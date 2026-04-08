@@ -1,0 +1,29 @@
+sequenceDiagram
+    autonumber
+    actor Browser
+    participant Main as main.rs
+    participant Listener as TcpListener
+    participant Stream as TcpStream
+    participant Buffer as buffer [0; 1024]
+    participant Response as response String
+
+    Note over Main,Listener: 启动阶段
+    Main->>Listener: bind("127.0.0.1:8080")
+    Listener-->>Main: listener 就绪
+
+    loop for stream in listener.incoming()
+        Browser->>Main: GET / HTTP/1.1
+        Main->>Listener: incoming()
+        Listener-->>Main: stream.unwrap()
+        Main->>Buffer: let mut buffer = [0; 1024]
+        Main->>Stream: read(&mut buffer)
+        Stream->>Buffer: 请求报文写入 buffer
+        Buffer-->>Main: println!(&buffer[..])
+        Main->>Response: format!(headers + body)
+        Response-->>Main: response String
+        Main->>Stream: write_all(response.as_bytes())
+        Stream->>Browser: HTTP/1.1 200 OK\nWelcome to Rust VPN Phase 1!
+        Note over Browser: 浏览器展示文本
+    end
+
+    Note over Main,Response: 当前代码未解析 HTTP 请求，只是读取原始字节并返回固定响应
