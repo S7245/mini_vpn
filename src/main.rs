@@ -1,6 +1,32 @@
-// use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+use bytes::{Buf, BytesMut};
+use chacha20poly1305::{
+    ChaCha20Poly1305, Key, Nonce,
+    aead::{Aead, KeyInit},
+};
+use std::io;
+use tokio_util::codec::Decoder;
+
+use bytes::BufMut; // 记得引入这个特型
+use tokio_util::codec::Encoder;
+
+use futures::{SinkExt, StreamExt};
+use tokio_util::codec::Framed; // 必须引入这两个特型才能使用 send 和 next
+
+// 代表我们在网络中传输的一个完整数据帧
+pub struct VpnFrame {
+    pub data: Vec<u8>,
+}
+
+// 我们的编解码器（暂时里面不需要存状态，是个空结构体）
+// pub struct VpnCodec;
+pub struct VpnCodec {
+    cipher: ChaCha20Poly1305,
+    send_counter: u64, // 发送计数器
+    recv_counter: u64, // 接收计数器
+}
 
 #[tokio::main]
 async fn main() {
@@ -36,46 +62,49 @@ async fn main() {
                 let mut target_stream = TcpStream::connect(&target_addr).await.unwrap();
                 // copy_bidirectional(&mut stream, &mut target_stream).await.unwrap();
 
-                let mut buf1 = [0u8; 8192]; // 从 Client (stream) 读取的数据缓冲区
-                let mut buf2 = [0u8; 8192]; // 从目标网站 (target_stream) 读取的数据缓冲区
+                // 2. 给 Server 换上新引擎
+                // 2.1. 准备一个统一的 32 字节密钥 (两边必须一致！)
+                let secret_key = b"an example very very secret key.";
+                // 2.2. 将来自客户端的 stream 包装成加密流
+                let mut encrypted_client = Framed::new(stream, VpnCodec::new(secret_key));
+                // (注意：与目标网站 target_stream 的通信依然是明文的，所以不需要包装)
+                let mut buf_from_target = [0u8; 8192];
                 loop {
                     tokio::select! {
-                        // 从 Client (stream) 读到的数据是密文。在发给真正的目标网站 (target_stream) 之前，需要先解密。
-                        result = stream.read(&mut buf1) => {
-                            
-                            let n = match result {
-                                Ok(n) => n,
+                        // 分支 A：从客户端接收加密数据，解密后发给目标网站
+                        result = encrypted_client.next() => {
+                            let frame_opt = match result {
+                               Some(Ok(f)) => f,
+                               _ => break, // 如果没数据了，或者解密失败报错了，直接退出循环断开连接
+                            };
+                            // frame_opt 现在是一个 VpnFrame。
+                            // 请把它里面的 data (明文) 通过 target_stream.write_all 写入目标网站。
+                            match target_stream.write_all(&frame_opt.data).await {
+                                Ok(_) => {},
                                 Err(e) => {
-                                    println!("读取失败: {}", e);
+                                    println!("写入失败: {}", e);
                                     break;
                                 }
                             };
-
-                            if n == 0 {break;}
-
-                            for i in 0..n {
-                                buf1[i] ^= 0x55;
-                            }
-                            target_stream.write_all(&buf1[..n]).await.unwrap();
                         }
-                        // Server 从目标网站 (target_stream) 读回来的数据是明文。在发回给 Client (stream) 之前，需要先加密。
-                        result = target_stream.read(&mut buf2) => {
+                        // 分支 B：从目标网站接收明文数据，加密后发给客户端
+                        result = target_stream.read(&mut buf_from_target) => {
                             let n = match result {
-                                Ok(n) => n,
+                                Ok(n) if n > 0 => n,
+                                _ => break,
+                            };
+                            // 我们将读到的明文 buf_from_target[..n] 包装成 VpnFrame。
+                            match encrypted_client.send(VpnFrame { data: buf_from_target[..n].to_vec() }).await {
+                                Ok(_) => {},
                                 Err(e) => {
-                                    println!("读取失败: {}", e);
+                                    println!("发送失败: {}", e);
                                     break;
                                 }
                             };
-                            if n == 0 {break;}
-                            for i in 0..n {
-                                buf2[i] ^= 0x55;
-                            }
-                            stream.write_all(&buf2[..n]).await.unwrap();
                         }
+
                     }
                 }
-
             });
         }
     } else if mode == "client" {
@@ -170,40 +199,139 @@ async fn main() {
                     .await
                     .unwrap();
 
-                // 3. 使用 copy_bidirectional 把本地的 stream（比如 curl）和 server_stream（代理服务端）对接起来。
-                // 删除：copy_bidirectional(&mut stream, &mut server_stream).await.unwrap();
+                // 2. 给 Server 换上新引擎
+                // 2.1. 准备一个统一的 32 字节密钥 (两边必须一致！)
+                let secret_key = b"an example very very secret key.";
+                let mut encrypted_server = Framed::new(server_stream, VpnCodec::new(secret_key));
+                // 2.2. 准备本地明文缓冲区
+                let mut buf_from_local = [0u8; 8192];
 
-                // 1. 在进入循环之前，我们需要为双向数据流分别准备存放数据的“篮子”（因为不能边读边写同一个数组）
-                let mut buf1 = [0u8; 8192]; // 用来装从本地浏览器/curl 读到的数据
-                let mut buf2 = [0u8; 8192]; // 用来装从远端 Server 读到的数据
+                // 编写对称的 tokio::select! 循环：
                 loop {
                     tokio::select! {
-                        // 2. 构建分支 A（加密发出 🔒）:这个分支负责处理客户端到服务端的方向：把本地发来的明文请求加密，然后交给 Server。
-                        result = stream.read(&mut buf1) => {
-                            let n = result.unwrap();
+                        // 分支 A (本地发往远端)：从本地 stream 读取明文到 buf_from_local，打包成 VpnFrame，然后使用 encrypted_server.send(...).await 发送出去。
+                        result = stream.read(&mut buf_from_local) => {
+                            let n = match result {
+                                Ok(n) => n,
+                                _ => break,
+                            };
                             if n == 0 { break; }
-                            // 对 buf1 进行 异或(XOR) 加密
-                            for i in 0..n {
-                                buf1[i] ^= 0x55;
-                            }
-                            // 把加密后的切片 &buf1[..n] 通过 server_stream.write_all(...).await 发送出去。
-                            server_stream.write_all(&buf1[..n]).await.unwrap();
+                            // 把 buf_from_local[..n] 通过 encrypted_server.send(...).await 发送出去。
+                            encrypted_server.send(VpnFrame {
+                                data: buf_from_local[..n].to_vec(),
+                            }).await.unwrap();
                         }
 
-                        // 构建分支 B（解密收回 🔓）:这个分支负责处理服务端到客户端的方向：把 Server 发回来的加密响应解密，然后交回给本地。
-                        result = server_stream.read(&mut buf2) => {
-                            let n = result.unwrap();
-                            if n == 0 { break; }
-                            // 对 buf2 进行 异或(XOR) 解密
-                            for i in 0..n {
-                               buf2[i] ^= 0x55;
-                            }
-                            // 把解密后的切片 &buf2[..n] 通过 stream.write_all(...).await 发送出去。
-                            stream.write_all(&buf2[..n]).await.unwrap();
+                        // 分支 B (远端收回本地)：调用 encrypted_server.next().await 接收解密好的 VpnFrame，把里面的 data 使用 stream.write_all(...).await 写回给本地浏览器/curl。
+                        result = encrypted_server.next() => {
+                            let frame = match result {
+                                Some(Ok(f)) => f,
+                                _ => break,
+                            };
+                            stream.write_all(&frame.data).await.unwrap();
                         }
                     }
                 }
             });
         }
+    }
+}
+
+impl VpnCodec {
+    // 初始化时传入 32 字节的密钥
+    pub fn new(secret_key: &[u8; 32]) -> Self {
+        Self {
+            cipher: ChaCha20Poly1305::new(Key::from_slice(secret_key)),
+            send_counter: 0,
+            recv_counter: 0,
+        }
+    }
+    // 辅助魔法：把 u64 计数器变成 12 字节的 Nonce
+    fn nonce_from_counter(counter: u64) -> chacha20poly1305::Nonce {
+        let mut nonce_bytes = [0u8; 12];
+        let counter_bytes = counter.to_be_bytes(); // u64 是 8 字节
+        nonce_bytes[4..12].copy_from_slice(&counter_bytes); // 放到最后 8 个字节
+        *Nonce::from_slice(&nonce_bytes)
+    }
+}
+
+impl Decoder for VpnCodec {
+    type Item = VpnFrame;
+    type Error = io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // 1. 检查缓冲区里有没有至少 2 个字节（因为我们约定用 2 字节来存长度 u16）
+        // 数据不够 2 字节，连头都读不出来，直接告诉 Tokio 继续等
+        if src.len() < 2 {
+            return Ok(None);
+        }
+
+        // 2. 偷看前 2 个字节，计算出真正的 payload (加密数据) 的长度
+        // 注意：这里只是偷看 (src[0], src[1])，并没有把这 2 个字节从缓冲区里吃掉
+        let payload_len = u16::from_be_bytes([src[0], src[1]]) as usize;
+
+        // 3. 检查当前缓冲区的总长度 src.len() 是否大于或等于【完整的包长度】。
+        //    完整的包长度 = 2 (头部) + payload_len。
+        //    如果不够，说明虽然知道了长度，但后面的数据还没在网线上全传过来，这里应该返回什么？
+        // 数据不够，直接返回 None
+        if src.len() < 2 + payload_len {
+            return Ok(None);
+        }
+
+        // 4. 如果长度足够了（凑齐了一个完整的包）：
+        //    - 第一步：使用 src.advance(2); 把头部的 2 个字节彻底从缓冲区里消耗掉。
+        //    - 第二步：使用 src.split_to(payload_len); 把接下来的有效数据切下来，它会返回一个 Bytes 对象。
+        //    - 第三步：把切下来的数据转换成 Vec<u8> (比如调用 .to_vec())，装进 VpnFrame 结构体中。
+        //    - 第四步：返回 Ok(Some(装好的 VpnFrame))。
+        src.advance(2);
+        let ciphertext = src.split_to(payload_len);
+
+        // 完成防篡改解密逻辑
+        // 1. 获取当前的接收 Nonce（使用 self.recv_counter）
+        // 2. 立刻递增 self.recv_counter
+        let nonce = Self::nonce_from_counter(self.recv_counter);
+        self.recv_counter += 1;
+
+        // 3. 调用 self.cipher.decrypt(&nonce, src.split_to(payload_len).as_ref()) 尝试解密。
+        //    如果成功，得到明文 plaintext (是一个 Vec<u8>)。
+        //    如果失败 (Err)，说明遭遇了篡改或探测！请直接通过 return Err(...) 返回一个 io::Error。
+        //    (提示：可以使用 std::io::Error::new(std::io::ErrorKind::InvalidData, "解密失败/遭探测") )
+        let plaintext = match self.cipher.decrypt(&nonce, ciphertext.as_ref()) {
+            Ok(plaintext) => plaintext,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "解密失败/遭探测",
+                ));
+            }
+        };
+
+        // 4. 将成功解密的 plaintext 包装成 VpnFrame，通过 Ok(Some(VpnFrame { data: plaintext })) 返回。
+        Ok(Some(VpnFrame { data: plaintext }))
+    }
+}
+
+impl Encoder<VpnFrame> for VpnCodec {
+    type Error = io::Error;
+
+    fn encode(&mut self, item: VpnFrame, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        // 2.1. 获取当前发送计数器对应的 Nonce：调用 Self::nonce_from_counter(self.send_counter)。
+        let nonce = Self::nonce_from_counter(self.send_counter);
+        // 2.2. 立刻将 self.send_counter += 1;（用完马上加 1，绝不重复）。
+        self.send_counter += 1;
+
+        // 2.3. 调用 self.cipher.encrypt(...) 对 item.data 进行加密，得到 ciphertext。
+        // 提示：这里可能会发生加密错误，encrypt 会返回 Result。如果失败，可以把它转换为 io::Error，或者简单点直接 .expect("加密失败")。
+        let ciphertext = self.cipher.encrypt(&nonce, item.data.as_ref()).expect("加密失败");
+
+        // 1.1. 安全起见，先要求底层缓冲区为我们准备好足够的空间
+        dst.reserve(2 + ciphertext.len());
+
+        // 2.4. 此时，你的数据长度变长了！（因为多了 16 字节的 Poly1305 MAC）。你需要把 ciphertext.len() 强转为 u16，作为长度写入缓冲区 dst.put_u16(...)。
+        dst.put_u16(ciphertext.len() as u16);
+        // 2.5. 最后把加密后的 ciphertext 写入缓冲区 dst.put_slice(...)。
+        dst.put_slice(&ciphertext);
+        // 2.6. 返回 Ok(())
+        Ok(())
     }
 }
