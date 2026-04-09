@@ -1,0 +1,39 @@
+sequenceDiagram
+    autonumber
+    actor Terminal as 客户端终端
+    participant Client as Client
+    participant Sever as Sever
+    participant Ipinfo as ipinfo.io
+
+    Note over Terminal,Client: 示例命令是 curl --socks5 127.0.0.1:8080 ipinfo.io
+    Note over Terminal,Client: 当前代码里 Client 实际监听 127.0.0.1:1080
+
+    Terminal->>Client: 1. 发起 SOCKS5 连接
+    Client-->>Terminal: 2. 接受连接
+
+    Note over Terminal,Client: 第一段：先打招呼，确认“怎么通信”
+    Terminal->>Client: 3. 我支持这些认证方式
+    Client-->>Terminal: 4. 选择“无需认证”
+
+    Note over Terminal,Client: 第二段：告诉代理“我要访问谁”
+    Terminal->>Client: 5. 请帮我连接 ipinfo.io:80
+    Client->>Client: 6. 解析域名和端口
+    Client-->>Terminal: 7. 回复“请求已受理”
+
+    Note over Client,Sever: 第三段：Client 不直接连网站，而是去找远端 Sever
+    Client->>Sever: 8. 建立到 127.0.0.1:8081 的连接
+    Client->>Sever: 9. 发送目标地址 ipinfo.io:80\n
+    Note over Client,Sever: 后续数据会被 VpnCodec 加密后再传输
+
+    Sever->>Ipinfo: 10. 代替 Client 连接 ipinfo.io:80
+    Ipinfo-->>Sever: 11. 连接建立成功
+
+    Note over Terminal,Ipinfo: 第四段：开始双向搬运数据
+    Terminal->>Client: 12. 发送 HTTP 请求
+    Client->>Sever: 13. 加密后转发请求
+    Sever->>Ipinfo: 14. 解密后转发请求
+    Ipinfo-->>Sever: 15. 返回网页数据
+    Sever-->>Client: 16. 加密后回传响应
+    Client-->>Terminal: 17. 解密后把结果交给 curl
+
+    Note over Terminal: 18. 终端看到 ipinfo.io 返回的内容

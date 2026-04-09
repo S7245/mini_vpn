@@ -1,46 +1,45 @@
 - 输出结果：
 
 ```rust
-if mode == "client" {
-    println!("Client 模式启动！");
-    let listener = TcpListener::bind("127.0.0.1:1080").await.unwrap();
-    loop {
-        let (mut stream, _addr) = listener.accept().await.unwrap();
-        tokio::spawn(async move {
-            // 省略代码...
-            // 1. 在给客户端发送成功响应之后，不要去连接 target_addr 了。改为连接我们的代理服务端：
-            let mut server_stream = TcpStream::connect("127.0.0.1:8081").await.unwrap();
-            println!("成功连接到代理服务端: 127.0.0.1:8081");
-            // 2. 此时的服务端还不知道我们要去哪。我们需要设计一个极其简单的自定义通信协议：将目标地址拼接上一个换行符 `\n`，发送给服务端。
-            server_stream.write_all(format!("{}\n", target_addr).as_bytes()).await.unwrap();
-            
-            // 2. 给 Server 换上新引擎
-            // 2.1. 准备一个统一的 32 字节密钥 (两边必须一致！)
-            let secret_key = b"an example very very secret key.";
-            let mut encrypted_server = Framed::new(server_stream,VpnCodec::new(secret_key));
-            // 2.2. 准备本地明文缓冲区
-            let mut buf_from_local = [0u8; 8192];
-            // 编写对称的 tokio::select! 循环：
-            loop {
-                tokio::select! {
-                    // 分支 A (本地发往远端)：从本地 stream 读取明文到 buf_from_local，打包成 VpnFrame，然后使用 encrypted_server.send(...).await 发送出去。
-                    result = stream.read(&mut buf_from_local) => {
-                        let n = result.unwrap();
-                        if n == 0 { break; }
-                        // 把 buf_from_local[..n] 通过 encrypted_server.send(...).await 发送出去。
-                        encrypted_server.send(VpnFrame {
-                            data: buf_from_local[..n].to_vec(),
-                        }).await.unwrap();
+async fn main() {
+    let mode = std::env::args()
+        .nth(1)
+        .expect("请指定运行模式: client 或 server");
+
+    if mode == "server" {
+        println!("运行服务器端");
+        // 1. 在 server 分支里，让 TcpListener 监听 "127.0.0.1:8081"，并加上我们熟悉的 loop 和 tokio::spawn 结构。
+        let listener = TcpListener::bind("127.0.0.1:8081").await.unwrap();
+        loop {
+            let (mut stream, _addr) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut magic_buf = [0u8; 40];
+                match stream.read_exact(&mut magic_buf).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        println!("读取暗号失败: {:?}", e);
+                        return;
                     }
-                    
-                    // 分支 B (远端收回本地)：调用 encrypted_server.next().await 接收解密好的 VpnFrame，把里面的 data 使用 stream.write_all(...).await 写回给本地浏览器/curl。
-                    result = encrypted_server.next() => {
-                        let frame = result.unwrap();
-                        stream.write_all(&frame.data).await.unwrap();
-                    }
+                };
+
+                if &magic_buf[..38] != b"GET / HTTP/1.1\r\nHost: www.bing.com\r\n\r\n" {
+                    println!("遭遇主动探测或未知连接，静默断开！");
+                    // 提示：直接结束当前的 spawn 任务，装死
+                    return;
                 }
-            }
-        });
+
+                let mut addr_bytes = Vec::new();
+                loop {
+                    let mut byte = [0u8; 1];
+                    stream.read_exact(&mut byte).await.unwrap();
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                    addr_bytes.push(byte[0]);
+                }
+                // 省略代码
+            });
+        }
     }
 }
 ```
