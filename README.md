@@ -2,59 +2,77 @@
 📄 src/server.rs: 服务端基站。封装 Server 模式下的监听、TLS 握手和 Yamux 逻辑。
 📄 src/client.rs: 客户端引擎。封装 SOCKS5 解析、长连接维护和多路复用逻辑。
 
-
 - 关键代码片段：
 
 ```rust
-if payload_buf.len() < 4 || payload_buf[0] != 0 || payload_buf[1] != 0 {
-    println!("非法的 SOCKS5 UDP 数据包");
-    continue; // 直接处理下一个包
-}
-let atyp = payload_buf[3];
-let mut header_len = 0; // 用来记录“导航头”一共占了多少字节
-let target_addr = match atyp {
-    1 => {
-        if payload_buf.len() < 10 {
+res = server_udp.recv_from(&mut internet_buf) => {
+    let (len, remote_addr) = match res {
+        Ok(r) => r,
+        Err(_) => break,
+    };
+    println!("🎉 收到来自互联网 {} 的 {} 字节响应！", remote_addr, len);
+    // (下一步，我们将在这里把数据重新打包回 SOCKS5 格式，发进 Yamux 隧道)
+    // 3. 使用 match 智能分流，并提取对应的 IP 和 端口
+    // 【你的任务】：
+    // 1. 创建一个新的动态数组 `let mut response_payload = Vec::new();`
+    let mut response_payload = Vec::new();
+    // 2. 依次向里面 extend 或 push 以下内容：
+    // - SOCKS5 头部: &[0, 0, 0, 1]  (1 代表 IPv4)
+    // response_payload.extend_from_slice(&[0, 0, 0, 1]);
+    // 2. 先塞入固定的 3 个字节：[0 (保留), 0 (保留), 0 (分片号)]
+    response_payload.extend_from_slice(&[0, 0, 0]);
+    match remote_addr {
+        std::net::SocketAddr::V4(addr_v4) => {
+            let ip_bytes = addr_v4.ip().octets(); // 拿到 [8, 8, 8, 8]
+            let port_bytes = addr_v4.port().to_be_bytes(); // 拿到端口的 2 字节数组
+            response_payload.push(1); // 1 代表 IPv4
+            response_payload.extend_from_slice(&ip_bytes);
+            response_payload.extend_from_slice(&port_bytes);
+        }
+        std::net::SocketAddr::V6(addr_v6) => {
+            let ip_bytes = addr_v6.ip().octets(); // 拿到 [16 字节]
+            let port_bytes = addr_v6.port().to_be_bytes(); // 拿到端口的 2 字节数组
+            response_payload.push(4); // 4 代表 IPv6
+            response_payload.extend_from_slice(&ip_bytes);
+            response_payload.extend_from_slice(&port_bytes);
+        }
+    }
+    // - 真正的响应数据: &internet_buf[..len]
+    response_payload.extend_from_slice(&internet_buf[..len]);
+    // 3. 算出 response_payload 的总长度 (as u16)，并转换为 2 字节的大端序数组。
+    let payload_len = response_payload.len() as u16;
+    let payload_len_be = payload_len.to_be_bytes();
+    // 4. 使用 tokio_yamux_stream 依次将 [2字节长度] 和 [response_payload] write_all 发送进隧道！
+    match tokio_yamux_stream.write_all(&payload_len_be).await {
+        Ok(_) => {},
+        Err(e) => {
+            println!("UDP发送长度字节失败: {e}");
             continue;
-        } // 4(头) + 4(IP) + 2(端口) = 10
-        let ip = &payload_buf[4..8];
-        let port =
-            u16::from_be_bytes(payload_buf[8..10].try_into().unwrap());
-        // let port = u16::from_be_bytes(&payload_buf[8..10]);
-        header_len = 10;
-        format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port)
+        }
     }
-    3 => {
-        // 提取域名长度，提取域名字符串，提取端口
-        // header_len = 4 + 1(长度) + 域名长度 + 2(端口);
-        let domain_len = payload_buf[4] as usize;
-        let domain = String::from_utf8_lossy(&payload_buf[5..5 + domain_len]);
-        let port = u16::from_be_bytes(payload_buf[5 + domain_len..7 + domain_len].try_into().unwrap());
-        header_len = 7 + domain_len;
-        format!("{}:{}", domain, port)
+    match tokio_yamux_stream.write_all(&response_payload).await {
+        Ok(_) => {},
+        Err(e) => {
+            println!("UDP发送响应数据失败: {e}");
+            continue;
+        }
     }
-    _ => {
-        println!("不支持的 UDP 地址类型");
-        continue;
-    }
-};
-// 切割出真正的用户数据！
-let real_data = &payload_buf[header_len..];
-println!("准备将 {} 字节真实数据发往 {}", real_data.len(), target_addr);
+}
 ```
 
 - 执行：`curl --socks5-hostname 127.0.0.1:1080 ipinfo.io`
 
 - Client输出：
+
 ```ini
 与代理服务端 TLS 握手失败: Custom { kind: InvalidData, error: InvalidCertificate(Other(CaUsedAsEndEntity)) }
 ```
 
 - Server输出：
+
 ```ini
 TLS 握手失败: Custom { kind: InvalidData, error: AlertReceived(CertificateUnknown) }
 ```
-
 
 ```sh
 openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=localhost"

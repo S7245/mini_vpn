@@ -1,4 +1,3 @@
-use bytes::buf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -14,11 +13,6 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use yamux::{Config, Connection, Mode};
-
-pub struct VpnFrame {
-    pub len: u16,
-    pub data: Vec<u8>,
-}
 
 pub async fn run() {
     println!("Client 模式启动！");

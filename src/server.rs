@@ -1,4 +1,4 @@
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use std::fs::File;
@@ -143,92 +143,127 @@ pub async fn run() {
                     println!("解析出的目标地址是: {target_addr}");
 
                     if target_addr == "UDP" {
-                        // println!("🌟 收到 UDP 代理指令，切换为 UDP 中继模式！");
-                        let mut len_buf = [0u8; 2];
+                        println!("🌟 收到 UDP 代理指令，切换为 UDP 中继模式！");
+                        // 准备一个服务端的 UDP 端口，用来和真实的互联网（如 8.8.8.8）通信
+                        let server_udp = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+
+                        let mut len_buf = [0u8; 2]; // 用来读 UDP 数据包长度的缓冲区
+                        let mut internet_buf = [0u8; 65536]; // 用来读 UDP 数据包的缓冲区
+
                         loop {
-                            // ================= 拆箱作业 =================
+                            tokio::select! {
+                                // ================= 分支 1：从隧道读 -> 发往真实互联网 =================
+                                res = tokio_yamux_stream.read_exact(&mut len_buf) => {
+                                    if res.is_err() { break; }
 
-                            // 【你的任务】：
-                            // 1. 使用 tokio_yamux_stream.read_exact 读取 2 字节到 len_buf。
-                            // (注意：如果 read_exact 报错或返回 Err，说明客户端断开了，直接 break 退出循环)
-                            match tokio_yamux_stream.read_exact(&mut len_buf).await {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    println!("读取 UDP 数据包长度失败: {e:?}");
-                                    break;
+                                    let payload_len = u16::from_be_bytes(len_buf);
+                                    let mut payload_buf = vec![0u8; payload_len as usize];
+                                    if tokio_yamux_stream.read_exact(&mut payload_buf).await.is_err() { break; }
+
+                                    if payload_buf.len() < 4 || payload_buf[0] != 0 || payload_buf[1] != 0 {
+                                        println!("非法的 SOCKS5 UDP 数据包");
+                                        continue; // 直接处理下一个包
+                                    }
+
+                                    let atyp = payload_buf[3];
+                                    let header_len; // 用来记录“导航头”一共占了多少字节
+                                    let target_addr = match atyp {
+                                        1 => {
+                                            if payload_buf.len() < 10 {
+                                                continue;
+                                            } // 4(头) + 4(IP) + 2(端口) = 10
+                                            let ip = &payload_buf[4..8];
+                                            let port =
+                                                u16::from_be_bytes(payload_buf[8..10].try_into().unwrap());
+                                            // let port = u16::from_be_bytes(&payload_buf[8..10]);
+                                            header_len = 10;
+                                            format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port)
+                                        }
+                                        3 => {
+                                            // 提取域名长度，提取域名字符串，提取端口
+                                            // header_len = 4 + 1(长度) + 域名长度 + 2(端口);
+                                            let domain_len = payload_buf[4] as usize;
+                                            let domain =
+                                                String::from_utf8_lossy(&payload_buf[5..5 + domain_len]);
+                                            let port = u16::from_be_bytes(
+                                                payload_buf[5 + domain_len..7 + domain_len]
+                                                    .try_into()
+                                                    .unwrap(),
+                                            );
+                                            header_len = 7 + domain_len;
+                                            format!("{}:{}", domain, port)
+                                        }
+                                        _ => {
+                                            println!("不支持的 UDP 地址类型");
+                                            continue;
+                                        }
+                                    };
+                                    // 切割出真正的用户数据！
+                                    let real_data = &payload_buf[header_len..];
+                                    // 解析完成后，直接发射给目标！
+                                    if let Err(e) = server_udp.send_to(real_data, &target_addr).await {
+                                        println!("代发 UDP 数据失败: {e}");
+                                    }
+                                    println!("已发送 {} 字节数据到 {}", real_data.len(), target_addr);
+                                }
+                                // ================= 分支 2：从真实互联网接收响应 -> (稍后)发回隧道 =================
+                                res = server_udp.recv_from(&mut internet_buf) => {
+                                    let (len, remote_addr) = match res {
+                                        Ok(r) => r,
+                                        Err(_) => break,
+                                    };
+                                    println!("🎉 收到来自互联网 {} 的 {} 字节响应！", remote_addr, len);
+                                    // (下一步，我们将在这里把数据重新打包回 SOCKS5 格式，发进 Yamux 隧道)
+
+                                    // 3. 使用 match 智能分流，并提取对应的 IP 和 端口
+                                    // 【你的任务】：
+                                    // 1. 创建一个新的动态数组 `let mut response_payload = Vec::new();`
+                                    let mut response_payload = Vec::new();
+                                    // 2. 依次向里面 extend 或 push 以下内容：
+                                    // - SOCKS5 头部: &[0, 0, 0, 1]  (1 代表 IPv4)
+                                    // response_payload.extend_from_slice(&[0, 0, 0, 1]);
+
+                                    // 2. 先塞入固定的 3 个字节：[0 (保留), 0 (保留), 0 (分片号)]
+                                    response_payload.extend_from_slice(&[0, 0, 0]);
+
+                                    match remote_addr {
+                                        std::net::SocketAddr::V4(addr_v4) => {
+                                            let ip_bytes = addr_v4.ip().octets(); // 拿到 [8, 8, 8, 8]
+                                            let port_bytes = addr_v4.port().to_be_bytes(); // 拿到端口的 2 字节数组
+                                            response_payload.push(1); // 1 代表 IPv4
+                                            response_payload.extend_from_slice(&ip_bytes);
+                                            response_payload.extend_from_slice(&port_bytes);
+                                        }
+                                        std::net::SocketAddr::V6(addr_v6) => {
+                                            let ip_bytes = addr_v6.ip().octets(); // 拿到 [16 字节]
+                                            let port_bytes = addr_v6.port().to_be_bytes(); // 拿到端口的 2 字节数组
+                                            response_payload.push(4); // 4 代表 IPv6
+                                            response_payload.extend_from_slice(&ip_bytes);
+                                            response_payload.extend_from_slice(&port_bytes);
+                                        }
+                                    }
+                                    // - 真正的响应数据: &internet_buf[..len]
+                                    response_payload.extend_from_slice(&internet_buf[..len]);
+                                    // 3. 算出 response_payload 的总长度 (as u16)，并转换为 2 字节的大端序数组。
+                                    let payload_len = response_payload.len() as u16;
+                                    let payload_len_be = payload_len.to_be_bytes();
+                                    // 4. 使用 tokio_yamux_stream 依次将 [2字节长度] 和 [response_payload] write_all 发送进隧道！
+                                    match tokio_yamux_stream.write_all(&payload_len_be).await {
+                                        Ok(_) => {},
+                                        Err(e) => {
+                                            println!("UDP发送长度字节失败: {e}");
+                                            continue;
+                                        }
+                                    }
+                                    match tokio_yamux_stream.write_all(&response_payload).await {
+                                        Ok(_) => {},
+                                        Err(e) => {
+                                            println!("UDP发送响应数据失败: {e}");
+                                            continue;
+                                        }
+                                    }
                                 }
                             }
-                            // 2. 用 u16::from_be_bytes 解析出真实长度 payload_len。
-                            let payload_len = u16::from_be_bytes(len_buf);
-                            println!("UDP 数据包长度: {payload_len}");
-
-                            // 3. 创建一个 vec![0u8; payload_len as usize] 的动态数组。
-                            let mut payload_buf = vec![0u8; payload_len as usize];
-                            // 4. 再次使用 read_exact 读满这个动态数组。
-                            match tokio_yamux_stream.read_exact(&mut payload_buf).await {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    println!("读取 UDP 数据包失败: {e:?}");
-                                    break;
-                                }
-                            }
-                            println!("Server 成功从隧道收到 {} 字节的 UDP 数据包！", payload_len);
-                            // - `payload_buf[0..2]`: 必须是 `[0, 0]` (保留字段)
-                            // - `payload_buf[2]`: 分片号 (一般是 0)
-                            // - `payload_buf[3]`: 地址类型 (ATYP)，`1` 代表 IPv4，`3` 代表域名
-                            // - `payload_buf[4..]`: 目标地址 + 目标端口
-                            // - `最后的剩余部分`: 真正的 UDP 数据 (也就是你的 `"Hello UDP"`)
-                            // (下一步，我们将在这里解析 SOCKS5 UDP 报头，并真正发往互联网)
-                            if payload_buf.len() < 4 || payload_buf[0] != 0 || payload_buf[1] != 0 {
-                                println!("非法的 SOCKS5 UDP 数据包");
-                                continue; // 直接处理下一个包
-                            }
-                            let atyp = payload_buf[3];
-                            let mut header_len = 0; // 用来记录“导航头”一共占了多少字节
-                            let target_addr = match atyp {
-                                1 => {
-                                    if payload_buf.len() < 10 {
-                                        continue;
-                                    } // 4(头) + 4(IP) + 2(端口) = 10
-                                    let ip = &payload_buf[4..8];
-                                    let port =
-                                        u16::from_be_bytes(payload_buf[8..10].try_into().unwrap());
-                                    // let port = u16::from_be_bytes(&payload_buf[8..10]);
-                                    header_len = 10;
-                                    format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port)
-                                }
-                                3 => {
-                                    // 提取域名长度，提取域名字符串，提取端口
-                                    // header_len = 4 + 1(长度) + 域名长度 + 2(端口);
-                                    let domain_len = payload_buf[4] as usize;
-                                    let domain = String::from_utf8_lossy(&payload_buf[5..5 + domain_len]);
-                                    let port = u16::from_be_bytes(payload_buf[5 + domain_len..7 + domain_len].try_into().unwrap());
-                                    header_len = 7 + domain_len;
-                                    format!("{}:{}", domain, port)
-                                }
-                                _ => {
-                                    println!("不支持的 UDP 地址类型");
-                                    continue;
-                                }
-                            };
-                            // 切割出真正的用户数据！
-                            let real_data = &payload_buf[header_len..];
-                            println!("准备将 {} 字节真实数据发往 {}", real_data.len(), target_addr);
-
-                            // println!("payload_buf 数组内容: {:?}", &payload_buf[0..]);
-                            // s.sendto(b"Hello UDP", ("8.8.8.8", 53))
-                            // [0, 0, 0, 1, 8, 8, 8, 8, 0, 53, 72, 101, 108, 108, 111, 32, 85, 68, 80]
-                            // s.sendto(b"Hello UDP", ("www.baidu.com", 53))
-                            // [0, 0, 0, 3, 13, 119, 119, 119, 46, 98, 97, 105, 100, 117, 46, 99, 111, 109, 0, 53, 72, 101, 108, 108, 111, 32, 85, 68, 80]
-
-                            // 打印 payload_buf 数组 [4..8] 的内容
-                            // println!("payload_buf 数组 [4..8] 内容: {:?}", &payload_buf[4..8]);
-                            // [4..8] 是 IP 地址：[8, 8, 8, 8]
-
-                            // ================= 代发作业 =================
-                            // 1. 创建一个临时的 UdpSocket 去连接目标地址
-                            // let server_udp = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
-                            // 2. 发送 real_data 到 target_addr
                         }
                     } else {
                         // 🌐 原本的 TCP 处理逻辑保持不变
