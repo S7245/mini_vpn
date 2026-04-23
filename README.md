@@ -2,63 +2,22 @@
 📄 src/server.rs: 服务端基站。封装 Server 模式下的监听、TLS 握手和 Yamux 逻辑。
 📄 src/client.rs: 客户端引擎。封装 SOCKS5 解析、长连接维护和多路复用逻辑。
 
-- 关键代码片段：
+- 运行 `cargo run -- server`，启动服务端。
+- 运行 `cargo run -- client`，启动客户端。
+- 错误流程：`关闭服务端` -> `启动服务端`，客服端不会主动重连，这是什么原因？
+
+- 这是我输出的关键代码片段：
 
 ```rust
-res = server_udp.recv_from(&mut internet_buf) => {
-    let (len, remote_addr) = match res {
-        Ok(r) => r,
-        Err(_) => break,
-    };
-    println!("🎉 收到来自互联网 {} 的 {} 字节响应！", remote_addr, len);
-    // (下一步，我们将在这里把数据重新打包回 SOCKS5 格式，发进 Yamux 隧道)
-    // 3. 使用 match 智能分流，并提取对应的 IP 和 端口
-    // 【你的任务】：
-    // 1. 创建一个新的动态数组 `let mut response_payload = Vec::new();`
-    let mut response_payload = Vec::new();
-    // 2. 依次向里面 extend 或 push 以下内容：
-    // - SOCKS5 头部: &[0, 0, 0, 1]  (1 代表 IPv4)
-    // response_payload.extend_from_slice(&[0, 0, 0, 1]);
-    // 2. 先塞入固定的 3 个字节：[0 (保留), 0 (保留), 0 (分片号)]
-    response_payload.extend_from_slice(&[0, 0, 0]);
-    match remote_addr {
-        std::net::SocketAddr::V4(addr_v4) => {
-            let ip_bytes = addr_v4.ip().octets(); // 拿到 [8, 8, 8, 8]
-            let port_bytes = addr_v4.port().to_be_bytes(); // 拿到端口的 2 字节数组
-            response_payload.push(1); // 1 代表 IPv4
-            response_payload.extend_from_slice(&ip_bytes);
-            response_payload.extend_from_slice(&port_bytes);
-        }
-        std::net::SocketAddr::V6(addr_v6) => {
-            let ip_bytes = addr_v6.ip().octets(); // 拿到 [16 字节]
-            let port_bytes = addr_v6.port().to_be_bytes(); // 拿到端口的 2 字节数组
-            response_payload.push(4); // 4 代表 IPv6
-            response_payload.extend_from_slice(&ip_bytes);
-            response_payload.extend_from_slice(&port_bytes);
-        }
+pub async fn flush_tx(&mut self) -> std::io::Result<()> {
+    while let Some(packet) = self.tx_queue.pop_front() {
+        self.device.write_all(&packet).await?;
     }
-    // - 真正的响应数据: &internet_buf[..len]
-    response_payload.extend_from_slice(&internet_buf[..len]);
-    // 3. 算出 response_payload 的总长度 (as u16)，并转换为 2 字节的大端序数组。
-    let payload_len = response_payload.len() as u16;
-    let payload_len_be = payload_len.to_be_bytes();
-    // 4. 使用 tokio_yamux_stream 依次将 [2字节长度] 和 [response_payload] write_all 发送进隧道！
-    match tokio_yamux_stream.write_all(&payload_len_be).await {
-        Ok(_) => {},
-        Err(e) => {
-            println!("UDP发送长度字节失败: {e}");
-            continue;
-        }
-    }
-    match tokio_yamux_stream.write_all(&response_payload).await {
-        Ok(_) => {},
-        Err(e) => {
-            println!("UDP发送响应数据失败: {e}");
-            continue;
-        }
-    }
+    Ok(())
 }
 ```
+
+但是 `<'a>` 是显示报错；
 
 - 执行：`curl --socks5-hostname 127.0.0.1:1080 ipinfo.io`
 
@@ -84,4 +43,42 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -node
 # -days 365: 证书有效期为 365 天。
 # -nodes (No DES): 生成不加密的私钥（本地测试用），无需输入密码。
 # -subj "/CN=localhost": 直接填写证书申请信息，跳过交互式问答。
+```
+
+
+## TUN
+
+```
+utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+	inet6 fe80::4a93:8ff6:27a3:aee2%utun0 prefixlen 64 scopeid 0x11 
+	nd6 options=201<PERFORMNUD,DAD>
+```
+
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant OS as 操作系统内核 (TUN)
+    participant VTD as VirtualTunDevice (异步/同步桥梁)
+    participant STCP as smoltcp (协议栈)
+
+    Note over OS, STCP: 接收链路 (Ingress: OS -> smoltcp)
+    OS->>VTD: 物理网卡收到 IP Packet (底层中断)
+    VTD->>VTD: wait_for_rx().await 读入临时栈数组 buf(1500)
+    VTD->>VTD: [性能痛点] to_vec() 堆分配拷贝存入 rx_buffer
+    
+    STCP->>VTD: 协议栈主动拉取: iface.poll() -> device.receive()
+    VTD-->>STCP: 移交 rx_buffer，返回 TunRxToken 和 TunTxToken
+    STCP->>VTD: 协议栈消费: TunRxToken::consume()
+    VTD->>STCP: 闭包 f(&mut buffer) 将数据喂给协议栈处理
+
+    Note over OS, STCP: 发送链路 (Egress: smoltcp -> OS)
+    STCP->>VTD: 协议栈准备回复: iface.poll() -> device.transmit()
+    VTD-->>STCP: 返回 TunTxToken (带着 tx_queue 钥匙)
+    STCP->>VTD: 协议栈生产: TunTxToken::consume(len)
+    VTD->>VTD: [性能痛点] vec_alloc(len) 再次堆分配
+    VTD->>STCP: 闭包 f(&mut buffer) 让协议栈填入以太网/IP数据
+    VTD->>VTD: 填满后 push_back 压入 tx_queue 队列排队
+    
+    VTD->>OS: flush_tx().await 异步遍历 tx_queue 写入内核
 ```

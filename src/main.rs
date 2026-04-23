@@ -1,5 +1,7 @@
 mod client;
 mod server;
+mod client_tun;
+mod device;
 
 #[tokio::main]
 async fn main() {

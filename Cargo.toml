@@ -19,3 +19,10 @@ rustls-pemfile = "1.0" # 用于读取证书文件
 # 连接多路复用 (Multiplexing) ⚡
 yamux = "0.10"
 # tokio-util = { version = "0.7", features = ["compat"] }
+
+# 处理 TUN 网卡
+tun = { version = "0.6", features = ["async"] }
+# 用户态 TCP/IP 协议栈
+smoltcp = { version = "0.10", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"] }
+# 辅助解析 IP/TCP 头部
+etherparse = "0.13"
