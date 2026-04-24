@@ -9,15 +9,20 @@
 - 这是我输出的关键代码片段：
 
 ```rust
-pub async fn flush_tx(&mut self) -> std::io::Result<()> {
-    while let Some(packet) = self.tx_queue.pop_front() {
-        self.device.write_all(&packet).await?;
+async fn main() {
+    let mode = std::env::args()
+        .nth(1)
+        .expect("请指定运行模式: client 或 server");
+
+    if mode == "server" {
+        server::run().await;
+    } else if mode == "client" {
+        client::start_tun_proxy().await;
     }
-    Ok(())
 }
 ```
 
-但是 `<'a>` 是显示报错；
+但是 `tokio::select! {}` 是显示报错；`This will prevent proc-macro expansion from working. Please consider updating your rust-analyzer to ensure compatibility with your current toolchain.`
 
 - 执行：`curl --socks5-hostname 127.0.0.1:1080 ipinfo.io`
 
@@ -82,3 +87,12 @@ sequenceDiagram
     
     VTD->>OS: flush_tx().await 异步遍历 tx_queue 写入内核
 ```
+
+
+
+## Todo
+
+- 性能目标：当前是单机调试链路，建议先把目标定成 1k pps 以内 ICMP 不丢、 read -> iface.poll() 路径 P99 < 5ms 、空闲内存基线 < 1MB 、空闲 CPU < 5% 。
+- 安全与合规：现阶段主要是本机 utun 调试，权限边界是 sudo cargo run ；后续若做产品化，建议切到 Network Extension 支持路径。
+- 潜在瓶颈：当前热路径里有 read -> Vec::to_vec -> smoltcp -> Vec 的额外拷贝， read/write 是 syscall 热点；但你这次“完全收不到包”的主因不是性能，而是接入语义错了。
+- 

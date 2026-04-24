@@ -12,6 +12,7 @@ async fn main() {
     if mode == "server" {
         server::run().await;
     } else if mode == "client" {
-        client::run().await;
+        //client::run().await;
+        client_tun::start_tun_proxy().await;
     }
 }
