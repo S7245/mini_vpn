@@ -1,20 +1,30 @@
 use crate::device::VirtualTunDevice;
 use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer};
 use smoltcp::wire::{IpAddress, IpCidr};
 
 pub async fn start_tun_proxy() {
     // =========== 1. 初始化底层网卡和通道 ===========
 
     // 1. 初始化 TUN 设备(化底层网卡和通道) / 创建操作系统的原生异步虚拟网卡
-    let mut raw_tun = create_tun_device().await;
+    let raw_tun = create_tun_device().await;
     // 使用 raw_tun 实例化我们的包装器
     let mut device = VirtualTunDevice::new(raw_tun);
 
     // =========== 2. 初始化 smoltcp 酒店和路由器 ===========
     // 2. 初始化 smoltcp 的“酒店”
     let mut sockets = SocketSet::new(vec![]);
+
+    let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; 65535]);
+    let tcp_tx_buffer = TcpSocketBuffer::new(vec![0; 65535]);
+    let mut tcp_socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
+    // 为了让它能接客（比如截获我们在终端里发起的 curl 请求），我们需要让它开始监听 (Listen) 特定的端口，比如 HTTP 常用的 80 端口。
+    tcp_socket.listen(80).unwrap();
+    // socket_handle：房间号/把手
+    let socket_handle = sockets.add(tcp_socket);
+
     // 3. 初始化 smoltcp 的“虚拟路由器”
-    let mut config = Config::new(smoltcp::wire::HardwareAddress::Ip);
+    let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
     // 这里传入了包装好的 &mut device
     let mut iface = Interface::new(config, &mut device, smoltcp::time::Instant::now());
 
@@ -48,6 +58,24 @@ pub async fn start_tun_proxy() {
                     // ❓ 任务 2: 异步调用 device 的发货方法，把 smoltcp 产生的回包真正发给网卡
                     // 提示: 这是一个 async 方法，别忘了 .await 和错误处理 (比如 .unwrap())
                     device.flush_tx().await.unwrap();
+
+                    // 🌟 查房时机 1：网卡收到新包并处理完后
+                    // ❓ 任务：在这里写代码查房
+                    let mut tcp_socket = sockets.get_mut::<TcpSocket>(socket_handle);
+                    // 询问是否有数据,检查接收缓冲区里有没有新鲜出炉的数据。
+                    if tcp_socket.can_recv() {
+                        // recv() 它会把缓冲区里的数据作为一个切片 data: &[u8] 传给你的闭包（闭包就是 { ... } 里的代码块）。
+                        tcp_socket.recv(|data|{
+                            println!("Received: {:?}", data);
+                            // ❓ 任务：将 data (它是 &[u8] 字节切片) 转换为 UTF-8 字符串并打印出来。
+                            // 提示：你可以使用 std::str::from_utf8(data) 来尝试转换。
+                            let utf8_str = std::str::from_utf8(data).unwrap_or("Invalid UTF-8 data");
+                            println!("Received UTF-8: {}", utf8_str);
+
+                            // 告诉 smoltcp 我们处理完了所有数据，把它从缓冲区里清空
+                            (data.len(),())
+                        }).unwrap();
+                    }
                 }
             }
             // 分支 2: 时钟滴答，处理超时重传等后台任务
@@ -56,6 +84,23 @@ pub async fn start_tun_proxy() {
                 // ❓ 任务 3: 这里需要做和上面完全一样的推进和发货操作
                 iface.poll(timestamp, &mut device, &mut sockets);
                 device.flush_tx().await.unwrap();
+
+                // 🌟 查房时机 2：时钟滴答，处理完后台任务后
+                // ❓ 任务：在这里写同样的查房代码，看看是否有新的包需要处理
+                let mut tcp_socket = sockets.get_mut::<TcpSocket>(socket_handle);
+                // 询问是否有数据,检查接收缓冲区里有没有新鲜出炉的数据。
+                if tcp_socket.can_recv() {
+                    // recv() 它会把缓冲区里的数据作为一个切片 data: &[u8] 传给你的闭包（闭包就是 { ... } 里的代码块）。
+                    tcp_socket.recv(|data|{
+                        println!("Received: {:?}", data);
+                        // ❓ 任务：将 data (它是 &[u8] 字节切片) 转换为 UTF-8 字符串并打印出来。
+                        // 提示：你可以使用 std::str::from_utf8(data) 来尝试转换。
+                        let utf8_str = std::str::from_utf8(data).unwrap_or("Invalid UTF-8 data");
+                        println!("Received UTF-8: {}", utf8_str);
+                            // 告诉 smoltcp 我们处理完了所有数据，把它从缓冲区里清空
+                        (data.len(),())
+                    }).unwrap();
+                }
             }
         }
     }

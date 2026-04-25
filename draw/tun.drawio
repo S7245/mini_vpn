@@ -1,9 +1,23 @@
 <mxfile host="65bd71144e">
     <diagram id="SK4-CPsVokxL4LTUJP4q" name="第 1 页">
-        <mxGraphModel dx="2701" dy="1525" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0">
+        <mxGraphModel dx="2026" dy="1144" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0">
             <root>
                 <mxCell id="0"/>
                 <mxCell id="1" parent="0"/>
+                <mxCell id="199" style="edgeStyle=none;html=1;" edge="1" parent="1" source="196" target="191">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="200" value="住满了" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" vertex="1" connectable="0" parent="199">
+                    <mxGeometry x="-0.1696" y="-1" relative="1" as="geometry">
+                        <mxPoint as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="196" value="包数据" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;" vertex="1" parent="1">
+                    <mxGeometry x="2670" y="1800" width="330" height="120" as="geometry"/>
+                </mxCell>
+                <mxCell id="198" value="包数据" style="rounded=1;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                    <mxGeometry x="2710" y="1840" width="120" height="60" as="geometry"/>
+                </mxCell>
                 <mxCell id="148" value="&lt;span style=&quot;color: rgb(0, 0, 0); text-wrap-mode: wrap; background-color: rgb(251, 251, 251);&quot;&gt;can_recv&lt;/span&gt;" style="edgeStyle=none;html=1;fontFamily=Helvetica;fontSize=12;fontColor=default;" parent="1" source="145" target="147" edge="1">
                     <mxGeometry x="-0.004" relative="1" as="geometry">
                         <mxPoint as="offset"/>
@@ -303,11 +317,53 @@
                 <mxCell id="172" value="smoltcp" style="rounded=1;whiteSpace=wrap;html=1;" parent="1" vertex="1">
                     <mxGeometry x="2700" y="920" width="120" height="60" as="geometry"/>
                 </mxCell>
-                <mxCell id="174" value="ping&amp;nbsp;" style="rounded=1;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                <mxCell id="174" value="ping&amp;nbsp;" style="rounded=1;whiteSpace=wrap;html=1;" parent="1" vertex="1">
                     <mxGeometry x="1440" y="1760" width="120" height="60" as="geometry"/>
                 </mxCell>
-                <mxCell id="176" value="smoltcp" style="rounded=1;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                <mxCell id="176" value="smoltcp" style="rounded=1;whiteSpace=wrap;html=1;" parent="1" vertex="1">
                     <mxGeometry x="1239" y="1760" width="120" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="189" value="登记入住" style="edgeStyle=none;html=1;" edge="1" parent="1" source="182" target="188">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="182" value="SocketHandle-1(房间号/把手)" style="swimlane;childLayout=stackLayout;horizontal=1;fillColor=none;horizontalStack=1;resizeParent=1;resizeParentMax=0;resizeLast=0;collapsible=0;strokeColor=none;stackBorder=10;stackSpacing=-12;resizable=1;align=center;points=[];whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                    <mxGeometry x="2440" y="1160" width="424" height="100" as="geometry"/>
+                </mxCell>
+                <mxCell id="183" value="GET / HTTP/1.1" style="shape=step;perimeter=stepPerimeter;fixedSize=1;points=[];whiteSpace=wrap;html=1;" vertex="1" parent="182">
+                    <mxGeometry x="10" y="33" width="140" height="57" as="geometry"/>
+                </mxCell>
+                <mxCell id="184" value="&lt;span style=&quot;color: rgb(0, 0, 0);&quot;&gt;TCP/UDP&amp;nbsp;&lt;/span&gt;" style="shape=step;perimeter=stepPerimeter;fixedSize=1;points=[];whiteSpace=wrap;html=1;" vertex="1" parent="182">
+                    <mxGeometry x="138" y="33" width="100" height="57" as="geometry"/>
+                </mxCell>
+                <mxCell id="185" value="&lt;span style=&quot;color: rgb(0, 0, 0);&quot;&gt;Socket&lt;/span&gt;" style="shape=step;perimeter=stepPerimeter;fixedSize=1;points=[];whiteSpace=wrap;html=1;" vertex="1" parent="182">
+                    <mxGeometry x="226" y="33" width="100" height="57" as="geometry"/>
+                </mxCell>
+                <mxCell id="186" value="SocketSet" style="shape=step;perimeter=stepPerimeter;fixedSize=1;points=[];whiteSpace=wrap;html=1;" vertex="1" parent="182">
+                    <mxGeometry x="314" y="33" width="100" height="57" as="geometry"/>
+                </mxCell>
+                <mxCell id="187" value="" style="whiteSpace=wrap;html=1;rounded=1;" vertex="1" parent="1">
+                    <mxGeometry x="2940" y="920" width="120" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="188" value="sockets" style="whiteSpace=wrap;html=1;rounded=1;" vertex="1" parent="1">
+                    <mxGeometry x="3020" y="1190" width="120" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="190" value="&lt;div&gt;&lt;span style=&quot;color: rgb(0, 0, 0);&quot;&gt;sockets 酒店&lt;/span&gt;&lt;/div&gt;let mut sockets = SocketSet::new(vec![]);" style="whiteSpace=wrap;html=1;rounded=1;verticalAlign=top;" vertex="1" parent="1">
+                    <mxGeometry x="2650" y="1390" width="400" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="192" value="1. 创建房间，并且只服务指定渠道客户（80）&lt;div&gt;2. add 入住酒店&lt;br&gt;&lt;span style=&quot;color: rgb(63, 63, 63); background-color: light-dark(#ffffff, var(--ge-dark-color, #121212));&quot;&gt;3.&amp;nbsp;socket_handle 房卡&lt;/span&gt;&lt;/div&gt;" style="edgeStyle=none;html=1;" edge="1" parent="1" source="191" target="190">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="191" value="&lt;div&gt;----&lt;/div&gt;&lt;div&gt;TCP客房&lt;/div&gt;&lt;div&gt;----&lt;/div&gt;    let rx_buffer = TcpSocketBuffer::new(vec![0; 65535]);&lt;br&gt;    let tx_buffer = TcpSocketBuffer::new(vec![0; 65535]);&lt;br&gt;    let tcp_socket = TcpSocket::new(rx_buffer, tx_buffer);&lt;br&gt;tcp_socket.listen(80).unwrap();&amp;nbsp;&lt;br&gt;&lt;br&gt;// socket_handle：房间号/把手&lt;br&gt;    let socket_handle = sockets.add(tcp_socket);" style="whiteSpace=wrap;html=1;rounded=1;verticalAlign=top;" vertex="1" parent="1">
+                    <mxGeometry x="2650" y="1550" width="400" height="180" as="geometry"/>
+                </mxCell>
+                <mxCell id="194" value="    let rx_buffer = TcpSocketBuffer::new(vec![0; 65535]);&#xa;    let tx_buffer = TcpSocketBuffer::new(vec![0; 65535]);&#xa;    let tcp_socket = TcpSocket::new(rx_buffer, tx_buffer);&#xa;    // socket_handle：房间号/把手&#xa;    let socket_handle = sockets.add(tcp_socket);" style="whiteSpace=wrap;html=1;rounded=1;verticalAlign=top;" vertex="1" parent="1">
+                    <mxGeometry x="3160" y="1575" width="400" height="100" as="geometry"/>
+                </mxCell>
+                <mxCell id="195" value="..." style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;" vertex="1" parent="1">
+                    <mxGeometry x="3060" y="1590" width="60" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="197" value="&lt;span style=&quot;color: rgb(0, 0, 0);&quot;&gt;包数据&lt;/span&gt;" style="rounded=1;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                    <mxGeometry x="2840" y="1840" width="120" height="60" as="geometry"/>
                 </mxCell>
             </root>
         </mxGraphModel>

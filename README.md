@@ -9,8 +9,13 @@
 - 这是我输出的关键代码片段：
 
 ```rust
-// expected `Vec<u8>`, found `BytesMut`
-TunRxToken { buffer },
+#[cfg(target_os = "macos")]
+{
+    let mut framed = Vec::with_capacity(UTUN_IPV4_HEADER.len() + packet.len());
+    // 💥 糟糕！我们在这里又套了一层 PI 头！
+    framed.extend_from_slice(&packet);
+    self.device.write_all(&framed).await?;
+}
 ```
 
 ----
@@ -89,3 +94,8 @@ sequenceDiagram
 - 安全与合规：现阶段主要是本机 utun 调试，权限边界是 sudo cargo run ；后续若做产品化，建议切到 Network Extension 支持路径。
 - 潜在瓶颈：当前热路径里有 read -> Vec::to_vec -> smoltcp -> Vec 的额外拷贝， read/write 是 syscall 热点；但你这次“完全收不到包”的主因不是性能，而是接入语义错了。
 - 
+
+```sh
+# 这是客户端收到的包：
+[0, 0, 2, 69, 0, 0, 64, 0, 0, 64, 0, 64, 6, 38, 182, 10, 0, 0, 1, 10, 0, 0, 2, 231, 18, 0, 80, 143, 245, 2, 232, 0, 0, 0, 0, 176, 194, 255, 255, 134, 216, 0, 0, 2, 4, 5, 180, 1, 3, 3, 6, 1, 1, 8, 10, 212, 185, 76, 103, 0, 0, 0, 0, 4, 2, 0, 0]
+```

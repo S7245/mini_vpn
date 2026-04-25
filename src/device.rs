@@ -1,4 +1,3 @@
-use futures::sink::Buffer;
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use std::collections::VecDeque;
 use tokio::io::{AsyncReadExt, AsyncWriteExt}; // ⚠️ 极其重要：引入异步读写魔法
@@ -74,7 +73,7 @@ impl VirtualTunDevice {
             #[cfg(target_os = "macos")]
             {
                 let mut framed = Vec::with_capacity(UTUN_IPV4_HEADER.len() + packet.len());
-                framed.extend_from_slice(&UTUN_IPV4_HEADER);
+                //error: framed.extend_from_slice(&UTUN_IPV4_HEADER);
                 framed.extend_from_slice(&packet);
                 self.device.write_all(&framed).await?;
             }
@@ -121,6 +120,7 @@ pub struct TunTxToken<'a> {
     queue: &'a mut VecDeque<BytesMut>,
 }
 
+// “造箱子”：在发货仓库里造一个指定大小的箱子，准备把真实数据写进去
 impl<'a> TxToken for TunTxToken<'a> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
@@ -165,8 +165,14 @@ impl Device for VirtualTunDevice {
         let mut caps = DeviceCapabilities::default();
         caps.max_transmission_unit = 1500; // 标准网卡 MTU
         caps.medium = Medium::Ip; // 我们处理的是纯 IP 包 (三层)，不是以太网帧 (二层)
-        
-        // println!("设备能力：{:?}", caps);
+
+        // 🌟 新增：解决操作系统校验和卸载问题
+        let mut cs = smoltcp::phy::ChecksumCapabilities::default();
+        // 设置为 Tx 表示：接收 (Rx) 时不检查校验和，但发送 (Tx) 时强制计算校验和
+        cs.tcp = smoltcp::phy::Checksum::Tx;
+        cs.ipv4 = smoltcp::phy::Checksum::Tx;
+        cs.icmpv4 = smoltcp::phy::Checksum::Tx;
+        caps.checksum = cs;
 
         caps
     }
