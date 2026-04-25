@@ -9,18 +9,11 @@
 - 这是我输出的关键代码片段：
 
 ```rust
-async fn main() {
-    let mode = std::env::args()
-        .nth(1)
-        .expect("请指定运行模式: client 或 server");
-
-    if mode == "server" {
-        server::run().await;
-    } else if mode == "client" {
-        client::start_tun_proxy().await;
-    }
-}
+// expected `Vec<u8>`, found `BytesMut`
+TunRxToken { buffer },
 ```
+
+----
 
 但是 `tokio::select! {}` 是显示报错；`This will prevent proc-macro expansion from working. Please consider updating your rust-analyzer to ensure compatibility with your current toolchain.`
 

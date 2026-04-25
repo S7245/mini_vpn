@@ -1,6 +1,8 @@
+use futures::sink::Buffer;
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use std::collections::VecDeque;
 use tokio::io::{AsyncReadExt, AsyncWriteExt}; // ⚠️ 极其重要：引入异步读写魔法
+use bytes::BytesMut;
 
 // 条件编译宏。这意味着如果在 Linux 系统上编译这段代码，编译器会自动忽略 PI 头逻辑，直接按标准处理。
 #[cfg(target_os = "macos")]
@@ -10,9 +12,9 @@ const UTUN_IPV4_HEADER: [u8; 4] = [0, 0, 0, 2];
 pub struct VirtualTunDevice {
     pub device: tun::AsyncDevice,
     /// 收货仓库：存放刚从网卡读出来、还没被 smoltcp 吃掉的一个完整 IP 包
-    pub rx_buffer: Option<Vec<u8>>,
+    pub rx_buffer: Option<BytesMut>,
     /// 发货仓库：存放 smoltcp 已经打包好、排队等待发给物理网卡的 IP 包队列
-    pub tx_queue: VecDeque<Vec<u8>>,
+    pub tx_queue: VecDeque<BytesMut>,
 }
 
 // 让我们稍微打磨一下这个基础结构体，顺便给它加上一个创建实例的关联函数：
@@ -30,11 +32,12 @@ impl VirtualTunDevice {
     // 当这个方法(wait_for_rx())被 .await 唤醒时，说明底层的 tun0 网卡来数据包了，我们需要把它读出来，存进 rx_buffer 这个“收货仓库”里，准备等下喂给 smoltcp。
     /// 异步进货：等待物理网卡吐出数据，存入 rx_buffer
     pub async fn wait_for_rx(&mut self) -> std::io::Result<()> {
+        
         // macOS utun raw read/write 总是带 4 字节 packet information 头。
         #[cfg(target_os = "macos")]
-        let mut buf = [0u8; 1504];
+        let mut buf = BytesMut::zeroed(1504);
         #[cfg(not(target_os = "macos"))]
-        let mut buf = [0u8; 1500];
+        let mut buf = BytesMut::zeroed(1500);
 
         // 2. 异步等待网卡吐出数据，并拿到读取的字节数 (n)
         let n = self.device.read(&mut buf).await?;
@@ -47,12 +50,14 @@ impl VirtualTunDevice {
                     "short utun packet",
                 ));
             }
-            self.rx_buffer = Some(buf[UTUN_IPV4_HEADER.len()..n].to_vec());
+            buf.truncate(n);
+            self.rx_buffer = Some(buf.split_off(UTUN_IPV4_HEADER.len()));
         }
 
         #[cfg(not(target_os = "macos"))]
         {
-            self.rx_buffer = Some(buf[..n].to_vec());
+            buf.truncate(n);
+            self.rx_buffer = Some(buf.advance(n));
         }
 
         Ok(())
@@ -95,7 +100,7 @@ impl VirtualTunDevice {
 
 /// 收货单：保管从 rx_buffer 拿出来的包裹
 pub struct TunRxToken {
-    buffer: Vec<u8>,
+    buffer: BytesMut,
 }
 
 impl RxToken for TunRxToken {
@@ -113,7 +118,7 @@ impl RxToken for TunRxToken {
 
 /// 发货单：持有发货仓库的可变钥匙
 pub struct TunTxToken<'a> {
-    queue: &'a mut VecDeque<Vec<u8>>,
+    queue: &'a mut VecDeque<BytesMut>,
 }
 
 impl<'a> TxToken for TunTxToken<'a> {
@@ -121,18 +126,33 @@ impl<'a> TxToken for TunTxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        println!("发货单-TxToken:{:?}", len);
-        // 1. 按 smoltcp 要求的长度，造一个填满 0 的新箱子
-        // 1. 造一个指定大小的空箱子
-        let mut buffer = vec![0u8; len];
-        // 2. 把箱子交给闭包 f，smoltcp 会把真实的 IP 数据写进去
-        // 2. 让 smoltcp 把真实数据填进去
-        let result = f(&mut buffer);
-        // 3. 箱子装满了！现在把它塞进发货队列的尾部
-        // 3. 扔进发货队列排队
-        self.queue.push_back(buffer);
-        // 4. 返回执行结果
-        result
+        #[cfg(target_os = "macos")]
+        {
+            // 1. 造一个多出 4 字节的箱子
+            let mut buffer = BytesMut::zeroed(4 + len);
+            // 2. 提前把 PI 头印在箱子的最前面
+            buffer[0..4].copy_from_slice(&[0, 0, 0, 2]);
+            // 3. 接下来该让 smoltcp 填数据了
+            // ❓ 任务：既然前 4 个字节已经被占用了，你应该如何写，才能把 buffer 中从索引 4 开始到最后的“剩余部分”，作为可变切片传给闭包 f 呢？
+            let result = f(&mut buffer[4..]);
+            self.queue.push_back(buffer);
+            result
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            println!("发货单-TxToken:{:?}", len);
+            // 1. 按 smoltcp 要求的长度，造一个填满 0 的新箱子
+            // 1. 造一个指定大小的空箱子
+            let mut buffer = BytesMut::zeroed(len);
+            // 2. 把箱子交给 f，smoltcp 会把真实的 IP 数据写进去
+            // 2. 让 smoltcp 把真实数据填进去
+            let result = f(&mut buffer);
+            // 3. 箱子装满了！现在把它塞进发货队列的尾部
+            // 3. 扔进发货队列排队
+            self.queue.push_back(buffer);
+            // 4. 返回执行结果
+            result
+        }
     }
 }
 
