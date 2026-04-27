@@ -8,13 +8,50 @@
 
 - 这是我输出的关键代码片段：
 
+```
+mini_vpn % curl 10.0.0.2:80
+Hello, smoltc%                                                                          
+mini_vpn % 
+```
+
 ```rust
-#[cfg(target_os = "macos")]
-{
-    let mut framed = Vec::with_capacity(UTUN_IPV4_HEADER.len() + packet.len());
-    // 💥 糟糕！我们在这里又套了一层 PI 头！
-    framed.extend_from_slice(&packet);
-    self.device.write_all(&framed).await?;
+res = device.wait_for_rx() =>{
+    if res.is_ok(){
+        // ...
+        if tcp_socket.can_recv() {
+            tcp_socket.recv(|data|{
+                println!("Received: {:?}", data);
+                let utf8_str = std::str::from_utf8(data).unwrap_or("Invalid UTF-8 data");
+                println!("Received UTF-8: {}", utf8_str);
+                (data.len(),())
+            }).unwrap();
+            
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, smoltcp!";
+            tcp_socket.send(|data| {
+                data.copy_from_slice(response);
+                (response.len(),())
+            }).unwrap();
+            tcp_socket.close();
+        }
+    }
+}
+// 分支 2: 时钟滴答，处理超时重传等后台任务
+_ = timer.tick() =>{
+    //...
+    if tcp_socket.can_recv() {
+        tcp_socket.recv(|data|{
+            println!("Received: {:?}", data);
+            let utf8_str = std::str::from_utf8(data).unwrap_or("Invalid UTF-8 data");
+            println!("Received UTF-8: {}", utf8_str);
+            (data.len(),())
+        }).unwrap();
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, smoltcp!";
+            tcp_socket.send(|data| {
+                data.copy_from_slice(response);
+                (response.len(),())
+            }).unwrap();
+            tcp_socket.close();
+    }
 }
 ```
 

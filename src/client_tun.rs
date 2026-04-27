@@ -75,6 +75,11 @@ pub async fn start_tun_proxy() {
                             // 告诉 smoltcp 我们处理完了所有数据，把它从缓冲区里清空
                             (data.len(),())
                         }).unwrap();
+                        
+                        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, smoltcp!";
+                        // 加上发送这段 response 的代码，并调用 close() 方法关闭连接吗？
+                        tcp_socket.send_slice(response).unwrap();
+                        tcp_socket.close();
                     }
                 }
             }
@@ -100,6 +105,11 @@ pub async fn start_tun_proxy() {
                             // 告诉 smoltcp 我们处理完了所有数据，把它从缓冲区里清空
                         (data.len(),())
                     }).unwrap();
+
+                    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, smoltcp!";
+                        // 加上发送这段 response 的代码，并调用 close() 方法关闭连接吗？
+                    tcp_socket.send_slice(response).unwrap();
+                    tcp_socket.close();
                 }
             }
         }

@@ -70,18 +70,8 @@ impl VirtualTunDevice {
         // // 3. 返回成功
         // Ok(())
         while let Some(packet) = self.tx_queue.pop_front() {
-            #[cfg(target_os = "macos")]
-            {
-                let mut framed = Vec::with_capacity(UTUN_IPV4_HEADER.len() + packet.len());
-                //error: framed.extend_from_slice(&UTUN_IPV4_HEADER);
-                framed.extend_from_slice(&packet);
-                self.device.write_all(&framed).await?;
-            }
-
-            #[cfg(not(target_os = "macos"))]
-            {
-                self.device.write_all(&packet).await?;
-            }
+            // 无论是 macOS 还是 Linux，发货仓库里的包已经是完美形态了，直接发！
+            self.device.write_all(&packet).await?;
         }
         Ok(())
     }
