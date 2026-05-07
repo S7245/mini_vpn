@@ -14,7 +14,6 @@ use std::io::BufReader;
 use std::sync::Arc;
 use tokio_rustls::rustls::Certificate;
 
-
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
@@ -114,8 +113,9 @@ pub async fn start_tun_proxy() {
                 // 2. 检查 payload 是否为空。
                 // 如果为空，说明服务端关闭了连接，我们需要关闭这个 Socket 并从 active_connections 中移除。
                 if payload.is_empty() {
-                    tcp_socket.close();
+                    tcp_socket.abort();
                     active_connections.remove(&handle);
+                    tcp_socket.listen(80).unwrap();
                 } else {
                     // 2. 将 payload 塞进这个 Socket 的发送缓冲区里。
                     tcp_socket.send_slice(&payload).unwrap();
