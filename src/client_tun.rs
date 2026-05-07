@@ -109,7 +109,7 @@ pub async fn start_tun_proxy() {
                 println!("📬 从大邮筒收到 {} 字节数据，准备送往房间 {:?}", payload.len(), handle);
                 // ❓ 任务：
                 // 1. 从 sockets 集合中，获取这个 handle 对应的 TcpSocket 可变引用。
-                let mut tcp_socket = sockets.get_mut::<TcpSocket>(handle);
+                let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
                 // 2. 检查 payload 是否为空。
                 // 如果为空，说明服务端关闭了连接，我们需要关闭这个 Socket 并从 active_connections 中移除。
                 if payload.is_empty() {
@@ -147,7 +147,7 @@ pub async fn start_tun_proxy() {
 
                     // 🌟 查房时机 1：网卡收到新包并处理完后
                     // ❓ 任务：在这里写代码查房
-                    let mut tcp_socket = sockets.get_mut::<TcpSocket>(socket_handle);
+                    let tcp_socket = sockets.get_mut::<TcpSocket>(socket_handle);
                     // 询问是否有数据,检查接收缓冲区里有没有新鲜出炉的数据。
                     if tcp_socket.can_recv() {
                         // 1. 在闭包外准备一个空的篮子
@@ -163,10 +163,9 @@ pub async fn start_tun_proxy() {
 
                         // 3. 离开闭包结界后，安全地进行异步操作
                         if let Some(payload) = payload {
-                            if active_connections.contains_key(&socket_handle) {
-                                let tx = &mut active_connections.get(&socket_handle).unwrap();
+                            if let Some(tx) = active_connections.get_mut(&socket_handle) {
                                 tx.send(payload).await.unwrap();
-                            }else {
+                            } else {
                                 // 1. 创建去程通道 (主循环 -> 车厢)
                                 let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
                                 active_connections.insert(socket_handle, tx.clone());
@@ -258,7 +257,7 @@ pub async fn start_tun_proxy() {
 
                 // 🌟 查房时机 2：时钟滴答，处理完后台任务后
                 // ❓ 任务：在这里写同样的查房代码，看看是否有新的包需要处理
-                let mut tcp_socket = sockets.get_mut::<TcpSocket>(socket_handle);
+                let tcp_socket = sockets.get_mut::<TcpSocket>(socket_handle);
                 // 询问是否有数据,检查接收缓冲区里有没有新鲜出炉的数据。
                 if tcp_socket.can_recv() {
                         // 1. 在闭包外准备一个空的篮子
@@ -274,10 +273,9 @@ pub async fn start_tun_proxy() {
 
                         // 3. 离开闭包结界后，安全地进行异步操作
                         if let Some(payload) = payload {
-                            if active_connections.contains_key(&socket_handle) {
-                                let tx = &mut active_connections.get(&socket_handle).unwrap();
+                            if let Some(tx) = active_connections.get_mut(&socket_handle) {
                                 tx.send(payload).await.unwrap();
-                            }else {
+                            } else {
                                 // 1. 创建去程通道 (主循环 -> 车厢)
                                 let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
                                 active_connections.insert(socket_handle, tx.clone());

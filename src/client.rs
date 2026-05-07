@@ -285,7 +285,7 @@ pub async fn run() {
                         return;
                     };
                     // 2. 此时的服务端还不知道我们要去哪。我们需要设计一个极其简单的自定义通信协议：将目标地址拼接上一个换行符 `\n`，发送给服务端。
-                    match tokio_yamux_stream.write_all(format!("UDP\n").as_bytes()).await {
+                    match tokio_yamux_stream.write_all(b"UDP\n").await {
                         Ok(_) => {}
                         Err(e) => {
                             println!("写入目标地址失败: {e}");
@@ -347,9 +347,7 @@ pub async fn run() {
                         }
                     }
                 }
-                _ => {
-                    return;
-                }
+                _ => {}
             }
         });
     }
