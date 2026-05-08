@@ -24,30 +24,51 @@ const TCP_SOCKET_BUFFER_SIZE: usize = 65_535;
 const RELAY_CHANNEL_CAPACITY: usize = 1024;
 const DEFAULT_TUN_POOL_SIZE: usize = 4;
 
+/// Describes how many local TCP listener slots the TUN runtime should create.
+/// 中文要点：这是监听池的蓝图，不代表连接本身，只描述“开几间房、监听哪个端口”。
 #[derive(Debug, Clone, Copy)]
 struct ListenerSpec {
+    /// Local TCP port intercepted on the TUN-side smoltcp stack.
+    /// 中文要点：这是虚拟网卡内侧被 smoltcp 截获的本地端口。
     local_port: u16,
+    /// Number of independent listener slots created for the same local port.
+    /// 中文要点：用多个监听槽位模拟 backlog，避免单 socket 退房时堵住后续连接。
     pool_size: usize,
 }
 
+/// Explicit lifecycle state for one listener slot.
+/// 中文要点：每个 handle 都要有自己的状态，避免“一个槽位出错、全局都混乱”。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SocketState {
+    /// Ready to accept a new intercepted local TCP session.
     Listening,
+    /// Opening the remote Yamux substream for the first local payload.
     OpeningRemote,
+    /// Local and remote sides are actively relaying payloads.
     Relaying,
+    /// The current slot is closing after EOF or transport failure.
     Closing,
+    /// The slot is re-entering the listening state after cleanup.
     Rearming,
 }
 
+/// Per-handle runtime context owned by a single listener slot.
+/// 中文要点：这是“房间上下文”，每个 handle 都有一份，专门存本槽位的状态和上行通道。
 #[derive(Debug)]
 struct SocketCtx {
+    /// The local port that must be re-listened after this slot is rearmed.
     local_port: u16,
+    /// Current lifecycle state for this listener slot.
     state: SocketState,
+    /// Default remote target used by the current TCP-over-TUN demo path.
     target: TargetAddr,
+    /// Sender used to push local payloads into the remote relay task for this slot only.
     uplink_tx: Option<mpsc::Sender<Vec<u8>>>,
 }
 
 impl SocketCtx {
+    /// Create the initial per-slot runtime context.
+    /// 中文要点：每个新建的监听槽位一开始都处于 Listening，没有绑定上行通道。
     fn new(local_port: u16, target: TargetAddr) -> Self {
         Self {
             local_port,
@@ -58,6 +79,8 @@ impl SocketCtx {
     }
 }
 
+/// Holds every smoltcp listener handle that belongs to the same logical local port pool.
+/// 中文要点：后续主循环只遍历这个池，而不是盯着单个裸 `socket_handle`。
 #[derive(Debug)]
 struct ListenerPool {
     spec: ListenerSpec,
@@ -231,6 +254,8 @@ pub async fn start_tun_proxy() {
     }
 }
 
+/// Allocate a fresh smoltcp TCP listener socket for one pool slot.
+/// 中文要点：每次调用都创建一间独立房间，并立即挂上 listen 牌子。
 fn build_listener_socket(spec: &ListenerSpec) -> TcpSocket<'static> {
     let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; TCP_SOCKET_BUFFER_SIZE]);
     let tcp_tx_buffer = TcpSocketBuffer::new(vec![0; TCP_SOCKET_BUFFER_SIZE]);
@@ -269,6 +294,8 @@ fn build_listener_pool(
     )
 }
 
+/// Drain the currently available local payload from one listener slot.
+/// 中文要点：这里只负责把 smoltcp 缓冲区里的数据取出来，不做任何异步外联动作。
 fn extract_socket_payload(socket: &mut TcpSocket<'_>) -> Option<Vec<u8>> {
     if !socket.can_recv() {
         return None;
@@ -284,6 +311,8 @@ fn extract_socket_payload(socket: &mut TcpSocket<'_>) -> Option<Vec<u8>> {
     payload
 }
 
+/// Reset a slot back into the listening state after the current relay ends.
+/// 中文要点：单个 handle 退房只影响自己，不能误清理其他房间的状态。
 fn rearm_socket(socket: &mut TcpSocket<'_>, ctx: &mut SocketCtx) {
     ctx.state = SocketState::Closing;
     socket.abort();
@@ -291,8 +320,11 @@ fn rearm_socket(socket: &mut TcpSocket<'_>, ctx: &mut SocketCtx) {
     ctx.state = SocketState::Rearming;
     socket.listen(ctx.local_port).unwrap();
     ctx.state = SocketState::Listening;
+    println!("♻️ handle slot rearmed on local port {}", ctx.local_port);
 }
 
+/// Process one listener slot after iface polling.
+/// 中文要点：主循环只负责遍历 handle，真正的房间处理逻辑都收口在这里。
 async fn process_listener_activity(
     handle: SocketHandle,
     sockets: &mut SocketSet<'_>,
@@ -324,6 +356,7 @@ async fn handle_local_payload(
     };
 
     if let Some(tx) = ctx.uplink_tx.as_mut() {
+        println!("🔄 handle {:?} entering {:?}", handle, ctx.state);
         tx.send(payload)
             .await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "本地中继通道已关闭"))?;
@@ -332,10 +365,12 @@ async fn handle_local_payload(
     }
 
     ctx.state = SocketState::OpeningRemote;
+    println!("🔄 handle {:?} entering {:?}", handle, ctx.state);
     let request = RelayRequest::Tcp {
         target: ctx.target.clone(),
     };
     let stream = open_remote_session(ctrl, &request).await?;
+    println!("🚪 handle {:?} remote session opened", handle);
 
     let (tx, rx) = tokio::sync::mpsc::channel(RELAY_CHANNEL_CAPACITY);
     tx.send(payload)
@@ -363,6 +398,7 @@ async fn handle_remote_payload(
     };
 
     if payload.is_empty() {
+        println!("🔄 handle {:?} entering {:?}", handle, SocketState::Closing);
         rearm_socket(tcp_socket, ctx);
         return Ok(());
     }
@@ -469,5 +505,27 @@ mod tests {
             .handles
             .iter()
             .all(|handle| socket_ctxs.contains_key(handle)));
+    }
+
+    #[test]
+    fn rearm_socket_restores_listening_state_and_clears_sender() {
+        let spec = ListenerSpec {
+            local_port: 80,
+            pool_size: 1,
+        };
+        let default_target = TargetAddr::parse("httpbin.org:80").expect("target should parse");
+        let mut socket = build_listener_socket(&spec);
+        let (tx, _rx) = mpsc::channel(1);
+        let mut ctx = SocketCtx {
+            local_port: 80,
+            state: SocketState::Relaying,
+            target: default_target,
+            uplink_tx: Some(tx),
+        };
+
+        rearm_socket(&mut socket, &mut ctx);
+
+        assert_eq!(ctx.state, SocketState::Listening);
+        assert!(ctx.uplink_tx.is_none());
     }
 }
