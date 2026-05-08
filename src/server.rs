@@ -1,6 +1,7 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use mini_vpn::shared::{RelayRequest, read_relay_request};
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
@@ -75,74 +76,17 @@ pub async fn run() {
             while let Ok(Some(yamux_stream)) = yamux_conn.next_stream().await {
                 // 为每一个浏览器发来的网页请求，单独开一个微线程处理
                 tokio::spawn(async move {
-                    // ==========================================
-                    // 【你的任务】：把你之前写的逻辑全部搬到这里面来！
-                    //
-                    // 注意：由于 yamux_stream 使用的是 futures 标准，
-                    // 我们需要给它也接上转换插头，转回 tokio 标准，才能使用我们熟悉的 read_exact：
-                    // let mut tokio_yamux_stream = yamux_stream.compat();
-                    //
-                    // 1. 从 tokio_yamux_stream 验证 38 字节的 HTTP 暗号门神
-                    // 2. 从 tokio_yamux_stream 读取 \n 结尾的目标地址
-                    // 3. 连接目标网站 target_stream
-                    // 4. copy_bidirectional(&mut tokio_yamux_stream, &mut target_stream).await;
-                    // ==========================================
-
                     let mut tokio_yamux_stream = yamux_stream.compat();
-
-                    // ================= 六、服务器 (Server) 的暗号验证 =========================
-                    // 6.1. 准备一个正好 40 字节的数组作为“篮子”
-                    let mut magic_buf = [0u8; 38];
-                    // 6.2. 尝试从 stream 中严格读取 40 个字节 (提示: 使用 read_exact)
-                    // 如果这里读取失败 (比如 GFW 只发了 10 个字节探测包)，使用 match 处理 Result，遇到 Err 直接 return;
-                    match tokio_yamux_stream.read_exact(&mut magic_buf).await {
-                        Ok(_) => {}
+                    let request = match read_relay_request(&mut tokio_yamux_stream).await {
+                        Ok(request) => request,
                         Err(e) => {
-                            println!("读取暗号失败: {e:?}");
+                            println!("读取共享中继请求失败: {e}");
                             return;
                         }
                     };
 
-                    // 6.3. 校验暗号：如果读到的 magic_buf 不是我们的 fake_header
-                    if &magic_buf != b"GET / HTTP/1.1\r\nHost: www.bing.com\r\n\r\n" {
-                        println!("遭遇主动探测或未知连接，静默断开！");
-                        // 提示：直接结束当前的 spawn 任务，装死
-                        return;
-                    }
-
-                    // 6.4. 暗号正确！继续执行原本读取目标地址的代码...
-                    // ==========================================
-
-                    // 2. 在 spawn 内部，准备一个空的动态数组 let mut addr_bytes = Vec::new();，用来存放读到的地址字节。
-                    let mut addr_bytes = Vec::new();
-                    // 3. 写一个无限循环 loop，每次准备一个 1 字节的缓冲区 let mut byte = [0u8; 1];。
-                    // 4. 使用 stream.read_exact(&mut byte).await.unwrap(); 读取这 1 个字节。
-                    // 5. 判断：如果 byte[0] == b'\n'，就可以 break; 跳出读取循环了。否则，把读到的字节推进数组：addr_bytes.push(byte[0]);。
-                    loop {
-                        let mut byte = [0u8; 1];
-                        match tokio_yamux_stream.read_exact(&mut byte).await {
-                            Ok(_) => {}
-                            Err(e) => {
-                                println!("读取目标地址失败: {e:?}");
-                                return;
-                            }
-                        };
-                        if byte[0] == b'\n' {
-                            break;
-                        }
-                        addr_bytes.push(byte[0]);
-                    }
-                    // 6. 循环结束后，将读到的字节转换为字符串：let target_addr = String::from_utf8(addr_bytes).unwrap();。
-                    let target_addr = match String::from_utf8(addr_bytes) {
-                        Ok(addr) => addr,
-                        Err(e) => {
-                            println!("解析目标地址失败: {e:?}");
-                            return;
-                        }
-                    };
-                    println!("解析出的目标地址是: {target_addr}");
-
-                    if target_addr == "UDP" {
+                    match request {
+                        RelayRequest::Udp { .. } => {
                         println!("🌟 收到 UDP 代理指令，切换为 UDP 中继模式！");
                         // 准备一个服务端的 UDP 端口，用来和真实的互联网（如 8.8.8.8）通信
                         let server_udp = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
@@ -265,7 +209,10 @@ pub async fn run() {
                                 }
                             }
                         }
-                    } else {
+                        }
+                        RelayRequest::Tcp { target } => {
+                        let target_addr = target.to_wire_string();
+                        println!("解析出的目标地址是: {target_addr}");
                         // 🌐 原本的 TCP 处理逻辑保持不变
                         // 7. 最后，像之前一样，连接 target_addr，并开启 copy_bidirectional。
                         let mut target_stream = match TcpStream::connect(&target_addr).await {
@@ -280,6 +227,7 @@ pub async fn run() {
                             &mut target_stream,
                         )
                         .await;
+                        }
                     }
                 });
             }

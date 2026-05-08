@@ -1,11 +1,9 @@
 use crate::shared::{ClientError, TargetAddr};
 use tokio::io::{
-    AsyncBufReadExt,
     AsyncRead,
     AsyncReadExt,
     AsyncWrite,
     AsyncWriteExt,
-    BufReader,
 };
 
 pub const FAKE_HTTP_HEADER: &[u8; 38] = b"GET / HTTP/1.1\r\nHost: www.bing.com\r\n\r\n";
@@ -57,17 +55,26 @@ where
         ));
     }
 
-    let mut buffered = BufReader::new(reader);
-    let mut line = String::new();
-    let bytes_read = buffered.read_line(&mut line).await?;
+    let mut line_bytes = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        let bytes_read = reader.read(&mut byte).await?;
 
-    if bytes_read == 0 {
-        return Err(ClientError::InvalidRelayRequest(
-            "empty relay request".to_string(),
-        ));
+        if bytes_read == 0 {
+            return Err(ClientError::InvalidRelayRequest(
+                "empty relay request".to_string(),
+            ));
+        }
+
+        if byte[0] == b'\n' {
+            break;
+        }
+
+        line_bytes.push(byte[0]);
     }
 
-    let line = line.trim_end_matches('\n').trim_end_matches('\r');
+    let line = String::from_utf8(line_bytes)?;
+    let line = line.trim_end_matches('\r');
 
     if line == "UDP" {
         return Ok(RelayRequest::Udp { target: None });

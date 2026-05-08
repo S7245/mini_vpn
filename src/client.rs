@@ -1,6 +1,7 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use mini_vpn::shared::{ClientError, RelayRequest, TargetAddr, open_remote_session};
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
-use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+use tokio_util::compat::TokioAsyncReadCompatExt;
 use yamux::{Config, Connection, Mode};
 
 pub async fn run() {
@@ -85,7 +86,6 @@ pub async fn run() {
         };
         // 给每一个本地浏览器请求，发一个“遥控器”
         let mut ctrl = ctrl.clone();
-        let _connector = connector.clone();
 
         tokio::spawn(async move {
             // 1. 先只读 2 个字节，获取版本号和方法数量。
@@ -139,106 +139,33 @@ pub async fn run() {
             match req_header[1] {
                 1 => {
                     // TCP 连接
-                    let target_addr = match req_header[3] {
-                        1 => {
-                            // 1. 准备一个 4 字节的数组读取 IP (stream.read_exact)
-                            let mut addr = [0u8; 4];
-                            match stream.read_exact(&mut addr).await {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    println!("读取目标地址失败: {e}");
-                                    return;
-                                }
-                            };
-                            // 2. 准备一个 2 字节的数组读取端口，并用 u16::from_be_bytes 转换
-                            let mut port_buf = [0u8; 2];
-                            match stream.read_exact(&mut port_buf).await {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    println!("读取目标端口失败: {e}");
-                                    return;
-                                }
-                            };
-                            let port = u16::from_be_bytes(port_buf);
-                            // 3. 使用 format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port) 返回字符串
-                            let ipv4_addr =
-                                format!("{}.{}.{}.{}:{}", addr[0], addr[1], addr[2], addr[3], port);
-
-                            ipv4_addr
-                        }
-                        3 => {
-                            // 解析域名 (Domain)
-                            let mut len_buf = [0u8; 1];
-                            match stream.read_exact(&mut len_buf).await {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    println!("读取域名长度失败: {e}");
-                                    return;
-                                }
-                            };
-                            let len = len_buf[0] as usize;
-
-                            let mut domain_buf = vec![0u8; len];
-                            match stream.read_exact(&mut domain_buf).await {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    println!("读取域名失败: {e}");
-                                    return;
-                                }
-                            };
-                            let domain = String::from_utf8_lossy(&domain_buf);
-
-                            let mut port_buf = [0u8; 2];
-                            match stream.read_exact(&mut port_buf).await {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    println!("读取目标端口失败: {e}");
-                                    return;
-                                }
-                            };
-                            let port = u16::from_be_bytes(port_buf);
-
-                            let domain = format!("{domain}:{port}");
-                            domain
-                        }
-                        _ => {
-                            println!("暂不支持的地址类型");
-                            return;
-                        } // _ => return,
-                    };
-                    println!("解析出的目标地址是: {target_addr}");
-
-                    // 当你拿到 target_addr 后，不要再去连 TcpStream 了！
-                    // 而是用遥控器申请打开一节新车厢 (Stream)：
-                    let yamux_stream = match ctrl.open_stream().await {
-                        Ok(s) => s,
+                    let target = match read_socks_target(&mut stream, req_header[3]).await {
+                        Ok(target) => target,
                         Err(e) => {
-                            println!("打开多路复用流失败: {:?}", e);
+                            println!("解析目标地址失败: {e}");
                             return;
                         }
                     };
-                    let mut tokio_yamux_stream = yamux_stream.compat();
+                    println!("解析出的目标地址是: {}", target.to_wire_string());
+
+                    let request = RelayRequest::Tcp { target };
+
+                    // 当你拿到 target 后，不要再去连 TcpStream 了！
+                    // 而是通过共享握手层打开一节已经完成远端协商的车厢。
+                    let mut tokio_yamux_stream =
+                        match open_remote_session(&mut ctrl, &request).await {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            println!("打开远端会话失败: {e}");
+                            return;
+                        }
+                    };
 
                     // 发送成功响应
                     match stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await {
                         Ok(_) => {}
                         Err(e) => {
                             println!("写入成功响应失败: {e}");
-                            return;
-                        }
-                    };
-
-                    // 1.1 发送 faker header 到服务端
-                    let fake_header = b"GET / HTTP/1.1\r\nHost: www.bing.com\r\n\r\n";
-                    if tokio_yamux_stream.write_all(fake_header).await.is_err() {
-                        return;
-                    };
-
-                    // 2. 此时的服务端还不知道我们要去哪。我们需要设计一个极其简单的自定义通信协议：将目标地址拼接上一个换行符 `\n`，发送给服务端。
-                    match tokio_yamux_stream.write_all(format!("{target_addr}\n").as_bytes()).await {
-                        Ok(_) => {}
-                        Err(e) => {
-                            println!("写入目标地址失败: {e}");
                             return;
                         }
                     };
@@ -270,25 +197,12 @@ pub async fn run() {
                         }
                     };
 
-                    // 把申请车厢、发送门神暗号，以及发送 "UDP\n" 指令的代码补上
-                    let yamux_stream = match ctrl.open_stream().await {
-                        Ok(s) => s,
+                    let request = RelayRequest::Udp { target: None };
+                    let mut tokio_yamux_stream =
+                        match open_remote_session(&mut ctrl, &request).await {
+                        Ok(stream) => stream,
                         Err(e) => {
-                            println!("打开多路复用流失败: {:?}", e);
-                            return;
-                        }
-                    };
-                    let mut tokio_yamux_stream = yamux_stream.compat();
-                    // 1.1 发送 faker header 到服务端
-                    let fake_header = b"GET / HTTP/1.1\r\nHost: www.bing.com\r\n\r\n";
-                    if tokio_yamux_stream.write_all(fake_header).await.is_err() {
-                        return;
-                    };
-                    // 2. 此时的服务端还不知道我们要去哪。我们需要设计一个极其简单的自定义通信协议：将目标地址拼接上一个换行符 `\n`，发送给服务端。
-                    match tokio_yamux_stream.write_all(b"UDP\n").await {
-                        Ok(_) => {}
-                        Err(e) => {
-                            println!("写入目标地址失败: {e}");
+                            println!("打开远端 UDP 会话失败: {e}");
                             return;
                         }
                     };
@@ -350,5 +264,45 @@ pub async fn run() {
                 _ => {}
             }
         });
+    }
+}
+
+/// Read and parse a SOCKS5 target address.
+/// 中文要点：根据地址类型，读取 IP 地址或域名，最后解析端口号。
+async fn read_socks_target(
+    stream: &mut TcpStream,
+    address_type: u8,
+) -> Result<TargetAddr, ClientError> {
+    match address_type {
+        1 => {
+            let mut addr = [0u8; 4];
+            stream.read_exact(&mut addr).await?;
+
+            let mut port_buf = [0u8; 2];
+            stream.read_exact(&mut port_buf).await?;
+            let port = u16::from_be_bytes(port_buf);
+
+            Ok(TargetAddr::IpPort(std::net::SocketAddr::from((addr, port))))
+        }
+        3 => {
+            let mut len_buf = [0u8; 1];
+            stream.read_exact(&mut len_buf).await?;
+            let len = len_buf[0] as usize;
+
+            let mut domain_buf = vec![0u8; len];
+            stream.read_exact(&mut domain_buf).await?;
+            let host = String::from_utf8(domain_buf)?;
+
+            let mut port_buf = [0u8; 2];
+            stream.read_exact(&mut port_buf).await?;
+            let port = u16::from_be_bytes(port_buf);
+
+            if host.is_empty() {
+                return Err(ClientError::InvalidTarget("empty domain".to_string()));
+            }
+
+            Ok(TargetAddr::DomainPort { host, port })
+        }
+        other => Err(ClientError::UnsupportedAddressType(other)),
     }
 }

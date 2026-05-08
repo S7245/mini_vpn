@@ -5,7 +5,7 @@ use mini_vpn::shared::{
     read_relay_request,
     write_relay_request,
 };
-use tokio::io::{AsyncReadExt, duplex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
 #[test]
 fn parses_ipv4_target() {
@@ -99,4 +99,40 @@ async fn write_relay_request_starts_with_fake_header() {
 
     writer.await.expect("writer task should join");
     assert_eq!(&magic, FAKE_HTTP_HEADER);
+}
+
+#[tokio::test]
+async fn read_request_preserves_following_payload() {
+    let request = RelayRequest::Tcp {
+        target: TargetAddr::parse("127.0.0.1:7897").expect("target should parse"),
+    };
+    let (mut client, mut server) = duplex(256);
+
+    let writer = tokio::spawn(async move {
+        write_relay_request(&mut client, &request)
+            .await
+            .expect("write should succeed");
+        client
+            .write_all(b"payload-after-request")
+            .await
+            .expect("payload write should succeed");
+    });
+
+    let received = read_relay_request(&mut server)
+        .await
+        .expect("read should succeed");
+    assert_eq!(
+        received,
+        RelayRequest::Tcp {
+            target: TargetAddr::parse("127.0.0.1:7897").expect("target should parse"),
+        }
+    );
+
+    let mut trailing = [0u8; 21];
+    server
+        .read_exact(&mut trailing)
+        .await
+        .expect("trailing payload should remain readable");
+    writer.await.expect("writer task should join");
+    assert_eq!(&trailing, b"payload-after-request");
 }

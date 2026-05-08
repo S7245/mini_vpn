@@ -1,10 +1,11 @@
 use crate::device::VirtualTunDevice;
+use mini_vpn::shared::{ClientError, RelayRequest, TargetAddr, open_remote_session};
 use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer};
 use smoltcp::wire::{IpAddress, IpCidr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 use yamux::{Config as YamuxConfig, Connection, Mode};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::ServerName;
@@ -17,7 +18,59 @@ use tokio_rustls::rustls::Certificate;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
+const DEFAULT_TUN_LISTEN_PORT: u16 = 80;
+const DEFAULT_TUN_TARGET: &str = "httpbin.org:80";
+const TCP_SOCKET_BUFFER_SIZE: usize = 65_535;
+const RELAY_CHANNEL_CAPACITY: usize = 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct ListenerSpec {
+    local_port: u16,
+    pool_size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketState {
+    Listening,
+    OpeningRemote,
+    Relaying,
+    Closing,
+    Rearming,
+}
+
+#[derive(Debug)]
+struct SocketCtx {
+    local_port: u16,
+    state: SocketState,
+    target: TargetAddr,
+    uplink_tx: Option<mpsc::Sender<Vec<u8>>>,
+}
+
+impl SocketCtx {
+    fn new(local_port: u16, target: TargetAddr) -> Self {
+        Self {
+            local_port,
+            state: SocketState::Listening,
+            target,
+            uplink_tx: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ListenerPool {
+    spec: ListenerSpec,
+    handles: Vec<SocketHandle>,
+}
+
 pub async fn start_tun_proxy() {
+    let listener_spec = ListenerSpec {
+        local_port: DEFAULT_TUN_LISTEN_PORT,
+        pool_size: 1,
+    };
+    let default_target =
+        TargetAddr::parse(DEFAULT_TUN_TARGET).expect("默认 TUN 目标地址必须合法");
+
     let mut root_cert_store = RootCertStore::empty();
     let cert_file = &mut BufReader::new(File::open("cert.pem").unwrap());
     let certs = rustls_pemfile::certs(cert_file).unwrap();
@@ -30,10 +83,10 @@ pub async fn start_tun_proxy() {
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(config));
 
-    // 记录：房间号 -> 专属通道的发送端 (注意 Sender 需要指定发送的数据类型 Vec<u8>)
-    let mut active_connections: HashMap<SocketHandle, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let mut socket_ctxs: HashMap<SocketHandle, SocketCtx> = HashMap::new();
     // 全局回信通道：接收端 global_rx 留在主循环，发送端 global_tx 会被克隆给每个后台车厢
-    let (global_tx, mut global_rx) = tokio::sync::mpsc::channel::<(SocketHandle, Vec<u8>)>(1024);
+    let (global_tx, mut global_rx) =
+        tokio::sync::mpsc::channel::<(SocketHandle, Vec<u8>)>(RELAY_CHANNEL_CAPACITY);
     // =========== 1. 初始化底层网卡和通道 ===========
 
     // 1. 初始化 TUN 设备(化底层网卡和通道) / 创建操作系统的原生异步虚拟网卡
@@ -45,13 +98,15 @@ pub async fn start_tun_proxy() {
     // 2. 初始化 smoltcp 的“酒店”
     let mut sockets = SocketSet::new(vec![]);
 
-    let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; 65535]);
-    let tcp_tx_buffer = TcpSocketBuffer::new(vec![0; 65535]);
-    let mut tcp_socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
-    // 为了让它能接客（比如截获我们在终端里发起的 curl 请求），我们需要让它开始监听 (Listen) 特定的端口，比如 HTTP 常用的 80 端口。
-    tcp_socket.listen(80).unwrap();
-    // socket_handle：房间号/把手
-    let socket_handle = sockets.add(tcp_socket);
+    let socket_handle = sockets.add(build_listener_socket(&listener_spec));
+    socket_ctxs.insert(
+        socket_handle,
+        SocketCtx::new(listener_spec.local_port, default_target),
+    );
+    let listener_pool = ListenerPool {
+        spec: listener_spec,
+        handles: vec![socket_handle],
+    };
 
     // 3. 初始化 smoltcp 的“虚拟路由器”
     let config = SmolConfig::new(smoltcp::wire::HardwareAddress::Ip);
@@ -67,7 +122,11 @@ pub async fn start_tun_proxy() {
 
     // 3. 初始化定时器 (例如每 5 毫秒触发一次)
     let mut timer = tokio::time::interval(std::time::Duration::from_millis(5));
-    println!("🚀 TUN 虚拟网卡主循环启动！试试 ping 10.0.0.2");
+    println!(
+        "🚀 TUN 虚拟网卡主循环启动！监听端口 {}，当前槽位数 {}",
+        listener_pool.spec.local_port,
+        listener_pool.spec.pool_size
+    );
 
     let domain = match ServerName::try_from("localhost") {
         Ok(domain) => domain,
@@ -107,23 +166,17 @@ pub async fn start_tun_proxy() {
             // 🌟 新增分支：监听洛杉矶回传的信件
             Some((handle, payload)) = global_rx.recv() =>{
                 println!("📬 从大邮筒收到 {} 字节数据，准备送往房间 {:?}", payload.len(), handle);
-                // ❓ 任务：
-                // 1. 从 sockets 集合中，获取这个 handle 对应的 TcpSocket 可变引用。
-                let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
-                // 2. 检查 payload 是否为空。
-                // 如果为空，说明服务端关闭了连接，我们需要关闭这个 Socket 并从 active_connections 中移除。
-                if payload.is_empty() {
-                    tcp_socket.abort();
-                    active_connections.remove(&handle);
-                    tcp_socket.listen(80).unwrap();
-                } else {
-                    // 2. 将 payload 塞进这个 Socket 的发送缓冲区里。
-                    tcp_socket.send_slice(&payload).unwrap();
-                    println!("✅ 成功将洛杉矶的回信发给本地浏览器！");
-                    // 立刻主动“推”路由器一把。
-                    let timestamp = smoltcp::time::Instant::now();
-                    iface.poll(timestamp, &mut device, &mut sockets);
-                    device.flush_tx().await.unwrap();
+                if let Err(e) = handle_remote_payload(
+                    handle,
+                    payload,
+                    &mut sockets,
+                    &mut socket_ctxs,
+                    &mut iface,
+                    &mut device,
+                )
+                .await
+                {
+                    println!("处理回程数据失败: {e}");
                 }
             }
             // 分支 1: 全局回信通道接收到了新数据包
@@ -145,106 +198,18 @@ pub async fn start_tun_proxy() {
                     // 提示: 这是一个 async 方法，别忘了 .await 和错误处理 (比如 .unwrap())
                     device.flush_tx().await.unwrap();
 
-                    // 🌟 查房时机 1：网卡收到新包并处理完后
-                    // ❓ 任务：在这里写代码查房
-                    let tcp_socket = sockets.get_mut::<TcpSocket>(socket_handle);
-                    // 询问是否有数据,检查接收缓冲区里有没有新鲜出炉的数据。
-                    if tcp_socket.can_recv() {
-                        // 1. 在闭包外准备一个空的篮子
-                        let mut payload: Option<Vec<u8>> = None;
-
-                        // recv() 它会把缓冲区里的数据作为一个切片 data: &[u8] 传给你的闭包（闭包就是 { ... } 里的代码块）。
-                        tcp_socket.recv(|data|{
-                            // 把 data 复制到 payload 篮子
-                            payload = Some(data.to_vec());
-                            // 告诉 smoltcp 我们处理完了所有数据，把它从缓冲区里清空
-                            (data.len(),())
-                        }).unwrap();
-
-                        // 3. 离开闭包结界后，安全地进行异步操作
-                        if let Some(payload) = payload {
-                            if let Some(tx) = active_connections.get_mut(&socket_handle) {
-                                tx.send(payload).await.unwrap();
-                            } else {
-                                // 1. 创建去程通道 (主循环 -> 车厢)
-                                let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
-                                active_connections.insert(socket_handle, tx.clone());
-                                // 2. 申请车厢
-                                let yamux_stream = ctrl.open_stream().await.expect("打开 Yamux 流失败");
-                                let mut tokio_yamux_stream = yamux_stream.compat();
-
-                                // ================= 🌟 把暗号代码搬到这里 =================
-                                let fake_header = b"GET / HTTP/1.1\r\nHost: www.bing.com\r\n\r\n";
-                                tokio_yamux_stream.write_all(fake_header).await.unwrap();
-                                tokio_yamux_stream.write_all(b"httpbin.org:80\n").await.unwrap();
-
-                                // 发送第一笔请求
-                                tx.send(payload).await.unwrap();
-                                // 3. 🌟 克隆一份全局回信通道的发送端，带入后台
-                                let back_tx = global_tx.clone();
-
-                                tokio::spawn(async move {
-                                    let mut buf = [0u8; 65536]; // 准备一个接收洛杉矶数据的缓冲区
-                                    loop {
-                                        tokio::select! {
-                                            // ================= 分支 1：去程 (Local -> Remote) =================
-                                            local_msg = rx.recv() => {
-                                                match local_msg {
-                                                    Some(payload) => {
-                                                        // ❓ 任务 1：使用 tokio_yamux_stream 把 data 发给洛杉矶
-                                                        // 提示：遇到 err 时可以直接 break 退出循环，结束这个后台任务
-                                                        match tokio_yamux_stream.write_all(&payload).await {
-                                                            Ok(_) => {
-                                                                // 成功发送
-                                                                println!("✅ 成功发送 {} 字节数据到洛杉矶", payload.len());
-                                                            }
-                                                            Err(e) => {
-                                                                println!("写入 Yamux 流失败: {:?}", e);
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                    None => {
-                                                        // 主循环把发送端丢弃了（本地连接断开）
-                                                        println!("本地房间 {:?} 已关闭通道", socket_handle);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            // ================= 分支 2：回程 (Remote -> Local) =================
-                                            remote_msg = tokio_yamux_stream.read(&mut buf) => {
-                                                match remote_msg {
-                                                    Ok(0) => {
-                                                        // 读到 0 字节，说明洛杉矶服务器主动关门了 (EOF)
-                                                        println!("洛杉矶服务器关闭了车厢 {:?}", socket_handle);
-
-                                                        /*
-                                                        💡 发送一个空的 Vec 作为“断开连接”的暗号给主循环！
-                                                        在网络字节流的世界里，如果你想传递真正的数据，这个数据的长度至少是 1。所以，一个长度为 0 的空数组（空切片），就是全宇宙通用的“连接已关闭 (EOF)”的终极暗号。
-                                                        既然我们的大邮筒只能接收 (SocketHandle, Vec<u8>)，那我们完全可以在 Ok(0) 的时候，人工制造一个空的 Vec 发过去：
-                                                        */
-                                                        back_tx.send((socket_handle, vec![])).await.unwrap();
-                                                        break;
-                                                    }
-                                                    Ok(n) => {
-                                                        // 成功收到了 n 字节的数据！
-                                                        // ❓ 任务 2：提取 buf 的前 n 个字节，打包成 (socket_handle, 真实数据)
-                                                        // 然后用 back_tx 发进全局大邮筒。
-                                                        let data = buf[..n].to_vec();
-                                                        back_tx.send((socket_handle, data)).await.unwrap();
-                                                    }
-                                                    Err(e) => {
-                                                        println!("读取 Yamux 流失败（从洛杉矶读取失败）: {:?}", e);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                });
-                            }
+                    for handle in &listener_pool.handles {
+                        if let Err(e) = process_listener_activity(
+                            *handle,
+                            &mut sockets,
+                            &mut socket_ctxs,
+                            &mut ctrl,
+                            &global_tx,
+                        )
+                        .await
+                        {
+                            println!("处理本地房间 {:?} 失败: {e}", handle);
                         }
-
                     }
                 }
             }
@@ -255,104 +220,192 @@ pub async fn start_tun_proxy() {
                 iface.poll(timestamp, &mut device, &mut sockets);
                 device.flush_tx().await.unwrap();
 
-                // 🌟 查房时机 2：时钟滴答，处理完后台任务后
-                // ❓ 任务：在这里写同样的查房代码，看看是否有新的包需要处理
-                let tcp_socket = sockets.get_mut::<TcpSocket>(socket_handle);
-                // 询问是否有数据,检查接收缓冲区里有没有新鲜出炉的数据。
-                if tcp_socket.can_recv() {
-                        // 1. 在闭包外准备一个空的篮子
-                        let mut payload: Option<Vec<u8>> = None;
-
-                        // recv() 它会把缓冲区里的数据作为一个切片 data: &[u8] 传给你的闭包（闭包就是 { ... } 里的代码块）。
-                        tcp_socket.recv(|data|{
-                            // 把 data 复制到 payload 篮子
-                            payload = Some(data.to_vec());
-                            // 告诉 smoltcp 我们处理完了所有数据，把它从缓冲区里清空
-                            (data.len(),())
-                        }).unwrap();
-
-                        // 3. 离开闭包结界后，安全地进行异步操作
-                        if let Some(payload) = payload {
-                            if let Some(tx) = active_connections.get_mut(&socket_handle) {
-                                tx.send(payload).await.unwrap();
-                            } else {
-                                // 1. 创建去程通道 (主循环 -> 车厢)
-                                let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
-                                active_connections.insert(socket_handle, tx.clone());
-                                // 2. 申请车厢
-                                let yamux_stream = ctrl.open_stream().await.expect("打开 Yamux 流失败");
-                                let mut tokio_yamux_stream = yamux_stream.compat();
-                                // 发送第一笔请求
-                                tx.send(payload).await.unwrap();
-                                // 3. 🌟 克隆一份全局回信通道的发送端，带入后台
-                                let back_tx = global_tx.clone();
-
-                                tokio::spawn(async move {
-                                    let mut buf = [0u8; 65536]; // 准备一个接收洛杉矶数据的缓冲区
-                                    loop {
-                                        tokio::select! {
-                                            // ================= 分支 1：去程 (Local -> Remote) =================
-                                            local_msg = rx.recv() => {
-                                                match local_msg {
-                                                    Some(payload) => {
-                                                        // ❓ 任务 1：使用 tokio_yamux_stream 把 data 发给洛杉矶
-                                                        // 提示：遇到 err 时可以直接 break 退出循环，结束这个后台任务
-                                                        match tokio_yamux_stream.write_all(&payload).await {
-                                                            Ok(_) => {
-                                                                // 成功发送
-                                                                println!("✅ 成功发送 {} 字节数据到洛杉矶", payload.len());
-                                                            }
-                                                            Err(e) => {
-                                                                println!("写入 Yamux 流失败: {:?}", e);
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                    None => {
-                                                        // 主循环把发送端丢弃了（本地连接断开）
-                                                        println!("本地房间 {:?} 已关闭通道", socket_handle);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            // ================= 分支 2：回程 (Remote -> Local) =================
-                                            remote_msg = tokio_yamux_stream.read(&mut buf) => {
-                                                match remote_msg {
-                                                    Ok(0) => {
-                                                        // 读到 0 字节，说明洛杉矶服务器主动关门了 (EOF)
-                                                        println!("洛杉矶服务器关闭了车厢 {:?}", socket_handle);
-
-                                                        /*
-                                                        💡 发送一个空的 Vec 作为“断开连接”的暗号给主循环！
-                                                        在网络字节流的世界里，如果你想传递真正的数据，这个数据的长度至少是 1。所以，一个长度为 0 的空数组（空切片），就是全宇宙通用的“连接已关闭 (EOF)”的终极暗号。
-                                                        既然我们的大邮筒只能接收 (SocketHandle, Vec<u8>)，那我们完全可以在 Ok(0) 的时候，人工制造一个空的 Vec 发过去：
-                                                        */
-                                                        back_tx.send((socket_handle, vec![])).await.unwrap();
-                                                        break;
-                                                    }
-                                                    Ok(n) => {
-                                                        // 成功收到了 n 字节的数据！
-                                                        // ❓ 任务 2：提取 buf 的前 n 个字节，打包成 (socket_handle, 真实数据)
-                                                        // 然后用 back_tx 发进全局大邮筒。
-                                                        let data = buf[..n].to_vec();
-                                                        back_tx.send((socket_handle, data)).await.unwrap();
-                                                    }
-                                                    Err(e) => {
-                                                        println!("读取 Yamux 流失败（从洛杉矶读取失败）: {:?}", e);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                });
-                            }
-                        }
-
+                for handle in &listener_pool.handles {
+                    if let Err(e) = process_listener_activity(
+                        *handle,
+                        &mut sockets,
+                        &mut socket_ctxs,
+                        &mut ctrl,
+                        &global_tx,
+                    )
+                    .await
+                    {
+                        println!("处理本地房间 {:?} 失败: {e}", handle);
                     }
+                }
             }
         }
     }
+}
+
+fn build_listener_socket(spec: &ListenerSpec) -> TcpSocket<'static> {
+    let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; TCP_SOCKET_BUFFER_SIZE]);
+    let tcp_tx_buffer = TcpSocketBuffer::new(vec![0; TCP_SOCKET_BUFFER_SIZE]);
+    let mut tcp_socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
+    tcp_socket.listen(spec.local_port).unwrap();
+    tcp_socket
+}
+
+fn extract_socket_payload(socket: &mut TcpSocket<'_>) -> Option<Vec<u8>> {
+    if !socket.can_recv() {
+        return None;
+    }
+
+    let mut payload = None;
+    socket
+        .recv(|data| {
+            payload = Some(data.to_vec());
+            (data.len(), ())
+        })
+        .unwrap();
+    payload
+}
+
+fn rearm_socket(socket: &mut TcpSocket<'_>, ctx: &mut SocketCtx) {
+    ctx.state = SocketState::Closing;
+    socket.abort();
+    ctx.uplink_tx = None;
+    ctx.state = SocketState::Rearming;
+    socket.listen(ctx.local_port).unwrap();
+    ctx.state = SocketState::Listening;
+}
+
+async fn process_listener_activity(
+    handle: SocketHandle,
+    sockets: &mut SocketSet<'_>,
+    socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
+    ctrl: &mut yamux::Control,
+    global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
+) -> Result<(), ClientError> {
+    let payload = {
+        let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
+        extract_socket_payload(tcp_socket)
+    };
+
+    if let Some(payload) = payload {
+        handle_local_payload(handle, payload, socket_ctxs, ctrl, global_tx).await?;
+    }
+
+    Ok(())
+}
+
+async fn handle_local_payload(
+    handle: SocketHandle,
+    payload: Vec<u8>,
+    socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
+    ctrl: &mut yamux::Control,
+    global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
+) -> Result<(), ClientError> {
+    let Some(ctx) = socket_ctxs.get_mut(&handle) else {
+        return Ok(());
+    };
+
+    if let Some(tx) = ctx.uplink_tx.as_mut() {
+        tx.send(payload)
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "本地中继通道已关闭"))?;
+        ctx.state = SocketState::Relaying;
+        return Ok(());
+    }
+
+    ctx.state = SocketState::OpeningRemote;
+    let request = RelayRequest::Tcp {
+        target: ctx.target.clone(),
+    };
+    let stream = open_remote_session(ctrl, &request).await?;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(RELAY_CHANNEL_CAPACITY);
+    tx.send(payload)
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "新建中继通道写入失败"))?;
+    ctx.uplink_tx = Some(tx);
+    ctx.state = SocketState::Relaying;
+
+    spawn_remote_relay(handle, stream, rx, global_tx.clone());
+    Ok(())
+}
+
+/// 处理远端回信
+async fn handle_remote_payload(
+    handle: SocketHandle,
+    payload: Vec<u8>,
+    sockets: &mut SocketSet<'_>,
+    socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
+    iface: &mut Interface,
+    device: &mut VirtualTunDevice,
+) -> std::io::Result<()> {
+    let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
+    let Some(ctx) = socket_ctxs.get_mut(&handle) else {
+        return Ok(());
+    };
+
+    if payload.is_empty() {
+        rearm_socket(tcp_socket, ctx);
+        return Ok(());
+    }
+
+    tcp_socket.send_slice(&payload).unwrap();
+    ctx.state = SocketState::Relaying;
+    println!("✅ 成功将远端回信发给本地浏览器！");
+
+    let timestamp = smoltcp::time::Instant::now();
+    iface.poll(timestamp, device, sockets);
+    device.flush_tx().await
+}
+
+fn spawn_remote_relay(
+    handle: SocketHandle,
+    mut tokio_yamux_stream: Compat<yamux::Stream>,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    back_tx: mpsc::Sender<(SocketHandle, Vec<u8>)>,
+) {
+    tokio::spawn(async move {
+        let mut buf = [0u8; 65_536];
+        loop {
+            tokio::select! {
+                local_msg = rx.recv() => {
+                    match local_msg {
+                        Some(payload) => {
+                            match tokio_yamux_stream.write_all(&payload).await {
+                                Ok(_) => {
+                                    println!("✅ 成功发送 {} 字节数据到远端", payload.len());
+                                }
+                                Err(e) => {
+                                    println!("写入 Yamux 流失败: {:?}", e);
+                                    break;
+                                }
+                            }
+                        }
+                        None => {
+                            println!("本地房间 {:?} 已关闭通道", handle);
+                            break;
+                        }
+                    }
+                }
+                remote_msg = tokio_yamux_stream.read(&mut buf) => {
+                    match remote_msg {
+                        Ok(0) => {
+                            println!("远端服务器关闭了车厢 {:?}", handle);
+                            if back_tx.send((handle, vec![])).await.is_err() {
+                                break;
+                            }
+                            break;
+                        }
+                        Ok(n) => {
+                            let data = buf[..n].to_vec();
+                            if back_tx.send((handle, data)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            println!("读取 Yamux 流失败（从远端读取失败）: {:?}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 pub async fn create_tun_device() -> tun::AsyncDevice {
