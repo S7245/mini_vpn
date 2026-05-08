@@ -22,6 +22,7 @@ const DEFAULT_TUN_LISTEN_PORT: u16 = 80;
 const DEFAULT_TUN_TARGET: &str = "httpbin.org:80";
 const TCP_SOCKET_BUFFER_SIZE: usize = 65_535;
 const RELAY_CHANNEL_CAPACITY: usize = 1024;
+const DEFAULT_TUN_POOL_SIZE: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 struct ListenerSpec {
@@ -66,7 +67,7 @@ struct ListenerPool {
 pub async fn start_tun_proxy() {
     let listener_spec = ListenerSpec {
         local_port: DEFAULT_TUN_LISTEN_PORT,
-        pool_size: 1,
+        pool_size: DEFAULT_TUN_POOL_SIZE,
     };
     let default_target =
         TargetAddr::parse(DEFAULT_TUN_TARGET).expect("默认 TUN 目标地址必须合法");
@@ -83,7 +84,6 @@ pub async fn start_tun_proxy() {
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(config));
 
-    let mut socket_ctxs: HashMap<SocketHandle, SocketCtx> = HashMap::new();
     // 全局回信通道：接收端 global_rx 留在主循环，发送端 global_tx 会被克隆给每个后台车厢
     let (global_tx, mut global_rx) =
         tokio::sync::mpsc::channel::<(SocketHandle, Vec<u8>)>(RELAY_CHANNEL_CAPACITY);
@@ -98,15 +98,8 @@ pub async fn start_tun_proxy() {
     // 2. 初始化 smoltcp 的“酒店”
     let mut sockets = SocketSet::new(vec![]);
 
-    let socket_handle = sockets.add(build_listener_socket(&listener_spec));
-    socket_ctxs.insert(
-        socket_handle,
-        SocketCtx::new(listener_spec.local_port, default_target),
-    );
-    let listener_pool = ListenerPool {
-        spec: listener_spec,
-        handles: vec![socket_handle],
-    };
+    let (listener_pool, mut socket_ctxs) =
+        build_listener_pool(&mut sockets, &listener_spec, &default_target);
 
     // 3. 初始化 smoltcp 的“虚拟路由器”
     let config = SmolConfig::new(smoltcp::wire::HardwareAddress::Ip);
@@ -244,6 +237,36 @@ fn build_listener_socket(spec: &ListenerSpec) -> TcpSocket<'static> {
     let mut tcp_socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
     tcp_socket.listen(spec.local_port).unwrap();
     tcp_socket
+}
+
+/// Build the real smoltcp listener pool for the TUN runtime.
+/// 中文要点：一次性创建多个监听槽位，让后续连接不再依赖单个 socket 反复复位。
+fn build_listener_pool(
+    sockets: &mut SocketSet<'_>,
+    spec: &ListenerSpec,
+    default_target: &TargetAddr,
+) -> (ListenerPool, HashMap<SocketHandle, SocketCtx>) {
+    let mut handles = Vec::with_capacity(spec.pool_size);
+    let mut socket_ctxs = HashMap::with_capacity(spec.pool_size);
+
+    for slot_index in 0..spec.pool_size {
+        let handle = sockets.add(build_listener_socket(spec));
+        let ctx = SocketCtx::new(spec.local_port, default_target.clone());
+        println!(
+            "🧩 listener slot {} created on local port {} with handle {:?}",
+            slot_index, spec.local_port, handle
+        );
+        handles.push(handle);
+        socket_ctxs.insert(handle, ctx);
+    }
+
+    (
+        ListenerPool {
+            spec: *spec,
+            handles,
+        },
+        socket_ctxs,
+    )
 }
 
 fn extract_socket_payload(socket: &mut TcpSocket<'_>) -> Option<Vec<u8>> {
@@ -422,4 +445,29 @@ pub async fn create_tun_device() -> tun::AsyncDevice {
 
     // 创建异步读取的 TUN 设备
     tun::create_as_async(&config).expect("无法创建 TUN 设备")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smoltcp::iface::SocketSet;
+
+    #[test]
+    fn build_listener_pool_creates_four_handles_and_contexts() {
+        let spec = ListenerSpec {
+            local_port: 80,
+            pool_size: 4,
+        };
+        let default_target = TargetAddr::parse("httpbin.org:80").expect("target should parse");
+        let mut sockets = SocketSet::new(vec![]);
+
+        let (pool, socket_ctxs) = build_listener_pool(&mut sockets, &spec, &default_target);
+
+        assert_eq!(pool.handles.len(), 4);
+        assert_eq!(socket_ctxs.len(), 4);
+        assert!(pool
+            .handles
+            .iter()
+            .all(|handle| socket_ctxs.contains_key(handle)));
+    }
 }
