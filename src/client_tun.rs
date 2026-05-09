@@ -87,6 +87,85 @@ struct ListenerPool {
     handles: Vec<SocketHandle>,
 }
 
+/// Startup configuration for the TUN runtime.
+/// 中文要点：这是运行时配置入口，负责把环境变量转换成稳定、可校验的启动参数。
+#[derive(Debug, Clone)]
+struct TunRuntimeConfig {
+    /// Local TCP port intercepted by the TUN-side smoltcp stack.
+    /// 中文要点：虚拟网卡这一侧实际监听的本地端口。
+    local_port: u16,
+    /// Default remote relay target for the current TCP-over-TUN demo path.
+    /// 中文要点：当前 TUN demo 默认转发到的远端目标。
+    target_addr: TargetAddr,
+    /// Number of listener slots created for the same local port.
+    /// 中文要点：监听池槽位数，决定会创建多少个独立的监听房间。
+    pool_size: usize,
+}
+
+impl TunRuntimeConfig {
+    /// Build config from optional string sources.
+    /// 中文要点：测试和环境变量入口共用同一套解析逻辑，避免两套规则漂移。
+    fn from_sources(
+        local_port: Option<&str>,
+        target_addr: Option<&str>,
+        pool_size: Option<&str>,
+    ) -> Result<Self, ClientError> {
+        let local_port = match local_port {
+            Some(value) => value
+                .parse::<u16>()
+                .map_err(|_| ClientError::InvalidTarget(format!("invalid local port: {value}")))?,
+            None => DEFAULT_TUN_LISTEN_PORT,
+        };
+
+        let target_addr = match target_addr {
+            Some(value) => TargetAddr::parse(value)?,
+            None => TargetAddr::parse(DEFAULT_TUN_TARGET)?,
+        };
+
+        let pool_size = match pool_size {
+            Some(value) => value
+                .parse::<usize>()
+                .map_err(|_| ClientError::InvalidTarget(format!("invalid pool size: {value}")))?,
+            None => DEFAULT_TUN_POOL_SIZE,
+        };
+
+        if pool_size == 0 {
+            return Err(ClientError::InvalidTarget(
+                "invalid pool size: must be at least 1".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            local_port,
+            target_addr,
+            pool_size,
+        })
+    }
+
+    /// Read config from process environment.
+    /// 中文要点：Stage 5 只做最小配置版，因此先走环境变量入口，不引入额外 CLI 层。
+    fn from_env() -> Result<Self, ClientError> {
+        let local_port = std::env::var("MINI_VPN_TUN_LOCAL_PORT").ok();
+        let target_addr = std::env::var("MINI_VPN_TUN_TARGET_ADDR").ok();
+        let pool_size = std::env::var("MINI_VPN_TUN_POOL_SIZE").ok();
+
+        Self::from_sources(
+            local_port.as_deref(),
+            target_addr.as_deref(),
+            pool_size.as_deref(),
+        )
+    }
+
+    /// Derive the listener-pool blueprint from startup config.
+    /// 中文要点：配置只负责输入，真正监听池蓝图仍然交给 `ListenerSpec`。
+    fn listener_spec(&self) -> ListenerSpec {
+        ListenerSpec {
+            local_port: self.local_port,
+            pool_size: self.pool_size,
+        }
+    }
+}
+
 pub async fn start_tun_proxy() {
     let listener_spec = ListenerSpec {
         local_port: DEFAULT_TUN_LISTEN_PORT,
@@ -527,5 +606,14 @@ mod tests {
 
         assert_eq!(ctx.state, SocketState::Listening);
         assert!(ctx.uplink_tx.is_none());
+    }
+
+    #[test]
+    fn tun_runtime_config_defaults_match_stage4_behavior() {
+        let config = TunRuntimeConfig::from_sources(None, None, None).expect("config should load");
+
+        assert_eq!(config.local_port, 80);
+        assert_eq!(config.pool_size, 4);
+        assert_eq!(config.target_addr.to_wire_string(), "httpbin.org:80");
     }
 }
