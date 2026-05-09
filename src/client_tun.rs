@@ -167,12 +167,15 @@ impl TunRuntimeConfig {
 }
 
 pub async fn start_tun_proxy() {
-    let listener_spec = ListenerSpec {
-        local_port: DEFAULT_TUN_LISTEN_PORT,
-        pool_size: DEFAULT_TUN_POOL_SIZE,
+    let runtime_config = match TunRuntimeConfig::from_env() {
+        Ok(config) => config,
+        Err(e) => {
+            println!("加载 TUN 运行时配置失败: {e}");
+            return;
+        }
     };
-    let default_target =
-        TargetAddr::parse(DEFAULT_TUN_TARGET).expect("默认 TUN 目标地址必须合法");
+    let listener_spec = runtime_config.listener_spec();
+    let default_target = runtime_config.target_addr.clone();
 
     let mut root_cert_store = RootCertStore::empty();
     let cert_file = &mut BufReader::new(File::open("cert.pem").unwrap());
@@ -218,9 +221,10 @@ pub async fn start_tun_proxy() {
     // 3. 初始化定时器 (例如每 5 毫秒触发一次)
     let mut timer = tokio::time::interval(std::time::Duration::from_millis(5));
     println!(
-        "🚀 TUN 虚拟网卡主循环启动！监听端口 {}，当前槽位数 {}",
+        "🚀 TUN runtime started with local_port={}, pool_size={}, target={}",
         listener_pool.spec.local_port,
-        listener_pool.spec.pool_size
+        listener_pool.spec.pool_size,
+        default_target.to_wire_string()
     );
 
     let domain = match ServerName::try_from("localhost") {
@@ -615,5 +619,18 @@ mod tests {
         assert_eq!(config.local_port, 80);
         assert_eq!(config.pool_size, 4);
         assert_eq!(config.target_addr.to_wire_string(), "httpbin.org:80");
+    }
+
+    #[test]
+    fn tun_runtime_config_derives_listener_spec_and_target() {
+        let config =
+            TunRuntimeConfig::from_sources(Some("8080"), Some("127.0.0.1:7897"), Some("2"))
+                .expect("config should load");
+
+        let listener_spec = config.listener_spec();
+
+        assert_eq!(listener_spec.local_port, 8080);
+        assert_eq!(listener_spec.pool_size, 2);
+        assert_eq!(config.target_addr.to_wire_string(), "127.0.0.1:7897");
     }
 }
