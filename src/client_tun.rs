@@ -83,7 +83,6 @@ impl SocketCtx {
 /// 中文要点：后续主循环只遍历这个池，而不是盯着单个裸 `socket_handle`。
 #[derive(Debug)]
 struct ListenerPool {
-    spec: ListenerSpec,
     handles: Vec<SocketHandle>,
 }
 
@@ -194,8 +193,21 @@ pub async fn start_tun_proxy() {
         tokio::sync::mpsc::channel::<(SocketHandle, Vec<u8>)>(RELAY_CHANNEL_CAPACITY);
     // =========== 1. 初始化底层网卡和通道 ===========
 
+    println!(
+        "🚀 TUN runtime started with local_port={}, pool_size={}, target={}",
+        listener_spec.local_port,
+        listener_spec.pool_size,
+        default_target.to_wire_string()
+    );
+
     // 1. 初始化 TUN 设备(化底层网卡和通道) / 创建操作系统的原生异步虚拟网卡
-    let raw_tun = create_tun_device().await;
+    let raw_tun = match create_tun_device().await {
+        Ok(device) => device,
+        Err(e) => {
+            println!("无法创建 TUN 设备: {e}");
+            return;
+        }
+    };
     // 使用 raw_tun 实例化我们的包装器
     let mut device = VirtualTunDevice::new(raw_tun);
 
@@ -220,12 +232,6 @@ pub async fn start_tun_proxy() {
 
     // 3. 初始化定时器 (例如每 5 毫秒触发一次)
     let mut timer = tokio::time::interval(std::time::Duration::from_millis(5));
-    println!(
-        "🚀 TUN runtime started with local_port={}, pool_size={}, target={}",
-        listener_pool.spec.local_port,
-        listener_pool.spec.pool_size,
-        default_target.to_wire_string()
-    );
 
     let domain = match ServerName::try_from("localhost") {
         Ok(domain) => domain,
@@ -369,10 +375,7 @@ fn build_listener_pool(
     }
 
     (
-        ListenerPool {
-            spec: *spec,
-            handles,
-        },
+        ListenerPool { handles },
         socket_ctxs,
     )
 }
@@ -550,7 +553,7 @@ fn spawn_remote_relay(
     });
 }
 
-pub async fn create_tun_device() -> tun::AsyncDevice {
+pub async fn create_tun_device() -> tun::Result<tun::AsyncDevice> {
     let mut config = tun::Configuration::default();
 
     config
@@ -562,8 +565,9 @@ pub async fn create_tun_device() -> tun::AsyncDevice {
     #[cfg(target_os = "macos")]
     config.layer(tun::Layer::L3); // macOS 通常需要显式指定三层（IP层）
 
-    // 创建异步读取的 TUN 设备
-    tun::create_as_async(&config).expect("无法创建 TUN 设备")
+    // Create the async TUN device with an explicit error path.
+    // 中文要点：这里不要 panic，启动失败应当以可观测的错误返回给上层。
+    tun::create_as_async(&config)
 }
 
 #[cfg(test)]
