@@ -633,4 +633,36 @@ mod tests {
         assert_eq!(listener_spec.pool_size, 2);
         assert_eq!(config.target_addr.to_wire_string(), "127.0.0.1:7897");
     }
+
+    #[test]
+    fn tun_runtime_config_rejects_invalid_local_port() {
+        let err = TunRuntimeConfig::from_sources(Some("abc"), None, None)
+            .expect_err("invalid port should fail");
+        assert!(err.to_string().contains("invalid local port"));
+    }
+
+    #[test]
+    fn tun_runtime_config_rejects_invalid_target_addr() {
+        let err = TunRuntimeConfig::from_sources(None, Some("bad-target"), None)
+            .expect_err("invalid target should fail");
+        assert!(err.to_string().contains("invalid target"));
+    }
+
+    #[test]
+    fn tun_runtime_config_rejects_zero_pool_size() {
+        let err = TunRuntimeConfig::from_sources(None, None, Some("0"))
+            .expect_err("zero pool size should fail");
+        assert!(err.to_string().contains("at least 1"));
+    }
+
+    #[test]
+    fn tun_runtime_config_accepts_valid_override_values() {
+        let config =
+            TunRuntimeConfig::from_sources(Some("8081"), Some("www.figma.com:443"), Some("3"))
+                .expect("valid config should load");
+
+        assert_eq!(config.local_port, 8081);
+        assert_eq!(config.pool_size, 3);
+        assert_eq!(config.target_addr.to_wire_string(), "www.figma.com:443");
+    }
 }
