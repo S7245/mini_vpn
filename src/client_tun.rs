@@ -23,6 +23,8 @@ const DEFAULT_TUN_TARGET: &str = "httpbin.org:80";
 const TCP_SOCKET_BUFFER_SIZE: usize = 65_535;
 const RELAY_CHANNEL_CAPACITY: usize = 1024;
 const DEFAULT_TUN_POOL_SIZE: usize = 4;
+const DEFAULT_TUN_SERVER_ADDR: &str = "127.0.0.1:8081";
+const DEFAULT_TUN_TLS_SNI: &str = "localhost";
 
 /// Describes how many local TCP listener slots the TUN runtime should create.
 /// 中文要点：这是监听池的蓝图，不代表连接本身，只描述“开几间房、监听哪个端口”。
@@ -86,10 +88,10 @@ struct ListenerPool {
     handles: Vec<SocketHandle>,
 }
 
-/// Startup configuration for the TUN runtime.
-/// 中文要点：这是运行时配置入口，负责把环境变量转换成稳定、可校验的启动参数。
+/// Local listener-side startup configuration for the TUN runtime.
+/// 中文要点：这一层只关心本地拦截面，不关心怎么连上游 TLS/Yamux 服务。
 #[derive(Debug, Clone)]
-struct TunRuntimeConfig {
+struct TunListenerConfig {
     /// Local TCP port intercepted by the TUN-side smoltcp stack.
     /// 中文要点：虚拟网卡这一侧实际监听的本地端口。
     local_port: u16,
@@ -101,9 +103,9 @@ struct TunRuntimeConfig {
     pool_size: usize,
 }
 
-impl TunRuntimeConfig {
-    /// Build config from optional string sources.
-    /// 中文要点：测试和环境变量入口共用同一套解析逻辑，避免两套规则漂移。
+impl TunListenerConfig {
+    /// Build listener config from optional string sources.
+    /// 中文要点：本地监听配置与上游外联配置分开解析，避免职责混淆。
     fn from_sources(
         local_port: Option<&str>,
         target_addr: Option<&str>,
@@ -141,8 +143,79 @@ impl TunRuntimeConfig {
         })
     }
 
+    /// Derive the listener-pool blueprint from startup config.
+    /// 中文要点：监听池蓝图依然只从 listener 配置派生，不受 upstream 字段影响。
+    fn listener_spec(&self) -> ListenerSpec {
+        ListenerSpec {
+            local_port: self.local_port,
+            pool_size: self.pool_size,
+        }
+    }
+}
+
+/// Upstream TLS/Yamux connection configuration for the TUN runtime.
+/// 中文要点：这一层只描述“连谁”和“用什么 SNI”，不参与本地监听池逻辑。
+#[derive(Debug, Clone)]
+struct TunUpstreamConfig {
+    /// TCP address of the upstream proxy server.
+    /// 中文要点：TUN 客户端实际要连的上游服务地址。
+    server_addr: String,
+    /// TLS SNI value used during the upstream handshake.
+    /// 中文要点：TLS 握手时发送给服务端的 Server Name。
+    tls_sni: String,
+}
+
+impl TunUpstreamConfig {
+    /// Build upstream config from optional string sources.
+    /// 中文要点：外联配置在启动时完成校验，避免把坏值带到 TLS 热路径。
+    fn from_sources(
+        server_addr: Option<&str>,
+        tls_sni: Option<&str>,
+    ) -> Result<Self, ClientError> {
+        let server_addr = server_addr.unwrap_or(DEFAULT_TUN_SERVER_ADDR).to_string();
+        let tls_sni = tls_sni.unwrap_or(DEFAULT_TUN_TLS_SNI).to_string();
+
+        server_addr.parse::<std::net::SocketAddr>().map_err(|_| {
+            ClientError::InvalidTarget(format!("invalid upstream server addr: {server_addr}"))
+        })?;
+
+        ServerName::try_from(tls_sni.as_str()).map_err(|_| {
+            ClientError::InvalidTarget(format!("invalid upstream tls sni: {tls_sni}"))
+        })?;
+
+        Ok(Self {
+            server_addr,
+            tls_sni,
+        })
+    }
+}
+
+/// Startup configuration for the TUN runtime.
+/// 中文要点：总配置壳只负责把 listener 与 upstream 两类配置组合起来。
+#[derive(Debug, Clone)]
+struct TunRuntimeConfig {
+    listener: TunListenerConfig,
+    upstream: TunUpstreamConfig,
+}
+
+impl TunRuntimeConfig {
+    /// Build config from optional string sources.
+    /// 中文要点：测试和环境变量入口共享同一套组合逻辑，避免行为漂移。
+    fn from_sources(
+        local_port: Option<&str>,
+        target_addr: Option<&str>,
+        pool_size: Option<&str>,
+        server_addr: Option<&str>,
+        tls_sni: Option<&str>,
+    ) -> Result<Self, ClientError> {
+        Ok(Self {
+            listener: TunListenerConfig::from_sources(local_port, target_addr, pool_size)?,
+            upstream: TunUpstreamConfig::from_sources(server_addr, tls_sni)?,
+        })
+    }
+
     /// Read config from process environment.
-    /// 中文要点：Stage 5 只做最小配置版，因此先走环境变量入口，不引入额外 CLI 层。
+    /// 中文要点：先保留 Stage 5 的环境变量入口，Stage 6 再补 upstream 变量接线。
     fn from_env() -> Result<Self, ClientError> {
         let local_port = std::env::var("MINI_VPN_TUN_LOCAL_PORT").ok();
         let target_addr = std::env::var("MINI_VPN_TUN_TARGET_ADDR").ok();
@@ -152,16 +225,9 @@ impl TunRuntimeConfig {
             local_port.as_deref(),
             target_addr.as_deref(),
             pool_size.as_deref(),
+            None,
+            None,
         )
-    }
-
-    /// Derive the listener-pool blueprint from startup config.
-    /// 中文要点：配置只负责输入，真正监听池蓝图仍然交给 `ListenerSpec`。
-    fn listener_spec(&self) -> ListenerSpec {
-        ListenerSpec {
-            local_port: self.local_port,
-            pool_size: self.pool_size,
-        }
     }
 }
 
@@ -173,8 +239,8 @@ pub async fn start_tun_proxy() {
             return;
         }
     };
-    let listener_spec = runtime_config.listener_spec();
-    let default_target = runtime_config.target_addr.clone();
+    let listener_spec = runtime_config.listener.listener_spec();
+    let default_target = runtime_config.listener.target_addr.clone();
 
     let mut root_cert_store = RootCertStore::empty();
     let cert_file = &mut BufReader::new(File::open("cert.pem").unwrap());
@@ -618,55 +684,78 @@ mod tests {
 
     #[test]
     fn tun_runtime_config_defaults_match_stage4_behavior() {
-        let config = TunRuntimeConfig::from_sources(None, None, None).expect("config should load");
+        let config = TunRuntimeConfig::from_sources(None, None, None, None, None)
+            .expect("config should load");
 
-        assert_eq!(config.local_port, 80);
-        assert_eq!(config.pool_size, 4);
-        assert_eq!(config.target_addr.to_wire_string(), "httpbin.org:80");
+        assert_eq!(config.listener.local_port, 80);
+        assert_eq!(config.listener.pool_size, 4);
+        assert_eq!(config.listener.target_addr.to_wire_string(), "httpbin.org:80");
     }
 
     #[test]
     fn tun_runtime_config_derives_listener_spec_and_target() {
-        let config =
-            TunRuntimeConfig::from_sources(Some("8080"), Some("127.0.0.1:7897"), Some("2"))
-                .expect("config should load");
+        let config = TunRuntimeConfig::from_sources(
+            Some("8080"),
+            Some("127.0.0.1:7897"),
+            Some("2"),
+            None,
+            None,
+        )
+        .expect("config should load");
 
-        let listener_spec = config.listener_spec();
+        let listener_spec = config.listener.listener_spec();
 
         assert_eq!(listener_spec.local_port, 8080);
         assert_eq!(listener_spec.pool_size, 2);
-        assert_eq!(config.target_addr.to_wire_string(), "127.0.0.1:7897");
+        assert_eq!(config.listener.target_addr.to_wire_string(), "127.0.0.1:7897");
     }
 
     #[test]
     fn tun_runtime_config_rejects_invalid_local_port() {
-        let err = TunRuntimeConfig::from_sources(Some("abc"), None, None)
+        let err = TunRuntimeConfig::from_sources(Some("abc"), None, None, None, None)
             .expect_err("invalid port should fail");
         assert!(err.to_string().contains("invalid local port"));
     }
 
     #[test]
     fn tun_runtime_config_rejects_invalid_target_addr() {
-        let err = TunRuntimeConfig::from_sources(None, Some("bad-target"), None)
+        let err = TunRuntimeConfig::from_sources(None, Some("bad-target"), None, None, None)
             .expect_err("invalid target should fail");
         assert!(err.to_string().contains("invalid target"));
     }
 
     #[test]
     fn tun_runtime_config_rejects_zero_pool_size() {
-        let err = TunRuntimeConfig::from_sources(None, None, Some("0"))
+        let err = TunRuntimeConfig::from_sources(None, None, Some("0"), None, None)
             .expect_err("zero pool size should fail");
         assert!(err.to_string().contains("at least 1"));
     }
 
     #[test]
     fn tun_runtime_config_accepts_valid_override_values() {
-        let config =
-            TunRuntimeConfig::from_sources(Some("8081"), Some("www.figma.com:443"), Some("3"))
-                .expect("valid config should load");
+        let config = TunRuntimeConfig::from_sources(
+            Some("8081"),
+            Some("www.figma.com:443"),
+            Some("3"),
+            None,
+            None,
+        )
+        .expect("valid config should load");
 
-        assert_eq!(config.local_port, 8081);
-        assert_eq!(config.pool_size, 3);
-        assert_eq!(config.target_addr.to_wire_string(), "www.figma.com:443");
+        assert_eq!(config.listener.local_port, 8081);
+        assert_eq!(config.listener.pool_size, 3);
+        assert_eq!(config.listener.target_addr.to_wire_string(), "www.figma.com:443");
+    }
+
+    #[test]
+    fn tun_runtime_config_defaults_include_upstream_values() {
+        let config = TunRuntimeConfig::from_sources(None, None, None, None, None)
+            .expect("config should load");
+
+        assert_eq!(config.listener.local_port, 80);
+        assert_eq!(config.listener.pool_size, 4);
+        assert_eq!(config.listener.target_addr.to_wire_string(), "httpbin.org:80");
+        assert_eq!(config.upstream.server_addr, "127.0.0.1:8081");
+        assert_eq!(config.upstream.tls_sni, "localhost");
     }
 }
