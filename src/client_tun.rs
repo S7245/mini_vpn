@@ -215,18 +215,20 @@ impl TunRuntimeConfig {
     }
 
     /// Read config from process environment.
-    /// 中文要点：先保留 Stage 5 的环境变量入口，Stage 6 再补 upstream 变量接线。
+    /// 中文要点：Stage 6 在 Stage 5 基础上新增 upstream 配置入口，但仍保持最小环境变量方案。
     fn from_env() -> Result<Self, ClientError> {
         let local_port = std::env::var("MINI_VPN_TUN_LOCAL_PORT").ok();
         let target_addr = std::env::var("MINI_VPN_TUN_TARGET_ADDR").ok();
         let pool_size = std::env::var("MINI_VPN_TUN_POOL_SIZE").ok();
+        let server_addr = std::env::var("MINI_VPN_TUN_SERVER_ADDR").ok();
+        let tls_sni = std::env::var("MINI_VPN_TUN_TLS_SNI").ok();
 
         Self::from_sources(
             local_port.as_deref(),
             target_addr.as_deref(),
             pool_size.as_deref(),
-            None,
-            None,
+            server_addr.as_deref(),
+            tls_sni.as_deref(),
         )
     }
 }
@@ -241,6 +243,8 @@ pub async fn start_tun_proxy() {
     };
     let listener_spec = runtime_config.listener.listener_spec();
     let default_target = runtime_config.listener.target_addr.clone();
+    let upstream_server_addr = runtime_config.upstream.server_addr.clone();
+    let upstream_tls_sni = runtime_config.upstream.tls_sni.clone();
 
     let mut root_cert_store = RootCertStore::empty();
     let cert_file = &mut BufReader::new(File::open("cert.pem").unwrap());
@@ -260,10 +264,12 @@ pub async fn start_tun_proxy() {
     // =========== 1. 初始化底层网卡和通道 ===========
 
     println!(
-        "🚀 TUN runtime started with local_port={}, pool_size={}, target={}",
+        "🚀 TUN runtime started with local_port={}, pool_size={}, target={}, server_addr={}, tls_sni={}",
         listener_spec.local_port,
         listener_spec.pool_size,
-        default_target.to_wire_string()
+        default_target.to_wire_string(),
+        upstream_server_addr,
+        upstream_tls_sni
     );
 
     // 1. 初始化 TUN 设备(化底层网卡和通道) / 创建操作系统的原生异步虚拟网卡
@@ -299,7 +305,7 @@ pub async fn start_tun_proxy() {
     // 3. 初始化定时器 (例如每 5 毫秒触发一次)
     let mut timer = tokio::time::interval(std::time::Duration::from_millis(5));
 
-    let domain = match ServerName::try_from("localhost") {
+    let domain = match ServerName::try_from(upstream_tls_sni.as_str()) {
         Ok(domain) => domain,
         Err(e) => {
             println!("解析 SNI 域名失败: {e:?}");
@@ -307,7 +313,7 @@ pub async fn start_tun_proxy() {
         }
     };
 
-    let server_stream = TcpStream::connect("127.0.0.1:8081")
+    let server_stream = TcpStream::connect(upstream_server_addr.as_str())
         .await
         .expect("TcpStream 连接错误");
 
@@ -757,5 +763,25 @@ mod tests {
         assert_eq!(config.listener.target_addr.to_wire_string(), "httpbin.org:80");
         assert_eq!(config.upstream.server_addr, "127.0.0.1:8081");
         assert_eq!(config.upstream.tls_sni, "localhost");
+    }
+
+    #[test]
+    fn tun_runtime_config_accepts_listener_and_upstream_overrides() {
+        let config = TunRuntimeConfig::from_sources(
+            Some("8080"),
+            Some("127.0.0.1:7897"),
+            Some("2"),
+            Some("127.0.0.1:9000"),
+            Some("example.com"),
+        )
+        .expect("config should load");
+
+        let listener_spec = config.listener.listener_spec();
+
+        assert_eq!(listener_spec.local_port, 8080);
+        assert_eq!(listener_spec.pool_size, 2);
+        assert_eq!(config.listener.target_addr.to_wire_string(), "127.0.0.1:7897");
+        assert_eq!(config.upstream.server_addr, "127.0.0.1:9000");
+        assert_eq!(config.upstream.tls_sni, "example.com");
     }
 }
