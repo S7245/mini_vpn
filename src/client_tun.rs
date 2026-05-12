@@ -784,4 +784,20 @@ mod tests {
         assert_eq!(config.upstream.server_addr, "127.0.0.1:9000");
         assert_eq!(config.upstream.tls_sni, "example.com");
     }
+
+    #[test]
+    fn tun_runtime_config_rejects_invalid_upstream_server_addr() {
+        let err = TunRuntimeConfig::from_sources(None, None, None, Some("bad-addr"), None)
+            .expect_err("invalid upstream server addr should fail");
+        assert!(err
+            .to_string()
+            .contains("invalid upstream server addr"));
+    }
+
+    #[test]
+    fn tun_runtime_config_rejects_invalid_upstream_tls_sni() {
+        let err = TunRuntimeConfig::from_sources(None, None, None, None, Some("bad sni"))
+            .expect_err("invalid upstream tls sni should fail");
+        assert!(err.to_string().contains("invalid upstream tls sni"));
+    }
 }
