@@ -313,9 +313,13 @@ pub async fn start_tun_proxy() {
         }
     };
 
-    let server_stream = TcpStream::connect(upstream_server_addr.as_str())
-        .await
-        .expect("TcpStream 连接错误");
+    let server_stream = match TcpStream::connect(upstream_server_addr.as_str()).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            println!("连接代理服务端失败 {upstream_server_addr}: {e}");
+            return;
+        }
+    };
 
      let tls_stream = match connector.clone().connect(domain, server_stream).await {
         Ok(s) => s,

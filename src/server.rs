@@ -11,8 +11,47 @@ use tokio_rustls::rustls::{Certificate, PrivateKey, ServerConfig};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use yamux::{Config, Connection, Mode};
 
+const DEFAULT_SERVER_BIND_ADDR: &str = "127.0.0.1:8081";
+
+/// Startup configuration for the relay server listener.
+/// 中文要点：这一层只负责“服务端监听在哪个地址”，不参与 TLS/Yamux 业务逻辑。
+#[derive(Debug, Clone)]
+struct ServerRuntimeConfig {
+    /// TCP bind address used by the relay server listener.
+    /// 中文要点：这是服务端真正对外监听的地址，客户端的 upstream 地址要和它对齐。
+    bind_addr: String,
+}
+
+impl ServerRuntimeConfig {
+    /// Build the server runtime config from optional sources.
+    /// 中文要点：当前先保持最小配置面，只开放监听地址一个入口。
+    fn from_sources(bind_addr: Option<&str>) -> Result<Self, String> {
+        let bind_addr = bind_addr.unwrap_or(DEFAULT_SERVER_BIND_ADDR).to_string();
+        bind_addr
+            .parse::<std::net::SocketAddr>()
+            .map_err(|_| format!("invalid server bind addr: {bind_addr}"))?;
+
+        Ok(Self { bind_addr })
+    }
+
+    /// Read the bind address from process environment.
+    /// 中文要点：默认值继续兼容 127.0.0.1:8081，只有显式传值时才覆盖。
+    fn from_env() -> Result<Self, String> {
+        let bind_addr = std::env::var("MINI_VPN_SERVER_BIND_ADDR").ok();
+        Self::from_sources(bind_addr.as_deref())
+    }
+}
+
 pub async fn run() {
-    println!("运行服务器端");
+    let runtime_config = match ServerRuntimeConfig::from_env() {
+        Ok(config) => config,
+        Err(e) => {
+            println!("加载服务端运行时配置失败: {e}");
+            return;
+        }
+    };
+
+    println!("运行服务器端，监听地址: {}", runtime_config.bind_addr);
 
     // 1. 读取证书和私钥
     let cert_file = &mut BufReader::new(File::open("cert.pem").unwrap());
@@ -36,8 +75,8 @@ pub async fn run() {
 
     let acceptor = TlsAcceptor::from(Arc::new(config));
 
-    // 1. 在 server 分支里，让 TcpListener 监听 "127.0.0.1:8081"，并加上我们熟悉的 loop 和 tokio::spawn 结构。
-    let listener = match TcpListener::bind("127.0.0.1:8081").await {
+    // 服务端监听地址来自显式配置，这样可以和 client-tun 的 upstream 覆盖值对齐。
+    let listener = match TcpListener::bind(runtime_config.bind_addr.as_str()).await {
         Ok(listener) => listener,
         Err(e) => {
             println!("绑定失败: {e:?}");
@@ -233,5 +272,30 @@ pub async fn run() {
             }
             println!("一条 Yamux 多路复用长连接已断开");
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_SERVER_BIND_ADDR, ServerRuntimeConfig};
+
+    #[test]
+    fn server_runtime_config_defaults_match_existing_behavior() {
+        let config = ServerRuntimeConfig::from_sources(None).expect("config should load");
+        assert_eq!(config.bind_addr, DEFAULT_SERVER_BIND_ADDR);
+    }
+
+    #[test]
+    fn server_runtime_config_accepts_valid_bind_addr() {
+        let config = ServerRuntimeConfig::from_sources(Some("127.0.0.1:9000"))
+            .expect("config should load");
+        assert_eq!(config.bind_addr, "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn server_runtime_config_rejects_invalid_bind_addr() {
+        let err = ServerRuntimeConfig::from_sources(Some("bad-addr"))
+            .expect_err("invalid bind addr should fail");
+        assert!(err.contains("invalid server bind addr"));
     }
 }
