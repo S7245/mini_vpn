@@ -12,6 +12,8 @@ use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use yamux::{Config, Connection, Mode};
 
 const DEFAULT_SERVER_BIND_ADDR: &str = "127.0.0.1:8081";
+const DEFAULT_SERVER_CERT_PATH: &str = "cert.pem";
+const DEFAULT_SERVER_KEY_PATH: &str = "key.pem";
 
 /// Startup configuration for the relay server listener.
 /// 中文要点：这一层只负责“服务端监听在哪个地址”，不参与 TLS/Yamux 业务逻辑。
@@ -42,6 +44,48 @@ impl ServerRuntimeConfig {
     }
 }
 
+/// Startup configuration for server-side TLS material files.
+/// 中文要点：这一层只描述服务端要加载哪张证书、哪把私钥，不负责监听地址。
+#[derive(Debug, Clone)]
+struct ServerTlsConfig {
+    /// PEM certificate chain path used by the TLS acceptor.
+    /// 中文要点：服务端握手时发给客户端的证书链文件路径。
+    cert_path: String,
+    /// PKCS8 private key path paired with the certificate chain.
+    /// 中文要点：和证书配套的私钥文件路径。
+    key_path: String,
+}
+
+impl ServerTlsConfig {
+    /// Build TLS material config from optional string sources.
+    /// 中文要点：本阶段先做最小路径配置，空字符串直接视为非法输入。
+    fn from_sources(cert_path: Option<&str>, key_path: Option<&str>) -> Result<Self, String> {
+        let cert_path = cert_path.unwrap_or(DEFAULT_SERVER_CERT_PATH).to_string();
+        let key_path = key_path.unwrap_or(DEFAULT_SERVER_KEY_PATH).to_string();
+
+        if cert_path.trim().is_empty() {
+            return Err("invalid server cert path: empty".to_string());
+        }
+
+        if key_path.trim().is_empty() {
+            return Err("invalid server key path: empty".to_string());
+        }
+
+        Ok(Self {
+            cert_path,
+            key_path,
+        })
+    }
+
+    /// Read TLS material paths from process environment.
+    /// 中文要点：默认继续兼容 `cert.pem` / `key.pem`，只有显式传值时才覆盖。
+    fn from_env() -> Result<Self, String> {
+        let cert_path = std::env::var("MINI_VPN_SERVER_CERT_PATH").ok();
+        let key_path = std::env::var("MINI_VPN_SERVER_KEY_PATH").ok();
+        Self::from_sources(cert_path.as_deref(), key_path.as_deref())
+    }
+}
+
 pub async fn run() {
     let runtime_config = match ServerRuntimeConfig::from_env() {
         Ok(config) => config,
@@ -51,11 +95,36 @@ pub async fn run() {
         }
     };
 
-    println!("运行服务器端，监听地址: {}", runtime_config.bind_addr);
+    let tls_config = match ServerTlsConfig::from_env() {
+        Ok(config) => config,
+        Err(e) => {
+            println!("加载服务端 TLS 配置失败: {e}");
+            return;
+        }
+    };
+
+    println!(
+        "运行服务器端，监听地址: {}, cert_path: {}, key_path: {}",
+        runtime_config.bind_addr, tls_config.cert_path, tls_config.key_path
+    );
 
     // 1. 读取证书和私钥
-    let cert_file = &mut BufReader::new(File::open("cert.pem").unwrap());
-    let key_file = &mut BufReader::new(File::open("key.pem").unwrap());
+    let cert_file = match File::open(tls_config.cert_path.as_str()) {
+        Ok(file) => file,
+        Err(e) => {
+            println!("打开服务端证书失败 {}: {e}", tls_config.cert_path);
+            return;
+        }
+    };
+    let key_file = match File::open(tls_config.key_path.as_str()) {
+        Ok(file) => file,
+        Err(e) => {
+            println!("打开服务端私钥失败 {}: {e}", tls_config.key_path);
+            return;
+        }
+    };
+    let cert_file = &mut BufReader::new(cert_file);
+    let key_file = &mut BufReader::new(key_file);
 
     let cert_chain = rustls_pemfile::certs(cert_file)
         .unwrap()
@@ -277,7 +346,7 @@ pub async fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_SERVER_BIND_ADDR, ServerRuntimeConfig};
+    use super::{DEFAULT_SERVER_BIND_ADDR, ServerRuntimeConfig, ServerTlsConfig};
 
     #[test]
     fn server_runtime_config_defaults_match_existing_behavior() {
@@ -297,5 +366,23 @@ mod tests {
         let err = ServerRuntimeConfig::from_sources(Some("bad-addr"))
             .expect_err("invalid bind addr should fail");
         assert!(err.contains("invalid server bind addr"));
+    }
+
+    #[test]
+    fn server_tls_config_defaults_match_existing_behavior() {
+        let config = ServerTlsConfig::from_sources(None, None).expect("config should load");
+        assert_eq!(config.cert_path, "cert.pem");
+        assert_eq!(config.key_path, "key.pem");
+    }
+
+    #[test]
+    fn server_tls_config_accepts_override_paths() {
+        let config = ServerTlsConfig::from_sources(
+            Some("certs/dev/server-cert.pem"),
+            Some("certs/dev/server-key.pem"),
+        )
+        .expect("config should load");
+        assert_eq!(config.cert_path, "certs/dev/server-cert.pem");
+        assert_eq!(config.key_path, "certs/dev/server-key.pem");
     }
 }
