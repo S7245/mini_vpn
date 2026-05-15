@@ -25,6 +25,7 @@ const RELAY_CHANNEL_CAPACITY: usize = 1024;
 const DEFAULT_TUN_POOL_SIZE: usize = 4;
 const DEFAULT_TUN_SERVER_ADDR: &str = "127.0.0.1:8081";
 const DEFAULT_TUN_TLS_SNI: &str = "localhost";
+const DEFAULT_TUN_CA_PATH: &str = "cert.pem";
 
 /// Describes how many local TCP listener slots the TUN runtime should create.
 /// 中文要点：这是监听池的蓝图，不代表连接本身，只描述“开几间房、监听哪个端口”。
@@ -190,12 +191,38 @@ impl TunUpstreamConfig {
     }
 }
 
+/// TLS trust material configuration for the TUN client.
+/// 中文要点：这一层只负责“信任哪份 CA 证书”，不参与监听池和上游地址解析。
+#[derive(Debug, Clone)]
+struct TunTlsConfig {
+    /// PEM CA certificate path loaded into the rustls root store.
+    /// 中文要点：客户端用它校验服务端证书链。
+    ca_path: String,
+}
+
+impl TunTlsConfig {
+    /// Build TLS trust config from optional string sources.
+    /// 中文要点：当前最小配置面只开放 CA 路径，空字符串直接视为非法输入。
+    fn from_sources(ca_path: Option<&str>) -> Result<Self, ClientError> {
+        let ca_path = ca_path.unwrap_or(DEFAULT_TUN_CA_PATH).to_string();
+
+        if ca_path.trim().is_empty() {
+            return Err(ClientError::InvalidTarget(
+                "invalid tun ca path: empty".to_string(),
+            ));
+        }
+
+        Ok(Self { ca_path })
+    }
+}
+
 /// Startup configuration for the TUN runtime.
-/// 中文要点：总配置壳只负责把 listener 与 upstream 两类配置组合起来。
+/// 中文要点：总配置壳负责把 listener、upstream、tls 三类配置组合起来。
 #[derive(Debug, Clone)]
 struct TunRuntimeConfig {
     listener: TunListenerConfig,
     upstream: TunUpstreamConfig,
+    tls: TunTlsConfig,
 }
 
 impl TunRuntimeConfig {
@@ -207,10 +234,12 @@ impl TunRuntimeConfig {
         pool_size: Option<&str>,
         server_addr: Option<&str>,
         tls_sni: Option<&str>,
+        ca_path: Option<&str>,
     ) -> Result<Self, ClientError> {
         Ok(Self {
             listener: TunListenerConfig::from_sources(local_port, target_addr, pool_size)?,
             upstream: TunUpstreamConfig::from_sources(server_addr, tls_sni)?,
+            tls: TunTlsConfig::from_sources(ca_path)?,
         })
     }
 
@@ -222,6 +251,7 @@ impl TunRuntimeConfig {
         let pool_size = std::env::var("MINI_VPN_TUN_POOL_SIZE").ok();
         let server_addr = std::env::var("MINI_VPN_TUN_SERVER_ADDR").ok();
         let tls_sni = std::env::var("MINI_VPN_TUN_TLS_SNI").ok();
+        let ca_path = std::env::var("MINI_VPN_TUN_CA_PATH").ok();
 
         Self::from_sources(
             local_port.as_deref(),
@@ -229,6 +259,7 @@ impl TunRuntimeConfig {
             pool_size.as_deref(),
             server_addr.as_deref(),
             tls_sni.as_deref(),
+            ca_path.as_deref(),
         )
     }
 }
@@ -245,9 +276,17 @@ pub async fn start_tun_proxy() {
     let default_target = runtime_config.listener.target_addr.clone();
     let upstream_server_addr = runtime_config.upstream.server_addr.clone();
     let upstream_tls_sni = runtime_config.upstream.tls_sni.clone();
+    let tls_ca_path = runtime_config.tls.ca_path.clone();
 
     let mut root_cert_store = RootCertStore::empty();
-    let cert_file = &mut BufReader::new(File::open("cert.pem").unwrap());
+    let cert_file = match File::open(tls_ca_path.as_str()) {
+        Ok(file) => file,
+        Err(e) => {
+            println!("打开客户端 CA 证书失败 {}: {e}", tls_ca_path);
+            return;
+        }
+    };
+    let cert_file = &mut BufReader::new(cert_file);
     let certs = rustls_pemfile::certs(cert_file).unwrap();
     for cert in certs {
         root_cert_store.add(&Certificate(cert)).unwrap();
@@ -264,12 +303,13 @@ pub async fn start_tun_proxy() {
     // =========== 1. 初始化底层网卡和通道 ===========
 
     println!(
-        "🚀 TUN runtime started with local_port={}, pool_size={}, target={}, server_addr={}, tls_sni={}",
+        "🚀 TUN runtime started with local_port={}, pool_size={}, target={}, server_addr={}, tls_sni={}, ca_path={}",
         listener_spec.local_port,
         listener_spec.pool_size,
         default_target.to_wire_string(),
         upstream_server_addr,
-        upstream_tls_sni
+        upstream_tls_sni,
+        tls_ca_path
     );
 
     // 1. 初始化 TUN 设备(化底层网卡和通道) / 创建操作系统的原生异步虚拟网卡
@@ -694,7 +734,7 @@ mod tests {
 
     #[test]
     fn tun_runtime_config_defaults_match_stage4_behavior() {
-        let config = TunRuntimeConfig::from_sources(None, None, None, None, None)
+        let config = TunRuntimeConfig::from_sources(None, None, None, None, None, None)
             .expect("config should load");
 
         assert_eq!(config.listener.local_port, 80);
@@ -710,6 +750,7 @@ mod tests {
             Some("2"),
             None,
             None,
+            None,
         )
         .expect("config should load");
 
@@ -722,21 +763,22 @@ mod tests {
 
     #[test]
     fn tun_runtime_config_rejects_invalid_local_port() {
-        let err = TunRuntimeConfig::from_sources(Some("abc"), None, None, None, None)
+        let err = TunRuntimeConfig::from_sources(Some("abc"), None, None, None, None, None)
             .expect_err("invalid port should fail");
         assert!(err.to_string().contains("invalid local port"));
     }
 
     #[test]
     fn tun_runtime_config_rejects_invalid_target_addr() {
-        let err = TunRuntimeConfig::from_sources(None, Some("bad-target"), None, None, None)
+        let err =
+            TunRuntimeConfig::from_sources(None, Some("bad-target"), None, None, None, None)
             .expect_err("invalid target should fail");
         assert!(err.to_string().contains("invalid target"));
     }
 
     #[test]
     fn tun_runtime_config_rejects_zero_pool_size() {
-        let err = TunRuntimeConfig::from_sources(None, None, Some("0"), None, None)
+        let err = TunRuntimeConfig::from_sources(None, None, Some("0"), None, None, None)
             .expect_err("zero pool size should fail");
         assert!(err.to_string().contains("at least 1"));
     }
@@ -749,6 +791,7 @@ mod tests {
             Some("3"),
             None,
             None,
+            None,
         )
         .expect("valid config should load");
 
@@ -759,7 +802,7 @@ mod tests {
 
     #[test]
     fn tun_runtime_config_defaults_include_upstream_values() {
-        let config = TunRuntimeConfig::from_sources(None, None, None, None, None)
+        let config = TunRuntimeConfig::from_sources(None, None, None, None, None, None)
             .expect("config should load");
 
         assert_eq!(config.listener.local_port, 80);
@@ -767,6 +810,7 @@ mod tests {
         assert_eq!(config.listener.target_addr.to_wire_string(), "httpbin.org:80");
         assert_eq!(config.upstream.server_addr, "127.0.0.1:8081");
         assert_eq!(config.upstream.tls_sni, "localhost");
+        assert_eq!(config.tls.ca_path, "cert.pem");
     }
 
     #[test]
@@ -777,6 +821,7 @@ mod tests {
             Some("2"),
             Some("127.0.0.1:9000"),
             Some("example.com"),
+            Some("certs/dev/ca-cert.pem"),
         )
         .expect("config should load");
 
@@ -787,12 +832,14 @@ mod tests {
         assert_eq!(config.listener.target_addr.to_wire_string(), "127.0.0.1:7897");
         assert_eq!(config.upstream.server_addr, "127.0.0.1:9000");
         assert_eq!(config.upstream.tls_sni, "example.com");
+        assert_eq!(config.tls.ca_path, "certs/dev/ca-cert.pem");
     }
 
     #[test]
     fn tun_runtime_config_rejects_invalid_upstream_server_addr() {
-        let err = TunRuntimeConfig::from_sources(None, None, None, Some("bad-addr"), None)
-            .expect_err("invalid upstream server addr should fail");
+        let err =
+            TunRuntimeConfig::from_sources(None, None, None, Some("bad-addr"), None, None)
+                .expect_err("invalid upstream server addr should fail");
         assert!(err
             .to_string()
             .contains("invalid upstream server addr"));
@@ -800,8 +847,21 @@ mod tests {
 
     #[test]
     fn tun_runtime_config_rejects_invalid_upstream_tls_sni() {
-        let err = TunRuntimeConfig::from_sources(None, None, None, None, Some("bad sni"))
+        let err = TunRuntimeConfig::from_sources(None, None, None, None, Some("bad sni"), None)
             .expect_err("invalid upstream tls sni should fail");
         assert!(err.to_string().contains("invalid upstream tls sni"));
+    }
+
+    #[test]
+    fn tun_tls_config_defaults_match_existing_behavior() {
+        let config = TunTlsConfig::from_sources(None).expect("config should load");
+        assert_eq!(config.ca_path, "cert.pem");
+    }
+
+    #[test]
+    fn tun_tls_config_accepts_override_path() {
+        let config = TunTlsConfig::from_sources(Some("certs/dev/ca-cert.pem"))
+            .expect("config should load");
+        assert_eq!(config.ca_path, "certs/dev/ca-cert.pem");
     }
 }
