@@ -1,3 +1,6 @@
 /target
 
 .DS_Store
+
+# Claude Code session worktrees and local state — never commit into the repo tree
+.claude/
