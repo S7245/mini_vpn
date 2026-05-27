@@ -123,12 +123,15 @@ target_from_endpoint(endpoint: IpEndpoint) -> TargetAddr
 
 ### 本机手动联调（验收 recipe）
 
-1. 选稳定 HTTP Target：`example.com` = `93.184.216.34:80`。
-2. 起 Upstream（server），确保它能出网连 `example.com:80`。
+> 用 IP 字面量做靶子，不要用域名：开发机若装了 TUN 代理（Clash/Mihomo）会用 fake-ip
+> 劫持 DNS（`198.18.0.0/15`），域名会被解析成假 IP。详细 runbook 见 `08-target-extraction.md`。
+
+1. preflight：`curl -m 8 -o /dev/null -w "%{http_code}\n" http://1.1.1.1/` 期望 `301`。
+2. 起 Upstream（server），确保它能出网连 `1.1.1.1:80`。
 3. `sudo -E ./target/debug/mini_vpn client-tun`（默认监听 80）。
-4. `ifconfig` 取 utun 号，`sudo route add -host 93.184.216.34 -interface utun<N>`。
-5. `curl http://93.184.216.34/`。
-6. 预期：client 打印提取出的 Target `93.184.216.34:80`；server 打印"解析出的目标地址是: 93.184.216.34:80"并返回 example.com 的 HTML。
+4. 取本项目 utun 号（地址 10.0.0.1），`sudo route -n add -host 1.1.1.1 -interface utun<N>`。
+5. `curl -v http://1.1.1.1/`。
+6. 预期：client 打印 `🎯 ... extracted target 1.1.1.1:80`；server 打印"解析出的目标地址是: 1.1.1.1:80"并返回 301。
 
 ## 文件范围
 
