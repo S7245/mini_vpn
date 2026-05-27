@@ -399,3 +399,77 @@ curl -H "Authorization: Bearer <token>" /api/nodes  # 应返回节点列表
 | 控制面语言 | **Rust Axum** | 与数据面共享 crate，减少语言边界；团队 Go 更熟可换 |
 | 文本 vs 二进制协议 | **保留文本，暂不升级** | 瓶颈在网络 RTT，过早优化增加复杂度 |
 | CDN 前置 vs 直连 | **Phase 1-4 直连** | CDN 前置增加延迟，先验证直连稳定性 |
+
+---
+
+## 10. 多服务器快速部署方案
+
+### 10.1 核心流程（方案 A：推荐）
+
+```
+git push main
+    ↓
+GitHub Actions (.github/workflows/deploy.yml)
+    ├─ cargo test
+    ├─ cargo build --release --target x86_64-unknown-linux-musl
+    ├─ docker build (多阶段，scratch 基础镜像，< 15MB)
+    └─ docker push → ghcr.io/org/mini_vpn:latest + :abc1234 (git SHA)
+                                    ↓
+                      各中继服务器上的 Watchtower（每 5 分钟轮询）
+                      发现新 :latest → docker pull → 重启容器
+                      全部节点在 5 分钟内完成滚动更新
+```
+
+**开发者体验**：只需 `git push`，无需 SSH 到任何服务器。
+
+### 10.2 新文件清单
+
+```
+Dockerfile                              # 多阶段构建，scratch 基础镜像
+.github/
+└── workflows/
+    ├── deploy.yml                      # 方案 A：Docker + GHCR（主流程）
+    └── deploy-ssh.yml                  # 方案 B：SSH + systemd（备选，≤10台）
+scripts/
+├── server-init.sh                      # 新服务器一次性初始化
+└── rollback.sh                         # 紧急回滚到指定 git SHA 或版本
+deploy/
+└── systemd/
+    └── mini_vpn.service               # systemd 单元文件（方案 B 使用）
+```
+
+### 10.3 新服务器接入步骤
+
+```bash
+# 1. 上传证书（一次性）
+scp cert.pem key.pem root@relay-us-3.example.com:/etc/mini_vpn/
+
+# 2. 运行初始化脚本（一次性）
+ssh root@relay-us-3.example.com \
+    "bash <(curl -fsSL https://raw.githubusercontent.com/org/mini_vpn/main/scripts/server-init.sh) <GITHUB_PAT>"
+
+# 3. 完成——后续更新完全自动
+```
+
+### 10.4 版本回滚
+
+```bash
+# 查找目标版本的 git SHA（在 GitHub Actions 构建日志或 git log 中获取）
+git log --oneline -10
+
+# 并行回滚所有服务器到指定版本
+bash scripts/rollback.sh abc1234
+
+# 或只回滚特定服务器
+SERVERS="relay-us-1.example.com" bash scripts/rollback.sh abc1234
+```
+
+### 10.5 两种方案对比
+
+| 维度 | 方案 A（Docker + Watchtower）| 方案 B（SSH + systemd）|
+|---|---|---|
+| 新增服务器 | 运行 `server-init.sh`，无需改 CI | 需在 `deploy-ssh.yml` 矩阵中追加一行 |
+| 更新触发 | 各服务器自主拉取（推送后 ≤5min）| CI 主动推送（推送后 ≤2min）|
+| 回滚 | `rollback.sh <sha>`（任意服务器）| 需重新构建或保留旧二进制 |
+| 停机时间 | ~1s（docker stop/start）| ~1s（systemctl restart）|
+| 适用规模 | **10+ 台** | **≤10 台** |

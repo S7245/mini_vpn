@@ -1,0 +1,98 @@
+# ── Deploy: GitHub Actions → GHCR → Watchtower ────────────────────────────────
+#
+# 方案 A（推荐）：构建 Docker 镜像 → 推送到 GHCR → 各服务器 Watchtower 自动拉取。
+#
+# 触发条件：
+#   - push 到 main 分支
+#   - 手动点击 Actions 页面的 "Run workflow"
+#
+# 前置要求（无需额外 Secrets，GITHUB_TOKEN 由 GitHub 自动提供）：
+#   - 各中继服务器已运行 Watchtower，配置见 scripts/server-init.sh
+#
+# 更新流程：
+#   git push main → Actions 构建新镜像 → push :latest → Watchtower 5min 内自动更新所有节点
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: Build & Deploy (Docker + Watchtower)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # ghcr.io/<owner>/mini_vpn，由 github.repository 自动推导
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run test suite
+        run: cargo test --locked
+
+  build-and-push:
+    name: Build image and push to GHCR
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # 允许推送到 ghcr.io
+
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tags: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 多平台构建加速（可选，目前只构建 linux/amd64）
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 生成镜像标签：
+      #   :latest      → 始终指向最新构建
+      #   :abc1234     → git short SHA，用于精确回滚
+      #   :v1.2.3      → 当推送 tag 时自动生成语义化版本标签
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=,suffix=,format=short
+            type=semver,pattern={{version}}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 利用 GitHub Actions 缓存加速后续构建（Rust 依赖层）
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Print deployed image info
+        run: |
+          echo "✅ Image pushed:"
+          echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n'
+          echo "Digest: ${{ steps.build.outputs.digest }}"

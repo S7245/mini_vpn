@@ -3,6 +3,16 @@ name = "mini_vpn"
 version = "0.1.0"
 edition = "2024"
 
+# ── Release profile ───────────────────────────────────────────────────────────
+# 中文要点：LTO 和 codegen-units=1 让编译器跨编译单元优化，减小二进制体积、提升运行速度。
+# 代价是编译时间增加，但只在 --release 时生效，不影响开发迭代速度。
+[profile.release]
+lto = true            # 链接时优化（Link-Time Optimization）
+codegen-units = 1     # 单编译单元，最大化优化深度
+strip = true          # 剥除调试符号，减小 Docker 镜像体积
+opt-level = 3         # 最高优化等级（Rust 默认 release 已是 3，此处显式声明）
+panic = "abort"       # 去掉 unwinding 代码，进一步缩小体积
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 chacha20poly1305 = "0.10"
