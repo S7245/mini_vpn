@@ -496,6 +496,14 @@ fn build_listener_pool(
     )
 }
 
+/// Convert a smoltcp endpoint into a relay Target.
+/// 中文要点：TUN 链路上目的地址在 IP 层已是裸 IP（域名早被 DNS 解析掉），
+/// 这里统一转成 `TargetAddr::IpPort`。当前 crate 只开 `proto-ipv4`，故必为 IPv4。
+fn target_from_endpoint(endpoint: smoltcp::wire::IpEndpoint) -> TargetAddr {
+    let ip = std::net::IpAddr::from(endpoint.addr);
+    TargetAddr::IpPort(std::net::SocketAddr::new(ip, endpoint.port))
+}
+
 /// Drain the currently available local payload from one listener slot.
 /// 中文要点：这里只负责把 smoltcp 缓冲区里的数据取出来，不做任何异步外联动作。
 fn extract_socket_payload(socket: &mut TcpSocket<'_>) -> Option<Vec<u8>> {
@@ -690,6 +698,13 @@ pub async fn create_tun_device() -> tun::Result<tun::AsyncDevice> {
 mod tests {
     use super::*;
     use smoltcp::iface::SocketSet;
+
+    #[test]
+    fn target_from_endpoint_builds_ipv4_target() {
+        let ep = smoltcp::wire::IpEndpoint::new(IpAddress::v4(93, 184, 216, 34), 80);
+        let target = target_from_endpoint(ep);
+        assert_eq!(target.to_wire_string(), "93.184.216.34:80");
+    }
 
     #[test]
     fn build_listener_pool_creates_four_handles_and_contexts() {

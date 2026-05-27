@@ -27,11 +27,11 @@ with a default route whose gateway is the interface's own IP.
 
 ---
 
-### Task 1: `target_from_endpoint` helper (TDD)
+### Task 1: `target_from_endpoint` helper (TDD) — DONE
 
 **Files:** Modify `src/client_tun.rs`
 
-- [ ] **Step 1: Write the failing test** in the `#[cfg(test)]` module:
+- [x] **Step 1: Write the failing test** in the `#[cfg(test)]` module:
 
 ```rust
     #[test]
