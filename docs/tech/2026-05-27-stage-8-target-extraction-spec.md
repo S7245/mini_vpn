@@ -147,7 +147,10 @@ target_from_endpoint(endpoint: IpEndpoint) -> TargetAddr
 Stage 8 完成时应满足：
 
 1. 代码中不再存在任何写死的 TUN Target。
-2. 路由一个真实 port-80 主机进 utun 后，Upstream 实际连到该真实 IP 并返回内容。
+2. Target 提取验证（同机即可）：路由一个真实 IP 进 utun 后，client 日志打印
+   `🎯 extracted target <ip:port>`，server 日志打印对应 `解析出的目标地址是`。
+   （完整字节往返需把 Upstream 放到另一台机器，否则全机路由会劫持 server 自身出口，
+   见 `08-target-extraction.md` 拓扑要求。）
 3. `cargo test`
 4. `cargo check`
 5. `cargo clippy --all-targets --all-features -- -D warnings`

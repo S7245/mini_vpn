@@ -144,6 +144,41 @@ sudo route -n add -host 198.51.100.10 -interface "$UT"
 curl -v http://198.51.100.10:8080/               # 期望返回目录列表，client/server 日志显示 target 198.51.100.10:8080
 ```
 
+## 拓扑要求：Upstream 必须在另一台机器（否则字节回不来）
+
+`route add -host <target> -interface <utun>` 是**全机生效**的。若 Upstream（server）
+跑在与 client-tun **同一台机器**上，server 自己 `connect(<target>)` 的出站也会被这条
+路由拽进本机 TUN，到不了真实目标 → `Connection refused` / 回环。
+
+- **Target 提取本身在同机即可验证**（client 日志的 `🎯 extracted target` + server 日志的
+  `解析出的目标地址是`）。
+- **完整字节往返必须把 Upstream 放到另一台机器**（真 VPN 拓扑，例如美国服务器）。
+
+### 跨机往返测试（美国服务器当 Upstream）
+
+US 服务器上（构建后）：
+
+```bash
+MINI_VPN_SERVER_BIND_ADDR=0.0.0.0:8081 \
+MINI_VPN_SERVER_CERT_PATH=certs/dev/server-cert.pem \
+MINI_VPN_SERVER_KEY_PATH=certs/dev/server-key.pem \
+./mini_vpn server
+```
+
+客户端（深圳 Mac；tls_sni 取证书 SAN 里有的名字，证书与连接 IP 解耦）：
+
+```bash
+MINI_VPN_TUN_SERVER_ADDR=<US_IP>:8081 \
+MINI_VPN_TUN_TLS_SNI=example.com \
+MINI_VPN_TUN_CA_PATH=certs/dev/ca-cert.pem \
+sudo -E ./target/debug/mini_vpn client-tun 2>&1 | tee /tmp/mv-client.log
+
+UT=$(ifconfig | awk '/^utun/{i=$1} /inet 10\.0\.0\.1 /{print i}' | tr -d ':')
+sudo route -n add -host 1.1.1.1 -interface "$UT"
+curl -v -m 15 http://1.1.1.1/        # 期望 301，server 在 US 机出网不再被本机路由劫持
+sudo route -n delete -host 1.1.1.1
+```
+
 ## 排障：`curl: (52) Empty reply from server`
 
 TCP 连接被接受了但没收到任何应用层字节。逐层定位：
