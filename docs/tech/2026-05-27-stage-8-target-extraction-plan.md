@@ -87,11 +87,11 @@ catch-all that returns the same IPv4 path; only `proto-ipv4` is enabled.)
 
 - [ ] **Step 3: Commit** `feat(tun): enable smoltcp AnyIP for arbitrary destination IPs`.
 
-### Task 3: Extract Target at first payload; drop hardcoded target
+### Task 3: Extract Target at first payload; drop hardcoded target — DONE
 
 **Files:** Modify `src/client_tun.rs`
 
-- [ ] **Step 1: Read `local_endpoint()` in `process_listener_activity`** alongside payload:
+- [x] **Step 1: Read `local_endpoint()` in `process_listener_activity`** alongside payload:
 
 ```rust
     let extracted = {
