@@ -137,11 +137,11 @@ catch-all that returns the same IPv4 path; only `proto-ipv4` is enabled.)
 
 - [ ] **Step 6: Commit** `feat(tun): relay to extracted Target instead of hardcoded address`.
 
-### Task 4: Teaching note + full validation
+### Task 4: Teaching note + full validation — DONE (manual e2e pending user)
 
 **Files:** Create `docs/tech/08-target-extraction.md`; Modify `src/client_tun.rs` if lints surface
 
-- [ ] **Step 1: Write the teaching note** covering:
+- [x] **Step 1: Write the teaching note** covering:
   - what AnyIP is and why the default route gateway is the interface's own IP
   - that the Target is extracted from `local_endpoint()` and is always IP:port (link ADR-0001)
   - the single-fixed-port limitation and that Stage 9 adds arbitrary ports
@@ -156,9 +156,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo doc --no-deps
 ```
 
-Expected: all PASS.
+Expected: all PASS. (Done: 19+7 tests ok, check ok, clippy -D warnings clean, doc ok.)
 
-- [ ] **Step 3: Manual end-to-end** (from the spec recipe): route `93.184.216.34` into utun,
+- [ ] **Step 3: Manual end-to-end** (from the spec recipe; requires sudo/TUN — pending user): route `93.184.216.34` into utun,
   `curl http://93.184.216.34/`, confirm client logs the extracted target and server connects
   to that IP and returns example.com HTML.
 
