@@ -1,0 +1,3 @@
+# TUN-path Target is always IP:port; domain names never enter the tunnel
+
+On the TUN path, the OS resolves DNS before a packet reaches the TUN, so smoltcp only ever sees a destination IP:port — extracted via `local_endpoint()` as `TargetAddr::IpPort`. The Upstream dials the Target by IP; HTTPS still works because the client's TLS SNI travels in-band. We deliberately do NOT intercept DNS or implement fake-IP mapping in this stage, even though that is required to reach domains that resolve incorrectly locally (e.g. GFW-poisoned domains from Shenzhen). DNS-over-tunnel / fake-IP is deferred to a later stage (tracked in TODO.md).
