@@ -67,11 +67,11 @@ catch-all that returns the same IPv4 path; only `proto-ipv4` is enabled.)
 
 - [ ] **Step 5: Commit** `feat(tun): add target_from_endpoint helper`.
 
-### Task 2: Enable AnyIP + default route
+### Task 2: Enable AnyIP + default route — DONE
 
 **Files:** Modify `src/client_tun.rs`
 
-- [ ] **Step 1:** After `iface.update_ip_addrs(... 10.0.0.2/24 ...)` in `start_tun_proxy`, add:
+- [x] **Step 1:** After `iface.update_ip_addrs(... 10.0.0.2/24 ...)` in `start_tun_proxy`, add:
 
 ```rust
     // AnyIP: accept packets whose destination IP is not our own (the real Target).

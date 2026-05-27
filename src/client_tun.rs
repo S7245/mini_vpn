@@ -342,6 +342,15 @@ pub async fn start_tun_proxy() {
             .unwrap();
     });
 
+    // AnyIP：接收目的 IP 不是本接口自身地址的包（即被拦截连接真正想去的 Target）。
+    // 中文要点：默认路由的网关填本接口自己的 IP 10.0.0.2 是 smoltcp AnyIP 接收判定的
+    // 硬性要求（routes.lookup(dst) 必须命中一个本接口 IP 才放行），不是笔误。
+    iface.set_any_ip(true);
+    iface
+        .routes_mut()
+        .add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 0, 2))
+        .unwrap();
+
     // 3. 初始化定时器 (例如每 5 毫秒触发一次)
     let mut timer = tokio::time::interval(std::time::Duration::from_millis(5));
 
