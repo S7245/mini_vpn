@@ -1,0 +1,113 @@
+# ── Deploy: GitHub Actions → SSH → systemd ────────────────────────────────────
+#
+# 方案 B（备选，≤ 10 台服务器）：编译静态二进制 → 并行 SSH 到各节点 → 替换二进制 → 重启 systemd。
+#
+# 前置要求（需在 GitHub Secrets 中配置）：
+#   DEPLOY_SSH_KEY：部署专用 SSH 私钥（对应各服务器 deploy 用户的 authorized_keys）
+#
+# 在矩阵（matrix）中添加新服务器即可扩展部署目标，所有服务器并行更新。
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: Build & Deploy (SSH + systemd)
+
+on:
+  # 此 workflow 默认不自动触发，需手动运行或改为 push 触发
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "部署目标（all / us-1 / uk-1 等，留空表示全部）"
+        required: false
+        default: "all"
+
+jobs:
+  build:
+    name: Compile static binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Install musl-tools
+        run: sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary (static)
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      # 上传产物供 deploy job 使用，有效期 1 天
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini_vpn-linux-amd64
+          path: target/x86_64-unknown-linux-musl/release/mini_vpn
+          retention-days: 1
+
+  deploy:
+    name: Deploy to ${{ matrix.server.name }}
+    needs: build
+    runs-on: ubuntu-latest
+
+    # ── 在此添加/删除中继节点 ─────────────────────────────────────────────────
+    strategy:
+      fail-fast: false    # 一台失败不中断其他服务器的部署
+      matrix:
+        server:
+          - { name: "US-West-1", host: "relay-us-1.example.com" }
+          - { name: "US-East-1", host: "relay-us-2.example.com" }
+          - { name: "UK-London-1", host: "relay-uk-1.example.com" }
+          # 新增节点：在此追加一行即可
+          # - { name: "JP-Tokyo-1", host: "relay-jp-1.example.com" }
+
+    steps:
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: mini_vpn-linux-amd64
+
+      - name: Make binary executable
+        run: chmod +x mini_vpn
+
+      # 将二进制复制到服务器 /tmp，再原子替换 /usr/local/bin/mini_vpn
+      - name: Copy binary to ${{ matrix.server.name }}
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ matrix.server.host }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: mini_vpn
+          target: /tmp/
+
+      - name: Restart service on ${{ matrix.server.name }}
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ matrix.server.host }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -e
+
+            # 原子替换二进制（避免替换时正在运行的进程读取到残缺文件）
+            sudo install -m 755 /tmp/mini_vpn /usr/local/bin/mini_vpn
+
+            # 重启 systemd 服务
+            sudo systemctl restart mini_vpn
+
+            # 等待最多 10 秒确认服务已启动
+            for i in $(seq 1 10); do
+              if sudo systemctl is-active --quiet mini_vpn; then
+                echo "✅ ${{ matrix.server.name }} 服务启动成功"
+                exit 0
+              fi
+              sleep 1
+            done
+
+            echo "❌ ${{ matrix.server.name }} 服务启动失败，查看日志："
+            sudo journalctl -u mini_vpn -n 20 --no-pager
+            exit 1

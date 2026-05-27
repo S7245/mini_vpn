@@ -1,3 +1,9 @@
 /target
-
 .DS_Store
+
+# 生产证书和私钥（绝对不能提交到仓库）
+# 开发用证书（certs/dev/ 和根目录的 cert.pem/key.pem）已明确 allow
+*.key
+.env
+.env.local
+/deploy/.env
