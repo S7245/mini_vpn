@@ -4,3 +4,7 @@
 
 # Claude Code session worktrees and local state — never commit into the repo tree
 .claude/
+
+# Local env files (deployment secrets, server IPs, etc.) — never commit
+.env
+.env.*
