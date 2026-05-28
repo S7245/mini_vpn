@@ -55,8 +55,12 @@ impl VirtualTunDevice {
 
         #[cfg(not(target_os = "macos"))]
         {
+            // Linux TUN（Layer::L3 + IFF_NO_PI）没有 macOS utun 那 4 字节 PI 头，
+            // 截到读出的 n 字节就是裸 IP 包，直接交给 smoltcp。
+            // 中文要点：不要写 buf.advance(n) —— 那个属于 Buf trait 且返回 ()，会同时
+            // 触发 trait 未导入 + 类型不匹配两个错误。
             buf.truncate(n);
-            self.rx_buffer = Some(buf.advance(n));
+            self.rx_buffer = Some(buf);
         }
 
         Ok(())
