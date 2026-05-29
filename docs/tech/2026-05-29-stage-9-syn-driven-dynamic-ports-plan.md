@@ -202,13 +202,13 @@ if let Some(buf) = &device.rx_buffer {
 - [ ] **Step 6:** `cargo test` PASS, `cargo clippy -D warnings` clean.
 - [ ] **Step 7: Commit** `feat(tun): wire ListenerRegistry into main loop`.
 
-### Task 4: teaching note + full validation + manual cross-machine e2e
+### Task 4: teaching note + full validation + manual cross-machine e2e — DONE (manual pending user)
 
 **Files:** Create `docs/tech/09-syn-driven-dynamic-ports.md`; Modify `src/client_tun.rs` if lint surfaces
 
-- [ ] **Step 1:** Write teaching note (mechanism, per-port pool, port cap, cross-machine
+- [x] **Step 1:** Write teaching note (mechanism, per-port pool, port cap, cross-machine
   acceptance for ports 80 AND 443).
-- [ ] **Step 2:** Full validation:
+- [x] **Step 2:** Full validation:
 
 ```bash
 cargo test
