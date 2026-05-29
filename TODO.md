@@ -36,6 +36,21 @@ Target extraction alone does NOT make real sites work. In order of blocking seve
   protocols (no client data before the server talks) never trigger relay. Pre-existing
   limitation, unchanged by Stage 8; revisit if such protocols are needed.
 
+## Future architecture topics
+
+These cut across multiple stages and may need their own design before being scheduled.
+
+### Multi-Hop
+
+Chain multiple Upstream hops (e.g. Shenzhen → HK → US) for jurisdiction layering
+and exit-IP rotation. Affects relay protocol, connection-table, and TLS chaining.
+
+### fake-IP / DNS interception
+
+Hand out fake IPs (e.g. 198.18.0.0/15 pool) for resolved domains and map them back
+to the real hostnames at the tunnel, instead of relying on local DNS. Required to
+reach GFW-poisoned domains; see "Gating dependencies" item 2 above.
+
 ## Deferred Work
 
 These items are intentionally out of scope for the current stage, but are likely to be needed later.
