@@ -487,6 +487,21 @@ fn build_listener_pool(
     )
 }
 
+/// Identify a clean inbound TCP SYN and return its destination port.
+/// 中文要点：纯解析、无副作用。仅 IPv4+TCP+`syn && !ack` 才返回 Some(dst_port);
+/// 解析失败或非 IPv4 / 非 TCP / 不是干净 SYN 一律 None。
+fn inspect_inbound_syn(packet: &[u8]) -> Option<u16> {
+    let parsed = etherparse::PacketHeaders::from_ip_slice(packet).ok()?;
+    let etherparse::TransportHeader::Tcp(tcp) = parsed.transport? else {
+        return None;
+    };
+    if tcp.syn && !tcp.ack {
+        Some(tcp.destination_port)
+    } else {
+        None
+    }
+}
+
 /// Convert a smoltcp endpoint into a relay Target.
 /// 中文要点：TUN 链路上目的地址在 IP 层已是裸 IP（域名早被 DNS 解析掉），
 /// 这里统一转成 `TargetAddr::IpPort`。当前 crate 只开 `proto-ipv4`，故必为 IPv4。
@@ -710,6 +725,47 @@ mod tests {
         let ep = smoltcp::wire::IpEndpoint::new(IpAddress::v4(93, 184, 216, 34), 80);
         let target = target_from_endpoint(ep);
         assert_eq!(target.to_wire_string(), "93.184.216.34:80");
+    }
+
+    /// Build a minimal IPv4+TCP packet with the requested flags for SYN-inspector tests.
+    fn build_ipv4_tcp(
+        src: [u8; 4],
+        dst: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+        syn: bool,
+        ack: bool,
+    ) -> Vec<u8> {
+        let b = etherparse::PacketBuilder::ipv4(src, dst, 64).tcp(src_port, dst_port, 0, 1024);
+        let b = if syn { b.syn() } else { b };
+        let b = if ack { b.ack(0) } else { b };
+        let mut buf = Vec::new();
+        let payload: [u8; 0] = [];
+        b.write(&mut buf, &payload).unwrap();
+        buf
+    }
+
+    #[test]
+    fn inspect_inbound_syn_returns_dst_port_for_clean_syn() {
+        let pkt = build_ipv4_tcp([10, 0, 0, 1], [1, 1, 1, 1], 60000, 443, true, false);
+        assert_eq!(inspect_inbound_syn(&pkt), Some(443));
+    }
+
+    #[test]
+    fn inspect_inbound_syn_rejects_syn_ack() {
+        let pkt = build_ipv4_tcp([1, 1, 1, 1], [10, 0, 0, 1], 443, 60000, true, true);
+        assert_eq!(inspect_inbound_syn(&pkt), None);
+    }
+
+    #[test]
+    fn inspect_inbound_syn_rejects_plain_ack() {
+        let pkt = build_ipv4_tcp([10, 0, 0, 1], [1, 1, 1, 1], 60000, 80, false, true);
+        assert_eq!(inspect_inbound_syn(&pkt), None);
+    }
+
+    #[test]
+    fn inspect_inbound_syn_rejects_garbage() {
+        assert_eq!(inspect_inbound_syn(&[0u8; 4]), None);
     }
 
     #[test]

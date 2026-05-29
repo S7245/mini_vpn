@@ -28,11 +28,11 @@ Main loop iterates the registry's all_handles for `process_listener_activity`.
 
 ---
 
-### Task 1: `inspect_inbound_syn` helper (TDD)
+### Task 1: `inspect_inbound_syn` helper (TDD) — DONE
 
 **Files:** Modify `src/client_tun.rs`
 
-- [ ] **Step 1: Failing tests** in `mod tests`:
+- [x] **Step 1: Failing tests** in `mod tests`:
 
 ```rust
     fn build_ipv4_tcp(
