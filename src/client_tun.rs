@@ -86,6 +86,78 @@ struct ListenerPool {
     handles: Vec<SocketHandle>,
 }
 
+/// Hard cap on the number of distinct destination ports we will intercept.
+/// 中文要点：防止 SYN flood 下 socket / 缓冲区无限增长，到顶就拒新端口。
+const MAX_INTERCEPTED_PORTS: usize = 64;
+
+/// Failure mode for `ListenerRegistry::ensure_port`.
+/// 中文要点：到顶时优雅拒绝，不能 panic，已注册端口的 socket 不受影响。
+#[derive(Debug, PartialEq, Eq)]
+enum RegistryError {
+    Capped,
+}
+
+/// Dynamic per-port listener pools.
+/// 中文要点：一个目的端口对应一组（`pool_size` 个）smoltcp 监听 socket，
+/// 由 SYN inspector 按需创建；主循环遍历所有 handle 处理首包。
+#[derive(Debug)]
+struct ListenerRegistry {
+    ports: HashMap<u16, Vec<SocketHandle>>,
+    pool_size: usize,
+}
+
+impl ListenerRegistry {
+    fn new(pool_size: usize) -> Self {
+        Self {
+            ports: HashMap::new(),
+            pool_size,
+        }
+    }
+
+    fn port_count(&self) -> usize {
+        self.ports.len()
+    }
+
+    /// Idempotently ensure a listener pool exists for `port`.
+    /// 中文要点：端口在册时不重复建；首次建则一次性创建 `pool_size` 个监听槽位
+    /// 并同步登记 `SocketCtx`，到顶返回 `Capped`。
+    fn ensure_port(
+        &mut self,
+        port: u16,
+        sockets: &mut SocketSet<'static>,
+        socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
+    ) -> Result<(), RegistryError> {
+        if self.ports.contains_key(&port) {
+            return Ok(());
+        }
+        if self.ports.len() >= MAX_INTERCEPTED_PORTS {
+            return Err(RegistryError::Capped);
+        }
+        let spec = ListenerSpec {
+            local_port: port,
+            pool_size: self.pool_size,
+        };
+        let mut handles = Vec::with_capacity(self.pool_size);
+        for _ in 0..self.pool_size {
+            let h = sockets.add(build_listener_socket(&spec));
+            socket_ctxs.insert(h, SocketCtx::new(port));
+            handles.push(h);
+        }
+        println!(
+            "🆕 listener pool created for port {port} (pool_size={})",
+            self.pool_size
+        );
+        self.ports.insert(port, handles);
+        Ok(())
+    }
+
+    /// Iterate every smoltcp handle across all currently intercepted ports.
+    /// 中文要点：主循环用它替代 `ListenerPool.handles`，跨所有端口轮询首包。
+    fn all_handles(&self) -> impl Iterator<Item = SocketHandle> + '_ {
+        self.ports.values().flatten().copied()
+    }
+}
+
 /// Local listener-side startup configuration for the TUN runtime.
 /// 中文要点：这一层只关心本地拦截面，不关心怎么连上游 TLS/Yamux 服务。
 #[derive(Debug, Clone)]
@@ -766,6 +838,30 @@ mod tests {
     #[test]
     fn inspect_inbound_syn_rejects_garbage() {
         assert_eq!(inspect_inbound_syn(&[0u8; 4]), None);
+    }
+
+    #[test]
+    fn registry_ensure_port_is_idempotent_and_capped() {
+        let mut sockets = SocketSet::new(vec![]);
+        let mut ctxs: HashMap<SocketHandle, SocketCtx> = HashMap::new();
+        let mut reg = ListenerRegistry::new(2);
+
+        for i in 0..MAX_INTERCEPTED_PORTS as u16 {
+            reg.ensure_port(i + 1, &mut sockets, &mut ctxs).unwrap();
+        }
+        assert_eq!(reg.port_count(), MAX_INTERCEPTED_PORTS);
+        // pool_size * port_count handles registered
+        assert_eq!(ctxs.len(), 2 * MAX_INTERCEPTED_PORTS);
+
+        // idempotent: re-adding an existing port does not grow the registry
+        reg.ensure_port(1, &mut sockets, &mut ctxs).unwrap();
+        assert_eq!(reg.port_count(), MAX_INTERCEPTED_PORTS);
+        assert_eq!(ctxs.len(), 2 * MAX_INTERCEPTED_PORTS);
+
+        // capped: a new port beyond the cap is rejected, existing state preserved
+        let err = reg.ensure_port(9999, &mut sockets, &mut ctxs).unwrap_err();
+        assert!(matches!(err, RegistryError::Capped));
+        assert_eq!(reg.port_count(), MAX_INTERCEPTED_PORTS);
     }
 
     #[test]

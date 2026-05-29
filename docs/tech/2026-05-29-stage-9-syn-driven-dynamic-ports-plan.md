@@ -96,11 +96,11 @@ fn inspect_inbound_syn(packet: &[u8]) -> Option<u16> {
 
 - [ ] **Step 5: Commit** `feat(tun): add inspect_inbound_syn helper`.
 
-### Task 2: `ListenerRegistry` replacing fixed pool
+### Task 2: `ListenerRegistry` replacing fixed pool — DONE
 
 **Files:** Modify `src/client_tun.rs`
 
-- [ ] **Step 1: Failing tests**:
+- [x] **Step 1: Failing tests**:
 
 ```rust
     #[test]
