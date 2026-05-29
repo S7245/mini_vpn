@@ -18,6 +18,21 @@ the worktree under `.claude/worktrees/…`. New files written to the worktree wo
 in a `git status` run from main. Use `git -C <worktree-path>` or stay in the default
 cwd (the worktree) — avoid `cd`-ing to the main checkout for git ops.
 
+## 2026-05-29 — Always check the binary's startup banner before debugging behavior
+
+A cross-machine test failed mysteriously: many `📡 收到` SYN logs, zero
+`🎯 extracted target`, server kept reporting yamux disconnects. Root cause was
+NOT code or topology — it was a stale binary. Stage 8 changes lived only on the
+worktree branch, but the user was running `./target/debug/mini_vpn` built from
+the main checkout (still at pre-Stage 8). The diagnostic tell was the startup
+banner: it contained `target=httpbin.org:80` (a field Task 3 had removed),
+proving the running binary predated Task 3.
+
+- After ANY code change, first check the startup banner / version line matches
+  the expected build. Don't debug behavior against a binary you didn't just compile.
+- When work lives on a feature branch / worktree, prefer running the binary from
+  that worktree's `target/debug/` until the branch is merged, or merge first.
+
 ## 2026-05-27 — Same-machine upstream + a global TUN host route = egress loop
 
 Stage 8 round-trip test failed with the upstream `server` on localhost: the

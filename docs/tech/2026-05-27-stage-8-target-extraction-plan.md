@@ -158,8 +158,11 @@ cargo doc --no-deps
 
 Expected: all PASS. (Done: 19+7 tests ok, check ok, clippy -D warnings clean, doc ok.)
 
-- [ ] **Step 3: Manual end-to-end** (from the spec recipe; requires sudo/TUN — pending user): route `93.184.216.34` into utun,
-  `curl http://93.184.216.34/`, confirm client logs the extracted target and server connects
-  to that IP and returns example.com HTML.
+- [x] **Step 3: Manual end-to-end** — DONE 2026-05-29.
+  Cross-machine topology: client (Shenzhen Mac) → Upstream (US server 47.251.188.205:8081) → real 1.1.1.1.
+  Route `1.1.1.1` into utun, `curl -v http://1.1.1.1/` returned `HTTP/1.1 301 Moved Permanently` with
+  `Server: cloudflare` and `CF-RAY: ...-SJC` (San Jose PoP — confirms egress from the US server,
+  not the client). Client logged `🎯 extracted target 1.1.1.1:80`; US server logged the matching
+  `解析出的目标地址是`.
 
 - [ ] **Step 4: Commit** `docs(tun): add stage 8 target extraction note`.
