@@ -175,11 +175,11 @@ impl ListenerRegistry {
 
 - [ ] **Step 5: Commit** `feat(tun): add ListenerRegistry for per-port dynamic pools`.
 
-### Task 3: wire registry into main loop, drop fixed listen port
+### Task 3: wire registry into main loop, drop fixed listen port — DONE
 
 **Files:** Modify `src/client_tun.rs`
 
-- [ ] **Step 1:** Replace `ListenerPool` field with `ListenerRegistry` in `start_tun_proxy`,
+- [x] **Step 1:** Replace `ListenerPool` field with `ListenerRegistry` in `start_tun_proxy`,
   drop `DEFAULT_TUN_LISTEN_PORT`, `MINI_VPN_TUN_LOCAL_PORT`, `TunListenerConfig.local_port`,
   `ListenerSpec.local_port` callers; lower `DEFAULT_TUN_POOL_SIZE` to 2.
 - [ ] **Step 2:** In the rx branch, BEFORE `iface.poll`:

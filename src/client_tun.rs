@@ -18,24 +18,20 @@ use tokio_rustls::rustls::Certificate;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
-const DEFAULT_TUN_LISTEN_PORT: u16 = 80;
 const TCP_SOCKET_BUFFER_SIZE: usize = 65_535;
 const RELAY_CHANNEL_CAPACITY: usize = 1024;
-const DEFAULT_TUN_POOL_SIZE: usize = 4;
+// 中文要点：Stage 9 起按"每端口"配 pool，64 端口 * 2 槽 * 2 缓冲 ≈ 16MB。
+const DEFAULT_TUN_POOL_SIZE: usize = 2;
 const DEFAULT_TUN_SERVER_ADDR: &str = "127.0.0.1:8081";
 const DEFAULT_TUN_TLS_SNI: &str = "localhost";
 const DEFAULT_TUN_CA_PATH: &str = "cert.pem";
 
-/// Describes how many local TCP listener slots the TUN runtime should create.
-/// 中文要点：这是监听池的蓝图，不代表连接本身，只描述“开几间房、监听哪个端口”。
+/// One listener socket's binding parameters.
+/// 中文要点：Stage 9 起 pool_size 已上移到 `ListenerRegistry`，这里只剩端口。
 #[derive(Debug, Clone, Copy)]
 struct ListenerSpec {
     /// Local TCP port intercepted on the TUN-side smoltcp stack.
-    /// 中文要点：这是虚拟网卡内侧被 smoltcp 截获的本地端口。
     local_port: u16,
-    /// Number of independent listener slots created for the same local port.
-    /// 中文要点：用多个监听槽位模拟 backlog，避免单 socket 退房时堵住后续连接。
-    pool_size: usize,
 }
 
 /// Explicit lifecycle state for one listener slot.
@@ -79,13 +75,6 @@ impl SocketCtx {
     }
 }
 
-/// Holds every smoltcp listener handle that belongs to the same logical local port pool.
-/// 中文要点：后续主循环只遍历这个池，而不是盯着单个裸 `socket_handle`。
-#[derive(Debug)]
-struct ListenerPool {
-    handles: Vec<SocketHandle>,
-}
-
 /// Hard cap on the number of distinct destination ports we will intercept.
 /// 中文要点：防止 SYN flood 下 socket / 缓冲区无限增长，到顶就拒新端口。
 const MAX_INTERCEPTED_PORTS: usize = 64;
@@ -114,6 +103,7 @@ impl ListenerRegistry {
         }
     }
 
+    #[cfg(test)]
     fn port_count(&self) -> usize {
         self.ports.len()
     }
@@ -133,10 +123,7 @@ impl ListenerRegistry {
         if self.ports.len() >= MAX_INTERCEPTED_PORTS {
             return Err(RegistryError::Capped);
         }
-        let spec = ListenerSpec {
-            local_port: port,
-            pool_size: self.pool_size,
-        };
+        let spec = ListenerSpec { local_port: port };
         let mut handles = Vec::with_capacity(self.pool_size);
         for _ in 0..self.pool_size {
             let h = sockets.add(build_listener_socket(&spec));
@@ -162,29 +149,17 @@ impl ListenerRegistry {
 /// 中文要点：这一层只关心本地拦截面，不关心怎么连上游 TLS/Yamux 服务。
 #[derive(Debug, Clone)]
 struct TunListenerConfig {
-    /// Local TCP port intercepted by the TUN-side smoltcp stack.
-    /// 中文要点：虚拟网卡这一侧实际监听的本地端口。
-    local_port: u16,
-    /// Number of listener slots created for the same local port.
-    /// 中文要点：监听池槽位数，决定会创建多少个独立的监听房间。
+    /// Per-port pool size: number of smoltcp listener slots created for each
+    /// intercepted destination port.
+    /// 中文要点：Stage 9 起 pool 按"每端口"算，决定单个端口能并发承接多少条连接。
     pool_size: usize,
 }
 
 impl TunListenerConfig {
     /// Build listener config from optional string sources.
-    /// 中文要点：本地监听配置与上游外联配置分开解析，避免职责混淆。
-    /// Target 不再来自配置——它在运行时从被拦截连接逐个提取（见 ADR-0001）。
-    fn from_sources(
-        local_port: Option<&str>,
-        pool_size: Option<&str>,
-    ) -> Result<Self, ClientError> {
-        let local_port = match local_port {
-            Some(value) => value
-                .parse::<u16>()
-                .map_err(|_| ClientError::InvalidTarget(format!("invalid local port: {value}")))?,
-            None => DEFAULT_TUN_LISTEN_PORT,
-        };
-
+    /// 中文要点：Stage 9 起本地不再固定监听端口，端口由 SYN inspector 按需注册，
+    /// 这里只保留 `pool_size` 一个旋钮。
+    fn from_sources(pool_size: Option<&str>) -> Result<Self, ClientError> {
         let pool_size = match pool_size {
             Some(value) => value
                 .parse::<usize>()
@@ -198,19 +173,7 @@ impl TunListenerConfig {
             ));
         }
 
-        Ok(Self {
-            local_port,
-            pool_size,
-        })
-    }
-
-    /// Derive the listener-pool blueprint from startup config.
-    /// 中文要点：监听池蓝图依然只从 listener 配置派生，不受 upstream 字段影响。
-    fn listener_spec(&self) -> ListenerSpec {
-        ListenerSpec {
-            local_port: self.local_port,
-            pool_size: self.pool_size,
-        }
+        Ok(Self { pool_size })
     }
 }
 
@@ -289,30 +252,27 @@ impl TunRuntimeConfig {
     /// Build config from optional string sources.
     /// 中文要点：测试和环境变量入口共享同一套组合逻辑，避免行为漂移。
     fn from_sources(
-        local_port: Option<&str>,
         pool_size: Option<&str>,
         server_addr: Option<&str>,
         tls_sni: Option<&str>,
         ca_path: Option<&str>,
     ) -> Result<Self, ClientError> {
         Ok(Self {
-            listener: TunListenerConfig::from_sources(local_port, pool_size)?,
+            listener: TunListenerConfig::from_sources(pool_size)?,
             upstream: TunUpstreamConfig::from_sources(server_addr, tls_sni)?,
             tls: TunTlsConfig::from_sources(ca_path)?,
         })
     }
 
     /// Read config from process environment.
-    /// 中文要点：Stage 8 起移除写死的 target 配置，Target 改为运行时逐连接提取。
+    /// 中文要点：Stage 9 起 `MINI_VPN_TUN_LOCAL_PORT` 已删除，端口由 SYN inspector 动态注册。
     fn from_env() -> Result<Self, ClientError> {
-        let local_port = std::env::var("MINI_VPN_TUN_LOCAL_PORT").ok();
         let pool_size = std::env::var("MINI_VPN_TUN_POOL_SIZE").ok();
         let server_addr = std::env::var("MINI_VPN_TUN_SERVER_ADDR").ok();
         let tls_sni = std::env::var("MINI_VPN_TUN_TLS_SNI").ok();
         let ca_path = std::env::var("MINI_VPN_TUN_CA_PATH").ok();
 
         Self::from_sources(
-            local_port.as_deref(),
             pool_size.as_deref(),
             server_addr.as_deref(),
             tls_sni.as_deref(),
@@ -329,7 +289,7 @@ pub async fn start_tun_proxy() {
             return;
         }
     };
-    let listener_spec = runtime_config.listener.listener_spec();
+    let pool_size = runtime_config.listener.pool_size;
     let upstream_server_addr = runtime_config.upstream.server_addr.clone();
     let upstream_tls_sni = runtime_config.upstream.tls_sni.clone();
     let tls_ca_path = runtime_config.tls.ca_path.clone();
@@ -359,12 +319,8 @@ pub async fn start_tun_proxy() {
     // =========== 1. 初始化底层网卡和通道 ===========
 
     println!(
-        "🚀 TUN runtime started with local_port={}, pool_size={}, server_addr={}, tls_sni={}, ca_path={}",
-        listener_spec.local_port,
-        listener_spec.pool_size,
-        upstream_server_addr,
-        upstream_tls_sni,
-        tls_ca_path
+        "🚀 TUN runtime started with pool_size={}, server_addr={}, tls_sni={}, ca_path={}",
+        pool_size, upstream_server_addr, upstream_tls_sni, tls_ca_path
     );
 
     // 1. 初始化 TUN 设备(化底层网卡和通道) / 创建操作系统的原生异步虚拟网卡
@@ -382,8 +338,10 @@ pub async fn start_tun_proxy() {
     // 2. 初始化 smoltcp 的“酒店”
     let mut sockets = SocketSet::new(vec![]);
 
-    let (listener_pool, mut socket_ctxs) =
-        build_listener_pool(&mut sockets, &listener_spec);
+    // Stage 9: 监听端口不再固定，由 SYN inspector 在 rx 热路径按需注册。
+    // 中文要点：启动时 registry 是空的；第一条到任意端口的 SYN 会触发该端口建池。
+    let mut registry = ListenerRegistry::new(pool_size);
+    let mut socket_ctxs: HashMap<SocketHandle, SocketCtx> = HashMap::new();
 
     // 3. 初始化 smoltcp 的“虚拟路由器”
     let config = SmolConfig::new(smoltcp::wire::HardwareAddress::Ip);
@@ -468,24 +426,31 @@ pub async fn start_tun_proxy() {
             // 分支 1: 物理网卡接收到了新数据包
             res = device.wait_for_rx() =>{
                 if res.is_ok(){
-                    // 🌟 加上这行雷达代码
+                    // 1) SYN inspector：在 iface.poll 之前看一眼包，若是去往新端口的干净 SYN，
+                    //    立刻为该端口建监听池，这样 smoltcp 同一帧就能 accept。
+                    // 中文要点：到顶时优雅拒绝并日志告警，绝不 panic。
                     if let Some(buf) = &device.rx_buffer {
                         println!("📡 收到来自操作系统的包，大小: {} 字节", buf.len());
-                        // 🌟 新增：打印前 4 个字节，看看是不是 macOS 偷偷加的料
                         println!("🔍 包的前 4 字节: {:?}", &buf[..4.min(buf.len())]);
+                        if let Some(port) = inspect_inbound_syn(buf)
+                            && let Err(e) =
+                                registry.ensure_port(port, &mut sockets, &mut socket_ctxs)
+                        {
+                            println!(
+                                "⚠️ intercepted port cap reached, drop SYN to port {port}: {:?}",
+                                e
+                            );
+                        }
                     }
+
                     let timestamp = smoltcp::time::Instant::now();
-
-                    // ❓ 任务 1: 调用 iface 的推进方法，依次传入 timestamp, &mut device 和 &mut sockets
                     iface.poll(timestamp, &mut device, &mut sockets);
-
-                    // ❓ 任务 2: 异步调用 device 的发货方法，把 smoltcp 产生的回包真正发给网卡
-                    // 提示: 这是一个 async 方法，别忘了 .await 和错误处理 (比如 .unwrap())
                     device.flush_tx().await.unwrap();
 
-                    for handle in &listener_pool.handles {
+                    let handles: Vec<SocketHandle> = registry.all_handles().collect();
+                    for handle in handles {
                         if let Err(e) = process_listener_activity(
-                            *handle,
+                            handle,
                             &mut sockets,
                             &mut socket_ctxs,
                             &mut ctrl,
@@ -501,13 +466,13 @@ pub async fn start_tun_proxy() {
             // 分支 2: 时钟滴答，处理超时重传等后台任务
             _ = timer.tick() =>{
                 let timestamp = smoltcp::time::Instant::now();
-                // ❓ 任务 3: 这里需要做和上面完全一样的推进和发货操作
                 iface.poll(timestamp, &mut device, &mut sockets);
                 device.flush_tx().await.unwrap();
 
-                for handle in &listener_pool.handles {
+                let handles: Vec<SocketHandle> = registry.all_handles().collect();
+                for handle in handles {
                     if let Err(e) = process_listener_activity(
-                        *handle,
+                        handle,
                         &mut sockets,
                         &mut socket_ctxs,
                         &mut ctrl,
@@ -531,32 +496,6 @@ fn build_listener_socket(spec: &ListenerSpec) -> TcpSocket<'static> {
     let mut tcp_socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
     tcp_socket.listen(spec.local_port).unwrap();
     tcp_socket
-}
-
-/// Build the real smoltcp listener pool for the TUN runtime.
-/// 中文要点：一次性创建多个监听槽位，让后续连接不再依赖单个 socket 反复复位。
-fn build_listener_pool(
-    sockets: &mut SocketSet<'_>,
-    spec: &ListenerSpec,
-) -> (ListenerPool, HashMap<SocketHandle, SocketCtx>) {
-    let mut handles = Vec::with_capacity(spec.pool_size);
-    let mut socket_ctxs = HashMap::with_capacity(spec.pool_size);
-
-    for slot_index in 0..spec.pool_size {
-        let handle = sockets.add(build_listener_socket(spec));
-        let ctx = SocketCtx::new(spec.local_port);
-        println!(
-            "🧩 listener slot {} created on local port {} with handle {:?}",
-            slot_index, spec.local_port, handle
-        );
-        handles.push(handle);
-        socket_ctxs.insert(handle, ctx);
-    }
-
-    (
-        ListenerPool { handles },
-        socket_ctxs,
-    )
 }
 
 /// Identify a clean inbound TCP SYN and return its destination port.
@@ -865,29 +804,8 @@ mod tests {
     }
 
     #[test]
-    fn build_listener_pool_creates_four_handles_and_contexts() {
-        let spec = ListenerSpec {
-            local_port: 80,
-            pool_size: 4,
-        };
-        let mut sockets = SocketSet::new(vec![]);
-
-        let (pool, socket_ctxs) = build_listener_pool(&mut sockets, &spec);
-
-        assert_eq!(pool.handles.len(), 4);
-        assert_eq!(socket_ctxs.len(), 4);
-        assert!(pool
-            .handles
-            .iter()
-            .all(|handle| socket_ctxs.contains_key(handle)));
-    }
-
-    #[test]
     fn rearm_socket_restores_listening_state_and_clears_sender() {
-        let spec = ListenerSpec {
-            local_port: 80,
-            pool_size: 1,
-        };
+        let spec = ListenerSpec { local_port: 80 };
         let mut socket = build_listener_socket(&spec);
         let (tx, _rx) = mpsc::channel(1);
         let mut ctx = SocketCtx {
@@ -903,55 +821,35 @@ mod tests {
     }
 
     #[test]
-    fn tun_runtime_config_defaults_match_stage4_behavior() {
-        let config = TunRuntimeConfig::from_sources(None, None, None, None, None)
+    fn tun_runtime_config_defaults_match_stage9_behavior() {
+        let config = TunRuntimeConfig::from_sources(None, None, None, None)
             .expect("config should load");
 
-        assert_eq!(config.listener.local_port, 80);
-        assert_eq!(config.listener.pool_size, 4);
-    }
-
-    #[test]
-    fn tun_runtime_config_derives_listener_spec() {
-        let config = TunRuntimeConfig::from_sources(Some("8080"), Some("2"), None, None, None)
-            .expect("config should load");
-
-        let listener_spec = config.listener.listener_spec();
-
-        assert_eq!(listener_spec.local_port, 8080);
-        assert_eq!(listener_spec.pool_size, 2);
-    }
-
-    #[test]
-    fn tun_runtime_config_rejects_invalid_local_port() {
-        let err = TunRuntimeConfig::from_sources(Some("abc"), None, None, None, None)
-            .expect_err("invalid port should fail");
-        assert!(err.to_string().contains("invalid local port"));
+        // Stage 9 drops local_port; pool_size default lowered to 2 (per-port now).
+        assert_eq!(config.listener.pool_size, 2);
     }
 
     #[test]
     fn tun_runtime_config_rejects_zero_pool_size() {
-        let err = TunRuntimeConfig::from_sources(None, Some("0"), None, None, None)
+        let err = TunRuntimeConfig::from_sources(Some("0"), None, None, None)
             .expect_err("zero pool size should fail");
         assert!(err.to_string().contains("at least 1"));
     }
 
     #[test]
-    fn tun_runtime_config_accepts_valid_override_values() {
-        let config = TunRuntimeConfig::from_sources(Some("8081"), Some("3"), None, None, None)
+    fn tun_runtime_config_accepts_pool_size_override() {
+        let config = TunRuntimeConfig::from_sources(Some("3"), None, None, None)
             .expect("valid config should load");
 
-        assert_eq!(config.listener.local_port, 8081);
         assert_eq!(config.listener.pool_size, 3);
     }
 
     #[test]
     fn tun_runtime_config_defaults_include_upstream_values() {
-        let config = TunRuntimeConfig::from_sources(None, None, None, None, None)
+        let config = TunRuntimeConfig::from_sources(None, None, None, None)
             .expect("config should load");
 
-        assert_eq!(config.listener.local_port, 80);
-        assert_eq!(config.listener.pool_size, 4);
+        assert_eq!(config.listener.pool_size, 2);
         assert_eq!(config.upstream.server_addr, "127.0.0.1:8081");
         assert_eq!(config.upstream.tls_sni, "localhost");
         assert_eq!(config.tls.ca_path, "cert.pem");
@@ -960,18 +858,14 @@ mod tests {
     #[test]
     fn tun_runtime_config_accepts_listener_and_upstream_overrides() {
         let config = TunRuntimeConfig::from_sources(
-            Some("8080"),
-            Some("2"),
+            Some("4"),
             Some("127.0.0.1:9000"),
             Some("example.com"),
             Some("certs/dev/ca-cert.pem"),
         )
         .expect("config should load");
 
-        let listener_spec = config.listener.listener_spec();
-
-        assert_eq!(listener_spec.local_port, 8080);
-        assert_eq!(listener_spec.pool_size, 2);
+        assert_eq!(config.listener.pool_size, 4);
         assert_eq!(config.upstream.server_addr, "127.0.0.1:9000");
         assert_eq!(config.upstream.tls_sni, "example.com");
         assert_eq!(config.tls.ca_path, "certs/dev/ca-cert.pem");
@@ -979,7 +873,7 @@ mod tests {
 
     #[test]
     fn tun_runtime_config_rejects_invalid_upstream_server_addr() {
-        let err = TunRuntimeConfig::from_sources(None, None, Some("bad-addr"), None, None)
+        let err = TunRuntimeConfig::from_sources(None, Some("bad-addr"), None, None)
             .expect_err("invalid upstream server addr should fail");
         assert!(err
             .to_string()
@@ -988,7 +882,7 @@ mod tests {
 
     #[test]
     fn tun_runtime_config_rejects_invalid_upstream_tls_sni() {
-        let err = TunRuntimeConfig::from_sources(None, None, None, Some("bad sni"), None)
+        let err = TunRuntimeConfig::from_sources(None, None, Some("bad sni"), None)
             .expect_err("invalid upstream tls sni should fail");
         assert!(err.to_string().contains("invalid upstream tls sni"));
     }
