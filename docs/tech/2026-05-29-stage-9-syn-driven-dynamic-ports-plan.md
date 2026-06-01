@@ -217,10 +217,13 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo doc --no-deps
 ```
 
-- [ ] **Step 3:** Manual cross-machine e2e (pending user, requires sudo/TUN):
-  - port 80: `curl -v http://1.1.1.1/` → 301
-  - port 443: `curl -v -k https://1.1.1.1/` → Cloudflare HTTPS response
-  - client logs `🆕 listener pool created for port 80` AND `for port 443`
-  - server logs `解析出的目标地址是: 1.1.1.1:80` AND `1.1.1.1:443`
+- [x] **Step 3:** Manual cross-machine e2e — DONE 2026-06-01.
+  Cross-machine topology (Shenzhen Mac client → US Upstream 47.251.188.205).
+  Startup banner correctly shows no `local_port=` field.
+  - port 80: `curl -v http://1.1.1.1/` → `HTTP/1.1 301`, `Server: cloudflare`, `CF-RAY ...-SJC`.
+  - port 443: `curl -v -k https://1.1.1.1/` → full TLS 1.3 handshake end-to-end, curl
+    observes Cloudflare's real leaf cert (`O=Cloudflare, Inc.; CN=cloudflare-dns.com`,
+    SSL.com intermediate), HTTP/2 `301`, `cf-ray ...-SJC`. Byte-level transparent relay
+    confirmed: TLS ClientHello + Cloudflare's reply traverse the tunnel unchanged.
 
 - [ ] **Step 4: Commit** `docs(tun): add stage 9 syn-driven dynamic ports note`.

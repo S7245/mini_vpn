@@ -1,5 +1,16 @@
 # Learnings
 
+## 2026-06-01 — Byte-level transparent TCP relay preserves end-to-end TLS
+
+Stage 9 cross-machine test against `https://1.1.1.1/` produced a full TLS 1.3
+handshake where curl saw Cloudflare's real leaf certificate (`CN=cloudflare-dns.com`,
+SSL.com intermediate) — not our dev cert. Confirms that the smoltcp + yamux + TLS
+pipeline only carries opaque bytes; the inner TLS session is established between
+the original client (curl) and the real target (Cloudflare), with our tunnel
+acting as a pure pipe. HTTP/2 multiplexing also works end-to-end. This is the
+right property for a VPN: the tunnel must NOT terminate the user's TLS or it
+would break SNI / cert pinning / E2E privacy.
+
 ## 2026-05-27 — Verify worktree baseline before any design/implementation
 
 The session worktree `claude/frosty-gates-10390f` was 39 commits behind `main`
