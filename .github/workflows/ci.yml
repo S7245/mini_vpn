@@ -1,0 +1,44 @@
+name: CI
+
+# Build, lint, test, and doc on both Linux and macOS.
+# Rationale: cfg-gated code (e.g. the Linux-only TUN rx branch) never compiles on
+# macOS dev machines, so platform-specific bugs slept until deployed. Running both
+# targets here catches them at PR time. See .learnings/LEARNINGS.md (2026-05-27).
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features
+
+      - name: Doc
+        run: cargo doc --no-deps --all-features
