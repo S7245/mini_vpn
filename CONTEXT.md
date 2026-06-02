@@ -12,6 +12,10 @@ _Avoid_: relay-server, gateway (when meaning the proxy box)
 The final `IP:port` an intercepted connection wants to reach (e.g. a website). On the TUN path it is extracted from smoltcp's `local_endpoint()`. The Upstream connects out to the Target.
 _Avoid_: upstream, destination, remote (these collide with other concepts)
 
+**Reconnect epoch**:
+A monotonically increasing counter for the Upstream connection's generation; it increments each time a new Upstream connection is established. Used so relay tasks belonging to a previous connection cannot feed data into a socket served by the new connection (anti-crosstalk).
+_Avoid_: session id, connection id (epoch is about generation, not identity)
+
 ## Relationships
 
 - The client opens one **Upstream** connection and multiplexes many intercepted sessions over it (Yamux substreams).

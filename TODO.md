@@ -51,6 +51,32 @@ Hand out fake IPs (e.g. 198.18.0.0/15 pool) for resolved domains and map them ba
 to the real hostnames at the tunnel, instead of relying on local DNS. Required to
 reach GFW-poisoned domains; see "Gating dependencies" item 2 above.
 
+### Scale & reconnection resilience (100+ servers / 5000+ users)
+
+Stage 10 ships client-side full-jitter reconnect as the baseline. To survive
+reconnect storms and scale, layered work beyond client code:
+
+- **Architecture**
+  - Multiple Upstream addresses + failover (rotate / health-aware pick); spreads
+    5000 users across the server pool (~50/server).
+  - Control plane / service discovery: clients pull a live healthy-server list with
+    weights instead of hardcoding one address; enables dynamic eviction + steering.
+  - L4 load balancer (LVS / NLB / nginx stream) in front of the pool. NOTE: a yamux
+    long connection is pinned to one backend, so if that backend dies the connection
+    still drops — client reconnect+jitter remains the foundation, LB does not replace it.
+  - Connection epoch/generation to discard stale relays after reconnect (anti-crosstalk).
+  - Application-layer heartbeat to detect half-open connections instead of waiting for
+    TCP timeout.
+- **Ops / deployment**
+  - Rolling restart + graceful drain (stop accepting, let existing connections drain)
+    — turns "5000 disconnect at once" into "a few dozen per batch"; most effective
+    anti-thundering-herd measure, more so than client jitter.
+  - Health checks with automatic node eviction; server-side accept rate limiting +
+    connection cap + SYN cookies to avoid being overwhelmed.
+  - Metrics (reconnect rate, concurrent connections, handshake failure rate) for
+    observability + alerting on reconnect storms.
+  - Cross-AZ / multi-region redundancy so single-point failure does not affect everyone.
+
 ## Deferred Work
 
 These items are intentionally out of scope for the current stage, but are likely to be needed later.
