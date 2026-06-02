@@ -1,6 +1,7 @@
 mod client;
 mod client_tun;
 mod device;
+mod dns;
 mod fake_ip;
 mod server;
 

@@ -82,11 +82,11 @@ integration points in the TUN runtime (UDP DNS interception, target rewrite), th
 - [ ] Step 4: `cargo test` → PASS.
 - [ ] Step 5: Commit `feat(fake-ip): add FakeIpPool with stable per-domain allocation`.
 
-### Task 2: minimal DNS codec (TDD, pure)
+### Task 2: minimal DNS codec (TDD, pure) — DONE
 
 **Files:** Create `src/dns.rs`; Modify `src/main.rs`/`src/lib.rs`
 
-- [ ] Step 1: Write failing tests (build query bytes by hand or with a helper):
+- [x] Step 1: Write failing tests (build query bytes by hand or with a helper):
 
 ```rust
     // Helper builds a standard A query for "test.com" with id=0x1234.
