@@ -16,6 +16,14 @@ _Avoid_: upstream, destination, remote (these collide with other concepts)
 A monotonically increasing counter for the Upstream connection's generation; it increments each time a new Upstream connection is established. Used so relay tasks belonging to a previous connection cannot feed data into a socket served by the new connection (anti-crosstalk).
 _Avoid_: session id, connection id (epoch is about generation, not identity)
 
+**fake-IP**:
+A placeholder IPv4 from the `198.18.0.0/15` range handed back to an application in a forged DNS response, instead of the domain's real address. The application connects to the fake-IP; the client maps it back to the domain when the TCP SYN arrives. Not a real address — never routed on the public internet.
+_Avoid_: virtual IP, proxy IP (fake-IP is the precise term, matching Clash's fake-ip mode)
+
+**fake-IP map**:
+The client-held bidirectional table `domain ↔ fake-IP`. Populated when forging a DNS response; read ("resolve") when an intercepted TCP SYN's destination falls in the fake-IP range, to recover the domain for the relay request.
+_Avoid_: dns cache (it is not a cache of real DNS answers)
+
 ## Relationships
 
 - The client opens one **Upstream** connection and multiplexes many intercepted sessions over it (Yamux substreams).

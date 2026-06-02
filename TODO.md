@@ -47,9 +47,22 @@ and exit-IP rotation. Affects relay protocol, connection-table, and TLS chaining
 
 ### fake-IP / DNS interception
 
-Hand out fake IPs (e.g. 198.18.0.0/15 pool) for resolved domains and map them back
-to the real hostnames at the tunnel, instead of relying on local DNS. Required to
-reach GFW-poisoned domains; see "Gating dependencies" item 2 above.
+Core implemented in Stage 11 (ADR-0002): intercept DNS in the TUN, forge A responses
+with `198.18.0.0/15` placeholders, map fake-IP↔domain, rewrite TCP target to DomainPort
+so the Upstream resolves at the exit. Follow-ups not in Stage 11:
+
+- **DoH/DoT interception**: encrypted DNS (browser/system) bypasses the plaintext UDP/53
+  resolver → app gets real IP → blocked IPs still fail. Intercept known DoH endpoints or
+  guide users to disable in-app DoH.
+- **Hardcoded-IP domains**: apps connecting to a literal IP never enter the fake-IP map;
+  stays IpPort. No clean fix without app cooperation.
+- **QUIC/UDP relay**: needed for QUIC (UDP/443) and UDP services; until then apps usually
+  fall back to TCP. (This is also the separate "UDP relay" roadmap task.)
+- **fake-IP reclamation / LRU**: pool is never reclaimed this stage (131k addresses); add
+  LRU + TTL-based eviction if it ever matters.
+- **Switch DNS codec to hickory-proto** when any of: parsing real upstream responses
+  (compression pointers), EDNS0/DNSSEC/DoH, more record types (CNAME/HTTPS/SVCB), or
+  hardening against malicious packets. Only the dns.rs codec module changes; interface stable.
 
 ### Scale & reconnection resilience (100+ servers / 5000+ users)
 
