@@ -26,11 +26,11 @@ integration points in the TUN runtime (UDP DNS interception, target rewrite), th
 
 ---
 
-### Task 1: `FakeIpPool` (TDD, pure)
+### Task 1: `FakeIpPool` (TDD, pure) — DONE
 
 **Files:** Create `src/fake_ip.rs`; Modify `src/main.rs`/`src/lib.rs`
 
-- [ ] Step 1: Write failing tests:
+- [x] Step 1: Write failing tests:
 
 ```rust
     use std::net::Ipv4Addr;

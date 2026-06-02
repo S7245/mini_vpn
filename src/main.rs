@@ -1,6 +1,7 @@
 mod client;
 mod client_tun;
 mod device;
+mod fake_ip;
 mod server;
 
 #[tokio::main]
