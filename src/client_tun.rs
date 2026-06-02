@@ -716,7 +716,22 @@ async fn handle_remote_payload(
         return Ok(());
     }
 
-    tcp_socket.send_slice(&payload).unwrap();
+    // 防串话 / 防 panic（epoch guard 的轻量降级版）：若该 handle 已被重连流程复位回
+    // Listening（uplink_tx 被清空），说明这是上一代上游连接的迟到回程数据，直接丢弃，
+    // 绝不能往非 Established 的 socket 写（否则 send_slice 报错、旧版本会 unwrap panic）。
+    if ctx.uplink_tx.is_none() {
+        println!(
+            "🗑️ handle {:?} 已复位，丢弃旧连接迟到回程 {} 字节",
+            handle,
+            payload.len()
+        );
+        return Ok(());
+    }
+
+    if let Err(e) = tcp_socket.send_slice(&payload) {
+        println!("写本地 socket 失败 {:?}: {:?}，丢弃该回程", handle, e);
+        return Ok(());
+    }
     ctx.state = SocketState::Relaying;
     println!("✅ 成功将远端回信发给本地浏览器！");
 
