@@ -390,37 +390,72 @@ pub async fn start_tun_proxy() {
         }
     };
 
-    let server_stream = match TcpStream::connect(upstream_server_addr.as_str()).await {
-        Ok(stream) => stream,
+    // 上游连接 + 断开信号通道。epoch 记录连接代际（每成功一次 +1）。
+    let (disconnect_tx, mut disconnect_rx) = mpsc::channel::<()>(1);
+    let mut epoch: u64 = 0;
+    let mut ctr = match connect_upstream(
+        &connector,
+        &upstream_server_addr,
+        domain.clone(),
+        disconnect_tx.clone(),
+    )
+    .await
+    {
+        Ok(c) => {
+            epoch += 1;
+            println!("✅ 成功连接到洛杉矶代理服务器！(epoch={epoch})");
+            c
+        }
         Err(e) => {
-            println!("连接代理服务端失败 {upstream_server_addr}: {e}");
+            println!("首次连接代理服务端失败: {e:?}");
             return;
         }
     };
-
-     let tls_stream = match connector.clone().connect(domain, server_stream).await {
-        Ok(s) => s,
-        Err(e) => {
-            println!("与代理服务端 TLS 握手失败: {:?}", e);
-            return;
-        }
-    };
-    println!("✅ 成功连接到洛杉矶代理服务器！");
-    let mut yamux_conn =
-        Connection::new(tls_stream.compat(), YamuxConfig::default(), Mode::Client);
-    // 获取遥控器 ctr
-    let ctr = yamux_conn.control();
-
-    //使用 tokio::spawn 把 Yamux 引擎放到后台 poll 运行。🚂
-    tokio::spawn(async move {
-        while let Ok(Some(_)) = yamux_conn.next_stream().await {}
-        println!("与服务端的 Yamux 长连接已断开，请重启 Client");
-    });
 
     loop {
         let mut ctrl = ctr.clone();
         tokio::select! {
-            // 在 tokio::select! 里面，模仿网卡或定时器的写法，增加一个新的监听分支来接收 global_rx 里的数据吗？
+            // 分支 0: 上游连接断开 → 复位在途连接 + 带 full-jitter 退避重连（无限重试）。
+            _ = disconnect_rx.recv() => {
+                println!("🔌 上游连接断开，准备重连");
+                let handles: Vec<SocketHandle> = registry.all_handles().collect();
+                let mut reset = 0usize;
+                for h in handles {
+                    if let Some(c) = socket_ctxs.get_mut(&h)
+                        && c.uplink_tx.is_some()
+                    {
+                        let sock = sockets.get_mut::<TcpSocket>(h);
+                        rearm_socket(sock, c);
+                        reset += 1;
+                    }
+                }
+                println!("♻️ 重连后复位 {reset} 条在途连接");
+                let mut attempt = 0u32;
+                loop {
+                    let delay = backoff_delay(attempt, rand::random::<f64>());
+                    println!("⏳ 第 {} 次重连，等待 {}ms", attempt + 1, delay.as_millis());
+                    tokio::time::sleep(delay).await;
+                    match connect_upstream(
+                        &connector,
+                        &upstream_server_addr,
+                        domain.clone(),
+                        disconnect_tx.clone(),
+                    )
+                    .await
+                    {
+                        Ok(new_ctr) => {
+                            ctr = new_ctr;
+                            epoch += 1;
+                            println!("✅ 上游重连成功 (epoch={epoch})");
+                            break;
+                        }
+                        Err(e) => {
+                            println!("重连失败: {e:?}");
+                            attempt = attempt.saturating_add(1);
+                        }
+                    }
+                }
+            }
             // 🌟 新增分支：监听洛杉矶回传的信件
             Some((handle, payload)) = global_rx.recv() =>{
                 println!("📬 从大邮筒收到 {} 字节数据，准备送往房间 {:?}", payload.len(), handle);
@@ -511,6 +546,27 @@ fn build_listener_socket(spec: &ListenerSpec) -> TcpSocket<'static> {
     let mut tcp_socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
     tcp_socket.listen(spec.local_port).unwrap();
     tcp_socket
+}
+
+/// Establish one upstream TLS + Yamux connection and spawn its background poll task.
+/// 中文要点：把"建 TCP→TLS→Yamux"收敛成一处，返回可替换的 Control；后台 poll task
+/// 退出（即连接断开）时通过 disconnect_tx 给主循环发信号，驱动重连。
+async fn connect_upstream(
+    connector: &TlsConnector,
+    server_addr: &str,
+    domain: ServerName,
+    disconnect_tx: mpsc::Sender<()>,
+) -> Result<yamux::Control, ClientError> {
+    let server_stream = TcpStream::connect(server_addr).await?;
+    let tls_stream = connector.clone().connect(domain, server_stream).await?;
+    let mut yamux_conn = Connection::new(tls_stream.compat(), YamuxConfig::default(), Mode::Client);
+    let ctr = yamux_conn.control();
+    tokio::spawn(async move {
+        while let Ok(Some(_)) = yamux_conn.next_stream().await {}
+        // 连接断开：通知主循环（receiver 可能已关闭，忽略错误）。
+        let _ = disconnect_tx.send(()).await;
+    });
+    Ok(ctr)
 }
 
 /// Identify a clean inbound TCP SYN and return its destination port.
