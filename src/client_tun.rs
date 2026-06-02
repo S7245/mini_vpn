@@ -79,6 +79,21 @@ impl SocketCtx {
 /// 中文要点：防止 SYN flood 下 socket / 缓冲区无限增长，到顶就拒新端口。
 const MAX_INTERCEPTED_PORTS: usize = 64;
 
+/// Reconnect backoff bounds (full-jitter exponential).
+/// 中文要点：base/cap 设为编译期常量，本阶段不开 env；cap 限单连接最长重试间隔。
+const RECONNECT_BASE_MS: u64 = 500;
+const RECONNECT_CAP_MS: u64 = 30_000;
+
+/// Full-jitter exponential backoff delay: `random(0, min(CAP, BASE * 2^attempt))`.
+/// 中文要点：下界取 0 是 full jitter，最大程度摊平 5000+ 客户端的重连惊群。
+/// `rand_unit ∈ [0,1)` 由调用方注入（运行时 `rand::random`，测试传固定值）。
+fn backoff_delay(attempt: u32, rand_unit: f64) -> std::time::Duration {
+    let exp = RECONNECT_BASE_MS.saturating_mul(1u64.checked_shl(attempt).unwrap_or(u64::MAX));
+    let upper = exp.min(RECONNECT_CAP_MS);
+    let ms = (upper as f64 * rand_unit) as u64;
+    std::time::Duration::from_millis(ms)
+}
+
 /// Failure mode for `ListenerRegistry::ensure_port`.
 /// 中文要点：到顶时优雅拒绝，不能 panic，已注册端口的 socket 不受影响。
 #[derive(Debug, PartialEq, Eq)]
@@ -777,6 +792,26 @@ mod tests {
     #[test]
     fn inspect_inbound_syn_rejects_garbage() {
         assert_eq!(inspect_inbound_syn(&[0u8; 4]), None);
+    }
+
+    #[test]
+    fn backoff_delay_full_jitter_lower_bound_is_zero() {
+        assert_eq!(backoff_delay(0, 0.0), std::time::Duration::ZERO);
+        assert_eq!(backoff_delay(10, 0.0), std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn backoff_delay_attempt_zero_upper_is_base() {
+        let d = backoff_delay(0, 1.0_f64.next_down());
+        assert!(d < std::time::Duration::from_millis(RECONNECT_BASE_MS));
+        assert!(d >= std::time::Duration::from_millis(RECONNECT_BASE_MS * 99 / 100));
+    }
+
+    #[test]
+    fn backoff_delay_is_capped() {
+        let d = backoff_delay(30, 1.0_f64.next_down());
+        assert!(d <= std::time::Duration::from_millis(RECONNECT_CAP_MS));
+        assert!(d >= std::time::Duration::from_millis(RECONNECT_CAP_MS * 99 / 100));
     }
 
     #[test]
