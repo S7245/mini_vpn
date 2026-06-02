@@ -137,7 +137,7 @@ integration points in the TUN runtime (UDP DNS interception, target rewrite), th
 - [ ] Step 4: `cargo test` → PASS.
 - [ ] Step 5: Commit `feat(dns): add minimal A/AAAA query parse + response build`.
 
-### Task 3: TUN DNS interception (integration)
+### Task 3: TUN DNS interception (integration) — DONE
 
 **Files:** Modify `src/client_tun.rs`
 
@@ -160,7 +160,7 @@ integration points in the TUN runtime (UDP DNS interception, target rewrite), th
 - [ ] Step 4: `cargo check` + `clippy -D warnings` clean. (No unit test; integration.)
 - [ ] Step 5: Commit `feat(tun): intercept DNS in TUN and forge fake-IP responses`.
 
-### Task 4: target rewrite (integration)
+### Task 4: target rewrite (integration) — DONE
 
 **Files:** Modify `src/client_tun.rs`
 

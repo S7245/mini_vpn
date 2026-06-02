@@ -1,8 +1,11 @@
 use crate::device::VirtualTunDevice;
 use mini_vpn::shared::{ClientError, RelayRequest, TargetAddr, open_remote_session};
+use crate::dns::{self, Answer};
+use crate::fake_ip::FakeIpPool;
 use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer};
-use smoltcp::wire::{IpAddress, IpCidr};
+use smoltcp::socket::udp;
+use smoltcp::wire::{IpAddress, IpCidr, IpListenEndpoint};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
@@ -358,6 +361,17 @@ pub async fn start_tun_proxy() {
     let mut registry = ListenerRegistry::new(pool_size);
     let mut socket_ctxs: HashMap<SocketHandle, SocketCtx> = HashMap::new();
 
+    // Stage 11: fake-IP DNS。监听 UDP :53（AnyIP 收发往 198.18.0.1:53 的查询），
+    // 本地伪造 A 响应（fake-IP）；TCP 时凭 fake-IP 查回域名走 DomainPort relay。
+    let dns_handle = {
+        let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 4096]);
+        let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 4096]);
+        let mut s = udp::Socket::new(rx, tx);
+        s.bind(IpListenEndpoint { addr: None, port: 53 }).unwrap();
+        sockets.add(s)
+    };
+    let mut fake_pool = FakeIpPool::new();
+
     // 3. 初始化 smoltcp 的“虚拟路由器”
     let config = SmolConfig::new(smoltcp::wire::HardwareAddress::Ip);
     // 这里传入了包装好的 &mut device
@@ -495,6 +509,9 @@ pub async fn start_tun_proxy() {
 
                     let timestamp = smoltcp::time::Instant::now();
                     iface.poll(timestamp, &mut device, &mut sockets);
+                    // 处理 DNS 查询并伪造响应；再 poll 一次把响应变成 IP 包入发货队列。
+                    drain_dns(&mut sockets, dns_handle, &mut fake_pool);
+                    iface.poll(timestamp, &mut device, &mut sockets);
                     device.flush_tx().await.unwrap();
 
                     let handles: Vec<SocketHandle> = registry.all_handles().collect();
@@ -505,6 +522,7 @@ pub async fn start_tun_proxy() {
                             &mut socket_ctxs,
                             &mut ctrl,
                             &global_tx,
+                            &fake_pool,
                         )
                         .await
                         {
@@ -517,6 +535,8 @@ pub async fn start_tun_proxy() {
             _ = timer.tick() =>{
                 let timestamp = smoltcp::time::Instant::now();
                 iface.poll(timestamp, &mut device, &mut sockets);
+                drain_dns(&mut sockets, dns_handle, &mut fake_pool);
+                iface.poll(timestamp, &mut device, &mut sockets);
                 device.flush_tx().await.unwrap();
 
                 let handles: Vec<SocketHandle> = registry.all_handles().collect();
@@ -527,6 +547,7 @@ pub async fn start_tun_proxy() {
                         &mut socket_ctxs,
                         &mut ctrl,
                         &global_tx,
+                        &fake_pool,
                     )
                     .await
                     {
@@ -592,6 +613,68 @@ fn target_from_endpoint(endpoint: smoltcp::wire::IpEndpoint) -> TargetAddr {
     TargetAddr::IpPort(std::net::SocketAddr::new(ip, endpoint.port))
 }
 
+/// fake-IP target 改写结果。
+enum TargetResolve {
+    /// 正常转发：IpPort 直连，或 fake-IP 查回的 DomainPort。
+    Direct(TargetAddr),
+    /// fake-IP 段内但查不到映射（如客户端重启丢表、应用用旧缓存 IP）：拒绝，让应用重查。
+    Refuse,
+}
+
+/// 把提取出的 endpoint 解析成 relay target。
+/// 中文要点：fake-IP → 查表得域名 → DomainPort（出口解析、绕污染）；非 fake → IpPort
+/// （Stage 8/9 行为不变）；fake 但无映射 → Refuse（拒绝连接）。
+fn resolve_target(endpoint: smoltcp::wire::IpEndpoint, fake_pool: &FakeIpPool) -> TargetResolve {
+    let std::net::IpAddr::V4(v4) = std::net::IpAddr::from(endpoint.addr) else {
+        return TargetResolve::Direct(target_from_endpoint(endpoint));
+    };
+    if fake_pool.is_fake(v4) {
+        match fake_pool.resolve(v4) {
+            Some(domain) => {
+                println!("🔁 fake-IP {} resolve → {}", v4, domain);
+                TargetResolve::Direct(TargetAddr::DomainPort {
+                    host: domain,
+                    port: endpoint.port,
+                })
+            }
+            None => TargetResolve::Refuse,
+        }
+    } else {
+        TargetResolve::Direct(target_from_endpoint(endpoint))
+    }
+}
+
+/// 处理 DNS socket 上排队的查询：A → 分配 fake-IP 并伪造 A 响应；其它 → NODATA。
+/// 中文要点：纯本地应答，不外发真实 DNS；解析失败的查询直接忽略，绝不 panic。
+fn drain_dns(sockets: &mut SocketSet<'_>, dns_handle: SocketHandle, fake_pool: &mut FakeIpPool) {
+    let sock = sockets.get_mut::<udp::Socket>(dns_handle);
+    while sock.can_recv() {
+        let (data, remote) = match sock.recv() {
+            Ok((d, meta)) => (d.to_vec(), meta.endpoint),
+            Err(_) => break,
+        };
+        let Some(q) = dns::parse_query(&data) else {
+            continue;
+        };
+        let resp = if q.qtype == dns::QTYPE_A {
+            let ip = fake_pool.alloc(&q.qname);
+            println!("🪪 DNS {} (A) → fake-IP {}", q.qname, ip);
+            dns::build_response(&q, Answer::A(ip, 5))
+        } else {
+            let kind = if q.qtype == dns::QTYPE_AAAA {
+                "AAAA"
+            } else {
+                "other"
+            };
+            println!("🪪 DNS {} ({}) → NODATA", q.qname, kind);
+            dns::build_response(&q, Answer::NoData)
+        };
+        if let Err(e) = sock.send_slice(&resp, remote) {
+            println!("DNS 响应发送失败: {:?}", e);
+        }
+    }
+}
+
 /// Drain the currently available local payload from one listener slot.
 /// 中文要点：这里只负责把 smoltcp 缓冲区里的数据取出来，不做任何异步外联动作。
 fn extract_socket_payload(socket: &mut TcpSocket<'_>) -> Option<Vec<u8>> {
@@ -629,21 +712,39 @@ async fn process_listener_activity(
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
     ctrl: &mut yamux::Control,
     global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
+    fake_pool: &FakeIpPool,
 ) -> Result<(), ClientError> {
-    // 取首包的同时读 local_endpoint：它就是被拦截连接真正想去的 Target。
+    // 取首包的同时读 local_endpoint：它就是被拦截连接真正想去的目的 endpoint。
     // 中文要点：两者都需要 socket，合并在这一处借用里读出，避免二次借用。
     let extracted = {
         let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
         let payload = extract_socket_payload(tcp_socket);
-        let target = tcp_socket.local_endpoint().map(target_from_endpoint);
-        payload.map(|p| (p, target))
+        let endpoint = tcp_socket.local_endpoint();
+        payload.map(|p| (p, endpoint))
     };
 
-    if let Some((payload, target)) = extracted {
-        handle_local_payload(handle, payload, target, socket_ctxs, ctrl, global_tx).await?;
-    }
+    // 只有"有首包"且"有 local_endpoint"才继续；否则跳过。
+    let Some((payload, Some(endpoint))) = extracted else {
+        return Ok(());
+    };
 
-    Ok(())
+    // Stage 11：fake-IP → 查表换域名（DomainPort）；非 fake → IpPort；fake 无映射 → 拒绝。
+    let target = match resolve_target(endpoint, fake_pool) {
+        TargetResolve::Direct(t) => t,
+        TargetResolve::Refuse => {
+            println!(
+                "🚫 fake-IP {} 无映射，拒绝连接（请重新解析）",
+                endpoint.addr
+            );
+            let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
+            if let Some(ctx) = socket_ctxs.get_mut(&handle) {
+                rearm_socket(tcp_socket, ctx);
+            }
+            return Ok(());
+        }
+    };
+
+    handle_local_payload(handle, payload, Some(target), socket_ctxs, ctrl, global_tx).await
 }
 
 async fn handle_local_payload(
