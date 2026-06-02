@@ -1,5 +1,18 @@
 # Learnings
 
+## 2026-06-01 — Full jitter is observable and correct in the reconnect logs
+
+Stage 10 cross-machine test (kill/restart US server) showed reconnect delays of
+409/440/1554/354/5966ms — non-monotonic. That non-monotonicity is the proof that
+full jitter is working: plain exponential backoff would be strictly increasing
+(500/1000/2000...). The randomness is what spreads 5000 clients' reconnect
+moments and prevents a thundering herd. When validating backoff, check that the
+delays are NOT monotonic — a monotonic sequence means jitter is broken.
+
+Also confirmed: infinite retry (4 failures then success) + reset-on-success
+(second disconnect cycle restarts the attempt counter) + epoch increments per
+reconnect (1→2→3). No panic when reconnecting while idle (0 in-flight to reset).
+
 ## 2026-06-01 — Byte-level transparent TCP relay preserves end-to-end TLS
 
 Stage 9 cross-machine test against `https://1.1.1.1/` produced a full TLS 1.3

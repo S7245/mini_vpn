@@ -163,7 +163,9 @@ async fn connect_upstream(
 - [ ] Step 3: Update `CONTEXT.md` (Reconnect epoch), `TODO.md` (failover, control plane,
   L4 LB, rolling restart + graceful drain, heartbeat).
 - [ ] Step 4: Full validation: `cargo test` / `check` / `clippy -D warnings` / `doc --no-deps`.
-- [ ] Step 5: Manual cross-machine e2e (pending user): kill+restart US server, confirm
-  client logs disconnect → backoff → reconnect, and `curl http://1.1.1.1/` works again
-  without restarting the client.
+- [x] Step 5: Manual cross-machine e2e — DONE 2026-06-01. Killed+restarted US server
+  twice; client logged `🔌 断开 → ♻️ 复位 → ⏳ 重连(随机退避) → ✅ 重连成功`, epoch
+  incrementing 1→2→3. Backoff delays observed non-monotonic (409/440/1554/354/5966ms),
+  confirming full jitter (not plain exponential). Infinite retry + reset-on-success
+  both verified across two disconnect cycles. No panic, no exit.
 - [ ] Step 6: Commit `docs(tun): add stage 10 yamux reconnect note`.
