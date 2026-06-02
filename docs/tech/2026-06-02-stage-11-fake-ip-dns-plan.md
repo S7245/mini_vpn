@@ -181,7 +181,7 @@ integration points in the TUN runtime (UDP DNS interception, target rewrite), th
 - [ ] Step 2: `cargo test` (existing 24+7 still pass) + `clippy -D warnings` clean.
 - [ ] Step 3: Commit `feat(tun): rewrite fake-IP target to DomainPort, refuse stale`.
 
-### Task 5: teaching note + full validation + cross-machine e2e
+### Task 5: teaching note + full validation + cross-machine e2e — DONE (manual e2e pending user)
 
 **Files:** Create `docs/tech/11-fake-ip-dns.md`; Modify `TODO.md`
 
