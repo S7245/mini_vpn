@@ -367,7 +367,14 @@ pub async fn start_tun_proxy() {
         let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 4096]);
         let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 4096]);
         let mut s = udp::Socket::new(rx, tx);
-        s.bind(IpListenEndpoint { addr: None, port: 53 }).unwrap();
+        // 必须 bind 到具体的 198.18.0.1，而非通配 None：否则 smoltcp 回复 DNS 响应时
+        // 按子网匹配选源地址（dst=10.0.0.1 → src=10.0.0.2），源与查询目的不一致，
+        // 系统 resolver 会丢弃响应。bind 到 198.18.0.1 才能让响应 src=198.18.0.1。
+        s.bind(IpListenEndpoint {
+            addr: Some(IpAddress::v4(198, 18, 0, 1)),
+            port: 53,
+        })
+        .unwrap();
         sockets.add(s)
     };
     let mut fake_pool = FakeIpPool::new();
