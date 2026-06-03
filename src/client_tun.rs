@@ -382,6 +382,11 @@ pub async fn start_tun_proxy() {
         ip_addrs
             .push(IpCidr::new(IpAddress::v4(10, 0, 0, 2), 24))
             .unwrap();
+        // Stage 11: 把 fake DNS resolver 地址也配成本接口 IP，否则 smoltcp 无法以
+        // src=198.18.0.1 发回 DNS 响应（egress 选不到合法 src），系统收不到应答。
+        ip_addrs
+            .push(IpCidr::new(IpAddress::v4(198, 18, 0, 1), 32))
+            .unwrap();
     });
 
     // AnyIP：接收目的 IP 不是本接口自身地址的包（即被拦截连接真正想去的 Target）。
