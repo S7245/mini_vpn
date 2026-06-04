@@ -190,7 +190,13 @@ integration points in the TUN runtime (UDP DNS interception, target rewrite), th
 - [ ] Step 2: `TODO.md`: DoH interception, hardcoded-IP, QUIC/UDP relay, fake-IP
   reclamation, hickory trigger conditions.
 - [ ] Step 3: Full validation: `cargo test` / `check` / `clippy -D warnings` / `doc --no-deps`.
-- [ ] Step 4: Manual cross-machine e2e (pending user, requires sudo/TUN/DNS setup):
+- [x] Step 4: Manual cross-machine e2e — DONE 2026-06-02. Shenzhen `curl
+  https://www.facebook.com/` → local fake-IP 198.18.0.13 → US exit resolved the
+  domain (server logged `解析出的目标地址是: www.facebook.com:443`) → real Meta server
+  (HTTP/2 200, genuine `*.facebook.com` cert). Local DNS poisoning bypassed. Two
+  follow-ups filed in TODO (first-SYN refused race; large-stream bad decrypt). Took
+  two fixes to get the DNS reply to egress (iface address + bind to concrete
+  198.18.0.1). Original recipe below.
   ```bash
   # client: route fake range + DNS into utun, point system DNS at 198.18.0.1
   UT=$(ifconfig | awk '/^utun/{i=$1} /inet 10\.0\.0\.1 /{print i}' | tr -d ':')

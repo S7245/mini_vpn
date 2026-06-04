@@ -1,5 +1,29 @@
 # Learnings
 
+## 2026-06-02 — fake-IP end-to-end reached a GFW-blocked domain; two TUN-UDP source-address gotchas
+
+Stage 11 fake-IP worked end-to-end: Shenzhen `curl https://www.facebook.com/` →
+local fake-IP → tunnel → US exit resolves the domain → real Meta server (HTTP/2 200,
+genuine `*.facebook.com` cert). First time the project bypassed local DNS poisoning.
+
+Two non-obvious bugs, both about the **source address of replies from an AnyIP TUN**:
+1. The fake DNS resolver listens on 198.18.0.1:53 via AnyIP, but a reply must carry
+   src=198.18.0.1. Two things were required and BOTH were needed:
+   (a) add 198.18.0.1 to the iface ip_addrs (else smoltcp can't egress that src), and
+   (b) bind the UDP socket to the concrete 198.18.0.1 (NOT addr:None) — with None,
+   smoltcp picks the reply source by subnet match (dst 10.0.0.1 → src 10.0.0.2), the
+   OS resolver drops replies whose source != the queried server, and the symptom is
+   `curl: Could not resolve host` while our log clearly shows the query arriving.
+   The tx queue staying EMPTY (`发货单：[]`) was the tell that the reply never egressed.
+
+Two follow-ups (logged in TODO):
+- First TCP SYN to a freshly-allocated fake-IP can hit `connection refused` (curl does
+  NOT retry on refused, unlike on timeout) — likely a race between the SYN inspector
+  building the listener and the SYN being processed.
+- Large HTTP/2 / multiplexed streams can fail mid-transfer with `bad decrypt` — relay
+  byte-stream corruption/reordering under load; mechanism is correct (first request got
+  a full 200) but high-throughput stability needs investigation.
+
 ## 2026-06-01 — Full jitter is observable and correct in the reconnect logs
 
 Stage 10 cross-machine test (kill/restart US server) showed reconnect delays of

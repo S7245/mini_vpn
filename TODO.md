@@ -63,6 +63,14 @@ so the Upstream resolves at the exit. Follow-ups not in Stage 11:
 - **Switch DNS codec to hickory-proto** when any of: parsing real upstream responses
   (compression pointers), EDNS0/DNSSEC/DoH, more record types (CNAME/HTTPS/SVCB), or
   hardening against malicious packets. Only the dns.rs codec module changes; interface stable.
+- **First-SYN-to-fresh-fake-IP can get `connection refused`** (observed Stage 11 e2e):
+  curl does NOT retry TCP on refused (unlike on timeout), so a one-off RST kills the
+  connect. Likely a race between the SYN inspector building the listener pool and the
+  SYN being processed in the same poll. Add a tolerance (pre-arm, or brief retry).
+- **Large HTTP/2 / multiplexed streams fail mid-transfer with `bad decrypt`** (observed
+  Stage 11 e2e): TLS handshake succeeds and the first request returns a full 200, but
+  high-throughput / many-stream transfers corrupt mid-flight. Investigate relay
+  byte-stream ordering/buffering under load (yamux substream multiplexing, relay copy).
 
 ### Scale & reconnection resilience (100+ servers / 5000+ users)
 
