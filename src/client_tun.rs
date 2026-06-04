@@ -63,6 +63,10 @@ struct SocketCtx {
     state: SocketState,
     /// Sender used to push local payloads into the remote relay task for this slot only.
     uplink_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Downlink bytes not yet accepted by the smoltcp tx buffer.
+    /// 中文要点：smoltcp send_slice 可能只写一部分（tx buffer 受 TCP ACK 释放制约），
+    /// 写不下的字节必须留在这里、由后续 poll 持续 flush，否则丢字节 → TLS bad decrypt。
+    downlink_pending: Vec<u8>,
 }
 
 impl SocketCtx {
@@ -74,6 +78,26 @@ impl SocketCtx {
             local_port,
             state: SocketState::Listening,
             uplink_tx: None,
+            downlink_pending: Vec::new(),
+        }
+    }
+}
+
+/// Push as much of the handle's downlink backlog into the smoltcp tx buffer as fits;
+/// keep the rest for the next poll. Partial `send_slice` writes are normal.
+/// 中文要点：这是修 bad decrypt 的关键——绝不丢弃写不下的字节。
+fn flush_downlink(tcp_socket: &mut TcpSocket, ctx: &mut SocketCtx) {
+    if ctx.downlink_pending.is_empty() || !tcp_socket.can_send() {
+        return;
+    }
+    match tcp_socket.send_slice(&ctx.downlink_pending) {
+        Ok(0) => {}
+        Ok(n) => {
+            ctx.downlink_pending.drain(..n);
+        }
+        Err(_) => {
+            // socket 不可发（已关闭/复位）：丢弃残留，避免无限堆积。
+            ctx.downlink_pending.clear();
         }
     }
 }
@@ -710,6 +734,7 @@ fn rearm_socket(socket: &mut TcpSocket<'_>, ctx: &mut SocketCtx) {
     ctx.state = SocketState::Closing;
     socket.abort();
     ctx.uplink_tx = None;
+    ctx.downlink_pending.clear();
     ctx.state = SocketState::Rearming;
     socket.listen(ctx.local_port).unwrap();
     ctx.state = SocketState::Listening;
@@ -726,6 +751,15 @@ async fn process_listener_activity(
     global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
     fake_pool: &FakeIpPool,
 ) -> Result<(), ClientError> {
+    // 每轮先推进该 handle 的下行 pending：TCP ACK 释放 tx buffer 空间后继续写，
+    // 直到把上一轮没写完的回程字节全部交付，绝不丢字节（修 bad decrypt 的另一半）。
+    {
+        let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
+        if let Some(ctx) = socket_ctxs.get_mut(&handle) {
+            flush_downlink(tcp_socket, ctx);
+        }
+    }
+
     // 取首包的同时读 local_endpoint：它就是被拦截连接真正想去的目的 endpoint。
     // 中文要点：两者都需要 socket，合并在这一处借用里读出，避免二次借用。
     let extracted = {
@@ -841,12 +875,11 @@ async fn handle_remote_payload(
         return Ok(());
     }
 
-    if let Err(e) = tcp_socket.send_slice(&payload) {
-        println!("写本地 socket 失败 {:?}: {:?}，丢弃该回程", handle, e);
-        return Ok(());
-    }
+    // 不直接 send_slice（会丢写不下的字节）：先入下行 pending，再尽量 flush；
+    // 剩余字节由主循环每轮 poll 持续推进（TCP ACK 释放 buffer 后继续）。
+    ctx.downlink_pending.extend_from_slice(&payload);
+    flush_downlink(tcp_socket, ctx);
     ctx.state = SocketState::Relaying;
-    println!("✅ 成功将远端回信发给本地浏览器！");
 
     let timestamp = smoltcp::time::Instant::now();
     iface.poll(timestamp, device, sockets);
@@ -1031,6 +1064,7 @@ mod tests {
             local_port: 80,
             state: SocketState::Relaying,
             uplink_tx: Some(tx),
+            downlink_pending: Vec::new(),
         };
 
         rearm_socket(&mut socket, &mut ctx);
