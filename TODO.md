@@ -67,10 +67,11 @@ so the Upstream resolves at the exit. Follow-ups not in Stage 11:
   curl does NOT retry TCP on refused (unlike on timeout), so a one-off RST kills the
   connect. Likely a race between the SYN inspector building the listener pool and the
   SYN being processed in the same poll. Add a tolerance (pre-arm, or brief retry).
-- **Large HTTP/2 / multiplexed streams fail mid-transfer with `bad decrypt`** (observed
-  Stage 11 e2e): TLS handshake succeeds and the first request returns a full 200, but
-  high-throughput / many-stream transfers corrupt mid-flight. Investigate relay
-  byte-stream ordering/buffering under load (yamux substream multiplexing, relay copy).
+- ~~**Large HTTP/2 / multiplexed streams fail mid-transfer with `bad decrypt`**~~
+  RESOLVED 2026-06-04 (commit b476854): root cause was `send_slice` dropping the
+  unwritten tail when the tx buffer was full; fixed with a per-handle downlink
+  pending buffer that never drops bytes. Verified: `curl https://www.facebook.com/`
+  downloads a full ~415KB repeatedly with no bad decrypt.
 
 ### Scale & reconnection resilience (100+ servers / 5000+ users)
 
