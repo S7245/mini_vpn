@@ -5,7 +5,12 @@
 //! `tests/` 集成测试都能复用。承重决策见 docs/adr/0003 与 stage-12 spec。
 
 use crate::shared::TargetAddr;
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+
+use quinn::Connection;
+use tokio::net::UdpSocket;
 
 /// ATYP=1：4 字节 IPv4 地址。
 const ATYP_IPV4: u8 = 1;
@@ -281,6 +286,120 @@ pub fn build_udp_ip_packet(src: (Ipv4Addr, u16), dst: (Ipv4Addr, u16), payload: 
     buf
 }
 
+// ===================== 服务端：QUIC datagram → 出口 UDP relay =====================
+
+/// 从「flow_id → last_activity(秒)」里挑出空闲超过 `idle_secs` 的 flow（服务端会话回收）。
+/// 中文要点：纯函数，便于单测回收策略；async 侧用它驱动 socket 关闭。
+pub fn expired_flow_ids<I>(entries: I, now: u64, idle_secs: u64) -> Vec<u32>
+where
+    I: IntoIterator<Item = (u32, u64)>,
+{
+    entries
+        .into_iter()
+        .filter(|(_, last)| now.saturating_sub(*last) > idle_secs)
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// 一条出口 UDP 会话：socket + 回程 task + 最近活动时间。
+struct ServerSession {
+    socket: Arc<UdpSocket>,
+    recv_task: tokio::task::JoinHandle<()>,
+    last_activity: u64,
+}
+
+/// 把 relay target 解析成可发的 `SocketAddr`（DomainPort 用服务端干净 DNS）。
+async fn resolve_target_addr(target: &TargetAddr) -> Option<SocketAddr> {
+    match target {
+        TargetAddr::IpPort(addr) => Some(*addr),
+        TargetAddr::DomainPort { host, port } => {
+            tokio::net::lookup_host((host.as_str(), *port))
+                .await
+                .ok()?
+                .next()
+        }
+    }
+}
+
+/// 为一个 flow 起回程 task：从出口 socket 收包 → 打 flow-id → send_datagram 回客户端。
+fn spawn_downlink(conn: Connection, flow_id: u32, socket: Arc<UdpSocket>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65_535];
+        loop {
+            match socket.recv_from(&mut buf).await {
+                Ok((n, _peer)) => {
+                    let dg = encode_downlink(flow_id, &buf[..n]);
+                    match conn.send_datagram(dg.into()) {
+                        Ok(()) => {}
+                        // 超限 → 丢弃（UDP 语义）；连接断/被禁/不支持 → 退出。
+                        Err(quinn::SendDatagramError::TooLarge) => {}
+                        Err(_) => break,
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+/// 服务端：在一条 QUIC 连接上中继 UDP datagram。每个 flow-id 配一个出口 UDP socket，
+/// 空闲超过 `idle_secs` 回收。中文要点：朴素「每流一 socket」，池化/端口抗压留平台 stage。
+pub async fn serve_quic_connection(conn: Connection, idle_secs: u64) {
+    let mut sessions: HashMap<u32, ServerSession> = HashMap::new();
+    let mut sweep = tokio::time::interval(std::time::Duration::from_secs(1));
+    let start = std::time::Instant::now();
+
+    loop {
+        tokio::select! {
+            dg = conn.read_datagram() => {
+                let bytes = match dg {
+                    Ok(b) => b,
+                    Err(_) => break, // 连接断开
+                };
+                let Some((flow_id, target, payload)) = decode_uplink(&bytes) else {
+                    continue;
+                };
+                let Some(dst) = resolve_target_addr(&target).await else {
+                    continue;
+                };
+                let now = start.elapsed().as_secs();
+                // 取/建会话，并把出口 socket 的 Arc 取出（释放 sessions 借用后再 await 发送）。
+                let socket = {
+                    if !sessions.contains_key(&flow_id) {
+                        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+                            Ok(s) => Arc::new(s),
+                            Err(_) => continue,
+                        };
+                        let recv_task = spawn_downlink(conn.clone(), flow_id, socket.clone());
+                        sessions.insert(flow_id, ServerSession { socket, recv_task, last_activity: now });
+                    }
+                    let s = sessions.get_mut(&flow_id).expect("just inserted");
+                    s.last_activity = now;
+                    s.socket.clone()
+                };
+                let _ = socket.send_to(payload, dst).await;
+            }
+            _ = sweep.tick() => {
+                let now = start.elapsed().as_secs();
+                let expired = expired_flow_ids(
+                    sessions.iter().map(|(k, s)| (*k, s.last_activity)),
+                    now,
+                    idle_secs,
+                );
+                for id in expired {
+                    if let Some(s) = sessions.remove(&id) {
+                        s.recv_task.abort();
+                    }
+                }
+            }
+        }
+    }
+    // 连接结束：清理所有回程 task。
+    for (_, s) in sessions {
+        s.recv_task.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,5 +552,20 @@ mod tests {
             .write(&mut tcp, &[])
             .unwrap();
         assert!(parse_inbound_udp(&tcp).is_none());
+    }
+
+    #[test]
+    fn expired_flow_ids_selects_only_idle() {
+        // flow 1 last_seen=0, flow 2 last_seen=50；now=61, idle=60 → 只有 1 过期。
+        let entries = vec![(1u32, 0u64), (2u32, 50u64)];
+        let mut got = expired_flow_ids(entries, 61, 60);
+        got.sort_unstable();
+        assert_eq!(got, vec![1]);
+    }
+
+    #[test]
+    fn expired_flow_ids_none_when_all_fresh() {
+        let entries = vec![(1u32, 30u64), (2u32, 40u64)];
+        assert!(expired_flow_ids(entries, 50, 60).is_empty());
     }
 }
