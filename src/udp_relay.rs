@@ -113,6 +113,134 @@ pub fn decode_downlink(buf: &[u8]) -> Option<(u32, &[u8])> {
     Some((flow_id, &buf[4..]))
 }
 
+/// 单客户端最多并发的 UDP flow 数；到顶 LRU 驱逐（见 spec / 系统稳定优先）。
+pub const MAX_UDP_FLOWS: usize = 1024;
+
+/// 一条 UDP flow 的四元组身份：`(srcIP:srcPort, dstIP:dstPort)`（IPv4，TUN 路径）。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct FourTuple {
+    pub src_ip: Ipv4Addr,
+    pub src_port: u16,
+    pub dst_ip: Ipv4Addr,
+    pub dst_port: u16,
+}
+
+/// flow 表里一条 flow 的运行态。
+#[derive(Clone, Copy, Debug)]
+pub struct FlowEntry {
+    pub tuple: FourTuple,
+    /// 最近活动时间（秒，由调用方注入，便于单测；不在内部读时钟）。
+    pub last_activity: u64,
+}
+
+impl FlowEntry {
+    /// 下行包的目的：app 当初的源端点。
+    pub fn app_endpoint(&self) -> (Ipv4Addr, u16) {
+        (self.tuple.src_ip, self.tuple.src_port)
+    }
+    /// 下行包的源：app 当初发往的目的（fake-IP/target），让 app 认得是对端回包。
+    pub fn target_src(&self) -> (Ipv4Addr, u16) {
+        (self.tuple.dst_ip, self.tuple.dst_port)
+    }
+}
+
+/// client 侧 flow 表：四元组 ↔ flow-id 双向 + 空闲回收 + LRU 上限。
+/// 中文要点：主循环独占、无锁；`now` 由调用方注入（不在内部读时钟，便于单测，呼应
+/// `backoff_delay` 的随机注入做法）。
+#[derive(Debug)]
+pub struct FlowTable {
+    tuple_to_id: std::collections::HashMap<FourTuple, u32>,
+    id_to_entry: std::collections::HashMap<u32, FlowEntry>,
+    next_id: u32,
+    cap: usize,
+}
+
+impl Default for FlowTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FlowTable {
+    pub fn new() -> Self {
+        Self::with_cap(MAX_UDP_FLOWS)
+    }
+
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            tuple_to_id: std::collections::HashMap::new(),
+            id_to_entry: std::collections::HashMap::new(),
+            next_id: 1,
+            cap: cap.max(1),
+        }
+    }
+
+    /// 查/铸 flow-id：四元组已在册稳定返回；否则铸新 id（到顶先 LRU 驱逐）。
+    pub fn intern(&mut self, tuple: FourTuple) -> u32 {
+        if let Some(&id) = self.tuple_to_id.get(&tuple) {
+            return id;
+        }
+        if self.id_to_entry.len() >= self.cap {
+            self.evict_lru();
+        }
+        let id = self.next_id;
+        // 单调递增、绝不复用，避免回收后的迟到 datagram 串到新 flow。
+        self.next_id = self.next_id.wrapping_add(1);
+        self.id_to_entry.insert(
+            id,
+            FlowEntry {
+                tuple,
+                last_activity: 0,
+            },
+        );
+        self.tuple_to_id.insert(tuple, id);
+        id
+    }
+
+    pub fn resolve(&self, flow_id: u32) -> Option<&FlowEntry> {
+        self.id_to_entry.get(&flow_id)
+    }
+
+    pub fn touch(&mut self, flow_id: u32, now: u64) {
+        if let Some(e) = self.id_to_entry.get_mut(&flow_id) {
+            e.last_activity = now;
+        }
+    }
+
+    /// 回收空闲超过 `idle_secs` 的 flow（双向删表）。
+    pub fn sweep(&mut self, now: u64, idle_secs: u64) {
+        let expired: Vec<(u32, FourTuple)> = self
+            .id_to_entry
+            .iter()
+            .filter(|(_, e)| now.saturating_sub(e.last_activity) > idle_secs)
+            .map(|(id, e)| (*id, e.tuple))
+            .collect();
+        for (id, tuple) in expired {
+            self.id_to_entry.remove(&id);
+            self.tuple_to_id.remove(&tuple);
+        }
+    }
+
+    /// 驱逐最久未活动的一条（last_activity 最小，同值取最小 flow-id = 最早插入）。
+    fn evict_lru(&mut self) {
+        let victim = self
+            .id_to_entry
+            .iter()
+            .min_by_key(|(id, e)| (e.last_activity, **id))
+            .map(|(id, _)| *id);
+        if let Some(id) = victim
+            && let Some(e) = self.id_to_entry.remove(&id)
+        {
+            self.tuple_to_id.remove(&e.tuple);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.id_to_entry.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +302,61 @@ mod tests {
         assert!(decode_uplink(&[0, 0, 0, 1, ATYP_DOMAIN, 200, b'a']).is_none()); // domain len overruns
         assert!(decode_uplink(&[0, 0, 0, 1, 99]).is_none()); // unknown ATYP
         assert!(decode_downlink(&[0u8; 2]).is_none());
+    }
+
+    fn tuple(p: u16) -> FourTuple {
+        FourTuple {
+            src_ip: Ipv4Addr::new(10, 0, 0, 1),
+            src_port: p,
+            dst_ip: Ipv4Addr::new(198, 18, 0, 5),
+            dst_port: 443,
+        }
+    }
+
+    #[test]
+    fn intern_is_stable_per_tuple_and_unique_across() {
+        let mut t = FlowTable::new();
+        let a = t.intern(tuple(1000));
+        assert_eq!(a, t.intern(tuple(1000)), "same tuple reuses flow-id");
+        assert_ne!(a, t.intern(tuple(1001)), "different tuple new flow-id");
+    }
+
+    #[test]
+    fn resolve_returns_entry_and_endpoints() {
+        let mut t = FlowTable::new();
+        let id = t.intern(tuple(1000));
+        let e = t.resolve(id).expect("entry present");
+        assert_eq!(e.app_endpoint(), (Ipv4Addr::new(10, 0, 0, 1), 1000));
+        assert_eq!(e.target_src(), (Ipv4Addr::new(198, 18, 0, 5), 443));
+    }
+
+    #[test]
+    fn sweep_reclaims_idle_flows() {
+        let mut t = FlowTable::new();
+        let id = t.intern(tuple(1000)); // last_activity = 0
+        assert!(t.resolve(id).is_some());
+        t.sweep(61, 60); // 61 - 0 > 60
+        assert!(t.resolve(id).is_none(), "idle > 60s reclaimed");
+        // 反向表也清掉：同四元组应铸新 id。
+        assert_ne!(t.intern(tuple(1000)), id);
+    }
+
+    #[test]
+    fn touch_keeps_flow_alive() {
+        let mut t = FlowTable::new();
+        let id = t.intern(tuple(1000)); // t=0
+        t.touch(id, 50);
+        t.sweep(100, 60); // 100 - 50 < 60
+        assert!(t.resolve(id).is_some());
+    }
+
+    #[test]
+    fn lru_evicts_oldest_beyond_cap() {
+        let mut t = FlowTable::with_cap(2);
+        let a = t.intern(tuple(1));
+        let _b = t.intern(tuple(2));
+        let _c = t.intern(tuple(3)); // evicts oldest (a)
+        assert!(t.resolve(a).is_none());
+        assert_eq!(t.len(), 2);
     }
 }
