@@ -121,6 +121,10 @@ pub fn decode_downlink(buf: &[u8]) -> Option<(u32, &[u8])> {
 /// 单客户端最多并发的 UDP flow 数；到顶 LRU 驱逐（见 spec / 系统稳定优先）。
 pub const MAX_UDP_FLOWS: usize = 1024;
 
+/// UDP flow 空闲回收阈值（秒）。client 与 server 各自独立计时、自愈兜底（见 stage-12 spec）。
+/// 中文要点：收口在此（sweep / expired_flow_ids 都在本模块），避免两端常量漂移。
+pub const UDP_FLOW_IDLE_SECS: u64 = 60;
+
 /// 一条 UDP flow 的四元组身份：`(srcIP:srcPort, dstIP:dstPort)`（IPv4，TUN 路径）。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct FourTuple {
@@ -154,8 +158,8 @@ impl FlowEntry {
 /// `backoff_delay` 的随机注入做法）。
 #[derive(Debug)]
 pub struct FlowTable {
-    tuple_to_id: std::collections::HashMap<FourTuple, u32>,
-    id_to_entry: std::collections::HashMap<u32, FlowEntry>,
+    tuple_to_id: HashMap<FourTuple, u32>,
+    id_to_entry: HashMap<u32, FlowEntry>,
     next_id: u32,
     cap: usize,
 }
@@ -173,8 +177,8 @@ impl FlowTable {
 
     pub fn with_cap(cap: usize) -> Self {
         Self {
-            tuple_to_id: std::collections::HashMap::new(),
-            id_to_entry: std::collections::HashMap::new(),
+            tuple_to_id: HashMap::new(),
+            id_to_entry: HashMap::new(),
             next_id: 1,
             cap: cap.max(1),
         }
@@ -321,18 +325,23 @@ async fn resolve_target_addr(target: &TargetAddr) -> Option<SocketAddr> {
     }
 }
 
-/// 为一个 flow 起回程 task：从出口 socket 收包 → 打 flow-id → send_datagram 回客户端。
+/// 为一个 flow 起回程 task：从（已 connect 的）出口 socket 收包 → 打 flow-id → 回客户端。
+/// 中文要点：socket 已 connect 到 target，`recv` 只收该对端的包 —— 杜绝任意主机伪造回程
+/// （off-path UDP 欺骗，对 DNS-over-UDP 尤其重要）。
 fn spawn_downlink(conn: Connection, flow_id: u32, socket: Arc<UdpSocket>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65_535];
         loop {
-            match socket.recv_from(&mut buf).await {
-                Ok((n, _peer)) => {
+            match socket.recv(&mut buf).await {
+                Ok(n) => {
                     let dg = encode_downlink(flow_id, &buf[..n]);
                     match conn.send_datagram(dg.into()) {
                         Ok(()) => {}
-                        // 超限 → 丢弃（UDP 语义）；连接断/被禁/不支持 → 退出。
-                        Err(quinn::SendDatagramError::TooLarge) => {}
+                        // 超限 → 丢弃（UDP 语义），但记一笔，绝不静默。
+                        Err(quinn::SendDatagramError::TooLarge) => {
+                            println!("⚠️ UDP 下行 datagram 超过 QUIC 上限，丢弃 (flow {flow_id})");
+                        }
+                        // 连接断/被禁/不支持 → 退出。
                         Err(_) => break,
                     }
                 }
@@ -359,25 +368,40 @@ pub async fn serve_quic_connection(conn: Connection, idle_secs: u64) {
                 let Some((flow_id, target, payload)) = decode_uplink(&bytes) else {
                     continue;
                 };
-                let Some(dst) = resolve_target_addr(&target).await else {
-                    continue;
-                };
                 let now = start.elapsed().as_secs();
-                // 取/建会话，并把出口 socket 的 Arc 取出（释放 sessions 借用后再 await 发送）。
-                let socket = {
-                    if !sessions.contains_key(&flow_id) {
-                        let socket = match UdpSocket::bind("0.0.0.0:0").await {
-                            Ok(s) => Arc::new(s),
+                // 取/建会话；首包才解析一次 target、按地址族绑定并 connect（此后整条 flow 复用）。
+                // 中文要点：解析移出每包热路径（避免 HOL + 重复 DNS）；connect 让收发只认该对端。
+                let socket = match sessions.get_mut(&flow_id) {
+                    Some(s) => {
+                        s.last_activity = now;
+                        s.socket.clone()
+                    }
+                    None => {
+                        let Some(dst) = resolve_target_addr(&target).await else {
+                            continue;
+                        };
+                        let bind: SocketAddr = if dst.is_ipv4() {
+                            (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+                        } else {
+                            (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+                        };
+                        let socket = match UdpSocket::bind(bind).await {
+                            Ok(s) => s,
                             Err(_) => continue,
                         };
+                        if socket.connect(dst).await.is_err() {
+                            continue;
+                        }
+                        let socket = Arc::new(socket);
                         let recv_task = spawn_downlink(conn.clone(), flow_id, socket.clone());
-                        sessions.insert(flow_id, ServerSession { socket, recv_task, last_activity: now });
+                        sessions.insert(
+                            flow_id,
+                            ServerSession { socket: socket.clone(), recv_task, last_activity: now },
+                        );
+                        socket
                     }
-                    let s = sessions.get_mut(&flow_id).expect("just inserted");
-                    s.last_activity = now;
-                    s.socket.clone()
                 };
-                let _ = socket.send_to(payload, dst).await;
+                let _ = socket.send(payload).await;
             }
             _ = sweep.tick() => {
                 let now = start.elapsed().as_secs();

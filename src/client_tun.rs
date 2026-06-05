@@ -2,7 +2,8 @@ use crate::device::VirtualTunDevice;
 use mini_vpn::quic::{client_endpoint, client_quic_config};
 use mini_vpn::shared::{ClientError, RelayRequest, TargetAddr, open_remote_session};
 use mini_vpn::udp_relay::{
-    FlowTable, FourTuple, build_udp_ip_packet, decode_downlink, encode_uplink, parse_inbound_udp,
+    FlowTable, FourTuple, UDP_FLOW_IDLE_SECS, build_udp_ip_packet, decode_downlink, encode_uplink,
+    parse_inbound_udp,
 };
 use crate::dns::{self, Answer};
 use crate::fake_ip::FakeIpPool;
@@ -116,8 +117,6 @@ const MAX_INTERCEPTED_PORTS: usize = 64;
 const RECONNECT_BASE_MS: u64 = 500;
 const RECONNECT_CAP_MS: u64 = 30_000;
 
-/// UDP flow 空闲回收阈值（秒）。与服务端各自独立，自愈兜底（见 stage-12 spec）。
-const UDP_FLOW_IDLE_SECS: u64 = 60;
 /// fake-IP DNS resolver 地址：去往它的 :53 UDP 走本地 fake-IP 应答，不进 UDP relay。
 const FAKE_DNS_RESOLVER: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 /// QUIC datagram 上行通道容量；满了丢弃（UDP 语义，不阻塞主循环）。
