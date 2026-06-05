@@ -3,10 +3,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use mini_vpn::quic::{server_endpoint, server_quic_config};
 use mini_vpn::shared::{RelayRequest, read_relay_request};
-use mini_vpn::udp_relay::serve_quic_connection;
-
-/// 出口 UDP 会话空闲回收阈值（秒）。中文要点：与客户端各自独立，自愈兜底（见 spec）。
-const UDP_FLOW_IDLE_SECS: u64 = 60;
+use mini_vpn::udp_relay::{UDP_FLOW_IDLE_SECS, serve_quic_connection};
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
