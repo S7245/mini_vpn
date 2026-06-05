@@ -241,6 +241,46 @@ impl FlowTable {
     }
 }
 
+/// 解析出来的入站 UDP 报文要点（裸包路径用）。
+#[derive(Debug, PartialEq, Eq)]
+pub struct UdpInbound<'a> {
+    pub src_ip: Ipv4Addr,
+    pub src_port: u16,
+    pub dst_ip: Ipv4Addr,
+    pub dst_port: u16,
+    pub payload: &'a [u8],
+}
+
+/// 解析一个裸 IPv4/UDP 包。非 IPv4 / 非 UDP / 解析失败一律 None（绝不 panic）。
+pub fn parse_inbound_udp(pkt: &[u8]) -> Option<UdpInbound<'_>> {
+    let headers = etherparse::PacketHeaders::from_ip_slice(pkt).ok()?;
+    let etherparse::IpHeader::Version4(ipv4, _) = headers.ip? else {
+        return None;
+    };
+    let etherparse::TransportHeader::Udp(udp) = headers.transport? else {
+        return None;
+    };
+    Some(UdpInbound {
+        src_ip: Ipv4Addr::from(ipv4.source),
+        src_port: udp.source_port,
+        dst_ip: Ipv4Addr::from(ipv4.destination),
+        dst_port: udp.destination_port,
+        payload: headers.payload,
+    })
+}
+
+/// 构造一个裸 IPv4/UDP 包（含正确的 IPv4 + UDP 校验和），用于下行注入 TUN。
+pub fn build_udp_ip_packet(src: (Ipv4Addr, u16), dst: (Ipv4Addr, u16), payload: &[u8]) -> Vec<u8> {
+    let builder =
+        etherparse::PacketBuilder::ipv4(src.0.octets(), dst.0.octets(), 64).udp(src.1, dst.1);
+    let mut buf = Vec::with_capacity(20 + 8 + payload.len());
+    // etherparse 在 write 时计算 IPv4 + UDP 校验和；写入 Vec 不会失败。
+    builder
+        .write(&mut buf, payload)
+        .expect("build_udp_ip_packet: write to Vec is infallible");
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +398,40 @@ mod tests {
         let _c = t.intern(tuple(3)); // evicts oldest (a)
         assert!(t.resolve(a).is_none());
         assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn build_then_parse_roundtrips_with_checksums() {
+        let src = (Ipv4Addr::new(198, 18, 0, 5), 443);
+        let dst = (Ipv4Addr::new(10, 0, 0, 1), 51000);
+        let pkt = build_udp_ip_packet(src, dst, b"payload");
+        let got = parse_inbound_udp(&pkt).expect("parses back");
+        assert_eq!(got.src_ip, src.0);
+        assert_eq!(got.src_port, src.1);
+        assert_eq!(got.dst_ip, dst.0);
+        assert_eq!(got.dst_port, dst.1);
+        assert_eq!(got.payload, b"payload");
+    }
+
+    #[test]
+    fn build_empty_payload_roundtrips() {
+        let src = (Ipv4Addr::new(1, 1, 1, 1), 53);
+        let dst = (Ipv4Addr::new(10, 0, 0, 1), 40000);
+        let pkt = build_udp_ip_packet(src, dst, b"");
+        let got = parse_inbound_udp(&pkt).expect("parses back");
+        assert!(got.payload.is_empty());
+        assert_eq!(got.dst_port, 40000);
+    }
+
+    #[test]
+    fn parse_rejects_garbage_and_tcp() {
+        assert!(parse_inbound_udp(&[0u8; 4]).is_none());
+        // 一个 IPv4+TCP 包能解析出 IP/Transport，但不是 UDP → None。
+        let mut tcp = Vec::new();
+        etherparse::PacketBuilder::ipv4([10, 0, 0, 1], [1, 1, 1, 1], 64)
+            .tcp(50000, 443, 0, 1024)
+            .write(&mut tcp, &[])
+            .unwrap();
+        assert!(parse_inbound_udp(&tcp).is_none());
     }
 }
