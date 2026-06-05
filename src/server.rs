@@ -1,7 +1,12 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use mini_vpn::quic::{server_endpoint, server_quic_config};
 use mini_vpn::shared::{RelayRequest, read_relay_request};
+use mini_vpn::udp_relay::serve_quic_connection;
+
+/// 出口 UDP 会话空闲回收阈值（秒）。中文要点：与客户端各自独立，自愈兜底（见 spec）。
+const UDP_FLOW_IDLE_SECS: u64 = 60;
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
@@ -152,6 +157,46 @@ pub async fn run() {
             return;
         }
     };
+
+    // Stage 12：QUIC datagram 数据面（UDP relay），与现有 TCP listener 并存（见 ADR-0003）。
+    // 默认复用同端口号(UDP)；QUIC listener 起不来则整体启动失败（不跑半套）。
+    let quic_bind: std::net::SocketAddr = match std::env::var("MINI_VPN_SERVER_QUIC_BIND_ADDR")
+        .ok()
+        .as_deref()
+        .unwrap_or(runtime_config.bind_addr.as_str())
+        .parse()
+    {
+        Ok(addr) => addr,
+        Err(e) => {
+            println!("QUIC 监听地址非法: {e}");
+            return;
+        }
+    };
+    let quic_cfg = match server_quic_config(&tls_config.cert_path, &tls_config.key_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            println!("加载 QUIC 服务端配置失败（启动中止）: {e}");
+            return;
+        }
+    };
+    let quic_endpoint = match server_endpoint(quic_cfg, quic_bind) {
+        Ok(ep) => ep,
+        Err(e) => {
+            println!("QUIC 监听失败（启动中止）: {e}");
+            return;
+        }
+    };
+    println!("🌐 QUIC datagram 数据面监听 UDP {quic_bind}（UDP relay）");
+    tokio::spawn(async move {
+        while let Some(connecting) = quic_endpoint.accept().await {
+            tokio::spawn(async move {
+                match connecting.await {
+                    Ok(conn) => serve_quic_connection(conn, UDP_FLOW_IDLE_SECS).await,
+                    Err(e) => println!("QUIC 握手失败: {e:?}"),
+                }
+            });
+        }
+    });
 
     loop {
         // 【外层套娃】：接收真实的底层 TCP 连接
