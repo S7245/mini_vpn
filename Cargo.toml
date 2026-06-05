@@ -21,6 +21,10 @@ rustls-pemfile = "1.0" # 用于读取证书文件
 yamux = "0.10"
 # tokio-util = { version = "0.7", features = ["compat"] }
 
+# Stage 12：QUIC datagram 数据面（UDP relay）。0.10 依赖 rustls ^0.21，与现有 TLS 栈共享，
+# 不引入第二个 rustls 版本（见 docs/adr/0003）。
+quinn = "0.10"
+
 # 处理 TUN 网卡
 tun = { version = "0.6", features = ["async"] }
 # 用户态 TCP/IP 协议栈
