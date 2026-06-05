@@ -20,10 +20,11 @@ Split into two stages so the hot-path rewrite stays isolated and reversible:
 
 Target extraction alone does NOT make real sites work. In order of blocking severity:
 
-1. Arbitrary ports (Stage 9) — needed for 443/HTTPS.
-2. DNS over tunnel or fake-IP — blocked domains resolve to poisoned IPs locally,
-   so the extracted Target IP would be wrong. Required for any GFW-blocked domain.
-3. UDP relay for QUIC/HTTP3 and live streaming (Rules.md UDP scenario).
+1. ~~Arbitrary ports (Stage 9)~~ — DONE.
+2. ~~DNS over tunnel or fake-IP (Stage 11)~~ — DONE (fake-IP).
+3. ~~UDP relay for QUIC/HTTP3 and live streaming~~ — first cut DONE (Stage 12):
+   UDP rides a new QUIC datagram data plane (ADR-0003), not the TCP/yamux tunnel.
+   Quality/scale hardening + TCP→QUIC migration are the follow-on QUIC track below.
 4. Exit IP reputation — datacenter IPs trigger target-site risk control; protocol-independent.
 5. MSS clamping / MTU handling — prevents large packets from stalling through the tunnel.
 
@@ -39,6 +40,22 @@ Target extraction alone does NOT make real sites work. In order of blocking seve
 ## Future architecture topics
 
 These cut across multiple stages and may need their own design before being scheduled.
+
+### Unify the data plane on QUIC (north star — ADR-0003)
+
+Stage 12 shipped the first cut: UDP relay over a QUIC datagram data plane, alongside the
+existing TCP/yamux link. The committed end-state is to unify the whole data plane on QUIC.
+Follow-on stages (each its own design):
+
+- **Migrate TCP relay onto QUIC streams**, retire yamux + its cross-flow HOL blocking.
+- **Server UDP session-table hardening**: socket pooling, ephemeral-port exhaustion under
+  high concurrency, fairness/pacing. First cut is naive one-socket-per-flow.
+- **Oversized-datagram stream-fallback**: today a UDP payload that exceeds the QUIC datagram
+  limit is dropped (counted/logged); fall back to a QUIC stream for those.
+- **Quality/scale**: per-flow congestion fairness, multi-upstream/failover, graceful drain,
+  control-plane server discovery + metrics. External stores (Redis/etcd/Postgres) belong here
+  in the control plane — NOT on the per-datagram data-plane hot path.
+- **DNS hardening**: intercept all `:53` (not just 198.18.0.1) / known DoH endpoints.
 
 ### Multi-Hop
 
