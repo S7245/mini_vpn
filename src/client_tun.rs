@@ -1,7 +1,12 @@
 use crate::device::VirtualTunDevice;
+use mini_vpn::quic::{client_endpoint, client_quic_config};
 use mini_vpn::shared::{ClientError, RelayRequest, TargetAddr, open_remote_session};
+use mini_vpn::udp_relay::{
+    FlowTable, FourTuple, build_udp_ip_packet, decode_downlink, encode_uplink, parse_inbound_udp,
+};
 use crate::dns::{self, Answer};
 use crate::fake_ip::FakeIpPool;
+use std::net::{Ipv4Addr, SocketAddr};
 use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer};
 use smoltcp::socket::udp;
@@ -110,6 +115,13 @@ const MAX_INTERCEPTED_PORTS: usize = 64;
 /// 中文要点：base/cap 设为编译期常量，本阶段不开 env；cap 限单连接最长重试间隔。
 const RECONNECT_BASE_MS: u64 = 500;
 const RECONNECT_CAP_MS: u64 = 30_000;
+
+/// UDP flow 空闲回收阈值（秒）。与服务端各自独立，自愈兜底（见 stage-12 spec）。
+const UDP_FLOW_IDLE_SECS: u64 = 60;
+/// fake-IP DNS resolver 地址：去往它的 :53 UDP 走本地 fake-IP 应答，不进 UDP relay。
+const FAKE_DNS_RESOLVER: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
+/// QUIC datagram 上行通道容量；满了丢弃（UDP 语义，不阻塞主循环）。
+const UDP_UPLINK_CHANNEL_CAPACITY: usize = 1024;
 
 /// Full-jitter exponential backoff delay: `random(0, min(CAP, BASE * 2^attempt))`.
 /// 中文要点：下界取 0 是 full jitter，最大程度摊平 5000+ 客户端的重连惊群。
@@ -462,6 +474,44 @@ pub async fn start_tun_proxy() {
         }
     };
 
+    // ===== Stage 12：QUIC datagram 数据面（UDP relay），独立于上面的 TCP/yamux 连接 =====
+    // 中文要点：QUIC 上游默认取同 host:port(UDP)、复用同一 CA/SNI；任一构建失败即启动中止。
+    let quic_server_addr: SocketAddr = match upstream_server_addr.parse() {
+        Ok(addr) => addr,
+        Err(e) => {
+            println!("QUIC 上游地址非法 {upstream_server_addr}: {e}");
+            return;
+        }
+    };
+    let quic_cfg = match client_quic_config(&tls_ca_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            println!("加载 QUIC 客户端配置失败（启动中止）: {e}");
+            return;
+        }
+    };
+    let quic_endpoint = match client_endpoint(quic_cfg) {
+        Ok(ep) => ep,
+        Err(e) => {
+            println!("QUIC 客户端 endpoint 失败（启动中止）: {e}");
+            return;
+        }
+    };
+    let (udp_uplink_tx, udp_uplink_rx) = mpsc::channel::<Vec<u8>>(UDP_UPLINK_CHANNEL_CAPACITY);
+    let (udp_downlink_tx, mut udp_downlink_rx) =
+        mpsc::channel::<Vec<u8>>(UDP_UPLINK_CHANNEL_CAPACITY);
+    tokio::spawn(run_quic_pump(
+        quic_endpoint,
+        quic_server_addr,
+        upstream_tls_sni.clone(),
+        udp_uplink_rx,
+        udp_downlink_tx,
+    ));
+    let mut flow_table = FlowTable::new();
+    let udp_clock = std::time::Instant::now();
+    let mut udp_sweep = tokio::time::interval(std::time::Duration::from_secs(1));
+    println!("🌊 UDP relay 数据面就绪（QUIC datagram → {quic_server_addr}）");
+
     loop {
         let mut ctrl = ctr.clone();
         tokio::select! {
@@ -526,46 +576,81 @@ pub async fn start_tun_proxy() {
             // 分支 1: 物理网卡接收到了新数据包
             res = device.wait_for_rx() =>{
                 if res.is_ok(){
-                    // 1) SYN inspector：在 iface.poll 之前看一眼包，若是去往新端口的干净 SYN，
-                    //    立刻为该端口建监听池，这样 smoltcp 同一帧就能 accept。
-                    // 中文要点：到顶时优雅拒绝并日志告警，绝不 panic。
-                    if let Some(buf) = &device.rx_buffer {
-                        println!("📡 收到来自操作系统的包，大小: {} 字节", buf.len());
-                        println!("🔍 包的前 4 字节: {:?}", &buf[..4.min(buf.len())]);
-                        if let Some(port) = inspect_inbound_syn(buf)
-                            && let Err(e) =
-                                registry.ensure_port(port, &mut sockets, &mut socket_ctxs)
-                        {
-                            println!(
-                                "⚠️ intercepted port cap reached, drop SYN to port {port}: {:?}",
-                                e
+                    // rx 分流（stage-12 D1）：去往 fake DNS 的 :53 → smoltcp；其它 UDP → 裸 relay；
+                    // 非 UDP → 既有 smoltcp 路径。UDP relay 包 take 走、不进 iface.poll。
+                    let class = device.rx_buffer.as_deref().map(classify_inbound);
+                    if class == Some(Inbound::UdpRelay) {
+                        if let Some(pkt) = device.rx_buffer.take() {
+                            handle_udp_uplink(
+                                &pkt,
+                                &mut flow_table,
+                                &fake_pool,
+                                &udp_uplink_tx,
+                                udp_clock.elapsed().as_secs(),
                             );
                         }
-                    }
+                    } else {
+                        // 1) SYN inspector：在 iface.poll 之前看一眼包，若是去往新端口的干净 SYN，
+                        //    立刻为该端口建监听池，这样 smoltcp 同一帧就能 accept。
+                        if let Some(buf) = &device.rx_buffer {
+                            println!("📡 收到来自操作系统的包，大小: {} 字节", buf.len());
+                            if let Some(port) = inspect_inbound_syn(buf)
+                                && let Err(e) =
+                                    registry.ensure_port(port, &mut sockets, &mut socket_ctxs)
+                            {
+                                println!(
+                                    "⚠️ intercepted port cap reached, drop SYN to port {port}: {:?}",
+                                    e
+                                );
+                            }
+                        }
 
-                    let timestamp = smoltcp::time::Instant::now();
-                    iface.poll(timestamp, &mut device, &mut sockets);
-                    // 处理 DNS 查询并伪造响应；再 poll 一次把响应变成 IP 包入发货队列。
-                    drain_dns(&mut sockets, dns_handle, &mut fake_pool);
-                    iface.poll(timestamp, &mut device, &mut sockets);
-                    device.flush_tx().await.unwrap();
+                        let timestamp = smoltcp::time::Instant::now();
+                        iface.poll(timestamp, &mut device, &mut sockets);
+                        // 处理 DNS 查询并伪造响应；再 poll 一次把响应变成 IP 包入发货队列。
+                        drain_dns(&mut sockets, dns_handle, &mut fake_pool);
+                        iface.poll(timestamp, &mut device, &mut sockets);
+                        device.flush_tx().await.unwrap();
 
-                    let handles: Vec<SocketHandle> = registry.all_handles().collect();
-                    for handle in handles {
-                        if let Err(e) = process_listener_activity(
-                            handle,
-                            &mut sockets,
-                            &mut socket_ctxs,
-                            &mut ctrl,
-                            &global_tx,
-                            &fake_pool,
-                        )
-                        .await
-                        {
-                            println!("处理本地房间 {:?} 失败: {e}", handle);
+                        let handles: Vec<SocketHandle> = registry.all_handles().collect();
+                        for handle in handles {
+                            if let Err(e) = process_listener_activity(
+                                handle,
+                                &mut sockets,
+                                &mut socket_ctxs,
+                                &mut ctrl,
+                                &global_tx,
+                                &fake_pool,
+                            )
+                            .await
+                            {
+                                println!("处理本地房间 {:?} 失败: {e}", handle);
+                            }
                         }
                     }
                 }
+            }
+            // Stage 12: QUIC 下行 datagram → 按 flow-id 造回程 IP/UDP 包注入 TUN。
+            Some(dg) = udp_downlink_rx.recv() => {
+                if let Some((flow_id, payload)) = decode_downlink(&dg) {
+                    // 先取出路由信息（Copy），释放 flow_table 借用后再 touch。
+                    let routed = flow_table
+                        .resolve(flow_id)
+                        .map(|e| (e.target_src(), e.app_endpoint()));
+                    if let Some((src, dst)) = routed {
+                        let pkt = build_udp_ip_packet(src, dst, payload);
+                        device.inject_ip_packet(&pkt);
+                        flow_table.touch(flow_id, udp_clock.elapsed().as_secs());
+                        if let Err(e) = device.flush_tx().await {
+                            println!("UDP 下行 flush 失败: {e}");
+                        }
+                    }
+                    // flow 已回收/未知 → 丢弃该回程（应用会重发/重查，自愈）。
+                }
+            }
+            // Stage 12: 周期回收空闲 UDP flow。
+            _ = udp_sweep.tick() => {
+                flow_table.sweep(udp_clock.elapsed().as_secs(), UDP_FLOW_IDLE_SECS);
             }
             // 分支 2: 时钟滴答，处理超时重传等后台任务
             _ = timer.tick() =>{
@@ -941,6 +1026,134 @@ fn spawn_remote_relay(
     });
 }
 
+/// rx 热路径分流结果。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Inbound {
+    /// 去往 fake-IP DNS resolver 的 UDP/53 —— 交给 smoltcp（本地 fake-IP 应答）。
+    Dns,
+    /// 其它 UDP —— 走裸包 UDP relay（绕过 smoltcp）。
+    UdpRelay,
+    /// 非 UDP（TCP/ICMP…）—— 走既有 smoltcp 路径。
+    Other,
+}
+
+/// 给一个入站裸 IP 包分类（见 stage-12 spec 的 D1 规则）。
+fn classify_inbound(pkt: &[u8]) -> Inbound {
+    match parse_inbound_udp(pkt) {
+        Some(udp) => {
+            if udp.dst_ip == FAKE_DNS_RESOLVER && udp.dst_port == 53 {
+                Inbound::Dns
+            } else {
+                Inbound::UdpRelay
+            }
+        }
+        None => Inbound::Other,
+    }
+}
+
+/// 处理一个被拦截的 UDP 上行包：解析 → fake-IP 改写 target → 铸 flow-id → 编码 → 投递给 QUIC 泵。
+/// 中文要点：fake 无映射 → 丢弃（UDP 无 socket 可复位，短 TTL 自愈）；通道满 → 丢弃（UDP 语义）。
+fn handle_udp_uplink(
+    pkt: &[u8],
+    flow_table: &mut FlowTable,
+    fake_pool: &FakeIpPool,
+    uplink_tx: &mpsc::Sender<Vec<u8>>,
+    now_secs: u64,
+) {
+    let Some(udp) = parse_inbound_udp(pkt) else {
+        return;
+    };
+    let dst_ep = smoltcp::wire::IpEndpoint::new(
+        IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_bytes(&udp.dst_ip.octets())),
+        udp.dst_port,
+    );
+    let target = match resolve_target(dst_ep, fake_pool) {
+        TargetResolve::Direct(t) => t,
+        TargetResolve::Refuse => {
+            println!("🚫 UDP fake-IP {} 无映射，丢弃（待应用重新解析）", udp.dst_ip);
+            return;
+        }
+    };
+    let tuple = FourTuple {
+        src_ip: udp.src_ip,
+        src_port: udp.src_port,
+        dst_ip: udp.dst_ip,
+        dst_port: udp.dst_port,
+    };
+    let flow_id = flow_table.intern(tuple);
+    flow_table.touch(flow_id, now_secs);
+    let dg = encode_uplink(flow_id, &target, udp.payload);
+    // 满了就丢（UDP 语义，绝不阻塞主循环）。
+    let _ = uplink_tx.try_send(dg);
+}
+
+/// QUIC 泵 task（哑管道）：连 Upstream，上行 `send_datagram`、下行转发给主循环；
+/// 断线用 full-jitter 退避自重连。中文要点：UDP 流无需复位，重连后下个 datagram 自愈。
+async fn run_quic_pump(
+    endpoint: quinn::Endpoint,
+    server_addr: SocketAddr,
+    server_name: String,
+    mut uplink_rx: mpsc::Receiver<Vec<u8>>,
+    downlink_tx: mpsc::Sender<Vec<u8>>,
+) {
+    let mut attempt = 0u32;
+    loop {
+        let conn = match endpoint.connect(server_addr, &server_name) {
+            Ok(connecting) => match connecting.await {
+                Ok(c) => {
+                    attempt = 0;
+                    println!("✅ QUIC 数据面已连接 {server_addr}");
+                    c
+                }
+                Err(e) => {
+                    println!("QUIC 连接握手失败: {e:?}");
+                    sleep_backoff(&mut attempt).await;
+                    continue;
+                }
+            },
+            Err(e) => {
+                println!("QUIC connect 失败: {e:?}");
+                sleep_backoff(&mut attempt).await;
+                continue;
+            }
+        };
+
+        loop {
+            tokio::select! {
+                msg = uplink_rx.recv() => {
+                    let Some(dg) = msg else { return; }; // 主循环已退出
+                    match conn.send_datagram(dg.into()) {
+                        Ok(()) => {}
+                        Err(quinn::SendDatagramError::TooLarge) => {
+                            println!("⚠️ UDP datagram 超过 QUIC 上限，丢弃");
+                        }
+                        Err(_) => break, // 连接断 → 重连
+                    }
+                }
+                dg = conn.read_datagram() => {
+                    match dg {
+                        Ok(bytes) => {
+                            if downlink_tx.send(bytes.to_vec()).await.is_err() {
+                                return; // 主循环已退出
+                            }
+                        }
+                        Err(_) => break, // 连接断 → 重连
+                    }
+                }
+            }
+        }
+        println!("🔌 QUIC 数据面断开，准备重连");
+        sleep_backoff(&mut attempt).await;
+    }
+}
+
+/// full-jitter 退避一拍并递增 attempt（复用 TCP 重连的 `backoff_delay`）。
+async fn sleep_backoff(attempt: &mut u32) {
+    let delay = backoff_delay(*attempt, rand::random::<f64>());
+    tokio::time::sleep(delay).await;
+    *attempt = attempt.saturating_add(1);
+}
+
 pub async fn create_tun_device() -> tun::Result<tun::AsyncDevice> {
     let mut config = tun::Configuration::default();
 
@@ -1151,5 +1364,29 @@ mod tests {
         let config = TunTlsConfig::from_sources(Some("certs/dev/ca-cert.pem"))
             .expect("config should load");
         assert_eq!(config.ca_path, "certs/dev/ca-cert.pem");
+    }
+
+    fn udp_pkt(dst: [u8; 4], dst_port: u16) -> Vec<u8> {
+        let mut v = Vec::new();
+        etherparse::PacketBuilder::ipv4([10, 0, 0, 1], dst, 64)
+            .udp(50000, dst_port)
+            .write(&mut v, &[])
+            .unwrap();
+        v
+    }
+
+    #[test]
+    fn classify_routes_dns_relay_and_other() {
+        assert_eq!(classify_inbound(&udp_pkt([198, 18, 0, 1], 53)), Inbound::Dns);
+        assert_eq!(
+            classify_inbound(&udp_pkt([198, 18, 0, 5], 443)),
+            Inbound::UdpRelay
+        );
+        // UDP/53 到非 fake-resolver 仍走 relay（D1：只本地应答 198.18.0.1:53）。
+        assert_eq!(classify_inbound(&udp_pkt([8, 8, 8, 8], 53)), Inbound::UdpRelay);
+        // TCP SYN / 垃圾 → Other。
+        let pkt = build_ipv4_tcp([10, 0, 0, 1], [1, 1, 1, 1], 60000, 443, true, false);
+        assert_eq!(classify_inbound(&pkt), Inbound::Other);
+        assert_eq!(classify_inbound(&[0u8; 4]), Inbound::Other);
     }
 }
