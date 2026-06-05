@@ -24,10 +24,19 @@ _Avoid_: virtual IP, proxy IP (fake-IP is the precise term, matching Clash's fak
 The client-held bidirectional table `domain ↔ fake-IP`. Populated when forging a DNS response; read ("resolve") when an intercepted TCP SYN's destination falls in the fake-IP range, to recover the domain for the relay request.
 _Avoid_: dns cache (it is not a cache of real DNS answers)
 
+**UDP flow**:
+One intercepted UDP conversation, identified by the app's 4-tuple `(srcIP:srcPort, dstIP:dstPort)`. Unlike a TCP **session** it has no handshake or teardown — it is born on the first datagram and reclaimed by idle timeout. Each **UDP flow** carries exactly one **Target** (the `dstIP:dstPort`, possibly a fake-IP resolved to a domain).
+_Avoid_: udp session, udp connection (UDP is connectionless; "flow" signals there is no connection state)
+
+**flow-id**:
+A `u32` minted by the client, one per **UDP flow**, carried in both directions on the QUIC datagram so each side can demux a datagram back to its flow. It exists because the server's reply addresses the real Target IP, which the client cannot reverse-map to a fake-IP — the flow-id is the only reliable demux key.
+_Avoid_: session id, stream id (it identifies a UDP flow, not a QUIC stream or TCP session)
+
 ## Relationships
 
 - The client opens one **Upstream** connection and multiplexes many intercepted sessions over it (Yamux substreams).
 - Each intercepted session carries exactly one **Target**; the **Upstream** dials that **Target**.
+- UDP relay rides a second transport to the same **Upstream** — a QUIC datagram data plane — where many **UDP flows** are multiplexed by **flow-id** (no per-flow stream).
 
 ## Flagged ambiguities
 
