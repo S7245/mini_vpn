@@ -79,6 +79,27 @@ impl VirtualTunDevice {
         }
         Ok(())
     }
+
+    /// 下行注入：把构造好的裸 IPv4/UDP 包塞进发货队列，等 `flush_tx` 发出。
+    /// 中文要点：UDP relay 绕过 smoltcp，回程包由主循环用 etherparse 造好后经此注入。
+    pub fn inject_ip_packet(&mut self, pkt: &[u8]) {
+        push_injected(&mut self.tx_queue, pkt);
+    }
+}
+
+/// 把一个裸 IPv4 包加帧后塞进发货队列。macOS utun 需要 4 字节 PI 头，Linux 不需要。
+/// 中文要点：抽成纯函数便于单测帧格式（与 `TxToken::consume` 的加头逻辑一致）。
+pub fn push_injected(queue: &mut VecDeque<BytesMut>, pkt: &[u8]) {
+    #[cfg(target_os = "macos")]
+    let mut framed = {
+        let mut b = BytesMut::with_capacity(UTUN_IPV4_HEADER.len() + pkt.len());
+        b.extend_from_slice(&UTUN_IPV4_HEADER);
+        b
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut framed = BytesMut::with_capacity(pkt.len());
+    framed.extend_from_slice(pkt);
+    queue.push_back(framed);
 }
 
 // ==========================================
@@ -209,3 +230,22 @@ impl Device for VirtualTunDevice {
 发货单-TxToken:84
 接收包：None
 */
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inject_enqueues_with_platform_header() {
+        let mut q: VecDeque<BytesMut> = VecDeque::new();
+        let pkt = vec![69u8, 0, 0, 28]; // IPv4 header start (version=4, ihl=5)
+        push_injected(&mut q, &pkt);
+        let framed = q.pop_front().expect("packet enqueued");
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(&framed[..4], &[0, 0, 0, 2], "macOS PI header prepended");
+            assert_eq!(&framed[4..], &pkt[..]);
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(&framed[..], &pkt[..]);
+    }
+}
