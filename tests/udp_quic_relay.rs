@@ -76,3 +76,38 @@ async fn udp_relay_roundtrip_and_flow_demux() {
     assert_eq!(seen.get(&7).map(|v| v.as_slice()), Some(&b"ping"[..]));
     assert_eq!(seen.get(&9).map(|v| v.as_slice()), Some(&b"pong"[..]));
 }
+
+/// Diagnostic: the QUIC data plane must survive an idle period longer than quinn's
+/// default 10s idle timeout (keep-alive must keep it up). Slow (12s); run explicitly.
+#[tokio::test]
+async fn quic_connection_survives_idle_beyond_default_timeout() {
+    let echo_addr = start_udp_echo().await;
+    let server_addr = start_quic_server().await;
+
+    let ccfg = client_quic_config("certs/dev/ca-cert.pem").unwrap();
+    let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    client.set_default_client_config(ccfg);
+    let conn = client
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .expect("quic connect");
+
+    // Stay completely idle past the default 10s idle timeout.
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    assert!(
+        conn.close_reason().is_none(),
+        "connection died during idle: {:?}",
+        conn.close_reason()
+    );
+
+    // And it must still relay after the idle period.
+    let target = TargetAddr::IpPort(echo_addr);
+    conn.send_datagram(encode_uplink(5, &target, b"alive").into())
+        .expect("send after idle");
+    let dg = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
+        .await
+        .expect("reply within 5s after idle")
+        .expect("datagram ok");
+    assert_eq!(decode_downlink(&dg).unwrap(), (5, &b"alive"[..]));
+}

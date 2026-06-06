@@ -17,9 +17,10 @@ pub const QUIC_ALPN: &[u8] = b"mvpn";
 
 /// 数据面空闲超时：30s（quinn 默认仅 10s，太短）。两端取 min 生效。
 const QUIC_MAX_IDLE_SECS: u64 = 30;
-/// keep-alive 间隔：10s（< idle/2），让空闲的数据面连接不被 idle 关掉。
-/// 中文要点：UDP 长连/直播空闲时不能让 QUIC 连接闪断（quinn 默认无 keep-alive → 反复重连）。
-const QUIC_KEEPALIVE_SECS: u64 = 10;
+/// keep-alive 间隔：5s。中文要点：必须明显小于「对端可能的空闲超时」才能续命。
+/// 取 5s 是为了即便对端跑的是**旧二进制**（quinn 默认 idle=10s、无 keep-alive，协商后 idle=min=10s），
+/// 客户端每 5s 的 PING 也能在 10s 触发前重置对端 idle 计时器 → 连接不闪断（抗版本错配，系统稳定优先）。
+const QUIC_KEEPALIVE_SECS: u64 = 5;
 
 /// 共享的 QUIC 传输参数：开 keep-alive + 拉长 idle 超时（datagram 等其余保持默认）。
 fn quic_transport_config() -> Arc<TransportConfig> {
