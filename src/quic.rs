@@ -7,12 +7,29 @@ use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use quinn::{ClientConfig, Endpoint, ServerConfig};
+use quinn::{ClientConfig, Endpoint, IdleTimeout, ServerConfig, TransportConfig};
 use rustls::{Certificate, PrivateKey, RootCertStore};
 
 /// QUIC ALPN：握手必须协商；client/server 一致。
 pub const QUIC_ALPN: &[u8] = b"mvpn";
+
+/// 数据面空闲超时：30s（quinn 默认仅 10s，太短）。两端取 min 生效。
+const QUIC_MAX_IDLE_SECS: u64 = 30;
+/// keep-alive 间隔：10s（< idle/2），让空闲的数据面连接不被 idle 关掉。
+/// 中文要点：UDP 长连/直播空闲时不能让 QUIC 连接闪断（quinn 默认无 keep-alive → 反复重连）。
+const QUIC_KEEPALIVE_SECS: u64 = 10;
+
+/// 共享的 QUIC 传输参数：开 keep-alive + 拉长 idle 超时（datagram 等其余保持默认）。
+fn quic_transport_config() -> Arc<TransportConfig> {
+    let mut t = TransportConfig::default();
+    let idle = IdleTimeout::try_from(Duration::from_secs(QUIC_MAX_IDLE_SECS))
+        .expect("idle timeout fits VarInt");
+    t.max_idle_timeout(Some(idle));
+    t.keep_alive_interval(Some(Duration::from_secs(QUIC_KEEPALIVE_SECS)));
+    Arc::new(t)
+}
 
 /// 构建 QUIC 服务端 config（PEM 证书链 + PKCS8 私钥 + ALPN）。
 /// 中文要点：复用 server.rs 的证书加载方式，只是包成 quinn 的 crypto。
@@ -25,7 +42,9 @@ pub fn server_quic_config(cert_path: &str, key_path: &str) -> Result<ServerConfi
         .with_single_cert(certs, key)
         .map_err(|e| format!("quic tls server config: {e}"))?;
     crypto.alpn_protocols = vec![QUIC_ALPN.to_vec()];
-    Ok(ServerConfig::with_crypto(Arc::new(crypto)))
+    let mut cfg = ServerConfig::with_crypto(Arc::new(crypto));
+    cfg.transport_config(quic_transport_config());
+    Ok(cfg)
 }
 
 /// 构建 QUIC 客户端 config（信任给定 CA + ALPN）。
@@ -41,7 +60,9 @@ pub fn client_quic_config(ca_path: &str) -> Result<ClientConfig, String> {
         .with_root_certificates(roots)
         .with_no_client_auth();
     crypto.alpn_protocols = vec![QUIC_ALPN.to_vec()];
-    Ok(ClientConfig::new(Arc::new(crypto)))
+    let mut cfg = ClientConfig::new(Arc::new(crypto));
+    cfg.transport_config(quic_transport_config());
+    Ok(cfg)
 }
 
 /// 绑定一个 QUIC 服务端 endpoint（监听 UDP `addr`）。
