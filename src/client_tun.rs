@@ -1081,14 +1081,18 @@ fn handle_udp_uplink(
         dst_ip: udp.dst_ip,
         dst_port: udp.dst_port,
     };
+    // 仅在「新 flow」时打日志（每流一次，不是每包）——既有可观测性，又不在大并发热路径刷屏。
+    let is_new = !flow_table.contains(&tuple);
     let flow_id = flow_table.intern(tuple);
     flow_table.touch(flow_id, now_secs);
     let payload_len = udp.payload.len();
+    if is_new {
+        println!(
+            "🌊 UDP↑ new flow={flow_id} → {} (first {payload_len}B)",
+            target.to_wire_string()
+        );
+    }
     let dg = encode_uplink(flow_id, &target, udp.payload);
-    println!(
-        "🌊 UDP↑ flow={flow_id} → {} ({payload_len}B)",
-        target.to_wire_string()
-    );
     // 满了就丢（UDP 语义，绝不阻塞主循环）。
     if uplink_tx.try_send(dg).is_err() {
         println!("⚠️ UDP↑ flow={flow_id} 上行通道满，丢弃");
