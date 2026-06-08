@@ -77,6 +77,52 @@ async fn udp_relay_roundtrip_and_flow_demux() {
     assert_eq!(seen.get(&9).map(|v| v.as_slice()), Some(&b"pong"[..]));
 }
 
+/// Many concurrent flows over ONE QUIC connection must (almost) all round-trip — isolates
+/// the relay/server from the client TUN main loop. If this passes but the field collapses
+/// under concurrency, the bottleneck is the TUN main loop (e.g. per-packet stdout logging).
+#[tokio::test]
+async fn udp_relay_handles_many_concurrent_flows() {
+    let echo_addr = start_udp_echo().await;
+    let server_addr = start_quic_server().await;
+
+    let ccfg = client_quic_config("certs/dev/ca-cert.pem").unwrap();
+    let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    client.set_default_client_config(ccfg);
+    let conn = client
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .expect("quic connect");
+
+    let target = TargetAddr::IpPort(echo_addr);
+    const N: u32 = 100;
+    // Fire N distinct flows back-to-back.
+    for fid in 0..N {
+        let dg = encode_uplink(fid, &target, format!("flow-{fid}").as_bytes());
+        // datagram send buffer can briefly fill under burst; that's a drop, tolerate.
+        let _ = conn.send_datagram(dg.into());
+    }
+    // Collect replies for up to 5s.
+    let mut seen = std::collections::HashSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while seen.len() < N as usize {
+        match tokio::time::timeout_at(deadline, conn.read_datagram()).await {
+            Ok(Ok(dg)) => {
+                if let Some((fid, _)) = decode_downlink(&dg) {
+                    seen.insert(fid);
+                }
+            }
+            _ => break,
+        }
+    }
+    // Loopback should deliver the vast majority; a handful of datagram drops is acceptable.
+    assert!(
+        seen.len() >= 90,
+        "relay should handle ~all concurrent flows; only {} / {N} returned",
+        seen.len()
+    );
+}
+
 /// A full-size (1200-byte) UDP payload must round-trip intact — proves the relay does
 /// not truncate large datagrams (the 1024 seen via `nc` is BSD nc chunking stdin, not us).
 #[tokio::test]

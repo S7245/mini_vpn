@@ -122,10 +122,9 @@ impl RxToken for TunRxToken {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        // 我们的任务：执行闭包 f，并把 self.buffer 的可变引用/切片传给它
-        // 最后返回 f 的执行结果
-        // 将包裹拆开（转为可变切片）喂给 smoltcp 处理
-        println!("收货单-RxToken:{:?}", &self.buffer[0..]);
+        // 将包裹拆开（转为可变切片）喂给 smoltcp 处理。
+        // 注意：绝不在此 println! 整包字节——这是每个收包的热路径，同步 stdout 会拖垮
+        // 单线程主循环（实测大并发下 TUN 缓冲溢出、UDP 大量丢包）。
         f(&mut self.buffer)
     }
 }
@@ -155,7 +154,6 @@ impl<'a> TxToken for TunTxToken<'a> {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            println!("发货单-TxToken:{:?}", len);
             // 1. 按 smoltcp 要求的长度，造一个填满 0 的新箱子
             // 1. 造一个指定大小的空箱子
             let mut buffer = BytesMut::zeroed(len);
@@ -213,7 +211,7 @@ impl Device for VirtualTunDevice {
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
         // 只需要返回一个持有 tx_queue 可变引用的 TxToken 即可
         // 直接给一张发货单，里面带着发货仓库的钥匙
-        println!("发货单：{:?}", self.tx_queue);
+        // （不在此 println! tx_queue——每次发包热路径，同步 stdout 会拖垮主循环）
         Some(TunTxToken {
             queue: &mut self.tx_queue,
         })
