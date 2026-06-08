@@ -77,6 +77,51 @@ async fn udp_relay_roundtrip_and_flow_demux() {
     assert_eq!(seen.get(&9).map(|v| v.as_slice()), Some(&b"pong"[..]));
 }
 
+/// A full-size (1200-byte) UDP payload must round-trip intact — proves the relay does
+/// not truncate large datagrams (the 1024 seen via `nc` is BSD nc chunking stdin, not us).
+#[tokio::test]
+async fn udp_relay_carries_full_1200_byte_payload() {
+    let echo_addr = start_udp_echo().await;
+    let server_addr = start_quic_server().await;
+
+    let ccfg = client_quic_config("certs/dev/ca-cert.pem").unwrap();
+    let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    client.set_default_client_config(ccfg);
+    let conn = client
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .expect("quic connect");
+
+    // quinn starts at the safe initial MTU (1200 → max_datagram_size ~1162), too small for a
+    // 1200-byte inner payload; PLPMTUD raises it once the path is probed. Warm up first.
+    // 中文要点：真·QUIC 的 1200B initial 同理——数据面 warm 起来后(PLPMTUD)才装得下，
+    // 我们的持久数据面在用户发请求时早已 warm。这条测试钉住「warm 后大包不截断」。
+    let target = TargetAddr::IpPort(echo_addr);
+    for _ in 0..5 {
+        let _ = conn.send_datagram(encode_uplink(99, &target, b"warmup").into());
+        let _ = tokio::time::timeout(Duration::from_millis(300), conn.read_datagram()).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert!(
+        conn.max_datagram_size().unwrap_or(0) >= 1224,
+        "PLPMTUD should raise datagram size enough for a 1200B inner payload, got {:?}",
+        conn.max_datagram_size()
+    );
+
+    let payload = vec![0xABu8; 1200];
+    conn.send_datagram(encode_uplink(11, &target, &payload).into())
+        .expect("send 1200B");
+    let dg = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
+        .await
+        .expect("reply within 5s")
+        .expect("datagram ok");
+    let (fid, got) = decode_downlink(&dg).expect("decodes");
+    assert_eq!(fid, 11);
+    assert_eq!(got.len(), 1200, "full payload must round-trip, not truncate");
+    assert_eq!(got, &payload[..]);
+}
+
 /// Diagnostic: the QUIC data plane must survive an idle period longer than quinn's
 /// default 10s idle timeout (keep-alive must keep it up). Slow (12s); run explicitly.
 #[tokio::test]
