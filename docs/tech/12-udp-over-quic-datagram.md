@@ -104,9 +104,20 @@ networksetup -setdnsservers Wi-Fi empty                # 恢复 DNS（重要）
 sudo route -n delete -net 198.18.0.0/15
 ```
 
+## MTU / datagram 尺寸（实测行为）
+
+外层 QUIC datagram 可用大小 = `conn.max_datagram_size()`，随路径 MTU 变化。quinn 从安全的 initial MTU 1200
+起步（此时 ~1162），**PLPMTUD 探测后升到 ~1414**（1500 MTU 路径；loopback 实测 1162→1414）。
+
+- 含义：内层 1200B UDP 包（典型 QUIC initial）+ 我们 ~20B 头 ≈ 1224 —— **冷连接(1162)装不下、warm 后(1414)装得下**。
+- 数据面是**持久连接**（启动即连 + keep-alive=5s 常驻），用户发请求时早已 warm → 真·QUIC 的 1200 initial 能过。
+- 冷窗口（刚 (重)连那一瞬）发超大包会被丢（记日志）；QUIC 会重传 initial、warm 后自愈。
+- 回归测试 `udp_relay_carries_full_1200_byte_payload` 钉住「warm 后 1200B 不截断」。
+
 ## 已知限制（→ TODO future）
 
-- 超限 datagram 丢弃（无 stream-fallback）；大 UDP 包/超大 DNS 响应会丢，QUIC-inside 靠内层 PMTUD 自愈。
+- 超限 datagram 丢弃（无 stream-fallback）；超过 warm 后 `max_datagram_size`(~1400) 的大 UDP 包/超大 DNS 响应会丢，
+  QUIC-inside 靠内层 PMTUD 缩包自愈。
 - 服务端会话表朴素「每流一 socket」，无端口耗尽/池化抗压。
 - 只本地应答 198.18.0.1:53；DoH/DoT、硬编码 DNS 不拦。
 - TCP relay 仍在 yamux（未迁 QUIC）；多 upstream/failover、外部存储是平台 stage。
