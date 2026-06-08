@@ -184,6 +184,11 @@ impl FlowTable {
         }
     }
 
+    /// 该四元组是否已在册（用于「仅在新 flow 时打日志」，避免每包刷屏）。
+    pub fn contains(&self, tuple: &FourTuple) -> bool {
+        self.tuple_to_id.contains_key(tuple)
+    }
+
     /// 查/铸 flow-id：四元组已在册稳定返回；否则铸新 id（到顶先 LRU 驱逐）。
     pub fn intern(&mut self, tuple: FourTuple) -> u32 {
         if let Some(&id) = self.tuple_to_id.get(&tuple) {
