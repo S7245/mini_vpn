@@ -592,7 +592,6 @@ pub async fn start_tun_proxy() {
                         // 1) SYN inspector：在 iface.poll 之前看一眼包，若是去往新端口的干净 SYN，
                         //    立刻为该端口建监听池，这样 smoltcp 同一帧就能 accept。
                         if let Some(buf) = &device.rx_buffer {
-                            println!("📡 收到来自操作系统的包，大小: {} 字节", buf.len());
                             if let Some(port) = inspect_inbound_syn(buf)
                                 && let Err(e) =
                                     registry.ensure_port(port, &mut sockets, &mut socket_ctxs)
@@ -637,7 +636,6 @@ pub async fn start_tun_proxy() {
                         .resolve(flow_id)
                         .map(|e| (e.target_src(), e.app_endpoint()));
                     if let Some((src, dst)) = routed {
-                        println!("📥 UDP↓ flow={flow_id} ({}B)", payload.len());
                         let pkt = build_udp_ip_packet(src, dst, payload);
                         device.inject_ip_packet(&pkt);
                         flow_table.touch(flow_id, udp_clock.elapsed().as_secs());
@@ -754,7 +752,8 @@ fn resolve_target(endpoint: smoltcp::wire::IpEndpoint, fake_pool: &FakeIpPool) -
     if fake_pool.is_fake(v4) {
         match fake_pool.resolve(v4) {
             Some(domain) => {
-                println!("🔁 fake-IP {} resolve → {}", v4, domain);
+                // 不在此 println!——resolve_target 在每个 UDP 包/每条 TCP 首包都会走到，
+                // 热路径同步 stdout 会拖垮大并发。flow 创建的可观测性放在服务端日志。
                 TargetResolve::Direct(TargetAddr::DomainPort {
                     host: domain,
                     port: endpoint.port,
