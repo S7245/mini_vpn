@@ -139,25 +139,19 @@ async fn udp_relay_carries_full_1200_byte_payload() {
         .await
         .expect("quic connect");
 
-    // quinn starts at the safe initial MTU (1200 → max_datagram_size ~1162), too small for a
-    // 1200-byte inner payload; PLPMTUD raises it once the path is probed. Warm up first.
-    // 中文要点：真·QUIC 的 1200B initial 同理——数据面 warm 起来后(PLPMTUD)才装得下，
-    // 我们的持久数据面在用户发请求时早已 warm。这条测试钉住「warm 后大包不截断」。
+    // No warm-up: with initial_mtu=1280, max_datagram_size is large enough for a 1200-byte
+    // inner payload from the very first datagram (cold window eliminated).
+    // 中文要点：真·QUIC 的 1200B initial 同理——刚连上(冷)就能过，不依赖 PLPMTUD warm。
     let target = TargetAddr::IpPort(echo_addr);
-    for _ in 0..5 {
-        let _ = conn.send_datagram(encode_uplink(99, &target, b"warmup").into());
-        let _ = tokio::time::timeout(Duration::from_millis(300), conn.read_datagram()).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
     assert!(
         conn.max_datagram_size().unwrap_or(0) >= 1224,
-        "PLPMTUD should raise datagram size enough for a 1200B inner payload, got {:?}",
+        "cold connection must already fit a 1200B inner payload, got {:?}",
         conn.max_datagram_size()
     );
 
     let payload = vec![0xABu8; 1200];
     conn.send_datagram(encode_uplink(11, &target, &payload).into())
-        .expect("send 1200B");
+        .expect("send 1200B cold");
     let dg = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
         .await
         .expect("reply within 5s")

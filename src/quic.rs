@@ -22,13 +22,21 @@ const QUIC_MAX_IDLE_SECS: u64 = 30;
 /// 客户端每 5s 的 PING 也能在 10s 触发前重置对端 idle 计时器 → 连接不闪断（抗版本错配，系统稳定优先）。
 const QUIC_KEEPALIVE_SECS: u64 = 5;
 
-/// 共享的 QUIC 传输参数：开 keep-alive + 拉长 idle 超时（datagram 等其余保持默认）。
+/// 数据面起步 MTU：1280（IPv6 最小 MTU，任何真实路径都支持）。中文要点：quinn 默认 1200，
+/// 此时 max_datagram_size ~1162，装不下「1200B 内层包(典型 QUIC initial) + ~20B 头 ≈ 1224」——
+/// 冷连接(刚连上、PLPMTUD 没探完)发大包会被丢。起步设 1280 → max_datagram ~1242 → 立刻装得下，
+/// 消除冷窗口；PLPMTUD 仍会继续往上探（~1414）拿更多余量。1280 普适安全，不会黑洞。
+const QUIC_INITIAL_MTU: u16 = 1280;
+
+/// 共享的 QUIC 传输参数：keep-alive + 拉长 idle + 起步 MTU（datagram 等其余保持默认）。
 fn quic_transport_config() -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
     let idle = IdleTimeout::try_from(Duration::from_secs(QUIC_MAX_IDLE_SECS))
         .expect("idle timeout fits VarInt");
     t.max_idle_timeout(Some(idle));
     t.keep_alive_interval(Some(Duration::from_secs(QUIC_KEEPALIVE_SECS)));
+    t.initial_mtu(QUIC_INITIAL_MTU);
+    t.min_mtu(QUIC_INITIAL_MTU);
     Arc::new(t)
 }
 
