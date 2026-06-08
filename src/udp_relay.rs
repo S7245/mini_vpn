@@ -378,8 +378,16 @@ pub async fn serve_quic_connection(conn: Connection, idle_secs: u64) {
                     }
                     None => {
                         let Some(dst) = resolve_target_addr(&target).await else {
+                            println!(
+                                "❌ UDP relay 无法解析 target {} (flow {flow_id})",
+                                target.to_wire_string()
+                            );
                             continue;
                         };
+                        println!(
+                            "📨 UDP relay flow={flow_id} {} → {dst}",
+                            target.to_wire_string()
+                        );
                         let bind: SocketAddr = if dst.is_ipv4() {
                             (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
                         } else {

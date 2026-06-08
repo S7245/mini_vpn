@@ -637,14 +637,17 @@ pub async fn start_tun_proxy() {
                         .resolve(flow_id)
                         .map(|e| (e.target_src(), e.app_endpoint()));
                     if let Some((src, dst)) = routed {
+                        println!("📥 UDP↓ flow={flow_id} ({}B)", payload.len());
                         let pkt = build_udp_ip_packet(src, dst, payload);
                         device.inject_ip_packet(&pkt);
                         flow_table.touch(flow_id, udp_clock.elapsed().as_secs());
                         if let Err(e) = device.flush_tx().await {
                             println!("UDP 下行 flush 失败: {e}");
                         }
+                    } else {
+                        // flow 已回收/未知 → 丢弃该回程（应用会重发/重查，自愈）。
+                        println!("🗑️ UDP↓ flow={flow_id} 无映射，丢弃 {}B", payload.len());
                     }
-                    // flow 已回收/未知 → 丢弃该回程（应用会重发/重查，自愈）。
                 }
             }
             // Stage 12: 周期回收空闲 UDP flow。
@@ -1081,9 +1084,16 @@ fn handle_udp_uplink(
     };
     let flow_id = flow_table.intern(tuple);
     flow_table.touch(flow_id, now_secs);
+    let payload_len = udp.payload.len();
     let dg = encode_uplink(flow_id, &target, udp.payload);
+    println!(
+        "🌊 UDP↑ flow={flow_id} → {} ({payload_len}B)",
+        target.to_wire_string()
+    );
     // 满了就丢（UDP 语义，绝不阻塞主循环）。
-    let _ = uplink_tx.try_send(dg);
+    if uplink_tx.try_send(dg).is_err() {
+        println!("⚠️ UDP↑ flow={flow_id} 上行通道满，丢弃");
+    }
 }
 
 /// QUIC 泵 task（哑管道）：连 Upstream，上行 `send_datagram`、下行转发给主循环；
