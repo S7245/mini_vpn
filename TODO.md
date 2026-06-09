@@ -41,21 +41,46 @@ Target extraction alone does NOT make real sites work. In order of blocking seve
 
 These cut across multiple stages and may need their own design before being scheduled.
 
-### Unify the data plane on QUIC (north star — ADR-0003)
+### Data plane → TUIC protocol on QUIC (ADR-0004, supersedes self-built transport)
 
-Stage 12 shipped the first cut: UDP relay over a QUIC datagram data plane, alongside the
-existing TCP/yamux link. The committed end-state is to unify the whole data plane on QUIC.
-Follow-on stages (each its own design):
+ADR-0003's north star (unify on QUIC) is now realized via the **TUIC v5 protocol** on quinn
+(**ADR-0004**), NOT a self-designed transport (that work was reverted). Priority rule:
+「用成熟方案拿到最好体验」>「复用自研引擎」. **Client-only**: the exit is a mature **sing-box TUIC
+server** (interop = best experience, zero server code from us). Stage 12's UDP-over-QUIC-datagram
+≈ TUIC native mode and is reused. quinn 0.10 already exposes `export_keying_material` (TUIC auth).
 
-- **Migrate TCP relay onto QUIC streams**, retire yamux + its cross-flow HOL blocking.
-- **Server UDP session-table hardening**: socket pooling, ephemeral-port exhaustion under
-  high concurrency, fairness/pacing. First cut is naive one-socket-per-flow.
-- **Oversized-datagram stream-fallback**: today a UDP payload that exceeds the QUIC datagram
-  limit is dropped (counted/logged); fall back to a QUIC stream for those.
-- **Quality/scale**: per-flow congestion fairness, multi-upstream/failover, graceful drain,
-  control-plane server discovery + metrics. External stores (Redis/etcd/Postgres) belong here
-  in the control plane — NOT on the per-datagram data-plane hot path.
+- **Stage 13 — TUIC client**: Authenticate (UUID + token via keying-material), TCP relay over TUIC
+  Connect bidirectional streams (**retires yamux**, staged for zero regression), UDP relay in native
+  (datagram) + quic-stream modes (the latter = the deferred oversized-datagram fallback), heartbeat;
+  enable QUIC connection migration + 0-RTT. **Acceptance includes interop against a real sing-box TUIC
+  server.** Our Stage-12 server QUIC relay is frozen (client-only direction).
+
+#### Transport / protocol extensibility — two tiers
+
+- **Proxy-transport trait** (the abstraction Stage 13 builds): pluggable L4/L7 proxy protocols sharing
+  "intercept flow → relay to exit → exit dials target". TUIC = impl #1; **VLESS+REALITY (TCP)** = planned
+  #2, the GFW-crackdown-resistant fallback (REALITY ≈ indistinguishable from real HTTPS; QUIC/TUIC is a
+  censorship target — GFW does QUIC-Initial SNI blocking, mitigated only by SNI-slicing). Trojan/SS/
+  Hysteria could follow the same trait.
+  - **Protocol selection** (REALITY stage, not Stage 13 — meaningless with one protocol): **auto-failover
+    by default** (urltest-style: TUIC → TCP/REALITY on QUIC block/timeout/loss) + a **manual 3-way
+    override** (auto / force-UDP / force-TCP).
+- **Data-plane "tunnel mode"** (separate future path, NOT behind the proxy trait): WireGuard / OpenVPN
+  forward raw IP packets (L3), bypassing smoltcp/fake-IP/per-flow — a different mode for "general VPN
+  (non-circumvention)" use, and easily GFW-blocked without obfuscation. Add only if that product need
+  appears. **StealthVPN (Astrill, proprietary/closed): not doing** (no open spec).
+
+#### Mobile (iOS/Android) readiness
+- Abstract packet I/O behind a trait (current `tun` crate backend; **iOS NEPacketTunnelFlow**; **Android
+  VpnService fd**) and library-ize the core (config struct in, not env/CLI) for FFI.
+- Adaptive keep-alive (battery vs NAT timeout; current 5s is battery-hostile) + memory budget (iOS
+  NetworkExtension ~15–50MB limit) + QUIC 0-RTT for fast resume after radio sleep.
+- UDP→TCP upstream fallback where UDP/QUIC is blocked (ties into the protocol selector above).
+
+#### Other follow-ons
 - **DNS hardening**: intercept all `:53` (not just 198.18.0.1) / known DoH endpoints.
+- **Scale/ops** (only if our own server returns): session-table hardening, multi-upstream/failover,
+  graceful drain, control-plane discovery + metrics (external stores belong here, not the hot path).
 
 ### Multi-Hop
 
