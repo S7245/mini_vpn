@@ -104,6 +104,25 @@ networksetup -setdnsservers Wi-Fi empty                # 恢复 DNS（重要）
 sudo route -n delete -net 198.18.0.0/15
 ```
 
+## 验收结果（2026-06-08，跨机签收）
+
+深圳 client（macOS）↔ US exit（弗吉尼亚 VPS），全部通过：
+
+| 项 | 结果 |
+|---|---|
+| ATYP=1（IP 直连） | `dig @1.1.1.1` 拿到真实应答；IP echo 回显 ✅ |
+| ATYP=3（fake-IP→域名） | `udp.zkwcloud.com` echo 回显，server `📨 ... → 47.252.50.10:9999` ✅ |
+| 1200B 冷启动（≈QUIC initial） | `got 1200`，刚连上即可（initial_mtu=1280）✅ |
+| 连接长稳 | keepalive=5s，`✅ 已连接` 常驻不闪 ✅ |
+| 持续 60s | 48/48（100%）✅ |
+| 并发 160 流（无 DNS / 有 DNS） | **160/160 / 160/160** ✅ |
+| TCP 不回归 | `curl https://1.1.1.1/` 正常 ✅ |
+
+> 跨机 bring-up 期间修复（均已合入）：keepalive + idle（be133c5/841f82a）、超限 datagram 改 connect 出口 socket
+> （f903a58）、热路径逐包日志拖垮主循环（185cc42）、initial_mtu=1280 消除冷窗口（9252e75）、fake DNS resolver
+> buffer 8→64 槽（cec9961）。**踩坑细节见 .learnings/LEARNINGS.md（2026-06-08）。**
+> 测试注意：echo 用单 socket 的 Python（`recvfrom`/`sendto`），别用 `ncat -k -u -e`（每对端 fork、扛不住并发）。
+
 ## MTU / datagram 尺寸（实测行为）
 
 外层 QUIC datagram 可用大小 = `conn.max_datagram_size()`，随路径 MTU 变化。quinn 从安全的 initial MTU 1200

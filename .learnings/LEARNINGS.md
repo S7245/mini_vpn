@@ -1,5 +1,42 @@
 # Learnings
 
+## 2026-06-08 — Stage 12 UDP-over-QUIC cross-machine acceptance; field-debugging lessons
+
+UDP relay over a QUIC datagram data plane works end-to-end (Shenzhen client → US exit):
+ATYP=1 (IP literal: `dig @1.1.1.1`, IP echo) and ATYP=3 (fake-IP→domain: `udp.zkwcloud.com`)
+both relay; 1200-byte (QUIC-initial-sized) datagrams round-trip cold; **160 concurrent flows
+= 160/160** with and without DNS. Several non-obvious lessons from the cross-machine bring-up:
+
+1. **quinn defaults bite at three points; all needed tuning for a real long-lived data plane.**
+   - `max_idle_timeout` defaults to 10s and `keep_alive_interval` to None → an idle QUIC
+     connection drops every 10s and reconnects forever. Set keepalive **5s** (must be well under
+     even a stale peer's 10s idle, since negotiated idle = min(both peers) — version skew between
+     client and server made a 10s keepalive race the 10s boundary).
+   - `initial_mtu` defaults to 1200 → `max_datagram_size` ~1162, too small for a 1200B inner
+     payload (~1224 with our header), so a freshly-(re)connected data plane dropped large
+     datagrams until PLPMTUD warmed. Set `initial_mtu`/`min_mtu` = **1280** (IPv6 minimum) so it
+     fits cold. Note quinn's "MTU" is the UDP payload size, not the IP packet — 1280 is safe on
+     real IPv4/1500 paths.
+   - Both keepalive and MTU live in the **shared** transport config → BOTH ends must be rebuilt;
+     a stale server silently dropped the 1200B *downlink* (1204B) as oversized. Always confirm
+     `git log -1` matches on every box before trusting a cross-machine result.
+
+2. **Per-packet `println!` on a single-threaded TUN loop is catastrophic under concurrency.**
+   The device dumped the full packet bytes every recv and the whole tx_queue every transmit;
+   under an 8-way burst this starved the loop, overflowed the utun buffer, and dropped UDP
+   (concurrent 1/160). Removing per-packet/byte-dump logging (keep per-flow + drop/error logs)
+   took it to 50/160. Logging on the data-plane hot path must be per-flow, not per-packet.
+
+3. **Localize before fixing — a passing loopback test + a field-isolating test pin the layer.**
+   A loopback integration test (one QUIC connection, 100 concurrent flows, ≥90/100) proved the
+   relay/server were fine, pointing at the client TUN loop. Then an IP-literal-vs-domain field
+   test split DNS contention from relay throughput.
+
+4. **The test harness was the final bottleneck.** `ncat -k -u -e /bin/cat` is connection-oriented
+   / forks per peer; our server uses one egress socket per flow, so the echo saw 160 distinct
+   peers and choked (15/160). A single-socket Python echo (`recvfrom`/`sendto` loop) → 160/160.
+   When a relay test underperforms, suspect the echo endpoint before the relay.
+
 ## 2026-06-02 — fake-IP end-to-end reached a GFW-blocked domain; two TUN-UDP source-address gotchas
 
 Stage 11 fake-IP worked end-to-end: Shenzhen `curl https://www.facebook.com/` →
