@@ -4,6 +4,13 @@ The data plane will speak the **TUIC v5 protocol** (a mature, QUIC-based 0-RTT p
 on our existing quinn stack**, replacing the previously-planned self-designed TCP→QUIC transport. We keep the
 TUN interception + fake-IP DNS front-end we already built.
 
+**Scope = client-only.** We implement the TUIC *client*; the exit is a mature **sing-box TUIC server** (we do
+NOT build/maintain our own server — it gives no experience advantage over sing-box and only adds maintenance).
+Our Stage-12 server-side QUIC relay is therefore **frozen**. Migration is **dual-run**: the existing
+yamux+self-server upstream stays as the working baseline behind a config switch until the TUIC→sing-box path is
+validated, then the legacy paths are removed (staged 13a TCP-Connect → 13b UDP-Packet → 13c migration/0-RTT →
+13d retire-legacy).
+
 We chose this because the project's priority was sharpened to **「用成熟方案拿到最好体验」> 「复用自研引擎」**
 (prefer a mature solution for the best experience over extending the self-built engine), and because mobile
 (iOS/Android, weak networks, WiFi↔cellular roaming) raises the bar far beyond what hand-rolling our own
