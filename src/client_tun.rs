@@ -399,8 +399,10 @@ pub async fn start_tun_proxy() {
     // Stage 11: fake-IP DNS。监听 UDP :53（AnyIP 收发往 198.18.0.1:53 的查询），
     // 本地伪造 A 响应（fake-IP）；TCP 时凭 fake-IP 查回域名走 DomainPort relay。
     let dns_handle = {
-        let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 4096]);
-        let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 4096]);
+        // 中文要点：DNS 查询常突发（应用并发解析 + 系统后台噪声），buffer 太小会丢查询 →
+        // getaddrinfo 失败 → 连接发不出。给足 64 槽 / 64KB，吸收突发。
+        let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 64], vec![0u8; 65_536]);
+        let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 64], vec![0u8; 65_536]);
         let mut s = udp::Socket::new(rx, tx);
         // 必须 bind 到具体的 198.18.0.1，而非通配 None：否则 smoltcp 回复 DNS 响应时
         // 按子网匹配选源地址（dst=10.0.0.1 → src=10.0.0.2），源与查询目的不一致，
