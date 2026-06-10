@@ -11,7 +11,11 @@ use crate::upstream::{ProxyUpstream, RelayStream};
 use quinn::{Connection, Endpoint};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
 /// 默认 ALPN：TUIC over QUIC 常用 `h3`，必须与 sing-box `tls.alpn` 一致。
 const DEFAULT_TUIC_ALPN: &str = "h3";
@@ -119,6 +123,14 @@ const CMD_PACKET: u8 = 0x02;
 const CMD_HEARTBEAT: u8 = 0x04;
 /// 地址 None 类型(回程可能省略地址)。
 const ATYP_NONE: u8 = 0xff;
+
+/// TUIC Heartbeat 周期：连接空闲时维持 NAT 映射/路径活性。取 3s，给 sing-box 的空闲超时留足余量。
+const TUIC_HEARTBEAT_SECS: u64 = 3;
+/// 下行 datagram channel 容量。背压由 pump 承担（`send().await`），不丢下行（DNS 响应不能丢）。
+const TUIC_DOWNLINK_CAPACITY: usize = 1024;
+/// UDP 驱动重连退避上限（确定性指数退避，无需 rand；UDP 自愈，重连节奏不敏感）。
+const UDP_RECONNECT_CAP_MS: u64 = 30_000;
+const UDP_RECONNECT_BASE_MS: u64 = 500;
 /// 地址类型(注意：TUIC 的 ATYP 取值与我们 Stage-12 自定义的不同)。
 const ATYP_DOMAIN: u8 = 0x00;
 const ATYP_IPV4: u8 = 0x01;
@@ -334,6 +346,8 @@ pub struct TuicUpstream {
     uuid: [u8; 16],
     password: String,
     conn: Mutex<Connection>,
+    /// 上行 UDP datagram 丢弃计数（TooLarge / 连接不可用）。可观测性，不影响 UDP 语义。
+    udp_drops: AtomicU64,
 }
 
 impl TuicUpstream {
@@ -351,6 +365,7 @@ impl TuicUpstream {
             uuid: cfg.uuid,
             password: cfg.password.clone(),
             conn: Mutex::new(conn),
+            udp_drops: AtomicU64::new(0),
         })
     }
 
@@ -377,21 +392,121 @@ impl TuicUpstream {
         uni.finish().await.map_err(|e| io_err("tuic auth finish", e))?;
         Ok(conn)
     }
+
+    /// 取当前活连接的克隆；若已关闭则就地重连+重认证（13a 逻辑，TCP/UDP 共用）。
+    /// 中文要点：单一事实源——TCP `open_tcp` 与 UDP `send_udp`/驱动任务都经此取连接，
+    /// 由 `conn` 互斥锁串行化重连，避免并发双连接。
+    async fn live_conn(&self) -> Result<Connection, ClientError> {
+        let mut guard = self.conn.lock().await;
+        if guard.close_reason().is_some() {
+            *guard = Self::handshake(
+                &self.endpoint,
+                self.server,
+                &self.sni,
+                &self.uuid,
+                &self.password,
+            )
+            .await?;
+        }
+        Ok(guard.clone())
+    }
+
+    /// 发一条**已编码**的 TUIC Packet（native datagram）。
+    /// 中文要点：TooLarge / 连接不可用 → 丢弃并计数（UDP 语义，绝不阻塞调用方除重连外）。
+    /// native 模式不分片，超 QUIC datagram 上限的包直接丢（quic-stream 兜底留待后续）。
+    pub async fn send_udp(&self, datagram: Vec<u8>) {
+        let conn = match self.live_conn().await {
+            Ok(c) => c,
+            Err(e) => {
+                self.udp_drops.fetch_add(1, Ordering::Relaxed);
+                println!("⚠️ TUIC UDP↑ 无可用连接，丢弃: {e:?}");
+                return;
+            }
+        };
+        match conn.send_datagram(datagram.into()) {
+            Ok(()) => {}
+            Err(quinn::SendDatagramError::TooLarge) => {
+                self.udp_drops.fetch_add(1, Ordering::Relaxed);
+                println!("⚠️ TUIC UDP↑ datagram 超过 QUIC 上限，丢弃");
+            }
+            Err(e) => {
+                self.udp_drops.fetch_add(1, Ordering::Relaxed);
+                println!("⚠️ TUIC UDP↑ 发送失败（连接将自愈），丢弃: {e:?}");
+            }
+        }
+    }
+
+    /// 累计丢弃的上行 UDP datagram 数（可观测性）。
+    pub fn udp_drop_count(&self) -> u64 {
+        self.udp_drops.load(Ordering::Relaxed)
+    }
+
+    /// 启动 UDP 驱动后台任务，返回**下行 datagram 接收端**给主循环 select。
+    /// 任务职责：① 下行泵——`read_datagram` → channel（主循环 `decode_packet` 后注入 TUN）；
+    /// ② 周期 Heartbeat 维持连接。连接断开则确定性退避后经 `live_conn` 重连，泵与心跳自然恢复
+    /// （等价于"重连后重启泵/心跳"）。
+    /// 中文要点：单自愈循环，避免多任务各自重连产生竞态；下行用 `send().await` 施加背压、不丢 DNS 响应。
+    pub fn start_udp(self: &Arc<Self>) -> mpsc::Receiver<Vec<u8>> {
+        let (downlink_tx, downlink_rx) = mpsc::channel::<Vec<u8>>(TUIC_DOWNLINK_CAPACITY);
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut attempt: u32 = 0;
+            loop {
+                let conn = match me.live_conn().await {
+                    Ok(c) => {
+                        attempt = 0;
+                        println!("🌊 TUIC UDP 驱动已就绪（datagram 泵 + heartbeat）");
+                        c
+                    }
+                    Err(e) => {
+                        println!("TUIC UDP 驱动重连失败: {e:?}");
+                        tokio::time::sleep(udp_reconnect_backoff(attempt)).await;
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
+                };
+                let mut hb = tokio::time::interval(Duration::from_secs(TUIC_HEARTBEAT_SECS));
+                hb.tick().await; // 第一拍立即返回，跳过（避免连上瞬间立刻发心跳）。
+                loop {
+                    tokio::select! {
+                        dg = conn.read_datagram() => {
+                            match dg {
+                                Ok(bytes) => {
+                                    if downlink_tx.send(bytes.to_vec()).await.is_err() {
+                                        return; // 主循环已退出 → 结束任务
+                                    }
+                                }
+                                Err(_) => break, // 连接断 → 外层 live_conn 重连
+                            }
+                        }
+                        _ = hb.tick() => {
+                            if conn.send_datagram(encode_heartbeat().into()).is_err() {
+                                break; // 连接断 → 外层 live_conn 重连
+                            }
+                        }
+                    }
+                }
+                println!("🔌 TUIC UDP 驱动连接断开，准备重连");
+                tokio::time::sleep(udp_reconnect_backoff(attempt)).await;
+                attempt = attempt.saturating_add(1);
+            }
+        });
+        downlink_rx
+    }
+}
+
+/// UDP 驱动重连退避：确定性指数退避（`base * 2^attempt`，封顶 `CAP`）。
+/// 中文要点：UDP 无连接状态、重连后下个 datagram 即自愈，对重连节奏不敏感，故不引入 jitter。
+fn udp_reconnect_backoff(attempt: u32) -> Duration {
+    let exp = UDP_RECONNECT_BASE_MS.saturating_mul(1u64.checked_shl(attempt).unwrap_or(u64::MAX));
+    Duration::from_millis(exp.min(UDP_RECONNECT_CAP_MS))
 }
 
 #[async_trait::async_trait]
 impl ProxyUpstream for TuicUpstream {
     async fn open_tcp(&self, target: &TargetAddr) -> Result<RelayStream, ClientError> {
-        // 取活连接，断了就地重连+重认证。
-        let conn = {
-            let mut guard = self.conn.lock().await;
-            if guard.close_reason().is_some() {
-                *guard =
-                    Self::handshake(&self.endpoint, self.server, &self.sni, &self.uuid, &self.password)
-                        .await?;
-            }
-            guard.clone()
-        };
+        // 取活连接，断了就地重连+重认证（与 UDP 共用 live_conn，单一事实源）。
+        let conn = self.live_conn().await?;
         let (mut send, recv) = conn.open_bi().await.map_err(|e| io_err("tuic open_bi", e))?;
         send.write_all(&encode_connect(target))
             .await
