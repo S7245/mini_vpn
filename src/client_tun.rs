@@ -1,6 +1,8 @@
 use crate::device::VirtualTunDevice;
 use mini_vpn::quic::{client_endpoint, client_quic_config};
 use mini_vpn::shared::{ClientError, RelayRequest, TargetAddr, open_remote_session};
+use mini_vpn::tuic::{TuicClientConfig, TuicUpstream};
+use mini_vpn::upstream::{ProxyUpstream, RelayStream};
 use mini_vpn::udp_relay::{
     FlowTable, FourTuple, UDP_FLOW_IDLE_SECS, build_udp_ip_packet, decode_downlink, encode_uplink,
     parse_inbound_udp,
@@ -14,7 +16,7 @@ use smoltcp::socket::udp;
 use smoltcp::wire::{IpAddress, IpCidr, IpListenEndpoint};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
+use tokio_util::compat::TokioAsyncReadCompatExt;
 use yamux::{Config as YamuxConfig, Connection, Mode};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::ServerName;
@@ -456,103 +458,146 @@ pub async fn start_tun_proxy() {
     // 上游连接 + 断开信号通道。epoch 记录连接代际（每成功一次 +1）。
     let (disconnect_tx, mut disconnect_rx) = mpsc::channel::<()>(1);
     let mut epoch: u64 = 0;
-    let mut ctr = match connect_upstream(
-        &connector,
-        &upstream_server_addr,
-        domain.clone(),
-        disconnect_tx.clone(),
-    )
-    .await
-    {
-        Ok(c) => {
-            epoch += 1;
-            println!("✅ 成功连接到洛杉矶代理服务器！(epoch={epoch})");
-            c
-        }
-        Err(e) => {
-            println!("首次连接代理服务端失败: {e:?}");
-            return;
-        }
-    };
 
-    // ===== Stage 12：QUIC datagram 数据面（UDP relay），独立于上面的 TCP/yamux 连接 =====
-    // 中文要点：QUIC 上游默认取同 host:port(UDP)、复用同一 CA/SNI；任一构建失败即启动中止。
-    let quic_server_addr: SocketAddr = match upstream_server_addr.parse() {
-        Ok(addr) => addr,
-        Err(e) => {
-            println!("QUIC 上游地址非法 {upstream_server_addr}: {e}");
-            return;
+    // Stage 13a 双轨:按 MINI_VPN_UPSTREAM 选 legacy(yamux→自研 server)或 tuic(TUIC→sing-box)。
+    let upstream_mode =
+        match parse_upstream_mode(std::env::var("MINI_VPN_UPSTREAM").ok().as_deref()) {
+            Ok(m) => m,
+            Err(e) => {
+                println!("{e}");
+                return;
+            }
+        };
+    let mut upstream = match upstream_mode {
+        UpstreamMode::Legacy => match connect_upstream(
+            &connector,
+            &upstream_server_addr,
+            domain.clone(),
+            disconnect_tx.clone(),
+        )
+        .await
+        {
+            Ok(c) => {
+                epoch += 1;
+                println!("✅ 成功连接到洛杉矶代理服务器！(epoch={epoch})");
+                Upstream::Legacy(c)
+            }
+            Err(e) => {
+                println!("首次连接代理服务端失败: {e:?}");
+                return;
+            }
+        },
+        UpstreamMode::Tuic => {
+            let cfg = match TuicClientConfig::from_env() {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("加载 TUIC 客户端配置失败（启动中止）: {e}");
+                    return;
+                }
+            };
+            match TuicUpstream::connect(&cfg).await {
+                Ok(u) => {
+                    println!("✅ 已连接 TUIC 出口 {} (sing-box)", cfg.server);
+                    Upstream::Tuic(Arc::new(u))
+                }
+                Err(e) => {
+                    println!("连接 TUIC 出口失败（启动中止）: {e:?}");
+                    return;
+                }
+            }
         }
     };
-    let quic_cfg = match client_quic_config(&tls_ca_path) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            println!("加载 QUIC 客户端配置失败（启动中止）: {e}");
-            return;
-        }
-    };
-    let quic_endpoint = match client_endpoint(quic_cfg) {
-        Ok(ep) => ep,
-        Err(e) => {
-            println!("QUIC 客户端 endpoint 失败（启动中止）: {e}");
-            return;
-        }
-    };
+    let udp_enabled = matches!(upstream, Upstream::Legacy(_));
+
+    // ===== Stage 12：QUIC datagram 数据面（UDP relay）。仅 legacy 模式启用(到自研 server);
+    // tuic 模式下 UDP relay 留待 13b,本阶段只过 TCP。channels 始终创建以便 select! 结构统一。 =====
     let (udp_uplink_tx, udp_uplink_rx) = mpsc::channel::<Vec<u8>>(UDP_UPLINK_CHANNEL_CAPACITY);
     let (udp_downlink_tx, mut udp_downlink_rx) =
         mpsc::channel::<Vec<u8>>(UDP_UPLINK_CHANNEL_CAPACITY);
-    tokio::spawn(run_quic_pump(
-        quic_endpoint,
-        quic_server_addr,
-        upstream_tls_sni.clone(),
-        udp_uplink_rx,
-        udp_downlink_tx,
-    ));
+    // 非 legacy 模式下保留一个 sender,让 udp_downlink_rx "开但无数据"(分支休眠),避免 closed-channel 空轮询。
+    let _udp_downlink_keepalive: Option<mpsc::Sender<Vec<u8>>>;
+    if udp_enabled {
+        let quic_server_addr: SocketAddr = match upstream_server_addr.parse() {
+            Ok(addr) => addr,
+            Err(e) => {
+                println!("QUIC 上游地址非法 {upstream_server_addr}: {e}");
+                return;
+            }
+        };
+        let quic_cfg = match client_quic_config(&tls_ca_path) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                println!("加载 QUIC 客户端配置失败（启动中止）: {e}");
+                return;
+            }
+        };
+        let quic_endpoint = match client_endpoint(quic_cfg) {
+            Ok(ep) => ep,
+            Err(e) => {
+                println!("QUIC 客户端 endpoint 失败（启动中止）: {e}");
+                return;
+            }
+        };
+        tokio::spawn(run_quic_pump(
+            quic_endpoint,
+            quic_server_addr,
+            upstream_tls_sni.clone(),
+            udp_uplink_rx,
+            udp_downlink_tx,
+        ));
+        _udp_downlink_keepalive = None;
+        println!("🌊 UDP relay 数据面就绪（QUIC datagram → {quic_server_addr}）");
+    } else {
+        drop(udp_uplink_rx);
+        _udp_downlink_keepalive = Some(udp_downlink_tx);
+        println!("ℹ️ tuic 模式:UDP relay 暂未支持(13b),本阶段仅 TCP 经 TUIC");
+    }
     let mut flow_table = FlowTable::new();
     let udp_clock = std::time::Instant::now();
     let mut udp_sweep = tokio::time::interval(std::time::Duration::from_secs(1));
-    println!("🌊 UDP relay 数据面就绪（QUIC datagram → {quic_server_addr}）");
 
     loop {
-        let mut ctrl = ctr.clone();
         tokio::select! {
-            // 分支 0: 上游连接断开 → 复位在途连接 + 带 full-jitter 退避重连（无限重试）。
+            // 分支 0:(legacy)上游断开 → 复位在途连接 + full-jitter 退避重连。
+            //   tuic 模式不发 disconnect(TuicUpstream 在 open_tcp 处自重连),此分支休眠。
             _ = disconnect_rx.recv() => {
-                println!("🔌 上游连接断开，准备重连");
-                let handles: Vec<SocketHandle> = registry.all_handles().collect();
-                let mut reset = 0usize;
-                for h in handles {
-                    if let Some(c) = socket_ctxs.get_mut(&h)
-                        && c.uplink_tx.is_some()
-                    {
-                        let sock = sockets.get_mut::<TcpSocket>(h);
-                        rearm_socket(sock, c);
-                        reset += 1;
-                    }
-                }
-                println!("♻️ 重连后复位 {reset} 条在途连接");
-                let mut attempt = 0u32;
-                loop {
-                    let delay = backoff_delay(attempt, rand::random::<f64>());
-                    println!("⏳ 第 {} 次重连，等待 {}ms", attempt + 1, delay.as_millis());
-                    tokio::time::sleep(delay).await;
-                    match connect_upstream(
-                        &connector,
-                        &upstream_server_addr,
-                        domain.clone(),
-                        disconnect_tx.clone(),
-                    )
-                    .await
-                    {
-                        Ok(new_ctr) => {
-                            ctr = new_ctr;
-                            epoch += 1;
-                            println!("✅ 上游重连成功 (epoch={epoch})");
-                            break;
+                if let Upstream::Legacy(ctr) = &mut upstream {
+                    println!("🔌 上游连接断开，准备重连");
+                    let handles: Vec<SocketHandle> = registry.all_handles().collect();
+                    let mut reset = 0usize;
+                    for h in handles {
+                        if let Some(c) = socket_ctxs.get_mut(&h)
+                            && c.uplink_tx.is_some()
+                        {
+                            let sock = sockets.get_mut::<TcpSocket>(h);
+                            rearm_socket(sock, c);
+                            reset += 1;
                         }
-                        Err(e) => {
-                            println!("重连失败: {e:?}");
-                            attempt = attempt.saturating_add(1);
+                    }
+                    println!("♻️ 重连后复位 {reset} 条在途连接");
+                    let mut attempt = 0u32;
+                    loop {
+                        let delay = backoff_delay(attempt, rand::random::<f64>());
+                        println!("⏳ 第 {} 次重连，等待 {}ms", attempt + 1, delay.as_millis());
+                        tokio::time::sleep(delay).await;
+                        match connect_upstream(
+                            &connector,
+                            &upstream_server_addr,
+                            domain.clone(),
+                            disconnect_tx.clone(),
+                        )
+                        .await
+                        {
+                            Ok(new_ctr) => {
+                                *ctr = new_ctr;
+                                epoch += 1;
+                                println!("✅ 上游重连成功 (epoch={epoch})");
+                                break;
+                            }
+                            Err(e) => {
+                                println!("重连失败: {e:?}");
+                                attempt = attempt.saturating_add(1);
+                            }
                         }
                     }
                 }
@@ -582,13 +627,16 @@ pub async fn start_tun_proxy() {
                     let class = device.rx_buffer.as_deref().map(classify_inbound);
                     if class == Some(Inbound::UdpRelay) {
                         if let Some(pkt) = device.rx_buffer.take() {
-                            handle_udp_uplink(
-                                &pkt,
-                                &mut flow_table,
-                                &fake_pool,
-                                &udp_uplink_tx,
-                                udp_clock.elapsed().as_secs(),
-                            );
+                            if udp_enabled {
+                                handle_udp_uplink(
+                                    &pkt,
+                                    &mut flow_table,
+                                    &fake_pool,
+                                    &udp_uplink_tx,
+                                    udp_clock.elapsed().as_secs(),
+                                );
+                            }
+                            // tuic 模式:UDP relay 留待 13b,丢弃该包(已 take,不进 smoltcp)。
                         }
                     } else {
                         // 1) SYN inspector：在 iface.poll 之前看一眼包，若是去往新端口的干净 SYN，
@@ -618,7 +666,7 @@ pub async fn start_tun_proxy() {
                                 handle,
                                 &mut sockets,
                                 &mut socket_ctxs,
-                                &mut ctrl,
+                                &upstream,
                                 &global_tx,
                                 &fake_pool,
                             )
@@ -668,7 +716,7 @@ pub async fn start_tun_proxy() {
                         handle,
                         &mut sockets,
                         &mut socket_ctxs,
-                        &mut ctrl,
+                        &upstream,
                         &global_tx,
                         &fake_pool,
                     )
@@ -690,6 +738,44 @@ fn build_listener_socket(spec: &ListenerSpec) -> TcpSocket<'static> {
     let mut tcp_socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
     tcp_socket.listen(spec.local_port).unwrap();
     tcp_socket
+}
+
+/// 选择的上游传输（Stage 13a 双轨）。
+/// 中文要点：legacy = 现有 TLS+yamux 到自研 server；tuic = TUIC 到 sing-box。两者都给 Target 开一条
+/// 中继流(RelayStream),喂给同一套双向泵。legacy 仍走原内联逻辑,只是结果被统一成 RelayStream(零回归)。
+enum Upstream {
+    Legacy(yamux::Control),
+    Tuic(Arc<TuicUpstream>),
+}
+
+impl Upstream {
+    async fn open_tcp(&self, target: TargetAddr) -> Result<RelayStream, ClientError> {
+        match self {
+            Upstream::Legacy(ctr) => {
+                let mut c = ctr.clone();
+                let stream = open_remote_session(&mut c, &RelayRequest::Tcp { target }).await?;
+                Ok(Box::new(stream))
+            }
+            Upstream::Tuic(u) => u.open_tcp(&target).await,
+        }
+    }
+}
+
+/// 上游模式开关（`MINI_VPN_UPSTREAM`）。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum UpstreamMode {
+    Legacy,
+    Tuic,
+}
+
+fn parse_upstream_mode(s: Option<&str>) -> Result<UpstreamMode, ClientError> {
+    match s.unwrap_or("legacy") {
+        "legacy" => Ok(UpstreamMode::Legacy),
+        "tuic" => Ok(UpstreamMode::Tuic),
+        other => Err(ClientError::InvalidTarget(format!(
+            "invalid MINI_VPN_UPSTREAM: {other}"
+        ))),
+    }
 }
 
 /// Establish one upstream TLS + Yamux connection and spawn its background poll task.
@@ -835,7 +921,7 @@ async fn process_listener_activity(
     handle: SocketHandle,
     sockets: &mut SocketSet<'_>,
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
-    ctrl: &mut yamux::Control,
+    upstream: &Upstream,
     global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
     fake_pool: &FakeIpPool,
 ) -> Result<(), ClientError> {
@@ -878,7 +964,7 @@ async fn process_listener_activity(
         }
     };
 
-    handle_local_payload(handle, payload, Some(target), socket_ctxs, ctrl, global_tx).await
+    handle_local_payload(handle, payload, Some(target), socket_ctxs, upstream, global_tx).await
 }
 
 async fn handle_local_payload(
@@ -886,7 +972,7 @@ async fn handle_local_payload(
     payload: Vec<u8>,
     target: Option<TargetAddr>,
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
-    ctrl: &mut yamux::Control,
+    upstream: &Upstream,
     global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
 ) -> Result<(), ClientError> {
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
@@ -916,8 +1002,7 @@ async fn handle_local_payload(
         target.to_wire_string()
     );
     println!("🔄 handle {:?} entering {:?}", handle, ctx.state);
-    let request = RelayRequest::Tcp { target };
-    let stream = open_remote_session(ctrl, &request).await?;
+    let stream = upstream.open_tcp(target).await?;
     println!("🚪 handle {:?} remote session opened", handle);
 
     let (tx, rx) = tokio::sync::mpsc::channel(RELAY_CHANNEL_CAPACITY);
@@ -976,7 +1061,7 @@ async fn handle_remote_payload(
 
 fn spawn_remote_relay(
     handle: SocketHandle,
-    mut tokio_yamux_stream: Compat<yamux::Stream>,
+    mut stream: RelayStream,
     mut rx: mpsc::Receiver<Vec<u8>>,
     back_tx: mpsc::Sender<(SocketHandle, Vec<u8>)>,
 ) {
@@ -987,12 +1072,10 @@ fn spawn_remote_relay(
                 local_msg = rx.recv() => {
                     match local_msg {
                         Some(payload) => {
-                            match tokio_yamux_stream.write_all(&payload).await {
-                                Ok(_) => {
-                                    println!("✅ 成功发送 {} 字节数据到远端", payload.len());
-                                }
+                            match stream.write_all(&payload).await {
+                                Ok(_) => {}
                                 Err(e) => {
-                                    println!("写入 Yamux 流失败: {:?}", e);
+                                    println!("写入上游流失败: {:?}", e);
                                     break;
                                 }
                             }
@@ -1003,7 +1086,7 @@ fn spawn_remote_relay(
                         }
                     }
                 }
-                remote_msg = tokio_yamux_stream.read(&mut buf) => {
+                remote_msg = stream.read(&mut buf) => {
                     match remote_msg {
                         Ok(0) => {
                             println!("远端服务器关闭了车厢 {:?}", handle);
@@ -1402,5 +1485,16 @@ mod tests {
         let pkt = build_ipv4_tcp([10, 0, 0, 1], [1, 1, 1, 1], 60000, 443, true, false);
         assert_eq!(classify_inbound(&pkt), Inbound::Other);
         assert_eq!(classify_inbound(&[0u8; 4]), Inbound::Other);
+    }
+
+    #[test]
+    fn upstream_mode_parses_with_legacy_default() {
+        assert_eq!(parse_upstream_mode(None).unwrap(), UpstreamMode::Legacy);
+        assert_eq!(
+            parse_upstream_mode(Some("legacy")).unwrap(),
+            UpstreamMode::Legacy
+        );
+        assert_eq!(parse_upstream_mode(Some("tuic")).unwrap(), UpstreamMode::Tuic);
+        assert!(parse_upstream_mode(Some("wireguard")).is_err());
     }
 }
