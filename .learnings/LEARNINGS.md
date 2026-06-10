@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-06-10 — Stage 13a: our hand-written TUIC client interoperates with sing-box
+
+The mini_vpn client now speaks the **TUIC v5 protocol** (ADR-0004) and was accepted by a real
+**sing-box TUIC server** as the exit: Shenzhen client (tuic mode) → sing-box (US, UDP 8443) →
+`curl https://1.1.1.1/` returned `HTTP/2 301` with Cloudflare's genuine TLS cert and `cf-ray …-SJC`
+(US egress). Lessons:
+
+1. **Interop is the proof of correctness.** A successful sing-box handshake validates the byte-exact
+   parts that unit tests can't fully cover on their own: the Authenticate token derivation
+   (`export_keying_material(label=UUID, context=password)`, 32 bytes) and the Connect/Address wire
+   layout (TUIC ATYP 0x00 domain / 0x01 IPv4 / 0x02 IPv6 — different from our Stage-12 custom codes).
+   We unit-tested the encoders against exact bytes, but "sing-box accepted it" is the real gate.
+2. **Implementing a standard protocol > a bespoke one** for this goal: speaking TUIC means the exit is
+   a mature, maintained sing-box (best experience, zero server code from us). The canonical TUIC repo is
+   spec-only and the reference Rust crate is yanked, so we implemented the (stable) spec on our existing
+   quinn — mature *design*, our *code*, full ecosystem interop.
+3. **Dual-run keeps zero regression** while swapping the upstream: `MINI_VPN_UPSTREAM=legacy|tuic`
+   (default legacy), an `Upstream` enum whose `open_tcp` returns a unified `RelayStream`, and the proven
+   legacy path only *wrapped*, not modified.
+4. **Concurrent sessions on one branch cause loss.** Another session committed to the same branch and
+   clobbered a commit (recovered + pushed). Push after every commit and keep one writer per branch.
+
 ## 2026-06-08 — Stage 12 UDP-over-QUIC cross-machine acceptance; field-debugging lessons
 
 UDP relay over a QUIC datagram data plane works end-to-end (Shenzhen client → US exit):

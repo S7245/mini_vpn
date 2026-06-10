@@ -4,6 +4,16 @@
 > 双轨(`MINI_VPN_UPSTREAM=legacy|tuic`,默认 legacy 零回归)。设计见 ADR-0004 + 13a spec/plan。
 > ⚠️ **凭据(UUID/password)不要提交进 git**;本文用占位符。
 
+## 验收结果（2026-06-10,跨机签收）
+
+深圳 client(tuic 模式)→ **sing-box TUIC server**(US,UDP 8443)→ 出网,通过:
+- `curl https://1.1.1.1/` 拿到 `HTTP/2 301`,TLS 1.3 + **Cloudflare 真证书**(CN=cloudflare-dns.com),
+  `cf-ray: …-SJC`(美国出口)→ 端到端 TLS 透传 + 真从 US sing-box 出网。
+- sing-box 接受了我们手写客户端的 **Authenticate(token 字节对齐)+ Connect** → **证明说的是真 TUIC 协议**。
+- 意义:mini_vpn 客户端正式**与成熟 TUIC 生态互操作**(出口可用 sing-box/Mihomo),无需自研 server。
+
+> 下一刀 13b:UDP relay 走 TUIC `Packet`(native datagram + quic-stream),让 UDP/QUIC 也经 sing-box。
+
 ## TUIC v5 线格式(本阶段用到)
 
 命令头 `[VER=0x05][TYPE]`;地址 `[ATYP][ADDR][PORT:u16 BE]`,ATYP **0x00=域名`[len][bytes]` / 0x01=IPv4 /

@@ -49,11 +49,14 @@ ADR-0003's north star (unify on QUIC) is now realized via the **TUIC v5 protocol
 server** (interop = best experience, zero server code from us). Stage 12's UDP-over-QUIC-datagram
 ≈ TUIC native mode and is reused. quinn 0.10 already exposes `export_keying_material` (TUIC auth).
 
-- **Stage 13 — TUIC client**: Authenticate (UUID + token via keying-material), TCP relay over TUIC
-  Connect bidirectional streams (**retires yamux**, staged for zero regression), UDP relay in native
-  (datagram) + quic-stream modes (the latter = the deferred oversized-datagram fallback), heartbeat;
-  enable QUIC connection migration + 0-RTT. **Acceptance includes interop against a real sing-box TUIC
-  server.** Our Stage-12 server QUIC relay is frozen (client-only direction).
+- **Stage 13 — TUIC client** (staged 13a→13d; dual-run `MINI_VPN_UPSTREAM=legacy|tuic`):
+  - ~~**13a — TCP relay over TUIC Connect**~~ — DONE (2026-06-10): Authenticate (token via
+    keying-material) + per-flow Connect bi-stream behind a `ProxyUpstream` trait; **verified end-to-end
+    against a real sing-box TUIC server** (curl https://1.1.1.1 → Cloudflare 301, US egress).
+  - **13b — UDP relay over TUIC `Packet`** (native datagram + quic-stream = the deferred oversized
+    fallback). tuic mode UDP is currently dropped.
+  - **13c — connection migration + 0-RTT + heartbeat** (mobile roaming / weak net).
+  - **13d — retire legacy** (yamux + Stage-12 self-server QUIC datagram + self server).
 
 #### Transport / protocol extensibility — two tiers
 
