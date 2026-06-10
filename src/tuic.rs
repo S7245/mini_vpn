@@ -113,6 +113,10 @@ const TUIC_VER: u8 = 0x05;
 /// 命令类型。
 const CMD_AUTHENTICATE: u8 = 0x00;
 const CMD_CONNECT: u8 = 0x01;
+const CMD_PACKET: u8 = 0x02;
+const CMD_HEARTBEAT: u8 = 0x04;
+/// 地址 None 类型(回程可能省略地址)。
+const ATYP_NONE: u8 = 0xff;
 /// 地址类型(注意：TUIC 的 ATYP 取值与我们 Stage-12 自定义的不同)。
 const ATYP_DOMAIN: u8 = 0x00;
 const ATYP_IPV4: u8 = 0x01;
@@ -162,6 +166,59 @@ pub fn encode_connect(target: &TargetAddr) -> Vec<u8> {
     v.push(CMD_CONNECT);
     v.extend_from_slice(&encode_address(target));
     v
+}
+
+/// 编码 TUIC `Packet`(native datagram)：
+/// `[0x05][0x02][ASSOC:u16][PKT_ID:u16=0][FRAG_TOTAL=1][FRAG_ID=0][SIZE:u16][ADDR][data]`。
+pub fn encode_packet(assoc_id: u16, target: &TargetAddr, data: &[u8]) -> Vec<u8> {
+    let addr = encode_address(target);
+    let mut v = Vec::with_capacity(10 + addr.len() + data.len());
+    v.push(TUIC_VER);
+    v.push(CMD_PACKET);
+    v.extend_from_slice(&assoc_id.to_be_bytes());
+    v.extend_from_slice(&0u16.to_be_bytes()); // PKT_ID(native 不重组,固定 0)
+    v.push(1); // FRAG_TOTAL
+    v.push(0); // FRAG_ID
+    v.extend_from_slice(&(data.len() as u16).to_be_bytes()); // SIZE
+    v.extend_from_slice(&addr);
+    v.extend_from_slice(data);
+    v
+}
+
+/// 解码下行 `Packet`,只取 `(assoc_id, data)`(跳过 ADDR)。越界/地址类型未知返回 None。
+pub fn decode_packet(buf: &[u8]) -> Option<(u16, &[u8])> {
+    // 固定前缀 10 字节:ver type assoc(2) pkt(2) ftot fid size(2)。
+    if buf.len() < 10 {
+        return None;
+    }
+    let assoc = u16::from_be_bytes([buf[2], buf[3]]);
+    let size = u16::from_be_bytes([buf[8], buf[9]]) as usize;
+    let addr_len = address_len(buf, 10)?;
+    let data_start = 10 + addr_len;
+    let data_end = data_start.checked_add(size)?;
+    if buf.len() < data_end {
+        return None;
+    }
+    Some((assoc, &buf[data_start..data_end]))
+}
+
+/// 编码 Heartbeat：`[0x05][0x04]`。
+pub fn encode_heartbeat() -> Vec<u8> {
+    vec![TUIC_VER, CMD_HEARTBEAT]
+}
+
+/// ADDR 段的字节长度(用于解码时跳过地址)。
+fn address_len(buf: &[u8], pos: usize) -> Option<usize> {
+    match *buf.get(pos)? {
+        ATYP_IPV4 => Some(1 + 4 + 2),
+        ATYP_IPV6 => Some(1 + 16 + 2),
+        ATYP_DOMAIN => {
+            let l = *buf.get(pos + 1)? as usize;
+            Some(1 + 1 + l + 2)
+        }
+        ATYP_NONE => Some(1),
+        _ => None,
+    }
 }
 
 /// 把任意可显示错误包成 ClientError（统一错误面）。
@@ -349,6 +406,47 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn packet_ipv4_layout() {
+        let p = encode_packet(7, &TargetAddr::IpPort("1.2.3.4:53".parse().unwrap()), b"hi");
+        assert_eq!(&p[..2], &[0x05, 0x02]); // ver + Packet
+        assert_eq!(&p[2..4], &[0x00, 0x07]); // assoc-id
+        assert_eq!(&p[4..6], &[0x00, 0x00]); // pkt-id
+        assert_eq!(p[6], 1); // frag total
+        assert_eq!(p[7], 0); // frag id
+        assert_eq!(&p[8..10], &[0x00, 0x02]); // size = 2
+        assert_eq!(&p[10..15], &[0x01, 1, 2, 3, 4]); // atyp ipv4 + ip
+        assert_eq!(&p[15..17], &[0x00, 0x35]); // port 53
+        assert_eq!(&p[17..], b"hi");
+    }
+
+    #[test]
+    fn packet_domain_roundtrips_assoc_and_data() {
+        let p = encode_packet(
+            9,
+            &TargetAddr::DomainPort {
+                host: "a.com".into(),
+                port: 443,
+            },
+            b"q",
+        );
+        let (assoc, data) = decode_packet(&p).unwrap();
+        assert_eq!(assoc, 9);
+        assert_eq!(data, b"q");
+    }
+
+    #[test]
+    fn packet_decode_rejects_truncated() {
+        assert!(decode_packet(&[0u8; 5]).is_none());
+        // size says 0, atyp domain len 200 overruns:
+        assert!(decode_packet(&[0x05, 0x02, 0, 7, 0, 0, 1, 0, 0, 0, 0x00, 200]).is_none());
+    }
+
+    #[test]
+    fn heartbeat_layout() {
+        assert_eq!(encode_heartbeat(), vec![0x05, 0x04]);
     }
 
     #[test]
