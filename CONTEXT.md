@@ -32,6 +32,10 @@ _Avoid_: udp session, udp connection (UDP is connectionless; "flow" signals ther
 A `u32` minted by the client, one per **UDP flow**, carried in both directions on the QUIC datagram so each side can demux a datagram back to its flow. It exists because the server's reply addresses the real Target IP, which the client cannot reverse-map to a fake-IP — the flow-id is the only reliable demux key.
 _Avoid_: session id, stream id (it identifies a UDP flow, not a QUIC stream or TCP session)
 
+**assoc-id**:
+The TUIC UDP association id (`u16`) carried in a TUIC `Packet`. In mini_vpn it is allocated **one per UDP flow** (4-tuple) — the same role as **flow-id**, just 16-bit and on the TUIC wire — so the reply (tagged with assoc-id) maps back to the app endpoint and fake-IP source. We deliberately do not use TUIC's full-cone "one association per local socket" model, because that would reintroduce the reply-demux problem flow-id solves.
+_Avoid_: session id (it identifies a UDP flow, not a QUIC stream or TCP session)
+
 ## Relationships
 
 - The client opens one **Upstream** connection and multiplexes many intercepted sessions over it (Yamux substreams).
