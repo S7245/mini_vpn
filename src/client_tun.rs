@@ -1,7 +1,7 @@
 use crate::device::VirtualTunDevice;
 use mini_vpn::quic::{client_endpoint, client_quic_config};
 use mini_vpn::shared::{ClientError, RelayRequest, TargetAddr, open_remote_session};
-use mini_vpn::tuic::{TuicClientConfig, TuicUpstream};
+use mini_vpn::tuic::{AssocTable, TuicClientConfig, TuicUpstream, decode_packet, encode_packet};
 use mini_vpn::upstream::{ProxyUpstream, RelayStream};
 use mini_vpn::udp_relay::{
     FlowTable, FourTuple, UDP_FLOW_IDLE_SECS, build_udp_ip_packet, decode_downlink, encode_uplink,
@@ -550,9 +550,25 @@ pub async fn start_tun_proxy() {
     } else {
         drop(udp_uplink_rx);
         _udp_downlink_keepalive = Some(udp_downlink_tx);
-        println!("ℹ️ tuic 模式:UDP relay 暂未支持(13b),本阶段仅 TCP 经 TUIC");
+        // tuic 模式的 UDP 走下面的 TUIC Packet 数据面（Stage 13b），不用 Stage 12 的 QUIC 泵。
     }
     let mut flow_table = FlowTable::new();
+
+    // ===== Stage 13b：tuic 模式 UDP over TUIC Packet（native datagram）。AssocTable 主循环独占；
+    // 下行接收端来自 TuicUpstream::start_udp()。legacy 模式用占位通道让 select 分支休眠（零回归）。=====
+    let mut assoc_table = AssocTable::new();
+    let (mut tuic_downlink_rx, _tuic_downlink_keepalive) = match &upstream {
+        Upstream::Tuic(u) => {
+            println!("🌊 UDP relay 数据面就绪（TUIC Packet datagram → sing-box）");
+            (u.start_udp(), None)
+        }
+        _ => {
+            // legacy：占位通道，保留 sender 让 receiver “开但无数据”，select 分支永久休眠。
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
+            (rx, Some(tx))
+        }
+    };
+
     let udp_clock = std::time::Instant::now();
     let mut udp_sweep = tokio::time::interval(std::time::Duration::from_secs(1));
 
@@ -635,8 +651,17 @@ pub async fn start_tun_proxy() {
                                     &udp_uplink_tx,
                                     udp_clock.elapsed().as_secs(),
                                 );
+                            } else if let Upstream::Tuic(u) = &upstream {
+                                // Stage 13b: tuic 模式 UDP → 编码 TUIC Packet → send_udp。
+                                handle_tuic_udp_uplink(
+                                    &pkt,
+                                    &mut assoc_table,
+                                    &fake_pool,
+                                    u,
+                                    udp_clock.elapsed().as_secs(),
+                                )
+                                .await;
                             }
-                            // tuic 模式:UDP relay 留待 13b,丢弃该包(已 take,不进 smoltcp)。
                         }
                     } else {
                         // 1) SYN inspector：在 iface.poll 之前看一眼包，若是去往新端口的干净 SYN，
@@ -698,9 +723,31 @@ pub async fn start_tun_proxy() {
                     }
                 }
             }
-            // Stage 12: 周期回收空闲 UDP flow。
+            // Stage 13b: TUIC 下行 datagram → decode_packet → AssocTable 解路由 → 造回程 IP/UDP 注入 TUN。
+            //   legacy 模式此通道无 sender 数据(占位),分支永久休眠(零回归)。
+            Some(dg) = tuic_downlink_rx.recv() => {
+                if let Some((assoc_id, payload)) = decode_packet(&dg) {
+                    // 先取出路由信息(Copy),释放 assoc_table 借用后再 touch。
+                    let routed = assoc_table
+                        .resolve(assoc_id)
+                        .map(|e| (e.target_src(), e.app_endpoint()));
+                    if let Some((src, dst)) = routed {
+                        let pkt = build_udp_ip_packet(src, dst, payload);
+                        device.inject_ip_packet(&pkt);
+                        assoc_table.touch(assoc_id, udp_clock.elapsed().as_secs());
+                        if let Err(e) = device.flush_tx().await {
+                            println!("UDP 下行 flush 失败: {e}");
+                        }
+                    } else {
+                        // assoc 已回收/未知 → 丢弃该回程(应用会重发/重查,自愈)。
+                        println!("🗑️ TUIC UDP↓ assoc={assoc_id} 无映射，丢弃 {}B", payload.len());
+                    }
+                }
+            }
+            // Stage 12/13b: 周期回收空闲 UDP flow / assoc(legacy 与 tuic 各扫各的,空表无开销)。
             _ = udp_sweep.tick() => {
                 flow_table.sweep(udp_clock.elapsed().as_secs(), UDP_FLOW_IDLE_SECS);
+                assoc_table.sweep(udp_clock.elapsed().as_secs(), UDP_FLOW_IDLE_SECS);
             }
             // 分支 2: 时钟滴答，处理超时重传等后台任务
             _ = timer.tick() =>{
@@ -1182,6 +1229,51 @@ fn handle_udp_uplink(
     if uplink_tx.try_send(dg).is_err() {
         println!("⚠️ UDP↑ flow={flow_id} 上行通道满，丢弃");
     }
+}
+
+/// 处理一个被拦截的 UDP 上行包(tuic 模式)：解析 → fake-IP 改写 target → 铸 assoc-id →
+/// 编码 TUIC Packet → `TuicUpstream::send_udp`。
+/// 中文要点：与 Stage 12 `handle_udp_uplink` 同形,仅把 flow-id/encode_uplink 换成 assoc-id/encode_packet,
+/// 并直接 send_udp(自带丢弃计数,UDP 语义)。fake 无映射 → 丢弃(短 TTL 自愈)。
+async fn handle_tuic_udp_uplink(
+    pkt: &[u8],
+    assoc_table: &mut AssocTable,
+    fake_pool: &FakeIpPool,
+    upstream: &Arc<TuicUpstream>,
+    now_secs: u64,
+) {
+    let Some(udp) = parse_inbound_udp(pkt) else {
+        return;
+    };
+    let dst_ep = smoltcp::wire::IpEndpoint::new(
+        IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_bytes(&udp.dst_ip.octets())),
+        udp.dst_port,
+    );
+    let target = match resolve_target(dst_ep, fake_pool) {
+        TargetResolve::Direct(t) => t,
+        TargetResolve::Refuse => {
+            println!("🚫 UDP fake-IP {} 无映射，丢弃（待应用重新解析）", udp.dst_ip);
+            return;
+        }
+    };
+    let tuple = FourTuple {
+        src_ip: udp.src_ip,
+        src_port: udp.src_port,
+        dst_ip: udp.dst_ip,
+        dst_port: udp.dst_port,
+    };
+    // 仅在「新 flow」时打日志（每流一次，不是每包），与 Stage 12 一致。
+    let is_new = !assoc_table.contains(&tuple);
+    let assoc_id = assoc_table.intern(tuple);
+    assoc_table.touch(assoc_id, now_secs);
+    if is_new {
+        println!(
+            "🌊 TUIC UDP↑ new assoc={assoc_id} → {} (first {}B)",
+            target.to_wire_string(),
+            udp.payload.len()
+        );
+    }
+    upstream.send_udp(encode_packet(assoc_id, &target, udp.payload)).await;
 }
 
 /// QUIC 泵 task（哑管道）：连 Upstream，上行 `send_datagram`、下行转发给主循环；

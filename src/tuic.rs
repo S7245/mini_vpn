@@ -294,6 +294,11 @@ impl AssocTable {
         self.id_to_entry.get(&assoc_id)
     }
 
+    /// 该 4 元组是否已在册（用于"每流一次"日志，避免热路径刷屏）。
+    pub fn contains(&self, tuple: &FourTuple) -> bool {
+        self.tuple_to_id.contains_key(tuple)
+    }
+
     pub fn touch(&mut self, assoc_id: u16, now: u64) {
         if let Some(e) = self.id_to_entry.get_mut(&assoc_id) {
             e.last_activity = now;
@@ -678,6 +683,15 @@ mod tests {
         let a = t.intern(tuple(1000));
         assert_eq!(a, t.intern(tuple(1000)));
         assert_ne!(a, t.intern(tuple(1001)));
+    }
+
+    #[test]
+    fn assoc_contains_tracks_membership() {
+        let mut t = AssocTable::new();
+        assert!(!t.contains(&tuple(1000)));
+        t.intern(tuple(1000));
+        assert!(t.contains(&tuple(1000)));
+        assert!(!t.contains(&tuple(1001)));
     }
 
     #[test]
