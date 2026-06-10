@@ -4,8 +4,12 @@
 //! 本文件先落「命令编码」纯函数(TDD 主战场),字节布局**严格按 TUIC v5 规范**,与 sing-box 字节级互通。
 //! 线格式参考见 docs/tech/2026-06-08-stage-13a-tuic-tcp-connect-plan.md。
 
+use crate::quic;
 use crate::shared::{ClientError, TargetAddr};
+use crate::upstream::{ProxyUpstream, RelayStream};
+use quinn::{Connection, Endpoint};
 use std::net::SocketAddr;
+use tokio::sync::Mutex;
 
 /// 默认 ALPN：TUIC over QUIC 常用 `h3`，必须与 sing-box `tls.alpn` 一致。
 const DEFAULT_TUIC_ALPN: &str = "h3";
@@ -160,6 +164,87 @@ pub fn encode_connect(target: &TargetAddr) -> Vec<u8> {
     v
 }
 
+/// 把任意可显示错误包成 ClientError（统一错误面）。
+fn io_err<E: std::fmt::Display>(ctx: &str, e: E) -> ClientError {
+    ClientError::from(std::io::Error::other(format!("{ctx}: {e}")))
+}
+
+/// TUIC 客户端上游：持有一条到 sing-box 的 QUIC 连接，每条 TCP 开一条 `Connect` 双向流。
+/// 中文要点：连接断了按需重连+重认证(13a 最小实现;迁移/0-RTT 调优在 13c)。
+pub struct TuicUpstream {
+    endpoint: Endpoint,
+    server: SocketAddr,
+    sni: String,
+    uuid: [u8; 16],
+    password: String,
+    conn: Mutex<Connection>,
+}
+
+impl TuicUpstream {
+    /// 建连 + 发 Authenticate（token 经 keying-material 导出，字节级对齐 sing-box）。
+    pub async fn connect(cfg: &TuicClientConfig) -> Result<Self, ClientError> {
+        let qcfg = quic::client_quic_config_alpn(&cfg.ca_path, vec![cfg.alpn.as_bytes().to_vec()])
+            .map_err(ClientError::InvalidTarget)?;
+        let endpoint = quic::client_endpoint(qcfg).map_err(ClientError::InvalidTarget)?;
+        let conn =
+            Self::handshake(&endpoint, cfg.server, &cfg.sni, &cfg.uuid, &cfg.password).await?;
+        Ok(Self {
+            endpoint,
+            server: cfg.server,
+            sni: cfg.sni.clone(),
+            uuid: cfg.uuid,
+            password: cfg.password.clone(),
+            conn: Mutex::new(conn),
+        })
+    }
+
+    async fn handshake(
+        endpoint: &Endpoint,
+        server: SocketAddr,
+        sni: &str,
+        uuid: &[u8; 16],
+        password: &str,
+    ) -> Result<Connection, ClientError> {
+        let conn = endpoint
+            .connect(server, sni)
+            .map_err(|e| io_err("tuic connect", e))?
+            .await
+            .map_err(|e| io_err("tuic handshake", e))?;
+        // TUIC token = export_keying_material(out=32, label=UUID(16), context=password)。
+        let mut token = [0u8; 32];
+        conn.export_keying_material(&mut token, uuid, password.as_bytes())
+            .map_err(|_| ClientError::InvalidTarget("tuic keying-material export failed".into()))?;
+        let mut uni = conn.open_uni().await.map_err(|e| io_err("tuic open_uni", e))?;
+        uni.write_all(&encode_authenticate(uuid, &token))
+            .await
+            .map_err(|e| io_err("tuic auth write", e))?;
+        uni.finish().await.map_err(|e| io_err("tuic auth finish", e))?;
+        Ok(conn)
+    }
+}
+
+#[async_trait::async_trait]
+impl ProxyUpstream for TuicUpstream {
+    async fn open_tcp(&self, target: &TargetAddr) -> Result<RelayStream, ClientError> {
+        // 取活连接，断了就地重连+重认证。
+        let conn = {
+            let mut guard = self.conn.lock().await;
+            if guard.close_reason().is_some() {
+                *guard =
+                    Self::handshake(&self.endpoint, self.server, &self.sni, &self.uuid, &self.password)
+                        .await?;
+            }
+            guard.clone()
+        };
+        let (mut send, recv) = conn.open_bi().await.map_err(|e| io_err("tuic open_bi", e))?;
+        send.write_all(&encode_connect(target))
+            .await
+            .map_err(|e| io_err("tuic connect write", e))?;
+        // 把双向流的收/发两半合成一条 AsyncRead+AsyncWrite，喂给现有双向泵。
+        Ok(Box::new(tokio::io::join(recv, send)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +348,15 @@ mod tests {
                 None
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn quic_config_builds_with_h3_alpn() {
+        // TUIC 上游的 TLS 配置(自定义 ALPN)能构建 —— connect 的真验证在互通 e2e(Task 6)。
+        assert!(
+            crate::quic::client_quic_config_alpn("certs/dev/ca-cert.pem", vec![b"h3".to_vec()])
+                .is_ok()
         );
     }
 

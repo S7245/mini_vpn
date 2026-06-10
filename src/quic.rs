@@ -56,8 +56,16 @@ pub fn server_quic_config(cert_path: &str, key_path: &str) -> Result<ServerConfi
     Ok(cfg)
 }
 
-/// 构建 QUIC 客户端 config（信任给定 CA + ALPN）。
+/// 构建 QUIC 客户端 config（信任给定 CA），ALPN 用本项目自有的 `mvpn`（Stage 12 数据面）。
 pub fn client_quic_config(ca_path: &str) -> Result<ClientConfig, String> {
+    client_quic_config_alpn(ca_path, vec![QUIC_ALPN.to_vec()])
+}
+
+/// 构建 QUIC 客户端 config，**ALPN 可指定**（TUIC 对接 sing-box 需用 `h3` 等，见 Stage 13a）。
+pub fn client_quic_config_alpn(
+    ca_path: &str,
+    alpn_protocols: Vec<Vec<u8>>,
+) -> Result<ClientConfig, String> {
     let mut roots = RootCertStore::empty();
     for cert in load_certs(ca_path)? {
         roots
@@ -68,7 +76,7 @@ pub fn client_quic_config(ca_path: &str) -> Result<ClientConfig, String> {
         .with_safe_defaults()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    crypto.alpn_protocols = vec![QUIC_ALPN.to_vec()];
+    crypto.alpn_protocols = alpn_protocols;
     let mut cfg = ClientConfig::new(Arc::new(crypto));
     cfg.transport_config(quic_transport_config());
     Ok(cfg)
