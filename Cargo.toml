@@ -25,6 +25,9 @@ yamux = "0.10"
 # 不引入第二个 rustls 版本（见 docs/adr/0003）。
 quinn = "0.10"
 
+# Stage 13a：ProxyUpstream trait 的 async fn 需要在 dyn 对象上分发（成熟惯用方案）。
+async-trait = "0.1"
+
 # 处理 TUN 网卡
 tun = { version = "0.6", features = ["async"] }
 # 用户态 TCP/IP 协议栈
