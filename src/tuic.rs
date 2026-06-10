@@ -6,8 +6,10 @@
 
 use crate::quic;
 use crate::shared::{ClientError, TargetAddr};
+use crate::udp_relay::{FlowEntry, FourTuple, MAX_UDP_FLOWS};
 use crate::upstream::{ProxyUpstream, RelayStream};
 use quinn::{Connection, Endpoint};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use tokio::sync::Mutex;
 
@@ -218,6 +220,103 @@ fn address_len(buf: &[u8], pos: usize) -> Option<usize> {
         }
         ATYP_NONE => Some(1),
         _ => None,
+    }
+}
+
+/// TUIC UDP 关联表:每条 UDP flow(4 元组)分配一个 **u16 assoc-id**(≈ Stage 12 flow-id),
+/// 双向 demux 用。主循环独占、无锁;`now` 注入便于单测。结构同 udp_relay::FlowTable,只是 id 宽 16 位。
+/// 中文要点:复用 FourTuple/FlowEntry,不动 Stage 12 的 FlowTable(系统稳定优先,接受少量重复)。
+#[derive(Debug)]
+pub struct AssocTable {
+    tuple_to_id: HashMap<FourTuple, u16>,
+    id_to_entry: HashMap<u16, FlowEntry>,
+    next_id: u16,
+    cap: usize,
+}
+
+impl Default for AssocTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AssocTable {
+    pub fn new() -> Self {
+        Self::with_cap(MAX_UDP_FLOWS)
+    }
+
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            tuple_to_id: HashMap::new(),
+            id_to_entry: HashMap::new(),
+            next_id: 1,
+            cap: cap.max(1).min(u16::MAX as usize),
+        }
+    }
+
+    /// 查/铸 assoc-id（已在册稳定返回;否则铸新,到顶 LRU 驱逐）。
+    pub fn intern(&mut self, tuple: FourTuple) -> u16 {
+        if let Some(&id) = self.tuple_to_id.get(&tuple) {
+            return id;
+        }
+        if self.id_to_entry.len() >= self.cap {
+            self.evict_lru();
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        if self.next_id == 0 {
+            self.next_id = 1; // 跳过 0,保持非零、单调
+        }
+        self.id_to_entry.insert(
+            id,
+            FlowEntry {
+                tuple,
+                last_activity: 0,
+            },
+        );
+        self.tuple_to_id.insert(tuple, id);
+        id
+    }
+
+    pub fn resolve(&self, assoc_id: u16) -> Option<&FlowEntry> {
+        self.id_to_entry.get(&assoc_id)
+    }
+
+    pub fn touch(&mut self, assoc_id: u16, now: u64) {
+        if let Some(e) = self.id_to_entry.get_mut(&assoc_id) {
+            e.last_activity = now;
+        }
+    }
+
+    pub fn sweep(&mut self, now: u64, idle_secs: u64) {
+        let expired: Vec<(u16, FourTuple)> = self
+            .id_to_entry
+            .iter()
+            .filter(|(_, e)| now.saturating_sub(e.last_activity) > idle_secs)
+            .map(|(id, e)| (*id, e.tuple))
+            .collect();
+        for (id, tuple) in expired {
+            self.id_to_entry.remove(&id);
+            self.tuple_to_id.remove(&tuple);
+        }
+    }
+
+    fn evict_lru(&mut self) {
+        let victim = self
+            .id_to_entry
+            .iter()
+            .min_by_key(|(id, e)| (e.last_activity, **id))
+            .map(|(id, _)| *id);
+        if let Some(id) = victim
+            && let Some(e) = self.id_to_entry.remove(&id)
+        {
+            self.tuple_to_id.remove(&e.tuple);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.id_to_entry.len()
     }
 }
 
@@ -447,6 +546,53 @@ mod tests {
     #[test]
     fn heartbeat_layout() {
         assert_eq!(encode_heartbeat(), vec![0x05, 0x04]);
+    }
+
+    fn tuple(p: u16) -> FourTuple {
+        FourTuple {
+            src_ip: std::net::Ipv4Addr::new(10, 0, 0, 1),
+            src_port: p,
+            dst_ip: std::net::Ipv4Addr::new(198, 18, 0, 5),
+            dst_port: 443,
+        }
+    }
+
+    #[test]
+    fn assoc_intern_stable_and_unique() {
+        let mut t = AssocTable::new();
+        let a = t.intern(tuple(1000));
+        assert_eq!(a, t.intern(tuple(1000)));
+        assert_ne!(a, t.intern(tuple(1001)));
+    }
+
+    #[test]
+    fn assoc_resolve_endpoints_and_sweep() {
+        let mut t = AssocTable::new();
+        let id = t.intern(tuple(1000));
+        let e = t.resolve(id).expect("entry");
+        assert_eq!(e.app_endpoint(), (std::net::Ipv4Addr::new(10, 0, 0, 1), 1000));
+        assert_eq!(e.target_src(), (std::net::Ipv4Addr::new(198, 18, 0, 5), 443));
+        t.sweep(61, 60);
+        assert!(t.resolve(id).is_none());
+    }
+
+    #[test]
+    fn assoc_touch_keeps_alive() {
+        let mut t = AssocTable::new();
+        let id = t.intern(tuple(1000));
+        t.touch(id, 50);
+        t.sweep(100, 60);
+        assert!(t.resolve(id).is_some());
+    }
+
+    #[test]
+    fn assoc_lru_evicts_at_cap() {
+        let mut t = AssocTable::with_cap(2);
+        let a = t.intern(tuple(1));
+        let _b = t.intern(tuple(2));
+        let _c = t.intern(tuple(3));
+        assert!(t.resolve(a).is_none());
+        assert_eq!(t.len(), 2);
     }
 
     #[test]
