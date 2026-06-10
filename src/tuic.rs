@@ -274,11 +274,7 @@ impl AssocTable {
         if self.id_to_entry.len() >= self.cap {
             self.evict_lru();
         }
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        if self.next_id == 0 {
-            self.next_id = 1; // 跳过 0,保持非零、单调
-        }
+        let id = self.alloc_id();
         self.id_to_entry.insert(
             id,
             FlowEntry {
@@ -288,6 +284,23 @@ impl AssocTable {
         );
         self.tuple_to_id.insert(tuple, id);
         id
+    }
+
+    /// 分配一个**空闲且非 0** 的 assoc-id（单调推进，跳过 0 与仍在册的 id）。
+    /// 中文要点：u16 空间仅 65535,回绕后 `next_id` 可能落到仍在册的 flow 上——不跳过就会
+    /// `insert` 覆盖活跃 flow(回程串到错误端点)并泄漏其 tuple_to_id 映射。活跃集(≤cap≤1024)
+    /// 远小于 id 空间,故必有空闲 id,扫描代价极小。调用前已 evict 保证 len<cap,循环必然终止。
+    fn alloc_id(&mut self) -> u16 {
+        loop {
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1);
+            if self.next_id == 0 {
+                self.next_id = 1; // 跳过 0,保持非零、单调
+            }
+            if !self.id_to_entry.contains_key(&id) {
+                return id;
+            }
+        }
     }
 
     pub fn resolve(&self, assoc_id: u16) -> Option<&FlowEntry> {
@@ -683,6 +696,21 @@ mod tests {
         let a = t.intern(tuple(1000));
         assert_eq!(a, t.intern(tuple(1000)));
         assert_ne!(a, t.intern(tuple(1001)));
+    }
+
+    #[test]
+    fn assoc_intern_skips_live_id_on_wraparound() {
+        // u16 回绕后 next_id 可能落到仍在册的 id 上：intern 必须跳过，绝不覆盖活跃 flow。
+        let mut t = AssocTable::with_cap(8);
+        let keep = t.intern(tuple(1)); // 一条长寿命 flow 占住 id=keep
+        t.next_id = keep; // 把分配游标强行推回 keep（模拟回绕撞上活跃 id）
+        let other = t.intern(tuple(2));
+        assert_ne!(other, keep, "intern 覆盖了仍在册的 flow");
+        assert!(t.resolve(keep).is_some(), "长寿命 flow 被覆盖丢失");
+        assert!(t.resolve(other).is_some());
+        // 两条 flow 各自映射独立，未发生 tuple_to_id 泄漏/串号。
+        assert_eq!(t.intern(tuple(1)), keep);
+        assert_eq!(t.intern(tuple(2)), other);
     }
 
     #[test]
