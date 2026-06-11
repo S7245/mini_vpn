@@ -59,8 +59,21 @@ server** (interop = best experience, zero server code from us). Stage 12's UDP-o
     real sing-box** (`dig @1.1.1.1 example.com/facebook.com` → real A records; `curl https://1.1.1.1`
     still HTTP/2 301 = TCP non-regression). See `docs/tech/13b-tuic-udp-packet.md`. Deferred: the
     quic-stream oversized fallback (native drops + counts datagrams over the QUIC datagram limit).
-  - **13c — connection migration + 0-RTT + heartbeat** (mobile roaming / weak net). NOTE: a fixed 3s
-    TUIC Heartbeat already ships in 13b; 13c makes keep-alive adaptive (battery vs NAT timeout).
+  - **13c — 0-RTT reconnect + keepalive clarification** — PARTIAL (2026-06-11). Scope narrowed (real
+    migration + battery-adaptive heartbeat moved to the mobile-readiness stage; they need iOS/Android
+    packet-flow backends to truly accept).
+    - DONE: **on-demand TUIC Heartbeat** — fires only while UDP is recently active (`last_udp_activity`
+      + `should_send_heartbeat`); pure-TCP sessions rely on the QUIC keep-alive PING. Two keepalive
+      layers clarified (QUIC PING = connection liveness; TUIC Heartbeat = UDP-session liveness).
+    - **0-RTT DEFERRED (ecosystem wall)**: quinn 0.10 / rustls 0.21 cannot `export_keying_material`
+      during the 0-RTT (handshake-incomplete) phase, and TUIC's auth token derives from it — so TUIC
+      0-RTT auth is **structurally impossible on this stack**. Verified vs sing-box (`zero_rtt_handshake`
+      on): auth fails → self-healing 1-RTT fallback, traffic flows. The 0-RTT code path + the
+      `MINI_VPN_TUIC_ZERO_RTT` switch are kept (default **OFF**, opt-in only).
+      - **Follow-up to actually get 0-RTT**: bump quinn/rustls to a version that exposes 0-RTT
+        keying-material (early-exporter) export — the version bump ADR-0004 foresaw. Best folded into
+        the **mobile-readiness stage** (weak-net / radio-sleep is where 0-RTT fast resume pays off),
+        alongside real connection migration + adaptive heartbeat. Re-validate against sing-box after the bump.
   - **13d — retire legacy** (yamux + Stage-12 self-server QUIC datagram + self server).
 
 #### Transport / protocol extensibility — two tiers
