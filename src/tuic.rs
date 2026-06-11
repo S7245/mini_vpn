@@ -36,7 +36,8 @@ pub struct TuicClientConfig {
     pub alpn: String,
     pub congestion_control: String,
     pub udp_relay_mode: String,
-    /// 重连是否尝试 QUIC 0-RTT（默认 true；失败自动回落 1-RTT。排障/规避 early-exporter 不齐时可关）。
+    /// 重连是否尝试 QUIC 0-RTT（**默认 false**：quinn 0.10 在 0-RTT 阶段不支持 `export_keying_material`，
+    /// TUIC auth 必失败、自愈回落 1-RTT；显式开仅供实验/未来 quinn 升级。失败时总能回落，不致命）。
     pub zero_rtt: bool,
 }
 
@@ -100,7 +101,9 @@ impl TuicClientConfig {
             alpn: alpn.unwrap_or(DEFAULT_TUIC_ALPN).to_string(),
             congestion_control: DEFAULT_TUIC_CC.to_string(),
             udp_relay_mode: DEFAULT_TUIC_UDP_MODE.to_string(),
-            zero_rtt: true,
+            // 默认关：quinn 0.10 在 0-RTT 阶段不支持 export_keying_material（TUIC auth 必失败回落）。
+            // 显式 `MINI_VPN_TUIC_ZERO_RTT=true` 可启用（实验/未来 quinn 升级）。
+            zero_rtt: false,
         })
     }
 
@@ -120,11 +123,14 @@ impl TuicClientConfig {
     }
 }
 
-/// 解析 `MINI_VPN_TUIC_ZERO_RTT`：默认开；显式 `false`/`0`/`off`/`no`（大小写无关）关。
+/// 解析 `MINI_VPN_TUIC_ZERO_RTT`：**默认关**；显式 `true`/`1`/`on`/`yes`（大小写无关）开。
+/// 中文要点：quinn 0.10 / rustls 0.21 在 0-RTT(握手未完成)阶段**不支持 `export_keying_material`**，
+/// 而 TUIC token 依赖它 → 0-RTT 认证必失败、自愈回落 1-RTT（实测 2026-06-11，见 13c 验收）。默认开纯属
+/// 每次重连白跑一次握手，故默认关；保留开关供未来 quinn 支持 0-RTT keying-material 后启用。
 fn parse_zero_rtt(s: Option<&str>) -> bool {
-    !matches!(
+    matches!(
         s.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-        Some("false") | Some("0") | Some("off") | Some("no")
+        Some("true") | Some("1") | Some("on") | Some("yes")
     )
 }
 
@@ -714,19 +720,20 @@ mod tests {
         assert_eq!(c.alpn, "h3"); // default
         assert_eq!(c.congestion_control, "bbr");
         assert_eq!(c.udp_relay_mode, "native");
-        assert!(c.zero_rtt, "0-RTT 默认开（重连尝试，失败自动回落 1-RTT）");
+        assert!(!c.zero_rtt, "0-RTT 默认关（quinn 0.10 在 0-RTT 不支持 keying-material 导出）");
     }
 
     #[test]
-    fn zero_rtt_defaults_on_and_parses_off() {
-        assert!(parse_zero_rtt(None)); // 默认开
+    fn zero_rtt_defaults_off_and_parses_on() {
+        assert!(!parse_zero_rtt(None)); // 默认关（quinn 0.10 限制）
         assert!(parse_zero_rtt(Some("true")));
         assert!(parse_zero_rtt(Some("1")));
-        // 显式关（排障/规避 early-exporter 不齐时回到可靠 1-RTT）。
+        assert!(parse_zero_rtt(Some("on")));
+        assert!(parse_zero_rtt(Some("YES")));
+        // 其它一律关。
         assert!(!parse_zero_rtt(Some("false")));
         assert!(!parse_zero_rtt(Some("0")));
-        assert!(!parse_zero_rtt(Some("off")));
-        assert!(!parse_zero_rtt(Some("FALSE")));
+        assert!(!parse_zero_rtt(Some("maybe")));
     }
 
     #[test]
