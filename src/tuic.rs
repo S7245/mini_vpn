@@ -126,6 +126,10 @@ const ATYP_NONE: u8 = 0xff;
 
 /// TUIC Heartbeat 周期：连接空闲时维持 NAT 映射/路径活性。取 3s，给 sing-box 的空闲超时留足余量。
 const TUIC_HEARTBEAT_SECS: u64 = 3;
+/// TUIC Heartbeat 活跃窗口：距上次 UDP 上行多久(秒)内仍算「UDP 活跃」、需要发心跳。
+/// 中文要点：Heartbeat 是**应用层 UDP 会话保活**(让 sing-box 不回收关联)；纯 TCP 会话由 QUIC keep-alive
+/// 保活、不需要它。取 60s 与 UDP flow 空闲回收(`UDP_FLOW_IDLE_SECS`)对齐：UDP 静默到该回收时，心跳也停。
+const TUIC_HB_IDLE_WINDOW_SECS: u64 = 60;
 /// 下行 datagram channel 容量。背压由 pump 承担（`send().await`），不丢下行（DNS 响应不能丢）。
 const TUIC_DOWNLINK_CAPACITY: usize = 1024;
 /// UDP 驱动重连退避上限（确定性指数退避，无需 rand；UDP 自愈，重连节奏不敏感）。
@@ -366,6 +370,10 @@ pub struct TuicUpstream {
     conn: Mutex<Connection>,
     /// 上行 UDP datagram 丢弃计数（TooLarge / 连接不可用）。可观测性，不影响 UDP 语义。
     udp_drops: AtomicU64,
+    /// 上次 UDP 上行的秒数（`clock` 起点，0=从未）。`send_udp` 写、心跳读，决定是否按需保活。
+    last_udp_activity: AtomicU64,
+    /// 单调时钟：`send_udp`(写活跃时刻)与驱动任务(读 now)**同源**，避免双时钟漂移。
+    clock: std::time::Instant,
 }
 
 impl TuicUpstream {
@@ -384,6 +392,8 @@ impl TuicUpstream {
             password: cfg.password.clone(),
             conn: Mutex::new(conn),
             udp_drops: AtomicU64::new(0),
+            last_udp_activity: AtomicU64::new(0),
+            clock: std::time::Instant::now(),
         })
     }
 
@@ -433,6 +443,9 @@ impl TuicUpstream {
     /// 中文要点：TooLarge / 连接不可用 → 丢弃并计数（UDP 语义，绝不阻塞调用方除重连外）。
     /// native 模式不分片，超 QUIC datagram 上限的包直接丢（quic-stream 兜底留待后续）。
     pub async fn send_udp(&self, datagram: Vec<u8>) {
+        // 记录 UDP 活跃时刻：驱动任务据此「仅活跃时发」Heartbeat（纯 TCP 不发，省流量/电量）。
+        self.last_udp_activity
+            .store(self.clock.elapsed().as_secs(), Ordering::Relaxed);
         let conn = match self.live_conn().await {
             Ok(c) => c,
             Err(e) => {
@@ -498,7 +511,12 @@ impl TuicUpstream {
                             }
                         }
                         _ = hb.tick() => {
-                            if conn.send_datagram(encode_heartbeat().into()).is_err() {
+                            // 仅在「最近有 UDP 上行」时发心跳；纯 TCP 会话由 QUIC keep-alive 保活，不发。
+                            let now = me.clock.elapsed().as_secs();
+                            let last = me.last_udp_activity.load(Ordering::Relaxed);
+                            if should_send_heartbeat(last, now, TUIC_HB_IDLE_WINDOW_SECS)
+                                && conn.send_datagram(encode_heartbeat().into()).is_err()
+                            {
                                 break; // 连接断 → 外层 live_conn 重连
                             }
                         }
@@ -511,6 +529,13 @@ impl TuicUpstream {
         });
         downlink_rx
     }
+}
+
+/// 是否该发 TUIC Heartbeat：仅当**最近有 UDP 上行活动**(距上次 ≤ 活跃窗口)。
+/// `last_activity=0` 表示从未发过 UDP → 不发(纯 TCP 会话靠 QUIC keep-alive 保活)。
+/// 中文要点：纯函数,`now`/`last` 同源单调秒数,便于单测;边界 `now-last==window` 取发(`<=`)。
+fn should_send_heartbeat(last_activity: u64, now: u64, idle_window: u64) -> bool {
+    last_activity != 0 && now.saturating_sub(last_activity) <= idle_window
 }
 
 /// UDP 驱动重连退避：确定性指数退避（`base * 2^attempt`，封顶 `CAP`）。
@@ -679,6 +704,19 @@ mod tests {
     #[test]
     fn heartbeat_layout() {
         assert_eq!(encode_heartbeat(), vec![0x05, 0x04]);
+    }
+
+    #[test]
+    fn heartbeat_only_while_udp_active() {
+        let w = 60;
+        // 从未发过 UDP(last=0)→ 不发,纯 TCP 会话靠 QUIC keepalive 保活。
+        assert!(!should_send_heartbeat(0, 100, w));
+        // 活跃窗口内(含同刻与边界 ==window)→ 发。
+        assert!(should_send_heartbeat(100, 100, w));
+        assert!(should_send_heartbeat(100, 130, w));
+        assert!(should_send_heartbeat(100, 160, w)); // 边界 now-last==window
+        // 超出活跃窗口 → 停发(此时也无活跃 flow 需要保活)。
+        assert!(!should_send_heartbeat(100, 161, w));
     }
 
     fn tuple(p: u16) -> FourTuple {
