@@ -10,15 +10,6 @@ pub enum ClientError {
     #[error("invalid target address: {0}")]
     InvalidTarget(String),
 
-    #[error("unsupported SOCKS address type: {0}")]
-    UnsupportedAddressType(u8),
-
-    #[error("invalid relay request: {0}")]
-    InvalidRelayRequest(String),
-
-    #[error("yamux open stream failed: {0}")]
-    YamuxOpen(#[source] yamux::ConnectionError),
-
     #[error("invalid utf-8 payload: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
 }

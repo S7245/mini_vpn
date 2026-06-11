@@ -5,24 +5,15 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-chacha20poly1305 = "0.10"
-rand = "0.8"
-tokio-util = { version = "0.7", features = ["codec","compat"] }
 bytes = "1.0"
-futures = "0.3"
 thiserror = "1.0"
 
-# 阶段七：真 TLS 流量伪装 (TLS Masquerading) 🎭。
-tokio-rustls = "0.24"
+# TLS 信任材料 / 证书加载（quinn 数据面用）。Stage 13d 退役 legacy 后不再需要
+# tokio-rustls（裸 TLS 流）/ yamux（多路复用）/ rand / tokio-util / futures / chacha。
 rustls = "0.21"
 rustls-pemfile = "1.0" # 用于读取证书文件
 
-# 连接多路复用 (Multiplexing) ⚡
-yamux = "0.10"
-# tokio-util = { version = "0.7", features = ["compat"] }
-
-# Stage 12：QUIC datagram 数据面（UDP relay）。0.10 依赖 rustls ^0.21，与现有 TLS 栈共享，
-# 不引入第二个 rustls 版本（见 docs/adr/0003）。
+# Stage 12+：QUIC 数据面（TUIC over quinn）。0.10 依赖 rustls ^0.21，单一 rustls 版本（见 docs/adr/0003）。
 quinn = "0.10"
 
 # Stage 13a：ProxyUpstream trait 的 async fn 需要在 dyn 对象上分发（成熟惯用方案）。
