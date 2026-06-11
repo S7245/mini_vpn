@@ -456,8 +456,11 @@ impl TuicUpstream {
             Ok(pair) => pair,
             Err(_connecting) => return None,
         };
-        // early-exporter 认证：若与 sing-box 不齐则失败 → None 回落（不卡死）。
-        Self::authenticate(&conn, uuid, password).await.ok()?;
+        // early-exporter 认证：若与 sing-box 不齐则失败 → 记一行(便于 e2e 诊断)并 None 回落（不卡死）。
+        if let Err(e) = Self::authenticate(&conn, uuid, password).await {
+            println!("⚠️ TUIC 0-RTT 认证失败(可能 early-exporter 与 sing-box 不齐)，回落 1-RTT: {e:?}");
+            return None;
+        }
         Some(conn)
     }
 

@@ -57,25 +57,38 @@ pub fn server_quic_config(cert_path: &str, key_path: &str) -> Result<ServerConfi
 }
 
 /// 构建 QUIC 客户端 config（信任给定 CA），ALPN 用本项目自有的 `mvpn`（Stage 12 数据面）。
+/// 中文要点：legacy 数据面(`run_quic_pump` 不调 `into_0rtt`)**不需要也不开** 0-RTT——
+/// `enable_0rtt=false` 严格保持 Stage-12 原行为（零回归），不把 0-RTT 能力泄漏到 legacy。
 pub fn client_quic_config(ca_path: &str) -> Result<ClientConfig, String> {
-    client_quic_config_alpn(ca_path, vec![QUIC_ALPN.to_vec()])
+    let crypto = client_crypto(ca_path, vec![QUIC_ALPN.to_vec()], false)?;
+    Ok(finish_client_config(crypto))
 }
 
 /// 构建 QUIC 客户端 config，**ALPN 可指定**（TUIC 对接 sing-box 需用 `h3` 等，见 Stage 13a）。
+/// 中文要点：TUIC(Stage 13)路径开 0-RTT early data（重连快速恢复，见 Stage 13c）。
 pub fn client_quic_config_alpn(
     ca_path: &str,
     alpn_protocols: Vec<Vec<u8>>,
 ) -> Result<ClientConfig, String> {
-    let crypto = client_crypto(ca_path, alpn_protocols)?;
-    let mut cfg = ClientConfig::new(Arc::new(crypto));
-    cfg.transport_config(quic_transport_config());
-    Ok(cfg)
+    let crypto = client_crypto(ca_path, alpn_protocols, true)?;
+    Ok(finish_client_config(crypto))
 }
 
-/// 构建客户端 rustls 配置（信任 CA + ALPN + **0-RTT early data**）。
-/// 中文要点：抽出为可测纯逻辑。`enable_early_data` 默认 false，TUIC 0-RTT(Stage 13c)必须显式开；
+/// 把 rustls 客户端配置包成 quinn `ClientConfig` 并装上共享传输参数。
+fn finish_client_config(crypto: rustls::ClientConfig) -> ClientConfig {
+    let mut cfg = ClientConfig::new(Arc::new(crypto));
+    cfg.transport_config(quic_transport_config());
+    cfg
+}
+
+/// 构建客户端 rustls 配置（信任 CA + ALPN + 可选 **0-RTT early data**）。
+/// 中文要点：抽出为可测纯逻辑。`enable_early_data` 默认 false，仅 TUIC 0-RTT(Stage 13c)按需开；
 /// rustls 默认已带内存 session cache(resumption)，重连即可复用 ticket 尝试 0-RTT，失败自动回落 1-RTT。
-fn client_crypto(ca_path: &str, alpn_protocols: Vec<Vec<u8>>) -> Result<rustls::ClientConfig, String> {
+fn client_crypto(
+    ca_path: &str,
+    alpn_protocols: Vec<Vec<u8>>,
+    enable_0rtt: bool,
+) -> Result<rustls::ClientConfig, String> {
     let mut roots = RootCertStore::empty();
     for cert in load_certs(ca_path)? {
         roots
@@ -87,7 +100,7 @@ fn client_crypto(ca_path: &str, alpn_protocols: Vec<Vec<u8>>) -> Result<rustls::
         .with_root_certificates(roots)
         .with_no_client_auth();
     crypto.alpn_protocols = alpn_protocols;
-    crypto.enable_early_data = true;
+    crypto.enable_early_data = enable_0rtt;
     Ok(crypto)
 }
 
@@ -142,11 +155,13 @@ mod tests {
     }
 
     #[test]
-    fn client_crypto_enables_0rtt_early_data() {
-        // 0-RTT(Stage 13c)要求客户端显式开 early data(rustls 默认 false)。
-        let c = client_crypto("certs/dev/ca-cert.pem", vec![b"h3".to_vec()]).unwrap();
-        assert!(c.enable_early_data, "client 必须启用 0-RTT early data");
-        assert_eq!(c.alpn_protocols, vec![b"h3".to_vec()]);
+    fn client_crypto_toggles_0rtt_early_data() {
+        // TUIC(Stage 13c)显式开 early data;legacy 路径关(回到 Stage-12 原行为,零回归)。
+        let on = client_crypto("certs/dev/ca-cert.pem", vec![b"h3".to_vec()], true).unwrap();
+        assert!(on.enable_early_data, "TUIC 必须启用 0-RTT early data");
+        assert_eq!(on.alpn_protocols, vec![b"h3".to_vec()]);
+        let off = client_crypto("certs/dev/ca-cert.pem", vec![QUIC_ALPN.to_vec()], false).unwrap();
+        assert!(!off.enable_early_data, "legacy 不应开 0-RTT early data");
     }
 
     #[test]
