@@ -1,30 +1,17 @@
 use crate::device::VirtualTunDevice;
-use mini_vpn::quic::{client_endpoint, client_quic_config};
-use mini_vpn::shared::{ClientError, RelayRequest, TargetAddr, open_remote_session};
+use mini_vpn::shared::{ClientError, TargetAddr};
 use mini_vpn::tuic::{AssocTable, TuicClientConfig, TuicUpstream, decode_packet, encode_packet};
 use mini_vpn::upstream::{ProxyUpstream, RelayStream};
-use mini_vpn::udp_relay::{
-    FlowTable, FourTuple, UDP_FLOW_IDLE_SECS, build_udp_ip_packet, decode_downlink, encode_uplink,
-    parse_inbound_udp,
-};
+use mini_vpn::udp_relay::{FourTuple, UDP_FLOW_IDLE_SECS, build_udp_ip_packet, parse_inbound_udp};
 use crate::dns::{self, Answer};
 use crate::fake_ip::FakeIpPool;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer};
 use smoltcp::socket::udp;
 use smoltcp::wire::{IpAddress, IpCidr, IpListenEndpoint};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio_util::compat::TokioAsyncReadCompatExt;
-use yamux::{Config as YamuxConfig, Connection, Mode};
-use tokio_rustls::TlsConnector;
-use tokio_rustls::rustls::ServerName;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use std::fs::File;
-use std::io::BufReader;
 use std::sync::Arc;
-use tokio_rustls::rustls::Certificate;
 
 use std::collections::HashMap;
 use tokio::sync::mpsc;
@@ -33,9 +20,6 @@ const TCP_SOCKET_BUFFER_SIZE: usize = 65_535;
 const RELAY_CHANNEL_CAPACITY: usize = 1024;
 // 中文要点：Stage 9 起按"每端口"配 pool，64 端口 * 2 槽 * 2 缓冲 ≈ 16MB。
 const DEFAULT_TUN_POOL_SIZE: usize = 2;
-const DEFAULT_TUN_SERVER_ADDR: &str = "127.0.0.1:8081";
-const DEFAULT_TUN_TLS_SNI: &str = "localhost";
-const DEFAULT_TUN_CA_PATH: &str = "cert.pem";
 
 /// One listener socket's binding parameters.
 /// 中文要点：Stage 9 起 pool_size 已上移到 `ListenerRegistry`，这里只剩端口。
@@ -114,25 +98,8 @@ fn flush_downlink(tcp_socket: &mut TcpSocket, ctx: &mut SocketCtx) {
 /// 中文要点：防止 SYN flood 下 socket / 缓冲区无限增长，到顶就拒新端口。
 const MAX_INTERCEPTED_PORTS: usize = 64;
 
-/// Reconnect backoff bounds (full-jitter exponential).
-/// 中文要点：base/cap 设为编译期常量，本阶段不开 env；cap 限单连接最长重试间隔。
-const RECONNECT_BASE_MS: u64 = 500;
-const RECONNECT_CAP_MS: u64 = 30_000;
-
 /// fake-IP DNS resolver 地址：去往它的 :53 UDP 走本地 fake-IP 应答，不进 UDP relay。
 const FAKE_DNS_RESOLVER: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
-/// QUIC datagram 上行通道容量；满了丢弃（UDP 语义，不阻塞主循环）。
-const UDP_UPLINK_CHANNEL_CAPACITY: usize = 1024;
-
-/// Full-jitter exponential backoff delay: `random(0, min(CAP, BASE * 2^attempt))`.
-/// 中文要点：下界取 0 是 full jitter，最大程度摊平 5000+ 客户端的重连惊群。
-/// `rand_unit ∈ [0,1)` 由调用方注入（运行时 `rand::random`，测试传固定值）。
-fn backoff_delay(attempt: u32, rand_unit: f64) -> std::time::Duration {
-    let exp = RECONNECT_BASE_MS.saturating_mul(1u64.checked_shl(attempt).unwrap_or(u64::MAX));
-    let upper = exp.min(RECONNECT_CAP_MS);
-    let ms = (upper as f64 * rand_unit) as u64;
-    std::time::Duration::from_millis(ms)
-}
 
 /// Failure mode for `ListenerRegistry::ensure_port`.
 /// 中文要点：到顶时优雅拒绝，不能 panic，已注册端口的 socket 不受影响。
@@ -232,107 +199,25 @@ impl TunListenerConfig {
     }
 }
 
-/// Upstream TLS/Yamux connection configuration for the TUN runtime.
-/// 中文要点：这一层只描述“连谁”和“用什么 SNI”，不参与本地监听池逻辑。
-#[derive(Debug, Clone)]
-struct TunUpstreamConfig {
-    /// TCP address of the upstream proxy server.
-    /// 中文要点：TUN 客户端实际要连的上游服务地址。
-    server_addr: String,
-    /// TLS SNI value used during the upstream handshake.
-    /// 中文要点：TLS 握手时发送给服务端的 Server Name。
-    tls_sni: String,
-}
-
-impl TunUpstreamConfig {
-    /// Build upstream config from optional string sources.
-    /// 中文要点：外联配置在启动时完成校验，避免把坏值带到 TLS 热路径。
-    fn from_sources(
-        server_addr: Option<&str>,
-        tls_sni: Option<&str>,
-    ) -> Result<Self, ClientError> {
-        let server_addr = server_addr.unwrap_or(DEFAULT_TUN_SERVER_ADDR).to_string();
-        let tls_sni = tls_sni.unwrap_or(DEFAULT_TUN_TLS_SNI).to_string();
-
-        server_addr.parse::<std::net::SocketAddr>().map_err(|_| {
-            ClientError::InvalidTarget(format!("invalid upstream server addr: {server_addr}"))
-        })?;
-
-        ServerName::try_from(tls_sni.as_str()).map_err(|_| {
-            ClientError::InvalidTarget(format!("invalid upstream tls sni: {tls_sni}"))
-        })?;
-
-        Ok(Self {
-            server_addr,
-            tls_sni,
-        })
-    }
-}
-
-/// TLS trust material configuration for the TUN client.
-/// 中文要点：这一层只负责“信任哪份 CA 证书”，不参与监听池和上游地址解析。
-#[derive(Debug, Clone)]
-struct TunTlsConfig {
-    /// PEM CA certificate path loaded into the rustls root store.
-    /// 中文要点：客户端用它校验服务端证书链。
-    ca_path: String,
-}
-
-impl TunTlsConfig {
-    /// Build TLS trust config from optional string sources.
-    /// 中文要点：当前最小配置面只开放 CA 路径，空字符串直接视为非法输入。
-    fn from_sources(ca_path: Option<&str>) -> Result<Self, ClientError> {
-        let ca_path = ca_path.unwrap_or(DEFAULT_TUN_CA_PATH).to_string();
-
-        if ca_path.trim().is_empty() {
-            return Err(ClientError::InvalidTarget(
-                "invalid tun ca path: empty".to_string(),
-            ));
-        }
-
-        Ok(Self { ca_path })
-    }
-}
-
 /// Startup configuration for the TUN runtime.
-/// 中文要点：总配置壳负责把 listener、upstream、tls 三类配置组合起来。
+/// 中文要点：Stage 13d 退役 legacy 上游后，运行时只剩本地监听池配置；
+/// TUIC 出口配置走 `MINI_VPN_TUIC_*`（见 tuic.rs），不在这里。
 #[derive(Debug, Clone)]
 struct TunRuntimeConfig {
     listener: TunListenerConfig,
-    upstream: TunUpstreamConfig,
-    tls: TunTlsConfig,
 }
 
 impl TunRuntimeConfig {
     /// Build config from optional string sources.
-    /// 中文要点：测试和环境变量入口共享同一套组合逻辑，避免行为漂移。
-    fn from_sources(
-        pool_size: Option<&str>,
-        server_addr: Option<&str>,
-        tls_sni: Option<&str>,
-        ca_path: Option<&str>,
-    ) -> Result<Self, ClientError> {
+    fn from_sources(pool_size: Option<&str>) -> Result<Self, ClientError> {
         Ok(Self {
             listener: TunListenerConfig::from_sources(pool_size)?,
-            upstream: TunUpstreamConfig::from_sources(server_addr, tls_sni)?,
-            tls: TunTlsConfig::from_sources(ca_path)?,
         })
     }
 
-    /// Read config from process environment.
-    /// 中文要点：Stage 9 起 `MINI_VPN_TUN_LOCAL_PORT` 已删除，端口由 SYN inspector 动态注册。
+    /// Read config from process environment（`MINI_VPN_TUN_POOL_SIZE`）。
     fn from_env() -> Result<Self, ClientError> {
-        let pool_size = std::env::var("MINI_VPN_TUN_POOL_SIZE").ok();
-        let server_addr = std::env::var("MINI_VPN_TUN_SERVER_ADDR").ok();
-        let tls_sni = std::env::var("MINI_VPN_TUN_TLS_SNI").ok();
-        let ca_path = std::env::var("MINI_VPN_TUN_CA_PATH").ok();
-
-        Self::from_sources(
-            pool_size.as_deref(),
-            server_addr.as_deref(),
-            tls_sni.as_deref(),
-            ca_path.as_deref(),
-        )
+        Self::from_sources(std::env::var("MINI_VPN_TUN_POOL_SIZE").ok().as_deref())
     }
 }
 
@@ -345,38 +230,13 @@ pub async fn start_tun_proxy() {
         }
     };
     let pool_size = runtime_config.listener.pool_size;
-    let upstream_server_addr = runtime_config.upstream.server_addr.clone();
-    let upstream_tls_sni = runtime_config.upstream.tls_sni.clone();
-    let tls_ca_path = runtime_config.tls.ca_path.clone();
 
-    let mut root_cert_store = RootCertStore::empty();
-    let cert_file = match File::open(tls_ca_path.as_str()) {
-        Ok(file) => file,
-        Err(e) => {
-            println!("打开客户端 CA 证书失败 {}: {e}", tls_ca_path);
-            return;
-        }
-    };
-    let cert_file = &mut BufReader::new(cert_file);
-    let certs = rustls_pemfile::certs(cert_file).unwrap();
-    for cert in certs {
-        root_cert_store.add(&Certificate(cert)).unwrap();
-    }
-    let config = ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(root_cert_store)
-        .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(config));
-
-    // 全局回信通道：接收端 global_rx 留在主循环，发送端 global_tx 会被克隆给每个后台车厢
+    // 全局回信通道（TCP relay 通用回程）：接收端 global_rx 留在主循环，发送端 global_tx 克隆给每个后台车厢。
     let (global_tx, mut global_rx) =
         tokio::sync::mpsc::channel::<(SocketHandle, Vec<u8>)>(RELAY_CHANNEL_CAPACITY);
     // =========== 1. 初始化底层网卡和通道 ===========
 
-    println!(
-        "🚀 TUN runtime started with pool_size={}, server_addr={}, tls_sni={}, ca_path={}",
-        pool_size, upstream_server_addr, upstream_tls_sni, tls_ca_path
-    );
+    println!("🚀 TUN runtime started with pool_size={pool_size}");
 
     // 1. 初始化 TUN 设备(化底层网卡和通道) / 创建操作系统的原生异步虚拟网卡
     let raw_tun = match create_tun_device().await {
@@ -447,178 +307,38 @@ pub async fn start_tun_proxy() {
     // 3. 初始化定时器 (例如每 5 毫秒触发一次)
     let mut timer = tokio::time::interval(std::time::Duration::from_millis(5));
 
-    let domain = match ServerName::try_from(upstream_tls_sni.as_str()) {
-        Ok(domain) => domain,
+    // ===== Stage 13d：仅 TUIC 上游（legacy yamux / 自研 server 已退役，见 ADR-0004）。 =====
+    let cfg = match TuicClientConfig::from_env() {
+        Ok(c) => c,
         Err(e) => {
-            println!("解析 SNI 域名失败: {e:?}");
+            println!("加载 TUIC 客户端配置失败（启动中止）: {e}");
+            return;
+        }
+    };
+    let upstream = match TuicUpstream::connect(&cfg).await {
+        Ok(u) => {
+            println!("✅ 已连接 TUIC 出口 {} (sing-box)", cfg.server);
+            Arc::new(u)
+        }
+        Err(e) => {
+            println!("连接 TUIC 出口失败（启动中止）: {e:?}");
             return;
         }
     };
 
-    // 上游连接 + 断开信号通道。epoch 记录连接代际（每成功一次 +1）。
-    let (disconnect_tx, mut disconnect_rx) = mpsc::channel::<()>(1);
-    let mut epoch: u64 = 0;
-
-    // Stage 13a 双轨:按 MINI_VPN_UPSTREAM 选 legacy(yamux→自研 server)或 tuic(TUIC→sing-box)。
-    let upstream_mode =
-        match parse_upstream_mode(std::env::var("MINI_VPN_UPSTREAM").ok().as_deref()) {
-            Ok(m) => m,
-            Err(e) => {
-                println!("{e}");
-                return;
-            }
-        };
-    let mut upstream = match upstream_mode {
-        UpstreamMode::Legacy => match connect_upstream(
-            &connector,
-            &upstream_server_addr,
-            domain.clone(),
-            disconnect_tx.clone(),
-        )
-        .await
-        {
-            Ok(c) => {
-                epoch += 1;
-                println!("✅ 成功连接到洛杉矶代理服务器！(epoch={epoch})");
-                Upstream::Legacy(c)
-            }
-            Err(e) => {
-                println!("首次连接代理服务端失败: {e:?}");
-                return;
-            }
-        },
-        UpstreamMode::Tuic => {
-            let cfg = match TuicClientConfig::from_env() {
-                Ok(c) => c,
-                Err(e) => {
-                    println!("加载 TUIC 客户端配置失败（启动中止）: {e}");
-                    return;
-                }
-            };
-            match TuicUpstream::connect(&cfg).await {
-                Ok(u) => {
-                    println!("✅ 已连接 TUIC 出口 {} (sing-box)", cfg.server);
-                    Upstream::Tuic(Arc::new(u))
-                }
-                Err(e) => {
-                    println!("连接 TUIC 出口失败（启动中止）: {e:?}");
-                    return;
-                }
-            }
-        }
-    };
-    let udp_enabled = matches!(upstream, Upstream::Legacy(_));
-
-    // ===== Stage 12：QUIC datagram 数据面（UDP relay）。仅 legacy 模式启用(到自研 server);
-    // tuic 模式下 UDP relay 留待 13b,本阶段只过 TCP。channels 始终创建以便 select! 结构统一。 =====
-    let (udp_uplink_tx, udp_uplink_rx) = mpsc::channel::<Vec<u8>>(UDP_UPLINK_CHANNEL_CAPACITY);
-    let (udp_downlink_tx, mut udp_downlink_rx) =
-        mpsc::channel::<Vec<u8>>(UDP_UPLINK_CHANNEL_CAPACITY);
-    // 非 legacy 模式下保留一个 sender,让 udp_downlink_rx "开但无数据"(分支休眠),避免 closed-channel 空轮询。
-    let _udp_downlink_keepalive: Option<mpsc::Sender<Vec<u8>>>;
-    if udp_enabled {
-        let quic_server_addr: SocketAddr = match upstream_server_addr.parse() {
-            Ok(addr) => addr,
-            Err(e) => {
-                println!("QUIC 上游地址非法 {upstream_server_addr}: {e}");
-                return;
-            }
-        };
-        let quic_cfg = match client_quic_config(&tls_ca_path) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                println!("加载 QUIC 客户端配置失败（启动中止）: {e}");
-                return;
-            }
-        };
-        let quic_endpoint = match client_endpoint(quic_cfg) {
-            Ok(ep) => ep,
-            Err(e) => {
-                println!("QUIC 客户端 endpoint 失败（启动中止）: {e}");
-                return;
-            }
-        };
-        tokio::spawn(run_quic_pump(
-            quic_endpoint,
-            quic_server_addr,
-            upstream_tls_sni.clone(),
-            udp_uplink_rx,
-            udp_downlink_tx,
-        ));
-        _udp_downlink_keepalive = None;
-        println!("🌊 UDP relay 数据面就绪（QUIC datagram → {quic_server_addr}）");
-    } else {
-        drop(udp_uplink_rx);
-        _udp_downlink_keepalive = Some(udp_downlink_tx);
-        // tuic 模式的 UDP 走下面的 TUIC Packet 数据面（Stage 13b），不用 Stage 12 的 QUIC 泵。
-    }
-    let mut flow_table = FlowTable::new();
-
-    // ===== Stage 13b：tuic 模式 UDP over TUIC Packet（native datagram）。AssocTable 主循环独占；
-    // 下行接收端来自 TuicUpstream::start_udp()。legacy 模式用占位通道让 select 分支休眠（零回归）。=====
+    // ===== Stage 13b：UDP over TUIC Packet（native datagram）。AssocTable 主循环独占；
+    // 下行接收端来自 TuicUpstream::start_udp()（断线自愈，见 13b/13c）。 =====
     let mut assoc_table = AssocTable::new();
-    let (mut tuic_downlink_rx, _tuic_downlink_keepalive) = match &upstream {
-        Upstream::Tuic(u) => {
-            println!("🌊 UDP relay 数据面就绪（TUIC Packet datagram → sing-box）");
-            (u.start_udp(), None)
-        }
-        _ => {
-            // legacy：占位通道，保留 sender 让 receiver “开但无数据”，select 分支永久休眠。
-            let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
-            (rx, Some(tx))
-        }
-    };
+    println!("🌊 UDP relay 数据面就绪（TUIC Packet datagram → sing-box）");
+    let mut tuic_downlink_rx = upstream.start_udp();
 
     let udp_clock = std::time::Instant::now();
     let mut udp_sweep = tokio::time::interval(std::time::Duration::from_secs(1));
 
     loop {
         tokio::select! {
-            // 分支 0:(legacy)上游断开 → 复位在途连接 + full-jitter 退避重连。
-            //   tuic 模式不发 disconnect(TuicUpstream 在 open_tcp 处自重连),此分支休眠。
-            _ = disconnect_rx.recv() => {
-                if let Upstream::Legacy(ctr) = &mut upstream {
-                    println!("🔌 上游连接断开，准备重连");
-                    let handles: Vec<SocketHandle> = registry.all_handles().collect();
-                    let mut reset = 0usize;
-                    for h in handles {
-                        if let Some(c) = socket_ctxs.get_mut(&h)
-                            && c.uplink_tx.is_some()
-                        {
-                            let sock = sockets.get_mut::<TcpSocket>(h);
-                            rearm_socket(sock, c);
-                            reset += 1;
-                        }
-                    }
-                    println!("♻️ 重连后复位 {reset} 条在途连接");
-                    let mut attempt = 0u32;
-                    loop {
-                        let delay = backoff_delay(attempt, rand::random::<f64>());
-                        println!("⏳ 第 {} 次重连，等待 {}ms", attempt + 1, delay.as_millis());
-                        tokio::time::sleep(delay).await;
-                        match connect_upstream(
-                            &connector,
-                            &upstream_server_addr,
-                            domain.clone(),
-                            disconnect_tx.clone(),
-                        )
-                        .await
-                        {
-                            Ok(new_ctr) => {
-                                *ctr = new_ctr;
-                                epoch += 1;
-                                println!("✅ 上游重连成功 (epoch={epoch})");
-                                break;
-                            }
-                            Err(e) => {
-                                println!("重连失败: {e:?}");
-                                attempt = attempt.saturating_add(1);
-                            }
-                        }
-                    }
-                }
-            }
-            // 🌟 新增分支：监听洛杉矶回传的信件
+            // TCP relay 回程：后台车厢把远端回传字节送回主循环 → 注入对应 smoltcp socket。
+            //   TUIC 自重连（live_conn），不需要 legacy 的 disconnect/复位分支。
             Some((handle, payload)) = global_rx.recv() =>{
                 println!("📬 从大邮筒收到 {} 字节数据，准备送往房间 {:?}", payload.len(), handle);
                 if let Err(e) = handle_remote_payload(
@@ -643,25 +363,15 @@ pub async fn start_tun_proxy() {
                     let class = device.rx_buffer.as_deref().map(classify_inbound);
                     if class == Some(Inbound::UdpRelay) {
                         if let Some(pkt) = device.rx_buffer.take() {
-                            if udp_enabled {
-                                handle_udp_uplink(
-                                    &pkt,
-                                    &mut flow_table,
-                                    &fake_pool,
-                                    &udp_uplink_tx,
-                                    udp_clock.elapsed().as_secs(),
-                                );
-                            } else if let Upstream::Tuic(u) = &upstream {
-                                // Stage 13b: tuic 模式 UDP → 编码 TUIC Packet → send_udp。
-                                handle_tuic_udp_uplink(
-                                    &pkt,
-                                    &mut assoc_table,
-                                    &fake_pool,
-                                    u,
-                                    udp_clock.elapsed().as_secs(),
-                                )
-                                .await;
-                            }
+                            // Stage 13b: UDP → 编码 TUIC Packet → send_udp。
+                            handle_tuic_udp_uplink(
+                                &pkt,
+                                &mut assoc_table,
+                                &fake_pool,
+                                &upstream,
+                                udp_clock.elapsed().as_secs(),
+                            )
+                            .await;
                         }
                     } else {
                         // 1) SYN inspector：在 iface.poll 之前看一眼包，若是去往新端口的干净 SYN，
@@ -703,28 +413,7 @@ pub async fn start_tun_proxy() {
                     }
                 }
             }
-            // Stage 12: QUIC 下行 datagram → 按 flow-id 造回程 IP/UDP 包注入 TUN。
-            Some(dg) = udp_downlink_rx.recv() => {
-                if let Some((flow_id, payload)) = decode_downlink(&dg) {
-                    // 先取出路由信息（Copy），释放 flow_table 借用后再 touch。
-                    let routed = flow_table
-                        .resolve(flow_id)
-                        .map(|e| (e.target_src(), e.app_endpoint()));
-                    if let Some((src, dst)) = routed {
-                        let pkt = build_udp_ip_packet(src, dst, payload);
-                        device.inject_ip_packet(&pkt);
-                        flow_table.touch(flow_id, udp_clock.elapsed().as_secs());
-                        if let Err(e) = device.flush_tx().await {
-                            println!("UDP 下行 flush 失败: {e}");
-                        }
-                    } else {
-                        // flow 已回收/未知 → 丢弃该回程（应用会重发/重查，自愈）。
-                        println!("🗑️ UDP↓ flow={flow_id} 无映射，丢弃 {}B", payload.len());
-                    }
-                }
-            }
             // Stage 13b: TUIC 下行 datagram → decode_packet → AssocTable 解路由 → 造回程 IP/UDP 注入 TUN。
-            //   legacy 模式此通道无 sender 数据(占位),分支永久休眠(零回归)。
             Some(dg) = tuic_downlink_rx.recv() => {
                 if let Some((assoc_id, payload)) = decode_packet(&dg) {
                     // 先取出路由信息(Copy),释放 assoc_table 借用后再 touch。
@@ -744,9 +433,8 @@ pub async fn start_tun_proxy() {
                     }
                 }
             }
-            // Stage 12/13b: 周期回收空闲 UDP flow / assoc(legacy 与 tuic 各扫各的,空表无开销)。
+            // Stage 13b: 周期回收空闲 UDP assoc。
             _ = udp_sweep.tick() => {
-                flow_table.sweep(udp_clock.elapsed().as_secs(), UDP_FLOW_IDLE_SECS);
                 assoc_table.sweep(udp_clock.elapsed().as_secs(), UDP_FLOW_IDLE_SECS);
             }
             // 分支 2: 时钟滴答，处理超时重传等后台任务
@@ -785,65 +473,6 @@ fn build_listener_socket(spec: &ListenerSpec) -> TcpSocket<'static> {
     let mut tcp_socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
     tcp_socket.listen(spec.local_port).unwrap();
     tcp_socket
-}
-
-/// 选择的上游传输（Stage 13a 双轨）。
-/// 中文要点：legacy = 现有 TLS+yamux 到自研 server；tuic = TUIC 到 sing-box。两者都给 Target 开一条
-/// 中继流(RelayStream),喂给同一套双向泵。legacy 仍走原内联逻辑,只是结果被统一成 RelayStream(零回归)。
-enum Upstream {
-    Legacy(yamux::Control),
-    Tuic(Arc<TuicUpstream>),
-}
-
-impl Upstream {
-    async fn open_tcp(&self, target: TargetAddr) -> Result<RelayStream, ClientError> {
-        match self {
-            Upstream::Legacy(ctr) => {
-                let mut c = ctr.clone();
-                let stream = open_remote_session(&mut c, &RelayRequest::Tcp { target }).await?;
-                Ok(Box::new(stream))
-            }
-            Upstream::Tuic(u) => u.open_tcp(&target).await,
-        }
-    }
-}
-
-/// 上游模式开关（`MINI_VPN_UPSTREAM`）。
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum UpstreamMode {
-    Legacy,
-    Tuic,
-}
-
-fn parse_upstream_mode(s: Option<&str>) -> Result<UpstreamMode, ClientError> {
-    match s.unwrap_or("legacy") {
-        "legacy" => Ok(UpstreamMode::Legacy),
-        "tuic" => Ok(UpstreamMode::Tuic),
-        other => Err(ClientError::InvalidTarget(format!(
-            "invalid MINI_VPN_UPSTREAM: {other}"
-        ))),
-    }
-}
-
-/// Establish one upstream TLS + Yamux connection and spawn its background poll task.
-/// 中文要点：把"建 TCP→TLS→Yamux"收敛成一处，返回可替换的 Control；后台 poll task
-/// 退出（即连接断开）时通过 disconnect_tx 给主循环发信号，驱动重连。
-async fn connect_upstream(
-    connector: &TlsConnector,
-    server_addr: &str,
-    domain: ServerName,
-    disconnect_tx: mpsc::Sender<()>,
-) -> Result<yamux::Control, ClientError> {
-    let server_stream = TcpStream::connect(server_addr).await?;
-    let tls_stream = connector.clone().connect(domain, server_stream).await?;
-    let mut yamux_conn = Connection::new(tls_stream.compat(), YamuxConfig::default(), Mode::Client);
-    let ctr = yamux_conn.control();
-    tokio::spawn(async move {
-        while let Ok(Some(_)) = yamux_conn.next_stream().await {}
-        // 连接断开：通知主循环（receiver 可能已关闭，忽略错误）。
-        let _ = disconnect_tx.send(()).await;
-    });
-    Ok(ctr)
 }
 
 /// Identify a clean inbound TCP SYN and return its destination port.
@@ -968,7 +597,7 @@ async fn process_listener_activity(
     handle: SocketHandle,
     sockets: &mut SocketSet<'_>,
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
-    upstream: &Upstream,
+    upstream: &TuicUpstream,
     global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
     fake_pool: &FakeIpPool,
 ) -> Result<(), ClientError> {
@@ -1019,7 +648,7 @@ async fn handle_local_payload(
     payload: Vec<u8>,
     target: Option<TargetAddr>,
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
-    upstream: &Upstream,
+    upstream: &TuicUpstream,
     global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
 ) -> Result<(), ClientError> {
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
@@ -1049,7 +678,7 @@ async fn handle_local_payload(
         target.to_wire_string()
     );
     println!("🔄 handle {:?} entering {:?}", handle, ctx.state);
-    let stream = upstream.open_tcp(target).await?;
+    let stream = upstream.open_tcp(&target).await?;
     println!("🚪 handle {:?} remote session opened", handle);
 
     let (tx, rx) = tokio::sync::mpsc::channel(RELAY_CHANNEL_CAPACITY);
@@ -1184,57 +813,9 @@ fn classify_inbound(pkt: &[u8]) -> Inbound {
     }
 }
 
-/// 处理一个被拦截的 UDP 上行包：解析 → fake-IP 改写 target → 铸 flow-id → 编码 → 投递给 QUIC 泵。
-/// 中文要点：fake 无映射 → 丢弃（UDP 无 socket 可复位，短 TTL 自愈）；通道满 → 丢弃（UDP 语义）。
-fn handle_udp_uplink(
-    pkt: &[u8],
-    flow_table: &mut FlowTable,
-    fake_pool: &FakeIpPool,
-    uplink_tx: &mpsc::Sender<Vec<u8>>,
-    now_secs: u64,
-) {
-    let Some(udp) = parse_inbound_udp(pkt) else {
-        return;
-    };
-    let dst_ep = smoltcp::wire::IpEndpoint::new(
-        IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_bytes(&udp.dst_ip.octets())),
-        udp.dst_port,
-    );
-    let target = match resolve_target(dst_ep, fake_pool) {
-        TargetResolve::Direct(t) => t,
-        TargetResolve::Refuse => {
-            println!("🚫 UDP fake-IP {} 无映射，丢弃（待应用重新解析）", udp.dst_ip);
-            return;
-        }
-    };
-    let tuple = FourTuple {
-        src_ip: udp.src_ip,
-        src_port: udp.src_port,
-        dst_ip: udp.dst_ip,
-        dst_port: udp.dst_port,
-    };
-    // 仅在「新 flow」时打日志（每流一次，不是每包）——既有可观测性，又不在大并发热路径刷屏。
-    let is_new = !flow_table.contains(&tuple);
-    let flow_id = flow_table.intern(tuple);
-    flow_table.touch(flow_id, now_secs);
-    let payload_len = udp.payload.len();
-    if is_new {
-        println!(
-            "🌊 UDP↑ new flow={flow_id} → {} (first {payload_len}B)",
-            target.to_wire_string()
-        );
-    }
-    let dg = encode_uplink(flow_id, &target, udp.payload);
-    // 满了就丢（UDP 语义，绝不阻塞主循环）。
-    if uplink_tx.try_send(dg).is_err() {
-        println!("⚠️ UDP↑ flow={flow_id} 上行通道满，丢弃");
-    }
-}
-
-/// 处理一个被拦截的 UDP 上行包(tuic 模式)：解析 → fake-IP 改写 target → 铸 assoc-id →
+/// 处理一个被拦截的 UDP 上行包：解析 → fake-IP 改写 target → 铸 assoc-id →
 /// 编码 TUIC Packet → `TuicUpstream::send_udp`。
-/// 中文要点：与 Stage 12 `handle_udp_uplink` 同形,仅把 flow-id/encode_uplink 换成 assoc-id/encode_packet,
-/// 并直接 send_udp(自带丢弃计数,UDP 语义)。fake 无映射 → 丢弃(短 TTL 自愈)。
+/// 中文要点：fake 无映射 → 丢弃(短 TTL 自愈)；send_udp 自带丢弃计数(UDP 语义)。
 async fn handle_tuic_udp_uplink(
     pkt: &[u8],
     assoc_table: &mut AssocTable,
@@ -1274,73 +855,6 @@ async fn handle_tuic_udp_uplink(
         );
     }
     upstream.send_udp(encode_packet(assoc_id, &target, udp.payload)).await;
-}
-
-/// QUIC 泵 task（哑管道）：连 Upstream，上行 `send_datagram`、下行转发给主循环；
-/// 断线用 full-jitter 退避自重连。中文要点：UDP 流无需复位，重连后下个 datagram 自愈。
-async fn run_quic_pump(
-    endpoint: quinn::Endpoint,
-    server_addr: SocketAddr,
-    server_name: String,
-    mut uplink_rx: mpsc::Receiver<Vec<u8>>,
-    downlink_tx: mpsc::Sender<Vec<u8>>,
-) {
-    let mut attempt = 0u32;
-    loop {
-        let conn = match endpoint.connect(server_addr, &server_name) {
-            Ok(connecting) => match connecting.await {
-                Ok(c) => {
-                    attempt = 0;
-                    println!("✅ QUIC 数据面已连接 {server_addr}");
-                    c
-                }
-                Err(e) => {
-                    println!("QUIC 连接握手失败: {e:?}");
-                    sleep_backoff(&mut attempt).await;
-                    continue;
-                }
-            },
-            Err(e) => {
-                println!("QUIC connect 失败: {e:?}");
-                sleep_backoff(&mut attempt).await;
-                continue;
-            }
-        };
-
-        loop {
-            tokio::select! {
-                msg = uplink_rx.recv() => {
-                    let Some(dg) = msg else { return; }; // 主循环已退出
-                    match conn.send_datagram(dg.into()) {
-                        Ok(()) => {}
-                        Err(quinn::SendDatagramError::TooLarge) => {
-                            println!("⚠️ UDP datagram 超过 QUIC 上限，丢弃");
-                        }
-                        Err(_) => break, // 连接断 → 重连
-                    }
-                }
-                dg = conn.read_datagram() => {
-                    match dg {
-                        Ok(bytes) => {
-                            if downlink_tx.send(bytes.to_vec()).await.is_err() {
-                                return; // 主循环已退出
-                            }
-                        }
-                        Err(_) => break, // 连接断 → 重连
-                    }
-                }
-            }
-        }
-        println!("🔌 QUIC 数据面断开，准备重连");
-        sleep_backoff(&mut attempt).await;
-    }
-}
-
-/// full-jitter 退避一拍并递增 attempt（复用 TCP 重连的 `backoff_delay`）。
-async fn sleep_backoff(attempt: &mut u32) {
-    let delay = backoff_delay(*attempt, rand::random::<f64>());
-    tokio::time::sleep(delay).await;
-    *attempt = attempt.saturating_add(1);
 }
 
 pub async fn create_tun_device() -> tun::Result<tun::AsyncDevice> {
@@ -1414,26 +928,6 @@ mod tests {
     }
 
     #[test]
-    fn backoff_delay_full_jitter_lower_bound_is_zero() {
-        assert_eq!(backoff_delay(0, 0.0), std::time::Duration::ZERO);
-        assert_eq!(backoff_delay(10, 0.0), std::time::Duration::ZERO);
-    }
-
-    #[test]
-    fn backoff_delay_attempt_zero_upper_is_base() {
-        let d = backoff_delay(0, 1.0_f64.next_down());
-        assert!(d < std::time::Duration::from_millis(RECONNECT_BASE_MS));
-        assert!(d >= std::time::Duration::from_millis(RECONNECT_BASE_MS * 99 / 100));
-    }
-
-    #[test]
-    fn backoff_delay_is_capped() {
-        let d = backoff_delay(30, 1.0_f64.next_down());
-        assert!(d <= std::time::Duration::from_millis(RECONNECT_CAP_MS));
-        assert!(d >= std::time::Duration::from_millis(RECONNECT_CAP_MS * 99 / 100));
-    }
-
-    #[test]
     fn registry_ensure_port_is_idempotent_and_capped() {
         let mut sockets = SocketSet::new(vec![]);
         let mut ctxs: HashMap<SocketHandle, SocketCtx> = HashMap::new();
@@ -1477,82 +971,21 @@ mod tests {
 
     #[test]
     fn tun_runtime_config_defaults_match_stage9_behavior() {
-        let config = TunRuntimeConfig::from_sources(None, None, None, None)
-            .expect("config should load");
-
+        let config = TunRuntimeConfig::from_sources(None).expect("config should load");
         // Stage 9 drops local_port; pool_size default lowered to 2 (per-port now).
         assert_eq!(config.listener.pool_size, 2);
     }
 
     #[test]
     fn tun_runtime_config_rejects_zero_pool_size() {
-        let err = TunRuntimeConfig::from_sources(Some("0"), None, None, None)
-            .expect_err("zero pool size should fail");
+        let err = TunRuntimeConfig::from_sources(Some("0")).expect_err("zero pool size should fail");
         assert!(err.to_string().contains("at least 1"));
     }
 
     #[test]
     fn tun_runtime_config_accepts_pool_size_override() {
-        let config = TunRuntimeConfig::from_sources(Some("3"), None, None, None)
-            .expect("valid config should load");
-
+        let config = TunRuntimeConfig::from_sources(Some("3")).expect("valid config should load");
         assert_eq!(config.listener.pool_size, 3);
-    }
-
-    #[test]
-    fn tun_runtime_config_defaults_include_upstream_values() {
-        let config = TunRuntimeConfig::from_sources(None, None, None, None)
-            .expect("config should load");
-
-        assert_eq!(config.listener.pool_size, 2);
-        assert_eq!(config.upstream.server_addr, "127.0.0.1:8081");
-        assert_eq!(config.upstream.tls_sni, "localhost");
-        assert_eq!(config.tls.ca_path, "cert.pem");
-    }
-
-    #[test]
-    fn tun_runtime_config_accepts_listener_and_upstream_overrides() {
-        let config = TunRuntimeConfig::from_sources(
-            Some("4"),
-            Some("127.0.0.1:9000"),
-            Some("example.com"),
-            Some("certs/dev/ca-cert.pem"),
-        )
-        .expect("config should load");
-
-        assert_eq!(config.listener.pool_size, 4);
-        assert_eq!(config.upstream.server_addr, "127.0.0.1:9000");
-        assert_eq!(config.upstream.tls_sni, "example.com");
-        assert_eq!(config.tls.ca_path, "certs/dev/ca-cert.pem");
-    }
-
-    #[test]
-    fn tun_runtime_config_rejects_invalid_upstream_server_addr() {
-        let err = TunRuntimeConfig::from_sources(None, Some("bad-addr"), None, None)
-            .expect_err("invalid upstream server addr should fail");
-        assert!(err
-            .to_string()
-            .contains("invalid upstream server addr"));
-    }
-
-    #[test]
-    fn tun_runtime_config_rejects_invalid_upstream_tls_sni() {
-        let err = TunRuntimeConfig::from_sources(None, None, Some("bad sni"), None)
-            .expect_err("invalid upstream tls sni should fail");
-        assert!(err.to_string().contains("invalid upstream tls sni"));
-    }
-
-    #[test]
-    fn tun_tls_config_defaults_match_existing_behavior() {
-        let config = TunTlsConfig::from_sources(None).expect("config should load");
-        assert_eq!(config.ca_path, "cert.pem");
-    }
-
-    #[test]
-    fn tun_tls_config_accepts_override_path() {
-        let config = TunTlsConfig::from_sources(Some("certs/dev/ca-cert.pem"))
-            .expect("config should load");
-        assert_eq!(config.ca_path, "certs/dev/ca-cert.pem");
     }
 
     fn udp_pkt(dst: [u8; 4], dst_port: u16) -> Vec<u8> {
@@ -1577,16 +1010,5 @@ mod tests {
         let pkt = build_ipv4_tcp([10, 0, 0, 1], [1, 1, 1, 1], 60000, 443, true, false);
         assert_eq!(classify_inbound(&pkt), Inbound::Other);
         assert_eq!(classify_inbound(&[0u8; 4]), Inbound::Other);
-    }
-
-    #[test]
-    fn upstream_mode_parses_with_legacy_default() {
-        assert_eq!(parse_upstream_mode(None).unwrap(), UpstreamMode::Legacy);
-        assert_eq!(
-            parse_upstream_mode(Some("legacy")).unwrap(),
-            UpstreamMode::Legacy
-        );
-        assert_eq!(parse_upstream_mode(Some("tuic")).unwrap(), UpstreamMode::Tuic);
-        assert!(parse_upstream_mode(Some("wireguard")).is_err());
     }
 }
