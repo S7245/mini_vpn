@@ -36,6 +36,8 @@ pub struct TuicClientConfig {
     pub alpn: String,
     pub congestion_control: String,
     pub udp_relay_mode: String,
+    /// 重连是否尝试 QUIC 0-RTT（默认 true；失败自动回落 1-RTT。排障/规避 early-exporter 不齐时可关）。
+    pub zero_rtt: bool,
 }
 
 impl std::fmt::Debug for TuicClientConfig {
@@ -49,6 +51,7 @@ impl std::fmt::Debug for TuicClientConfig {
             .field("alpn", &self.alpn)
             .field("congestion_control", &self.congestion_control)
             .field("udp_relay_mode", &self.udp_relay_mode)
+            .field("zero_rtt", &self.zero_rtt)
             .finish()
     }
 }
@@ -97,21 +100,32 @@ impl TuicClientConfig {
             alpn: alpn.unwrap_or(DEFAULT_TUIC_ALPN).to_string(),
             congestion_control: DEFAULT_TUIC_CC.to_string(),
             udp_relay_mode: DEFAULT_TUIC_UDP_MODE.to_string(),
+            zero_rtt: true,
         })
     }
 
     /// 从进程环境读取（`MINI_VPN_TUIC_*`）。
     pub fn from_env() -> Result<Self, ClientError> {
         let g = |k: &str| std::env::var(k).ok();
-        Self::from_sources(
+        let mut cfg = Self::from_sources(
             g("MINI_VPN_TUIC_SERVER").as_deref(),
             g("MINI_VPN_TUIC_UUID").as_deref(),
             g("MINI_VPN_TUIC_PASSWORD").as_deref(),
             g("MINI_VPN_TUIC_SNI").as_deref(),
             g("MINI_VPN_TUIC_CA_PATH").as_deref(),
             g("MINI_VPN_TUIC_ALPN").as_deref(),
-        )
+        )?;
+        cfg.zero_rtt = parse_zero_rtt(g("MINI_VPN_TUIC_ZERO_RTT").as_deref());
+        Ok(cfg)
     }
+}
+
+/// 解析 `MINI_VPN_TUIC_ZERO_RTT`：默认开；显式 `false`/`0`/`off`/`no`（大小写无关）关。
+fn parse_zero_rtt(s: Option<&str>) -> bool {
+    !matches!(
+        s.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("false") | Some("0") | Some("off") | Some("no")
+    )
 }
 
 /// TUIC 协议版本字节。
@@ -374,6 +388,8 @@ pub struct TuicUpstream {
     last_udp_activity: AtomicU64,
     /// 单调时钟：`send_udp`(写活跃时刻)与驱动任务(读 now)**同源**，避免双时钟漂移。
     clock: std::time::Instant,
+    /// 重连是否尝试 0-RTT（来自 config；失败自愈回落 1-RTT）。
+    zero_rtt: bool,
 }
 
 impl TuicUpstream {
@@ -382,8 +398,15 @@ impl TuicUpstream {
         let qcfg = quic::client_quic_config_alpn(&cfg.ca_path, vec![cfg.alpn.as_bytes().to_vec()])
             .map_err(ClientError::InvalidTarget)?;
         let endpoint = quic::client_endpoint(qcfg).map_err(ClientError::InvalidTarget)?;
-        let conn =
-            Self::handshake(&endpoint, cfg.server, &cfg.sni, &cfg.uuid, &cfg.password).await?;
+        let conn = Self::handshake(
+            &endpoint,
+            cfg.server,
+            &cfg.sni,
+            &cfg.uuid,
+            &cfg.password,
+            cfg.zero_rtt,
+        )
+        .await?;
         Ok(Self {
             endpoint,
             server: cfg.server,
@@ -394,10 +417,52 @@ impl TuicUpstream {
             udp_drops: AtomicU64::new(0),
             last_udp_activity: AtomicU64::new(0),
             clock: std::time::Instant::now(),
+            zero_rtt: cfg.zero_rtt,
         })
     }
 
+    /// 建连 + 认证。`zero_rtt` 时先试 0-RTT（early data）；任何原因失败（无 ticket / 服务端不支持 /
+    /// early-exporter 认证不齐）都**自愈回落 1-RTT**，绝不卡死重连循环。
+    /// 中文要点：首连必无 ticket → `into_0rtt` 必失败 → 走 1-RTT（与 13a 行为一致，零回归）。
     async fn handshake(
+        endpoint: &Endpoint,
+        server: SocketAddr,
+        sni: &str,
+        uuid: &[u8; 16],
+        password: &str,
+        zero_rtt: bool,
+    ) -> Result<Connection, ClientError> {
+        if zero_rtt
+            && let Some(conn) = Self::try_0rtt(endpoint, server, sni, uuid, password).await
+        {
+            println!("⚡ TUIC 0-RTT 重连成功（early data）");
+            return Ok(conn);
+        }
+        // 关了 0-RTT，或 0-RTT 不可用（无 ticket/不支持/认证不齐）→ 回落 1-RTT。
+        Self::handshake_1rtt(endpoint, server, sni, uuid, password).await
+    }
+
+    /// 尝试 0-RTT 握手 + early-data 认证；不可用返回 None（交由调用方回落 1-RTT）。
+    async fn try_0rtt(
+        endpoint: &Endpoint,
+        server: SocketAddr,
+        sni: &str,
+        uuid: &[u8; 16],
+        password: &str,
+    ) -> Option<Connection> {
+        let connecting = endpoint.connect(server, sni).ok()?;
+        // into_0rtt 的 Err 返回原 Connecting（非 Error 类型），无 ticket/不支持时走这里。
+        let (conn, _accepted) = match connecting.into_0rtt() {
+            Ok(pair) => pair,
+            Err(_connecting) => return None,
+        };
+        // early-exporter 认证：若与 sing-box 不齐则失败 → None 回落（不卡死）。
+        Self::authenticate(&conn, uuid, password).await.ok()?;
+        Some(conn)
+    }
+
+    /// 普通 1-RTT 握手 + 认证（13a 行为）。
+    async fn handshake_1rtt(
         endpoint: &Endpoint,
         server: SocketAddr,
         sni: &str,
@@ -409,7 +474,17 @@ impl TuicUpstream {
             .map_err(|e| io_err("tuic connect", e))?
             .await
             .map_err(|e| io_err("tuic handshake", e))?;
-        // TUIC token = export_keying_material(out=32, label=UUID(16), context=password)。
+        Self::authenticate(&conn, uuid, password).await?;
+        Ok(conn)
+    }
+
+    /// 在已建立(0-RTT 或 1-RTT)的连接上发 TUIC Authenticate（单向流）。
+    /// token = export_keying_material(out=32, label=UUID(16), context=password) —— 字节级对齐 sing-box。
+    async fn authenticate(
+        conn: &Connection,
+        uuid: &[u8; 16],
+        password: &str,
+    ) -> Result<(), ClientError> {
         let mut token = [0u8; 32];
         conn.export_keying_material(&mut token, uuid, password.as_bytes())
             .map_err(|_| ClientError::InvalidTarget("tuic keying-material export failed".into()))?;
@@ -418,7 +493,7 @@ impl TuicUpstream {
             .await
             .map_err(|e| io_err("tuic auth write", e))?;
         uni.finish().await.map_err(|e| io_err("tuic auth finish", e))?;
-        Ok(conn)
+        Ok(())
     }
 
     /// 取当前活连接的克隆；若已关闭则就地重连+重认证（13a 逻辑，TCP/UDP 共用）。
@@ -433,6 +508,7 @@ impl TuicUpstream {
                 &self.sni,
                 &self.uuid,
                 &self.password,
+                self.zero_rtt,
             )
             .await?;
         }
@@ -635,6 +711,19 @@ mod tests {
         assert_eq!(c.alpn, "h3"); // default
         assert_eq!(c.congestion_control, "bbr");
         assert_eq!(c.udp_relay_mode, "native");
+        assert!(c.zero_rtt, "0-RTT 默认开（重连尝试，失败自动回落 1-RTT）");
+    }
+
+    #[test]
+    fn zero_rtt_defaults_on_and_parses_off() {
+        assert!(parse_zero_rtt(None)); // 默认开
+        assert!(parse_zero_rtt(Some("true")));
+        assert!(parse_zero_rtt(Some("1")));
+        // 显式关（排障/规避 early-exporter 不齐时回到可靠 1-RTT）。
+        assert!(!parse_zero_rtt(Some("false")));
+        assert!(!parse_zero_rtt(Some("0")));
+        assert!(!parse_zero_rtt(Some("off")));
+        assert!(!parse_zero_rtt(Some("FALSE")));
     }
 
     #[test]
