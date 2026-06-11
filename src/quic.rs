@@ -66,6 +66,16 @@ pub fn client_quic_config_alpn(
     ca_path: &str,
     alpn_protocols: Vec<Vec<u8>>,
 ) -> Result<ClientConfig, String> {
+    let crypto = client_crypto(ca_path, alpn_protocols)?;
+    let mut cfg = ClientConfig::new(Arc::new(crypto));
+    cfg.transport_config(quic_transport_config());
+    Ok(cfg)
+}
+
+/// 构建客户端 rustls 配置（信任 CA + ALPN + **0-RTT early data**）。
+/// 中文要点：抽出为可测纯逻辑。`enable_early_data` 默认 false，TUIC 0-RTT(Stage 13c)必须显式开；
+/// rustls 默认已带内存 session cache(resumption)，重连即可复用 ticket 尝试 0-RTT，失败自动回落 1-RTT。
+fn client_crypto(ca_path: &str, alpn_protocols: Vec<Vec<u8>>) -> Result<rustls::ClientConfig, String> {
     let mut roots = RootCertStore::empty();
     for cert in load_certs(ca_path)? {
         roots
@@ -77,9 +87,8 @@ pub fn client_quic_config_alpn(
         .with_root_certificates(roots)
         .with_no_client_auth();
     crypto.alpn_protocols = alpn_protocols;
-    let mut cfg = ClientConfig::new(Arc::new(crypto));
-    cfg.transport_config(quic_transport_config());
-    Ok(cfg)
+    crypto.enable_early_data = true;
+    Ok(crypto)
 }
 
 /// 绑定一个 QUIC 服务端 endpoint（监听 UDP `addr`）。
@@ -130,6 +139,14 @@ mod tests {
     fn client_config_builds_with_dev_ca() {
         let cfg = client_quic_config("certs/dev/ca-cert.pem");
         assert!(cfg.is_ok(), "{:?}", cfg.err());
+    }
+
+    #[test]
+    fn client_crypto_enables_0rtt_early_data() {
+        // 0-RTT(Stage 13c)要求客户端显式开 early data(rustls 默认 false)。
+        let c = client_crypto("certs/dev/ca-cert.pem", vec![b"h3".to_vec()]).unwrap();
+        assert!(c.enable_early_data, "client 必须启用 0-RTT early data");
+        assert_eq!(c.alpn_protocols, vec![b"h3".to_vec()]);
     }
 
     #[test]
