@@ -1,5 +1,34 @@
 # Learnings
 
+## 2026-06-11 — Stage 13b: UDP over TUIC Packet rides the same authenticated QUIC connection
+
+UDP relay now speaks **TUIC `Packet` (native QUIC datagram)** through the same sing-box exit as 13a's TCP:
+Shenzhen client (tuic mode) → sing-box → `dig @1.1.1.1 example.com` returned Cloudflare's real A records,
+`dig @1.1.1.1 facebook.com` a second flow, and `curl https://1.1.1.1/` still got `HTTP/2 301` (TCP
+non-regression on the *same* connection). Lessons:
+
+1. **A narrowed id space silently breaks an invariant inherited from a wider one.** `AssocTable` mirrors
+   Stage-12 `FlowTable`'s "monotonic `next_id`, never reuse an id" scheme (so late datagrams can't cross
+   into a new flow) — but in **u16**, `next_id` wraps after 65535 interns. The original copy assigned
+   `next_id` unconditionally, so after a wrap it could `insert()` onto a *still-live* id (overwriting an
+   active flow's mapping → downlink misroute) and orphan that flow's `tuple_to_id` entry (slow unbounded
+   leak). `FlowTable` is safe only because u32 never wraps in practice. Fix: `alloc_id()` skips in-use ids;
+   the live set (≤1024) ≪ 65536 so a free id always exists. Lesson: when you copy a table/allocator and
+   shrink its key width, re-audit every "the space is so large this never happens" assumption.
+2. **TUIC multiplexes TCP (bi-streams) and UDP (datagrams) over ONE authenticated connection.** sing-box
+   validates auth per connection, so UDP datagrams must ride the *same* connection that sent Authenticate —
+   you can't open a second anonymous QUIC connection for UDP. We funnel both `open_tcp` and `send_udp`/the
+   datagram pump through a single `live_conn()` (reconnect serialized by one mutex), which is also why the
+   TCP non-regression `curl` is a real test of co-existence, not a separate path.
+3. **Downlink applies backpressure (`send().await`), uplink drops (`try`/count).** Dropping a DNS *response*
+   on the downlink breaks `getaddrinfo`, so the datagram pump blocks rather than drops; the uplink keeps
+   UDP semantics (drop + count on full / TooLarge / dead connection, self-heals on the next packet). Same
+   asymmetry as Stage 12's `run_quic_pump`, reused deliberately.
+4. **`@1.1.1.1` is the right UDP-relay probe precisely because it dodges the local fake-resolver.** The TUN
+   only forges fake-IP answers for 198.18.0.1:53; every other `:53` goes to the relay (stage-12 D1 rule).
+   So `dig @1.1.1.1` returning a *real* Cloudflare IP proves the query went out through TUIC Packet, not a
+   local forgery — a self-forged answer would have returned a 198.18/15 address.
+
 ## 2026-06-10 — Stage 13a: our hand-written TUIC client interoperates with sing-box
 
 The mini_vpn client now speaks the **TUIC v5 protocol** (ADR-0004) and was accepted by a real

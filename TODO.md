@@ -53,9 +53,14 @@ server** (interop = best experience, zero server code from us). Stage 12's UDP-o
   - ~~**13a — TCP relay over TUIC Connect**~~ — DONE (2026-06-10): Authenticate (token via
     keying-material) + per-flow Connect bi-stream behind a `ProxyUpstream` trait; **verified end-to-end
     against a real sing-box TUIC server** (curl https://1.1.1.1 → Cloudflare 301, US egress).
-  - **13b — UDP relay over TUIC `Packet`** (native datagram + quic-stream = the deferred oversized
-    fallback). tuic mode UDP is currently dropped.
-  - **13c — connection migration + 0-RTT + heartbeat** (mobile roaming / weak net).
+  - ~~**13b — UDP relay over TUIC `Packet`**~~ — DONE (2026-06-11): native QUIC datagram, one u16
+    assoc-id per UDP 4-tuple (`AssocTable`), `send_udp` + a self-healing downlink datagram pump +
+    periodic Heartbeat over the *same* authenticated connection as TCP; **verified end-to-end against a
+    real sing-box** (`dig @1.1.1.1 example.com/facebook.com` → real A records; `curl https://1.1.1.1`
+    still HTTP/2 301 = TCP non-regression). See `docs/tech/13b-tuic-udp-packet.md`. Deferred: the
+    quic-stream oversized fallback (native drops + counts datagrams over the QUIC datagram limit).
+  - **13c — connection migration + 0-RTT + heartbeat** (mobile roaming / weak net). NOTE: a fixed 3s
+    TUIC Heartbeat already ships in 13b; 13c makes keep-alive adaptive (battery vs NAT timeout).
   - **13d — retire legacy** (yamux + Stage-12 self-server QUIC datagram + self server).
 
 #### Transport / protocol extensibility — two tiers
