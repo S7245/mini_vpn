@@ -376,16 +376,14 @@ pub async fn start_tun_proxy() {
                     } else {
                         // 1) SYN inspector：在 iface.poll 之前看一眼包，若是去往新端口的干净 SYN，
                         //    立刻为该端口建监听池，这样 smoltcp 同一帧就能 accept。
-                        if let Some(buf) = &device.rx_buffer {
-                            if let Some(port) = inspect_inbound_syn(buf)
-                                && let Err(e) =
-                                    registry.ensure_port(port, &mut sockets, &mut socket_ctxs)
-                            {
-                                println!(
-                                    "⚠️ intercepted port cap reached, drop SYN to port {port}: {:?}",
-                                    e
-                                );
-                            }
+                        if let Some(buf) = &device.rx_buffer
+                            && let Some(port) = inspect_inbound_syn(buf)
+                            && let Err(e) = registry.ensure_port(port, &mut sockets, &mut socket_ctxs)
+                        {
+                            println!(
+                                "⚠️ intercepted port cap reached, drop SYN to port {port}: {:?}",
+                                e
+                            );
                         }
 
                         let timestamp = smoltcp::time::Instant::now();
