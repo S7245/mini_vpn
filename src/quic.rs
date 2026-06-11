@@ -9,8 +9,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use quinn::{ClientConfig, Endpoint, IdleTimeout, ServerConfig, TransportConfig};
-use rustls::{Certificate, PrivateKey, RootCertStore};
+use quinn::{ClientConfig, Endpoint, IdleTimeout, TransportConfig};
+use rustls::{Certificate, RootCertStore};
 
 /// QUIC ALPN：握手必须协商；client/server 一致。
 pub const QUIC_ALPN: &[u8] = b"mvpn";
@@ -38,22 +38,6 @@ fn quic_transport_config() -> Arc<TransportConfig> {
     t.initial_mtu(QUIC_INITIAL_MTU);
     t.min_mtu(QUIC_INITIAL_MTU);
     Arc::new(t)
-}
-
-/// 构建 QUIC 服务端 config（PEM 证书链 + PKCS8 私钥 + ALPN）。
-/// 中文要点：复用 server.rs 的证书加载方式，只是包成 quinn 的 crypto。
-pub fn server_quic_config(cert_path: &str, key_path: &str) -> Result<ServerConfig, String> {
-    let certs = load_certs(cert_path)?;
-    let key = load_key(key_path)?;
-    let mut crypto = rustls::ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| format!("quic tls server config: {e}"))?;
-    crypto.alpn_protocols = vec![QUIC_ALPN.to_vec()];
-    let mut cfg = ServerConfig::with_crypto(Arc::new(crypto));
-    cfg.transport_config(quic_transport_config());
-    Ok(cfg)
 }
 
 /// 构建 QUIC 客户端 config（信任给定 CA），ALPN 用本项目自有的 `mvpn`（Stage 12 数据面）。
@@ -104,11 +88,6 @@ fn client_crypto(
     Ok(crypto)
 }
 
-/// 绑定一个 QUIC 服务端 endpoint（监听 UDP `addr`）。
-pub fn server_endpoint(cfg: ServerConfig, addr: SocketAddr) -> Result<Endpoint, String> {
-    Endpoint::server(cfg, addr).map_err(|e| format!("quic server bind {addr}: {e}"))
-}
-
 /// 绑定一个 QUIC 客户端 endpoint（本地 ephemeral UDP 端口）并装上默认 client config。
 pub fn client_endpoint(cfg: ClientConfig) -> Result<Endpoint, String> {
     let bind: SocketAddr = "0.0.0.0:0".parse().expect("valid bind addr");
@@ -127,26 +106,9 @@ fn load_certs(path: &str) -> Result<Vec<Certificate>, String> {
     Ok(certs.into_iter().map(Certificate).collect())
 }
 
-fn load_key(path: &str) -> Result<PrivateKey, String> {
-    let f = File::open(path).map_err(|e| format!("open {path}: {e}"))?;
-    let mut r = BufReader::new(f);
-    let mut keys =
-        rustls_pemfile::pkcs8_private_keys(&mut r).map_err(|e| format!("read key {path}: {e}"))?;
-    if keys.is_empty() {
-        return Err(format!("no pkcs8 private key in {path}"));
-    }
-    Ok(PrivateKey(keys.remove(0)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn server_config_builds_with_dev_cert_and_alpn() {
-        let cfg = server_quic_config("certs/dev/server-cert.pem", "certs/dev/server-key.pem");
-        assert!(cfg.is_ok(), "{:?}", cfg.err());
-    }
 
     #[test]
     fn client_config_builds_with_dev_ca() {
@@ -162,11 +124,6 @@ mod tests {
         assert_eq!(on.alpn_protocols, vec![b"h3".to_vec()]);
         let off = client_crypto("certs/dev/ca-cert.pem", vec![QUIC_ALPN.to_vec()], false).unwrap();
         assert!(!off.enable_early_data, "legacy 不应开 0-RTT early data");
-    }
-
-    #[test]
-    fn server_config_missing_file_errs() {
-        assert!(server_quic_config("does/not/exist.pem", "nope.pem").is_err());
     }
 
     // Endpoint::client 需要 tokio 运行时上下文（真实运行在 #[tokio::main] 下）。

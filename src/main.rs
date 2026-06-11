@@ -1,23 +1,13 @@
-mod client;
 mod client_tun;
 mod device;
 mod dns;
 mod fake_ip;
-mod server;
 
 #[tokio::main]
 async fn main() {
-    let mode = std::env::args()
-        .nth(1)
-        .expect("请指定运行模式: server、client-direct 或 client-tun");
-
-    if mode == "server" {
-        server::run().await;
-    } else if mode == "client-direct" {
-        client::run().await;
-    } else if mode == "client" || mode == "client-tun" {
-        client_tun::start_tun_proxy().await;
-    } else {
-        panic!("未知运行模式: {mode}");
+    // Stage 13d 起退役 legacy（自研 server / 直连 client / yamux），仅保留 TUN + TUIC 客户端。
+    match std::env::args().nth(1).as_deref() {
+        Some("client") | Some("client-tun") | None => client_tun::start_tun_proxy().await,
+        Some(other) => panic!("未知运行模式: {other}（13d 起仅支持 client-tun）"),
     }
 }
