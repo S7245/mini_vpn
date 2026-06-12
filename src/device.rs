@@ -85,6 +85,55 @@ impl VirtualTunDevice {
     pub fn inject_ip_packet(&mut self, pkt: &[u8]) {
         push_injected(&mut self.tx_queue, pkt);
     }
+
+    /// 只读窥视当前收货仓库（不取走）：classify_inbound / inspect_inbound_syn 热路径用。
+    pub fn rx_peek(&self) -> Option<&[u8]> {
+        self.rx_buffer.as_deref()
+    }
+
+    /// 取走当前收货仓库（UDP relay 把包 take 走、不进 iface.poll）。
+    pub fn rx_take(&mut self) -> Option<BytesMut> {
+        self.rx_buffer.take()
+    }
+}
+
+/// 主循环与「TUN 设备」之间的 IO 接缝（knife1）。
+///
+/// 中文要点：把主循环对设备的全部依赖收口成一个 trait，使 `run_event_loop` 既能跑真 utun
+/// (`VirtualTunDevice`)，也能跑内存回环设备（并发压测 harness），**生产与测试共用同一份循环**。
+/// 同时要求 smoltcp `Device`（`iface.poll` 需要）。用泛型单态化承载（smoltcp `Device`
+/// 含 GAT、非对象安全），生产热路径零 dyn 开销。
+#[allow(async_fn_in_trait)] // 仅作泛型约束使用、从不 `dyn TunIo`，无需 auto-trait 边界
+pub trait TunIo: Device {
+    /// 异步进货：等待下一个 IP 包就绪并存入内部 rx 槽。
+    async fn wait_for_rx(&mut self) -> std::io::Result<()>;
+    /// 只读窥视当前 rx 槽（不取走）。
+    fn rx_peek(&self) -> Option<&[u8]>;
+    /// 取走当前 rx 槽。
+    fn rx_take(&mut self) -> Option<BytesMut>;
+    /// 异步发货：把发货队列里排队的包全部写出。
+    async fn flush_tx(&mut self) -> std::io::Result<()>;
+    /// 下行注入：裸 IP 包入发货队列，等 `flush_tx` 发出。
+    fn inject_ip_packet(&mut self, pkt: &[u8]);
+}
+
+impl TunIo for VirtualTunDevice {
+    // 委托既有 inherent 方法（inherent 优先于 trait 解析，不会递归）。
+    async fn wait_for_rx(&mut self) -> std::io::Result<()> {
+        VirtualTunDevice::wait_for_rx(self).await
+    }
+    fn rx_peek(&self) -> Option<&[u8]> {
+        VirtualTunDevice::rx_peek(self)
+    }
+    fn rx_take(&mut self) -> Option<BytesMut> {
+        VirtualTunDevice::rx_take(self)
+    }
+    async fn flush_tx(&mut self) -> std::io::Result<()> {
+        VirtualTunDevice::flush_tx(self).await
+    }
+    fn inject_ip_packet(&mut self, pkt: &[u8]) {
+        VirtualTunDevice::inject_ip_packet(self, pkt)
+    }
 }
 
 /// 把一个裸 IPv4 包加帧后塞进发货队列。macOS utun 需要 4 字节 PI 头，Linux 不需要。
