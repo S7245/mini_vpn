@@ -136,6 +136,26 @@ so the Upstream resolves at the exit. Follow-ups not in Stage 11:
   pending buffer that never drops bytes. Verified: `curl https://www.facebook.com/`
   downloads a full ~415KB repeatedly with no bad decrypt.
 
+### Client-side concurrency bottlenecks (knife1 findings, 2026-06-12)
+
+Quantified by the mock loopback harness (`src/harness.rs`, feature `harness`);
+full data in `docs/tech/2026-06-12-knife1-bottleneck-findings.md`. For Rules.md ③
+(大并发) the dominant cost is **client-side**, not the network:
+
+- **P0 #1 — `run_event_loop` sweeps `registry.all_handles()` O(total listener slots)
+  every tick.** relay/call scales linearly with `distinct_ports × pool_size` and is
+  independent of active connections (0.13→0.45ms as slots 512→2048, N fixed). knife2:
+  process only handles with readiness (event/dirty-set), not a full per-tick sweep.
+- **P0 #2 — per-port `pool_size` is a hard concurrency ceiling.** 256 conns to ONE
+  port with default pool=2 complete only 2/256; hot-port bursts stall (rearm-under-churn
+  doesn't drain — overlaps the first-SYN-refused race below). knife2: elastic per-port
+  pool / reuse + accept backlog. Global ceiling today ≈ 64 ports × pool 2 = 128.
+- **P1 #4 single-thread select ceiling** (throughput halves as per-tick work grows;
+  coupled to #1) and **P2 #5 128KB/socket** (2048 slots ≈ 256MB, mostly idle swept slots).
+- **#3 single QUIC connection** (HOL under concurrency) is unmeasured by the mock —
+  needs the end-to-end sing-box probe in the findings doc. Same concern as the yamux
+  HOL note above, now on the TUIC/QUIC data plane.
+
 ### Scale & reconnection resilience (100+ servers / 5000+ users)
 
 Stage 10 ships client-side full-jitter reconnect as the baseline. To survive

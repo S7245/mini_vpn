@@ -4,11 +4,13 @@
 
 ## 当前状态（基线）
 
-- 分支 **`claude/stage13-tuic-data-plane`**，基线 commit **`cea29f1`**（领先 `main` 52 个 commit，**尚未合 main**）。
+- **Stage 13 已在 `main`**（TUIC 数据面，ADR-0004）。**刀1 已完成**，在分支
+  **`claude/knife1-concurrency-harness`**（从 main 起，逐 commit push，**尚未合 main**）——见下「刀1 已完成」。
 - **Stage 13 全部完成**：数据面已是 **client-only TUIC over quinn → sing-box**（ADR-0004）。
   - 13a TCP via TUIC Connect ✅、13b UDP via TUIC Packet ✅、13c 按需 heartbeat + 保活厘清（0-RTT 撞 quinn 0.10 墙、deferred）✅、13d 退役 legacy（删 yamux/自研 server/双轨开关/6 个依赖）✅。
-  - 全部跨机签收（深圳 client → US/HK sing-box）；52 单测、clippy 0 warning、release build 绿。
-- 新 session 起点：从 `cea29f1` 起新分支（或 Stage 13 合 main 后从 main 起）。**一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
+  - 全部跨机签收（深圳 client → US/HK sing-box）；55 单测、clippy 0 warning、release build 绿。
+- 新 session 起点（刀2）：从 `claude/knife1-concurrency-harness` 起新分支（或刀1 合 main 后从 main 起）。
+  **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
 ## 目标（唯一北极星）：`Rules.md`
 
@@ -35,8 +37,8 @@
 
 ```
 主线（Rules.md 三目标）
- ├─ 刀1  大并发压测 harness（先定位真瓶颈，事实先行）  ← 下一刀，详见下
- ├─ 刀2  大并发优化（按刀1结果对症）+ fake-IP 池 LRU/TTL 回收
+ ├─ 刀1  大并发压测 harness（先定位真瓶颈，事实先行）  ✅ 完成（见下「刀1 已完成」）
+ ├─ 刀2  大并发优化（按刀1结果对症）+ fake-IP 池 LRU/TTL 回收  ← 下一刀
  ├─ 刀3  UDP 直播硬化（quic-stream fallback + 吞吐压测 + MSS/MTU）
  └─ 刀4  连接成功率（DoH/DoT 拦截 + 拦全 :53；first-SYN-to-fresh-fake-IP refused）
 
@@ -45,25 +47,33 @@
 ```
 - 优先级与关联：**fake-IP 池回收**属"大并发长稳"（并入刀2）；**DoH 拦截**是"真实场景能连上"的前置（刀4，可视情提前——真机浏览器场景不修则 fake-IP 形同虚设）。**A（REALITY）正交**：当前 QUIC 能连，不阻塞三目标达标；TCP-based，替代不了 UDP 直播。
 
-## 下一刀（刀1）：大并发压测 harness
+## 刀1 已完成（2026-06-12）：大并发压测 harness + 瓶颈定位
 
-**为什么先做**：Rules.md ③ 未达标，但当前**不知道真瓶颈在哪**。记忆/LEARNINGS 的纪律是 **"localize before fixing"**——先量化，别盲改。低风险、为刀2 提供事实地基。
+**交付**（分支 `claude/knife1-concurrency-harness`，从 main 起，已逐 commit push；未合 main）：
+- 重构：`start_tun_proxy` 抽成 `run_event_loop<D: TunIo, U: ProxyUpstream+DatagramUpstream, M: MetricsSink>`
+  （生产/测试同一份循环，零回归）；新增 `TunIo`(device.rs)/`DatagramUpstream`(upstream.rs)/`MetricsSink`。
+  client_tun/device/dns/fake_ip 搬进 library（tests/ 整合测试可达）。
+- harness：`src/harness.rs`（feature `harness`）= 内存回环 device + mock echo 上游 + 第二 smoltcp 流量发生器，
+  对外高层 `run_tcp_scenario`/`run_udp_echo_scenario` → `Report`。`tests/concurrency_harness.rs` 跑 N sweep。
+  跑法：`cargo test --features harness --test concurrency_harness -- [--ignored] --nocapture`。
+- **定位结论：`docs/tech/2026-06-12-knife1-bottleneck-findings.md`**（spec/plan 同目录 `2026-06-12-knife1-*`）。
 
-**目标**：可复现的 benchmark，量化 **N 路并发 TCP + 持续 UDP 吞吐** 下的 吞吐 / 延迟 / 丢包 / CPU / 内存，定位瓶颈到具体环节。
+**瓶颈裁决（指向刀2）**：
+1. ✅ **P0 #1 `all_handles()` O(总 listener 槽数) 全量 sweep**（主因）：relay/call 线性于 `端口×pool`、与活跃连接无关。
+2. ✅ **P0 #2 每端口 `pool_size` 硬并发上限**：单端口 pool=2 下 256 路只完成 2/256（热门端口 stall，与 first-SYN-refused 重叠）。
+3. ⏸ **#3 单条 QUIC 连接** mock 测不到（无网络拥塞）→ deferred，findings 附端到端 sing-box probe 配方。
+4. ✅ **P1 #4 单线程 select 上限**（吞吐随每-tick 开销跌；与 #1 强耦合）。
+5. ✅ **P2 #5 128KB/socket**（2048 槽≈256MB，多为 #1 空扫的空闲槽）。
 
-**设计倾向（待 grill 定，给约束不定死）**：
-- 优先 **隔离客户端处理能力**：用一个 `ProxyUpstream` 的 **mock 实现**（直接 echo / 计数，不经真 TUIC/网络），把"客户端主循环 + smoltcp + relay 调度"的并发瓶颈从网络中隔离出来。再做端到端（本地 sing-box 出口）补充真实吞吐。
-- 复现 Stage 12 的可控环境（loopback、CI 可跑），**避开 Stage 12 踩过的坑**：① per-packet `println!` 拖垮单线程主循环；② `ncat -k -u -e` echo 服务端 fork/连接态成瓶颈（用单 socket recvfrom/sendto echo）；③ 用 loopback 集成测试 + 字段隔离测试定位层。
-- 注入流量进 TUN 侧需要真 utun（root）或从 device/smoltcp 侧注入——注入方式由 grill 定。
+## 下一刀（刀2）：大并发优化（对症刀1）+ fake-IP 池回收
 
-**重点验证这些怀疑瓶颈**（刀1 要给出数据，刀2 据此修）：
-1. 主循环每 tick `registry.all_handles()` **O(n) 全量遍历** socket。
-2. `MAX_INTERCEPTED_PORTS=64` 端口上限。
-3. **单条 TUIC QUIC 连接**承载所有 TCP flow（单连接拥塞/队头；是否需连接池）。
-4. 单线程 `tokio::select!` 主循环的串行处理上限。
-5. 每 socket 64KB×2 缓冲的内存/poll 成本。
-
-**产出**：benchmark 代码（`benches/` 或 `tests/` 可重复跑）+ 一份"瓶颈定位结论"（数据 + 指向刀2 的优化项）。
+**起点**：从 `claude/knife1-concurrency-harness`（或合 main 后从 main）起新分支。读 findings 文档。
+**主攻**（按刀1 优先级）：
+- **#1**：主循环别每 tick 全量 sweep `all_handles()`；改"仅处理有 readiness 的 handle"（事件/脏集合驱动）。
+  harness 的三段插桩 + N sweep 可直接量化优化效果（优化前后对比 relay/call）。
+- **#2**：per-port pool 弹性扩容/复用 + accept backlog；放开 `MAX_INTERCEPTED_PORTS`/`pool_size` 的硬上限。
+- 顺带 **fake-IP 池 LRU/TTL 回收**（长稳）。#4/#5 多半随 #1/#2 一起缓解。
+**验证**：harness N sweep 优化前后对比 + 跨机 acceptance；#3 用 findings 的 probe 配方判定是否需 QUIC 连接池。
 
 ## Rhythm（每刀都遵守）
 
