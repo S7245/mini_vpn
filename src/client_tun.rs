@@ -1,8 +1,8 @@
 use crate::device::VirtualTunDevice;
-use mini_vpn::shared::{ClientError, TargetAddr};
-use mini_vpn::tuic::{AssocTable, TuicClientConfig, TuicUpstream, decode_packet, encode_packet};
-use mini_vpn::upstream::{ProxyUpstream, RelayStream};
-use mini_vpn::udp_relay::{FourTuple, UDP_FLOW_IDLE_SECS, build_udp_ip_packet, parse_inbound_udp};
+use crate::shared::{ClientError, TargetAddr};
+use crate::tuic::{AssocTable, TuicClientConfig, TuicUpstream, decode_packet, encode_packet};
+use crate::upstream::{ProxyUpstream, RelayStream};
+use crate::udp_relay::{FourTuple, UDP_FLOW_IDLE_SECS, build_udp_ip_packet, parse_inbound_udp};
 use crate::dns::{self, Answer};
 use crate::fake_ip::FakeIpPool;
 use std::net::Ipv4Addr;

@@ -1,7 +1,4 @@
-mod client_tun;
-mod device;
-mod dns;
-mod fake_ip;
+use mini_vpn::client_tun;
 
 #[tokio::main]
 async fn main() {
