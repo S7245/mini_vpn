@@ -1,4 +1,4 @@
-use crate::device::VirtualTunDevice;
+use crate::device::{TunIo, VirtualTunDevice};
 use crate::shared::{ClientError, TargetAddr};
 use crate::tuic::{AssocTable, TuicClientConfig, TuicUpstream, decode_packet, encode_packet};
 use crate::upstream::{ProxyUpstream, RelayStream};
@@ -18,6 +18,28 @@ use tokio::sync::mpsc;
 
 const TCP_SOCKET_BUFFER_SIZE: usize = 65_535;
 const RELAY_CHANNEL_CAPACITY: usize = 1024;
+
+/// 主循环分段插桩接缝（knife1：并发压测定位瓶颈）。
+///
+/// 中文要点：生产传 [`NoopSink`]（空方法，单态化内联后**零开销**，热路径无 `Instant::now()`）；
+/// 并发压测 harness 传 RecordingSink，在每个回调里采集每段耗时/调用次数。计时逻辑全部留在 sink
+/// 实现内，主循环只做平凡方法调用——生产与测试**同一份循环**。
+pub trait MetricsSink {
+    /// 进入 smoltcp poll 段（poll → drain_dns → poll → flush_tx）。
+    fn enter_poll(&mut self) {}
+    /// 离开 poll 段。
+    fn leave_poll(&mut self) {}
+    /// 进入 relay 调度段（`all_handles()` 全量遍历 + `process_listener_activity`）。
+    fn enter_relay(&mut self) {}
+    /// 离开 relay 调度段。
+    fn leave_relay(&mut self) {}
+    /// 记录本 tick relay 段遍历的 listener handle 数（量化怀疑瓶颈 #1：O(n) 全量遍历）。
+    fn note_listeners(&mut self, _n: usize) {}
+}
+
+/// 生产用空插桩：所有回调空实现，单态化后零开销。
+pub struct NoopSink;
+impl MetricsSink for NoopSink {}
 // 中文要点：Stage 9 起按"每端口"配 pool，64 端口 * 2 槽 * 2 缓冲 ≈ 16MB。
 const DEFAULT_TUN_POOL_SIZE: usize = 2;
 
@@ -170,11 +192,11 @@ impl ListenerRegistry {
 /// Local listener-side startup configuration for the TUN runtime.
 /// 中文要点：这一层只关心本地拦截面，不关心怎么连上游 TLS/Yamux 服务。
 #[derive(Debug, Clone)]
-struct TunListenerConfig {
+pub struct TunListenerConfig {
     /// Per-port pool size: number of smoltcp listener slots created for each
     /// intercepted destination port.
     /// 中文要点：Stage 9 起 pool 按"每端口"算，决定单个端口能并发承接多少条连接。
-    pool_size: usize,
+    pub pool_size: usize,
 }
 
 impl TunListenerConfig {
@@ -203,13 +225,13 @@ impl TunListenerConfig {
 /// 中文要点：Stage 13d 退役 legacy 上游后，运行时只剩本地监听池配置；
 /// TUIC 出口配置走 `MINI_VPN_TUIC_*`（见 tuic.rs），不在这里。
 #[derive(Debug, Clone)]
-struct TunRuntimeConfig {
-    listener: TunListenerConfig,
+pub struct TunRuntimeConfig {
+    pub listener: TunListenerConfig,
 }
 
 impl TunRuntimeConfig {
     /// Build config from optional string sources.
-    fn from_sources(pool_size: Option<&str>) -> Result<Self, ClientError> {
+    pub fn from_sources(pool_size: Option<&str>) -> Result<Self, ClientError> {
         Ok(Self {
             listener: TunListenerConfig::from_sources(pool_size)?,
         })
@@ -221,6 +243,10 @@ impl TunRuntimeConfig {
     }
 }
 
+/// 生产入口：建真 utun + 真 TUIC 上游，然后跑共享的 [`run_event_loop`]。
+///
+/// 中文要点：knife1 起把主循环抽成 `run_event_loop`（泛型 over [`TunIo`] 设备 + [`MetricsSink`]），
+/// 生产与并发压测 harness **跑同一份循环代码**。本薄壳只负责构造真依赖；循环逻辑零回归。
 pub async fn start_tun_proxy() {
     let runtime_config = match TunRuntimeConfig::from_env() {
         Ok(config) => config,
@@ -229,16 +255,12 @@ pub async fn start_tun_proxy() {
             return;
         }
     };
-    let pool_size = runtime_config.listener.pool_size;
+    println!(
+        "🚀 TUN runtime started with pool_size={}",
+        runtime_config.listener.pool_size
+    );
 
-    // 全局回信通道（TCP relay 通用回程）：接收端 global_rx 留在主循环，发送端 global_tx 克隆给每个后台车厢。
-    let (global_tx, mut global_rx) =
-        tokio::sync::mpsc::channel::<(SocketHandle, Vec<u8>)>(RELAY_CHANNEL_CAPACITY);
-    // =========== 1. 初始化底层网卡和通道 ===========
-
-    println!("🚀 TUN runtime started with pool_size={pool_size}");
-
-    // 1. 初始化 TUN 设备(化底层网卡和通道) / 创建操作系统的原生异步虚拟网卡
+    // 1. 初始化 TUN 设备 / 创建操作系统的原生异步虚拟网卡。
     let raw_tun = match create_tun_device().await {
         Ok(device) => device,
         Err(e) => {
@@ -246,11 +268,57 @@ pub async fn start_tun_proxy() {
             return;
         }
     };
-    // 使用 raw_tun 实例化我们的包装器
-    let mut device = VirtualTunDevice::new(raw_tun);
+    let device = VirtualTunDevice::new(raw_tun);
 
-    // =========== 2. 初始化 smoltcp 酒店和路由器 ===========
-    // 2. 初始化 smoltcp 的“酒店”
+    // 2. 仅 TUIC 上游（legacy yamux / 自研 server 已退役，见 ADR-0004）。
+    let cfg = match TuicClientConfig::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("加载 TUIC 客户端配置失败（启动中止）: {e}");
+            return;
+        }
+    };
+    let upstream = match TuicUpstream::connect(&cfg).await {
+        Ok(u) => {
+            println!("✅ 已连接 TUIC 出口 {} (sing-box)", cfg.server);
+            Arc::new(u)
+        }
+        Err(e) => {
+            println!("连接 TUIC 出口失败（启动中止）: {e:?}");
+            return;
+        }
+    };
+
+    // 3. UDP over TUIC Packet 下行接收端（断线自愈，见 13b/13c）。
+    println!("🌊 UDP relay 数据面就绪（TUIC Packet datagram → sing-box）");
+    let tuic_downlink_rx = upstream.start_udp();
+
+    // 4. 进入共享主循环（生产传 NoopSink：零插桩开销）。
+    run_event_loop(device, upstream, tuic_downlink_rx, runtime_config, NoopSink).await;
+}
+
+/// 共享主循环：生产（真 utun + 真 TUIC）与并发压测 harness（内存回环 device + mock 上游）共用。
+///
+/// 中文要点：泛型 over [`TunIo`]（设备接缝）与 [`MetricsSink`]（分段插桩）。所有 smoltcp 装置
+/// （sockets / iface / registry / fake DNS / fake_pool / assoc_table）在此内部构造，与生产逐字一致，
+/// 使 harness 也忠实地走同一套 SYN inspector / DNS / relay 调度路径。
+pub async fn run_event_loop<D, M>(
+    mut device: D,
+    upstream: Arc<TuicUpstream>,
+    mut tuic_downlink_rx: mpsc::Receiver<Vec<u8>>,
+    runtime_config: TunRuntimeConfig,
+    mut metrics: M,
+) where
+    D: TunIo,
+    M: MetricsSink,
+{
+    let pool_size = runtime_config.listener.pool_size;
+
+    // 全局回信通道（TCP relay 通用回程）：接收端 global_rx 留在主循环，发送端 global_tx 克隆给每个后台车厢。
+    let (global_tx, mut global_rx) =
+        tokio::sync::mpsc::channel::<(SocketHandle, Vec<u8>)>(RELAY_CHANNEL_CAPACITY);
+
+    // =========== 初始化 smoltcp 酒店和路由器 ===========
     let mut sockets = SocketSet::new(vec![]);
 
     // Stage 9: 监听端口不再固定，由 SYN inspector 在 rx 热路径按需注册。
@@ -304,34 +372,12 @@ pub async fn start_tun_proxy() {
         .add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 0, 2))
         .unwrap();
 
-    // 3. 初始化定时器 (例如每 5 毫秒触发一次)
+    // 初始化定时器 (每 5 毫秒触发一次)
     let mut timer = tokio::time::interval(std::time::Duration::from_millis(5));
 
-    // ===== Stage 13d：仅 TUIC 上游（legacy yamux / 自研 server 已退役，见 ADR-0004）。 =====
-    let cfg = match TuicClientConfig::from_env() {
-        Ok(c) => c,
-        Err(e) => {
-            println!("加载 TUIC 客户端配置失败（启动中止）: {e}");
-            return;
-        }
-    };
-    let upstream = match TuicUpstream::connect(&cfg).await {
-        Ok(u) => {
-            println!("✅ 已连接 TUIC 出口 {} (sing-box)", cfg.server);
-            Arc::new(u)
-        }
-        Err(e) => {
-            println!("连接 TUIC 出口失败（启动中止）: {e:?}");
-            return;
-        }
-    };
-
-    // ===== Stage 13b：UDP over TUIC Packet（native datagram）。AssocTable 主循环独占；
-    // 下行接收端来自 TuicUpstream::start_udp()（断线自愈，见 13b/13c）。 =====
+    // Stage 13b：UDP over TUIC Packet。AssocTable 主循环独占；upstream 与下行 rx 由调用方注入
+    // （生产=真 TuicUpstream::start_udp()；harness=mock echo 回环）。
     let mut assoc_table = AssocTable::new();
-    println!("🌊 UDP relay 数据面就绪（TUIC Packet datagram → sing-box）");
-    let mut tuic_downlink_rx = upstream.start_udp();
-
     let udp_clock = std::time::Instant::now();
     let mut udp_sweep = tokio::time::interval(std::time::Duration::from_secs(1));
 
@@ -360,9 +406,9 @@ pub async fn start_tun_proxy() {
                 if res.is_ok(){
                     // rx 分流（stage-12 D1）：去往 fake DNS 的 :53 → smoltcp；其它 UDP → 裸 relay；
                     // 非 UDP → 既有 smoltcp 路径。UDP relay 包 take 走、不进 iface.poll。
-                    let class = device.rx_buffer.as_deref().map(classify_inbound);
+                    let class = device.rx_peek().map(classify_inbound);
                     if class == Some(Inbound::UdpRelay) {
-                        if let Some(pkt) = device.rx_buffer.take() {
+                        if let Some(pkt) = device.rx_take() {
                             // Stage 13b: UDP → 编码 TUIC Packet → send_udp。
                             handle_tuic_udp_uplink(
                                 &pkt,
@@ -376,7 +422,7 @@ pub async fn start_tun_proxy() {
                     } else {
                         // 1) SYN inspector：在 iface.poll 之前看一眼包，若是去往新端口的干净 SYN，
                         //    立刻为该端口建监听池，这样 smoltcp 同一帧就能 accept。
-                        if let Some(buf) = &device.rx_buffer
+                        if let Some(buf) = device.rx_peek()
                             && let Some(port) = inspect_inbound_syn(buf)
                             && let Err(e) = registry.ensure_port(port, &mut sockets, &mut socket_ctxs)
                         {
@@ -386,14 +432,18 @@ pub async fn start_tun_proxy() {
                             );
                         }
 
+                        metrics.enter_poll();
                         let timestamp = smoltcp::time::Instant::now();
                         iface.poll(timestamp, &mut device, &mut sockets);
                         // 处理 DNS 查询并伪造响应；再 poll 一次把响应变成 IP 包入发货队列。
                         drain_dns(&mut sockets, dns_handle, &mut fake_pool);
                         iface.poll(timestamp, &mut device, &mut sockets);
                         device.flush_tx().await.unwrap();
+                        metrics.leave_poll();
 
+                        metrics.enter_relay();
                         let handles: Vec<SocketHandle> = registry.all_handles().collect();
+                        metrics.note_listeners(handles.len());
                         for handle in handles {
                             if let Err(e) = process_listener_activity(
                                 handle,
@@ -408,6 +458,7 @@ pub async fn start_tun_proxy() {
                                 println!("处理本地房间 {:?} 失败: {e}", handle);
                             }
                         }
+                        metrics.leave_relay();
                     }
                 }
             }
@@ -437,13 +488,17 @@ pub async fn start_tun_proxy() {
             }
             // 分支 2: 时钟滴答，处理超时重传等后台任务
             _ = timer.tick() =>{
+                metrics.enter_poll();
                 let timestamp = smoltcp::time::Instant::now();
                 iface.poll(timestamp, &mut device, &mut sockets);
                 drain_dns(&mut sockets, dns_handle, &mut fake_pool);
                 iface.poll(timestamp, &mut device, &mut sockets);
                 device.flush_tx().await.unwrap();
+                metrics.leave_poll();
 
+                metrics.enter_relay();
                 let handles: Vec<SocketHandle> = registry.all_handles().collect();
+                metrics.note_listeners(handles.len());
                 for handle in handles {
                     if let Err(e) = process_listener_activity(
                         handle,
@@ -458,6 +513,7 @@ pub async fn start_tun_proxy() {
                         println!("处理本地房间 {:?} 失败: {e}", handle);
                     }
                 }
+                metrics.leave_relay();
             }
         }
     }
@@ -691,13 +747,13 @@ async fn handle_local_payload(
 }
 
 /// 处理远端回信
-async fn handle_remote_payload(
+async fn handle_remote_payload<D: TunIo>(
     handle: SocketHandle,
     payload: Vec<u8>,
     sockets: &mut SocketSet<'_>,
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
     iface: &mut Interface,
-    device: &mut VirtualTunDevice,
+    device: &mut D,
 ) -> std::io::Result<()> {
     let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
@@ -882,6 +938,51 @@ mod tests {
         let ep = smoltcp::wire::IpEndpoint::new(IpAddress::v4(93, 184, 216, 34), 80);
         let target = target_from_endpoint(ep);
         assert_eq!(target.to_wire_string(), "93.184.216.34:80");
+    }
+
+    /// MetricsSink 契约：自定义 sink 能覆写默认空实现，逐回调被调用、listener 计数透传。
+    /// 中文要点：锁住 run_event_loop 的插桩接缝形状（生产 NoopSink 零开销、harness 可记录）。
+    #[derive(Default)]
+    struct CountingSink {
+        poll_enters: usize,
+        relay_enters: usize,
+        last_listeners: usize,
+    }
+    impl MetricsSink for CountingSink {
+        fn enter_poll(&mut self) {
+            self.poll_enters += 1;
+        }
+        fn enter_relay(&mut self) {
+            self.relay_enters += 1;
+        }
+        fn note_listeners(&mut self, n: usize) {
+            self.last_listeners = n;
+        }
+    }
+
+    #[test]
+    fn metrics_sink_records_per_phase_calls() {
+        let mut sink = CountingSink::default();
+        // 模拟一个 tick：poll 段 + relay 段（遍历 7 个 listener）。
+        sink.enter_poll();
+        sink.leave_poll();
+        sink.enter_relay();
+        sink.note_listeners(7);
+        sink.leave_relay();
+        assert_eq!(sink.poll_enters, 1);
+        assert_eq!(sink.relay_enters, 1);
+        assert_eq!(sink.last_listeners, 7);
+    }
+
+    #[test]
+    fn noop_sink_is_zero_state() {
+        // NoopSink 全空实现：可被反复调用且无副作用（生产热路径零开销的依据）。
+        let mut sink = NoopSink;
+        sink.enter_poll();
+        sink.leave_poll();
+        sink.enter_relay();
+        sink.note_listeners(1024);
+        sink.leave_relay();
     }
 
     /// Build a minimal IPv4+TCP packet with the requested flags for SYN-inspector tests.
