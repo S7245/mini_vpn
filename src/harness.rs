@@ -384,7 +384,8 @@ impl Report {
         }
         let mut v = self.latencies_us.clone();
         v.sort_unstable();
-        let idx = ((v.len() as f64 - 1.0) * p).round() as usize;
+        // p∈[0,1] 时 (len-1)*p ≤ len-1，理论不越界；min 仅作浮点防御。
+        let idx = (((v.len() as f64 - 1.0) * p).round() as usize).min(v.len() - 1);
         v[idx]
     }
     pub fn p50_us(&self) -> u64 {
@@ -571,8 +572,8 @@ pub async fn run_tcp_scenario(params: ScenarioParams) -> Report {
     } else {
         0.0
     };
-    // per-socket 缓冲 = pool 内每 listener 的 smoltcp rx+tx（见 client_tun TCP_SOCKET_BUFFER_SIZE）。
-    let per_socket_buffer_bytes = 2 * 65_535;
+    // per-socket 缓冲 = 每 listener 的 smoltcp rx+tx（引用真常量，避免与 client_tun 漂移）。
+    let per_socket_buffer_bytes = 2 * crate::client_tun::TCP_SOCKET_BUFFER_SIZE;
 
     Report {
         connections: params.connections,

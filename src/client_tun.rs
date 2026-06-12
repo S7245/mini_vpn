@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
-const TCP_SOCKET_BUFFER_SIZE: usize = 65_535;
+pub(crate) const TCP_SOCKET_BUFFER_SIZE: usize = 65_535;
 const RELAY_CHANNEL_CAPACITY: usize = 1024;
 
 /// 主循环分段插桩接缝（knife1：并发压测定位瓶颈）。
