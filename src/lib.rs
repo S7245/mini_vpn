@@ -2,6 +2,8 @@ pub mod client_tun;
 pub mod device;
 pub mod dns;
 pub mod fake_ip;
+#[cfg(feature = "harness")]
+pub mod harness;
 pub mod quic;
 pub mod shared;
 pub mod tuic;

@@ -25,3 +25,12 @@ tun = { version = "0.6", features = ["async"] }
 smoltcp = { version = "0.10", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"] }
 # 辅助解析 IP/TCP 头部
 etherparse = "0.13"
+
+[features]
+# knife1：大并发压测 harness（内存回环 device + mock 上游 + 第二 smoltcp 流量发生器）。
+# 仅在跑压测时启用，生产二进制不含此脚手架。见 docs/tech/2026-06-12-knife1-*。
+harness = []
+
+[dev-dependencies]
+# tests/concurrency_harness.rs 用 #[tokio::test] 驱动高层 harness API（smoltcp/bytes 全封在 lib 内）。
+tokio = { version = "1", features = ["full"] }
