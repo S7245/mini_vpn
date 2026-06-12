@@ -1,7 +1,7 @@
 use crate::device::{TunIo, VirtualTunDevice};
 use crate::shared::{ClientError, TargetAddr};
 use crate::tuic::{AssocTable, TuicClientConfig, TuicUpstream, decode_packet, encode_packet};
-use crate::upstream::{ProxyUpstream, RelayStream};
+use crate::upstream::{DatagramUpstream, ProxyUpstream, RelayStream};
 use crate::udp_relay::{FourTuple, UDP_FLOW_IDLE_SECS, build_udp_ip_packet, parse_inbound_udp};
 use crate::dns::{self, Answer};
 use crate::fake_ip::FakeIpPool;
@@ -302,14 +302,15 @@ pub async fn start_tun_proxy() {
 /// 中文要点：泛型 over [`TunIo`]（设备接缝）与 [`MetricsSink`]（分段插桩）。所有 smoltcp 装置
 /// （sockets / iface / registry / fake DNS / fake_pool / assoc_table）在此内部构造，与生产逐字一致，
 /// 使 harness 也忠实地走同一套 SYN inspector / DNS / relay 调度路径。
-pub async fn run_event_loop<D, M>(
+pub async fn run_event_loop<D, U, M>(
     mut device: D,
-    upstream: Arc<TuicUpstream>,
+    upstream: Arc<U>,
     mut tuic_downlink_rx: mpsc::Receiver<Vec<u8>>,
     runtime_config: TunRuntimeConfig,
     mut metrics: M,
 ) where
     D: TunIo,
+    U: ProxyUpstream + DatagramUpstream,
     M: MetricsSink,
 {
     let pool_size = runtime_config.listener.pool_size;
@@ -414,7 +415,7 @@ pub async fn run_event_loop<D, M>(
                                 &pkt,
                                 &mut assoc_table,
                                 &fake_pool,
-                                &upstream,
+                                &*upstream,
                                 udp_clock.elapsed().as_secs(),
                             )
                             .await;
@@ -449,7 +450,7 @@ pub async fn run_event_loop<D, M>(
                                 handle,
                                 &mut sockets,
                                 &mut socket_ctxs,
-                                &upstream,
+                                &*upstream,
                                 &global_tx,
                                 &fake_pool,
                             )
@@ -504,7 +505,7 @@ pub async fn run_event_loop<D, M>(
                         handle,
                         &mut sockets,
                         &mut socket_ctxs,
-                        &upstream,
+                        &*upstream,
                         &global_tx,
                         &fake_pool,
                     )
@@ -647,11 +648,11 @@ fn rearm_socket(socket: &mut TcpSocket<'_>, ctx: &mut SocketCtx) {
 
 /// Process one listener slot after iface polling.
 /// 中文要点：主循环只负责遍历 handle，真正的房间处理逻辑都收口在这里。
-async fn process_listener_activity(
+async fn process_listener_activity<U: ProxyUpstream>(
     handle: SocketHandle,
     sockets: &mut SocketSet<'_>,
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
-    upstream: &TuicUpstream,
+    upstream: &U,
     global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
     fake_pool: &FakeIpPool,
 ) -> Result<(), ClientError> {
@@ -697,12 +698,12 @@ async fn process_listener_activity(
     handle_local_payload(handle, payload, Some(target), socket_ctxs, upstream, global_tx).await
 }
 
-async fn handle_local_payload(
+async fn handle_local_payload<U: ProxyUpstream>(
     handle: SocketHandle,
     payload: Vec<u8>,
     target: Option<TargetAddr>,
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
-    upstream: &TuicUpstream,
+    upstream: &U,
     global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
 ) -> Result<(), ClientError> {
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
@@ -870,11 +871,11 @@ fn classify_inbound(pkt: &[u8]) -> Inbound {
 /// 处理一个被拦截的 UDP 上行包：解析 → fake-IP 改写 target → 铸 assoc-id →
 /// 编码 TUIC Packet → `TuicUpstream::send_udp`。
 /// 中文要点：fake 无映射 → 丢弃(短 TTL 自愈)；send_udp 自带丢弃计数(UDP 语义)。
-async fn handle_tuic_udp_uplink(
+async fn handle_tuic_udp_uplink<U: DatagramUpstream>(
     pkt: &[u8],
     assoc_table: &mut AssocTable,
     fake_pool: &FakeIpPool,
-    upstream: &Arc<TuicUpstream>,
+    upstream: &U,
     now_secs: u64,
 ) {
     let Some(udp) = parse_inbound_udp(pkt) else {

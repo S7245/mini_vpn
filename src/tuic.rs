@@ -7,7 +7,7 @@
 use crate::quic;
 use crate::shared::{ClientError, TargetAddr};
 use crate::udp_relay::{FlowEntry, FourTuple, MAX_UDP_FLOWS};
-use crate::upstream::{ProxyUpstream, RelayStream};
+use crate::upstream::{DatagramUpstream, ProxyUpstream, RelayStream};
 use quinn::{Connection, Endpoint};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -641,6 +641,14 @@ impl ProxyUpstream for TuicUpstream {
             .map_err(|e| io_err("tuic connect write", e))?;
         // 把双向流的收/发两半合成一条 AsyncRead+AsyncWrite，喂给现有双向泵。
         Ok(Box::new(tokio::io::join(recv, send)))
+    }
+}
+
+#[async_trait::async_trait]
+impl DatagramUpstream for TuicUpstream {
+    // 委托既有 inherent `send_udp`（inherent 优先解析，不会递归）。
+    async fn send_udp(&self, datagram: Vec<u8>) {
+        TuicUpstream::send_udp(self, datagram).await
     }
 }
 
