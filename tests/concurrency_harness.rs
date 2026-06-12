@@ -76,3 +76,54 @@ async fn concurrency_sweep_report() {
     }
     println!("==== 端到端 #3（单条 QUIC 连接）见 spec：deferred，需真 sing-box probe ====\n");
 }
+
+/// 隔离怀疑瓶颈 #1（all_handles O(n) 全量遍历）：固定 N=256，只变 pool_size →
+/// 总 listener 槽 = distinct_ports × pool_size。若 relay 段耗时随「槽数」涨而非随连接数，
+/// 即坐实 sweep 成本来自 O(总槽数) 而非 O(活跃连接)。
+#[tokio::test]
+#[ignore = "experiment for #1; run with --ignored --nocapture"]
+async fn pool_size_isolates_sweep_cost() {
+    println!("\n==== #1 隔离：固定 N=256，扫 pool_size（总槽=64×pool）====");
+    for &pool in &[8usize, 16, 32] {
+        let report = run_tcp_scenario(ScenarioParams {
+            connections: 256,
+            distinct_ports: 64,
+            payload_len: 1024,
+            pool_size: pool,
+            timeout: Duration::from_secs(60),
+        })
+        .await;
+        print!("pool={pool:>2} 总槽={:>4} | ", 64 * pool);
+        report.print_row();
+        assert_eq!(report.completed, 256);
+    }
+}
+
+/// 坐实怀疑瓶颈 #2（每端口 pool_size 是硬并发上限）：256 路全打到**单个**目标端口，
+/// pool_size=2（生产默认）。超出 2 槽的连接靠慢速 SYN 重传 + 槽 rearm，无法在窗口内排空 →
+/// 远不到 N/N。这是「大并发到热门端口」（如 :443）的首要墙。
+#[tokio::test]
+#[ignore = "demonstrates #2 pool stall; run with --ignored --nocapture"]
+async fn small_pool_stalls_hot_port() {
+    println!("\n==== #2 坐实：256 路全压单端口，pool_size=2（生产默认）====");
+    let report = run_tcp_scenario(ScenarioParams {
+        connections: 256,
+        distinct_ports: 1, // 全压一个端口
+        payload_len: 1024,
+        pool_size: 2,
+        timeout: Duration::from_secs(20),
+    })
+    .await;
+    print!("单端口 pool=2 | ");
+    report.print_row();
+    // 不强求 N/N——本测试就是要展示它**完不成**（pool=2 的并发墙）。
+    assert!(
+        report.completed < 256,
+        "pool=2 单端口下不应 N/N（completed={}）——证明 #2 是硬上限",
+        report.completed
+    );
+    println!(
+        "→ 256 路只完成 {}/256：每端口 pool_size 即硬并发上限（#2），刀2 需 pool 弹性扩容/复用",
+        report.completed
+    );
+}
