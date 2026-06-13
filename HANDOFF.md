@@ -4,12 +4,12 @@
 
 ## 当前状态（基线）
 
-- **Stage 13 已在 `main`**（TUIC 数据面，ADR-0004）。**刀1 已完成**，在分支
-  **`claude/knife1-concurrency-harness`**（从 main 起，逐 commit push，**尚未合 main**）——见下「刀1 已完成」。
+- **Stage 13 + 刀1 已在 `main`**（TUIC 数据面 ADR-0004 + 并发压测 harness/定位）。
+  刀1 已 fast-forward 合入 main（`2d604f6`）——见下「刀1 已完成」。
 - **Stage 13 全部完成**：数据面已是 **client-only TUIC over quinn → sing-box**（ADR-0004）。
   - 13a TCP via TUIC Connect ✅、13b UDP via TUIC Packet ✅、13c 按需 heartbeat + 保活厘清（0-RTT 撞 quinn 0.10 墙、deferred）✅、13d 退役 legacy（删 yamux/自研 server/双轨开关/6 个依赖）✅。
   - 全部跨机签收（深圳 client → US/HK sing-box）；55 单测、clippy 0 warning、release build 绿。
-- 新 session 起点（刀2）：从 `claude/knife1-concurrency-harness` 起新分支（或刀1 合 main 后从 main 起）。
+- 新 session 起点（刀2）：**从 `main` 起新分支**（刀1 已合 main）。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
 ## 目标（唯一北极星）：`Rules.md`
@@ -67,7 +67,7 @@
 
 ## 下一刀（刀2）：大并发优化（对症刀1）+ fake-IP 池回收
 
-**起点**：从 `claude/knife1-concurrency-harness`（或合 main 后从 main）起新分支。读 findings 文档。
+**起点**：从 `main` 起新分支（刀1 已合 main）。读 findings 文档。
 **主攻**（按刀1 优先级）：
 - **#1**：主循环别每 tick 全量 sweep `all_handles()`；改"仅处理有 readiness 的 handle"（事件/脏集合驱动）。
   harness 的三段插桩 + N sweep 可直接量化优化效果（优化前后对比 relay/call）。
