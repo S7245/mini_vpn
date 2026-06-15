@@ -95,3 +95,60 @@ cargo test --features harness --test concurrency_harness -- --nocapture
 # 重量级定位（A/B/C 三组实验）
 cargo test --features harness --test concurrency_harness -- --ignored --nocapture
 ```
+
+---
+
+# 刀2 优化结果（2026-06-15，对症本 findings）
+
+> 实现见 `2026-06-15-knife2-concurrency-opt-{spec,plan}.md`。分支 `claude/knife2-concurrency-opt`。
+> 同机（darwin）同 harness，仅换被测主循环逻辑。**趋势/比例**是结论。
+
+## #1（脏集合驱动）——relay 段不再随总槽线性翻倍
+
+固定 N=256，扫 pool_size（总槽=64×pool）。`relay` 段耗时 / `avg_listeners`（优化前 → 优化后）：
+
+| 总槽 | relay 段 | avg_listeners | 吞吐 |
+|---|---|---|---|
+| 512 (pool=8)  | 124.2ms → **8.8ms**  | 494.6 → **7.8**  | 8.94 → **16.99** Mb/s |
+| 1024 (pool=16)| 264.4ms → **15.6ms** | 993.3 → **15.5** | 5.00 → **11.53** Mb/s |
+| 2048 (pool=32)| 532.9ms → **23.8ms** | 1989.6 → **30.5**| 2.76 → **8.54** Mb/s |
+
+- **relay 段不再随总槽线性翻倍**：avg_listeners 从 ≈总槽 降到 ≈活跃 pool（O(总槽) → O(活跃)）。#1 砍掉。
+- relay 段从主导降为零头；剩余瓶颈转移到 **poll 段**（smoltcp，#4/#5）——符合 findings「砍掉 #1 后 #4 缓解大半」。
+
+## N sweep（固定 64×16=1024 槽）——吞吐回升
+
+| N | relay 段（前→后） | 吞吐（前→后） |
+|---|---|---|
+| 64   | 53.4ms → **3.1ms**  | 6.09 → **16.64** Mb/s |
+| 256  | 231.7ms → **14.2ms**| 5.67 → **12.56** Mb/s |
+| 1024 | 1618ms → **70.8ms** | 2.50 → **5.71** Mb/s |
+
+N=1024 的 relay 从 1618ms（占满单线程）降到 70.8ms；瓶颈现由 poll 段（1030ms，smoltcp 遍历活跃 socket）主导。
+
+## #2（弹性扩容）——单热门端口不再 stall
+
+256 路全压**单端口** pool=2（生产默认）：
+
+```
+优化前：done=   2/256  wall=20000ms（超时 stall）  listeners max=2
+优化后：done= 256/256  wall=  266ms              listeners max=257（弹性扩容）
+```
+
+每端口 pool 硬上限打掉：SYN 命中即弹性补足空闲 listening 槽，全局 `MAX_TOTAL_LISTENERS=4096` 兜底。
+
+## #5（空闲槽内存）——随 #1/#2 缓解
+
+- #1 后空闲槽不再被每 tick 全扫（relay 只碰活跃）；#2 按需扩容使槽数随真实并发而非预建 `64×pool`。
+- per-socket buffer 默认未动（65535×2，保 TCP 窗口/吞吐与稳定）；激进缩小留后续按需评估。
+
+## fake-IP 引用计数回收（长稳）
+
+- 每映射 refcount + last_used；TCP（`SocketCtx.fake_ip`）/ UDP（`AssocTable` id→fake-IP）两条 flow 生命周期
+  打通 acquire/release；`udp_sweep`（1s）周期 `fake_pool.sweep(now, TTL=300)`。
+- **活跃 flow（refcount>0）绝不回收**（单测覆盖）；仅 idle 且无 flow 超 TTL 才回收 → 长稳防泄漏、不断连。
+
+## 仍 deferred（本刀未碰）
+
+- **#3 单条 QUIC 连接**（拥塞/队头）：mock 测不到，需真 sing-box probe（本 findings 末节配方），归刀3 acceptance。
+- **#4 多线程/分片**：#1 已缓解大半；poll 段（smoltcp 单线程遍历）成新瓶颈，是否多线程留后续。
