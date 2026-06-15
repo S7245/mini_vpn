@@ -368,18 +368,25 @@ impl AssocTable {
         }
     }
 
-    pub fn sweep(&mut self, now: u64, idle_secs: u64) {
+    /// 回收 idle 超 `idle_secs` 的 assoc，**直接返回**这些 assoc 占用的 fake-IP（供调用方 release）。
+    /// 中文要点：review #8——sweep 自包含返回，不再依赖 stash-and-drain（调用方无需记得随后 take）；
+    /// `take_reclaimed_fake_ips` 仅服务 intern 内部的 LRU 驱逐（那里无法返回值）。
+    pub fn sweep(&mut self, now: u64, idle_secs: u64) -> Vec<Ipv4Addr> {
         let expired: Vec<(u16, FourTuple)> = self
             .id_to_entry
             .iter()
             .filter(|(_, e)| now.saturating_sub(e.last_activity) > idle_secs)
             .map(|(id, e)| (*id, e.tuple))
             .collect();
+        let mut reclaimed = Vec::new();
         for (id, tuple) in expired {
             self.id_to_entry.remove(&id);
             self.tuple_to_id.remove(&tuple);
-            self.note_reclaimed(id); // 刀2：回收该 assoc 占用的 fake-IP（→ 待 release）
+            if let Some(ip) = self.id_to_fake_ip.remove(&id) {
+                reclaimed.push(ip); // 刀2：该 assoc 占用的 fake-IP → 调用方 release
+            }
         }
+        reclaimed
     }
 
     fn evict_lru(&mut self) {
@@ -906,24 +913,17 @@ mod tests {
         assert!(t.resolve(id).is_none());
     }
 
-    /// 刀2：sweep 回收带 fake-IP 的 assoc 时，把该 fake-IP 累积进 reclaimed（供主循环 release）。
+    /// 刀2：sweep 回收带 fake-IP 的 assoc 时，直接返回该 fake-IP（review #8：自包含返回）。
     #[test]
     fn assoc_sweep_reclaims_fake_ip() {
         let mut t = AssocTable::new();
         let id = t.intern(tuple(1000));
         t.set_fake_ip(id, Ipv4Addr::new(198, 18, 0, 5));
         t.touch(id, 0);
-        // 未过期：不回收，reclaimed 空。
-        t.sweep(30, 60);
-        assert!(t.take_reclaimed_fake_ips().is_empty());
-        // 过期：回收，reclaimed 含该 fake-IP。
-        t.sweep(61, 60);
-        assert_eq!(
-            t.take_reclaimed_fake_ips(),
-            vec![Ipv4Addr::new(198, 18, 0, 5)]
-        );
-        // take 后清空（不重复 release）。
-        assert!(t.take_reclaimed_fake_ips().is_empty());
+        // 未过期：不回收，返回空。
+        assert!(t.sweep(30, 60).is_empty());
+        // 过期：回收，返回含该 fake-IP。
+        assert_eq!(t.sweep(61, 60), vec![Ipv4Addr::new(198, 18, 0, 5)]);
     }
 
     /// 刀2：LRU 驱逐带 fake-IP 的 assoc 时也累积 reclaimed（intern 到 cap 触发 evict）。

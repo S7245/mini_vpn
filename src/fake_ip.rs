@@ -80,8 +80,13 @@ impl FakeIpPool {
             }
         }
         // 一圈全占用（极端：~13 万映射全在册）：覆盖当前 next（罕见，调用方应已 sweep）。
+        // review #3：覆盖前清掉 victim 的 domain_to_ip，否则旧域名残留一条悬挂别名指向这个 IP，
+        // 而 ip_to_mapping[ip] 即将被改写成新域名 → resolve(旧域名查到的 IP) 串到新域名。
         let cand = Ipv4Addr::from(self.next);
         self.advance_next();
+        if let Some(victim) = self.ip_to_mapping.remove(&cand) {
+            self.domain_to_ip.remove(&victim.domain);
+        }
         cand
     }
 

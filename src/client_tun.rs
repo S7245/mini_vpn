@@ -139,9 +139,10 @@ const MIN_SPARE_LISTENERS: usize = 2;
 const FAKE_DNS_RESOLVER: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 
 /// fake-IP 映射回收 TTL（秒）：idle 且 refcount==0 超此时长才回收。
-/// 中文要点：远大于 DNS A 记录 TTL（5s），保证「DNS 查回后短暂未连」的映射不被过早回收；
+/// 中文要点：远大于 DNS A 记录 TTL（5s）。review #4：取 30min（而非 300s），给「应用已解析并缓存
+/// fake-IP、但尚未发起连接」留足窗口——这段 refcount==0，过早回收会让后续用缓存 IP 的连接被 Refuse。
 /// 活跃 flow（refcount>0）任何情况都不回收（见 FakeIpPool::sweep）。
-const FAKE_IP_TTL: u64 = 300;
+const FAKE_IP_TTL: u64 = 1800;
 
 /// Failure mode for `ListenerRegistry::ensure_port`.
 /// 中文要点：到顶时优雅拒绝，不能 panic，已注册端口的 socket 不受影响。
@@ -159,6 +160,9 @@ struct ListenerRegistry {
     pool_size: usize,
     /// 全局 listener socket 总数上限（#2 弹性扩容兜底；默认 [`MAX_TOTAL_LISTENERS`]）。
     max_total: usize,
+    /// 当前 listener socket 总数（review #6：O(1) 计数器，避免每 SYN 在扩容循环里 O(端口) 求和）。
+    /// 中文要点：槽只增不删（rearm/reap 复用回 Listen，从不从 ports 移除），故计数器随建槽单调累加。
+    total: usize,
 }
 
 impl ListenerRegistry {
@@ -167,6 +171,7 @@ impl ListenerRegistry {
             ports: HashMap::new(),
             pool_size,
             max_total: MAX_TOTAL_LISTENERS,
+            total: 0,
         }
     }
 
@@ -176,12 +181,13 @@ impl ListenerRegistry {
             ports: HashMap::new(),
             pool_size,
             max_total,
+            total: 0,
         }
     }
 
-    /// 当前所有端口的 listener socket 总数（O(端口数)，端口数 ≤ MAX_INTERCEPTED_PORTS）。
+    /// 当前所有端口的 listener socket 总数（O(1)，维护计数器）。
     fn total_handles(&self) -> usize {
-        self.ports.values().map(Vec::len).sum()
+        self.total
     }
 
     #[cfg(test)]
@@ -211,6 +217,7 @@ impl ListenerRegistry {
             socket_ctxs.insert(h, SocketCtx::new(port));
             handles.push(h);
         }
+        self.total += self.pool_size;
         println!(
             "🆕 listener pool created for port {port} (pool_size={})",
             self.pool_size
@@ -220,8 +227,7 @@ impl ListenerRegistry {
     }
 
     /// Iterate every smoltcp handle across all currently intercepted ports.
-    /// 中文要点：主循环用它替代 `ListenerPool.handles`，跨所有端口轮询首包。
-    #[cfg(test)]
+    /// 中文要点：脏集合驱动后热路径不再用它；仅低频「死槽回收」(reap_dead_slots) + 测试遍历。
     fn all_handles(&self) -> impl Iterator<Item = SocketHandle> + '_ {
         self.ports.values().flatten().copied()
     }
@@ -268,6 +274,7 @@ impl ListenerRegistry {
             let h = sockets.add(build_listener_socket(&spec));
             socket_ctxs.insert(h, SocketCtx::new(port));
             self.ports.get_mut(&port).unwrap().push(h);
+            self.total += 1;
         }
         Ok(())
     }
@@ -470,6 +477,8 @@ pub async fn run_event_loop<D, U, M>(
     let mut assoc_table = AssocTable::new();
     let udp_clock = std::time::Instant::now();
     let mut udp_sweep = tokio::time::interval(std::time::Duration::from_secs(1));
+    // review #7：fake-IP 池回收单独走低频 tick（TTL=300s，无需每秒全表扫）。
+    let mut fake_ip_sweep = tokio::time::interval(std::time::Duration::from_secs(60));
 
     loop {
         tokio::select! {
@@ -525,34 +534,35 @@ pub async fn run_event_loop<D, U, M>(
                         //    - 干净 SYN 去往新端口 → 立刻建监听池，smoltcp 同一帧就能 accept。
                         //    - 任意去往拦截端口的 TCP 包 → 把该端口 pool 标脏（#1），覆盖 SYN 之后
                         //      让 listener can_recv 的首个 data 包；relay 段只处理脏集合，不再全扫。
-                        if let Some(buf) = device.rx_peek() {
-                            if let Some(syn_port) = inspect_inbound_syn(buf) {
+                        if let Some(buf) = device.rx_peek()
+                            && let Some((port, is_clean_syn)) = inspect_inbound_tcp(buf)
+                        {
+                            if is_clean_syn {
                                 if let Err(e) =
-                                    registry.ensure_port(syn_port, &mut sockets, &mut socket_ctxs)
+                                    registry.ensure_port(port, &mut sockets, &mut socket_ctxs)
                                 {
                                     println!(
-                                        "⚠️ intercepted port cap reached, drop SYN to port {syn_port}: {:?}",
+                                        "⚠️ intercepted port cap reached, drop SYN to port {port}: {:?}",
                                         e
                                     );
                                 }
                                 // #2 弹性扩容：SYN accept 前确保该端口有空闲 listening 槽吸收突发，
                                 // 打掉「每端口 pool_size 固定上限」导致的热门端口 stall。全局 cap 兜底。
                                 if let Err(e) = registry.ensure_spare_listeners(
-                                    syn_port,
+                                    port,
                                     MIN_SPARE_LISTENERS,
                                     &mut sockets,
                                     &mut socket_ctxs,
                                 ) {
                                     println!(
-                                        "⚠️ global listener cap reached, 端口 {syn_port} 无法弹性扩容: {:?}",
+                                        "⚠️ global listener cap reached, 端口 {port} 无法弹性扩容: {:?}",
                                         e
                                     );
                                 }
                             }
-                            if let Some(port) = inbound_tcp_dst_port(buf) {
-                                for &h in registry.handles_for_port(port) {
-                                    dirty.insert(h);
-                                }
+                            // 任意去往拦截端口的 TCP 包 → 标脏该端口 pool（覆盖 SYN 之后的首个 data 包）。
+                            for &h in registry.handles_for_port(port) {
+                                dirty.insert(h);
                             }
                         }
 
@@ -602,13 +612,17 @@ pub async fn run_event_loop<D, U, M>(
             // Stage 13b: 周期回收空闲 UDP assoc。刀2：同时回收 fake-IP 引用 + sweep fake-IP 池。
             _ = udp_sweep.tick() => {
                 let now = udp_clock.elapsed().as_secs();
-                assoc_table.sweep(now, UDP_FLOW_IDLE_SECS);
                 // 被回收的 UDP assoc → release 其占用的 fake-IP（引用计数归零，进可回收候选）。
-                for ip in assoc_table.take_reclaimed_fake_ips() {
+                for ip in assoc_table.sweep(now, UDP_FLOW_IDLE_SECS) {
                     fake_pool.release(ip, now);
                 }
-                // 刀2（3d）：周期回收 idle 且 refcount==0 超 TTL 的 fake-IP 映射（长稳防泄漏）。
-                fake_pool.sweep(now, FAKE_IP_TTL);
+                // review #1/#2：回收已死/卡住的 TCP listener 槽（本地关闭/开远端失败的 teardown 缺口），
+                // 释放其 fake-IP refcount 并让槽回 Listen 复用，防 refcount 泄漏 + 槽数涨到 Capped。
+                reap_dead_slots(&registry, &mut sockets, &mut socket_ctxs, &mut fake_pool, now);
+            }
+            // review #7：低频回收 idle 且 refcount==0 超 TTL 的 fake-IP 映射（长稳防泄漏）。
+            _ = fake_ip_sweep.tick() => {
+                fake_pool.sweep(udp_clock.elapsed().as_secs(), FAKE_IP_TTL);
             }
             // 分支 2: 时钟滴答，处理超时重传等后台任务
             _ = timer.tick() =>{
@@ -690,6 +704,49 @@ async fn process_dirty_relay<U, M>(
     metrics.leave_relay();
 }
 
+/// 回收「已用过但已死/卡住」的 listener 槽（review #1/#2 修复）：本地 FIN/RST 关闭、双向关闭完成、
+/// 或开远端失败卡住的槽，热路径的 rearm 只在「远端 EOF / Refuse」触发，覆盖不到这些路径——
+/// 不回收则 ① 它持有的 fake-IP refcount 永不归零 → 映射永不被 sweep 回收（泄漏）；
+/// ② 槽停在非 Listen，`ensure_spare_listeners` 不断新建 → `total_handles` 涨到 `MAX_TOTAL_LISTENERS`
+/// → Capped → #2 修好的热门端口 stall 又回来。低频（1s tick）调用，非每包热路径。
+///
+/// 死槽判定（仅对「被用过」的槽，即 `ctx.state != Listening`；空闲 Listen 槽 ctx.state==Listening 永不命中）：
+/// - `!is_active()`：Closed / TimeWait（RST、双向关闭完成）；
+/// - `CloseWait`：被拦截应用已发 FIN（主动关闭）→ teardown，绝不会再有上行；
+/// - `OpeningRemote && uplink_tx.is_none()`：`open_tcp` 失败后状态卡在 OpeningRemote。
+fn reap_dead_slots(
+    registry: &ListenerRegistry,
+    sockets: &mut SocketSet<'_>,
+    socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
+    fake_pool: &mut FakeIpPool,
+    now_secs: u64,
+) -> usize {
+    let handles: Vec<SocketHandle> = registry.all_handles().collect();
+    let mut reaped = 0;
+    for h in handles {
+        let dead = {
+            let st = sockets.get::<TcpSocket>(h).state();
+            let active = sockets.get::<TcpSocket>(h).is_active();
+            match socket_ctxs.get(&h) {
+                Some(ctx) if ctx.state != SocketState::Listening => {
+                    !active
+                        || st == TcpState::CloseWait
+                        || (ctx.state == SocketState::OpeningRemote && ctx.uplink_tx.is_none())
+                }
+                _ => false,
+            }
+        };
+        if dead {
+            let sock = sockets.get_mut::<TcpSocket>(h);
+            if let Some(ctx) = socket_ctxs.get_mut(&h) {
+                rearm_socket(sock, ctx, fake_pool, now_secs);
+                reaped += 1;
+            }
+        }
+    }
+    reaped
+}
+
 /// Allocate a fresh smoltcp TCP listener socket for one pool slot.
 /// 中文要点：每次调用都创建一间独立房间，并立即挂上 listen 牌子。
 fn build_listener_socket(spec: &ListenerSpec) -> TcpSocket<'static> {
@@ -700,31 +757,17 @@ fn build_listener_socket(spec: &ListenerSpec) -> TcpSocket<'static> {
     tcp_socket
 }
 
-/// Identify a clean inbound TCP SYN and return its destination port.
-/// 中文要点：纯解析、无副作用。仅 IPv4+TCP+`syn && !ack` 才返回 Some(dst_port);
-/// 解析失败或非 IPv4 / 非 TCP / 不是干净 SYN 一律 None。
-fn inspect_inbound_syn(packet: &[u8]) -> Option<u16> {
-    let parsed = etherparse::PacketHeaders::from_ip_slice(packet).ok()?;
-    let etherparse::TransportHeader::Tcp(tcp) = parsed.transport? else {
-        return None;
-    };
-    if tcp.syn && !tcp.ack {
-        Some(tcp.destination_port)
-    } else {
-        None
-    }
-}
-
-/// Extract the destination TCP port from *any* inbound IPv4+TCP packet (not only a clean SYN).
-/// 中文要点：#1 脏集合驱动用——任何去往拦截端口的 TCP 包都把该端口 pool 标脏，覆盖
-/// SYN 之后让 listener `can_recv` 的首个 data 包（`inspect_inbound_syn` 只认干净 SYN，太窄）。
+/// 解析入站 IPv4+TCP 包：返回 `(目的端口, 是否干净 SYN)`。一次解析同时供 SYN 建池与脏集合标脏。
+/// 中文要点：review #5——原 `inspect_inbound_syn` + `inbound_tcp_dst_port` 对同一包解析两遍，
+/// 每个入站 TCP 包在热路径白跑一次 etherparse。合并为一次解析：`is_clean_syn = syn && !ack`
+/// 用于建池/扩容；端口对任意 TCP 包都返回，用于标脏（覆盖 SYN 之后让 listener can_recv 的首个 data 包）。
 /// 非 IPv4 / 非 TCP / 解析失败 → None。
-fn inbound_tcp_dst_port(packet: &[u8]) -> Option<u16> {
+fn inspect_inbound_tcp(packet: &[u8]) -> Option<(u16, bool)> {
     let parsed = etherparse::PacketHeaders::from_ip_slice(packet).ok()?;
     let etherparse::TransportHeader::Tcp(tcp) = parsed.transport? else {
         return None;
     };
-    Some(tcp.destination_port)
+    Some((tcp.destination_port, tcp.syn && !tcp.ack))
 }
 
 /// Convert a smoltcp endpoint into a relay Target.
@@ -1248,26 +1291,23 @@ mod tests {
     }
 
     #[test]
-    fn inspect_inbound_syn_returns_dst_port_for_clean_syn() {
-        let pkt = build_ipv4_tcp([10, 0, 0, 1], [1, 1, 1, 1], 60000, 443, true, false);
-        assert_eq!(inspect_inbound_syn(&pkt), Some(443));
+    fn inspect_inbound_tcp_flags_clean_syn() {
+        // 干净 SYN → (端口, is_clean_syn=true)。
+        let syn = build_ipv4_tcp([10, 0, 0, 1], [1, 1, 1, 1], 60000, 443, true, false);
+        assert_eq!(inspect_inbound_tcp(&syn), Some((443, true)));
+        // SYN-ACK → 端口仍返回（用于标脏），但非干净 SYN（不建池）。
+        let synack = build_ipv4_tcp([1, 1, 1, 1], [10, 0, 0, 1], 443, 60000, true, true);
+        assert_eq!(inspect_inbound_tcp(&synack), Some((60000, false)));
+        // 纯 ACK / data 包 → 端口返回，非 SYN（首包数据让 listener can_recv 的那一刻）。
+        let ack = build_ipv4_tcp([10, 0, 0, 1], [1, 1, 1, 1], 60000, 80, false, true);
+        assert_eq!(inspect_inbound_tcp(&ack), Some((80, false)));
     }
 
     #[test]
-    fn inspect_inbound_syn_rejects_syn_ack() {
-        let pkt = build_ipv4_tcp([1, 1, 1, 1], [10, 0, 0, 1], 443, 60000, true, true);
-        assert_eq!(inspect_inbound_syn(&pkt), None);
-    }
-
-    #[test]
-    fn inspect_inbound_syn_rejects_plain_ack() {
-        let pkt = build_ipv4_tcp([10, 0, 0, 1], [1, 1, 1, 1], 60000, 80, false, true);
-        assert_eq!(inspect_inbound_syn(&pkt), None);
-    }
-
-    #[test]
-    fn inspect_inbound_syn_rejects_garbage() {
-        assert_eq!(inspect_inbound_syn(&[0u8; 4]), None);
+    fn inspect_inbound_tcp_rejects_non_tcp_and_garbage() {
+        // 非 TCP（UDP）/ 垃圾 → None。
+        assert_eq!(inspect_inbound_tcp(&udp_pkt([8, 8, 8, 8], 53)), None);
+        assert_eq!(inspect_inbound_tcp(&[0u8; 4]), None);
     }
 
     #[test]
@@ -1343,6 +1383,43 @@ mod tests {
         assert_eq!(reg.handles_for_port(443).len(), 3);
     }
 
+    /// review #1/#2：reap_dead_slots 回收已用过且已死的槽（abort→Closed），rearm 回 Listen +
+    /// release 其 fake-IP；空闲 Listen 槽（ctx.state==Listening）不被回收。
+    #[test]
+    fn reap_dead_slots_rearms_closed_slot_and_releases_fake_ip() {
+        let mut sockets = SocketSet::new(vec![]);
+        let mut ctxs: HashMap<SocketHandle, SocketCtx> = HashMap::new();
+        let mut reg = ListenerRegistry::new(2);
+        reg.ensure_port(443, &mut sockets, &mut ctxs).unwrap();
+        let mut pool = FakeIpPool::new();
+        let ip = pool.alloc("x.com", 0);
+        pool.acquire(ip, 0);
+
+        let handles: Vec<SocketHandle> = reg.handles_for_port(443).to_vec();
+        let dead = handles[0];
+        let idle_listen = handles[1];
+        // dead 槽：模拟被用过后本地关闭（abort → Closed）+ 持有 fake-IP。
+        sockets.get_mut::<TcpSocket>(dead).abort();
+        {
+            let ctx = ctxs.get_mut(&dead).unwrap();
+            ctx.state = SocketState::Relaying;
+            ctx.fake_ip = Some(ip);
+        }
+        // idle_listen 槽：空闲监听（ctx.state 默认 Listening）→ 不该被回收。
+
+        let reaped = reap_dead_slots(&reg, &mut sockets, &mut ctxs, &mut pool, 1);
+        assert_eq!(reaped, 1, "只回收 1 个死槽");
+        let dead_ctx = ctxs.get(&dead).unwrap();
+        assert_eq!(dead_ctx.state, SocketState::Listening, "死槽回 Listening");
+        assert!(dead_ctx.fake_ip.is_none(), "死槽 fake-IP 已 release");
+        assert_eq!(pool.sweep(1000, 300), 1, "release 后映射可回收");
+        assert_eq!(
+            ctxs.get(&idle_listen).unwrap().state,
+            SocketState::Listening,
+            "空闲 Listen 槽不动"
+        );
+    }
+
     #[test]
     fn rearm_socket_restores_listening_state_and_releases_fake_ip() {
         let spec = ListenerSpec { local_port: 80 };
@@ -1409,24 +1486,6 @@ mod tests {
         let pkt = build_ipv4_tcp([10, 0, 0, 1], [1, 1, 1, 1], 60000, 443, true, false);
         assert_eq!(classify_inbound(&pkt), Inbound::Other);
         assert_eq!(classify_inbound(&[0u8; 4]), Inbound::Other);
-    }
-
-    /// #1 脏集合驱动：`inbound_tcp_dst_port` 对任意 TCP 包（不只干净 SYN）返回 dst_port，
-    /// 用于把该端口 pool 标脏。非 TCP / 垃圾返回 None。
-    #[test]
-    fn inbound_tcp_dst_port_returns_port_for_any_tcp() {
-        // 干净 SYN。
-        let syn = build_ipv4_tcp([10, 0, 0, 1], [1, 1, 1, 1], 60000, 443, true, false);
-        assert_eq!(inbound_tcp_dst_port(&syn), Some(443));
-        // SYN-ACK（inspect_inbound_syn 会拒，但脏集合驱动要认它的 dst_port）。
-        let synack = build_ipv4_tcp([1, 1, 1, 1], [10, 0, 0, 1], 443, 60000, true, true);
-        assert_eq!(inbound_tcp_dst_port(&synack), Some(60000));
-        // 纯 ACK / data 包（首包数据让 listener can_recv 的那一刻）。
-        let ack = build_ipv4_tcp([10, 0, 0, 1], [1, 1, 1, 1], 60000, 80, false, true);
-        assert_eq!(inbound_tcp_dst_port(&ack), Some(80));
-        // 非 TCP（UDP）/ 垃圾 → None。
-        assert_eq!(inbound_tcp_dst_port(&udp_pkt([8, 8, 8, 8], 53)), None);
-        assert_eq!(inbound_tcp_dst_port(&[0u8; 4]), None);
     }
 
     /// #1 脏集合驱动：`handles_for_port` 返回该端口 pool 的全部 handle；未注册端口空 slice。
