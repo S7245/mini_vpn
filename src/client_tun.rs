@@ -13,7 +13,7 @@ use smoltcp::wire::{IpAddress, IpCidr, IpListenEndpoint};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::sync::Arc;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 
 pub(crate) const TCP_SOCKET_BUFFER_SIZE: usize = 65_535;
@@ -184,8 +184,16 @@ impl ListenerRegistry {
 
     /// Iterate every smoltcp handle across all currently intercepted ports.
     /// 中文要点：主循环用它替代 `ListenerPool.handles`，跨所有端口轮询首包。
+    #[cfg(test)]
     fn all_handles(&self) -> impl Iterator<Item = SocketHandle> + '_ {
         self.ports.values().flatten().copied()
+    }
+
+    /// All listener handles registered for `port`（未注册端口返回空 slice）。
+    /// 中文要点：#1 脏集合驱动——按 inbound 包的 dst_port 取该端口 pool 全部 handle 标脏，
+    /// 替代每 tick 全量 `all_handles()` 遍历。
+    fn handles_for_port(&self, port: u16) -> &[SocketHandle] {
+        self.ports.get(&port).map(Vec::as_slice).unwrap_or(&[])
     }
 }
 
@@ -327,6 +335,11 @@ pub async fn run_event_loop<D, U, M>(
     let mut registry = ListenerRegistry::new(pool_size);
     let mut socket_ctxs: HashMap<SocketHandle, SocketCtx> = HashMap::new();
 
+    // #1 脏集合驱动：只有「本 tick 有活动」的 listener handle 进集合，relay 段仅处理它们，
+    // 替代每 tick O(总槽) 全量 sweep。入集 = inbound TCP 包标脏其端口 pool / 回程残留下行 pending；
+    // 出集 = 处理后无 pending 且不再 can_recv（见 process_dirty_relay）。
+    let mut dirty: HashSet<SocketHandle> = HashSet::new();
+
     // Stage 11: fake-IP DNS。监听 UDP :53（AnyIP 收发往 198.18.0.1:53 的查询），
     // 本地伪造 A 响应（fake-IP）；TCP 时凭 fake-IP 查回域名走 DomainPort relay。
     let dns_handle = {
@@ -400,6 +413,15 @@ pub async fn run_event_loop<D, U, M>(
                 {
                     println!("处理回程数据失败: {e}");
                 }
+                // #1：回程写不下的下行字节留在 downlink_pending（tx buffer 满）→ 标脏，
+                // 让 relay 段后续 tick 持续 flush，直到排空才出集（绝不丢字节）。
+                if socket_ctxs
+                    .get(&handle)
+                    .map(|c| !c.downlink_pending.is_empty())
+                    .unwrap_or(false)
+                {
+                    dirty.insert(handle);
+                }
             }
             // 分支 1: 全局回信通道接收到了新数据包
             // 分支 1: 物理网卡接收到了新数据包
@@ -421,16 +443,25 @@ pub async fn run_event_loop<D, U, M>(
                             .await;
                         }
                     } else {
-                        // 1) SYN inspector：在 iface.poll 之前看一眼包，若是去往新端口的干净 SYN，
-                        //    立刻为该端口建监听池，这样 smoltcp 同一帧就能 accept。
-                        if let Some(buf) = device.rx_peek()
-                            && let Some(port) = inspect_inbound_syn(buf)
-                            && let Err(e) = registry.ensure_port(port, &mut sockets, &mut socket_ctxs)
-                        {
-                            println!(
-                                "⚠️ intercepted port cap reached, drop SYN to port {port}: {:?}",
-                                e
-                            );
+                        // 1) SYN inspector + 脏集合标脏：在 iface.poll 之前看一眼包。
+                        //    - 干净 SYN 去往新端口 → 立刻建监听池，smoltcp 同一帧就能 accept。
+                        //    - 任意去往拦截端口的 TCP 包 → 把该端口 pool 标脏（#1），覆盖 SYN 之后
+                        //      让 listener can_recv 的首个 data 包；relay 段只处理脏集合，不再全扫。
+                        if let Some(buf) = device.rx_peek() {
+                            if let Some(syn_port) = inspect_inbound_syn(buf)
+                                && let Err(e) =
+                                    registry.ensure_port(syn_port, &mut sockets, &mut socket_ctxs)
+                            {
+                                println!(
+                                    "⚠️ intercepted port cap reached, drop SYN to port {syn_port}: {:?}",
+                                    e
+                                );
+                            }
+                            if let Some(port) = inbound_tcp_dst_port(buf) {
+                                for &h in registry.handles_for_port(port) {
+                                    dirty.insert(h);
+                                }
+                            }
                         }
 
                         metrics.enter_poll();
@@ -442,24 +473,16 @@ pub async fn run_event_loop<D, U, M>(
                         device.flush_tx().await.unwrap();
                         metrics.leave_poll();
 
-                        metrics.enter_relay();
-                        let handles: Vec<SocketHandle> = registry.all_handles().collect();
-                        metrics.note_listeners(handles.len());
-                        for handle in handles {
-                            if let Err(e) = process_listener_activity(
-                                handle,
-                                &mut sockets,
-                                &mut socket_ctxs,
-                                &*upstream,
-                                &global_tx,
-                                &fake_pool,
-                            )
-                            .await
-                            {
-                                println!("处理本地房间 {:?} 失败: {e}", handle);
-                            }
-                        }
-                        metrics.leave_relay();
+                        process_dirty_relay(
+                            &mut dirty,
+                            &mut sockets,
+                            &mut socket_ctxs,
+                            &*upstream,
+                            &global_tx,
+                            &fake_pool,
+                            &mut metrics,
+                        )
+                        .await;
                     }
                 }
             }
@@ -497,27 +520,70 @@ pub async fn run_event_loop<D, U, M>(
                 device.flush_tx().await.unwrap();
                 metrics.leave_poll();
 
-                metrics.enter_relay();
-                let handles: Vec<SocketHandle> = registry.all_handles().collect();
-                metrics.note_listeners(handles.len());
-                for handle in handles {
-                    if let Err(e) = process_listener_activity(
-                        handle,
-                        &mut sockets,
-                        &mut socket_ctxs,
-                        &*upstream,
-                        &global_tx,
-                        &fake_pool,
-                    )
-                    .await
-                    {
-                        println!("处理本地房间 {:?} 失败: {e}", handle);
-                    }
-                }
-                metrics.leave_relay();
+                // #1：timer tick 无新 inbound 包，只续推进脏集合（主要是下行 pending flush +
+                // smoltcp 超时重传释放 tx buffer 后继续写）。不再全量 sweep。
+                process_dirty_relay(
+                    &mut dirty,
+                    &mut sockets,
+                    &mut socket_ctxs,
+                    &*upstream,
+                    &global_tx,
+                    &fake_pool,
+                    &mut metrics,
+                )
+                .await;
             }
         }
     }
+}
+
+/// #1 脏集合驱动的 relay 调度段：只处理本 tick 标脏的 handle，替代每 tick 全量 `all_handles()`。
+///
+/// 中文要点：把 relay 段成本从 O(总 listener 槽数) 降到 O(活跃 handle)。处理完一个 handle 后，
+/// 若它既无下行 pending、smoltcp 侧也不再 `can_recv`（首包已 drain、已开远端进 Relaying），
+/// 就出脏集合——后续回程走 `global_rx` 分支，残留 pending 时会被重新标脏。仍有活就留在集合里下个 tick 续处理。
+async fn process_dirty_relay<U, M>(
+    dirty: &mut HashSet<SocketHandle>,
+    sockets: &mut SocketSet<'_>,
+    socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
+    upstream: &U,
+    global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
+    fake_pool: &FakeIpPool,
+    metrics: &mut M,
+) where
+    U: ProxyUpstream,
+    M: MetricsSink,
+{
+    metrics.enter_relay();
+    // 快照后处理：边遍历边 `dirty.remove` 会与迭代借用冲突。dirty 规模 = O(活跃)，分配可忽略。
+    let snapshot: Vec<SocketHandle> = dirty.iter().copied().collect();
+    metrics.note_listeners(snapshot.len());
+    for handle in snapshot {
+        if let Err(e) = process_listener_activity(
+            handle,
+            sockets,
+            socket_ctxs,
+            upstream,
+            global_tx,
+            fake_pool,
+        )
+        .await
+        {
+            println!("处理本地房间 {:?} 失败: {e}", handle);
+        }
+        let still_active = {
+            let has_recv = sockets.get_mut::<TcpSocket>(handle).can_recv();
+            let has_pending = socket_ctxs
+                .get(&handle)
+                .map(|c| !c.downlink_pending.is_empty())
+                .unwrap_or(false);
+            has_recv || has_pending
+        };
+        if !still_active {
+            dirty.remove(&handle);
+        }
+    }
+    metrics.leave_relay();
 }
 
 /// Allocate a fresh smoltcp TCP listener socket for one pool slot.
@@ -543,6 +609,18 @@ fn inspect_inbound_syn(packet: &[u8]) -> Option<u16> {
     } else {
         None
     }
+}
+
+/// Extract the destination TCP port from *any* inbound IPv4+TCP packet (not only a clean SYN).
+/// 中文要点：#1 脏集合驱动用——任何去往拦截端口的 TCP 包都把该端口 pool 标脏，覆盖
+/// SYN 之后让 listener `can_recv` 的首个 data 包（`inspect_inbound_syn` 只认干净 SYN，太窄）。
+/// 非 IPv4 / 非 TCP / 解析失败 → None。
+fn inbound_tcp_dst_port(packet: &[u8]) -> Option<u16> {
+    let parsed = etherparse::PacketHeaders::from_ip_slice(packet).ok()?;
+    let etherparse::TransportHeader::Tcp(tcp) = parsed.transport? else {
+        return None;
+    };
+    Some(tcp.destination_port)
 }
 
 /// Convert a smoltcp endpoint into a relay Target.
@@ -1110,5 +1188,34 @@ mod tests {
         let pkt = build_ipv4_tcp([10, 0, 0, 1], [1, 1, 1, 1], 60000, 443, true, false);
         assert_eq!(classify_inbound(&pkt), Inbound::Other);
         assert_eq!(classify_inbound(&[0u8; 4]), Inbound::Other);
+    }
+
+    /// #1 脏集合驱动：`inbound_tcp_dst_port` 对任意 TCP 包（不只干净 SYN）返回 dst_port，
+    /// 用于把该端口 pool 标脏。非 TCP / 垃圾返回 None。
+    #[test]
+    fn inbound_tcp_dst_port_returns_port_for_any_tcp() {
+        // 干净 SYN。
+        let syn = build_ipv4_tcp([10, 0, 0, 1], [1, 1, 1, 1], 60000, 443, true, false);
+        assert_eq!(inbound_tcp_dst_port(&syn), Some(443));
+        // SYN-ACK（inspect_inbound_syn 会拒，但脏集合驱动要认它的 dst_port）。
+        let synack = build_ipv4_tcp([1, 1, 1, 1], [10, 0, 0, 1], 443, 60000, true, true);
+        assert_eq!(inbound_tcp_dst_port(&synack), Some(60000));
+        // 纯 ACK / data 包（首包数据让 listener can_recv 的那一刻）。
+        let ack = build_ipv4_tcp([10, 0, 0, 1], [1, 1, 1, 1], 60000, 80, false, true);
+        assert_eq!(inbound_tcp_dst_port(&ack), Some(80));
+        // 非 TCP（UDP）/ 垃圾 → None。
+        assert_eq!(inbound_tcp_dst_port(&udp_pkt([8, 8, 8, 8], 53)), None);
+        assert_eq!(inbound_tcp_dst_port(&[0u8; 4]), None);
+    }
+
+    /// #1 脏集合驱动：`handles_for_port` 返回该端口 pool 的全部 handle；未注册端口空 slice。
+    #[test]
+    fn handles_for_port_returns_pool_handles() {
+        let mut sockets = SocketSet::new(vec![]);
+        let mut ctxs: HashMap<SocketHandle, SocketCtx> = HashMap::new();
+        let mut reg = ListenerRegistry::new(3);
+        reg.ensure_port(443, &mut sockets, &mut ctxs).unwrap();
+        assert_eq!(reg.handles_for_port(443).len(), 3);
+        assert!(reg.handles_for_port(8080).is_empty());
     }
 }

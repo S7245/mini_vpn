@@ -61,6 +61,26 @@ commit：`feat(knife2): periodic fake-IP sweep in event loop (3d)`
 3. 跨机/压测 acceptance（用户配合 sing-box env，#3 probe 视情）。
 4. 更新 HANDOFF / TODO 状态（刀2 完成、刀3 入口）。
 
-## 基线数据（Task 0 填）
+## 基线数据（Task 0，2026-06-15 本机 darwin）
 
-（待跑）
+优化前（`--ignored --nocapture`）：
+
+```
+# #1 隔离（N=256，扫 pool_size）：relay 随总槽线性翻倍、avg_listeners≈总槽
+pool= 8 总槽= 512  relay=124.2ms/ 926  avg_listeners= 494.6  thrpt=8.94Mb/s
+pool=16 总槽=1024  relay=264.4ms/1052  avg_listeners= 993.3  thrpt=5.00Mb/s
+pool=32 总槽=2048  relay=532.9ms/1104  avg_listeners=1989.6  thrpt=2.76Mb/s
+
+# N sweep（固定 64×16=1024 槽）：吞吐随 N 跌
+N=  64  relay= 53.4ms/ 209  avg_listeners= 869.7  thrpt=6.09Mb/s
+N= 256  relay=231.7ms/ 942  avg_listeners= 989.8  thrpt=5.67Mb/s
+N=1024  relay=1618ms/6322  avg_listeners=1018.9  thrpt=2.50Mb/s
+
+# #2 单端口 pool=2（生产默认）：硬上限 stall
+单端口 pool=2  done=2/256  wall=20000ms(超时)  listeners max=2
+```
+
+判据（优化后应达成）：
+- #1：relay 段 / avg_listeners **不再随总槽线性翻倍**，而随活跃连接走。
+- #2：单端口 256 路 **done 接近 N/N**（弹性扩容打掉硬上限）。
+- 吞吐 N 曲线回升（relay 不再塞满单线程）。
