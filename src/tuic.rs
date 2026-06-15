@@ -10,7 +10,7 @@ use crate::udp_relay::{FlowEntry, FourTuple, MAX_UDP_FLOWS};
 use crate::upstream::{DatagramUpstream, ProxyUpstream, RelayStream};
 use quinn::{Connection, Endpoint};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -266,6 +266,11 @@ fn address_len(buf: &[u8], pos: usize) -> Option<usize> {
 pub struct AssocTable {
     tuple_to_id: HashMap<FourTuple, u16>,
     id_to_entry: HashMap<u16, FlowEntry>,
+    /// 刀2：assoc-id → 本 UDP flow 占用的 fake-IP（若 target 经 fake-IP 改写）。
+    /// 中文要点：用于回收（evict/sweep）该 assoc 时知道要 `release` 哪个 fake-IP（引用计数）。
+    id_to_fake_ip: HashMap<u16, Ipv4Addr>,
+    /// 刀2：本轮被回收（evict/sweep）且有 fake-IP 的 assoc 的 fake-IP，待主循环 drain 后 `release`。
+    reclaimed_fake_ips: Vec<Ipv4Addr>,
     next_id: u16,
     cap: usize,
 }
@@ -285,8 +290,29 @@ impl AssocTable {
         Self {
             tuple_to_id: HashMap::new(),
             id_to_entry: HashMap::new(),
+            id_to_fake_ip: HashMap::new(),
+            reclaimed_fake_ips: Vec::new(),
             next_id: 1,
             cap: cap.max(1).min(u16::MAX as usize),
+        }
+    }
+
+    /// 刀2：登记该 assoc 占用的 fake-IP（UDP 新 flow 时调，调用方随后 `fake_pool.acquire`）。
+    pub fn set_fake_ip(&mut self, assoc_id: u16, ip: Ipv4Addr) {
+        self.id_to_fake_ip.insert(assoc_id, ip);
+    }
+
+    /// 刀2：取走本轮被回收（evict/sweep）的 fake-IP 列表，主循环对每个 `fake_pool.release`。
+    /// 中文要点：assoc 回收与 fake-IP release 解耦——AssocTable 不持有 FakeIpPool，
+    /// 只累积「该 release 谁」，由独占两者的主循环执行，避免交叉借用/循环依赖。
+    pub fn take_reclaimed_fake_ips(&mut self) -> Vec<Ipv4Addr> {
+        std::mem::take(&mut self.reclaimed_fake_ips)
+    }
+
+    /// assoc 被回收时，若它占用了 fake-IP，移出映射并记入待 release 队列。
+    fn note_reclaimed(&mut self, assoc_id: u16) {
+        if let Some(ip) = self.id_to_fake_ip.remove(&assoc_id) {
+            self.reclaimed_fake_ips.push(ip);
         }
     }
 
@@ -352,6 +378,7 @@ impl AssocTable {
         for (id, tuple) in expired {
             self.id_to_entry.remove(&id);
             self.tuple_to_id.remove(&tuple);
+            self.note_reclaimed(id); // 刀2：回收该 assoc 占用的 fake-IP（→ 待 release）
         }
     }
 
@@ -365,6 +392,7 @@ impl AssocTable {
             && let Some(e) = self.id_to_entry.remove(&id)
         {
             self.tuple_to_id.remove(&e.tuple);
+            self.note_reclaimed(id); // 刀2：LRU 驱逐时同样回收 fake-IP
         }
     }
 
@@ -876,6 +904,40 @@ mod tests {
         assert_eq!(e.target_src(), (std::net::Ipv4Addr::new(198, 18, 0, 5), 443));
         t.sweep(61, 60);
         assert!(t.resolve(id).is_none());
+    }
+
+    /// 刀2：sweep 回收带 fake-IP 的 assoc 时，把该 fake-IP 累积进 reclaimed（供主循环 release）。
+    #[test]
+    fn assoc_sweep_reclaims_fake_ip() {
+        let mut t = AssocTable::new();
+        let id = t.intern(tuple(1000));
+        t.set_fake_ip(id, Ipv4Addr::new(198, 18, 0, 5));
+        t.touch(id, 0);
+        // 未过期：不回收，reclaimed 空。
+        t.sweep(30, 60);
+        assert!(t.take_reclaimed_fake_ips().is_empty());
+        // 过期：回收，reclaimed 含该 fake-IP。
+        t.sweep(61, 60);
+        assert_eq!(
+            t.take_reclaimed_fake_ips(),
+            vec![Ipv4Addr::new(198, 18, 0, 5)]
+        );
+        // take 后清空（不重复 release）。
+        assert!(t.take_reclaimed_fake_ips().is_empty());
+    }
+
+    /// 刀2：LRU 驱逐带 fake-IP 的 assoc 时也累积 reclaimed（intern 到 cap 触发 evict）。
+    #[test]
+    fn assoc_evict_reclaims_fake_ip() {
+        let mut t = AssocTable::with_cap(1);
+        let id1 = t.intern(tuple(1));
+        t.set_fake_ip(id1, Ipv4Addr::new(198, 18, 0, 9));
+        // 再 intern 一条 → cap=1 触发 evict id1。
+        let _id2 = t.intern(tuple(2));
+        assert_eq!(
+            t.take_reclaimed_fake_ips(),
+            vec![Ipv4Addr::new(198, 18, 0, 9)]
+        );
     }
 
     #[test]

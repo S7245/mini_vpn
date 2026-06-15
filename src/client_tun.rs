@@ -138,6 +138,11 @@ const MIN_SPARE_LISTENERS: usize = 2;
 /// fake-IP DNS resolver 地址：去往它的 :53 UDP 走本地 fake-IP 应答，不进 UDP relay。
 const FAKE_DNS_RESOLVER: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 
+/// fake-IP 映射回收 TTL（秒）：idle 且 refcount==0 超此时长才回收。
+/// 中文要点：远大于 DNS A 记录 TTL（5s），保证「DNS 查回后短暂未连」的映射不被过早回收；
+/// 活跃 flow（refcount>0）任何情况都不回收（见 FakeIpPool::sweep）。
+const FAKE_IP_TTL: u64 = 300;
+
 /// Failure mode for `ListenerRegistry::ensure_port`.
 /// 中文要点：到顶时优雅拒绝，不能 panic，已注册端口的 socket 不受影响。
 #[derive(Debug, PartialEq, Eq)]
@@ -509,7 +514,7 @@ pub async fn run_event_loop<D, U, M>(
                             handle_tuic_udp_uplink(
                                 &pkt,
                                 &mut assoc_table,
-                                &fake_pool,
+                                &mut fake_pool,
                                 &*upstream,
                                 udp_clock.elapsed().as_secs(),
                             )
@@ -594,9 +599,16 @@ pub async fn run_event_loop<D, U, M>(
                     }
                 }
             }
-            // Stage 13b: 周期回收空闲 UDP assoc。
+            // Stage 13b: 周期回收空闲 UDP assoc。刀2：同时回收 fake-IP 引用 + sweep fake-IP 池。
             _ = udp_sweep.tick() => {
-                assoc_table.sweep(udp_clock.elapsed().as_secs(), UDP_FLOW_IDLE_SECS);
+                let now = udp_clock.elapsed().as_secs();
+                assoc_table.sweep(now, UDP_FLOW_IDLE_SECS);
+                // 被回收的 UDP assoc → release 其占用的 fake-IP（引用计数归零，进可回收候选）。
+                for ip in assoc_table.take_reclaimed_fake_ips() {
+                    fake_pool.release(ip, now);
+                }
+                // 刀2（3d）：周期回收 idle 且 refcount==0 超 TTL 的 fake-IP 映射（长稳防泄漏）。
+                fake_pool.sweep(now, FAKE_IP_TTL);
             }
             // 分支 2: 时钟滴答，处理超时重传等后台任务
             _ = timer.tick() =>{
@@ -1095,7 +1107,7 @@ fn classify_inbound(pkt: &[u8]) -> Inbound {
 async fn handle_tuic_udp_uplink<U: DatagramUpstream>(
     pkt: &[u8],
     assoc_table: &mut AssocTable,
-    fake_pool: &FakeIpPool,
+    fake_pool: &mut FakeIpPool,
     upstream: &U,
     now_secs: u64,
 ) {
@@ -1106,9 +1118,8 @@ async fn handle_tuic_udp_uplink<U: DatagramUpstream>(
         IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_bytes(&udp.dst_ip.octets())),
         udp.dst_port,
     );
-    let target = match resolve_target(dst_ep, fake_pool) {
-        // UDP flow 的 fake-IP 引用计数在 3c 经 AssocTable 打通（这里先取 target）。
-        TargetResolve::Direct { target, .. } => target,
+    let (target, fake_ip) = match resolve_target(dst_ep, fake_pool) {
+        TargetResolve::Direct { target, fake_ip } => (target, fake_ip),
         TargetResolve::Refuse => {
             println!("🚫 UDP fake-IP {} 无映射，丢弃（待应用重新解析）", udp.dst_ip);
             return;
@@ -1125,11 +1136,21 @@ async fn handle_tuic_udp_uplink<U: DatagramUpstream>(
     let assoc_id = assoc_table.intern(tuple);
     assoc_table.touch(assoc_id, now_secs);
     if is_new {
+        // 刀2 引用计数：UDP 新 flow 占用 fake-IP → 登记到 assoc + acquire，
+        // 保证该映射在 flow 存活期间不被 fake_pool sweep 回收（回收会让回程 resolve 失败）。
+        if let Some(ip) = fake_ip {
+            assoc_table.set_fake_ip(assoc_id, ip);
+            fake_pool.acquire(ip, now_secs);
+        }
         println!(
             "🌊 TUIC UDP↑ new assoc={assoc_id} → {} (first {}B)",
             target.to_wire_string(),
             udp.payload.len()
         );
+    }
+    // intern 可能 LRU 驱逐旧 assoc → 立即 release 其占用的 fake-IP（引用计数平衡）。
+    for ip in assoc_table.take_reclaimed_fake_ips() {
+        fake_pool.release(ip, now_secs);
     }
     upstream.send_udp(encode_packet(assoc_id, &target, udp.payload)).await;
 }
