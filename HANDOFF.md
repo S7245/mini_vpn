@@ -9,7 +9,8 @@
 - **Stage 13 全部完成**：数据面已是 **client-only TUIC over quinn → sing-box**（ADR-0004）。
   - 13a TCP via TUIC Connect ✅、13b UDP via TUIC Packet ✅、13c 按需 heartbeat + 保活厘清（0-RTT 撞 quinn 0.10 墙、deferred）✅、13d 退役 legacy（删 yamux/自研 server/双轨开关/6 个依赖）✅。
   - 全部跨机签收（深圳 client → US/HK sing-box）；55 单测、clippy 0 warning、release build 绿。
-- 新 session 起点（刀2）：**从 `main` 起新分支**（刀1 已合 main）。
+- **刀2 已完成**，在分支 `claude/knife2-concurrency-opt`（**未合 main**，见下「刀2 已完成」）。
+- 新 session 起点（刀3）：待用户合并刀2 后**从 `main` 起新分支**，或直接从 `claude/knife2-concurrency-opt` 起。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
 ## 目标（唯一北极星）：`Rules.md`
@@ -38,8 +39,8 @@
 ```
 主线（Rules.md 三目标）
  ├─ 刀1  大并发压测 harness（先定位真瓶颈，事实先行）  ✅ 完成（见下「刀1 已完成」）
- ├─ 刀2  大并发优化（按刀1结果对症）+ fake-IP 池 LRU/TTL 回收  ← 下一刀
- ├─ 刀3  UDP 直播硬化（quic-stream fallback + 吞吐压测 + MSS/MTU）
+ ├─ 刀2  大并发优化（#1 脏集合 + #2 弹性扩容 + fake-IP 引用计数回收）  ✅ 完成（见下「刀2 已完成」）
+ ├─ 刀3  UDP 直播硬化（quic-stream fallback + 吞吐压测 + MSS/MTU）  ← 下一刀
  └─ 刀4  连接成功率（DoH/DoT 拦截 + 拦全 :53；first-SYN-to-fresh-fake-IP refused）
 
 正交线（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）
@@ -65,15 +66,25 @@
 4. ✅ **P1 #4 单线程 select 上限**（吞吐随每-tick 开销跌；与 #1 强耦合）。
 5. ✅ **P2 #5 128KB/socket**（2048 槽≈256MB，多为 #1 空扫的空闲槽）。
 
-## 下一刀（刀2）：大并发优化（对症刀1）+ fake-IP 池回收
+## 刀2 已完成（2026-06-15）：大并发优化 + fake-IP 引用计数回收
 
-**起点**：从 `main` 起新分支（刀1 已合 main）。读 findings 文档。
-**主攻**（按刀1 优先级）：
-- **#1**：主循环别每 tick 全量 sweep `all_handles()`；改"仅处理有 readiness 的 handle"（事件/脏集合驱动）。
-  harness 的三段插桩 + N sweep 可直接量化优化效果（优化前后对比 relay/call）。
-- **#2**：per-port pool 弹性扩容/复用 + accept backlog；放开 `MAX_INTERCEPTED_PORTS`/`pool_size` 的硬上限。
-- 顺带 **fake-IP 池 LRU/TTL 回收**（长稳）。#4/#5 多半随 #1/#2 一起缓解。
-**验证**：harness N sweep 优化前后对比 + 跨机 acceptance；#3 用 findings 的 probe 配方判定是否需 QUIC 连接池。
+**交付**（分支 `claude/knife2-concurrency-opt`，从 main 起，逐 commit push；未合 main）：
+- **#1 脏集合驱动**：主循环 relay 段从每 tick 全量 `all_handles()` O(总槽) sweep → 只处理脏集合
+  （`dirty: HashSet<SocketHandle>`，inbound TCP 包按 dst_port 标脏 + 回程残留 pending 标脏）。
+- **#2 弹性扩容**：`ensure_spare_listeners` 按需补足空闲 Listen 槽（看 smoltcp `state()==Listen`），
+  全局 `MAX_TOTAL_LISTENERS=4096` 兜底；打掉每端口 pool 硬上限。
+- **fake-IP 引用计数回收**：`FakeIpPool` 每映射 refcount+last_used；TCP（`SocketCtx.fake_ip`）/
+  UDP（`AssocTable` id→fake-IP）两条 flow 打通 acquire/release；周期 sweep（60s tick，TTL=1800s）；
+  `reap_dead_slots`（1s tick）回收本地关闭/开远端失败的死槽 → 释放 refcount + 槽复用。
+- spec/plan/findings 续篇：`docs/tech/2026-06-15-knife2-concurrency-opt-*` + findings「刀2 优化结果」。
+
+**量化（harness，优化前→后）**：#1 relay 段不再随总槽线性翻倍（N=1024 relay 1618ms→71ms，
+吞吐 2.50→6.22 Mb/s）；#2 单端口 256 路 done 2/256(20s stall)→256/256(266ms)。
+`/code-review`（high effort）8 条 findings 已全部修复（核心：teardown 死槽回收修 refcount/槽泄漏）。
+
+**未做（deferred）**：#3 单条 QUIC 连接拥塞/队头需真 sing-box probe（findings 末节配方，归刀3 acceptance）；
+#4 多线程化（#1 后 poll/smoltcp 段成新瓶颈，留后续评估）；CloseWait+远端 keepalive 的半关闭已被
+`reap_dead_slots` 覆盖（CloseWait 视为应用关闭 teardown）。**未做跨机/真出口 acceptance**（需用户 sing-box env）。
 
 ## Rhythm（每刀都遵守）
 
@@ -89,7 +100,7 @@
 - **0-RTT**：quinn 0.10 / rustls 0.21 在 0-RTT 阶段无法 `export_keying_material`，TUIC auth 必失败回落 1-RTT → `MINI_VPN_TUIC_ZERO_RTT` 默认关。真 0-RTT 需 quinn 升级（归移动端 stage），见 TODO 13c。
 - **quic-stream UDP fallback** 未实现（native datagram 超上限丢弃）——刀3 要做。
 - **DoH/DoT 绕过 fake-IP**：浏览器/系统加密 DNS 会拿到真实 IP → 连接失败——刀4。
-- **fake-IP 池永不回收**（198.18/15）——刀2 长稳。
+- ~~**fake-IP 池永不回收**（198.18/15）~~——✅ 刀2 已修（引用计数活跃 flow + 60s sweep + 死槽回收）。
 - **first-SYN-to-fresh-fake-IP `connection refused`**（SYN inspector 建池竞态，curl 不重试 refused）——刀4。
 - 出口是 VPS datacenter IP → Google/Meta 风控（协议无关，记录即可）。
 
