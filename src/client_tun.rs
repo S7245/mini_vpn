@@ -548,7 +548,7 @@ pub async fn run_event_loop<D, U, M>(
                         let timestamp = smoltcp::time::Instant::now();
                         iface.poll(timestamp, &mut device, &mut sockets);
                         // 处理 DNS 查询并伪造响应；再 poll 一次把响应变成 IP 包入发货队列。
-                        drain_dns(&mut sockets, dns_handle, &mut fake_pool);
+                        drain_dns(&mut sockets, dns_handle, &mut fake_pool, udp_clock.elapsed().as_secs());
                         iface.poll(timestamp, &mut device, &mut sockets);
                         device.flush_tx().await.unwrap();
                         metrics.leave_poll();
@@ -595,7 +595,7 @@ pub async fn run_event_loop<D, U, M>(
                 metrics.enter_poll();
                 let timestamp = smoltcp::time::Instant::now();
                 iface.poll(timestamp, &mut device, &mut sockets);
-                drain_dns(&mut sockets, dns_handle, &mut fake_pool);
+                drain_dns(&mut sockets, dns_handle, &mut fake_pool, udp_clock.elapsed().as_secs());
                 iface.poll(timestamp, &mut device, &mut sockets);
                 device.flush_tx().await.unwrap();
                 metrics.leave_poll();
@@ -745,7 +745,12 @@ fn resolve_target(endpoint: smoltcp::wire::IpEndpoint, fake_pool: &FakeIpPool) -
 
 /// 处理 DNS socket 上排队的查询：A → 分配 fake-IP 并伪造 A 响应；其它 → NODATA。
 /// 中文要点：纯本地应答，不外发真实 DNS；解析失败的查询直接忽略，绝不 panic。
-fn drain_dns(sockets: &mut SocketSet<'_>, dns_handle: SocketHandle, fake_pool: &mut FakeIpPool) {
+fn drain_dns(
+    sockets: &mut SocketSet<'_>,
+    dns_handle: SocketHandle,
+    fake_pool: &mut FakeIpPool,
+    now_secs: u64,
+) {
     let sock = sockets.get_mut::<udp::Socket>(dns_handle);
     while sock.can_recv() {
         let (data, remote) = match sock.recv() {
@@ -756,7 +761,7 @@ fn drain_dns(sockets: &mut SocketSet<'_>, dns_handle: SocketHandle, fake_pool: &
             continue;
         };
         let resp = if q.qtype == dns::QTYPE_A {
-            let ip = fake_pool.alloc(&q.qname);
+            let ip = fake_pool.alloc(&q.qname, now_secs);
             println!("🪪 DNS {} (A) → fake-IP {}", q.qname, ip);
             dns::build_response(&q, Answer::A(ip, 5))
         } else {
