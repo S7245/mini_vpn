@@ -81,6 +81,10 @@ struct SocketCtx {
     /// 中文要点：smoltcp send_slice 可能只写一部分（tx buffer 受 TCP ACK 释放制约），
     /// 写不下的字节必须留在这里、由后续 poll 持续 flush，否则丢字节 → TLS bad decrypt。
     downlink_pending: Vec<u8>,
+    /// 本槽位当前 flow 占用的 fake-IP（若 target 经 fake-IP 改写）。
+    /// 中文要点：刀2 引用计数——首次开远端时 `acquire`、rearm 时 `release`，
+    /// 保证该 fake-IP 映射在本 flow 存活期间不被 sweep 回收（否则 resolve 失败 → 断连）。
+    fake_ip: Option<Ipv4Addr>,
 }
 
 impl SocketCtx {
@@ -93,6 +97,7 @@ impl SocketCtx {
             state: SocketState::Listening,
             uplink_tx: None,
             downlink_pending: Vec::new(),
+            fake_ip: None,
         }
     }
 }
@@ -474,6 +479,8 @@ pub async fn run_event_loop<D, U, M>(
                     &mut socket_ctxs,
                     &mut iface,
                     &mut device,
+                    &mut fake_pool,
+                    udp_clock.elapsed().as_secs(),
                 )
                 .await
                 {
@@ -559,7 +566,8 @@ pub async fn run_event_loop<D, U, M>(
                             &mut socket_ctxs,
                             &*upstream,
                             &global_tx,
-                            &fake_pool,
+                            &mut fake_pool,
+                            udp_clock.elapsed().as_secs(),
                             &mut metrics,
                         )
                         .await;
@@ -608,7 +616,8 @@ pub async fn run_event_loop<D, U, M>(
                     &mut socket_ctxs,
                     &*upstream,
                     &global_tx,
-                    &fake_pool,
+                    &mut fake_pool,
+                    udp_clock.elapsed().as_secs(),
                     &mut metrics,
                 )
                 .await;
@@ -622,13 +631,15 @@ pub async fn run_event_loop<D, U, M>(
 /// 中文要点：把 relay 段成本从 O(总 listener 槽数) 降到 O(活跃 handle)。处理完一个 handle 后，
 /// 若它既无下行 pending、smoltcp 侧也不再 `can_recv`（首包已 drain、已开远端进 Relaying），
 /// 就出脏集合——后续回程走 `global_rx` 分支，残留 pending 时会被重新标脏。仍有活就留在集合里下个 tick 续处理。
+#[allow(clippy::too_many_arguments)]
 async fn process_dirty_relay<U, M>(
     dirty: &mut HashSet<SocketHandle>,
     sockets: &mut SocketSet<'_>,
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
     upstream: &U,
     global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
-    fake_pool: &FakeIpPool,
+    fake_pool: &mut FakeIpPool,
+    now_secs: u64,
     metrics: &mut M,
 ) where
     U: ProxyUpstream,
@@ -646,6 +657,7 @@ async fn process_dirty_relay<U, M>(
             upstream,
             global_tx,
             fake_pool,
+            now_secs,
         )
         .await
         {
@@ -713,8 +725,12 @@ fn target_from_endpoint(endpoint: smoltcp::wire::IpEndpoint) -> TargetAddr {
 
 /// fake-IP target 改写结果。
 enum TargetResolve {
-    /// 正常转发：IpPort 直连，或 fake-IP 查回的 DomainPort。
-    Direct(TargetAddr),
+    /// 正常转发：IpPort 直连（`fake_ip=None`），或 fake-IP 查回的 DomainPort（`fake_ip=Some`）。
+    /// 中文要点：刀2 透出 fake_ip，供上层在首开远端时 `acquire`、rearm 时 `release`（引用计数回收）。
+    Direct {
+        target: TargetAddr,
+        fake_ip: Option<Ipv4Addr>,
+    },
     /// fake-IP 段内但查不到映射（如客户端重启丢表、应用用旧缓存 IP）：拒绝，让应用重查。
     Refuse,
 }
@@ -724,22 +740,31 @@ enum TargetResolve {
 /// （Stage 8/9 行为不变）；fake 但无映射 → Refuse（拒绝连接）。
 fn resolve_target(endpoint: smoltcp::wire::IpEndpoint, fake_pool: &FakeIpPool) -> TargetResolve {
     let std::net::IpAddr::V4(v4) = std::net::IpAddr::from(endpoint.addr) else {
-        return TargetResolve::Direct(target_from_endpoint(endpoint));
+        return TargetResolve::Direct {
+            target: target_from_endpoint(endpoint),
+            fake_ip: None,
+        };
     };
     if fake_pool.is_fake(v4) {
         match fake_pool.resolve(v4) {
             Some(domain) => {
                 // 不在此 println!——resolve_target 在每个 UDP 包/每条 TCP 首包都会走到，
                 // 热路径同步 stdout 会拖垮大并发。flow 创建的可观测性放在服务端日志。
-                TargetResolve::Direct(TargetAddr::DomainPort {
-                    host: domain,
-                    port: endpoint.port,
-                })
+                TargetResolve::Direct {
+                    target: TargetAddr::DomainPort {
+                        host: domain,
+                        port: endpoint.port,
+                    },
+                    fake_ip: Some(v4),
+                }
             }
             None => TargetResolve::Refuse,
         }
     } else {
-        TargetResolve::Direct(target_from_endpoint(endpoint))
+        TargetResolve::Direct {
+            target: target_from_endpoint(endpoint),
+            fake_ip: None,
+        }
     }
 }
 
@@ -798,11 +823,20 @@ fn extract_socket_payload(socket: &mut TcpSocket<'_>) -> Option<Vec<u8>> {
 
 /// Reset a slot back into the listening state after the current relay ends.
 /// 中文要点：单个 handle 退房只影响自己，不能误清理其他房间的状态。
-fn rearm_socket(socket: &mut TcpSocket<'_>, ctx: &mut SocketCtx) {
+fn rearm_socket(
+    socket: &mut TcpSocket<'_>,
+    ctx: &mut SocketCtx,
+    fake_pool: &mut FakeIpPool,
+    now_secs: u64,
+) {
     ctx.state = SocketState::Closing;
     socket.abort();
     ctx.uplink_tx = None;
     ctx.downlink_pending.clear();
+    // 刀2 引用计数：本 flow 占用的 fake-IP 释放（归零后该映射进入可回收候选，sweep 才回收）。
+    if let Some(ip) = ctx.fake_ip.take() {
+        fake_pool.release(ip, now_secs);
+    }
     ctx.state = SocketState::Rearming;
     socket.listen(ctx.local_port).unwrap();
     ctx.state = SocketState::Listening;
@@ -817,7 +851,8 @@ async fn process_listener_activity<U: ProxyUpstream>(
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
     upstream: &U,
     global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
-    fake_pool: &FakeIpPool,
+    fake_pool: &mut FakeIpPool,
+    now_secs: u64,
 ) -> Result<(), ClientError> {
     // 每轮先推进该 handle 的下行 pending：TCP ACK 释放 tx buffer 空间后继续写，
     // 直到把上一轮没写完的回程字节全部交付，绝不丢字节（修 bad decrypt 的另一半）。
@@ -843,8 +878,8 @@ async fn process_listener_activity<U: ProxyUpstream>(
     };
 
     // Stage 11：fake-IP → 查表换域名（DomainPort）；非 fake → IpPort；fake 无映射 → 拒绝。
-    let target = match resolve_target(endpoint, fake_pool) {
-        TargetResolve::Direct(t) => t,
+    let (target, fake_ip) = match resolve_target(endpoint, fake_pool) {
+        TargetResolve::Direct { target, fake_ip } => (target, fake_ip),
         TargetResolve::Refuse => {
             println!(
                 "🚫 fake-IP {} 无映射，拒绝连接（请重新解析）",
@@ -852,22 +887,37 @@ async fn process_listener_activity<U: ProxyUpstream>(
             );
             let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
             if let Some(ctx) = socket_ctxs.get_mut(&handle) {
-                rearm_socket(tcp_socket, ctx);
+                rearm_socket(tcp_socket, ctx, fake_pool, now_secs);
             }
             return Ok(());
         }
     };
 
-    handle_local_payload(handle, payload, Some(target), socket_ctxs, upstream, global_tx).await
+    handle_local_payload(
+        handle,
+        payload,
+        Some(target),
+        fake_ip,
+        socket_ctxs,
+        upstream,
+        global_tx,
+        fake_pool,
+        now_secs,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_local_payload<U: ProxyUpstream>(
     handle: SocketHandle,
     payload: Vec<u8>,
     target: Option<TargetAddr>,
+    fake_ip: Option<Ipv4Addr>,
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
     upstream: &U,
     global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
+    fake_pool: &mut FakeIpPool,
+    now_secs: u64,
 ) -> Result<(), ClientError> {
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
         return Ok(());
@@ -905,12 +955,18 @@ async fn handle_local_payload<U: ProxyUpstream>(
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "新建中继通道写入失败"))?;
     ctx.uplink_tx = Some(tx);
     ctx.state = SocketState::Relaying;
+    // 刀2 引用计数：首次开远端成功后才 acquire（开失败走 `?` 早返回，不会泄漏 refcount）。
+    if let Some(ip) = fake_ip {
+        fake_pool.acquire(ip, now_secs);
+        ctx.fake_ip = Some(ip);
+    }
 
     spawn_remote_relay(handle, stream, rx, global_tx.clone());
     Ok(())
 }
 
 /// 处理远端回信
+#[allow(clippy::too_many_arguments)]
 async fn handle_remote_payload<D: TunIo>(
     handle: SocketHandle,
     payload: Vec<u8>,
@@ -918,6 +974,8 @@ async fn handle_remote_payload<D: TunIo>(
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
     iface: &mut Interface,
     device: &mut D,
+    fake_pool: &mut FakeIpPool,
+    now_secs: u64,
 ) -> std::io::Result<()> {
     let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
@@ -926,7 +984,7 @@ async fn handle_remote_payload<D: TunIo>(
 
     if payload.is_empty() {
         println!("🔄 handle {:?} entering {:?}", handle, SocketState::Closing);
-        rearm_socket(tcp_socket, ctx);
+        rearm_socket(tcp_socket, ctx, fake_pool, now_secs);
         return Ok(());
     }
 
@@ -1049,7 +1107,8 @@ async fn handle_tuic_udp_uplink<U: DatagramUpstream>(
         udp.dst_port,
     );
     let target = match resolve_target(dst_ep, fake_pool) {
-        TargetResolve::Direct(t) => t,
+        // UDP flow 的 fake-IP 引用计数在 3c 经 AssocTable 打通（这里先取 target）。
+        TargetResolve::Direct { target, .. } => target,
         TargetResolve::Refuse => {
             println!("🚫 UDP fake-IP {} 无映射，丢弃（待应用重新解析）", udp.dst_ip);
             return;
@@ -1264,21 +1323,28 @@ mod tests {
     }
 
     #[test]
-    fn rearm_socket_restores_listening_state_and_clears_sender() {
+    fn rearm_socket_restores_listening_state_and_releases_fake_ip() {
         let spec = ListenerSpec { local_port: 80 };
         let mut socket = build_listener_socket(&spec);
         let (tx, _rx) = mpsc::channel(1);
+        let mut pool = FakeIpPool::new();
+        let ip = pool.alloc("x.com", 0);
+        pool.acquire(ip, 0); // 模拟本 flow 已 acquire
         let mut ctx = SocketCtx {
             local_port: 80,
             state: SocketState::Relaying,
             uplink_tx: Some(tx),
             downlink_pending: Vec::new(),
+            fake_ip: Some(ip),
         };
 
-        rearm_socket(&mut socket, &mut ctx);
+        rearm_socket(&mut socket, &mut ctx, &mut pool, 1);
 
         assert_eq!(ctx.state, SocketState::Listening);
         assert!(ctx.uplink_tx.is_none());
+        assert!(ctx.fake_ip.is_none(), "rearm 应清空 fake_ip");
+        // refcount 已归零 → idle 超 TTL 可回收（证明 rearm 走了 release）。
+        assert_eq!(pool.sweep(1000, 300), 1);
     }
 
     #[test]
