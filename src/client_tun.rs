@@ -7,7 +7,7 @@ use crate::dns::{self, Answer};
 use crate::fake_ip::FakeIpPool;
 use std::net::Ipv4Addr;
 use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
-use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer};
+use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState};
 use smoltcp::socket::udp;
 use smoltcp::wire::{IpAddress, IpCidr, IpListenEndpoint};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -120,6 +120,16 @@ fn flush_downlink(tcp_socket: &mut TcpSocket, ctx: &mut SocketCtx) {
 /// 中文要点：防止 SYN flood 下 socket / 缓冲区无限增长，到顶就拒新端口。
 const MAX_INTERCEPTED_PORTS: usize = 64;
 
+/// 全局 listener socket 总数上限（#2 弹性扩容的兜底）。
+/// 中文要点：放开了「每端口 pool_size 固定上限」后，仍需一个全局闸防 SYN flood 把内存撑爆。
+/// 4096 槽 × 128KB ≈ 512MB 上界；实际按需扩容远小于此。
+const MAX_TOTAL_LISTENERS: usize = 4096;
+
+/// SYN 命中时为该端口保证的空闲 listening 槽数（#2 弹性扩容触发阈值）。
+/// 中文要点：每个新 SYN 到来前确保该端口恒有 ≥2 个空闲 listening 槽，吸收突发并发，
+/// 避免「所有槽都 Relaying 时新 SYN 无 socket 可握手 → SYN 退避重传 stall」。
+const MIN_SPARE_LISTENERS: usize = 2;
+
 /// fake-IP DNS resolver 地址：去往它的 :53 UDP 走本地 fake-IP 应答，不进 UDP relay。
 const FAKE_DNS_RESOLVER: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 
@@ -137,6 +147,8 @@ enum RegistryError {
 struct ListenerRegistry {
     ports: HashMap<u16, Vec<SocketHandle>>,
     pool_size: usize,
+    /// 全局 listener socket 总数上限（#2 弹性扩容兜底；默认 [`MAX_TOTAL_LISTENERS`]）。
+    max_total: usize,
 }
 
 impl ListenerRegistry {
@@ -144,7 +156,22 @@ impl ListenerRegistry {
         Self {
             ports: HashMap::new(),
             pool_size,
+            max_total: MAX_TOTAL_LISTENERS,
         }
+    }
+
+    #[cfg(test)]
+    fn with_max_total(pool_size: usize, max_total: usize) -> Self {
+        Self {
+            ports: HashMap::new(),
+            pool_size,
+            max_total,
+        }
+    }
+
+    /// 当前所有端口的 listener socket 总数（O(端口数)，端口数 ≤ MAX_INTERCEPTED_PORTS）。
+    fn total_handles(&self) -> usize {
+        self.ports.values().map(Vec::len).sum()
     }
 
     #[cfg(test)]
@@ -194,6 +221,45 @@ impl ListenerRegistry {
     /// 替代每 tick 全量 `all_handles()` 遍历。
     fn handles_for_port(&self, port: u16) -> &[SocketHandle] {
         self.ports.get(&port).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// #2 弹性扩容：保证 `port` 当前至少有 `min_spare` 个 Listening 槽，不足则按需补建。
+    ///
+    /// 中文要点：这是放开「每端口 pool_size 固定上限」的核心——热门端口（如 :443）突发时，
+    /// 已有槽都进了 Relaying，新 SYN 没有 listening socket 可握手就会 stall。每个 SYN 到来前
+    /// 补足空闲槽即可吸收突发。rearm 回 Listening 的旧槽计入空闲、优先复用，不无限增长；
+    /// 全局 `max_total` 兜底防 SYN flood，到顶返回 `Capped`（退回旧行为，不 panic）。
+    /// 未注册端口（无 SYN 命中过）→ no-op，建池仍由 `ensure_port` 负责。
+    fn ensure_spare_listeners(
+        &mut self,
+        port: u16,
+        min_spare: usize,
+        sockets: &mut SocketSet<'static>,
+        socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
+    ) -> Result<(), RegistryError> {
+        if !self.ports.contains_key(&port) {
+            return Ok(());
+        }
+        // 「空闲」必须看 smoltcp socket 的真实状态（accept 后立即离开 Listen），不能看
+        // SocketCtx.state——后者直到 process 首包才更新，SYN 刚被 accept 时仍是 Listening，
+        // 计数虚高会导致永不补建（实测单端口仍 stall）。
+        let listening = self.ports[&port]
+            .iter()
+            .filter(|h| sockets.get::<TcpSocket>(**h).state() == TcpState::Listen)
+            .count();
+        if listening >= min_spare {
+            return Ok(());
+        }
+        let spec = ListenerSpec { local_port: port };
+        for _ in listening..min_spare {
+            if self.total_handles() >= self.max_total {
+                return Err(RegistryError::Capped);
+            }
+            let h = sockets.add(build_listener_socket(&spec));
+            socket_ctxs.insert(h, SocketCtx::new(port));
+            self.ports.get_mut(&port).unwrap().push(h);
+        }
+        Ok(())
     }
 }
 
@@ -448,14 +514,28 @@ pub async fn run_event_loop<D, U, M>(
                         //    - 任意去往拦截端口的 TCP 包 → 把该端口 pool 标脏（#1），覆盖 SYN 之后
                         //      让 listener can_recv 的首个 data 包；relay 段只处理脏集合，不再全扫。
                         if let Some(buf) = device.rx_peek() {
-                            if let Some(syn_port) = inspect_inbound_syn(buf)
-                                && let Err(e) =
+                            if let Some(syn_port) = inspect_inbound_syn(buf) {
+                                if let Err(e) =
                                     registry.ensure_port(syn_port, &mut sockets, &mut socket_ctxs)
-                            {
-                                println!(
-                                    "⚠️ intercepted port cap reached, drop SYN to port {syn_port}: {:?}",
-                                    e
-                                );
+                                {
+                                    println!(
+                                        "⚠️ intercepted port cap reached, drop SYN to port {syn_port}: {:?}",
+                                        e
+                                    );
+                                }
+                                // #2 弹性扩容：SYN accept 前确保该端口有空闲 listening 槽吸收突发，
+                                // 打掉「每端口 pool_size 固定上限」导致的热门端口 stall。全局 cap 兜底。
+                                if let Err(e) = registry.ensure_spare_listeners(
+                                    syn_port,
+                                    MIN_SPARE_LISTENERS,
+                                    &mut sockets,
+                                    &mut socket_ctxs,
+                                ) {
+                                    println!(
+                                        "⚠️ global listener cap reached, 端口 {syn_port} 无法弹性扩容: {:?}",
+                                        e
+                                    );
+                                }
                             }
                             if let Some(port) = inbound_tcp_dst_port(buf) {
                                 for &h in registry.handles_for_port(port) {
@@ -1127,6 +1207,55 @@ mod tests {
         let err = reg.ensure_port(9999, &mut sockets, &mut ctxs).unwrap_err();
         assert!(matches!(err, RegistryError::Capped));
         assert_eq!(reg.port_count(), MAX_INTERCEPTED_PORTS);
+    }
+
+    /// #2 弹性扩容：端口 Listening 槽不足 min_spare 时按需补建，已够则幂等不动，
+    /// 未注册端口 no-op；rearm 回 Listening 的槽计入空闲、可复用。
+    #[test]
+    fn ensure_spare_listeners_grows_and_is_idempotent() {
+        let mut sockets = SocketSet::new(vec![]);
+        let mut ctxs: HashMap<SocketHandle, SocketCtx> = HashMap::new();
+        let mut reg = ListenerRegistry::new(2);
+        reg.ensure_port(443, &mut sockets, &mut ctxs).unwrap();
+        assert_eq!(reg.handles_for_port(443).len(), 2);
+
+        // 占满已有 2 槽（abort → 离开 Listen 状态，模拟被 accept 占用）→ 无空闲 listening。
+        let hs: Vec<SocketHandle> = reg.handles_for_port(443).to_vec();
+        for h in &hs {
+            sockets.get_mut::<TcpSocket>(*h).abort();
+        }
+        // 要求 ≥2 空闲 → 补建 2 个。
+        reg.ensure_spare_listeners(443, 2, &mut sockets, &mut ctxs)
+            .unwrap();
+        assert_eq!(reg.handles_for_port(443).len(), 4);
+        // 幂等：已有 2 空闲，不再建。
+        reg.ensure_spare_listeners(443, 2, &mut sockets, &mut ctxs)
+            .unwrap();
+        assert_eq!(reg.handles_for_port(443).len(), 4);
+        // 未注册端口 → no-op（建池仍由 ensure_port 负责）。
+        reg.ensure_spare_listeners(8080, 2, &mut sockets, &mut ctxs)
+            .unwrap();
+        assert!(reg.handles_for_port(8080).is_empty());
+    }
+
+    /// #2 全局总槽上限：弹性扩容受 `max_total` 兜底，达上限返回 Capped、不再增长（防 SYN flood）。
+    #[test]
+    fn ensure_spare_listeners_respects_global_cap() {
+        let mut sockets = SocketSet::new(vec![]);
+        let mut ctxs: HashMap<SocketHandle, SocketCtx> = HashMap::new();
+        // cap=3：pool_size=2 首建占 2，弹性最多再加 1。
+        let mut reg = ListenerRegistry::with_max_total(2, 3);
+        reg.ensure_port(443, &mut sockets, &mut ctxs).unwrap();
+        let hs: Vec<SocketHandle> = reg.handles_for_port(443).to_vec();
+        for h in &hs {
+            sockets.get_mut::<TcpSocket>(*h).abort();
+        }
+        // 要 4 空闲，但 cap=3：建到 total=3 即停，返回 Capped。
+        let err = reg
+            .ensure_spare_listeners(443, 4, &mut sockets, &mut ctxs)
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::Capped));
+        assert_eq!(reg.handles_for_port(443).len(), 3);
     }
 
     #[test]

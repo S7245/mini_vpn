@@ -99,31 +99,31 @@ async fn pool_size_isolates_sweep_cost() {
     }
 }
 
-/// 坐实怀疑瓶颈 #2（每端口 pool_size 是硬并发上限）：256 路全打到**单个**目标端口，
-/// pool_size=2（生产默认）。超出 2 槽的连接靠慢速 SYN 重传 + 槽 rearm，无法在窗口内排空 →
-/// 远不到 N/N。这是「大并发到热门端口」（如 :443）的首要墙。
+/// 验证 #2 修复（弹性扩容打掉每端口 pool 硬上限）：256 路全打到**单个**目标端口，
+/// pool_size=2（生产默认）。优化前：超出 2 槽的连接靠慢速 SYN 重传 + rearm，窗口内 done=2/256 stall。
+/// 优化后（刀2）：SYN 命中端口即弹性补足空闲 listening 槽，单热门端口（如 :443）突发也能排空 → 接近 N/N。
 #[tokio::test]
-#[ignore = "demonstrates #2 pool stall; run with --ignored --nocapture"]
-async fn small_pool_stalls_hot_port() {
-    println!("\n==== #2 坐实：256 路全压单端口，pool_size=2（生产默认）====");
+#[ignore = "verifies #2 elastic pool drains hot port; run with --ignored --nocapture"]
+async fn elastic_pool_drains_hot_port() {
+    println!("\n==== #2 验证：256 路全压单端口，pool_size=2 + 弹性扩容 ====");
     let report = run_tcp_scenario(ScenarioParams {
         connections: 256,
         distinct_ports: 1, // 全压一个端口
         payload_len: 1024,
         pool_size: 2,
-        timeout: Duration::from_secs(20),
+        timeout: Duration::from_secs(30),
     })
     .await;
-    print!("单端口 pool=2 | ");
+    print!("单端口 pool=2 弹性 | ");
     report.print_row();
-    // 不强求 N/N——本测试就是要展示它**完不成**（pool=2 的并发墙）。
+    // 优化前这里 done=2/256 stall；弹性扩容后应接近 N/N。
     assert!(
-        report.completed < 256,
-        "pool=2 单端口下不应 N/N（completed={}）——证明 #2 是硬上限",
+        report.completed >= 250,
+        "弹性扩容后单端口应接近 N/N（completed={}）——#2 硬上限已打掉",
         report.completed
     );
     println!(
-        "→ 256 路只完成 {}/256：每端口 pool_size 即硬并发上限（#2），刀2 需 pool 弹性扩容/复用",
+        "→ 256 路完成 {}/256：弹性扩容把每端口 pool 硬上限打掉（#2 fixed）",
         report.completed
     );
 }
