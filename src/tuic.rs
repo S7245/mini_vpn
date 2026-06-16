@@ -223,13 +223,24 @@ pub fn encode_packet(assoc_id: u16, target: &TargetAddr, data: &[u8]) -> Vec<u8>
     v
 }
 
-/// 解码下行 `Packet`,只取 `(assoc_id, data)`(跳过 ADDR)。越界/地址类型未知返回 None。
-pub fn decode_packet(buf: &[u8]) -> Option<(u16, &[u8])> {
+/// 下行 Packet 的 frag 感知元信息（native 分片重组用）。
+/// 中文要点：`data` 是**本（分片）chunk**（SIZE 字节）；整包由同 `(assoc_id,pkt_id)` 的
+/// 各 `frag_id` 按序拼接而成（ADDR 仅在 `frag_id==0`，后续分片为 ATYP_NONE，由 `address_len` 跳过）。
+#[derive(Debug, PartialEq, Eq)]
+pub struct PacketMeta<'a> {
+    pub assoc_id: u16,
+    pub pkt_id: u16,
+    pub frag_total: u8,
+    pub frag_id: u8,
+    pub data: &'a [u8],
+}
+
+/// 解码下行 `Packet` 的完整元信息（含 FRAG 字段，供重组）。越界/地址类型未知返回 None（不 panic）。
+pub fn decode_packet_meta(buf: &[u8]) -> Option<PacketMeta<'_>> {
     // 固定前缀 10 字节:ver type assoc(2) pkt(2) ftot fid size(2)。
     if buf.len() < 10 {
         return None;
     }
-    let assoc = u16::from_be_bytes([buf[2], buf[3]]);
     let size = u16::from_be_bytes([buf[8], buf[9]]) as usize;
     let addr_len = address_len(buf, 10)?;
     let data_start = 10 + addr_len;
@@ -237,7 +248,19 @@ pub fn decode_packet(buf: &[u8]) -> Option<(u16, &[u8])> {
     if buf.len() < data_end {
         return None;
     }
-    Some((assoc, &buf[data_start..data_end]))
+    Some(PacketMeta {
+        assoc_id: u16::from_be_bytes([buf[2], buf[3]]),
+        pkt_id: u16::from_be_bytes([buf[4], buf[5]]),
+        frag_total: buf[6],
+        frag_id: buf[7],
+        data: &buf[data_start..data_end],
+    })
+}
+
+/// 解码下行 `Packet`,只取 `(assoc_id, data)`(跳过 ADDR/FRAG)。越界/地址类型未知返回 None。
+/// 中文要点：`decode_packet_meta` 的薄包装，服务 `FRAG_TOTAL==1` 快路径（零回归）。
+pub fn decode_packet(buf: &[u8]) -> Option<(u16, &[u8])> {
+    decode_packet_meta(buf).map(|m| (m.assoc_id, m.data))
 }
 
 /// 编码 Heartbeat：`[0x05][0x04]`。
@@ -846,6 +869,47 @@ mod tests {
     #[test]
     fn heartbeat_layout() {
         assert_eq!(encode_heartbeat(), vec![0x05, 0x04]);
+    }
+
+    #[test]
+    fn packet_meta_single_fragment() {
+        // encode_packet 产出的单帧（FRAG_TOTAL=1）→ meta 各字段就位，data 即整 payload。
+        let p = encode_packet(7, &TargetAddr::IpPort("1.2.3.4:53".parse().unwrap()), b"hi");
+        let m = decode_packet_meta(&p).expect("meta");
+        assert_eq!(m.assoc_id, 7);
+        assert_eq!(m.pkt_id, 0);
+        assert_eq!(m.frag_total, 1);
+        assert_eq!(m.frag_id, 0);
+        assert_eq!(m.data, b"hi");
+    }
+
+    #[test]
+    fn packet_meta_non_first_fragment_skips_none_addr() {
+        // 非首分片：ADDR=ATYP_NONE(0xff，跳 1 字节)，FRAG_ID=1，SIZE=本分片 chunk 长。
+        // [ver type assoc(2)=9 pkt(2)=2 ftot=3 fid=1 size(2)=3 ATYP_NONE 'a' 'b' 'c']
+        let buf = [
+            0x05, 0x02, 0x00, 0x09, 0x00, 0x02, 0x03, 0x01, 0x00, 0x03, 0xff, b'a', b'b', b'c',
+        ];
+        let m = decode_packet_meta(&buf).expect("meta");
+        assert_eq!(m.assoc_id, 9);
+        assert_eq!(m.pkt_id, 2);
+        assert_eq!(m.frag_total, 3);
+        assert_eq!(m.frag_id, 1);
+        assert_eq!(m.data, b"abc");
+    }
+
+    #[test]
+    fn packet_meta_rejects_truncated() {
+        assert!(decode_packet_meta(&[0u8; 5]).is_none());
+        // size 说 200 但 buffer 不够 → None（不 panic）。
+        assert!(decode_packet_meta(&[0x05, 0x02, 0, 7, 0, 0, 1, 0, 0, 200, 0x01, 1, 2, 3, 4]).is_none());
+    }
+
+    #[test]
+    fn decode_packet_delegates_to_meta() {
+        // decode_packet 仍取 (assoc, data)，与 meta 一致（薄包装零回归）。
+        let p = encode_packet(3, &TargetAddr::IpPort("1.2.3.4:53".parse().unwrap()), b"xy");
+        assert_eq!(decode_packet(&p), Some((3, &b"xy"[..])));
     }
 
     #[test]
