@@ -580,8 +580,10 @@ pub struct TuicUpstream {
     uuid: [u8; 16],
     password: String,
     conn: Mutex<Connection>,
-    /// 上行 UDP datagram 丢弃计数（TooLarge / 连接不可用）。可观测性，不影响 UDP 语义。
+    /// 上行 UDP datagram 丢弃计数（连接不可用 / stream 兜底也失败）。可观测性，不影响 UDP 语义。
     udp_drops: AtomicU64,
+    /// 上行走 uni-stream 兜底（超 datagram 上限）的次数。可观测性：判断 MTU 调优是否够、兜底是否热。
+    udp_stream_fallbacks: AtomicU64,
     /// 上次 UDP 上行的秒数（`clock` 起点，0=从未）。`send_udp` 写、心跳读，决定是否按需保活。
     last_udp_activity: AtomicU64,
     /// 单调时钟：`send_udp`(写活跃时刻)与驱动任务(读 now)**同源**，避免双时钟漂移。
@@ -613,6 +615,7 @@ impl TuicUpstream {
             password: cfg.password.clone(),
             conn: Mutex::new(conn),
             udp_drops: AtomicU64::new(0),
+            udp_stream_fallbacks: AtomicU64::new(0),
             last_udp_activity: AtomicU64::new(0),
             clock: std::time::Instant::now(),
             zero_rtt: cfg.zero_rtt,
@@ -716,9 +719,10 @@ impl TuicUpstream {
         Ok(guard.clone())
     }
 
-    /// 发一条**已编码**的 TUIC Packet（native datagram）。
-    /// 中文要点：TooLarge / 连接不可用 → 丢弃并计数（UDP 语义，绝不阻塞调用方除重连外）。
-    /// native 模式不分片，超 QUIC datagram 上限的包直接丢（quic-stream 兜底留待后续）。
+    /// 发一条**已编码**的 TUIC Packet（刀3：datagram 主路径 + uni-stream 兜底）。
+    /// 中文要点：先按 `udp_send_plan(max_datagram_size, len)` 主动分流——装得下走 native datagram，
+    /// 超上限/不可用走 **per-packet uni-stream 兜底**（持续大流量直播不丢包）。datagram 真发遇
+    /// `TooLarge`（MTU 竞态收缩）→ 二次 stream 兜底。仅**真失败**才丢弃计数（UDP 语义，不阻塞调用方除重连）。
     pub async fn send_udp(&self, datagram: Vec<u8>) {
         // 记录 UDP 活跃时刻：驱动任务据此「仅活跃时发」Heartbeat（纯 TCP 不发，省流量/电量）。
         self.last_udp_activity
@@ -731,22 +735,53 @@ impl TuicUpstream {
                 return;
             }
         };
-        match conn.send_datagram(datagram.into()) {
-            Ok(()) => {}
-            Err(quinn::SendDatagramError::TooLarge) => {
-                self.udp_drops.fetch_add(1, Ordering::Relaxed);
-                println!("⚠️ TUIC UDP↑ datagram 超过 QUIC 上限，丢弃");
-            }
-            Err(e) => {
-                self.udp_drops.fetch_add(1, Ordering::Relaxed);
-                println!("⚠️ TUIC UDP↑ 发送失败（连接将自愈），丢弃: {e:?}");
-            }
+        // Bytes：datagram 路径下 `clone()` 为 O(1)（Arc 引用计数），TooLarge 竞态二次兜底不深拷贝。
+        let bytes = bytes::Bytes::from(datagram);
+        match udp_send_plan(conn.max_datagram_size(), bytes.len()) {
+            UdpSend::Datagram => match conn.send_datagram(bytes.clone()) {
+                Ok(()) => {}
+                Err(quinn::SendDatagramError::TooLarge) => {
+                    // 分流时还装得下、真发时 MTU 已收缩 → 二次 stream 兜底，不丢。
+                    self.send_udp_via_stream(&conn, bytes).await;
+                }
+                Err(e) => {
+                    self.udp_drops.fetch_add(1, Ordering::Relaxed);
+                    println!("⚠️ TUIC UDP↑ 发送失败（连接将自愈），丢弃: {e:?}");
+                }
+            },
+            UdpSend::Stream => self.send_udp_via_stream(&conn, bytes).await,
         }
+    }
+
+    /// uni-stream 兜底：开单向流 → 写整条已编码 Packet → finish。
+    /// 中文要点：TUIC quic-relay-mode 即「一条 uni-stream 承载一个完整 Packet 命令」（`FRAG_TOTAL=1`），
+    /// 字节与 datagram 模式**完全一致**（复用同一 `encode_packet` 产物）。任一步失败→丢弃计数（UDP 自愈重发）。
+    async fn send_udp_via_stream(&self, conn: &Connection, datagram: bytes::Bytes) {
+        self.udp_stream_fallbacks.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = Self::write_uni_packet(conn, &datagram).await {
+            self.udp_drops.fetch_add(1, Ordering::Relaxed);
+            println!("⚠️ TUIC UDP↑ stream 兜底失败（连接将自愈），丢弃: {e:?}");
+        }
+    }
+
+    /// 在连接上开 uni-stream 写一个 Packet 并 finish（抽出便于错误归一）。
+    async fn write_uni_packet(conn: &Connection, packet: &[u8]) -> Result<(), ClientError> {
+        let mut uni = conn.open_uni().await.map_err(|e| io_err("udp open_uni", e))?;
+        uni.write_all(packet)
+            .await
+            .map_err(|e| io_err("udp uni write", e))?;
+        uni.finish().await.map_err(|e| io_err("udp uni finish", e))?;
+        Ok(())
     }
 
     /// 累计丢弃的上行 UDP datagram 数（可观测性）。
     pub fn udp_drop_count(&self) -> u64 {
         self.udp_drops.load(Ordering::Relaxed)
+    }
+
+    /// 累计走 uni-stream 兜底的上行包数（可观测性：MTU 调优是否足够 / 兜底是否过热）。
+    pub fn udp_stream_fallback_count(&self) -> u64 {
+        self.udp_stream_fallbacks.load(Ordering::Relaxed)
     }
 
     /// 启动 UDP 驱动后台任务，返回**下行 datagram 接收端**给主循环 select。
