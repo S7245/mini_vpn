@@ -6,7 +6,9 @@
 //! 全部 smoltcp/device/mock 复杂度封在 `mini_vpn::harness` 内，本文件只编排 + 断言 + 打表。
 #![cfg(feature = "harness")]
 
-use mini_vpn::harness::{ScenarioParams, run_tcp_scenario, run_udp_echo_scenario};
+use mini_vpn::harness::{
+    ScenarioParams, run_tcp_scenario, run_udp_echo_scenario, run_udp_throughput_scenario,
+};
 use std::time::Duration;
 
 /// 烟雾测试：单连接经回环 device + mock echo 完成一次 TCP 往返。
@@ -54,6 +56,48 @@ async fn udp_datagrams_reach_upstream() {
         "全部 UDP datagram 应抵达 mock 上游上行（uplinks={}）",
         report.uplinks
     );
+}
+
+/// 刀3 下行**分片重组正确性**（常驻）：大 payload 经 mock 拆成多帧（FRAG_TOTAL>1）回灌，
+/// 主循环 `FragReassembler` 必须逐字节还原 → 全部 echo intact。验证重组在真主循环里跑通（无需真网络）。
+#[tokio::test]
+async fn fragmented_downlink_reassembles_intact() {
+    // 4000B payload，chunk=1200 → 4 帧/包；16 个独立 flow。
+    let report = run_udp_throughput_scenario(16, 4000, Some(1200), Duration::from_secs(10)).await;
+    report.print_row();
+    assert_eq!(
+        report.echoed_intact, report.sent,
+        "分片下行应全部逐字节重组还原（intact={}/{}）",
+        report.echoed_intact, report.sent
+    );
+    assert!(report.fragmented, "本场景应触发分片");
+}
+
+/// 刀3 下行 datagram **直通**正确性（常驻，零回归）：单帧（FRAG_TOTAL=1）经新 decode_packet_meta
+/// 路径仍正确 echo 回 app。守住「重组改造没破坏快路径」。
+#[tokio::test]
+async fn passthrough_downlink_still_intact() {
+    let report = run_udp_throughput_scenario(16, 1000, None, Duration::from_secs(10)).await;
+    report.print_row();
+    assert_eq!(
+        report.echoed_intact, report.sent,
+        "单帧直通应全部完整 echo（intact={}/{}）",
+        report.echoed_intact, report.sent
+    );
+}
+
+/// 刀3 UDP 吞吐 sweep（重，显式 `--ignored` 跑）：对比 passthrough vs 分片下行的吞吐/丢包，
+/// 量化主循环 UDP 路径 + 重组成本。真 datagram/stream 兜底对比归真出口 acceptance。
+#[tokio::test]
+#[ignore = "UDP throughput sweep; run with --ignored --nocapture"]
+async fn udp_throughput_sweep_report() {
+    println!("\n==== 刀3 UDP 吞吐表（mock 回环，隔离主循环 UDP 路径 + 重组）====");
+    for &(payload, chunk) in &[(1000usize, None), (1400, None), (4000, Some(1200usize)), (8000, Some(1200))] {
+        let report = run_udp_throughput_scenario(500, payload, chunk, Duration::from_secs(60)).await;
+        report.print_row();
+        assert_eq!(report.echoed_intact, report.sent, "应零丢包零损坏（mock 无网络丢失）");
+    }
+    println!("==== 真 datagram TooLarge / stream 兜底 / 真 sing-box 大流量见 acceptance（#3 复测）====\n");
 }
 
 /// 大并发 sweep（重，显式 `--ignored` 跑）：N∈{64,256,1024} 多端口，打印三段耗时定位表。

@@ -216,15 +216,24 @@ pub struct MockUpstream {
     udp_uplinks: AtomicU64,
     echo_buf: usize,
     downlink_tx: mpsc::Sender<Vec<u8>>,
+    /// 刀3：>Some(chunk) 时，模拟 sing-box native 模式把大下行包拆成多个 `FRAG_TOTAL>1` datagram，
+    /// 回灌到下行 channel → 经真主循环 `FragReassembler` 重组（端到端验证重组，无需真网络）。
+    /// None = 原样回灌（passthrough echo）。
+    frag_chunk: Option<usize>,
 }
 
 impl MockUpstream {
     fn new(echo_buf: usize, downlink_tx: mpsc::Sender<Vec<u8>>) -> Self {
+        Self::with_frag(echo_buf, downlink_tx, None)
+    }
+
+    fn with_frag(echo_buf: usize, downlink_tx: mpsc::Sender<Vec<u8>>, frag_chunk: Option<usize>) -> Self {
         Self {
             tcp_opens: AtomicU64::new(0),
             udp_uplinks: AtomicU64::new(0),
             echo_buf,
             downlink_tx,
+            frag_chunk,
         }
     }
     fn tcp_opens(&self) -> u64 {
@@ -263,10 +272,56 @@ impl ProxyUpstream for MockUpstream {
 impl DatagramUpstream for MockUpstream {
     async fn send_udp(&self, datagram: Vec<u8>) {
         self.udp_uplinks.fetch_add(1, Ordering::Relaxed);
-        // 原样回灌：SUT 上行发的是 encode_packet(assoc_id,target,payload)，
-        // 下行分支 decode_packet 取回 (assoc_id,payload) 即完成 UDP echo（assoc 路由回 app）。
-        let _ = self.downlink_tx.send(datagram).await;
+        // 上行是 encode_packet(assoc_id,target,payload)；下行分支 decode_packet_meta 取回路由 + 重组。
+        match self.frag_chunk {
+            // passthrough echo：原样回灌（FRAG_TOTAL=1，主循环直通）。
+            None => {
+                let _ = self.downlink_tx.send(datagram).await;
+            }
+            // 分片回灌：模拟 server native 模式把大下行包拆成多帧 → 主循环 FragReassembler 重组。
+            Some(chunk) => {
+                let Some((assoc, payload)) = crate::tuic::decode_packet(&datagram) else {
+                    return;
+                };
+                for frag in fragment_downlink(assoc, payload, chunk) {
+                    if self.downlink_tx.send(frag).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
     }
+}
+
+/// 模拟 server native 分片：把 `payload` 按 `chunk` 拆成多个下行 Packet 命令字节。
+/// 中文要点：ADDR 一律用 ATYP_NONE(0xff)（下行路由只用 assoc，ADDR 被跳过，简化模拟）；pkt_id 固定 0
+/// （调用方保证每包 assoc 不同 → 重组 key `(assoc,pkt_id)` 不撞）。`payload<=chunk` 时退化为单帧。
+fn fragment_downlink(assoc: u16, payload: &[u8], chunk: usize) -> Vec<Vec<u8>> {
+    let chunk = chunk.max(1);
+    let chunks: Vec<&[u8]> = if payload.is_empty() {
+        vec![payload]
+    } else {
+        payload.chunks(chunk).collect()
+    };
+    let frag_total = chunks.len().min(u8::MAX as usize) as u8;
+    chunks
+        .into_iter()
+        .enumerate()
+        .take(u8::MAX as usize)
+        .map(|(i, data)| {
+            let mut v = Vec::with_capacity(11 + data.len());
+            v.push(0x05); // VER
+            v.push(0x02); // CMD_PACKET
+            v.extend_from_slice(&assoc.to_be_bytes());
+            v.extend_from_slice(&0u16.to_be_bytes()); // PKT_ID=0
+            v.push(frag_total);
+            v.push(i as u8); // FRAG_ID
+            v.extend_from_slice(&(data.len() as u16).to_be_bytes()); // SIZE = 本分片 chunk 长
+            v.push(0xff); // ATYP_NONE
+            v.extend_from_slice(data);
+            v
+        })
+        .collect()
 }
 
 // ============================ 分段插桩 sink ============================
@@ -650,4 +705,138 @@ fn build_udp_ip(src: Ipv4Address, src_port: u16, dst: Ipv4Address, dst_port: u16
     let mut out = Vec::with_capacity(builder.size(payload.len()));
     builder.write(&mut out, payload).unwrap();
     out
+}
+
+// ============================ UDP 吞吐 + 分片重组场景（刀3）============================
+
+/// UDP 吞吐场景报告。`echoed_intact` = 下行回到「app」且**整 payload 逐字节匹配**的包数
+/// （分片场景下即重组正确性）。`lost` = sent − echoed_intact。
+#[derive(Debug, Clone)]
+pub struct UdpThroughputReport {
+    pub sent: usize,
+    pub echoed_intact: usize,
+    pub lost: usize,
+    pub wall: Duration,
+    pub payload_len: usize,
+    pub fragmented: bool,
+}
+
+impl UdpThroughputReport {
+    pub fn pps(&self) -> f64 {
+        let s = self.wall.as_secs_f64();
+        if s <= 0.0 { 0.0 } else { self.echoed_intact as f64 / s }
+    }
+    pub fn throughput_mbps(&self) -> f64 {
+        let s = self.wall.as_secs_f64();
+        if s <= 0.0 {
+            return 0.0;
+        }
+        (self.echoed_intact as f64 * self.payload_len as f64 * 8.0) / (s * 1_000_000.0)
+    }
+    pub fn print_row(&self) {
+        println!(
+            "UDP frag={:<5} N={:>4} intact={:>4}/{:<4} lost={:>3} wall={:>7.1}ms | {:>8.0} pps {:>7.2} Mb/s | payload={}B",
+            self.fragmented,
+            self.sent,
+            self.echoed_intact,
+            self.sent,
+            self.lost,
+            self.wall.as_secs_f64() * 1e3,
+            self.pps(),
+            self.throughput_mbps(),
+            self.payload_len,
+        );
+    }
+}
+
+/// app 第 `i` 包的期望 payload：前 2 字节 = marker(i, BE)，其余 `payload[j] = (i + j) & 0xff`
+/// （位置相关 → 重组乱序/损坏可检出）。
+fn throughput_payload(i: usize, payload_len: usize) -> Vec<u8> {
+    let mut p = vec![0u8; payload_len];
+    if payload_len >= 2 {
+        p[0..2].copy_from_slice(&(i as u16).to_be_bytes());
+    }
+    for (j, b) in p.iter_mut().enumerate().skip(2) {
+        *b = ((i + j) & 0xff) as u8;
+    }
+    p
+}
+
+/// 从 `sut_to_gen` 排空已回到「app」的下行 UDP 包，逐字节核对完整性，收集 intact 的 marker。
+/// 返回是否至少排空了一个包。
+fn drain_intact_echoes(link: &PacketLink, payload_len: usize, intact: &mut std::collections::HashSet<u16>) -> bool {
+    let mut any = false;
+    while let Some(pkt) = link.pop() {
+        any = true;
+        let Some(udp) = crate::udp_relay::parse_inbound_udp(&pkt) else {
+            continue;
+        };
+        if udp.payload.len() != payload_len {
+            continue;
+        }
+        let marker = u16::from_be_bytes([udp.payload[0], udp.payload[1]]) as usize;
+        if udp.payload == throughput_payload(marker, payload_len).as_slice() {
+            intact.insert(marker as u16);
+        }
+    }
+    any
+}
+
+/// 跑一场 UDP 吞吐：N 个独立 flow（每包独立 src_port → 独立 assoc）发 `payload_len` 字节，
+/// 经 mock 上游回灌（`frag_chunk=Some` 时拆多帧 → 主循环 `FragReassembler` 重组）→ 核对回到 app 的完整性。
+///
+/// 注：真 datagram `TooLarge` / stream 兜底走真 quinn，harness 测不到（同 #3 边界）→ 归 acceptance。
+/// 本场景量化的是**主循环 UDP 路径 + 重组**的吞吐/丢包/正确性。
+pub async fn run_udp_throughput_scenario(
+    n: usize,
+    payload_len: usize,
+    frag_chunk: Option<usize>,
+    timeout: Duration,
+) -> UdpThroughputReport {
+    let gen_to_sut = PacketLink::new();
+    let sut_to_gen = PacketLink::new();
+    let (downlink_tx, downlink_rx) = mpsc::channel::<Vec<u8>>(4096);
+    let mock = Arc::new(MockUpstream::with_frag(64 * 1024, downlink_tx, frag_chunk));
+    let sut_device = LoopbackTunDevice::new(gen_to_sut.clone(), sut_to_gen.clone());
+    let shared = Arc::new(Mutex::new(Recorded::default()));
+    let config = TunRuntimeConfig::from_sources(Some("2")).unwrap();
+    let sut = tokio::spawn(run_event_loop(
+        sut_device,
+        mock.clone(),
+        downlink_rx,
+        config,
+        RecordingSink::new(shared),
+    ));
+
+    let mut intact = std::collections::HashSet::new();
+    let start = Instant::now();
+    for i in 0..n {
+        let payload = throughput_payload(i, payload_len);
+        let pkt = build_udp_ip(
+            GEN_IP,
+            40_000u16.wrapping_add(i as u16),
+            TARGET_IP,
+            5000,
+            &payload,
+        );
+        gen_to_sut.push(BytesMut::from(&pkt[..]));
+        tokio::time::sleep(Duration::from_micros(100)).await;
+        drain_intact_echoes(&sut_to_gen, payload_len, &mut intact);
+    }
+    // 收尾排空：直到收齐或超时。
+    while intact.len() < n && start.elapsed() < timeout {
+        if !drain_intact_echoes(&sut_to_gen, payload_len, &mut intact) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    let wall = start.elapsed();
+    sut.abort();
+    UdpThroughputReport {
+        sent: n,
+        echoed_intact: intact.len(),
+        lost: n - intact.len(),
+        wall,
+        payload_len,
+        fragmented: frag_chunk.is_some(),
+    }
 }
