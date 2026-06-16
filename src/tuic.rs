@@ -158,6 +158,8 @@ const MAX_TUIC_PACKET_BYTES: usize = 66 * 1024;
 /// 下行 uni-stream 并发读取上限：超额直接丢弃该 stream（reset），防 flood 下无界派生任务。
 /// quic-relay-mode 下每包一条 uni-stream；256 并发够吸收突发，又不至失控。
 const MAX_CONCURRENT_DOWNLINK_STREAMS: usize = 256;
+/// UDP 上行统计行打印周期（秒）：周期性把 stream 兜底/丢弃计数打一行，供真出口 acceptance 与生产观测。
+const UDP_STATS_LOG_SECS: u64 = 30;
 /// UDP 驱动重连退避上限（确定性指数退避，无需 rand；UDP 自愈，重连节奏不敏感）。
 const UDP_RECONNECT_CAP_MS: u64 = 30_000;
 const UDP_RECONNECT_BASE_MS: u64 = 500;
@@ -823,6 +825,8 @@ impl TuicUpstream {
                 };
                 let mut hb = tokio::time::interval(Duration::from_secs(TUIC_HEARTBEAT_SECS));
                 hb.tick().await; // 第一拍立即返回，跳过（避免连上瞬间立刻发心跳）。
+                let mut stats = tokio::time::interval(Duration::from_secs(UDP_STATS_LOG_SECS));
+                stats.tick().await; // 跳过第一拍（连上瞬间不打统计）。
                 loop {
                     tokio::select! {
                         dg = conn.read_datagram() => {
@@ -852,6 +856,17 @@ impl TuicUpstream {
                                     }
                                 }
                                 Err(_) => break, // 连接断 → 外层 live_conn 重连
+                            }
+                        }
+                        _ = stats.tick() => {
+                            // 周期性观测：stream 兜底/丢弃计数（非零才打，避免空闲刷屏）。
+                            let fb = me.udp_stream_fallbacks.load(Ordering::Relaxed);
+                            let drops = me.udp_drops.load(Ordering::Relaxed);
+                            if fb > 0 || drops > 0 {
+                                println!(
+                                    "📊 TUIC UDP↑ 统计: datagram 上限={:?} stream 兜底={fb} 丢弃={drops}",
+                                    conn.max_datagram_size()
+                                );
                             }
                         }
                         _ = hb.tick() => {

@@ -166,3 +166,33 @@ mock harness 之外的端到端验证（IP 直连 1.1.1.1:443，`route -n add -h
 
 - **#4 多线程/分片**：#1 已缓解大半；poll 段（smoltcp 单线程遍历）成新瓶颈，是否多线程留后续。
 - **#3 连接池**：当前负载无需；刀3 真直播大流量再评估。
+
+---
+
+# 刀3 真出口 acceptance 配方（待跑，需真 sing-box）
+
+> 实现见 `2026-06-16-knife3-udp-streaming-{spec,plan}.md`。分支 `claude/knife3-udp-streaming`。
+> harness 已验证主循环 UDP 路径 + 分片重组（mock 回环，500/500 逐字节 intact）；**真 datagram
+> TooLarge / uni-stream 兜底 / 真 sing-box 分片互通 / `max_datagram_size` 真上限**只能真出口测。
+
+## 准备
+
+1. 起客户端（HANDOFF「Not in git」的 `MINI_VPN_TUIC_*` env）：
+   `sudo MINI_VPN_TUIC_* ./target/release/mini_vpn client-tun`
+   - 连上即打印 `📏 TUIC datagram 初始上限 = N 字节` → **记录 N（真实 datagram 天花板）**。
+   - 每 30s 打印 `📊 TUIC UDP↑ 统计: datagram 上限=.. stream 兜底=F 丢弃=D`（非零才打）。
+2. 路由：受控 UDP 目标用 IP 直连绕本地 fake-IP（同刀2 `route -n add -host <ip> -interface utunX`）。
+
+## 测项
+
+| 测试 | 命令要点 | 看什么 | 判定 |
+|---|---|---|---|
+| ① datagram 真上限 | 读启动 `📏` 行 | N（PLPMTUD 探完会更大） | N≥~1242；记录之 |
+| ② 持续大流量不丢 | `iperf3 -c <egress-reachable> -u -b 50M -t 30`（或真 RTP/SRT 直播）经隧道 | iperf3 丢包率 + 客户端 `📊` 的兜底/丢弃 | 丢包率低位；`丢弃 D` 不随流量线性涨（兜底生效） |
+| ③ 大包走兜底 | 发 payload>N 的 UDP（如 `iperf3 -l 1400`/大 MTU），或自然大包直播 | `📊` 的 `stream 兜底=F` | F>0 证明 uni-stream 兜底真触发；对应包不计入 `丢弃` |
+| ④ 下行分片重组 | 下行重的直播（观看）| 画面是否完整、无花屏；client 无「无映射丢弃」洪水 | 大下行包经 server 分片→本端重组，播放正常 |
+| #3 复测 | 大流量 UDP 持续时观测单连接 | 吞吐是否塌缩 / 尾延迟暴涨 | 评估「多 QUIC 连接池 vs 单连接多流」是否仍非必需 |
+
+## 裁决（待填）
+
+- datagram 真上限 N = ___；stream 兜底触发频率 = ___；#3 单连接在真直播大流量下 = 够 / 需池。
