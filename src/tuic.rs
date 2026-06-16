@@ -263,6 +263,123 @@ pub fn decode_packet(buf: &[u8]) -> Option<(u16, &[u8])> {
     decode_packet_meta(buf).map(|m| (m.assoc_id, m.data))
 }
 
+/// 下行 native 分片重组的并发未完成包上限（到顶 LRU 驱逐最老）。
+pub const FRAG_REASSEMBLY_CAP: usize = 256;
+/// 未集齐的分片包存活上限（秒）：超时即弃（一片丢 → 整包弃，保直播 liveness，不无限等）。
+pub const FRAG_REASSEMBLY_TTL_SECS: u64 = 10;
+
+/// 一个未完成 UDP 包的分片缓冲（按 `(assoc_id, pkt_id)` 索引）。
+struct FragPartial {
+    frag_total: u8,
+    frags: Vec<Option<Vec<u8>>>, // 下标 = frag_id
+    received: usize,
+    first_seen: u64,
+}
+
+/// native 下行分片重组器（**纯状态机**，主循环独占、无锁，与 `AssocTable` 同寿）。
+/// 中文要点：server native 模式把大下行包拆成多个 `FRAG_TOTAL>1` 的 Packet 命令，
+/// 本器按 `(assoc_id, pkt_id)` 收集、集齐按 `frag_id` 序拼接还原整包。`FRAG_TOTAL==1` 直通快路径。
+pub struct FragReassembler {
+    partials: HashMap<(u16, u16), FragPartial>,
+    cap: usize,
+}
+
+impl Default for FragReassembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FragReassembler {
+    pub fn new() -> Self {
+        Self::with_cap(FRAG_REASSEMBLY_CAP)
+    }
+
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            partials: HashMap::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// 喂入一个（分片）Packet。集齐返回完整 payload；未齐/无效返回 None。
+    /// 中文要点：`FRAG_TOTAL==1` 直通不入表；`frag_id>=frag_total` 或 `frag_total==0` 视为无效丢弃；
+    /// 重复 frag_id 幂等（保留首个）；新 key 到 cap 触发 LRU（按 first_seen）驱逐最老未完成包。
+    pub fn accept(&mut self, m: &PacketMeta, now: u64) -> Option<Vec<u8>> {
+        if m.frag_total == 0 || m.frag_id >= m.frag_total {
+            return None; // 无效分片头，丢弃（防越界/除零）
+        }
+        if m.frag_total == 1 {
+            return Some(m.data.to_vec()); // 快路径：单帧直通，不入表
+        }
+        let key = (m.assoc_id, m.pkt_id);
+        let frag_total = m.frag_total as usize;
+        // pkt_id 复用但 frag_total 变化 → 旧残留作废，按新分片重建。
+        let stale = self
+            .partials
+            .get(&key)
+            .is_some_and(|p| p.frag_total != m.frag_total);
+        if stale {
+            self.partials.remove(&key);
+        }
+        if !self.partials.contains_key(&key) {
+            self.evict_if_full();
+            self.partials.insert(
+                key,
+                FragPartial {
+                    frag_total: m.frag_total,
+                    frags: (0..frag_total).map(|_| None).collect(),
+                    received: 0,
+                    first_seen: now,
+                },
+            );
+        }
+        let p = self.partials.get_mut(&key).expect("just inserted");
+        let slot = &mut p.frags[m.frag_id as usize];
+        if slot.is_some() {
+            return None; // 重复 frag，幂等忽略
+        }
+        *slot = Some(m.data.to_vec());
+        p.received += 1;
+        if p.received < p.frag_total as usize {
+            return None;
+        }
+        // 集齐：按 frag_id 序拼接，清出该项。
+        let done = self.partials.remove(&key).expect("present");
+        let mut whole = Vec::with_capacity(done.frags.iter().flatten().map(Vec::len).sum());
+        for frag in done.frags.into_iter().flatten() {
+            whole.extend_from_slice(&frag);
+        }
+        Some(whole)
+    }
+
+    /// 回收未集齐且超 `ttl` 秒的分片包（丢片自愈，防内存泄漏）。
+    pub fn sweep(&mut self, now: u64, ttl: u64) {
+        self.partials
+            .retain(|_, p| now.saturating_sub(p.first_seen) <= ttl);
+    }
+
+    /// 新 key 到 cap 前驱逐最老（first_seen 最小）未完成包。
+    fn evict_if_full(&mut self) {
+        if self.partials.len() < self.cap {
+            return;
+        }
+        if let Some(victim) = self
+            .partials
+            .iter()
+            .min_by_key(|(k, p)| (p.first_seen, **k))
+            .map(|(k, _)| *k)
+        {
+            self.partials.remove(&victim);
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.partials.len()
+    }
+}
+
 /// 编码 Heartbeat：`[0x05][0x04]`。
 pub fn encode_heartbeat() -> Vec<u8> {
     vec![TUIC_VER, CMD_HEARTBEAT]
@@ -869,6 +986,76 @@ mod tests {
     #[test]
     fn heartbeat_layout() {
         assert_eq!(encode_heartbeat(), vec![0x05, 0x04]);
+    }
+
+    fn meta(assoc: u16, pkt: u16, ftot: u8, fid: u8, data: &[u8]) -> PacketMeta<'_> {
+        PacketMeta {
+            assoc_id: assoc,
+            pkt_id: pkt,
+            frag_total: ftot,
+            frag_id: fid,
+            data,
+        }
+    }
+
+    #[test]
+    fn reassemble_single_fragment_passthrough() {
+        let mut r = FragReassembler::new();
+        // FRAG_TOTAL=1 立即返回整 payload，且不入表（无残留）。
+        assert_eq!(r.accept(&meta(1, 0, 1, 0, b"hello"), 0), Some(b"hello".to_vec()));
+        assert_eq!(r.pending_len(), 0);
+    }
+
+    #[test]
+    fn reassemble_two_fragments_in_order() {
+        let mut r = FragReassembler::new();
+        assert_eq!(r.accept(&meta(5, 9, 2, 0, b"AB"), 0), None);
+        assert_eq!(r.accept(&meta(5, 9, 2, 1, b"CD"), 0), Some(b"ABCD".to_vec()));
+        assert_eq!(r.pending_len(), 0); // 集齐后清出
+    }
+
+    #[test]
+    fn reassemble_two_fragments_out_of_order() {
+        let mut r = FragReassembler::new();
+        // 先到 frag_id=1，再到 0 → 仍按 frag_id 序拼接。
+        assert_eq!(r.accept(&meta(5, 9, 2, 1, b"CD"), 0), None);
+        assert_eq!(r.accept(&meta(5, 9, 2, 0, b"AB"), 0), Some(b"ABCD".to_vec()));
+    }
+
+    #[test]
+    fn reassemble_duplicate_fragment_idempotent() {
+        let mut r = FragReassembler::new();
+        assert_eq!(r.accept(&meta(5, 9, 2, 0, b"AB"), 0), None);
+        assert_eq!(r.accept(&meta(5, 9, 2, 0, b"XX"), 0), None); // 重复 frag_id=0，忽略
+        assert_eq!(r.accept(&meta(5, 9, 2, 1, b"CD"), 0), Some(b"ABCD".to_vec())); // 仍用首个
+    }
+
+    #[test]
+    fn reassemble_incomplete_swept_by_ttl() {
+        let mut r = FragReassembler::new();
+        assert_eq!(r.accept(&meta(5, 9, 3, 0, b"AB"), 0), None);
+        assert_eq!(r.pending_len(), 1);
+        r.sweep(11, 10); // first_seen=0，超 TTL=10 → 清
+        assert_eq!(r.pending_len(), 0);
+    }
+
+    #[test]
+    fn reassemble_rejects_bad_frag_id() {
+        let mut r = FragReassembler::new();
+        // frag_id >= frag_total → 丢弃，不入表（防越界）。
+        assert_eq!(r.accept(&meta(5, 9, 2, 2, b"X"), 0), None);
+        assert_eq!(r.pending_len(), 0);
+        // frag_total=0 也无效。
+        assert_eq!(r.accept(&meta(5, 9, 0, 0, b"X"), 0), None);
+        assert_eq!(r.pending_len(), 0);
+    }
+
+    #[test]
+    fn reassemble_cap_evicts_oldest() {
+        let mut r = FragReassembler::with_cap(1);
+        r.accept(&meta(1, 1, 2, 0, b"A"), 0); // partial #1，first_seen=0
+        r.accept(&meta(2, 2, 2, 0, b"B"), 5); // 新 key 触发 evict 最老 → 仍 ≤cap
+        assert_eq!(r.pending_len(), 1);
     }
 
     #[test]
