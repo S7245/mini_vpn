@@ -613,6 +613,12 @@ impl TuicUpstream {
             cfg.zero_rtt,
         )
         .await?;
+        // 刀3：记录初始 datagram 发送上限（acceptance 据此读真实 datagram 天花板；PLPMTUD 探完会更大）。
+        // 超此上限的上行包走 uni-stream 兜底；下行大包由 server 分片、本端重组。
+        println!(
+            "📏 TUIC datagram 初始上限 = {:?} 字节（超此走 uni-stream 兜底；PLPMTUD 将继续上探）",
+            conn.max_datagram_size()
+        );
         Ok(Self {
             endpoint,
             server: cfg.server,

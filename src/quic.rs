@@ -28,6 +28,13 @@ const QUIC_KEEPALIVE_SECS: u64 = 5;
 /// 消除冷窗口；PLPMTUD 仍会继续往上探（~1414）拿更多余量。1280 普适安全，不会黑洞。
 const QUIC_INITIAL_MTU: u16 = 1280;
 
+/// 接收侧 `max_udp_payload_size` 传输参数（刀3）：告诉对端「我方单个 UDP 载荷最大能收多大」。
+/// 中文要点（已核 quinn-proto-0.10.6）：**这是接收侧 headroom，不决定我方发送 datagram 上限**——
+/// 发送上限 = `min(current_mtu 推导, peer.max_datagram_frame_size)`，由 MTU/PLPMTUD 决定（见 `send_udp`）。
+/// 取 1472 = 1500 以太网 MTU − 28（IP+UDP 头），与默认一致、匹配普通互联网路径；显式设以**可见可调**：
+/// 仅 jumbo-frame/回环等大 MTU 路径抬高才有收益（代价是接收缓冲线性增大），是否抬由真出口 probe 定档。
+const QUIC_MAX_UDP_PAYLOAD_SIZE: u16 = 1472;
+
 /// 共享的 QUIC 传输参数：keep-alive + 拉长 idle + 起步 MTU（datagram 等其余保持默认）。
 fn quic_transport_config() -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
@@ -88,10 +95,20 @@ fn client_crypto(
     Ok(crypto)
 }
 
-/// 绑定一个 QUIC 客户端 endpoint（本地 ephemeral UDP 端口）并装上默认 client config。
+/// 绑定一个 QUIC 客户端 endpoint（本地 ephemeral UDP 端口）并装上 client config。
+/// 中文要点（刀3）：经 `Endpoint::new` 注入自定义 `EndpointConfig`，显式设 `max_udp_payload_size`
+/// （接收侧 headroom，见常量注释）；replaces `Endpoint::client`（其用默认 EndpointConfig，旋钮不可调）。
 pub fn client_endpoint(cfg: ClientConfig) -> Result<Endpoint, String> {
     let bind: SocketAddr = "0.0.0.0:0".parse().expect("valid bind addr");
-    let mut ep = Endpoint::client(bind).map_err(|e| format!("quic client bind: {e}"))?;
+    let socket = std::net::UdpSocket::bind(bind).map_err(|e| format!("quic client bind: {e}"))?;
+    let runtime =
+        quinn::default_runtime().ok_or_else(|| "no async runtime for quic endpoint".to_string())?;
+    let mut ep_cfg = quinn::EndpointConfig::default();
+    ep_cfg
+        .max_udp_payload_size(QUIC_MAX_UDP_PAYLOAD_SIZE)
+        .map_err(|e| format!("quic max_udp_payload_size: {e:?}"))?;
+    let mut ep = Endpoint::new(ep_cfg, None, socket, runtime)
+        .map_err(|e| format!("quic client endpoint: {e}"))?;
     ep.set_default_client_config(cfg);
     Ok(ep)
 }
