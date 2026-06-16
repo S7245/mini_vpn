@@ -1,6 +1,8 @@
 use crate::device::{TunIo, VirtualTunDevice};
 use crate::shared::{ClientError, TargetAddr};
-use crate::tuic::{AssocTable, TuicClientConfig, TuicUpstream, decode_packet, encode_packet};
+use crate::tuic::{
+    AssocTable, FragReassembler, TuicClientConfig, TuicUpstream, decode_packet_meta, encode_packet,
+};
 use crate::upstream::{DatagramUpstream, ProxyUpstream, RelayStream};
 use crate::udp_relay::{FourTuple, UDP_FLOW_IDLE_SECS, build_udp_ip_packet, parse_inbound_udp};
 use crate::dns::{self, Answer};
@@ -475,6 +477,8 @@ pub async fn run_event_loop<D, U, M>(
     // Stage 13b：UDP over TUIC Packet。AssocTable 主循环独占；upstream 与下行 rx 由调用方注入
     // （生产=真 TuicUpstream::start_udp()；harness=mock echo 回环）。
     let mut assoc_table = AssocTable::new();
+    // 刀3：native 下行分片重组器（主循环独占、无锁，与 AssocTable 同寿）。
+    let mut reassembler = FragReassembler::new();
     let udp_clock = std::time::Instant::now();
     let mut udp_sweep = tokio::time::interval(std::time::Duration::from_secs(1));
     // review #7：fake-IP 池回收单独走低频 tick（TTL=300s，无需每秒全表扫）。
@@ -589,23 +593,28 @@ pub async fn run_event_loop<D, U, M>(
                     }
                 }
             }
-            // Stage 13b: TUIC 下行 datagram → decode_packet → AssocTable 解路由 → 造回程 IP/UDP 注入 TUN。
+            // Stage 13b/刀3: TUIC 下行（datagram 或 uni-stream）→ decode_packet_meta → 分片重组
+            // → AssocTable 解路由 → 造回程 IP/UDP 注入 TUN。FRAG_TOTAL==1 直通；>1 集齐才注入。
             Some(dg) = tuic_downlink_rx.recv() => {
-                if let Some((assoc_id, payload)) = decode_packet(&dg) {
-                    // 先取出路由信息(Copy),释放 assoc_table 借用后再 touch。
-                    let routed = assoc_table
-                        .resolve(assoc_id)
-                        .map(|e| (e.target_src(), e.app_endpoint()));
-                    if let Some((src, dst)) = routed {
-                        let pkt = build_udp_ip_packet(src, dst, payload);
-                        device.inject_ip_packet(&pkt);
-                        assoc_table.touch(assoc_id, udp_clock.elapsed().as_secs());
-                        if let Err(e) = device.flush_tx().await {
-                            println!("UDP 下行 flush 失败: {e}");
+                if let Some(meta) = decode_packet_meta(&dg) {
+                    let assoc_id = meta.assoc_id;
+                    // 分片重组：单帧直通；多帧集齐返回整包，否则缓存等后续帧。
+                    if let Some(payload) = reassembler.accept(&meta, udp_clock.elapsed().as_secs()) {
+                        // 先取出路由信息(Copy),释放 assoc_table 借用后再 touch。
+                        let routed = assoc_table
+                            .resolve(assoc_id)
+                            .map(|e| (e.target_src(), e.app_endpoint()));
+                        if let Some((src, dst)) = routed {
+                            let pkt = build_udp_ip_packet(src, dst, &payload);
+                            device.inject_ip_packet(&pkt);
+                            assoc_table.touch(assoc_id, udp_clock.elapsed().as_secs());
+                            if let Err(e) = device.flush_tx().await {
+                                println!("UDP 下行 flush 失败: {e}");
+                            }
+                        } else {
+                            // assoc 已回收/未知 → 丢弃该回程(应用会重发/重查,自愈)。
+                            println!("🗑️ TUIC UDP↓ assoc={assoc_id} 无映射，丢弃 {}B", payload.len());
                         }
-                    } else {
-                        // assoc 已回收/未知 → 丢弃该回程(应用会重发/重查,自愈)。
-                        println!("🗑️ TUIC UDP↓ assoc={assoc_id} 无映射，丢弃 {}B", payload.len());
                     }
                 }
             }
@@ -616,6 +625,8 @@ pub async fn run_event_loop<D, U, M>(
                 for ip in assoc_table.sweep(now, UDP_FLOW_IDLE_SECS) {
                     fake_pool.release(ip, now);
                 }
+                // 刀3：回收未集齐且超时的下行分片包（丢片自愈，防内存泄漏）。
+                reassembler.sweep(now, crate::tuic::FRAG_REASSEMBLY_TTL_SECS);
                 // review #1/#2：回收已死/卡住的 TCP listener 槽（本地关闭/开远端失败的 teardown 缺口），
                 // 释放其 fake-IP refcount 并让槽回 Listen 复用，防 refcount 泄漏 + 槽数涨到 Capped。
                 reap_dead_slots(&registry, &mut sockets, &mut socket_ctxs, &mut fake_pool, now);
