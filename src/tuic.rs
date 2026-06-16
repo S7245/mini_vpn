@@ -549,6 +549,23 @@ impl AssocTable {
     }
 }
 
+/// 上行 UDP 的传输选择：datagram 快路径 vs uni-stream 兜底。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum UdpSend {
+    Datagram,
+    Stream,
+}
+
+/// 纯决策：给定当前 datagram 发送上限（`conn.max_datagram_size()`）与待发字节数，选传输。
+/// 中文要点：装得下走 datagram（含边界 `len==max`）；超上限或 datagram 不可用（`None`）→ stream 兜底。
+/// 主动分流（先查 max_datagram_size），避免 `send_datagram` 返回 `TooLarge` 的往返。
+pub fn udp_send_plan(max_datagram: Option<usize>, len: usize) -> UdpSend {
+    match max_datagram {
+        Some(max) if len <= max => UdpSend::Datagram,
+        _ => UdpSend::Stream,
+    }
+}
+
 /// 把任意可显示错误包成 ClientError（统一错误面）。
 fn io_err<E: std::fmt::Display>(ctx: &str, e: E) -> ClientError {
     ClientError::from(std::io::Error::other(format!("{ctx}: {e}")))
@@ -981,6 +998,18 @@ mod tests {
         assert!(decode_packet(&[0u8; 5]).is_none());
         // size says 0, atyp domain len 200 overruns:
         assert!(decode_packet(&[0x05, 0x02, 0, 7, 0, 0, 1, 0, 0, 0, 0x00, 200]).is_none());
+    }
+
+    #[test]
+    fn udp_send_plan_picks_transport() {
+        use UdpSend::*;
+        // 装得下 → datagram 快路径（含边界 ==max）。
+        assert_eq!(udp_send_plan(Some(1242), 1000), Datagram);
+        assert_eq!(udp_send_plan(Some(1242), 1242), Datagram);
+        // 超上限 → stream 兜底。
+        assert_eq!(udp_send_plan(Some(1242), 1243), Stream);
+        // datagram 不可用（对端不支持/未协商）→ stream。
+        assert_eq!(udp_send_plan(None, 100), Stream);
     }
 
     #[test]
