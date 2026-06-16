@@ -82,9 +82,14 @@
 吞吐 2.50→6.22 Mb/s）；#2 单端口 256 路 done 2/256(20s stall)→256/256(266ms)。
 `/code-review`（high effort）8 条 findings 已全部修复（核心：teardown 死槽回收修 refcount/槽泄漏）。
 
-**未做（deferred）**：#3 单条 QUIC 连接拥塞/队头需真 sing-box probe（findings 末节配方，归刀3 acceptance）；
-#4 多线程化（#1 后 poll/smoltcp 段成新瓶颈，留后续评估）；CloseWait+远端 keepalive 的半关闭已被
-`reap_dead_slots` 覆盖（CloseWait 视为应用关闭 teardown）。**未做跨机/真出口 acceptance**（需用户 sing-box env）。
+**真出口 acceptance ✅（2026-06-15，深圳 client → 47.251.188.205 sing-box，IP 直连 1.1.1.1:443）**：
+- ① TCP+TLS：curl HTTPS `TLS_verify=0`，三端日志闭环（client `relay→rearm` / server `inbound→outbound to 1.1.1.1:443`）。
+- ③ 大并发：200 路并发**全压单端口 :443** → `200 301` 全成功、零 `000` 超时（#2 弹性扩容真实生效；优化前此处 stall 2/256）。
+- #3 probe：200 路 `time_total` p50=0.379 / p95=0.491 / max=0.557s（max≈1.47×p50，分布极平）→
+  **单条 QUIC 连接在此负载下无队头/拥塞瓶颈，暂不需连接池**；更高负载/真直播大流量再评估（归刀3）。
+
+**未做（deferred）**：#4 多线程化（#1 后 poll/smoltcp 段成新瓶颈，留后续评估）；#3 连接池视刀3 更高负载/真直播再定。
+CloseWait+远端 keepalive 的半关闭已被 `reap_dead_slots` 覆盖（CloseWait 视为应用关闭 teardown）。
 
 ## Rhythm（每刀都遵守）
 

@@ -148,7 +148,21 @@ N=1024 的 relay 从 1618ms（占满单线程）降到 70.8ms；瓶颈现由 pol
   打通 acquire/release；`udp_sweep`（1s）周期 `fake_pool.sweep(now, TTL=300)`。
 - **活跃 flow（refcount>0）绝不回收**（单测覆盖）；仅 idle 且无 flow 超 TTL 才回收 → 长稳防泄漏、不断连。
 
-## 仍 deferred（本刀未碰）
+## 刀2 真出口 acceptance（2026-06-15，深圳 client → 47.251.188.205 sing-box）
 
-- **#3 单条 QUIC 连接**（拥塞/队头）：mock 测不到，需真 sing-box probe（本 findings 末节配方），归刀3 acceptance。
+mock harness 之外的端到端验证（IP 直连 1.1.1.1:443，`route -n add -host 1.1.1.1 -interface utunX`，不动全机 DNS）：
+
+| 测试 | 命令要点 | 结果 | 判定 |
+|---|---|---|---|
+| ① TCP+TLS | `curl -w '%{ssl_verify_result}' https://1.1.1.1/` | `HTTP=301 TLS_verify=0`，三端日志闭环 | ✅ 端到端 TLS 经 TUIC 打通 |
+| ③ 大并发 | `seq 1 200 \| xargs -P200 curl … :443` | `200 301`（全成功零 `000`），数秒内 | ✅ #2 弹性扩容真实生效（优化前 stall 2/256） |
+| #3 probe | 200 路 `time_total` 分位 | p50=0.379 / p95=0.491 / **max=0.557s** | 见下 |
+
+**#3 裁决（用真 sing-box probe，替代刀1 deferred）**：200 路并发下 `time_total` 分布极平
+（max≈1.47×p50，无长尾）→ **单条 TUIC QUIC 连接在此负载下不存在队头/拥塞瓶颈，暂不需连接池**。
+更高并发 / 真 UDP 直播大流量下是否需要「多 QUIC 连接池 vs 单连接多流」留刀3 acceptance 复测。
+
+## 仍 deferred
+
 - **#4 多线程/分片**：#1 已缓解大半；poll 段（smoltcp 单线程遍历）成新瓶颈，是否多线程留后续。
+- **#3 连接池**：当前负载无需；刀3 真直播大流量再评估。
