@@ -303,6 +303,14 @@ fn fragment_downlink(assoc: u16, payload: &[u8], chunk: usize) -> Vec<Vec<u8>> {
     } else {
         payload.chunks(chunk).collect()
     };
+    // FRAG_ID/FRAG_TOTAL 是 u8 → 单包最多 255 帧。超出会静默截断 → 重组得到截断 payload（假丢包）。
+    // 当前场景远不及（8000/1200≈7 帧）；加断言让未来大 payload 误用**响亮失败**而非静默错。
+    debug_assert!(
+        chunks.len() <= u8::MAX as usize,
+        "fragment_downlink: >255 帧（payload {} / chunk {}）超 u8 FRAG 上限",
+        payload.len(),
+        chunk
+    );
     let frag_total = chunks.len().min(u8::MAX as usize) as u8;
     chunks
         .into_iter()

@@ -88,4 +88,8 @@ UDP 数据面**全程 native datagram**：
 - **stream 兜底吞吐**：per-packet uni-stream 在高频大包下开销高于 datagram；依赖 MTU 调优把大包频率压低。若 acceptance 显示典型视频包频繁触发兜底 → 重新评估抬 `initial_mtu` 或 per-assoc quic 模式（留后续刀）。
 - **下行 stream 无界 spawn**：Semaphore 兜底；超额 drop（UDP 自愈）。
 - **分片丢失放大**：一片丢 → 整包弃（TTL）。视频可容忍（自带 FEC/重传或丢帧），优于无限等待。
+- **跨重连分片串味**（code-review C3）：连接断/重连后 server 可能复用同 `(assoc_id, pkt_id)`。
+  重组器不随重连重置（与主循环解耦）。缓解：frag_total 变→整体重建；frag_total 同→**last-writer-wins**
+  让新 frag 覆盖残片；未被新包重发的残留 slot 仍可能混入，由 `FRAG_REASSEMBLY_TTL_SECS`(10s) sweep 兜底。
+  窄窗且可容忍（分片仅大包尾部，重组失败应用自愈）；彻底消除需把重连信号引入主循环重置，权衡后不做（系统稳定优先）。
 - **SIZE 语义**：按「本分片 chunk 长」实现，acceptance 对真 sing-box 校验；若不符则按实测修。

@@ -275,9 +275,9 @@ pub const FRAG_REASSEMBLY_CAP: usize = 256;
 pub const FRAG_REASSEMBLY_TTL_SECS: u64 = 10;
 
 /// 一个未完成 UDP 包的分片缓冲（按 `(assoc_id, pkt_id)` 索引）。
+/// 中文要点：`frags.len()` 即 frag_total（构造后不变），不再单独存字段（单一事实源）。
 struct FragPartial {
-    frag_total: u8,
-    frags: Vec<Option<Vec<u8>>>, // 下标 = frag_id
+    frags: Vec<Option<Vec<u8>>>, // 下标 = frag_id；len == frag_total
     received: usize,
     first_seen: u64,
 }
@@ -310,7 +310,10 @@ impl FragReassembler {
 
     /// 喂入一个（分片）Packet。集齐返回完整 payload；未齐/无效返回 None。
     /// 中文要点：`FRAG_TOTAL==1` 直通不入表；`frag_id>=frag_total` 或 `frag_total==0` 视为无效丢弃；
-    /// 重复 frag_id 幂等（保留首个）；新 key 到 cap 触发 LRU（按 first_seen）驱逐最老未完成包。
+    /// 重复 frag_id **last-writer-wins**（保留较新；见下「跨重连」）；新 key 到 cap 触发 LRU（按 first_seen）驱逐最老。
+    /// 跨重连：连接断/重连后 server 可能复用同 `(assoc_id, pkt_id)`。frag_total 变 → 整体重建；frag_total 同
+    /// → last-writer-wins 让新连接的 frag 覆盖残片（减少串味），未被新包重发的残留 slot 仍可能混入，由
+    /// `FRAG_REASSEMBLY_TTL_SECS` sweep 兜底（窄窗、可容忍：分片仅大包尾部，重组失败应用自愈）。
     pub fn accept(&mut self, m: &PacketMeta, now: u64) -> Option<Vec<u8>> {
         if m.frag_total == 0 || m.frag_id >= m.frag_total {
             return None; // 无效分片头，丢弃（防越界/除零）
@@ -321,33 +324,28 @@ impl FragReassembler {
         let key = (m.assoc_id, m.pkt_id);
         let frag_total = m.frag_total as usize;
         // pkt_id 复用但 frag_total 变化 → 旧残留作废，按新分片重建。
-        let stale = self
+        if self
             .partials
             .get(&key)
-            .is_some_and(|p| p.frag_total != m.frag_total);
-        if stale {
+            .is_some_and(|p| p.frags.len() != frag_total)
+        {
             self.partials.remove(&key);
         }
+        // 新 key 到 cap → 先驱逐最老未完成（在借用 entry 前做，避免交叉借用）。
         if !self.partials.contains_key(&key) {
             self.evict_if_full();
-            self.partials.insert(
-                key,
-                FragPartial {
-                    frag_total: m.frag_total,
-                    frags: (0..frag_total).map(|_| None).collect(),
-                    received: 0,
-                    first_seen: now,
-                },
-            );
         }
-        let p = self.partials.get_mut(&key).expect("just inserted");
+        let p = self.partials.entry(key).or_insert_with(|| FragPartial {
+            frags: (0..frag_total).map(|_| None).collect(),
+            received: 0,
+            first_seen: now,
+        });
         let slot = &mut p.frags[m.frag_id as usize];
-        if slot.is_some() {
-            return None; // 重复 frag，幂等忽略
+        if slot.is_none() {
+            p.received += 1;
         }
-        *slot = Some(m.data.to_vec());
-        p.received += 1;
-        if p.received < p.frag_total as usize {
+        *slot = Some(m.data.to_vec()); // last-writer-wins（覆盖；跨重连残片被新 frag 顶替）
+        if p.received < p.frags.len() {
             return None;
         }
         // 集齐：按 frag_id 序拼接，清出该项。
@@ -1130,11 +1128,13 @@ mod tests {
     }
 
     #[test]
-    fn reassemble_duplicate_fragment_idempotent() {
+    fn reassemble_duplicate_fragment_last_writer_wins() {
         let mut r = FragReassembler::new();
+        // 重复 frag_id last-writer-wins：第二个 frag_id=0 覆盖第一个（received 不重复计数），
+        // 既保跨重连残片被新 frag 顶替，又不破坏完成判定。
         assert_eq!(r.accept(&meta(5, 9, 2, 0, b"AB"), 0), None);
-        assert_eq!(r.accept(&meta(5, 9, 2, 0, b"XX"), 0), None); // 重复 frag_id=0，忽略
-        assert_eq!(r.accept(&meta(5, 9, 2, 1, b"CD"), 0), Some(b"ABCD".to_vec())); // 仍用首个
+        assert_eq!(r.accept(&meta(5, 9, 2, 0, b"XX"), 0), None); // 覆盖 slot[0]
+        assert_eq!(r.accept(&meta(5, 9, 2, 1, b"CD"), 0), Some(b"XXCD".to_vec())); // 用较新的
     }
 
     #[test]
