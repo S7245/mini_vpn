@@ -152,6 +152,12 @@ const TUIC_HEARTBEAT_SECS: u64 = 3;
 const TUIC_HB_IDLE_WINDOW_SECS: u64 = 60;
 /// 下行 datagram channel 容量。背压由 pump 承担（`send().await`），不丢下行（DNS 响应不能丢）。
 const TUIC_DOWNLINK_CAPACITY: usize = 1024;
+/// 一个 TUIC Packet 命令的字节上限（读 uni-stream 的 `read_to_end` size_limit，防恶意/异常无界流）。
+/// UDP 载荷最大 65507 + TUIC 头/地址 ≈ 65537 → 取 66KiB 兜头。
+const MAX_TUIC_PACKET_BYTES: usize = 66 * 1024;
+/// 下行 uni-stream 并发读取上限：超额直接丢弃该 stream（reset），防 flood 下无界派生任务。
+/// quic-relay-mode 下每包一条 uni-stream；256 并发够吸收突发，又不至失控。
+const MAX_CONCURRENT_DOWNLINK_STREAMS: usize = 256;
 /// UDP 驱动重连退避上限（确定性指数退避，无需 rand；UDP 自愈，重连节奏不敏感）。
 const UDP_RECONNECT_CAP_MS: u64 = 30_000;
 const UDP_RECONNECT_BASE_MS: u64 = 500;
@@ -785,13 +791,16 @@ impl TuicUpstream {
     }
 
     /// 启动 UDP 驱动后台任务，返回**下行 datagram 接收端**给主循环 select。
-    /// 任务职责：① 下行泵——`read_datagram` → channel（主循环 `decode_packet` 后注入 TUN）；
-    /// ② 周期 Heartbeat 维持连接。连接断开则确定性退避后经 `live_conn` 重连，泵与心跳自然恢复
-    /// （等价于"重连后重启泵/心跳"）。
+    /// 任务职责：① 下行泵——`read_datagram`（native）+ `accept_uni`（quic-relay-mode / 大包）→ channel
+    /// （主循环 `decode_packet_meta` + 重组后注入 TUN）；② 周期 Heartbeat 维持连接。连接断开则确定性退避后
+    /// 经 `live_conn` 重连，泵与心跳自然恢复（等价于"重连后重启泵/心跳"）。
     /// 中文要点：单自愈循环，避免多任务各自重连产生竞态；下行用 `send().await` 施加背压、不丢 DNS 响应。
+    /// uni-stream 读取有界派生（`Semaphore`），超并发上限丢弃该 stream（UDP 自愈），防 flood 无界 spawn。
     pub fn start_udp(self: &Arc<Self>) -> mpsc::Receiver<Vec<u8>> {
         let (downlink_tx, downlink_rx) = mpsc::channel::<Vec<u8>>(TUIC_DOWNLINK_CAPACITY);
         let me = Arc::clone(self);
+        // 跨重连共享：限制下行 uni-stream 的并发读取数。
+        let stream_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLINK_STREAMS));
         tokio::spawn(async move {
             let mut attempt: u32 = 0;
             loop {
@@ -822,6 +831,25 @@ impl TuicUpstream {
                                 Err(_) => break, // 连接断 → 外层 live_conn 重连
                             }
                         }
+                        // quic-relay-mode / 超 datagram 上限的下行包：经 uni-stream 来。读满整条 Packet
+                        // → 同一下行 channel（与 datagram 路径同构，主循环统一 decode + 重组）。
+                        stream = conn.accept_uni() => {
+                            match stream {
+                                Ok(recv) => {
+                                    // 有界派生：拿到 permit 才读；拿不到（达并发上限）→ 丢弃该 stream（UDP 自愈）。
+                                    if let Ok(permit) = Arc::clone(&stream_sem).try_acquire_owned() {
+                                        let tx = downlink_tx.clone();
+                                        tokio::spawn(async move {
+                                            let _permit = permit; // 持有到读完，限并发
+                                            if let Some(pkt) = read_uni_packet(recv).await {
+                                                let _ = tx.send(pkt).await;
+                                            }
+                                        });
+                                    }
+                                }
+                                Err(_) => break, // 连接断 → 外层 live_conn 重连
+                            }
+                        }
                         _ = hb.tick() => {
                             // 仅在「最近有 UDP 上行」时发心跳；纯 TCP 会话由 QUIC keep-alive 保活，不发。
                             let now = me.clock.elapsed().as_secs();
@@ -840,6 +868,15 @@ impl TuicUpstream {
             }
         });
         downlink_rx
+    }
+}
+
+/// 读满一条下行 uni-stream（一个完整 TUIC Packet 命令），上限 `MAX_TUIC_PACKET_BYTES`。
+/// 中文要点：流过大/被 reset/读错 → None（丢弃该包，UDP 自愈）。空流（finish 无数据）→ None。
+async fn read_uni_packet(mut recv: quinn::RecvStream) -> Option<Vec<u8>> {
+    match recv.read_to_end(MAX_TUIC_PACKET_BYTES).await {
+        Ok(buf) if !buf.is_empty() => Some(buf),
+        _ => None,
     }
 }
 
