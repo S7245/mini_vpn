@@ -238,3 +238,47 @@ mock harness 之外的端到端验证（IP 直连 1.1.1.1:443，`route -n add -h
 - 选项：① 持续/高码率 UDP flow 默认走 stream（quic-relay-mode 或自适应：观测到高 pps 即切流）；
   ② 给 datagram 路径加 pacing/背压（按 `send_buffer_space` 节流）+ 丢包可观测；③ 评估多 QUIC 连接池
   对 datagram 聚合吞吐是否有效。需带 quinn 级 instrumentation（RTT/cwnd/datagram drop）量化后再定方向。
+
+---
+
+# 刀3.5 真出口 acceptance 配方（待跑，需真 sing-box + 深圳 macOS 真机）
+
+> 实现见 `2026-06-17-knife35-highrate-udp-{spec,plan}.md`。分支 `claude/knife35-highrate-udp`。
+> 代码已完成（BBR/Cubic 可切 + quic-relay-mode + quinn 插桩 + 抬 uni-stream 配额），逻辑/harness 全绿。
+> **本节是 ready-to-run 配方；跑完把结果填回「实测」与「裁决」。**
+> grill 已定 4K(~25M) 为**必跨线**；首包锁定下行 mode（SPEC 已查证）→ 高码率走 quic-relay-mode（全 UDP
+> 首包即 uni-stream，server 镜像下行也走 stream）；#221 靠抬 `max_concurrent_uni_streams=4096` 缓解。
+
+## 准备
+
+1. env（HANDOFF「Not in git」+ 刀3.5 新增两个旋钮）：
+   - 既有：`MINI_VPN_TUIC_SERVER=47.251.188.205:8443` `MINI_VPN_TUIC_UUID/PASSWORD/SNI/CA_PATH/ALPN`。
+   - **新增**：`MINI_VPN_TUIC_CC=bbr|cubic`（默认 bbr，A/B 用）、`MINI_VPN_TUIC_UDP_MODE=native|quic`（默认 native）。
+2. 起客户端：`sudo MINI_VPN_TUIC_* ./target/release/mini_vpn client-tun`
+   - 连上打印 `📏 datagram 初始上限`、`🧭 拥塞控制器=Bbr|Cubic | UDP relay mode=Native|Quic`（**确认 BBR/quic 真装上**）。
+   - 每 30s 打 `📊 TUIC UDP↑: ... | RTT=..ms cwnd=.. 丢包=lost/sent send_buf 余=..B`（UDP 活跃即打，native 背压时附 `⚠️背压`）。
+3. **链路铁律**：测试链路带宽 **≥50M**（别把 43.x 限到 10M，否则链路成新瓶颈污染判读），靠 `-b` 控码率。
+4. 受控 UDP 目标 IP 直连绕 fake-IP：`sudo route -n add -host 43.110.37.170 -interface utunX`。
+
+## 测项（对应 spec 矩阵 T-A~T-H）
+
+| # | 测项 | 命令要点 | 看什么 | 判据 |
+|---|---|---|---|---|
+| T-A | CC A/B（gate 主判据） | `MINI_VPN_TUIC_CC=cubic` vs `bbr`（均 native），`iperf3 -c 43.110.37.170 -u -l 1200 -R -b 5/10/20/40M -t 30` | 各档实收/丢包 + `📊` cwnd/RTT | **BBR 下行 datagram 干净吞吐 ≥30M → 保 native 默认、Phase 2 跳过；<30M → 默认翻 quic** |
+| T-B | 下行 stream 吞吐（刀3 只测上行） | `MINI_VPN_TUIC_UDP_MODE=quic`，`-l 1200 -R -b 40M -t 30` | 实收 vs datagram 5.3M | 下行经 stream 跑满 offered → 证 stream 修下行 |
+| T-C | 上行 datagram + BBR | `-l 1200 -b 40M`（不 -R） | 上行实收 | BBR 是否把上行 datagram 抬过 5.3M（归因 CC vs 无背压） |
+| T-D | 4K 端到端（quic 模式） | `udp_mode=quic`，`-b 25M` 上/下行各一轮 | 丢包 + `📊` | 丢包低位；`stream 兜底=0`（quic 主发，非兜底）；无映射洪水 |
+| T-E | 多 flow gate | `udp_mode=quic`，并行 2 路：`-b 25M` + `-b 8M`（≈33M 聚合） | 单连接聚合实收 | 聚合 **≥33M 成立** → 池 defer；否则池升后续刀首项 |
+| T-F | DNS/小流延迟（carve-out 触发） | quic 模式 `dig @<resolver> ... ` / 小 UDP 往返 vs native 基线 | 往返延迟差 | 明显退化 → **本刀补 DNS/小流 datagram carve-out**；否则不做 |
+| T-G | 首包锁定 + 配额验证 | quic 模式起播，看 `📊`/日志 | 下行是否真走 stream、有无 #221 塌缩 | 坐实「首包 stream→下行镜像 stream」且 4096 配额够 |
+| T-H | 真实混合场景长稳 soak（深圳 macOS） | YouTube 视/直 + TikTok 视/直 + Facebook 网页 + Telegram 客服，30–60min+ | 主观流畅度 + `📊`/重连/内存 | 视频不卡、TG 跟手、FB 不滞；`📊` 合理、重连低、内存不涨、无映射洪水。TG/FB 明显滞 → 触发 carve-out |
+
+## 实测（待填）
+
+> 跑完填表；建议先 T-A 定默认 mode，再 T-B/D/G 坐实 stream 修下行，T-E 多 flow，T-F/H 决定 carve-out。
+
+## 裁决（待填）
+
+- 默认 `udp_relay_mode` =（T-A 定）；是否补 `docs/adr/0005-default-udp-relay-mode-quic.md`。
+- 是否补 DNS/小流 carve-out（T-F/T-H 定）。
+- 连接池是否升后续刀首项（T-E 定）。
