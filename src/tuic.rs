@@ -662,6 +662,9 @@ pub struct TuicUpstream {
     clock: std::time::Instant,
     /// 重连是否尝试 0-RTT（来自 config；失败自愈回落 1-RTT）。
     zero_rtt: bool,
+    /// UDP relay mode（刀3.5；来自 config）：`Quic` → 所有上行包走 uni-stream（首包即触发 server
+    /// 下行镜像 stream，摆脱 datagram 天花板）；`Native` → datagram 主 + 超限 stream 兜底（刀3 行为）。
+    udp_relay_mode: UdpRelayMode,
 }
 
 impl TuicUpstream {
@@ -675,6 +678,14 @@ impl TuicUpstream {
                 cfg.congestion_control
             );
         }
+        // 刀3.5：解析 UDP relay mode（未知值回落 Native + 告警，与 CC 对称）。
+        let udp_relay_mode = UdpRelayMode::parse(&cfg.udp_relay_mode).unwrap_or_else(|| {
+            println!(
+                "⚠️ TUIC 未知 udp_relay_mode={:?}，回落 native（datagram 主 + 超限 stream 兜底）",
+                cfg.udp_relay_mode
+            );
+            UdpRelayMode::Native
+        });
         let qcfg =
             quic::client_quic_config_alpn(&cfg.ca_path, vec![cfg.alpn.as_bytes().to_vec()], cc)
                 .map_err(ClientError::InvalidTarget)?;
@@ -706,7 +717,13 @@ impl TuicUpstream {
             last_udp_activity: AtomicU64::new(0),
             clock: std::time::Instant::now(),
             zero_rtt: cfg.zero_rtt,
+            udp_relay_mode,
         })
+    }
+
+    /// 当前 UDP relay mode（可观测/测试）。
+    pub fn udp_relay_mode(&self) -> UdpRelayMode {
+        self.udp_relay_mode
     }
 
     /// 建连 + 认证。`zero_rtt` 时先试 0-RTT（early data）；任何原因失败（无 ticket / 服务端不支持 /
@@ -824,8 +841,8 @@ impl TuicUpstream {
         };
         // Bytes：datagram 路径下 `clone()` 为 O(1)（Arc 引用计数），TooLarge 竞态二次兜底不深拷贝。
         let bytes = bytes::Bytes::from(datagram);
-        // T1：mode 暂固定 Native（零回归）；真实 mode 由 T6 从 config 接入 `self.udp_relay_mode`。
-        match udp_send_plan(UdpRelayMode::Native, conn.max_datagram_size(), bytes.len()) {
+        // 按 config 的 relay mode 分流：Quic→恒 uni-stream（首包触发下行镜像 stream）；Native→size-based。
+        match udp_send_plan(self.udp_relay_mode, conn.max_datagram_size(), bytes.len()) {
             UdpSend::Datagram => match conn.send_datagram(bytes.clone()) {
                 Ok(()) => {}
                 Err(quinn::SendDatagramError::TooLarge) => {
