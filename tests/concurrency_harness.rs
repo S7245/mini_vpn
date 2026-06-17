@@ -86,6 +86,23 @@ async fn passthrough_downlink_still_intact() {
     );
 }
 
+/// 刀3.5 quic 模式高量级下行回归（常驻）：quic-relay-mode 下行是**整包不分片**（FRAG_TOTAL=1，
+/// uni-stream 承载完整 Packet），等价 passthrough 形态。本测以高量级（300 包）代表高码率直播下行，
+/// 守住主循环在持续高速下逐字节零损坏 + 无丢。注：真 datagram↔stream 传输选择在 TuicUpstream、
+/// harness 测不到（同 #3 边界，归 acceptance T-B/T-D/T-G）。
+#[tokio::test]
+async fn quic_mode_highrate_downlink_intact() {
+    // 1200B × 300 包 ≈ 代表高码率流的整包下行（mock 直通 = quic 模式下行形态）。
+    let report = run_udp_throughput_scenario(300, 1200, None, Duration::from_secs(15)).await;
+    report.print_row();
+    assert!(!report.fragmented, "quic 模式下行应为整包直通（FRAG_TOTAL=1，不分片）");
+    assert_eq!(
+        report.echoed_intact, report.sent,
+        "高量级整包下行应全部逐字节完整（intact={}/{}）",
+        report.echoed_intact, report.sent
+    );
+}
+
 /// 刀3 UDP 吞吐 sweep（重，显式 `--ignored` 跑）：对比 passthrough vs 分片下行的吞吐/丢包，
 /// 量化主循环 UDP 路径 + 重组成本。真 datagram/stream 兜底对比归真出口 acceptance。
 #[tokio::test]
