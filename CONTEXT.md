@@ -36,6 +36,10 @@ _Avoid_: session id, stream id (it identifies a UDP flow, not a QUIC stream or T
 The TUIC UDP association id (`u16`) carried in a TUIC `Packet`. In mini_vpn it is allocated **one per UDP flow** (4-tuple) — the same role as **flow-id**, just 16-bit and on the TUIC wire — so the reply (tagged with assoc-id) maps back to the app endpoint and fake-IP source. We deliberately do not use TUIC's full-cone "one association per local socket" model, because that would reintroduce the reply-demux problem flow-id solves.
 _Avoid_: session id (it identifies a UDP flow, not a QUIC stream or TCP session)
 
+**UDP relay mode** (`native` / `quic`):
+How a TUIC `Packet` is carried over the **Upstream**'s QUIC connection. _native_ = QUIC datagram (unreliable, low-latency, but throughput-capped on high-RTT/lossy paths and silently lossy under overload — drops the oldest buffered datagram without error). _quic_ = each `Packet` on its own QUIC **unidirectional stream** (reliable, ordered within the one packet it carries; escapes the datagram throughput ceiling, at the cost of one stream setup per packet). Per the TUIC spec the **Upstream** mirrors the mode of an association's **first** `Packet` for all of that association's downlink `Packet`s — so the mode is effectively chosen at **UDP flow** birth and cannot be flipped mid-flow.
+_Avoid_: "stream mode" alone (ambiguous with TCP relay streams); "datagram fallback" (oversized-packet stream fallback is a separate, size-driven thing within _native_ mode)
+
 ## Relationships
 
 - The client opens one **Upstream** connection and multiplexes many intercepted sessions over it (Yamux substreams).
