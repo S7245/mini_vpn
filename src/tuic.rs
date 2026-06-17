@@ -173,8 +173,6 @@ const MAX_TUIC_PACKET_BYTES: usize = 66 * 1024;
 const MAX_CONCURRENT_DOWNLINK_STREAMS: usize = 256;
 /// UDP 上行统计行打印周期（秒）：周期性把 stream 兜底/丢弃计数打一行，供真出口 acceptance 与生产观测。
 const UDP_STATS_LOG_SECS: u64 = 30;
-/// datagram 背压判定的 MTU 兜底值（仅当 `max_datagram_size()` 为 None 时用；与 quic.rs 起步 MTU 1280 对齐）。
-const QUIC_INITIAL_MTU_FLOOR: usize = 1280;
 /// UDP 驱动重连退避上限（确定性指数退避，无需 rand；UDP 自愈，重连节奏不敏感）。
 const UDP_RECONNECT_CAP_MS: u64 = 30_000;
 const UDP_RECONNECT_BASE_MS: u64 = 500;
@@ -850,7 +848,8 @@ impl TuicUpstream {
             UdpSend::Datagram => match conn.send_datagram(bytes.clone()) {
                 Ok(()) => {}
                 Err(quinn::SendDatagramError::TooLarge) => {
-                    // 分流时还装得下、真发时 MTU 已收缩 → 二次 stream 兜底，不丢。
+                    // 分流时还装得下、真发时 MTU 已收缩 → 二次 stream **兜底**（计 fallback），不丢。
+                    self.udp_stream_fallbacks.fetch_add(1, Ordering::Relaxed);
                     self.send_udp_via_stream(&conn, bytes).await;
                 }
                 Err(e) => {
@@ -858,18 +857,26 @@ impl TuicUpstream {
                     println!("⚠️ TUIC UDP↑ 发送失败（连接将自愈），丢弃: {e:?}");
                 }
             },
-            UdpSend::Stream => self.send_udp_via_stream(&conn, bytes).await,
+            UdpSend::Stream => {
+                // Native 走到这里=超 datagram 上限的**兜底**（计数，acceptance 判 MTU 调优是否够）；
+                // Quic 模式 stream 是**主发路径**（非兜底，不计 fallback，否则 `📊 stream 兜底` 会被
+                // 误读为 MTU 失败——量级 = 全部包）。主发量看 path.sent_packets。
+                if self.udp_relay_mode == UdpRelayMode::Native {
+                    self.udp_stream_fallbacks.fetch_add(1, Ordering::Relaxed);
+                }
+                self.send_udp_via_stream(&conn, bytes).await;
+            }
         }
     }
 
-    /// uni-stream 兜底：开单向流 → 写整条已编码 Packet → finish。
+    /// 在 uni-stream 上发一条完整 TUIC Packet：开单向流 → 写整条已编码 Packet → finish。
     /// 中文要点：TUIC quic-relay-mode 即「一条 uni-stream 承载一个完整 Packet 命令」（`FRAG_TOTAL=1`），
     /// 字节与 datagram 模式**完全一致**（复用同一 `encode_packet` 产物）。任一步失败→丢弃计数（UDP 自愈重发）。
+    /// fallback 计数由调用方负责（仅 Native 兜底场景计），本函数只管 I/O + 真失败丢弃。
     async fn send_udp_via_stream(&self, conn: &Connection, datagram: bytes::Bytes) {
-        self.udp_stream_fallbacks.fetch_add(1, Ordering::Relaxed);
         if let Err(e) = Self::write_uni_packet(conn, &datagram).await {
             self.udp_drops.fetch_add(1, Ordering::Relaxed);
-            println!("⚠️ TUIC UDP↑ stream 兜底失败（连接将自愈），丢弃: {e:?}");
+            println!("⚠️ TUIC UDP↑ uni-stream 发送失败（连接将自愈），丢弃: {e:?}");
         }
     }
 
@@ -974,7 +981,13 @@ impl TuicUpstream {
                                     path.lost_packets, path.sent_packets, space,
                                 );
                                 // datagram 背压代理信号：剩余 < 1 个 datagram 上限 → 即将丢最老（静默丢盲点）。
-                                if is_datagram_pressured(space, max_dg.unwrap_or(QUIC_INITIAL_MTU_FLOOR)) {
+                                // 仅 Native 模式有意义（Quic 模式 relay 不走 datagram，背压无关，避免假警报）。
+                                let pressured = me.udp_relay_mode == UdpRelayMode::Native
+                                    && is_datagram_pressured(
+                                        space,
+                                        max_dg.unwrap_or(quic::QUIC_INITIAL_MTU as usize),
+                                    );
+                                if pressured {
                                     println!("{line} ⚠️背压(datagram 缓冲将丢最老)");
                                 } else {
                                     println!("{line}");

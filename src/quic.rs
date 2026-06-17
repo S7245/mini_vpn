@@ -27,7 +27,7 @@ const QUIC_KEEPALIVE_SECS: u64 = 5;
 /// 此时 max_datagram_size ~1162，装不下「1200B 内层包(典型 QUIC initial) + ~20B 头 ≈ 1224」——
 /// 冷连接(刚连上、PLPMTUD 没探完)发大包会被丢。起步设 1280 → max_datagram ~1242 → 立刻装得下，
 /// 消除冷窗口；PLPMTUD 仍会继续往上探（~1414）拿更多余量。1280 普适安全，不会黑洞。
-const QUIC_INITIAL_MTU: u16 = 1280;
+pub const QUIC_INITIAL_MTU: u16 = 1280;
 
 /// 接收侧 `max_udp_payload_size` 传输参数（刀3）：告诉对端「我方单个 UDP 载荷最大能收多大」。
 /// 中文要点（已核 quinn-proto-0.10.6）：**这是接收侧 headroom，不决定我方发送 datagram 上限**——
