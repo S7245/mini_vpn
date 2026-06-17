@@ -35,6 +35,25 @@ const QUIC_INITIAL_MTU: u16 = 1280;
 /// 仅 jumbo-frame/回环等大 MTU 路径抬高才有收益（代价是接收缓冲线性增大），是否抬由真出口 probe 定档。
 const QUIC_MAX_UDP_PAYLOAD_SIZE: u16 = 1472;
 
+/// 拥塞控制器选择（刀3.5）。中文要点：quinn 默认 Cubic；高 RTT/丢包跨境路径 BBR 通常显著优于
+/// Cubic（model-based，不因丢包腰斩 cwnd）——这是刀3 acceptance datagram ~5.3M 天花板的一大成因。
+/// `quinn-proto 0.10.6` 已导出 `BbrConfig`（已查证），故可接。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum CcChoice {
+    Bbr,
+    Cubic,
+}
+
+/// 纯解析：拥塞控制器名（大小写不敏感）→ `(选择, 是否回落)`。
+/// 未知/空名回落 Cubic（quinn 默认），第二位 `true` 供调用方打一行告警（失败自愈不致命）。
+pub fn parse_cc(name: &str) -> (CcChoice, bool) {
+    match name.to_ascii_lowercase().as_str() {
+        "bbr" => (CcChoice::Bbr, false),
+        "cubic" => (CcChoice::Cubic, false),
+        _ => (CcChoice::Cubic, true),
+    }
+}
+
 /// 共享的 QUIC 传输参数：keep-alive + 拉长 idle + 起步 MTU（datagram 等其余保持默认）。
 fn quic_transport_config() -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
@@ -126,6 +145,17 @@ fn load_certs(path: &str) -> Result<Vec<Certificate>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_cc_maps_and_falls_back() {
+        // 已知名（大小写不敏感）→ 对应控制器，无回落。
+        assert_eq!(parse_cc("bbr"), (CcChoice::Bbr, false));
+        assert_eq!(parse_cc("BBR"), (CcChoice::Bbr, false));
+        assert_eq!(parse_cc("cubic"), (CcChoice::Cubic, false));
+        // 未知/空 → 回落 Cubic（quinn 默认），flag=true 供调用方告警。
+        assert_eq!(parse_cc(""), (CcChoice::Cubic, true));
+        assert_eq!(parse_cc("reno"), (CcChoice::Cubic, true));
+    }
 
     #[test]
     fn client_config_builds_with_dev_ca() {
