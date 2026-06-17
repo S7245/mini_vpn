@@ -611,6 +611,33 @@ pub fn udp_send_plan(mode: UdpRelayMode, max_datagram: Option<usize>, len: usize
     }
 }
 
+/// datagram 背压压力信号（刀3.5 可观测）：出向 datagram 缓冲剩余 `< 1 个 MTU` 时，
+/// 再发大 datagram 极可能触发 quinn「丢最老」——不报错的静默丢（刀3 acceptance 盲点）。
+/// 中文要点：这是**代理信号**（pressure），非逐包精确丢包数；逐包精确留待真做主动背压时一起上。
+pub fn is_datagram_pressured(send_buffer_space: usize, mtu: usize) -> bool {
+    send_buffer_space < mtu
+}
+
+/// 格式化 30s UDP 上行统计行（**纯函数**，便于单测；I/O 取数在 `start_udp`）。
+/// 中文要点：在刀3 的「stream 兜底/丢弃」基础上加 quinn 级量化——`RTT/cwnd/丢包/send_buf 余`，
+/// 供真出口 acceptance 归因 datagram 天花板成因（CC vs 无背压）。
+#[allow(clippy::too_many_arguments)]
+pub fn format_udp_stats(
+    max_datagram: Option<usize>,
+    fallbacks: u64,
+    drops: u64,
+    rtt_ms: u128,
+    cwnd: u64,
+    lost: u64,
+    sent: u64,
+    send_buffer_space: usize,
+) -> String {
+    format!(
+        "📊 TUIC UDP↑: datagram 上限={max_datagram:?} stream 兜底={fallbacks} 丢弃={drops} \
+         | RTT={rtt_ms}ms cwnd={cwnd} 丢包={lost}/{sent} send_buf 余={send_buffer_space}B"
+    )
+}
+
 /// 把任意可显示错误包成 ClientError（统一错误面）。
 fn io_err<E: std::fmt::Display>(ctx: &str, e: E) -> ClientError {
     ClientError::from(std::io::Error::other(format!("{ctx}: {e}")))
@@ -1148,6 +1175,26 @@ mod tests {
         assert!(decode_packet(&[0u8; 5]).is_none());
         // size says 0, atyp domain len 200 overruns:
         assert!(decode_packet(&[0x05, 0x02, 0, 7, 0, 0, 1, 0, 0, 0, 0x00, 200]).is_none());
+    }
+
+    #[test]
+    fn datagram_pressure_signal() {
+        // 出向 datagram 缓冲剩余 < 1 MTU → 视为正在背压（quinn 会静默丢最老）。
+        assert!(is_datagram_pressured(0, 1200));
+        assert!(is_datagram_pressured(1199, 1200));
+        assert!(!is_datagram_pressured(1200, 1200)); // 边界：刚好 1 MTU 不算压力
+        assert!(!is_datagram_pressured(100_000, 1200));
+    }
+
+    #[test]
+    fn format_udp_stats_includes_key_metrics() {
+        let s = format_udp_stats(Some(1332), 7, 2, 180, 65535, 3, 1000, 4096);
+        assert!(s.contains("stream 兜底=7"), "{s}");
+        assert!(s.contains("丢弃=2"), "{s}");
+        assert!(s.contains("RTT=180ms"), "{s}");
+        assert!(s.contains("cwnd=65535"), "{s}");
+        assert!(s.contains("3/1000"), "{s}"); // lost/sent
+        assert!(s.contains("4096"), "{s}"); // send_buffer 余
     }
 
     #[test]
