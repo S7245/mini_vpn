@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use quinn::congestion::{BbrConfig, CubicConfig};
 use quinn::{ClientConfig, Endpoint, IdleTimeout, TransportConfig};
 use rustls::{Certificate, RootCertStore};
 
@@ -54,8 +55,15 @@ pub fn parse_cc(name: &str) -> (CcChoice, bool) {
     }
 }
 
-/// 共享的 QUIC 传输参数：keep-alive + 拉长 idle + 起步 MTU（datagram 等其余保持默认）。
-fn quic_transport_config() -> Arc<TransportConfig> {
+/// 下行 uni-stream 并发配额（刀3.5）：quinn 默认仅 **100**，而 quic-relay-mode 每包一条 uni-stream，
+/// 4K 下行 ~2600pps × ~1RTT(0.25s) ≈ 650 条在飞、多 flow(~33M) ≈ 850 条 → 默认 100 会让下行 stream
+/// 一开就阻塞塌缩（TUIC issue #221）。抬到 4096：按需建流、空闲不预分配，上限不是预分配开销。
+const QUIC_MAX_CONCURRENT_UNI_STREAMS: u32 = 4096;
+
+/// 共享的 QUIC 传输参数：keep-alive + 拉长 idle + 起步 MTU + CC + uni-stream 配额（datagram 等其余默认）。
+/// 中文要点（刀3.5）：装 `congestion_controller_factory`（quinn 默认 Cubic；高 RTT/丢包跨境 BBR 通常更优）
+/// + 抬 `max_concurrent_uni_streams`（避 #221）。
+fn quic_transport_config(cc: CcChoice) -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
     let idle = IdleTimeout::try_from(Duration::from_secs(QUIC_MAX_IDLE_SECS))
         .expect("idle timeout fits VarInt");
@@ -63,6 +71,11 @@ fn quic_transport_config() -> Arc<TransportConfig> {
     t.keep_alive_interval(Some(Duration::from_secs(QUIC_KEEPALIVE_SECS)));
     t.initial_mtu(QUIC_INITIAL_MTU);
     t.min_mtu(QUIC_INITIAL_MTU);
+    t.max_concurrent_uni_streams(QUIC_MAX_CONCURRENT_UNI_STREAMS.into());
+    match cc {
+        CcChoice::Bbr => t.congestion_controller_factory(Arc::new(BbrConfig::default())),
+        CcChoice::Cubic => t.congestion_controller_factory(Arc::new(CubicConfig::default())),
+    };
     Arc::new(t)
 }
 
@@ -71,23 +84,26 @@ fn quic_transport_config() -> Arc<TransportConfig> {
 /// `enable_0rtt=false` 严格保持 Stage-12 原行为（零回归），不把 0-RTT 能力泄漏到 legacy。
 pub fn client_quic_config(ca_path: &str) -> Result<ClientConfig, String> {
     let crypto = client_crypto(ca_path, vec![QUIC_ALPN.to_vec()], false)?;
-    Ok(finish_client_config(crypto))
+    // legacy 路径保持 quinn 默认 CC（Cubic），零回归——CC 选择只对 TUIC 数据面开放。
+    Ok(finish_client_config(crypto, CcChoice::Cubic))
 }
 
-/// 构建 QUIC 客户端 config，**ALPN 可指定**（TUIC 对接 sing-box 需用 `h3` 等，见 Stage 13a）。
-/// 中文要点：TUIC(Stage 13)路径开 0-RTT early data（重连快速恢复，见 Stage 13c）。
+/// 构建 QUIC 客户端 config，**ALPN + 拥塞控制器可指定**（TUIC 对接 sing-box 需用 `h3` 等，见 Stage 13a）。
+/// 中文要点：TUIC(Stage 13)路径开 0-RTT early data（重连快速恢复，见 Stage 13c）；
+/// 刀3.5 起 `cc` 由 config 决定（BBR/Cubic），贯穿到 transport config。
 pub fn client_quic_config_alpn(
     ca_path: &str,
     alpn_protocols: Vec<Vec<u8>>,
+    cc: CcChoice,
 ) -> Result<ClientConfig, String> {
     let crypto = client_crypto(ca_path, alpn_protocols, true)?;
-    Ok(finish_client_config(crypto))
+    Ok(finish_client_config(crypto, cc))
 }
 
-/// 把 rustls 客户端配置包成 quinn `ClientConfig` 并装上共享传输参数。
-fn finish_client_config(crypto: rustls::ClientConfig) -> ClientConfig {
+/// 把 rustls 客户端配置包成 quinn `ClientConfig` 并装上共享传输参数（含选定 CC）。
+fn finish_client_config(crypto: rustls::ClientConfig, cc: CcChoice) -> ClientConfig {
     let mut cfg = ClientConfig::new(Arc::new(crypto));
-    cfg.transport_config(quic_transport_config());
+    cfg.transport_config(quic_transport_config(cc));
     cfg
 }
 
@@ -178,5 +194,16 @@ mod tests {
     async fn client_endpoint_binds() {
         let cfg = client_quic_config("certs/dev/ca-cert.pem").unwrap();
         assert!(client_endpoint(cfg).is_ok());
+    }
+
+    // 刀3.5：BBR/Cubic 两种 CC 都能装进 transport config 并 bind（真 CC 生效靠 acceptance 验，
+    // 此处只锁"装得上、bind 绿"，factory 本身 opaque 不可断言类型）。
+    #[tokio::test]
+    async fn client_endpoint_binds_with_each_cc() {
+        for cc in [CcChoice::Bbr, CcChoice::Cubic] {
+            let cfg =
+                client_quic_config_alpn("certs/dev/ca-cert.pem", vec![b"h3".to_vec()], cc).unwrap();
+            assert!(client_endpoint(cfg).is_ok(), "bind failed for {cc:?}");
+        }
     }
 }

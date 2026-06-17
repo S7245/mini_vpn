@@ -640,8 +640,17 @@ pub struct TuicUpstream {
 impl TuicUpstream {
     /// 建连 + 发 Authenticate（token 经 keying-material 导出，字节级对齐 sing-box）。
     pub async fn connect(cfg: &TuicClientConfig) -> Result<Self, ClientError> {
-        let qcfg = quic::client_quic_config_alpn(&cfg.ca_path, vec![cfg.alpn.as_bytes().to_vec()])
-            .map_err(ClientError::InvalidTarget)?;
+        // 刀3.5：从 config 解析 CC（未知值回落 Cubic + 告警，失败自愈不致命）。
+        let (cc, fell_back) = quic::parse_cc(&cfg.congestion_control);
+        if fell_back {
+            println!(
+                "⚠️ TUIC 未知 congestion_control={:?}，回落 Cubic（quinn 默认）",
+                cfg.congestion_control
+            );
+        }
+        let qcfg =
+            quic::client_quic_config_alpn(&cfg.ca_path, vec![cfg.alpn.as_bytes().to_vec()], cc)
+                .map_err(ClientError::InvalidTarget)?;
         let endpoint = quic::client_endpoint(qcfg).map_err(ClientError::InvalidTarget)?;
         let conn = Self::handshake(
             &endpoint,
@@ -1407,8 +1416,12 @@ mod tests {
     fn quic_config_builds_with_h3_alpn() {
         // TUIC 上游的 TLS 配置(自定义 ALPN)能构建 —— connect 的真验证在互通 e2e(Task 6)。
         assert!(
-            crate::quic::client_quic_config_alpn("certs/dev/ca-cert.pem", vec![b"h3".to_vec()])
-                .is_ok()
+            crate::quic::client_quic_config_alpn(
+                "certs/dev/ca-cert.pem",
+                vec![b"h3".to_vec()],
+                crate::quic::CcChoice::Bbr,
+            )
+            .is_ok()
         );
     }
 
