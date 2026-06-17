@@ -173,6 +173,8 @@ const MAX_TUIC_PACKET_BYTES: usize = 66 * 1024;
 const MAX_CONCURRENT_DOWNLINK_STREAMS: usize = 256;
 /// UDP 上行统计行打印周期（秒）：周期性把 stream 兜底/丢弃计数打一行，供真出口 acceptance 与生产观测。
 const UDP_STATS_LOG_SECS: u64 = 30;
+/// datagram 背压判定的 MTU 兜底值（仅当 `max_datagram_size()` 为 None 时用；与 quic.rs 起步 MTU 1280 对齐）。
+const QUIC_INITIAL_MTU_FLOOR: usize = 1280;
 /// UDP 驱动重连退避上限（确定性指数退避，无需 rand；UDP 自愈，重连节奏不敏感）。
 const UDP_RECONNECT_CAP_MS: u64 = 30_000;
 const UDP_RECONNECT_BASE_MS: u64 = 500;
@@ -705,6 +707,8 @@ impl TuicUpstream {
             "📏 TUIC datagram 初始上限 = {:?} 字节（超此走 uni-stream 兜底；PLPMTUD 将继续上探）",
             conn.max_datagram_size()
         );
+        // 刀3.5：打实际生效的 CC + relay mode，供 acceptance 确认 BBR/quic 真装上（A/B 归因）。
+        println!("🧭 TUIC 拥塞控制器={cc:?} | UDP relay mode={udp_relay_mode:?}");
         Ok(Self {
             endpoint,
             server: cfg.server,
@@ -952,14 +956,29 @@ impl TuicUpstream {
                             }
                         }
                         _ = stats.tick() => {
-                            // 周期性观测：stream 兜底/丢弃计数（非零才打，避免空闲刷屏）。
+                            // 周期性观测（刀3.5）：UDP 最近活跃 或 有兜底/丢弃 才打（空闲静默，不刷屏）。
+                            // 中文要点：native datagram acceptance 下 fb/drops 常为 0，但仍需看 cwnd/rtt/丢包，
+                            // 故以「最近 UDP 活跃」为主闸门——量化 datagram 天花板成因（CC vs 无背压）。
                             let fb = me.udp_stream_fallbacks.load(Ordering::Relaxed);
                             let drops = me.udp_drops.load(Ordering::Relaxed);
-                            if fb > 0 || drops > 0 {
-                                println!(
-                                    "📊 TUIC UDP↑ 统计: datagram 上限={:?} stream 兜底={fb} 丢弃={drops}",
-                                    conn.max_datagram_size()
+                            let now = me.clock.elapsed().as_secs();
+                            let last = me.last_udp_activity.load(Ordering::Relaxed);
+                            let udp_active = should_send_heartbeat(last, now, TUIC_HB_IDLE_WINDOW_SECS);
+                            if udp_active || fb > 0 || drops > 0 {
+                                let path = conn.stats().path;
+                                let max_dg = conn.max_datagram_size();
+                                let space = conn.datagram_send_buffer_space();
+                                let line = format_udp_stats(
+                                    max_dg, fb, drops,
+                                    path.rtt.as_millis(), path.cwnd,
+                                    path.lost_packets, path.sent_packets, space,
                                 );
+                                // datagram 背压代理信号：剩余 < 1 个 datagram 上限 → 即将丢最老（静默丢盲点）。
+                                if is_datagram_pressured(space, max_dg.unwrap_or(QUIC_INITIAL_MTU_FLOOR)) {
+                                    println!("{line} ⚠️背压(datagram 缓冲将丢最老)");
+                                } else {
+                                    println!("{line}");
+                                }
                             }
                         }
                         _ = hb.tick() => {
