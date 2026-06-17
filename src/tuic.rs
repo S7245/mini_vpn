@@ -119,7 +119,20 @@ impl TuicClientConfig {
             g("MINI_VPN_TUIC_ALPN").as_deref(),
         )?;
         cfg.zero_rtt = parse_zero_rtt(g("MINI_VPN_TUIC_ZERO_RTT").as_deref());
+        // 刀3.5：CC / UDP relay mode 经 env 覆盖（A/B 归因必需）。原始字符串存字段，
+        // 解析+回落在使用点（`parse_cc` / `UdpRelayMode::parse`）——存而未用的字段终于接上。
+        cfg.congestion_control = override_field(cfg.congestion_control, g("MINI_VPN_TUIC_CC"));
+        cfg.udp_relay_mode = override_field(cfg.udp_relay_mode, g("MINI_VPN_TUIC_UDP_MODE"));
         Ok(cfg)
+    }
+}
+
+/// 用 env 值覆盖默认：非空白则取 env 值，否则保留默认。
+/// 中文要点：抽成纯函数便于单测（不污染进程环境），与 `parse_zero_rtt` 同 idiom。
+fn override_field(default: String, env_val: Option<String>) -> String {
+    match env_val {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => default,
     }
 }
 
@@ -1039,6 +1052,16 @@ mod tests {
         assert_eq!(c.congestion_control, "bbr");
         assert_eq!(c.udp_relay_mode, "native");
         assert!(!c.zero_rtt, "0-RTT 默认关（quinn 0.10 在 0-RTT 不支持 keying-material 导出）");
+    }
+
+    #[test]
+    fn env_overrides_cc_and_udp_mode() {
+        // 有值覆盖默认（A/B 切换：MINI_VPN_TUIC_CC=cubic / MINI_VPN_TUIC_UDP_MODE=quic）。
+        assert_eq!(override_field("bbr".into(), Some("cubic".into())), "cubic");
+        assert_eq!(override_field("native".into(), Some("quic".into())), "quic");
+        // 无值 / 空白 → 保留默认。
+        assert_eq!(override_field("bbr".into(), None), "bbr");
+        assert_eq!(override_field("native".into(), Some("   ".into())), "native");
     }
 
     #[test]
