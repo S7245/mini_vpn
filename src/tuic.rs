@@ -562,13 +562,39 @@ pub enum UdpSend {
     Stream,
 }
 
-/// 纯决策：给定当前 datagram 发送上限（`conn.max_datagram_size()`）与待发字节数，选传输。
-/// 中文要点：装得下走 datagram（含边界 `len==max`）；超上限或 datagram 不可用（`None`）→ stream 兜底。
-/// 主动分流（先查 max_datagram_size），避免 `send_datagram` 返回 `TooLarge` 的往返。
-pub fn udp_send_plan(max_datagram: Option<usize>, len: usize) -> UdpSend {
-    match max_datagram {
-        Some(max) if len <= max => UdpSend::Datagram,
-        _ => UdpSend::Stream,
+/// TUIC UDP relay mode（per-association；本项目按 config 全局选一种）。
+/// 中文要点（已查证 TUIC SPEC + 刀3.5 spec）：`Native` = QUIC datagram（低延迟、但高 RTT/丢包路径有
+/// ~5.3M 硬天花板、溢出静默丢）；`Quic` = 每个 `Packet` 一条 uni-stream（可靠、摆脱天花板，代价是每包建流）。
+/// **server 按某 assoc 首包 mode 镜像下行**——故 `Quic` 模式首包即走 stream → 下行也镜像 stream（高码率必需）。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum UdpRelayMode {
+    Native,
+    Quic,
+}
+
+impl UdpRelayMode {
+    /// 解析配置字符串（大小写不敏感）。非法返回 None（调用方决定回落/报错）。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "native" => Some(Self::Native),
+            "quic" => Some(Self::Quic),
+            _ => None,
+        }
+    }
+}
+
+/// 纯决策：给定 relay mode、当前 datagram 发送上限（`conn.max_datagram_size()`）与待发字节数，选传输。
+/// 中文要点：
+/// - `Quic` → **恒 Stream**（首包起即 uni-stream，触发 server 下行镜像 stream，摆脱 datagram 天花板）。
+/// - `Native` → size-based：装得下走 datagram（含边界 `len==max`）；超上限或 datagram 不可用（`None`）→ stream 兜底
+///   （刀3 现行语义，零回归）。主动分流（先查 max_datagram_size），避免 `send_datagram` 返回 `TooLarge` 的往返。
+pub fn udp_send_plan(mode: UdpRelayMode, max_datagram: Option<usize>, len: usize) -> UdpSend {
+    match mode {
+        UdpRelayMode::Quic => UdpSend::Stream,
+        UdpRelayMode::Native => match max_datagram {
+            Some(max) if len <= max => UdpSend::Datagram,
+            _ => UdpSend::Stream,
+        },
     }
 }
 
@@ -749,7 +775,8 @@ impl TuicUpstream {
         };
         // Bytes：datagram 路径下 `clone()` 为 O(1)（Arc 引用计数），TooLarge 竞态二次兜底不深拷贝。
         let bytes = bytes::Bytes::from(datagram);
-        match udp_send_plan(conn.max_datagram_size(), bytes.len()) {
+        // T1：mode 暂固定 Native（零回归）；真实 mode 由 T6 从 config 接入 `self.udp_relay_mode`。
+        match udp_send_plan(UdpRelayMode::Native, conn.max_datagram_size(), bytes.len()) {
             UdpSend::Datagram => match conn.send_datagram(bytes.clone()) {
                 Ok(()) => {}
                 Err(quinn::SendDatagramError::TooLarge) => {
@@ -1092,15 +1119,36 @@ mod tests {
     }
 
     #[test]
-    fn udp_send_plan_picks_transport() {
+    fn udp_send_plan_native_is_size_based() {
         use UdpSend::*;
-        // 装得下 → datagram 快路径（含边界 ==max）。
-        assert_eq!(udp_send_plan(Some(1242), 1000), Datagram);
-        assert_eq!(udp_send_plan(Some(1242), 1242), Datagram);
+        use UdpRelayMode::Native;
+        // Native：装得下 → datagram 快路径（含边界 ==max）——保刀3 现行语义，零回归。
+        assert_eq!(udp_send_plan(Native, Some(1242), 1000), Datagram);
+        assert_eq!(udp_send_plan(Native, Some(1242), 1242), Datagram);
         // 超上限 → stream 兜底。
-        assert_eq!(udp_send_plan(Some(1242), 1243), Stream);
+        assert_eq!(udp_send_plan(Native, Some(1242), 1243), Stream);
         // datagram 不可用（对端不支持/未协商）→ stream。
-        assert_eq!(udp_send_plan(None, 100), Stream);
+        assert_eq!(udp_send_plan(Native, None, 100), Stream);
+    }
+
+    #[test]
+    fn udp_send_plan_quic_is_always_stream() {
+        use UdpSend::*;
+        use UdpRelayMode::Quic;
+        // Quic：无论装不装得下、datagram 是否可用，首包起恒走 uni-stream
+        // （触发 TUIC server 镜像下行也走 stream，摆脱 datagram 天花板）。
+        assert_eq!(udp_send_plan(Quic, Some(1242), 1000), Stream);
+        assert_eq!(udp_send_plan(Quic, Some(1242), 1242), Stream);
+        assert_eq!(udp_send_plan(Quic, Some(1242), 1243), Stream);
+        assert_eq!(udp_send_plan(Quic, None, 100), Stream);
+    }
+
+    #[test]
+    fn udp_relay_mode_parses() {
+        assert_eq!(UdpRelayMode::parse("native"), Some(UdpRelayMode::Native));
+        assert_eq!(UdpRelayMode::parse("quic"), Some(UdpRelayMode::Quic));
+        assert_eq!(UdpRelayMode::parse("QUIC"), Some(UdpRelayMode::Quic));
+        assert_eq!(UdpRelayMode::parse("nope"), None);
     }
 
     #[test]
