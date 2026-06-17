@@ -40,7 +40,8 @@
 主线（Rules.md 三目标）
  ├─ 刀1  大并发压测 harness（先定位真瓶颈，事实先行）  ✅ 完成（见下「刀1 已完成」）
  ├─ 刀2  大并发优化（#1 脏集合 + #2 弹性扩容 + fake-IP 引用计数回收）  ✅ 完成（见下「刀2 已完成」）
- ├─ 刀3  UDP 直播硬化（quic-stream fallback + 吞吐压测 + MSS/MTU）  ✅ 实现完成（见下「刀3」），真出口 acceptance 待跑
+ ├─ 刀3  UDP 直播硬化（quic-stream fallback + 吞吐压测 + MSS/MTU）  ✅ 完成 + 真出口 acceptance（见下「刀3」）
+ ├─ 刀3.5 高码率 UDP（native datagram ~5.3M 天花板 → 高码率流走 stream / datagram 加 pacing+背压）  ← acceptance 新发现
  └─ 刀4  连接成功率（DoH/DoT 拦截 + 拦全 :53；first-SYN-to-fresh-fake-IP refused）  ← 下一刀
 
 正交线（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）
@@ -111,9 +112,20 @@ CloseWait+远端 keepalive 的半关闭已被 `reap_dead_slots` 覆盖（CloseWa
 **质量**：80 测全绿、`clippy --all-targets --features harness` 0 warning、release build 绿。
 `/code-review`（high effort，7 角度）findings 已修（last-writer-wins 跨重连、去冗余 frag_total 字段、entry API、harness >255 帧断言）。
 
-**未做（deferred）**：**真出口 acceptance 待跑**（需用户 `MINI_VPN_TUIC_*` env + 真直播大流量；配方见 findings 末节）——
-测 datagram 真上限 / stream 兜底真触发 / 真 sing-box 分片互通 / #3 单连接在真直播大流量下是否需连接池。
-harness 测不到真 quinn 的 datagram TooLarge / stream 兜底 / 真分片（同 #3 边界）。
+**真出口 acceptance ✅（2026-06-17，深圳 client → 47.x sing-box → 43.x iperf3，IP 直连，详见 findings 末节）**：
+- ✅ **上行 quic-stream 兜底实锤**：1400B 包（>datagram 上限 N=1332）全走 uni-stream → **50Mbps / 0.037% 丢**
+  （改造前这些包 100% 被 TooLarge 丢）。刀3 核心目标达成。
+- ✅ **典型直播码率达标**：≤5Mbps native datagram 下行 1.7% 丢（视频可用）。
+- ❗ **native datagram 有 ~5.3Mbps 硬天花板**（上/下行两方向都卡，与 offered 无关；stream 同链路跑满 50M）
+  → 是 QUIC 不可靠 datagram 的传输特性（高 RTT + 不重传 + 无背压），非客户端小改可解。
+  **试过下行批量 flush（摊销每包 syscall）→ 零效果，已 revert**（坐实瓶颈不在我方消费端）。
+- **观测盲点**：datagram 丢包 quinn 不报错（`send_datagram` 仍 Ok），`udp_drops` 看不到 → 需后续补背压可观测。
+
+**新发现 → 刀3.5（高码率 UDP）**：高码率（>5M）直播需要「高码率流走 stream / datagram 加 pacing+背压 / 评估连接池」，
+带 quinn 级 instrumentation（RTT/cwnd/datagram drop）量化后定方向。**#3 裁决**：单连接非连接数瓶颈（stream 跑满 50M），
+瓶颈是 datagram 传输特性。
+
+**harness 边界**：测不到真 quinn 的 datagram TooLarge / stream 兜底 / 真分片 / datagram 吞吐天花板（同 #3，需真出口）。
 
 ## Rhythm（每刀都遵守）
 

@@ -193,6 +193,48 @@ mock harness 之外的端到端验证（IP 直连 1.1.1.1:443，`route -n add -h
 | ④ 下行分片重组 | 下行重的直播（观看）| 画面是否完整、无花屏；client 无「无映射丢弃」洪水 | 大下行包经 server 分片→本端重组，播放正常 |
 | #3 复测 | 大流量 UDP 持续时观测单连接 | 吞吐是否塌缩 / 尾延迟暴涨 | 评估「多 QUIC 连接池 vs 单连接多流」是否仍非必需 |
 
-## 裁决（待填）
+## 裁决（2026-06-17，深圳 client → 47.251.188.205 sing-box → 43.110.37.170 iperf3，IP 直连）
 
-- datagram 真上限 N = ___；stream 兜底触发频率 = ___；#3 单连接在真直播大流量下 = 够 / 需池。
+**datagram 真上限 N = 1332 字节**（`📏` 日志；PLPMTUD 已从 1280 floor 上探）。1400B 包编码后 ≈1417B>N → 走兜底。
+
+### 实测数据（50Mbps offered，`-l` = UDP 载荷字节）
+
+| 测法 | 走哪条路 | 实收 / 丢包 |
+|---|---|---|
+| 上行 `-l 1400`（>N） | **uni-stream 兜底** | **49.7Mbps / 0.037%** ✅ |
+| 上行 `-l 1200`（<N） | native datagram | 5.3Mbps / 89% ❌ |
+| 下行 `-l 1400 -R` | datagram 分片 | 11.5Mbps / 77% ❌ |
+| 下行 `-l 1200 -R` | native datagram | 5.2Mbps / 90% ❌ |
+
+### 下行 datagram bitrate sweep（`-l 1200 -R`，找干净上限）
+
+| offered | 实收 | 丢包 |
+|---|---|---|
+| 5 Mbps | 4.91 | **1.7%** ✅ |
+| 10 Mbps | 5.31 | 47% |
+| 20 Mbps | 5.30 | 74% |
+
+### 结论（三条，均坐实）
+
+1. **✅ 上行 quic-stream 兜底真实生效**：1400B 包全部超 datagram 上限，全走 per-packet uni-stream，
+   真 sing-box 上 50Mbps / 0.037% 丢。**改造前这些包 100% 被丢（TooLarge→drop）**——刀3 核心目标达成。
+2. **❗ native QUIC datagram 路径有 ~5.3Mbps 硬天花板**：实收死死卡 ~5.3Mbps，与 offered 无关
+   （10M→5.31、20M→5.30），**上行/下行 datagram 两个方向都卡同一数**。而 stream 路径同链路跑满 50Mbps
+   → **不是带宽/拥塞**（路能扛 50M），是 **QUIC 不可靠 datagram 在高 RTT + 丢包不重传 + 无应用背压**
+   下的固有限制。**试过下行批量 flush（摊销每包 syscall）→ 零效果**（10M 仍 47%）→ 排除「我方消费端每包
+   flush」假设，瓶颈确在 datagram 传输层，非客户端可小改解。
+3. **观测盲点**：datagram 丢包**我方 `udp_drops` 完全看不到**（quinn 缓冲溢出丢最老 datagram 不返回错误，
+   `send_datagram` 仍 `Ok`）——90% 丢失但 `📊` 无丢弃计数。需后续补 datagram 背压可观测（`send_buffer_space`）。
+
+### 对 Rules.md ② UDP 直播的判定
+
+- **典型直播码率（≤5Mbps：720p~2.5M / 1080p~4-5M）经 native datagram：1.7% 丢 → 视频可用（达标）**。
+- **高码率（>5Mbps：1080p60/4K）下行**：datagram 卡 ~5.3M；但 stream 已证明链路能跑 50M。
+- **#3 复测裁决**：单连接**不是**连接数瓶颈——同一连接 stream 跑满 50M。瓶颈是 **datagram 传输特性**；
+  连接池对 datagram 未必是解，真正的杠杆是「高码率流走 stream / 给 datagram 加 pacing+背压」。
+
+### 归后续刀（高码率 UDP 直播硬化，独立一刀）
+
+- 选项：① 持续/高码率 UDP flow 默认走 stream（quic-relay-mode 或自适应：观测到高 pps 即切流）；
+  ② 给 datagram 路径加 pacing/背压（按 `send_buffer_space` 节流）+ 丢包可观测；③ 评估多 QUIC 连接池
+  对 datagram 聚合吞吐是否有效。需带 quinn 级 instrumentation（RTT/cwnd/datagram drop）量化后再定方向。
