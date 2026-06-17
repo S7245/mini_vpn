@@ -146,12 +146,6 @@ const FAKE_DNS_RESOLVER: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 /// 活跃 flow（refcount>0）任何情况都不回收（见 FakeIpPool::sweep）。
 const FAKE_IP_TTL: u64 = 1800;
 
-/// 刀3：下行 UDP 单次唤醒最多批量处理多少个 datagram（drain channel 后一次 `flush_tx`，摊销每包 syscall）。
-/// 中文要点：真出口 acceptance 实测——每包一次 `flush_tx().await` 把下行 datagram 吞吐死死压在 ~5Mbps
-/// （~550 包/秒、每包 ~1.8ms 的 utun 写 syscall 串行 await）。批量 drain + 单次 flush 摊销 syscall。
-/// 上限兜底防一次性 drain 饿死其它 select 分支（TCP relay/poll/timer）；channel 容量 1024，取 256。
-const TUIC_DOWNLINK_BATCH: usize = 256;
-
 /// Failure mode for `ListenerRegistry::ensure_port`.
 /// 中文要点：到顶时优雅拒绝，不能 panic，已注册端口的 socket 不受影响。
 #[derive(Debug, PartialEq, Eq)]
@@ -601,42 +595,27 @@ pub async fn run_event_loop<D, U, M>(
             }
             // Stage 13b/刀3: TUIC 下行（datagram 或 uni-stream）→ decode_packet_meta → 分片重组
             // → AssocTable 解路由 → 造回程 IP/UDP 注入 TUN。FRAG_TOTAL==1 直通；>1 集齐才注入。
-            // 刀3 吞吐：本包 + drain channel 里已到的其余包，批量 inject，最后**一次** flush_tx
-            // （摊销每包 utun 写 syscall——acceptance 实测每包 flush 把下行压在 ~5Mbps）。
             Some(dg) = tuic_downlink_rx.recv() => {
-                let now = udp_clock.elapsed().as_secs();
-                let mut injected = false;
-                let mut next = Some(dg);
-                let mut budget = TUIC_DOWNLINK_BATCH;
-                while let Some(dg) = next.take() {
-                    if let Some(meta) = decode_packet_meta(&dg) {
-                        let assoc_id = meta.assoc_id;
-                        // 分片重组：单帧直通；多帧集齐返回整包，否则缓存等后续帧。
-                        if let Some(payload) = reassembler.accept(&meta, now) {
-                            // 先取出路由信息(Copy),释放 assoc_table 借用后再 touch。
-                            let routed = assoc_table
-                                .resolve(assoc_id)
-                                .map(|e| (e.target_src(), e.app_endpoint()));
-                            if let Some((src, dst)) = routed {
-                                let pkt = build_udp_ip_packet(src, dst, &payload);
-                                device.inject_ip_packet(&pkt);
-                                assoc_table.touch(assoc_id, now);
-                                injected = true;
-                            } else {
-                                // assoc 已回收/未知 → 丢弃该回程(应用会重发/重查,自愈)。
-                                println!("🗑️ TUIC UDP↓ assoc={assoc_id} 无映射，丢弃 {}B", payload.len());
+                if let Some(meta) = decode_packet_meta(&dg) {
+                    let assoc_id = meta.assoc_id;
+                    // 分片重组：单帧直通；多帧集齐返回整包，否则缓存等后续帧。
+                    if let Some(payload) = reassembler.accept(&meta, udp_clock.elapsed().as_secs()) {
+                        // 先取出路由信息(Copy),释放 assoc_table 借用后再 touch。
+                        let routed = assoc_table
+                            .resolve(assoc_id)
+                            .map(|e| (e.target_src(), e.app_endpoint()));
+                        if let Some((src, dst)) = routed {
+                            let pkt = build_udp_ip_packet(src, dst, &payload);
+                            device.inject_ip_packet(&pkt);
+                            assoc_table.touch(assoc_id, udp_clock.elapsed().as_secs());
+                            if let Err(e) = device.flush_tx().await {
+                                println!("UDP 下行 flush 失败: {e}");
                             }
+                        } else {
+                            // assoc 已回收/未知 → 丢弃该回程(应用会重发/重查,自愈)。
+                            println!("🗑️ TUIC UDP↓ assoc={assoc_id} 无映射，丢弃 {}B", payload.len());
                         }
                     }
-                    budget -= 1;
-                    if budget == 0 {
-                        break; // 兜底：别一次性 drain 饿死其它 select 分支
-                    }
-                    next = tuic_downlink_rx.try_recv().ok();
-                }
-                // 批量注入后一次性 flush（drain 整个 tx_queue），摊销每包 syscall。
-                if injected && let Err(e) = device.flush_tx().await {
-                    println!("UDP 下行 flush 失败: {e}");
                 }
             }
             // Stage 13b: 周期回收空闲 UDP assoc。刀2：同时回收 fake-IP 引用 + sweep fake-IP 池。

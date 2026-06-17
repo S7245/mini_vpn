@@ -10,3 +10,6 @@
 .env.*
 # 测试/fuzz 临时产物（曾误提交，见 c4d4465）
 test_data_*
+
+# 运行期日志（acceptance/调试 tee 输出，不入库）
+logs/
