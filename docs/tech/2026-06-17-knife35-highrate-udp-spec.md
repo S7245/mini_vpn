@@ -1,5 +1,12 @@
 # 刀3.5 — 高码率 UDP 硬化（spec）
 
+> ⚠️ **后续纠偏（2026-06-17 真出口实测，必读）**：本 spec 的前提——「native datagram 有 ~5.3M 硬天花板、
+> 需 stream 摆脱」——**被推翻**。该「天花板」实为测试 VPS 链路 5M cap 的假象；80M 链路下 native datagram
+> 下行 39.8M/0.25%。最终裁决：**默认 native + Cubic**（非 BBR、非 quic-stream）；quic-relay-mode 降为可配置选项。
+> 完整数据与裁决见 findings 末节 + `docs/adr/0005-cubic-over-bbr-datagram.md`。下文设计仍有效（代码已交付），
+> 但「为破天花板而默认走 stream」的动机已不成立——本刀真实价值是**插桩纠偏 + CC 调优**。
+
+
 > 配套：plan（同目录 `2026-06-17-knife35-highrate-udp-plan.md`）、findings（复用并续写
 > `2026-06-12-knife1-bottleneck-findings.md` 的「刀3 真出口 acceptance 裁决」段）。
 > 对症刀3 acceptance 实测发现：native QUIC datagram **上/下行两方向都卡 ~5.3Mbps 硬天花板**，

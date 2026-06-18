@@ -273,12 +273,59 @@ mock harness 之外的端到端验证（IP 直连 1.1.1.1:443，`route -n add -h
 | T-G | 首包锁定 + 配额验证 | quic 模式起播，看 `📊`/日志 | 下行是否真走 stream、有无 #221 塌缩 | 坐实「首包 stream→下行镜像 stream」且 4096 配额够 |
 | T-H | 真实混合场景长稳 soak（深圳 macOS） | YouTube 视/直 + TikTok 视/直 + Facebook 网页 + Telegram 客服，30–60min+ | 主观流畅度 + `📊`/重连/内存 | 视频不卡、TG 跟手、FB 不滞；`📊` 合理、重连低、内存不涨、无映射洪水。TG/FB 明显滞 → 触发 carve-out |
 
-## 实测（待填）
+## 实测（2026-06-17，深圳 client → 47.251.188.205 sing-box → 43.110.37.170 iperf3）
 
-> 跑完填表；建议先 T-A 定默认 mode，再 T-B/D/G 坐实 stream 修下行，T-E 多 flow，T-F/H 决定 carve-out。
+> **关键前提变化**：本轮把两端链路从旧的 47.x=**5M** / 43.x=**10M** 升到**双 80M**。
+> 这一改直接暴露了刀3 结论的根因——见「裁决①」。
 
-## 裁决（待填）
+### T-A 下行 datagram sweep（`-l 1200 -R`，Cubic vs BBR）
 
-- 默认 `udp_relay_mode` =（T-A 定）；是否补 `docs/adr/0005-default-udp-relay-mode-quic.md`。
-- 是否补 DNS/小流 carve-out（T-F/T-H 定）。
-- 连接池是否升后续刀首项（T-E 定）。
+| offered | Cubic 实收/丢 | BBR 实收/丢 |
+|---|---|---|
+| 5M  | 4.90M / 2.2%  | 4.95M / 1.1% |
+| 10M | 9.95M / 0.15% | 9.79M / 2.1% |
+| 20M | 17.8M / 11%*  | 19.5M / 2.3% |
+| 40M | **39.8M / 0.25%** ✅ | **30.1M / 24%** ❌ |
+
+`*` 20M Cubic 的 11% 系瞬时抖动（同配置 40M 仅 0.25%，证非系统性）。
+**插桩对照（40M）**：Cubic `cwnd≈12000 RTT 172ms`（稳、不过驱）；BBR `cwnd 暴涨 245K→252K、RTT 178→252ms`
+（bufferbloat，对不可靠 datagram 狂发不退 → 24% 丢）。`send_buf 余` 全程 1048576B（出向缓冲未压满，丢在传输/对端）。
+
+### T-B 下行 **stream**（quic 模式，BBR）`-b 40M`
+
+**7.02M / 71% 丢、RTT 259ms、cwnd 暴涨 4.5MB** ❌❌。每包一条 uni-stream（~4000pps）+ BBR 过驱 → 拥塞崩溃。
+**stream 模式高码率下行远不如 datagram**（7M/71% vs 40M/0.25%）。
+
+### T-C 上行 datagram（Cubic）`-b 40M`
+
+**37.5M / 4.5%**。上行同样清掉旧「5.3M/89%」假象。
+
+### T-E 多 flow（Cubic native，2 路并行 `-P 2 -b 17M -R`）
+
+稳态多数秒 **~34M / 0% 丢**；整体 31.7M / 6.2%（被首秒 72% 启动 + 11s 一次 33% 抖动拖高）。单连接聚合 ~34M。
+
+## 裁决（2026-06-17，数据全锁定）
+
+**① 最大纠偏：刀3 的「~5.3M datagram 硬天花板」是 5M VPS 链路 cap 的测量假象，不是 QUIC datagram 限制。**
+升到 80M 链路后，native datagram 下行 39.8M/0.25%、上行 37.5M/4.5%。刀3「stream 50M / datagram 5.3M」的对比
+是被 5M 链路污染的产物。**插桩（cwnd/RTT/loss）是揭穿真相的功臣**——印证 HANDOFF「先量化、别凭猜改」。
+
+**② 默认 `congestion_control` = cubic（不是 bbr）。** datagram 数据面 Cubic 完胜 BBR：40M 下 0.25% vs 24%。
+quinn 0.10 的 BBR 对 unreliable datagram 过驱（cwnd/RTT 暴涨）。BBR 仍可经 `MINI_VPN_TUIC_CC=bbr` 显式选用。
+→ 已改 `DEFAULT_TUIC_CC`。补 `docs/adr/0005-cubic-over-bbr-datagram.md`。
+
+**③ 默认 `udp_relay_mode` = native（datagram）。** datagram 4K 富余且低延迟；quic 全 stream 模式高码率灾难
+（71% 丢）。**quic 模式保留为可配置选项**（代码完成+测过；抗封锁场景——网络封 UDP datagram 但放行 QUIC stream
+时可能有用——非默认、非高码率推荐）。
+
+**④ DNS/小流 carve-out 不需要。** 默认 native → DNS/小 UDP 本就走低延迟 datagram；carve-out 仅是「全 stream quic 默认」
+的顾虑，不发生。
+
+**⑤ 连接池 defer 坐实。** 多 flow 单连接聚合 ~34M ≥ 33M gate。更高并发再评估。
+
+### 对 Rules.md ② UDP 直播的判定（更新）
+
+- **typical（≤5M）/ 1080p60（~8–12M）/ 4K（~25M）下行直播：native datagram + Cubic 全部达标**（40M/0.25% 实测，4K 富余）。
+- 高码率不再需要 stream-routing——刀3.5 的原始前提（datagram 有天花板需 stream）被实测推翻；真正交付的价值是
+  **插桩纠偏 + CC 调优（cubic）+ 证实 datagram 本就够**，避免了上线不必要的全-stream 复杂度。
+- **待跑 T-H 真实 soak**（native+cubic，深圳 macOS 看 YouTube/TikTok/FB/TG 30–60min）作最终 UX/长稳 gate。

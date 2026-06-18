@@ -41,7 +41,7 @@
  ├─ 刀1  大并发压测 harness（先定位真瓶颈，事实先行）  ✅ 完成（见下「刀1 已完成」）
  ├─ 刀2  大并发优化（#1 脏集合 + #2 弹性扩容 + fake-IP 引用计数回收）  ✅ 完成（见下「刀2 已完成」）
  ├─ 刀3  UDP 直播硬化（quic-stream fallback + 吞吐压测 + MSS/MTU）  ✅ 完成 + 真出口 acceptance（见下「刀3」）
- ├─ 刀3.5 高码率 UDP（BBR + quinn 插桩 + quic-relay-mode 全 UDP 走 stream）  ✅ 代码完成，acceptance 待跑（见下「刀3.5」）
+ ├─ 刀3.5 高码率 UDP（quinn 插桩 + CC 调优）  ✅ 完成 + 真出口 acceptance（见下「刀3.5」）；纠偏：5.3M「天花板」实为链路 cap 假象
  └─ 刀4  连接成功率（DoH/DoT 拦截 + 拦全 :53；first-SYN-to-fresh-fake-IP refused）  ← 下一刀
 
 正交线（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）
@@ -144,10 +144,20 @@ CloseWait+远端 keepalive 的半关闭已被 `reap_dead_slots` 覆盖（CloseWa
 `/code-review`（high effort，7 角度）findings 已修 3 条（A: fallback 计数只算 Native 真兜底，避 quic 模式 `📊` 误读；
 B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
 
-**真出口 acceptance：待跑**（需用户 `MINI_VPN_TUIC_*` env + 深圳 macOS 真机，配方见 findings 末节）。
-gate 主判据 = BBR 下行 datagram 干净吞吐 ≥30M？→ 决定**默认 `udp_relay_mode`**（native vs quic）。
-4K(~25M) 为**必跨线**。诚实预期：下行 datagram 天花板在 sing-box 发送侧、客户端够不着 → BBR 主要抬上行 →
-gate 极可能判 <30M → 默认翻 quic。
+**真出口 acceptance ✅（2026-06-17，深圳 client → 47.x sing-box → 43.x iperf3，**两端链路升到 80M**）**：
+- **🔑 最大纠偏**：刀3「~5.3M datagram 硬天花板」是 **5M VPS 链路 cap 的测量假象**，非 QUIC datagram 限制。
+  80M 链路下 native datagram 下行 **39.8M/0.25%**、上行 37.5M/4.5%。**插桩（cwnd/RTT/loss）揭穿真相**（先量化、别凭猜）。
+- **CC 裁决**：datagram 数据面 **Cubic 完胜 BBR**（40M 下 0.25% vs 24%；BBR cwnd 暴涨 245K/RTT bufferbloat、
+  对不可靠 datagram 过驱）。→ **默认改 cubic**（`MINI_VPN_TUIC_CC=bbr` 仍可显式选）。
+- **mode 裁决**：**默认 native（datagram）**——4K(25M) 富余且低延迟；quic 全 stream 模式高码率灾难（40M→7M/71%，cwnd 4.5MB）。
+  **quic 模式保留为可配置选项**（代码完成+测过；抗封锁场景或有用，非高码率推荐）。
+- **多 flow gate**：2 路并发单连接聚合 ~34M ≥ 33M → **连接池 defer 坐实**。
+- **carve-out 不需要**：默认 native → DNS/小流本就走低延迟 datagram。
+- ADR：`docs/adr/0005-cubic-over-bbr-datagram.md`（CC 选择 + 天花板假象纠偏）。findings 末节有完整数据表。
+- **T-H 真实 soak 待跑**（native+cubic，深圳 macOS 看 YouTube/TikTok/FB/TG 30–60min）作最终 UX/长稳 gate。
+
+**本刀的真实价值**（前提被纠偏后）：① quinn 级插桩（揭穿假象 + 纠正 CC）；② CC 调优（默认 cubic）；
+③ 证实 native datagram 本就够高码率、避免上线不必要的全-stream 复杂度；④ quic-relay-mode 能力（备用/抗封锁）。
 
 **code-review defer（非本刀阻塞，后续按需）**：
 - `from_sources` 未收 `cc`/`udp_mode` 参数 → 仅 env 可切；**前端/移动端经 file/FFI 注入 config 时需补**（`TuicClientConfig` 字段注释已述 FFI 注入计划）。
