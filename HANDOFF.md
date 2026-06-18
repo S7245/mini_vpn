@@ -4,13 +4,11 @@
 
 ## 当前状态（基线）
 
-- **Stage 13 + 刀1 已在 `main`**（TUIC 数据面 ADR-0004 + 并发压测 harness/定位）。
-  刀1 已 fast-forward 合入 main（`2d604f6`）——见下「刀1 已完成」。
-- **Stage 13 全部完成**：数据面已是 **client-only TUIC over quinn → sing-box**（ADR-0004）。
-  - 13a TCP via TUIC Connect ✅、13b UDP via TUIC Packet ✅、13c 按需 heartbeat + 保活厘清（0-RTT 撞 quinn 0.10 墙、deferred）✅、13d 退役 legacy（删 yamux/自研 server/双轨开关/6 个依赖）✅。
-  - 全部跨机签收（深圳 client → US/HK sing-box）；55 单测、clippy 0 warning、release build 绿。
-- **刀2 已完成**，在分支 `claude/knife2-concurrency-opt`（**未合 main**，见下「刀2 已完成」）。
-- 新 session 起点（刀3）：待用户合并刀2 后**从 `main` 起新分支**，或直接从 `claude/knife2-concurrency-opt` 起。
+- **Stage 13 + 刀1 + 刀2 + 刀3 + 刀3.5 全部已在 `main`**（`591a629`，2026-06-17 fast-forward 合入，与 origin 同步）。
+  数据面 = **client-only TUIC over quinn → sing-box**（ADR-0004）；UDP 默认 **native datagram + Cubic**（刀3.5 实测裁决）。
+- **Stage 13 全部完成**：13a TCP via TUIC Connect ✅、13b UDP via TUIC Packet ✅、13c 按需 heartbeat（0-RTT 撞 quinn 0.10 墙、deferred）✅、13d 退役 legacy（删 yamux/自研 server/双轨开关/6 个依赖）✅。
+- **刀1/2/3/3.5 完成**（见下各「已完成」段）：并发压测 harness + 大并发优化（脏集合 + 弹性扩容 + fake-IP 回收）+ UDP 直播硬化（quic-stream 兜底 + 分片重组）+ 高码率 UDP（BBR/Cubic 可切 + quinn 插桩 + quic-relay-mode；**纠偏：刀3「5.3M datagram 天花板」实为链路 cap 假象**）。
+- **新 session 起点（刀4）：直接从 `main`（`591a629`）起新分支**（如 `claude/knife4-connect-success`）。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
 ## 目标（唯一北极星）：`Rules.md`
@@ -129,7 +127,7 @@ CloseWait+远端 keepalive 的半关闭已被 `reap_dead_slots` 覆盖（CloseWa
 
 ## 刀3.5 代码完成（2026-06-17）：高码率 UDP 硬化（BBR + 插桩 + quic-relay-mode）
 
-**交付**（分支 `claude/knife35-highrate-udp`，从 main 起，逐 commit push；未合 main）：
+**交付**（分支 `claude/knife35-highrate-udp`，从 main 起，逐 commit push；**已 fast-forward 合入 main `591a629`**）：
 - **接 BBR**：`congestion_control` 字段（存而未用）→ `quic_transport_config` 的 `congestion_controller_factory`
   （`bbr→BbrConfig`、`cubic→CubicConfig`、未知→Cubic+告警）；env `MINI_VPN_TUIC_CC` 可切（A/B 归因）。已查证 quinn-proto 0.10.6 导出 BBR。
 - **quic-relay-mode 接线**：`UdpRelayMode{Native,Quic}` + mode 感知 `udp_send_plan`（`Quic`→恒 uni-stream；
