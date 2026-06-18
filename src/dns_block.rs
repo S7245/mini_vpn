@@ -14,8 +14,12 @@ pub fn is_encrypted_dns_port(port: u16) -> bool {
 }
 
 /// 内置 DoH 域名名单(公认**专用** DoH 端点;取专用名以杜绝误伤正常服务)。
+/// 中文要点:`is_doh_domain` 子域规则已**自动覆盖** `*.<apex>`(如 `*.cloudflare-dns.com`),
+/// 故显式列子域(mozilla./chrome.)仅为自文档;新增同 apex 子域无需再列。名单尽力而非穷尽——
+/// 默认浏览器(Cloudflare/Google/Quad9)已覆盖,exotic/opt-in 端点由真出口 acceptance 实测增补 / SNI(defer)。
 const DOH_DOMAINS: &[&str] = &[
     "dns.google",
+    "dns.google.com", // 旧版 Google DoH 主机名（部分老客户端仍用；非 dns.google 子域，需显式列）
     "dns64.dns.google",
     "cloudflare-dns.com",
     "mozilla.cloudflare-dns.com",
@@ -76,6 +80,7 @@ mod tests {
     #[test]
     fn doh_domain_exact_and_case_insensitive() {
         assert!(is_doh_domain("dns.google"));
+        assert!(is_doh_domain("dns.google.com")); // 旧版 Google DoH 主机名(显式列,非 dns.google 子域)
         assert!(is_doh_domain("DNS.GOOGLE")); // 大小写不敏感
         assert!(is_doh_domain("cloudflare-dns.com"));
         assert!(is_doh_domain("dns.google.")); // 末尾点(FQDN)

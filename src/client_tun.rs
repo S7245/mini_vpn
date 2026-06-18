@@ -1202,11 +1202,11 @@ async fn handle_tuic_udp_uplink<U: DatagramUpstream>(
             println!("🚫 UDP fake-IP {} 无映射，丢弃（待应用重新解析）", udp.dst_ip);
             return;
         }
-        // 刀4：加密 DNS（DoQ :853 / DoH3 :443）→ 丢包，逼应用回落明文 DNS。
-        TargetResolve::Block => {
-            println!("🛡️ 阻断加密 DNS UDP {}:{}（→ 丢包，逼回落明文 DNS）", udp.dst_ip, udp.dst_port);
-            return;
-        }
+        // 刀4：加密 DNS（DoQ :853 / DoH3 :443）→ **静默丢包**，逼应用回落明文 DNS。
+        // 中文要点：此处每个入站 UDP datagram 必经，**不在热路径 println!**（同 resolve_target 的纪律：
+        // 同步 stdout 会拖垮大并发；DoQ/DoH3 被丢后 QUIC 会重传一串包 → 逐包打印即洪水）。丢弃即正确行为；
+        // 需要可观测时另加计数器周期汇报（cheap follow-up，本刀从简）。
+        TargetResolve::Block => return,
     };
     let tuple = FourTuple {
         src_ip: udp.src_ip,
