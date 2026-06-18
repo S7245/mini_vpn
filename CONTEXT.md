@@ -40,6 +40,10 @@ _Avoid_: session id (it identifies a UDP flow, not a QUIC stream or TCP session)
 How a TUIC `Packet` is carried over the **Upstream**'s QUIC connection. _native_ = QUIC datagram (unreliable, low-latency, but throughput-capped on high-RTT/lossy paths and silently lossy under overload — drops the oldest buffered datagram without error). _quic_ = each `Packet` on its own QUIC **unidirectional stream** (reliable, ordered within the one packet it carries; escapes the datagram throughput ceiling, at the cost of one stream setup per packet). Per the TUIC spec the **Upstream** mirrors the mode of an association's **first** `Packet` for all of that association's downlink `Packet`s — so the mode is effectively chosen at **UDP flow** birth and cannot be flipped mid-flow. The default is _native_: real-egress measurement (2026-06-17) showed datagram sustains high-rate cleanly (~40 Mbps) once links aren't bandwidth-capped, so _quic_ mode is an opt-in (anti-censorship / oversized fallback), not the throughput path. See `docs/adr/0005-cubic-over-bbr-datagram.md`.
 _Avoid_: "stream mode" alone (ambiguous with TCP relay streams); "datagram fallback" (oversized-packet stream fallback is a separate, size-driven thing within _native_ mode)
 
+**Encrypted DNS** (DoH / DoT / DoQ / DoH3):
+DNS carried inside an encrypted transport so it cannot be intercepted as plaintext: **DoH** (DNS-over-HTTPS, TCP :443), **DoT** (DNS-over-TLS, TCP :853), **DoQ** (DNS-over-QUIC, UDP :853), **DoH3** (DoH over HTTP/3, QUIC UDP :443). It **bypasses the fake-IP map** — the app gets a real address and connects directly, defeating fake-IP routing. The client therefore **blocks** known encrypted-DNS endpoints (by port for :853, by resolved domain or destination IP for :443) to force the app to fall back to plaintext DNS, which is then forged into a **fake-IP**.
+_Avoid_: "DNS leak" (that is the symptom — a real IP escaping interception; encrypted DNS is one cause)
+
 ## Relationships
 
 - The client opens one **Upstream** connection and multiplexes many intercepted sessions over it (Yamux substreams).
