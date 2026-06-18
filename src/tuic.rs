@@ -21,7 +21,11 @@ use tokio::sync::mpsc;
 const DEFAULT_TUIC_ALPN: &str = "h3";
 const DEFAULT_TUIC_SNI: &str = "localhost";
 const DEFAULT_TUIC_CA_PATH: &str = "cert.pem";
-const DEFAULT_TUIC_CC: &str = "bbr";
+/// 默认拥塞控制器 = **cubic**（刀3.5 真出口实测裁决，2026-06-17）：在高 RTT(深圳→US ~175ms)+
+/// datagram 数据面上，Cubic 显著优于 BBR——40M offered 下 Cubic 39.8M/0.25%，BBR 仅 30.1M/24%
+/// （cwnd 暴涨到 245K、RTT 178→252ms bufferbloat，对不可靠 datagram 过驱狂发不退）。quinn 0.10 的 BBR
+/// 对 unreliable datagram 有害。BBR 仍可经 `MINI_VPN_TUIC_CC=bbr` 显式选用（实验/特定链路）。
+const DEFAULT_TUIC_CC: &str = "cubic";
 const DEFAULT_TUIC_UDP_MODE: &str = "native";
 
 /// TUIC 客户端配置（单一事实源；桌面从 env 加载，移动端将来从 file/FFI 注入）。
@@ -1134,7 +1138,7 @@ mod tests {
         assert_eq!(c.server, "1.2.3.4:8443".parse().unwrap());
         assert_eq!(c.uuid[0], 0x55);
         assert_eq!(c.alpn, "h3"); // default
-        assert_eq!(c.congestion_control, "bbr");
+        assert_eq!(c.congestion_control, "cubic"); // 刀3.5 实测裁决：datagram 路径 Cubic 优于 BBR
         assert_eq!(c.udp_relay_mode, "native");
         assert!(!c.zero_rtt, "0-RTT 默认关（quinn 0.10 在 0-RTT 不支持 keying-material 导出）");
     }
