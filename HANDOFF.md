@@ -40,7 +40,8 @@
  ├─ 刀2  大并发优化（#1 脏集合 + #2 弹性扩容 + fake-IP 引用计数回收）  ✅ 完成（见下「刀2 已完成」）
  ├─ 刀3  UDP 直播硬化（quic-stream fallback + 吞吐压测 + MSS/MTU）  ✅ 完成 + 真出口 acceptance（见下「刀3」）
  ├─ 刀3.5 高码率 UDP（quinn 插桩 + CC 调优）  ✅ 完成 + 真出口 acceptance（见下「刀3.5」）；纠偏：5.3M「天花板」实为链路 cap 假象
- └─ 刀4  连接成功率（DoH/DoT 拦截 + 拦全 :53；first-SYN-to-fresh-fake-IP refused）  ← 下一刀
+ ├─ 刀4  连接成功率（拦截加密 DNS DoT/DoH/DoQ/DoH3）  ✅ 代码完成，acceptance 待跑（见下「刀4」）；拦全:53 + first-SYN 见下
+ └─ 刀5  ?（拦全:53 裸包劫持 / first-SYN 复现才修 / 正交线 A REALITY）  ← 下一刀（按 acceptance 与优先级定）
 
 正交线（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）
  └─ A   VLESS+REALITY（TCP）+ 协议 auto-failover（TUIC→REALITY）
@@ -165,6 +166,30 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
 - `max_concurrent_uni_streams=4096` 经共享 `quic_transport_config` 也作用于 legacy `client_quic_config`（仅测试用、无害；ceiling 非预分配）。
 - `udp_drops` 混合 datagram-send-fail 与 uni-stream-fail 两类（acceptance 归因时留意）。
 - **acceptance 后**：按 gate 定默认 mode → 补 `docs/adr/0005-*`；按 T-F/T-H 定是否补 DNS/小流 carve-out。
+
+## 刀4 代码完成（2026-06-18）：连接成功率（拦截加密 DNS）
+
+**交付**（分支 `claude/knife4-connect-success`，从 main 起，逐 commit push；**未合 main**）：
+- **对症**：浏览器/系统用**加密 DNS**(DoH:443/DoT:853/DoQ:UDP853/DoH3:QUIC443)拿真实 IP → 绕过 fake-IP →
+  真实 IP 没进隧道 → GFW 墙 → **连接失败**。
+- **做法**：新 `src/dns_block.rs`（`is_encrypted_dns_port`/`is_doh_domain`/`is_doh_ip` + 内置 DoH 域名/IP 名单）；
+  `resolve_target` 加 **`Block`** 变体(:853 任意 IP / :443+fake-IP 域名∈DoH名单 / :443+非fake IP∈DoH-IP名单)，
+  一处决策天然覆盖 TCP+UDP 两路径。**TCP→RST**(复用 `rearm_socket`)、**UDP→静默丢包**(热路径勿 println)。
+  逼应用回落明文 :53 → 我方伪造 fake-IP → 进隧道。:443 **仅按名单精确判**，不碰普通 HTTPS/QUIC。
+- **质量**：87 lib 测绿、`clippy --all-targets --features harness` 0 warning。`/code-review`(9 角度)findings 已处理
+  （真 bug：UDP Block 逐包 println 洪水 → 改静默丢弃；补 dns.google.com）。
+- **设计文档**：`docs/tech/2026-06-18-knife4-connect-success-{spec,plan}.md`；ADR `docs/adr/0006-block-encrypted-dns.md`。
+
+**deferred（grill 决策）**：
+- **拦全 :53**（任意 resolver 明文查询都伪造）→ 需**裸包 DNS 路径**(脱离 smoltcp socket，中等重构)；模型 a 下
+  系统 DNS=198.18.0.1 已覆盖明文 → defer 后续刀。**这是无缝 on/off 不依赖系统 DNS 的关键拼图**(配合前端 NE)。
+- **first-SYN-to-fresh-fake-IP refused**：静态分析表明已被 **knife2 同帧 `ensure_port`+`ensure_spare_listeners` 修**
+  （HANDOFF 原条目疑陈旧）→ 仅 acceptance 探针验证(`curl rc=7≈0`)，复现才回头查。
+- **harness Block 端到端**：harness 连固定 TARGET_IP、FakeIpPool 不可注入 DoH 映射 → 降级 acceptance（Block 决策已全分支单测）。
+
+**真出口 acceptance：待跑**（需用户 env + 深圳测试机，配方见 findings 末节「刀4」）：
+浏览器开 DoH → 看 `🛡️ 阻断加密 DNS` 命中 + 网页正常(回落明文+fake-IP) + first-SYN 探针 `rc=7≈0`。
+acceptance 校准 DoH 名单后,刀4 即收官。
 
 ## Rhythm（每刀都遵守）
 

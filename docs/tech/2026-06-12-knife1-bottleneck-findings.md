@@ -350,3 +350,54 @@ YouTube **4K 视频不卡顿**（必跨线真实达标）+ Telegram/Facebook 正
 - **carve-out 不需要**确认：native 下 DNS/小流走 datagram，TG/FB 交互无滞（主观）。
 
 **→ 刀3.5 全部完成**（代码 + iperf3 矩阵 + 真机 soak）。native+cubic 出厂默认达 Rules.md ② 全码率（含 4K）。
+
+---
+
+# 刀4 真出口 acceptance 配方(待跑,需真 sing-box + 深圳测试机)
+
+> 实现见 `2026-06-18-knife4-connect-success-{spec,plan}.md`。分支 `claude/knife4-connect-success`。
+> 代码已完成(加密 DNS 拦截 DoT/DoH/DoQ/DoH3 → RST/丢包逼回落明文 → fake-IP);87 lib 测绿、clippy 0 warning。
+> **本节是 ready-to-run 配方;跑完把结果填回。**
+
+## 准备
+
+```bash
+cd <repo>; git checkout claude/knife4-connect-success && git pull
+cargo build --release
+export MINI_VPN_TUIC_SERVER=47.251.188.205:8443 MINI_VPN_TUIC_UUID=<uuid> MINI_VPN_TUIC_PASSWORD=<pass>
+sudo -E bash scripts/knife35-acceptance.sh soak     # 全局隧道 native+cubic + DNS→198.18.0.1
+```
+
+## 测项
+
+| # | 测项 | 操作 | 判据 |
+|---|---|---|---|
+| K4-A | **DoH 拦截(浏览器)** | Chrome `chrome://settings/security` 开「使用安全 DNS」选 Cloudflare(或 Google);访问几个站 | client 日志出现 `🛡️ 阻断加密 DNS ...cloudflare-dns.com/1.1.1.1:443`;同时 `🪪 DNS ...→fake-IP` 持续(证回落明文+fake-IP);**网页正常打开** |
+| K4-B | **DoT 拦截** | 系统/应用配 DoT(:853) 或 `kdig +tls @1.1.1.1 example.com` 经隧道 | :853 连接被 RST;`🛡️` 日志命中 853 |
+| K4-C | **回归:DoH 关时正常** | 浏览器关安全 DNS,正常用 | 无 `🛡️` 洪水;浏览正常(零回归) |
+| K4-D | **first-SYN 探针**(见下) | 高并发连发新域名 | `curl rc=7≈0` → first-SYN 已被 knife2 修、本刀不碰 |
+
+## first-SYN 复现探针(K4-D)
+
+```bash
+LOG=/tmp/knife4_firstsyn.log; : > "$LOG"
+domains="example.com wikipedia.org github.com cloudflare.com mozilla.org \
+apple.com microsoft.com amazon.com bing.com duckduckgo.com python.org \
+rust-lang.org debian.org kernel.org archlinux.org nginx.org postgresql.org \
+redis.io sqlite.org gnu.org openssl.org curl.se git-scm.com gitlab.com bitbucket.org"
+for r in $(seq 1 15); do
+  echo "$domains" | tr ' ' '\n' | grep . | xargs -P 26 -I{} sh -c \
+    'code=$(curl -s -o /dev/null --connect-timeout 8 -w "%{http_code}" "https://{}/"); echo "$code rc=$? {}"' >> "$LOG" 2>&1
+done
+echo "总:$(grep -c . "$LOG") 成功:$(awk '$1~/^[23]/' "$LOG"|wc -l) ★rc=7(疑first-SYN):$(grep -c 'rc=7' "$LOG")"
+grep 'rc=7' "$LOG" | sort | uniq -c | head
+```
+
+## 收尾
+```bash
+sudo -E bash scripts/knife35-acceptance.sh soak-stop   # 还原 DNS
+```
+
+## 实测 / 裁决(待填)
+
+- DoH/DoT 拦截是否生效(`🛡️` 命中 + 浏览正常)、DoH 名单是否需增补;first-SYN `rc=7` 是否 ≈0。
