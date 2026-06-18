@@ -310,9 +310,19 @@ mock harness 之外的端到端验证（IP 直连 1.1.1.1:443，`route -n add -h
 升到 80M 链路后，native datagram 下行 39.8M/0.25%、上行 37.5M/4.5%。刀3「stream 50M / datagram 5.3M」的对比
 是被 5M 链路污染的产物。**插桩（cwnd/RTT/loss）是揭穿真相的功臣**——印证 HANDOFF「先量化、别凭猜改」。
 
-**② 默认 `congestion_control` = cubic（不是 bbr）。** datagram 数据面 Cubic 完胜 BBR：40M 下 0.25% vs 24%。
-quinn 0.10 的 BBR 对 unreliable datagram 过驱（cwnd/RTT 暴涨）。BBR 仍可经 `MINI_VPN_TUIC_CC=bbr` 显式选用。
+**② 默认 `congestion_control` = cubic（不是 bbr）——理由是 worst-case 更好 / 方差更小，非「BBR 总是差」。**
+两台深圳机各测一轮 40M 下行 datagram：
+
+| 机器 | Cubic 丢 | BBR 丢 |
+|---|---|---|
+| 原机 | **0.25%** | **24%**（cwnd 暴涨 245K、RTT 178→252ms 过驱） |
+| 专用测试机 | 7.6% | 5.8% |
+
+BBR **有更糟的尾部**（原机那次是真实过驱事件）；专用机这轮两者相当（BBR 略好）。Cubic worst-case 7.6% < BBR 24%、
+更平稳，对看重一致性的直播 VPN 更稳妥 → 默认 Cubic。BBR 仍可经 `MINI_VPN_TUIC_CC=bbr` 显式选用（部分链路可能更优）。
 → 已改 `DEFAULT_TUIC_CC`。补 `docs/adr/0005-cubic-over-bbr-datagram.md`。
+**专用机复核**：① Cubic 40M→37.0M/7.6%、② BBR 40M→37.7M/5.8%（均高码率 OK）、③ quic 全 stream 40M→**0.95M/39%**（崩，
+比原机 7M/71% 更惨）→ 再次坐实 native datagram ≫ quic stream，cubic 默认稳。
 
 **③ 默认 `udp_relay_mode` = native（datagram）。** datagram 4K 富余且低延迟；quic 全 stream 模式高码率灾难
 （71% 丢）。**quic 模式保留为可配置选项**（代码完成+测过；抗封锁场景——网络封 UDP datagram 但放行 QUIC stream
