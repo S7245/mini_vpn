@@ -799,12 +799,19 @@ enum TargetResolve {
     },
     /// fake-IP 段内但查不到映射（如客户端重启丢表、应用用旧缓存 IP）：拒绝，让应用重查。
     Refuse,
+    /// 加密 DNS 端点（DoT/DoQ :853、DoH/DoH3 :443 命中名单）：阻断，逼应用回落明文 DNS。
+    /// 中文要点（刀4）：TCP 发 RST（rearm）、UDP 丢包；应用回落 :53 → 我方伪造 fake-IP → 进隧道。
+    Block,
 }
 
 /// 把提取出的 endpoint 解析成 relay target。
 /// 中文要点：fake-IP → 查表得域名 → DomainPort（出口解析、绕污染）；非 fake → IpPort
 /// （Stage 8/9 行为不变）；fake 但无映射 → Refuse（拒绝连接）。
 fn resolve_target(endpoint: smoltcp::wire::IpEndpoint, fake_pool: &FakeIpPool) -> TargetResolve {
+    // 刀4：加密 DNS 拦截(先于常规解析)。:853 = DoT/DoQ(任意 IP)→ Block。
+    if crate::dns_block::is_encrypted_dns_port(endpoint.port) {
+        return TargetResolve::Block;
+    }
     let std::net::IpAddr::V4(v4) = std::net::IpAddr::from(endpoint.addr) else {
         return TargetResolve::Direct {
             target: target_from_endpoint(endpoint),
@@ -814,6 +821,10 @@ fn resolve_target(endpoint: smoltcp::wire::IpEndpoint, fake_pool: &FakeIpPool) -
     if fake_pool.is_fake(v4) {
         match fake_pool.resolve(v4) {
             Some(domain) => {
+                // 刀4：DoH/DoH3 经 fake-IP——:443 且域名命中 DoH 名单 → Block（不碰普通 :443）。
+                if endpoint.port == 443 && crate::dns_block::is_doh_domain(&domain) {
+                    return TargetResolve::Block;
+                }
                 // 不在此 println!——resolve_target 在每个 UDP 包/每条 TCP 首包都会走到，
                 // 热路径同步 stdout 会拖垮大并发。flow 创建的可观测性放在服务端日志。
                 TargetResolve::Direct {
@@ -827,6 +838,10 @@ fn resolve_target(endpoint: smoltcp::wire::IpEndpoint, fake_pool: &FakeIpPool) -
             None => TargetResolve::Refuse,
         }
     } else {
+        // 刀4：DoH/DoH3 硬编 bootstrap IP——:443 且 IP 命中 DoH-IP 名单 → Block。
+        if endpoint.port == 443 && crate::dns_block::is_doh_ip(v4) {
+            return TargetResolve::Block;
+        }
         TargetResolve::Direct {
             target: target_from_endpoint(endpoint),
             fake_ip: None,
@@ -951,6 +966,15 @@ async fn process_listener_activity<U: ProxyUpstream>(
                 "🚫 fake-IP {} 无映射，拒绝连接（请重新解析）",
                 endpoint.addr
             );
+            let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
+            if let Some(ctx) = socket_ctxs.get_mut(&handle) {
+                rearm_socket(tcp_socket, ctx, fake_pool, now_secs);
+            }
+            return Ok(());
+        }
+        // 刀4：加密 DNS（DoT :853 / DoH :443）→ RST（rearm），逼应用回落明文 DNS。
+        TargetResolve::Block => {
+            println!("🛡️ 阻断加密 DNS {}:{}（→ RST，逼回落明文 DNS）", endpoint.addr, endpoint.port);
             let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
             if let Some(ctx) = socket_ctxs.get_mut(&handle) {
                 rearm_socket(tcp_socket, ctx, fake_pool, now_secs);
@@ -1176,6 +1200,11 @@ async fn handle_tuic_udp_uplink<U: DatagramUpstream>(
         TargetResolve::Direct { target, fake_ip } => (target, fake_ip),
         TargetResolve::Refuse => {
             println!("🚫 UDP fake-IP {} 无映射，丢弃（待应用重新解析）", udp.dst_ip);
+            return;
+        }
+        // 刀4：加密 DNS（DoQ :853 / DoH3 :443）→ 丢包，逼应用回落明文 DNS。
+        TargetResolve::Block => {
+            println!("🛡️ 阻断加密 DNS UDP {}:{}（→ 丢包，逼回落明文 DNS）", udp.dst_ip, udp.dst_port);
             return;
         }
     };
@@ -1497,6 +1526,46 @@ mod tests {
         let pkt = build_ipv4_tcp([10, 0, 0, 1], [1, 1, 1, 1], 60000, 443, true, false);
         assert_eq!(classify_inbound(&pkt), Inbound::Other);
         assert_eq!(classify_inbound(&[0u8; 4]), Inbound::Other);
+    }
+
+    /// 刀4：resolve_target 对加密 DNS 端点返回 Block，且精确不误伤普通 :443 / 零回归 Refuse。
+    #[test]
+    fn resolve_target_blocks_encrypted_dns() {
+        use smoltcp::wire::IpEndpoint;
+        let mut pool = FakeIpPool::new();
+        let ep = |ip: [u8; 4], port: u16| {
+            IpEndpoint::new(IpAddress::v4(ip[0], ip[1], ip[2], ip[3]), port)
+        };
+
+        // DoT/DoQ :853（任意 IP）→ Block。
+        assert!(matches!(resolve_target(ep([1, 1, 1, 1], 853), &pool), TargetResolve::Block));
+        assert!(matches!(
+            resolve_target(ep([93, 184, 216, 34], 853), &pool),
+            TargetResolve::Block
+        ));
+
+        // DoH 经 fake-IP：dns.google:443 → Block；普通域名:443 → Direct；DoH 域名但 :80 → Direct（仅 :443）。
+        let doh_fake = pool.alloc("dns.google", 0);
+        assert!(matches!(resolve_target(ep(doh_fake.octets(), 443), &pool), TargetResolve::Block));
+        assert!(matches!(resolve_target(ep(doh_fake.octets(), 80), &pool), TargetResolve::Direct { .. }));
+        let normal_fake = pool.alloc("example.com", 0);
+        assert!(matches!(
+            resolve_target(ep(normal_fake.octets(), 443), &pool),
+            TargetResolve::Direct { .. }
+        ));
+
+        // DoH 硬编 IP 1.1.1.1:443 → Block；普通真实 IP:443 → Direct。
+        assert!(matches!(resolve_target(ep([1, 1, 1, 1], 443), &pool), TargetResolve::Block));
+        assert!(matches!(
+            resolve_target(ep([93, 184, 216, 34], 443), &pool),
+            TargetResolve::Direct { .. }
+        ));
+
+        // fake-IP 段内无映射 → Refuse（零回归，不被 Block 吞掉）。
+        assert!(matches!(
+            resolve_target(IpEndpoint::new(IpAddress::v4(198, 18, 99, 99), 443), &pool),
+            TargetResolve::Refuse
+        ));
     }
 
     /// #1 脏集合驱动：`handles_for_port` 返回该端口 pool 的全部 handle；未注册端口空 slice。
