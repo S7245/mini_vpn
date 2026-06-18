@@ -338,4 +338,15 @@ BBR **有更糟的尾部**（原机那次是真实过驱事件）；专用机这
 - **typical（≤5M）/ 1080p60（~8–12M）/ 4K（~25M）下行直播：native datagram + Cubic 全部达标**（40M/0.25% 实测，4K 富余）。
 - 高码率不再需要 stream-routing——刀3.5 的原始前提（datagram 有天花板需 stream）被实测推翻；真正交付的价值是
   **插桩纠偏 + CC 调优（cubic）+ 证实 datagram 本就够**，避免了上线不必要的全-stream 复杂度。
-- **待跑 T-H 真实 soak**（native+cubic，深圳 macOS 看 YouTube/TikTok/FB/TG 30–60min）作最终 UX/长稳 gate。
+
+### T-H 真实 soak ✅（2026-06-17，专用测试机，native+cubic 出厂默认，真应用长稳）
+
+YouTube **4K 视频不卡顿**（必跨线真实达标）+ Telegram/Facebook 正常。`📊` 长稳读数（连续 20–30min+）：
+- **累计丢包 ~0.31%**（`丢包≈8553/2716577`，跨洲高 RTT UDP 路径极低）；**`丢弃=0` 全程**（零硬丢弃）。
+- `RTT` 多数 ~170ms 稳；末尾一次拥塞/PMTU 事件（RTT 626ms、`datagram 上限` PLPMTUD 探到 1246、`stream 兜底`
+  跳到 63）被**优雅吸收**——超 MTU 大包自动走 uni-stream 兜底（`丢弃=0`），随后恢复 176ms/1375。
+- `stream 兜底` 整轮 3→76 缓增（Native 模式 **大包尾部兜底**在工作，非高码率全 stream）；`send_buf 余` 基本满（无背压）。
+- **无 `🔌` 重连风暴、无「无映射丢弃」洪水** → 长稳健康。
+- **carve-out 不需要**确认：native 下 DNS/小流走 datagram，TG/FB 交互无滞（主观）。
+
+**→ 刀3.5 全部完成**（代码 + iperf3 矩阵 + 真机 soak）。native+cubic 出厂默认达 Rules.md ② 全码率（含 4K）。
