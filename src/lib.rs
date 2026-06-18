@@ -1,6 +1,7 @@
 pub mod client_tun;
 pub mod device;
 pub mod dns;
+pub mod dns_block;
 pub mod fake_ip;
 #[cfg(feature = "harness")]
 pub mod harness;
