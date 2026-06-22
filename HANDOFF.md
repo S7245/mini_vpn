@@ -4,16 +4,15 @@
 
 ## 当前状态（基线）
 
-- **Stage 13 + 刀1 + 刀2 + 刀3 + 刀3.5 + 刀4 全部已在 `main`**（`cd9ff62`，2026-06-18 fast-forward 合入，与 origin 同步）。
+- **Stage 13 + 刀1 + 刀2 + 刀3 + 刀3.5 + 刀4 + 刀5 全部已在 `main`**（`e589767`，2026-06-22 fast-forward 合入，与 origin 同步）。
   数据面 = **client-only TUIC over quinn → sing-box**（ADR-0004）；UDP 默认 **native datagram + Cubic**（刀3.5）；
-  **拦截加密 DNS** 逼回落明文 → fake-IP（刀4，ADR-0006）。
-- **刀5 完成（分支 `claude/knife5-dns-hijack`，从 main 起，逐 commit push；真出口 acceptance PASS；未合 main，待用户决定）**：
-  **拦全 :53 裸包 DNS 劫持**——任意 resolver(如 8.8.8.8:53)的明文查询都本地伪造 fake-IP(裸包构造,src=被查询的 resolver),
-  废 smoltcp DNS socket、统一一条路径,fake-IP 不再依赖系统 DNS 指向 198.18.0.1(ADR-0007)。见下「刀5 完成」。
+  **拦截加密 DNS** 逼回落明文 → fake-IP（刀4，ADR-0006）；**拦全 :53 裸包 DNS 劫持**——任意 resolver(如 8.8.8.8:53)的明文
+  查询都本地伪造 fake-IP(裸包构造,src=被查询的 resolver)、废 smoltcp DNS socket，fake-IP 不再依赖系统 DNS 指向 198.18.0.1
+  （刀5，ADR-0007）。见下「刀5 完成」。
 - **Stage 13 全部完成**：13a TCP via TUIC Connect ✅、13b UDP via TUIC Packet ✅、13c 按需 heartbeat（0-RTT 撞 quinn 0.10 墙、deferred）✅、13d 退役 legacy（删 yamux/自研 server/双轨开关/6 个依赖）✅。
 - **刀1/2/3/3.5 完成**（见下各「已完成」段）：并发压测 harness + 大并发优化（脏集合 + 弹性扩容 + fake-IP 回收）+ UDP 直播硬化（quic-stream 兜底 + 分片重组）+ 高码率 UDP（BBR/Cubic 可切 + quinn 插桩 + quic-relay-mode；**纠偏：刀3「5.3M datagram 天花板」实为链路 cap 假象**）。
-- **新 session 起点（下一刀）：刀5 合 main 后从 `main` 起新分支**（刀5 仍在分支 `claude/knife5-dns-hijack`，待用户合）。
-  拦全:53 已由刀5 达成。下一刀候选：正交线 A REALITY 抗封锁 / 高带宽压测+数据面多线程（逼近 100M）/
+- **新 session 起点（下一刀）：直接从 `main`（`e589767`）起新分支**。拦全:53 已由刀5 达成。
+  下一刀候选：正交线 A REALITY 抗封锁 / 高带宽压测+数据面多线程（逼近 100M）/
   observability(DNS forge 计数、datagram drop 背压可观测)——按优先级定。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
@@ -47,7 +46,7 @@
  ├─ 刀3  UDP 直播硬化（quic-stream fallback + 吞吐压测 + MSS/MTU）  ✅ 完成 + 真出口 acceptance（见下「刀3」）
  ├─ 刀3.5 高码率 UDP（quinn 插桩 + CC 调优）  ✅ 完成 + 真出口 acceptance（见下「刀3.5」）；纠偏：5.3M「天花板」实为链路 cap 假象
  ├─ 刀4  连接成功率（拦截加密 DNS DoT/DoH/DoQ/DoH3）  ✅ 完成 + 真出口 acceptance（见下「刀4」）；first-SYN 已确认 knife2 修复、关闭
- ├─ 刀5  拦全:53 裸包 DNS 劫持（任意 resolver 明文→fake-IP，废 smoltcp DNS socket）  ✅ 完成 + 真出口 acceptance（见下「刀5」，ADR-0007）；未合 main
+ ├─ 刀5  拦全:53 裸包 DNS 劫持（任意 resolver 明文→fake-IP，废 smoltcp DNS socket）  ✅ 完成 + 真出口 acceptance（见下「刀5」，ADR-0007）；已合 main
  └─ 刀6  ?（正交线 A REALITY 抗封锁 / 高带宽多线程逼近 100M / DNS·datagram observability）  ← 下一刀（按优先级定）
 
 正交线（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）
@@ -203,7 +202,7 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
 
 ## 刀5 代码完成（2026-06-22）：拦全 :53 裸包 DNS 劫持
 
-**交付**（分支 `claude/knife5-dns-hijack`，从 main 起，逐 commit push；**未合 main，待用户决定**）：
+**交付**（分支 `claude/knife5-dns-hijack`，从 main 起，逐 commit push；**已 fast-forward 合入 main `e589767`**）：
 - **对症**：刀4 逼应用回落明文 DNS，但应用回落到的是**它自己配的 resolver**（如 `8.8.8.8:53`），非 198.18.0.1。
   原 `classify_inbound` 仅伪造 `198.18.0.1:53`、其它 :53 隧道转发真 DNS → 真实 IP 绕过 fake-IP（仅"模型 a 系统 DNS=198.18.0.1"下不漏）。
 - **做法**（grill 4 裁决 + ADR-0007）：① **裸包**——`classify_inbound` 任意 `:53`→`Dns`，新 `forge_dns_reply`(纯)
