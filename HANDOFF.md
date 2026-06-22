@@ -4,11 +4,13 @@
 
 ## 当前状态（基线）
 
-- **Stage 13 + 刀1 + 刀2 + 刀3 + 刀3.5 全部已在 `main`**（`591a629`，2026-06-17 fast-forward 合入，与 origin 同步）。
-  数据面 = **client-only TUIC over quinn → sing-box**（ADR-0004）；UDP 默认 **native datagram + Cubic**（刀3.5 实测裁决）。
+- **Stage 13 + 刀1 + 刀2 + 刀3 + 刀3.5 + 刀4 全部已在 `main`**（`cd9ff62`，2026-06-18 fast-forward 合入，与 origin 同步）。
+  数据面 = **client-only TUIC over quinn → sing-box**（ADR-0004）；UDP 默认 **native datagram + Cubic**（刀3.5）；
+  **拦截加密 DNS** 逼回落明文 → fake-IP（刀4，ADR-0006）。
 - **Stage 13 全部完成**：13a TCP via TUIC Connect ✅、13b UDP via TUIC Packet ✅、13c 按需 heartbeat（0-RTT 撞 quinn 0.10 墙、deferred）✅、13d 退役 legacy（删 yamux/自研 server/双轨开关/6 个依赖）✅。
 - **刀1/2/3/3.5 完成**（见下各「已完成」段）：并发压测 harness + 大并发优化（脏集合 + 弹性扩容 + fake-IP 回收）+ UDP 直播硬化（quic-stream 兜底 + 分片重组）+ 高码率 UDP（BBR/Cubic 可切 + quinn 插桩 + quic-relay-mode；**纠偏：刀3「5.3M datagram 天花板」实为链路 cap 假象**）。
-- **新 session 起点（刀4）：直接从 `main`（`591a629`）起新分支**（如 `claude/knife4-connect-success`）。
+- **新 session 起点（下一刀）：直接从 `main`（`cd9ff62`）起新分支**。下一刀候选：拦全:53 裸包劫持（无缝 on/off 拼图）/
+  正交线 A REALITY 抗封锁 / 高带宽压测+数据面多线程（逼近 100M）——按优先级定。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
 ## 目标（唯一北极星）：`Rules.md`
@@ -169,7 +171,7 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
 
 ## 刀4 代码完成（2026-06-18）：连接成功率（拦截加密 DNS）
 
-**交付**（分支 `claude/knife4-connect-success`，从 main 起，逐 commit push；**未合 main**）：
+**交付**（分支 `claude/knife4-connect-success`，从 main 起，逐 commit push；**已 fast-forward 合入 main `cd9ff62`**）：
 - **对症**：浏览器/系统用**加密 DNS**(DoH:443/DoT:853/DoQ:UDP853/DoH3:QUIC443)拿真实 IP → 绕过 fake-IP →
   真实 IP 没进隧道 → GFW 墙 → **连接失败**。
 - **做法**：新 `src/dns_block.rs`（`is_encrypted_dns_port`/`is_doh_domain`/`is_doh_ip` + 内置 DoH 域名/IP 名单）；
