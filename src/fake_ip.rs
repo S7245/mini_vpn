@@ -32,7 +32,7 @@ impl Default for FakeIpPool {
 }
 
 impl FakeIpPool {
-    /// 构造：`198.18.0.0/15`，从 `.2` 起分配（`.0` 不用、`.1` 预留给 DNS resolver）。
+    /// 构造：`198.18.0.0/15`，从 `.2` 起分配（`.0` 不用、`.1` 预留为可对外广告的 resolver 地址）。
     pub fn new() -> Self {
         let range_start = u32::from(Ipv4Addr::new(198, 18, 0, 0));
         let range_end = u32::from(Ipv4Addr::new(198, 19, 255, 255));

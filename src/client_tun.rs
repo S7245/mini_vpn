@@ -12,8 +12,7 @@ use crate::fake_ip::FakeIpPool;
 use std::net::Ipv4Addr;
 use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState};
-use smoltcp::socket::udp;
-use smoltcp::wire::{IpAddress, IpCidr, IpListenEndpoint};
+use smoltcp::wire::{IpAddress, IpCidr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::sync::Arc;
 
@@ -29,7 +28,7 @@ const RELAY_CHANNEL_CAPACITY: usize = 1024;
 /// 并发压测 harness 传 RecordingSink，在每个回调里采集每段耗时/调用次数。计时逻辑全部留在 sink
 /// 实现内，主循环只做平凡方法调用——生产与测试**同一份循环**。
 pub trait MetricsSink {
-    /// 进入 smoltcp poll 段（poll → drain_dns → poll → flush_tx）。
+    /// 进入 smoltcp poll 段（poll → flush_tx）。
     fn enter_poll(&mut self) {}
     /// 离开 poll 段。
     fn leave_poll(&mut self) {}
@@ -424,24 +423,9 @@ pub async fn run_event_loop<D, U, M>(
     // 出集 = 处理后无 pending 且不再 can_recv（见 process_dirty_relay）。
     let mut dirty: HashSet<SocketHandle> = HashSet::new();
 
-    // Stage 11: fake-IP DNS。监听 UDP :53（AnyIP 收发往 198.18.0.1:53 的查询），
-    // 本地伪造 A 响应（fake-IP）；TCP 时凭 fake-IP 查回域名走 DomainPort relay。
-    let dns_handle = {
-        // 中文要点：DNS 查询常突发（应用并发解析 + 系统后台噪声），buffer 太小会丢查询 →
-        // getaddrinfo 失败 → 连接发不出。给足 64 槽 / 64KB，吸收突发。
-        let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 64], vec![0u8; 65_536]);
-        let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 64], vec![0u8; 65_536]);
-        let mut s = udp::Socket::new(rx, tx);
-        // 必须 bind 到具体的 198.18.0.1，而非通配 None：否则 smoltcp 回复 DNS 响应时
-        // 按子网匹配选源地址（dst=10.0.0.1 → src=10.0.0.2），源与查询目的不一致，
-        // 系统 resolver 会丢弃响应。bind 到 198.18.0.1 才能让响应 src=198.18.0.1。
-        s.bind(IpListenEndpoint {
-            addr: Some(IpAddress::v4(198, 18, 0, 1)),
-            port: 53,
-        })
-        .unwrap();
-        sockets.add(s)
-    };
+    // 刀5: fake-IP DNS 不再用 smoltcp socket。任意 resolver 的明文 :53 在 rx 热路径被
+    // classify_inbound 判 Dns → handle_dns_hijack 裸包伪造 fake-IP 回包（绕过 smoltcp，
+    // 源 = 被查询的 resolver，故不依赖系统 DNS 指向 198.18.0.1，见 ADR-0007）。
     let mut fake_pool = FakeIpPool::new();
 
     // 3. 初始化 smoltcp 的“虚拟路由器”
@@ -454,11 +438,8 @@ pub async fn run_event_loop<D, U, M>(
         ip_addrs
             .push(IpCidr::new(IpAddress::v4(10, 0, 0, 2), 24))
             .unwrap();
-        // Stage 11: 把 fake DNS resolver 地址也配成本接口 IP，否则 smoltcp 无法以
-        // src=198.18.0.1 发回 DNS 响应（egress 选不到合法 src），系统收不到应答。
-        ip_addrs
-            .push(IpCidr::new(IpAddress::v4(198, 18, 0, 1), 32))
-            .unwrap();
+        // 刀5：不再把 198.18.0.1/32 配成接口 IP——DNS 回包改由 handle_dns_hijack 裸包注入
+        // （src = 被查询的 resolver），不经 smoltcp 选源，故无需本接口持有 resolver 地址。
     });
 
     // AnyIP：接收目的 IP 不是本接口自身地址的包（即被拦截连接真正想去的 Target）。
@@ -517,8 +498,8 @@ pub async fn run_event_loop<D, U, M>(
             // 分支 1: 物理网卡接收到了新数据包
             res = device.wait_for_rx() =>{
                 if res.is_ok(){
-                    // rx 分流（stage-12 D1）：去往 fake DNS 的 :53 → smoltcp；其它 UDP → 裸 relay；
-                    // 非 UDP → 既有 smoltcp 路径。UDP relay 包 take 走、不进 iface.poll。
+                    // rx 分流（stage-12 D1 + 刀5）：任意 :53 → 裸包 DNS 劫持；其它 UDP → 裸 relay；
+                    // 非 UDP → 既有 smoltcp 路径。前两类 take 走、不进 iface.poll。
                     let class = device.rx_peek().map(classify_inbound);
                     if class == Some(Inbound::UdpRelay) {
                         if let Some(pkt) = device.rx_take() {
@@ -528,6 +509,17 @@ pub async fn run_event_loop<D, U, M>(
                                 &mut assoc_table,
                                 &mut fake_pool,
                                 &*upstream,
+                                udp_clock.elapsed().as_secs(),
+                            )
+                            .await;
+                        }
+                    } else if class == Some(Inbound::Dns) {
+                        // 刀5：任意 resolver 的明文 :53 → 裸包伪造 fake-IP 回包（绕过 smoltcp）。
+                        if let Some(pkt) = device.rx_take() {
+                            handle_dns_hijack(
+                                &pkt,
+                                &mut fake_pool,
+                                &mut device,
                                 udp_clock.elapsed().as_secs(),
                             )
                             .await;
@@ -571,9 +563,6 @@ pub async fn run_event_loop<D, U, M>(
 
                         metrics.enter_poll();
                         let timestamp = smoltcp::time::Instant::now();
-                        iface.poll(timestamp, &mut device, &mut sockets);
-                        // 处理 DNS 查询并伪造响应；再 poll 一次把响应变成 IP 包入发货队列。
-                        drain_dns(&mut sockets, dns_handle, &mut fake_pool, udp_clock.elapsed().as_secs());
                         iface.poll(timestamp, &mut device, &mut sockets);
                         device.flush_tx().await.unwrap();
                         metrics.leave_poll();
@@ -638,8 +627,6 @@ pub async fn run_event_loop<D, U, M>(
             _ = timer.tick() =>{
                 metrics.enter_poll();
                 let timestamp = smoltcp::time::Instant::now();
-                iface.poll(timestamp, &mut device, &mut sockets);
-                drain_dns(&mut sockets, dns_handle, &mut fake_pool, udp_clock.elapsed().as_secs());
                 iface.poll(timestamp, &mut device, &mut sockets);
                 device.flush_tx().await.unwrap();
                 metrics.leave_poll();
@@ -849,50 +836,12 @@ fn resolve_target(endpoint: smoltcp::wire::IpEndpoint, fake_pool: &FakeIpPool) -
     }
 }
 
-/// 处理 DNS socket 上排队的查询：A → 分配 fake-IP 并伪造 A 响应；其它 → NODATA。
-/// 中文要点：纯本地应答，不外发真实 DNS；解析失败的查询直接忽略，绝不 panic。
-fn drain_dns(
-    sockets: &mut SocketSet<'_>,
-    dns_handle: SocketHandle,
-    fake_pool: &mut FakeIpPool,
-    now_secs: u64,
-) {
-    let sock = sockets.get_mut::<udp::Socket>(dns_handle);
-    while sock.can_recv() {
-        let (data, remote) = match sock.recv() {
-            Ok((d, meta)) => (d.to_vec(), meta.endpoint),
-            Err(_) => break,
-        };
-        let Some(q) = dns::parse_query(&data) else {
-            continue;
-        };
-        let resp = if q.qtype == dns::QTYPE_A {
-            let ip = fake_pool.alloc(&q.qname, now_secs);
-            println!("🪪 DNS {} (A) → fake-IP {}", q.qname, ip);
-            dns::build_response(&q, Answer::A(ip, 5))
-        } else {
-            let kind = if q.qtype == dns::QTYPE_AAAA {
-                "AAAA"
-            } else {
-                "other"
-            };
-            println!("🪪 DNS {} ({}) → NODATA", q.qname, kind);
-            dns::build_response(&q, Answer::NoData)
-        };
-        if let Err(e) = sock.send_slice(&resp, remote) {
-            println!("DNS 响应发送失败: {:?}", e);
-        }
-    }
-}
-
 /// 刀5：把发往**任意** resolver 的明文 DNS 查询，本地伪造成 fake-IP 回包（裸包构造）。
 /// 中文要点：A 查询 → 分配 fake-IP 并回伪造 A 记录；AAAA/其它 → NODATA；不可解析 → `None`
 /// （调用方丢弃，**绝不转发真 DNS**——转发即泄漏真实 IP，绕过 fake-IP）。回包源 = app 当初查询的
 /// resolver（`udp.dst_ip:53`），目的 = app 原端点；否则 app 的 socket 认不出回包而丢弃。裸包能任意
 /// 设 src（smoltcp 受限于本接口 IP、对无界 resolver 集合做不到，见 ADR-0007）。纯逻辑（只依赖
 /// `UdpInbound` + `&mut FakeIpPool`），无 device/async，便于单测。
-// 刀5 T1：纯函数先行，T4 接线 `handle_dns_hijack` 后即被非测试代码调用（届时移除本 allow）。
-#[allow(dead_code)]
 fn forge_dns_reply(udp: &UdpInbound<'_>, fake_pool: &mut FakeIpPool, now_secs: u64) -> Option<Vec<u8>> {
     let q = dns::parse_query(udp.payload)?;
     let resp = if q.qtype == dns::QTYPE_A {
@@ -914,6 +863,26 @@ fn forge_dns_reply(udp: &UdpInbound<'_>, fake_pool: &mut FakeIpPool, now_secs: u
         (udp.src_ip, udp.src_port),
         &resp,
     ))
+}
+
+/// 刀5：rx 热路径的裸包 DNS 劫持薄壳——解析入站 :53 包 → `forge_dns_reply` → 注入回包到 TUN。
+/// 中文要点：`forge_dns_reply` 返回 `None`（不可解析）→ 静默丢弃（app 重查自愈，绝不转发真 DNS）。
+/// 与 UDP relay 下行注入同款（`inject_ip_packet` + `flush_tx`）；泛型 `D: TunIo` 使生产/harness 共用。
+async fn handle_dns_hijack<D: TunIo>(
+    pkt: &[u8],
+    fake_pool: &mut FakeIpPool,
+    device: &mut D,
+    now_secs: u64,
+) {
+    let Some(udp) = parse_inbound_udp(pkt) else {
+        return;
+    };
+    if let Some(reply) = forge_dns_reply(&udp, fake_pool, now_secs) {
+        device.inject_ip_packet(&reply);
+        if let Err(e) = device.flush_tx().await {
+            println!("DNS 劫持回包 flush 失败: {e}");
+        }
+    }
 }
 
 /// Drain the currently available local payload from one listener slot.
