@@ -974,7 +974,15 @@ async fn process_listener_activity<U: ProxyUpstream>(
         }
         // 刀4：加密 DNS（DoT :853 / DoH :443）→ RST（rearm），逼应用回落明文 DNS。
         TargetResolve::Block => {
-            println!("🛡️ 阻断加密 DNS {}:{}（→ RST，逼回落明文 DNS）", endpoint.addr, endpoint.port);
+            // 解析 fake-IP 回域名供日志（low-rate TCP block 路径，便于核对命中端点 / 调 DoH 名单）；
+            // :853/DoH-IP（非 fake-IP）则显示 IP。
+            let who = match std::net::IpAddr::from(endpoint.addr) {
+                std::net::IpAddr::V4(v4) => {
+                    fake_pool.resolve(v4).unwrap_or_else(|| endpoint.addr.to_string())
+                }
+                _ => endpoint.addr.to_string(),
+            };
+            println!("🛡️ 阻断加密 DNS {who} (@{}:{})（→ RST，逼回落明文 DNS）", endpoint.addr, endpoint.port);
             let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
             if let Some(ctx) = socket_ctxs.get_mut(&handle) {
                 rearm_socket(tcp_socket, ctx, fake_pool, now_secs);

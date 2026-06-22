@@ -398,6 +398,24 @@ grep 'rc=7' "$LOG" | sort | uniq -c | head
 sudo -E bash scripts/knife35-acceptance.sh soak-stop   # 还原 DNS
 ```
 
-## 实测 / 裁决(待填)
+## 实测 / 裁决(2026-06-18,深圳测试机,native+cubic 全局隧道)
 
-- DoH/DoT 拦截是否生效(`🛡️` 命中 + 浏览正常)、DoH 名单是否需增补;first-SYN `rc=7` 是否 ≈0。
+**K4-A DoH 拦截 ✅**:Chrome 开「安全 DNS=Cloudflare」→ `🛡️ 阻断加密 DNS 198.18.0.2:443 → RST` 反复命中。
+`198.18.0.2` 是浏览器把 **cloudflare-dns.com 经我方 fake DNS 解析**得的 fake-IP → `resolve_target` 查回域名命中
+DoH 名单 → Block。**域名识别真生效**(默认 provider Cloudflare 被拦)。浏览器随后回落明文 → 正常上网。
+
+**K4-C 回归 ✅**:DoH 关 → 明文 DNS 健康(facebook/instagram/youtube/googlevideo/fbcdn 全部 `🪪 → fake-IP`),
+无 `🛡️` 误伤、浏览正常。
+
+**K4-D first-SYN ✅**:探针 `总 375 / 成功 360 / rc=7=**0**` → **零 connection-refused → first-SYN 竞态不复现,
+确认已被 knife2 同帧 ensure_port+ensure_spare_listeners 修,HANDOFF 原条目陈旧**。本刀正确未碰 SYN 热路径。
+
+### 裁决
+
+- **加密 DNS 拦截达成**:DoH(经 fake-IP 域名)被 RST、应用回落明文 → fake-IP → 进隧道。默认浏览器 provider
+  (Cloudflare/Google)的域名+IP 已覆盖;本轮未暴露名单缺口。exotic/opt-in 端点留真实使用中按 `🛡️` 日志增补 / SNI(defer)。
+- **first-SYN 不复现** → 该项关闭(knife2 已修)。
+- **拦全:53 仍 defer**(裸包重构,无缝 on/off 拼图,后续刀)。
+- 小改:TCP block 日志改显**解析域名**(`🛡️ 阻断加密 DNS cloudflare-dns.com (@198.18.0.2:443)`),便于核对/调名单。
+
+**→ 刀4 完成**(代码 + 单测 + ADR-0006 + 真出口 acceptance)。Rules.md「真实浏览器场景能连上」前置达成。

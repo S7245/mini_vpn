@@ -40,7 +40,7 @@
  ├─ 刀2  大并发优化（#1 脏集合 + #2 弹性扩容 + fake-IP 引用计数回收）  ✅ 完成（见下「刀2 已完成」）
  ├─ 刀3  UDP 直播硬化（quic-stream fallback + 吞吐压测 + MSS/MTU）  ✅ 完成 + 真出口 acceptance（见下「刀3」）
  ├─ 刀3.5 高码率 UDP（quinn 插桩 + CC 调优）  ✅ 完成 + 真出口 acceptance（见下「刀3.5」）；纠偏：5.3M「天花板」实为链路 cap 假象
- ├─ 刀4  连接成功率（拦截加密 DNS DoT/DoH/DoQ/DoH3）  ✅ 代码完成，acceptance 待跑（见下「刀4」）；拦全:53 + first-SYN 见下
+ ├─ 刀4  连接成功率（拦截加密 DNS DoT/DoH/DoQ/DoH3）  ✅ 完成 + 真出口 acceptance（见下「刀4」）；first-SYN 已确认 knife2 修复、关闭
  └─ 刀5  ?（拦全:53 裸包劫持 / first-SYN 复现才修 / 正交线 A REALITY）  ← 下一刀（按 acceptance 与优先级定）
 
 正交线（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）
@@ -187,9 +187,12 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
   （HANDOFF 原条目疑陈旧）→ 仅 acceptance 探针验证(`curl rc=7≈0`)，复现才回头查。
 - **harness Block 端到端**：harness 连固定 TARGET_IP、FakeIpPool 不可注入 DoH 映射 → 降级 acceptance（Block 决策已全分支单测）。
 
-**真出口 acceptance：待跑**（需用户 env + 深圳测试机，配方见 findings 末节「刀4」）：
-浏览器开 DoH → 看 `🛡️ 阻断加密 DNS` 命中 + 网页正常(回落明文+fake-IP) + first-SYN 探针 `rc=7≈0`。
-acceptance 校准 DoH 名单后,刀4 即收官。
+**真出口 acceptance ✅（2026-06-18，深圳测试机）**：
+- **K4-A DoH 拦截**：Chrome 开「安全 DNS=Cloudflare」→ `🛡️ 阻断加密 DNS cloudflare-dns.com(@fake-IP:443) → RST` 命中
+  (域名识别经 fake-IP 真生效)→ 浏览器回落明文 → fake-IP → 正常上网。
+- **K4-C 回归**：DoH 关 → 明文 DNS 健康(FB/IG/YT 全 `🪪→fake-IP`)、无误伤。
+- **K4-D first-SYN**：探针 375 总 / rc=7=**0** → 竞态不复现、**确认 knife2 已修**(HANDOFF 原条目陈旧、关闭)。
+- 小改：TCP block 日志显**解析域名**(便于核对/调名单)。**→ 刀4 完成**（代码+单测+ADR-0006+acceptance）。
 
 ## Rhythm（每刀都遵守）
 
