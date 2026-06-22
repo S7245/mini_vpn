@@ -5,8 +5,12 @@ A learning-oriented VPN: a local client intercepts traffic through a TUN device 
 ## Language
 
 **Upstream**:
-The remote proxy/relay server the client tunnels through (e.g. the US server). The client establishes the TLS + Yamux connection to it.
+The remote proxy/relay server the client tunnels through (e.g. the US server). The client reaches it over a **Transport**, and the Upstream connects out to the Target on the client's behalf.
 _Avoid_: relay-server, gateway (when meaning the proxy box)
+
+**Transport**:
+How the client carries its tunnel to the **Upstream**. Today: **TUIC over QUIC** (the data plane — TCP relay streams plus a UDP datagram plane). A second transport, **VLESS over REALITY over TCP**, is the anti-censorship fallback for when QUIC is degraded or blocked.
+_Avoid_: protocol (overloaded), connection (a transport can span reconnects)
 
 **Target**:
 The final `IP:port` an intercepted connection wants to reach (e.g. a website). On the TUN path it is extracted from smoltcp's `local_endpoint()`. The Upstream connects out to the Target.
@@ -44,11 +48,20 @@ _Avoid_: "stream mode" alone (ambiguous with TCP relay streams); "datagram fallb
 DNS carried inside an encrypted transport so it cannot be intercepted as plaintext: **DoH** (DNS-over-HTTPS, TCP :443), **DoT** (DNS-over-TLS, TCP :853), **DoQ** (DNS-over-QUIC, UDP :853), **DoH3** (DoH over HTTP/3, QUIC UDP :443). It **bypasses the fake-IP map** — the app gets a real address and connects directly, defeating fake-IP routing. The client therefore **blocks** known encrypted-DNS endpoints (by port for :853, by resolved domain or destination IP for :443) to force the app to fall back to plaintext DNS, which is then forged into a **fake-IP**. The plaintext fallback is intercepted **regardless of which resolver the app targets**, so fake-IP routing does not depend on the system DNS pointing at the client's resolver.
 _Avoid_: "DNS leak" (that is the symptom — a real IP escaping interception; encrypted DNS is one cause)
 
+**VLESS**:
+A lightweight, stateless proxy protocol that frames one relay request (UUID auth + command + **Target** address) over an already-encrypted stream; it carries no transport security of its own — it relies on the **Transport** beneath it (here, **REALITY**).
+_Avoid_: VMess (its heavier, crypto-carrying predecessor)
+
+**REALITY**:
+A TLS-camouflage **Transport** that hides its authentication inside a genuine TLS 1.3 handshake aimed at a borrowed real site, so a network observer sees ordinary HTTPS; an unauthenticated peer (including an active prober) is transparently forwarded to the real site. Carries **VLESS** as the censorship-resistant alternative to TUIC-over-QUIC, over TCP.
+_Avoid_: "TLS proxy" (the whole point is to be indistinguishable from a non-proxy)
+
 ## Relationships
 
-- The client opens one **Upstream** connection and multiplexes many intercepted sessions over it (Yamux substreams).
+- The client reaches one **Upstream** over a **Transport** and multiplexes many intercepted TCP sessions over it (one relay stream per session).
 - Each intercepted session carries exactly one **Target**; the **Upstream** dials that **Target**.
-- UDP relay rides a second transport to the same **Upstream** — a QUIC datagram data plane — where many **UDP flows** are multiplexed by **flow-id** (no per-flow stream).
+- UDP relay rides the QUIC datagram plane of the TUIC **Transport** — many **UDP flows** multiplexed by **flow-id** (no per-flow stream).
+- The same **Upstream** may be reachable over more than one **Transport** (TUIC-over-QUIC, or VLESS+REALITY-over-TCP) — same destination, different camouflage. **REALITY is TCP-only**; UDP stays on the QUIC datagram plane.
 
 ## Flagged ambiguities
 
