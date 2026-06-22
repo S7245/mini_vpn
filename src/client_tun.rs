@@ -139,9 +139,6 @@ const MAX_TOTAL_LISTENERS: usize = 4096;
 /// 避免「所有槽都 Relaying 时新 SYN 无 socket 可握手 → SYN 退避重传 stall」。
 const MIN_SPARE_LISTENERS: usize = 2;
 
-/// fake-IP DNS resolver 地址：去往它的 :53 UDP 走本地 fake-IP 应答，不进 UDP relay。
-const FAKE_DNS_RESOLVER: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
-
 /// fake-IP 映射回收 TTL（秒）：idle 且 refcount==0 超此时长才回收。
 /// 中文要点：远大于 DNS A 记录 TTL（5s）。review #4：取 30min（而非 300s），给「应用已解析并缓存
 /// fake-IP、但尚未发起连接」留足窗口——这段 refcount==0，过早回收会让后续用缓存 IP 的连接被 Refuse。
@@ -1198,7 +1195,7 @@ fn spawn_remote_relay(
 /// rx 热路径分流结果。
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Inbound {
-    /// 去往 fake-IP DNS resolver 的 UDP/53 —— 交给 smoltcp（本地 fake-IP 应答）。
+    /// 任意 resolver 的明文 UDP/53 —— 走裸包 DNS 劫持（本地伪造 fake-IP，绕过 smoltcp，见 ADR-0007）。
     Dns,
     /// 其它 UDP —— 走裸包 UDP relay（绕过 smoltcp）。
     UdpRelay,
@@ -1206,16 +1203,12 @@ enum Inbound {
     Other,
 }
 
-/// 给一个入站裸 IP 包分类（见 stage-12 spec 的 D1 规则）。
+/// 给一个入站裸 IP 包分类（见 stage-12 spec 的 D1 规则；刀5 起任意 :53 → Dns）。
 fn classify_inbound(pkt: &[u8]) -> Inbound {
     match parse_inbound_udp(pkt) {
-        Some(udp) => {
-            if udp.dst_ip == FAKE_DNS_RESOLVER && udp.dst_port == 53 {
-                Inbound::Dns
-            } else {
-                Inbound::UdpRelay
-            }
-        }
+        // 刀5：任意 resolver 的明文 :53 → Dns（裸包伪造 fake-IP，不依赖系统 DNS 指向 198.18.0.1）。
+        Some(udp) if udp.dst_port == 53 => Inbound::Dns,
+        Some(_) => Inbound::UdpRelay,
         None => Inbound::Other,
     }
 }
@@ -1554,15 +1547,19 @@ mod tests {
         v
     }
 
+    /// 刀5：classify_inbound 把**任意** :53 路由到 Dns（裸包伪造），:853/:443 仍走 UdpRelay。
     #[test]
     fn classify_routes_dns_relay_and_other() {
+        // 任意 resolver 的 :53 → Dns（不再只限 198.18.0.1）。
         assert_eq!(classify_inbound(&udp_pkt([198, 18, 0, 1], 53)), Inbound::Dns);
+        assert_eq!(classify_inbound(&udp_pkt([8, 8, 8, 8], 53)), Inbound::Dns);
+        assert_eq!(classify_inbound(&udp_pkt([1, 1, 1, 1], 53)), Inbound::Dns);
+        // 其它 UDP（含 DoT/DoQ :853、DoH3/视频 :443）→ UdpRelay（刀4 Block 由 resolve_target 判）。
         assert_eq!(
             classify_inbound(&udp_pkt([198, 18, 0, 5], 443)),
             Inbound::UdpRelay
         );
-        // UDP/53 到非 fake-resolver 仍走 relay（D1：只本地应答 198.18.0.1:53）。
-        assert_eq!(classify_inbound(&udp_pkt([8, 8, 8, 8], 53)), Inbound::UdpRelay);
+        assert_eq!(classify_inbound(&udp_pkt([1, 1, 1, 1], 853)), Inbound::UdpRelay);
         // TCP SYN / 垃圾 → Other。
         let pkt = build_ipv4_tcp([10, 0, 0, 1], [1, 1, 1, 1], 60000, 443, true, false);
         assert_eq!(classify_inbound(&pkt), Inbound::Other);
