@@ -5,9 +5,10 @@
 # 用法（凭据先 export，见下）：
 #   构建：      cargo build --release            # (在 repo 根，无需 sudo)
 #   iperf3 配置：sudo -E bash scripts/knife35-acceptance.sh start <cc> <mode>   # cc=bbr|cubic mode=native|quic
-#   全局 soak： sudo -E bash scripts/knife35-acceptance.sh soak [cc]            # 默认 cubic；设 DNS+/15 路由
+#   全局 soak： sudo -E bash scripts/knife35-acceptance.sh soak [cc]            # 默认 cubic；DNS=198.18.0.1+/15 路由
+#   刀5 soak： sudo -E bash scripts/knife35-acceptance.sh soak-knife5 [cc]      # DNS=8.8.8.8(非我方 resolver)+路由进 TUN
 #   停 iperf3： sudo -E bash scripts/knife35-acceptance.sh stop
-#   停 soak：   sudo -E bash scripts/knife35-acceptance.sh soak-stop            # 自动还原 DNS
+#   停 soak：   sudo -E bash scripts/knife35-acceptance.sh soak-stop            # 自动还原 DNS（soak / soak-knife5 通用）
 #
 # 凭据 export（向项目负责人要，勿入库）：
 #   export MINI_VPN_TUIC_SERVER=47.251.188.205:8443
@@ -26,6 +27,8 @@ LOG=/tmp/mvpn_accept.log
 TARGET="${IPERF_TARGET:-43.110.37.170}"
 FAKE_DNS=198.18.0.1
 FAKE_NET=198.18.0.0/15
+# 刀5 acceptance：把系统 DNS 设成"非我方 resolver"，验证任意 :53 仍被本地劫持伪造。可 K5_RES 覆盖。
+K5_RES="${K5_RES:-8.8.8.8}"
 DNS_SAVE=/tmp/mvpn_prior_dns.txt
 ACTION="${1:-}"
 
@@ -55,6 +58,7 @@ soak_stop() {
   pkill -f "mini_vpn client-tun" 2>/dev/null
   route -n delete -net "$FAKE_NET" >/dev/null 2>&1
   route -n delete -host "$TARGET" >/dev/null 2>&1
+  route -n delete -host "$K5_RES" >/dev/null 2>&1   # 刀5：清掉 alt-resolver host 路由（soak-knife5 用）
   sleep 1
   echo "soak stopped + /15 route removed + DNS restored"
 }
@@ -62,11 +66,15 @@ soak_stop() {
 case "$ACTION" in
   stop)      stop; exit 0 ;;
   soak-stop) soak_stop; exit 0 ;;
-  start|soak) ;;
-  *) echo "usage: $0 {start <cc> <mode> | soak [cc] | stop | soak-stop}"; exit 2 ;;
+  start|soak|soak-knife5) ;;
+  *) echo "usage: $0 {start <cc> <mode> | soak [cc] | soak-knife5 [cc] | stop | soak-stop}"; exit 2 ;;
 esac
 
-if [ "$ACTION" = "soak" ]; then CC="${2:-cubic}"; MODE="native"; else CC="${2:-bbr}"; MODE="${3:-native}"; fi
+if [ "$ACTION" = "soak" ] || [ "$ACTION" = "soak-knife5" ]; then
+  CC="${2:-cubic}"; MODE="native"
+else
+  CC="${2:-bbr}"; MODE="${3:-native}"
+fi
 
 [ -x "$BIN" ] || { echo "!! 未找到 release binary: $BIN（先 'cargo build --release'）"; exit 1; }
 
@@ -101,13 +109,28 @@ UTUN="$(comm -13 <(echo "$BEFORE") <(echo "$AFTER") | head -1)"
 [ -z "$UTUN" ] && { echo "!! no new utun detected (BEFORE=[$BEFORE] AFTER=[$AFTER])"; exit 1; }
 
 # 6. 路由
-if [ "$ACTION" = "soak" ]; then
+if [ "$ACTION" = "soak" ] || [ "$ACTION" = "soak-knife5" ]; then
   SVC="$(detect_netsvc)"
   route -n add -net "$FAKE_NET" -interface "$UTUN" >/dev/null 2>&1 \
     && echo "route ${FAKE_NET} -> ${UTUN} OK" || echo "!! /15 route add failed"
   networksetup -getdnsservers "$SVC" 2>/dev/null > "$DNS_SAVE"
-  networksetup -setdnsservers "$SVC" "$FAKE_DNS" \
-    && echo "DNS(${SVC}) -> ${FAKE_DNS} (saved=${DNS_SAVE}; soak-stop auto-reverts)"
+  if [ "$ACTION" = "soak-knife5" ]; then
+    # 刀5：系统 DNS 设成 alt-resolver（非 198.18.0.1），并把该 resolver 路由进 TUN，
+    # 验证任意 :53 仍被劫持伪造 fake-IP（不依赖系统 DNS 指向我方 resolver，见 ADR-0007）。
+    route -n add -host "$K5_RES" -interface "$UTUN" >/dev/null 2>&1 \
+      && echo "route ${K5_RES} -> ${UTUN} OK (alt-resolver into TUN)" \
+      || echo "!! alt-resolver route add failed"
+    networksetup -setdnsservers "$SVC" "$K5_RES" \
+      && echo "DNS(${SVC}) -> ${K5_RES} (NOT 198.18.0.1; saved=${DNS_SAVE}; soak-stop auto-reverts)"
+    echo "---- 刀5 验证（另开终端跑；判据见 plan T-DNS）----"
+    echo "  dig @${K5_RES} example.com +short       # 期望 198.18.x.x（fake-IP，非真实 IP）"
+    echo "  dig +tcp @${K5_RES} example.com +short  # 期望 超时/拒绝（TCP :53 被 RST）"
+    echo "  curl -sS -o /dev/null -w '%{http_code}\\n' https://example.com  # 期望 200/301（经隧道）"
+    echo "  grep '🪪 DNS' ${LOG}                     # 期望 见 example.com → fake-IP"
+  else
+    networksetup -setdnsservers "$SVC" "$FAKE_DNS" \
+      && echo "DNS(${SVC}) -> ${FAKE_DNS} (saved=${DNS_SAVE}; soak-stop auto-reverts)"
+  fi
 else
   route -n add -host "$TARGET" -interface "$UTUN" >/dev/null 2>&1 \
     && echo "route ${TARGET} -> ${UTUN} OK" || echo "!! route add failed"
