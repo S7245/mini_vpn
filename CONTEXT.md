@@ -21,7 +21,7 @@ A placeholder IPv4 from the `198.18.0.0/15` range handed back to an application 
 _Avoid_: virtual IP, proxy IP (fake-IP is the precise term, matching Clash's fake-ip mode)
 
 **fake-IP map**:
-The client-held bidirectional table `domain ↔ fake-IP`. Populated when forging a DNS response; read ("resolve") when an intercepted TCP SYN's destination falls in the fake-IP range, to recover the domain for the relay request.
+The client-held bidirectional table `domain ↔ fake-IP`. Populated when the client intercepts a plaintext DNS query — sent to **any** resolver — and forges a fake-IP response, so no plaintext query reaches a real resolver; read ("resolve") when an intercepted TCP SYN's destination falls in the fake-IP range, to recover the domain for the relay request.
 _Avoid_: dns cache (it is not a cache of real DNS answers)
 
 **UDP flow**:
@@ -41,7 +41,7 @@ How a TUIC `Packet` is carried over the **Upstream**'s QUIC connection. _native_
 _Avoid_: "stream mode" alone (ambiguous with TCP relay streams); "datagram fallback" (oversized-packet stream fallback is a separate, size-driven thing within _native_ mode)
 
 **Encrypted DNS** (DoH / DoT / DoQ / DoH3):
-DNS carried inside an encrypted transport so it cannot be intercepted as plaintext: **DoH** (DNS-over-HTTPS, TCP :443), **DoT** (DNS-over-TLS, TCP :853), **DoQ** (DNS-over-QUIC, UDP :853), **DoH3** (DoH over HTTP/3, QUIC UDP :443). It **bypasses the fake-IP map** — the app gets a real address and connects directly, defeating fake-IP routing. The client therefore **blocks** known encrypted-DNS endpoints (by port for :853, by resolved domain or destination IP for :443) to force the app to fall back to plaintext DNS, which is then forged into a **fake-IP**.
+DNS carried inside an encrypted transport so it cannot be intercepted as plaintext: **DoH** (DNS-over-HTTPS, TCP :443), **DoT** (DNS-over-TLS, TCP :853), **DoQ** (DNS-over-QUIC, UDP :853), **DoH3** (DoH over HTTP/3, QUIC UDP :443). It **bypasses the fake-IP map** — the app gets a real address and connects directly, defeating fake-IP routing. The client therefore **blocks** known encrypted-DNS endpoints (by port for :853, by resolved domain or destination IP for :443) to force the app to fall back to plaintext DNS, which is then forged into a **fake-IP**. The plaintext fallback is intercepted **regardless of which resolver the app targets**, so fake-IP routing does not depend on the system DNS pointing at the client's resolver.
 _Avoid_: "DNS leak" (that is the symptom — a real IP escaping interception; encrypted DNS is one cause)
 
 ## Relationships
