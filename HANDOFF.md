@@ -7,10 +7,14 @@
 - **Stage 13 + 刀1 + 刀2 + 刀3 + 刀3.5 + 刀4 全部已在 `main`**（`cd9ff62`，2026-06-18 fast-forward 合入，与 origin 同步）。
   数据面 = **client-only TUIC over quinn → sing-box**（ADR-0004）；UDP 默认 **native datagram + Cubic**（刀3.5）；
   **拦截加密 DNS** 逼回落明文 → fake-IP（刀4，ADR-0006）。
+- **刀5 完成（分支 `claude/knife5-dns-hijack`，从 main 起，逐 commit push；真出口 acceptance PASS；未合 main，待用户决定）**：
+  **拦全 :53 裸包 DNS 劫持**——任意 resolver(如 8.8.8.8:53)的明文查询都本地伪造 fake-IP(裸包构造,src=被查询的 resolver),
+  废 smoltcp DNS socket、统一一条路径,fake-IP 不再依赖系统 DNS 指向 198.18.0.1(ADR-0007)。见下「刀5 完成」。
 - **Stage 13 全部完成**：13a TCP via TUIC Connect ✅、13b UDP via TUIC Packet ✅、13c 按需 heartbeat（0-RTT 撞 quinn 0.10 墙、deferred）✅、13d 退役 legacy（删 yamux/自研 server/双轨开关/6 个依赖）✅。
 - **刀1/2/3/3.5 完成**（见下各「已完成」段）：并发压测 harness + 大并发优化（脏集合 + 弹性扩容 + fake-IP 回收）+ UDP 直播硬化（quic-stream 兜底 + 分片重组）+ 高码率 UDP（BBR/Cubic 可切 + quinn 插桩 + quic-relay-mode；**纠偏：刀3「5.3M datagram 天花板」实为链路 cap 假象**）。
-- **新 session 起点（下一刀）：直接从 `main`（`cd9ff62`）起新分支**。下一刀候选：拦全:53 裸包劫持（无缝 on/off 拼图）/
-  正交线 A REALITY 抗封锁 / 高带宽压测+数据面多线程（逼近 100M）——按优先级定。
+- **新 session 起点（下一刀）：刀5 合 main 后从 `main` 起新分支**（刀5 仍在分支 `claude/knife5-dns-hijack`，待用户合）。
+  拦全:53 已由刀5 达成。下一刀候选：正交线 A REALITY 抗封锁 / 高带宽压测+数据面多线程（逼近 100M）/
+  observability(DNS forge 计数、datagram drop 背压可观测)——按优先级定。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
 ## 目标（唯一北极星）：`Rules.md`
@@ -43,7 +47,8 @@
  ├─ 刀3  UDP 直播硬化（quic-stream fallback + 吞吐压测 + MSS/MTU）  ✅ 完成 + 真出口 acceptance（见下「刀3」）
  ├─ 刀3.5 高码率 UDP（quinn 插桩 + CC 调优）  ✅ 完成 + 真出口 acceptance（见下「刀3.5」）；纠偏：5.3M「天花板」实为链路 cap 假象
  ├─ 刀4  连接成功率（拦截加密 DNS DoT/DoH/DoQ/DoH3）  ✅ 完成 + 真出口 acceptance（见下「刀4」）；first-SYN 已确认 knife2 修复、关闭
- └─ 刀5  ?（拦全:53 裸包劫持 / first-SYN 复现才修 / 正交线 A REALITY）  ← 下一刀（按 acceptance 与优先级定）
+ ├─ 刀5  拦全:53 裸包 DNS 劫持（任意 resolver 明文→fake-IP，废 smoltcp DNS socket）  ✅ 完成 + 真出口 acceptance（见下「刀5」，ADR-0007）；未合 main
+ └─ 刀6  ?（正交线 A REALITY 抗封锁 / 高带宽多线程逼近 100M / DNS·datagram observability）  ← 下一刀（按优先级定）
 
 正交线（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）
  └─ A   VLESS+REALITY（TCP）+ 协议 auto-failover（TUIC→REALITY）
@@ -183,8 +188,8 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
 - **设计文档**：`docs/tech/2026-06-18-knife4-connect-success-{spec,plan}.md`；ADR `docs/adr/0006-block-encrypted-dns.md`。
 
 **deferred（grill 决策）**：
-- **拦全 :53**（任意 resolver 明文查询都伪造）→ 需**裸包 DNS 路径**(脱离 smoltcp socket，中等重构)；模型 a 下
-  系统 DNS=198.18.0.1 已覆盖明文 → defer 后续刀。**这是无缝 on/off 不依赖系统 DNS 的关键拼图**(配合前端 NE)。
+- ~~**拦全 :53**（任意 resolver 明文查询都伪造）~~ → ✅ **刀5 已做**（裸包 DNS 路径、废 smoltcp DNS socket、ADR-0007）；
+  无缝 on/off 不依赖系统 DNS 的关键拼图就位（配合前端 NE）。
 - **first-SYN-to-fresh-fake-IP refused**：静态分析表明已被 **knife2 同帧 `ensure_port`+`ensure_spare_listeners` 修**
   （HANDOFF 原条目疑陈旧）→ 仅 acceptance 探针验证(`curl rc=7≈0`)，复现才回头查。
 - **harness Block 端到端**：harness 连固定 TARGET_IP、FakeIpPool 不可注入 DoH 映射 → 降级 acceptance（Block 决策已全分支单测）。
@@ -195,6 +200,30 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
 - **K4-C 回归**：DoH 关 → 明文 DNS 健康(FB/IG/YT 全 `🪪→fake-IP`)、无误伤。
 - **K4-D first-SYN**：探针 375 总 / rc=7=**0** → 竞态不复现、**确认 knife2 已修**(HANDOFF 原条目陈旧、关闭)。
 - 小改：TCP block 日志显**解析域名**(便于核对/调名单)。**→ 刀4 完成**（代码+单测+ADR-0006+acceptance）。
+
+## 刀5 代码完成（2026-06-22）：拦全 :53 裸包 DNS 劫持
+
+**交付**（分支 `claude/knife5-dns-hijack`，从 main 起，逐 commit push；**未合 main，待用户决定**）：
+- **对症**：刀4 逼应用回落明文 DNS，但应用回落到的是**它自己配的 resolver**（如 `8.8.8.8:53`），非 198.18.0.1。
+  原 `classify_inbound` 仅伪造 `198.18.0.1:53`、其它 :53 隧道转发真 DNS → 真实 IP 绕过 fake-IP（仅"模型 a 系统 DNS=198.18.0.1"下不漏）。
+- **做法**（grill 4 裁决 + ADR-0007）：① **裸包**——`classify_inbound` 任意 `:53`→`Dns`，新 `forge_dns_reply`(纯)
+  伪造 fake-IP 回包(`src=被查询的 resolver`)，`handle_dns_hijack` 经 `inject_ip_packet`+`flush_tx` 注入（复用 UDP relay 下行机制，
+  smoltcp 无法为无界 resolver IP 设 src）。② **废 smoltcp DNS socket**——删 `dns_handle`/`bind`/接口 IP `198.18.0.1/32`/`drain_dns`/
+  `FAKE_DNS_RESOLVER`，统一一条裸包路径（含 198.18.0.1）。③ **全劫持**不按 dst 过滤。④ **TCP :53 → RST**：
+  `dns_block::is_dns_relay_port`(53||853) → `resolve_target` Block（不变量：UDP :53 已被 classify 截走 → port==53 只命中 TCP）。
+- **质量**：93 lib 测（含 forge_dns_reply 5 测）+ 6 harness 测绿、`clippy --all-targets --features harness` 0 warning、release build 绿。
+  `/code-review`(high effort,7 角度) **零正确性 bug**（独立追踪确认 UDP :53 永不到 resolve_target）；唯一动手=在 classify_inbound 标注 load-bearing 不变量。
+- **设计文档**：`docs/tech/2026-06-22-knife5-dns-hijack-{spec,plan}.md`；ADR `docs/adr/0007-hijack-all-plaintext-dns.md`；CONTEXT.md 词汇表更新。
+
+**真出口 acceptance ✅（2026-06-22，测试机，native+cubic 全局隧道，系统 DNS=8.8.8.8 非我方 resolver）**：
+- **K5-1 核心**：`dig @8.8.8.8 example.com` → `198.18.0.36`(fake-IP) → **系统 DNS≠198.18.0.1 时任意 :53 仍被劫持，北极星达成**。
+- **K5-2**：`dig +tcp @8.8.8.8` → connection reset、无 IP（TCP :53 RST，无 real-IP 泄漏）。
+- **K5-3**：`curl https://example.com` → HTTP/2 200（fake-IP→DomainPort→隧道）。
+- **K5-4**：google/github/cloudflare 全 fake-IP，零逃逸。**K5-5**：apple/icloud/google 等真实 app `🪪→fake-IP`。
+- **刀4↔刀5 闭环**：`dns.google` 明文解析→fake-IP，该 fake-IP:443 再命中刀4 DoH Block。
+- helper：`scripts/knife35-acceptance.sh soak-knife5`（DNS=8.8.8.8 + alt-resolver 路由进 TUN）。
+- **已知限制**（未触发）：split-horizon/内网域名走出口解析、exotic 多 question 查询丢弃(不泄漏)、IPv6 :53 不劫持(crate ipv4-only)。
+- **→ 刀5 完成**（代码+单测+ADR-0007+acceptance）。详见 findings 末节「刀5」。
 
 ## Rhythm（每刀都遵守）
 
@@ -220,3 +249,5 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
 - 启动：`sudo MINI_VPN_TUIC_* ./target/debug/mini_vpn client-tun`（13d 起 `MINI_VPN_UPSTREAM` 已删，恒 TUIC；`MINI_VPN_TUN_POOL_SIZE` 可调端口池）。
 - **刀3.5 新增旋钮**（非凭据，可入库默认；env 覆盖）：`MINI_VPN_TUIC_CC=bbr|cubic`（默认 bbr）、`MINI_VPN_TUIC_UDP_MODE=native|quic`（默认 native，acceptance gate 后可能翻 quic）。
 - 刀1 若走 mock-upstream 隔离压测，则**不需要** sing-box。
+- **刀5 acceptance**：`sudo -E bash scripts/knife35-acceptance.sh soak-knife5`（设系统 DNS=8.8.8.8 非我方 resolver + 路由进 TUN，
+  验证任意 :53 仍被劫持）；`soak-stop` 自动还原。`K5_RES` env 可换 alt-resolver。需同上 `MINI_VPN_TUIC_*` 凭据。
