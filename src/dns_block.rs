@@ -13,6 +13,14 @@ pub fn is_encrypted_dns_port(port: u16) -> bool {
     port == 853
 }
 
+/// 刀5:到达 `resolve_target` 的 DNS 端口都该 Block——`:53`(明文 DNS over **TCP**) + `:853`(DoT/DoQ)。
+/// 中文要点(ADR-0007):**不变量**——UDP :53 已被 `classify_inbound` 截到裸包劫持路径(本地伪造 fake-IP)、
+/// **不到** resolve_target,故此处 `port==53` 只命中 **TCP** :53(明文 DNS over TCP)→ RST 逼应用回落
+/// UDP :53(我方应答极小、永不触发 TC 截断,标准 stub 不升级 TCP)。:853 复用 `is_encrypted_dns_port`。
+pub fn is_dns_relay_port(port: u16) -> bool {
+    port == 53 || is_encrypted_dns_port(port)
+}
+
 /// 内置 DoH 域名名单(公认**专用** DoH 端点;取专用名以杜绝误伤正常服务)。
 /// 中文要点:`is_doh_domain` 子域规则已**自动覆盖** `*.<apex>`(如 `*.cloudflare-dns.com`),
 /// 故显式列子域(mozilla./chrome.)仅为自文档;新增同 apex 子域无需再列。名单尽力而非穷尽——
@@ -74,6 +82,17 @@ mod tests {
         assert!(is_encrypted_dns_port(853));
         for p in [53, 80, 443, 8443, 0, 65535] {
             assert!(!is_encrypted_dns_port(p), "port {p} 不应判为加密 DNS");
+        }
+    }
+
+    /// 刀5：到达 resolve_target 的 DNS 端口（TCP :53 明文 + DoT/DoQ :853）都应 Block。
+    /// mDNS :5353 / 普通端口不命中（绝不误伤）。
+    #[test]
+    fn dns_relay_port_covers_53_and_853() {
+        assert!(is_dns_relay_port(53));
+        assert!(is_dns_relay_port(853));
+        for p in [443, 80, 0, 65535, 5353, 8443] {
+            assert!(!is_dns_relay_port(p), "port {p} 不应判为 DNS relay 端口");
         }
     }
 

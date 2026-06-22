@@ -807,8 +807,9 @@ enum TargetResolve {
 /// 中文要点：fake-IP → 查表得域名 → DomainPort（出口解析、绕污染）；非 fake → IpPort
 /// （Stage 8/9 行为不变）；fake 但无映射 → Refuse（拒绝连接）。
 fn resolve_target(endpoint: smoltcp::wire::IpEndpoint, fake_pool: &FakeIpPool) -> TargetResolve {
-    // 刀4：加密 DNS 拦截(先于常规解析)。:853 = DoT/DoQ(任意 IP)→ Block。
-    if crate::dns_block::is_encrypted_dns_port(endpoint.port) {
+    // 刀4/刀5：DNS 端口拦截(先于常规解析)。:853 = DoT/DoQ(任意 IP)→ Block；
+    // :53 = TCP 明文 DNS(UDP :53 已被 classify 截到劫持路径、不到此)→ Block(RST 逼回落 UDP :53)。
+    if crate::dns_block::is_dns_relay_port(endpoint.port) {
         return TargetResolve::Block;
     }
     let std::net::IpAddr::V4(v4) = std::net::IpAddr::from(endpoint.addr) else {
@@ -1677,6 +1678,14 @@ mod tests {
         assert!(matches!(resolve_target(ep([1, 1, 1, 1], 853), &pool), TargetResolve::Block));
         assert!(matches!(
             resolve_target(ep([93, 184, 216, 34], 853), &pool),
+            TargetResolve::Block
+        ));
+
+        // 刀5：TCP :53（明文 DNS over TCP，任意 IP）→ Block（RST，逼回落 UDP :53）。
+        // 不变量：UDP :53 已被 classify_inbound 截到 Dns 路径、不到 resolve_target，故 port==53 只命中 TCP。
+        assert!(matches!(resolve_target(ep([8, 8, 8, 8], 53), &pool), TargetResolve::Block));
+        assert!(matches!(
+            resolve_target(ep([198, 18, 0, 1], 53), &pool),
             TargetResolve::Block
         ));
 
