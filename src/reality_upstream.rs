@@ -358,6 +358,9 @@ impl RealityUpstream {
             }
         })
         .await?;
+        // REALITY auth 决策已通过（drive 成功 ⟺ verify_server_cert==true；否则上面 `?` 已返回）。
+        // 这行是真出口 acceptance 的核心证据（**非** session_id echo 充数，见 ADR-0009/0010）。
+        println!("🔐 REALITY 握手成功（证书 HMAC 校验通过）→ {}", target.to_wire_string());
         // 5. 发 VLESS 请求（握手后第一条 app record，send_keys seq 0）。
         let vless = out.send_keys.seal(0x17, &encode_vless_request(&self.cfg.uuid, VLESS_CMD_TCP, target));
         stream.write_all(&vless).await.map_err(|e| ClientError::Reality(format!("写 VLESS 请求: {e}")))?;
