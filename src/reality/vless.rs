@@ -67,6 +67,11 @@ impl VlessResponseStripper {
         Self { stripped: false }
     }
 
+    /// 响应头是否已剥完（调用方据此短路：剥完后无需再过 staging）。
+    pub fn is_stripped(&self) -> bool {
+        self.stripped
+    }
+
     /// 尝试剥离响应头。返回 `true`=已剥完（`buf` 现为真数据，可放行）；`false`=头部未集齐（不消费 `buf`，等更多）。
     pub fn strip(&mut self, buf: &mut bytes::BytesMut) -> bool {
         if self.stripped {

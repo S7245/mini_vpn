@@ -75,8 +75,9 @@ impl RecordReader {
         Self { buf: BytesMut::with_capacity(4096) }
     }
 
-    /// 用握手阶段多读的残留字节初始化（RealityStream 接手时用——T8 接线后此 allow 移除）。
-    #[allow(dead_code)]
+    /// 用残留字节初始化 RecordReader（仅测试用：生产路径 RealityStream::new 直接把 leftover 塞 read_raw、
+    /// 走内联 decode_one，不经此构造器；保留它供单测续读，故 cfg(test) 门控，L6）。
+    #[cfg(test)]
     pub(crate) fn with_leftover(buf: BytesMut) -> Self {
         Self { buf }
     }

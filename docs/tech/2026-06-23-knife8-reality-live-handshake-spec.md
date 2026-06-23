@@ -28,6 +28,16 @@
 - 0x1302/0x1303 record/key schedule（ADR-0009 gap）。
 - Vision flow（已 defer，空 flow）。
 - 标准 CertificateVerify 验签（本刀 defer，见 §2c）。
+- post-handshake KeyUpdate 密钥轮换（本刀 loud-fail，见 ADR-0010 gap；完整轮换留刀9）。
+
+### Code-review deferred（→ 刀9，本刀已止血/登记）
+- **M3 握手并发化**：`open_tcp` 现在主循环 inline await 跑完整握手（多 RTT），高并发下串行化、单连接握手延迟拖累
+  所有 flow（TUIC 因复用既有 QUIC 连接不暴露）。**本刀止血 = `open_tcp` 10s 超时**（H2，防慢/半开 server stall
+  整个事件循环）；**根治 = 把 connect+握手+发 VLESS 整体 spawn 出主循环、经 channel 交回 RelayStream**（类
+  `spawn_remote_relay`），属并发架构改造，留刀9（与 failover 一起）。
+- **L2 RealityStream relay 阶段缺 idle/读超时**：握手后的 relay 读无超时——server 不发够 VLESS 响应头 addons 或
+  发完后 hang 会让该 flow 的 relay task 永久 pending（仅占一个 spawned task + listener 槽，非忙等、非全局 stall；
+  威胁模型下 REALITY server 是用户自配出口）。根治 = relay 读 idle 超时，与 M3 同根，留刀9。
 
 ## 2. Grill 裁决（2026-06-23）
 

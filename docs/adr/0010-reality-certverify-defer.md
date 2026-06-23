@@ -48,3 +48,15 @@
 - 未来若要验 CertificateVerify：SPKI ed25519 pubkey 已由 `cert.rs::extract_ed25519_pubkey_and_sig` 提出可复用；
   需引 ed25519 verify 依赖 + 核对 SignatureScheme（ed25519 = `0x0807`，RFC 8446 §4.2.3）。
 - 不影响 ADR-0008（auth 仍在 session_id + 证书 HMAC）/ ADR-0009（cipher 0x1301）。
+
+## 刀8 收尾登记的 gap（code-review）
+
+- **post-handshake TLS1.3 KeyUpdate（RFC 8446 §4.6.3）未实现**：`RealityStream` 不保留 application traffic
+  secret，无法在收到 KeyUpdate 时把 server 发送密钥轮换到 `application_traffic_secret_N+1`。若静默丢弃该消息，
+  其后每条 server record 会用错密钥 AEAD 失败、看似随机断连。故 `decode_one` 对内层 `0x16`/msg `0x18`（KeyUpdate）
+  **显式 loud-fail**（`io::ErrorKind::Unsupported`），与 0x1302/0x1303 cipher gap 同纪律（显式拒绝而非静默误用）。
+  NewSessionTicket（msg `0x04`）等无密钥影响的 post-handshake 消息照常丢弃。完整 KeyUpdate 轮换（traffic secret
+  进 RealityStream + update-requested 时回发）留后续刀。长连接/大流量出口才可能触发；短连接 acceptance 不受影响。
+- **REALITY 握手要求 server flight 必含可校验的 Certificate**（H1 守卫）：`drive` 完成握手前强制 `verify_cert`
+  通过过一次 Certificate(0x0b)——否则只发 EE+Finished 的回落 decoy 会绕过 REALITY auth（server Finished MAC 仅
+  ECDHE 派生、与静态 pbk 无关，诚实 server 也算得对）。这是 REALITY「证书 HMAC 是唯一 auth 锚」的强制点。

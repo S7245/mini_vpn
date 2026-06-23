@@ -10,7 +10,7 @@ use crate::reality::auth::{
     x25519_shared_secret,
 };
 use crate::reality::cert::extract_ed25519_pubkey_and_sig;
-use crate::reality::client_hello::{AuthedClientHelloParams, build_authed_client_hello};
+use crate::reality::client_hello::{AuthedClientHelloParams, authed_session_id, build_authed_client_hello};
 use crate::reality::handshake::{self, HandshakeInput};
 use crate::reality::record::RecordKeys;
 use crate::reality::vless::{VLESS_CMD_TCP, VlessResponseStripper, encode_vless_request};
@@ -99,15 +99,45 @@ impl<R, W> RealityStream<R, W> {
             .recv_keys
             .open(&header, &payload)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        Ok(Some(match inner {
+        let decoded = match inner {
             0x17 => Decoded::Data(content),
-            0x15 => Decoded::Eof,
-            _ => Decoded::Drop, // 0x16 post-handshake / 未知 → 丢
-        }))
+            0x15 => {
+                // alert `[level, description]`：close_notify(1,0) → 干净 EOF；fatal/其它 → loud-fail（L1）。
+                // 不区分会把 server 主动拒绝/目标侧失败当正常关闭，返回不完整响应而无错误信号。
+                match (content.first().copied(), content.get(1).copied()) {
+                    (Some(1), Some(0)) => Decoded::Eof,
+                    (level, desc) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            format!("REALITY 收到 TLS alert level={level:?} desc={desc:?}（server 拒绝/错误）"),
+                        ));
+                    }
+                }
+            }
+            0x16 => {
+                // post-handshake handshake message：KeyUpdate(0x18) 会轮换 server 发送密钥——未实现轮换
+                // → **loud-fail**（M1），否则后续每条 record 必 bad-decrypt 断流且归因误导（看似随机断连）。
+                // NewSessionTicket(0x04)/其它无密钥影响 → 静默丢弃。
+                if content.first() == Some(&0x18) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "REALITY 收到 TLS1.3 KeyUpdate（密钥轮换未实现，留刀9）→ 断开（避免后续 record 静默 bad-decrypt）",
+                    ));
+                }
+                Decoded::Drop
+            }
+            _ => Decoded::Drop,
+        };
+        Ok(Some(decoded))
     }
 
     /// 吸收一条 app-data 内容：首读经 VLESS 响应头 strip（可跨 record 累积），剥完后转入 plaintext_out。
+    /// 中文要点（L7）：响应头剥完后短路直接入 plaintext_out，省每条 record 经 staging 的双拷贝。
     fn absorb_app(&mut self, content: &[u8]) {
+        if self.resp.is_stripped() {
+            self.plaintext_out.extend_from_slice(content);
+            return;
+        }
         self.staging.extend_from_slice(content);
         if self.resp.strip(&mut self.staging) {
             self.plaintext_out.extend_from_slice(&self.staging);
@@ -164,7 +194,15 @@ impl<R: AsyncRead + Unpin, W: Unpin> AsyncRead for RealityStream<R, W> {
                 Poll::Ready(Ok(())) => {
                     let filled = rb.filled();
                     if filled.is_empty() {
-                        return Poll::Ready(Ok(())); // EOF
+                        // 底层 EOF。read_raw 空（裸 FIN 在 record 边界）→ 干净 EOF；非空（半条 record 残留）→
+                        // 截断（M4，RFC 8446 §6.1）。与 RecordReader::next 截断纪律对齐，不静默丢字节。
+                        if this.read_raw.is_empty() {
+                            return Poll::Ready(Ok(()));
+                        }
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "REALITY 流在 record 中途被截断",
+                        )));
                     }
                     this.read_raw.extend_from_slice(filled);
                 }
@@ -344,7 +382,7 @@ impl RealityUpstream {
             short_id: self.cfg.short_id,
             timestamp,
         });
-        let expected_session_id = ch[39..71].to_vec();
+        let expected_session_id = authed_session_id(&ch).to_vec();
         // 4. 跑握手，注入 verify_server_cert 做 REALITY auth 决策。
         let input = HandshakeInput { client_hello: ch, client_eph_secret: sk_c, expected_session_id };
         let mut out = handshake::drive(stream, input, move |cert_msg| {
@@ -369,13 +407,22 @@ impl RealityUpstream {
     }
 }
 
+/// REALITY connect + 握手超时（H2 止血）。`run_event_loop` 是单任务顺序循环，`open_tcp` 在主循环 inline
+/// await——零超时下慢/半开 server 会 stall **整个**事件循环（所有 flow 饿死）。10s 封顶把它降级为单 flow 失败。
+/// 中文要点：根治（把握手 spawn 出主循环并发化）是 M3，留刀9；本超时是本刀止血。
+const REALITY_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+
 #[async_trait::async_trait]
 impl ProxyUpstream for RealityUpstream {
     async fn open_tcp(&self, target: &TargetAddr) -> Result<RelayStream, ClientError> {
-        let mut stream = TcpStream::connect(&self.cfg.server)
+        let timeout = std::time::Duration::from_secs(REALITY_HANDSHAKE_TIMEOUT_SECS);
+        let mut stream = tokio::time::timeout(timeout, TcpStream::connect(&self.cfg.server))
             .await
+            .map_err(|_| ClientError::Reality(format!("TCP 连 REALITY 出口 {} 超时", self.cfg.server)))?
             .map_err(|e| ClientError::Reality(format!("TCP 连 REALITY 出口 {} 失败: {e}", self.cfg.server)))?;
-        let out = self.establish(&mut stream, target).await?;
+        let out = tokio::time::timeout(timeout, self.establish(&mut stream, target))
+            .await
+            .map_err(|_| ClientError::Reality("REALITY 握手超时（慢/半开 server）".into()))??;
         // prod 用 into_split（lock-free 独立读写半），喂给同一套双向中继泵。
         let (rh, wh) = stream.into_split();
         Ok(Box::new(RealityStream::new(rh, wh, out.recv_keys, out.send_keys, out.leftover)))
@@ -751,5 +798,62 @@ mod tests {
         stream.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"split-record-payload", "半条 record 跨 read 重组");
         let _ = writer.await;
+    }
+
+    /// 构一个最小 RealityStream over duplex（test helper）。
+    fn mk_stream(rk: [u8; 16], iv: [u8; 12]) -> (
+        RealityStream<tokio::io::ReadHalf<tokio::io::DuplexStream>, tokio::io::WriteHalf<tokio::io::DuplexStream>>,
+        tokio::io::DuplexStream,
+    ) {
+        let (client_end, server_end) = tokio::io::duplex(4096);
+        let (cr, cw) = tokio::io::split(client_end);
+        let s = RealityStream::new(cr, cw, RecordKeys::new(&rk, &iv), RecordKeys::new(&[0x33; 16], &[0x44; 12]), BytesMut::new());
+        (s, server_end)
+    }
+
+    /// M1：post-handshake KeyUpdate(inner 0x16/msg 0x18) → loud-fail（而非静默 Drop 后 bad-decrypt 断流）。
+    #[tokio::test]
+    async fn realitystream_keyupdate_loud_fails() {
+        let (rk, iv) = ([0x11u8; 16], [0x22u8; 12]);
+        let (mut stream, mut srv_end) = mk_stream(rk, iv);
+        let mut srv = RecordKeys::new(&rk, &iv);
+        srv_end.write_all(&srv.seal(0x16, &[0x18, 0x00, 0x00, 0x01, 0x00])).await.unwrap(); // KeyUpdate
+        srv_end.flush().await.unwrap();
+        let mut b = [0u8; 8];
+        assert!(stream.read(&mut b).await.is_err(), "KeyUpdate → loud-fail（M1）");
+    }
+
+    /// L1：fatal alert → Err；close_notify → 干净 EOF（read 返回 0）。
+    #[tokio::test]
+    async fn realitystream_alert_distinguished() {
+        // fatal(2) handshake_failure(0x28) → Err。
+        let (rk, iv) = ([0x55u8; 16], [0x66u8; 12]);
+        let (mut s1, mut e1) = mk_stream(rk, iv);
+        let mut srv1 = RecordKeys::new(&rk, &iv);
+        e1.write_all(&srv1.seal(0x15, &[0x02, 0x28])).await.unwrap();
+        e1.flush().await.unwrap();
+        let mut b = [0u8; 4];
+        assert!(s1.read(&mut b).await.is_err(), "fatal alert → Err（L1）");
+
+        // close_notify(1,0) → 干净 EOF。
+        let (mut s2, mut e2) = mk_stream(rk, iv);
+        let mut srv2 = RecordKeys::new(&rk, &iv);
+        e2.write_all(&srv2.seal(0x15, &[0x01, 0x00])).await.unwrap();
+        e2.flush().await.unwrap();
+        drop(e2);
+        let mut b2 = [0u8; 4];
+        assert_eq!(s2.read(&mut b2).await.unwrap(), 0, "close_notify → 干净 EOF");
+    }
+
+    /// M4：半条 record + 裸 FIN → 截断 Err（不静默丢字节/不伪装干净 EOF）。
+    #[tokio::test]
+    async fn realitystream_truncated_record_errs() {
+        let (rk, iv) = ([0x77u8; 16], [0x88u8; 12]);
+        let (mut stream, mut srv_end) = mk_stream(rk, iv);
+        srv_end.write_all(&[0x17, 0x03, 0x03]).await.unwrap(); // 只发 record 头的一部分
+        srv_end.flush().await.unwrap();
+        drop(srv_end); // FIN
+        let mut b = [0u8; 4];
+        assert!(stream.read(&mut b).await.is_err(), "半条 record + FIN → 截断 Err（M4）");
     }
 }

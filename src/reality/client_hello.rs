@@ -15,6 +15,12 @@ const GREASE: u16 = 0x0a0a;
 const SESSION_ID_OFFSET: usize = 39;
 const SESSION_ID_LEN: usize = 32;
 
+/// 取 ClientHello message 里的 session_id 区（REALITY=32B sealed 值），供握手层 SH echo 一致性检查复用，
+/// 避免调用方裸抄 `[39..71]` 魔数（L4，单一布局事实源）。
+pub(crate) fn authed_session_id(client_hello: &[u8]) -> &[u8] {
+    &client_hello[SESSION_ID_OFFSET..SESSION_ID_OFFSET + SESSION_ID_LEN]
+}
+
 /// Chrome 风 cipher 列表（GREASE 头）。**TLS1.3 仅 offer 0x1301**（刀8 grill 裁决 f，ADR-0009 修订）：
 /// 删 0x1302/0x1303，使任何合规借用站被 RFC 8446 §9.1 强制只能回 0x1301（唯一交集），根除 0x1302 decoy
 /// loud-fail（我方 schedule/record 硬编 SHA-256/AES-128，完成不了 0x1302/0x1303）。代价：偏离 Chrome 真实

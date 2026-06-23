@@ -1194,6 +1194,10 @@ fn spawn_remote_relay(
                 }
             }
         }
+        // M2：关流前 shutdown——驱动 poll_shutdown 排空应用层缓冲（RealityStream 的 write_pending 尾部密文）
+        // + 底层发 FIN；否则 best-effort poll_write 残留的 TLS app-record 尾部密文随 drop 丢弃 → 对端 AEAD
+        // 停在 record 中途 + 收到提前 FIN（bad-decrypt / 被 REALITY 当异常流量）。对 TUIC 也是干净 finish。
+        let _ = stream.shutdown().await;
     });
 }
 
