@@ -11,10 +11,22 @@ use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 
 /// 握手阶段密钥材料（TLS_AES_128_GCM_SHA256：key 16B / iv 12B）。
-/// 中文要点：secret 字段留给刀8 算 Finished（`compute_finished_verify_data`）；key/iv 给 record 层 open/seal。
+/// 中文要点：`*_hs_secret` 留给刀8 算 Finished（`compute_finished_verify_data`）；`handshake_secret` 留给刀8
+/// 派生 application keys（`derive_application_keys`）；key/iv 给 record 层 open/seal。
 pub struct HsKeys {
+    pub handshake_secret: [u8; 32],
     pub c_hs_secret: [u8; 32],
     pub s_hs_secret: [u8; 32],
+    pub client_key: [u8; 16],
+    pub server_key: [u8; 16],
+    pub client_iv: [u8; 12],
+    pub server_iv: [u8; 12],
+}
+
+/// application 阶段密钥材料（握手完成后）。
+pub struct AppKeys {
+    pub c_ap_secret: [u8; 32],
+    pub s_ap_secret: [u8; 32],
     pub client_key: [u8; 16],
     pub server_key: [u8; 16],
     pub client_iv: [u8; 12],
@@ -48,9 +60,31 @@ pub fn derive_handshake_keys(
         server_key: to16(expand_label(&s_hs, "key", b"", 16)),
         client_iv: to12(expand_label(&c_hs, "iv", b"", 12)),
         server_iv: to12(expand_label(&s_hs, "iv", b"", 12)),
+        handshake_secret: handshake,
         c_hs_secret: c_hs,
         s_hs_secret: s_hs,
     })
+}
+
+/// 派生 application 阶段密钥（RFC 8446 §7.1，握手完成后）：
+/// derived2 = Derive-Secret(handshake_secret,"derived","")；Master = Extract(derived2, 0)；
+/// {c,s}_ap_traffic = Derive-Secret(Master, "c/s ap traffic", transcript_hash(CH..serverFinished))；key/iv 同 hs。
+/// 中文要点（刀8 用）：server Finished 验证通过后调本函数；`transcript_hash` = hash(CH..serverFinished)。
+pub fn derive_application_keys(handshake_secret: &[u8; 32], transcript_ch_sfin: &[u8; 32]) -> AppKeys {
+    let derived2 = derive_secret(handshake_secret, "derived", &transcript_hash(&[]));
+    let master = extract(&derived2, &[0u8; 32]);
+    let c_ap = derive_secret(&master, "c ap traffic", transcript_ch_sfin);
+    let s_ap = derive_secret(&master, "s ap traffic", transcript_ch_sfin);
+    let to16 = |v: Vec<u8>| -> [u8; 16] { v.try_into().expect("key 16B") };
+    let to12 = |v: Vec<u8>| -> [u8; 12] { v.try_into().expect("iv 12B") };
+    AppKeys {
+        client_key: to16(expand_label(&c_ap, "key", b"", 16)),
+        server_key: to16(expand_label(&s_ap, "key", b"", 16)),
+        client_iv: to12(expand_label(&c_ap, "iv", b"", 12)),
+        server_iv: to12(expand_label(&s_ap, "iv", b"", 12)),
+        c_ap_secret: c_ap,
+        s_ap_secret: s_ap,
+    }
 }
 
 /// HkdfLabel 编码（RFC 8446 §7.1）：`length(u16) || u8len("tls13 "+label) || u8len(context)+context`。
@@ -244,6 +278,63 @@ mod tests {
             compute_finished_verify_data(&s_hs, &th),
             arr32("9b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718"),
             "server Finished verify_data（RFC 8448 §3 真值）"
+        );
+    }
+
+    /// T7：handshake_secret 经 HsKeys 透出（刀8 派生 app keys 要用）。
+    #[test]
+    fn rfc8448_handshake_secret_exposed() {
+        let ks = derive_handshake_keys(&arr32(RFC8448_ECDHE), &hex(RFC8448_CH), &hex(RFC8448_SH))
+            .unwrap();
+        assert_eq!(
+            ks.handshake_secret,
+            arr32("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac")
+        );
+    }
+
+    /// T7：application 阶段密钥（RFC 8448 §3 KAT）。transcript = hash(CH..serverFinished)。
+    #[test]
+    fn rfc8448_application_keys() {
+        // 先复算 handshake_secret。
+        let ks = derive_handshake_keys(&arr32(RFC8448_ECDHE), &hex(RFC8448_CH), &hex(RFC8448_SH))
+            .unwrap();
+        // master = Extract(Derive-Secret(handshake,"derived",""), 0) —— 中间值 KAT，便于定位。
+        let derived2 = derive_secret(&ks.handshake_secret, "derived", &transcript_hash(&[]));
+        assert_eq!(
+            derived2,
+            arr32("43de77e0c77713859a944db9db2590b53190a65b3ee2e4f12dd7a0bb7ce254b4"),
+            "derived2"
+        );
+        assert_eq!(
+            extract(&derived2, &[0u8; 32]),
+            arr32("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919"),
+            "Master Secret"
+        );
+        // app 阶段 transcript = hash(CH || SH || EE || Cert || CertVerify || serverFinished)。
+        let sfin = hex("14000020 9b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718");
+        let th = transcript_hash(&[
+            &hex(RFC8448_CH),
+            &hex(RFC8448_SH),
+            &hex(RFC8448_EE),
+            &hex(RFC8448_CERT),
+            &hex(RFC8448_CV),
+            &sfin,
+        ]);
+        assert_eq!(
+            th,
+            arr32("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13"),
+            "transcript_hash(CH..serverFinished)"
+        );
+        let ap = derive_application_keys(&ks.handshake_secret, &th);
+        assert_eq!(
+            ap.c_ap_secret,
+            arr32("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5"),
+            "client_application_traffic_secret_0"
+        );
+        assert_eq!(
+            ap.s_ap_secret,
+            arr32("a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643"),
+            "server_application_traffic_secret_0"
         );
     }
 }
