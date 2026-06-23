@@ -11,8 +11,11 @@
   （刀5，ADR-0007）。见下「刀5 完成」。
 - **Stage 13 全部完成**：13a TCP via TUIC Connect ✅、13b UDP via TUIC Packet ✅、13c 按需 heartbeat（0-RTT 撞 quinn 0.10 墙、deferred）✅、13d 退役 legacy（删 yamux/自研 server/双轨开关/6 个依赖）✅。
 - **刀1/2/3/3.5 完成**（见下各「已完成」段）：并发压测 harness + 大并发优化（脏集合 + 弹性扩容 + fake-IP 回收）+ UDP 直播硬化（quic-stream 兜底 + 分片重组）+ 高码率 UDP（BBR/Cubic 可切 + quinn 插桩 + quic-relay-mode；**纠偏：刀3「5.3M datagram 天花板」实为链路 cap 假象**）。
-- **新 session 起点（下一刀）：直接从 `main`（`e589767`）起新分支**。拦全:53 已由刀5 达成。
-  下一刀候选：正交线 A REALITY 抗封锁 / 高带宽压测+数据面多线程（逼近 100M）/
+- **刀6 进行中（分支 `claude/knife6-reality-transport`，从 main 起，未合 main）**：正交线 A REALITY 第二 Transport
+  的**第一片**——离线 auth 密码学 + TLS 1.3 ClientHello（手写，ADR-0008）。REALITY 是 2–3 刀 mini-project（刀6→刀9，见上）。
+  **下一刀=刀7**（从 `claude/knife6-reality-transport` 续，或刀6 合 main 后从 main 起）：ServerHello+key schedule+record。
+- **新 session 起点（若开主线而非续 REALITY）：从 `main`（`e589767`）起新分支**。拦全:53 已由刀5 达成。
+  主线下一候选：高带宽压测+数据面多线程（逼近 100M）/
   observability(DNS forge 计数、datagram drop 背压可观测)——按优先级定。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
@@ -47,10 +50,13 @@
  ├─ 刀3.5 高码率 UDP（quinn 插桩 + CC 调优）  ✅ 完成 + 真出口 acceptance（见下「刀3.5」）；纠偏：5.3M「天花板」实为链路 cap 假象
  ├─ 刀4  连接成功率（拦截加密 DNS DoT/DoH/DoQ/DoH3）  ✅ 完成 + 真出口 acceptance（见下「刀4」）；first-SYN 已确认 knife2 修复、关闭
  ├─ 刀5  拦全:53 裸包 DNS 劫持（任意 resolver 明文→fake-IP，废 smoltcp DNS socket）  ✅ 完成 + 真出口 acceptance（见下「刀5」，ADR-0007）；已合 main
- └─ 刀6  ?（正交线 A REALITY 抗封锁 / 高带宽多线程逼近 100M / DNS·datagram observability）  ← 下一刀（按优先级定）
+ └─ （主线下一候选）高带宽多线程逼近 100M / DNS·datagram observability
 
-正交线（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）
- └─ A   VLESS+REALITY（TCP）+ 协议 auto-failover（TUIC→REALITY）
+正交线 A（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）= VLESS+REALITY 第二 Transport（手写 TLS 1.3，ADR-0008）
+ ├─ 刀6  REALITY auth 密码学 + TLS 1.3 ClientHello 构造（sans-IO，100% 离线 TDD）  ✅ 完成（见下「刀6」）；未合 main
+ ├─ 刀7  ServerHello 解析 + TLS 1.3 key schedule（RFC 8448 向量）+ record-layer AEAD  ← REALITY 下一片
+ ├─ 刀8  server-flight 解密 + HMAC 证书校验 + client Finished + 实 TCP 握手 + VLESS 帧 + RealityUpstream(ProxyUpstream) + env 选择器 + 真出口 acceptance
+ └─ 刀9  auto-failover（健康感知 TUIC↔REALITY；分离 TCP/UDP 上游；UDP 留 QUIC）
 ```
 - 优先级与关联：**fake-IP 池回收**属"大并发长稳"（并入刀2）；**DoH 拦截**是"真实场景能连上"的前置（刀4，可视情提前——真机浏览器场景不修则 fake-IP 形同虚设）。**A（REALITY）正交**：当前 QUIC 能连，不阻塞三目标达标；TCP-based，替代不了 UDP 直播。
 
@@ -223,6 +229,16 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
 - helper：`scripts/knife35-acceptance.sh soak-knife5`（DNS=8.8.8.8 + alt-resolver 路由进 TUN）。
 - **已知限制**（未触发）：split-horizon/内网域名走出口解析、exotic 多 question 查询丢弃(不泄漏)、IPv6 :53 不劫持(crate ipv4-only)。
 - **→ 刀5 完成**（代码+单测+ADR-0007+acceptance）。详见 findings 末节「刀5」。
+
+## 刀6 代码完成（2026-06-22）：REALITY 第二 Transport — 离线 auth + ClientHello（mini-project 第一片）
+
+**交付**（分支 `claude/knife6-reality-transport`，从 main 起，逐 commit push；**未合 main**；本片 **sans-IO、100% 离线**，无真握手/无 acceptance）：
+- **背景**：正交线 A = 给 Upstream 加第二 Transport（VLESS over REALITY over TCP，抗封锁 fallback）。REALITY 把 auth 藏进 TLS ClientHello `session_id`，stock TLS 库不让写 → **手写 TLS 1.3**（shoes 蓝本），RustCrypto 仅作原语（不破 ADR-0003 单 rustls）。grill 决策：**boring/craftls 均否决**（boring 写不了 session_id 需 patch C；craftls 只给指纹）→ 手写（ADR-0008）。
+- **本片做了**（`src/reality/{auth,client_hello}.rs`）：① `auth`：x25519 ECDH(RFC 7748 KAT)、`derive_auth_key`=HKDF-SHA256(salt=random[0..20],info="REALITY",32B)、session_id 16B 布局、`seal/open_session_id`=**AES-256-GCM 完整 32B key**(nonce=random[20..32],AAD=session_id 清零的 ClientHello)、`verify_server_cert`=HMAC-SHA512(同 32B key, ed25519 pubkey)；② `client_hello`：手写 TLS 1.3 ClientHello(Chrome-like:GREASE+X25519 keyshare+ALPN+扩展序;supported_versions 仅 1.3)、`build_authed_client_hello`(建零 session_id→seal→回写 offset 39..71)。
+- **质量**：12 reality 单测（含 RFC 7748 KAT + **server-view round-trip**：ECDH→derive→encode→seal→AAD清零→解封全链 + 篡改 ClientHello→解封失败）+ 105 lib 测全绿、clippy 0 warning。`/code-review`(high effort)：零正确性 bug，修了过时 AES-128 文档(实为 AES-256)、命名 session_id 偏移常量、x25519 低阶点安全注记。
+- **🔑 查证锁定的互通关键（刀7/8 别再踩）**：REALITY session_id AEAD = **AES-256-GCM + 完整 32B AuthKey（不截断！）**；用 AES-128/截断会让 sing-box 静默拒绝回落 decoy。HKDF salt=random[:20]、info="REALITY"、L=32。AAD = handshake message（含 4B 头），session_id 区 32B 清零。证书校验 HMAC-SHA512 用同一 32B key。
+- **设计文档**：`docs/tech/2026-06-22-knife6-reality-transport-{spec,plan}.md`；ADR-0008；CONTEXT.md 加 Transport/VLESS/REALITY。
+- **deferred（刀7/8/9）**：ServerHello+key schedule+record（刀7）；server-flight 验证+Finished+实握手+VLESS+RealityUpstream+acceptance（刀8，需服务端 VLESS+REALITY inbound 空 flow）；failover（刀9）。**刀7 起 x25519 用于网络 server keyshare → 必须加 contributory/全零检查**（见 auth.rs 注）。
 
 ## Rhythm（每刀都遵守）
 
