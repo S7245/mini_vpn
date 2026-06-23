@@ -134,4 +134,42 @@ mod tests {
         msg[1] ^= 0xff; // 破坏 handshake 长度字段
         assert!(extract_ed25519_pubkey_and_sig(&msg).is_err(), "长度字段不符");
     }
+
+    /// 把一张 ed25519 cert DER 的末 64B 签名换成 `HMAC-SHA512(auth_key, 裸 32B 公钥)`，
+    /// 模拟 REALITY 服务端临时证书（服务端正是这样写签名的）。
+    fn realityize_cert(der: &[u8], auth_key: &[u8; 32]) -> Vec<u8> {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha512;
+        let pubkey = &hex(ED25519_PUBKEY);
+        let mut mac = Hmac::<Sha512>::new_from_slice(auth_key).unwrap();
+        mac.update(pubkey);
+        let hmac = mac.finalize().into_bytes();
+        let mut out = der.to_vec();
+        let n = out.len();
+        out[n - 64..].copy_from_slice(&hmac); // 覆写签名 BitString 内容（结构仍合法，x509-cert 不验签）
+        out
+    }
+
+    /// T4 端到端：cert 提取 ⊕ verify_server_cert（REALITY auth 决策）。
+    /// 跑通即证明「解析临时证书 → HMAC-SHA512 校验」整条 REALITY auth 链离线正确。
+    #[test]
+    fn cert_extract_then_verify_server_cert_e2e() {
+        use crate::reality::auth::verify_server_cert;
+        let auth_key = [0x5a_u8; 32];
+        let der = realityize_cert(&hex(ED25519_CERT_DER), &auth_key);
+        let msg = wrap_cert_message(&der);
+        let (pubkey, sig) = extract_ed25519_pubkey_and_sig(&msg).expect("提取成功");
+        assert_eq!(&pubkey[..], &hex(ED25519_PUBKEY)[..]);
+        assert!(verify_server_cert(&auth_key, &pubkey, &sig), "正确 AuthKey → REALITY auth 通过");
+        // 错 AuthKey（decoy / 攻击者无静态私钥）→ 拒。
+        assert!(!verify_server_cert(&[0u8; 32], &pubkey, &sig), "错 AuthKey → 拒");
+        // 篡改公钥任一字节 → HMAC 失配 → 拒。
+        let mut bad_pk = pubkey;
+        bad_pk[0] ^= 0x01;
+        assert!(!verify_server_cert(&auth_key, &bad_pk, &sig), "篡改公钥 → 拒");
+        // 篡改签名任一字节 → 拒。
+        let mut bad_sig = sig.clone();
+        bad_sig[0] ^= 0x01;
+        assert!(!verify_server_cert(&auth_key, &pubkey, &bad_sig), "篡改签名 → 拒");
+    }
 }
