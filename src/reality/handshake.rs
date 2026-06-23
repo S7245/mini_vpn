@@ -52,13 +52,10 @@ impl HandshakeReassembler {
     }
 }
 
-use crate::reality::record::RecordKeys;
+use crate::reality::record::{MAX_TLS_PLAINTEXT, MAX_TLS_RECORD, RecordKeys};
 use crate::shared::ClientError;
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-
-/// TLS record 上限（密文 2^14 + 256，RFC 8446 §5.2）——防恶意巨 length 字段无界分配。
-const MAX_TLS_RECORD: usize = 16640;
 
 fn err(m: impl Into<String>) -> ClientError {
     ClientError::Reality(m.into())
@@ -116,12 +113,17 @@ impl RecordReader {
 }
 
 /// 写一条明文 record：`content_type | version(2B) | u16(len) | body`。
+/// 中文要点（L3）：body 超 2^14 明文上限 → 显式 Err（防 `as u16` 静默截断 → 对端按错长解析握手失败无线索）。
+/// 与读路径 `MAX_TLS_RECORD` 防御对称；当前 CH 约 200-300B，纯防御性（将来扩 CH 才可能触及）。
 async fn write_record<W: AsyncWrite + Unpin + ?Sized>(
     w: &mut W,
     content_type: u8,
     version: u16,
     body: &[u8],
 ) -> Result<(), ClientError> {
+    if body.len() > MAX_TLS_PLAINTEXT {
+        return Err(err(format!("明文 record body {} 超 2^14 上限", body.len())));
+    }
     let mut rec = Vec::with_capacity(5 + body.len());
     rec.push(content_type);
     rec.extend_from_slice(&version.to_be_bytes());
@@ -191,7 +193,12 @@ where
     let mut send_hs = RecordKeys::new(&hs.client_key, &hs.client_iv); // write-seq 0
 
     // 4. 读 + 解密 server flight，跨 record 重组消息，处理到 server Finished。
+    // **H1 安全守卫**：REALITY auth 唯一判据是 Certificate(0x0b) 上的 verify_cert。server Finished 的 MAC 只用
+    // ECDHE 派生的 s_hs（与 REALITY 静态 pbk 无关），任何完成 ECDHE 的诚实 TLS server/decoy 都能算对 → 若 flight
+    // 只发 EE+Finished（被回落的 decoy 可如此塑形）会干净走到 break 而 verify_cert 从未执行、auth 被静默绕过。
+    // 故 `cert_verified` 门控：未见过通过校验的 Certificate 不许完成握手（brief R4-C5）。
     let mut reasm = HandshakeReassembler::new();
+    let mut cert_verified = false;
     'outer: loop {
         let (ct, hdr, payload) = reader.next(stream).await?;
         match ct {
@@ -208,10 +215,17 @@ where
                         0x0b => {
                             // Certificate → **REALITY auth 决策**（verify_cert）。失败 → 握手 Err。
                             verify_cert(&msg)?;
+                            cert_verified = true;
                             transcript.extend_from_slice(&msg);
                         }
                         0x0f => transcript.extend_from_slice(&msg), // CertificateVerify：折但不验签（ADR-0010）
                         0x14 => {
+                            // 完成握手前强制：必须已通过 Certificate 的 REALITY auth（H1）。
+                            if !cert_verified {
+                                return Err(err(
+                                    "server flight 未含通过校验的 Certificate → REALITY auth 未执行，拒绝握手",
+                                ));
+                            }
                             // server Finished：用 transcript(CH..CertVerify) 验 MAC，再折入。
                             let th = transcript_hash(&[&transcript]);
                             let expected = compute_finished_verify_data(&hs.s_hs_secret, &th);
@@ -403,6 +417,53 @@ mod tests {
         client_io.flush().await.unwrap();
 
         sim.await.unwrap();
+    }
+
+    // RFC 8448 §3 EncryptedExtensions message（供 H1 负向测试构造「无 Certificate」的 flight）。
+    const RFC8448_EE: &str = "080000240022000a00140012001d00170018001901000101010201030104001c0002400100000000";
+
+    /// **H1 安全守卫负向 KAT**：server flight 只发 EE + Finished（无 Certificate），transcript 自洽、
+    /// server Finished MAC 正确（ECDHE 派生，与 REALITY 静态 pbk 无关）——模拟被回落的 decoy。
+    /// 即便 verify_cert=always-ok，drive 也**必须拒绝**（verify_cert 从未执行 → REALITY auth 未发生）。
+    #[tokio::test]
+    async fn drive_rejects_flight_without_certificate() {
+        use crate::reality::key_schedule::compute_finished_verify_data;
+        use crate::reality::record::RecordKeys;
+        use tokio::io::AsyncWriteExt;
+
+        let ch = hex(RFC8448_CH);
+        let sh = hex(RFC8448_SH);
+        let ee = hex(RFC8448_EE);
+        // 恶意 flight = EE || Finished(MAC over transcript CH..EE，无 Cert/CV)。
+        let s_hs = arr32("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38");
+        let th = transcript_hash(&[&ch, &sh, &ee]);
+        let mut flight = ee.clone();
+        flight.extend_from_slice(&[0x14, 0x00, 0x00, 0x20]);
+        flight.extend_from_slice(&compute_finished_verify_data(&s_hs, &th));
+
+        let (mut client_io, mut server_io) = tokio::io::duplex(16384);
+        let sim = tokio::spawn(async move {
+            let mut shrec = vec![0x16, 0x03, 0x03];
+            shrec.extend_from_slice(&(sh.len() as u16).to_be_bytes());
+            shrec.extend_from_slice(&sh);
+            server_io.write_all(&shrec).await.unwrap();
+            server_io.write_all(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]).await.unwrap();
+            let server_key: [u8; 16] = hex("3fce516009c21727d0f2e4e86ee403bc").try_into().unwrap();
+            let server_iv: [u8; 12] = hex("5d313eb2671276ee13000b30").try_into().unwrap();
+            let mut s_hs_rk = RecordKeys::new(&server_key, &server_iv);
+            server_io.write_all(&s_hs_rk.seal(0x16, &flight)).await.unwrap();
+            server_io.flush().await.unwrap();
+        });
+
+        let input = HandshakeInput {
+            client_hello: ch.clone(),
+            client_eph_secret: arr32(RFC8448_CLIENT_EPH),
+            expected_session_id: vec![],
+        };
+        // verify_cert=always-ok：证明拒绝不是因为 verify_cert 失败，而是 Certificate 根本没出现。
+        let r = drive(&mut client_io, input, |_cert| Ok(())).await;
+        assert!(r.is_err(), "无 Certificate 的 flight 必须拒绝（REALITY auth 未执行）");
+        let _ = sim.await;
     }
 
     /// 负：首条 record 非 ServerHello → Err（不 panic）。

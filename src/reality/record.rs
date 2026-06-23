@@ -9,6 +9,12 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes128Gcm, Nonce};
 use crate::shared::ClientError;
 
+/// TLS 1.3 record 上限（RFC 8446 §5.2，单一事实源；handshake/reality_upstream 共用，避免常量漂移，L5）：
+/// 明文 2^14；密文 = 明文 + 256（AEAD tag + 内层 type + padding 余量）。读路径据此防恶意巨 length 无界分配，
+/// 写路径据此防 `as u16` 静默截断。
+pub(crate) const MAX_TLS_PLAINTEXT: usize = 16384;
+pub(crate) const MAX_TLS_RECORD: usize = 16640;
+
 /// per-record nonce（RFC 8446 §5.3）：seq（u64 big-endian，8B）右对齐 XOR 进 12B iv 的低 8B（nonce[4..12]）。
 /// seq=0 时 nonce==iv（首条 sanity）。
 pub fn per_record_nonce(iv: &[u8; 12], seq: u64) -> [u8; 12] {
