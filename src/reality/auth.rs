@@ -124,16 +124,7 @@ pub fn verify_server_cert(auth_key: &[u8; 32], ed25519_pubkey: &[u8], signature:
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn hex(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
-    }
-    fn arr32(s: &str) -> [u8; 32] {
-        hex(s).try_into().unwrap()
-    }
+    use crate::reality::testutil::arr32;
 
     /// RFC 7748 §5.2 X25519 已知答案向量（钉死 ECDH 接线 + 内部 clamp）。
     #[test]
