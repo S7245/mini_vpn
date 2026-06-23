@@ -3,8 +3,8 @@
 //! 中文要点（已查证 XTLS/REALITY 源 + shoes 蓝本，见 spec C1）：
 //! - X25519 ECDH(我方临时私钥 × server 静态 pbk) → shared secret。
 //! - AuthKey = HKDF-SHA256(IKM=shared, salt=ClientHello.random[0..20], info="REALITY")。
-//! - session_id 明文 **16B** = version[4] + timestamp(u32 BE)[4] + short_id[8]；AES-128-GCM seal
-//!   (nonce=random[20..32], AAD=session_id 清零的 ClientHello) → ct(16)+tag(16)=**32B** 填满 session_id 字段。
+//! - session_id 明文 **16B** = version[4] + timestamp(u32 BE)[4] + short_id[8]；**AES-256-GCM** seal
+//!   (key=完整 32B AuthKey, nonce=random[20..32], AAD=session_id 清零的 ClientHello) → ct(16)+tag(16)=**32B** 填满字段。
 //! - 服务端临时证书校验 = HMAC-SHA512(AuthKey, cert.ed25519_pubkey) == cert.signature（不走 CA 链）。
 
 use aes_gcm::aead::{Aead, Payload};
@@ -20,6 +20,9 @@ pub const REALITY_VERSION: [u8; 4] = [1, 8, 0, 0];
 
 /// X25519 ECDH：我方私钥标量 × 对端公钥点 → 32B 共享密钥。
 /// 中文要点：底层 `x25519` 函数内部对标量做 clamp（与 RFC 7748 一致），故存原始 32B 私钥即可。
+/// ⚠️ **安全前提**：底层 `x25519` **不**拒绝低阶点（恶意对端发小阶点 → 全零共享密钥）。REALITY auth 路径
+/// 的 `peer_public` 是**可信配置 pbk**（非攻击者可控）→ 本刀安全。**刀7 的 TLS1.3 握手 ECDH 用的是网络来的
+/// server keyshare（不可信）→ 届时必须加 contributory/全零检查**（见 x25519-dalek 的 `was_contributory`）。
 pub fn x25519_shared_secret(my_secret: [u8; 32], peer_public: [u8; 32]) -> [u8; 32] {
     x25519_dalek::x25519(my_secret, peer_public)
 }
@@ -44,7 +47,7 @@ pub fn derive_auth_key(shared_secret: &[u8; 32], client_random: &[u8; 32]) -> [u
 }
 
 /// session_id 明文（16B）：version[4] + timestamp(u32 BE)[4] + short_id[8]。
-/// 中文要点：AES-128-GCM seal 后 = ct(16)+tag(16) = 32B，正好填满 TLS session_id 字段。
+/// 中文要点：AES-256-GCM seal 后 = ct(16)+tag(16) = 32B，正好填满 TLS session_id 字段。
 pub struct SessionIdPlaintext {
     pub version: [u8; 4],
     pub timestamp: u32,

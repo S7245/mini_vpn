@@ -9,6 +9,12 @@
 /// 固定 GREASE 值（真 Chrome 随机选；固定值对"够用"的指纹足够，离线测也确定）。
 const GREASE: u16 = 0x0a0a;
 
+/// session_id 字段在 ClientHello **handshake message** 里的偏移与长度（REALITY seal 回写处）。
+/// 4(handshake hdr) + 2(legacy_version) + 32(random) + 1(session_id len) = **39**；长度恒 **32**
+/// （`build_client_hello` 永远写 32B session_id，故偏移稳定——load-bearing，勿动布局而不改此处）。
+const SESSION_ID_OFFSET: usize = 39;
+const SESSION_ID_LEN: usize = 32;
+
 /// Chrome 风 cipher 列表（GREASE 头；TLS1.3 套件 0x1301/02/03 供真协商，TLS1.2 套件仅指纹）。
 const CIPHERS: &[u16] = &[
     GREASE, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013, 0xc014,
@@ -159,9 +165,15 @@ pub fn build_authed_client_hello(p: &AuthedClientHelloParams) -> Vec<u8> {
     }
     .to_bytes();
     let nonce: [u8; 12] = p.random[20..32].try_into().expect("random 有 32 字节");
+    // 不变量（最易错点）：seal 前 session_id 区必须全零（AAD 与服务端一致）。由步骤1 构造保证。
+    debug_assert_eq!(
+        &msg[SESSION_ID_OFFSET..SESSION_ID_OFFSET + SESSION_ID_LEN],
+        &[0u8; SESSION_ID_LEN],
+        "AAD 不变量：seal 前 session_id 区须清零"
+    );
     let sealed = seal_session_id(&p.auth_key, &pt, &nonce, &msg);
     // 3. 密文回写 session_id 字段。
-    msg[39..71].copy_from_slice(&sealed);
+    msg[SESSION_ID_OFFSET..SESSION_ID_OFFSET + SESSION_ID_LEN].copy_from_slice(&sealed);
     msg
 }
 
