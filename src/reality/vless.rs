@@ -51,10 +51,46 @@ pub fn encode_vless_request(uuid: &[u8; 16], command: u8, target: &TargetAddr) -
     v
 }
 
+/// VLESS 响应头剥离器（**互通-critical**，brief §1.4/§5 风险 6）。
+/// 中文要点：服务端回的第一段 application_data（record 解密后明文）前缀 = `version(1B) + addon_length(1B=N) + addons(N B)`，
+/// **无 command/address/port**。客户端须**首读一次性 strip `2+N` 字节**才接真数据：
+/// - **动态算 N**（读 `buf[1]`），**禁硬编 2**（非空 addons 会污染上游真 TLS → bad-decrypt 类）；
+/// - 头部 `2+N` 可能跨多 record 到达 → **累积**：不足 `2+N` 返回 false（等更多），不消费；
+/// - **仅首次剥一次**（`stripped` 门控），之后透传。
+#[derive(Default)]
+pub struct VlessResponseStripper {
+    stripped: bool,
+}
+
+impl VlessResponseStripper {
+    pub fn new() -> Self {
+        Self { stripped: false }
+    }
+
+    /// 尝试剥离响应头。返回 `true`=已剥完（`buf` 现为真数据，可放行）；`false`=头部未集齐（不消费 `buf`，等更多）。
+    pub fn strip(&mut self, buf: &mut bytes::BytesMut) -> bool {
+        if self.stripped {
+            return true; // 已剥过 → 透传
+        }
+        if buf.len() < 2 {
+            return false; // 连 version+addon_len 都不够 → 等更多
+        }
+        let addons_len = buf[1] as usize;
+        let header_len = 2 + addons_len;
+        if buf.len() < header_len {
+            return false; // 头部跨 record 未集齐 → 累积，不消费
+        }
+        let _ = buf.split_to(header_len); // 一次性剥 2+N
+        self.stripped = true;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::reality::testutil::hex;
+    use bytes::BytesMut;
 
     /// golden KAT：UUID 全 0x11、TCP、1.2.3.4:443 → 26B（brief §1.4）。
     /// 钉死 PortThenAddress（port 在 atyp 前）+ ATYP IPv4=0x01。
@@ -113,5 +149,52 @@ mod tests {
         );
         assert_eq!(req[22], 255, "域名长度截断到 255");
         assert_eq!(req.len(), 1 + 16 + 1 + 1 + 2 + 1 + 1 + 255);
+    }
+
+    /// 空 addons：strip 2B（`00 00`），剩真数据，返回 true。
+    #[test]
+    fn strip_empty_addons() {
+        let mut s = VlessResponseStripper::new();
+        let mut buf = BytesMut::from(&hex("00 00 deadbeef")[..]);
+        assert!(s.strip(&mut buf), "头部集齐 → 剥完");
+        assert_eq!(&buf[..], &hex("deadbeef")[..], "剩真数据");
+    }
+
+    /// 非空 addons（N=3）：strip 2+3=5B，**动态算 N**（禁硬编 2）。
+    #[test]
+    fn strip_nonempty_addons() {
+        let mut s = VlessResponseStripper::new();
+        let mut buf = BytesMut::from(&hex("00 03 aabbcc cafe")[..]);
+        assert!(s.strip(&mut buf));
+        assert_eq!(&buf[..], &hex("cafe")[..], "硬编 2 会留 aabbcc 污染上游");
+    }
+
+    /// 跨 record 累积：头部分多段到达，集齐前不消费、返回 false。
+    #[test]
+    fn strip_accumulates_across_segments() {
+        let mut s = VlessResponseStripper::new();
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&hex("00")); // 仅 version
+        assert!(!s.strip(&mut buf), "len<2 → 等更多");
+        assert_eq!(buf.len(), 1, "不消费");
+        buf.extend_from_slice(&hex("03 aa")); // addon_len=3，但只来了 1B addons
+        assert!(!s.strip(&mut buf), "len 3 < 2+3 → 等更多");
+        assert_eq!(buf.len(), 3, "不消费");
+        buf.extend_from_slice(&hex("bbcc 11223344")); // 余下 2B addons + 真数据
+        assert!(s.strip(&mut buf), "集齐 → 剥完");
+        assert_eq!(&buf[..], &hex("11223344")[..]);
+    }
+
+    /// 仅首次剥一次：stripped 后透传，不再消费。
+    #[test]
+    fn strip_only_once() {
+        let mut s = VlessResponseStripper::new();
+        let mut buf = BytesMut::from(&hex("00 00 aa")[..]);
+        assert!(s.strip(&mut buf));
+        assert_eq!(&buf[..], &hex("aa")[..]);
+        // 第二段数据恰好以 0x00 0x00 开头——不能被当响应头再剥。
+        let mut buf2 = BytesMut::from(&hex("0000bbcc")[..]);
+        assert!(s.strip(&mut buf2), "已 stripped → 透传 true");
+        assert_eq!(&buf2[..], &hex("0000bbcc")[..], "透传，不消费");
     }
 }
