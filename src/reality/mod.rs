@@ -6,3 +6,4 @@
 //! 100% 离线 TDD；真握手 / ServerHello / key schedule / VLESS / 互通 acceptance 归刀7/8。
 
 pub mod auth;
+pub mod client_hello;
