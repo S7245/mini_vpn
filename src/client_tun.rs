@@ -4,6 +4,7 @@ use crate::tuic::{
     AssocTable, FragReassembler, TuicClientConfig, TuicUpstream, decode_packet_meta, encode_packet,
 };
 use crate::upstream::{DatagramUpstream, ProxyUpstream, RelayStream};
+use crate::reality_upstream::RealityUpstream;
 use crate::udp_relay::{
     FourTuple, UDP_FLOW_IDLE_SECS, UdpInbound, build_udp_ip_packet, parse_inbound_udp,
 };
@@ -361,31 +362,65 @@ pub async fn start_tun_proxy() {
     };
     let device = VirtualTunDevice::new(raw_tun);
 
-    // 2. 仅 TUIC 上游（legacy yamux / 自研 server 已退役，见 ADR-0004）。
-    let cfg = match TuicClientConfig::from_env() {
-        Ok(c) => c,
-        Err(e) => {
-            println!("加载 TUIC 客户端配置失败（启动中止）: {e}");
-            return;
+    // 2. 选上游 Transport：MINI_VPN_UPSTREAM=tuic（默认）| reality（VLESS over REALITY over TCP，刀8）。
+    //    两分支各自单态化 run_event_loop（device 只在选中的分支被 move，互斥）。
+    match select_upstream_kind(std::env::var("MINI_VPN_UPSTREAM").ok().as_deref()) {
+        UpstreamKind::Tuic => {
+            let cfg = match TuicClientConfig::from_env() {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("加载 TUIC 客户端配置失败（启动中止）: {e}");
+                    return;
+                }
+            };
+            let upstream = match TuicUpstream::connect(&cfg).await {
+                Ok(u) => {
+                    println!("✅ 已连接 TUIC 出口 {} (sing-box)", cfg.server);
+                    Arc::new(u)
+                }
+                Err(e) => {
+                    println!("连接 TUIC 出口失败（启动中止）: {e:?}");
+                    return;
+                }
+            };
+            // 3. UDP over TUIC Packet 下行接收端（断线自愈，见 13b/13c）。
+            println!("🌊 UDP relay 数据面就绪（TUIC Packet datagram → sing-box）");
+            let tuic_downlink_rx = upstream.start_udp();
+            // 4. 进入共享主循环（生产传 NoopSink：零插桩开销）。
+            run_event_loop(device, upstream, tuic_downlink_rx, runtime_config, NoopSink).await;
         }
-    };
-    let upstream = match TuicUpstream::connect(&cfg).await {
-        Ok(u) => {
-            println!("✅ 已连接 TUIC 出口 {} (sing-box)", cfg.server);
-            Arc::new(u)
+        UpstreamKind::Reality => {
+            // REALITY 是 **TCP-only**（force-reality）：UDP no-op（DatagramUpstream 静默丢）+
+            // **空 downlink channel**——持有 tx 永不 send → run_event_loop 的下行 select 分支永久 pending
+            // （REALITY 无 UDP 下行；分离上游/UDP-over-VLESS/failover 留刀9）。
+            let upstream = match RealityUpstream::from_env() {
+                Ok(u) => {
+                    println!("✅ 已配置 REALITY 出口（VLESS over REALITY over TCP；TCP-only，UDP no-op）");
+                    Arc::new(u)
+                }
+                Err(e) => {
+                    println!("加载 REALITY 客户端配置失败（启动中止）: {e:?}");
+                    return;
+                }
+            };
+            let (_dummy_tx, dummy_rx) = mpsc::channel::<Vec<u8>>(1); // 持 tx 不 drop → 下行分支永挂
+            run_event_loop(device, upstream, dummy_rx, runtime_config, NoopSink).await;
         }
-        Err(e) => {
-            println!("连接 TUIC 出口失败（启动中止）: {e:?}");
-            return;
-        }
-    };
+    }
+}
 
-    // 3. UDP over TUIC Packet 下行接收端（断线自愈，见 13b/13c）。
-    println!("🌊 UDP relay 数据面就绪（TUIC Packet datagram → sing-box）");
-    let tuic_downlink_rx = upstream.start_udp();
+/// 选哪个上游 Transport（纯函数，便于单测）。默认 + 未知值 → TUIC（零回归）。
+#[derive(Debug, PartialEq, Eq)]
+enum UpstreamKind {
+    Tuic,
+    Reality,
+}
 
-    // 4. 进入共享主循环（生产传 NoopSink：零插桩开销）。
-    run_event_loop(device, upstream, tuic_downlink_rx, runtime_config, NoopSink).await;
+fn select_upstream_kind(env: Option<&str>) -> UpstreamKind {
+    match env.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("reality") => UpstreamKind::Reality,
+        _ => UpstreamKind::Tuic,
+    }
 }
 
 /// 共享主循环：生产（真 utun + 真 TUIC）与并发压测 harness（内存回环 device + mock 上游）共用。
@@ -1266,6 +1301,16 @@ pub async fn create_tun_device() -> tun::Result<tun::AsyncDevice> {
 mod tests {
     use super::*;
     use smoltcp::iface::SocketSet;
+
+    /// 刀8：上游选择器——reality（大小写/空白不敏感）→ Reality；其余（含 tuic/缺省/未知）→ Tuic（零回归）。
+    #[test]
+    fn upstream_kind_selector() {
+        assert_eq!(select_upstream_kind(Some("reality")), UpstreamKind::Reality);
+        assert_eq!(select_upstream_kind(Some("  REALITY ")), UpstreamKind::Reality);
+        assert_eq!(select_upstream_kind(Some("tuic")), UpstreamKind::Tuic);
+        assert_eq!(select_upstream_kind(None), UpstreamKind::Tuic, "缺省 → TUIC");
+        assert_eq!(select_upstream_kind(Some("bogus")), UpstreamKind::Tuic, "未知 → TUIC（零回归）");
+    }
 
     #[test]
     fn target_from_endpoint_builds_ipv4_target() {
