@@ -127,6 +127,44 @@ pub fn build_client_hello(p: &ClientHelloParams) -> Vec<u8> {
     msg
 }
 
+/// 构造带 REALITY auth 的 ClientHello 的入参。
+pub struct AuthedClientHelloParams<'a> {
+    pub server_name: &'a str,
+    pub key_share: [u8; 32],
+    pub random: [u8; 32],
+    /// REALITY AuthKey（= HKDF(ECDH(我方临时私钥, server pbk))），见 `auth::derive_auth_key`。
+    pub auth_key: [u8; 32],
+    pub short_id: [u8; 8],
+    pub timestamp: u32,
+}
+
+/// 构造 **带 REALITY auth 的 ClientHello**：先建 session_id 清零的 ClientHello（即 AEAD 的 AAD），
+/// 对其 seal 16B 明文，把 32B 密文回写进 session_id 字段（message 偏移 39..71）。
+/// 中文要点(最易错点)：AAD 必须是「session_id 区清零」的完整 handshake message——本函数天然满足
+/// （步骤1 就用全零 session_id 建）。nonce=random[20..32]。
+pub fn build_authed_client_hello(p: &AuthedClientHelloParams) -> Vec<u8> {
+    use crate::reality::auth::{REALITY_VERSION, SessionIdPlaintext, seal_session_id};
+    // 1. 用全零 session_id 建 ClientHello —— 这份字节即 seal 的 AAD。
+    let mut msg = build_client_hello(&ClientHelloParams {
+        server_name: p.server_name,
+        key_share: p.key_share,
+        random: p.random,
+        session_id: [0u8; 32],
+    });
+    // 2. seal 16B 明文（version+timestamp+short_id），AAD = 上面清零的 message。
+    let pt = SessionIdPlaintext {
+        version: REALITY_VERSION,
+        timestamp: p.timestamp,
+        short_id: p.short_id,
+    }
+    .to_bytes();
+    let nonce: [u8; 12] = p.random[20..32].try_into().expect("random 有 32 字节");
+    let sealed = seal_session_id(&p.auth_key, &pt, &nonce, &msg);
+    // 3. 密文回写 session_id 字段。
+    msg[39..71].copy_from_slice(&sealed);
+    msg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +265,84 @@ mod tests {
         // ALPN 含 h2。
         let alpn = find_ext(exts, 0x0010).expect("ALPN 扩展");
         assert!(alpn.windows(2).any(|w| w == b"h2"), "ALPN 含 h2");
+    }
+
+    /// 刀6 T3 核心：build_authed → 「服务端视角」解封 round-trip。
+    /// 跑通即证明 ECDH + derive_auth_key + ClientHello 编码 + seal + **AAD 清零纪律** 全链正确。
+    #[test]
+    fn authed_client_hello_server_view_roundtrip() {
+        use crate::reality::auth::{
+            REALITY_VERSION, derive_auth_key, generate_ephemeral_keypair, open_session_id,
+            parse_short_id, x25519_shared_secret,
+        };
+        // server 静态 + client 临时密钥；双向 ECDH 应一致。
+        let (sk_s, pk_s) = generate_ephemeral_keypair();
+        let (sk_c, pk_c) = generate_ephemeral_keypair();
+        let shared_c = x25519_shared_secret(sk_c, pk_s);
+        let shared_s = x25519_shared_secret(sk_s, pk_c);
+        assert_eq!(shared_c, shared_s, "ECDH 对称");
+
+        let random = [0x33u8; 32];
+        let auth_key = derive_auth_key(&shared_c, &random);
+        let short_id = parse_short_id("01ab").unwrap();
+        let ts = 0x0102_0304u32;
+        let authed = build_authed_client_hello(&AuthedClientHelloParams {
+            server_name: "www.microsoft.com",
+            key_share: pk_c,
+            random,
+            auth_key,
+            short_id,
+            timestamp: ts,
+        });
+        assert_ne!(&authed[39..71], &[0u8; 32], "session_id 已 seal（非全零）");
+        // 仍是结构合法的 ClientHello（session_id 现为密文，仍 32B）。
+        assert!(parse_tls_message_handshake(&authed).is_ok());
+
+        // 服务端视角：取出密文 → session_id 区清零重建 AAD → 用 server 侧 auth_key 解封。
+        let sealed: [u8; 32] = authed[39..71].try_into().unwrap();
+        let mut aad = authed.clone();
+        aad[39..71].fill(0);
+        let nonce: [u8; 12] = random[20..32].try_into().unwrap();
+        let auth_key_server = derive_auth_key(&shared_s, &random);
+        let pt = open_session_id(&auth_key_server, &sealed, &nonce, &aad)
+            .expect("服务端解封成功 → key/nonce/AAD 全对");
+        assert_eq!(&pt[0..4], &REALITY_VERSION);
+        assert_eq!(u32::from_be_bytes(pt[4..8].try_into().unwrap()), ts);
+        assert_eq!(&pt[8..16], &short_id);
+    }
+
+    /// 篡改 ClientHello 任一字节 → 服务端 AAD 变 → 解封失败（AEAD 把 auth 绑定到整条 ClientHello）。
+    #[test]
+    fn authed_client_hello_tamper_breaks_auth() {
+        use crate::reality::auth::{
+            derive_auth_key, generate_ephemeral_keypair, open_session_id, parse_short_id,
+            x25519_shared_secret,
+        };
+        let (sk_s, pk_s) = generate_ephemeral_keypair();
+        let (sk_c, pk_c) = generate_ephemeral_keypair();
+        let shared = x25519_shared_secret(sk_c, pk_s);
+        let random = [0x44u8; 32];
+        let auth_key = derive_auth_key(&shared, &random);
+        let mut authed = build_authed_client_hello(&AuthedClientHelloParams {
+            server_name: "www.apple.com",
+            key_share: pk_c,
+            random,
+            auth_key,
+            short_id: parse_short_id("ff").unwrap(),
+            timestamp: 1,
+        });
+        let sealed: [u8; 32] = authed[39..71].try_into().unwrap();
+        // 篡改一个扩展字节（最后一字节，远离 session_id）。
+        let last = authed.len() - 1;
+        authed[last] ^= 0xff;
+        let mut aad = authed.clone();
+        aad[39..71].fill(0);
+        let nonce: [u8; 12] = random[20..32].try_into().unwrap();
+        let auth_key_server = derive_auth_key(&x25519_shared_secret(sk_s, pk_c), &random);
+        assert_eq!(
+            open_session_id(&auth_key_server, &sealed, &nonce, &aad),
+            None,
+            "篡改 ClientHello → AAD 变 → 解封失败"
+        );
     }
 }
