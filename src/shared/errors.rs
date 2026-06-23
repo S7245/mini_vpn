@@ -12,4 +12,8 @@ pub enum ClientError {
 
     #[error("invalid utf-8 payload: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
+
+    /// 刀6：REALITY 传输的配置/握手错误（short_id 解析、ClientHello 构造、证书校验失败等）。
+    #[error("REALITY error: {0}")]
+    Reality(String),
 }

@@ -6,6 +6,7 @@ pub mod fake_ip;
 #[cfg(feature = "harness")]
 pub mod harness;
 pub mod quic;
+pub mod reality;
 pub mod shared;
 pub mod tuic;
 pub mod udp_relay;

@@ -37,9 +37,9 @@
 已查证字节布局(研究 + XTLS/REALITY 源 + shoes)：
 - `x25519` 临时密钥对；ECDH(client 临时私钥 × server 静态 `public_key`/pbk) → shared secret。
 - `derive_auth_key`：HKDF-SHA256(IKM=shared_secret, **salt=ClientHello.random[0..20]**, info=`"REALITY"`) → 32B AuthKey。
-- `session_id` 明文布局(32B)：`[0..4]`=版本`[1,8,?,?]`(我方标识,可仿 Xray) / 实测以 shoes 的 `[1,8,0,0]` 为蓝本；`[4..8]`=Unix 时间戳(u32 BE)；`[8..32]`=`short_id`(hex 解码,零填充,≤8B)。
-  - ⚠️ shoes 蓝本版本字节 `[1,8,0,0]`；以**与 sing-box 服务端互通**为准(刀8 acceptance 校准)。
-- `seal_session_id`：AES-128-GCM，key=AuthKey，**nonce=ClientHello.random[20..32]**(12B)，**AAD=完整 ClientHello 字节(session_id 字段先清零)**，密文 16B + tag 写回 session_id 前段。
+- `session_id` 明文布局(**16B**)：`[0..4]`=版本`[1,8,0,0]`(shoes 蓝本,我方标识)；`[4..8]`=Unix 时间戳(u32 BE)；`[8..16]`=`short_id`(hex 解码,零填充,≤8B)。
+  - ⚠️ 版本字节以**与 sing-box 服务端互通**为准(刀8 acceptance 校准)。
+- `seal_session_id`：AES-128-GCM，key=AuthKey，**nonce=ClientHello.random[20..32]**(12B)，**AAD=完整 ClientHello 字节(session_id 字段 32B 先清零)**，16B 明文 → **ct(16)+tag(16)=32B** 填满 TLS session_id 字段。
   - 🔑 **最易错点**(impl #1 失败原因)：AAD 必须是「session_id 已清零」的序列化 ClientHello；本刀用离线测钉死。
 - `verify_server_cert`(刀8 用,本刀先实现纯函数)：`HMAC-SHA512(AuthKey, server_temp_cert.ed25519_pubkey) == cert.signature` —— REALITY 不走 CA 链,靠此 HMAC 认证服务端临时证书。
 
