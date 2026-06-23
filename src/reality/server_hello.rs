@@ -73,7 +73,13 @@ pub fn parse_server_hello(
     if bytes.first() != Some(&0x02) {
         return Err(err("非 ServerHello（handshake type != 0x02）"));
     }
+    let len_field = bytes.get(1..4).ok_or_else(|| err("handshake 头截断"))?;
     let body = bytes.get(4..).ok_or_else(|| err("handshake 头截断"))?;
+    // 校验 handshake 长度字段（uint24）== 实际 body 长度（防截断/拼接的网络输入静默误解析）。
+    let claimed = ((len_field[0] as usize) << 16) | ((len_field[1] as usize) << 8) | len_field[2] as usize;
+    if claimed != body.len() {
+        return Err(err("handshake 长度字段与实际 body 不符"));
+    }
     let mut p = 0usize;
 
     if body.get(p..p + 2) != Some(&[0x03, 0x03][..]) {
@@ -102,6 +108,13 @@ pub fn parse_server_hello(
     let cs = body.get(p..p + 2).ok_or_else(|| err("cipher_suite 截断"))?;
     let cipher_suite = u16::from_be_bytes([cs[0], cs[1]]);
     p += 2;
+    // 刀7 仅支持 TLS_AES_128_GCM_SHA256（key schedule/record 硬编 SHA-256/AES-128-GCM）。
+    // 在 parse 层显式拒绝其它套件，避免 0x1302(AES-256-GCM-SHA384) decoy 被静默 mis-key（见 ADR-0009 gap）。
+    if cipher_suite != 0x1301 {
+        return Err(err(
+            "不支持的 cipher_suite（刀7 仅 TLS_AES_128_GCM_SHA256 0x1301；0x1302/0x1303 见 ADR-0009 gap）",
+        ));
+    }
 
     if *body.get(p).ok_or_else(|| err("compression 截断"))? != 0 {
         return Err(err("legacy_compression != 0"));
@@ -183,6 +196,11 @@ mod tests {
         let n = ver.len();
         ver[n - 2..].copy_from_slice(&[0x03, 0x03]);
         assert!(parse_server_hello(&ver, b"").is_err(), "version!=1.3");
+
+        // 不支持的 cipher_suite（RFC SH cipher 在 [39..41] = 1301 → 改 1302）→ Err。
+        let mut cs = base.clone();
+        cs[39..41].copy_from_slice(&[0x13, 0x02]);
+        assert!(parse_server_hello(&cs, b"").is_err(), "cipher_suite != 0x1301");
 
         // session_id_echo 不一致（RFC SH 空 echo，传 32B expected）→ Err。
         assert!(parse_server_hello(&base, &[0u8; 32]).is_err(), "echo mismatch");

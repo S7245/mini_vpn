@@ -91,6 +91,9 @@ pub fn derive_application_keys(handshake_secret: &[u8; 32], transcript_ch_sfin: 
 /// 中文要点（**#1 静默互通杀手**）：`tls13 ` **含尾空格**；label 与 context 各用 **u8** 长前缀；仅顶层 length 是 u16。
 pub fn hkdf_label(length: u16, label: &str, context: &[u8]) -> Vec<u8> {
     let full_label = [b"tls13 ".as_slice(), label.as_bytes()].concat();
+    // TLS 不变量（RFC 8446 §7.1）：label / context 各 ≤255（u8 长前缀）。所有调用点都是短常量；
+    // debug_assert 文档化此前提，防 `as u8` 静默截断（若将来传入超长 label）。
+    debug_assert!(full_label.len() <= 255 && context.len() <= 255, "HkdfLabel 字段超 255");
     let mut out = Vec::with_capacity(2 + 1 + full_label.len() + 1 + context.len());
     out.extend_from_slice(&length.to_be_bytes());
     out.push(full_label.len() as u8);

@@ -1,11 +1,12 @@
 # REALITY TLS 1.3: implement TLS_AES_128_GCM_SHA256 (0x1301) first, with a generic-over-hash skeleton
 
 The hand-rolled TLS 1.3 client for REALITY (ADR-0008) implements and **known-answer-tests only
-`TLS_AES_128_GCM_SHA256` (0x1301)** in 刀7. The key schedule is written **generic over the hash**
-and the record layer **generic over the AEAD** from day one (a `CipherSuite` enum carrying
-`hash_len`/`key_len`/`iv_len`), but only the 0x1301 path is wired and verified. `TLS_AES_256_GCM_SHA384`
-(0x1302) and `TLS_CHACHA20_POLY1305_SHA256` (0x1303) are **deferred** — a known gap to be filled in a
-刀7-tail task or 刀8.
+`TLS_AES_128_GCM_SHA256` (0x1301)** in 刀7. **The 刀7 code is hard-coded to SHA-256 + AES-128-GCM**
+(fixed `[u8;32]` secrets / `[u8;16]` keys / `[u8;12]` IVs; `Hkdf::<Sha256>` / `Aes128Gcm` throughout) —
+there is **no `CipherSuite` enum / no hash-or-AEAD genericity yet**; that refactor is **deferred** until a
+second suite is actually needed. `TLS_AES_256_GCM_SHA384` (0x1302) and `TLS_CHACHA20_POLY1305_SHA256`
+(0x1303) are **not implemented** — a known gap to fill in a 刀7-tail task or 刀8. To prevent silent
+mis-keying, **`parse_server_hello` (刀7) already errors on any `cipher_suite != 0x1301`** at parse time.
 
 Decided in 刀7 grill, 2026-06-23, on the back of an understand-phase research workflow; see
 `docs/tech/2026-06-23-knife7-reality-handshake-*`.
@@ -26,10 +27,12 @@ not obliged to honour our ClientHello's cipher order.** Large AES-NI sites commo
 **0x1302 (AES-256-GCM-SHA384)**. Until the 0x1302 path is wired, **a live REALITY server fronting such a
 site will fail the handshake** — and could fail *silently* if not guarded. Mitigations:
 
-- The generic-over-hash schedule + generic-over-AEAD record make adding 0x1302/0x1303 cheap (no
-  restructuring) — it is wiring + a self-consistency test, not a redesign.
-- 刀8's ServerHello handling must **explicitly error** on an unsupported `cipher_suite` (not silently
-  proceed), so the failure is diagnosable and points here.
+- `parse_server_hello` **explicitly errors** on an unsupported `cipher_suite` (≠0x1301), so a 0x1302/0x1303
+  decoy fails **loudly and diagnosably** (pointing here) instead of being silently mis-keyed.
+- Adding 0x1302/0x1303 later means: introduce the deferred `CipherSuite`-generic schedule/record (the SHA-384
+  second-hash path + a `chacha20poly1305` dep for 0x1303), then relax the parse-time cipher check. It is more
+  than pure wiring (the genericity does not exist yet), but it is well-scoped and the RFC 8448-pinned 0x1301
+  path is a working reference.
 
 ## Considered Options
 
