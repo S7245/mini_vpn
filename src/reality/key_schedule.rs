@@ -90,6 +90,20 @@ pub fn extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Finished verify_data（RFC 8446 §4.4.4）= HMAC-SHA256(finished_key, transcript_hash)，
+/// 其中 finished_key = Expand-Label(base_secret, "finished", "", 32)。base_secret = 对应方向的 hs_traffic_secret。
+/// 中文要点（刀8 用）：server 用 s_hs + transcript(CH..CertificateVerify) 算出的应等于其 Finished 内容；
+/// client 用 c_hs + transcript(CH..serverFinished) 算出自己的 Finished。本刀提供纯函数 + RFC 8448 KAT。
+pub fn compute_finished_verify_data(base_secret: &[u8; 32], transcript_hash: &[u8; 32]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    let finished_key = expand_label(base_secret, "finished", b"", 32);
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&finished_key).expect("HMAC key any len");
+    mac.update(transcript_hash);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&mac.finalize().into_bytes());
+    out
+}
+
 /// Transcript-Hash = SHA-256(msg1 || msg2 || ...)（RFC 8446 §4.4.1）。
 pub fn transcript_hash(msgs: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha256::new();
@@ -188,5 +202,48 @@ mod tests {
     fn zero_ecdhe_rejected() {
         let err = derive_handshake_keys(&[0u8; 32], &hex(RFC8448_CH), &hex(RFC8448_SH));
         assert!(err.is_err(), "全零 ECDHE 必须拒绝");
+    }
+
+    // RFC 8448 §3 server flight 后续 handshake messages（脚本从 RFC 文本抽取、字节数核对 40/445/136）。
+    const RFC8448_EE: &str = "080000240022000a00140012001d00170018001901000101010201030104001c0002400100000000";
+    const RFC8448_CERT: &str = "0b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e310c300a06035504031303727361301e170d3136303733303031323335395a170d3236303733303031323335395a300e310c300a0603550403130372736130819f300d06092a864886f70d010101050003818d0030818902818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b0603551d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b42b4de10000";
+    const RFC8448_CV: &str = "0f000084080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd484145ab3ff52f1fda8477b0b7abc90db78e2d33a5c141a078653fa6bef780c5ea248eeaaa785c4f394cab6d30bbe8d4859ee511f602957b15411ac027671459e46445c9ea58c181e818e95b8c3fb0bf3278409d3be152a3da5043e063dda65cdf5aea20d53dfacd42f74f3";
+
+    /// finished_key = Expand-Label(s_hs,"finished","",32) —— RFC 8448 §3 直接给出的中间值。
+    #[test]
+    fn rfc8448_finished_key() {
+        let s_hs = arr32("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38");
+        assert_eq!(
+            expand_label(&s_hs, "finished", b"", 32),
+            hex("008d3b66f816ea559f96b537e885c31fc068bf492c652f01f288a1d8cdc19fc8"),
+            "server finished_key"
+        );
+        let c_hs = arr32("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21");
+        assert_eq!(
+            expand_label(&c_hs, "finished", b"", 32),
+            hex("b80ad01015fb2f0bd65ff7d4da5d6bf83f84821d1f87fdc7d3c75b5a7b42d9c4"),
+            "client finished_key"
+        );
+    }
+
+    /// 最强端到端 KAT：用 RFC 8448 §3 真 server flight 算 server Finished verify_data。
+    /// 跑通即证明 compute_finished_verify_data（finished_key + HMAC over transcript）字节级正确——刀8 验证服务端 Finished 就靠它。
+    #[test]
+    fn rfc8448_server_finished_verify_data() {
+        let s_hs = arr32("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38");
+        let (ch, sh) = (hex(RFC8448_CH), hex(RFC8448_SH));
+        let (ee, cert, cv) = (hex(RFC8448_EE), hex(RFC8448_CERT), hex(RFC8448_CV));
+        // server Finished 的 transcript = CH..CertificateVerify。
+        let th = transcript_hash(&[&ch, &sh, &ee, &cert, &cv]);
+        assert_eq!(
+            th,
+            arr32("edb7725fa7a3473b031ec8ef65a2485493900138a2b91291407d7951a06110ed"),
+            "transcript_hash(CH..CertVerify)"
+        );
+        assert_eq!(
+            compute_finished_verify_data(&s_hs, &th),
+            arr32("9b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718"),
+            "server Finished verify_data（RFC 8448 §3 真值）"
+        );
     }
 }
