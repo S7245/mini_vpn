@@ -6,10 +6,13 @@
 //! （全离线，RFC 8448 §3 KAT）；刀8 = 实 TCP 握手 + 解密 server flight + 证书 HMAC + VLESS + RealityUpstream + acceptance。
 
 pub mod auth;
+pub mod cert;
 pub mod client_hello;
+pub mod handshake;
 pub mod key_schedule;
 pub mod record;
 pub mod server_hello;
+pub mod vless;
 
 /// reality 模块测试共用 helper（hex 解码），供 auth/key_schedule/record/server_hello 单测复用。
 #[cfg(test)]

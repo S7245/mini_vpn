@@ -53,3 +53,26 @@ site will fail the handshake** — and could fail *silently* if not guarded. Mit
   not regress it.
 - Unaffected: REALITY auth (ADR-0008) uses **AES-256-GCM** for the session_id seal — a *separate* AEAD
   from this record-layer AES-128-GCM. Do not conflate the two.
+
+## Amendment (刀8, 2026-06-23): tighten the ClientHello cipher offer to 0x1301 only
+
+刀8 (live handshake) resolves the gap above differently than originally anticipated. The original assumption was
+"keep offering Chrome's three TLS 1.3 suites (0x1301/0x1302/0x1303) and **loud-fail** if a server-pref AES-256
+decoy selects 0x1302." 刀8 grill instead **removes 0x1302/0x1303 from the ClientHello offer**
+(`client_hello.rs` `CIPHERS`), so the only TLS 1.3 suite offered is **0x1301**. Per RFC 8446 §9.1 a compliant
+decoy must then select 0x1301 (the only intersection) — this **roots out the loud-fail at the source**, making any
+compliant borrowed site usable regardless of its AES-256 preference. Belt-and-suspenders: the acceptance helper
+also runs an **openssl egress preflight** against the chosen decoy and refuses to start if it does not negotiate
+`TLS_AES_128_GCM_SHA256`, and the operator still picks a known-0x1301 decoy (e.g. `gateway.icloud.com`,
+`dl.google.com`).
+
+- **Trade-off (the real cost):** offering a single TLS 1.3 suite deviates from a real Chrome's three-suite offer —
+  a JA3/JA4 cipher-list hash no longer matches Chrome, and "one TLS 1.3 suite + a pile of TLS 1.2 suites" is a
+  combination no real browser produces. This is a deliberate **robustness-over-fingerprint** choice (系统稳定优先),
+  consistent with ADR-0008's stance that REALITY stealth is **best-effort, not byte-exact**. Offering suites we
+  cannot actually complete (the schedule/record are hard-coded SHA-256/AES-128) was itself a fingerprint
+  inconsistency — a real Chrome *completes* a 0x1302 handshake.
+- **Reversal path:** when 0x1302/0x1303 are eventually implemented (the deferred `CipherSuite`-generic
+  schedule/record + a `chacha20poly1305` dep), restore the full three-suite offer — the loud-fail disappears
+  on its own and Chrome's exact cipher list is recovered. Decided in 刀8 grill; see
+  `docs/tech/2026-06-23-knife8-reality-live-handshake-spec.md` §2(f).

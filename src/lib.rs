@@ -7,6 +7,7 @@ pub mod fake_ip;
 pub mod harness;
 pub mod quic;
 pub mod reality;
+pub mod reality_upstream;
 pub mod shared;
 pub mod tuic;
 pub mod udp_relay;

@@ -35,6 +35,12 @@ aes-gcm = "0.10"
 hmac = "0.12"
 rand = "0.8"
 
+# 刀8：REALITY 实握手收尾。x509-cert(RustCrypto 系,纯 Rust,不引 ring/不破 ADR-0003)解析服务端临时证书,
+# 提 ed25519 SPKI 公钥 + 签名(末 64B HMAC)——结构解析不验签(REALITY auth 锚=HMAC,见 ADR-0010)。
+# base64 解码 sing-box reality public_key(base64url 43 字符 → 32B,见 ADR-0009 修订/grill 裁决 e)。
+x509-cert = "0.2"
+base64 = "0.22"
+
 [features]
 # knife1：大并发压测 harness（内存回环 device + mock 上游 + 第二 smoltcp 流量发生器）。
 # 仅在跑压测时启用，生产二进制不含此脚手架。见 docs/tech/2026-06-12-knife1-*。
