@@ -13,9 +13,9 @@
 - **刀1/2/3/3.5 完成**（见下各「已完成」段）：并发压测 harness + 大并发优化（脏集合 + 弹性扩容 + fake-IP 回收）+ UDP 直播硬化（quic-stream 兜底 + 分片重组）+ 高码率 UDP（BBR/Cubic 可切 + quinn 插桩 + quic-relay-mode；**纠偏：刀3「5.3M datagram 天花板」实为链路 cap 假象**）。
 - **刀6 已在 `main`（`b7785a2`，2026-06-22 fast-forward 合入）**：正交线 A REALITY 第二 Transport 的**第一片**——
   离线 auth 密码学 + TLS 1.3 ClientHello（手写 TLS 1.3，ADR-0008，sans-IO 无 acceptance）。REALITY 是 mini-project（刀6→刀9，见上）。
-- **刀7 完成（分支 `claude/knife7-reality-handshake`，从 main 起，未合 main）**：REALITY 第二片——离线
-  ServerHello 解析 + TLS 1.3 key schedule + record AEAD（手写，全程 RFC 8448 §3 KAT 字节级验证，sans-IO 无 acceptance）。见下「刀7 完成」。
-- **新 session 起点（下一刀=刀8）：刀7 合 main 后从 main 起新分支**（续 REALITY：实 TCP 握手 + 解密 server flight + 证书 HMAC + Finished + VLESS + RealityUpstream + acceptance，见下「刀7 完成」末 deferred）。
+- **刀7 已在 `main`（`14258e4`，2026-06-23 fast-forward 合入）**：REALITY 第二片——离线 ServerHello 解析 +
+  TLS 1.3 key schedule + record AEAD（手写，全程 RFC 8448 §3 KAT 字节级验证，sans-IO 无 acceptance，ADR-0009）。见下「刀7 完成」。
+- **新 session 起点（下一刀=刀8）：直接从 `main`（`14258e4`）起新分支**（续 REALITY：实 TCP 握手 + 解密 server flight + 证书 HMAC + Finished + VLESS + RealityUpstream + 真出口 acceptance，见下「刀7 完成」末 deferred）。
   若改开主线：高带宽压测+数据面多线程（逼近 100M）/ observability(DNS forge 计数、datagram drop 背压)——按优先级定。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
@@ -54,7 +54,7 @@
 
 正交线 A（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）= VLESS+REALITY 第二 Transport（手写 TLS 1.3，ADR-0008）
  ├─ 刀6  REALITY auth 密码学 + TLS 1.3 ClientHello 构造（sans-IO，100% 离线 TDD）  ✅ 完成（见下「刀6」，ADR-0008）；已合 main
- ├─ 刀7  ServerHello 解析 + TLS 1.3 key schedule（RFC 8448 向量）+ record-layer AEAD  ✅ 完成（见下「刀7」，ADR-0009）；未合 main
+ ├─ 刀7  ServerHello 解析 + TLS 1.3 key schedule（RFC 8448 向量）+ record-layer AEAD  ✅ 完成（见下「刀7」，ADR-0009）；已合 main
  ├─ 刀8  server-flight 解密 + HMAC 证书校验 + client Finished + 实 TCP 握手 + VLESS 帧 + RealityUpstream(ProxyUpstream) + env 选择器 + 真出口 acceptance
  └─ 刀9  auto-failover（健康感知 TUIC↔REALITY；分离 TCP/UDP 上游；UDP 留 QUIC）
 ```
@@ -242,7 +242,7 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
 
 ## 刀7 代码完成（2026-06-23）：REALITY 握手核心 — 手写 TLS 1.3 ServerHello/key schedule/record（第二片）
 
-**交付**（分支 `claude/knife7-reality-handshake`，从 main 起，逐 commit push；**未合 main**；**sans-IO、100% 离线，无 acceptance**）：
+**交付**（分支 `claude/knife7-reality-handshake`，从 main 起，逐 commit push；**已 fast-forward 合入 main `14258e4`**；**sans-IO、100% 离线，无 acceptance**）：
 - **设计输入**：understand-phase research **workflow**（5 路并行研究 + 综合，brief 见 session）→ spec/plan/ADR-0009。
 - **本片做了**（`src/reality/{key_schedule,record,server_hello}.rs` + `testutil.rs`）：
   - `key_schedule`：HKDF-Expand-Label/Derive-Secret/Extract/transcript_hash；`derive_handshake_keys`（Early→derived→Handshake(from ECDHE)→{c,s}_hs→key/iv，**全零 ECDHE 拒**）；`compute_finished_verify_data`；`derive_application_keys`（derived2→Master→{c,s}_ap）。
