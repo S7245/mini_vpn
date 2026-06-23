@@ -15,10 +15,13 @@ const GREASE: u16 = 0x0a0a;
 const SESSION_ID_OFFSET: usize = 39;
 const SESSION_ID_LEN: usize = 32;
 
-/// Chrome 风 cipher 列表（GREASE 头；TLS1.3 套件 0x1301/02/03 供真协商，TLS1.2 套件仅指纹）。
+/// Chrome 风 cipher 列表（GREASE 头）。**TLS1.3 仅 offer 0x1301**（刀8 grill 裁决 f，ADR-0009 修订）：
+/// 删 0x1302/0x1303，使任何合规借用站被 RFC 8446 §9.1 强制只能回 0x1301（唯一交集），根除 0x1302 decoy
+/// loud-fail（我方 schedule/record 硬编 SHA-256/AES-128，完成不了 0x1302/0x1303）。代价：偏离 Chrome 真实
+/// 三套件指纹（robustness>fingerprint，系统稳定优先）；0x1302/0x1303 实现后可恢复全列表。TLS1.2 套件仅指纹。
 const CIPHERS: &[u16] = &[
-    GREASE, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013, 0xc014,
-    0x009c, 0x009d, 0x002f, 0x0035,
+    GREASE, 0x1301, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013, 0xc014, 0x009c, 0x009d,
+    0x002f, 0x0035,
 ];
 
 /// 构造 ClientHello 的入参（session_id 在 T2 为占位，T3 由 seal 回写密文）。
@@ -229,6 +232,10 @@ mod tests {
         let ciphers: Vec<u16> = ch.ciphers.iter().map(|c| c.0).collect();
         assert!(ciphers.contains(&0x1301), "TLS_AES_128_GCM_SHA256");
         assert!(ciphers.contains(&GREASE), "GREASE cipher");
+        // 刀8 裁决 f / ADR-0009 修订：收紧 TLS1.3 offer 仅 0x1301——绝不 offer 我方完成不了的 0x1302/0x1303
+        // （否则借用站选中即 loud-fail；详见 server_hello::parse_server_hello 的 cipher guard）。
+        assert!(!ciphers.contains(&0x1302), "不 offer 0x1302（schedule/record 不支持，避 decoy loud-fail）");
+        assert!(!ciphers.contains(&0x1303), "不 offer 0x1303（同上）");
         assert_eq!(ch.session_id, Some(&[0u8; 32][..]));
     }
 
