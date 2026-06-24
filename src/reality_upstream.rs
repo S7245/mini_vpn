@@ -427,6 +427,12 @@ impl ProxyUpstream for RealityUpstream {
         let (rh, wh) = stream.into_split();
         Ok(Box::new(RealityStream::new(rh, wh, out.recv_keys, out.send_keys, out.leftover)))
     }
+
+    /// REALITY 每条 TCP 一次完整多-RTT 手写 TLS 握手——**不廉价**，主循环须 spawn 出去并发化（刀9 M3），
+    /// 否则一条慢握手 stall 整个单任务 select 循环（H2 的 10s 超时只是止血，根治靠并发化）。
+    fn open_is_cheap(&self) -> bool {
+        false
+    }
 }
 
 #[async_trait::async_trait]

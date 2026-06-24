@@ -241,6 +241,13 @@ where
             TcpLeg::Reality => self.reality.open_tcp(target).await,
         }
     }
+
+    /// 按当前选腿委托：TUIC 腿廉价（inline）；REALITY 腿不廉价（主循环 spawn 出去，刀9 M3）。
+    /// 中文要点：active_leg 可能在本判定与真正 open_tcp 之间翻转——但这只影响 inline/spawn 选择、
+    /// 绝不影响正确性（spawn/inline 的 open_tcp 都按调用时选腿做对的事，epoch 框架兜住迟到结果）。
+    fn open_is_cheap(&self) -> bool {
+        self.state.active_leg() == TcpLeg::Tuic
+    }
 }
 
 #[async_trait::async_trait]
