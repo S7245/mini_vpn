@@ -1064,6 +1064,18 @@ impl DatagramUpstream for TuicUpstream {
     }
 }
 
+/// 刀9 F1：failover 健康探测面。`probe` 主动探活（live_conn=QUIC 握手+TUIC 认证，非浅探）；
+/// `is_dead` 区分 down 快路（黑洞，连接被 idle/keepalive 打死）/慢路（流失败）。
+#[async_trait::async_trait]
+impl crate::failover::HealthProbe for TuicUpstream {
+    async fn probe(&self) -> bool {
+        self.live_conn().await.is_ok()
+    }
+    async fn is_dead(&self) -> bool {
+        self.conn.lock().await.close_reason().is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

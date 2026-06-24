@@ -444,6 +444,8 @@ pub async fn start_tun_proxy() {
                 }
             };
             let upstream = Arc::new(FailoverUpstream::new(tuic, reality));
+            // 后台健康探针：REALITY 当班时每 30s 探 TUIC，按不对称迟滞（连续 3 + 60s 冷却）切回。
+            upstream.spawn_health_probe();
             println!("🔀 failover 就绪：TCP relay 健康感知 TUIC↔REALITY，UDP 恒走 TUIC");
             run_event_loop(device, upstream, tuic_downlink_rx, runtime_config, NoopSink).await;
         }
