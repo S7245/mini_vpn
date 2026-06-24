@@ -5,6 +5,7 @@ use crate::tuic::{
 };
 use crate::upstream::{DatagramUpstream, ProxyUpstream, RelayStream};
 use crate::reality_upstream::RealityUpstream;
+use crate::failover::FailoverUpstream;
 use crate::udp_relay::{
     FourTuple, UDP_FLOW_IDLE_SECS, UdpInbound, build_udp_ip_packet, parse_inbound_udp,
 };
@@ -406,19 +407,60 @@ pub async fn start_tun_proxy() {
             let (_dummy_tx, dummy_rx) = mpsc::channel::<Vec<u8>>(1); // 持 tx 不 drop → 下行分支永挂
             run_event_loop(device, upstream, dummy_rx, runtime_config, NoopSink).await;
         }
+        UpstreamKind::Failover => {
+            // 刀9：健康感知 TUIC↔REALITY。两腿都建——TUIC 既承 TCP relay 又是 **UDP 唯一出口**，
+            // REALITY 是 TCP-only 备路。`FailoverUpstream::open_tcp` 按健康态选腿；`send_udp` 恒走 tuic。
+            let tuic_cfg = match TuicClientConfig::from_env() {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("加载 TUIC 客户端配置失败（failover 启动中止）: {e}");
+                    return;
+                }
+            };
+            let tuic = match TuicUpstream::connect(&tuic_cfg).await {
+                Ok(u) => {
+                    println!("✅ 已连接 TUIC 出口 {} (failover 主腿)", tuic_cfg.server);
+                    Arc::new(u)
+                }
+                Err(e) => {
+                    println!("连接 TUIC 出口失败（failover 启动中止）: {e:?}");
+                    return;
+                }
+            };
+            // UDP 下行接收端来源端 = TUIC（独立于 TCP 选腿；UDP 永久绑 TUIC）。
+            println!("🌊 UDP relay 数据面就绪（TUIC Packet datagram → sing-box；UDP 永留 QUIC）");
+            let tuic_downlink_rx = tuic.start_udp();
+            let reality = match RealityUpstream::from_env() {
+                Ok(u) => {
+                    println!("✅ 已配置 REALITY 出口（failover 备腿；VLESS over REALITY over TCP）");
+                    Arc::new(u)
+                }
+                Err(e) => {
+                    println!("加载 REALITY 客户端配置失败（failover 需两腿都配齐，启动中止）: {e:?}");
+                    return;
+                }
+            };
+            let upstream = Arc::new(FailoverUpstream::new(tuic, reality));
+            println!("🔀 failover 就绪：TCP relay 健康感知 TUIC↔REALITY，UDP 恒走 TUIC");
+            run_event_loop(device, upstream, tuic_downlink_rx, runtime_config, NoopSink).await;
+        }
     }
 }
 
 /// 选哪个上游 Transport（纯函数，便于单测）。默认 + 未知值 → TUIC（零回归）。
+/// 刀9：新增 `failover`（健康感知 TUIC↔REALITY，需两腿都配齐）。`tuic`/`reality` 仍作强制单腿调试旁路。
+/// **failover 设为 opt-in**（非默认）：默认/未设保持纯 TUIC，对既有 TUIC-only 部署零回归（稳定优先）。
 #[derive(Debug, PartialEq, Eq)]
 enum UpstreamKind {
     Tuic,
     Reality,
+    Failover,
 }
 
 fn select_upstream_kind(env: Option<&str>) -> UpstreamKind {
     match env.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
         Some("reality") => UpstreamKind::Reality,
+        Some("failover") => UpstreamKind::Failover,
         _ => UpstreamKind::Tuic,
     }
 }
@@ -1306,13 +1348,16 @@ mod tests {
     use super::*;
     use smoltcp::iface::SocketSet;
 
-    /// 刀8：上游选择器——reality（大小写/空白不敏感）→ Reality；其余（含 tuic/缺省/未知）→ Tuic（零回归）。
+    /// 刀8/刀9：上游选择器——reality→Reality、failover→Failover（大小写/空白不敏感）；
+    /// 其余（含 tuic/缺省/未知）→ Tuic（零回归，failover opt-in）。
     #[test]
     fn upstream_kind_selector() {
         assert_eq!(select_upstream_kind(Some("reality")), UpstreamKind::Reality);
         assert_eq!(select_upstream_kind(Some("  REALITY ")), UpstreamKind::Reality);
+        assert_eq!(select_upstream_kind(Some("failover")), UpstreamKind::Failover);
+        assert_eq!(select_upstream_kind(Some(" Failover ")), UpstreamKind::Failover);
         assert_eq!(select_upstream_kind(Some("tuic")), UpstreamKind::Tuic);
-        assert_eq!(select_upstream_kind(None), UpstreamKind::Tuic, "缺省 → TUIC");
+        assert_eq!(select_upstream_kind(None), UpstreamKind::Tuic, "缺省 → TUIC（failover opt-in）");
         assert_eq!(select_upstream_kind(Some("bogus")), UpstreamKind::Tuic, "未知 → TUIC（零回归）");
     }
 
