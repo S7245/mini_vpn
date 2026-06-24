@@ -435,6 +435,56 @@ impl DatagramUpstream for RealityUpstream {
     async fn send_udp(&self, _datagram: Vec<u8>) {}
 }
 
+/// 直连探针（诊断用，**无 TUN/无 sudo**）：用 `MINI_VPN_REALITY_*` env 对 `target` 跑一次 REALITY 握手 +
+/// 一个明文 HTTP GET，逐步打印卡点。把 REALITY 协议/服务端问题从 TUN/主循环 inline-blocking/curl 突发里隔离出来。
+/// 中文要点：`target` 用**明文 HTTP 端口**（如 `example.com:80`）——探针发裸 HTTP，目标须能直接收 HTTP（:443 会要 TLS）。
+/// 建议配 `MINI_VPN_REALITY_DEBUG=1` 看握手逐步日志。
+pub async fn reality_probe(target: &str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let cfg = match RealityClientConfig::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[probe] ❌ 配置错误: {e:?}");
+            return;
+        }
+    };
+    eprintln!("[probe] REALITY 出口 server={} sni={} → target={target}", cfg.server, cfg.sni);
+    let t = match TargetAddr::parse(target) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[probe] ❌ target 非法: {e:?}");
+            return;
+        }
+    };
+    let host = match &t {
+        TargetAddr::DomainPort { host, .. } => host.clone(),
+        TargetAddr::IpPort(a) => a.ip().to_string(),
+    };
+    let up = RealityUpstream::new(cfg);
+    match up.open_tcp(&t).await {
+        Ok(mut s) => {
+            eprintln!("[probe] ✅ open_tcp 成功（REALITY 握手 + VLESS 请求完成）→ 发 HTTP GET…");
+            let req = format!(
+                "GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: mini-vpn-probe\r\n\r\n"
+            );
+            if let Err(e) = s.write_all(req.as_bytes()).await {
+                eprintln!("[probe] ❌ 写请求失败: {e}");
+                return;
+            }
+            let mut buf = vec![0u8; 4096];
+            match s.read(&mut buf).await {
+                Ok(0) => eprintln!("[probe] ⚠️ 读到 EOF（隧道通但目标无响应）"),
+                Ok(n) => eprintln!(
+                    "[probe] ✅ 经 REALITY 隧道收到 {n} 字节响应（前 300）:\n{}",
+                    String::from_utf8_lossy(&buf[..n.min(300)])
+                ),
+                Err(e) => eprintln!("[probe] ❌ 读响应失败: {e}"),
+            }
+        }
+        Err(e) => eprintln!("[probe] ❌ open_tcp 失败: {e:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -64,6 +64,15 @@ fn io_err<E: std::fmt::Display>(ctx: &str, e: E) -> ClientError {
     ClientError::Reality(format!("{ctx}: {e}"))
 }
 
+/// 握手逐步诊断日志（env `MINI_VPN_REALITY_DEBUG` 开）：定位真出口握手卡在哪一步（排障/acceptance 用）。
+macro_rules! rdbg {
+    ($($arg:tt)*) => {
+        if std::env::var_os("MINI_VPN_REALITY_DEBUG").is_some() {
+            eprintln!("[reality-dbg] {}", format_args!($($arg)*));
+        }
+    };
+}
+
 /// 逐条读 outer TLS record（5B 头 + body），跨 read 缓冲粘包/拆包。
 /// 中文要点：握手与 app data 都按 record 分帧；`leftover` 在握手结束后交给 RealityStream 续读。
 pub(crate) struct RecordReader {
@@ -175,21 +184,25 @@ where
         .await
         .map_err(|e| io_err("写 client CCS", e))?;
     stream.flush().await.map_err(|e| io_err("flush CH", e))?;
+    rdbg!("→ 已发 ClientHello {} 字节 + dummy CCS，等 ServerHello…", input.client_hello.len());
 
     let mut transcript: Vec<u8> = input.client_hello.clone();
 
     let mut reader = RecordReader::new();
     // 2. 读 ServerHello（首条 record 须 0x16）。
     let (ct, _hdr, sh_msg) = reader.next(stream).await?;
+    rdbg!("← 收到首条 record type=0x{ct:02x} body={} 字节", sh_msg.len());
     if ct != 0x16 {
         return Err(err(format!("首条 record 非 handshake（type 0x{ct:02x}，期望 ServerHello）")));
     }
     let sh = parse_server_hello(&sh_msg, &input.expected_session_id)?;
+    rdbg!("✓ ServerHello 解析 OK cipher=0x{:04x}", sh.cipher_suite);
     transcript.extend_from_slice(&sh_msg);
 
     // 3. TLS 握手 ECDHE = x25519(client 临时, server SH 临时 keyshare)；派生握手密钥（全零 ECDHE 已拒）。
     let ecdhe = x25519_shared_secret(input.client_eph_secret, sh.server_key_share);
     let hs = derive_handshake_keys(&ecdhe, &input.client_hello, &sh_msg)?;
+    rdbg!("✓ 握手密钥派生 OK（ECDHE 非全零）");
     let mut recv = RecordKeys::new(&hs.server_key, &hs.server_iv); // read-seq 0
     let mut send_hs = RecordKeys::new(&hs.client_key, &hs.client_iv); // write-seq 0
 
@@ -202,6 +215,7 @@ where
     let mut cert_verified = false;
     'outer: loop {
         let (ct, hdr, payload) = reader.next(stream).await?;
+        rdbg!("← flight record type=0x{ct:02x} body={} 字节", payload.len());
         match ct {
             // server dummy CCS：整条丢弃，**不 open、不递增 server read seq**（不变量 3）。
             0x14 => continue,
@@ -211,12 +225,14 @@ where
                     return Err(err(format!("flight 阶段内层非 handshake（0x{inner_type:02x}）")));
                 }
                 for msg in reasm.push(&content) {
+                    rdbg!("  flight message type=0x{:02x} len={}", msg[0], msg.len());
                     match msg[0] {
                         0x08 => transcript.extend_from_slice(&msg), // EncryptedExtensions
                         0x0b => {
                             // Certificate → **REALITY auth 决策**（verify_cert）。失败 → 握手 Err。
                             verify_cert(&msg)?;
                             cert_verified = true;
+                            rdbg!("  ✓ Certificate 校验通过（REALITY auth HMAC OK）");
                             transcript.extend_from_slice(&msg);
                         }
                         0x0f => transcript.extend_from_slice(&msg), // CertificateVerify：折但不验签（ADR-0010）
@@ -234,6 +250,7 @@ where
                             if got != expected {
                                 return Err(err("server Finished MAC 不匹配（握手完整性失败）"));
                             }
+                            rdbg!("  ✓ server Finished MAC 验证通过");
                             transcript.extend_from_slice(&msg);
                             break 'outer;
                         }
@@ -259,6 +276,7 @@ where
     let app = derive_application_keys(&hs.handshake_secret, &th_sfin);
     let recv_keys = RecordKeys::new(&app.server_key, &app.server_iv);
     let send_keys = RecordKeys::new(&app.client_key, &app.client_iv);
+    rdbg!("✓ 握手完成，app 密钥派生，已发 client Finished");
 
     Ok(HandshakeOutput {
         recv_keys,
