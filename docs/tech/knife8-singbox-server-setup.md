@@ -7,12 +7,12 @@
 
 ```bash
 sing-box generate reality-keypair    # PrivateKey / PublicKey（均 base64url RawURL，43 字符）
-# PrivateKey: <server reality.private_key â not in git>
-# PublicKey: <client MINI_VPN_REALITY_PBK â not in git>
+# PrivateKey: <server reality.private_key - NOT IN GIT>
+# PublicKey:  <client MINI_VPN_REALITY_PBK - NOT IN GIT>
 sing-box generate uuid               # 或任意 RFC4122 UUID
-# <uuid â not in git>
+# UUID: <both ends identical - NOT IN GIT>
 openssl rand -hex 8                   # short_id（8 字节=16 hex；1-8 字节都行）
-# <short_id â not in git>
+# short_id: <both ends identical - NOT IN GIT>
 ```
 
 | 产物 | 用途 |
