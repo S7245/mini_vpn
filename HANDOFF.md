@@ -15,8 +15,8 @@
   离线 auth 密码学 + TLS 1.3 ClientHello（手写 TLS 1.3，ADR-0008，sans-IO 无 acceptance）。REALITY 是 mini-project（刀6→刀9，见上）。
 - **刀7 已在 `main`（`14258e4`，2026-06-23 fast-forward 合入）**：REALITY 第二片——离线 ServerHello 解析 +
   TLS 1.3 key schedule + record AEAD（手写，全程 RFC 8448 §3 KAT 字节级验证，sans-IO 无 acceptance，ADR-0009）。见下「刀7 完成」。
-- **刀8 已完成（2026-06-24）+ 真出口 acceptance ✅**：REALITY 收官片——实 TCP 握手 + 解密 server flight + 证书 HMAC + Finished + VLESS + `RealityUpstream` + env 选择器；**VLESS over REALITY over TCP 在真 sing-box 上端到端跑通**（HTTP 200 三端闭环）。见下「刀8 完成」。**分支 `claude/knife8-reality-live-handshake`（HEAD `a928125`+，未合 main——待用户 fast-forward）。**
-- **新 session 起点（下一刀=刀9）：刀8 合入 main 后从 main 起新分支**（REALITY mini-project 收尾 = auto-failover 健康感知 TUIC↔REALITY + 分离 TCP/UDP 上游；见下「刀8 完成」末 deferred）。
+- **刀8 已完成（2026-06-24）+ 真出口 acceptance ✅，已 ff 合入 main（`a9172a0`）**：REALITY 收官片——实 TCP 握手 + 解密 server flight + 证书 HMAC + Finished + VLESS + `RealityUpstream` + env 选择器；**VLESS over REALITY over TCP 在真 sing-box 上端到端跑通**（HTTP 200 三端闭环）。见下「刀8 完成」。
+- **新 session 起点（下一刀=刀9）：直接从 `main`（`a9172a0`）起新分支**（REALITY mini-project 收尾 = auto-failover 健康感知 TUIC↔REALITY + 分离 TCP/UDP 上游；见下「刀8 完成」末 deferred）。
   若改开主线：高带宽压测+数据面多线程（逼近 100M）/ observability(DNS forge 计数、datagram drop 背压)——按优先级定。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
@@ -256,7 +256,7 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
 
 ## 刀8 代码完成（2026-06-24）：REALITY 收官 — 实握手 + VLESS + RealityUpstream + **真出口 acceptance ✅**
 
-**交付**（分支 `claude/knife8-reality-live-handshake`，从 main 起，逐 commit push；**REALITY mini-project（刀6→9）的收官片，VLESS over REALITY over TCP 端到端跑通**）：
+**交付**（分支 `claude/knife8-reality-live-handshake`，从 main 起，逐 commit push；**已 ff 合入 main `a9172a0`**；**REALITY mini-project（刀6→9）的收官片，VLESS over REALITY over TCP 端到端跑通**）：
 - **设计输入**：understand-phase 研究 workflow（5 路并行 + 20 条互通-critical 断言对抗验证）→ brief；grill 6 裁决（见 spec §2）。
 - **新增**（`src/reality/{handshake,vless,cert}.rs` + `src/reality_upstream.rs`）：
   - `vless`：`encode_vless_request`（空 flow，**PortThenAddress** + ATYP v4=01/domain=02/v6=03，**不复用 tuic**）+ `VlessResponseStripper`（动态 2+addons_len 首读剥）。
