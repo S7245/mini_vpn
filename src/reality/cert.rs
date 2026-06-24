@@ -56,7 +56,15 @@ pub fn extract_ed25519_pubkey_and_sig(
     let cert = Certificate::from_der(der).map_err(|e| err(format!("DER 解析失败: {e}")))?;
     let spki = &cert.tbs_certificate.subject_public_key_info;
     if spki.algorithm.oid.to_string() != OID_ED25519 {
-        return Err(err("SPKI 算法非 ed25519（1.3.101.112）"));
+        // 拿到的是**非 ed25519 真实证书** = 借用站(decoy)的真证书 → 服务端 REALITY auth **失败**、把我们
+        // 当未认证 prober 静默转发到了真借用站（不发 alert）。这不是握手 bug，是凭据/配置不匹配。排查顺序：
+        // ① pbk 必须 = 服务端 public_key（**不是 private_key**，也须与服务端 keypair 同对）；
+        // ② SNI 必须 ∈ 服务端 serverNames（精确相等）；③ short_id 必须 ∈ 服务端 short_id 列表。
+        return Err(err(format!(
+            "拿到非 ed25519 证书（SPKI OID {}）→ 服务端 REALITY auth 失败、回落到 decoy。\
+             查：①pbk=服务端 public_key(非 private_key) ②SNI∈serverNames ③short_id 匹配",
+            spki.algorithm.oid
+        )));
     }
     let pk = spki
         .subject_public_key
