@@ -23,6 +23,9 @@ use tokio::sync::mpsc;
 
 pub(crate) const TCP_SOCKET_BUFFER_SIZE: usize = 65_535;
 const RELAY_CHANNEL_CAPACITY: usize = 1024;
+/// L2（刀9 F4）：一条 relay 双向静默多久判 idle → 退出 + shutdown。防慢/卡死上游（尤其 REALITY
+/// TCP-only 手写 TLS 遇 server 不返回）长期挂住 relay task 泄漏。90s 偏宽松保稳（长轮询/SSE 不误杀）。
+const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// 主循环分段插桩接缝（knife1：并发压测定位瓶颈）。
 ///
@@ -1188,59 +1191,75 @@ async fn handle_remote_payload<D: TunIo>(
 
 fn spawn_remote_relay(
     handle: SocketHandle,
+    stream: RelayStream,
+    rx: mpsc::Receiver<Vec<u8>>,
+    back_tx: mpsc::Sender<(SocketHandle, Vec<u8>)>,
+) {
+    tokio::spawn(run_relay(handle, stream, rx, back_tx));
+}
+
+/// 一条 TCP relay 的双向泵（独立 task body；抽出便于 idle 超时单测）。
+/// 中文要点：L2（刀9 F4）select 加 idle 超时分支——双向 `RELAY_IDLE_TIMEOUT` 无活动 → 退出 + shutdown。
+/// 任一方向有活动（本地→上游 write 成功 / 上游→本地 read）即重置（每轮 select 重建 sleep，计「距上次活动」）。
+/// 适用 TUIC/REALITY 两种 RelayStream，与连接级 failover 探测无关（那是连接级，这是单 relay 级）。
+async fn run_relay(
+    handle: SocketHandle,
     mut stream: RelayStream,
     mut rx: mpsc::Receiver<Vec<u8>>,
     back_tx: mpsc::Sender<(SocketHandle, Vec<u8>)>,
 ) {
-    tokio::spawn(async move {
-        let mut buf = [0u8; 65_536];
-        loop {
-            tokio::select! {
-                local_msg = rx.recv() => {
-                    match local_msg {
-                        Some(payload) => {
-                            match stream.write_all(&payload).await {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    println!("写入上游流失败: {:?}", e);
-                                    break;
-                                }
+    let mut buf = [0u8; 65_536];
+    loop {
+        tokio::select! {
+            local_msg = rx.recv() => {
+                match local_msg {
+                    Some(payload) => {
+                        match stream.write_all(&payload).await {
+                            Ok(_) => {}
+                            Err(e) => {
+                                println!("写入上游流失败: {:?}", e);
+                                break;
                             }
-                        }
-                        None => {
-                            println!("本地房间 {:?} 已关闭通道", handle);
-                            break;
                         }
                     }
-                }
-                remote_msg = stream.read(&mut buf) => {
-                    match remote_msg {
-                        Ok(0) => {
-                            println!("远端服务器关闭了车厢 {:?}", handle);
-                            if back_tx.send((handle, vec![])).await.is_err() {
-                                break;
-                            }
-                            break;
-                        }
-                        Ok(n) => {
-                            let data = buf[..n].to_vec();
-                            if back_tx.send((handle, data)).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            println!("读取 Yamux 流失败（从远端读取失败）: {:?}", e);
-                            break;
-                        }
+                    None => {
+                        println!("本地房间 {:?} 已关闭通道", handle);
+                        break;
                     }
                 }
             }
+            remote_msg = stream.read(&mut buf) => {
+                match remote_msg {
+                    Ok(0) => {
+                        println!("远端服务器关闭了车厢 {:?}", handle);
+                        if back_tx.send((handle, vec![])).await.is_err() {
+                            break;
+                        }
+                        break;
+                    }
+                    Ok(n) => {
+                        let data = buf[..n].to_vec();
+                        if back_tx.send((handle, data)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        println!("读取 Yamux 流失败（从远端读取失败）: {:?}", e);
+                        break;
+                    }
+                }
+            }
+            // L2：双向静默超时 → 主动清理（防泄漏）。有活动的 select 分支会重启 loop → 重建 sleep。
+            _ = tokio::time::sleep(RELAY_IDLE_TIMEOUT) => {
+                println!("⏱️ relay {:?} 双向静默 {}s，idle 超时关闭（L2）", handle, RELAY_IDLE_TIMEOUT.as_secs());
+                break;
+            }
         }
-        // M2：关流前 shutdown——驱动 poll_shutdown 排空应用层缓冲（RealityStream 的 write_pending 尾部密文）
-        // + 底层发 FIN；否则 best-effort poll_write 残留的 TLS app-record 尾部密文随 drop 丢弃 → 对端 AEAD
-        // 停在 record 中途 + 收到提前 FIN（bad-decrypt / 被 REALITY 当异常流量）。对 TUIC 也是干净 finish。
-        let _ = stream.shutdown().await;
-    });
+    }
+    // M2：关流前 shutdown——驱动 poll_shutdown 排空应用层缓冲（RealityStream 的 write_pending 尾部密文）
+    // + 底层发 FIN；否则 best-effort poll_write 残留的 TLS app-record 尾部密文随 drop 丢弃 → 对端 AEAD
+    // 停在 record 中途 + 收到提前 FIN（bad-decrypt / 被 REALITY 当异常流量）。对 TUIC 也是干净 finish。
+    let _ = stream.shutdown().await;
 }
 
 /// rx 热路径分流结果。
@@ -1359,6 +1378,84 @@ mod tests {
         assert_eq!(select_upstream_kind(Some("tuic")), UpstreamKind::Tuic);
         assert_eq!(select_upstream_kind(None), UpstreamKind::Tuic, "缺省 → TUIC（failover opt-in）");
         assert_eq!(select_upstream_kind(Some("bogus")), UpstreamKind::Tuic, "未知 → TUIC（零回归）");
+    }
+
+    // ---- 刀9 F4：relay idle 超时（L2）----
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+
+    /// 一条永不产数据的 mock 上游流：read 恒 Pending、write/flush 即成、shutdown 记账。
+    /// 用于驱动 run_relay 的 idle 超时分支（唯一能 fire 的分支）。
+    struct IdleStream {
+        shutdown_called: Arc<AtomicBool>,
+    }
+    impl tokio::io::AsyncRead for IdleStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending // 永不产数据/永不 EOF：只有 idle sleep 分支能完成
+        }
+    }
+    impl tokio::io::AsyncWrite for IdleStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len())) // 上行 write 即成（活动 → 重置 idle）
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.shutdown_called.store(true, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn mk_test_handle(sockets: &mut SocketSet<'static>) -> SocketHandle {
+        sockets.add(build_listener_socket(&ListenerSpec { local_port: 12345 }))
+    }
+
+    /// idle：双向 90s 无活动 → relay task 退出 + stream.shutdown 被调（L2）。
+    #[tokio::test(start_paused = true)]
+    async fn relay_idle_timeout_shuts_down_stream() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let flag = Arc::new(AtomicBool::new(false));
+        let stream: RelayStream = Box::new(IdleStream { shutdown_called: flag.clone() });
+        let (_tx, rx) = mpsc::channel::<Vec<u8>>(8); // 持 _tx → rx 不关、永不收（无活动）
+        let (back_tx, _back_rx) = mpsc::channel(8);
+        let task = tokio::spawn(run_relay(handle, stream, rx, back_tx));
+
+        tokio::time::advance(std::time::Duration::from_secs(89)).await;
+        assert!(!task.is_finished(), "89s < 90s idle 阈值，relay 不应退出");
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        task.await.unwrap();
+        assert!(flag.load(Ordering::SeqCst), "idle 超时应退出并调用 stream.shutdown（L2）");
+    }
+
+    /// 活动重置：临近阈值前来一次上行活动 → idle 计时重置，不退出；再静默满 90s 才退出。
+    #[tokio::test(start_paused = true)]
+    async fn relay_activity_resets_idle_timer() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let flag = Arc::new(AtomicBool::new(false));
+        let stream: RelayStream = Box::new(IdleStream { shutdown_called: flag.clone() });
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let (back_tx, _back_rx) = mpsc::channel(8);
+        let task = tokio::spawn(run_relay(handle, stream, rx, back_tx));
+
+        tokio::time::advance(std::time::Duration::from_secs(89)).await;
+        tx.send(vec![1, 2, 3]).await.unwrap(); // 活动（上行 write）→ 重置 idle 计时
+        tokio::task::yield_now().await; // 让 relay 消费该活动并重建 sleep
+        tokio::time::advance(std::time::Duration::from_secs(89)).await;
+        assert!(!task.is_finished(), "活动重置了 idle 计时，第二个 89s 窗口内不应退出");
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        task.await.unwrap();
+        assert!(flag.load(Ordering::SeqCst), "重置后再满 90s 静默才退出");
     }
 
     #[test]
