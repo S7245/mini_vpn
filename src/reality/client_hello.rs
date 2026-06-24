@@ -7,7 +7,13 @@
 //! 不能让借用站谈成 1.2），key_share 含 **X25519**（sing-box 硬要求，从中取 ECDHE pubkey 派生 AuthKey）。
 
 /// 固定 GREASE 值（真 Chrome 随机选；固定值对"够用"的指纹足够，离线测也确定）。
+/// 用于 cipher / supported_groups / supported_versions 列表里的 GREASE 占位值，以及**第一个** GREASE 扩展的 type。
 const GREASE: u16 = 0x0a0a;
+/// **第二个** GREASE 扩展的 type，必须与 [`GREASE`] **不同**（互通-critical）：
+/// 两个 GREASE 扩展若同 type 0x0a0a = **重复扩展类型**，违反 RFC 8446 §4.2「同一扩展块不得有重复 type」。
+/// 宽容解析器（Apple/tls-parser）容忍，但 sing-box 的 Go-tls 严格解析器**拒整个 ClientHello → REALITY auth 前
+/// 回落 decoy**（真出口实测根因，2026-06-24）。真 Chrome 的两个 GREASE 扩展正是用不同 GREASE 值。0x1a1a 是合法 GREASE 值。
+const GREASE_EXT2: u16 = 0x1a1a;
 
 /// session_id 字段在 ClientHello **handshake message** 里的偏移与长度（REALITY seal 回写处）。
 /// 4(handshake hdr) + 2(legacy_version) + 32(random) + 1(session_id len) = **39**；长度恒 **32**
@@ -118,8 +124,8 @@ fn build_extensions(p: &ClientHelloParams) -> Vec<u8> {
         b.extend_from_slice(&vers);
         e.extend_from_slice(&ext(0x002b, &b));
     }
-    // 尾部 GREASE（空）
-    e.extend_from_slice(&ext(GREASE, &[]));
+    // 尾部 GREASE（空）——**必须用与开头不同的 GREASE type**（GREASE_EXT2），否则重复扩展类型被 Go-tls 拒。
+    e.extend_from_slice(&ext(GREASE_EXT2, &[]));
     e
 }
 
@@ -290,6 +296,30 @@ mod tests {
         // ALPN 含 h2。
         let alpn = find_ext(exts, 0x0010).expect("ALPN 扩展");
         assert!(alpn.windows(2).any(|w| w == b"h2"), "ALPN 含 h2");
+    }
+
+    /// **互通-critical 回归守卫**：ClientHello 扩展块**无重复扩展类型**（RFC 8446 §4.2）。
+    /// 历史 bug：两个 GREASE 扩展同 type 0x0a0a → 严格的 Go-tls(sing-box REALITY) 拒整个 CH → auth 前回落 decoy
+    /// （真出口实测根因，2026-06-24）。两个 GREASE 扩展须用不同 GREASE type。
+    #[test]
+    fn no_duplicate_extension_types() {
+        let msg = sample();
+        let (_rest, hs) = parse_tls_message_handshake(&msg).unwrap();
+        let TlsMessage::Handshake(TlsMessageHandshake::ClientHello(ch)) = hs else {
+            panic!("不是 ClientHello")
+        };
+        let exts = ch.ext.expect("有扩展块");
+        let mut seen = std::collections::HashSet::new();
+        let mut i = 0;
+        while i + 4 <= exts.len() {
+            let t = u16::from_be_bytes([exts[i], exts[i + 1]]);
+            let l = u16::from_be_bytes([exts[i + 2], exts[i + 3]]) as usize;
+            assert!(seen.insert(t), "重复扩展类型 0x{t:04x}（违反 RFC 8446 §4.2，被 Go-tls 拒 → 回落 decoy）");
+            i += 4 + l;
+        }
+        // 两个 GREASE 扩展都在，但 type 不同。
+        assert!(seen.contains(&GREASE), "含第一个 GREASE 扩展");
+        assert!(seen.contains(&GREASE_EXT2), "含第二个 GREASE 扩展（不同 type）");
     }
 
     /// 刀6 T3 核心：build_authed → 「服务端视角」解封 round-trip。
