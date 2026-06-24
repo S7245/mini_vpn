@@ -15,7 +15,8 @@
   离线 auth 密码学 + TLS 1.3 ClientHello（手写 TLS 1.3，ADR-0008，sans-IO 无 acceptance）。REALITY 是 mini-project（刀6→刀9，见上）。
 - **刀7 已在 `main`（`14258e4`，2026-06-23 fast-forward 合入）**：REALITY 第二片——离线 ServerHello 解析 +
   TLS 1.3 key schedule + record AEAD（手写，全程 RFC 8448 §3 KAT 字节级验证，sans-IO 无 acceptance，ADR-0009）。见下「刀7 完成」。
-- **新 session 起点（下一刀=刀8）：直接从 `main`（`14258e4`）起新分支**（续 REALITY：实 TCP 握手 + 解密 server flight + 证书 HMAC + Finished + VLESS + RealityUpstream + 真出口 acceptance，见下「刀7 完成」末 deferred）。
+- **刀8 已完成（2026-06-24）+ 真出口 acceptance ✅**：REALITY 收官片——实 TCP 握手 + 解密 server flight + 证书 HMAC + Finished + VLESS + `RealityUpstream` + env 选择器；**VLESS over REALITY over TCP 在真 sing-box 上端到端跑通**（HTTP 200 三端闭环）。见下「刀8 完成」。**分支 `claude/knife8-reality-live-handshake`（HEAD `a928125`+，未合 main——待用户 fast-forward）。**
+- **新 session 起点（下一刀=刀9）：刀8 合入 main 后从 main 起新分支**（REALITY mini-project 收尾 = auto-failover 健康感知 TUIC↔REALITY + 分离 TCP/UDP 上游；见下「刀8 完成」末 deferred）。
   若改开主线：高带宽压测+数据面多线程（逼近 100M）/ observability(DNS forge 计数、datagram drop 背压)——按优先级定。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
@@ -252,6 +253,26 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
 - **🔑 刀8 别再踩**：TLS 握手 ECDHE = x25519(client 临时, **server 临时** keyshare from SH)，≠ 刀6 AuthKey 的 (client × server **静态** pbk)；**x25519 全零拒已在 `derive_handshake_keys`**；record cipher = AES-128-GCM（≠ 刀6 session_id seal 的 AES-256）；**cipher≠0x1301 已在 parse 层拒**（0x1302/0x1303 是 ADR-0009 gap）。
 - **设计文档**：`docs/tech/2026-06-23-knife7-reality-handshake-{spec,plan}.md`；ADR-0009（cipher 范围 + echo≠auth 不变量）。
 - **deferred（刀8）**：实 TCP 握手 + 读写循环 + 跳明文 dummy CCS（不进 read-seq）；用 record/key_schedule 解密真 server flight；X.509 DER 提 ed25519 pubkey+sig → 刀6 `verify_server_cert`（REALITY auth 决策）；CertificateVerify ed25519 检；server-Finished MAC 验 + 发 client Finished；app keys（刀7 已就绪）；VLESS 帧（空 flow）；`RealityUpstream`(ProxyUpstream open_tcp) + env 选择器 + 真出口 acceptance（需 sing-box VLESS+REALITY inbound 空 flow）。可能需 x509 parser crate。
+
+## 刀8 代码完成（2026-06-24）：REALITY 收官 — 实握手 + VLESS + RealityUpstream + **真出口 acceptance ✅**
+
+**交付**（分支 `claude/knife8-reality-live-handshake`，从 main 起，逐 commit push；**REALITY mini-project（刀6→9）的收官片，VLESS over REALITY over TCP 端到端跑通**）：
+- **设计输入**：understand-phase 研究 workflow（5 路并行 + 20 条互通-critical 断言对抗验证）→ brief；grill 6 裁决（见 spec §2）。
+- **新增**（`src/reality/{handshake,vless,cert}.rs` + `src/reality_upstream.rs`）：
+  - `vless`：`encode_vless_request`（空 flow，**PortThenAddress** + ATYP v4=01/domain=02/v6=03，**不复用 tuic**）+ `VlessResponseStripper`（动态 2+addons_len 首读剥）。
+  - `cert`：`extract_ed25519_pubkey_and_sig`——**手解 DER** 扫 ed25519 SPKI marker 取裸 32B 公钥 + 取 leaf DER 末 64B 签名（**不碰 Validity**；见下 acceptance 真因）。
+  - `handshake`：`drive<S:AsyncRead+AsyncWrite>`（编排 spec §5 时序）+ `RecordReader`（逐 record，跨 read 缓冲）+ `HandshakeReassembler`（内层 0x16 跨 record 重组）。**H1 cert-seen 守卫**：无通过校验的 Certificate 不许完成握手（防 EE+Finished 的 decoy 绕过 auth）。
+  - `reality_upstream`：`parse_pbk`（base64url+std→强断言 32B）+ `RealityClientConfig`（脱敏 Debug）+ `RealityStream`（AsyncRead/Write over TLS1.3 app record + VLESS 响应 strip + post-handshake drop + KeyUpdate loud-fail）+ `RealityUpstream`（`ProxyUpstream::open_tcp` 每 TCP 一次完整握手 + 10s 超时；`DatagramUpstream::send_udp` no-op）。
+  - `client_tun`：`MINI_VPN_UPSTREAM=tuic|reality` 选择器（默认 tuic，零回归）+ reality 空 downlink channel（持 tx 永不 send）。
+- **质量**：161 lib 测全绿（每个互通-critical 字节 KAT；RFC 8448 §3 握手 drive e2e；**loopback 全 REALITY 握手 e2e**=测试内 REALITY server 模拟器走通真 verify_server_cert + VLESS 往返）+ clippy 0 warning + release 绿。`/code-review`（多 agent 对抗式，16 confirmed findings）已修：H1(auth bypass 守卫)/H2(握手超时)/M1(KeyUpdate loud-fail)/M2(relay shutdown)/M4(截断报错)/L1-L7；deferred → 刀9：M3(握手并发化,H2 超时止血)/L2(relay idle 超时)。
+- **🔑 真出口 acceptance ✅（2026-06-24，深圳 client → 47.x sing-box VLESS+REALITY inbound，借用站 gateway.icloud.com）**：curl HTTPS 经 REALITY 隧道 **HTTP 200**（cloudflare trace 见 VPS 出口 IP=三端闭环）+ client 日志 `🔐 REALITY 握手成功（证书 HMAC 校验通过）`（**真 HMAC，非 echo 充数**）；多目标并发握手成功；force-reality 下 UDP no-op 符合预期。
+- **🔑 acceptance 抓出的两个互通 bug（离线测全绿但真出口才暴露 —— "宽容方收、严格方拒"，坐实真出口纪律必要）**：
+  1. **重复 GREASE 扩展类型**：两个 GREASE 扩展都用 type 0x0a0a（违反 RFC 8446 §4.2）→ Apple/tls-parser 宽容但 sing-box 的 Go-tls 严格解析器**拒整个 ClientHello → REALITY auth 前回落 decoy**。修：尾部 GREASE 改 0x1a1a（真 Chrome 同法）+ 回归守卫 `no_duplicate_extension_types`。
+  2. **GeneralizedTime 证书**：真 sing-box 临时证书 Validity 用 GeneralizedTime（notAfter≥2050）→ x509-cert 严格 RFC 5280 拒。修：改回**手解 DER 定点提取**（不碰 Validity，反转 grill 裁决 a、印证 brief 原判；去掉 x509-cert 依赖）+ GeneralizedTime fixture 回归测试。
+  - **诊断链**（教学价值）：用真服务端私钥在 Rust 证明客户端密码学 100% 正确（AuthKey 匹配、session_id 可解）→ 排除凭据/AAD/keypair → 锁定"CH 被严格 Go 解析器拒" → dump CH 发现重复 GREASE → 修 → 穿过 decoy → 撞 GeneralizedTime → 手解 DER。
+- **设计文档**：`docs/tech/2026-06-23-knife8-reality-live-handshake-{spec,plan}.md` + `2026-06-23-knife8-research-brief.md` + `knife8-singbox-server-setup.md`；ADR-00010（CertVerify defer + KeyUpdate gap + cert 提取反转）；ADR-0009 修订（收紧 cipher offer 0x1301）。acceptance helper `scripts/knife8-reality-acceptance.sh`（preflight/soak/smoke/soak-stop + openssl 0x1301 出口预检）。
+- **deferred（刀9）**：auto-failover（健康感知 TUIC↔REALITY）；分离 TCP/UDP 上游；UDP-over-VLESS；连接复用（每 TCP 一次握手）；握手并发化（M3，移出主循环 spawn）；relay idle 超时（L2）；KeyUpdate 密钥轮换（ADR-0010 gap）；0x1302/0x1303（ADR-0009 gap）；Vision flow。
+- **⚠️ 安全 note**：acceptance 期间一份服务端凭据（reality private_key/uuid/short_id）曾被误提交进 `docs/tech/knife8-singbox-server-setup.md`（commit 5ded2a2）并推 origin → 已 force-push 重写历史清除（HEAD a928125）+ 文件改占位符；**该 keypair 须在服务端轮换**（私钥上过远端=已暴露）。
 
 ## Rhythm（每刀都遵守）
 

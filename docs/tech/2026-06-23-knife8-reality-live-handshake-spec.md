@@ -148,3 +148,13 @@ Cargo.toml (改)                   + x509-cert, + base64
 - `/code-review`（high effort）findings 处理完。
 - 真出口 acceptance：client 日志 `verify_server_cert==true`（非 echo 充数）+ curl HTTPS 经 REALITY 隧道三端闭环；force-reality 下 UDP no-op 符合预期；握手延迟量化；JA3 best-effort。
 - ADR-00010 + ADR-0009 修订 + CONTEXT/HANDOFF 更新。
+
+## 9. 完成 ✅（2026-06-24）
+
+- **离线**：161 lib 测全绿（每互通-critical 字节 KAT + RFC 8448 §3 握手 drive e2e + loopback 全 REALITY 握手 e2e）、clippy 0、release 绿。`/code-review`（多 agent 对抗式，16 confirmed）全修（H1-L7；M3/L2 → 刀9）。
+- **真出口 acceptance ✅**（深圳 client → 47.x sing-box VLESS+REALITY，借用站 gateway.icloud.com）：curl HTTPS **HTTP 200**（cloudflare trace 见 VPS 出口 IP = 三端闭环）+ client 日志 `🔐 REALITY 握手成功（证书 HMAC 校验通过）`（真 HMAC，非 echo）+ 多目标并发握手成功 + UDP no-op 符合预期。
+- **acceptance 抓出两个离线测不到的互通 bug**（宽容方收、严格方拒 —— 坐实真出口纪律必要）：
+  1. **重复 GREASE 扩展类型**（两个 GREASE 扩展同 type 0x0a0a，违 RFC 8446 §4.2）→ sing-box Go-tls 拒整个 ClientHello → REALITY auth 前回落 decoy。修：尾部 GREASE → 0x1a1a（`GREASE_EXT2`）+ 回归守卫 `no_duplicate_extension_types`。
+  2. **GeneralizedTime 证书**（真临时证书 Validity notAfter≥2050 用 GeneralizedTime）→ x509-cert 严格 RFC 5280 拒。修：改回**手解 DER**（不碰 Validity，反转 grill 裁决 a、印证 brief 原判，去 x509-cert 依赖）+ GeneralizedTime fixture 回归测试。
+  - 诊断链：用真服务端私钥在 Rust 证明客户端密码学 100% 正确（AuthKey 匹配、session_id 可解）→ 排除凭据/AAD/keypair → 锁定 CH 被严格 Go 拒 → dump CH 发现重复 GREASE → 修 → 穿过 decoy → 撞 GeneralizedTime → 手解 DER。
+- **安全 note**：acceptance 期一份服务端凭据曾误提交进 `knife8-singbox-server-setup.md`（5ded2a2）并推 origin → force-push 重写历史清除（HEAD a928125）+ 改占位符；**该 keypair 须服务端轮换**（私钥上过远端=已暴露）。
