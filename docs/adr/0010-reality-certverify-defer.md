@@ -60,3 +60,16 @@
 - **REALITY 握手要求 server flight 必含可校验的 Certificate**（H1 守卫）：`drive` 完成握手前强制 `verify_cert`
   通过过一次 Certificate(0x0b)——否则只发 EE+Finished 的回落 decoy 会绕过 REALITY auth（server Finished MAC 仅
   ECDHE 派生、与静态 pbk 无关，诚实 server 也算得对）。这是 REALITY「证书 HMAC 是唯一 auth 锚」的强制点。
+
+## 证书提取：x509-cert → 手解 DER（真出口实测反转 grill 裁决 a，2026-06-24）
+
+grill 裁决 (a) 原选 `x509-cert` crate 解析临时证书（override 了 research brief 的「手解 DER」推荐）。**真出口
+acceptance 推翻了它**：真 sing-box 临时证书的 `Validity` 用 **GeneralizedTime**（notAfter ≥ 2050），`x509-cert`
+的严格 RFC 5280 解析报 `malformed ASN.1 DER value for GeneralizedTime` 拒掉整张证书——而我们**根本不需要
+Validity**（REALITY auth 锚是证书 HMAC，与有效期/证书链无关）。
+
+改回 **手解 DER 定点提取**（`src/reality/cert.rs`，shoes 蓝本同法）：扫 ed25519 SPKI marker
+`06 03 2b 65 70 03 21 00` 取其后裸 32B 公钥；取 leaf DER **末 64B** 为签名（= 服务端 `h.Sum(cert[:len-64])`
+写入处）。**不解析 Validity/issuer 等无关字段** → 不受 GeneralizedTime 严格性影响，更稳健、且去掉 `x509-cert`
++ 一串 transitive deps。回归守卫：`cert.rs` 测试含 GeneralizedTime-validity 证书 fixture。这印证了 research brief
+的原始判断（「只需两个定长字段，全 X.509 解析是 overkill」）。

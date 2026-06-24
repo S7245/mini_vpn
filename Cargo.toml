@@ -35,10 +35,9 @@ aes-gcm = "0.10"
 hmac = "0.12"
 rand = "0.8"
 
-# 刀8：REALITY 实握手收尾。x509-cert(RustCrypto 系,纯 Rust,不引 ring/不破 ADR-0003)解析服务端临时证书,
-# 提 ed25519 SPKI 公钥 + 签名(末 64B HMAC)——结构解析不验签(REALITY auth 锚=HMAC,见 ADR-0010)。
-# base64 解码 sing-box reality public_key(base64url 43 字符 → 32B,见 ADR-0009 修订/grill 裁决 e)。
-x509-cert = "0.2"
+# 刀8：base64 解码 sing-box reality public_key(base64url 43 字符 → 32B,见 ADR-0009 修订/grill 裁决 e)。
+# 注：原拟用 x509-cert 解析临时证书,但真出口实测 sing-box 临时证书 Validity 用 GeneralizedTime,
+# x509-cert(严格 RFC 5280) 拒之 → 改回手解 DER 定点提 SPKI 公钥+末 64B 签名(src/reality/cert.rs,见 ADR-0010)。
 base64 = "0.22"
 
 [features]
