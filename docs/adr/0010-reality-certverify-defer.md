@@ -51,12 +51,17 @@
 
 ## 刀8 收尾登记的 gap（code-review）
 
-- **post-handshake TLS1.3 KeyUpdate（RFC 8446 §4.6.3）未实现**：`RealityStream` 不保留 application traffic
-  secret，无法在收到 KeyUpdate 时把 server 发送密钥轮换到 `application_traffic_secret_N+1`。若静默丢弃该消息，
-  其后每条 server record 会用错密钥 AEAD 失败、看似随机断连。故 `decode_one` 对内层 `0x16`/msg `0x18`（KeyUpdate）
-  **显式 loud-fail**（`io::ErrorKind::Unsupported`），与 0x1302/0x1303 cipher gap 同纪律（显式拒绝而非静默误用）。
-  NewSessionTicket（msg `0x04`）等无密钥影响的 post-handshake 消息照常丢弃。完整 KeyUpdate 轮换（traffic secret
-  进 RealityStream + update-requested 时回发）留后续刀。长连接/大流量出口才可能触发；短连接 acceptance 不受影响。
+- **post-handshake TLS1.3 KeyUpdate（RFC 8446 §4.6.3）→ ✅ 已实现（刀10/F5，2026-06-25）。** 原 loud-fail
+  （`io::ErrorKind::Unsupported`）是刀8 的占位止血。刀10 把它换成正确轮换：`HandshakeOutput` 透出
+  `{s,c}_ap_secret`（application_traffic_secret_0）→ `RealityStream` 持两 secret；`decode_one` 内层 `0x16` 按
+  message 逐条切分，对 KeyUpdate(`0x18`) 调 `on_key_update`：步骤 A 总轮接收方向（`secret_{N+1}=ExpandLabel(secret_N,
+  "traffic upd","",32)` → 新 recv key/iv，seq 归 0）；`update_requested(1)` 时 B1 用旧 send key 封回发
+  `KeyUpdate(update_not_requested=0)` 入 write_pending（铁律 B1 先于 B2）→ B2 轮发送方向；`update_not_requested(0)`
+  只轮接收；非法 request_update/帧长前置校验 Err 零 mutation。NewSessionTicket(`0x04`) 等仍照常丢弃。规范见
+  `docs/tech/2026-06-25-knife10-keyupdate-spec.md`（照 brief §6 V1 字节级核验）。测试 T16（KAT）/T17（时序铁律
+  crypto-evidence）/T18（recv-only+非法值）/T19（端到端 loopback）/T20a（coalesced record）。acceptance：服务端主动
+  KeyUpdate 不可由客户端诱发、生产服务端极少发，故以 T19 loopback（真 read/write 路径 + 真 KeyUpdate + 双向轮换）为
+  高保真替身；真出口 server-initiated KeyUpdate 未触发，如实记录（brief §8 T20「尽力而为」）。
 - **REALITY 握手要求 server flight 必含可校验的 Certificate**（H1 守卫）：`drive` 完成握手前强制 `verify_cert`
   通过过一次 Certificate(0x0b)——否则只发 EE+Finished 的回落 decoy 会绕过 REALITY auth（server Finished MAC 仅
   ECDHE 派生、与静态 pbk 无关，诚实 server 也算得对）。这是 REALITY「证书 HMAC 是唯一 auth 锚」的强制点。

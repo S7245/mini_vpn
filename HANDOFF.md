@@ -19,9 +19,20 @@
 - **刀9 已完成 + 真出口 acceptance ✅，已 ff 合入 main（`831afe3`，2026-06-25）**：REALITY mini-project 收尾 = auto-failover 主链。
   F2 分离 TCP/UDP 上游 + F3 M3 握手并发化 + F1 不对称 failover + F4 idle 超时。全链路 acceptance 通过（~10s 切 REALITY 200 / ~62s 切回 TUIC 200）；
   acceptance 逼出并修了 4 个检测坑（**主动 udp_rx 黑洞探测为主机制**，检测从 >80s→~10s）；两次对抗式 review（零正确性 bug）。**F5 KeyUpdate 拆到刀10**。见下「刀9 完成」。
-- **新 session 起点（下一刀=刀10）：从 `main`（`831afe3`）起新分支**——KeyUpdate 密钥轮换（与 failover 主链零耦合；`docs/tech/2026-06-24-knife9-research-brief.md` §6 有 V1 字节级核验的精确规范）。
-  若改开主线：高带宽压测+数据面多线程（逼近 100M）/ observability（DNS forge 计数、datagram drop 背压）。
-  若改开主线：高带宽压测+数据面多线程（逼近 100M）/ observability(DNS forge 计数、datagram drop 背压)——按优先级定。
+- **刀10 已完成（2026-06-25），分支 `claude/knife10-keyupdate`（待合 main）**：REALITY mini-project 的最后一片 = F5
+  **TLS 1.3 KeyUpdate 密钥轮换**（RFC 8446 §4.6.3/§7.2/§5.3）。`RealityStream` 收到 post-handshake KeyUpdate 从刀8 占位
+  loud-fail 改为正确轮换：`HandshakeOutput` 透出 `{s,c}_ap_secret` → 流持两 secret；`decode_one` 内层 `0x16` 逐 message 切，
+  KeyUpdate(`0x18`) 调 `on_key_update`（步骤 A 总轮接收 `ExpandLabel(secret,"traffic upd","",32)`；`update_requested(1)`
+  则 B1 旧 send key 封回发→B2 轮发送，铁律 B1<B2；`update_not_requested(0)` 只轮接收；非法值前置 Err 零 mutation）。
+  poll_read 顶部机会性 flush（AsyncRead 补 `W:AsyncWrite` bound）使纯下载也即时回发。record.rs 不改。
+  测试 T16 KAT/T17 时序铁律(crypto-evidence)/T18 recv-only+非法值/T19 端到端 loopback/T20a coalesced record；
+  质量门：lib+harness 180 绿 / clippy --all-targets --features harness 0 / release 绿。对抗式 review(5 lens)+/code-review+test-rigor
+  **零正确性 bug**（修 1 个 minor：coalesced `[NST][KeyUpdate]` 逐 message 切；1 nit + 注释诚实化）。
+  **acceptance**：server-initiated KeyUpdate 不可由客户端诱发、生产服务端极少发 → 以 T19 loopback（真 read/write 路径 + 真
+  KeyUpdate + 双向轮换）为高保真替身；真出口 KeyUpdate 未触发，如实记录（brief §8 T20「尽力而为」）。spec=`docs/tech/2026-06-25-knife10-keyupdate-spec.md`，gap 收口见 ADR-0010。
+  **⚠️ 刀8 泄漏凭据仍须服务端轮换。**
+- **REALITY mini-project（刀6→刀10）全部完成。新 session 起点（下一刀=主线）**：从 `main` 起新分支——
+  高带宽压测+数据面多线程（逼近 100M）/ observability（DNS forge 计数、datagram drop 背压）——按优先级定。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
 ## 目标（唯一北极星）：`Rules.md`
@@ -61,8 +72,8 @@
  ├─ 刀6  REALITY auth 密码学 + TLS 1.3 ClientHello 构造（sans-IO，100% 离线 TDD）  ✅ 完成（见下「刀6」，ADR-0008）；已合 main
  ├─ 刀7  ServerHello 解析 + TLS 1.3 key schedule（RFC 8448 向量）+ record-layer AEAD  ✅ 完成（见下「刀7」，ADR-0009）；已合 main
  ├─ 刀8  server-flight 解密 + HMAC 证书校验 + client Finished + 实 TCP 握手 + VLESS 帧 + RealityUpstream(ProxyUpstream) + env 选择器 + 真出口 acceptance
- ├─ 刀9  auto-failover（健康感知 TUIC↔REALITY；分离 TCP/UDP 上游；M3 握手并发化；L2 idle）  ✅ 完成 + 真出口 acceptance ✅（未合 main）
- └─ 刀10 KeyUpdate 密钥轮换（拆出，与 failover 主链零耦合；brief §6 有精确规范）
+ ├─ 刀9  auto-failover（健康感知 TUIC↔REALITY；分离 TCP/UDP 上游；M3 握手并发化；L2 idle）  ✅ 完成 + 真出口 acceptance ✅（已合 main `831afe3`）
+ └─ 刀10 KeyUpdate 密钥轮换（拆出，与 failover 主链零耦合）  ✅ 完成（分支 claude/knife10-keyupdate，待合 main；loopback acceptance，真出口 KeyUpdate 难诱发如实记录）→ REALITY mini-project 收官
 ```
 - 优先级与关联：**fake-IP 池回收**属"大并发长稳"（并入刀2）；**DoH 拦截**是"真实场景能连上"的前置（刀4，可视情提前——真机浏览器场景不修则 fake-IP 形同虚设）。**A（REALITY）正交**：当前 QUIC 能连，不阻塞三目标达标；TCP-based，替代不了 UDP 直播。
 
