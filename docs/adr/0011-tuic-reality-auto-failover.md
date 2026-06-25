@@ -36,7 +36,13 @@
 - **`live_conn` 重连握手封 5s 超时**（`TUIC_RECONNECT_TIMEOUT`）：超时 → Err、guard 仍持旧死连接 → `is_dead`=true → 切。
 - **`QUIC_MAX_IDLE_SECS` 30s → 15s**（grill 裁决）：切换 ≈ idle + 5s ≈ **~20s**。不增误切——healthy 连接靠 keepalive=5s
   （3 PING/15s 窗口）永不 idle 到阈值；弱网 15–30s 瞬时中断只自愈成一次廉价重连（~1-RTT），failover 还要求「重连也失败」才触发。
+- **TUIC `open_tcp` 封 5s 超时**（acceptance 复测的第三坑）：黑洞期间 `open_bi + write_all(Connect)` 因 QUIC send 窗口满+无 ACK
+  **无限挂**（连接未判死、快慢路都无信号，日志见 `🎯 spawn 握手` 却无 `🚪`）。封 5s 超时 → 黑洞 open 快速失败 → 走**慢路计数**
+  （并发 open 下 ~5s 累计 3 次即切，不再死等 close_reason）。这才是检测的**主**机制；idle/close_reason 是**备**机制。
+  另：非对称封锁（只封出向，VPS 入向包仍到 → idle 计时器被一直重置 → close_reason >80s 才来）坐实「不能只依赖 idle 检测」。
 - **first-byte 健康判定**（黑洞 ~5s 即测出、无需 idle trade-off）= brief §2.3 的「正确」方案，但需重构 spawn 数据路径 + 首字节注入，**留后续**。
+- **✅ acceptance 已证 failover 端到端通**（2026-06-25）：`🔀 切到 REALITY` + `🔐 REALITY 握手成功` + 切回 TUIC 都实测发生；
+  本轮修复把检测从 >80s 提速到 ~5-15s（open 超时慢路 ~5s + idle 快路 ~15-20s 双保险），待复测确认提速。
 
 ### 4. failover 模式恒 spawn 所有 open（M3 + code-review Finding 1 深修）
 - M3：把昂贵的 REALITY 多-RTT 握手 spawn 出单任务 select 主循环，避免一条慢握手饿死所有 flow。
