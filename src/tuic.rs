@@ -647,9 +647,14 @@ fn io_err<E: std::fmt::Display>(ctx: &str, e: E) -> ClientError {
     ClientError::from(std::io::Error::other(format!("{ctx}: {e}")))
 }
 
-/// 刀9（spec §2.3）：QUIC 重连握手超时。黑洞/不可达 server 的握手默认受 idle(30s) 约束可阻塞数十秒，
+/// 刀9（spec §2.3）：QUIC 重连握手超时。黑洞/不可达 server 的握手默认受 idle 约束可阻塞数十秒，
 /// 5s 封顶让 failover 快路（连接死 + 重连失败）快速暴露；正常重连 1-RTT 远小于 5s，不会误伤高 RTT 链路。
 const TUIC_RECONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 刀9（真出口 acceptance 修）：单条 TCP open（open_bi + write Connect）超时。黑洞连接上 write_all
+/// 因 send 窗口满+无 ACK 会无限挂（连接尚未判死），5s 封顶让 failover 慢路收到「连接活但 open 失败」
+/// 信号；正常 open 是本地操作远小于 5s，不误伤。
+const TUIC_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// TUIC 客户端上游：持有一条到 sing-box 的 QUIC 连接，每条 TCP 开一条 `Connect` 双向流。
 /// 中文要点：连接断了按需重连+重认证(13a 最小实现;迁移/0-RTT 调优在 13c)。
@@ -1054,14 +1059,24 @@ fn udp_reconnect_backoff(attempt: u32) -> Duration {
 #[async_trait::async_trait]
 impl ProxyUpstream for TuicUpstream {
     async fn open_tcp(&self, target: &TargetAddr) -> Result<RelayStream, ClientError> {
-        // 取活连接，断了就地重连+重认证（与 UDP 共用 live_conn，单一事实源）。
+        // 取活连接，断了就地重连+重认证（与 UDP 共用 live_conn，单一事实源；reconnect 自带 5s 超时）。
         let conn = self.live_conn().await?;
-        let (mut send, recv) = conn.open_bi().await.map_err(|e| io_err("tuic open_bi", e))?;
-        send.write_all(&encode_connect(target))
+        // 刀9（真出口 acceptance 修）：open_bi + write Connect 在**黑洞连接**上会 hang——连接尚未被
+        // 判死（close_reason 仍 None，因 keepalive/非对称封锁架空 idle 检测），但 QUIC send 窗口满、
+        // 收不到 ACK → write_all 无限阻塞，failover 快/慢路都收不到信号。封 5s 超时让黑洞 open **快速失败**
+        // → FailoverUpstream 据「连接活但 open 超时」走 **慢路计数**（并发 open 下 ~5s 累计 3 次即切 REALITY，
+        // 不再死等 close_reason）。正常 open（open_bi + 写小 Connect 头）是本地操作、远小于 5s，不误伤。
+        let open = async {
+            let (mut send, recv) = conn.open_bi().await.map_err(|e| io_err("tuic open_bi", e))?;
+            send.write_all(&encode_connect(target))
+                .await
+                .map_err(|e| io_err("tuic connect write", e))?;
+            // 把双向流的收/发两半合成一条 AsyncRead+AsyncWrite，喂给现有双向泵。
+            Ok::<RelayStream, ClientError>(Box::new(tokio::io::join(recv, send)))
+        };
+        tokio::time::timeout(TUIC_OPEN_TIMEOUT, open)
             .await
-            .map_err(|e| io_err("tuic connect write", e))?;
-        // 把双向流的收/发两半合成一条 AsyncRead+AsyncWrite，喂给现有双向泵。
-        Ok(Box::new(tokio::io::join(recv, send)))
+            .map_err(|_| io_err("tuic open_tcp", "5s 超时（黑洞/send 窗口满无 ACK；failover 慢路据此累计切备腿）"))?
     }
 }
 

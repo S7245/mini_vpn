@@ -60,11 +60,13 @@ tuic_port() { printf '%s' "${MINI_VPN_TUIC_SERVER:-}" | sed -E 's/^.*://'; }
 cut_tuic() {
   : "${MINI_VPN_TUIC_SERVER:?需 export MINI_VPN_TUIC_SERVER（host:port）}"
   local h p; h="$(tuic_host)"; p="$(tuic_port)"
-  echo "==> 阻断 TUIC：pf block outbound UDP → ${h}:${p}（REALITY TCP 不受影响）"
+  echo "==> 阻断 TUIC：pf block UDP 双向 ↔ ${h}:${p}（REALITY TCP 不受影响；双向=贴近真实 GFW 封锁）"
   # 备份系统 pf.conf；把 block 灌进独立 anchor，并在 pf.conf 副本末尾引用该 anchor（保留系统规则）。
+  # 双向都封：出向挡客户端发包，入向挡 VPS 回包——否则只封出向时客户端仍收 VPS 包 → idle 计时器被
+  # 一直重置 → close_reason 迟迟不来（acceptance 实测 >80s）。双向封后 idle 快路 ~15-20s 也能触发。
   cp /etc/pf.conf "$PF_BAK" 2>/dev/null || : > "$PF_BAK"
-  printf 'block drop out quick proto udp from any to %s port %s\n' "$h" "$p" \
-    | pfctl -a "$PF_ANCHOR" -f - 2>/dev/null
+  printf 'block drop out quick proto udp from any to %s port %s\nblock drop in quick proto udp from %s port %s to any\n' \
+    "$h" "$p" "$h" "$p" | pfctl -a "$PF_ANCHOR" -f - 2>/dev/null
   { cat /etc/pf.conf 2>/dev/null; echo "anchor \"$PF_ANCHOR\""; } | pfctl -f - 2>/dev/null
   pfctl -e 2>/dev/null || true
   echo "   ✅ 已阻断 QUIC/UDP。≤(idle30s + 1 次重连失败) 内应见日志：🔀 failover：TUIC 连接死(黑洞快路) → 切到 REALITY"
