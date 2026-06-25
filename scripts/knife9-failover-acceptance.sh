@@ -69,8 +69,8 @@ cut_tuic() {
     "$h" "$p" "$h" "$p" | pfctl -a "$PF_ANCHOR" -f - 2>/dev/null
   { cat /etc/pf.conf 2>/dev/null; echo "anchor \"$PF_ANCHOR\""; } | pfctl -f - 2>/dev/null
   pfctl -e 2>/dev/null || true
-  echo "   ✅ 已阻断 QUIC/UDP。≤(idle30s + 1 次重连失败) 内应见日志：🔀 failover：TUIC 连接死(黑洞快路) → 切到 REALITY"
-  echo "   验证：bash scripts/knife9-failover-acceptance.sh smoke  （应仍 200，经 REALITY）"
+  echo "   ✅ 已阻断 QUIC/UDP。**主动黑洞探测**（udp_rx 停滞 ~10s）→ ~10-13s 应见：🔀 failover：TUIC 黑洞... → 切到 REALITY"
+  echo "   验证：bash scripts/knife9-failover-acceptance.sh wait-switch reality  （现应 ~10-15s 就切）"
 }
 
 restore_tuic() {
