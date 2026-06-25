@@ -30,9 +30,12 @@
   **零正确性 bug**（修 1 个 minor：coalesced `[NST][KeyUpdate]` 逐 message 切；1 nit + 注释诚实化）。
   **acceptance**：server-initiated KeyUpdate 不可由客户端诱发、生产服务端极少发 → 以 T19 loopback（真 read/write 路径 + 真
   KeyUpdate + 双向轮换）为高保真替身；真出口 KeyUpdate 未触发，如实记录（brief §8 T20「尽力而为」）。spec=`docs/tech/2026-06-25-knife10-keyupdate-spec.md`，gap 收口见 ADR-0010。
-  **⚠️ 刀8 泄漏凭据仍须服务端轮换。**
-- **REALITY mini-project（刀6→刀10）全部完成。新 session 起点（下一刀=主线）**：从 `main` 起新分支——
-  高带宽压测+数据面多线程（逼近 100M）/ observability（DNS forge 计数、datagram drop 背压）——按优先级定。
+  **刀8 泄漏凭据已服务端轮换（2026-06-26）——安全遗留项关闭。**
+- **REALITY mini-project（刀6→刀10）全部完成。下一刀=刀11 数据面可观测性（observability）**——用户选定（主线另一候选「数据面多线程逼近 100M」顺延）。
+  **grill 已完成**（2026-06-26）：广度=DNS forge 计数 + datagram drop/背压 + 统一数据面快照（TCP 活跃连接/relay + fake-IP 池用量 + failover 当班腿）；
+  接口=`MetricsSnapshot` struct（原子计数快照）喂 30s `📊` 日志 + 为 mini_vpn_app 前端预留可读契约。
+  **seed/scope（接缝指针 + 开放设计问题 + TDD 草案）= `docs/tech/2026-06-26-knife11-observability-seed.md`。**
+  **新 session 起点：从 `main`（`927e009` 后 HEAD）起新分支，冷启动接力 ground→spec→TDD→review→acceptance。**
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
 ## 目标（唯一北极星）：`Rules.md`
@@ -66,7 +69,8 @@
  ├─ 刀3.5 高码率 UDP（quinn 插桩 + CC 调优）  ✅ 完成 + 真出口 acceptance（见下「刀3.5」）；纠偏：5.3M「天花板」实为链路 cap 假象
  ├─ 刀4  连接成功率（拦截加密 DNS DoT/DoH/DoQ/DoH3）  ✅ 完成 + 真出口 acceptance（见下「刀4」）；first-SYN 已确认 knife2 修复、关闭
  ├─ 刀5  拦全:53 裸包 DNS 劫持（任意 resolver 明文→fake-IP，废 smoltcp DNS socket）  ✅ 完成 + 真出口 acceptance（见下「刀5」，ADR-0007）；已合 main
- └─ （主线下一候选）高带宽多线程逼近 100M / DNS·datagram observability
+ ├─ 刀11 数据面可观测性（DNS forge 计数 + datagram drop/背压 + 统一快照 MetricsSnapshot）  ← **下一刀**（grill 完成，seed=`docs/tech/2026-06-26-knife11-observability-seed.md`）
+ └─ （主线后续候选）高带宽多线程逼近 100M（Rules ③ 主战场，刀11 后量化底座就位再上）
 
 正交线 A（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）= VLESS+REALITY 第二 Transport（手写 TLS 1.3，ADR-0008）
  ├─ 刀6  REALITY auth 密码学 + TLS 1.3 ClientHello 构造（sans-IO，100% 离线 TDD）  ✅ 完成（见下「刀6」，ADR-0008）；已合 main
