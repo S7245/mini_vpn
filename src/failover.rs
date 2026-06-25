@@ -25,6 +25,13 @@ const UP_PROBE_CONSEC: u32 = 3;
 const UP_COOLDOWN_SECS: u64 = 60;
 /// REALITY 当班时后台探 TUIC 的节奏。
 const PROBE_INTERVAL_SECS: u64 = 30;
+/// 健康任务 tick 间隔（down 黑洞探测 + up 探针共用此 tick；up 探针再按 PROBE_INTERVAL_SECS 限速）。
+const HEALTH_TICK_SECS: u64 = 3;
+/// TUIC 当班时 `udp_rx.datagrams` 停滞多久判黑洞（真出口 acceptance 修——idle/open-success 检测对
+/// QUIC 黑洞不可靠：open 写小 Connect 头乐观成功、keepalive 架空 idle）。用 rx 计数当存活信标：健康连接
+/// 每 ~5s 有 keepalive ACK 进来→rx 增长；黑洞连 ACK 都收不到→rx 停滞。10s ≈ 2 个 keepalive 周期，停滞
+/// 这么久 = 真黑洞（误判也只是优雅切 REALITY + 冷却切回，自愈）。
+const BLACKHOLE_RX_STALE_SECS: u64 = 10;
 
 /// 上游腿的健康探测面（failover 用）。TUIC 实现它；REALITY 腿无需。
 ///
@@ -36,6 +43,45 @@ pub trait HealthProbe: Send + Sync {
     async fn probe(&self) -> bool;
     /// 当前连接是否已死（`close_reason` 有值 = 黑洞/超时打死，重建才知能不能回来）。
     async fn is_dead(&self) -> bool;
+    /// 当前连接累计收到的 UDP datagram 数（quinn `stats().udp_rx.datagrams`）。**黑洞存活信标**：
+    /// 健康连接每 ~5s 有 keepalive ACK 进来→单调增；黑洞连 ACK 都收不到→停滞。down 探测据此判黑洞。
+    async fn rx_datagrams(&self) -> u64;
+}
+
+/// 黑洞探测器（纯逻辑，可单测）：观察 TUIC 连接的 `udp_rx.datagrams`，停滞 `BLACKHOLE_RX_STALE_SECS`
+/// 即判黑洞。中文要点：rx 一变就刷新「上次变化时刻」；连续停滞超窗口 → true（判黑洞一次）。
+pub struct BlackholeDetector {
+    last_rx: u64,
+    last_change_secs: u64,
+    primed: bool,
+}
+
+impl BlackholeDetector {
+    pub fn new() -> Self {
+        Self { last_rx: 0, last_change_secs: 0, primed: false }
+    }
+
+    /// 观察一次 rx 计数。返回 true=判定黑洞（rx 停滞 ≥ 窗口）。
+    pub fn observe(&mut self, rx: u64, now_secs: u64) -> bool {
+        if !self.primed || rx != self.last_rx {
+            self.last_rx = rx;
+            self.last_change_secs = now_secs;
+            self.primed = true;
+            return false;
+        }
+        now_secs.saturating_sub(self.last_change_secs) >= BLACKHOLE_RX_STALE_SECS
+    }
+
+    /// 复位（切腿后重新计，避免跨腿误判）。
+    pub fn reset(&mut self) {
+        self.primed = false;
+    }
+}
+
+impl Default for BlackholeDetector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// TCP relay 当前走哪条腿（仅 TCP；UDP 恒 TUIC，不在此枚举内）。
@@ -170,6 +216,16 @@ impl FailoverState {
             false
         }
     }
+
+    /// down 黑洞探测判定黑洞 → 切 REALITY（快路同款，CAS 幂等）。返回 true=本调用真切。
+    /// 中文要点：这是**主**检测机制（rx 停滞 ~10s，可靠且不被 keepalive/乐观开流架空）；open_tcp 失败的
+    /// 快/慢路是**备**（黑洞下 open 可能乐观成功、不报错，故不能只靠它，见 ADR-0011 §3b）。
+    pub fn record_blackhole(&self, now_secs: u64) -> bool {
+        if self.active_leg() != TcpLeg::Tuic {
+            return false;
+        }
+        self.switch_to_reality(now_secs)
+    }
 }
 
 impl Default for FailoverState {
@@ -204,22 +260,43 @@ where
     T: HealthProbe + 'static,
     R: Send + Sync + 'static,
 {
-    /// 启动后台健康探针任务：REALITY 当班时每 30s 探 TUIC，按不对称迟滞切回（spec §2.4）。
-    /// 中文要点：仅 REALITY 当班才探（leg==TUIC 时 open_tcp 失败自会驱动 down 切换，无需探）。
-    /// 探针 = `HealthProbe::probe`（live_conn，连接已健康时仅检查 close_reason + clone，廉价）。
+    /// 启动后台健康任务（down 黑洞探测 + up 恢复探针，统一一个 task，HEALTH_TICK_SECS 节奏）：
+    /// - **TUIC 当班**：观察 `udp_rx.datagrams`，停滞 ~10s（连 keepalive ACK 都没有）→ 判黑洞 → 切 REALITY。
+    ///   这是**主**检测（可靠、不被 keepalive/乐观开流架空，见 ADR-0011 §3b）。
+    /// - **REALITY 当班**：每 PROBE_INTERVAL_SECS 探一次 TUIC（live_conn 非浅探），不对称迟滞切回（spec §2.4）。
     pub fn spawn_health_probe(self: &Arc<Self>) {
         let state = self.state.clone();
         let tuic = self.tuic.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(PROBE_INTERVAL_SECS));
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(HEALTH_TICK_SECS));
+            let mut detector = BlackholeDetector::new();
+            let mut secs_since_up_probe = 0u64;
             loop {
                 tick.tick().await;
-                if state.active_leg() != TcpLeg::Reality {
-                    continue; // 仅 REALITY 当班才探 TUIC 是否恢复
-                }
-                let ok = tuic.probe().await;
-                if state.record_probe(ok, state.now_secs()) {
-                    println!("🔀 failover：TUIC 探针连续成功 + 冷却已过 → 切回 TUIC 主腿");
+                match state.active_leg() {
+                    TcpLeg::Tuic => {
+                        secs_since_up_probe = 0;
+                        let rx = tuic.rx_datagrams().await;
+                        if detector.observe(rx, state.now_secs())
+                            && state.record_blackhole(state.now_secs())
+                        {
+                            println!(
+                                "🔀 failover：TUIC 黑洞（{BLACKHOLE_RX_STALE_SECS}s 无收包，连 keepalive ACK 都没有）→ 切到 REALITY 备路",
+                            );
+                            detector.reset();
+                        }
+                    }
+                    TcpLeg::Reality => {
+                        detector.reset(); // 切回 TUIC 后重新计，避免跨腿误判
+                        secs_since_up_probe += HEALTH_TICK_SECS;
+                        if secs_since_up_probe >= PROBE_INTERVAL_SECS {
+                            secs_since_up_probe = 0;
+                            let ok = tuic.probe().await;
+                            if state.record_probe(ok, state.now_secs()) {
+                                println!("🔀 failover：TUIC 探针连续成功 + 冷却已过 → 切回 TUIC 主腿");
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -294,6 +371,7 @@ mod tests {
         fail_open: AtomicBool,
         dead: AtomicBool,
         probe_ok: AtomicBool,
+        rx: std::sync::atomic::AtomicU64,
     }
 
     #[async_trait::async_trait]
@@ -322,6 +400,9 @@ mod tests {
         }
         async fn is_dead(&self) -> bool {
             self.dead.load(Ordering::Relaxed)
+        }
+        async fn rx_datagrams(&self) -> u64 {
+            self.rx.load(Ordering::Relaxed)
         }
     }
 
@@ -438,6 +519,35 @@ mod tests {
         assert_eq!(s.active_leg(), TcpLeg::Reality);
         assert!(!s.record_tuic_failure(true, 11), "已在 REALITY → 不重复切，返回 false");
         assert!(!s.record_tuic_failure(false, 12), "已在 REALITY → 慢路也不动，返回 false");
+    }
+
+    /// down 黑洞探测（主检测）：rx 停滞 ≥ 窗口 → BlackholeDetector 判黑洞；rx 一增长就复位计时。
+    #[test]
+    fn blackhole_detector_fires_on_rx_stall() {
+        let mut d = BlackholeDetector::new();
+        // 首次观察 = prime，不判黑洞。
+        assert!(!d.observe(100, 0), "prime");
+        // rx 持续增长（健康，keepalive ACK 进来）→ 永不判黑洞。
+        assert!(!d.observe(101, 5));
+        assert!(!d.observe(102, 10));
+        // rx 停滞：从 t=10 起不变；t=10+10=20 达窗口 → 判黑洞。
+        assert!(!d.observe(102, 12), "停滞 2s <10s");
+        assert!(!d.observe(102, 19), "停滞 9s <10s");
+        assert!(d.observe(102, 20), "停滞 10s ≥窗口 → 黑洞");
+        // 复位后重新计。
+        d.reset();
+        assert!(!d.observe(102, 21), "reset 后重新 prime");
+        assert!(!d.observe(102, 30), "刚 prime 不到窗口");
+        assert!(d.observe(102, 31), "再停滞满窗口");
+    }
+
+    /// record_blackhole：TUIC 当班 → 切 REALITY（CAS 幂等）；已在 REALITY → false。
+    #[test]
+    fn record_blackhole_switches_once() {
+        let s = FailoverState::new();
+        assert!(s.record_blackhole(100), "TUIC 当班 + 黑洞 → 切 REALITY");
+        assert_eq!(s.active_leg(), TcpLeg::Reality);
+        assert!(!s.record_blackhole(101), "已在 REALITY → 不重复切");
     }
 
     /// 铁律：send_udp 永不被 active_leg/冷却 gate——REALITY 当班 + 冷却期内仍恒走 tuic。

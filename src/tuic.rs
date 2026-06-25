@@ -1098,6 +1098,11 @@ impl crate::failover::HealthProbe for TuicUpstream {
     async fn is_dead(&self) -> bool {
         self.conn.lock().await.close_reason().is_some()
     }
+    /// 累计收到的 UDP datagram 数（quinn `stats().udp_rx.datagrams`）——黑洞存活信标：健康连接每 ~5s
+    /// 有 keepalive ACK 进来→单调增；黑洞连 ACK 都收不到→停滞。down 探测据此判黑洞（不被乐观开流/keepalive 架空）。
+    async fn rx_datagrams(&self) -> u64 {
+        self.conn.lock().await.stats().udp_rx.datagrams
+    }
 }
 
 #[cfg(test)]
