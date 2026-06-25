@@ -87,6 +87,17 @@ pub fn derive_application_keys(handshake_secret: &[u8; 32], transcript_ch_sfin: 
     }
 }
 
+/// KeyUpdate 后的下一代 application_traffic_secret（RFC 8446 §7.2，刀10/F5）：
+/// `secret_{N+1} = HKDF-Expand-Label(secret_N, "traffic upd", "", Hash.length=32)`。
+/// 中文要点（**#1 静默互通杀手**）：label 是 `"traffic upd"`（11B，`upd` **非** `update`，中间一个空格；
+/// `expand_label` 包成 `"tls13 traffic upd"`）；context = 空（**不**取 transcript hash）；len = 32。
+/// 换密钥后 record seq 由 `RecordKeys::new` 天然归 0（RFC 8446 §5.3）。
+pub fn next_application_traffic_secret(secret: &[u8; 32]) -> [u8; 32] {
+    expand_label(secret, "traffic upd", b"", 32)
+        .try_into()
+        .expect("expand_label(.,32) 返回 32 字节")
+}
+
 /// HkdfLabel 编码（RFC 8446 §7.1）：`length(u16) || u8len("tls13 "+label) || u8len(context)+context`。
 /// 中文要点（**#1 静默互通杀手**）：`tls13 ` **含尾空格**；label 与 context 各用 **u8** 长前缀；仅顶层 length 是 u16。
 pub fn hkdf_label(length: u16, label: &str, context: &[u8]) -> Vec<u8> {
@@ -293,6 +304,41 @@ mod tests {
             ks.handshake_secret,
             arr32("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac")
         );
+    }
+
+    /// T16（刀10/F5）KeyUpdate 下一代 traffic secret KAT。
+    /// 三重锚点（非循环）：① `hkdf_label("traffic upd")` 手算字节钉死 label 字符串（#1 静默互通杀手）；
+    /// ② `next_application_traffic_secret` 等价于 `expand_label(.,"traffic upd","",32)`（证函数用对 label/ctx/len）；
+    /// ③ N+1 secret 派 key16/iv12 → seal@seq0/open@seq0 还原（证派生一致 + record seq 换密钥后归 0）。
+    /// 附 frozen 回归值（RFC 8448 §3 `s_ap_secret_0` 起一步）。
+    #[test]
+    fn keyupdate_next_traffic_secret_kat() {
+        // ① label 字节级（手算）：len=32 → 00 20；full_label="tls13 traffic upd"(17B=0x11)；context 空 → 00。
+        assert_eq!(
+            hkdf_label(32, "traffic upd", b""),
+            hex("00 20 11 74 6c 73 31 33 20 74 72 61 66 66 69 63 20 75 70 64 00"),
+            "KeyUpdate label 必须是 'traffic upd'（tls13 traffic upd），upd≠update、一个空格"
+        );
+        // ② 函数 == 直接 expand_label（防将来误改 label/ctx/len）。
+        let s0 = arr32("a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643"); // RFC 8448 s_ap_0
+        let s1 = next_application_traffic_secret(&s0);
+        assert_eq!(s1.to_vec(), expand_label(&s0, "traffic upd", b"", 32), "next ≡ ExpandLabel(.,traffic upd,'',32)");
+        // frozen 回归值 + 链可继续推进。
+        assert_eq!(
+            s1,
+            arr32("51921b8aa3001976eb401d0a4319a8516416a6c56001a357e5d162031e84f916"),
+            "s_ap_secret_1（frozen 回归）"
+        );
+        assert_ne!(next_application_traffic_secret(&s1), s1, "链 N+1→N+2 推进");
+        // ③ N+1 key/iv round-trip + seq 归 0。
+        let key: [u8; 16] = expand_label(&s1, "key", b"", 16).try_into().unwrap();
+        let iv: [u8; 12] = expand_label(&s1, "iv", b"", 12).try_into().unwrap();
+        let mut send = crate::reality::record::RecordKeys::new(&key, &iv);
+        let mut recv = crate::reality::record::RecordKeys::new(&key, &iv);
+        let rec = send.seal(0x17, b"post-keyupdate"); // send seq0
+        let hdr: [u8; 5] = rec[..5].try_into().unwrap();
+        let (ct, body) = recv.open(&hdr, &rec[5..]).unwrap(); // recv seq0
+        assert_eq!((ct, body.as_slice()), (0x17, &b"post-keyupdate"[..]), "N+1 key/iv @seq0 round-trip");
     }
 
     /// T7：application 阶段密钥（RFC 8448 §3 KAT）。transcript = hash(CH..serverFinished)。
