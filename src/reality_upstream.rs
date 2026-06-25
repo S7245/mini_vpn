@@ -140,8 +140,11 @@ impl<R, W> RealityStream<R, W> {
                 // （Drop）；回发 reply（若有）已入 write_pending，poll_read 顶部机会性 flush 出去。
                 // ⚠️ **只看首字节会漏**：若 NST 在前、KeyUpdate 合并在后，仅判 content.first() 会把整条丢弃 →
                 // 接收方向不轮换 → 后续 record bad-decrypt 掉线（正是本刀要消解的失效）。故必须逐 message 切。
-                // 已知限制（稳定优先）：**跨 record 分片**的 post-handshake message 不重组——KeyUpdate 恒 5B 不分片；
-                // 大 NST 即便被分片也只是丢弃，不影响密钥轮换正确性。
+                // 已知限制（稳定优先）：**跨 record 分片**的 post-handshake message 不重组（刻意不复用握手期
+                // `HandshakeReassembler`——那会在长连接上持无界跨 record buffer）。半条（rest<total）→ break 丢弃本条剩余；
+                // 其续片会在下一条 record 被当作新 message 头解析，仅 0x18 才动作（误命中 KeyUpdate 概率 ~2^-32 可忽略）。
+                // 这依赖「REALITY 服务端不把 post-handshake message 跨 record 分片」——Xray/sing-box 均满足；
+                // KeyUpdate 恒 5B 本就不分片，NST 本客户端也不消费（无连接复用，刀8）。若未来接会分片的服务端再议。
                 let mut rest: &[u8] = &content;
                 while rest.len() >= 4 {
                     let msg_len = ((rest[1] as usize) << 16) | ((rest[2] as usize) << 8) | rest[3] as usize;
@@ -1160,10 +1163,17 @@ mod tests {
         let (_t3, b3) = s2.recv_keys.open(&dh0, &d0[5..]).expect("非法值：recv_keys 未轮、仍 s0 seq0");
         assert_eq!(b3, b"still-s0");
 
-        // ---- 非法帧长（body_len != 1）→ Err。----
+        // ---- 非法帧长（body_len != 1）→ Err 且零 mutation。----
         let (mut s3, _e3) = mk_stream_secrets(s0, c0);
         assert!(s3.on_key_update(&[0x18, 0x00, 0x00, 0x02, 0x00, 0x00]).is_err(), "body_len=2 → Err");
         assert!(s3.on_key_update(&[0x18, 0x00, 0x00]).is_err(), "截断帧 → Err");
+        // 非法帧前置校验先于任何 mutation：recv_keys 未轮、仍 s0 seq0；接收 secret 不变。
+        assert_eq!(s3.server_ap_secret, s0, "非法帧不改接收 secret");
+        let mut srv_s0b = keys_from(&s0);
+        let d3 = srv_s0b.seal(0x17, b"frame-illegal");
+        let dh3: [u8; 5] = d3[..5].try_into().unwrap();
+        let (_t4, b4) = s3.recv_keys.open(&dh3, &d3[5..]).expect("非法帧：recv_keys 未轮、仍 s0 seq0");
+        assert_eq!(b4, b"frame-illegal");
     }
 
     /// T20a（刀10/F5 robustness，对抗式 review finding）：单条 0x16 record **合并** `[NST][KeyUpdate]`
