@@ -293,6 +293,7 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
   ③ 切后 curl **HTTP 200**（`🔐 REALITY 握手成功` + `▶ leg=REALITY`，DNS 不饿死）；④ 恢复 TUIC → **~62s 切回**（冷却迟滞）；
   ⑤ 切回后 curl 200（`▶ leg=TUIC`）。**🔑 acceptance 抓出 4 个离线测不到的检测坑（idle/open-success 对 QUIC 黑洞不可靠）**，
   全修并坐实「主动 udp_rx 探测才是可靠主机制」（见 ADR-0011 §3b + 下「检测修订」）。helper：`scripts/knife9-failover-acceptance.sh`。
+- **第二次对抗式 review（检测修复 diff，23 agent / 含并发-死锁专项，commit `a8bfb9f`）**：**零正确性 bug**（try_lock/CAS/检测状态机扛住），4 条 cleanup/altitude 全修（注释陈旧 idle/rx_datagrams 也改 try_lock 非阻塞/常量澄清/reset 注释）。
 - **🔑 检测修订（acceptance 复测 4 轮逼出，commit `8287cb5`→`79ef068`）**：idle/open-success 检测被 ① open 写小 Connect 头黑洞下乐观返 Ok
   （重置慢路计数）② keepalive 架空 idle（close_reason >80s，keepalive 不能删=保活长连接）双重架空。**主修=主动黑洞探测**：
   quinn `stats().udp_rx.datagrams` 当存活信标（健康每 ~5s 有 keepalive ACK→rx 增；黑洞→停滞），`BlackholeDetector` rx 停滞 ≥10s
