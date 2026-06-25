@@ -42,6 +42,10 @@
   → 用 quinn `stats().udp_rx.datagrams` 当**存活信标**：健康连接每 ~5s 有 keepalive ACK 进来（rx 单调增），黑洞连 ACK 都收不到
   （rx 停滞）。`BlackholeDetector`：rx 停滞 ≥10s（~2 keepalive 周期）→ `record_blackhole` 切 REALITY。`spawn_health_probe` =
   down（rx 停滞，3s tick）+ up（探针，30s 限速）统一任务。**~10-13s 检测、可靠、不删 keepalive、不碰数据路径、不需探针目标**。
+- **主循环全程非阻塞（failover 模式）**：`send_udp` 在主循环 inline await，黑洞期若 inline 重连（5s）会 stall 整个事件循环、
+  饿死 DNS 劫持（本地 forge）等所有分支 → 真出口实测「切到 REALITY 后 DNS Resolving timed out」。修：`send_udp` 改 `current_conn`
+  （`try_lock` 非阻塞 + **不重连**，锁被占/已死即快速丢），TUIC 重连交后台 `start_udp` 自愈循环。配合 open_tcp 在 failover 模式
+  spawn 出主循环，主循环至此无任何 inline-blocking 上游调用。
 - **备机制**（防御纵深，非主）：TUIC `open_tcp` 5s 超时（黑洞 open hang 止血）+ live_conn 重连 5s 超时 + idle 15s。
 - **first-byte 健康判定**（黑洞 ~5s 即测出）= brief §2.3 方案，但需重构 spawn 数据路径 + 首字节注入；udp_rx 探测已达同等可靠且更省，**不做**。
 - **✅ acceptance 已证 failover 端到端通**（2026-06-25，3 轮）：`🔀 切到 REALITY` + `🔐 REALITY 握手成功` + 切回 TUIC 都实测发生；
