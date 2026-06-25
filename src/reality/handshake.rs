@@ -153,10 +153,16 @@ pub struct HandshakeInput {
 }
 
 /// 握手产出：app 阶段读/写密钥（seq 各从 0）+ 握手结束后多读的残留字节。
+/// 中文要点（刀10/F5）：透出 `{s,c}_ap_secret`（application_traffic_secret_0）给 `RealityStream`，
+/// 供 post-handshake KeyUpdate 派下一代密钥（RFC 8446 §7.2）——握手期不用、轮换期才用。
 pub struct HandshakeOutput {
     pub recv_keys: RecordKeys,
     pub send_keys: RecordKeys,
     pub leftover: BytesMut,
+    /// server→client 方向 application_traffic_secret_0（KeyUpdate 轮接收方向用）。
+    pub s_ap_secret: [u8; 32],
+    /// client→server 方向 application_traffic_secret_0（收 update_requested 时轮发送方向用）。
+    pub c_ap_secret: [u8; 32],
 }
 
 /// 驱动一次完整 REALITY TLS 1.3 握手（spec §5 时序）。`verify_cert` = 对 Certificate(0x0b) message
@@ -282,6 +288,8 @@ where
         recv_keys,
         send_keys,
         leftover: reader.into_leftover(),
+        s_ap_secret: app.s_ap_secret,
+        c_ap_secret: app.c_ap_secret,
     })
 }
 
