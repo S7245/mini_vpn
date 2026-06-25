@@ -134,11 +134,25 @@ impl<R, W> RealityStream<R, W> {
                 }
             }
             0x16 => {
-                // post-handshake handshake message：KeyUpdate(0x18) → 正确轮换密钥（刀10/F5，RFC 8446 §4.6.3/§7.2）。
-                // NewSessionTicket(0x04)/其它无密钥影响 → 静默丢弃。轮换后本条无 app data 上抛（Drop）；
-                // 回发的 reply（若有）已入 write_pending，poll_read 顶部机会性 flush 出去。
-                if content.first() == Some(&0x18) {
-                    self.on_key_update(&content)?;
+                // post-handshake handshake message：按 `1B type + 3B u24 len` 切分（同握手期重组纪律；RFC 8446 §5.1
+                // 允许同向多条 message 合并进一条 record，如 [NewSessionTicket][KeyUpdate]）。仅 KeyUpdate(0x18) →
+                // 正确轮换（刀10/F5，§4.6.3/§7.2）；其余（NST 0x04 等无密钥影响）→ 丢。轮换后本条无 app data 上抛
+                // （Drop）；回发 reply（若有）已入 write_pending，poll_read 顶部机会性 flush 出去。
+                // ⚠️ **只看首字节会漏**：若 NST 在前、KeyUpdate 合并在后，仅判 content.first() 会把整条丢弃 →
+                // 接收方向不轮换 → 后续 record bad-decrypt 掉线（正是本刀要消解的失效）。故必须逐 message 切。
+                // 已知限制（稳定优先）：**跨 record 分片**的 post-handshake message 不重组——KeyUpdate 恒 5B 不分片；
+                // 大 NST 即便被分片也只是丢弃，不影响密钥轮换正确性。
+                let mut rest: &[u8] = &content;
+                while rest.len() >= 4 {
+                    let msg_len = ((rest[1] as usize) << 16) | ((rest[2] as usize) << 8) | rest[3] as usize;
+                    let total = 4 + msg_len;
+                    if rest.len() < total {
+                        break; // 半条（跨 record 分片）：本条不处理（见上「已知限制」）。
+                    }
+                    if rest[0] == 0x18 {
+                        self.on_key_update(&rest[..total])?;
+                    }
+                    rest = &rest[total..];
                 }
                 Decoded::Drop
             }
@@ -155,8 +169,8 @@ impl<R, W> RealityStream<R, W> {
     ///   （先换再封 = 对端用旧 key 解新 key record → 掉线）。回发的 request_update 恒 0（防环）。
     /// - 非法 `request_update`（非 0/1）→ Err（前置校验，零 mutation）。换密钥后 record seq 由新实例天然归 0。
     fn on_key_update(&mut self, msg: &[u8]) -> io::Result<()> {
-        // 帧校验（先于任何 mutation）：KeyUpdate body 长度字段必为 1（18 00 00 01 RU）。
-        if msg.len() < 5 || msg[1..4] != [0x00, 0x00, 0x01] {
+        // 帧校验（先于任何 mutation）：调用方已按 message 边界切出 → KeyUpdate 必恰 5 字节（18 00 00 01 RU）。
+        if msg.len() != 5 || msg[1..4] != [0x00, 0x00, 0x01] {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "REALITY KeyUpdate 帧非法（须 18 00 00 01 RU）",
@@ -175,6 +189,9 @@ impl<R, W> RealityStream<R, W> {
         // 步骤 B：仅 update_requested(1) 才回发 + 轮“发送”方向。
         if request_update == 1 {
             // B1：必须用“旧”send key（旧 seq）封装回发 KeyUpdate(update_not_requested=0)，入 write_pending。
+            // 不对 write_pending 设独立上限（对抗式 review nit）：reply 仅 ~26B/条，要无界增长需「TCP 写满 +
+            // 消费者持续读 + 服务端用正确轮换密钥持续刷 KeyUpdate」三者同时成立——REALITY 出口是用户自有可信端，
+            // 出模型；且 write_pending 与 poll_write 的 app-data 背压共用，硬上限会误伤正常大下载背压（footgun）。
             let reply = self.send_keys.seal(0x16, &[0x18, 0x00, 0x00, 0x01, 0x00]);
             self.write_pending.extend_from_slice(&reply);
             // B2：封装完毕“才”轮发送方向（铁律 B1 必先于 B2）。
@@ -1147,6 +1164,31 @@ mod tests {
         let (mut s3, _e3) = mk_stream_secrets(s0, c0);
         assert!(s3.on_key_update(&[0x18, 0x00, 0x00, 0x02, 0x00, 0x00]).is_err(), "body_len=2 → Err");
         assert!(s3.on_key_update(&[0x18, 0x00, 0x00]).is_err(), "截断帧 → Err");
+    }
+
+    /// T20a（刀10/F5 robustness，对抗式 review finding）：单条 0x16 record **合并** `[NST][KeyUpdate]`
+    /// （RFC 8446 §5.1 同向允许合并）→ KeyUpdate 仍被切出处理（recv 轮换），而非「只看首字节(=NST 0x04)整条丢」。
+    /// 反例保护：旧实现只判 content.first()==0x18 会漏掉尾部 KeyUpdate → recv 不轮 → 下条 record bad-decrypt（本 read_exact 会 Err）。
+    #[tokio::test]
+    async fn keyupdate_coalesced_after_nst_in_one_record() {
+        let (s0, c0) = ([0x3Cu8; 32], [0x4Du8; 32]);
+        let (mut stream, mut srv_end) = mk_stream_secrets(s0, c0);
+        // server 用 s0（=client recv）封一条 0x16：content = [NST 0x04 len4 body] || [KeyUpdate update_not_requested]。
+        let mut srv = keys_from(&s0);
+        let mut content = vec![0x04, 0x00, 0x00, 0x04, 0xAA, 0xBB, 0xCC, 0xDD]; // NewSessionTicket（4B body）
+        content.extend_from_slice(&[0x18, 0x00, 0x00, 0x01, 0x00]); // 合并的 KeyUpdate(update_not_requested=0)
+        srv_end.write_all(&srv.seal(0x16, &content)).await.unwrap();
+        // 紧接着用「轮换后」s1 发 app data（含 VLESS 头）；client 只有真处理了合并的 KeyUpdate（recv→s1）才能解。
+        let s1 = next_application_traffic_secret(&s0);
+        let mut srv_new = keys_from(&s1);
+        let mut down = vec![0x00, 0x00];
+        down.extend_from_slice(b"after-coalesced");
+        srv_end.write_all(&srv_new.seal(0x17, &down)).await.unwrap();
+        srv_end.flush().await.unwrap();
+
+        let mut got = vec![0u8; b"after-coalesced".len()];
+        stream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"after-coalesced", "合并 record 中的 KeyUpdate 被处理 → recv 轮到 s1，新-key 数据可解");
     }
 
     /// L1：fatal alert → Err；close_notify → 干净 EOF（read 返回 0）。
