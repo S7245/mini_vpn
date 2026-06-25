@@ -104,6 +104,22 @@ udp_check() {
   fi
 }
 
+# 轮询等待切换日志（纠正「restore/检查太早」——down 检测需 idle(>=15s) + 5s 重连，别在窗口内就 restore）。
+# 用法：wait-switch [reality|tuic]（默认 reality）。
+wait_switch() {
+  local want="${2:-reality}" pat secs=0 max=80
+  if [ "$want" = "tuic" ]; then pat="切回 TUIC"; else pat="切到 REALITY"; fi
+  echo "==> 等 failover 日志『${pat}』（最多 ${max}s；别提前 restore）..."
+  while [ "$secs" -lt "$max" ]; do
+    if grep -q "$pat" "$LOG" 2>/dev/null; then
+      echo ""; echo "✅ 切换发生（~${secs}s）：$(grep "$pat" "$LOG" | tail -1)"
+      return 0
+    fi
+    sleep 2; secs=$((secs+2)); printf '\r    %ss...' "$secs"
+  done
+  echo ""; echo "❌ ${max}s 内未见『${pat}』。当前 status："; status; return 1
+}
+
 status() {
   echo "---- failover 切换/握手日志（tail）----"
   grep -E "🔀 failover|REALITY 握手成功|切到 REALITY|切回 TUIC|无可用连接，丢弃|spawn 握手" "$LOG" 2>/dev/null | tail -10
@@ -131,12 +147,13 @@ soak_stop() {
 case "$ACTION" in
   smoke)        smoke; exit 0 ;;
   udp-check)    udp_check; exit 0 ;;
+  wait-switch)  wait_switch "$@"; exit $? ;;
   status)       status; exit 0 ;;
   cut-tuic)     cut_tuic; exit 0 ;;
   restore-tuic) restore_tuic; exit 0 ;;
   soak-stop)    soak_stop; exit 0 ;;
   soak)         ;;
-  *) echo "usage: $0 {soak | smoke | udp-check | cut-tuic | restore-tuic | status | soak-stop}"; exit 2 ;;
+  *) echo "usage: $0 {soak | smoke | udp-check | cut-tuic | wait-switch [reality|tuic] | restore-tuic | status | soak-stop}"; exit 2 ;;
 esac
 
 # ---- soak（failover 模式：两腿都配齐）----
@@ -181,12 +198,11 @@ networksetup -setdnsservers "$SVC" "$FAKE_DNS" \
 
 echo "---- startup lines ----"; grep -E "TUIC 出口|REALITY 出口|failover 就绪|UDP relay" "$LOG" | tail -4
 echo "READY  utun=${UTUN}  upstream=failover  log=${LOG}"
-echo "---- acceptance 流程（另开终端）----"
+echo "---- acceptance 流程（另开终端；⚠️ 关键：down 检测需 idle(>=15s)+5s 重连，cut 后**先 wait-switch 再 restore**）----"
 echo "  1) smoke                                      # TUIC 当班 → 200"
-echo "  2) udp-check                                  # TUIC 当班 → HTTP/3 通（UDP datagram）"
-echo "  3) sudo -E bash $0 cut-tuic                   # 打断 TUIC（pf 封 UDP:${MINI_VPN_TUIC_SERVER}）"
-echo "  4) smoke                                      # 应仍 200（经 REALITY；status 见 ▶ REALITY）"
-echo "  5) udp-check                                  # REALITY 当班 → UDP 丢（h3 失败 / 见 udp_drops）"
-echo "  6) sudo -E bash $0 restore-tuic               # 恢复；等 60s+ 冷却"
-echo "  7) status                                     # 应见 🔀 切回 TUIC 主腿"
+echo "  2) sudo -E bash $0 cut-tuic                   # 打断 TUIC（pf 封 UDP:${MINI_VPN_TUIC_SERVER}）"
+echo "  3) bash $0 wait-switch reality                # 轮询等『切到 REALITY』（最多 80s；**别提前 restore**）"
+echo "  4) smoke                                      # 切换后应仍 200（经 REALITY；status 见 ▶ REALITY）"
+echo "  5) sudo -E bash $0 restore-tuic               # 恢复 TUIC（仅在已观察到切到 REALITY 后）"
+echo "  6) bash $0 wait-switch tuic                   # 轮询等『切回 TUIC』（连续 3 探针 + 60s 冷却 → ~90s+）"
 echo "  停：sudo -E bash $0 soak-stop"

@@ -647,6 +647,10 @@ fn io_err<E: std::fmt::Display>(ctx: &str, e: E) -> ClientError {
     ClientError::from(std::io::Error::other(format!("{ctx}: {e}")))
 }
 
+/// 刀9（spec §2.3）：QUIC 重连握手超时。黑洞/不可达 server 的握手默认受 idle(30s) 约束可阻塞数十秒，
+/// 5s 封顶让 failover 快路（连接死 + 重连失败）快速暴露；正常重连 1-RTT 远小于 5s，不会误伤高 RTT 链路。
+const TUIC_RECONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// TUIC 客户端上游：持有一条到 sing-box 的 QUIC 连接，每条 TCP 开一条 `Connect` 双向流。
 /// 中文要点：连接断了按需重连+重认证(13a 最小实现;迁移/0-RTT 调优在 13c)。
 pub struct TuicUpstream {
@@ -813,18 +817,23 @@ impl TuicUpstream {
     /// 取当前活连接的克隆；若已关闭则就地重连+重认证（13a 逻辑，TCP/UDP 共用）。
     /// 中文要点：单一事实源——TCP `open_tcp` 与 UDP `send_udp`/驱动任务都经此取连接，
     /// 由 `conn` 互斥锁串行化重连，避免并发双连接。
+    /// 刀9（spec §2.3）：重连握手封 **5s 超时**——黑洞/不可达 server 的 QUIC 握手默认受 idle(30s) 约束、
+    /// 可阻塞数十秒；5s 封顶让「连接死 + 重连失败」这个 failover 快路强信号**快速暴露**（is_dead 仍为
+    /// true，调用方 record_tuic_failure(dead) 即切 REALITY），同时也止血纯 TUIC 模式的 inline 重连久挂。
     async fn live_conn(&self) -> Result<Connection, ClientError> {
         let mut guard = self.conn.lock().await;
         if guard.close_reason().is_some() {
-            *guard = Self::handshake(
+            let hs = Self::handshake(
                 &self.endpoint,
                 self.server,
                 &self.sni,
                 &self.uuid,
                 &self.password,
                 self.zero_rtt,
-            )
-            .await?;
+            );
+            *guard = tokio::time::timeout(TUIC_RECONNECT_TIMEOUT, hs)
+                .await
+                .map_err(|_| io_err("tuic reconnect", "5s 超时（黑洞/不可达；failover 据 is_dead 切备腿）"))??;
         }
         Ok(guard.clone())
     }
