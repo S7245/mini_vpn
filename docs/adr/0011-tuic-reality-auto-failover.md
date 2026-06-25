@@ -26,7 +26,17 @@
 - **up 迟滞**（防抖）：REALITY 当班时后台每 30s 探 TUIC（`live_conn`，非浅探）；切回需**连续 3 次成功
   且距切换 ≥60s 冷却**。门槛严于 down 快路，构成不对称迟滞。
 - **不上指数退避**：只 2 条腿 + UDP 常驱 TUIC 重连，固定 60s 冷却 + 30s 探针足够（稳优先，实现更简单）。
-- 数值见 spec §2.6。黑洞检测**复用既有** `quic.rs` 的 idle30s/keepalive5s（无需新增 transport config）。
+- 数值见 spec §2.6。黑洞检测靠 `quic.rs` idle_timeout + keepalive5s。
+
+### 3b. 检测速度（真出口 acceptance 驱动的修订，2026-06-25）
+真出口 acceptance 暴露两点：① QUIC `open_tcp` 在黑洞连接上**乐观返回 Ok**（开 bi-stream + 写 Connect 头是本地操作、
+不等服务端），failover 看不到失败 → 检测下限 = `idle_timeout`（连接被 quinn 判死、`close_reason` 有值，下次 open
+重连失败才切）；② spec §2.3 的「QUIC 重连 5s 超时」我漏实现 → 重连到黑洞 server 受 idle 约束可阻塞数十秒，最坏 ~60s 才切。
+修：
+- **`live_conn` 重连握手封 5s 超时**（`TUIC_RECONNECT_TIMEOUT`）：超时 → Err、guard 仍持旧死连接 → `is_dead`=true → 切。
+- **`QUIC_MAX_IDLE_SECS` 30s → 15s**（grill 裁决）：切换 ≈ idle + 5s ≈ **~20s**。不增误切——healthy 连接靠 keepalive=5s
+  （3 PING/15s 窗口）永不 idle 到阈值；弱网 15–30s 瞬时中断只自愈成一次廉价重连（~1-RTT），failover 还要求「重连也失败」才触发。
+- **first-byte 健康判定**（黑洞 ~5s 即测出、无需 idle trade-off）= brief §2.3 的「正确」方案，但需重构 spawn 数据路径 + 首字节注入，**留后续**。
 
 ### 4. failover 模式恒 spawn 所有 open（M3 + code-review Finding 1 深修）
 - M3：把昂贵的 REALITY 多-RTT 握手 spawn 出单任务 select 主循环，避免一条慢握手饿死所有 flow。

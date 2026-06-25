@@ -16,11 +16,16 @@ use rustls::{Certificate, RootCertStore};
 /// QUIC ALPN：握手必须协商；client/server 一致。
 pub const QUIC_ALPN: &[u8] = b"mvpn";
 
-/// 数据面空闲超时：30s（quinn 默认仅 10s，太短）。两端取 min 生效。
-const QUIC_MAX_IDLE_SECS: u64 = 30;
-/// keep-alive 间隔：5s。中文要点：必须明显小于「对端可能的空闲超时」才能续命。
-/// 取 5s 是为了即便对端跑的是**旧二进制**（quinn 默认 idle=10s、无 keep-alive，协商后 idle=min=10s），
-/// 客户端每 5s 的 PING 也能在 10s 触发前重置对端 idle 计时器 → 连接不闪断（抗版本错配，系统稳定优先）。
+/// 数据面空闲超时：15s（刀9 从 30s 降——见下）。两端取 min 生效。
+/// 中文要点（刀9，grill 裁决 2026-06-25）：此值 = failover 黑洞**检测下限**——QUIC `open_tcp` 在黑洞连接上
+/// 乐观返回 Ok（开流是本地操作、不等服务端），failover 看不到失败，只能等 quinn 在 idle 超时把连接判死
+/// （`close_reason`），下次 open 重连失败（5s）才切 REALITY，即「切换 ≈ idle + 5s」。30s 太慢（~35s 黑洞）；
+/// 降到 15s → ~20s 切。**不会增加误切**：healthy 连接靠 keepalive=5s（3 PING/窗口）永不 idle 到阈值；
+/// 弱网下 15–30s 瞬时中断只会自愈成一次廉价重连（~1-RTT），failover 还要求「重连也失败」才触发。
+const QUIC_MAX_IDLE_SECS: u64 = 15;
+/// keep-alive 间隔：5s。中文要点：必须明显小于本端 idle(15s) 与「对端可能的空闲超时」才能续命。
+/// 取 5s（3 PING/15s 窗口，丢 1-2 个也续得上）：即便对端跑**旧二进制**（quinn 默认 idle=10s、无 keep-alive，
+/// 协商后 idle=min=10s），每 5s 的 PING 也能在 10s 触发前重置对端 idle 计时器 → 连接不闪断（抗版本错配，稳优先）。
 const QUIC_KEEPALIVE_SECS: u64 = 5;
 
 /// 数据面起步 MTU：1280（IPv6 最小 MTU，任何真实路径都支持）。中文要点：quinn 默认 1200，
