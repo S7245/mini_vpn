@@ -868,8 +868,9 @@ fn reap_dead_slots(
     let mut reaped = 0;
     for h in handles {
         let dead = {
-            let st = sockets.get::<TcpSocket>(h).state();
-            let active = sockets.get::<TcpSocket>(h).is_active();
+            let s = sockets.get::<TcpSocket>(h);
+            let st = s.state();
+            let active = s.is_active();
             match socket_ctxs.get(&h) {
                 Some(ctx) if ctx.state != SocketState::Listening => {
                     !active
@@ -1238,7 +1239,10 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
             fake_pool.acquire(ip, now_secs);
             ctx.fake_ip = Some(ip);
         }
-        ctx.buffer_uplink(&payload); // 首包远小于 256KB 上限，必入
+        if !ctx.buffer_uplink(&payload) {
+            // 理论不可达（spawn 入口 buffer 必空、首包 << 256KB）；防御性对称上面 HandshakePending 分支。
+            println!("⚠️ handle {:?} spawn 入口缓存首包失败（{}B），丢弃", handle, payload.len());
+        }
         println!("🎯 handle {:?} target {} → spawn 握手（并发化，不 stall 主循环）", handle, target.to_wire_string());
 
         let up = Arc::clone(upstream);
@@ -1281,11 +1285,17 @@ fn handle_handshake_done(
     match result {
         Ok(stream) => {
             let (tx, rx) = tokio::sync::mpsc::channel(RELAY_CHANNEL_CAPACITY);
-            // 按序 flush 握手期缓存的上行字节（首包 + 在飞期到达的后续包，FIFO）。新 channel 容量充足，
-            // try_send 必成（避免 await-with-borrow）。
+            // 按序 flush 握手期缓存的上行字节（首包 + 在飞期到达的后续包，FIFO）。新 channel 容量充足、
+            // rx 未 drop、仅 1 条消息 → try_send 必成（避免 await-with-borrow）。防御性：万一失败（未来
+            // 容量被改小等），**不静默丢缓存**——log + rearm 撤掉本槽，让应用 TCP 重建（Finding 2）。
             if !ctx.uplink_buffer.is_empty() {
                 let buffered = std::mem::take(&mut ctx.uplink_buffer);
-                let _ = tx.try_send(buffered);
+                if let Err(e) = tx.try_send(buffered) {
+                    println!("❌ handle {:?} flush 握手缓存失败({e}) → rearm（不静默丢字节）", handle);
+                    let socket = sockets.get_mut::<TcpSocket>(handle);
+                    rearm_socket(socket, ctx, fake_pool, now_secs);
+                    return; // stream 随作用域 drop 干净关闭
+                }
             }
             ctx.uplink_tx = Some(tx);
             ctx.state = SocketState::Relaying;

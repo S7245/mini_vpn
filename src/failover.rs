@@ -100,17 +100,34 @@ impl FailoverState {
         self.clock.elapsed().as_secs()
     }
 
-    fn switch_to_reality(&self, now_secs: u64) {
-        self.active_tcp_leg.store(TcpLeg::Reality.as_u8(), Ordering::Relaxed);
+    /// CAS 切到 REALITY：并发下（option A：失败 open 在多个 spawn task 里跑，record_tuic_failure 可并发）
+    /// **只有一个 caller 真正切换**（返回 true）；其余返回 false，不重复触发 seamless 重试 / 不重置计数。
+    fn switch_to_reality(&self, now_secs: u64) -> bool {
+        if self
+            .active_tcp_leg
+            .compare_exchange(TcpLeg::Tuic.as_u8(), TcpLeg::Reality.as_u8(), Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return false; // 别人已切（或已不在 TUIC）
+        }
         self.reality_switch_at.store(now_secs, Ordering::Relaxed);
         self.tuic_consec_fail.store(0, Ordering::Relaxed);
         self.probe_consec_ok.store(0, Ordering::Relaxed); // up 探针从头计
+        true
     }
 
-    fn switch_to_tuic(&self) {
-        self.active_tcp_leg.store(TcpLeg::Tuic.as_u8(), Ordering::Relaxed);
+    /// CAS 切回 TUIC（仅探针任务单线程调用，CAS 仅为与 switch_to_reality 对称 + 防与并发 down 切换打架）。
+    fn switch_to_tuic(&self) -> bool {
+        if self
+            .active_tcp_leg
+            .compare_exchange(TcpLeg::Reality.as_u8(), TcpLeg::Tuic.as_u8(), Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
         self.tuic_consec_fail.store(0, Ordering::Relaxed);
         self.probe_consec_ok.store(0, Ordering::Relaxed);
+        true
     }
 
     /// TUIC open_tcp 成功 → 清慢路计数（连续性被打断）。
@@ -125,13 +142,11 @@ impl FailoverState {
             return false; // 已不在 TUIC（并发切换），无需重复切
         }
         if dead {
-            self.switch_to_reality(now_secs); // 快路：连接死 + 重建失败 = 黑洞强信号，1 次即切
-            return true;
+            return self.switch_to_reality(now_secs); // 快路：连接死 + 重建失败 = 黑洞强信号，1 次即切
         }
         let n = self.tuic_consec_fail.fetch_add(1, Ordering::Relaxed) + 1;
         if n >= DOWN_SLOW_CONSEC {
-            self.switch_to_reality(now_secs); // 慢路：连接活但连续 3 次流失败
-            true
+            self.switch_to_reality(now_secs) // 慢路：连接活但连续 3 次流失败
         } else {
             false
         }
@@ -150,8 +165,7 @@ impl FailoverState {
         let n = self.probe_consec_ok.fetch_add(1, Ordering::Relaxed) + 1;
         let cooled = now_secs.saturating_sub(self.reality_switch_at.load(Ordering::Relaxed)) >= UP_COOLDOWN_SECS;
         if n >= UP_PROBE_CONSEC && cooled {
-            self.switch_to_tuic();
-            true
+            self.switch_to_tuic()
         } else {
             false
         }
@@ -242,11 +256,14 @@ where
         }
     }
 
-    /// 按当前选腿委托：TUIC 腿廉价（inline）；REALITY 腿不廉价（主循环 spawn 出去，刀9 M3）。
-    /// 中文要点：active_leg 可能在本判定与真正 open_tcp 之间翻转——但这只影响 inline/spawn 选择、
-    /// 绝不影响正确性（spawn/inline 的 open_tcp 都按调用时选腿做对的事，epoch 框架兜住迟到结果）。
+    /// **恒 false → failover 模式下所有 open 都 spawn 出主循环**（code-review Finding 1 的深修）。
+    /// 中文要点：不按 active_leg 动态判（那会在「读 open_is_cheap」与「open_tcp 内再读 leg」之间留 TOCTOU
+    /// 窗口 → inline 分支可能真跑 REALITY 握手 stall 主循环）；且**失败模式下 TUIC open 本身也不廉价**——
+    /// 它要做黑洞 reconnect（QUIC 握手到被封 server，可阻塞），inline 同样 stall。恒 spawn 把所有 open
+    /// （含 down 切换的 seamless 重试、黑洞 reconnect）都移出主循环，彻底消除 stall 与 TOCTOU。
+    /// 纯 TUIC 默认模式（非 failover）走 `TuicUpstream`（open_is_cheap=true）仍 inline，零回归不受影响。
     fn open_is_cheap(&self) -> bool {
-        self.state.active_leg() == TcpLeg::Tuic
+        false
     }
 }
 
@@ -410,6 +427,17 @@ mod tests {
         assert_eq!(s2.active_leg(), TcpLeg::Reality, "中途失败清零 → 仅 2 连续，不切");
         assert!(s2.record_probe(true, 240), "ok 连续3 + 冷却 → 切回");
         assert_eq!(s2.active_leg(), TcpLeg::Tuic);
+    }
+
+    /// CAS/guard 幂等：已切到 REALITY 后再来 dead 失败不重复切、返回 false（并发下只一个 caller 真切，
+    /// 单线程经 `active_leg != Tuic` guard 同样保证；Finding 5）。
+    #[test]
+    fn down_switch_is_idempotent() {
+        let s = FailoverState::new();
+        assert!(s.record_tuic_failure(true, 10), "首次 dead → 切 REALITY，返回 true");
+        assert_eq!(s.active_leg(), TcpLeg::Reality);
+        assert!(!s.record_tuic_failure(true, 11), "已在 REALITY → 不重复切，返回 false");
+        assert!(!s.record_tuic_failure(false, 12), "已在 REALITY → 慢路也不动，返回 false");
     }
 
     /// 铁律：send_udp 永不被 active_leg/冷却 gate——REALITY 当班 + 冷却期内仍恒走 tuic。
