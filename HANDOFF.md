@@ -293,7 +293,8 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
   3. **UDP**：TUIC 当班 `dig` over QUIC datagram 通；REALITY 当班 UDP 丢（符合预期，UDP 永绑 TUIC）；
   4. **F3 不 stall**：REALITY 当班多并发 curl，一条慢握手不拖垮其余（对比 inline 基线）；
   5. **F4 idle**：relay 静默 90s 自动清理。
-  helper 可扩 `scripts/knife8-reality-acceptance.sh`（两腿 env + pfctl 打断 TUIC）。
+  helper：**`scripts/knife9-failover-acceptance.sh`**（`soak`/`cut-tuic`/`restore-tuic`/`smoke`/`udp-check`/`status`/`soak-stop`；
+  两腿 env + pfctl 按端口阻断 TUIC UDP 不碰 REALITY TCP）。流程印在 `soak` 末尾。
 - **deferred（刀10+）**：**F5 KeyUpdate 密钥轮换**（与 failover 主链零耦合、单独成刀；brief §6 有 V1 字节级核验的精确规范：label `"traffic upd"`/seq 归 0/收 update_requested 必回发且**旧 send key 先封装再换密钥**/`AppKeys` 已暴露 c/s_ap_secret）；UDP-over-VLESS；连接复用；指数退避；0x1302/0x1303。
 
 ## Rhythm（每刀都遵守）
