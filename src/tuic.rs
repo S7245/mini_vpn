@@ -843,6 +843,18 @@ impl TuicUpstream {
         Ok(guard.clone())
     }
 
+    /// 取当前活连接克隆——**非阻塞、不重连**（刀9，ADR-0011 §3b）。锁被占（后台 start_udp 正在重连，持锁
+    /// 数秒）→ `None`，**绝不 await 锁**（否则在主循环 inline 的 send_udp 会被 stall）。连接已死 → `None`。
+    /// 重连交给后台 `start_udp` 自愈循环（背景退避重连），与主循环解耦。
+    fn current_conn(&self) -> Option<Connection> {
+        let guard = self.conn.try_lock().ok()?;
+        if guard.close_reason().is_some() {
+            None
+        } else {
+            Some(guard.clone())
+        }
+    }
+
     /// 发一条**已编码**的 TUIC Packet（刀3：datagram 主路径 + uni-stream 兜底）。
     /// 中文要点：先按 `udp_send_plan(max_datagram_size, len)` 主动分流——装得下走 native datagram，
     /// 超上限/不可用走 **per-packet uni-stream 兜底**（持续大流量直播不丢包）。datagram 真发遇
@@ -851,11 +863,14 @@ impl TuicUpstream {
         // 记录 UDP 活跃时刻：驱动任务据此「仅活跃时发」Heartbeat（纯 TCP 不发，省流量/电量）。
         self.last_udp_activity
             .store(self.clock.elapsed().as_secs(), Ordering::Relaxed);
-        let conn = match self.live_conn().await {
-            Ok(c) => c,
-            Err(e) => {
+        // 刀9（真出口 acceptance 修，ADR-0011 §3b）：**绝不在此 inline 重连**——send_udp 在主循环 inline
+        // await（handle_tuic_udp_uplink），黑洞期每个 UDP 包触发 5s 重连会 stall 整个事件循环、饿死 DNS 劫持
+        // 等所有主循环分支。改用 `current_conn`（try_lock 非阻塞 + 不重连）：连接活就发；锁被占（后台 start_udp
+        // 正在重连）或已死 → 快速静默丢（热路径勿刷屏，udp_drops 计数即观测）。重连由后台 start_udp 自愈循环负责。
+        let conn = match self.current_conn() {
+            Some(c) => c,
+            None => {
                 self.udp_drops.fetch_add(1, Ordering::Relaxed);
-                println!("⚠️ TUIC UDP↑ 无可用连接，丢弃: {e:?}");
                 return;
             }
         };
