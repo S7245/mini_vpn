@@ -16,11 +16,11 @@
 - **刀7 已在 `main`（`14258e4`，2026-06-23 fast-forward 合入）**：REALITY 第二片——离线 ServerHello 解析 +
   TLS 1.3 key schedule + record AEAD（手写，全程 RFC 8448 §3 KAT 字节级验证，sans-IO 无 acceptance，ADR-0009）。见下「刀7 完成」。
 - **刀8 已完成（2026-06-24）+ 真出口 acceptance ✅，已 ff 合入 main（`a9172a0`）**：REALITY 收官片——实 TCP 握手 + 解密 server flight + 证书 HMAC + Finished + VLESS + `RealityUpstream` + env 选择器；**VLESS over REALITY over TCP 在真 sing-box 上端到端跑通**（HTTP 200 三端闭环）。见下「刀8 完成」。
-- **刀9 完成 + 真出口 acceptance ✅（2026-06-25，分支 `claude/knife9-auto-failover`，逐 commit push；**未合 main**）**：
-  REALITY mini-project 收尾 = auto-failover 主链。F2 分离 TCP/UDP 上游 + F3 M3 握手并发化 + F1 不对称 failover + F4 idle 超时。
-  全链路 acceptance 通过（~10s 切 REALITY 200 / ~62s 切回 TUIC 200）；acceptance 逼出并修了 4 个检测坑（主动 udp_rx 黑洞探测为主机制）。
-  **F5 KeyUpdate 拆到刀10**。见下「刀9 完成」。
-- **新 session 起点：合 刀9 到 main（acceptance 已过）；然后刀10（KeyUpdate 密钥轮换）从 main 起；或先开主线**。
+- **刀9 已完成 + 真出口 acceptance ✅，已 ff 合入 main（`831afe3`，2026-06-25）**：REALITY mini-project 收尾 = auto-failover 主链。
+  F2 分离 TCP/UDP 上游 + F3 M3 握手并发化 + F1 不对称 failover + F4 idle 超时。全链路 acceptance 通过（~10s 切 REALITY 200 / ~62s 切回 TUIC 200）；
+  acceptance 逼出并修了 4 个检测坑（**主动 udp_rx 黑洞探测为主机制**，检测从 >80s→~10s）；两次对抗式 review（零正确性 bug）。**F5 KeyUpdate 拆到刀10**。见下「刀9 完成」。
+- **新 session 起点（下一刀=刀10）：从 `main`（`831afe3`）起新分支**——KeyUpdate 密钥轮换（与 failover 主链零耦合；`docs/tech/2026-06-24-knife9-research-brief.md` §6 有 V1 字节级核验的精确规范）。
+  若改开主线：高带宽压测+数据面多线程（逼近 100M）/ observability（DNS forge 计数、datagram drop 背压）。
   若改开主线：高带宽压测+数据面多线程（逼近 100M）/ observability(DNS forge 计数、datagram drop 背压)——按优先级定。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
