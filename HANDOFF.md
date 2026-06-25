@@ -16,7 +16,10 @@
 - **刀7 已在 `main`（`14258e4`，2026-06-23 fast-forward 合入）**：REALITY 第二片——离线 ServerHello 解析 +
   TLS 1.3 key schedule + record AEAD（手写，全程 RFC 8448 §3 KAT 字节级验证，sans-IO 无 acceptance，ADR-0009）。见下「刀7 完成」。
 - **刀8 已完成（2026-06-24）+ 真出口 acceptance ✅，已 ff 合入 main（`a9172a0`）**：REALITY 收官片——实 TCP 握手 + 解密 server flight + 证书 HMAC + Finished + VLESS + `RealityUpstream` + env 选择器；**VLESS over REALITY over TCP 在真 sing-box 上端到端跑通**（HTTP 200 三端闭环）。见下「刀8 完成」。
-- **新 session 起点（下一刀=刀9）：直接从 `main`（`a9172a0`）起新分支**（REALITY mini-project 收尾 = auto-failover 健康感知 TUIC↔REALITY + 分离 TCP/UDP 上游；见下「刀8 完成」末 deferred）。
+- **刀9 代码完成（2026-06-25，分支 `claude/knife9-auto-failover`，逐 commit push；未合 main；真出口 acceptance 待用户跑）**：
+  REALITY mini-project 收尾 = auto-failover 主链。F2 分离 TCP/UDP 上游 + F3 M3 握手并发化 + F1 不对称 failover + F4 idle 超时。
+  **F5 KeyUpdate 拆到刀10**。见下「刀9 代码完成」。**下一刀=刀10（KeyUpdate 密钥轮换）或合并 刀9 后开主线**。
+- **新 session 起点：刀9 acceptance（用户跑，见「刀9」末 runbook）→ 合 main；或刀10 从 `claude/knife9-auto-failover`/main 起**。
   若改开主线：高带宽压测+数据面多线程（逼近 100M）/ observability(DNS forge 计数、datagram drop 背压)——按优先级定。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
@@ -57,7 +60,8 @@
  ├─ 刀6  REALITY auth 密码学 + TLS 1.3 ClientHello 构造（sans-IO，100% 离线 TDD）  ✅ 完成（见下「刀6」，ADR-0008）；已合 main
  ├─ 刀7  ServerHello 解析 + TLS 1.3 key schedule（RFC 8448 向量）+ record-layer AEAD  ✅ 完成（见下「刀7」，ADR-0009）；已合 main
  ├─ 刀8  server-flight 解密 + HMAC 证书校验 + client Finished + 实 TCP 握手 + VLESS 帧 + RealityUpstream(ProxyUpstream) + env 选择器 + 真出口 acceptance
- └─ 刀9  auto-failover（健康感知 TUIC↔REALITY；分离 TCP/UDP 上游；UDP 留 QUIC）
+ ├─ 刀9  auto-failover（健康感知 TUIC↔REALITY；分离 TCP/UDP 上游；M3 握手并发化；L2 idle）  ✅ 代码完成（acceptance 待跑）
+ └─ 刀10 KeyUpdate 密钥轮换（拆出，与 failover 主链零耦合；brief §6 有精确规范）
 ```
 - 优先级与关联：**fake-IP 池回收**属"大并发长稳"（并入刀2）；**DoH 拦截**是"真实场景能连上"的前置（刀4，可视情提前——真机浏览器场景不修则 fake-IP 形同虚设）。**A（REALITY）正交**：当前 QUIC 能连，不阻塞三目标达标；TCP-based，替代不了 UDP 直播。
 
@@ -273,6 +277,24 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
 - **设计文档**：`docs/tech/2026-06-23-knife8-reality-live-handshake-{spec,plan}.md` + `2026-06-23-knife8-research-brief.md` + `knife8-singbox-server-setup.md`；ADR-00010（CertVerify defer + KeyUpdate gap + cert 提取反转）；ADR-0009 修订（收紧 cipher offer 0x1301）。acceptance helper `scripts/knife8-reality-acceptance.sh`（preflight/soak/smoke/soak-stop + openssl 0x1301 出口预检）。
 - **deferred（刀9）**：auto-failover（健康感知 TUIC↔REALITY）；分离 TCP/UDP 上游；UDP-over-VLESS；连接复用（每 TCP 一次握手）；握手并发化（M3，移出主循环 spawn）；relay idle 超时（L2）；KeyUpdate 密钥轮换（ADR-0010 gap）；0x1302/0x1303（ADR-0009 gap）；Vision flow。
 - **⚠️ 安全 note**：acceptance 期间一份服务端凭据（reality private_key/uuid/short_id）曾被误提交进 `docs/tech/knife8-singbox-server-setup.md`（commit 5ded2a2）并推 origin → 已 force-push 重写历史清除（HEAD a928125）+ 文件改占位符；**该 keypair 须在服务端轮换**（私钥上过远端=已暴露）。
+
+## 刀9 代码完成（2026-06-25）：auto-failover 主链 + M3 + L2（真出口 acceptance 待跑）
+
+**交付**（分支 `claude/knife9-auto-failover`，从 main `a9172a0` 起，逐 commit push；**未合 main**；REALITY mini-project 收尾）：
+- **设计输入**：understand-phase research **workflow**（5 路并行研究 + 3 路对抗式核验 + 综合落盘 `docs/tech/2026-06-24-knife9-research-brief.md`）+ grill 4 裁决。spec/plan：`docs/tech/2026-06-24-knife9-auto-failover-{spec,plan}.md`。ADR-0011。
+- **F2 分离 TCP/UDP 上游**（`src/failover.rs`，commit `423d79d`）：`FailoverUpstream<T,R>`（泛型，贴合本仓单态化惯用法 + 可注入 mock）impl `ProxyUpstream`（open_tcp 选腿）+ `DatagramUpstream`（**send_udp 恒走 tuic**，F2 硬约束一处钉死）。`MINI_VPN_UPSTREAM=failover`（**opt-in**，默认/未设仍纯 TUIC 零回归；`tuic`/`reality` 作强制单腿旁路）。
+- **F4 relay idle 超时（L2）**（commit `9ea70f1`）：`spawn_remote_relay` 抽 `run_relay` + select 加 idle 分支（90s 双向静默 → 退出 + `stream.shutdown`，防慢/卡死上游泄漏）。dev-dep tokio 加 `test-util`（start_paused 确定性测；"full" 不含，已知坑）。
+- **F1 不对称 auto-failover**（commit `d64d514`）：`HealthProbe` trait（probe=live_conn 非浅探 / is_dead=close_reason）TuicUpstream impl；`FailoverState` 决策方法收 `now_secs`（可注入时钟确定性单测）；**down 快路（连接死 is_dead）1 次切 / 慢路连续 3 次切 + 成功清零**；**up 连续 3 探针成功 + 60s 冷却切回**（不对称迟滞防 flap）；后台 `spawn_health_probe`（仅 REALITY 当班、30s 节奏）。**铁律**：send_udp 永不读 state（结构性）。
+- **F3 M3 握手并发化**（commit `d19c482`）：把昂贵的 REALITY 多-RTT 握手 spawn 出单任务 select 主循环。`ProxyUpstream::open_is_cheap()`（默认 true=inline 零回归；REALITY=false；**FailoverUpstream 恒 false**=失败模式 TUIC reconnect 也不廉价 + 消除 TOCTOU，见下 review）。`SocketState::HandshakePending`（spawn 在飞态，与 inline `OpeningRemote` 区分→reap 不误杀在飞握手）+ `conn_epoch` 防串话（进 +1、rearm +1，`handle_handshake_done` **先比 epoch** 再看状态）+ `uplink_buffer`（256KB 上限，握手期上行缓存、成功后按序 flush）+ `HandshakeDone` channel（cap 128）回灌。fake-IP：spawn 时 acquire、rearm 时 release（平衡）。
+- **质量**：174 lib 测 + 6 harness 测全绿、clippy `--all-targets --features harness` 0 warning、release 绿。**对抗式 code-review workflow（41 agent / 7 角度 / 1-vote 核验，commit `546e715`）5 findings 全修**：F1 TOCTOU 深修（FailoverUpstream `open_is_cheap` 改恒 false → 所有 open 含 seamless 重试/黑洞 reconnect 都 spawn 出主循环，纯 TUIC 默认仍 inline）；F5 switch 用 `compare_exchange`（恒 spawn 后 record_tuic_failure 可并发）；F2 try_send 失败 log+rearm 不静默丢；F3 spawn 入口 buffer_uplink 检返回；F4 reap 两次 sockets.get() 合一。
+- **🔑 真出口 acceptance（待用户跑，runbook）**：`MINI_VPN_UPSTREAM=failover` + 同时配齐 `MINI_VPN_TUIC_*`（刀8 那套）与 `MINI_VPN_REALITY_*`（server/uuid/pbk/short_id/sni）两腿 → 跑 client-tun。验证：
+  1. **F1 down**：TUIC 正常 curl HTTPS 200 → 人为打断 TUIC（client 侧 pfctl 封 outbound UDP 到 VPS:8443，或 server 侧停 QUIC）→ 日志 `🔀 failover：TUIC ... → 切到 REALITY` + curl 仍 200（cloudflare trace 见 VPS 出口）；
+  2. **F1 up**：恢复 TUIC → 60s+ 后日志 `🔀 切回 TUIC 主腿`；
+  3. **UDP**：TUIC 当班 `dig` over QUIC datagram 通；REALITY 当班 UDP 丢（符合预期，UDP 永绑 TUIC）；
+  4. **F3 不 stall**：REALITY 当班多并发 curl，一条慢握手不拖垮其余（对比 inline 基线）；
+  5. **F4 idle**：relay 静默 90s 自动清理。
+  helper 可扩 `scripts/knife8-reality-acceptance.sh`（两腿 env + pfctl 打断 TUIC）。
+- **deferred（刀10+）**：**F5 KeyUpdate 密钥轮换**（与 failover 主链零耦合、单独成刀；brief §6 有 V1 字节级核验的精确规范：label `"traffic upd"`/seq 归 0/收 update_requested 必回发且**旧 send key 先封装再换密钥**/`AppKeys` 已暴露 c/s_ap_secret）；UDP-over-VLESS；连接复用；指数退避；0x1302/0x1303。
 
 ## Rhythm（每刀都遵守）
 
