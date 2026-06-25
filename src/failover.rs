@@ -45,7 +45,8 @@ pub trait HealthProbe: Send + Sync {
     async fn is_dead(&self) -> bool;
     /// 当前连接累计收到的 UDP datagram 数（quinn `stats().udp_rx.datagrams`）。**黑洞存活信标**：
     /// 健康连接每 ~5s 有 keepalive ACK 进来→单调增；黑洞连 ACK 都收不到→停滞。down 探测据此判黑洞。
-    async fn rx_datagrams(&self) -> u64;
+    /// **非阻塞**：返回 `None`=锁被占（后台正在重连）或不可读 → 调用方跳过本次观察（停滞计时靠 now 累积、不重置）。
+    async fn rx_datagrams(&self) -> Option<u64>;
 }
 
 /// 黑洞探测器（纯逻辑，可单测）：观察 TUIC 连接的 `udp_rx.datagrams`，停滞 `BLACKHOLE_RX_STALE_SECS`
@@ -276,8 +277,9 @@ where
                 match state.active_leg() {
                     TcpLeg::Tuic => {
                         secs_since_up_probe = 0;
-                        let rx = tuic.rx_datagrams().await;
-                        if detector.observe(rx, state.now_secs())
+                        // rx_datagrams 非阻塞：None=锁被占（重连中）→ 跳过本次观察（停滞计时靠 now 累积、不重置）。
+                        if let Some(rx) = tuic.rx_datagrams().await
+                            && detector.observe(rx, state.now_secs())
                             && state.record_blackhole(state.now_secs())
                         {
                             println!(
@@ -287,7 +289,8 @@ where
                         }
                     }
                     TcpLeg::Reality => {
-                        detector.reset(); // 切回 TUIC 后重新计，避免跨腿误判
+                        // 每 REALITY tick 复位（幂等）：保证切回 TUIC 时 detector 从干净状态开始计（非仅切换瞬间）。
+                        detector.reset();
                         secs_since_up_probe += HEALTH_TICK_SECS;
                         if secs_since_up_probe >= PROBE_INTERVAL_SECS {
                             secs_since_up_probe = 0;
@@ -401,8 +404,8 @@ mod tests {
         async fn is_dead(&self) -> bool {
             self.dead.load(Ordering::Relaxed)
         }
-        async fn rx_datagrams(&self) -> u64 {
-            self.rx.load(Ordering::Relaxed)
+        async fn rx_datagrams(&self) -> Option<u64> {
+            Some(self.rx.load(Ordering::Relaxed))
         }
     }
 

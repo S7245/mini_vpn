@@ -651,9 +651,11 @@ fn io_err<E: std::fmt::Display>(ctx: &str, e: E) -> ClientError {
 /// 5s 封顶让 failover 快路（连接死 + 重连失败）快速暴露；正常重连 1-RTT 远小于 5s，不会误伤高 RTT 链路。
 const TUIC_RECONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// 刀9（真出口 acceptance 修）：单条 TCP open（open_bi + write Connect）超时。黑洞连接上 write_all
+/// 刀9（真出口 acceptance 修）：单条 TUIC TCP open（open_bi + write Connect）超时。黑洞连接上 write_all
 /// 因 send 窗口满+无 ACK 会无限挂（连接尚未判死），5s 封顶让 failover 慢路收到「连接活但 open 失败」
-/// 信号；正常 open 是本地操作远小于 5s，不误伤。
+/// 信号；正常 open 是本地操作远小于 5s，不误伤。**与 `TUIC_RECONNECT_TIMEOUT` 各自独立**（恰好都 5s，
+/// 非耦合）；亦**不同于** spec §2.6 的「open_tcp 10s」——那指 **REALITY** open 的 H2 止血超时（reality_upstream.rs），
+/// 此处是 TUIC open 的黑洞探测超时（acceptance 新加，spec 当时未有）。
 const TUIC_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// TUIC 客户端上游：持有一条到 sing-box 的 QUIC 连接，每条 TCP 开一条 `Connect` 双向流。
@@ -822,7 +824,7 @@ impl TuicUpstream {
     /// 取当前活连接的克隆；若已关闭则就地重连+重认证（13a 逻辑，TCP/UDP 共用）。
     /// 中文要点：单一事实源——TCP `open_tcp` 与 UDP `send_udp`/驱动任务都经此取连接，
     /// 由 `conn` 互斥锁串行化重连，避免并发双连接。
-    /// 刀9（spec §2.3）：重连握手封 **5s 超时**——黑洞/不可达 server 的 QUIC 握手默认受 idle(30s) 约束、
+    /// 刀9（spec §2.3）：重连握手封 **5s 超时**——黑洞/不可达 server 的 QUIC 握手默认受 idle(15s, quic.rs) 约束、
     /// 可阻塞数十秒；5s 封顶让「连接死 + 重连失败」这个 failover 快路强信号**快速暴露**（is_dead 仍为
     /// true，调用方 record_tuic_failure(dead) 即切 REALITY），同时也止血纯 TUIC 模式的 inline 重连久挂。
     async fn live_conn(&self) -> Result<Connection, ClientError> {
@@ -1115,8 +1117,11 @@ impl crate::failover::HealthProbe for TuicUpstream {
     }
     /// 累计收到的 UDP datagram 数（quinn `stats().udp_rx.datagrams`）——黑洞存活信标：健康连接每 ~5s
     /// 有 keepalive ACK 进来→单调增；黑洞连 ACK 都收不到→停滞。down 探测据此判黑洞（不被乐观开流/keepalive 架空）。
-    async fn rx_datagrams(&self) -> u64 {
-        self.conn.lock().await.stats().udp_rx.datagrams
+    /// **非阻塞**（try_lock，同 current_conn）：锁被占（后台 start_udp 正在重连，持锁≤5s）→ `None`，**绝不 await
+    /// 锁**——否则健康探针任务被卡 5s、把锁等待当成网络停滞、检测计时偏斜（review finding）。调用方对 None
+    /// 跳过本次观察：连接正在重连本就不健康，停滞计时靠 `now` 累积、不重置，下次能读到（仍停滞）即判黑洞。
+    async fn rx_datagrams(&self) -> Option<u64> {
+        Some(self.conn.try_lock().ok()?.stats().udp_rx.datagrams)
     }
 }
 
