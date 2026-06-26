@@ -536,3 +536,55 @@ harness 集成 `metrics_relays_spawned_tracks_load`（32 flow → relays_spawned
 **经验**：短突发验证须 `export MINI_VPN_METRICS_SECS=5` + `sudo -E env MINI_VPN_METRICS_SECS=5 ...` 确保透传（本轮启动行显示 30s=未透传），或用持续负载（YouTube/iperf）让多条 30s 快照覆盖。
 
 **→ 刀11 数据面可观测性 全部完成（代码 + 两轮 review 零 bug + 真出口 acceptance ✅）。** 量化底座就位，下一刀=主线「多线程逼近 100M」。
+
+---
+
+# 刀12 — 多核逼近 100M：量化定位（quantify-only，2026-06-26/27）
+
+> spec/plan：`2026-06-26-knife12-multicore-quantify-{spec,plan}.md`；acceptance 清单同目录
+> `2026-06-26-knife12-acceptance-checklist.md`；裁决 ADR `docs/adr/0013-*`。分支 `claude/knife12-multicore-100m`。
+
+## 交付（仪器，非干预）
+
+`LoopProfiler`（新 `src/loop_profiler.rs`，env `MINI_VPN_PROFILE_LOOP=1` 开，默认 `NoopSink` 零开销）：
+主循环 **poll / relay / loop-active** 三段 wall-fraction，每 `MINI_VPN_METRICS_SECS` 打 `🔬` 行。判决逻辑：
+loop-active→~100% 且 poll 占大头 ⇒ #4（分片有理）；loop-active 低（多 park 空等上游）⇒ #3（连接池）。
+harness 多核就绪 spike 证仪器正确（注入 on-loop CPU → loop-active 0.706→0.996、poll 0.170→0.692）。
+
+## 真出口实测（深圳 macOS client → 47.x sing-box；iperf3 经/绕隧道）
+
+| 场景 | 聚合 | client `🔬` | 读法 |
+|---|---|---|---|
+| 直连/未进隧道（`📊 TCP relay 累计=0`） | 22–26M（裸跨太平洋，单次 60s 重传达 63509） | `loop-active≈0.1% poll≈0.1% park≈99.9% iters≈1007`（纯定时器） | 流量没经过客户端 |
+| **隧道 P=4 setup 窗口** | scaling 到 **~46M** | `loop-active=72% poll=3.8% relay=66% iters=16523` | 忙，但成本在 **relay** 不在 poll；瞬态（建连） |
+| 隧道 P=8 窗口 | ~44M | `loop-active=10.4% poll=0.7% relay=9.3%` | poll 可忽略 |
+
+**poll 段在每个样本 ≤3.8%、多数 0.1%**（直连 + 隧道、各负载）。并行 scaling：P=1→22M、P=4→46M、P=8→44M
+（单 QUIC 连接非 7M 死墙，聚合平台 ~46M）。
+
+## 裁决（详见 ADR-0013）
+
+1. **#4（单核 smoltcp poll = 100M 天花板）实测推翻。** poll 处处可忽略——仪器证伪 brief 承重假设
+   （同刀3.5 推翻「5.3M 天花板」，先量化别凭猜改再次兑现）。
+2. **当前的墙是 WAN 跨太平洋路径**（~22M 单流 / ~46M 聚合、高丢包、RTT 限），不是客户端。**100M 在此路物理不可达**
+   （网口 100M ≠ 可达吞吐）；客户端 CPU 天花板在此观察不到。
+3. **瓶颈模型纠偏**：唯一出现的 on-loop 成本是**建连瞬态的 relay 段**（非 poll）——若主循环真有瓶颈，是
+   连接 churn 的 relay 调度 / inline open，不是 smoltcp poll。
+4. **#3（单 QUIC 连接）此路答不了**：聚合随并行涨到 ~46M 后平台，路太烂分不清「连接 CC」与「WAN 容量」。
+
+## 对刀13 的硬结论
+
+- **取消事件循环分片（route a）**——分片一个 99% 空闲、poll 可忽略的循环毫无意义。**quantify-only 的最大价值：
+  挡掉一次对着伪瓶颈的极大重构。**
+- **#3 连接池**留待**低 RTT、能真跑 ≥100M 的胖链路**（同区域/局域网出口，非深圳↔美国）再测；此前可能无用。
+- **新候选轴（Rules ③ 大并发）**：建连 churn 的 relay 段才是潜在客户端并发成本，独立一刀探「数千并发 open」，
+  若 relay 饱和则把 inline open 移出主循环——与吞吐问题不同，本刀未测。
+
+## 诚实 gap
+
+- 未拿到**隧道满载稳态**的干净 `🔬`：两次 60s `-P 4` 流量**绕过隧道**（`TCP relay 累计=0`——client 重启换了 utun 号，
+  旧 `route -interface utunX` 失效回落默认路由）。隧道证据来自较短、含建连噪声的窗口。**不削弱 #4 推翻**（隧道窗口
+  poll 皆可忽略），但 ~46M 路径上限处的循环稳态占用是**推断、非干净实测**。`📊 TCP relay 累计`（刀11）是抓出绕隧道的功臣。
+- 启动首条 `🔬` 退化（`wall≈0ms`，tokio interval 首 tick 立即触发）——无害，忽略首行；可选 1 行 guard 跳过。
+
+**→ 刀12 quantify-only 完成**（仪器 + review + 真出口归因 → #4 证伪 / WAN 受限 / 取消分片 / #3 留胖链路）。**未做任何多核重构，是基于证据的正确决定。**

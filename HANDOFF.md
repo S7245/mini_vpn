@@ -32,7 +32,9 @@
   KeyUpdate + 双向轮换）为高保真替身；真出口 KeyUpdate 未触发，如实记录（brief §8 T20「尽力而为」）。spec=`docs/tech/2026-06-25-knife10-keyupdate-spec.md`，gap 收口见 ADR-0010。
   **刀8 泄漏凭据已服务端轮换（2026-06-26）——安全遗留项关闭。**
 - **REALITY mini-project（刀6→刀10）全部完成。刀11 数据面可观测性（observability）✅ 全部完成 + 已 ff 合入 main `9de0604`（2026-06-26，代码 + 两轮 review 零 bug + 真出口 acceptance ✅）**——见下「刀11 完成」。
-  **下一刀 = 主线「高带宽多线程逼近 100M」**（Rules ③ 主战场；刀11 量化底座已就位，可量化归因再上多线程）。
+  **刀12（多核逼近 100M，quantify-only）已完成**（分支 `claude/knife12-multicore-100m`，未合 main；见下「刀12 完成」）——
+  LoopProfiler 仪器 + 真出口归因 → **#4（单核 smoltcp poll = 天花板）实测推翻、取消事件循环分片**；当前墙是 WAN 跨太平洋路径，
+  100M 此路不可达；#3 连接池留低 RTT 胖链路再测（ADR-0013）。**下一刀待定**（见 ADR-0013「Consequences」）。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
 ## 目标（唯一北极星）：`Rules.md`
@@ -67,7 +69,8 @@
  ├─ 刀4  连接成功率（拦截加密 DNS DoT/DoH/DoQ/DoH3）  ✅ 完成 + 真出口 acceptance（见下「刀4」）；first-SYN 已确认 knife2 修复、关闭
  ├─ 刀5  拦全:53 裸包 DNS 劫持（任意 resolver 明文→fake-IP，废 smoltcp DNS socket）  ✅ 完成 + 真出口 acceptance（见下「刀5」，ADR-0007）；已合 main
  ├─ 刀11 数据面可观测性（DNS forge 计数 + datagram drop/背压 + 统一快照 MetricsSnapshot）  ✅ **完成（代码 + 两轮 review 零 bug + 真出口 acceptance ✅）+ 已 ff 合入 main `9de0604`**（见下「刀11 完成」）
- └─ （主线下一刀）高带宽多线程逼近 100M（Rules ③ 主战场，**刀11 量化底座已就位**）  ← **下一刀**
+ ├─ 刀12 多核逼近 100M：量化定位（quantify-only，LoopProfiler 仪器）  ✅ 完成 + 真出口归因（见下「刀12 完成」，ADR-0013）；**#4 实测推翻、取消分片**
+ └─ （主线下一刀）**待定**——#3 连接池需低 RTT 胖链路再测；或「大并发 open churn」探针（见 ADR-0013 / 刀12 裁决）
 
 正交线 A（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）= VLESS+REALITY 第二 Transport（手写 TLS 1.3，ADR-0008）
  ├─ 刀6  REALITY auth 密码学 + TLS 1.3 ClientHello 构造（sans-IO，100% 离线 TDD）  ✅ 完成（见下「刀6」，ADR-0008）；已合 main
@@ -347,6 +350,30 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
   详见 findings 末节「刀11」。
 - **deferred / 已知边界**：① UDP 下行 drop/背压的 I/O 触发点 harness mock 不覆盖 → 归 acceptance；② NODATA（AAAA）按 `Some=forge`
   计入 `dns_forged`，如需区分留 `dns_nodata`（破纯性，defer）；③ 前端读取通道（IPC/local-control）留前端 session（本刀只导出 snapshot 值）。
+
+## 刀12 完成（2026-06-27）：多核逼近 100M 量化定位 — LoopProfiler + 真出口归因（quantify-only）
+
+**交付**（分支 `claude/knife12-multicore-100m`，从 main `460a349` 起，逐 commit push；**未合 main**；**纯量化、零热路径行为改动**）：
+- **设计输入**：grill 拍板「量化-only + ADR 定瓶颈」（非「量化+干预」）；understand workflow（5 接缝并行深挖 + 路线可行性综合）。
+  spec/plan/acceptance：`docs/tech/2026-06-26-knife12-multicore-quantify-{spec,plan}.md` + `2026-06-26-knife12-acceptance-checklist.md`。
+- **`LoopProfiler`**（新 `src/loop_profiler.rs`）：knife1 `MetricsSink` **计时**接缝的生产实现，量主循环 **poll/relay/loop-active**
+  三段 wall-fraction（loop-active = 1−park/wall）。env `MINI_VPN_PROFILE_LOOP=1` 开 → 每 `MINI_VPN_METRICS_SECS` 打 `🔬` 行；
+  **默认 `NoopSink` 零开销逐字不变**（trait 加 `loop_park_begin/end`/`report` default-空方法，8 arm 首行 park_end + 循环底 park_begin
+  + metrics_tick report）。harness 多核就绪 spike 证仪器正确（注入 on-loop CPU → loop-active 0.706→0.996/poll 0.170→0.692）。
+- **质量**：205 lib + 8 harness 测全绿、`clippy --all-targets --features harness` 0 warning、release 绿。**对抗式 review workflow
+  撞 session 限额失败 → 改 inline 逐维度自评（零开销/数学/插桩语义/harness）零正确性 bug**，仅修一处 doc（`enter_relay` 注释陈旧）。
+- **🔑 真出口归因（深圳 macOS client → 47.x sing-box，iperf3）→ #4 实测推翻（ADR-0013）**：
+  - **poll 段处处 ≤3.8%、多数 0.1%**（直连 + 隧道、各负载）→ **单核 smoltcp poll 不是 100M 天花板**（brief 承重假设证伪，
+    同刀3.5 推翻「5.3M 天花板」）。
+  - **当前墙是 WAN 跨太平洋路径**（单流 ~22M / 并行聚合 ~46M、重传一次达 63509、RTT 限）→ **100M 此路物理不可达**，
+    客户端在任何可达负载下接近空闲（loop-active 多 0.1%、park 99.9%）。
+  - 唯一 on-loop 成本是**建连瞬态的 relay 段**（P=4 setup 窗口 relay=66%/poll=3.8%）→ 若主循环有瓶颈是 relay 调度/inline open，非 poll。
+  - **诚实 gap**：两次 60s 跑流量**绕过隧道**（`📊 TCP relay 累计=0`——client 重启换 utun 号 → 旧 route 失效回落 en0）→ 隧道满载
+    稳态 `🔬` 是推断非干净实测（不削弱 #4 推翻）。`📊 relay 累计`（刀11）是抓出绕隧道的功臣。
+- **裁决（ADR-0013）→ 刀13**：**取消事件循环分片（route a）**（分片 99% 空闲循环无意义——quantify-only 挡掉一次伪瓶颈重构）；
+  **#3 连接池**留**低 RTT 胖链路**（同区域出口）再测、此前可能无用；**新候选轴**=「大并发 open churn」探针（relay 段若饱和则 inline open
+  移出主循环，与吞吐正交，本刀未测）。`LoopProfiler` 留作随时复测 #4/#3 的工具。
+- **deferred / 可选**：启动首条 `🔬`（`wall≈0ms` tokio interval 首 tick）退化、无害，可选 1 行 guard 跳过。
 
 ## Rhythm（每刀都遵守）
 
