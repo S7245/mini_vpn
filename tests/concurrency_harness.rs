@@ -21,6 +21,7 @@ async fn single_tcp_connection_round_trips() {
         payload_len: 1024,
         pool_size: 2,
         timeout: Duration::from_secs(10),
+        cpu_burn_per_flush: Duration::ZERO,
     })
     .await;
     report.print_row();
@@ -39,6 +40,7 @@ async fn concurrent_64_all_complete() {
         payload_len: 1024,
         pool_size: 8,
         timeout: Duration::from_secs(30),
+        cpu_burn_per_flush: Duration::ZERO,
     })
     .await;
     report.print_row();
@@ -55,6 +57,7 @@ async fn metrics_relays_spawned_tracks_load() {
         payload_len: 1024,
         pool_size: 8,
         timeout: Duration::from_secs(30),
+        cpu_burn_per_flush: Duration::ZERO,
     })
     .await;
     report.print_row();
@@ -152,6 +155,7 @@ async fn concurrency_sweep_report() {
             payload_len: 1024,
             pool_size: 16,
             timeout: Duration::from_secs(120),
+            cpu_burn_per_flush: Duration::ZERO,
         })
         .await;
         report.print_row();
@@ -174,6 +178,7 @@ async fn pool_size_isolates_sweep_cost() {
             payload_len: 1024,
             pool_size: pool,
             timeout: Duration::from_secs(60),
+            cpu_burn_per_flush: Duration::ZERO,
         })
         .await;
         print!("pool={pool:>2} 总槽={:>4} | ", 64 * pool);
@@ -195,6 +200,7 @@ async fn elastic_pool_drains_hot_port() {
         payload_len: 1024,
         pool_size: 2,
         timeout: Duration::from_secs(30),
+        cpu_burn_per_flush: Duration::ZERO,
     })
     .await;
     print!("单端口 pool=2 弹性 | ");
@@ -208,5 +214,63 @@ async fn elastic_pool_drains_hot_port() {
     println!(
         "→ 256 路完成 {}/256：弹性扩容把每端口 pool 硬上限打掉（#2 fixed）",
         report.completed
+    );
+}
+
+/// 刀12 T4：multi_thread runtime + 注入 on-loop CPU burn → 验证 profiler 的 loop-active/poll 信号
+/// 随主循环 CPU 负载上升（仪器正确性 + harness 能造单核饱和信号，为刀13 真分片 gate 铺路）。
+///
+/// **不**断言 wall/throughput（harness wall 被 generator `sleep(200µs)` 节拍污染，findings 刀1 局限）
+/// ——只断段 fraction 的相对趋势。这正是 #4 判决在真出口的核心读法：on-loop CPU↑ → loop-active↑。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn loop_profiler_detects_on_loop_cpu_saturation() {
+    let base_params = ScenarioParams {
+        connections: 32,
+        distinct_ports: 8,
+        payload_len: 2048,
+        pool_size: 8,
+        timeout: Duration::from_secs(10),
+        cpu_burn_per_flush: Duration::ZERO,
+    };
+    // 基线：无 burn，主循环处理快 → 多在 select! 空等 → loop-active 低。
+    let baseline = run_tcp_scenario(base_params.clone()).await;
+    // 加载：每 flush 300µs 合成 on-loop CPU（落在 poll 段）→ loop-active / poll fraction 显著上升。
+    let loaded = run_tcp_scenario(ScenarioParams {
+        cpu_burn_per_flush: Duration::from_micros(300),
+        ..base_params
+    })
+    .await;
+
+    let base = baseline.loop_profile();
+    let load = loaded.loop_profile();
+    eprintln!(
+        "T4 baseline: loop-active={:.3} poll={:.3} iters={} | loaded: loop-active={:.3} poll={:.3} iters={}",
+        base.loop_active_fraction(),
+        base.poll_fraction(),
+        base.iters,
+        load.loop_active_fraction(),
+        load.poll_fraction(),
+        load.iters,
+    );
+
+    // fraction 在合法区间。
+    assert!((0.0..=1.0).contains(&base.loop_active_fraction()), "base loop-active 越界: {base:?}");
+    assert!((0.0..=1.0).contains(&load.loop_active_fraction()), "load loop-active 越界: {load:?}");
+    // 主循环确有迭代（仪器在真 run_event_loop 里被调用过）。
+    assert!(base.iters > 0 && load.iters > 0, "两轮都应有 select! 迭代");
+
+    // 仪器正确性 + harness 能造饱和：注入 on-loop CPU → loop-active 明显上升。
+    assert!(
+        load.loop_active_fraction() > base.loop_active_fraction() + 0.05,
+        "on-loop CPU burn 应抬升 loop-active：base={:.3} load={:.3}",
+        base.loop_active_fraction(),
+        load.loop_active_fraction()
+    );
+    // burn 落在 poll 段（flush_tx）→ poll fraction 也随之上升。
+    assert!(
+        load.poll_fraction() > base.poll_fraction(),
+        "burn 在 poll 段应抬升 poll fraction：base={:.3} load={:.3}",
+        base.poll_fraction(),
+        load.poll_fraction()
     );
 }

@@ -102,6 +102,20 @@ fn loopback_caps() -> DeviceCapabilities {
     caps
 }
 
+/// 刀12：合成 CPU burn——忙等 `d` 时长，模拟 on-loop per-flush 处理成本（真分片/校验和等）。
+/// `black_box` 防被优化掉；`d.is_zero()` 立即返回（默认零开销，不影响既有场景）。
+fn busy_spin(d: Duration) {
+    if d.is_zero() {
+        return;
+    }
+    let start = Instant::now();
+    let mut x: u64 = 0;
+    while start.elapsed() < d {
+        x = x.wrapping_add(1);
+        std::hint::black_box(x);
+    }
+}
+
 // ============================ SUT 侧回环设备（impl TunIo）============================
 
 /// 被测主循环（SUT）用的内存回环 TUN 设备：结构镜像 `VirtualTunDevice`
@@ -111,15 +125,25 @@ pub struct LoopbackTunDevice {
     tx_queue: VecDeque<BytesMut>,
     inbound: PacketLink,  // 发生器 → SUT
     outbound: PacketLink, // SUT → 发生器
+    /// 刀12：每次 `flush_tx` 注入的合成 on-loop CPU 成本（busy-spin）。默认 ZERO。
+    /// `flush_tx` 在主循环 poll 段内（enter_poll/leave_poll 括起）→ 该 burn 计入 poll_time / loop-active，
+    /// 用于验证 profiler 能侦测「主循环被 on-loop CPU 拖满」的饱和信号（T4 spike）。
+    cpu_burn_per_flush: Duration,
 }
 
 impl LoopbackTunDevice {
     fn new(inbound: PacketLink, outbound: PacketLink) -> Self {
+        Self::with_burn(inbound, outbound, Duration::ZERO)
+    }
+
+    /// 带合成 on-loop CPU 成本的回环设备（T4：multi_thread 饱和 spike 用）。
+    fn with_burn(inbound: PacketLink, outbound: PacketLink, cpu_burn_per_flush: Duration) -> Self {
         Self {
             rx_buffer: None,
             tx_queue: VecDeque::new(),
             inbound,
             outbound,
+            cpu_burn_per_flush,
         }
     }
 }
@@ -142,6 +166,7 @@ impl TunIo for LoopbackTunDevice {
         self.rx_buffer.take()
     }
     async fn flush_tx(&mut self) -> std::io::Result<()> {
+        busy_spin(self.cpu_burn_per_flush); // 刀12：合成 on-loop CPU（默认 ZERO 即 no-op）。
         while let Some(pkt) = self.tx_queue.pop_front() {
             self.outbound.push(pkt);
         }
@@ -344,6 +369,9 @@ struct Recorded {
     max_listeners: usize,
     listener_sum: u64,
     listener_obs: u64,
+    /// 刀12：主循环 park（select! 空等）累计 + 迭代数，用于算 loop-active fraction。
+    park_time: Duration,
+    iters: u64,
 }
 
 /// 记录型插桩：把主循环三段耗时 + listener 全量遍历规模汇总进共享 [`Recorded`]，供测试读取。
@@ -352,6 +380,7 @@ pub struct RecordingSink {
     shared: Arc<Mutex<Recorded>>,
     poll_start: Option<Instant>,
     relay_start: Option<Instant>,
+    park_start: Option<Instant>,
 }
 
 impl RecordingSink {
@@ -360,6 +389,7 @@ impl RecordingSink {
             shared,
             poll_start: None,
             relay_start: None,
+            park_start: None,
         }
     }
 }
@@ -391,6 +421,18 @@ impl MetricsSink for RecordingSink {
         r.listener_sum += n as u64;
         r.listener_obs += 1;
     }
+    fn loop_park_begin(&mut self) {
+        self.park_start = Some(Instant::now());
+    }
+    fn loop_park_end(&mut self) {
+        // 先在锁外算 elapsed（少持锁）；首迭代无 mark → 只 +iters。
+        let dt = self.park_start.take().map(|s| s.elapsed());
+        let mut r = self.shared.lock().unwrap();
+        if let Some(d) = dt {
+            r.park_time += d;
+        }
+        r.iters += 1;
+    }
 }
 
 // ============================ 场景参数 / 报告 ============================
@@ -408,6 +450,9 @@ pub struct ScenarioParams {
     pub pool_size: usize,
     /// 整场超时。
     pub timeout: Duration,
+    /// 刀12：每次 SUT `flush_tx`（poll 段内）注入的合成 on-loop CPU 成本。默认 ZERO（既有场景零影响）；
+    /// T4 multi_thread spike 设非零造主循环单核饱和，验证 profiler 的 loop-active/poll 信号会随之上升。
+    pub cpu_burn_per_flush: Duration,
 }
 
 impl Default for ScenarioParams {
@@ -418,6 +463,7 @@ impl Default for ScenarioParams {
             payload_len: 1024,
             pool_size: 8,
             timeout: Duration::from_secs(30),
+            cpu_burn_per_flush: Duration::ZERO,
         }
     }
 }
@@ -437,6 +483,9 @@ pub struct Report {
     pub max_listeners: usize,
     pub avg_listeners: f64,
     pub per_socket_buffer_bytes: usize,
+    /// 刀12：主循环 park 累计 + 迭代数（算 loop-active fraction，T4 饱和 spike 用）。
+    pub park_time: Duration,
+    pub iters: u64,
     /// 每连接 connect→echo 完成延迟（微秒），用于分位。
     pub latencies_us: Vec<u64>,
     /// 刀11：跑完后的数据面计数快照（读末态 Arc<Metrics>）。`relays_spawned` 随真 relay 增长；
@@ -470,6 +519,19 @@ impl Report {
             return 0.0;
         }
         (self.bytes_echoed as f64 * 8.0) / (secs * 1_000_000.0)
+    }
+
+    /// 刀12：把本场景的 poll/relay/park/wall 折成 [`LoopProfileSnapshot`]，复用其 fraction 数学。
+    /// **注意**：harness wall 受 generator `sleep(200µs)` 节拍污染、不可信；段 fraction（尤其
+    /// loop-active 在 burn 下的相对上升）才是可信信号——只作 #4 仪器自检，不当 100M 进度。
+    pub fn loop_profile(&self) -> crate::loop_profiler::LoopProfileSnapshot {
+        crate::loop_profiler::LoopProfileSnapshot {
+            poll: self.poll_time,
+            relay: self.relay_time,
+            park: self.park_time,
+            wall: self.wall,
+            iters: self.iters,
+        }
     }
 
     /// 打印一行人类可读的定位指标（测试 `--nocapture` 下显示）。
@@ -528,7 +590,12 @@ pub async fn run_tcp_scenario(params: ScenarioParams) -> Report {
     let mock = Arc::new(MockUpstream::new(echo_buf, downlink_tx));
 
     // ---- 2. 启动 SUT 主循环（内存回环 device + mock 上游 + recording sink）----
-    let sut_device = LoopbackTunDevice::new(gen_to_sut.clone(), sut_to_gen.clone());
+    // 刀12：注入合成 on-loop CPU（默认 ZERO；T4 spike 设非零造单核饱和信号）。
+    let sut_device = LoopbackTunDevice::with_burn(
+        gen_to_sut.clone(),
+        sut_to_gen.clone(),
+        params.cpu_burn_per_flush,
+    );
     let shared = Arc::new(Mutex::new(Recorded::default()));
     let sink = RecordingSink::new(shared.clone());
     let config = TunRuntimeConfig::from_sources(Some(&params.pool_size.to_string()))
@@ -658,6 +725,8 @@ pub async fn run_tcp_scenario(params: ScenarioParams) -> Report {
         max_listeners: rec.max_listeners,
         avg_listeners,
         per_socket_buffer_bytes,
+        park_time: rec.park_time,
+        iters: rec.iters,
         latencies_us,
         metrics: metrics.snapshot(0, 0),
     }
