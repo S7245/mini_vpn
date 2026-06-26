@@ -439,6 +439,9 @@ pub struct Report {
     pub per_socket_buffer_bytes: usize,
     /// 每连接 connect→echo 完成延迟（微秒），用于分位。
     pub latencies_us: Vec<u64>,
+    /// 刀11：跑完后的数据面计数快照（读末态 Arc<Metrics>）。`relays_spawned` 随真 relay 增长；
+    /// gauge（active_relays/fake_ip_*）仅 30s tick 发布，sub-second 压测里不触发 → 单独单测覆盖。
+    pub metrics: crate::metrics::MetricsSnapshot,
 }
 
 impl Report {
@@ -530,12 +533,14 @@ pub async fn run_tcp_scenario(params: ScenarioParams) -> Report {
     let sink = RecordingSink::new(shared.clone());
     let config = TunRuntimeConfig::from_sources(Some(&params.pool_size.to_string()))
         .expect("valid pool size");
+    // 刀11：bind 共享 Arc<Metrics>，跑完 .abort() 后读末态 snapshot 入 Report（仿 RecordingSink drain 模式）。
+    let metrics = Arc::new(Metrics::new());
     let sut = tokio::spawn(run_event_loop(
         sut_device,
         mock.clone(),
         downlink_rx,
         config,
-        Arc::new(Metrics::new()), // 刀11 T4：接线占位（T5 改 bind 并在 Report 暴露 snapshot）
+        Arc::clone(&metrics),
         sink,
     ));
 
@@ -654,6 +659,7 @@ pub async fn run_tcp_scenario(params: ScenarioParams) -> Report {
         avg_listeners,
         per_socket_buffer_bytes,
         latencies_us,
+        metrics: metrics.snapshot(0, 0),
     }
 }
 

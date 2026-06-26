@@ -45,6 +45,28 @@ async fn concurrent_64_all_complete() {
     assert_eq!(report.completed, 64, "64 路应全部完成（N/N）");
 }
 
+/// 刀11：可观测性计数随真负载增长——N 路 TCP flow 各开一次远端 → `relays_spawned` ≥ 完成数。
+/// （cumulative counter 走事件点 fetch_add，不依赖 30s gauge tick；gauge 单独单测覆盖。）
+#[tokio::test]
+async fn metrics_relays_spawned_tracks_load() {
+    let report = run_tcp_scenario(ScenarioParams {
+        connections: 32,
+        distinct_ports: 32,
+        payload_len: 1024,
+        pool_size: 8,
+        timeout: Duration::from_secs(30),
+    })
+    .await;
+    report.print_row();
+    assert_eq!(report.completed, 32, "32 路应全部完成");
+    assert!(
+        report.metrics.relays_spawned >= report.completed as u64,
+        "relays_spawned({}) 应 ≥ 完成数({})——每条 flow 开远端成功计一次",
+        report.metrics.relays_spawned,
+        report.completed,
+    );
+}
+
 /// 轻量 UDP liveness：datagram 上行经 mock echo 不被 TCP 饿死（主体吞吐压测留刀3）。
 #[tokio::test]
 async fn udp_datagrams_reach_upstream() {

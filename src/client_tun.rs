@@ -27,6 +27,8 @@ const RELAY_CHANNEL_CAPACITY: usize = 1024;
 /// L2（刀9 F4）：一条 relay 双向静默多久判 idle → 退出 + shutdown。防慢/卡死上游（尤其 REALITY
 /// TCP-only 手写 TLS 遇 server 不返回）长期挂住 relay task 泄漏。90s 偏宽松保稳（长轮询/SSE 不误杀）。
 const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+/// 刀11：数据面可观测性快照周期（30s，对齐 TuicUpstream UDP_STATS_LOG_SECS）。仅周期采样/打印，不进热路径。
+const METRICS_SNAPSHOT_SECS: u64 = 30;
 
 /// 主循环分段插桩接缝（knife1：并发压测定位瓶颈）。
 ///
@@ -622,6 +624,10 @@ pub async fn run_event_loop<D, U, M>(
     let mut udp_sweep = tokio::time::interval(std::time::Duration::from_secs(1));
     // review #7：fake-IP 池回收单独走低频 tick（TTL=300s，无需每秒全表扫）。
     let mut fake_ip_sweep = tokio::time::interval(std::time::Duration::from_secs(60));
+    // 刀11：数据面可观测性快照 tick（30s）。在此**单写者** task 重算 loop-owned gauge
+    // （active_relays / fake-IP 用量 / failover 当班腿）→ 发布进 Arc<Metrics> → 打统一 📊 快照行。
+    // 与 TuicUpstream::start_udp 的 UDP-path 📊 行（RTT/cwnd/背压）是两条独立日志、各司其职（见 ADR-0012 §5）。
+    let mut metrics_tick = tokio::time::interval(std::time::Duration::from_secs(METRICS_SNAPSHOT_SECS));
 
     loop {
         tokio::select! {
@@ -736,6 +742,7 @@ pub async fn run_event_loop<D, U, M>(
                             &global_tx,
                             &mut fake_pool,
                             udp_clock.elapsed().as_secs(),
+                            &metrics_handle,
                             &mut metrics,
                         )
                         .await;
@@ -752,6 +759,7 @@ pub async fn run_event_loop<D, U, M>(
                     &global_tx,
                     &mut fake_pool,
                     udp_clock.elapsed().as_secs(),
+                    &metrics_handle,
                 );
             }
             // Stage 13b/刀3: TUIC 下行（datagram 或 uni-stream）→ decode_packet_meta → 分片重组
@@ -796,6 +804,20 @@ pub async fn run_event_loop<D, U, M>(
             _ = fake_ip_sweep.tick() => {
                 fake_pool.sweep(udp_clock.elapsed().as_secs(), FAKE_IP_TTL);
             }
+            // 刀11：数据面可观测性快照（30s）。在此单写者 task 重算 loop-owned gauge → 发布进
+            // Arc<Metrics> → snapshot 读出（上行计数经 upstream trait 访问器）→ **无门控**打统一 📊 行
+            // （TCP/DNS/failover 在 UDP 空闲时也有意义；UDP-path 行另由 start_udp 发，见 ADR-0012 §5）。
+            _ = metrics_tick.tick() => {
+                publish_gauges(
+                    &metrics_handle,
+                    socket_ctxs.values(),
+                    &fake_pool,
+                    upstream.failover_leg_u8(),
+                );
+                let snap = metrics_handle
+                    .snapshot(upstream.udp_drops_up(), upstream.udp_stream_fallbacks());
+                println!("{}", crate::metrics::format_metrics_snapshot(&snap));
+            }
             // 分支 2: 时钟滴答，处理超时重传等后台任务
             _ = timer.tick() =>{
                 metrics.enter_poll();
@@ -815,6 +837,7 @@ pub async fn run_event_loop<D, U, M>(
                     &global_tx,
                     &mut fake_pool,
                     udp_clock.elapsed().as_secs(),
+                    &metrics_handle,
                     &mut metrics,
                 )
                 .await;
@@ -838,6 +861,7 @@ async fn process_dirty_relay<U, M>(
     global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
+    metrics_handle: &Metrics,
     metrics: &mut M,
 ) where
     U: ProxyUpstream + 'static,
@@ -857,6 +881,7 @@ async fn process_dirty_relay<U, M>(
             global_tx,
             fake_pool,
             now_secs,
+            metrics_handle,
         )
         .await
         {
@@ -1127,6 +1152,7 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
     global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
+    metrics_handle: &Metrics,
 ) -> Result<(), ClientError> {
     // 每轮先推进该 handle 的下行 pending：TCP ACK 释放 tx buffer 空间后继续写，
     // 直到把上一轮没写完的回程字节全部交付，绝不丢字节（修 bad decrypt 的另一半）。
@@ -1195,6 +1221,7 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
         global_tx,
         fake_pool,
         now_secs,
+        metrics_handle,
     )
     .await
 }
@@ -1211,6 +1238,7 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
     global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
+    metrics_handle: &Metrics,
 ) -> Result<(), ClientError> {
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
         return Ok(());
@@ -1265,7 +1293,7 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
             fake_pool.acquire(ip, now_secs);
             ctx.fake_ip = Some(ip);
         }
-        spawn_remote_relay(handle, stream, rx, global_tx.clone());
+        spawn_remote_relay(handle, stream, rx, global_tx.clone(), metrics_handle);
         Ok(())
     } else {
         // —— 不廉价上游（REALITY：每条 TCP 一次多-RTT 手写 TLS 握手）：spawn 出主循环并发化（刀9 M3）——
@@ -1305,6 +1333,7 @@ fn handle_handshake_done(
     global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
+    metrics_handle: &Metrics,
 ) {
     let HandshakeDone { handle, epoch, result } = done;
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
@@ -1340,7 +1369,7 @@ fn handle_handshake_done(
             ctx.uplink_tx = Some(tx);
             ctx.state = SocketState::Relaying;
             println!("🚪 handle {:?} remote session opened（spawn 握手成功）", handle);
-            spawn_remote_relay(handle, stream, rx, global_tx.clone());
+            spawn_remote_relay(handle, stream, rx, global_tx.clone(), metrics_handle);
         }
         Err(e) => {
             println!("❌ handle {:?} spawn 握手失败: {e} → rearm", handle);
@@ -1396,12 +1425,33 @@ async fn handle_remote_payload<D: TunIo>(
     device.flush_tx().await
 }
 
+/// 刀11：在 run_event_loop 单写者 task 重算 loop-owned gauge 并发布进 `Arc<Metrics>`（30s tick 调）。
+/// 中文要点：`active_relays`（state==Relaying 计数）与 fake-IP 用量来自 loop **独占无锁**的
+/// `socket_ctxs`/`fake_pool`，**不能跨 task 读**（严禁套 Arc<Mutex>）→ 只能在此 task 周期重算后 `store`，
+/// 外部读者（snapshot/未来前端）见最新已发布值。`failover_leg_u8` 由 caller 经 upstream trait 读出后传入。
+/// O(n) 扫描只在 30s tick，不进每包热路径。
+fn publish_gauges<'a>(
+    metrics_handle: &Metrics,
+    ctxs: impl Iterator<Item = &'a SocketCtx>,
+    fake_pool: &FakeIpPool,
+    failover_leg_u8: u8,
+) {
+    let active = ctxs.filter(|c| c.state == SocketState::Relaying).count();
+    metrics_handle.set_active_relays(active as u32);
+    let (total, act) = fake_pool.usage();
+    metrics_handle.set_fake_ip(total as u32, act as u32);
+    metrics_handle.set_failover_leg(failover_leg_u8);
+}
+
 fn spawn_remote_relay(
     handle: SocketHandle,
     stream: RelayStream,
     rx: mpsc::Receiver<Vec<u8>>,
     back_tx: mpsc::Sender<(SocketHandle, Vec<u8>)>,
+    metrics_handle: &Metrics,
 ) {
+    // 刀11：每条新 TCP flow 开远端成功后在此唯一入口计一次（覆盖 inline TUIC + spawn 握手两条路）。
+    metrics_handle.inc_relays_spawned();
     tokio::spawn(run_relay(handle, stream, rx, back_tx));
 }
 
@@ -1928,14 +1978,14 @@ mod tests {
 
         // 迟到 epoch 3 ≠ 5 → 丢弃，状态/uplink_tx 不变。
         let stale = HandshakeDone { handle, epoch: 3, result: Ok(Box::new(tokio::io::duplex(64).0)) };
-        handle_handshake_done(stale, &mut sockets, &mut socket_ctxs, &global_tx, &mut pool, 0);
+        handle_handshake_done(stale, &mut sockets, &mut socket_ctxs, &global_tx, &mut pool, 0, &Metrics::new());
         let ctx = socket_ctxs.get(&handle).unwrap();
         assert_eq!(ctx.state, SocketState::HandshakePending, "迟到 epoch → 不装、状态不变");
         assert!(ctx.uplink_tx.is_none(), "迟到 epoch → 不安装 uplink_tx");
 
         // 匹配 epoch 5 + Ok → 安装 relay。
         let ok = HandshakeDone { handle, epoch: 5, result: Ok(Box::new(tokio::io::duplex(64).0)) };
-        handle_handshake_done(ok, &mut sockets, &mut socket_ctxs, &global_tx, &mut pool, 0);
+        handle_handshake_done(ok, &mut sockets, &mut socket_ctxs, &global_tx, &mut pool, 0, &Metrics::new());
         let ctx = socket_ctxs.get(&handle).unwrap();
         assert_eq!(ctx.state, SocketState::Relaying, "匹配 epoch → 安装 relay 进 Relaying");
         assert!(ctx.uplink_tx.is_some(), "匹配 epoch → 安装 uplink_tx");
@@ -1957,7 +2007,7 @@ mod tests {
         let (global_tx, _grx) = mpsc::channel(8);
 
         let err = HandshakeDone { handle, epoch: 2, result: Err(ClientError::Reality("握手失败".into())) };
-        handle_handshake_done(err, &mut sockets, &mut socket_ctxs, &global_tx, &mut pool, 1);
+        handle_handshake_done(err, &mut sockets, &mut socket_ctxs, &global_tx, &mut pool, 1, &Metrics::new());
         let ctx = socket_ctxs.get(&handle).unwrap();
         assert_eq!(ctx.state, SocketState::Listening, "失败 → rearm 回 Listening");
         assert!(ctx.fake_ip.is_none(), "失败 rearm 释放 fake-IP（平衡 spawn 的 acquire）");
@@ -1981,7 +2031,7 @@ mod tests {
         // near = relay 写入端（上游流）；far = 测试读端（模拟出口收到的上行）。
         let (near, mut far) = tokio::io::duplex(1024);
         let ok = HandshakeDone { handle, epoch: 1, result: Ok(Box::new(near)) };
-        handle_handshake_done(ok, &mut sockets, &mut socket_ctxs, &global_tx, &mut pool, 0);
+        handle_handshake_done(ok, &mut sockets, &mut socket_ctxs, &global_tx, &mut pool, 0, &Metrics::new());
 
         let mut got = vec![0u8; b"HELLO-BUFFERED".len()];
         far.read_exact(&mut got).await.unwrap();
@@ -2206,6 +2256,39 @@ mod tests {
         let s = metrics.snapshot(0, 0);
         assert_eq!((s.dns_forged, s.dns_dropped), (1, 1), "drop 不增 forge");
         assert_eq!(dev.injected.len(), 1, "drop 不注入");
+    }
+
+    /// 刀11 T5：`publish_gauges` 从 loop-owned 状态重算 gauge 并发布——
+    /// active_relays 只数 Relaying、fake-IP (total,active)、failover_leg 哨兵 → None。
+    #[test]
+    fn publish_gauges_samples_relaying_pool_and_leg() {
+        use crate::metrics::{FailoverLegView, NO_FAILOVER};
+        let mk = |s: SocketState| {
+            let mut c = SocketCtx::new(0);
+            c.state = s;
+            c
+        };
+        let ctxs = [
+            mk(SocketState::Relaying),
+            mk(SocketState::Relaying),
+            mk(SocketState::Listening),
+            mk(SocketState::OpeningRemote), // 在飞、未成 relay → 不计 active
+        ];
+        let mut pool = FakeIpPool::new();
+        let ip = pool.alloc("a.com", 0);
+        pool.acquire(ip, 0); // 1 个有活跃 flow
+        let _ = pool.alloc("b.com", 0); // 在册未 acquire
+
+        let metrics = Metrics::new();
+        publish_gauges(&metrics, ctxs.iter(), &pool, 1); // leg=Reality
+        let s = metrics.snapshot(0, 0);
+        assert_eq!(s.active_relays, 2, "只数 state==Relaying");
+        assert_eq!((s.fake_ip_total, s.fake_ip_active), (2, 1));
+        assert_eq!(s.failover_leg, FailoverLegView::Reality);
+
+        // 非 failover 单腿上游传哨兵 → snapshot 视图 None。
+        publish_gauges(&metrics, ctxs.iter(), &pool, NO_FAILOVER);
+        assert_eq!(metrics.snapshot(0, 0).failover_leg, FailoverLegView::None);
     }
 
     /// 刀4：resolve_target 对加密 DNS 端点返回 Block，且精确不误伤普通 :443 / 零回归 Refuse。
