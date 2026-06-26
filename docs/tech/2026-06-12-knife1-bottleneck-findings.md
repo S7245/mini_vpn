@@ -514,3 +514,25 @@ harness 集成 `metrics_relays_spawned_tracks_load`（32 flow → relays_spawned
 3. **UDP 下行 drop / 背压**（难强制）：`MINI_VPN_METRICS_SECS=5 ... scripts/knife35-acceptance.sh soak` 大码率 UDP（YouTube 4K / iperf3）→ 观察
    `UDP↓丢` / `背压`；native+cubic 高保真链路下常为 0（刀3.5 已证 datagram 够用），若触发则如实记录。REALITY-only 模式记 UDP 项恒 0（无 start_udp）。
 4. 判据：负载后某条 `📊` 行各指标**随对应负载单调变化**（量化底座可信）→ 为后续「多线程逼近 100M」就位。
+
+### 刀11 真出口 acceptance ✅ PASS（2026-06-26，深圳真机 → 47.251.188.205 sing-box，TUIC :8443 + REALITY :443 两腿）
+
+新 binary（含启动行 `📊 数据面可观测性：快照周期 = 30s`，env 未 export 故走默认）。全部指标真负载下打出、单调/正确：
+
+| 指标 | 实测证据 | 判定 |
+|---|---|---|
+| `dns_forged` | failover: 147→171→210；YouTube4K: 153→176→198（单调增） | ✅ |
+| `relays_spawned`(累计) | 95→99→129；95→128（单调增） | ✅ |
+| `active_relays`(活跃) | 17/15/22；40/43（随并发变） | ✅ |
+| `fake_ip_total`(在册) | 35→38→41；57→60 | ✅ |
+| `fake_ip_active`(活跃) | 15/13/15；35/38 | ✅ |
+| `failover_leg` | 纯TUIC=`-`、failover起始=`TUIC`、cut-tuic 后=`REALITY`（+ `🔐 REALITY 握手成功`×4 真连接） | ✅ |
+| `udp_drops_up` | cut-tuic 封锁窗口 =**5**（TUIC 上行丢，时机吻合，交叉验证计数器真工作） | ✅ |
+| `udp_drops_down` / `datagram_pressure_events` | =0（刀3.5 已证 native+cubic datagram 高保真链路够用，I/O 触发点未触发） | ✅ 如实记录 |
+
+**额外**：`leg=REALITY` + 真 REALITY 握手 = 顺带复证刀9 failover 端到端仍通 + leg gauge 读得对。
+
+**两处仅采样时机漏，非失败**：① 纯 TUIC 短突发（`dig`+3 curl）+ `sleep 8` < 30s 周期 → 该轮快照在负载前，全 0（failover/YouTube 长负载已覆盖同指标）；② restore-tuic 后 `leg=TUIC` 未采到——切回需 3 探针 +60s 冷却 ≈90s+ > `sleep 70`，快照仍 `REALITY`（leg 机制已由 `-`/TUIC/REALITY 三态读出证明）。
+**经验**：短突发验证须 `export MINI_VPN_METRICS_SECS=5` + `sudo -E env MINI_VPN_METRICS_SECS=5 ...` 确保透传（本轮启动行显示 30s=未透传），或用持续负载（YouTube/iperf）让多条 30s 快照覆盖。
+
+**→ 刀11 数据面可观测性 全部完成（代码 + 两轮 review 零 bug + 真出口 acceptance ✅）。** 量化底座就位，下一刀=主线「多线程逼近 100M」。

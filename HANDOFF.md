@@ -66,7 +66,7 @@
  ├─ 刀3.5 高码率 UDP（quinn 插桩 + CC 调优）  ✅ 完成 + 真出口 acceptance（见下「刀3.5」）；纠偏：5.3M「天花板」实为链路 cap 假象
  ├─ 刀4  连接成功率（拦截加密 DNS DoT/DoH/DoQ/DoH3）  ✅ 完成 + 真出口 acceptance（见下「刀4」）；first-SYN 已确认 knife2 修复、关闭
  ├─ 刀5  拦全:53 裸包 DNS 劫持（任意 resolver 明文→fake-IP，废 smoltcp DNS socket）  ✅ 完成 + 真出口 acceptance（见下「刀5」，ADR-0007）；已合 main
- ├─ 刀11 数据面可观测性（DNS forge 计数 + datagram drop/背压 + 统一快照 MetricsSnapshot）  ✅ **代码完成 + 两轮 review 零 bug**（真出口 acceptance 待用户跑，见下「刀11 完成」；未合 main）
+ ├─ 刀11 数据面可观测性（DNS forge 计数 + datagram drop/背压 + 统一快照 MetricsSnapshot）  ✅ **完成（代码 + 两轮 review 零 bug + 真出口 acceptance ✅）**（见下「刀11 完成」；未合 main，待合）
  └─ （主线下一刀）高带宽多线程逼近 100M（Rules ③ 主战场，**刀11 量化底座已就位**）  ← **下一刀**
 
 正交线 A（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）= VLESS+REALITY 第二 Transport（手写 TLS 1.3，ADR-0008）
@@ -339,8 +339,12 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
   （8 角度 → 仅 cleanup 建议，逐条权衡后不动：扩 blast radius / 耦合 feature gate / 纯偏好，稳定优先）。
 - **设计文档**：`docs/tech/2026-06-26-knife11-observability-{spec,plan,seed}.md`；ADR-0012；CONTEXT.md「Metrics snapshot」词汇；
   findings 末节「刀11」（含 `📊` 行格式 + acceptance 配方）。
-- **真出口 acceptance 待用户跑（尽力而为如实记录，无需新脚本）**：复用 `scripts/knife9-failover-acceptance.sh`（验 `leg=` 翻转）+
-  `scripts/knife35-acceptance.sh`（验 UDP↓丢/背压）+ soak 期间观察 `📊` 行随 DNS/并发/UDP 负载变化。详见 findings 末节「刀11」。
+- **真出口 acceptance ✅ PASS（2026-06-26，深圳真机 → 47.x sing-box，TUIC+REALITY 两腿）**：`📊` 行真负载下全部指标非 0 且单调/正确——
+  `dns_forged` 147→171→210 / 153→176→198、`relays_spawned`(累计) 95→129、`active_relays` 17~43、`fake_ip 在册` 35→60、
+  `failover_leg` 纯TUIC=`-`·cut后=`REALITY`(+4 真 REALITY 握手)、`udp_drops_up`=5(cut 封锁窗口吻合)；`udp_drops_down`/背压=0
+  （刀3.5 已证 native+cubic datagram 够用、未触发，如实记录）。两处仅采样时机漏（短突发+`sleep<周期`、切回冷却~90s>sleep70），非失败。
+  **测试单**=`docs/tech/2026-06-26-knife11-acceptance-checklist.md`；env 旋钮 `MINI_VPN_METRICS_SECS`（默认 30，acceptance 设 5）。
+  详见 findings 末节「刀11」。
 - **deferred / 已知边界**：① UDP 下行 drop/背压的 I/O 触发点 harness mock 不覆盖 → 归 acceptance；② NODATA（AAAA）按 `Some=forge`
   计入 `dns_forged`，如需区分留 `dns_nodata`（破纯性，defer）；③ 前端读取通道（IPC/local-control）留前端 session（本刀只导出 snapshot 值）。
 
