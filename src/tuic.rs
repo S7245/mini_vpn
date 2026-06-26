@@ -4,6 +4,7 @@
 //! 本文件先落「命令编码」纯函数(TDD 主战场),字节布局**严格按 TUIC v5 规范**,与 sing-box 字节级互通。
 //! 线格式参考见 docs/tech/2026-06-08-stage-13a-tuic-tcp-connect-plan.md。
 
+use crate::metrics::{Metrics, note_pressure_edge};
 use crate::quic;
 use crate::shared::{ClientError, TargetAddr};
 use crate::udp_relay::{FlowEntry, FourTuple, MAX_UDP_FLOWS};
@@ -680,11 +681,18 @@ pub struct TuicUpstream {
     /// UDP relay mode（刀3.5；来自 config）：`Quic` → 所有上行包走 uni-stream（首包即触发 server
     /// 下行镜像 stream，摆脱 datagram 天花板）；`Native` → datagram 主 + 超限 stream 兜底（刀3 行为）。
     udp_relay_mode: UdpRelayMode,
+    /// 刀11：进程级数据面可观测性句柄（与 run_event_loop 共享同一 `Arc<Metrics>`）。`start_udp` spawn 的
+    /// 下行/统计 task 经 `me.metrics` 写**下行** drop（`udp_drops_down`）+ datagram 背压上升沿
+    /// （`datagram_pressure_events`）。上行 `udp_drops`/`udp_stream_fallbacks` 仍是上方既有字段（零回归）。
+    metrics: Arc<Metrics>,
 }
 
 impl TuicUpstream {
     /// 建连 + 发 Authenticate（token 经 keying-material 导出，字节级对齐 sing-box）。
-    pub async fn connect(cfg: &TuicClientConfig) -> Result<Self, ClientError> {
+    pub async fn connect(
+        cfg: &TuicClientConfig,
+        metrics: Arc<Metrics>,
+    ) -> Result<Self, ClientError> {
         // 刀3.5：从 config 解析 CC（未知值回落 Cubic + 告警，失败自愈不致命）。
         let (cc, fell_back) = quic::parse_cc(&cfg.congestion_control);
         if fell_back {
@@ -735,6 +743,7 @@ impl TuicUpstream {
             clock: std::time::Instant::now(),
             zero_rtt: cfg.zero_rtt,
             udp_relay_mode,
+            metrics,
         })
     }
 
@@ -966,6 +975,8 @@ impl TuicUpstream {
                 hb.tick().await; // 第一拍立即返回，跳过（避免连上瞬间立刻发心跳）。
                 let mut stats = tokio::time::interval(Duration::from_secs(UDP_STATS_LOG_SECS));
                 stats.tick().await; // 跳过第一拍（连上瞬间不打统计）。
+                // 刀11：datagram 背压上升沿 latch（单 task 局部、无需原子；每重连复位，新连接从未背压起算）。
+                let mut prev_pressured = false;
                 loop {
                     tokio::select! {
                         dg = conn.read_datagram() => {
@@ -986,12 +997,20 @@ impl TuicUpstream {
                                     // 有界派生：拿到 permit 才读；拿不到（达并发上限）→ 丢弃该 stream（UDP 自愈）。
                                     if let Ok(permit) = Arc::clone(&stream_sem).try_acquire_owned() {
                                         let tx = downlink_tx.clone();
+                                        let m = Arc::clone(&me.metrics);
                                         tokio::spawn(async move {
                                             let _permit = permit; // 持有到读完，限并发
-                                            if let Some(pkt) = read_uni_packet(recv).await {
-                                                let _ = tx.send(pkt).await;
+                                            match read_uni_packet(recv).await {
+                                                Some(pkt) => {
+                                                    let _ = tx.send(pkt).await;
+                                                }
+                                                // 刀11：下行 uni-stream 解码/读失败（超长/reset/空）→ 静默丢，计下行 drop。
+                                                None => m.inc_udp_drops_down(),
                                             }
                                         });
+                                    } else {
+                                        // 刀11：下行并发达上限（信号量耗尽）→ 丢弃该 stream（UDP 自愈），计下行 drop。
+                                        me.metrics.inc_udp_drops_down();
                                     }
                                 }
                                 Err(_) => break, // 连接断 → 外层 live_conn 重连
@@ -1006,22 +1025,27 @@ impl TuicUpstream {
                             let now = me.clock.elapsed().as_secs();
                             let last = me.last_udp_activity.load(Ordering::Relaxed);
                             let udp_active = should_send_heartbeat(last, now, TUIC_HB_IDLE_WINDOW_SECS);
+                            let max_dg = conn.max_datagram_size();
+                            let space = conn.datagram_send_buffer_space();
+                            // datagram 背压代理信号：剩余 < 1 个 datagram 上限 → 即将丢最老（静默丢盲点）。
+                            // 仅 Native 模式有意义（Quic 模式 relay 不走 datagram，背压无关，避免假警报）。
+                            let pressured = me.udp_relay_mode == UdpRelayMode::Native
+                                && is_datagram_pressured(
+                                    space,
+                                    max_dg.unwrap_or(quic::QUIC_INITIAL_MTU as usize),
+                                );
+                            // 刀11：**每 tick 都更新 latch**（独立于打印门控，否则空闲期 latch 不复位）。
+                            // 只在 false→true 上升沿计一次「集」，避免一段持续背压每 tick 重复计数。
+                            if note_pressure_edge(pressured, &mut prev_pressured) {
+                                me.metrics.inc_datagram_pressure_events();
+                            }
                             if udp_active || fb > 0 || drops > 0 {
                                 let path = conn.stats().path;
-                                let max_dg = conn.max_datagram_size();
-                                let space = conn.datagram_send_buffer_space();
                                 let line = format_udp_stats(
                                     max_dg, fb, drops,
                                     path.rtt.as_millis(), path.cwnd,
                                     path.lost_packets, path.sent_packets, space,
                                 );
-                                // datagram 背压代理信号：剩余 < 1 个 datagram 上限 → 即将丢最老（静默丢盲点）。
-                                // 仅 Native 模式有意义（Quic 模式 relay 不走 datagram，背压无关，避免假警报）。
-                                let pressured = me.udp_relay_mode == UdpRelayMode::Native
-                                    && is_datagram_pressured(
-                                        space,
-                                        max_dg.unwrap_or(quic::QUIC_INITIAL_MTU as usize),
-                                    );
                                 if pressured {
                                     println!("{line} ⚠️背压(datagram 缓冲将丢最老)");
                                 } else {

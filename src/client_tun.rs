@@ -424,7 +424,7 @@ pub async fn start_tun_proxy() {
                     return;
                 }
             };
-            let upstream = match TuicUpstream::connect(&cfg).await {
+            let upstream = match TuicUpstream::connect(&cfg, Arc::clone(&metrics)).await {
                 Ok(u) => {
                     println!("✅ 已连接 TUIC 出口 {} (sing-box)", cfg.server);
                     Arc::new(u)
@@ -483,7 +483,7 @@ pub async fn start_tun_proxy() {
                     return;
                 }
             };
-            let tuic = match TuicUpstream::connect(&tuic_cfg).await {
+            let tuic = match TuicUpstream::connect(&tuic_cfg, Arc::clone(&metrics)).await {
                 Ok(u) => {
                     println!("✅ 已连接 TUIC 出口 {} (failover 主腿)", tuic_cfg.server);
                     Arc::new(u)
