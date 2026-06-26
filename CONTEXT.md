@@ -56,6 +56,10 @@ _Avoid_: VMess (its heavier, crypto-carrying predecessor)
 A TLS-camouflage **Transport** that hides its authentication inside a genuine TLS 1.3 handshake aimed at a borrowed real site, so a network observer sees ordinary HTTPS; an unauthenticated peer (including an active prober) is transparently forwarded to the real site. Carries **VLESS** as the censorship-resistant alternative to TUIC-over-QUIC, over TCP.
 _Avoid_: "TLS proxy" (the whole point is to be indistinguishable from a non-proxy)
 
+**Metrics snapshot** (`MetricsSnapshot` / `Metrics`):
+The data-plane observability seam (刀11). `Metrics` is a process-level `Arc` of atomics, cloned into the two data-plane tasks (the `run_event_loop` task and the TUIC `start_udp` task) — the only handle that bridges both. It holds two kinds of value: **cumulative counters** (`dns_forged`/`dns_dropped`/`udp_drops_down`/`datagram_pressure_events`/`relays_spawned`), incremented with `fetch_add(Relaxed)` at their event sites; and **published gauges** (`active_relays`/`fake_ip_active`/`fake_ip_total`/`failover_leg`), which the loop **recomputes on a 30s tick** from its single-writer-owned state (`socket_ctxs`, `fake_pool`, the upstream's leg) and `store`s back — because that state must never be read cross-task or locked. `MetricsSnapshot` is the plain-value, `Copy` read-out (the frontend contract). It is distinct from `MetricsSink`, the knife1 per-segment **timing** seam (which stays zero-cost in production). Backpressure is counted on the **rising edge** (false→true), not per tick. See `docs/adr/0012-data-plane-observability-metrics.md`.
+_Avoid_: conflating it with `MetricsSink` (timing vs counters/gauges); "live gauge" (the gauges are periodically recomputed, not +1/-1 tracked)
+
 ## Relationships
 
 - The client reaches one **Upstream** over a **Transport** and multiplexes many intercepted TCP sessions over it (one relay stream per session).
