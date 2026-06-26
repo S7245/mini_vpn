@@ -69,6 +69,12 @@ fn ratio(num: Duration, den: Duration) -> f64 {
 use crate::client_tun::MetricsSink;
 use std::time::Instant;
 
+/// 报告周期 wall 下限：低于此视为退化周期，`report` 跳过不打印。
+/// 中文要点：`tokio::time::interval` 的**首 tick 立即触发**（wall≈0），此时 `loop-active=1−park/wall`
+/// 会算出 ~99% 的**误导性噪声**（循环其实空闲）——跳过它避免 acceptance 读者误判为「主循环饱和」。
+/// 合法周期 = `MINI_VPN_METRICS_SECS ≥ 1s`，远高于本阈值，绝不会被误跳。
+const MIN_REPORT_WALL: Duration = Duration::from_millis(500);
+
 /// 主循环计时累计器（[`MetricsSink`] 实现）。仅 `MINI_VPN_PROFILE_LOOP=1` 时单态化选中、装进
 /// `run_event_loop`；默认生产走 `NoopSink`（零开销）。每 `report()` 取周期快照、打 🔬 行、重置。
 ///
@@ -153,7 +159,11 @@ impl MetricsSink for LoopProfiler {
     }
     fn report(&mut self) {
         let snap = self.take_period();
-        println!("{}", format_loop_profile(&snap));
+        // 跳过退化首周期（tokio interval 首 tick 立即触发 → wall≈0 → loop-active≈99% 噪声）。
+        // take_period 已重置累计，不打印即可（合法周期 ≥~1s，远高于阈值）。
+        if snap.wall >= MIN_REPORT_WALL {
+            println!("{}", format_loop_profile(&snap));
+        }
     }
 }
 
@@ -300,6 +310,20 @@ mod tests {
         let s2 = p.take_period();
         assert_eq!(s2.poll, Duration::ZERO);
         assert_eq!(s2.iters, 0);
+    }
+
+    #[test]
+    fn degenerate_startup_period_skipped_by_report_guard() {
+        use crate::client_tun::MetricsSink;
+        let mut p = LoopProfiler::new();
+        // 立即取周期 → wall≈0，模拟 tokio interval 首 tick 立即触发的退化样本。
+        let snap = p.take_period();
+        assert!(
+            snap.wall < MIN_REPORT_WALL,
+            "退化首周期应低于 report 阈值（会被跳过）: {snap:?}"
+        );
+        // report() 对退化周期不打印也不 panic（take_period 已重置）。
+        p.report();
     }
 
     #[test]
