@@ -31,7 +31,7 @@
   **acceptance**：server-initiated KeyUpdate 不可由客户端诱发、生产服务端极少发 → 以 T19 loopback（真 read/write 路径 + 真
   KeyUpdate + 双向轮换）为高保真替身；真出口 KeyUpdate 未触发，如实记录（brief §8 T20「尽力而为」）。spec=`docs/tech/2026-06-25-knife10-keyupdate-spec.md`，gap 收口见 ADR-0010。
   **刀8 泄漏凭据已服务端轮换（2026-06-26）——安全遗留项关闭。**
-- **REALITY mini-project（刀6→刀10）全部完成。刀11 数据面可观测性（observability）代码完成（2026-06-26）**——见下「刀11 完成」。
+- **REALITY mini-project（刀6→刀10）全部完成。刀11 数据面可观测性（observability）✅ 全部完成 + 已 ff 合入 main `9de0604`（2026-06-26，代码 + 两轮 review 零 bug + 真出口 acceptance ✅）**——见下「刀11 完成」。
   **下一刀 = 主线「高带宽多线程逼近 100M」**（Rules ③ 主战场；刀11 量化底座已就位，可量化归因再上多线程）。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
@@ -66,7 +66,7 @@
  ├─ 刀3.5 高码率 UDP（quinn 插桩 + CC 调优）  ✅ 完成 + 真出口 acceptance（见下「刀3.5」）；纠偏：5.3M「天花板」实为链路 cap 假象
  ├─ 刀4  连接成功率（拦截加密 DNS DoT/DoH/DoQ/DoH3）  ✅ 完成 + 真出口 acceptance（见下「刀4」）；first-SYN 已确认 knife2 修复、关闭
  ├─ 刀5  拦全:53 裸包 DNS 劫持（任意 resolver 明文→fake-IP，废 smoltcp DNS socket）  ✅ 完成 + 真出口 acceptance（见下「刀5」，ADR-0007）；已合 main
- ├─ 刀11 数据面可观测性（DNS forge 计数 + datagram drop/背压 + 统一快照 MetricsSnapshot）  ✅ **完成（代码 + 两轮 review 零 bug + 真出口 acceptance ✅）**（见下「刀11 完成」；未合 main，待合）
+ ├─ 刀11 数据面可观测性（DNS forge 计数 + datagram drop/背压 + 统一快照 MetricsSnapshot）  ✅ **完成（代码 + 两轮 review 零 bug + 真出口 acceptance ✅）+ 已 ff 合入 main `9de0604`**（见下「刀11 完成」）
  └─ （主线下一刀）高带宽多线程逼近 100M（Rules ③ 主战场，**刀11 量化底座已就位**）  ← **下一刀**
 
 正交线 A（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）= VLESS+REALITY 第二 Transport（手写 TLS 1.3，ADR-0008）
@@ -323,7 +323,7 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
 
 ## 刀11 完成（2026-06-26）：数据面可观测性 — Arc<Metrics> + MetricsSnapshot 契约 + 30s 📊 快照
 
-**交付**（分支 `claude/knife11-observability`，从 main `6ba6d42` 起，逐 commit push；**未合 main**；主线量化底座）：
+**交付**（分支 `claude/knife11-observability`，从 main `6ba6d42` 起，逐 commit push；**已 ff 合入 main `9de0604`**；主线量化底座）：
 - **设计输入**：grounding workflow（5 接缝并行核实）+ 设计综合（seed §4 五开放问题逐一裁决）→ spec/plan/ADR-0012。
 - **新 `src/metrics.rs`**：进程级 `Arc<Metrics>`（原子，唯一桥接 run_event_loop task ↔ TuicUpstream::start_udp task）=
   累计 counter（`inc_*` fetch_add Relaxed）+ 发布式 gauge（`set_*` store；loop 30s tick 从单写者 socket_ctxs/fake_pool 重算后发布）；
