@@ -6,6 +6,7 @@ pub mod failover;
 pub mod fake_ip;
 #[cfg(feature = "harness")]
 pub mod harness;
+pub mod loop_profiler;
 pub mod metrics;
 pub mod quic;
 pub mod reality;
