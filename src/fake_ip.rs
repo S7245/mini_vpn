@@ -144,6 +144,21 @@ impl FakeIpPool {
         let v = u32::from(ip);
         v >= self.range_start && v <= self.range_end
     }
+
+    /// 池用量快照：`(total, active)` —— total=在册映射数、active=refcount>0（有活跃 flow）的映射数。
+    /// 中文要点（刀11 可观测性）：只读 `&self`、不 touch `last_used`、不分配（不像 `resolve` clone domain）。
+    /// `Mapping.refcount` 私有 → 必须是 `FakeIpPool` 的 inherent 方法。total=O(1)、active=O(n) 一遍 values()，
+    /// **只在 30s tick 采样**（最坏 ~131k 映射，O(n) 进每包热路径不可接受）。`alloc` 不改 refcount，故
+    /// active 追踪「有活跃 flow」而非「已分配」——刚 alloc 未连的域名计入 total 不计 active。
+    pub fn usage(&self) -> (usize, usize) {
+        let total = self.ip_to_mapping.len();
+        let active = self
+            .ip_to_mapping
+            .values()
+            .filter(|m| m.refcount > 0)
+            .count();
+        (total, active)
+    }
 }
 
 #[cfg(test)]
@@ -220,6 +235,24 @@ mod tests {
         p.release(ip, 2);
         // 归零状态，idle 超 TTL 即可回收（证明没被 release 弄成巨值卡住）。
         assert_eq!(p.sweep(1000, 300), 1);
+    }
+
+    /// 池用量 usage()（刀11）：alloc 计 total 不计 active；acquire/release 动 active；sweep 降 total。
+    #[test]
+    fn usage_tracks_total_and_active() {
+        let mut p = FakeIpPool::new();
+        assert_eq!(p.usage(), (0, 0), "空池");
+        let ip = p.alloc("a.com", 0);
+        assert_eq!(p.usage(), (1, 0), "alloc 计 total、不改 refcount → active=0");
+        p.acquire(ip, 0);
+        assert_eq!(p.usage(), (1, 1), "acquire → active=1");
+        let _ = p.alloc("b.com", 0);
+        assert_eq!(p.usage(), (2, 1), "第二域名进 total、未 acquire");
+        p.release(ip, 5);
+        assert_eq!(p.usage(), (2, 0), "release 归零 → active=0、total 不变");
+        // a.com、b.com 均 refcount==0 且 idle 超 TTL → 回收。
+        assert_eq!(p.sweep(1000, 300), 2);
+        assert_eq!(p.usage(), (0, 0), "sweep 后池空");
     }
 
     /// 回收腾出的 IP 可被新域名复用（next_free_ip 跳过在册、回收后空出）。
