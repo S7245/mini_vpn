@@ -11,6 +11,7 @@ use crate::udp_relay::{
 };
 use crate::dns::{self, Answer};
 use crate::fake_ip::FakeIpPool;
+use crate::loop_profiler::LoopProfiler;
 use crate::metrics::Metrics;
 use std::net::Ipv4Addr;
 use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
@@ -376,6 +377,10 @@ pub struct TunRuntimeConfig {
     /// env `MINI_VPN_METRICS_SECS` 可调（acceptance 设小值如 5 秒级看指标；0/非法回落默认，**绝不为 0**
     /// 否则 `tokio::time::interval` panic）。仅 `from_env` 读 env，`from_sources`（harness/测试）恒用默认。
     pub metrics_secs: u64,
+    /// 刀12：主循环 profiler 开关。`MINI_VPN_PROFILE_LOOP=1` 时主循环装 `LoopProfiler`（打 🔬 归因行
+    /// 量化 #4 vs #3）；默认 `false` → 装 `NoopSink`（**零开销路径逐字不变**）。仅 `from_env` 读 env，
+    /// `from_sources`（harness/测试）恒 `false`。
+    pub profile_loop: bool,
 }
 
 impl TunRuntimeConfig {
@@ -384,13 +389,16 @@ impl TunRuntimeConfig {
         Ok(Self {
             listener: TunListenerConfig::from_sources(pool_size)?,
             metrics_secs: METRICS_SNAPSHOT_SECS,
+            profile_loop: false,
         })
     }
 
-    /// Read config from process environment（`MINI_VPN_TUN_POOL_SIZE` + `MINI_VPN_METRICS_SECS`）。
+    /// Read config from process environment
+    /// （`MINI_VPN_TUN_POOL_SIZE` + `MINI_VPN_METRICS_SECS` + `MINI_VPN_PROFILE_LOOP`）。
     fn from_env() -> Result<Self, ClientError> {
         let mut cfg = Self::from_sources(std::env::var("MINI_VPN_TUN_POOL_SIZE").ok().as_deref())?;
         cfg.metrics_secs = parse_metrics_secs(std::env::var("MINI_VPN_METRICS_SECS").ok().as_deref());
+        cfg.profile_loop = parse_profile_loop(std::env::var("MINI_VPN_PROFILE_LOOP").ok().as_deref());
         Ok(cfg)
     }
 }
@@ -401,6 +409,53 @@ fn parse_metrics_secs(s: Option<&str>) -> u64 {
     s.and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(METRICS_SNAPSHOT_SECS)
+}
+
+/// 刀12：解析 `MINI_VPN_PROFILE_LOOP`：`1`/`true`（不区分大小写、去空白）→ 开；其它/缺省 → 关。
+fn parse_profile_loop(s: Option<&str>) -> bool {
+    matches!(
+        s.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+/// 刀12：按 `profile_loop` 在 `NoopSink`（默认零开销）与 `LoopProfiler`（🔬 归因）间**单态化二选一**
+/// 装进共享 [`run_event_loop`]。分支收口一处，三上游 arm 各一行调用、零重复。
+///
+/// 中文要点：`profile_loop`（Copy bool）作首参先求值，`runtime_config` 作后参再 move——左到右求值序
+/// 保证读字段不与 move 冲突。默认（`false`）分支逐字等价旧 `run_event_loop(.., NoopSink)`，零回归。
+async fn run_event_loop_sinked<D, U>(
+    profile_loop: bool,
+    device: D,
+    upstream: Arc<U>,
+    downlink_rx: mpsc::Receiver<Vec<u8>>,
+    runtime_config: TunRuntimeConfig,
+    metrics: Arc<Metrics>,
+) where
+    D: TunIo,
+    U: ProxyUpstream + DatagramUpstream + 'static,
+{
+    if profile_loop {
+        run_event_loop(
+            device,
+            upstream,
+            downlink_rx,
+            runtime_config,
+            metrics,
+            LoopProfiler::new(),
+        )
+        .await;
+    } else {
+        run_event_loop(
+            device,
+            upstream,
+            downlink_rx,
+            runtime_config,
+            metrics,
+            NoopSink,
+        )
+        .await;
+    }
 }
 
 /// 生产入口：建真 utun + 真 TUIC 上游，然后跑共享的 [`run_event_loop`]。
@@ -424,6 +479,13 @@ pub async fn start_tun_proxy() {
         "📊 数据面可观测性：快照周期 = {}s（MINI_VPN_METRICS_SECS 可调）",
         runtime_config.metrics_secs
     );
+    // 刀12：主循环 profiler（默认关；MINI_VPN_PROFILE_LOOP=1 开 → 打 🔬 归因行量化 #4 vs #3）。
+    if runtime_config.profile_loop {
+        println!(
+            "🔬 主循环 profiler 已启用（loop-active/poll/relay 占比，每 {}s；MINI_VPN_PROFILE_LOOP）",
+            runtime_config.metrics_secs
+        );
+    }
 
     // 1. 初始化 TUN 设备 / 创建操作系统的原生异步虚拟网卡。
     let raw_tun = match create_tun_device().await {
@@ -464,13 +526,13 @@ pub async fn start_tun_proxy() {
             println!("🌊 UDP relay 数据面就绪（TUIC Packet datagram → sing-box）");
             let tuic_downlink_rx = upstream.start_udp();
             // 4. 进入共享主循环（生产传 NoopSink：零插桩开销）。
-            run_event_loop(
+            run_event_loop_sinked(
+                runtime_config.profile_loop,
                 device,
                 upstream,
                 tuic_downlink_rx,
                 runtime_config,
                 Arc::clone(&metrics),
-                NoopSink,
             )
             .await;
         }
@@ -489,13 +551,13 @@ pub async fn start_tun_proxy() {
                 }
             };
             let (_dummy_tx, dummy_rx) = mpsc::channel::<Vec<u8>>(1); // 持 tx 不 drop → 下行分支永挂
-            run_event_loop(
+            run_event_loop_sinked(
+                runtime_config.profile_loop,
                 device,
                 upstream,
                 dummy_rx,
                 runtime_config,
                 Arc::clone(&metrics),
-                NoopSink,
             )
             .await;
         }
@@ -536,13 +598,13 @@ pub async fn start_tun_proxy() {
             // 后台健康探针：REALITY 当班时每 30s 探 TUIC，按不对称迟滞（连续 3 + 60s 冷却）切回。
             upstream.spawn_health_probe();
             println!("🔀 failover 就绪：TCP relay 健康感知 TUIC↔REALITY，UDP 恒走 TUIC");
-            run_event_loop(
+            run_event_loop_sinked(
+                runtime_config.profile_loop,
                 device,
                 upstream,
                 tuic_downlink_rx,
                 runtime_config,
                 Arc::clone(&metrics),
-                NoopSink,
             )
             .await;
         }
@@ -2096,6 +2158,25 @@ mod tests {
         assert_eq!(parse_metrics_secs(Some("abc")), METRICS_SNAPSHOT_SECS);
         assert_eq!(parse_metrics_secs(Some("")), METRICS_SNAPSHOT_SECS);
         assert_eq!(parse_metrics_secs(None), METRICS_SNAPSHOT_SECS);
+    }
+
+    #[test]
+    fn parse_profile_loop_only_truthy_enables() {
+        assert!(parse_profile_loop(Some("1")));
+        assert!(parse_profile_loop(Some("true")));
+        assert!(parse_profile_loop(Some(" TRUE ")));
+        assert!(!parse_profile_loop(Some("0")));
+        assert!(!parse_profile_loop(Some("false")));
+        assert!(!parse_profile_loop(Some("yes")));
+        assert!(!parse_profile_loop(Some("")));
+        assert!(!parse_profile_loop(None), "缺省关——默认 NoopSink 零开销路径");
+    }
+
+    #[test]
+    fn tun_runtime_config_defaults_profile_loop_off() {
+        // from_sources（harness/测试）恒关；只有 from_env 读 MINI_VPN_PROFILE_LOOP。
+        let cfg = TunRuntimeConfig::from_sources(None).expect("valid config");
+        assert!(!cfg.profile_loop);
     }
 
     #[test]
