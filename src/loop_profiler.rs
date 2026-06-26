@@ -66,6 +66,110 @@ fn ratio(num: Duration, den: Duration) -> f64 {
     }
 }
 
+use crate::client_tun::MetricsSink;
+use std::time::Instant;
+
+/// 主循环计时累计器（[`MetricsSink`] 实现）。仅 `MINI_VPN_PROFILE_LOOP=1` 时单态化选中、装进
+/// `run_event_loop`；默认生产走 `NoopSink`（零开销）。每 `report()` 取周期快照、打 🔬 行、重置。
+///
+/// 中文要点：各段用「`enter` 记 mark / `leave` 加 now−mark」配对累计；park 同理（`loop_park_begin`
+/// 记 mark、`loop_park_end` 加并 +iters）。`saturating_duration_since` 防时钟回拨 panic（稳定优先）。
+pub struct LoopProfiler {
+    period_start: Instant,
+    poll: Duration,
+    relay: Duration,
+    park: Duration,
+    iters: u64,
+    poll_mark: Option<Instant>,
+    relay_mark: Option<Instant>,
+    park_mark: Option<Instant>,
+}
+
+impl LoopProfiler {
+    pub fn new() -> Self {
+        Self {
+            period_start: Instant::now(),
+            poll: Duration::ZERO,
+            relay: Duration::ZERO,
+            park: Duration::ZERO,
+            iters: 0,
+            poll_mark: None,
+            relay_mark: None,
+            park_mark: None,
+        }
+    }
+
+    /// 取走本周期快照并重置累计（`period_start = now`、各段归零、iters 归 0）。
+    /// `report()` 内部调用；单测可直接调以确定性断言。
+    pub fn take_period(&mut self) -> LoopProfileSnapshot {
+        let now = Instant::now();
+        let snap = LoopProfileSnapshot {
+            poll: self.poll,
+            relay: self.relay,
+            park: self.park,
+            wall: now.saturating_duration_since(self.period_start),
+            iters: self.iters,
+        };
+        self.poll = Duration::ZERO;
+        self.relay = Duration::ZERO;
+        self.park = Duration::ZERO;
+        self.iters = 0;
+        self.period_start = now;
+        snap
+    }
+}
+
+impl Default for LoopProfiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MetricsSink for LoopProfiler {
+    fn enter_poll(&mut self) {
+        self.poll_mark = Some(Instant::now());
+    }
+    fn leave_poll(&mut self) {
+        if let Some(m) = self.poll_mark.take() {
+            self.poll += Instant::now().saturating_duration_since(m);
+        }
+    }
+    fn enter_relay(&mut self) {
+        self.relay_mark = Some(Instant::now());
+    }
+    fn leave_relay(&mut self) {
+        if let Some(m) = self.relay_mark.take() {
+            self.relay += Instant::now().saturating_duration_since(m);
+        }
+    }
+    fn loop_park_begin(&mut self) {
+        self.park_mark = Some(Instant::now());
+    }
+    fn loop_park_end(&mut self) {
+        if let Some(m) = self.park_mark.take() {
+            self.park += Instant::now().saturating_duration_since(m);
+        }
+        self.iters += 1;
+    }
+    fn report(&mut self) {
+        let snap = self.take_period();
+        println!("{}", format_loop_profile(&snap));
+    }
+}
+
+/// 🔬 归因行（纯函数，便于格式单测）。一位小数；wall 用实测毫秒（非名义周期）。
+pub fn format_loop_profile(snap: &LoopProfileSnapshot) -> String {
+    format!(
+        "🔬 主循环: loop-active={:.1}% | poll={:.1}% relay={:.1}% | park={:.1}% | iters={}/wall={}ms",
+        snap.loop_active_fraction() * 100.0,
+        snap.poll_fraction() * 100.0,
+        snap.relay_fraction() * 100.0,
+        snap.park_fraction() * 100.0,
+        snap.iters,
+        snap.wall.as_millis(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +254,69 @@ mod tests {
         assert_eq!(snap.loop_active_fraction(), 0.0);
         // park_fraction 反映原始比例（>1 容许，诚实暴露抖动）。
         assert!(snap.park_fraction() > 1.0);
+    }
+
+    #[test]
+    fn noop_sink_is_zero_sized() {
+        // 生产默认路径必须真零开销：NoopSink 无字段、单态化后内联消失。
+        assert_eq!(std::mem::size_of::<crate::client_tun::NoopSink>(), 0);
+    }
+
+    #[test]
+    fn profiler_accumulates_and_orders_segments() {
+        use crate::client_tun::MetricsSink;
+        let mut p = LoopProfiler::new();
+        // 一次迭代：park 1ms → poll 8ms → relay 1ms（8× 余量，断言粗序、不脆）。
+        p.loop_park_begin();
+        std::thread::sleep(ms(1));
+        p.loop_park_end(); // park ≈ 1ms，iters=1
+        p.enter_poll();
+        std::thread::sleep(ms(8));
+        p.leave_poll(); // poll ≈ 8ms
+        p.enter_relay();
+        std::thread::sleep(ms(1));
+        p.leave_relay(); // relay ≈ 1ms
+        let snap = p.take_period();
+        assert_eq!(snap.iters, 1);
+        assert!(snap.poll_fraction() > 0.5, "poll 应主导: {snap:?}");
+        assert!(snap.poll_fraction() > snap.relay_fraction(), "{snap:?}");
+        assert!(snap.loop_active_fraction() > 0.5, "park 小→active 高: {snap:?}");
+        assert!(snap.park_fraction() < 0.3, "park 小: {snap:?}");
+    }
+
+    #[test]
+    fn take_period_resets_accumulators() {
+        use crate::client_tun::MetricsSink;
+        let mut p = LoopProfiler::new();
+        p.enter_poll();
+        std::thread::sleep(ms(2));
+        p.leave_poll();
+        p.loop_park_begin();
+        p.loop_park_end();
+        let s1 = p.take_period();
+        assert!(s1.poll > Duration::ZERO);
+        assert_eq!(s1.iters, 1);
+        // 立刻再取 → 空周期（已重置）。
+        let s2 = p.take_period();
+        assert_eq!(s2.poll, Duration::ZERO);
+        assert_eq!(s2.iters, 0);
+    }
+
+    #[test]
+    fn format_includes_all_fields() {
+        let snap = LoopProfileSnapshot {
+            poll: ms(600),
+            relay: ms(100),
+            park: ms(300),
+            wall: ms(1000),
+            iters: 42,
+        };
+        let s = format_loop_profile(&snap);
+        assert!(s.contains("loop-active=70.0%"), "{s}");
+        assert!(s.contains("poll=60.0%"), "{s}");
+        assert!(s.contains("relay=10.0%"), "{s}");
+        assert!(s.contains("park=30.0%"), "{s}");
+        assert!(s.contains("iters=42"), "{s}");
+        assert!(s.contains("wall=1000ms"), "{s}");
     }
 }

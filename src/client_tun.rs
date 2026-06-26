@@ -46,6 +46,12 @@ pub trait MetricsSink {
     fn leave_relay(&mut self) {}
     /// 记录本 tick relay 段遍历的 listener handle 数（量化怀疑瓶颈 #1：O(n) 全量遍历）。
     fn note_listeners(&mut self, _n: usize) {}
+    /// 刀12：主循环底部、即将停在 `tokio::select!` 空等下一个事件——park 开始。
+    fn loop_park_begin(&mut self) {}
+    /// 刀12：select! arm 首行——park 结束、active 开始（一次迭代）。
+    fn loop_park_end(&mut self) {}
+    /// 刀12：报告周期结束（metrics_tick）——输出 🔬 归因行并重置周期累计。
+    fn report(&mut self) {}
 }
 
 /// 生产用空插桩：所有回调空实现，单态化后零开销。
@@ -655,6 +661,7 @@ pub async fn run_event_loop<D, U, M>(
             // TCP relay 回程：后台车厢把远端回传字节送回主循环 → 注入对应 smoltcp socket。
             //   TUIC 自重连（live_conn），不需要 legacy 的 disconnect/复位分支。
             Some((handle, payload)) = global_rx.recv() =>{
+                metrics.loop_park_end();
                 println!("📬 从大邮筒收到 {} 字节数据，准备送往房间 {:?}", payload.len(), handle);
                 if let Err(e) = handle_remote_payload(
                     handle,
@@ -683,6 +690,7 @@ pub async fn run_event_loop<D, U, M>(
             // 分支 1: 全局回信通道接收到了新数据包
             // 分支 1: 物理网卡接收到了新数据包
             res = device.wait_for_rx() =>{
+                metrics.loop_park_end();
                 if res.is_ok(){
                     // rx 分流（stage-12 D1 + 刀5）：任意 :53 → 裸包 DNS 劫持；其它 UDP → 裸 relay；
                     // 非 UDP → 既有 smoltcp 路径。前两类 take 走、不进 iface.poll。
@@ -773,6 +781,7 @@ pub async fn run_event_loop<D, U, M>(
             // 刀9 M3：spawn 出主循环的远端握手（REALITY）完成 → 安装 relay（成功）/ rearm（失败），
             // 带 epoch 防串话。廉价上游（TUIC）走 inline、不经此分支（零回归）。
             Some(done) = handshake_done_rx.recv() => {
+                metrics.loop_park_end();
                 handle_handshake_done(
                     done,
                     &mut sockets,
@@ -786,6 +795,7 @@ pub async fn run_event_loop<D, U, M>(
             // Stage 13b/刀3: TUIC 下行（datagram 或 uni-stream）→ decode_packet_meta → 分片重组
             // → AssocTable 解路由 → 造回程 IP/UDP 注入 TUN。FRAG_TOTAL==1 直通；>1 集齐才注入。
             Some(dg) = tuic_downlink_rx.recv() => {
+                metrics.loop_park_end();
                 if let Some(meta) = decode_packet_meta(&dg) {
                     let assoc_id = meta.assoc_id;
                     // 分片重组：单帧直通；多帧集齐返回整包，否则缓存等后续帧。
@@ -810,6 +820,7 @@ pub async fn run_event_loop<D, U, M>(
             }
             // Stage 13b: 周期回收空闲 UDP assoc。刀2：同时回收 fake-IP 引用 + sweep fake-IP 池。
             _ = udp_sweep.tick() => {
+                metrics.loop_park_end();
                 let now = udp_clock.elapsed().as_secs();
                 // 被回收的 UDP assoc → release 其占用的 fake-IP（引用计数归零，进可回收候选）。
                 for ip in assoc_table.sweep(now, UDP_FLOW_IDLE_SECS) {
@@ -823,12 +834,14 @@ pub async fn run_event_loop<D, U, M>(
             }
             // review #7：低频回收 idle 且 refcount==0 超 TTL 的 fake-IP 映射（长稳防泄漏）。
             _ = fake_ip_sweep.tick() => {
+                metrics.loop_park_end();
                 fake_pool.sweep(udp_clock.elapsed().as_secs(), FAKE_IP_TTL);
             }
             // 刀11：数据面可观测性快照（30s）。在此单写者 task 重算 loop-owned gauge → 发布进
             // Arc<Metrics> → snapshot 读出（上行计数经 upstream trait 访问器）→ **无门控**打统一 📊 行
             // （TCP/DNS/failover 在 UDP 空闲时也有意义；UDP-path 行另由 start_udp 发，见 ADR-0012 §5）。
             _ = metrics_tick.tick() => {
+                metrics.loop_park_end();
                 publish_gauges(
                     &metrics_handle,
                     socket_ctxs.values(),
@@ -838,9 +851,12 @@ pub async fn run_event_loop<D, U, M>(
                 let snap = metrics_handle
                     .snapshot(upstream.udp_drops_up(), upstream.udp_stream_fallbacks());
                 println!("{}", crate::metrics::format_metrics_snapshot(&snap));
+                // 刀12：紧挨 📊 行打 🔬 主循环归因行（profiler 关闭时 NoopSink::report 空、零开销）。
+                metrics.report();
             }
             // 分支 2: 时钟滴答，处理超时重传等后台任务
             _ = timer.tick() =>{
+                metrics.loop_park_end();
                 metrics.enter_poll();
                 let timestamp = smoltcp::time::Instant::now();
                 iface.poll(timestamp, &mut device, &mut sockets);
@@ -864,6 +880,9 @@ pub async fn run_event_loop<D, U, M>(
                 .await;
             }
         }
+        // 刀12：循环底部——即将停在 select! 空等下一个事件，标记 park 开始
+        //（NoopSink::loop_park_begin 空、零开销；仅 LoopProfiler 采时钟）。
+        metrics.loop_park_begin();
     }
 }
 
