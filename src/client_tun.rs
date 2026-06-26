@@ -41,7 +41,7 @@ pub trait MetricsSink {
     fn enter_poll(&mut self) {}
     /// 离开 poll 段。
     fn leave_poll(&mut self) {}
-    /// 进入 relay 调度段（`all_handles()` 全量遍历 + `process_listener_activity`）。
+    /// 进入 relay 调度段（脏集合驱动 `process_dirty_relay`，刀2 起 O(活跃 handle)、非全量遍历）。
     fn enter_relay(&mut self) {}
     /// 离开 relay 调度段。
     fn leave_relay(&mut self) {}
