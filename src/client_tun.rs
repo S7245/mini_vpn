@@ -366,20 +366,35 @@ impl TunListenerConfig {
 #[derive(Debug, Clone)]
 pub struct TunRuntimeConfig {
     pub listener: TunListenerConfig,
+    /// 刀11：数据面可观测性 `📊` 快照周期（秒）。默认 [`METRICS_SNAPSHOT_SECS`]（30）；
+    /// env `MINI_VPN_METRICS_SECS` 可调（acceptance 设小值如 5 秒级看指标；0/非法回落默认，**绝不为 0**
+    /// 否则 `tokio::time::interval` panic）。仅 `from_env` 读 env，`from_sources`（harness/测试）恒用默认。
+    pub metrics_secs: u64,
 }
 
 impl TunRuntimeConfig {
-    /// Build config from optional string sources.
+    /// Build config from optional string sources.（metrics 周期恒默认；env 覆盖只在 `from_env`。）
     pub fn from_sources(pool_size: Option<&str>) -> Result<Self, ClientError> {
         Ok(Self {
             listener: TunListenerConfig::from_sources(pool_size)?,
+            metrics_secs: METRICS_SNAPSHOT_SECS,
         })
     }
 
-    /// Read config from process environment（`MINI_VPN_TUN_POOL_SIZE`）。
+    /// Read config from process environment（`MINI_VPN_TUN_POOL_SIZE` + `MINI_VPN_METRICS_SECS`）。
     fn from_env() -> Result<Self, ClientError> {
-        Self::from_sources(std::env::var("MINI_VPN_TUN_POOL_SIZE").ok().as_deref())
+        let mut cfg = Self::from_sources(std::env::var("MINI_VPN_TUN_POOL_SIZE").ok().as_deref())?;
+        cfg.metrics_secs = parse_metrics_secs(std::env::var("MINI_VPN_METRICS_SECS").ok().as_deref());
+        Ok(cfg)
     }
+}
+
+/// 解析 `MINI_VPN_METRICS_SECS`：默认 [`METRICS_SNAPSHOT_SECS`]；**0/非数字一律回落默认**
+/// （0 会让 `tokio::time::interval` panic，必须挡住）。
+fn parse_metrics_secs(s: Option<&str>) -> u64 {
+    s.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(METRICS_SNAPSHOT_SECS)
 }
 
 /// 生产入口：建真 utun + 真 TUIC 上游，然后跑共享的 [`run_event_loop`]。
@@ -397,6 +412,11 @@ pub async fn start_tun_proxy() {
     println!(
         "🚀 TUN runtime started with pool_size={}",
         runtime_config.listener.pool_size
+    );
+    // 刀11：数据面 📊 快照周期（MINI_VPN_METRICS_SECS 可调；acceptance 设 5 即秒级看指标）。
+    println!(
+        "📊 数据面可观测性：快照周期 = {}s（MINI_VPN_METRICS_SECS 可调）",
+        runtime_config.metrics_secs
     );
 
     // 1. 初始化 TUN 设备 / 创建操作系统的原生异步虚拟网卡。
@@ -627,7 +647,8 @@ pub async fn run_event_loop<D, U, M>(
     // 刀11：数据面可观测性快照 tick（30s）。在此**单写者** task 重算 loop-owned gauge
     // （active_relays / fake-IP 用量 / failover 当班腿）→ 发布进 Arc<Metrics> → 打统一 📊 快照行。
     // 与 TuicUpstream::start_udp 的 UDP-path 📊 行（RTT/cwnd/背压）是两条独立日志、各司其职（见 ADR-0012 §5）。
-    let mut metrics_tick = tokio::time::interval(std::time::Duration::from_secs(METRICS_SNAPSHOT_SECS));
+    let mut metrics_tick =
+        tokio::time::interval(std::time::Duration::from_secs(runtime_config.metrics_secs));
 
     loop {
         tokio::select! {
@@ -2043,6 +2064,19 @@ mod tests {
         let config = TunRuntimeConfig::from_sources(None).expect("config should load");
         // Stage 9 drops local_port; pool_size default lowered to 2 (per-port now).
         assert_eq!(config.listener.pool_size, 2);
+        // 刀11：from_sources（harness/测试路径）恒用默认快照周期。
+        assert_eq!(config.metrics_secs, METRICS_SNAPSHOT_SECS);
+    }
+
+    /// 刀11：MINI_VPN_METRICS_SECS 解析——有效正整数采用；0/非数字/缺失回落默认（防 interval panic）。
+    #[test]
+    fn parse_metrics_secs_clamps_and_defaults() {
+        assert_eq!(parse_metrics_secs(Some("5")), 5);
+        assert_eq!(parse_metrics_secs(Some("  10 ")), 10);
+        assert_eq!(parse_metrics_secs(Some("0")), METRICS_SNAPSHOT_SECS, "0 必回落（否则 interval panic）");
+        assert_eq!(parse_metrics_secs(Some("abc")), METRICS_SNAPSHOT_SECS);
+        assert_eq!(parse_metrics_secs(Some("")), METRICS_SNAPSHOT_SECS);
+        assert_eq!(parse_metrics_secs(None), METRICS_SNAPSHOT_SECS);
     }
 
     #[test]

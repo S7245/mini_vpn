@@ -502,12 +502,15 @@ sudo -E bash scripts/knife35-acceptance.sh soak-stop       # 还原 DNS + 清路
 harness 集成 `metrics_relays_spawned_tracks_load`（32 flow → relays_spawned≥完成数，复用 knife1 harness + 读末态 Arc<Metrics>）。
 **UDP 下行 drop / 背压的 I/O 触发点**（真 quinn accept_uni 溢出 / read None / datagram 缓冲将满）harness mock echo 不走 → 归真出口 acceptance。
 
-**真出口 acceptance 配方（待用户跑，尽力而为如实记录）**——无需新脚本，复用既有 soak，**观察新 `📊` 行随负载变化**：
-1. **failover_leg 翻转**：`sudo -E bash scripts/knife9-failover-acceptance.sh soak`（两腿）→ `📊 … leg=TUIC`；
-   `cut-tuic` → 切后 `📊 … leg=REALITY`；`restore-tuic` → 冷却后 `📊 … leg=TUIC`。
-2. **DNS forge / TCP relay / fake-IP**：soak 期间浏览 / `dig @8.8.8.8 …` / 并发 `curl` → `📊` 行 `DNS forge` 随查询↑、
+**真出口 acceptance 配方（待用户跑，尽力而为如实记录）**——无需新脚本，复用既有 soak，**观察新 `📊` 行随负载变化**。
+
+**⚠️ 第一轮 acceptance 复盘（2026-06-26，两条方法教训，非 bug）**：① `📊` 是**周期快照（默认 30s）**——真流量必须在某次 tick **之前**发生、且 client 在负载后**多跑 ≥1 个周期**才能被捕获（首轮 18 次 forge/35 次 relay 全发生在最后一条快照之后 → 全 0 是采样时机，非计数错）。**→ 已加 env `MINI_VPN_METRICS_SECS`**（默认 30，acceptance 设 `=5` 秒级看；0/非法回落 30）。② app 会**缓存上轮的 fake-IP**，client 重启后池空 → 狂连旧 fake-IP 被 `🚫 无映射` 拒（不 forge/不 relay）→ soak 前必须**清 DNS 缓存**（macOS：`sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder` + 重启浏览器 / 用新域名）。
+
+跑法（**所有 soak 前置 `MINI_VPN_METRICS_SECS=5` 与清缓存**）：
+1. **failover_leg 翻转**：`sudo -E MINI_VPN_METRICS_SECS=5 bash scripts/knife9-failover-acceptance.sh soak`（两腿）→ `📊 … leg=TUIC`；
+   `cut-tuic` 后**保持运行 + 访问新站 ≥10s** → `📊 … leg=REALITY` + `🔐 REALITY 握手成功`；`restore-tuic` 后等冷却 → `📊 … leg=TUIC`。
+2. **DNS forge / TCP relay / fake-IP**：soak 期间浏览**新**站 / `dig` 新域名 / 并发 `curl` → 看**最后一条** `📊`：`DNS forge` 随查询↑、
    `TCP relay 活跃/累计` 随并发↑、`fake-IP 活跃/在册` 随域名↑。
-3. **UDP 下行 drop / 背压**（难强制）：`scripts/knife35-acceptance.sh soak` 大码率 UDP（YouTube 4K / iperf3）→ 观察
-   `UDP↓丢` / `背压`；native+cubic 高保真链路下常为 0（刀3.5 已证 datagram 够用），若触发则如实记录。REALITY-only 模式记 UDP 项恒 0
-   （无 start_udp）。
-4. 判据：`📊` 行出现且各指标**随对应负载单调变化**（量化底座可信）→ 为后续「多线程逼近 100M」就位。
+3. **UDP 下行 drop / 背压**（难强制）：`MINI_VPN_METRICS_SECS=5 ... scripts/knife35-acceptance.sh soak` 大码率 UDP（YouTube 4K / iperf3）→ 观察
+   `UDP↓丢` / `背压`；native+cubic 高保真链路下常为 0（刀3.5 已证 datagram 够用），若触发则如实记录。REALITY-only 模式记 UDP 项恒 0（无 start_udp）。
+4. 判据：负载后某条 `📊` 行各指标**随对应负载单调变化**（量化底座可信）→ 为后续「多线程逼近 100M」就位。
