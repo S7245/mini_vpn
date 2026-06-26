@@ -1103,6 +1103,14 @@ impl DatagramUpstream for TuicUpstream {
     async fn send_udp(&self, datagram: Vec<u8>) {
         TuicUpstream::send_udp(self, datagram).await
     }
+
+    // 刀11：上行计数仍住 TuicUpstream（零回归）→ 经既有 inherent 访问器暴露给 snapshot。
+    fn udp_drops_up(&self) -> u64 {
+        self.udp_drop_count()
+    }
+    fn udp_stream_fallbacks(&self) -> u64 {
+        self.udp_stream_fallback_count()
+    }
 }
 
 /// 刀9 F1：failover 健康探测面。`probe` 主动探活（live_conn=QUIC 握手+TUIC 认证，非浅探）；

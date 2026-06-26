@@ -29,6 +29,14 @@ pub trait ProxyUpstream: Send + Sync {
     fn open_is_cheap(&self) -> bool {
         true
     }
+
+    /// 当前 TCP 选腿编码（刀11 可观测性）：默认 [`NO_FAILOVER`](crate::metrics::NO_FAILOVER)——
+    /// 非 failover 上游（纯 TUIC / 纯 REALITY 单腿）无选腿概念。仅 `FailoverUpstream` override 返回
+    /// `state().active_leg().as_u8()`（0=TUIC / 1=REALITY）。30s tick 周期采样、**不在 UDP 数据路径**
+    /// （独立 Relaxed 读 → 不破 ADR-0011 的 send_udp 铁律）。
+    fn failover_leg_u8(&self) -> u8 {
+        crate::metrics::NO_FAILOVER
+    }
 }
 
 /// 代理上游的 UDP/datagram 面:把一条已编码好的 datagram 发往出口。
@@ -40,6 +48,18 @@ pub trait ProxyUpstream: Send + Sync {
 #[async_trait::async_trait]
 pub trait DatagramUpstream: Send + Sync {
     async fn send_udp(&self, datagram: Vec<u8>);
+
+    /// 上行 UDP datagram 累计丢弃（刀11 可观测性）：默认 0；`TuicUpstream` override 返回
+    /// `udp_drop_count()`，`FailoverUpstream` 转发 tuic 腿（UDP 恒 TUIC）。snapshot 时读，与新增的
+    /// **下行** drop（`Metrics.udp_drops_down`）严格分离。
+    fn udp_drops_up(&self) -> u64 {
+        0
+    }
+    /// 上行走 uni-stream 兜底累计次数（刀11 可观测性）：默认 0；`TuicUpstream` override 返回
+    /// `udp_stream_fallback_count()`，`FailoverUpstream` 转发 tuic 腿。
+    fn udp_stream_fallbacks(&self) -> u64 {
+        0
+    }
 }
 
 #[cfg(test)]

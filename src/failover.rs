@@ -93,7 +93,9 @@ pub enum TcpLeg {
 }
 
 impl TcpLeg {
-    fn as_u8(self) -> u8 {
+    /// 编码为 u8（0=Tuic / 1=Reality）。`pub(crate)` 供刀11 可观测性 `failover_leg_u8()` 复用——
+    /// 单一编码源，勿在别处重写 match。
+    pub(crate) fn as_u8(self) -> u8 {
         match self {
             TcpLeg::Tuic => 0,
             TcpLeg::Reality => 1,
@@ -345,6 +347,11 @@ where
     fn open_is_cheap(&self) -> bool {
         false
     }
+
+    /// 刀11：当前 TCP 选腿（独立周期 Relaxed 读，不在数据路径 → 不破铁律）。
+    fn failover_leg_u8(&self) -> u8 {
+        self.state.active_leg().as_u8()
+    }
 }
 
 #[async_trait::async_trait]
@@ -357,6 +364,14 @@ where
         // F2 硬约束（铁律）：UDP datagram 永久绑 TUIC，绝不读 active_leg、绝不看冷却、绝不降级 REALITY。
         // TUIC 不可用时由 TuicUpstream::send_udp 内部优雅丢弃（udp_drops++）+ live_conn 自愈，failover 不干预。
         self.tuic.send_udp(datagram).await;
+    }
+
+    // 刀11：上行计数转发 tuic 腿（UDP 恒 TUIC，REALITY 腿无 datagram）。
+    fn udp_drops_up(&self) -> u64 {
+        self.tuic.udp_drops_up()
+    }
+    fn udp_stream_fallbacks(&self) -> u64 {
+        self.tuic.udp_stream_fallbacks()
     }
 }
 
@@ -375,6 +390,7 @@ mod tests {
         dead: AtomicBool,
         probe_ok: AtomicBool,
         rx: std::sync::atomic::AtomicU64,
+        drops_up: std::sync::atomic::AtomicU64,
     }
 
     #[async_trait::async_trait]
@@ -393,6 +409,9 @@ mod tests {
     impl DatagramUpstream for MockLeg {
         async fn send_udp(&self, datagram: Vec<u8>) {
             self.udp.lock().unwrap().push(datagram);
+        }
+        fn udp_drops_up(&self) -> u64 {
+            self.drops_up.load(Ordering::Relaxed)
         }
     }
 
@@ -418,6 +437,35 @@ mod tests {
 
     fn target() -> TargetAddr {
         TargetAddr::parse("1.2.3.4:443").unwrap()
+    }
+
+    /// 刀11：`failover_leg_u8()` 随 `active_leg` 变（0=Tuic / 1=Reality）。
+    #[test]
+    fn failover_leg_u8_tracks_active_leg() {
+        let (_t, _r, fo) = mk();
+        assert_eq!(fo.failover_leg_u8(), 0, "默认 Tuic");
+        fo.state().set_leg(TcpLeg::Reality);
+        assert_eq!(fo.failover_leg_u8(), 1);
+        fo.state().set_leg(TcpLeg::Tuic);
+        assert_eq!(fo.failover_leg_u8(), 0);
+    }
+
+    /// 刀11：`FailoverUpstream::udp_drops_up()` 转发 tuic 腿（UDP 恒 TUIC）。
+    #[test]
+    fn udp_drops_up_forwards_to_tuic_leg() {
+        let (tuic, reality, fo) = mk();
+        tuic.drops_up.store(42, Ordering::Relaxed);
+        reality.drops_up.store(999, Ordering::Relaxed); // 不应被读到
+        assert_eq!(fo.udp_drops_up(), 42);
+        assert_eq!(fo.udp_stream_fallbacks(), 0, "MockLeg 未 override fallbacks → 默认 0");
+    }
+
+    /// 刀11：非 failover 单腿上游继承默认（leg=NO_FAILOVER、fallbacks=0）。
+    #[test]
+    fn non_failover_leg_u8_is_sentinel() {
+        let leg = MockLeg::default();
+        assert_eq!(leg.failover_leg_u8(), crate::metrics::NO_FAILOVER);
+        assert_eq!(leg.udp_stream_fallbacks(), 0);
     }
 
     /// F2：open_tcp 按 active_leg 选腿；send_udp 恒走 tuic（即使 leg=REALITY）。
