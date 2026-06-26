@@ -11,6 +11,7 @@ use crate::udp_relay::{
 };
 use crate::dns::{self, Answer};
 use crate::fake_ip::FakeIpPool;
+use crate::metrics::Metrics;
 use std::net::Ipv4Addr;
 use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState};
@@ -406,6 +407,10 @@ pub async fn start_tun_proxy() {
     };
     let device = VirtualTunDevice::new(raw_tun);
 
+    // 刀11：进程级数据面可观测性句柄。**在选上游之前**构造一次 → 同一 `Arc<Metrics>` 既喂
+    // run_event_loop（DNS/relay/gauge），又（T6 起）clone 进 TuicUpstream（UDP 下行 drop/背压）。
+    let metrics = Arc::new(Metrics::new());
+
     // 2. 选上游 Transport：MINI_VPN_UPSTREAM=tuic（默认）| reality（VLESS over REALITY over TCP，刀8）。
     //    两分支各自单态化 run_event_loop（device 只在选中的分支被 move，互斥）。
     match select_upstream_kind(std::env::var("MINI_VPN_UPSTREAM").ok().as_deref()) {
@@ -431,7 +436,15 @@ pub async fn start_tun_proxy() {
             println!("🌊 UDP relay 数据面就绪（TUIC Packet datagram → sing-box）");
             let tuic_downlink_rx = upstream.start_udp();
             // 4. 进入共享主循环（生产传 NoopSink：零插桩开销）。
-            run_event_loop(device, upstream, tuic_downlink_rx, runtime_config, NoopSink).await;
+            run_event_loop(
+                device,
+                upstream,
+                tuic_downlink_rx,
+                runtime_config,
+                Arc::clone(&metrics),
+                NoopSink,
+            )
+            .await;
         }
         UpstreamKind::Reality => {
             // REALITY 是 **TCP-only**（force-reality）：UDP no-op（DatagramUpstream 静默丢）+
@@ -448,7 +461,15 @@ pub async fn start_tun_proxy() {
                 }
             };
             let (_dummy_tx, dummy_rx) = mpsc::channel::<Vec<u8>>(1); // 持 tx 不 drop → 下行分支永挂
-            run_event_loop(device, upstream, dummy_rx, runtime_config, NoopSink).await;
+            run_event_loop(
+                device,
+                upstream,
+                dummy_rx,
+                runtime_config,
+                Arc::clone(&metrics),
+                NoopSink,
+            )
+            .await;
         }
         UpstreamKind::Failover => {
             // 刀9：健康感知 TUIC↔REALITY。两腿都建——TUIC 既承 TCP relay 又是 **UDP 唯一出口**，
@@ -487,7 +508,15 @@ pub async fn start_tun_proxy() {
             // 后台健康探针：REALITY 当班时每 30s 探 TUIC，按不对称迟滞（连续 3 + 60s 冷却）切回。
             upstream.spawn_health_probe();
             println!("🔀 failover 就绪：TCP relay 健康感知 TUIC↔REALITY，UDP 恒走 TUIC");
-            run_event_loop(device, upstream, tuic_downlink_rx, runtime_config, NoopSink).await;
+            run_event_loop(
+                device,
+                upstream,
+                tuic_downlink_rx,
+                runtime_config,
+                Arc::clone(&metrics),
+                NoopSink,
+            )
+            .await;
         }
     }
 }
@@ -520,6 +549,9 @@ pub async fn run_event_loop<D, U, M>(
     upstream: Arc<U>,
     mut tuic_downlink_rx: mpsc::Receiver<Vec<u8>>,
     runtime_config: TunRuntimeConfig,
+    // 刀11：进程级数据面计数/gauge 句柄（与计时导向的 `metrics: M` 正交）。run_event_loop 写
+    // dns_*/relays_spawned + 30s tick 发布 gauge；同一 Arc 也被 TuicUpstream::start_udp clone（写 UDP 计数）。
+    metrics_handle: Arc<Metrics>,
     mut metrics: M,
 ) where
     D: TunIo,
@@ -648,6 +680,7 @@ pub async fn run_event_loop<D, U, M>(
                                 &mut fake_pool,
                                 &mut device,
                                 udp_clock.elapsed().as_secs(),
+                                &metrics_handle,
                             )
                             .await;
                         }
@@ -1020,15 +1053,22 @@ async fn handle_dns_hijack<D: TunIo>(
     fake_pool: &mut FakeIpPool,
     device: &mut D,
     now_secs: u64,
+    metrics: &Metrics,
 ) {
     let Some(udp) = parse_inbound_udp(pkt) else {
+        // 生产里 classify_inbound 已保证 parse 成功才路由到 Dns → 此早返在生产中实为 dead。
+        // **不计数**（避免与下方 forge None 的 dns_dropped 双计；防御性早返不该污染指标）。
         return;
     };
     if let Some(reply) = forge_dns_reply(&udp, fake_pool, now_secs) {
+        metrics.inc_dns_forged();
         device.inject_ip_packet(&reply);
         if let Err(e) = device.flush_tx().await {
             println!("DNS 劫持回包 flush 失败: {e}");
         }
+    } else {
+        // 不可解析查询：静默丢（forge_dns_reply 已记 app 重查自愈），计入 dns_dropped。
+        metrics.inc_dns_dropped();
     }
 }
 
@@ -2091,6 +2131,81 @@ mod tests {
         let r1 = forge_dns_reply(&parse_inbound_udp(&p1).unwrap(), &mut pool, 0).unwrap();
         let r2 = forge_dns_reply(&parse_inbound_udp(&p2).unwrap(), &mut pool, 1).unwrap();
         assert_eq!(reply_rdata_ip(&r1), reply_rdata_ip(&r2));
+    }
+
+    /// 最小 TunIo mock（刀11 T4）：只支持 `handle_dns_hijack` 用到的 `inject_ip_packet`（记录注入回包）
+    /// + `flush_tx`（no-op）；`Device` 超 trait 的 receive/transmit 在本测试路径不被调用 → 返 None。
+    #[derive(Default)]
+    struct DnsInjectRecorder {
+        injected: Vec<Vec<u8>>,
+    }
+    struct DeadToken;
+    impl smoltcp::phy::RxToken for DeadToken {
+        fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, _f: F) -> R {
+            unreachable!("mock 不产生 rx")
+        }
+    }
+    impl smoltcp::phy::TxToken for DeadToken {
+        fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, _len: usize, _f: F) -> R {
+            unreachable!("mock 不经 smoltcp transmit")
+        }
+    }
+    impl smoltcp::phy::Device for DnsInjectRecorder {
+        type RxToken<'a> = DeadToken;
+        type TxToken<'a> = DeadToken;
+        fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
+            smoltcp::phy::DeviceCapabilities::default()
+        }
+        fn receive(
+            &mut self,
+            _t: smoltcp::time::Instant,
+        ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+            None
+        }
+        fn transmit(&mut self, _t: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+            None
+        }
+    }
+    impl TunIo for DnsInjectRecorder {
+        async fn wait_for_rx(&mut self) -> std::io::Result<()> {
+            unreachable!("测试直调 handle_dns_hijack，不进 wait_for_rx")
+        }
+        fn rx_peek(&self) -> Option<&[u8]> {
+            None
+        }
+        fn rx_take(&mut self) -> Option<bytes::BytesMut> {
+            None
+        }
+        async fn flush_tx(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn inject_ip_packet(&mut self, pkt: &[u8]) {
+            self.injected.push(pkt.to_vec());
+        }
+    }
+
+    /// 刀11 T4：`handle_dns_hijack` 把 forge/drop 结局映射到 dns_forged/dns_dropped 计数。
+    #[tokio::test]
+    async fn handle_dns_hijack_counts_forge_and_drop() {
+        let metrics = Metrics::new();
+        let mut pool = FakeIpPool::new();
+        let mut dev = DnsInjectRecorder::default();
+        let app = (Ipv4Addr::new(10, 0, 0, 2), 50000);
+        let res = (Ipv4Addr::new(8, 8, 8, 8), 53);
+
+        // 可解析 A 查询 → forge++、注入一个回包。
+        let q = build_udp_ip_packet(app, res, &dns_query(1, "example.com", dns::QTYPE_A));
+        handle_dns_hijack(&q, &mut pool, &mut dev, 0, &metrics).await;
+        let s = metrics.snapshot(0, 0);
+        assert_eq!((s.dns_forged, s.dns_dropped), (1, 0));
+        assert_eq!(dev.injected.len(), 1, "forge 应注入一个回包");
+
+        // 不可解析 payload（截断）→ drop++、不注入。
+        let bad = build_udp_ip_packet(app, res, &[0u8; 4]);
+        handle_dns_hijack(&bad, &mut pool, &mut dev, 0, &metrics).await;
+        let s = metrics.snapshot(0, 0);
+        assert_eq!((s.dns_forged, s.dns_dropped), (1, 1), "drop 不增 forge");
+        assert_eq!(dev.injected.len(), 1, "drop 不注入");
     }
 
     /// 刀4：resolve_target 对加密 DNS 端点返回 Block，且精确不误伤普通 :443 / 零回归 Refuse。

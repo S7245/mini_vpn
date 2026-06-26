@@ -13,6 +13,7 @@
 
 use crate::client_tun::{MetricsSink, TunRuntimeConfig, run_event_loop};
 use crate::device::TunIo;
+use crate::metrics::Metrics;
 use crate::shared::ClientError;
 use crate::upstream::{DatagramUpstream, ProxyUpstream, RelayStream};
 
@@ -534,6 +535,7 @@ pub async fn run_tcp_scenario(params: ScenarioParams) -> Report {
         mock.clone(),
         downlink_rx,
         config,
+        Arc::new(Metrics::new()), // 刀11 T4：接线占位（T5 改 bind 并在 Report 暴露 snapshot）
         sink,
     ));
 
@@ -680,6 +682,7 @@ pub async fn run_udp_echo_scenario(datagrams: usize, payload_len: usize) -> UdpR
         mock.clone(),
         downlink_rx,
         config,
+        Arc::new(Metrics::new()), // 刀11 T4：接线占位（UDP scenario 不读 snapshot）
         RecordingSink::new(shared),
     ));
 
@@ -813,6 +816,7 @@ pub async fn run_udp_throughput_scenario(
         mock.clone(),
         downlink_rx,
         config,
+        Arc::new(Metrics::new()), // 刀11 T4：接线占位（UDP scenario 不读 snapshot）
         RecordingSink::new(shared),
     ));
 
