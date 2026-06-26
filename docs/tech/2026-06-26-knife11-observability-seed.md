@@ -1,6 +1,6 @@
 # 刀11 — 数据面可观测性（observability）seed / scope
 
-> 日期：2026-06-26 ｜ 状态：**grill 已完成，待新 session 冷启动接力（ground → spec → TDD → review → acceptance）**
+> 日期：2026-06-26 ｜ 状态：**✅ 代码完成 + 两轮 review 零 bug（spec/plan=同目录 `2026-06-26-knife11-observability-{spec,plan}.md`、ADR-0012；真出口 acceptance 待用户跑）。本文件为历史 seed，最终设计以 spec/ADR 为准。**
 > 起点：从 `main`（`927e009`，REALITY 刀6→10 收官后）起新分支，新 session（one knife per session）。
 > 原则：系统稳定 > 代码漂亮；**先量化、别凭猜改**（本刀正是为后续多线程/100M 性能工作铺量化底座）。
 

@@ -469,3 +469,45 @@ sudo -E bash scripts/knife35-acceptance.sh soak-stop       # 还原 DNS + 清路
 - 已知限制(本轮未触发):split-horizon/纯内网域名走出口解析、exotic 多 question 查询丢弃(不泄漏)、IPv6 :53 不劫持(crate ipv4-only)。
 
 **→ 刀5 完成**(代码 + 单测 + ADR-0007 + 真出口 acceptance)。`/code-review` high effort 零正确性 bug。
+
+## 刀11 — 数据面可观测性（observability）（2026-06-26，代码完成 + 两轮 review 零 bug；真出口 acceptance 待用户跑）
+
+**交付**（分支 `claude/knife11-observability`，从 main `6ba6d42` 起，逐 commit push；未合 main）：
+- 新 `src/metrics.rs`：进程级 `Arc<Metrics>`（原子）= 累计 counter（`inc_*` fetch_add Relaxed）+ 发布式 gauge
+  （`set_*` store）；`MetricsSnapshot` 纯值 Copy 契约（前端用，无 serde）；`note_pressure_edge` 纯沿 helper。
+- **counter**：DNS `dns_forged`/`dns_dropped`（`handle_dns_hijack`）、UDP 下行 `udp_drops_down`（start_udp accept-uni 溢出
+  + read_uni_packet None，**与上行 udp_drops 严格分离**）、`datagram_pressure_events`（背压 false→true 上升沿，task-local latch）、
+  `relays_spawned`（`spawn_remote_relay` 唯一入口，覆盖 inline TUIC + spawn 握手两路）。
+- **gauge**（loop 单写者 30s tick 重算后 store；snapshot load）：`active_relays`（socket_ctxs state==Relaying）、
+  `fake_ip_active`/`fake_ip_total`（`FakeIpPool::usage()`）、`failover_leg`（`upstream.failover_leg_u8()` trait 默认方法，
+  非 failover→NO_FAILOVER）。
+- **接口/发射**：run_event_loop 新 30s `metrics_tick` → `publish_gauges` → `snapshot` → **无门控**打统一 `📊` 行；
+  既有 start_udp 的 UDP-path `📊` 行（RTT/cwnd/背压）原样保留、各司其职（ADR-0012 §5，两条独立 30s interval）。
+- 设计文档：`docs/tech/2026-06-26-knife11-observability-{spec,plan}.md`；ADR `docs/adr/0012-data-plane-observability-metrics.md`；
+  CONTEXT.md 加 Metrics snapshot 词汇。
+
+**统一 `📊` 快照行格式**（run_event_loop，每 30s）：
+```
+📊 数据面: DNS forge=<n>/drop=<n> | TCP relay 活跃=<gauge>/累计=<n> | fake-IP 活跃=<g>/在册=<g> | UDP↓丢=<n> 背压=<n> | UDP↑丢=<n> stream兜底=<n> | leg=<TUIC|REALITY|->
+```
+
+**质量**：193 lib + harness 测全绿、`clippy --all-targets --features harness` 0 warning、release 绿。
+**两轮 review 零正确性 bug**：① 对抗式 review workflow（5 维度[并发/单写者·铁律·双计·热路径·简化] × 逐条对抗式核验，
+28 agent / default-refute）→ 23 findings 全判 not-a-bug；② `/code-review` high effort（8 角度）→ 仅 cleanup 建议（test mock
+样板、&Metrics threading、Arc clone 样板等），逐条权衡后**不动**（扩 blast radius / 耦合 feature gate / 纯偏好，稳定优先）。
+唯一「correctness-sounding」候选（snapshot 在 failover 切腿时混读上行计数）经核验**伪**——`FailoverUpstream::udp_drops_up`/
+`udp_stream_fallbacks` 恒转发 `self.tuic`（非 active_leg），UDP 恒绑 TUIC，不混腿。
+
+**测试分层（诚实）**：metrics/usage/trait/DNS-计数/publish_gauges/沿逻辑均纯单测（含并发 fetch_add 不丢）；
+harness 集成 `metrics_relays_spawned_tracks_load`（32 flow → relays_spawned≥完成数，复用 knife1 harness + 读末态 Arc<Metrics>）。
+**UDP 下行 drop / 背压的 I/O 触发点**（真 quinn accept_uni 溢出 / read None / datagram 缓冲将满）harness mock echo 不走 → 归真出口 acceptance。
+
+**真出口 acceptance 配方（待用户跑，尽力而为如实记录）**——无需新脚本，复用既有 soak，**观察新 `📊` 行随负载变化**：
+1. **failover_leg 翻转**：`sudo -E bash scripts/knife9-failover-acceptance.sh soak`（两腿）→ `📊 … leg=TUIC`；
+   `cut-tuic` → 切后 `📊 … leg=REALITY`；`restore-tuic` → 冷却后 `📊 … leg=TUIC`。
+2. **DNS forge / TCP relay / fake-IP**：soak 期间浏览 / `dig @8.8.8.8 …` / 并发 `curl` → `📊` 行 `DNS forge` 随查询↑、
+   `TCP relay 活跃/累计` 随并发↑、`fake-IP 活跃/在册` 随域名↑。
+3. **UDP 下行 drop / 背压**（难强制）：`scripts/knife35-acceptance.sh soak` 大码率 UDP（YouTube 4K / iperf3）→ 观察
+   `UDP↓丢` / `背压`；native+cubic 高保真链路下常为 0（刀3.5 已证 datagram 够用），若触发则如实记录。REALITY-only 模式记 UDP 项恒 0
+   （无 start_udp）。
+4. 判据：`📊` 行出现且各指标**随对应负载单调变化**（量化底座可信）→ 为后续「多线程逼近 100M」就位。

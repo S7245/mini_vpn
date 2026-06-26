@@ -31,11 +31,8 @@
   **acceptance**：server-initiated KeyUpdate 不可由客户端诱发、生产服务端极少发 → 以 T19 loopback（真 read/write 路径 + 真
   KeyUpdate + 双向轮换）为高保真替身；真出口 KeyUpdate 未触发，如实记录（brief §8 T20「尽力而为」）。spec=`docs/tech/2026-06-25-knife10-keyupdate-spec.md`，gap 收口见 ADR-0010。
   **刀8 泄漏凭据已服务端轮换（2026-06-26）——安全遗留项关闭。**
-- **REALITY mini-project（刀6→刀10）全部完成。下一刀=刀11 数据面可观测性（observability）**——用户选定（主线另一候选「数据面多线程逼近 100M」顺延）。
-  **grill 已完成**（2026-06-26）：广度=DNS forge 计数 + datagram drop/背压 + 统一数据面快照（TCP 活跃连接/relay + fake-IP 池用量 + failover 当班腿）；
-  接口=`MetricsSnapshot` struct（原子计数快照）喂 30s `📊` 日志 + 为 mini_vpn_app 前端预留可读契约。
-  **seed/scope（接缝指针 + 开放设计问题 + TDD 草案）= `docs/tech/2026-06-26-knife11-observability-seed.md`。**
-  **新 session 起点：从 `main`（`927e009` 后 HEAD）起新分支，冷启动接力 ground→spec→TDD→review→acceptance。**
+- **REALITY mini-project（刀6→刀10）全部完成。刀11 数据面可观测性（observability）代码完成（2026-06-26）**——见下「刀11 完成」。
+  **下一刀 = 主线「高带宽多线程逼近 100M」**（Rules ③ 主战场；刀11 量化底座已就位，可量化归因再上多线程）。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
 ## 目标（唯一北极星）：`Rules.md`
@@ -69,8 +66,8 @@
  ├─ 刀3.5 高码率 UDP（quinn 插桩 + CC 调优）  ✅ 完成 + 真出口 acceptance（见下「刀3.5」）；纠偏：5.3M「天花板」实为链路 cap 假象
  ├─ 刀4  连接成功率（拦截加密 DNS DoT/DoH/DoQ/DoH3）  ✅ 完成 + 真出口 acceptance（见下「刀4」）；first-SYN 已确认 knife2 修复、关闭
  ├─ 刀5  拦全:53 裸包 DNS 劫持（任意 resolver 明文→fake-IP，废 smoltcp DNS socket）  ✅ 完成 + 真出口 acceptance（见下「刀5」，ADR-0007）；已合 main
- ├─ 刀11 数据面可观测性（DNS forge 计数 + datagram drop/背压 + 统一快照 MetricsSnapshot）  ← **下一刀**（grill 完成，seed=`docs/tech/2026-06-26-knife11-observability-seed.md`）
- └─ （主线后续候选）高带宽多线程逼近 100M（Rules ③ 主战场，刀11 后量化底座就位再上）
+ ├─ 刀11 数据面可观测性（DNS forge 计数 + datagram drop/背压 + 统一快照 MetricsSnapshot）  ✅ **代码完成 + 两轮 review 零 bug**（真出口 acceptance 待用户跑，见下「刀11 完成」；未合 main）
+ └─ （主线下一刀）高带宽多线程逼近 100M（Rules ③ 主战场，**刀11 量化底座已就位**）  ← **下一刀**
 
 正交线 A（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）= VLESS+REALITY 第二 Transport（手写 TLS 1.3，ADR-0008）
  ├─ 刀6  REALITY auth 密码学 + TLS 1.3 ClientHello 构造（sans-IO，100% 离线 TDD）  ✅ 完成（见下「刀6」，ADR-0008）；已合 main
@@ -323,6 +320,29 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
   helper：**`scripts/knife9-failover-acceptance.sh`**（`soak`/`cut-tuic`/`restore-tuic`/`smoke`/`udp-check`/`status`/`soak-stop`；
   两腿 env + pfctl 按端口阻断 TUIC UDP 不碰 REALITY TCP）。流程印在 `soak` 末尾。
 - **deferred（刀10+）**：**F5 KeyUpdate 密钥轮换**（与 failover 主链零耦合、单独成刀；brief §6 有 V1 字节级核验的精确规范：label `"traffic upd"`/seq 归 0/收 update_requested 必回发且**旧 send key 先封装再换密钥**/`AppKeys` 已暴露 c/s_ap_secret）；UDP-over-VLESS；连接复用；指数退避；0x1302/0x1303。
+
+## 刀11 完成（2026-06-26）：数据面可观测性 — Arc<Metrics> + MetricsSnapshot 契约 + 30s 📊 快照
+
+**交付**（分支 `claude/knife11-observability`，从 main `6ba6d42` 起，逐 commit push；**未合 main**；主线量化底座）：
+- **设计输入**：grounding workflow（5 接缝并行核实）+ 设计综合（seed §4 五开放问题逐一裁决）→ spec/plan/ADR-0012。
+- **新 `src/metrics.rs`**：进程级 `Arc<Metrics>`（原子，唯一桥接 run_event_loop task ↔ TuicUpstream::start_udp task）=
+  累计 counter（`inc_*` fetch_add Relaxed）+ 发布式 gauge（`set_*` store；loop 30s tick 从单写者 socket_ctxs/fake_pool 重算后发布）；
+  `MetricsSnapshot` 纯值 Copy 契约（前端用，无 serde）；`note_pressure_edge` 纯沿 helper。**不扩 MetricsSink**（计时正交，NoopSink 仍零开销）。
+- **指标**：DNS `dns_forged`/`dns_dropped`（`handle_dns_hijack`，纯函数 `forge_dns_reply` 不碰）；UDP 下行 `udp_drops_down`
+  （accept-uni 溢出 + read None，**与上行 udp_drops 严格分离**）；`datagram_pressure_events`（背压 false→true 上升沿，task-local latch）；
+  `relays_spawned`（`spawn_remote_relay` 唯一入口）；gauge `active_relays`（state==Relaying）/`fake_ip_active`/`fake_ip_total`
+  （`FakeIpPool::usage()`）/`failover_leg`（`ProxyUpstream::failover_leg_u8()` 默认方法，非 failover→`NO_FAILOVER`）。
+- **发射**：run_event_loop 新 30s `metrics_tick` → `publish_gauges` → `snapshot` → **无门控**打统一 `📊` 行；既有 start_udp
+  UDP-path `📊` 行原样保留、各司其职（ADR-0012 §5）。
+- **质量**：193 lib + harness 测全绿、`clippy --all-targets --features harness` 0 warning、release 绿。**两轮 review 零正确性 bug**：
+  对抗式 review workflow（5 维度 × 逐条对抗式核验，28 agent / default-refute → 23 findings 全 not-a-bug）+ `/code-review` high effort
+  （8 角度 → 仅 cleanup 建议，逐条权衡后不动：扩 blast radius / 耦合 feature gate / 纯偏好，稳定优先）。
+- **设计文档**：`docs/tech/2026-06-26-knife11-observability-{spec,plan,seed}.md`；ADR-0012；CONTEXT.md「Metrics snapshot」词汇；
+  findings 末节「刀11」（含 `📊` 行格式 + acceptance 配方）。
+- **真出口 acceptance 待用户跑（尽力而为如实记录，无需新脚本）**：复用 `scripts/knife9-failover-acceptance.sh`（验 `leg=` 翻转）+
+  `scripts/knife35-acceptance.sh`（验 UDP↓丢/背压）+ soak 期间观察 `📊` 行随 DNS/并发/UDP 负载变化。详见 findings 末节「刀11」。
+- **deferred / 已知边界**：① UDP 下行 drop/背压的 I/O 触发点 harness mock 不覆盖 → 归 acceptance；② NODATA（AAAA）按 `Some=forge`
+  计入 `dns_forged`，如需区分留 `dns_nodata`（破纯性，defer）；③ 前端读取通道（IPC/local-control）留前端 session（本刀只导出 snapshot 值）。
 
 ## Rhythm（每刀都遵守）
 
