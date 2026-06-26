@@ -46,21 +46,23 @@ iperf3 -c <egress-reachable> -p <port> -t 60          # TCP，看隧道吞吐
 # B. 高带宽 UDP（推 native datagram 上/下行）：
 iperf3 -c <egress-reachable> -u -b 90M -l 1200 -t 60        # 上行
 iperf3 -c <egress-reachable> -u -b 90M -l 1200 -R -t 60     # 下行
-# C. 同时另开终端，OS 层抓 run_event_loop 所在线程 CPU%（交叉验证 in-process loop-active）：
-top -H -pid $(pgrep -n mini_vpn)      # 看线程级 CPU%
-#    或更细：sample $(pgrep -n mini_vpn) 5 -mayDie    # 5s 采样栈，看 CPU 热点在不在 iface.poll
+# C. 同时另开终端，OS 层交叉验证 CPU 热点（client 是 macOS，无 Linux `top -H`）：
+PID=$(pgrep -n mini_vpn)
+sample $PID 10 -mayDie          # 10s 采样调用栈：CPU 热点在不在 iface.poll / smoltcp（最有用）
+ps -M $PID                      # 列进程各线程（含每线程 CPU 时间）
+top -l 0 -pid $PID -stats pid,cpu,th   # 进程总 CPU% + 线程数（>100% = 多核；接近 100% 单核饱和迹象）
 ```
 
 **读什么**（每 5s 一条 `🔬`，取负载稳态的几条）：
 
 | 观测 | 裁决 |
 |---|---|
-| 吞吐封顶（卡某值 < 链路上限），`🔬` **loop-active ≳ 80% 且 poll 占大头**；`top -H` 某线程 ~100% | **#4 坐实**：单核 smoltcp poll 是墙 → 刀13 分片 |
-| 吞吐封顶，`🔬` **loop-active 偏低**（如 <40–50%），主循环大量 park；`top -H` 无单线程饱和 | **#3 坐实**：墙在单 QUIC 连接 CC / 路径 → 刀13 连接池 |
-| loop-active 高但 poll 不占大头（某非-poll arm 吃 CPU） | #4 家族但点不同 → 记 `iters`/各段占比，细化 |
+| 吞吐封顶（卡某值 < 链路上限），`🔬` **loop-active ≳ 80% 且 poll 占大头**；`sample` 热栈在 `iface.poll`/smoltcp | **#4 坐实**：单核 smoltcp poll 是墙 → 刀13 分片 |
+| 吞吐封顶，`🔬` **loop-active 偏低**（如 <40–50%），主循环大量 park；`sample` 热栈不在 poll（多在 quinn/IO 等待） | **#3 坐实**：墙在单 QUIC 连接 CC / 路径 → 刀13 连接池 |
+| loop-active 高但 poll 不占大头（某非-poll arm 吃 CPU） | #4 家族但点不同 → 记 `iters`/各段占比 + `sample` 热栈，细化 |
 
-> ⚠️ R1（spec §5）：多核 runtime 下 run_event_loop task 可在 worker 间迁移，`top -H` 单线程 CPU% 不严格
-> 对应该 task——**以 in-process `🔬` loop-active 为主**，`top -H`/`sample` 仅交叉验证 + 看热点是否在 iface.poll。
+> ⚠️ R1（spec §5）：多核 runtime 下 run_event_loop task 可在 worker 间迁移，OS 单线程 CPU% 不严格对应该 task
+> ——**以 in-process `🔬` loop-active 为主判据**，`sample`/`ps -M` 仅交叉验证 + 看 CPU 热点是否落在 `iface.poll`。
 
 ## 3. Probe ② — 单连接 CC scaling（证实/证伪 #3）
 
