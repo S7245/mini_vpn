@@ -70,7 +70,7 @@
  ├─ 刀5  拦全:53 裸包 DNS 劫持（任意 resolver 明文→fake-IP，废 smoltcp DNS socket）  ✅ 完成 + 真出口 acceptance（见下「刀5」，ADR-0007）；已合 main
  ├─ 刀11 数据面可观测性（DNS forge 计数 + datagram drop/背压 + 统一快照 MetricsSnapshot）  ✅ **完成（代码 + 两轮 review 零 bug + 真出口 acceptance ✅）+ 已 ff 合入 main `9de0604`**（见下「刀11 完成」）
  ├─ 刀12 多核逼近 100M：量化定位（quantify-only，LoopProfiler 仪器）  ✅ 完成 + 真出口归因（见下「刀12 完成」，ADR-0013）；**#4 实测推翻、取消分片**
- └─ （主线下一刀）**待定**——#3 连接池需低 RTT 胖链路再测；或「大并发 open churn」探针（见 ADR-0013 / 刀12 裁决）
+ └─ （主线下一刀）**领先候选=刀13 非阻塞上行发送**（消除跨流 head-of-line：阻塞 `tx.send().await` → `try_send`+留 smoltcp 背压；干净隧道实测挖出，见 ADR-0013「Update」）；#3 连接池留低 RTT 胖链路再测
 
 正交线 A（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）= VLESS+REALITY 第二 Transport（手写 TLS 1.3，ADR-0008）
  ├─ 刀6  REALITY auth 密码学 + TLS 1.3 ClientHello 构造（sans-IO，100% 离线 TDD）  ✅ 完成（见下「刀6」，ADR-0008）；已合 main
@@ -368,12 +368,18 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
   - **当前墙是 WAN 跨太平洋路径**（单流 ~22M / 并行聚合 ~46M、重传一次达 63509、RTT 限）→ **100M 此路物理不可达**，
     客户端在任何可达负载下接近空闲（loop-active 多 0.1%、park 99.9%）。
   - 唯一 on-loop 成本是**建连瞬态的 relay 段**（P=4 setup 窗口 relay=66%/poll=3.8%）→ 若主循环有瓶颈是 relay 调度/inline open，非 poll。
-  - **诚实 gap**：两次 60s 跑流量**绕过隧道**（`📊 TCP relay 累计=0`——client 重启换 utun 号 → 旧 route 失效回落 en0）→ 隧道满载
-    稳态 `🔬` 是推断非干净实测（不削弱 #4 推翻）。`📊 relay 累计`（刀11）是抓出绕隧道的功臣。
-- **裁决（ADR-0013）→ 刀13**：**取消事件循环分片（route a）**（分片 99% 空闲循环无意义——quantify-only 挡掉一次伪瓶颈重构）；
-  **#3 连接池**留**低 RTT 胖链路**（同区域出口）再测、此前可能无用；**新候选轴**=「大并发 open churn」探针（relay 段若饱和则 inline open
-  移出主循环，与吞吐正交，本刀未测）。`LoopProfiler` 留作随时复测 #4/#3 的工具。
-- **deferred / 可选**：启动首条 `🔬`（`wall≈0ms` tokio interval 首 tick）退化、无害，可选 1 行 guard 跳过。
+  - **早先绕过隧道**（裸跑 client-tun 不配路由 → 流量走 en0；`curl ipinfo.io` 显示本地 IP 是金标准症状）。
+- **🔑 干净隧道实测（2026-06-27，`soak` 路由修好，44.5M 隧道）→ 裁决站得住 + 挖出 HoL bug（ADR-0013「Update」）**：
+  稳态 `🔬` = **loop-active≈93% / poll≈8% / relay≈81% / park≈7%**。读代码坐实：上行 `tx.send().await`（有界 1024 channel，
+  client_tun.rs:1350）在 QUIC 上游拥塞时**阻塞主循环等上游** → relay=81% 是**背压等待非 CPU**，poll=8% 是真 CPU。
+  **主循环 upstream-bound 非 CPU-bound，墙仍是 QUIC 上游/WAN（#3），裁决不翻。** 仪器局限：loop-active 混 CPU 与 arm 内
+  `.await` 背压（纯 CPU 需 OS `sample`，预期低 CPU=背压坐实）。**真 bug**：阻塞上行使一条拥塞慢流 **HoL 阻塞整个事件循环**
+  （大并发混合流下慢流拖死快流）。
+- **裁决（ADR-0013）→ 刀13**：**取消事件循环分片（route a）**（loop 非 CPU-bound，分片无用）；**#3 连接池**留**低 RTT 胖链路**再测；
+  **🔑 领先候选 = 非阻塞上行发送**（`try_send`+满则留 smoltcp 数据+保持 dirty，靠 TCP 窗口端到端背压，主循环永不阻塞、消除跨流
+  HoL；便宜、对症、不破无锁单写者，直接服务 Rules ③）。`LoopProfiler` 留作随时复测 #4/#3 工具。
+- **deferred / 可选**：① 启动首条 `🔬`（`wall≈0ms` tokio interval 首 tick）退化——**已加 guard 跳过**（commit `33d9418`）；
+  ② OS `sample` 压测期线程 CPU 确认背压（盖棺 #3 vs #4，强代码推断已足）。
 
 ## Rhythm（每刀都遵守）
 

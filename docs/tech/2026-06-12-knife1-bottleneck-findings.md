@@ -588,3 +588,19 @@ harness 多核就绪 spike 证仪器正确（注入 on-loop CPU → loop-active 
 - 启动首条 `🔬` 退化（`wall≈0ms`，tokio interval 首 tick 立即触发）——无害，忽略首行；可选 1 行 guard 跳过。
 
 **→ 刀12 quantify-only 完成**（仪器 + review + 真出口归因 → #4 证伪 / WAN 受限 / 取消分片 / #3 留胖链路）。**未做任何多核重构，是基于证据的正确决定。**
+
+### 刀12 续 — 第一个「干净隧道」实测（2026-06-27，裁决站得住 + 挖出 HoL bug）
+
+早先「绕过隧道」用 `soak`（全局路由+DNS）修好后，首次真进隧道（`📊 TCP relay 累计` 1→22，iperf `-P 4` =
+**44.5M / 613 重传** vs 直连 26M/63509）拿到稳态 `🔬`：**loop-active≈92–93% / poll≈8% / relay≈81% / park≈7%**。
+乍看像主循环饱和，**实为读 `handle_local_payload`（client_tun.rs:1350）代码后坐实**：上行是**阻塞** `tx.send().await`
+（有界 1024 channel），QUIC 上游被高 RTT 限速时 channel 满 → **主循环卡在 `send().await` 等上游**。故：
+- **poll=8% 是真 CPU**（smoltcp poll 不等上游）→ 处理 44.5M 仅 8% CPU，**#4-as-poll 再次坐实证伪**。
+- **relay=81% 主要是背压等待非 CPU**（loop 阻塞等慢上游排空上行队列）→ **主循环 upstream-bound 非 CPU-bound，墙仍是
+  QUIC 上游/WAN（#3），裁决站得住、不翻**。
+- **仪器局限**：`loop-active=1−park/wall` 把「CPU 忙」与「arm 内 `.await` 背压等待」混在一起，纯 CPU 需 OS 线程
+  `sample`（压测期低 CPU + 热栈停 `tx.send`/channel await = 背压坐实；高 CPU 停 `process_dirty_relay` 才是 #4）。
+- **🔑 挖出真 loop bug（刀13 领先候选）**：阻塞上行 `send().await` 使**一条拥塞慢流 head-of-line 阻塞整个事件循环**
+  （其它流上行 / 下行回程 / 5ms 定时器 / DNS 全卡）。iperf 4 条同质流看不出，**大并发混合流下慢流拖死快流**——正打中
+  Rules ③。**刀13 候选**：上行改**非阻塞** `try_send`，满了**不取 smoltcp 数据、留 socket rx + 保持 dirty**，靠 smoltcp
+  TCP 窗口端到端背压，主循环永不阻塞、消除跨流 HoL；比分片/连接池便宜且对症、不破无锁单写者模型。详见 ADR-0013「Update」段。
