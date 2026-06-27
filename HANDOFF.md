@@ -70,7 +70,7 @@
  ├─ 刀5  拦全:53 裸包 DNS 劫持（任意 resolver 明文→fake-IP，废 smoltcp DNS socket）  ✅ 完成 + 真出口 acceptance（见下「刀5」，ADR-0007）；已合 main
  ├─ 刀11 数据面可观测性（DNS forge 计数 + datagram drop/背压 + 统一快照 MetricsSnapshot）  ✅ **完成（代码 + 两轮 review 零 bug + 真出口 acceptance ✅）+ 已 ff 合入 main `9de0604`**（见下「刀11 完成」）
  ├─ 刀12 多核逼近 100M：量化定位（quantify-only，LoopProfiler 仪器）  ✅ 完成 + 真出口归因（见下「刀12 完成」，ADR-0013）；**#4 实测推翻、取消分片**
- └─ （主线下一刀）**领先候选=刀13 非阻塞上行发送**（消除跨流 head-of-line：阻塞 `tx.send().await` → `try_send`+留 smoltcp 背压；干净隧道实测挖出，见 ADR-0013「Update」）；#3 连接池留低 RTT 胖链路再测
+ └─ （主线下一刀）**刀13 候选**（sample 实测定，ADR-0013「Update」）：①最便宜=**删/门控热路径 `println!`**（sample 揪出 loop 头号 on-CPU）②结构性=**非阻塞上行发送**（消除跨流 HoL）；#3 连接池留低 RTT 胖链路再测
 
 正交线 A（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）= VLESS+REALITY 第二 Transport（手写 TLS 1.3，ADR-0008）
  ├─ 刀6  REALITY auth 密码学 + TLS 1.3 ClientHello 构造（sans-IO，100% 离线 TDD）  ✅ 完成（见下「刀6」，ADR-0008）；已合 main
@@ -373,13 +373,15 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
   稳态 `🔬` = **loop-active≈93% / poll≈8% / relay≈81% / park≈7%**。读代码坐实：上行 `tx.send().await`（有界 1024 channel，
   client_tun.rs:1350）在 QUIC 上游拥塞时**阻塞主循环等上游** → relay=81% 是**背压等待非 CPU**，poll=8% 是真 CPU。
   **主循环 upstream-bound 非 CPU-bound，墙仍是 QUIC 上游/WAN（#3），裁决不翻。** 仪器局限：loop-active 混 CPU 与 arm 内
-  `.await` 背压（纯 CPU 需 OS `sample`，预期低 CPU=背压坐实）。**真 bug**：阻塞上行使一条拥塞慢流 **HoL 阻塞整个事件循环**
-  （大并发混合流下慢流拖死快流）。
+  `.await` 背压（纯 CPU 需 OS `sample`）。**真 bug**：阻塞上行使一条拥塞慢流 **HoL 阻塞整个事件循环**（大并发混合流下慢流拖死快流）。
+- **🔑 OS `sample` 确认（2026-06-27，压测期）→ 裁决锁死 + 挖出 println**：栈采样 top `__psynch_cvwait 29149/kevent 7283`
+  （parked/空等）压倒，真 CPU 极小（smoltcp poll 仅 17）→ **进程非 CPU-bound、#4 二次证伪、#3 锁死**。**💎 主循环 #1 on-CPU
+  成本=热路径 `println!`**（`process_listener_activity→_print→write` ~183 采样；`📬` 行 client_tun.rs:658 等）远超 poll(17)——
+  22000 事件/秒每次阻塞 write、纯浪费 + 加重 HoL。
 - **裁决（ADR-0013）→ 刀13**：**取消事件循环分片（route a）**（loop 非 CPU-bound，分片无用）；**#3 连接池**留**低 RTT 胖链路**再测；
-  **🔑 领先候选 = 非阻塞上行发送**（`try_send`+满则留 smoltcp 数据+保持 dirty，靠 TCP 窗口端到端背压，主循环永不阻塞、消除跨流
-  HoL；便宜、对症、不破无锁单写者，直接服务 Rules ③）。`LoopProfiler` 留作随时复测 #4/#3 工具。
-- **deferred / 可选**：① 启动首条 `🔬`（`wall≈0ms` tokio interval 首 tick）退化——**已加 guard 跳过**（commit `33d9418`）；
-  ② OS `sample` 压测期线程 CPU 确认背压（盖棺 #3 vs #4，强代码推断已足）。
+  **🔑 刀13 候选（cheap→结构性）**：①**删/门控热路径 println**（最便宜、干掉 loop 头号 on-CPU + 每事件一次阻塞 write）
+  ②**非阻塞上行发送**（`try_send`+满则留 smoltcp+保持 dirty，端到端 TCP 背压，消除跨流 HoL，服务 Rules ③）。`LoopProfiler` 留作复测工具。
+- **deferred / 可选**：启动首条 `🔬`（`wall≈0ms` tokio interval 首 tick）退化——**已加 guard 跳过**（commit `33d9418`）。
 
 ## Rhythm（每刀都遵守）
 

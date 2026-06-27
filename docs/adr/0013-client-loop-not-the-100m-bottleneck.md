@@ -57,6 +57,27 @@ targeted than event-loop sharding or a connection pool; it treats the loop-seria
 touching the no-lock single-writer model. (Aggregate throughput on a given path is still upstream/WAN
 bound — this fix removes cross-flow head-of-line stalling, not the per-connection CC ceiling.)
 
+### Sample confirms it (2026-06-27, `sample <pid> 10` during the 44.5M tunneled load) — verdict locked
+
+Whole-process stack sample, "sort by top of stack": **`__psynch_cvwait` 29149 / `kevent` 7283** (threads
+parked / event-loop idle) utterly dominate; actual CPU is tiny — `write` 263, `__sendmsg` 137, `read` 77,
+**`smoltcp::Interface::poll` only 17**, `process_dirty_relay` 10. **So the process is NOT CPU-bound; the
+loop is parked waiting on the congested upstream (#3). #4 (poll-CPU) is refuted twice over — verdict
+locked.** The `🔬 relay=81%` is the loop blocked in `send().await`, which shows as `cvwait`/idle here.
+
+**💎 The sample also found the loop's #1 *on-CPU* cost — hot-path `println!`.** The fattest run-loop stack
+is `process_listener_activity → std::io::stdio::_print → write_all → write` (~183 samples in the `write`
+syscall), i.e. debug logging in the relay hot path (`handle_remote_payload`'s `📬 从大邮筒收到…`,
+src/client_tun.rs:658, and siblings) — far above smoltcp poll (17). At ~22 000 relay events/s this is one
+blocking `write` syscall per event (to the redirected log under `soak`), pure waste that also adds to the
+head-of-line stalling. The "no hot-path println" discipline (device.rs comment) has leftover violators.
+
+**→ Reprioritised 刀13 targets (cheap → structural):**
+1. **Remove/gate the hot-path `println!`s** (the `📬` line + the relay-path debug prints). The loop's
+   single biggest on-CPU cost and an extra blocking syscall per relay event — a few lines, high value.
+2. **Non-blocking uplink send** (the structural head-of-line fix above).
+3. Aggregate throughput stays WAN/#3-bound; a connection pool only helps on a fat low-RTT path.
+
 ## Measurement
 
 `MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS=5`, iperf3 `-c 47.77.215.177` over the client, 1/4/8
@@ -120,8 +141,9 @@ client's true CPU ceiling is not observable here.
   `-P 4` attempts had the iperf traffic **bypass the tunnel** (`TCP relay 累计=0` throughout). **RESOLVED
   2026-06-27** — a `soak`-routed run (`TCP relay 累计` 1→22, 44.5M tunneled) gave the clean sustained
   reading; see the **Update** section. It confirmed the verdict (poll ~8%, loop upstream-bound) and found
-  the head-of-line bug. The one remaining confirmation is an OS thread-CPU `sample` during load (expected
-  low CPU = back-pressure, not #4).
+  the head-of-line bug. **The OS `sample` confirmation is also done** (see Update §"Sample confirms it"):
+  process dominated by `cvwait`/`kevent` idle, smoltcp poll only 17 samples → loop not CPU-bound, #3
+  locked; and it surfaced hot-path `println!` as the loop's top on-CPU cost.
 - **Root cause of the bypass (important for future probes):** running the bare
   `./target/release/mini_vpn client-tun` only builds the utun device + the TUIC connection — it does
   **not** configure macOS routing/DNS, so all traffic still exits via `en0` directly and never enters the

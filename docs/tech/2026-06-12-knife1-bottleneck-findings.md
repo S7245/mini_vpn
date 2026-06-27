@@ -604,3 +604,12 @@ harness 多核就绪 spike 证仪器正确（注入 on-loop CPU → loop-active 
   （其它流上行 / 下行回程 / 5ms 定时器 / DNS 全卡）。iperf 4 条同质流看不出，**大并发混合流下慢流拖死快流**——正打中
   Rules ③。**刀13 候选**：上行改**非阻塞** `try_send`，满了**不取 smoltcp 数据、留 socket rx + 保持 dirty**，靠 smoltcp
   TCP 窗口端到端背压，主循环永不阻塞、消除跨流 HoL；比分片/连接池便宜且对症、不破无锁单写者模型。详见 ADR-0013「Update」段。
+
+**OS `sample` 确认（2026-06-27，压测期 `sample <pid> 10`）——裁决锁死 + 挖出 println**：进程栈采样 top-of-stack
+`__psynch_cvwait 29149 / kevent 7283`（线程 parked/空等）压倒一切，真 CPU 极小——`write 263 / __sendmsg 137 /
+read 77 / smoltcp poll 仅 17 / process_dirty_relay 10`。**→ 进程非 CPU-bound、主循环 parked 等上游，#4 二次证伪、#3 锁死**
+（`🔬 relay=81%` = parked 在 `send().await`，sample 里表现为 cvwait）。**💎 sample 还揪出主循环 #1 on-CPU 成本=热路径
+`println!`**：最粗 run-loop 栈是 `process_listener_activity → _print → write`（~183 采样在 write 系统调用），即 relay 热路径
+调试日志（`handle_remote_payload` 的 `📬` 行 client_tun.rs:658 等）远超 smoltcp poll（17）。22000 事件/秒每次一个阻塞 write
+（soak 下写日志文件）——纯浪费 + 加重 HoL。**刀13 重排序**：① 删/门控热路径 println（最便宜、干掉 loop 头号 on-CPU）② 非阻塞上行
+send（结构性 HoL 修复）③ 吞吐=WAN/#3、连接池仅低 RTT 胖链路有用。
