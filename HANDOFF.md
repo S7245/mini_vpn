@@ -32,7 +32,7 @@
   KeyUpdate + 双向轮换）为高保真替身；真出口 KeyUpdate 未触发，如实记录（brief §8 T20「尽力而为」）。spec=`docs/tech/2026-06-25-knife10-keyupdate-spec.md`，gap 收口见 ADR-0010。
   **刀8 泄漏凭据已服务端轮换（2026-06-26）——安全遗留项关闭。**
 - **REALITY mini-project（刀6→刀10）全部完成。刀11 数据面可观测性（observability）✅ 全部完成 + 已 ff 合入 main `9de0604`（2026-06-26，代码 + 两轮 review 零 bug + 真出口 acceptance ✅）**——见下「刀11 完成」。
-  **刀12（多核逼近 100M，quantify-only）已完成**（分支 `claude/knife12-multicore-100m`，未合 main；见下「刀12 完成」）——
+  **刀12（多核逼近 100M，quantify-only）已完成 + 已 ff 合入 main `68b5e56`（2026-06-27）**（见下「刀12 完成」）——
   LoopProfiler 仪器 + 真出口归因 → **#4（单核 smoltcp poll = 天花板）实测推翻、取消事件循环分片**；当前墙是 WAN 跨太平洋路径，
   100M 此路不可达；#3 连接池留低 RTT 胖链路再测（ADR-0013）。**下一刀待定**（见 ADR-0013「Consequences」）。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
@@ -353,7 +353,7 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
 
 ## 刀12 完成（2026-06-27）：多核逼近 100M 量化定位 — LoopProfiler + 真出口归因（quantify-only）
 
-**交付**（分支 `claude/knife12-multicore-100m`，从 main `460a349` 起，逐 commit push；**未合 main**；**纯量化、零热路径行为改动**）：
+**交付**（分支 `claude/knife12-multicore-100m`，从 main `460a349` 起，逐 commit push；**已 ff 合入 main `68b5e56`（2026-06-27）**；**纯量化、零热路径行为改动**）：
 - **设计输入**：grill 拍板「量化-only + ADR 定瓶颈」（非「量化+干预」）；understand workflow（5 接缝并行深挖 + 路线可行性综合）。
   spec/plan/acceptance：`docs/tech/2026-06-26-knife12-multicore-quantify-{spec,plan}.md` + `2026-06-26-knife12-acceptance-checklist.md`。
 - **`LoopProfiler`**（新 `src/loop_profiler.rs`）：knife1 `MetricsSink` **计时**接缝的生产实现，量主循环 **poll/relay/loop-active**
