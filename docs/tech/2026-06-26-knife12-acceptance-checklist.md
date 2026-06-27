@@ -29,8 +29,18 @@ sudo -E MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS=5 \
 
 - 连上应见启动行 `🔬 主循环 profiler 已启用（… 每 5s；MINI_VPN_PROFILE_LOOP）`（**确认透传**——
   教训同刀11：`sudo -E` + 显式 env 才透传；若启动行显示「每 30s」则 env 没透进去，重设）。
+- **⚠️ 必用 `soak`（全局路由 + DNS 劫持），不要裸跑 `./mini_vpn client-tun`**——裸二进制只建 utun + TUIC，
+  **不配 macOS 路由/DNS**，流量仍从 en0 直连、压根不进隧道（这是刀12 所有「绕过隧道」跑的根因）。
+- **★ 金标准验证「是否真进隧道」——压测前必做：**
+  ```bash
+  curl ipinfo.io            # 必须显示美国 VPS 出口 IP，不是深圳本地 IP（深圳 IP = 没进隧道，全部作废）
+  dig example.com +short    # 应是 198.18.x.x（fake-IP）
+  ```
+  > `curl ipinfo.io` 比 `📊 TCP relay 累计` 更直接：显示本地（深圳）IP = 流量绕过隧道，任何吞吐/丢包数
+  > 都是在量**裸路径、不是 mini_vpn**（之前那些重传是裸跨太平洋路径的丢包，与 mini_vpn 无关）。
 - **链路铁律**：出口链路 **≥100M**（否则 100M 处链路 cap 与 #3 缠绕、污染判读）。靠 `-b` 控码率压到 80–100M。
-- 受控目标 IP 直连绕 fake-IP：`sudo route -n add -host <target_ip> -interface utunX`。
+- 受控目标若要 IP 直连绕 fake-IP：`sudo route -n add -host <target_ip> -interface utunX`——**但 client 重启会
+  让 utun 改号使该路由失效**（fragile），优先靠 `soak` 的全局路由 + `curl ipinfo.io` 验证。
 - 收尾：`sudo -E bash scripts/knife35-acceptance.sh soak-stop`（还原 DNS/路由）。
 
 ## 2. Probe ① — poll-fraction 归因（#4 vs #3，主判据）

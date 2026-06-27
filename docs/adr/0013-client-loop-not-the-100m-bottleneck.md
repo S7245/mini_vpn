@@ -65,11 +65,22 @@ client's true CPU ceiling is not observable here.
 ## Honest gaps (尽力而为如实记录)
 
 - A clean **sustained tunneled-at-path-max** `🔬` reading was **not** captured: two 60s `-P 4` attempts
-  had the iperf traffic **bypass the tunnel** (`TCP relay 累计=0` throughout — client restart changed the
-  utun number, leaving a stale `route ... -interface utunX` that fell back to the default route). The
-  tunneled evidence is from shorter, setup-contaminated windows. This does **not** weaken the #4
-  refutation (poll is negligible in every tunneled window observed), but the loop's *steady-state*
-  occupancy at the ~46M path-max is **inferred, not cleanly measured**.
+  had the iperf traffic **bypass the tunnel** (`TCP relay 累计=0` throughout). The tunneled evidence is
+  from shorter, setup-contaminated windows. This does **not** weaken the #4 refutation (poll is
+  negligible in every tunneled window observed), but the loop's *steady-state* occupancy at the ~46M
+  path-max is **inferred, not cleanly measured**.
+- **Root cause of the bypass (important for future probes):** running the bare
+  `./target/release/mini_vpn client-tun` only builds the utun device + the TUIC connection — it does
+  **not** configure macOS routing/DNS, so all traffic still exits via `en0` directly and never enters the
+  utun. The `scripts/knife35-acceptance.sh soak` helper (global route + plaintext-DNS hijack) is what
+  actually steers traffic into the tunnel; a manual `route -host <ip> -interface utunX` is fragile (a
+  client restart renumbers the utun, leaving the route stale → fallback to the default route).
+- **The gold-standard "am I tunneled?" check is `curl ipinfo.io` — it must report the US exit IP, not the
+  client's local (深圳) IP.** Simpler and more direct than the `📊 TCP relay 累计` counter; a local IP
+  means traffic is bypassing the tunnel and any throughput/loss numbers are measuring the **bare path,
+  not mini_vpn** (so the heavy iperf retransmits seen were the raw trans-Pacific internet path's loss,
+  not the client's). Always verify `curl ipinfo.io` (and `dig <domain> +short` → a `198.18.x.x` fake-IP)
+  **before** any throughput probe.
 - The `📊 TCP relay 累计` counter (刀11) was the load-bearing signal that caught the bypass — without it
   the idle `🔬` would have been misread as "loop idle under tunneled load."
 - Cosmetic: the first `🔬` line after startup shows a degenerate `wall≈0ms / loop-active≈99%` (tokio
