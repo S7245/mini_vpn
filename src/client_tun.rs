@@ -31,6 +31,35 @@ const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(9
 /// 刀11：数据面可观测性快照周期（30s，对齐 TuicUpstream UDP_STATS_LOG_SECS）。仅周期采样/打印，不进热路径。
 const METRICS_SNAPSHOT_SECS: u64 = 30;
 
+/// 刀13 ①：解析 `MINI_VPN_TRACE`（`1`/`true`，去空白、不区分大小写 → 开；其它/缺省 → 关）。
+/// 对齐 [`parse_profile_loop`] 惯用法；抽纯函数便于单测（`trace_enabled` 只是它 + `OnceLock` 包壳）。
+fn parse_trace(s: Option<&str>) -> bool {
+    matches!(
+        s.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+/// 刀13 ①：热路径诊断日志总开关。**只读一次** env 缓存进 `OnceLock`——门控的是每包/每连接路径
+/// （刀12 OS sample 实锤 `_print → write` 是主循环 #1 on-CPU 成本，22000 事件/秒），绝不能像 reality 的
+/// `rdbg!` 那样每次调用一次 env syscall。默认关 → 主循环热路径零 stdout。
+fn trace_enabled() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| parse_trace(std::env::var("MINI_VPN_TRACE").ok().as_deref()))
+}
+
+/// 刀13 ①：热路径诊断 `println!` 门控宏——`trace_enabled()` 为真才打印（默认静默；翻 `MINI_VPN_TRACE=1`
+/// 全恢复，零信息损失）。保留 `println!`（stdout，acceptance 重定向到日志）语义不变。**仅门控每包/每连接/
+/// churn 噪声**；启动/错误/周期 📊/acceptance 依赖信号（🪪 DNS / 🛡️ 阻断 / spawn 握手）/run_relay
+/// lifecycle 仍用裸 `println!`（见 `docs/tech/2026-06-27-knife13-loop-hotpath-spec.md` §1.2 门控清单）。
+macro_rules! trace_log {
+    ($($arg:tt)*) => {
+        if trace_enabled() {
+            println!($($arg)*);
+        }
+    };
+}
+
 /// 主循环分段插桩接缝（knife1：并发压测定位瓶颈）。
 ///
 /// 中文要点：生产传 [`NoopSink`]（空方法，单态化内联后**零开销**，热路径无 `Instant::now()`）；
@@ -273,7 +302,7 @@ impl ListenerRegistry {
             handles.push(h);
         }
         self.total += self.pool_size;
-        println!(
+        trace_log!(
             "🆕 listener pool created for port {port} (pool_size={})",
             self.pool_size
         );
@@ -724,7 +753,7 @@ pub async fn run_event_loop<D, U, M>(
             //   TUIC 自重连（live_conn），不需要 legacy 的 disconnect/复位分支。
             Some((handle, payload)) = global_rx.recv() =>{
                 metrics.loop_park_end();
-                println!("📬 从大邮筒收到 {} 字节数据，准备送往房间 {:?}", payload.len(), handle);
+                trace_log!("📬 从大邮筒收到 {} 字节数据，准备送往房间 {:?}", payload.len(), handle);
                 if let Err(e) = handle_remote_payload(
                     handle,
                     payload,
@@ -737,7 +766,7 @@ pub async fn run_event_loop<D, U, M>(
                 )
                 .await
                 {
-                    println!("处理回程数据失败: {e}");
+                    trace_log!("处理回程数据失败: {e}");
                 }
                 // #1：回程写不下的下行字节留在 downlink_pending（tx buffer 满）→ 标脏，
                 // 让 relay 段后续 tick 持续 flush，直到排空才出集（绝不丢字节）。
@@ -871,11 +900,11 @@ pub async fn run_event_loop<D, U, M>(
                             device.inject_ip_packet(&pkt);
                             assoc_table.touch(assoc_id, udp_clock.elapsed().as_secs());
                             if let Err(e) = device.flush_tx().await {
-                                println!("UDP 下行 flush 失败: {e}");
+                                trace_log!("UDP 下行 flush 失败: {e}");
                             }
                         } else {
                             // assoc 已回收/未知 → 丢弃该回程(应用会重发/重查,自愈)。
-                            println!("🗑️ TUIC UDP↓ assoc={assoc_id} 无映射，丢弃 {}B", payload.len());
+                            trace_log!("🗑️ TUIC UDP↓ assoc={assoc_id} 无映射，丢弃 {}B", payload.len());
                         }
                     }
                 }
@@ -987,7 +1016,7 @@ async fn process_dirty_relay<U, M>(
         )
         .await
         {
-            println!("处理本地房间 {:?} 失败: {e}", handle);
+            trace_log!("处理本地房间 {:?} 失败: {e}", handle);
         }
         let still_active = {
             let has_recv = sockets.get_mut::<TcpSocket>(handle).can_recv();
@@ -1239,7 +1268,7 @@ fn rearm_socket(
     ctx.state = SocketState::Rearming;
     socket.listen(ctx.local_port).unwrap();
     ctx.state = SocketState::Listening;
-    println!("♻️ handle slot rearmed on local port {}", ctx.local_port);
+    trace_log!("♻️ handle slot rearmed on local port {}", ctx.local_port);
 }
 
 /// Process one listener slot after iface polling.
@@ -1283,7 +1312,7 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
     let (target, fake_ip) = match resolve_target(endpoint, fake_pool) {
         TargetResolve::Direct { target, fake_ip } => (target, fake_ip),
         TargetResolve::Refuse => {
-            println!(
+            trace_log!(
                 "🚫 fake-IP {} 无映射，拒绝连接（请重新解析）",
                 endpoint.addr
             );
@@ -1348,7 +1377,7 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
 
     // 已建立 relay：直接转发上行（不变）。
     if let Some(tx) = ctx.uplink_tx.as_mut() {
-        println!("🔄 handle {:?} entering {:?}", handle, ctx.state);
+        trace_log!("🔄 handle {:?} entering {:?}", handle, ctx.state);
         tx.send(payload)
             .await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "本地中继通道已关闭"))?;
@@ -1359,7 +1388,7 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
     // 刀9 M3：spawn 握手在飞中 → 后续上行包入 buffer（防双开 + 保序），不再开第二次握手。
     if ctx.state == SocketState::HandshakePending {
         if !ctx.buffer_uplink(&payload) {
-            println!(
+            trace_log!(
                 "⚠️ handle {:?} 握手在飞、上行缓存超上限({}KB)，丢弃 {}B（应用 TCP 背压自愈）",
                 handle,
                 MAX_UPLINK_BUFFER / 1024,
@@ -1372,17 +1401,17 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
     // 首次开远端必须有提取出的 Target；理论上首包时连接已 Established，local_endpoint 不应为 None。
     // 中文要点：缺 Target 时记录并跳过，绝不 panic、绝不退回写死地址。
     let Some(target) = target else {
-        println!("⚠️ handle {:?} 无 local_endpoint，跳过开远端", handle);
+        trace_log!("⚠️ handle {:?} 无 local_endpoint，跳过开远端", handle);
         return Ok(());
     };
 
     if upstream.open_is_cheap() {
         // —— 廉价上游（TUIC：复用 QUIC 连接 open_bi）：inline 开远端（刀2 行为，**零回归**）。——
         ctx.state = SocketState::OpeningRemote;
-        println!("🎯 handle {:?} extracted target {}", handle, target.to_wire_string());
-        println!("🔄 handle {:?} entering {:?}", handle, ctx.state);
+        trace_log!("🎯 handle {:?} extracted target {}", handle, target.to_wire_string());
+        trace_log!("🔄 handle {:?} entering {:?}", handle, ctx.state);
         let stream = upstream.open_tcp(&target).await?;
-        println!("🚪 handle {:?} remote session opened", handle);
+        trace_log!("🚪 handle {:?} remote session opened", handle);
 
         let (tx, rx) = tokio::sync::mpsc::channel(RELAY_CHANNEL_CAPACITY);
         tx.send(payload)
@@ -1411,7 +1440,7 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
         }
         if !ctx.buffer_uplink(&payload) {
             // 理论不可达（spawn 入口 buffer 必空、首包 << 256KB）；防御性对称上面 HandshakePending 分支。
-            println!("⚠️ handle {:?} spawn 入口缓存首包失败（{}B），丢弃", handle, payload.len());
+            trace_log!("⚠️ handle {:?} spawn 入口缓存首包失败（{}B），丢弃", handle, payload.len());
         }
         println!("🎯 handle {:?} target {} → spawn 握手（并发化，不 stall 主循环）", handle, target.to_wire_string());
 
@@ -1445,7 +1474,7 @@ fn handle_handshake_done(
     // 迟到的握手结果丢弃，绝不装到新一代 socket。Ok 的流随作用域结束 drop 而干净关闭。
     if ctx.conn_epoch != epoch {
         if result.is_ok() {
-            println!("🗑️ handle {:?} 迟到握手结果(epoch {epoch}≠{}) 丢弃，不装到新代 socket", handle, ctx.conn_epoch);
+            trace_log!("🗑️ handle {:?} 迟到握手结果(epoch {epoch}≠{}) 丢弃，不装到新代 socket", handle, ctx.conn_epoch);
         }
         return;
     }
@@ -1462,7 +1491,7 @@ fn handle_handshake_done(
             if !ctx.uplink_buffer.is_empty() {
                 let buffered = std::mem::take(&mut ctx.uplink_buffer);
                 if let Err(e) = tx.try_send(buffered) {
-                    println!("❌ handle {:?} flush 握手缓存失败({e}) → rearm（不静默丢字节）", handle);
+                    trace_log!("❌ handle {:?} flush 握手缓存失败({e}) → rearm（不静默丢字节）", handle);
                     let socket = sockets.get_mut::<TcpSocket>(handle);
                     rearm_socket(socket, ctx, fake_pool, now_secs);
                     return; // stream 随作用域 drop 干净关闭
@@ -1499,7 +1528,7 @@ async fn handle_remote_payload<D: TunIo>(
     };
 
     if payload.is_empty() {
-        println!("🔄 handle {:?} entering {:?}", handle, SocketState::Closing);
+        trace_log!("🔄 handle {:?} entering {:?}", handle, SocketState::Closing);
         rearm_socket(tcp_socket, ctx, fake_pool, now_secs);
         return Ok(());
     }
@@ -1508,7 +1537,7 @@ async fn handle_remote_payload<D: TunIo>(
     // Listening（uplink_tx 被清空），说明这是上一代上游连接的迟到回程数据，直接丢弃，
     // 绝不能往非 Established 的 socket 写（否则 send_slice 报错、旧版本会 unwrap panic）。
     if ctx.uplink_tx.is_none() {
-        println!(
+        trace_log!(
             "🗑️ handle {:?} 已复位，丢弃旧连接迟到回程 {} 字节",
             handle,
             payload.len()
@@ -1665,7 +1694,7 @@ async fn handle_tuic_udp_uplink<U: DatagramUpstream>(
     let (target, fake_ip) = match resolve_target(dst_ep, fake_pool) {
         TargetResolve::Direct { target, fake_ip } => (target, fake_ip),
         TargetResolve::Refuse => {
-            println!("🚫 UDP fake-IP {} 无映射，丢弃（待应用重新解析）", udp.dst_ip);
+            trace_log!("🚫 UDP fake-IP {} 无映射，丢弃（待应用重新解析）", udp.dst_ip);
             return;
         }
         // 刀4：加密 DNS（DoQ :853 / DoH3 :443）→ **静默丢包**，逼应用回落明文 DNS。
@@ -1691,7 +1720,7 @@ async fn handle_tuic_udp_uplink<U: DatagramUpstream>(
             assoc_table.set_fake_ip(assoc_id, ip);
             fake_pool.acquire(ip, now_secs);
         }
-        println!(
+        trace_log!(
             "🌊 TUIC UDP↑ new assoc={assoc_id} → {} (first {}B)",
             target.to_wire_string(),
             udp.payload.len()
@@ -2170,6 +2199,20 @@ mod tests {
         assert!(!parse_profile_loop(Some("yes")));
         assert!(!parse_profile_loop(Some("")));
         assert!(!parse_profile_loop(None), "缺省关——默认 NoopSink 零开销路径");
+    }
+
+    /// 刀13 ①：MINI_VPN_TRACE 解析——`1`/`true`（去空白、不区分大小写）开；其它/缺省关
+    /// （默认关 = 主循环热路径零 stdout；翻 flag 恢复全部诊断打印）。
+    #[test]
+    fn parse_trace_only_truthy_enables() {
+        assert!(parse_trace(Some("1")));
+        assert!(parse_trace(Some("true")));
+        assert!(parse_trace(Some(" TRUE ")));
+        assert!(!parse_trace(Some("0")), "0 必须关——否则 MINI_VPN_TRACE=0 反而开是 footgun");
+        assert!(!parse_trace(Some("false")));
+        assert!(!parse_trace(Some("yes")));
+        assert!(!parse_trace(Some("")));
+        assert!(!parse_trace(None), "缺省关——热路径默认静默");
     }
 
     #[test]
