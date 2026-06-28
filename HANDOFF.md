@@ -39,7 +39,9 @@
   ① 热路径 `println!` 由 `MINI_VPN_TRACE` 门控，默认不再每包/每连接同步写 stdout；② TCP uplink 改非阻塞
   `try_reserve`，Full 时不 `recv`、不分配、保持 smoltcp rx buffer 字节，靠 TCP 窗口端到端背压，修复一条慢流
   HoL 阻塞整个事件循环的问题。质量门：`cargo test` / `cargo test --features harness` / clippy / release 绿；
-  新 harness `stalled_tcp_uplink_does_not_block_other_flows` 覆盖慢流不阻塞快流。**下一刀：刀14a 文档收口 + 刀14b 低 RTT 胖链路 #3 量化 gate**。
+  新 harness `stalled_tcp_uplink_does_not_block_other_flows` 覆盖慢流不阻塞快流。**下一刀：刀14a 文档收口 + 刀14b 低 RTT 胖链路 #3 量化 gate**
+  （spec/plan：`docs/tech/2026-06-28-knife14b-lowrtt-cc-pool-quantify-{spec,plan}.md`；probe：
+  `scripts/knife14b-lowrtt-probe.sh`）。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
 ## 目标（唯一北极星）：`Rules.md`
@@ -79,7 +81,7 @@
  ├─ 刀12 多核逼近 100M：量化定位（quantify-only，LoopProfiler 仪器）  ✅ 完成 + 真出口归因（见下「刀12 完成」，ADR-0013）；**#4 实测推翻、取消分片**
  ├─ 刀13 主循环热路径净化  ✅ 完成 + 已合 main `8be4141`：`MINI_VPN_TRACE` 门控热路径日志 + 非阻塞 TCP uplink（try_reserve，Full 保留 smoltcp 字节）消除跨流 HoL
  ├─ 刀14a 文档/接力收口：把刀13 从候选改为已完成，修 stale TODO/HANDOFF/ADR 指针
- └─ 刀14b 低 RTT 胖链路 #3 量化 gate：只做 probe/spec/acceptance；无合格链路前不写 connection pool
+ └─ 刀14b 低 RTT 胖链路 #3 量化 gate：只做 probe/spec/acceptance（见 `2026-06-28-knife14b-*`）；无合格链路前不写 connection pool
 
 正交线 A（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）= VLESS+REALITY 第二 Transport（手写 TLS 1.3，ADR-0008）
  ├─ 刀6  REALITY auth 密码学 + TLS 1.3 ClientHello 构造（sans-IO，100% 离线 TDD）  ✅ 完成（见下「刀6」，ADR-0008）；已合 main
