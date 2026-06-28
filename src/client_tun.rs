@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 
 pub(crate) const TCP_SOCKET_BUFFER_SIZE: usize = 65_535;
 const RELAY_CHANNEL_CAPACITY: usize = 1024;
+const _: () = assert!(RELAY_CHANNEL_CAPACITY >= 1);
 /// L2（刀9 F4）：一条 relay 双向静默多久判 idle → 退出 + shutdown。防慢/卡死上游（尤其 REALITY
 /// TCP-only 手写 TLS 遇 server 不返回）长期挂住 relay task 泄漏。90s 偏宽松保稳（长轮询/SSE 不误杀）。
 const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
@@ -1294,6 +1295,50 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
         }
     }
 
+    // 刀13 ②：已建立 relay 的上行必须非阻塞。先抢 mpsc permit，再从 smoltcp 取字节；
+    // Full 时不 recv、不分配、不打印，让字节留在 smoltcp rx buffer → TCP 窗口自然背压 app。
+    // 这消除一条慢上游 flow 在 `tx.send().await` 上 HoL 阻塞整个主循环的问题。
+    enum EstablishedUplink {
+        NotEstablished,
+        Handled,
+        Closed,
+    }
+    let established_uplink = {
+        let Some(ctx) = socket_ctxs.get_mut(&handle) else {
+            return Ok(());
+        };
+        if let Some(tx) = ctx.uplink_tx.as_mut() {
+            match tx.try_reserve() {
+                Ok(permit) => {
+                    let payload = {
+                        let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
+                        extract_socket_payload(tcp_socket)
+                    };
+                    if let Some(payload) = payload {
+                        permit.send(payload);
+                        ctx.state = SocketState::Relaying;
+                    }
+                    EstablishedUplink::Handled
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => EstablishedUplink::Handled,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => EstablishedUplink::Closed,
+            }
+        } else {
+            EstablishedUplink::NotEstablished
+        }
+    };
+    match established_uplink {
+        EstablishedUplink::Handled => return Ok(()),
+        EstablishedUplink::Closed => {
+            let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
+            if let Some(ctx) = socket_ctxs.get_mut(&handle) {
+                rearm_socket(tcp_socket, ctx, fake_pool, now_secs);
+            }
+            return Ok(());
+        }
+        EstablishedUplink::NotEstablished => {}
+    }
+
     // 取首包的同时读 local_endpoint：它就是被拦截连接真正想去的目的 endpoint。
     // 中文要点：两者都需要 socket，合并在这一处借用里读出，避免二次借用。
     let extracted = {
@@ -1346,6 +1391,7 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
         payload,
         Some(target),
         fake_ip,
+        sockets,
         socket_ctxs,
         upstream,
         handshake_done_tx,
@@ -1363,6 +1409,7 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
     payload: Vec<u8>,
     target: Option<TargetAddr>,
     fake_ip: Option<Ipv4Addr>,
+    sockets: &mut SocketSet<'_>,
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
     upstream: &Arc<U>,
     handshake_done_tx: &mpsc::Sender<HandshakeDone>,
@@ -1374,16 +1421,6 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
         return Ok(());
     };
-
-    // 已建立 relay：直接转发上行（不变）。
-    if let Some(tx) = ctx.uplink_tx.as_mut() {
-        trace_log!("🔄 handle {:?} entering {:?}", handle, ctx.state);
-        tx.send(payload)
-            .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "本地中继通道已关闭"))?;
-        ctx.state = SocketState::Relaying;
-        return Ok(());
-    }
 
     // 刀9 M3：spawn 握手在飞中 → 后续上行包入 buffer（防双开 + 保序），不再开第二次握手。
     if ctx.state == SocketState::HandshakePending {
@@ -1414,9 +1451,12 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
         trace_log!("🚪 handle {:?} remote session opened", handle);
 
         let (tx, rx) = tokio::sync::mpsc::channel(RELAY_CHANNEL_CAPACITY);
-        tx.send(payload)
-            .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "新建中继通道写入失败"))?;
+        if let Err(e) = tx.try_send(payload) {
+            trace_log!("❌ handle {:?} 新建中继通道写入失败({e}) → rearm（不静默丢首包）", handle);
+            let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
+            rearm_socket(tcp_socket, ctx, fake_pool, now_secs);
+            return Ok(());
+        }
         ctx.uplink_tx = Some(tx);
         ctx.state = SocketState::Relaying;
         // 刀2 引用计数：inline 路径开远端成功后才 acquire（开失败走 `?` 早返回，不泄漏 refcount）。

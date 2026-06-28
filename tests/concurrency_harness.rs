@@ -7,7 +7,8 @@
 #![cfg(feature = "harness")]
 
 use mini_vpn::harness::{
-    ScenarioParams, run_tcp_scenario, run_udp_echo_scenario, run_udp_throughput_scenario,
+    ScenarioParams, run_tcp_hol_scenario, run_tcp_scenario, run_udp_echo_scenario,
+    run_udp_throughput_scenario,
 };
 use std::time::Duration;
 
@@ -70,6 +71,45 @@ async fn metrics_relays_spawned_tracks_load() {
     );
 }
 
+/// 刀13：一条上游停读的慢 TCP flow 不应 head-of-line 阻塞另一条正常 flow。
+///
+/// 旧实现会在主循环里 `tx.send(payload).await` 等慢流 relay channel 腾位，导致 B 流的 SYN/上行/下行
+/// 都不能推进；修复后 A 满了只保留 smoltcp 背压，B 应在 A 仍堵住时完成。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_tcp_uplink_does_not_block_other_flows() {
+    let report = run_tcp_hol_scenario().await;
+    eprintln!("HoL report: {report:?}");
+    assert!(
+        report.stall_observed,
+        "测试必须先观察到 mock 上游停读，否则没有触发 HoL 场景"
+    );
+    assert!(
+        report.normal_completed_while_stalled,
+        "A 流上游停读时，B 流仍应完成；否则主循环仍被慢流 HoL 阻塞"
+    );
+    assert!(
+        !report.stalled_completed_while_stalled,
+        "释放 stall 前 A 不应完成，否则测试没有保持慢流拥塞窗口"
+    );
+    assert!(
+        report.stalled_completed_after_release,
+        "释放 stall 后 A 应最终完成"
+    );
+    assert!(report.normal_bytes_match, "B 流 echo 字节必须逐字节完整");
+    assert!(
+        report.stalled_bytes_match,
+        "A 流释放后 echo 字节必须逐字节完整"
+    );
+    assert_eq!(
+        report.tcp_opens_while_stalled, 2,
+        "stall 期间应只有 A+B 两次 open；spurious rearm/reopen 会破坏 relay 稳定性"
+    );
+    assert_eq!(
+        report.tcp_opens_after_release, 2,
+        "释放后也不应为 A 重开远端；Full 路径应保留原 relay 并靠背压恢复"
+    );
+}
+
 /// 轻量 UDP liveness：datagram 上行经 mock echo 不被 TCP 饿死（主体吞吐压测留刀3）。
 #[tokio::test]
 async fn udp_datagrams_reach_upstream() {
@@ -120,7 +160,10 @@ async fn quic_mode_highrate_downlink_intact() {
     // 1200B × 300 包 ≈ 代表高码率流的整包下行（mock 直通 = quic 模式下行形态）。
     let report = run_udp_throughput_scenario(300, 1200, None, Duration::from_secs(15)).await;
     report.print_row();
-    assert!(!report.fragmented, "quic 模式下行应为整包直通（FRAG_TOTAL=1，不分片）");
+    assert!(
+        !report.fragmented,
+        "quic 模式下行应为整包直通（FRAG_TOTAL=1，不分片）"
+    );
     assert_eq!(
         report.echoed_intact, report.sent,
         "高量级整包下行应全部逐字节完整（intact={}/{}）",
@@ -134,12 +177,23 @@ async fn quic_mode_highrate_downlink_intact() {
 #[ignore = "UDP throughput sweep; run with --ignored --nocapture"]
 async fn udp_throughput_sweep_report() {
     println!("\n==== 刀3 UDP 吞吐表（mock 回环，隔离主循环 UDP 路径 + 重组）====");
-    for &(payload, chunk) in &[(1000usize, None), (1400, None), (4000, Some(1200usize)), (8000, Some(1200))] {
-        let report = run_udp_throughput_scenario(500, payload, chunk, Duration::from_secs(60)).await;
+    for &(payload, chunk) in &[
+        (1000usize, None),
+        (1400, None),
+        (4000, Some(1200usize)),
+        (8000, Some(1200)),
+    ] {
+        let report =
+            run_udp_throughput_scenario(500, payload, chunk, Duration::from_secs(60)).await;
         report.print_row();
-        assert_eq!(report.echoed_intact, report.sent, "应零丢包零损坏（mock 无网络丢失）");
+        assert_eq!(
+            report.echoed_intact, report.sent,
+            "应零丢包零损坏（mock 无网络丢失）"
+        );
     }
-    println!("==== 真 datagram TooLarge / stream 兜底 / 真 sing-box 大流量见 acceptance（#3 复测）====\n");
+    println!(
+        "==== 真 datagram TooLarge / stream 兜底 / 真 sing-box 大流量见 acceptance（#3 复测）====\n"
+    );
 }
 
 /// 大并发 sweep（重，显式 `--ignored` 跑）：N∈{64,256,1024} 多端口，打印三段耗时定位表。
@@ -254,8 +308,14 @@ async fn loop_profiler_detects_on_loop_cpu_saturation() {
     );
 
     // fraction 在合法区间。
-    assert!((0.0..=1.0).contains(&base.loop_active_fraction()), "base loop-active 越界: {base:?}");
-    assert!((0.0..=1.0).contains(&load.loop_active_fraction()), "load loop-active 越界: {load:?}");
+    assert!(
+        (0.0..=1.0).contains(&base.loop_active_fraction()),
+        "base loop-active 越界: {base:?}"
+    );
+    assert!(
+        (0.0..=1.0).contains(&load.loop_active_fraction()),
+        "load loop-active 越界: {load:?}"
+    );
     // 主循环确有迭代（仪器在真 run_event_loop 里被调用过）。
     assert!(base.iters > 0 && load.iters > 0, "两轮都应有 select! 迭代");
 

@@ -14,7 +14,7 @@
 use crate::client_tun::{MetricsSink, TunRuntimeConfig, run_event_loop};
 use crate::device::TunIo;
 use crate::metrics::Metrics;
-use crate::shared::ClientError;
+use crate::shared::{ClientError, TargetAddr};
 use crate::upstream::{DatagramUpstream, ProxyUpstream, RelayStream};
 
 use bytes::BytesMut;
@@ -24,7 +24,7 @@ use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -246,6 +246,53 @@ pub struct MockUpstream {
     /// 回灌到下行 channel → 经真主循环 `FragReassembler` 重组（端到端验证重组，无需真网络）。
     /// None = 原样回灌（passthrough echo）。
     frag_chunk: Option<usize>,
+    /// 刀13：指定 TCP 目标端口进入“拥塞但不关闭”的 mock stall，用来复现一条慢流堵住
+    /// relay channel 时是否拖死其它流。None = 普通 echo（既有场景零影响）。
+    stall: Option<StallConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct StallConfig {
+    port: u16,
+    after_bytes: usize,
+    control: StallControl,
+}
+
+/// 刀13 harness：可释放的上游停读控制。`released` 解决 `Notify` 先发后等会丢信号的问题。
+#[derive(Debug, Clone)]
+struct StallControl {
+    released: Arc<AtomicBool>,
+    stalled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl StallControl {
+    fn new() -> Self {
+        Self {
+            released: Arc::new(AtomicBool::new(false)),
+            stalled: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    fn mark_stalled(&self) {
+        self.stalled.store(true, Ordering::Relaxed);
+    }
+
+    fn is_stalled(&self) -> bool {
+        self.stalled.load(Ordering::Relaxed)
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait_released(&self) {
+        while !self.released.load(Ordering::Relaxed) {
+            self.notify.notified().await;
+        }
+    }
 }
 
 impl MockUpstream {
@@ -253,15 +300,42 @@ impl MockUpstream {
         Self::with_frag(echo_buf, downlink_tx, None)
     }
 
-    fn with_frag(echo_buf: usize, downlink_tx: mpsc::Sender<Vec<u8>>, frag_chunk: Option<usize>) -> Self {
+    fn with_frag(
+        echo_buf: usize,
+        downlink_tx: mpsc::Sender<Vec<u8>>,
+        frag_chunk: Option<usize>,
+    ) -> Self {
         Self {
             tcp_opens: AtomicU64::new(0),
             udp_uplinks: AtomicU64::new(0),
             echo_buf,
             downlink_tx,
             frag_chunk,
+            stall: None,
         }
     }
+
+    fn with_stall(
+        echo_buf: usize,
+        downlink_tx: mpsc::Sender<Vec<u8>>,
+        stall_port: u16,
+        stall_after_bytes: usize,
+        control: StallControl,
+    ) -> Self {
+        Self {
+            tcp_opens: AtomicU64::new(0),
+            udp_uplinks: AtomicU64::new(0),
+            echo_buf,
+            downlink_tx,
+            frag_chunk: None,
+            stall: Some(StallConfig {
+                port: stall_port,
+                after_bytes: stall_after_bytes,
+                control,
+            }),
+        }
+    }
+
     fn tcp_opens(&self) -> u64 {
         self.tcp_opens.load(Ordering::Relaxed)
     }
@@ -270,26 +344,78 @@ impl MockUpstream {
     }
 }
 
+fn target_port(target: &TargetAddr) -> u16 {
+    match target {
+        TargetAddr::IpPort(addr) => addr.port(),
+        TargetAddr::DomainPort { port, .. } => *port,
+    }
+}
+
 #[async_trait::async_trait]
 impl ProxyUpstream for MockUpstream {
-    async fn open_tcp(&self, _target: &crate::shared::TargetAddr) -> Result<RelayStream, ClientError> {
+    async fn open_tcp(&self, target: &TargetAddr) -> Result<RelayStream, ClientError> {
         self.tcp_opens.fetch_add(1, Ordering::Relaxed);
-        let (near, far) = tokio::io::duplex(self.echo_buf);
+        let stall = self
+            .stall
+            .as_ref()
+            .filter(|s| s.port == target_port(target))
+            .cloned();
+        let echo_buf = if stall.is_some() {
+            self.echo_buf
+        } else {
+            // HoL 场景里 stall flow 需要小 buffer 快速制造背压；普通 flow 仍保留足够 buffer，
+            // 避免 mock echo 自身在 write_all ↔ echo-write 之间形成全双工死锁。
+            self.echo_buf.max(64 * 1024)
+        };
+        let (near, far) = tokio::io::duplex(echo_buf);
         // echo：把 relay 写来的上行字节原样写回（→ 成为下行）。
-        tokio::spawn(async move {
-            let mut far = far;
-            let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                match far.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if far.write_all(&buf[..n]).await.is_err() {
-                            break;
+        if let Some(stall) = stall {
+            let (mut rd, mut wr) = tokio::io::split(far);
+            let (echo_tx, mut echo_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            tokio::spawn(async move {
+                while let Some(data) = echo_rx.recv().await {
+                    if wr.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                let mut read_total = 0usize;
+                let mut stalled_once = false;
+                loop {
+                    match rd.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            read_total += n;
+                            if echo_tx.send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
+                            if !stalled_once && read_total >= stall.after_bytes {
+                                stalled_once = true;
+                                stall.control.mark_stalled();
+                                stall.control.wait_released().await;
+                            }
                         }
                     }
                 }
-            }
-        });
+            });
+        } else {
+            tokio::spawn(async move {
+                let mut far = far;
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    match far.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if far.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
         Ok(Box::new(near))
     }
 }
@@ -623,10 +749,7 @@ pub async fn run_tcp_scenario(params: ScenarioParams) -> Report {
             a.push(IpCidr::new(IpAddress::Ipv4(GEN_IP), 24)).unwrap();
         });
         // 默认路由（网关填自身 IP，仅为让 smoltcp 对 off-link 目标 emit IP 包）。
-        iface
-            .routes_mut()
-            .add_default_ipv4_route(GEN_IP)
-            .unwrap();
+        iface.routes_mut().add_default_ipv4_route(GEN_IP).unwrap();
         iface
     };
 
@@ -732,6 +855,252 @@ pub async fn run_tcp_scenario(params: ScenarioParams) -> Report {
     }
 }
 
+// ============================ TCP HoL 场景（刀13）============================
+
+/// 刀13：一条上游停读的慢 TCP flow 不应阻塞另一条正常 flow。
+#[derive(Debug, Clone)]
+pub struct TcpHolReport {
+    pub stall_observed: bool,
+    pub normal_completed_while_stalled: bool,
+    pub stalled_completed_while_stalled: bool,
+    pub stalled_completed_after_release: bool,
+    pub normal_bytes_match: bool,
+    pub stalled_bytes_match: bool,
+    pub normal_sent: usize,
+    pub normal_received: usize,
+    pub stalled_sent: usize,
+    pub stalled_received: usize,
+    pub tcp_opens_while_stalled: u64,
+    pub tcp_opens_after_release: u64,
+}
+
+struct HolConn {
+    handle: SocketHandle,
+    payload: Vec<u8>,
+    send_chunk: usize,
+    sent: usize,
+    received: Vec<u8>,
+    started: Instant,
+    done_us: Option<u64>,
+    closed: bool,
+}
+
+impl HolConn {
+    fn new(handle: SocketHandle, payload: Vec<u8>, send_chunk: usize) -> Self {
+        Self {
+            handle,
+            payload,
+            send_chunk: send_chunk.max(1),
+            sent: 0,
+            received: Vec::new(),
+            started: Instant::now(),
+            done_us: None,
+            closed: false,
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.done_us.is_some()
+    }
+
+    fn bytes_match(&self) -> bool {
+        self.received == self.payload
+    }
+}
+
+fn hol_payload(seed: u8, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| seed.wrapping_add((i & 0xff) as u8))
+        .collect()
+}
+
+fn push_hol_conn(
+    iface: &mut Interface,
+    sockets: &mut SocketSet<'_>,
+    dst_port: u16,
+    local_port: u16,
+    payload: Vec<u8>,
+) -> SocketHandle {
+    let buf_sz = (payload.len() * 2).max(4096);
+    let rx = tcp::SocketBuffer::new(vec![0u8; buf_sz]);
+    let tx = tcp::SocketBuffer::new(vec![0u8; buf_sz]);
+    let mut sock = tcp::Socket::new(rx, tx);
+    sock.connect(
+        iface.context(),
+        (IpAddress::Ipv4(TARGET_IP), dst_port),
+        local_port,
+    )
+    .expect("connect");
+    sockets.add(sock)
+}
+
+async fn drive_hol_generator<F>(
+    iface: &mut Interface,
+    device: &mut GeneratorDevice,
+    sockets: &mut SocketSet<'_>,
+    conns: &mut [HolConn],
+    timeout: Duration,
+    mut stop: F,
+) where
+    F: FnMut(&[HolConn]) -> bool,
+{
+    let start = Instant::now();
+    while !stop(conns) && start.elapsed() < timeout {
+        iface.poll(SmolInstant::now(), device, sockets);
+        for c in conns.iter_mut() {
+            if c.done_us.is_some() && c.closed {
+                continue;
+            }
+            let sock = sockets.get_mut::<tcp::Socket>(c.handle);
+            if c.sent < c.payload.len() && sock.can_send() {
+                let end = (c.sent + c.send_chunk).min(c.payload.len());
+                if let Ok(n) = sock.send_slice(&c.payload[c.sent..end]) {
+                    c.sent += n;
+                }
+            }
+            while sock.can_recv() {
+                match sock.recv(|data| {
+                    c.received.extend_from_slice(data);
+                    (data.len(), ())
+                }) {
+                    Ok(()) => {}
+                    Err(_) => break,
+                }
+            }
+            if c.done_us.is_none() && c.received.len() >= c.payload.len() {
+                c.done_us = Some(c.started.elapsed().as_micros() as u64);
+                sock.close();
+            }
+            if c.done_us.is_some() && !sock.is_active() {
+                c.closed = true;
+            }
+        }
+        tokio::time::sleep(Duration::from_micros(50)).await;
+    }
+}
+
+/// 刀13 HoL 高保真场景：
+/// 1. A 流连到会停读但不关闭的 mock upstream，并用小消息把 relay channel 填满；
+/// 2. A 仍堵住时启动 B 流，B 必须能完成 echo；
+/// 3. 释放 A 后，A 也必须逐字节完整完成，且 stall 期间没有 spurious reopen。
+pub async fn run_tcp_hol_scenario() -> TcpHolReport {
+    let stall_port = TARGET_PORT_BASE;
+    let normal_port = TARGET_PORT_BASE + 1;
+    let stall_control = StallControl::new();
+
+    let gen_to_sut = PacketLink::new();
+    let sut_to_gen = PacketLink::new();
+    let (downlink_tx, downlink_rx) = mpsc::channel::<Vec<u8>>(1024);
+    let mock = Arc::new(MockUpstream::with_stall(
+        64,
+        downlink_tx,
+        stall_port,
+        16,
+        stall_control.clone(),
+    ));
+
+    let sut_device = LoopbackTunDevice::new(gen_to_sut.clone(), sut_to_gen.clone());
+    let shared = Arc::new(Mutex::new(Recorded::default()));
+    let config = TunRuntimeConfig::from_sources(Some("4")).unwrap();
+    let sut = tokio::spawn(run_event_loop(
+        sut_device,
+        mock.clone(),
+        downlink_rx,
+        config,
+        Arc::new(Metrics::new()),
+        RecordingSink::new(shared),
+    ));
+
+    let mut gen_device = GeneratorDevice {
+        inbound: sut_to_gen,
+        outbound: gen_to_sut,
+    };
+    let mut gen_iface = {
+        let cfg = SmolConfig::new(smoltcp::wire::HardwareAddress::Ip);
+        let mut iface = Interface::new(cfg, &mut gen_device, SmolInstant::now());
+        iface.update_ip_addrs(|a| {
+            a.push(IpCidr::new(IpAddress::Ipv4(GEN_IP), 24)).unwrap();
+        });
+        iface.routes_mut().add_default_ipv4_route(GEN_IP).unwrap();
+        iface
+    };
+
+    let mut sockets = SocketSet::new(vec![]);
+    let stall_payload = hol_payload(0xA0, 16 * 1024);
+    let stall_handle = push_hol_conn(
+        &mut gen_iface,
+        &mut sockets,
+        stall_port,
+        41_000,
+        stall_payload.clone(),
+    );
+    let mut conns = vec![HolConn::new(stall_handle, stall_payload, 4)];
+
+    // 先只驱动 A：等 mock 已经停读，并继续送足够多小消息来填满 A 的 relay channel。
+    drive_hol_generator(
+        &mut gen_iface,
+        &mut gen_device,
+        &mut sockets,
+        &mut conns,
+        Duration::from_secs(8),
+        |c| stall_control.is_stalled() && c[0].sent >= 8 * 1024,
+    )
+    .await;
+    let stall_observed = stall_control.is_stalled();
+
+    let normal_payload = hol_payload(0x20, 8 * 1024);
+    let normal_handle = push_hol_conn(
+        &mut gen_iface,
+        &mut sockets,
+        normal_port,
+        41_001,
+        normal_payload.clone(),
+    );
+    conns.push(HolConn::new(normal_handle, normal_payload, 1024));
+
+    // A 仍停读时，B 应能独立完成。旧实现会卡在 A 的 tx.send().await，这里超时失败。
+    drive_hol_generator(
+        &mut gen_iface,
+        &mut gen_device,
+        &mut sockets,
+        &mut conns,
+        Duration::from_secs(5),
+        |c| c[1].done(),
+    )
+    .await;
+    let normal_completed_while_stalled = conns[1].done();
+    let stalled_completed_while_stalled = conns[0].done();
+    let tcp_opens_while_stalled = mock.tcp_opens();
+
+    stall_control.release();
+    drive_hol_generator(
+        &mut gen_iface,
+        &mut gen_device,
+        &mut sockets,
+        &mut conns,
+        Duration::from_secs(10),
+        |c| c[0].done() && c[1].done(),
+    )
+    .await;
+
+    sut.abort();
+
+    TcpHolReport {
+        stall_observed,
+        normal_completed_while_stalled,
+        stalled_completed_while_stalled,
+        stalled_completed_after_release: conns[0].done(),
+        normal_bytes_match: conns[1].bytes_match(),
+        stalled_bytes_match: conns[0].bytes_match(),
+        normal_sent: conns[1].sent,
+        normal_received: conns[1].received.len(),
+        stalled_sent: conns[0].sent,
+        stalled_received: conns[0].received.len(),
+        tcp_opens_while_stalled,
+        tcp_opens_after_release: mock.tcp_opens(),
+    }
+}
+
 // ============================ UDP echo 场景（轻量 liveness）============================
 
 /// 轻量 UDP 用例报告。
@@ -785,7 +1154,13 @@ pub async fn run_udp_echo_scenario(datagrams: usize, payload_len: usize) -> UdpR
 }
 
 /// 构造一个裸 IPv4/UDP 包（用于 UDP relay 注入）。
-fn build_udp_ip(src: Ipv4Address, src_port: u16, dst: Ipv4Address, dst_port: u16, payload: &[u8]) -> Vec<u8> {
+fn build_udp_ip(
+    src: Ipv4Address,
+    src_port: u16,
+    dst: Ipv4Address,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
     use etherparse::PacketBuilder;
     let builder = PacketBuilder::ipv4(src.0, dst.0, 64).udp(src_port, dst_port);
     let mut out = Vec::with_capacity(builder.size(payload.len()));
@@ -810,7 +1185,11 @@ pub struct UdpThroughputReport {
 impl UdpThroughputReport {
     pub fn pps(&self) -> f64 {
         let s = self.wall.as_secs_f64();
-        if s <= 0.0 { 0.0 } else { self.echoed_intact as f64 / s }
+        if s <= 0.0 {
+            0.0
+        } else {
+            self.echoed_intact as f64 / s
+        }
     }
     pub fn throughput_mbps(&self) -> f64 {
         let s = self.wall.as_secs_f64();
@@ -850,7 +1229,11 @@ fn throughput_payload(i: usize, payload_len: usize) -> Vec<u8> {
 
 /// 从 `sut_to_gen` 排空已回到「app」的下行 UDP 包，逐字节核对完整性，收集 intact 的 marker。
 /// 返回是否至少排空了一个包。
-fn drain_intact_echoes(link: &PacketLink, payload_len: usize, intact: &mut std::collections::HashSet<u16>) -> bool {
+fn drain_intact_echoes(
+    link: &PacketLink,
+    payload_len: usize,
+    intact: &mut std::collections::HashSet<u16>,
+) -> bool {
     let mut any = false;
     while let Some(pkt) = link.pop() {
         any = true;
