@@ -106,6 +106,37 @@ append_metrics_since() {
   fi
 }
 
+append_cleanliness_check() {
+  append_section "Pre-run Cleanliness Check"
+  if [[ ! -f "$LOG" ]]; then
+    echo "log not found: $LOG" | tee -a "$OUT"
+    return
+  fi
+
+  local line
+  line="$(grep -E '📊 数据面' "$LOG" | tail -1 || true)"
+  if [[ -z "$line" ]]; then
+    echo "no mini_vpn data-plane metric line found before sweep" | tee -a "$OUT"
+    return
+  fi
+
+  echo '```text' | tee -a "$OUT"
+  echo "$line" | tee -a "$OUT"
+  echo '```' | tee -a "$OUT"
+
+  if [[ "$line" =~ TCP\ relay\ 活跃=([0-9]+)/累计=([0-9]+).*fake-IP\ 活跃=([0-9]+)/在册=([0-9]+) ]]; then
+    local tcp_active="${BASH_REMATCH[1]}"
+    local fake_active="${BASH_REMATCH[3]}"
+    if (( tcp_active > 0 || fake_active > 0 )); then
+      echo "⚠️ background tunnel activity detected; close noisy apps or restart the tunnel before a decisive 14b run." | tee -a "$OUT"
+    else
+      echo "quiet baseline: no active TCP relay or fake-IP flow in the last metric tick." | tee -a "$OUT"
+    fi
+  else
+    echo "could not parse active-flow gauges from the last metric tick." | tee -a "$OUT"
+  fi
+}
+
 append_iperf_cmd() {
   local metrics_title="$1"
   shift
@@ -146,6 +177,8 @@ if [[ -f "$LOG" ]]; then
 else
   echo "log not found: $LOG" | tee -a "$OUT"
 fi
+
+append_cleanliness_check
 
 append_section "TCP Forward Sweep"
 for p in $PARALLEL_SET; do
