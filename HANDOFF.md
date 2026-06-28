@@ -410,9 +410,11 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
 1. 新 session → 读本 HANDOFF + `Rules.md` → 先 **grill**（用 `/grill-with-docs` 或 brainstorm，对齐设计与本刀范围）→ 出 **spec + plan**（docs/tech/，TDD 分解）。
 2. **TDD per task**：写失败测试 → red → 实现 → green → commit；**每次 commit 后 `git push`**；一个分支一个 writer。
 3. 收尾：**`/code-review`** over the diff → 修 → 跨机/压测 **acceptance**。
-4. **cwd 陷阱**：Bash cwd 可能在 call 之间被重置到别的 worktree——每条 git/cargo 命令前 `cd` 到本 worktree 并用绝对路径编辑；`git branch --show-current` 应是本分支。
-5. 文档/教学叙述（teaching note、LEARNINGS）由用户另行通过代码+commit 生成；**本路线只产 spec/plan + 代码 + commit + 必要的 TODO 状态**（除非用户另说）。
-6. 用**中文**回复（代码/术语/commit 保留英文）。
+4. **真实数据测试协作模式**：凡是需要用户在真实环境采集性能/连通性数据，优先在 `./scripts/` 增加可复跑脚本，
+   同时给出测试步骤、前置检查、日志路径和判据；用户按指导测试并贴回日志后，再基于日志分析和优化。不要让用户手拼长命令。
+5. **cwd 陷阱**：Bash cwd 可能在 call 之间被重置到别的 worktree——每条 git/cargo 命令前 `cd` 到本 worktree 并用绝对路径编辑；`git branch --show-current` 应是本分支。
+6. 文档/教学叙述（teaching note、LEARNINGS）由用户另行通过代码+commit 生成；**本路线只产 spec/plan + 代码 + commit + 必要的 TODO 状态**（除非用户另说）。
+7. 用**中文**回复（代码/术语/commit 保留英文）。
 
 ## 已知坑 / deferred（接力时别重新踩）
 
