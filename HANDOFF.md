@@ -92,6 +92,17 @@
 ```
 - 优先级与关联：**fake-IP 池回收**属"大并发长稳"（并入刀2）；**DoH 拦截**是"真实场景能连上"的前置（刀4，可视情提前——真机浏览器场景不修则 fake-IP 形同虚设）。**A（REALITY）正交**：当前 QUIC 能连，不阻塞三目标达标；TCP-based，替代不了 UDP 直播。
 
+## 后续任务池（post-14b）
+
+1. **真跑刀14b 低 RTT 胖链路量化**：有低 RTT、低丢包、端到端 >100M 路径时，用 `scripts/knife14b-lowrtt-probe.sh` 产出结果。
+2. **#3 connection-pool spike**：仅在刀14b 证明 single TUIC/QUIC connection 是墙时开始；否则不写 pool。
+3. **移动端/产品化 core 接缝**：packet I/O trait、library config struct、`cc`/`udp_mode` 等旋钮从 env-only 补到可注入配置。
+4. **0-RTT / 弱网恢复**：升级 quinn/rustls 以支持 early exporter，并与 adaptive keepalive / mobile radio-sleep 一起评估。
+5. **DNS 边界硬化**：IPv6 DNS、split-horizon/internal domains、multi-question DNS、hardcoded-IP app、`hickory-proto` 迁移时机。
+6. **抗封锁韧性增强**：QUIC 被封时是否需要 UDP-over-VLESS/TCP fallback；这是延迟/复杂度权衡，不是默认路线。
+7. **Scale / Ops**：多 Upstream/service discovery/weighted health/graceful drain/metrics alerting/multi-region。
+8. **更远期产品模式**：Multi-Hop、L3 tunnel mode、REALITY Vision flow / 0x1302/0x1303 指纹恢复、出口 IP reputation。
+
 ## 刀1 已完成（2026-06-12）：大并发压测 harness + 瓶颈定位
 
 **交付**（分支 `claude/knife1-concurrency-harness`，从 main 起，已逐 commit push；未合 main）：
