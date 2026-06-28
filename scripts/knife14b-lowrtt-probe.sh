@@ -45,6 +45,7 @@ RUN_UDP="${RUN_UDP:-0}"
 UDP_BW="${UDP_BW:-90M}"
 UDP_LEN="${UDP_LEN:-1200}"
 OUT="${OUT:-/tmp/mvpn_knife14b_lowrtt_$(date +%Y%m%d_%H%M%S).md}"
+METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode'
 
 append_cmd() {
   {
@@ -73,6 +74,48 @@ append_section() {
   } | tee -a "$OUT"
 }
 
+append_subsection() {
+  {
+    echo
+    echo "### $1"
+  } | tee -a "$OUT"
+}
+
+log_line_count() {
+  if [[ -f "$LOG" ]]; then
+    wc -l < "$LOG" | tr -d ' '
+  else
+    echo 0
+  fi
+}
+
+append_metrics_since() {
+  local start_line="$1"
+  local title="$2"
+
+  append_subsection "$title"
+  if [[ -f "$LOG" ]]; then
+    {
+      echo '```text'
+      tail -n +"$((start_line + 1))" "$LOG" | grep -E "$METRIC_RE" || \
+        echo "(no matching mini_vpn metrics emitted during this run)"
+      echo '```'
+    } | tee -a "$OUT"
+  else
+    echo "log not found: $LOG" | tee -a "$OUT"
+  fi
+}
+
+append_iperf_cmd() {
+  local metrics_title="$1"
+  shift
+
+  local start_line
+  start_line="$(log_line_count)"
+  append_cmd "$@"
+  append_metrics_since "$start_line" "$metrics_title"
+}
+
 {
   echo "# 刀14b low-RTT fat-path probe result"
   echo
@@ -97,7 +140,7 @@ append_section "Recent mini_vpn Metrics"
 if [[ -f "$LOG" ]]; then
   {
     echo '```text'
-    grep -E '📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode' "$LOG" | tail -20 || true
+    grep -E "$METRIC_RE" "$LOG" | tail -20 || true
     echo '```'
   } | tee -a "$OUT"
 else
@@ -106,23 +149,27 @@ fi
 
 append_section "TCP Forward Sweep"
 for p in $PARALLEL_SET; do
-  append_cmd iperf3 -c "$TARGET" -p "$PORT" -t "$DURATION" -P "$p"
+  append_iperf_cmd "mini_vpn Metrics during TCP Forward P=$p" \
+    iperf3 -c "$TARGET" -p "$PORT" -t "$DURATION" -P "$p"
 done
 
 append_section "TCP Reverse Sweep"
 for p in $PARALLEL_SET; do
-  append_cmd iperf3 -c "$TARGET" -p "$PORT" -t "$DURATION" -P "$p" -R
+  append_iperf_cmd "mini_vpn Metrics during TCP Reverse P=$p" \
+    iperf3 -c "$TARGET" -p "$PORT" -t "$DURATION" -P "$p" -R
 done
 
 if [[ "$RUN_UDP" == "1" || "$RUN_UDP" == "true" ]]; then
   append_section "UDP Forward Sweep"
   for p in $PARALLEL_SET; do
-    append_cmd iperf3 -c "$TARGET" -p "$PORT" -u -b "$UDP_BW" -l "$UDP_LEN" -t "$DURATION" -P "$p"
+    append_iperf_cmd "mini_vpn Metrics during UDP Forward P=$p" \
+      iperf3 -c "$TARGET" -p "$PORT" -u -b "$UDP_BW" -l "$UDP_LEN" -t "$DURATION" -P "$p"
   done
 
   append_section "UDP Reverse Sweep"
   for p in $PARALLEL_SET; do
-    append_cmd iperf3 -c "$TARGET" -p "$PORT" -u -b "$UDP_BW" -l "$UDP_LEN" -t "$DURATION" -P "$p" -R
+    append_iperf_cmd "mini_vpn Metrics during UDP Reverse P=$p" \
+      iperf3 -c "$TARGET" -p "$PORT" -u -b "$UDP_BW" -l "$UDP_LEN" -t "$DURATION" -P "$p" -R
   done
 fi
 
@@ -130,7 +177,7 @@ append_section "Post-run mini_vpn Metrics"
 if [[ -f "$LOG" ]]; then
   {
     echo '```text'
-    grep -E '📊 数据面|🔬 主循环' "$LOG" | tail -30 || true
+    grep -E "$METRIC_RE" "$LOG" | tail -30 || true
     echo '```'
   } | tee -a "$OUT"
 fi
