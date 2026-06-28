@@ -135,6 +135,22 @@ client's true CPU ceiling is not observable here.
 - The `LoopProfiler` instrument stays (env-gated, default `NoopSink` zero-cost) as the standing tool to
   re-test #4/#3 on any future path.
 
+## Postscript (2026-06-28): 刀13 implemented the loop-local fixes; #3 still requires a clean path
+
+刀13 completed both loop-local candidates and was merged to `main` at `8be4141`:
+
+- `MINI_VPN_TRACE` now gates the hot-path relay/debug `println!` calls. Default soak logs keep load-bearing
+  acceptance signals (`🪪`, `📊`, `🛡️`) but no longer pay one blocking stdout write per relay event.
+- TCP uplink now reserves channel capacity before reading from smoltcp. On `Full`, it leaves bytes in the
+  smoltcp socket, keeps the handle dirty, and lets the TCP receive window apply backpressure. Harness
+  `stalled_tcp_uplink_does_not_block_other_flows` proves a stalled upstream flow no longer HoL-blocks a
+  normal flow.
+
+This closes the 刀13 action items from this ADR. The remaining `#3 connection pool` question is deliberately
+**not** an implementation task yet: first run a low-RTT, genuinely >100M end-to-end probe that compares
+single-connection throughput against a multi-connection candidate or baseline. If that path cannot show a
+single-connection ceiling, a connection pool is likely complexity without leverage.
+
 ## Honest gaps (尽力而为如实记录)
 
 - A clean **sustained tunneled-at-path-max** `🔬` reading was initially **not** captured: two early 60s
@@ -165,5 +181,6 @@ client's true CPU ceiling is not observable here.
 ## Status
 
 刀12 quantify-only **complete**: instrument delivered + reviewed + real-egress measurement → **#4
-refuted, sharding cancelled, #3 deferred pending a fat low-RTT path.** No multicore refactor was
-performed, by design and on evidence.
+refuted, sharding cancelled, #3 deferred pending a fat low-RTT path.** 刀13 then implemented the two
+loop-local follow-ups (trace-gated hot-path logging and non-blocking uplink send) without changing the
+connection-pool decision. No multicore refactor was performed, by design and on evidence.

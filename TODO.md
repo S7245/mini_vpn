@@ -22,20 +22,20 @@ Target extraction alone does NOT make real sites work. In order of blocking seve
 
 1. ~~Arbitrary ports (Stage 9)~~ — DONE.
 2. ~~DNS over tunnel or fake-IP (Stage 11)~~ — DONE (fake-IP).
-3. ~~UDP relay for QUIC/HTTP3 and live streaming~~ — first cut DONE (Stage 12):
-   UDP rides a new QUIC datagram data plane (ADR-0003), not the TCP/yamux tunnel.
-   Quality/scale hardening + TCP→QUIC migration are the follow-on QUIC track below.
+3. ~~UDP relay for QUIC/HTTP3 and live streaming~~ — DONE through TUIC:
+   UDP now rides TUIC `Packet` over QUIC datagrams (ADR-0004), oversized packets have
+   uni-stream fallback (刀3), and native+cubic high-rate soak passed (刀3.5). Re-test
+   on new exits/paths, but this is no longer a known missing feature.
 4. Exit IP reputation — datacenter IPs trigger target-site risk control; protocol-independent.
 5. MSS clamping / MTU handling — prevents large packets from stalling through the tunnel.
 
-### Architectural constraints to revisit
+### Historical architectural constraints retired by TUIC
 
-- Yamux multiplexes all substreams over one TLS/TCP connection -> TCP head-of-line
-  blocking under high concurrency (Rules.md high-concurrency scenario). May need
-  multiple upstream connections or a different transport.
-- The remote Yamux session opens on the first local payload, so server-speaks-first
-  protocols (no client data before the server talks) never trigger relay. Pre-existing
-  limitation, unchanged by Stage 8; revisit if such protocols are needed.
+- Yamux/TLS is no longer the data plane. TUIC Connect uses one QUIC bi-stream per TCP
+  session, and the legacy server/yamux path was retired in 13d.
+- Server-speaks-first protocols remain outside the current proxy trigger model (the
+  local relay still opens on first local payload), but this is now a product/protocol
+  requirement question, not a yamux limitation.
 
 ## Future architecture topics
 
@@ -49,7 +49,7 @@ ADR-0003's north star (unify on QUIC) is now realized via the **TUIC v5 protocol
 server** (interop = best experience, zero server code from us). Stage 12's UDP-over-QUIC-datagram
 ≈ TUIC native mode and is reused. quinn 0.10 already exposes `export_keying_material` (TUIC auth).
 
-- **Stage 13 — TUIC client** (staged 13a→13d; dual-run `MINI_VPN_UPSTREAM=legacy|tuic`):
+- **Stage 13 — TUIC client** (13a→13d complete; legacy/yamux retired):
   - ~~**13a — TCP relay over TUIC Connect**~~ — DONE (2026-06-10): Authenticate (token via
     keying-material) + per-flow Connect bi-stream behind a `ProxyUpstream` trait; **verified end-to-end
     against a real sing-box TUIC server** (curl https://1.1.1.1 → Cloudflare 301, US egress).
@@ -57,8 +57,8 @@ server** (interop = best experience, zero server code from us). Stage 12's UDP-o
     assoc-id per UDP 4-tuple (`AssocTable`), `send_udp` + a self-healing downlink datagram pump +
     periodic Heartbeat over the *same* authenticated connection as TCP; **verified end-to-end against a
     real sing-box** (`dig @1.1.1.1 example.com/facebook.com` → real A records; `curl https://1.1.1.1`
-    still HTTP/2 301 = TCP non-regression). See `docs/tech/13b-tuic-udp-packet.md`. Deferred: the
-    quic-stream oversized fallback (native drops + counts datagrams over the QUIC datagram limit).
+    still HTTP/2 301 = TCP non-regression). See `docs/tech/13b-tuic-udp-packet.md`. Oversized-packet
+    stream fallback was completed in 刀3.
   - **13c — 0-RTT reconnect + keepalive clarification** — PARTIAL (2026-06-11). Scope narrowed (real
     migration + battery-adaptive heartbeat moved to the mobile-readiness stage; they need iOS/Android
     packet-flow backends to truly accept).
@@ -74,18 +74,16 @@ server** (interop = best experience, zero server code from us). Stage 12's UDP-o
         keying-material (early-exporter) export — the version bump ADR-0004 foresaw. Best folded into
         the **mobile-readiness stage** (weak-net / radio-sleep is where 0-RTT fast resume pays off),
         alongside real connection migration + adaptive heartbeat. Re-validate against sing-box after the bump.
-  - **13d — retire legacy** (yamux + Stage-12 self-server QUIC datagram + self server).
+  - ~~**13d — retire legacy** (yamux + Stage-12 self-server QUIC datagram + self server)~~ — DONE.
 
 #### Transport / protocol extensibility — two tiers
 
 - **Proxy-transport trait** (the abstraction Stage 13 builds): pluggable L4/L7 proxy protocols sharing
-  "intercept flow → relay to exit → exit dials target". TUIC = impl #1; **VLESS+REALITY (TCP)** = planned
-  #2, the GFW-crackdown-resistant fallback (REALITY ≈ indistinguishable from real HTTPS; QUIC/TUIC is a
-  censorship target — GFW does QUIC-Initial SNI blocking, mitigated only by SNI-slicing). Trojan/SS/
-  Hysteria could follow the same trait.
-  - **Protocol selection** (REALITY stage, not Stage 13 — meaningless with one protocol): **auto-failover
-    by default** (urltest-style: TUIC → TCP/REALITY on QUIC block/timeout/loss) + a **manual 3-way
-    override** (auto / force-UDP / force-TCP).
+  "intercept flow → relay to exit → exit dials target". TUIC = impl #1; **VLESS+REALITY (TCP)** is impl #2
+  and is wired into health-aware failover (刀6→刀10). Trojan/SS/Hysteria could follow the same trait if
+  a real product need appears.
+  - **Protocol selection** is implemented as `MINI_VPN_UPSTREAM=tuic|reality|failover`; failover keeps
+    UDP on TUIC and switches TCP to REALITY when QUIC/TUIC is unhealthy.
 - **Data-plane "tunnel mode"** (separate future path, NOT behind the proxy trait): WireGuard / OpenVPN
   forward raw IP packets (L3), bypassing smoltcp/fake-IP/per-flow — a different mode for "general VPN
   (non-circumvention)" use, and easily GFW-blocked without obfuscation. Add only if that product need
@@ -99,7 +97,9 @@ server** (interop = best experience, zero server code from us). Stage 12's UDP-o
 - UDP→TCP upstream fallback where UDP/QUIC is blocked (ties into the protocol selector above).
 
 #### Other follow-ons
-- **DNS hardening**: intercept all `:53` (not just 198.18.0.1) / known DoH endpoints.
+- **DNS hardening**: core DoH/DoT/DoQ blocking and all plaintext `:53` hijack are done (刀4/刀5).
+  Remaining work is edge-case policy: IPv6 DNS, split-horizon/internal domains, exotic multi-question DNS,
+  or moving to hickory-proto when richer DNS record handling is needed.
 - **Scale/ops** (only if our own server returns): session-table hardening, multi-upstream/failover,
   graceful drain, control-plane discovery + metrics (external stores belong here, not the hot path).
 
@@ -112,49 +112,47 @@ and exit-IP rotation. Affects relay protocol, connection-table, and TLS chaining
 
 Core implemented in Stage 11 (ADR-0002): intercept DNS in the TUN, forge A responses
 with `198.18.0.0/15` placeholders, map fake-IP↔domain, rewrite TCP target to DomainPort
-so the Upstream resolves at the exit. Follow-ups not in Stage 11:
+so the Upstream resolves at the exit. Follow-ups not in the original Stage 11, with current status:
 
-- **DoH/DoT interception**: encrypted DNS (browser/system) bypasses the plaintext UDP/53
-  resolver → app gets real IP → blocked IPs still fail. Intercept known DoH endpoints or
-  guide users to disable in-app DoH.
+- ~~**DoH/DoT interception**: encrypted DNS (browser/system) bypasses the plaintext UDP/53
+  resolver → app gets real IP → blocked IPs still fail.~~ DONE in 刀4 for known encrypted DNS endpoints.
 - **Hardcoded-IP domains**: apps connecting to a literal IP never enter the fake-IP map;
   stays IpPort. No clean fix without app cooperation.
-- **QUIC/UDP relay**: needed for QUIC (UDP/443) and UDP services; until then apps usually
-  fall back to TCP. (This is also the separate "UDP relay" roadmap task.)
-- **fake-IP reclamation / LRU**: pool is never reclaimed this stage (131k addresses); add
-  LRU + TTL-based eviction if it ever matters.
+- ~~**QUIC/UDP relay**: needed for QUIC (UDP/443) and UDP services; until then apps usually
+  fall back to TCP.~~ DONE via TUIC Packet + native/cubic default.
+- ~~**fake-IP reclamation / LRU**: pool is never reclaimed this stage (131k addresses); add
+  LRU + TTL-based eviction if it ever matters.~~ DONE in 刀2 with refcount + idle sweep.
 - **Switch DNS codec to hickory-proto** when any of: parsing real upstream responses
   (compression pointers), EDNS0/DNSSEC/DoH, more record types (CNAME/HTTPS/SVCB), or
   hardening against malicious packets. Only the dns.rs codec module changes; interface stable.
-- **First-SYN-to-fresh-fake-IP can get `connection refused`** (observed Stage 11 e2e):
-  curl does NOT retry TCP on refused (unlike on timeout), so a one-off RST kills the
-  connect. Likely a race between the SYN inspector building the listener pool and the
-  SYN being processed in the same poll. Add a tolerance (pre-arm, or brief retry).
+- **First-SYN-to-fresh-fake-IP refused race is closed**. 刀4 acceptance confirmed knife2's same-frame
+  listener creation and elastic spare listener logic eliminated the observed refused race.
 - ~~**Large HTTP/2 / multiplexed streams fail mid-transfer with `bad decrypt`**~~
   RESOLVED 2026-06-04 (commit b476854): root cause was `send_slice` dropping the
   unwritten tail when the tx buffer was full; fixed with a per-handle downlink
   pending buffer that never drops bytes. Verified: `curl https://www.facebook.com/`
   downloads a full ~415KB repeatedly with no bad decrypt.
 
-### Client-side concurrency bottlenecks (knife1 findings, 2026-06-12)
+### Client-side concurrency bottlenecks (knife1/12/13 findings)
 
-Quantified by the mock loopback harness (`src/harness.rs`, feature `harness`);
-full data in `docs/tech/2026-06-12-knife1-bottleneck-findings.md`. For Rules.md ③
-(大并发) the dominant cost is **client-side**, not the network:
+Quantified by the mock loopback harness (`src/harness.rs`, feature `harness`) and later
+real-egress probes. Full data starts in `docs/tech/2026-06-12-knife1-bottleneck-findings.md`;
+ADR-0013 records the 100M attribution update.
 
-- **P0 #1 — `run_event_loop` sweeps `registry.all_handles()` O(total listener slots)
+- ~~**P0 #1 — `run_event_loop` sweeps `registry.all_handles()` O(total listener slots)
   every tick.** relay/call scales linearly with `distinct_ports × pool_size` and is
   independent of active connections (0.13→0.45ms as slots 512→2048, N fixed). knife2:
-  process only handles with readiness (event/dirty-set), not a full per-tick sweep.
-- **P0 #2 — per-port `pool_size` is a hard concurrency ceiling.** 256 conns to ONE
+  process only handles with readiness (event/dirty-set), not a full per-tick sweep.~~ DONE in 刀2.
+- ~~**P0 #2 — per-port `pool_size` is a hard concurrency ceiling.** 256 conns to ONE
   port with default pool=2 complete only 2/256; hot-port bursts stall (rearm-under-churn
   doesn't drain — overlaps the first-SYN-refused race below). knife2: elastic per-port
-  pool / reuse + accept backlog. Global ceiling today ≈ 64 ports × pool 2 = 128.
-- **P1 #4 single-thread select ceiling** (throughput halves as per-tick work grows;
-  coupled to #1) and **P2 #5 128KB/socket** (2048 slots ≈ 256MB, mostly idle swept slots).
-- **#3 single QUIC connection** (HOL under concurrency) is unmeasured by the mock —
-  needs the end-to-end sing-box probe in the findings doc. Same concern as the yamux
-  HOL note above, now on the TUIC/QUIC data plane.
+  pool / reuse + accept backlog.~~ DONE in 刀2.
+- **P1 #4 single-thread select ceiling** was re-tested by 刀12 LoopProfiler. `iface.poll` is not the 100M
+  bottleneck on measured paths, so event-loop sharding is cancelled for now.
+- **Cross-flow HoL from blocking TCP uplink send** was found by 刀12 and fixed by 刀13 using non-blocking
+  `try_reserve`: Full leaves bytes in smoltcp rx buffer and lets TCP window apply backpressure.
+- **#3 single QUIC connection / connection pool** remains unproven. Only revisit on a low RTT, genuinely
+  >100M end-to-end path where single-connection-vs-pool can be measured cleanly.
 
 ### Scale & reconnection resilience (100+ servers / 5000+ users)
 

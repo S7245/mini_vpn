@@ -34,7 +34,12 @@
 - **REALITY mini-project（刀6→刀10）全部完成。刀11 数据面可观测性（observability）✅ 全部完成 + 已 ff 合入 main `9de0604`（2026-06-26，代码 + 两轮 review 零 bug + 真出口 acceptance ✅）**——见下「刀11 完成」。
   **刀12（多核逼近 100M，quantify-only）已完成 + 已 ff 合入 main `68b5e56`（2026-06-27）**（见下「刀12 完成」）——
   LoopProfiler 仪器 + 真出口归因 → **#4（单核 smoltcp poll = 天花板）实测推翻、取消事件循环分片**；当前墙是 WAN 跨太平洋路径，
-  100M 此路不可达；#3 连接池留低 RTT 胖链路再测（ADR-0013）。**下一刀待定**（见 ADR-0013「Consequences」）。
+  100M 此路不可达；#3 连接池留低 RTT 胖链路再测（ADR-0013）。
+- **刀13 已完成 + 已 ff 合入 main `8be4141`（2026-06-28）**：主循环热路径净化（见 `docs/tech/2026-06-27-knife13-loop-hotpath-spec.md`）。
+  ① 热路径 `println!` 由 `MINI_VPN_TRACE` 门控，默认不再每包/每连接同步写 stdout；② TCP uplink 改非阻塞
+  `try_reserve`，Full 时不 `recv`、不分配、保持 smoltcp rx buffer 字节，靠 TCP 窗口端到端背压，修复一条慢流
+  HoL 阻塞整个事件循环的问题。质量门：`cargo test` / `cargo test --features harness` / clippy / release 绿；
+  新 harness `stalled_tcp_uplink_does_not_block_other_flows` 覆盖慢流不阻塞快流。**下一刀：刀14a 文档收口 + 刀14b 低 RTT 胖链路 #3 量化 gate**。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
 ## 目标（唯一北极星）：`Rules.md`
@@ -42,9 +47,11 @@
 ```
 ① TCP 连接   ② UDP 视频直播   ③ 大并发连接
 ```
-- ① 基本达标（curl HTTPS 端到端 TLS、~415KB 反复下载无 bad-decrypt）。
-- ② 部分：DNS 验证过，但直播是持续大流量 UDP，**native datagram 超上限的包直接丢**（quic-stream fallback 未实现），未压测。
-- ③ **未达标，主战场**（见下"已知瓶颈"）。
+- ① 基本达标（curl HTTPS 端到端 TLS、~415KB 反复下载无 bad-decrypt；TUIC/REALITY 两腿均真出口通过）。
+- ② 基本达标于当前真出口条件（刀3/3.5：oversized UDP stream 兜底 + native/cubic 高码率；YouTube 4K soak 通过）。
+  仍需在新网络/新服务端上按 acceptance 复测。
+- ③ 大并发主路径已修两类 client-side 问题（刀2 脏集合/弹性扩容/fake-IP 回收，刀13 非阻塞 uplink 去跨流 HoL）。
+  剩余吞吐杠杆是 **#3 单 QUIC connection / connection pool**，但只在低 RTT、端到端 >100M 胖链路上才值得量化。
 
 > 范围边界：前端/桌面/移动 App + 云端 backend 在**独立仓 `mini_vpn_app`**（契约先行，另一个 session 设计架构）。**core 仓只做数据面**，不碰 GUI/backend；library 化 / `local-control` 接入由前端 session 主导，**不在本路线内**——本路线只把 Rules.md 三目标做达标。
 
@@ -70,7 +77,9 @@
  ├─ 刀5  拦全:53 裸包 DNS 劫持（任意 resolver 明文→fake-IP，废 smoltcp DNS socket）  ✅ 完成 + 真出口 acceptance（见下「刀5」，ADR-0007）；已合 main
  ├─ 刀11 数据面可观测性（DNS forge 计数 + datagram drop/背压 + 统一快照 MetricsSnapshot）  ✅ **完成（代码 + 两轮 review 零 bug + 真出口 acceptance ✅）+ 已 ff 合入 main `9de0604`**（见下「刀11 完成」）
  ├─ 刀12 多核逼近 100M：量化定位（quantify-only，LoopProfiler 仪器）  ✅ 完成 + 真出口归因（见下「刀12 完成」，ADR-0013）；**#4 实测推翻、取消分片**
- └─ （主线下一刀）**刀13 候选**（sample 实测定，ADR-0013「Update」）：①最便宜=**删/门控热路径 `println!`**（sample 揪出 loop 头号 on-CPU）②结构性=**非阻塞上行发送**（消除跨流 HoL）；#3 连接池留低 RTT 胖链路再测
+ ├─ 刀13 主循环热路径净化  ✅ 完成 + 已合 main `8be4141`：`MINI_VPN_TRACE` 门控热路径日志 + 非阻塞 TCP uplink（try_reserve，Full 保留 smoltcp 字节）消除跨流 HoL
+ ├─ 刀14a 文档/接力收口：把刀13 从候选改为已完成，修 stale TODO/HANDOFF/ADR 指针
+ └─ 刀14b 低 RTT 胖链路 #3 量化 gate：只做 probe/spec/acceptance；无合格链路前不写 connection pool
 
 正交线 A（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）= VLESS+REALITY 第二 Transport（手写 TLS 1.3，ADR-0008）
  ├─ 刀6  REALITY auth 密码学 + TLS 1.3 ClientHello 构造（sans-IO，100% 离线 TDD）  ✅ 完成（见下「刀6」，ADR-0008）；已合 main
@@ -378,9 +387,9 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
   （parked/空等）压倒，真 CPU 极小（smoltcp poll 仅 17）→ **进程非 CPU-bound、#4 二次证伪、#3 锁死**。**💎 主循环 #1 on-CPU
   成本=热路径 `println!`**（`process_listener_activity→_print→write` ~183 采样；`📬` 行 client_tun.rs:658 等）远超 poll(17)——
   22000 事件/秒每次阻塞 write、纯浪费 + 加重 HoL。
-- **裁决（ADR-0013）→ 刀13**：**取消事件循环分片（route a）**（loop 非 CPU-bound，分片无用）；**#3 连接池**留**低 RTT 胖链路**再测；
-  **🔑 刀13 候选（cheap→结构性）**：①**删/门控热路径 println**（最便宜、干掉 loop 头号 on-CPU + 每事件一次阻塞 write）
-  ②**非阻塞上行发送**（`try_send`+满则留 smoltcp+保持 dirty，端到端 TCP 背压，消除跨流 HoL，服务 Rules ③）。`LoopProfiler` 留作复测工具。
+- **裁决（ADR-0013）→ 刀13**：**取消事件循环分片（route a）**（loop 非 CPU-bound，分片无用）；**#3 连接池**留**低 RTT 胖链路**再测。
+  刀13 已按 sample 的 cheap→结构性顺序完成：①热路径 `println!` 由 `MINI_VPN_TRACE` 门控；②上行发送改
+  `try_reserve`，Full 时留 smoltcp 字节 + 保持 dirty，端到端 TCP 背压，消除跨流 HoL。`LoopProfiler` 留作复测工具。
 - **deferred / 可选**：启动首条 `🔬`（`wall≈0ms` tokio interval 首 tick）退化——**已加 guard 跳过**（commit `33d9418`）。
 
 ## Rhythm（每刀都遵守）
@@ -395,17 +404,17 @@ B: 背压警告门控 Native；C: 去重 MTU floor 常量）。
 ## 已知坑 / deferred（接力时别重新踩）
 
 - **0-RTT**：quinn 0.10 / rustls 0.21 在 0-RTT 阶段无法 `export_keying_material`，TUIC auth 必失败回落 1-RTT → `MINI_VPN_TUIC_ZERO_RTT` 默认关。真 0-RTT 需 quinn 升级（归移动端 stage），见 TODO 13c。
-- **quic-stream UDP fallback** 未实现（native datagram 超上限丢弃）——刀3 要做。
-- **DoH/DoT 绕过 fake-IP**：浏览器/系统加密 DNS 会拿到真实 IP → 连接失败——刀4。
+- **quic-stream UDP fallback 已完成**：刀3 已做 oversized packet uni-stream 兜底；刀3.5 后默认仍是 native/cubic。
+- **加密 DNS/fake-IP 绕行主链已关闭**：刀4 阻断已知 DoH/DoT/DoQ/DoH3，刀5 拦全 plaintext :53。
 - ~~**fake-IP 池永不回收**（198.18/15）~~——✅ 刀2 已修（引用计数活跃 flow + 60s sweep + 死槽回收）。
-- **first-SYN-to-fresh-fake-IP `connection refused`**（SYN inspector 建池竞态，curl 不重试 refused）——刀4。
+- **first-SYN-to-fresh-fake-IP refused 竞态已关闭**：刀4 acceptance 确认 knife2 已修。
 - 出口是 VPS datacenter IP → Google/Meta 风控（协议无关，记录即可）。
 
 ## Not in git（用户提供；真实/UDP 直播 acceptance 时需要）
 
 - sing-box 互通参数（env）：`MINI_VPN_TUIC_SERVER=<VPS_IP>:8443`、`MINI_VPN_TUIC_UUID=<uuid>`、`MINI_VPN_TUIC_PASSWORD=<pass>`、`MINI_VPN_TUIC_SNI=example.com`、`MINI_VPN_TUIC_CA_PATH=certs/dev/ca-cert.pem`、`MINI_VPN_TUIC_ALPN=h3`。（向用户要实际 UUID/password/IP，**勿入库**。）
 - 启动：`sudo MINI_VPN_TUIC_* ./target/debug/mini_vpn client-tun`（13d 起 `MINI_VPN_UPSTREAM` 已删，恒 TUIC；`MINI_VPN_TUN_POOL_SIZE` 可调端口池）。
-- **刀3.5 新增旋钮**（非凭据，可入库默认；env 覆盖）：`MINI_VPN_TUIC_CC=bbr|cubic`（默认 bbr）、`MINI_VPN_TUIC_UDP_MODE=native|quic`（默认 native，acceptance gate 后可能翻 quic）。
+- **刀3.5 新增旋钮**（非凭据，可入库默认；env 覆盖）：`MINI_VPN_TUIC_CC=bbr|cubic`（默认 cubic）、`MINI_VPN_TUIC_UDP_MODE=native|quic`（默认 native）。
 - 刀1 若走 mock-upstream 隔离压测，则**不需要** sing-box。
 - **刀5 acceptance**：`sudo -E bash scripts/knife35-acceptance.sh soak-knife5`（设系统 DNS=8.8.8.8 非我方 resolver + 路由进 TUN，
   验证任意 :53 仍被劫持）；`soak-stop` 自动还原。`K5_RES` env 可换 alt-resolver。需同上 `MINI_VPN_TUIC_*` 凭据。
