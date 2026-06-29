@@ -159,6 +159,8 @@ append_iperf_cmd() {
   echo "> 判读前先确认：curl ipinfo.io 必须是 exit IP；dig example.com +short 应是 198.18.x.x；📊 TCP relay 累计应增长。"
 } > "$OUT"
 
+append_cleanliness_check
+
 append_section "Tunnel Gold Checks"
 append_cmd curl -fsS ipinfo.io
 if command -v dig >/dev/null 2>&1; then
@@ -177,8 +179,6 @@ if [[ -f "$LOG" ]]; then
 else
   echo "log not found: $LOG" | tee -a "$OUT"
 fi
-
-append_cleanliness_check
 
 append_section "TCP Forward Sweep"
 for p in $PARALLEL_SET; do

@@ -18,7 +18,7 @@ T1 刀14b spec/plan
 T2 probe 脚本
  ├─ `scripts/knife14b-lowrtt-probe.sh <target> [port]`
  ├─ 记录 `curl ipinfo.io`、fake-IP DNS、`📊/🔬` 尾部日志
- ├─ 开跑前提示当前 `TCP relay` / `fake-IP` 活跃度，避免后台流量污染 14b 判读
+ ├─ 金丝雀前提示当前 `TCP relay` / `fake-IP` 活跃度，避免后台流量污染 14b 判读
  ├─ 每组 iperf 后附本组期间新增的 `📊/🔬` 行，方便对齐吞吐塌缩和主循环状态
  ├─ 跑 `iperf3 -P 1 2 4 8` 正/反向
  └─ 可选 UDP probe（`RUN_UDP=1`）
