@@ -137,11 +137,14 @@ for p in $PARALLEL_SET; do
 done
 
 append_section "Result Summary Lines"
+summary_tmp="$(mktemp)"
+grep -E '^\[SUM\].*(sender|receiver)$|^\[[[:space:]]*[0-9]+\].*(sender|receiver)$|^exit=' "$OUT" > "$summary_tmp" || true
 {
   echo '```text'
-  grep -E '^\[SUM\].*(sender|receiver)$|^\[[[:space:]]*[0-9]+\].*(sender|receiver)$|^exit=' "$OUT" || true
+  cat "$summary_tmp"
   echo '```'
 } | tee -a "$OUT"
+rm -f "$summary_tmp"
 
 echo
 echo "report written: $OUT"
