@@ -17,6 +17,7 @@ T1 刀14b spec/plan
 
 T2 probe 脚本
  ├─ `scripts/knife14b-lowrtt-probe.sh <target> [port]`
+ ├─ `scripts/knife14b-direct-baseline.sh <target> [port]`：在出口服务器上验证裸路径上限
  ├─ 记录 `curl ipinfo.io`、fake-IP DNS、`📊/🔬` 尾部日志
  ├─ 金丝雀前提示当前 `TCP relay` / `fake-IP` 活跃度，避免后台流量污染 14b 判读
  ├─ 每组 iperf 后附本组期间新增的 `📊/🔬` 行，方便对齐吞吐塌缩和主循环状态
@@ -24,12 +25,32 @@ T2 probe 脚本
  └─ 可选 UDP probe（`RUN_UDP=1`）
 
 T3 验证
- ├─ `bash -n scripts/knife14b-lowrtt-probe.sh`
+ ├─ `bash -n scripts/knife14b-lowrtt-probe.sh && bash -n scripts/knife14b-direct-baseline.sh`
  ├─ 文档 grep 自检：刀13 不再作为候选
  └─ 代码质量门按需；本刀无 Rust 代码变更，不跑 cargo 全套
 ```
 
 ## T2 脚本接口
+
+### Direct baseline（在出口服务器运行）
+
+```bash
+scripts/knife14b-direct-baseline.sh <iperf-target> [port]
+```
+
+环境变量：
+
+| Env | 默认 | 说明 |
+|---|---:|---|
+| `PARALLEL_SET` | `1 2 4 8` | iperf parallel flow sweep |
+| `DURATION` | `30` | 每组秒数 |
+| `OUT` | `/tmp/mvpn_knife14b_direct_<timestamp>.md` | 输出报告 |
+| `PING_COUNT` | `20` | ping RTT 样本数 |
+| `MTR_COUNT` | `20` | 有 `mtr` 时的采样数 |
+
+输出报告包含 host context、出口公网 IP、路由/RTT/path trace、TCP 正/反向 P sweep 和 summary lines。
+
+### Tunnel probe（在 client 运行）
 
 ```bash
 scripts/knife14b-lowrtt-probe.sh <iperf-target> [port]
