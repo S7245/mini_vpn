@@ -517,8 +517,8 @@ pub async fn start_tun_proxy() {
         }
     };
     println!(
-        "🚀 TUN runtime started with pool_size={}",
-        runtime_config.listener.pool_size
+        "🚀 TUN runtime started with pool_size={}, tun_mtu={}",
+        runtime_config.listener.pool_size, runtime_config.tun_mtu
     );
     // 刀11：数据面 📊 快照周期（MINI_VPN_METRICS_SECS 可调；acceptance 设 5 即秒级看指标）。
     println!(
@@ -534,14 +534,14 @@ pub async fn start_tun_proxy() {
     }
 
     // 1. 初始化 TUN 设备 / 创建操作系统的原生异步虚拟网卡。
-    let raw_tun = match create_tun_device().await {
+    let raw_tun = match create_tun_device(runtime_config.tun_mtu).await {
         Ok(device) => device,
         Err(e) => {
             println!("无法创建 TUN 设备: {e}");
             return;
         }
     };
-    let device = VirtualTunDevice::new(raw_tun);
+    let device = VirtualTunDevice::new(raw_tun, runtime_config.tun_mtu);
 
     // 刀11：进程级数据面可观测性句柄。**在选上游之前**构造一次 → 同一 `Arc<Metrics>` 既喂
     // run_event_loop（DNS/relay/gauge），又（T6 起）clone 进 TuicUpstream（UDP 下行 drop/背压）。
@@ -1789,13 +1789,14 @@ async fn handle_tuic_udp_uplink<U: DatagramUpstream>(
     upstream.send_udp(encode_packet(assoc_id, &target, udp.payload)).await;
 }
 
-pub async fn create_tun_device() -> tun::Result<tun::AsyncDevice> {
+pub async fn create_tun_device(tun_mtu: usize) -> tun::Result<tun::AsyncDevice> {
     let mut config = tun::Configuration::default();
 
     config
         .address((10, 0, 0, 1)) // 网卡的 IP 地址
         .destination((10, 0, 0, 2)) // 🌟 新增：告诉 OS 水管另一头是谁！
         .netmask((255, 255, 255, 0)) // 子网掩码
+        .mtu(tun_mtu_for_config(tun_mtu)) // 刀14c：OS TUN MTU 与 smoltcp capability 对齐
         .up(); // 启动网卡
 
     #[cfg(target_os = "macos")]
@@ -1804,6 +1805,10 @@ pub async fn create_tun_device() -> tun::Result<tun::AsyncDevice> {
     // Create the async TUN device with an explicit error path.
     // 中文要点：这里不要 panic，启动失败应当以可观测的错误返回给上层。
     tun::create_as_async(&config)
+}
+
+fn tun_mtu_for_config(tun_mtu: usize) -> i32 {
+    i32::try_from(tun_mtu).expect("validated MINI_VPN_TUN_MTU fits tun::Configuration::mtu(i32)")
 }
 
 #[cfg(test)]
@@ -2271,6 +2276,13 @@ mod tests {
         assert_eq!(parse_tun_mtu(Some("abc")), DEFAULT_TUN_MTU);
         assert_eq!(parse_tun_mtu(Some("")), DEFAULT_TUN_MTU);
         assert_eq!(parse_tun_mtu(None), DEFAULT_TUN_MTU);
+    }
+
+    #[test]
+    fn tun_mtu_for_config_preserves_runtime_mtu() {
+        assert_eq!(tun_mtu_for_config(1200), 1200);
+        assert_eq!(tun_mtu_for_config(DEFAULT_TUN_MTU), 1500);
+        assert_eq!(tun_mtu_for_config(MAX_TUN_MTU), 9000);
     }
 
     /// 刀13 ①：MINI_VPN_TRACE 解析——`1`/`true`（去空白、不区分大小写）开；其它/缺省关

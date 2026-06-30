@@ -10,6 +10,8 @@ const UTUN_IPV4_HEADER: [u8; 4] = [0, 0, 0, 2];
 /// 虚拟 TUN 设备包装器：连接异步物理网卡与同步 smoltcp 协议栈的桥梁
 pub struct VirtualTunDevice {
     pub device: tun::AsyncDevice,
+    /// 刀14c：真实 TUN IP MTU。必须和 OS TUN MTU / smoltcp capability 保持一致。
+    mtu: usize,
     /// 收货仓库：存放刚从网卡读出来、还没被 smoltcp 吃掉的一个完整 IP 包
     pub rx_buffer: Option<BytesMut>,
     /// 发货仓库：存放 smoltcp 已经打包好、排队等待发给物理网卡的 IP 包队列
@@ -19,9 +21,10 @@ pub struct VirtualTunDevice {
 // 让我们稍微打磨一下这个基础结构体，顺便给它加上一个创建实例的关联函数：
 impl VirtualTunDevice {
     /// 构造函数
-    pub fn new(device: tun::AsyncDevice) -> Self {
+    pub fn new(device: tun::AsyncDevice, mtu: usize) -> Self {
         Self {
             device,
+            mtu,
             rx_buffer: None,
             tx_queue: VecDeque::new(),
         }
@@ -31,12 +34,7 @@ impl VirtualTunDevice {
     // 当这个方法(wait_for_rx())被 .await 唤醒时，说明底层的 tun0 网卡来数据包了，我们需要把它读出来，存进 rx_buffer 这个“收货仓库”里，准备等下喂给 smoltcp。
     /// 异步进货：等待物理网卡吐出数据，存入 rx_buffer
     pub async fn wait_for_rx(&mut self) -> std::io::Result<()> {
-        
-        // macOS utun raw read/write 总是带 4 字节 packet information 头。
-        #[cfg(target_os = "macos")]
-        let mut buf = BytesMut::zeroed(1504);
-        #[cfg(not(target_os = "macos"))]
-        let mut buf = BytesMut::zeroed(1500);
+        let mut buf = BytesMut::zeroed(rx_buffer_capacity_for_mtu(self.mtu));
 
         // 2. 异步等待网卡吐出数据，并拿到读取的字节数 (n)
         let n = self.device.read(&mut buf).await?;
@@ -224,19 +222,7 @@ impl Device for VirtualTunDevice {
     type TxToken<'a> = TunTxToken<'a>;
 
     fn capabilities(&self) -> DeviceCapabilities {
-        let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1500; // 标准网卡 MTU
-        caps.medium = Medium::Ip; // 我们处理的是纯 IP 包 (三层)，不是以太网帧 (二层)
-
-        // 🌟 新增：解决操作系统校验和卸载问题
-        let mut cs = smoltcp::phy::ChecksumCapabilities::default();
-        // 设置为 Tx 表示：接收 (Rx) 时不检查校验和，但发送 (Tx) 时强制计算校验和
-        cs.tcp = smoltcp::phy::Checksum::Tx;
-        cs.ipv4 = smoltcp::phy::Checksum::Tx;
-        cs.icmpv4 = smoltcp::phy::Checksum::Tx;
-        caps.checksum = cs;
-
-        caps
+        device_capabilities_for_mtu(self.mtu)
     }
 
     fn receive(
@@ -267,6 +253,36 @@ impl Device for VirtualTunDevice {
     }
 }
 
+fn rx_buffer_capacity_for_mtu(mtu: usize) -> usize {
+    mtu + tun_packet_header_len()
+}
+
+fn tun_packet_header_len() -> usize {
+    #[cfg(target_os = "macos")]
+    {
+        UTUN_IPV4_HEADER.len()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        0
+    }
+}
+
+fn device_capabilities_for_mtu(mtu: usize) -> DeviceCapabilities {
+    let mut caps = DeviceCapabilities::default();
+    caps.max_transmission_unit = mtu;
+    caps.medium = Medium::Ip;
+
+    let mut cs = smoltcp::phy::ChecksumCapabilities::default();
+    // 设置为 Tx 表示：接收 (Rx) 时不检查校验和，但发送 (Tx) 时强制计算校验和。
+    cs.tcp = smoltcp::phy::Checksum::Tx;
+    cs.ipv4 = smoltcp::phy::Checksum::Tx;
+    cs.icmpv4 = smoltcp::phy::Checksum::Tx;
+    caps.checksum = cs;
+
+    caps
+}
+
 
 /*
 设备能力：DeviceCapabilities { medium: Ip, max_transmission_unit: 1500, max_burst_size: None, checksum: ChecksumCapabilities { ipv4: Both, udp: Both, tcp: Both, icmpv4: Both } }
@@ -294,5 +310,23 @@ mod tests {
         }
         #[cfg(not(target_os = "macos"))]
         assert_eq!(&framed[..], &pkt[..]);
+    }
+
+    #[test]
+    fn rx_buffer_capacity_tracks_configured_mtu() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(rx_buffer_capacity_for_mtu(1200), 1204);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(rx_buffer_capacity_for_mtu(1200), 1200);
+    }
+
+    #[test]
+    fn device_capabilities_tracks_configured_mtu() {
+        let caps = device_capabilities_for_mtu(1200);
+        assert_eq!(caps.medium, Medium::Ip);
+        assert_eq!(caps.max_transmission_unit, 1200);
+        assert!(matches!(caps.checksum.tcp, smoltcp::phy::Checksum::Tx));
+        assert!(matches!(caps.checksum.ipv4, smoltcp::phy::Checksum::Tx));
+        assert!(matches!(caps.checksum.icmpv4, smoltcp::phy::Checksum::Tx));
     }
 }
