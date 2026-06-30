@@ -7,8 +7,8 @@
 #![cfg(feature = "harness")]
 
 use mini_vpn::harness::{
-    ScenarioParams, run_tcp_hol_scenario, run_tcp_scenario, run_udp_echo_scenario,
-    run_udp_throughput_scenario,
+    ScenarioParams, run_tcp_hol_scenario, run_tcp_scenario, run_tcp_slow_open_scenario,
+    run_udp_echo_scenario, run_udp_throughput_scenario,
 };
 use std::time::Duration;
 
@@ -107,6 +107,38 @@ async fn stalled_tcp_uplink_does_not_block_other_flows() {
     assert_eq!(
         report.tcp_opens_after_release, 2,
         "释放后也不应为 A 重开远端；Full 路径应保留原 relay 并靠背压恢复"
+    );
+}
+
+/// 刀14d：一条慢 `open_tcp` 不能 head-of-line 阻塞另一条正常 flow。
+///
+/// 旧实现会在主循环里 inline await A 的 `open_tcp`，导致 B 的 SYN/上行/下行都不能推进；
+/// 修复后 A 的远端开流在后台完成，B 应在 A 仍卡住时完成。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_tcp_open_does_not_block_other_flows() {
+    let report = run_tcp_slow_open_scenario().await;
+    eprintln!("slow-open report: {report:?}");
+    assert!(
+        report.slow_open_observed,
+        "测试必须先观察到 mock open_tcp 卡住，否则没有触发 slow-open 场景"
+    );
+    assert!(
+        report.normal_completed_while_slow_open,
+        "A 流 open_tcp 卡住时，B 流仍应完成；否则主循环仍被慢 open HoL 阻塞"
+    );
+    assert!(
+        report.slow_completed_after_release,
+        "释放 slow open 后 A 应最终完成"
+    );
+    assert!(report.normal_bytes_match, "B 流 echo 字节必须逐字节完整");
+    assert!(report.slow_bytes_match, "A 流 echo 字节必须逐字节完整");
+    assert_eq!(
+        report.tcp_opens_while_slow_open, 2,
+        "slow open 期间应只打开 A+B 两条远端流"
+    );
+    assert_eq!(
+        report.tcp_opens_after_release, 2,
+        "释放后不应为 A 重开远端；迟到 open 结果应安装原 flow"
     );
 }
 

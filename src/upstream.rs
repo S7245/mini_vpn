@@ -21,11 +21,10 @@ pub type RelayStream = Box<dyn AsyncStream>;
 pub trait ProxyUpstream: Send + Sync {
     async fn open_tcp(&self, target: &TargetAddr) -> Result<RelayStream, ClientError>;
 
-    /// `open_tcp` 是否足够廉价、可在单任务主循环里 inline await 而不 stall 其它 flow（刀9 M3）。
-    /// 中文要点：默认 **true**（inline，零回归——TUIC 复用 QUIC 连接 open_bi 廉价、harness/mock 也 inline）。
-    /// 仅 REALITY（每条 TCP 一次多-RTT 手写 TLS 握手）override 成 false → 主循环把它 spawn 出去并发化，
-    /// 避免一条慢握手饿死所有 flow（尤其 failover 到 REALITY 当班、握手频繁时）。`FailoverUpstream` 按当前
-    /// 选腿委托（TUIC 腿→true、REALITY 腿→false）。
+    /// `open_tcp` 是否足够廉价、可在单任务主循环里 inline await 而不 stall 其它 flow（刀9 M3 / 刀14d）。
+    /// 中文要点：默认 **true** 只适合明确不会等待网络/flow-control 的测试或轻量 mock。生产 Transport 若
+    /// `open_tcp` 可能等待重连、握手、开流或写 Connect 头，必须 override 成 false，让主循环 spawn async
+    /// remote-open，避免一条慢 open 饿死所有 flow。
     fn open_is_cheap(&self) -> bool {
         true
     }

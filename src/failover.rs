@@ -343,7 +343,7 @@ where
     /// 窗口 → inline 分支可能真跑 REALITY 握手 stall 主循环）；且**失败模式下 TUIC open 本身也不廉价**——
     /// 它要做黑洞 reconnect（QUIC 握手到被封 server，可阻塞），inline 同样 stall。恒 spawn 把所有 open
     /// （含 down 切换的 seamless 重试、黑洞 reconnect）都移出主循环，彻底消除 stall 与 TOCTOU。
-    /// 纯 TUIC 默认模式（非 failover）走 `TuicUpstream`（open_is_cheap=true）仍 inline，零回归不受影响。
+    /// 刀14d 后纯 TUIC 也把 open spawn 出主循环；failover 继续恒 false，避免动态选腿 TOCTOU。
     fn open_is_cheap(&self) -> bool {
         false
     }

@@ -249,6 +249,8 @@ pub struct MockUpstream {
     /// 刀13：指定 TCP 目标端口进入“拥塞但不关闭”的 mock stall，用来复现一条慢流堵住
     /// relay channel 时是否拖死其它流。None = 普通 echo（既有场景零影响）。
     stall: Option<StallConfig>,
+    /// 刀14d：指定 TCP 目标端口在 `open_tcp` 阶段等待，用来证明远端开流本身不能 inline 卡住主循环。
+    open_stall: Option<OpenStallConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -258,7 +260,13 @@ struct StallConfig {
     control: StallControl,
 }
 
-/// 刀13 harness：可释放的上游停读控制。`released` 解决 `Notify` 先发后等会丢信号的问题。
+#[derive(Debug, Clone)]
+struct OpenStallConfig {
+    port: u16,
+    control: OpenStallControl,
+}
+
+/// 刀13 harness：可释放的上游停读控制。`released` + `notify_one` permit 解决先发后等丢信号的问题。
 #[derive(Debug, Clone)]
 struct StallControl {
     released: Arc<AtomicBool>,
@@ -285,7 +293,43 @@ impl StallControl {
 
     fn release(&self) {
         self.released.store(true, Ordering::Relaxed);
-        self.notify.notify_waiters();
+        self.notify.notify_one();
+    }
+
+    async fn wait_released(&self) {
+        while !self.released.load(Ordering::Relaxed) {
+            self.notify.notified().await;
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OpenStallControl {
+    released: Arc<AtomicBool>,
+    waiting: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl OpenStallControl {
+    fn new() -> Self {
+        Self {
+            released: Arc::new(AtomicBool::new(false)),
+            waiting: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    fn mark_waiting(&self) {
+        self.waiting.store(true, Ordering::Relaxed);
+    }
+
+    fn is_waiting(&self) -> bool {
+        self.waiting.load(Ordering::Relaxed)
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::Relaxed);
+        self.notify.notify_one();
     }
 
     async fn wait_released(&self) {
@@ -312,6 +356,7 @@ impl MockUpstream {
             downlink_tx,
             frag_chunk,
             stall: None,
+            open_stall: None,
         }
     }
 
@@ -331,6 +376,27 @@ impl MockUpstream {
             stall: Some(StallConfig {
                 port: stall_port,
                 after_bytes: stall_after_bytes,
+                control,
+            }),
+            open_stall: None,
+        }
+    }
+
+    fn with_open_stall(
+        echo_buf: usize,
+        downlink_tx: mpsc::Sender<Vec<u8>>,
+        open_stall_port: u16,
+        control: OpenStallControl,
+    ) -> Self {
+        Self {
+            tcp_opens: AtomicU64::new(0),
+            udp_uplinks: AtomicU64::new(0),
+            echo_buf,
+            downlink_tx,
+            frag_chunk: None,
+            stall: None,
+            open_stall: Some(OpenStallConfig {
+                port: open_stall_port,
                 control,
             }),
         }
@@ -355,6 +421,15 @@ fn target_port(target: &TargetAddr) -> u16 {
 impl ProxyUpstream for MockUpstream {
     async fn open_tcp(&self, target: &TargetAddr) -> Result<RelayStream, ClientError> {
         self.tcp_opens.fetch_add(1, Ordering::Relaxed);
+        if let Some(open_stall) = self
+            .open_stall
+            .as_ref()
+            .filter(|s| s.port == target_port(target))
+            .cloned()
+        {
+            open_stall.control.mark_waiting();
+            open_stall.control.wait_released().await;
+        }
         let stall = self
             .stall
             .as_ref()
@@ -417,6 +492,10 @@ impl ProxyUpstream for MockUpstream {
             });
         }
         Ok(Box::new(near))
+    }
+
+    fn open_is_cheap(&self) -> bool {
+        self.open_stall.is_none()
     }
 }
 
@@ -874,6 +953,18 @@ pub struct TcpHolReport {
     pub tcp_opens_after_release: u64,
 }
 
+/// 刀14d：一条慢 `open_tcp` 不应阻塞另一条正常 TCP flow。
+#[derive(Debug, Clone)]
+pub struct TcpSlowOpenReport {
+    pub slow_open_observed: bool,
+    pub normal_completed_while_slow_open: bool,
+    pub slow_completed_after_release: bool,
+    pub normal_bytes_match: bool,
+    pub slow_bytes_match: bool,
+    pub tcp_opens_while_slow_open: u64,
+    pub tcp_opens_after_release: u64,
+}
+
 struct HolConn {
     handle: SocketHandle,
     payload: Vec<u8>,
@@ -1097,6 +1188,119 @@ pub async fn run_tcp_hol_scenario() -> TcpHolReport {
         stalled_sent: conns[0].sent,
         stalled_received: conns[0].received.len(),
         tcp_opens_while_stalled,
+        tcp_opens_after_release: mock.tcp_opens(),
+    }
+}
+
+/// 刀14d slow-open 高保真场景：
+/// 1. A 流的 mock `open_tcp` 在返回 relay stream 前等待；
+/// 2. A open 仍卡住时启动 B 流，B 必须完成；
+/// 3. 释放 A 后，A 也必须逐字节完整完成，且没有 spurious reopen。
+pub async fn run_tcp_slow_open_scenario() -> TcpSlowOpenReport {
+    let slow_port = TARGET_PORT_BASE;
+    let normal_port = TARGET_PORT_BASE + 1;
+    let open_control = OpenStallControl::new();
+
+    let gen_to_sut = PacketLink::new();
+    let sut_to_gen = PacketLink::new();
+    let (downlink_tx, downlink_rx) = mpsc::channel::<Vec<u8>>(1024);
+    let mock = Arc::new(MockUpstream::with_open_stall(
+        64 * 1024,
+        downlink_tx,
+        slow_port,
+        open_control.clone(),
+    ));
+
+    let sut_device = LoopbackTunDevice::new(gen_to_sut.clone(), sut_to_gen.clone());
+    let shared = Arc::new(Mutex::new(Recorded::default()));
+    let config = TunRuntimeConfig::from_sources(Some("4")).unwrap();
+    let sut = tokio::spawn(run_event_loop(
+        sut_device,
+        mock.clone(),
+        downlink_rx,
+        config,
+        Arc::new(Metrics::new()),
+        RecordingSink::new(shared),
+    ));
+
+    let mut gen_device = GeneratorDevice {
+        inbound: sut_to_gen,
+        outbound: gen_to_sut,
+    };
+    let mut gen_iface = {
+        let cfg = SmolConfig::new(smoltcp::wire::HardwareAddress::Ip);
+        let mut iface = Interface::new(cfg, &mut gen_device, SmolInstant::now());
+        iface.update_ip_addrs(|a| {
+            a.push(IpCidr::new(IpAddress::Ipv4(GEN_IP), 24)).unwrap();
+        });
+        iface.routes_mut().add_default_ipv4_route(GEN_IP).unwrap();
+        iface
+    };
+
+    let mut sockets = SocketSet::new(vec![]);
+    let slow_payload = hol_payload(0xB0, 8 * 1024);
+    let slow_handle = push_hol_conn(
+        &mut gen_iface,
+        &mut sockets,
+        slow_port,
+        42_000,
+        slow_payload.clone(),
+    );
+    let mut conns = vec![HolConn::new(slow_handle, slow_payload, 1024)];
+
+    drive_hol_generator(
+        &mut gen_iface,
+        &mut gen_device,
+        &mut sockets,
+        &mut conns,
+        Duration::from_secs(3),
+        |_| open_control.is_waiting(),
+    )
+    .await;
+    let slow_open_observed = open_control.is_waiting();
+
+    let normal_payload = hol_payload(0x30, 8 * 1024);
+    let normal_handle = push_hol_conn(
+        &mut gen_iface,
+        &mut sockets,
+        normal_port,
+        42_001,
+        normal_payload.clone(),
+    );
+    conns.push(HolConn::new(normal_handle, normal_payload, 1024));
+
+    drive_hol_generator(
+        &mut gen_iface,
+        &mut gen_device,
+        &mut sockets,
+        &mut conns,
+        Duration::from_secs(3),
+        |c| c[1].done(),
+    )
+    .await;
+    let normal_completed_while_slow_open = conns[1].done();
+    let tcp_opens_while_slow_open = mock.tcp_opens();
+
+    open_control.release();
+    drive_hol_generator(
+        &mut gen_iface,
+        &mut gen_device,
+        &mut sockets,
+        &mut conns,
+        Duration::from_secs(10),
+        |c| c[0].done() && c[1].done(),
+    )
+    .await;
+
+    sut.abort();
+
+    TcpSlowOpenReport {
+        slow_open_observed,
+        normal_completed_while_slow_open,
+        slow_completed_after_release: conns[0].done(),
+        normal_bytes_match: conns[1].bytes_match(),
+        slow_bytes_match: conns[0].bytes_match(),
+        tcp_opens_while_slow_open,
         tcp_opens_after_release: mock.tcp_opens(),
     }
 }

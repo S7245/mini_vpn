@@ -835,7 +835,7 @@ impl TuicUpstream {
     /// 由 `conn` 互斥锁串行化重连，避免并发双连接。
     /// 刀9（spec §2.3）：重连握手封 **5s 超时**——黑洞/不可达 server 的 QUIC 握手默认受 idle(15s, quic.rs) 约束、
     /// 可阻塞数十秒；5s 封顶让「连接死 + 重连失败」这个 failover 快路强信号**快速暴露**（is_dead 仍为
-    /// true，调用方 record_tuic_failure(dead) 即切 REALITY），同时也止血纯 TUIC 模式的 inline 重连久挂。
+    /// true，调用方 record_tuic_failure(dead) 即切 REALITY），同时也避免纯 TUIC open 任务久挂。
     async fn live_conn(&self) -> Result<Connection, ClientError> {
         let mut guard = self.conn.lock().await;
         if guard.close_reason().is_some() {
@@ -1118,6 +1118,13 @@ impl ProxyUpstream for TuicUpstream {
         tokio::time::timeout(TUIC_OPEN_TIMEOUT, open)
             .await
             .map_err(|_| io_err("tuic open_tcp", "5s 超时（黑洞/send 窗口满无 ACK；failover 慢路据此累计切备腿）"))?
+    }
+
+    /// 刀14d：TUIC `open_tcp` 通常很快，但它仍可能 await QUIC reconnect、`open_bi` 或 Connect write
+    /// flow-control up to `TUIC_OPEN_TIMEOUT`. 在单任务主循环里 inline await 会让一条慢 open 暂停
+    /// 下行 flush、timer、DNS 和 reap；所以走已有 async-open 状态机。
+    fn open_is_cheap(&self) -> bool {
+        false
     }
 }
 

@@ -51,7 +51,7 @@ fn trace_enabled() -> bool {
 
 /// 刀13 ①：热路径诊断 `println!` 门控宏——`trace_enabled()` 为真才打印（默认静默；翻 `MINI_VPN_TRACE=1`
 /// 全恢复，零信息损失）。保留 `println!`（stdout，acceptance 重定向到日志）语义不变。**仅门控每包/每连接/
-/// churn 噪声**；启动/错误/周期 📊/acceptance 依赖信号（🪪 DNS / 🛡️ 阻断 / spawn 握手）/run_relay
+/// churn 噪声**；启动/错误/周期 📊/acceptance 依赖信号（🪪 DNS / 🛡️ 阻断 / remote-open 失败）/run_relay
 /// lifecycle 仍用裸 `println!`（见 `docs/tech/2026-06-27-knife13-loop-hotpath-spec.md` §1.2 门控清单）。
 macro_rules! trace_log {
     ($($arg:tt)*) => {
@@ -124,13 +124,13 @@ struct ListenerSpec {
 enum SocketState {
     /// Ready to accept a new intercepted local TCP session.
     Listening,
-    /// Opening the remote substream **inline**（廉价上游：TUIC open_bi）。失败会卡在此态 →
-    /// 由 `reap_dead_slots` 第三判据回收（与刀2 行为一致，inline 路径零回归）。
+    /// Opening the remote substream **inline**（仅明确 cheap 的测试/mock 路径）。失败会卡在此态 →
+    /// 由 `reap_dead_slots` 第三判据回收（兼容旧 inline 行为）。
     OpeningRemote,
-    /// 刀9 M3：远端握手已 **spawn 出主循环**、在飞中（不廉价上游：REALITY 多-RTT 手写 TLS）。
-    /// 中文要点：与 `OpeningRemote` 区分——在飞握手是**正常态**（最长 ~10s，由上游 open_tcp 内置超时
+    /// Remote TCP open has been spawned out of the main loop and is still in flight.
+    /// 中文要点：与 `OpeningRemote` 区分——in-flight open 是**正常态**（由上游 open_tcp 内置超时
     /// 兜底 + `HandshakeDone` 必回灌），`reap_dead_slots` **不**按「OpeningRemote+无 uplink_tx」误杀它；
-    /// 仅当本地已关闭（`!is_active()`）才回收（回收时 bump epoch → 迟到结果被丢）。
+    /// 仅当本地已关闭（`!is_active()` / CloseWait）才回收（回收时 bump epoch → 迟到结果被丢）。
     HandshakePending,
     /// Local and remote sides are actively relaying payloads.
     Relaying,
@@ -251,11 +251,11 @@ struct SocketCtx {
     /// 中文要点：刀2 引用计数——首次开远端时 `acquire`、rearm 时 `release`，
     /// 保证该 fake-IP 映射在本 flow 存活期间不被 sweep 回收（否则 resolve 失败 → 断连）。
     fake_ip: Option<Ipv4Addr>,
-    /// 刀9 M3：握手代次。每进 `HandshakePending`（spawn 一次握手）+1；`rearm` 也 +1（让在飞握手失效）。
-    /// 中文要点：spawn 的握手任务捕获当时的 epoch；`handle_handshake_done` **先比 epoch**——不匹配
-    /// 说明本槽已被 rearm/复位/换代，迟到的握手结果直接丢弃，绝不装到新一代 socket（防串话核心）。
+    /// 刀9 M3 / 刀14d：async remote-open 代次。每进 `HandshakePending` +1；`rearm` 也 +1（让在飞 open 失效）。
+    /// 中文要点：spawn 的 open 任务捕获当时的 epoch；`handle_handshake_done` **先比 epoch**——不匹配
+    /// 说明本槽已被 rearm/复位/换代，迟到的 open 结果直接丢弃，绝不装到新一代 socket（防串话核心）。
     conn_epoch: u64,
-    /// 刀9 M3：spawn 握手在飞期间，本地到达的上行字节暂存（`uplink_tx` 尚未建立）。握手成功后按序
+    /// Async remote-open 在飞期间，本地到达的上行字节暂存（`uplink_tx` 尚未建立）。open 成功后按序
     /// flush 进 relay。**256KB 硬上限**防 OOM——溢出丢弃（应用 TCP 会因未 ACK 而背压/重传，自愈）。
     uplink_buffer: Vec<u8>,
     /// 刀14c：TCP 下行诊断计数。主循环独占，按事件日志输出，不进全局 MetricsSnapshot 防高基数。
@@ -279,7 +279,7 @@ impl SocketCtx {
         }
     }
 
-    /// 刀9 M3：握手在飞期间往 `uplink_buffer` 追加上行字节，带 256KB 硬上限。返回是否被接受
+    /// Async remote-open 在飞期间往 `uplink_buffer` 追加上行字节，带 256KB 硬上限。返回是否被接受
     /// （false=溢出丢弃，应用 TCP 未 ACK 会背压/重传，自愈）。
     fn buffer_uplink(&mut self, payload: &[u8]) -> bool {
         if self.uplink_buffer.len() + payload.len() > MAX_UPLINK_BUFFER {
@@ -290,12 +290,12 @@ impl SocketCtx {
     }
 }
 
-/// 刀9 M3：握手在飞期间 `uplink_buffer` 字节上限（防 OOM）。1000 连接×此上限 ≈ 256MB 上界，
-/// 实际远低（握手 ~RTT 级、buffer 通常仅首包几 KB）；超限丢弃由应用 TCP 背压自愈。
+/// Async remote-open 在飞期间 `uplink_buffer` 字节上限（防 OOM）。1000 连接×此上限 ≈ 256MB 上界，
+/// 实际远低（open 通常 ~RTT 级、buffer 通常仅首包几 KB）；超限丢弃由应用 TCP 背压自愈。
 const MAX_UPLINK_BUFFER: usize = 256 * 1024;
 
-/// 刀9 M3：一次 spawn 出主循环的远端握手完成事件，经 mpsc 回灌主循环 select。
-/// 中文要点：`epoch` = spawn 时捕获的握手代次，`handle_handshake_done` 据此防串话（迟到结果不装新代 socket）。
+/// 刀9 M3 / 刀14d：一次 spawn 出主循环的 remote-open 完成事件，经 mpsc 回灌主循环 select。
+/// 中文要点：`epoch` = spawn 时捕获的 open 代次，`handle_handshake_done` 据此防串话（迟到结果不装新代 socket）。
 struct HandshakeDone {
     handle: SocketHandle,
     epoch: u64,
@@ -828,8 +828,8 @@ pub async fn run_event_loop<D, U, M>(
     let (global_tx, mut global_rx) =
         tokio::sync::mpsc::channel::<(SocketHandle, Vec<u8>)>(RELAY_CHANNEL_CAPACITY);
 
-    // 刀9 M3：spawn 出主循环的远端握手（不廉价上游=REALITY）完成后经此回灌主循环安装 relay。
-    // 廉价上游（TUIC）仍 inline，不走此通道（零回归）。
+    // 刀9 M3 / 刀14d：spawn 出主循环的 remote-open 完成后经此回灌主循环安装 relay。
+    // 明确 cheap 的测试/mock 路径仍可 inline，不走此通道。
     let (handshake_done_tx, mut handshake_done_rx) =
         tokio::sync::mpsc::channel::<HandshakeDone>(HANDSHAKE_DONE_CAPACITY);
 
@@ -1023,8 +1023,8 @@ pub async fn run_event_loop<D, U, M>(
                     }
                 }
             }
-            // 刀9 M3：spawn 出主循环的远端握手（REALITY）完成 → 安装 relay（成功）/ rearm（失败），
-            // 带 epoch 防串话。廉价上游（TUIC）走 inline、不经此分支（零回归）。
+            // 刀9 M3 / 刀14d：spawn 出主循环的 remote-open 完成 → 安装 relay（成功）/ rearm（失败），
+            // 带 epoch 防串话。
             Some(done) = handshake_done_rx.recv() => {
                 metrics.loop_park_end();
                 handle_handshake_done(
@@ -1205,12 +1205,12 @@ async fn process_dirty_relay<U, M>(
 /// → Capped → #2 修好的热门端口 stall 又回来。低频（1s tick）调用，非每包热路径。
 ///
 /// 死槽判定（仅对「被用过」的槽，即 `ctx.state != Listening`；空闲 Listen 槽 ctx.state==Listening 永不命中）：
-/// - `!is_active()`：Closed / TimeWait（RST、双向关闭完成）；**也覆盖刀9 M3 的 `HandshakePending` 槽
-///   在本地已关闭时**（握手在飞但 app 已断）——回收时 rearm bump epoch，迟到的 `HandshakeDone` 被丢；
+/// - `!is_active()`：Closed / TimeWait（RST、双向关闭完成）；**也覆盖 `HandshakePending` 槽
+///   在本地已关闭时**（remote-open 在飞但 app 已断）——回收时 rearm bump epoch，迟到的 `HandshakeDone` 被丢；
 /// - `CloseWait`：被拦截应用已发 FIN（主动关闭）→ teardown，绝不会再有上行；
 /// - `OpeningRemote && uplink_tx.is_none()`：**inline** `open_tcp` 失败后状态卡在 OpeningRemote。
-///   中文要点（刀9 M3）：此第三判据**仅匹配 `OpeningRemote`**（inline 路径），**不**匹配 `HandshakePending`
-///   ——后者是 spawn 握手的**正常在飞态**（最长 ~10s，`HandshakeDone` 必回灌解决），绝不能在飞就回收。
+///   中文要点：此第三判据**仅匹配 `OpeningRemote`**（inline 路径），**不**匹配 `HandshakePending`
+///   ——后者是 async remote-open 的**正常在飞态**（由上游超时兜底，`HandshakeDone` 必回灌解决），绝不能在飞就回收。
 fn reap_dead_slots(
     registry: &ListenerRegistry,
     sockets: &mut SocketSet<'_>,
@@ -1225,14 +1225,10 @@ fn reap_dead_slots(
             let s = sockets.get::<TcpSocket>(h);
             let st = s.state();
             let active = s.is_active();
-            match socket_ctxs.get(&h) {
-                Some(ctx) if ctx.state != SocketState::Listening => {
-                    !active
-                        || st == TcpState::CloseWait
-                        || (ctx.state == SocketState::OpeningRemote && ctx.uplink_tx.is_none())
-                }
-                _ => false,
-            }
+            socket_ctxs
+                .get(&h)
+                .map(|ctx| should_reap_slot(ctx, st, active))
+                .unwrap_or(false)
         };
         if dead {
             let sock = sockets.get_mut::<TcpSocket>(h);
@@ -1251,6 +1247,15 @@ fn reap_dead_slots(
         }
     }
     reaped
+}
+
+fn should_reap_slot(ctx: &SocketCtx, tcp_state: TcpState, active: bool) -> bool {
+    if ctx.state == SocketState::Listening {
+        return false;
+    }
+    !active
+        || tcp_state == TcpState::CloseWait
+        || (ctx.state == SocketState::OpeningRemote && ctx.uplink_tx.is_none())
 }
 
 /// Allocate a fresh smoltcp TCP listener socket for one pool slot.
@@ -1459,7 +1464,7 @@ fn rearm_socket(
     ctx.uplink_tx = None;
     ctx.downlink_pending.clear();
     ctx.downlink_diag = TcpDownlinkDiag::default();
-    // 刀9 M3：清握手在飞缓存 + bump epoch——让任何在飞 spawn 握手的迟到 `HandshakeDone` 失配被丢
+    // 清 async-open 在飞缓存 + bump epoch——让任何迟到 `HandshakeDone` 失配被丢
     // （绝不装到本次 rearm 后的新一代 socket 上，防串话核心）。对非 spawn 槽是无害的纯计数自增。
     ctx.uplink_buffer.clear();
     ctx.conn_epoch = ctx.conn_epoch.wrapping_add(1);
@@ -1647,11 +1652,11 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
         return Ok(());
     };
 
-    // 刀9 M3：spawn 握手在飞中 → 后续上行包入 buffer（防双开 + 保序），不再开第二次握手。
+    // Async remote-open 在飞中 → 后续上行包入 buffer（防双开 + 保序），不再开第二次 open。
     if ctx.state == SocketState::HandshakePending {
         if !ctx.buffer_uplink(&payload) {
             trace_log!(
-                "⚠️ handle {:?} 握手在飞、上行缓存超上限({}KB)，丢弃 {}B（应用 TCP 背压自愈）",
+                "⚠️ handle {:?} remote open 在飞、上行缓存超上限({}KB)，丢弃 {}B（应用 TCP 背压自愈）",
                 handle,
                 MAX_UPLINK_BUFFER / 1024,
                 payload.len()
@@ -1668,7 +1673,7 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
     };
 
     if upstream.open_is_cheap() {
-        // —— 廉价上游（TUIC：复用 QUIC 连接 open_bi）：inline 开远端（刀2 行为，**零回归**）。——
+        // —— 明确廉价的上游：inline 开远端（主要用于测试/mock 轻路径）。——
         ctx.state = SocketState::OpeningRemote;
         trace_log!("🎯 handle {:?} extracted target {}", handle, target.to_wire_string());
         trace_log!("🔄 handle {:?} entering {:?}", handle, ctx.state);
@@ -1700,13 +1705,13 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
         spawn_remote_relay(handle, stream, rx, global_tx.clone(), metrics_handle);
         Ok(())
     } else {
-        // —— 不廉价上游（REALITY：每条 TCP 一次多-RTT 手写 TLS 握手）：spawn 出主循环并发化（刀9 M3）——
-        // 主循环立即返回处理其它 flow，不被这条慢握手 stall。握手完成经 handshake_done channel 回灌。
+        // —— 不廉价上游：把远端 TCP open spawn 出主循环并发化（刀9 M3 / 刀14d）——
+        // 主循环立即返回处理其它 flow，不被这条慢 open stall。完成后经 handshake_done channel 回灌。
         ctx.state = SocketState::HandshakePending;
-        ctx.conn_epoch = ctx.conn_epoch.wrapping_add(1); // 新握手代次
+        ctx.conn_epoch = ctx.conn_epoch.wrapping_add(1); // 新 remote-open 代次
         let epoch = ctx.conn_epoch;
         // fake-IP 在 spawn 时 acquire（与 inline「成功后才 acquire」不同——spawn 路径无早返回，
-        // 由 rearm 在握手失败/复位时 release，平衡）。首包入 buffer，握手成功后按序 flush。
+        // 由 rearm 在 open 失败/复位时 release，平衡）。首包入 buffer，open 成功后按序 flush。
         if let Some(ip) = fake_ip {
             fake_pool.acquire(ip, now_secs);
             ctx.fake_ip = Some(ip);
@@ -1715,12 +1720,12 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
             // 理论不可达（spawn 入口 buffer 必空、首包 << 256KB）；防御性对称上面 HandshakePending 分支。
             trace_log!("⚠️ handle {:?} spawn 入口缓存首包失败（{}B），丢弃", handle, payload.len());
         }
-        println!("🎯 handle {:?} target {} → spawn 握手（并发化，不 stall 主循环）", handle, target.to_wire_string());
+        trace_log!("🎯 handle {:?} target {} → spawn remote open（并发化，不 stall 主循环）", handle, target.to_wire_string());
 
         let up = Arc::clone(upstream);
         let done_tx = handshake_done_tx.clone();
         tokio::spawn(async move {
-            let result = up.open_tcp(&target).await; // REALITY open_tcp 自带 10s 超时兜底
+            let result = up.open_tcp(&target).await; // production open_tcp implementations carry their own timeout budget
             // channel 满 → send().await 背压（不丢，等主循环排空）；主循环已退出 → send 失败、忽略。
             let _ = done_tx.send(HandshakeDone { handle, epoch, result }).await;
         });
@@ -1728,8 +1733,8 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
     }
 }
 
-/// 刀9 M3：处理一次 spawn 握手的完成事件。**epoch 防串话置于一切之前**——迟到结果绝不装到新一代 socket。
-/// 成功 → 安装 uplink channel + 按序 flush 握手期缓存 + spawn relay；失败 → rearm。
+/// 处理一次 spawned remote-open 的完成事件。**epoch 防串话置于一切之前**——迟到结果绝不装到新一代 socket。
+/// 成功 → 安装 uplink channel + 按序 flush open 期间缓存 + spawn relay；失败 → rearm。
 fn handle_handshake_done(
     done: HandshakeDone,
     sockets: &mut SocketSet<'_>,
@@ -1744,10 +1749,10 @@ fn handle_handshake_done(
         return; // 槽已不存在：丢弃（Ok 的流随作用域 drop 关闭）
     };
     // 防串话（V2 patch 3）：epoch 比较置于状态检查**之前**。不匹配 = 本槽已 rearm/换代/复位 →
-    // 迟到的握手结果丢弃，绝不装到新一代 socket。Ok 的流随作用域结束 drop 而干净关闭。
+    // 迟到的 open 结果丢弃，绝不装到新一代 socket。Ok 的流随作用域结束 drop 而干净关闭。
     if ctx.conn_epoch != epoch {
         if result.is_ok() {
-            trace_log!("🗑️ handle {:?} 迟到握手结果(epoch {epoch}≠{}) 丢弃，不装到新代 socket", handle, ctx.conn_epoch);
+            trace_log!("🗑️ handle {:?} 迟到 open 结果(epoch {epoch}≠{}) 丢弃，不装到新代 socket", handle, ctx.conn_epoch);
         }
         return;
     }
@@ -1758,13 +1763,13 @@ fn handle_handshake_done(
     match result {
         Ok(stream) => {
             let (tx, rx) = tokio::sync::mpsc::channel(RELAY_CHANNEL_CAPACITY);
-            // 按序 flush 握手期缓存的上行字节（首包 + 在飞期到达的后续包，FIFO）。新 channel 容量充足、
+            // 按序 flush open 期间缓存的上行字节（首包 + 在飞期到达的后续包，FIFO）。新 channel 容量充足、
             // rx 未 drop、仅 1 条消息 → try_send 必成（避免 await-with-borrow）。防御性：万一失败（未来
             // 容量被改小等），**不静默丢缓存**——log + rearm 撤掉本槽，让应用 TCP 重建（Finding 2）。
             if !ctx.uplink_buffer.is_empty() {
                 let buffered = std::mem::take(&mut ctx.uplink_buffer);
                 if let Err(e) = tx.try_send(buffered) {
-                    trace_log!("❌ handle {:?} flush 握手缓存失败({e}) → rearm（不静默丢字节）", handle);
+                    trace_log!("❌ handle {:?} flush open 缓存失败({e}) → rearm（不静默丢字节）", handle);
                     let socket = sockets.get_mut::<TcpSocket>(handle);
                     rearm_socket_with_reason(
                         handle,
@@ -1780,11 +1785,11 @@ fn handle_handshake_done(
             }
             ctx.uplink_tx = Some(tx);
             ctx.state = SocketState::Relaying;
-            println!("🚪 handle {:?} remote session opened（spawn 握手成功）", handle);
+            trace_log!("🚪 handle {:?} remote session opened（spawn open 成功）", handle);
             spawn_remote_relay(handle, stream, rx, global_tx.clone(), metrics_handle);
         }
         Err(e) => {
-            println!("❌ handle {:?} spawn 握手失败: {e} → rearm", handle);
+            println!("❌ handle {:?} spawned remote open failed: {e} → rearm", handle);
             let socket = sockets.get_mut::<TcpSocket>(handle);
             rearm_socket_with_reason(
                 handle,
@@ -1888,7 +1893,7 @@ fn spawn_remote_relay(
     back_tx: mpsc::Sender<(SocketHandle, Vec<u8>)>,
     metrics_handle: &Metrics,
 ) {
-    // 刀11：每条新 TCP flow 开远端成功后在此唯一入口计一次（覆盖 inline TUIC + spawn 握手两条路）。
+    // 刀11：每条新 TCP flow 开远端成功后在此唯一入口计一次（覆盖 inline + spawned remote-open 两条路）。
     metrics_handle.inc_relays_spawned();
     tokio::spawn(run_relay(handle, stream, rx, back_tx));
 }
@@ -2393,6 +2398,88 @@ mod tests {
     }
 
     #[test]
+    fn reap_predicate_preserves_active_async_open() {
+        let mut pending = SocketCtx::new(443);
+        pending.state = SocketState::HandshakePending;
+        assert!(
+            !should_reap_slot(&pending, TcpState::Established, true),
+            "活跃 async-open 槽不能因 uplink_tx=None 被误 reap"
+        );
+
+        let mut opening = SocketCtx::new(443);
+        opening.state = SocketState::OpeningRemote;
+        assert!(
+            should_reap_slot(&opening, TcpState::Established, true),
+            "旧 inline OpeningRemote 且无 uplink_tx 仍应视为卡住可 reap"
+        );
+
+        let listening = SocketCtx::new(443);
+        assert!(
+            !should_reap_slot(&listening, TcpState::Closed, false),
+            "空闲 Listening 槽永不 reap"
+        );
+    }
+
+    /// 刀14d：本地已关闭的 in-flight open 必须回收、bump epoch，并让迟到 `HandshakeDone`
+    /// 被 epoch guard 丢弃。
+    #[tokio::test]
+    async fn reap_dead_async_open_drops_stale_result() {
+        let mut sockets = SocketSet::new(vec![]);
+        let mut ctxs: HashMap<SocketHandle, SocketCtx> = HashMap::new();
+        let mut reg = ListenerRegistry::new(1);
+        reg.ensure_port(443, &mut sockets, &mut ctxs).unwrap();
+        let handles: Vec<SocketHandle> = reg.handles_for_port(443).to_vec();
+        let closed_pending = handles[0];
+
+        let mut pool = FakeIpPool::new();
+        let ip = pool.alloc("x.com", 0);
+        pool.acquire(ip, 0);
+
+        {
+            let ctx = ctxs.get_mut(&closed_pending).unwrap();
+            ctx.state = SocketState::HandshakePending;
+            ctx.conn_epoch = 9;
+            ctx.fake_ip = Some(ip);
+        }
+        sockets.get_mut::<TcpSocket>(closed_pending).abort();
+
+        let reaped = reap_dead_slots(&reg, &mut sockets, &mut ctxs, &mut pool, 1);
+        assert_eq!(reaped, 1, "应回收本地已关闭的 async-open 槽");
+
+        let closed_ctx = ctxs.get(&closed_pending).unwrap();
+        assert_eq!(closed_ctx.state, SocketState::Listening);
+        assert_eq!(
+            closed_ctx.conn_epoch, 10,
+            "reap 应 bump epoch 让迟到 open 结果失效"
+        );
+        assert!(closed_ctx.fake_ip.is_none(), "reap 应释放 in-flight flow fake-IP");
+        assert_eq!(pool.sweep(1000, 300), 1, "release 后映射可回收");
+
+        let (global_tx, _grx) = mpsc::channel(8);
+        let stale = HandshakeDone {
+            handle: closed_pending,
+            epoch: 9,
+            result: Ok(Box::new(tokio::io::duplex(64).0)),
+        };
+        handle_handshake_done(
+            stale,
+            &mut sockets,
+            &mut ctxs,
+            &global_tx,
+            &mut pool,
+            2,
+            &Metrics::new(),
+        );
+        let closed_ctx = ctxs.get(&closed_pending).unwrap();
+        assert_eq!(
+            closed_ctx.state,
+            SocketState::Listening,
+            "迟到 open 结果不应装到 rearm 后的新一代 socket"
+        );
+        assert!(closed_ctx.uplink_tx.is_none());
+    }
+
+    #[test]
     fn rearm_socket_restores_listening_state_and_releases_fake_ip() {
         let spec = ListenerSpec { local_port: 80 };
         let mut socket = build_listener_socket(&spec);
@@ -2423,7 +2510,7 @@ mod tests {
             ctx.downlink_diag.downlink_pending_high_water, 0,
             "rearm 应清空当前 flow 的 downlink diagnostics"
         );
-        assert_eq!(ctx.conn_epoch, 8, "rearm 应 bump conn_epoch（让在飞握手失效，M3）");
+        assert_eq!(ctx.conn_epoch, 8, "rearm 应 bump conn_epoch（让在飞 open 失效，M3）");
         // refcount 已归零 → idle 超 TTL 可回收（证明 rearm 走了 release）。
         assert_eq!(pool.sweep(1000, 300), 1);
     }
@@ -2475,7 +2562,7 @@ mod tests {
         assert!(ctx.uplink_tx.is_some(), "匹配 epoch → 安装 uplink_tx");
     }
 
-    /// 握手失败（匹配 epoch + Err）→ rearm：回 Listening、释放 spawn 时 acquire 的 fake-IP、清 buffer。
+    /// Async open 失败（匹配 epoch + Err）→ rearm：回 Listening、释放 spawn 时 acquire 的 fake-IP、清 buffer。
     #[tokio::test]
     async fn handshake_done_failure_rearms_and_releases_fakeip() {
         let mut sockets = SocketSet::new(vec![]);
@@ -2490,7 +2577,7 @@ mod tests {
         socket_ctxs.insert(handle, ctx);
         let (global_tx, _grx) = mpsc::channel(8);
 
-        let err = HandshakeDone { handle, epoch: 2, result: Err(ClientError::Reality("握手失败".into())) };
+        let err = HandshakeDone { handle, epoch: 2, result: Err(ClientError::Reality("open 失败".into())) };
         handle_handshake_done(err, &mut sockets, &mut socket_ctxs, &global_tx, &mut pool, 1, &Metrics::new());
         let ctx = socket_ctxs.get(&handle).unwrap();
         assert_eq!(ctx.state, SocketState::Listening, "失败 → rearm 回 Listening");
@@ -2499,7 +2586,7 @@ mod tests {
         assert_eq!(pool.sweep(1000, 300), 1, "refcount 归零 → 可回收（acquire/release 平衡）");
     }
 
-    /// 握手成功 → 按序 flush 握手期缓存的上行字节到 relay 流。
+    /// Async open 成功 → 按序 flush open 期间缓存的上行字节到 relay 流。
     #[tokio::test]
     async fn handshake_done_flushes_buffered_uplink_in_order() {
         use tokio::io::AsyncReadExt;
@@ -2519,7 +2606,7 @@ mod tests {
 
         let mut got = vec![0u8; b"HELLO-BUFFERED".len()];
         far.read_exact(&mut got).await.unwrap();
-        assert_eq!(&got, b"HELLO-BUFFERED", "握手成功后按序 flush 缓存的上行字节");
+        assert_eq!(&got, b"HELLO-BUFFERED", "open 成功后按序 flush 缓存的上行字节");
     }
 
     #[test]
