@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 刀14b US-client tunnel suite.
+# 刀14c US-client tunnel suite.
 #
 # Run on the Ubuntu Client VPS. It validates the environment, starts mini_vpn
 # client-tun, routes only the iperf target into the TUN, runs the low-RTT probe,
@@ -26,8 +26,9 @@ Optional env:
   OUT_DIR=/tmp/conn
   DURATION=30
   PARALLEL_SET="1 2 4 8"
-  MTU=1200
-  RUN_BASE_MTU_P1=1         also run a P1 probe before lowering TUN MTU
+  SUITE_TAG=knife14c        report/bundle filename tag
+  MTU=1200                  TUN MTU passed to mini_vpn before client-tun starts
+  RUN_BASE_MTU_P1=0         14c keeps one aligned MTU per process; use a separate MTU=1500 run for baseline
   BUILD_RELEASE=1           build target/release/mini_vpn if missing
   KILL_OLD=1                stop old mini_vpn client-tun before starting
   KEEP_TUNNEL=0             keep mini_vpn running after the suite
@@ -35,8 +36,8 @@ Optional env:
   METRICS_SECS=5
 
 Output:
-  /tmp/conn/mvpn_knife14b_usclient_suite_<timestamp>.md
-  /tmp/conn/mvpn_knife14b_usclient_suite_<timestamp>.tar.gz
+  /tmp/conn/mvpn_knife14c_usclient_suite_<timestamp>.md
+  /tmp/conn/mvpn_knife14c_usclient_suite_<timestamp>.tar.gz
 USAGE
 }
 
@@ -47,12 +48,13 @@ fi
 
 TS="$(date +%Y%m%d_%H%M%S)"
 OUT_DIR="${OUT_DIR:-/tmp/conn}"
+SUITE_TAG="${SUITE_TAG:-knife14c}"
 TARGET="${TARGET:-43.130.32.77}"
 IPERF_PORT="${IPERF_PORT:-5201}"
 DURATION="${DURATION:-30}"
 PARALLEL_SET="${PARALLEL_SET:-1 2 4 8}"
 MTU="${MTU:-1200}"
-RUN_BASE_MTU_P1="${RUN_BASE_MTU_P1:-1}"
+RUN_BASE_MTU_P1="${RUN_BASE_MTU_P1:-0}"
 BUILD_RELEASE="${BUILD_RELEASE:-1}"
 KILL_OLD="${KILL_OLD:-1}"
 KEEP_TUNNEL="${KEEP_TUNNEL:-0}"
@@ -60,9 +62,9 @@ STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-25}"
 METRICS_SECS="${METRICS_SECS:-5}"
 
 mkdir -p "$OUT_DIR"
-REPORT="$OUT_DIR/mvpn_knife14b_usclient_suite_${TS}.md"
+REPORT="$OUT_DIR/mvpn_${SUITE_TAG}_usclient_suite_${TS}.md"
 CLIENT_LOG="$OUT_DIR/mvpn_accept_${TS}.log"
-BUNDLE="$OUT_DIR/mvpn_knife14b_usclient_suite_${TS}.tar.gz"
+BUNDLE="$OUT_DIR/mvpn_${SUITE_TAG}_usclient_suite_${TS}.tar.gz"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/target/release/mini_vpn}"
@@ -212,7 +214,7 @@ run_lowrtt_probe() {
   local label="$1"
   local parallel="$2"
   local duration="$3"
-  local probe_out="$OUT_DIR/mvpn_knife14b_usclient_tunnel_${label}_${TS}.md"
+  local probe_out="$OUT_DIR/mvpn_${SUITE_TAG}_usclient_tunnel_${label}_${TS}.md"
   ARTIFACTS+=("$probe_out")
 
   append ""
@@ -234,7 +236,7 @@ run_lowrtt_probe() {
   append "### Probe $label Summary"
   if [[ -f "$probe_out" ]]; then
     append '```text'
-    grep -E 'local 10[.]0[.]0[.]1|receiver$|sender$|error -|Connection reset|log not found|📊|🔬|TUIC datagram|UDP relay mode|exit=' "$probe_out" | tail -120 | tee -a "$REPORT" || true
+    grep -E 'local 10[.]0[.]0[.]1|receiver$|sender$|error -|Connection reset|log not found|📊|🔬|TUIC datagram|UDP relay mode|tcp-(relay-close|handle-close|global-rx-pressure|loop-flush-tx|tun-flush-fail|send-slice-error)|exit=' "$probe_out" | tail -160 | tee -a "$REPORT" || true
     append '```'
   else
     append "probe report missing: $probe_out"
@@ -302,7 +304,7 @@ on_exit() {
 trap on_exit EXIT
 
 {
-  echo "# 刀14b US Client Tunnel Suite"
+  echo "# 刀14c US Client Tunnel Suite"
   echo
   echo "- date: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   echo "- repo: $REPO_ROOT"
@@ -380,6 +382,7 @@ if [[ "${MINI_VPN_UPSTREAM:-tuic}" != "tuic" ]]; then
   fail "本测试要求 MINI_VPN_UPSTREAM=tuic。当前 MINI_VPN_UPSTREAM=${MINI_VPN_UPSTREAM}"
 fi
 export MINI_VPN_UPSTREAM=tuic
+export MINI_VPN_TUN_MTU="$MTU"
 export MINI_VPN_TUIC_CC="${MINI_VPN_TUIC_CC:-cubic}"
 export MINI_VPN_TUIC_UDP_MODE="${MINI_VPN_TUIC_UDP_MODE:-native}"
 export MINI_VPN_TUIC_ZERO_RTT="${MINI_VPN_TUIC_ZERO_RTT:-false}"
@@ -391,6 +394,7 @@ esac
 
 append "- EXIT_HOST=$EXIT_HOST"
 append "- MINI_VPN_UPSTREAM=$MINI_VPN_UPSTREAM"
+append "- MINI_VPN_TUN_MTU=$MINI_VPN_TUN_MTU"
 append "- MINI_VPN_TUIC_CC=$MINI_VPN_TUIC_CC"
 append "- MINI_VPN_TUIC_UDP_MODE=$MINI_VPN_TUIC_UDP_MODE"
 append "- MINI_VPN_TUIC_ZERO_RTT=$MINI_VPN_TUIC_ZERO_RTT"
@@ -460,8 +464,8 @@ append ""
 append "## Start mini_vpn client-tun"
 : > "$CLIENT_LOG"
 append "- client_log: $CLIENT_LOG"
-append "- command: sudo -E env MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS=$METRICS_SECS $BIN client-tun"
-sudo -E env MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS="$METRICS_SECS" \
+append "- command: sudo -E env MINI_VPN_TUN_MTU=$MTU MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS=$METRICS_SECS $BIN client-tun"
+sudo -E env MINI_VPN_TUN_MTU="$MTU" MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS="$METRICS_SECS" \
   "$BIN" client-tun > "$CLIENT_LOG" 2>&1 &
 VPN_PID=$!
 append "- launcher_pid: $VPN_PID"
@@ -513,20 +517,23 @@ append "- tun_if: $TUN_IF"
 append "- base_mtu: ${BASE_MTU:-unknown}"
 append "- test_mtu: $MTU"
 append "- run_base_mtu_p1: $RUN_BASE_MTU_P1"
+if [[ "${BASE_MTU:-}" != "$MTU" ]]; then
+  fail "TUN MTU mismatch: expected MINI_VPN_TUN_MTU=$MTU but $TUN_IF reports ${BASE_MTU:-unknown}. 请看 $CLIENT_LOG。"
+fi
 
 if [[ "$RUN_BASE_MTU_P1" == "1" ]]; then
-  run_cmd ip link show "$TUN_IF" || true
-  run_lowrtt_probe "p1_mtu${BASE_MTU:-unknown}" "1" "$DURATION" || true
+  append ""
+  append "## Base MTU Probe Skipped"
+  append "14c 要求 mini_vpn 进程启动前就对齐 OS TUN MTU 与 smoltcp MTU；同一进程内不再先跑 1500 再 ip link set。若要 baseline，请另跑一次 MTU=1500。"
 fi
 
 append ""
-append "## Set Test MTU"
-run_cmd sudo ip link set dev "$TUN_IF" mtu "$MTU" || fail "设置 $TUN_IF MTU=$MTU 失败。"
+append "## Verified Test MTU"
 run_cmd ip link show "$TUN_IF" || true
 route_target_into_tun
 
 run_lowrtt_probe "mtu${MTU}_p1" "1" "$DURATION" || true
-MTU_P1_OUT="$OUT_DIR/mvpn_knife14b_usclient_tunnel_mtu${MTU}_p1_${TS}.md"
+MTU_P1_OUT="$OUT_DIR/mvpn_${SUITE_TAG}_usclient_tunnel_mtu${MTU}_p1_${TS}.md"
 
 if [[ -f "$MTU_P1_OUT" ]] && probe_has_receiver_result "$MTU_P1_OUT"; then
   run_lowrtt_probe "mtu${MTU}_full" "$PARALLEL_SET" "$DURATION" || true
