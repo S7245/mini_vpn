@@ -44,7 +44,7 @@ Connection pool 只有在一个干净的低 RTT 胖链路上才值得写。刀14
 
 ### Probe A — single-connection scaling baseline
 
-先在出口 / sing-box 服务器上跑 direct baseline，证明 exit→iperf target 裸路径本身足够胖：
+先跑 direct baseline，分别证明 `client→exit` 与 `exit→iperf target` 裸路径本身是否足够胖：
 
 ```bash
 scripts/knife14b-direct-baseline.sh <TARGET> <PORT>
@@ -93,6 +93,6 @@ done
 ## 产物
 
 - `scripts/knife14b-lowrtt-probe.sh`：收集 tunnel gold checks、`📊/🔬` 日志和 iperf P sweep。
-- `scripts/knife14b-direct-baseline.sh`：在出口 / sing-box 服务器上收集 direct path baseline，验证裸路径是否 `>=150M`。
+- `scripts/knife14b-direct-baseline.sh`：收集 direct path baseline，验证 `client→exit` / `exit→target` 裸路径是否 `>=150M`。
 - 本 spec + plan。
 - 真跑时把结果另存为 `docs/tech/YYYY-MM-DD-knife14b-lowrtt-results.md`（不要伪造；无环境则不创建结果文档）。

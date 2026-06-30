@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # 刀14b direct path baseline.
-# Run this on the sing-box / TUIC exit host, not on the mini_vpn client.
-# It measures whether the exit -> iperf target path is itself a clean 150M+ path.
+# Run this on either endpoint when a direct baseline is needed, e.g.:
+#   - sing-box/TUIC exit -> iperf target
+#   - mini_vpn client -> sing-box/TUIC exit
+# It measures whether that direct path is itself a clean 150M+ path.
 
 set -euo pipefail
 
@@ -15,8 +17,9 @@ env:
   OUT=/tmp/mvpn_knife14b_direct_<timestamp>.md
   PING_COUNT=20              ping samples before iperf
   MTR_COUNT=20               mtr samples when mtr is installed
+  RUN_LABEL="client-to-exit"  optional label written into the report
 
-Run on the exit/sing-box server. The output .md is the file to send back for analysis.
+Run on the endpoint whose direct path you want to validate. The output .md is the file to send back for analysis.
 USAGE
 }
 
@@ -40,6 +43,7 @@ DURATION="${DURATION:-30}"
 PING_COUNT="${PING_COUNT:-20}"
 MTR_COUNT="${MTR_COUNT:-20}"
 OUT="${OUT:-/tmp/mvpn_knife14b_direct_$(date +%Y%m%d_%H%M%S).md}"
+RUN_LABEL="${RUN_LABEL:-direct path baseline}"
 
 append_cmd() {
   {
@@ -85,8 +89,9 @@ append_section() {
   echo "- parallel_set: ${PARALLEL_SET}"
   echo "- duration: ${DURATION}s"
   echo "- host: $(hostname 2>/dev/null || echo unknown)"
+  echo "- run_label: ${RUN_LABEL}"
   echo
-  echo "> Run location: sing-box / TUIC exit host. Purpose: prove whether the direct exit-to-target path can stably reach 150M+ before blaming mini_vpn single-connection behavior."
+  echo "> Purpose: prove whether this direct path can stably reach 150M+ before blaming mini_vpn single-connection behavior."
 } > "$OUT"
 
 append_section "Host Context"
@@ -99,14 +104,24 @@ append_cmd iperf3 --version
 if command -v ip >/dev/null 2>&1; then
   append_cmd ip route get "$TARGET"
   append_cmd ip -brief addr
+elif command -v route >/dev/null 2>&1; then
+  append_cmd route -n get "$TARGET"
+  if command -v ifconfig >/dev/null 2>&1; then
+    append_cmd ifconfig -a
+  else
+    append_skip "ifconfig not found; skipping address snapshot"
+  fi
 else
-  append_skip "ip command not found; skipping route/address snapshot"
+  append_skip "ip/route command not found; skipping route/address snapshot"
 fi
 
-if command -v sysctl >/dev/null 2>&1; then
+kernel_name="$(uname -s 2>/dev/null || echo unknown)"
+if [[ "$kernel_name" == "Linux" ]] && command -v sysctl >/dev/null 2>&1; then
   append_cmd sysctl net.ipv4.tcp_congestion_control net.ipv4.tcp_available_congestion_control
+elif [[ "$kernel_name" == "Darwin" ]] && command -v sysctl >/dev/null 2>&1; then
+  append_cmd sysctl net.inet.tcp.sendspace net.inet.tcp.recvspace net.inet.tcp.mssdflt
 else
-  append_skip "sysctl not found; skipping TCP congestion-control snapshot"
+  append_skip "no supported sysctl snapshot for kernel=${kernel_name}; skipping TCP kernel snapshot"
 fi
 
 append_section "Path RTT"
