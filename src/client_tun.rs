@@ -90,6 +90,10 @@ pub struct NoopSink;
 impl MetricsSink for NoopSink {}
 // 中文要点：Stage 9 起按"每端口"配 pool，64 端口 * 2 槽 * 2 缓冲 ≈ 16MB。
 const DEFAULT_TUN_POOL_SIZE: usize = 2;
+/// 刀14c：TUN IP MTU 默认保持 1500（零惊喜）；US-client 14c suite 显式设 1200 作为测试基准。
+const DEFAULT_TUN_MTU: usize = 1500;
+const MIN_TUN_MTU: usize = 576;
+const MAX_TUN_MTU: usize = 9000;
 
 /// One listener socket's binding parameters.
 /// 中文要点：Stage 9 起 pool_size 已上移到 `ListenerRegistry`，这里只剩端口。
@@ -403,6 +407,9 @@ impl TunListenerConfig {
 #[derive(Debug, Clone)]
 pub struct TunRuntimeConfig {
     pub listener: TunListenerConfig,
+    /// 刀14c：本进程创建 TUN 时使用的 IP MTU，同时喂给 smoltcp DeviceCapabilities。
+    /// 默认保持 1500；真实 14c US-client 测试由脚本显式设 `MINI_VPN_TUN_MTU=1200`。
+    pub tun_mtu: usize,
     /// 刀11：数据面可观测性 `📊` 快照周期（秒）。默认 [`METRICS_SNAPSHOT_SECS`]（30）；
     /// env `MINI_VPN_METRICS_SECS` 可调（acceptance 设小值如 5 秒级看指标；0/非法回落默认，**绝不为 0**
     /// 否则 `tokio::time::interval` panic）。仅 `from_env` 读 env，`from_sources`（harness/测试）恒用默认。
@@ -418,6 +425,7 @@ impl TunRuntimeConfig {
     pub fn from_sources(pool_size: Option<&str>) -> Result<Self, ClientError> {
         Ok(Self {
             listener: TunListenerConfig::from_sources(pool_size)?,
+            tun_mtu: DEFAULT_TUN_MTU,
             metrics_secs: METRICS_SNAPSHOT_SECS,
             profile_loop: false,
         })
@@ -427,6 +435,7 @@ impl TunRuntimeConfig {
     /// （`MINI_VPN_TUN_POOL_SIZE` + `MINI_VPN_METRICS_SECS` + `MINI_VPN_PROFILE_LOOP`）。
     fn from_env() -> Result<Self, ClientError> {
         let mut cfg = Self::from_sources(std::env::var("MINI_VPN_TUN_POOL_SIZE").ok().as_deref())?;
+        cfg.tun_mtu = parse_tun_mtu(std::env::var("MINI_VPN_TUN_MTU").ok().as_deref());
         cfg.metrics_secs = parse_metrics_secs(std::env::var("MINI_VPN_METRICS_SECS").ok().as_deref());
         cfg.profile_loop = parse_profile_loop(std::env::var("MINI_VPN_PROFILE_LOOP").ok().as_deref());
         Ok(cfg)
@@ -439,6 +448,13 @@ fn parse_metrics_secs(s: Option<&str>) -> u64 {
     s.and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(METRICS_SNAPSHOT_SECS)
+}
+
+/// 刀14c：解析 `MINI_VPN_TUN_MTU`。有效 IPv4 MTU 范围采用；缺失/非法回落默认 1500。
+fn parse_tun_mtu(s: Option<&str>) -> usize {
+    s.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| (MIN_TUN_MTU..=MAX_TUN_MTU).contains(&n))
+        .unwrap_or(DEFAULT_TUN_MTU)
 }
 
 /// 刀12：解析 `MINI_VPN_PROFILE_LOOP`：`1`/`true`（不区分大小写、去空白）→ 开；其它/缺省 → 关。
@@ -2214,6 +2230,7 @@ mod tests {
         let config = TunRuntimeConfig::from_sources(None).expect("config should load");
         // Stage 9 drops local_port; pool_size default lowered to 2 (per-port now).
         assert_eq!(config.listener.pool_size, 2);
+        assert_eq!(config.tun_mtu, DEFAULT_TUN_MTU);
         // 刀11：from_sources（harness/测试路径）恒用默认快照周期。
         assert_eq!(config.metrics_secs, METRICS_SNAPSHOT_SECS);
     }
@@ -2239,6 +2256,21 @@ mod tests {
         assert!(!parse_profile_loop(Some("yes")));
         assert!(!parse_profile_loop(Some("")));
         assert!(!parse_profile_loop(None), "缺省关——默认 NoopSink 零开销路径");
+    }
+
+    /// 刀14c：TUN MTU 解析。1200 是 US-client suite 的测试基准；默认仍 1500 以保持零惊喜。
+    #[test]
+    fn parse_tun_mtu_accepts_safe_range_and_defaults() {
+        assert_eq!(parse_tun_mtu(Some("1200")), 1200);
+        assert_eq!(parse_tun_mtu(Some("  1500 ")), 1500);
+        assert_eq!(parse_tun_mtu(Some("576")), 576);
+        assert_eq!(parse_tun_mtu(Some("9000")), 9000);
+        assert_eq!(parse_tun_mtu(Some("0")), DEFAULT_TUN_MTU);
+        assert_eq!(parse_tun_mtu(Some("575")), DEFAULT_TUN_MTU);
+        assert_eq!(parse_tun_mtu(Some("9001")), DEFAULT_TUN_MTU);
+        assert_eq!(parse_tun_mtu(Some("abc")), DEFAULT_TUN_MTU);
+        assert_eq!(parse_tun_mtu(Some("")), DEFAULT_TUN_MTU);
+        assert_eq!(parse_tun_mtu(None), DEFAULT_TUN_MTU);
     }
 
     /// 刀13 ①：MINI_VPN_TRACE 解析——`1`/`true`（去空白、不区分大小写）开；其它/缺省关
