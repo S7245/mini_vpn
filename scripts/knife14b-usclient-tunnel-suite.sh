@@ -28,6 +28,7 @@ Optional env:
   PARALLEL_SET="1 2 4 8"
   SUITE_TAG=knife14c        report/bundle filename tag
   MTU=1200                  TUN MTU passed to mini_vpn before client-tun starts
+  MINI_VPN_TCP_DIAG=1       emit knife14c per-handle TCP diagnostics
   RUN_BASE_MTU_P1=0         14c keeps one aligned MTU per process; use a separate MTU=1500 run for baseline
   BUILD_RELEASE=1           build target/release/mini_vpn if missing
   KILL_OLD=1                stop old mini_vpn client-tun before starting
@@ -383,6 +384,7 @@ if [[ "${MINI_VPN_UPSTREAM:-tuic}" != "tuic" ]]; then
 fi
 export MINI_VPN_UPSTREAM=tuic
 export MINI_VPN_TUN_MTU="$MTU"
+export MINI_VPN_TCP_DIAG="${MINI_VPN_TCP_DIAG:-1}"
 export MINI_VPN_TUIC_CC="${MINI_VPN_TUIC_CC:-cubic}"
 export MINI_VPN_TUIC_UDP_MODE="${MINI_VPN_TUIC_UDP_MODE:-native}"
 export MINI_VPN_TUIC_ZERO_RTT="${MINI_VPN_TUIC_ZERO_RTT:-false}"
@@ -395,6 +397,7 @@ esac
 append "- EXIT_HOST=$EXIT_HOST"
 append "- MINI_VPN_UPSTREAM=$MINI_VPN_UPSTREAM"
 append "- MINI_VPN_TUN_MTU=$MINI_VPN_TUN_MTU"
+append "- MINI_VPN_TCP_DIAG=$MINI_VPN_TCP_DIAG"
 append "- MINI_VPN_TUIC_CC=$MINI_VPN_TUIC_CC"
 append "- MINI_VPN_TUIC_UDP_MODE=$MINI_VPN_TUIC_UDP_MODE"
 append "- MINI_VPN_TUIC_ZERO_RTT=$MINI_VPN_TUIC_ZERO_RTT"
@@ -464,8 +467,8 @@ append ""
 append "## Start mini_vpn client-tun"
 : > "$CLIENT_LOG"
 append "- client_log: $CLIENT_LOG"
-append "- command: sudo -E env MINI_VPN_TUN_MTU=$MTU MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS=$METRICS_SECS $BIN client-tun"
-sudo -E env MINI_VPN_TUN_MTU="$MTU" MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS="$METRICS_SECS" \
+append "- command: sudo -E env MINI_VPN_TUN_MTU=$MTU MINI_VPN_TCP_DIAG=$MINI_VPN_TCP_DIAG MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS=$METRICS_SECS $BIN client-tun"
+sudo -E env MINI_VPN_TUN_MTU="$MTU" MINI_VPN_TCP_DIAG="$MINI_VPN_TCP_DIAG" MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS="$METRICS_SECS" \
   "$BIN" client-tun > "$CLIENT_LOG" 2>&1 &
 VPN_PID=$!
 append "- launcher_pid: $VPN_PID"

@@ -61,6 +61,21 @@ macro_rules! trace_log {
     };
 }
 
+/// 刀14c：TCP 下行/背压诊断日志开关。默认关，避免高基数 per-handle stdout 干扰 harness/热路径；
+/// US-client 14c suite 显式 `MINI_VPN_TCP_DIAG=1` 打开。
+fn tcp_diag_enabled() -> bool {
+    static TCP_DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TCP_DIAG.get_or_init(|| parse_trace(std::env::var("MINI_VPN_TCP_DIAG").ok().as_deref()))
+}
+
+macro_rules! tcp_diag_log {
+    ($($arg:tt)*) => {
+        if tcp_diag_enabled() {
+            println!($($arg)*);
+        }
+    };
+}
+
 /// 主循环分段插桩接缝（knife1：并发压测定位瓶颈）。
 ///
 /// 中文要点：生产传 [`NoopSink`]（空方法，单态化内联后**零开销**，热路径无 `Instant::now()`）；
@@ -312,7 +327,7 @@ fn flush_downlink(handle: SocketHandle, tcp_socket: &mut TcpSocket, ctx: &mut So
                 .note_send_slice_ok(n, ctx.downlink_pending.len());
         }
         Err(_) => {
-            println!(
+            tcp_diag_log!(
                 "🔎 tcp-send-slice-error handle={:?} pending={} state={:?} → clear",
                 handle,
                 ctx.downlink_pending.len(),
@@ -985,7 +1000,7 @@ pub async fn run_event_loop<D, U, M>(
                         tcp_loop_flush_tx_calls += 1;
                         if let Err(e) = device.flush_tx().await {
                             tcp_loop_flush_tx_failures += 1;
-                            println!(
+                            tcp_diag_log!(
                                 "🔎 tcp-loop-flush-tx-fail stage=inbound_poll calls={} failures={} err={e}",
                                 tcp_loop_flush_tx_calls, tcp_loop_flush_tx_failures
                             );
@@ -1081,7 +1096,7 @@ pub async fn run_event_loop<D, U, M>(
                 let snap = metrics_handle
                     .snapshot(upstream.udp_drops_up(), upstream.udp_stream_fallbacks());
                 println!("{}", crate::metrics::format_metrics_snapshot(&snap));
-                println!(
+                tcp_diag_log!(
                     "🔎 tcp-loop-flush-tx calls={} failures={}",
                     tcp_loop_flush_tx_calls, tcp_loop_flush_tx_failures
                 );
@@ -1097,7 +1112,7 @@ pub async fn run_event_loop<D, U, M>(
                 tcp_loop_flush_tx_calls += 1;
                 if let Err(e) = device.flush_tx().await {
                     tcp_loop_flush_tx_failures += 1;
-                    println!(
+                    tcp_diag_log!(
                         "🔎 tcp-loop-flush-tx-fail stage=timer_poll calls={} failures={} err={e}",
                         tcp_loop_flush_tx_calls, tcp_loop_flush_tx_failures
                     );
@@ -1412,7 +1427,7 @@ fn rearm_socket_with_reason(
     close_direction: &'static str,
     close_reason: &'static str,
 ) {
-    println!(
+    tcp_diag_log!(
         "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} tun_flush_tx_calls={} tun_flush_tx_failures={}",
         handle,
         close_direction,
@@ -1843,7 +1858,7 @@ async fn handle_remote_payload<D: TunIo>(
         ctx.downlink_diag.note_tun_flush(ok);
     }
     if let Err(e) = &result {
-        println!("🔎 tcp-tun-flush-fail handle={:?} stage=remote_payload err={e}", handle);
+        tcp_diag_log!("🔎 tcp-tun-flush-fail handle={:?} stage=remote_payload err={e}", handle);
     }
     result
 }
@@ -1933,7 +1948,7 @@ async fn run_relay(
                         let waited = wait_started.elapsed();
                         diag.note_global_rx_wait(waited, global_rx_pressure_threshold);
                         if waited >= global_rx_pressure_threshold {
-                            println!(
+                            tcp_diag_log!(
                                 "🔎 tcp-global-rx-pressure handle={:?} wait_us={} payload_bytes={} pressure_events={}",
                                 handle,
                                 waited.as_micros(),
@@ -1958,7 +1973,7 @@ async fn run_relay(
             }
         }
     };
-    println!(
+    tcp_diag_log!(
         "🔎 tcp-relay-close handle={:?} direction={} reason={} uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} global_rx_wait_max_us={} global_rx_pressure_events={}",
         handle,
         close_direction,
