@@ -43,24 +43,28 @@ These cut across multiple stages and may need their own design before being sche
 
 ### Prioritized future task backlog (post-14b)
 
-Keep this list as the canonical next-work queue after 刀14a/14b. Items are ordered by current leverage:
+Keep this list as the canonical next-work queue after 刀14a/14b. Items are ordered by current leverage.
+The 2026-06-30 US-client result moved connection-pool work behind downlink/backpressure + MTU/MSS; see
+`docs/tech/2026-06-30-knife14b-usclient-results.md`.
 
-1. **Run 刀14b on a real low-RTT fat path.** Use `scripts/knife14b-lowrtt-probe.sh` only after the tunnel is
-   confirmed active and the path is low RTT, low loss, and genuinely >100M end-to-end.
-2. **#3 connection-pool spike.** Only start this if 刀14b proves a single TUIC/QUIC connection is the wall.
-   Otherwise do not add pool complexity.
-3. **Mobile/productization core seam.** Add packet I/O traits for macOS tun / iOS `NEPacketTunnelFlow` /
+1. **刀14c TCP downlink/backpressure + MTU/MSS.** The US-client suite proved routing/TUIC are correct but
+   reverse P1 collapses to ~2M and P2+ resets. Instrument first, then fix the downlink or MTU/MSS mechanism.
+2. **Re-run the US-client suite after 14c.** Keep the same Client/Exit/Target shape and upload the generated
+   markdown/tar bundle for analysis.
+3. **#3 connection-pool spike.** Only start this if post-14c measurements still prove a single TUIC/QUIC
+   connection is the wall. Otherwise do not add pool complexity.
+4. **Mobile/productization core seam.** Add packet I/O traits for macOS tun / iOS `NEPacketTunnelFlow` /
    Android `VpnService`, library-style config structs, and config injection for knobs such as `cc` and
    `udp_mode`.
-4. **0-RTT / weak-network resume.** Revisit quinn/rustls once early exporter support is available, and pair
+5. **0-RTT / weak-network resume.** Revisit quinn/rustls once early exporter support is available, and pair
    it with adaptive keepalive / mobile radio-sleep behavior.
-5. **DNS edge hardening.** Decide policy for IPv6 DNS, split-horizon/internal domains, exotic multi-question
+6. **DNS edge hardening.** Decide policy for IPv6 DNS, split-horizon/internal domains, exotic multi-question
    DNS, hardcoded-IP apps, and when to switch parsing to `hickory-proto`.
-6. **Anti-censorship resilience beyond TCP failover.** Evaluate UDP-over-VLESS/TCP fallback only if QUIC is
+7. **Anti-censorship resilience beyond TCP failover.** Evaluate UDP-over-VLESS/TCP fallback only if QUIC is
    blocked and UDP service continuity matters more than latency/complexity.
-7. **Scale / ops.** If multi-server or many-user operation returns, design service discovery, weighted
+8. **Scale / ops.** If multi-server or many-user operation returns, design service discovery, weighted
    upstream health, graceful drain, metrics/alerting, and multi-region steering.
-8. **Longer-horizon product modes.** Multi-Hop, L3 tunnel mode, REALITY Vision flow / broader TLS cipher
+9. **Longer-horizon product modes.** Multi-Hop, L3 tunnel mode, REALITY Vision flow / broader TLS cipher
    fingerprinting, and exit-IP reputation handling are product-line decisions, not current data-plane blockers.
 
 ### Data plane → TUIC protocol on QUIC (ADR-0004, supersedes self-built transport)

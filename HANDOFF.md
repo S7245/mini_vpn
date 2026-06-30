@@ -42,6 +42,11 @@
   新 harness `stalled_tcp_uplink_does_not_block_other_flows` 覆盖慢流不阻塞快流。**下一刀：刀14a 文档收口 + 刀14b 低 RTT 胖链路 #3 量化 gate**
   （spec/plan：`docs/tech/2026-06-28-knife14b-lowrtt-cc-pool-quantify-{spec,plan}.md`；probe：
   `scripts/knife14b-lowrtt-probe.sh`）。
+- **2026-06-30 刀14b 真 US-client 测试已跑出决定性结果**：Client=`43.172.75.27`、Exit=`43.153.32.33`、
+  Target=`43.130.32.77:5201`，路由和 TUIC 都正确；MTU 1500 forward P1 只有 `476 Kbit/s`，MTU 1200 forward P1
+  提升到约 `29-33 Mbit/s`，但 reverse P1 仍只有 `2.06 Mbit/s`，P2+ 出现 iperf result/control reset。
+  **裁决：先不要做 connection pool**；P1 reverse 已坏，下一刀应是 **刀14c：TCP downlink/backpressure instrumentation +
+  MTU/MSS fix**。证据和任务树见 `docs/tech/2026-06-30-knife14b-usclient-results.md`。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
 ## 目标（唯一北极星）：`Rules.md`
@@ -80,8 +85,9 @@
  ├─ 刀11 数据面可观测性（DNS forge 计数 + datagram drop/背压 + 统一快照 MetricsSnapshot）  ✅ **完成（代码 + 两轮 review 零 bug + 真出口 acceptance ✅）+ 已 ff 合入 main `9de0604`**（见下「刀11 完成」）
  ├─ 刀12 多核逼近 100M：量化定位（quantify-only，LoopProfiler 仪器）  ✅ 完成 + 真出口归因（见下「刀12 完成」，ADR-0013）；**#4 实测推翻、取消分片**
  ├─ 刀13 主循环热路径净化  ✅ 完成 + 已合 main `8be4141`：`MINI_VPN_TRACE` 门控热路径日志 + 非阻塞 TCP uplink（try_reserve，Full 保留 smoltcp 字节）消除跨流 HoL
- ├─ 刀14a 文档/接力收口：把刀13 从候选改为已完成，修 stale TODO/HANDOFF/ADR 指针
- └─ 刀14b 低 RTT 胖链路 #3 量化 gate：只做 probe/spec/acceptance（见 `2026-06-28-knife14b-*`）；无合格链路前不写 connection pool
+ ├─ 刀14a 文档/接力收口：把刀13 从候选改为已完成，修 stale TODO/HANDOFF/ADR 指针  ✅ 已完成
+ ├─ 刀14b 低 RTT 胖链路 #3 量化 gate：probe/spec/acceptance + US Client VPS 实测  ✅ 已完成；结论是不进 pool
+ └─ 刀14c TCP downlink/backpressure instrumentation + MTU/MSS fix：修 reverse P1 2M / P2 reset，再决定 pool
 
 正交线 A（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）= VLESS+REALITY 第二 Transport（手写 TLS 1.3，ADR-0008）
  ├─ 刀6  REALITY auth 密码学 + TLS 1.3 ClientHello 构造（sans-IO，100% 离线 TDD）  ✅ 完成（见下「刀6」，ADR-0008）；已合 main
@@ -94,14 +100,15 @@
 
 ## 后续任务池（post-14b）
 
-1. **真跑刀14b 低 RTT 胖链路量化**：有低 RTT、低丢包、端到端 >100M 路径时，用 `scripts/knife14b-lowrtt-probe.sh` 产出结果。
-2. **#3 connection-pool spike**：仅在刀14b 证明 single TUIC/QUIC connection 是墙时开始；否则不写 pool。
-3. **移动端/产品化 core 接缝**：packet I/O trait、library config struct、`cc`/`udp_mode` 等旋钮从 env-only 补到可注入配置。
-4. **0-RTT / 弱网恢复**：升级 quinn/rustls 以支持 early exporter，并与 adaptive keepalive / mobile radio-sleep 一起评估。
-5. **DNS 边界硬化**：IPv6 DNS、split-horizon/internal domains、multi-question DNS、hardcoded-IP app、`hickory-proto` 迁移时机。
-6. **抗封锁韧性增强**：QUIC 被封时是否需要 UDP-over-VLESS/TCP fallback；这是延迟/复杂度权衡，不是默认路线。
-7. **Scale / Ops**：多 Upstream/service discovery/weighted health/graceful drain/metrics alerting/multi-region。
-8. **更远期产品模式**：Multi-Hop、L3 tunnel mode、REALITY Vision flow / 0x1302/0x1303 指纹恢复、出口 IP reputation。
+1. **刀14c TCP downlink/backpressure + MTU/MSS**：基于 2026-06-30 US-client 结果，先修 reverse P1 2M / P2 reset。
+2. **复跑 US-client suite**：14c 后用同一环境和脚本复测，目标是 forward 不回退、reverse P1 不再塌缩、P2 不 reset。
+3. **#3 connection-pool spike**：仅在 14c 后仍证明 single TUIC/QUIC connection 是墙时开始；否则不写 pool。
+4. **移动端/产品化 core 接缝**：packet I/O trait、library config struct、`cc`/`udp_mode` 等旋钮从 env-only 补到可注入配置。
+5. **0-RTT / 弱网恢复**：升级 quinn/rustls 以支持 early exporter，并与 adaptive keepalive / mobile radio-sleep 一起评估。
+6. **DNS 边界硬化**：IPv6 DNS、split-horizon/internal domains、multi-question DNS、hardcoded-IP app、`hickory-proto` 迁移时机。
+7. **抗封锁韧性增强**：QUIC 被封时是否需要 UDP-over-VLESS/TCP fallback；这是延迟/复杂度权衡，不是默认路线。
+8. **Scale / Ops**：多 Upstream/service discovery/weighted health/graceful drain/metrics alerting/multi-region。
+9. **更远期产品模式**：Multi-Hop、L3 tunnel mode、REALITY Vision flow / 0x1302/0x1303 指纹恢复、出口 IP reputation。
 
 ## 刀1 已完成（2026-06-12）：大并发压测 harness + 瓶颈定位
 
