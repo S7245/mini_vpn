@@ -45,8 +45,13 @@
 - **2026-06-30 刀14b 真 US-client 测试已跑出决定性结果**：Client=`43.172.75.27`、Exit=`43.153.32.33`、
   Target=`43.130.32.77:5201`，路由和 TUIC 都正确；MTU 1500 forward P1 只有 `476 Kbit/s`，MTU 1200 forward P1
   提升到约 `29-33 Mbit/s`，但 reverse P1 仍只有 `2.06 Mbit/s`，P2+ 出现 iperf result/control reset。
-  **裁决：先不要做 connection pool**；P1 reverse 已坏，下一刀应是 **刀14c：TCP downlink/backpressure instrumentation +
-  MTU/MSS fix**。证据和任务树见 `docs/tech/2026-06-30-knife14b-usclient-results.md`。
+  **裁决：先不要做 connection pool**；P1 reverse 已坏，先做 TCP downlink/backpressure + MTU/MSS 方向。证据和任务树见
+  `docs/tech/2026-06-30-knife14b-usclient-results.md`。
+- **刀14c 已完成并合到 main (`bda254a`)**：TUN MTU 与 smoltcp capabilities 对齐，补 `MINI_VPN_TUN_MTU` / TCP downlink
+  diagnostics，并记录 US-client handoff。14c 后本地仍缺新的 US-client bundle，不能声明 reverse/P2 已修复。
+- **刀14d 已完成本地代码 + gates（分支 `codex/knife14d-downlink-reap-open`，commit `75b92af`）**：纯 TUIC `open_tcp`
+  不再被视为 cheap，统一走已有 async remote-open 状态机；新增 slow-open harness 锁住“一条慢 open 不阻塞另一条 flow”，
+  并补 reap epoch 守卫。下一步是复跑 US-client suite 验证 reverse/P2。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
 
 ## 目标（唯一北极星）：`Rules.md`
@@ -87,7 +92,8 @@
  ├─ 刀13 主循环热路径净化  ✅ 完成 + 已合 main `8be4141`：`MINI_VPN_TRACE` 门控热路径日志 + 非阻塞 TCP uplink（try_reserve，Full 保留 smoltcp 字节）消除跨流 HoL
  ├─ 刀14a 文档/接力收口：把刀13 从候选改为已完成，修 stale TODO/HANDOFF/ADR 指针  ✅ 已完成
  ├─ 刀14b 低 RTT 胖链路 #3 量化 gate：probe/spec/acceptance + US Client VPS 实测  ✅ 已完成；结论是不进 pool
- └─ 刀14c TCP downlink/backpressure instrumentation + MTU/MSS fix：修 reverse P1 2M / P2 reset，再决定 pool
+ ├─ 刀14c TCP downlink/backpressure instrumentation + MTU/MSS fix  ✅ 已完成；本地代码/脚本 ready，US-client 复测缺 bundle
+ └─ 刀14d async TCP open：TUIC open 移出主循环，保护 downlink/timer/reap progress  ✅ 本地完成；等待 US-client 复测
 
 正交线 A（抗封锁韧性，不阻塞主线；QUIC 被 GFW 封时才必需）= VLESS+REALITY 第二 Transport（手写 TLS 1.3，ADR-0008）
  ├─ 刀6  REALITY auth 密码学 + TLS 1.3 ClientHello 构造（sans-IO，100% 离线 TDD）  ✅ 完成（见下「刀6」，ADR-0008）；已合 main
@@ -98,11 +104,11 @@
 ```
 - 优先级与关联：**fake-IP 池回收**属"大并发长稳"（并入刀2）；**DoH 拦截**是"真实场景能连上"的前置（刀4，可视情提前——真机浏览器场景不修则 fake-IP 形同虚设）。**A（REALITY）正交**：当前 QUIC 能连，不阻塞三目标达标；TCP-based，替代不了 UDP 直播。
 
-## 后续任务池（post-14b）
+## 后续任务池（post-14d）
 
-1. **刀14c TCP downlink/backpressure + MTU/MSS**：基于 2026-06-30 US-client 结果，先修 reverse P1 2M / P2 reset。
-2. **复跑 US-client suite**：14c 后用同一环境和脚本复测，目标是 forward 不回退、reverse P1 不再塌缩、P2 不 reset。
-3. **#3 connection-pool spike**：仅在 14c 后仍证明 single TUIC/QUIC connection 是墙时开始；否则不写 pool。
+1. **复跑 US-client suite**：用同一 Client/Exit/Target 环境复测 14c+14d，目标是 forward 不回退、reverse P1 不再塌缩、P2 不 reset；上传生成的 markdown/tar bundle。
+2. **按 bundle 决策下一刀**：若 reverse/P2 仍坏，先读 knife14c diagnostics + loop profile 定位；不要直接写 connection pool。
+3. **#3 connection-pool spike**：仅在复测证明 single TUIC/QUIC connection 是墙时开始；否则不加 pool complexity。
 4. **移动端/产品化 core 接缝**：packet I/O trait、library config struct、`cc`/`udp_mode` 等旋钮从 env-only 补到可注入配置。
 5. **0-RTT / 弱网恢复**：升级 quinn/rustls 以支持 early exporter，并与 adaptive keepalive / mobile radio-sleep 一起评估。
 6. **DNS 边界硬化**：IPv6 DNS、split-horizon/internal domains、multi-question DNS、hardcoded-IP app、`hickory-proto` 迁移时机。

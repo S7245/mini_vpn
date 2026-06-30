@@ -41,17 +41,18 @@ Target extraction alone does NOT make real sites work. In order of blocking seve
 
 These cut across multiple stages and may need their own design before being scheduled.
 
-### Prioritized future task backlog (post-14b)
+### Prioritized future task backlog (post-14d)
 
-Keep this list as the canonical next-work queue after 刀14a/14b. Items are ordered by current leverage.
-The 2026-06-30 US-client result moved connection-pool work behind downlink/backpressure + MTU/MSS; see
-`docs/tech/2026-06-30-knife14b-usclient-results.md`.
+Keep this list as the canonical next-work queue after 刀14c/14d. Items are ordered by current leverage.
+The 2026-06-30 US-client result moved connection-pool work behind downlink/backpressure + async-open
+validation; see `docs/tech/2026-06-30-knife14b-usclient-results.md` and
+`docs/tech/2026-06-30-knife14d-downlink-reap-open-spec.md`.
 
-1. **刀14c TCP downlink/backpressure + MTU/MSS.** The US-client suite proved routing/TUIC are correct but
-   reverse P1 collapses to ~2M and P2+ resets. Instrument first, then fix the downlink or MTU/MSS mechanism.
-2. **Re-run the US-client suite after 14c.** Keep the same Client/Exit/Target shape and upload the generated
-   markdown/tar bundle for analysis.
-3. **#3 connection-pool spike.** Only start this if post-14c measurements still prove a single TUIC/QUIC
+1. **Re-run the US-client suite after 14c+14d.** Keep the same Client/Exit/Target shape and upload the
+   generated markdown/tar bundle for analysis.
+2. **Use the bundle to choose the next knife.** If reverse/P2 still fails, read the TCP diagnostics and loop
+   profile first; do not jump straight to connection-pool work.
+3. **#3 connection-pool spike.** Only start this if post-14d measurements still prove a single TUIC/QUIC
    connection is the wall. Otherwise do not add pool complexity.
 4. **Mobile/productization core seam.** Add packet I/O traits for macOS tun / iOS `NEPacketTunnelFlow` /
    Android `VpnService`, library-style config structs, and config injection for knobs such as `cc` and
