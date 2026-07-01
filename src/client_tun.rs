@@ -1249,7 +1249,8 @@ async fn process_dirty_relay<U, M>(
 /// 死槽判定（仅对「被用过」的槽，即 `ctx.state != Listening`；空闲 Listen 槽 ctx.state==Listening 永不命中）：
 /// - `!is_active()`：Closed / TimeWait（RST、双向关闭完成）；**也覆盖 `HandshakePending` 槽
 ///   在本地已关闭时**（remote-open 在飞但 app 已断）——回收时 rearm bump epoch，迟到的 `HandshakeDone` 被丢；
-/// - `CloseWait`：被拦截应用已发 FIN（主动关闭）→ teardown，绝不会再有上行；
+/// - `CloseWait` 且无 pending downlink：被拦截应用已发 FIN（主动关闭）→ teardown；若仍有
+///   `downlink_pending`，说明远端尾包已被接受但尚未全部写入 smoltcp，必须先让 dirty flush 排空；
 /// - `OpeningRemote && uplink_tx.is_none()`：**inline** `open_tcp` 失败后状态卡在 OpeningRemote。
 ///   中文要点：此第三判据**仅匹配 `OpeningRemote`**（inline 路径），**不**匹配 `HandshakePending`
 ///   ——后者是 async remote-open 的**正常在飞态**（由上游超时兜底，`HandshakeDone` 必回灌解决），绝不能在飞就回收。
@@ -1295,8 +1296,13 @@ fn should_reap_slot(ctx: &SocketCtx, tcp_state: TcpState, active: bool) -> bool 
     if ctx.state == SocketState::Listening {
         return false;
     }
-    !active
-        || tcp_state == TcpState::CloseWait
+    if !active {
+        return true;
+    }
+    if !ctx.downlink_pending.is_empty() {
+        return false;
+    }
+    tcp_state == TcpState::CloseWait
         || (ctx.state == SocketState::OpeningRemote && ctx.uplink_tx.is_none())
 }
 
@@ -2708,6 +2714,30 @@ mod tests {
         assert!(
             !should_reap_slot(&listening, TcpState::Closed, false),
             "空闲 Listening 槽永不 reap"
+        );
+    }
+
+    #[test]
+    fn reap_predicate_preserves_active_closewait_pending_downlink() {
+        let mut ctx = SocketCtx::new(443);
+        ctx.state = SocketState::Relaying;
+        ctx.downlink_pending = vec![1, 2, 3];
+
+        assert!(
+            !should_reap_slot(&ctx, TcpState::CloseWait, true),
+            "active CloseWait with pending downlink must keep flushing instead of aborting"
+        );
+
+        ctx.downlink_pending.clear();
+        assert!(
+            should_reap_slot(&ctx, TcpState::CloseWait, true),
+            "CloseWait is reapable again once pending downlink drains"
+        );
+
+        ctx.downlink_pending = vec![1, 2, 3];
+        assert!(
+            should_reap_slot(&ctx, TcpState::Closed, false),
+            "inactive sockets still reap even if pending bytes can no longer be delivered"
         );
     }
 
