@@ -29,6 +29,9 @@ const _: () = assert!(RELAY_CHANNEL_CAPACITY >= 1);
 /// L2（刀9 F4）：一条 relay 双向静默多久判 idle → 退出 + shutdown。防慢/卡死上游（尤其 REALITY
 /// TCP-only 手写 TLS 遇 server 不返回）长期挂住 relay task 泄漏。90s 偏宽松保稳（长轮询/SSE 不误杀）。
 const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+/// Knife14f：单次本地→上游写入的进度预算。`write_all` 在 QUIC send window 黑洞时可长期 Pending；
+/// 必须在 relay task 内部止血，否则外层 `select!` 的 idle timeout 永远没有机会运行。
+const RELAY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// 刀11：数据面可观测性快照周期（30s，对齐 TuicUpstream UDP_STATS_LOG_SECS）。仅周期采样/打印，不进热路径。
 const METRICS_SNAPSHOT_SECS: u64 = 30;
 
@@ -2061,16 +2064,25 @@ async fn run_relay(
                 match local_msg {
                     Some(payload) => {
                         let payload_len = payload.len();
-                        match stream.write_all(&payload).await {
-                            Ok(_) => {
+                        match tokio::time::timeout(RELAY_WRITE_TIMEOUT, stream.write_all(&payload)).await {
+                            Ok(Ok(_)) => {
                                 diag.note_uplink_write(payload_len);
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 println!(
                                     "写入上游流失败 direction=local_to_remote handle={:?} attempted_bytes={} err={:?}",
                                     handle, payload_len, e
                                 );
                                 break ("local_to_remote", "remote_write_failed");
+                            }
+                            Err(_) => {
+                                println!(
+                                    "写入上游流超时 direction=local_to_remote handle={:?} attempted_bytes={} timeout={}s",
+                                    handle,
+                                    payload_len,
+                                    RELAY_WRITE_TIMEOUT.as_secs()
+                                );
+                                break ("local_to_remote", "remote_write_timeout");
                             }
                         }
                     }
@@ -2320,6 +2332,36 @@ mod tests {
             Poll::Pending
         }
     }
+
+    /// 一条上行写永远不完成的 mock 上游流，用来锁住 write_all 卡住时也会主动关 relay。
+    struct PendingWriteStream {
+        shutdown_called: Arc<AtomicBool>,
+    }
+    impl tokio::io::AsyncRead for PendingWriteStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+    impl tokio::io::AsyncWrite for PendingWriteStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.shutdown_called.store(true, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
     impl tokio::io::AsyncWrite for FailingWriteStream {
         fn poll_write(
             self: std::pin::Pin<&mut Self>,
@@ -2391,6 +2433,35 @@ mod tests {
                 assert_eq!(close.epoch, 11);
                 assert_eq!(close.direction, "local_to_remote");
                 assert_eq!(close.reason, "remote_write_failed");
+            }
+            other => panic!("expected relay close event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_remote_write_timeout_notifies_main_loop() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let flag = Arc::new(AtomicBool::new(false));
+        let stream: RelayStream = Box::new(PendingWriteStream { shutdown_called: flag.clone() });
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let (back_tx, mut back_rx) = mpsc::channel(8);
+        let task = tokio::spawn(run_relay(handle, 17, stream, rx, back_tx));
+
+        tx.send(vec![1, 2, 3]).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(RELAY_WRITE_TIMEOUT - std::time::Duration::from_secs(1)).await;
+        assert!(!task.is_finished(), "relay should not close before write timeout");
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        task.await.unwrap();
+
+        assert!(flag.load(Ordering::SeqCst), "write timeout should still call stream.shutdown");
+        match back_rx.try_recv().expect("write timeout should notify main loop") {
+            (h, RelayEvent::Closed(close)) => {
+                assert_eq!(h, handle);
+                assert_eq!(close.epoch, 17);
+                assert_eq!(close.direction, "local_to_remote");
+                assert_eq!(close.reason, "remote_write_timeout");
             }
             other => panic!("expected relay close event, got {other:?}"),
         }
