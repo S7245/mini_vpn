@@ -233,6 +233,23 @@ impl RelayTaskDiag {
     }
 }
 
+/// Terminal reason reported by one background TCP relay task.
+#[derive(Debug, Clone, Copy)]
+struct RelayClose {
+    epoch: u64,
+    direction: &'static str,
+    reason: &'static str,
+}
+
+/// Event sent from one background TCP relay task back into the single owner main loop.
+/// Data events preserve the existing downlink path; Closed makes every relay terminal reason visible to
+/// the socket state machine instead of relying on smoltcp to notice the local side later.
+#[derive(Debug)]
+enum RelayEvent {
+    Data { epoch: u64, bytes: Vec<u8> },
+    Closed(RelayClose),
+}
+
 /// Per-handle runtime context owned by a single listener slot.
 /// 中文要点：这是“房间上下文”，每个 handle 都有一份，专门存本槽位的状态和上行通道。
 #[derive(Debug)]
@@ -247,6 +264,8 @@ struct SocketCtx {
     /// 中文要点：smoltcp send_slice 可能只写一部分（tx buffer 受 TCP ACK 释放制约），
     /// 写不下的字节必须留在这里、由后续 poll 持续 flush，否则丢字节 → TLS bad decrypt。
     downlink_pending: Vec<u8>,
+    /// Relay has ended, but downlink bytes still need to be flushed before the slot can be rearmed.
+    pending_relay_close: Option<RelayClose>,
     /// 本槽位当前 flow 占用的 fake-IP（若 target 经 fake-IP 改写）。
     /// 中文要点：刀2 引用计数——首次开远端时 `acquire`、rearm 时 `release`，
     /// 保证该 fake-IP 映射在本 flow 存活期间不被 sweep 回收（否则 resolve 失败 → 断连）。
@@ -272,6 +291,7 @@ impl SocketCtx {
             state: SocketState::Listening,
             uplink_tx: None,
             downlink_pending: Vec::new(),
+            pending_relay_close: None,
             fake_ip: None,
             conn_epoch: 0,
             uplink_buffer: Vec::new(),
@@ -826,7 +846,7 @@ pub async fn run_event_loop<D, U, M>(
 
     // 全局回信通道（TCP relay 通用回程）：接收端 global_rx 留在主循环，发送端 global_tx 克隆给每个后台车厢。
     let (global_tx, mut global_rx) =
-        tokio::sync::mpsc::channel::<(SocketHandle, Vec<u8>)>(RELAY_CHANNEL_CAPACITY);
+        tokio::sync::mpsc::channel::<(SocketHandle, RelayEvent)>(RELAY_CHANNEL_CAPACITY);
 
     // 刀9 M3 / 刀14d：spawn 出主循环的 remote-open 完成后经此回灌主循环安装 relay。
     // 明确 cheap 的测试/mock 路径仍可 inline，不走此通道。
@@ -898,31 +918,50 @@ pub async fn run_event_loop<D, U, M>(
         tokio::select! {
             // TCP relay 回程：后台车厢把远端回传字节送回主循环 → 注入对应 smoltcp socket。
             //   TUIC 自重连（live_conn），不需要 legacy 的 disconnect/复位分支。
-            Some((handle, payload)) = global_rx.recv() =>{
+            Some((handle, event)) = global_rx.recv() =>{
                 metrics.loop_park_end();
-                trace_log!("📬 从大邮筒收到 {} 字节数据，准备送往房间 {:?}", payload.len(), handle);
-                if let Err(e) = handle_remote_payload(
-                    handle,
-                    payload,
-                    &mut sockets,
-                    &mut socket_ctxs,
-                    &mut iface,
-                    &mut device,
-                    &mut fake_pool,
-                    udp_clock.elapsed().as_secs(),
-                )
-                .await
-                {
-                    trace_log!("处理回程数据失败: {e}");
-                }
-                // #1：回程写不下的下行字节留在 downlink_pending（tx buffer 满）→ 标脏，
-                // 让 relay 段后续 tick 持续 flush，直到排空才出集（绝不丢字节）。
-                if socket_ctxs
-                    .get(&handle)
-                    .map(|c| !c.downlink_pending.is_empty())
-                    .unwrap_or(false)
-                {
-                    dirty.insert(handle);
+                match event {
+                    RelayEvent::Data { epoch, bytes: payload } => {
+                        trace_log!("📬 从大邮筒收到 {} 字节数据，准备送往房间 {:?}", payload.len(), handle);
+                        if let Err(e) = handle_remote_payload(
+                            handle,
+                            epoch,
+                            payload,
+                            &mut sockets,
+                            &mut socket_ctxs,
+                            &mut iface,
+                            &mut device,
+                            &mut fake_pool,
+                            udp_clock.elapsed().as_secs(),
+                        )
+                        .await
+                        {
+                            trace_log!("处理回程数据失败: {e}");
+                        }
+                        // #1：回程写不下的下行字节留在 downlink_pending（tx buffer 满）→ 标脏，
+                        // 让 relay 段后续 tick 持续 flush，直到排空才出集（绝不丢字节）。
+                        if socket_ctxs
+                            .get(&handle)
+                            .map(|c| !c.downlink_pending.is_empty())
+                            .unwrap_or(false)
+                        {
+                            dirty.insert(handle);
+                        }
+                    }
+                    RelayEvent::Closed(close) => {
+                        if handle_relay_closed(
+                            handle,
+                            close,
+                            &mut sockets,
+                            &mut socket_ctxs,
+                            &mut fake_pool,
+                            udp_clock.elapsed().as_secs(),
+                        ) {
+                            dirty.insert(handle);
+                        } else {
+                            dirty.remove(&handle);
+                        }
+                    }
                 }
             }
             // 分支 1: 全局回信通道接收到了新数据包
@@ -1154,7 +1193,7 @@ async fn process_dirty_relay<U, M>(
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
     upstream: &Arc<U>,
     handshake_done_tx: &mpsc::Sender<HandshakeDone>,
-    global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
+    global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
     metrics_handle: &Metrics,
@@ -1463,6 +1502,7 @@ fn rearm_socket(
     socket.abort();
     ctx.uplink_tx = None;
     ctx.downlink_pending.clear();
+    ctx.pending_relay_close = None;
     ctx.downlink_diag = TcpDownlinkDiag::default();
     // 清 async-open 在飞缓存 + bump epoch——让任何迟到 `HandshakeDone` 失配被丢
     // （绝不装到本次 rearm 后的新一代 socket 上，防串话核心）。对非 spawn 槽是无害的纯计数自增。
@@ -1487,7 +1527,7 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
     upstream: &Arc<U>,
     handshake_done_tx: &mpsc::Sender<HandshakeDone>,
-    global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
+    global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
     metrics_handle: &Metrics,
@@ -1498,6 +1538,15 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
         let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
         if let Some(ctx) = socket_ctxs.get_mut(&handle) {
             flush_downlink(handle, tcp_socket, ctx);
+            if finish_deferred_relay_close_if_drained(
+                handle,
+                tcp_socket,
+                ctx,
+                fake_pool,
+                now_secs,
+            ) {
+                return Ok(());
+            }
         }
     }
 
@@ -1643,7 +1692,7 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
     upstream: &Arc<U>,
     handshake_done_tx: &mpsc::Sender<HandshakeDone>,
-    global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
+    global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
     metrics_handle: &Metrics,
@@ -1702,7 +1751,7 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
             fake_pool.acquire(ip, now_secs);
             ctx.fake_ip = Some(ip);
         }
-        spawn_remote_relay(handle, stream, rx, global_tx.clone(), metrics_handle);
+        spawn_remote_relay(handle, ctx.conn_epoch, stream, rx, global_tx.clone(), metrics_handle);
         Ok(())
     } else {
         // —— 不廉价上游：把远端 TCP open spawn 出主循环并发化（刀9 M3 / 刀14d）——
@@ -1739,7 +1788,7 @@ fn handle_handshake_done(
     done: HandshakeDone,
     sockets: &mut SocketSet<'_>,
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
-    global_tx: &mpsc::Sender<(SocketHandle, Vec<u8>)>,
+    global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
     metrics_handle: &Metrics,
@@ -1786,7 +1835,7 @@ fn handle_handshake_done(
             ctx.uplink_tx = Some(tx);
             ctx.state = SocketState::Relaying;
             trace_log!("🚪 handle {:?} remote session opened（spawn open 成功）", handle);
-            spawn_remote_relay(handle, stream, rx, global_tx.clone(), metrics_handle);
+            spawn_remote_relay(handle, epoch, stream, rx, global_tx.clone(), metrics_handle);
         }
         Err(e) => {
             println!("❌ handle {:?} spawned remote open failed: {e} → rearm", handle);
@@ -1808,6 +1857,7 @@ fn handle_handshake_done(
 #[allow(clippy::too_many_arguments)]
 async fn handle_remote_payload<D: TunIo>(
     handle: SocketHandle,
+    epoch: u64,
     payload: Vec<u8>,
     sockets: &mut SocketSet<'_>,
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
@@ -1820,6 +1870,15 @@ async fn handle_remote_payload<D: TunIo>(
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
         return Ok(());
     };
+    if ctx.conn_epoch != epoch {
+        trace_log!(
+            "🗑️ handle {:?} 丢弃旧 relay data(epoch {epoch}≠{}) {}B",
+            handle,
+            ctx.conn_epoch,
+            payload.len()
+        );
+        return Ok(());
+    }
 
     if payload.is_empty() {
         trace_log!("🔄 handle {:?} entering {:?}", handle, SocketState::Closing);
@@ -1868,6 +1927,89 @@ async fn handle_remote_payload<D: TunIo>(
     result
 }
 
+fn handle_relay_closed(
+    handle: SocketHandle,
+    close: RelayClose,
+    sockets: &mut SocketSet<'_>,
+    socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
+    fake_pool: &mut FakeIpPool,
+    now_secs: u64,
+) -> bool {
+    let Some(ctx) = socket_ctxs.get_mut(&handle) else {
+        return false;
+    };
+    if ctx.conn_epoch != close.epoch {
+        trace_log!(
+            "🗑️ handle {:?} relay close({}/{}) epoch {}≠{}; ignored",
+            handle,
+            close.direction,
+            close.reason,
+            close.epoch,
+            ctx.conn_epoch
+        );
+        return false;
+    }
+    if ctx.state == SocketState::Listening && ctx.uplink_tx.is_none() {
+        trace_log!(
+            "🗑️ handle {:?} relay close({}/{}) arrived after rearm; ignored",
+            handle,
+            close.direction,
+            close.reason
+        );
+        return false;
+    }
+    if !ctx.downlink_pending.is_empty() {
+        trace_log!(
+            "⏳ handle {:?} relay close({}/{}) waits for {} pending downlink bytes",
+            handle,
+            close.direction,
+            close.reason,
+            ctx.downlink_pending.len()
+        );
+        ctx.state = SocketState::Closing;
+        ctx.uplink_tx = None;
+        ctx.pending_relay_close = Some(close);
+        return true;
+    }
+
+    let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
+    rearm_socket_with_reason(
+        handle,
+        tcp_socket,
+        ctx,
+        fake_pool,
+        now_secs,
+        close.direction,
+        close.reason,
+    );
+    false
+}
+
+fn finish_deferred_relay_close_if_drained(
+    handle: SocketHandle,
+    socket: &mut TcpSocket<'_>,
+    ctx: &mut SocketCtx,
+    fake_pool: &mut FakeIpPool,
+    now_secs: u64,
+) -> bool {
+    let Some(close) = ctx.pending_relay_close else {
+        return false;
+    };
+    if !ctx.downlink_pending.is_empty() {
+        return true;
+    }
+    rearm_socket_with_reason(
+        handle,
+        socket,
+        ctx,
+        fake_pool,
+        now_secs,
+        close.direction,
+        close.reason,
+    );
+    true
+}
+
 /// 刀11：在 run_event_loop 单写者 task 重算 loop-owned gauge 并发布进 `Arc<Metrics>`（30s tick 调）。
 /// 中文要点：`active_relays`（state==Relaying 计数）与 fake-IP 用量来自 loop **独占无锁**的
 /// `socket_ctxs`/`fake_pool`，**不能跨 task 读**（严禁套 Arc<Mutex>）→ 只能在此 task 周期重算后 `store`，
@@ -1888,14 +2030,15 @@ fn publish_gauges<'a>(
 
 fn spawn_remote_relay(
     handle: SocketHandle,
+    epoch: u64,
     stream: RelayStream,
     rx: mpsc::Receiver<Vec<u8>>,
-    back_tx: mpsc::Sender<(SocketHandle, Vec<u8>)>,
+    back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
     metrics_handle: &Metrics,
 ) {
     // 刀11：每条新 TCP flow 开远端成功后在此唯一入口计一次（覆盖 inline + spawned remote-open 两条路）。
     metrics_handle.inc_relays_spawned();
-    tokio::spawn(run_relay(handle, stream, rx, back_tx));
+    tokio::spawn(run_relay(handle, epoch, stream, rx, back_tx));
 }
 
 /// 一条 TCP relay 的双向泵（独立 task body；抽出便于 idle 超时单测）。
@@ -1904,9 +2047,10 @@ fn spawn_remote_relay(
 /// 适用 TUIC/REALITY 两种 RelayStream，与连接级 failover 探测无关（那是连接级，这是单 relay 级）。
 async fn run_relay(
     handle: SocketHandle,
+    epoch: u64,
     mut stream: RelayStream,
     mut rx: mpsc::Receiver<Vec<u8>>,
-    back_tx: mpsc::Sender<(SocketHandle, Vec<u8>)>,
+    back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
 ) {
     let mut buf = [0u8; 65_536];
     let mut diag = RelayTaskDiag::default();
@@ -1940,16 +2084,15 @@ async fn run_relay(
                 match remote_msg {
                     Ok(0) => {
                         println!("远端服务器关闭了车厢 {:?}", handle);
-                        if back_tx.send((handle, vec![])).await.is_err() {
-                            break ("remote_to_local", "global_rx_closed_on_eof");
-                        }
                         break ("remote_to_local", "remote_eof");
                     }
                     Ok(n) => {
                         diag.note_remote_read(n);
                         let data = buf[..n].to_vec();
                         let wait_started = std::time::Instant::now();
-                        let send_result = back_tx.send((handle, data)).await;
+                        let send_result = back_tx
+                            .send((handle, RelayEvent::Data { epoch, bytes: data }))
+                            .await;
                         let waited = wait_started.elapsed();
                         diag.note_global_rx_wait(waited, global_rx_pressure_threshold);
                         if waited >= global_rx_pressure_threshold {
@@ -1990,6 +2133,16 @@ async fn run_relay(
         diag.global_rx_wait_max_micros,
         diag.global_rx_pressure_events
     );
+    let _ = back_tx
+        .send((
+            handle,
+            RelayEvent::Closed(RelayClose {
+                epoch,
+                direction: close_direction,
+                reason: close_reason,
+            }),
+        ))
+        .await;
     // M2：关流前 shutdown——驱动 poll_shutdown 排空应用层缓冲（RealityStream 的 write_pending 尾部密文）
     // + 底层发 FIN；否则 best-effort poll_write 残留的 TLS app-record 尾部密文随 drop 丢弃 → 对端 AEAD
     // 停在 record 中途 + 收到提前 FIN（bad-decrypt / 被 REALITY 当异常流量）。对 TUIC 也是干净 finish。
@@ -2154,6 +2307,39 @@ mod tests {
         }
     }
 
+    /// 一条上行写立即失败的 mock 上游流，用来锁住 remote_write_failed 也会通知主循环 rearm。
+    struct FailingWriteStream {
+        shutdown_called: Arc<AtomicBool>,
+    }
+    impl tokio::io::AsyncRead for FailingWriteStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+    impl tokio::io::AsyncWrite for FailingWriteStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "test write reset",
+            )))
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.shutdown_called.store(true, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
+
     fn mk_test_handle(sockets: &mut SocketSet<'static>) -> SocketHandle {
         sockets.add(build_listener_socket(&ListenerSpec { local_port: 12345 }))
     }
@@ -2166,14 +2352,48 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let stream: RelayStream = Box::new(IdleStream { shutdown_called: flag.clone() });
         let (_tx, rx) = mpsc::channel::<Vec<u8>>(8); // 持 _tx → rx 不关、永不收（无活动）
-        let (back_tx, _back_rx) = mpsc::channel(8);
-        let task = tokio::spawn(run_relay(handle, stream, rx, back_tx));
+        let (back_tx, mut back_rx) = mpsc::channel(8);
+        let task = tokio::spawn(run_relay(handle, 7, stream, rx, back_tx));
 
         tokio::time::advance(std::time::Duration::from_secs(89)).await;
         assert!(!task.is_finished(), "89s < 90s idle 阈值，relay 不应退出");
         tokio::time::advance(std::time::Duration::from_secs(2)).await;
         task.await.unwrap();
         assert!(flag.load(Ordering::SeqCst), "idle 超时应退出并调用 stream.shutdown（L2）");
+        match back_rx.try_recv().expect("relay close should notify main loop") {
+            (h, RelayEvent::Closed(close)) => {
+                assert_eq!(h, handle);
+                assert_eq!(close.epoch, 7);
+                assert_eq!(close.direction, "timer");
+                assert_eq!(close.reason, "idle_timeout");
+            }
+            other => panic!("expected relay close event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_remote_write_failed_notifies_main_loop() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let flag = Arc::new(AtomicBool::new(false));
+        let stream: RelayStream = Box::new(FailingWriteStream { shutdown_called: flag.clone() });
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let (back_tx, mut back_rx) = mpsc::channel(8);
+        let task = tokio::spawn(run_relay(handle, 11, stream, rx, back_tx));
+
+        tx.send(vec![1, 2, 3]).await.unwrap();
+        task.await.unwrap();
+
+        assert!(flag.load(Ordering::SeqCst), "write failure should still call stream.shutdown");
+        match back_rx.try_recv().expect("write failure should notify main loop") {
+            (h, RelayEvent::Closed(close)) => {
+                assert_eq!(h, handle);
+                assert_eq!(close.epoch, 11);
+                assert_eq!(close.direction, "local_to_remote");
+                assert_eq!(close.reason, "remote_write_failed");
+            }
+            other => panic!("expected relay close event, got {other:?}"),
+        }
     }
 
     /// 活动重置：临近阈值前来一次上行活动 → idle 计时重置，不退出；再静默满 90s 才退出。
@@ -2185,7 +2405,7 @@ mod tests {
         let stream: RelayStream = Box::new(IdleStream { shutdown_called: flag.clone() });
         let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
         let (back_tx, _back_rx) = mpsc::channel(8);
-        let task = tokio::spawn(run_relay(handle, stream, rx, back_tx));
+        let task = tokio::spawn(run_relay(handle, 13, stream, rx, back_tx));
 
         tokio::time::advance(std::time::Duration::from_secs(89)).await;
         tx.send(vec![1, 2, 3]).await.unwrap(); // 活动（上行 write）→ 重置 idle 计时
@@ -2494,6 +2714,7 @@ mod tests {
             state: SocketState::Relaying,
             uplink_tx: Some(tx),
             downlink_pending: Vec::new(),
+            pending_relay_close: None,
             fake_ip: Some(ip),
             conn_epoch: 7,
             uplink_buffer: vec![1, 2, 3],
@@ -2513,6 +2734,87 @@ mod tests {
         assert_eq!(ctx.conn_epoch, 8, "rearm 应 bump conn_epoch（让在飞 open 失效，M3）");
         // refcount 已归零 → idle 超 TTL 可回收（证明 rearm 走了 release）。
         assert_eq!(pool.sweep(1000, 300), 1);
+    }
+
+    #[test]
+    fn relay_closed_epoch_guard_drops_stale_close() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(build_listener_socket(&ListenerSpec { local_port: 12345 }));
+        let (tx, _rx) = mpsc::channel(1);
+        let mut ctx = SocketCtx::new(12345);
+        ctx.state = SocketState::Relaying;
+        ctx.conn_epoch = 22;
+        ctx.uplink_tx = Some(tx);
+        let mut socket_ctxs = HashMap::new();
+        socket_ctxs.insert(handle, ctx);
+        let mut pool = FakeIpPool::new();
+
+        handle_relay_closed(
+            handle,
+            RelayClose {
+                epoch: 21,
+                direction: "timer",
+                reason: "idle_timeout",
+            },
+            &mut sockets,
+            &mut socket_ctxs,
+            &mut pool,
+            1,
+        );
+
+        let ctx = socket_ctxs.get(&handle).unwrap();
+        assert_eq!(ctx.state, SocketState::Relaying, "stale close must not rearm a new epoch");
+        assert_eq!(ctx.conn_epoch, 22);
+        assert!(ctx.uplink_tx.is_some());
+    }
+
+    #[test]
+    fn relay_closed_with_pending_downlink_defers_rearm() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(build_listener_socket(&ListenerSpec { local_port: 12345 }));
+        let (tx, _rx) = mpsc::channel(1);
+        let mut ctx = SocketCtx::new(12345);
+        ctx.state = SocketState::Relaying;
+        ctx.conn_epoch = 5;
+        ctx.uplink_tx = Some(tx);
+        ctx.downlink_pending = vec![1, 2, 3];
+        let mut socket_ctxs = HashMap::new();
+        socket_ctxs.insert(handle, ctx);
+        let mut pool = FakeIpPool::new();
+
+        let keep_dirty = handle_relay_closed(
+            handle,
+            RelayClose {
+                epoch: 5,
+                direction: "remote_to_local",
+                reason: "remote_eof",
+            },
+            &mut sockets,
+            &mut socket_ctxs,
+            &mut pool,
+            1,
+        );
+
+        let ctx = socket_ctxs.get_mut(&handle).unwrap();
+        assert!(keep_dirty, "pending downlink must stay dirty until it drains");
+        assert_eq!(ctx.state, SocketState::Closing);
+        assert!(ctx.uplink_tx.is_none());
+        assert_eq!(ctx.downlink_pending, vec![1, 2, 3]);
+        assert!(ctx.pending_relay_close.is_some());
+        assert_eq!(ctx.conn_epoch, 5, "deferred close must not bump epoch before drain");
+
+        ctx.downlink_pending.clear();
+        let socket = sockets.get_mut::<TcpSocket>(handle);
+        assert!(finish_deferred_relay_close_if_drained(
+            handle,
+            socket,
+            ctx,
+            &mut pool,
+            2
+        ));
+        assert_eq!(ctx.state, SocketState::Listening);
+        assert!(ctx.pending_relay_close.is_none());
+        assert_eq!(ctx.conn_epoch, 6);
     }
 
     // ---- 刀9 M3：握手并发化（epoch 防串话 / buffer 上限 / flush 保序 / 失败 rearm）----

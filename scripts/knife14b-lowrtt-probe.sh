@@ -17,6 +17,7 @@ env:
   DURATION=30              seconds per iperf run
   LOG=/tmp/mvpn_accept.log mini_vpn soak log
   OUT=/tmp/mvpn_knife14b_lowrtt_<timestamp>.md
+  IPERF_TIMEOUT_SECS=DURATION+20 external timeout per iperf command
   RUN_UDP=0                set 1 to run UDP probes too
   UDP_BW=90M               UDP offered bandwidth
   UDP_LEN=1200             UDP datagram payload length
@@ -37,9 +38,11 @@ fi
 
 command -v iperf3 >/dev/null 2>&1 || { echo "iperf3 not found" >&2; exit 1; }
 command -v curl >/dev/null 2>&1 || { echo "curl not found" >&2; exit 1; }
+command -v timeout >/dev/null 2>&1 || { echo "timeout not found" >&2; exit 1; }
 
 PARALLEL_SET="${PARALLEL_SET:-1 2 4 8}"
 DURATION="${DURATION:-30}"
+IPERF_TIMEOUT_SECS="${IPERF_TIMEOUT_SECS:-$((DURATION + 20))}"
 LOG="${LOG:-/tmp/mvpn_accept.log}"
 RUN_UDP="${RUN_UDP:-0}"
 UDP_BW="${UDP_BW:-90M}"
@@ -143,7 +146,7 @@ append_iperf_cmd() {
 
   local start_line
   start_line="$(log_line_count)"
-  append_cmd "$@"
+  append_cmd timeout "${IPERF_TIMEOUT_SECS}s" "$@"
   append_metrics_since "$start_line" "$metrics_title"
 }
 
@@ -154,6 +157,7 @@ append_iperf_cmd() {
   echo "- target: ${TARGET}:${PORT}"
   echo "- parallel_set: ${PARALLEL_SET}"
   echo "- duration: ${DURATION}s"
+  echo "- iperf_timeout: ${IPERF_TIMEOUT_SECS}s"
   echo "- log: ${LOG}"
   echo
   echo "> 判读前先确认：curl ipinfo.io 必须是 exit IP；dig example.com +short 应是 198.18.x.x；📊 TCP relay 累计应增长。"
