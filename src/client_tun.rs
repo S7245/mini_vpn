@@ -237,8 +237,15 @@ impl RelayTaskDiag {
 }
 
 #[derive(Debug)]
+enum RelayCommand {
+    Data(Vec<u8>),
+    Finish,
+}
+
+#[derive(Debug)]
 enum RelayWriterSignal {
     Progress { bytes: usize },
+    WriteHalfClosed { reason: &'static str },
     Closed {
         direction: &'static str,
         reason: &'static str,
@@ -271,7 +278,9 @@ struct SocketCtx {
     /// Current lifecycle state for this listener slot.
     state: SocketState,
     /// Sender used to push local payloads into the remote relay task for this slot only.
-    uplink_tx: Option<mpsc::Sender<Vec<u8>>>,
+    uplink_tx: Option<mpsc::Sender<RelayCommand>>,
+    /// Whether this flow has already propagated the local TCP finish into the relay write half.
+    local_fin_sent: bool,
     /// Downlink bytes not yet accepted by the smoltcp tx buffer.
     /// 中文要点：smoltcp send_slice 可能只写一部分（tx buffer 受 TCP ACK 释放制约），
     /// 写不下的字节必须留在这里、由后续 poll 持续 flush，否则丢字节 → TLS bad decrypt。
@@ -302,6 +311,7 @@ impl SocketCtx {
             local_port,
             state: SocketState::Listening,
             uplink_tx: None,
+            local_fin_sent: false,
             downlink_pending: Vec::new(),
             pending_relay_close: None,
             fake_ip: None,
@@ -875,7 +885,7 @@ pub async fn run_event_loop<D, U, M>(
 
     // #1 脏集合驱动：只有「本 tick 有活动」的 listener handle 进集合，relay 段仅处理它们，
     // 替代每 tick O(总槽) 全量 sweep。入集 = inbound TCP 包标脏其端口 pool / 回程残留下行 pending；
-    // 出集 = 处理后无 pending 且不再 can_recv（见 process_dirty_relay）。
+    // 出集 = 处理后无 pending、不再 can_recv、且没有待发送本地 FIN（见 process_dirty_relay）。
     let mut dirty: HashSet<SocketHandle> = HashSet::new();
 
     // 刀5: fake-IP DNS 不再用 smoltcp socket。任意 resolver 的明文 :53 在 rx 热路径被
@@ -1196,8 +1206,8 @@ pub async fn run_event_loop<D, U, M>(
 /// #1 脏集合驱动的 relay 调度段：只处理本 tick 标脏的 handle，替代每 tick 全量 `all_handles()`。
 ///
 /// 中文要点：把 relay 段成本从 O(总 listener 槽数) 降到 O(活跃 handle)。处理完一个 handle 后，
-/// 若它既无下行 pending、smoltcp 侧也不再 `can_recv`（首包已 drain、已开远端进 Relaying），
-/// 就出脏集合——后续回程走 `global_rx` 分支，残留 pending 时会被重新标脏。仍有活就留在集合里下个 tick 续处理。
+/// 若它无下行 pending、smoltcp 侧不再 `can_recv`、且没有本地 FIN 待发（首包已 drain、已开远端进 Relaying），
+/// 就出脏集合——后续回程走 `global_rx` 分支，残留 pending 或 FIN 重试时会留脏。仍有活就留在集合里下个 tick 续处理。
 #[allow(clippy::too_many_arguments)]
 async fn process_dirty_relay<U, M>(
     dirty: &mut HashSet<SocketHandle>,
@@ -1235,12 +1245,22 @@ async fn process_dirty_relay<U, M>(
             trace_log!("处理本地房间 {:?} 失败: {e}", handle);
         }
         let still_active = {
-            let has_recv = sockets.get_mut::<TcpSocket>(handle).can_recv();
-            let has_pending = socket_ctxs
+            let (has_recv, tcp_state) = {
+                let socket = sockets.get_mut::<TcpSocket>(handle);
+                (socket.can_recv(), socket.state())
+            };
+            let (has_pending, needs_local_finish) = socket_ctxs
                 .get(&handle)
-                .map(|c| !c.downlink_pending.is_empty())
-                .unwrap_or(false);
-            has_recv || has_pending
+                .map(|c| {
+                    (
+                        !c.downlink_pending.is_empty(),
+                        tcp_state == TcpState::CloseWait
+                            && c.uplink_tx.is_some()
+                            && !c.local_fin_sent,
+                    )
+                })
+                .unwrap_or((false, false));
+            has_recv || has_pending || needs_local_finish
         };
         if !still_active {
             dirty.remove(&handle);
@@ -1522,6 +1542,7 @@ fn rearm_socket(
     ctx.state = SocketState::Closing;
     socket.abort();
     ctx.uplink_tx = None;
+    ctx.local_fin_sent = false;
     ctx.downlink_pending.clear();
     ctx.pending_relay_close = None;
     ctx.downlink_diag = TcpDownlinkDiag::default();
@@ -1586,13 +1607,16 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
         if let Some(tx) = ctx.uplink_tx.as_mut() {
             match tx.try_reserve() {
                 Ok(permit) => {
-                    let payload = {
+                    let (payload, tcp_state) = {
                         let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
-                        extract_socket_payload(tcp_socket)
+                        (extract_socket_payload(tcp_socket), tcp_socket.state())
                     };
                     if let Some(payload) = payload {
-                        permit.send(payload);
+                        permit.send(RelayCommand::Data(payload));
                         ctx.state = SocketState::Relaying;
+                    } else if tcp_state == TcpState::CloseWait && !ctx.local_fin_sent {
+                        permit.send(RelayCommand::Finish);
+                        ctx.local_fin_sent = true;
                     }
                     EstablishedUplink::Handled
                 }
@@ -1751,7 +1775,7 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
         trace_log!("🚪 handle {:?} remote session opened", handle);
 
         let (tx, rx) = tokio::sync::mpsc::channel(RELAY_CHANNEL_CAPACITY);
-        if let Err(e) = tx.try_send(payload) {
+        if let Err(e) = tx.try_send(RelayCommand::Data(payload)) {
             trace_log!("❌ handle {:?} 新建中继通道写入失败({e}) → rearm（不静默丢首包）", handle);
             let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
             rearm_socket_with_reason(
@@ -1838,7 +1862,7 @@ fn handle_handshake_done(
             // 容量被改小等），**不静默丢缓存**——log + rearm 撤掉本槽，让应用 TCP 重建（Finding 2）。
             if !ctx.uplink_buffer.is_empty() {
                 let buffered = std::mem::take(&mut ctx.uplink_buffer);
-                if let Err(e) = tx.try_send(buffered) {
+                if let Err(e) = tx.try_send(RelayCommand::Data(buffered)) {
                     trace_log!("❌ handle {:?} flush open 缓存失败({e}) → rearm（不静默丢字节）", handle);
                     let socket = sockets.get_mut::<TcpSocket>(handle);
                     rearm_socket_with_reason(
@@ -2053,7 +2077,7 @@ fn spawn_remote_relay(
     handle: SocketHandle,
     epoch: u64,
     stream: RelayStream,
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<RelayCommand>,
     back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
     metrics_handle: &Metrics,
 ) {
@@ -2070,7 +2094,7 @@ async fn run_relay(
     handle: SocketHandle,
     epoch: u64,
     stream: RelayStream,
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<RelayCommand>,
     back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
 ) {
     let (mut remote_reader, remote_writer) = tokio::io::split(stream);
@@ -2089,19 +2113,29 @@ async fn run_relay(
     let global_rx_pressure_threshold = std::time::Duration::from_millis(5);
     let idle = tokio::time::sleep(RELAY_IDLE_TIMEOUT);
     tokio::pin!(idle);
+    let mut writer_done = false;
     let (close_direction, close_reason) = loop {
         tokio::select! {
-            signal = writer_signal_rx.recv() => {
+            signal = writer_signal_rx.recv(), if !writer_done => {
                 match signal {
                     Some(RelayWriterSignal::Progress { bytes }) => {
                         diag.note_uplink_write(bytes);
+                        idle.as_mut().reset(tokio::time::Instant::now() + RELAY_IDLE_TIMEOUT);
+                    }
+                    Some(RelayWriterSignal::WriteHalfClosed { reason }) => {
+                        tcp_diag_log!(
+                            "🔎 tcp-relay-write-half-closed handle={:?} reason={}",
+                            handle,
+                            reason
+                        );
+                        writer_done = true;
                         idle.as_mut().reset(tokio::time::Instant::now() + RELAY_IDLE_TIMEOUT);
                     }
                     Some(RelayWriterSignal::Closed { direction, reason }) => {
                         break (direction, reason);
                     }
                     None => {
-                        break ("local_to_remote", "writer_signal_closed");
+                        writer_done = true;
                     }
                 }
             }
@@ -2186,7 +2220,7 @@ async fn run_relay(
 async fn run_relay_writer(
     handle: SocketHandle,
     mut writer: tokio::io::WriteHalf<RelayStream>,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<RelayCommand>,
     signal_tx: mpsc::Sender<RelayWriterSignal>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
@@ -2198,7 +2232,7 @@ async fn run_relay_writer(
             }
             local_msg = rx.recv() => {
                 match local_msg {
-                    Some(payload) => {
+                    Some(RelayCommand::Data(payload)) => {
                         let payload_len = payload.len();
                         let write_result = tokio::select! {
                             _ = &mut stop_rx => {
@@ -2240,6 +2274,52 @@ async fn run_relay_writer(
                                     })
                                     .await;
                                 let _ = writer.shutdown().await;
+                                return;
+                            }
+                        }
+                    }
+                    Some(RelayCommand::Finish) => {
+                        let shutdown_result = tokio::select! {
+                            _ = &mut stop_rx => {
+                                let _ = writer.shutdown().await;
+                                return;
+                            }
+                            result = tokio::time::timeout(RELAY_WRITE_TIMEOUT, writer.shutdown()) => result,
+                        };
+                        match shutdown_result {
+                            Ok(Ok(_)) => {
+                                let _ = signal_tx
+                                    .send(RelayWriterSignal::WriteHalfClosed {
+                                        reason: "local_finish",
+                                    })
+                                    .await;
+                                return;
+                            }
+                            Ok(Err(e)) => {
+                                println!(
+                                    "关闭上游写半边失败 direction=local_to_remote handle={:?} err={:?}",
+                                    handle, e
+                                );
+                                let _ = signal_tx
+                                    .send(RelayWriterSignal::Closed {
+                                        direction: "local_to_remote",
+                                        reason: "remote_shutdown_failed",
+                                    })
+                                    .await;
+                                return;
+                            }
+                            Err(_) => {
+                                println!(
+                                    "关闭上游写半边超时 direction=local_to_remote handle={:?} timeout={}s",
+                                    handle,
+                                    RELAY_WRITE_TIMEOUT.as_secs()
+                                );
+                                let _ = signal_tx
+                                    .send(RelayWriterSignal::Closed {
+                                        direction: "local_to_remote",
+                                        reason: "remote_shutdown_timeout",
+                                    })
+                                    .await;
                                 return;
                             }
                         }
@@ -2489,6 +2569,46 @@ mod tests {
             Poll::Ready(Ok(()))
         }
     }
+
+    /// 写半边 shutdown 后读侧才产数据：锁住本地 FIN 不应终止 remote-to-local 方向。
+    struct LocalFinishThenReadableStream {
+        shutdown_called: Arc<AtomicBool>,
+        read_sent: bool,
+    }
+    impl tokio::io::AsyncRead for LocalFinishThenReadableStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if !self.shutdown_called.load(Ordering::SeqCst) {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            if self.read_sent {
+                return Poll::Ready(Ok(()));
+            }
+            buf.put_slice(b"after-local-finish");
+            self.read_sent = true;
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl tokio::io::AsyncWrite for LocalFinishThenReadableStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.shutdown_called.store(true, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
     impl tokio::io::AsyncWrite for PendingWriteStream {
         fn poll_write(
             self: std::pin::Pin<&mut Self>,
@@ -2536,7 +2656,7 @@ mod tests {
         let handle = mk_test_handle(&mut sockets);
         let flag = Arc::new(AtomicBool::new(false));
         let stream: RelayStream = Box::new(IdleStream { shutdown_called: flag.clone() });
-        let (_tx, rx) = mpsc::channel::<Vec<u8>>(8); // 持 _tx → rx 不关、永不收（无活动）
+        let (_tx, rx) = mpsc::channel::<RelayCommand>(8); // 持 _tx → rx 不关、永不收（无活动）
         let (back_tx, mut back_rx) = mpsc::channel(8);
         let task = tokio::spawn(run_relay(handle, 7, stream, rx, back_tx));
 
@@ -2562,11 +2682,11 @@ mod tests {
         let handle = mk_test_handle(&mut sockets);
         let flag = Arc::new(AtomicBool::new(false));
         let stream: RelayStream = Box::new(FailingWriteStream { shutdown_called: flag.clone() });
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, rx) = mpsc::channel::<RelayCommand>(8);
         let (back_tx, mut back_rx) = mpsc::channel(8);
         let task = tokio::spawn(run_relay(handle, 11, stream, rx, back_tx));
 
-        tx.send(vec![1, 2, 3]).await.unwrap();
+        tx.send(RelayCommand::Data(vec![1, 2, 3])).await.unwrap();
         task.await.unwrap();
 
         assert!(flag.load(Ordering::SeqCst), "write failure should still call stream.shutdown");
@@ -2587,11 +2707,11 @@ mod tests {
         let handle = mk_test_handle(&mut sockets);
         let flag = Arc::new(AtomicBool::new(false));
         let stream: RelayStream = Box::new(PendingWriteStream { shutdown_called: flag.clone() });
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, rx) = mpsc::channel::<RelayCommand>(8);
         let (back_tx, mut back_rx) = mpsc::channel(8);
         let task = tokio::spawn(run_relay(handle, 17, stream, rx, back_tx));
 
-        tx.send(vec![1, 2, 3]).await.unwrap();
+        tx.send(RelayCommand::Data(vec![1, 2, 3])).await.unwrap();
         tokio::task::yield_now().await;
         tokio::time::advance(RELAY_WRITE_TIMEOUT - std::time::Duration::from_secs(1)).await;
         assert!(!task.is_finished(), "relay should not close before write timeout");
@@ -2621,11 +2741,11 @@ mod tests {
             shutdown_called: shutdown_called.clone(),
             read_sent: false,
         });
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, rx) = mpsc::channel::<RelayCommand>(8);
         let (back_tx, mut back_rx) = mpsc::channel(8);
         let task = tokio::spawn(run_relay(handle, 23, stream, rx, back_tx));
 
-        tx.send(vec![1, 2, 3]).await.unwrap();
+        tx.send(RelayCommand::Data(vec![1, 2, 3])).await.unwrap();
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
 
@@ -2650,6 +2770,39 @@ mod tests {
         task.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn relay_local_finish_keeps_remote_read_open() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let stream: RelayStream = Box::new(LocalFinishThenReadableStream {
+            shutdown_called: shutdown_called.clone(),
+            read_sent: false,
+        });
+        let (tx, rx) = mpsc::channel::<RelayCommand>(8);
+        let (back_tx, mut back_rx) = mpsc::channel(8);
+        let task = tokio::spawn(run_relay(handle, 29, stream, rx, back_tx));
+
+        tx.send(RelayCommand::Finish).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            shutdown_called.load(Ordering::SeqCst),
+            "local finish should shutdown only the remote write half"
+        );
+        match back_rx.recv().await.expect("remote data should still reach main loop") {
+            (h, RelayEvent::Data { epoch, bytes }) => {
+                assert_eq!(h, handle);
+                assert_eq!(epoch, 29);
+                assert_eq!(bytes, b"after-local-finish");
+            }
+            other => panic!("expected remote data after local finish, got {other:?}"),
+        }
+
+        task.await.unwrap();
+    }
+
     /// 活动重置：临近阈值前来一次上行活动 → idle 计时重置，不退出；再静默满 90s 才退出。
     #[tokio::test(start_paused = true)]
     async fn relay_activity_resets_idle_timer() {
@@ -2657,12 +2810,12 @@ mod tests {
         let handle = mk_test_handle(&mut sockets);
         let flag = Arc::new(AtomicBool::new(false));
         let stream: RelayStream = Box::new(IdleStream { shutdown_called: flag.clone() });
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, rx) = mpsc::channel::<RelayCommand>(8);
         let (back_tx, _back_rx) = mpsc::channel(8);
         let task = tokio::spawn(run_relay(handle, 13, stream, rx, back_tx));
 
         tokio::time::advance(std::time::Duration::from_secs(89)).await;
-        tx.send(vec![1, 2, 3]).await.unwrap(); // 活动（上行 write）→ 重置 idle 计时
+        tx.send(RelayCommand::Data(vec![1, 2, 3])).await.unwrap(); // 活动（上行 write）→ 重置 idle 计时
         tokio::task::yield_now().await; // 让 relay 消费该活动并重建 sleep
         tokio::time::advance(std::time::Duration::from_secs(89)).await;
         assert!(!task.is_finished(), "活动重置了 idle 计时，第二个 89s 窗口内不应退出");
@@ -3010,6 +3163,7 @@ mod tests {
             local_port: 80,
             state: SocketState::Relaying,
             uplink_tx: Some(tx),
+            local_fin_sent: true,
             downlink_pending: Vec::new(),
             pending_relay_close: None,
             fake_ip: Some(ip),
@@ -3022,6 +3176,7 @@ mod tests {
 
         assert_eq!(ctx.state, SocketState::Listening);
         assert!(ctx.uplink_tx.is_none());
+        assert!(!ctx.local_fin_sent, "rearm 应清空本地 FIN 发送状态");
         assert!(ctx.fake_ip.is_none(), "rearm 应清空 fake_ip");
         assert!(ctx.uplink_buffer.is_empty(), "rearm 应清空 uplink_buffer（M3 patch）");
         assert_eq!(
