@@ -133,7 +133,7 @@ enum SocketState {
     /// Remote TCP open has been spawned out of the main loop and is still in flight.
     /// 中文要点：与 `OpeningRemote` 区分——in-flight open 是**正常态**（由上游 open_tcp 内置超时
     /// 兜底 + `HandshakeDone` 必回灌），`reap_dead_slots` **不**按「OpeningRemote+无 uplink_tx」误杀它；
-    /// 仅当本地已关闭（`!is_active()` / CloseWait）才回收（回收时 bump epoch → 迟到结果被丢）。
+    /// 仅当本地 socket 已不 active，或 CloseWait 已无 live relay 时才回收（回收时 bump epoch → 迟到结果被丢）。
     HandshakePending,
     /// Local and remote sides are actively relaying payloads.
     Relaying,
@@ -1258,8 +1258,9 @@ async fn process_dirty_relay<U, M>(
 /// 死槽判定（仅对「被用过」的槽，即 `ctx.state != Listening`；空闲 Listen 槽 ctx.state==Listening 永不命中）：
 /// - `!is_active()`：Closed / TimeWait（RST、双向关闭完成）；**也覆盖 `HandshakePending` 槽
 ///   在本地已关闭时**（remote-open 在飞但 app 已断）——回收时 rearm bump epoch，迟到的 `HandshakeDone` 被丢；
-/// - `CloseWait` 且无 pending downlink：被拦截应用已发 FIN（主动关闭）→ teardown；若仍有
-///   `downlink_pending`，说明远端尾包已被接受但尚未全部写入 smoltcp，必须先让 dirty flush 排空；
+/// - `CloseWait` 且无 pending downlink、无 live relay：被拦截应用已结束发送半边，且远端 relay
+///   也已卸下 → teardown；若 relay 仍活着，即使当前 pending 为空，也可能还有 reverse/downlink 字节稍后到达；
+///   若仍有 `downlink_pending`，说明远端尾包已被接受但尚未全部写入 smoltcp，必须先让 dirty flush 排空；
 /// - `OpeningRemote && uplink_tx.is_none()`：**inline** `open_tcp` 失败后状态卡在 OpeningRemote。
 ///   中文要点：此第三判据**仅匹配 `OpeningRemote`**（inline 路径），**不**匹配 `HandshakePending`
 ///   ——后者是 async remote-open 的**正常在飞态**（由上游超时兜底，`HandshakeDone` 必回灌解决），绝不能在飞就回收。
@@ -1311,8 +1312,10 @@ fn should_reap_slot(ctx: &SocketCtx, tcp_state: TcpState, active: bool) -> bool 
     if !ctx.downlink_pending.is_empty() {
         return false;
     }
-    tcp_state == TcpState::CloseWait
-        || (ctx.state == SocketState::OpeningRemote && ctx.uplink_tx.is_none())
+    if tcp_state == TcpState::CloseWait {
+        return ctx.uplink_tx.is_none();
+    }
+    ctx.state == SocketState::OpeningRemote && ctx.uplink_tx.is_none()
 }
 
 /// Allocate a fresh smoltcp TCP listener socket for one pool slot.
@@ -2912,6 +2915,25 @@ mod tests {
         assert!(
             should_reap_slot(&ctx, TcpState::Closed, false),
             "inactive sockets still reap even if pending bytes can no longer be delivered"
+        );
+    }
+
+    #[test]
+    fn reap_predicate_preserves_active_closewait_live_relay() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut ctx = SocketCtx::new(443);
+        ctx.state = SocketState::Relaying;
+        ctx.uplink_tx = Some(tx);
+
+        assert!(
+            !should_reap_slot(&ctx, TcpState::CloseWait, true),
+            "active CloseWait with a live relay may still receive reverse/downlink bytes"
+        );
+
+        ctx.uplink_tx = None;
+        assert!(
+            should_reap_slot(&ctx, TcpState::CloseWait, true),
+            "CloseWait is reapable once there is no live relay and no pending downlink"
         );
     }
 
