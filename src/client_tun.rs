@@ -236,6 +236,15 @@ impl RelayTaskDiag {
     }
 }
 
+#[derive(Debug)]
+enum RelayWriterSignal {
+    Progress { bytes: usize },
+    Closed {
+        direction: &'static str,
+        reason: &'static str,
+    },
+}
+
 /// Terminal reason reported by one background TCP relay task.
 #[derive(Debug, Clone, Copy)]
 struct RelayClose {
@@ -2057,48 +2066,43 @@ fn spawn_remote_relay(
 async fn run_relay(
     handle: SocketHandle,
     epoch: u64,
-    mut stream: RelayStream,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    stream: RelayStream,
+    rx: mpsc::Receiver<Vec<u8>>,
     back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
 ) {
+    let (mut remote_reader, remote_writer) = tokio::io::split(stream);
+    let (writer_signal_tx, mut writer_signal_rx) =
+        mpsc::channel::<RelayWriterSignal>(RELAY_CHANNEL_CAPACITY);
+    let (writer_stop_tx, writer_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut writer_task = tokio::spawn(run_relay_writer(
+        handle,
+        remote_writer,
+        rx,
+        writer_signal_tx,
+        writer_stop_rx,
+    ));
     let mut buf = [0u8; 65_536];
     let mut diag = RelayTaskDiag::default();
     let global_rx_pressure_threshold = std::time::Duration::from_millis(5);
+    let idle = tokio::time::sleep(RELAY_IDLE_TIMEOUT);
+    tokio::pin!(idle);
     let (close_direction, close_reason) = loop {
         tokio::select! {
-            local_msg = rx.recv() => {
-                match local_msg {
-                    Some(payload) => {
-                        let payload_len = payload.len();
-                        match tokio::time::timeout(RELAY_WRITE_TIMEOUT, stream.write_all(&payload)).await {
-                            Ok(Ok(_)) => {
-                                diag.note_uplink_write(payload_len);
-                            }
-                            Ok(Err(e)) => {
-                                println!(
-                                    "写入上游流失败 direction=local_to_remote handle={:?} attempted_bytes={} err={:?}",
-                                    handle, payload_len, e
-                                );
-                                break ("local_to_remote", "remote_write_failed");
-                            }
-                            Err(_) => {
-                                println!(
-                                    "写入上游流超时 direction=local_to_remote handle={:?} attempted_bytes={} timeout={}s",
-                                    handle,
-                                    payload_len,
-                                    RELAY_WRITE_TIMEOUT.as_secs()
-                                );
-                                break ("local_to_remote", "remote_write_timeout");
-                            }
-                        }
+            signal = writer_signal_rx.recv() => {
+                match signal {
+                    Some(RelayWriterSignal::Progress { bytes }) => {
+                        diag.note_uplink_write(bytes);
+                        idle.as_mut().reset(tokio::time::Instant::now() + RELAY_IDLE_TIMEOUT);
+                    }
+                    Some(RelayWriterSignal::Closed { direction, reason }) => {
+                        break (direction, reason);
                     }
                     None => {
-                        println!("本地房间 {:?} 已关闭通道", handle);
-                        break ("local_to_remote", "local_channel_closed");
+                        break ("local_to_remote", "writer_signal_closed");
                     }
                 }
             }
-            remote_msg = stream.read(&mut buf) => {
+            remote_msg = remote_reader.read(&mut buf) => {
                 match remote_msg {
                     Ok(0) => {
                         println!("远端服务器关闭了车厢 {:?}", handle);
@@ -2125,6 +2129,7 @@ async fn run_relay(
                         if send_result.is_err() {
                             break ("remote_to_local", "global_rx_closed");
                         }
+                        idle.as_mut().reset(tokio::time::Instant::now() + RELAY_IDLE_TIMEOUT);
                     }
                     Err(e) => {
                         println!("读取上游流失败 direction=remote_to_local handle={:?} err={:?}", handle, e);
@@ -2133,12 +2138,24 @@ async fn run_relay(
                 }
             }
             // L2：双向静默超时 → 主动清理（防泄漏）。有活动的 select 分支会重启 loop → 重建 sleep。
-            _ = tokio::time::sleep(RELAY_IDLE_TIMEOUT) => {
+            _ = &mut idle => {
                 println!("⏱️ relay {:?} 双向静默 {}s，idle 超时关闭（L2）", handle, RELAY_IDLE_TIMEOUT.as_secs());
                 break ("timer", "idle_timeout");
             }
         }
     };
+    let _ = writer_stop_tx.send(());
+    // M2 preserved after splitting the pump: let the write half drive shutdown so protocol-layer
+    // pending bytes can flush, but keep the relay close path bounded if shutdown itself wedges.
+    if writer_task.is_finished() {
+        let _ = writer_task.await;
+    } else if tokio::time::timeout(RELAY_WRITE_TIMEOUT, &mut writer_task)
+        .await
+        .is_err()
+    {
+        writer_task.abort();
+        let _ = writer_task.await;
+    }
     tcp_diag_log!(
         "🔎 tcp-relay-close handle={:?} direction={} reason={} uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} global_rx_wait_max_us={} global_rx_pressure_events={}",
         handle,
@@ -2161,10 +2178,84 @@ async fn run_relay(
             }),
         ))
         .await;
-    // M2：关流前 shutdown——驱动 poll_shutdown 排空应用层缓冲（RealityStream 的 write_pending 尾部密文）
-    // + 底层发 FIN；否则 best-effort poll_write 残留的 TLS app-record 尾部密文随 drop 丢弃 → 对端 AEAD
-    // 停在 record 中途 + 收到提前 FIN（bad-decrypt / 被 REALITY 当异常流量）。对 TUIC 也是干净 finish。
-    let _ = stream.shutdown().await;
+}
+
+async fn run_relay_writer(
+    handle: SocketHandle,
+    mut writer: tokio::io::WriteHalf<RelayStream>,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    signal_tx: mpsc::Sender<RelayWriterSignal>,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = &mut stop_rx => {
+                let _ = writer.shutdown().await;
+                return;
+            }
+            local_msg = rx.recv() => {
+                match local_msg {
+                    Some(payload) => {
+                        let payload_len = payload.len();
+                        let write_result = tokio::select! {
+                            _ = &mut stop_rx => {
+                                let _ = writer.shutdown().await;
+                                return;
+                            }
+                            result = tokio::time::timeout(RELAY_WRITE_TIMEOUT, writer.write_all(&payload)) => result,
+                        };
+                        match write_result {
+                            Ok(Ok(_)) => {
+                                let _ = signal_tx
+                                    .try_send(RelayWriterSignal::Progress { bytes: payload_len });
+                            }
+                            Ok(Err(e)) => {
+                                println!(
+                                    "写入上游流失败 direction=local_to_remote handle={:?} attempted_bytes={} err={:?}",
+                                    handle, payload_len, e
+                                );
+                                let _ = signal_tx
+                                    .send(RelayWriterSignal::Closed {
+                                        direction: "local_to_remote",
+                                        reason: "remote_write_failed",
+                                    })
+                                    .await;
+                                let _ = writer.shutdown().await;
+                                return;
+                            }
+                            Err(_) => {
+                                println!(
+                                    "写入上游流超时 direction=local_to_remote handle={:?} attempted_bytes={} timeout={}s",
+                                    handle,
+                                    payload_len,
+                                    RELAY_WRITE_TIMEOUT.as_secs()
+                                );
+                                let _ = signal_tx
+                                    .send(RelayWriterSignal::Closed {
+                                        direction: "local_to_remote",
+                                        reason: "remote_write_timeout",
+                                    })
+                                    .await;
+                                let _ = writer.shutdown().await;
+                                return;
+                            }
+                        }
+                    }
+                    None => {
+                        println!("本地房间 {:?} 已关闭通道", handle);
+                        let _ = signal_tx
+                            .send(RelayWriterSignal::Closed {
+                                direction: "local_to_remote",
+                                reason: "local_channel_closed",
+                            })
+                            .await;
+                        let _ = writer.shutdown().await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// rx 热路径分流结果。
@@ -2352,6 +2443,49 @@ mod tests {
             Poll::Pending
         }
     }
+
+    /// 写侧 Pending 后读侧才产数据：锁住 relay 读写必须真正并发。
+    struct PendingWriteThenReadableStream {
+        write_polled: Arc<AtomicBool>,
+        shutdown_called: Arc<AtomicBool>,
+        read_sent: bool,
+    }
+    impl tokio::io::AsyncRead for PendingWriteThenReadableStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.read_sent {
+                return Poll::Pending;
+            }
+            if !self.write_polled.load(Ordering::SeqCst) {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            buf.put_slice(b"remote-progress");
+            self.read_sent = true;
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl tokio::io::AsyncWrite for PendingWriteThenReadableStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.write_polled.store(true, Ordering::SeqCst);
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.shutdown_called.store(true, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
     impl tokio::io::AsyncWrite for PendingWriteStream {
         fn poll_write(
             self: std::pin::Pin<&mut Self>,
@@ -2471,6 +2605,46 @@ mod tests {
             }
             other => panic!("expected relay close event, got {other:?}"),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_remote_read_progresses_while_local_write_is_pending() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let write_polled = Arc::new(AtomicBool::new(false));
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let stream: RelayStream = Box::new(PendingWriteThenReadableStream {
+            write_polled: write_polled.clone(),
+            shutdown_called: shutdown_called.clone(),
+            read_sent: false,
+        });
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let (back_tx, mut back_rx) = mpsc::channel(8);
+        let task = tokio::spawn(run_relay(handle, 23, stream, rx, back_tx));
+
+        tx.send(vec![1, 2, 3]).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            write_polled.load(Ordering::SeqCst),
+            "test stream should have entered the pending write"
+        );
+        match back_rx.try_recv().expect("remote read should not wait for write timeout") {
+            (h, RelayEvent::Data { epoch, bytes }) => {
+                assert_eq!(h, handle);
+                assert_eq!(epoch, 23);
+                assert_eq!(bytes, b"remote-progress");
+            }
+            other => panic!("expected remote data before write timeout, got {other:?}"),
+        }
+        assert!(
+            !shutdown_called.load(Ordering::SeqCst),
+            "relay should still be alive before write timeout"
+        );
+
+        tokio::time::advance(RELAY_WRITE_TIMEOUT).await;
+        task.await.unwrap();
     }
 
     /// 活动重置：临近阈值前来一次上行活动 → idle 计时重置，不退出；再静默满 90s 才退出。
