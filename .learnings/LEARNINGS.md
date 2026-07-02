@@ -1,5 +1,30 @@
 # Learnings
 
+## 2026-07-02 — Knife14q: QUIC stream backpressure is not a per-chunk write failure
+
+`480c3e8` / knife14p was tested with
+`/tmp/mvpn_knife14p_usclient_suite_20260702_143215.tar.gz`. The run completed,
+but it did not meet acceptance: forward P=2 timed out, reverse P=2/4/8 timed
+out, reverse P=1 stayed at Kbit/s scale, and the client log still showed
+`remote_write_timeout attempted_bytes=1160 timeout=5s`.
+
+The important discriminator was that `global_rx_pressure_events=0` throughout
+the run, so the new downlink high/low watermark was not the active mechanism.
+The code-review finding was on the opposite direction: `run_relay_writer`
+treated a pending TUIC/QUIC stream `write_all` as a hard failure after 5s. That
+is wrong for a VPN data plane. A pending stream write can be normal QUIC
+flow-control or path backpressure and should propagate back to the local TCP
+socket through the bounded relay channel and smoltcp receive window.
+
+Reusable rule: do not put short per-chunk deadlines around data-plane
+`write_all` calls unless the deadline represents a protocol invariant. Keep
+cleanup bounded at the relay/task level (`idle_timeout`, stop/shutdown abort),
+not at the single payload write level.
+
+Follow-up observation: if the next VPS run still shows weak reverse throughput,
+focus on downlink/half-close/reap behavior. Knife14q only removes the confirmed
+uplink `remote_write_timeout` failure mode.
+
 ## 2026-07-02 — Stage workflow now requires self-improvement summaries
 
 Project memory is split into two layers:

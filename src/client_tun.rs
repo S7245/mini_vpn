@@ -36,9 +36,9 @@ const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(9
 /// Knife14n：本地 Finish 已关闭上游写半边后，只剩远端读半边。若远端没有继续发数据或 EOF，
 /// 用短窗口关闭，避免 read-only relay 卡住 active gauge 并污染下一轮 suite。
 const RELAY_HALF_CLOSED_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// Knife14f：单次本地→上游写入的进度预算。`write_all` 在 QUIC send window 黑洞时可长期 Pending；
-/// 必须在 relay task 内部止血，否则外层 `select!` 的 idle timeout 永远没有机会运行。
-const RELAY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Writer task 停止/关闭预算。注意：这不是单次 `write_all` 的进度 deadline；TUIC/QUIC
+/// stream 的 pending write 可能只是正常 flow-control 背压，必须让 TCP 自然回压。
+const RELAY_WRITER_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Knife14o：relay 已关闭但仍有 downlink_pending 时，给 dirty flush 一个短窗口。
 /// 超过窗口仍无法交付则回到 hard reap，防永久脏槽。
 const DEFERRED_CLOSE_PENDING_GRACE_SECS: u64 = 5;
@@ -2345,7 +2345,7 @@ async fn run_relay(
     // pending bytes can flush, but keep the relay close path bounded if shutdown itself wedges.
     if writer_task.is_finished() {
         let _ = writer_task.await;
-    } else if tokio::time::timeout(RELAY_WRITE_TIMEOUT, &mut writer_task)
+    } else if tokio::time::timeout(RELAY_WRITER_STOP_TIMEOUT, &mut writer_task)
         .await
         .is_err()
     {
@@ -2398,14 +2398,14 @@ async fn run_relay_writer(
                                 let _ = writer.shutdown().await;
                                 return;
                             }
-                            result = tokio::time::timeout(RELAY_WRITE_TIMEOUT, writer.write_all(&payload)) => result,
+                            result = writer.write_all(&payload) => result,
                         };
                         match write_result {
-                            Ok(Ok(_)) => {
+                            Ok(_) => {
                                 let _ = signal_tx
                                     .try_send(RelayWriterSignal::Progress { bytes: payload_len });
                             }
-                            Ok(Err(e)) => {
+                            Err(e) => {
                                 println!(
                                     "写入上游流失败 direction=local_to_remote handle={:?} attempted_bytes={} err={:?}",
                                     handle, payload_len, e
@@ -2419,22 +2419,6 @@ async fn run_relay_writer(
                                 let _ = writer.shutdown().await;
                                 return;
                             }
-                            Err(_) => {
-                                println!(
-                                    "写入上游流超时 direction=local_to_remote handle={:?} attempted_bytes={} timeout={}s",
-                                    handle,
-                                    payload_len,
-                                    RELAY_WRITE_TIMEOUT.as_secs()
-                                );
-                                let _ = signal_tx
-                                    .send(RelayWriterSignal::Closed {
-                                        direction: "local_to_remote",
-                                        reason: "remote_write_timeout",
-                                    })
-                                    .await;
-                                let _ = writer.shutdown().await;
-                                return;
-                            }
                         }
                     }
                     Some(RelayCommand::Finish) => {
@@ -2443,7 +2427,7 @@ async fn run_relay_writer(
                                 let _ = writer.shutdown().await;
                                 return;
                             }
-                            result = tokio::time::timeout(RELAY_WRITE_TIMEOUT, writer.shutdown()) => result,
+                            result = tokio::time::timeout(RELAY_WRITER_STOP_TIMEOUT, writer.shutdown()) => result,
                         };
                         match shutdown_result {
                             Ok(Ok(_)) => {
@@ -2471,7 +2455,7 @@ async fn run_relay_writer(
                                 println!(
                                     "关闭上游写半边超时 direction=local_to_remote handle={:?} timeout={}s",
                                     handle,
-                                    RELAY_WRITE_TIMEOUT.as_secs()
+                                    RELAY_WRITER_STOP_TIMEOUT.as_secs()
                                 );
                                 let _ = signal_tx
                                     .send(RelayWriterSignal::Closed {
@@ -2672,7 +2656,7 @@ mod tests {
         }
     }
 
-    /// 一条上行写永远不完成的 mock 上游流，用来锁住 write_all 卡住时也会主动关 relay。
+    /// 一条上行写永远不完成的 mock 上游流，用来锁住 pending write 只由 relay 级 idle 兜底清理。
     struct PendingWriteStream {
         shutdown_called: Arc<AtomicBool>,
     }
@@ -2861,7 +2845,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn relay_remote_write_timeout_notifies_main_loop() {
+    async fn relay_pending_remote_write_waits_for_relay_idle_timeout() {
         let mut sockets = SocketSet::new(vec![]);
         let handle = mk_test_handle(&mut sockets);
         let flag = Arc::new(AtomicBool::new(false));
@@ -2872,18 +2856,28 @@ mod tests {
 
         tx.send(RelayCommand::Data(vec![1, 2, 3])).await.unwrap();
         tokio::task::yield_now().await;
-        tokio::time::advance(RELAY_WRITE_TIMEOUT - std::time::Duration::from_secs(1)).await;
-        assert!(!task.is_finished(), "relay should not close before write timeout");
+        tokio::time::advance(RELAY_WRITER_STOP_TIMEOUT - std::time::Duration::from_secs(1)).await;
+        assert!(!task.is_finished(), "relay should not close before the former per-write timeout");
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(
+            !task.is_finished(),
+            "normal upstream backpressure must not close the relay after a fixed per-write timeout"
+        );
+        assert!(
+            back_rx.try_recv().is_err(),
+            "pending write should not emit remote_write_timeout"
+        );
+
+        tokio::time::advance(RELAY_IDLE_TIMEOUT).await;
         task.await.unwrap();
 
-        assert!(flag.load(Ordering::SeqCst), "write timeout should still call stream.shutdown");
-        match back_rx.try_recv().expect("write timeout should notify main loop") {
+        assert!(flag.load(Ordering::SeqCst), "relay idle cleanup should still call stream.shutdown");
+        match back_rx.try_recv().expect("idle timeout should notify main loop") {
             (h, RelayEvent::Closed(close)) => {
                 assert_eq!(h, handle);
                 assert_eq!(close.epoch, 17);
-                assert_eq!(close.direction, "local_to_remote");
-                assert_eq!(close.reason, "remote_write_timeout");
+                assert_eq!(close.direction, "timer");
+                assert_eq!(close.reason, "idle_timeout");
             }
             other => panic!("expected relay close event, got {other:?}"),
         }
@@ -2922,10 +2916,10 @@ mod tests {
         }
         assert!(
             !shutdown_called.load(Ordering::SeqCst),
-            "relay should still be alive before write timeout"
+            "relay should still be alive while the pending write is not blocking remote reads"
         );
 
-        tokio::time::advance(RELAY_WRITE_TIMEOUT).await;
+        tokio::time::advance(RELAY_IDLE_TIMEOUT).await;
         task.await.unwrap();
     }
 
