@@ -1,5 +1,24 @@
 # Errors
 
+## 2026-07-02 — Knife14s exposed a non-deferred pending downlink reap hole
+
+- Log bundle: `/tmp/mvpn_knife14s_usclient_suite_20260702_180337.tar.gz`
+- Tested commit reported by the suite: `6ff49cf`
+- Symptom: client diagnostics still showed `tcp-handle-close ... reason=dead_slot_reap ...
+  pending>0`, including `state=Relaying pending=1348494`,
+  `state=Relaying pending=1307798`, `state=Relaying pending=1258063`, and
+  smaller `state=Closing pending>0` cases.
+- Important discriminator: those lines had `send_slice_errors=0` and
+  `tun_flush_tx_failures=0`; the backlog was not being cleared by a local send
+  failure path.
+- Rejected assumption: only `pending_relay_close` needs progress-sensitive grace.
+- Correct behavior: non-empty `downlink_pending` should have generic progress
+  metadata and should be reapable only after no observation/accepted-byte
+  progress for the grace window when the socket is inactive.
+- Future debugging rule: whenever logs show `pending>0` at close, split the
+  branch by lifecycle state (`Relaying`, `Closing`, `CloseWait`, `Closed`) before
+  assuming one terminal-event guard covers them all.
+
 ## 2026-07-02 — Knife14r exposed one-payload-per-tick uplink throttling
 
 - Log bundle: `/tmp/mvpn_knife14r_usclient_suite_20260702_171341.tar.gz`

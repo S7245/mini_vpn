@@ -1,5 +1,34 @@
 # Learnings
 
+## 2026-07-02 — Knife14t: pending downlink grace must be generic, not only deferred close
+
+Knife14s was tested with
+`/tmp/mvpn_knife14s_usclient_suite_20260702_180337.tar.gz`. The run proved the
+previous established-uplink batching fix helped: the full forward P1/P2/P4/P8
+sweep completed around 11-13 Mbit/s, reverse reached roughly 18-27 Mbit/s, and
+`remote_write_timeout` stayed absent. The remaining lifecycle signal was still
+bad: `dead_slot_reap` closed both `state=Relaying` and `state=Closing` slots
+with non-zero `downlink_pending` while `send_slice_errors=0` and
+`tun_flush_tx_failures=0`.
+
+Root cause: knife14r protected only `pending_relay_close`. That fixed part of
+the `state=Closing` path, but `state=Relaying` with pending bytes and an inactive
+smoltcp socket still fell through `!active => reap` before a deferred relay close
+record existed.
+
+Knife14t makes pending progress generic. `flush_downlink` now reports accepted
+bytes, `SocketCtx` tracks generic downlink pending progress, and the reap
+predicate gives all non-empty pending a short progress-sensitive grace. First
+observation and accepted bytes refresh the grace; pure growth does not. This
+keeps tail delivery bounded without letting a stuck inactive slot live forever.
+
+Local acceptance passed: `cargo test --lib client_tun`, full `cargo test`,
+`cargo clippy --all-targets -- -D warnings`, and `git diff --check`.
+
+Reusable rule: if a lifecycle exception is justified by "useful pending bytes
+may still drain", attach the exception to the pending buffer itself, not only to
+one terminal event that might arrive after another reap branch.
+
 ## 2026-07-02 — Knife14s: one payload per dirty pass looked exactly like a 5ms throughput cap
 
 Knife14r was tested with

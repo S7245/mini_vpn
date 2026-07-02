@@ -305,6 +305,10 @@ struct SocketCtx {
     pending_relay_close_last_progress_secs: Option<u64>,
     /// Last observed pending size for progress-sensitive deferred close reap.
     pending_relay_close_last_pending_bytes: usize,
+    /// Monotonic event-loop seconds when generic pending downlink was first observed or last drained.
+    downlink_pending_last_progress_secs: Option<u64>,
+    /// Last observed pending size for generic pending downlink reap.
+    downlink_pending_last_pending_bytes: usize,
     /// 本槽位当前 flow 占用的 fake-IP（若 target 经 fake-IP 改写）。
     /// 中文要点：刀2 引用计数——首次开远端时 `acquire`、rearm 时 `release`，
     /// 保证该 fake-IP 映射在本 flow 存活期间不被 sweep 回收（否则 resolve 失败 → 断连）。
@@ -335,6 +339,8 @@ impl SocketCtx {
             pending_relay_close_since_secs: None,
             pending_relay_close_last_progress_secs: None,
             pending_relay_close_last_pending_bytes: 0,
+            downlink_pending_last_progress_secs: None,
+            downlink_pending_last_pending_bytes: 0,
             fake_ip: None,
             conn_epoch: 0,
             uplink_buffer: Vec::new(),
@@ -371,23 +377,25 @@ const HANDSHAKE_DONE_CAPACITY: usize = 128;
 /// Push as much of the handle's downlink backlog into the smoltcp tx buffer as fits;
 /// keep the rest for the next poll. Partial `send_slice` writes are normal.
 /// 中文要点：这是修 bad decrypt 的关键——绝不丢弃写不下的字节。
-fn flush_downlink(handle: SocketHandle, tcp_socket: &mut TcpSocket, ctx: &mut SocketCtx) {
+fn flush_downlink(handle: SocketHandle, tcp_socket: &mut TcpSocket, ctx: &mut SocketCtx) -> usize {
     if ctx.downlink_pending.is_empty() {
-        return;
+        return 0;
     }
     ctx.downlink_diag.note_pending(ctx.downlink_pending.len());
     if !tcp_socket.can_send() {
-        return;
+        return 0;
     }
     match tcp_socket.send_slice(&ctx.downlink_pending) {
         Ok(0) => {
             ctx.downlink_diag
                 .note_send_slice_ok(0, ctx.downlink_pending.len());
+            0
         }
         Ok(n) => {
             ctx.downlink_pending.drain(..n);
             ctx.downlink_diag
                 .note_send_slice_ok(n, ctx.downlink_pending.len());
+            n
         }
         Err(_) => {
             tcp_diag_log!(
@@ -400,23 +408,59 @@ fn flush_downlink(handle: SocketHandle, tcp_socket: &mut TcpSocket, ctx: &mut So
             // socket 不可发（已关闭/复位）：丢弃残留，避免无限堆积。
             ctx.downlink_pending.clear();
             ctx.downlink_diag.note_pending(0);
+            0
         }
     }
 }
 
-fn note_deferred_close_drain_progress(ctx: &mut SocketCtx, now_secs: u64) {
-    if ctx.pending_relay_close.is_none() || ctx.downlink_pending.is_empty() {
+fn update_pending_drain_progress(
+    pending: usize,
+    last_progress_secs: &mut Option<u64>,
+    last_pending_bytes: &mut usize,
+    now_secs: u64,
+    accepted_bytes: usize,
+) {
+    if pending == 0 {
+        *last_progress_secs = None;
+        *last_pending_bytes = 0;
         return;
     }
 
-    let pending = ctx.downlink_pending.len();
-    let last_pending = ctx.pending_relay_close_last_pending_bytes;
-    if last_pending == 0 || pending < last_pending {
-        ctx.pending_relay_close_last_pending_bytes = pending;
-        ctx.pending_relay_close_last_progress_secs = Some(now_secs);
+    let last_pending = *last_pending_bytes;
+    if last_pending == 0 || pending < last_pending || accepted_bytes > 0 {
+        *last_pending_bytes = pending;
+        *last_progress_secs = Some(now_secs);
     } else if pending > last_pending {
-        ctx.pending_relay_close_last_pending_bytes = pending;
+        *last_pending_bytes = pending;
     }
+}
+
+fn note_downlink_pending_progress(ctx: &mut SocketCtx, now_secs: u64, accepted_bytes: usize) {
+    update_pending_drain_progress(
+        ctx.downlink_pending.len(),
+        &mut ctx.downlink_pending_last_progress_secs,
+        &mut ctx.downlink_pending_last_pending_bytes,
+        now_secs,
+        accepted_bytes,
+    );
+    note_deferred_close_drain_progress(ctx, now_secs, accepted_bytes);
+}
+
+fn note_deferred_close_drain_progress(
+    ctx: &mut SocketCtx,
+    now_secs: u64,
+    accepted_bytes: usize,
+) {
+    if ctx.pending_relay_close.is_none() {
+        return;
+    }
+    update_pending_drain_progress(
+        ctx.downlink_pending.len(),
+        &mut ctx.pending_relay_close_last_progress_secs,
+        &mut ctx.pending_relay_close_last_pending_bytes,
+        now_secs,
+        accepted_bytes,
+    );
 }
 
 /// Hard cap on the number of distinct destination ports we will intercept.
@@ -1425,10 +1469,10 @@ async fn process_dirty_relay<U, M>(
 /// → Capped → #2 修好的热门端口 stall 又回来。低频（1s tick）调用，非每包热路径。
 ///
 /// 死槽判定（仅对「被用过」的槽，即 `ctx.state != Listening`；空闲 Listen 槽 ctx.state==Listening 永不命中）：
-/// - `!is_active()`：Closed / TimeWait（RST、双向关闭完成）；**但**若 relay close 已延迟且仍有
-///   `downlink_pending`，先按最近一次 pending 下降给 dirty flush 一个短 grace 窗口，无进展过期才 hard reap。此例外覆盖
-///   Knife14n 看到的 `state=Closing pending>0` 被 sweep 抢先清尾包。
-///   其余 inactive pending 仍按旧规则回收，防不可交付的残留永久占槽。也覆盖 `HandshakePending` 槽
+/// - `!is_active()`：Closed / TimeWait（RST、双向关闭完成）；**但**若仍有
+///   `downlink_pending`，先按最近一次 pending 观察/接受进展给 dirty flush 一个短 grace 窗口，
+///   无进展过期才 hard reap。此例外覆盖 Knife14n/14s 看到的 `state=Closing/Relaying pending>0`
+///   被 sweep 抢先清尾包，且仍保持 bounded lifecycle。也覆盖 `HandshakePending` 槽
 ///   在本地已关闭时**（remote-open 在飞但 app 已断）——回收时 rearm bump epoch，迟到的 `HandshakeDone` 被丢；
 /// - `CloseWait` 且无 pending downlink、无 live relay：被拦截应用已结束发送半边，且远端 relay
 ///   也已卸下 → teardown；若 relay 仍活着，即使当前 pending 为空，也可能还有 reverse/downlink 字节稍后到达；
@@ -1478,20 +1522,21 @@ fn should_reap_slot(ctx: &SocketCtx, tcp_state: TcpState, active: bool, now_secs
     if ctx.state == SocketState::Listening {
         return false;
     }
-    if ctx.pending_relay_close.is_some() && !ctx.downlink_pending.is_empty() {
-        let Some(deadline_base) = ctx
-            .pending_relay_close_last_progress_secs
-            .or(ctx.pending_relay_close_since_secs)
-        else {
+    if !ctx.downlink_pending.is_empty() {
+        if active {
             return false;
+        }
+        let Some(deadline_base) = ctx
+            .pending_relay_close_since_secs
+            .max(ctx.pending_relay_close_last_progress_secs)
+            .max(ctx.downlink_pending_last_progress_secs)
+        else {
+            return true;
         };
         return now_secs.saturating_sub(deadline_base) >= DEFERRED_CLOSE_PENDING_GRACE_SECS;
     }
     if !active {
         return true;
-    }
-    if !ctx.downlink_pending.is_empty() {
-        return false;
     }
     if tcp_state == TcpState::CloseWait {
         return ctx.uplink_tx.is_none() && !ctx.local_fin_sent;
@@ -1754,6 +1799,8 @@ fn rearm_socket(
     ctx.pending_relay_close_since_secs = None;
     ctx.pending_relay_close_last_progress_secs = None;
     ctx.pending_relay_close_last_pending_bytes = 0;
+    ctx.downlink_pending_last_progress_secs = None;
+    ctx.downlink_pending_last_pending_bytes = 0;
     ctx.downlink_diag = TcpDownlinkDiag::default();
     // 清 async-open 在飞缓存 + bump epoch——让任何迟到 `HandshakeDone` 失配被丢
     // （绝不装到本次 rearm 后的新一代 socket 上，防串话核心）。对非 spawn 槽是无害的纯计数自增。
@@ -1788,8 +1835,8 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
     {
         let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
         if let Some(ctx) = socket_ctxs.get_mut(&handle) {
-            flush_downlink(handle, tcp_socket, ctx);
-            note_deferred_close_drain_progress(ctx, now_secs);
+            let accepted_bytes = flush_downlink(handle, tcp_socket, ctx);
+            note_downlink_pending_progress(ctx, now_secs, accepted_bytes);
             if finish_deferred_relay_close_if_drained(
                 handle,
                 tcp_socket,
@@ -2146,7 +2193,8 @@ async fn handle_remote_payload<D: TunIo>(
     ctx.downlink_pending.extend_from_slice(&payload);
     ctx.downlink_diag
         .note_remote_payload(payload.len(), ctx.downlink_pending.len());
-    flush_downlink(handle, tcp_socket, ctx);
+    let accepted_bytes = flush_downlink(handle, tcp_socket, ctx);
+    note_downlink_pending_progress(ctx, now_secs, accepted_bytes);
     ctx.state = SocketState::Relaying;
 
     let timestamp = smoltcp::time::Instant::now();
@@ -2207,6 +2255,8 @@ fn handle_relay_closed(
         ctx.pending_relay_close_since_secs = Some(now_secs);
         ctx.pending_relay_close_last_progress_secs = Some(now_secs);
         ctx.pending_relay_close_last_pending_bytes = ctx.downlink_pending.len();
+        ctx.downlink_pending_last_progress_secs = Some(now_secs);
+        ctx.downlink_pending_last_pending_bytes = ctx.downlink_pending.len();
         return true;
     }
 
@@ -3297,9 +3347,15 @@ mod tests {
         );
 
         ctx.downlink_pending = vec![1, 2, 3];
+        ctx.downlink_pending_last_progress_secs = Some(10);
+        ctx.downlink_pending_last_pending_bytes = 3;
         assert!(
-            should_reap_slot(&ctx, TcpState::Closed, false, 0),
-            "inactive sockets still reap even if pending bytes can no longer be delivered"
+            !should_reap_slot(&ctx, TcpState::Closed, false, 14),
+            "inactive pending with recent progress should get a short flush grace"
+        );
+        assert!(
+            should_reap_slot(&ctx, TcpState::Closed, false, 15),
+            "inactive pending remains bounded after the no-progress grace"
         );
     }
 
@@ -3366,9 +3422,15 @@ mod tests {
         ctx.pending_relay_close_since_secs = None;
         ctx.pending_relay_close_last_progress_secs = None;
         ctx.pending_relay_close_last_pending_bytes = 0;
+        ctx.downlink_pending_last_progress_secs = Some(13);
+        ctx.downlink_pending_last_pending_bytes = 3;
         assert!(
-            should_reap_slot(&ctx, TcpState::Closed, false, 14),
-            "non-deferred inactive pending remains hard-reapable"
+            !should_reap_slot(&ctx, TcpState::Closed, false, 14),
+            "non-deferred inactive pending should use the same recent-progress grace"
+        );
+        assert!(
+            should_reap_slot(&ctx, TcpState::Closed, false, 18),
+            "non-deferred inactive pending should still be bounded"
         );
     }
 
@@ -3385,17 +3447,17 @@ mod tests {
         ctx.pending_relay_close_last_progress_secs = Some(10);
         ctx.pending_relay_close_last_pending_bytes = 100;
 
-        note_deferred_close_drain_progress(&mut ctx, 11);
+        note_deferred_close_drain_progress(&mut ctx, 11, 0);
         assert_eq!(ctx.pending_relay_close_last_progress_secs, Some(10));
         assert_eq!(ctx.pending_relay_close_last_pending_bytes, 100);
 
         ctx.downlink_pending.truncate(60);
-        note_deferred_close_drain_progress(&mut ctx, 12);
+        note_deferred_close_drain_progress(&mut ctx, 12, 0);
         assert_eq!(ctx.pending_relay_close_last_progress_secs, Some(12));
         assert_eq!(ctx.pending_relay_close_last_pending_bytes, 60);
 
         ctx.downlink_pending.resize(80, 0);
-        note_deferred_close_drain_progress(&mut ctx, 13);
+        note_deferred_close_drain_progress(&mut ctx, 13, 0);
         assert_eq!(
             ctx.pending_relay_close_last_progress_secs,
             Some(12),
@@ -3405,13 +3467,53 @@ mod tests {
 
         ctx.pending_relay_close_last_pending_bytes = 0;
         ctx.pending_relay_close_last_progress_secs = Some(1);
-        note_deferred_close_drain_progress(&mut ctx, 14);
+        note_deferred_close_drain_progress(&mut ctx, 14, 0);
         assert_eq!(
             ctx.pending_relay_close_last_progress_secs,
             Some(14),
             "missing baseline should restart from the first observed pending size"
         );
         assert_eq!(ctx.pending_relay_close_last_pending_bytes, 80);
+    }
+
+    #[test]
+    fn downlink_pending_progress_tracks_observation_accept_and_growth() {
+        let mut ctx = SocketCtx::new(443);
+        ctx.downlink_pending = vec![0; 100];
+        note_downlink_pending_progress(&mut ctx, 10, 0);
+        assert_eq!(ctx.downlink_pending_last_progress_secs, Some(10));
+        assert_eq!(ctx.downlink_pending_last_pending_bytes, 100);
+
+        note_downlink_pending_progress(&mut ctx, 11, 0);
+        assert_eq!(
+            ctx.downlink_pending_last_progress_secs,
+            Some(10),
+            "unchanged pending must not fake new progress"
+        );
+        assert_eq!(ctx.downlink_pending_last_pending_bytes, 100);
+
+        ctx.downlink_pending.resize(150, 0);
+        note_downlink_pending_progress(&mut ctx, 12, 0);
+        assert_eq!(
+            ctx.downlink_pending_last_progress_secs,
+            Some(10),
+            "growth without accepted bytes must not refresh progress"
+        );
+        assert_eq!(ctx.downlink_pending_last_pending_bytes, 150);
+
+        ctx.downlink_pending.resize(180, 0);
+        note_downlink_pending_progress(&mut ctx, 13, 25);
+        assert_eq!(
+            ctx.downlink_pending_last_progress_secs,
+            Some(13),
+            "accepted bytes are progress even if final pending grew"
+        );
+        assert_eq!(ctx.downlink_pending_last_pending_bytes, 180);
+
+        ctx.downlink_pending.clear();
+        note_downlink_pending_progress(&mut ctx, 14, 0);
+        assert!(ctx.downlink_pending_last_progress_secs.is_none());
+        assert_eq!(ctx.downlink_pending_last_pending_bytes, 0);
     }
 
     #[test]
@@ -3506,6 +3608,8 @@ mod tests {
             pending_relay_close_since_secs: None,
             pending_relay_close_last_progress_secs: None,
             pending_relay_close_last_pending_bytes: 0,
+            downlink_pending_last_progress_secs: Some(9),
+            downlink_pending_last_pending_bytes: 42,
             fake_ip: Some(ip),
             conn_epoch: 7,
             uplink_buffer: vec![1, 2, 3],
@@ -3596,6 +3700,8 @@ mod tests {
         assert_eq!(ctx.pending_relay_close_since_secs, Some(1));
         assert_eq!(ctx.pending_relay_close_last_progress_secs, Some(1));
         assert_eq!(ctx.pending_relay_close_last_pending_bytes, 3);
+        assert_eq!(ctx.downlink_pending_last_progress_secs, Some(1));
+        assert_eq!(ctx.downlink_pending_last_pending_bytes, 3);
         assert_eq!(ctx.conn_epoch, 5, "deferred close must not bump epoch before drain");
 
         ctx.downlink_pending.clear();
@@ -3612,6 +3718,8 @@ mod tests {
         assert!(ctx.pending_relay_close_since_secs.is_none());
         assert!(ctx.pending_relay_close_last_progress_secs.is_none());
         assert_eq!(ctx.pending_relay_close_last_pending_bytes, 0);
+        assert!(ctx.downlink_pending_last_progress_secs.is_none());
+        assert_eq!(ctx.downlink_pending_last_pending_bytes, 0);
         assert_eq!(ctx.conn_epoch, 6);
     }
 
