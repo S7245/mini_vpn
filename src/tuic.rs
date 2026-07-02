@@ -28,6 +28,8 @@ const DEFAULT_TUIC_CA_PATH: &str = "cert.pem";
 /// 对 unreliable datagram 有害。BBR 仍可经 `MINI_VPN_TUIC_CC=bbr` 显式选用（实验/特定链路）。
 const DEFAULT_TUIC_CC: &str = "cubic";
 const DEFAULT_TUIC_UDP_MODE: &str = "native";
+const DEFAULT_TUIC_TCP_POOL: usize = 1;
+const MAX_TUIC_TCP_POOL: usize = 16;
 
 /// TUIC 客户端配置（单一事实源；桌面从 env 加载，移动端将来从 file/FFI 注入）。
 /// 中文要点：凭据(uuid/password)经自定义 Debug **脱敏**，绝不随日志泄漏。
@@ -41,6 +43,7 @@ pub struct TuicClientConfig {
     pub alpn: String,
     pub congestion_control: String,
     pub udp_relay_mode: String,
+    pub tcp_pool: usize,
     /// 重连是否尝试 QUIC 0-RTT（**默认 false**：quinn 0.10 在 0-RTT 阶段不支持 `export_keying_material`，
     /// TUIC auth 必失败、自愈回落 1-RTT；显式开仅供实验/未来 quinn 升级。失败时总能回落，不致命）。
     pub zero_rtt: bool,
@@ -57,6 +60,7 @@ impl std::fmt::Debug for TuicClientConfig {
             .field("alpn", &self.alpn)
             .field("congestion_control", &self.congestion_control)
             .field("udp_relay_mode", &self.udp_relay_mode)
+            .field("tcp_pool", &self.tcp_pool)
             .field("zero_rtt", &self.zero_rtt)
             .finish()
     }
@@ -106,6 +110,7 @@ impl TuicClientConfig {
             alpn: alpn.unwrap_or(DEFAULT_TUIC_ALPN).to_string(),
             congestion_control: DEFAULT_TUIC_CC.to_string(),
             udp_relay_mode: DEFAULT_TUIC_UDP_MODE.to_string(),
+            tcp_pool: DEFAULT_TUIC_TCP_POOL,
             // 默认关：quinn 0.10 在 0-RTT 阶段不支持 export_keying_material（TUIC auth 必失败回落）。
             // 显式 `MINI_VPN_TUIC_ZERO_RTT=true` 可启用（实验/未来 quinn 升级）。
             zero_rtt: false,
@@ -128,6 +133,7 @@ impl TuicClientConfig {
         // 解析+回落在使用点（`parse_cc` / `UdpRelayMode::parse`）——存而未用的字段终于接上。
         cfg.congestion_control = override_field(cfg.congestion_control, g("MINI_VPN_TUIC_CC"));
         cfg.udp_relay_mode = override_field(cfg.udp_relay_mode, g("MINI_VPN_TUIC_UDP_MODE"));
+        cfg.tcp_pool = parse_tcp_pool(g("MINI_VPN_TUIC_TCP_POOL").as_deref());
         Ok(cfg)
     }
 }
@@ -138,6 +144,23 @@ fn override_field(default: String, env_val: Option<String>) -> String {
     match env_val {
         Some(v) if !v.trim().is_empty() => v,
         _ => default,
+    }
+}
+
+/// 解析 `MINI_VPN_TUIC_TCP_POOL`：默认 1；非法/空白/0 回 1；大值裁到上限。
+/// 中文要点：这是 knife14l 的 A/B 开关，不改变默认行为，且永不产生空连接池。
+fn parse_tcp_pool(s: Option<&str>) -> usize {
+    s.and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_TUIC_TCP_POOL)
+        .clamp(DEFAULT_TUIC_TCP_POOL, MAX_TUIC_TCP_POOL)
+}
+
+/// TCP pool 轮询选择。`pool_len` 在生产中恒非 0；纯函数保底处理 0，避免测试/未来误用 panic。
+fn tcp_pool_index(pool_len: usize, cursor: u64) -> usize {
+    if pool_len == 0 {
+        0
+    } else {
+        (cursor % pool_len as u64) as usize
     }
 }
 
@@ -659,7 +682,7 @@ const TUIC_RECONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// 此处是 TUIC open 的黑洞探测超时（acceptance 新加，spec 当时未有）。
 const TUIC_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// TUIC 客户端上游：持有一条到 sing-box 的 QUIC 连接，每条 TCP 开一条 `Connect` 双向流。
+/// TUIC 客户端上游：持有到 sing-box 的 QUIC 连接，每条 TCP 开一条 `Connect` 双向流。
 /// 中文要点：连接断了按需重连+重认证(13a 最小实现;迁移/0-RTT 调优在 13c)。
 pub struct TuicUpstream {
     endpoint: Endpoint,
@@ -667,7 +690,10 @@ pub struct TuicUpstream {
     sni: String,
     uuid: [u8; 16],
     password: String,
-    conn: Mutex<Connection>,
+    /// 主连接是 index 0：UDP relay、heartbeat、health probe 都固定走它，避免 TCP pool 改变 UDP 语义。
+    conns: Vec<Mutex<Connection>>,
+    /// TCP `open_tcp` 的轮询游标。Relaxed 足够：只需要分散流，不承载同步语义。
+    tcp_next: AtomicU64,
     /// 上行 UDP datagram 丢弃计数（连接不可用 / stream 兜底也失败）。可观测性，不影响 UDP 语义。
     udp_drops: AtomicU64,
     /// 上行走 uni-stream 兜底（超 datagram 上限）的次数。可观测性：判断 MTU 调优是否够、兜底是否热。
@@ -730,13 +756,34 @@ impl TuicUpstream {
         );
         // 刀3.5：打实际生效的 CC + relay mode，供 acceptance 确认 BBR/quic 真装上（A/B 归因）。
         println!("🧭 TUIC 拥塞控制器={cc:?} | UDP relay mode={udp_relay_mode:?}");
+        let tcp_pool = cfg.tcp_pool.clamp(DEFAULT_TUIC_TCP_POOL, MAX_TUIC_TCP_POOL);
+        let mut conns = Vec::with_capacity(tcp_pool);
+        conns.push(Mutex::new(conn));
+        for _ in 1..tcp_pool {
+            let extra = Self::handshake(
+                &endpoint,
+                cfg.server,
+                &cfg.sni,
+                &cfg.uuid,
+                &cfg.password,
+                cfg.zero_rtt,
+            )
+            .await?;
+            conns.push(Mutex::new(extra));
+        }
+        if tcp_pool > 1 {
+            println!(
+                "🧵 TUIC TCP connection pool={tcp_pool}（UDP/health 仍走 primary connection）"
+            );
+        }
         Ok(Self {
             endpoint,
             server: cfg.server,
             sni: cfg.sni.clone(),
             uuid: cfg.uuid,
             password: cfg.password.clone(),
-            conn: Mutex::new(conn),
+            conns,
+            tcp_next: AtomicU64::new(0),
             udp_drops: AtomicU64::new(0),
             udp_stream_fallbacks: AtomicU64::new(0),
             last_udp_activity: AtomicU64::new(0),
@@ -763,8 +810,7 @@ impl TuicUpstream {
         password: &str,
         zero_rtt: bool,
     ) -> Result<Connection, ClientError> {
-        if zero_rtt
-            && let Some(conn) = Self::try_0rtt(endpoint, server, sni, uuid, password).await
+        if zero_rtt && let Some(conn) = Self::try_0rtt(endpoint, server, sni, uuid, password).await
         {
             println!("⚡ TUIC 0-RTT 重连成功（early data）");
             return Ok(conn);
@@ -789,7 +835,9 @@ impl TuicUpstream {
         };
         // early-exporter 认证：若与 sing-box 不齐则失败 → 记一行(便于 e2e 诊断)并 None 回落（不卡死）。
         if let Err(e) = Self::authenticate(&conn, uuid, password).await {
-            println!("⚠️ TUIC 0-RTT 认证失败(可能 early-exporter 与 sing-box 不齐)，回落 1-RTT: {e:?}");
+            println!(
+                "⚠️ TUIC 0-RTT 认证失败(可能 early-exporter 与 sing-box 不齐)，回落 1-RTT: {e:?}"
+            );
             return None;
         }
         Some(conn)
@@ -822,22 +870,35 @@ impl TuicUpstream {
         let mut token = [0u8; 32];
         conn.export_keying_material(&mut token, uuid, password.as_bytes())
             .map_err(|_| ClientError::InvalidTarget("tuic keying-material export failed".into()))?;
-        let mut uni = conn.open_uni().await.map_err(|e| io_err("tuic open_uni", e))?;
+        let mut uni = conn
+            .open_uni()
+            .await
+            .map_err(|e| io_err("tuic open_uni", e))?;
         uni.write_all(&encode_authenticate(uuid, &token))
             .await
             .map_err(|e| io_err("tuic auth write", e))?;
-        uni.finish().await.map_err(|e| io_err("tuic auth finish", e))?;
+        uni.finish()
+            .await
+            .map_err(|e| io_err("tuic auth finish", e))?;
         Ok(())
     }
 
-    /// 取当前活连接的克隆；若已关闭则就地重连+重认证（13a 逻辑，TCP/UDP 共用）。
-    /// 中文要点：单一事实源——TCP `open_tcp` 与 UDP `send_udp`/驱动任务都经此取连接，
-    /// 由 `conn` 互斥锁串行化重连，避免并发双连接。
+    /// 取当前主连接的克隆；若已关闭则就地重连+重认证（13a 逻辑，UDP/health 共用）。
+    /// 中文要点：主连接(index 0)是 UDP/health 的单一事实源；TCP pool 通过 `live_tcp_conn` 分散到其它连接。
     /// 刀9（spec §2.3）：重连握手封 **5s 超时**——黑洞/不可达 server 的 QUIC 握手默认受 idle(15s, quic.rs) 约束、
     /// 可阻塞数十秒；5s 封顶让「连接死 + 重连失败」这个 failover 快路强信号**快速暴露**（is_dead 仍为
     /// true，调用方 record_tuic_failure(dead) 即切 REALITY），同时也避免纯 TUIC open 任务久挂。
     async fn live_conn(&self) -> Result<Connection, ClientError> {
-        let mut guard = self.conn.lock().await;
+        self.live_conn_at(0).await
+    }
+
+    /// 取一条 TCP pool 连接的克隆；连接自身已关闭则只重连该槽位。
+    async fn live_conn_at(&self, index: usize) -> Result<Connection, ClientError> {
+        let slot = self
+            .conns
+            .get(index)
+            .ok_or_else(|| ClientError::InvalidTarget("tuic tcp pool index out of range".into()))?;
+        let mut guard = slot.lock().await;
         if guard.close_reason().is_some() {
             let hs = Self::handshake(
                 &self.endpoint,
@@ -849,16 +910,28 @@ impl TuicUpstream {
             );
             *guard = tokio::time::timeout(TUIC_RECONNECT_TIMEOUT, hs)
                 .await
-                .map_err(|_| io_err("tuic reconnect", "5s 超时（黑洞/不可达；failover 据 is_dead 切备腿）"))??;
+                .map_err(|_| {
+                    io_err(
+                        "tuic reconnect",
+                        "5s 超时（黑洞/不可达；failover 据 is_dead 切备腿）",
+                    )
+                })??;
         }
         Ok(guard.clone())
+    }
+
+    /// TCP 专用连接选择：默认 pool=1 时等价旧行为；pool>1 时 round-robin 分散新流。
+    async fn live_tcp_conn(&self) -> Result<Connection, ClientError> {
+        let cursor = self.tcp_next.fetch_add(1, Ordering::Relaxed);
+        let index = tcp_pool_index(self.conns.len(), cursor);
+        self.live_conn_at(index).await
     }
 
     /// 取当前活连接克隆——**非阻塞、不重连**（刀9，ADR-0011 §3b）。锁被占（后台 start_udp 正在重连，持锁
     /// 数秒）→ `None`，**绝不 await 锁**（否则在主循环 inline 的 send_udp 会被 stall）。连接已死 → `None`。
     /// 重连交给后台 `start_udp` 自愈循环（背景退避重连），与主循环解耦。
     fn current_conn(&self) -> Option<Connection> {
-        let guard = self.conn.try_lock().ok()?;
+        let guard = self.conns.first()?.try_lock().ok()?;
         if guard.close_reason().is_some() {
             None
         } else {
@@ -926,11 +999,16 @@ impl TuicUpstream {
 
     /// 在连接上开 uni-stream 写一个 Packet 并 finish（抽出便于错误归一）。
     async fn write_uni_packet(conn: &Connection, packet: &[u8]) -> Result<(), ClientError> {
-        let mut uni = conn.open_uni().await.map_err(|e| io_err("udp open_uni", e))?;
+        let mut uni = conn
+            .open_uni()
+            .await
+            .map_err(|e| io_err("udp open_uni", e))?;
         uni.write_all(packet)
             .await
             .map_err(|e| io_err("udp uni write", e))?;
-        uni.finish().await.map_err(|e| io_err("udp uni finish", e))?;
+        uni.finish()
+            .await
+            .map_err(|e| io_err("udp uni finish", e))?;
         Ok(())
     }
 
@@ -1100,15 +1178,18 @@ fn udp_reconnect_backoff(attempt: u32) -> Duration {
 #[async_trait::async_trait]
 impl ProxyUpstream for TuicUpstream {
     async fn open_tcp(&self, target: &TargetAddr) -> Result<RelayStream, ClientError> {
-        // 取活连接，断了就地重连+重认证（与 UDP 共用 live_conn，单一事实源；reconnect 自带 5s 超时）。
-        let conn = self.live_conn().await?;
+        // 取 TCP pool 活连接，断了只重连该槽位；pool=1 时等价旧行为。
+        let conn = self.live_tcp_conn().await?;
         // 刀9（真出口 acceptance 修）：open_bi + write Connect 在**黑洞连接**上会 hang——连接尚未被
         // 判死（close_reason 仍 None，因 keepalive/非对称封锁架空 idle 检测），但 QUIC send 窗口满、
         // 收不到 ACK → write_all 无限阻塞，failover 快/慢路都收不到信号。封 5s 超时让黑洞 open **快速失败**
         // → FailoverUpstream 据「连接活但 open 超时」走 **慢路计数**（并发 open 下 ~5s 累计 3 次即切 REALITY，
         // 不再死等 close_reason）。正常 open（open_bi + 写小 Connect 头）是本地操作、远小于 5s，不误伤。
         let open = async {
-            let (mut send, recv) = conn.open_bi().await.map_err(|e| io_err("tuic open_bi", e))?;
+            let (mut send, recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| io_err("tuic open_bi", e))?;
             send.write_all(&encode_connect(target))
                 .await
                 .map_err(|e| io_err("tuic connect write", e))?;
@@ -1117,7 +1198,12 @@ impl ProxyUpstream for TuicUpstream {
         };
         tokio::time::timeout(TUIC_OPEN_TIMEOUT, open)
             .await
-            .map_err(|_| io_err("tuic open_tcp", "5s 超时（黑洞/send 窗口满无 ACK；failover 慢路据此累计切备腿）"))?
+            .map_err(|_| {
+                io_err(
+                    "tuic open_tcp",
+                    "5s 超时（黑洞/send 窗口满无 ACK；failover 慢路据此累计切备腿）",
+                )
+            })?
     }
 
     /// 刀14d：TUIC `open_tcp` 通常很快，但它仍可能 await QUIC reconnect、`open_bi` 或 Connect write
@@ -1152,7 +1238,13 @@ impl crate::failover::HealthProbe for TuicUpstream {
         self.live_conn().await.is_ok()
     }
     async fn is_dead(&self) -> bool {
-        self.conn.lock().await.close_reason().is_some()
+        self.conns
+            .first()
+            .expect("TuicUpstream always has a primary connection")
+            .lock()
+            .await
+            .close_reason()
+            .is_some()
     }
     /// 累计收到的 UDP datagram 数（quinn `stats().udp_rx.datagrams`）——黑洞存活信标：健康连接每 ~5s
     /// 有 keepalive ACK 进来→单调增；黑洞连 ACK 都收不到→停滞。down 探测据此判黑洞（不被乐观开流/keepalive 架空）。
@@ -1160,7 +1252,15 @@ impl crate::failover::HealthProbe for TuicUpstream {
     /// 锁**——否则健康探针任务被卡 5s、把锁等待当成网络停滞、检测计时偏斜（review finding）。调用方对 None
     /// 跳过本次观察：连接正在重连本就不健康，停滞计时靠 `now` 累积、不重置，下次能读到（仍停滞）即判黑洞。
     async fn rx_datagrams(&self) -> Option<u64> {
-        Some(self.conn.try_lock().ok()?.stats().udp_rx.datagrams)
+        Some(
+            self.conns
+                .first()?
+                .try_lock()
+                .ok()?
+                .stats()
+                .udp_rx
+                .datagrams,
+        )
     }
 }
 
@@ -1240,7 +1340,11 @@ mod tests {
         assert_eq!(c.alpn, "h3"); // default
         assert_eq!(c.congestion_control, "cubic"); // 刀3.5 实测裁决：datagram 路径 Cubic 优于 BBR
         assert_eq!(c.udp_relay_mode, "native");
-        assert!(!c.zero_rtt, "0-RTT 默认关（quinn 0.10 在 0-RTT 不支持 keying-material 导出）");
+        assert_eq!(c.tcp_pool, 1);
+        assert!(
+            !c.zero_rtt,
+            "0-RTT 默认关（quinn 0.10 在 0-RTT 不支持 keying-material 导出）"
+        );
     }
 
     #[test]
@@ -1250,7 +1354,29 @@ mod tests {
         assert_eq!(override_field("native".into(), Some("quic".into())), "quic");
         // 无值 / 空白 → 保留默认。
         assert_eq!(override_field("bbr".into(), None), "bbr");
-        assert_eq!(override_field("native".into(), Some("   ".into())), "native");
+        assert_eq!(
+            override_field("native".into(), Some("   ".into())),
+            "native"
+        );
+    }
+
+    #[test]
+    fn tcp_pool_parse_defaults_and_clamps() {
+        assert_eq!(parse_tcp_pool(None), 1);
+        assert_eq!(parse_tcp_pool(Some("")), 1);
+        assert_eq!(parse_tcp_pool(Some("0")), 1);
+        assert_eq!(parse_tcp_pool(Some("nope")), 1);
+        assert_eq!(parse_tcp_pool(Some("4")), 4);
+        assert_eq!(parse_tcp_pool(Some("999")), MAX_TUIC_TCP_POOL);
+    }
+
+    #[test]
+    fn tcp_pool_round_robin_selection() {
+        assert_eq!(tcp_pool_index(1, 42), 0);
+        assert_eq!(tcp_pool_index(3, 0), 0);
+        assert_eq!(tcp_pool_index(3, 1), 1);
+        assert_eq!(tcp_pool_index(3, 2), 2);
+        assert_eq!(tcp_pool_index(3, 3), 0);
     }
 
     #[test]
@@ -1352,8 +1478,8 @@ mod tests {
 
     #[test]
     fn udp_send_plan_native_is_size_based() {
-        use UdpSend::*;
         use UdpRelayMode::Native;
+        use UdpSend::*;
         // Native：装得下 → datagram 快路径（含边界 ==max）——保刀3 现行语义，零回归。
         assert_eq!(udp_send_plan(Native, Some(1242), 1000), Datagram);
         assert_eq!(udp_send_plan(Native, Some(1242), 1242), Datagram);
@@ -1365,8 +1491,8 @@ mod tests {
 
     #[test]
     fn udp_send_plan_quic_is_always_stream() {
-        use UdpSend::*;
         use UdpRelayMode::Quic;
+        use UdpSend::*;
         // Quic：无论装不装得下、datagram 是否可用，首包起恒走 uni-stream
         // （触发 TUIC server 镜像下行也走 stream，摆脱 datagram 天花板）。
         assert_eq!(udp_send_plan(Quic, Some(1242), 1000), Stream);
@@ -1402,7 +1528,10 @@ mod tests {
     fn reassemble_single_fragment_passthrough() {
         let mut r = FragReassembler::new();
         // FRAG_TOTAL=1 立即返回整 payload，且不入表（无残留）。
-        assert_eq!(r.accept(&meta(1, 0, 1, 0, b"hello"), 0), Some(b"hello".to_vec()));
+        assert_eq!(
+            r.accept(&meta(1, 0, 1, 0, b"hello"), 0),
+            Some(b"hello".to_vec())
+        );
         assert_eq!(r.pending_len(), 0);
     }
 
@@ -1410,7 +1539,10 @@ mod tests {
     fn reassemble_two_fragments_in_order() {
         let mut r = FragReassembler::new();
         assert_eq!(r.accept(&meta(5, 9, 2, 0, b"AB"), 0), None);
-        assert_eq!(r.accept(&meta(5, 9, 2, 1, b"CD"), 0), Some(b"ABCD".to_vec()));
+        assert_eq!(
+            r.accept(&meta(5, 9, 2, 1, b"CD"), 0),
+            Some(b"ABCD".to_vec())
+        );
         assert_eq!(r.pending_len(), 0); // 集齐后清出
     }
 
@@ -1419,7 +1551,10 @@ mod tests {
         let mut r = FragReassembler::new();
         // 先到 frag_id=1，再到 0 → 仍按 frag_id 序拼接。
         assert_eq!(r.accept(&meta(5, 9, 2, 1, b"CD"), 0), None);
-        assert_eq!(r.accept(&meta(5, 9, 2, 0, b"AB"), 0), Some(b"ABCD".to_vec()));
+        assert_eq!(
+            r.accept(&meta(5, 9, 2, 0, b"AB"), 0),
+            Some(b"ABCD".to_vec())
+        );
     }
 
     #[test]
@@ -1429,7 +1564,10 @@ mod tests {
         // 既保跨重连残片被新 frag 顶替，又不破坏完成判定。
         assert_eq!(r.accept(&meta(5, 9, 2, 0, b"AB"), 0), None);
         assert_eq!(r.accept(&meta(5, 9, 2, 0, b"XX"), 0), None); // 覆盖 slot[0]
-        assert_eq!(r.accept(&meta(5, 9, 2, 1, b"CD"), 0), Some(b"XXCD".to_vec())); // 用较新的
+        assert_eq!(
+            r.accept(&meta(5, 9, 2, 1, b"CD"), 0),
+            Some(b"XXCD".to_vec())
+        ); // 用较新的
     }
 
     #[test]
@@ -1491,7 +1629,9 @@ mod tests {
     fn packet_meta_rejects_truncated() {
         assert!(decode_packet_meta(&[0u8; 5]).is_none());
         // size 说 200 但 buffer 不够 → None（不 panic）。
-        assert!(decode_packet_meta(&[0x05, 0x02, 0, 7, 0, 0, 1, 0, 0, 200, 0x01, 1, 2, 3, 4]).is_none());
+        assert!(
+            decode_packet_meta(&[0x05, 0x02, 0, 7, 0, 0, 1, 0, 0, 200, 0x01, 1, 2, 3, 4]).is_none()
+        );
     }
 
     #[test]
@@ -1560,8 +1700,14 @@ mod tests {
         let mut t = AssocTable::new();
         let id = t.intern(tuple(1000));
         let e = t.resolve(id).expect("entry");
-        assert_eq!(e.app_endpoint(), (std::net::Ipv4Addr::new(10, 0, 0, 1), 1000));
-        assert_eq!(e.target_src(), (std::net::Ipv4Addr::new(198, 18, 0, 5), 443));
+        assert_eq!(
+            e.app_endpoint(),
+            (std::net::Ipv4Addr::new(10, 0, 0, 1), 1000)
+        );
+        assert_eq!(
+            e.target_src(),
+            (std::net::Ipv4Addr::new(198, 18, 0, 5), 443)
+        );
         t.sweep(61, 60);
         assert!(t.resolve(id).is_none());
     }
