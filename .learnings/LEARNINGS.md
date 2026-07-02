@@ -1,5 +1,32 @@
 # Learnings
 
+## 2026-07-02 — Knife14v: local Finish should wait for reverse traffic to go quiet
+
+`a57873a` was tested with
+`/tmp/mvpn_knife14c_usclient_suite_20260702_223847.tar.gz`. The filename kept
+the default `knife14c` tag, but the report recorded `repo_commit: a57873a`.
+Knife14u's core change worked: the remaining `dead_slot_reap pending>0` carried
+`tcp_state=Closed active=false can_send=false can_recv=false`, so it was an
+undeliverable local tail rather than a protected useful buffer.
+
+The run exposed the next independent reverse-path problem. Forward P1 recovered
+to 13.6 Mbit/s receiver, but reverse P1 stayed at Kbit/s scale and reverse
+P2/P4/P8 timed out or transferred zero. The accept log showed
+`tcp-relay-write-half-closed ... reason=local_finish` followed by tiny
+`remote_to_global_rx_bytes` and `half_closed_idle_timeout`. Immediate propagation
+of local `CloseWait` into upstream write-half shutdown appears to interrupt
+reverse traffic on this TUIC/exit path.
+
+Knife14v defers `RelayCommand::Finish`: first `CloseWait` records a pending
+local finish, remote-to-local payload refreshes the defer deadline, and Finish is
+sent only after remote traffic is quiet for `LOCAL_FINISH_DEFER_SECS`. Cleanup
+remains bounded by the existing half-closed idle timeout after Finish.
+
+Reusable rule: for reverse-heavy TCP flows, "local app has no more upload bytes"
+is not the same as "safe to send upstream FIN now." Preserve the read direction
+while remote data is making progress, then close the write half after a bounded
+quiet window.
+
 ## 2026-07-02 — Knife14u: pending grace must require local send capability
 
 Knife14t was tested with

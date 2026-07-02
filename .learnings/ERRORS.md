@@ -1,5 +1,23 @@
 # Errors
 
+## 2026-07-02 — a57873a exposed premature local Finish on reverse traffic
+
+- Log bundle: `/tmp/mvpn_knife14c_usclient_suite_20260702_223847.tar.gz`
+- Tested commit: `a57873a`
+- Symptom: forward P1 recovered, but reverse P1 stayed at Kbit/s scale and
+  reverse P2/P4/P8 timed out or transferred zero.
+- Important discriminator: the only `dead_slot_reap pending>0` was
+  `tcp_state=Closed active=false can_send=false`, so the knife14u pending-reap
+  branch was not the reverse bottleneck.
+- Rejected assumption: once smoltcp reports local `CloseWait`, immediately
+  sending upstream `Finish` is harmless for reverse traffic.
+- Correct behavior: defer `Finish` while remote-to-local data is making progress;
+  send it only after a short remote-quiet window, then let the existing
+  half-closed idle timeout bound cleanup.
+- Future debugging rule: when reverse traffic collapses after a tiny burst, look
+  for early local FIN/half-close propagation before changing QUIC flow-control or
+  buffer sizes.
+
 ## 2026-07-02 — Knife14t showed generic pending grace can preserve dead local tails
 
 - Log bundle: `/tmp/mvpn_knife14t_usclient_suite_20260702_215901.tar.gz`

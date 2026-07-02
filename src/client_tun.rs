@@ -38,6 +38,9 @@ const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(9
 /// Knife14n：本地 Finish 已关闭上游写半边后，只剩远端读半边。若远端没有继续发数据或 EOF，
 /// 用短窗口关闭，避免 read-only relay 卡住 active gauge 并污染下一轮 suite。
 const RELAY_HALF_CLOSED_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Knife14v：本地 TCP 已无上行时，先让 reverse/downlink 继续跑；远端静默超过这个窗口后才把
+/// `Finish` 传播到上游写半边。避免 TUIC/exit 对早 FIN 的处理打断 reverse 流。
+const LOCAL_FINISH_DEFER_SECS: u64 = 5;
 /// Writer task 停止/关闭预算。注意：这不是单次 `write_all` 的进度 deadline；TUIC/QUIC
 /// stream 的 pending write 可能只是正常 flow-control 背压，必须让 TCP 自然回压。
 const RELAY_WRITER_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -312,6 +315,10 @@ struct SocketCtx {
     uplink_tx: Option<mpsc::Sender<RelayCommand>>,
     /// Whether this flow has already propagated the local TCP finish into the relay write half.
     local_fin_sent: bool,
+    /// Monotonic event-loop seconds when local finish became pending but was deferred for reverse traffic.
+    local_fin_pending_since_secs: Option<u64>,
+    /// Latest remote-to-local progress while a local finish is pending.
+    local_fin_last_remote_progress_secs: Option<u64>,
     /// Downlink bytes not yet accepted by the smoltcp tx buffer.
     /// 中文要点：smoltcp send_slice 可能只写一部分（tx buffer 受 TCP ACK 释放制约），
     /// 写不下的字节必须留在这里、由后续 poll 持续 flush，否则丢字节 → TLS bad decrypt。
@@ -353,6 +360,8 @@ impl SocketCtx {
             state: SocketState::Listening,
             uplink_tx: None,
             local_fin_sent: false,
+            local_fin_pending_since_secs: None,
+            local_fin_last_remote_progress_secs: None,
             downlink_pending: Vec::new(),
             pending_relay_close: None,
             pending_relay_close_since_secs: None,
@@ -463,6 +472,12 @@ fn note_downlink_pending_progress(ctx: &mut SocketCtx, now_secs: u64, accepted_b
         accepted_bytes,
     );
     note_deferred_close_drain_progress(ctx, now_secs, accepted_bytes);
+}
+
+fn note_local_finish_remote_progress(ctx: &mut SocketCtx, now_secs: u64) {
+    if ctx.local_fin_pending_since_secs.is_some() && !ctx.local_fin_sent {
+        ctx.local_fin_last_remote_progress_secs = Some(now_secs);
+    }
 }
 
 fn note_deferred_close_drain_progress(
@@ -1756,6 +1771,7 @@ enum EstablishedUplink {
 fn pump_established_uplink(
     ctx: &mut SocketCtx,
     tcp_state: TcpState,
+    now_secs: u64,
     mut next_payload: impl FnMut() -> Option<Vec<u8>>,
 ) -> EstablishedUplink {
     let Some(tx) = ctx.uplink_tx.as_mut() else {
@@ -1770,8 +1786,19 @@ fn pump_established_uplink(
                     ctx.state = SocketState::Relaying;
                 } else {
                     if tcp_state == TcpState::CloseWait && !ctx.local_fin_sent {
-                        permit.send(RelayCommand::Finish);
-                        ctx.local_fin_sent = true;
+                        let pending_since = *ctx
+                            .local_fin_pending_since_secs
+                            .get_or_insert(now_secs);
+                        let deadline_base = ctx
+                            .local_fin_last_remote_progress_secs
+                            .unwrap_or(pending_since)
+                            .max(pending_since);
+                        if now_secs.saturating_sub(deadline_base) >= LOCAL_FINISH_DEFER_SECS {
+                            permit.send(RelayCommand::Finish);
+                            ctx.local_fin_sent = true;
+                            ctx.local_fin_pending_since_secs = None;
+                            ctx.local_fin_last_remote_progress_secs = None;
+                        }
                     }
                     return EstablishedUplink::Handled;
                 }
@@ -1876,6 +1903,8 @@ fn rearm_socket(
     socket.abort();
     ctx.uplink_tx = None;
     ctx.local_fin_sent = false;
+    ctx.local_fin_pending_since_secs = None;
+    ctx.local_fin_last_remote_progress_secs = None;
     ctx.downlink_pending.clear();
     ctx.pending_relay_close = None;
     ctx.pending_relay_close_since_secs = None;
@@ -1940,7 +1969,7 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
         };
         let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
         let tcp_state = tcp_socket.state();
-        pump_established_uplink(ctx, tcp_state, || extract_socket_payload(tcp_socket))
+        pump_established_uplink(ctx, tcp_state, now_secs, || extract_socket_payload(tcp_socket))
     };
     match established_uplink {
         EstablishedUplink::Handled => return Ok(()),
@@ -2275,6 +2304,7 @@ async fn handle_remote_payload<D: TunIo>(
     ctx.downlink_pending.extend_from_slice(&payload);
     ctx.downlink_diag
         .note_remote_payload(payload.len(), ctx.downlink_pending.len());
+    note_local_finish_remote_progress(ctx, now_secs);
     let accepted_bytes = flush_downlink(handle, tcp_socket, ctx);
     note_downlink_pending_progress(ctx, now_secs, accepted_bytes);
     ctx.state = SocketState::Relaying;
@@ -3697,6 +3727,8 @@ mod tests {
             state: SocketState::Relaying,
             uplink_tx: Some(tx),
             local_fin_sent: true,
+            local_fin_pending_since_secs: Some(3),
+            local_fin_last_remote_progress_secs: Some(4),
             downlink_pending: Vec::new(),
             pending_relay_close: None,
             pending_relay_close_since_secs: None,
@@ -3715,6 +3747,14 @@ mod tests {
         assert_eq!(ctx.state, SocketState::Listening);
         assert!(ctx.uplink_tx.is_none());
         assert!(!ctx.local_fin_sent, "rearm 应清空本地 FIN 发送状态");
+        assert!(
+            ctx.local_fin_pending_since_secs.is_none(),
+            "rearm 应清空 deferred local FIN 状态"
+        );
+        assert!(
+            ctx.local_fin_last_remote_progress_secs.is_none(),
+            "rearm 应清空 deferred local FIN 进展时间"
+        );
         assert!(ctx.fake_ip.is_none(), "rearm 应清空 fake_ip");
         assert!(ctx.uplink_buffer.is_empty(), "rearm 应清空 uplink_buffer（M3 patch）");
         assert_eq!(
@@ -3843,7 +3883,7 @@ mod tests {
             VecDeque::from([b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
 
         assert!(matches!(
-            pump_established_uplink(&mut ctx, TcpState::Established, || payloads.pop_front()),
+            pump_established_uplink(&mut ctx, TcpState::Established, 0, || payloads.pop_front()),
             EstablishedUplink::Handled
         ));
         assert!(payloads.is_empty(), "one dirty pass should drain the readable batch");
@@ -3870,7 +3910,7 @@ mod tests {
             .collect();
 
         assert!(matches!(
-            pump_established_uplink(&mut ctx, TcpState::Established, || payloads.pop_front()),
+            pump_established_uplink(&mut ctx, TcpState::Established, 0, || payloads.pop_front()),
             EstablishedUplink::Handled
         ));
         assert_eq!(
@@ -3898,7 +3938,7 @@ mod tests {
         let mut payloads: VecDeque<Vec<u8>> = VecDeque::from([b"must-stay".to_vec()]);
 
         assert!(matches!(
-            pump_established_uplink(&mut ctx, TcpState::Established, || payloads.pop_front()),
+            pump_established_uplink(&mut ctx, TcpState::Established, 0, || payloads.pop_front()),
             EstablishedUplink::Handled
         ));
         assert_eq!(
@@ -3909,13 +3949,28 @@ mod tests {
     }
 
     #[test]
-    fn established_uplink_sends_finish_after_payloads_drain() {
+    fn established_uplink_defers_finish_after_payloads_drain() {
         let (tx, mut rx) = mpsc::channel(4);
         let mut ctx = SocketCtx::new(80);
         ctx.uplink_tx = Some(tx);
 
         assert!(matches!(
-            pump_established_uplink(&mut ctx, TcpState::CloseWait, || None),
+            pump_established_uplink(&mut ctx, TcpState::CloseWait, 10, || None),
+            EstablishedUplink::Handled
+        ));
+        assert!(!ctx.local_fin_sent);
+        assert_eq!(ctx.local_fin_pending_since_secs, Some(10));
+        assert!(rx.try_recv().is_err(), "initial CloseWait should defer Finish");
+
+        assert!(matches!(
+            pump_established_uplink(&mut ctx, TcpState::CloseWait, 14, || None),
+            EstablishedUplink::Handled
+        ));
+        assert!(!ctx.local_fin_sent);
+        assert!(rx.try_recv().is_err(), "defer window has not expired");
+
+        assert!(matches!(
+            pump_established_uplink(&mut ctx, TcpState::CloseWait, 15, || None),
             EstablishedUplink::Handled
         ));
         assert!(ctx.local_fin_sent);
@@ -3924,6 +3979,36 @@ mod tests {
             RelayCommand::Finish
         ));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn established_uplink_remote_progress_extends_finish_defer() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut ctx = SocketCtx::new(80);
+        ctx.uplink_tx = Some(tx);
+
+        assert!(matches!(
+            pump_established_uplink(&mut ctx, TcpState::CloseWait, 10, || None),
+            EstablishedUplink::Handled
+        ));
+        note_local_finish_remote_progress(&mut ctx, 13);
+
+        assert!(matches!(
+            pump_established_uplink(&mut ctx, TcpState::CloseWait, 15, || None),
+            EstablishedUplink::Handled
+        ));
+        assert!(!ctx.local_fin_sent);
+        assert!(rx.try_recv().is_err(), "remote progress should extend Finish defer");
+
+        assert!(matches!(
+            pump_established_uplink(&mut ctx, TcpState::CloseWait, 18, || None),
+            EstablishedUplink::Handled
+        ));
+        assert!(ctx.local_fin_sent);
+        assert!(matches!(
+            rx.try_recv().expect("finish should be sent after remote quiet"),
+            RelayCommand::Finish
+        ));
     }
 
     fn mk_pending_ctx(epoch: u64) -> SocketCtx {
