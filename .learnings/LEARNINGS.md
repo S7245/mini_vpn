@@ -1,5 +1,26 @@
 # Learnings
 
+## 2026-07-02 — Knife14r: deferred close grace should follow drain progress
+
+Knife14q was tested with
+`/tmp/mvpn_knife14q_usclient_suite_20260702_160853.tar.gz`. It confirmed the
+knife14q uplink change: `remote_write_timeout` disappeared and reverse iperf no
+longer timed out. The remaining lifecycle signal was still bad for a VPN data
+plane: `dead_slot_reap` closed `state=Closing` slots with non-zero
+`downlink_pending`.
+
+The reusable rule is that a deferred relay close should not be bounded by the
+age of the original close event alone. It should be bounded by lack of drain
+progress: while `downlink_pending.len()` keeps decreasing, the local TCP side is
+still accepting useful tail bytes and the slot should stay dirty; once pending
+stops decreasing for `DEFERRED_CLOSE_PENDING_GRACE_SECS`, the slot can be hard
+reaped to avoid leaks.
+
+Local acceptance for this stage: added focused tests for progress-sensitive
+reap and progress bookkeeping, then passed `cargo test --lib client_tun`,
+`cargo test`, `cargo clippy --all-targets -- -D warnings`, and
+`git diff --check`.
+
 ## 2026-07-02 — Knife14q: QUIC stream backpressure is not a per-chunk write failure
 
 `480c3e8` / knife14p was tested with
