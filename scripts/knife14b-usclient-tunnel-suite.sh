@@ -30,7 +30,7 @@ Optional env:
   MTU=1200                  TUN MTU passed to mini_vpn before client-tun starts
   MINI_VPN_TCP_DIAG=1       emit knife14c per-handle TCP diagnostics
   RUN_BASE_MTU_P1=0         14c keeps one aligned MTU per process; use a separate MTU=1500 run for baseline
-  BUILD_RELEASE=1           build target/release/mini_vpn if missing
+  BUILD_RELEASE=1           build target/release/mini_vpn before running; set 0 to reuse existing binary
   KILL_OLD=1                stop old mini_vpn client-tun before starting
   KEEP_TUNNEL=0             keep mini_vpn running after the suite
   STARTUP_TIMEOUT=25
@@ -429,6 +429,7 @@ trap on_exit EXIT
   echo
   echo "- date: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   echo "- repo: $REPO_ROOT"
+  echo "- repo_commit: $(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   echo "- host: $(hostname 2>/dev/null || echo unknown)"
   echo "- target: ${TARGET}:${IPERF_PORT}"
   echo "- out_dir: $OUT_DIR"
@@ -563,14 +564,24 @@ if ! sudo -E env sh -c 'test -n "${MINI_VPN_TUIC_PASSWORD:-}"' >/dev/null 2>&1; 
   fail "sudo -E 没有保留 MINI_VPN_TUIC_* 环境变量。请在 root shell 中 export 这些变量后运行脚本，或调整 sudoers env_keep。"
 fi
 
-if [[ ! -x "$BIN" ]]; then
-  if [[ "$BUILD_RELEASE" == "1" ]]; then
-    require_cmd cargo "curl https://sh.rustup.rs -sSf | sh; source ~/.cargo/env" || \
-      fail "target/release/mini_vpn 不存在，且 cargo 不可用。"
-    run_cmd cargo build --release || fail "cargo build --release 失败。请把 report 发回来。"
-  else
-    fail "binary missing: $BIN。设置 BUILD_RELEASE=1 或先运行 cargo build --release。"
-  fi
+append ""
+append "## Git / Binary Snapshot"
+run_cmd git -C "$REPO_ROOT" rev-parse --short HEAD || true
+run_cmd git -C "$REPO_ROOT" status --short || true
+
+if [[ "$BUILD_RELEASE" == "1" ]]; then
+  require_cmd cargo "curl https://sh.rustup.rs -sSf | sh; source ~/.cargo/env" || \
+    fail "BUILD_RELEASE=1 但 cargo 不可用。"
+  run_cmd cargo build --release || fail "cargo build --release 失败。请把 report 发回来。"
+elif [[ ! -x "$BIN" ]]; then
+  fail "binary missing: $BIN。设置 BUILD_RELEASE=1 或先运行 cargo build --release。"
+fi
+append "- binary: $BIN"
+run_cmd ls -lh "$BIN" || true
+if command_status sha256sum; then
+  run_cmd sha256sum "$BIN" || true
+else
+  warn "sha256sum not found; skipping binary checksum."
 fi
 run_cmd "$BIN" --help || true
 

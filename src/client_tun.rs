@@ -26,6 +26,8 @@ use tokio::sync::mpsc;
 pub(crate) const TCP_SOCKET_BUFFER_SIZE: usize = 65_535;
 const RELAY_CHANNEL_CAPACITY: usize = 1024;
 const _: () = assert!(RELAY_CHANNEL_CAPACITY >= 1);
+const MAX_ESTABLISHED_UPLINK_BATCH: usize = 64;
+const _: () = assert!(MAX_ESTABLISHED_UPLINK_BATCH >= 1);
 const DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES: usize = TCP_SOCKET_BUFFER_SIZE * 32;
 const DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES: usize = TCP_SOCKET_BUFFER_SIZE * 8;
 const _: () =
@@ -1666,6 +1668,47 @@ fn extract_socket_payload(socket: &mut TcpSocket<'_>) -> Option<Vec<u8>> {
     payload
 }
 
+enum EstablishedUplink {
+    NotEstablished,
+    Handled,
+    Closed,
+}
+
+fn pump_established_uplink(
+    ctx: &mut SocketCtx,
+    tcp_state: TcpState,
+    mut next_payload: impl FnMut() -> Option<Vec<u8>>,
+) -> EstablishedUplink {
+    let Some(tx) = ctx.uplink_tx.as_mut() else {
+        return EstablishedUplink::NotEstablished;
+    };
+
+    for _ in 0..MAX_ESTABLISHED_UPLINK_BATCH {
+        match tx.try_reserve() {
+            Ok(permit) => {
+                if let Some(payload) = next_payload() {
+                    permit.send(RelayCommand::Data(payload));
+                    ctx.state = SocketState::Relaying;
+                } else {
+                    if tcp_state == TcpState::CloseWait && !ctx.local_fin_sent {
+                        permit.send(RelayCommand::Finish);
+                        ctx.local_fin_sent = true;
+                    }
+                    return EstablishedUplink::Handled;
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                return EstablishedUplink::Handled;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return EstablishedUplink::Closed;
+            }
+        }
+    }
+
+    EstablishedUplink::Handled
+}
+
 fn rearm_socket_with_reason(
     handle: SocketHandle,
     socket: &mut TcpSocket<'_>,
@@ -1759,40 +1802,16 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
         }
     }
 
-    // 刀13 ②：已建立 relay 的上行必须非阻塞。先抢 mpsc permit，再从 smoltcp 取字节；
+    // 刀13 ② / 刀14s：已建立 relay 的上行必须非阻塞。先抢 mpsc permit，再从 smoltcp 取字节；
     // Full 时不 recv、不分配、不打印，让字节留在 smoltcp rx buffer → TCP 窗口自然背压 app。
-    // 这消除一条慢上游 flow 在 `tx.send().await` 上 HoL 阻塞整个主循环的问题。
-    enum EstablishedUplink {
-        NotEstablished,
-        Handled,
-        Closed,
-    }
+    // 14s 起每个 dirty pass 抽一批 payload，避免退化成“每 5ms timer 只转发一个 MSS”。
     let established_uplink = {
         let Some(ctx) = socket_ctxs.get_mut(&handle) else {
             return Ok(());
         };
-        if let Some(tx) = ctx.uplink_tx.as_mut() {
-            match tx.try_reserve() {
-                Ok(permit) => {
-                    let (payload, tcp_state) = {
-                        let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
-                        (extract_socket_payload(tcp_socket), tcp_socket.state())
-                    };
-                    if let Some(payload) = payload {
-                        permit.send(RelayCommand::Data(payload));
-                        ctx.state = SocketState::Relaying;
-                    } else if tcp_state == TcpState::CloseWait && !ctx.local_fin_sent {
-                        permit.send(RelayCommand::Finish);
-                        ctx.local_fin_sent = true;
-                    }
-                    EstablishedUplink::Handled
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => EstablishedUplink::Handled,
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => EstablishedUplink::Closed,
-            }
-        } else {
-            EstablishedUplink::NotEstablished
-        }
+        let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
+        let tcp_state = tcp_socket.state();
+        pump_established_uplink(ctx, tcp_state, || extract_socket_payload(tcp_socket))
     };
     match established_uplink {
         EstablishedUplink::Handled => return Ok(()),
@@ -3609,6 +3628,100 @@ mod tests {
         assert_eq!(ctx.uplink_buffer.len(), MAX_UPLINK_BUFFER);
         assert!(!ctx.buffer_uplink(&[0u8; 1]), "超上限 1B 应丢弃");
         assert_eq!(ctx.uplink_buffer.len(), MAX_UPLINK_BUFFER, "丢弃不改变 buffer");
+    }
+
+    #[test]
+    fn established_uplink_batch_drains_multiple_payloads_in_one_pass() {
+        use std::collections::VecDeque;
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut ctx = SocketCtx::new(80);
+        ctx.uplink_tx = Some(tx);
+        let mut payloads: VecDeque<Vec<u8>> =
+            VecDeque::from([b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
+
+        assert!(matches!(
+            pump_established_uplink(&mut ctx, TcpState::Established, || payloads.pop_front()),
+            EstablishedUplink::Handled
+        ));
+        assert!(payloads.is_empty(), "one dirty pass should drain the readable batch");
+        assert_eq!(ctx.state, SocketState::Relaying);
+
+        for expected in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()] {
+            match rx.try_recv().expect("payload should be forwarded") {
+                RelayCommand::Data(got) => assert_eq!(got, expected),
+                other => panic!("expected data command, got {other:?}"),
+            }
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn established_uplink_batch_stops_at_fairness_cap() {
+        use std::collections::VecDeque;
+
+        let (tx, mut rx) = mpsc::channel(MAX_ESTABLISHED_UPLINK_BATCH + 2);
+        let mut ctx = SocketCtx::new(80);
+        ctx.uplink_tx = Some(tx);
+        let mut payloads: VecDeque<Vec<u8>> = (0..=MAX_ESTABLISHED_UPLINK_BATCH)
+            .map(|i| vec![i as u8])
+            .collect();
+
+        assert!(matches!(
+            pump_established_uplink(&mut ctx, TcpState::Established, || payloads.pop_front()),
+            EstablishedUplink::Handled
+        ));
+        assert_eq!(
+            payloads.len(),
+            1,
+            "batch cap should leave remaining readable data for the next dirty pass"
+        );
+        for _ in 0..MAX_ESTABLISHED_UPLINK_BATCH {
+            assert!(matches!(
+                rx.try_recv().expect("batch payload should be sent"),
+                RelayCommand::Data(_)
+            ));
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn established_uplink_full_channel_does_not_consume_payload() {
+        use std::collections::VecDeque;
+
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(RelayCommand::Data(b"occupied".to_vec())).unwrap();
+        let mut ctx = SocketCtx::new(80);
+        ctx.uplink_tx = Some(tx);
+        let mut payloads: VecDeque<Vec<u8>> = VecDeque::from([b"must-stay".to_vec()]);
+
+        assert!(matches!(
+            pump_established_uplink(&mut ctx, TcpState::Established, || payloads.pop_front()),
+            EstablishedUplink::Handled
+        ));
+        assert_eq!(
+            payloads.len(),
+            1,
+            "mpsc full must preserve smoltcp bytes for TCP-window backpressure"
+        );
+    }
+
+    #[test]
+    fn established_uplink_sends_finish_after_payloads_drain() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut ctx = SocketCtx::new(80);
+        ctx.uplink_tx = Some(tx);
+
+        assert!(matches!(
+            pump_established_uplink(&mut ctx, TcpState::CloseWait, || None),
+            EstablishedUplink::Handled
+        ));
+        assert!(ctx.local_fin_sent);
+        assert!(matches!(
+            rx.try_recv().expect("finish should be sent"),
+            RelayCommand::Finish
+        ));
+        assert!(rx.try_recv().is_err());
     }
 
     fn mk_pending_ctx(epoch: u64) -> SocketCtx {

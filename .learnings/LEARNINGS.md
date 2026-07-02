@@ -1,5 +1,29 @@
 # Learnings
 
+## 2026-07-02 — Knife14s: one payload per dirty pass looked exactly like a 5ms throughput cap
+
+Knife14r was tested with
+`/tmp/mvpn_knife14r_usclient_suite_20260702_171341.tar.gz`. Service preflight was
+healthy, `remote_write_timeout` stayed absent, but forward throughput stayed in
+the 1-2 Mbit/s range with long zero-bps windows. The code matched the number:
+established uplink read exactly one smoltcp payload per dirty pass, so quiet
+periods fell back to the 5ms timer. One MSS per 5ms is roughly the observed
+forward rate.
+
+Knife14s changes the established uplink path to drain a bounded batch per dirty
+pass while preserving the old safety rule: reserve relay mpsc capacity before
+reading smoltcp. If the relay channel is full, leave bytes in smoltcp so TCP
+window backpressure still works.
+
+Reusable rule: when a throughput result is close to `payload_size * tick_rate`,
+look for hidden "one item per timer tick" logic before changing transport
+settings. Batch hot-path work with an explicit fairness cap, not with unbounded
+loops.
+
+The suite now also records the git commit and binary checksum, and
+`BUILD_RELEASE=1` builds the release binary before running. Future VPS logs must
+prove which commit and binary were tested before we trust performance evidence.
+
 ## 2026-07-02 — Knife14r: deferred close grace should follow drain progress
 
 Knife14q was tested with

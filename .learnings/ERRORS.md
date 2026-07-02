@@ -1,5 +1,32 @@
 # Errors
 
+## 2026-07-02 — Knife14r exposed one-payload-per-tick uplink throttling
+
+- Log bundle: `/tmp/mvpn_knife14r_usclient_suite_20260702_171341.tar.gz`
+- Symptom: forward P1/P4/P8 stayed around low Mbit/s with long zero-bps gaps,
+  and P2 timed out. `remote_write_timeout` was absent, so this was not the old
+  QUIC write-deadline failure.
+- Root cause in code: established uplink drained at most one smoltcp payload per
+  dirty pass. Without continuous inbound wakeups, the 5ms timer became the
+  effective throughput limiter.
+- Correct behavior: drain a bounded batch per dirty pass, but reserve relay mpsc
+  capacity before reading each payload so channel fullness still applies TCP
+  backpressure.
+- Future debugging rule: when measured throughput is suspiciously close to
+  `MSS * timer frequency`, inspect event-loop batching before touching QUIC,
+  congestion control, or VPS tuning.
+
+## 2026-07-02 — Knife14r report could not prove the exact binary commit
+
+- Log bundle: `/tmp/mvpn_knife14r_usclient_suite_20260702_171341.tar.gz`
+- Symptom: the report showed `SUITE_TAG=knife14r`, but did not include
+  `git rev-parse` output or binary checksum. The script also only built the
+  release binary if it was missing.
+- Correct behavior: test suites should record git commit, worktree status,
+  binary path, and checksum; `BUILD_RELEASE=1` should rebuild before running.
+- Future debugging rule: never analyze a VPS performance run as definitive until
+  the report proves the binary came from the intended commit.
+
 ## 2026-07-02 — Knife14q showed fixed deferred-close grace still drops useful tail bytes
 
 - Log bundle: `/tmp/mvpn_knife14q_usclient_suite_20260702_160853.tar.gz`
