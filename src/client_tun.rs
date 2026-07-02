@@ -26,6 +26,10 @@ use tokio::sync::mpsc;
 pub(crate) const TCP_SOCKET_BUFFER_SIZE: usize = 65_535;
 const RELAY_CHANNEL_CAPACITY: usize = 1024;
 const _: () = assert!(RELAY_CHANNEL_CAPACITY >= 1);
+const DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES: usize = TCP_SOCKET_BUFFER_SIZE * 32;
+const DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES: usize = TCP_SOCKET_BUFFER_SIZE * 8;
+const _: () =
+    assert!(DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES < DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES);
 /// L2（刀9 F4）：一条 relay 双向静默多久判 idle → 退出 + shutdown。防慢/卡死上游（尤其 REALITY
 /// TCP-only 手写 TLS 遇 server 不返回）长期挂住 relay task 泄漏。90s 偏宽松保稳（长轮询/SSE 不误杀）。
 const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
@@ -580,6 +584,86 @@ impl TunListenerConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DownlinkBackpressureConfig {
+    high_bytes: usize,
+    low_bytes: usize,
+}
+
+impl Default for DownlinkBackpressureConfig {
+    fn default() -> Self {
+        Self {
+            high_bytes: DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES,
+            low_bytes: DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DownlinkPendingStats {
+    max_pending: usize,
+    total_pending: usize,
+}
+
+impl DownlinkPendingStats {
+    fn new(max_pending: usize, total_pending: usize) -> Self {
+        Self {
+            max_pending,
+            total_pending,
+        }
+    }
+}
+
+fn downlink_pending_stats<'a>(
+    ctxs: impl IntoIterator<Item = &'a SocketCtx>,
+) -> DownlinkPendingStats {
+    let mut max_pending = 0usize;
+    let mut total_pending = 0usize;
+    for ctx in ctxs {
+        let pending = ctx.downlink_pending.len();
+        max_pending = max_pending.max(pending);
+        total_pending = total_pending.saturating_add(pending);
+    }
+    DownlinkPendingStats::new(max_pending, total_pending)
+}
+
+fn next_downlink_backpressure(
+    was_paused: bool,
+    stats: DownlinkPendingStats,
+    cfg: DownlinkBackpressureConfig,
+) -> bool {
+    if was_paused {
+        stats.max_pending > cfg.low_bytes
+    } else {
+        stats.max_pending >= cfg.high_bytes
+    }
+}
+
+fn parse_backpressure_bytes(s: Option<&str>, default: usize) -> usize {
+    s.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn parse_downlink_backpressure_config(
+    high: Option<&str>,
+    low: Option<&str>,
+) -> DownlinkBackpressureConfig {
+    let default = DownlinkBackpressureConfig::default();
+    let high_bytes = parse_backpressure_bytes(high, default.high_bytes);
+    let mut low_bytes = parse_backpressure_bytes(low, default.low_bytes);
+    if low_bytes >= high_bytes {
+        low_bytes = default.low_bytes;
+    }
+    if low_bytes >= high_bytes {
+        low_bytes = high_bytes.saturating_sub(1).max(1);
+    }
+    DownlinkBackpressureConfig {
+        high_bytes,
+        low_bytes,
+    }
+}
+
 /// Startup configuration for the TUN runtime.
 /// 中文要点：Stage 13d 退役 legacy 上游后，运行时只剩本地监听池配置；
 /// TUIC 出口配置走 `MINI_VPN_TUIC_*`（见 tuic.rs），不在这里。
@@ -597,6 +681,7 @@ pub struct TunRuntimeConfig {
     /// 量化 #4 vs #3）；默认 `false` → 装 `NoopSink`（**零开销路径逐字不变**）。仅 `from_env` 读 env，
     /// `from_sources`（harness/测试）恒 `false`。
     pub profile_loop: bool,
+    downlink_backpressure: DownlinkBackpressureConfig,
 }
 
 impl TunRuntimeConfig {
@@ -607,16 +692,26 @@ impl TunRuntimeConfig {
             tun_mtu: DEFAULT_TUN_MTU,
             metrics_secs: METRICS_SNAPSHOT_SECS,
             profile_loop: false,
+            downlink_backpressure: DownlinkBackpressureConfig::default(),
         })
     }
 
     /// Read config from process environment
-    /// （`MINI_VPN_TUN_POOL_SIZE` + `MINI_VPN_METRICS_SECS` + `MINI_VPN_PROFILE_LOOP`）。
+    /// （`MINI_VPN_TUN_POOL_SIZE` + `MINI_VPN_METRICS_SECS` + `MINI_VPN_PROFILE_LOOP`
+    /// + downlink backpressure watermarks）。
     fn from_env() -> Result<Self, ClientError> {
         let mut cfg = Self::from_sources(std::env::var("MINI_VPN_TUN_POOL_SIZE").ok().as_deref())?;
         cfg.tun_mtu = parse_tun_mtu(std::env::var("MINI_VPN_TUN_MTU").ok().as_deref());
         cfg.metrics_secs = parse_metrics_secs(std::env::var("MINI_VPN_METRICS_SECS").ok().as_deref());
         cfg.profile_loop = parse_profile_loop(std::env::var("MINI_VPN_PROFILE_LOOP").ok().as_deref());
+        cfg.downlink_backpressure = parse_downlink_backpressure_config(
+            std::env::var("MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES")
+                .ok()
+                .as_deref(),
+            std::env::var("MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES")
+                .ok()
+                .as_deref(),
+        );
         Ok(cfg)
     }
 }
@@ -711,6 +806,11 @@ pub async fn start_tun_proxy() {
             runtime_config.metrics_secs
         );
     }
+    println!(
+        "🧯 TCP 下行背压: high={}B low={}B（MINI_VPN_DOWNLINK_BACKPRESSURE_* 可调）",
+        runtime_config.downlink_backpressure.high_bytes,
+        runtime_config.downlink_backpressure.low_bytes
+    );
 
     // 1. 初始化 TUN 设备 / 创建操作系统的原生异步虚拟网卡。
     let raw_tun = match create_tun_device(runtime_config.tun_mtu).await {
@@ -944,12 +1044,29 @@ pub async fn run_event_loop<D, U, M>(
         tokio::time::interval(std::time::Duration::from_secs(runtime_config.metrics_secs));
     let mut tcp_loop_flush_tx_calls: u64 = 0;
     let mut tcp_loop_flush_tx_failures: u64 = 0;
+    let downlink_backpressure = runtime_config.downlink_backpressure;
+    let mut global_rx_paused = false;
 
     loop {
+        let downlink_stats =
+            downlink_pending_stats(dirty.iter().filter_map(|handle| socket_ctxs.get(handle)));
+        let next_global_rx_paused =
+            next_downlink_backpressure(global_rx_paused, downlink_stats, downlink_backpressure);
+        if next_global_rx_paused != global_rx_paused {
+            global_rx_paused = next_global_rx_paused;
+            tcp_diag_log!(
+                "🔎 tcp-downlink-backpressure paused={} max_pending={} total_pending={} high={} low={}",
+                global_rx_paused,
+                downlink_stats.max_pending,
+                downlink_stats.total_pending,
+                downlink_backpressure.high_bytes,
+                downlink_backpressure.low_bytes
+            );
+        }
         tokio::select! {
             // TCP relay 回程：后台车厢把远端回传字节送回主循环 → 注入对应 smoltcp socket。
             //   TUIC 自重连（live_conn），不需要 legacy 的 disconnect/复位分支。
-            Some((handle, event)) = global_rx.recv() =>{
+            Some((handle, event)) = global_rx.recv(), if !global_rx_paused =>{
                 metrics.loop_park_end();
                 match event {
                     RelayEvent::Data { epoch, bytes: payload } => {
@@ -3567,6 +3684,66 @@ mod tests {
         assert_eq!(diag.send_slice_errors, 1);
         assert_eq!(diag.tun_flush_tx_calls, 2);
         assert_eq!(diag.tun_flush_tx_failures, 1);
+    }
+
+    #[test]
+    fn downlink_pending_stats_track_max_and_total() {
+        let mut a = SocketCtx::new(443);
+        a.downlink_pending = vec![0; 10];
+        let mut b = SocketCtx::new(443);
+        b.downlink_pending = vec![0; 25];
+
+        let stats = downlink_pending_stats([&a, &b]);
+        assert_eq!(stats.max_pending, 25);
+        assert_eq!(stats.total_pending, 35);
+    }
+
+    #[test]
+    fn downlink_backpressure_uses_high_low_hysteresis() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+
+        assert!(
+            !next_downlink_backpressure(false, DownlinkPendingStats::new(99, 99), cfg),
+            "below high watermark keeps global_rx enabled"
+        );
+        assert!(
+            next_downlink_backpressure(false, DownlinkPendingStats::new(100, 100), cfg),
+            "hitting high watermark pauses global_rx"
+        );
+        assert!(
+            next_downlink_backpressure(true, DownlinkPendingStats::new(41, 41), cfg),
+            "while paused, stay paused until below low watermark"
+        );
+        assert!(
+            !next_downlink_backpressure(true, DownlinkPendingStats::new(40, 40), cfg),
+            "low watermark resumes global_rx"
+        );
+    }
+
+    #[test]
+    fn parse_downlink_backpressure_config_defaults_and_rejects_bad_low() {
+        let default = DownlinkBackpressureConfig::default();
+        assert_eq!(
+            parse_downlink_backpressure_config(None, None),
+            default,
+            "missing env uses defaults"
+        );
+        assert_eq!(
+            parse_downlink_backpressure_config(Some("abc"), Some("0")),
+            default,
+            "invalid or zero values fall back to defaults"
+        );
+
+        let custom = parse_downlink_backpressure_config(Some("4096"), Some("1024"));
+        assert_eq!(custom.high_bytes, 4096);
+        assert_eq!(custom.low_bytes, 1024);
+
+        let repaired = parse_downlink_backpressure_config(Some("4194304"), Some("4194304"));
+        assert_eq!(repaired.high_bytes, 4194304);
+        assert_eq!(repaired.low_bytes, default.low_bytes);
     }
 
     #[test]
