@@ -1,5 +1,21 @@
 # Learnings
 
+## 2026-07-02 — Stage workflow now requires self-improvement summaries
+
+Project memory is split into two layers:
+
+1. Stable project goals and operating rules live in `AGENTS.md`, so new Codex
+   sessions know mini_vpn's data-plane goal before planning or editing.
+2. Stage experience, failed assumptions, test conclusions, and reusable debugging
+   lessons live in `.learnings/LEARNINGS.md` or `.learnings/ERRORS.md` using the
+   self-improving-agent pattern.
+
+At the end of every meaningful stage, write a compact learning summary before
+asking for the next VPS run or closing the turn. Include the stage name, commit
+ID or log path when available, outcome, root cause if known, and the reusable
+rule for future sessions. Promote only stable, repeated guidance into
+`AGENTS.md` or `docs/tech/`; keep raw one-off noise out of memory.
+
 ## 2026-06-11 — Stage 13b: UDP over TUIC Packet rides the same authenticated QUIC connection
 
 UDP relay now speaks **TUIC `Packet` (native QUIC datagram)** through the same sing-box exit as 13a's TCP:

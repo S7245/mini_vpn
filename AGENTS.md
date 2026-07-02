@@ -57,10 +57,30 @@ For meaningful changes, follow this sequence:
 6. Commit per coherent task when requested by the workflow.
 7. Stage code-review: review for bugs, regressions, missing tests, and
    operational risk before asking for another VPS run.
+8. Stage learning: after every meaningful stage, write a short self-improvement
+   summary to `.learnings/LEARNINGS.md`. If a command, test, script, or VPS run
+   failed in a way that changes future behavior, also record it in
+   `.learnings/ERRORS.md`.
 
 Small related issues found during review should be fixed together before a
 concentrated integration test, instead of running a full VPS suite after every
 tiny edit.
+
+## Stage Learning Memory
+
+Use the `self-improving-agent` pattern for project-local memory:
+
+- At the end of each stage, summarize what happened, the outcome, what worked,
+  what failed or was rejected, the likely root cause, and the next reusable rule.
+- Include relevant commit IDs, log archive paths, scripts, and acceptance
+  signals when they matter.
+- Keep `.learnings/LEARNINGS.md` for mini_vpn-specific stage lessons.
+- Keep `.learnings/ERRORS.md` for failures that should change future debugging,
+  testing, or implementation behavior.
+- Do not put secrets, TUIC passwords, private keys, or one-off noisy logs into
+  learning memory.
+- Promote a learning into this `AGENTS.md` file or `docs/tech/` only when it
+  becomes stable project guidance rather than a single-stage observation.
 
 ## Test Strategy
 
