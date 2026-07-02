@@ -44,6 +44,8 @@ Optional env:
   WAIT_QUIET_BEFORE_FULL=1  after standalone P1, wait for active relays to drop before full sweep
   QUIET_TIMEOUT_SECS=20
   QUIET_POLL_SECS=1
+  IPERF_BUSY_RETRIES=3      retry each iperf sub-run when Target reports "server is busy"
+  IPERF_BUSY_WAIT_SECS=5    seconds to wait between iperf busy retries
 
 Output:
   /tmp/conn/mvpn_knife14c_usclient_suite_<timestamp>.md
@@ -79,6 +81,8 @@ DIRECT_IPERF_TIMEOUT="${DIRECT_IPERF_TIMEOUT:-8s}"
 WAIT_QUIET_BEFORE_FULL="${WAIT_QUIET_BEFORE_FULL:-1}"
 QUIET_TIMEOUT_SECS="${QUIET_TIMEOUT_SECS:-20}"
 QUIET_POLL_SECS="${QUIET_POLL_SECS:-1}"
+IPERF_BUSY_RETRIES="${IPERF_BUSY_RETRIES:-3}"
+IPERF_BUSY_WAIT_SECS="${IPERF_BUSY_WAIT_SECS:-5}"
 
 mkdir -p "$OUT_DIR"
 REPORT="$OUT_DIR/mvpn_${SUITE_TAG}_usclient_suite_${TS}.md"
@@ -341,6 +345,8 @@ run_lowrtt_probe() {
     OUT="$probe_out" \
     PARALLEL_SET="$parallel" \
     DURATION="$duration" \
+    IPERF_BUSY_RETRIES="$IPERF_BUSY_RETRIES" \
+    IPERF_BUSY_WAIT_SECS="$IPERF_BUSY_WAIT_SECS" \
     bash "$LOWRTT_SCRIPT" "$TARGET" "$IPERF_PORT"
   local status=$?
 

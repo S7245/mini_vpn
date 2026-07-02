@@ -21,6 +21,8 @@ env:
   RUN_UDP=0                set 1 to run UDP probes too
   UDP_BW=90M               UDP offered bandwidth
   UDP_LEN=1200             UDP datagram payload length
+  IPERF_BUSY_RETRIES=3     retry an iperf command when the target server is busy
+  IPERF_BUSY_WAIT_SECS=5   seconds to wait between busy retries
 USAGE
 }
 
@@ -47,6 +49,8 @@ LOG="${LOG:-/tmp/mvpn_accept.log}"
 RUN_UDP="${RUN_UDP:-0}"
 UDP_BW="${UDP_BW:-90M}"
 UDP_LEN="${UDP_LEN:-1200}"
+IPERF_BUSY_RETRIES="${IPERF_BUSY_RETRIES:-3}"
+IPERF_BUSY_WAIT_SECS="${IPERF_BUSY_WAIT_SECS:-5}"
 OUT="${OUT:-/tmp/mvpn_knife14b_lowrtt_$(date +%Y%m%d_%H%M%S).md}"
 METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode'
 
@@ -146,7 +150,44 @@ append_iperf_cmd() {
 
   local start_line
   start_line="$(log_line_count)"
-  append_cmd timeout "${IPERF_TIMEOUT_SECS}s" "$@"
+  local attempt=1
+  local max_attempts=$((IPERF_BUSY_RETRIES + 1))
+  while ((attempt <= max_attempts)); do
+    local tmp
+    tmp="$(mktemp)"
+    {
+      echo
+      echo "- iperf_attempt: ${attempt}/${max_attempts}"
+      echo '```bash'
+      printf '$'
+      printf ' %q' timeout "${IPERF_TIMEOUT_SECS}s" "$@"
+      echo
+    } | tee -a "$OUT"
+
+    set +e
+    timeout "${IPERF_TIMEOUT_SECS}s" "$@" 2>&1 | tee -a "$OUT" "$tmp"
+    local status=${PIPESTATUS[0]}
+    set -e
+
+    {
+      echo "exit=$status"
+      echo '```'
+    } | tee -a "$OUT"
+
+    if grep -q 'server is busy running a test' "$tmp" && ((attempt < max_attempts)); then
+      {
+        echo
+        echo "> iperf3 target is busy; waiting ${IPERF_BUSY_WAIT_SECS}s before retry ${attempt}/${IPERF_BUSY_RETRIES}."
+      } | tee -a "$OUT"
+      rm -f "$tmp"
+      sleep "$IPERF_BUSY_WAIT_SECS"
+      attempt=$((attempt + 1))
+      continue
+    fi
+
+    rm -f "$tmp"
+    break
+  done
   append_metrics_since "$start_line" "$metrics_title"
 }
 
@@ -158,6 +199,8 @@ append_iperf_cmd() {
   echo "- parallel_set: ${PARALLEL_SET}"
   echo "- duration: ${DURATION}s"
   echo "- iperf_timeout: ${IPERF_TIMEOUT_SECS}s"
+  echo "- iperf_busy_retries: ${IPERF_BUSY_RETRIES}"
+  echo "- iperf_busy_wait_secs: ${IPERF_BUSY_WAIT_SECS}"
   echo "- log: ${LOG}"
   echo
   echo "> 判读前先确认：curl ipinfo.io 必须是 exit IP；dig example.com +short 应是 198.18.x.x；📊 TCP relay 累计应增长。"
