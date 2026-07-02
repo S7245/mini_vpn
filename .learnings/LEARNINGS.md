@@ -1,5 +1,32 @@
 # Learnings
 
+## 2026-07-02 — Knife14u: pending grace must require local send capability
+
+Knife14t was tested with
+`/tmp/mvpn_knife14t_usclient_suite_20260702_215901.tar.gz` on commit
+`51072c8`. The bundle proved the VPS path was healthy, but tunnel throughput
+regressed sharply: forward fell to low Mbit/s or below, reverse had Kbit/s-scale
+windows and timeout cases, and loop active stayed mostly parked. The prior
+generic pending grace reduced `dead_slot_reap pending>0` sizes, but kept
+inactive stale flows alive for the grace window even when the local smoltcp
+socket was no longer send-capable.
+
+Knife14u narrows the lifecycle exception: active pending is still preserved, and
+inactive pending gets progress-sensitive grace only if `TcpSocket::can_send()`
+is still true. Inactive pending with `can_send=false` is undeliverable tail and
+is reaped immediately. `dead_slot_reap` diagnostics now include `tcp_state`,
+`active`, `can_send`, and `can_recv` so the next VPS log can separate useful
+tail-loss risk from correct cleanup.
+
+Local acceptance passed after removing accidental full-repo formatting churn:
+`cargo test --lib reap_predicate -- --nocapture`, `cargo test --lib client_tun`,
+full `cargo test`, `cargo clippy --all-targets -- -D warnings`, and
+`git diff --check`.
+
+Reusable rule: never protect a pending buffer solely because it exists. For TCP
+downlink, the pending bytes must be tied to a local socket state that can still
+accept them; otherwise a grace window turns cleanup into stale-flow interference.
+
 ## 2026-07-02 — Knife14t: pending downlink grace must be generic, not only deferred close
 
 Knife14s was tested with

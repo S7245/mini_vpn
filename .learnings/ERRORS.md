@@ -1,5 +1,33 @@
 # Errors
 
+## 2026-07-02 — Knife14t showed generic pending grace can preserve dead local tails
+
+- Log bundle: `/tmp/mvpn_knife14t_usclient_suite_20260702_215901.tar.gz`
+- Tested commit: `51072c8`
+- Symptom: VPS preflight was healthy, but tunnel throughput regressed badly and
+  reverse tests showed Kbit/s-scale windows/timeouts. `dead_slot_reap pending>0`
+  remained, with smaller pending values than knife14s.
+- Rejected assumption: if inactive `downlink_pending` had recent progress, it is
+  always worth preserving for the full grace window.
+- Correct behavior: split inactive pending by local send capability. If
+  `TcpSocket::can_send()` is false while the socket is inactive, the pending
+  bytes are no longer deliverable and should be reaped immediately; if it is
+  true, keep the existing bounded progress-sensitive grace.
+- Future debugging rule: pending-byte lifecycle logs must include enough local
+  socket state (`tcp_state`, `active`, `can_send`) to tell whether a close
+  dropped useful tail bytes or correctly discarded undeliverable bytes.
+
+## 2026-07-02 — Full-repo cargo fmt creates unrelated churn in this workspace
+
+- Symptom: running `cargo fmt` during knife14u rewrote many unrelated source
+  files and inflated the diff far beyond the data-plane change.
+- Correct behavior: avoid full-repo formatting unless the stage explicitly owns
+  that cleanup. For scoped fixes in this repository, keep existing local style
+  and rely on tests, clippy, and `git diff --check` unless formatting is needed
+  for the touched hunk.
+- Future debugging rule: inspect `git diff --stat` after any formatting command
+  before continuing; revert accidental churn immediately.
+
 ## 2026-07-02 — Knife14s exposed a non-deferred pending downlink reap hole
 
 - Log bundle: `/tmp/mvpn_knife14s_usclient_suite_20260702_180337.tar.gz`

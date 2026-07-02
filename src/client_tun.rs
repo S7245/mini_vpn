@@ -272,6 +272,25 @@ struct RelayClose {
     reason: &'static str,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SocketCloseSnapshot {
+    tcp_state: TcpState,
+    active: bool,
+    can_send: bool,
+    can_recv: bool,
+}
+
+impl SocketCloseSnapshot {
+    fn from_socket(socket: &TcpSocket<'_>) -> Self {
+        Self {
+            tcp_state: socket.state(),
+            active: socket.is_active(),
+            can_send: socket.can_send(),
+            can_recv: socket.can_recv(),
+        }
+    }
+}
+
 /// Event sent from one background TCP relay task back into the single owner main loop.
 /// Data events preserve the existing downlink path; Closed makes every relay terminal reason visible to
 /// the socket state machine instead of relying on smoltcp to notice the local side later.
@@ -1492,17 +1511,22 @@ fn reap_dead_slots(
     for h in handles {
         let dead = {
             let s = sockets.get::<TcpSocket>(h);
-            let st = s.state();
-            let active = s.is_active();
-            socket_ctxs
-                .get(&h)
-                .map(|ctx| should_reap_slot(ctx, st, active, now_secs))
-                .unwrap_or(false)
+            let snapshot = SocketCloseSnapshot::from_socket(s);
+            socket_ctxs.get(&h).and_then(|ctx| {
+                should_reap_slot(
+                    ctx,
+                    snapshot.tcp_state,
+                    snapshot.active,
+                    snapshot.can_send,
+                    now_secs,
+                )
+                .then_some(snapshot)
+            })
         };
-        if dead {
+        if let Some(snapshot) = dead {
             let sock = sockets.get_mut::<TcpSocket>(h);
             if let Some(ctx) = socket_ctxs.get_mut(&h) {
-                rearm_socket_with_reason(
+                rearm_socket_with_reason_and_snapshot(
                     h,
                     sock,
                     ctx,
@@ -1510,6 +1534,7 @@ fn reap_dead_slots(
                     now_secs,
                     "local",
                     "dead_slot_reap",
+                    Some(snapshot),
                 );
                 reaped += 1;
             }
@@ -1518,13 +1543,22 @@ fn reap_dead_slots(
     reaped
 }
 
-fn should_reap_slot(ctx: &SocketCtx, tcp_state: TcpState, active: bool, now_secs: u64) -> bool {
+fn should_reap_slot(
+    ctx: &SocketCtx,
+    tcp_state: TcpState,
+    active: bool,
+    can_send: bool,
+    now_secs: u64,
+) -> bool {
     if ctx.state == SocketState::Listening {
         return false;
     }
     if !ctx.downlink_pending.is_empty() {
         if active {
             return false;
+        }
+        if !can_send {
+            return true;
         }
         let Some(deadline_base) = ctx
             .pending_relay_close_since_secs
@@ -1763,6 +1797,54 @@ fn rearm_socket_with_reason(
     close_direction: &'static str,
     close_reason: &'static str,
 ) {
+    rearm_socket_with_reason_and_snapshot(
+        handle,
+        socket,
+        ctx,
+        fake_pool,
+        now_secs,
+        close_direction,
+        close_reason,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rearm_socket_with_reason_and_snapshot(
+    handle: SocketHandle,
+    socket: &mut TcpSocket<'_>,
+    ctx: &mut SocketCtx,
+    fake_pool: &mut FakeIpPool,
+    now_secs: u64,
+    close_direction: &'static str,
+    close_reason: &'static str,
+    close_snapshot: Option<SocketCloseSnapshot>,
+) {
+    if let Some(snapshot) = close_snapshot {
+        tcp_diag_log!(
+            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} tun_flush_tx_calls={} tun_flush_tx_failures={} tcp_state={:?} active={} can_send={} can_recv={}",
+            handle,
+            close_direction,
+            close_reason,
+            ctx.state,
+            ctx.downlink_pending.len(),
+            ctx.downlink_diag.downlink_pending_high_water,
+            ctx.downlink_diag.remote_to_global_rx_bytes,
+            ctx.downlink_diag.send_slice_calls,
+            ctx.downlink_diag.send_slice_accepted_bytes,
+            ctx.downlink_diag.send_slice_zero,
+            ctx.downlink_diag.send_slice_errors,
+            ctx.downlink_diag.tun_flush_tx_calls,
+            ctx.downlink_diag.tun_flush_tx_failures,
+            snapshot.tcp_state,
+            snapshot.active,
+            snapshot.can_send,
+            snapshot.can_recv
+        );
+        rearm_socket(socket, ctx, fake_pool, now_secs);
+        return;
+    }
+
     tcp_diag_log!(
         "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} tun_flush_tx_calls={} tun_flush_tx_failures={}",
         handle,
@@ -3311,20 +3393,20 @@ mod tests {
         let mut pending = SocketCtx::new(443);
         pending.state = SocketState::HandshakePending;
         assert!(
-            !should_reap_slot(&pending, TcpState::Established, true, 0),
+            !should_reap_slot(&pending, TcpState::Established, true, true, 0),
             "活跃 async-open 槽不能因 uplink_tx=None 被误 reap"
         );
 
         let mut opening = SocketCtx::new(443);
         opening.state = SocketState::OpeningRemote;
         assert!(
-            should_reap_slot(&opening, TcpState::Established, true, 0),
+            should_reap_slot(&opening, TcpState::Established, true, true, 0),
             "旧 inline OpeningRemote 且无 uplink_tx 仍应视为卡住可 reap"
         );
 
         let listening = SocketCtx::new(443);
         assert!(
-            !should_reap_slot(&listening, TcpState::Closed, false, 0),
+            !should_reap_slot(&listening, TcpState::Closed, false, false, 0),
             "空闲 Listening 槽永不 reap"
         );
     }
@@ -3336,13 +3418,13 @@ mod tests {
         ctx.downlink_pending = vec![1, 2, 3];
 
         assert!(
-            !should_reap_slot(&ctx, TcpState::CloseWait, true, 0),
+            !should_reap_slot(&ctx, TcpState::CloseWait, true, true, 0),
             "active CloseWait with pending downlink must keep flushing instead of aborting"
         );
 
         ctx.downlink_pending.clear();
         assert!(
-            should_reap_slot(&ctx, TcpState::CloseWait, true, 0),
+            should_reap_slot(&ctx, TcpState::CloseWait, true, true, 0),
             "CloseWait is reapable again once pending downlink drains"
         );
 
@@ -3350,12 +3432,16 @@ mod tests {
         ctx.downlink_pending_last_progress_secs = Some(10);
         ctx.downlink_pending_last_pending_bytes = 3;
         assert!(
-            !should_reap_slot(&ctx, TcpState::Closed, false, 14),
-            "inactive pending with recent progress should get a short flush grace"
+            should_reap_slot(&ctx, TcpState::Closed, false, false, 14),
+            "inactive pending that cannot be sent is undeliverable and should reap immediately"
         );
         assert!(
-            should_reap_slot(&ctx, TcpState::Closed, false, 15),
-            "inactive pending remains bounded after the no-progress grace"
+            !should_reap_slot(&ctx, TcpState::Closed, false, true, 14),
+            "inactive pending with send capacity and recent progress should get a short flush grace"
+        );
+        assert!(
+            should_reap_slot(&ctx, TcpState::Closed, false, true, 15),
+            "inactive send-capable pending remains bounded after the no-progress grace"
         );
     }
 
@@ -3367,13 +3453,13 @@ mod tests {
         ctx.uplink_tx = Some(tx);
 
         assert!(
-            !should_reap_slot(&ctx, TcpState::CloseWait, true, 0),
+            !should_reap_slot(&ctx, TcpState::CloseWait, true, true, 0),
             "active CloseWait with a live relay may still receive reverse/downlink bytes"
         );
 
         ctx.uplink_tx = None;
         assert!(
-            should_reap_slot(&ctx, TcpState::CloseWait, true, 0),
+            should_reap_slot(&ctx, TcpState::CloseWait, true, true, 0),
             "CloseWait is reapable once there is no live relay and no pending downlink"
         );
     }
@@ -3386,7 +3472,7 @@ mod tests {
         ctx.uplink_tx = None;
 
         assert!(
-            !should_reap_slot(&ctx, TcpState::CloseWait, true, 0),
+            !should_reap_slot(&ctx, TcpState::CloseWait, true, true, 0),
             "post-Finish CloseWait must wait for the relay close event instead of dead-slot reap"
         );
     }
@@ -3406,15 +3492,19 @@ mod tests {
         ctx.pending_relay_close_last_pending_bytes = 3;
 
         assert!(
-            !should_reap_slot(&ctx, TcpState::Closed, false, 14),
+            should_reap_slot(&ctx, TcpState::Closed, false, false, 14),
+            "deferred close pending without local send capacity should reap immediately"
+        );
+        assert!(
+            !should_reap_slot(&ctx, TcpState::Closed, false, true, 14),
             "deferred close pending should get a short grace window to flush"
         );
         assert!(
-            !should_reap_slot(&ctx, TcpState::Closed, false, 15),
+            !should_reap_slot(&ctx, TcpState::Closed, false, true, 15),
             "deferred close pending should keep draining when recent progress exists"
         );
         assert!(
-            should_reap_slot(&ctx, TcpState::Closed, false, 18),
+            should_reap_slot(&ctx, TcpState::Closed, false, true, 18),
             "deferred close pending should still be bounded after no-progress grace"
         );
 
@@ -3425,11 +3515,15 @@ mod tests {
         ctx.downlink_pending_last_progress_secs = Some(13);
         ctx.downlink_pending_last_pending_bytes = 3;
         assert!(
-            !should_reap_slot(&ctx, TcpState::Closed, false, 14),
+            should_reap_slot(&ctx, TcpState::Closed, false, false, 14),
+            "non-deferred inactive pending without local send capacity should reap immediately"
+        );
+        assert!(
+            !should_reap_slot(&ctx, TcpState::Closed, false, true, 14),
             "non-deferred inactive pending should use the same recent-progress grace"
         );
         assert!(
-            should_reap_slot(&ctx, TcpState::Closed, false, 18),
+            should_reap_slot(&ctx, TcpState::Closed, false, true, 18),
             "non-deferred inactive pending should still be bounded"
         );
     }
