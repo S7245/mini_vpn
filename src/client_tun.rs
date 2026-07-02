@@ -35,6 +35,9 @@ const RELAY_HALF_CLOSED_IDLE_TIMEOUT: std::time::Duration = std::time::Duration:
 /// Knife14f：单次本地→上游写入的进度预算。`write_all` 在 QUIC send window 黑洞时可长期 Pending；
 /// 必须在 relay task 内部止血，否则外层 `select!` 的 idle timeout 永远没有机会运行。
 const RELAY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Knife14o：relay 已关闭但仍有 downlink_pending 时，给 dirty flush 一个短窗口。
+/// 超过窗口仍无法交付则回到 hard reap，防永久脏槽。
+const DEFERRED_CLOSE_PENDING_GRACE_SECS: u64 = 5;
 /// 刀11：数据面可观测性快照周期（30s，对齐 TuicUpstream UDP_STATS_LOG_SECS）。仅周期采样/打印，不进热路径。
 const METRICS_SNAPSHOT_SECS: u64 = 30;
 
@@ -290,6 +293,8 @@ struct SocketCtx {
     downlink_pending: Vec<u8>,
     /// Relay has ended, but downlink bytes still need to be flushed before the slot can be rearmed.
     pending_relay_close: Option<RelayClose>,
+    /// Monotonic event-loop seconds when `pending_relay_close` was installed.
+    pending_relay_close_since_secs: Option<u64>,
     /// 本槽位当前 flow 占用的 fake-IP（若 target 经 fake-IP 改写）。
     /// 中文要点：刀2 引用计数——首次开远端时 `acquire`、rearm 时 `release`，
     /// 保证该 fake-IP 映射在本 flow 存活期间不被 sweep 回收（否则 resolve 失败 → 断连）。
@@ -317,6 +322,7 @@ impl SocketCtx {
             local_fin_sent: false,
             downlink_pending: Vec::new(),
             pending_relay_close: None,
+            pending_relay_close_since_secs: None,
             fake_ip: None,
             conn_epoch: 0,
             uplink_buffer: Vec::new(),
@@ -1279,7 +1285,10 @@ async fn process_dirty_relay<U, M>(
 /// → Capped → #2 修好的热门端口 stall 又回来。低频（1s tick）调用，非每包热路径。
 ///
 /// 死槽判定（仅对「被用过」的槽，即 `ctx.state != Listening`；空闲 Listen 槽 ctx.state==Listening 永不命中）：
-/// - `!is_active()`：Closed / TimeWait（RST、双向关闭完成）；**也覆盖 `HandshakePending` 槽
+/// - `!is_active()`：Closed / TimeWait（RST、双向关闭完成）；**但**若 relay close 已延迟且仍有
+///   `downlink_pending`，先给 dirty flush 一个短 grace 窗口，过期才 hard reap。此例外覆盖
+///   Knife14n 看到的 `state=Closing pending>0` 被 sweep 抢先清尾包。
+///   其余 inactive pending 仍按旧规则回收，防不可交付的残留永久占槽。也覆盖 `HandshakePending` 槽
 ///   在本地已关闭时**（remote-open 在飞但 app 已断）——回收时 rearm bump epoch，迟到的 `HandshakeDone` 被丢；
 /// - `CloseWait` 且无 pending downlink、无 live relay：被拦截应用已结束发送半边，且远端 relay
 ///   也已卸下 → teardown；若 relay 仍活着，即使当前 pending 为空，也可能还有 reverse/downlink 字节稍后到达；
@@ -1303,7 +1312,7 @@ fn reap_dead_slots(
             let active = s.is_active();
             socket_ctxs
                 .get(&h)
-                .map(|ctx| should_reap_slot(ctx, st, active))
+                .map(|ctx| should_reap_slot(ctx, st, active, now_secs))
                 .unwrap_or(false)
         };
         if dead {
@@ -1325,9 +1334,15 @@ fn reap_dead_slots(
     reaped
 }
 
-fn should_reap_slot(ctx: &SocketCtx, tcp_state: TcpState, active: bool) -> bool {
+fn should_reap_slot(ctx: &SocketCtx, tcp_state: TcpState, active: bool, now_secs: u64) -> bool {
     if ctx.state == SocketState::Listening {
         return false;
+    }
+    if ctx.pending_relay_close.is_some() && !ctx.downlink_pending.is_empty() {
+        let Some(since) = ctx.pending_relay_close_since_secs else {
+            return false;
+        };
+        return now_secs.saturating_sub(since) >= DEFERRED_CLOSE_PENDING_GRACE_SECS;
     }
     if !active {
         return true;
@@ -1552,6 +1567,7 @@ fn rearm_socket(
     ctx.local_fin_sent = false;
     ctx.downlink_pending.clear();
     ctx.pending_relay_close = None;
+    ctx.pending_relay_close_since_secs = None;
     ctx.downlink_diag = TcpDownlinkDiag::default();
     // 清 async-open 在飞缓存 + bump epoch——让任何迟到 `HandshakeDone` 失配被丢
     // （绝不装到本次 rearm 后的新一代 socket 上，防串话核心）。对非 spawn 槽是无害的纯计数自增。
@@ -2025,6 +2041,7 @@ fn handle_relay_closed(
         ctx.state = SocketState::Closing;
         ctx.uplink_tx = None;
         ctx.pending_relay_close = Some(close);
+        ctx.pending_relay_close_since_secs = Some(now_secs);
         return true;
     }
 
@@ -3085,20 +3102,20 @@ mod tests {
         let mut pending = SocketCtx::new(443);
         pending.state = SocketState::HandshakePending;
         assert!(
-            !should_reap_slot(&pending, TcpState::Established, true),
+            !should_reap_slot(&pending, TcpState::Established, true, 0),
             "活跃 async-open 槽不能因 uplink_tx=None 被误 reap"
         );
 
         let mut opening = SocketCtx::new(443);
         opening.state = SocketState::OpeningRemote;
         assert!(
-            should_reap_slot(&opening, TcpState::Established, true),
+            should_reap_slot(&opening, TcpState::Established, true, 0),
             "旧 inline OpeningRemote 且无 uplink_tx 仍应视为卡住可 reap"
         );
 
         let listening = SocketCtx::new(443);
         assert!(
-            !should_reap_slot(&listening, TcpState::Closed, false),
+            !should_reap_slot(&listening, TcpState::Closed, false, 0),
             "空闲 Listening 槽永不 reap"
         );
     }
@@ -3110,19 +3127,19 @@ mod tests {
         ctx.downlink_pending = vec![1, 2, 3];
 
         assert!(
-            !should_reap_slot(&ctx, TcpState::CloseWait, true),
+            !should_reap_slot(&ctx, TcpState::CloseWait, true, 0),
             "active CloseWait with pending downlink must keep flushing instead of aborting"
         );
 
         ctx.downlink_pending.clear();
         assert!(
-            should_reap_slot(&ctx, TcpState::CloseWait, true),
+            should_reap_slot(&ctx, TcpState::CloseWait, true, 0),
             "CloseWait is reapable again once pending downlink drains"
         );
 
         ctx.downlink_pending = vec![1, 2, 3];
         assert!(
-            should_reap_slot(&ctx, TcpState::Closed, false),
+            should_reap_slot(&ctx, TcpState::Closed, false, 0),
             "inactive sockets still reap even if pending bytes can no longer be delivered"
         );
     }
@@ -3135,13 +3152,13 @@ mod tests {
         ctx.uplink_tx = Some(tx);
 
         assert!(
-            !should_reap_slot(&ctx, TcpState::CloseWait, true),
+            !should_reap_slot(&ctx, TcpState::CloseWait, true, 0),
             "active CloseWait with a live relay may still receive reverse/downlink bytes"
         );
 
         ctx.uplink_tx = None;
         assert!(
-            should_reap_slot(&ctx, TcpState::CloseWait, true),
+            should_reap_slot(&ctx, TcpState::CloseWait, true, 0),
             "CloseWait is reapable once there is no live relay and no pending downlink"
         );
     }
@@ -3154,8 +3171,37 @@ mod tests {
         ctx.uplink_tx = None;
 
         assert!(
-            !should_reap_slot(&ctx, TcpState::CloseWait, true),
+            !should_reap_slot(&ctx, TcpState::CloseWait, true, 0),
             "post-Finish CloseWait must wait for the relay close event instead of dead-slot reap"
+        );
+    }
+
+    #[test]
+    fn reap_predicate_graces_deferred_close_pending_downlink() {
+        let mut ctx = SocketCtx::new(443);
+        ctx.state = SocketState::Closing;
+        ctx.downlink_pending = vec![1, 2, 3];
+        ctx.pending_relay_close = Some(RelayClose {
+            epoch: 9,
+            direction: "remote_to_local",
+            reason: "remote_eof",
+        });
+        ctx.pending_relay_close_since_secs = Some(10);
+
+        assert!(
+            !should_reap_slot(&ctx, TcpState::Closed, false, 14),
+            "deferred close pending should get a short grace window to flush"
+        );
+        assert!(
+            should_reap_slot(&ctx, TcpState::Closed, false, 15),
+            "deferred close pending should still be bounded after grace"
+        );
+
+        ctx.pending_relay_close = None;
+        ctx.pending_relay_close_since_secs = None;
+        assert!(
+            should_reap_slot(&ctx, TcpState::Closed, false, 14),
+            "non-deferred inactive pending remains hard-reapable"
         );
     }
 
@@ -3248,6 +3294,7 @@ mod tests {
             local_fin_sent: true,
             downlink_pending: Vec::new(),
             pending_relay_close: None,
+            pending_relay_close_since_secs: None,
             fake_ip: Some(ip),
             conn_epoch: 7,
             uplink_buffer: vec![1, 2, 3],
@@ -3335,6 +3382,7 @@ mod tests {
         assert!(ctx.uplink_tx.is_none());
         assert_eq!(ctx.downlink_pending, vec![1, 2, 3]);
         assert!(ctx.pending_relay_close.is_some());
+        assert_eq!(ctx.pending_relay_close_since_secs, Some(1));
         assert_eq!(ctx.conn_epoch, 5, "deferred close must not bump epoch before drain");
 
         ctx.downlink_pending.clear();
@@ -3348,6 +3396,7 @@ mod tests {
         ));
         assert_eq!(ctx.state, SocketState::Listening);
         assert!(ctx.pending_relay_close.is_none());
+        assert!(ctx.pending_relay_close_since_secs.is_none());
         assert_eq!(ctx.conn_epoch, 6);
     }
 
