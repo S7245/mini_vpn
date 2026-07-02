@@ -29,6 +29,9 @@ const _: () = assert!(RELAY_CHANNEL_CAPACITY >= 1);
 /// L2（刀9 F4）：一条 relay 双向静默多久判 idle → 退出 + shutdown。防慢/卡死上游（尤其 REALITY
 /// TCP-only 手写 TLS 遇 server 不返回）长期挂住 relay task 泄漏。90s 偏宽松保稳（长轮询/SSE 不误杀）。
 const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+/// Knife14n：本地 Finish 已关闭上游写半边后，只剩远端读半边。若远端没有继续发数据或 EOF，
+/// 用短窗口关闭，避免 read-only relay 卡住 active gauge 并污染下一轮 suite。
+const RELAY_HALF_CLOSED_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Knife14f：单次本地→上游写入的进度预算。`write_all` 在 QUIC send window 黑洞时可长期 Pending；
 /// 必须在 relay task 内部止血，否则外层 `select!` 的 idle timeout 永远没有机会运行。
 const RELAY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1333,9 +1336,13 @@ fn should_reap_slot(ctx: &SocketCtx, tcp_state: TcpState, active: bool) -> bool 
         return false;
     }
     if tcp_state == TcpState::CloseWait {
-        return ctx.uplink_tx.is_none();
+        return ctx.uplink_tx.is_none() && !ctx.local_fin_sent;
     }
     ctx.state == SocketState::OpeningRemote && ctx.uplink_tx.is_none()
+}
+
+fn relay_allows_remote_payload(ctx: &SocketCtx) -> bool {
+    ctx.uplink_tx.is_some() || ctx.local_fin_sent
 }
 
 /// Allocate a fresh smoltcp TCP listener socket for one pool slot.
@@ -1632,6 +1639,10 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
         EstablishedUplink::Closed => {
             let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
             if let Some(ctx) = socket_ctxs.get_mut(&handle) {
+                if ctx.local_fin_sent {
+                    ctx.uplink_tx = None;
+                    return Ok(());
+                }
                 rearm_socket_with_reason(
                     handle,
                     tcp_socket,
@@ -1942,7 +1953,7 @@ async fn handle_remote_payload<D: TunIo>(
     // 防串话 / 防 panic（epoch guard 的轻量降级版）：若该 handle 已被重连流程复位回
     // Listening（uplink_tx 被清空），说明这是上一代上游连接的迟到回程数据，直接丢弃，
     // 绝不能往非 Established 的 socket 写（否则 send_slice 报错、旧版本会 unwrap panic）。
-    if ctx.uplink_tx.is_none() {
+    if !relay_allows_remote_payload(ctx) {
         trace_log!(
             "🗑️ handle {:?} 已复位，丢弃旧连接迟到回程 {} 字节",
             handle,
@@ -2114,6 +2125,7 @@ async fn run_relay(
     let idle = tokio::time::sleep(RELAY_IDLE_TIMEOUT);
     tokio::pin!(idle);
     let mut writer_done = false;
+    let mut read_only_after_local_finish = false;
     let (close_direction, close_reason) = loop {
         tokio::select! {
             signal = writer_signal_rx.recv(), if !writer_done => {
@@ -2129,7 +2141,10 @@ async fn run_relay(
                             reason
                         );
                         writer_done = true;
-                        idle.as_mut().reset(tokio::time::Instant::now() + RELAY_IDLE_TIMEOUT);
+                        read_only_after_local_finish = true;
+                        idle.as_mut().reset(
+                            tokio::time::Instant::now() + RELAY_HALF_CLOSED_IDLE_TIMEOUT
+                        );
                     }
                     Some(RelayWriterSignal::Closed { direction, reason }) => {
                         break (direction, reason);
@@ -2166,7 +2181,12 @@ async fn run_relay(
                         if send_result.is_err() {
                             break ("remote_to_local", "global_rx_closed");
                         }
-                        idle.as_mut().reset(tokio::time::Instant::now() + RELAY_IDLE_TIMEOUT);
+                        let timeout = if read_only_after_local_finish {
+                            RELAY_HALF_CLOSED_IDLE_TIMEOUT
+                        } else {
+                            RELAY_IDLE_TIMEOUT
+                        };
+                        idle.as_mut().reset(tokio::time::Instant::now() + timeout);
                     }
                     Err(e) => {
                         println!("读取上游流失败 direction=remote_to_local handle={:?} err={:?}", handle, e);
@@ -2176,8 +2196,13 @@ async fn run_relay(
             }
             // L2：双向静默超时 → 主动清理（防泄漏）。有活动的 select 分支会重启 loop → 重建 sleep。
             _ = &mut idle => {
-                println!("⏱️ relay {:?} 双向静默 {}s，idle 超时关闭（L2）", handle, RELAY_IDLE_TIMEOUT.as_secs());
-                break ("timer", "idle_timeout");
+                let (timeout, reason) = if read_only_after_local_finish {
+                    (RELAY_HALF_CLOSED_IDLE_TIMEOUT, "half_closed_idle_timeout")
+                } else {
+                    (RELAY_IDLE_TIMEOUT, "idle_timeout")
+                };
+                println!("⏱️ relay {:?} 双向静默 {}s，idle 超时关闭（L2）", handle, timeout.as_secs());
+                break ("timer", reason);
             }
         }
     };
@@ -2803,6 +2828,37 @@ mod tests {
         task.await.unwrap();
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn relay_local_finish_without_remote_progress_uses_half_closed_idle_timeout() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let stream: RelayStream = Box::new(IdleStream { shutdown_called: shutdown_called.clone() });
+        let (tx, rx) = mpsc::channel::<RelayCommand>(8);
+        let (back_tx, mut back_rx) = mpsc::channel(8);
+        let task = tokio::spawn(run_relay(handle, 31, stream, rx, back_tx));
+
+        tx.send(RelayCommand::Finish).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(shutdown_called.load(Ordering::SeqCst), "Finish should shutdown the remote write half");
+
+        tokio::time::advance(RELAY_HALF_CLOSED_IDLE_TIMEOUT - std::time::Duration::from_secs(1)).await;
+        assert!(!task.is_finished(), "half-closed relay should stay open before the short idle timeout");
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        task.await.unwrap();
+
+        match back_rx.try_recv().expect("half-closed idle should notify main loop") {
+            (h, RelayEvent::Closed(close)) => {
+                assert_eq!(h, handle);
+                assert_eq!(close.epoch, 31);
+                assert_eq!(close.direction, "timer");
+                assert_eq!(close.reason, "half_closed_idle_timeout");
+            }
+            other => panic!("expected half-closed relay close event, got {other:?}"),
+        }
+    }
+
     /// 活动重置：临近阈值前来一次上行活动 → idle 计时重置，不退出；再静默满 90s 才退出。
     #[tokio::test(start_paused = true)]
     async fn relay_activity_resets_idle_timer() {
@@ -3087,6 +3143,32 @@ mod tests {
         assert!(
             should_reap_slot(&ctx, TcpState::CloseWait, true),
             "CloseWait is reapable once there is no live relay and no pending downlink"
+        );
+    }
+
+    #[test]
+    fn reap_predicate_preserves_closewait_after_local_finish() {
+        let mut ctx = SocketCtx::new(443);
+        ctx.state = SocketState::Relaying;
+        ctx.local_fin_sent = true;
+        ctx.uplink_tx = None;
+
+        assert!(
+            !should_reap_slot(&ctx, TcpState::CloseWait, true),
+            "post-Finish CloseWait must wait for the relay close event instead of dead-slot reap"
+        );
+    }
+
+    #[test]
+    fn remote_payload_allowed_after_local_finish_without_uplink_sender() {
+        let mut ctx = SocketCtx::new(443);
+        ctx.state = SocketState::Relaying;
+        ctx.local_fin_sent = true;
+        ctx.uplink_tx = None;
+
+        assert!(
+            relay_allows_remote_payload(&ctx),
+            "post-Finish read-only relay must still accept remote payloads"
         );
     }
 
