@@ -46,6 +46,7 @@ Optional env:
   QUIET_POLL_SECS=1
   IPERF_BUSY_RETRIES=3      retry each iperf sub-run when Target reports "server is busy"
   IPERF_BUSY_WAIT_SECS=5    seconds to wait between iperf busy retries
+  MINI_VPN_TUIC_TCP_POOL=1  opt-in TUIC TCP connection pool experiment
 
 Output:
   /tmp/conn/mvpn_knife14c_usclient_suite_<timestamp>.md
@@ -508,6 +509,7 @@ export MINI_VPN_TCP_DIAG="${MINI_VPN_TCP_DIAG:-1}"
 export MINI_VPN_TUIC_CC="${MINI_VPN_TUIC_CC:-cubic}"
 export MINI_VPN_TUIC_UDP_MODE="${MINI_VPN_TUIC_UDP_MODE:-native}"
 export MINI_VPN_TUIC_ZERO_RTT="${MINI_VPN_TUIC_ZERO_RTT:-false}"
+export MINI_VPN_TUIC_TCP_POOL="${MINI_VPN_TUIC_TCP_POOL:-1}"
 
 case "$MINI_VPN_TUIC_SERVER" in
   *:*)
@@ -525,6 +527,7 @@ append "- MINI_VPN_TCP_DIAG=$MINI_VPN_TCP_DIAG"
 append "- MINI_VPN_TUIC_CC=$MINI_VPN_TUIC_CC"
 append "- MINI_VPN_TUIC_UDP_MODE=$MINI_VPN_TUIC_UDP_MODE"
 append "- MINI_VPN_TUIC_ZERO_RTT=$MINI_VPN_TUIC_ZERO_RTT"
+append "- MINI_VPN_TUIC_TCP_POOL=$MINI_VPN_TUIC_TCP_POOL"
 
 if [[ "$MINI_VPN_TUIC_ALPN" != "h3" ]]; then
   warn "MINI_VPN_TUIC_ALPN=$MINI_VPN_TUIC_ALPN, but current sing-box config says h3."
@@ -601,8 +604,9 @@ append ""
 append "## Start mini_vpn client-tun"
 : > "$CLIENT_LOG"
 append "- client_log: $CLIENT_LOG"
-append "- command: sudo -E env MINI_VPN_TUN_MTU=$MTU MINI_VPN_TCP_DIAG=$MINI_VPN_TCP_DIAG MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS=$METRICS_SECS $BIN client-tun"
-sudo -E env MINI_VPN_TUN_MTU="$MTU" MINI_VPN_TCP_DIAG="$MINI_VPN_TCP_DIAG" MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS="$METRICS_SECS" \
+append "- command: sudo -E env MINI_VPN_TUN_MTU=$MTU MINI_VPN_TCP_DIAG=$MINI_VPN_TCP_DIAG MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS=$METRICS_SECS MINI_VPN_TUIC_TCP_POOL=$MINI_VPN_TUIC_TCP_POOL $BIN client-tun"
+sudo -E env MINI_VPN_TUN_MTU="$MTU" MINI_VPN_TCP_DIAG="$MINI_VPN_TCP_DIAG" MINI_VPN_PROFILE_LOOP=1 \
+  MINI_VPN_METRICS_SECS="$METRICS_SECS" MINI_VPN_TUIC_TCP_POOL="$MINI_VPN_TUIC_TCP_POOL" \
   "$BIN" client-tun > "$CLIENT_LOG" 2>&1 &
 VPN_PID=$!
 append "- launcher_pid: $VPN_PID"
