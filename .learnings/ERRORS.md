@@ -1,5 +1,20 @@
 # Errors
 
+## 2026-07-03 — Client↔Target direct baseline is insufficient for tunnel reverse
+
+- Log bundle: `/tmp/mini_vpn/mvpn_knife14ad_usclient_suite_20260703_183503.tar.gz`
+- Tested commit: `33659c9`
+- Symptom: direct `.77 -> .27` reverse reached 268 Mbit/s, but tunnel reverse
+  stayed around 15-22 Mbit/s. The new diagnostics showed reverse data did reach
+  the client (`remote_to_global_rx_bytes` grew to tens of MB), so the failure was
+  no longer the old "no server bytes at all" branch.
+- Rejected assumption: a healthy Client↔Target direct reverse baseline proves
+  the reverse path used by the tunnel is healthy.
+- Correct behavior: also measure Exit↔Target from `.33`, especially `.77 -> .33`
+  via `iperf3 -R`, because tunnel reverse is Target→Exit→TUIC→Client. Without
+  this baseline, server/path attribution and client data-plane attribution are
+  mixed.
+
 ## 2026-07-03 — `cargo fmt --check` is noisy on the current historical tree
 
 - Stage: Knife14ad local verification after adding stream-level diagnostics.

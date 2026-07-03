@@ -45,6 +45,11 @@ Optional env:
   DIRECT_IPERF_TIMEOUT=8s
   DIRECT_IPERF_REVERSE_CHECK=1   direct Target iperf3 -R baseline before routing Target into TUN
   DIRECT_IPERF_REVERSE_REQUIRED=1 fail when the direct reverse check command fails; set 0 to warn
+  EXIT_TO_TARGET_IPERF_CHECK=0    optionally SSH to Exit and test Exit<->Target iperf path
+  EXIT_TO_TARGET_IPERF_REQUIRED=1 fail when enabled Exit<->Target check fails; set 0 to warn
+  EXIT_SSH_HOST=""                SSH destination for Exit, e.g. ubuntu@43.153.32.33
+  EXIT_SSH_PORT=22
+  EXIT_SSH_KEY=""                 optional private key for Exit SSH
   RUN_REVERSE_FIRST_P1=0   run a fresh reverse-only P1 probe before the normal forward-first probe
   WAIT_QUIET_BEFORE_FULL=1  after standalone P1, wait for active relays to drop before full sweep
   QUIET_TIMEOUT_SECS=20
@@ -93,6 +98,11 @@ DIRECT_IPERF_DURATION="${DIRECT_IPERF_DURATION:-1}"
 DIRECT_IPERF_TIMEOUT="${DIRECT_IPERF_TIMEOUT:-8s}"
 DIRECT_IPERF_REVERSE_CHECK="${DIRECT_IPERF_REVERSE_CHECK:-1}"
 DIRECT_IPERF_REVERSE_REQUIRED="${DIRECT_IPERF_REVERSE_REQUIRED:-1}"
+EXIT_TO_TARGET_IPERF_CHECK="${EXIT_TO_TARGET_IPERF_CHECK:-0}"
+EXIT_TO_TARGET_IPERF_REQUIRED="${EXIT_TO_TARGET_IPERF_REQUIRED:-1}"
+EXIT_SSH_HOST="${EXIT_SSH_HOST:-}"
+EXIT_SSH_PORT="${EXIT_SSH_PORT:-22}"
+EXIT_SSH_KEY="${EXIT_SSH_KEY:-}"
 RUN_REVERSE_FIRST_P1="${RUN_REVERSE_FIRST_P1:-0}"
 WAIT_QUIET_BEFORE_FULL="${WAIT_QUIET_BEFORE_FULL:-1}"
 QUIET_TIMEOUT_SECS="${QUIET_TIMEOUT_SECS:-20}"
@@ -393,6 +403,69 @@ cleanup_stale_target_tun_route() {
   run_cmd ip route get "$TARGET" || true
 }
 
+run_exit_ssh_cmd() {
+  local remote_cmd="$1"
+  local -a ssh_cmd=(ssh -o BatchMode=yes -o ConnectTimeout=8)
+  if [[ -n "$EXIT_SSH_KEY" ]]; then
+    ssh_cmd+=(-i "$EXIT_SSH_KEY")
+  fi
+  if [[ -n "$EXIT_SSH_PORT" ]]; then
+    ssh_cmd+=(-p "$EXIT_SSH_PORT")
+  fi
+  ssh_cmd+=("$EXIT_SSH_HOST" "$remote_cmd")
+  run_cmd "${ssh_cmd[@]}"
+}
+
+preflight_exit_to_target_path() {
+  append ""
+  append "### Exit VPS ↔ Target VPS iperf3 Path (${EXIT_HOST} ↔ ${TARGET}:${IPERF_PORT})"
+  append "- exit_to_target_iperf_check: $EXIT_TO_TARGET_IPERF_CHECK"
+  append "- exit_to_target_iperf_required: $EXIT_TO_TARGET_IPERF_REQUIRED"
+  append "- exit_ssh_host: ${EXIT_SSH_HOST:-<unset>}"
+
+  if [[ "$EXIT_TO_TARGET_IPERF_CHECK" != "1" ]]; then
+    append "skipped because EXIT_TO_TARGET_IPERF_CHECK=$EXIT_TO_TARGET_IPERF_CHECK"
+    append "manual commands to run on Exit VPS (${EXIT_HOST}) if reverse tunnel remains low:"
+    append_block bash \
+      "timeout $DIRECT_IPERF_TIMEOUT iperf3 -c $TARGET -p $IPERF_PORT -t $DIRECT_IPERF_DURATION -P 1" \
+      "timeout $DIRECT_IPERF_TIMEOUT iperf3 -c $TARGET -p $IPERF_PORT -t $DIRECT_IPERF_DURATION -P 1 -R"
+    return 0
+  fi
+
+  if [[ -z "$EXIT_SSH_HOST" ]]; then
+    if [[ "$EXIT_TO_TARGET_IPERF_REQUIRED" == "1" ]]; then
+      fail "EXIT_TO_TARGET_IPERF_CHECK=1 需要设置 EXIT_SSH_HOST，例如 EXIT_SSH_HOST=ubuntu@${EXIT_HOST}。"
+    fi
+    warn "EXIT_TO_TARGET_IPERF_CHECK=1 but EXIT_SSH_HOST is empty; skipping Exit↔Target path check."
+    return 0
+  fi
+
+  local remote_preflight="command -v iperf3 >/dev/null && command -v timeout >/dev/null && ip route get $TARGET"
+  if ! run_exit_ssh_cmd "$remote_preflight"; then
+    if [[ "$EXIT_TO_TARGET_IPERF_REQUIRED" == "1" ]]; then
+      fail "Exit VPS SSH/path preflight failed. 请确认 EXIT_SSH_HOST/KEY/PORT、.33 上 iperf3/timeout 是否可用，以及 .33 到 .77 是否有路由。"
+    fi
+    warn "Exit VPS SSH/path preflight failed; continuing without Exit↔Target attribution."
+    return 0
+  fi
+
+  local remote_forward="timeout $DIRECT_IPERF_TIMEOUT iperf3 -c $TARGET -p $IPERF_PORT -t $DIRECT_IPERF_DURATION -P 1"
+  if ! run_exit_ssh_cmd "$remote_forward"; then
+    if [[ "$EXIT_TO_TARGET_IPERF_REQUIRED" == "1" ]]; then
+      fail "Exit VPS -> Target VPS direct iperf3 failed. 请检查 .33 -> .77 路由、安全组或 .77 iperf3 服务。"
+    fi
+    warn "Exit VPS -> Target VPS direct iperf3 failed; continuing but forward tunnel attribution is incomplete."
+  fi
+
+  local remote_reverse="timeout $DIRECT_IPERF_TIMEOUT iperf3 -c $TARGET -p $IPERF_PORT -t $DIRECT_IPERF_DURATION -P 1 -R"
+  if ! run_exit_ssh_cmd "$remote_reverse"; then
+    if [[ "$EXIT_TO_TARGET_IPERF_REQUIRED" == "1" ]]; then
+      fail "Target VPS -> Exit VPS direct iperf3 -R failed/low. 反向隧道验收无法归因；请检查 .77 -> .33 路由、安全组或 VPS provider path。"
+    fi
+    warn "Target VPS -> Exit VPS direct iperf3 -R failed; continuing but reverse tunnel attribution is incomplete."
+  fi
+}
+
 preflight_vps_services() {
   append ""
   append "## VPS Service Preflight"
@@ -401,6 +474,9 @@ preflight_vps_services() {
   append "- direct_iperf_duration_secs: $DIRECT_IPERF_DURATION"
   append "- direct_iperf_reverse_check: $DIRECT_IPERF_REVERSE_CHECK"
   append "- direct_iperf_reverse_required: $DIRECT_IPERF_REVERSE_REQUIRED"
+  append "- exit_to_target_iperf_check: $EXIT_TO_TARGET_IPERF_CHECK"
+  append "- exit_to_target_iperf_required: $EXIT_TO_TARGET_IPERF_REQUIRED"
+  append "- exit_ssh_host: ${EXIT_SSH_HOST:-<unset>}"
 
   append ""
   append "### Exit VPS Reachability (${EXIT_HOST})"
@@ -436,6 +512,8 @@ preflight_vps_services() {
     append "### Target VPS iperf3 Reverse Baseline (${TARGET})"
     append "skipped because DIRECT_IPERF_REVERSE_CHECK=$DIRECT_IPERF_REVERSE_CHECK"
   fi
+
+  preflight_exit_to_target_path
 }
 
 route_target_into_tun() {
@@ -607,6 +685,9 @@ require_cmd sed "sudo apt update && sudo apt install -y sed" || missing=1
 require_cmd tar "sudo apt update && sudo apt install -y tar" || missing=1
 if [[ "$CHECK_VPS_SERVICES" == "1" ]]; then
   require_cmd timeout "sudo apt update && sudo apt install -y coreutils" || missing=1
+fi
+if [[ "$CHECK_VPS_SERVICES" == "1" && "$EXIT_TO_TARGET_IPERF_CHECK" == "1" ]]; then
+  require_cmd ssh "sudo apt update && sudo apt install -y openssh-client" || missing=1
 fi
 if ! command_status dig; then
   warn "dig not found; fake-IP DNS gold check will be skipped by the probe. fix: sudo apt install -y dnsutils"

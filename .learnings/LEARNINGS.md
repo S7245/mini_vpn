@@ -1,5 +1,34 @@
 # Learnings
 
+## 2026-07-03 — Knife14ad: reverse now has bytes; missing baseline is Exit↔Target
+
+`33659c9` was tested with
+`/tmp/mini_vpn/mvpn_knife14ad_usclient_suite_20260703_183503.tar.gz`. The suite
+completed and the new stream-level diagnostics worked. Client-to-target direct
+baselines were healthy (`.27 -> .77` 276 Mbit/s receiver, `.77 -> .27` 268
+Mbit/s receiver). Tunnel fresh reverse-first improved from the earlier Kbit/s
+failure to 22.4 Mbit/s receiver, but it is still far below the direct reverse
+baseline. Later reverse P1 samples stayed around 15.8-20.8 Mbit/s, while full
+forward P1 reached 191 Mbit/s receiver.
+
+The new `tcp-relay-live` lines prove reverse is no longer "server sends
+nothing": the data flow accumulated tens of MB of
+`remote_to_global_rx_bytes`, `tcp-global-rx-pressure` did not fire, and
+client loop CPU stayed low. The remaining attribution gap is the actual tunnel
+reverse pre-exit path: `.77 -> .33`. The suite had only proven `.77 -> .27`,
+which is not the same route.
+
+Knife14ad follow-up adds an optional Exit-to-Target SSH preflight to
+`scripts/knife14b-usclient-tunnel-suite.sh`. Reusable rule: for a TUIC exit
+proxy, direct client-target baselines are necessary but not sufficient. Reverse
+tunnel attribution also needs `.33 <-> .77` direct iperf from the exit host
+before changing mini_vpn data-plane code.
+
+Stage code-review found and fixed one harness usability edge case: only require
+the local `ssh` command when `CHECK_VPS_SERVICES=1` and the Exit-to-Target
+preflight is enabled, because disabled service preflight will not run the SSH
+check.
+
 ## 2026-07-03 — Knife14ac: fresh reverse is still dead; add stream-level diagnostics
 
 `74d3d0a` was tested with
