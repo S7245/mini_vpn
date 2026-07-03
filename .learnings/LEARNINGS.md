@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-07-03 — Knife14af2: stale TCP pool reconnect acceptance passed
+
+`7c683b0` was tested from `.27` with
+`/tmp/mini_vpn/mvpn_knife14af2_usclient_suite_20260703_214744.tar.gz` after
+restarting `.33` sing-box. The suite exited successfully. The final full reverse
+P1 no longer failed with `conn=1 closed=TimedOut` or 0-byte iperf; it refreshed
+the stale extra pool slot first:
+`tuic-tcp-pool-reconnect conn=1 reason=stale_tcp_pool_slot`.
+
+Observed throughput after the fix:
+
+- reverse-first P1: 30.9 Mbit/s receiver
+- standalone forward P1: 2.93 Mbit/s receiver
+- standalone reverse P1: 26.7 Mbit/s receiver
+- full forward P1: 191 Mbit/s receiver
+- full reverse P1: 23.1 Mbit/s receiver
+
+The stale-slot acceptance is satisfied, but the next bottleneck is now a
+different branch: throughput variance with local write pressure and QUIC
+loss/congestion on one TCP pool connection. Keep the next stage focused on
+pressure/loss rather than reopening the stale pool diagnosis.
+
 ## 2026-07-03 — Knife14ae3: reverse throughput recovered; stale TCP pool slot remains
 
 After fixing Exit SSH and restarting `.33` sing-box, `ebd3567` was tested with

@@ -1,5 +1,23 @@
 # Errors
 
+## 2026-07-03 — TUN discovery awk regex must not double-escape `/`
+
+- Symptom: `knife14af2` printed `awk: syntax error` while discovering `tun0`,
+  but continued through the fallback path and completed the suite.
+- Root cause: an awk program inside single quotes used `\\//`; awk received an
+  extra backslash before `/`.
+- Correct behavior: use `\//` inside the single-quoted awk regex, matching the
+  earlier stale-TUN cleanup code.
+
+## 2026-07-03 — VPS `/tmp` mode can break acceptance before code runs
+
+- Symptom: the first `knife14af` attempt on `.27` failed before build/suite with
+  `mkdir: cannot create directory '/tmp': Permission denied`.
+- Root cause: `.27` had `/tmp` as `drwx------ root root` instead of the standard
+  sticky world-writable mode.
+- Correct behavior: repair the host with `sudo chmod 1777 /tmp`, then create and
+  chown the suite output directory before rerunning.
+
 ## 2026-07-03 — Use cargo fmt for file-level Rust formatting in this 2024-edition repo
 
 - Symptom: running bare `rustfmt src/tuic.rs` failed with Rust 2015 parsing

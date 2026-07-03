@@ -531,7 +531,7 @@ preflight_vps_services() {
 }
 
 route_target_into_tun() {
-  TUN_IF="$(ip -o -4 addr show | awk '$4 ~ /^10[.]0[.]0[.]1\\// {print $2; exit}')"
+  TUN_IF="$(ip -o -4 addr show | awk '$4 ~ /^10[.]0[.]0[.]1\// {print $2; exit}')"
   if [[ -z "$TUN_IF" ]]; then
     TUN_IF="$(ip -brief addr | awk '/10[.]0[.]0[.]1/ {print $1; exit}')"
   fi
