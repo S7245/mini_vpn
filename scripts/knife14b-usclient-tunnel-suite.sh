@@ -43,6 +43,8 @@ Optional env:
   EXIT_PING_TIMEOUT=2
   DIRECT_IPERF_DURATION=1   direct Target iperf3 service check duration before routing Target into TUN
   DIRECT_IPERF_TIMEOUT=8s
+  DIRECT_IPERF_REVERSE_CHECK=1   direct Target iperf3 -R baseline before routing Target into TUN
+  DIRECT_IPERF_REVERSE_REQUIRED=1 fail when the direct reverse check command fails; set 0 to warn
   WAIT_QUIET_BEFORE_FULL=1  after standalone P1, wait for active relays to drop before full sweep
   QUIET_TIMEOUT_SECS=20
   QUIET_POLL_SECS=1
@@ -86,13 +88,26 @@ EXIT_PING_COUNT="${EXIT_PING_COUNT:-3}"
 EXIT_PING_TIMEOUT="${EXIT_PING_TIMEOUT:-2}"
 DIRECT_IPERF_DURATION="${DIRECT_IPERF_DURATION:-1}"
 DIRECT_IPERF_TIMEOUT="${DIRECT_IPERF_TIMEOUT:-8s}"
+DIRECT_IPERF_REVERSE_CHECK="${DIRECT_IPERF_REVERSE_CHECK:-1}"
+DIRECT_IPERF_REVERSE_REQUIRED="${DIRECT_IPERF_REVERSE_REQUIRED:-1}"
 WAIT_QUIET_BEFORE_FULL="${WAIT_QUIET_BEFORE_FULL:-1}"
 QUIET_TIMEOUT_SECS="${QUIET_TIMEOUT_SECS:-20}"
 QUIET_POLL_SECS="${QUIET_POLL_SECS:-1}"
 IPERF_BUSY_RETRIES="${IPERF_BUSY_RETRIES:-3}"
 IPERF_BUSY_WAIT_SECS="${IPERF_BUSY_WAIT_SECS:-5}"
 
-mkdir -p "$OUT_DIR"
+if ! mkdir -p "$OUT_DIR"; then
+  echo "ERROR: cannot create OUT_DIR=$OUT_DIR" >&2
+  echo "fix: sudo mkdir -p '$OUT_DIR' && sudo chown -R \"\$(id -u):\$(id -g)\" '$OUT_DIR'" >&2
+  exit 1
+fi
+OUT_DIR_WRITE_PROBE="$OUT_DIR/.mvpn_write_probe_$$"
+if ! touch "$OUT_DIR_WRITE_PROBE" >/dev/null 2>&1; then
+  echo "ERROR: OUT_DIR is not writable by the current user: $OUT_DIR" >&2
+  echo "fix: sudo chown -R \"\$(id -u):\$(id -g)\" '$OUT_DIR' && chmod u+rwx '$OUT_DIR'" >&2
+  exit 1
+fi
+rm -f "$OUT_DIR_WRITE_PROBE"
 REPORT="$OUT_DIR/mvpn_${SUITE_TAG}_usclient_suite_${TS}.md"
 if [[ -n "$CC_VARIANT_LABEL" ]]; then
   CLIENT_LOG="$OUT_DIR/mvpn_accept_${CC_VARIANT_LABEL}_${TS}.log"
@@ -379,6 +394,9 @@ preflight_vps_services() {
   append "## VPS Service Preflight"
   append "- exit_vps: ${EXIT_HOST}:${EXIT_PORT}（TUIC/sing-box；UDP 服务由后续 mini_vpn handshake 做强校验）"
   append "- target_vps: ${TARGET}:${IPERF_PORT}（iperf3）"
+  append "- direct_iperf_duration_secs: $DIRECT_IPERF_DURATION"
+  append "- direct_iperf_reverse_check: $DIRECT_IPERF_REVERSE_CHECK"
+  append "- direct_iperf_reverse_required: $DIRECT_IPERF_REVERSE_REQUIRED"
 
   append ""
   append "### Exit VPS Reachability (${EXIT_HOST})"
@@ -398,6 +416,22 @@ preflight_vps_services() {
   run_cmd timeout "$DIRECT_IPERF_TIMEOUT" \
     iperf3 -c "$TARGET" -p "$IPERF_PORT" -t "$DIRECT_IPERF_DURATION" -P 1 || \
     fail "Target VPS ${TARGET}:${IPERF_PORT} direct iperf3 检查失败。请登录 .77 检查或重启 iperf3 服务，例如：sudo systemctl status iperf3 --no-pager；sudo systemctl restart iperf3（或确认手动 iperf3 -s -p ${IPERF_PORT} 正在运行）。"
+
+  if [[ "$DIRECT_IPERF_REVERSE_CHECK" == "1" ]]; then
+    append ""
+    append "### Target VPS iperf3 Reverse Baseline (${TARGET})"
+    if ! run_cmd timeout "$DIRECT_IPERF_TIMEOUT" \
+      iperf3 -c "$TARGET" -p "$IPERF_PORT" -t "$DIRECT_IPERF_DURATION" -P 1 -R; then
+      if [[ "$DIRECT_IPERF_REVERSE_REQUIRED" == "1" ]]; then
+        fail "Target VPS ${TARGET}:${IPERF_PORT} direct iperf3 -R 检查失败。反向隧道验收无法归因；请检查 .77 iperf3 服务、Client<->Target 路由/安全组，或临时设置 DIRECT_IPERF_REVERSE_REQUIRED=0 继续采样。"
+      fi
+      warn "Target VPS ${TARGET}:${IPERF_PORT} direct iperf3 -R 检查失败；继续运行，但 reverse tunnel 结果只能作为参考。"
+    fi
+  else
+    append ""
+    append "### Target VPS iperf3 Reverse Baseline (${TARGET})"
+    append "skipped because DIRECT_IPERF_REVERSE_CHECK=$DIRECT_IPERF_REVERSE_CHECK"
+  fi
 }
 
 route_target_into_tun() {

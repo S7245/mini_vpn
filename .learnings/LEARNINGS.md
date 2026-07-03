@@ -1,5 +1,28 @@
 # Learnings
 
+## 2026-07-03 — Knife14z: BBR improves forward, reverse still needs direct -R attribution
+
+`1b6f2d8` was tested with
+`/tmp/mvpn_knife14z_usclient_suite_20260703_154429.tar.gz`. The CC sweep harness
+worked: Cubic and BBR ran as fresh child suites with separate reports, bundles,
+and `mvpn_accept_<cc>_<timestamp>.log` files.
+
+The result split the problem. BBR materially improved forward throughput on this
+US-client path: standalone P1 reached 192 Mbit/s, full P2 reached 192 Mbit/s,
+and full P4 reached 150 Mbit/s, while Cubic stayed around 1-27 Mbit/s. That
+confirms Cubic/path congestion is a real forward bottleneck here. But BBR is not
+a complete acceptance fix: full P8 still collapsed to 18.6 Mbit/s, and reverse
+remained Kbit/s-scale for both CC variants.
+
+The existing suite only had a direct forward `.77:5201` iperf preflight. Add a
+direct `iperf3 -R` baseline before routing `.77` into the TUN so future reverse
+failures can be attributed to target/path/service versus tunnel data-plane
+logic.
+
+Reusable rule: do not promote BBR to a global default from forward-only wins.
+For mixed TCP/UDP VPN goals, keep CC/profile decisions explicit until forward,
+reverse, P8, and UDP acceptance all have matching evidence.
+
 ## 2026-07-03 — Knife14z: run congestion-control A/B after knife14y stats
 
 `f7deb9b` was tested with

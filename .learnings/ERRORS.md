@@ -1,5 +1,22 @@
 # Errors
 
+## 2026-07-03 — Knife14z reverse results lacked a direct reverse baseline
+
+- Log bundle: `/tmp/mvpn_knife14z_usclient_suite_20260703_154429.tar.gz`
+- Tested commit: `1b6f2d8`
+- Symptom: Cubic and BBR both showed Kbit/s-scale reverse tunnel results, while
+  the suite only proved direct forward `.77:5201` iperf was healthy.
+- Important discriminator: BBR dramatically improved forward P1/P2/P4, so the
+  remaining reverse failure cannot be explained by "Cubic only" or by the CC
+  sweep wrapper itself.
+- Rejected assumption: a healthy direct forward iperf preflight is enough to
+  attribute reverse tunnel collapse to relay/TUIC code.
+- Correct behavior: measure direct `iperf3 -R` before the target route is moved
+  into the TUN. If the command fails, stop or explicitly mark reverse tunnel
+  results as degraded evidence.
+- Future debugging rule: every reverse tunnel acceptance bundle needs a direct
+  reverse baseline recorded before the tunnel starts.
+
 ## 2026-07-03 — Local CC sweep smoke stops at the host guard on macOS
 
 - Command pattern:
