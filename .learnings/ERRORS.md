@@ -1,5 +1,23 @@
 # Errors
 
+## 2026-07-03 — Knife14ab disproved socket buffer as sufficient reverse fix
+
+- Log bundle: `/tmp/mini_vpn/mvpn_knife14ab_usclient_suite_20260703_172934.tar.gz`
+- Tested commit: `3af4f7c`
+- Symptom: 1MiB smoltcp TCP socket buffers were confirmed in the startup log and
+  forward throughput improved, but tunnel reverse remained only 17-32 Mbit/s
+  while direct reverse was 281 Mbit/s.
+- Important discriminator: client-side `send_slice_zero`/`send_slice_errors`
+  stayed zero, and reverse throughput was bursty with long zero-throughput
+  windows. This is not the same as the pre-knife14ab 64KiB local socket-window
+  hypothesis.
+- Rejected assumption: after raising smoltcp socket buffers, any remaining
+  reverse failure should be fixed by increasing the same buffers again.
+- Correct behavior: run a fresh reverse-only P1 probe before any forward pressure
+  and test with an explicit TUIC TCP connection pool. If fresh reverse is still
+  low, collect `.33`/sing-box or path-level evidence for server-side/downlink
+  QUIC behavior.
+
 ## 2026-07-03 — Knife14aa showed healthy direct reverse but tiny tunnel reverse
 
 - Log bundle: `/tmp/mini_vpn/mvpn_knife14aa_usclient_suite_20260703_162932.tar.gz`

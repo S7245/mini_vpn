@@ -45,12 +45,13 @@ Optional env:
   DIRECT_IPERF_TIMEOUT=8s
   DIRECT_IPERF_REVERSE_CHECK=1   direct Target iperf3 -R baseline before routing Target into TUN
   DIRECT_IPERF_REVERSE_REQUIRED=1 fail when the direct reverse check command fails; set 0 to warn
+  RUN_REVERSE_FIRST_P1=0   run a fresh reverse-only P1 probe before the normal forward-first probe
   WAIT_QUIET_BEFORE_FULL=1  after standalone P1, wait for active relays to drop before full sweep
   QUIET_TIMEOUT_SECS=20
   QUIET_POLL_SECS=1
   IPERF_BUSY_RETRIES=3      retry each iperf sub-run when Target reports "server is busy"
   IPERF_BUSY_WAIT_SECS=5    seconds to wait between iperf busy retries
-  MINI_VPN_TUIC_TCP_POOL=1  opt-in TUIC TCP connection pool experiment
+  MINI_VPN_TUIC_TCP_POOL=1  TUIC TCP connection pool; set >1 to isolate concurrent flow congestion
   MINI_VPN_TCP_RX_BUFFER_BYTES=1048576
   MINI_VPN_TCP_TX_BUFFER_BYTES=1048576
   MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=2097120
@@ -92,6 +93,7 @@ DIRECT_IPERF_DURATION="${DIRECT_IPERF_DURATION:-1}"
 DIRECT_IPERF_TIMEOUT="${DIRECT_IPERF_TIMEOUT:-8s}"
 DIRECT_IPERF_REVERSE_CHECK="${DIRECT_IPERF_REVERSE_CHECK:-1}"
 DIRECT_IPERF_REVERSE_REQUIRED="${DIRECT_IPERF_REVERSE_REQUIRED:-1}"
+RUN_REVERSE_FIRST_P1="${RUN_REVERSE_FIRST_P1:-0}"
 WAIT_QUIET_BEFORE_FULL="${WAIT_QUIET_BEFORE_FULL:-1}"
 QUIET_TIMEOUT_SECS="${QUIET_TIMEOUT_SECS:-20}"
 QUIET_POLL_SECS="${QUIET_POLL_SECS:-1}"
@@ -476,6 +478,7 @@ run_lowrtt_probe() {
   local label="$1"
   local parallel="$2"
   local duration="$3"
+  local probe_order="${4:-forward-first}"
   local probe_out="$OUT_DIR/mvpn_${SUITE_TAG}_usclient_tunnel_${label}_${TS}.md"
   ARTIFACTS+=("$probe_out")
 
@@ -484,6 +487,7 @@ run_lowrtt_probe() {
   append "- out: $probe_out"
   append "- parallel_set: $parallel"
   append "- duration: ${duration}s"
+  append "- probe_order: $probe_order"
   append "- client_log: $CLIENT_LOG"
 
   run_cmd env \
@@ -491,6 +495,7 @@ run_lowrtt_probe() {
     OUT="$probe_out" \
     PARALLEL_SET="$parallel" \
     DURATION="$duration" \
+    PROBE_ORDER="$probe_order" \
     IPERF_BUSY_RETRIES="$IPERF_BUSY_RETRIES" \
     IPERF_BUSY_WAIT_SECS="$IPERF_BUSY_WAIT_SECS" \
     bash "$LOWRTT_SCRIPT" "$TARGET" "$IPERF_PORT"
@@ -681,6 +686,7 @@ append "- MINI_VPN_TCP_DIAG=$MINI_VPN_TCP_DIAG"
 append "- MINI_VPN_TUIC_CC=$MINI_VPN_TUIC_CC"
 append "- CC_SWEEP=${CC_SWEEP:-<single>}"
 append "- CC_VARIANT_LABEL=${CC_VARIANT_LABEL:-<none>}"
+append "- RUN_REVERSE_FIRST_P1=$RUN_REVERSE_FIRST_P1"
 append "- MINI_VPN_TUIC_UDP_MODE=$MINI_VPN_TUIC_UDP_MODE"
 append "- MINI_VPN_TUIC_ZERO_RTT=$MINI_VPN_TUIC_ZERO_RTT"
 append "- MINI_VPN_TUIC_TCP_POOL=$MINI_VPN_TUIC_TCP_POOL"
@@ -857,26 +863,50 @@ append "## Verified Test MTU"
 run_cmd ip link show "$TUN_IF" || true
 route_target_into_tun
 
-run_lowrtt_probe "mtu${MTU}_p1" "1" "$DURATION" || true
+proceed_to_standard_p1=1
+if [[ "$RUN_REVERSE_FIRST_P1" == "1" ]]; then
+  run_lowrtt_probe "mtu${MTU}_reverse_first_p1" "1" "$DURATION" "reverse-only" || true
+  REVERSE_FIRST_END_LINE="$(client_log_line_count)"
+  if [[ "$WAIT_QUIET_BEFORE_FULL" == "1" ]]; then
+    if ! wait_for_quiet_tunnel "standard P1 probe" "$REVERSE_FIRST_END_LINE"; then
+      proceed_to_standard_p1=0
+      append ""
+      append "## Standard P1 / Full Sweep Skipped"
+      append "reverse-first P1 后 tunnel 没有在 ${QUIET_TIMEOUT_SECS}s 内确认归零；跳过后续 sweep，避免把旧连接残留误判成吞吐问题。"
+    fi
+  fi
+fi
+
+if [[ "$proceed_to_standard_p1" == "1" ]]; then
+  run_lowrtt_probe "mtu${MTU}_p1" "1" "$DURATION" "forward-first" || true
+else
+  append ""
+  append "## Standard P1 Probe Skipped"
+  append "see reverse-first quiet wait result above."
+fi
 MTU_P1_OUT="$OUT_DIR/mvpn_${SUITE_TAG}_usclient_tunnel_mtu${MTU}_p1_${TS}.md"
 P1_END_LINE="$(client_log_line_count)"
 
-if [[ -f "$MTU_P1_OUT" ]] && probe_has_receiver_result "$MTU_P1_OUT"; then
+if [[ "$proceed_to_standard_p1" == "1" && -f "$MTU_P1_OUT" ]] && probe_has_receiver_result "$MTU_P1_OUT"; then
   if [[ "$WAIT_QUIET_BEFORE_FULL" == "1" ]]; then
     if wait_for_quiet_tunnel "full sweep" "$P1_END_LINE"; then
-      run_lowrtt_probe "mtu${MTU}_full" "$PARALLEL_SET" "$DURATION" || true
+      run_lowrtt_probe "mtu${MTU}_full" "$PARALLEL_SET" "$DURATION" "forward-first" || true
     else
       append ""
       append "## Full Sweep Skipped"
       append "P1 后 tunnel 没有在 ${QUIET_TIMEOUT_SECS}s 内确认归零；跳过 full sweep，避免把旧连接残留误判成 P2/P4 问题。"
     fi
   else
-    run_lowrtt_probe "mtu${MTU}_full" "$PARALLEL_SET" "$DURATION" || true
+    run_lowrtt_probe "mtu${MTU}_full" "$PARALLEL_SET" "$DURATION" "forward-first" || true
   fi
 else
   append ""
   append "## Full Sweep Skipped"
-  append "MTU=$MTU P1 没有 receiver 结果，说明 tunnel 基础连通/iperf 控制连接已经失败；跳过 full sweep，避免浪费时间。"
+  if [[ "$proceed_to_standard_p1" == "1" ]]; then
+    append "MTU=$MTU P1 没有 receiver 结果，说明 tunnel 基础连通/iperf 控制连接已经失败；跳过 full sweep，避免浪费时间。"
+  else
+    append "standard P1 已因 reverse-first quiet wait 未通过而跳过；full sweep 同步跳过。"
+  fi
 fi
 
 append ""

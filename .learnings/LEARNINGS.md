@@ -1,5 +1,32 @@
 # Learnings
 
+## 2026-07-03 — Knife14ab: 1MiB TCP socket buffers helped forward but not reverse
+
+`3af4f7c` was tested with
+`/tmp/mini_vpn/mvpn_knife14ab_usclient_suite_20260703_172934.tar.gz`. The user
+message mentioned `7621bc6`, but the report's `repo_commit` and git snapshot
+both show `3af4f7c`.
+
+The socket-buffer change was applied correctly: the startup log printed
+`TCP socket buffers: rx=1048576B tx=1048576B`. Direct baselines were healthy
+again (`.77` forward receiver 276 Mbit/s, reverse receiver 281 Mbit/s). Tunnel
+forward improved materially: standalone P1 reached 190 Mbit/s, and full
+P2/P4/P8 reached 192/150/163 Mbit/s receiver.
+
+Reverse did not recover: standalone P1 was 20.7 Mbit/s, and full P1/P2/P4/P8
+were 17.5/26.2/32.2/26.5 Mbit/s. `send_slice_zero` and `send_slice_errors`
+remained zero, so the next attribution branch is not "keep increasing smoltcp
+socket buffer." The current probe always runs forward before reverse on the same
+client process/TUIC connection, so it cannot distinguish intrinsic `.33 -> .27`
+reverse weakness from same-connection congestion-state pollution after forward
+pressure.
+
+Knife14ac adds a reverse-only P1 probe order and a parent-suite
+`RUN_REVERSE_FIRST_P1` gate. Reusable rule: once enlarged local TCP socket
+buffers are confirmed but reverse remains bursty, run a fresh reverse-first
+probe and a multi-connection acceptance run before asking for server logs or
+changing protocol internals.
+
 ## 2026-07-03 — Knife14aa: direct reverse is healthy; test TCP socket buffer BDP next
 
 `7621bc6` was tested with

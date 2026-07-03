@@ -3,8 +3,8 @@
 # Requires an already-running tunnel started with:
 #   sudo -E MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS=5 bash scripts/knife35-acceptance.sh soak
 #
-# This script does not implement or test a connection pool. It records the single-connection baseline
-# needed to decide whether a pool is worth building.
+# This script drives iperf through an already-running tunnel. Connection-pool behavior is configured
+# by the parent mini_vpn process; this probe only controls traffic direction/order.
 
 set -euo pipefail
 
@@ -23,6 +23,8 @@ env:
   UDP_LEN=1200             UDP datagram payload length
   IPERF_BUSY_RETRIES=3     retry an iperf command when the target server is busy
   IPERF_BUSY_WAIT_SECS=5   seconds to wait between busy retries
+  PROBE_ORDER=forward-first
+                            forward-first | reverse-first | forward-only | reverse-only
 USAGE
 }
 
@@ -51,8 +53,17 @@ UDP_BW="${UDP_BW:-90M}"
 UDP_LEN="${UDP_LEN:-1200}"
 IPERF_BUSY_RETRIES="${IPERF_BUSY_RETRIES:-3}"
 IPERF_BUSY_WAIT_SECS="${IPERF_BUSY_WAIT_SECS:-5}"
+PROBE_ORDER="${PROBE_ORDER:-forward-first}"
 OUT="${OUT:-/tmp/mvpn_knife14b_lowrtt_$(date +%Y%m%d_%H%M%S).md}"
 METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tcp-local-write-pressure|tcp-downlink-backpressure'
+
+case "$PROBE_ORDER" in
+  forward-first|reverse-first|forward-only|reverse-only) ;;
+  *)
+    echo "invalid PROBE_ORDER=$PROBE_ORDER (expected forward-first|reverse-first|forward-only|reverse-only)" >&2
+    exit 2
+    ;;
+esac
 
 append_cmd() {
   {
@@ -201,6 +212,7 @@ append_iperf_cmd() {
   echo "- iperf_timeout: ${IPERF_TIMEOUT_SECS}s"
   echo "- iperf_busy_retries: ${IPERF_BUSY_RETRIES}"
   echo "- iperf_busy_wait_secs: ${IPERF_BUSY_WAIT_SECS}"
+  echo "- probe_order: ${PROBE_ORDER}"
   echo "- log: ${LOG}"
   echo
   echo "> 判读前先确认：curl ipinfo.io 必须是 exit IP；dig example.com +short 应是 198.18.x.x；📊 TCP relay 累计应增长。"
@@ -227,17 +239,38 @@ else
   echo "log not found: $LOG" | tee -a "$OUT"
 fi
 
-append_section "TCP Forward Sweep"
-for p in $PARALLEL_SET; do
-  append_iperf_cmd "mini_vpn Metrics during TCP Forward P=$p" \
-    iperf3 -c "$TARGET" -p "$PORT" -t "$DURATION" -P "$p"
-done
+run_tcp_forward_sweep() {
+  append_section "TCP Forward Sweep"
+  for p in $PARALLEL_SET; do
+    append_iperf_cmd "mini_vpn Metrics during TCP Forward P=$p" \
+      iperf3 -c "$TARGET" -p "$PORT" -t "$DURATION" -P "$p"
+  done
+}
 
-append_section "TCP Reverse Sweep"
-for p in $PARALLEL_SET; do
-  append_iperf_cmd "mini_vpn Metrics during TCP Reverse P=$p" \
-    iperf3 -c "$TARGET" -p "$PORT" -t "$DURATION" -P "$p" -R
-done
+run_tcp_reverse_sweep() {
+  append_section "TCP Reverse Sweep"
+  for p in $PARALLEL_SET; do
+    append_iperf_cmd "mini_vpn Metrics during TCP Reverse P=$p" \
+      iperf3 -c "$TARGET" -p "$PORT" -t "$DURATION" -P "$p" -R
+  done
+}
+
+case "$PROBE_ORDER" in
+  forward-first)
+    run_tcp_forward_sweep
+    run_tcp_reverse_sweep
+    ;;
+  reverse-first)
+    run_tcp_reverse_sweep
+    run_tcp_forward_sweep
+    ;;
+  forward-only)
+    run_tcp_forward_sweep
+    ;;
+  reverse-only)
+    run_tcp_reverse_sweep
+    ;;
+esac
 
 if [[ "$RUN_UDP" == "1" || "$RUN_UDP" == "true" ]]; then
   append_section "UDP Forward Sweep"
