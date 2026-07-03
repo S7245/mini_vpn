@@ -26,6 +26,7 @@ Optional env:
   OUT_DIR=/tmp/conn
   DURATION=30
   PARALLEL_SET="1 2 4 8"
+  CC_SWEEP=""                optional space-separated CC variants, e.g. "cubic bbr"; empty keeps single-run behavior
   SUITE_TAG=knife14c        report/bundle filename tag
   MTU=1200                  TUN MTU passed to mini_vpn before client-tun starts
   MINI_VPN_TCP_DIAG=1       emit knife14c per-handle TCP diagnostics
@@ -69,6 +70,9 @@ TARGET="${TARGET:-43.130.32.77}"
 IPERF_PORT="${IPERF_PORT:-5201}"
 DURATION="${DURATION:-30}"
 PARALLEL_SET="${PARALLEL_SET:-1 2 4 8}"
+CC_SWEEP="${CC_SWEEP:-}"
+CC_SWEEP_ACTIVE="${CC_SWEEP_ACTIVE:-0}"
+CC_VARIANT_LABEL="${CC_VARIANT_LABEL:-}"
 MTU="${MTU:-1200}"
 RUN_BASE_MTU_P1="${RUN_BASE_MTU_P1:-0}"
 BUILD_RELEASE="${BUILD_RELEASE:-1}"
@@ -90,7 +94,11 @@ IPERF_BUSY_WAIT_SECS="${IPERF_BUSY_WAIT_SECS:-5}"
 
 mkdir -p "$OUT_DIR"
 REPORT="$OUT_DIR/mvpn_${SUITE_TAG}_usclient_suite_${TS}.md"
-CLIENT_LOG="$OUT_DIR/mvpn_accept_${TS}.log"
+if [[ -n "$CC_VARIANT_LABEL" ]]; then
+  CLIENT_LOG="$OUT_DIR/mvpn_accept_${CC_VARIANT_LABEL}_${TS}.log"
+else
+  CLIENT_LOG="$OUT_DIR/mvpn_accept_${TS}.log"
+fi
 BUNDLE="$OUT_DIR/mvpn_${SUITE_TAG}_usclient_suite_${TS}.tar.gz"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -179,6 +187,77 @@ fail() {
 
 warn() {
   append "- WARN: $*"
+}
+
+cc_variant_label() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_.-]/_/g'
+}
+
+run_cc_sweep_wrapper() {
+  local all_status=0
+  local cc
+  local -a cc_variants
+  read -r -a cc_variants <<< "$CC_SWEEP"
+
+  append ""
+  append "## CC Sweep"
+  append "- cc_sweep: $CC_SWEEP"
+  append "- parent_report: $REPORT"
+  append "- parent_bundle: $BUNDLE"
+  append ""
+  append "Each CC variant is executed by a fresh child suite with its own client log,"
+  append "probe reports, cleanup, and bundle. The parent bundle includes all child"
+  append "artifacts found under $OUT_DIR."
+
+  for cc in "${cc_variants[@]}"; do
+    local label child_tag child_keep status f
+    label="$(cc_variant_label "$cc")"
+    if [[ -z "$label" ]]; then
+      label="cc"
+    fi
+    child_tag="${SUITE_TAG}_${label}"
+    child_keep=0
+
+    append ""
+    append "## CC Variant: $cc"
+    append "- label: $label"
+    append "- child_suite_tag: $child_tag"
+    append '```bash'
+    printf '$ env CC_SWEEP= CC_SWEEP_ACTIVE=1 CC_VARIANT_LABEL=%q MINI_VPN_TUIC_CC=%q SUITE_TAG=%q KEEP_TUNNEL=%q bash %q\n' \
+      "$label" "$cc" "$child_tag" "$child_keep" "$0" | tee -a "$REPORT"
+    append '```'
+
+    set +e
+    env CC_SWEEP= CC_SWEEP_ACTIVE=1 CC_VARIANT_LABEL="$label" \
+      MINI_VPN_TUIC_CC="$cc" SUITE_TAG="$child_tag" KEEP_TUNNEL="$child_keep" \
+      bash "$0" 2>&1 | tee -a "$REPORT"
+    status=${PIPESTATUS[0]}
+    set -u
+
+    append ""
+    append "- child_exit=$status"
+    for f in "$OUT_DIR"/mvpn_"${child_tag}"_* "$OUT_DIR"/mvpn_accept_"${label}"_*.log; do
+      [[ -f "$f" ]] && ARTIFACTS+=("$f")
+    done
+
+    if ((status != 0)); then
+      all_status=$status
+      warn "CC variant $cc failed; stopping sweep so the failure can be inspected before more VPS time is spent."
+      break
+    fi
+  done
+
+  if ((all_status == 0)); then
+    RESULT_STATUS="COMPLETED"
+    append ""
+    append "## Send Back"
+    append "请把这个 parent bundle 发回来："
+    append_block text "$BUNDLE"
+    append "里面包含每个 CC 子 suite 的 report、client log、probe report 和 child bundle。"
+  else
+    RESULT_STATUS="FAILED"
+  fi
+  exit "$all_status"
 }
 
 require_cmd() {
@@ -465,6 +544,10 @@ trap on_exit EXIT
   echo "- client_log: $CLIENT_LOG"
 } > "$REPORT"
 
+if [[ -n "$CC_SWEEP" && "$CC_SWEEP_ACTIVE" != "1" ]]; then
+  run_cc_sweep_wrapper
+fi
+
 append ""
 append "## Environment Checks"
 if [[ "$(uname -s)" != "Linux" ]]; then
@@ -558,6 +641,8 @@ append "- MINI_VPN_UPSTREAM=$MINI_VPN_UPSTREAM"
 append "- MINI_VPN_TUN_MTU=$MINI_VPN_TUN_MTU"
 append "- MINI_VPN_TCP_DIAG=$MINI_VPN_TCP_DIAG"
 append "- MINI_VPN_TUIC_CC=$MINI_VPN_TUIC_CC"
+append "- CC_SWEEP=${CC_SWEEP:-<single>}"
+append "- CC_VARIANT_LABEL=${CC_VARIANT_LABEL:-<none>}"
 append "- MINI_VPN_TUIC_UDP_MODE=$MINI_VPN_TUIC_UDP_MODE"
 append "- MINI_VPN_TUIC_ZERO_RTT=$MINI_VPN_TUIC_ZERO_RTT"
 append "- MINI_VPN_TUIC_TCP_POOL=$MINI_VPN_TUIC_TCP_POOL"
@@ -658,9 +743,10 @@ append ""
 append "## Start mini_vpn client-tun"
 : > "$CLIENT_LOG"
 append "- client_log: $CLIENT_LOG"
-append "- command: sudo -E env MINI_VPN_TUN_MTU=$MTU MINI_VPN_TCP_DIAG=$MINI_VPN_TCP_DIAG MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS=$METRICS_SECS MINI_VPN_TUIC_TCP_POOL=$MINI_VPN_TUIC_TCP_POOL MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES $BIN client-tun"
+append "- command: sudo -E env MINI_VPN_TUN_MTU=$MTU MINI_VPN_TCP_DIAG=$MINI_VPN_TCP_DIAG MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS=$METRICS_SECS MINI_VPN_TUIC_CC=$MINI_VPN_TUIC_CC MINI_VPN_TUIC_TCP_POOL=$MINI_VPN_TUIC_TCP_POOL MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES $BIN client-tun"
 sudo -E env MINI_VPN_TUN_MTU="$MTU" MINI_VPN_TCP_DIAG="$MINI_VPN_TCP_DIAG" MINI_VPN_PROFILE_LOOP=1 \
-  MINI_VPN_METRICS_SECS="$METRICS_SECS" MINI_VPN_TUIC_TCP_POOL="$MINI_VPN_TUIC_TCP_POOL" \
+  MINI_VPN_METRICS_SECS="$METRICS_SECS" MINI_VPN_TUIC_CC="$MINI_VPN_TUIC_CC" \
+  MINI_VPN_TUIC_TCP_POOL="$MINI_VPN_TUIC_TCP_POOL" \
   MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES="$MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES" \
   MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES="$MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES" \
   "$BIN" client-tun > "$CLIENT_LOG" 2>&1 &

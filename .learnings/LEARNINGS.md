@@ -1,5 +1,32 @@
 # Learnings
 
+## 2026-07-03 — Knife14z: run congestion-control A/B after knife14y stats
+
+`f7deb9b` was tested with
+`/tmp/mini_vpn/mvpn_knife14y_usclient_suite_20260703_143704.tar.gz`. The run
+completed the full US-client tunnel suite. Service preflight was healthy:
+`.33` was reachable, `.77:5201` direct iperf passed, cargo/build worked, and
+TUIC startup printed the expected QUIC windows and stats.
+
+Knife14y resolved the attribution question. During the remaining stalls,
+`tx_blocked(data|stream)` stayed zero while QUIC loss/congestion climbed and
+`cwnd` stayed tiny, for example `lost=75744/2058977`,
+`lost_bytes=95844092`, `congestion_events=48725`, `cwnd=2904`. That makes the
+current blocker a congestion/path acceptance question, not another client
+flow-control or relay lifecycle guess. P1 was improved relative to earlier
+Kbit/s runs, but the Cubic full sweep still showed zero-rate windows.
+
+Knife14z adds `CC_SWEEP` to `scripts/knife14b-usclient-tunnel-suite.sh`.
+`CC_SWEEP="cubic bbr"` runs each CC through a fresh child suite with isolated
+client logs and probe artifacts, while the old single-run behavior remains
+unchanged when `CC_SWEEP` is empty. The low-RTT probe summary now also includes
+`TUIC QUIC stats`, `tcp-local-write-pressure`, and
+`tcp-downlink-backpressure` lines.
+
+Reusable rule: when QUIC stats show no flow-control blocked frames but high
+loss/congestion and tiny cwnd, do a same-script Cubic/BBR A/B acceptance run
+before changing relay lifecycle, buffers, or product defaults.
+
 ## 2026-07-03 — Knife14x: client windows applied, remaining stall needs QUIC stats
 
 `ee2e83a` was tested with

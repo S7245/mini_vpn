@@ -1,5 +1,18 @@
 # Errors
 
+## 2026-07-03 — Local CC sweep smoke stops at the host guard on macOS
+
+- Command pattern:
+  `CC_SWEEP="cubic bbr" OUT_DIR=/tmp/mvpn_cc_sweep_smoke* SUITE_TAG=knife14z_smoke CHECK_VPS_SERVICES=0 BUILD_RELEASE=0 bash scripts/knife14b-usclient-tunnel-suite.sh`
+- Symptom: the parent wrapper correctly dispatched the `cubic` child suite, but
+  the child failed at `此脚本面向 Ubuntu/Linux Client VPS。当前内核: Darwin`.
+- Rejected assumption: a developer-machine smoke run can validate the later
+  Ubuntu-only TUIC env checks.
+- Correct behavior: on macOS, use the smoke only to validate `CC_SWEEP`
+  dispatch, child artifact naming, and parent bundle creation. The missing-env,
+  sudo, build, VPS service, and tunnel startup checks must be trusted to the
+  Ubuntu/VPS run.
+
 ## 2026-07-03 — ee2e83a proved client window tuning alone is insufficient
 
 - Log bundle: `/tmp/mvpn_knife14x_usclient_suite_20260703_120013.tar.gz`
