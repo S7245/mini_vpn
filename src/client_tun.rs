@@ -28,6 +28,8 @@ const RELAY_CHANNEL_CAPACITY: usize = 1024;
 const _: () = assert!(RELAY_CHANNEL_CAPACITY >= 1);
 const MAX_ESTABLISHED_UPLINK_BATCH: usize = 64;
 const _: () = assert!(MAX_ESTABLISHED_UPLINK_BATCH >= 1);
+const RELAY_WRITER_COALESCE_MAX_MESSAGES: usize = MAX_ESTABLISHED_UPLINK_BATCH;
+const RELAY_WRITER_COALESCE_MAX_BYTES: usize = TCP_SOCKET_BUFFER_SIZE;
 const DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES: usize = TCP_SOCKET_BUFFER_SIZE * 32;
 const DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES: usize = TCP_SOCKET_BUFFER_SIZE * 8;
 const _: () =
@@ -225,6 +227,10 @@ struct RelayTaskDiag {
     global_rx_wait_max_micros: u128,
     /// Count of remote payload sends whose wait crossed the diagnostic threshold.
     global_rx_pressure_events: u64,
+    /// Highest observed wait for a local-to-remote writer batch.
+    local_write_wait_max_micros: u128,
+    /// Count of local writer batches whose wait crossed the diagnostic threshold.
+    local_write_pressure_events: u64,
 }
 
 impl RelayTaskDiag {
@@ -249,6 +255,18 @@ impl RelayTaskDiag {
             self.global_rx_pressure_events += 1;
         }
     }
+
+    fn note_local_write_wait(
+        &mut self,
+        elapsed: std::time::Duration,
+        pressure_threshold: std::time::Duration,
+    ) {
+        self.local_write_wait_max_micros =
+            self.local_write_wait_max_micros.max(elapsed.as_micros());
+        if elapsed >= pressure_threshold {
+            self.local_write_pressure_events += 1;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -259,12 +277,57 @@ enum RelayCommand {
 
 #[derive(Debug)]
 enum RelayWriterSignal {
-    Progress { bytes: usize },
+    Progress {
+        bytes: usize,
+        write_wait: std::time::Duration,
+    },
     WriteHalfClosed { reason: &'static str },
     Closed {
         direction: &'static str,
         reason: &'static str,
     },
+}
+
+struct CoalescedRelayWrite {
+    payload: Vec<u8>,
+    finish_after: bool,
+    deferred: Option<RelayCommand>,
+}
+
+fn coalesce_relay_payload(
+    mut payload: Vec<u8>,
+    rx: &mut mpsc::Receiver<RelayCommand>,
+) -> CoalescedRelayWrite {
+    let mut messages = 1usize;
+    let mut finish_after = false;
+    while messages < RELAY_WRITER_COALESCE_MAX_MESSAGES
+        && payload.len() < RELAY_WRITER_COALESCE_MAX_BYTES
+    {
+        match rx.try_recv() {
+            Ok(RelayCommand::Data(mut next)) => {
+                if payload.len().saturating_add(next.len()) > RELAY_WRITER_COALESCE_MAX_BYTES {
+                    return CoalescedRelayWrite {
+                        payload,
+                        finish_after,
+                        deferred: Some(RelayCommand::Data(next)),
+                    };
+                }
+                payload.append(&mut next);
+                messages += 1;
+            }
+            Ok(RelayCommand::Finish) => {
+                finish_after = true;
+                break;
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        }
+    }
+    CoalescedRelayWrite {
+        payload,
+        finish_after,
+        deferred: None,
+    }
 }
 
 /// Terminal reason reported by one background TCP relay task.
@@ -2466,6 +2529,7 @@ async fn run_relay(
     let mut buf = [0u8; 65_536];
     let mut diag = RelayTaskDiag::default();
     let global_rx_pressure_threshold = std::time::Duration::from_millis(5);
+    let local_write_pressure_threshold = std::time::Duration::from_millis(5);
     let idle = tokio::time::sleep(RELAY_IDLE_TIMEOUT);
     tokio::pin!(idle);
     let mut writer_done = false;
@@ -2474,8 +2538,18 @@ async fn run_relay(
         tokio::select! {
             signal = writer_signal_rx.recv(), if !writer_done => {
                 match signal {
-                    Some(RelayWriterSignal::Progress { bytes }) => {
+                    Some(RelayWriterSignal::Progress { bytes, write_wait }) => {
                         diag.note_uplink_write(bytes);
+                        diag.note_local_write_wait(write_wait, local_write_pressure_threshold);
+                        if write_wait >= local_write_pressure_threshold {
+                            tcp_diag_log!(
+                                "🔎 tcp-local-write-pressure handle={:?} wait_us={} payload_bytes={} pressure_events={}",
+                                handle,
+                                write_wait.as_micros(),
+                                bytes,
+                                diag.local_write_pressure_events
+                            );
+                        }
                         idle.as_mut().reset(tokio::time::Instant::now() + RELAY_IDLE_TIMEOUT);
                     }
                     Some(RelayWriterSignal::WriteHalfClosed { reason }) => {
@@ -2563,7 +2637,7 @@ async fn run_relay(
         let _ = writer_task.await;
     }
     tcp_diag_log!(
-        "🔎 tcp-relay-close handle={:?} direction={} reason={} uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} global_rx_wait_max_us={} global_rx_pressure_events={}",
+        "🔎 tcp-relay-close handle={:?} direction={} reason={} uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} global_rx_wait_max_us={} global_rx_pressure_events={} local_write_wait_max_us={} local_write_pressure_events={}",
         handle,
         close_direction,
         close_reason,
@@ -2572,7 +2646,9 @@ async fn run_relay(
         diag.remote_to_global_rx_bytes,
         diag.remote_reads,
         diag.global_rx_wait_max_micros,
-        diag.global_rx_pressure_events
+        diag.global_rx_pressure_events,
+        diag.local_write_wait_max_micros,
+        diag.local_write_pressure_events
     );
     let _ = back_tx
         .send((
@@ -2586,6 +2662,55 @@ async fn run_relay(
         .await;
 }
 
+async fn shutdown_relay_writer_after_finish(
+    handle: SocketHandle,
+    writer: &mut tokio::io::WriteHalf<RelayStream>,
+    signal_tx: &mpsc::Sender<RelayWriterSignal>,
+    stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
+) {
+    let shutdown_result = tokio::select! {
+        _ = stop_rx => {
+            let _ = writer.shutdown().await;
+            return;
+        }
+        result = tokio::time::timeout(RELAY_WRITER_STOP_TIMEOUT, writer.shutdown()) => result,
+    };
+    match shutdown_result {
+        Ok(Ok(_)) => {
+            let _ = signal_tx
+                .send(RelayWriterSignal::WriteHalfClosed {
+                    reason: "local_finish",
+                })
+                .await;
+        }
+        Ok(Err(e)) => {
+            println!(
+                "关闭上游写半边失败 direction=local_to_remote handle={:?} err={:?}",
+                handle, e
+            );
+            let _ = signal_tx
+                .send(RelayWriterSignal::Closed {
+                    direction: "local_to_remote",
+                    reason: "remote_shutdown_failed",
+                })
+                .await;
+        }
+        Err(_) => {
+            println!(
+                "关闭上游写半边超时 direction=local_to_remote handle={:?} timeout={}s",
+                handle,
+                RELAY_WRITER_STOP_TIMEOUT.as_secs()
+            );
+            let _ = signal_tx
+                .send(RelayWriterSignal::Closed {
+                    direction: "local_to_remote",
+                    reason: "remote_shutdown_timeout",
+                })
+                .await;
+        }
+    }
+}
+
 async fn run_relay_writer(
     handle: SocketHandle,
     mut writer: tokio::io::WriteHalf<RelayStream>,
@@ -2593,102 +2718,88 @@ async fn run_relay_writer(
     signal_tx: mpsc::Sender<RelayWriterSignal>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
+    let mut deferred_cmd = None;
     loop {
-        tokio::select! {
-            _ = &mut stop_rx => {
-                let _ = writer.shutdown().await;
-                return;
+        let local_msg = if let Some(cmd) = deferred_cmd.take() {
+            Some(cmd)
+        } else {
+            tokio::select! {
+                _ = &mut stop_rx => {
+                    let _ = writer.shutdown().await;
+                    return;
+                }
+                local_msg = rx.recv() => local_msg,
             }
-            local_msg = rx.recv() => {
-                match local_msg {
-                    Some(RelayCommand::Data(payload)) => {
-                        let payload_len = payload.len();
-                        let write_result = tokio::select! {
-                            _ = &mut stop_rx => {
-                                let _ = writer.shutdown().await;
-                                return;
-                            }
-                            result = writer.write_all(&payload) => result,
-                        };
-                        match write_result {
-                            Ok(_) => {
-                                let _ = signal_tx
-                                    .try_send(RelayWriterSignal::Progress { bytes: payload_len });
-                            }
-                            Err(e) => {
-                                println!(
-                                    "写入上游流失败 direction=local_to_remote handle={:?} attempted_bytes={} err={:?}",
-                                    handle, payload_len, e
-                                );
-                                let _ = signal_tx
-                                    .send(RelayWriterSignal::Closed {
-                                        direction: "local_to_remote",
-                                        reason: "remote_write_failed",
-                                    })
-                                    .await;
-                                let _ = writer.shutdown().await;
-                                return;
-                            }
+        };
+        match local_msg {
+            Some(RelayCommand::Data(payload)) => {
+                let coalesced = coalesce_relay_payload(payload, &mut rx);
+                deferred_cmd = coalesced.deferred;
+                let payload = coalesced.payload;
+                let payload_len = payload.len();
+                let write_started = std::time::Instant::now();
+                let write_result = tokio::select! {
+                    _ = &mut stop_rx => {
+                        let _ = writer.shutdown().await;
+                        return;
+                    }
+                    result = writer.write_all(&payload) => result,
+                };
+                let write_wait = write_started.elapsed();
+                match write_result {
+                    Ok(_) => {
+                        let _ = signal_tx
+                            .try_send(RelayWriterSignal::Progress {
+                                bytes: payload_len,
+                                write_wait,
+                            });
+                        if coalesced.finish_after {
+                            shutdown_relay_writer_after_finish(
+                                handle,
+                                &mut writer,
+                                &signal_tx,
+                                &mut stop_rx,
+                            )
+                            .await;
+                            return;
                         }
                     }
-                    Some(RelayCommand::Finish) => {
-                        let shutdown_result = tokio::select! {
-                            _ = &mut stop_rx => {
-                                let _ = writer.shutdown().await;
-                                return;
-                            }
-                            result = tokio::time::timeout(RELAY_WRITER_STOP_TIMEOUT, writer.shutdown()) => result,
-                        };
-                        match shutdown_result {
-                            Ok(Ok(_)) => {
-                                let _ = signal_tx
-                                    .send(RelayWriterSignal::WriteHalfClosed {
-                                        reason: "local_finish",
-                                    })
-                                    .await;
-                                return;
-                            }
-                            Ok(Err(e)) => {
-                                println!(
-                                    "关闭上游写半边失败 direction=local_to_remote handle={:?} err={:?}",
-                                    handle, e
-                                );
-                                let _ = signal_tx
-                                    .send(RelayWriterSignal::Closed {
-                                        direction: "local_to_remote",
-                                        reason: "remote_shutdown_failed",
-                                    })
-                                    .await;
-                                return;
-                            }
-                            Err(_) => {
-                                println!(
-                                    "关闭上游写半边超时 direction=local_to_remote handle={:?} timeout={}s",
-                                    handle,
-                                    RELAY_WRITER_STOP_TIMEOUT.as_secs()
-                                );
-                                let _ = signal_tx
-                                    .send(RelayWriterSignal::Closed {
-                                        direction: "local_to_remote",
-                                        reason: "remote_shutdown_timeout",
-                                    })
-                                    .await;
-                                return;
-                            }
-                        }
-                    }
-                    None => {
-                        println!("本地房间 {:?} 已关闭通道", handle);
+                    Err(e) => {
+                        println!(
+                            "写入上游流失败 direction=local_to_remote handle={:?} attempted_bytes={} err={:?}",
+                            handle, payload_len, e
+                        );
                         let _ = signal_tx
                             .send(RelayWriterSignal::Closed {
                                 direction: "local_to_remote",
-                                reason: "local_channel_closed",
+                                reason: "remote_write_failed",
                             })
                             .await;
                         let _ = writer.shutdown().await;
                         return;
                     }
                 }
+            }
+            Some(RelayCommand::Finish) => {
+                shutdown_relay_writer_after_finish(
+                    handle,
+                    &mut writer,
+                    &signal_tx,
+                    &mut stop_rx,
+                )
+                .await;
+                return;
+            }
+            None => {
+                println!("本地房间 {:?} 已关闭通道", handle);
+                let _ = signal_tx
+                    .send(RelayWriterSignal::Closed {
+                        direction: "local_to_remote",
+                        reason: "local_channel_closed",
+                    })
+                    .await;
+                let _ = writer.shutdown().await;
+                return;
             }
         }
     }
@@ -2819,6 +2930,7 @@ mod tests {
 
     // ---- 刀9 F4：relay idle 超时（L2）----
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
     use std::task::{Context, Poll};
 
     /// 一条永不产数据的 mock 上游流：read 恒 Pending、write/flush 即成、shutdown 记账。
@@ -2842,6 +2954,37 @@ mod tests {
             buf: &[u8],
         ) -> Poll<std::io::Result<usize>> {
             Poll::Ready(Ok(buf.len())) // 上行 write 即成（活动 → 重置 idle）
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.shutdown_called.store(true, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct RecordingWriteStream {
+        shutdown_called: Arc<AtomicBool>,
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+    impl tokio::io::AsyncRead for RecordingWriteStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+    impl tokio::io::AsyncWrite for RecordingWriteStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.writes.lock().unwrap().push(buf.to_vec());
+            Poll::Ready(Ok(buf.len()))
         }
         fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
@@ -3024,6 +3167,71 @@ mod tests {
                 assert_eq!(close.epoch, 7);
                 assert_eq!(close.direction, "timer");
                 assert_eq!(close.reason, "idle_timeout");
+            }
+            other => panic!("expected relay close event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coalesced_relay_payload_preserves_finish_order() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(RelayCommand::Data(b"two".to_vec())).unwrap();
+        tx.try_send(RelayCommand::Finish).unwrap();
+
+        let coalesced = coalesce_relay_payload(b"one".to_vec(), &mut rx);
+
+        assert_eq!(coalesced.payload, b"onetwo");
+        assert!(coalesced.finish_after, "queued Finish must run after queued data");
+        assert!(coalesced.deferred.is_none());
+        assert!(rx.try_recv().is_err(), "Finish should be consumed into finish_after");
+    }
+
+    #[test]
+    fn coalesced_relay_payload_defers_data_that_would_exceed_cap() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(RelayCommand::Data(vec![2; 2])).unwrap();
+
+        let coalesced = coalesce_relay_payload(vec![1; RELAY_WRITER_COALESCE_MAX_BYTES - 1], &mut rx);
+
+        assert_eq!(coalesced.payload.len(), RELAY_WRITER_COALESCE_MAX_BYTES - 1);
+        match coalesced.deferred.expect("oversized next data should be deferred") {
+            RelayCommand::Data(bytes) => assert_eq!(bytes, vec![2; 2]),
+            other => panic!("expected deferred data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_writer_coalesces_queued_data_before_single_write() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let stream: RelayStream = Box::new(RecordingWriteStream {
+            shutdown_called: shutdown_called.clone(),
+            writes: writes.clone(),
+        });
+        let (tx, rx) = mpsc::channel::<RelayCommand>(8);
+        tx.send(RelayCommand::Data(b"one".to_vec())).await.unwrap();
+        tx.send(RelayCommand::Data(b"two".to_vec())).await.unwrap();
+        tx.send(RelayCommand::Data(b"three".to_vec())).await.unwrap();
+        drop(tx);
+        let (back_tx, mut back_rx) = mpsc::channel(8);
+
+        let task = tokio::spawn(run_relay(handle, 41, stream, rx, back_tx));
+        task.await.unwrap();
+
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![b"onetwothree".to_vec()],
+            "queued data should become one upstream write batch"
+        );
+        assert!(shutdown_called.load(Ordering::SeqCst), "local channel close still shuts down writer");
+        match back_rx.try_recv().expect("local channel close should notify main loop") {
+            (h, RelayEvent::Closed(close)) => {
+                assert_eq!(h, handle);
+                assert_eq!(close.epoch, 41);
+                assert_eq!(close.direction, "local_to_remote");
+                assert_eq!(close.reason, "local_channel_closed");
             }
             other => panic!("expected relay close event, got {other:?}"),
         }
@@ -4238,12 +4446,22 @@ mod tests {
             std::time::Duration::from_micros(5),
             std::time::Duration::from_micros(10),
         );
+        diag.note_local_write_wait(
+            std::time::Duration::from_micros(30),
+            std::time::Duration::from_micros(10),
+        );
+        diag.note_local_write_wait(
+            std::time::Duration::from_micros(7),
+            std::time::Duration::from_micros(10),
+        );
 
         assert_eq!(diag.uplink_bytes, 40);
         assert_eq!(diag.remote_to_global_rx_bytes, 100);
         assert_eq!(diag.remote_reads, 1);
         assert_eq!(diag.global_rx_wait_max_micros, 25);
         assert_eq!(diag.global_rx_pressure_events, 1);
+        assert_eq!(diag.local_write_wait_max_micros, 30);
+        assert_eq!(diag.local_write_pressure_events, 1);
     }
 
     /// 刀13 ①：MINI_VPN_TRACE 解析——`1`/`true`（去空白、不区分大小写）开；其它/缺省关

@@ -1,5 +1,37 @@
 # Learnings
 
+## 2026-07-03 — Knife14w: forward bottleneck moved to relay writer small writes
+
+`c90471c` was tested with
+`/tmp/mvpn_knife14v_usclient_suite_20260703_103350.tar.gz`. The run validated
+the knife14v reverse fix: standalone reverse P1 reached roughly 181 Mbit/s and
+the full reverse P1/P2/P4/P8 sweep completed around 153-183 Mbit/s receiver.
+Remaining `dead_slot_reap pending>0` lines were on `tcp_state=Closed
+active=false can_send=false can_recv=false`, consistent with undeliverable local
+tails rather than useful downlink loss.
+
+The new blocker is forward. Standalone forward P1 was only 2.37 Mbit/s receiver,
+and full forward P1/P2/P4/P8 stayed around 1.15-2.33 Mbit/s receiver with long
+zero-rate windows. The accept log for forward P1 showed about 10.5 MB written
+upstream across 8529 local writer calls, i.e. MSS-sized writes, with no
+`remote_write_timeout`.
+
+Knife14w therefore coalesces already queued `RelayCommand::Data` messages inside
+`run_relay_writer` before one `write_all`, preserving the existing bounded mpsc
+channel as the backpressure boundary. `RelayCommand::Finish` is consumed only as
+a `finish_after` flag, so queued data is written first and the upstream write
+half is then shut down in FIFO order. Relay close logs now include local writer
+wait counters (`local_write_wait_max_us`, `local_write_pressure_events`) to
+separate true upstream write backpressure from global_rx/downlink pressure.
+
+Local acceptance passed: `cargo test --lib client_tun`, full `cargo test`,
+`cargo clippy --all-targets -- -D warnings`, and `git diff --check`.
+
+Reusable rule: after fixing event-loop read batching, inspect writer-side write
+granularity before blaming QUIC, VPS config, or congestion control. A VPN relay
+can still behave like one-MSS-per-await even when the main loop drains batches
+correctly.
+
 ## 2026-07-02 — Knife14v: local Finish should wait for reverse traffic to go quiet
 
 `a57873a` was tested with

@@ -1,5 +1,23 @@
 # Errors
 
+## 2026-07-03 — c90471c exposed relay-writer small-write amplification
+
+- Log bundle: `/tmp/mvpn_knife14v_usclient_suite_20260703_103350.tar.gz`
+- Tested commit: `c90471c`
+- Symptom: reverse TCP was healthy at roughly 153-183 Mbit/s receiver, but
+  forward TCP stayed near 1-3 Mbit/s receiver with long zero-bps gaps.
+- Important discriminator: `remote_write_timeout` was absent; forward P1 close
+  diagnostics showed roughly 10.5 MB upstream across 8529 writer calls, so the
+  path was dominated by many 1160-byte class `write_all` operations.
+- Rejected assumption: once established-uplink reads are batched in the main
+  loop, forward throughput is no longer limited by per-payload scheduling.
+- Correct behavior: coalesce already queued relay `Data` commands into bounded
+  writer batches, preserve `Finish` order, and log local write wait pressure on
+  relay close.
+- Future debugging rule: when forward throughput shows burst-then-silence
+  windows without write timeouts, compare `uplink_bytes` with `uplink_writes`
+  before changing TUIC pool, MTU, congestion control, or VPS service settings.
+
 ## 2026-07-02 — a57873a exposed premature local Finish on reverse traffic
 
 - Log bundle: `/tmp/mvpn_knife14c_usclient_suite_20260702_223847.tar.gz`
