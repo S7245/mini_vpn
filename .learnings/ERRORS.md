@@ -1,5 +1,49 @@
 # Errors
 
+## 2026-07-03 — Knife14ag reverse-first failed with no pressure signal
+
+- Log bundle:
+  `/tmp/mini_vpn/mvpn_knife14ag_usclient_suite_20260703_225103.tar.gz`
+- Tested commit: `fbe030c`
+- Symptom: reverse-first P1 over the tunnel exited 0 but delivered
+  0 receiver bytes. The suite then skipped standard P1/full sweep because the
+  tunnel still had one active relay after the quiet wait.
+- Important discriminator: the attribution summary reported no local write
+  pressure, no global_rx pressure, no downlink backpressure, no QUIC
+  loss/congestion delta, no blocked-frame delta, and no stale reconnects.
+  During the iperf window the data relay had `remote_to_global_rx_bytes=0`.
+- Late signal: after iperf finished and `tcp-relay-write-half-closed
+  reason=local_finish` fired, the same relay later read 43,772 remote bytes and
+  closed by `half_closed_idle_timeout`.
+- Correct behavior: do not continue stale-slot diagnosis and do not tune local
+  pressure/backpressure or QUIC congestion parameters from this result. First
+  add/collect diagnostics that distinguish TUIC control vs data stream timing,
+  server-side target connect/write timing, and late remote bytes after local
+  half-close.
+
+## 2026-07-03 — Source `.evn` silently, never echo secret exports
+
+- Stage: Knife14ag VPS suite launch after the user created `.evn` in `.27`'s
+  project root.
+- Symptom: sourcing `.evn` in a noninteractive command produced export output,
+  which exposed secret values in command output.
+- Correct behavior: when loading project-local env files on VPS hosts, use
+  `set -a && . ./.evn >/dev/null && set +a` and only run secret-safe
+  presence/length checks. Do not print env-file output, TUIC UUIDs, passwords,
+  private keys, or raw env dumps into reports, learnings, or final summaries.
+
+## 2026-07-03 — Run `.27` suite as root when `sudo -v` cannot prompt
+
+- Stage: Knife14ag VPS suite launch from noninteractive SSH.
+- Symptom: invoking the suite as `ubuntu` failed early at `sudo -v` because
+  the session had no TTY/password prompt, even though `sudo -n true` was
+  available.
+- Correct behavior: for noninteractive agent-launched `.27` suites, load the
+  env file silently and invoke the suite itself with
+  `sudo -n -E env ... bash scripts/knife14b-usclient-tunnel-suite.sh`. That
+  makes the suite's internal `sudo -v` run as root and keeps env propagation
+  explicit.
+
 ## 2026-07-03 — Noninteractive Client VPS SSH does not carry TUIC env
 
 - Stage: Knife14ag VPS acceptance attempt after pushing `4c62d74`.

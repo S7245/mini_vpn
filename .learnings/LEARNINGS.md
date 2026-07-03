@@ -1,5 +1,33 @@
 # Learnings
 
+## 2026-07-03 — Knife14ag VPS run split reverse silence from pressure/loss
+
+`fbe030c` was tested from `.27` with
+`/tmp/mini_vpn/mvpn_knife14ag_usclient_suite_20260703_225103.tar.gz` after
+loading `.27`'s project-local `.evn` file and running the suite under
+`sudo -n -E env ... bash`.
+
+The host/path preflights were healthy: `.27 -> .77` 291 Mbit/s receiver,
+`.77 -> .27` 273 Mbit/s receiver, `.33 -> .77` 297 Mbit/s receiver, and
+`.77 -> .33` 282 Mbit/s receiver. The tunnel reverse-first P1 still failed:
+iperf sender reported 2.62 MBytes / 733 Kbit/s, while the receiver reported
+0 bytes. The new attribution summary reported `no_pressure_signal`:
+no local write pressure, no global_rx pressure, no downlink backpressure,
+no QUIC loss/congestion delta, and no flow-control blocked-frame delta.
+
+The decisive discriminator is timing: during the 30s iperf window the data
+relay had `remote_to_global_rx_bytes=0`, but after iperf had already finished
+and the local side half-closed, the same relay later read 43,772 bytes and then
+closed by `half_closed_idle_timeout`. This is not the stale pool slot branch,
+and it is not enough evidence for tuning congestion control, socket buffers, or
+downlink watermarks.
+
+Reusable rule: when reverse-first yields 0 receiver bytes plus
+`no_pressure_signal`, inspect server/TUIC stream lifecycle and late-arriving
+remote bytes before changing local pressure/backpressure settings. The next
+diagnostic should make control stream vs data stream and server-side target
+connect/write timing visible.
+
 ## 2026-07-03 — Knife14ag: summarize pressure per iperf window before tuning
 
 After `knife14af2` proved stale TCP pool reconnect acceptance, the next
