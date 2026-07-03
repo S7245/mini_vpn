@@ -9,12 +9,15 @@ use crate::quic;
 use crate::shared::{ClientError, TargetAddr};
 use crate::udp_relay::{FlowEntry, FourTuple, MAX_UDP_FLOWS};
 use crate::upstream::{DatagramUpstream, ProxyUpstream, RelayStream};
-use quinn::{Connection, Endpoint};
+use quinn::{Connection, Endpoint, VarInt};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
 use tokio::sync::{mpsc, watch};
 
@@ -211,6 +214,87 @@ fn tcp_pool_index(pool_len: usize, cursor: u64) -> usize {
         0
     } else {
         (cursor % pool_len as u64) as usize
+    }
+}
+
+fn tcp_pool_slot_stale(now_secs: u64, last_used_secs: u64) -> bool {
+    now_secs.saturating_sub(last_used_secs) >= TUIC_TCP_POOL_STALE_RECONNECT_SECS
+}
+
+fn tcp_pool_stale_reconnect_reason(
+    index: usize,
+    now_secs: u64,
+    last_used_secs: u64,
+    idle_exclusive: bool,
+) -> Option<&'static str> {
+    if index == 0 || !idle_exclusive {
+        None
+    } else {
+        tcp_pool_slot_stale(now_secs, last_used_secs).then_some("stale_tcp_pool_slot")
+    }
+}
+
+struct TcpPoolSlotLease {
+    active: Arc<AtomicU64>,
+}
+
+impl TcpPoolSlotLease {
+    fn reserve(active: Arc<AtomicU64>) -> (Self, bool) {
+        match active.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => (Self { active }, true),
+            Err(_) => {
+                active.fetch_add(1, Ordering::AcqRel);
+                (Self { active }, false)
+            }
+        }
+    }
+}
+
+impl Drop for TcpPoolSlotLease {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct TrackedRelayStream<S> {
+    inner: S,
+    _lease: TcpPoolSlotLease,
+}
+
+impl<S> TrackedRelayStream<S> {
+    fn new(inner: S, lease: TcpPoolSlotLease) -> Self {
+        Self {
+            inner,
+            _lease: lease,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for TrackedRelayStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for TrackedRelayStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -859,6 +943,10 @@ const TUIC_RECONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// 非耦合）；亦**不同于** spec §2.6 的「open_tcp 10s」——那指 **REALITY** open 的 H2 止血超时（reality_upstream.rs），
 /// 此处是 TUIC open 的黑洞探测超时（acceptance 新加，spec 当时未有）。
 const TUIC_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// TCP pool slot stale threshold. Some sing-box/TUIC paths can let otherwise healthy-looking
+/// idle pool connections time out only when the next stream is opened. Reconnect idle TCP slots
+/// before reuse; primary UDP/health connection keeps its existing behavior.
+const TUIC_TCP_POOL_STALE_RECONNECT_SECS: u64 = 10;
 
 /// TUIC 客户端上游：持有到 sing-box 的 QUIC 连接，每条 TCP 开一条 `Connect` 双向流。
 /// 中文要点：连接断了按需重连+重认证(13a 最小实现;迁移/0-RTT 调优在 13c)。
@@ -872,6 +960,12 @@ pub struct TuicUpstream {
     conns: Vec<Mutex<Connection>>,
     /// TCP `open_tcp` 的轮询游标。Relaxed 足够：只需要分散流，不承载同步语义。
     tcp_next: AtomicU64,
+    /// Per-slot last TCP use, measured against `clock`. A stale TCP-only pool slot is reconnected
+    /// before opening a new stream so the data relay does not inherit a just-timed-out connection.
+    tcp_last_used_secs: Vec<AtomicU64>,
+    /// Active or opening TCP relay count per pool slot. Stale reconnect is only safe when a slot is
+    /// idle; closing an active QUIC connection would cut every stream multiplexed on that slot.
+    tcp_active_streams: Vec<Arc<AtomicU64>>,
     /// 上行 UDP datagram 丢弃计数（连接不可用 / stream 兜底也失败）。可观测性，不影响 UDP 语义。
     udp_drops: AtomicU64,
     /// 上行走 uni-stream 兜底（超 datagram 上限）的次数。可观测性：判断 MTU 调优是否够、兜底是否热。
@@ -978,6 +1072,8 @@ impl TuicUpstream {
                 "🧵 TUIC TCP connection pool={tcp_pool}（UDP/health 仍走 primary connection）"
             );
         }
+        let tcp_last_used_secs = (0..tcp_pool).map(|_| AtomicU64::new(0)).collect();
+        let tcp_active_streams = (0..tcp_pool).map(|_| Arc::new(AtomicU64::new(0))).collect();
         Ok(Self {
             endpoint,
             server: cfg.server,
@@ -986,6 +1082,8 @@ impl TuicUpstream {
             password: cfg.password.clone(),
             conns,
             tcp_next: AtomicU64::new(0),
+            tcp_last_used_secs,
+            tcp_active_streams,
             udp_drops: AtomicU64::new(0),
             udp_stream_fallbacks: AtomicU64::new(0),
             last_udp_activity: AtomicU64::new(0),
@@ -1098,12 +1196,25 @@ impl TuicUpstream {
 
     /// 取一条 TCP pool 连接的克隆；连接自身已关闭则只重连该槽位。
     async fn live_conn_at(&self, index: usize) -> Result<Connection, ClientError> {
+        self.live_conn_at_with_reason(index, None).await
+    }
+
+    async fn live_conn_at_with_reason(
+        &self,
+        index: usize,
+        reconnect_reason: Option<&'static str>,
+    ) -> Result<Connection, ClientError> {
         let slot = self
             .conns
             .get(index)
             .ok_or_else(|| ClientError::InvalidTarget("tuic tcp pool index out of range".into()))?;
         let mut guard = slot.lock().await;
-        if guard.close_reason().is_some() {
+        let closed = guard.close_reason().is_some();
+        if closed || reconnect_reason.is_some() {
+            if let Some(reason) = reconnect_reason {
+                println!("🔁 tuic-tcp-pool-reconnect conn={index} reason={reason}");
+                guard.close(VarInt::from_u32(0), reason.as_bytes());
+            }
             let hs = Self::handshake(
                 &self.endpoint,
                 self.server,
@@ -1130,10 +1241,30 @@ impl TuicUpstream {
     }
 
     /// TCP 专用连接选择：默认 pool=1 时等价旧行为；pool>1 时 round-robin 分散新流。
-    async fn live_tcp_conn(&self) -> Result<(usize, Connection), ClientError> {
+    async fn live_tcp_conn(&self) -> Result<(usize, Connection, TcpPoolSlotLease), ClientError> {
         let cursor = self.tcp_next.fetch_add(1, Ordering::Relaxed);
         let index = tcp_pool_index(self.conns.len(), cursor);
-        Ok((index, self.live_conn_at(index).await?))
+        let now_secs = self.clock.elapsed().as_secs();
+        let last_used = self
+            .tcp_last_used_secs
+            .get(index)
+            .ok_or_else(|| ClientError::InvalidTarget("tuic tcp pool index out of range".into()))?
+            .load(Ordering::Relaxed);
+        let active = self
+            .tcp_active_streams
+            .get(index)
+            .ok_or_else(|| ClientError::InvalidTarget("tuic tcp pool index out of range".into()))?
+            .clone();
+        let (lease, idle_exclusive) = TcpPoolSlotLease::reserve(active);
+        let reconnect_reason =
+            tcp_pool_stale_reconnect_reason(index, now_secs, last_used, idle_exclusive);
+        let conn = self
+            .live_conn_at_with_reason(index, reconnect_reason)
+            .await?;
+        if let Some(last) = self.tcp_last_used_secs.get(index) {
+            last.store(now_secs, Ordering::Relaxed);
+        }
+        Ok((index, conn, lease))
     }
 
     /// 取当前活连接克隆——**非阻塞、不重连**（刀9，ADR-0011 §3b）。锁被占（后台 start_udp 正在重连，持锁
@@ -1388,7 +1519,7 @@ fn udp_reconnect_backoff(attempt: u32) -> Duration {
 impl ProxyUpstream for TuicUpstream {
     async fn open_tcp(&self, target: &TargetAddr) -> Result<RelayStream, ClientError> {
         // 取 TCP pool 活连接，断了只重连该槽位；pool=1 时等价旧行为。
-        let (conn_index, conn) = self.live_tcp_conn().await?;
+        let (conn_index, conn, lease) = self.live_tcp_conn().await?;
         // 刀9（真出口 acceptance 修）：open_bi + write Connect 在**黑洞连接**上会 hang——连接尚未被
         // 判死（close_reason 仍 None，因 keepalive/非对称封锁架空 idle 检测），但 QUIC send 窗口满、
         // 收不到 ACK → write_all 无限阻塞，failover 快/慢路都收不到信号。封 5s 超时让黑洞 open **快速失败**
@@ -1409,7 +1540,10 @@ impl ProxyUpstream for TuicUpstream {
                 );
             }
             // 把双向流的收/发两半合成一条 AsyncRead+AsyncWrite，喂给现有双向泵。
-            Ok::<RelayStream, ClientError>(Box::new(tokio::io::join(recv, send)))
+            Ok::<RelayStream, ClientError>(Box::new(TrackedRelayStream::new(
+                tokio::io::join(recv, send),
+                lease,
+            )))
         };
         tokio::time::timeout(TUIC_OPEN_TIMEOUT, open)
             .await
@@ -1677,6 +1811,46 @@ mod tests {
         assert_eq!(tcp_pool_index(3, 1), 1);
         assert_eq!(tcp_pool_index(3, 2), 2);
         assert_eq!(tcp_pool_index(3, 3), 0);
+    }
+
+    #[test]
+    fn tcp_pool_slot_stale_after_threshold() {
+        assert!(!tcp_pool_slot_stale(9, 0));
+        assert!(tcp_pool_slot_stale(10, 0));
+        assert!(tcp_pool_slot_stale(25, 15));
+        assert!(!tcp_pool_slot_stale(24, 15));
+        assert!(
+            !tcp_pool_slot_stale(3, 15),
+            "clock skew/saturation must not mark stale"
+        );
+    }
+
+    #[test]
+    fn tcp_pool_stale_reconnect_skips_primary_connection() {
+        assert_eq!(tcp_pool_stale_reconnect_reason(0, 100, 0, true), None);
+        assert_eq!(
+            tcp_pool_stale_reconnect_reason(1, 100, 90, true),
+            Some("stale_tcp_pool_slot")
+        );
+        assert_eq!(tcp_pool_stale_reconnect_reason(1, 99, 90, true), None);
+        assert_eq!(tcp_pool_stale_reconnect_reason(1, 100, 90, false), None);
+    }
+
+    #[test]
+    fn tcp_pool_slot_lease_reserves_one_idle_owner() {
+        let active = Arc::new(AtomicU64::new(0));
+        {
+            let (_first, first_idle) = TcpPoolSlotLease::reserve(active.clone());
+            assert!(first_idle);
+            assert_eq!(active.load(Ordering::Relaxed), 1);
+            {
+                let (_second, second_idle) = TcpPoolSlotLease::reserve(active.clone());
+                assert!(!second_idle);
+                assert_eq!(active.load(Ordering::Relaxed), 2);
+            }
+            assert_eq!(active.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(active.load(Ordering::Relaxed), 0);
     }
 
     #[test]

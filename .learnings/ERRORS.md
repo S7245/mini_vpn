@@ -1,5 +1,48 @@
 # Errors
 
+## 2026-07-03 — Use cargo fmt for file-level Rust formatting in this 2024-edition repo
+
+- Symptom: running bare `rustfmt src/tuic.rs` failed with Rust 2015 parsing
+  errors (`async fn` not permitted, let chains require Rust 2024).
+- Root cause: bare `rustfmt` did not pick up the crate's `edition = "2024"`.
+- Correct behavior: use `cargo fmt -- <path>` for targeted formatting, or expect
+  `cargo fmt --check` to report historical repository-wide formatting noise.
+
+## 2026-07-03 — A TCP pool slot can be stale before `close_reason` is observed
+
+- Log bundle: `/tmp/mini_vpn/mvpn_knife14ae3_usclient_suite_20260703_212412.tar.gz`
+- Tested commit: `ebd3567`
+- Symptom: the final full reverse P1 opened TUIC TCP on `conn=1`, then the
+  connection immediately reported `closed=TimedOut`; iperf reverse transferred
+  0 bytes and exited after the 50s wrapper timeout.
+- Rejected assumption: `close_reason().is_none()` before `open_bi` is enough to
+  prove a pooled QUIC connection is safe for a new TCP relay.
+- Correct behavior: track TCP pool slot freshness and reconnect stale slots
+  before opening a new TUIC Connect stream, so a relay does not inherit a
+  connection that only reveals timeout after the stream is handed to the pump.
+
+## 2026-07-03 — Stale pool reconnect must be idle-only
+
+- Symptom avoided during code review: a simple stale timeout on a shared QUIC
+  pool slot would close the whole connection even if another TCP relay on that
+  slot was still active, breaking long-lived or concurrent TCP flows.
+- Correct behavior: only reconnect a stale non-primary pool slot when its active
+  or opening relay count is zero; keep a CAS-reserved lease from slot selection
+  through returned stream drop, and let only the exclusive idle owner reconnect.
+
+## 2026-07-03 — Active sing-box can still fail TUIC auth until restarted
+
+- Log bundle: `/tmp/mini_vpn/mvpn_knife14ae2_usclient_suite_20260703_212154.tar.gz`
+- Tested commit: `ebd3567`
+- Symptom: `.33` sing-box was `active`, config credentials matched the client,
+  and direct `.33 <-> .77` iperf was healthy, but mini_vpn startup failed at
+  `tuic auth finish: sending stopped by peer: error 0`.
+- Observed fix: restarting `sing-box` on `.33` made the next run authenticate
+  and proceed into tunnel throughput testing.
+- Correct behavior: when TUIC auth fails despite matching config, treat VPS
+  service state as a first-class branch; collect `.33` logs/status and restart
+  the service before changing mini_vpn protocol code.
+
 ## 2026-07-03 — Exit SSH preflight must not depend on root known_hosts
 
 - Log bundle: `/tmp/mini_vpn/mvpn_knife14ae_usclient_suite_20260703_211833.tar.gz`

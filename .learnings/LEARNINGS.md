@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-07-03 — Knife14ae3: reverse throughput recovered; stale TCP pool slot remains
+
+After fixing Exit SSH and restarting `.33` sing-box, `ebd3567` was tested with
+`/tmp/mini_vpn/mvpn_knife14ae3_usclient_suite_20260703_212412.tar.gz`. The new
+Exit-to-Target preflight worked and proved all direct legs were healthy:
+`.27 -> .77` 283 Mbit/s receiver, `.77 -> .27` 280 Mbit/s receiver,
+`.33 -> .77` 281 Mbit/s receiver, and `.77 -> .33` 275 Mbit/s receiver.
+
+Restarting sing-box changed TUIC startup from `tuic auth finish: sending stopped
+by peer` to success, so an active systemd service is not sufficient proof that
+TUIC auth is healthy. For future acceptance runs, when startup fails at TUIC auth
+while config matches, restart or deeper-check sing-box before changing data-plane
+code.
+
+The tunnel itself improved substantially: reverse-first P1 reached 187 Mbit/s
+receiver, standalone forward/reverse P1 both reached 155 Mbit/s receiver, and
+full forward P1 reached 187 Mbit/s receiver. The remaining failure is narrower:
+the final full reverse selected a TCP pool slot that reported `closed=TimedOut`
+and transferred 0 bytes. Follow-up: refresh stale TCP pool slots before opening
+new TUIC Connect streams, but only when the selected non-primary slot has no
+active/opening relay.
+
 ## 2026-07-03 — Knife14ae: Exit SSH preflight needs suite-local host-key state
 
 The first `knife14ae` run against `70e59a0` reached the new Exit-to-Target
