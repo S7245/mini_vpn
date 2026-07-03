@@ -1,5 +1,25 @@
 # Errors
 
+## 2026-07-03 — Shell parser tests must cover Bash and BSD awk strictness
+
+- Stage: Knife14ag local verification for low-RTT probe attribution summaries.
+- Symptoms:
+  - `bash -n scripts/knife14b-lowrtt-probe.sh` failed when self-test used one
+    multi-line `case` pattern with adjacent `*pattern*` fragments.
+  - `bash scripts/knife14b-lowrtt-probe.sh --self-test` failed on macOS awk with
+    `illegal primary in regular expression +local_write_pressure+`.
+  - A later self-test printed success but exited non-zero because an `EXIT` trap
+    referenced a local `tmpdir` after the function returned under `set -u`.
+- Root causes:
+  - Bash `case` patterns cannot be composed that way across lines.
+  - awk string `!~` and `split(..., "+")` treat the right side/separator as a
+    regex; bare or leading `+` is not portable.
+  - `EXIT` traps run after local variables leave scope.
+- Correct behavior: use explicit `assert_contains` checks, compare de-duplicated
+  values with split/string loops rather than regex membership, use `[+]` for a
+  literal plus separator, and either expand temp paths into traps or clear traps
+  before returning.
+
 ## 2026-07-03 — TUN discovery awk regex must not double-escape `/`
 
 - Symptom: `knife14af2` printed `awk: syntax error` while discovering `tun0`,

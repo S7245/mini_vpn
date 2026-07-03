@@ -1,5 +1,32 @@
 # Learnings
 
+## 2026-07-03 — Knife14ag: summarize pressure per iperf window before tuning
+
+After `knife14af2` proved stale TCP pool reconnect acceptance, the next
+throughput branch split by probe segment: forward/uplink-heavy runs showed
+`tcp-local-write-pressure` plus QUIC loss/congestion, while reverse-heavy runs
+showed `tcp-downlink-backpressure` with no QUIC flow-control blocked frames.
+
+Knife14ag adds per-iperf attribution summaries to the low-RTT probe. Each run
+now reports receiver Mbps, selected TCP pool connections, stale reconnects,
+local write pressure, global_rx pressure, downlink backlog, QUIC loss/congestion
+deltas, blocked-frame deltas, and a conservative attribution label. The parent
+US-client suite surfaces these summary lines in its probe summaries.
+
+Local verification passed:
+
+- `bash -n scripts/knife14b-lowrtt-probe.sh`
+- `bash -n scripts/knife14b-usclient-tunnel-suite.sh`
+- `bash scripts/knife14b-lowrtt-probe.sh --self-test`
+- parser smoke against the extracted `knife14af2` probe/report files
+
+Reusable rule: for throughput variance, do not tune CC, pools, buffers, or
+backpressure thresholds until each iperf window has a structured attribution
+summary. Treat `tuic-open-tcp` as a stream-open event, not proof of a new QUIC
+connection; QUIC loss/congestion attribution should use the first stats sample
+inside the window as its baseline to avoid blaming old cumulative counters on a
+new iperf run.
+
 ## 2026-07-03 — Knife14af2: stale TCP pool reconnect acceptance passed
 
 `7c683b0` was tested from `.27` with
