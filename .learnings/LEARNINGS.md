@@ -1,5 +1,18 @@
 # Learnings
 
+## 2026-07-03 — Knife14ae: Exit SSH preflight needs suite-local host-key state
+
+The first `knife14ae` run against `70e59a0` reached the new Exit-to-Target
+preflight and failed before tunnel testing:
+`/tmp/mini_vpn/mvpn_knife14ae_usclient_suite_20260703_211833.tar.gz`. The
+direct Client↔Target checks were healthy, but SSH from `.27` to `.33` failed
+with `Host key verification failed` because the suite was running under root via
+`sudo -E`.
+
+Follow-up: make the harness pass an explicit Exit SSH host-key policy and a
+suite-local known-hosts file. Reusable rule: noninteractive VPS harnesses must
+not depend on whichever user's `~/.ssh/known_hosts` happens to exist.
+
 ## 2026-07-03 — Knife14ad: reverse now has bytes; missing baseline is Exit↔Target
 
 `33659c9` was tested with

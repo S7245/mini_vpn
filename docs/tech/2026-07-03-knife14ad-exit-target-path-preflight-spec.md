@@ -42,6 +42,8 @@ Add opt-in env controls:
 - `EXIT_TO_TARGET_IPERF_REQUIRED=1`
 - `EXIT_SSH_HOST=ubuntu@43.153.32.33`
 - optional `EXIT_SSH_PORT` and `EXIT_SSH_KEY`
+- `EXIT_SSH_STRICT_HOST_KEY_CHECKING=accept-new`
+- `EXIT_SSH_KNOWN_HOSTS_FILE=$OUT_DIR/exit_ssh_known_hosts`
 
 When enabled, the suite SSHes to the Exit VPS and runs:
 
@@ -53,11 +55,15 @@ timeout $DIRECT_IPERF_TIMEOUT iperf3 -c $TARGET -p $IPERF_PORT -t $DIRECT_IPERF_
 When disabled, the report prints those manual commands so the attribution gap is
 visible.
 
+The suite usually runs under `sudo -E`, so Exit SSH cannot rely on the invoking
+user's `known_hosts`. It uses a suite-local known-hosts file and `accept-new` by
+default so first contact is noninteractive while changed host keys still fail.
+
 ## Acceptance
 
 - Existing default suite behavior is unchanged.
 - `bash -n scripts/knife14b-usclient-tunnel-suite.sh` passes.
 - The report records whether Exit-Target checking was enabled, required, and
-which SSH destination was used.
+- which SSH destination and host-key policy were used.
 - If enabled and required, SSH/path/iperf failures stop the suite before VPS time
 is spent on an ambiguous tunnel run.

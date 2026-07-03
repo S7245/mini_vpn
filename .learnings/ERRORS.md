@@ -1,5 +1,18 @@
 # Errors
 
+## 2026-07-03 — Exit SSH preflight must not depend on root known_hosts
+
+- Log bundle: `/tmp/mini_vpn/mvpn_knife14ae_usclient_suite_20260703_211833.tar.gz`
+- Tested commit: `70e59a0`
+- Symptom: `EXIT_TO_TARGET_IPERF_CHECK=1` failed before tunnel testing with
+  `Host key verification failed` while SSHing from `.27` to `.33`.
+- Root cause: the suite runs under `sudo -E`, so the SSH command used root's
+  host-key store rather than `ubuntu`'s interactive `known_hosts`; with
+  `BatchMode=yes`, first-use host-key confirmation cannot be answered.
+- Correct behavior: Exit SSH preflight should be explicitly noninteractive by
+  default, using a suite-local known-hosts file and `StrictHostKeyChecking`
+  policy that accepts new hosts while still failing on changed host keys.
+
 ## 2026-07-03 — Client↔Target direct baseline is insufficient for tunnel reverse
 
 - Log bundle: `/tmp/mini_vpn/mvpn_knife14ad_usclient_suite_20260703_183503.tar.gz`

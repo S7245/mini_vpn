@@ -50,6 +50,8 @@ Optional env:
   EXIT_SSH_HOST=""                SSH destination for Exit, e.g. ubuntu@43.153.32.33
   EXIT_SSH_PORT=22
   EXIT_SSH_KEY=""                 optional private key for Exit SSH
+  EXIT_SSH_STRICT_HOST_KEY_CHECKING=accept-new  noninteractive host-key policy for Exit SSH
+  EXIT_SSH_KNOWN_HOSTS_FILE="$OUT_DIR/exit_ssh_known_hosts"
   RUN_REVERSE_FIRST_P1=0   run a fresh reverse-only P1 probe before the normal forward-first probe
   WAIT_QUIET_BEFORE_FULL=1  after standalone P1, wait for active relays to drop before full sweep
   QUIET_TIMEOUT_SECS=20
@@ -103,6 +105,8 @@ EXIT_TO_TARGET_IPERF_REQUIRED="${EXIT_TO_TARGET_IPERF_REQUIRED:-1}"
 EXIT_SSH_HOST="${EXIT_SSH_HOST:-}"
 EXIT_SSH_PORT="${EXIT_SSH_PORT:-22}"
 EXIT_SSH_KEY="${EXIT_SSH_KEY:-}"
+EXIT_SSH_STRICT_HOST_KEY_CHECKING="${EXIT_SSH_STRICT_HOST_KEY_CHECKING:-accept-new}"
+EXIT_SSH_KNOWN_HOSTS_FILE="${EXIT_SSH_KNOWN_HOSTS_FILE:-$OUT_DIR/exit_ssh_known_hosts}"
 RUN_REVERSE_FIRST_P1="${RUN_REVERSE_FIRST_P1:-0}"
 WAIT_QUIET_BEFORE_FULL="${WAIT_QUIET_BEFORE_FULL:-1}"
 QUIET_TIMEOUT_SECS="${QUIET_TIMEOUT_SECS:-20}"
@@ -405,7 +409,15 @@ cleanup_stale_target_tun_route() {
 
 run_exit_ssh_cmd() {
   local remote_cmd="$1"
-  local -a ssh_cmd=(ssh -o BatchMode=yes -o ConnectTimeout=8)
+  local -a ssh_cmd=(
+    ssh
+    -o BatchMode=yes
+    -o ConnectTimeout=8
+    -o "StrictHostKeyChecking=$EXIT_SSH_STRICT_HOST_KEY_CHECKING"
+  )
+  if [[ -n "$EXIT_SSH_KNOWN_HOSTS_FILE" ]]; then
+    ssh_cmd+=(-o "UserKnownHostsFile=$EXIT_SSH_KNOWN_HOSTS_FILE")
+  fi
   if [[ -n "$EXIT_SSH_KEY" ]]; then
     ssh_cmd+=(-i "$EXIT_SSH_KEY")
   fi
@@ -422,6 +434,8 @@ preflight_exit_to_target_path() {
   append "- exit_to_target_iperf_check: $EXIT_TO_TARGET_IPERF_CHECK"
   append "- exit_to_target_iperf_required: $EXIT_TO_TARGET_IPERF_REQUIRED"
   append "- exit_ssh_host: ${EXIT_SSH_HOST:-<unset>}"
+  append "- exit_ssh_strict_host_key_checking: $EXIT_SSH_STRICT_HOST_KEY_CHECKING"
+  append "- exit_ssh_known_hosts_file: ${EXIT_SSH_KNOWN_HOSTS_FILE:-<unset>}"
 
   if [[ "$EXIT_TO_TARGET_IPERF_CHECK" != "1" ]]; then
     append "skipped because EXIT_TO_TARGET_IPERF_CHECK=$EXIT_TO_TARGET_IPERF_CHECK"

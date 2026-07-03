@@ -93,6 +93,33 @@ Use the `self-improving-agent` pattern for project-local memory:
 - If a VPS service looks unhealthy, tell the user to inspect or restart it
   before running the expensive test.
 
+## VPS Acceptance Test Access
+
+Current acceptance hosts:
+
+- Client VPS `.27` (`43.172.75.27`): run mini_vpn from
+  `/home/ubuntu/mini_vpn`.
+- Exit VPS `.33` (`43.153.32.33`): sing-box/TUIC host. Check service with
+  `sudo systemctl status sing-box`; log file is `/var/log/sing-box.log`.
+- Target VPS `.77` (`43.130.32.77`): iperf3 host. Check service with
+  `systemctl status iperf3`; inspect logs with `journalctl -u iperf3`.
+
+SSH access:
+
+- From the Mac mini, use `ssh -i ~/.ssh/vpn ubuntu@<host>` for `.27`, `.33`,
+  and `.77`.
+- From `.27`, use `ssh -i ~/.ssh/vpn ubuntu@43.153.32.33` and
+  `ssh -i ~/.ssh/vpn ubuntu@43.130.32.77`.
+
+Operational rules:
+
+- The agent may run smoke tests, pressure tests, and collect logs directly from
+  these VPS hosts when the task calls for it.
+- Do not store TUIC UUIDs, passwords, private keys, or other secrets in the
+  repository, specs, learning memory, or final summaries.
+- sing-box logs on `.33` can grow quickly; inspect or truncate them deliberately
+  when needed, and mention destructive log cleanup before doing it.
+
 ## Current Acceptance Bias
 
 When investigating performance or reliability, prefer acceptance criteria that
