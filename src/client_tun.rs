@@ -224,8 +224,12 @@ struct RelayTaskDiag {
     uplink_bytes: u64,
     /// Bytes read from the remote stream and accepted into the global_rx path.
     remote_to_global_rx_bytes: u64,
+    /// Bytes read from the remote stream after local `Finish` was observed.
+    remote_after_local_finish_bytes: u64,
     /// Number of successful remote stream reads.
     remote_reads: u64,
+    /// Number of successful remote stream reads after local `Finish`.
+    remote_after_local_finish_reads: u64,
     /// Number of successful local payload writes to the remote stream.
     local_writes: u64,
     /// Highest observed wait before global_rx accepted a remote payload.
@@ -236,6 +240,7 @@ struct RelayTaskDiag {
     local_write_wait_max_micros: u128,
     /// Count of local writer batches whose wait crossed the diagnostic threshold.
     local_write_pressure_events: u64,
+    local_finish_seen: bool,
 }
 
 impl RelayTaskDiag {
@@ -244,9 +249,17 @@ impl RelayTaskDiag {
         self.uplink_bytes += bytes as u64;
     }
 
+    fn note_local_finish(&mut self) {
+        self.local_finish_seen = true;
+    }
+
     fn note_remote_read(&mut self, bytes: usize) {
         self.remote_reads += 1;
         self.remote_to_global_rx_bytes += bytes as u64;
+        if self.local_finish_seen {
+            self.remote_after_local_finish_reads += 1;
+            self.remote_after_local_finish_bytes += bytes as u64;
+        }
     }
 
     fn note_global_rx_wait(
@@ -285,12 +298,39 @@ fn format_relay_live_diag(
         "🔎 tcp-relay-live handle={handle:?} epoch={epoch} writer_done={writer_done} \
          read_only_after_local_finish={read_only_after_local_finish} \
          uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} \
+         remote_after_local_finish_bytes={} remote_after_local_finish_reads={} \
          global_rx_wait_max_us={} global_rx_pressure_events={} \
          local_write_wait_max_us={} local_write_pressure_events={}",
         diag.uplink_bytes,
         diag.local_writes,
         diag.remote_to_global_rx_bytes,
         diag.remote_reads,
+        diag.remote_after_local_finish_bytes,
+        diag.remote_after_local_finish_reads,
+        diag.global_rx_wait_max_micros,
+        diag.global_rx_pressure_events,
+        diag.local_write_wait_max_micros,
+        diag.local_write_pressure_events
+    )
+}
+
+fn format_relay_close_diag(
+    handle: SocketHandle,
+    close_direction: &'static str,
+    close_reason: &'static str,
+    diag: &RelayTaskDiag,
+) -> String {
+    format!(
+        "🔎 tcp-relay-close handle={:?} direction={} reason={} uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} remote_after_local_finish_bytes={} remote_after_local_finish_reads={} global_rx_wait_max_us={} global_rx_pressure_events={} local_write_wait_max_us={} local_write_pressure_events={}",
+        handle,
+        close_direction,
+        close_reason,
+        diag.uplink_bytes,
+        diag.local_writes,
+        diag.remote_to_global_rx_bytes,
+        diag.remote_reads,
+        diag.remote_after_local_finish_bytes,
+        diag.remote_after_local_finish_reads,
         diag.global_rx_wait_max_micros,
         diag.global_rx_pressure_events,
         diag.local_write_wait_max_micros,
@@ -2678,6 +2718,7 @@ async fn run_relay(
                         idle.as_mut().reset(tokio::time::Instant::now() + RELAY_IDLE_TIMEOUT);
                     }
                     Some(RelayWriterSignal::WriteHalfClosed { reason }) => {
+                        diag.note_local_finish();
                         tcp_diag_log!(
                             "🔎 tcp-relay-write-half-closed handle={:?} reason={}",
                             handle,
@@ -2761,20 +2802,7 @@ async fn run_relay(
         writer_task.abort();
         let _ = writer_task.await;
     }
-    tcp_diag_log!(
-        "🔎 tcp-relay-close handle={:?} direction={} reason={} uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} global_rx_wait_max_us={} global_rx_pressure_events={} local_write_wait_max_us={} local_write_pressure_events={}",
-        handle,
-        close_direction,
-        close_reason,
-        diag.uplink_bytes,
-        diag.local_writes,
-        diag.remote_to_global_rx_bytes,
-        diag.remote_reads,
-        diag.global_rx_wait_max_micros,
-        diag.global_rx_pressure_events,
-        diag.local_write_wait_max_micros,
-        diag.local_write_pressure_events
-    );
+    tcp_diag_log!("{}", format_relay_close_diag(handle, close_direction, close_reason, &diag));
     let _ = back_tx
         .send((
             handle,
@@ -4609,6 +4637,8 @@ mod tests {
         let mut diag = RelayTaskDiag::default();
         diag.note_uplink_write(40);
         diag.note_remote_read(100);
+        diag.note_local_finish();
+        diag.note_remote_read(28);
         diag.note_global_rx_wait(
             std::time::Duration::from_micros(25),
             std::time::Duration::from_micros(10),
@@ -4627,8 +4657,10 @@ mod tests {
         );
 
         assert_eq!(diag.uplink_bytes, 40);
-        assert_eq!(diag.remote_to_global_rx_bytes, 100);
-        assert_eq!(diag.remote_reads, 1);
+        assert_eq!(diag.remote_to_global_rx_bytes, 128);
+        assert_eq!(diag.remote_reads, 2);
+        assert_eq!(diag.remote_after_local_finish_bytes, 28);
+        assert_eq!(diag.remote_after_local_finish_reads, 1);
         assert_eq!(diag.global_rx_wait_max_micros, 25);
         assert_eq!(diag.global_rx_pressure_events, 1);
         assert_eq!(diag.local_write_wait_max_micros, 30);
@@ -4644,6 +4676,7 @@ mod tests {
         ));
         let mut diag = RelayTaskDiag::default();
         diag.note_uplink_write(64);
+        diag.note_local_finish();
         diag.note_remote_read(128);
 
         let line = format_relay_live_diag(handle, 7, true, true, &diag);
@@ -4658,6 +4691,29 @@ mod tests {
         assert!(line.contains("uplink_bytes=64"), "{line}");
         assert!(line.contains("remote_to_global_rx_bytes=128"), "{line}");
         assert!(line.contains("remote_reads=1"), "{line}");
+        assert!(line.contains("remote_after_local_finish_bytes=128"), "{line}");
+        assert!(line.contains("remote_after_local_finish_reads=1"), "{line}");
+    }
+
+    #[test]
+    fn relay_close_diag_line_includes_post_finish_remote_counters() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(TcpSocket::new(
+            TcpSocketBuffer::new(vec![0; 16]),
+            TcpSocketBuffer::new(vec![0; 16]),
+        ));
+        let mut diag = RelayTaskDiag::default();
+        diag.note_uplink_write(37);
+        diag.note_local_finish();
+        diag.note_remote_read(43_772);
+
+        let line = format_relay_close_diag(handle, "timer", "half_closed_idle_timeout", &diag);
+
+        assert!(line.contains("tcp-relay-close"), "{line}");
+        assert!(line.contains("direction=timer"), "{line}");
+        assert!(line.contains("reason=half_closed_idle_timeout"), "{line}");
+        assert!(line.contains("remote_after_local_finish_bytes=43772"), "{line}");
+        assert!(line.contains("remote_after_local_finish_reads=1"), "{line}");
     }
 
     /// 刀13 ①：MINI_VPN_TRACE 解析——`1`/`true`（去空白、不区分大小写）开；其它/缺省关

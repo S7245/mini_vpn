@@ -209,6 +209,83 @@ summarize_metrics_window() {
       }
     }
 
+    /tcp-relay-write-half-closed/ && /reason=local_finish/ {
+      handle = ""
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^handle=/) {
+          handle = numeric_token($i, "handle")
+        }
+      }
+      if (handle != "") {
+        local_finish_count++
+        local_finish_seen[handle] = 1
+        before_finish_bytes[handle] = last_remote_bytes[handle] + 0
+        before_finish_reads[handle] = last_remote_reads[handle] + 0
+      }
+    }
+
+    /tcp-relay-live/ || /tcp-relay-close/ {
+      handle = ""
+      remote_bytes = 0
+      remote_reads = 0
+      explicit_after_bytes = 0
+      explicit_after_reads = 0
+      has_explicit_after_bytes = 0
+      has_explicit_after_reads = 0
+      read_only_after_finish = 0
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^handle=/) {
+          handle = numeric_token($i, "handle")
+        } else if ($i == "read_only_after_local_finish=true") {
+          read_only_after_finish = 1
+        } else if ($i ~ /^remote_to_global_rx_bytes=/) {
+          remote_bytes = numeric_token($i, "remote_to_global_rx_bytes")
+        } else if ($i ~ /^remote_reads=/) {
+          remote_reads = numeric_token($i, "remote_reads")
+        } else if ($i ~ /^remote_after_local_finish_bytes=/) {
+          explicit_after_bytes = numeric_token($i, "remote_after_local_finish_bytes")
+          has_explicit_after_bytes = 1
+        } else if ($i ~ /^remote_after_local_finish_reads=/) {
+          explicit_after_reads = numeric_token($i, "remote_after_local_finish_reads")
+          has_explicit_after_reads = 1
+        }
+      }
+      if (handle == "") {
+        next
+      }
+
+      if (has_explicit_after_bytes) {
+        late_bytes = explicit_after_bytes
+      } else if (local_finish_seen[handle] || read_only_after_finish) {
+        late_bytes = remote_bytes - before_finish_bytes[handle]
+      } else {
+        late_bytes = 0
+      }
+      if (has_explicit_after_reads) {
+        late_reads = explicit_after_reads
+      } else if (local_finish_seen[handle] || read_only_after_finish) {
+        late_reads = remote_reads - before_finish_reads[handle]
+      } else {
+        late_reads = 0
+      }
+      if (late_bytes < 0) {
+        late_bytes = 0
+      }
+      if (late_reads < 0) {
+        late_reads = 0
+      }
+      if (late_bytes > max_late_remote_bytes) {
+        max_late_remote_bytes = late_bytes
+      }
+      if (late_reads > max_late_remote_reads) {
+        max_late_remote_reads = late_reads
+      }
+      if (!(handle in last_remote_bytes) || remote_bytes >= last_remote_bytes[handle]) {
+        last_remote_bytes[handle] = remote_bytes
+        last_remote_reads[handle] = remote_reads
+      }
+    }
+
     /TUIC QUIC stats/ && /cwnd=/ {
       conn = ""
       id = ""
@@ -323,6 +400,9 @@ summarize_metrics_window() {
       if (global_rx_count > 0) {
         add_label("global_rx_backpressure")
       }
+      if (max_late_remote_bytes > 0 || max_late_remote_reads > 0) {
+        add_label("late_remote_after_local_finish")
+      }
       if (labels == "") {
         labels = "no_pressure_signal"
       }
@@ -345,6 +425,7 @@ summarize_metrics_window() {
       printf "- local_write_pressure: events=%d max_wait_ms=%.3f max_payload_bytes=%d\n", local_write_count, max_local_wait_us / 1000, max_local_payload
       printf "- global_rx_pressure: events=%d max_wait_ms=%.3f\n", global_rx_count, max_global_wait_us / 1000
       printf "- downlink_backpressure: pause_edges=%d resume_edges=%d max_pending_bytes=%d max_total_pending_bytes=%d\n", down_pause_count, down_resume_count, max_down_pending, max_down_total
+      printf "- relay_late_remote: post_finish_bytes=%d post_finish_reads=%d local_finish_events=%d\n", max_late_remote_bytes, max_late_remote_reads, local_finish_count
       printf "- quic: samples=%d worst_conn=%s max_lost_bytes_delta=%d max_congestion_events_delta=%d min_cwnd=%s max_tx_blocked_data_delta=%d max_tx_blocked_stream_delta=%d max_rx_blocked_data_delta=%d max_rx_blocked_stream_delta=%d\n", quic_samples, worst_conn, max_lost_bytes_delta, max_congestion_delta, min_cwnd_all, max_tx_data_delta, max_tx_stream_delta, max_rx_data_delta, max_rx_stream_delta
       print "- attribution: " labels
     }
@@ -399,6 +480,32 @@ EOF_LOG
   summary="$(summarize_metrics_window 0 "existing-conn-self-test" "$iperf_sample" "$log_sample")"
   assert_contains "$summary" "max_lost_bytes_delta=500"
   assert_contains "$summary" "max_congestion_events_delta=3"
+
+  cat > "$iperf_sample" <<'EOF_IPERF'
+[  5]   0.00-30.04  sec  2.62 MBytes   733 Kbits/sec    3             sender
+[  5]   0.00-30.00  sec  0.00 Bytes  0.00 bits/sec                  receiver
+EOF_IPERF
+  cat > "$log_sample" <<'EOF_LOG'
+🔎 tuic-open-tcp target=43.130.32.77:5201 conn=1 id=99
+📊 TUIC QUIC stats conn=1 id=99 rtt=0ms cwnd=247211 lost=0/34 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=32/9214B udp_rx=219/296179B dg_max=Some(1418) dg_space=1048576B
+🔎 tcp-relay-live handle=SocketHandle(1) epoch=1 writer_done=false read_only_after_local_finish=false uplink_bytes=37 uplink_writes=1 remote_to_global_rx_bytes=0 remote_reads=0 global_rx_wait_max_us=0 global_rx_pressure_events=0 local_write_wait_max_us=0 local_write_pressure_events=0
+🔎 tcp-relay-write-half-closed handle=SocketHandle(1) reason=local_finish
+🔎 tcp-relay-live handle=SocketHandle(1) epoch=1 writer_done=true read_only_after_local_finish=true uplink_bytes=37 uplink_writes=1 remote_to_global_rx_bytes=43772 remote_reads=1 remote_after_local_finish_bytes=43772 remote_after_local_finish_reads=1 global_rx_wait_max_us=4 global_rx_pressure_events=0 local_write_wait_max_us=0 local_write_pressure_events=0
+🔎 tcp-relay-close handle=SocketHandle(1) direction=timer reason=half_closed_idle_timeout uplink_bytes=37 uplink_writes=1 remote_to_global_rx_bytes=43772 remote_reads=1 remote_after_local_finish_bytes=43772 remote_after_local_finish_reads=1 global_rx_wait_max_us=4 global_rx_pressure_events=0 local_write_wait_max_us=0 local_write_pressure_events=0
+EOF_LOG
+  summary="$(summarize_metrics_window 0 "late-remote-self-test" "$iperf_sample" "$log_sample")"
+  assert_contains "$summary" "iperf_receiver_mbps: 0.000"
+  assert_contains "$summary" "relay_late_remote: post_finish_bytes=43772 post_finish_reads=1"
+  assert_contains "$summary" "attribution: late_remote_after_local_finish"
+
+  cat > "$log_sample" <<'EOF_LOG'
+🔎 tcp-relay-live handle=SocketHandle(1) epoch=1 writer_done=false read_only_after_local_finish=false uplink_bytes=37 uplink_writes=1 remote_to_global_rx_bytes=100 remote_reads=1 global_rx_wait_max_us=0 global_rx_pressure_events=0 local_write_wait_max_us=0 local_write_pressure_events=0
+🔎 tcp-relay-write-half-closed handle=SocketHandle(1) reason=local_finish
+🔎 tcp-relay-live handle=SocketHandle(1) epoch=1 writer_done=true read_only_after_local_finish=true uplink_bytes=37 uplink_writes=1 remote_to_global_rx_bytes=100 remote_reads=1 remote_after_local_finish_bytes=0 remote_after_local_finish_reads=0 global_rx_wait_max_us=0 global_rx_pressure_events=0 local_write_wait_max_us=0 local_write_pressure_events=0
+EOF_LOG
+  summary="$(summarize_metrics_window 0 "late-remote-zero-self-test" "$iperf_sample" "$log_sample")"
+  assert_contains "$summary" "relay_late_remote: post_finish_bytes=0 post_finish_reads=0"
+  assert_contains "$summary" "attribution: no_pressure_signal"
   echo "lowrtt probe self-test passed"
   rm -rf "$tmpdir"
   trap - EXIT
@@ -440,7 +547,7 @@ IPERF_BUSY_RETRIES="${IPERF_BUSY_RETRIES:-3}"
 IPERF_BUSY_WAIT_SECS="${IPERF_BUSY_WAIT_SECS:-5}"
 PROBE_ORDER="${PROBE_ORDER:-forward-first}"
 OUT="${OUT:-/tmp/mvpn_knife14b_lowrtt_$(date +%Y%m%d_%H%M%S).md}"
-METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tuic-open-tcp|tuic-tcp-pool-reconnect|tcp-relay-live|tcp-local-write-pressure|tcp-global-rx-pressure|tcp-downlink-backpressure'
+METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tuic-open-tcp|tuic-tcp-pool-reconnect|tcp-relay-live|tcp-relay-write-half-closed|tcp-relay-close|tcp-handle-close|tcp-local-write-pressure|tcp-global-rx-pressure|tcp-downlink-backpressure'
 
 case "$PROBE_ORDER" in
   forward-first|reverse-first|forward-only|reverse-only) ;;

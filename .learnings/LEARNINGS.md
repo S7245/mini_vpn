@@ -1,5 +1,47 @@
 # Learnings
 
+## 2026-07-03 — Knife14ah labels late remote bytes after local Finish
+
+Knife14ag's reverse-first blocker was not stale pool, local pressure, downlink
+backpressure, or QUIC loss. The useful discriminator was late timing: remote
+bytes appeared only after local `Finish`. Knife14ah turns that manual
+correlation into structured diagnostics.
+
+Changes:
+
+- `RelayTaskDiag` now counts `remote_after_local_finish_bytes` and reads after
+  local `Finish`, and emits those counters in `tcp-relay-live` and
+  `tcp-relay-close` lines under `MINI_VPN_TCP_DIAG=1`.
+- `scripts/knife14b-lowrtt-probe.sh` now summarizes
+  `relay_late_remote` and emits `late_remote_after_local_finish` attribution.
+- The parser supports both new explicit post-finish counters and old logs by
+  diffing `remote_to_global_rx_bytes` before/after `tcp-relay-write-half-closed`.
+- The parent US-client suite summary now preserves relay live/half-close/close
+  lines plus `relay_late_remote`.
+
+Verification passed:
+
+- `bash -n scripts/knife14b-lowrtt-probe.sh`
+- `bash -n scripts/knife14b-usclient-tunnel-suite.sh`
+- `bash scripts/knife14b-lowrtt-probe.sh --self-test`
+- `cargo test relay_`
+- `cargo test --lib client_tun`
+- `git diff --check`
+- parser smoke against
+  `/tmp/mini_vpn/mvpn_knife14ag_usclient_suite_20260703_225103.tar.gz`, which
+  now summarizes `relay_late_remote: post_finish_bytes=43772` and attribution
+  `late_remote_after_local_finish`.
+
+Full `cargo test` was attempted and passed 251 tests, but failed the two
+`quic::tests::client_endpoint_binds*` local endpoint-bind tests while
+`src/quic.rs` had no diff. Record this as environment residual risk, not as
+evidence against the late-remote diagnostics.
+
+Reusable rule: when reverse-first has 0 receiver bytes plus no pressure/loss
+signals, preserve and summarize half-close lifecycle lines before changing data
+plane behavior. If bytes only arrive after local `Finish`, the next diagnostic
+belongs at TUIC/sing-box/target stream timing, not at local queue thresholds.
+
 ## 2026-07-03 — Knife14ag VPS run split reverse silence from pressure/loss
 
 `fbe030c` was tested from `.27` with

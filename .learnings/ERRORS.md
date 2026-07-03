@@ -1,5 +1,20 @@
 # Errors
 
+## 2026-07-03 — Full `cargo test` can fail on local QUIC endpoint bind
+
+- Stage: Knife14ah local verification.
+- Symptom: full `cargo test` passed 251 tests but failed
+  `quic::tests::client_endpoint_binds` and
+  `quic::tests::client_endpoint_binds_with_each_cc`.
+- Important discriminator: `src/quic.rs` had no diff in this stage, and focused
+  relay/parser tests passed. The failing tests exercise `client_endpoint`, which
+  binds `0.0.0.0:0` and creates a Quinn endpoint through the local async runtime.
+- Correct behavior: treat these two tests as local endpoint-bind environment
+  checks, not evidence about relay late-remote diagnostics. For scoped data-plane
+  observability stages, report the full-test residual risk and rely on focused
+  Rust tests plus VPS acceptance for QUIC path behavior unless the stage touches
+  `src/quic.rs`.
+
 ## 2026-07-03 — Knife14ag reverse-first failed with no pressure signal
 
 - Log bundle:
