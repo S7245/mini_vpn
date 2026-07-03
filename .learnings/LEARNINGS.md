@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-07-03 — Knife14w VPS bundle did not test the data plane
+
+`1144fc2` was submitted with
+`/tmp/mvpn_knife14w_usclient_suite_20260703_111144.tar.gz`. The archive
+contained only the markdown report and no accept log or tunnel artifacts. The
+suite ran as root, passed basic env/CA checks, then failed in the build stage
+because `BUILD_RELEASE=1` could not find `cargo` in root's `PATH`.
+
+This means the relay-writer coalescing change has not yet been exercised on the
+VPS path. The next run must first reach the `.33/.77` preflight and then the
+tunnel/iperf sections before its result can say anything about `1144fc2` data
+plane behavior.
+
+Knife14w suite follow-up makes cargo discovery explicit: use executable `CARGO`
+when provided, then `PATH`, then common rustup paths such as
+`/home/ubuntu/.cargo/bin/cargo` and `/root/.cargo/bin/cargo`. The report should
+record the chosen path and cargo version.
+
+Reusable rule: when a bundle contains only the suite report, classify it as a
+harness/environment result first. Do not infer data-plane success or failure
+until client logs and iperf sections exist.
+
 ## 2026-07-03 — Knife14w: forward bottleneck moved to relay writer small writes
 
 `c90471c` was tested with

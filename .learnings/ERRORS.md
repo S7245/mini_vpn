@@ -1,5 +1,22 @@
 # Errors
 
+## 2026-07-03 — 1144fc2 suite failed because root PATH missed cargo
+
+- Log bundle: `/tmp/mvpn_knife14w_usclient_suite_20260703_111144.tar.gz`
+- Tested commit: `1144fc2`
+- Symptom: suite stopped at `BUILD_RELEASE=1 但 cargo 不可用。` before VPS
+  service preflight, tunnel startup, or iperf traffic.
+- Important discriminator: the archive contained only the markdown report; there
+  was no accept log evidence to inspect for data-plane behavior.
+- Rejected assumption: because the checkout is clean and `BUILD_RELEASE=1` is
+  set, root can necessarily run `cargo` through `PATH`.
+- Correct behavior: resolve cargo from `CARGO`, `PATH`, `$HOME/.cargo/bin`,
+  `/home/ubuntu/.cargo/bin`, or `/root/.cargo/bin`, then record the chosen path
+  and version in the report.
+- Future debugging rule: if a suite fails before `.33/.77` preflight, fix the
+  harness/environment first and do not spend analysis budget on TUIC, QUIC,
+  smoltcp, MTU, or concurrency branches.
+
 ## 2026-07-03 — c90471c exposed relay-writer small-write amplification
 
 - Log bundle: `/tmp/mvpn_knife14v_usclient_suite_20260703_103350.tar.gz`

@@ -31,6 +31,7 @@ Optional env:
   MINI_VPN_TCP_DIAG=1       emit knife14c per-handle TCP diagnostics
   RUN_BASE_MTU_P1=0         14c keeps one aligned MTU per process; use a separate MTU=1500 run for baseline
   BUILD_RELEASE=1           build target/release/mini_vpn before running; set 0 to reuse existing binary
+  CARGO=<path>              cargo binary override, useful when running as root with rustup under /home/ubuntu
   KILL_OLD=1                stop old mini_vpn client-tun before starting
   KEEP_TUNNEL=0             keep mini_vpn running after the suite
   STARTUP_TIMEOUT=25
@@ -194,6 +195,33 @@ require_cmd() {
 
 command_status() {
   command -v "$1" >/dev/null 2>&1
+}
+
+find_cargo() {
+  local candidate
+
+  if [[ -n "${CARGO:-}" && -x "$CARGO" ]]; then
+    printf '%s\n' "$CARGO"
+    return 0
+  fi
+
+  if command_status cargo; then
+    command -v cargo
+    return 0
+  fi
+
+  for candidate in \
+    "${HOME:-}/.cargo/bin/cargo" \
+    /home/ubuntu/.cargo/bin/cargo \
+    /root/.cargo/bin/cargo
+  do
+    if [[ "$candidate" != "/.cargo/bin/cargo" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
 }
 
 client_still_running() {
@@ -570,9 +598,18 @@ run_cmd git -C "$REPO_ROOT" rev-parse --short HEAD || true
 run_cmd git -C "$REPO_ROOT" status --short || true
 
 if [[ "$BUILD_RELEASE" == "1" ]]; then
-  require_cmd cargo "curl https://sh.rustup.rs -sSf | sh; source ~/.cargo/env" || \
+  if ! CARGO_BIN="$(find_cargo)"; then
+    append "- MISSING: cargo"
+    append "  searched: CARGO, PATH, \$HOME/.cargo/bin/cargo, /home/ubuntu/.cargo/bin/cargo, /root/.cargo/bin/cargo"
+    append "  fix: export CARGO=/home/ubuntu/.cargo/bin/cargo 或 export PATH=/home/ubuntu/.cargo/bin:\$PATH 后重跑"
     fail "BUILD_RELEASE=1 但 cargo 不可用。"
-  run_cmd cargo build --release || fail "cargo build --release 失败。请把 report 发回来。"
+  fi
+  if [[ -n "${CARGO:-}" && "$CARGO_BIN" != "$CARGO" ]]; then
+    warn "CARGO is set but not executable: $CARGO; using $CARGO_BIN"
+  fi
+  append "- OK: cargo ($CARGO_BIN)"
+  run_cmd "$CARGO_BIN" --version || true
+  run_cmd "$CARGO_BIN" build --release || fail "cargo build --release 失败。请把 report 发回来。"
 elif [[ ! -x "$BIN" ]]; then
   fail "binary missing: $BIN。设置 BUILD_RELEASE=1 或先运行 cargo build --release。"
 fi
