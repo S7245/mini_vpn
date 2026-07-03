@@ -24,6 +24,8 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 
 pub(crate) const TCP_SOCKET_BUFFER_SIZE: usize = 65_535;
+const MIN_TCP_SOCKET_BUFFER_BYTES: usize = 4 * 1024;
+const MAX_TCP_SOCKET_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 const RELAY_CHANNEL_CAPACITY: usize = 1024;
 const _: () = assert!(RELAY_CHANNEL_CAPACITY >= 1);
 const MAX_ESTABLISHED_UPLINK_BATCH: usize = 64;
@@ -594,6 +596,7 @@ enum RegistryError {
 struct ListenerRegistry {
     ports: HashMap<u16, Vec<SocketHandle>>,
     pool_size: usize,
+    socket_buffers: TcpSocketBufferConfig,
     /// 全局 listener socket 总数上限（#2 弹性扩容兜底；默认 [`MAX_TOTAL_LISTENERS`]）。
     max_total: usize,
     /// 当前 listener socket 总数（review #6：O(1) 计数器，避免每 SYN 在扩容循环里 O(端口) 求和）。
@@ -602,10 +605,16 @@ struct ListenerRegistry {
 }
 
 impl ListenerRegistry {
+    #[cfg(test)]
     fn new(pool_size: usize) -> Self {
+        Self::with_socket_buffers(pool_size, TcpSocketBufferConfig::default())
+    }
+
+    fn with_socket_buffers(pool_size: usize, socket_buffers: TcpSocketBufferConfig) -> Self {
         Self {
             ports: HashMap::new(),
             pool_size,
+            socket_buffers,
             max_total: MAX_TOTAL_LISTENERS,
             total: 0,
         }
@@ -616,6 +625,7 @@ impl ListenerRegistry {
         Self {
             ports: HashMap::new(),
             pool_size,
+            socket_buffers: TcpSocketBufferConfig::default(),
             max_total,
             total: 0,
         }
@@ -649,7 +659,10 @@ impl ListenerRegistry {
         let spec = ListenerSpec { local_port: port };
         let mut handles = Vec::with_capacity(self.pool_size);
         for _ in 0..self.pool_size {
-            let h = sockets.add(build_listener_socket(&spec));
+            let h = sockets.add(build_listener_socket_with_buffers(
+                &spec,
+                self.socket_buffers,
+            ));
             socket_ctxs.insert(h, SocketCtx::new(port));
             handles.push(h);
         }
@@ -707,7 +720,10 @@ impl ListenerRegistry {
             if self.total_handles() >= self.max_total {
                 return Err(RegistryError::Capped);
             }
-            let h = sockets.add(build_listener_socket(&spec));
+            let h = sockets.add(build_listener_socket_with_buffers(
+                &spec,
+                self.socket_buffers,
+            ));
             socket_ctxs.insert(h, SocketCtx::new(port));
             self.ports.get_mut(&port).unwrap().push(h);
             self.total += 1;
@@ -759,6 +775,21 @@ impl Default for DownlinkBackpressureConfig {
         Self {
             high_bytes: DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES,
             low_bytes: DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpSocketBufferConfig {
+    rx_bytes: usize,
+    tx_bytes: usize,
+}
+
+impl Default for TcpSocketBufferConfig {
+    fn default() -> Self {
+        Self {
+            rx_bytes: TCP_SOCKET_BUFFER_SIZE,
+            tx_bytes: TCP_SOCKET_BUFFER_SIZE,
         }
     }
 }
@@ -828,6 +859,25 @@ fn parse_downlink_backpressure_config(
     }
 }
 
+fn parse_tcp_socket_buffer_bytes(s: Option<&str>, default: usize) -> usize {
+    s.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| {
+            (MIN_TCP_SOCKET_BUFFER_BYTES..=MAX_TCP_SOCKET_BUFFER_BYTES).contains(value)
+        })
+        .unwrap_or(default)
+}
+
+fn parse_tcp_socket_buffer_config(
+    rx: Option<&str>,
+    tx: Option<&str>,
+) -> TcpSocketBufferConfig {
+    let default = TcpSocketBufferConfig::default();
+    TcpSocketBufferConfig {
+        rx_bytes: parse_tcp_socket_buffer_bytes(rx, default.rx_bytes),
+        tx_bytes: parse_tcp_socket_buffer_bytes(tx, default.tx_bytes),
+    }
+}
+
 /// Startup configuration for the TUN runtime.
 /// 中文要点：Stage 13d 退役 legacy 上游后，运行时只剩本地监听池配置；
 /// TUIC 出口配置走 `MINI_VPN_TUIC_*`（见 tuic.rs），不在这里。
@@ -846,6 +896,7 @@ pub struct TunRuntimeConfig {
     /// `from_sources`（harness/测试）恒 `false`。
     pub profile_loop: bool,
     downlink_backpressure: DownlinkBackpressureConfig,
+    tcp_socket_buffers: TcpSocketBufferConfig,
 }
 
 impl TunRuntimeConfig {
@@ -857,12 +908,20 @@ impl TunRuntimeConfig {
             metrics_secs: METRICS_SNAPSHOT_SECS,
             profile_loop: false,
             downlink_backpressure: DownlinkBackpressureConfig::default(),
+            tcp_socket_buffers: TcpSocketBufferConfig::default(),
         })
+    }
+
+    pub fn tcp_socket_buffer_bytes(&self) -> (usize, usize) {
+        (
+            self.tcp_socket_buffers.rx_bytes,
+            self.tcp_socket_buffers.tx_bytes,
+        )
     }
 
     /// Read config from process environment
     /// （`MINI_VPN_TUN_POOL_SIZE` + `MINI_VPN_METRICS_SECS` + `MINI_VPN_PROFILE_LOOP`
-    /// + downlink backpressure watermarks）。
+    /// + downlink backpressure watermarks + TCP socket buffers）。
     fn from_env() -> Result<Self, ClientError> {
         let mut cfg = Self::from_sources(std::env::var("MINI_VPN_TUN_POOL_SIZE").ok().as_deref())?;
         cfg.tun_mtu = parse_tun_mtu(std::env::var("MINI_VPN_TUN_MTU").ok().as_deref());
@@ -873,6 +932,14 @@ impl TunRuntimeConfig {
                 .ok()
                 .as_deref(),
             std::env::var("MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES")
+                .ok()
+                .as_deref(),
+        );
+        cfg.tcp_socket_buffers = parse_tcp_socket_buffer_config(
+            std::env::var("MINI_VPN_TCP_RX_BUFFER_BYTES")
+                .ok()
+                .as_deref(),
+            std::env::var("MINI_VPN_TCP_TX_BUFFER_BYTES")
                 .ok()
                 .as_deref(),
         );
@@ -974,6 +1041,11 @@ pub async fn start_tun_proxy() {
         "🧯 TCP 下行背压: high={}B low={}B（MINI_VPN_DOWNLINK_BACKPRESSURE_* 可调）",
         runtime_config.downlink_backpressure.high_bytes,
         runtime_config.downlink_backpressure.low_bytes
+    );
+    println!(
+        "🧱 TCP socket buffers: rx={}B tx={}B（MINI_VPN_TCP_*_BUFFER_BYTES 可调）",
+        runtime_config.tcp_socket_buffers.rx_bytes,
+        runtime_config.tcp_socket_buffers.tx_bytes
     );
 
     // 1. 初始化 TUN 设备 / 创建操作系统的原生异步虚拟网卡。
@@ -1153,7 +1225,10 @@ pub async fn run_event_loop<D, U, M>(
 
     // Stage 9: 监听端口不再固定，由 SYN inspector 在 rx 热路径按需注册。
     // 中文要点：启动时 registry 是空的；第一条到任意端口的 SYN 会触发该端口建池。
-    let mut registry = ListenerRegistry::new(pool_size);
+    let mut registry = ListenerRegistry::with_socket_buffers(
+        pool_size,
+        runtime_config.tcp_socket_buffers,
+    );
     let mut socket_ctxs: HashMap<SocketHandle, SocketCtx> = HashMap::new();
 
     // #1 脏集合驱动：只有「本 tick 有活动」的 listener handle 进集合，relay 段仅处理它们，
@@ -1662,9 +1737,17 @@ fn relay_allows_remote_payload(ctx: &SocketCtx) -> bool {
 
 /// Allocate a fresh smoltcp TCP listener socket for one pool slot.
 /// 中文要点：每次调用都创建一间独立房间，并立即挂上 listen 牌子。
+#[cfg(test)]
 fn build_listener_socket(spec: &ListenerSpec) -> TcpSocket<'static> {
-    let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; TCP_SOCKET_BUFFER_SIZE]);
-    let tcp_tx_buffer = TcpSocketBuffer::new(vec![0; TCP_SOCKET_BUFFER_SIZE]);
+    build_listener_socket_with_buffers(spec, TcpSocketBufferConfig::default())
+}
+
+fn build_listener_socket_with_buffers(
+    spec: &ListenerSpec,
+    buffers: TcpSocketBufferConfig,
+) -> TcpSocket<'static> {
+    let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; buffers.rx_bytes]);
+    let tcp_tx_buffer = TcpSocketBuffer::new(vec![0; buffers.tx_bytes]);
     let mut tcp_socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
     tcp_socket.listen(spec.local_port).unwrap();
     tcp_socket
@@ -4306,6 +4389,10 @@ mod tests {
         assert_eq!(config.tun_mtu, DEFAULT_TUN_MTU);
         // 刀11：from_sources（harness/测试路径）恒用默认快照周期。
         assert_eq!(config.metrics_secs, METRICS_SNAPSHOT_SECS);
+        assert_eq!(
+            config.tcp_socket_buffer_bytes(),
+            (TCP_SOCKET_BUFFER_SIZE, TCP_SOCKET_BUFFER_SIZE)
+        );
     }
 
     /// 刀11：MINI_VPN_METRICS_SECS 解析——有效正整数采用；0/非数字/缺失回落默认（防 interval panic）。
@@ -4431,6 +4518,48 @@ mod tests {
         let repaired = parse_downlink_backpressure_config(Some("4194304"), Some("4194304"));
         assert_eq!(repaired.high_bytes, 4194304);
         assert_eq!(repaired.low_bytes, default.low_bytes);
+    }
+
+    #[test]
+    fn parse_tcp_socket_buffer_config_defaults_and_bounds() {
+        let default = TcpSocketBufferConfig::default();
+        assert_eq!(parse_tcp_socket_buffer_config(None, None), default);
+        assert_eq!(
+            parse_tcp_socket_buffer_config(Some("abc"), Some("0")),
+            default,
+            "invalid and below-minimum values fall back to defaults"
+        );
+
+        let custom = parse_tcp_socket_buffer_config(Some("1048576"), Some("2097152"));
+        assert_eq!(custom.rx_bytes, 1_048_576);
+        assert_eq!(custom.tx_bytes, 2_097_152);
+
+        let above_max =
+            parse_tcp_socket_buffer_config(Some("33554432"), Some("33554432"));
+        assert_eq!(
+            above_max, default,
+            "oversized socket buffers must not be accepted silently"
+        );
+    }
+
+    #[test]
+    fn listener_registry_uses_configured_socket_buffers() {
+        let buffers = TcpSocketBufferConfig {
+            rx_bytes: 8192,
+            tx_bytes: 16384,
+        };
+        let mut registry = ListenerRegistry::with_socket_buffers(1, buffers);
+        let mut sockets = SocketSet::new(vec![]);
+        let mut ctxs = HashMap::new();
+
+        registry
+            .ensure_port(443, &mut sockets, &mut ctxs)
+            .expect("port should be registered");
+        let handle = registry.handles_for_port(443)[0];
+        let socket = sockets.get::<TcpSocket>(handle);
+
+        assert_eq!(socket.recv_capacity(), buffers.rx_bytes);
+        assert_eq!(socket.send_capacity(), buffers.tx_bytes);
     }
 
     #[test]

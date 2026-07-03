@@ -52,7 +52,7 @@ UDP_LEN="${UDP_LEN:-1200}"
 IPERF_BUSY_RETRIES="${IPERF_BUSY_RETRIES:-3}"
 IPERF_BUSY_WAIT_SECS="${IPERF_BUSY_WAIT_SECS:-5}"
 OUT="${OUT:-/tmp/mvpn_knife14b_lowrtt_$(date +%Y%m%d_%H%M%S).md}"
-METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TUIC QUIC stats|tcp-local-write-pressure|tcp-downlink-backpressure'
+METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tcp-local-write-pressure|tcp-downlink-backpressure'
 
 append_cmd() {
   {

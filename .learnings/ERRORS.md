@@ -1,5 +1,23 @@
 # Errors
 
+## 2026-07-03 — Knife14aa showed healthy direct reverse but tiny tunnel reverse
+
+- Log bundle: `/tmp/mini_vpn/mvpn_knife14aa_usclient_suite_20260703_162932.tar.gz`
+- Tested commit: `7621bc6`
+- Symptom: direct `.77:5201 -R` reached 299 Mbit/s receiver, but tunnel reverse
+  stayed at 8.25 Mbit/s standalone P1 and 18-27 Mbit/s in the full sweep.
+- Important discriminator: `.77` iperf service and the direct reverse route were
+  healthy; QUIC `tx_blocked` stayed zero; client logs showed
+  `tcp-downlink-backpressure` and pending downlink at close.
+- Rejected assumption: reverse tunnel collapse can still be blamed on `.77`
+  service health after direct `iperf3 -R` passes.
+- Correct behavior: test whether the 65,535-byte smoltcp TCP tx buffer is the
+  local downlink window bottleneck by making socket rx/tx buffers configurable
+  and running the high-throughput suite with larger explicit values.
+- Future debugging rule: for reverse/downlink bottlenecks, always compare direct
+  reverse baseline with tunnel reverse and inspect local socket/window sizing
+  before changing QUIC CC or relay FIN logic again.
+
 ## 2026-07-03 — Knife14z reverse results lacked a direct reverse baseline
 
 - Log bundle: `/tmp/mvpn_knife14z_usclient_suite_20260703_154429.tar.gz`

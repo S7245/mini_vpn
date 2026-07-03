@@ -1,5 +1,29 @@
 # Learnings
 
+## 2026-07-03 — Knife14aa: direct reverse is healthy; test TCP socket buffer BDP next
+
+`7621bc6` was tested with
+`/tmp/mini_vpn/mvpn_knife14aa_usclient_suite_20260703_162932.tar.gz`. The new
+direct reverse preflight worked and proved `.77 -> client` is not the primary
+reverse blocker: direct `iperf3 -R` reached 299 Mbit/s receiver, while tunnel
+reverse was still only 8.25 Mbit/s standalone P1 and 18-27 Mbit/s in the full
+sweep.
+
+The strongest live signal moved to the client downlink path. The log showed
+`tcp-downlink-backpressure` transitions, high `remote_to_global_rx_bytes`, and
+pending downlink at close; QUIC `tx_blocked` stayed zero. The smoltcp TCP socket
+tx buffer was still fixed at 65,535 bytes, which can cap the local
+mini_vpn -> app receive leg and push extra reverse bytes into `downlink_pending`.
+
+Knife14ab makes smoltcp TCP listener rx/tx buffer sizes configurable and teaches
+the US-client suite to run high-throughput acceptance with 1MiB rx/tx buffers.
+Defaults remain unchanged until VPS evidence proves the throughput/memory
+tradeoff.
+
+Reusable rule: once direct `iperf3 -R` is healthy but tunnel reverse remains low
+and `downlink_pending`/backpressure grows, inspect the local smoltcp send window
+before returning to VPS service state, CC, or QUIC flow-control tuning.
+
 ## 2026-07-03 — Knife14z: BBR improves forward, reverse still needs direct -R attribution
 
 `1b6f2d8` was tested with

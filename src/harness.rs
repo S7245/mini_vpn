@@ -805,6 +805,8 @@ pub async fn run_tcp_scenario(params: ScenarioParams) -> Report {
     let sink = RecordingSink::new(shared.clone());
     let config = TunRuntimeConfig::from_sources(Some(&params.pool_size.to_string()))
         .expect("valid pool size");
+    let (tcp_rx_buffer_bytes, tcp_tx_buffer_bytes) = config.tcp_socket_buffer_bytes();
+    let per_socket_buffer_bytes = tcp_rx_buffer_bytes + tcp_tx_buffer_bytes;
     // 刀11：bind 共享 Arc<Metrics>，跑完 .abort() 后读末态 snapshot 入 Report（仿 RecordingSink drain 模式）。
     let metrics = Arc::new(Metrics::new());
     let sut = tokio::spawn(run_event_loop(
@@ -911,9 +913,6 @@ pub async fn run_tcp_scenario(params: ScenarioParams) -> Report {
     } else {
         0.0
     };
-    // per-socket 缓冲 = 每 listener 的 smoltcp rx+tx（引用真常量，避免与 client_tun 漂移）。
-    let per_socket_buffer_bytes = 2 * crate::client_tun::TCP_SOCKET_BUFFER_SIZE;
-
     Report {
         connections: params.connections,
         completed,
