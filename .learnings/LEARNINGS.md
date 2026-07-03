@@ -1,5 +1,44 @@
 # Learnings
 
+## 2026-07-03 — Knife14ai labels reverse sender backpressure in reports
+
+Knife14ah proved a sharper failure branch: reverse receiver throughput was low,
+but the target-side iperf sender was also low, while client-side relay,
+downlink, and QUIC diagnostics did not show pressure/loss. Knife14ai makes that
+branch visible in the low-RTT report instead of requiring manual `.77` journal
+correlation.
+
+Changes:
+
+- `scripts/knife14b-lowrtt-probe.sh` now parses and prints
+  `iperf_sender_mbps` alongside `iperf_receiver_mbps`.
+- TCP reverse probes can emit `reverse_sender_backpressured` when sender and
+  receiver throughput are both low and stronger local/client pressure labels
+  are absent.
+- The attribution path carries a `probe_kind`, so UDP reverse probes do not get
+  mislabeled by the TCP sender-backpressure heuristic.
+- `scripts/knife14b-usclient-tunnel-suite.sh` includes `iperf_sender_mbps` in
+  the parent suite probe summary grep.
+- Added
+  `docs/tech/2026-07-03-knife14ai-reverse-sender-backpressure-spec.md` and
+  `docs/tech/2026-07-03-knife14ai-reverse-sender-backpressure-plan.md`.
+
+Verification passed:
+
+- `bash -n scripts/knife14b-lowrtt-probe.sh`
+- `bash -n scripts/knife14b-usclient-tunnel-suite.sh`
+- `bash scripts/knife14b-lowrtt-probe.sh --self-test`
+- `git diff --check`
+
+Stage review found no Rust data-plane changes and no new secret exposure. The
+main review catch was that `Reverse mode` also appears in UDP iperf output; the
+fix was to gate `reverse_sender_backpressured` behind `probe_kind=tcp` and add
+a negative self-test.
+
+Reusable rule: when adding attribution labels to shared probe code, pass the
+probe kind explicitly instead of inferring all semantics from iperf text. Iperf
+phrases such as `Reverse mode` are shared across TCP and UDP.
+
 ## 2026-07-03 — Knife14ah VPS run moved reverse failure to server-side backpressure
 
 `4282682` was tested from `.27` with

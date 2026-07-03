@@ -29,10 +29,14 @@ env:
 USAGE
 }
 
-iperf_receiver_mbps() {
+iperf_role_mbps() {
   local iperf_file="$1"
-  awk '
+  local role="$2"
+  awk -v role="$role" '
     function to_mbps(value, unit) {
+      if (unit == "bits/sec") {
+        return value / 1000000
+      }
       if (unit == "Kbits/sec") {
         return value / 1000
       }
@@ -45,7 +49,7 @@ iperf_receiver_mbps() {
       return value
     }
 
-    $NF == "receiver" {
+    $NF == role {
       for (i = 1; i < NF; i++) {
         if ($(i + 1) ~ /bits\/sec$/) {
           mbps = to_mbps($i + 0, $(i + 1))
@@ -64,16 +68,37 @@ iperf_receiver_mbps() {
   ' "$iperf_file"
 }
 
+iperf_receiver_mbps() {
+  iperf_role_mbps "$1" "receiver"
+}
+
+iperf_sender_mbps() {
+  iperf_role_mbps "$1" "sender"
+}
+
+iperf_is_reverse_tcp() {
+  local iperf_file="$1"
+  if grep -q '^Reverse mode,' "$iperf_file"; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
 summarize_metrics_window() {
   local start_line="$1"
   local title="$2"
   local iperf_file="$3"
   local log_file="$4"
-  local receiver_mbps
+  local probe_kind="${5:-tcp}"
+  local receiver_mbps sender_mbps reverse_tcp
   receiver_mbps="$(iperf_receiver_mbps "$iperf_file")"
+  sender_mbps="$(iperf_sender_mbps "$iperf_file")"
+  reverse_tcp="$(iperf_is_reverse_tcp "$iperf_file")"
 
   if [[ ! -f "$log_file" ]]; then
     {
+      echo "- iperf_sender_mbps: $sender_mbps"
       echo "- iperf_receiver_mbps: $receiver_mbps"
       echo "- metrics_window: log_missing"
       echo "- attribution: no_metrics"
@@ -81,7 +106,12 @@ summarize_metrics_window() {
     return
   fi
 
-  tail -n +"$((start_line + 1))" "$log_file" | awk -v title="$title" -v receiver="$receiver_mbps" '
+  tail -n +"$((start_line + 1))" "$log_file" | awk \
+    -v title="$title" \
+    -v probe_kind="$probe_kind" \
+    -v sender="$sender_mbps" \
+    -v receiver="$receiver_mbps" \
+    -v reverse_tcp="$reverse_tcp" '
     function numeric_token(token, key, value) {
       value = token
       sub("^" key "=", "", value)
@@ -403,6 +433,15 @@ summarize_metrics_window() {
       if (max_late_remote_bytes > 0 || max_late_remote_reads > 0) {
         add_label("late_remote_after_local_finish")
       }
+      if (probe_kind == "tcp" && reverse_tcp == "1" &&
+          sender != "unknown" && receiver != "unknown" &&
+          (sender + 0) < 5 && (receiver + 0) < 5 &&
+          local_write_count == 0 && down_pause_count == 0 && global_rx_count == 0 &&
+          max_lost_bytes_delta == 0 && max_congestion_delta == 0 &&
+          max_tx_data_delta == 0 && max_tx_stream_delta == 0 &&
+          reconnect_count == 0) {
+        add_label("reverse_sender_backpressured")
+      }
       if (labels == "") {
         labels = "no_pressure_signal"
       }
@@ -420,6 +459,7 @@ summarize_metrics_window() {
       }
 
       print "- metrics_title: " title
+      print "- iperf_sender_mbps: " sender
       print "- iperf_receiver_mbps: " receiver
       printf "- tcp_pool: opens=%d conns=%s reconnects=%d reasons=%s\n", open_count, open_conns, reconnect_count, reconnect_reasons
       printf "- local_write_pressure: events=%d max_wait_ms=%.3f max_payload_bytes=%d\n", local_write_count, max_local_wait_us / 1000, max_local_payload
@@ -459,6 +499,16 @@ EOF_LOG
     local needle="$2"
     if [[ "$haystack" != *"$needle"* ]]; then
       echo "lowrtt probe self-test failed: missing '$needle'" >&2
+      echo "$haystack" >&2
+      exit 1
+    fi
+  }
+
+  assert_not_contains() {
+    local haystack="$1"
+    local needle="$2"
+    if [[ "$haystack" == *"$needle"* ]]; then
+      echo "lowrtt probe self-test failed: unexpectedly found '$needle'" >&2
       echo "$haystack" >&2
       exit 1
     fi
@@ -506,6 +556,23 @@ EOF_LOG
   summary="$(summarize_metrics_window 0 "late-remote-zero-self-test" "$iperf_sample" "$log_sample")"
   assert_contains "$summary" "relay_late_remote: post_finish_bytes=0 post_finish_reads=0"
   assert_contains "$summary" "attribution: no_pressure_signal"
+
+  cat > "$iperf_sample" <<'EOF_IPERF'
+Reverse mode, remote host 43.130.32.77 is sending
+[  5]   0.00-30.04  sec  3.00 MBytes   838 Kbits/sec    2             sender
+[  5]   0.00-30.00  sec  88.2 KBytes  24.1 Kbits/sec                  receiver
+EOF_IPERF
+  cat > "$log_sample" <<'EOF_LOG'
+🔎 tuic-open-tcp target=43.130.32.77:5201 conn=1 id=99
+📊 TUIC QUIC stats conn=1 id=99 rtt=8ms cwnd=247211 lost=0/35 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=33/9175B udp_rx=177/232816B dg_max=Some(1418) dg_space=1048576B
+🔎 tcp-relay-live handle=SocketHandle(1) epoch=1 writer_done=false read_only_after_local_finish=false uplink_bytes=37 uplink_writes=1 remote_to_global_rx_bytes=90312 remote_reads=6 remote_after_local_finish_bytes=0 remote_after_local_finish_reads=0 global_rx_wait_max_us=5 global_rx_pressure_events=0 local_write_wait_max_us=0 local_write_pressure_events=0
+📊 TUIC QUIC stats conn=1 id=99 rtt=5ms cwnd=247289 lost=0/105 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=103/14703B udp_rx=535/734789B dg_max=Some(1418) dg_space=1048576B
+EOF_LOG
+  summary="$(summarize_metrics_window 0 "reverse-sender-backpressure-self-test" "$iperf_sample" "$log_sample")"
+  assert_contains "$summary" "iperf_sender_mbps: 0.838"
+  assert_contains "$summary" "attribution: reverse_sender_backpressured"
+  summary="$(summarize_metrics_window 0 "udp-reverse-self-test" "$iperf_sample" "$log_sample" "udp")"
+  assert_not_contains "$summary" "reverse_sender_backpressured"
   echo "lowrtt probe self-test passed"
   rm -rf "$tmpdir"
   trap - EXIT
@@ -620,9 +687,10 @@ append_attribution_summary() {
   local start_line="$1"
   local title="$2"
   local iperf_file="$3"
+  local probe_kind="$4"
 
   append_subsection "Attribution Summary: $title"
-  summarize_metrics_window "$start_line" "$title" "$iperf_file" "$LOG" | tee -a "$OUT"
+  summarize_metrics_window "$start_line" "$title" "$iperf_file" "$LOG" "$probe_kind" | tee -a "$OUT"
 }
 
 append_cleanliness_check() {
@@ -659,6 +727,10 @@ append_cleanliness_check() {
 append_iperf_cmd() {
   local metrics_title="$1"
   shift
+  local probe_kind="tcp"
+  if [[ "$metrics_title" == *"UDP "* ]]; then
+    probe_kind="udp"
+  fi
 
   local start_line
   start_line="$(log_line_count)"
@@ -702,7 +774,7 @@ append_iperf_cmd() {
   done
   append_metrics_since "$start_line" "$metrics_title"
   if [[ -n "$tmp" && -f "$tmp" ]]; then
-    append_attribution_summary "$start_line" "$metrics_title" "$tmp"
+    append_attribution_summary "$start_line" "$metrics_title" "$tmp" "$probe_kind"
     rm -f "$tmp"
   fi
 }
