@@ -42,6 +42,9 @@ const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(9
 /// Knife14n：本地 Finish 已关闭上游写半边后，只剩远端读半边。若远端没有继续发数据或 EOF，
 /// 用短窗口关闭，避免 read-only relay 卡住 active gauge 并污染下一轮 suite。
 const RELAY_HALF_CLOSED_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Knife14ad：TCP 诊断打开时，relay task 的 live 计数采样周期。用于区分 reverse 数据是否真正到达
+/// 客户端 TUIC stream，默认随 `MINI_VPN_TCP_DIAG` 关闭。
+const RELAY_LIVE_DIAG_SECS: u64 = 5;
 /// Knife14v：本地 TCP 已无上行时，先让 reverse/downlink 继续跑；远端静默超过这个窗口后才把
 /// `Finish` 传播到上游写半边。避免 TUIC/exit 对早 FIN 的处理打断 reverse 流。
 const LOCAL_FINISH_DEFER_SECS: u64 = 5;
@@ -269,6 +272,30 @@ impl RelayTaskDiag {
             self.local_write_pressure_events += 1;
         }
     }
+}
+
+fn format_relay_live_diag(
+    handle: SocketHandle,
+    epoch: u64,
+    writer_done: bool,
+    read_only_after_local_finish: bool,
+    diag: &RelayTaskDiag,
+) -> String {
+    format!(
+        "🔎 tcp-relay-live handle={handle:?} epoch={epoch} writer_done={writer_done} \
+         read_only_after_local_finish={read_only_after_local_finish} \
+         uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} \
+         global_rx_wait_max_us={} global_rx_pressure_events={} \
+         local_write_wait_max_us={} local_write_pressure_events={}",
+        diag.uplink_bytes,
+        diag.local_writes,
+        diag.remote_to_global_rx_bytes,
+        diag.remote_reads,
+        diag.global_rx_wait_max_micros,
+        diag.global_rx_pressure_events,
+        diag.local_write_wait_max_micros,
+        diag.local_write_pressure_events
+    )
 }
 
 #[derive(Debug)]
@@ -2615,10 +2642,25 @@ async fn run_relay(
     let local_write_pressure_threshold = std::time::Duration::from_millis(5);
     let idle = tokio::time::sleep(RELAY_IDLE_TIMEOUT);
     tokio::pin!(idle);
+    let mut diag_tick = tokio::time::interval(std::time::Duration::from_secs(RELAY_LIVE_DIAG_SECS));
+    diag_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    diag_tick.tick().await;
     let mut writer_done = false;
     let mut read_only_after_local_finish = false;
     let (close_direction, close_reason) = loop {
         tokio::select! {
+            _ = diag_tick.tick(), if tcp_diag_enabled() => {
+                tcp_diag_log!(
+                    "{}",
+                    format_relay_live_diag(
+                        handle,
+                        epoch,
+                        writer_done,
+                        read_only_after_local_finish,
+                        &diag
+                    )
+                );
+            }
             signal = writer_signal_rx.recv(), if !writer_done => {
                 match signal {
                     Some(RelayWriterSignal::Progress { bytes, write_wait }) => {
@@ -4591,6 +4633,31 @@ mod tests {
         assert_eq!(diag.global_rx_pressure_events, 1);
         assert_eq!(diag.local_write_wait_max_micros, 30);
         assert_eq!(diag.local_write_pressure_events, 1);
+    }
+
+    #[test]
+    fn relay_live_diag_line_includes_directional_counters() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(TcpSocket::new(
+            TcpSocketBuffer::new(vec![0; 16]),
+            TcpSocketBuffer::new(vec![0; 16]),
+        ));
+        let mut diag = RelayTaskDiag::default();
+        diag.note_uplink_write(64);
+        diag.note_remote_read(128);
+
+        let line = format_relay_live_diag(handle, 7, true, true, &diag);
+
+        assert!(line.contains("tcp-relay-live"), "{line}");
+        assert!(line.contains("epoch=7"), "{line}");
+        assert!(line.contains("writer_done=true"), "{line}");
+        assert!(
+            line.contains("read_only_after_local_finish=true"),
+            "{line}"
+        );
+        assert!(line.contains("uplink_bytes=64"), "{line}");
+        assert!(line.contains("remote_to_global_rx_bytes=128"), "{line}");
+        assert!(line.contains("remote_reads=1"), "{line}");
     }
 
     /// 刀13 ①：MINI_VPN_TRACE 解析——`1`/`true`（去空白、不区分大小写）开；其它/缺省关

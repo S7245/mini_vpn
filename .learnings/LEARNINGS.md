@@ -1,5 +1,29 @@
 # Learnings
 
+## 2026-07-03 — Knife14ac: fresh reverse is still dead; add stream-level diagnostics
+
+`74d3d0a` was tested with
+`/tmp/mini_vpn/mvpn_knife14ac_usclient_suite_20260703_180352.tar.gz`. The run
+used `RUN_REVERSE_FIRST_P1=1`, `MINI_VPN_TUIC_TCP_POOL=4`, BBR, and 1MiB
+smoltcp TCP socket buffers. Direct baselines were healthy (`.77` forward
+receiver 282 Mbit/s, reverse receiver 266 Mbit/s), but the fresh tunnel reverse
+P1 receiver was only 62.5 Kbit/s.
+
+This rejects two earlier sufficient-cause branches: the 64KiB local socket
+window is no longer enough to explain the failure, and forward traffic on the
+same QUIC connection is not required to poison reverse because reverse-first
+failed before the normal sweep. Client QUIC connection stats showed no loss,
+blocked frames, or loop CPU pressure during the reverse probe. The relay for the
+data flow only reached `tcp-relay-write-half-closed ... reason=local_finish` and
+then remained active without a close line in the captured window.
+
+Knife14ad therefore adds per-TUIC TCP open diagnostics and relay live counters
+behind `MINI_VPN_TCP_DIAG=1`, and teaches the low-RTT probe to include those
+lines in markdown summaries. Reusable rule: when reverse-first is nearly silent
+while client loop/QUIC stats are idle, stop tuning buffers/CC/pool and collect
+per-stream evidence that distinguishes "client received no remote bytes" from
+".33/sing-box/exit did not send them."
+
 ## 2026-07-03 — Knife14ab: 1MiB TCP socket buffers helped forward but not reverse
 
 `3af4f7c` was tested with

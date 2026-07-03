@@ -200,6 +200,11 @@ fn parse_truthy(s: Option<&str>) -> bool {
     )
 }
 
+fn tcp_diag_enabled() -> bool {
+    static TCP_DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TCP_DIAG.get_or_init(|| parse_truthy(std::env::var("MINI_VPN_TCP_DIAG").ok().as_deref()))
+}
+
 /// TCP pool 轮询选择。`pool_len` 在生产中恒非 0；纯函数保底处理 0，避免测试/未来误用 panic。
 fn tcp_pool_index(pool_len: usize, cursor: u64) -> usize {
     if pool_len == 0 {
@@ -770,6 +775,15 @@ fn format_quic_stats_line(conn_index: usize, stable_id: usize, stats: QuicStatsS
     )
 }
 
+fn format_tuic_tcp_open_line(target: &TargetAddr, conn_index: usize, stable_id: usize) -> String {
+    format!(
+        "🔎 tuic-open-tcp target={} conn={} id={}",
+        target.to_wire_string(),
+        conn_index,
+        stable_id
+    )
+}
+
 fn quic_stats_snapshot(conn: &Connection) -> QuicStatsSnapshot {
     let stats = conn.stats();
     QuicStatsSnapshot {
@@ -1116,10 +1130,10 @@ impl TuicUpstream {
     }
 
     /// TCP 专用连接选择：默认 pool=1 时等价旧行为；pool>1 时 round-robin 分散新流。
-    async fn live_tcp_conn(&self) -> Result<Connection, ClientError> {
+    async fn live_tcp_conn(&self) -> Result<(usize, Connection), ClientError> {
         let cursor = self.tcp_next.fetch_add(1, Ordering::Relaxed);
         let index = tcp_pool_index(self.conns.len(), cursor);
-        self.live_conn_at(index).await
+        Ok((index, self.live_conn_at(index).await?))
     }
 
     /// 取当前活连接克隆——**非阻塞、不重连**（刀9，ADR-0011 §3b）。锁被占（后台 start_udp 正在重连，持锁
@@ -1374,7 +1388,7 @@ fn udp_reconnect_backoff(attempt: u32) -> Duration {
 impl ProxyUpstream for TuicUpstream {
     async fn open_tcp(&self, target: &TargetAddr) -> Result<RelayStream, ClientError> {
         // 取 TCP pool 活连接，断了只重连该槽位；pool=1 时等价旧行为。
-        let conn = self.live_tcp_conn().await?;
+        let (conn_index, conn) = self.live_tcp_conn().await?;
         // 刀9（真出口 acceptance 修）：open_bi + write Connect 在**黑洞连接**上会 hang——连接尚未被
         // 判死（close_reason 仍 None，因 keepalive/非对称封锁架空 idle 检测），但 QUIC send 窗口满、
         // 收不到 ACK → write_all 无限阻塞，failover 快/慢路都收不到信号。封 5s 超时让黑洞 open **快速失败**
@@ -1388,6 +1402,12 @@ impl ProxyUpstream for TuicUpstream {
             send.write_all(&encode_connect(target))
                 .await
                 .map_err(|e| io_err("tuic connect write", e))?;
+            if tcp_diag_enabled() {
+                println!(
+                    "{}",
+                    format_tuic_tcp_open_line(target, conn_index, conn.stable_id())
+                );
+            }
             // 把双向流的收/发两半合成一条 AsyncRead+AsyncWrite，喂给现有双向泵。
             Ok::<RelayStream, ClientError>(Box::new(tokio::io::join(recv, send)))
         };
@@ -1637,6 +1657,17 @@ mod tests {
         );
         assert!(line.contains("dg_max=Some(1375)"), "{line}");
         assert!(line.contains("dg_space=18B"), "{line}");
+    }
+
+    #[test]
+    fn format_tuic_tcp_open_line_includes_target_pool_and_id() {
+        let target = TargetAddr::parse("1.2.3.4:5201").unwrap();
+        let line = format_tuic_tcp_open_line(&target, 3, 42);
+
+        assert!(line.contains("tuic-open-tcp"), "{line}");
+        assert!(line.contains("target=1.2.3.4:5201"), "{line}");
+        assert!(line.contains("conn=3"), "{line}");
+        assert!(line.contains("id=42"), "{line}");
     }
 
     #[test]

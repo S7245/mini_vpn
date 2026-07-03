@@ -1,5 +1,18 @@
 # Errors
 
+## 2026-07-03 — `cargo fmt --check` is noisy on the current historical tree
+
+- Stage: Knife14ad local verification after adding stream-level diagnostics.
+- Symptom: `cargo fmt --check` failed with a huge rustfmt diff spanning many
+  pre-existing files and hunks outside the current change. No files were changed
+  because it was a check-only command.
+- Rejected assumption: a failing full-repo fmt check necessarily means the
+  current small patch should run `cargo fmt` and accept the resulting churn.
+- Correct behavior: for scoped acceptance/debugging stages, use
+  `git diff --check`, focused tests, full `cargo test`, and `cargo clippy
+  --all-targets -- -D warnings`. Only run/apply broad formatting when the stage
+  explicitly owns formatting cleanup.
+
 ## 2026-07-03 — Knife14ab disproved socket buffer as sufficient reverse fix
 
 - Log bundle: `/tmp/mini_vpn/mvpn_knife14ab_usclient_suite_20260703_172934.tar.gz`
