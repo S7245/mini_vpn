@@ -1,5 +1,31 @@
 # Learnings
 
+## 2026-07-03 — Knife14x: client windows applied, remaining stall needs QUIC stats
+
+`ee2e83a` was tested with
+`/tmp/mvpn_knife14x_usclient_suite_20260703_120013.tar.gz`. The suite reached
+the full tunnel path and completed. Cargo discovery/build worked, `.33`
+reachability and `.77:5201` direct iperf service passed, and the TUIC startup
+log confirmed the explicit client QUIC windows:
+`bidi=512 uni=4096 stream_rx=8388608B conn_rx=33554432B send=33554432B`.
+
+The result did not recover throughput. Direct `.77` iperf receiver was about
+285 Mbit/s, but tunnel forward stayed around Kbit/s to low Mbit/s and reverse
+remained Kbit/s-scale or timed out. `tcp-local-write-pressure` remained active:
+104 pressure lines, average wait about 5.1s, max wait about 37.8s, while
+`global_rx_pressure_events` stayed zero.
+
+Knife14y should not keep tuning client windows or relay batching. Add QUIC
+connection stats (`tx_blocked`, `rx_blocked`, `cwnd`, loss, congestion events,
+and window-update frame counts) so the next acceptance bundle can distinguish
+peer/server flow-control from congestion/path loss.
+
+Reusable rule: once explicit client windows are logged and long write waits
+remain, treat the next step as attribution, not another throughput tweak. If
+`tx_blocked(data|stream)` climbs with low loss, inspect sing-box/server
+flow-control. If loss/congestion climbs or cwnd stays tiny, test congestion
+control or the VPS path.
+
 ## 2026-07-03 — Knife14w2: writer coalescing exposed real QUIC stream write pressure
 
 `95bfe47` was tested with

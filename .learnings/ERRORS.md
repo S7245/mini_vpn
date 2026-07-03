@@ -1,5 +1,25 @@
 # Errors
 
+## 2026-07-03 — ee2e83a proved client window tuning alone is insufficient
+
+- Log bundle: `/tmp/mvpn_knife14x_usclient_suite_20260703_120013.tar.gz`
+- Tested commit: `ee2e83a`
+- Symptom: direct `.77` iperf receiver was healthy at about 285 Mbit/s, but
+  tunnel forward remained Kbit/s-to-low-Mbit/s and reverse remained
+  Kbit/s-scale or timed out.
+- Important discriminator: the startup log confirmed the new client windows
+  (`stream_rx=8388608B`, `conn_rx=33554432B`, `send=33554432B`), yet
+  `tcp-local-write-pressure` still appeared 104 times with max wait about
+  37.8s. `global_rx_pressure_events` stayed zero.
+- Rejected assumption: making the client QUIC windows explicit is enough to
+  resolve the long `write_all` stalls.
+- Correct behavior: add QUIC connection stats around the stall so the next run
+  can attribute it to peer flow-control, congestion/path loss, or server/egress
+  behavior.
+- Future debugging rule: after a client-window change is confirmed in the live
+  log, do not repeat that same tuning loop. Instrument blocked frames and path
+  stats before deciding between server config, BBR/Cubic A/B, or VPS path tests.
+
 ## 2026-07-03 — 95bfe47 exposed long TUIC stream write waits after coalescing
 
 - Log bundle: `/tmp/mvpn_knife14w2_usclient_suite_20260703_112033.tar.gz`

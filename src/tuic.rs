@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 /// 默认 ALPN：TUIC over QUIC 常用 `h3`，必须与 sing-box `tls.alpn` 一致。
 const DEFAULT_TUIC_ALPN: &str = "h3";
@@ -30,6 +30,7 @@ const DEFAULT_TUIC_CC: &str = "cubic";
 const DEFAULT_TUIC_UDP_MODE: &str = "native";
 const DEFAULT_TUIC_TCP_POOL: usize = 1;
 const MAX_TUIC_TCP_POOL: usize = 16;
+const DEFAULT_TUIC_QUIC_STATS_SECS: u64 = 30;
 
 /// TUIC 客户端配置（单一事实源；桌面从 env 加载，移动端将来从 file/FFI 注入）。
 /// 中文要点：凭据(uuid/password)经自定义 Debug **脱敏**，绝不随日志泄漏。
@@ -44,6 +45,10 @@ pub struct TuicClientConfig {
     pub congestion_control: String,
     pub udp_relay_mode: String,
     pub tcp_pool: usize,
+    /// QUIC connection stats logging interval. `None` keeps normal runtime quiet; acceptance
+    /// enables it through `MINI_VPN_TCP_DIAG=1`, or explicitly via
+    /// `MINI_VPN_TUIC_QUIC_STATS_SECS`.
+    pub quic_stats_secs: Option<u64>,
     /// 重连是否尝试 QUIC 0-RTT（**默认 false**：quinn 0.10 在 0-RTT 阶段不支持 `export_keying_material`，
     /// TUIC auth 必失败、自愈回落 1-RTT；显式开仅供实验/未来 quinn 升级。失败时总能回落，不致命）。
     pub zero_rtt: bool,
@@ -61,6 +66,7 @@ impl std::fmt::Debug for TuicClientConfig {
             .field("congestion_control", &self.congestion_control)
             .field("udp_relay_mode", &self.udp_relay_mode)
             .field("tcp_pool", &self.tcp_pool)
+            .field("quic_stats_secs", &self.quic_stats_secs)
             .field("zero_rtt", &self.zero_rtt)
             .finish()
     }
@@ -111,6 +117,7 @@ impl TuicClientConfig {
             congestion_control: DEFAULT_TUIC_CC.to_string(),
             udp_relay_mode: DEFAULT_TUIC_UDP_MODE.to_string(),
             tcp_pool: DEFAULT_TUIC_TCP_POOL,
+            quic_stats_secs: None,
             // 默认关：quinn 0.10 在 0-RTT 阶段不支持 export_keying_material（TUIC auth 必失败回落）。
             // 显式 `MINI_VPN_TUIC_ZERO_RTT=true` 可启用（实验/未来 quinn 升级）。
             zero_rtt: false,
@@ -134,6 +141,11 @@ impl TuicClientConfig {
         cfg.congestion_control = override_field(cfg.congestion_control, g("MINI_VPN_TUIC_CC"));
         cfg.udp_relay_mode = override_field(cfg.udp_relay_mode, g("MINI_VPN_TUIC_UDP_MODE"));
         cfg.tcp_pool = parse_tcp_pool(g("MINI_VPN_TUIC_TCP_POOL").as_deref());
+        cfg.quic_stats_secs = parse_quic_stats_secs(
+            g("MINI_VPN_TUIC_QUIC_STATS_SECS").as_deref(),
+            g("MINI_VPN_TCP_DIAG").as_deref(),
+            g("MINI_VPN_METRICS_SECS").as_deref(),
+        );
         Ok(cfg)
     }
 }
@@ -155,6 +167,39 @@ fn parse_tcp_pool(s: Option<&str>) -> usize {
         .clamp(DEFAULT_TUIC_TCP_POOL, MAX_TUIC_TCP_POOL)
 }
 
+/// 解析 QUIC stats 日志周期。
+/// 中文要点：acceptance 已用 `MINI_VPN_TCP_DIAG=1` 打开 TCP 诊断，因此默认跟随该开关并复用
+/// `MINI_VPN_METRICS_SECS` 周期；生产默认静默。显式 `MINI_VPN_TUIC_QUIC_STATS_SECS=0` 可关闭。
+fn parse_quic_stats_secs(
+    explicit: Option<&str>,
+    tcp_diag: Option<&str>,
+    metrics_secs: Option<&str>,
+) -> Option<u64> {
+    if let Some(v) = explicit {
+        return v
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .and_then(|secs| (secs > 0).then_some(secs));
+    }
+    if !parse_truthy(tcp_diag) {
+        return None;
+    }
+    Some(
+        metrics_secs
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&secs| secs > 0)
+            .unwrap_or(DEFAULT_TUIC_QUIC_STATS_SECS),
+    )
+}
+
+fn parse_truthy(s: Option<&str>) -> bool {
+    matches!(
+        s.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("true") | Some("1") | Some("on") | Some("yes")
+    )
+}
+
 /// TCP pool 轮询选择。`pool_len` 在生产中恒非 0；纯函数保底处理 0，避免测试/未来误用 panic。
 fn tcp_pool_index(pool_len: usize, cursor: u64) -> usize {
     if pool_len == 0 {
@@ -169,10 +214,7 @@ fn tcp_pool_index(pool_len: usize, cursor: u64) -> usize {
 /// 而 TUIC token 依赖它 → 0-RTT 认证必失败、自愈回落 1-RTT（实测 2026-06-11，见 13c 验收）。默认开纯属
 /// 每次重连白跑一次握手，故默认关；保留开关供未来 quinn 支持 0-RTT keying-material 后启用。
 fn parse_zero_rtt(s: Option<&str>) -> bool {
-    matches!(
-        s.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-        Some("true") | Some("1") | Some("on") | Some("yes")
-    )
+    parse_truthy(s)
 }
 
 /// TUIC 协议版本字节。
@@ -666,6 +708,128 @@ pub fn format_udp_stats(
     )
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct QuicStatsSnapshot {
+    rtt_ms: u128,
+    cwnd: u64,
+    lost_packets: u64,
+    sent_packets: u64,
+    lost_bytes: u64,
+    congestion_events: u64,
+    tx_data_blocked: u64,
+    tx_stream_data_blocked: u64,
+    tx_streams_blocked_bidi: u64,
+    tx_streams_blocked_uni: u64,
+    tx_max_data: u64,
+    tx_max_stream_data: u64,
+    rx_data_blocked: u64,
+    rx_stream_data_blocked: u64,
+    rx_max_data: u64,
+    rx_max_stream_data: u64,
+    udp_tx_datagrams: u64,
+    udp_tx_bytes: u64,
+    udp_rx_datagrams: u64,
+    udp_rx_bytes: u64,
+    datagram_max: Option<usize>,
+    datagram_send_buffer_space: usize,
+}
+
+/// 格式化 QUIC 连接级诊断（刀14y）。
+/// 中文要点：`tx_blocked` 是本端发送 DATA_BLOCKED/STREAM_DATA_BLOCKED，直接指向对端 flow-control；
+/// `cwnd/lost/congestion_events` 指向拥塞/丢包。两组指标一起看，下一轮 acceptance 不再盲猜。
+fn format_quic_stats_line(conn_index: usize, stable_id: usize, stats: QuicStatsSnapshot) -> String {
+    format!(
+        "📊 TUIC QUIC stats conn={conn_index} id={stable_id} \
+         rtt={}ms cwnd={} lost={}/{} lost_bytes={} congestion_events={} \
+         tx_blocked(data={},stream={},streams_bidi={},streams_uni={}) \
+         rx_blocked(data={},stream={}) tx_window(max_data={},max_stream_data={}) \
+         rx_window(max_data={},max_stream_data={}) udp_tx={}/{}B udp_rx={}/{}B \
+         dg_max={:?} dg_space={}B",
+        stats.rtt_ms,
+        stats.cwnd,
+        stats.lost_packets,
+        stats.sent_packets,
+        stats.lost_bytes,
+        stats.congestion_events,
+        stats.tx_data_blocked,
+        stats.tx_stream_data_blocked,
+        stats.tx_streams_blocked_bidi,
+        stats.tx_streams_blocked_uni,
+        stats.rx_data_blocked,
+        stats.rx_stream_data_blocked,
+        stats.tx_max_data,
+        stats.tx_max_stream_data,
+        stats.rx_max_data,
+        stats.rx_max_stream_data,
+        stats.udp_tx_datagrams,
+        stats.udp_tx_bytes,
+        stats.udp_rx_datagrams,
+        stats.udp_rx_bytes,
+        stats.datagram_max,
+        stats.datagram_send_buffer_space
+    )
+}
+
+fn quic_stats_snapshot(conn: &Connection) -> QuicStatsSnapshot {
+    let stats = conn.stats();
+    QuicStatsSnapshot {
+        rtt_ms: stats.path.rtt.as_millis(),
+        cwnd: stats.path.cwnd,
+        lost_packets: stats.path.lost_packets,
+        sent_packets: stats.path.sent_packets,
+        lost_bytes: stats.path.lost_bytes,
+        congestion_events: stats.path.congestion_events,
+        tx_data_blocked: stats.frame_tx.data_blocked,
+        tx_stream_data_blocked: stats.frame_tx.stream_data_blocked,
+        tx_streams_blocked_bidi: stats.frame_tx.streams_blocked_bidi,
+        tx_streams_blocked_uni: stats.frame_tx.streams_blocked_uni,
+        tx_max_data: stats.frame_tx.max_data,
+        tx_max_stream_data: stats.frame_tx.max_stream_data,
+        rx_data_blocked: stats.frame_rx.data_blocked,
+        rx_stream_data_blocked: stats.frame_rx.stream_data_blocked,
+        rx_max_data: stats.frame_rx.max_data,
+        rx_max_stream_data: stats.frame_rx.max_stream_data,
+        udp_tx_datagrams: stats.udp_tx.datagrams,
+        udp_tx_bytes: stats.udp_tx.bytes,
+        udp_rx_datagrams: stats.udp_rx.datagrams,
+        udp_rx_bytes: stats.udp_rx.bytes,
+        datagram_max: conn.max_datagram_size(),
+        datagram_send_buffer_space: conn.datagram_send_buffer_space(),
+    }
+}
+
+fn spawn_quic_stats_logger(
+    conn: Connection,
+    conn_index: usize,
+    interval_secs: u64,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let stable_id = conn.stable_id();
+                    if let Some(reason) = conn.close_reason() {
+                        println!("📊 TUIC QUIC stats conn={conn_index} id={stable_id} closed={reason:?}");
+                        break;
+                    }
+                    println!(
+                        "{}",
+                        format_quic_stats_line(conn_index, stable_id, quic_stats_snapshot(&conn))
+                    );
+                }
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// 把任意可显示错误包成 ClientError（统一错误面）。
 fn io_err<E: std::fmt::Display>(ctx: &str, e: E) -> ClientError {
     ClientError::from(std::io::Error::other(format!("{ctx}: {e}")))
@@ -704,6 +868,10 @@ pub struct TuicUpstream {
     clock: std::time::Instant,
     /// 重连是否尝试 0-RTT（来自 config；失败自愈回落 1-RTT）。
     zero_rtt: bool,
+    /// QUIC 连接级 stats 日志周期；`None` 表示关闭。
+    quic_stats_secs: Option<u64>,
+    /// QUIC stats task 停止信号。`Drop` 时触发，避免诊断 task 持有 `Connection` clone 延长连接生命周期。
+    quic_stats_stop: Option<watch::Sender<bool>>,
     /// UDP relay mode（刀3.5；来自 config）：`Quic` → 所有上行包走 uni-stream（首包即触发 server
     /// 下行镜像 stream，摆脱 datagram 天花板）；`Native` → datagram 主 + 超限 stream 兜底（刀3 行为）。
     udp_relay_mode: UdpRelayMode,
@@ -766,8 +934,15 @@ impl TuicUpstream {
         );
         let tcp_pool = cfg.tcp_pool.clamp(DEFAULT_TUIC_TCP_POOL, MAX_TUIC_TCP_POOL);
         let mut conns = Vec::with_capacity(tcp_pool);
+        let quic_stats_stop = cfg.quic_stats_secs.map(|_| watch::channel(false).0);
+        if let Some(secs) = cfg.quic_stats_secs {
+            println!("🔬 TUIC QUIC stats 已启用：每 {secs}s 打印连接级 flow/congestion 指标");
+            if let Some(stop) = &quic_stats_stop {
+                spawn_quic_stats_logger(conn.clone(), 0, secs, stop.subscribe());
+            }
+        }
         conns.push(Mutex::new(conn));
-        for _ in 1..tcp_pool {
+        for index in 1..tcp_pool {
             let extra = Self::handshake(
                 &endpoint,
                 cfg.server,
@@ -777,6 +952,11 @@ impl TuicUpstream {
                 cfg.zero_rtt,
             )
             .await?;
+            if let Some(secs) = cfg.quic_stats_secs
+                && let Some(stop) = &quic_stats_stop
+            {
+                spawn_quic_stats_logger(extra.clone(), index, secs, stop.subscribe());
+            }
             conns.push(Mutex::new(extra));
         }
         if tcp_pool > 1 {
@@ -797,6 +977,8 @@ impl TuicUpstream {
             last_udp_activity: AtomicU64::new(0),
             clock: std::time::Instant::now(),
             zero_rtt: cfg.zero_rtt,
+            quic_stats_secs: cfg.quic_stats_secs,
+            quic_stats_stop,
             udp_relay_mode,
             metrics,
         })
@@ -924,6 +1106,11 @@ impl TuicUpstream {
                         "5s 超时（黑洞/不可达；failover 据 is_dead 切备腿）",
                     )
                 })??;
+            if let Some(secs) = self.quic_stats_secs
+                && let Some(stop) = &self.quic_stats_stop
+            {
+                spawn_quic_stats_logger(guard.clone(), index, secs, stop.subscribe());
+            }
         }
         Ok(guard.clone())
     }
@@ -1238,6 +1425,14 @@ impl DatagramUpstream for TuicUpstream {
     }
 }
 
+impl Drop for TuicUpstream {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.quic_stats_stop {
+            let _ = stop.send(true);
+        }
+    }
+}
+
 /// 刀9 F1：failover 健康探测面。`probe` 主动探活（live_conn=QUIC 握手+TUIC 认证，非浅探）；
 /// `is_dead` 区分 down 快路（黑洞，连接被 idle/keepalive 打死）/慢路（流失败）。
 #[async_trait::async_trait]
@@ -1349,6 +1544,7 @@ mod tests {
         assert_eq!(c.congestion_control, "cubic"); // 刀3.5 实测裁决：datagram 路径 Cubic 优于 BBR
         assert_eq!(c.udp_relay_mode, "native");
         assert_eq!(c.tcp_pool, 1);
+        assert_eq!(c.quic_stats_secs, None);
         assert!(
             !c.zero_rtt,
             "0-RTT 默认关（quinn 0.10 在 0-RTT 不支持 keying-material 导出）"
@@ -1376,6 +1572,71 @@ mod tests {
         assert_eq!(parse_tcp_pool(Some("nope")), 1);
         assert_eq!(parse_tcp_pool(Some("4")), 4);
         assert_eq!(parse_tcp_pool(Some("999")), MAX_TUIC_TCP_POOL);
+    }
+
+    #[test]
+    fn quic_stats_secs_follows_tcp_diag_or_explicit_override() {
+        assert_eq!(parse_quic_stats_secs(None, None, Some("5")), None);
+        assert_eq!(parse_quic_stats_secs(None, Some("1"), Some("5")), Some(5));
+        assert_eq!(
+            parse_quic_stats_secs(None, Some("true"), Some("nope")),
+            Some(DEFAULT_TUIC_QUIC_STATS_SECS)
+        );
+        assert_eq!(
+            parse_quic_stats_secs(Some("7"), Some("0"), Some("5")),
+            Some(7)
+        );
+        assert_eq!(parse_quic_stats_secs(Some("0"), Some("1"), Some("5")), None);
+        assert_eq!(
+            parse_quic_stats_secs(Some("nope"), Some("1"), Some("5")),
+            None
+        );
+    }
+
+    #[test]
+    fn format_quic_stats_line_includes_flow_and_congestion_signals() {
+        let line = format_quic_stats_line(
+            2,
+            99,
+            QuicStatsSnapshot {
+                rtt_ms: 181,
+                cwnd: 65_535,
+                lost_packets: 3,
+                sent_packets: 100,
+                lost_bytes: 4096,
+                congestion_events: 2,
+                tx_data_blocked: 4,
+                tx_stream_data_blocked: 5,
+                tx_streams_blocked_bidi: 6,
+                tx_streams_blocked_uni: 7,
+                tx_max_data: 8,
+                tx_max_stream_data: 9,
+                rx_data_blocked: 10,
+                rx_stream_data_blocked: 11,
+                rx_max_data: 12,
+                rx_max_stream_data: 13,
+                udp_tx_datagrams: 14,
+                udp_tx_bytes: 15,
+                udp_rx_datagrams: 16,
+                udp_rx_bytes: 17,
+                datagram_max: Some(1375),
+                datagram_send_buffer_space: 18,
+            },
+        );
+        assert!(line.contains("conn=2"), "{line}");
+        assert!(line.contains("id=99"), "{line}");
+        assert!(line.contains("rtt=181ms"), "{line}");
+        assert!(line.contains("cwnd=65535"), "{line}");
+        assert!(line.contains("lost=3/100"), "{line}");
+        assert!(line.contains("congestion_events=2"), "{line}");
+        assert!(line.contains("tx_blocked(data=4,stream=5"), "{line}");
+        assert!(line.contains("rx_blocked(data=10,stream=11"), "{line}");
+        assert!(
+            line.contains("rx_window(max_data=12,max_stream_data=13"),
+            "{line}"
+        );
+        assert!(line.contains("dg_max=Some(1375)"), "{line}");
+        assert!(line.contains("dg_space=18B"), "{line}");
     }
 
     #[test]
