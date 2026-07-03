@@ -1,5 +1,20 @@
 # Errors
 
+## 2026-07-03 — Noninteractive Client VPS SSH does not carry TUIC env
+
+- Stage: Knife14ag VPS acceptance attempt after pushing `4c62d74`.
+- Preflight result: `.33` sing-box and `.77` iperf3 were active; `.27` was
+  fast-forwarded to `4c62d74`; `bash scripts/knife14b-lowrtt-probe.sh
+  --self-test` passed on `.27`.
+- Blocker: noninteractive SSH, `bash -lc`, and `sudo -E` on `.27` all reported
+  `MINI_VPN_TUIC_SERVER`, `MINI_VPN_TUIC_UUID`, `MINI_VPN_TUIC_PASSWORD`,
+  `MINI_VPN_TUIC_SNI`, `MINI_VPN_TUIC_CA_PATH`, and `MINI_VPN_TUIC_ALPN` as
+  missing. A file-name-only search found no common `.env`/`*env*` candidate.
+- Correct behavior: before launching an expensive VPS suite from a fresh SSH
+  session, verify TUIC env presence without printing values. If missing, ask for
+  an env file path or have the user run/export the credentials from a shell that
+  already has them; do not inspect shell history or reports for secrets.
+
 ## 2026-07-03 — Shell parser tests must cover Bash and BSD awk strictness
 
 - Stage: Knife14ag local verification for low-RTT probe attribution summaries.
