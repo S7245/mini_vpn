@@ -1,5 +1,42 @@
 # Learnings
 
+## 2026-07-03 — Knife14ah VPS run moved reverse failure to server-side backpressure
+
+`4282682` was tested from `.27` with
+`/tmp/mini_vpn/mvpn_knife14ah_usclient_suite_20260703_231523.tar.gz`.
+The run used `.27`'s project-local `.evn` silently, `MINI_VPN_TUIC_CC=bbr`,
+`MINI_VPN_TUIC_TCP_POOL=4`, and a reverse-first P1 probe.
+
+The direct host/path preflights were healthy: `.27 -> .77` 257 Mbit/s
+receiver, `.77 -> .27` 264 Mbit/s receiver, `.33 -> .77` 283 Mbit/s receiver,
+and `.77 -> .33` 269 Mbit/s receiver. The tunnel reverse-first P1 was still
+Kbit/s-scale: iperf sender reported 3.00 MBytes / 838 Kbit/s with 2 retries,
+while the receiver reported 88.2 KBytes / 24.1 Kbit/s.
+
+Knife14ah's new relay counters split the previous late-remote branch further.
+During the iperf window, handle 1 had already read 90,312 remote bytes before
+local `Finish`, with no local write pressure, no global_rx pressure, no
+downlink backpressure, no QUIC loss/congestion, and no QUIC blocked-frame
+delta. After local `Finish`, the same relay read another 96,624 bytes and
+closed by `half_closed_idle_timeout`; `tcp-handle-close` showed `pending=0`,
+`send_slice_accepted=186936`, and zero TUN flush failures.
+
+The decisive new discriminator came from `.77` iperf3 journal for the same
+time window: the target-side sender only produced 3.00 MBytes in the first
+second, then 29 seconds of 0 bytes with cwnd about 432 KBytes. `.33`
+sing-box logs showed both TUIC inbound/direct outbound opens to `.77:5201` at
+23:15:55 CST, but no close/error detail in the INFO log. This means the next
+question is no longer whether the client local loop dropped received bytes; it
+is why the target TCP sender is rapidly backpressured when the path goes
+through sing-box/TUIC.
+
+Reusable rule: for reverse no-pressure runs, always correlate three views
+before tuning client buffers: client relay accepted bytes, target iperf sender
+timeline, and exit/sing-box connection logs. If the target sender itself stops
+after a tiny burst while direct exit-target reverse is healthy, inspect
+server-side TUIC stream flow-control/write pressure or protocol semantics
+before changing local downlink watermarks.
+
 ## 2026-07-03 — Knife14ah labels late remote bytes after local Finish
 
 Knife14ag's reverse-first blocker was not stale pool, local pressure, downlink

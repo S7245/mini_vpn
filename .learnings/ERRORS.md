@@ -1,5 +1,31 @@
 # Errors
 
+## 2026-07-03 — Knife14ah reverse-first backpressured target sender through TUIC
+
+- Log bundle:
+  `/tmp/mini_vpn/mvpn_knife14ah_usclient_suite_20260703_231523.tar.gz`
+- Tested commit: `4282682`
+- Symptom: reverse-first P1 over the tunnel exited 0 but delivered only
+  88.2 KBytes / 24.1 Kbit/s to the receiver. The suite skipped standard P1 and
+  full sweep because one relay stayed active after the quiet wait.
+- Important discriminator: client-side relay diagnostics showed no local write
+  pressure, no global_rx pressure, no downlink backpressure, no QUIC
+  loss/congestion or blocked-frame deltas, and no stale-pool reconnects.
+  The relay accepted 186,936 remote bytes total into smoltcp with `pending=0`
+  and zero TUN flush failures.
+- Late signal: 90,312 bytes arrived before local `Finish`; another 96,624
+  bytes arrived after local `Finish`, then the relay closed by
+  `half_closed_idle_timeout`.
+- Server-side signal: `.77` iperf3 journal showed the reverse sender only sent
+  3.00 MBytes in the first second, then 29 seconds of 0 bytes with cwnd about
+  432 KBytes. `.33` sing-box INFO logs showed TUIC inbound and direct outbound
+  opens to `.77:5201` at the run time, but no close/error detail.
+- Correct behavior: do not tune client local downlink queues, socket buffers,
+  stale slot handling, or congestion control from this result. First add or
+  collect diagnostics that distinguish sing-box/TUIC server-side stream
+  flow-control/write pressure, target TCP receive-window behavior, and TUIC
+  Connect half-close semantics.
+
 ## 2026-07-03 — Full `cargo test` can fail on local QUIC endpoint bind
 
 - Stage: Knife14ah local verification.
