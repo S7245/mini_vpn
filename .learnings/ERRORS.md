@@ -1,5 +1,25 @@
 # Errors
 
+## 2026-07-03 — 95bfe47 exposed long TUIC stream write waits after coalescing
+
+- Log bundle: `/tmp/mvpn_knife14w2_usclient_suite_20260703_112033.tar.gz`
+- Tested commit: `95bfe47`
+- Symptom: direct `.77` iperf receiver was healthy at about 281 Mbit/s, but
+  tunnel forward P1 was 2.83 Mbit/s receiver and reverse P1 was 314 Kbit/s
+  receiver. Reverse P2/P4/P8 later timed out.
+- Important discriminator: `global_rx_pressure_events=0`; the main loop was
+  mostly parked; forward writer payloads were often 64KiB-class; and
+  `tcp-local-write-pressure` appeared 110 times with waits up to multi-second
+  and tens-of-seconds ranges.
+- Rejected assumption: after writer-side coalescing, remaining low throughput is
+  still caused by too many MSS-sized `write_all` calls.
+- Correct behavior: make client QUIC stream/data/send windows explicit and log
+  them. If pressure remains with larger client windows, investigate peer/server
+  flow-control, congestion controller choice, and path loss.
+- Future debugging rule: when coalescing proves batching is active, do not keep
+  tuning relay batching blindly. Follow the pressure signal into QUIC transport
+  windows and congestion-control evidence.
+
 ## 2026-07-03 — 1144fc2 suite failed because root PATH missed cargo
 
 - Log bundle: `/tmp/mvpn_knife14w_usclient_suite_20260703_111144.tar.gz`

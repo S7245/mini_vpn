@@ -63,7 +63,21 @@ pub fn parse_cc(name: &str) -> (CcChoice, bool) {
 /// 下行 uni-stream 并发配额（刀3.5）：quinn 默认仅 **100**，而 quic-relay-mode 每包一条 uni-stream，
 /// 4K 下行 ~2600pps × ~1RTT(0.25s) ≈ 650 条在飞、多 flow(~33M) ≈ 850 条 → 默认 100 会让下行 stream
 /// 一开就阻塞塌缩（TUIC issue #221）。抬到 4096：按需建流、空闲不预分配，上限不是预分配开销。
-const QUIC_MAX_CONCURRENT_UNI_STREAMS: u32 = 4096;
+pub const QUIC_MAX_CONCURRENT_UNI_STREAMS: u32 = 4096;
+/// 入站 bidi-stream 并发配额。TUIC TCP Connect 主要由客户端开 bidi stream，但保持一个高于 quinn
+/// 默认 100 的显式上限，避免未来 server-initiated/control stream 误踩默认值；总接收内存仍由
+/// `QUIC_RECEIVE_WINDOW_BYTES` 约束。
+pub const QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 512;
+/// 单 stream 接收窗口。quinn 默认按 100ms × 100Mbit/s 估算约 1.25MB；跨 VPS / 跨境链路 RTT
+/// 更高时，reverse/downlink TCP 会被窗口周期性卡住。8MB 覆盖约 250Mbit/s × 250ms 的 BDP，
+/// 同时仍足够小，避免单 stream 长时间吞掉所有接收缓冲。
+pub const QUIC_STREAM_RECEIVE_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
+/// 连接级接收窗口。多条 TCP stream 同时下行时需要高于单 stream 窗口；32MB 覆盖高并发测试，
+/// 并为 `max_concurrent_bidi_streams * stream_receive_window` 提供实际内存上界。
+pub const QUIC_RECEIVE_WINDOW_BYTES: u32 = 32 * 1024 * 1024;
+/// 本端发送窗口上限。默认约 10MB，长 RTT 或多 stream forward 时容易在应用写入处表现成
+/// `tcp-local-write-pressure`。32MB 给高吞吐 TCP 留出更接近真实 BDP 的在飞空间。
+pub const QUIC_SEND_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
 
 /// 共享的 QUIC 传输参数：keep-alive + 拉长 idle + 起步 MTU + CC + uni-stream 配额（datagram 等其余默认）。
 /// 中文要点（刀3.5）：装 `congestion_controller_factory`（quinn 默认 Cubic；高 RTT/丢包跨境 BBR 通常更优）
@@ -76,7 +90,11 @@ fn quic_transport_config(cc: CcChoice) -> Arc<TransportConfig> {
     t.keep_alive_interval(Some(Duration::from_secs(QUIC_KEEPALIVE_SECS)));
     t.initial_mtu(QUIC_INITIAL_MTU);
     t.min_mtu(QUIC_INITIAL_MTU);
+    t.max_concurrent_bidi_streams(QUIC_MAX_CONCURRENT_BIDI_STREAMS.into());
     t.max_concurrent_uni_streams(QUIC_MAX_CONCURRENT_UNI_STREAMS.into());
+    t.stream_receive_window(QUIC_STREAM_RECEIVE_WINDOW_BYTES.into());
+    t.receive_window(QUIC_RECEIVE_WINDOW_BYTES.into());
+    t.send_window(QUIC_SEND_WINDOW_BYTES);
     match cc {
         CcChoice::Bbr => t.congestion_controller_factory(Arc::new(BbrConfig::default())),
         CcChoice::Cubic => t.congestion_controller_factory(Arc::new(CubicConfig::default())),
@@ -210,5 +228,40 @@ mod tests {
                 client_quic_config_alpn("certs/dev/ca-cert.pem", vec![b"h3".to_vec()], cc).unwrap();
             assert!(client_endpoint(cfg).is_ok(), "bind failed for {cc:?}");
         }
+    }
+
+    #[test]
+    fn transport_config_sets_vpn_flow_control_windows() {
+        let cfg = quic_transport_config(CcChoice::Cubic);
+        let dbg = format!("{cfg:?}");
+        assert!(
+            dbg.contains(&format!(
+                "max_concurrent_bidi_streams: {}",
+                QUIC_MAX_CONCURRENT_BIDI_STREAMS
+            )),
+            "{dbg}"
+        );
+        assert!(
+            dbg.contains(&format!(
+                "max_concurrent_uni_streams: {}",
+                QUIC_MAX_CONCURRENT_UNI_STREAMS
+            )),
+            "{dbg}"
+        );
+        assert!(
+            dbg.contains(&format!(
+                "stream_receive_window: {}",
+                QUIC_STREAM_RECEIVE_WINDOW_BYTES
+            )),
+            "{dbg}"
+        );
+        assert!(
+            dbg.contains(&format!("receive_window: {}", QUIC_RECEIVE_WINDOW_BYTES)),
+            "{dbg}"
+        );
+        assert!(
+            dbg.contains(&format!("send_window: {}", QUIC_SEND_WINDOW_BYTES)),
+            "{dbg}"
+        );
     }
 }

@@ -1,5 +1,33 @@
 # Learnings
 
+## 2026-07-03 — Knife14w2: writer coalescing exposed real QUIC stream write pressure
+
+`95bfe47` was tested with
+`/tmp/mvpn_knife14w2_usclient_suite_20260703_112033.tar.gz`. The suite reached
+the full tunnel path: cargo was found at `/home/ubuntu/.cargo/bin/cargo`, `.33`
+reachability and `.77:5201` direct iperf preflight passed, and the final suite
+status was `COMPLETED`.
+
+The data-plane result is still below target. Direct `.77` preflight receiver was
+about 281 Mbit/s, but tunnel forward P1 was 2.83 Mbit/s receiver and reverse P1
+was 314 Kbit/s receiver; later reverse P2/P4/P8 timed out. The relay writer
+coalescing stage did work mechanically: forward close logs showed 64KiB-class
+payloads and far fewer writer calls than the earlier MSS-sized pattern. The new
+signal is `tcp-local-write-pressure`: 110 pressure lines appeared, with some
+`local_write_wait_max_us` values in the multi-second to tens-of-seconds range.
+
+Knife14x makes the client QUIC transport windows explicit: raise stream receive,
+connection receive, send window, and bidi-stream allowance to VPN-sized values,
+and print them at TUIC startup. This does not prove the server/path window is
+fixed; it removes the client's default transport window as an ambiguous cause
+and gives the next log a clearer attribution point.
+
+Reusable rule: once writer batches are 64KiB-class and `global_rx_pressure` is
+zero, treat long local writer waits as QUIC stream/connection pressure. First
+make local transport windows explicit and observable; if pressure persists, test
+congestion control or server-side flow-control rather than more relay lifecycle
+changes.
+
 ## 2026-07-03 — Knife14w VPS bundle did not test the data plane
 
 `1144fc2` was submitted with

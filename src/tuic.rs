@@ -756,6 +756,14 @@ impl TuicUpstream {
         );
         // 刀3.5：打实际生效的 CC + relay mode，供 acceptance 确认 BBR/quic 真装上（A/B 归因）。
         println!("🧭 TUIC 拥塞控制器={cc:?} | UDP relay mode={udp_relay_mode:?}");
+        println!(
+            "🪟 QUIC flow windows: bidi={} uni={} stream_rx={}B conn_rx={}B send={}B",
+            quic::QUIC_MAX_CONCURRENT_BIDI_STREAMS,
+            quic::QUIC_MAX_CONCURRENT_UNI_STREAMS,
+            quic::QUIC_STREAM_RECEIVE_WINDOW_BYTES,
+            quic::QUIC_RECEIVE_WINDOW_BYTES,
+            quic::QUIC_SEND_WINDOW_BYTES
+        );
         let tcp_pool = cfg.tcp_pool.clamp(DEFAULT_TUIC_TCP_POOL, MAX_TUIC_TCP_POOL);
         let mut conns = Vec::with_capacity(tcp_pool);
         conns.push(Mutex::new(conn));
