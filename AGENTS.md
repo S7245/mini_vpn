@@ -104,3 +104,16 @@ show the system survives realistic pressure:
 - no unexpected relay reaping while useful buffered data remains;
 - clear metrics showing whether a bottleneck is local loop CPU, QUIC path,
   server config, VPS network, or application logic.
+
+
+# Agent Behavior Guidelines
+- **Model Consistency:** Keep using the currently selected advanced Codex model (such as GPT-5.5). Downgrading the model to a smaller or simplified version without my explicit authorization is strictly prohibited.
+- **Quality Standard:** If you encounter difficulties, prefer using the "deep thinking" or "extended reasoning" mode. Prohibit giving incomplete code due to speed or quota constraints.
+
+
+# Session & Context Management
+- **Frequent Refreshes:** If the task takes too long to run or multiple repair failures occur, please automatically re-evaluate the current architecture.
+- **Source of Truth:** Always refer to the project root's `AGENTS.md` and architecture design files. Do not rely on short-term memory. If the context is too large, ask me if a new session tree is needed to maintain code quality.
+
+# Execution Plans
+- **Self-Correction:** If the repair test fails, do not immediately begin random modifications. You must first analyze the reasons for the failure and output a proposed modification plan, then wait for my confirmation before proceeding to the next step.
