@@ -1,5 +1,30 @@
 # Errors
 
+## 2026-07-04 - Knife14ax VPS acceptance failed after tx-queue backpressure patch
+
+- Stage: Knife14ax tx-queue-aware downlink backpressure acceptance for commit
+  `58f847d`.
+- Failed bundle:
+  `/tmp/mini_vpn/mvpn_knife14ax_tx_queue_backpressure_usclient_suite_20260704_215053.tar.gz`
+- Symptom: clean reverse-first P1 failed with `iperf3: unable to receive
+  results` instead of producing a low but complete `10-20 Mbit/s` result.
+- Important discriminator: the new tx-queue pressure metrics did not trigger:
+  `downlink_backpressure pause_edges=0`, `max_tx_queue_bytes=0`, and
+  `max_pressure_bytes=0`. The clean window also had `global_rx_pressure=0`,
+  `tun_tx_dropped_delta=0`, TUN flush failures zero, and QUIC loss/congestion
+  delta zero.
+- Close-boundary signal: the reverse data socket had only about `221884`
+  remote-to-local bytes before `dead_slot_reap` observed
+  `tcp_state=Closed active=false can_send=false`, with `41208` bytes classified
+  as terminal pending.
+- Rejected next moves: do not keep tuning tx-queue backpressure, stale pool,
+  iperf3, sing-box, egress pacing, TUN queue length, or QUIC congestion for the
+  clean reverse-first root without new evidence.
+- Future behavior: after a failed repair run like this, stop before behavior
+  edits. First add lifecycle/state-transition diagnostics and focused tests that
+  explain why the local TCP socket becomes `Closed` while remote downlink volume
+  is still tiny.
+
 ## 2026-07-04 - Local cargo test QUIC bind checks fail inside restricted sandbox
 
 - Stage: Knife14ax local regression.

@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-07-04 - Knife14ax rejects tx-queue backpressure as the clean reverse root
+
+- Code commit: `58f847d`
+- Result doc:
+  `docs/tech/2026-07-04-knife14ax-tx-queue-backpressure-results.md`
+- Log bundle:
+  `/tmp/mini_vpn/mvpn_knife14ax_tx_queue_backpressure_usclient_suite_20260704_215053.tar.gz`
+- Outcome: tx-queue-aware backpressure passed local gates but failed VPS
+  acceptance. Clean reverse-first P1 did not complete (`iperf3: unable to
+  receive results`). The new summary fields were active but stayed zero:
+  `pause_edges=0`, `max_tx_queue_bytes=0`, and `max_pressure_bytes=0`.
+- Key signal: the reverse data flow only reached about `221884` remote-to-local
+  bytes before the local TCP socket was reaped as
+  `tcp_state=Closed active=false can_send=false`, with `41208` terminal pending
+  bytes. Clean-window QUIC loss/congestion, TUN drops, TUN flush failures, and
+  global_rx pressure were all zero.
+- Reusable rule: when reverse fails with tiny `remote_to_global_rx_bytes` and no
+  tx-queue/global_rx/TUN/QUIC pressure, stop tuning backpressure. Instrument the
+  local TCP state transition into `Closed` and prove whether the local peer
+  closed early, a FIN/RST was mishandled, or the relay stopped reading before
+  useful downlink arrived.
+
 ## 2026-07-04 - Knife14ax keeps tx-queue pressure visible to global_rx backpressure
 
 - Stage docs:
