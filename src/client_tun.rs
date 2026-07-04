@@ -41,7 +41,7 @@ const MIN_DOWNLINK_FLUSH_MAX_BYTES: usize = 4 * 1024;
 const MAX_DOWNLINK_FLUSH_MAX_BYTES: usize = MAX_TCP_SOCKET_BUFFER_BYTES;
 const _: () = assert!(MIN_DOWNLINK_FLUSH_MAX_BYTES <= DEFAULT_DOWNLINK_FLUSH_MAX_BYTES);
 const _: () = assert!(DEFAULT_DOWNLINK_FLUSH_MAX_BYTES <= MAX_DOWNLINK_FLUSH_MAX_BYTES);
-const DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES: usize = 64 * 1024;
+const DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES: usize = MAX_TCP_SOCKET_BUFFER_BYTES;
 const MAX_DOWNLINK_EGRESS_IMMEDIATE_BYTES: usize = MAX_TCP_SOCKET_BUFFER_BYTES;
 const _: () =
     assert!(DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES <= MAX_DOWNLINK_EGRESS_IMMEDIATE_BYTES);
@@ -1048,7 +1048,16 @@ impl DownlinkEgressPacer {
         }
     }
 
-    fn allow_remote_payload_flush(&mut self, accepted_bytes: usize) -> bool {
+    fn debit_budget(&mut self, accepted_bytes: usize) {
+        self.remaining_immediate_bytes =
+            self.remaining_immediate_bytes.saturating_sub(accepted_bytes);
+    }
+
+    fn allow_remote_payload_flush(&mut self, accepted_bytes: usize, pending_bytes: usize) -> bool {
+        if pending_bytes > 0 {
+            self.debit_budget(accepted_bytes);
+            return true;
+        }
         if accepted_bytes == 0 || self.immediate_budget_bytes == 0 {
             return false;
         }
@@ -1318,7 +1327,7 @@ pub async fn start_tun_proxy() {
         runtime_config.downlink_flush_max_bytes
     );
     println!(
-        "🚦 TCP 下行 egress pacing: immediate={}B/tick（MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES 可调，0=timer-only）",
+        "🚦 TCP 下行 egress pacing: immediate={}B/tick（MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES 可调；pending backlog 会强制 immediate flush）",
         runtime_config.downlink_egress_immediate_bytes
     );
     println!(
@@ -2289,7 +2298,7 @@ fn rearm_socket_with_reason_and_snapshot(
 ) {
     if let Some(snapshot) = close_snapshot {
         tcp_diag_log!(
-            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tcp_state={:?} active={} can_send={} can_recv={}",
+            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} tcp_state={:?} active={} can_send={} can_recv={}",
             handle,
             close_direction,
             close_reason,
@@ -2307,6 +2316,7 @@ fn rearm_socket_with_reason_and_snapshot(
             ctx.downlink_diag.send_slice_max_accepted_bytes,
             ctx.downlink_diag.tun_flush_tx_calls,
             ctx.downlink_diag.tun_flush_tx_failures,
+            ctx.downlink_diag.tun_flush_deferred,
             snapshot.tcp_state,
             snapshot.active,
             snapshot.can_send,
@@ -2317,7 +2327,7 @@ fn rearm_socket_with_reason_and_snapshot(
     }
 
     tcp_diag_log!(
-        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={}",
+        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={}",
         handle,
         close_direction,
         close_reason,
@@ -2334,7 +2344,8 @@ fn rearm_socket_with_reason_and_snapshot(
         ctx.downlink_diag.send_slice_budget_limited,
         ctx.downlink_diag.send_slice_max_accepted_bytes,
         ctx.downlink_diag.tun_flush_tx_calls,
-        ctx.downlink_diag.tun_flush_tx_failures
+        ctx.downlink_diag.tun_flush_tx_failures,
+        ctx.downlink_diag.tun_flush_deferred
     );
     rearm_socket(socket, ctx, fake_pool, now_secs);
 }
@@ -2761,7 +2772,9 @@ async fn handle_remote_payload<D: TunIo>(
     note_downlink_pending_progress(ctx, now_secs, accepted_bytes);
     ctx.state = SocketState::Relaying;
 
-    if !downlink_egress_pacer.allow_remote_payload_flush(accepted_bytes) {
+    if !downlink_egress_pacer
+        .allow_remote_payload_flush(accepted_bytes, ctx.downlink_pending.len())
+    {
         if accepted_bytes > 0 {
             ctx.downlink_diag.note_tun_flush_deferred();
         }
@@ -4849,41 +4862,55 @@ mod tests {
         let mut pacer = DownlinkEgressPacer::new(65_536);
 
         assert!(
-            pacer.allow_remote_payload_flush(32_768),
+            pacer.allow_remote_payload_flush(32_768, 0),
             "first accepted slice should flush immediately while budget remains"
         );
         assert!(
-            pacer.allow_remote_payload_flush(32_768),
+            pacer.allow_remote_payload_flush(32_768, 0),
             "budget may be consumed exactly"
         );
         assert!(
-            !pacer.allow_remote_payload_flush(1),
+            !pacer.allow_remote_payload_flush(1, 0),
             "extra accepted bytes in the same interval should defer to timer flush"
         );
 
         pacer.on_timer_tick();
         assert!(
-            pacer.allow_remote_payload_flush(1),
+            pacer.allow_remote_payload_flush(1, 0),
             "timer reset should reopen the immediate flush budget"
         );
     }
 
     #[test]
-    fn downlink_egress_pacer_zero_budget_defers_all_remote_payload_flushes() {
+    fn downlink_egress_pacer_zero_budget_defers_only_when_no_backlog_remains() {
         let mut pacer = DownlinkEgressPacer::new(0);
 
         assert!(
-            !pacer.allow_remote_payload_flush(1),
-            "zero budget should make remote-payload egress fully timer-paced"
+            !pacer.allow_remote_payload_flush(1, 0),
+            "zero budget should defer when the current payload left no backlog"
         );
         assert!(
-            !pacer.allow_remote_payload_flush(0),
+            !pacer.allow_remote_payload_flush(0, 0),
             "zero accepted bytes should never force an immediate TUN flush"
+        );
+        assert!(
+            pacer.allow_remote_payload_flush(0, 1),
+            "pending backlog should force an immediate flush attempt even with zero budget"
         );
         pacer.on_timer_tick();
         assert!(
-            !pacer.allow_remote_payload_flush(65_536),
-            "timer reset should preserve an explicitly disabled immediate budget"
+            !pacer.allow_remote_payload_flush(65_536, 0),
+            "timer reset should preserve an explicitly disabled no-backlog budget"
+        );
+    }
+
+    #[test]
+    fn downlink_egress_pacer_forces_flush_while_pending_remains() {
+        let mut pacer = DownlinkEgressPacer::new(65_536);
+
+        assert!(
+            pacer.allow_remote_payload_flush(65_537, 1),
+            "pending backlog must force immediate egress even when accepted bytes exceed budget"
         );
     }
 
@@ -5024,6 +5051,11 @@ mod tests {
 
     #[test]
     fn parse_downlink_egress_immediate_bytes_defaults_and_bounds() {
+        assert_eq!(
+            DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES,
+            MAX_DOWNLINK_EGRESS_IMMEDIATE_BYTES,
+            "Knife14ar default must preserve old immediate-flush behavior; small budgets are explicit A/B only"
+        );
         assert_eq!(
             parse_downlink_egress_immediate_bytes(None),
             DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES

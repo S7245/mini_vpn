@@ -10,7 +10,7 @@ set -uo pipefail
 readonly DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES=524288
 readonly DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES=131072
 readonly DEFAULT_DOWNLINK_FLUSH_MAX_BYTES=262144
-readonly DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES=65536
+readonly DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES=16777216
 
 extract_client_tun_pids_from_ps() {
   awk '
@@ -63,6 +63,10 @@ EOF
 
   if [[ "$DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES:$DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES" != "524288:131072" ]]; then
     echo "suite self-test failed: downlink backpressure defaults drifted" >&2
+    return 1
+  fi
+  if [[ "$DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES" != "16777216" ]]; then
+    echo "suite self-test failed: downlink egress default must preserve old immediate-flush behavior" >&2
     return 1
   fi
 
@@ -142,7 +146,7 @@ Optional env:
   MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=524288
   MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=131072
   MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=262144
-  MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=65536
+  MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=16777216
 
 Output:
   /tmp/conn/mvpn_knife14c_usclient_suite_<timestamp>.md

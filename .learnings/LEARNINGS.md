@@ -1,5 +1,29 @@
 # Learnings
 
+## 2026-07-04 — Knife14ar makes downlink egress pacing close-safe by default
+
+Knife14aq proved that a small default remote-payload egress budget was useful
+as a probe but unsafe as a product default. Knife14ar therefore keeps the
+`MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES` knob but changes the default from
+`65536` to the maximum bounded value (`16777216`) so normal runs preserve the
+old immediate-flush behavior instead of reusing the rejected pacing default.
+The `.27` suite default now matches Rust so acceptance does not accidentally
+override the product default.
+
+The pacer decision now receives the current downlink pending size. It may defer
+only when accepted bytes leave no app-owned backlog; any non-empty
+`downlink_pending` forces an immediate `iface.poll + flush_tx` attempt, even
+with a zero or exhausted budget. Close/reap diagnostics also include
+`tun_flush_deferred`, so the next VPS bundle can correlate pending-at-close
+with pacing decisions.
+
+Verification passed locally with focused downlink egress tests, `client_tun`,
+full `cargo test`, low-RTT probe self-test, US-client suite self-test, and
+`git diff --check`. Reusable rule: when pacing an accepted downlink path,
+never let the pacing gate outrank lifecycle safety. Backlog ownership and
+close-boundary drain/progress must stay visible and preferred over drop-count
+reduction.
+
 ## 2026-07-04 — Knife14aq rejects blunt remote-payload egress pacing as a default
 
 Commit `212ce26` passed local tests and was run from `.27` with
