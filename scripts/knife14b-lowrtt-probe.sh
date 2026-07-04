@@ -572,7 +572,36 @@ summarize_metrics_window() {
       }
     }
 
-    /tcp-tun-egress/ {
+    /tcp-tun-egress-feedback/ {
+      feedback_delta_token = ""
+      for (i = 1; i <= NF; i++) {
+        if ($i == "paused=true") {
+          tun_feedback_pause_count++
+        } else if ($i == "paused=false") {
+          tun_feedback_resume_count++
+        } else if ($i ~ /^tx_dropped_delta=/) {
+          feedback_delta_token = $i
+          sub(/^tx_dropped_delta=/, "", feedback_delta_token)
+        } else if ($i ~ /^max_pressure=/) {
+          value = numeric_token($i, "max_pressure")
+          if (value > max_tun_feedback_pressure) {
+            max_tun_feedback_pressure = value
+          }
+        }
+      }
+      if (feedback_delta_token != "" && feedback_delta_token ~ /^[0-9]+$/) {
+        feedback_delta = feedback_delta_token + 0
+        tun_feedback_drop_delta_total += feedback_delta
+        if (feedback_delta > 0) {
+          tun_feedback_drop_events++
+        }
+        if (feedback_delta > max_tun_feedback_delta) {
+          max_tun_feedback_delta = feedback_delta
+        }
+      }
+    }
+
+    /tcp-tun-egress[[:space:]]/ {
       runtime_tun_samples++
       runtime_tun_status = ""
       runtime_tun_delta_token = ""
@@ -1101,6 +1130,9 @@ summarize_metrics_window() {
       if (runtime_tun_drop_delta_total > 0) {
         add_label("local_tun_egress_drop")
       }
+      if (tun_feedback_pause_count > 0) {
+        add_label("local_tun_egress_feedback")
+      }
       if (down_pause_count > 0) {
         add_label("local_downlink_backpressure")
       }
@@ -1244,6 +1276,7 @@ summarize_metrics_window() {
       printf "- tuic_tcp_stream: first_rx_events=%d first_rx_max_ms=%d read_gap_events=%d read_gap_max_ms=%d close_events=%d close_first_rx_max_ms=%d close_gap_max_ms=%d rx_bytes_max=%d reads_max=%d zero_rx_closes=%d data_streams=%d data_first_rx_max_ms=%d data_read_gap_max_ms=%d data_close_gap_max_ms=%d data_rx_bytes_max=%d data_rx_min_bytes=%d\n", tuic_first_rx_events, max_tuic_first_rx_ms, tuic_read_gap_events, max_tuic_read_gap_ms, tuic_stream_close_events, max_tuic_close_first_rx_ms, max_tuic_close_gap_ms, max_tuic_close_rx_bytes, max_tuic_close_reads, tuic_zero_rx_closes, tuic_data_streams, max_tuic_data_first_rx_ms, max_tuic_data_read_gap_ms, max_tuic_data_close_gap_ms, max_tuic_data_rx_bytes, data_stream_min_rx_bytes
       printf "- tun_drops: if=%s tun_rx_dropped_delta=%s tun_tx_dropped_delta=%s\n", tun_if, tun_rx_delta, tun_tx_delta
       printf "- runtime_tun_egress: samples=%d drop_events=%d drop_delta_total=%d max_delta=%d unavailable=%d resets=%d\n", runtime_tun_samples, runtime_tun_drop_events, runtime_tun_drop_delta_total, max_runtime_tun_delta, runtime_tun_unavailable, runtime_tun_resets
+      printf "- tun_egress_feedback: pause_edges=%d resume_edges=%d drop_events=%d drop_delta_total=%d max_delta=%d max_pressure_bytes=%d\n", tun_feedback_pause_count, tun_feedback_resume_count, tun_feedback_drop_events, tun_feedback_drop_delta_total, max_tun_feedback_delta, max_tun_feedback_pressure
       printf "- quic: samples=%d worst_conn=%s max_lost_bytes_delta=%d max_congestion_events_delta=%d max_start_lost_bytes=%d max_start_congestion_events=%d min_start_cwnd=%s min_cwnd=%s inherited_conns=%s inherited_low_cwnd_threshold=%d max_tx_blocked_data_delta=%d max_tx_blocked_stream_delta=%d max_rx_blocked_data_delta=%d max_rx_blocked_stream_delta=%d\n", quic_samples, worst_conn, max_lost_bytes_delta, max_congestion_delta, max_start_lost_bytes, max_start_congestion_events, min_start_cwnd_all, min_cwnd_all, inherited_quic_conns, inherited_low_cwnd_limit, max_tx_data_delta, max_tx_stream_delta, max_rx_data_delta, max_rx_stream_delta
       print "- attribution: " labels
     }
@@ -1397,6 +1430,28 @@ EOF_TUN
   summary="$(summarize_metrics_window 0 "tun-drop-self-test" "$iperf_sample" "$log_sample" "tcp" "$tun_if_after" "$tun_rx_before" "$tun_tx_before" "$tun_rx_after" "$tun_tx_after")"
   assert_contains "$summary" "tun_drops: if=tun0 tun_rx_dropped_delta=0 tun_tx_dropped_delta=1423"
   assert_contains "$summary" "attribution: local_tun_egress_drop"
+
+  cat > "$iperf_sample" <<'EOF_IPERF'
+Reverse mode, remote host 43.130.32.77 is sending
+[  5]   0.00-30.04  sec  72.7 MBytes  20.3 Mbits/sec    0             sender
+[  5]   0.00-30.00  sec  67.6 MBytes  18.9 Mbits/sec                  receiver
+EOF_IPERF
+  cat > "$log_sample" <<'EOF_LOG'
+🔎 tuic-open-tcp target=43.130.32.77:5201 conn=1 id=99
+📊 TUIC QUIC stats conn=1 id=99 rtt=1ms cwnd=247092 lost=0/35 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=33/9175B udp_rx=177/232816B dg_max=Some(1418) dg_space=1048576B
+🔎 tcp-downlink-flush pending_total=0 pending_max=0 pending_high=0 remote_to_global_rx_bytes=70988513 flush_attempts=201 no_send_capacity=0 send_window_samples=201 send_capacity_min=4194304 send_capacity_max=4194304 send_queue_max=3786786 recv_queue_max=4096 may_send_false=0 may_recv_false=0 no_send_capacity_streak_max=0 no_send_capacity_pending_max=0 send_slice_calls=201 send_slice_accepted=70988513 send_slice_zero=0 send_slice_errors=0 budget_limited_calls=0 send_slice_max_accepted=65535 tun_flush_tx_calls=201 tun_flush_tx_failures=0 tun_flush_deferred=0 dirty_handles=1
+🔎 tcp-tun-egress if=tun0 status=delta tx_dropped_total=28123 tx_dropped_delta=14167 global_rx_paused=false pending_total=0 pending_max=0 pending_high=0 remote_to_global_rx_bytes=70988513 tun_flush_tx_calls=201 dirty_handles=1
+🔎 tcp-tun-egress-feedback paused=true reason=drop_delta tx_dropped_delta=14167 max_pressure=3786786 total_pressure=3786786 high=4194304 low=1048576 drop_events=1 drop_delta_total=14167 pause_edges=1 resume_edges=0
+📊 TUIC QUIC stats conn=1 id=99 rtt=1ms cwnd=247092 lost=0/105 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=103/14703B udp_rx=535/734789B dg_max=Some(1418) dg_space=1048576B
+EOF_LOG
+  summary="$(summarize_metrics_window 0 "tun-feedback-self-test" "$iperf_sample" "$log_sample")"
+  assert_contains "$summary" "downlink_backpressure: pause_edges=0 resume_edges=0"
+  assert_contains "$summary" "downlink_flush: attempts=201 no_send_capacity=0 send_window_samples=201 send_capacity_min=4194304 send_capacity_max=4194304 send_queue_max=3786786"
+  assert_contains "$summary" "runtime_tun_egress: samples=1 drop_events=1 drop_delta_total=14167 max_delta=14167"
+  assert_contains "$summary" "tun_egress_feedback: pause_edges=1 resume_edges=0 drop_events=1 drop_delta_total=14167 max_delta=14167 max_pressure_bytes=3786786"
+  assert_contains "$summary" "attribution: local_tun_egress_drop+local_tun_egress_feedback"
+  assert_not_contains "$summary" "local_downlink_backpressure"
+  assert_contains "$summary" "terminal_pending_reap: events=0 bytes=0 max_bytes=0"
 
   cat > "$iperf_sample" <<'EOF_IPERF'
 [  5]   0.00-30.04  sec  2.62 MBytes   733 Kbits/sec    3             sender

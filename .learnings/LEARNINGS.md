@@ -1848,3 +1848,29 @@ worth cleaning up separately.
 - Reusable rule: if a larger tx buffer worsens clean reverse and introduces TUN
   egress drops while QUIC stays clean, stop increasing buffers. Treat the larger
   buffer as evidence that burst smoothing / TUN feedback is missing.
+
+## 2026-07-05 — Knife14bf adds TUN-drop feedback as a separate pause reason
+
+- Stage: Knife14bf local TUN-drop-aware downlink feedback.
+- Outcome: Added a separate `TunEgressFeedbackState` so runtime TUN egress
+  drops can pause `global_rx` without being counted as ordinary
+  high-watermark downlink backpressure. The feedback samples Linux TUN
+  `tx_dropped` once per second, pauses when a positive drop delta appears with
+  local downlink pressure, and resumes once local pressure drains to the
+  configured low watermark.
+- Parser/result shape: `scripts/knife14b-lowrtt-probe.sh` now reports
+  `tun_egress_feedback` separately from `runtime_tun_egress` and avoids
+  double-counting `tcp-tun-egress-feedback` as a `tcp-tun-egress` runtime drop
+  sample.
+- Local gates passed: `cargo test --lib client_tun`,
+  `bash scripts/knife14b-lowrtt-probe.sh --self-test`,
+  `bash scripts/knife14b-usclient-tunnel-suite.sh --self-test`,
+  `bash -n` for both scripts, and `git diff --check`.
+- Key lesson: Knife14be's new root is not "any TUN drop is fatal"; Knife14at
+  already showed high reverse throughput with some drops. The actionable shape
+  is "large tx queue below high watermark + clean QUIC + TUN drops + no
+  ordinary backpressure," which needs its own feedback/accounting path.
+- Reusable rule: when adding a new diagnostic line with a shared prefix, tighten
+  parser regexes first. Otherwise derived lines such as
+  `tcp-tun-egress-feedback` can be accidentally counted as base
+  `tcp-tun-egress` samples.

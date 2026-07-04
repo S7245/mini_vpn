@@ -65,6 +65,9 @@ const RELAY_WRITER_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from
 const DEFERRED_CLOSE_PENDING_GRACE_SECS: u64 = 5;
 /// 刀11：数据面可观测性快照周期（30s，对齐 TuicUpstream UDP_STATS_LOG_SECS）。仅周期采样/打印，不进热路径。
 const METRICS_SNAPSHOT_SECS: u64 = 30;
+/// Knife14bf：低频 TUN egress drop feedback 控制周期。1s 足够覆盖 30s reverse probe，
+/// 也避免把 Linux sysfs 读取放进每包热路径。
+const TUN_EGRESS_FEEDBACK_SAMPLE_SECS: u64 = 1;
 
 /// 刀13 ①：解析 `MINI_VPN_TRACE`（`1`/`true`，去空白、不区分大小写 → 开；其它/缺省 → 关）。
 /// 对齐 [`parse_profile_loop`] 惯用法；抽纯函数便于单测（`trace_enabled` 只是它 + `OnceLock` 包壳）。
@@ -1573,6 +1576,115 @@ fn parse_u64_counter(raw: &str) -> Option<u64> {
     raw.trim().parse::<u64>().ok()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunEgressFeedbackReason {
+    DropDelta,
+    PressureLow,
+}
+
+impl TunEgressFeedbackReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DropDelta => "drop_delta",
+            Self::PressureLow => "pressure_low",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TunEgressFeedbackEvent {
+    paused: bool,
+    reason: TunEgressFeedbackReason,
+    tx_dropped_delta: u64,
+    max_pressure: usize,
+    total_pressure: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TunEgressFeedbackState {
+    paused: bool,
+    drop_events: u64,
+    drop_delta_total: u64,
+    max_drop_delta: u64,
+    pause_edges: u64,
+    resume_edges: u64,
+}
+
+impl TunEgressFeedbackState {
+    fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    fn update(
+        &mut self,
+        sample: &TunEgressDropSample,
+        stats: DownlinkPressureStats,
+        cfg: DownlinkBackpressureConfig,
+    ) -> Option<TunEgressFeedbackEvent> {
+        let drop_delta = match sample {
+            TunEgressDropSample::Delta { delta, .. } => *delta,
+            _ => 0,
+        };
+        if drop_delta > 0 {
+            self.drop_events = self.drop_events.saturating_add(1);
+            self.drop_delta_total = self.drop_delta_total.saturating_add(drop_delta);
+            self.max_drop_delta = self.max_drop_delta.max(drop_delta);
+        }
+
+        let max_pressure = stats.max_pressure();
+        let total_pressure = stats.total_pressure();
+        if drop_delta > 0 && total_pressure > 0 {
+            if !self.paused {
+                self.paused = true;
+                self.pause_edges = self.pause_edges.saturating_add(1);
+            }
+            return Some(TunEgressFeedbackEvent {
+                paused: true,
+                reason: TunEgressFeedbackReason::DropDelta,
+                tx_dropped_delta: drop_delta,
+                max_pressure,
+                total_pressure,
+            });
+        }
+
+        if self.paused && max_pressure <= cfg.low_bytes {
+            self.paused = false;
+            self.resume_edges = self.resume_edges.saturating_add(1);
+            return Some(TunEgressFeedbackEvent {
+                paused: false,
+                reason: TunEgressFeedbackReason::PressureLow,
+                tx_dropped_delta: drop_delta,
+                max_pressure,
+                total_pressure,
+            });
+        }
+
+        None
+    }
+}
+
+fn format_tun_egress_feedback_diag(
+    event: TunEgressFeedbackEvent,
+    state: &TunEgressFeedbackState,
+    cfg: DownlinkBackpressureConfig,
+) -> String {
+    format!(
+        "🔎 tcp-tun-egress-feedback paused={} reason={} tx_dropped_delta={} max_pressure={} total_pressure={} high={} low={} drop_events={} drop_delta_total={} max_delta={} pause_edges={} resume_edges={}",
+        event.paused,
+        event.reason.as_str(),
+        event.tx_dropped_delta,
+        event.max_pressure,
+        event.total_pressure,
+        cfg.high_bytes,
+        cfg.low_bytes,
+        state.drop_events,
+        state.drop_delta_total,
+        state.max_drop_delta,
+        state.pause_edges,
+        state.resume_edges
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn read_tun_tx_dropped_stat(interface_name: &str) -> std::io::Result<String> {
     std::fs::read_to_string(format!(
@@ -2197,6 +2309,8 @@ pub async fn run_event_loop<D, U, M>(
     // 与 TuicUpstream::start_udp 的 UDP-path 📊 行（RTT/cwnd/背压）是两条独立日志、各司其职（见 ADR-0012 §5）。
     let mut metrics_tick =
         tokio::time::interval(std::time::Duration::from_secs(runtime_config.metrics_secs));
+    let mut tun_egress_feedback_tick =
+        tokio::time::interval(std::time::Duration::from_secs(TUN_EGRESS_FEEDBACK_SAMPLE_SECS));
     let mut tcp_loop_flush_tx_calls: u64 = 0;
     let mut tcp_loop_flush_tx_failures: u64 = 0;
     let downlink_backpressure = runtime_config.downlink_backpressure;
@@ -2204,17 +2318,18 @@ pub async fn run_event_loop<D, U, M>(
     let mut downlink_egress_pacer =
         DownlinkEgressPacer::new(runtime_config.downlink_egress_immediate_bytes);
     let mut tun_egress_drop_sampler = TunEgressDropSampler::new(device.interface_name());
-    let mut global_rx_paused = false;
+    let mut tun_egress_feedback = TunEgressFeedbackState::default();
+    let mut downlink_rx_paused = false;
 
     loop {
         let downlink_stats = downlink_pressure_stats(&dirty, &socket_ctxs, &sockets);
-        let next_global_rx_paused =
-            next_downlink_backpressure(global_rx_paused, downlink_stats, downlink_backpressure);
-        if next_global_rx_paused != global_rx_paused {
-            global_rx_paused = next_global_rx_paused;
+        let next_downlink_rx_paused =
+            next_downlink_backpressure(downlink_rx_paused, downlink_stats, downlink_backpressure);
+        if next_downlink_rx_paused != downlink_rx_paused {
+            downlink_rx_paused = next_downlink_rx_paused;
             tcp_diag_log!(
                 "🔎 tcp-downlink-backpressure paused={} max_pending={} total_pending={} max_tx_queue={} total_tx_queue={} max_pressure={} total_pressure={} high={} low={}",
-                global_rx_paused,
+                downlink_rx_paused,
                 downlink_stats.max_pending,
                 downlink_stats.total_pending,
                 downlink_stats.max_tx_queue,
@@ -2225,6 +2340,7 @@ pub async fn run_event_loop<D, U, M>(
                 downlink_backpressure.low_bytes
             );
         }
+        let global_rx_paused = downlink_rx_paused || tun_egress_feedback.is_paused();
         tokio::select! {
             // TCP relay 回程：后台车厢把远端回传字节送回主循环 → 注入对应 smoltcp socket。
             //   TUIC 自重连（live_conn），不需要 legacy 的 disconnect/复位分支。
@@ -2462,8 +2578,21 @@ pub async fn run_event_loop<D, U, M>(
                     "{}",
                     format_tcp_downlink_flush_diag(&tcp_downlink, dirty.len())
                 );
+                // 刀12：紧挨 📊 行打 🔬 主循环归因行（profiler 关闭时 NoopSink::report 空、零开销）。
+                metrics.report();
+            }
+            // Knife14bf：TUN egress drop feedback。诊断日志仍受 MINI_VPN_TCP_DIAG 门控，
+            // 但反馈状态每秒更新，避免 30s probe 结束后才发现 clean-window qdisc drops。
+            _ = tun_egress_feedback_tick.tick() => {
+                metrics.loop_park_end();
+                let downlink_stats = downlink_pressure_stats(&dirty, &socket_ctxs, &sockets);
+                let tcp_downlink = tcp_downlink_aggregate(socket_ctxs.values());
+                let tun_sample = tun_egress_drop_sampler.sample();
+                let feedback_event =
+                    tun_egress_feedback.update(&tun_sample, downlink_stats, downlink_backpressure);
+                let sampled_global_rx_paused =
+                    downlink_rx_paused || tun_egress_feedback.is_paused();
                 if tcp_diag_enabled() {
-                    let tun_sample = tun_egress_drop_sampler.sample();
                     println!(
                         "{}",
                         format_tun_egress_diag(
@@ -2471,12 +2600,20 @@ pub async fn run_event_loop<D, U, M>(
                             &tun_sample,
                             &tcp_downlink,
                             dirty.len(),
-                            global_rx_paused,
+                            sampled_global_rx_paused,
                         )
                     );
+                    if let Some(event) = feedback_event {
+                        println!(
+                            "{}",
+                            format_tun_egress_feedback_diag(
+                                event,
+                                &tun_egress_feedback,
+                                downlink_backpressure,
+                            )
+                        );
+                    }
                 }
-                // 刀12：紧挨 📊 行打 🔬 主循环归因行（profiler 关闭时 NoopSink::report 空、零开销）。
-                metrics.report();
             }
             // 分支 2: 时钟滴答，处理超时重传等后台任务
             _ = timer.tick() =>{
@@ -6005,6 +6142,188 @@ mod tests {
             !next_downlink_backpressure(true, DownlinkPressureStats::new(0, 0, 40, 40), cfg),
             "low tx queue watermark resumes global_rx when app pending is empty"
         );
+    }
+
+    #[test]
+    fn tun_egress_feedback_pauses_on_drop_delta_with_local_pressure() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 4_194_304,
+            low_bytes: 1_048_576,
+        };
+        let mut feedback = TunEgressFeedbackState::default();
+        let event = feedback.update(
+            &TunEgressDropSample::Delta {
+                total: 28_123,
+                delta: 14_167,
+            },
+            DownlinkPressureStats::new(0, 0, 3_786_786, 3_786_786),
+            cfg,
+        );
+
+        assert!(feedback.is_paused());
+        assert_eq!(feedback.drop_events, 1);
+        assert_eq!(feedback.drop_delta_total, 14_167);
+        assert_eq!(feedback.max_drop_delta, 14_167);
+        assert_eq!(feedback.pause_edges, 1);
+        assert_eq!(feedback.resume_edges, 0);
+        assert_eq!(
+            event,
+            Some(TunEgressFeedbackEvent {
+                paused: true,
+                reason: TunEgressFeedbackReason::DropDelta,
+                tx_dropped_delta: 14_167,
+                max_pressure: 3_786_786,
+                total_pressure: 3_786_786,
+            })
+        );
+    }
+
+    #[test]
+    fn tun_egress_feedback_resumes_after_pressure_drains_to_low() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 4_194_304,
+            low_bytes: 1_048_576,
+        };
+        let mut feedback = TunEgressFeedbackState::default();
+        assert!(
+            feedback
+                .update(
+                    &TunEgressDropSample::Delta {
+                        total: 10,
+                        delta: 10,
+                    },
+                    DownlinkPressureStats::new(0, 0, 2_000_000, 2_000_000),
+                    cfg,
+                )
+                .is_some()
+        );
+
+        let repeated_drop = feedback.update(
+            &TunEgressDropSample::Delta {
+                total: 15,
+                delta: 5,
+            },
+            DownlinkPressureStats::new(0, 0, 1_500_000, 1_500_000),
+            cfg,
+        );
+        assert_eq!(
+            repeated_drop,
+            Some(TunEgressFeedbackEvent {
+                paused: true,
+                reason: TunEgressFeedbackReason::DropDelta,
+                tx_dropped_delta: 5,
+                max_pressure: 1_500_000,
+                total_pressure: 1_500_000,
+            }),
+            "drops while already paused should remain visible"
+        );
+        assert_eq!(feedback.pause_edges, 1, "already-paused drops must not add pause edges");
+
+        assert_eq!(
+            feedback.update(
+                &TunEgressDropSample::Delta {
+                    total: 15,
+                    delta: 0,
+                },
+                DownlinkPressureStats::new(0, 0, 1_048_577, 1_048_577),
+                cfg,
+            ),
+            None,
+            "stay paused above low watermark"
+        );
+
+        let event = feedback.update(
+            &TunEgressDropSample::Delta {
+                total: 15,
+                delta: 0,
+            },
+            DownlinkPressureStats::new(0, 0, 1_048_576, 1_048_576),
+            cfg,
+        );
+        assert!(!feedback.is_paused());
+        assert_eq!(feedback.pause_edges, 1);
+        assert_eq!(feedback.resume_edges, 1);
+        assert_eq!(
+            event,
+            Some(TunEgressFeedbackEvent {
+                paused: false,
+                reason: TunEgressFeedbackReason::PressureLow,
+                tx_dropped_delta: 0,
+                max_pressure: 1_048_576,
+                total_pressure: 1_048_576,
+            })
+        );
+    }
+
+    #[test]
+    fn tun_egress_feedback_ignores_unavailable_reset_first_and_zero_pressure() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let mut feedback = TunEgressFeedbackState::default();
+        let samples = [
+            TunEgressDropSample::Unavailable {
+                reason: "read_error",
+            },
+            TunEgressDropSample::First { total: 5 },
+            TunEgressDropSample::Reset {
+                previous: 10,
+                total: 1,
+            },
+            TunEgressDropSample::Delta { total: 10, delta: 0 },
+            TunEgressDropSample::Delta { total: 20, delta: 10 },
+        ];
+        let stats = [
+            DownlinkPressureStats::new(0, 0, 99, 99),
+            DownlinkPressureStats::new(0, 0, 99, 99),
+            DownlinkPressureStats::new(0, 0, 99, 99),
+            DownlinkPressureStats::new(0, 0, 99, 99),
+            DownlinkPressureStats::default(),
+        ];
+
+        for (sample, stats) in samples.iter().zip(stats) {
+            assert_eq!(feedback.update(sample, stats, cfg), None);
+        }
+        assert!(!feedback.is_paused());
+        assert_eq!(
+            feedback.drop_events, 1,
+            "zero-pressure positive drops are counted but do not pause"
+        );
+        assert_eq!(feedback.pause_edges, 0);
+    }
+
+    #[test]
+    fn tun_egress_feedback_diag_formats_transition_counters() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 4_194_304,
+            low_bytes: 1_048_576,
+        };
+        let mut feedback = TunEgressFeedbackState::default();
+        let event = feedback
+            .update(
+                &TunEgressDropSample::Delta {
+                    total: 28_123,
+                    delta: 14_167,
+                },
+                DownlinkPressureStats::new(0, 0, 3_786_786, 3_786_786),
+                cfg,
+            )
+            .expect("drop delta should pause feedback");
+        let line = format_tun_egress_feedback_diag(event, &feedback, cfg);
+
+        assert!(line.contains("tcp-tun-egress-feedback"));
+        assert!(line.contains("paused=true"));
+        assert!(line.contains("reason=drop_delta"));
+        assert!(line.contains("tx_dropped_delta=14167"));
+        assert!(line.contains("max_pressure=3786786"));
+        assert!(line.contains("high=4194304"));
+        assert!(line.contains("low=1048576"));
+        assert!(line.contains("drop_events=1"));
+        assert!(line.contains("drop_delta_total=14167"));
+        assert!(line.contains("max_delta=14167"));
+        assert!(line.contains("pause_edges=1"));
+        assert!(line.contains("resume_edges=0"));
     }
 
     #[test]

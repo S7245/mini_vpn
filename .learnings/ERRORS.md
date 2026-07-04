@@ -1118,3 +1118,16 @@
 - Correct behavior: stop increasing tx buffers. The next repair must first
   analyze and plan local TCP/TUN drain cadence or TUN-drop-aware feedback, then
   add deterministic accounting/parser tests before another VPS run.
+
+## 2026-07-05 — Knife14bf repeated root cargo fmt churn
+
+- Symptom: running root `cargo fmt` during the Knife14bf scoped patch
+  reformatted many unrelated Rust files and expanded the diff well beyond the
+  intended `client_tun`/parser/docs task.
+- Fix: restored the unrelated files and then restored/reapplied
+  `src/client_tun.rs` as a minimal hand patch. No root `cargo fmt` output was
+  kept in the final diff.
+- Correct behavior: do not run root `cargo fmt` in Knife14 scoped stages. If a
+  patch needs formatting, keep the local style or format only the precise
+  touched hunk, then rely on `cargo test`, script self-tests, and
+  `git diff --check`.
