@@ -1089,32 +1089,86 @@ impl Default for TcpSocketBufferConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DownlinkPendingStats {
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DownlinkPressureStats {
     max_pending: usize,
     total_pending: usize,
+    max_tx_queue: usize,
+    total_tx_queue: usize,
 }
 
-impl DownlinkPendingStats {
-    fn new(max_pending: usize, total_pending: usize) -> Self {
+impl DownlinkPressureStats {
+    #[cfg(test)]
+    fn new(
+        max_pending: usize,
+        total_pending: usize,
+        max_tx_queue: usize,
+        total_tx_queue: usize,
+    ) -> Self {
         Self {
             max_pending,
             total_pending,
+            max_tx_queue,
+            total_tx_queue,
         }
+    }
+
+    #[cfg(test)]
+    fn pending_only(max_pending: usize, total_pending: usize) -> Self {
+        Self::new(max_pending, total_pending, 0, 0)
+    }
+
+    fn note_pending(&mut self, pending: usize) {
+        self.max_pending = self.max_pending.max(pending);
+        self.total_pending = self.total_pending.saturating_add(pending);
+    }
+
+    fn note_tx_queue(&mut self, tx_queue: usize) {
+        self.max_tx_queue = self.max_tx_queue.max(tx_queue);
+        self.total_tx_queue = self.total_tx_queue.saturating_add(tx_queue);
+    }
+
+    fn max_pressure(&self) -> usize {
+        self.max_pending.max(self.max_tx_queue)
+    }
+
+    fn total_pressure(&self) -> usize {
+        self.total_pending.saturating_add(self.total_tx_queue)
     }
 }
 
+#[cfg(test)]
 fn downlink_pending_stats<'a>(
     ctxs: impl IntoIterator<Item = &'a SocketCtx>,
-) -> DownlinkPendingStats {
-    let mut max_pending = 0usize;
-    let mut total_pending = 0usize;
+) -> DownlinkPressureStats {
+    let mut stats = DownlinkPressureStats::default();
     for ctx in ctxs {
-        let pending = ctx.downlink_pending.len();
-        max_pending = max_pending.max(pending);
-        total_pending = total_pending.saturating_add(pending);
+        stats.note_pending(ctx.downlink_pending.len());
     }
-    DownlinkPendingStats::new(max_pending, total_pending)
+    stats
+}
+
+fn downlink_pressure_stats(
+    dirty: &HashSet<SocketHandle>,
+    socket_ctxs: &HashMap<SocketHandle, SocketCtx>,
+    sockets: &SocketSet<'_>,
+) -> DownlinkPressureStats {
+    let mut stats = DownlinkPressureStats::default();
+    for handle in dirty {
+        let Some(ctx) = socket_ctxs.get(handle) else {
+            continue;
+        };
+        stats.note_pending(ctx.downlink_pending.len());
+    }
+    for (handle, socket) in sockets.iter() {
+        if !dirty.contains(&handle) || !socket_ctxs.contains_key(&handle) {
+            continue;
+        }
+        if let smoltcp::socket::Socket::Tcp(tcp_socket) = socket {
+            stats.note_tx_queue(tcp_socket.send_queue());
+        }
+    }
+    stats
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1433,13 +1487,13 @@ impl DownlinkEgressPacer {
 
 fn next_downlink_backpressure(
     was_paused: bool,
-    stats: DownlinkPendingStats,
+    stats: DownlinkPressureStats,
     cfg: DownlinkBackpressureConfig,
 ) -> bool {
     if was_paused {
-        stats.max_pending > cfg.low_bytes
+        stats.max_pressure() > cfg.low_bytes
     } else {
-        stats.max_pending >= cfg.high_bytes
+        stats.max_pressure() >= cfg.high_bytes
     }
 }
 
@@ -1936,17 +1990,20 @@ pub async fn run_event_loop<D, U, M>(
     let mut global_rx_paused = false;
 
     loop {
-        let downlink_stats =
-            downlink_pending_stats(dirty.iter().filter_map(|handle| socket_ctxs.get(handle)));
+        let downlink_stats = downlink_pressure_stats(&dirty, &socket_ctxs, &sockets);
         let next_global_rx_paused =
             next_downlink_backpressure(global_rx_paused, downlink_stats, downlink_backpressure);
         if next_global_rx_paused != global_rx_paused {
             global_rx_paused = next_global_rx_paused;
             tcp_diag_log!(
-                "🔎 tcp-downlink-backpressure paused={} max_pending={} total_pending={} high={} low={}",
+                "🔎 tcp-downlink-backpressure paused={} max_pending={} total_pending={} max_tx_queue={} total_tx_queue={} max_pressure={} total_pressure={} high={} low={}",
                 global_rx_paused,
                 downlink_stats.max_pending,
                 downlink_stats.total_pending,
+                downlink_stats.max_tx_queue,
+                downlink_stats.total_tx_queue,
+                downlink_stats.max_pressure(),
+                downlink_stats.total_pressure(),
                 downlink_backpressure.high_bytes,
                 downlink_backpressure.low_bytes
             );
@@ -1959,7 +2016,7 @@ pub async fn run_event_loop<D, U, M>(
                 match event {
                     RelayEvent::Data { epoch, bytes: payload } => {
                         trace_log!("📬 从大邮筒收到 {} 字节数据，准备送往房间 {:?}", payload.len(), handle);
-                        if let Err(e) = handle_remote_payload(
+                        let accepted_bytes = match handle_remote_payload(
                             handle,
                             epoch,
                             payload,
@@ -1974,13 +2031,17 @@ pub async fn run_event_loop<D, U, M>(
                         )
                         .await
                         {
-                            trace_log!("处理回程数据失败: {e}");
-                        }
-                        // #1：回程写不下的下行字节留在 downlink_pending（tx buffer 满）→ 标脏，
-                        // 让 relay 段后续 tick 持续 flush，直到排空才出集（绝不丢字节）。
+                            Ok(accepted_bytes) => accepted_bytes,
+                            Err(e) => {
+                                trace_log!("处理回程数据失败: {e}");
+                                0
+                            }
+                        };
+                        // #1：回程下行可能留在 app pending，也可能已进入 smoltcp tx queue。
+                        // 两者都需要继续标脏，直到本地 TCP/TUN egress 压力退到 low watermark。
                         if socket_ctxs
                             .get(&handle)
-                            .map(|c| !c.downlink_pending.is_empty())
+                            .map(|c| !c.downlink_pending.is_empty() || accepted_bytes > 0)
                             .unwrap_or(false)
                         {
                             dirty.insert(handle);
@@ -2096,6 +2157,7 @@ pub async fn run_event_loop<D, U, M>(
                             &metrics_handle,
                             &mut metrics,
                             downlink_flush_max_bytes,
+                            downlink_backpressure,
                         )
                         .await;
                     }
@@ -2230,6 +2292,7 @@ pub async fn run_event_loop<D, U, M>(
                     &metrics_handle,
                     &mut metrics,
                     downlink_flush_max_bytes,
+                    downlink_backpressure,
                 )
                 .await;
             }
@@ -2243,8 +2306,9 @@ pub async fn run_event_loop<D, U, M>(
 /// #1 脏集合驱动的 relay 调度段：只处理本 tick 标脏的 handle，替代每 tick 全量 `all_handles()`。
 ///
 /// 中文要点：把 relay 段成本从 O(总 listener 槽数) 降到 O(活跃 handle)。处理完一个 handle 后，
-/// 若它无下行 pending、smoltcp 侧不再 `can_recv`、且没有本地 FIN 待发（首包已 drain、已开远端进 Relaying），
-/// 就出脏集合——后续回程走 `global_rx` 分支，残留 pending 或 FIN 重试时会留脏。仍有活就留在集合里下个 tick 续处理。
+/// 若它无下行 pending、smoltcp 侧不再 `can_recv`、tx queue 已降到 low watermark、且没有本地 FIN
+/// 待发（首包已 drain、已开远端进 Relaying），就出脏集合——后续回程走 `global_rx` 分支，残留
+/// pending、tx queue pressure 或 FIN 重试时会留脏。仍有活就留在集合里下个 tick 续处理。
 #[allow(clippy::too_many_arguments)]
 async fn process_dirty_relay<U, M>(
     dirty: &mut HashSet<SocketHandle>,
@@ -2258,6 +2322,7 @@ async fn process_dirty_relay<U, M>(
     metrics_handle: &Metrics,
     metrics: &mut M,
     downlink_flush_max_bytes: usize,
+    downlink_backpressure: DownlinkBackpressureConfig,
 ) where
     U: ProxyUpstream + 'static,
     M: MetricsSink,
@@ -2284,9 +2349,9 @@ async fn process_dirty_relay<U, M>(
             trace_log!("处理本地房间 {:?} 失败: {e}", handle);
         }
         let still_active = {
-            let (has_recv, tcp_state) = {
+            let (has_recv, tcp_state, tx_queue) = {
                 let socket = sockets.get_mut::<TcpSocket>(handle);
-                (socket.can_recv(), socket.state())
+                (socket.can_recv(), socket.state(), socket.send_queue())
             };
             let (has_pending, needs_local_finish) = socket_ctxs
                 .get(&handle)
@@ -2299,7 +2364,7 @@ async fn process_dirty_relay<U, M>(
                     )
                 })
                 .unwrap_or((false, false));
-            has_recv || has_pending || needs_local_finish
+            has_recv || has_pending || needs_local_finish || tx_queue > downlink_backpressure.low_bytes
         };
         if !still_active {
             dirty.remove(&handle);
@@ -3128,10 +3193,10 @@ async fn handle_remote_payload<D: TunIo>(
     now_secs: u64,
     downlink_flush_max_bytes: usize,
     downlink_egress_pacer: &mut DownlinkEgressPacer,
-) -> std::io::Result<()> {
+) -> std::io::Result<usize> {
     let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
-        return Ok(());
+        return Ok(0);
     };
     if ctx.conn_epoch != epoch {
         trace_log!(
@@ -3140,7 +3205,7 @@ async fn handle_remote_payload<D: TunIo>(
             ctx.conn_epoch,
             payload.len()
         );
-        return Ok(());
+        return Ok(0);
     }
 
     if payload.is_empty() {
@@ -3154,7 +3219,7 @@ async fn handle_remote_payload<D: TunIo>(
             "remote_to_local",
             "remote_eof",
         );
-        return Ok(());
+        return Ok(0);
     }
 
     // 防串话 / 防 panic（epoch guard 的轻量降级版）：若该 handle 已被重连流程复位回
@@ -3166,7 +3231,7 @@ async fn handle_remote_payload<D: TunIo>(
             handle,
             payload.len()
         );
-        return Ok(());
+        return Ok(0);
     }
 
     // 不直接 send_slice（会丢写不下的字节）：先入下行 pending，再尽量 flush；
@@ -3185,7 +3250,7 @@ async fn handle_remote_payload<D: TunIo>(
         if accepted_bytes > 0 {
             ctx.downlink_diag.note_tun_flush_deferred();
         }
-        return Ok(());
+        return Ok(accepted_bytes);
     }
 
     let timestamp = smoltcp::time::Instant::now();
@@ -3198,7 +3263,9 @@ async fn handle_remote_payload<D: TunIo>(
     if let Err(e) = &result {
         tcp_diag_log!("🔎 tcp-tun-flush-fail handle={:?} stage=remote_payload err={e}", handle);
     }
-    result
+    // Even if this flush fails, accepted bytes are already queued in smoltcp and
+    // must keep the handle dirty for tx-queue-aware backpressure.
+    Ok(accepted_bytes)
 }
 
 fn handle_relay_closed(
@@ -5554,6 +5621,10 @@ mod tests {
         let stats = downlink_pending_stats([&a, &b]);
         assert_eq!(stats.max_pending, 25);
         assert_eq!(stats.total_pending, 35);
+        assert_eq!(stats.max_tx_queue, 0);
+        assert_eq!(stats.total_tx_queue, 0);
+        assert_eq!(stats.max_pressure(), 25);
+        assert_eq!(stats.total_pressure(), 35);
     }
 
     #[test]
@@ -5564,20 +5635,45 @@ mod tests {
         };
 
         assert!(
-            !next_downlink_backpressure(false, DownlinkPendingStats::new(99, 99), cfg),
+            !next_downlink_backpressure(false, DownlinkPressureStats::pending_only(99, 99), cfg),
             "below high watermark keeps global_rx enabled"
         );
         assert!(
-            next_downlink_backpressure(false, DownlinkPendingStats::new(100, 100), cfg),
+            next_downlink_backpressure(false, DownlinkPressureStats::pending_only(100, 100), cfg),
             "hitting high watermark pauses global_rx"
         );
         assert!(
-            next_downlink_backpressure(true, DownlinkPendingStats::new(41, 41), cfg),
+            next_downlink_backpressure(true, DownlinkPressureStats::pending_only(41, 41), cfg),
             "while paused, stay paused until below low watermark"
         );
         assert!(
-            !next_downlink_backpressure(true, DownlinkPendingStats::new(40, 40), cfg),
+            !next_downlink_backpressure(true, DownlinkPressureStats::pending_only(40, 40), cfg),
             "low watermark resumes global_rx"
+        );
+    }
+
+    #[test]
+    fn downlink_backpressure_uses_tx_queue_pressure_when_pending_is_empty() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+
+        assert!(
+            !next_downlink_backpressure(false, DownlinkPressureStats::new(0, 0, 99, 99), cfg),
+            "below high watermark keeps global_rx enabled even with tx queue pressure"
+        );
+        assert!(
+            next_downlink_backpressure(false, DownlinkPressureStats::new(0, 0, 100, 100), cfg),
+            "hitting high watermark via smoltcp tx queue pauses global_rx"
+        );
+        assert!(
+            next_downlink_backpressure(true, DownlinkPressureStats::new(0, 0, 41, 41), cfg),
+            "while paused, tx queue pressure keeps global_rx paused until low watermark"
+        );
+        assert!(
+            !next_downlink_backpressure(true, DownlinkPressureStats::new(0, 0, 40, 40), cfg),
+            "low tx queue watermark resumes global_rx when app pending is empty"
         );
     }
 

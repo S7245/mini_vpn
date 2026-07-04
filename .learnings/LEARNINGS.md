@@ -1,5 +1,26 @@
 # Learnings
 
+## 2026-07-04 - Knife14ax keeps tx-queue pressure visible to global_rx backpressure
+
+- Stage docs:
+  `docs/tech/2026-07-04-knife14ax-tx-queue-backpressure-spec.md`,
+  `docs/tech/2026-07-04-knife14ax-tx-queue-backpressure-plan.md`
+- Outcome: changed downlink backpressure from app-pending-only to
+  tx-queue-aware pressure. Handles that accept downlink bytes into smoltcp now
+  stay dirty while their socket tx queue remains above the low watermark, and
+  `global_rx_paused` uses the max of app-owned pending and smoltcp tx queue
+  pressure. The low-RTT parser now reports tx-queue pressure in
+  `downlink_backpressure`.
+- Verification passed: focused downlink TDD red/green test,
+  `cargo test --lib client_tun`, low-RTT probe self-test, US-client suite
+  self-test, shell syntax checks, `cargo test`, `cargo test --features
+  harness`, `cargo clippy --all-targets --features harness -- -D warnings`,
+  and `git diff --check`.
+- Reusable rule: if `send_slice` accepts bytes into smoltcp, app-owned
+  `downlink_pending` is no longer a sufficient backpressure signal. Keep the
+  handle observable until the smoltcp tx queue also drains below the resume
+  watermark.
+
 ## 2026-07-04 - Knife14aw identifies smoltcp tx queue pressure as the missing feedback edge
 
 - Code commit: `ef7364c`

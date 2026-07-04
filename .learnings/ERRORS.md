@@ -1,5 +1,18 @@
 # Errors
 
+## 2026-07-04 - Local cargo test QUIC bind checks fail inside restricted sandbox
+
+- Stage: Knife14ax local regression.
+- Symptom: `cargo test` and `cargo test --features harness` failed only for
+  `quic::tests::client_endpoint_binds` and
+  `quic::tests::client_endpoint_binds_with_each_cc` when run inside the managed
+  sandbox. The same filtered tests passed immediately outside the sandbox.
+- Root cause: the tests create local QUIC endpoints and require local bind
+  permissions not available in the restricted sandbox.
+- Correct behavior: when these exact tests fail under sandboxing, rerun the
+  cargo test command outside the sandbox before treating it as a code
+  regression. Do not change QUIC code or test assertions for this failure mode.
+
 ## 2026-07-04 - Knife14aw diagnostics passed but reverse-first throughput stayed low
 
 - Stage: Knife14aw send-window/global_rx diagnostics acceptance for commit
