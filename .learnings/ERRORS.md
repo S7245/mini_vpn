@@ -1,5 +1,28 @@
 # Errors
 
+## 2026-07-04 - Knife14at first VPS attempt missed local TUIC environment
+
+- Failed report:
+  `/tmp/conn/mvpn_knife14at_tun_egress_feedback_usclient_suite_20260704_185107.md`
+- Failed bundle:
+  `/tmp/conn/mvpn_knife14at_tun_egress_feedback_usclient_suite_20260704_185107.tar.gz`
+- Symptom: the first `.27` Knife14at suite attempt stopped before sudo, build,
+  tunnel startup, or iperf traffic because the non-login SSH shell had not
+  loaded required TUIC environment variables.
+- Rejected assumption: if `.env` exists on `.27`, a direct remote suite command
+  will automatically load it.
+- Correct behavior: before running the suite, check that the required variable
+  names exist without printing values, then explicitly source the VPS-local
+  `.env` in the same TTY command:
+  `set -a && . ./.env && set +a && ...`.
+- Security rule: keep `.env` local to the VPS/user environment. Do not print,
+  commit, copy, summarize, or store secret values in reports, docs, learning
+  memory, commands, or final messages.
+- Future debugging rule: if a suite fails at TUIC Env Checks, treat it as an
+  invocation/environment failure. Do not analyze mini_vpn, sing-box, iperf, TUN,
+  or QUIC behavior until the environment is loaded and the tunnel actually
+  starts.
+
 ## 2026-07-04 - Non-TTY sudo preflight failure produced no data-plane evidence
 
 - Log bundle:

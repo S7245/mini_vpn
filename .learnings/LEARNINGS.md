@@ -1,5 +1,34 @@
 # Learnings
 
+## 2026-07-04 - Knife14at makes TUN egress drops runtime-observable, but not sufficient root cause
+
+- Code commit: `e8a7c41`
+- Log bundle:
+  `/tmp/mini_vpn/mvpn_knife14at_tun_egress_feedback_usclient_suite_20260704_191427.tar.gz`
+- Result doc:
+  `docs/tech/2026-07-04-knife14at-tun-egress-feedback-results.md`
+- Outcome: the scoped reverse-first P1 window reached `185/183 Mbit/s`, so the
+  Knife14as low reverse result (`22.2 Mbit/s` receiver) did not reproduce.
+  The clean window had `terminal_pending_reap=0`, no relay-late-remote signal,
+  no local/global write pressure, no QUIC loss/congestion deltas,
+  `send_slice_zero=0`, `send_slice_errors=0`, `tun_flush_failures=0`, and
+  `tun_flush_deferred=0`.
+- New discriminator: runtime `tcp-tun-egress` worked and matched probe-level
+  accounting in the clean reverse-first window:
+  `runtime_tun_egress drop_delta_total=376` and
+  `tun_tx_dropped_delta=376`.
+- Corrected assumption: local TUN egress drops plus downlink backpressure are
+  real, but they are not sufficient to explain low reverse throughput by
+  themselves. In this run reverse throughput stayed high while those signals
+  were present.
+- Separate branch: forward P1 remained bad (`5.56/2.06 Mbit/s`) with
+  `quic_loss_congestion+local_write_pressure+local_tun_egress_drop`, and later
+  reverse windows inherited QUIC congestion but still reached `184/180 Mbit/s`.
+- Reusable rule: after a runtime drop signal is observable, do not treat the
+  label as causal without throughput correlation. Split reverse downlink egress
+  from forward/uplink QUIC congestion before changing TUN queues, watermarks,
+  downlink pacing, or close-drain logic again.
+
 ## 2026-07-04 - Knife14as separated terminal pending from active reverse bottleneck
 
 - Code commits: `575a448`, `2205734`
