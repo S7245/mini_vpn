@@ -1683,11 +1683,49 @@ fn parse_backpressure_bytes(s: Option<&str>, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+#[cfg(test)]
 fn parse_downlink_backpressure_config(
     high: Option<&str>,
     low: Option<&str>,
 ) -> DownlinkBackpressureConfig {
+    parse_downlink_backpressure_config_with_default(
+        high,
+        low,
+        DownlinkBackpressureConfig::default(),
+    )
+}
+
+fn default_downlink_backpressure_for_tx_buffer(tx_bytes: usize) -> DownlinkBackpressureConfig {
     let default = DownlinkBackpressureConfig::default();
+    if tx_bytes <= default.high_bytes {
+        return default;
+    }
+
+    let high_bytes = tx_bytes;
+    let low_bytes = (tx_bytes / 4).max(1).min(high_bytes.saturating_sub(1));
+    DownlinkBackpressureConfig {
+        high_bytes,
+        low_bytes,
+    }
+}
+
+fn parse_downlink_backpressure_config_for_tx_buffer(
+    high: Option<&str>,
+    low: Option<&str>,
+    tx_bytes: usize,
+) -> DownlinkBackpressureConfig {
+    parse_downlink_backpressure_config_with_default(
+        high,
+        low,
+        default_downlink_backpressure_for_tx_buffer(tx_bytes),
+    )
+}
+
+fn parse_downlink_backpressure_config_with_default(
+    high: Option<&str>,
+    low: Option<&str>,
+    default: DownlinkBackpressureConfig,
+) -> DownlinkBackpressureConfig {
     let high_bytes = parse_backpressure_bytes(high, default.high_bytes);
     let mut low_bytes = parse_backpressure_bytes(low, default.low_bytes);
     if low_bytes >= high_bytes {
@@ -1788,13 +1826,20 @@ impl TunRuntimeConfig {
         cfg.tun_mtu = parse_tun_mtu(std::env::var("MINI_VPN_TUN_MTU").ok().as_deref());
         cfg.metrics_secs = parse_metrics_secs(std::env::var("MINI_VPN_METRICS_SECS").ok().as_deref());
         cfg.profile_loop = parse_profile_loop(std::env::var("MINI_VPN_PROFILE_LOOP").ok().as_deref());
-        cfg.downlink_backpressure = parse_downlink_backpressure_config(
-            std::env::var("MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES")
-                .ok()
-                .as_deref(),
-            std::env::var("MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES")
-                .ok()
-                .as_deref(),
+        let tcp_rx_buffer = std::env::var("MINI_VPN_TCP_RX_BUFFER_BYTES").ok();
+        let tcp_tx_buffer = std::env::var("MINI_VPN_TCP_TX_BUFFER_BYTES").ok();
+        cfg.tcp_socket_buffers = parse_tcp_socket_buffer_config(
+            tcp_rx_buffer.as_deref(),
+            tcp_tx_buffer.as_deref(),
+        );
+        let downlink_backpressure_high =
+            std::env::var("MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES").ok();
+        let downlink_backpressure_low =
+            std::env::var("MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES").ok();
+        cfg.downlink_backpressure = parse_downlink_backpressure_config_for_tx_buffer(
+            downlink_backpressure_high.as_deref(),
+            downlink_backpressure_low.as_deref(),
+            cfg.tcp_socket_buffers.tx_bytes,
         );
         cfg.downlink_flush_max_bytes = parse_downlink_flush_max_bytes(
             std::env::var("MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES")
@@ -1803,14 +1848,6 @@ impl TunRuntimeConfig {
         );
         cfg.downlink_egress_immediate_bytes = parse_downlink_egress_immediate_bytes(
             std::env::var("MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES")
-                .ok()
-                .as_deref(),
-        );
-        cfg.tcp_socket_buffers = parse_tcp_socket_buffer_config(
-            std::env::var("MINI_VPN_TCP_RX_BUFFER_BYTES")
-                .ok()
-                .as_deref(),
-            std::env::var("MINI_VPN_TCP_TX_BUFFER_BYTES")
                 .ok()
                 .as_deref(),
         );
@@ -6017,6 +6054,27 @@ mod tests {
         let repaired = parse_downlink_backpressure_config(Some("4194304"), Some("4194304"));
         assert_eq!(repaired.high_bytes, 4194304);
         assert_eq!(repaired.low_bytes, default.low_bytes);
+    }
+
+    #[test]
+    fn parse_downlink_backpressure_config_scales_defaults_with_tcp_tx_buffer() {
+        let scaled =
+            parse_downlink_backpressure_config_for_tx_buffer(None, None, 1_048_576);
+        assert_eq!(scaled.high_bytes, 1_048_576);
+        assert_eq!(scaled.low_bytes, 262_144);
+
+        let legacy =
+            parse_downlink_backpressure_config_for_tx_buffer(None, None, 65_535);
+        assert_eq!(legacy, DownlinkBackpressureConfig::default());
+
+        let explicit =
+            parse_downlink_backpressure_config_for_tx_buffer(
+                Some("4096"),
+                Some("1024"),
+                1_048_576,
+            );
+        assert_eq!(explicit.high_bytes, 4096);
+        assert_eq!(explicit.low_bytes, 1024);
     }
 
     #[test]

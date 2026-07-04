@@ -1775,3 +1775,23 @@ worth cleaning up separately.
 - Reusable rule: parser attribution for throughput root cause should use
   data-stream filtered fields, while raw/global maxima remain in the report for
   manual inspection.
+
+## 2026-07-04 — Knife14bc scales tx-queue backpressure with the configured tx buffer
+
+- Stage: Knife14bc tx-window scaled backpressure defaults.
+- Outcome: Added adaptive default downlink backpressure for runtime env config:
+  when `MINI_VPN_TCP_TX_BUFFER_BYTES` is larger than the legacy `512KiB` high
+  watermark and backpressure env values are not explicitly set, the high
+  watermark rises to the tx buffer size and the low watermark rises to one
+  quarter of that size. Explicit backpressure env values still win.
+- Local gates passed: focused RED/GREEN test, `cargo test --lib
+  client_tun::tests::`, low-RTT parser self-test, US-client suite self-test,
+  full `cargo test` outside sandbox, `cargo test --features harness` outside
+  sandbox, and `cargo clippy --all-targets --features harness -- -D warnings`.
+- Key lesson: Knife14ba showed useful receiver bytes matched
+  `send_slice_accepted`; the terminal pending tail arrived after local close.
+  The earlier limiter is the fixed 512KiB tx-queue pause threshold acting as a
+  receive-window cap on a VPS RTT path.
+- Reusable rule: when TCP socket tx buffer is explicitly enlarged for
+  throughput, tx-queue backpressure defaults must scale with that buffer unless
+  the operator explicitly configures different watermarks.

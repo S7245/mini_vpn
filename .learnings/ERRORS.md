@@ -1040,3 +1040,15 @@
 - Future debugging rule: when adding parser labels, include a negative fixture
   for the nearest known false-positive shape before trusting new attribution in
   VPS reports.
+
+## 2026-07-04 — Knife14bc left a parser helper as production dead code
+
+- Symptom: after `from_env` switched to the tx-buffer-aware backpressure parser,
+  full `cargo test` emitted a `dead_code` warning for the old fixed-default
+  `parse_downlink_backpressure_config` helper. `cargo clippy -D warnings` would
+  have failed if this had been left in place.
+- Fix: mark the fixed-default helper `#[cfg(test)]`; production now uses the
+  tx-buffer-aware parser while legacy default behavior remains covered by
+  tests.
+- Future debugging rule: after replacing a production config path, check whether
+  any helper became test-only and gate it before running clippy.
