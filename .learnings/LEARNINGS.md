@@ -1795,3 +1795,16 @@ worth cleaning up separately.
 - Reusable rule: when TCP socket tx buffer is explicitly enlarged for
   throughput, tx-queue backpressure defaults must scale with that buffer unless
   the operator explicitly configures different watermarks.
+
+## 2026-07-04 — Knife14bd suite must not override adaptive runtime defaults
+
+- Stage: Knife14bd suite adaptive backpressure.
+- Outcome: Updated `scripts/knife14b-usclient-tunnel-suite.sh` so default
+  downlink backpressure env values are empty and reported as `<auto>`, letting
+  the Knife14bc binary scale high/low from `MINI_VPN_TCP_TX_BUFFER_BYTES`.
+  Explicit operator-provided high/low env values still pass through.
+- Local gates passed: suite self-test and shell syntax check.
+- Key lesson: code-side adaptive defaults are ineffective if acceptance scripts
+  always export fixed legacy env values.
+- Reusable rule: before a VPS run that validates runtime config defaults, grep
+  the suite for env exports that may shadow the binary default being tested.

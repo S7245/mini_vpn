@@ -1052,3 +1052,23 @@
   tests.
 - Future debugging rule: after replacing a production config path, check whether
   any helper became test-only and gate it before running clippy.
+
+## 2026-07-04 — Knife14bc VPS run would have been masked by suite env defaults
+
+- Symptom: before running VPS acceptance, inspection showed
+  `scripts/knife14b-usclient-tunnel-suite.sh` exported fixed
+  `MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=524288` and
+  `MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=131072`, which would override the
+  Knife14bc adaptive binary defaults.
+- Fix: Knife14bd changed the suite defaults to empty `<auto>` values while
+  preserving explicit operator overrides.
+- Future debugging rule: after a config-default patch, inspect the acceptance
+  script's exported env vars before running VPS. A script-level default can
+  silently invalidate the code path under test.
+
+## 2026-07-04 — .27 VPS does not have ripgrep installed
+
+- Symptom: `ssh ... 'rg ...'` on `.27` failed with `bash: line 1: rg: command
+  not found`.
+- Correct behavior: use portable `grep`/`find` commands on VPS hosts unless
+  `rg` availability has been checked.
