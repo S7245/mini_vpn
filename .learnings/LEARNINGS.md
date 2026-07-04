@@ -1,5 +1,37 @@
 # Learnings
 
+## 2026-07-04 — Knife14ao A/B proves lower downlink watermarks are the next code lever
+
+The first no-code A/B for Knife14ao ran commit `246f8fa` from `.27` with
+default TUN qlen 500, `MINI_VPN_TUIC_CC=bbr`, `MINI_VPN_TUIC_TCP_POOL=1`,
+1MiB TCP socket buffers, `MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=262144`,
+`MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=524288`, and
+`MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=131072`. Bundle:
+`/tmp/mini_vpn/mvpn_knife14ao_bp512_128_flush256_defaultqlen_tty_usclient_suite_20260704_142413.tar.gz`.
+
+The clean reverse-first P1 improved from the Knife14an 23.5 Mbit/s receiver
+result to 157 Mbit/s receiver. QUIC stayed clean for that first reverse window
+(`max_lost_bytes_delta=0`, `max_congestion_events_delta=0`,
+`inherited_conns=none`), while downlink pending was bounded near the new high
+watermark (`max_pending_bytes=589570` instead of roughly 2.15 MiB). This
+falsifies the idea that the low reverse throughput is primarily iperf3,
+sing-box, or the VPS path: the same binary and path materially improve when the
+local downlink watermarks are lowered.
+
+This A/B is not a final acceptance. The clean reverse still reported
+`local_tun_egress_drop+local_downlink_backpressure` and
+`tun_tx_dropped_delta=4394`, so lower watermarks reduce backlog size and improve
+throughput but do not fully eliminate local TUN egress pressure. A stricter
+256/64 KiB A/B was attempted next, but it failed during TUIC startup before
+app-level server logging and is recorded in `.learnings/ERRORS.md`, not as a
+throughput result.
+
+Reusable rule: the next code change should be a narrow default-watermark update
+or a stronger local-egress feedback mechanism, guarded by tests and a rerun
+that reaches the clean reverse-first probe. Do not keep tuning iperf3,
+sing-box, or QUIC congestion control until the local watermark/TUN-drop branch
+has been accepted or falsified.
+
 ## 2026-07-04 — Knife14an VPS run falsifies per-flush-only downlink pacing
 
 Commits `03f6bdc`, `739c8c0`, and `2261aed` were tested from `.27` with the

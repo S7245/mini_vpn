@@ -1,5 +1,42 @@
 # Errors
 
+## 2026-07-04 — Manual `.27` suite invocations must explicitly source `.env`
+
+- Stage: Knife14ao downlink-watermark A/B.
+- Failed bundle:
+  `/tmp/conn/mvpn_knife14ao_bp256_64_flush256_defaultqlen_tty_usclient_suite_20260704_142904.tar.gz`
+- Symptom: the suite stopped before startup with all TUIC environment variables
+  reported missing.
+- Important discriminator: `/home/ubuntu/mini_vpn/.env` existed, had mode 600,
+  and `set -a; . ./.env; set +a` exported the required TUIC variables. The file
+  uses `export KEY=...`, so a naive `grep '^KEY='` check is not a valid
+  presence test.
+- Correct behavior: when invoking the suite manually over SSH, run it from
+  `/home/ubuntu/mini_vpn` after sourcing `.env` in the same shell. Keep secrets
+  out of command output, scripts, repository files, reports, and learning
+  memory.
+
+## 2026-07-04 — Knife14ao A/B #2 failed before TUIC app-level logging
+
+- Stage: Knife14ao downlink-watermark A/B with
+  `MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=262144`,
+  `MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=65536`, and
+  `MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=262144`.
+- Failed bundle:
+  `/tmp/conn/mvpn_knife14ao_bp256_64_flush256_defaultqlen_tty_usclient_suite_20260704_143108.tar.gz`
+- Symptom: `.27` loaded the TUIC env and direct baselines were healthy
+  (`.27 -> .77` reverse 290 Mbit/s receiver, `.33 -> .77` reverse
+  287 Mbit/s receiver), but `client-tun` exited during startup with
+  `tuic auth finish: sending stopped by peer: error 0`.
+- Important discriminator: `.33` `sing-box` was active, had not restarted, and
+  UDP `:8443` was owned by the `sing-box` process, but
+  `/var/log/sing-box.log` mtime remained at `2026-07-04 14:27:09 +0800`.
+  The failed 14:31 startup did not produce a TUIC inbound log line.
+- Future behavior: do not interpret this failure as a throughput result or a
+  watermark regression. Treat it as a startup/QUIC-handshake boundary issue
+  until a rerun reaches the iperf probe window or server-side logs show an
+  app-level TUIC connection.
+
 ## 2026-07-04 — `.27` suite needs a TTY when sudo timestamp is cold
 
 - Stage: Knife14an VPS acceptance.
