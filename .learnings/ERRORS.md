@@ -1,5 +1,21 @@
 # Errors
 
+## 2026-07-04 — Full `cargo fmt --check` reports broad pre-existing formatting drift
+
+- Stage: Knife14an local verification after adding the downlink flush budget.
+- Command failed locally: `cargo fmt --check`.
+- Symptom: rustfmt wanted to rewrite large portions of `src/client_tun.rs`,
+  `src/reality_upstream.rs`, and `src/main.rs`, including many lines outside
+  the Knife14an diff.
+- Important discriminator: focused behavior checks passed:
+  `cargo test --lib client_tun`, `bash -n scripts/knife14b-usclient-tunnel-suite.sh`,
+  `bash scripts/knife14b-usclient-tunnel-suite.sh --self-test`, and
+  `git diff --check`.
+- Correct behavior: do not run whole-repo `cargo fmt` inside a scoped
+  throughput fix because it would create unrelated churn and make review harder.
+  Use `git diff --check` for patch whitespace, and make formatting cleanup a
+  separate explicit task if the project decides to normalize rustfmt output.
+
 ## 2026-07-04 — Knife14al cleanup regex killed the active suite shell
 
 - Failed bundle:

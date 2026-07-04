@@ -1,5 +1,42 @@
 # Learnings
 
+## 2026-07-04 — Knife14an bounds each downlink flush burst before VPS retest
+
+Commit `03f6bdc` added a configurable TCP downlink flush budget instead of
+changing sing-box, iperf3, QUIC congestion control, or the stale TUIC TCP pool
+branch. The grounding signal was Knife14al's same-window bundle
+`/tmp/mini_vpn/mvpn_knife14al_samewindow_defaultqlen2_usclient_suite_20260704_133130.tar.gz`:
+reverse-first tunnel throughput was 13.7/12.4 Mbit/s with
+`local_tun_egress_drop+local_downlink_backpressure`, while direct client/exit
+paths and sing-box health were normal.
+
+The implementation caps one `flush_downlink` pass to
+`MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES`, defaulting to 256 KiB and accepting
+4 KiB through 16 MiB. Bytes beyond the cap remain in `downlink_pending`; only
+the bytes actually accepted by smoltcp are drained. The US-client suite now
+records and passes the active budget so `.27` VPS reports show whether the
+default or an A/B override was used.
+
+Verification:
+- `cargo test --lib client_tun`
+- `bash -n scripts/knife14b-usclient-tunnel-suite.sh`
+- `bash scripts/knife14b-usclient-tunnel-suite.sh --self-test`
+- `git diff --check`
+
+Stage review found no blocking bug in the local change: dirty handles remain
+dirty while pending downlink exists, parser bounds avoid accidental zero or
+oversized budgets, and `MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=1048576` remains
+available for an approximate previous-behavior A/B. Full `cargo fmt --check`
+still reports broad pre-existing formatting drift, so avoid a whole-repo
+formatting churn inside throughput stages unless formatting is made a separate
+task.
+
+Reusable rule: when larger smoltcp TCP buffers improve one direction but local
+TUN/qdisc drops appear in the reverse path, first bound the amount admitted into
+smoltcp per local egress pass. Do not use a larger TUN queue or lower global
+pending watermarks as the first product fix unless the per-flush burst bound is
+falsified by a same-window VPS run.
+
 ## 2026-07-04 — Knife14am labels inherited QUIC congestion before pacing work
 
 Commit `fec33fe` fixed the low-RTT attribution gap from Knife14al without
