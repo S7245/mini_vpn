@@ -1,5 +1,42 @@
 # Learnings
 
+## 2026-07-04 — Knife14ap makes bounded downlink flush progress visible
+
+Knife14ao default-watermark acceptance for commit `0d0765f` did not reproduce
+the earlier high no-code A/B result. The `.27` bundle
+`/tmp/mini_vpn/mvpn_knife14ao_default_bp512_128_flush256_tty_usclient_suite_20260704_144755.tar.gz`
+showed the new defaults were active (`high=524288B`, `low=131072B`,
+`flush=262144B`) and direct paths were healthy, but clean reverse-first P1 was
+only `22.5/21.4 Mbit/s`. QUIC loss/congestion remained clean in that first
+window; the residual signals were local TUN egress drop and downlink
+backpressure. The failure is recorded in `.learnings/ERRORS.md` so future work
+does not treat 512/128 KiB as accepted.
+
+Knife14ap therefore avoided another blind tuning pass and added a smaller
+observability step. `TcpDownlinkDiag` now counts non-empty flush attempts,
+`can_send=false` attempts, budget-limited attempts, zero/error `send_slice`
+events, total accepted bytes, largest single acceptance, and downlink-triggered
+TUN flush calls/failures. The event loop emits an aggregate
+`tcp-downlink-flush` line on the regular metrics tick, and the low-RTT probe
+summarizes it as `downlink_flush:` in each iperf attribution block.
+
+Verification:
+- `cargo test --lib tcp_downlink_flush`
+- `cargo test --lib client_tun`
+- `bash -n scripts/knife14b-lowrtt-probe.sh`
+- `bash scripts/knife14b-lowrtt-probe.sh --self-test`
+- `bash -n scripts/knife14b-usclient-tunnel-suite.sh`
+- `bash scripts/knife14b-usclient-tunnel-suite.sh --self-test`
+- `git diff --check`
+
+Stage review found no data-plane behavior change: the new counters are
+incremented inside existing flush branches, the new aggregate line remains
+behind `MINI_VPN_TCP_DIAG`, and the parser stays compatible with old logs by
+printing zero-valued `downlink_flush:` fields when no new line exists. The next
+VPS run should use clean reverse-first again and read `downlink_flush:` together
+with TUN drops to decide whether the next code stage is egress scheduling,
+smoltcp send-capacity feedback, or a different local queue strategy.
+
 ## 2026-07-04 — Knife14ao promotes 512/128 KiB downlink watermarks as defaults
 
 Knife14ao converted the no-code A/B result into a narrow product default

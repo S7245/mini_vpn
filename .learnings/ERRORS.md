@@ -1,5 +1,26 @@
 # Errors
 
+## 2026-07-04 — Knife14ao default-watermark acceptance did not reproduce the high A/B result
+
+- Stage: Knife14ao default downlink-watermark acceptance for commit `0d0765f`.
+- Failed bundle:
+  `/tmp/mini_vpn/mvpn_knife14ao_default_bp512_128_flush256_tty_usclient_suite_20260704_144755.tar.gz`
+- Symptom: `.27` ran the current branch with the new product defaults active
+  (`high=524288B`, `low=131072B`, `flush=262144B`), but clean reverse-first P1
+  reached only `22.5/21.4 Mbit/s`. The earlier no-code 512/128 KiB A/B had
+  reached `158/157 Mbit/s`.
+- Important discriminator: direct `.27 -> .77` and `.33 -> .77` iperf baselines
+  were healthy, sing-box and iperf3 services were active, and the clean
+  reverse-first tunnel window had no QUIC loss/congestion or inherited
+  congestion. The remaining signals were local:
+  `local_tun_egress_drop+local_downlink_backpressure`,
+  `max_pending_bytes=589698`, and `tun_tx_dropped_delta=496`.
+- Future behavior: do not treat 512/128 KiB watermarks as a final throughput
+  fix. Before further tuning or scheduler changes, add downlink flush progress
+  observability so the next bundle can distinguish `can_send=false`, zero/short
+  `send_slice`, budget clipping, and TUN/qdisc loss after successful smoltcp
+  acceptance.
+
 ## 2026-07-04 — Manual `.27` suite invocations must explicitly source `.env`
 
 - Stage: Knife14ao downlink-watermark A/B.

@@ -176,12 +176,20 @@ struct TcpDownlinkDiag {
     remote_to_global_rx_bytes: u64,
     /// Highest observed `SocketCtx.downlink_pending.len()`.
     downlink_pending_high_water: usize,
+    /// Number of times a non-empty pending backlog tried to progress through `flush_downlink`.
+    flush_attempts: u64,
     /// Number of attempted `tcp_socket.send_slice` calls.
     send_slice_calls: u64,
     /// Bytes accepted by smoltcp `send_slice`.
     send_slice_accepted_bytes: u64,
+    /// Largest single `send_slice` acceptance.
+    send_slice_max_accepted_bytes: usize,
     /// Times smoltcp accepted zero bytes while the socket was considered writable.
     send_slice_zero: u64,
+    /// Times pending existed but the smoltcp socket could not send yet.
+    send_slice_no_capacity: u64,
+    /// Times the configured per-flush budget clipped a larger pending backlog.
+    send_slice_budget_limited: u64,
     /// `send_slice` errors, usually socket close/reset while downlink still had bytes.
     send_slice_errors: u64,
     /// TCP downlink-triggered TUN flush attempts.
@@ -201,9 +209,24 @@ impl TcpDownlinkDiag {
         self.note_pending(pending_current);
     }
 
+    fn note_flush_attempt(&mut self, pending_current: usize, max_bytes_per_flush: usize) {
+        self.flush_attempts += 1;
+        if pending_current > bounded_downlink_flush_len(pending_current, max_bytes_per_flush) {
+            self.send_slice_budget_limited += 1;
+        }
+        self.note_pending(pending_current);
+    }
+
+    fn note_no_send_capacity(&mut self, pending_current: usize) {
+        self.send_slice_no_capacity += 1;
+        self.note_pending(pending_current);
+    }
+
     fn note_send_slice_ok(&mut self, accepted: usize, pending_current: usize) {
         self.send_slice_calls += 1;
         self.send_slice_accepted_bytes += accepted as u64;
+        self.send_slice_max_accepted_bytes =
+            self.send_slice_max_accepted_bytes.max(accepted);
         if accepted == 0 {
             self.send_slice_zero += 1;
         }
@@ -555,8 +578,11 @@ fn flush_downlink(
     if ctx.downlink_pending.is_empty() {
         return 0;
     }
-    ctx.downlink_diag.note_pending(ctx.downlink_pending.len());
+    ctx.downlink_diag
+        .note_flush_attempt(ctx.downlink_pending.len(), max_bytes_per_flush);
     if !tcp_socket.can_send() {
+        ctx.downlink_diag
+            .note_no_send_capacity(ctx.downlink_pending.len());
         return 0;
     }
     let flush_len = bounded_downlink_flush_len(ctx.downlink_pending.len(), max_bytes_per_flush);
@@ -902,6 +928,95 @@ fn downlink_pending_stats<'a>(
         total_pending = total_pending.saturating_add(pending);
     }
     DownlinkPendingStats::new(max_pending, total_pending)
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TcpDownlinkAggregate {
+    pending_total: usize,
+    pending_max: usize,
+    pending_high: usize,
+    remote_to_global_rx_bytes: u64,
+    flush_attempts: u64,
+    send_slice_no_capacity: u64,
+    send_slice_calls: u64,
+    send_slice_accepted_bytes: u64,
+    send_slice_zero: u64,
+    send_slice_errors: u64,
+    send_slice_budget_limited: u64,
+    send_slice_max_accepted_bytes: usize,
+    tun_flush_tx_calls: u64,
+    tun_flush_tx_failures: u64,
+}
+
+fn tcp_downlink_aggregate<'a>(
+    ctxs: impl IntoIterator<Item = &'a SocketCtx>,
+) -> TcpDownlinkAggregate {
+    let mut aggregate = TcpDownlinkAggregate::default();
+    for ctx in ctxs {
+        let pending = ctx.downlink_pending.len();
+        aggregate.pending_total = aggregate.pending_total.saturating_add(pending);
+        aggregate.pending_max = aggregate.pending_max.max(pending);
+        aggregate.pending_high =
+            aggregate.pending_high.max(ctx.downlink_diag.downlink_pending_high_water);
+        aggregate.remote_to_global_rx_bytes = aggregate
+            .remote_to_global_rx_bytes
+            .saturating_add(ctx.downlink_diag.remote_to_global_rx_bytes);
+        aggregate.flush_attempts = aggregate
+            .flush_attempts
+            .saturating_add(ctx.downlink_diag.flush_attempts);
+        aggregate.send_slice_no_capacity = aggregate
+            .send_slice_no_capacity
+            .saturating_add(ctx.downlink_diag.send_slice_no_capacity);
+        aggregate.send_slice_calls = aggregate
+            .send_slice_calls
+            .saturating_add(ctx.downlink_diag.send_slice_calls);
+        aggregate.send_slice_accepted_bytes = aggregate
+            .send_slice_accepted_bytes
+            .saturating_add(ctx.downlink_diag.send_slice_accepted_bytes);
+        aggregate.send_slice_zero = aggregate
+            .send_slice_zero
+            .saturating_add(ctx.downlink_diag.send_slice_zero);
+        aggregate.send_slice_errors = aggregate
+            .send_slice_errors
+            .saturating_add(ctx.downlink_diag.send_slice_errors);
+        aggregate.send_slice_budget_limited = aggregate
+            .send_slice_budget_limited
+            .saturating_add(ctx.downlink_diag.send_slice_budget_limited);
+        aggregate.send_slice_max_accepted_bytes = aggregate
+            .send_slice_max_accepted_bytes
+            .max(ctx.downlink_diag.send_slice_max_accepted_bytes);
+        aggregate.tun_flush_tx_calls = aggregate
+            .tun_flush_tx_calls
+            .saturating_add(ctx.downlink_diag.tun_flush_tx_calls);
+        aggregate.tun_flush_tx_failures = aggregate
+            .tun_flush_tx_failures
+            .saturating_add(ctx.downlink_diag.tun_flush_tx_failures);
+    }
+    aggregate
+}
+
+fn format_tcp_downlink_flush_diag(
+    aggregate: &TcpDownlinkAggregate,
+    dirty_handles: usize,
+) -> String {
+    format!(
+        "🔎 tcp-downlink-flush pending_total={} pending_max={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} dirty_handles={}",
+        aggregate.pending_total,
+        aggregate.pending_max,
+        aggregate.pending_high,
+        aggregate.remote_to_global_rx_bytes,
+        aggregate.flush_attempts,
+        aggregate.send_slice_no_capacity,
+        aggregate.send_slice_calls,
+        aggregate.send_slice_accepted_bytes,
+        aggregate.send_slice_zero,
+        aggregate.send_slice_errors,
+        aggregate.send_slice_budget_limited,
+        aggregate.send_slice_max_accepted_bytes,
+        aggregate.tun_flush_tx_calls,
+        aggregate.tun_flush_tx_failures,
+        dirty_handles
+    )
 }
 
 fn next_downlink_backpressure(
@@ -1630,6 +1745,11 @@ pub async fn run_event_loop<D, U, M>(
                     "🔎 tcp-loop-flush-tx calls={} failures={}",
                     tcp_loop_flush_tx_calls, tcp_loop_flush_tx_failures
                 );
+                let tcp_downlink = tcp_downlink_aggregate(socket_ctxs.values());
+                tcp_diag_log!(
+                    "{}",
+                    format_tcp_downlink_flush_diag(&tcp_downlink, dirty.len())
+                );
                 // 刀12：紧挨 📊 行打 🔬 主循环归因行（profiler 关闭时 NoopSink::report 空、零开销）。
                 metrics.report();
             }
@@ -2102,7 +2222,7 @@ fn rearm_socket_with_reason_and_snapshot(
 ) {
     if let Some(snapshot) = close_snapshot {
         tcp_diag_log!(
-            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} tun_flush_tx_calls={} tun_flush_tx_failures={} tcp_state={:?} active={} can_send={} can_recv={}",
+            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tcp_state={:?} active={} can_send={} can_recv={}",
             handle,
             close_direction,
             close_reason,
@@ -2110,10 +2230,14 @@ fn rearm_socket_with_reason_and_snapshot(
             ctx.downlink_pending.len(),
             ctx.downlink_diag.downlink_pending_high_water,
             ctx.downlink_diag.remote_to_global_rx_bytes,
+            ctx.downlink_diag.flush_attempts,
+            ctx.downlink_diag.send_slice_no_capacity,
             ctx.downlink_diag.send_slice_calls,
             ctx.downlink_diag.send_slice_accepted_bytes,
             ctx.downlink_diag.send_slice_zero,
             ctx.downlink_diag.send_slice_errors,
+            ctx.downlink_diag.send_slice_budget_limited,
+            ctx.downlink_diag.send_slice_max_accepted_bytes,
             ctx.downlink_diag.tun_flush_tx_calls,
             ctx.downlink_diag.tun_flush_tx_failures,
             snapshot.tcp_state,
@@ -2126,7 +2250,7 @@ fn rearm_socket_with_reason_and_snapshot(
     }
 
     tcp_diag_log!(
-        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} tun_flush_tx_calls={} tun_flush_tx_failures={}",
+        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={}",
         handle,
         close_direction,
         close_reason,
@@ -2134,10 +2258,14 @@ fn rearm_socket_with_reason_and_snapshot(
         ctx.downlink_pending.len(),
         ctx.downlink_diag.downlink_pending_high_water,
         ctx.downlink_diag.remote_to_global_rx_bytes,
+        ctx.downlink_diag.flush_attempts,
+        ctx.downlink_diag.send_slice_no_capacity,
         ctx.downlink_diag.send_slice_calls,
         ctx.downlink_diag.send_slice_accepted_bytes,
         ctx.downlink_diag.send_slice_zero,
         ctx.downlink_diag.send_slice_errors,
+        ctx.downlink_diag.send_slice_budget_limited,
+        ctx.downlink_diag.send_slice_max_accepted_bytes,
         ctx.downlink_diag.tun_flush_tx_calls,
         ctx.downlink_diag.tun_flush_tx_failures
     );
@@ -4575,6 +4703,64 @@ mod tests {
         assert_eq!(diag.send_slice_errors, 1);
         assert_eq!(diag.tun_flush_tx_calls, 2);
         assert_eq!(diag.tun_flush_tx_failures, 1);
+    }
+
+    #[test]
+    fn tcp_downlink_flush_progress_diag_tracks_budget_and_capacity() {
+        let mut diag = TcpDownlinkDiag::default();
+        diag.note_flush_attempt(600_000, 262_144);
+        diag.note_send_slice_ok(262_144, 337_856);
+        diag.note_flush_attempt(337_856, 262_144);
+        diag.note_no_send_capacity(337_856);
+        diag.note_flush_attempt(337_856, 262_144);
+        diag.note_send_slice_ok(0, 337_856);
+        diag.note_flush_attempt(337_856, 262_144);
+        diag.note_send_slice_error();
+
+        assert_eq!(diag.flush_attempts, 4);
+        assert_eq!(diag.send_slice_no_capacity, 1);
+        assert_eq!(diag.send_slice_budget_limited, 4);
+        assert_eq!(diag.send_slice_calls, 3);
+        assert_eq!(diag.send_slice_zero, 1);
+        assert_eq!(diag.send_slice_errors, 1);
+        assert_eq!(diag.send_slice_accepted_bytes, 262_144);
+        assert_eq!(diag.send_slice_max_accepted_bytes, 262_144);
+        assert_eq!(diag.downlink_pending_high_water, 600_000);
+    }
+
+    #[test]
+    fn tcp_downlink_flush_aggregate_formats_progress_signal() {
+        let mut a = SocketCtx::new(443);
+        a.downlink_pending = vec![0; 10];
+        a.downlink_diag.note_remote_payload(100, 100);
+        a.downlink_diag.note_flush_attempt(100, 64);
+        a.downlink_diag.note_send_slice_ok(64, 36);
+        a.downlink_diag.note_tun_flush(true);
+
+        let mut b = SocketCtx::new(443);
+        b.downlink_pending = vec![0; 25];
+        b.downlink_diag.note_remote_payload(200, 200);
+        b.downlink_diag.note_flush_attempt(200, 64);
+        b.downlink_diag.note_no_send_capacity(200);
+        b.downlink_diag.note_tun_flush(false);
+
+        let aggregate = tcp_downlink_aggregate([&a, &b]);
+        let line = format_tcp_downlink_flush_diag(&aggregate, 2);
+
+        assert!(line.contains("tcp-downlink-flush"));
+        assert!(line.contains("pending_total=35"));
+        assert!(line.contains("pending_max=25"));
+        assert!(line.contains("pending_high=200"));
+        assert!(line.contains("remote_to_global_rx_bytes=300"));
+        assert!(line.contains("flush_attempts=2"));
+        assert!(line.contains("no_send_capacity=1"));
+        assert!(line.contains("send_slice_calls=1"));
+        assert!(line.contains("send_slice_accepted=64"));
+        assert!(line.contains("budget_limited_calls=2"));
+        assert!(line.contains("send_slice_max_accepted=64"));
+        assert!(line.contains("tun_flush_tx_calls=2"));
+        assert!(line.contains("tun_flush_tx_failures=1"));
+        assert!(line.contains("dirty_handles=2"));
     }
 
     #[test]

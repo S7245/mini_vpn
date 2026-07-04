@@ -348,6 +348,87 @@ summarize_metrics_window() {
       }
     }
 
+    /tcp-downlink-flush/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^pending_total=/) {
+          value = numeric_token($i, "pending_total")
+          if (value > max_flush_pending_total) {
+            max_flush_pending_total = value
+          }
+        } else if ($i ~ /^pending_max=/) {
+          value = numeric_token($i, "pending_max")
+          if (value > max_flush_pending_max) {
+            max_flush_pending_max = value
+          }
+        } else if ($i ~ /^pending_high=/) {
+          value = numeric_token($i, "pending_high")
+          if (value > max_flush_pending_high) {
+            max_flush_pending_high = value
+          }
+        } else if ($i ~ /^remote_to_global_rx_bytes=/) {
+          value = numeric_token($i, "remote_to_global_rx_bytes")
+          if (value > max_flush_remote_bytes) {
+            max_flush_remote_bytes = value
+          }
+        } else if ($i ~ /^flush_attempts=/) {
+          value = numeric_token($i, "flush_attempts")
+          if (value > max_flush_attempts) {
+            max_flush_attempts = value
+          }
+        } else if ($i ~ /^no_send_capacity=/) {
+          value = numeric_token($i, "no_send_capacity")
+          if (value > max_no_send_capacity) {
+            max_no_send_capacity = value
+          }
+        } else if ($i ~ /^send_slice_calls=/) {
+          value = numeric_token($i, "send_slice_calls")
+          if (value > max_flush_send_calls) {
+            max_flush_send_calls = value
+          }
+        } else if ($i ~ /^send_slice_accepted=/) {
+          value = numeric_token($i, "send_slice_accepted")
+          if (value > max_flush_accepted) {
+            max_flush_accepted = value
+          }
+        } else if ($i ~ /^send_slice_zero=/) {
+          value = numeric_token($i, "send_slice_zero")
+          if (value > max_flush_zero) {
+            max_flush_zero = value
+          }
+        } else if ($i ~ /^send_slice_errors=/) {
+          value = numeric_token($i, "send_slice_errors")
+          if (value > max_flush_errors) {
+            max_flush_errors = value
+          }
+        } else if ($i ~ /^budget_limited_calls=/) {
+          value = numeric_token($i, "budget_limited_calls")
+          if (value > max_budget_limited) {
+            max_budget_limited = value
+          }
+        } else if ($i ~ /^send_slice_max_accepted=/) {
+          value = numeric_token($i, "send_slice_max_accepted")
+          if (value > max_send_slice_max_accepted) {
+            max_send_slice_max_accepted = value
+          }
+        } else if ($i ~ /^tun_flush_tx_calls=/) {
+          value = numeric_token($i, "tun_flush_tx_calls")
+          if (value > max_tun_flush_calls) {
+            max_tun_flush_calls = value
+          }
+        } else if ($i ~ /^tun_flush_tx_failures=/) {
+          value = numeric_token($i, "tun_flush_tx_failures")
+          if (value > max_tun_flush_failures) {
+            max_tun_flush_failures = value
+          }
+        } else if ($i ~ /^dirty_handles=/) {
+          value = numeric_token($i, "dirty_handles")
+          if (value > max_dirty_handles) {
+            max_dirty_handles = value
+          }
+        }
+      }
+    }
+
     /tcp-relay-write-half-closed/ && /reason=local_finish/ {
       handle = ""
       for (i = 1; i <= NF; i++) {
@@ -606,6 +687,7 @@ summarize_metrics_window() {
       printf "- local_write_pressure: events=%d max_wait_ms=%.3f max_payload_bytes=%d\n", local_write_count, max_local_wait_us / 1000, max_local_payload
       printf "- global_rx_pressure: events=%d max_wait_ms=%.3f\n", global_rx_count, max_global_wait_us / 1000
       printf "- downlink_backpressure: pause_edges=%d resume_edges=%d max_pending_bytes=%d max_total_pending_bytes=%d\n", down_pause_count, down_resume_count, max_down_pending, max_down_total
+      printf "- downlink_flush: attempts=%d no_send_capacity=%d send_slice_calls=%d accepted_bytes=%d zero=%d errors=%d budget_limited=%d max_accepted_bytes=%d tun_flush_calls=%d tun_flush_failures=%d pending_total_max=%d pending_max=%d pending_high=%d remote_to_global_rx_bytes=%d dirty_handles_max=%d\n", max_flush_attempts, max_no_send_capacity, max_flush_send_calls, max_flush_accepted, max_flush_zero, max_flush_errors, max_budget_limited, max_send_slice_max_accepted, max_tun_flush_calls, max_tun_flush_failures, max_flush_pending_total, max_flush_pending_max, max_flush_pending_high, max_flush_remote_bytes, max_dirty_handles
       printf "- relay_late_remote: post_finish_bytes=%d post_finish_reads=%d local_finish_events=%d\n", max_late_remote_bytes, max_late_remote_reads, local_finish_count
       printf "- tun_drops: if=%s tun_rx_dropped_delta=%s tun_tx_dropped_delta=%s\n", tun_if, tun_rx_delta, tun_tx_delta
       printf "- quic: samples=%d worst_conn=%s max_lost_bytes_delta=%d max_congestion_events_delta=%d max_start_lost_bytes=%d max_start_congestion_events=%d min_start_cwnd=%s min_cwnd=%s inherited_conns=%s inherited_low_cwnd_threshold=%d max_tx_blocked_data_delta=%d max_tx_blocked_stream_delta=%d max_rx_blocked_data_delta=%d max_rx_blocked_stream_delta=%d\n", quic_samples, worst_conn, max_lost_bytes_delta, max_congestion_delta, max_start_lost_bytes, max_start_congestion_events, min_start_cwnd_all, min_cwnd_all, inherited_quic_conns, inherited_low_cwnd_limit, max_tx_data_delta, max_tx_stream_delta, max_rx_data_delta, max_rx_stream_delta
@@ -635,6 +717,7 @@ EOF_IPERF
 🔎 tcp-local-write-pressure handle=SocketHandle(1) wait_us=3607684 payload_bytes=64960 pressure_events=1
 🔎 tcp-downlink-backpressure paused=true max_pending=2151649 total_pending=2151649 high=2097120 low=524280
 🔎 tcp-downlink-backpressure paused=false max_pending=524233 total_pending=524233 high=2097120 low=524280
+🔎 tcp-downlink-flush pending_total=524233 pending_max=524233 pending_high=2151649 remote_to_global_rx_bytes=3145728 flush_attempts=23 no_send_capacity=7 send_slice_calls=16 send_slice_accepted=2621440 send_slice_zero=2 send_slice_errors=0 budget_limited_calls=9 send_slice_max_accepted=262144 tun_flush_tx_calls=14 tun_flush_tx_failures=1 dirty_handles=1
 📊 TUIC QUIC stats conn=3 id=99 rtt=0ms cwnd=13068 lost=303/1374 lost_bytes=439956 congestion_events=38 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=1,max_stream_data=2) udp_tx=1372/1977208B udp_rx=332/20762B dg_max=Some(1418) dg_space=1048576B
 🔁 tuic-tcp-pool-reconnect conn=1 reason=stale_tcp_pool_slot
 EOF_LOG
@@ -664,6 +747,7 @@ EOF_LOG
   assert_contains "$summary" "tcp_pool: opens=1 conns=3 reconnects=1 reasons=stale_tcp_pool_slot"
   assert_contains "$summary" "local_write_pressure: events=1 max_wait_ms=3607.684"
   assert_contains "$summary" "downlink_backpressure: pause_edges=1 resume_edges=1 max_pending_bytes=2151649"
+  assert_contains "$summary" "downlink_flush: attempts=23 no_send_capacity=7 send_slice_calls=16 accepted_bytes=2621440 zero=2 errors=0 budget_limited=9 max_accepted_bytes=262144 tun_flush_calls=14 tun_flush_failures=1"
   assert_contains "$summary" "max_lost_bytes_delta=439956"
   assert_contains "$summary" "attribution: quic_loss_congestion+local_write_pressure+local_downlink_backpressure"
 
@@ -813,7 +897,7 @@ IPERF_BUSY_RETRIES="${IPERF_BUSY_RETRIES:-3}"
 IPERF_BUSY_WAIT_SECS="${IPERF_BUSY_WAIT_SECS:-5}"
 PROBE_ORDER="${PROBE_ORDER:-forward-first}"
 OUT="${OUT:-/tmp/mvpn_knife14b_lowrtt_$(date +%Y%m%d_%H%M%S).md}"
-METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tuic-open-tcp|tuic-tcp-pool-reconnect|tcp-relay-live|tcp-relay-write-half-closed|tcp-relay-close|tcp-handle-close|tcp-local-write-pressure|tcp-global-rx-pressure|tcp-downlink-backpressure'
+METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tuic-open-tcp|tuic-tcp-pool-reconnect|tcp-relay-live|tcp-relay-write-half-closed|tcp-relay-close|tcp-handle-close|tcp-local-write-pressure|tcp-global-rx-pressure|tcp-downlink-backpressure|tcp-downlink-flush'
 
 case "$PROBE_ORDER" in
   forward-first|reverse-first|forward-only|reverse-only) ;;
