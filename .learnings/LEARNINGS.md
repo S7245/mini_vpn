@@ -1,5 +1,32 @@
 # Learnings
 
+## 2026-07-04 - Knife14ay makes local TCP Closed transitions observable
+
+- Code commit: this Knife14ay stage commit.
+- Stage docs:
+  `docs/tech/2026-07-04-knife14ay-local-tcp-closed-transition-spec.md`,
+  `docs/tech/2026-07-04-knife14ay-local-tcp-closed-transition-plan.md`
+- Outcome: added behavior-neutral per-handle TCP lifecycle observations. The
+  first observation seeds state, later changes in TCP state or send/receive
+  capability emit `tcp-lifecycle-transition` with previous source/state,
+  current state, send/recv capability, pending bytes, remote-to-local bytes,
+  local FIN fields, and `terminal_candidate`. The observation is reset on
+  rearm, and close/reap/backpressure/TUIC/TUN behavior is unchanged.
+- Parser update: low-RTT summaries now report `tcp_lifecycle` transitions,
+  closed edges, terminal candidates, max pending, max remote-to-local bytes,
+  sources, and states. A terminal transition adds the
+  `local_tcp_terminal_transition` attribution label.
+- Verification passed: focused Rust lifecycle diagnostic test,
+  `cargo test --lib client_tun`, low-RTT probe self-test, US-client suite
+  self-test, shell syntax check, `cargo test`, `cargo test --features
+  harness`, `cargo clippy --all-targets --features harness -- -D warnings`,
+  and `git diff --check`. The full cargo tests that bind local QUIC endpoints
+  were rerun outside the restricted sandbox and passed.
+- Reusable rule: when terminal pending appears with tiny reverse downlink
+  volume, do not infer the root from the final close line alone. Capture the
+  source immediately before `Closed` so the next behavior patch can distinguish
+  local peer close, relay close, dirty-pass transition, and reaper discovery.
+
 ## 2026-07-04 - Knife14ax rejects tx-queue backpressure as the clean reverse root
 
 - Code commit: `58f847d`

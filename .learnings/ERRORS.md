@@ -1,5 +1,19 @@
 # Errors
 
+## 2026-07-04 - Broad cargo fmt check exposed pre-existing repo formatting drift
+
+- Stage: Knife14ay local regression.
+- Symptom: `cargo fmt --all -- --check` produced large diffs in many files
+  outside the Knife14ay change set, including unrelated modules such as
+  `src/main.rs` and `src/reality_upstream.rs`.
+- Root cause: repository-wide rustfmt drift predates this diagnostic patch.
+  Applying broad formatting here would mix unrelated churn into a lifecycle
+  observability commit.
+- Correct behavior: do not treat this broad diff as a Knife14ay code
+  regression. Keep the current stage scoped, use `git diff --check` for
+  whitespace safety, and reserve full-repo rustfmt cleanup for a separate
+  coherent task.
+
 ## 2026-07-04 - Knife14ax VPS acceptance failed after tx-queue backpressure patch
 
 - Stage: Knife14ax tx-queue-aware downlink backpressure acceptance for commit

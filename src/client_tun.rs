@@ -397,6 +397,92 @@ fn close_pending_accounting(
     }
 }
 
+fn tcp_lifecycle_changed(prev: SocketCloseSnapshot, current: SocketCloseSnapshot) -> bool {
+    prev.tcp_state != current.tcp_state
+        || prev.active != current.active
+        || prev.can_send != current.can_send
+        || prev.can_recv != current.can_recv
+        || prev.may_send != current.may_send
+        || prev.may_recv != current.may_recv
+}
+
+fn option_secs(value: Option<u64>) -> String {
+    value
+        .map(|secs| secs.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn observe_tcp_lifecycle(
+    handle: SocketHandle,
+    ctx: &mut SocketCtx,
+    snapshot: SocketCloseSnapshot,
+    now_secs: u64,
+    source: &'static str,
+) -> Option<String> {
+    let previous = ctx.last_tcp_lifecycle;
+    ctx.last_tcp_lifecycle = Some(TcpLifecycleObservation {
+        snapshot,
+        source,
+        observed_secs: now_secs,
+    });
+
+    let previous = previous?;
+    if !tcp_lifecycle_changed(previous.snapshot, snapshot) {
+        return None;
+    }
+
+    let terminal_candidate = !ctx.downlink_pending.is_empty()
+        && snapshot.tcp_state == TcpState::Closed
+        && !snapshot.active
+        && !snapshot.can_send;
+
+    Some(format!(
+        "🔎 tcp-lifecycle-transition handle={handle:?} source={source} prev_source={} prev_observed_secs={} observed_secs={} prev_state={:?} state={:?} prev_active={} active={} prev_can_send={} can_send={} prev_can_recv={} can_recv={} prev_may_send={} may_send={} prev_may_recv={} may_recv={} prev_send_queue={} send_queue={} prev_recv_queue={} recv_queue={} ctx_state={:?} uplink_tx={} local_fin_sent={} local_fin_pending_since={} local_fin_last_remote_progress={} pending={} pending_high={} remote_to_global_rx_bytes={} send_slice_accepted={} flush_attempts={} terminal_candidate={}",
+        previous.source,
+        previous.observed_secs,
+        now_secs,
+        previous.snapshot.tcp_state,
+        snapshot.tcp_state,
+        previous.snapshot.active,
+        snapshot.active,
+        previous.snapshot.can_send,
+        snapshot.can_send,
+        previous.snapshot.can_recv,
+        snapshot.can_recv,
+        previous.snapshot.may_send,
+        snapshot.may_send,
+        previous.snapshot.may_recv,
+        snapshot.may_recv,
+        previous.snapshot.send_queue,
+        snapshot.send_queue,
+        previous.snapshot.recv_queue,
+        snapshot.recv_queue,
+        ctx.state,
+        ctx.uplink_tx.is_some(),
+        ctx.local_fin_sent,
+        option_secs(ctx.local_fin_pending_since_secs),
+        option_secs(ctx.local_fin_last_remote_progress_secs),
+        ctx.downlink_pending.len(),
+        ctx.downlink_diag.downlink_pending_high_water,
+        ctx.downlink_diag.remote_to_global_rx_bytes,
+        ctx.downlink_diag.send_slice_accepted_bytes,
+        ctx.downlink_diag.flush_attempts,
+        terminal_candidate
+    ))
+}
+
+fn log_tcp_lifecycle_observation(
+    handle: SocketHandle,
+    ctx: &mut SocketCtx,
+    snapshot: SocketCloseSnapshot,
+    now_secs: u64,
+    source: &'static str,
+) {
+    if let Some(line) = observe_tcp_lifecycle(handle, ctx, snapshot, now_secs, source) {
+        tcp_diag_log!("{line}");
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 struct RelayTaskDiag {
     /// Bytes written from local smoltcp side into the remote stream.
@@ -638,6 +724,13 @@ impl SocketCloseSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TcpLifecycleObservation {
+    snapshot: SocketCloseSnapshot,
+    source: &'static str,
+    observed_secs: u64,
+}
+
 /// Event sent from one background TCP relay task back into the single owner main loop.
 /// Data events preserve the existing downlink path; Closed makes every relay terminal reason visible to
 /// the socket state machine instead of relying on smoltcp to notice the local side later.
@@ -692,6 +785,8 @@ struct SocketCtx {
     uplink_buffer: Vec<u8>,
     /// 刀14c：TCP 下行诊断计数。主循环独占，按事件日志输出，不进全局 MetricsSnapshot 防高基数。
     downlink_diag: TcpDownlinkDiag,
+    /// Last observed TCP socket lifecycle snapshot for transition diagnostics.
+    last_tcp_lifecycle: Option<TcpLifecycleObservation>,
 }
 
 impl SocketCtx {
@@ -717,6 +812,7 @@ impl SocketCtx {
             conn_epoch: 0,
             uplink_buffer: Vec::new(),
             downlink_diag: TcpDownlinkDiag::default(),
+            last_tcp_lifecycle: None,
         }
     }
 
@@ -2349,22 +2445,32 @@ async fn process_dirty_relay<U, M>(
             trace_log!("处理本地房间 {:?} 失败: {e}", handle);
         }
         let still_active = {
-            let (has_recv, tcp_state, tx_queue) = {
+            let (has_recv, snapshot) = {
                 let socket = sockets.get_mut::<TcpSocket>(handle);
-                (socket.can_recv(), socket.state(), socket.send_queue())
+                (socket.can_recv(), SocketCloseSnapshot::from_socket(socket))
             };
             let (has_pending, needs_local_finish) = socket_ctxs
-                .get(&handle)
+                .get_mut(&handle)
                 .map(|c| {
+                    log_tcp_lifecycle_observation(
+                        handle,
+                        c,
+                        snapshot,
+                        now_secs,
+                        "dirty_relay",
+                    );
                     (
                         !c.downlink_pending.is_empty(),
-                        tcp_state == TcpState::CloseWait
+                        snapshot.tcp_state == TcpState::CloseWait
                             && c.uplink_tx.is_some()
                             && !c.local_fin_sent,
                     )
                 })
                 .unwrap_or((false, false));
-            has_recv || has_pending || needs_local_finish || tx_queue > downlink_backpressure.low_bytes
+            has_recv
+                || has_pending
+                || needs_local_finish
+                || snapshot.send_queue > downlink_backpressure.low_bytes
         };
         if !still_active {
             dirty.remove(&handle);
@@ -2404,15 +2510,21 @@ fn reap_dead_slots(
         let dead = {
             let s = sockets.get::<TcpSocket>(h);
             let snapshot = SocketCloseSnapshot::from_socket(s);
-            socket_ctxs.get(&h).and_then(|ctx| {
-                should_reap_slot(
+            socket_ctxs.get_mut(&h).and_then(|ctx| {
+                let should_reap = should_reap_slot(
                     ctx,
                     snapshot.tcp_state,
                     snapshot.active,
                     snapshot.can_send,
                     now_secs,
-                )
-                .then_some(snapshot)
+                );
+                let source = if should_reap {
+                    "dead_slot_reap"
+                } else {
+                    "dead_slot_scan"
+                };
+                log_tcp_lifecycle_observation(h, ctx, snapshot, now_secs, source);
+                should_reap.then_some(snapshot)
             })
         };
         if let Some(snapshot) = dead {
@@ -2734,6 +2846,7 @@ fn rearm_socket_with_reason_and_snapshot(
     close_snapshot: Option<SocketCloseSnapshot>,
 ) {
     if let Some(snapshot) = close_snapshot {
+        log_tcp_lifecycle_observation(handle, ctx, snapshot, now_secs, close_reason);
         let close_pending = close_pending_accounting(ctx, snapshot);
         tcp_diag_log!(
             "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes={} tcp_state={:?} active={} can_send={} can_recv={} may_send={} may_recv={} send_capacity={} send_queue={} recv_queue={}",
@@ -2844,6 +2957,7 @@ fn rearm_socket(
     ctx.downlink_pending_last_progress_secs = None;
     ctx.downlink_pending_last_pending_bytes = 0;
     ctx.downlink_diag = TcpDownlinkDiag::default();
+    ctx.last_tcp_lifecycle = None;
     // 清 async-open 在飞缓存 + bump epoch——让任何迟到 `HandshakeDone` 失配被丢
     // （绝不装到本次 rearm 后的新一代 socket 上，防串话核心）。对非 spawn 槽是无害的纯计数自增。
     ctx.uplink_buffer.clear();
@@ -3243,6 +3357,8 @@ async fn handle_remote_payload<D: TunIo>(
     let accepted_bytes = flush_downlink(handle, tcp_socket, ctx, downlink_flush_max_bytes);
     note_downlink_pending_progress(ctx, now_secs, accepted_bytes);
     ctx.state = SocketState::Relaying;
+    let snapshot = SocketCloseSnapshot::from_socket(tcp_socket);
+    log_tcp_lifecycle_observation(handle, ctx, snapshot, now_secs, "remote_payload");
 
     if !downlink_egress_pacer
         .allow_remote_payload_flush(accepted_bytes, ctx.downlink_pending.len())
@@ -3299,6 +3415,11 @@ fn handle_relay_closed(
         );
         return false;
     }
+    let snapshot = {
+        let tcp_socket = sockets.get::<TcpSocket>(handle);
+        SocketCloseSnapshot::from_socket(tcp_socket)
+    };
+    log_tcp_lifecycle_observation(handle, ctx, snapshot, now_secs, "relay_close");
     if !ctx.downlink_pending.is_empty() {
         trace_log!(
             "⏳ handle {:?} relay close({}/{}) waits for {} pending downlink bytes",
@@ -4812,6 +4933,62 @@ mod tests {
     }
 
     #[test]
+    fn tcp_lifecycle_transition_diag_reports_previous_state_and_context() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(build_listener_socket(&ListenerSpec { local_port: 443 }));
+        let (tx, _rx) = mpsc::channel(1);
+        let mut ctx = SocketCtx::new(443);
+        ctx.state = SocketState::Relaying;
+        ctx.uplink_tx = Some(tx);
+        ctx.downlink_pending = vec![0; 41_208];
+        ctx.downlink_diag.note_remote_payload(221_884, 41_208);
+        ctx.downlink_diag.note_send_slice_ok(180_676, 41_208);
+
+        let established = SocketCloseSnapshot {
+            tcp_state: TcpState::Established,
+            active: true,
+            can_send: true,
+            can_recv: true,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 1_048_576,
+            send_queue: 65_536,
+            recv_queue: 0,
+        };
+        assert!(
+            observe_tcp_lifecycle(handle, &mut ctx, established, 10, "remote_payload").is_none(),
+            "first observation seeds previous state without logging a transition"
+        );
+
+        let closed = SocketCloseSnapshot {
+            tcp_state: TcpState::Closed,
+            active: false,
+            can_send: false,
+            can_recv: false,
+            may_send: false,
+            may_recv: false,
+            send_capacity: 1_048_576,
+            send_queue: 0,
+            recv_queue: 0,
+        };
+        let line = observe_tcp_lifecycle(handle, &mut ctx, closed, 15, "dead_slot_reap")
+            .expect("state transition should produce a diagnostic line");
+
+        assert!(line.contains("tcp-lifecycle-transition"), "{line}");
+        assert!(line.contains("source=dead_slot_reap"), "{line}");
+        assert!(line.contains("prev_source=remote_payload"), "{line}");
+        assert!(line.contains("prev_state=Established state=Closed"), "{line}");
+        assert!(line.contains("prev_active=true active=false"), "{line}");
+        assert!(line.contains("ctx_state=Relaying"), "{line}");
+        assert!(line.contains("uplink_tx=true"), "{line}");
+        assert!(line.contains("local_fin_sent=false"), "{line}");
+        assert!(line.contains("pending=41208"), "{line}");
+        assert!(line.contains("remote_to_global_rx_bytes=221884"), "{line}");
+        assert!(line.contains("send_slice_accepted=180676"), "{line}");
+        assert!(line.contains("terminal_candidate=true"), "{line}");
+    }
+
+    #[test]
     fn remote_payload_allowed_after_local_finish_without_uplink_sender() {
         let mut ctx = SocketCtx::new(443);
         ctx.state = SocketState::Relaying;
@@ -4911,6 +5088,7 @@ mod tests {
             conn_epoch: 7,
             uplink_buffer: vec![1, 2, 3],
             downlink_diag,
+            last_tcp_lifecycle: None,
         };
 
         rearm_socket(&mut socket, &mut ctx, &mut pool, 1);
