@@ -1,5 +1,34 @@
 # Learnings
 
+## 2026-07-04 — Knife14am labels inherited QUIC congestion before pacing work
+
+Commit `fec33fe` fixed the low-RTT attribution gap from Knife14al without
+touching Rust data-plane behavior. The new parser rule emits
+`inherited_quic_congestion` when a probe window starts with a low first cwnd and
+large historical QUIC loss/congestion counters, even if the per-window deltas
+stay zero.
+
+The embedded self-test now reproduces the post-forward reverse shape from
+`/tmp/mini_vpn/mvpn_knife14al_samewindow_defaultqlen2_usclient_suite_20260704_133130.tar.gz`:
+11.5/10.7 Mbit/s reverse iperf, `cwnd=5808`,
+`lost_bytes=500976100`, `congestion_events=93571`, and zero new
+loss/congestion delta. Before the fix this sample reported
+`no_pressure_signal`; after the fix it reports `inherited_quic_congestion` and
+prints `max_start_lost_bytes`, `max_start_congestion_events`,
+`min_start_cwnd`, and `inherited_conns` in the `quic:` line.
+
+Verification:
+- `bash -n scripts/knife14b-lowrtt-probe.sh`
+- `bash scripts/knife14b-lowrtt-probe.sh --self-test`
+- `bash -n scripts/knife14b-usclient-tunnel-suite.sh`
+- `bash scripts/knife14b-usclient-tunnel-suite.sh --self-test`
+- `git diff --check`
+
+Reusable rule: before changing pacing or watermarks from a sequential
+forward-then-reverse run, first check whether the reverse window inherited a
+damaged QUIC state. A clean reverse-first/fresh-connection sample is still the
+stronger signal for local downlink/TUN pressure.
+
 ## 2026-07-04 — Knife14al same-window run pins the current limiter to local downlink/TUN pressure
 
 Commit `1ab58e3` fixed the suite cleanup self-match bug, then `.27` reran the
