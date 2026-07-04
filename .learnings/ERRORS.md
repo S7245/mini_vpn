@@ -1010,3 +1010,20 @@
   `cargo fmt`. If formatting is necessary, format only the touched hunks or
   accept existing local style, then use `git diff --stat` and `git diff --check`
   to catch whitespace issues.
+
+## 2026-07-04 — Knife14ba stream-gap attribution counted idle control streams
+
+- Bundle: `/tmp/mini_vpn/mvpn_knife14ba_stream_timing_usclient_suite_20260704_231537.tar.gz`
+- Symptom: clean reverse-first attribution included `tuic_stream_read_gap` and
+  `relay_remote_read_gap`, but the >30s gap came from a tiny iperf control
+  stream (`rx_bytes=343`). The data stream had `rx_bytes=110790062` and
+  `max_read_gap_ms=3763`.
+- Root cause: the parser grouped all TUIC TCP streams and relay remote-read
+  streams together, so an idle control stream could label the probe as a data
+  read-gap failure.
+- Correct behavior: split or filter small control streams before assigning
+  read-gap attribution. Data-stream read-gap labels should require enough
+  received bytes to represent the throughput stream.
+- Future debugging rule: if stream timing diagnostics show a large gap, always
+  pair the gap with stream byte volume before treating it as the performance
+  root.

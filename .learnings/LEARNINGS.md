@@ -1738,3 +1738,23 @@ worth cleaning up separately.
   counters stay quiet, parse `tuic_tcp_stream` and `relay_remote_timing` before
   changing behavior. A large first-byte or read-gap label should drive the next
   patch; contradictory timing evidence should trigger architecture review.
+
+## 2026-07-04 — Knife14ba rules out TUIC first-byte for clean reverse-first
+
+- Stage: Knife14ba VPS acceptance for stream timing diagnostics.
+- Bundle: `/tmp/mini_vpn/mvpn_knife14ba_stream_timing_usclient_suite_20260704_231537.tar.gz`
+- Code commit: `7e25e92`.
+- Outcome: clean reverse-first P1 improved only to `31.0/28.7 Mbit/s`, but
+  TUIC first receive was fast (`3ms`) and the data stream delivered about
+  `110MB` into mini_vpn with `max_read_gap_ms=3763`. Clean-window QUIC
+  loss/congestion, TUN drops, global_rx pressure, and local write pressure were
+  all quiet.
+- Key lesson: the remaining clean reverse-first root is local TCP downlink
+  delivery under tx-queue / receive-window pressure, not delayed TUIC stream
+  first byte. The run ended with `max_tx_queue_bytes=574824`,
+  `pending_at_close=542302`, and `terminal_pending_reap=542302` on a closed
+  non-send-capable local TCP socket.
+- Reusable rule: after first-byte/read-gap diagnostics contradict a remote-read
+  stall hypothesis, keep those diagnostics but move the next TDD slice to local
+  send-queue pressure and terminal pending accounting. Do not revisit stale
+  pool, iperf3, sing-box, or blunt pacing without new contradictory evidence.
