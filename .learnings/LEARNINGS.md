@@ -1,5 +1,29 @@
 # Learnings
 
+## 2026-07-04 - Knife14az locks local TCP socket policy at listener and rearm
+
+- Code commit: this Knife14az local policy stage commit.
+- Stage docs:
+  `docs/tech/2026-07-04-knife14az-local-tcp-socket-policy-spec.md`,
+  `docs/tech/2026-07-04-knife14az-local-tcp-socket-policy-plan.md`
+- Outcome: added a single local virtual-link TCP socket policy helper that
+  disables smoltcp Nagle and delayed ACK for listener sockets. The same helper
+  runs again before `listen` during rearm so a reused socket cannot drift back
+  to smoltcp defaults after a flow closes.
+- TDD signal: the listener test first failed on `nagle_enabled()`, and the
+  rearm test first failed after deliberately restoring Nagle and delayed ACK
+  before `rearm_socket`. Both turned green after applying the helper in the two
+  required paths.
+- Verification passed: focused listener/rearm tests,
+  `cargo test --lib client_tun`, low-RTT probe self-test, US-client suite
+  self-test, `git diff --check`, full `cargo test`, `cargo test --features
+  harness`, and `cargo clippy --all-targets --features harness -- -D warnings`.
+  QUIC endpoint-bind tests were confirmed outside the restricted sandbox.
+- Reusable rule: local smoltcp socket options are part of lifecycle state.
+  Apply them both at first listener construction and immediately before rearm
+  `listen`; otherwise later connections can silently differ from the intended
+  virtual-link TCP policy.
+
 ## 2026-07-04 - Knife14ay closes the terminal-pending ambiguity
 
 - Code commit: `67a8c46`

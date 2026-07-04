@@ -2600,8 +2600,14 @@ fn build_listener_socket_with_buffers(
     let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; buffers.rx_bytes]);
     let tcp_tx_buffer = TcpSocketBuffer::new(vec![0; buffers.tx_bytes]);
     let mut tcp_socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
+    configure_local_tcp_socket(&mut tcp_socket);
     tcp_socket.listen(spec.local_port).unwrap();
     tcp_socket
+}
+
+fn configure_local_tcp_socket(socket: &mut TcpSocket<'_>) {
+    socket.set_nagle_enabled(false);
+    socket.set_ack_delay(None);
 }
 
 /// 解析入站 IPv4+TCP 包：返回 `(目的端口, 是否干净 SYN)`。一次解析同时供 SYN 建池与脏集合标脏。
@@ -2967,6 +2973,7 @@ fn rearm_socket(
         fake_pool.release(ip, now_secs);
     }
     ctx.state = SocketState::Rearming;
+    configure_local_tcp_socket(socket);
     socket.listen(ctx.local_port).unwrap();
     ctx.state = SocketState::Listening;
     trace_log!("♻️ handle slot rearmed on local port {}", ctx.local_port);
@@ -4154,6 +4161,20 @@ mod tests {
         sockets.add(build_listener_socket(&ListenerSpec { local_port: 12345 }))
     }
 
+    #[test]
+    fn listener_socket_uses_local_virtual_link_tcp_policy() {
+        let socket = build_listener_socket(&ListenerSpec { local_port: 12345 });
+
+        assert!(
+            !socket.nagle_enabled(),
+            "local virtual-link TCP sockets should not add Nagle latency"
+        );
+        assert!(
+            socket.ack_delay().is_none(),
+            "local virtual-link TCP sockets should not delay ACKs"
+        );
+    }
+
     /// idle：双向 90s 无活动 → relay task 退出 + stream.shutdown 被调（L2）。
     #[tokio::test(start_paused = true)]
     async fn relay_idle_timeout_shuts_down_stream() {
@@ -5064,6 +5085,8 @@ mod tests {
     fn rearm_socket_restores_listening_state_and_releases_fake_ip() {
         let spec = ListenerSpec { local_port: 80 };
         let mut socket = build_listener_socket(&spec);
+        socket.set_nagle_enabled(true);
+        socket.set_ack_delay(Some(smoltcp::time::Duration::from_millis(10)));
         let (tx, _rx) = mpsc::channel(1);
         let mut pool = FakeIpPool::new();
         let ip = pool.alloc("x.com", 0);
@@ -5111,6 +5134,14 @@ mod tests {
             "rearm 应清空当前 flow 的 downlink diagnostics"
         );
         assert_eq!(ctx.conn_epoch, 8, "rearm 应 bump conn_epoch（让在飞 open 失效，M3）");
+        assert!(
+            !socket.nagle_enabled(),
+            "rearm 应恢复本地 virtual-link TCP no-Nagle 策略"
+        );
+        assert!(
+            socket.ack_delay().is_none(),
+            "rearm 应恢复本地 virtual-link TCP no-delayed-ACK 策略"
+        );
         // refcount 已归零 → idle 超 TTL 可回收（证明 rearm 走了 release）。
         assert_eq!(pool.sweep(1000, 300), 1);
     }
