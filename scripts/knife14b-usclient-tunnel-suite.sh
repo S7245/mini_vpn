@@ -29,6 +29,7 @@ Optional env:
   CC_SWEEP=""                optional space-separated CC variants, e.g. "cubic bbr"; empty keeps single-run behavior
   SUITE_TAG=knife14c        report/bundle filename tag
   MTU=1200                  TUN MTU passed to mini_vpn before client-tun starts
+  TUN_TX_QUEUE_LEN=""       optional Linux TUN txqueuelen after startup; empty keeps OS default
   MINI_VPN_TCP_DIAG=1       emit knife14c per-handle TCP diagnostics
   RUN_BASE_MTU_P1=0         14c keeps one aligned MTU per process; use a separate MTU=1500 run for baseline
   BUILD_RELEASE=1           build target/release/mini_vpn before running; set 0 to reuse existing binary
@@ -86,6 +87,7 @@ CC_SWEEP="${CC_SWEEP:-}"
 CC_SWEEP_ACTIVE="${CC_SWEEP_ACTIVE:-0}"
 CC_VARIANT_LABEL="${CC_VARIANT_LABEL:-}"
 MTU="${MTU:-1200}"
+TUN_TX_QUEUE_LEN="${TUN_TX_QUEUE_LEN:-}"
 RUN_BASE_MTU_P1="${RUN_BASE_MTU_P1:-0}"
 BUILD_RELEASE="${BUILD_RELEASE:-1}"
 KILL_OLD="${KILL_OLD:-1}"
@@ -561,6 +563,26 @@ route_target_into_tun() {
   fi
 }
 
+configure_tun_tx_queue_len() {
+  if [[ -z "$TUN_TX_QUEUE_LEN" ]]; then
+    return 0
+  fi
+  if ! [[ "$TUN_TX_QUEUE_LEN" =~ ^[0-9]+$ ]] || (( 10#$TUN_TX_QUEUE_LEN <= 0 )); then
+    fail "TUN_TX_QUEUE_LEN 必须是正整数，当前值: $TUN_TX_QUEUE_LEN"
+  fi
+
+  append ""
+  append "## TUN TX Queue Setup"
+  append "- requested_tx_queue_len: $TUN_TX_QUEUE_LEN"
+  run_cmd sudo ip link set dev "$TUN_IF" txqueuelen "$TUN_TX_QUEUE_LEN" || \
+    fail "无法设置 $TUN_IF txqueuelen=$TUN_TX_QUEUE_LEN。请确认 iproute2/sudo 权限。"
+  run_cmd ip link show "$TUN_IF" || true
+}
+
+tun_tx_queue_len_actual() {
+  ip link show "$TUN_IF" 2>/dev/null | sed -n 's/.* qlen \([0-9][0-9]*\).*/\1/p' | head -1
+}
+
 probe_has_receiver_result() {
   local file="$1"
   grep -Eq 'receiver$' "$file"
@@ -783,6 +805,7 @@ append "- MINI_VPN_TUIC_CC=$MINI_VPN_TUIC_CC"
 append "- CC_SWEEP=${CC_SWEEP:-<single>}"
 append "- CC_VARIANT_LABEL=${CC_VARIANT_LABEL:-<none>}"
 append "- RUN_REVERSE_FIRST_P1=$RUN_REVERSE_FIRST_P1"
+append "- TUN_TX_QUEUE_LEN=${TUN_TX_QUEUE_LEN:-<default>}"
 append "- MINI_VPN_TUIC_UDP_MODE=$MINI_VPN_TUIC_UDP_MODE"
 append "- MINI_VPN_TUIC_ZERO_RTT=$MINI_VPN_TUIC_ZERO_RTT"
 append "- MINI_VPN_TUIC_TCP_POOL=$MINI_VPN_TUIC_TCP_POOL"
@@ -931,6 +954,7 @@ if [[ "$ready" != "1" ]]; then
 fi
 
 route_target_into_tun
+configure_tun_tx_queue_len
 
 append ""
 append "## Wait For First Metrics Tick"
@@ -938,11 +962,14 @@ sleep "$((METRICS_SECS + 2))"
 append_block text "$(tail -n 200 "$CLIENT_LOG" 2>/dev/null || true)"
 
 BASE_MTU="$(ip link show "$TUN_IF" 2>/dev/null | sed -n 's/.* mtu \([0-9][0-9]*\) .*/\1/p' | head -1)"
+ACTUAL_TUN_TX_QUEUE_LEN="$(tun_tx_queue_len_actual)"
 append ""
 append "## MTU / Probe Plan"
 append "- tun_if: $TUN_IF"
 append "- base_mtu: ${BASE_MTU:-unknown}"
 append "- test_mtu: $MTU"
+append "- tun_tx_queue_len_requested: ${TUN_TX_QUEUE_LEN:-<default>}"
+append "- tun_tx_queue_len_actual: ${ACTUAL_TUN_TX_QUEUE_LEN:-unknown}"
 append "- run_base_mtu_p1: $RUN_BASE_MTU_P1"
 if [[ "${BASE_MTU:-}" != "$MTU" ]]; then
   fail "TUN MTU mismatch: expected MINI_VPN_TUN_MTU=$MTU but $TUN_IF reports ${BASE_MTU:-unknown}. 请看 $CLIENT_LOG。"
