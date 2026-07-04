@@ -30,6 +30,25 @@ can_send=false pending>0`, treat it as terminal cleanup unless a test proves the
 socket can send again. For reverse throughput, inspect TUN/qdisc dropped deltas
 before changing the pending reap predicate.
 
+VPS follow-up on `.27` at `6b45d29` produced bundle
+`/tmp/mini_vpn/mvpn_knife14aj_tun_drop_env_usclient_suite_20260704_112101.tar.gz`.
+The report confirmed the new attribution survives the real suite:
+
+- reverse-first P1: sender 183 Mbit/s, receiver 182 Mbit/s,
+  `tun_tx_dropped_delta=3209`, attribution
+  `local_tun_egress_drop+local_downlink_backpressure`;
+- standard forward P1: sender 177 Mbit/s, receiver 164 Mbit/s,
+  `tun_tx_dropped_delta=17`, attribution
+  `quic_loss_congestion+local_write_pressure+local_tun_egress_drop`;
+- standard reverse P1: sender 124 Mbit/s, receiver 123 Mbit/s,
+  `tun_tx_dropped_delta=16661`, attribution
+  `local_tun_egress_drop+local_downlink_backpressure`.
+
+The scoped run improved sharply versus the prior post-restart 23.6 Mbit/s
+receiver result, but it also proved the local TUN/qdisc drop signal is real.
+The next throughput branch should treat TUN egress drops and burst pacing as
+first-class, not as a side note hidden behind pending-tail reap logs.
+
 ## 2026-07-04 — Knife14ai restart gate isolates next bottleneck to downlink pending
 
 After the pool=4 startup-only smoke reproduced `tuic auth finish: sending

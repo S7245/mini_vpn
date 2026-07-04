@@ -9,6 +9,20 @@
   SSH GitHub access is available, use a one-shot SSH URL or ask before changing
   `origin`.
 
+## 2026-07-04 — Source `.evn` with output redirected; it can dump secrets
+
+- First VPS suite invocation failed because TUIC env vars were not loaded:
+  `/tmp/mini_vpn/mvpn_knife14aj_tun_drop_usclient_suite_20260704_111955.tar.gz`.
+- The `.27` project root had `.evn`, not `.env`, and it was missing explicit
+  `MINI_VPN_TUIC_SNI`/`MINI_VPN_TUIC_ALPN`; repo convention fills those as
+  `example.com` and `h3`.
+- Pitfall: sourcing `.evn` printed exported environment lines to stdout in the
+  SSH command stream, including sensitive values. The generated suite bundle
+  still redacted secrets, but the command stream did not.
+- Future behavior: never source `.evn` directly in a command whose stdout is
+  captured. Use a quiet wrapper such as `set -a; source ./.evn >/dev/null
+  2>&1; set +a`, then explicitly export non-secret defaults.
+
 ## 2026-07-04 — Knife14aj initial plan mistook Closed pending for drainable pressure
 
 - Initial design branch: add a progress-sensitive grace for inactive pending
