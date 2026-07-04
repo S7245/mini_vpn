@@ -117,6 +117,15 @@ Operational rules:
   these VPS hosts when the task calls for it.
 - Do not store TUIC UUIDs, passwords, private keys, or other secrets in the
   repository, specs, learning memory, or final summaries.
+- When a `.27` VPS suite may need `sudo -v`, start it in a true writable TTY
+  session from the beginning and enter the sudo password only at the prompt.
+  Do not rerun the same suite through non-TTY SSH after sudo has already asked
+  for a password, and do not place sudo passwords in commands, scripts, docs,
+  logs, repository files, reports, or summaries.
+- For GitHub push from the Mac mini, do not keep retrying HTTPS origin when it
+  fails with an interactive credential prompt. If SSH auth works, use a
+  one-shot SSH push URL such as `git@github.com:S7245/mini_vpn.git`; ask before
+  changing the repository's configured `origin`.
 - sing-box logs on `.33` can grow quickly; inspect or truncate them deliberately
   when needed, and mention destructive log cleanup before doing it.
 

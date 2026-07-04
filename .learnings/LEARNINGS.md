@@ -1,5 +1,18 @@
 # Learnings
 
+## 2026-07-04 — Promote repeated environment traps into default operating rules
+
+User feedback after the Knife14ap run clarified that repeated sudo/TTY and
+GitHub credential failures should not be rediscovered every session. When an
+environment issue has a known working path, promote it into `AGENTS.md` and use
+that path directly on future runs.
+
+Reusable rule: for `.27` suites that may need `sudo -v`, start with a true
+writable TTY and enter the password only at the prompt. For Mac mini GitHub
+pushes where HTTPS origin cannot read credentials, use the working SSH push URL
+instead of retrying HTTPS. Do not write passwords or secrets into commands,
+scripts, docs, reports, learning memory, or final summaries.
+
 ## 2026-07-04 — Knife14ap acceptance pins the remaining clean reverse limiter after smoltcp acceptance
 
 Commit `27aa73f` ran from `.27` with the new downlink flush diagnostics active.
