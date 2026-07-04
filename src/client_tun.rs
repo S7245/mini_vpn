@@ -256,6 +256,19 @@ impl TcpDownlinkDiag {
     }
 }
 
+fn terminal_pending_reap_bytes(ctx: &SocketCtx, snapshot: SocketCloseSnapshot) -> usize {
+    let pending = ctx.downlink_pending.len();
+    if pending > 0
+        && snapshot.tcp_state == TcpState::Closed
+        && !snapshot.active
+        && !snapshot.can_send
+    {
+        pending
+    } else {
+        0
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 struct RelayTaskDiag {
     /// Bytes written from local smoltcp side into the remote stream.
@@ -2273,6 +2286,7 @@ fn rearm_socket_with_reason(
     close_direction: &'static str,
     close_reason: &'static str,
 ) {
+    let snapshot = SocketCloseSnapshot::from_socket(socket);
     rearm_socket_with_reason_and_snapshot(
         handle,
         socket,
@@ -2281,7 +2295,7 @@ fn rearm_socket_with_reason(
         now_secs,
         close_direction,
         close_reason,
-        None,
+        Some(snapshot),
     );
 }
 
@@ -2297,8 +2311,9 @@ fn rearm_socket_with_reason_and_snapshot(
     close_snapshot: Option<SocketCloseSnapshot>,
 ) {
     if let Some(snapshot) = close_snapshot {
+        let terminal_pending_reap_bytes = terminal_pending_reap_bytes(ctx, snapshot);
         tcp_diag_log!(
-            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} tcp_state={:?} active={} can_send={} can_recv={}",
+            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} terminal_pending_reap_bytes={} tcp_state={:?} active={} can_send={} can_recv={}",
             handle,
             close_direction,
             close_reason,
@@ -2317,6 +2332,7 @@ fn rearm_socket_with_reason_and_snapshot(
             ctx.downlink_diag.tun_flush_tx_calls,
             ctx.downlink_diag.tun_flush_tx_failures,
             ctx.downlink_diag.tun_flush_deferred,
+            terminal_pending_reap_bytes,
             snapshot.tcp_state,
             snapshot.active,
             snapshot.can_send,
@@ -2327,7 +2343,7 @@ fn rearm_socket_with_reason_and_snapshot(
     }
 
     tcp_diag_log!(
-        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={}",
+        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} terminal_pending_reap_bytes=0",
         handle,
         close_direction,
         close_reason,
@@ -4258,6 +4274,57 @@ mod tests {
         note_downlink_pending_progress(&mut ctx, 14, 0);
         assert!(ctx.downlink_pending_last_progress_secs.is_none());
         assert_eq!(ctx.downlink_pending_last_pending_bytes, 0);
+    }
+
+    #[test]
+    fn terminal_pending_reap_bytes_classifies_closed_no_send_tail() {
+        let mut ctx = SocketCtx::new(443);
+        ctx.state = SocketState::Relaying;
+        ctx.downlink_pending = vec![0; 224_765];
+
+        let terminal = SocketCloseSnapshot {
+            tcp_state: TcpState::Closed,
+            active: false,
+            can_send: false,
+            can_recv: false,
+        };
+        assert_eq!(terminal_pending_reap_bytes(&ctx, terminal), 224_765);
+
+        let active = SocketCloseSnapshot {
+            active: true,
+            can_send: true,
+            ..terminal
+        };
+        assert_eq!(
+            terminal_pending_reap_bytes(&ctx, active),
+            0,
+            "active send-capable pending is still deliverable evidence, not terminal reap"
+        );
+
+        let send_capable = SocketCloseSnapshot {
+            can_send: true,
+            ..terminal
+        };
+        assert_eq!(
+            terminal_pending_reap_bytes(&ctx, send_capable),
+            0,
+            "inactive pending with send capacity belongs to the bounded grace branch"
+        );
+
+        let close_wait = SocketCloseSnapshot {
+            tcp_state: TcpState::CloseWait,
+            active: false,
+            can_send: false,
+            can_recv: false,
+        };
+        assert_eq!(
+            terminal_pending_reap_bytes(&ctx, close_wait),
+            0,
+            "Knife14as terminal accounting is deliberately scoped to Closed && !can_send"
+        );
+
+        ctx.downlink_pending.clear();
+        assert_eq!(terminal_pending_reap_bytes(&ctx, terminal), 0);
     }
 
     #[test]
