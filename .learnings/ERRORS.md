@@ -1,5 +1,28 @@
 # Errors
 
+## 2026-07-04 — Knife14aq egress pacing default failed VPS acceptance
+
+- Stage: Knife14aq default downlink egress pacing acceptance for commit
+  `212ce26`.
+- Failed bundle:
+  `/tmp/mini_vpn/mvpn_knife14aq_egress_pacing_default_usclient_suite_20260704_160317.tar.gz`
+- Symptom: clean reverse-first P1 reached only `16.3/13.8 Mbit/s` with
+  `MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=65536`, worse than the previous
+  Knife14ap clean reverse-first receiver result of `22.0 Mbit/s`.
+- Important discriminator: direct `.27 -> .77` and `.33 -> .77` reverse
+  baselines were healthy (`295 Mbit/s` and `283 Mbit/s` receiver). The clean
+  reverse window had no QUIC loss/congestion delta, no `send_slice` zero/error,
+  and no TUN flush syscall failure. The pacer did engage
+  (`tun_flush_deferred=1057`) and reduced TUN drops (`366 -> 65`), but
+  backpressure remained and throughput fell.
+- Close-boundary signal: the same run reaped a relay with
+  `reason=dead_slot_reap`, `pending=576827`, `tcp_state=Closed`,
+  `can_send=false`, and `can_recv=false`.
+- Future behavior: do not continue tuning this default as if it were accepted.
+  Before further VPS runs, change the design so remote-payload egress pacing is
+  close-safe or default-off, and add tests for pending downlink bytes across
+  close/reap boundaries.
+
 ## 2026-07-04 — Codex interactive sudo over SSH needs a writable PTY session
 
 - Stage: Knife14ap VPS acceptance.

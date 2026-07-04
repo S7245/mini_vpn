@@ -1,5 +1,33 @@
 # Learnings
 
+## 2026-07-04 — Knife14aq rejects blunt remote-payload egress pacing as a default
+
+Commit `212ce26` passed local tests and was run from `.27` with
+`MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=65536`. Bundle:
+`/tmp/mini_vpn/mvpn_knife14aq_egress_pacing_default_usclient_suite_20260704_160317.tar.gz`.
+Direct baselines were healthy: `.27 -> .77` reverse receiver was
+`295 Mbit/s`, and `.33 -> .77` reverse receiver was `283 Mbit/s`.
+
+The clean reverse-first window proved the pacer was active and not a server
+problem: `tun_flush_deferred=1057`, no clean QUIC loss/congestion delta,
+`send_slice_zero=0`, `send_slice_errors=0`, and `tun_flush_failures=0`. It did
+reduce TUN egress drops versus Knife14ap (`366 -> 65`), but receiver throughput
+fell from `22.0 Mbit/s` to `13.8 Mbit/s`, and downlink backpressure still
+oscillated around the high watermark.
+
+The important new discriminator is the close boundary. After the clean reverse
+window, a relay was reaped with `reason=dead_slot_reap`, `pending=576827`,
+`tcp_state=Closed`, `can_send=false`, and `can_recv=false`. Later reverse
+windows also closed with roughly `534 KiB` pending. The likely root cause is
+that skipping immediate `iface.poll + flush_tx` after remote payload acceptance
+can delay local egress enough for useful pending bytes to meet local close/reap.
+
+Reusable rule: do not ship blunt remote-payload immediate-flush deferral as the
+default fix. The next design must be close-safe first: pending downlink bytes
+must either drain, remain owned by a live relay, or be explicitly accounted as a
+terminal loss before the relay is reaped. Pacing should move closer to the TUN
+write cadence or include forced drain/progress around close boundaries.
+
 ## 2026-07-04 — Knife14aq adds observable remote-payload egress pacing
 
 Knife14ap showed the clean reverse limiter had moved after smoltcp acceptance:
