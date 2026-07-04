@@ -1,5 +1,32 @@
 # Learnings
 
+## 2026-07-04 — Knife14ap acceptance pins the remaining clean reverse limiter after smoltcp acceptance
+
+Commit `27aa73f` ran from `.27` with the new downlink flush diagnostics active.
+Bundle:
+`/tmp/mini_vpn/mvpn_knife14ap_flushdiag_default_bp512_128_tty2_usclient_suite_20260704_154215.tar.gz`.
+The run used `bbr`, TUIC TCP pool `1`, TUN MTU `1200`, default TUN qlen `500`,
+512/128 KiB downlink watermarks, and a 256 KiB flush budget. Direct baselines
+were healthy: `.27 -> .77` reverse receiver was 262 Mbit/s and `.33 -> .77`
+reverse receiver was 284 Mbit/s.
+
+The clean reverse-first tunnel window still failed throughput acceptance at
+`24.2/22.0 Mbit/s`, but it gave the missing discriminator. QUIC had no
+loss/congestion delta or inherited congestion, and `downlink_flush:` showed
+`send_slice_calls=13301`, `accepted_bytes=72320335`, `zero=0`, `errors=0`, and
+`tun_flush_failures=0`. The bad signals were instead
+`local_tun_egress_drop+local_downlink_backpressure`,
+`pause_edges=8/resume_edges=8`, `max_pending_bytes=584779`, and
+`tun_tx_dropped_delta=366`.
+
+Reusable rule: stop treating `send_slice` failure or TUN flush syscall failure
+as the leading clean reverse hypothesis. The data is accepted by smoltcp and
+flush calls return success, but the local egress path still drops after those
+accepted bytes are pushed toward TUN/qdisc. The next design branch should add
+local egress feedback or pacing around accepted downlink bytes, not another
+blind watermark/default tweak. Post-forward reverse samples in this run were
+polluted by inherited QUIC congestion and should remain secondary evidence.
+
 ## 2026-07-04 — Knife14ap makes bounded downlink flush progress visible
 
 Knife14ao default-watermark acceptance for commit `0d0765f` did not reproduce

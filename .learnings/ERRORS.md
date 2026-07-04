@@ -1,5 +1,22 @@
 # Errors
 
+## 2026-07-04 — Codex interactive sudo over SSH needs a writable PTY session
+
+- Stage: Knife14ap VPS acceptance.
+- Failed/non-useful attempts:
+  - `ssh -tt ...` without `tty=true` reached `.27` `sudo -v`, but the Codex
+    session did not keep writable stdin for the password prompt.
+  - Non-TTY suite invocation failed at `sudo -v` even after an outer
+    `sudo -n true` check, because the script uses a naked `sudo -v` and sudo
+    needed a terminal/password for that invocation.
+- Working behavior: run the suite over SSH with a true writable PTY
+  (`exec_command` with `tty=true`) and enter the sudo password only into the
+  prompt. Do not place the password in scripts, repository files, reports, or
+  final summaries.
+- Future behavior: for `.27` acceptance runs where sudo may be cold, start the
+  VPS suite in a writable PTY from the beginning. A plain `ssh -tt` subprocess
+  can still leave Codex unable to answer the prompt.
+
 ## 2026-07-04 — Knife14ao default-watermark acceptance did not reproduce the high A/B result
 
 - Stage: Knife14ao default downlink-watermark acceptance for commit `0d0765f`.
