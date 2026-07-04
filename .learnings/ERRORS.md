@@ -1,5 +1,14 @@
 # Errors
 
+## 2026-07-04 — HTTPS origin push failed; SSH one-shot push worked
+
+- Command failed: `git push` against `origin=https://github.com/S7245/mini_vpn.git`.
+- Error: `fatal: could not read Username for 'https://github.com': Device not configured`.
+- Working fallback: `git push git@github.com:S7245/mini_vpn.git codex/knife14d-downlink-reap-open`.
+- Future behavior: do not assume HTTPS origin can push from this session. If
+  SSH GitHub access is available, use a one-shot SSH URL or ask before changing
+  `origin`.
+
 ## 2026-07-04 — Knife14aj initial plan mistook Closed pending for drainable pressure
 
 - Initial design branch: add a progress-sensitive grace for inactive pending
