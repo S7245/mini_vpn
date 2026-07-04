@@ -2,6 +2,7 @@ use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use std::collections::VecDeque;
 use tokio::io::{AsyncReadExt, AsyncWriteExt}; // ⚠️ 极其重要：引入异步读写魔法
 use bytes::BytesMut;
+use tun::Device as TunDevice;
 
 // 条件编译宏。这意味着如果在 Linux 系统上编译这段代码，编译器会自动忽略 PI 头逻辑，直接按标准处理。
 #[cfg(target_os = "macos")]
@@ -10,6 +11,8 @@ const UTUN_IPV4_HEADER: [u8; 4] = [0, 0, 0, 2];
 /// 虚拟 TUN 设备包装器：连接异步物理网卡与同步 smoltcp 协议栈的桥梁
 pub struct VirtualTunDevice {
     pub device: tun::AsyncDevice,
+    /// OS interface name when the platform exposes it (diagnostics only).
+    interface_name: Option<String>,
     /// 刀14c：真实 TUN IP MTU。必须和 OS TUN MTU / smoltcp capability 保持一致。
     mtu: usize,
     /// 收货仓库：存放刚从网卡读出来、还没被 smoltcp 吃掉的一个完整 IP 包
@@ -22,8 +25,10 @@ pub struct VirtualTunDevice {
 impl VirtualTunDevice {
     /// 构造函数
     pub fn new(device: tun::AsyncDevice, mtu: usize) -> Self {
+        let interface_name = TunDevice::name(device.get_ref()).ok();
         Self {
             device,
+            interface_name,
             mtu,
             rx_buffer: None,
             tx_queue: VecDeque::new(),
@@ -113,6 +118,10 @@ pub trait TunIo: Device {
     async fn flush_tx(&mut self) -> std::io::Result<()>;
     /// 下行注入：裸 IP 包入发货队列，等 `flush_tx` 发出。
     fn inject_ip_packet(&mut self, pkt: &[u8]);
+    /// OS interface name when available. Diagnostics only; behavior must not depend on it.
+    fn interface_name(&self) -> Option<&str> {
+        None
+    }
 }
 
 impl TunIo for VirtualTunDevice {
@@ -131,6 +140,9 @@ impl TunIo for VirtualTunDevice {
     }
     fn inject_ip_packet(&mut self, pkt: &[u8]) {
         VirtualTunDevice::inject_ip_packet(self, pkt)
+    }
+    fn interface_name(&self) -> Option<&str> {
+        self.interface_name.as_deref()
     }
 }
 

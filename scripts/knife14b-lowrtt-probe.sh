@@ -434,6 +434,36 @@ summarize_metrics_window() {
       }
     }
 
+    /tcp-tun-egress/ {
+      runtime_tun_samples++
+      runtime_tun_status = ""
+      runtime_tun_delta_token = ""
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^status=/) {
+          runtime_tun_status = $i
+          sub(/^status=/, "", runtime_tun_status)
+        } else if ($i ~ /^tx_dropped_delta=/) {
+          runtime_tun_delta_token = $i
+          sub(/^tx_dropped_delta=/, "", runtime_tun_delta_token)
+        }
+      }
+      if (runtime_tun_status == "reset") {
+        runtime_tun_resets++
+      } else if (runtime_tun_status ~ /^(no_interface|invalid_interface|read_error|parse_error)$/) {
+        runtime_tun_unavailable++
+      }
+      if (runtime_tun_delta_token != "" && runtime_tun_delta_token ~ /^[0-9]+$/) {
+        runtime_tun_delta = runtime_tun_delta_token + 0
+        runtime_tun_drop_delta_total += runtime_tun_delta
+        if (runtime_tun_delta > 0) {
+          runtime_tun_drop_events++
+        }
+        if (runtime_tun_delta > max_runtime_tun_delta) {
+          max_runtime_tun_delta = runtime_tun_delta
+        }
+      }
+    }
+
     /tcp-handle-close/ {
       pending = 0
       terminal_pending = 0
@@ -677,6 +707,9 @@ summarize_metrics_window() {
       if (tun_tx_delta != "unknown" && (tun_tx_delta + 0) > 0) {
         add_label("local_tun_egress_drop")
       }
+      if (runtime_tun_drop_delta_total > 0) {
+        add_label("local_tun_egress_drop")
+      }
       if (down_pause_count > 0) {
         add_label("local_downlink_backpressure")
       }
@@ -732,6 +765,7 @@ summarize_metrics_window() {
       printf "- terminal_pending_reap: events=%d bytes=%d max_bytes=%d\n", terminal_pending_events, terminal_pending_bytes, max_terminal_pending_bytes
       printf "- relay_late_remote: post_finish_bytes=%d post_finish_reads=%d local_finish_events=%d\n", max_late_remote_bytes, max_late_remote_reads, local_finish_count
       printf "- tun_drops: if=%s tun_rx_dropped_delta=%s tun_tx_dropped_delta=%s\n", tun_if, tun_rx_delta, tun_tx_delta
+      printf "- runtime_tun_egress: samples=%d drop_events=%d drop_delta_total=%d max_delta=%d unavailable=%d resets=%d\n", runtime_tun_samples, runtime_tun_drop_events, runtime_tun_drop_delta_total, max_runtime_tun_delta, runtime_tun_unavailable, runtime_tun_resets
       printf "- quic: samples=%d worst_conn=%s max_lost_bytes_delta=%d max_congestion_events_delta=%d max_start_lost_bytes=%d max_start_congestion_events=%d min_start_cwnd=%s min_cwnd=%s inherited_conns=%s inherited_low_cwnd_threshold=%d max_tx_blocked_data_delta=%d max_tx_blocked_stream_delta=%d max_rx_blocked_data_delta=%d max_rx_blocked_stream_delta=%d\n", quic_samples, worst_conn, max_lost_bytes_delta, max_congestion_delta, max_start_lost_bytes, max_start_congestion_events, min_start_cwnd_all, min_cwnd_all, inherited_quic_conns, inherited_low_cwnd_limit, max_tx_data_delta, max_tx_stream_delta, max_rx_data_delta, max_rx_stream_delta
       print "- attribution: " labels
     }
@@ -760,6 +794,7 @@ EOF_IPERF
 🔎 tcp-downlink-backpressure paused=true max_pending=2151649 total_pending=2151649 high=2097120 low=524280
 🔎 tcp-downlink-backpressure paused=false max_pending=524233 total_pending=524233 high=2097120 low=524280
 🔎 tcp-downlink-flush pending_total=524233 pending_max=524233 pending_high=2151649 remote_to_global_rx_bytes=3145728 flush_attempts=23 no_send_capacity=7 send_slice_calls=16 send_slice_accepted=2621440 send_slice_zero=2 send_slice_errors=0 budget_limited_calls=9 send_slice_max_accepted=262144 tun_flush_tx_calls=14 tun_flush_tx_failures=1 tun_flush_deferred=3 dirty_handles=1
+🔎 tcp-tun-egress if=tun0 status=delta tx_dropped_total=1523 tx_dropped_delta=1423 global_rx_paused=true pending_total=524233 pending_max=524233 pending_high=2151649 remote_to_global_rx_bytes=3145728 tun_flush_tx_calls=14 dirty_handles=1
 🔎 tcp-handle-close handle=SocketHandle(1) direction=local reason=dead_slot_reap state=Relaying pending=4096 pending_high=2151649 remote_to_global_rx_bytes=3145728 flush_attempts=23 no_send_capacity=7 send_slice_calls=16 send_slice_accepted=2621440 send_slice_zero=2 send_slice_errors=0 budget_limited_calls=9 send_slice_max_accepted=262144 tun_flush_tx_calls=14 tun_flush_tx_failures=1 tun_flush_deferred=3 terminal_pending_reap_bytes=4096 tcp_state=Closed active=false can_send=false can_recv=false
 📊 TUIC QUIC stats conn=3 id=99 rtt=0ms cwnd=13068 lost=303/1374 lost_bytes=439956 congestion_events=38 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=1,max_stream_data=2) udp_tx=1372/1977208B udp_rx=332/20762B dg_max=Some(1418) dg_space=1048576B
 🔁 tuic-tcp-pool-reconnect conn=1 reason=stale_tcp_pool_slot
@@ -792,8 +827,9 @@ EOF_LOG
   assert_contains "$summary" "downlink_backpressure: pause_edges=1 resume_edges=1 max_pending_bytes=2151649"
   assert_contains "$summary" "downlink_flush: attempts=23 no_send_capacity=7 send_slice_calls=16 accepted_bytes=2621440 zero=2 errors=0 budget_limited=9 max_accepted_bytes=262144 tun_flush_calls=14 tun_flush_failures=1 tun_flush_deferred=3"
   assert_contains "$summary" "terminal_pending_reap: events=1 bytes=4096 max_bytes=4096"
+  assert_contains "$summary" "runtime_tun_egress: samples=1 drop_events=1 drop_delta_total=1423 max_delta=1423 unavailable=0 resets=0"
   assert_contains "$summary" "max_lost_bytes_delta=439956"
-  assert_contains "$summary" "attribution: quic_loss_congestion+local_write_pressure+local_downlink_backpressure+terminal_pending_reap"
+  assert_contains "$summary" "attribution: quic_loss_congestion+local_write_pressure+local_tun_egress_drop+local_downlink_backpressure+terminal_pending_reap"
 
   cat > "$log_sample" <<'EOF_LOG'
 🔎 tuic-open-tcp target=43.130.32.77:5201 conn=3 id=99
@@ -941,7 +977,7 @@ IPERF_BUSY_RETRIES="${IPERF_BUSY_RETRIES:-3}"
 IPERF_BUSY_WAIT_SECS="${IPERF_BUSY_WAIT_SECS:-5}"
 PROBE_ORDER="${PROBE_ORDER:-forward-first}"
 OUT="${OUT:-/tmp/mvpn_knife14b_lowrtt_$(date +%Y%m%d_%H%M%S).md}"
-METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tuic-open-tcp|tuic-tcp-pool-reconnect|tcp-relay-live|tcp-relay-write-half-closed|tcp-relay-close|tcp-handle-close|tcp-local-write-pressure|tcp-global-rx-pressure|tcp-downlink-backpressure|tcp-downlink-flush'
+METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tuic-open-tcp|tuic-tcp-pool-reconnect|tcp-relay-live|tcp-relay-write-half-closed|tcp-relay-close|tcp-handle-close|tcp-local-write-pressure|tcp-global-rx-pressure|tcp-downlink-backpressure|tcp-downlink-flush|tcp-tun-egress'
 
 case "$PROBE_ORDER" in
   forward-first|reverse-first|forward-only|reverse-only) ;;

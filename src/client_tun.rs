@@ -1047,6 +1047,135 @@ fn format_tcp_downlink_flush_diag(
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TunEgressDropSample {
+    Unavailable { reason: &'static str },
+    First { total: u64 },
+    Delta { total: u64, delta: u64 },
+    Reset { previous: u64, total: u64 },
+}
+
+#[derive(Debug, Clone)]
+struct TunEgressDropSampler {
+    interface_name: Option<String>,
+    last_tx_dropped: Option<u64>,
+}
+
+impl TunEgressDropSampler {
+    fn new(interface_name: Option<&str>) -> Self {
+        Self {
+            interface_name: interface_name.map(str::to_owned),
+            last_tx_dropped: None,
+        }
+    }
+
+    fn sample(&mut self) -> TunEgressDropSample {
+        self.sample_with(read_tun_tx_dropped_stat)
+    }
+
+    fn sample_with<F>(&mut self, read_stat: F) -> TunEgressDropSample
+    where
+        F: FnOnce(&str) -> std::io::Result<String>,
+    {
+        let Some(interface_name) = self.interface_name.as_deref() else {
+            return TunEgressDropSample::Unavailable {
+                reason: "no_interface",
+            };
+        };
+        if !valid_sysfs_interface_name(interface_name) {
+            return TunEgressDropSample::Unavailable {
+                reason: "invalid_interface",
+            };
+        }
+        let Ok(raw) = read_stat(interface_name) else {
+            return TunEgressDropSample::Unavailable {
+                reason: "read_error",
+            };
+        };
+        let Some(total) = parse_u64_counter(raw.trim()) else {
+            return TunEgressDropSample::Unavailable {
+                reason: "parse_error",
+            };
+        };
+        match self.last_tx_dropped.replace(total) {
+            None => TunEgressDropSample::First { total },
+            Some(previous) if total >= previous => TunEgressDropSample::Delta {
+                total,
+                delta: total - previous,
+            },
+            Some(previous) => TunEgressDropSample::Reset { previous, total },
+        }
+    }
+
+    fn interface_label(&self) -> &str {
+        self.interface_name.as_deref().unwrap_or("unknown")
+    }
+}
+
+fn valid_sysfs_interface_name(interface_name: &str) -> bool {
+    !interface_name.is_empty()
+        && interface_name != "."
+        && interface_name != ".."
+        && !interface_name.contains('/')
+        && !interface_name.contains('\0')
+}
+
+fn parse_u64_counter(raw: &str) -> Option<u64> {
+    raw.trim().parse::<u64>().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn read_tun_tx_dropped_stat(interface_name: &str) -> std::io::Result<String> {
+    std::fs::read_to_string(format!(
+        "/sys/class/net/{interface_name}/statistics/tx_dropped"
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_tun_tx_dropped_stat(_interface_name: &str) -> std::io::Result<String> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "TUN tx_dropped sysfs counter is Linux-only",
+    ))
+}
+
+fn format_tun_egress_diag(
+    interface_name: &str,
+    sample: &TunEgressDropSample,
+    downlink: &TcpDownlinkAggregate,
+    dirty_handles: usize,
+    global_rx_paused: bool,
+) -> String {
+    let (status, total, delta) = match sample {
+        TunEgressDropSample::Unavailable { reason } => {
+            (*reason, "unknown".to_string(), "unknown".to_string())
+        }
+        TunEgressDropSample::First { total } => ("first", total.to_string(), "0".to_string()),
+        TunEgressDropSample::Delta { total, delta } => {
+            ("delta", total.to_string(), delta.to_string())
+        }
+        TunEgressDropSample::Reset { previous, total } => (
+            "reset",
+            total.to_string(),
+            format!("unknown_previous_{previous}"),
+        ),
+    };
+    format!(
+        "🔎 tcp-tun-egress if={} status={} tx_dropped_total={} tx_dropped_delta={} global_rx_paused={} pending_total={} pending_max={} pending_high={} remote_to_global_rx_bytes={} tun_flush_tx_calls={} dirty_handles={}",
+        interface_name,
+        status,
+        total,
+        delta,
+        global_rx_paused,
+        downlink.pending_total,
+        downlink.pending_max,
+        downlink.pending_high,
+        downlink.remote_to_global_rx_bytes,
+        downlink.tun_flush_tx_calls,
+        dirty_handles
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DownlinkEgressPacer {
     immediate_budget_bytes: usize,
@@ -1588,6 +1717,7 @@ pub async fn run_event_loop<D, U, M>(
     let downlink_flush_max_bytes = runtime_config.downlink_flush_max_bytes;
     let mut downlink_egress_pacer =
         DownlinkEgressPacer::new(runtime_config.downlink_egress_immediate_bytes);
+    let mut tun_egress_drop_sampler = TunEgressDropSampler::new(device.interface_name());
     let mut global_rx_paused = false;
 
     loop {
@@ -1838,6 +1968,19 @@ pub async fn run_event_loop<D, U, M>(
                     "{}",
                     format_tcp_downlink_flush_diag(&tcp_downlink, dirty.len())
                 );
+                if tcp_diag_enabled() {
+                    let tun_sample = tun_egress_drop_sampler.sample();
+                    println!(
+                        "{}",
+                        format_tun_egress_diag(
+                            tun_egress_drop_sampler.interface_label(),
+                            &tun_sample,
+                            &tcp_downlink,
+                            dirty.len(),
+                            global_rx_paused,
+                        )
+                    );
+                }
                 // 刀12：紧挨 📊 行打 🔬 主循环归因行（profiler 关闭时 NoopSink::report 空、零开销）。
                 metrics.report();
             }
@@ -4921,6 +5064,121 @@ mod tests {
         assert!(line.contains("tun_flush_tx_calls=2"));
         assert!(line.contains("tun_flush_tx_failures=1"));
         assert!(line.contains("tun_flush_deferred=1"));
+        assert!(line.contains("dirty_handles=2"));
+    }
+
+    #[test]
+    fn tun_egress_drop_sampler_tracks_first_delta_and_reset() {
+        let mut sampler = TunEgressDropSampler::new(Some("tun0"));
+
+        assert_eq!(
+            sampler.sample_with(|iface| {
+                assert_eq!(iface, "tun0");
+                Ok("100\n".to_string())
+            }),
+            TunEgressDropSample::First { total: 100 }
+        );
+        assert_eq!(
+            sampler.sample_with(|iface| {
+                assert_eq!(iface, "tun0");
+                Ok("1523\n".to_string())
+            }),
+            TunEgressDropSample::Delta {
+                total: 1523,
+                delta: 1423,
+            }
+        );
+        assert_eq!(
+            sampler.sample_with(|iface| {
+                assert_eq!(iface, "tun0");
+                Ok("9\n".to_string())
+            }),
+            TunEgressDropSample::Reset {
+                previous: 1523,
+                total: 9,
+            }
+        );
+    }
+
+    #[test]
+    fn tun_egress_drop_sampler_reports_unavailable_without_behavior_pressure() {
+        let mut no_name = TunEgressDropSampler::new(None);
+        assert_eq!(
+            no_name.sample_with(|_| unreachable!("no interface should not read sysfs")),
+            TunEgressDropSample::Unavailable {
+                reason: "no_interface"
+            }
+        );
+
+        let mut invalid = TunEgressDropSampler::new(Some("../tun0"));
+        assert_eq!(
+            invalid.sample_with(|_| unreachable!("invalid interface should not read sysfs")),
+            TunEgressDropSample::Unavailable {
+                reason: "invalid_interface"
+            }
+        );
+
+        let mut parent_dir = TunEgressDropSampler::new(Some(".."));
+        assert_eq!(
+            parent_dir.sample_with(|_| unreachable!("parent dir should not read sysfs")),
+            TunEgressDropSample::Unavailable {
+                reason: "invalid_interface"
+            }
+        );
+
+        let mut read_err = TunEgressDropSampler::new(Some("tun0"));
+        assert_eq!(
+            read_err.sample_with(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "missing stat",
+                ))
+            }),
+            TunEgressDropSample::Unavailable {
+                reason: "read_error"
+            }
+        );
+
+        let mut parse_err = TunEgressDropSampler::new(Some("tun0"));
+        assert_eq!(
+            parse_err.sample_with(|_| Ok("not-a-counter\n".to_string())),
+            TunEgressDropSample::Unavailable {
+                reason: "parse_error"
+            }
+        );
+    }
+
+    #[test]
+    fn tun_egress_diag_formats_drop_delta_with_downlink_context() {
+        let aggregate = TcpDownlinkAggregate {
+            pending_total: 10,
+            pending_max: 7,
+            pending_high: 100,
+            remote_to_global_rx_bytes: 4096,
+            tun_flush_tx_calls: 12,
+            ..TcpDownlinkAggregate::default()
+        };
+        let line = format_tun_egress_diag(
+            "tun0",
+            &TunEgressDropSample::Delta {
+                total: 1523,
+                delta: 1423,
+            },
+            &aggregate,
+            2,
+            true,
+        );
+
+        assert!(line.contains("tcp-tun-egress"));
+        assert!(line.contains("if=tun0"));
+        assert!(line.contains("status=delta"));
+        assert!(line.contains("tx_dropped_total=1523"));
+        assert!(line.contains("tx_dropped_delta=1423"));
+        assert!(line.contains("global_rx_paused=true"));
+        assert!(line.contains("pending_total=10"));
+        assert!(line.contains("pending_high=100"));
+        assert!(line.contains("remote_to_global_rx_bytes=4096"));
+        assert!(line.contains("tun_flush_tx_calls=12"));
         assert!(line.contains("dirty_handles=2"));
     }
 
