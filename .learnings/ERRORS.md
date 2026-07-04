@@ -1027,3 +1027,16 @@
 - Future debugging rule: if stream timing diagnostics show a large gap, always
   pair the gap with stream byte volume before treating it as the performance
   root.
+
+## 2026-07-04 — Knife14bb fixed control-stream read-gap over-attribution
+
+- Fix: `scripts/knife14b-lowrtt-probe.sh` now keeps all-stream timing maxima in
+  the summary but uses data-bearing streams/handles (`>=65536` received bytes)
+  for reverse TCP read-gap attribution.
+- Regression test: the parser self-test now includes the Knife14ba shape where
+  a `343B` control stream has `30147ms` gap and a `110MB` data stream has
+  `3763ms` gap. The expected attribution excludes `tuic_stream_read_gap` and
+  `relay_remote_read_gap`.
+- Future debugging rule: when adding parser labels, include a negative fixture
+  for the nearest known false-positive shape before trusting new attribution in
+  VPS reports.

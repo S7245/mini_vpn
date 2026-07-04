@@ -1758,3 +1758,20 @@ worth cleaning up separately.
   stall hypothesis, keep those diagnostics but move the next TDD slice to local
   send-queue pressure and terminal pending accounting. Do not revisit stale
   pool, iperf3, sing-box, or blunt pacing without new contradictory evidence.
+
+## 2026-07-04 — Knife14bb parser attribution must separate control and data streams
+
+- Stage: Knife14bb parser data-stream attribution.
+- Outcome: Updated `scripts/knife14b-lowrtt-probe.sh` so global stream timing
+  maxima remain visible, but reverse TCP read-gap attribution uses data-bearing
+  streams/handles only. The parser now reports `data_streams`,
+  `data_*_max_ms`, `data_rx_bytes_max`, and `data_rx_min_bytes=65536`.
+- Local gates passed: `scripts/knife14b-lowrtt-probe.sh --self-test`,
+  `scripts/knife14b-usclient-tunnel-suite.sh --self-test`, and `bash -n` for
+  both scripts.
+- Key lesson: a large read gap is not enough to identify the throughput root.
+  It must be paired with stream byte volume; otherwise idle iperf control
+  streams can create false remote-read labels.
+- Reusable rule: parser attribution for throughput root cause should use
+  data-stream filtered fields, while raw/global maxima remain in the report for
+  manual inspection.

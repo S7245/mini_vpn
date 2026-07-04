@@ -223,7 +223,8 @@ summarize_metrics_window() {
     -v inherited_low_cwnd_limit=65536 \
     -v inherited_lost_bytes_floor=1048576 \
     -v inherited_cong_floor=100 \
-    -v slow_rx_floor_ms=5000 '
+    -v slow_rx_floor_ms=5000 \
+    -v data_stream_min_rx_bytes=65536 '
     function numeric_token(token, key, value) {
       value = token
       sub("^" key "=", "", value)
@@ -232,6 +233,13 @@ summarize_metrics_window() {
         return 0
       }
       return value + 0
+    }
+
+    function digits_token(token, key, value) {
+      value = token
+      sub("^" key "=", "", value)
+      gsub(/[^0-9]/, "", value)
+      return value
     }
 
     function metric_pair_value(text, key, parts, i, kv) {
@@ -274,6 +282,26 @@ summarize_metrics_window() {
         labels = label
       } else {
         labels = labels "+" label
+      }
+    }
+
+    function remember_relay_handle(handle) {
+      if (handle == "") {
+        return
+      }
+      if (!(handle in seen_relay_handle)) {
+        seen_relay_handle[handle] = 1
+        relay_handles[++relay_handle_count] = handle
+      }
+    }
+
+    function remember_tuic_stream(key) {
+      if (key == "") {
+        return
+      }
+      if (!(key in seen_tuic_stream)) {
+        seen_tuic_stream[key] = 1
+        tuic_stream_keys[++tuic_stream_key_count] = key
       }
     }
 
@@ -729,6 +757,7 @@ summarize_metrics_window() {
       if (handle == "") {
         next
       }
+      remember_relay_handle(handle)
       if (has_first_remote_read_ms && first_remote_read_ms > max_relay_first_remote_read_ms) {
         max_relay_first_remote_read_ms = first_remote_read_ms
       }
@@ -740,6 +769,15 @@ summarize_metrics_window() {
       }
       if (has_current_remote_read_gap_ms && remote_reads == 0 && current_remote_read_gap_ms > max_relay_no_first_remote_gap_ms) {
         max_relay_no_first_remote_gap_ms = current_remote_read_gap_ms
+      }
+      if (remote_bytes > relay_remote_bytes[handle]) {
+        relay_remote_bytes[handle] = remote_bytes
+      }
+      if (has_first_remote_read_ms && first_remote_read_ms > relay_first_remote_read_ms[handle]) {
+        relay_first_remote_read_ms[handle] = first_remote_read_ms
+      }
+      if (has_max_remote_read_gap_ms && max_remote_read_gap_ms > relay_remote_read_gap_ms[handle]) {
+        relay_remote_read_gap_ms[handle] = max_remote_read_gap_ms
       }
 
       if (has_explicit_after_bytes) {
@@ -776,24 +814,84 @@ summarize_metrics_window() {
 
     /tuic-tcp-stream-first-rx/ {
       tuic_first_rx_events++
+      has_conn = 0
+      has_id = 0
+      has_stream = 0
+      conn = ""
+      id = ""
+      stream = ""
+      first_rx_ms = 0
+      has_first_rx_ms = 0
       for (i = 1; i <= NF; i++) {
-        if ($i ~ /^first_rx_ms=/) {
-          value = numeric_token($i, "first_rx_ms")
+        if ($i ~ /^conn=/) {
+          conn = digits_token($i, "conn")
+          has_conn = 1
+        } else if ($i ~ /^id=/) {
+          id = digits_token($i, "id")
+          has_id = 1
+        } else if ($i ~ /^stream=/) {
+          stream = digits_token($i, "stream")
+          has_stream = 1
+        } else if ($i ~ /^first_rx_ms=/) {
+          first_rx_ms = numeric_token($i, "first_rx_ms")
+          has_first_rx_ms = 1
+          value = first_rx_ms
           if (value > max_tuic_first_rx_ms) {
             max_tuic_first_rx_ms = value
           }
+        }
+      }
+      if (has_conn && has_id && has_stream && has_first_rx_ms) {
+        key = conn ":" id ":" stream
+        remember_tuic_stream(key)
+        if (first_rx_ms > tuic_stream_first_rx_ms[key]) {
+          tuic_stream_first_rx_ms[key] = first_rx_ms
         }
       }
     }
 
     /tuic-tcp-stream-read-gap/ {
       tuic_read_gap_events++
+      has_conn = 0
+      has_id = 0
+      has_stream = 0
+      conn = ""
+      id = ""
+      stream = ""
+      read_gap_ms = 0
+      read_gap_rx_bytes = 0
+      has_read_gap_ms = 0
+      has_read_gap_rx_bytes = 0
       for (i = 1; i <= NF; i++) {
-        if ($i ~ /^gap_ms=/) {
-          value = numeric_token($i, "gap_ms")
+        if ($i ~ /^conn=/) {
+          conn = digits_token($i, "conn")
+          has_conn = 1
+        } else if ($i ~ /^id=/) {
+          id = digits_token($i, "id")
+          has_id = 1
+        } else if ($i ~ /^stream=/) {
+          stream = digits_token($i, "stream")
+          has_stream = 1
+        } else if ($i ~ /^gap_ms=/) {
+          read_gap_ms = numeric_token($i, "gap_ms")
+          has_read_gap_ms = 1
+          value = read_gap_ms
           if (value > max_tuic_read_gap_ms) {
             max_tuic_read_gap_ms = value
           }
+        } else if ($i ~ /^rx_bytes=/) {
+          read_gap_rx_bytes = numeric_token($i, "rx_bytes")
+          has_read_gap_rx_bytes = 1
+        }
+      }
+      if (has_conn && has_id && has_stream) {
+        key = conn ":" id ":" stream
+        remember_tuic_stream(key)
+        if (has_read_gap_ms && read_gap_ms > tuic_stream_read_gap_ms[key]) {
+          tuic_stream_read_gap_ms[key] = read_gap_ms
+        }
+        if (has_read_gap_rx_bytes && read_gap_rx_bytes > tuic_stream_observed_rx_bytes[key]) {
+          tuic_stream_observed_rx_bytes[key] = read_gap_rx_bytes
         }
       }
     }
@@ -801,16 +899,38 @@ summarize_metrics_window() {
     /tuic-tcp-stream-close/ {
       tuic_stream_close_events++
       close_rx_bytes = 0
+      has_conn = 0
+      has_id = 0
+      has_stream = 0
+      conn = ""
+      id = ""
+      stream = ""
+      close_first_rx_ms = 0
+      close_gap_ms = 0
+      has_close_first_rx_ms = 0
+      has_close_gap_ms = 0
       for (i = 1; i <= NF; i++) {
-        if ($i ~ /^first_rx_ms=/) {
-          value = numeric_token($i, "first_rx_ms")
+        if ($i ~ /^conn=/) {
+          conn = digits_token($i, "conn")
+          has_conn = 1
+        } else if ($i ~ /^id=/) {
+          id = digits_token($i, "id")
+          has_id = 1
+        } else if ($i ~ /^stream=/) {
+          stream = digits_token($i, "stream")
+          has_stream = 1
+        } else if ($i ~ /^first_rx_ms=/) {
+          close_first_rx_ms = numeric_token($i, "first_rx_ms")
+          has_close_first_rx_ms = 1
+          value = close_first_rx_ms
           if (value > max_tuic_close_first_rx_ms) {
             max_tuic_close_first_rx_ms = value
           }
         } else if ($i ~ /^max_read_gap_ms=/) {
-          value = numeric_token($i, "max_read_gap_ms")
-          if (value > max_tuic_close_gap_ms) {
-            max_tuic_close_gap_ms = value
+          close_gap_ms = numeric_token($i, "max_read_gap_ms")
+          has_close_gap_ms = 1
+          if (close_gap_ms > max_tuic_close_gap_ms) {
+            max_tuic_close_gap_ms = close_gap_ms
           }
         } else if ($i ~ /^rx_bytes=/) {
           close_rx_bytes = numeric_token($i, "rx_bytes")
@@ -826,6 +946,22 @@ summarize_metrics_window() {
       }
       if (close_rx_bytes == 0) {
         tuic_zero_rx_closes++
+      }
+      if (has_conn && has_id && has_stream) {
+        key = conn ":" id ":" stream
+        remember_tuic_stream(key)
+        if (close_rx_bytes > tuic_stream_close_rx_bytes[key]) {
+          tuic_stream_close_rx_bytes[key] = close_rx_bytes
+        }
+        if (close_rx_bytes > tuic_stream_observed_rx_bytes[key]) {
+          tuic_stream_observed_rx_bytes[key] = close_rx_bytes
+        }
+        if (has_close_first_rx_ms && close_first_rx_ms > tuic_stream_first_rx_ms[key]) {
+          tuic_stream_first_rx_ms[key] = close_first_rx_ms
+        }
+        if (has_close_gap_ms && close_gap_ms > tuic_stream_close_gap_ms[key]) {
+          tuic_stream_close_gap_ms[key] = close_gap_ms
+        }
       }
     }
 
@@ -995,24 +1131,57 @@ summarize_metrics_window() {
       if (lifecycle_terminal_candidates > 0) {
         add_label("local_tcp_terminal_transition")
       }
+      for (i = 1; i <= relay_handle_count; i++) {
+        handle = relay_handles[i]
+        if (relay_remote_bytes[handle] >= data_stream_min_rx_bytes) {
+          relay_data_streams++
+          if (relay_remote_bytes[handle] > max_relay_data_remote_bytes) {
+            max_relay_data_remote_bytes = relay_remote_bytes[handle]
+          }
+          if (relay_first_remote_read_ms[handle] > max_relay_data_first_remote_read_ms) {
+            max_relay_data_first_remote_read_ms = relay_first_remote_read_ms[handle]
+          }
+          if (relay_remote_read_gap_ms[handle] > max_relay_data_remote_read_gap_ms) {
+            max_relay_data_remote_read_gap_ms = relay_remote_read_gap_ms[handle]
+          }
+        }
+      }
+      for (i = 1; i <= tuic_stream_key_count; i++) {
+        key = tuic_stream_keys[i]
+        stream_rx_bytes = tuic_stream_observed_rx_bytes[key]
+        if (stream_rx_bytes >= data_stream_min_rx_bytes) {
+          tuic_data_streams++
+          if (stream_rx_bytes > max_tuic_data_rx_bytes) {
+            max_tuic_data_rx_bytes = stream_rx_bytes
+          }
+          if (tuic_stream_first_rx_ms[key] > max_tuic_data_first_rx_ms) {
+            max_tuic_data_first_rx_ms = tuic_stream_first_rx_ms[key]
+          }
+          if (tuic_stream_read_gap_ms[key] > max_tuic_data_read_gap_ms) {
+            max_tuic_data_read_gap_ms = tuic_stream_read_gap_ms[key]
+          }
+          if (tuic_stream_close_gap_ms[key] > max_tuic_data_close_gap_ms) {
+            max_tuic_data_close_gap_ms = tuic_stream_close_gap_ms[key]
+          }
+        }
+      }
       remote_timing_slow = 0
       if (probe_kind == "tcp" && reverse_tcp == "1") {
-        if (max_tuic_first_rx_ms >= slow_rx_floor_ms ||
-            max_tuic_close_first_rx_ms >= slow_rx_floor_ms) {
+        if (max_tuic_data_first_rx_ms >= slow_rx_floor_ms) {
           add_label("tuic_stream_first_byte_slow")
           remote_timing_slow = 1
         }
-        if (max_tuic_read_gap_ms >= slow_rx_floor_ms ||
-            max_tuic_close_gap_ms >= slow_rx_floor_ms) {
+        if (max_tuic_data_read_gap_ms >= slow_rx_floor_ms ||
+            max_tuic_data_close_gap_ms >= slow_rx_floor_ms) {
           add_label("tuic_stream_read_gap")
           remote_timing_slow = 1
         }
-        if (max_relay_first_remote_read_ms >= slow_rx_floor_ms ||
+        if (max_relay_data_first_remote_read_ms >= slow_rx_floor_ms ||
             max_relay_no_first_remote_gap_ms >= slow_rx_floor_ms) {
           add_label("relay_remote_first_byte_slow")
           remote_timing_slow = 1
         }
-        if (max_relay_remote_read_gap_ms >= slow_rx_floor_ms) {
+        if (max_relay_data_remote_read_gap_ms >= slow_rx_floor_ms) {
           add_label("relay_remote_read_gap")
           remote_timing_slow = 1
         }
@@ -1071,8 +1240,8 @@ summarize_metrics_window() {
       printf "- terminal_pending_reap: events=%d bytes=%d max_bytes=%d\n", terminal_pending_events, terminal_pending_bytes, max_terminal_pending_bytes
       printf "- pending_at_close: events=%d bytes=%d max_bytes=%d terminal_events=%d terminal_bytes=%d active_no_send_events=%d active_no_send_bytes=%d send_capable_events=%d send_capable_bytes=%d inactive_no_send_events=%d inactive_no_send_bytes=%d unknown_events=%d unknown_bytes=%d\n", pending_at_close_events, pending_at_close_bytes, max_pending_at_close_bytes, terminal_pending_events, terminal_pending_bytes, pending_close_active_no_send_events, pending_close_active_no_send_bytes, pending_close_send_capable_events, pending_close_send_capable_bytes, pending_close_inactive_no_send_events, pending_close_inactive_no_send_bytes, pending_close_unknown_events, pending_close_unknown_bytes
       printf "- relay_late_remote: post_finish_bytes=%d post_finish_reads=%d local_finish_events=%d\n", max_late_remote_bytes, max_late_remote_reads, local_finish_count
-      printf "- relay_remote_timing: first_read_max_ms=%d max_read_gap_ms=%d current_gap_max_ms=%d no_first_read_gap_max_ms=%d\n", max_relay_first_remote_read_ms, max_relay_remote_read_gap_ms, max_relay_current_remote_gap_ms, max_relay_no_first_remote_gap_ms
-      printf "- tuic_tcp_stream: first_rx_events=%d first_rx_max_ms=%d read_gap_events=%d read_gap_max_ms=%d close_events=%d close_first_rx_max_ms=%d close_gap_max_ms=%d rx_bytes_max=%d reads_max=%d zero_rx_closes=%d\n", tuic_first_rx_events, max_tuic_first_rx_ms, tuic_read_gap_events, max_tuic_read_gap_ms, tuic_stream_close_events, max_tuic_close_first_rx_ms, max_tuic_close_gap_ms, max_tuic_close_rx_bytes, max_tuic_close_reads, tuic_zero_rx_closes
+      printf "- relay_remote_timing: first_read_max_ms=%d max_read_gap_ms=%d current_gap_max_ms=%d no_first_read_gap_max_ms=%d data_streams=%d data_first_read_max_ms=%d data_max_read_gap_ms=%d data_rx_bytes_max=%d data_rx_min_bytes=%d\n", max_relay_first_remote_read_ms, max_relay_remote_read_gap_ms, max_relay_current_remote_gap_ms, max_relay_no_first_remote_gap_ms, relay_data_streams, max_relay_data_first_remote_read_ms, max_relay_data_remote_read_gap_ms, max_relay_data_remote_bytes, data_stream_min_rx_bytes
+      printf "- tuic_tcp_stream: first_rx_events=%d first_rx_max_ms=%d read_gap_events=%d read_gap_max_ms=%d close_events=%d close_first_rx_max_ms=%d close_gap_max_ms=%d rx_bytes_max=%d reads_max=%d zero_rx_closes=%d data_streams=%d data_first_rx_max_ms=%d data_read_gap_max_ms=%d data_close_gap_max_ms=%d data_rx_bytes_max=%d data_rx_min_bytes=%d\n", tuic_first_rx_events, max_tuic_first_rx_ms, tuic_read_gap_events, max_tuic_read_gap_ms, tuic_stream_close_events, max_tuic_close_first_rx_ms, max_tuic_close_gap_ms, max_tuic_close_rx_bytes, max_tuic_close_reads, tuic_zero_rx_closes, tuic_data_streams, max_tuic_data_first_rx_ms, max_tuic_data_read_gap_ms, max_tuic_data_close_gap_ms, max_tuic_data_rx_bytes, data_stream_min_rx_bytes
       printf "- tun_drops: if=%s tun_rx_dropped_delta=%s tun_tx_dropped_delta=%s\n", tun_if, tun_rx_delta, tun_tx_delta
       printf "- runtime_tun_egress: samples=%d drop_events=%d drop_delta_total=%d max_delta=%d unavailable=%d resets=%d\n", runtime_tun_samples, runtime_tun_drop_events, runtime_tun_drop_delta_total, max_runtime_tun_delta, runtime_tun_unavailable, runtime_tun_resets
       printf "- quic: samples=%d worst_conn=%s max_lost_bytes_delta=%d max_congestion_events_delta=%d max_start_lost_bytes=%d max_start_congestion_events=%d min_start_cwnd=%s min_cwnd=%s inherited_conns=%s inherited_low_cwnd_threshold=%d max_tx_blocked_data_delta=%d max_tx_blocked_stream_delta=%d max_rx_blocked_data_delta=%d max_rx_blocked_stream_delta=%d\n", quic_samples, worst_conn, max_lost_bytes_delta, max_congestion_delta, max_start_lost_bytes, max_start_congestion_events, min_start_cwnd_all, min_cwnd_all, inherited_quic_conns, inherited_low_cwnd_limit, max_tx_data_delta, max_tx_stream_delta, max_rx_data_delta, max_rx_stream_delta
@@ -1276,6 +1445,28 @@ EOF_LOG
   assert_contains "$summary" "tuic_tcp_stream: first_rx_events=1 first_rx_max_ms=20500 read_gap_events=1 read_gap_max_ms=15000 close_events=1 close_first_rx_max_ms=20500 close_gap_max_ms=15000 rx_bytes_max=109304 reads_max=3 zero_rx_closes=0"
   assert_contains "$summary" "attribution: tuic_stream_first_byte_slow+tuic_stream_read_gap+relay_remote_first_byte_slow+relay_remote_read_gap"
   assert_not_contains "$summary" "reverse_sender_backpressured"
+
+  cat > "$iperf_sample" <<'EOF_IPERF'
+Reverse mode, remote host 43.130.32.77 is sending
+[  5]   0.00-30.04  sec   111 MBytes  31.0 Mbits/sec    0             sender
+[  5]   0.00-30.00  sec   103 MBytes  28.7 Mbits/sec                  receiver
+EOF_IPERF
+  cat > "$log_sample" <<'EOF_LOG'
+🔎 tuic-open-tcp target=43.130.32.77:5201 conn=3 id=99
+📊 TUIC QUIC stats conn=3 id=99 rtt=8ms cwnd=247211 lost=0/35 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=33/9175B udp_rx=177/232816B dg_max=Some(1418) dg_space=1048576B
+🔎 tcp-relay-close handle=SocketHandle(1) direction=timer reason=half_closed_idle_timeout uplink_bytes=37 uplink_writes=1 remote_to_global_rx_bytes=343 remote_reads=6 remote_after_local_finish_bytes=0 remote_after_local_finish_reads=0 first_remote_read_ms=3 max_remote_read_gap_ms=30147 current_remote_read_gap_ms=0 global_rx_wait_max_us=0 global_rx_pressure_events=0 global_rx_queue_used_max=1 global_rx_queue_capacity=1024 local_write_wait_max_us=0 local_write_pressure_events=0
+🔎 tcp-relay-close handle=SocketHandle(2) direction=timer reason=remote_eof uplink_bytes=37 uplink_writes=1 remote_to_global_rx_bytes=110790062 remote_reads=9637 remote_after_local_finish_bytes=0 remote_after_local_finish_reads=0 first_remote_read_ms=3 max_remote_read_gap_ms=3763 current_remote_read_gap_ms=0 global_rx_wait_max_us=4 global_rx_pressure_events=0 global_rx_queue_used_max=1 global_rx_queue_capacity=1024 local_write_wait_max_us=0 local_write_pressure_events=0
+🔎 tuic-tcp-stream-read-gap target=43.130.32.77:5201 conn=3 id=99 stream=0 gap_ms=30147 read_bytes=32 reads=6 rx_bytes=343
+🔎 tuic-tcp-stream-close target=43.130.32.77:5201 conn=3 id=99 stream=0 first_rx_ms=3 max_read_gap_ms=30147 rx_bytes=343 reads=6
+🔎 tuic-tcp-stream-read-gap target=43.130.32.77:5201 conn=3 id=99 stream=4 gap_ms=3763 read_bytes=12220 reads=101 rx_bytes=1275382
+🔎 tuic-tcp-stream-close target=43.130.32.77:5201 conn=3 id=99 stream=4 first_rx_ms=3 max_read_gap_ms=3763 rx_bytes=110790062 reads=9637
+📊 TUIC QUIC stats conn=3 id=99 rtt=5ms cwnd=247289 lost=0/105 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=103/14703B udp_rx=535/734789B dg_max=Some(1418) dg_space=1048576B
+EOF_LOG
+  summary="$(summarize_metrics_window 0 "control-stream-gap-self-test" "$iperf_sample" "$log_sample")"
+  assert_contains "$summary" "relay_remote_timing: first_read_max_ms=3 max_read_gap_ms=30147 current_gap_max_ms=0 no_first_read_gap_max_ms=0 data_streams=1 data_first_read_max_ms=3 data_max_read_gap_ms=3763"
+  assert_contains "$summary" "tuic_tcp_stream: first_rx_events=0 first_rx_max_ms=0 read_gap_events=2 read_gap_max_ms=30147 close_events=2 close_first_rx_max_ms=3 close_gap_max_ms=30147 rx_bytes_max=110790062 reads_max=9637 zero_rx_closes=0 data_streams=1 data_first_rx_max_ms=3 data_read_gap_max_ms=3763 data_close_gap_max_ms=3763 data_rx_bytes_max=110790062"
+  assert_not_contains "$summary" "tuic_stream_read_gap"
+  assert_not_contains "$summary" "relay_remote_read_gap"
 
   cat > "$iperf_sample" <<'EOF_IPERF'
 Reverse mode, remote host 43.130.32.77 is sending
