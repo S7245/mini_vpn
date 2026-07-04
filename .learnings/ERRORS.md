@@ -1095,3 +1095,26 @@
   next patch/run must distinguish tx-buffer/receive-window capacity from local
   TCP/TUN drain cadence; do not keep changing close-drain, pool, sing-box,
   iperf3, TUN queue length, or egress pacing without new evidence.
+
+## 2026-07-05 — Knife14be repeated the missing tool-level TTY mistake
+
+- Symptom: the first Knife14be suite attempt used `ssh -tt`, but the local tool
+  command omitted `tty=true`. The run blocked at `sudo -v`, stdin was closed,
+  and the partial bundle
+  `/tmp/conn/mvpn_knife14be_tx4m_auto_usclient_suite_20260705_065544.tar.gz`
+  is invalid.
+- Correct behavior: any `.27` suite that may need sudo must start with both
+  remote `ssh -tt` and tool-level `tty=true`. If this is missed, kill the remote
+  suite process and discard the partial bundle.
+
+## 2026-07-05 — 4MiB receive-window A/B introduced clean TUN egress drops
+
+- Symptom: Knife14be clean reverse-first with `tx=4194304B` and auto
+  backpressure `high=4194304B low=1048576B` achieved only `20.3/18.9 Mbit/s`
+  and reported `tun_tx_dropped_delta=27530`.
+- Rejected interpretation: larger local TCP tx buffers are not the Knife14 fix.
+  The 4MiB run worsened clean throughput and moved the failure to TUN/qdisc
+  loss while QUIC remained clean.
+- Correct behavior: stop increasing tx buffers. The next repair must first
+  analyze and plan local TCP/TUN drain cadence or TUN-drop-aware feedback, then
+  add deterministic accounting/parser tests before another VPS run.

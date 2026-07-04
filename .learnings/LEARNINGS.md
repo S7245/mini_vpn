@@ -1829,3 +1829,22 @@ worth cleaning up separately.
   throughput remains burst/idle, test whether larger tx-window capacity improves
   useful receiver throughput before changing close-drain behavior again. If it
   only scales the terminal tail, pivot to local TCP/TUN drain cadence.
+
+## 2026-07-05 — Knife14be falsifies simple receive-window capacity
+
+- Stage: Knife14be 4MiB receive-window A/B.
+- Bundle:
+  `/tmp/mini_vpn/knife14be_tx4m_auto_20260705_065724/mvpn_knife14be_tx4m_auto_usclient_suite_20260705_065724.tar.gz`
+- Code under test: `5f1cbfb`.
+- Outcome: startup confirmed `tx=4194304B` and auto downlink backpressure
+  `high=4194304B low=1048576B`, but clean reverse-first dropped to
+  `20.3/18.9 Mbit/s`. Clean-window QUIC loss/congestion remained quiet, but
+  TUN egress drops appeared: `tun_tx_dropped_delta=27530`,
+  `runtime_tun_egress drop_delta_total=14946`.
+- Key lesson: increasing the local TCP tx buffer moved pressure from
+  visible 1MiB backpressure/terminal pending into TUN/qdisc loss. The root is
+  not simply receive-window capacity; the next useful branch is local TCP/TUN
+  drain cadence or TUN-drop-aware feedback.
+- Reusable rule: if a larger tx buffer worsens clean reverse and introduces TUN
+  egress drops while QUIC stays clean, stop increasing buffers. Treat the larger
+  buffer as evidence that burst smoothing / TUN feedback is missing.
