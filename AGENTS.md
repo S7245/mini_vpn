@@ -66,6 +66,61 @@ Small related issues found during review should be fixed together before a
 concentrated integration test, instead of running a full VPS suite after every
 tiny edit.
 
+## Current Agent Role And Knife14 Position
+
+The agent's role in this repository is data-plane engineering for the
+mini_vpn core: read evidence, design small testable stages, implement Rust and
+script changes, review risk, run or prepare VPS acceptance, and preserve
+learning memory. The agent is not owning GUI, mobile App, or backend control
+plane work in this route; those belong to separate product/control-plane
+sessions. Current work must stay tied to the `Rules.md` data-plane goals:
+transparent TCP, UDP/live-streaming, high concurrency, high throughput, long
+duration, and stable quality.
+
+For cold-start grounding, read this file, `Rules.md`, `HANDOFF.md`, `TODO.md`,
+latest `.learnings/LEARNINGS.md` / `.learnings/ERRORS.md`, and the relevant
+`docs/tech/2026-*.md` files. The older numbered `docs/tech/*.md` files are
+historical background; do not load all of them by default. For the current TCP
+throughput branch, prioritize the 2026 Knife14 documents, especially the
+US-client results, downlink/backpressure/lifecycle specs, and the latest
+results documents.
+
+Current Knife14 summary, as of 2026-07-04:
+
+- Stale TUIC TCP pool slot diagnosis is closed. The accepted fix was
+  `7c683b0` plus acceptance record `afb18f5`, with the key signal
+  `tuic-tcp-pool-reconnect conn=1 reason=stale_tcp_pool_slot` and no later
+  stale-slot timeout.
+- Knife14ar code commit `3baf476` made downlink egress pacing close-safe by
+  default: product/default egress immediate budget is no longer the rejected
+  `65536`, non-empty pending backlog forces immediate flush, and close logs
+  include `tun_flush_deferred`.
+- Knife14ar result commit `ba9225f` recorded the failed VPS acceptance. The
+  clean reverse-first window had healthy direct baselines, no clean-window QUIC
+  loss/congestion, `tun_tx_dropped_delta=0`, `tun_flush_deferred=0`,
+  `send_slice_zero=0`, `send_slice_errors=0`, and `tun_flush_failures=0`, but
+  reverse throughput was still low (`17.2/16.2 Mbit/s`) and later closed with
+  `dead_slot_reap ... pending=224765 ... tcp_state=Closed ... can_send=false`.
+- Therefore the next root is not iperf3, sing-box, stale pool slots, blunt
+  egress pacing, clean-window QUIC loss/congestion, TUN syscall failure, or
+  clean-window TUN qdisc drops. The remaining branch is mini_vpn local TCP
+  downlink lifecycle / receive-window / close-drain / terminal pending
+  accounting.
+
+Next stage bias:
+
+- Do not keep tuning the downlink egress pacer, TUN queue length, connection
+  pool, iperf3, or sing-box before resolving the lifecycle branch.
+- Knife14as should first write a design tree, spec, and TDD plan that
+  distinguishes "expected terminal pending after local close" from "premature
+  local close or receive-window behavior that caused low reverse throughput."
+- Add deterministic tests and explicit metrics/accounting for terminal pending
+  bytes, such as pending bytes reaped when `tcp_state=Closed` and
+  `can_send=false`, before asking for another expensive VPS throughput run.
+- If this branch does not produce a coherent causal explanation after focused
+  tests and one scoped acceptance run, re-evaluate the architecture instead of
+  continuing suffix-by-suffix tuning.
+
 ## Stage Learning Memory
 
 Use the `self-improving-agent` pattern for project-local memory:
