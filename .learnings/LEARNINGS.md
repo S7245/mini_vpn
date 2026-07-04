@@ -1,5 +1,29 @@
 # Learnings
 
+## 2026-07-04 - Knife14az shifts the failed reverse root before local downlink drain
+
+- Code commit: `f21e782`
+- Result doc:
+  `docs/tech/2026-07-04-knife14az-local-tcp-socket-policy-results.md`
+- Log bundle:
+  `/tmp/mini_vpn/mvpn_knife14az_tcp_policy_usclient_suite_20260704_224324.tar.gz`
+- Outcome: the local smoltcp socket policy patch passed local gates but failed
+  VPS acceptance. Clean reverse-first P1 regressed to `0.245/0.009 Mbit/s`,
+  and the suite skipped later windows because an active relay did not clear
+  within the quiet wait.
+- Key signal: clean summary showed `send_queue_max=1`, pending `0`, no
+  downlink backpressure edges, no terminal or close-time pending, no TUN drops,
+  and no QUIC loss/congestion. The attribution was
+  `reverse_sender_backpressured`, with only about `35 KiB` accepted from the
+  reverse data stream during the summary.
+- Baseline check: `.33 -> .77` direct forward/reverse remained healthy
+  (`231/232 Mbit/s` receiver), so the failure is not a simple exit-target path
+  bottleneck.
+- Reusable rule: when reverse-first fails with
+  `reverse_sender_backpressured` and mini_vpn receives only tiny downlink bytes,
+  stop tuning local tx-queue/pending/close-drain. Instrument TUIC TCP stream
+  first-byte latency and remote read gaps before the next behavior patch.
+
 ## 2026-07-04 - Knife14az locks local TCP socket policy at listener and rearm
 
 - Code commit: this Knife14az local policy stage commit.

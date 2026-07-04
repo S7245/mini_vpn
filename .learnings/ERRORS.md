@@ -1,5 +1,24 @@
 # Errors
 
+## 2026-07-04 - Knife14az reverse_sender_backpressured needs exit-target baseline and stream-gap evidence
+
+- Log bundle:
+  `/tmp/mini_vpn/mvpn_knife14az_tcp_policy_usclient_suite_20260704_224324.tar.gz`
+- Symptom: clean reverse-first P1 on commit `f21e782` produced only
+  `0.245/0.009 Mbit/s` while local downlink pressure, terminal pending, TUN
+  drops, and QUIC loss/congestion were all absent.
+- Rejected assumption: a tiny reverse receiver result after the local TCP socket
+  policy patch still implies local smoltcp tx-queue drain is the active limiter.
+  In this run `send_queue_max=1`, pending was `0`, and the parser attributed the
+  probe to `reverse_sender_backpressured`.
+- Follow-up check: `.33 -> .77` direct forward/reverse was healthy
+  (`231/232 Mbit/s` receiver), so the suite result was not explained by a
+  simple exit-target iperf path bottleneck.
+- Correct behavior: when `reverse_sender_backpressured` appears, collect or
+  enable exit-target preflight in the suite, then add behavior-neutral TUIC TCP
+  stream first-byte/read-gap diagnostics before changing lifecycle, pacing,
+  socket buffer, queue, or close/reap behavior again.
+
 ## 2026-07-04 - Knife14ay VPS acceptance failed but identified pre-terminal Closed edge
 
 - Stage: Knife14ay local TCP Closed transition diagnostics acceptance for
