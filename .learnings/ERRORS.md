@@ -1,5 +1,39 @@
 # Errors
 
+## 2026-07-04 — Knife14al cleanup regex killed the active suite shell
+
+- Failed bundle:
+  `/tmp/mini_vpn/mvpn_knife14al_samewindow_defaultqlen_usclient_suite_20260704_132521.tar.gz`
+- Symptom: the default-queue same-window diagnostic stopped during
+  `Stop Old Tunnel`, before any tunnel iperf connection reached `.77`.
+- Root cause: `pgrep/pkill -f '[m]ini_vpn.*client-tun'` matched the active
+  shell/SSH command line because it included the `/home/ubuntu/mini_vpn` working
+  path and the `knife14b-usclient-tunnel-suite.sh` script name. The cleanup
+  therefore killed the runner instead of only stale `mini_vpn client-tun`
+  processes.
+- Fix: commit `1ab58e3` matches `comm == mini_vpn` plus an independent
+  `client-tun` argv token, and adds `--self-test` false-positive coverage.
+- Future behavior: before adding `pkill -f` to a harness, write or run a
+  self-test with realistic SSH/sudo/script command lines. Prefer PID lists from
+  `ps` parsing over broad command-line regexes for destructive cleanup.
+
+## 2026-07-04 — Knife14al attribution missed inherited QUIC congestion
+
+- Log bundle:
+  `/tmp/mini_vpn/mvpn_knife14al_samewindow_defaultqlen2_usclient_suite_20260704_133130.tar.gz`
+- Symptom: the standard P1 reverse probe after a high-throughput forward probe
+  reported `attribution: no_pressure_signal` while throughput was only
+  11.5 Mbit/s sender and 10.7 Mbit/s receiver.
+- Important discriminator: the reverse window did not accumulate new QUIC
+  loss/congestion deltas, but it started with a damaged connection state:
+  `cwnd=5808`, `lost_bytes=500976100`, and `congestion_events=93571` inherited
+  from the preceding forward burst.
+- Correct behavior: do not interpret this post-forward reverse sample as a
+  clean no-pressure branch. Prefer reverse-first/fresh-connection samples for
+  directional diagnosis, or reset the TUIC connection before the comparison.
+- Future behavior: update low-RTT attribution to flag absolute low cwnd and
+  preexisting high loss/congestion counters, not only per-window deltas.
+
 ## 2026-07-04 — Knife14ak qlen=5000 sample hit reverse sender backpressure, not TUN drops
 
 - Log bundle:

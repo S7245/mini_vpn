@@ -1,5 +1,66 @@
 # Learnings
 
+## 2026-07-04 — Knife14al same-window run pins the current limiter to local downlink/TUN pressure
+
+Commit `1ab58e3` fixed the suite cleanup self-match bug, then `.27` reran the
+default-queue same-window diagnostic from `/home/ubuntu/mini_vpn/.env` with
+`MINI_VPN_TUIC_CC=bbr`, `MINI_VPN_TUIC_TCP_POOL=1`, reverse-first P1 enabled,
+and exit-to-target preflights required. Bundle:
+`/tmp/mini_vpn/mvpn_knife14al_samewindow_defaultqlen2_usclient_suite_20260704_133130.tar.gz`.
+
+The direct paths were healthy in the same run window: client-target reverse
+preflight was 269 Mbit/s receiver, exit-target forward was 279 Mbit/s receiver,
+and exit-target reverse was 295 Mbit/s receiver. Post-suite direct reverse
+checks from both `.27` and `.33` also stayed around the high-200 Mbit/s range.
+`.33` sing-box logs showed ordinary TUIC inbound/direct outbound opens for the
+target; there was no same-window service failure signal.
+
+The clean reverse-first tunnel probe collapsed to 13.7 Mbit/s sender and
+12.4 Mbit/s receiver while reporting `downlink_backpressure` pause/resume
+edges, `max_pending_bytes=2153280`, `tun_tx_dropped_delta=404`, and no QUIC
+loss/congestion or flow-control blocked deltas. This is no longer an iperf3,
+provider baseline, `.env`, stale TCP pool slot, or sing-box-health question. The
+current product branch is client-local downlink/TUN egress pressure: the remote
+iperf sender slows because TCP backpressure propagates from mini_vpn's local
+delivery path back through the TUIC stream.
+
+The standard forward P1 in the same session reached 204/191 Mbit/s but produced
+761 local-write-pressure events, `tun_tx_dropped_delta=9`, and heavy QUIC
+loss/congestion deltas. The following reverse P1 was therefore not a clean
+reverse sample: it inherited a low-cwnd/lossy QUIC state and ran at
+11.5/10.7 Mbit/s. Reusable rule: when diagnosing directional throughput, trust
+reverse-first or fresh-connection samples more than a reverse probe after a
+lossy forward burst, and teach attribution to flag preexisting low cwnd/large
+absolute loss counters instead of only per-window deltas.
+
+Next implementation branch: do not tune iperf3 or chase sing-box first. Design
+bounded/paced local downlink flushing and/or better TUN egress backpressure
+watermarks, with an attribution upgrade for inherited QUIC congestion state.
+
+## 2026-07-04 — Knife14al suite cleanup must match the executable, not the command line
+
+The first same-window default-queue diagnostic failed before tunnel probing:
+`/tmp/mini_vpn/mvpn_knife14al_samewindow_defaultqlen_usclient_suite_20260704_132521.tar.gz`.
+The old cleanup used `pgrep/pkill -f '[m]ini_vpn.*client-tun'`. When the suite
+was launched from `/home/ubuntu/mini_vpn`, the current shell command line
+contained both `mini_vpn` and `usclient-tunnel`, so the cleanup matched and
+killed its own SSH/shell process.
+
+Commit `1ab58e3` replaced the broad regex with a `ps` parser that matches only
+processes whose `comm` is `mini_vpn` and whose argv contains an independent
+`client-tun` token. The script now has `--self-test` cases for the real
+`mini_vpn ... client-tun` process and for false positives such as the suite
+script path, sudo/env wrapper commands before exec, `pgrep -af`, and helper
+probes. Verification passed locally and on `.27`:
+
+- `bash -n scripts/knife14b-usclient-tunnel-suite.sh`
+- `bash scripts/knife14b-usclient-tunnel-suite.sh --self-test`
+- `git diff --check`
+
+Reusable rule: destructive process cleanup in VPS harnesses must match the
+actual executable identity plus argv tokens. Never kill by a broad `-f` regex
+that can match the suite path or the SSH command used to launch it.
+
 ## 2026-07-04 — Knife14ak qlen A/B shifts the live branch back to reverse sender
 
 Commit `b31b234` added an opt-in `TUN_TX_QUEUE_LEN` suite knob and documented the
