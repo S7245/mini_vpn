@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-07-04 — Knife14as starts with terminal pending accounting, not behavior tuning
+
+Commit `575a448` added the first Knife14as slice: design/spec docs,
+behavior-neutral TCP close diagnostics, and parser accounting for terminal
+pending downlink bytes. All TCP close paths now log a pre-abort smoltcp socket
+snapshot, and `Closed && active=false && can_send=false` pending bytes are
+reported as `terminal_pending_reap_bytes`. The low-RTT probe summary now emits
+`terminal_pending_reap: events=... bytes=... max_bytes=...` and keeps backward
+compatibility with older logs that only had `pending`, `tcp_state=Closed`, and
+`can_send=false`.
+
+Outcome: local gates passed (`cargo test --lib client_tun`, full
+`cargo test --lib`, full `cargo test`, harness test, clippy with harness,
+low-RTT probe self-test, US-client suite self-test, shell syntax checks, and
+`git diff --check`). No data-plane send, pacing, close, backpressure, TUIC, or
+TUN behavior was intentionally changed in this slice.
+
+Reusable rule: when a close-boundary tail appears after low reverse throughput,
+do not immediately tune around the tail. First separate "terminal and no longer
+deliverable" from "still deliverable but prematurely closed or window-starved"
+with explicit accounting in both the process log and acceptance summary.
+
 ## 2026-07-04 — Knife14ar falsifies egress deferral as the remaining reverse root
 
 Commit `3baf476` was tested from `.27` with the close-safe egress pacing
