@@ -1,5 +1,37 @@
 # Learnings
 
+## 2026-07-04 — Knife14ao promotes 512/128 KiB downlink watermarks as defaults
+
+Knife14ao converted the no-code A/B result into a narrow product default
+change. Rust now defaults TCP downlink backpressure to 524288 bytes high and
+131072 bytes low, while keeping the existing env overrides and invalid-value
+repair behavior. The US-client suite defaults were aligned so a normal `.27`
+run exercises the product default instead of silently injecting the old
+2097120/524280 byte values.
+
+The TDD loop was intentionally small: first add
+`downlink_backpressure_defaults_match_knife14ao_ab`, watch it fail against the
+old `2097120` high watermark, then change the defaults and re-run the focused
+test. The suite self-test now also checks the script-level defaults and help
+text so future acceptance reports do not drift away from the Rust default.
+
+Verification:
+- `cargo test --lib downlink_backpressure_defaults_match_knife14ao_ab`
+- `cargo test --lib client_tun`
+- `bash -n scripts/knife14b-usclient-tunnel-suite.sh`
+- `bash scripts/knife14b-usclient-tunnel-suite.sh --self-test`
+- `bash -n scripts/knife14b-lowrtt-probe.sh`
+- `bash scripts/knife14b-lowrtt-probe.sh --self-test`
+- `git diff --check`
+
+Stage review found no blocking issue: the parser still accepts explicit
+deployment overrides, invalid high/low values still fall back or repair to a
+valid pair, and the data path remains lossless because the change only pauses
+remote reads sooner. Remaining risk is operational: the next VPS run must prove
+the default is active and reaches a clean reverse-first probe window. If TUIC
+startup/auth fails before app-level server logging again, treat that as a
+startup boundary issue, not a throughput regression.
+
 ## 2026-07-04 — Knife14ao A/B proves lower downlink watermarks are the next code lever
 
 The first no-code A/B for Knife14ao ran commit `246f8fa` from `.27` with

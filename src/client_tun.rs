@@ -32,8 +32,8 @@ const MAX_ESTABLISHED_UPLINK_BATCH: usize = 64;
 const _: () = assert!(MAX_ESTABLISHED_UPLINK_BATCH >= 1);
 const RELAY_WRITER_COALESCE_MAX_MESSAGES: usize = MAX_ESTABLISHED_UPLINK_BATCH;
 const RELAY_WRITER_COALESCE_MAX_BYTES: usize = TCP_SOCKET_BUFFER_SIZE;
-const DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES: usize = TCP_SOCKET_BUFFER_SIZE * 32;
-const DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES: usize = TCP_SOCKET_BUFFER_SIZE * 8;
+const DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES: usize = 512 * 1024;
+const DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES: usize = 128 * 1024;
 const _: () =
     assert!(DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES < DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES);
 const DEFAULT_DOWNLINK_FLUSH_MAX_BYTES: usize = 256 * 1024;
@@ -4612,6 +4612,13 @@ mod tests {
             !next_downlink_backpressure(true, DownlinkPendingStats::new(40, 40), cfg),
             "low watermark resumes global_rx"
         );
+    }
+
+    #[test]
+    fn downlink_backpressure_defaults_match_knife14ao_ab() {
+        let default = DownlinkBackpressureConfig::default();
+        assert_eq!(default.high_bytes, 512 * 1024);
+        assert_eq!(default.low_bytes, 128 * 1024);
     }
 
     #[test]

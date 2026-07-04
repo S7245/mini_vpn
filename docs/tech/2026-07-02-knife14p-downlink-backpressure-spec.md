@@ -61,6 +61,10 @@ real flow-control pressure.
 
 ## Defaults
 
+Superseded note, 2026-07-04: Knife14ao later promoted validated defaults of
+524288 bytes high and 131072 bytes low. See
+`docs/tech/2026-07-04-knife14ao-downlink-watermark-default-spec.md`.
+
 The default high watermark is `32 * TCP_SOCKET_BUFFER_SIZE` (about 2 MiB). The
 default low watermark is `8 * TCP_SOCKET_BUFFER_SIZE` (about 512 KiB).
 

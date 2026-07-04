@@ -7,6 +7,10 @@
 
 set -uo pipefail
 
+readonly DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES=524288
+readonly DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES=131072
+readonly DEFAULT_DOWNLINK_FLUSH_MAX_BYTES=262144
+
 extract_client_tun_pids_from_ps() {
   awk '
     {
@@ -33,7 +37,7 @@ client_tun_pids() {
 }
 
 suite_self_test() {
-  local sample expected actual
+  local sample expected actual help_text
 
   sample="$(cat <<'EOF'
 111 bash ssh ubuntu@43.172.75.27 cd /home/ubuntu/mini_vpn && bash scripts/knife14b-usclient-tunnel-suite.sh
@@ -53,6 +57,21 @@ EOF
     printf '%s\n' "$expected" >&2
     echo "actual:" >&2
     printf '%s\n' "$actual" >&2
+    return 1
+  fi
+
+  if [[ "$DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES:$DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES" != "524288:131072" ]]; then
+    echo "suite self-test failed: downlink backpressure defaults drifted" >&2
+    return 1
+  fi
+
+  help_text="$(usage)"
+  if ! grep -q "MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=$DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES" <<<"$help_text"; then
+    echo "suite self-test failed: high watermark help default drifted" >&2
+    return 1
+  fi
+  if ! grep -q "MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=$DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES" <<<"$help_text"; then
+    echo "suite self-test failed: low watermark help default drifted" >&2
     return 1
   fi
 
@@ -115,8 +134,8 @@ Optional env:
   MINI_VPN_TUIC_TCP_POOL=1  TUIC TCP connection pool; set >1 to isolate concurrent flow congestion
   MINI_VPN_TCP_RX_BUFFER_BYTES=1048576
   MINI_VPN_TCP_TX_BUFFER_BYTES=1048576
-  MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=2097120
-  MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=524280
+  MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=524288
+  MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=131072
   MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=262144
 
 Output:
@@ -875,9 +894,9 @@ export MINI_VPN_TUIC_ZERO_RTT="${MINI_VPN_TUIC_ZERO_RTT:-false}"
 export MINI_VPN_TUIC_TCP_POOL="${MINI_VPN_TUIC_TCP_POOL:-1}"
 export MINI_VPN_TCP_RX_BUFFER_BYTES="${MINI_VPN_TCP_RX_BUFFER_BYTES:-1048576}"
 export MINI_VPN_TCP_TX_BUFFER_BYTES="${MINI_VPN_TCP_TX_BUFFER_BYTES:-1048576}"
-export MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES="${MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES:-2097120}"
-export MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES="${MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES:-524280}"
-export MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES="${MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES:-262144}"
+export MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES="${MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES:-$DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES}"
+export MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES="${MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES:-$DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES}"
+export MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES="${MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES:-$DEFAULT_DOWNLINK_FLUSH_MAX_BYTES}"
 
 case "$MINI_VPN_TUIC_SERVER" in
   *:*)
