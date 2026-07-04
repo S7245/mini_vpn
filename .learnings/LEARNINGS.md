@@ -1,5 +1,32 @@
 # Learnings
 
+## 2026-07-04 — Knife14ar falsifies egress deferral as the remaining reverse root
+
+Commit `3baf476` was tested from `.27` with the close-safe egress pacing
+default. Bundle:
+`/tmp/mini_vpn/mvpn_knife14ar_close_safe_default_usclient_suite_20260704_164651.tar.gz`.
+The suite proved the code change took effect: default
+`MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=16777216`, startup logged that pending
+backlog forces immediate flush, and the clean reverse-first attribution had
+`tun_flush_deferred=0`.
+
+The acceptance still failed. Clean reverse-first P1 reached only
+`17.2/16.2 Mbit/s`, below the Knife14ap receiver result of `22.0 Mbit/s`, even
+though direct `.27 -> .77` and `.33 -> .77` reverse baselines were healthy
+(`271 Mbit/s` and `285 Mbit/s`). The clean reverse window had no new QUIC
+loss/congestion, no TUN drops, no `send_slice` zero/error, and no TUN flush
+failure. The only remaining primary attribution was local downlink
+backpressure.
+
+The decisive close-boundary signal moved: after the clean reverse window,
+`dead_slot_reap` still appeared with `pending=224765`,
+`pending_high=583624`, `tcp_state=Closed`, `active=false`,
+`can_send=false`, and `tun_flush_deferred=0`. Later polluted reverse windows
+also closed with roughly `524-534 KiB` pending and no deferral. Reusable rule:
+stop modifying the egress pacer for this symptom. The next stage must model
+local TCP close/drain semantics and explicitly account pending bytes at terminal
+reap boundaries before another throughput acceptance run.
+
 ## 2026-07-04 — Knife14ar makes downlink egress pacing close-safe by default
 
 Knife14aq proved that a small default remote-payload egress budget was useful

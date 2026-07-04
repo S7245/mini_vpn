@@ -1,5 +1,27 @@
 # Errors
 
+## 2026-07-04 — Knife14ar close-safe egress pacing failed VPS acceptance
+
+- Stage: Knife14ar close-safe downlink egress pacing acceptance for commit
+  `3baf476`.
+- Failed bundle:
+  `/tmp/mini_vpn/mvpn_knife14ar_close_safe_default_usclient_suite_20260704_164651.tar.gz`
+- Symptom: clean reverse-first P1 reached only `17.2/16.2 Mbit/s`, still below
+  the Knife14ap clean reverse-first receiver result of `22.0 Mbit/s`.
+- Important discriminator: the intended defaults and code path were active
+  (`MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=16777216`,
+  `tun_flush_deferred=0`). Direct reverse baselines were healthy
+  (`.27 -> .77` receiver `271 Mbit/s`, `.33 -> .77` receiver
+  `285 Mbit/s`). The clean reverse window had no QUIC loss/congestion delta, no
+  TUN drops, no `send_slice` zero/error, and no TUN flush syscall failure.
+- Close-boundary signal: after the clean reverse window, a relay still hit
+  `reason=dead_slot_reap` with `pending=224765`, `pending_high=583624`,
+  `tcp_state=Closed`, `active=false`, `can_send=false`, and
+  `tun_flush_deferred=0`.
+- Future behavior: do not keep tuning downlink egress pacing for this failure.
+  The next code plan must add deterministic close/reap tests and explicit
+  accounting for terminal pending bytes before another VPS throughput run.
+
 ## 2026-07-04 — Knife14aq egress pacing default failed VPS acceptance
 
 - Stage: Knife14aq default downlink egress pacing acceptance for commit
