@@ -24,6 +24,8 @@ env:
   UDP_LEN=1200             UDP datagram payload length
   IPERF_BUSY_RETRIES=3     retry an iperf command when the target server is busy
   IPERF_BUSY_WAIT_SECS=5   seconds to wait between busy retries
+  POST_IPERF_METRICS_SETTLE_SECS=2
+                            seconds to wait for close-tail metrics after iperf exits
   PROBE_ORDER=forward-first
                             forward-first | reverse-first | forward-only | reverse-only
   TUN_IF=tun0              TUN interface to sample for RX/TX dropped deltas
@@ -841,6 +843,24 @@ summarize_metrics_window() {
   '
 }
 
+wait_for_post_iperf_metrics_settle() {
+  local title="$1"
+  local settle_secs="${POST_IPERF_METRICS_SETTLE_SECS:-2}"
+
+  if ! is_uint "$settle_secs"; then
+    echo "invalid POST_IPERF_METRICS_SETTLE_SECS=$settle_secs (expected non-negative integer seconds)" >&2
+    exit 2
+  fi
+  if (( settle_secs == 0 )); then
+    return
+  fi
+
+  if [[ -n "${OUT:-}" ]]; then
+    echo "> waiting ${settle_secs}s for post-iperf close-tail metrics before summarizing: ${title}" | tee -a "$OUT"
+  fi
+  sleep "$settle_secs"
+}
+
 run_self_test() {
   local tmpdir iperf_sample log_sample tun_before tun_after summary
   local tun_if_before tun_rx_before tun_tx_before tun_if_after tun_rx_after tun_tx_after
@@ -994,6 +1014,30 @@ EOF_LOG
 
   cat > "$iperf_sample" <<'EOF_IPERF'
 Reverse mode, remote host 43.130.32.77 is sending
+[  5]   0.00-30.04  sec   642 MBytes   179 Mbits/sec    0             sender
+[  5]   0.00-30.00  sec   641 MBytes   179 Mbits/sec                  receiver
+EOF_IPERF
+  cat > "$log_sample" <<'EOF_LOG'
+🔎 tuic-open-tcp target=43.130.32.77:5201 conn=1 id=99
+EOF_LOG
+  local late_start_line
+  late_start_line="$(wc -l < "$log_sample" | tr -d ' ')"
+  (
+    sleep 0.2
+    cat >> "$log_sample" <<'EOF_LATE_LOG'
+🔎 tcp-handle-close handle=SocketHandle(3) direction=local reason=dead_slot_reap state=Relaying pending=16384 pending_high=524635 remote_to_global_rx_bytes=671088640 flush_attempts=17 no_send_capacity=3 send_slice_calls=14 send_slice_accepted=670564005 send_slice_zero=0 send_slice_errors=0 budget_limited_calls=2 send_slice_max_accepted=262144 tun_flush_tx_calls=13 tun_flush_tx_failures=0 tun_flush_deferred=0 close_pending_class=terminal_closed_no_send close_pending_bytes=16384 terminal_pending_reap_bytes=16384 tcp_state=Closed active=false can_send=false can_recv=false
+EOF_LATE_LOG
+  ) &
+  local late_writer_pid=$!
+  POST_IPERF_METRICS_SETTLE_SECS=1 wait_for_post_iperf_metrics_settle "late-close-tail-self-test"
+  wait "$late_writer_pid"
+  summary="$(summarize_metrics_window "$late_start_line" "late-close-tail-self-test" "$iperf_sample" "$log_sample")"
+  assert_contains "$summary" "terminal_pending_reap: events=1 bytes=16384 max_bytes=16384"
+  assert_contains "$summary" "pending_at_close: events=1 bytes=16384 max_bytes=16384 terminal_events=1 terminal_bytes=16384"
+  assert_contains "$summary" "attribution: terminal_pending_reap+pending_at_close"
+
+  cat > "$iperf_sample" <<'EOF_IPERF'
+Reverse mode, remote host 43.130.32.77 is sending
 [  5]   0.00-30.04  sec  3.00 MBytes   838 Kbits/sec    2             sender
 [  5]   0.00-30.00  sec  88.2 KBytes  24.1 Kbits/sec                  receiver
 EOF_IPERF
@@ -1047,6 +1091,7 @@ UDP_BW="${UDP_BW:-90M}"
 UDP_LEN="${UDP_LEN:-1200}"
 IPERF_BUSY_RETRIES="${IPERF_BUSY_RETRIES:-3}"
 IPERF_BUSY_WAIT_SECS="${IPERF_BUSY_WAIT_SECS:-5}"
+POST_IPERF_METRICS_SETTLE_SECS="${POST_IPERF_METRICS_SETTLE_SECS:-2}"
 PROBE_ORDER="${PROBE_ORDER:-forward-first}"
 OUT="${OUT:-/tmp/mvpn_knife14b_lowrtt_$(date +%Y%m%d_%H%M%S).md}"
 METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tuic-open-tcp|tuic-tcp-pool-reconnect|tcp-relay-live|tcp-relay-write-half-closed|tcp-relay-close|tcp-handle-close|tcp-local-write-pressure|tcp-global-rx-pressure|tcp-downlink-backpressure|tcp-downlink-flush|tcp-tun-egress'
@@ -1058,6 +1103,10 @@ case "$PROBE_ORDER" in
     exit 2
     ;;
 esac
+if ! is_uint "$POST_IPERF_METRICS_SETTLE_SECS"; then
+  echo "invalid POST_IPERF_METRICS_SETTLE_SECS=$POST_IPERF_METRICS_SETTLE_SECS (expected non-negative integer seconds)" >&2
+  exit 2
+fi
 
 append_cmd() {
   {
@@ -1227,6 +1276,7 @@ append_iperf_cmd() {
 
     break
   done
+  wait_for_post_iperf_metrics_settle "$metrics_title"
   tun_after="$(sample_tun_drops "$tun_if_before")"
   read -r tun_if_after tun_rx_after tun_tx_after <<< "$tun_after"
   append_metrics_since "$start_line" "$metrics_title"
@@ -1255,6 +1305,7 @@ append_iperf_cmd() {
   echo "- iperf_timeout: ${IPERF_TIMEOUT_SECS}s"
   echo "- iperf_busy_retries: ${IPERF_BUSY_RETRIES}"
   echo "- iperf_busy_wait_secs: ${IPERF_BUSY_WAIT_SECS}"
+  echo "- post_iperf_metrics_settle_secs: ${POST_IPERF_METRICS_SETTLE_SECS}"
   echo "- probe_order: ${PROBE_ORDER}"
   echo "- log: ${LOG}"
   echo

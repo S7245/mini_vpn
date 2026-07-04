@@ -848,3 +848,19 @@
   formatting unless the stage explicitly owns that cleanup. Prefer existing
   local style plus `cargo test`, clippy, script self-tests, shell syntax checks,
   and `git diff --check`.
+
+## 2026-07-04 — Knife14au per-probe summary missed a post-iperf close-tail
+
+- Log bundle: `/tmp/mini_vpn/mvpn_knife14au_pending_close_taxonomy_usclient_suite_20260704_193706.tar.gz`
+- Symptom: full reverse raw log contained `tcp-handle-close pending>0` with
+  `close_pending_class=terminal_closed_no_send`, but that probe's attribution
+  summary reported `pending_at_close=0`.
+- Root cause: `scripts/knife14b-lowrtt-probe.sh` sampled TUN counters and wrote
+  metrics/attribution immediately after `iperf3` exited. The close-tail log
+  arrived shortly afterward and only appeared in the final post-run metric tail.
+- Correct behavior: wait a short, bounded post-iperf settle window before
+  per-probe metrics and attribution summaries. Sample final TUN counters after
+  that window so tail flush/drop effects stay in the same probe.
+- Future debugging rule: if a raw log and a per-probe summary disagree, inspect
+  the report timing before changing Rust lifecycle, pacing, TUIC pool, iperf3,
+  or sing-box behavior.

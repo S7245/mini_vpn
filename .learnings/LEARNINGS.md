@@ -1491,3 +1491,19 @@ worth cleaning up separately.
   split pending tails by `terminal_closed_no_send`, `active_no_send`,
   send-capable, inactive no-send, and unknown before changing close-drain,
   pacing, TUN queue length, TUIC pool, iperf3, or sing-box.
+
+## 2026-07-04 — Knife14av per-probe summaries need a post-iperf settle window
+
+- Stage: Knife14av post-iperf close-tail reporting.
+- Outcome: Knife14au VPS acceptance showed reverse TCP throughput recovered
+  (`179/179`, `185/185`, and `183/181 Mbit/s`), but one full-reverse raw
+  `tcp-handle-close pending>0` line appeared after that probe's attribution
+  summary had already been written.
+- Key lesson: a final post-run metric tail is not enough for Knife14 branch
+  decisions. If close/reap logs arrive just after `iperf3` exits, the raw log
+  may contain the evidence while the per-probe `pending_at_close` attribution
+  remains zero.
+- Reusable rule: reverse/downlink acceptance probes must wait a short, bounded
+  post-iperf settle window before sampling final TUN counters and summarizing
+  metrics. Keep the window explicit in the report and configurable for quick
+  local debugging.
