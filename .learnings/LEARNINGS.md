@@ -1,5 +1,28 @@
 # Learnings
 
+## 2026-07-04 - Knife14ay closes the terminal-pending ambiguity
+
+- Code commit: `67a8c46`
+- Result doc:
+  `docs/tech/2026-07-04-knife14ay-local-tcp-closed-transition-results.md`
+- Log bundle:
+  `/tmp/mini_vpn/mvpn_knife14ay_tcp_lifecycle_usclient_suite_20260704_222042.tar.gz`
+- Outcome: the behavior-neutral lifecycle diagnostics worked. Clean
+  reverse-first P1 still failed (`9.15/8.18 Mbit/s`), but the new transition
+  line showed the reverse data socket moved from `Established` to `Closed` in
+  `dirty_relay` with `pending=0`, `terminal_candidate=false`, and about
+  `30.8 MiB` already accepted into smoltcp. The later `552440` pending bytes
+  were produced after that close edge when the remote relay delivered EOF.
+- Key signal: clean-window QUIC loss/congestion, TUN drops, TUN flush
+  failures, deferred TUN flush, `send_slice_zero`, and `send_slice_errors`
+  were all zero. The active limiter was local downlink tx-queue/receive-window
+  behavior: tx-queue backpressure paused/resumed remote reads while app-owned
+  pending stayed zero until the close tail.
+- Reusable rule: when lifecycle transition reports `terminal_candidate=false`
+  at `Established -> Closed` and terminal pending appears only afterward, stop
+  changing close-drain/reap policy. Focus the next patch on smoltcp local TCP
+  socket send policy and tx-queue drain rate.
+
 ## 2026-07-04 - Knife14ay makes local TCP Closed transitions observable
 
 - Code commit: this Knife14ay stage commit.

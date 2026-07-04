@@ -1,5 +1,27 @@
 # Errors
 
+## 2026-07-04 - Knife14ay VPS acceptance failed but identified pre-terminal Closed edge
+
+- Stage: Knife14ay local TCP Closed transition diagnostics acceptance for
+  commit `67a8c46`.
+- Failed bundle:
+  `/tmp/mini_vpn/mvpn_knife14ay_tcp_lifecycle_usclient_suite_20260704_222042.tar.gz`
+- Symptom: clean reverse-first P1 reached only `9.15/8.18 Mbit/s` while the
+  direct `.27 -> .77` reverse preflight receiver was about `276 Mbit/s`.
+- Important discriminator: the new lifecycle line showed
+  `prev_state=Established state=Closed source=dirty_relay pending=0
+  terminal_candidate=false`, followed by close-tail terminal pending
+  `552440` bytes. Terminal pending was therefore a post-Closed accounting
+  outcome, not the hidden pre-close loss point.
+- Rejected next moves: do not change close/reap behavior, stale pool, iperf3,
+  sing-box, TUN queue length, connection pool, or egress pacer for this clean
+  reverse-first failure without new evidence.
+- Future behavior: before the next behavior patch, confirm a plan that targets
+  local smoltcp TCP send policy and tx-queue/receive-window drain. The first
+  candidates are focused tests plus local-link socket policy evaluation
+  (`TCP_NODELAY` via `set_nagle_enabled(false)` and, if justified,
+  `set_ack_delay(None)`).
+
 ## 2026-07-04 - Broad cargo fmt check exposed pre-existing repo formatting drift
 
 - Stage: Knife14ay local regression.
