@@ -1,5 +1,33 @@
 # Errors
 
+## 2026-07-04 — `.27` suite needs a TTY when sudo timestamp is cold
+
+- Stage: Knife14an VPS acceptance.
+- Failed bundle:
+  `/tmp/conn/mvpn_knife14an_flush256_defaultqlen_usclient_suite_20260704_140940.tar.gz`
+- Symptom: the suite stopped at `sudo -v` with
+  "a terminal is required to read the password" before building or starting
+  `client-tun`.
+- Important discriminator: rerunning the same suite through `ssh -tt` and
+  entering the `.27` sudo password succeeded. The successful bundle was
+  `/tmp/conn/mvpn_knife14an_flush256_defaultqlen_tty_usclient_suite_20260704_141008.tar.gz`.
+- Future behavior: when `.27` sudo timestamp may be cold, use an interactive
+  TTY for the suite instead of non-TTY SSH. Do not put the sudo password into
+  scripts, repo files, reports, or learning memory.
+
+## 2026-07-04 — Use `.27` HTTPS origin or known_hosts before GitHub SSH pull
+
+- Stage: Knife14an VPS checkout sync.
+- Command failed on `.27`: one-shot `git pull --ff-only` from
+  `git@github.com:S7245/mini_vpn.git`.
+- Error: `Host key verification failed`.
+- Working fallback: `.27` already had
+  `origin=https://github.com/S7245/mini_vpn.git`, and
+  `git pull --ff-only origin codex/knife14d-downlink-reap-open` succeeded.
+- Future behavior: do not use GitHub SSH from `.27` until its known_hosts entry
+  is deliberately initialized. HTTPS origin is fine for fetch/pull; local Mac
+  still needs SSH for push.
+
 ## 2026-07-04 — Full `cargo fmt --check` reports broad pre-existing formatting drift
 
 - Stage: Knife14an local verification after adding the downlink flush budget.

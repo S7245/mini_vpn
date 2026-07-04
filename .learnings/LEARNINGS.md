@@ -1,5 +1,40 @@
 # Learnings
 
+## 2026-07-04 — Knife14an VPS run falsifies per-flush-only downlink pacing
+
+Commits `03f6bdc`, `739c8c0`, and `2261aed` were tested from `.27` with the
+default TUN qlen 500, `MINI_VPN_TUIC_CC=bbr`, `MINI_VPN_TUIC_TCP_POOL=1`,
+1MiB TCP socket buffers, and `MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=262144`.
+Bundle:
+`/tmp/mini_vpn/mvpn_knife14an_flush256_defaultqlen_tty_usclient_suite_20260704_141008.tar.gz`.
+
+The run confirms the implementation and harness wiring worked: the report and
+startup log both show the 262144-byte flush budget, `.27 -> .77` direct reverse
+was 263 Mbit/s receiver, `.33 -> .77` direct reverse was 283 Mbit/s receiver,
+and `tun0` stayed at the default qlen 500. No stale TUIC TCP pool reconnects
+appeared.
+
+The product hypothesis did not pass acceptance. The clean reverse-first P1 was
+24.7/23.5 Mbit/s and still attributed
+`local_tun_egress_drop+local_downlink_backpressure`, with two pause/resume
+cycles, `max_pending_bytes=2145742`, and `tun_tx_dropped_delta=594`. This is
+not a meaningful improvement over the previous post-restart/downlink-pressure
+branch, and the pending high-water stayed pinned near the 2MiB global
+backpressure high watermark.
+
+The standard forward P1 still reached 198/191 Mbit/s, but it produced
+648 local-write-pressure events plus heavy QUIC loss/congestion
+(`lost_bytes_delta=931106142`, `congestion_events_delta=134446`). The following
+reverse was correctly labeled `inherited_quic_congestion`, validating the
+Knife14am attribution fix. Later full-sweep samples were polluted by that
+inherited QUIC state and should not drive a product change.
+
+Reusable rule: bounding a single `send_slice` call is not enough when the
+global downlink watermarks still allow roughly 2MiB pending bursts. The next
+branch should not keep tuning the per-flush cap first; it should test lower
+downlink high/low watermarks or a stronger local-egress/backpressure signal,
+preferably as a no-code env A/B before changing defaults.
+
 ## 2026-07-04 — Knife14an bounds each downlink flush burst before VPS retest
 
 Commit `03f6bdc` added a configurable TCP downlink flush budget instead of
