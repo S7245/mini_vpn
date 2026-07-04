@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-07-04 - Knife14aw identifies smoltcp tx queue pressure as the missing feedback edge
+
+- Code commit: `ef7364c`
+- Log bundle:
+  `/tmp/mini_vpn/mvpn_knife14aw_send_window_globalrx_usclient_suite_20260704_204329.tar.gz`
+- Result doc:
+  `docs/tech/2026-07-04-knife14aw-send-window-globalrx-results.md`
+- Outcome: the behavior-neutral send-window/global_rx diagnostics worked, but
+  clean reverse-first P1 still failed at `16.4/15.0 Mbit/s`. Direct `.27` and
+  `.33` baselines to `.77` were about `196-198 Mbit/s`, so the public path was
+  not in the failed throughput band.
+- Key signal: `pending_total=0` while `send_queue_max=1048576`,
+  `send_capacity_min=max=1048576`, `global_rx_queue_used_max=258/1024`,
+  `send_slice` zero/error was zero, and clean-window QUIC loss/congestion was
+  zero. The close tail was explicitly terminal
+  (`tcp_state=Closed active=false may_send=false`) and accounted as
+  `terminal_pending_reap=524627`.
+- Reusable rule: when app-owned pending is empty but smoltcp tx queue is full,
+  `global_rx_paused` must treat the tx queue as downlink pressure. Otherwise the
+  report can show `pending_total=0` while local TCP/TUN egress is still the
+  limiter.
+
 ## 2026-07-04 - Knife14aw exposes send-window and relay queue state before changing behavior
 
 - Stage docs:

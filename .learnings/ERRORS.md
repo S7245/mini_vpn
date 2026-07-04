@@ -1,5 +1,25 @@
 # Errors
 
+## 2026-07-04 - Knife14aw diagnostics passed but reverse-first throughput stayed low
+
+- Stage: Knife14aw send-window/global_rx diagnostics acceptance for commit
+  `ef7364c`.
+- Failed bundle:
+  `/tmp/mini_vpn/mvpn_knife14aw_send_window_globalrx_usclient_suite_20260704_204329.tar.gz`
+- Symptom: clean reverse-first P1 reached only `16.4/15.0 Mbit/s`, while
+  post-suite direct baselines on `.27 <-> .77` and `.33 <-> .77` were about
+  `196-198 Mbit/s`.
+- Important discriminator: the new diagnostics showed `send_queue_max=1048576`
+  with `send_capacity_min=max=1048576`, `pending_total=0`,
+  `global_rx_queue_used_max=258/1024`, no clean-window QUIC loss/congestion,
+  and no `send_slice` zero/error. The low throughput is not explained by a
+  missing parser tail, relay channel saturation, or a shrunken smoltcp capacity.
+- Rejected next moves: do not return to stale pool, iperf3, sing-box, egress
+  pacer, TUN queue length, or close/reap tuning without new evidence.
+- Future behavior: make downlink backpressure aware of smoltcp tx queue
+  occupancy, because app-owned `downlink_pending` can be zero while the socket
+  tx queue is saturated and TUN egress drops.
+
 ## 2026-07-04 - Knife14av post-iperf reporting passed but VPS throughput failed
 
 - Stage: Knife14av post-iperf close-tail reporting acceptance for commit
