@@ -1896,3 +1896,18 @@ worth cleaning up separately.
   they are correlated with same-window local pressure. The next Knife14 patch
   should reduce ordinary `downlink_backpressure` and terminal pending directly,
   not only add later drop feedback.
+
+## 2026-07-05 — Knife14bg should test TUN ingress fairness before more tuning
+
+- Stage: Knife14bg grounding/spec for TUN RX drain cadence.
+- Outcome: code reading showed remote downlink bytes enter through
+  `global_rx.recv()`, while local TCP ACK/window-update packets enter only via
+  `device.wait_for_rx()`, one packet at a time. The 5ms timer polls smoltcp but
+  does not read new TUN packets. Under a constantly ready remote downlink
+  branch, this can delay local ACK/window processing until tx-queue backpressure
+  pauses remote reads.
+- Key lesson: a full smoltcp tx queue with clean QUIC and zero TUN flush
+  failures can be caused by ingress fairness, not just egress write capacity.
+- Reusable rule: before changing buffers again, add a bounded nonblocking TUN
+  RX drain path and diagnostics that prove whether local ACK/window updates are
+  being processed promptly during remote downlink pressure.
