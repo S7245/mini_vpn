@@ -1131,3 +1131,26 @@
   patch needs formatting, keep the local style or format only the precise
   touched hunk, then rely on `cargo test`, script self-tests, and
   `git diff --check`.
+
+## 2026-07-05 — Knife14bf initial VPS run failed at TUIC auth finish
+
+- Symptom: the first `.27` Knife14bf suite on `e661613` failed before data
+  plane acceptance with `tuic auth finish: sending stopped by peer: error 0`.
+- Follow-up: `.33` sing-box was active and client/server credential hashes
+  matched without exposing secrets. Restarting sing-box cleared the startup
+  failure; the rerun connected and produced a valid bundle.
+- Correct behavior: when TUIC startup fails with `auth finish: sending stopped
+  by peer` while service health and credential hashes match, restart sing-box
+  once and rerun before invalidating the client code. Do not record the failed
+  startup bundle as throughput evidence.
+
+## 2026-07-05 — .27 lacks GitHub deploy-key fetch access
+
+- Symptom: syncing `.27` directly from GitHub over SSH failed because the VPS
+  key was not accepted for the repository.
+- Workaround: created a local git bundle for the Mac commit range, copied it to
+  `.27`, then used `git fetch /tmp/... HEAD` plus `git merge --ff-only
+  FETCH_HEAD`.
+- Correct behavior: use the bundle sync path for `.27` until repository SSH
+  access is deliberately configured on that host. Do not keep retrying
+  interactive GitHub authentication from the VPS.

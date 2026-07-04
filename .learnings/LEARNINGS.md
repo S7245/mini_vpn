@@ -1874,3 +1874,25 @@ worth cleaning up separately.
   parser regexes first. Otherwise derived lines such as
   `tcp-tun-egress-feedback` can be accidentally counted as base
   `tcp-tun-egress` samples.
+
+## 2026-07-05 — Knife14bf feedback did not hit clean reverse-first pressure
+
+- Stage: Knife14bf VPS acceptance for TUN-drop-aware downlink feedback.
+- Bundle:
+  `/tmp/mini_vpn/knife14bf_tun_feedback_rerun_20260705_073541/mvpn_knife14bf_tun_feedback_rerun_usclient_suite_20260705_073541.tar.gz`
+- Code under test: `e661613`.
+- Outcome: after a sing-box restart cleared an initial TUIC startup failure,
+  clean reverse-first P1 still measured only `22.8/21.6 Mbit/s`. The clean
+  window had no QUIC loss/congestion and no TUN flush failures, but still had
+  ordinary downlink backpressure (`pause_edges=7`, `max_tx_queue_bytes=1048576`)
+  plus terminal pending/reap of `1108466B`.
+- Key lesson: the sysfs TUN-drop feedback gate is observable and can fire on
+  VPS, but it did not fire in the clean reverse-first window because the drop
+  delta was sampled when `dirty_handles=0` and `pending_total=0`. The primary
+  clean limiter remains local TCP/TUN drain cadence plus 1MiB tx-queue
+  backpressure/terminal pending, not stale pools, server path, larger receive
+  windows, or egress pacing.
+- Reusable rule: treat Linux TUN drop counters as lagging diagnostics unless
+  they are correlated with same-window local pressure. The next Knife14 patch
+  should reduce ordinary `downlink_backpressure` and terminal pending directly,
+  not only add later drop feedback.
