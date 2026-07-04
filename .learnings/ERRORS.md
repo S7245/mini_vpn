@@ -1,5 +1,25 @@
 # Errors
 
+## 2026-07-04 - Knife14av post-iperf reporting passed but VPS throughput failed
+
+- Stage: Knife14av post-iperf close-tail reporting acceptance for commit
+  `b7e10b1`.
+- Failed bundle:
+  `/tmp/mini_vpn/mvpn_knife14av_post_iperf_close_tail_usclient_suite_20260704_202011.tar.gz`
+- Symptom: reverse-first P1 reached only `11.4/10.1 Mbit/s`, and later reverse
+  windows stayed low (`18.1/17.0 Mbit/s`, `24.1/23.3 Mbit/s`).
+- Important discriminator: the parser fix worked. The clean reverse-first
+  `tcp-handle-close ... pending=69769 ... terminal_pending_reap_bytes=69769`
+  line appeared in the same probe summary as `terminal_pending_reap` and
+  `pending_at_close`.
+- Rejected next moves: do not treat this as a stale-pool, iperf3, sing-box,
+  egress-pacer, TUN queue, or clean-window QUIC loss/congestion issue without
+  new evidence.
+- Future behavior: add send-window and relay queue diagnostics before changing
+  close/reap behavior. `global_rx_pressure=0` and `no_send_capacity=N` are not
+  detailed enough to distinguish channel backlog, smoltcp tx-buffer fullness,
+  terminal `may_send=false`, or receive-window behavior.
+
 ## 2026-07-04 - Knife14at first VPS attempt missed local TUIC environment
 
 - Failed report:

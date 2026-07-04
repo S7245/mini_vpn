@@ -1,5 +1,50 @@
 # Learnings
 
+## 2026-07-04 - Knife14aw exposes send-window and relay queue state before changing behavior
+
+- Stage docs:
+  `docs/tech/2026-07-04-knife14aw-send-window-globalrx-spec.md`,
+  `docs/tech/2026-07-04-knife14aw-send-window-globalrx-plan.md`
+- Outcome: added behavior-neutral diagnostics for smoltcp downlink send-window
+  state and relay `global_rx` queue occupancy. `tcp-downlink-flush` now
+  reports `send_window_samples`, `send_capacity_min/max`, `send_queue_max`,
+  `recv_queue_max`, `may_send_false`, `may_recv_false`,
+  `no_send_streak_max`, and `no_send_pending_max`. Relay live/close lines now
+  report `global_rx_queue_used_max` and `global_rx_queue_capacity`, and close
+  logs include `may_send`, `may_recv`, `send_capacity`, `send_queue`, and
+  `recv_queue`.
+- Verification passed: focused Rust tests, `cargo test --lib client_tun`, low
+  RTT probe self-test, US-client suite self-test, shell syntax checks,
+  `cargo test`, `cargo test --features harness`,
+  `cargo clippy --all-targets --features harness -- -D warnings`, and
+  `git diff --check`.
+- Reusable rule: when a large bounded channel or socket buffer can hide queueing
+  without crossing a wait threshold, log occupancy/capacity directly. Wait
+  counters alone are not enough to distinguish "not blocked" from "buffered but
+  not yet blocked".
+
+## 2026-07-04 - Knife14av closes the reporting gap but not the reverse throughput gap
+
+- Code commit: `b7e10b1`
+- Log bundle:
+  `/tmp/mini_vpn/mvpn_knife14av_post_iperf_close_tail_usclient_suite_20260704_202011.tar.gz`
+- Result doc:
+  `docs/tech/2026-07-04-knife14av-post-iperf-close-tail-results.md`
+- Outcome: the post-iperf settle window worked. The clean reverse-first raw
+  `tcp-handle-close pending>0` line was included in the per-probe
+  `terminal_pending_reap` and `pending_at_close` summaries.
+- Throughput still failed: reverse-first P1 was `11.4/10.1 Mbit/s`, with no
+  clean-window QUIC loss/congestion, no local write pressure, no
+  `send_slice` zero/error, no TUN flush failure, and no immediate flush
+  deferral.
+- Remaining blind spot: `global_rx_pressure=0` only means the relay task did
+  not wait beyond the pressure threshold; it does not prove the channel had no
+  backlog. `no_send_capacity` also lacks `send_capacity`, `send_queue`,
+  `recv_queue`, `may_send`, and no-send streak detail.
+- Reusable rule: before another close/reap or pacing change, add
+  behavior-neutral smoltcp send-window and relay queue occupancy diagnostics so
+  a low reverse run can show where bytes are waiting before terminal close.
+
 ## 2026-07-04 - Knife14at makes TUN egress drops runtime-observable, but not sufficient root cause
 
 - Code commit: `e8a7c41`

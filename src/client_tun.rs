@@ -202,6 +202,49 @@ struct TcpDownlinkDiag {
     tun_flush_tx_failures: u64,
     /// Immediate remote-payload TUN flushes deferred to the timer egress path.
     tun_flush_deferred: u64,
+    /// Number of smoltcp socket window snapshots observed while flushing downlink.
+    send_window_samples: u64,
+    /// Minimum observed smoltcp tx-buffer capacity.
+    send_capacity_min: usize,
+    /// Maximum observed smoltcp tx-buffer capacity.
+    send_capacity_max: usize,
+    /// Maximum observed queued bytes in smoltcp tx buffer.
+    send_queue_max: usize,
+    /// Maximum observed queued bytes in smoltcp rx buffer.
+    recv_queue_max: usize,
+    /// Times the socket state could no longer send at all.
+    may_send_false: u64,
+    /// Times the socket state could no longer receive from the local app.
+    may_recv_false: u64,
+    /// Current consecutive `can_send=false` streak across flush attempts.
+    no_send_capacity_streak_current: u64,
+    /// Maximum consecutive `can_send=false` streak across flush attempts.
+    no_send_capacity_streak_max: u64,
+    /// Largest pending backlog seen while `can_send=false`.
+    no_send_capacity_pending_max: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpSendWindowSnapshot {
+    can_send: bool,
+    may_send: bool,
+    may_recv: bool,
+    send_capacity: usize,
+    send_queue: usize,
+    recv_queue: usize,
+}
+
+impl TcpSendWindowSnapshot {
+    fn from_socket(socket: &TcpSocket<'_>) -> Self {
+        Self {
+            can_send: socket.can_send(),
+            may_send: socket.may_send(),
+            may_recv: socket.may_recv(),
+            send_capacity: socket.send_capacity(),
+            send_queue: socket.send_queue(),
+            recv_queue: socket.recv_queue(),
+        }
+    }
 }
 
 impl TcpDownlinkDiag {
@@ -225,6 +268,35 @@ impl TcpDownlinkDiag {
 
     fn note_no_send_capacity(&mut self, pending_current: usize) {
         self.send_slice_no_capacity += 1;
+        self.note_pending(pending_current);
+    }
+
+    fn note_send_window(&mut self, snapshot: TcpSendWindowSnapshot, pending_current: usize) {
+        self.send_window_samples += 1;
+        if self.send_window_samples == 1 {
+            self.send_capacity_min = snapshot.send_capacity;
+        } else {
+            self.send_capacity_min = self.send_capacity_min.min(snapshot.send_capacity);
+        }
+        self.send_capacity_max = self.send_capacity_max.max(snapshot.send_capacity);
+        self.send_queue_max = self.send_queue_max.max(snapshot.send_queue);
+        self.recv_queue_max = self.recv_queue_max.max(snapshot.recv_queue);
+        if !snapshot.may_send {
+            self.may_send_false += 1;
+        }
+        if !snapshot.may_recv {
+            self.may_recv_false += 1;
+        }
+        if snapshot.can_send {
+            self.no_send_capacity_streak_current = 0;
+        } else {
+            self.no_send_capacity_streak_current += 1;
+            self.no_send_capacity_streak_max = self
+                .no_send_capacity_streak_max
+                .max(self.no_send_capacity_streak_current);
+            self.no_send_capacity_pending_max =
+                self.no_send_capacity_pending_max.max(pending_current);
+        }
         self.note_pending(pending_current);
     }
 
@@ -343,6 +415,10 @@ struct RelayTaskDiag {
     global_rx_wait_max_micros: u128,
     /// Count of remote payload sends whose wait crossed the diagnostic threshold.
     global_rx_pressure_events: u64,
+    /// Highest observed used slots in the relay -> main-loop channel.
+    global_rx_queue_used_max: usize,
+    /// Bounded channel capacity used by the relay -> main-loop channel.
+    global_rx_queue_capacity: usize,
     /// Highest observed wait for a local-to-remote writer batch.
     local_write_wait_max_micros: u128,
     /// Count of local writer batches whose wait crossed the diagnostic threshold.
@@ -381,6 +457,11 @@ impl RelayTaskDiag {
         }
     }
 
+    fn note_global_rx_queue(&mut self, used: usize, max_capacity: usize) {
+        self.global_rx_queue_used_max = self.global_rx_queue_used_max.max(used);
+        self.global_rx_queue_capacity = self.global_rx_queue_capacity.max(max_capacity);
+    }
+
     fn note_local_write_wait(
         &mut self,
         elapsed: std::time::Duration,
@@ -392,6 +473,15 @@ impl RelayTaskDiag {
             self.local_write_pressure_events += 1;
         }
     }
+}
+
+fn note_global_rx_channel_occupancy<T>(
+    diag: &mut RelayTaskDiag,
+    tx: &mpsc::Sender<T>,
+) {
+    let max_capacity = tx.max_capacity();
+    let used = max_capacity.saturating_sub(tx.capacity());
+    diag.note_global_rx_queue(used, max_capacity);
 }
 
 fn format_relay_live_diag(
@@ -407,6 +497,7 @@ fn format_relay_live_diag(
          uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} \
          remote_after_local_finish_bytes={} remote_after_local_finish_reads={} \
          global_rx_wait_max_us={} global_rx_pressure_events={} \
+         global_rx_queue_used_max={} global_rx_queue_capacity={} \
          local_write_wait_max_us={} local_write_pressure_events={}",
         diag.uplink_bytes,
         diag.local_writes,
@@ -416,6 +507,8 @@ fn format_relay_live_diag(
         diag.remote_after_local_finish_reads,
         diag.global_rx_wait_max_micros,
         diag.global_rx_pressure_events,
+        diag.global_rx_queue_used_max,
+        diag.global_rx_queue_capacity,
         diag.local_write_wait_max_micros,
         diag.local_write_pressure_events
     )
@@ -428,7 +521,7 @@ fn format_relay_close_diag(
     diag: &RelayTaskDiag,
 ) -> String {
     format!(
-        "🔎 tcp-relay-close handle={:?} direction={} reason={} uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} remote_after_local_finish_bytes={} remote_after_local_finish_reads={} global_rx_wait_max_us={} global_rx_pressure_events={} local_write_wait_max_us={} local_write_pressure_events={}",
+        "🔎 tcp-relay-close handle={:?} direction={} reason={} uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} remote_after_local_finish_bytes={} remote_after_local_finish_reads={} global_rx_wait_max_us={} global_rx_pressure_events={} global_rx_queue_used_max={} global_rx_queue_capacity={} local_write_wait_max_us={} local_write_pressure_events={}",
         handle,
         close_direction,
         close_reason,
@@ -440,6 +533,8 @@ fn format_relay_close_diag(
         diag.remote_after_local_finish_reads,
         diag.global_rx_wait_max_micros,
         diag.global_rx_pressure_events,
+        diag.global_rx_queue_used_max,
+        diag.global_rx_queue_capacity,
         diag.local_write_wait_max_micros,
         diag.local_write_pressure_events
     )
@@ -520,6 +615,11 @@ struct SocketCloseSnapshot {
     active: bool,
     can_send: bool,
     can_recv: bool,
+    may_send: bool,
+    may_recv: bool,
+    send_capacity: usize,
+    send_queue: usize,
+    recv_queue: usize,
 }
 
 impl SocketCloseSnapshot {
@@ -529,6 +629,11 @@ impl SocketCloseSnapshot {
             active: socket.is_active(),
             can_send: socket.can_send(),
             can_recv: socket.can_recv(),
+            may_send: socket.may_send(),
+            may_recv: socket.may_recv(),
+            send_capacity: socket.send_capacity(),
+            send_queue: socket.send_queue(),
+            recv_queue: socket.recv_queue(),
         }
     }
 }
@@ -659,7 +764,10 @@ fn flush_downlink(
     }
     ctx.downlink_diag
         .note_flush_attempt(ctx.downlink_pending.len(), max_bytes_per_flush);
-    if !tcp_socket.can_send() {
+    let send_window = TcpSendWindowSnapshot::from_socket(tcp_socket);
+    ctx.downlink_diag
+        .note_send_window(send_window, ctx.downlink_pending.len());
+    if !send_window.can_send {
         ctx.downlink_diag
             .note_no_send_capacity(ctx.downlink_pending.len());
         return 0;
@@ -1026,6 +1134,15 @@ struct TcpDownlinkAggregate {
     tun_flush_tx_calls: u64,
     tun_flush_tx_failures: u64,
     tun_flush_deferred: u64,
+    send_window_samples: u64,
+    send_capacity_min: usize,
+    send_capacity_max: usize,
+    send_queue_max: usize,
+    recv_queue_max: usize,
+    may_send_false: u64,
+    may_recv_false: u64,
+    no_send_capacity_streak_max: u64,
+    no_send_capacity_pending_max: usize,
 }
 
 fn tcp_downlink_aggregate<'a>(
@@ -1074,6 +1191,39 @@ fn tcp_downlink_aggregate<'a>(
         aggregate.tun_flush_deferred = aggregate
             .tun_flush_deferred
             .saturating_add(ctx.downlink_diag.tun_flush_deferred);
+        if ctx.downlink_diag.send_window_samples > 0 {
+            if aggregate.send_window_samples == 0 {
+                aggregate.send_capacity_min = ctx.downlink_diag.send_capacity_min;
+            } else {
+                aggregate.send_capacity_min = aggregate
+                    .send_capacity_min
+                    .min(ctx.downlink_diag.send_capacity_min);
+            }
+            aggregate.send_capacity_max = aggregate
+                .send_capacity_max
+                .max(ctx.downlink_diag.send_capacity_max);
+        }
+        aggregate.send_window_samples = aggregate
+            .send_window_samples
+            .saturating_add(ctx.downlink_diag.send_window_samples);
+        aggregate.send_queue_max = aggregate
+            .send_queue_max
+            .max(ctx.downlink_diag.send_queue_max);
+        aggregate.recv_queue_max = aggregate
+            .recv_queue_max
+            .max(ctx.downlink_diag.recv_queue_max);
+        aggregate.may_send_false = aggregate
+            .may_send_false
+            .saturating_add(ctx.downlink_diag.may_send_false);
+        aggregate.may_recv_false = aggregate
+            .may_recv_false
+            .saturating_add(ctx.downlink_diag.may_recv_false);
+        aggregate.no_send_capacity_streak_max = aggregate
+            .no_send_capacity_streak_max
+            .max(ctx.downlink_diag.no_send_capacity_streak_max);
+        aggregate.no_send_capacity_pending_max = aggregate
+            .no_send_capacity_pending_max
+            .max(ctx.downlink_diag.no_send_capacity_pending_max);
     }
     aggregate
 }
@@ -1083,13 +1233,22 @@ fn format_tcp_downlink_flush_diag(
     dirty_handles: usize,
 ) -> String {
     format!(
-        "🔎 tcp-downlink-flush pending_total={} pending_max={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} dirty_handles={}",
+        "🔎 tcp-downlink-flush pending_total={} pending_max={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} dirty_handles={}",
         aggregate.pending_total,
         aggregate.pending_max,
         aggregate.pending_high,
         aggregate.remote_to_global_rx_bytes,
         aggregate.flush_attempts,
         aggregate.send_slice_no_capacity,
+        aggregate.send_window_samples,
+        aggregate.send_capacity_min,
+        aggregate.send_capacity_max,
+        aggregate.send_queue_max,
+        aggregate.recv_queue_max,
+        aggregate.may_send_false,
+        aggregate.may_recv_false,
+        aggregate.no_send_capacity_streak_max,
+        aggregate.no_send_capacity_pending_max,
         aggregate.send_slice_calls,
         aggregate.send_slice_accepted_bytes,
         aggregate.send_slice_zero,
@@ -2512,7 +2671,7 @@ fn rearm_socket_with_reason_and_snapshot(
     if let Some(snapshot) = close_snapshot {
         let close_pending = close_pending_accounting(ctx, snapshot);
         tcp_diag_log!(
-            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes={} tcp_state={:?} active={} can_send={} can_recv={}",
+            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes={} tcp_state={:?} active={} can_send={} can_recv={} may_send={} may_recv={} send_capacity={} send_queue={} recv_queue={}",
             handle,
             close_direction,
             close_reason,
@@ -2522,6 +2681,15 @@ fn rearm_socket_with_reason_and_snapshot(
             ctx.downlink_diag.remote_to_global_rx_bytes,
             ctx.downlink_diag.flush_attempts,
             ctx.downlink_diag.send_slice_no_capacity,
+            ctx.downlink_diag.send_window_samples,
+            ctx.downlink_diag.send_capacity_min,
+            ctx.downlink_diag.send_capacity_max,
+            ctx.downlink_diag.send_queue_max,
+            ctx.downlink_diag.recv_queue_max,
+            ctx.downlink_diag.may_send_false,
+            ctx.downlink_diag.may_recv_false,
+            ctx.downlink_diag.no_send_capacity_streak_max,
+            ctx.downlink_diag.no_send_capacity_pending_max,
             ctx.downlink_diag.send_slice_calls,
             ctx.downlink_diag.send_slice_accepted_bytes,
             ctx.downlink_diag.send_slice_zero,
@@ -2537,7 +2705,12 @@ fn rearm_socket_with_reason_and_snapshot(
             snapshot.tcp_state,
             snapshot.active,
             snapshot.can_send,
-            snapshot.can_recv
+            snapshot.can_recv,
+            snapshot.may_send,
+            snapshot.may_recv,
+            snapshot.send_capacity,
+            snapshot.send_queue,
+            snapshot.recv_queue
         );
         rearm_socket(socket, ctx, fake_pool, now_secs);
         return;
@@ -2550,7 +2723,7 @@ fn rearm_socket_with_reason_and_snapshot(
         ClosePendingClass::Unknown
     };
     tcp_diag_log!(
-        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes=0",
+        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes=0",
         handle,
         close_direction,
         close_reason,
@@ -2560,6 +2733,15 @@ fn rearm_socket_with_reason_and_snapshot(
         ctx.downlink_diag.remote_to_global_rx_bytes,
         ctx.downlink_diag.flush_attempts,
         ctx.downlink_diag.send_slice_no_capacity,
+        ctx.downlink_diag.send_window_samples,
+        ctx.downlink_diag.send_capacity_min,
+        ctx.downlink_diag.send_capacity_max,
+        ctx.downlink_diag.send_queue_max,
+        ctx.downlink_diag.recv_queue_max,
+        ctx.downlink_diag.may_send_false,
+        ctx.downlink_diag.may_recv_false,
+        ctx.downlink_diag.no_send_capacity_streak_max,
+        ctx.downlink_diag.no_send_capacity_pending_max,
         ctx.downlink_diag.send_slice_calls,
         ctx.downlink_diag.send_slice_accepted_bytes,
         ctx.downlink_diag.send_slice_zero,
@@ -3231,11 +3413,13 @@ async fn run_relay(
                     Ok(n) => {
                         diag.note_remote_read(n);
                         let data = buf[..n].to_vec();
+                        note_global_rx_channel_occupancy(&mut diag, &back_tx);
                         let wait_started = std::time::Instant::now();
                         let send_result = back_tx
                             .send((handle, RelayEvent::Data { epoch, bytes: data }))
                             .await;
                         let waited = wait_started.elapsed();
+                        note_global_rx_channel_occupancy(&mut diag, &back_tx);
                         diag.note_global_rx_wait(waited, global_rx_pressure_threshold);
                         if waited >= global_rx_pressure_threshold {
                             tcp_diag_log!(
@@ -4496,6 +4680,11 @@ mod tests {
             active: false,
             can_send: false,
             can_recv: false,
+            may_send: false,
+            may_recv: false,
+            send_capacity: 1_048_576,
+            send_queue: 0,
+            recv_queue: 0,
         };
         let accounting = close_pending_accounting(&ctx, terminal);
         assert_eq!(accounting.class, ClosePendingClass::TerminalClosedNoSend);
@@ -4506,6 +4695,9 @@ mod tests {
             tcp_state: TcpState::Established,
             active: true,
             can_send: false,
+            may_send: true,
+            may_recv: true,
+            send_queue: 1_048_576,
             ..terminal
         };
         let accounting = close_pending_accounting(&ctx, active_no_send);
@@ -4535,6 +4727,11 @@ mod tests {
             active: false,
             can_send: false,
             can_recv: false,
+            may_send: true,
+            may_recv: false,
+            send_capacity: 1_048_576,
+            send_queue: 1_048_576,
+            recv_queue: 0,
         };
         let accounting = close_pending_accounting(&ctx, inactive_no_send);
         assert_eq!(accounting.class, ClosePendingClass::InactiveNoSend);
@@ -5113,6 +5310,17 @@ mod tests {
         a.downlink_pending = vec![0; 10];
         a.downlink_diag.note_remote_payload(100, 100);
         a.downlink_diag.note_flush_attempt(100, 64);
+        a.downlink_diag.note_send_window(
+            TcpSendWindowSnapshot {
+                can_send: true,
+                may_send: true,
+                may_recv: true,
+                send_capacity: 1_048_576,
+                send_queue: 1_048_576,
+                recv_queue: 4096,
+            },
+            100,
+        );
         a.downlink_diag.note_send_slice_ok(64, 36);
         a.downlink_diag.note_tun_flush(true);
         a.downlink_diag.note_tun_flush_deferred();
@@ -5121,6 +5329,17 @@ mod tests {
         b.downlink_pending = vec![0; 25];
         b.downlink_diag.note_remote_payload(200, 200);
         b.downlink_diag.note_flush_attempt(200, 64);
+        b.downlink_diag.note_send_window(
+            TcpSendWindowSnapshot {
+                can_send: false,
+                may_send: false,
+                may_recv: false,
+                send_capacity: 0,
+                send_queue: 0,
+                recv_queue: 0,
+            },
+            200,
+        );
         b.downlink_diag.note_no_send_capacity(200);
         b.downlink_diag.note_tun_flush(false);
 
@@ -5138,6 +5357,15 @@ mod tests {
         assert!(line.contains("send_slice_accepted=64"));
         assert!(line.contains("budget_limited_calls=2"));
         assert!(line.contains("send_slice_max_accepted=64"));
+        assert!(line.contains("send_window_samples=2"));
+        assert!(line.contains("send_capacity_min=0"));
+        assert!(line.contains("send_capacity_max=1048576"));
+        assert!(line.contains("send_queue_max=1048576"));
+        assert!(line.contains("recv_queue_max=4096"));
+        assert!(line.contains("may_send_false=1"));
+        assert!(line.contains("may_recv_false=1"));
+        assert!(line.contains("no_send_capacity_streak_max=1"));
+        assert!(line.contains("no_send_capacity_pending_max=200"));
         assert!(line.contains("tun_flush_tx_calls=2"));
         assert!(line.contains("tun_flush_tx_failures=1"));
         assert!(line.contains("tun_flush_deferred=1"));
@@ -5514,6 +5742,8 @@ mod tests {
             std::time::Duration::from_micros(5),
             std::time::Duration::from_micros(10),
         );
+        diag.note_global_rx_queue(7, 1024);
+        diag.note_global_rx_queue(3, 1024);
         diag.note_local_write_wait(
             std::time::Duration::from_micros(30),
             std::time::Duration::from_micros(10),
@@ -5530,6 +5760,8 @@ mod tests {
         assert_eq!(diag.remote_after_local_finish_reads, 1);
         assert_eq!(diag.global_rx_wait_max_micros, 25);
         assert_eq!(diag.global_rx_pressure_events, 1);
+        assert_eq!(diag.global_rx_queue_used_max, 7);
+        assert_eq!(diag.global_rx_queue_capacity, 1024);
         assert_eq!(diag.local_write_wait_max_micros, 30);
         assert_eq!(diag.local_write_pressure_events, 1);
     }
@@ -5545,6 +5777,7 @@ mod tests {
         diag.note_uplink_write(64);
         diag.note_local_finish();
         diag.note_remote_read(128);
+        diag.note_global_rx_queue(5, 1024);
 
         let line = format_relay_live_diag(handle, 7, true, true, &diag);
 
@@ -5560,6 +5793,8 @@ mod tests {
         assert!(line.contains("remote_reads=1"), "{line}");
         assert!(line.contains("remote_after_local_finish_bytes=128"), "{line}");
         assert!(line.contains("remote_after_local_finish_reads=1"), "{line}");
+        assert!(line.contains("global_rx_queue_used_max=5"), "{line}");
+        assert!(line.contains("global_rx_queue_capacity=1024"), "{line}");
     }
 
     #[test]
@@ -5573,6 +5808,7 @@ mod tests {
         diag.note_uplink_write(37);
         diag.note_local_finish();
         diag.note_remote_read(43_772);
+        diag.note_global_rx_queue(9, 1024);
 
         let line = format_relay_close_diag(handle, "timer", "half_closed_idle_timeout", &diag);
 
@@ -5581,6 +5817,8 @@ mod tests {
         assert!(line.contains("reason=half_closed_idle_timeout"), "{line}");
         assert!(line.contains("remote_after_local_finish_bytes=43772"), "{line}");
         assert!(line.contains("remote_after_local_finish_reads=1"), "{line}");
+        assert!(line.contains("global_rx_queue_used_max=9"), "{line}");
+        assert!(line.contains("global_rx_queue_capacity=1024"), "{line}");
     }
 
     /// 刀13 ①：MINI_VPN_TRACE 解析——`1`/`true`（去空白、不区分大小写）开；其它/缺省关
