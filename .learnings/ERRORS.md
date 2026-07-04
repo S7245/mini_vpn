@@ -1,5 +1,66 @@
 # Errors
 
+## 2026-07-04 — Knife14aj initial plan mistook Closed pending for drainable pressure
+
+- Initial design branch: add a progress-sensitive grace for inactive pending
+  even when `can_send=false`, based on the post-restart close tail
+  `dead_slot_reap ... pending=2111595 ... tcp_state=Closed active=false
+  can_send=false`.
+- Re-grounding result: in smoltcp `0.10.0`, `can_send()` is false for `Closed`
+  because `may_send()` only permits `Established` and `CloseWait`. A grace in
+  this branch cannot flush userspace pending into the local TCP socket.
+- Correct behavior: do not weaken knife14u's immediate reap for
+  `Closed && !can_send` pending. Attribute earlier pressure instead, especially
+  TUN/qdisc TX drops that were visible in the VPS report but absent from the
+  per-probe summary.
+- Command pitfall encountered: `cargo test` accepts one filter; running
+  `cargo test --lib test_a test_b` fails with "unexpected argument". Use a
+  shared substring such as `cargo test --lib reap_predicate` for grouped tests.
+
+## 2026-07-04 — Knife14ai post-restart reverse P1 still reaps closed relay with pending downlink
+
+- Log bundle:
+  `/tmp/mini_vpn/mvpn_knife14ai_pool4_after_singbox_restart_usclient_suite_20260704_091224.tar.gz`
+- Tested commit: `34d5cb7`
+- Precondition: pool=4 startup-only smoke failed before restarting `.33`
+  sing-box, then passed immediately after `.33` restart at 09:11:13 CST.
+- Symptom: reverse-first P1 completed, but throughput remained bursty and low
+  relative to direct baselines: iperf sender 24.8 Mbit/s, receiver 23.6 Mbit/s.
+- Important discriminator: attribution reported `local_downlink_backpressure`
+  with two pause/resume edges and max pending 2,149,256 bytes. QUIC had no
+  loss/congestion/blocked deltas; local write and global_rx pressure counters
+  were zero.
+- Close-tail signal: handle 1 closed by `dead_slot_reap` with
+  `state=Relaying pending=2111595`, `tcp_state=Closed active=false
+  can_send=false can_recv=false`, no send-slice errors, and no TUN flush
+  failures. Standard P1/full sweep were skipped because no fresh quiet metrics
+  tick arrived within the short gate.
+- Correct behavior: do not continue stale TCP pool slot diagnosis and do not
+  change iperf3. The next repair branch should target downlink pending lifecycle
+  and TUN local delivery/backpressure for inactive or closed TCP handles.
+
+## 2026-07-03 — Knife14ai pool=4 failed before tunnel iperf at TUIC auth finish
+
+- Log bundle:
+  `/tmp/mini_vpn/mvpn_knife14ai_pool4_usclient_suite_20260703_234304.tar.gz`
+- Tested commit: `34d5cb7`
+- Symptom: the pool=4 experiment failed during `client-tun` startup with
+  `tuic auth finish: sending stopped by peer: error 0`. The suite never reached
+  tunnel iperf.
+- Important discriminator: `.77` iperf3 stayed active and completed the
+  direct/exit-target preflights at roughly 285-309 Mbit/s during the same run.
+  The preceding pool=1 control also completed tunnel iperf, so credentials and
+  the basic TUIC path were not globally broken.
+- Exit-side signal: `.33` sing-box was systemd-active. Its log window showed
+  pool=1 TUIC inbound/direct outbound opens at 23:42:07 CST and one stream
+  cancel at 23:42:38 CST, but no corresponding pool=4 TUIC inbound line around
+  the 23:43 startup failure.
+- Correct behavior: do not adjust iperf3 or change Rust data-plane throughput
+  code from this failure. First validate `MINI_VPN_TUIC_TCP_POOL>1` with a
+  startup-only smoke and collect `.33` TUIC logs; if auth failure persists,
+  treat sing-box service state or multi-connection startup behavior as the
+  next hypothesis before running another expensive throughput suite.
+
 ## 2026-07-03 — Knife14ah reverse-first backpressured target sender through TUIC
 
 - Log bundle:

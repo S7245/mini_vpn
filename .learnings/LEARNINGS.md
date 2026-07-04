@@ -1,5 +1,98 @@
 # Learnings
 
+## 2026-07-04 — Knife14aj keeps closed-pending reap and adds TUN drop attribution
+
+Grounding against smoltcp `0.10.0` changed the stage design: `TcpSocket::can_send()`
+is `may_send() && !tx_buffer.is_full()`, and `may_send()` is true only in
+`Established` and `CloseWait`. Therefore `TcpState=Closed active=false
+can_send=false` pending downlink is terminal tail, not temporary local tx-buffer
+pressure. Delaying `dead_slot_reap` for that state would not deliver bytes and
+risks reopening the stale-flow regression that knife14u fixed.
+
+The safer stage move was to keep the existing lifecycle guard covered by
+`reap_predicate` tests and make the suspected pressure source observable. The
+low-RTT probe now samples `ip -s link show <tun>` before and after each iperf
+probe, prints `tun_rx_dropped_delta` and `tun_tx_dropped_delta`, and labels
+positive TX-drop deltas as `local_tun_egress_drop`. The parent suite passes the
+discovered `TUN_IF` into the probe and includes `tun_drops:` in the report
+summary grep.
+
+Verification:
+- `cargo test --lib reap_predicate`
+- `cargo test --lib client_tun`
+- `bash -n scripts/knife14b-lowrtt-probe.sh`
+- `bash -n scripts/knife14b-usclient-tunnel-suite.sh`
+- `bash scripts/knife14b-lowrtt-probe.sh --self-test`
+- `git diff --check`
+
+Reusable rule: when a close diagnostic says `tcp_state=Closed active=false
+can_send=false pending>0`, treat it as terminal cleanup unless a test proves the
+socket can send again. For reverse throughput, inspect TUN/qdisc dropped deltas
+before changing the pending reap predicate.
+
+## 2026-07-04 — Knife14ai restart gate isolates next bottleneck to downlink pending
+
+After the pool=4 startup-only smoke reproduced `tuic auth finish: sending
+stopped by peer: error 0`, `.33` sing-box was restarted. The service returned
+active with `ActiveEnterTimestamp=Sat 2026-07-04 09:11:13 CST`. Re-running the
+same pool=4 startup-only smoke immediately passed: all four TUIC TCP pool
+connections authenticated, the log printed `TUIC TCP connection pool=4`, and
+the UDP relay was ready.
+
+The post-restart scoped suite at commit `34d5cb7` completed with bundle
+`/tmp/mini_vpn/mvpn_knife14ai_pool4_after_singbox_restart_usclient_suite_20260704_091224.tar.gz`.
+It ran the reverse-first P1 probe and then skipped standard P1/full sweep
+because the quiet gate did not observe a fresh zero-active metrics tick. Direct
+preflights stayed healthy: client-target and exit-target checks were all roughly
+277-284 Mbit/s receiver.
+
+The tunnel reverse-first P1 improved to 88.9 MBytes / 24.8 Mbit/s sender and
+84.2 MBytes / 23.6 Mbit/s receiver. The attribution was
+`local_downlink_backpressure`: two pause/resume edges, max pending 2,149,256
+bytes, no local write pressure, no global_rx pressure, no late remote bytes, and
+no QUIC loss/congestion/flow-control blocked deltas. The close tail again showed
+`dead_slot_reap` on handle 1 with `tcp_state=Closed active=false can_send=false
+can_recv=false` and about 2.1 MiB pending, which is not the old stale pool slot
+branch.
+
+Reusable rule: once TUIC auth is restored by restarting sing-box, stop treating
+pool=4 startup as the throughput bottleneck. The next code design should focus
+on how downlink pending accumulates and is reaped for inactive/closed TCP state,
+and on why TUN TX drops/queueing create bursty reverse throughput despite a
+clean QUIC path.
+
+## 2026-07-03 — Knife14ai pool A/B separates iperf health from TUIC pool startup
+
+`34d5cb7` was tested from `.27` with two focused acceptance bundles:
+`/tmp/mini_vpn/mvpn_knife14ai_pool1_usclient_suite_20260703_234149.tar.gz`
+and
+`/tmp/mini_vpn/mvpn_knife14ai_pool4_usclient_suite_20260703_234304.tar.gz`.
+
+The pool=1 control completed. Direct preflights were healthy on all relevant
+legs, including `.27 -> .77`, `.77 -> .27`, `.33 -> .77`, and `.77 -> .33`
+around 275-286 Mbit/s. The tunnel reverse-first P1 improved from the prior
+Kbit/s branch to 66.4 MBytes / 18.5 Mbit/s sender and 62.8 MBytes /
+17.5 Mbit/s receiver, but the attribution changed to
+`local_downlink_backpressure`: pending reached 2,118,593 bytes, paused once,
+resumed once, and QUIC showed no loss, congestion, or flow-control blocked
+delta. This means the earlier `reverse_sender_backpressured` label was useful:
+it distinguishes the prior server-side sender stall from this new local
+downlink-backpressure branch.
+
+The pool=4 experiment did not reach tunnel iperf. It failed during TUIC startup
+with `tuic auth finish: sending stopped by peer: error 0`. `.33` sing-box was
+still systemd-active, and `.77` iperf3 was active; `.77` journal showed the
+pool=4 run only performed direct/exit-target preflights and did not receive a
+tunnel iperf connection. The `.33` sing-box log window showed the preceding
+pool=1 TUIC connects and a stream cancel at 23:42:38 CST, but no later pool=4
+TUIC inbound line at the 23:43 startup failure.
+
+Reusable rule: do not treat low reverse throughput as an iperf3 problem when
+direct client-target and exit-target preflights are healthy. For pool A/B, add
+a startup-only health gate for `MINI_VPN_TUIC_TCP_POOL>1` before comparing
+throughput, and keep sing-box/TUIC service state as a first-class branch even
+when systemd says the service is active.
+
 ## 2026-07-03 — Knife14ai labels reverse sender backpressure in reports
 
 Knife14ah proved a sharper failure branch: reverse receiver throughput was low,

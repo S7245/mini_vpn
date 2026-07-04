@@ -588,6 +588,7 @@ run_lowrtt_probe() {
     PARALLEL_SET="$parallel" \
     DURATION="$duration" \
     PROBE_ORDER="$probe_order" \
+    TUN_IF="$TUN_IF" \
     IPERF_BUSY_RETRIES="$IPERF_BUSY_RETRIES" \
     IPERF_BUSY_WAIT_SECS="$IPERF_BUSY_WAIT_SECS" \
     bash "$LOWRTT_SCRIPT" "$TARGET" "$IPERF_PORT"
@@ -597,7 +598,7 @@ run_lowrtt_probe() {
   append "### Probe $label Summary"
   if [[ -f "$probe_out" ]]; then
     append '```text'
-    grep -E 'Attribution Summary|iperf_sender_mbps|iperf_receiver_mbps|tcp_pool:|local_write_pressure:|global_rx_pressure:|downlink_backpressure:|relay_late_remote:|quic:|attribution:|local 10[.]0[.]0[.]1|receiver$|sender$|error -|Connection reset|log not found|📊|🔬|TUIC datagram|UDP relay mode|tuic-tcp-pool-reconnect|tcp-(relay-live|relay-write-half-closed|relay-close|handle-close|local-write-pressure|global-rx-pressure|downlink-backpressure|loop-flush-tx|tun-flush-fail|send-slice-error)|exit=' "$probe_out" | tail -200 | tee -a "$REPORT" || true
+    grep -E 'Attribution Summary|iperf_sender_mbps|iperf_receiver_mbps|tcp_pool:|local_write_pressure:|global_rx_pressure:|downlink_backpressure:|relay_late_remote:|tun_drops:|quic:|attribution:|local 10[.]0[.]0[.]1|receiver$|sender$|error -|Connection reset|log not found|📊|🔬|TUIC datagram|UDP relay mode|tuic-tcp-pool-reconnect|tcp-(relay-live|relay-write-half-closed|relay-close|handle-close|local-write-pressure|global-rx-pressure|downlink-backpressure|loop-flush-tx|tun-flush-fail|send-slice-error)|exit=' "$probe_out" | tail -200 | tee -a "$REPORT" || true
     append '```'
   else
     append "probe report missing: $probe_out"

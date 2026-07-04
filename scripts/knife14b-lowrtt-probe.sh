@@ -26,6 +26,7 @@ env:
   IPERF_BUSY_WAIT_SECS=5   seconds to wait between busy retries
   PROBE_ORDER=forward-first
                             forward-first | reverse-first | forward-only | reverse-only
+  TUN_IF=tun0              TUN interface to sample for RX/TX dropped deltas
 USAGE
 }
 
@@ -85,21 +86,123 @@ iperf_is_reverse_tcp() {
   fi
 }
 
+is_uint() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+counter_delta() {
+  local before="${1:-unknown}"
+  local after="${2:-unknown}"
+  if is_uint "$before" && is_uint "$after" && ((after >= before)); then
+    echo "$((after - before))"
+  else
+    echo "unknown"
+  fi
+}
+
+parse_tun_drop_sample() {
+  local file="$1"
+  local preferred_if="${2:-}"
+  awk -v preferred_if="$preferred_if" '
+    function clean_iface(raw) {
+      sub(/:.*/, "", raw)
+      sub(/@.*/, "", raw)
+      return raw
+    }
+
+    /^[0-9]+:[[:space:]]/ {
+      iface = clean_iface($2)
+      selected = preferred_if == "" || iface == preferred_if
+      have_rx = 0
+      have_tx = 0
+      next
+    }
+
+    selected && /^[[:space:]]*RX:/ {
+      if (getline > 0) {
+        rx_dropped = $4 + 0
+        have_rx = 1
+      }
+      next
+    }
+
+    selected && /^[[:space:]]*TX:/ {
+      if (getline > 0) {
+        tx_dropped = $4 + 0
+        have_tx = 1
+      }
+      if (have_rx && have_tx) {
+        print iface, rx_dropped, tx_dropped
+        exit
+      }
+    }
+  ' "$file"
+}
+
+discover_tun_if() {
+  if [[ -n "${TUN_IF:-}" ]]; then
+    echo "$TUN_IF"
+    return
+  fi
+  if ! command -v ip >/dev/null 2>&1; then
+    return
+  fi
+  ip -o -4 addr show 2>/dev/null | awk '$4 ~ /^10[.]0[.]0[.]1\// {print $2; exit}'
+}
+
+sample_tun_drops() {
+  local tun_if="${1:-}"
+  if [[ -z "$tun_if" ]]; then
+    tun_if="$(discover_tun_if || true)"
+  fi
+  if [[ -z "$tun_if" ]]; then
+    echo "unknown unknown unknown"
+    return
+  fi
+  if ! command -v ip >/dev/null 2>&1; then
+    echo "$tun_if unknown unknown"
+    return
+  fi
+
+  local tmp parsed
+  tmp="$(mktemp)"
+  if ip -s link show dev "$tun_if" > "$tmp" 2>/dev/null; then
+    parsed="$(parse_tun_drop_sample "$tmp" "$tun_if" || true)"
+    rm -f "$tmp"
+    if [[ -n "$parsed" ]]; then
+      echo "$parsed"
+    else
+      echo "$tun_if unknown unknown"
+    fi
+  else
+    rm -f "$tmp"
+    echo "$tun_if unknown unknown"
+  fi
+}
+
 summarize_metrics_window() {
   local start_line="$1"
   local title="$2"
   local iperf_file="$3"
   local log_file="$4"
   local probe_kind="${5:-tcp}"
-  local receiver_mbps sender_mbps reverse_tcp
+  local tun_if="${6:-unknown}"
+  local tun_rx_before="${7:-unknown}"
+  local tun_tx_before="${8:-unknown}"
+  local tun_rx_after="${9:-unknown}"
+  local tun_tx_after="${10:-unknown}"
+  local receiver_mbps sender_mbps reverse_tcp tun_rx_delta tun_tx_delta
   receiver_mbps="$(iperf_receiver_mbps "$iperf_file")"
   sender_mbps="$(iperf_sender_mbps "$iperf_file")"
   reverse_tcp="$(iperf_is_reverse_tcp "$iperf_file")"
+  tun_rx_delta="$(counter_delta "$tun_rx_before" "$tun_rx_after")"
+  tun_tx_delta="$(counter_delta "$tun_tx_before" "$tun_tx_after")"
 
   if [[ ! -f "$log_file" ]]; then
     {
       echo "- iperf_sender_mbps: $sender_mbps"
       echo "- iperf_receiver_mbps: $receiver_mbps"
+      echo "- tun_drops: if=$tun_if tun_rx_dropped_delta=$tun_rx_delta tun_tx_dropped_delta=$tun_tx_delta"
       echo "- metrics_window: log_missing"
       echo "- attribution: no_metrics"
     }
@@ -111,7 +214,10 @@ summarize_metrics_window() {
     -v probe_kind="$probe_kind" \
     -v sender="$sender_mbps" \
     -v receiver="$receiver_mbps" \
-    -v reverse_tcp="$reverse_tcp" '
+    -v reverse_tcp="$reverse_tcp" \
+    -v tun_if="$tun_if" \
+    -v tun_rx_delta="$tun_rx_delta" \
+    -v tun_tx_delta="$tun_tx_delta" '
     function numeric_token(token, key, value) {
       value = token
       sub("^" key "=", "", value)
@@ -424,6 +530,9 @@ summarize_metrics_window() {
       if (local_write_count > 0) {
         add_label("local_write_pressure")
       }
+      if (tun_tx_delta != "unknown" && (tun_tx_delta + 0) > 0) {
+        add_label("local_tun_egress_drop")
+      }
       if (down_pause_count > 0) {
         add_label("local_downlink_backpressure")
       }
@@ -466,6 +575,7 @@ summarize_metrics_window() {
       printf "- global_rx_pressure: events=%d max_wait_ms=%.3f\n", global_rx_count, max_global_wait_us / 1000
       printf "- downlink_backpressure: pause_edges=%d resume_edges=%d max_pending_bytes=%d max_total_pending_bytes=%d\n", down_pause_count, down_resume_count, max_down_pending, max_down_total
       printf "- relay_late_remote: post_finish_bytes=%d post_finish_reads=%d local_finish_events=%d\n", max_late_remote_bytes, max_late_remote_reads, local_finish_count
+      printf "- tun_drops: if=%s tun_rx_dropped_delta=%s tun_tx_dropped_delta=%s\n", tun_if, tun_rx_delta, tun_tx_delta
       printf "- quic: samples=%d worst_conn=%s max_lost_bytes_delta=%d max_congestion_events_delta=%d min_cwnd=%s max_tx_blocked_data_delta=%d max_tx_blocked_stream_delta=%d max_rx_blocked_data_delta=%d max_rx_blocked_stream_delta=%d\n", quic_samples, worst_conn, max_lost_bytes_delta, max_congestion_delta, min_cwnd_all, max_tx_data_delta, max_tx_stream_delta, max_rx_data_delta, max_rx_stream_delta
       print "- attribution: " labels
     }
@@ -473,10 +583,13 @@ summarize_metrics_window() {
 }
 
 run_self_test() {
-  local tmpdir iperf_sample log_sample summary
+  local tmpdir iperf_sample log_sample tun_before tun_after summary
+  local tun_if_before tun_rx_before tun_tx_before tun_if_after tun_rx_after tun_tx_after
   tmpdir="$(mktemp -d)"
   iperf_sample="$tmpdir/iperf.txt"
   log_sample="$tmpdir/mvpn.log"
+  tun_before="$tmpdir/tun-before.txt"
+  tun_after="$tmpdir/tun-after.txt"
   trap "rm -rf '$tmpdir'" EXIT
 
   cat > "$iperf_sample" <<'EOF_IPERF'
@@ -530,6 +643,33 @@ EOF_LOG
   summary="$(summarize_metrics_window 0 "existing-conn-self-test" "$iperf_sample" "$log_sample")"
   assert_contains "$summary" "max_lost_bytes_delta=500"
   assert_contains "$summary" "max_congestion_events_delta=3"
+
+  cat > "$log_sample" <<'EOF_LOG'
+🔎 tuic-open-tcp target=43.130.32.77:5201 conn=1 id=99
+📊 TUIC QUIC stats conn=1 id=99 rtt=1ms cwnd=247092 lost=0/35 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=33/9175B udp_rx=177/232816B dg_max=Some(1418) dg_space=1048576B
+📊 TUIC QUIC stats conn=1 id=99 rtt=1ms cwnd=247092 lost=0/105 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=103/14703B udp_rx=535/734789B dg_max=Some(1418) dg_space=1048576B
+EOF_LOG
+  cat > "$tun_before" <<'EOF_TUN'
+7: tun0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1200 qdisc fq_codel state UNKNOWN mode DEFAULT group default qlen 500
+    link/none
+    RX:  bytes packets errors dropped  missed   mcast
+      1024       8      0       0       0       0
+    TX:  bytes packets errors dropped carrier collsns
+      2048      16      0     100       0       0
+EOF_TUN
+  cat > "$tun_after" <<'EOF_TUN'
+7: tun0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1200 qdisc fq_codel state UNKNOWN mode DEFAULT group default qlen 500
+    link/none
+    RX:  bytes packets errors dropped  missed   mcast
+      4096      32      0       0       0       0
+    TX:  bytes packets errors dropped carrier collsns
+      8192      64      0    1523       0       0
+EOF_TUN
+  read -r tun_if_before tun_rx_before tun_tx_before <<< "$(parse_tun_drop_sample "$tun_before" "tun0")"
+  read -r tun_if_after tun_rx_after tun_tx_after <<< "$(parse_tun_drop_sample "$tun_after" "$tun_if_before")"
+  summary="$(summarize_metrics_window 0 "tun-drop-self-test" "$iperf_sample" "$log_sample" "tcp" "$tun_if_after" "$tun_rx_before" "$tun_tx_before" "$tun_rx_after" "$tun_tx_after")"
+  assert_contains "$summary" "tun_drops: if=tun0 tun_rx_dropped_delta=0 tun_tx_dropped_delta=1423"
+  assert_contains "$summary" "attribution: local_tun_egress_drop"
 
   cat > "$iperf_sample" <<'EOF_IPERF'
 [  5]   0.00-30.04  sec  2.62 MBytes   733 Kbits/sec    3             sender
@@ -688,9 +828,24 @@ append_attribution_summary() {
   local title="$2"
   local iperf_file="$3"
   local probe_kind="$4"
+  local tun_if="${5:-unknown}"
+  local tun_rx_before="${6:-unknown}"
+  local tun_tx_before="${7:-unknown}"
+  local tun_rx_after="${8:-unknown}"
+  local tun_tx_after="${9:-unknown}"
 
   append_subsection "Attribution Summary: $title"
-  summarize_metrics_window "$start_line" "$title" "$iperf_file" "$LOG" "$probe_kind" | tee -a "$OUT"
+  summarize_metrics_window \
+    "$start_line" \
+    "$title" \
+    "$iperf_file" \
+    "$LOG" \
+    "$probe_kind" \
+    "$tun_if" \
+    "$tun_rx_before" \
+    "$tun_tx_before" \
+    "$tun_rx_after" \
+    "$tun_tx_after" | tee -a "$OUT"
 }
 
 append_cleanliness_check() {
@@ -734,6 +889,11 @@ append_iperf_cmd() {
 
   local start_line
   start_line="$(log_line_count)"
+  local tun_before tun_after
+  local tun_if_before tun_rx_before tun_tx_before
+  local tun_if_after tun_rx_after tun_tx_after
+  tun_before="$(sample_tun_drops "${TUN_IF:-}")"
+  read -r tun_if_before tun_rx_before tun_tx_before <<< "$tun_before"
   local attempt=1
   local max_attempts=$((IPERF_BUSY_RETRIES + 1))
   local tmp=""
@@ -772,9 +932,20 @@ append_iperf_cmd() {
 
     break
   done
+  tun_after="$(sample_tun_drops "$tun_if_before")"
+  read -r tun_if_after tun_rx_after tun_tx_after <<< "$tun_after"
   append_metrics_since "$start_line" "$metrics_title"
   if [[ -n "$tmp" && -f "$tmp" ]]; then
-    append_attribution_summary "$start_line" "$metrics_title" "$tmp" "$probe_kind"
+    append_attribution_summary \
+      "$start_line" \
+      "$metrics_title" \
+      "$tmp" \
+      "$probe_kind" \
+      "$tun_if_after" \
+      "$tun_rx_before" \
+      "$tun_tx_before" \
+      "$tun_rx_after" \
+      "$tun_tx_after"
     rm -f "$tmp"
   fi
 }
