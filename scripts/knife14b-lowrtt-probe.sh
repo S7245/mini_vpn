@@ -217,7 +217,10 @@ summarize_metrics_window() {
     -v reverse_tcp="$reverse_tcp" \
     -v tun_if="$tun_if" \
     -v tun_rx_delta="$tun_rx_delta" \
-    -v tun_tx_delta="$tun_tx_delta" '
+    -v tun_tx_delta="$tun_tx_delta" \
+    -v inherited_low_cwnd_limit=65536 \
+    -v inherited_lost_bytes_floor=1048576 \
+    -v inherited_cong_floor=100 '
     function numeric_token(token, key, value) {
       value = token
       sub("^" key "=", "", value)
@@ -458,6 +461,7 @@ summarize_metrics_window() {
       if (!(key in seen_quic)) {
         seen_quic[key] = 1
         quic_keys[++quic_key_count] = key
+        first_cwnd[key] = cwnd
         first_lost_bytes[key] = lost_bytes
         first_congestion_events[key] = congestion_events
         first_tx_data[key] = tx_data
@@ -479,8 +483,10 @@ summarize_metrics_window() {
 
     END {
       min_cwnd_all = ""
+      min_start_cwnd_all = ""
       for (i = 1; i <= quic_key_count; i++) {
         key = quic_keys[i]
+        baseline_cwnd = first_cwnd[key]
         baseline_lost = first_lost_bytes[key]
         baseline_cong = first_congestion_events[key]
         baseline_tx_data = first_tx_data[key]
@@ -493,6 +499,22 @@ summarize_metrics_window() {
         tx_stream_delta = last_tx_stream[key] - baseline_tx_stream
         rx_data_delta = last_rx_data[key] - baseline_rx_data
         rx_stream_delta = last_rx_stream[key] - baseline_rx_stream
+
+        if (baseline_lost > max_start_lost_bytes) {
+          max_start_lost_bytes = baseline_lost
+        }
+        if (baseline_cong > max_start_congestion_events) {
+          max_start_congestion_events = baseline_cong
+        }
+        if (baseline_cwnd > 0 && (min_start_cwnd_all == "" || baseline_cwnd < min_start_cwnd_all)) {
+          min_start_cwnd_all = baseline_cwnd
+        }
+        if (baseline_cwnd > 0 &&
+            baseline_cwnd <= inherited_low_cwnd_limit &&
+            (baseline_lost >= inherited_lost_bytes_floor || baseline_cong >= inherited_cong_floor)) {
+          inherited_quic_congestion = 1
+          inherited_quic_conns = add_unique(inherited_quic_conns, key)
+        }
 
         if (lost_delta > max_lost_bytes_delta) {
           max_lost_bytes_delta = lost_delta
@@ -527,6 +549,9 @@ summarize_metrics_window() {
       if (max_lost_bytes_delta > 0 || max_congestion_delta > 0) {
         add_label("quic_loss_congestion")
       }
+      if (inherited_quic_congestion > 0) {
+        add_label("inherited_quic_congestion")
+      }
       if (local_write_count > 0) {
         add_label("local_write_pressure")
       }
@@ -548,6 +573,7 @@ summarize_metrics_window() {
           local_write_count == 0 && down_pause_count == 0 && global_rx_count == 0 &&
           max_lost_bytes_delta == 0 && max_congestion_delta == 0 &&
           max_tx_data_delta == 0 && max_tx_stream_delta == 0 &&
+          inherited_quic_congestion == 0 &&
           reconnect_count == 0) {
         add_label("reverse_sender_backpressured")
       }
@@ -566,6 +592,12 @@ summarize_metrics_window() {
       if (min_cwnd_all == "") {
         min_cwnd_all = "n/a"
       }
+      if (min_start_cwnd_all == "") {
+        min_start_cwnd_all = "n/a"
+      }
+      if (inherited_quic_conns == "") {
+        inherited_quic_conns = "none"
+      }
 
       print "- metrics_title: " title
       print "- iperf_sender_mbps: " sender
@@ -576,7 +608,7 @@ summarize_metrics_window() {
       printf "- downlink_backpressure: pause_edges=%d resume_edges=%d max_pending_bytes=%d max_total_pending_bytes=%d\n", down_pause_count, down_resume_count, max_down_pending, max_down_total
       printf "- relay_late_remote: post_finish_bytes=%d post_finish_reads=%d local_finish_events=%d\n", max_late_remote_bytes, max_late_remote_reads, local_finish_count
       printf "- tun_drops: if=%s tun_rx_dropped_delta=%s tun_tx_dropped_delta=%s\n", tun_if, tun_rx_delta, tun_tx_delta
-      printf "- quic: samples=%d worst_conn=%s max_lost_bytes_delta=%d max_congestion_events_delta=%d min_cwnd=%s max_tx_blocked_data_delta=%d max_tx_blocked_stream_delta=%d max_rx_blocked_data_delta=%d max_rx_blocked_stream_delta=%d\n", quic_samples, worst_conn, max_lost_bytes_delta, max_congestion_delta, min_cwnd_all, max_tx_data_delta, max_tx_stream_delta, max_rx_data_delta, max_rx_stream_delta
+      printf "- quic: samples=%d worst_conn=%s max_lost_bytes_delta=%d max_congestion_events_delta=%d max_start_lost_bytes=%d max_start_congestion_events=%d min_start_cwnd=%s min_cwnd=%s inherited_conns=%s inherited_low_cwnd_threshold=%d max_tx_blocked_data_delta=%d max_tx_blocked_stream_delta=%d max_rx_blocked_data_delta=%d max_rx_blocked_stream_delta=%d\n", quic_samples, worst_conn, max_lost_bytes_delta, max_congestion_delta, max_start_lost_bytes, max_start_congestion_events, min_start_cwnd_all, min_cwnd_all, inherited_quic_conns, inherited_low_cwnd_limit, max_tx_data_delta, max_tx_stream_delta, max_rx_data_delta, max_rx_stream_delta
       print "- attribution: " labels
     }
   '
@@ -643,6 +675,33 @@ EOF_LOG
   summary="$(summarize_metrics_window 0 "existing-conn-self-test" "$iperf_sample" "$log_sample")"
   assert_contains "$summary" "max_lost_bytes_delta=500"
   assert_contains "$summary" "max_congestion_events_delta=3"
+
+  cat > "$iperf_sample" <<'EOF_IPERF'
+Reverse mode, remote host 43.130.32.77 is sending
+[  5]   0.00-30.04  sec  41.2 MBytes  11.5 Mbits/sec   67             sender
+[  5]   0.00-30.00  sec  38.4 MBytes  10.7 Mbits/sec                  receiver
+EOF_IPERF
+  cat > "$log_sample" <<'EOF_LOG'
+🔎 tuic-open-tcp target=43.130.32.77:5201 conn=0 id=103708502287008
+📊 TUIC QUIC stats conn=0 id=103708502287008 rtt=0ms cwnd=5808 lost=391390/973313 lost_bytes=500976100 congestion_events=93571 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=14,max_stream_data=54) rx_window(max_data=878,max_stream_data=1289) udp_tx=973311/1235276813B udp_rx=198656/95566719B dg_max=Some(1246) dg_space=1048576B
+📊 TUIC QUIC stats conn=0 id=103708502287008 rtt=0ms cwnd=23540 lost=391390/976428 lost_bytes=500976100 congestion_events=93571 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=18,max_stream_data=74) rx_window(max_data=878,max_stream_data=1289) udp_tx=976426/1235704935B udp_rx=217657/122723118B dg_max=Some(1246) dg_space=1048576B
+EOF_LOG
+  summary="$(summarize_metrics_window 0 "inherited-quic-self-test" "$iperf_sample" "$log_sample")"
+  assert_contains "$summary" "max_lost_bytes_delta=0"
+  assert_contains "$summary" "max_congestion_events_delta=0"
+  assert_contains "$summary" "max_start_lost_bytes=500976100"
+  assert_contains "$summary" "max_start_congestion_events=93571"
+  assert_contains "$summary" "attribution: inherited_quic_congestion"
+  assert_not_contains "$summary" "attribution: no_pressure_signal"
+
+  cat > "$iperf_sample" <<'EOF_IPERF'
+Reverse mode, remote host 43.130.32.77 is sending
+[  5]   0.00-30.04  sec  3.00 MBytes   838 Kbits/sec    2             sender
+[  5]   0.00-30.00  sec  88.2 KBytes  24.1 Kbits/sec                  receiver
+EOF_IPERF
+  summary="$(summarize_metrics_window 0 "inherited-suppresses-reverse-sender-self-test" "$iperf_sample" "$log_sample")"
+  assert_contains "$summary" "attribution: inherited_quic_congestion"
+  assert_not_contains "$summary" "reverse_sender_backpressured"
 
   cat > "$log_sample" <<'EOF_LOG'
 🔎 tuic-open-tcp target=43.130.32.77:5201 conn=1 id=99
