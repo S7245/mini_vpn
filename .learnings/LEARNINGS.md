@@ -1472,3 +1472,22 @@ correct target); only the outbound hop broke.
 Note: `67c466b add` committed the worktree directory itself as a gitlink
 (mode 160000 `.claude/worktrees/frosty-gates-10390f`). Recursive/self-referential;
 worth cleaning up separately.
+
+## 2026-07-04 — Knife14au terminal-zero is not close-pending-zero
+
+- Stage: Knife14au pending-at-close taxonomy.
+- Outcome: Added behavior-neutral close pending classification to
+  `tcp-handle-close` diagnostics and low-RTT probe summaries. Local gates passed:
+  `cargo test --lib client_tun`, full `cargo test`,
+  `cargo clippy --all-targets -- -D warnings`, probe/suite self-tests, shell
+  syntax checks, and `git diff --check`.
+- Key lesson: `terminal_pending_reap: events=0 bytes=0` only proves no close
+  matched `Closed && active=false && can_send=false`; it does not prove there
+  were no close-time pending bytes. Knife14at raw logs had
+  `tcp_state=Established active=true can_send=false pending>0`, which was
+  previously visible only by manual raw-log inspection.
+- Reusable rule: every reverse/downlink acceptance report must read
+  `pending_at_close` alongside `terminal_pending_reap`. If throughput is low,
+  split pending tails by `terminal_closed_no_send`, `active_no_send`,
+  send-capable, inactive no-send, and unknown before changing close-drain,
+  pacing, TUN queue length, TUIC pool, iperf3, or sing-box.

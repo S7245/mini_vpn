@@ -836,3 +836,15 @@
 - Future debugging rule: when a stage adds backpressure, verify which direction
   the evidence points to. `global_rx_pressure_events=0` meant knife14p's
   downlink mechanism was not firing; the next fix belonged in the uplink writer.
+
+## 2026-07-04 — Knife14au repeated the full-repo cargo fmt churn risk
+
+- Symptom: running `cargo fmt` at the repository root reformatted many unrelated
+  Rust files and expanded the diff beyond the pending-at-close observability
+  slice.
+- Fix: reverted the formatter-only churn before committing, then reapplied only
+  the `src/client_tun.rs` behavior-neutral logging/test changes.
+- Future debugging rule: for scoped Knife14 fixes, do not run full-repo
+  formatting unless the stage explicitly owns that cleanup. Prefer existing
+  local style plus `cargo test`, clippy, script self-tests, shell syntax checks,
+  and `git diff --check`.

@@ -256,16 +256,72 @@ impl TcpDownlinkDiag {
     }
 }
 
-fn terminal_pending_reap_bytes(ctx: &SocketCtx, snapshot: SocketCloseSnapshot) -> usize {
-    let pending = ctx.downlink_pending.len();
-    if pending > 0
-        && snapshot.tcp_state == TcpState::Closed
-        && !snapshot.active
-        && !snapshot.can_send
-    {
-        pending
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosePendingClass {
+    NoPending,
+    TerminalClosedNoSend,
+    ActiveNoSend,
+    ActiveSendCapable,
+    InactiveSendCapable,
+    InactiveNoSend,
+    Unknown,
+}
+
+impl ClosePendingClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoPending => "none",
+            Self::TerminalClosedNoSend => "terminal_closed_no_send",
+            Self::ActiveNoSend => "active_no_send",
+            Self::ActiveSendCapable => "active_send_capable",
+            Self::InactiveSendCapable => "inactive_send_capable",
+            Self::InactiveNoSend => "inactive_no_send",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClosePendingAccounting {
+    class: ClosePendingClass,
+    pending_bytes: usize,
+    terminal_pending_reap_bytes: usize,
+}
+
+fn classify_close_pending(pending: usize, snapshot: SocketCloseSnapshot) -> ClosePendingClass {
+    if pending == 0 {
+        return ClosePendingClass::NoPending;
+    }
+    if snapshot.tcp_state == TcpState::Closed && !snapshot.active && !snapshot.can_send {
+        return ClosePendingClass::TerminalClosedNoSend;
+    }
+    if snapshot.active && !snapshot.can_send {
+        return ClosePendingClass::ActiveNoSend;
+    }
+    if snapshot.active && snapshot.can_send {
+        return ClosePendingClass::ActiveSendCapable;
+    }
+    if snapshot.can_send {
+        return ClosePendingClass::InactiveSendCapable;
+    }
+    ClosePendingClass::InactiveNoSend
+}
+
+fn close_pending_accounting(
+    ctx: &SocketCtx,
+    snapshot: SocketCloseSnapshot,
+) -> ClosePendingAccounting {
+    let pending_bytes = ctx.downlink_pending.len();
+    let class = classify_close_pending(pending_bytes, snapshot);
+    let terminal_pending_reap_bytes = if class == ClosePendingClass::TerminalClosedNoSend {
+        pending_bytes
     } else {
         0
+    };
+    ClosePendingAccounting {
+        class,
+        pending_bytes,
+        terminal_pending_reap_bytes,
     }
 }
 
@@ -2454,9 +2510,9 @@ fn rearm_socket_with_reason_and_snapshot(
     close_snapshot: Option<SocketCloseSnapshot>,
 ) {
     if let Some(snapshot) = close_snapshot {
-        let terminal_pending_reap_bytes = terminal_pending_reap_bytes(ctx, snapshot);
+        let close_pending = close_pending_accounting(ctx, snapshot);
         tcp_diag_log!(
-            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} terminal_pending_reap_bytes={} tcp_state={:?} active={} can_send={} can_recv={}",
+            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes={} tcp_state={:?} active={} can_send={} can_recv={}",
             handle,
             close_direction,
             close_reason,
@@ -2475,7 +2531,9 @@ fn rearm_socket_with_reason_and_snapshot(
             ctx.downlink_diag.tun_flush_tx_calls,
             ctx.downlink_diag.tun_flush_tx_failures,
             ctx.downlink_diag.tun_flush_deferred,
-            terminal_pending_reap_bytes,
+            close_pending.class.as_str(),
+            close_pending.pending_bytes,
+            close_pending.terminal_pending_reap_bytes,
             snapshot.tcp_state,
             snapshot.active,
             snapshot.can_send,
@@ -2485,8 +2543,14 @@ fn rearm_socket_with_reason_and_snapshot(
         return;
     }
 
+    let close_pending_bytes = ctx.downlink_pending.len();
+    let close_pending_class = if close_pending_bytes == 0 {
+        ClosePendingClass::NoPending
+    } else {
+        ClosePendingClass::Unknown
+    };
     tcp_diag_log!(
-        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} terminal_pending_reap_bytes=0",
+        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes=0",
         handle,
         close_direction,
         close_reason,
@@ -2504,7 +2568,9 @@ fn rearm_socket_with_reason_and_snapshot(
         ctx.downlink_diag.send_slice_max_accepted_bytes,
         ctx.downlink_diag.tun_flush_tx_calls,
         ctx.downlink_diag.tun_flush_tx_failures,
-        ctx.downlink_diag.tun_flush_deferred
+        ctx.downlink_diag.tun_flush_deferred,
+        close_pending_class.as_str(),
+        close_pending_bytes
     );
     rearm_socket(socket, ctx, fake_pool, now_secs);
 }
@@ -4420,7 +4486,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_pending_reap_bytes_classifies_closed_no_send_tail() {
+    fn close_pending_accounting_classifies_pending_close_taxonomy() {
         let mut ctx = SocketCtx::new(443);
         ctx.state = SocketState::Relaying;
         ctx.downlink_pending = vec![0; 224_765];
@@ -4431,43 +4497,54 @@ mod tests {
             can_send: false,
             can_recv: false,
         };
-        assert_eq!(terminal_pending_reap_bytes(&ctx, terminal), 224_765);
+        let accounting = close_pending_accounting(&ctx, terminal);
+        assert_eq!(accounting.class, ClosePendingClass::TerminalClosedNoSend);
+        assert_eq!(accounting.pending_bytes, 224_765);
+        assert_eq!(accounting.terminal_pending_reap_bytes, 224_765);
 
-        let active = SocketCloseSnapshot {
+        let active_no_send = SocketCloseSnapshot {
+            tcp_state: TcpState::Established,
             active: true,
+            can_send: false,
+            ..terminal
+        };
+        let accounting = close_pending_accounting(&ctx, active_no_send);
+        assert_eq!(accounting.class, ClosePendingClass::ActiveNoSend);
+        assert_eq!(accounting.pending_bytes, 224_765);
+        assert_eq!(accounting.terminal_pending_reap_bytes, 0);
+
+        let active_send_capable = SocketCloseSnapshot {
+            can_send: true,
+            ..active_no_send
+        };
+        let accounting = close_pending_accounting(&ctx, active_send_capable);
+        assert_eq!(accounting.class, ClosePendingClass::ActiveSendCapable);
+        assert_eq!(accounting.terminal_pending_reap_bytes, 0);
+
+        let inactive_send_capable = SocketCloseSnapshot {
+            active: false,
             can_send: true,
             ..terminal
         };
-        assert_eq!(
-            terminal_pending_reap_bytes(&ctx, active),
-            0,
-            "active send-capable pending is still deliverable evidence, not terminal reap"
-        );
+        let accounting = close_pending_accounting(&ctx, inactive_send_capable);
+        assert_eq!(accounting.class, ClosePendingClass::InactiveSendCapable);
+        assert_eq!(accounting.terminal_pending_reap_bytes, 0);
 
-        let send_capable = SocketCloseSnapshot {
-            can_send: true,
-            ..terminal
-        };
-        assert_eq!(
-            terminal_pending_reap_bytes(&ctx, send_capable),
-            0,
-            "inactive pending with send capacity belongs to the bounded grace branch"
-        );
-
-        let close_wait = SocketCloseSnapshot {
+        let inactive_no_send = SocketCloseSnapshot {
             tcp_state: TcpState::CloseWait,
             active: false,
             can_send: false,
             can_recv: false,
         };
-        assert_eq!(
-            terminal_pending_reap_bytes(&ctx, close_wait),
-            0,
-            "Knife14as terminal accounting is deliberately scoped to Closed && !can_send"
-        );
+        let accounting = close_pending_accounting(&ctx, inactive_no_send);
+        assert_eq!(accounting.class, ClosePendingClass::InactiveNoSend);
+        assert_eq!(accounting.terminal_pending_reap_bytes, 0);
 
         ctx.downlink_pending.clear();
-        assert_eq!(terminal_pending_reap_bytes(&ctx, terminal), 0);
+        let accounting = close_pending_accounting(&ctx, terminal);
+        assert_eq!(accounting.class, ClosePendingClass::NoPending);
+        assert_eq!(accounting.pending_bytes, 0);
+        assert_eq!(accounting.terminal_pending_reap_bytes, 0);
     }
 
     #[test]
