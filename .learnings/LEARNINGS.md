@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-07-04 — Knife14aq adds observable remote-payload egress pacing
+
+Knife14ap showed the clean reverse limiter had moved after smoltcp acceptance:
+`send_slice` succeeded, TUN flush calls returned success, but Linux TUN/qdisc
+still reported egress drops. Knife14aq therefore avoids another watermark or
+server-side guess and adds a product-side egress pacer for TCP downlink
+remote-payload events.
+
+The stage gates immediate `iface.poll + flush_tx` after remote payload
+acceptance with `MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES` (default 65536 bytes
+per timer interval, `0` for timer-only). Accepted bytes are still preserved in
+smoltcp/downlink pending; only the immediate TUN write is deferred to the
+existing timer poll/flush path when the budget is exhausted. The aggregate
+`tcp-downlink-flush` diagnostic now includes `tun_flush_deferred`, and the
+low-RTT probe summarizes it in `downlink_flush:`.
+
+Verification passed locally with `cargo test`, both low-RTT and US-client suite
+self-tests, and `git diff --check`. This is not yet a throughput conclusion:
+the next reusable rule is to require a clean `.27` reverse-first acceptance run
+before deciding whether egress pacing reduced TUN drops/backpressure or needs a
+different local queue strategy.
+
 ## 2026-07-04 — Promote repeated environment traps into default operating rules
 
 User feedback after the Knife14ap run clarified that repeated sudo/TTY and

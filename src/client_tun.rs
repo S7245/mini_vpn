@@ -41,6 +41,10 @@ const MIN_DOWNLINK_FLUSH_MAX_BYTES: usize = 4 * 1024;
 const MAX_DOWNLINK_FLUSH_MAX_BYTES: usize = MAX_TCP_SOCKET_BUFFER_BYTES;
 const _: () = assert!(MIN_DOWNLINK_FLUSH_MAX_BYTES <= DEFAULT_DOWNLINK_FLUSH_MAX_BYTES);
 const _: () = assert!(DEFAULT_DOWNLINK_FLUSH_MAX_BYTES <= MAX_DOWNLINK_FLUSH_MAX_BYTES);
+const DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES: usize = 64 * 1024;
+const MAX_DOWNLINK_EGRESS_IMMEDIATE_BYTES: usize = MAX_TCP_SOCKET_BUFFER_BYTES;
+const _: () =
+    assert!(DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES <= MAX_DOWNLINK_EGRESS_IMMEDIATE_BYTES);
 /// L2（刀9 F4）：一条 relay 双向静默多久判 idle → 退出 + shutdown。防慢/卡死上游（尤其 REALITY
 /// TCP-only 手写 TLS 遇 server 不返回）长期挂住 relay task 泄漏。90s 偏宽松保稳（长轮询/SSE 不误杀）。
 const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
@@ -196,6 +200,8 @@ struct TcpDownlinkDiag {
     tun_flush_tx_calls: u64,
     /// TCP downlink-triggered TUN flush failures.
     tun_flush_tx_failures: u64,
+    /// Immediate remote-payload TUN flushes deferred to the timer egress path.
+    tun_flush_deferred: u64,
 }
 
 impl TcpDownlinkDiag {
@@ -243,6 +249,10 @@ impl TcpDownlinkDiag {
         if !ok {
             self.tun_flush_tx_failures += 1;
         }
+    }
+
+    fn note_tun_flush_deferred(&mut self) {
+        self.tun_flush_deferred += 1;
     }
 }
 
@@ -946,6 +956,7 @@ struct TcpDownlinkAggregate {
     send_slice_max_accepted_bytes: usize,
     tun_flush_tx_calls: u64,
     tun_flush_tx_failures: u64,
+    tun_flush_deferred: u64,
 }
 
 fn tcp_downlink_aggregate<'a>(
@@ -991,6 +1002,9 @@ fn tcp_downlink_aggregate<'a>(
         aggregate.tun_flush_tx_failures = aggregate
             .tun_flush_tx_failures
             .saturating_add(ctx.downlink_diag.tun_flush_tx_failures);
+        aggregate.tun_flush_deferred = aggregate
+            .tun_flush_deferred
+            .saturating_add(ctx.downlink_diag.tun_flush_deferred);
     }
     aggregate
 }
@@ -1000,7 +1014,7 @@ fn format_tcp_downlink_flush_diag(
     dirty_handles: usize,
 ) -> String {
     format!(
-        "🔎 tcp-downlink-flush pending_total={} pending_max={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} dirty_handles={}",
+        "🔎 tcp-downlink-flush pending_total={} pending_max={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} dirty_handles={}",
         aggregate.pending_total,
         aggregate.pending_max,
         aggregate.pending_high,
@@ -1015,8 +1029,40 @@ fn format_tcp_downlink_flush_diag(
         aggregate.send_slice_max_accepted_bytes,
         aggregate.tun_flush_tx_calls,
         aggregate.tun_flush_tx_failures,
+        aggregate.tun_flush_deferred,
         dirty_handles
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DownlinkEgressPacer {
+    immediate_budget_bytes: usize,
+    remaining_immediate_bytes: usize,
+}
+
+impl DownlinkEgressPacer {
+    fn new(immediate_budget_bytes: usize) -> Self {
+        Self {
+            immediate_budget_bytes,
+            remaining_immediate_bytes: immediate_budget_bytes,
+        }
+    }
+
+    fn allow_remote_payload_flush(&mut self, accepted_bytes: usize) -> bool {
+        if accepted_bytes == 0 || self.immediate_budget_bytes == 0 {
+            return false;
+        }
+        if accepted_bytes > self.remaining_immediate_bytes {
+            self.remaining_immediate_bytes = 0;
+            return false;
+        }
+        self.remaining_immediate_bytes -= accepted_bytes;
+        true
+    }
+
+    fn on_timer_tick(&mut self) {
+        self.remaining_immediate_bytes = self.immediate_budget_bytes;
+    }
 }
 
 fn next_downlink_backpressure(
@@ -1064,6 +1110,12 @@ fn parse_downlink_flush_max_bytes(s: Option<&str>) -> usize {
         .unwrap_or(DEFAULT_DOWNLINK_FLUSH_MAX_BYTES)
 }
 
+fn parse_downlink_egress_immediate_bytes(s: Option<&str>) -> usize {
+    s.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value <= MAX_DOWNLINK_EGRESS_IMMEDIATE_BYTES)
+        .unwrap_or(DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES)
+}
+
 fn parse_tcp_socket_buffer_bytes(s: Option<&str>, default: usize) -> usize {
     s.and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| {
@@ -1102,6 +1154,7 @@ pub struct TunRuntimeConfig {
     pub profile_loop: bool,
     downlink_backpressure: DownlinkBackpressureConfig,
     downlink_flush_max_bytes: usize,
+    downlink_egress_immediate_bytes: usize,
     tcp_socket_buffers: TcpSocketBufferConfig,
 }
 
@@ -1115,6 +1168,7 @@ impl TunRuntimeConfig {
             profile_loop: false,
             downlink_backpressure: DownlinkBackpressureConfig::default(),
             downlink_flush_max_bytes: DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
+            downlink_egress_immediate_bytes: DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES,
             tcp_socket_buffers: TcpSocketBufferConfig::default(),
         })
     }
@@ -1144,6 +1198,11 @@ impl TunRuntimeConfig {
         );
         cfg.downlink_flush_max_bytes = parse_downlink_flush_max_bytes(
             std::env::var("MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES")
+                .ok()
+                .as_deref(),
+        );
+        cfg.downlink_egress_immediate_bytes = parse_downlink_egress_immediate_bytes(
+            std::env::var("MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES")
                 .ok()
                 .as_deref(),
         );
@@ -1257,6 +1316,10 @@ pub async fn start_tun_proxy() {
     println!(
         "🚰 TCP 下行 flush budget: max={}B（MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES 可调）",
         runtime_config.downlink_flush_max_bytes
+    );
+    println!(
+        "🚦 TCP 下行 egress pacing: immediate={}B/tick（MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES 可调，0=timer-only）",
+        runtime_config.downlink_egress_immediate_bytes
     );
     println!(
         "🧱 TCP socket buffers: rx={}B tx={}B（MINI_VPN_TCP_*_BUFFER_BYTES 可调）",
@@ -1501,6 +1564,8 @@ pub async fn run_event_loop<D, U, M>(
     let mut tcp_loop_flush_tx_failures: u64 = 0;
     let downlink_backpressure = runtime_config.downlink_backpressure;
     let downlink_flush_max_bytes = runtime_config.downlink_flush_max_bytes;
+    let mut downlink_egress_pacer =
+        DownlinkEgressPacer::new(runtime_config.downlink_egress_immediate_bytes);
     let mut global_rx_paused = false;
 
     loop {
@@ -1538,6 +1603,7 @@ pub async fn run_event_loop<D, U, M>(
                             &mut fake_pool,
                             udp_clock.elapsed().as_secs(),
                             downlink_flush_max_bytes,
+                            &mut downlink_egress_pacer,
                         )
                         .await
                         {
@@ -1756,6 +1822,7 @@ pub async fn run_event_loop<D, U, M>(
             // 分支 2: 时钟滴答，处理超时重传等后台任务
             _ = timer.tick() =>{
                 metrics.loop_park_end();
+                downlink_egress_pacer.on_timer_tick();
                 metrics.enter_poll();
                 let timestamp = smoltcp::time::Instant::now();
                 iface.poll(timestamp, &mut device, &mut sockets);
@@ -2642,6 +2709,7 @@ async fn handle_remote_payload<D: TunIo>(
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
     downlink_flush_max_bytes: usize,
+    downlink_egress_pacer: &mut DownlinkEgressPacer,
 ) -> std::io::Result<()> {
     let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
@@ -2692,6 +2760,13 @@ async fn handle_remote_payload<D: TunIo>(
     let accepted_bytes = flush_downlink(handle, tcp_socket, ctx, downlink_flush_max_bytes);
     note_downlink_pending_progress(ctx, now_secs, accepted_bytes);
     ctx.state = SocketState::Relaying;
+
+    if !downlink_egress_pacer.allow_remote_payload_flush(accepted_bytes) {
+        if accepted_bytes > 0 {
+            ctx.downlink_diag.note_tun_flush_deferred();
+        }
+        return Ok(());
+    }
 
     let timestamp = smoltcp::time::Instant::now();
     iface.poll(timestamp, device, sockets);
@@ -4638,6 +4713,10 @@ mod tests {
             config.downlink_flush_max_bytes,
             DEFAULT_DOWNLINK_FLUSH_MAX_BYTES
         );
+        assert_eq!(
+            config.downlink_egress_immediate_bytes,
+            DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES
+        );
     }
 
     /// 刀11：MINI_VPN_METRICS_SECS 解析——有效正整数采用；0/非数字/缺失回落默认（防 interval panic）。
@@ -4736,6 +4815,7 @@ mod tests {
         a.downlink_diag.note_flush_attempt(100, 64);
         a.downlink_diag.note_send_slice_ok(64, 36);
         a.downlink_diag.note_tun_flush(true);
+        a.downlink_diag.note_tun_flush_deferred();
 
         let mut b = SocketCtx::new(443);
         b.downlink_pending = vec![0; 25];
@@ -4760,7 +4840,51 @@ mod tests {
         assert!(line.contains("send_slice_max_accepted=64"));
         assert!(line.contains("tun_flush_tx_calls=2"));
         assert!(line.contains("tun_flush_tx_failures=1"));
+        assert!(line.contains("tun_flush_deferred=1"));
         assert!(line.contains("dirty_handles=2"));
+    }
+
+    #[test]
+    fn downlink_egress_pacer_allows_budget_then_defers_until_timer_reset() {
+        let mut pacer = DownlinkEgressPacer::new(65_536);
+
+        assert!(
+            pacer.allow_remote_payload_flush(32_768),
+            "first accepted slice should flush immediately while budget remains"
+        );
+        assert!(
+            pacer.allow_remote_payload_flush(32_768),
+            "budget may be consumed exactly"
+        );
+        assert!(
+            !pacer.allow_remote_payload_flush(1),
+            "extra accepted bytes in the same interval should defer to timer flush"
+        );
+
+        pacer.on_timer_tick();
+        assert!(
+            pacer.allow_remote_payload_flush(1),
+            "timer reset should reopen the immediate flush budget"
+        );
+    }
+
+    #[test]
+    fn downlink_egress_pacer_zero_budget_defers_all_remote_payload_flushes() {
+        let mut pacer = DownlinkEgressPacer::new(0);
+
+        assert!(
+            !pacer.allow_remote_payload_flush(1),
+            "zero budget should make remote-payload egress fully timer-paced"
+        );
+        assert!(
+            !pacer.allow_remote_payload_flush(0),
+            "zero accepted bytes should never force an immediate TUN flush"
+        );
+        pacer.on_timer_tick();
+        assert!(
+            !pacer.allow_remote_payload_flush(65_536),
+            "timer reset should preserve an explicitly disabled immediate budget"
+        );
     }
 
     #[test]
@@ -4895,6 +5019,29 @@ mod tests {
             parse_downlink_flush_max_bytes(Some("33554432")),
             DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
             "oversized values should not disable the burst bound by accident"
+        );
+    }
+
+    #[test]
+    fn parse_downlink_egress_immediate_bytes_defaults_and_bounds() {
+        assert_eq!(
+            parse_downlink_egress_immediate_bytes(None),
+            DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES
+        );
+        assert_eq!(
+            parse_downlink_egress_immediate_bytes(Some("abc")),
+            DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES
+        );
+        assert_eq!(
+            parse_downlink_egress_immediate_bytes(Some("0")),
+            0,
+            "zero explicitly disables immediate remote-payload TUN flushes"
+        );
+        assert_eq!(parse_downlink_egress_immediate_bytes(Some("65536")), 65_536);
+        assert_eq!(
+            parse_downlink_egress_immediate_bytes(Some("33554432")),
+            DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES,
+            "oversized values should not silently remove pacing"
         );
     }
 
