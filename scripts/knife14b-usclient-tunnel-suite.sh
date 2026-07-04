@@ -7,9 +7,62 @@
 
 set -uo pipefail
 
+extract_client_tun_pids_from_ps() {
+  awk '
+    {
+      pid = $1
+      comm = $2
+      args = $0
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]*/, "", args)
+      if (comm != "mini_vpn") {
+        next
+      }
+      n = split(args, fields, /[[:space:]]+/)
+      for (i = 1; i <= n; i++) {
+        if (fields[i] == "client-tun") {
+          print pid
+          break
+        }
+      }
+    }
+  '
+}
+
+client_tun_pids() {
+  ps -eo pid=,comm=,args= | extract_client_tun_pids_from_ps
+}
+
+suite_self_test() {
+  local sample expected actual
+
+  sample="$(cat <<'EOF'
+111 bash ssh ubuntu@43.172.75.27 cd /home/ubuntu/mini_vpn && bash scripts/knife14b-usclient-tunnel-suite.sh
+222 mini_vpn /home/ubuntu/mini_vpn/target/release/mini_vpn client-tun
+333 sudo sudo -E env MINI_VPN_TUN_MTU=1200 /home/ubuntu/mini_vpn/target/release/mini_vpn client-tun
+444 mini_vpn mini_vpn client-tun
+555 mini_vpn /home/ubuntu/mini_vpn/target/release/mini_vpn reality-probe
+666 bash pgrep -af [m]ini_vpn.*client-tun
+EOF
+)"
+  expected="$(printf '222\n444\n')"
+  actual="$(printf '%s\n' "$sample" | extract_client_tun_pids_from_ps)"
+
+  if [[ "$actual" != "$expected" ]]; then
+    echo "suite self-test failed: client_tun pid matcher" >&2
+    echo "expected:" >&2
+    printf '%s\n' "$expected" >&2
+    echo "actual:" >&2
+    printf '%s\n' "$actual" >&2
+    return 1
+  fi
+
+  echo "suite self-test passed"
+}
+
 usage() {
   cat <<'USAGE'
 usage: scripts/knife14b-usclient-tunnel-suite.sh
+       scripts/knife14b-usclient-tunnel-suite.sh --self-test
 
 Required env:
   MINI_VPN_TUIC_SERVER      e.g. 43.153.32.33:8443
@@ -74,6 +127,10 @@ USAGE
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   usage
   exit 0
+fi
+if [[ "${1:-}" == "--self-test" ]]; then
+  suite_self_test
+  exit $?
 fi
 
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -309,6 +366,36 @@ require_cmd() {
 
 command_status() {
   command -v "$1" >/dev/null 2>&1
+}
+
+kill_client_tun_pids() {
+  local pids_text="$1"
+  local -a pids=()
+  local pid
+
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && pids+=("$pid")
+  done <<< "$pids_text"
+  if ((${#pids[@]} == 0)); then
+    return 0
+  fi
+
+  run_cmd sudo kill "${pids[@]}" || true
+  sleep 2
+
+  local remaining=""
+  remaining="$(client_tun_pids || true)"
+  if [[ -z "$remaining" ]]; then
+    return 0
+  fi
+
+  pids=()
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && pids+=("$pid")
+  done <<< "$remaining"
+  if ((${#pids[@]} > 0)); then
+    run_cmd sudo kill -9 "${pids[@]}" || true
+  fi
 }
 
 find_cargo() {
@@ -667,7 +754,9 @@ on_exit() {
       sudo kill "$VPN_PID" >/dev/null 2>&1 || true
       sleep 1
       sudo kill -9 "$VPN_PID" >/dev/null 2>&1 || true
-      sudo pkill -f '[m]ini_vpn.*client-tun' >/dev/null 2>&1 || true
+      while IFS= read -r pid; do
+        [[ -n "$pid" ]] && sudo kill -9 "$pid" >/dev/null 2>&1 || true
+      done <<< "$(client_tun_pids || true)"
     fi
   fi
 
@@ -880,13 +969,12 @@ run_cmd ip -brief addr || true
 
 append ""
 append "## Stop Old Tunnel"
-old_pids="$(pgrep -f '[m]ini_vpn.*client-tun' || true)"
+old_pids="$(client_tun_pids || true)"
 if [[ -n "$old_pids" ]]; then
   append "old mini_vpn client-tun pids:"
   append_block text "$old_pids"
   if [[ "$KILL_OLD" == "1" ]]; then
-    run_cmd sudo pkill -f '[m]ini_vpn.*client-tun' || true
-    sleep 2
+    kill_client_tun_pids "$old_pids"
   else
     fail "已有 mini_vpn client-tun 在运行。设置 KILL_OLD=1 或手动停止后重跑。"
   fi
