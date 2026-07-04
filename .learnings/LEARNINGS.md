@@ -1,5 +1,36 @@
 # Learnings
 
+## 2026-07-04 — Knife14ak qlen A/B shifts the live branch back to reverse sender
+
+Commit `b31b234` added an opt-in `TUN_TX_QUEUE_LEN` suite knob and documented the
+Knife14ak A/B plan. Local verification passed:
+
+- `bash -n scripts/knife14b-usclient-tunnel-suite.sh`
+- `bash scripts/knife14b-usclient-tunnel-suite.sh --help | rg 'TUN_TX_QUEUE_LEN|MTU=1200'`
+- `git diff --check`
+
+The scoped `.27` VPS run with `TUN_TX_QUEUE_LEN=5000`, `MINI_VPN_TUIC_CC=bbr`,
+`MINI_VPN_TUIC_TCP_POOL=1`, and reverse-first P1 produced bundle
+`/tmp/mini_vpn/mvpn_knife14ak_tunqlen5000_usclient_suite_20260704_131103.tar.gz`.
+The suite proved the harness knob works: `tun0` reported `qdisc fq_codel` and
+`qlen 5000`, and the report recorded `tun_tx_queue_len_requested=5000` plus
+`tun_tx_queue_len_actual=5000`.
+
+The A/B result did not validate TUN queue depth as the current primary limiter.
+Direct preflights were healthy (`.27 -> .77` reverse receiver 274 Mbit/s,
+`.33 -> .77` reverse receiver 298 Mbit/s), but tunnel reverse P1 collapsed to
+0.314 Mbit/s sender and 0.057 Mbit/s receiver. Attribution was
+`reverse_sender_backpressured`: local write pressure, global RX pressure,
+downlink backpressure, TUN drops, QUIC loss/congestion, and QUIC blocked-frame
+deltas were all zero. The close log showed `pending=0` and only 329,254 bytes
+read from the remote side.
+
+Reusable rule: a larger TUN queue can be a useful A/B knob, but if reverse iperf
+sender throughput is also low and mini_vpn local pressure is clean, stop tuning
+TUN/downlink. The next branch needs paired tunnel/direct reverse sender
+diagnostics and exit/server-side evidence around the exact probe window before
+changing product pacing or watermarks.
+
 ## 2026-07-04 — Knife14aj keeps closed-pending reap and adds TUN drop attribution
 
 Grounding against smoltcp `0.10.0` changed the stage design: `TcpSocket::can_send()`

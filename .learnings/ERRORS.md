@@ -1,5 +1,38 @@
 # Errors
 
+## 2026-07-04 — Knife14ak qlen=5000 sample hit reverse sender backpressure, not TUN drops
+
+- Log bundle:
+  `/tmp/mini_vpn/mvpn_knife14ak_tunqlen5000_usclient_suite_20260704_131103.tar.gz`
+- Tested commit: `b31b234`
+- Setup: `.27` sourced `/home/ubuntu/mini_vpn/.evn` quietly, used
+  `TUN_TX_QUEUE_LEN=5000`, `MINI_VPN_TUIC_CC=bbr`, `MINI_VPN_TUIC_TCP_POOL=1`,
+  and `RUN_REVERSE_FIRST_P1=1`.
+- The qlen setup itself worked: report showed `tun_tx_queue_len_actual=5000`.
+- Symptom: reverse tunnel P1 collapsed to 0.314 Mbit/s sender and 0.057 Mbit/s
+  receiver, while direct client-target and exit-target reverse preflights were
+  healthy.
+- Important discriminator: `tun_tx_dropped_delta=0`, downlink backpressure was
+  zero, local/global pressure was zero, QUIC loss/congestion and blocked-frame
+  deltas were zero, and the close tail had `pending=0`.
+- Exit-side clue: sing-box logged the TUIC inbound/direct outbound opens and
+  later `connection download closed: stream 4 canceled by remote with error
+  code 0` for the probe window.
+- Correct behavior: do not interpret this as proof that qlen=5000 fixes or
+  breaks mini_vpn throughput. The run switched to the
+  `reverse_sender_backpressured` branch. Before product changes, add or run
+  paired diagnostics that capture target sender, exit sing-box, and mini_vpn
+  TUIC receive evidence during the same reverse probe.
+
+## 2026-07-04 — Use portable find commands on macOS
+
+- Command failed locally after extracting the Knife14ak bundle:
+  `find /tmp/mini_vpn/knife14ak_tunqlen5000_131103 -maxdepth 1 -type f -printf '%f\n'`.
+- Error: macOS/BSD `find` does not support GNU `-printf`.
+- Working fallback: `find <dir> -maxdepth 1 -type f -exec basename {} \; | sort`.
+- Future behavior: avoid GNU-only `find -printf` in this Mac workspace unless
+  GNU find is explicitly installed.
+
 ## 2026-07-04 — HTTPS origin push failed; SSH one-shot push worked
 
 - Command failed: `git push` against `origin=https://github.com/S7245/mini_vpn.git`.
