@@ -1808,3 +1808,24 @@ worth cleaning up separately.
   always export fixed legacy env values.
 - Reusable rule: before a VPS run that validates runtime config defaults, grep
   the suite for env exports that may shadow the binary default being tested.
+
+## 2026-07-04 — Knife14bd 1MiB adaptive backpressure is necessary but insufficient
+
+- Stage: Knife14bd VPS acceptance for tx-buffer-scaled downlink backpressure.
+- Bundle:
+  `/tmp/mini_vpn/knife14bd_scaled_auto_20260704_234307/mvpn_knife14bd_scaled_auto_usclient_suite_20260704_234307.tar.gz`
+- Code under test: `9578f5e`.
+- Outcome: startup confirmed auto watermarks `high=1048576B low=262144B`, but
+  clean reverse-first stayed at `27.8/26.2 Mbit/s`. Clean-window QUIC
+  loss/congestion, TUN drops, local/global write pressure, and flush failures
+  remained quiet. The data stream first read was `3ms`, data max read gap was
+  `3826ms`, `send_queue_max=1048576`, and terminal pending/reap grew to
+  `1058416B`.
+- Key lesson: moving the high watermark from 512KiB to the configured 1MiB tx
+  buffer validates the receive-window branch but does not clear it. The next
+  discriminating test is a scoped tx-buffer/receive-window A/B, not another
+  stale-pool, sing-box, iperf3, TUN queue, or egress-pacer change.
+- Reusable rule: if terminal pending scales with the tx buffer and clean
+  throughput remains burst/idle, test whether larger tx-window capacity improves
+  useful receiver throughput before changing close-drain behavior again. If it
+  only scales the terminal tail, pivot to local TCP/TUN drain cadence.

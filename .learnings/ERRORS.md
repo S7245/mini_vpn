@@ -1072,3 +1072,26 @@
   not found`.
 - Correct behavior: use portable `grep`/`find` commands on VPS hosts unless
   `rg` availability has been checked.
+
+## 2026-07-04 — sudo VPS suites need a real tool TTY from the start
+
+- Symptom: the first Knife14bd suite attempt used `ssh -tt`, but the local
+  command was not started with a writable tool TTY. `sudo -v` prompted for a
+  password, stdin closed, and the resulting bundle was incomplete.
+- Correct behavior: when a `.27` suite may need sudo, start the command with a
+  true TTY session at the tool level from the beginning, then enter the password
+  only at the sudo prompt. Do not treat any non-TTY sudo-failed bundle as
+  acceptance evidence.
+
+## 2026-07-04 — 1MiB adaptive downlink backpressure did not fix Knife14 throughput
+
+- Symptom: Knife14bd clean reverse-first with auto watermarks
+  `high=1048576B low=262144B` still achieved only `27.8/26.2 Mbit/s` and ended
+  with `terminal_pending_reap=1058416B`.
+- Rejected interpretation: the remaining clean root is not the legacy 512KiB
+  suite override alone; that was fixed and the binary startup confirmed the
+  1MiB watermarks.
+- Correct behavior: analyze the failed run before further code changes. The
+  next patch/run must distinguish tx-buffer/receive-window capacity from local
+  TCP/TUN drain cadence; do not keep changing close-drain, pool, sing-box,
+  iperf3, TUN queue length, or egress pacing without new evidence.
