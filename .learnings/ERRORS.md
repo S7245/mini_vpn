@@ -1,5 +1,22 @@
 # Errors
 
+## 2026-07-04 - Non-TTY sudo preflight failure produced no data-plane evidence
+
+- Log bundle:
+  `/tmp/conn/mvpn_knife14as_terminal_pending_reversefirst_usclient_suite_20260704_181027.tar.gz`
+- Symptom: the first `.27` Knife14as suite attempt stopped at `sudo -v` before
+  build, tunnel startup, or iperf traffic. There was no mini_vpn behavior to
+  analyze.
+- Rejected assumption: a suite that may invoke `sudo -v` can be rerun through a
+  non-interactive SSH command and still produce useful acceptance evidence.
+- Correct behavior: start `.27` suites that need sudo in a real writable TTY and
+  enter the sudo password only at the prompt.
+- Security rule: do not store sudo passwords in `.env`, commands, scripts,
+  repository files, docs, learning memory, reports, or summaries.
+- Future debugging rule: if a suite fails before build or service preflight,
+  treat it as a harness/operator failure, fix the invocation mode, and do not
+  spend analysis budget on TUIC, QUIC, TUN, smoltcp, or iperf.
+
 ## 2026-07-04 — Knife14ar close-safe egress pacing failed VPS acceptance
 
 - Stage: Knife14ar close-safe downlink egress pacing acceptance for commit

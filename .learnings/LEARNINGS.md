@@ -1,5 +1,31 @@
 # Learnings
 
+## 2026-07-04 - Knife14as separated terminal pending from active reverse bottleneck
+
+- Code commits: `575a448`, `2205734`
+- Log bundle:
+  `/tmp/mini_vpn/mvpn_knife14as_terminal_pending_reversefirst2_usclient_suite_20260704_182136.tar.gz`
+- Result doc:
+  `docs/tech/2026-07-04-knife14as-terminal-pending-lifecycle-results.md`
+- Outcome: VPS throughput still failed, but the lifecycle branch got a clear
+  discriminator. In the clean reverse-first window, receiver throughput was
+  `22.2 Mbit/s`, `terminal_pending_reap=0`, QUIC loss/congestion deltas were
+  zero, `send_slice_zero=0`, `send_slice_errors=0`,
+  `tun_flush_failures=0`, and `tun_flush_deferred=0`; the active attribution was
+  `local_tun_egress_drop+local_downlink_backpressure`.
+- Close-boundary signal: after the clean measurement, the same reverse flow
+  closed with `terminal_pending_reap_bytes=555611` and
+  `tcp_state=Closed active=false can_send=false`. That makes terminal pending a
+  post-close accounting outcome, not the direct clean-window throughput root.
+- Reusable rule: when terminal pending appears after a reverse throughput
+  window, first ask whether it was present during the measurement summary. If
+  `terminal_pending_reap=0` in-window, shift the next design to the earlier
+  active egress/backpressure path instead of adding more closed-socket grace.
+- Next rule: do not tune queue length, TUIC pool, iperf3, sing-box, or the old
+  immediate-flush pacer again before designing local TUN egress feedback or
+  product-safe shaping that ties remote downlink reads to actual local egress
+  capacity.
+
 ## 2026-07-04 — Knife14as starts with terminal pending accounting, not behavior tuning
 
 Commit `575a448` added the first Knife14as slice: design/spec docs,
