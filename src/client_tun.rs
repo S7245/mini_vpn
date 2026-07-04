@@ -36,6 +36,11 @@ const DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES: usize = TCP_SOCKET_BUFFER_SIZE *
 const DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES: usize = TCP_SOCKET_BUFFER_SIZE * 8;
 const _: () =
     assert!(DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES < DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES);
+const DEFAULT_DOWNLINK_FLUSH_MAX_BYTES: usize = 256 * 1024;
+const MIN_DOWNLINK_FLUSH_MAX_BYTES: usize = 4 * 1024;
+const MAX_DOWNLINK_FLUSH_MAX_BYTES: usize = MAX_TCP_SOCKET_BUFFER_BYTES;
+const _: () = assert!(MIN_DOWNLINK_FLUSH_MAX_BYTES <= DEFAULT_DOWNLINK_FLUSH_MAX_BYTES);
+const _: () = assert!(DEFAULT_DOWNLINK_FLUSH_MAX_BYTES <= MAX_DOWNLINK_FLUSH_MAX_BYTES);
 /// L2（刀9 F4）：一条 relay 双向静默多久判 idle → 退出 + shutdown。防慢/卡死上游（尤其 REALITY
 /// TCP-only 手写 TLS 遇 server 不返回）长期挂住 relay task 泄漏。90s 偏宽松保稳（长轮询/SSE 不误杀）。
 const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
@@ -537,7 +542,16 @@ const HANDSHAKE_DONE_CAPACITY: usize = 128;
 /// Push as much of the handle's downlink backlog into the smoltcp tx buffer as fits;
 /// keep the rest for the next poll. Partial `send_slice` writes are normal.
 /// 中文要点：这是修 bad decrypt 的关键——绝不丢弃写不下的字节。
-fn flush_downlink(handle: SocketHandle, tcp_socket: &mut TcpSocket, ctx: &mut SocketCtx) -> usize {
+fn bounded_downlink_flush_len(pending_len: usize, max_bytes_per_flush: usize) -> usize {
+    pending_len.min(max_bytes_per_flush.max(1))
+}
+
+fn flush_downlink(
+    handle: SocketHandle,
+    tcp_socket: &mut TcpSocket,
+    ctx: &mut SocketCtx,
+    max_bytes_per_flush: usize,
+) -> usize {
     if ctx.downlink_pending.is_empty() {
         return 0;
     }
@@ -545,7 +559,8 @@ fn flush_downlink(handle: SocketHandle, tcp_socket: &mut TcpSocket, ctx: &mut So
     if !tcp_socket.can_send() {
         return 0;
     }
-    match tcp_socket.send_slice(&ctx.downlink_pending) {
+    let flush_len = bounded_downlink_flush_len(ctx.downlink_pending.len(), max_bytes_per_flush);
+    match tcp_socket.send_slice(&ctx.downlink_pending[..flush_len]) {
         Ok(0) => {
             ctx.downlink_diag
                 .note_send_slice_ok(0, ctx.downlink_pending.len());
@@ -926,6 +941,14 @@ fn parse_downlink_backpressure_config(
     }
 }
 
+fn parse_downlink_flush_max_bytes(s: Option<&str>) -> usize {
+    s.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| {
+            (MIN_DOWNLINK_FLUSH_MAX_BYTES..=MAX_DOWNLINK_FLUSH_MAX_BYTES).contains(value)
+        })
+        .unwrap_or(DEFAULT_DOWNLINK_FLUSH_MAX_BYTES)
+}
+
 fn parse_tcp_socket_buffer_bytes(s: Option<&str>, default: usize) -> usize {
     s.and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| {
@@ -963,6 +986,7 @@ pub struct TunRuntimeConfig {
     /// `from_sources`（harness/测试）恒 `false`。
     pub profile_loop: bool,
     downlink_backpressure: DownlinkBackpressureConfig,
+    downlink_flush_max_bytes: usize,
     tcp_socket_buffers: TcpSocketBufferConfig,
 }
 
@@ -975,6 +999,7 @@ impl TunRuntimeConfig {
             metrics_secs: METRICS_SNAPSHOT_SECS,
             profile_loop: false,
             downlink_backpressure: DownlinkBackpressureConfig::default(),
+            downlink_flush_max_bytes: DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
             tcp_socket_buffers: TcpSocketBufferConfig::default(),
         })
     }
@@ -999,6 +1024,11 @@ impl TunRuntimeConfig {
                 .ok()
                 .as_deref(),
             std::env::var("MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES")
+                .ok()
+                .as_deref(),
+        );
+        cfg.downlink_flush_max_bytes = parse_downlink_flush_max_bytes(
+            std::env::var("MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES")
                 .ok()
                 .as_deref(),
         );
@@ -1108,6 +1138,10 @@ pub async fn start_tun_proxy() {
         "🧯 TCP 下行背压: high={}B low={}B（MINI_VPN_DOWNLINK_BACKPRESSURE_* 可调）",
         runtime_config.downlink_backpressure.high_bytes,
         runtime_config.downlink_backpressure.low_bytes
+    );
+    println!(
+        "🚰 TCP 下行 flush budget: max={}B（MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES 可调）",
+        runtime_config.downlink_flush_max_bytes
     );
     println!(
         "🧱 TCP socket buffers: rx={}B tx={}B（MINI_VPN_TCP_*_BUFFER_BYTES 可调）",
@@ -1351,6 +1385,7 @@ pub async fn run_event_loop<D, U, M>(
     let mut tcp_loop_flush_tx_calls: u64 = 0;
     let mut tcp_loop_flush_tx_failures: u64 = 0;
     let downlink_backpressure = runtime_config.downlink_backpressure;
+    let downlink_flush_max_bytes = runtime_config.downlink_flush_max_bytes;
     let mut global_rx_paused = false;
 
     loop {
@@ -1387,6 +1422,7 @@ pub async fn run_event_loop<D, U, M>(
                             &mut device,
                             &mut fake_pool,
                             udp_clock.elapsed().as_secs(),
+                            downlink_flush_max_bytes,
                         )
                         .await
                         {
@@ -1511,6 +1547,7 @@ pub async fn run_event_loop<D, U, M>(
                             udp_clock.elapsed().as_secs(),
                             &metrics_handle,
                             &mut metrics,
+                            downlink_flush_max_bytes,
                         )
                         .await;
                     }
@@ -1625,6 +1662,7 @@ pub async fn run_event_loop<D, U, M>(
                     udp_clock.elapsed().as_secs(),
                     &metrics_handle,
                     &mut metrics,
+                    downlink_flush_max_bytes,
                 )
                 .await;
             }
@@ -1652,6 +1690,7 @@ async fn process_dirty_relay<U, M>(
     now_secs: u64,
     metrics_handle: &Metrics,
     metrics: &mut M,
+    downlink_flush_max_bytes: usize,
 ) where
     U: ProxyUpstream + 'static,
     M: MetricsSink,
@@ -1671,6 +1710,7 @@ async fn process_dirty_relay<U, M>(
             fake_pool,
             now_secs,
             metrics_handle,
+            downlink_flush_max_bytes,
         )
         .await
         {
@@ -2153,13 +2193,15 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
     metrics_handle: &Metrics,
+    downlink_flush_max_bytes: usize,
 ) -> Result<(), ClientError> {
     // 每轮先推进该 handle 的下行 pending：TCP ACK 释放 tx buffer 空间后继续写，
     // 直到把上一轮没写完的回程字节全部交付，绝不丢字节（修 bad decrypt 的另一半）。
     {
         let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
         if let Some(ctx) = socket_ctxs.get_mut(&handle) {
-            let accepted_bytes = flush_downlink(handle, tcp_socket, ctx);
+            let accepted_bytes =
+                flush_downlink(handle, tcp_socket, ctx, downlink_flush_max_bytes);
             note_downlink_pending_progress(ctx, now_secs, accepted_bytes);
             if finish_deferred_relay_close_if_drained(
                 handle,
@@ -2471,6 +2513,7 @@ async fn handle_remote_payload<D: TunIo>(
     device: &mut D,
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
+    downlink_flush_max_bytes: usize,
 ) -> std::io::Result<()> {
     let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
@@ -2518,7 +2561,7 @@ async fn handle_remote_payload<D: TunIo>(
     ctx.downlink_diag
         .note_remote_payload(payload.len(), ctx.downlink_pending.len());
     note_local_finish_remote_progress(ctx, now_secs);
-    let accepted_bytes = flush_downlink(handle, tcp_socket, ctx);
+    let accepted_bytes = flush_downlink(handle, tcp_socket, ctx, downlink_flush_max_bytes);
     note_downlink_pending_progress(ctx, now_secs, accepted_bytes);
     ctx.state = SocketState::Relaying;
 
@@ -4463,6 +4506,10 @@ mod tests {
             config.tcp_socket_buffer_bytes(),
             (TCP_SOCKET_BUFFER_SIZE, TCP_SOCKET_BUFFER_SIZE)
         );
+        assert_eq!(
+            config.downlink_flush_max_bytes,
+            DEFAULT_DOWNLINK_FLUSH_MAX_BYTES
+        );
     }
 
     /// 刀11：MINI_VPN_METRICS_SECS 解析——有效正整数采用；0/非数字/缺失回落默认（防 interval panic）。
@@ -4568,6 +4615,25 @@ mod tests {
     }
 
     #[test]
+    fn downlink_flush_budget_caps_each_pass() {
+        assert_eq!(
+            bounded_downlink_flush_len(2_000_000, 262_144),
+            262_144,
+            "large pending should be split across multiple flush passes"
+        );
+        assert_eq!(
+            bounded_downlink_flush_len(16_384, 262_144),
+            16_384,
+            "small pending should flush in one pass"
+        );
+        assert_eq!(
+            bounded_downlink_flush_len(16_384, 0),
+            1,
+            "defensive zero budget must still make bounded progress"
+        );
+    }
+
+    #[test]
     fn parse_downlink_backpressure_config_defaults_and_rejects_bad_low() {
         let default = DownlinkBackpressureConfig::default();
         assert_eq!(
@@ -4609,6 +4675,33 @@ mod tests {
         assert_eq!(
             above_max, default,
             "oversized socket buffers must not be accepted silently"
+        );
+    }
+
+    #[test]
+    fn parse_downlink_flush_max_bytes_defaults_and_bounds() {
+        assert_eq!(
+            parse_downlink_flush_max_bytes(None),
+            DEFAULT_DOWNLINK_FLUSH_MAX_BYTES
+        );
+        assert_eq!(
+            parse_downlink_flush_max_bytes(Some("abc")),
+            DEFAULT_DOWNLINK_FLUSH_MAX_BYTES
+        );
+        assert_eq!(
+            parse_downlink_flush_max_bytes(Some("0")),
+            DEFAULT_DOWNLINK_FLUSH_MAX_BYTES
+        );
+        assert_eq!(
+            parse_downlink_flush_max_bytes(Some("1024")),
+            DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
+            "below-minimum values should not silently underfeed the local path"
+        );
+        assert_eq!(parse_downlink_flush_max_bytes(Some("1048576")), 1_048_576);
+        assert_eq!(
+            parse_downlink_flush_max_bytes(Some("33554432")),
+            DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
+            "oversized values should not disable the burst bound by accident"
         );
     }
 
