@@ -997,3 +997,16 @@
 - Future debugging rule: if a raw log and a per-probe summary disagree, inspect
   the report timing before changing Rust lifecycle, pacing, TUIC pool, iperf3,
   or sing-box behavior.
+
+## 2026-07-04 — Knife14ba repeated scoped-change cargo fmt churn
+
+- Symptom: running root `cargo fmt` during the scoped diagnostics stage
+  reformatted many unrelated Rust files, including REALITY and failover modules,
+  and expanded the diff far beyond the intended `client_tun`, `tuic`, and parser
+  changes.
+- Fix: restored the unrelated formatter-only churn and reapplied the
+  `client_tun.rs` relay timing patch as a minimal diff.
+- Future debugging rule: for Knife14 scoped changes, do not run root
+  `cargo fmt`. If formatting is necessary, format only the touched hunks or
+  accept existing local style, then use `git diff --stat` and `git diff --check`
+  to catch whitespace issues.

@@ -1715,3 +1715,26 @@ worth cleaning up separately.
   post-iperf settle window before sampling final TUN counters and summarizing
   metrics. Keep the window explicit in the report and configurable for quick
   local debugging.
+
+## 2026-07-04 — Knife14ba needs first-byte/read-gap evidence before behavior patches
+
+- Stage: Knife14ba TUIC stream first-byte and relay read-gap diagnostics.
+- Outcome: Added behavior-neutral timing diagnostics for relay remote reads and
+  TUIC TCP stream reads, plus low-RTT parser summaries/attribution for
+  `tuic_stream_first_byte_slow`, `tuic_stream_read_gap`,
+  `relay_remote_first_byte_slow`, and `relay_remote_read_gap`.
+- Local gates passed: `cargo test --lib tuic::tests::`,
+  `cargo test --lib client_tun::tests::`,
+  `scripts/knife14b-lowrtt-probe.sh --self-test`,
+  `scripts/knife14b-usclient-tunnel-suite.sh --self-test`, full `cargo test`
+  outside sandbox, `cargo test --features harness` outside sandbox,
+  `cargo clippy --all-targets --features harness -- -D warnings`, and
+  `git diff --check`.
+- Key lesson: after Knife14az showed `remote_to_global_rx_bytes` near zero with
+  no downlink pending, terminal pending, TUN drop, or clean-window QUIC loss,
+  the next useful evidence is stream first-byte latency and read gaps, not
+  another close-drain, pacer, pool, iperf3, or sing-box tweak.
+- Reusable rule: if reverse-first throughput is low and local downlink/pending
+  counters stay quiet, parse `tuic_tcp_stream` and `relay_remote_timing` before
+  changing behavior. A large first-byte or read-gap label should drive the next
+  patch; contradictory timing evidence should trigger architecture review.

@@ -483,8 +483,16 @@ fn log_tcp_lifecycle_observation(
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct RelayTaskDiag {
+    /// Relay task creation time, used to measure first remote byte latency.
+    started_at: std::time::Instant,
+    /// Delay from relay start to the first successful remote read.
+    first_remote_read_millis: Option<u128>,
+    /// Timestamp of the latest successful remote read.
+    last_remote_read_at: Option<std::time::Instant>,
+    /// Largest gap between successful remote reads.
+    max_remote_read_gap_millis: u128,
     /// Bytes written from local smoltcp side into the remote stream.
     uplink_bytes: u64,
     /// Bytes read from the remote stream and accepted into the global_rx path.
@@ -512,7 +520,35 @@ struct RelayTaskDiag {
     local_finish_seen: bool,
 }
 
+impl Default for RelayTaskDiag {
+    fn default() -> Self {
+        Self::new(std::time::Instant::now())
+    }
+}
+
 impl RelayTaskDiag {
+    fn new(started_at: std::time::Instant) -> Self {
+        Self {
+            started_at,
+            first_remote_read_millis: None,
+            last_remote_read_at: None,
+            max_remote_read_gap_millis: 0,
+            uplink_bytes: 0,
+            remote_to_global_rx_bytes: 0,
+            remote_after_local_finish_bytes: 0,
+            remote_reads: 0,
+            remote_after_local_finish_reads: 0,
+            local_writes: 0,
+            global_rx_wait_max_micros: 0,
+            global_rx_pressure_events: 0,
+            global_rx_queue_used_max: 0,
+            global_rx_queue_capacity: 0,
+            local_write_wait_max_micros: 0,
+            local_write_pressure_events: 0,
+            local_finish_seen: false,
+        }
+    }
+
     fn note_uplink_write(&mut self, bytes: usize) {
         self.local_writes += 1;
         self.uplink_bytes += bytes as u64;
@@ -523,12 +559,35 @@ impl RelayTaskDiag {
     }
 
     fn note_remote_read(&mut self, bytes: usize) {
+        self.note_remote_read_at(bytes, std::time::Instant::now());
+    }
+
+    fn note_remote_read_at(&mut self, bytes: usize, now: std::time::Instant) {
         self.remote_reads += 1;
         self.remote_to_global_rx_bytes += bytes as u64;
+        if self.first_remote_read_millis.is_none() {
+            self.first_remote_read_millis =
+                Some(now.saturating_duration_since(self.started_at).as_millis());
+        }
+        if let Some(last) = self.last_remote_read_at {
+            self.max_remote_read_gap_millis = self
+                .max_remote_read_gap_millis
+                .max(now.saturating_duration_since(last).as_millis());
+        }
+        self.last_remote_read_at = Some(now);
         if self.local_finish_seen {
             self.remote_after_local_finish_reads += 1;
             self.remote_after_local_finish_bytes += bytes as u64;
         }
+    }
+
+    fn first_remote_read_millis(&self) -> u128 {
+        self.first_remote_read_millis.unwrap_or(0)
+    }
+
+    fn current_remote_read_gap_millis_at(&self, now: std::time::Instant) -> u128 {
+        let since = self.last_remote_read_at.unwrap_or(self.started_at);
+        now.saturating_duration_since(since).as_millis()
     }
 
     fn note_global_rx_wait(
@@ -577,11 +636,30 @@ fn format_relay_live_diag(
     read_only_after_local_finish: bool,
     diag: &RelayTaskDiag,
 ) -> String {
+    format_relay_live_diag_at(
+        handle,
+        epoch,
+        writer_done,
+        read_only_after_local_finish,
+        diag,
+        std::time::Instant::now(),
+    )
+}
+
+fn format_relay_live_diag_at(
+    handle: SocketHandle,
+    epoch: u64,
+    writer_done: bool,
+    read_only_after_local_finish: bool,
+    diag: &RelayTaskDiag,
+    now: std::time::Instant,
+) -> String {
     format!(
         "🔎 tcp-relay-live handle={handle:?} epoch={epoch} writer_done={writer_done} \
          read_only_after_local_finish={read_only_after_local_finish} \
          uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} \
          remote_after_local_finish_bytes={} remote_after_local_finish_reads={} \
+         first_remote_read_ms={} max_remote_read_gap_ms={} current_remote_read_gap_ms={} \
          global_rx_wait_max_us={} global_rx_pressure_events={} \
          global_rx_queue_used_max={} global_rx_queue_capacity={} \
          local_write_wait_max_us={} local_write_pressure_events={}",
@@ -591,6 +669,9 @@ fn format_relay_live_diag(
         diag.remote_reads,
         diag.remote_after_local_finish_bytes,
         diag.remote_after_local_finish_reads,
+        diag.first_remote_read_millis(),
+        diag.max_remote_read_gap_millis,
+        diag.current_remote_read_gap_millis_at(now),
         diag.global_rx_wait_max_micros,
         diag.global_rx_pressure_events,
         diag.global_rx_queue_used_max,
@@ -607,7 +688,7 @@ fn format_relay_close_diag(
     diag: &RelayTaskDiag,
 ) -> String {
     format!(
-        "🔎 tcp-relay-close handle={:?} direction={} reason={} uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} remote_after_local_finish_bytes={} remote_after_local_finish_reads={} global_rx_wait_max_us={} global_rx_pressure_events={} global_rx_queue_used_max={} global_rx_queue_capacity={} local_write_wait_max_us={} local_write_pressure_events={}",
+        "🔎 tcp-relay-close handle={:?} direction={} reason={} uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} remote_after_local_finish_bytes={} remote_after_local_finish_reads={} first_remote_read_ms={} max_remote_read_gap_ms={} current_remote_read_gap_ms={} global_rx_wait_max_us={} global_rx_pressure_events={} global_rx_queue_used_max={} global_rx_queue_capacity={} local_write_wait_max_us={} local_write_pressure_events={}",
         handle,
         close_direction,
         close_reason,
@@ -617,6 +698,9 @@ fn format_relay_close_diag(
         diag.remote_reads,
         diag.remote_after_local_finish_bytes,
         diag.remote_after_local_finish_reads,
+        diag.first_remote_read_millis(),
+        diag.max_remote_read_gap_millis,
+        diag.current_remote_read_gap_millis_at(std::time::Instant::now()),
         diag.global_rx_wait_max_micros,
         diag.global_rx_pressure_events,
         diag.global_rx_queue_used_max,
@@ -6103,6 +6187,32 @@ mod tests {
     }
 
     #[test]
+    fn relay_live_diag_line_includes_remote_read_timing() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(TcpSocket::new(
+            TcpSocketBuffer::new(vec![0; 16]),
+            TcpSocketBuffer::new(vec![0; 16]),
+        ));
+        let start = std::time::Instant::now();
+        let mut diag = RelayTaskDiag::new(start);
+        diag.note_remote_read_at(100, start + std::time::Duration::from_millis(750));
+        diag.note_remote_read_at(50, start + std::time::Duration::from_millis(2_250));
+
+        let line = format_relay_live_diag_at(
+            handle,
+            7,
+            false,
+            false,
+            &diag,
+            start + std::time::Duration::from_millis(3_500),
+        );
+
+        assert!(line.contains("first_remote_read_ms=750"), "{line}");
+        assert!(line.contains("max_remote_read_gap_ms=1500"), "{line}");
+        assert!(line.contains("current_remote_read_gap_ms=1250"), "{line}");
+    }
+
+    #[test]
     fn relay_close_diag_line_includes_post_finish_remote_counters() {
         let mut sockets = SocketSet::new(vec![]);
         let handle = sockets.add(TcpSocket::new(
@@ -6122,6 +6232,9 @@ mod tests {
         assert!(line.contains("reason=half_closed_idle_timeout"), "{line}");
         assert!(line.contains("remote_after_local_finish_bytes=43772"), "{line}");
         assert!(line.contains("remote_after_local_finish_reads=1"), "{line}");
+        assert!(line.contains("first_remote_read_ms="), "{line}");
+        assert!(line.contains("max_remote_read_gap_ms="), "{line}");
+        assert!(line.contains("current_remote_read_gap_ms="), "{line}");
         assert!(line.contains("global_rx_queue_used_max=9"), "{line}");
         assert!(line.contains("global_rx_queue_capacity=1024"), "{line}");
     }

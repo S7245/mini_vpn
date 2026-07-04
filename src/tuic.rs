@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
 use tokio::sync::{mpsc, watch};
@@ -34,6 +34,7 @@ const DEFAULT_TUIC_UDP_MODE: &str = "native";
 const DEFAULT_TUIC_TCP_POOL: usize = 1;
 const MAX_TUIC_TCP_POOL: usize = 16;
 const DEFAULT_TUIC_QUIC_STATS_SECS: u64 = 30;
+const TUIC_TCP_STREAM_READ_GAP_LOG_MS: u128 = 1_000;
 
 /// TUIC 客户端配置（单一事实源；桌面从 env 加载，移动端将来从 file/FFI 注入）。
 /// 中文要点：凭据(uuid/password)经自定义 Debug **脱敏**，绝不随日志泄漏。
@@ -258,13 +259,15 @@ impl Drop for TcpPoolSlotLease {
 
 struct TrackedRelayStream<S> {
     inner: S,
+    tcp_diag: Option<TuicTcpStreamDiag>,
     _lease: TcpPoolSlotLease,
 }
 
 impl<S> TrackedRelayStream<S> {
-    fn new(inner: S, lease: TcpPoolSlotLease) -> Self {
+    fn new(inner: S, lease: TcpPoolSlotLease, tcp_diag: Option<TuicTcpStreamDiag>) -> Self {
         Self {
             inner,
+            tcp_diag,
             _lease: lease,
         }
     }
@@ -276,7 +279,43 @@ impl<S: AsyncRead + Unpin> AsyncRead for TrackedRelayStream<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        let before_len = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &poll {
+            let read_bytes = buf.filled().len().saturating_sub(before_len);
+            if read_bytes > 0
+                && let Some(diag) = self.tcp_diag.as_mut()
+            {
+                let event = diag.note_read_at(read_bytes, Instant::now());
+                let meta = diag.meta.clone();
+                if let Some(first_rx_ms) = event.first_rx_ms {
+                    println!(
+                        "{}",
+                        format_tuic_tcp_stream_first_rx_line(
+                            &meta,
+                            first_rx_ms,
+                            event.read_bytes,
+                            event.reads
+                        )
+                    );
+                }
+                if let Some(gap_ms) = event.gap_ms
+                    && gap_ms >= TUIC_TCP_STREAM_READ_GAP_LOG_MS
+                {
+                    println!(
+                        "{}",
+                        format_tuic_tcp_stream_read_gap_line(
+                            &meta,
+                            gap_ms,
+                            event.read_bytes,
+                            event.reads,
+                            event.rx_bytes
+                        )
+                    );
+                }
+            }
+        }
+        poll
     }
 }
 
@@ -295,6 +334,24 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TrackedRelayStream<S> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl<S> Drop for TrackedRelayStream<S> {
+    fn drop(&mut self) {
+        if let Some(diag) = &self.tcp_diag {
+            let snapshot = diag.close_snapshot();
+            println!(
+                "{}",
+                format_tuic_tcp_stream_close_line(
+                    &diag.meta,
+                    snapshot.first_rx_ms,
+                    snapshot.max_read_gap_ms,
+                    snapshot.rx_bytes,
+                    snapshot.reads
+                )
+            );
+        }
     }
 }
 
@@ -865,6 +922,161 @@ fn format_tuic_tcp_open_line(target: &TargetAddr, conn_index: usize, stable_id: 
         target.to_wire_string(),
         conn_index,
         stable_id
+    )
+}
+
+#[derive(Debug, Clone)]
+struct TuicTcpStreamDiagMeta {
+    target: String,
+    conn_index: usize,
+    stable_id: usize,
+    stream_id: u64,
+}
+
+impl TuicTcpStreamDiagMeta {
+    fn new(target: &TargetAddr, conn_index: usize, stable_id: usize, stream_id: u64) -> Self {
+        Self {
+            target: target.to_wire_string(),
+            conn_index,
+            stable_id,
+            stream_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TuicTcpStreamReadEvent {
+    first_rx_ms: Option<u128>,
+    gap_ms: Option<u128>,
+    read_bytes: usize,
+    rx_bytes: u64,
+    reads: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TuicTcpStreamCloseSnapshot {
+    first_rx_ms: u128,
+    max_read_gap_ms: u128,
+    rx_bytes: u64,
+    reads: u64,
+}
+
+#[derive(Debug, Clone)]
+struct TuicTcpStreamDiag {
+    meta: TuicTcpStreamDiagMeta,
+    opened_at: Instant,
+    first_rx_ms: Option<u128>,
+    last_rx_at: Option<Instant>,
+    max_read_gap_ms: u128,
+    rx_bytes: u64,
+    reads: u64,
+}
+
+impl TuicTcpStreamDiag {
+    fn new(meta: TuicTcpStreamDiagMeta, opened_at: Instant) -> Self {
+        Self {
+            meta,
+            opened_at,
+            first_rx_ms: None,
+            last_rx_at: None,
+            max_read_gap_ms: 0,
+            rx_bytes: 0,
+            reads: 0,
+        }
+    }
+
+    fn note_read_at(&mut self, read_bytes: usize, now: Instant) -> TuicTcpStreamReadEvent {
+        let first_rx_ms = if self.first_rx_ms.is_none() {
+            let elapsed = now.saturating_duration_since(self.opened_at).as_millis();
+            self.first_rx_ms = Some(elapsed);
+            Some(elapsed)
+        } else {
+            None
+        };
+        let gap_ms = self
+            .last_rx_at
+            .map(|last| now.saturating_duration_since(last).as_millis());
+        if let Some(gap) = gap_ms {
+            self.max_read_gap_ms = self.max_read_gap_ms.max(gap);
+        }
+        self.last_rx_at = Some(now);
+        self.reads += 1;
+        self.rx_bytes += read_bytes as u64;
+
+        TuicTcpStreamReadEvent {
+            first_rx_ms,
+            gap_ms,
+            read_bytes,
+            rx_bytes: self.rx_bytes,
+            reads: self.reads,
+        }
+    }
+
+    fn close_snapshot(&self) -> TuicTcpStreamCloseSnapshot {
+        TuicTcpStreamCloseSnapshot {
+            first_rx_ms: self.first_rx_ms.unwrap_or(0),
+            max_read_gap_ms: self.max_read_gap_ms,
+            rx_bytes: self.rx_bytes,
+            reads: self.reads,
+        }
+    }
+}
+
+fn format_tuic_tcp_stream_first_rx_line(
+    meta: &TuicTcpStreamDiagMeta,
+    first_rx_ms: u128,
+    read_bytes: usize,
+    reads: u64,
+) -> String {
+    format!(
+        "🔎 tuic-tcp-stream-first-rx target={} conn={} id={} stream={} first_rx_ms={} read_bytes={} reads={}",
+        meta.target,
+        meta.conn_index,
+        meta.stable_id,
+        meta.stream_id,
+        first_rx_ms,
+        read_bytes,
+        reads
+    )
+}
+
+fn format_tuic_tcp_stream_read_gap_line(
+    meta: &TuicTcpStreamDiagMeta,
+    gap_ms: u128,
+    read_bytes: usize,
+    reads: u64,
+    rx_bytes: u64,
+) -> String {
+    format!(
+        "🔎 tuic-tcp-stream-read-gap target={} conn={} id={} stream={} gap_ms={} read_bytes={} reads={} rx_bytes={}",
+        meta.target,
+        meta.conn_index,
+        meta.stable_id,
+        meta.stream_id,
+        gap_ms,
+        read_bytes,
+        reads,
+        rx_bytes
+    )
+}
+
+fn format_tuic_tcp_stream_close_line(
+    meta: &TuicTcpStreamDiagMeta,
+    first_rx_ms: u128,
+    max_read_gap_ms: u128,
+    rx_bytes: u64,
+    reads: u64,
+) -> String {
+    format!(
+        "🔎 tuic-tcp-stream-close target={} conn={} id={} stream={} first_rx_ms={} max_read_gap_ms={} rx_bytes={} reads={}",
+        meta.target,
+        meta.conn_index,
+        meta.stable_id,
+        meta.stream_id,
+        first_rx_ms,
+        max_read_gap_ms,
+        rx_bytes,
+        reads
     )
 }
 
@@ -1530,19 +1742,28 @@ impl ProxyUpstream for TuicUpstream {
                 .open_bi()
                 .await
                 .map_err(|e| io_err("tuic open_bi", e))?;
+            let stable_id = conn.stable_id();
+            let stream_id = recv.id().0;
             send.write_all(&encode_connect(target))
                 .await
                 .map_err(|e| io_err("tuic connect write", e))?;
-            if tcp_diag_enabled() {
+            let tcp_stream_diag = if tcp_diag_enabled() {
                 println!(
                     "{}",
-                    format_tuic_tcp_open_line(target, conn_index, conn.stable_id())
+                    format_tuic_tcp_open_line(target, conn_index, stable_id)
                 );
-            }
+                Some(TuicTcpStreamDiag::new(
+                    TuicTcpStreamDiagMeta::new(target, conn_index, stable_id, stream_id),
+                    Instant::now(),
+                ))
+            } else {
+                None
+            };
             // 把双向流的收/发两半合成一条 AsyncRead+AsyncWrite，喂给现有双向泵。
             Ok::<RelayStream, ClientError>(Box::new(TrackedRelayStream::new(
                 tokio::io::join(recv, send),
                 lease,
+                tcp_stream_diag,
             )))
         };
         tokio::time::timeout(TUIC_OPEN_TIMEOUT, open)
@@ -1802,6 +2023,92 @@ mod tests {
         assert!(line.contains("target=1.2.3.4:5201"), "{line}");
         assert!(line.contains("conn=3"), "{line}");
         assert!(line.contains("id=42"), "{line}");
+    }
+
+    #[test]
+    fn format_tuic_tcp_stream_diag_lines_include_first_rx_and_gaps() {
+        let target = TargetAddr::parse("1.2.3.4:5201").unwrap();
+        let meta = TuicTcpStreamDiagMeta::new(&target, 3, 42, 8);
+        let first = format_tuic_tcp_stream_first_rx_line(&meta, 20_500, 35_244, 1);
+        let gap = format_tuic_tcp_stream_read_gap_line(&meta, 15_000, 39_884, 2, 75_128);
+        let close = format_tuic_tcp_stream_close_line(&meta, 20_500, 15_000, 109_304, 3);
+
+        assert!(first.contains("tuic-tcp-stream-first-rx"), "{first}");
+        assert!(first.contains("target=1.2.3.4:5201"), "{first}");
+        assert!(first.contains("conn=3"), "{first}");
+        assert!(first.contains("id=42"), "{first}");
+        assert!(first.contains("stream=8"), "{first}");
+        assert!(first.contains("first_rx_ms=20500"), "{first}");
+        assert!(first.contains("read_bytes=35244"), "{first}");
+        assert!(first.contains("reads=1"), "{first}");
+
+        assert!(gap.contains("tuic-tcp-stream-read-gap"), "{gap}");
+        assert!(gap.contains("gap_ms=15000"), "{gap}");
+        assert!(gap.contains("read_bytes=39884"), "{gap}");
+        assert!(gap.contains("rx_bytes=75128"), "{gap}");
+
+        assert!(close.contains("tuic-tcp-stream-close"), "{close}");
+        assert!(close.contains("first_rx_ms=20500"), "{close}");
+        assert!(close.contains("max_read_gap_ms=15000"), "{close}");
+        assert!(close.contains("rx_bytes=109304"), "{close}");
+        assert!(close.contains("reads=3"), "{close}");
+    }
+
+    #[test]
+    fn tuic_tcp_stream_diag_tracks_first_rx_and_read_gaps() {
+        let target = TargetAddr::parse("1.2.3.4:5201").unwrap();
+        let meta = TuicTcpStreamDiagMeta::new(&target, 3, 42, 8);
+        let start = std::time::Instant::now();
+        let mut diag = TuicTcpStreamDiag::new(meta, start);
+
+        let first = diag.note_read_at(35_244, start + std::time::Duration::from_millis(20_500));
+        assert_eq!(first.first_rx_ms, Some(20_500));
+        assert_eq!(first.gap_ms, None);
+        assert_eq!(first.rx_bytes, 35_244);
+        assert_eq!(first.reads, 1);
+
+        let second = diag.note_read_at(39_884, start + std::time::Duration::from_millis(35_500));
+        assert_eq!(second.first_rx_ms, None);
+        assert_eq!(second.gap_ms, Some(15_000));
+        assert_eq!(second.rx_bytes, 75_128);
+        assert_eq!(second.reads, 2);
+
+        let close = diag.close_snapshot();
+        assert_eq!(close.first_rx_ms, 20_500);
+        assert_eq!(close.max_read_gap_ms, 15_000);
+        assert_eq!(close.rx_bytes, 75_128);
+        assert_eq!(close.reads, 2);
+    }
+
+    #[tokio::test]
+    async fn tracked_relay_stream_records_nonempty_reads() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let target = TargetAddr::parse("1.2.3.4:5201").unwrap();
+        let meta = TuicTcpStreamDiagMeta::new(&target, 3, 42, 8);
+        let active = Arc::new(AtomicU64::new(0));
+        let (lease, _) = TcpPoolSlotLease::reserve(active);
+        let (mut writer, inner) = tokio::io::duplex(64);
+        let mut stream = TrackedRelayStream::new(
+            inner,
+            lease,
+            Some(TuicTcpStreamDiag::new(meta, std::time::Instant::now())),
+        );
+
+        writer.write_all(b"abc").await.unwrap();
+
+        let mut buf = [0u8; 3];
+        let read = stream.read(&mut buf).await.unwrap();
+
+        assert_eq!(read, 3);
+        assert_eq!(&buf, b"abc");
+        let snapshot = stream.tcp_diag.as_ref().unwrap().close_snapshot();
+        assert_eq!(snapshot.rx_bytes, 3);
+        assert_eq!(snapshot.reads, 1);
+        assert!(
+            snapshot.first_rx_ms < 1_000,
+            "first_rx_ms should be immediate in the in-memory stream: {snapshot:?}"
+        );
     }
 
     #[test]
