@@ -14,6 +14,10 @@ readonly DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES=16777216
 readonly DEFAULT_TUN_RX_DRAIN_BUDGET=0
 readonly DEFAULT_SERVER_EVIDENCE_SING_BOX_TAIL=220
 readonly DEFAULT_SERVER_EVIDENCE_TARGET_JOURNAL_TAIL=260
+readonly DEFAULT_KNIFE14_EXIT_HOST=43.153.32.33
+readonly DEFAULT_KNIFE14_TARGET_HOST=43.130.32.77
+readonly DEFAULT_KNIFE14_VPS_SSH_USER=ubuntu
+readonly DEFAULT_KNIFE14_VPS_SSH_KEY=/home/ubuntu/.ssh/vpn
 
 extract_client_tun_pids_from_ps() {
   awk '
@@ -142,6 +146,54 @@ sys.exit(0 if all(checks.values()) else 2)
 PY
 }
 
+server_evidence_default_ssh_host() {
+  local role="$1"
+  local host="$2"
+
+  case "$role:$host" in
+    exit:$DEFAULT_KNIFE14_EXIT_HOST | target:$DEFAULT_KNIFE14_TARGET_HOST)
+      printf '%s@%s' "$DEFAULT_KNIFE14_VPS_SSH_USER" "$host"
+      ;;
+  esac
+}
+
+server_evidence_default_ssh_key() {
+  local key_path="${KNIFE14_DEFAULT_VPS_SSH_KEY:-$DEFAULT_KNIFE14_VPS_SSH_KEY}"
+  if [[ -f "$key_path" ]]; then
+    printf '%s' "$key_path"
+  fi
+}
+
+apply_server_evidence_ssh_defaults() {
+  if [[ "$SERVER_EVIDENCE_CHECK" != "1" ]]; then
+    return 0
+  fi
+
+  local default_host default_key
+  if [[ -z "$EXIT_SSH_HOST" ]]; then
+    default_host="$(server_evidence_default_ssh_host exit "$EXIT_HOST")"
+    if [[ -n "$default_host" ]]; then
+      EXIT_SSH_HOST="$default_host"
+    fi
+  fi
+  if [[ -z "$TARGET_SSH_HOST" ]]; then
+    default_host="$(server_evidence_default_ssh_host target "$TARGET")"
+    if [[ -n "$default_host" ]]; then
+      TARGET_SSH_HOST="$default_host"
+    fi
+  fi
+
+  default_key="$(server_evidence_default_ssh_key)"
+  if [[ -n "$default_key" ]]; then
+    if [[ -n "$(server_evidence_default_ssh_host exit "$EXIT_HOST")" && -z "$EXIT_SSH_KEY" ]]; then
+      EXIT_SSH_KEY="$default_key"
+    fi
+    if [[ -n "$(server_evidence_default_ssh_host target "$TARGET")" && -z "$TARGET_SSH_KEY" ]]; then
+      TARGET_SSH_KEY="$default_key"
+    fi
+  fi
+}
+
 suite_self_test() {
   local sample expected actual help_text
 
@@ -219,6 +271,89 @@ EOF
     return 1
   fi
 
+  local tmp_key
+  tmp_key="$(mktemp "${TMPDIR:-/tmp}/knife14bp_vps_key.XXXXXX")" || return 1
+  if ! (
+    SERVER_EVIDENCE_CHECK=1
+    EXIT_HOST=43.153.32.33
+    TARGET=43.130.32.77
+    EXIT_SSH_HOST=""
+    TARGET_SSH_HOST=""
+    EXIT_SSH_KEY=""
+    TARGET_SSH_KEY=""
+    KNIFE14_DEFAULT_VPS_SSH_KEY="$tmp_key"
+    apply_server_evidence_ssh_defaults
+    [[ "$EXIT_SSH_HOST" == "ubuntu@43.153.32.33" ]] &&
+      [[ "$TARGET_SSH_HOST" == "ubuntu@43.130.32.77" ]] &&
+      [[ "$EXIT_SSH_KEY" == "$tmp_key" ]] &&
+      [[ "$TARGET_SSH_KEY" == "$tmp_key" ]]
+  ); then
+    rm -f "$tmp_key"
+    echo "suite self-test failed: server evidence defaults for known VPS topology" >&2
+    return 1
+  fi
+
+  if ! (
+    SERVER_EVIDENCE_CHECK=1
+    EXIT_HOST=43.153.32.33
+    TARGET=43.130.32.77
+    EXIT_SSH_HOST="custom-exit"
+    TARGET_SSH_HOST="custom-target"
+    EXIT_SSH_KEY="/custom/exit/key"
+    TARGET_SSH_KEY="/custom/target/key"
+    KNIFE14_DEFAULT_VPS_SSH_KEY="$tmp_key"
+    apply_server_evidence_ssh_defaults
+    [[ "$EXIT_SSH_HOST" == "custom-exit" ]] &&
+      [[ "$TARGET_SSH_HOST" == "custom-target" ]] &&
+      [[ "$EXIT_SSH_KEY" == "/custom/exit/key" ]] &&
+      [[ "$TARGET_SSH_KEY" == "/custom/target/key" ]]
+  ); then
+    rm -f "$tmp_key"
+    echo "suite self-test failed: server evidence defaults overwrote explicit SSH env" >&2
+    return 1
+  fi
+
+  if ! (
+    SERVER_EVIDENCE_CHECK=0
+    EXIT_HOST=43.153.32.33
+    TARGET=43.130.32.77
+    EXIT_SSH_HOST=""
+    TARGET_SSH_HOST=""
+    EXIT_SSH_KEY=""
+    TARGET_SSH_KEY=""
+    KNIFE14_DEFAULT_VPS_SSH_KEY="$tmp_key"
+    apply_server_evidence_ssh_defaults
+    [[ -z "$EXIT_SSH_HOST" ]] &&
+      [[ -z "$TARGET_SSH_HOST" ]] &&
+      [[ -z "$EXIT_SSH_KEY" ]] &&
+      [[ -z "$TARGET_SSH_KEY" ]]
+  ); then
+    rm -f "$tmp_key"
+    echo "suite self-test failed: server evidence defaults applied while disabled" >&2
+    return 1
+  fi
+
+  if ! (
+    SERVER_EVIDENCE_CHECK=1
+    EXIT_HOST=203.0.113.33
+    TARGET=203.0.113.77
+    EXIT_SSH_HOST=""
+    TARGET_SSH_HOST=""
+    EXIT_SSH_KEY=""
+    TARGET_SSH_KEY=""
+    KNIFE14_DEFAULT_VPS_SSH_KEY="$tmp_key"
+    apply_server_evidence_ssh_defaults
+    [[ -z "$EXIT_SSH_HOST" ]] &&
+      [[ -z "$TARGET_SSH_HOST" ]] &&
+      [[ -z "$EXIT_SSH_KEY" ]] &&
+      [[ -z "$TARGET_SSH_KEY" ]]
+  ); then
+    rm -f "$tmp_key"
+    echo "suite self-test failed: server evidence defaults applied to unknown topology" >&2
+    return 1
+  fi
+  rm -f "$tmp_key"
+
   echo "suite self-test passed"
 }
 
@@ -266,7 +401,7 @@ Optional env:
   EXIT_TO_TARGET_IPERF_REQUIRED=1 fail when enabled Exit<->Target check fails; set 0 to warn
   EXIT_SSH_HOST=""                SSH destination for Exit, e.g. ubuntu@43.153.32.33
   EXIT_SSH_PORT=22
-  EXIT_SSH_KEY=""                 optional private key for Exit SSH
+  EXIT_SSH_KEY=""                 optional private key for Exit SSH; known Knife14 evidence host uses /home/ubuntu/.ssh/vpn if present
   EXIT_SSH_STRICT_HOST_KEY_CHECKING=accept-new  noninteractive host-key policy for Exit SSH
   EXIT_SSH_KNOWN_HOSTS_FILE="$OUT_DIR/exit_ssh_known_hosts"
   SERVER_EVIDENCE_CHECK=0         collect bounded .33/.77 evidence around each probe
@@ -274,7 +409,7 @@ Optional env:
   SERVER_EVIDENCE_TARGET_JOURNAL_TAIL=260
   TARGET_SSH_HOST=""              SSH destination for Target, e.g. ubuntu@43.130.32.77
   TARGET_SSH_PORT=22
-  TARGET_SSH_KEY=""               optional private key for Target SSH
+  TARGET_SSH_KEY=""               optional private key for Target SSH; known Knife14 evidence host uses /home/ubuntu/.ssh/vpn if present
   TARGET_SSH_STRICT_HOST_KEY_CHECKING=accept-new
   TARGET_SSH_KNOWN_HOSTS_FILE="$OUT_DIR/target_ssh_known_hosts"
   RUN_REVERSE_FIRST_P1=0   run a fresh reverse-only P1 probe before the normal forward-first probe
@@ -1375,6 +1510,7 @@ case "$MINI_VPN_TUIC_SERVER" in
     ;;
   *) fail "MINI_VPN_TUIC_SERVER 必须包含 host:port，例如 43.153.32.33:8443" ;;
 esac
+apply_server_evidence_ssh_defaults
 
 append "- EXIT_HOST=$EXIT_HOST"
 append "- EXIT_PORT=$EXIT_PORT"
@@ -1400,6 +1536,12 @@ append "- MINI_VPN_TUN_RX_DRAIN_BUDGET=$MINI_VPN_TUN_RX_DRAIN_BUDGET"
 append "- SERVER_EVIDENCE_CHECK=$SERVER_EVIDENCE_CHECK"
 append "- SERVER_EVIDENCE_SING_BOX_TAIL=$SERVER_EVIDENCE_SING_BOX_TAIL"
 append "- SERVER_EVIDENCE_TARGET_JOURNAL_TAIL=$SERVER_EVIDENCE_TARGET_JOURNAL_TAIL"
+append "- EXIT_SSH_HOST=${EXIT_SSH_HOST:-<unset>}"
+if [[ -n "$EXIT_SSH_KEY" ]]; then
+  append "- EXIT_SSH_KEY=<set>"
+else
+  append "- EXIT_SSH_KEY=<unset>"
+fi
 append "- TARGET_SSH_HOST=${TARGET_SSH_HOST:-<unset>}"
 if [[ -n "$TARGET_SSH_KEY" ]]; then
   append "- TARGET_SSH_KEY=<set>"

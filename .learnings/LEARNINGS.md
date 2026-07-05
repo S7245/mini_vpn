@@ -2247,3 +2247,24 @@ worth cleaning up separately.
   TUN drops, and QUIC loss are all zero while the target sender is low, do not
   continue close-drain or egress-pacer patches. Instrument tx-queue-only
   backpressure and sender stalls next.
+
+## 2026-07-05 — Knife14bp defaults server evidence SSH for known VPS topology
+
+- Stage: Knife14bp local script/spec before VPS evidence acceptance.
+- Outcome: `scripts/knife14b-usclient-tunnel-suite.sh` now defaults
+  `EXIT_SSH_HOST` and `TARGET_SSH_HOST` for the known Knife14 `.33/.77`
+  topology when `SERVER_EVIDENCE_CHECK=1`. It also defaults the VPS key path
+  only when that file exists and the corresponding host is one of the known
+  acceptance hosts. Explicit SSH env values are preserved.
+- Code/spec:
+  `docs/tech/2026-07-05-knife14bp-server-evidence-defaults-spec.md`,
+  `docs/tech/2026-07-05-knife14bp-server-evidence-defaults-plan.md`, and
+  `scripts/knife14b-usclient-tunnel-suite.sh`.
+- Local gates passed: TDD self-test first failed on missing
+  `apply_server_evidence_ssh_defaults`; after implementation,
+  `scripts/knife14b-usclient-tunnel-suite.sh --self-test`,
+  `scripts/knife14b-lowrtt-probe.sh --self-test`, `bash -n`, and
+  `git diff --check` passed.
+- Reusable rule: when a VPS acceptance run needs server-side attribution,
+  make the known topology self-contained in the suite and test the defaults
+  offline. Do not depend on manual SSH envs for every run.
