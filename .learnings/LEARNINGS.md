@@ -2033,3 +2033,25 @@ worth cleaning up separately.
   low `data_poll_gap_max_ms` as evidence against local relay-task starvation;
   if both are high, inspect task wakeups/scheduling before blaming sing-box,
   target iperf, close-drain, or TUN egress.
+
+## 2026-07-05 — Knife14bj VPS poll-cadence run narrows starvation away from local polling
+
+- Stage: Knife14bj scoped reverse-first VPS acceptance.
+- Bundle:
+  `/tmp/mini_vpn/knife14bj_poll_20260705_131659/mvpn_knife14bj_poll_usclient_suite_20260705_131659.tar.gz`
+- Code under test: `4dc79af`.
+- Outcome: direct `.27 -> .77` and `.33 -> .77` baselines were healthy around
+  `279-282 Mbit/s`, `.33` had no sampled `fail auth`, and mini_vpn startup
+  confirmed `TUN RX drain budget: 0`. Reverse P1 still collapsed to
+  `0.210/0.019 Mbit/s`.
+- Key signal: the data stream showed `data_pending_gap_max_ms=20516` and only
+  `137520B` received, but `data_poll_gap_max_ms=5000` with `data_polls_max=123`.
+  Local downlink backpressure, global_rx pressure, TUN drops, and QUIC
+  loss/blocking stayed quiet.
+- Key lesson: Knife14bj excludes a full relay-task polling blackout for the
+  starvation window. The task is periodically re-polled, but the data stream
+  does not become ready for long gaps.
+- Reusable rule: after this shape, the next useful diagnostic must capture the
+  server/send side or stream readiness boundary. Do not keep changing local
+  close-drain, TUN egress, stale pool, egress pacing, or buffer sizes without
+  evidence that those paths are active in the clean window.

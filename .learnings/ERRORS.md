@@ -1263,3 +1263,28 @@
   verify with a sandbox-external `cargo test` before changing QUIC endpoint or
   transport code. Treat the sandbox failure as test-environment evidence, not
   a product regression.
+
+## 2026-07-05 — .27 non-login SSH shell does not expose cargo
+
+- Symptom: `ssh ... 'cd /home/ubuntu/mini_vpn && cargo build --release'`
+  failed on `.27` with `cargo: command not found`.
+- Fix: rerun through a login shell:
+  `bash -lc "cd /home/ubuntu/mini_vpn && cargo build --release"`.
+- Correct behavior: for `.27` remote builds, use `bash -lc` or explicitly
+  source the Rust environment before invoking cargo. Do not treat a non-login
+  shell `cargo` miss as a Rust build failure.
+
+## 2026-07-05 — Knife14bj poll diagnostics did not fix reverse starvation
+
+- Symptom: the `4dc79af` scoped reverse-first VPS suite measured only
+  `0.210/0.019 Mbit/s` even though `.27 -> .77` and `.33 -> .77` baselines
+  were healthy and `.33` reported no sampled `fail auth`.
+- Rejected interpretation: this bundle is not evidence for stale pool, TUN RX
+  drain, local TUN egress drops, global_rx pressure, downlink backpressure,
+  egress pacing, or clean-window QUIC loss/congestion. The data stream was
+  periodically polled (`data_poll_gap_max_ms=5000`) while its pending/read gaps
+  reached about `20.5s`.
+- Correct behavior: before any behavior code patch, add or collect
+  server-side/send-side diagnostics that prove whether `.77` sent little data,
+  sing-box stopped forwarding, or mini_vpn/quinn did not receive stream-ready
+  data. Do not keep patching local lifecycle paths without that evidence.
