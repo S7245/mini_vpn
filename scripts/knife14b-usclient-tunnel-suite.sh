@@ -11,6 +11,7 @@ readonly DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES=""
 readonly DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES=""
 readonly DEFAULT_DOWNLINK_FLUSH_MAX_BYTES=262144
 readonly DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES=16777216
+readonly DEFAULT_TUN_RX_DRAIN_BUDGET=8
 
 extract_client_tun_pids_from_ps() {
   awk '
@@ -83,6 +84,14 @@ EOF
     echo "suite self-test failed: downlink egress help default drifted" >&2
     return 1
   fi
+  if ! grep -q "MINI_VPN_TUN_RX_DRAIN_BUDGET=$DEFAULT_TUN_RX_DRAIN_BUDGET" <<<"$help_text"; then
+    echo "suite self-test failed: tun rx drain budget help default drifted" >&2
+    return 1
+  fi
+  if ! grep -q "STOP_AFTER_REVERSE_FIRST_P1=0" <<<"$help_text"; then
+    echo "suite self-test failed: reverse-only stop help missing" >&2
+    return 1
+  fi
 
   echo "suite self-test passed"
 }
@@ -135,6 +144,7 @@ Optional env:
   EXIT_SSH_STRICT_HOST_KEY_CHECKING=accept-new  noninteractive host-key policy for Exit SSH
   EXIT_SSH_KNOWN_HOSTS_FILE="$OUT_DIR/exit_ssh_known_hosts"
   RUN_REVERSE_FIRST_P1=0   run a fresh reverse-only P1 probe before the normal forward-first probe
+  STOP_AFTER_REVERSE_FIRST_P1=0  stop after the fresh reverse-only P1 and final snapshots
   WAIT_QUIET_BEFORE_FULL=1  after standalone P1, wait for active relays to drop before full sweep
   QUIET_TIMEOUT_SECS=20
   QUIET_POLL_SECS=1
@@ -147,6 +157,7 @@ Optional env:
   MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=<auto>   empty/unset lets mini_vpn scale to TCP tx buffer / 4
   MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=262144
   MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=16777216
+  MINI_VPN_TUN_RX_DRAIN_BUDGET=8   set 0 to disable opportunistic TUN ingress drain during A/B
 
 Output:
   /tmp/conn/mvpn_knife14c_usclient_suite_<timestamp>.md
@@ -197,6 +208,7 @@ EXIT_SSH_KEY="${EXIT_SSH_KEY:-}"
 EXIT_SSH_STRICT_HOST_KEY_CHECKING="${EXIT_SSH_STRICT_HOST_KEY_CHECKING:-accept-new}"
 EXIT_SSH_KNOWN_HOSTS_FILE="${EXIT_SSH_KNOWN_HOSTS_FILE:-$OUT_DIR/exit_ssh_known_hosts}"
 RUN_REVERSE_FIRST_P1="${RUN_REVERSE_FIRST_P1:-0}"
+STOP_AFTER_REVERSE_FIRST_P1="${STOP_AFTER_REVERSE_FIRST_P1:-0}"
 WAIT_QUIET_BEFORE_FULL="${WAIT_QUIET_BEFORE_FULL:-1}"
 QUIET_TIMEOUT_SECS="${QUIET_TIMEOUT_SECS:-20}"
 QUIET_POLL_SECS="${QUIET_POLL_SECS:-1}"
@@ -908,6 +920,7 @@ export MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES="${MINI_VPN_DOWNLINK_BACKPRESSU
 export MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES="${MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES:-$DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES}"
 export MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES="${MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES:-$DEFAULT_DOWNLINK_FLUSH_MAX_BYTES}"
 export MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES="${MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES:-$DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES}"
+export MINI_VPN_TUN_RX_DRAIN_BUDGET="${MINI_VPN_TUN_RX_DRAIN_BUDGET:-$DEFAULT_TUN_RX_DRAIN_BUDGET}"
 
 case "$MINI_VPN_TUIC_SERVER" in
   *:*)
@@ -926,6 +939,7 @@ append "- MINI_VPN_TUIC_CC=$MINI_VPN_TUIC_CC"
 append "- CC_SWEEP=${CC_SWEEP:-<single>}"
 append "- CC_VARIANT_LABEL=${CC_VARIANT_LABEL:-<none>}"
 append "- RUN_REVERSE_FIRST_P1=$RUN_REVERSE_FIRST_P1"
+append "- STOP_AFTER_REVERSE_FIRST_P1=$STOP_AFTER_REVERSE_FIRST_P1"
 append "- TUN_TX_QUEUE_LEN=${TUN_TX_QUEUE_LEN:-<default>}"
 append "- MINI_VPN_TUIC_UDP_MODE=$MINI_VPN_TUIC_UDP_MODE"
 append "- MINI_VPN_TUIC_ZERO_RTT=$MINI_VPN_TUIC_ZERO_RTT"
@@ -936,6 +950,7 @@ append "- MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=${MINI_VPN_DOWNLINK_BACKPRES
 append "- MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=${MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES:-<auto>}"
 append "- MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=$MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES"
 append "- MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=$MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES"
+append "- MINI_VPN_TUN_RX_DRAIN_BUDGET=$MINI_VPN_TUN_RX_DRAIN_BUDGET"
 
 if [[ "$MINI_VPN_TUIC_ALPN" != "h3" ]]; then
   warn "MINI_VPN_TUIC_ALPN=$MINI_VPN_TUIC_ALPN, but current sing-box config says h3."
@@ -1030,7 +1045,7 @@ append ""
 append "## Start mini_vpn client-tun"
 : > "$CLIENT_LOG"
 append "- client_log: $CLIENT_LOG"
-append "- command: sudo -E env MINI_VPN_TUN_MTU=$MTU MINI_VPN_TCP_DIAG=$MINI_VPN_TCP_DIAG MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS=$METRICS_SECS MINI_VPN_TUIC_CC=$MINI_VPN_TUIC_CC MINI_VPN_TUIC_TCP_POOL=$MINI_VPN_TUIC_TCP_POOL MINI_VPN_TCP_RX_BUFFER_BYTES=$MINI_VPN_TCP_RX_BUFFER_BYTES MINI_VPN_TCP_TX_BUFFER_BYTES=$MINI_VPN_TCP_TX_BUFFER_BYTES MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=$MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=$MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES $BIN client-tun"
+append "- command: sudo -E env MINI_VPN_TUN_MTU=$MTU MINI_VPN_TCP_DIAG=$MINI_VPN_TCP_DIAG MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS=$METRICS_SECS MINI_VPN_TUIC_CC=$MINI_VPN_TUIC_CC MINI_VPN_TUIC_TCP_POOL=$MINI_VPN_TUIC_TCP_POOL MINI_VPN_TCP_RX_BUFFER_BYTES=$MINI_VPN_TCP_RX_BUFFER_BYTES MINI_VPN_TCP_TX_BUFFER_BYTES=$MINI_VPN_TCP_TX_BUFFER_BYTES MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=$MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=$MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES MINI_VPN_TUN_RX_DRAIN_BUDGET=$MINI_VPN_TUN_RX_DRAIN_BUDGET $BIN client-tun"
 sudo -E env MINI_VPN_TUN_MTU="$MTU" MINI_VPN_TCP_DIAG="$MINI_VPN_TCP_DIAG" MINI_VPN_PROFILE_LOOP=1 \
   MINI_VPN_METRICS_SECS="$METRICS_SECS" MINI_VPN_TUIC_CC="$MINI_VPN_TUIC_CC" \
   MINI_VPN_TUIC_TCP_POOL="$MINI_VPN_TUIC_TCP_POOL" \
@@ -1040,6 +1055,7 @@ sudo -E env MINI_VPN_TUN_MTU="$MTU" MINI_VPN_TCP_DIAG="$MINI_VPN_TCP_DIAG" MINI_
   MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES="$MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES" \
   MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES="$MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES" \
   MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES="$MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES" \
+  MINI_VPN_TUN_RX_DRAIN_BUDGET="$MINI_VPN_TUN_RX_DRAIN_BUDGET" \
   "$BIN" client-tun > "$CLIENT_LOG" 2>&1 &
 VPN_PID=$!
 append "- launcher_pid: $VPN_PID"
@@ -1114,7 +1130,12 @@ proceed_to_standard_p1=1
 if [[ "$RUN_REVERSE_FIRST_P1" == "1" ]]; then
   run_lowrtt_probe "mtu${MTU}_reverse_first_p1" "1" "$DURATION" "reverse-only" || true
   REVERSE_FIRST_END_LINE="$(client_log_line_count)"
-  if [[ "$WAIT_QUIET_BEFORE_FULL" == "1" ]]; then
+  if [[ "$STOP_AFTER_REVERSE_FIRST_P1" == "1" ]]; then
+    proceed_to_standard_p1=0
+    append ""
+    append "## Standard P1 / Full Sweep Skipped"
+    append "STOP_AFTER_REVERSE_FIRST_P1=1；只保留 clean reverse-first P1 窗口，随后采集 final snapshots 和 bundle。"
+  elif [[ "$WAIT_QUIET_BEFORE_FULL" == "1" ]]; then
     if ! wait_for_quiet_tunnel "standard P1 probe" "$REVERSE_FIRST_END_LINE"; then
       proceed_to_standard_p1=0
       append ""
@@ -1129,7 +1150,11 @@ if [[ "$proceed_to_standard_p1" == "1" ]]; then
 else
   append ""
   append "## Standard P1 Probe Skipped"
-  append "see reverse-first quiet wait result above."
+  if [[ "$STOP_AFTER_REVERSE_FIRST_P1" == "1" ]]; then
+    append "STOP_AFTER_REVERSE_FIRST_P1=1."
+  else
+    append "see reverse-first quiet wait result above."
+  fi
 fi
 MTU_P1_OUT="$OUT_DIR/mvpn_${SUITE_TAG}_usclient_tunnel_mtu${MTU}_p1_${TS}.md"
 P1_END_LINE="$(client_log_line_count)"
@@ -1152,7 +1177,11 @@ else
   if [[ "$proceed_to_standard_p1" == "1" ]]; then
     append "MTU=$MTU P1 没有 receiver 结果，说明 tunnel 基础连通/iperf 控制连接已经失败；跳过 full sweep，避免浪费时间。"
   else
-    append "standard P1 已因 reverse-first quiet wait 未通过而跳过；full sweep 同步跳过。"
+    if [[ "$STOP_AFTER_REVERSE_FIRST_P1" == "1" ]]; then
+      append "STOP_AFTER_REVERSE_FIRST_P1=1；full sweep 同步跳过。"
+    else
+      append "standard P1 已因 reverse-first quiet wait 未通过而跳过；full sweep 同步跳过。"
+    fi
   fi
 fi
 

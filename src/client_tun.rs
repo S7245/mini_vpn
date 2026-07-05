@@ -68,8 +68,10 @@ const METRICS_SNAPSHOT_SECS: u64 = 30;
 /// Knife14bf：低频 TUN egress drop feedback 控制周期。1s 足够覆盖 30s reverse probe，
 /// 也避免把 Linux sysfs 读取放进每包热路径。
 const TUN_EGRESS_FEEDBACK_SAMPLE_SECS: u64 = 1;
-/// Knife14bg：远端下行压力下，最多顺手处理多少个已 ready 的 TUN ingress 包。
-const TUN_RX_DRAIN_BUDGET: usize = 8;
+/// Knife14bg：远端下行压力下，默认最多顺手处理多少个已 ready 的 TUN ingress 包。
+const DEFAULT_TUN_RX_DRAIN_BUDGET: usize = 8;
+/// Knife14bh：TUN RX drain 是诊断/公平性路径，允许 A/B 关闭或小幅放大，禁止无界热路径扫描。
+const MAX_TUN_RX_DRAIN_BUDGET: usize = 64;
 
 /// 刀13 ①：解析 `MINI_VPN_TRACE`（`1`/`true`，去空白、不区分大小写 → 开；其它/缺省 → 关）。
 /// 对齐 [`parse_profile_loop`] 惯用法；抽纯函数便于单测（`trace_enabled` 只是它 + `OnceLock` 包壳）。
@@ -1978,6 +1980,7 @@ pub struct TunRuntimeConfig {
     downlink_flush_max_bytes: usize,
     downlink_egress_immediate_bytes: usize,
     tcp_socket_buffers: TcpSocketBufferConfig,
+    tun_rx_drain_budget: usize,
 }
 
 impl TunRuntimeConfig {
@@ -1992,6 +1995,7 @@ impl TunRuntimeConfig {
             downlink_flush_max_bytes: DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
             downlink_egress_immediate_bytes: DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES,
             tcp_socket_buffers: TcpSocketBufferConfig::default(),
+            tun_rx_drain_budget: DEFAULT_TUN_RX_DRAIN_BUDGET,
         })
     }
 
@@ -2035,6 +2039,11 @@ impl TunRuntimeConfig {
                 .ok()
                 .as_deref(),
         );
+        cfg.tun_rx_drain_budget = parse_tun_rx_drain_budget(
+            std::env::var("MINI_VPN_TUN_RX_DRAIN_BUDGET")
+                .ok()
+                .as_deref(),
+        );
         Ok(cfg)
     }
 }
@@ -2052,6 +2061,13 @@ fn parse_tun_mtu(s: Option<&str>) -> usize {
     s.and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| (MIN_TUN_MTU..=MAX_TUN_MTU).contains(&n))
         .unwrap_or(DEFAULT_TUN_MTU)
+}
+
+/// Knife14bh：`0` 明确关闭 opportunistic drain；非法/越界回落默认，避免误把热路径扫成无界循环。
+fn parse_tun_rx_drain_budget(s: Option<&str>) -> usize {
+    s.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n <= MAX_TUN_RX_DRAIN_BUDGET)
+        .unwrap_or(DEFAULT_TUN_RX_DRAIN_BUDGET)
 }
 
 /// 刀12：解析 `MINI_VPN_PROFILE_LOOP`：`1`/`true`（不区分大小写、去空白）→ 开；其它/缺省 → 关。
@@ -2146,6 +2162,10 @@ pub async fn start_tun_proxy() {
         "🧱 TCP socket buffers: rx={}B tx={}B（MINI_VPN_TCP_*_BUFFER_BYTES 可调）",
         runtime_config.tcp_socket_buffers.rx_bytes,
         runtime_config.tcp_socket_buffers.tx_bytes
+    );
+    println!(
+        "🧺 TUN RX drain budget: {} packets/pass（MINI_VPN_TUN_RX_DRAIN_BUDGET=0 可关闭）",
+        runtime_config.tun_rx_drain_budget
     );
 
     // 1. 初始化 TUN 设备 / 创建操作系统的原生异步虚拟网卡。
@@ -2387,6 +2407,7 @@ pub async fn run_event_loop<D, U, M>(
     let mut tcp_loop_flush_tx_failures: u64 = 0;
     let downlink_backpressure = runtime_config.downlink_backpressure;
     let downlink_flush_max_bytes = runtime_config.downlink_flush_max_bytes;
+    let tun_rx_drain_budget = runtime_config.tun_rx_drain_budget;
     let mut downlink_egress_pacer =
         DownlinkEgressPacer::new(runtime_config.downlink_egress_immediate_bytes);
     let mut tun_egress_drop_sampler = TunEgressDropSampler::new(device.interface_name());
@@ -2476,7 +2497,7 @@ pub async fn run_event_loop<D, U, M>(
                                 &mut tcp_loop_flush_tx_calls,
                                 &mut tcp_loop_flush_tx_failures,
                                 &mut tun_rx_drain_diag,
-                                TUN_RX_DRAIN_BUDGET,
+                                tun_rx_drain_budget,
                                 "remote_payload",
                             )
                             .await;
@@ -5969,6 +5990,7 @@ mod tests {
             config.downlink_egress_immediate_bytes,
             DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES
         );
+        assert_eq!(config.tun_rx_drain_budget, DEFAULT_TUN_RX_DRAIN_BUDGET);
     }
 
     /// 刀11：MINI_VPN_METRICS_SECS 解析——有效正整数采用；0/非数字/缺失回落默认（防 interval panic）。
@@ -6007,6 +6029,28 @@ mod tests {
         assert_eq!(parse_tun_mtu(Some("abc")), DEFAULT_TUN_MTU);
         assert_eq!(parse_tun_mtu(Some("")), DEFAULT_TUN_MTU);
         assert_eq!(parse_tun_mtu(None), DEFAULT_TUN_MTU);
+    }
+
+    #[test]
+    fn parse_tun_rx_drain_budget_allows_zero_and_bounds() {
+        assert_eq!(
+            parse_tun_rx_drain_budget(None),
+            DEFAULT_TUN_RX_DRAIN_BUDGET
+        );
+        assert_eq!(
+            parse_tun_rx_drain_budget(Some("abc")),
+            DEFAULT_TUN_RX_DRAIN_BUDGET
+        );
+        assert_eq!(parse_tun_rx_drain_budget(Some("0")), 0);
+        assert_eq!(parse_tun_rx_drain_budget(Some(" 8 ")), 8);
+        assert_eq!(
+            parse_tun_rx_drain_budget(Some("64")),
+            MAX_TUN_RX_DRAIN_BUDGET
+        );
+        assert_eq!(
+            parse_tun_rx_drain_budget(Some("65")),
+            DEFAULT_TUN_RX_DRAIN_BUDGET
+        );
     }
 
     #[test]
