@@ -1327,3 +1327,17 @@
 - Correct behavior: whenever a `.27` suite may need `sudo -v`, set both remote
   `ssh -tt` and local exec `tty=true` from the beginning. Do not rely on
   `ssh -tt` alone.
+
+## 2026-07-05 — Knife14bm failed in a non-comparable no-data-stream shape
+
+- Symptom: the `3d06bea` recent-pressure VPS run measured only
+  `1.19/0.00 Mbit/s`; `.77` sender stopped after `4.25 MiB`, mini_vpn data
+  stream first RX arrived after about `37.6s`, and the clean window had no TUN
+  drops, downlink backpressure, QUIC loss, or terminal pending.
+- Rejected interpretation: this is not evidence that the recent-pressure latch
+  made TUN egress worse, and it is not a valid replay of Knife14bl's
+  `130 Mbit/s` tail-collapse with sampled TUN drops.
+- Correct behavior: after a repair run changes failure shape this sharply,
+  stop before new behavior-code edits. Record the result, compare same-window
+  behavior or tighten attribution, then proceed only after confirming the next
+  plan.

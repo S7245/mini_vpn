@@ -2160,3 +2160,23 @@ worth cleaning up separately.
 - Reusable rule: keep TUN drop attribution bounded to the next feedback sample;
   only latch high-watermark pressure, not arbitrary small queues, so unrelated
   future drops do not trigger false global_rx pauses.
+
+## 2026-07-05 — Knife14bm VPS run did not exercise the recent-pressure latch
+
+- Stage: Knife14bm scoped VPS acceptance for `3d06bea`.
+- Bundle:
+  `/tmp/mini_vpn/knife14bm_recent_pressure_20260705_154706/mvpn_knife14bm_recent_pressure_usclient_suite_20260705_154706.tar.gz`
+- Outcome: reverse-first P1 regressed to `1.19/0.00 Mbit/s`, but this was not
+  the Knife14bl TUN-pressure tail-collapse shape. `.77` iperf3 also sent only
+  `4.25 MBytes / 1.19 Mbit/s`, mini_vpn data stream first RX was delayed until
+  about `37.6s`, and local egress stayed quiet:
+  `tun_tx_dropped_delta=0`, `downlink_backpressure pause_edges=0`,
+  `terminal_pending_reap=0`.
+- Key lesson: this VPS run cannot validate or reject the recent-pressure latch
+  because no TUN drop or local pressure existed to classify. The evidence
+  points back to receive-window/ACK-path or stream readiness starvation before
+  local egress.
+- Reusable rule: when target sender bytes are also low and local egress counters
+  are quiet, do not continue TUN feedback tuning. First run a bounded same-window
+  A/B or add attribution that separates code regression from VPS stream-readiness
+  variance, then choose the next behavior branch.
