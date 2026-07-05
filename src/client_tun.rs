@@ -68,6 +68,8 @@ const METRICS_SNAPSHOT_SECS: u64 = 30;
 /// Knife14bf：低频 TUN egress drop feedback 控制周期。1s 足够覆盖 30s reverse probe，
 /// 也避免把 Linux sysfs 读取放进每包热路径。
 const TUN_EGRESS_FEEDBACK_SAMPLE_SECS: u64 = 1;
+/// Knife14bg：远端下行压力下，最多顺手处理多少个已 ready 的 TUN ingress 包。
+const TUN_RX_DRAIN_BUDGET: usize = 8;
 
 /// 刀13 ①：解析 `MINI_VPN_TRACE`（`1`/`true`，去空白、不区分大小写 → 开；其它/缺省 → 关）。
 /// 对齐 [`parse_profile_loop`] 惯用法；抽纯函数便于单测（`trace_enabled` 只是它 + `OnceLock` 包壳）。
@@ -1738,6 +1740,76 @@ fn format_tun_egress_diag(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunRxPacketKind {
+    Tcp,
+    Dns,
+    Udp,
+}
+
+#[derive(Debug, Default, Clone)]
+struct TunRxDrainDiag {
+    attempts: u64,
+    packets: u64,
+    tcp_packets: u64,
+    dns_packets: u64,
+    udp_packets: u64,
+    budget_exhausted: u64,
+    would_block: u64,
+    errors: u64,
+}
+
+impl TunRxDrainDiag {
+    fn note_attempt(&mut self) {
+        self.attempts = self.attempts.saturating_add(1);
+    }
+
+    fn note_packet(&mut self, kind: TunRxPacketKind) {
+        self.packets = self.packets.saturating_add(1);
+        match kind {
+            TunRxPacketKind::Tcp => {
+                self.tcp_packets = self.tcp_packets.saturating_add(1);
+            }
+            TunRxPacketKind::Dns => {
+                self.dns_packets = self.dns_packets.saturating_add(1);
+            }
+            TunRxPacketKind::Udp => {
+                self.udp_packets = self.udp_packets.saturating_add(1);
+            }
+        }
+    }
+
+    fn note_budget_exhausted(&mut self) {
+        self.budget_exhausted = self.budget_exhausted.saturating_add(1);
+    }
+
+    fn note_would_block(&mut self) {
+        self.would_block = self.would_block.saturating_add(1);
+    }
+
+    fn note_error(&mut self) {
+        self.errors = self.errors.saturating_add(1);
+    }
+}
+
+fn format_tun_rx_drain_diag(diag: &TunRxDrainDiag) -> String {
+    format!(
+        "🔎 tcp-tun-rx-drain attempts={} packets={} tcp={} dns={} udp={} budget_exhausted={} would_block={} errors={}",
+        diag.attempts,
+        diag.packets,
+        diag.tcp_packets,
+        diag.dns_packets,
+        diag.udp_packets,
+        diag.budget_exhausted,
+        diag.would_block,
+        diag.errors
+    )
+}
+
+fn should_drain_tun_rx_after_remote_payload(ctx: Option<&SocketCtx>, accepted_bytes: usize) -> bool {
+    accepted_bytes > 0 || ctx.map(|c| !c.downlink_pending.is_empty()).unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DownlinkEgressPacer {
     immediate_budget_bytes: usize,
     remaining_immediate_bytes: usize,
@@ -2319,6 +2391,7 @@ pub async fn run_event_loop<D, U, M>(
         DownlinkEgressPacer::new(runtime_config.downlink_egress_immediate_bytes);
     let mut tun_egress_drop_sampler = TunEgressDropSampler::new(device.interface_name());
     let mut tun_egress_feedback = TunEgressFeedbackState::default();
+    let mut tun_rx_drain_diag = TunRxDrainDiag::default();
     let mut downlink_rx_paused = false;
 
     loop {
@@ -2379,6 +2452,35 @@ pub async fn run_event_loop<D, U, M>(
                         {
                             dirty.insert(handle);
                         }
+                        if should_drain_tun_rx_after_remote_payload(
+                            socket_ctxs.get(&handle),
+                            accepted_bytes,
+                        ) {
+                            drain_ready_tun_rx(
+                                &mut device,
+                                &mut assoc_table,
+                                &mut fake_pool,
+                                &upstream,
+                                udp_clock.elapsed().as_secs(),
+                                &metrics_handle,
+                                &mut registry,
+                                &mut sockets,
+                                &mut socket_ctxs,
+                                &mut iface,
+                                &mut dirty,
+                                &handshake_done_tx,
+                                &global_tx,
+                                &mut metrics,
+                                downlink_flush_max_bytes,
+                                downlink_backpressure,
+                                &mut tcp_loop_flush_tx_calls,
+                                &mut tcp_loop_flush_tx_failures,
+                                &mut tun_rx_drain_diag,
+                                TUN_RX_DRAIN_BUDGET,
+                                "remote_payload",
+                            )
+                            .await;
+                        }
                     }
                     RelayEvent::Closed(close) => {
                         if handle_relay_closed(
@@ -2401,99 +2503,28 @@ pub async fn run_event_loop<D, U, M>(
             res = device.wait_for_rx() =>{
                 metrics.loop_park_end();
                 if res.is_ok(){
-                    // rx 分流（stage-12 D1 + 刀5）：任意 :53 → 裸包 DNS 劫持；其它 UDP → 裸 relay；
-                    // 非 UDP → 既有 smoltcp 路径。前两类 take 走、不进 iface.poll。
-                    let class = device.rx_peek().map(classify_inbound);
-                    if class == Some(Inbound::UdpRelay) {
-                        if let Some(pkt) = device.rx_take() {
-                            // Stage 13b: UDP → 编码 TUIC Packet → send_udp。
-                            handle_tuic_udp_uplink(
-                                &pkt,
-                                &mut assoc_table,
-                                &mut fake_pool,
-                                &*upstream,
-                                udp_clock.elapsed().as_secs(),
-                            )
-                            .await;
-                        }
-                    } else if class == Some(Inbound::Dns) {
-                        // 刀5：任意 resolver 的明文 :53 → 裸包伪造 fake-IP 回包（绕过 smoltcp）。
-                        if let Some(pkt) = device.rx_take() {
-                            handle_dns_hijack(
-                                &pkt,
-                                &mut fake_pool,
-                                &mut device,
-                                udp_clock.elapsed().as_secs(),
-                                &metrics_handle,
-                            )
-                            .await;
-                        }
-                    } else {
-                        // 1) SYN inspector + 脏集合标脏：在 iface.poll 之前看一眼包。
-                        //    - 干净 SYN 去往新端口 → 立刻建监听池，smoltcp 同一帧就能 accept。
-                        //    - 任意去往拦截端口的 TCP 包 → 把该端口 pool 标脏（#1），覆盖 SYN 之后
-                        //      让 listener can_recv 的首个 data 包；relay 段只处理脏集合，不再全扫。
-                        if let Some(buf) = device.rx_peek()
-                            && let Some((port, is_clean_syn)) = inspect_inbound_tcp(buf)
-                        {
-                            if is_clean_syn {
-                                if let Err(e) =
-                                    registry.ensure_port(port, &mut sockets, &mut socket_ctxs)
-                                {
-                                    println!(
-                                        "⚠️ intercepted port cap reached, drop SYN to port {port}: {:?}",
-                                        e
-                                    );
-                                }
-                                // #2 弹性扩容：SYN accept 前确保该端口有空闲 listening 槽吸收突发，
-                                // 打掉「每端口 pool_size 固定上限」导致的热门端口 stall。全局 cap 兜底。
-                                if let Err(e) = registry.ensure_spare_listeners(
-                                    port,
-                                    MIN_SPARE_LISTENERS,
-                                    &mut sockets,
-                                    &mut socket_ctxs,
-                                ) {
-                                    println!(
-                                        "⚠️ global listener cap reached, 端口 {port} 无法弹性扩容: {:?}",
-                                        e
-                                    );
-                                }
-                            }
-                            // 任意去往拦截端口的 TCP 包 → 标脏该端口 pool（覆盖 SYN 之后的首个 data 包）。
-                            for &h in registry.handles_for_port(port) {
-                                dirty.insert(h);
-                            }
-                        }
-
-                        metrics.enter_poll();
-                        let timestamp = smoltcp::time::Instant::now();
-                        iface.poll(timestamp, &mut device, &mut sockets);
-                        tcp_loop_flush_tx_calls += 1;
-                        if let Err(e) = device.flush_tx().await {
-                            tcp_loop_flush_tx_failures += 1;
-                            tcp_diag_log!(
-                                "🔎 tcp-loop-flush-tx-fail stage=inbound_poll calls={} failures={} err={e}",
-                                tcp_loop_flush_tx_calls, tcp_loop_flush_tx_failures
-                            );
-                        }
-                        metrics.leave_poll();
-
-                        process_dirty_relay(
-                            &mut dirty,
-                            &mut sockets,
-                            &mut socket_ctxs,
-                            &upstream,
-                            &handshake_done_tx,
-                            &global_tx,
-                            &mut fake_pool,
-                            udp_clock.elapsed().as_secs(),
-                            &metrics_handle,
-                            &mut metrics,
-                            downlink_flush_max_bytes,
-                            downlink_backpressure,
-                        )
-                        .await;
-                    }
+                    process_ready_tun_rx_packet(
+                        &mut device,
+                        &mut assoc_table,
+                        &mut fake_pool,
+                        &upstream,
+                        udp_clock.elapsed().as_secs(),
+                        &metrics_handle,
+                        &mut registry,
+                        &mut sockets,
+                        &mut socket_ctxs,
+                        &mut iface,
+                        &mut dirty,
+                        &handshake_done_tx,
+                        &global_tx,
+                        &mut metrics,
+                        downlink_flush_max_bytes,
+                        downlink_backpressure,
+                        &mut tcp_loop_flush_tx_calls,
+                        &mut tcp_loop_flush_tx_failures,
+                        "inbound_poll",
+                    )
+                    .await;
                 }
             }
             // 刀9 M3 / 刀14d：spawn 出主循环的 remote-open 完成 → 安装 relay（成功）/ rearm（失败），
@@ -2578,6 +2609,7 @@ pub async fn run_event_loop<D, U, M>(
                     "{}",
                     format_tcp_downlink_flush_diag(&tcp_downlink, dirty.len())
                 );
+                tcp_diag_log!("{}", format_tun_rx_drain_diag(&tun_rx_drain_diag));
                 // 刀12：紧挨 📊 行打 🔬 主循环归因行（profiler 关闭时 NoopSink::report 空、零开销）。
                 metrics.report();
             }
@@ -2655,6 +2687,195 @@ pub async fn run_event_loop<D, U, M>(
         //（NoopSink::loop_park_begin 空、零开销；仅 LoopProfiler 采时钟）。
         metrics.loop_park_begin();
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_ready_tun_rx_packet<D, U, M>(
+    device: &mut D,
+    assoc_table: &mut AssocTable,
+    fake_pool: &mut FakeIpPool,
+    upstream: &Arc<U>,
+    now_secs: u64,
+    metrics_handle: &Metrics,
+    registry: &mut ListenerRegistry,
+    sockets: &mut SocketSet<'static>,
+    socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
+    iface: &mut Interface,
+    dirty: &mut HashSet<SocketHandle>,
+    handshake_done_tx: &mpsc::Sender<HandshakeDone>,
+    global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    metrics: &mut M,
+    downlink_flush_max_bytes: usize,
+    downlink_backpressure: DownlinkBackpressureConfig,
+    tcp_loop_flush_tx_calls: &mut u64,
+    tcp_loop_flush_tx_failures: &mut u64,
+    poll_stage: &str,
+) -> TunRxPacketKind
+where
+    D: TunIo,
+    U: ProxyUpstream + DatagramUpstream + 'static,
+    M: MetricsSink,
+{
+    // rx 分流（stage-12 D1 + 刀5）：任意 :53 → 裸包 DNS 劫持；其它 UDP → 裸 relay；
+    // 非 UDP → 既有 smoltcp 路径。前两类 take 走、不进 iface.poll。
+    let class = device.rx_peek().map(classify_inbound);
+    if class == Some(Inbound::UdpRelay) {
+        if let Some(pkt) = device.rx_take() {
+            handle_tuic_udp_uplink(&pkt, assoc_table, fake_pool, upstream.as_ref(), now_secs).await;
+        }
+        return TunRxPacketKind::Udp;
+    }
+    if class == Some(Inbound::Dns) {
+        if let Some(pkt) = device.rx_take() {
+            handle_dns_hijack(&pkt, fake_pool, device, now_secs, metrics_handle).await;
+        }
+        return TunRxPacketKind::Dns;
+    }
+
+    // 1) SYN inspector + 脏集合标脏：在 iface.poll 之前看一眼包。
+    //    - 干净 SYN 去往新端口 → 立刻建监听池，smoltcp 同一帧就能 accept。
+    //    - 任意去往拦截端口的 TCP 包 → 把该端口 pool 标脏（#1）。
+    if let Some(buf) = device.rx_peek()
+        && let Some((port, is_clean_syn)) = inspect_inbound_tcp(buf)
+    {
+        if is_clean_syn {
+            if let Err(e) = registry.ensure_port(port, sockets, socket_ctxs) {
+                println!(
+                    "⚠️ intercepted port cap reached, drop SYN to port {port}: {:?}",
+                    e
+                );
+            }
+            if let Err(e) = registry.ensure_spare_listeners(
+                port,
+                MIN_SPARE_LISTENERS,
+                sockets,
+                socket_ctxs,
+            ) {
+                println!(
+                    "⚠️ global listener cap reached, 端口 {port} 无法弹性扩容: {:?}",
+                    e
+                );
+            }
+        }
+        for &h in registry.handles_for_port(port) {
+            dirty.insert(h);
+        }
+    }
+
+    metrics.enter_poll();
+    let timestamp = smoltcp::time::Instant::now();
+    iface.poll(timestamp, device, sockets);
+    *tcp_loop_flush_tx_calls = tcp_loop_flush_tx_calls.saturating_add(1);
+    if let Err(e) = device.flush_tx().await {
+        *tcp_loop_flush_tx_failures = tcp_loop_flush_tx_failures.saturating_add(1);
+        tcp_diag_log!(
+            "🔎 tcp-loop-flush-tx-fail stage={} calls={} failures={} err={e}",
+            poll_stage,
+            *tcp_loop_flush_tx_calls,
+            *tcp_loop_flush_tx_failures
+        );
+    }
+    metrics.leave_poll();
+
+    process_dirty_relay(
+        dirty,
+        sockets,
+        socket_ctxs,
+        upstream,
+        handshake_done_tx,
+        global_tx,
+        fake_pool,
+        now_secs,
+        metrics_handle,
+        metrics,
+        downlink_flush_max_bytes,
+        downlink_backpressure,
+    )
+    .await;
+
+    TunRxPacketKind::Tcp
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drain_ready_tun_rx<D, U, M>(
+    device: &mut D,
+    assoc_table: &mut AssocTable,
+    fake_pool: &mut FakeIpPool,
+    upstream: &Arc<U>,
+    now_secs: u64,
+    metrics_handle: &Metrics,
+    registry: &mut ListenerRegistry,
+    sockets: &mut SocketSet<'static>,
+    socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
+    iface: &mut Interface,
+    dirty: &mut HashSet<SocketHandle>,
+    handshake_done_tx: &mpsc::Sender<HandshakeDone>,
+    global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    metrics: &mut M,
+    downlink_flush_max_bytes: usize,
+    downlink_backpressure: DownlinkBackpressureConfig,
+    tcp_loop_flush_tx_calls: &mut u64,
+    tcp_loop_flush_tx_failures: &mut u64,
+    diag: &mut TunRxDrainDiag,
+    budget: usize,
+    source: &str,
+) -> usize
+where
+    D: TunIo,
+    U: ProxyUpstream + DatagramUpstream + 'static,
+    M: MetricsSink,
+{
+    if budget == 0 {
+        return 0;
+    }
+
+    diag.note_attempt();
+    let mut drained = 0usize;
+    while drained < budget {
+        match device.try_recv_rx() {
+            Ok(true) => {
+                let kind = process_ready_tun_rx_packet(
+                    device,
+                    assoc_table,
+                    fake_pool,
+                    upstream,
+                    now_secs,
+                    metrics_handle,
+                    registry,
+                    sockets,
+                    socket_ctxs,
+                    iface,
+                    dirty,
+                    handshake_done_tx,
+                    global_tx,
+                    metrics,
+                    downlink_flush_max_bytes,
+                    downlink_backpressure,
+                    tcp_loop_flush_tx_calls,
+                    tcp_loop_flush_tx_failures,
+                    "tun_rx_drain",
+                )
+                .await;
+                diag.note_packet(kind);
+                drained += 1;
+            }
+            Ok(false) => {
+                diag.note_would_block();
+                return drained;
+            }
+            Err(e) => {
+                diag.note_error();
+                tcp_diag_log!(
+                    "🔎 tcp-tun-rx-drain-error source={} drained={} err={e}",
+                    source,
+                    drained
+                );
+                return drained;
+            }
+        }
+    }
+    diag.note_budget_exhausted();
+    drained
 }
 
 /// #1 脏集合驱动的 relay 调度段：只处理本 tick 标脏的 handle，替代每 tick 全量 `all_handles()`。
@@ -6327,6 +6548,42 @@ mod tests {
     }
 
     #[test]
+    fn tun_rx_drain_diag_tracks_budget_and_packet_kinds() {
+        let mut diag = TunRxDrainDiag::default();
+
+        diag.note_attempt();
+        diag.note_packet(TunRxPacketKind::Tcp);
+        diag.note_packet(TunRxPacketKind::Dns);
+        diag.note_packet(TunRxPacketKind::Udp);
+        diag.note_budget_exhausted();
+        diag.note_would_block();
+        diag.note_error();
+
+        let line = format_tun_rx_drain_diag(&diag);
+        assert!(line.contains("tcp-tun-rx-drain"));
+        assert!(line.contains("attempts=1"), "{line}");
+        assert!(line.contains("packets=3"), "{line}");
+        assert!(line.contains("tcp=1"), "{line}");
+        assert!(line.contains("dns=1"), "{line}");
+        assert!(line.contains("udp=1"), "{line}");
+        assert!(line.contains("budget_exhausted=1"), "{line}");
+        assert!(line.contains("would_block=1"), "{line}");
+        assert!(line.contains("errors=1"), "{line}");
+    }
+
+    #[test]
+    fn tun_rx_drain_after_remote_payload_tracks_acceptance_or_pending() {
+        assert!(should_drain_tun_rx_after_remote_payload(None, 1));
+        assert!(!should_drain_tun_rx_after_remote_payload(None, 0));
+
+        let mut ctx = SocketCtx::new(443);
+        assert!(!should_drain_tun_rx_after_remote_payload(Some(&ctx), 0));
+
+        ctx.downlink_pending.extend_from_slice(&[1, 2, 3]);
+        assert!(should_drain_tun_rx_after_remote_payload(Some(&ctx), 0));
+    }
+
+    #[test]
     fn downlink_backpressure_defaults_match_knife14ao_ab() {
         let default = DownlinkBackpressureConfig::default();
         assert_eq!(default.high_bytes, 512 * 1024);
@@ -6811,6 +7068,9 @@ mod tests {
     impl TunIo for DnsInjectRecorder {
         async fn wait_for_rx(&mut self) -> std::io::Result<()> {
             unreachable!("测试直调 handle_dns_hijack，不进 wait_for_rx")
+        }
+        fn try_recv_rx(&mut self) -> std::io::Result<bool> {
+            Ok(false)
         }
         fn rx_peek(&self) -> Option<&[u8]> {
             None

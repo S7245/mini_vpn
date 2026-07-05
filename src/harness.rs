@@ -159,6 +159,16 @@ impl TunIo for LoopbackTunDevice {
             self.inbound.notify.notified().await;
         }
     }
+    fn try_recv_rx(&mut self) -> std::io::Result<bool> {
+        if self.rx_buffer.is_some() {
+            return Ok(true);
+        }
+        if let Some(pkt) = self.inbound.pop() {
+            self.rx_buffer = Some(pkt);
+            return Ok(true);
+        }
+        Ok(false)
+    }
     fn rx_peek(&self) -> Option<&[u8]> {
         self.rx_buffer.as_deref()
     }
@@ -1511,5 +1521,43 @@ pub async fn run_udp_throughput_scenario(
         wall,
         payload_len,
         fragmented: frag_chunk.is_some(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_try_recv_rx_reports_no_ready_packet_without_blocking() {
+        let inbound = PacketLink::new();
+        let outbound = PacketLink::new();
+        let mut device = LoopbackTunDevice::new(inbound, outbound);
+
+        assert!(!device.try_recv_rx().unwrap());
+        assert!(device.rx_peek().is_none());
+    }
+
+    #[test]
+    fn loopback_try_recv_rx_fills_single_rx_slot_without_overwriting() {
+        let inbound = PacketLink::new();
+        let outbound = PacketLink::new();
+        inbound.push(BytesMut::from(&b"first"[..]));
+        inbound.push(BytesMut::from(&b"second"[..]));
+        let mut device = LoopbackTunDevice::new(inbound, outbound);
+
+        assert!(device.try_recv_rx().unwrap());
+        assert_eq!(device.rx_peek().unwrap(), b"first");
+
+        assert!(device.try_recv_rx().unwrap());
+        assert_eq!(
+            device.rx_peek().unwrap(),
+            b"first",
+            "nonblocking receive must not overwrite an unconsumed rx slot",
+        );
+
+        assert_eq!(device.rx_take().unwrap(), BytesMut::from(&b"first"[..]));
+        assert!(device.try_recv_rx().unwrap());
+        assert_eq!(device.rx_take().unwrap(), BytesMut::from(&b"second"[..]));
     }
 }

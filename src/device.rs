@@ -1,7 +1,8 @@
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use std::collections::VecDeque;
-use tokio::io::{AsyncReadExt, AsyncWriteExt}; // ⚠️ 极其重要：引入异步读写魔法
 use bytes::BytesMut;
+use std::collections::VecDeque;
+use std::io::{ErrorKind, Read};
+use tokio::io::{AsyncReadExt, AsyncWriteExt}; // ⚠️ 极其重要：引入异步读写魔法
 use tun::Device as TunDevice;
 
 // 条件编译宏。这意味着如果在 Linux 系统上编译这段代码，编译器会自动忽略 PI 头逻辑，直接按标准处理。
@@ -43,7 +44,10 @@ impl VirtualTunDevice {
 
         // 2. 异步等待网卡吐出数据，并拿到读取的字节数 (n)
         let n = self.device.read(&mut buf).await?;
+        self.store_rx_packet(buf, n)
+    }
 
+    fn store_rx_packet(&mut self, mut buf: BytesMut, n: usize) -> std::io::Result<()> {
         #[cfg(target_os = "macos")]
         {
             if n < UTUN_IPV4_HEADER.len() {
@@ -67,6 +71,28 @@ impl VirtualTunDevice {
         }
 
         Ok(())
+    }
+
+    pub fn try_recv_rx(&mut self) -> std::io::Result<bool> {
+        if self.rx_buffer.is_some() {
+            return Ok(true);
+        }
+
+        let mut buf = BytesMut::zeroed(rx_buffer_capacity_for_mtu(self.mtu));
+        loop {
+            match self.device.get_mut().read(&mut buf) {
+                Ok(n) => {
+                    if n == 0 {
+                        return Ok(false);
+                    }
+                    self.store_rx_packet(buf, n)?;
+                    return Ok(true);
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(false),
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     pub async fn flush_tx(&mut self) -> std::io::Result<()> {
@@ -110,6 +136,8 @@ impl VirtualTunDevice {
 pub trait TunIo: Device {
     /// 异步进货：等待下一个 IP 包就绪并存入内部 rx 槽。
     async fn wait_for_rx(&mut self) -> std::io::Result<()>;
+    /// 非阻塞进货：若已有 IP 包 ready，则存入内部 rx 槽；无包时返回 Ok(false)。
+    fn try_recv_rx(&mut self) -> std::io::Result<bool>;
     /// 只读窥视当前 rx 槽（不取走）。
     fn rx_peek(&self) -> Option<&[u8]>;
     /// 取走当前 rx 槽。
@@ -128,6 +156,9 @@ impl TunIo for VirtualTunDevice {
     // 委托既有 inherent 方法（inherent 优先于 trait 解析，不会递归）。
     async fn wait_for_rx(&mut self) -> std::io::Result<()> {
         VirtualTunDevice::wait_for_rx(self).await
+    }
+    fn try_recv_rx(&mut self) -> std::io::Result<bool> {
+        VirtualTunDevice::try_recv_rx(self)
     }
     fn rx_peek(&self) -> Option<&[u8]> {
         VirtualTunDevice::rx_peek(self)

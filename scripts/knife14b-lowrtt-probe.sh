@@ -631,6 +631,52 @@ summarize_metrics_window() {
       }
     }
 
+    /tcp-tun-rx-drain/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^attempts=/) {
+          value = numeric_token($i, "attempts")
+          if (value > max_tun_rx_drain_attempts) {
+            max_tun_rx_drain_attempts = value
+          }
+        } else if ($i ~ /^packets=/) {
+          value = numeric_token($i, "packets")
+          if (value > max_tun_rx_drain_packets) {
+            max_tun_rx_drain_packets = value
+          }
+        } else if ($i ~ /^tcp=/) {
+          value = numeric_token($i, "tcp")
+          if (value > max_tun_rx_drain_tcp) {
+            max_tun_rx_drain_tcp = value
+          }
+        } else if ($i ~ /^dns=/) {
+          value = numeric_token($i, "dns")
+          if (value > max_tun_rx_drain_dns) {
+            max_tun_rx_drain_dns = value
+          }
+        } else if ($i ~ /^udp=/) {
+          value = numeric_token($i, "udp")
+          if (value > max_tun_rx_drain_udp) {
+            max_tun_rx_drain_udp = value
+          }
+        } else if ($i ~ /^budget_exhausted=/) {
+          value = numeric_token($i, "budget_exhausted")
+          if (value > max_tun_rx_drain_budget_exhausted) {
+            max_tun_rx_drain_budget_exhausted = value
+          }
+        } else if ($i ~ /^would_block=/) {
+          value = numeric_token($i, "would_block")
+          if (value > max_tun_rx_drain_would_block) {
+            max_tun_rx_drain_would_block = value
+          }
+        } else if ($i ~ /^errors=/) {
+          value = numeric_token($i, "errors")
+          if (value > max_tun_rx_drain_errors) {
+            max_tun_rx_drain_errors = value
+          }
+        }
+      }
+    }
+
     /tcp-handle-close/ {
       pending = 0
       close_pending_bytes_token = ""
@@ -1277,6 +1323,7 @@ summarize_metrics_window() {
       printf "- tun_drops: if=%s tun_rx_dropped_delta=%s tun_tx_dropped_delta=%s\n", tun_if, tun_rx_delta, tun_tx_delta
       printf "- runtime_tun_egress: samples=%d drop_events=%d drop_delta_total=%d max_delta=%d unavailable=%d resets=%d\n", runtime_tun_samples, runtime_tun_drop_events, runtime_tun_drop_delta_total, max_runtime_tun_delta, runtime_tun_unavailable, runtime_tun_resets
       printf "- tun_egress_feedback: pause_edges=%d resume_edges=%d drop_events=%d drop_delta_total=%d max_delta=%d max_pressure_bytes=%d\n", tun_feedback_pause_count, tun_feedback_resume_count, tun_feedback_drop_events, tun_feedback_drop_delta_total, max_tun_feedback_delta, max_tun_feedback_pressure
+      printf "- tun_rx_drain: attempts=%d packets=%d tcp=%d dns=%d udp=%d budget_exhausted=%d would_block=%d errors=%d\n", max_tun_rx_drain_attempts, max_tun_rx_drain_packets, max_tun_rx_drain_tcp, max_tun_rx_drain_dns, max_tun_rx_drain_udp, max_tun_rx_drain_budget_exhausted, max_tun_rx_drain_would_block, max_tun_rx_drain_errors
       printf "- quic: samples=%d worst_conn=%s max_lost_bytes_delta=%d max_congestion_events_delta=%d max_start_lost_bytes=%d max_start_congestion_events=%d min_start_cwnd=%s min_cwnd=%s inherited_conns=%s inherited_low_cwnd_threshold=%d max_tx_blocked_data_delta=%d max_tx_blocked_stream_delta=%d max_rx_blocked_data_delta=%d max_rx_blocked_stream_delta=%d\n", quic_samples, worst_conn, max_lost_bytes_delta, max_congestion_delta, max_start_lost_bytes, max_start_congestion_events, min_start_cwnd_all, min_cwnd_all, inherited_quic_conns, inherited_low_cwnd_limit, max_tx_data_delta, max_tx_stream_delta, max_rx_data_delta, max_rx_stream_delta
       print "- attribution: " labels
     }
@@ -1323,6 +1370,7 @@ EOF_IPERF
 🔎 tcp-downlink-backpressure paused=true max_pending=2151649 total_pending=2151649 max_tx_queue=1048576 total_tx_queue=1048576 max_pressure=2151649 total_pressure=3200225 high=2097120 low=524280
 🔎 tcp-downlink-backpressure paused=false max_pending=524233 total_pending=524233 max_tx_queue=524280 total_tx_queue=524280 max_pressure=524280 total_pressure=1048513 high=2097120 low=524280
 🔎 tcp-downlink-flush pending_total=524233 pending_max=524233 pending_high=2151649 remote_to_global_rx_bytes=3145728 flush_attempts=23 no_send_capacity=7 send_window_samples=23 send_capacity_min=0 send_capacity_max=1048576 send_queue_max=1048576 recv_queue_max=4096 may_send_false=1 may_recv_false=1 no_send_capacity_streak_max=7 no_send_capacity_pending_max=524233 send_slice_calls=16 send_slice_accepted=2621440 send_slice_zero=2 send_slice_errors=0 budget_limited_calls=9 send_slice_max_accepted=262144 tun_flush_tx_calls=14 tun_flush_tx_failures=1 tun_flush_deferred=3 dirty_handles=1
+🔎 tcp-tun-rx-drain attempts=4 packets=11 tcp=9 dns=1 udp=1 budget_exhausted=1 would_block=3 errors=0
 🔎 tcp-tun-egress if=tun0 status=delta tx_dropped_total=1523 tx_dropped_delta=1423 global_rx_paused=true pending_total=524233 pending_max=524233 pending_high=2151649 remote_to_global_rx_bytes=3145728 tun_flush_tx_calls=14 dirty_handles=1
 🔎 tcp-lifecycle-transition handle=SocketHandle(1) source=dead_slot_reap prev_source=remote_payload prev_observed_secs=10 observed_secs=15 prev_state=Established state=Closed prev_active=true active=false prev_can_send=true can_send=false prev_can_recv=true can_recv=false prev_may_send=true may_send=false prev_may_recv=true may_recv=false prev_send_queue=65536 send_queue=0 prev_recv_queue=0 recv_queue=0 ctx_state=Relaying uplink_tx=true local_fin_sent=false local_fin_pending_since=none local_fin_last_remote_progress=none pending=4096 pending_high=2151649 remote_to_global_rx_bytes=3145728 send_slice_accepted=2621440 flush_attempts=23 terminal_candidate=true
 🔎 tcp-handle-close handle=SocketHandle(1) direction=local reason=dead_slot_reap state=Relaying pending=4096 pending_high=2151649 remote_to_global_rx_bytes=3145728 flush_attempts=23 no_send_capacity=7 send_slice_calls=16 send_slice_accepted=2621440 send_slice_zero=2 send_slice_errors=0 budget_limited_calls=9 send_slice_max_accepted=262144 tun_flush_tx_calls=14 tun_flush_tx_failures=1 tun_flush_deferred=3 close_pending_class=terminal_closed_no_send close_pending_bytes=4096 terminal_pending_reap_bytes=4096 tcp_state=Closed active=false can_send=false can_recv=false
@@ -1364,6 +1412,7 @@ EOF_LOG
   assert_contains "$summary" "relay_remote_timing: first_read_max_ms=0 max_read_gap_ms=0 current_gap_max_ms=0 no_first_read_gap_max_ms=0"
   assert_contains "$summary" "tuic_tcp_stream: first_rx_events=0 first_rx_max_ms=0 read_gap_events=0 read_gap_max_ms=0 close_events=0 close_first_rx_max_ms=0 close_gap_max_ms=0 rx_bytes_max=0 reads_max=0 zero_rx_closes=0"
   assert_contains "$summary" "runtime_tun_egress: samples=1 drop_events=1 drop_delta_total=1423 max_delta=1423 unavailable=0 resets=0"
+  assert_contains "$summary" "tun_rx_drain: attempts=4 packets=11 tcp=9 dns=1 udp=1 budget_exhausted=1 would_block=3 errors=0"
   assert_contains "$summary" "max_lost_bytes_delta=439956"
   assert_contains "$summary" "attribution: quic_loss_congestion+local_write_pressure+local_tun_egress_drop+local_downlink_backpressure+terminal_pending_reap"
   assert_contains "$summary" "pending_at_close+pending_close_active_no_send"
@@ -1605,7 +1654,7 @@ IPERF_BUSY_WAIT_SECS="${IPERF_BUSY_WAIT_SECS:-5}"
 POST_IPERF_METRICS_SETTLE_SECS="${POST_IPERF_METRICS_SETTLE_SECS:-2}"
 PROBE_ORDER="${PROBE_ORDER:-forward-first}"
 OUT="${OUT:-/tmp/mvpn_knife14b_lowrtt_$(date +%Y%m%d_%H%M%S).md}"
-METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tuic-open-tcp|tuic-tcp-stream-first-rx|tuic-tcp-stream-read-gap|tuic-tcp-stream-close|tuic-tcp-pool-reconnect|tcp-relay-live|tcp-relay-write-half-closed|tcp-relay-close|tcp-handle-close|tcp-lifecycle-transition|tcp-local-write-pressure|tcp-global-rx-pressure|tcp-downlink-backpressure|tcp-downlink-flush|tcp-tun-egress'
+METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tuic-open-tcp|tuic-tcp-stream-first-rx|tuic-tcp-stream-read-gap|tuic-tcp-stream-close|tuic-tcp-pool-reconnect|tcp-relay-live|tcp-relay-write-half-closed|tcp-relay-close|tcp-handle-close|tcp-lifecycle-transition|tcp-local-write-pressure|tcp-global-rx-pressure|tcp-downlink-backpressure|tcp-downlink-flush|tcp-tun-rx-drain|tcp-tun-egress'
 
 case "$PROBE_ORDER" in
   forward-first|reverse-first|forward-only|reverse-only) ;;
