@@ -461,6 +461,16 @@ summarize_metrics_window() {
           if (value > max_flush_remote_bytes) {
             max_flush_remote_bytes = value
           }
+        } else if ($i ~ /^terminal_late_remote_payload_bytes=/) {
+          value = numeric_token($i, "terminal_late_remote_payload_bytes")
+          if (value > max_flush_terminal_late_remote_bytes) {
+            max_flush_terminal_late_remote_bytes = value
+          }
+        } else if ($i ~ /^terminal_late_remote_payload_events=/) {
+          value = numeric_token($i, "terminal_late_remote_payload_events")
+          if (value > max_flush_terminal_late_remote_events) {
+            max_flush_terminal_late_remote_events = value
+          }
         } else if ($i ~ /^flush_attempts=/) {
           value = numeric_token($i, "flush_attempts")
           if (value > max_flush_attempts) {
@@ -631,6 +641,29 @@ summarize_metrics_window() {
       }
     }
 
+    /tcp-terminal-remote-payload/ {
+      line_bytes = 0
+      line_total_bytes = 0
+      line_events = 0
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^bytes=/) {
+          line_bytes = numeric_token($i, "bytes")
+        } else if ($i ~ /^total_bytes=/) {
+          line_total_bytes = numeric_token($i, "total_bytes")
+        } else if ($i ~ /^events=/) {
+          line_events = numeric_token($i, "events")
+        }
+      }
+      terminal_late_remote_payload_events++
+      terminal_late_remote_payload_bytes += line_bytes
+      if (line_total_bytes > max_terminal_late_remote_payload_bytes) {
+        max_terminal_late_remote_payload_bytes = line_total_bytes
+      }
+      if (line_events > max_terminal_late_remote_payload_events) {
+        max_terminal_late_remote_payload_events = line_events
+      }
+    }
+
     /tcp-tun-rx-drain/ {
       for (i = 1; i <= NF; i++) {
         if ($i ~ /^attempts=/) {
@@ -699,6 +732,22 @@ summarize_metrics_window() {
         } else if ($i ~ /^terminal_pending_reap_bytes=/) {
           terminal_pending = numeric_token($i, "terminal_pending_reap_bytes")
           has_terminal_pending = 1
+        } else if ($i ~ /^terminal_late_remote_payload_bytes=/) {
+          value = numeric_token($i, "terminal_late_remote_payload_bytes")
+          if (value > max_terminal_late_remote_payload_close_bytes) {
+            max_terminal_late_remote_payload_close_bytes = value
+          }
+          if (value > max_terminal_late_remote_payload_bytes) {
+            max_terminal_late_remote_payload_bytes = value
+          }
+        } else if ($i ~ /^terminal_late_remote_payload_events=/) {
+          value = numeric_token($i, "terminal_late_remote_payload_events")
+          if (value > max_terminal_late_remote_payload_close_events) {
+            max_terminal_late_remote_payload_close_events = value
+          }
+          if (value > max_terminal_late_remote_payload_events) {
+            max_terminal_late_remote_payload_events = value
+          }
         } else if ($i == "tcp_state=Closed") {
           closed_state = 1
         } else if ($i == "active=true") {
@@ -1310,6 +1359,11 @@ summarize_metrics_window() {
       if (max_late_remote_bytes > 0 || max_late_remote_reads > 0) {
         add_label("late_remote_after_local_finish")
       }
+      if (terminal_late_remote_payload_events > 0 ||
+          terminal_late_remote_payload_bytes > 0 ||
+          max_terminal_late_remote_payload_bytes > 0) {
+        add_label("terminal_late_remote_payload")
+      }
       if (terminal_pending_events > 0) {
         add_label("terminal_pending_reap")
       }
@@ -1448,9 +1502,10 @@ summarize_metrics_window() {
       printf "- local_write_pressure: events=%d max_wait_ms=%.3f max_payload_bytes=%d\n", local_write_count, max_local_wait_us / 1000, max_local_payload
       printf "- global_rx_pressure: events=%d max_wait_ms=%.3f queue_used_max=%d queue_capacity=%d\n", global_rx_count, max_global_wait_us / 1000, max_global_rx_queue_used, max_global_rx_queue_capacity
       printf "- downlink_backpressure: pause_edges=%d resume_edges=%d max_pending_bytes=%d max_total_pending_bytes=%d max_tx_queue_bytes=%d max_total_tx_queue_bytes=%d max_pressure_bytes=%d max_total_pressure_bytes=%d\n", down_pause_count, down_resume_count, max_down_pending, max_down_total, max_down_tx_queue, max_down_total_tx_queue, max_down_pressure, max_down_total_pressure
-      printf "- downlink_flush: attempts=%d no_send_capacity=%d send_window_samples=%d send_capacity_min=%d send_capacity_max=%d send_queue_max=%d recv_queue_max=%d may_send_false=%d may_recv_false=%d no_send_streak_max=%d no_send_pending_max=%d send_slice_calls=%d accepted_bytes=%d zero=%d errors=%d budget_limited=%d max_accepted_bytes=%d tun_flush_calls=%d tun_flush_failures=%d tun_flush_deferred=%d pending_total_max=%d pending_max=%d pending_high=%d remote_to_global_rx_bytes=%d dirty_handles_max=%d\n", max_flush_attempts, max_no_send_capacity, max_send_window_samples, min_send_capacity_min, max_send_capacity_max, max_send_queue_max, max_recv_queue_max, max_may_send_false, max_may_recv_false, max_no_send_capacity_streak, max_no_send_capacity_pending, max_flush_send_calls, max_flush_accepted, max_flush_zero, max_flush_errors, max_budget_limited, max_send_slice_max_accepted, max_tun_flush_calls, max_tun_flush_failures, max_tun_flush_deferred, max_flush_pending_total, max_flush_pending_max, max_flush_pending_high, max_flush_remote_bytes, max_dirty_handles
+      printf "- downlink_flush: attempts=%d no_send_capacity=%d send_window_samples=%d send_capacity_min=%d send_capacity_max=%d send_queue_max=%d recv_queue_max=%d may_send_false=%d may_recv_false=%d no_send_streak_max=%d no_send_pending_max=%d send_slice_calls=%d accepted_bytes=%d zero=%d errors=%d budget_limited=%d max_accepted_bytes=%d tun_flush_calls=%d tun_flush_failures=%d tun_flush_deferred=%d pending_total_max=%d pending_max=%d pending_high=%d remote_to_global_rx_bytes=%d terminal_late_remote_payload_bytes=%d terminal_late_remote_payload_events=%d dirty_handles_max=%d\n", max_flush_attempts, max_no_send_capacity, max_send_window_samples, min_send_capacity_min, max_send_capacity_max, max_send_queue_max, max_recv_queue_max, max_may_send_false, max_may_recv_false, max_no_send_capacity_streak, max_no_send_capacity_pending, max_flush_send_calls, max_flush_accepted, max_flush_zero, max_flush_errors, max_budget_limited, max_send_slice_max_accepted, max_tun_flush_calls, max_tun_flush_failures, max_tun_flush_deferred, max_flush_pending_total, max_flush_pending_max, max_flush_pending_high, max_flush_remote_bytes, max_flush_terminal_late_remote_bytes, max_flush_terminal_late_remote_events, max_dirty_handles
       printf "- tcp_lifecycle: transitions=%d closed_edges=%d terminal_candidates=%d max_pending_bytes=%d max_remote_to_global_rx_bytes=%d sources=%s states=%s\n", lifecycle_transitions, lifecycle_closed_edges, lifecycle_terminal_candidates, max_lifecycle_pending, max_lifecycle_remote_bytes, lifecycle_sources, lifecycle_states
       printf "- terminal_pending_reap: events=%d bytes=%d max_bytes=%d\n", terminal_pending_events, terminal_pending_bytes, max_terminal_pending_bytes
+      printf "- terminal_late_remote_payload: events=%d bytes=%d max_bytes=%d close_max_bytes=%d close_max_events=%d\n", terminal_late_remote_payload_events, terminal_late_remote_payload_bytes, max_terminal_late_remote_payload_bytes, max_terminal_late_remote_payload_close_bytes, max_terminal_late_remote_payload_close_events
       printf "- pending_at_close: events=%d bytes=%d max_bytes=%d terminal_events=%d terminal_bytes=%d active_no_send_events=%d active_no_send_bytes=%d send_capable_events=%d send_capable_bytes=%d inactive_no_send_events=%d inactive_no_send_bytes=%d unknown_events=%d unknown_bytes=%d\n", pending_at_close_events, pending_at_close_bytes, max_pending_at_close_bytes, terminal_pending_events, terminal_pending_bytes, pending_close_active_no_send_events, pending_close_active_no_send_bytes, pending_close_send_capable_events, pending_close_send_capable_bytes, pending_close_inactive_no_send_events, pending_close_inactive_no_send_bytes, pending_close_unknown_events, pending_close_unknown_bytes
       printf "- relay_late_remote: post_finish_bytes=%d post_finish_reads=%d local_finish_events=%d\n", max_late_remote_bytes, max_late_remote_reads, local_finish_count
       printf "- relay_remote_timing: first_read_max_ms=%d max_read_gap_ms=%d current_gap_max_ms=%d no_first_read_gap_max_ms=%d data_streams=%d data_first_read_max_ms=%d data_max_read_gap_ms=%d data_rx_bytes_max=%d data_rx_min_bytes=%d\n", max_relay_first_remote_read_ms, max_relay_remote_read_gap_ms, max_relay_current_remote_gap_ms, max_relay_no_first_remote_gap_ms, relay_data_streams, max_relay_data_first_remote_read_ms, max_relay_data_remote_read_gap_ms, max_relay_data_remote_bytes, data_stream_min_rx_bytes
@@ -1506,12 +1561,13 @@ EOF_IPERF
 🔎 tcp-local-write-pressure handle=SocketHandle(1) wait_us=3607684 payload_bytes=64960 pressure_events=1
 🔎 tcp-downlink-backpressure paused=true max_pending=2151649 total_pending=2151649 max_tx_queue=1048576 total_tx_queue=1048576 max_pressure=2151649 total_pressure=3200225 high=2097120 low=524280
 🔎 tcp-downlink-backpressure paused=false max_pending=524233 total_pending=524233 max_tx_queue=524280 total_tx_queue=524280 max_pressure=524280 total_pressure=1048513 high=2097120 low=524280
-🔎 tcp-downlink-flush pending_total=524233 pending_max=524233 pending_high=2151649 remote_to_global_rx_bytes=3145728 flush_attempts=23 no_send_capacity=7 send_window_samples=23 send_capacity_min=0 send_capacity_max=1048576 send_queue_max=1048576 recv_queue_max=4096 may_send_false=1 may_recv_false=1 no_send_capacity_streak_max=7 no_send_capacity_pending_max=524233 send_slice_calls=16 send_slice_accepted=2621440 send_slice_zero=2 send_slice_errors=0 budget_limited_calls=9 send_slice_max_accepted=262144 tun_flush_tx_calls=14 tun_flush_tx_failures=1 tun_flush_deferred=3 dirty_handles=1
+🔎 tcp-downlink-flush pending_total=524233 pending_max=524233 pending_high=2151649 remote_to_global_rx_bytes=3145728 terminal_late_remote_payload_bytes=128 terminal_late_remote_payload_events=1 flush_attempts=23 no_send_capacity=7 send_window_samples=23 send_capacity_min=0 send_capacity_max=1048576 send_queue_max=1048576 recv_queue_max=4096 may_send_false=1 may_recv_false=1 no_send_capacity_streak_max=7 no_send_capacity_pending_max=524233 send_slice_calls=16 send_slice_accepted=2621440 send_slice_zero=2 send_slice_errors=0 budget_limited_calls=9 send_slice_max_accepted=262144 tun_flush_tx_calls=14 tun_flush_tx_failures=1 tun_flush_deferred=3 dirty_handles=1
 🔎 tcp-tun-rx-drain attempts=4 packets=11 tcp=9 dns=1 udp=1 budget_exhausted=1 would_block=3 errors=0
 🔎 tcp-tun-egress if=tun0 status=delta tx_dropped_total=1523 tx_dropped_delta=1423 global_rx_paused=true pending_total=524233 pending_max=524233 pending_high=2151649 remote_to_global_rx_bytes=3145728 tun_flush_tx_calls=14 dirty_handles=1
 🔎 tcp-lifecycle-transition handle=SocketHandle(1) source=dead_slot_reap prev_source=remote_payload prev_observed_secs=10 observed_secs=15 prev_state=Established state=Closed prev_active=true active=false prev_can_send=true can_send=false prev_can_recv=true can_recv=false prev_may_send=true may_send=false prev_may_recv=true may_recv=false prev_send_queue=65536 send_queue=0 prev_recv_queue=0 recv_queue=0 ctx_state=Relaying uplink_tx=true local_fin_sent=false local_fin_pending_since=none local_fin_last_remote_progress=none pending=4096 pending_high=2151649 remote_to_global_rx_bytes=3145728 send_slice_accepted=2621440 flush_attempts=23 terminal_candidate=true
-🔎 tcp-handle-close handle=SocketHandle(1) direction=local reason=dead_slot_reap state=Relaying pending=4096 pending_high=2151649 remote_to_global_rx_bytes=3145728 flush_attempts=23 no_send_capacity=7 send_slice_calls=16 send_slice_accepted=2621440 send_slice_zero=2 send_slice_errors=0 budget_limited_calls=9 send_slice_max_accepted=262144 tun_flush_tx_calls=14 tun_flush_tx_failures=1 tun_flush_deferred=3 close_pending_class=terminal_closed_no_send close_pending_bytes=4096 terminal_pending_reap_bytes=4096 tcp_state=Closed active=false can_send=false can_recv=false
-🔎 tcp-handle-close handle=SocketHandle(2) direction=local_to_remote reason=uplink_channel_closed state=Relaying pending=8192 pending_high=589159 remote_to_global_rx_bytes=692415971 flush_attempts=42 no_send_capacity=11 send_slice_calls=31 send_slice_accepted=691826812 send_slice_zero=0 send_slice_errors=0 budget_limited_calls=17 send_slice_max_accepted=262144 tun_flush_tx_calls=29 tun_flush_tx_failures=0 tun_flush_deferred=0 close_pending_class=active_no_send close_pending_bytes=8192 terminal_pending_reap_bytes=0 tcp_state=Established active=true can_send=false can_recv=false
+🔎 tcp-terminal-remote-payload handle=SocketHandle(1) bytes=128 total_bytes=128 events=1 pending=4096 tcp_state=Closed active=false can_send=false can_recv=false may_send=false may_recv=false send_capacity=1048576 send_queue=0 recv_queue=0
+🔎 tcp-handle-close handle=SocketHandle(1) direction=local reason=dead_slot_reap state=Relaying pending=4096 pending_high=2151649 remote_to_global_rx_bytes=3145728 terminal_late_remote_payload_bytes=128 terminal_late_remote_payload_events=1 flush_attempts=23 no_send_capacity=7 send_slice_calls=16 send_slice_accepted=2621440 send_slice_zero=2 send_slice_errors=0 budget_limited_calls=9 send_slice_max_accepted=262144 tun_flush_tx_calls=14 tun_flush_tx_failures=1 tun_flush_deferred=3 close_pending_class=terminal_closed_no_send close_pending_bytes=4096 terminal_pending_reap_bytes=4096 tcp_state=Closed active=false can_send=false can_recv=false
+🔎 tcp-handle-close handle=SocketHandle(2) direction=local_to_remote reason=uplink_channel_closed state=Relaying pending=8192 pending_high=589159 remote_to_global_rx_bytes=692415971 terminal_late_remote_payload_bytes=0 terminal_late_remote_payload_events=0 flush_attempts=42 no_send_capacity=11 send_slice_calls=31 send_slice_accepted=691826812 send_slice_zero=0 send_slice_errors=0 budget_limited_calls=17 send_slice_max_accepted=262144 tun_flush_tx_calls=29 tun_flush_tx_failures=0 tun_flush_deferred=0 close_pending_class=active_no_send close_pending_bytes=8192 terminal_pending_reap_bytes=0 tcp_state=Established active=true can_send=false can_recv=false
 📊 TUIC QUIC stats conn=3 id=99 rtt=0ms cwnd=13068 lost=303/1374 lost_bytes=439956 congestion_events=38 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=1,max_stream_data=2) udp_tx=1372/1977208B udp_rx=332/20762B dg_max=Some(1418) dg_space=1048576B
 🔁 tuic-tcp-pool-reconnect conn=1 reason=stale_tcp_pool_slot
 EOF_LOG
@@ -1543,8 +1599,10 @@ EOF_LOG
   assert_contains "$summary" "global_rx_pressure: events=0 max_wait_ms=0.000 queue_used_max=0 queue_capacity=0"
   assert_contains "$summary" "downlink_backpressure: pause_edges=1 resume_edges=1 max_pending_bytes=2151649 max_total_pending_bytes=2151649 max_tx_queue_bytes=1048576 max_total_tx_queue_bytes=1048576 max_pressure_bytes=2151649 max_total_pressure_bytes=3200225"
   assert_contains "$summary" "downlink_flush: attempts=23 no_send_capacity=7 send_window_samples=23 send_capacity_min=0 send_capacity_max=1048576 send_queue_max=1048576 recv_queue_max=4096 may_send_false=1 may_recv_false=1 no_send_streak_max=7 no_send_pending_max=524233 send_slice_calls=16 accepted_bytes=2621440 zero=2 errors=0 budget_limited=9 max_accepted_bytes=262144 tun_flush_calls=14 tun_flush_failures=1 tun_flush_deferred=3"
+  assert_contains "$summary" "terminal_late_remote_payload_bytes=128 terminal_late_remote_payload_events=1"
   assert_contains "$summary" "tcp_lifecycle: transitions=1 closed_edges=1 terminal_candidates=1 max_pending_bytes=4096 max_remote_to_global_rx_bytes=3145728 sources=dead_slot_reap states=Closed"
   assert_contains "$summary" "terminal_pending_reap: events=1 bytes=4096 max_bytes=4096"
+  assert_contains "$summary" "terminal_late_remote_payload: events=1 bytes=128 max_bytes=128 close_max_bytes=128 close_max_events=1"
   assert_contains "$summary" "pending_at_close: events=2 bytes=12288 max_bytes=8192 terminal_events=1 terminal_bytes=4096 active_no_send_events=1 active_no_send_bytes=8192 send_capable_events=0 send_capable_bytes=0 inactive_no_send_events=0 inactive_no_send_bytes=0 unknown_events=0 unknown_bytes=0"
   assert_contains "$summary" "relay_remote_timing: first_read_max_ms=0 max_read_gap_ms=0 current_gap_max_ms=0 no_first_read_gap_max_ms=0"
   assert_contains "$summary" "tuic_tcp_stream: first_rx_events=0 first_rx_max_ms=0 read_gap_events=0 read_gap_max_ms=0 close_events=0 close_first_rx_max_ms=0 close_gap_max_ms=0 rx_bytes_max=0 reads_max=0 zero_rx_closes=0"
@@ -1553,7 +1611,7 @@ EOF_LOG
   assert_contains "$summary" "runtime_tun_egress: samples=1 drop_events=1 drop_delta_total=1423 max_delta=1423 unavailable=0 resets=0"
   assert_contains "$summary" "tun_rx_drain: attempts=4 packets=11 tcp=9 dns=1 udp=1 budget_exhausted=1 would_block=3 errors=0"
   assert_contains "$summary" "max_lost_bytes_delta=439956"
-  assert_contains "$summary" "attribution: quic_loss_congestion+local_write_pressure+local_tun_egress_drop+local_downlink_backpressure+terminal_pending_reap"
+  assert_contains "$summary" "attribution: quic_loss_congestion+local_write_pressure+local_tun_egress_drop+local_downlink_backpressure+terminal_late_remote_payload+terminal_pending_reap"
   assert_contains "$summary" "pending_at_close+pending_close_active_no_send"
 
   cat > "$log_sample" <<'EOF_LOG'

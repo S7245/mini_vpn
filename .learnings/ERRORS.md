@@ -1360,3 +1360,15 @@
 - Correct behavior: when running the suite manually from `.27`, start from the
   repo root and run `set -a; . ./.env; set +a` before invoking the suite. Treat
   missing TUIC env bundles as invalid pre-throughput artifacts.
+
+## 2026-07-05 — cargo fmt --check is still a noisy gate on this branch
+
+- Symptom: Knife14bo `cargo fmt --check` failed with repository-wide formatting
+  diffs in unrelated Rust files, including files outside the scoped
+  close-drain change.
+- Cause: the current branch still contains historical non-rustfmt formatting,
+  so even check-only formatting is not a useful narrow-stage gate.
+- Correct behavior: keep using `git diff --check`, focused tests, parser
+  self-tests, and sandbox-external `cargo test --lib` for this Knife14 branch.
+  Do not run or apply root formatting unless repository formatting is the
+  explicit task.

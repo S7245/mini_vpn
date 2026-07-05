@@ -185,6 +185,10 @@ enum SocketState {
 struct TcpDownlinkDiag {
     /// Bytes accepted from relay task into the main-loop global_rx path.
     remote_to_global_rx_bytes: u64,
+    /// Remote payload bytes dropped because the local TCP socket was already terminal no-send.
+    terminal_late_remote_payload_bytes: u64,
+    /// Remote payload events dropped because the local TCP socket was already terminal no-send.
+    terminal_late_remote_payload_events: u64,
     /// Highest observed `SocketCtx.downlink_pending.len()`.
     downlink_pending_high_water: usize,
     /// Number of times a non-empty pending backlog tried to progress through `flush_downlink`.
@@ -263,6 +267,15 @@ impl TcpDownlinkDiag {
     fn note_remote_payload(&mut self, bytes: usize, pending_current: usize) {
         self.remote_to_global_rx_bytes += bytes as u64;
         self.note_pending(pending_current);
+    }
+
+    fn note_terminal_late_remote_payload(&mut self, bytes: usize) {
+        self.terminal_late_remote_payload_bytes = self
+            .terminal_late_remote_payload_bytes
+            .saturating_add(bytes as u64);
+        self.terminal_late_remote_payload_events = self
+            .terminal_late_remote_payload_events
+            .saturating_add(1);
     }
 
     fn note_flush_attempt(&mut self, pending_current: usize, max_bytes_per_flush: usize) {
@@ -1364,6 +1377,8 @@ struct TcpDownlinkAggregate {
     pending_max: usize,
     pending_high: usize,
     remote_to_global_rx_bytes: u64,
+    terminal_late_remote_payload_bytes: u64,
+    terminal_late_remote_payload_events: u64,
     flush_attempts: u64,
     send_slice_no_capacity: u64,
     send_slice_calls: u64,
@@ -1399,6 +1414,12 @@ fn tcp_downlink_aggregate<'a>(
         aggregate.remote_to_global_rx_bytes = aggregate
             .remote_to_global_rx_bytes
             .saturating_add(ctx.downlink_diag.remote_to_global_rx_bytes);
+        aggregate.terminal_late_remote_payload_bytes = aggregate
+            .terminal_late_remote_payload_bytes
+            .saturating_add(ctx.downlink_diag.terminal_late_remote_payload_bytes);
+        aggregate.terminal_late_remote_payload_events = aggregate
+            .terminal_late_remote_payload_events
+            .saturating_add(ctx.downlink_diag.terminal_late_remote_payload_events);
         aggregate.flush_attempts = aggregate
             .flush_attempts
             .saturating_add(ctx.downlink_diag.flush_attempts);
@@ -1474,11 +1495,13 @@ fn format_tcp_downlink_flush_diag(
     dirty_handles: usize,
 ) -> String {
     format!(
-        "🔎 tcp-downlink-flush pending_total={} pending_max={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} dirty_handles={}",
+        "🔎 tcp-downlink-flush pending_total={} pending_max={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} dirty_handles={}",
         aggregate.pending_total,
         aggregate.pending_max,
         aggregate.pending_high,
         aggregate.remote_to_global_rx_bytes,
+        aggregate.terminal_late_remote_payload_bytes,
+        aggregate.terminal_late_remote_payload_events,
         aggregate.flush_attempts,
         aggregate.send_slice_no_capacity,
         aggregate.send_window_samples,
@@ -3123,6 +3146,27 @@ fn relay_allows_remote_payload(ctx: &SocketCtx) -> bool {
     ctx.uplink_tx.is_some() || ctx.local_fin_sent
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemotePayloadDisposition {
+    Accept,
+    StaleRelayReset,
+    TerminalNoSend,
+}
+
+fn remote_payload_disposition(
+    ctx: &SocketCtx,
+    snapshot: SocketCloseSnapshot,
+) -> RemotePayloadDisposition {
+    if snapshot.tcp_state == TcpState::Closed && !snapshot.active && !snapshot.can_send {
+        return RemotePayloadDisposition::TerminalNoSend;
+    }
+    if relay_allows_remote_payload(ctx) {
+        RemotePayloadDisposition::Accept
+    } else {
+        RemotePayloadDisposition::StaleRelayReset
+    }
+}
+
 /// Allocate a fresh smoltcp TCP listener socket for one pool slot.
 /// 中文要点：每次调用都创建一间独立房间，并立即挂上 listen 牌子。
 #[cfg(test)]
@@ -3392,7 +3436,7 @@ fn rearm_socket_with_reason_and_snapshot(
         log_tcp_lifecycle_observation(handle, ctx, snapshot, now_secs, close_reason);
         let close_pending = close_pending_accounting(ctx, snapshot);
         tcp_diag_log!(
-            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes={} tcp_state={:?} active={} can_send={} can_recv={} may_send={} may_recv={} send_capacity={} send_queue={} recv_queue={}",
+            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes={} tcp_state={:?} active={} can_send={} can_recv={} may_send={} may_recv={} send_capacity={} send_queue={} recv_queue={}",
             handle,
             close_direction,
             close_reason,
@@ -3400,6 +3444,8 @@ fn rearm_socket_with_reason_and_snapshot(
             ctx.downlink_pending.len(),
             ctx.downlink_diag.downlink_pending_high_water,
             ctx.downlink_diag.remote_to_global_rx_bytes,
+            ctx.downlink_diag.terminal_late_remote_payload_bytes,
+            ctx.downlink_diag.terminal_late_remote_payload_events,
             ctx.downlink_diag.flush_attempts,
             ctx.downlink_diag.send_slice_no_capacity,
             ctx.downlink_diag.send_window_samples,
@@ -3444,7 +3490,7 @@ fn rearm_socket_with_reason_and_snapshot(
         ClosePendingClass::Unknown
     };
     tcp_diag_log!(
-        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes=0",
+        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes=0",
         handle,
         close_direction,
         close_reason,
@@ -3452,6 +3498,8 @@ fn rearm_socket_with_reason_and_snapshot(
         ctx.downlink_pending.len(),
         ctx.downlink_diag.downlink_pending_high_water,
         ctx.downlink_diag.remote_to_global_rx_bytes,
+        ctx.downlink_diag.terminal_late_remote_payload_bytes,
+        ctx.downlink_diag.terminal_late_remote_payload_events,
         ctx.downlink_diag.flush_attempts,
         ctx.downlink_diag.send_slice_no_capacity,
         ctx.downlink_diag.send_window_samples,
@@ -3881,16 +3929,46 @@ async fn handle_remote_payload<D: TunIo>(
         return Ok(0);
     }
 
-    // 防串话 / 防 panic（epoch guard 的轻量降级版）：若该 handle 已被重连流程复位回
-    // Listening（uplink_tx 被清空），说明这是上一代上游连接的迟到回程数据，直接丢弃，
-    // 绝不能往非 Established 的 socket 写（否则 send_slice 报错、旧版本会 unwrap panic）。
-    if !relay_allows_remote_payload(ctx) {
-        trace_log!(
-            "🗑️ handle {:?} 已复位，丢弃旧连接迟到回程 {} 字节",
-            handle,
-            payload.len()
-        );
-        return Ok(0);
+    let before_payload_snapshot = SocketCloseSnapshot::from_socket(tcp_socket);
+    match remote_payload_disposition(ctx, before_payload_snapshot) {
+        RemotePayloadDisposition::Accept => {}
+        RemotePayloadDisposition::StaleRelayReset => {
+            trace_log!(
+                "🗑️ handle {:?} 已复位，丢弃旧连接迟到回程 {} 字节",
+                handle,
+                payload.len()
+            );
+            return Ok(0);
+        }
+        RemotePayloadDisposition::TerminalNoSend => {
+            ctx.downlink_diag
+                .note_terminal_late_remote_payload(payload.len());
+            log_tcp_lifecycle_observation(
+                handle,
+                ctx,
+                before_payload_snapshot,
+                now_secs,
+                "terminal_remote_payload",
+            );
+            tcp_diag_log!(
+                "🔎 tcp-terminal-remote-payload handle={:?} bytes={} total_bytes={} events={} pending={} tcp_state={:?} active={} can_send={} can_recv={} may_send={} may_recv={} send_capacity={} send_queue={} recv_queue={}",
+                handle,
+                payload.len(),
+                ctx.downlink_diag.terminal_late_remote_payload_bytes,
+                ctx.downlink_diag.terminal_late_remote_payload_events,
+                ctx.downlink_pending.len(),
+                before_payload_snapshot.tcp_state,
+                before_payload_snapshot.active,
+                before_payload_snapshot.can_send,
+                before_payload_snapshot.can_recv,
+                before_payload_snapshot.may_send,
+                before_payload_snapshot.may_recv,
+                before_payload_snapshot.send_capacity,
+                before_payload_snapshot.send_queue,
+                before_payload_snapshot.recv_queue
+            );
+            return Ok(0);
+        }
     }
 
     // 不直接 send_slice（会丢写不下的字节）：先入下行 pending，再尽量 flush；
@@ -5558,10 +5636,51 @@ mod tests {
         ctx.state = SocketState::Relaying;
         ctx.local_fin_sent = true;
         ctx.uplink_tx = None;
+        let active_closewait = SocketCloseSnapshot {
+            tcp_state: TcpState::CloseWait,
+            active: true,
+            can_send: true,
+            can_recv: false,
+            may_send: true,
+            may_recv: false,
+            send_capacity: 1_048_576,
+            send_queue: 0,
+            recv_queue: 0,
+        };
 
         assert!(
             relay_allows_remote_payload(&ctx),
             "post-Finish read-only relay must still accept remote payloads"
+        );
+        assert_eq!(
+            remote_payload_disposition(&ctx, active_closewait),
+            RemotePayloadDisposition::Accept,
+            "post-Finish read-only relay must still accept remote payloads"
+        );
+    }
+
+    #[test]
+    fn remote_payload_rejected_after_terminal_no_send_socket() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut ctx = SocketCtx::new(443);
+        ctx.state = SocketState::Relaying;
+        ctx.uplink_tx = Some(tx);
+        let terminal = SocketCloseSnapshot {
+            tcp_state: TcpState::Closed,
+            active: false,
+            can_send: false,
+            can_recv: false,
+            may_send: false,
+            may_recv: false,
+            send_capacity: 1_048_576,
+            send_queue: 29_568,
+            recv_queue: 0,
+        };
+
+        assert_eq!(
+            remote_payload_disposition(&ctx, terminal),
+            RemotePayloadDisposition::TerminalNoSend,
+            "terminal no-send socket must not accumulate late remote payload in downlink_pending"
         );
     }
 
@@ -6107,6 +6226,7 @@ mod tests {
     fn tcp_downlink_diag_tracks_pending_acceptance_and_flush_failures() {
         let mut diag = TcpDownlinkDiag::default();
         diag.note_remote_payload(100, 100);
+        diag.note_terminal_late_remote_payload(25);
         diag.note_send_slice_ok(60, 40);
         diag.note_send_slice_ok(0, 40);
         diag.note_send_slice_error();
@@ -6114,6 +6234,8 @@ mod tests {
         diag.note_tun_flush(false);
 
         assert_eq!(diag.remote_to_global_rx_bytes, 100);
+        assert_eq!(diag.terminal_late_remote_payload_bytes, 25);
+        assert_eq!(diag.terminal_late_remote_payload_events, 1);
         assert_eq!(diag.downlink_pending_high_water, 100);
         assert_eq!(diag.send_slice_calls, 3);
         assert_eq!(diag.send_slice_accepted_bytes, 60);
@@ -6170,6 +6292,8 @@ mod tests {
         let mut b = SocketCtx::new(443);
         b.downlink_pending = vec![0; 25];
         b.downlink_diag.note_remote_payload(200, 200);
+        b.downlink_diag.note_terminal_late_remote_payload(10);
+        b.downlink_diag.note_terminal_late_remote_payload(15);
         b.downlink_diag.note_flush_attempt(200, 64);
         b.downlink_diag.note_send_window(
             TcpSendWindowSnapshot {
@@ -6193,6 +6317,8 @@ mod tests {
         assert!(line.contains("pending_max=25"));
         assert!(line.contains("pending_high=200"));
         assert!(line.contains("remote_to_global_rx_bytes=300"));
+        assert!(line.contains("terminal_late_remote_payload_bytes=25"));
+        assert!(line.contains("terminal_late_remote_payload_events=2"));
         assert!(line.contains("flush_attempts=2"));
         assert!(line.contains("no_send_capacity=1"));
         assert!(line.contains("send_slice_calls=1"));

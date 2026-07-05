@@ -2202,3 +2202,26 @@ worth cleaning up separately.
   no-data-stream while the newer commit reaches the pressure branch, do not
   revert the newer diagnostic/control fix. Continue from the run that activates
   the local pressure path and fix the next visible lifecycle invariant.
+
+## 2026-07-05 — Knife14bo local gate separates terminal-late payload
+
+- Stage: Knife14bo local TDD/code before VPS acceptance.
+- Outcome: `handle_remote_payload` now gates remote payload with the current
+  smoltcp socket snapshot before appending to `downlink_pending`. Local FIN
+  read-only payload remains accepted while the socket is active/send-capable,
+  but `Closed && !active && !can_send` payload is rejected and counted as
+  `terminal_late_remote_payload`.
+- Code/spec: `src/client_tun.rs`,
+  `scripts/knife14b-lowrtt-probe.sh`,
+  `docs/tech/2026-07-05-knife14bo-terminal-pending-close-drain-spec.md`, and
+  `docs/tech/2026-07-05-knife14bo-terminal-pending-close-drain-plan.md`.
+- Local gates passed: focused `cargo test --lib remote_payload_`, focused
+  TCP downlink diag/aggregate tests, `scripts/knife14b-lowrtt-probe.sh
+  --self-test`, sandbox-external `cargo test --lib`, and `git diff --check`.
+- Key lesson: terminal pending must be split into pre-terminal backlog and
+  terminal-late remote payload. Reaping true terminal no-send pending remains
+  correct, but accepting additional remote bytes after that state hides the
+  causal loss point.
+- Reusable rule: any future close-drain patch must preserve local-FIN read-only
+  reverse data while refusing terminal no-send late payload before it enters
+  app-owned pending.
