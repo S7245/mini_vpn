@@ -2055,3 +2055,22 @@ worth cleaning up separately.
   server/send side or stream readiness boundary. Do not keep changing local
   close-drain, TUN egress, stale pool, egress pacing, or buffer sizes without
   evidence that those paths are active in the clean window.
+
+## 2026-07-05 — Knife14bk adds per-probe server-side evidence capture
+
+- Stage: Knife14bk local implementation for server/send-side attribution.
+- Outcome: extended the US-client tunnel suite with opt-in
+  `SERVER_EVIDENCE_CHECK=1` artifacts per probe. When enabled, the suite now
+  captures bounded `.33` sing-box TUIC/outbound/fail-auth/error lines and `.77`
+  iperf3 journal lines for the probe time window, with UUID/password-like
+  values redacted and SSH keys reported only as set/unset.
+- Local gates passed: `bash scripts/knife14b-usclient-tunnel-suite.sh
+  --self-test`, `bash -n scripts/knife14b-usclient-tunnel-suite.sh`, and
+  `git diff --check`.
+- Key lesson: Knife14 stream-starvation acceptance needs server-side evidence
+  inside the bundle, not manual journal inspection after the fact.
+- Reusable rule: before applying behavior changes to local downlink lifecycle
+  after a starvation run, capture the target sender totals and exit forwarding
+  lines in the same probe window. If `.77` itself sends little, pivot to
+  ACK/window/send-side analysis; if `.77` sends much more than mini_vpn reads,
+  inspect exit forwarding and TUIC stream readiness.

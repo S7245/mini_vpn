@@ -12,6 +12,8 @@ readonly DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES=""
 readonly DEFAULT_DOWNLINK_FLUSH_MAX_BYTES=262144
 readonly DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES=16777216
 readonly DEFAULT_TUN_RX_DRAIN_BUDGET=0
+readonly DEFAULT_SERVER_EVIDENCE_SING_BOX_TAIL=220
+readonly DEFAULT_SERVER_EVIDENCE_TARGET_JOURNAL_TAIL=260
 
 extract_client_tun_pids_from_ps() {
   awk '
@@ -194,6 +196,14 @@ EOF
     echo "suite self-test failed: reverse-only stop help missing" >&2
     return 1
   fi
+  if ! grep -q "SERVER_EVIDENCE_CHECK=0" <<<"$help_text"; then
+    echo "suite self-test failed: server evidence help missing" >&2
+    return 1
+  fi
+  if ! grep -q "TARGET_SSH_HOST=\"\"" <<<"$help_text"; then
+    echo "suite self-test failed: target ssh help missing" >&2
+    return 1
+  fi
 
   local auth_script
   auth_script="$(auth_config_match_python)"
@@ -259,6 +269,14 @@ Optional env:
   EXIT_SSH_KEY=""                 optional private key for Exit SSH
   EXIT_SSH_STRICT_HOST_KEY_CHECKING=accept-new  noninteractive host-key policy for Exit SSH
   EXIT_SSH_KNOWN_HOSTS_FILE="$OUT_DIR/exit_ssh_known_hosts"
+  SERVER_EVIDENCE_CHECK=0         collect bounded .33/.77 evidence around each probe
+  SERVER_EVIDENCE_SING_BOX_TAIL=220
+  SERVER_EVIDENCE_TARGET_JOURNAL_TAIL=260
+  TARGET_SSH_HOST=""              SSH destination for Target, e.g. ubuntu@43.130.32.77
+  TARGET_SSH_PORT=22
+  TARGET_SSH_KEY=""               optional private key for Target SSH
+  TARGET_SSH_STRICT_HOST_KEY_CHECKING=accept-new
+  TARGET_SSH_KNOWN_HOSTS_FILE="$OUT_DIR/target_ssh_known_hosts"
   RUN_REVERSE_FIRST_P1=0   run a fresh reverse-only P1 probe before the normal forward-first probe
   STOP_AFTER_REVERSE_FIRST_P1=0  stop after the fresh reverse-only P1 and final snapshots
   WAIT_QUIET_BEFORE_FULL=1  after standalone P1, wait for active relays to drop before full sweep
@@ -323,6 +341,14 @@ EXIT_SSH_PORT="${EXIT_SSH_PORT:-22}"
 EXIT_SSH_KEY="${EXIT_SSH_KEY:-}"
 EXIT_SSH_STRICT_HOST_KEY_CHECKING="${EXIT_SSH_STRICT_HOST_KEY_CHECKING:-accept-new}"
 EXIT_SSH_KNOWN_HOSTS_FILE="${EXIT_SSH_KNOWN_HOSTS_FILE:-$OUT_DIR/exit_ssh_known_hosts}"
+SERVER_EVIDENCE_CHECK="${SERVER_EVIDENCE_CHECK:-0}"
+SERVER_EVIDENCE_SING_BOX_TAIL="${SERVER_EVIDENCE_SING_BOX_TAIL:-$DEFAULT_SERVER_EVIDENCE_SING_BOX_TAIL}"
+SERVER_EVIDENCE_TARGET_JOURNAL_TAIL="${SERVER_EVIDENCE_TARGET_JOURNAL_TAIL:-$DEFAULT_SERVER_EVIDENCE_TARGET_JOURNAL_TAIL}"
+TARGET_SSH_HOST="${TARGET_SSH_HOST:-}"
+TARGET_SSH_PORT="${TARGET_SSH_PORT:-22}"
+TARGET_SSH_KEY="${TARGET_SSH_KEY:-}"
+TARGET_SSH_STRICT_HOST_KEY_CHECKING="${TARGET_SSH_STRICT_HOST_KEY_CHECKING:-accept-new}"
+TARGET_SSH_KNOWN_HOSTS_FILE="${TARGET_SSH_KNOWN_HOSTS_FILE:-$OUT_DIR/target_ssh_known_hosts}"
 RUN_REVERSE_FIRST_P1="${RUN_REVERSE_FIRST_P1:-0}"
 STOP_AFTER_REVERSE_FIRST_P1="${STOP_AFTER_REVERSE_FIRST_P1:-0}"
 WAIT_QUIET_BEFORE_FULL="${WAIT_QUIET_BEFORE_FULL:-1}"
@@ -696,6 +722,200 @@ exit_ssh_raw() {
   "${ssh_cmd[@]}"
 }
 
+target_ssh_raw() {
+  local remote_cmd="$1"
+  local -a ssh_cmd=(
+    ssh
+    -o BatchMode=yes
+    -o ConnectTimeout=8
+    -o "StrictHostKeyChecking=$TARGET_SSH_STRICT_HOST_KEY_CHECKING"
+  )
+  if [[ -n "$TARGET_SSH_KNOWN_HOSTS_FILE" ]]; then
+    ssh_cmd+=(-o "UserKnownHostsFile=$TARGET_SSH_KNOWN_HOSTS_FILE")
+  fi
+  if [[ -n "$TARGET_SSH_KEY" ]]; then
+    ssh_cmd+=(-i "$TARGET_SSH_KEY")
+  fi
+  if [[ -n "$TARGET_SSH_PORT" ]]; then
+    ssh_cmd+=(-p "$TARGET_SSH_PORT")
+  fi
+  ssh_cmd+=("$TARGET_SSH_HOST" "$remote_cmd")
+  "${ssh_cmd[@]}"
+}
+
+positive_int_or_default() {
+  local value="$1"
+  local fallback="$2"
+  if [[ "$value" =~ ^[0-9]+$ && "$value" -gt 0 ]]; then
+    printf '%s' "$value"
+  else
+    printf '%s' "$fallback"
+  fi
+}
+
+collect_server_side_evidence() {
+  local label="$1"
+  local start_epoch="$2"
+  local end_epoch="$3"
+
+  append ""
+  append "### Server Evidence: $label"
+  append "- server_evidence_check: $SERVER_EVIDENCE_CHECK"
+  append "- exit_ssh_host: ${EXIT_SSH_HOST:-<unset>}"
+  append "- target_ssh_host: ${TARGET_SSH_HOST:-<unset>}"
+
+  if [[ "$SERVER_EVIDENCE_CHECK" != "1" ]]; then
+    append "skipped because SERVER_EVIDENCE_CHECK=$SERVER_EVIDENCE_CHECK"
+    return 0
+  fi
+
+  local evidence_out="$OUT_DIR/mvpn_${SUITE_TAG}_server_evidence_${label}_${TS}.md"
+  ARTIFACTS+=("$evidence_out")
+  append "- out: $evidence_out"
+
+  if ! [[ "$start_epoch" =~ ^[0-9]+$ && "$end_epoch" =~ ^[0-9]+$ ]]; then
+    start_epoch="$(date +%s 2>/dev/null || printf '0')"
+    end_epoch="$start_epoch"
+  fi
+  local since_epoch=$((start_epoch - 5))
+  if ((since_epoch < 0)); then
+    since_epoch=0
+  fi
+  local until_epoch=$((end_epoch + 10))
+  local since_utc until_utc
+  since_utc="$(date -u -d "@$since_epoch" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || printf '@%s' "$since_epoch")"
+  until_utc="$(date -u -d "@$until_epoch" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || printf '@%s' "$until_epoch")"
+
+  {
+    echo "# Knife14 Server Evidence: $label"
+    echo
+    echo "- collected_at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo "- probe_start_epoch: $start_epoch"
+    echo "- probe_end_epoch: $end_epoch"
+    echo "- journal_since: $since_utc"
+    echo "- journal_until: $until_utc"
+    echo "- exit_ssh_host: ${EXIT_SSH_HOST:-<unset>}"
+    if [[ -n "$EXIT_SSH_KEY" ]]; then
+      echo "- exit_ssh_key: <set>"
+    else
+      echo "- exit_ssh_key: <unset>"
+    fi
+    echo "- target_ssh_host: ${TARGET_SSH_HOST:-<unset>}"
+    if [[ -n "$TARGET_SSH_KEY" ]]; then
+      echo "- target_ssh_key: <set>"
+    else
+      echo "- target_ssh_key: <unset>"
+    fi
+  } > "$evidence_out"
+
+  {
+    echo
+    echo "## Time Context"
+    echo
+    echo '```text'
+    date -u '+client_utc=%Y-%m-%dT%H:%M:%SZ'
+    date '+client_epoch=%s'
+    echo '```'
+  } >> "$evidence_out"
+
+  if [[ -n "$EXIT_SSH_HOST" ]]; then
+    {
+      echo
+      echo "### Exit Time"
+      echo
+      echo '```text'
+    } >> "$evidence_out"
+    set +e
+    exit_ssh_raw 'date -u "+exit_utc=%Y-%m-%dT%H:%M:%SZ"; date "+exit_epoch=%s"; timedatectl show -p NTPSynchronized -p SystemClockSynchronized --no-pager 2>/dev/null || true' >> "$evidence_out" 2>&1
+    local exit_time_status=$?
+    set -u
+    {
+      echo "exit_time_status=$exit_time_status"
+      echo '```'
+    } >> "$evidence_out"
+  fi
+
+  if [[ -n "$TARGET_SSH_HOST" ]]; then
+    {
+      echo
+      echo "### Target Time"
+      echo
+      echo '```text'
+    } >> "$evidence_out"
+    set +e
+    target_ssh_raw 'date -u "+target_utc=%Y-%m-%dT%H:%M:%SZ"; date "+target_epoch=%s"; timedatectl show -p NTPSynchronized -p SystemClockSynchronized --no-pager 2>/dev/null || true' >> "$evidence_out" 2>&1
+    local target_time_status=$?
+    set -u
+    {
+      echo "target_time_status=$target_time_status"
+      echo '```'
+    } >> "$evidence_out"
+  fi
+
+  {
+    echo
+    echo "## Exit sing-box Log"
+    echo
+  } >> "$evidence_out"
+  if [[ -z "$EXIT_SSH_HOST" ]]; then
+    echo "skipped: EXIT_SSH_HOST is unset." >> "$evidence_out"
+  else
+    local sing_tail target_regex exit_grep_regex redactor exit_log_cmd
+    sing_tail="$(positive_int_or_default "$SERVER_EVIDENCE_SING_BOX_TAIL" "$DEFAULT_SERVER_EVIDENCE_SING_BOX_TAIL")"
+    target_regex="${TARGET//./[.]}"
+    exit_grep_regex="${target_regex}|inbound.*tuic|outbound/direct|connection download closed|stream .*canceled|fail auth|auth|tuic|error|ERROR|warn|WARN"
+    redactor='s/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<uuid-redacted>/g; s/([Pp]assword[=: ]+)[^ ]+/\1<redacted>/g'
+    printf -v exit_log_cmd 'sudo grep -E %q /var/log/sing-box.log 2>/dev/null | tail -n %q | sed -E %q || true' \
+      "$exit_grep_regex" "$sing_tail" "$redactor"
+    {
+      echo '```text'
+      echo "sing_box_tail_limit=$sing_tail"
+    } >> "$evidence_out"
+    set +e
+    exit_ssh_raw "$exit_log_cmd" >> "$evidence_out" 2>&1
+    local exit_log_status=$?
+    set -u
+    {
+      echo "exit_log_status=$exit_log_status"
+      echo '```'
+    } >> "$evidence_out"
+  fi
+
+  {
+    echo
+    echo "## Target iperf3 Journal"
+    echo
+  } >> "$evidence_out"
+  if [[ -z "$TARGET_SSH_HOST" ]]; then
+    echo "skipped: TARGET_SSH_HOST is unset." >> "$evidence_out"
+    append "- WARN: SERVER_EVIDENCE_CHECK=1 but TARGET_SSH_HOST is unset; .77 iperf3 journal was not collected."
+  else
+    local journal_tail target_journal_cmd
+    journal_tail="$(positive_int_or_default "$SERVER_EVIDENCE_TARGET_JOURNAL_TAIL" "$DEFAULT_SERVER_EVIDENCE_TARGET_JOURNAL_TAIL")"
+    printf -v target_journal_cmd 'journalctl -u iperf3 --since %q --until %q --no-pager 2>/dev/null | tail -n %q || true' \
+      "$since_utc" "$until_utc" "$journal_tail"
+    {
+      echo '```text'
+      echo "journal_tail_limit=$journal_tail"
+    } >> "$evidence_out"
+    set +e
+    target_ssh_raw "$target_journal_cmd" >> "$evidence_out" 2>&1
+    local target_journal_status=$?
+    set -u
+    {
+      echo "target_journal_status=$target_journal_status"
+      echo '```'
+    } >> "$evidence_out"
+  fi
+
+  append ""
+  append "#### Server Evidence $label Summary"
+  append '```text'
+  grep -E 'fail auth|accepted connection|connected|Mbits/sec|Kbits/sec|bits/sec|sender$|receiver$|outbound|inbound|tuic|canceled|closed|error|ERROR|WARN|warning|status=' "$evidence_out" |
+    tail -180 | tee -a "$REPORT" || true
+  append '```'
+}
+
 diagnose_exit_time_delta() {
   append ""
   append "### Client ↔ Exit Time Check"
@@ -952,6 +1172,8 @@ run_lowrtt_probe() {
   append "- probe_order: $probe_order"
   append "- client_log: $CLIENT_LOG"
 
+  local probe_start_epoch probe_end_epoch
+  probe_start_epoch="$(date +%s 2>/dev/null || printf '0')"
   run_cmd env \
     LOG="$CLIENT_LOG" \
     OUT="$probe_out" \
@@ -963,6 +1185,7 @@ run_lowrtt_probe() {
     IPERF_BUSY_WAIT_SECS="$IPERF_BUSY_WAIT_SECS" \
     bash "$LOWRTT_SCRIPT" "$TARGET" "$IPERF_PORT"
   local status=$?
+  probe_end_epoch="$(date +%s 2>/dev/null || printf '%s' "$probe_start_epoch")"
 
   append ""
   append "### Probe $label Summary"
@@ -973,6 +1196,8 @@ run_lowrtt_probe() {
   else
     append "probe report missing: $probe_out"
   fi
+
+  collect_server_side_evidence "$label" "$probe_start_epoch" "$probe_end_epoch"
 
   return "$status"
 }
@@ -1074,7 +1299,8 @@ require_cmd tar "sudo apt update && sudo apt install -y tar" || missing=1
 if [[ "$CHECK_VPS_SERVICES" == "1" ]]; then
   require_cmd timeout "sudo apt update && sudo apt install -y coreutils" || missing=1
 fi
-if [[ "$CHECK_VPS_SERVICES" == "1" && "$EXIT_TO_TARGET_IPERF_CHECK" == "1" ]]; then
+if [[ "$SERVER_EVIDENCE_CHECK" == "1" ]] ||
+  { [[ "$CHECK_VPS_SERVICES" == "1" ]] && [[ "$EXIT_TO_TARGET_IPERF_CHECK" == "1" ]]; }; then
   require_cmd ssh "sudo apt update && sudo apt install -y openssh-client" || missing=1
 fi
 if ! command_status dig; then
@@ -1171,6 +1397,15 @@ append "- MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=${MINI_VPN_DOWNLINK_BACKPRESS
 append "- MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=$MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES"
 append "- MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=$MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES"
 append "- MINI_VPN_TUN_RX_DRAIN_BUDGET=$MINI_VPN_TUN_RX_DRAIN_BUDGET"
+append "- SERVER_EVIDENCE_CHECK=$SERVER_EVIDENCE_CHECK"
+append "- SERVER_EVIDENCE_SING_BOX_TAIL=$SERVER_EVIDENCE_SING_BOX_TAIL"
+append "- SERVER_EVIDENCE_TARGET_JOURNAL_TAIL=$SERVER_EVIDENCE_TARGET_JOURNAL_TAIL"
+append "- TARGET_SSH_HOST=${TARGET_SSH_HOST:-<unset>}"
+if [[ -n "$TARGET_SSH_KEY" ]]; then
+  append "- TARGET_SSH_KEY=<set>"
+else
+  append "- TARGET_SSH_KEY=<unset>"
+fi
 
 if [[ "$MINI_VPN_TUIC_ALPN" != "h3" ]]; then
   warn "MINI_VPN_TUIC_ALPN=$MINI_VPN_TUIC_ALPN, but current sing-box config says h3."
