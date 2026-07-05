@@ -68,8 +68,8 @@ const METRICS_SNAPSHOT_SECS: u64 = 30;
 /// Knife14bf：低频 TUN egress drop feedback 控制周期。1s 足够覆盖 30s reverse probe，
 /// 也避免把 Linux sysfs 读取放进每包热路径。
 const TUN_EGRESS_FEEDBACK_SAMPLE_SECS: u64 = 1;
-/// Knife14bg：远端下行压力下，默认最多顺手处理多少个已 ready 的 TUN ingress 包。
-const DEFAULT_TUN_RX_DRAIN_BUDGET: usize = 8;
+/// Knife14bi：Knife14bg 证明 opportunistic TUN RX drain 会让 reverse-first 退化；默认关闭。
+const DEFAULT_TUN_RX_DRAIN_BUDGET: usize = 0;
 /// Knife14bh：TUN RX drain 是诊断/公平性路径，允许 A/B 关闭或小幅放大，禁止无界热路径扫描。
 const MAX_TUN_RX_DRAIN_BUDGET: usize = 64;
 
@@ -2164,7 +2164,7 @@ pub async fn start_tun_proxy() {
         runtime_config.tcp_socket_buffers.tx_bytes
     );
     println!(
-        "🧺 TUN RX drain budget: {} packets/pass（MINI_VPN_TUN_RX_DRAIN_BUDGET=0 可关闭）",
+        "🧺 TUN RX drain budget: {} packets/pass（默认关闭；MINI_VPN_TUN_RX_DRAIN_BUDGET>0 仅用于显式 A/B）",
         runtime_config.tun_rx_drain_budget
     );
 

@@ -11,7 +11,7 @@ readonly DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES=""
 readonly DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES=""
 readonly DEFAULT_DOWNLINK_FLUSH_MAX_BYTES=262144
 readonly DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES=16777216
-readonly DEFAULT_TUN_RX_DRAIN_BUDGET=8
+readonly DEFAULT_TUN_RX_DRAIN_BUDGET=0
 
 extract_client_tun_pids_from_ps() {
   awk '
@@ -157,7 +157,7 @@ Optional env:
   MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=<auto>   empty/unset lets mini_vpn scale to TCP tx buffer / 4
   MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=262144
   MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=16777216
-  MINI_VPN_TUN_RX_DRAIN_BUDGET=8   set 0 to disable opportunistic TUN ingress drain during A/B
+  MINI_VPN_TUN_RX_DRAIN_BUDGET=0   default off; set >0 only for explicit TUN ingress drain A/B
 
 Output:
   /tmp/conn/mvpn_knife14c_usclient_suite_<timestamp>.md
