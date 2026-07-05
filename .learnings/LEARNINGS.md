@@ -2139,3 +2139,24 @@ worth cleaning up separately.
 - Reusable rule: for TUN egress feedback, correlate `tx_dropped` with recent
   downlink pressure, not only pressure visible at the exact 1s sample. Keep the
   next patch local and testable before another VPS run.
+
+## 2026-07-05 — Knife14bm latches recent high pressure for TUN drop feedback
+
+- Stage: Knife14bm local TDD/code before VPS acceptance.
+- Outcome: added a bounded recent high-pressure latch to
+  `TunEgressFeedbackState`. The event loop observes existing
+  `downlink_pressure_stats` each iteration; if pressure reaches the high
+  watermark, the next 1s TUN drop sample can attribute a positive
+  `tx_dropped_delta` even if current pressure has drained to zero.
+- Code/spec: `src/client_tun.rs`,
+  `docs/tech/2026-07-05-knife14bm-tun-egress-recent-pressure-spec.md`, and
+  `docs/tech/2026-07-05-knife14bm-tun-egress-recent-pressure-plan.md`.
+- Local gates passed: `cargo test tun_egress --lib`,
+  `cargo test downlink --lib`,
+  `scripts/knife14b-usclient-tunnel-suite.sh --self-test`,
+  `scripts/knife14b-lowrtt-probe.sh --self-test`,
+  sandbox-external `cargo test --lib`, `cargo clippy --lib -- -D warnings`,
+  and `git diff --check`.
+- Reusable rule: keep TUN drop attribution bounded to the next feedback sample;
+  only latch high-watermark pressure, not arbitrary small queues, so unrelated
+  future drops do not trigger false global_rx pauses.

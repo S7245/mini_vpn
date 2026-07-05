@@ -1612,11 +1612,33 @@ struct TunEgressFeedbackState {
     max_drop_delta: u64,
     pause_edges: u64,
     resume_edges: u64,
+    recent_max_pressure: usize,
+    recent_total_pressure: usize,
 }
 
 impl TunEgressFeedbackState {
     fn is_paused(&self) -> bool {
         self.paused
+    }
+
+    fn observe_pressure(&mut self, stats: DownlinkPressureStats, cfg: DownlinkBackpressureConfig) {
+        if stats.max_pressure() < cfg.high_bytes {
+            return;
+        }
+        self.recent_max_pressure = self.recent_max_pressure.max(stats.max_pressure());
+        self.recent_total_pressure = self.recent_total_pressure.max(stats.total_pressure());
+    }
+
+    fn take_recent_pressure(&mut self) -> DownlinkPressureStats {
+        let stats = DownlinkPressureStats {
+            max_pending: 0,
+            total_pending: 0,
+            max_tx_queue: self.recent_max_pressure,
+            total_tx_queue: self.recent_total_pressure,
+        };
+        self.recent_max_pressure = 0;
+        self.recent_total_pressure = 0;
+        stats
     }
 
     fn update(
@@ -1625,6 +1647,7 @@ impl TunEgressFeedbackState {
         stats: DownlinkPressureStats,
         cfg: DownlinkBackpressureConfig,
     ) -> Option<TunEgressFeedbackEvent> {
+        let recent_stats = self.take_recent_pressure();
         let drop_delta = match sample {
             TunEgressDropSample::Delta { delta, .. } => *delta,
             _ => 0,
@@ -1637,7 +1660,9 @@ impl TunEgressFeedbackState {
 
         let max_pressure = stats.max_pressure();
         let total_pressure = stats.total_pressure();
-        if drop_delta > 0 && total_pressure > 0 {
+        let drop_max_pressure = max_pressure.max(recent_stats.max_pressure());
+        let drop_total_pressure = total_pressure.max(recent_stats.total_pressure());
+        if drop_delta > 0 && drop_total_pressure > 0 {
             if !self.paused {
                 self.paused = true;
                 self.pause_edges = self.pause_edges.saturating_add(1);
@@ -1646,8 +1671,8 @@ impl TunEgressFeedbackState {
                 paused: true,
                 reason: TunEgressFeedbackReason::DropDelta,
                 tx_dropped_delta: drop_delta,
-                max_pressure,
-                total_pressure,
+                max_pressure: drop_max_pressure,
+                total_pressure: drop_total_pressure,
             });
         }
 
@@ -2427,6 +2452,7 @@ pub async fn run_event_loop<D, U, M>(
 
     loop {
         let downlink_stats = downlink_pressure_stats(&dirty, &socket_ctxs, &sockets);
+        tun_egress_feedback.observe_pressure(downlink_stats, downlink_backpressure);
         let next_downlink_rx_paused =
             next_downlink_backpressure(downlink_rx_paused, downlink_stats, downlink_backpressure);
         if next_downlink_rx_paused != downlink_rx_paused {
@@ -6493,6 +6519,47 @@ mod tests {
                 max_pressure: 3_786_786,
                 total_pressure: 3_786_786,
             })
+        );
+    }
+
+    #[test]
+    fn tun_egress_feedback_pauses_on_drop_delta_with_recent_high_pressure() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 4_194_304,
+            low_bytes: 1_048_576,
+        };
+        let mut feedback = TunEgressFeedbackState::default();
+        feedback.observe_pressure(
+            DownlinkPressureStats::new(0, 0, 3_786_786, 3_786_786),
+            cfg,
+        );
+        feedback.observe_pressure(
+            DownlinkPressureStats::new(0, 0, 4_194_304, 4_194_304),
+            cfg,
+        );
+
+        let event = feedback.update(
+            &TunEgressDropSample::Delta {
+                total: 28_123,
+                delta: 14_167,
+            },
+            DownlinkPressureStats::default(),
+            cfg,
+        );
+
+        assert!(feedback.is_paused());
+        assert_eq!(feedback.drop_events, 1);
+        assert_eq!(feedback.pause_edges, 1);
+        assert_eq!(
+            event,
+            Some(TunEgressFeedbackEvent {
+                paused: true,
+                reason: TunEgressFeedbackReason::DropDelta,
+                tx_dropped_delta: 14_167,
+                max_pressure: 4_194_304,
+                total_pressure: 4_194_304,
+            }),
+            "drop sampled after pressure drains should still be attributed to recent high pressure"
         );
     }
 
