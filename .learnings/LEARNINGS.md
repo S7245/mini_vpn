@@ -1973,3 +1973,22 @@ worth cleaning up separately.
 - Reusable rule: separate regression removal from next-root optimization. First
   make the default match the known-better drain0 shape, then tune the recovered
   egress/backpressure limiter.
+
+## 2026-07-05 — Knife14bi default-off patch reached VPS startup but not throughput
+
+- Stage: Knife14bi default drain-off.
+- Code under test: `76af8dc`.
+- Bundle:
+  `/tmp/mini_vpn/mvpn_knife14bi_default_usclient_suite_20260705_111824.tar.gz`.
+- Outcome: local gates passed and `.27` startup confirmed
+  `TUN RX drain budget: 0 packets/pass`, but the scoped VPS suite failed before
+  throughput with `tuic auth finish: sending stopped by peer: error 0`.
+  Direct `.27 -> .77` and `.33 -> .77` baselines were healthy, `.33` sing-box
+  was active/listening/config-valid, certificates were valid, and a no-secret
+  exact comparison showed UUID/password/SNI/ALPN all matched.
+- Key lesson: this bundle is not throughput evidence and does not invalidate
+  the drain default-off patch. It is the same startup-failure class observed in
+  Knife14bf before sing-box restart.
+- Reusable rule: when TUIC auth-finish startup fails while service health and
+  exact no-secret config comparison pass, restart sing-box once and rerun the
+  same scoped suite before touching mini_vpn data-plane code.

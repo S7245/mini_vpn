@@ -1199,3 +1199,29 @@
 - Correct behavior: do not run or apply root `cargo fmt` in Knife14 scoped
   stages. Use `git diff --check`, focused tests, clippy, and hand-format the
   touched hunks only.
+
+## 2026-07-05 — Knife14bi default VPS run failed before throughput at TUIC startup
+
+- Symptom: the `.27` Knife14bi default suite on `76af8dc` failed before the
+  reverse-first probe with
+  `tuic auth finish: sending stopped by peer: error 0`.
+- Evidence: `.33` sing-box was active, had `NRestarts=0`, passed config check,
+  listened on UDP `8443`, used a valid server certificate, and a no-secret exact
+  comparison reported matching UUID/password/SNI/ALPN between `.27` env and
+  `.33` config.
+- Correct behavior: do not treat this bundle as throughput evidence and do not
+  change mini_vpn lifecycle/backpressure code for this failure. Restart
+  `.33` sing-box once and rerun the identical scoped suite; if it fails again,
+  stop for TUIC startup compatibility analysis.
+
+## 2026-07-05 — Nested SSH config comparison must not expose TUIC secrets
+
+- Symptom: a first attempt to summarize `.33` config with remote Python failed
+  due escaped newline syntax, and a second nested SSH `jq` comparison failed
+  because the remote shell interpreted the unquoted jq filter's pipes.
+- Safety catch: an attempted grep that would have printed `uuid` and
+  `password` lines was rejected. That rejection was correct.
+- Correct behavior: when exact credential comparison is needed, feed a short
+  script to remote `python3 -` over SSH stdin and print only boolean
+  match/mismatch fields. Never print TUIC credentials or hashes in logs,
+  reports, learnings, or summaries.
