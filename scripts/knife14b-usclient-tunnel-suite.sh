@@ -38,6 +38,108 @@ client_tun_pids() {
   ps -eo pid=,comm=,args= | extract_client_tun_pids_from_ps
 }
 
+auth_config_match_python() {
+  cat <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+host = os.environ.get("EXIT_SSH_HOST", "")
+if not host:
+    print("exit_ssh_host_set=0")
+    sys.exit(0)
+
+ssh_cmd = [
+    "ssh",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=8",
+    "-o",
+    f"StrictHostKeyChecking={os.environ.get('EXIT_SSH_STRICT_HOST_KEY_CHECKING', 'accept-new')}",
+]
+known_hosts = os.environ.get("EXIT_SSH_KNOWN_HOSTS_FILE", "")
+if known_hosts:
+    ssh_cmd += ["-o", f"UserKnownHostsFile={known_hosts}"]
+key = os.environ.get("EXIT_SSH_KEY", "")
+if key:
+    ssh_cmd += ["-i", key]
+port = os.environ.get("EXIT_SSH_PORT", "")
+if port:
+    ssh_cmd += ["-p", port]
+ssh_cmd += [host, "sudo", "python3", "-"]
+
+remote_script = r'''
+import json
+cfg = json.load(open('/etc/sing-box/config.json'))
+inbounds = [item for item in cfg.get('inbounds', []) if item.get('type') == 'tuic']
+if not inbounds:
+    print(json.dumps({"error": "no_tuic_inbound"}))
+    raise SystemExit(0)
+ib = inbounds[0]
+users = ib.get('users') or []
+user = users[0] if users else {}
+tls = ib.get('tls') or {}
+alpn = tls.get('alpn') or []
+print(json.dumps({
+    "listen": ib.get('listen', ''),
+    "listen_port": ib.get('listen_port', ''),
+    "users_len": len(users),
+    "uuid": user.get('uuid', ''),
+    "password": user.get('password', ''),
+    "server_name": tls.get('server_name', ''),
+    "alpn0": alpn[0] if alpn else '',
+    "certificate_path": tls.get('certificate_path', ''),
+    "congestion_control": ib.get('congestion_control', ''),
+}))
+'''
+
+try:
+    raw = subprocess.check_output(
+        ssh_cmd,
+        input=remote_script,
+        text=True,
+        stderr=subprocess.STDOUT,
+        timeout=15,
+    )
+except Exception as exc:
+    print("exit_config_compare_error=1")
+    print(f"exit_config_compare_error_type={type(exc).__name__}")
+    sys.exit(1)
+
+try:
+    remote = json.loads(raw)
+except json.JSONDecodeError:
+    print("exit_config_parse_error=1")
+    sys.exit(1)
+
+if remote.get("error"):
+    print(f"exit_config_error={remote['error']}")
+    sys.exit(2)
+
+checks = {
+    "uuid_match": os.environ.get("MINI_VPN_TUIC_UUID", "") == remote.get("uuid", ""),
+    "password_match": os.environ.get("MINI_VPN_TUIC_PASSWORD", "") == remote.get("password", ""),
+    "sni_match": os.environ.get("MINI_VPN_TUIC_SNI", "") == remote.get("server_name", ""),
+    "alpn_match": os.environ.get("MINI_VPN_TUIC_ALPN", "") == remote.get("alpn0", ""),
+}
+
+print(f"tuic_listen={remote.get('listen', '')}:{remote.get('listen_port', '')}")
+print(f"tuic_users={remote.get('users_len', 0)}")
+print(f"tuic_uuid_len={len(str(remote.get('uuid', '')))}")
+print(f"tuic_password_len={len(str(remote.get('password', '')))}")
+print(f"tuic_server_name_len={len(str(remote.get('server_name', '')))}")
+print(f"tuic_alpn0_len={len(str(remote.get('alpn0', '')))}")
+print(f"tuic_certificate_path_set={int(bool(remote.get('certificate_path', '')))}")
+print(f"tuic_congestion_control_set={int(bool(remote.get('congestion_control', '')))}")
+for key in ("uuid_match", "password_match", "sni_match", "alpn_match"):
+    print(f"{key}={int(checks[key])}")
+
+sys.exit(0 if all(checks.values()) else 2)
+PY
+}
+
 suite_self_test() {
   local sample expected actual help_text
 
@@ -90,6 +192,20 @@ EOF
   fi
   if ! grep -q "STOP_AFTER_REVERSE_FIRST_P1=0" <<<"$help_text"; then
     echo "suite self-test failed: reverse-only stop help missing" >&2
+    return 1
+  fi
+
+  local auth_script
+  auth_script="$(auth_config_match_python)"
+  for field in uuid_match password_match sni_match alpn_match tuic_password_len; do
+    if ! grep -q "$field" <<<"$auth_script"; then
+      echo "suite self-test failed: auth diagnostic script missing $field" >&2
+      return 1
+    fi
+  done
+  if grep -Eq 'hexdigest|sha256' <<<"$auth_script" ||
+    grep -Eq 'print[(]f?"(uuid|password)=' <<<"$auth_script"; then
+    echo "suite self-test failed: auth diagnostic script must not print secrets or derived hashes" >&2
     return 1
   fi
 
@@ -559,6 +675,109 @@ run_exit_ssh_cmd() {
   run_cmd "${ssh_cmd[@]}"
 }
 
+exit_ssh_raw() {
+  local remote_cmd="$1"
+  local -a ssh_cmd=(
+    ssh
+    -o BatchMode=yes
+    -o ConnectTimeout=8
+    -o "StrictHostKeyChecking=$EXIT_SSH_STRICT_HOST_KEY_CHECKING"
+  )
+  if [[ -n "$EXIT_SSH_KNOWN_HOSTS_FILE" ]]; then
+    ssh_cmd+=(-o "UserKnownHostsFile=$EXIT_SSH_KNOWN_HOSTS_FILE")
+  fi
+  if [[ -n "$EXIT_SSH_KEY" ]]; then
+    ssh_cmd+=(-i "$EXIT_SSH_KEY")
+  fi
+  if [[ -n "$EXIT_SSH_PORT" ]]; then
+    ssh_cmd+=(-p "$EXIT_SSH_PORT")
+  fi
+  ssh_cmd+=("$EXIT_SSH_HOST" "$remote_cmd")
+  "${ssh_cmd[@]}"
+}
+
+diagnose_exit_time_delta() {
+  append ""
+  append "### Client ↔ Exit Time Check"
+  append '```text'
+  local client_epoch remote_epoch status delta abs_delta
+  client_epoch="$(date +%s 2>/dev/null || true)"
+  remote_epoch="$(exit_ssh_raw 'date +%s' 2>&1)"
+  status=$?
+  {
+    printf 'client_epoch=%s\n' "${client_epoch:-unknown}"
+    printf 'exit_epoch=%s\n' "${remote_epoch:-unknown}"
+    printf 'exit_epoch_status=%s\n' "$status"
+    if [[ "$status" == "0" && "$client_epoch" =~ ^[0-9]+$ && "$remote_epoch" =~ ^[0-9]+$ ]]; then
+      delta=$((client_epoch - remote_epoch))
+      abs_delta="${delta#-}"
+      printf 'client_minus_exit_seconds=%s\n' "$delta"
+      printf 'abs_time_skew_seconds=%s\n' "$abs_delta"
+      if ((abs_delta > 5)); then
+        printf 'time_skew_warning=1\n'
+      else
+        printf 'time_skew_warning=0\n'
+      fi
+    fi
+  } | tee -a "$REPORT"
+  append '```'
+}
+
+run_auth_config_match_check() {
+  if ! command_status python3; then
+    warn "python3 not found; skipping no-secret TUIC config match check."
+    return 0
+  fi
+  local script="$OUT_DIR/tuic_auth_match_check_${TS}.py"
+  auth_config_match_python > "$script"
+  append ""
+  append "### No-Secret TUIC Config Match"
+  run_cmd python3 "$script" || true
+}
+
+run_exit_auth_diagnostics() {
+  append ""
+  append "### Automated Exit TUIC/Auth Diagnostics"
+  append "- exit_ssh_host: ${EXIT_SSH_HOST:-<unset>}"
+  if [[ -n "$EXIT_SSH_KEY" ]]; then
+    append "- exit_ssh_key: <set>"
+  else
+    append "- exit_ssh_key: <unset>"
+  fi
+  append "- note: this section prints only service state, time delta, lengths, and match booleans; it must not print TUIC secrets."
+
+  if [[ -z "$EXIT_SSH_HOST" ]]; then
+    warn "EXIT_SSH_HOST is empty; automated .33 auth diagnostics skipped."
+    return 0
+  fi
+
+  diagnose_exit_time_delta
+  run_exit_ssh_cmd 'date -u "+%Y-%m-%dT%H:%M:%SZ"; timedatectl show -p NTPSynchronized -p SystemClockSynchronized -p TimeUSec --no-pager 2>/dev/null || true' || true
+  run_exit_ssh_cmd 'systemctl is-active sing-box; systemctl show sing-box -p ActiveState -p SubState -p ExecMainPID -p NRestarts --no-pager' || true
+  run_exit_ssh_cmd "sudo ss -lunp | grep ':${EXIT_PORT:-8443}' || true" || true
+  run_exit_ssh_cmd 'sudo /usr/bin/sing-box -c /etc/sing-box/config.json check' || true
+  run_exit_ssh_cmd 'sudo python3 - <<'"'"'PY'"'"'
+import json
+cfg = json.load(open("/etc/sing-box/config.json"))
+for ib in cfg.get("inbounds", []):
+    if ib.get("type") == "tuic":
+        users = ib.get("users") or []
+        tls = ib.get("tls") or {}
+        alpn = tls.get("alpn") or []
+        print(f"tuic_listen={ib.get('"'"'listen'"'"', '"'"''"'"')}:{ib.get('"'"'listen_port'"'"', '"'"''"'"')}")
+        print(f"tuic_users={len(users)}")
+        print(f"tuic_uuid_lengths={[len(str(u.get('"'"'uuid'"'"', '"'"''"'"'))) for u in users]}")
+        print(f"tuic_password_lengths={[len(str(u.get('"'"'password'"'"', '"'"''"'"'))) for u in users]}")
+        print(f"tuic_alpn_lengths={[len(str(x)) for x in alpn]}")
+        print(f"tuic_server_name_len={len(str(tls.get('"'"'server_name'"'"', '"'"''"'"')))}")
+        print(f"tuic_certificate_path_set={int(bool(tls.get('"'"'certificate_path'"'"', '"'"''"'"')))}")
+        print(f"tuic_congestion_control_set={int(bool(ib.get('"'"'congestion_control'"'"', '"'"''"'"')))}")
+PY' || true
+  run_exit_ssh_cmd 'sudo openssl x509 -in /etc/sing-box/server-cert.pem -noout -subject -issuer -dates -fingerprint -sha256 2>/dev/null || true' || true
+  run_exit_ssh_cmd 'sudo grep "fail auth\|auth\|tuic" /var/log/sing-box.log 2>/dev/null | tail -n 80 | sed -E "s/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<uuid-redacted>/g; s/([Pp]assword[=: ]+)[^ ]+/\1<redacted>/g" || true' || true
+  run_auth_config_match_check
+}
+
 preflight_exit_to_target_path() {
   append ""
   append "### Exit VPS ↔ Target VPS iperf3 Path (${EXIT_HOST} ↔ ${TARGET}:${IPERF_PORT})"
@@ -762,6 +981,7 @@ diagnose_auth_failure() {
   append ""
   append "## TUIC Startup Diagnosis"
   append "mini_vpn 没有成功连上 TUIC exit。Exit VPS ${EXIT_HOST:-unknown}:${EXIT_PORT:-unknown} 的 sing-box/TUIC 服务可能异常，或凭据/网络不匹配。优先检查这些点："
+  run_exit_auth_diagnostics
   append ""
   append "1. 在 ${EXIT_HOST:-43.153.32.33} 上确认 sing-box 已加载新配置："
   append_block bash "sudo systemctl status sing-box --no-pager" \
