@@ -1316,3 +1316,14 @@
   gate for narrow data-plane patches. Prefer `git diff --check`, focused tests,
   and manual/targeted formatting unless the intended task is repository
   formatting.
+
+## 2026-07-05 — ssh -tt alone is not enough for sudo prompt input through exec
+
+- Symptom: the first Knife14bl suite launch used remote `ssh -tt`, but the local
+  exec session did not set `tty=true`; stdin was closed when sudo prompted for
+  the `.27` password.
+- Fix: terminate that hung SSH process and rerun the identical command with
+  `tty=true`, then enter the password only at the sudo prompt.
+- Correct behavior: whenever a `.27` suite may need `sudo -v`, set both remote
+  `ssh -tt` and local exec `tty=true` from the beginning. Do not rely on
+  `ssh -tt` alone.

@@ -2119,3 +2119,23 @@ worth cleaning up separately.
   also low and local `tun_tx_dropped`/send-queue pressure is present, the first
   behavior fix should reduce remote-payload-driven immediate TUN bursts at the
   local pressure boundary without lowering product-wide egress defaults.
+
+## 2026-07-05 — Knife14bl VPS run escapes 10-20 Mbit/s but does not pass acceptance
+
+- Stage: Knife14bl scoped VPS acceptance for `09bb67c`.
+- Bundle:
+  `/tmp/mini_vpn/knife14bl_pressure_gate_20260705_152416/mvpn_knife14bl_pressure_gate_usclient_suite_20260705_152416.tar.gz`
+- Outcome: reverse-first P1 improved to `131/130 Mbit/s` from Knife14bk
+  `18.8/17.0 Mbit/s`, proving the pressure-aware immediate-flush gate helped.
+  Direct baselines stayed healthy around `281-282 Mbit/s` receiver on the
+  reverse path.
+- Remaining blockers: throughput collapsed back to `11-24 Mbit/s` in the last
+  seconds; `tun_tx_dropped_delta=2707`; backpressure still toggled
+  `143/143`; terminal pending reap returned with `1048938B`.
+- Key lesson: the drop sampler saw the TUN qdisc drop only after local pressure
+  had drained, so `runtime_tun_egress` counted the drop but
+  `tun_egress_feedback` did not pause (`drop_events=0`). Current-pressure-only
+  drop attribution is too narrow for this failure shape.
+- Reusable rule: for TUN egress feedback, correlate `tx_dropped` with recent
+  downlink pressure, not only pressure visible at the exact 1s sample. Keep the
+  next patch local and testable before another VPS run.
