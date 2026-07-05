@@ -1178,3 +1178,24 @@
 - Correct behavior: use the bundle sync path for `.27` until repository SSH
   access is deliberately configured on that host. Do not keep retrying
   interactive GitHub authentication from the VPS.
+
+## 2026-07-05 — Knife14bg TUN RX drain default can starve reverse downlink
+
+- Symptom: Knife14bh A/B on `7e33d44` showed
+  `MINI_VPN_TUN_RX_DRAIN_BUDGET=8` collapsed clean reverse-first P1 to
+  `0.245/0.035 Mbit/s`; data stream first useful RX was delayed about
+  `24.5s`, and `tun_rx_drain` consumed `53` TCP packets in the window.
+- Rejected interpretation: the bg drain path is not merely a harmless fairness
+  helper. It changes the clean reverse-first failure mode and can make the data
+  stream appear TUIC-starved.
+- Correct behavior: flip the product/suite default drain budget to `0` before
+  further lifecycle or receive-window work. Keep the drain path only as an
+  explicit env-gated A/B tool until a safer scheduling design exists.
+
+## 2026-07-05 — Root cargo fmt --check is not a Knife14 scoped gate
+
+- Symptom: `cargo fmt --check` reported thousands of repo-wide formatting diffs
+  including unrelated files, matching the earlier Knife14bf fmt-churn hazard.
+- Correct behavior: do not run or apply root `cargo fmt` in Knife14 scoped
+  stages. Use `git diff --check`, focused tests, clippy, and hand-format the
+  touched hunks only.

@@ -1936,3 +1936,40 @@ worth cleaning up separately.
 - Reusable rule: before changing buffers again, add a bounded nonblocking TUN
   RX drain path and diagnostics that prove whether local ACK/window updates are
   being processed promptly during remote downlink pressure.
+
+## 2026-07-05 — Knife14bh shows bg TUN RX drain is a regression trigger
+
+- Stage: Knife14bh stream-gap A/B.
+- Code under test: `7e33d44`.
+- Bundles:
+  `/tmp/mini_vpn/mvpn_knife14bh_default_usclient_suite_20260705_094918.tar.gz`
+  and
+  `/tmp/mini_vpn/mvpn_knife14bh_drain0_usclient_suite_20260705_095120.tar.gz`.
+- Outcome: default `MINI_VPN_TUN_RX_DRAIN_BUDGET=8` collapsed clean
+  reverse-first P1 to `0.245/0.035 Mbit/s` and produced a data stream
+  `data_pending_gap_max_ms=24516` with only `209758B` received. Setting
+  `MINI_VPN_TUN_RX_DRAIN_BUDGET=0` restored useful flow to
+  `26.5/24.5 Mbit/s`, data stream first byte `4ms`, and about `99MB` received.
+- Key lesson: the Knife14bg opportunistic TUN RX drain path is not safe as a
+  default. It can starve useful reverse downlink rather than improve ACK/window
+  fairness.
+- Reusable rule: when an opportunistic fairness path runs inside a hot remote
+  payload branch, prove it with an off-switch A/B before accepting it as a
+  default. If `budget=0` materially improves throughput, flip the default off
+  before continuing deeper lifecycle work.
+
+## 2026-07-05 — Drain-disabled path exposes next local limiter
+
+- Stage: Knife14bh drain0 analysis.
+- Outcome: with TUN RX drain disabled, clean reverse-first still only reached
+  `24.5 Mbit/s` receiver. TUIC data-stream first byte was fast and data pending
+  gap was no longer the primary label, while local pressure appeared as
+  `downlink_backpressure pause_edges=11`, `send_queue_max=1048576`,
+  `tun_tx_dropped_delta=1639`, and pending-at-close `5617B`
+  (`active_no_send`).
+- Key lesson: after removing the bg drain regression, the remaining Knife14
+  branch is local TUN egress/downlink backpressure, not TUIC stream first-byte
+  starvation.
+- Reusable rule: separate regression removal from next-root optimization. First
+  make the default match the known-better drain0 shape, then tune the recovered
+  egress/backpressure limiter.
