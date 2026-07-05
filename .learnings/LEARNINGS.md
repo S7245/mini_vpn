@@ -2180,3 +2180,25 @@ worth cleaning up separately.
   are quiet, do not continue TUN feedback tuning. First run a bounded same-window
   A/B or add attribution that separates code regression from VPS stream-readiness
   variance, then choose the next behavior branch.
+
+## 2026-07-05 — Knife14bn A/B clears 3d06bea as the no-data-stream cause
+
+- Stage: Knife14bn same-window VPS A/B.
+- Bundles:
+  `/tmp/mini_vpn/knife14bn_ab_20260705/mvpn_knife14bn_ab_09bb67c_usclient_suite_20260705_174746.tar.gz`
+  and
+  `/tmp/mini_vpn/knife14bn_ab_20260705/mvpn_knife14bn_ab_3d06bea_usclient_suite_20260705_175004.tar.gz`.
+- Outcome: `09bb67c` also produced a low-byte quiet-egress run
+  (`0.210/0.021 Mbit/s`, `.77` sender `768 KiB / 210 Kbit/s`), so the prior
+  Knife14bm no-data-stream result was not enough to blame `3d06bea`.
+  `3d06bea` returned to a local pressure shape (`19.3/18.2 Mbit/s`) with
+  `downlink_backpressure 6/6`, `tun_tx_dropped_delta=1272`, and
+  `terminal_pending_reap=809715B`.
+- Key lesson: the recent-pressure latch did fire on VPS evidence:
+  `tun_egress_feedback pause_edges=1 resume_edges=1 drop_events=1`. Keep it.
+  The remaining blocker is not latch attribution but close-drain/terminal
+  pending under local downlink pressure.
+- Reusable rule: if a same-window A/B shows the older commit can also hit
+  no-data-stream while the newer commit reaches the pressure branch, do not
+  revert the newer diagnostic/control fix. Continue from the run that activates
+  the local pressure path and fix the next visible lifecycle invariant.

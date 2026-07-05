@@ -1341,3 +1341,22 @@
   stop before new behavior-code edits. Record the result, compare same-window
   behavior or tighten attribution, then proceed only after confirming the next
   plan.
+
+## 2026-07-05 — raw SHA bundle creation can produce an empty bundle
+
+- Symptom: `git bundle create /tmp/... 09bb67c` and the same command for
+  `3d06bea` failed with `fatal: Refusing to create empty bundle`.
+- Cause: a raw commit SHA is not a bundle ref by itself for this usage.
+- Correct behavior: create a bundle from a real ref such as `HEAD` when the
+  target commits are reachable, then fetch that bundle on `.27` and switch to
+  the desired commit SHA locally.
+
+## 2026-07-05 — .27 suite commands must source .env explicitly
+
+- Symptom: the first Knife14bn `09bb67c` suite failed before throughput because
+  `MINI_VPN_TUIC_*` env vars were missing.
+- Cause: the remote command did not source `/home/ubuntu/mini_vpn/.env`; an SSH
+  login shell did not export those variables automatically.
+- Correct behavior: when running the suite manually from `.27`, start from the
+  repo root and run `set -a; . ./.env; set +a` before invoking the suite. Treat
+  missing TUIC env bundles as invalid pre-throughput artifacts.
