@@ -2268,3 +2268,23 @@ worth cleaning up separately.
 - Reusable rule: when a VPS acceptance run needs server-side attribution,
   make the known topology self-contained in the suite and test the defaults
   offline. Do not depend on manual SSH envs for every run.
+
+## 2026-07-05 — Knife14bp VPS proves server evidence defaults and exposes no-data shape
+
+- Stage: Knife14bp scoped VPS evidence acceptance for `d5d8542`.
+- Bundle:
+  `/tmp/mini_vpn/knife14bp_evidence_defaults_20260705/mvpn_knife14bp_evidence_defaults_d5d8542_usclient_suite_20260705_193204.tar.gz`
+- Outcome: the suite resolved `.33/.77` SSH hosts and key paths without explicit
+  SSH envs, and the bundle included both sing-box and iperf3 evidence. Script
+  acceptance passed.
+- Throughput result: reverse-first P1 failed at `280 Kbit/s` sender and
+  `2.64 Kbit/s` receiver. Direct `.27 <-> .77` baselines were healthy around
+  `279-280 Mbit/s` receiver.
+- Key lesson: `.77` iperf3 journal showed the target sender itself at only
+  `1.00 MBytes / 280 Kbit/s`; `.33` showed TUIC inbound/direct outbound and no
+  `fail auth`. This is a no-data/delayed-stream shape, not hidden local loss of
+  a high-rate sender.
+- Reusable rule: after a run changes from tx-queue pressure to no-data with
+  complete server evidence, do not patch behavior immediately. Repeat or add
+  evidence-only instrumentation to separate VPS variance, stream-readiness, and
+  local TCP window/ACK behavior.

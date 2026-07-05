@@ -1386,3 +1386,20 @@
   `EXIT_SSH_KEY=/home/ubuntu/.ssh/vpn` / `TARGET_SSH_KEY=/home/ubuntu/.ssh/vpn`
   from `.27`, or teach the suite to default these values for the Knife14
   acceptance hosts.
+
+## 2026-07-05 — Knife14bp evidence run changed to no-data shape
+
+- Symptom: the `d5d8542` evidence-defaults suite had healthy direct baselines
+  but reverse-first P1 over mini_vpn measured only `280 Kbit/s` sender and
+  `2.64 Kbit/s` receiver.
+- Evidence: server evidence was complete. `.33` showed current TUIC
+  inbound/direct outbound with no `fail auth`; `.77` iperf3 journal showed the
+  target sender itself at `1.00 MBytes / 280 Kbit/s`. mini_vpn had no TUN
+  drops, no downlink backpressure, no QUIC loss/congestion, no pending-at-close,
+  and no terminal pending reap. Terminal-late payload was visible and bounded:
+  `28544B` across `2` events.
+- Correct behavior: do not treat this run as a clean tx-queue-only
+  receive-window branch and do not make a behavior patch from it alone. First
+  repeat in the same evidence mode or add evidence-only stream/window
+  instrumentation to distinguish VPS run variance from a deterministic
+  stream-readiness or local TCP ACK/window issue.
