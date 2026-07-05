@@ -1239,3 +1239,27 @@
   next VPS run, add or inspect instrumentation that explains why the TUIC data
   stream receives only about `86KB` despite healthy direct baselines and clean
   local egress counters.
+
+## 2026-07-05 — Knife14bj clippy caught a widening formatter argument list
+
+- Symptom: `cargo clippy --lib -- -D warnings` failed after adding TUIC stream
+  poll-cadence fields because `format_tuic_tcp_stream_close_line` grew to nine
+  positional arguments and triggered `clippy::too_many_arguments`.
+- Fix: pass the existing `TuicTcpStreamCloseSnapshot` into the close-line
+  formatter instead of extending the positional parameter list.
+- Correct behavior: when adding multiple diagnostic counters to an existing
+  formatter, prefer a snapshot/struct parameter over more positional arguments,
+  then run clippy before committing.
+
+## 2026-07-05 — Sandbox blocks UDP bind for QUIC endpoint tests
+
+- Symptom: sandboxed `cargo test --lib` failed only
+  `quic::tests::client_endpoint_binds` and
+  `quic::tests::client_endpoint_binds_with_each_cc`; a direct sandboxed
+  `python3` UDP bind to `0.0.0.0:0` also failed with `Operation not permitted`.
+- Evidence: rerunning `cargo test --lib` outside the sandbox passed all
+  `282` lib tests.
+- Correct behavior: if QUIC endpoint bind tests fail under the managed sandbox,
+  verify with a sandbox-external `cargo test` before changing QUIC endpoint or
+  transport code. Treat the sandbox failure as test-environment evidence, not
+  a product regression.

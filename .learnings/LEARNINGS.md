@@ -2011,3 +2011,25 @@ worth cleaning up separately.
   downlink/backpressure counters are quiet, pivot away from close-drain and
   TUN egress. The next diagnostic must instrument TUIC stream read progress,
   receive-window/flow-control state, and server-side send behavior.
+
+## 2026-07-05 — Knife14bj adds TUIC stream poll-cadence diagnostics
+
+- Stage: Knife14bj TUIC stream starvation diagnostics.
+- Outcome: Added behavior-neutral poll cadence accounting to TUIC TCP stream
+  diagnostics and parser output. `tuic-tcp-stream-pending` /
+  `tuic-tcp-stream-close` now include `polls` and `max_poll_gap_ms`, and the
+  low-RTT parser emits `tuic_stream_polling` with data-stream-filtered poll
+  maxima.
+- Local gates passed: `cargo test --lib tuic::tests::`,
+  `bash scripts/knife14b-lowrtt-probe.sh --self-test`,
+  `bash scripts/knife14b-usclient-tunnel-suite.sh --self-test`,
+  shell syntax checks for both scripts, `cargo clippy --lib -- -D warnings`,
+  sandbox-external `cargo test --lib`, and `git diff --check`.
+- Key lesson: the old `pending_gap_ms` signal showed the stream had no bytes,
+  but not whether the relay task itself was being polled. Pairing
+  `pending_gap_ms` with `max_poll_gap_ms` separates task scheduling/wakeup
+  gaps from a consistently polled but idle QUIC stream.
+- Reusable rule: for TUIC stream starvation, treat high `pending_gap_ms` plus
+  low `data_poll_gap_max_ms` as evidence against local relay-task starvation;
+  if both are high, inspect task wakeups/scheduling before blaming sing-box,
+  target iperf, close-drain, or TUN egress.

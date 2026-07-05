@@ -281,6 +281,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for TrackedRelayStream<S> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let before_len = buf.filled().len();
+        let now = Instant::now();
+        if let Some(diag) = self.tcp_diag.as_mut() {
+            diag.note_poll_at(now);
+        }
         let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
         match &poll {
             Poll::Ready(Ok(())) => {
@@ -288,7 +292,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for TrackedRelayStream<S> {
                 if read_bytes > 0
                     && let Some(diag) = self.tcp_diag.as_mut()
                 {
-                    let event = diag.note_read_at(read_bytes, Instant::now());
+                    let event = diag.note_read_at(read_bytes, now);
                     let meta = diag.meta.clone();
                     if let Some(first_rx_ms) = event.first_rx_ms {
                         println!(
@@ -319,7 +323,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for TrackedRelayStream<S> {
             }
             Poll::Pending => {
                 if let Some(diag) = self.tcp_diag.as_mut()
-                    && let Some(event) = diag.note_pending_at(Instant::now())
+                    && let Some(event) = diag.note_pending_at(now)
                 {
                     let meta = diag.meta.clone();
                     println!(
@@ -328,6 +332,8 @@ impl<S: AsyncRead + Unpin> AsyncRead for TrackedRelayStream<S> {
                             &meta,
                             event.pending_gap_ms,
                             event.pending_polls,
+                            event.polls,
+                            event.max_poll_gap_ms,
                             event.rx_bytes,
                             event.reads
                         )
@@ -364,15 +370,7 @@ impl<S> Drop for TrackedRelayStream<S> {
             let snapshot = diag.close_snapshot();
             println!(
                 "{}",
-                format_tuic_tcp_stream_close_line(
-                    &diag.meta,
-                    snapshot.first_rx_ms,
-                    snapshot.max_read_gap_ms,
-                    snapshot.rx_bytes,
-                    snapshot.reads,
-                    snapshot.pending_polls,
-                    snapshot.max_pending_gap_ms
-                )
+                format_tuic_tcp_stream_close_line(&diag.meta, &snapshot)
             );
         }
     }
@@ -984,12 +982,16 @@ struct TuicTcpStreamCloseSnapshot {
     reads: u64,
     pending_polls: u64,
     max_pending_gap_ms: u128,
+    polls: u64,
+    max_poll_gap_ms: u128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TuicTcpStreamPendingEvent {
     pending_gap_ms: u128,
     pending_polls: u64,
+    polls: u64,
+    max_poll_gap_ms: u128,
     rx_bytes: u64,
     reads: u64,
 }
@@ -1003,6 +1005,9 @@ struct TuicTcpStreamDiag {
     max_read_gap_ms: u128,
     rx_bytes: u64,
     reads: u64,
+    polls: u64,
+    last_poll_at: Option<Instant>,
+    max_poll_gap_ms: u128,
     pending_polls: u64,
     max_pending_gap_ms: u128,
     last_pending_log_at: Option<Instant>,
@@ -1018,10 +1023,23 @@ impl TuicTcpStreamDiag {
             max_read_gap_ms: 0,
             rx_bytes: 0,
             reads: 0,
+            polls: 0,
+            last_poll_at: None,
+            max_poll_gap_ms: 0,
             pending_polls: 0,
             max_pending_gap_ms: 0,
             last_pending_log_at: None,
         }
+    }
+
+    fn note_poll_at(&mut self, now: Instant) {
+        self.polls += 1;
+        if let Some(last) = self.last_poll_at {
+            self.max_poll_gap_ms = self
+                .max_poll_gap_ms
+                .max(now.saturating_duration_since(last).as_millis());
+        }
+        self.last_poll_at = Some(now);
     }
 
     fn note_read_at(&mut self, read_bytes: usize, now: Instant) -> TuicTcpStreamReadEvent {
@@ -1073,6 +1091,8 @@ impl TuicTcpStreamDiag {
         Some(TuicTcpStreamPendingEvent {
             pending_gap_ms,
             pending_polls: self.pending_polls,
+            polls: self.polls,
+            max_poll_gap_ms: self.max_poll_gap_ms,
             rx_bytes: self.rx_bytes,
             reads: self.reads,
         })
@@ -1086,6 +1106,8 @@ impl TuicTcpStreamDiag {
             reads: self.reads,
             pending_polls: self.pending_polls,
             max_pending_gap_ms: self.max_pending_gap_ms,
+            polls: self.polls,
+            max_poll_gap_ms: self.max_poll_gap_ms,
         }
     }
 }
@@ -1132,17 +1154,21 @@ fn format_tuic_tcp_stream_pending_line(
     meta: &TuicTcpStreamDiagMeta,
     pending_gap_ms: u128,
     pending_polls: u64,
+    polls: u64,
+    max_poll_gap_ms: u128,
     rx_bytes: u64,
     reads: u64,
 ) -> String {
     format!(
-        "🔎 tuic-tcp-stream-pending target={} conn={} id={} stream={} pending_gap_ms={} pending_polls={} rx_bytes={} reads={}",
+        "🔎 tuic-tcp-stream-pending target={} conn={} id={} stream={} pending_gap_ms={} pending_polls={} polls={} max_poll_gap_ms={} rx_bytes={} reads={}",
         meta.target,
         meta.conn_index,
         meta.stable_id,
         meta.stream_id,
         pending_gap_ms,
         pending_polls,
+        polls,
+        max_poll_gap_ms,
         rx_bytes,
         reads
     )
@@ -1150,25 +1176,22 @@ fn format_tuic_tcp_stream_pending_line(
 
 fn format_tuic_tcp_stream_close_line(
     meta: &TuicTcpStreamDiagMeta,
-    first_rx_ms: u128,
-    max_read_gap_ms: u128,
-    rx_bytes: u64,
-    reads: u64,
-    pending_polls: u64,
-    max_pending_gap_ms: u128,
+    snapshot: &TuicTcpStreamCloseSnapshot,
 ) -> String {
     format!(
-        "🔎 tuic-tcp-stream-close target={} conn={} id={} stream={} first_rx_ms={} max_read_gap_ms={} rx_bytes={} reads={} pending_polls={} max_pending_gap_ms={}",
+        "🔎 tuic-tcp-stream-close target={} conn={} id={} stream={} first_rx_ms={} max_read_gap_ms={} rx_bytes={} reads={} pending_polls={} max_pending_gap_ms={} polls={} max_poll_gap_ms={}",
         meta.target,
         meta.conn_index,
         meta.stable_id,
         meta.stream_id,
-        first_rx_ms,
-        max_read_gap_ms,
-        rx_bytes,
-        reads,
-        pending_polls,
-        max_pending_gap_ms
+        snapshot.first_rx_ms,
+        snapshot.max_read_gap_ms,
+        snapshot.rx_bytes,
+        snapshot.reads,
+        snapshot.pending_polls,
+        snapshot.max_pending_gap_ms,
+        snapshot.polls,
+        snapshot.max_poll_gap_ms
     )
 }
 
@@ -2123,8 +2146,19 @@ mod tests {
         let meta = TuicTcpStreamDiagMeta::new(&target, 3, 42, 8);
         let first = format_tuic_tcp_stream_first_rx_line(&meta, 20_500, 35_244, 1);
         let gap = format_tuic_tcp_stream_read_gap_line(&meta, 15_000, 39_884, 2, 75_128);
-        let pending = format_tuic_tcp_stream_pending_line(&meta, 12_000, 24, 75_128, 2);
-        let close = format_tuic_tcp_stream_close_line(&meta, 20_500, 15_000, 109_304, 3, 24, 12_000);
+        let pending =
+            format_tuic_tcp_stream_pending_line(&meta, 12_000, 24, 31, 5_000, 75_128, 2);
+        let close_snapshot = TuicTcpStreamCloseSnapshot {
+            first_rx_ms: 20_500,
+            max_read_gap_ms: 15_000,
+            rx_bytes: 109_304,
+            reads: 3,
+            pending_polls: 24,
+            max_pending_gap_ms: 12_000,
+            polls: 31,
+            max_poll_gap_ms: 5_000,
+        };
+        let close = format_tuic_tcp_stream_close_line(&meta, &close_snapshot);
 
         assert!(first.contains("tuic-tcp-stream-first-rx"), "{first}");
         assert!(first.contains("target=1.2.3.4:5201"), "{first}");
@@ -2143,6 +2177,8 @@ mod tests {
         assert!(pending.contains("tuic-tcp-stream-pending"), "{pending}");
         assert!(pending.contains("pending_gap_ms=12000"), "{pending}");
         assert!(pending.contains("pending_polls=24"), "{pending}");
+        assert!(pending.contains("polls=31"), "{pending}");
+        assert!(pending.contains("max_poll_gap_ms=5000"), "{pending}");
         assert!(pending.contains("rx_bytes=75128"), "{pending}");
         assert!(pending.contains("reads=2"), "{pending}");
 
@@ -2153,6 +2189,8 @@ mod tests {
         assert!(close.contains("reads=3"), "{close}");
         assert!(close.contains("pending_polls=24"), "{close}");
         assert!(close.contains("max_pending_gap_ms=12000"), "{close}");
+        assert!(close.contains("polls=31"), "{close}");
+        assert!(close.contains("max_poll_gap_ms=5000"), "{close}");
     }
 
     #[test]
@@ -2162,12 +2200,14 @@ mod tests {
         let start = std::time::Instant::now();
         let mut diag = TuicTcpStreamDiag::new(meta, start);
 
+        diag.note_poll_at(start + std::time::Duration::from_millis(20_500));
         let first = diag.note_read_at(35_244, start + std::time::Duration::from_millis(20_500));
         assert_eq!(first.first_rx_ms, Some(20_500));
         assert_eq!(first.gap_ms, None);
         assert_eq!(first.rx_bytes, 35_244);
         assert_eq!(first.reads, 1);
 
+        diag.note_poll_at(start + std::time::Duration::from_millis(35_500));
         let second = diag.note_read_at(39_884, start + std::time::Duration::from_millis(35_500));
         assert_eq!(second.first_rx_ms, None);
         assert_eq!(second.gap_ms, Some(15_000));
@@ -2179,6 +2219,8 @@ mod tests {
         assert_eq!(close.max_read_gap_ms, 15_000);
         assert_eq!(close.rx_bytes, 75_128);
         assert_eq!(close.reads, 2);
+        assert_eq!(close.polls, 2);
+        assert_eq!(close.max_poll_gap_ms, 15_000);
     }
 
     #[test]
@@ -2188,40 +2230,54 @@ mod tests {
         let start = std::time::Instant::now();
         let mut diag = TuicTcpStreamDiag::new(meta, start);
 
+        diag.note_poll_at(start + std::time::Duration::from_millis(999));
         assert_eq!(
             diag.note_pending_at(start + std::time::Duration::from_millis(999)),
             None
         );
+        diag.note_poll_at(start + std::time::Duration::from_millis(1_000));
         let first = diag
             .note_pending_at(start + std::time::Duration::from_millis(1_000))
             .expect("first threshold-crossing pending poll logs");
         assert_eq!(first.pending_gap_ms, 1_000);
         assert_eq!(first.pending_polls, 2);
+        assert_eq!(first.polls, 2);
+        assert_eq!(first.max_poll_gap_ms, 1);
         assert_eq!(first.rx_bytes, 0);
         assert_eq!(first.reads, 0);
+        diag.note_poll_at(start + std::time::Duration::from_millis(1_500));
         assert_eq!(
             diag.note_pending_at(start + std::time::Duration::from_millis(1_500)),
             None,
             "pending logs are rate limited"
         );
+        diag.note_poll_at(start + std::time::Duration::from_millis(2_100));
         let second = diag
             .note_pending_at(start + std::time::Duration::from_millis(2_100))
             .expect("second pending log after the log interval");
         assert_eq!(second.pending_gap_ms, 2_100);
         assert_eq!(second.pending_polls, 4);
+        assert_eq!(second.polls, 4);
+        assert_eq!(second.max_poll_gap_ms, 600);
 
+        diag.note_poll_at(start + std::time::Duration::from_millis(2_200));
         let read = diag.note_read_at(128, start + std::time::Duration::from_millis(2_200));
         assert_eq!(read.rx_bytes, 128);
+        diag.note_poll_at(start + std::time::Duration::from_millis(3_300));
         let after_read = diag
             .note_pending_at(start + std::time::Duration::from_millis(3_300))
             .expect("pending gap is measured from the latest data read");
         assert_eq!(after_read.pending_gap_ms, 1_100);
+        assert_eq!(after_read.polls, 6);
+        assert_eq!(after_read.max_poll_gap_ms, 1_100);
         assert_eq!(after_read.rx_bytes, 128);
         assert_eq!(after_read.reads, 1);
 
         let close = diag.close_snapshot();
         assert_eq!(close.pending_polls, 5);
         assert_eq!(close.max_pending_gap_ms, 2_100);
+        assert_eq!(close.polls, 6);
+        assert_eq!(close.max_poll_gap_ms, 1_100);
     }
 
     #[tokio::test]
@@ -2249,6 +2305,10 @@ mod tests {
         let snapshot = stream.tcp_diag.as_ref().unwrap().close_snapshot();
         assert_eq!(snapshot.rx_bytes, 3);
         assert_eq!(snapshot.reads, 1);
+        assert!(
+            snapshot.polls >= 1,
+            "stream read should poll at least once: {snapshot:?}"
+        );
         assert!(
             snapshot.first_rx_ms < 1_000,
             "first_rx_ms should be immediate in the in-memory stream: {snapshot:?}"

@@ -981,9 +981,13 @@ summarize_metrics_window() {
       stream = ""
       pending_gap_ms = 0
       pending_polls = 0
+      poll_count = 0
+      poll_gap_ms = 0
       pending_rx_bytes = 0
       has_pending_gap_ms = 0
       has_pending_polls = 0
+      has_poll_count = 0
+      has_poll_gap_ms = 0
       has_pending_rx_bytes = 0
       for (i = 1; i <= NF; i++) {
         if ($i ~ /^conn=/) {
@@ -1007,6 +1011,18 @@ summarize_metrics_window() {
           if (pending_polls > max_tuic_pending_polls) {
             max_tuic_pending_polls = pending_polls
           }
+        } else if ($i ~ /^polls=/) {
+          poll_count = numeric_token($i, "polls")
+          has_poll_count = 1
+          if (poll_count > max_tuic_polls) {
+            max_tuic_polls = poll_count
+          }
+        } else if ($i ~ /^max_poll_gap_ms=/) {
+          poll_gap_ms = numeric_token($i, "max_poll_gap_ms")
+          has_poll_gap_ms = 1
+          if (poll_gap_ms > max_tuic_poll_gap_ms) {
+            max_tuic_poll_gap_ms = poll_gap_ms
+          }
         } else if ($i ~ /^rx_bytes=/) {
           pending_rx_bytes = numeric_token($i, "rx_bytes")
           has_pending_rx_bytes = 1
@@ -1020,6 +1036,12 @@ summarize_metrics_window() {
         }
         if (has_pending_polls && pending_polls > tuic_stream_pending_polls[key]) {
           tuic_stream_pending_polls[key] = pending_polls
+        }
+        if (has_poll_count && poll_count > tuic_stream_polls[key]) {
+          tuic_stream_polls[key] = poll_count
+        }
+        if (has_poll_gap_ms && poll_gap_ms > tuic_stream_poll_gap_ms[key]) {
+          tuic_stream_poll_gap_ms[key] = poll_gap_ms
         }
         if (has_pending_rx_bytes && pending_rx_bytes > tuic_stream_observed_rx_bytes[key]) {
           tuic_stream_observed_rx_bytes[key] = pending_rx_bytes
@@ -1040,10 +1062,14 @@ summarize_metrics_window() {
       close_gap_ms = 0
       close_pending_polls = 0
       close_pending_gap_ms = 0
+      close_poll_count = 0
+      close_poll_gap_ms = 0
       has_close_first_rx_ms = 0
       has_close_gap_ms = 0
       has_close_pending_polls = 0
       has_close_pending_gap_ms = 0
+      has_close_poll_count = 0
+      has_close_poll_gap_ms = 0
       for (i = 1; i <= NF; i++) {
         if ($i ~ /^conn=/) {
           conn = digits_token($i, "conn")
@@ -1089,6 +1115,18 @@ summarize_metrics_window() {
           if (close_pending_gap_ms > max_tuic_pending_gap_ms) {
             max_tuic_pending_gap_ms = close_pending_gap_ms
           }
+        } else if ($i ~ /^polls=/) {
+          close_poll_count = numeric_token($i, "polls")
+          has_close_poll_count = 1
+          if (close_poll_count > max_tuic_polls) {
+            max_tuic_polls = close_poll_count
+          }
+        } else if ($i ~ /^max_poll_gap_ms=/) {
+          close_poll_gap_ms = numeric_token($i, "max_poll_gap_ms")
+          has_close_poll_gap_ms = 1
+          if (close_poll_gap_ms > max_tuic_poll_gap_ms) {
+            max_tuic_poll_gap_ms = close_poll_gap_ms
+          }
         }
       }
       if (close_rx_bytes == 0) {
@@ -1114,6 +1152,12 @@ summarize_metrics_window() {
         }
         if (has_close_pending_gap_ms && close_pending_gap_ms > tuic_stream_pending_gap_ms[key]) {
           tuic_stream_pending_gap_ms[key] = close_pending_gap_ms
+        }
+        if (has_close_poll_count && close_poll_count > tuic_stream_polls[key]) {
+          tuic_stream_polls[key] = close_poll_count
+        }
+        if (has_close_poll_gap_ms && close_poll_gap_ms > tuic_stream_poll_gap_ms[key]) {
+          tuic_stream_poll_gap_ms[key] = close_poll_gap_ms
         }
       }
     }
@@ -1322,6 +1366,12 @@ summarize_metrics_window() {
           if (tuic_stream_pending_gap_ms[key] > max_tuic_data_pending_gap_ms) {
             max_tuic_data_pending_gap_ms = tuic_stream_pending_gap_ms[key]
           }
+          if (tuic_stream_polls[key] > max_tuic_data_polls) {
+            max_tuic_data_polls = tuic_stream_polls[key]
+          }
+          if (tuic_stream_poll_gap_ms[key] > max_tuic_data_poll_gap_ms) {
+            max_tuic_data_poll_gap_ms = tuic_stream_poll_gap_ms[key]
+          }
         }
       }
       remote_timing_slow = 0
@@ -1406,6 +1456,7 @@ summarize_metrics_window() {
       printf "- relay_remote_timing: first_read_max_ms=%d max_read_gap_ms=%d current_gap_max_ms=%d no_first_read_gap_max_ms=%d data_streams=%d data_first_read_max_ms=%d data_max_read_gap_ms=%d data_rx_bytes_max=%d data_rx_min_bytes=%d\n", max_relay_first_remote_read_ms, max_relay_remote_read_gap_ms, max_relay_current_remote_gap_ms, max_relay_no_first_remote_gap_ms, relay_data_streams, max_relay_data_first_remote_read_ms, max_relay_data_remote_read_gap_ms, max_relay_data_remote_bytes, data_stream_min_rx_bytes
       printf "- tuic_tcp_stream: first_rx_events=%d first_rx_max_ms=%d read_gap_events=%d read_gap_max_ms=%d close_events=%d close_first_rx_max_ms=%d close_gap_max_ms=%d rx_bytes_max=%d reads_max=%d zero_rx_closes=%d data_streams=%d data_first_rx_max_ms=%d data_read_gap_max_ms=%d data_close_gap_max_ms=%d data_rx_bytes_max=%d data_rx_min_bytes=%d\n", tuic_first_rx_events, max_tuic_first_rx_ms, tuic_read_gap_events, max_tuic_read_gap_ms, tuic_stream_close_events, max_tuic_close_first_rx_ms, max_tuic_close_gap_ms, max_tuic_close_rx_bytes, max_tuic_close_reads, tuic_zero_rx_closes, tuic_data_streams, max_tuic_data_first_rx_ms, max_tuic_data_read_gap_ms, max_tuic_data_close_gap_ms, max_tuic_data_rx_bytes, data_stream_min_rx_bytes
       printf "- tuic_stream_pending: events=%d max_pending_gap_ms=%d pending_polls_max=%d data_streams=%d data_pending_gap_max_ms=%d data_rx_bytes_max=%d data_rx_min_bytes=%d\n", tuic_pending_events, max_tuic_pending_gap_ms, max_tuic_pending_polls, tuic_data_streams, max_tuic_data_pending_gap_ms, max_tuic_data_rx_bytes, data_stream_min_rx_bytes
+      printf "- tuic_stream_polling: polls_max=%d max_poll_gap_ms=%d data_streams=%d data_polls_max=%d data_poll_gap_max_ms=%d data_rx_bytes_max=%d data_rx_min_bytes=%d\n", max_tuic_polls, max_tuic_poll_gap_ms, tuic_data_streams, max_tuic_data_polls, max_tuic_data_poll_gap_ms, max_tuic_data_rx_bytes, data_stream_min_rx_bytes
       printf "- tun_drops: if=%s tun_rx_dropped_delta=%s tun_tx_dropped_delta=%s\n", tun_if, tun_rx_delta, tun_tx_delta
       printf "- runtime_tun_egress: samples=%d drop_events=%d drop_delta_total=%d max_delta=%d unavailable=%d resets=%d\n", runtime_tun_samples, runtime_tun_drop_events, runtime_tun_drop_delta_total, max_runtime_tun_delta, runtime_tun_unavailable, runtime_tun_resets
       printf "- tun_egress_feedback: pause_edges=%d resume_edges=%d drop_events=%d drop_delta_total=%d max_delta=%d max_pressure_bytes=%d\n", tun_feedback_pause_count, tun_feedback_resume_count, tun_feedback_drop_events, tun_feedback_drop_delta_total, max_tun_feedback_delta, max_tun_feedback_pressure
@@ -1498,6 +1549,7 @@ EOF_LOG
   assert_contains "$summary" "relay_remote_timing: first_read_max_ms=0 max_read_gap_ms=0 current_gap_max_ms=0 no_first_read_gap_max_ms=0"
   assert_contains "$summary" "tuic_tcp_stream: first_rx_events=0 first_rx_max_ms=0 read_gap_events=0 read_gap_max_ms=0 close_events=0 close_first_rx_max_ms=0 close_gap_max_ms=0 rx_bytes_max=0 reads_max=0 zero_rx_closes=0"
   assert_contains "$summary" "tuic_stream_pending: events=0 max_pending_gap_ms=0 pending_polls_max=0 data_streams=0 data_pending_gap_max_ms=0 data_rx_bytes_max=0"
+  assert_contains "$summary" "tuic_stream_polling: polls_max=0 max_poll_gap_ms=0 data_streams=0 data_polls_max=0 data_poll_gap_max_ms=0 data_rx_bytes_max=0"
   assert_contains "$summary" "runtime_tun_egress: samples=1 drop_events=1 drop_delta_total=1423 max_delta=1423 unavailable=0 resets=0"
   assert_contains "$summary" "tun_rx_drain: attempts=4 packets=11 tcp=9 dns=1 udp=1 budget_exhausted=1 would_block=3 errors=0"
   assert_contains "$summary" "max_lost_bytes_delta=439956"
@@ -1628,14 +1680,15 @@ EOF_IPERF
 🔎 tuic-tcp-stream-first-rx target=43.130.32.77:5201 conn=3 id=99 stream=8 first_rx_ms=20500 read_bytes=35244 reads=1
 🔎 tcp-relay-live handle=SocketHandle(1) epoch=1 writer_done=false read_only_after_local_finish=false uplink_bytes=37 uplink_writes=1 remote_to_global_rx_bytes=75128 remote_reads=2 remote_after_local_finish_bytes=0 remote_after_local_finish_reads=0 first_remote_read_ms=20500 max_remote_read_gap_ms=15000 current_remote_read_gap_ms=100 global_rx_wait_max_us=4 global_rx_pressure_events=0 global_rx_queue_used_max=1 global_rx_queue_capacity=1024 local_write_wait_max_us=0 local_write_pressure_events=0
 🔎 tuic-tcp-stream-read-gap target=43.130.32.77:5201 conn=3 id=99 stream=8 gap_ms=15000 read_bytes=39884 reads=2 rx_bytes=75128
-🔎 tuic-tcp-stream-pending target=43.130.32.77:5201 conn=3 id=99 stream=8 pending_gap_ms=12000 pending_polls=97 rx_bytes=75128 reads=2
-🔎 tuic-tcp-stream-close target=43.130.32.77:5201 conn=3 id=99 stream=8 first_rx_ms=20500 max_read_gap_ms=15000 rx_bytes=109304 reads=3 pending_polls=97 max_pending_gap_ms=12000
+🔎 tuic-tcp-stream-pending target=43.130.32.77:5201 conn=3 id=99 stream=8 pending_gap_ms=12000 pending_polls=97 polls=112 max_poll_gap_ms=5000 rx_bytes=75128 reads=2
+🔎 tuic-tcp-stream-close target=43.130.32.77:5201 conn=3 id=99 stream=8 first_rx_ms=20500 max_read_gap_ms=15000 rx_bytes=109304 reads=3 pending_polls=97 max_pending_gap_ms=12000 polls=126 max_poll_gap_ms=5000
 📊 TUIC QUIC stats conn=3 id=99 rtt=5ms cwnd=247289 lost=0/105 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=103/14703B udp_rx=535/734789B dg_max=Some(1418) dg_space=1048576B
 EOF_LOG
   summary="$(summarize_metrics_window 0 "stream-timing-self-test" "$iperf_sample" "$log_sample")"
   assert_contains "$summary" "relay_remote_timing: first_read_max_ms=20500 max_read_gap_ms=15000 current_gap_max_ms=12000 no_first_read_gap_max_ms=12000"
   assert_contains "$summary" "tuic_tcp_stream: first_rx_events=1 first_rx_max_ms=20500 read_gap_events=1 read_gap_max_ms=15000 close_events=1 close_first_rx_max_ms=20500 close_gap_max_ms=15000 rx_bytes_max=109304 reads_max=3 zero_rx_closes=0"
   assert_contains "$summary" "tuic_stream_pending: events=1 max_pending_gap_ms=12000 pending_polls_max=97 data_streams=1 data_pending_gap_max_ms=12000 data_rx_bytes_max=109304"
+  assert_contains "$summary" "tuic_stream_polling: polls_max=126 max_poll_gap_ms=5000 data_streams=1 data_polls_max=126 data_poll_gap_max_ms=5000 data_rx_bytes_max=109304"
   assert_contains "$summary" "attribution: tuic_stream_first_byte_slow+tuic_stream_read_gap+tuic_stream_read_pending+relay_remote_first_byte_slow+relay_remote_read_gap"
   assert_not_contains "$summary" "reverse_sender_backpressured"
 
