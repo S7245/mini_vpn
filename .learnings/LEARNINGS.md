@@ -2097,3 +2097,25 @@ worth cleaning up separately.
   receive-window feedback caused by smoltcp send-queue saturation and TUN qdisc
   drops. Do not continue the TUIC stream-starvation branch unless a new run
   again shows low target sender bytes without local egress pressure.
+
+## 2026-07-05 — Knife14bl gates immediate downlink TUN flush on local send-queue pressure
+
+- Stage: Knife14bl local TDD/code before VPS acceptance.
+- Outcome: added a pressure-aware remote-payload immediate flush decision. A
+  pending downlink backlog still forces immediate progress while the local TCP
+  send queue is below the downlink high watermark, but if `send_queue >= high`
+  the flush is deferred to the timer/dirty-relay path and accepted bytes still
+  debit the immediate budget.
+- Code/spec: `src/client_tun.rs`,
+  `docs/tech/2026-07-05-knife14bl-tun-egress-pressure-spec.md`, and
+  `docs/tech/2026-07-05-knife14bl-tun-egress-pressure-plan.md`.
+- Local gates passed: `cargo test downlink_egress_pacer --lib`,
+  `cargo test downlink --lib`, `cargo test tun_egress --lib`,
+  `scripts/knife14b-usclient-tunnel-suite.sh --self-test`,
+  `scripts/knife14b-lowrtt-probe.sh --self-test`,
+  sandbox-external `cargo test --lib`, `cargo clippy --lib -- -D warnings`,
+  and `git diff --check`.
+- Reusable rule: after evidence shows target-side reverse sender throughput is
+  also low and local `tun_tx_dropped`/send-queue pressure is present, the first
+  behavior fix should reduce remote-payload-driven immediate TUN bursts at the
+  local pressure boundary without lowering product-wide egress defaults.

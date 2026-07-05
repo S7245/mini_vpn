@@ -1830,7 +1830,17 @@ impl DownlinkEgressPacer {
             self.remaining_immediate_bytes.saturating_sub(accepted_bytes);
     }
 
-    fn allow_remote_payload_flush(&mut self, accepted_bytes: usize, pending_bytes: usize) -> bool {
+    fn allow_remote_payload_flush(
+        &mut self,
+        accepted_bytes: usize,
+        pending_bytes: usize,
+        send_queue_bytes: usize,
+        backpressure: DownlinkBackpressureConfig,
+    ) -> bool {
+        if send_queue_bytes >= backpressure.high_bytes {
+            self.debit_budget(accepted_bytes);
+            return false;
+        }
         if pending_bytes > 0 {
             self.debit_budget(accepted_bytes);
             return true;
@@ -2155,7 +2165,7 @@ pub async fn start_tun_proxy() {
         runtime_config.downlink_flush_max_bytes
     );
     println!(
-        "🚦 TCP 下行 egress pacing: immediate={}B/tick（MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES 可调；pending backlog 会强制 immediate flush）",
+        "🚦 TCP 下行 egress pacing: immediate={}B/tick（MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES 可调；pending backlog 在本地 egress 压力低于 high 时强制 immediate flush）",
         runtime_config.downlink_egress_immediate_bytes
     );
     println!(
@@ -2455,6 +2465,7 @@ pub async fn run_event_loop<D, U, M>(
                             udp_clock.elapsed().as_secs(),
                             downlink_flush_max_bytes,
                             &mut downlink_egress_pacer,
+                            downlink_backpressure,
                         )
                         .await
                         {
@@ -3814,6 +3825,7 @@ async fn handle_remote_payload<D: TunIo>(
     now_secs: u64,
     downlink_flush_max_bytes: usize,
     downlink_egress_pacer: &mut DownlinkEgressPacer,
+    downlink_backpressure: DownlinkBackpressureConfig,
 ) -> std::io::Result<usize> {
     let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
@@ -3868,7 +3880,12 @@ async fn handle_remote_payload<D: TunIo>(
     log_tcp_lifecycle_observation(handle, ctx, snapshot, now_secs, "remote_payload");
 
     if !downlink_egress_pacer
-        .allow_remote_payload_flush(accepted_bytes, ctx.downlink_pending.len())
+        .allow_remote_payload_flush(
+            accepted_bytes,
+            ctx.downlink_pending.len(),
+            snapshot.send_queue,
+            downlink_backpressure,
+        )
     {
         if accepted_bytes > 0 {
             ctx.downlink_diag.note_tun_flush_deferred();
@@ -6288,58 +6305,94 @@ mod tests {
 
     #[test]
     fn downlink_egress_pacer_allows_budget_then_defers_until_timer_reset() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 1_000_000,
+            low_bytes: 250_000,
+        };
         let mut pacer = DownlinkEgressPacer::new(65_536);
 
         assert!(
-            pacer.allow_remote_payload_flush(32_768, 0),
+            pacer.allow_remote_payload_flush(32_768, 0, 0, cfg),
             "first accepted slice should flush immediately while budget remains"
         );
         assert!(
-            pacer.allow_remote_payload_flush(32_768, 0),
+            pacer.allow_remote_payload_flush(32_768, 0, 0, cfg),
             "budget may be consumed exactly"
         );
         assert!(
-            !pacer.allow_remote_payload_flush(1, 0),
+            !pacer.allow_remote_payload_flush(1, 0, 0, cfg),
             "extra accepted bytes in the same interval should defer to timer flush"
         );
 
         pacer.on_timer_tick();
         assert!(
-            pacer.allow_remote_payload_flush(1, 0),
+            pacer.allow_remote_payload_flush(1, 0, 0, cfg),
             "timer reset should reopen the immediate flush budget"
         );
     }
 
     #[test]
     fn downlink_egress_pacer_zero_budget_defers_only_when_no_backlog_remains() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 1_000_000,
+            low_bytes: 250_000,
+        };
         let mut pacer = DownlinkEgressPacer::new(0);
 
         assert!(
-            !pacer.allow_remote_payload_flush(1, 0),
+            !pacer.allow_remote_payload_flush(1, 0, 0, cfg),
             "zero budget should defer when the current payload left no backlog"
         );
         assert!(
-            !pacer.allow_remote_payload_flush(0, 0),
+            !pacer.allow_remote_payload_flush(0, 0, 0, cfg),
             "zero accepted bytes should never force an immediate TUN flush"
         );
         assert!(
-            pacer.allow_remote_payload_flush(0, 1),
+            pacer.allow_remote_payload_flush(0, 1, 0, cfg),
             "pending backlog should force an immediate flush attempt even with zero budget"
         );
         pacer.on_timer_tick();
         assert!(
-            !pacer.allow_remote_payload_flush(65_536, 0),
+            !pacer.allow_remote_payload_flush(65_536, 0, 0, cfg),
             "timer reset should preserve an explicitly disabled no-backlog budget"
         );
     }
 
     #[test]
     fn downlink_egress_pacer_forces_flush_while_pending_remains() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 1_000_000,
+            low_bytes: 250_000,
+        };
         let mut pacer = DownlinkEgressPacer::new(65_536);
 
         assert!(
-            pacer.allow_remote_payload_flush(65_537, 1),
+            pacer.allow_remote_payload_flush(65_537, 1, 0, cfg),
             "pending backlog must force immediate egress even when accepted bytes exceed budget"
+        );
+    }
+
+    #[test]
+    fn downlink_egress_pacer_defers_pending_flush_at_send_queue_high_watermark() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let mut pacer = DownlinkEgressPacer::new(100);
+
+        assert!(
+            !pacer.allow_remote_payload_flush(32, 1, 100, cfg),
+            "local send queue at high watermark should defer remote-payload TUN flush"
+        );
+        assert_eq!(
+            pacer.remaining_immediate_bytes, 68,
+            "bytes accepted into smoltcp should still consume the immediate budget"
+        );
+
+        pacer.on_timer_tick();
+        assert!(
+            pacer.allow_remote_payload_flush(0, 1, 99, cfg),
+            "pending backlog can still force progress while send queue is below high"
         );
     }
 

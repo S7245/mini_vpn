@@ -1304,3 +1304,15 @@
   TUN egress/backpressure plan that targets smoltcp send-queue saturation and
   TUN qdisc drops. Also tighten `.33` server-evidence log bounding because the
   current tail-based capture includes unrelated older VLESS noise.
+
+## 2026-07-05 — Root cargo fmt creates unrelated repository-wide churn
+
+- Symptom: running `cargo fmt` at the repository root during Knife14bl rewrote
+  many unrelated Rust files, producing a large diff outside the scoped
+  downlink/TUN egress task.
+- Fix: reverse only the agent-created formatting churn and reapply the scoped
+  Knife14bl patch manually.
+- Correct behavior: on this branch, do not use root `cargo fmt` as a default
+  gate for narrow data-plane patches. Prefer `git diff --check`, focused tests,
+  and manual/targeted formatting unless the intended task is repository
+  formatting.
