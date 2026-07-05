@@ -1288,3 +1288,19 @@
   server-side/send-side diagnostics that prove whether `.77` sent little data,
   sing-box stopped forwarding, or mini_vpn/quinn did not receive stream-ready
   data. Do not keep patching local lifecycle paths without that evidence.
+
+## 2026-07-05 — Knife14bk acceptance still low, but failure shape changed
+
+- Symptom: the `804eec1` server-evidence suite completed but reverse-first P1
+  was still only `18.8/17.0 Mbit/s`.
+- Evidence: `.77` journal showed its reverse sender also finished at
+  `67.1 MBytes / 18.8 Mbit/s`; `.33` showed TUIC inbound/direct outbound opens
+  and no current `fail auth`; mini_vpn showed `tun_tx_dropped_delta=6070`,
+  `downlink_backpressure pause_edges=10`, and `active_no_send` close pending.
+- Rejected interpretation: this run is not proof that `.77` sent hundreds of
+  Mbit/s and mini_vpn silently lost the bytes, and it is not a terminal
+  pending-reap loss point.
+- Correct behavior: before changing data-plane behavior, propose a small local
+  TUN egress/backpressure plan that targets smoltcp send-queue saturation and
+  TUN qdisc drops. Also tighten `.33` server-evidence log bounding because the
+  current tail-based capture includes unrelated older VLESS noise.

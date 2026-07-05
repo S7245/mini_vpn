@@ -2074,3 +2074,26 @@ worth cleaning up separately.
   lines in the same probe window. If `.77` itself sends little, pivot to
   ACK/window/send-side analysis; if `.77` sends much more than mini_vpn reads,
   inspect exit forwarding and TUIC stream readiness.
+
+## 2026-07-05 — Knife14bk server evidence re-opens local TUN egress pressure
+
+- Stage: Knife14bk scoped VPS acceptance with server-side evidence.
+- Bundle:
+  `/tmp/mini_vpn/knife14bk_server_evidence_20260705_134634/mvpn_knife14bk_server_evidence_usclient_suite_20260705_134634.tar.gz`
+- Code under test: `804eec1`.
+- Outcome: reverse-first P1 remained low at `18.8/17.0 Mbit/s`, while direct
+  `.27 -> .77` and `.33 -> .77` reverse baselines were healthy around
+  `297` and `284 Mbit/s`. The server evidence artifact showed `.77` iperf3
+  itself sent only `67.1 MBytes / 18.8 Mbit/s` over the tunneled reverse path,
+  and `.33` logged TUIC inbound/direct outbound opens without a current
+  `fail auth` signal.
+- Key lesson: this run is no longer the Knife14bj near-zero stream-starvation
+  shape. mini_vpn read about `70MB` from the TUIC stream, but local egress
+  pressure reappeared: `downlink_backpressure pause_edges=10`,
+  `tun_tx_dropped_delta=6070`, `runtime_tun_egress drop_delta_total=5666`, and
+  close pending was `active_no_send=16254B` with `terminal_pending_reap=0`.
+- Reusable rule: when server-side reverse sender throughput equals tunnel
+  sender throughput and direct baselines are healthy, inspect the local ACK /
+  receive-window feedback caused by smoltcp send-queue saturation and TUN qdisc
+  drops. Do not continue the TUIC stream-starvation branch unless a new run
+  again shows low target sender bytes without local egress pressure.
