@@ -1225,3 +1225,17 @@
   script to remote `python3 -` over SSH stdin and print only boolean
   match/mismatch fields. Never print TUIC credentials or hashes in logs,
   reports, learnings, or summaries.
+
+## 2026-07-05 — Knife14bi default drain-off did not reproduce bh drain0 throughput
+
+- Symptom: after restarting `.33`, the Knife14bi default rerun started
+  successfully with `MINI_VPN_TUN_RX_DRAIN_BUDGET=0`, but reverse-first P1
+  collapsed to `0.280/0.017 Mbit/s`.
+- Rejected interpretation: this is not the old bg TUN RX drain regression and
+  not a close-drain/terminal-pending loss point. The run had
+  `tun_rx_drain attempts=0`, no downlink backpressure, no TUN drops, no
+  terminal pending reap, no send-slice errors, and no QUIC loss/blocking.
+- Correct behavior: stop treating drain-off as sufficient proof. Before the
+  next VPS run, add or inspect instrumentation that explains why the TUIC data
+  stream receives only about `86KB` despite healthy direct baselines and clean
+  local egress counters.

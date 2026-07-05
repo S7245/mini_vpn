@@ -1992,3 +1992,22 @@ worth cleaning up separately.
 - Reusable rule: when TUIC auth-finish startup fails while service health and
   exact no-secret config comparison pass, restart sing-box once and rerun the
   same scoped suite before touching mini_vpn data-plane code.
+
+## 2026-07-05 — Knife14bi restart rerun exposes TUIC stream starvation
+
+- Stage: Knife14bi default drain-off rerun after `.33` sing-box restart.
+- Bundle:
+  `/tmp/mini_vpn/mvpn_knife14bi_default_rerun_usclient_suite_20260705_113246.tar.gz`.
+- Outcome: restart cleared the TUIC auth-finish startup failure, and startup
+  confirmed `TUN RX drain budget: 0` with `tun_rx_drain attempts=0`. The
+  reverse-first probe still collapsed to `0.280/0.017 Mbit/s`. Local pending,
+  TUN drops, terminal pending, downlink backpressure, and QUIC loss/blocking
+  were all quiet.
+- Key lesson: default drain-off is necessary but not sufficient. The new
+  failing shape is data-stream starvation: first RX is fast (`3ms`), but the
+  TUIC data stream only receives about `86KB` and reports long
+  read/pending gaps around `17s`.
+- Reusable rule: when `remote_to_global_rx_bytes` remains tiny while local
+  downlink/backpressure counters are quiet, pivot away from close-drain and
+  TUN egress. The next diagnostic must instrument TUIC stream read progress,
+  receive-window/flow-control state, and server-side send behavior.
