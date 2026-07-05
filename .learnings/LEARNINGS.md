@@ -1,5 +1,30 @@
 # Learnings
 
+## 2026-07-05 - Knife14bg rejects TUN RX drain cadence as the clean reverse root
+
+- Code commit: `356e2d2`
+- Result doc:
+  `docs/tech/2026-07-05-knife14bg-tun-rx-drain-cadence-results.md`
+- Log bundle:
+  `/tmp/mini_vpn/mvpn_knife14bg_tun_rx_drain_usclient_suite_20260705_085637.tar.gz`
+- Outcome: the bounded nonblocking TUN RX drain patch passed local gates but
+  failed VPS acceptance. Clean reverse-first P1 collapsed to
+  `0.315/0.025 Mbit/s`.
+- Key signal: the new drain path was active in the clean window
+  (`tun_rx_drain packets=25 tcp=25 errors=0`), but `downlink_backpressure`,
+  terminal pending, close-time pending, TUN drops, TUN flush failures,
+  `send_slice` zero/errors, global_rx pressure, and clean-window QUIC
+  loss/congestion were all zero. The data stream delivered only about `92 KiB`
+  and the attribution moved to `tuic_stream_read_gap+relay_remote_read_gap`.
+- Baseline check: `.27 -> .77` and `.33 -> .77` direct reverse preflights were
+  healthy (`280` and `283 Mbit/s` receiver), and `.33` sing-box stayed active
+  with normal TUIC inbound/direct outbound log lines.
+- Reusable rule: when clean reverse-first has tiny remote-to-local bytes,
+  active `tun_rx_drain`, and no local downlink pressure, stop changing TUN,
+  pending, close/reap, or tx-queue behavior. Add behavior-neutral TUIC stream
+  gap evidence and run a scoped reverse-only A/B before the next behavior
+  patch.
+
 ## 2026-07-04 - Knife14az shifts the failed reverse root before local downlink drain
 
 - Code commit: `f21e782`

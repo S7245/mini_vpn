@@ -1,5 +1,29 @@
 # Errors
 
+## 2026-07-05 - Knife14bg VPS acceptance failed after TUN RX drain patch
+
+- Stage: Knife14bg bounded TUN RX drain cadence acceptance for commit
+  `356e2d2`.
+- Failed bundle:
+  `/tmp/mini_vpn/mvpn_knife14bg_tun_rx_drain_usclient_suite_20260705_085637.tar.gz`
+- Symptom: clean reverse-first P1 reached only `0.315/0.025 Mbit/s` even
+  though `.27 -> .77` and `.33 -> .77` direct reverse preflights were healthy.
+- Important discriminator: `tun_rx_drain` processed `25` TCP packets with
+  zero errors, while `downlink_backpressure`, terminal pending, close-time
+  pending, TUN drops, TUN flush failures, `send_slice` zero/errors, and
+  clean-window QUIC loss/congestion all stayed zero.
+- Active signal: only about `92 KiB` reached mini_vpn on the reverse data
+  stream, and the clean attribution was
+  `tuic_stream_read_gap+relay_remote_read_gap`.
+- Rejected next moves: do not tune TUN RX drain budget, TUN queue length,
+  close/reap grace, terminal pending accounting, downlink egress pacing, stale
+  TCP pool, iperf3, sing-box availability, or connection pool from this failed
+  clean window.
+- Correct behavior: after this failure, stop before behavior edits. First add
+  behavior-neutral stream-gap instrumentation and a scoped reverse-only A/B that
+  can compare drain enabled versus disabled without later forward-window QUIC
+  congestion polluting the result.
+
 ## 2026-07-04 - Knife14az reverse_sender_backpressured needs exit-target baseline and stream-gap evidence
 
 - Log bundle:
