@@ -1372,3 +1372,17 @@
   self-tests, and sandbox-external `cargo test --lib` for this Knife14 branch.
   Do not run or apply root formatting unless repository formatting is the
   explicit task.
+
+## 2026-07-05 — SERVER_EVIDENCE_CHECK needs SSH host envs
+
+- Symptom: the Knife14bo suite was launched with `SERVER_EVIDENCE_CHECK=1`, but
+  its server-evidence artifact skipped both `.33` sing-box and `.77` iperf3
+  collection because `EXIT_SSH_HOST` and `TARGET_SSH_HOST` were unset.
+- Fix: manually collected `.33` and `.77` evidence for the probe time window
+  after the run.
+- Correct behavior: when requesting server evidence on the known VPS topology,
+  also pass `EXIT_SSH_HOST=ubuntu@43.153.32.33`,
+  `TARGET_SSH_HOST=ubuntu@43.130.32.77`, and
+  `EXIT_SSH_KEY=/home/ubuntu/.ssh/vpn` / `TARGET_SSH_KEY=/home/ubuntu/.ssh/vpn`
+  from `.27`, or teach the suite to default these values for the Knife14
+  acceptance hosts.

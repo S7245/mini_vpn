@@ -2225,3 +2225,25 @@ worth cleaning up separately.
 - Reusable rule: any future close-drain patch must preserve local-FIN read-only
   reverse data while refusing terminal no-send late payload before it enters
   app-owned pending.
+
+## 2026-07-05 — Knife14bo VPS clears terminal pending as current loss point
+
+- Stage: Knife14bo scoped VPS acceptance for `615cf47`.
+- Bundle:
+  `/tmp/mini_vpn/knife14bo_terminal_late_20260705/mvpn_knife14bo_terminal_late_615cf47_usclient_suite_20260705_184932.tar.gz`
+- Outcome: reverse-first P1 remained low at `25.3/24.0 Mbit/s`, but the targeted
+  close-drain branch stayed clean: `terminal_pending_reap=0`,
+  `terminal_late_remote_payload=0`, `pending_at_close=0`, `tun_tx_dropped_delta=0`,
+  and QUIC loss/congestion `0/0`.
+- Server-side follow-up: manual `.33` window logs showed TUIC inbound and direct
+  outbound opens with no `fail auth`; manual `.77` iperf3 journal showed the
+  target sender itself at `90.6 MBytes / 25.3 Mbit/s`, matching the tunnel
+  sender.
+- Key lesson: Knife14bo did not meet final throughput acceptance, but it proved
+  the current low-throughput run is not hiding loss in terminal pending/close
+  reap. The next branch is pre-close receive-window / ACK / tx-queue-only
+  backpressure behavior.
+- Reusable rule: when app-owned pending, terminal pending, terminal-late payload,
+  TUN drops, and QUIC loss are all zero while the target sender is low, do not
+  continue close-drain or egress-pacer patches. Instrument tx-queue-only
+  backpressure and sender stalls next.
