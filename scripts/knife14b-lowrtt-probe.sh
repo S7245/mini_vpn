@@ -812,6 +812,12 @@ summarize_metrics_window() {
       pending = 0
       close_pending_bytes_token = ""
       close_pending_class = ""
+      close_egress_bytes = 0
+      close_egress_bytes_token = ""
+      close_egress_class = ""
+      close_egress_drain_candidate = 0
+      has_close_egress_drain_candidate = 0
+      send_queue = 0
       terminal_pending = 0
       has_terminal_pending = 0
       closed_state = 0
@@ -827,6 +833,17 @@ summarize_metrics_window() {
         } else if ($i ~ /^close_pending_class=/) {
           close_pending_class = $i
           sub(/^close_pending_class=/, "", close_pending_class)
+        } else if ($i ~ /^close_egress_bytes=/) {
+          close_egress_bytes_token = numeric_token($i, "close_egress_bytes")
+        } else if ($i ~ /^close_egress_class=/) {
+          close_egress_class = $i
+          sub(/^close_egress_class=/, "", close_egress_class)
+        } else if ($i == "close_egress_drain_candidate=true") {
+          close_egress_drain_candidate = 1
+          has_close_egress_drain_candidate = 1
+        } else if ($i == "close_egress_drain_candidate=false") {
+          close_egress_drain_candidate = 0
+          has_close_egress_drain_candidate = 1
         } else if ($i ~ /^terminal_pending_reap_bytes=/) {
           terminal_pending = numeric_token($i, "terminal_pending_reap_bytes")
           has_terminal_pending = 1
@@ -856,10 +873,17 @@ summarize_metrics_window() {
           send_capacity_socket = 1
         } else if ($i == "can_send=false") {
           no_send_capacity_socket = 1
+        } else if ($i ~ /^send_queue=/) {
+          send_queue = numeric_token($i, "send_queue")
         }
       }
       if (pending == 0 && close_pending_bytes_token != "") {
         pending = close_pending_bytes_token
+      }
+      if (close_egress_bytes_token != "") {
+        close_egress_bytes = close_egress_bytes_token
+      } else {
+        close_egress_bytes = send_queue
       }
       if (close_pending_class == "") {
         if (pending == 0) {
@@ -877,6 +901,27 @@ summarize_metrics_window() {
         } else {
           close_pending_class = "unknown"
         }
+      }
+      if (close_egress_class == "") {
+        if (close_egress_bytes == 0) {
+          close_egress_class = "none"
+        } else if (closed_state && inactive_socket && no_send_capacity_socket) {
+          close_egress_class = "terminal_closed_no_send"
+        } else if (active_socket && no_send_capacity_socket) {
+          close_egress_class = "active_no_send"
+        } else if (active_socket && send_capacity_socket) {
+          close_egress_class = "active_send_capable"
+        } else if (inactive_socket && send_capacity_socket) {
+          close_egress_class = "inactive_send_capable"
+        } else if (inactive_socket && no_send_capacity_socket) {
+          close_egress_class = "inactive_no_send"
+        } else {
+          close_egress_class = "unknown"
+        }
+      }
+      if (!has_close_egress_drain_candidate &&
+          close_egress_class == "active_send_capable") {
+        close_egress_drain_candidate = 1
       }
       if (!has_terminal_pending && pending > 0 && close_pending_class == "terminal_closed_no_send") {
         terminal_pending = pending
@@ -899,6 +944,33 @@ summarize_metrics_window() {
         } else if (close_pending_class == "unknown") {
           pending_close_unknown_events++
           pending_close_unknown_bytes += pending
+        }
+      }
+      if (close_egress_bytes > 0) {
+        egress_at_close_events++
+        egress_at_close_bytes += close_egress_bytes
+        if (close_egress_bytes > max_egress_at_close_bytes) {
+          max_egress_at_close_bytes = close_egress_bytes
+        }
+        if (close_egress_class == "terminal_closed_no_send") {
+          egress_close_terminal_events++
+          egress_close_terminal_bytes += close_egress_bytes
+        } else if (close_egress_class == "active_no_send") {
+          egress_close_active_no_send_events++
+          egress_close_active_no_send_bytes += close_egress_bytes
+        } else if (close_egress_class == "active_send_capable" || close_egress_class == "inactive_send_capable") {
+          egress_close_send_capable_events++
+          egress_close_send_capable_bytes += close_egress_bytes
+        } else if (close_egress_class == "inactive_no_send") {
+          egress_close_inactive_no_send_events++
+          egress_close_inactive_no_send_bytes += close_egress_bytes
+        } else if (close_egress_class == "unknown") {
+          egress_close_unknown_events++
+          egress_close_unknown_bytes += close_egress_bytes
+        }
+        if (close_egress_drain_candidate == 1) {
+          egress_close_drain_candidate_events++
+          egress_close_drain_candidate_bytes += close_egress_bytes
         }
       }
       if (terminal_pending > 0) {
@@ -1498,6 +1570,24 @@ summarize_metrics_window() {
       if (pending_close_unknown_events > 0) {
         add_label("pending_close_unknown")
       }
+      if (egress_at_close_events > 0) {
+        add_label("egress_at_close")
+      }
+      if (egress_close_active_no_send_events > 0) {
+        add_label("egress_close_active_no_send")
+      }
+      if (egress_close_send_capable_events > 0) {
+        add_label("egress_close_send_capable")
+      }
+      if (egress_close_inactive_no_send_events > 0) {
+        add_label("egress_close_inactive_no_send")
+      }
+      if (egress_close_drain_candidate_events > 0) {
+        add_label("egress_close_drain_candidate")
+      }
+      if (egress_close_unknown_events > 0) {
+        add_label("egress_close_unknown")
+      }
       if (lifecycle_terminal_candidates > 0) {
         add_label("local_tcp_terminal_transition")
       }
@@ -1645,6 +1735,7 @@ summarize_metrics_window() {
       printf "- terminal_pending_reap: events=%d bytes=%d max_bytes=%d\n", terminal_pending_events, terminal_pending_bytes, max_terminal_pending_bytes
       printf "- terminal_late_remote_payload: events=%d bytes=%d max_bytes=%d close_max_bytes=%d close_max_events=%d\n", terminal_late_remote_payload_events, terminal_late_remote_payload_bytes, max_terminal_late_remote_payload_bytes, max_terminal_late_remote_payload_close_bytes, max_terminal_late_remote_payload_close_events
       printf "- pending_at_close: events=%d bytes=%d max_bytes=%d terminal_events=%d terminal_bytes=%d active_no_send_events=%d active_no_send_bytes=%d send_capable_events=%d send_capable_bytes=%d inactive_no_send_events=%d inactive_no_send_bytes=%d unknown_events=%d unknown_bytes=%d\n", pending_at_close_events, pending_at_close_bytes, max_pending_at_close_bytes, terminal_pending_events, terminal_pending_bytes, pending_close_active_no_send_events, pending_close_active_no_send_bytes, pending_close_send_capable_events, pending_close_send_capable_bytes, pending_close_inactive_no_send_events, pending_close_inactive_no_send_bytes, pending_close_unknown_events, pending_close_unknown_bytes
+      printf "- egress_at_close: events=%d bytes=%d max_bytes=%d terminal_events=%d terminal_bytes=%d active_no_send_events=%d active_no_send_bytes=%d send_capable_events=%d send_capable_bytes=%d inactive_no_send_events=%d inactive_no_send_bytes=%d drain_candidate_events=%d drain_candidate_bytes=%d unknown_events=%d unknown_bytes=%d\n", egress_at_close_events, egress_at_close_bytes, max_egress_at_close_bytes, egress_close_terminal_events, egress_close_terminal_bytes, egress_close_active_no_send_events, egress_close_active_no_send_bytes, egress_close_send_capable_events, egress_close_send_capable_bytes, egress_close_inactive_no_send_events, egress_close_inactive_no_send_bytes, egress_close_drain_candidate_events, egress_close_drain_candidate_bytes, egress_close_unknown_events, egress_close_unknown_bytes
       printf "- relay_late_remote: post_finish_bytes=%d post_finish_reads=%d local_finish_events=%d\n", max_late_remote_bytes, max_late_remote_reads, local_finish_count
       printf "- relay_remote_timing: first_read_max_ms=%d max_read_gap_ms=%d current_gap_max_ms=%d no_first_read_gap_max_ms=%d data_streams=%d data_first_read_max_ms=%d data_max_read_gap_ms=%d data_rx_bytes_max=%d data_rx_min_bytes=%d\n", max_relay_first_remote_read_ms, max_relay_remote_read_gap_ms, max_relay_current_remote_gap_ms, max_relay_no_first_remote_gap_ms, relay_data_streams, max_relay_data_first_remote_read_ms, max_relay_data_remote_read_gap_ms, max_relay_data_remote_bytes, data_stream_min_rx_bytes
       printf "- tuic_tcp_stream: first_rx_events=%d first_rx_max_ms=%d read_gap_events=%d read_gap_max_ms=%d close_events=%d close_first_rx_max_ms=%d close_gap_max_ms=%d rx_bytes_max=%d reads_max=%d zero_rx_closes=%d data_streams=%d data_first_rx_max_ms=%d data_read_gap_max_ms=%d data_close_gap_max_ms=%d data_rx_bytes_max=%d data_rx_min_bytes=%d\n", tuic_first_rx_events, max_tuic_first_rx_ms, tuic_read_gap_events, max_tuic_read_gap_ms, tuic_stream_close_events, max_tuic_close_first_rx_ms, max_tuic_close_gap_ms, max_tuic_close_rx_bytes, max_tuic_close_reads, tuic_zero_rx_closes, tuic_data_streams, max_tuic_data_first_rx_ms, max_tuic_data_read_gap_ms, max_tuic_data_close_gap_ms, max_tuic_data_rx_bytes, data_stream_min_rx_bytes
@@ -1706,6 +1797,7 @@ EOF_IPERF
 🔎 tcp-terminal-remote-payload handle=SocketHandle(1) bytes=128 total_bytes=128 events=1 pending=4096 tcp_state=Closed active=false can_send=false can_recv=false may_send=false may_recv=false send_capacity=1048576 send_queue=0 recv_queue=0
 🔎 tcp-handle-close handle=SocketHandle(1) direction=local reason=dead_slot_reap state=Relaying pending=4096 pending_high=2151649 remote_to_global_rx_bytes=3145728 terminal_late_remote_payload_bytes=128 terminal_late_remote_payload_events=1 flush_attempts=23 no_send_capacity=7 send_slice_calls=16 send_slice_accepted=2621440 send_slice_zero=2 send_slice_errors=0 budget_limited_calls=9 send_slice_max_accepted=262144 tun_flush_tx_calls=14 tun_flush_tx_failures=1 tun_flush_deferred=3 close_pending_class=terminal_closed_no_send close_pending_bytes=4096 terminal_pending_reap_bytes=4096 tcp_state=Closed active=false can_send=false can_recv=false
 🔎 tcp-handle-close handle=SocketHandle(2) direction=local_to_remote reason=uplink_channel_closed state=Relaying pending=8192 pending_high=589159 remote_to_global_rx_bytes=692415971 terminal_late_remote_payload_bytes=0 terminal_late_remote_payload_events=0 flush_attempts=42 no_send_capacity=11 send_slice_calls=31 send_slice_accepted=691826812 send_slice_zero=0 send_slice_errors=0 budget_limited_calls=17 send_slice_max_accepted=262144 tun_flush_tx_calls=29 tun_flush_tx_failures=0 tun_flush_deferred=0 close_pending_class=active_no_send close_pending_bytes=8192 terminal_pending_reap_bytes=0 tcp_state=Established active=true can_send=false can_recv=false
+🔎 tcp-handle-close handle=SocketHandle(4) direction=local_to_remote reason=uplink_channel_closed state=Relaying pending=0 pending_high=65536 remote_to_global_rx_bytes=57959636 terminal_late_remote_payload_bytes=0 terminal_late_remote_payload_events=0 flush_attempts=7157 no_send_capacity=0 send_slice_calls=7157 send_slice_accepted=57959636 send_slice_zero=0 send_slice_errors=0 budget_limited_calls=0 send_slice_max_accepted=65536 tun_flush_tx_calls=7094 tun_flush_tx_failures=0 tun_flush_deferred=63 close_pending_class=none close_pending_bytes=0 terminal_pending_reap_bytes=0 close_egress_class=active_send_capable close_egress_bytes=524288 close_egress_drain_candidate=true tcp_state=CloseWait active=true can_send=true can_recv=false may_send=true may_recv=false send_capacity=1048576 send_queue=524288 recv_queue=0
 📊 TUIC QUIC stats conn=3 id=99 rtt=0ms cwnd=13068 lost=303/1374 lost_bytes=439956 congestion_events=38 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=1,max_stream_data=2) udp_tx=1372/1977208B udp_rx=332/20762B dg_max=Some(1418) dg_space=1048576B
 🔁 tuic-tcp-pool-reconnect conn=1 reason=stale_tcp_pool_slot
 EOF_LOG
@@ -1742,6 +1834,7 @@ EOF_LOG
   assert_contains "$summary" "terminal_pending_reap: events=1 bytes=4096 max_bytes=4096"
   assert_contains "$summary" "terminal_late_remote_payload: events=1 bytes=128 max_bytes=128 close_max_bytes=128 close_max_events=1"
   assert_contains "$summary" "pending_at_close: events=2 bytes=12288 max_bytes=8192 terminal_events=1 terminal_bytes=4096 active_no_send_events=1 active_no_send_bytes=8192 send_capable_events=0 send_capable_bytes=0 inactive_no_send_events=0 inactive_no_send_bytes=0 unknown_events=0 unknown_bytes=0"
+  assert_contains "$summary" "egress_at_close: events=1 bytes=524288 max_bytes=524288 terminal_events=0 terminal_bytes=0 active_no_send_events=0 active_no_send_bytes=0 send_capable_events=1 send_capable_bytes=524288 inactive_no_send_events=0 inactive_no_send_bytes=0 drain_candidate_events=1 drain_candidate_bytes=524288 unknown_events=0 unknown_bytes=0"
   assert_contains "$summary" "relay_remote_timing: first_read_max_ms=0 max_read_gap_ms=0 current_gap_max_ms=0 no_first_read_gap_max_ms=0"
   assert_contains "$summary" "tuic_tcp_stream: first_rx_events=0 first_rx_max_ms=0 read_gap_events=0 read_gap_max_ms=0 close_events=0 close_first_rx_max_ms=0 close_gap_max_ms=0 rx_bytes_max=0 reads_max=0 zero_rx_closes=0"
   assert_contains "$summary" "tuic_stream_pending: events=0 max_pending_gap_ms=0 pending_polls_max=0 data_streams=0 data_pending_gap_max_ms=0 data_rx_bytes_max=0"
@@ -1751,6 +1844,7 @@ EOF_LOG
   assert_contains "$summary" "max_lost_bytes_delta=439956"
   assert_contains "$summary" "attribution: quic_loss_congestion+local_write_pressure+local_tun_egress_drop+local_downlink_backpressure+terminal_late_remote_payload+terminal_pending_reap"
   assert_contains "$summary" "pending_at_close+pending_close_active_no_send"
+  assert_contains "$summary" "egress_at_close+egress_close_send_capable+egress_close_drain_candidate"
 
   cat > "$log_sample" <<'EOF_LOG'
 🔎 tuic-open-tcp target=43.130.32.77:5201 conn=3 id=99

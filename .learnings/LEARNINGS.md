@@ -2464,3 +2464,25 @@ worth cleaning up separately.
   removed the prior TUN drop signal without improving throughput, so the next
   code slice must target close/receive-window/egress-drain accounting for a
   send-capable `CloseWait` socket with queued downlink bytes.
+
+## 2026-07-06 - Knife14bv makes close-time egress pressure visible
+
+- Stage: Knife14bv-a behavior-neutral observability after Knife14bu showed
+  `pending=0` but `send_queue=524288` at `CloseWait` close.
+- Outcome: close logs now keep app-owned pending accounting and add separate
+  `close_egress_class`, `close_egress_bytes`, and
+  `close_egress_drain_candidate` fields. Downlink backpressure transition logs
+  now include raw pressure and effective held pressure fields so a pressure
+  hold can be distinguished from real smoltcp queue state.
+- Parser update: low-RTT summaries now include `egress_at_close` and label
+  `egress_close_drain_candidate` when a send-capable close still has queued
+  egress bytes. This is acceptance visibility, not a script-side product fix.
+- Cleanup: the unused `observe_pressure` wrapper is now test-only, so release
+  builds are warning-clean again.
+- Verification passed: focused close-egress and raw/effective pressure tests,
+  downlink backpressure tests, TUN egress feedback tests, low-RTT probe
+  self-test, US-client suite self-test, full `cargo test --lib`, release build,
+  shell syntax checks, and `git diff --check`.
+- Reusable rule: when close logs say `pending=0`, still classify smoltcp
+  egress queue separately before claiming close/reap is clean. App pending and
+  already-accepted-but-not-egressed bytes are different loss surfaces.

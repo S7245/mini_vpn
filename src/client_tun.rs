@@ -383,6 +383,36 @@ struct ClosePendingAccounting {
     terminal_pending_reap_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseEgressClass {
+    NoQueuedEgress,
+    TerminalClosedNoSend,
+    ActiveNoSend,
+    ActiveSendCapable,
+    InactiveSendCapable,
+    InactiveNoSend,
+}
+
+impl CloseEgressClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoQueuedEgress => "none",
+            Self::TerminalClosedNoSend => "terminal_closed_no_send",
+            Self::ActiveNoSend => "active_no_send",
+            Self::ActiveSendCapable => "active_send_capable",
+            Self::InactiveSendCapable => "inactive_send_capable",
+            Self::InactiveNoSend => "inactive_no_send",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CloseEgressAccounting {
+    class: CloseEgressClass,
+    bytes: usize,
+    drain_candidate: bool,
+}
+
 fn classify_close_pending(pending: usize, snapshot: SocketCloseSnapshot) -> ClosePendingClass {
     if pending == 0 {
         return ClosePendingClass::NoPending;
@@ -402,6 +432,25 @@ fn classify_close_pending(pending: usize, snapshot: SocketCloseSnapshot) -> Clos
     ClosePendingClass::InactiveNoSend
 }
 
+fn classify_close_egress(snapshot: SocketCloseSnapshot) -> CloseEgressClass {
+    if snapshot.send_queue == 0 {
+        return CloseEgressClass::NoQueuedEgress;
+    }
+    if snapshot.tcp_state == TcpState::Closed && !snapshot.active && !snapshot.can_send {
+        return CloseEgressClass::TerminalClosedNoSend;
+    }
+    if snapshot.active && !snapshot.can_send {
+        return CloseEgressClass::ActiveNoSend;
+    }
+    if snapshot.active && snapshot.can_send {
+        return CloseEgressClass::ActiveSendCapable;
+    }
+    if snapshot.can_send {
+        return CloseEgressClass::InactiveSendCapable;
+    }
+    CloseEgressClass::InactiveNoSend
+}
+
 fn close_pending_accounting(
     ctx: &SocketCtx,
     snapshot: SocketCloseSnapshot,
@@ -417,6 +466,15 @@ fn close_pending_accounting(
         class,
         pending_bytes,
         terminal_pending_reap_bytes,
+    }
+}
+
+fn close_egress_accounting(snapshot: SocketCloseSnapshot) -> CloseEgressAccounting {
+    let class = classify_close_egress(snapshot);
+    CloseEgressAccounting {
+        class,
+        bytes: snapshot.send_queue,
+        drain_candidate: class == CloseEgressClass::ActiveSendCapable,
     }
 }
 
@@ -1656,6 +1714,7 @@ impl TunEgressFeedbackState {
         self.paused
     }
 
+    #[cfg(test)]
     fn observe_pressure(&mut self, stats: DownlinkPressureStats, cfg: DownlinkBackpressureConfig) {
         self.observe_pressure_at(stats, cfg, std::time::Instant::now());
     }
@@ -1972,6 +2031,39 @@ fn next_downlink_backpressure(
     } else {
         stats.max_pressure() >= cfg.high_bytes
     }
+}
+
+fn format_tcp_downlink_backpressure_diag(
+    paused: bool,
+    raw: DownlinkPressureStats,
+    effective: DownlinkPressureStats,
+    cfg: DownlinkBackpressureConfig,
+) -> String {
+    format!(
+        "🔎 tcp-downlink-backpressure paused={} max_pending={} total_pending={} max_tx_queue={} total_tx_queue={} max_pressure={} total_pressure={} high={} low={} raw_max_pending={} raw_total_pending={} raw_max_tx_queue={} raw_total_tx_queue={} raw_max_pressure={} raw_total_pressure={} effective_max_pending={} effective_total_pending={} effective_max_tx_queue={} effective_total_tx_queue={} effective_max_pressure={} effective_total_pressure={} held_pressure={}",
+        paused,
+        effective.max_pending,
+        effective.total_pending,
+        effective.max_tx_queue,
+        effective.total_tx_queue,
+        effective.max_pressure(),
+        effective.total_pressure(),
+        cfg.high_bytes,
+        cfg.low_bytes,
+        raw.max_pending,
+        raw.total_pending,
+        raw.max_tx_queue,
+        raw.total_tx_queue,
+        raw.max_pressure(),
+        raw.total_pressure(),
+        effective.max_pending,
+        effective.total_pending,
+        effective.max_tx_queue,
+        effective.total_tx_queue,
+        effective.max_pressure(),
+        effective.total_pressure(),
+        raw != effective
+    )
 }
 
 fn parse_backpressure_bytes(s: Option<&str>, default: usize) -> usize {
@@ -2533,16 +2625,13 @@ pub async fn run_event_loop<D, U, M>(
         if next_downlink_rx_paused != downlink_rx_paused {
             downlink_rx_paused = next_downlink_rx_paused;
             tcp_diag_log!(
-                "🔎 tcp-downlink-backpressure paused={} max_pending={} total_pending={} max_tx_queue={} total_tx_queue={} max_pressure={} total_pressure={} high={} low={}",
-                downlink_rx_paused,
-                downlink_stats.max_pending,
-                downlink_stats.total_pending,
-                downlink_stats.max_tx_queue,
-                downlink_stats.total_tx_queue,
-                downlink_stats.max_pressure(),
-                downlink_stats.total_pressure(),
-                downlink_backpressure.high_bytes,
-                downlink_backpressure.low_bytes
+                "{}",
+                format_tcp_downlink_backpressure_diag(
+                    downlink_rx_paused,
+                    downlink_stats_raw,
+                    downlink_stats,
+                    downlink_backpressure,
+                )
             );
         }
         let global_rx_paused = downlink_rx_paused || tun_egress_feedback.is_paused();
@@ -3495,8 +3584,9 @@ fn rearm_socket_with_reason_and_snapshot(
     if let Some(snapshot) = close_snapshot {
         log_tcp_lifecycle_observation(handle, ctx, snapshot, now_secs, close_reason);
         let close_pending = close_pending_accounting(ctx, snapshot);
+        let close_egress = close_egress_accounting(snapshot);
         tcp_diag_log!(
-            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes={} tcp_state={:?} active={} can_send={} can_recv={} may_send={} may_recv={} send_capacity={} send_queue={} recv_queue={}",
+            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes={} close_egress_class={} close_egress_bytes={} close_egress_drain_candidate={} tcp_state={:?} active={} can_send={} can_recv={} may_send={} may_recv={} send_capacity={} send_queue={} recv_queue={}",
             handle,
             close_direction,
             close_reason,
@@ -3529,6 +3619,9 @@ fn rearm_socket_with_reason_and_snapshot(
             close_pending.class.as_str(),
             close_pending.pending_bytes,
             close_pending.terminal_pending_reap_bytes,
+            close_egress.class.as_str(),
+            close_egress.bytes,
+            close_egress.drain_candidate,
             snapshot.tcp_state,
             snapshot.active,
             snapshot.can_send,
@@ -3550,7 +3643,7 @@ fn rearm_socket_with_reason_and_snapshot(
         ClosePendingClass::Unknown
     };
     tcp_diag_log!(
-        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes=0",
+        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes=0 close_egress_class=unknown close_egress_bytes=0 close_egress_drain_candidate=false",
         handle,
         close_direction,
         close_reason,
@@ -5635,6 +5728,27 @@ mod tests {
     }
 
     #[test]
+    fn close_egress_accounting_reports_send_queue_without_app_pending() {
+        let knife14bu_close = SocketCloseSnapshot {
+            tcp_state: TcpState::CloseWait,
+            active: true,
+            can_send: true,
+            can_recv: false,
+            may_send: true,
+            may_recv: false,
+            send_capacity: 1_048_576,
+            send_queue: 524_288,
+            recv_queue: 0,
+        };
+
+        let accounting = close_egress_accounting(knife14bu_close);
+
+        assert_eq!(accounting.class, CloseEgressClass::ActiveSendCapable);
+        assert_eq!(accounting.bytes, 524_288);
+        assert!(accounting.drain_candidate);
+    }
+
+    #[test]
     fn tcp_lifecycle_transition_diag_reports_previous_state_and_context() {
         let mut sockets = SocketSet::new(vec![]);
         let handle = sockets.add(build_listener_socket(&ListenerSpec { local_port: 443 }));
@@ -6704,6 +6818,25 @@ mod tests {
             !next_downlink_backpressure(true, expired, cfg),
             "after the bounded hold expires, ordinary low watermark resume applies"
         );
+    }
+
+    #[test]
+    fn downlink_backpressure_diag_reports_raw_and_effective_pressure() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let raw = DownlinkPressureStats::default();
+        let effective = DownlinkPressureStats::new(0, 0, 100, 100);
+
+        let line = format_tcp_downlink_backpressure_diag(true, raw, effective, cfg);
+
+        assert!(line.contains("tcp-downlink-backpressure"), "{line}");
+        assert!(line.contains("paused=true"), "{line}");
+        assert!(line.contains("max_tx_queue=100"), "{line}");
+        assert!(line.contains("raw_max_tx_queue=0"), "{line}");
+        assert!(line.contains("effective_max_tx_queue=100"), "{line}");
+        assert!(line.contains("held_pressure=true"), "{line}");
     }
 
     #[test]
