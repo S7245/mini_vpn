@@ -80,6 +80,9 @@ const MAX_TUN_RX_DRAIN_BUDGET: usize = 64;
 /// Knife14ci: keep default TUN RX drain off, but allow a small MTU-derived ACK
 /// drain budget when downlink egress reaches the existing credit edge.
 const TUN_RX_PRESSURE_DRAIN_MAX_PACKETS: usize = 32;
+const TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_PRE: &str = "remote_payload_pre";
+const TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD: &str = "remote_payload";
+const TUN_RX_DRAIN_SOURCE_TIMER_PRESSURE: &str = "timer_pressure";
 
 /// 刀13 ①：解析 `MINI_VPN_TRACE`（`1`/`true`，去空白、不区分大小写 → 开；其它/缺省 → 关）。
 /// 对齐 [`parse_profile_loop`] 惯用法；抽纯函数便于单测（`trace_enabled` 只是它 + `OnceLock` 包壳）。
@@ -2653,6 +2656,10 @@ enum TunRxPacketKind {
 #[derive(Debug, Default, Clone)]
 struct TunRxDrainDiag {
     attempts: u64,
+    pre_payload_attempts: u64,
+    remote_payload_attempts: u64,
+    maintenance_attempts: u64,
+    other_attempts: u64,
     packets: u64,
     tcp_packets: u64,
     dns_packets: u64,
@@ -2663,8 +2670,22 @@ struct TunRxDrainDiag {
 }
 
 impl TunRxDrainDiag {
-    fn note_attempt(&mut self) {
+    fn note_attempt(&mut self, source: &str) {
         self.attempts = self.attempts.saturating_add(1);
+        match source {
+            TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_PRE => {
+                self.pre_payload_attempts = self.pre_payload_attempts.saturating_add(1);
+            }
+            TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD => {
+                self.remote_payload_attempts = self.remote_payload_attempts.saturating_add(1);
+            }
+            TUN_RX_DRAIN_SOURCE_TIMER_PRESSURE => {
+                self.maintenance_attempts = self.maintenance_attempts.saturating_add(1);
+            }
+            _ => {
+                self.other_attempts = self.other_attempts.saturating_add(1);
+            }
+        }
     }
 
     fn note_packet(&mut self, kind: TunRxPacketKind) {
@@ -2697,8 +2718,12 @@ impl TunRxDrainDiag {
 
 fn format_tun_rx_drain_diag(diag: &TunRxDrainDiag) -> String {
     format!(
-        "🔎 tcp-tun-rx-drain attempts={} packets={} tcp={} dns={} udp={} budget_exhausted={} would_block={} errors={}",
+        "🔎 tcp-tun-rx-drain attempts={} pre_payload_attempts={} remote_payload_attempts={} maintenance_attempts={} other_attempts={} packets={} tcp={} dns={} udp={} budget_exhausted={} would_block={} errors={}",
         diag.attempts,
+        diag.pre_payload_attempts,
+        diag.remote_payload_attempts,
+        diag.maintenance_attempts,
+        diag.other_attempts,
         diag.packets,
         diag.tcp_packets,
         diag.dns_packets,
@@ -2740,6 +2765,51 @@ fn tun_rx_drain_budget_after_remote_payload(
         pressure_tun_rx_drain_budget(cfg, tun_mtu)
     } else {
         0
+    }
+}
+
+fn tun_rx_drain_budget_before_remote_payload(
+    ctx: Option<&SocketCtx>,
+    snapshot: SocketCloseSnapshot,
+    epoch: u64,
+    payload_len: usize,
+    configured_budget: usize,
+    cfg: DownlinkBackpressureConfig,
+    tun_mtu: usize,
+) -> usize {
+    let Some(ctx) = ctx else {
+        return 0;
+    };
+    if payload_len == 0 || ctx.conn_epoch != epoch {
+        return 0;
+    }
+    if remote_payload_disposition(ctx, snapshot) != RemotePayloadDisposition::Accept {
+        return 0;
+    }
+
+    tun_rx_drain_budget_after_remote_payload(
+        true,
+        snapshot.send_queue,
+        configured_budget,
+        cfg,
+        tun_mtu,
+    )
+}
+
+fn tun_rx_drain_budget_for_dirty_pressure(
+    has_dirty_downlink: bool,
+    stats: DownlinkPressureStats,
+    configured_budget: usize,
+    cfg: DownlinkBackpressureConfig,
+    tun_mtu: usize,
+) -> usize {
+    if !has_dirty_downlink || !reaches_downlink_credit_debt_pressure_threshold(stats, cfg) {
+        return 0;
+    }
+    if configured_budget > 0 {
+        configured_budget
+    } else {
+        pressure_tun_rx_drain_budget(cfg, tun_mtu)
     }
 }
 
@@ -3536,6 +3606,52 @@ pub async fn run_event_loop<D, U, M>(
                 match event {
                     RelayEvent::Data { epoch, bytes: payload } => {
                         trace_log!("📬 从大邮筒收到 {} 字节数据，准备送往房间 {:?}", payload.len(), handle);
+                        let pre_payload_tun_rx_budget = if payload.is_empty() {
+                            0
+                        } else if let Some(ctx) = socket_ctxs.get(&handle) {
+                            let snapshot = {
+                                let socket = sockets.get::<TcpSocket>(handle);
+                                SocketCloseSnapshot::from_socket(socket)
+                            };
+                            tun_rx_drain_budget_before_remote_payload(
+                                Some(ctx),
+                                snapshot,
+                                epoch,
+                                payload.len(),
+                                tun_rx_drain_budget,
+                                downlink_backpressure,
+                                runtime_config.tun_mtu,
+                            )
+                        } else {
+                            0
+                        };
+                        if pre_payload_tun_rx_budget > 0 {
+                            drain_ready_tun_rx(
+                                &mut device,
+                                &mut assoc_table,
+                                &mut fake_pool,
+                                &upstream,
+                                udp_clock.elapsed().as_secs(),
+                                &metrics_handle,
+                                &mut registry,
+                                &mut sockets,
+                                &mut socket_ctxs,
+                                &mut iface,
+                                &mut dirty,
+                                &handshake_done_tx,
+                                &global_tx,
+                                &mut metrics,
+                                downlink_flush_max_bytes,
+                                downlink_backpressure,
+                                &mut downlink_egress_drop_debt,
+                                &mut tcp_loop_flush_tx_calls,
+                                &mut tcp_loop_flush_tx_failures,
+                                &mut tun_rx_drain_diag,
+                                pre_payload_tun_rx_budget,
+                                TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_PRE,
+                            )
+                            .await;
+                        }
                         let accepted_bytes = match handle_remote_payload(
                             handle,
                             epoch,
@@ -3607,7 +3723,7 @@ pub async fn run_event_loop<D, U, M>(
                                 &mut tcp_loop_flush_tx_failures,
                                 &mut tun_rx_drain_diag,
                                 tun_rx_budget,
-                                "remote_payload",
+                                TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD,
                             )
                             .await;
                         }
@@ -3816,6 +3932,41 @@ pub async fn run_event_loop<D, U, M>(
                 }
                 metrics.leave_poll();
 
+                let maintenance_tun_rx_budget = tun_rx_drain_budget_for_dirty_pressure(
+                    !dirty.is_empty(),
+                    downlink_pressure_stats(&dirty, &socket_ctxs, &sockets),
+                    tun_rx_drain_budget,
+                    downlink_backpressure,
+                    runtime_config.tun_mtu,
+                );
+                if maintenance_tun_rx_budget > 0 {
+                    drain_ready_tun_rx(
+                        &mut device,
+                        &mut assoc_table,
+                        &mut fake_pool,
+                        &upstream,
+                        udp_clock.elapsed().as_secs(),
+                        &metrics_handle,
+                        &mut registry,
+                        &mut sockets,
+                        &mut socket_ctxs,
+                        &mut iface,
+                        &mut dirty,
+                        &handshake_done_tx,
+                        &global_tx,
+                        &mut metrics,
+                        downlink_flush_max_bytes,
+                        downlink_backpressure,
+                        &mut downlink_egress_drop_debt,
+                        &mut tcp_loop_flush_tx_calls,
+                        &mut tcp_loop_flush_tx_failures,
+                        &mut tun_rx_drain_diag,
+                        maintenance_tun_rx_budget,
+                        TUN_RX_DRAIN_SOURCE_TIMER_PRESSURE,
+                    )
+                    .await;
+                }
+
                 // #1：timer tick 无新 inbound 包，只续推进脏集合（主要是下行 pending flush +
                 // smoltcp 超时重传释放 tx buffer 后继续写）。不再全量 sweep。
                 process_dirty_relay(
@@ -3985,7 +4136,7 @@ where
         return 0;
     }
 
-    diag.note_attempt();
+    diag.note_attempt(source);
     let mut drained = 0usize;
     while drained < budget {
         match device.try_recv_rx() {
@@ -8770,7 +8921,10 @@ mod tests {
     fn tun_rx_drain_diag_tracks_budget_and_packet_kinds() {
         let mut diag = TunRxDrainDiag::default();
 
-        diag.note_attempt();
+        diag.note_attempt(TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_PRE);
+        diag.note_attempt(TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD);
+        diag.note_attempt(TUN_RX_DRAIN_SOURCE_TIMER_PRESSURE);
+        diag.note_attempt("other");
         diag.note_packet(TunRxPacketKind::Tcp);
         diag.note_packet(TunRxPacketKind::Dns);
         diag.note_packet(TunRxPacketKind::Udp);
@@ -8780,7 +8934,11 @@ mod tests {
 
         let line = format_tun_rx_drain_diag(&diag);
         assert!(line.contains("tcp-tun-rx-drain"));
-        assert!(line.contains("attempts=1"), "{line}");
+        assert!(line.contains("attempts=4"), "{line}");
+        assert!(line.contains("pre_payload_attempts=1"), "{line}");
+        assert!(line.contains("remote_payload_attempts=1"), "{line}");
+        assert!(line.contains("maintenance_attempts=1"), "{line}");
+        assert!(line.contains("other_attempts=1"), "{line}");
         assert!(line.contains("packets=3"), "{line}");
         assert!(line.contains("tcp=1"), "{line}");
         assert!(line.contains("dns=1"), "{line}");
@@ -8876,6 +9034,166 @@ mod tests {
             ),
             1,
             "small guards should still get one pressure ACK drain packet"
+        );
+    }
+
+    #[test]
+    fn pre_payload_tun_rx_drain_budget_requires_current_accepting_payload() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let (tx, _rx) = mpsc::channel(1);
+        let mut ctx = SocketCtx::new(443);
+        ctx.state = SocketState::Relaying;
+        ctx.uplink_tx = Some(tx);
+        ctx.conn_epoch = 7;
+        let active_pressure = SocketCloseSnapshot {
+            tcp_state: TcpState::Established,
+            active: true,
+            can_send: true,
+            can_recv: true,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 1_048_576,
+            send_queue: tx_queue_credit_spend_threshold(cfg),
+            recv_queue: 0,
+        };
+
+        assert_eq!(
+            tun_rx_drain_budget_before_remote_payload(
+                Some(&ctx),
+                active_pressure,
+                7,
+                1_200,
+                0,
+                cfg,
+                1_200,
+            ),
+            1,
+            "current accepting payload at credit edge should pre-drain ACKs"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_before_remote_payload(
+                Some(&ctx),
+                active_pressure,
+                7,
+                0,
+                0,
+                cfg,
+                1_200,
+            ),
+            0,
+            "empty payload should not scan TUN RX"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_before_remote_payload(
+                Some(&ctx),
+                active_pressure,
+                6,
+                1_200,
+                0,
+                cfg,
+                1_200,
+            ),
+            0,
+            "stale epoch must not pre-drain for a rearmed socket"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_before_remote_payload(
+                None,
+                active_pressure,
+                7,
+                1_200,
+                0,
+                cfg,
+                1_200,
+            ),
+            0,
+            "missing context cannot prove lifecycle eligibility"
+        );
+
+        let terminal = SocketCloseSnapshot {
+            tcp_state: TcpState::Closed,
+            active: false,
+            can_send: false,
+            can_recv: false,
+            may_send: false,
+            may_recv: false,
+            send_capacity: 1_048_576,
+            send_queue: tx_queue_credit_spend_threshold(cfg),
+            recv_queue: 0,
+        };
+        assert_eq!(
+            tun_rx_drain_budget_before_remote_payload(
+                Some(&ctx),
+                terminal,
+                7,
+                1_200,
+                0,
+                cfg,
+                1_200,
+            ),
+            0,
+            "terminal no-send socket must not pre-drain before rejecting late payload"
+        );
+    }
+
+    #[test]
+    fn maintenance_tun_rx_drain_budget_requires_dirty_pressure() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let below_credit = DownlinkPressureStats::new(
+            0,
+            0,
+            tx_queue_credit_spend_threshold(cfg).saturating_sub(1),
+            tx_queue_credit_spend_threshold(cfg).saturating_sub(1),
+        );
+        let credit_edge = DownlinkPressureStats::new(
+            0,
+            0,
+            tx_queue_credit_spend_threshold(cfg),
+            tx_queue_credit_spend_threshold(cfg),
+        );
+        let pending_with_low_tx = DownlinkPressureStats::new(cfg.high_bytes, cfg.high_bytes, 1, 1);
+        let pending_with_flush_edge = DownlinkPressureStats::new(
+            cfg.high_bytes,
+            cfg.high_bytes,
+            tx_queue_flush_threshold(cfg),
+            tx_queue_flush_threshold(cfg),
+        );
+
+        assert_eq!(
+            tun_rx_drain_budget_for_dirty_pressure(false, credit_edge, 0, cfg, 1_200),
+            0,
+            "pressure without dirty downlink work should not scan TUN RX"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_dirty_pressure(true, below_credit, 0, cfg, 1_200),
+            0,
+            "maintenance drain should stay off below the credit edge"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_dirty_pressure(true, credit_edge, 0, cfg, 1_200),
+            1,
+            "maintenance drain should enable bounded adaptive ACK drain at the credit edge"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_dirty_pressure(true, credit_edge, 9, cfg, 1_200),
+            9,
+            "explicit drain budget remains an operator override once pressure is eligible"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_dirty_pressure(true, pending_with_low_tx, 0, cfg, 1_200),
+            0,
+            "pending-only pressure should not drain ACKs without egress queue pressure"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_dirty_pressure(true, pending_with_flush_edge, 0, cfg, 1_200),
+            1,
+            "pending pressure plus flush-edge tx queue should maintain ACK drain"
         );
     }
 
