@@ -1229,6 +1229,10 @@ struct DownlinkEgressCreditDebt {
 type DownlinkEgressDropDebt = DownlinkEgressCreditDebt;
 
 impl DownlinkEgressCreditDebt {
+    fn has_active_debt(&self) -> bool {
+        self.debt_bytes > 0
+    }
+
     fn note_tun_drop(&mut self, cfg: DownlinkBackpressureConfig) -> usize {
         let added = self.install(
             EgressCreditDebtSource::Drop,
@@ -2893,6 +2897,19 @@ fn next_downlink_backpressure(
     stats: DownlinkPressureStats,
     cfg: DownlinkBackpressureConfig,
 ) -> bool {
+    next_downlink_backpressure_with_credit_debt(was_paused, stats, cfg, false)
+}
+
+fn next_downlink_backpressure_with_credit_debt(
+    was_paused: bool,
+    stats: DownlinkPressureStats,
+    cfg: DownlinkBackpressureConfig,
+    has_active_credit_debt: bool,
+) -> bool {
+    if has_active_credit_debt && reaches_downlink_credit_debt_pressure_threshold(stats, cfg) {
+        return true;
+    }
+
     if was_paused && stats.max_pending > cfg.low_bytes {
         return true;
     }
@@ -3548,12 +3565,12 @@ pub async fn run_event_loop<D, U, M>(
             downlink_backpressure,
             pressure_now,
         );
-        let next_downlink_rx_paused =
+        let next_downlink_rx_paused_without_debt =
             next_downlink_backpressure(downlink_rx_paused, downlink_stats, downlink_backpressure);
         let previous_downlink_rx_paused = downlink_rx_paused;
         if should_install_downlink_pressure_credit_debt(
             previous_downlink_rx_paused,
-            next_downlink_rx_paused,
+            next_downlink_rx_paused_without_debt,
             downlink_stats_raw,
             downlink_backpressure,
         ) {
@@ -3563,7 +3580,7 @@ pub async fn run_event_loop<D, U, M>(
                 tcp_diag_log!(
                     "{}",
                     format_downlink_egress_credit_debt_diag(
-                        if next_downlink_rx_paused {
+                        if next_downlink_rx_paused_without_debt {
                             "pressure_pause_edge"
                         } else {
                             "pressure_credit_edge"
@@ -3576,6 +3593,12 @@ pub async fn run_event_loop<D, U, M>(
                 );
             }
         }
+        let next_downlink_rx_paused = next_downlink_backpressure_with_credit_debt(
+            downlink_rx_paused,
+            downlink_stats,
+            downlink_backpressure,
+            downlink_egress_drop_debt.has_active_debt(),
+        );
         if next_downlink_rx_paused != previous_downlink_rx_paused {
             downlink_rx_paused = next_downlink_rx_paused;
             tcp_diag_log!(
@@ -8558,6 +8581,29 @@ mod tests {
         assert!(
             !next_downlink_backpressure(true, DownlinkPressureStats::new(0, 0, 100, 100), cfg),
             "tx-queue-only pressure resumes once it drains to the soft high watermark"
+        );
+    }
+
+    #[test]
+    fn downlink_backpressure_active_credit_debt_pauses_at_credit_edge() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let credit_edge = DownlinkPressureStats::new(0, 0, 157, 157);
+        let recovered = DownlinkPressureStats::new(0, 0, 100, 100);
+
+        assert!(
+            !next_downlink_backpressure(false, credit_edge, cfg),
+            "without active credit debt, the tx-queue credit edge remains below the hard pause edge"
+        );
+        assert!(
+            next_downlink_backpressure_with_credit_debt(false, credit_edge, cfg, true),
+            "active credit debt should pause remote receive at the credit edge before more pending accumulates"
+        );
+        assert!(
+            !next_downlink_backpressure_with_credit_debt(true, recovered, cfg, true),
+            "once pressure reaches the ordinary resume threshold, active debt should not deadlock receive"
         );
     }
 
