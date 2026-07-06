@@ -1981,3 +1981,45 @@
 - Correct behavior: on `.27`, use POSIX tools such as `grep`, `find`, and
   `sed` for remote smoke/preflight checks unless `rg` is deliberately
   installed. Keep using local `rg` on the Mac workspace.
+
+## 2026-07-06 - Exit-to-target preflight needs explicit SSH env when server evidence is off
+
+- Stage: Knife14cj first VPS run.
+- Failed bundle:
+  `/tmp/mini_vpn/knife14cj_pre_payload_ack_drain_20260707_0229/mvpn_knife14cj_pre_payload_ack_drain_usclient_suite_20260707_022926.tar.gz`
+- Symptom: the suite failed before tunnel P1 with
+  `EXIT_TO_TARGET_IPERF_CHECK=1 需要设置 EXIT_SSH_HOST`.
+- Cause: `EXIT_TO_TARGET_IPERF_CHECK=1` was enabled while `EXIT_SSH_HOST` and
+  `TARGET_SSH_HOST` were not passed explicitly; the script did not infer them
+  in that configuration.
+- Correct behavior: when running `.27` suites with Exit↔Target preflight,
+  always pass `EXIT_SSH_HOST=ubuntu@43.153.32.33`,
+  `EXIT_SSH_KEY=/home/ubuntu/.ssh/vpn`,
+  `TARGET_SSH_HOST=ubuntu@43.130.32.77`, and
+  `TARGET_SSH_KEY=/home/ubuntu/.ssh/vpn`.
+
+## 2026-07-06 - Do not use repo-wide cargo fmt as a Knife14 gate
+
+- Stage: Knife14cj local review.
+- Symptom: `cargo fmt --check` reported broad rustfmt changes across
+  unrelated files, including files not touched by the stage.
+- Cause: the current repository is not rustfmt-clean as a whole.
+- Correct behavior: avoid running `cargo fmt` for Knife14 hot-path patches
+  because it creates unrelated churn. Use `git diff --check`, clippy, focused
+  tests, and small manual formatting for touched hunks unless a dedicated
+  formatting-only stage is opened.
+
+## 2026-07-06 - MTU-derived pressure ACK drain budget can be too small
+
+- Stage: Knife14cj VPS retry.
+- Bundle:
+  `/tmp/mini_vpn/knife14cj_pre_payload_ack_drain_retry_20260707_0231/mvpn_knife14cj_pre_payload_ack_drain_retry_usclient_suite_20260707_023111.tar.gz`
+- Symptom: pre-payload and maintenance TUN RX drains engaged, but every drain
+  exhausted its budget (`attempts=252`, `packets=5292`,
+  `budget_exhausted=252`, `would_block=0`) while local TUN egress drops still
+  reached `7794`.
+- Cause: `guard_bytes / tun_mtu` estimates data-sized packets, but pressure
+  TUN RX work is mostly small TCP ACK/window packets.
+- Correct behavior: derive pressure-drain packet budget from ACK-sized packets
+  with a hard cap, and prove it can reach `would_block` under pressure without
+  becoming unconditional TUN RX polling.

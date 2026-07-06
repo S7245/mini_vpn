@@ -3062,3 +3062,27 @@ worth cleaning up separately.
   TUN drop and egress-at-close signals remain. After pool=2 default, the next
   patch should make egress drain credit drop-aware instead of changing pool
   size or static thresholds.
+
+## 2026-07-06 - Knife14cj proves ACK drain timing but exposes undersized packet budget
+
+- Code commit: `567d25b`.
+- Result doc:
+  `docs/tech/2026-07-06-knife14cj-pre-payload-pressure-ack-drain-results.md`
+- VPS retry bundle:
+  `/tmp/mini_vpn/knife14cj_pre_payload_ack_drain_retry_20260707_0231/mvpn_knife14cj_pre_payload_ack_drain_retry_usclient_suite_20260707_023111.tar.gz`
+- Outcome: reverse-first P1 stayed low at `15.5/14.5 Mbit/s` even though
+  `.27/.33 -> .77` baselines were healthy and QUIC loss/congestion/blocking
+  deltas stayed zero.
+- Clean lifecycle surfaces: `terminal_pending_reap=0`, `pending_at_close=0`,
+  `egress_at_close=0`, `terminal_late_remote_payload=0`, send-slice errors
+  were zero, and TUN flush failures were zero.
+- Failure surface: local TUN egress remained the blocker with
+  `tun_tx_dropped_delta=7794`, runtime drop events `5`, feedback pause/resume
+  `5/4`, and `send_queue_max=892928`.
+- Knife14cj-specific signal: pre-payload and timer-maintenance drain engaged
+  (`pre_payload_attempts=41`, `maintenance_attempts=11`), but aggregate drain
+  was always exhausted (`attempts=252`, `packets=5292`,
+  `budget_exhausted=252`, `would_block=0`).
+- Reusable rule: pressure-gated TUN RX drain is the right timing, but deriving
+  packet budget from `guard_bytes / MTU` underestimates ACK/window traffic. The
+  next budget should be ACK-sized and bounded, not a static env override.
