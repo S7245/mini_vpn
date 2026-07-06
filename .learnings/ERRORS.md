@@ -1,5 +1,29 @@
 # Errors
 
+## 2026-07-06 - Knife14bw clippy caught wide diagnostic formatter arguments
+
+- Stage: Knife14bw reverse-window diagnostic local gate.
+- Symptom: `cargo clippy --all-targets --features harness -- -D warnings`
+  failed on `format_tcp_reverse_window_diag` with
+  `clippy::too_many_arguments` after the first implementation used eight
+  parameters.
+- Root cause: diagnostic-only helper functions can still trip repo quality
+  gates when they mirror log fields directly as positional parameters.
+- Correct behavior: collect diagnostic log fields into a small purpose-specific
+  struct and keep the formatter interface narrow. This preserves log output,
+  makes call sites clearer, and avoids adding local `allow` attributes for a
+  simple design issue.
+
+## 2026-07-06 - Cargo test accepts one test filter before harness args
+
+- Stage: Knife14bw focused local test rerun.
+- Symptom: `cargo test --lib test_a test_b test_c` failed with
+  `unexpected argument` because Cargo accepts only one test name/filter before
+  `--`.
+- Correct behavior: use one broad filter such as
+  `cargo test --lib client_tun::tests::reverse_window_diag`, or run separate
+  filtered commands when exact test names are needed.
+
 ## 2026-07-05 - Knife14bg VPS acceptance failed after TUN RX drain patch
 
 - Stage: Knife14bg bounded TUN RX drain cadence acceptance for commit

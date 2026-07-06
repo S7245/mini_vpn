@@ -322,6 +322,7 @@ summarize_metrics_window() {
     -v inherited_lost_bytes_floor=1048576 \
     -v inherited_cong_floor=100 \
     -v slow_rx_floor_ms=5000 \
+    -v tuic_stream_starved_rx_ceiling=5242880 \
     -v data_stream_min_rx_bytes=65536 '
     function numeric_token(token, key, value) {
       value = token
@@ -759,6 +760,48 @@ summarize_metrics_window() {
       }
       if (line_events > max_terminal_late_remote_payload_events) {
         max_terminal_late_remote_payload_events = line_events
+      }
+    }
+
+    /tcp-reverse-window/ {
+      reverse_window_events++
+      line_send_capacity = ""
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^payload_bytes=/) {
+          reverse_window_payload_bytes += numeric_token($i, "payload_bytes")
+        } else if ($i ~ /^accepted_bytes=/) {
+          reverse_window_accepted_bytes += numeric_token($i, "accepted_bytes")
+        } else if ($i ~ /^pending=/) {
+          value = numeric_token($i, "pending")
+          if (value > max_reverse_window_pending) {
+            max_reverse_window_pending = value
+          }
+        } else if ($i ~ /^send_capacity=/) {
+          line_send_capacity = numeric_token($i, "send_capacity")
+          if (line_send_capacity > max_reverse_send_capacity) {
+            max_reverse_send_capacity = line_send_capacity
+          }
+        } else if ($i ~ /^send_queue=/) {
+          value = numeric_token($i, "send_queue")
+          if (value > max_reverse_send_queue) {
+            max_reverse_send_queue = value
+          }
+        } else if ($i ~ /^recv_queue=/) {
+          value = numeric_token($i, "recv_queue")
+          if (value > max_reverse_recv_queue) {
+            max_reverse_recv_queue = value
+          }
+        } else if ($i == "may_recv=false") {
+          reverse_window_may_recv_false++
+        } else if ($i == "active=false") {
+          reverse_window_active_false++
+        } else if ($i == "can_send=false") {
+          reverse_window_can_send_false++
+        }
+      }
+      if (line_send_capacity != "" &&
+          (min_reverse_send_capacity == "" || line_send_capacity < min_reverse_send_capacity)) {
+        min_reverse_send_capacity = line_send_capacity
       }
     }
 
@@ -1555,6 +1598,10 @@ summarize_metrics_window() {
       if (terminal_pending_events > 0) {
         add_label("terminal_pending_reap")
       }
+      if (max_terminal_late_remote_payload_close_events > 0 ||
+          max_terminal_late_remote_payload_close_bytes > 0) {
+        add_label("terminal_closed_late_payload")
+      }
       if (pending_at_close_events > 0) {
         add_label("pending_at_close")
       }
@@ -1659,6 +1706,7 @@ summarize_metrics_window() {
           remote_timing_slow = 1
         }
       }
+      clean_reverse_no_data = 0
       if (probe_kind == "tcp" && reverse_tcp == "1" &&
           sender != "unknown" && receiver != "unknown" &&
           (sender + 0) < 5 && (receiver + 0) < 5 &&
@@ -1666,9 +1714,21 @@ summarize_metrics_window() {
           max_lost_bytes_delta == 0 && max_congestion_delta == 0 &&
           max_tx_data_delta == 0 && max_tx_stream_delta == 0 &&
           inherited_quic_congestion == 0 &&
-          reconnect_count == 0 &&
+          reconnect_count == 0) {
+        clean_reverse_no_data = 1
+      }
+      if (probe_kind == "tcp" && reverse_tcp == "1" &&
+          clean_reverse_no_data == 1 &&
           remote_timing_slow == 0) {
         add_label("reverse_sender_backpressured")
+      }
+      if (clean_reverse_no_data == 1) {
+        add_label("target_sender_stalled")
+        if (max_tuic_data_pending_gap_ms >= slow_rx_floor_ms &&
+            max_tuic_data_rx_bytes > 0 &&
+            max_tuic_data_rx_bytes < tuic_stream_starved_rx_ceiling) {
+          add_label("tuic_stream_starved")
+        }
       }
       throughput_shape = "unknown"
       no_data_shape = 0
@@ -1720,6 +1780,9 @@ summarize_metrics_window() {
       if (min_send_capacity_min == "") {
         min_send_capacity_min = 0
       }
+      if (min_reverse_send_capacity == "") {
+        min_reverse_send_capacity = 0
+      }
 
       print "- metrics_title: " title
       print "- iperf_sender_mbps: " sender
@@ -1732,6 +1795,7 @@ summarize_metrics_window() {
       printf "- downlink_backpressure: pause_edges=%d resume_edges=%d max_pending_bytes=%d max_total_pending_bytes=%d max_tx_queue_bytes=%d max_total_tx_queue_bytes=%d max_pressure_bytes=%d max_total_pressure_bytes=%d\n", down_pause_count, down_resume_count, max_down_pending, max_down_total, max_down_tx_queue, max_down_total_tx_queue, max_down_pressure, max_down_total_pressure
       printf "- downlink_flush: attempts=%d no_send_capacity=%d send_window_samples=%d send_capacity_min=%d send_capacity_max=%d send_queue_max=%d recv_queue_max=%d may_send_false=%d may_recv_false=%d no_send_streak_max=%d no_send_pending_max=%d send_slice_calls=%d accepted_bytes=%d zero=%d errors=%d budget_limited=%d max_accepted_bytes=%d tun_flush_calls=%d tun_flush_failures=%d tun_flush_deferred=%d pending_total_max=%d pending_max=%d pending_high=%d remote_to_global_rx_bytes=%d terminal_late_remote_payload_bytes=%d terminal_late_remote_payload_events=%d dirty_handles_max=%d\n", max_flush_attempts, max_no_send_capacity, max_send_window_samples, min_send_capacity_min, max_send_capacity_max, max_send_queue_max, max_recv_queue_max, max_may_send_false, max_may_recv_false, max_no_send_capacity_streak, max_no_send_capacity_pending, max_flush_send_calls, max_flush_accepted, max_flush_zero, max_flush_errors, max_budget_limited, max_send_slice_max_accepted, max_tun_flush_calls, max_tun_flush_failures, max_tun_flush_deferred, max_flush_pending_total, max_flush_pending_max, max_flush_pending_high, max_flush_remote_bytes, max_flush_terminal_late_remote_bytes, max_flush_terminal_late_remote_events, max_dirty_handles
       printf "- tcp_lifecycle: transitions=%d closed_edges=%d terminal_candidates=%d max_pending_bytes=%d max_remote_to_global_rx_bytes=%d sources=%s states=%s\n", lifecycle_transitions, lifecycle_closed_edges, lifecycle_terminal_candidates, max_lifecycle_pending, max_lifecycle_remote_bytes, lifecycle_sources, lifecycle_states
+      printf "- tcp_reverse_window: events=%d payload_bytes=%d accepted_bytes=%d pending_max=%d send_capacity_min=%d send_capacity_max=%d send_queue_max=%d recv_queue_max=%d may_recv_false=%d active_false=%d can_send_false=%d\n", reverse_window_events, reverse_window_payload_bytes, reverse_window_accepted_bytes, max_reverse_window_pending, min_reverse_send_capacity, max_reverse_send_capacity, max_reverse_send_queue, max_reverse_recv_queue, reverse_window_may_recv_false, reverse_window_active_false, reverse_window_can_send_false
       printf "- terminal_pending_reap: events=%d bytes=%d max_bytes=%d\n", terminal_pending_events, terminal_pending_bytes, max_terminal_pending_bytes
       printf "- terminal_late_remote_payload: events=%d bytes=%d max_bytes=%d close_max_bytes=%d close_max_events=%d\n", terminal_late_remote_payload_events, terminal_late_remote_payload_bytes, max_terminal_late_remote_payload_bytes, max_terminal_late_remote_payload_close_bytes, max_terminal_late_remote_payload_close_events
       printf "- pending_at_close: events=%d bytes=%d max_bytes=%d terminal_events=%d terminal_bytes=%d active_no_send_events=%d active_no_send_bytes=%d send_capable_events=%d send_capable_bytes=%d inactive_no_send_events=%d inactive_no_send_bytes=%d unknown_events=%d unknown_bytes=%d\n", pending_at_close_events, pending_at_close_bytes, max_pending_at_close_bytes, terminal_pending_events, terminal_pending_bytes, pending_close_active_no_send_events, pending_close_active_no_send_bytes, pending_close_send_capable_events, pending_close_send_capable_bytes, pending_close_inactive_no_send_events, pending_close_inactive_no_send_bytes, pending_close_unknown_events, pending_close_unknown_bytes
@@ -2065,6 +2129,31 @@ EOF_LOG
 
   cat > "$iperf_sample" <<'EOF_IPERF'
 Reverse mode, remote host 43.130.32.77 is sending
+[  5]   0.00-30.04  sec  1.13 MBytes   315 Kbits/sec    3             sender
+[  5]   0.00-30.00  sec   414 KBytes   113 Kbits/sec                  receiver
+EOF_IPERF
+  cat > "$log_sample" <<'EOF_LOG'
+🔎 tuic-open-tcp target=43.130.32.77:5201 conn=4 id=99
+📊 TUIC QUIC stats conn=4 id=99 rtt=8ms cwnd=247211 lost=0/35 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=33/9175B udp_rx=177/232816B dg_max=Some(1418) dg_space=1048576B
+🔎 tcp-reverse-window handle=SocketHandle(1) ctx_state=Relaying payload_bytes=65536 accepted_bytes=65536 pending=0 remote_to_global_rx_bytes=65536 local_fin_sent=false tcp_state=Established active=true can_send=true can_recv=false may_send=true may_recv=true send_capacity=1048576 send_queue=65536 recv_queue=0
+🔎 tcp-relay-live handle=SocketHandle(1) epoch=1 writer_done=false read_only_after_local_finish=false uplink_bytes=37 uplink_writes=1 remote_to_global_rx_bytes=723424 remote_reads=27 remote_after_local_finish_bytes=0 remote_after_local_finish_reads=0 first_remote_read_ms=4 max_remote_read_gap_ms=20567 current_remote_read_gap_ms=20567 global_rx_wait_max_us=5 global_rx_pressure_events=0 global_rx_queue_used_max=1 global_rx_queue_capacity=1024 local_write_wait_max_us=0 local_write_pressure_events=0
+🔎 tcp-reverse-window handle=SocketHandle(1) ctx_state=Relaying payload_bytes=65536 accepted_bytes=65536 pending=0 remote_to_global_rx_bytes=723424 local_fin_sent=false tcp_state=Established active=true can_send=true can_recv=false may_send=true may_recv=true send_capacity=1048576 send_queue=65536 recv_queue=0
+🔎 tuic-tcp-stream-pending target=43.130.32.77:5201 conn=4 id=99 stream=4 pending_gap_ms=20567 pending_polls=88 polls=115 max_poll_gap_ms=5000 rx_bytes=723424 reads=27
+🔎 tuic-tcp-stream-close target=43.130.32.77:5201 conn=4 id=99 stream=4 first_rx_ms=4 max_read_gap_ms=20567 rx_bytes=723424 reads=27 pending_polls=88 max_pending_gap_ms=20567 polls=119 max_poll_gap_ms=5000
+🔎 tcp-terminal-remote-payload handle=SocketHandle(1) bytes=241304 total_bytes=241304 events=9 pending=0 tcp_state=Closed active=false can_send=false can_recv=false may_send=false may_recv=false send_capacity=1048576 send_queue=0 recv_queue=0
+🔎 tcp-handle-close handle=SocketHandle(1) direction=local reason=dead_slot_reap state=Relaying pending=0 pending_high=65536 remote_to_global_rx_bytes=723424 terminal_late_remote_payload_bytes=241304 terminal_late_remote_payload_events=9 flush_attempts=27 no_send_capacity=0 send_window_samples=27 send_capacity_min=1048576 send_capacity_max=1048576 send_queue_max=65536 recv_queue_max=0 may_send_false=0 may_recv_false=0 no_send_capacity_streak_max=0 no_send_capacity_pending_max=0 send_slice_calls=27 send_slice_accepted=723424 send_slice_zero=0 send_slice_errors=0 budget_limited_calls=0 send_slice_max_accepted=65536 tun_flush_tx_calls=27 tun_flush_tx_failures=0 tun_flush_deferred=0 close_pending_class=none close_pending_bytes=0 terminal_pending_reap_bytes=0 tcp_state=Closed active=false can_send=false can_recv=false may_send=false may_recv=false send_capacity=1048576 send_queue=0 recv_queue=0
+📊 TUIC QUIC stats conn=4 id=99 rtt=5ms cwnd=247289 lost=0/105 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=103/14703B udp_rx=535/734789B dg_max=Some(1418) dg_space=1048576B
+EOF_LOG
+  summary="$(summarize_metrics_window 0 "reverse-starvation-self-test" "$iperf_sample" "$log_sample")"
+  assert_contains "$summary" "throughput_shape: shape=no_data tail_collapse=0 local_pressure=0 no_data=1 stable_high=0"
+  assert_contains "$summary" "tcp_reverse_window: events=2 payload_bytes=131072 accepted_bytes=131072 pending_max=0 send_capacity_min=1048576 send_capacity_max=1048576 send_queue_max=65536 recv_queue_max=0 may_recv_false=0 active_false=0 can_send_false=0"
+  assert_contains "$summary" "tuic_stream_starved"
+  assert_contains "$summary" "target_sender_stalled"
+  assert_contains "$summary" "terminal_closed_late_payload"
+  assert_not_contains "$summary" "reverse_sender_backpressured"
+
+  cat > "$iperf_sample" <<'EOF_IPERF'
+Reverse mode, remote host 43.130.32.77 is sending
 [  5]   0.00-30.04  sec   111 MBytes  31.0 Mbits/sec    0             sender
 [  5]   0.00-30.00  sec   103 MBytes  28.7 Mbits/sec                  receiver
 EOF_IPERF
@@ -2168,7 +2257,7 @@ IPERF_BUSY_WAIT_SECS="${IPERF_BUSY_WAIT_SECS:-5}"
 POST_IPERF_METRICS_SETTLE_SECS="${POST_IPERF_METRICS_SETTLE_SECS:-2}"
 PROBE_ORDER="${PROBE_ORDER:-forward-first}"
 OUT="${OUT:-/tmp/mvpn_knife14b_lowrtt_$(date +%Y%m%d_%H%M%S).md}"
-METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tuic-open-tcp|tuic-tcp-stream-first-rx|tuic-tcp-stream-read-gap|tuic-tcp-stream-pending|tuic-tcp-stream-close|tuic-tcp-pool-reconnect|tcp-relay-live|tcp-relay-write-half-closed|tcp-relay-close|tcp-handle-close|tcp-deferred-close-egress|tcp-lifecycle-transition|tcp-local-write-pressure|tcp-global-rx-pressure|tcp-downlink-backpressure|tcp-downlink-flush|tcp-tun-rx-drain|tcp-tun-egress'
+METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tuic-open-tcp|tuic-tcp-stream-first-rx|tuic-tcp-stream-read-gap|tuic-tcp-stream-pending|tuic-tcp-stream-close|tuic-tcp-pool-reconnect|tcp-relay-live|tcp-relay-write-half-closed|tcp-relay-close|tcp-handle-close|tcp-deferred-close-egress|tcp-lifecycle-transition|tcp-reverse-window|tcp-local-write-pressure|tcp-global-rx-pressure|tcp-downlink-backpressure|tcp-downlink-flush|tcp-tun-rx-drain|tcp-tun-egress'
 
 case "$PROBE_ORDER" in
   forward-first|reverse-first|forward-only|reverse-only) ;;

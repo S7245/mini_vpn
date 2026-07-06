@@ -71,6 +71,8 @@ const TUN_EGRESS_FEEDBACK_SAMPLE_SECS: u64 = 1;
 /// Knife14bu：smoltcp send_queue 高压刚 flush 到 TUN/qdisc 后，短暂保留本地 egress
 /// 压力，避免下一轮 raw pressure=0 时立刻恢复远端读取。
 const TUN_EGRESS_PRESSURE_HOLD_MS: u64 = 25;
+/// Knife14bw：反向 TCP 窗口诊断低频采样周期。只影响 `MINI_VPN_TCP_DIAG=1` 日志密度。
+const TCP_REVERSE_WINDOW_DIAG_INTERVAL_SECS: u64 = 5;
 /// Knife14bi：Knife14bg 证明 opportunistic TUN RX drain 会让 reverse-first 退化；默认关闭。
 const DEFAULT_TUN_RX_DRAIN_BUDGET: usize = 0;
 /// Knife14bh：TUN RX drain 是诊断/公平性路径，允许 A/B 关闭或小幅放大，禁止无界热路径扫描。
@@ -564,6 +566,25 @@ fn log_tcp_lifecycle_observation(
     }
 }
 
+fn should_log_tcp_reverse_window(
+    ctx: &mut SocketCtx,
+    snapshot: SocketCloseSnapshot,
+    now_secs: u64,
+) -> bool {
+    let urgent = !snapshot.active || !snapshot.can_send || !snapshot.may_recv;
+    let due = ctx
+        .reverse_window_last_log_secs
+        .map(|last| {
+            urgent
+                || now_secs.saturating_sub(last) >= TCP_REVERSE_WINDOW_DIAG_INTERVAL_SECS
+        })
+        .unwrap_or(true);
+    if due {
+        ctx.reverse_window_last_log_secs = Some(now_secs);
+    }
+    due
+}
+
 #[derive(Debug, Clone)]
 struct RelayTaskDiag {
     /// Relay task creation time, used to measure first remote byte latency.
@@ -791,6 +812,39 @@ fn format_relay_close_diag(
     )
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TcpReverseWindowDiag {
+    ctx_state: SocketState,
+    payload_bytes: usize,
+    accepted_bytes: usize,
+    pending: usize,
+    remote_to_global_rx_bytes: u64,
+    local_fin_sent: bool,
+    snapshot: SocketCloseSnapshot,
+}
+
+fn format_tcp_reverse_window_diag(handle: SocketHandle, diag: TcpReverseWindowDiag) -> String {
+    format!(
+        "🔎 tcp-reverse-window handle={:?} ctx_state={:?} payload_bytes={} accepted_bytes={} pending={} remote_to_global_rx_bytes={} local_fin_sent={} tcp_state={:?} active={} can_send={} can_recv={} may_send={} may_recv={} send_capacity={} send_queue={} recv_queue={}",
+        handle,
+        diag.ctx_state,
+        diag.payload_bytes,
+        diag.accepted_bytes,
+        diag.pending,
+        diag.remote_to_global_rx_bytes,
+        diag.local_fin_sent,
+        diag.snapshot.tcp_state,
+        diag.snapshot.active,
+        diag.snapshot.can_send,
+        diag.snapshot.can_recv,
+        diag.snapshot.may_send,
+        diag.snapshot.may_recv,
+        diag.snapshot.send_capacity,
+        diag.snapshot.send_queue,
+        diag.snapshot.recv_queue
+    )
+}
+
 #[derive(Debug)]
 enum RelayCommand {
     Data(Vec<u8>),
@@ -956,6 +1010,8 @@ struct SocketCtx {
     downlink_diag: TcpDownlinkDiag,
     /// Last observed TCP socket lifecycle snapshot for transition diagnostics.
     last_tcp_lifecycle: Option<TcpLifecycleObservation>,
+    /// Latest event-loop second when live reverse TCP window diagnostics were logged.
+    reverse_window_last_log_secs: Option<u64>,
 }
 
 impl SocketCtx {
@@ -984,6 +1040,7 @@ impl SocketCtx {
             uplink_buffer: Vec::new(),
             downlink_diag: TcpDownlinkDiag::default(),
             last_tcp_lifecycle: None,
+            reverse_window_last_log_secs: None,
         }
     }
 
@@ -3797,6 +3854,7 @@ fn rearm_socket(
     ctx.downlink_pending_last_pending_bytes = 0;
     ctx.downlink_diag = TcpDownlinkDiag::default();
     ctx.last_tcp_lifecycle = None;
+    ctx.reverse_window_last_log_secs = None;
     // 清 async-open 在飞缓存 + bump epoch——让任何迟到 `HandshakeDone` 失配被丢
     // （绝不装到本次 rearm 后的新一代 socket 上，防串话核心）。对非 spawn 槽是无害的纯计数自增。
     ctx.uplink_buffer.clear();
@@ -4257,6 +4315,23 @@ async fn handle_remote_payload<D: TunIo>(
     ctx.state = SocketState::Relaying;
     let snapshot = SocketCloseSnapshot::from_socket(tcp_socket);
     log_tcp_lifecycle_observation(handle, ctx, snapshot, now_secs, "remote_payload");
+    if should_log_tcp_reverse_window(ctx, snapshot, now_secs) {
+        tcp_diag_log!(
+            "{}",
+            format_tcp_reverse_window_diag(
+                handle,
+                TcpReverseWindowDiag {
+                    ctx_state: ctx.state,
+                    payload_bytes: payload.len(),
+                    accepted_bytes,
+                    pending: ctx.downlink_pending.len(),
+                    remote_to_global_rx_bytes: ctx.downlink_diag.remote_to_global_rx_bytes,
+                    local_fin_sent: ctx.local_fin_sent,
+                    snapshot,
+                },
+            )
+        );
+    }
 
     if !downlink_egress_pacer
         .allow_remote_payload_flush(
@@ -6121,6 +6196,7 @@ mod tests {
             uplink_buffer: vec![1, 2, 3],
             downlink_diag,
             last_tcp_lifecycle: None,
+            reverse_window_last_log_secs: Some(12),
         };
 
         rearm_socket(&mut socket, &mut ctx, &mut pool, 1);
@@ -6149,6 +6225,10 @@ mod tests {
         assert_eq!(
             ctx.downlink_diag.downlink_pending_high_water, 0,
             "rearm 应清空当前 flow 的 downlink diagnostics"
+        );
+        assert!(
+            ctx.reverse_window_last_log_secs.is_none(),
+            "rearm 应清空 reverse-window diagnostics 限流状态"
         );
         assert_eq!(ctx.conn_epoch, 8, "rearm 应 bump conn_epoch（让在飞 open 失效，M3）");
         assert!(
@@ -7665,6 +7745,82 @@ mod tests {
         assert!(line.contains("current_remote_read_gap_ms="), "{line}");
         assert!(line.contains("global_rx_queue_used_max=9"), "{line}");
         assert!(line.contains("global_rx_queue_capacity=1024"), "{line}");
+    }
+
+    #[test]
+    fn reverse_window_diag_line_reports_live_tcp_window_state() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(TcpSocket::new(
+            TcpSocketBuffer::new(vec![0; 16]),
+            TcpSocketBuffer::new(vec![0; 16]),
+        ));
+        let snapshot = SocketCloseSnapshot {
+            tcp_state: TcpState::Established,
+            active: true,
+            can_send: true,
+            can_recv: false,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 1_048_576,
+            send_queue: 65_536,
+            recv_queue: 0,
+        };
+
+        let line = format_tcp_reverse_window_diag(
+            handle,
+            TcpReverseWindowDiag {
+                ctx_state: SocketState::Relaying,
+                payload_bytes: 65_536,
+                accepted_bytes: 65_536,
+                pending: 0,
+                remote_to_global_rx_bytes: 4_194_304,
+                local_fin_sent: false,
+                snapshot,
+            },
+        );
+
+        assert!(line.contains("tcp-reverse-window"), "{line}");
+        assert!(line.contains("payload_bytes=65536"), "{line}");
+        assert!(line.contains("accepted_bytes=65536"), "{line}");
+        assert!(line.contains("pending=0"), "{line}");
+        assert!(line.contains("remote_to_global_rx_bytes=4194304"), "{line}");
+        assert!(line.contains("ctx_state=Relaying"), "{line}");
+        assert!(line.contains("local_fin_sent=false"), "{line}");
+        assert!(line.contains("tcp_state=Established"), "{line}");
+        assert!(line.contains("active=true"), "{line}");
+        assert!(line.contains("can_send=true"), "{line}");
+        assert!(line.contains("may_recv=true"), "{line}");
+        assert!(line.contains("send_capacity=1048576"), "{line}");
+        assert!(line.contains("send_queue=65536"), "{line}");
+    }
+
+    #[test]
+    fn reverse_window_diag_rate_limiter_logs_first_and_interval() {
+        let mut ctx = SocketCtx::new(5201);
+        let snapshot = SocketCloseSnapshot {
+            tcp_state: TcpState::Established,
+            active: true,
+            can_send: true,
+            can_recv: false,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 1_048_576,
+            send_queue: 0,
+            recv_queue: 0,
+        };
+
+        assert!(
+            should_log_tcp_reverse_window(&mut ctx, snapshot, 10),
+            "first reverse payload should log the local TCP window"
+        );
+        assert!(
+            !should_log_tcp_reverse_window(&mut ctx, snapshot, 14),
+            "steady high-throughput reverse payloads should be rate-limited"
+        );
+        assert!(
+            should_log_tcp_reverse_window(&mut ctx, snapshot, 15),
+            "diagnostics should refresh after the bounded interval"
+        );
     }
 
     /// 刀13 ①：MINI_VPN_TRACE 解析——`1`/`true`（去空白、不区分大小写）开；其它/缺省关

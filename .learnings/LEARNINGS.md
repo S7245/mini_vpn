@@ -1,5 +1,34 @@
 # Learnings
 
+## 2026-07-06 - Knife14bw adds reverse stream starvation diagnostics before behavior changes
+
+- Stage docs:
+  `docs/tech/2026-07-06-knife14bw-stream-starvation-diagnostics-plan.md`
+- Outcome: added behavior-neutral `tcp-reverse-window` diagnostics on accepted
+  reverse payloads, rate-limited to first payload plus a five-second refresh
+  cadence, with urgent refresh on inactive/no-send/no-recv-window states. The
+  state is cleared on `rearm_socket` so listener slot reuse cannot inherit old
+  diagnostic cadence.
+- Parser update: low-RTT summaries now report `tcp_reverse_window` and label
+  clean no-data reverse windows as `target_sender_stalled`; a small data stream
+  with long TUIC pending/read gaps also gets `tuic_stream_starved`; close-tail
+  late remote bytes recorded on the close line get
+  `terminal_closed_late_payload`.
+- TDD signal: focused tests cover the reverse-window log line, rate limiting,
+  and rearm cleanup. The low-RTT self-test includes a Knife14bv-shaped no-data
+  sample requiring `tcp_reverse_window`, `tuic_stream_starved`,
+  `target_sender_stalled`, and `terminal_closed_late_payload`.
+- Verification passed: low-RTT probe self-test, US-client suite self-test,
+  shell syntax checks, focused reverse-window tests, `cargo test`,
+  `cargo test --features harness`, `cargo build --release`,
+  `cargo clippy --all-targets --features harness -- -D warnings`, and
+  `git diff --check`.
+- Reusable rule: when a clean reverse-first run has tiny TUIC data-stream bytes
+  and no local pressure, do not patch close-drain or pacing first. Add a live
+  local TCP window sample at the exact remote-payload boundary, then let the VPS
+  result decide between TUIC server-to-client stream starvation and local
+  TCP ACK/receive-window behavior.
+
 ## 2026-07-05 - Knife14bg rejects TUN RX drain cadence as the clean reverse root
 
 - Code commit: `356e2d2`
