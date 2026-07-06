@@ -79,6 +79,85 @@ iperf_sender_mbps() {
   iperf_role_mbps "$1" "sender"
 }
 
+iperf_interval_profile() {
+  local iperf_file="$1"
+  awk '
+    function to_mbps(value, unit) {
+      if (unit == "bits/sec") {
+        return value / 1000000
+      }
+      if (unit == "Kbits/sec") {
+        return value / 1000
+      }
+      if (unit == "Mbits/sec") {
+        return value
+      }
+      if (unit == "Gbits/sec") {
+        return value * 1000
+      }
+      return value
+    }
+
+    /^\[[[:space:]]*[0-9]+]/ {
+      if ($NF == "sender" || $NF == "receiver") {
+        next
+      }
+      interval_found = 0
+      rate_found = 0
+      duration = 0
+      rate_mbps = 0
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^[0-9]+([.][0-9]+)?-[0-9]+([.][0-9]+)?$/) {
+          split($i, bounds, "-")
+          start_sec = bounds[1] + 0
+          end_sec = bounds[2] + 0
+          duration = end_sec - start_sec
+          interval_found = 1
+        }
+        if (i < NF && $(i + 1) ~ /^([KMG]?bits\/sec|bits\/sec)$/) {
+          rate_mbps = to_mbps($i + 0, $(i + 1))
+          rate_found = 1
+        }
+      }
+      if (interval_found && rate_found && duration > 0 && duration <= 2.0) {
+        samples++
+        rates[samples] = rate_mbps
+        total += rate_mbps
+      }
+    }
+
+    END {
+      if (samples == 0) {
+        printf "0 0.000 0.000 0 0.000 0.000 0\n"
+        exit
+      }
+
+      tail_samples = samples < 6 ? samples : 6
+      tail_start = samples - tail_samples + 1
+      tail_min = ""
+      for (i = 1; i <= samples; i++) {
+        if (i >= tail_start) {
+          tail_total += rates[i]
+          if (tail_min == "" || rates[i] < tail_min) {
+            tail_min = rates[i]
+          }
+        } else {
+          prefix_total += rates[i]
+          prefix_samples++
+        }
+      }
+      overall_avg = total / samples
+      tail_avg = tail_total / tail_samples
+      prefix_avg = prefix_samples > 0 ? prefix_total / prefix_samples : overall_avg
+      tail_collapse = 0
+      if (samples >= 4 && prefix_avg >= 100 && tail_avg < 50 && tail_avg <= prefix_avg * 0.35) {
+        tail_collapse = 1
+      }
+      printf "%d %.3f %.3f %d %.3f %.3f %d\n", samples, overall_avg, prefix_avg, tail_samples, tail_avg, tail_min, tail_collapse
+    }
+  ' "$iperf_file"
+}
+
 iperf_is_reverse_tcp() {
   local iperf_file="$1"
   if grep -q '^Reverse mode,' "$iperf_file"; then
@@ -194,16 +273,28 @@ summarize_metrics_window() {
   local tun_rx_after="${9:-unknown}"
   local tun_tx_after="${10:-unknown}"
   local receiver_mbps sender_mbps reverse_tcp tun_rx_delta tun_tx_delta
+  local interval_samples interval_avg interval_prefix_avg interval_tail_samples interval_tail_avg
+  local interval_tail_min interval_tail_collapse
   receiver_mbps="$(iperf_receiver_mbps "$iperf_file")"
   sender_mbps="$(iperf_sender_mbps "$iperf_file")"
   reverse_tcp="$(iperf_is_reverse_tcp "$iperf_file")"
   tun_rx_delta="$(counter_delta "$tun_rx_before" "$tun_rx_after")"
   tun_tx_delta="$(counter_delta "$tun_tx_before" "$tun_tx_after")"
+  read -r \
+    interval_samples \
+    interval_avg \
+    interval_prefix_avg \
+    interval_tail_samples \
+    interval_tail_avg \
+    interval_tail_min \
+    interval_tail_collapse <<< "$(iperf_interval_profile "$iperf_file")"
 
   if [[ ! -f "$log_file" ]]; then
     {
       echo "- iperf_sender_mbps: $sender_mbps"
       echo "- iperf_receiver_mbps: $receiver_mbps"
+      echo "- iperf_interval_profile: samples=$interval_samples overall_avg_mbps=$interval_avg prefix_avg_mbps=$interval_prefix_avg tail_samples=$interval_tail_samples tail_avg_mbps=$interval_tail_avg tail_min_mbps=$interval_tail_min tail_collapse=$interval_tail_collapse"
+      echo "- throughput_shape: shape=unknown tail_collapse=$interval_tail_collapse local_pressure=unknown no_data=0 stable_high=0"
       echo "- tun_drops: if=$tun_if tun_rx_dropped_delta=$tun_rx_delta tun_tx_dropped_delta=$tun_tx_delta"
       echo "- metrics_window: log_missing"
       echo "- attribution: no_metrics"
@@ -217,6 +308,13 @@ summarize_metrics_window() {
     -v sender="$sender_mbps" \
     -v receiver="$receiver_mbps" \
     -v reverse_tcp="$reverse_tcp" \
+    -v interval_samples="$interval_samples" \
+    -v interval_avg="$interval_avg" \
+    -v interval_prefix_avg="$interval_prefix_avg" \
+    -v interval_tail_samples="$interval_tail_samples" \
+    -v interval_tail_avg="$interval_tail_avg" \
+    -v interval_tail_min="$interval_tail_min" \
+    -v interval_tail_collapse="$interval_tail_collapse" \
     -v tun_if="$tun_if" \
     -v tun_rx_delta="$tun_rx_delta" \
     -v tun_tx_delta="$tun_tx_delta" \
@@ -1353,6 +1451,24 @@ summarize_metrics_window() {
       if (down_pause_count > 0) {
         add_label("local_downlink_backpressure")
       }
+      local_pressure = 0
+      if (tun_tx_delta != "unknown" && (tun_tx_delta + 0) > 0) {
+        local_pressure = 1
+      }
+      if (runtime_tun_drop_delta_total > 0 ||
+          tun_feedback_pause_count > 0 ||
+          down_pause_count > 0 ||
+          max_tun_flush_deferred > 0) {
+        local_pressure = 1
+      }
+      tail_collapse_active = 0
+      if (probe_kind == "tcp" && reverse_tcp == "1" && interval_tail_collapse == "1") {
+        tail_collapse_active = 1
+        add_label("iperf_tail_collapse")
+        if (local_pressure > 0) {
+          add_label("tail_collapse_local_pressure")
+        }
+      }
       if (global_rx_count > 0) {
         add_label("global_rx_backpressure")
       }
@@ -1464,6 +1580,26 @@ summarize_metrics_window() {
           remote_timing_slow == 0) {
         add_label("reverse_sender_backpressured")
       }
+      throughput_shape = "unknown"
+      no_data_shape = 0
+      stable_high_shape = 0
+      if (probe_kind == "tcp" && reverse_tcp == "1" && sender != "unknown" && receiver != "unknown") {
+        if ((sender + 0) < 5 && (receiver + 0) < 5) {
+          throughput_shape = "no_data"
+          no_data_shape = 1
+        } else if (tail_collapse_active > 0 && local_pressure > 0) {
+          throughput_shape = "tail_collapse_local_pressure"
+        } else if (tail_collapse_active > 0) {
+          throughput_shape = "tail_collapse"
+        } else if ((receiver + 0) >= 100 && interval_tail_samples > 0 && (interval_tail_avg + 0) >= 100) {
+          throughput_shape = "stable_high"
+          stable_high_shape = 1
+        } else if ((receiver + 0) >= 100) {
+          throughput_shape = "high_average_unclassified"
+        } else {
+          throughput_shape = "low_average"
+        }
+      }
       if (labels == "") {
         labels = "no_pressure_signal"
       }
@@ -1498,6 +1634,8 @@ summarize_metrics_window() {
       print "- metrics_title: " title
       print "- iperf_sender_mbps: " sender
       print "- iperf_receiver_mbps: " receiver
+      printf "- iperf_interval_profile: samples=%d overall_avg_mbps=%.3f prefix_avg_mbps=%.3f tail_samples=%d tail_avg_mbps=%.3f tail_min_mbps=%.3f tail_collapse=%d\n", interval_samples, interval_avg, interval_prefix_avg, interval_tail_samples, interval_tail_avg, interval_tail_min, interval_tail_collapse
+      printf "- throughput_shape: shape=%s tail_collapse=%d local_pressure=%d no_data=%d stable_high=%d\n", throughput_shape, tail_collapse_active, local_pressure, no_data_shape, stable_high_shape
       printf "- tcp_pool: opens=%d conns=%s reconnects=%d reasons=%s\n", open_count, open_conns, reconnect_count, reconnect_reasons
       printf "- local_write_pressure: events=%d max_wait_ms=%.3f max_payload_bytes=%d\n", local_write_count, max_local_wait_us / 1000, max_local_payload
       printf "- global_rx_pressure: events=%d max_wait_ms=%.3f queue_used_max=%d queue_capacity=%d\n", global_rx_count, max_global_wait_us / 1000, max_global_rx_queue_used, max_global_rx_queue_capacity
@@ -1700,6 +1838,87 @@ EOF_LOG
   assert_contains "$summary" "terminal_pending_reap: events=0 bytes=0 max_bytes=0"
 
   cat > "$iperf_sample" <<'EOF_IPERF'
+Reverse mode, remote host 43.130.32.77 is sending
+[  5]   0.00-1.00   sec  32.0 MBytes   268 Mbits/sec
+[  5]   1.00-2.00   sec  20.0 MBytes   168 Mbits/sec
+[  5]   2.00-3.00   sec  17.2 MBytes   145 Mbits/sec
+[  5]   3.00-4.00   sec  24.8 MBytes   208 Mbits/sec
+[  5]   4.00-5.00   sec  17.0 MBytes   143 Mbits/sec
+[  5]   5.00-6.00   sec  26.0 MBytes   218 Mbits/sec
+[  5]   6.00-7.00   sec  15.2 MBytes   128 Mbits/sec
+[  5]   7.00-8.00   sec  25.5 MBytes   214 Mbits/sec
+[  5]   8.00-9.00   sec  15.5 MBytes   130 Mbits/sec
+[  5]   9.00-10.00  sec  28.2 MBytes   237 Mbits/sec
+[  5]  10.00-11.00  sec  22.0 MBytes   185 Mbits/sec
+[  5]  11.00-12.00  sec  19.2 MBytes   162 Mbits/sec
+[  5]  12.00-13.00  sec  24.4 MBytes   204 Mbits/sec
+[  5]  13.00-14.00  sec  20.2 MBytes   170 Mbits/sec
+[  5]  14.00-15.00  sec  22.6 MBytes   190 Mbits/sec
+[  5]  15.00-16.00  sec  15.0 MBytes   126 Mbits/sec
+[  5]  16.00-17.00  sec  23.2 MBytes   195 Mbits/sec
+[  5]  17.00-18.00  sec  23.1 MBytes   194 Mbits/sec
+[  5]  18.00-19.00  sec  23.6 MBytes   198 Mbits/sec
+[  5]  19.00-20.00  sec  22.1 MBytes   186 Mbits/sec
+[  5]  20.00-21.00  sec  21.8 MBytes   182 Mbits/sec
+[  5]  21.00-22.00  sec  22.1 MBytes   186 Mbits/sec
+[  5]  22.00-23.00  sec  21.5 MBytes   180 Mbits/sec
+[  5]  23.00-24.00  sec  17.1 MBytes   144 Mbits/sec
+[  5]  24.00-25.00  sec  2.00 MBytes  16.8 Mbits/sec
+[  5]  25.00-26.00  sec  1.88 MBytes  15.7 Mbits/sec
+[  5]  26.00-27.00  sec  2.00 MBytes  16.8 Mbits/sec
+[  5]  27.00-28.00  sec  1.88 MBytes  15.7 Mbits/sec
+[  5]  28.00-29.00  sec  1.88 MBytes  15.7 Mbits/sec
+[  5]  29.00-30.00  sec  2.00 MBytes  16.8 Mbits/sec
+[  5]   0.00-30.00  sec   537 MBytes   150 Mbits/sec  264             sender
+[  5]   0.00-30.00  sec   531 MBytes   149 Mbits/sec                  receiver
+EOF_IPERF
+  cat > "$log_sample" <<'EOF_LOG'
+🔎 tuic-open-tcp target=43.130.32.77:5201 conn=0 id=97320573301536
+📊 TUIC QUIC stats conn=0 id=97320573301536 rtt=0ms cwnd=12000 lost=0/35 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=188,max_stream_data=672) rx_window(max_data=0,max_stream_data=0) udp_tx=35/4096B udp_rx=350/497000B dg_max=Some(1418) dg_space=1048576B
+🔎 tcp-downlink-backpressure paused=true max_pending=0 total_pending=0 max_tx_queue=589819 total_tx_queue=589819 max_pressure=589819 total_pressure=589819 high=524288 low=131072
+🔎 tcp-downlink-backpressure paused=false max_pending=0 total_pending=0 max_tx_queue=120000 total_tx_queue=120000 max_pressure=120000 total_pressure=120000 high=524288 low=131072
+🔎 tcp-downlink-flush pending_total=0 pending_max=0 pending_high=65536 remote_to_global_rx_bytes=550507645 terminal_late_remote_payload_bytes=0 terminal_late_remote_payload_events=0 flush_attempts=29264 no_send_capacity=0 send_window_samples=29264 send_capacity_min=1048576 send_capacity_max=1048576 send_queue_max=524283 recv_queue_max=0 may_send_false=0 may_recv_false=0 no_send_capacity_streak_max=0 no_send_capacity_pending_max=0 send_slice_calls=29264 send_slice_accepted=550507645 send_slice_zero=0 send_slice_errors=0 budget_limited_calls=0 send_slice_max_accepted=65536 tun_flush_tx_calls=28571 tun_flush_tx_failures=0 tun_flush_deferred=693 dirty_handles=1
+🔎 tcp-tun-egress if=tun0 status=delta tx_dropped_total=14804 tx_dropped_delta=14804 global_rx_paused=true pending_total=0 pending_max=0 pending_high=65536 remote_to_global_rx_bytes=361787036 tun_flush_tx_calls=16263 dirty_handles=0
+🔎 tcp-tun-egress-feedback paused=true reason=drop_delta tx_dropped_delta=14804 max_pressure=589816 total_pressure=589816 high=524288 low=131072 drop_events=5 drop_delta_total=14804 max_delta=5472 pause_edges=5 resume_edges=4
+🔎 tcp-tun-egress-feedback paused=false reason=pressure_low tx_dropped_delta=0 max_pressure=0 total_pressure=0 high=524288 low=131072 drop_events=5 drop_delta_total=14804 max_delta=5472 pause_edges=5 resume_edges=5
+🔎 tcp-terminal-remote-payload handle=SocketHandle(1) bytes=1474528 total_bytes=1474528 events=835 pending=0 tcp_state=Closed active=false can_send=false can_recv=false may_send=false may_recv=false send_capacity=1048576 send_queue=2816 recv_queue=0
+🔎 tcp-handle-close handle=SocketHandle(1) direction=local reason=dead_slot_reap state=Relaying pending=0 pending_high=65536 remote_to_global_rx_bytes=557140382 terminal_late_remote_payload_bytes=1474528 terminal_late_remote_payload_events=835 flush_attempts=33044 no_send_capacity=0 send_window_samples=33044 send_capacity_min=1048576 send_capacity_max=1048576 send_queue_max=524283 recv_queue_max=0 may_send_false=0 may_recv_false=2 no_send_capacity_streak_max=0 no_send_capacity_pending_max=0 send_slice_calls=33044 send_slice_accepted=557140382 send_slice_zero=0 send_slice_errors=0 budget_limited_calls=0 send_slice_max_accepted=65536 tun_flush_tx_calls=32351 tun_flush_tx_failures=0 tun_flush_deferred=693 close_pending_class=none close_pending_bytes=0 terminal_pending_reap_bytes=0 tcp_state=Closed active=false can_send=false can_recv=false may_send=false may_recv=false send_capacity=1048576 send_queue=2816 recv_queue=0
+📊 TUIC QUIC stats conn=0 id=97320573301536 rtt=0ms cwnd=12000 lost=0/82929 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=190,max_stream_data=680) rx_window(max_data=0,max_stream_data=0) udp_tx=82927/9796183B udp_rx=414492/589086494B dg_max=Some(1418) dg_space=1048576B
+EOF_LOG
+  summary="$(summarize_metrics_window 0 "tail-collapse-self-test" "$iperf_sample" "$log_sample")"
+  assert_contains "$summary" "iperf_interval_profile: samples=30"
+  assert_contains "$summary" "tail_samples=6 tail_avg_mbps=16.250 tail_min_mbps=15.700 tail_collapse=1"
+  assert_contains "$summary" "throughput_shape: shape=tail_collapse_local_pressure tail_collapse=1 local_pressure=1"
+  assert_contains "$summary" "iperf_tail_collapse"
+  assert_contains "$summary" "tail_collapse_local_pressure"
+  assert_not_contains "$summary" "shape=stable_high"
+
+  cat > "$iperf_sample" <<'EOF_IPERF'
+Reverse mode, remote host 43.130.32.77 is sending
+[  5]   0.00-1.00   sec  21.5 MBytes   180 Mbits/sec
+[  5]   1.00-2.00   sec  22.6 MBytes   190 Mbits/sec
+[  5]   2.00-3.00   sec  21.8 MBytes   183 Mbits/sec
+[  5]   3.00-4.00   sec  22.4 MBytes   188 Mbits/sec
+[  5]   4.00-5.00   sec  22.0 MBytes   185 Mbits/sec
+[  5]   5.00-6.00   sec  21.9 MBytes   184 Mbits/sec
+[  5]   6.00-7.00   sec  22.1 MBytes   186 Mbits/sec
+[  5]   7.00-8.00   sec  22.0 MBytes   185 Mbits/sec
+[  5]   8.00-9.00   sec  21.8 MBytes   183 Mbits/sec
+[  5]   9.00-10.00  sec  22.4 MBytes   188 Mbits/sec
+[  5]   0.00-10.00  sec   220 MBytes   185 Mbits/sec    0             sender
+[  5]   0.00-10.00  sec   219 MBytes   184 Mbits/sec                  receiver
+EOF_IPERF
+  cat > "$log_sample" <<'EOF_LOG'
+🔎 tuic-open-tcp target=43.130.32.77:5201 conn=1 id=99
+📊 TUIC QUIC stats conn=1 id=99 rtt=1ms cwnd=247092 lost=0/35 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=33/9175B udp_rx=177/232816B dg_max=Some(1418) dg_space=1048576B
+📊 TUIC QUIC stats conn=1 id=99 rtt=1ms cwnd=247092 lost=0/105 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=103/14703B udp_rx=535/734789B dg_max=Some(1418) dg_space=1048576B
+EOF_LOG
+  summary="$(summarize_metrics_window 0 "stable-high-self-test" "$iperf_sample" "$log_sample")"
+  assert_contains "$summary" "iperf_interval_profile: samples=10"
+  assert_contains "$summary" "throughput_shape: shape=stable_high tail_collapse=0 local_pressure=0 no_data=0 stable_high=1"
+  assert_not_contains "$summary" "iperf_tail_collapse"
+
+  cat > "$iperf_sample" <<'EOF_IPERF'
 [  5]   0.00-30.04  sec  2.62 MBytes   733 Kbits/sec    3             sender
 [  5]   0.00-30.00  sec  0.00 Bytes  0.00 bits/sec                  receiver
 EOF_IPERF
@@ -1809,6 +2028,7 @@ EOF_IPERF
 EOF_LOG
   summary="$(summarize_metrics_window 0 "reverse-sender-backpressure-self-test" "$iperf_sample" "$log_sample")"
   assert_contains "$summary" "iperf_sender_mbps: 0.838"
+  assert_contains "$summary" "throughput_shape: shape=no_data tail_collapse=0 local_pressure=0 no_data=1 stable_high=0"
   assert_contains "$summary" "attribution: reverse_sender_backpressured"
   summary="$(summarize_metrics_window 0 "udp-reverse-self-test" "$iperf_sample" "$log_sample" "udp")"
   assert_not_contains "$summary" "reverse_sender_backpressured"

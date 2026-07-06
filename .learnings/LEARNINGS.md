@@ -2316,3 +2316,27 @@ worth cleaning up separately.
   tail-collapse, record it as a separate failure shape and add correlation
   evidence before behavior changes. Do not claim final acceptance from average
   throughput while tail seconds and TUN drops remain unhealthy.
+
+## 2026-07-06 — Knife14br makes tail collapse machine-readable
+
+- Stage: Knife14br parser/report patch after the Knife14bq repeat.
+- Outcome: `scripts/knife14b-lowrtt-probe.sh` now emits
+  `iperf_interval_profile` and `throughput_shape` in every attribution summary,
+  and the parent US-client suite surfaces those lines in probe summaries.
+- TDD: the first self-test fixture reproduced the Knife14bq shape: `150/149
+  Mbit/s` aggregate, high first 24 seconds, `~16 Mbit/s` final-six-second tail,
+  local downlink/TUN pressure, no QUIC loss/congestion, and terminal-late
+  accounting. It initially failed because no interval profile existed, then
+  passed after the parser implementation.
+- Local gates passed: `bash -n scripts/knife14b-lowrtt-probe.sh`,
+  `bash scripts/knife14b-lowrtt-probe.sh --self-test`,
+  `bash -n scripts/knife14b-usclient-tunnel-suite.sh`,
+  `bash scripts/knife14b-usclient-tunnel-suite.sh --self-test`, a Knife14bq
+  bundle parser smoke, and `git diff --check`.
+- Evidence smoke: the extracted Knife14bq bundle now summarizes as
+  `throughput_shape: shape=tail_collapse_local_pressure` and attribution adds
+  `iperf_tail_collapse+tail_collapse_local_pressure`.
+- Reusable rule: future high-average TCP reverse runs are not acceptable unless
+  `throughput_shape` is `stable_high` or a deliberate acceptance note explains
+  why the tail is irrelevant. A high aggregate with `tail_collapse_*` remains a
+  Knife14 failure shape.

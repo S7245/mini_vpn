@@ -1419,3 +1419,15 @@
   average `149 Mbit/s` as final acceptance. The next patch must be
   evidence/TDD-first around local TUN egress pressure, downlink pause/resume
   timing, and close-tail terminal-late correlation before changing behavior.
+
+## 2026-07-06 — throughput-shape tests must match probe direction
+
+- Symptom: during Knife14br TDD, a new `no_data` assertion was first attached to
+  an existing late-remote fixture that was not a reverse TCP iperf sample, so the
+  parser correctly returned `throughput_shape: shape=unknown`.
+- Cause: the new shape classifier is intentionally scoped to reverse TCP probes;
+  forward and UDP samples keep attribution labels but do not receive reverse
+  throughput-shape semantics.
+- Correct behavior: put `no_data`, `tail_collapse`, and `stable_high`
+  throughput-shape assertions on reverse TCP fixtures only. Use forward fixtures
+  for relay/late-remote behavior, not reverse-throughput acceptance shape.
