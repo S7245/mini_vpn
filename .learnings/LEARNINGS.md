@@ -1,5 +1,29 @@
 # Learnings
 
+## 2026-07-06 - Knife14ci proves ACK drain is real but post-payload is too late
+
+- Stage docs:
+  `docs/tech/2026-07-06-knife14ci-adaptive-tun-rx-ack-drain-spec.md`,
+  `docs/tech/2026-07-06-knife14ci-adaptive-tun-rx-ack-drain-plan.md`,
+  `docs/tech/2026-07-06-knife14ci-adaptive-tun-rx-ack-drain-results.md`
+- Code commit: `554d3b4`.
+- Log bundles:
+  `/tmp/mini_vpn/knife14ci_adaptive_ack_drain_20260707_0208/mvpn_knife14ci_adaptive_ack_drain_usclient_suite_20260707_020847.tar.gz`,
+  `/tmp/mini_vpn/knife14ci_adaptive_ack_drain_retry_20260707_0212/mvpn_knife14ci_adaptive_ack_drain_retry_usclient_suite_20260707_021233.tar.gz`
+- Outcome: local gates passed and the retry VPS suite reached P1, but
+  reverse-first stayed low at `18.8/17.9 Mbit/s`.
+- What worked: the default-safe pressure adaptive path engaged:
+  `tcp-tun-rx-drain attempts=5 packets=105 tcp=105 budget_exhausted=5`.
+  This proves ready ACK/window traffic exists at the egress credit edge.
+- What did not work: post-payload drain was too late. The run still saw
+  `tun_tx_dropped_delta=82`, `send_queue_max=892928`, multi-second TUIC data
+  read gaps, and close-tail active send-capable backlog
+  (`pending=525514`, `close_egress_bytes=892928`).
+- Reusable rule: do not solve this by raising a static TUN RX drain knob.
+  The next repair should use the same pressure gate but drain before accepting
+  more remote payload and at pressure-maintenance points while dirty downlink
+  remains.
+
 ## 2026-07-06 - Knife14ch redirects pressure work toward adaptive ACK drain
 
 - Stage docs:

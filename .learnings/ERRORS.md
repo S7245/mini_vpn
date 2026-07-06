@@ -1,5 +1,51 @@
 # Errors
 
+## 2026-07-06 - Knife14ci VPS failed because ACK drain runs after the burst
+
+- Stage: Knife14ci adaptive TUN RX ACK drain VPS acceptance.
+- Failed/diagnostic bundles:
+  `/tmp/mini_vpn/knife14ci_adaptive_ack_drain_20260707_0208/mvpn_knife14ci_adaptive_ack_drain_usclient_suite_20260707_020847.tar.gz`,
+  `/tmp/mini_vpn/knife14ci_adaptive_ack_drain_retry_20260707_0212/mvpn_knife14ci_adaptive_ack_drain_retry_usclient_suite_20260707_021233.tar.gz`
+- Symptom: the retry P1 stayed `low_average` at `18.8/17.9 Mbit/s` despite
+  healthy direct `.27 -> .77` and `.33 -> .77` baselines.
+- Important discriminator: `tcp-tun-rx-drain attempts=5 packets=105 tcp=105
+  budget_exhausted=5`, so ACK/window packets were ready and the new code path
+  engaged. The failure is not "no ACK drain"; it is "ACK drain happens too late
+  and only on remote-payload events."
+- Local loss/backlog: `tun_tx_dropped_delta=82`, `send_queue_max=892928`,
+  `hard_edge_guard_limited=51`, and close-tail active send-capable backlog
+  (`pending=525514`, `close_egress_bytes=892928`).
+- Clean surfaces: no QUIC loss/congestion/blocking deltas, no send-slice
+  zero/errors, no TUN flush failure, no terminal pending reap, no terminal late
+  remote payload.
+- Correct behavior: add pressure-gated pre-payload and maintenance TUN RX drain
+  before more remote bytes are accepted/flushed. Keep it bounded and off below
+  the existing egress credit edge.
+
+## 2026-07-06 - Knife14ci startup auth failure was transient, not config mismatch
+
+- Stage: first Knife14ci VPS suite attempt.
+- Failed bundle:
+  `/tmp/mini_vpn/knife14ci_adaptive_ack_drain_20260707_0208/mvpn_knife14ci_adaptive_ack_drain_usclient_suite_20260707_020847.tar.gz`
+- Symptom: client-tun exited during startup with
+  `tuic auth finish: sending stopped by peer: error 0`.
+- Checks: `.33` sing-box was active with `NRestarts=0`, config check passed,
+  `.27` and `.33` time skew was `0s`, NTP was synchronized, and no-secret
+  comparison showed UUID/password/ALPN/SNI all matched exactly.
+- Resolution: a 20s client-tun smoke immediately after the failure connected
+  successfully, and the retry suite reached P1. Treat this as a transient
+  TUIC/QUIC entry failure unless it repeats three times in a row.
+- Correct behavior: when this appears, run no-secret config/time checks and a
+  short startup smoke before restarting sing-box or changing mini_vpn code.
+
+## 2026-07-06 - .27 non-login shell lacks cargo and rg
+
+- Stage: Knife14ci `.27` verification.
+- Symptom: `ssh ... 'cargo test ...'` failed with `cargo: command not found`;
+  `rg` was also unavailable on `.27`.
+- Correct behavior: use `source ~/.cargo/env && cd /home/ubuntu/mini_vpn` for
+  remote cargo commands, and use `grep` on `.27` unless `rg` is installed.
+
 ## 2026-07-06 - Knife14ch VPS failed before pressure debt could prove throughput
 
 - Stage: Knife14ch adaptive pressure credit debt VPS acceptance.
