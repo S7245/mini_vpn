@@ -2777,3 +2777,22 @@ worth cleaning up separately.
   design must clock downlink acceptance from actual local egress progress and
   must parse final lifecycle/drop snapshots before declaring pending/close/reap
   accounting clean.
+
+## 2026-07-06 - Knife14cb adds suite-level final lifecycle summaries
+
+- Stage: Knife14cb parser/reporting patch after Knife14ca showed low-RTT
+  attribution summaries can miss post-probe close/drop lines.
+- Outcome: the US-client tunnel suite now emits final lifecycle summaries for
+  both the whole suite and the post-reverse-first tail when that probe ran.
+- TDD: the RED self-test reproduced Knife14ca-style post-summary evidence:
+  `pending=566509`, `close_pending_class=active_send_capable`,
+  `headroom_deferred_bytes=3317103134`, and cumulative TUN feedback
+  `drop_delta_total=2691`. The GREEN parser reports those fields as
+  `final_pending_at_close`, `final_downlink_flush`, and
+  `final_tun_egress_feedback`.
+- Local gates passed: `bash scripts/knife14b-usclient-tunnel-suite.sh
+  --self-test`, `bash scripts/knife14b-lowrtt-probe.sh --self-test`, shell
+  syntax checks for both scripts, and `git diff --check`.
+- Reusable rule: final acceptance must include lifecycle/drop events emitted
+  after the per-probe attribution block. A clean low-RTT summary is not enough
+  when final snapshots later reveal pending bytes or TUN egress drops.

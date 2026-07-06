@@ -230,6 +230,276 @@ normalize_downlink_backpressure_env() {
   DOWNLINK_BACKPRESSURE_AUTO_REASON="legacy_512k_for_scaled_tx_buffer"
 }
 
+summarize_final_lifecycle_window() {
+  local start_line="${1:-0}"
+  local title="${2:-final}"
+
+  awk -v start_line="$start_line" -v title="$title" '
+    function numeric_token(token, key, value) {
+      value = token
+      sub("^" key "=", "", value)
+      gsub(/[^0-9]/, "", value)
+      if (value == "") {
+        return 0
+      }
+      return value + 0
+    }
+
+    function text_token(token, key, value) {
+      value = token
+      sub("^" key "=", "", value)
+      return value
+    }
+
+    function update_downlink_maxima() {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^flush_attempts=/) {
+          value = numeric_token($i, "flush_attempts")
+          if (value > max_flush_attempts) {
+            max_flush_attempts = value
+          }
+        } else if ($i ~ /^send_queue_max=/) {
+          value = numeric_token($i, "send_queue_max")
+          if (value > max_send_queue_max) {
+            max_send_queue_max = value
+          }
+        } else if ($i ~ /^may_recv_false=/) {
+          value = numeric_token($i, "may_recv_false")
+          if (value > max_may_recv_false) {
+            max_may_recv_false = value
+          }
+        } else if ($i ~ /^headroom_limited_calls=/) {
+          value = numeric_token($i, "headroom_limited_calls")
+          if (value > max_headroom_limited) {
+            max_headroom_limited = value
+          }
+        } else if ($i ~ /^headroom_deferred_bytes=/) {
+          value = numeric_token($i, "headroom_deferred_bytes")
+          if (value > max_headroom_deferred_bytes) {
+            max_headroom_deferred_bytes = value
+          }
+        } else if ($i ~ /^send_slice_zero=/) {
+          value = numeric_token($i, "send_slice_zero")
+          if (value > max_send_slice_zero) {
+            max_send_slice_zero = value
+          }
+        } else if ($i ~ /^send_slice_errors=/) {
+          value = numeric_token($i, "send_slice_errors")
+          if (value > max_send_slice_errors) {
+            max_send_slice_errors = value
+          }
+        } else if ($i ~ /^tun_flush_tx_failures=/) {
+          value = numeric_token($i, "tun_flush_tx_failures")
+          if (value > max_tun_flush_failures) {
+            max_tun_flush_failures = value
+          }
+        } else if ($i ~ /^tun_flush_deferred=/) {
+          value = numeric_token($i, "tun_flush_deferred")
+          if (value > max_tun_flush_deferred) {
+            max_tun_flush_deferred = value
+          }
+        }
+      }
+    }
+
+    NR <= start_line {
+      next
+    }
+
+    /tcp-downlink-flush/ {
+      update_downlink_maxima()
+    }
+
+    /tcp-handle-close/ {
+      pending = 0
+      close_pending_class = ""
+      close_egress_class = ""
+      close_egress_bytes = 0
+      close_egress_drain_candidate = 0
+      terminal_pending = 0
+      update_downlink_maxima()
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^pending=/) {
+          pending = numeric_token($i, "pending")
+        } else if ($i ~ /^close_pending_bytes=/) {
+          pending = numeric_token($i, "close_pending_bytes")
+        } else if ($i ~ /^close_pending_class=/) {
+          close_pending_class = text_token($i, "close_pending_class")
+        } else if ($i ~ /^close_egress_bytes=/) {
+          close_egress_bytes = numeric_token($i, "close_egress_bytes")
+        } else if ($i ~ /^close_egress_class=/) {
+          close_egress_class = text_token($i, "close_egress_class")
+        } else if ($i == "close_egress_drain_candidate=true") {
+          close_egress_drain_candidate = 1
+        } else if ($i ~ /^terminal_pending_reap_bytes=/) {
+          terminal_pending = numeric_token($i, "terminal_pending_reap_bytes")
+        }
+      }
+      if (pending > 0) {
+        pending_events++
+        pending_bytes += pending
+        if (pending > max_pending_bytes) {
+          max_pending_bytes = pending
+        }
+        if (close_pending_class == "active_send_capable" ||
+            close_pending_class == "inactive_send_capable") {
+          pending_send_capable_events++
+          pending_send_capable_bytes += pending
+        } else if (close_pending_class == "active_no_send") {
+          pending_active_no_send_events++
+          pending_active_no_send_bytes += pending
+        } else if (close_pending_class == "terminal_closed_no_send") {
+          pending_terminal_events++
+          pending_terminal_bytes += pending
+        }
+      }
+      if (terminal_pending > 0) {
+        terminal_pending_events++
+        terminal_pending_bytes += terminal_pending
+        if (terminal_pending > max_terminal_pending_bytes) {
+          max_terminal_pending_bytes = terminal_pending
+        }
+      }
+      if (close_egress_bytes > 0) {
+        egress_events++
+        egress_bytes += close_egress_bytes
+        if (close_egress_bytes > max_egress_bytes) {
+          max_egress_bytes = close_egress_bytes
+        }
+        if (close_egress_class == "active_send_capable" ||
+            close_egress_class == "inactive_send_capable") {
+          egress_send_capable_events++
+          egress_send_capable_bytes += close_egress_bytes
+        } else if (close_egress_class == "active_no_send") {
+          egress_active_no_send_events++
+          egress_active_no_send_bytes += close_egress_bytes
+        } else if (close_egress_class == "terminal_closed_no_send") {
+          egress_terminal_events++
+          egress_terminal_bytes += close_egress_bytes
+        }
+        if (close_egress_drain_candidate == 1) {
+          egress_drain_candidate_events++
+          egress_drain_candidate_bytes += close_egress_bytes
+        }
+      }
+    }
+
+    /tcp-tun-egress[[:space:]]/ {
+      runtime_tun_samples++
+      runtime_delta = ""
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^tx_dropped_delta=/) {
+          runtime_delta = $i
+          sub(/^tx_dropped_delta=/, "", runtime_delta)
+        }
+      }
+      if (runtime_delta ~ /^[0-9]+$/) {
+        runtime_delta += 0
+        runtime_drop_delta_total += runtime_delta
+        if (runtime_delta > 0) {
+          runtime_drop_events++
+        }
+        if (runtime_delta > max_runtime_delta) {
+          max_runtime_delta = runtime_delta
+        }
+      }
+    }
+
+    /tcp-tun-egress-feedback/ {
+      feedback_delta = ""
+      for (i = 1; i <= NF; i++) {
+        if ($i == "paused=true") {
+          feedback_pause_edges++
+        } else if ($i == "paused=false") {
+          feedback_resume_edges++
+        } else if ($i ~ /^tx_dropped_delta=/) {
+          feedback_delta = $i
+          sub(/^tx_dropped_delta=/, "", feedback_delta)
+        } else if ($i ~ /^drop_events=/) {
+          value = numeric_token($i, "drop_events")
+          if (value > feedback_drop_events_from_log) {
+            feedback_drop_events_from_log = value
+          }
+        } else if ($i ~ /^drop_delta_total=/) {
+          value = numeric_token($i, "drop_delta_total")
+          if (value > feedback_drop_delta_total_from_log) {
+            feedback_drop_delta_total_from_log = value
+          }
+        } else if ($i ~ /^max_delta=/) {
+          value = numeric_token($i, "max_delta")
+          if (value > max_feedback_delta) {
+            max_feedback_delta = value
+          }
+        } else if ($i ~ /^max_pressure=/) {
+          value = numeric_token($i, "max_pressure")
+          if (value > max_feedback_pressure) {
+            max_feedback_pressure = value
+          }
+        }
+      }
+      if (feedback_delta ~ /^[0-9]+$/) {
+        feedback_delta += 0
+        feedback_drop_delta_sum += feedback_delta
+        if (feedback_delta > 0) {
+          feedback_drop_events_from_delta++
+        }
+        if (feedback_delta > max_feedback_delta) {
+          max_feedback_delta = feedback_delta
+        }
+      }
+    }
+
+    END {
+      feedback_drop_events = feedback_drop_events_from_log
+      if (feedback_drop_events_from_delta > feedback_drop_events) {
+        feedback_drop_events = feedback_drop_events_from_delta
+      }
+      feedback_drop_delta_total = feedback_drop_delta_total_from_log
+      if (feedback_drop_delta_sum > feedback_drop_delta_total) {
+        feedback_drop_delta_total = feedback_drop_delta_sum
+      }
+
+      labels = ""
+      if (pending_events > 0) {
+        labels = labels == "" ? "final_pending_at_close" : labels "+final_pending_at_close"
+      }
+      if (pending_send_capable_events > 0) {
+        labels = labels == "" ? "final_pending_send_capable" : labels "+final_pending_send_capable"
+      }
+      if (terminal_pending_events > 0) {
+        labels = labels == "" ? "final_terminal_pending_reap" : labels "+final_terminal_pending_reap"
+      }
+      if (egress_events > 0) {
+        labels = labels == "" ? "final_egress_at_close" : labels "+final_egress_at_close"
+      }
+      if (egress_drain_candidate_events > 0) {
+        labels = labels == "" ? "final_egress_drain_candidate" : labels "+final_egress_drain_candidate"
+      }
+      if (runtime_drop_delta_total > 0) {
+        labels = labels == "" ? "final_runtime_tun_egress_drop" : labels "+final_runtime_tun_egress_drop"
+      }
+      if (feedback_drop_delta_total > 0) {
+        labels = labels == "" ? "final_tun_egress_feedback_drop" : labels "+final_tun_egress_feedback_drop"
+      }
+      if (max_headroom_limited > 0 || max_headroom_deferred_bytes > 0) {
+        labels = labels == "" ? "final_headroom_limited" : labels "+final_headroom_limited"
+      }
+      if (labels == "") {
+        labels = "final_no_pressure_signal"
+      }
+
+      print "- final_metrics_title: " title
+      printf "- final_pending_at_close: events=%d bytes=%d max_bytes=%d send_capable_events=%d send_capable_bytes=%d active_no_send_events=%d active_no_send_bytes=%d terminal_events=%d terminal_bytes=%d\n", pending_events, pending_bytes, max_pending_bytes, pending_send_capable_events, pending_send_capable_bytes, pending_active_no_send_events, pending_active_no_send_bytes, pending_terminal_events, pending_terminal_bytes
+      printf "- final_terminal_pending_reap: events=%d bytes=%d max_bytes=%d\n", terminal_pending_events, terminal_pending_bytes, max_terminal_pending_bytes
+      printf "- final_egress_at_close: events=%d bytes=%d max_bytes=%d send_capable_events=%d send_capable_bytes=%d active_no_send_events=%d active_no_send_bytes=%d terminal_events=%d terminal_bytes=%d drain_candidate_events=%d drain_candidate_bytes=%d\n", egress_events, egress_bytes, max_egress_bytes, egress_send_capable_events, egress_send_capable_bytes, egress_active_no_send_events, egress_active_no_send_bytes, egress_terminal_events, egress_terminal_bytes, egress_drain_candidate_events, egress_drain_candidate_bytes
+      printf "- final_downlink_flush: attempts=%d send_queue_max=%d may_recv_false=%d headroom_limited=%d headroom_deferred_bytes=%d send_slice_zero=%d send_slice_errors=%d tun_flush_failures=%d tun_flush_deferred=%d\n", max_flush_attempts, max_send_queue_max, max_may_recv_false, max_headroom_limited, max_headroom_deferred_bytes, max_send_slice_zero, max_send_slice_errors, max_tun_flush_failures, max_tun_flush_deferred
+      printf "- final_runtime_tun_egress: samples=%d drop_events=%d drop_delta_total=%d max_delta=%d\n", runtime_tun_samples, runtime_drop_events, runtime_drop_delta_total, max_runtime_delta
+      printf "- final_tun_egress_feedback: pause_edges=%d resume_edges=%d drop_events=%d drop_delta_total=%d max_delta=%d max_pressure_bytes=%d\n", feedback_pause_edges, feedback_resume_edges, feedback_drop_events, feedback_drop_delta_total, max_feedback_delta, max_feedback_pressure
+      print "- final_attribution: " labels
+    }
+  '
+}
+
 suite_self_test() {
   local sample expected actual help_text
 
@@ -350,6 +620,32 @@ EOF
   if grep -Eq 'hexdigest|sha256' <<<"$auth_script" ||
     grep -Eq 'print[(]f?"(uuid|password)=' <<<"$auth_script"; then
     echo "suite self-test failed: auth diagnostic script must not print secrets or derived hashes" >&2
+    return 1
+  fi
+
+  local final_log final_summary
+  final_log="$(cat <<'EOF'
+🔎 tcp-downlink-flush pending_total=0 pending_max=0 pending_high=585869 remote_to_global_rx_bytes=55599078 flush_attempts=4242 no_send_capacity=0 send_window_samples=4242 send_capacity_min=1048576 send_capacity_max=1048576 send_queue_max=720896 recv_queue_max=0 may_send_false=0 may_recv_false=0 send_slice_calls=4148 send_slice_accepted=55599078 send_slice_zero=0 send_slice_errors=0 budget_limited_calls=418 headroom_limited_calls=1094 headroom_deferred_bytes=203578857 send_slice_max_accepted=178048 tun_flush_tx_calls=3148 tun_flush_tx_failures=0 tun_flush_deferred=0 dirty_handles=1
+🔎 tcp-tun-egress-feedback paused=true reason=drop_delta tx_dropped_delta=1349 max_pressure=720896 total_pressure=1853914 high=524288 low=131072 drop_events=1 drop_delta_total=1349 max_delta=1349 pause_edges=1 resume_edges=0
+🔎 tcp-handle-close handle=SocketHandle(1) direction=local_to_remote reason=uplink_channel_closed state=Relaying pending=566509 pending_high=585869 remote_to_global_rx_bytes=56886483 flush_attempts=16139 no_send_capacity=0 send_window_samples=16139 send_capacity_min=1048576 send_capacity_max=1048576 send_queue_max=720896 recv_queue_max=0 may_send_false=0 may_recv_false=11897 send_slice_calls=4167 send_slice_accepted=56319974 send_slice_zero=0 send_slice_errors=0 budget_limited_calls=12291 headroom_limited_calls=12973 headroom_deferred_bytes=3317103134 send_slice_max_accepted=178048 tun_flush_tx_calls=3167 tun_flush_tx_failures=0 tun_flush_deferred=0 close_pending_class=active_send_capable close_pending_bytes=566509 terminal_pending_reap_bytes=0 close_egress_class=active_send_capable close_egress_bytes=720896 close_egress_drain_candidate=true tcp_state=CloseWait active=true can_send=true can_recv=false may_send=true may_recv=false send_capacity=1048576 send_queue=720896 recv_queue=0
+🔎 tcp-tun-egress if=tun0 status=delta tx_dropped_total=2691 tx_dropped_delta=122 global_rx_paused=true pending_total=0 pending_max=0 pending_high=0 remote_to_global_rx_bytes=0 tun_flush_tx_calls=0 dirty_handles=0
+🔎 tcp-tun-egress-feedback paused=true reason=drop_delta tx_dropped_delta=122 max_pressure=720896 total_pressure=1287405 high=524288 low=131072 drop_events=5 drop_delta_total=2691 max_delta=1349 pause_edges=1 resume_edges=0
+EOF
+)"
+  final_summary="$(printf '%s\n' "$final_log" | summarize_final_lifecycle_window 0 "self-test-final")"
+  if ! grep -q "final_pending_at_close: events=1 bytes=566509 max_bytes=566509 send_capable_events=1 send_capable_bytes=566509" <<<"$final_summary"; then
+    echo "suite self-test failed: final lifecycle summary missed send-capable pending close" >&2
+    printf '%s\n' "$final_summary" >&2
+    return 1
+  fi
+  if ! grep -q "final_tun_egress_feedback: pause_edges=2 resume_edges=0 drop_events=5 drop_delta_total=2691 max_delta=1349 max_pressure_bytes=720896" <<<"$final_summary"; then
+    echo "suite self-test failed: final lifecycle summary missed post-probe tun feedback drops" >&2
+    printf '%s\n' "$final_summary" >&2
+    return 1
+  fi
+  if ! grep -q "final_downlink_flush: attempts=16139 send_queue_max=720896 may_recv_false=11897 headroom_limited=12973 headroom_deferred_bytes=3317103134" <<<"$final_summary"; then
+    echo "suite self-test failed: final lifecycle summary missed close-line downlink maxima" >&2
+    printf '%s\n' "$final_summary" >&2
     return 1
   fi
 
@@ -1420,6 +1716,21 @@ run_lowrtt_probe() {
   return "$status"
 }
 
+append_final_lifecycle_summary() {
+  local start_line="$1"
+  local title="$2"
+
+  append ""
+  append "### Final Lifecycle Summary: $title"
+  if [[ -f "$CLIENT_LOG" ]]; then
+    append '```text'
+    summarize_final_lifecycle_window "$start_line" "$title" < "$CLIENT_LOG" | tee -a "$REPORT"
+    append '```'
+  else
+    append "client log not found: $CLIENT_LOG"
+  fi
+}
+
 diagnose_auth_failure() {
   append ""
   append "## TUIC Startup Diagnosis"
@@ -1876,6 +2187,10 @@ append "## Final Snapshots"
 run_cmd ip route get "$TARGET" || true
 run_cmd ip route get "$EXIT_HOST" || true
 run_cmd ip -s link show "$TUN_IF" || true
+append_final_lifecycle_summary 0 "whole-suite-final"
+if [[ -n "${REVERSE_FIRST_END_LINE:-}" ]]; then
+  append_final_lifecycle_summary "$REVERSE_FIRST_END_LINE" "post-reverse-first-final"
+fi
 append ""
 append "### Final mini_vpn Log Tail"
 append_block text "$(tail -n 240 "$CLIENT_LOG" 2>/dev/null || true)"
