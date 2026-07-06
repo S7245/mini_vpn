@@ -1,5 +1,32 @@
 # Learnings
 
+## 2026-07-06 - Knife14cf pressure debt reduces drops but not burst/stall throughput
+
+- Stage docs:
+  `docs/tech/2026-07-06-knife14cf-proactive-egress-credit-gate-spec.md`,
+  `docs/tech/2026-07-06-knife14cf-proactive-egress-credit-gate-plan.md`,
+  `docs/tech/2026-07-06-knife14cf-proactive-egress-credit-gate-results.md`
+- Log bundle:
+  `/tmp/mini_vpn/knife14cf_pressure_credit_20260707_0112/mvpn_knife14cf_pressure_credit_usclient_suite_20260707_011213.tar.gz`
+- Outcome: local TDD/regression gates passed, and proactive pressure credit
+  engaged on VPS, but clean reverse-first P1 still failed at
+  `20.5/19.5 Mbit/s`.
+- What worked: pressure debt was visible in `tcp-egress-credit-debt` and
+  `tcp-downlink-flush`; probe TUN drops fell from Knife14ce's `2813` to `539`,
+  and feedback recovered in the probe (`pause_edges=1 resume_edges=1`).
+- What did not work: local tx-queue pressure still reached
+  `send_queue_max=892928`, the close tail still had active send-capable backlog
+  (`pending=574203`, `close_egress_bytes=892928`), and the data TUIC stream
+  still showed multi-second read gaps (`max_read_gap_ms=4325`).
+- Clean surfaces: no current-window TUIC `fail auth`, healthy `.27 -> .77` and
+  `.33 -> .77` baselines, no QUIC loss/congestion/blocking deltas, no
+  `send_slice` zero/errors, no TUN flush failures, and no terminal pending reap.
+- Reusable rule: proactive debt/threshold gating can reduce damage signals but
+  is not the full Knife14 fix when throughput remains burst/stall. Stop adding
+  more static debt as the primary repair; evaluate bounded receive-path
+  decoupling so TUIC stream/window progress is not coarsely tied to local TUN
+  egress bursts.
+
 ## 2026-07-06 - Knife14ce proves post-drop credit debt is too late
 
 - Stage docs:

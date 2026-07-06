@@ -1,5 +1,40 @@
 # Errors
 
+## 2026-07-06 - Knife14cf VPS failed after proactive pressure credit reduced drops
+
+- Stage: Knife14cf proactive egress credit gate VPS acceptance.
+- Failed bundle:
+  `/tmp/mini_vpn/knife14cf_pressure_credit_20260707_0112/mvpn_knife14cf_pressure_credit_usclient_suite_20260707_011213.tar.gz`
+- Symptom: reverse-first P1 reached only `20.5/19.5 Mbit/s`, with many
+  zero-throughput iperf intervals, even though direct `.27 -> .77` and
+  `.33 -> .77` baselines were healthy.
+- Important discriminator: proactive pressure debt engaged and reduced probe
+  TUN drops (`tun_tx_dropped_delta=539`, down from Knife14ce's `2813`), and the
+  feedback gate recovered during the probe (`pause_edges=1 resume_edges=1`).
+- Remaining root for this stage: local burst/stall cadence still reached the
+  hard smoltcp tx-queue edge (`send_queue_max=892928`) and closed with active
+  send-capable backlog (`pending=574203`, `close_egress_bytes=892928`).
+- Rejected next moves: do not keep adding static pressure/drop debt, stale pool
+  changes, iperf3 tuning, sing-box auth/time/config work, QUIC congestion work,
+  TUN queue length tuning, or close/reap hiding.
+- Correct behavior: re-evaluate the receive-path architecture. The next patch
+  should test bounded decoupling between TUIC stream reads/global receive
+  progress and local TUN egress pressure, while keeping per-flow pending and
+  close accounting bounded and observable.
+
+## 2026-07-06 - Knife14cf rsync must preserve repository paths and SSH key
+
+- Stage: Knife14cf local-to-`.27` sync.
+- Symptom A: a first `rsync` attempt without `-i ~/.ssh/vpn` failed with SSH
+  `Permission denied`.
+- Correct behavior A: use `rsync -e 'ssh -i ~/.ssh/vpn ...'` for `.27`, `.33`,
+  and `.77` syncs from the Mac mini.
+- Symptom B: a second sync without `-R` copied selected files into
+  `/home/ubuntu/mini_vpn/` root instead of their repository subdirectories.
+- Correct behavior B: for focused file syncs, use `rsync -avR` from the repo
+  root or explicit destination directories. Remove any accidental root-level
+  copies before running VPS tests so the remote worktree stays understandable.
+
 ## 2026-07-06 - Knife14ce VPS failed because drop-debt feedback arrived after the hot burst
 
 - Stage: Knife14ce drop-aware egress credit VPS acceptance.
