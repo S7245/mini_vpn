@@ -458,6 +458,55 @@ summarize_metrics_window() {
       }
     }
 
+    /tcp-global-rx-backpressure/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "paused=true") {
+          global_receive_pause_count++
+        } else if ($i == "paused=false") {
+          global_receive_resume_count++
+        } else if ($i ~ /^max_pending=/) {
+          value = numeric_token($i, "max_pending")
+          if (value > max_global_receive_pending) {
+            max_global_receive_pending = value
+          }
+        } else if ($i ~ /^total_pending=/) {
+          value = numeric_token($i, "total_pending")
+          if (value > max_global_receive_total_pending) {
+            max_global_receive_total_pending = value
+          }
+        } else if ($i ~ /^max_tx_queue=/) {
+          value = numeric_token($i, "max_tx_queue")
+          if (value > max_global_receive_tx_queue) {
+            max_global_receive_tx_queue = value
+          }
+        } else if ($i ~ /^receive_high=/) {
+          value = numeric_token($i, "receive_high")
+          if (value > max_global_receive_high) {
+            max_global_receive_high = value
+          }
+        } else if ($i ~ /^receive_low=/) {
+          value = numeric_token($i, "receive_low")
+          if (value > max_global_receive_low) {
+            max_global_receive_low = value
+          }
+        } else if ($i ~ /^receive_total_high=/) {
+          value = numeric_token($i, "receive_total_high")
+          if (value > max_global_receive_total_high) {
+            max_global_receive_total_high = value
+          }
+        } else if ($i ~ /^receive_total_low=/) {
+          value = numeric_token($i, "receive_total_low")
+          if (value > max_global_receive_total_low) {
+            max_global_receive_total_low = value
+          }
+        } else if ($i == "local_egress_paused=true") {
+          global_receive_local_egress_paused = 1
+        } else if ($i == "tun_feedback_paused=true") {
+          global_receive_tun_feedback_paused = 1
+        }
+      }
+    }
+
     /tcp-downlink-backpressure/ {
       for (i = 1; i <= NF; i++) {
         if ($i == "paused=true") {
@@ -1642,6 +1691,9 @@ summarize_metrics_window() {
       if (down_pause_count > 0) {
         add_label("local_downlink_backpressure")
       }
+      if (global_receive_pause_count > 0) {
+        add_label("local_global_rx_receive_window")
+      }
       local_pressure = 0
       if (tun_tx_delta != "unknown" && (tun_tx_delta + 0) > 0) {
         local_pressure = 1
@@ -1649,6 +1701,7 @@ summarize_metrics_window() {
       if (runtime_tun_drop_delta_total > 0 ||
           tun_feedback_pause_count > 0 ||
           down_pause_count > 0 ||
+          global_receive_pause_count > 0 ||
           max_tun_flush_deferred > 0) {
         local_pressure = 1
       }
@@ -1868,6 +1921,7 @@ summarize_metrics_window() {
       printf "- tcp_pool: opens=%d conns=%s reconnects=%d reasons=%s\n", open_count, open_conns, reconnect_count, reconnect_reasons
       printf "- local_write_pressure: events=%d max_wait_ms=%.3f max_payload_bytes=%d\n", local_write_count, max_local_wait_us / 1000, max_local_payload
       printf "- global_rx_pressure: events=%d max_wait_ms=%.3f queue_used_max=%d queue_capacity=%d\n", global_rx_count, max_global_wait_us / 1000, max_global_rx_queue_used, max_global_rx_queue_capacity
+      printf "- global_rx_receive: pause_edges=%d resume_edges=%d max_pending_bytes=%d max_total_pending_bytes=%d max_tx_queue_bytes=%d receive_high=%d receive_low=%d receive_total_high=%d receive_total_low=%d local_egress_paused=%d tun_feedback_paused=%d\n", global_receive_pause_count, global_receive_resume_count, max_global_receive_pending, max_global_receive_total_pending, max_global_receive_tx_queue, max_global_receive_high, max_global_receive_low, max_global_receive_total_high, max_global_receive_total_low, global_receive_local_egress_paused, global_receive_tun_feedback_paused
       printf "- downlink_backpressure: pause_edges=%d resume_edges=%d max_pending_bytes=%d max_total_pending_bytes=%d max_tx_queue_bytes=%d max_total_tx_queue_bytes=%d max_pressure_bytes=%d max_total_pressure_bytes=%d\n", down_pause_count, down_resume_count, max_down_pending, max_down_total, max_down_tx_queue, max_down_total_tx_queue, max_down_pressure, max_down_total_pressure
       printf "- downlink_flush: attempts=%d no_send_capacity=%d send_window_samples=%d send_capacity_min=%d send_capacity_max=%d send_queue_max=%d recv_queue_max=%d may_send_false=%d may_recv_false=%d no_send_streak_max=%d no_send_pending_max=%d send_slice_calls=%d accepted_bytes=%d zero=%d errors=%d budget_limited=%d headroom_limited=%d headroom_deferred_bytes=%d drain_credit_granted_bytes=%d drain_credit_planned_bytes=%d drain_credit_used_bytes=%d drop_credit_debt_bytes=%d drop_credit_debt_paid_bytes=%d drop_credit_blocked_bytes=%d pressure_credit_debt_bytes=%d pressure_credit_debt_paid_bytes=%d pressure_credit_blocked_bytes=%d hard_edge_guard_bytes=%d hard_edge_guard_limited=%d hard_edge_guard_deferred_bytes=%d max_accepted_bytes=%d tun_flush_calls=%d tun_flush_failures=%d tun_flush_deferred=%d pending_total_max=%d pending_max=%d pending_high=%d remote_to_global_rx_bytes=%d terminal_late_remote_payload_bytes=%d terminal_late_remote_payload_events=%d dirty_handles_max=%d\n", max_flush_attempts, max_no_send_capacity, max_send_window_samples, min_send_capacity_min, max_send_capacity_max, max_send_queue_max, max_recv_queue_max, max_may_send_false, max_may_recv_false, max_no_send_capacity_streak, max_no_send_capacity_pending, max_flush_send_calls, max_flush_accepted, max_flush_zero, max_flush_errors, max_budget_limited, max_headroom_limited, max_headroom_deferred_bytes, max_drain_credit_granted_bytes, max_drain_credit_planned_bytes, max_drain_credit_used_bytes, max_drop_credit_debt_bytes, max_drop_credit_debt_paid_bytes, max_drop_credit_blocked_bytes, max_pressure_credit_debt_bytes, max_pressure_credit_debt_paid_bytes, max_pressure_credit_blocked_bytes, max_hard_edge_guard_bytes, max_hard_edge_guard_limited, max_hard_edge_guard_deferred_bytes, max_send_slice_max_accepted, max_tun_flush_calls, max_tun_flush_failures, max_tun_flush_deferred, max_flush_pending_total, max_flush_pending_max, max_flush_pending_high, max_flush_remote_bytes, max_flush_terminal_late_remote_bytes, max_flush_terminal_late_remote_events, max_dirty_handles
       printf "- tcp_lifecycle: transitions=%d closed_edges=%d terminal_candidates=%d max_pending_bytes=%d max_remote_to_global_rx_bytes=%d sources=%s states=%s\n", lifecycle_transitions, lifecycle_closed_edges, lifecycle_terminal_candidates, max_lifecycle_pending, max_lifecycle_remote_bytes, lifecycle_sources, lifecycle_states
@@ -1930,6 +1984,8 @@ EOF_IPERF
 🔎 tcp-local-write-pressure handle=SocketHandle(1) wait_us=3607684 payload_bytes=64960 pressure_events=1
 🔎 tcp-downlink-backpressure paused=true max_pending=2151649 total_pending=2151649 max_tx_queue=1048576 total_tx_queue=1048576 max_pressure=2151649 total_pressure=3200225 high=2097120 low=524280
 🔎 tcp-downlink-backpressure paused=false max_pending=524233 total_pending=524233 max_tx_queue=524280 total_tx_queue=524280 max_pressure=524280 total_pressure=1048513 high=2097120 low=524280
+🔎 tcp-global-rx-backpressure paused=true max_pending=8388480 total_pending=8388480 max_tx_queue=1048576 total_tx_queue=1048576 max_pressure=8388480 total_pressure=9437056 receive_high=8388480 receive_low=2097120 receive_total_high=16776960 receive_total_low=4194240 local_egress_paused=true tun_feedback_paused=false
+🔎 tcp-global-rx-backpressure paused=false max_pending=2097120 total_pending=2097120 max_tx_queue=524280 total_tx_queue=524280 max_pressure=2097120 total_pressure=2611400 receive_high=8388480 receive_low=2097120 receive_total_high=16776960 receive_total_low=4194240 local_egress_paused=false tun_feedback_paused=false
 🔎 tcp-downlink-flush pending_total=524233 pending_max=524233 pending_high=2151649 remote_to_global_rx_bytes=3145728 terminal_late_remote_payload_bytes=128 terminal_late_remote_payload_events=1 flush_attempts=23 no_send_capacity=7 send_window_samples=23 send_capacity_min=0 send_capacity_max=1048576 send_queue_max=1048576 recv_queue_max=4096 may_send_false=1 may_recv_false=1 no_send_capacity_streak_max=7 no_send_capacity_pending_max=524233 send_slice_calls=16 send_slice_accepted=2621440 send_slice_zero=2 send_slice_errors=0 budget_limited_calls=9 headroom_limited_calls=4 headroom_deferred_bytes=4096 drain_credit_granted_bytes=8192 drain_credit_planned_bytes=4096 drain_credit_used_bytes=2048 drop_credit_debt_bytes=1024 drop_credit_debt_paid_bytes=512 drop_credit_blocked_bytes=1536 pressure_credit_debt_bytes=2048 pressure_credit_debt_paid_bytes=256 pressure_credit_blocked_bytes=768 hard_edge_guard_bytes=24576 hard_edge_guard_limited_calls=2 hard_edge_guard_deferred_bytes=8192 send_slice_max_accepted=262144 tun_flush_tx_calls=14 tun_flush_tx_failures=1 tun_flush_deferred=3 dirty_handles=1
 🔎 tcp-tun-rx-drain attempts=4 packets=11 tcp=9 dns=1 udp=1 budget_exhausted=1 would_block=3 errors=0
 🔎 tcp-tun-egress if=tun0 status=delta tx_dropped_total=1523 tx_dropped_delta=1423 global_rx_paused=true pending_total=524233 pending_max=524233 pending_high=2151649 remote_to_global_rx_bytes=3145728 tun_flush_tx_calls=14 dirty_handles=1
@@ -1967,6 +2023,7 @@ EOF_LOG
   assert_contains "$summary" "tcp_pool: opens=1 conns=3 reconnects=1 reasons=stale_tcp_pool_slot"
   assert_contains "$summary" "local_write_pressure: events=1 max_wait_ms=3607.684"
   assert_contains "$summary" "global_rx_pressure: events=0 max_wait_ms=0.000 queue_used_max=0 queue_capacity=0"
+  assert_contains "$summary" "global_rx_receive: pause_edges=1 resume_edges=1 max_pending_bytes=8388480 max_total_pending_bytes=8388480 max_tx_queue_bytes=1048576 receive_high=8388480 receive_low=2097120 receive_total_high=16776960 receive_total_low=4194240 local_egress_paused=1 tun_feedback_paused=0"
   assert_contains "$summary" "downlink_backpressure: pause_edges=1 resume_edges=1 max_pending_bytes=2151649 max_total_pending_bytes=2151649 max_tx_queue_bytes=1048576 max_total_tx_queue_bytes=1048576 max_pressure_bytes=2151649 max_total_pressure_bytes=3200225"
   assert_contains "$summary" "downlink_flush: attempts=23 no_send_capacity=7 send_window_samples=23 send_capacity_min=0 send_capacity_max=1048576 send_queue_max=1048576 recv_queue_max=4096 may_send_false=1 may_recv_false=1 no_send_streak_max=7 no_send_pending_max=524233 send_slice_calls=16 accepted_bytes=2621440 zero=2 errors=0 budget_limited=9 headroom_limited=4 headroom_deferred_bytes=4096 drain_credit_granted_bytes=8192 drain_credit_planned_bytes=4096 drain_credit_used_bytes=2048 drop_credit_debt_bytes=1024 drop_credit_debt_paid_bytes=512 drop_credit_blocked_bytes=1536 pressure_credit_debt_bytes=2048 pressure_credit_debt_paid_bytes=256 pressure_credit_blocked_bytes=768 hard_edge_guard_bytes=24576 hard_edge_guard_limited=2 hard_edge_guard_deferred_bytes=8192 max_accepted_bytes=262144 tun_flush_calls=14 tun_flush_failures=1 tun_flush_deferred=3"
   assert_contains "$summary" "terminal_late_remote_payload_bytes=128 terminal_late_remote_payload_events=1"
@@ -1982,7 +2039,7 @@ EOF_LOG
   assert_contains "$summary" "runtime_tun_egress: samples=1 drop_events=1 drop_delta_total=1423 max_delta=1423 unavailable=0 resets=0"
   assert_contains "$summary" "tun_rx_drain: attempts=4 packets=11 tcp=9 dns=1 udp=1 budget_exhausted=1 would_block=3 errors=0"
   assert_contains "$summary" "max_lost_bytes_delta=439956"
-  assert_contains "$summary" "attribution: quic_loss_congestion+local_write_pressure+local_tun_egress_drop+local_drop_credit+local_pressure_credit+local_downlink_backpressure+terminal_late_remote_payload+terminal_pending_reap"
+  assert_contains "$summary" "attribution: quic_loss_congestion+local_write_pressure+local_tun_egress_drop+local_drop_credit+local_pressure_credit+local_downlink_backpressure+local_global_rx_receive_window+terminal_late_remote_payload+terminal_pending_reap"
   assert_contains "$summary" "pending_at_close+pending_close_active_no_send"
   assert_contains "$summary" "egress_at_close+egress_close_send_capable+egress_close_drain_candidate"
 
@@ -2333,7 +2390,7 @@ IPERF_BUSY_WAIT_SECS="${IPERF_BUSY_WAIT_SECS:-5}"
 POST_IPERF_METRICS_SETTLE_SECS="${POST_IPERF_METRICS_SETTLE_SECS:-2}"
 PROBE_ORDER="${PROBE_ORDER:-forward-first}"
 OUT="${OUT:-/tmp/mvpn_knife14b_lowrtt_$(date +%Y%m%d_%H%M%S).md}"
-METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tuic-open-tcp|tuic-tcp-stream-first-rx|tuic-tcp-stream-read-gap|tuic-tcp-stream-pending|tuic-tcp-stream-close|tuic-tcp-pool-reconnect|tcp-relay-live|tcp-relay-write-half-closed|tcp-relay-close|tcp-handle-close|tcp-deferred-close-egress|tcp-lifecycle-transition|tcp-reverse-window|tcp-local-write-pressure|tcp-global-rx-pressure|tcp-downlink-backpressure|tcp-downlink-flush|tcp-tun-rx-drain|tcp-tun-egress'
+METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tuic-open-tcp|tuic-tcp-stream-first-rx|tuic-tcp-stream-read-gap|tuic-tcp-stream-pending|tuic-tcp-stream-close|tuic-tcp-pool-reconnect|tcp-relay-live|tcp-relay-write-half-closed|tcp-relay-close|tcp-handle-close|tcp-deferred-close-egress|tcp-lifecycle-transition|tcp-reverse-window|tcp-local-write-pressure|tcp-global-rx-pressure|tcp-global-rx-backpressure|tcp-downlink-backpressure|tcp-downlink-flush|tcp-tun-rx-drain|tcp-tun-egress'
 
 case "$PROBE_ORDER" in
   forward-first|reverse-first|forward-only|reverse-only) ;;

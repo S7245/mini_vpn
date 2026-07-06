@@ -370,6 +370,36 @@ summarize_final_lifecycle_window() {
       update_downlink_maxima()
     }
 
+    /tcp-global-rx-backpressure/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "paused=true") {
+          global_receive_pause_edges++
+        } else if ($i == "paused=false") {
+          global_receive_resume_edges++
+        } else if ($i ~ /^max_pending=/) {
+          value = numeric_token($i, "max_pending")
+          if (value > max_global_receive_pending) {
+            max_global_receive_pending = value
+          }
+        } else if ($i ~ /^total_pending=/) {
+          value = numeric_token($i, "total_pending")
+          if (value > max_global_receive_total_pending) {
+            max_global_receive_total_pending = value
+          }
+        } else if ($i ~ /^receive_high=/) {
+          value = numeric_token($i, "receive_high")
+          if (value > max_global_receive_high) {
+            max_global_receive_high = value
+          }
+        } else if ($i ~ /^receive_low=/) {
+          value = numeric_token($i, "receive_low")
+          if (value > max_global_receive_low) {
+            max_global_receive_low = value
+          }
+        }
+      }
+    }
+
     /tcp-handle-close/ {
       pending = 0
       close_pending_class = ""
@@ -556,6 +586,9 @@ summarize_final_lifecycle_window() {
       if (max_hard_edge_guard_limited > 0 || max_hard_edge_guard_deferred_bytes > 0) {
         labels = labels == "" ? "final_hard_edge_guard" : labels "+final_hard_edge_guard"
       }
+      if (global_receive_pause_edges > 0) {
+        labels = labels == "" ? "final_global_rx_receive_window" : labels "+final_global_rx_receive_window"
+      }
       if (labels == "") {
         labels = "final_no_pressure_signal"
       }
@@ -564,6 +597,7 @@ summarize_final_lifecycle_window() {
       printf "- final_pending_at_close: events=%d bytes=%d max_bytes=%d send_capable_events=%d send_capable_bytes=%d active_no_send_events=%d active_no_send_bytes=%d terminal_events=%d terminal_bytes=%d\n", pending_events, pending_bytes, max_pending_bytes, pending_send_capable_events, pending_send_capable_bytes, pending_active_no_send_events, pending_active_no_send_bytes, pending_terminal_events, pending_terminal_bytes
       printf "- final_terminal_pending_reap: events=%d bytes=%d max_bytes=%d\n", terminal_pending_events, terminal_pending_bytes, max_terminal_pending_bytes
       printf "- final_egress_at_close: events=%d bytes=%d max_bytes=%d send_capable_events=%d send_capable_bytes=%d active_no_send_events=%d active_no_send_bytes=%d terminal_events=%d terminal_bytes=%d drain_candidate_events=%d drain_candidate_bytes=%d\n", egress_events, egress_bytes, max_egress_bytes, egress_send_capable_events, egress_send_capable_bytes, egress_active_no_send_events, egress_active_no_send_bytes, egress_terminal_events, egress_terminal_bytes, egress_drain_candidate_events, egress_drain_candidate_bytes
+      printf "- final_global_rx_receive: pause_edges=%d resume_edges=%d max_pending_bytes=%d max_total_pending_bytes=%d receive_high=%d receive_low=%d\n", global_receive_pause_edges, global_receive_resume_edges, max_global_receive_pending, max_global_receive_total_pending, max_global_receive_high, max_global_receive_low
       printf "- final_downlink_flush: attempts=%d send_queue_max=%d may_recv_false=%d headroom_limited=%d headroom_deferred_bytes=%d drain_credit_granted_bytes=%d drain_credit_planned_bytes=%d drain_credit_used_bytes=%d drop_credit_debt_bytes=%d drop_credit_debt_paid_bytes=%d drop_credit_blocked_bytes=%d pressure_credit_debt_bytes=%d pressure_credit_debt_paid_bytes=%d pressure_credit_blocked_bytes=%d hard_edge_guard_bytes=%d hard_edge_guard_limited=%d hard_edge_guard_deferred_bytes=%d send_slice_zero=%d send_slice_errors=%d tun_flush_failures=%d tun_flush_deferred=%d\n", max_flush_attempts, max_send_queue_max, max_may_recv_false, max_headroom_limited, max_headroom_deferred_bytes, max_drain_credit_granted_bytes, max_drain_credit_planned_bytes, max_drain_credit_used_bytes, max_drop_credit_debt_bytes, max_drop_credit_debt_paid_bytes, max_drop_credit_blocked_bytes, max_pressure_credit_debt_bytes, max_pressure_credit_debt_paid_bytes, max_pressure_credit_blocked_bytes, max_hard_edge_guard_bytes, max_hard_edge_guard_limited, max_hard_edge_guard_deferred_bytes, max_send_slice_zero, max_send_slice_errors, max_tun_flush_failures, max_tun_flush_deferred
       printf "- final_runtime_tun_egress: samples=%d drop_events=%d drop_delta_total=%d max_delta=%d\n", runtime_tun_samples, runtime_drop_events, runtime_drop_delta_total, max_runtime_delta
       printf "- final_tun_egress_feedback: pause_edges=%d resume_edges=%d drop_events=%d drop_delta_total=%d max_delta=%d max_pressure_bytes=%d\n", feedback_pause_edges, feedback_resume_edges, feedback_drop_events, feedback_drop_delta_total, max_feedback_delta, max_feedback_pressure
@@ -698,6 +732,8 @@ EOF
   local final_log final_summary
   final_log="$(cat <<'EOF'
 🔎 tcp-downlink-flush pending_total=0 pending_max=0 pending_high=585869 remote_to_global_rx_bytes=55599078 flush_attempts=4242 no_send_capacity=0 send_window_samples=4242 send_capacity_min=1048576 send_capacity_max=1048576 send_queue_max=720896 recv_queue_max=0 may_send_false=0 may_recv_false=0 send_slice_calls=4148 send_slice_accepted=55599078 send_slice_zero=0 send_slice_errors=0 budget_limited_calls=418 headroom_limited_calls=1094 headroom_deferred_bytes=203578857 drain_credit_granted_bytes=1048576 drain_credit_planned_bytes=524288 drain_credit_used_bytes=262144 drop_credit_debt_bytes=0 drop_credit_debt_paid_bytes=0 drop_credit_blocked_bytes=0 pressure_credit_debt_bytes=0 pressure_credit_debt_paid_bytes=0 pressure_credit_blocked_bytes=0 hard_edge_guard_bytes=24576 hard_edge_guard_limited_calls=23 hard_edge_guard_deferred_bytes=65536 send_slice_max_accepted=178048 tun_flush_tx_calls=3148 tun_flush_tx_failures=0 tun_flush_deferred=0 dirty_handles=1
+🔎 tcp-global-rx-backpressure paused=true max_pending=2097152 total_pending=2097152 max_tx_queue=720896 total_tx_queue=720896 max_pressure=2097152 total_pressure=2818048 receive_high=2097152 receive_low=524288 receive_total_high=4194304 receive_total_low=1048576 local_egress_paused=true tun_feedback_paused=false
+🔎 tcp-global-rx-backpressure paused=false max_pending=524288 total_pending=524288 max_tx_queue=131072 total_tx_queue=131072 max_pressure=524288 total_pressure=655360 receive_high=2097152 receive_low=524288 receive_total_high=4194304 receive_total_low=1048576 local_egress_paused=false tun_feedback_paused=false
 🔎 tcp-tun-egress-feedback paused=true reason=drop_delta tx_dropped_delta=1349 max_pressure=720896 total_pressure=1853914 high=524288 low=131072 drop_events=1 drop_delta_total=1349 max_delta=1349 pause_edges=1 resume_edges=0 egress_credit_generation=1 egress_credit_debt_bytes=196608 drop_credit_debt_bytes=196608 pressure_credit_debt_bytes=0 drop_credit_events=1 pressure_credit_events=0
 🔎 tcp-handle-close handle=SocketHandle(1) direction=local_to_remote reason=uplink_channel_closed state=Relaying pending=566509 pending_high=585869 remote_to_global_rx_bytes=56886483 flush_attempts=16139 no_send_capacity=0 send_window_samples=16139 send_capacity_min=1048576 send_capacity_max=1048576 send_queue_max=720896 recv_queue_max=0 may_send_false=0 may_recv_false=11897 send_slice_calls=4167 send_slice_accepted=56319974 send_slice_zero=0 send_slice_errors=0 budget_limited_calls=12291 headroom_limited_calls=12973 headroom_deferred_bytes=3317103134 drain_credit_granted_bytes=2097152 drain_credit_planned_bytes=1048576 drain_credit_used_bytes=786432 drop_credit_debt_bytes=196608 drop_credit_debt_paid_bytes=98304 drop_credit_blocked_bytes=229376 pressure_credit_debt_bytes=32768 pressure_credit_debt_paid_bytes=16384 pressure_credit_blocked_bytes=49152 hard_edge_guard_bytes=24576 hard_edge_guard_limited_calls=37 hard_edge_guard_deferred_bytes=131072 send_slice_max_accepted=178048 tun_flush_tx_calls=3167 tun_flush_tx_failures=0 tun_flush_deferred=0 close_pending_class=active_send_capable close_pending_bytes=566509 terminal_pending_reap_bytes=0 close_egress_class=active_send_capable close_egress_bytes=720896 close_egress_drain_candidate=true tcp_state=CloseWait active=true can_send=true can_recv=false may_send=true may_recv=false send_capacity=1048576 send_queue=720896 recv_queue=0
 🔎 tcp-tun-egress if=tun0 status=delta tx_dropped_total=2691 tx_dropped_delta=122 global_rx_paused=true pending_total=0 pending_max=0 pending_high=0 remote_to_global_rx_bytes=0 tun_flush_tx_calls=0 dirty_handles=0
@@ -720,8 +756,18 @@ EOF
     printf '%s\n' "$final_summary" >&2
     return 1
   fi
+  if ! grep -q "final_global_rx_receive: pause_edges=1 resume_edges=1 max_pending_bytes=2097152 max_total_pending_bytes=2097152 receive_high=2097152 receive_low=524288" <<<"$final_summary"; then
+    echo "suite self-test failed: final lifecycle summary missed global receive window" >&2
+    printf '%s\n' "$final_summary" >&2
+    return 1
+  fi
   if ! grep -q "final_pressure_credit" <<<"$final_summary"; then
     echo "suite self-test failed: final lifecycle summary missed pressure credit attribution" >&2
+    printf '%s\n' "$final_summary" >&2
+    return 1
+  fi
+  if ! grep -q "final_global_rx_receive_window" <<<"$final_summary"; then
+    echo "suite self-test failed: final lifecycle summary missed global receive attribution" >&2
     printf '%s\n' "$final_summary" >&2
     return 1
   fi
@@ -1782,7 +1828,7 @@ run_lowrtt_probe() {
   append "### Probe $label Summary"
   if [[ -f "$probe_out" ]]; then
     append '```text'
-    grep -E 'Attribution Summary|iperf_sender_mbps|iperf_receiver_mbps|iperf_interval_profile:|throughput_shape:|tcp_pool:|local_write_pressure:|global_rx_pressure:|downlink_backpressure:|downlink_flush:|tcp_reverse_window:|terminal_pending_reap:|pending_at_close:|egress_at_close:|relay_late_remote:|tun_drops:|runtime_tun_egress:|tun_egress_feedback:|tun_rx_drain:|quic:|attribution:|local 10[.]0[.]0[.]1|receiver$|sender$|error -|Connection reset|log not found|📊|🔬|TUIC datagram|UDP relay mode|tuic-tcp-pool-reconnect|tcp-(relay-live|relay-write-half-closed|relay-close|handle-close|deferred-close-egress|reverse-window|local-write-pressure|global-rx-pressure|downlink-backpressure|downlink-flush|egress-credit-debt|tun-rx-drain|tun-egress|loop-flush-tx|tun-flush-fail|send-slice-error)|exit=' "$probe_out" | tail -200 | tee -a "$REPORT" || true
+    grep -E 'Attribution Summary|iperf_sender_mbps|iperf_receiver_mbps|iperf_interval_profile:|throughput_shape:|tcp_pool:|local_write_pressure:|global_rx_pressure:|global_rx_receive:|downlink_backpressure:|downlink_flush:|tcp_reverse_window:|terminal_pending_reap:|pending_at_close:|egress_at_close:|relay_late_remote:|tun_drops:|runtime_tun_egress:|tun_egress_feedback:|tun_rx_drain:|quic:|attribution:|local 10[.]0[.]0[.]1|receiver$|sender$|error -|Connection reset|log not found|📊|🔬|TUIC datagram|UDP relay mode|tuic-tcp-pool-reconnect|tcp-(relay-live|relay-write-half-closed|relay-close|handle-close|deferred-close-egress|reverse-window|local-write-pressure|global-rx-pressure|global-rx-backpressure|downlink-backpressure|downlink-flush|egress-credit-debt|tun-rx-drain|tun-egress|loop-flush-tx|tun-flush-fail|send-slice-error)|exit=' "$probe_out" | tail -200 | tee -a "$REPORT" || true
     append '```'
   else
     append "probe report missing: $probe_out"

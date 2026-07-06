@@ -1,5 +1,29 @@
 # Errors
 
+## 2026-07-06 - Knife14cg VPS failed because receive decoupling inflated local backlog
+
+- Stage: Knife14cg bounded global RX receive-window VPS acceptance.
+- Failed bundle:
+  `/tmp/mini_vpn/knife14cg_global_rx_receive_20260707_0126/mvpn_knife14cg_global_rx_receive_usclient_suite_20260707_012632.tar.gz`
+- Symptom: reverse-first P1 reached only `20.0/18.7 Mbit/s` with
+  `throughput_shape=low_average`, despite healthy direct `.27 -> .77` and
+  `.33 -> .77` baselines.
+- Important discriminator: `global_rx_receive` paused at the intended receive
+  bound (`receive_high=2097152`, `max_pending_bytes=2123091`), proving the A/B
+  path was active. The result was larger app-owned pending, not higher
+  throughput.
+- Local loss/backlog: final lifecycle showed active send-capable pending
+  (`pending=2123091`) and close egress backlog (`close_egress_bytes=892928`),
+  with final TUN egress drops totaling `4051`.
+- Rejected next moves: do not keep raising receive windows, split receive
+  thresholds, pool size, iperf3, sing-box auth/time/config, QUIC congestion, or
+  stale pool logic from this evidence.
+- Correct behavior: gate bounded global receive decoupling behind
+  `MINI_VPN_BOUNDED_GLOBAL_RX_RECEIVE_WINDOW=1` and keep the product default on
+  the safe receive gate. The next behavior patch must target local egress
+  drain/cadence and prove that queued bytes are consumed rather than buffered
+  into larger pending.
+
 ## 2026-07-06 - Knife14cf VPS failed after proactive pressure credit reduced drops
 
 - Stage: Knife14cf proactive egress credit gate VPS acceptance.

@@ -1,5 +1,35 @@
 # Learnings
 
+## 2026-07-06 - Knife14cg rejects bounded global receive decoupling as default
+
+- Stage docs:
+  `docs/tech/2026-07-06-knife14cg-bounded-global-rx-receive-window-spec.md`,
+  `docs/tech/2026-07-06-knife14cg-bounded-global-rx-receive-window-plan.md`,
+  `docs/tech/2026-07-06-knife14cg-bounded-global-rx-receive-window-results.md`
+- Log bundle:
+  `/tmp/mini_vpn/knife14cg_global_rx_receive_20260707_0126/mvpn_knife14cg_global_rx_receive_usclient_suite_20260707_012632.tar.gz`
+- Outcome: local TDD/regression gates passed, but the scoped VPS A/B failed.
+  Reverse-first P1 stayed low at `20.0/18.7 Mbit/s`.
+- What worked: the new `tcp-global-rx-backpressure` metric and parser summaries
+  proved the receive window engaged at the intended bound
+  (`receive_high=2097152`, `max_pending_bytes=2123091`), and final suite
+  parsing exposed the same close-tail receive-window state.
+- What did not work: decoupling TUIC/global receive from local TUN egress
+  pressure increased app-owned pending instead of restoring throughput. The
+  run closed with `pending=2123091`, `close_egress_bytes=892928`, and final TUN
+  egress drops totaling `4051`.
+- Clean surfaces: direct `.27 -> .77` and `.33 -> .77` baselines stayed
+  healthy, current-window `.33` TUIC auth was clean, QUIC loss/congestion
+  deltas were zero, `send_slice` errors were zero, and TUN flush failures were
+  zero.
+- Code decision: keep bounded global receive decoupling as an explicit A/B via
+  `MINI_VPN_BOUNDED_GLOBAL_RX_RECEIVE_WINDOW=1`; the default path uses the
+  prior safe receive gate.
+- Reusable rule: do not fix the current bottleneck by increasing read-ahead or
+  receive-window space. If bounded pending fills while local egress is stuck at
+  `send_queue_max=892928`, the next repair must improve local egress
+  drain/cadence rather than letting more remote bytes accumulate.
+
 ## 2026-07-06 - Knife14cf pressure debt reduces drops but not burst/stall throughput
 
 - Stage docs:

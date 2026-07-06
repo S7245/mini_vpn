@@ -1972,6 +1972,45 @@ fn should_install_downlink_pressure_credit_debt(
         && reaches_downlink_credit_debt_pressure_threshold(raw_stats, cfg)
 }
 
+fn downlink_receive_window_high(cfg: DownlinkBackpressureConfig) -> usize {
+    cfg.high_bytes
+        .saturating_mul(4)
+        .max(cfg.high_bytes)
+        .min(MAX_TCP_SOCKET_BUFFER_BYTES)
+}
+
+fn downlink_receive_window_low(cfg: DownlinkBackpressureConfig) -> usize {
+    cfg.high_bytes.min(downlink_receive_window_high(cfg))
+}
+
+fn downlink_receive_window_total_high(cfg: DownlinkBackpressureConfig) -> usize {
+    downlink_receive_window_high(cfg)
+        .saturating_mul(DEFAULT_TUN_POOL_SIZE)
+        .max(downlink_receive_window_high(cfg))
+        .min(MAX_TCP_SOCKET_BUFFER_BYTES)
+}
+
+fn downlink_receive_window_total_low(cfg: DownlinkBackpressureConfig) -> usize {
+    downlink_receive_window_low(cfg)
+        .saturating_mul(DEFAULT_TUN_POOL_SIZE)
+        .max(downlink_receive_window_low(cfg))
+        .min(downlink_receive_window_total_high(cfg))
+}
+
+fn next_global_rx_receive_backpressure(
+    was_paused: bool,
+    stats: DownlinkPressureStats,
+    cfg: DownlinkBackpressureConfig,
+) -> bool {
+    if was_paused {
+        return stats.max_pending > downlink_receive_window_low(cfg)
+            || stats.total_pending > downlink_receive_window_total_low(cfg);
+    }
+
+    stats.max_pending >= downlink_receive_window_high(cfg)
+        || stats.total_pending >= downlink_receive_window_total_high(cfg)
+}
+
 #[cfg(test)]
 fn downlink_pending_stats<'a>(
     ctxs: impl IntoIterator<Item = &'a SocketCtx>,
@@ -2767,6 +2806,31 @@ fn format_tcp_downlink_backpressure_diag(
     )
 }
 
+fn format_tcp_global_rx_backpressure_diag(
+    paused: bool,
+    stats: DownlinkPressureStats,
+    cfg: DownlinkBackpressureConfig,
+    local_egress_paused: bool,
+    tun_feedback_paused: bool,
+) -> String {
+    format!(
+        "🔎 tcp-global-rx-backpressure paused={} max_pending={} total_pending={} max_tx_queue={} total_tx_queue={} max_pressure={} total_pressure={} receive_high={} receive_low={} receive_total_high={} receive_total_low={} local_egress_paused={} tun_feedback_paused={}",
+        paused,
+        stats.max_pending,
+        stats.total_pending,
+        stats.max_tx_queue,
+        stats.total_tx_queue,
+        stats.max_pressure(),
+        stats.total_pressure(),
+        downlink_receive_window_high(cfg),
+        downlink_receive_window_low(cfg),
+        downlink_receive_window_total_high(cfg),
+        downlink_receive_window_total_low(cfg),
+        local_egress_paused,
+        tun_feedback_paused
+    )
+}
+
 fn parse_backpressure_bytes(s: Option<&str>, default: usize) -> usize {
     s.and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -2877,6 +2941,7 @@ pub struct TunRuntimeConfig {
     downlink_egress_immediate_bytes: usize,
     tcp_socket_buffers: TcpSocketBufferConfig,
     tun_rx_drain_budget: usize,
+    bounded_global_rx_receive_window: bool,
 }
 
 impl TunRuntimeConfig {
@@ -2892,6 +2957,7 @@ impl TunRuntimeConfig {
             downlink_egress_immediate_bytes: DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES,
             tcp_socket_buffers: TcpSocketBufferConfig::default(),
             tun_rx_drain_budget: DEFAULT_TUN_RX_DRAIN_BUDGET,
+            bounded_global_rx_receive_window: false,
         })
     }
 
@@ -2937,6 +3003,11 @@ impl TunRuntimeConfig {
         );
         cfg.tun_rx_drain_budget = parse_tun_rx_drain_budget(
             std::env::var("MINI_VPN_TUN_RX_DRAIN_BUDGET")
+                .ok()
+                .as_deref(),
+        );
+        cfg.bounded_global_rx_receive_window = parse_trace(
+            std::env::var("MINI_VPN_BOUNDED_GLOBAL_RX_RECEIVE_WINDOW")
                 .ok()
                 .as_deref(),
         );
@@ -3065,6 +3136,14 @@ pub async fn start_tun_proxy() {
     println!(
         "🧺 TUN RX drain budget: {} packets/pass（默认关闭；MINI_VPN_TUN_RX_DRAIN_BUDGET>0 仅用于显式 A/B）",
         runtime_config.tun_rx_drain_budget
+    );
+    println!(
+        "🧪 bounded global_rx receive window: {}（MINI_VPN_BOUNDED_GLOBAL_RX_RECEIVE_WINDOW=1 仅用于 Knife14cg A/B）",
+        if runtime_config.bounded_global_rx_receive_window {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
 
     // 1. 初始化 TUN 设备 / 创建操作系统的原生异步虚拟网卡。
@@ -3307,6 +3386,7 @@ pub async fn run_event_loop<D, U, M>(
     let downlink_backpressure = runtime_config.downlink_backpressure;
     let downlink_flush_max_bytes = runtime_config.downlink_flush_max_bytes;
     let tun_rx_drain_budget = runtime_config.tun_rx_drain_budget;
+    let bounded_global_rx_receive_window = runtime_config.bounded_global_rx_receive_window;
     let mut downlink_egress_pacer =
         DownlinkEgressPacer::new(runtime_config.downlink_egress_immediate_bytes);
     let mut downlink_egress_drop_debt = DownlinkEgressDropDebt::default();
@@ -3314,6 +3394,7 @@ pub async fn run_event_loop<D, U, M>(
     let mut tun_egress_feedback = TunEgressFeedbackState::default();
     let mut tun_rx_drain_diag = TunRxDrainDiag::default();
     let mut downlink_rx_paused = false;
+    let mut global_rx_receive_paused = false;
 
     loop {
         let downlink_stats_raw = downlink_pressure_stats(&dirty, &socket_ctxs, &sockets);
@@ -3359,7 +3440,30 @@ pub async fn run_event_loop<D, U, M>(
                 )
             );
         }
-        let global_rx_paused = downlink_rx_paused || tun_egress_feedback.is_paused();
+        let global_rx_paused = if bounded_global_rx_receive_window {
+            let previous_global_rx_receive_paused = global_rx_receive_paused;
+            let next_global_rx_receive_paused = next_global_rx_receive_backpressure(
+                global_rx_receive_paused,
+                downlink_stats_raw,
+                downlink_backpressure,
+            );
+            if next_global_rx_receive_paused != previous_global_rx_receive_paused {
+                global_rx_receive_paused = next_global_rx_receive_paused;
+                tcp_diag_log!(
+                    "{}",
+                    format_tcp_global_rx_backpressure_diag(
+                        global_rx_receive_paused,
+                        downlink_stats_raw,
+                        downlink_backpressure,
+                        downlink_rx_paused,
+                        tun_egress_feedback.is_paused(),
+                    )
+                );
+            }
+            global_rx_receive_paused
+        } else {
+            downlink_rx_paused || tun_egress_feedback.is_paused()
+        };
         tokio::select! {
             // TCP relay 回程：后台车厢把远端回传字节送回主循环 → 注入对应 smoltcp socket。
             //   TUIC 自重连（live_conn），不需要 legacy 的 disconnect/复位分支。
@@ -3589,8 +3693,11 @@ pub async fn run_event_loop<D, U, M>(
                     downlink_backpressure,
                     pressure_now,
                 );
-                let sampled_global_rx_paused =
-                    downlink_rx_paused || tun_egress_feedback.is_paused();
+                let sampled_global_rx_paused = if bounded_global_rx_receive_window {
+                    global_rx_receive_paused
+                } else {
+                    downlink_rx_paused || tun_egress_feedback.is_paused()
+                };
                 if tcp_diag_enabled() {
                     println!(
                         "{}",
@@ -7532,6 +7639,10 @@ mod tests {
             DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES
         );
         assert_eq!(config.tun_rx_drain_budget, DEFAULT_TUN_RX_DRAIN_BUDGET);
+        assert!(
+            !config.bounded_global_rx_receive_window,
+            "Knife14cg bounded receive window is opt-in after VPS rejected it as a default"
+        );
     }
 
     /// 刀11：MINI_VPN_METRICS_SECS 解析——有效正整数采用；0/非数字/缺失回落默认（防 interval panic）。
@@ -8204,6 +8315,89 @@ mod tests {
         assert!(line.contains("raw_max_tx_queue=0"), "{line}");
         assert!(line.contains("effective_max_tx_queue=100"), "{line}");
         assert!(line.contains("held_pressure=true"), "{line}");
+    }
+
+    #[test]
+    fn global_rx_receive_window_ignores_tx_queue_only_pressure() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let tx_queue_only_pressure = DownlinkPressureStats::new(0, 0, 160, 160);
+
+        assert!(
+            next_downlink_backpressure(false, tx_queue_only_pressure, cfg),
+            "local egress backpressure should still pause at the tx-queue hard cap"
+        );
+        assert!(
+            !next_global_rx_receive_backpressure(false, tx_queue_only_pressure, cfg),
+            "tx-queue-only pressure must not stop bounded relay receive progress"
+        );
+    }
+
+    #[test]
+    fn global_rx_receive_window_uses_pending_high_low_hysteresis() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+
+        assert_eq!(downlink_receive_window_high(cfg), 400);
+        assert_eq!(downlink_receive_window_low(cfg), 100);
+
+        assert!(
+            !next_global_rx_receive_backpressure(
+                false,
+                DownlinkPressureStats::pending_only(399, 399),
+                cfg,
+            ),
+            "pending below the receive-window high watermark should keep relay receive enabled"
+        );
+        assert!(
+            next_global_rx_receive_backpressure(
+                false,
+                DownlinkPressureStats::pending_only(400, 400),
+                cfg,
+            ),
+            "pending at the bounded receive-window high watermark should pause relay receive"
+        );
+        assert!(
+            next_global_rx_receive_backpressure(
+                true,
+                DownlinkPressureStats::pending_only(101, 101),
+                cfg,
+            ),
+            "while paused, receive stays paused above the receive low watermark"
+        );
+        assert!(
+            !next_global_rx_receive_backpressure(
+                true,
+                DownlinkPressureStats::pending_only(100, 100),
+                cfg,
+            ),
+            "receive resumes after pending drains to the receive low watermark"
+        );
+    }
+
+    #[test]
+    fn global_rx_receive_diag_reports_local_egress_and_feedback_state() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let stats = DownlinkPressureStats::new(150, 275, 160, 160);
+
+        let line = format_tcp_global_rx_backpressure_diag(true, stats, cfg, true, true);
+
+        assert!(line.contains("tcp-global-rx-backpressure"), "{line}");
+        assert!(line.contains("paused=true"), "{line}");
+        assert!(line.contains("max_pending=150"), "{line}");
+        assert!(line.contains("total_pending=275"), "{line}");
+        assert!(line.contains("max_tx_queue=160"), "{line}");
+        assert!(line.contains("receive_high=400"), "{line}");
+        assert!(line.contains("receive_low=100"), "{line}");
+        assert!(line.contains("local_egress_paused=true"), "{line}");
+        assert!(line.contains("tun_feedback_paused=true"), "{line}");
     }
 
     #[test]
