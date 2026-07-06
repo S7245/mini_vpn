@@ -1,5 +1,32 @@
 # Errors
 
+## 2026-07-06 - Knife14ch VPS failed before pressure debt could prove throughput
+
+- Stage: Knife14ch adaptive pressure credit debt VPS acceptance.
+- Failed bundles:
+  `/tmp/mini_vpn/knife14ch_adaptive_pressure_20260707_0142/mvpn_knife14ch_adaptive_pressure_usclient_suite_20260707_014241.tar.gz`,
+  `/tmp/mini_vpn/knife14ch_adaptive_pressure_repeat_20260707_0149/mvpn_knife14ch_adaptive_pressure_repeat_usclient_suite_20260707_014902.tar.gz`
+- Symptom A: the first run was `no_data` (`0.245/0.020 Mbit/s`) with
+  `pressure_credit_debt_bytes=0`, no local pressure, no TUN drops, and no
+  current TUIC `fail auth`. It did not exercise the code path being tested.
+- Symptom B: the repeat, with `.33 -> .77` baseline forced on, returned to
+  `low_average` (`16.0/15.5 Mbit/s`) while direct baselines stayed healthy:
+  `.27 -> .77` `282/298 Mbit/s`, `.33 -> .77` `266/297 Mbit/s`.
+- Important discriminator: the repeat had clean QUIC loss/congestion/blocking
+  deltas, no TUN drops, no global RX queue pressure, and no send-slice errors,
+  but still reached `send_queue_max=892928`, `hard_edge_guard_limited=47`, and
+  `terminal_late_remote_payload_bytes=1834980`.
+- Root cause direction: adaptive pressure debt was not rejected directly; it
+  was not installed. The remaining local branch is ACK/window/TUN-RX drain
+  cadence under sustained remote payload, plus the close lifecycle consequence
+  when the socket reaches terminal no-send while the relay still has tail data.
+- Rejected next moves: do not attribute this run to sing-box auth/time/config,
+  iperf3, stale pool, QUIC congestion/loss, bounded receive-window growth, or
+  another static pressure-debt variant.
+- Correct behavior: add a focused, pressure-triggered TUN RX drain path that
+  activates only near the egress credit edge and keeps explicit
+  `MINI_VPN_TUN_RX_DRAIN_BUDGET` as an override/test knob.
+
 ## 2026-07-06 - Knife14cg VPS failed because receive decoupling inflated local backlog
 
 - Stage: Knife14cg bounded global RX receive-window VPS acceptance.

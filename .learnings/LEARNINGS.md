@@ -1,5 +1,33 @@
 # Learnings
 
+## 2026-07-06 - Knife14ch redirects pressure work toward adaptive ACK drain
+
+- Stage docs:
+  `docs/tech/2026-07-06-knife14ch-adaptive-pressure-credit-debt-spec.md`,
+  `docs/tech/2026-07-06-knife14ch-adaptive-pressure-credit-debt-plan.md`,
+  `docs/tech/2026-07-06-knife14ch-adaptive-pressure-credit-debt-results.md`
+- Code commit: `0cc6d31`.
+- Log bundles:
+  `/tmp/mini_vpn/knife14ch_adaptive_pressure_20260707_0142/mvpn_knife14ch_adaptive_pressure_usclient_suite_20260707_014241.tar.gz`,
+  `/tmp/mini_vpn/knife14ch_adaptive_pressure_repeat_20260707_0149/mvpn_knife14ch_adaptive_pressure_repeat_usclient_suite_20260707_014902.tar.gz`
+- Outcome: local TDD/regression gates passed, but VPS acceptance failed. The
+  first run was `no_data` and did not exercise adaptive pressure debt. The
+  repeat was actionable: reverse-first P1 was `16.0/15.5 Mbit/s` with healthy
+  `.27 -> .77` and `.33 -> .77` baselines.
+- What worked: adaptive pressure debt stayed bounded and no TUN drops were
+  observed in the repeat (`runtime_tun_egress drop_events=0`). Current-window
+  `.33` TUIC auth was clean and QUIC loss/congestion/blocking deltas were zero.
+- What did not work: `pressure_credit_debt_bytes=0` because the repeat touched
+  the credit spend edge (`send_queue_max=892928`) without crossing the
+  backpressure pause edge. The run still closed with
+  `terminal_late_remote_payload_bytes=1834980` and
+  `hard_edge_guard_limited=47`.
+- Reusable rule: do not keep adding pressure-debt variants just to make the
+  guard edge quieter. When TUN drops are zero but send_queue rides the credit
+  guard and throughput is low, prioritize adaptive local ACK/TUN-RX drain so
+  smoltcp send capacity is freed by processing ACK/window updates, not by
+  reading less remote data.
+
 ## 2026-07-06 - Knife14cg rejects bounded global receive decoupling as default
 
 - Stage docs:
