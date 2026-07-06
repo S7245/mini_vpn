@@ -81,6 +81,9 @@ const MAX_TUN_RX_DRAIN_BUDGET: usize = 64;
 /// budget targets ACK/window-sized packets rather than MTU-sized data packets.
 const TUN_RX_PRESSURE_DRAIN_ESTIMATED_PACKET_BYTES: usize = 64;
 const TUN_RX_PRESSURE_DRAIN_MAX_PACKETS: usize = 256;
+/// Knife14co: active reverse flows get a smaller event-driven ACK/window drain
+/// before the pressure edge so sender windows can progress without background polling.
+const TUN_RX_ACTIVE_FLOW_DRAIN_MAX_PACKETS: usize = 32;
 const TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_PRE: &str = "remote_payload_pre";
 const TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD: &str = "remote_payload";
 const TUN_RX_DRAIN_SOURCE_TIMER_PRESSURE: &str = "timer_pressure";
@@ -2760,6 +2763,17 @@ fn pressure_tun_rx_drain_budget(cfg: DownlinkBackpressureConfig, tun_mtu: usize)
     packets.clamp(1, TUN_RX_PRESSURE_DRAIN_MAX_PACKETS)
 }
 
+fn active_flow_tun_rx_drain_budget(cfg: DownlinkBackpressureConfig, tun_mtu: usize) -> usize {
+    let pressure_budget = pressure_tun_rx_drain_budget(cfg, tun_mtu);
+    if pressure_budget == 0 {
+        return 0;
+    }
+    pressure_budget
+        .saturating_add(7)
+        .saturating_div(8)
+        .clamp(1, TUN_RX_ACTIVE_FLOW_DRAIN_MAX_PACKETS)
+}
+
 fn tun_rx_drain_budget_after_remote_payload(
     has_downlink_work: bool,
     send_queue_bytes: usize,
@@ -2776,7 +2790,7 @@ fn tun_rx_drain_budget_after_remote_payload(
     if send_queue_bytes >= tx_queue_credit_spend_threshold(cfg) {
         pressure_tun_rx_drain_budget(cfg, tun_mtu)
     } else {
-        0
+        active_flow_tun_rx_drain_budget(cfg, tun_mtu)
     }
 }
 
@@ -9128,7 +9142,7 @@ mod tests {
     }
 
     #[test]
-    fn tun_rx_drain_budget_stays_off_without_work_or_pressure() {
+    fn tun_rx_drain_budget_stays_off_without_downlink_work() {
         let cfg = DownlinkBackpressureConfig {
             high_bytes: 100,
             low_bytes: 40,
@@ -9140,6 +9154,16 @@ mod tests {
             0,
             "pressure alone should not scan TUN RX without downlink work"
         );
+    }
+
+    #[test]
+    fn tun_rx_drain_budget_enables_active_flow_below_credit_edge() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let credit_edge = tx_queue_credit_spend_threshold(cfg);
+
         assert_eq!(
             tun_rx_drain_budget_after_remote_payload(
                 true,
@@ -9148,8 +9172,8 @@ mod tests {
                 cfg,
                 1200,
             ),
-            0,
-            "default budget should stay off below the credit edge"
+            active_flow_tun_rx_drain_budget(cfg, 1200),
+            "active reverse payload should get a bounded ACK/window drain before pressure"
         );
     }
 
@@ -9351,6 +9375,27 @@ mod tests {
             pressure_tun_rx_drain_budget(cfg, 1),
             TUN_RX_PRESSURE_DRAIN_MAX_PACKETS,
             "adaptive pressure drain remains bounded even with tiny MTU input"
+        );
+    }
+
+    #[test]
+    fn tun_rx_active_flow_drain_budget_is_smaller_than_pressure() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 512 * 1024,
+            low_bytes: 128 * 1024,
+        };
+
+        assert_eq!(
+            pressure_tun_rx_drain_budget(cfg, 1200),
+            TUN_RX_PRESSURE_DRAIN_MAX_PACKETS
+        );
+        assert_eq!(
+            active_flow_tun_rx_drain_budget(cfg, 1200),
+            TUN_RX_ACTIVE_FLOW_DRAIN_MAX_PACKETS,
+            "active-flow drain should be useful but smaller than pressure drain"
+        );
+        assert!(
+            active_flow_tun_rx_drain_budget(cfg, 1200) < pressure_tun_rx_drain_budget(cfg, 1200)
         );
     }
 
