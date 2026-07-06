@@ -77,9 +77,10 @@ const TCP_REVERSE_WINDOW_DIAG_INTERVAL_SECS: u64 = 5;
 const DEFAULT_TUN_RX_DRAIN_BUDGET: usize = 0;
 /// Knife14bh：TUN RX drain 是诊断/公平性路径，允许 A/B 关闭或小幅放大，禁止无界热路径扫描。
 const MAX_TUN_RX_DRAIN_BUDGET: usize = 64;
-/// Knife14ci: keep default TUN RX drain off, but allow a small MTU-derived ACK
-/// drain budget when downlink egress reaches the existing credit edge.
-const TUN_RX_PRESSURE_DRAIN_MAX_PACKETS: usize = 32;
+/// Knife14ck: default TUN RX drain stays pressure-gated, but the adaptive
+/// budget targets ACK/window-sized packets rather than MTU-sized data packets.
+const TUN_RX_PRESSURE_DRAIN_ESTIMATED_PACKET_BYTES: usize = 64;
+const TUN_RX_PRESSURE_DRAIN_MAX_PACKETS: usize = 256;
 const TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_PRE: &str = "remote_payload_pre";
 const TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD: &str = "remote_payload";
 const TUN_RX_DRAIN_SOURCE_TIMER_PRESSURE: &str = "timer_pressure";
@@ -2743,7 +2744,7 @@ fn pressure_tun_rx_drain_budget(cfg: DownlinkBackpressureConfig, tun_mtu: usize)
     if guard == 0 {
         return 0;
     }
-    let packet_bytes = tun_mtu.max(1);
+    let packet_bytes = tun_mtu.clamp(1, TUN_RX_PRESSURE_DRAIN_ESTIMATED_PACKET_BYTES);
     let packets = guard.saturating_add(packet_bytes.saturating_sub(1)) / packet_bytes;
     packets.clamp(1, TUN_RX_PRESSURE_DRAIN_MAX_PACKETS)
 }
@@ -9198,7 +9199,7 @@ mod tests {
     }
 
     #[test]
-    fn tun_rx_pressure_drain_budget_is_guard_mtu_derived_and_capped() {
+    fn tun_rx_pressure_drain_budget_is_ack_sized_and_capped() {
         let cfg = DownlinkBackpressureConfig {
             high_bytes: 512 * 1024,
             low_bytes: 128 * 1024,
@@ -9206,8 +9207,8 @@ mod tests {
         assert_eq!(tx_queue_credit_guard_bytes(cfg), 24 * 1024);
         assert_eq!(
             pressure_tun_rx_drain_budget(cfg, 1200),
-            21,
-            "default guard should be rounded up by TUN MTU"
+            TUN_RX_PRESSURE_DRAIN_MAX_PACKETS,
+            "default guard should be ACK-sized and capped, not MTU-sized"
         );
         assert_eq!(
             pressure_tun_rx_drain_budget(cfg, 1),
