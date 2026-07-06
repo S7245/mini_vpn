@@ -1537,3 +1537,21 @@
   Knife14 gate until formatting is normalized in a dedicated task. For these
   lifecycle patches, keep edits narrow and use `cargo test/build`,
   script self-tests/syntax checks, and `git diff --check`.
+
+## 2026-07-06 - Knife14bv no-data run was not a close-egress candidate
+
+- Symptom: Knife14bv acceptance for `8f68a89` regressed reverse-first P1 to
+  `0.315/0.113 Mbit/s` with `throughput_shape=no_data`.
+- Evidence: `downlink_backpressure=0/0`, TUN drops `0`, send-slice errors `0`,
+  QUIC client-side loss/congestion/blocking `0`, and no
+  `tcp-deferred-close-egress` line. The only close-egress accounting was a
+  terminal closed/no-send `14824B`, while TUIC stream 4 showed
+  `max_read_gap_ms=20567` and only `723424B` total rx.
+- Rejected next move: do not extend the close-egress drain grace, tune
+  close/reap thresholds, or chase sing-box auth from this evidence. `.33`
+  current-window TUIC auth was clean and the bottleneck appears before the
+  close boundary.
+- Correct behavior: stop before behavior changes. First add diagnostics/TDD
+  that distinguish TUIC server-to-client stream starvation from mini_vpn local
+  TCP ACK/receive-window collapse, then run one scoped acceptance before
+  choosing a behavior patch.

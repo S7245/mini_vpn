@@ -2509,3 +2509,28 @@ worth cleaning up separately.
   appears at close, do not rearm the listener immediately. Give already
   accepted downlink bytes a bounded local egress drain window, then let the
   existing reap/rearm machinery close the slot if progress stops.
+
+## 2026-07-06 - Knife14bv rejects close-egress drain as the throughput root
+
+- Stage: Knife14bv VPS acceptance for `8f68a89`.
+- Result doc:
+  `docs/tech/2026-07-06-knife14bv-close-egress-drain-results.md`
+- Bundle:
+  `/tmp/mini_vpn/knife14bv_close_egress_20260706/mvpn_knife14bv_close_egress_usclient_suite_20260706_194841.tar.gz`
+- Outcome: reverse-first P1 failed at `0.315/0.113 Mbit/s` with
+  `throughput_shape=no_data`, much worse than the prior 10-20 Mbit/s tier.
+- Signals: `.27/.33/.77` preflight and direct baselines were healthy, no
+  current-window `.33` TUIC auth failure appeared, QUIC client-side
+  loss/congestion/blocking deltas stayed zero, TUN drops were zero, and local
+  downlink backpressure never paused.
+- Discriminator: no `tcp-deferred-close-egress` line appeared. The only
+  close-egress bytes were `14824B` at terminal closed/no-send state, so the new
+  send-capable close-drain branch was not the active bottleneck.
+- New root branch: reverse data starves before close cleanup. TUIC stream 4
+  closed with only `723424B` over `27` reads, `max_read_gap_ms=20567`, and the
+  target iperf sender was stuck near `109KB` cwnd with almost all intervals at
+  zero throughput.
+- Reusable rule: after a no-data reverse run with no local pressure, no TUN
+  drops, no QUIC client loss, and no deferred-close-egress candidate, do not
+  keep tuning close/reap. Add diagnostics that separate TUIC server-to-client
+  starvation from mini_vpn local TCP ACK/receive-window behavior.
