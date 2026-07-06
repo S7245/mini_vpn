@@ -1,5 +1,32 @@
 # Learnings
 
+## 2026-07-06 - Knife14ce proves post-drop credit debt is too late
+
+- Stage docs:
+  `docs/tech/2026-07-06-knife14ce-drop-aware-egress-credit-spec.md`,
+  `docs/tech/2026-07-06-knife14ce-drop-aware-egress-credit-plan.md`,
+  `docs/tech/2026-07-06-knife14ce-drop-aware-egress-credit-results.md`
+- Log bundle:
+  `/tmp/mini_vpn/knife14ce_drop_credit_20260707_0049/mvpn_knife14ce_drop_credit_usclient_suite_20260707_005007.tar.gz`
+- Outcome: local TDD and regressions passed, but scoped VPS acceptance failed.
+  Reverse-first P1 fell back to `23.6/21.5 Mbit/s` while direct `.27 -> .77`
+  and `.33 -> .77` baselines stayed healthy.
+- Key signal: TUN feedback installed global debt
+  (`drop_credit_generation=1 drop_credit_debt_bytes=196608`), but
+  `tcp-downlink-flush` and final lifecycle still reported
+  `drop_credit_debt_bytes=0 drop_credit_debt_paid_bytes=0
+  drop_credit_blocked_bytes=0`. The first positive TUN drop feedback arrived
+  near the close tail after the harmful local tx-queue burst had already
+  happened.
+- Clean surfaces: default pool=2 stayed active with `conns=0,1`, no current
+  TUIC `fail auth`, no QUIC loss/congestion/blocking deltas, no send-slice
+  zero/errors, no TUN flush failures, and no terminal pending/egress-at-close
+  hidden loss.
+- Reusable rule: post-drop credit debt is a valid invariant but not an adequate
+  first control signal. The next behavior patch must move credit denial earlier
+  to local egress pressure edges and prove feedback pause can resume from raw
+  low pressure.
+
 ## 2026-07-06 - Knife14bw narrows reverse failure to local tx-queue cadence
 
 - Code commit: `4a12b18`

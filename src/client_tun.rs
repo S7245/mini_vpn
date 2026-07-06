@@ -220,6 +220,12 @@ struct TcpDownlinkDiag {
     send_slice_drain_credit_planned_bytes: u64,
     /// Bytes of drain credit actually consumed by accepted `send_slice` bytes.
     send_slice_drain_credit_used_bytes: u64,
+    /// Remaining drop debt observed while planning downlink flushes.
+    send_slice_drop_credit_debt_bytes: usize,
+    /// Bytes of observed egress drain spent repaying drop debt.
+    send_slice_drop_credit_debt_paid_bytes: u64,
+    /// Bytes of stale or would-be drain credit blocked by active drop debt.
+    send_slice_drop_credit_blocked_bytes: u64,
     /// Largest derived guard reserved below the hard tx_queue pause edge.
     send_slice_hard_edge_guard_bytes: usize,
     /// Flush attempts limited specifically by the hard-edge guard.
@@ -327,6 +333,15 @@ impl TcpDownlinkDiag {
         self.send_slice_drain_credit_planned_bytes = self
             .send_slice_drain_credit_planned_bytes
             .saturating_add(limit.drain_credit_planned_bytes as u64);
+        self.send_slice_drop_credit_debt_bytes = self
+            .send_slice_drop_credit_debt_bytes
+            .max(limit.drop_credit_debt_bytes);
+        self.send_slice_drop_credit_debt_paid_bytes = self
+            .send_slice_drop_credit_debt_paid_bytes
+            .saturating_add(limit.drop_credit_debt_paid_bytes as u64);
+        self.send_slice_drop_credit_blocked_bytes = self
+            .send_slice_drop_credit_blocked_bytes
+            .saturating_add(limit.drop_credit_blocked_bytes as u64);
         self.send_slice_hard_edge_guard_bytes = self
             .send_slice_hard_edge_guard_bytes
             .max(limit.hard_edge_guard_bytes);
@@ -1143,6 +1158,9 @@ struct DownlinkFlushLimit {
     clean_headroom_bytes: usize,
     drain_credit_granted_bytes: usize,
     drain_credit_planned_bytes: usize,
+    drop_credit_debt_bytes: usize,
+    drop_credit_debt_paid_bytes: usize,
+    drop_credit_blocked_bytes: usize,
     hard_edge_guard_bytes: usize,
     hard_edge_guard_deferred_bytes: usize,
 }
@@ -1151,6 +1169,38 @@ struct DownlinkFlushLimit {
 struct DownlinkEgressClock {
     last_send_queue: Option<usize>,
     drain_credit_bytes: usize,
+    drop_debt_generation_seen: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DownlinkEgressDropDebt {
+    generation: u64,
+    debt_bytes: usize,
+}
+
+impl DownlinkEgressDropDebt {
+    fn note_tun_drop(&mut self, cfg: DownlinkBackpressureConfig) -> usize {
+        let installed = downlink_egress_credit_span(cfg);
+        if installed == 0 {
+            return 0;
+        }
+        self.generation = self.generation.saturating_add(1);
+        self.debt_bytes = self.debt_bytes.saturating_add(installed).min(installed);
+        installed
+    }
+
+    fn pay(&mut self, bytes: usize) -> usize {
+        let paid = bytes.min(self.debt_bytes);
+        self.debt_bytes -= paid;
+        paid
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DownlinkEgressCreditObservation {
+    granted_bytes: usize,
+    drop_debt_paid_bytes: usize,
+    drop_credit_blocked_bytes: usize,
 }
 
 impl DownlinkEgressClock {
@@ -1158,24 +1208,44 @@ impl DownlinkEgressClock {
         &mut self,
         send_queue: usize,
         cfg: DownlinkBackpressureConfig,
-    ) -> usize {
+        drop_debt: &mut DownlinkEgressDropDebt,
+    ) -> DownlinkEgressCreditObservation {
+        let mut observation = DownlinkEgressCreditObservation::default();
+        if self.drop_debt_generation_seen != drop_debt.generation {
+            self.drop_debt_generation_seen = drop_debt.generation;
+            observation.drop_credit_blocked_bytes = self.drain_credit_bytes;
+            self.drain_credit_bytes = 0;
+        }
+
         let Some(last_send_queue) = self.last_send_queue else {
             self.last_send_queue = Some(send_queue);
-            return 0;
+            return observation;
         };
         if last_send_queue <= send_queue {
             self.last_send_queue = Some(send_queue);
-            return 0;
+            return observation;
         }
 
-        let max_credit = tx_queue_pause_threshold(cfg).saturating_sub(tx_queue_flush_threshold(cfg));
-        let granted = last_send_queue.saturating_sub(send_queue).min(max_credit);
+        let max_credit = downlink_egress_credit_span(cfg);
+        let observed_drain = last_send_queue.saturating_sub(send_queue);
+        let debt_paid = drop_debt.pay(observed_drain);
+        observation.drop_debt_paid_bytes = debt_paid;
+        observation.drop_credit_blocked_bytes = observation
+            .drop_credit_blocked_bytes
+            .saturating_add(debt_paid.min(max_credit));
+        let creditable_drain = observed_drain.saturating_sub(debt_paid);
+        let granted = if drop_debt.debt_bytes == 0 {
+            creditable_drain.min(max_credit)
+        } else {
+            0
+        };
         self.drain_credit_bytes = self
             .drain_credit_bytes
             .saturating_add(granted)
             .min(max_credit);
         self.last_send_queue = Some(send_queue);
-        granted
+        observation.granted_bytes = granted;
+        observation
     }
 
     fn note_flush_result(
@@ -1191,6 +1261,10 @@ impl DownlinkEgressClock {
         self.last_send_queue = Some(send_queue_before.saturating_add(accepted));
         used
     }
+}
+
+fn downlink_egress_credit_span(cfg: DownlinkBackpressureConfig) -> usize {
+    tx_queue_pause_threshold(cfg).saturating_sub(tx_queue_flush_threshold(cfg))
 }
 
 #[cfg(test)]
@@ -1211,17 +1285,40 @@ fn bounded_downlink_flush_limit_for_window(
         clean_headroom_bytes: egress_headroom,
         drain_credit_granted_bytes: 0,
         drain_credit_planned_bytes: 0,
+        drop_credit_debt_bytes: 0,
+        drop_credit_debt_paid_bytes: 0,
+        drop_credit_blocked_bytes: 0,
         hard_edge_guard_bytes: 0,
         hard_edge_guard_deferred_bytes: 0,
     }
 }
 
+#[cfg(test)]
 fn bounded_downlink_flush_limit_for_window_with_clock(
     pending_len: usize,
     max_bytes_per_flush: usize,
     send_window: TcpSendWindowSnapshot,
     cfg: DownlinkBackpressureConfig,
     clock: &mut DownlinkEgressClock,
+) -> DownlinkFlushLimit {
+    let mut drop_debt = DownlinkEgressDropDebt::default();
+    bounded_downlink_flush_limit_for_window_with_clock_and_drop(
+        pending_len,
+        max_bytes_per_flush,
+        send_window,
+        cfg,
+        clock,
+        &mut drop_debt,
+    )
+}
+
+fn bounded_downlink_flush_limit_for_window_with_clock_and_drop(
+    pending_len: usize,
+    max_bytes_per_flush: usize,
+    send_window: TcpSendWindowSnapshot,
+    cfg: DownlinkBackpressureConfig,
+    clock: &mut DownlinkEgressClock,
+    drop_debt: &mut DownlinkEgressDropDebt,
 ) -> DownlinkFlushLimit {
     let budget_len = bounded_downlink_flush_len(pending_len, max_bytes_per_flush);
     let socket_len = budget_len.min(send_window.send_capacity);
@@ -1230,23 +1327,31 @@ fn bounded_downlink_flush_limit_for_window_with_clock(
     let hard_edge_guard = tx_queue_credit_guard_bytes(cfg);
     let guarded_hard_headroom =
         tx_queue_credit_spend_threshold(cfg).saturating_sub(send_window.send_queue);
-    let granted = clock.note_observed_send_queue(send_window.send_queue, cfg);
+    let credit_observation = clock.note_observed_send_queue(send_window.send_queue, cfg, drop_debt);
+    let usable_credit = if drop_debt.debt_bytes == 0 {
+        clock.drain_credit_bytes
+    } else {
+        0
+    };
     let unguarded_available = clean_headroom
-        .saturating_add(clock.drain_credit_bytes)
+        .saturating_add(usable_credit)
         .min(hard_headroom);
     let available = unguarded_available.min(guarded_hard_headroom);
     let unguarded_len = socket_len.min(unguarded_available);
     let len = socket_len.min(available);
     let drain_credit_planned = len
         .saturating_sub(clean_headroom)
-        .min(clock.drain_credit_bytes);
+        .min(usable_credit);
     DownlinkFlushLimit {
         len,
         headroom_limited: len < socket_len,
         headroom_deferred_bytes: socket_len.saturating_sub(len),
         clean_headroom_bytes: clean_headroom,
-        drain_credit_granted_bytes: granted,
+        drain_credit_granted_bytes: credit_observation.granted_bytes,
         drain_credit_planned_bytes: drain_credit_planned,
+        drop_credit_debt_bytes: drop_debt.debt_bytes,
+        drop_credit_debt_paid_bytes: credit_observation.drop_debt_paid_bytes,
+        drop_credit_blocked_bytes: credit_observation.drop_credit_blocked_bytes,
         hard_edge_guard_bytes: hard_edge_guard,
         hard_edge_guard_deferred_bytes: unguarded_len.saturating_sub(len),
     }
@@ -1274,6 +1379,7 @@ fn flush_downlink(
     ctx: &mut SocketCtx,
     max_bytes_per_flush: usize,
     downlink_backpressure: DownlinkBackpressureConfig,
+    downlink_egress_drop_debt: &mut DownlinkEgressDropDebt,
 ) -> DownlinkFlushOutcome {
     if ctx.downlink_pending.is_empty() {
         return DownlinkFlushOutcome {
@@ -1294,12 +1400,13 @@ fn flush_downlink(
             headroom_limited: false,
         };
     }
-    let flush_limit = bounded_downlink_flush_limit_for_window_with_clock(
+    let flush_limit = bounded_downlink_flush_limit_for_window_with_clock_and_drop(
         ctx.downlink_pending.len(),
         max_bytes_per_flush,
         send_window,
         downlink_backpressure,
         &mut ctx.downlink_egress_clock,
+        downlink_egress_drop_debt,
     );
     ctx.downlink_diag.note_flush_limit(
         ctx.downlink_pending.len(),
@@ -1797,6 +1904,9 @@ struct TcpDownlinkAggregate {
     send_slice_drain_credit_granted_bytes: u64,
     send_slice_drain_credit_planned_bytes: u64,
     send_slice_drain_credit_used_bytes: u64,
+    send_slice_drop_credit_debt_bytes: usize,
+    send_slice_drop_credit_debt_paid_bytes: u64,
+    send_slice_drop_credit_blocked_bytes: u64,
     send_slice_hard_edge_guard_bytes: usize,
     send_slice_hard_edge_guard_limited: u64,
     send_slice_hard_edge_guard_deferred_bytes: u64,
@@ -1870,6 +1980,15 @@ fn tcp_downlink_aggregate<'a>(
         aggregate.send_slice_drain_credit_used_bytes = aggregate
             .send_slice_drain_credit_used_bytes
             .saturating_add(ctx.downlink_diag.send_slice_drain_credit_used_bytes);
+        aggregate.send_slice_drop_credit_debt_bytes = aggregate
+            .send_slice_drop_credit_debt_bytes
+            .max(ctx.downlink_diag.send_slice_drop_credit_debt_bytes);
+        aggregate.send_slice_drop_credit_debt_paid_bytes = aggregate
+            .send_slice_drop_credit_debt_paid_bytes
+            .saturating_add(ctx.downlink_diag.send_slice_drop_credit_debt_paid_bytes);
+        aggregate.send_slice_drop_credit_blocked_bytes = aggregate
+            .send_slice_drop_credit_blocked_bytes
+            .saturating_add(ctx.downlink_diag.send_slice_drop_credit_blocked_bytes);
         aggregate.send_slice_hard_edge_guard_bytes = aggregate
             .send_slice_hard_edge_guard_bytes
             .max(ctx.downlink_diag.send_slice_hard_edge_guard_bytes);
@@ -1933,7 +2052,7 @@ fn format_tcp_downlink_flush_diag(
     dirty_handles: usize,
 ) -> String {
     format!(
-        "🔎 tcp-downlink-flush pending_total={} pending_max={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} drain_credit_granted_bytes={} drain_credit_planned_bytes={} drain_credit_used_bytes={} hard_edge_guard_bytes={} hard_edge_guard_limited_calls={} hard_edge_guard_deferred_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} dirty_handles={}",
+        "🔎 tcp-downlink-flush pending_total={} pending_max={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} drain_credit_granted_bytes={} drain_credit_planned_bytes={} drain_credit_used_bytes={} drop_credit_debt_bytes={} drop_credit_debt_paid_bytes={} drop_credit_blocked_bytes={} hard_edge_guard_bytes={} hard_edge_guard_limited_calls={} hard_edge_guard_deferred_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} dirty_handles={}",
         aggregate.pending_total,
         aggregate.pending_max,
         aggregate.pending_high,
@@ -1961,6 +2080,9 @@ fn format_tcp_downlink_flush_diag(
         aggregate.send_slice_drain_credit_granted_bytes,
         aggregate.send_slice_drain_credit_planned_bytes,
         aggregate.send_slice_drain_credit_used_bytes,
+        aggregate.send_slice_drop_credit_debt_bytes,
+        aggregate.send_slice_drop_credit_debt_paid_bytes,
+        aggregate.send_slice_drop_credit_blocked_bytes,
         aggregate.send_slice_hard_edge_guard_bytes,
         aggregate.send_slice_hard_edge_guard_limited,
         aggregate.send_slice_hard_edge_guard_deferred_bytes,
@@ -2213,9 +2335,10 @@ fn format_tun_egress_feedback_diag(
     event: TunEgressFeedbackEvent,
     state: &TunEgressFeedbackState,
     cfg: DownlinkBackpressureConfig,
+    drop_debt: DownlinkEgressDropDebt,
 ) -> String {
     format!(
-        "🔎 tcp-tun-egress-feedback paused={} reason={} tx_dropped_delta={} max_pressure={} total_pressure={} high={} low={} drop_events={} drop_delta_total={} max_delta={} pause_edges={} resume_edges={}",
+        "🔎 tcp-tun-egress-feedback paused={} reason={} tx_dropped_delta={} max_pressure={} total_pressure={} high={} low={} drop_events={} drop_delta_total={} max_delta={} pause_edges={} resume_edges={} drop_credit_generation={} drop_credit_debt_bytes={}",
         event.paused,
         event.reason.as_str(),
         event.tx_dropped_delta,
@@ -2227,7 +2350,9 @@ fn format_tun_egress_feedback_diag(
         state.drop_delta_total,
         state.max_drop_delta,
         state.pause_edges,
-        state.resume_edges
+        state.resume_edges,
+        drop_debt.generation,
+        drop_debt.debt_bytes
     )
 }
 
@@ -3017,6 +3142,7 @@ pub async fn run_event_loop<D, U, M>(
     let tun_rx_drain_budget = runtime_config.tun_rx_drain_budget;
     let mut downlink_egress_pacer =
         DownlinkEgressPacer::new(runtime_config.downlink_egress_immediate_bytes);
+    let mut downlink_egress_drop_debt = DownlinkEgressDropDebt::default();
     let mut tun_egress_drop_sampler = TunEgressDropSampler::new(device.interface_name());
     let mut tun_egress_feedback = TunEgressFeedbackState::default();
     let mut tun_rx_drain_diag = TunRxDrainDiag::default();
@@ -3067,6 +3193,7 @@ pub async fn run_event_loop<D, U, M>(
                             udp_clock.elapsed().as_secs(),
                             downlink_flush_max_bytes,
                             &mut downlink_egress_pacer,
+                            &mut downlink_egress_drop_debt,
                             downlink_backpressure,
                         )
                         .await
@@ -3107,6 +3234,7 @@ pub async fn run_event_loop<D, U, M>(
                                 &mut metrics,
                                 downlink_flush_max_bytes,
                                 downlink_backpressure,
+                                &mut downlink_egress_drop_debt,
                                 &mut tcp_loop_flush_tx_calls,
                                 &mut tcp_loop_flush_tx_failures,
                                 &mut tun_rx_drain_diag,
@@ -3155,6 +3283,7 @@ pub async fn run_event_loop<D, U, M>(
                         &mut metrics,
                         downlink_flush_max_bytes,
                         downlink_backpressure,
+                        &mut downlink_egress_drop_debt,
                         &mut tcp_loop_flush_tx_calls,
                         &mut tcp_loop_flush_tx_failures,
                         "inbound_poll",
@@ -3260,6 +3389,15 @@ pub async fn run_event_loop<D, U, M>(
                 let tun_sample = tun_egress_drop_sampler.sample();
                 let feedback_event =
                     tun_egress_feedback.update(&tun_sample, downlink_stats, downlink_backpressure);
+                if matches!(
+                    feedback_event,
+                    Some(TunEgressFeedbackEvent {
+                        reason: TunEgressFeedbackReason::DropDelta,
+                        ..
+                    })
+                ) {
+                    downlink_egress_drop_debt.note_tun_drop(downlink_backpressure);
+                }
                 tun_egress_feedback.observe_pressure_at(
                     downlink_stats_raw,
                     downlink_backpressure,
@@ -3285,6 +3423,7 @@ pub async fn run_event_loop<D, U, M>(
                                 event,
                                 &tun_egress_feedback,
                                 downlink_backpressure,
+                                downlink_egress_drop_debt,
                             )
                         );
                     }
@@ -3322,6 +3461,7 @@ pub async fn run_event_loop<D, U, M>(
                     &mut metrics,
                     downlink_flush_max_bytes,
                     downlink_backpressure,
+                    &mut downlink_egress_drop_debt,
                 )
                 .await;
             }
@@ -3350,6 +3490,7 @@ async fn process_ready_tun_rx_packet<D, U, M>(
     metrics: &mut M,
     downlink_flush_max_bytes: usize,
     downlink_backpressure: DownlinkBackpressureConfig,
+    downlink_egress_drop_debt: &mut DownlinkEgressDropDebt,
     tcp_loop_flush_tx_calls: &mut u64,
     tcp_loop_flush_tx_failures: &mut u64,
     poll_stage: &str,
@@ -3433,6 +3574,7 @@ where
         metrics,
         downlink_flush_max_bytes,
         downlink_backpressure,
+        downlink_egress_drop_debt,
     )
     .await;
 
@@ -3457,6 +3599,7 @@ async fn drain_ready_tun_rx<D, U, M>(
     metrics: &mut M,
     downlink_flush_max_bytes: usize,
     downlink_backpressure: DownlinkBackpressureConfig,
+    downlink_egress_drop_debt: &mut DownlinkEgressDropDebt,
     tcp_loop_flush_tx_calls: &mut u64,
     tcp_loop_flush_tx_failures: &mut u64,
     diag: &mut TunRxDrainDiag,
@@ -3494,6 +3637,7 @@ where
                     metrics,
                     downlink_flush_max_bytes,
                     downlink_backpressure,
+                    downlink_egress_drop_debt,
                     tcp_loop_flush_tx_calls,
                     tcp_loop_flush_tx_failures,
                     "tun_rx_drain",
@@ -3541,6 +3685,7 @@ async fn process_dirty_relay<U, M>(
     metrics: &mut M,
     downlink_flush_max_bytes: usize,
     downlink_backpressure: DownlinkBackpressureConfig,
+    downlink_egress_drop_debt: &mut DownlinkEgressDropDebt,
 ) where
     U: ProxyUpstream + 'static,
     M: MetricsSink,
@@ -3562,6 +3707,7 @@ async fn process_dirty_relay<U, M>(
             metrics_handle,
             downlink_flush_max_bytes,
             downlink_backpressure,
+            downlink_egress_drop_debt,
         )
         .await
         {
@@ -4085,7 +4231,7 @@ fn rearm_socket_with_reason_and_snapshot(
         let close_pending = close_pending_accounting(ctx, snapshot);
         let close_egress = close_egress_accounting(snapshot);
         tcp_diag_log!(
-            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} drain_credit_granted_bytes={} drain_credit_planned_bytes={} drain_credit_used_bytes={} hard_edge_guard_bytes={} hard_edge_guard_limited_calls={} hard_edge_guard_deferred_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes={} close_egress_class={} close_egress_bytes={} close_egress_drain_candidate={} tcp_state={:?} active={} can_send={} can_recv={} may_send={} may_recv={} send_capacity={} send_queue={} recv_queue={}",
+            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} drain_credit_granted_bytes={} drain_credit_planned_bytes={} drain_credit_used_bytes={} drop_credit_debt_bytes={} drop_credit_debt_paid_bytes={} drop_credit_blocked_bytes={} hard_edge_guard_bytes={} hard_edge_guard_limited_calls={} hard_edge_guard_deferred_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes={} close_egress_class={} close_egress_bytes={} close_egress_drain_candidate={} tcp_state={:?} active={} can_send={} can_recv={} may_send={} may_recv={} send_capacity={} send_queue={} recv_queue={}",
             handle,
             close_direction,
             close_reason,
@@ -4116,6 +4262,9 @@ fn rearm_socket_with_reason_and_snapshot(
             ctx.downlink_diag.send_slice_drain_credit_granted_bytes,
             ctx.downlink_diag.send_slice_drain_credit_planned_bytes,
             ctx.downlink_diag.send_slice_drain_credit_used_bytes,
+            ctx.downlink_diag.send_slice_drop_credit_debt_bytes,
+            ctx.downlink_diag.send_slice_drop_credit_debt_paid_bytes,
+            ctx.downlink_diag.send_slice_drop_credit_blocked_bytes,
             ctx.downlink_diag.send_slice_hard_edge_guard_bytes,
             ctx.downlink_diag.send_slice_hard_edge_guard_limited,
             ctx.downlink_diag.send_slice_hard_edge_guard_deferred_bytes,
@@ -4150,7 +4299,7 @@ fn rearm_socket_with_reason_and_snapshot(
         ClosePendingClass::Unknown
     };
     tcp_diag_log!(
-        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} drain_credit_granted_bytes={} drain_credit_planned_bytes={} drain_credit_used_bytes={} hard_edge_guard_bytes={} hard_edge_guard_limited_calls={} hard_edge_guard_deferred_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes=0 close_egress_class=unknown close_egress_bytes=0 close_egress_drain_candidate=false",
+        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} drain_credit_granted_bytes={} drain_credit_planned_bytes={} drain_credit_used_bytes={} drop_credit_debt_bytes={} drop_credit_debt_paid_bytes={} drop_credit_blocked_bytes={} hard_edge_guard_bytes={} hard_edge_guard_limited_calls={} hard_edge_guard_deferred_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes=0 close_egress_class=unknown close_egress_bytes=0 close_egress_drain_candidate=false",
         handle,
         close_direction,
         close_reason,
@@ -4181,6 +4330,9 @@ fn rearm_socket_with_reason_and_snapshot(
         ctx.downlink_diag.send_slice_drain_credit_granted_bytes,
         ctx.downlink_diag.send_slice_drain_credit_planned_bytes,
         ctx.downlink_diag.send_slice_drain_credit_used_bytes,
+        ctx.downlink_diag.send_slice_drop_credit_debt_bytes,
+        ctx.downlink_diag.send_slice_drop_credit_debt_paid_bytes,
+        ctx.downlink_diag.send_slice_drop_credit_blocked_bytes,
         ctx.downlink_diag.send_slice_hard_edge_guard_bytes,
         ctx.downlink_diag.send_slice_hard_edge_guard_limited,
         ctx.downlink_diag.send_slice_hard_edge_guard_deferred_bytes,
@@ -4251,6 +4403,7 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
     metrics_handle: &Metrics,
     downlink_flush_max_bytes: usize,
     downlink_backpressure: DownlinkBackpressureConfig,
+    downlink_egress_drop_debt: &mut DownlinkEgressDropDebt,
 ) -> Result<(), ClientError> {
     // 每轮先推进该 handle 的下行 pending：TCP ACK 释放 tx buffer 空间后继续写，
     // 直到把上一轮没写完的回程字节全部交付，绝不丢字节（修 bad decrypt 的另一半）。
@@ -4263,6 +4416,7 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
                 ctx,
                 downlink_flush_max_bytes,
                 downlink_backpressure,
+                downlink_egress_drop_debt,
             );
             note_downlink_pending_progress(ctx, now_secs, flush_outcome.accepted_bytes);
             if finish_deferred_relay_close_if_drained(
@@ -4603,6 +4757,7 @@ async fn handle_remote_payload<D: TunIo>(
     now_secs: u64,
     downlink_flush_max_bytes: usize,
     downlink_egress_pacer: &mut DownlinkEgressPacer,
+    downlink_egress_drop_debt: &mut DownlinkEgressDropDebt,
     downlink_backpressure: DownlinkBackpressureConfig,
 ) -> std::io::Result<usize> {
     let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
@@ -4687,6 +4842,7 @@ async fn handle_remote_payload<D: TunIo>(
         ctx,
         downlink_flush_max_bytes,
         downlink_backpressure,
+        downlink_egress_drop_debt,
     );
     let accepted_bytes = flush_outcome.accepted_bytes;
     note_downlink_pending_progress(ctx, now_secs, accepted_bytes);
@@ -6685,6 +6841,7 @@ mod tests {
             downlink_egress_clock: DownlinkEgressClock {
                 last_send_queue: Some(12_345),
                 drain_credit_bytes: 1024,
+                drop_debt_generation_seen: 3,
             },
             last_tcp_lifecycle: None,
             reverse_window_last_log_secs: Some(12),
@@ -7311,6 +7468,9 @@ mod tests {
                 clean_headroom_bytes: 2,
                 drain_credit_granted_bytes: 0,
                 drain_credit_planned_bytes: 0,
+                drop_credit_debt_bytes: 13,
+                drop_credit_debt_paid_bytes: 5,
+                drop_credit_blocked_bytes: 8,
                 hard_edge_guard_bytes: 0,
                 hard_edge_guard_deferred_bytes: 0,
             },
@@ -7320,6 +7480,9 @@ mod tests {
         assert_eq!(diag.send_slice_budget_limited, 0);
         assert_eq!(diag.send_slice_headroom_limited, 1);
         assert_eq!(diag.send_slice_headroom_deferred_bytes, 62);
+        assert_eq!(diag.send_slice_drop_credit_debt_bytes, 13);
+        assert_eq!(diag.send_slice_drop_credit_debt_paid_bytes, 5);
+        assert_eq!(diag.send_slice_drop_credit_blocked_bytes, 8);
         assert_eq!(diag.send_slice_hard_edge_guard_limited, 0);
         assert_eq!(diag.send_slice_hard_edge_guard_deferred_bytes, 0);
         assert_eq!(diag.downlink_pending_high_water, 64);
@@ -7383,6 +7546,9 @@ mod tests {
         assert!(line.contains("budget_limited_calls=2"));
         assert!(line.contains("headroom_limited_calls=0"));
         assert!(line.contains("headroom_deferred_bytes=0"));
+        assert!(line.contains("drop_credit_debt_bytes=0"));
+        assert!(line.contains("drop_credit_debt_paid_bytes=0"));
+        assert!(line.contains("drop_credit_blocked_bytes=0"));
         assert!(line.contains("hard_edge_guard_bytes=0"));
         assert!(line.contains("hard_edge_guard_limited_calls=0"));
         assert!(line.contains("hard_edge_guard_deferred_bytes=0"));
@@ -8046,7 +8212,9 @@ mod tests {
                 cfg,
             )
             .expect("drop delta should pause feedback");
-        let line = format_tun_egress_feedback_diag(event, &feedback, cfg);
+        let mut drop_debt = DownlinkEgressDropDebt::default();
+        drop_debt.note_tun_drop(cfg);
+        let line = format_tun_egress_feedback_diag(event, &feedback, cfg, drop_debt);
 
         assert!(line.contains("tcp-tun-egress-feedback"));
         assert!(line.contains("paused=true"));
@@ -8060,6 +8228,8 @@ mod tests {
         assert!(line.contains("max_delta=14167"));
         assert!(line.contains("pause_edges=1"));
         assert!(line.contains("resume_edges=0"));
+        assert!(line.contains("drop_credit_generation=1"));
+        assert!(line.contains("drop_credit_debt_bytes=1572864"));
     }
 
     #[test]
@@ -8350,6 +8520,108 @@ mod tests {
         );
         assert_eq!(third.drain_credit_planned_bytes, 12);
         assert_eq!(third.hard_edge_guard_deferred_bytes, 3);
+    }
+
+    #[test]
+    fn downlink_drop_credit_debt_blocks_existing_credit_after_tun_drop() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let mut clock = DownlinkEgressClock {
+            last_send_queue: Some(130),
+            drain_credit_bytes: 27,
+            drop_debt_generation_seen: 0,
+        };
+        let mut drop_debt = DownlinkEgressDropDebt::default();
+        assert_eq!(drop_debt.note_tun_drop(cfg), 30);
+
+        let after_drop_drain = TcpSendWindowSnapshot {
+            can_send: true,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 100,
+            send_queue: 100,
+            recv_queue: 0,
+        };
+        let limit = bounded_downlink_flush_limit_for_window_with_clock_and_drop(
+            100,
+            100,
+            after_drop_drain,
+            cfg,
+            &mut clock,
+            &mut drop_debt,
+        );
+
+        assert_eq!(
+            limit.len, 30,
+            "drop debt must leave clean headroom usable but block extra credit"
+        );
+        assert_eq!(limit.clean_headroom_bytes, 30);
+        assert_eq!(limit.drain_credit_granted_bytes, 0);
+        assert_eq!(limit.drain_credit_planned_bytes, 0);
+        assert_eq!(limit.drop_credit_debt_paid_bytes, 30);
+        assert_eq!(limit.drop_credit_debt_bytes, 0);
+        assert_eq!(
+            limit.drop_credit_blocked_bytes, 57,
+            "stale credit plus drop-paid drain should be visible as blocked credit"
+        );
+    }
+
+    #[test]
+    fn downlink_drop_credit_debt_must_be_paid_before_new_credit() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let mut clock = DownlinkEgressClock {
+            last_send_queue: Some(160),
+            drain_credit_bytes: 0,
+            drop_debt_generation_seen: 0,
+        };
+        let mut drop_debt = DownlinkEgressDropDebt::default();
+        drop_debt.note_tun_drop(cfg);
+
+        let debt_payment_window = TcpSendWindowSnapshot {
+            can_send: true,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 100,
+            send_queue: 130,
+            recv_queue: 0,
+        };
+        let debt_payment = bounded_downlink_flush_limit_for_window_with_clock_and_drop(
+            100,
+            100,
+            debt_payment_window,
+            cfg,
+            &mut clock,
+            &mut drop_debt,
+        );
+        assert_eq!(debt_payment.drop_credit_debt_paid_bytes, 30);
+        assert_eq!(debt_payment.drain_credit_granted_bytes, 0);
+        assert_eq!(debt_payment.len, 0);
+        clock.note_flush_result(debt_payment_window.send_queue, 0, debt_payment);
+
+        let clean_drain_window = TcpSendWindowSnapshot {
+            send_queue: 100,
+            ..debt_payment_window
+        };
+        let clean_drain = bounded_downlink_flush_limit_for_window_with_clock_and_drop(
+            100,
+            100,
+            clean_drain_window,
+            cfg,
+            &mut clock,
+            &mut drop_debt,
+        );
+        assert_eq!(
+            clean_drain.drain_credit_granted_bytes, 30,
+            "only drain observed after drop debt is paid can become credit"
+        );
+        assert_eq!(clean_drain.drop_credit_debt_paid_bytes, 0);
+        assert_eq!(clean_drain.drain_credit_planned_bytes, 27);
+        assert_eq!(clean_drain.len, 57);
     }
 
     #[test]

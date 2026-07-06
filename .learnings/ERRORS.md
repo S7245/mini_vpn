@@ -1,5 +1,40 @@
 # Errors
 
+## 2026-07-06 - Knife14ce VPS failed because drop-debt feedback arrived after the hot burst
+
+- Stage: Knife14ce drop-aware egress credit VPS acceptance.
+- Failed bundle:
+  `/tmp/mini_vpn/knife14ce_drop_credit_20260707_0049/mvpn_knife14ce_drop_credit_usclient_suite_20260707_005007.tar.gz`
+- Symptom: reverse-first P1 reached only `23.6/21.5 Mbit/s` with
+  `tun_tx_dropped_delta=2813` in the probe and final `drop_delta_total=5405`.
+- Important discriminator: `tcp-tun-egress-feedback` installed
+  `drop_credit_debt_bytes=196608`, but the hot `tcp-downlink-flush` and final
+  lifecycle summaries kept `drop_credit_debt_bytes=0`,
+  `drop_credit_debt_paid_bytes=0`, and `drop_credit_blocked_bytes=0`.
+- Root cause for this stage: sysfs TUN drop feedback was sampled too late to
+  control the burst that had already filled local egress pressure; it became
+  close-tail evidence rather than hot-path control.
+- Rejected next moves: do not treat this as stale pool, iperf3, sing-box auth,
+  time skew, server config, QUIC loss/congestion, terminal pending, or
+  close/reap loss.
+- Correct behavior: keep the debt invariant, but add a proactive local
+  egress-pressure credit gate before another VPS run. Also verify feedback can
+  resume from raw low pressure instead of remaining stuck after drops.
+
+## 2026-07-06 - Knife14ce remote commands need login shell and explicit env source
+
+- Stage: Knife14ce `.27` sync and VPS acceptance setup.
+- Symptom A: a direct non-login SSH command on `.27` failed with
+  `cargo: command not found`.
+- Correct behavior A: use `bash -lc 'cd /home/ubuntu/mini_vpn && cargo ...'`
+  for remote Rust commands so the VPS toolchain environment is loaded.
+- Symptom B: the first suite attempt stopped before the business test because
+  required TUIC environment variables were not present in the shell even though
+  `.env` existed on `.27`.
+- Correct behavior B: in the same true TTY command that runs the suite, source
+  the VPS-local `.env` with `set -a; . ./.env; set +a` before invoking the
+  script. Do not print or store any secret values.
+
 ## 2026-07-06 - Knife14bw VPS acceptance failed with tx-queue pressure oscillation
 
 - Stage: Knife14bw reverse starvation diagnostics acceptance for commit
