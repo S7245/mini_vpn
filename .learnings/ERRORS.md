@@ -1403,3 +1403,19 @@
   repeat in the same evidence mode or add evidence-only stream/window
   instrumentation to distinguish VPS run variance from a deterministic
   stream-readiness or local TCP ACK/window issue.
+
+## 2026-07-06 — Knife14bq repeat changed from no-data to tail-collapse pressure
+
+- Symptom: the same `d5d8542` reverse-first P1 repeat with server evidence and
+  `.33 <-> .77` path checks averaged `150/149 Mbit/s`, but the final six
+  seconds collapsed to about `15.7-16.8 Mbit/s`.
+- Evidence: `.27 <-> .77` and `.33 <-> .77` baselines were healthy, `.33`
+  showed current TUIC inbound/direct outbound to `.77:5201` and no current TUIC
+  `fail auth`, `.77` sender matched `537 MBytes / 150 Mbit/s`, QUIC
+  loss/congestion stayed `0/0`, while mini_vpn recorded
+  `tun_tx_dropped_delta=14804`, `downlink_backpressure=693/693`, and
+  `terminal_late_remote_payload=1474528B`.
+- Correct behavior: do not continue the no-data branch and do not treat the
+  average `149 Mbit/s` as final acceptance. The next patch must be
+  evidence/TDD-first around local TUN egress pressure, downlink pause/resume
+  timing, and close-tail terminal-late correlation before changing behavior.

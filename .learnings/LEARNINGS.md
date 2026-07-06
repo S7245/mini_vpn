@@ -2288,3 +2288,31 @@ worth cleaning up separately.
   complete server evidence, do not patch behavior immediately. Repeat or add
   evidence-only instrumentation to separate VPS variance, stream-readiness, and
   local TCP window/ACK behavior.
+
+## 2026-07-06 — Knife14bq repeat rejects stable no-data and exposes tail-collapse pressure
+
+- Stage: Knife14bq same-code repeat for `d5d8542` with default server evidence
+  and same-window `.33 <-> .77` iperf path checks.
+- Bundle:
+  `/tmp/mini_vpn/knife14bp_repeat_exitpath_20260706/mvpn_knife14bp_repeat_exitpath_d5d8542_usclient_suite_20260706_155856.tar.gz`
+- Outcome: reverse-first P1 averaged `150/149 Mbit/s`, so the prior no-data
+  shape was not stable and the code can leave the old `10-20 Mbit/s` band.
+  The final six seconds still collapsed to about `15.7-16.8 Mbit/s`, so this
+  is not stable throughput acceptance.
+- Evidence: direct `.27 <-> .77` and `.33 <-> .77` baselines were healthy
+  (`281-284 Mbit/s` receiver direction), `.33` had current TUIC inbound and
+  direct outbound to `.77:5201` with no TUIC `fail auth`, `.77` sender matched
+  the tunnel at `537 MBytes / 150 Mbit/s`, and QUIC loss/congestion remained
+  `0/0`.
+- mini_vpn signals: `tun_tx_dropped_delta=14804`,
+  `downlink_backpressure=693/693`, `tun_flush_deferred=693`,
+  `terminal_pending_reap=0`, `pending_at_close=0`, and
+  `terminal_late_remote_payload=1474528B` across `835` events.
+- Key lesson: Knife14 is no longer blocked on the no-data branch, but the
+  acceptance blocker is still local downlink/TUN egress pressure and tail
+  collapse, not sing-box auth, iperf3, stale pool slots, or the exit-target
+  path.
+- Reusable rule: after a repeat changes from no-data to high-average
+  tail-collapse, record it as a separate failure shape and add correlation
+  evidence before behavior changes. Do not claim final acceptance from average
+  throughput while tail seconds and TUN drops remain unhealthy.
