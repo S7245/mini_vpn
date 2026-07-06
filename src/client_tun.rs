@@ -1939,18 +1939,10 @@ fn parse_downlink_backpressure_config(
     )
 }
 
-fn default_downlink_backpressure_for_tx_buffer(tx_bytes: usize) -> DownlinkBackpressureConfig {
-    let default = DownlinkBackpressureConfig::default();
-    if tx_bytes <= default.high_bytes {
-        return default;
-    }
-
-    let high_bytes = tx_bytes;
-    let low_bytes = (tx_bytes / 4).max(1).min(high_bytes.saturating_sub(1));
-    DownlinkBackpressureConfig {
-        high_bytes,
-        low_bytes,
-    }
+fn default_downlink_backpressure_for_tx_buffer(_tx_bytes: usize) -> DownlinkBackpressureConfig {
+    // Knife14bs showed tx-buffer-sized auto high watermarks can create stop/go
+    // reverse throughput.
+    DownlinkBackpressureConfig::default()
 }
 
 fn parse_downlink_backpressure_config_for_tx_buffer(
@@ -6923,11 +6915,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_downlink_backpressure_config_scales_defaults_with_tcp_tx_buffer() {
-        let scaled =
+    fn parse_downlink_backpressure_config_keeps_safe_defaults_with_large_tcp_tx_buffer() {
+        let auto =
             parse_downlink_backpressure_config_for_tx_buffer(None, None, 1_048_576);
-        assert_eq!(scaled.high_bytes, 1_048_576);
-        assert_eq!(scaled.low_bytes, 262_144);
+        assert_eq!(auto, DownlinkBackpressureConfig::default());
 
         let legacy =
             parse_downlink_backpressure_config_for_tx_buffer(None, None, 65_535);

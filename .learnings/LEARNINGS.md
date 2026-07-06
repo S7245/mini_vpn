@@ -2378,3 +2378,23 @@ worth cleaning up separately.
   creates stop/go receive-window behavior. The next model must account for
   TUN/qdisc egress capacity and stream read-gap timing, not just smoltcp
   `send_queue` bytes.
+
+## 2026-07-06 — Knife14bt restores conservative core auto backpressure
+
+- Stage: Knife14bt core default patch after Knife14bs showed that binary auto
+  high `1048576` / low `262144` regressed reverse-first P1 to a low-average
+  `18.8 Mbit/s` receiver shape.
+- Outcome: `client_tun.rs` no longer derives auto downlink backpressure from
+  TCP tx buffer size. Empty/unset high/low env now resolve to the conservative
+  product default `524288/131072`; explicit high/low env remains honored for
+  deliberate A/B tests.
+- TDD: the focused parser test first failed with the old `1048576/262144`
+  auto value, then passed after the core default change.
+- Local gates passed: focused backpressure parser test, focused downlink
+  backpressure tests, focused TUN egress feedback tests, full `cargo test
+  --lib`, and `git diff --check`.
+- Reusable rule: when acceptance shows a larger receive-window/backpressure
+  default reduces drops but creates stop/go low-average throughput, remove that
+  default from the product path and keep larger watermarks explicit only. The
+  remaining Knife14 branch is durable local TUN egress pressure and tail
+  collapse, not script env normalization.
