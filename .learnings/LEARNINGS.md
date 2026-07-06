@@ -2725,3 +2725,28 @@ worth cleaning up separately.
   soft/mid/hard numbers. The next core fix should bound remote payload
   acceptance by remaining egress headroom before `send_slice` can push the
   local TUN/qdisc path past clean capacity.
+
+## 2026-07-06 - Knife14ca bounds remote accept by egress headroom
+
+- Stage: Knife14ca code patch after Knife14bz proved static midpoint threshold
+  tuning still allowed tx_queue overshoot and TUN drops.
+- Outcome: `flush_downlink` now caps each `send_slice` attempt by configured
+  per-flush budget, smoltcp send capacity, and remaining tx_queue clean egress
+  headroom. Bytes that do not fit remain in `downlink_pending` for dirty/timer
+  retry instead of being dropped or pushed past the local TUN/qdisc clean
+  capacity.
+- Diagnostics: `tcp-downlink-flush` and `tcp-handle-close` now include
+  `headroom_limited_calls` and `headroom_deferred_bytes`; the low-RTT parser
+  summary exposes these fields as `headroom_limited` and
+  `headroom_deferred_bytes`.
+- TDD: the RED test first failed because
+  `bounded_downlink_flush_len_for_window` did not exist. The GREEN patch added
+  the headroom-aware limit, wired it through both remote-payload and
+  dirty/timer pending flush paths, and added diagnostic coverage.
+- Local gates passed: focused headroom/diag/pacer/backpressure tests, full
+  `cargo test --lib` (`299` passed), low-RTT and US-client suite self-tests,
+  shell syntax checks, `git diff --check`, release build, harness tests
+  (`10` passed, `4` ignored), and clippy with harness.
+- Reusable rule: when post-send egress pacing is too late, move the guard to
+  the pre-`send_slice` accept boundary and keep overflow as pending data. This
+  is an algorithmic capacity-match change, not another threshold-only tweak.

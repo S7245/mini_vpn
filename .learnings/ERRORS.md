@@ -1680,3 +1680,14 @@
   fast-forward from `origin/codex/knife14d-downlink-reap-open`, or configure
   deploy-key access deliberately outside the test path. Do not change the repo
   origin or retry interactive HTTPS pushes during Knife14 acceptance.
+
+## 2026-07-06 - Cargo test accepts one filter per invocation
+
+- Symptom: while running Knife14ca focused tests, commands such as
+  `cargo test --lib test_a test_b` failed with
+  `unexpected argument 'test_b' found`.
+- Cause: `cargo test` accepts at most one test filter before `--`; additional
+  positional filters are interpreted as invalid arguments.
+- Correct behavior: run exact test filters in separate commands, or use one
+  broader substring filter that matches the desired group. Do not combine
+  multiple exact test names in one `cargo test` invocation.

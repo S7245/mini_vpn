@@ -210,6 +210,10 @@ struct TcpDownlinkDiag {
     send_slice_no_capacity: u64,
     /// Times the configured per-flush budget clipped a larger pending backlog.
     send_slice_budget_limited: u64,
+    /// Times the tx_queue clean egress headroom clipped a send attempt.
+    send_slice_headroom_limited: u64,
+    /// Bytes intentionally left pending because the tx_queue clean headroom was exhausted.
+    send_slice_headroom_deferred_bytes: u64,
     /// `send_slice` errors, usually socket close/reset while downlink still had bytes.
     send_slice_errors: u64,
     /// TCP downlink-triggered TUN flush attempts.
@@ -289,6 +293,22 @@ impl TcpDownlinkDiag {
             self.send_slice_budget_limited += 1;
         }
         self.note_pending(pending_current);
+    }
+
+    fn note_flush_limit(
+        &mut self,
+        pending_current: usize,
+        max_bytes_per_flush: usize,
+        limit: DownlinkFlushLimit,
+    ) {
+        self.note_flush_attempt(pending_current, max_bytes_per_flush);
+        if limit.headroom_limited {
+            self.send_slice_headroom_limited =
+                self.send_slice_headroom_limited.saturating_add(1);
+            self.send_slice_headroom_deferred_bytes = self
+                .send_slice_headroom_deferred_bytes
+                .saturating_add(limit.headroom_deferred_bytes as u64);
+        }
     }
 
     fn note_no_send_capacity(&mut self, pending_current: usize) {
@@ -1077,37 +1097,107 @@ fn bounded_downlink_flush_len(pending_len: usize, max_bytes_per_flush: usize) ->
     pending_len.min(max_bytes_per_flush.max(1))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DownlinkFlushLimit {
+    len: usize,
+    headroom_limited: bool,
+    headroom_deferred_bytes: usize,
+}
+
+fn bounded_downlink_flush_limit_for_window(
+    pending_len: usize,
+    max_bytes_per_flush: usize,
+    send_window: TcpSendWindowSnapshot,
+    cfg: DownlinkBackpressureConfig,
+) -> DownlinkFlushLimit {
+    let budget_len = bounded_downlink_flush_len(pending_len, max_bytes_per_flush);
+    let socket_len = budget_len.min(send_window.send_capacity);
+    let egress_headroom = tx_queue_flush_threshold(cfg).saturating_sub(send_window.send_queue);
+    let len = socket_len.min(egress_headroom);
+    DownlinkFlushLimit {
+        len,
+        headroom_limited: len < socket_len,
+        headroom_deferred_bytes: socket_len.saturating_sub(len),
+    }
+}
+
+#[cfg(test)]
+fn bounded_downlink_flush_len_for_window(
+    pending_len: usize,
+    max_bytes_per_flush: usize,
+    send_window: TcpSendWindowSnapshot,
+    cfg: DownlinkBackpressureConfig,
+) -> usize {
+    bounded_downlink_flush_limit_for_window(pending_len, max_bytes_per_flush, send_window, cfg).len
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DownlinkFlushOutcome {
+    accepted_bytes: usize,
+    headroom_limited: bool,
+}
+
 fn flush_downlink(
     handle: SocketHandle,
     tcp_socket: &mut TcpSocket,
     ctx: &mut SocketCtx,
     max_bytes_per_flush: usize,
-) -> usize {
+    downlink_backpressure: DownlinkBackpressureConfig,
+) -> DownlinkFlushOutcome {
     if ctx.downlink_pending.is_empty() {
-        return 0;
+        return DownlinkFlushOutcome {
+            accepted_bytes: 0,
+            headroom_limited: false,
+        };
     }
-    ctx.downlink_diag
-        .note_flush_attempt(ctx.downlink_pending.len(), max_bytes_per_flush);
     let send_window = TcpSendWindowSnapshot::from_socket(tcp_socket);
     ctx.downlink_diag
         .note_send_window(send_window, ctx.downlink_pending.len());
     if !send_window.can_send {
         ctx.downlink_diag
+            .note_flush_attempt(ctx.downlink_pending.len(), max_bytes_per_flush);
+        ctx.downlink_diag
             .note_no_send_capacity(ctx.downlink_pending.len());
-        return 0;
+        return DownlinkFlushOutcome {
+            accepted_bytes: 0,
+            headroom_limited: false,
+        };
     }
-    let flush_len = bounded_downlink_flush_len(ctx.downlink_pending.len(), max_bytes_per_flush);
+    let flush_limit = bounded_downlink_flush_limit_for_window(
+        ctx.downlink_pending.len(),
+        max_bytes_per_flush,
+        send_window,
+        downlink_backpressure,
+    );
+    ctx.downlink_diag.note_flush_limit(
+        ctx.downlink_pending.len(),
+        max_bytes_per_flush,
+        flush_limit,
+    );
+    if flush_limit.len == 0 {
+        return DownlinkFlushOutcome {
+            accepted_bytes: 0,
+            headroom_limited: flush_limit.headroom_limited,
+        };
+    }
+    let flush_len = flush_limit.len;
     match tcp_socket.send_slice(&ctx.downlink_pending[..flush_len]) {
         Ok(0) => {
             ctx.downlink_diag
                 .note_send_slice_ok(0, ctx.downlink_pending.len());
-            0
+            DownlinkFlushOutcome {
+                accepted_bytes: 0,
+                headroom_limited: flush_limit.headroom_limited,
+            }
         }
         Ok(n) => {
             ctx.downlink_pending.drain(..n);
             ctx.downlink_diag
                 .note_send_slice_ok(n, ctx.downlink_pending.len());
-            n
+            DownlinkFlushOutcome {
+                accepted_bytes: n,
+                headroom_limited: flush_limit.headroom_limited,
+            }
         }
         Err(_) => {
             tcp_diag_log!(
@@ -1120,7 +1210,10 @@ fn flush_downlink(
             // socket 不可发（已关闭/复位）：丢弃残留，避免无限堆积。
             ctx.downlink_pending.clear();
             ctx.downlink_diag.note_pending(0);
-            0
+            DownlinkFlushOutcome {
+                accepted_bytes: 0,
+                headroom_limited: flush_limit.headroom_limited,
+            }
         }
     }
 }
@@ -1538,6 +1631,8 @@ struct TcpDownlinkAggregate {
     send_slice_zero: u64,
     send_slice_errors: u64,
     send_slice_budget_limited: u64,
+    send_slice_headroom_limited: u64,
+    send_slice_headroom_deferred_bytes: u64,
     send_slice_max_accepted_bytes: usize,
     tun_flush_tx_calls: u64,
     tun_flush_tx_failures: u64,
@@ -1593,6 +1688,12 @@ fn tcp_downlink_aggregate<'a>(
         aggregate.send_slice_budget_limited = aggregate
             .send_slice_budget_limited
             .saturating_add(ctx.downlink_diag.send_slice_budget_limited);
+        aggregate.send_slice_headroom_limited = aggregate
+            .send_slice_headroom_limited
+            .saturating_add(ctx.downlink_diag.send_slice_headroom_limited);
+        aggregate.send_slice_headroom_deferred_bytes = aggregate
+            .send_slice_headroom_deferred_bytes
+            .saturating_add(ctx.downlink_diag.send_slice_headroom_deferred_bytes);
         aggregate.send_slice_max_accepted_bytes = aggregate
             .send_slice_max_accepted_bytes
             .max(ctx.downlink_diag.send_slice_max_accepted_bytes);
@@ -1647,7 +1748,7 @@ fn format_tcp_downlink_flush_diag(
     dirty_handles: usize,
 ) -> String {
     format!(
-        "🔎 tcp-downlink-flush pending_total={} pending_max={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} dirty_handles={}",
+        "🔎 tcp-downlink-flush pending_total={} pending_max={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} dirty_handles={}",
         aggregate.pending_total,
         aggregate.pending_max,
         aggregate.pending_high,
@@ -1670,6 +1771,8 @@ fn format_tcp_downlink_flush_diag(
         aggregate.send_slice_zero,
         aggregate.send_slice_errors,
         aggregate.send_slice_budget_limited,
+        aggregate.send_slice_headroom_limited,
+        aggregate.send_slice_headroom_deferred_bytes,
         aggregate.send_slice_max_accepted_bytes,
         aggregate.tun_flush_tx_calls,
         aggregate.tun_flush_tx_failures,
@@ -2076,6 +2179,18 @@ impl DownlinkEgressPacer {
     fn debit_budget(&mut self, accepted_bytes: usize) {
         self.remaining_immediate_bytes =
             self.remaining_immediate_bytes.saturating_sub(accepted_bytes);
+    }
+
+    fn allow_headroom_limited_flush(&mut self, accepted_bytes: usize) -> bool {
+        if accepted_bytes == 0 || self.immediate_budget_bytes == 0 {
+            return false;
+        }
+        if accepted_bytes > self.remaining_immediate_bytes {
+            self.remaining_immediate_bytes = 0;
+            return false;
+        }
+        self.remaining_immediate_bytes -= accepted_bytes;
+        true
     }
 
     fn allow_remote_payload_flush(
@@ -3777,7 +3892,7 @@ fn rearm_socket_with_reason_and_snapshot(
         let close_pending = close_pending_accounting(ctx, snapshot);
         let close_egress = close_egress_accounting(snapshot);
         tcp_diag_log!(
-            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes={} close_egress_class={} close_egress_bytes={} close_egress_drain_candidate={} tcp_state={:?} active={} can_send={} can_recv={} may_send={} may_recv={} send_capacity={} send_queue={} recv_queue={}",
+            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes={} close_egress_class={} close_egress_bytes={} close_egress_drain_candidate={} tcp_state={:?} active={} can_send={} can_recv={} may_send={} may_recv={} send_capacity={} send_queue={} recv_queue={}",
             handle,
             close_direction,
             close_reason,
@@ -3803,6 +3918,8 @@ fn rearm_socket_with_reason_and_snapshot(
             ctx.downlink_diag.send_slice_zero,
             ctx.downlink_diag.send_slice_errors,
             ctx.downlink_diag.send_slice_budget_limited,
+            ctx.downlink_diag.send_slice_headroom_limited,
+            ctx.downlink_diag.send_slice_headroom_deferred_bytes,
             ctx.downlink_diag.send_slice_max_accepted_bytes,
             ctx.downlink_diag.tun_flush_tx_calls,
             ctx.downlink_diag.tun_flush_tx_failures,
@@ -3834,7 +3951,7 @@ fn rearm_socket_with_reason_and_snapshot(
         ClosePendingClass::Unknown
     };
     tcp_diag_log!(
-        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes=0 close_egress_class=unknown close_egress_bytes=0 close_egress_drain_candidate=false",
+        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes=0 close_egress_class=unknown close_egress_bytes=0 close_egress_drain_candidate=false",
         handle,
         close_direction,
         close_reason,
@@ -3860,6 +3977,8 @@ fn rearm_socket_with_reason_and_snapshot(
         ctx.downlink_diag.send_slice_zero,
         ctx.downlink_diag.send_slice_errors,
         ctx.downlink_diag.send_slice_budget_limited,
+        ctx.downlink_diag.send_slice_headroom_limited,
+        ctx.downlink_diag.send_slice_headroom_deferred_bytes,
         ctx.downlink_diag.send_slice_max_accepted_bytes,
         ctx.downlink_diag.tun_flush_tx_calls,
         ctx.downlink_diag.tun_flush_tx_failures,
@@ -3932,9 +4051,14 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
     {
         let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
         if let Some(ctx) = socket_ctxs.get_mut(&handle) {
-            let accepted_bytes =
-                flush_downlink(handle, tcp_socket, ctx, downlink_flush_max_bytes);
-            note_downlink_pending_progress(ctx, now_secs, accepted_bytes);
+            let flush_outcome = flush_downlink(
+                handle,
+                tcp_socket,
+                ctx,
+                downlink_flush_max_bytes,
+                downlink_backpressure,
+            );
+            note_downlink_pending_progress(ctx, now_secs, flush_outcome.accepted_bytes);
             if finish_deferred_relay_close_if_drained(
                 handle,
                 tcp_socket,
@@ -4351,7 +4475,14 @@ async fn handle_remote_payload<D: TunIo>(
     ctx.downlink_diag
         .note_remote_payload(payload.len(), ctx.downlink_pending.len());
     note_local_finish_remote_progress(ctx, now_secs);
-    let accepted_bytes = flush_downlink(handle, tcp_socket, ctx, downlink_flush_max_bytes);
+    let flush_outcome = flush_downlink(
+        handle,
+        tcp_socket,
+        ctx,
+        downlink_flush_max_bytes,
+        downlink_backpressure,
+    );
+    let accepted_bytes = flush_outcome.accepted_bytes;
     note_downlink_pending_progress(ctx, now_secs, accepted_bytes);
     ctx.state = SocketState::Relaying;
     let snapshot = SocketCloseSnapshot::from_socket(tcp_socket);
@@ -4374,14 +4505,17 @@ async fn handle_remote_payload<D: TunIo>(
         );
     }
 
-    if !downlink_egress_pacer
-        .allow_remote_payload_flush(
+    let allow_immediate_flush = if flush_outcome.headroom_limited && accepted_bytes > 0 {
+        downlink_egress_pacer.allow_headroom_limited_flush(accepted_bytes)
+    } else {
+        downlink_egress_pacer.allow_remote_payload_flush(
             accepted_bytes,
             ctx.downlink_pending.len(),
             snapshot.send_queue,
             downlink_backpressure,
         )
-    {
+    };
+    if !allow_immediate_flush {
         if accepted_bytes > 0 {
             ctx.downlink_diag.note_tun_flush_deferred();
         }
@@ -6844,6 +6978,26 @@ mod tests {
     }
 
     #[test]
+    fn tcp_downlink_diag_tracks_headroom_limited_flushes() {
+        let mut diag = TcpDownlinkDiag::default();
+        diag.note_flush_limit(
+            64,
+            64,
+            DownlinkFlushLimit {
+                len: 2,
+                headroom_limited: true,
+                headroom_deferred_bytes: 62,
+            },
+        );
+
+        assert_eq!(diag.flush_attempts, 1);
+        assert_eq!(diag.send_slice_budget_limited, 0);
+        assert_eq!(diag.send_slice_headroom_limited, 1);
+        assert_eq!(diag.send_slice_headroom_deferred_bytes, 62);
+        assert_eq!(diag.downlink_pending_high_water, 64);
+    }
+
+    #[test]
     fn tcp_downlink_flush_aggregate_formats_progress_signal() {
         let mut a = SocketCtx::new(443);
         a.downlink_pending = vec![0; 10];
@@ -6899,6 +7053,8 @@ mod tests {
         assert!(line.contains("send_slice_calls=1"));
         assert!(line.contains("send_slice_accepted=64"));
         assert!(line.contains("budget_limited_calls=2"));
+        assert!(line.contains("headroom_limited_calls=0"));
+        assert!(line.contains("headroom_deferred_bytes=0"));
         assert!(line.contains("send_slice_max_accepted=64"));
         assert!(line.contains("send_window_samples=2"));
         assert!(line.contains("send_capacity_min=0"));
@@ -7634,6 +7790,28 @@ mod tests {
             bounded_downlink_flush_len(16_384, 0),
             1,
             "defensive zero budget must still make bounded progress"
+        );
+    }
+
+    #[test]
+    fn downlink_flush_len_respects_remaining_egress_headroom() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let send_window = TcpSendWindowSnapshot {
+            can_send: true,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 64,
+            send_queue: 128,
+            recv_queue: 0,
+        };
+
+        assert_eq!(
+            bounded_downlink_flush_len_for_window(64, 64, send_window, cfg),
+            2,
+            "flush should only accept the remaining clean tx_queue headroom"
         );
     }
 
