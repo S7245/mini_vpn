@@ -833,7 +833,7 @@ Optional env:
   QUIET_POLL_SECS=1
   IPERF_BUSY_RETRIES=3      retry each iperf sub-run when Target reports "server is busy"
   IPERF_BUSY_WAIT_SECS=5    seconds to wait between iperf busy retries
-  MINI_VPN_TUIC_TCP_POOL=1  TUIC TCP connection pool; set >1 to isolate concurrent flow congestion
+  MINI_VPN_TUIC_TCP_POOL=2  TUIC TCP connection pool; set 1 for single-connection A/B diagnostics
   MINI_VPN_TCP_RX_BUFFER_BYTES=1048576
   MINI_VPN_TCP_TX_BUFFER_BYTES=1048576
   MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=<auto>  empty/unset lets mini_vpn scale to TCP tx buffer
@@ -1924,7 +1924,7 @@ export MINI_VPN_TCP_DIAG="${MINI_VPN_TCP_DIAG:-1}"
 export MINI_VPN_TUIC_CC="${MINI_VPN_TUIC_CC:-cubic}"
 export MINI_VPN_TUIC_UDP_MODE="${MINI_VPN_TUIC_UDP_MODE:-native}"
 export MINI_VPN_TUIC_ZERO_RTT="${MINI_VPN_TUIC_ZERO_RTT:-false}"
-export MINI_VPN_TUIC_TCP_POOL="${MINI_VPN_TUIC_TCP_POOL:-1}"
+export MINI_VPN_TUIC_TCP_POOL="${MINI_VPN_TUIC_TCP_POOL:-2}"
 export MINI_VPN_TCP_RX_BUFFER_BYTES="${MINI_VPN_TCP_RX_BUFFER_BYTES:-1048576}"
 export MINI_VPN_TCP_TX_BUFFER_BYTES="${MINI_VPN_TCP_TX_BUFFER_BYTES:-1048576}"
 export MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES="${MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES:-$DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES}"

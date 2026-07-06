@@ -1751,3 +1751,37 @@
   alone. Require final TUN egress/drop summaries to stay clean, and repair this
   as a credit-spend/drop-feedback algorithm issue instead of another static
   threshold tune.
+
+## 2026-07-06 - Knife14cc pool=1 no-data was stream starvation, not hard-edge credit
+
+- Stage: Knife14cc VPS acceptance and repeat for commit `7d1f47f`.
+- Failed bundles:
+  `/tmp/mini_vpn/knife14cc_hard_edge_guard_20260706_1606/mvpn_knife14cc_hard_edge_guard_usclient_suite_20260707_000531.tar.gz`
+  and
+  `/tmp/mini_vpn/knife14cc_repeat_20260706_1611/mvpn_knife14cc_repeat_usclient_suite_20260707_001035.tar.gz`.
+- Symptom: reverse-first P1 collapsed twice with `throughput_shape=no_data`
+  (`0.033 Mbit/s` and `0.034 Mbit/s` receiver) even though direct
+  `.27/.33 -> .77` baselines were healthy.
+- Important discriminator: TUN drops, QUIC loss/congestion/blocking,
+  send-slice errors, pending-at-close, terminal pending reap, and hard-edge
+  guard activity were all clean or zero. The repeat run's data stream had
+  `first_rx_ms=17880` and only about `258 KiB` received.
+- Cause: concurrent TUIC TCP streams on the same QUIC connection can starve the
+  reverse data stream under this acceptance shape. Pool=2 A/B changed the
+  stream set to `conns=0,1` and restored immediate data delivery.
+- Correct behavior: make pool=2 the default isolation layer and keep pool=1 as
+  an explicit A/B/regression setting. Do not keep patching local egress, close,
+  or reap logic from pool=1 no-data evidence.
+
+## 2026-07-06 - Relay writer flush is not a TUIC causality claim on quinn 0.10
+
+- Stage: Knife14cd relay writer semantic TDD.
+- Symptom: a generic `AsyncWrite` test proved a flush-gated stream can withhold
+  remote response until `flush()` is called after `write_all`.
+- Transport check: `quinn 0.10.2` implements `SendStream::poll_flush` as
+  immediate `Poll::Ready(Ok(()))` for both `futures_io` and Tokio
+  `AsyncWrite`.
+- Correct behavior: keep `writer.flush().await` as a generic AsyncWrite
+  semantic safeguard, but do not attribute TUIC VPS throughput changes to it.
+  For current TUIC acceptance, use TCP pool isolation and stream metrics as the
+  causal evidence.

@@ -2874,3 +2874,31 @@ worth cleaning up separately.
 - Reusable rule: after a throughput-restoring credit algorithm, protect the
   local egress hard edge with a derived guard and make that guard visible in
   final lifecycle summaries. Average throughput alone is not acceptance.
+
+## 2026-07-06 - Knife14cd isolates concurrent TUIC TCP streams by default
+
+- Stage: Knife14cd follow-up after Knife14cc pool=1 VPS reruns produced
+  repeatable no-data reverse-first windows on commit `7d1f47f`.
+- Result docs:
+  `docs/tech/2026-07-06-knife14cc-hard-edge-credit-guard-results.md`,
+  `docs/tech/2026-07-06-knife14cd-tcp-pool-isolation-spec.md`, and
+  `docs/tech/2026-07-06-knife14cd-tcp-pool-isolation-plan.md`.
+- VPS discriminator: two pool=1 runs had healthy direct baselines, zero TUN
+  drops, zero QUIC loss/congestion/blocking, clean pending/reap accounting, and
+  `tcp_pool ... conns=0`; the repeat run showed data stream
+  `first_rx_ms=17880` and only about `258 KiB` received.
+- A/B signal: rerunning the same binary with `MINI_VPN_TUIC_TCP_POOL=2`
+  changed the stream set to `conns=0,1`, data stream `first_rx_ms=3`, and about
+  `101 MB` received. Reverse throughput improved to `25.9 Mbit/s`, proving
+  pool isolation removes the no-data branch.
+- Remaining root after pool=2: local egress/drop/backlog became visible again
+  (`tun_tx_dropped_delta=541`, `pending_at_close=553066`,
+  `egress_at_close=892928`, `hard_edge_guard_limited=1701`). This is not the
+  final Knife14 fix.
+- Code direction: product and US-client suite defaults move to pool=2, while
+  explicit `MINI_VPN_TUIC_TCP_POOL=1` remains valid for constrained exits and
+  single-connection A/B.
+- Reusable rule: when reverse-first is no-data with clean local egress and both
+  iperf control/data streams on one TUIC connection, test pool isolation before
+  editing local drain/close/egress code. Once pool=2 restores immediate data,
+  stop increasing pool size and return to the newly visible local limiter.

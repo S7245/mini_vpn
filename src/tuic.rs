@@ -31,7 +31,10 @@ const DEFAULT_TUIC_CA_PATH: &str = "cert.pem";
 /// 对 unreliable datagram 有害。BBR 仍可经 `MINI_VPN_TUIC_CC=bbr` 显式选用（实验/特定链路）。
 const DEFAULT_TUIC_CC: &str = "cubic";
 const DEFAULT_TUIC_UDP_MODE: &str = "native";
-const DEFAULT_TUIC_TCP_POOL: usize = 1;
+const MIN_TUIC_TCP_POOL: usize = 1;
+// Knife14cd: pool=2 keeps concurrent TCP control/data streams off the same QUIC connection by default.
+// Explicit pool=1 remains supported for constrained servers and single-connection A/B diagnostics.
+const DEFAULT_TUIC_TCP_POOL: usize = 2;
 const MAX_TUIC_TCP_POOL: usize = 16;
 const DEFAULT_TUIC_QUIC_STATS_SECS: u64 = 30;
 const TUIC_TCP_STREAM_READ_GAP_LOG_MS: u128 = 1_000;
@@ -164,12 +167,12 @@ fn override_field(default: String, env_val: Option<String>) -> String {
     }
 }
 
-/// 解析 `MINI_VPN_TUIC_TCP_POOL`：默认 1；非法/空白/0 回 1；大值裁到上限。
-/// 中文要点：这是 knife14l 的 A/B 开关，不改变默认行为，且永不产生空连接池。
+/// 解析 `MINI_VPN_TUIC_TCP_POOL`：默认 2；非法/空白回默认；0 裁到最小 1；大值裁到上限。
+/// 中文要点：Knife14cd 默认隔离并发 TCP streams；显式 1 仍可复现单连接 A/B，且永不产生空连接池。
 fn parse_tcp_pool(s: Option<&str>) -> usize {
     s.and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_TUIC_TCP_POOL)
-        .clamp(DEFAULT_TUIC_TCP_POOL, MAX_TUIC_TCP_POOL)
+        .clamp(MIN_TUIC_TCP_POOL, MAX_TUIC_TCP_POOL)
 }
 
 /// 解析 QUIC stats 日志周期。
@@ -1367,7 +1370,7 @@ impl TuicUpstream {
             quic::QUIC_RECEIVE_WINDOW_BYTES,
             quic::QUIC_SEND_WINDOW_BYTES
         );
-        let tcp_pool = cfg.tcp_pool.clamp(DEFAULT_TUIC_TCP_POOL, MAX_TUIC_TCP_POOL);
+        let tcp_pool = cfg.tcp_pool.clamp(MIN_TUIC_TCP_POOL, MAX_TUIC_TCP_POOL);
         let mut conns = Vec::with_capacity(tcp_pool);
         let quic_stats_stop = cfg.quic_stats_secs.map(|_| watch::channel(false).0);
         if let Some(secs) = cfg.quic_stats_secs {
@@ -2033,7 +2036,7 @@ mod tests {
         assert_eq!(c.alpn, "h3"); // default
         assert_eq!(c.congestion_control, "cubic"); // 刀3.5 实测裁决：datagram 路径 Cubic 优于 BBR
         assert_eq!(c.udp_relay_mode, "native");
-        assert_eq!(c.tcp_pool, 1);
+        assert_eq!(c.tcp_pool, 2);
         assert_eq!(c.quic_stats_secs, None);
         assert!(
             !c.zero_rtt,
@@ -2056,10 +2059,11 @@ mod tests {
 
     #[test]
     fn tcp_pool_parse_defaults_and_clamps() {
-        assert_eq!(parse_tcp_pool(None), 1);
-        assert_eq!(parse_tcp_pool(Some("")), 1);
+        assert_eq!(parse_tcp_pool(None), 2);
+        assert_eq!(parse_tcp_pool(Some("")), 2);
         assert_eq!(parse_tcp_pool(Some("0")), 1);
-        assert_eq!(parse_tcp_pool(Some("nope")), 1);
+        assert_eq!(parse_tcp_pool(Some("nope")), 2);
+        assert_eq!(parse_tcp_pool(Some("1")), 1);
         assert_eq!(parse_tcp_pool(Some("4")), 4);
         assert_eq!(parse_tcp_pool(Some("999")), MAX_TUIC_TCP_POOL);
     }
