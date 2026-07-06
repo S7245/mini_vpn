@@ -68,6 +68,9 @@ const METRICS_SNAPSHOT_SECS: u64 = 30;
 /// Knife14bf：低频 TUN egress drop feedback 控制周期。1s 足够覆盖 30s reverse probe，
 /// 也避免把 Linux sysfs 读取放进每包热路径。
 const TUN_EGRESS_FEEDBACK_SAMPLE_SECS: u64 = 1;
+/// Knife14bu：smoltcp send_queue 高压刚 flush 到 TUN/qdisc 后，短暂保留本地 egress
+/// 压力，避免下一轮 raw pressure=0 时立刻恢复远端读取。
+const TUN_EGRESS_PRESSURE_HOLD_MS: u64 = 25;
 /// Knife14bi：Knife14bg 证明 opportunistic TUN RX drain 会让 reverse-first 退化；默认关闭。
 const DEFAULT_TUN_RX_DRAIN_BUDGET: usize = 0;
 /// Knife14bh：TUN RX drain 是诊断/公平性路径，允许 A/B 关闭或小幅放大，禁止无界热路径扫描。
@@ -1328,6 +1331,12 @@ impl DownlinkPressureStats {
         self.total_tx_queue = self.total_tx_queue.saturating_add(tx_queue);
     }
 
+    fn with_tx_queue_floor(mut self, max_tx_queue: usize, total_tx_queue: usize) -> Self {
+        self.max_tx_queue = self.max_tx_queue.max(max_tx_queue);
+        self.total_tx_queue = self.total_tx_queue.max(total_tx_queue);
+        self
+    }
+
     fn max_pressure(&self) -> usize {
         self.max_pending.max(self.max_tx_queue)
     }
@@ -1637,6 +1646,9 @@ struct TunEgressFeedbackState {
     resume_edges: u64,
     recent_max_pressure: usize,
     recent_total_pressure: usize,
+    egress_hold_until: Option<std::time::Instant>,
+    egress_hold_max_pressure: usize,
+    egress_hold_total_pressure: usize,
 }
 
 impl TunEgressFeedbackState {
@@ -1645,11 +1657,52 @@ impl TunEgressFeedbackState {
     }
 
     fn observe_pressure(&mut self, stats: DownlinkPressureStats, cfg: DownlinkBackpressureConfig) {
+        self.observe_pressure_at(stats, cfg, std::time::Instant::now());
+    }
+
+    fn observe_pressure_at(
+        &mut self,
+        stats: DownlinkPressureStats,
+        cfg: DownlinkBackpressureConfig,
+        now: std::time::Instant,
+    ) {
+        self.expire_egress_pressure_hold(now);
         if stats.max_pressure() < cfg.high_bytes {
             return;
         }
         self.recent_max_pressure = self.recent_max_pressure.max(stats.max_pressure());
         self.recent_total_pressure = self.recent_total_pressure.max(stats.total_pressure());
+        self.egress_hold_max_pressure =
+            self.egress_hold_max_pressure.max(stats.max_pressure());
+        self.egress_hold_total_pressure =
+            self.egress_hold_total_pressure.max(stats.total_pressure());
+        self.egress_hold_until = Some(
+            now + std::time::Duration::from_millis(TUN_EGRESS_PRESSURE_HOLD_MS),
+        );
+    }
+
+    fn effective_downlink_pressure_at(
+        &mut self,
+        stats: DownlinkPressureStats,
+        now: std::time::Instant,
+    ) -> DownlinkPressureStats {
+        self.expire_egress_pressure_hold(now);
+        if self.egress_hold_until.is_none() {
+            return stats;
+        }
+        stats.with_tx_queue_floor(
+            self.egress_hold_max_pressure,
+            self.egress_hold_total_pressure,
+        )
+    }
+
+    fn expire_egress_pressure_hold(&mut self, now: std::time::Instant) {
+        if !matches!(self.egress_hold_until, Some(until) if now >= until) {
+            return;
+        }
+        self.egress_hold_until = None;
+        self.egress_hold_max_pressure = 0;
+        self.egress_hold_total_pressure = 0;
     }
 
     fn take_recent_pressure(&mut self) -> DownlinkPressureStats {
@@ -2466,8 +2519,15 @@ pub async fn run_event_loop<D, U, M>(
     let mut downlink_rx_paused = false;
 
     loop {
-        let downlink_stats = downlink_pressure_stats(&dirty, &socket_ctxs, &sockets);
-        tun_egress_feedback.observe_pressure(downlink_stats, downlink_backpressure);
+        let downlink_stats_raw = downlink_pressure_stats(&dirty, &socket_ctxs, &sockets);
+        let pressure_now = std::time::Instant::now();
+        let downlink_stats = tun_egress_feedback
+            .effective_downlink_pressure_at(downlink_stats_raw, pressure_now);
+        tun_egress_feedback.observe_pressure_at(
+            downlink_stats_raw,
+            downlink_backpressure,
+            pressure_now,
+        );
         let next_downlink_rx_paused =
             next_downlink_backpressure(downlink_rx_paused, downlink_stats, downlink_backpressure);
         if next_downlink_rx_paused != downlink_rx_paused {
@@ -2690,11 +2750,19 @@ pub async fn run_event_loop<D, U, M>(
             // 但反馈状态每秒更新，避免 30s probe 结束后才发现 clean-window qdisc drops。
             _ = tun_egress_feedback_tick.tick() => {
                 metrics.loop_park_end();
-                let downlink_stats = downlink_pressure_stats(&dirty, &socket_ctxs, &sockets);
+                let downlink_stats_raw = downlink_pressure_stats(&dirty, &socket_ctxs, &sockets);
+                let pressure_now = std::time::Instant::now();
+                let downlink_stats = tun_egress_feedback
+                    .effective_downlink_pressure_at(downlink_stats_raw, pressure_now);
                 let tcp_downlink = tcp_downlink_aggregate(socket_ctxs.values());
                 let tun_sample = tun_egress_drop_sampler.sample();
                 let feedback_event =
                     tun_egress_feedback.update(&tun_sample, downlink_stats, downlink_backpressure);
+                tun_egress_feedback.observe_pressure_at(
+                    downlink_stats_raw,
+                    downlink_backpressure,
+                    pressure_now,
+                );
                 let sampled_global_rx_paused =
                     downlink_rx_paused || tun_egress_feedback.is_paused();
                 if tcp_diag_enabled() {
@@ -6603,6 +6671,38 @@ mod tests {
         assert!(
             !next_downlink_backpressure(true, DownlinkPressureStats::new(0, 0, 40, 40), cfg),
             "low tx queue watermark resumes global_rx when app pending is empty"
+        );
+    }
+
+    #[test]
+    fn downlink_backpressure_holds_recent_high_tx_queue_after_flush() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let mut feedback = TunEgressFeedbackState::default();
+        let now = std::time::Instant::now();
+
+        feedback.observe_pressure_at(DownlinkPressureStats::new(0, 0, 100, 100), cfg, now);
+
+        let held = feedback.effective_downlink_pressure_at(
+            DownlinkPressureStats::default(),
+            now + std::time::Duration::from_millis(TUN_EGRESS_PRESSURE_HOLD_MS - 1),
+        );
+        assert_eq!(held.max_pressure(), 100);
+        assert!(
+            next_downlink_backpressure(true, held, cfg),
+            "recent high egress pressure keeps global_rx paused briefly after raw pressure drains"
+        );
+
+        let expired = feedback.effective_downlink_pressure_at(
+            DownlinkPressureStats::default(),
+            now + std::time::Duration::from_millis(TUN_EGRESS_PRESSURE_HOLD_MS + 1),
+        );
+        assert_eq!(expired.max_pressure(), 0);
+        assert!(
+            !next_downlink_backpressure(true, expired, cfg),
+            "after the bounded hold expires, ordinary low watermark resume applies"
         );
     }
 

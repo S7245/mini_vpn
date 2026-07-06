@@ -2422,3 +2422,23 @@ worth cleaning up separately.
   and QUIC deltas `0`, do not chase sing-box, iperf3, scripts, or stale pools.
   Add a core test that prevents immediate clean resume after a high
   `send_queue` flush before changing behavior.
+
+## 2026-07-06 — Knife14bu makes local egress pressure durable
+
+- Stage: Knife14bu core pressure-gate patch after Knife14bt showed
+  high-to-zero `send_queue` transitions with low-average reverse throughput.
+- Outcome: `client_tun.rs` now keeps a short bounded effective downlink
+  pressure hold after raw pressure reaches high, so the main loop does not
+  immediately resume remote reads just because smoltcp moved bytes into
+  TUN/qdisc.
+- TDD: the focused test first failed because no hold method/constant existed,
+  then passed after adding a 25ms local egress pressure hold.
+- Local gates passed: focused new test, `downlink_backpressure` tests,
+  `tun_egress_feedback` tests, full `cargo test --lib`, and
+  `git diff --check`.
+- Reusable rule: after evidence shows smoltcp pressure drops to zero
+  immediately after a high-watermark flush while remote stream gaps grow,
+  preserve recent local egress pressure for a short bounded interval before
+  declaring the downlink clean. Keep this separate from 1s sysfs TUN drop
+  feedback so pre-drop gating and post-drop attribution do not erase each
+  other.
