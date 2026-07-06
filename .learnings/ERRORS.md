@@ -1721,3 +1721,15 @@
   attribution block, before declaring pending, close, reap, or TUN-drop
   accounting clean. Add parser/self-test coverage for final post-summary
   lifecycle and egress feedback lines before the next expensive VPS run.
+
+## 2026-07-06 - Test-only helpers must be cfg(test) before clippy gates
+
+- Symptom: during Knife14cb local gates, `cargo clippy --all-targets
+  --features harness -- -D warnings` failed because
+  `bounded_downlink_flush_limit_for_window` became production-dead after the
+  egress-clock implementation replaced its runtime use.
+- Cause: the helper was still compiled into the library even though only tests
+  used it.
+- Correct behavior: when a behavior patch replaces a runtime helper but keeps
+  it for regression tests, mark that helper `#[cfg(test)]` before running
+  clippy with `-D warnings`.

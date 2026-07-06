@@ -2796,3 +2796,30 @@ worth cleaning up separately.
 - Reusable rule: final acceptance must include lifecycle/drop events emitted
   after the per-probe attribution block. A clean low-RTT summary is not enough
   when final snapshots later reveal pending bytes or TUN egress drops.
+
+## 2026-07-06 - Knife14cb clocks downlink accept from egress progress
+
+- Stage: Knife14cb core behavior patch after fixed pre-send headroom caps
+  regressed throughput by creating sticky pending and receive-window stalls.
+- Outcome: each TCP flow now has a `DownlinkEgressClock`. Observed decreases
+  in smoltcp `send_queue` grant bounded one-shot drain credit, so downlink can
+  accept above the clean flush threshold only when local egress has actually
+  progressed. Planned accepts remain capped by pending length, per-flush
+  budget, smoltcp send capacity, clean headroom plus credit, and the hard
+  tx_queue pause threshold.
+- TDD: the RED test first failed because `DownlinkEgressClock` and
+  `bounded_downlink_flush_limit_for_window_with_clock` did not exist. The
+  GREEN patch added the clock, reset it on rearm, and added coverage that
+  partial `send_slice` acceptance consumes only actually accepted credit.
+- Diagnostics: `tcp-downlink-flush` and `tcp-handle-close` now include
+  `drain_credit_granted_bytes`, `drain_credit_planned_bytes`, and
+  `drain_credit_used_bytes`; both low-RTT and suite final parsers expose those
+  fields.
+- Local gates passed so far: focused egress-clock tests, full
+  `cargo test --lib` (`301` passed), low-RTT and US-client suite self-tests,
+  shell syntax checks, release build, harness tests, clippy with harness, and
+  `git diff --check`.
+- Reusable rule: do not use queue occupancy alone as a downlink accept clock.
+  Allow extra accept above the clean threshold only when observed local egress
+  drain grants bounded credit, and consume credit based on actual accepted
+  bytes rather than the planned flush length.

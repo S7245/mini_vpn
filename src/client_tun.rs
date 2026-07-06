@@ -214,6 +214,12 @@ struct TcpDownlinkDiag {
     send_slice_headroom_limited: u64,
     /// Bytes intentionally left pending because the tx_queue clean headroom was exhausted.
     send_slice_headroom_deferred_bytes: u64,
+    /// Bytes of extra accept credit granted from observed local egress drain.
+    send_slice_drain_credit_granted_bytes: u64,
+    /// Bytes of drain credit included in planned `send_slice` limits.
+    send_slice_drain_credit_planned_bytes: u64,
+    /// Bytes of drain credit actually consumed by accepted `send_slice` bytes.
+    send_slice_drain_credit_used_bytes: u64,
     /// `send_slice` errors, usually socket close/reset while downlink still had bytes.
     send_slice_errors: u64,
     /// TCP downlink-triggered TUN flush attempts.
@@ -309,6 +315,12 @@ impl TcpDownlinkDiag {
                 .send_slice_headroom_deferred_bytes
                 .saturating_add(limit.headroom_deferred_bytes as u64);
         }
+        self.send_slice_drain_credit_granted_bytes = self
+            .send_slice_drain_credit_granted_bytes
+            .saturating_add(limit.drain_credit_granted_bytes as u64);
+        self.send_slice_drain_credit_planned_bytes = self
+            .send_slice_drain_credit_planned_bytes
+            .saturating_add(limit.drain_credit_planned_bytes as u64);
     }
 
     fn note_no_send_capacity(&mut self, pending_current: usize) {
@@ -354,6 +366,12 @@ impl TcpDownlinkDiag {
             self.send_slice_zero += 1;
         }
         self.note_pending(pending_current);
+    }
+
+    fn note_drain_credit_used(&mut self, used: usize) {
+        self.send_slice_drain_credit_used_bytes = self
+            .send_slice_drain_credit_used_bytes
+            .saturating_add(used as u64);
     }
 
     fn note_send_slice_error(&mut self) {
@@ -1028,6 +1046,8 @@ struct SocketCtx {
     uplink_buffer: Vec<u8>,
     /// 刀14c：TCP 下行诊断计数。主循环独占，按事件日志输出，不进全局 MetricsSnapshot 防高基数。
     downlink_diag: TcpDownlinkDiag,
+    /// Knife14cb：observed local egress progress grants bounded extra downlink accept credit.
+    downlink_egress_clock: DownlinkEgressClock,
     /// Last observed TCP socket lifecycle snapshot for transition diagnostics.
     last_tcp_lifecycle: Option<TcpLifecycleObservation>,
     /// Latest event-loop second when live reverse TCP window diagnostics were logged.
@@ -1059,6 +1079,7 @@ impl SocketCtx {
             conn_epoch: 0,
             uplink_buffer: Vec::new(),
             downlink_diag: TcpDownlinkDiag::default(),
+            downlink_egress_clock: DownlinkEgressClock::default(),
             last_tcp_lifecycle: None,
             reverse_window_last_log_secs: None,
         }
@@ -1102,8 +1123,58 @@ struct DownlinkFlushLimit {
     len: usize,
     headroom_limited: bool,
     headroom_deferred_bytes: usize,
+    clean_headroom_bytes: usize,
+    drain_credit_granted_bytes: usize,
+    drain_credit_planned_bytes: usize,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DownlinkEgressClock {
+    last_send_queue: Option<usize>,
+    drain_credit_bytes: usize,
+}
+
+impl DownlinkEgressClock {
+    fn note_observed_send_queue(
+        &mut self,
+        send_queue: usize,
+        cfg: DownlinkBackpressureConfig,
+    ) -> usize {
+        let Some(last_send_queue) = self.last_send_queue else {
+            self.last_send_queue = Some(send_queue);
+            return 0;
+        };
+        if last_send_queue <= send_queue {
+            self.last_send_queue = Some(send_queue);
+            return 0;
+        }
+
+        let max_credit = tx_queue_pause_threshold(cfg).saturating_sub(tx_queue_flush_threshold(cfg));
+        let granted = last_send_queue.saturating_sub(send_queue).min(max_credit);
+        self.drain_credit_bytes = self
+            .drain_credit_bytes
+            .saturating_add(granted)
+            .min(max_credit);
+        self.last_send_queue = Some(send_queue);
+        granted
+    }
+
+    fn note_flush_result(
+        &mut self,
+        send_queue_before: usize,
+        accepted: usize,
+        limit: DownlinkFlushLimit,
+    ) -> usize {
+        let used = accepted
+            .saturating_sub(limit.clean_headroom_bytes)
+            .min(limit.drain_credit_planned_bytes);
+        self.drain_credit_bytes = self.drain_credit_bytes.saturating_sub(used);
+        self.last_send_queue = Some(send_queue_before.saturating_add(accepted));
+        used
+    }
+}
+
+#[cfg(test)]
 fn bounded_downlink_flush_limit_for_window(
     pending_len: usize,
     max_bytes_per_flush: usize,
@@ -1118,6 +1189,38 @@ fn bounded_downlink_flush_limit_for_window(
         len,
         headroom_limited: len < socket_len,
         headroom_deferred_bytes: socket_len.saturating_sub(len),
+        clean_headroom_bytes: egress_headroom,
+        drain_credit_granted_bytes: 0,
+        drain_credit_planned_bytes: 0,
+    }
+}
+
+fn bounded_downlink_flush_limit_for_window_with_clock(
+    pending_len: usize,
+    max_bytes_per_flush: usize,
+    send_window: TcpSendWindowSnapshot,
+    cfg: DownlinkBackpressureConfig,
+    clock: &mut DownlinkEgressClock,
+) -> DownlinkFlushLimit {
+    let budget_len = bounded_downlink_flush_len(pending_len, max_bytes_per_flush);
+    let socket_len = budget_len.min(send_window.send_capacity);
+    let clean_headroom = tx_queue_flush_threshold(cfg).saturating_sub(send_window.send_queue);
+    let hard_headroom = tx_queue_pause_threshold(cfg).saturating_sub(send_window.send_queue);
+    let granted = clock.note_observed_send_queue(send_window.send_queue, cfg);
+    let available = clean_headroom
+        .saturating_add(clock.drain_credit_bytes)
+        .min(hard_headroom);
+    let len = socket_len.min(available);
+    let drain_credit_planned = len
+        .saturating_sub(clean_headroom)
+        .min(clock.drain_credit_bytes);
+    DownlinkFlushLimit {
+        len,
+        headroom_limited: len < socket_len,
+        headroom_deferred_bytes: socket_len.saturating_sub(len),
+        clean_headroom_bytes: clean_headroom,
+        drain_credit_granted_bytes: granted,
+        drain_credit_planned_bytes: drain_credit_planned,
     }
 }
 
@@ -1163,11 +1266,12 @@ fn flush_downlink(
             headroom_limited: false,
         };
     }
-    let flush_limit = bounded_downlink_flush_limit_for_window(
+    let flush_limit = bounded_downlink_flush_limit_for_window_with_clock(
         ctx.downlink_pending.len(),
         max_bytes_per_flush,
         send_window,
         downlink_backpressure,
+        &mut ctx.downlink_egress_clock,
     );
     ctx.downlink_diag.note_flush_limit(
         ctx.downlink_pending.len(),
@@ -1175,6 +1279,10 @@ fn flush_downlink(
         flush_limit,
     );
     if flush_limit.len == 0 {
+        let used = ctx
+            .downlink_egress_clock
+            .note_flush_result(send_window.send_queue, 0, flush_limit);
+        ctx.downlink_diag.note_drain_credit_used(used);
         return DownlinkFlushOutcome {
             accepted_bytes: 0,
             headroom_limited: flush_limit.headroom_limited,
@@ -1183,6 +1291,10 @@ fn flush_downlink(
     let flush_len = flush_limit.len;
     match tcp_socket.send_slice(&ctx.downlink_pending[..flush_len]) {
         Ok(0) => {
+            let used = ctx
+                .downlink_egress_clock
+                .note_flush_result(send_window.send_queue, 0, flush_limit);
+            ctx.downlink_diag.note_drain_credit_used(used);
             ctx.downlink_diag
                 .note_send_slice_ok(0, ctx.downlink_pending.len());
             DownlinkFlushOutcome {
@@ -1191,6 +1303,10 @@ fn flush_downlink(
             }
         }
         Ok(n) => {
+            let used = ctx
+                .downlink_egress_clock
+                .note_flush_result(send_window.send_queue, n, flush_limit);
+            ctx.downlink_diag.note_drain_credit_used(used);
             ctx.downlink_pending.drain(..n);
             ctx.downlink_diag
                 .note_send_slice_ok(n, ctx.downlink_pending.len());
@@ -1200,6 +1316,10 @@ fn flush_downlink(
             }
         }
         Err(_) => {
+            let used = ctx
+                .downlink_egress_clock
+                .note_flush_result(send_window.send_queue, 0, flush_limit);
+            ctx.downlink_diag.note_drain_credit_used(used);
             tcp_diag_log!(
                 "🔎 tcp-send-slice-error handle={:?} pending={} state={:?} → clear",
                 handle,
@@ -1633,6 +1753,9 @@ struct TcpDownlinkAggregate {
     send_slice_budget_limited: u64,
     send_slice_headroom_limited: u64,
     send_slice_headroom_deferred_bytes: u64,
+    send_slice_drain_credit_granted_bytes: u64,
+    send_slice_drain_credit_planned_bytes: u64,
+    send_slice_drain_credit_used_bytes: u64,
     send_slice_max_accepted_bytes: usize,
     tun_flush_tx_calls: u64,
     tun_flush_tx_failures: u64,
@@ -1694,6 +1817,15 @@ fn tcp_downlink_aggregate<'a>(
         aggregate.send_slice_headroom_deferred_bytes = aggregate
             .send_slice_headroom_deferred_bytes
             .saturating_add(ctx.downlink_diag.send_slice_headroom_deferred_bytes);
+        aggregate.send_slice_drain_credit_granted_bytes = aggregate
+            .send_slice_drain_credit_granted_bytes
+            .saturating_add(ctx.downlink_diag.send_slice_drain_credit_granted_bytes);
+        aggregate.send_slice_drain_credit_planned_bytes = aggregate
+            .send_slice_drain_credit_planned_bytes
+            .saturating_add(ctx.downlink_diag.send_slice_drain_credit_planned_bytes);
+        aggregate.send_slice_drain_credit_used_bytes = aggregate
+            .send_slice_drain_credit_used_bytes
+            .saturating_add(ctx.downlink_diag.send_slice_drain_credit_used_bytes);
         aggregate.send_slice_max_accepted_bytes = aggregate
             .send_slice_max_accepted_bytes
             .max(ctx.downlink_diag.send_slice_max_accepted_bytes);
@@ -1748,7 +1880,7 @@ fn format_tcp_downlink_flush_diag(
     dirty_handles: usize,
 ) -> String {
     format!(
-        "🔎 tcp-downlink-flush pending_total={} pending_max={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} dirty_handles={}",
+        "🔎 tcp-downlink-flush pending_total={} pending_max={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} drain_credit_granted_bytes={} drain_credit_planned_bytes={} drain_credit_used_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} dirty_handles={}",
         aggregate.pending_total,
         aggregate.pending_max,
         aggregate.pending_high,
@@ -1773,6 +1905,9 @@ fn format_tcp_downlink_flush_diag(
         aggregate.send_slice_budget_limited,
         aggregate.send_slice_headroom_limited,
         aggregate.send_slice_headroom_deferred_bytes,
+        aggregate.send_slice_drain_credit_granted_bytes,
+        aggregate.send_slice_drain_credit_planned_bytes,
+        aggregate.send_slice_drain_credit_used_bytes,
         aggregate.send_slice_max_accepted_bytes,
         aggregate.tun_flush_tx_calls,
         aggregate.tun_flush_tx_failures,
@@ -3892,7 +4027,7 @@ fn rearm_socket_with_reason_and_snapshot(
         let close_pending = close_pending_accounting(ctx, snapshot);
         let close_egress = close_egress_accounting(snapshot);
         tcp_diag_log!(
-            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes={} close_egress_class={} close_egress_bytes={} close_egress_drain_candidate={} tcp_state={:?} active={} can_send={} can_recv={} may_send={} may_recv={} send_capacity={} send_queue={} recv_queue={}",
+            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} drain_credit_granted_bytes={} drain_credit_planned_bytes={} drain_credit_used_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes={} close_egress_class={} close_egress_bytes={} close_egress_drain_candidate={} tcp_state={:?} active={} can_send={} can_recv={} may_send={} may_recv={} send_capacity={} send_queue={} recv_queue={}",
             handle,
             close_direction,
             close_reason,
@@ -3920,6 +4055,9 @@ fn rearm_socket_with_reason_and_snapshot(
             ctx.downlink_diag.send_slice_budget_limited,
             ctx.downlink_diag.send_slice_headroom_limited,
             ctx.downlink_diag.send_slice_headroom_deferred_bytes,
+            ctx.downlink_diag.send_slice_drain_credit_granted_bytes,
+            ctx.downlink_diag.send_slice_drain_credit_planned_bytes,
+            ctx.downlink_diag.send_slice_drain_credit_used_bytes,
             ctx.downlink_diag.send_slice_max_accepted_bytes,
             ctx.downlink_diag.tun_flush_tx_calls,
             ctx.downlink_diag.tun_flush_tx_failures,
@@ -3951,7 +4089,7 @@ fn rearm_socket_with_reason_and_snapshot(
         ClosePendingClass::Unknown
     };
     tcp_diag_log!(
-        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes=0 close_egress_class=unknown close_egress_bytes=0 close_egress_drain_candidate=false",
+        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} drain_credit_granted_bytes={} drain_credit_planned_bytes={} drain_credit_used_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes=0 close_egress_class=unknown close_egress_bytes=0 close_egress_drain_candidate=false",
         handle,
         close_direction,
         close_reason,
@@ -3979,6 +4117,9 @@ fn rearm_socket_with_reason_and_snapshot(
         ctx.downlink_diag.send_slice_budget_limited,
         ctx.downlink_diag.send_slice_headroom_limited,
         ctx.downlink_diag.send_slice_headroom_deferred_bytes,
+        ctx.downlink_diag.send_slice_drain_credit_granted_bytes,
+        ctx.downlink_diag.send_slice_drain_credit_planned_bytes,
+        ctx.downlink_diag.send_slice_drain_credit_used_bytes,
         ctx.downlink_diag.send_slice_max_accepted_bytes,
         ctx.downlink_diag.tun_flush_tx_calls,
         ctx.downlink_diag.tun_flush_tx_failures,
@@ -4013,6 +4154,7 @@ fn rearm_socket(
     ctx.downlink_pending_last_progress_secs = None;
     ctx.downlink_pending_last_pending_bytes = 0;
     ctx.downlink_diag = TcpDownlinkDiag::default();
+    ctx.downlink_egress_clock = DownlinkEgressClock::default();
     ctx.last_tcp_lifecycle = None;
     ctx.reverse_window_last_log_secs = None;
     // 清 async-open 在飞缓存 + bump epoch——让任何迟到 `HandshakeDone` 失配被丢
@@ -6370,6 +6512,10 @@ mod tests {
             conn_epoch: 7,
             uplink_buffer: vec![1, 2, 3],
             downlink_diag,
+            downlink_egress_clock: DownlinkEgressClock {
+                last_send_queue: Some(12_345),
+                drain_credit_bytes: 1024,
+            },
             last_tcp_lifecycle: None,
             reverse_window_last_log_secs: Some(12),
         };
@@ -6400,6 +6546,11 @@ mod tests {
         assert_eq!(
             ctx.downlink_diag.downlink_pending_high_water, 0,
             "rearm 应清空当前 flow 的 downlink diagnostics"
+        );
+        assert_eq!(
+            ctx.downlink_egress_clock,
+            DownlinkEgressClock::default(),
+            "rearm 应清空当前 flow 的 egress progress clock"
         );
         assert!(
             ctx.reverse_window_last_log_secs.is_none(),
@@ -6987,6 +7138,9 @@ mod tests {
                 len: 2,
                 headroom_limited: true,
                 headroom_deferred_bytes: 62,
+                clean_headroom_bytes: 2,
+                drain_credit_granted_bytes: 0,
+                drain_credit_planned_bytes: 0,
             },
         );
 
@@ -7813,6 +7967,129 @@ mod tests {
             2,
             "flush should only accept the remaining clean tx_queue headroom"
         );
+    }
+
+    #[test]
+    fn downlink_flush_len_uses_observed_egress_drain_credit() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let mut clock = DownlinkEgressClock::default();
+        let at_clean_cap = TcpSendWindowSnapshot {
+            can_send: true,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 100,
+            send_queue: 130,
+            recv_queue: 0,
+        };
+
+        let first = bounded_downlink_flush_limit_for_window_with_clock(
+            100,
+            100,
+            at_clean_cap,
+            cfg,
+            &mut clock,
+        );
+        assert_eq!(first.len, 0, "no observed drain means no extra credit");
+        clock.note_flush_result(at_clean_cap.send_queue, 0, first);
+
+        let after_drain = TcpSendWindowSnapshot {
+            send_queue: 100,
+            ..at_clean_cap
+        };
+        let second = bounded_downlink_flush_limit_for_window_with_clock(
+            100,
+            100,
+            after_drain,
+            cfg,
+            &mut clock,
+        );
+        assert_eq!(
+            second.len, 60,
+            "observed drain should grant one-shot credit above clean headroom"
+        );
+        assert_eq!(second.drain_credit_granted_bytes, 30);
+        assert_eq!(second.drain_credit_planned_bytes, 30);
+        clock.note_flush_result(after_drain.send_queue, 60, second);
+
+        let at_hard_pause = TcpSendWindowSnapshot {
+            send_queue: 160,
+            ..after_drain
+        };
+        let third = bounded_downlink_flush_limit_for_window_with_clock(
+            100,
+            100,
+            at_hard_pause,
+            cfg,
+            &mut clock,
+        );
+        assert_eq!(
+            third.len, 0,
+            "drain credit must not let a pass plan beyond the hard pause threshold"
+        );
+    }
+
+    #[test]
+    fn downlink_egress_clock_consumes_only_accepted_credit() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let mut clock = DownlinkEgressClock::default();
+        let at_clean_cap = TcpSendWindowSnapshot {
+            can_send: true,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 100,
+            send_queue: 130,
+            recv_queue: 0,
+        };
+        let first = bounded_downlink_flush_limit_for_window_with_clock(
+            100,
+            100,
+            at_clean_cap,
+            cfg,
+            &mut clock,
+        );
+        clock.note_flush_result(at_clean_cap.send_queue, 0, first);
+
+        let after_drain = TcpSendWindowSnapshot {
+            send_queue: 100,
+            ..at_clean_cap
+        };
+        let second = bounded_downlink_flush_limit_for_window_with_clock(
+            100,
+            100,
+            after_drain,
+            cfg,
+            &mut clock,
+        );
+        assert_eq!(second.len, 60);
+        assert_eq!(second.drain_credit_planned_bytes, 30);
+        assert_eq!(
+            clock.note_flush_result(after_drain.send_queue, 45, second),
+            15,
+            "only bytes accepted above clean headroom should consume credit"
+        );
+
+        let after_partial_accept = TcpSendWindowSnapshot {
+            send_queue: 145,
+            ..at_clean_cap
+        };
+        let third = bounded_downlink_flush_limit_for_window_with_clock(
+            100,
+            100,
+            after_partial_accept,
+            cfg,
+            &mut clock,
+        );
+        assert_eq!(
+            third.len, 15,
+            "unused drain credit should remain available but still stop at hard pause"
+        );
+        assert_eq!(third.drain_credit_planned_bytes, 15);
     }
 
     #[test]
