@@ -1230,11 +1230,14 @@ type DownlinkEgressDropDebt = DownlinkEgressCreditDebt;
 
 impl DownlinkEgressCreditDebt {
     fn note_tun_drop(&mut self, cfg: DownlinkBackpressureConfig) -> usize {
-        self.drop_events = self.drop_events.saturating_add(1);
-        self.install(
+        let added = self.install(
             EgressCreditDebtSource::Drop,
             downlink_egress_credit_span(cfg),
-        )
+        );
+        if added > 0 {
+            self.drop_events = self.drop_events.saturating_add(1);
+        }
+        added
     }
 
     fn note_egress_pressure(
@@ -1246,17 +1249,23 @@ impl DownlinkEgressCreditDebt {
         if debt_bytes == 0 {
             return 0;
         }
-        self.pressure_events = self.pressure_events.saturating_add(1);
-        self.install(EgressCreditDebtSource::Pressure, debt_bytes)
+        let added = self.install(EgressCreditDebtSource::Pressure, debt_bytes);
+        if added > 0 {
+            self.pressure_events = self.pressure_events.saturating_add(1);
+        }
+        added
     }
 
     fn install(&mut self, source: EgressCreditDebtSource, installed: usize) -> usize {
         if installed == 0 {
             return 0;
         }
+        let added = installed.saturating_sub(self.debt_bytes);
+        if added == 0 {
+            return 0;
+        }
         self.generation = self.generation.saturating_add(1);
         self.last_source = Some(source);
-        let added = installed.saturating_sub(self.debt_bytes);
         self.debt_bytes = self.debt_bytes.saturating_add(added).min(installed);
         match source {
             EgressCreditDebtSource::Drop => {
@@ -1996,13 +2005,11 @@ fn reaches_downlink_credit_debt_pressure_threshold(
 
 fn should_install_downlink_pressure_credit_debt(
     was_paused: bool,
-    is_paused: bool,
+    _is_paused: bool,
     raw_stats: DownlinkPressureStats,
     cfg: DownlinkBackpressureConfig,
 ) -> bool {
-    !was_paused
-        && is_paused
-        && reaches_downlink_credit_debt_pressure_threshold(raw_stats, cfg)
+    !was_paused && reaches_downlink_credit_debt_pressure_threshold(raw_stats, cfg)
 }
 
 fn downlink_receive_window_high(cfg: DownlinkBackpressureConfig) -> usize {
@@ -3552,16 +3559,22 @@ pub async fn run_event_loop<D, U, M>(
         ) {
             let installed_bytes =
                 downlink_egress_drop_debt.note_egress_pressure(downlink_stats_raw, downlink_backpressure);
-            tcp_diag_log!(
-                "{}",
-                format_downlink_egress_credit_debt_diag(
-                    "pressure_edge",
-                    installed_bytes,
-                    downlink_stats_raw,
-                    downlink_backpressure,
-                    downlink_egress_drop_debt,
-                )
-            );
+            if installed_bytes > 0 {
+                tcp_diag_log!(
+                    "{}",
+                    format_downlink_egress_credit_debt_diag(
+                        if next_downlink_rx_paused {
+                            "pressure_pause_edge"
+                        } else {
+                            "pressure_credit_edge"
+                        },
+                        installed_bytes,
+                        downlink_stats_raw,
+                        downlink_backpressure,
+                        downlink_egress_drop_debt,
+                    )
+                );
+            }
         }
         if next_downlink_rx_paused != previous_downlink_rx_paused {
             downlink_rx_paused = next_downlink_rx_paused;
@@ -9686,6 +9699,43 @@ mod tests {
         assert!(
             !should_install_downlink_pressure_credit_debt(true, true, credit_edge, cfg),
             "already-paused pressure should not keep installing new debt every loop"
+        );
+    }
+
+    #[test]
+    fn downlink_pressure_credit_debt_installs_before_pause_at_credit_edge() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let credit_edge = DownlinkPressureStats::new(0, 0, 157, 157);
+
+        assert!(
+            should_install_downlink_pressure_credit_debt(false, false, credit_edge, cfg),
+            "credit-edge pressure should install bounded debt before the hard pause edge"
+        );
+    }
+
+    #[test]
+    fn downlink_pressure_credit_debt_repeated_edge_is_idempotent() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let credit_edge = DownlinkPressureStats::new(0, 0, 157, 157);
+        let mut credit_debt = DownlinkEgressCreditDebt::default();
+
+        assert_eq!(credit_debt.note_egress_pressure(credit_edge, cfg), 3);
+        assert_eq!(credit_debt.generation, 1);
+        assert_eq!(credit_debt.pressure_events, 1);
+        assert_eq!(credit_debt.note_egress_pressure(credit_edge, cfg), 0);
+        assert_eq!(
+            credit_debt.generation, 1,
+            "same-sized pressure debt should not create a new generation"
+        );
+        assert_eq!(
+            credit_debt.pressure_events, 1,
+            "diagnostic pressure events count debt installs, not repeated observations"
         );
     }
 
