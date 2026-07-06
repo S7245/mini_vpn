@@ -2823,3 +2823,30 @@ worth cleaning up separately.
   Allow extra accept above the clean threshold only when observed local egress
   drain grants bounded credit, and consume credit based on actual accepted
   bytes rather than the planned flush length.
+
+## 2026-07-06 - Knife14cb restores reverse throughput but leaves TUN egress edge pressure
+
+- Stage: VPS acceptance for commit `5bf60d9` on `.27 -> .33 -> .77`.
+- Result doc:
+  `docs/tech/2026-07-06-knife14cb-egress-progress-clocked-accept-results.md`
+- Bundle:
+  `/tmp/mini_vpn/knife14cb_egress_clock_20260706_1552/mvpn_knife14cb_egress_clock_usclient_suite_20260706_235136.tar.gz`
+- Positive result: reverse-first P1 reached `152/152 Mbit/s`, escaping the
+  rejected `10-20 Mbit/s` band and exceeding the Knife14by `29.0 Mbit/s`
+  reference. QUIC loss/congestion/blocking stayed zero, `send_slice_zero=0`,
+  `send_slice_errors=0`, and `tun_flush_failures=0`.
+- Lifecycle result: final close/reap accounting was clean. Final summaries
+  showed `final_pending_at_close: events=0 bytes=0` and
+  `final_terminal_pending_reap: events=0 bytes=0`; the main reverse flow
+  closed with `pending=0`, `close_pending_class=none`, and
+  `terminal_pending_reap_bytes=0`.
+- Remaining risk: local TUN egress still dropped once
+  (`tun_tx_dropped_delta=712`, `drop_delta_total=712`) while pressure reached
+  `917504B`, and iperf still showed a two-second zero-throughput gap at
+  `23-25s`.
+- `.33` note: current-window sing-box evidence did not show TUIC `fail auth`;
+  clocks were synchronized and TUIC inbound entries matched the `.27` run.
+- Reusable rule: progress-clocked accept is the right direction, but credit
+  spending must not repeatedly push the local send queue to the hard pause
+  edge. The next patch should smooth or make credit debt drop-aware rather
+  than only moving thresholds.

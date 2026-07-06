@@ -1733,3 +1733,21 @@
 - Correct behavior: when a behavior patch replaces a runtime helper but keeps
   it for regression tests, mark that helper `#[cfg(test)]` before running
   clippy with `-D warnings`.
+
+## 2026-07-06 - High throughput can still hide hard-edge TUN drops
+
+- Symptom: Knife14cb commit `5bf60d9` restored reverse-first P1 to
+  `152/152 Mbit/s`, but the same bundle still showed
+  `tun_tx_dropped_delta=712`, final TUN egress feedback
+  `drop_delta_total=712`, and a two-second iperf zero-throughput gap.
+- Evidence: close/reap accounting was clean (`pending=0`,
+  `final_pending_at_close=0`, `terminal_pending_reap_bytes=0`), QUIC
+  loss/congestion/blocking was zero, and current-window `.33` TUIC evidence
+  had no `fail auth`.
+- Cause: progress-clocked accept fixed receive-window starvation, but credit
+  spending can still drive local pressure to the hard tx_queue pause threshold
+  (`917504B`) and trigger kernel/TUN egress drops.
+- Correct behavior: do not declare Knife14 acceptance from average throughput
+  alone. Require final TUN egress/drop summaries to stay clean, and repair this
+  as a credit-spend/drop-feedback algorithm issue instead of another static
+  threshold tune.
