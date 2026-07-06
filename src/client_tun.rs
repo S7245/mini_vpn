@@ -4418,6 +4418,26 @@ fn start_deferred_close_for_egress_if_needed(
     true
 }
 
+fn start_deferred_close_for_pending_downlink(
+    ctx: &mut SocketCtx,
+    close: RelayClose,
+    now_secs: u64,
+) -> bool {
+    if ctx.downlink_pending.is_empty() {
+        return false;
+    }
+
+    ctx.state = SocketState::Closing;
+    ctx.uplink_tx = None;
+    ctx.pending_relay_close = Some(close);
+    ctx.pending_relay_close_since_secs = Some(now_secs);
+    ctx.pending_relay_close_last_progress_secs = Some(now_secs);
+    ctx.pending_relay_close_last_pending_bytes = ctx.downlink_pending.len();
+    ctx.downlink_pending_last_progress_secs = Some(now_secs);
+    ctx.downlink_pending_last_pending_bytes = ctx.downlink_pending.len();
+    true
+}
+
 fn deferred_close_egress_deadline_base(ctx: &SocketCtx) -> Option<u64> {
     ctx.pending_relay_close_since_secs
         .max(ctx.pending_relay_close_last_egress_progress_secs)
@@ -4986,6 +5006,17 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
                     direction: "local_to_remote",
                     reason: "uplink_channel_closed",
                 };
+                if start_deferred_close_for_pending_downlink(ctx, close, now_secs) {
+                    tcp_diag_log!(
+                        "🔎 tcp-deferred-close-pending handle={:?} direction={} reason={} pending={} started_secs={}",
+                        handle,
+                        close.direction,
+                        close.reason,
+                        ctx.downlink_pending.len(),
+                        now_secs
+                    );
+                    return Ok(());
+                }
                 if start_deferred_close_for_egress_if_needed(
                     ctx,
                     close,
@@ -5464,7 +5495,7 @@ fn handle_relay_closed(
         SocketCloseSnapshot::from_socket(tcp_socket)
     };
     log_tcp_lifecycle_observation(handle, ctx, snapshot, now_secs, "relay_close");
-    if !ctx.downlink_pending.is_empty() {
+    if start_deferred_close_for_pending_downlink(ctx, close, now_secs) {
         trace_log!(
             "⏳ handle {:?} relay close({}/{}) waits for {} pending downlink bytes",
             handle,
@@ -5472,14 +5503,14 @@ fn handle_relay_closed(
             close.reason,
             ctx.downlink_pending.len()
         );
-        ctx.state = SocketState::Closing;
-        ctx.uplink_tx = None;
-        ctx.pending_relay_close = Some(close);
-        ctx.pending_relay_close_since_secs = Some(now_secs);
-        ctx.pending_relay_close_last_progress_secs = Some(now_secs);
-        ctx.pending_relay_close_last_pending_bytes = ctx.downlink_pending.len();
-        ctx.downlink_pending_last_progress_secs = Some(now_secs);
-        ctx.downlink_pending_last_pending_bytes = ctx.downlink_pending.len();
+        tcp_diag_log!(
+            "🔎 tcp-deferred-close-pending handle={:?} direction={} reason={} pending={} started_secs={}",
+            handle,
+            close.direction,
+            close.reason,
+            ctx.downlink_pending.len(),
+            now_secs
+        );
         return true;
     }
 
@@ -7555,6 +7586,53 @@ mod tests {
         assert_eq!(ctx.pending_relay_close_since_secs, Some(10));
         assert_eq!(ctx.pending_relay_close_last_egress_progress_secs, Some(10));
         assert_eq!(ctx.pending_relay_close_last_egress_queue_bytes, 524_288);
+    }
+
+    #[test]
+    fn pending_downlink_close_deferral_is_direction_agnostic() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut ctx = SocketCtx::new(12345);
+        ctx.state = SocketState::Relaying;
+        ctx.conn_epoch = 5;
+        ctx.uplink_tx = Some(tx);
+        ctx.downlink_pending = vec![1, 2, 3, 4];
+        let close = RelayClose {
+            epoch: 5,
+            direction: "local_to_remote",
+            reason: "uplink_channel_closed",
+        };
+
+        assert!(start_deferred_close_for_pending_downlink(&mut ctx, close, 12));
+        assert_eq!(ctx.state, SocketState::Closing);
+        assert!(ctx.uplink_tx.is_none());
+        assert_eq!(ctx.pending_relay_close.map(|c| c.reason), Some("uplink_channel_closed"));
+        assert_eq!(ctx.pending_relay_close_since_secs, Some(12));
+        assert_eq!(ctx.pending_relay_close_last_progress_secs, Some(12));
+        assert_eq!(ctx.pending_relay_close_last_pending_bytes, 4);
+        assert_eq!(ctx.downlink_pending_last_progress_secs, Some(12));
+        assert_eq!(ctx.downlink_pending_last_pending_bytes, 4);
+        assert_eq!(ctx.conn_epoch, 5, "pending deferral must not rearm or bump epoch");
+    }
+
+    #[test]
+    fn pending_downlink_close_deferral_ignores_empty_pending() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut ctx = SocketCtx::new(12345);
+        ctx.state = SocketState::Relaying;
+        ctx.conn_epoch = 5;
+        ctx.uplink_tx = Some(tx);
+        let close = RelayClose {
+            epoch: 5,
+            direction: "local_to_remote",
+            reason: "uplink_channel_closed",
+        };
+
+        assert!(!start_deferred_close_for_pending_downlink(&mut ctx, close, 12));
+        assert_eq!(ctx.state, SocketState::Relaying);
+        assert!(ctx.uplink_tx.is_some());
+        assert!(ctx.pending_relay_close.is_none());
+        assert!(ctx.pending_relay_close_since_secs.is_none());
+        assert!(ctx.downlink_pending_last_progress_secs.is_none());
     }
 
     #[test]
