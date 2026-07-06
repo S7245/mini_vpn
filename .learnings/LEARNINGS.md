@@ -1,5 +1,32 @@
 # Learnings
 
+## 2026-07-06 - Knife14co removes local pressure from P1 but exposes burst/idle without pressure
+
+- Stage docs:
+  `docs/tech/2026-07-06-knife14co-active-flow-ack-drain-spec.md`,
+  `docs/tech/2026-07-06-knife14co-active-flow-ack-drain-plan.md`,
+  `docs/tech/2026-07-06-knife14co-active-flow-ack-drain-results.md`
+- Code commit: `3a3bdbf`.
+- Log bundle:
+  `/tmp/mini_vpn/knife14co_active_flow_ack_20260706_034114/mvpn_knife14co_active_flow_ack_usclient_suite_20260707_034114.tar.gz`
+- Outcome: local gates passed and reverse-first P1 improved to
+  `25.5/24.3 Mbit/s`, but still failed as `low_average`.
+- What worked: active-flow TUN RX ACK/window drain ran below the credit edge
+  (`attempts=7506`, `packets=24055`, `would_block=7491`) and removed local
+  pressure during the attribution window: `tun_tx_dropped_delta=0`,
+  `downlink_backpressure pause_edges=0`, `send_queue_max=427496`.
+- What stayed clean: pending/close/reap accounting remained clean, QUIC
+  loss/congestion/blocking stayed zero, `send_slice` errors stayed zero, and a
+  current `.33` log check showed no `fail auth`.
+- What did not work: throughput was still burst/idle with many zero intervals
+  and attribution became `no_pressure_signal`, leaving stream read/pending gaps
+  despite clean local pressure surfaces.
+- Reusable rule: once active-flow drain reaches `would_block` and local
+  pressure disappears, stop treating TUN drops/debt as the primary root. The
+  next repair should cover post-burst ACK/window drain on a bounded
+  recent-active timer, because a payload-triggered drain cannot run during the
+  idle gaps it is meant to prevent.
+
 ## 2026-07-06 - Knife14cl removes hidden local-close rearm but exposes pressure debt recovery
 
 - Stage docs:

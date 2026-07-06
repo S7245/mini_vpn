@@ -1,5 +1,53 @@
 # Errors
 
+## 2026-07-06 - Knife14co VPS still failed after active-flow drain removed local pressure
+
+- Stage: Knife14co active-flow ACK drain VPS acceptance.
+- Failed bundle:
+  `/tmp/mini_vpn/knife14co_active_flow_ack_20260706_034114/mvpn_knife14co_active_flow_ack_usclient_suite_20260707_034114.tar.gz`
+- Symptom: reverse-first P1 improved to `25.5/24.3 Mbit/s` but remained
+  `low_average`.
+- Important discriminator: the failure was no longer local pressure during the
+  probe window. The parser reported `local_pressure=0`,
+  `downlink_backpressure pause_edges=0`, `tun_tx_dropped_delta=0`,
+  runtime `drop_delta_total=0`, and `send_queue_max=427496`.
+- Active-flow ACK drain was engaged and bounded:
+  `tun_rx_drain attempts=7506 packets=24055 tcp=24055 budget_exhausted=15
+  would_block=7491 errors=0`.
+- Clean surfaces: direct `.27/.33 <-> .77` baselines were healthy, current
+  `.33` logs had no `fail auth`, QUIC loss/congestion/blocking deltas were
+  zero, pending/close/reap accounting stayed clean, and there were no
+  send-slice or TUN flush errors.
+- Remaining root direction: do not keep adding pressure/drop debt or ACK budget
+  size. The next repair should test a recent-active timer drain below pressure
+  so ACK/window updates generated after a burst can be drained even when no new
+  remote payload arrives to trigger event-driven drain.
+
+## 2026-07-06 - Knife14co server evidence target SSH polluted post-probe client log tail
+
+- Stage: Knife14co VPS acceptance evidence collection.
+- Bundle:
+  `/tmp/mini_vpn/knife14co_active_flow_ack_20260706_034114/mvpn_knife14co_active_flow_ack_usclient_suite_20260707_034114.tar.gz`
+- Symptom: after the P1 attribution summary, the client log showed a new
+  `tuic-open-tcp target=43.130.32.77:22` flow and later pressure/drop lines.
+- Root cause: the suite collects target `.77` SSH evidence while the
+  `43.130.32.77/32` route is still installed through `tun0`, so the evidence
+  SSH session itself enters mini_vpn and perturbs the client log tail.
+- Correct behavior: for Knife14 attribution, trust the probe-window summary and
+  treat target-evidence tail pressure as test noise unless the same signals
+  appear inside the P1 window. Future suite improvements should remove the
+  target route before target SSH evidence or skip target SSH evidence for
+  reverse-first stop runs.
+
+## 2026-07-06 - cargo fmt check is not a safe Knife14 gate in the current worktree
+
+- Stage: Knife14co local gates.
+- Symptom: an extra `cargo fmt --check` failed with broad formatting diffs in
+  many pre-existing files, far beyond the Knife14co patch.
+- Correct behavior: do not run `cargo fmt` during Knife14 unless a dedicated
+  formatting task is requested. Keep using `git diff --check`, focused tests,
+  full tests, release build, harness, and clippy as the stage gates.
+
 ## 2026-07-06 - Knife14cl VPS failed after local-close deferral exposed unpaid drop debt
 
 - Stage: Knife14cl local uplink close pending deferral VPS acceptance.
