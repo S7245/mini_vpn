@@ -2850,3 +2850,27 @@ worth cleaning up separately.
   spending must not repeatedly push the local send queue to the hard pause
   edge. The next patch should smooth or make credit debt drop-aware rather
   than only moving thresholds.
+
+## 2026-07-06 - Knife14cc reserves a derived hard-edge guard for drain credit
+
+- Stage: Knife14cc behavior patch after Knife14cb restored `152/152 Mbit/s`
+  but still hit `tun_tx_dropped_delta=712` at the hard tx_queue pause edge.
+- Design: progress-clocked accept remains enabled, but drain credit now spends
+  only up to a derived credit ceiling below hard pause. The guard is based on
+  the clean-to-hard credit span, has no environment knob, and is clamped so it
+  never reduces clean-headroom accepts when the span is tiny.
+- TDD: the RED test first showed current code returned `60` bytes and planned
+  `send_queue=160` at the hard edge. The GREEN path returns `57` with a guard
+  of `3` for the small test config; the default production guard is `24576B`
+  below the hard edge.
+- Diagnostics: `tcp-downlink-flush` and `tcp-handle-close` now emit
+  `hard_edge_guard_bytes`, `hard_edge_guard_limited_calls`, and
+  `hard_edge_guard_deferred_bytes`; low-RTT and suite final parsers expose
+  those fields.
+- Local gates passed: focused guard/egress-clock tests, full
+  `cargo test --lib` (`303` passed), parser self-tests, shell syntax checks,
+  `git diff --check`, release build, harness tests (`10` passed, `4`
+  ignored), and clippy with harness.
+- Reusable rule: after a throughput-restoring credit algorithm, protect the
+  local egress hard edge with a derived guard and make that guard visible in
+  final lifecycle summaries. Average throughput alone is not acceptance.

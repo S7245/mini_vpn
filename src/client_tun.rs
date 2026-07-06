@@ -220,6 +220,12 @@ struct TcpDownlinkDiag {
     send_slice_drain_credit_planned_bytes: u64,
     /// Bytes of drain credit actually consumed by accepted `send_slice` bytes.
     send_slice_drain_credit_used_bytes: u64,
+    /// Largest derived guard reserved below the hard tx_queue pause edge.
+    send_slice_hard_edge_guard_bytes: usize,
+    /// Flush attempts limited specifically by the hard-edge guard.
+    send_slice_hard_edge_guard_limited: u64,
+    /// Bytes intentionally deferred by the hard-edge guard.
+    send_slice_hard_edge_guard_deferred_bytes: u64,
     /// `send_slice` errors, usually socket close/reset while downlink still had bytes.
     send_slice_errors: u64,
     /// TCP downlink-triggered TUN flush attempts.
@@ -321,6 +327,17 @@ impl TcpDownlinkDiag {
         self.send_slice_drain_credit_planned_bytes = self
             .send_slice_drain_credit_planned_bytes
             .saturating_add(limit.drain_credit_planned_bytes as u64);
+        self.send_slice_hard_edge_guard_bytes = self
+            .send_slice_hard_edge_guard_bytes
+            .max(limit.hard_edge_guard_bytes);
+        if limit.hard_edge_guard_deferred_bytes > 0 {
+            self.send_slice_hard_edge_guard_limited = self
+                .send_slice_hard_edge_guard_limited
+                .saturating_add(1);
+            self.send_slice_hard_edge_guard_deferred_bytes = self
+                .send_slice_hard_edge_guard_deferred_bytes
+                .saturating_add(limit.hard_edge_guard_deferred_bytes as u64);
+        }
     }
 
     fn note_no_send_capacity(&mut self, pending_current: usize) {
@@ -1126,6 +1143,8 @@ struct DownlinkFlushLimit {
     clean_headroom_bytes: usize,
     drain_credit_granted_bytes: usize,
     drain_credit_planned_bytes: usize,
+    hard_edge_guard_bytes: usize,
+    hard_edge_guard_deferred_bytes: usize,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1192,6 +1211,8 @@ fn bounded_downlink_flush_limit_for_window(
         clean_headroom_bytes: egress_headroom,
         drain_credit_granted_bytes: 0,
         drain_credit_planned_bytes: 0,
+        hard_edge_guard_bytes: 0,
+        hard_edge_guard_deferred_bytes: 0,
     }
 }
 
@@ -1206,10 +1227,15 @@ fn bounded_downlink_flush_limit_for_window_with_clock(
     let socket_len = budget_len.min(send_window.send_capacity);
     let clean_headroom = tx_queue_flush_threshold(cfg).saturating_sub(send_window.send_queue);
     let hard_headroom = tx_queue_pause_threshold(cfg).saturating_sub(send_window.send_queue);
+    let hard_edge_guard = tx_queue_credit_guard_bytes(cfg);
+    let guarded_hard_headroom =
+        tx_queue_credit_spend_threshold(cfg).saturating_sub(send_window.send_queue);
     let granted = clock.note_observed_send_queue(send_window.send_queue, cfg);
-    let available = clean_headroom
+    let unguarded_available = clean_headroom
         .saturating_add(clock.drain_credit_bytes)
         .min(hard_headroom);
+    let available = unguarded_available.min(guarded_hard_headroom);
+    let unguarded_len = socket_len.min(unguarded_available);
     let len = socket_len.min(available);
     let drain_credit_planned = len
         .saturating_sub(clean_headroom)
@@ -1221,6 +1247,8 @@ fn bounded_downlink_flush_limit_for_window_with_clock(
         clean_headroom_bytes: clean_headroom,
         drain_credit_granted_bytes: granted,
         drain_credit_planned_bytes: drain_credit_planned,
+        hard_edge_guard_bytes: hard_edge_guard,
+        hard_edge_guard_deferred_bytes: unguarded_len.saturating_sub(len),
     }
 }
 
@@ -1695,6 +1723,19 @@ fn tx_queue_flush_threshold(cfg: DownlinkBackpressureConfig) -> usize {
     cfg.high_bytes.saturating_add(bounded_flush_headroom)
 }
 
+fn tx_queue_credit_guard_bytes(cfg: DownlinkBackpressureConfig) -> usize {
+    let credit_span = tx_queue_pause_threshold(cfg).saturating_sub(tx_queue_flush_threshold(cfg));
+    if credit_span == 0 {
+        0
+    } else {
+        (credit_span / 8).max(1).min(credit_span)
+    }
+}
+
+fn tx_queue_credit_spend_threshold(cfg: DownlinkBackpressureConfig) -> usize {
+    tx_queue_pause_threshold(cfg).saturating_sub(tx_queue_credit_guard_bytes(cfg))
+}
+
 fn reaches_downlink_pressure_hold_threshold(
     stats: DownlinkPressureStats,
     cfg: DownlinkBackpressureConfig,
@@ -1756,6 +1797,9 @@ struct TcpDownlinkAggregate {
     send_slice_drain_credit_granted_bytes: u64,
     send_slice_drain_credit_planned_bytes: u64,
     send_slice_drain_credit_used_bytes: u64,
+    send_slice_hard_edge_guard_bytes: usize,
+    send_slice_hard_edge_guard_limited: u64,
+    send_slice_hard_edge_guard_deferred_bytes: u64,
     send_slice_max_accepted_bytes: usize,
     tun_flush_tx_calls: u64,
     tun_flush_tx_failures: u64,
@@ -1826,6 +1870,15 @@ fn tcp_downlink_aggregate<'a>(
         aggregate.send_slice_drain_credit_used_bytes = aggregate
             .send_slice_drain_credit_used_bytes
             .saturating_add(ctx.downlink_diag.send_slice_drain_credit_used_bytes);
+        aggregate.send_slice_hard_edge_guard_bytes = aggregate
+            .send_slice_hard_edge_guard_bytes
+            .max(ctx.downlink_diag.send_slice_hard_edge_guard_bytes);
+        aggregate.send_slice_hard_edge_guard_limited = aggregate
+            .send_slice_hard_edge_guard_limited
+            .saturating_add(ctx.downlink_diag.send_slice_hard_edge_guard_limited);
+        aggregate.send_slice_hard_edge_guard_deferred_bytes = aggregate
+            .send_slice_hard_edge_guard_deferred_bytes
+            .saturating_add(ctx.downlink_diag.send_slice_hard_edge_guard_deferred_bytes);
         aggregate.send_slice_max_accepted_bytes = aggregate
             .send_slice_max_accepted_bytes
             .max(ctx.downlink_diag.send_slice_max_accepted_bytes);
@@ -1880,7 +1933,7 @@ fn format_tcp_downlink_flush_diag(
     dirty_handles: usize,
 ) -> String {
     format!(
-        "🔎 tcp-downlink-flush pending_total={} pending_max={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} drain_credit_granted_bytes={} drain_credit_planned_bytes={} drain_credit_used_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} dirty_handles={}",
+        "🔎 tcp-downlink-flush pending_total={} pending_max={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} drain_credit_granted_bytes={} drain_credit_planned_bytes={} drain_credit_used_bytes={} hard_edge_guard_bytes={} hard_edge_guard_limited_calls={} hard_edge_guard_deferred_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} dirty_handles={}",
         aggregate.pending_total,
         aggregate.pending_max,
         aggregate.pending_high,
@@ -1908,6 +1961,9 @@ fn format_tcp_downlink_flush_diag(
         aggregate.send_slice_drain_credit_granted_bytes,
         aggregate.send_slice_drain_credit_planned_bytes,
         aggregate.send_slice_drain_credit_used_bytes,
+        aggregate.send_slice_hard_edge_guard_bytes,
+        aggregate.send_slice_hard_edge_guard_limited,
+        aggregate.send_slice_hard_edge_guard_deferred_bytes,
         aggregate.send_slice_max_accepted_bytes,
         aggregate.tun_flush_tx_calls,
         aggregate.tun_flush_tx_failures,
@@ -2703,9 +2759,11 @@ pub async fn start_tun_proxy() {
         runtime_config.downlink_flush_max_bytes
     );
     println!(
-        "🚦 TCP 下行 egress pacing: immediate={}B/tick tx_queue_flush_high={}B（MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES 可调；pending backlog 在本地 egress 压力低于 high 时强制 immediate flush）",
+        "🚦 TCP 下行 egress pacing: immediate={}B/tick tx_queue_flush_high={}B tx_queue_credit_high={}B tx_queue_pause_high={}B（MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES 可调；pending backlog 在本地 egress 压力低于 high 时强制 immediate flush）",
         runtime_config.downlink_egress_immediate_bytes,
-        tx_queue_flush_threshold(runtime_config.downlink_backpressure)
+        tx_queue_flush_threshold(runtime_config.downlink_backpressure),
+        tx_queue_credit_spend_threshold(runtime_config.downlink_backpressure),
+        tx_queue_pause_threshold(runtime_config.downlink_backpressure)
     );
     println!(
         "🧱 TCP socket buffers: rx={}B tx={}B（MINI_VPN_TCP_*_BUFFER_BYTES 可调）",
@@ -4027,7 +4085,7 @@ fn rearm_socket_with_reason_and_snapshot(
         let close_pending = close_pending_accounting(ctx, snapshot);
         let close_egress = close_egress_accounting(snapshot);
         tcp_diag_log!(
-            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} drain_credit_granted_bytes={} drain_credit_planned_bytes={} drain_credit_used_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes={} close_egress_class={} close_egress_bytes={} close_egress_drain_candidate={} tcp_state={:?} active={} can_send={} can_recv={} may_send={} may_recv={} send_capacity={} send_queue={} recv_queue={}",
+            "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} drain_credit_granted_bytes={} drain_credit_planned_bytes={} drain_credit_used_bytes={} hard_edge_guard_bytes={} hard_edge_guard_limited_calls={} hard_edge_guard_deferred_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes={} close_egress_class={} close_egress_bytes={} close_egress_drain_candidate={} tcp_state={:?} active={} can_send={} can_recv={} may_send={} may_recv={} send_capacity={} send_queue={} recv_queue={}",
             handle,
             close_direction,
             close_reason,
@@ -4058,6 +4116,9 @@ fn rearm_socket_with_reason_and_snapshot(
             ctx.downlink_diag.send_slice_drain_credit_granted_bytes,
             ctx.downlink_diag.send_slice_drain_credit_planned_bytes,
             ctx.downlink_diag.send_slice_drain_credit_used_bytes,
+            ctx.downlink_diag.send_slice_hard_edge_guard_bytes,
+            ctx.downlink_diag.send_slice_hard_edge_guard_limited,
+            ctx.downlink_diag.send_slice_hard_edge_guard_deferred_bytes,
             ctx.downlink_diag.send_slice_max_accepted_bytes,
             ctx.downlink_diag.tun_flush_tx_calls,
             ctx.downlink_diag.tun_flush_tx_failures,
@@ -4089,7 +4150,7 @@ fn rearm_socket_with_reason_and_snapshot(
         ClosePendingClass::Unknown
     };
     tcp_diag_log!(
-        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} drain_credit_granted_bytes={} drain_credit_planned_bytes={} drain_credit_used_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes=0 close_egress_class=unknown close_egress_bytes=0 close_egress_drain_candidate=false",
+        "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} drain_credit_granted_bytes={} drain_credit_planned_bytes={} drain_credit_used_bytes={} hard_edge_guard_bytes={} hard_edge_guard_limited_calls={} hard_edge_guard_deferred_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes=0 close_egress_class=unknown close_egress_bytes=0 close_egress_drain_candidate=false",
         handle,
         close_direction,
         close_reason,
@@ -4120,6 +4181,9 @@ fn rearm_socket_with_reason_and_snapshot(
         ctx.downlink_diag.send_slice_drain_credit_granted_bytes,
         ctx.downlink_diag.send_slice_drain_credit_planned_bytes,
         ctx.downlink_diag.send_slice_drain_credit_used_bytes,
+        ctx.downlink_diag.send_slice_hard_edge_guard_bytes,
+        ctx.downlink_diag.send_slice_hard_edge_guard_limited,
+        ctx.downlink_diag.send_slice_hard_edge_guard_deferred_bytes,
         ctx.downlink_diag.send_slice_max_accepted_bytes,
         ctx.downlink_diag.tun_flush_tx_calls,
         ctx.downlink_diag.tun_flush_tx_failures,
@@ -7141,6 +7205,8 @@ mod tests {
                 clean_headroom_bytes: 2,
                 drain_credit_granted_bytes: 0,
                 drain_credit_planned_bytes: 0,
+                hard_edge_guard_bytes: 0,
+                hard_edge_guard_deferred_bytes: 0,
             },
         );
 
@@ -7148,6 +7214,8 @@ mod tests {
         assert_eq!(diag.send_slice_budget_limited, 0);
         assert_eq!(diag.send_slice_headroom_limited, 1);
         assert_eq!(diag.send_slice_headroom_deferred_bytes, 62);
+        assert_eq!(diag.send_slice_hard_edge_guard_limited, 0);
+        assert_eq!(diag.send_slice_hard_edge_guard_deferred_bytes, 0);
         assert_eq!(diag.downlink_pending_high_water, 64);
     }
 
@@ -7209,6 +7277,9 @@ mod tests {
         assert!(line.contains("budget_limited_calls=2"));
         assert!(line.contains("headroom_limited_calls=0"));
         assert!(line.contains("headroom_deferred_bytes=0"));
+        assert!(line.contains("hard_edge_guard_bytes=0"));
+        assert!(line.contains("hard_edge_guard_limited_calls=0"));
+        assert!(line.contains("hard_edge_guard_deferred_bytes=0"));
         assert!(line.contains("send_slice_max_accepted=64"));
         assert!(line.contains("send_window_samples=2"));
         assert!(line.contains("send_capacity_min=0"));
@@ -8007,12 +8078,14 @@ mod tests {
             &mut clock,
         );
         assert_eq!(
-            second.len, 60,
+            second.len, 57,
             "observed drain should grant one-shot credit above clean headroom"
         );
         assert_eq!(second.drain_credit_granted_bytes, 30);
-        assert_eq!(second.drain_credit_planned_bytes, 30);
-        clock.note_flush_result(after_drain.send_queue, 60, second);
+        assert_eq!(second.drain_credit_planned_bytes, 27);
+        assert_eq!(second.hard_edge_guard_bytes, 3);
+        assert_eq!(second.hard_edge_guard_deferred_bytes, 3);
+        clock.note_flush_result(after_drain.send_queue, 57, second);
 
         let at_hard_pause = TcpSendWindowSnapshot {
             send_queue: 160,
@@ -8029,6 +8102,86 @@ mod tests {
             third.len, 0,
             "drain credit must not let a pass plan beyond the hard pause threshold"
         );
+    }
+
+    #[test]
+    fn downlink_drain_credit_keeps_guard_below_hard_pause_edge() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let mut clock = DownlinkEgressClock::default();
+        let at_clean_cap = TcpSendWindowSnapshot {
+            can_send: true,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 100,
+            send_queue: 130,
+            recv_queue: 0,
+        };
+
+        let first = bounded_downlink_flush_limit_for_window_with_clock(
+            100,
+            100,
+            at_clean_cap,
+            cfg,
+            &mut clock,
+        );
+        clock.note_flush_result(at_clean_cap.send_queue, 0, first);
+
+        let after_drain = TcpSendWindowSnapshot {
+            send_queue: 100,
+            ..at_clean_cap
+        };
+        let second = bounded_downlink_flush_limit_for_window_with_clock(
+            100,
+            100,
+            after_drain,
+            cfg,
+            &mut clock,
+        );
+
+        assert_eq!(
+            second.len, 57,
+            "credit should leave a derived guard below hard pause"
+        );
+        assert_eq!(
+            after_drain.send_queue + second.len,
+            157,
+            "planned send queue should stay below pause=160"
+        );
+    }
+
+    #[test]
+    fn downlink_credit_guard_never_reduces_clean_headroom() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 2,
+            low_bytes: 1,
+        };
+        let mut clock = DownlinkEgressClock::default();
+        let send_window = TcpSendWindowSnapshot {
+            can_send: true,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 10,
+            send_queue: 0,
+            recv_queue: 0,
+        };
+
+        let limit =
+            bounded_downlink_flush_limit_for_window_with_clock(10, 10, send_window, cfg, &mut clock);
+
+        assert_eq!(
+            tx_queue_credit_guard_bytes(cfg),
+            0,
+            "zero-width credit spans cannot reserve a guard below clean headroom"
+        );
+        assert_eq!(
+            limit.len,
+            tx_queue_flush_threshold(cfg),
+            "clean headroom must remain usable even when credit span is tiny"
+        );
+        assert_eq!(limit.hard_edge_guard_deferred_bytes, 0);
     }
 
     #[test]
@@ -8066,8 +8219,8 @@ mod tests {
             cfg,
             &mut clock,
         );
-        assert_eq!(second.len, 60);
-        assert_eq!(second.drain_credit_planned_bytes, 30);
+        assert_eq!(second.len, 57);
+        assert_eq!(second.drain_credit_planned_bytes, 27);
         assert_eq!(
             clock.note_flush_result(after_drain.send_queue, 45, second),
             15,
@@ -8086,10 +8239,11 @@ mod tests {
             &mut clock,
         );
         assert_eq!(
-            third.len, 15,
+            third.len, 12,
             "unused drain credit should remain available but still stop at hard pause"
         );
-        assert_eq!(third.drain_credit_planned_bytes, 15);
+        assert_eq!(third.drain_credit_planned_bytes, 12);
+        assert_eq!(third.hard_edge_guard_deferred_bytes, 3);
     }
 
     #[test]
