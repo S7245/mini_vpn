@@ -1462,6 +1462,22 @@
   once before changing code or restarting sing-box. If repeated, then stop and
   inspect `.33` service/runtime logs before more acceptance runs.
 
+## 2026-07-06 — No-secret TUIC compare error is inconclusive by itself
+
+- Symptom: the first Knife14bt VPS run on `b5752c4` failed with the same
+  `tuic auth finish: sending stopped by peer: error 0`, and the generated
+  no-secret compare script printed `exit_config_compare_error=1` with
+  `CalledProcessError`.
+- Evidence: service diagnostics still showed `.27/.33` time skew `0s`, `.33`
+  sing-box active, UDP `:8443` listening, and sing-box config check passing. A
+  manual rerun of the no-secret compare with explicit SSH env immediately
+  returned `uuid_match=1`, `password_match=1`, `sni_match=1`, and
+  `alpn_match=1`; the no-build retry then connected.
+- Correct behavior: treat `exit_config_compare_error=1` as an inconclusive
+  diagnostic failure, not as an auth mismatch. Rerun the no-secret compare with
+  explicit `EXIT_SSH_*` env and only blame sing-box/config if the match booleans
+  fail or the startup failure repeats after one retry.
+
 ## 2026-07-06 — Tx-buffer-scaled high watermark can regress reverse throughput
 
 - Symptom: with suite normalization forcing binary auto defaults,

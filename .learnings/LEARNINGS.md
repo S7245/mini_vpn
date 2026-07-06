@@ -2398,3 +2398,27 @@ worth cleaning up separately.
   default from the product path and keep larger watermarks explicit only. The
   remaining Knife14 branch is durable local TUN egress pressure and tail
   collapse, not script env normalization.
+
+## 2026-07-06 — Knife14bt conservative auto still low-average on VPS
+
+- Stage: Knife14bt scoped VPS acceptance on commit `b5752c4`.
+- Outcome: the core-default fix was applied on `.27`: suite high/low were
+  `<auto>` and mini_vpn started with `high=524288B low=131072B`. The first run
+  hit the known one-shot TUIC auth-finish transient; manual no-secret compare
+  then showed all auth fields matched, and the no-build retry connected.
+- Result: reverse-first P1 still failed at `18.4/17.4 Mbit/s` with
+  `throughput_shape=low_average`, repeated zero-throughput intervals, healthy
+  direct baselines, and no QUIC loss/congestion/blocking.
+- Signals: `downlink_backpressure=26/26`, `max_tx_queue_bytes=586083`,
+  `tun_tx_dropped_delta=172`, `tun_egress_feedback=1/1`,
+  `terminal_pending_reap=0`, `terminal_late_remote_payload=2890364B/145`,
+  `send_slice_zero=0`, `send_slice_errors=0`, and `tun_flush_failures=0`.
+- Likely root: the high watermark value is no longer the primary branch.
+  smoltcp `send_queue` pressure crosses high and then appears as zero
+  immediately after poll/flush, while the remote stream develops multi-second
+  read/pending gaps. The gate needs durable local egress pressure, not another
+  default high/low tweak.
+- Reusable rule: after a low-average reverse run with `terminal_pending_reap=0`
+  and QUIC deltas `0`, do not chase sing-box, iperf3, scripts, or stale pools.
+  Add a core test that prevents immediate clean resume after a high
+  `send_queue` flush before changing behavior.
