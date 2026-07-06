@@ -1,5 +1,33 @@
 # Learnings
 
+## 2026-07-06 - Knife14cr repeats stable high reverse P1 with timer drain off
+
+- Stage docs:
+  `docs/tech/2026-07-06-knife14cr-repeat-stability-spec.md`,
+  `docs/tech/2026-07-06-knife14cr-repeat-stability-plan.md`,
+  `docs/tech/2026-07-06-knife14cr-repeat-stability-results.md`
+- Log bundle:
+  `/tmp/mini_vpn/knife14cr_repeat_stability_20260707_041152/mvpn_knife14cr_repeat_stability_usclient_suite_20260707_041152.tar.gz`
+- Outcome: without code changes after Knife14cq, the repeat reverse-first P1
+  stayed high at `174/172 Mbit/s` with `throughput_shape=stable_high`.
+- What worked: the default-disabled timer path stayed disabled
+  (`TUN RX active-flow timer drain: 0ms`,
+  `timer_active_flow_attempts=0`), while event-driven drain handled
+  ACK/window traffic (`attempts=65834`, `would_block=65752`).
+- What stayed clean: `pending_at_close=0`, `egress_at_close=0`,
+  `terminal_pending_reap=0`, `terminal_late_remote_payload=0`,
+  `tun_tx_dropped_delta=0`, `drop_delta_total=0`, no send-slice or TUN flush
+  errors, no QUIC loss/congestion/blocking, and no current `.33` TUIC
+  `fail auth`.
+- What to watch: the final one-second iperf interval dipped to `4.19 Mbit/s`,
+  but six-sample tail stayed high (`tail_avg_mbps=153.865`) and
+  `tail_collapse=0`.
+- Reusable rule: after a high-throughput recovery, require at least one repeat
+  with the same binary and default env before declaring the P1 root closed.
+  Knife14 can now move to broader TCP regression rather than more P1
+  lifecycle patches.
+- Overall Knife14 estimate after this repeat: `93%`.
+
 ## 2026-07-06 - Knife14cq restores stable high reverse P1 by disabling timer drain default
 
 - Stage docs:
