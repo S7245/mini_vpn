@@ -5137,7 +5137,10 @@ async fn run_relay_writer(
                         let _ = writer.shutdown().await;
                         return;
                     }
-                    result = writer.write_all(&payload) => result,
+                    result = async {
+                        writer.write_all(&payload).await?;
+                        writer.flush().await
+                    } => result,
                 };
                 let write_wait = write_started.elapsed();
                 match write_result {
@@ -5325,7 +5328,7 @@ mod tests {
     // ---- 刀9 F4：relay idle 超时（L2）----
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
-    use std::task::{Context, Poll};
+    use std::task::{Context, Poll, Waker};
 
     /// 一条永不产数据的 mock 上游流：read 恒 Pending、write/flush 即成、shutdown 记账。
     /// 用于驱动 run_relay 的 idle 超时分支（唯一能 fire 的分支）。
@@ -5384,6 +5387,59 @@ mod tests {
             Poll::Ready(Ok(()))
         }
         fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.shutdown_called.store(true, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct FlushGatedReadableStream {
+        shutdown_called: Arc<AtomicBool>,
+        flushed: Arc<AtomicBool>,
+        read_waker: Arc<Mutex<Option<Waker>>>,
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        read_sent: bool,
+    }
+    impl tokio::io::AsyncRead for FlushGatedReadableStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.read_sent {
+                return Poll::Pending;
+            }
+            if !self.flushed.load(Ordering::SeqCst) {
+                *self.read_waker.lock().unwrap() = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            buf.put_slice(b"remote-after-flush");
+            self.read_sent = true;
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl tokio::io::AsyncWrite for FlushGatedReadableStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.writes.lock().unwrap().push(buf.to_vec());
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.flushed.store(true, Ordering::SeqCst);
+            if let Some(waker) = self.read_waker.lock().unwrap().take() {
+                waker.wake();
+            }
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
             self.shutdown_called.store(true, Ordering::SeqCst);
             Poll::Ready(Ok(()))
         }
@@ -5643,6 +5699,56 @@ mod tests {
             }
             other => panic!("expected relay close event, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn relay_writer_flushes_payload_to_release_remote_response() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let flushed = Arc::new(AtomicBool::new(false));
+        let read_waker = Arc::new(Mutex::new(None));
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let stream: RelayStream = Box::new(FlushGatedReadableStream {
+            shutdown_called: shutdown_called.clone(),
+            flushed: flushed.clone(),
+            read_waker,
+            writes: writes.clone(),
+            read_sent: false,
+        });
+        let (tx, rx) = mpsc::channel::<RelayCommand>(8);
+        let (back_tx, mut back_rx) = mpsc::channel(8);
+        let task = tokio::spawn(run_relay(handle, 43, stream, rx, back_tx));
+
+        tx.send(RelayCommand::Data(b"reverse-control".to_vec()))
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(200), back_rx.recv())
+            .await
+            .expect("remote response gated on flush should arrive promptly")
+            .expect("relay should still be alive");
+
+        assert!(
+            flushed.load(Ordering::SeqCst),
+            "payload writes must be flushed after write_all"
+        );
+        assert_eq!(*writes.lock().unwrap(), vec![b"reverse-control".to_vec()]);
+        match event {
+            (h, RelayEvent::Data { epoch, bytes }) => {
+                assert_eq!(h, handle);
+                assert_eq!(epoch, 43);
+                assert_eq!(bytes, b"remote-after-flush");
+            }
+            other => panic!("expected remote response after flushed payload, got {other:?}"),
+        }
+
+        drop(tx);
+        task.await.unwrap();
+        assert!(
+            shutdown_called.load(Ordering::SeqCst),
+            "local channel close still shuts down writer"
+        );
     }
 
     #[tokio::test]
