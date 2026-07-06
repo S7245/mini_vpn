@@ -1224,7 +1224,10 @@ type DownlinkEgressDropDebt = DownlinkEgressCreditDebt;
 impl DownlinkEgressCreditDebt {
     fn note_tun_drop(&mut self, cfg: DownlinkBackpressureConfig) -> usize {
         self.drop_events = self.drop_events.saturating_add(1);
-        self.install(EgressCreditDebtSource::Drop, cfg)
+        self.install(
+            EgressCreditDebtSource::Drop,
+            downlink_egress_credit_span(cfg),
+        )
     }
 
     fn note_egress_pressure(
@@ -1232,19 +1235,15 @@ impl DownlinkEgressCreditDebt {
         stats: DownlinkPressureStats,
         cfg: DownlinkBackpressureConfig,
     ) -> usize {
-        if !reaches_downlink_credit_debt_pressure_threshold(stats, cfg) {
+        let debt_bytes = downlink_egress_pressure_debt_bytes(stats, cfg);
+        if debt_bytes == 0 {
             return 0;
         }
         self.pressure_events = self.pressure_events.saturating_add(1);
-        self.install(EgressCreditDebtSource::Pressure, cfg)
+        self.install(EgressCreditDebtSource::Pressure, debt_bytes)
     }
 
-    fn install(
-        &mut self,
-        source: EgressCreditDebtSource,
-        cfg: DownlinkBackpressureConfig,
-    ) -> usize {
-        let installed = downlink_egress_credit_span(cfg);
+    fn install(&mut self, source: EgressCreditDebtSource, installed: usize) -> usize {
         if installed == 0 {
             return 0;
         }
@@ -1361,6 +1360,33 @@ impl DownlinkEgressClock {
 
 fn downlink_egress_credit_span(cfg: DownlinkBackpressureConfig) -> usize {
     tx_queue_pause_threshold(cfg).saturating_sub(tx_queue_flush_threshold(cfg))
+}
+
+fn downlink_egress_pressure_debt_bytes(
+    stats: DownlinkPressureStats,
+    cfg: DownlinkBackpressureConfig,
+) -> usize {
+    if !reaches_downlink_credit_debt_pressure_threshold(stats, cfg) {
+        return 0;
+    }
+    let span = downlink_egress_credit_span(cfg);
+    if span == 0 {
+        return 0;
+    }
+    let guard = tx_queue_credit_guard_bytes(cfg).max(1).min(span);
+    let tx_overshoot = stats
+        .max_tx_queue
+        .saturating_sub(tx_queue_credit_spend_threshold(cfg));
+    let pending_overshoot = if stats.max_pending >= cfg.high_bytes
+        && stats.max_tx_queue >= tx_queue_flush_threshold(cfg)
+    {
+        stats.max_pending.saturating_sub(cfg.high_bytes)
+    } else {
+        0
+    };
+    guard
+        .saturating_add(tx_overshoot.max(pending_overshoot))
+        .min(span)
 }
 
 #[cfg(test)]
@@ -9120,6 +9146,46 @@ mod tests {
     }
 
     #[test]
+    fn downlink_pressure_credit_debt_sizes_from_guard_and_overshoot() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        assert_eq!(downlink_egress_credit_span(cfg), 30);
+        assert_eq!(tx_queue_credit_guard_bytes(cfg), 3);
+        assert_eq!(tx_queue_credit_spend_threshold(cfg), 157);
+
+        assert_eq!(
+            downlink_egress_pressure_debt_bytes(DownlinkPressureStats::new(0, 0, 156, 156), cfg),
+            0,
+            "below the credit edge should not install pressure debt"
+        );
+        assert_eq!(
+            downlink_egress_pressure_debt_bytes(DownlinkPressureStats::new(0, 0, 157, 157), cfg),
+            3,
+            "the credit edge is an early warning, so it installs a guard-sized nudge"
+        );
+        assert_eq!(
+            downlink_egress_pressure_debt_bytes(DownlinkPressureStats::new(0, 0, 170, 170), cfg),
+            16,
+            "pressure overshoot should scale debt above the guard"
+        );
+        assert_eq!(
+            downlink_egress_pressure_debt_bytes(DownlinkPressureStats::new(0, 0, 220, 220), cfg),
+            30,
+            "pressure debt remains bounded by the original full credit span"
+        );
+        assert_eq!(
+            downlink_egress_pressure_debt_bytes(
+                DownlinkPressureStats::new(125, 125, 130, 130),
+                cfg,
+            ),
+            28,
+            "pending pressure at the flush edge should also scale the early debt"
+        );
+    }
+
+    #[test]
     fn downlink_pressure_credit_debt_blocks_stale_credit_before_tun_drop() {
         let cfg = DownlinkBackpressureConfig {
             high_bytes: 100,
@@ -9133,7 +9199,7 @@ mod tests {
         let mut credit_debt = DownlinkEgressCreditDebt::default();
         assert_eq!(
             credit_debt.note_egress_pressure(DownlinkPressureStats::new(0, 0, 157, 157), cfg),
-            30
+            3
         );
 
         let after_pressure_drain = TcpSendWindowSnapshot {
@@ -9157,10 +9223,10 @@ mod tests {
         assert_eq!(limit.clean_headroom_bytes, 30);
         assert_eq!(limit.drain_credit_granted_bytes, 0);
         assert_eq!(limit.drain_credit_planned_bytes, 0);
-        assert_eq!(limit.pressure_credit_debt_paid_bytes, 30);
+        assert_eq!(limit.pressure_credit_debt_paid_bytes, 3);
         assert_eq!(limit.pressure_credit_debt_bytes, 0);
         assert_eq!(
-            limit.pressure_credit_blocked_bytes, 57,
+            limit.pressure_credit_blocked_bytes, 30,
             "stale credit plus pressure-paid drain should be attributed to pressure debt"
         );
         assert_eq!(limit.drop_credit_blocked_bytes, 0);
@@ -9196,7 +9262,7 @@ mod tests {
             &mut clock,
             &mut credit_debt,
         );
-        assert_eq!(debt_payment.pressure_credit_debt_paid_bytes, 30);
+        assert_eq!(debt_payment.pressure_credit_debt_paid_bytes, 3);
         assert_eq!(debt_payment.drain_credit_granted_bytes, 0);
         assert_eq!(
             debt_payment.len, 30,
