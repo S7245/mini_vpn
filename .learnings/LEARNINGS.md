@@ -2358,3 +2358,23 @@ worth cleaning up separately.
   values must be treated as part of the test surface and made visible in the
   report. Always verify both the suite config lines and the mini_vpn startup
   high/low log before interpreting throughput.
+
+## 2026-07-06 — Knife14bs auto high/low is not sufficient
+
+- Stage: Knife14bs VPS acceptance on commit `dd9c6ad`.
+- Outcome: suite normalization worked on `.27`: the report showed
+  `downlink_backpressure_auto_reset=legacy_512k_for_scaled_tx_buffer`, and
+  mini_vpn started with `high=1048576B low=262144B`.
+- Result: the clean reverse-first P1 did not pass. Throughput was
+  `20.2/18.8 Mbit/s` with a `low_average` shape and repeated zero-throughput
+  intervals, despite healthy `.27 <-> .77` and `.33 <-> .77` direct baselines.
+- Signals: compared with Knife14bq, downlink pause/resume fell from `693/693`
+  to `19/19` and TUN drops fell from `14804` to `586`, but throughput also fell
+  from `149 Mbit/s` to `18.8 Mbit/s`. QUIC loss/congestion stayed zero, global
+  rx pressure stayed zero, and terminal pending remained non-hidden
+  (`terminal_pending_reap=0`, `pending_at_close=0`).
+- Reusable rule: do not assume `TCP tx buffer size == safe downlink high
+  watermark`. On this topology, a 1 MiB high watermark with TUN qlen `500`
+  creates stop/go receive-window behavior. The next model must account for
+  TUN/qdisc egress capacity and stream read-gap timing, not just smoltcp
+  `send_queue` bytes.

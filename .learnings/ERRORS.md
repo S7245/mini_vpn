@@ -1447,3 +1447,32 @@
   `KNIFE14_KEEP_EXPLICIT_DOWNLINK_BACKPRESSURE=1` is set. Future result
   analysis must check the actual startup high/low line before blaming
   receive-window code.
+
+## 2026-07-06 — TUIC auth finish can fail once despite matching config
+
+- Symptom: the first Knife14bs VPS run on `dd9c6ad` failed during mini_vpn
+  startup with `tuic auth finish: sending stopped by peer: error 0`.
+- Evidence: `.33` sing-box was active with UDP `:8443` listening, `.27/.33`
+  time skew was `0s`, sing-box config check passed, and a manual no-secret
+  comparison showed `uuid_match=1`, `password_match=1`, `sni_match=1`, and
+  `alpn_match=1`. A no-build retry immediately afterward connected and reached
+  the reverse-first probe.
+- Correct behavior: if this exact startup failure appears once while no-secret
+  config/time/service checks pass, treat it as a startup transient and retry
+  once before changing code or restarting sing-box. If repeated, then stop and
+  inspect `.33` service/runtime logs before more acceptance runs.
+
+## 2026-07-06 — Tx-buffer-scaled high watermark can regress reverse throughput
+
+- Symptom: with suite normalization forcing binary auto defaults,
+  `high=1048576B low=262144B`, reverse-first P1 fell to `18.8 Mbit/s` receiver
+  with periodic zero-throughput intervals.
+- Evidence: direct and exit-target baselines stayed healthy; QUIC
+  loss/congestion/blocking stayed zero; global_rx pressure stayed zero; TUN
+  drops reduced to `586`, but smoltcp `send_queue` hit `1048576`, stream read
+  gaps reached `3782ms`, and target sender cwnd collapsed in the same stop/go
+  pattern.
+- Correct behavior: do not increase receive-window/high watermark as a default
+  throughput fix without TUN/qdisc-capacity evidence. The next patch must make
+  local egress pressure durable across poll/flush or explicitly tune high/low
+  against measured TUN egress capacity.
