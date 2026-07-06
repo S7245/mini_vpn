@@ -933,6 +933,10 @@ struct SocketCtx {
     pending_relay_close_last_progress_secs: Option<u64>,
     /// Last observed pending size for progress-sensitive deferred close reap.
     pending_relay_close_last_pending_bytes: usize,
+    /// Latest event-loop second when queued smoltcp egress drained while relay close was deferred.
+    pending_relay_close_last_egress_progress_secs: Option<u64>,
+    /// Last observed smoltcp send queue size for egress-drain deferred close.
+    pending_relay_close_last_egress_queue_bytes: usize,
     /// Monotonic event-loop seconds when generic pending downlink was first observed or last drained.
     downlink_pending_last_progress_secs: Option<u64>,
     /// Last observed pending size for generic pending downlink reap.
@@ -971,6 +975,8 @@ impl SocketCtx {
             pending_relay_close_since_secs: None,
             pending_relay_close_last_progress_secs: None,
             pending_relay_close_last_pending_bytes: 0,
+            pending_relay_close_last_egress_progress_secs: None,
+            pending_relay_close_last_egress_queue_bytes: 0,
             downlink_pending_last_progress_secs: None,
             downlink_pending_last_pending_bytes: 0,
             fake_ip: None,
@@ -2712,6 +2718,7 @@ pub async fn run_event_loop<D, U, M>(
                             &mut socket_ctxs,
                             &mut fake_pool,
                             udp_clock.elapsed().as_secs(),
+                            downlink_backpressure,
                         ) {
                             dirty.insert(handle);
                         } else {
@@ -3148,6 +3155,7 @@ async fn process_dirty_relay<U, M>(
             now_secs,
             metrics_handle,
             downlink_flush_max_bytes,
+            downlink_backpressure,
         )
         .await
         {
@@ -3282,6 +3290,16 @@ fn should_reap_slot(
         };
         return now_secs.saturating_sub(deadline_base) >= DEFERRED_CLOSE_PENDING_GRACE_SECS;
     }
+    if ctx.pending_relay_close.is_some()
+        && active
+        && can_send
+        && ctx.pending_relay_close_last_egress_queue_bytes > 0
+    {
+        let Some(deadline_base) = deferred_close_egress_deadline_base(ctx) else {
+            return false;
+        };
+        return now_secs.saturating_sub(deadline_base) >= DEFERRED_CLOSE_PENDING_GRACE_SECS;
+    }
     if !active {
         return true;
     }
@@ -3293,6 +3311,81 @@ fn should_reap_slot(
 
 fn relay_allows_remote_payload(ctx: &SocketCtx) -> bool {
     ctx.uplink_tx.is_some() || ctx.local_fin_sent
+}
+
+fn should_start_deferred_close_for_egress(
+    snapshot: SocketCloseSnapshot,
+    cfg: DownlinkBackpressureConfig,
+) -> bool {
+    snapshot.active && snapshot.can_send && snapshot.send_queue >= cfg.high_bytes
+}
+
+fn start_deferred_close_for_egress_if_needed(
+    ctx: &mut SocketCtx,
+    close: RelayClose,
+    snapshot: SocketCloseSnapshot,
+    cfg: DownlinkBackpressureConfig,
+    now_secs: u64,
+) -> bool {
+    if !ctx.downlink_pending.is_empty()
+        || !should_start_deferred_close_for_egress(snapshot, cfg)
+    {
+        return false;
+    }
+
+    ctx.state = SocketState::Closing;
+    ctx.uplink_tx = None;
+    ctx.pending_relay_close = Some(close);
+    ctx.pending_relay_close_since_secs = Some(now_secs);
+    ctx.pending_relay_close_last_progress_secs = None;
+    ctx.pending_relay_close_last_pending_bytes = 0;
+    ctx.pending_relay_close_last_egress_progress_secs = Some(now_secs);
+    ctx.pending_relay_close_last_egress_queue_bytes = snapshot.send_queue;
+    true
+}
+
+fn deferred_close_egress_deadline_base(ctx: &SocketCtx) -> Option<u64> {
+    ctx.pending_relay_close_since_secs
+        .max(ctx.pending_relay_close_last_egress_progress_secs)
+}
+
+fn note_deferred_close_egress_progress(
+    ctx: &mut SocketCtx,
+    send_queue: usize,
+    now_secs: u64,
+) {
+    if send_queue == 0 {
+        ctx.pending_relay_close_last_egress_progress_secs = None;
+        ctx.pending_relay_close_last_egress_queue_bytes = 0;
+        return;
+    }
+    let last_queue = ctx.pending_relay_close_last_egress_queue_bytes;
+    if last_queue == 0 || send_queue < last_queue {
+        ctx.pending_relay_close_last_egress_queue_bytes = send_queue;
+        ctx.pending_relay_close_last_egress_progress_secs = Some(now_secs);
+    } else if send_queue > last_queue {
+        ctx.pending_relay_close_last_egress_queue_bytes = send_queue;
+    }
+}
+
+fn should_keep_deferred_close_for_egress(
+    ctx: &mut SocketCtx,
+    snapshot: SocketCloseSnapshot,
+    cfg: DownlinkBackpressureConfig,
+    now_secs: u64,
+) -> bool {
+    if ctx.pending_relay_close.is_none()
+        || !snapshot.active
+        || !snapshot.can_send
+        || snapshot.send_queue <= cfg.low_bytes
+    {
+        return false;
+    }
+    note_deferred_close_egress_progress(ctx, snapshot.send_queue, now_secs);
+    let Some(deadline_base) = deferred_close_egress_deadline_base(ctx) else {
+        return false;
+    };
+    now_secs.saturating_sub(deadline_base) < DEFERRED_CLOSE_PENDING_GRACE_SECS
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3698,6 +3791,8 @@ fn rearm_socket(
     ctx.pending_relay_close_since_secs = None;
     ctx.pending_relay_close_last_progress_secs = None;
     ctx.pending_relay_close_last_pending_bytes = 0;
+    ctx.pending_relay_close_last_egress_progress_secs = None;
+    ctx.pending_relay_close_last_egress_queue_bytes = 0;
     ctx.downlink_pending_last_progress_secs = None;
     ctx.downlink_pending_last_pending_bytes = 0;
     ctx.downlink_diag = TcpDownlinkDiag::default();
@@ -3731,6 +3826,7 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
     now_secs: u64,
     metrics_handle: &Metrics,
     downlink_flush_max_bytes: usize,
+    downlink_backpressure: DownlinkBackpressureConfig,
 ) -> Result<(), ClientError> {
     // 每轮先推进该 handle 的下行 pending：TCP ACK 释放 tx buffer 空间后继续写，
     // 直到把上一轮没写完的回程字节全部交付，绝不丢字节（修 bad decrypt 的另一半）。
@@ -3746,6 +3842,7 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
                 ctx,
                 fake_pool,
                 now_secs,
+                downlink_backpressure,
             ) {
                 return Ok(());
             }
@@ -3770,6 +3867,31 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
             if let Some(ctx) = socket_ctxs.get_mut(&handle) {
                 if ctx.local_fin_sent {
                     ctx.uplink_tx = None;
+                    return Ok(());
+                }
+                let snapshot = SocketCloseSnapshot::from_socket(tcp_socket);
+                let close = RelayClose {
+                    epoch: ctx.conn_epoch,
+                    direction: "local_to_remote",
+                    reason: "uplink_channel_closed",
+                };
+                if start_deferred_close_for_egress_if_needed(
+                    ctx,
+                    close,
+                    snapshot,
+                    downlink_backpressure,
+                    now_secs,
+                ) {
+                    tcp_diag_log!(
+                        "🔎 tcp-deferred-close-egress handle={:?} direction={} reason={} send_queue={} high={} low={} started_secs={}",
+                        handle,
+                        close.direction,
+                        close.reason,
+                        snapshot.send_queue,
+                        downlink_backpressure.high_bytes,
+                        downlink_backpressure.low_bytes,
+                        now_secs
+                    );
                     return Ok(());
                 }
                 rearm_socket_with_reason(
@@ -4172,6 +4294,7 @@ fn handle_relay_closed(
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
+    downlink_backpressure: DownlinkBackpressureConfig,
 ) -> bool {
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
         return false;
@@ -4220,6 +4343,26 @@ fn handle_relay_closed(
         return true;
     }
 
+    if start_deferred_close_for_egress_if_needed(
+        ctx,
+        close,
+        snapshot,
+        downlink_backpressure,
+        now_secs,
+    ) {
+        tcp_diag_log!(
+            "🔎 tcp-deferred-close-egress handle={:?} direction={} reason={} send_queue={} high={} low={} started_secs={}",
+            handle,
+            close.direction,
+            close.reason,
+            snapshot.send_queue,
+            downlink_backpressure.high_bytes,
+            downlink_backpressure.low_bytes,
+            now_secs
+        );
+        return true;
+    }
+
     let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
     rearm_socket_with_reason(
         handle,
@@ -4239,11 +4382,16 @@ fn finish_deferred_relay_close_if_drained(
     ctx: &mut SocketCtx,
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
+    downlink_backpressure: DownlinkBackpressureConfig,
 ) -> bool {
     let Some(close) = ctx.pending_relay_close else {
         return false;
     };
     if !ctx.downlink_pending.is_empty() {
+        return true;
+    }
+    let snapshot = SocketCloseSnapshot::from_socket(socket);
+    if should_keep_deferred_close_for_egress(ctx, snapshot, downlink_backpressure, now_secs) {
         return true;
     }
     rearm_socket_with_reason(
@@ -5520,6 +5668,29 @@ mod tests {
     }
 
     #[test]
+    fn reap_predicate_preserves_deferred_close_egress_until_grace() {
+        let mut ctx = SocketCtx::new(443);
+        ctx.state = SocketState::Closing;
+        ctx.pending_relay_close = Some(RelayClose {
+            epoch: 7,
+            direction: "local_to_remote",
+            reason: "uplink_channel_closed",
+        });
+        ctx.pending_relay_close_since_secs = Some(10);
+        ctx.pending_relay_close_last_egress_progress_secs = Some(10);
+        ctx.pending_relay_close_last_egress_queue_bytes = 524_288;
+
+        assert!(
+            !should_reap_slot(&ctx, TcpState::CloseWait, true, true, 14),
+            "deferred egress close should not be reaped inside the bounded grace"
+        );
+        assert!(
+            should_reap_slot(&ctx, TcpState::CloseWait, true, true, 15),
+            "deferred egress close remains bounded when the queue makes no progress"
+        );
+    }
+
+    #[test]
     fn reap_predicate_graces_deferred_close_pending_downlink() {
         let mut ctx = SocketCtx::new(443);
         ctx.state = SocketState::Closing;
@@ -5941,6 +6112,8 @@ mod tests {
             pending_relay_close_since_secs: None,
             pending_relay_close_last_progress_secs: None,
             pending_relay_close_last_pending_bytes: 0,
+            pending_relay_close_last_egress_progress_secs: Some(5),
+            pending_relay_close_last_egress_queue_bytes: 12_345,
             downlink_pending_last_progress_secs: Some(9),
             downlink_pending_last_pending_bytes: 42,
             fake_ip: Some(ip),
@@ -5962,6 +6135,14 @@ mod tests {
         assert!(
             ctx.local_fin_last_remote_progress_secs.is_none(),
             "rearm 应清空 deferred local FIN 进展时间"
+        );
+        assert!(
+            ctx.pending_relay_close_last_egress_progress_secs.is_none(),
+            "rearm 应清空 deferred close egress 进展时间"
+        );
+        assert_eq!(
+            ctx.pending_relay_close_last_egress_queue_bytes, 0,
+            "rearm 应清空 deferred close egress 队列状态"
         );
         assert!(ctx.fake_ip.is_none(), "rearm 应清空 fake_ip");
         assert!(ctx.uplink_buffer.is_empty(), "rearm 应清空 uplink_buffer（M3 patch）");
@@ -6006,6 +6187,7 @@ mod tests {
             &mut socket_ctxs,
             &mut pool,
             1,
+            DownlinkBackpressureConfig::default(),
         );
 
         let ctx = socket_ctxs.get(&handle).unwrap();
@@ -6039,6 +6221,7 @@ mod tests {
             &mut socket_ctxs,
             &mut pool,
             1,
+            DownlinkBackpressureConfig::default(),
         );
 
         let ctx = socket_ctxs.get_mut(&handle).unwrap();
@@ -6061,7 +6244,8 @@ mod tests {
             socket,
             ctx,
             &mut pool,
-            2
+            2,
+            DownlinkBackpressureConfig::default()
         ));
         assert_eq!(ctx.state, SocketState::Listening);
         assert!(ctx.pending_relay_close.is_none());
@@ -6071,6 +6255,102 @@ mod tests {
         assert!(ctx.downlink_pending_last_progress_secs.is_none());
         assert_eq!(ctx.downlink_pending_last_pending_bytes, 0);
         assert_eq!(ctx.conn_epoch, 6);
+    }
+
+    #[test]
+    fn deferred_close_egress_starts_for_send_capable_closewait_queue() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut ctx = SocketCtx::new(12345);
+        ctx.state = SocketState::Relaying;
+        ctx.conn_epoch = 5;
+        ctx.uplink_tx = Some(tx);
+        let snapshot = SocketCloseSnapshot {
+            tcp_state: TcpState::CloseWait,
+            active: true,
+            can_send: true,
+            can_recv: false,
+            may_send: true,
+            may_recv: false,
+            send_capacity: 1_048_576,
+            send_queue: 524_288,
+            recv_queue: 0,
+        };
+        let close = RelayClose {
+            epoch: 5,
+            direction: "local_to_remote",
+            reason: "uplink_channel_closed",
+        };
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 524_288,
+            low_bytes: 131_072,
+        };
+
+        assert!(start_deferred_close_for_egress_if_needed(
+            &mut ctx, close, snapshot, cfg, 10
+        ));
+        assert_eq!(ctx.state, SocketState::Closing);
+        assert!(ctx.uplink_tx.is_none());
+        assert_eq!(ctx.pending_relay_close.map(|c| c.reason), Some("uplink_channel_closed"));
+        assert_eq!(ctx.pending_relay_close_since_secs, Some(10));
+        assert_eq!(ctx.pending_relay_close_last_egress_progress_secs, Some(10));
+        assert_eq!(ctx.pending_relay_close_last_egress_queue_bytes, 524_288);
+    }
+
+    #[test]
+    fn deferred_close_egress_waits_until_low_or_grace() {
+        let mut ctx = SocketCtx::new(12345);
+        ctx.state = SocketState::Closing;
+        ctx.pending_relay_close = Some(RelayClose {
+            epoch: 5,
+            direction: "local_to_remote",
+            reason: "uplink_channel_closed",
+        });
+        ctx.pending_relay_close_since_secs = Some(10);
+        ctx.pending_relay_close_last_egress_progress_secs = Some(10);
+        ctx.pending_relay_close_last_egress_queue_bytes = 524_288;
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 524_288,
+            low_bytes: 131_072,
+        };
+        let mut snapshot = SocketCloseSnapshot {
+            tcp_state: TcpState::CloseWait,
+            active: true,
+            can_send: true,
+            can_recv: false,
+            may_send: true,
+            may_recv: false,
+            send_capacity: 1_048_576,
+            send_queue: 524_288,
+            recv_queue: 0,
+        };
+
+        assert!(
+            should_keep_deferred_close_for_egress(&mut ctx, snapshot, cfg, 14),
+            "high egress queue within grace should keep the close deferred"
+        );
+
+        snapshot.send_queue = 300_000;
+        assert!(
+            should_keep_deferred_close_for_egress(&mut ctx, snapshot, cfg, 14),
+            "queue drain progress should refresh the bounded grace"
+        );
+        assert_eq!(ctx.pending_relay_close_last_egress_progress_secs, Some(14));
+        assert_eq!(ctx.pending_relay_close_last_egress_queue_bytes, 300_000);
+
+        assert!(
+            should_keep_deferred_close_for_egress(&mut ctx, snapshot, cfg, 18),
+            "still above low but within refreshed grace should keep waiting"
+        );
+        assert!(
+            !should_keep_deferred_close_for_egress(&mut ctx, snapshot, cfg, 19),
+            "above low without progress must remain bounded"
+        );
+
+        snapshot.send_queue = 131_072;
+        assert!(
+            !should_keep_deferred_close_for_egress(&mut ctx, snapshot, cfg, 20),
+            "low watermark means queued egress drained enough to finish close"
+        );
     }
 
     // ---- 刀9 M3：握手并发化（epoch 防串话 / buffer 上限 / flush 保序 / 失败 rearm）----

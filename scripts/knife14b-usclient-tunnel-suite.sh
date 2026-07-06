@@ -1409,7 +1409,7 @@ run_lowrtt_probe() {
   append "### Probe $label Summary"
   if [[ -f "$probe_out" ]]; then
     append '```text'
-    grep -E 'Attribution Summary|iperf_sender_mbps|iperf_receiver_mbps|iperf_interval_profile:|throughput_shape:|tcp_pool:|local_write_pressure:|global_rx_pressure:|downlink_backpressure:|downlink_flush:|terminal_pending_reap:|pending_at_close:|egress_at_close:|relay_late_remote:|tun_drops:|runtime_tun_egress:|tun_egress_feedback:|tun_rx_drain:|quic:|attribution:|local 10[.]0[.]0[.]1|receiver$|sender$|error -|Connection reset|log not found|📊|🔬|TUIC datagram|UDP relay mode|tuic-tcp-pool-reconnect|tcp-(relay-live|relay-write-half-closed|relay-close|handle-close|local-write-pressure|global-rx-pressure|downlink-backpressure|downlink-flush|tun-rx-drain|tun-egress|loop-flush-tx|tun-flush-fail|send-slice-error)|exit=' "$probe_out" | tail -200 | tee -a "$REPORT" || true
+    grep -E 'Attribution Summary|iperf_sender_mbps|iperf_receiver_mbps|iperf_interval_profile:|throughput_shape:|tcp_pool:|local_write_pressure:|global_rx_pressure:|downlink_backpressure:|downlink_flush:|terminal_pending_reap:|pending_at_close:|egress_at_close:|relay_late_remote:|tun_drops:|runtime_tun_egress:|tun_egress_feedback:|tun_rx_drain:|quic:|attribution:|local 10[.]0[.]0[.]1|receiver$|sender$|error -|Connection reset|log not found|📊|🔬|TUIC datagram|UDP relay mode|tuic-tcp-pool-reconnect|tcp-(relay-live|relay-write-half-closed|relay-close|handle-close|deferred-close-egress|local-write-pressure|global-rx-pressure|downlink-backpressure|downlink-flush|tun-rx-drain|tun-egress|loop-flush-tx|tun-flush-fail|send-slice-error)|exit=' "$probe_out" | tail -200 | tee -a "$REPORT" || true
     append '```'
   else
     append "probe report missing: $probe_out"

@@ -1524,3 +1524,16 @@
   warning-clean. Remove unused wrappers or gate test-only helpers with
   `#[cfg(test)]` before running acceptance, so warning noise does not blur
   operational evidence.
+
+## 2026-07-06 - Repo-wide rustfmt check is not a Knife14 gate
+
+- Symptom: `cargo fmt --check` failed before the Knife14bv-b commit by printing
+  a repo-wide formatting diff across existing Rust files, including files
+  outside the close-egress lifecycle patch.
+- Cause: the repository has pre-existing global rustfmt drift; applying
+  `cargo fmt` would create a large unrelated formatting change and obscure the
+  small lifecycle patch.
+- Correct behavior: do not use repo-wide `cargo fmt --check` as a blocking
+  Knife14 gate until formatting is normalized in a dedicated task. For these
+  lifecycle patches, keep edits narrow and use `cargo test/build`,
+  script self-tests/syntax checks, and `git diff --check`.

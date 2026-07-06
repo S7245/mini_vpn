@@ -2486,3 +2486,26 @@ worth cleaning up separately.
 - Reusable rule: when close logs say `pending=0`, still classify smoltcp
   egress queue separately before claiming close/reap is clean. App pending and
   already-accepted-but-not-egressed bytes are different loss surfaces.
+
+## 2026-07-06 - Knife14bv defers close while smoltcp egress drains
+
+- Stage: Knife14bv-b bounded close-egress drain behavior after Knife14bv-a made
+  send-capable close pressure visible.
+- Outcome: core TCP lifecycle now treats a relay close with empty app pending
+  but high smoltcp `send_queue` as a deferred close candidate. Both
+  `uplink_channel_closed` and relay close events install `pending_relay_close`
+  instead of immediately rearming, and the dirty loop keeps the handle live
+  until the queue drops below the low watermark or the existing 5s grace
+  expires.
+- Guardrails: app-owned `downlink_pending` still uses its existing drain path;
+  remote payload acceptance was not loosened; dead-slot reap preserves the
+  deferred egress close only inside the bounded grace window. Script changes
+  only surface the new `tcp-deferred-close-egress` evidence in acceptance logs.
+- Verification passed: focused deferred-close egress tests, relay close epoch
+  and pending-drain tests, reap predicate tests, rearm cleanup test, full
+  `cargo test --lib`, release build, low-RTT and US-client suite self-tests,
+  shell syntax checks, and `git diff --check`.
+- Reusable rule: when `CloseWait can_send=true send_queue>=high pending=0`
+  appears at close, do not rearm the listener immediately. Give already
+  accepted downlink bytes a bounded local egress drain window, then let the
+  existing reap/rearm machinery close the slot if progress stops.
