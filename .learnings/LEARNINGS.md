@@ -2442,3 +2442,25 @@ worth cleaning up separately.
   declaring the downlink clean. Keep this separate from 1s sysfs TUN drop
   feedback so pre-drop gating and post-drop attribution do not erase each
   other.
+
+## 2026-07-06 - Knife14bu rejects a simple 25ms pressure hold as the throughput fix
+
+- Stage: Knife14bu scoped VPS acceptance for commit `fd3f2ed`.
+- Result doc:
+  `docs/tech/2026-07-06-knife14bu-durable-egress-pressure-results.md`
+- Bundle:
+  `/tmp/mini_vpn/knife14bu_durable_20260706/mvpn_knife14bu_durable_usclient_suite_20260706_190244.tar.gz`
+- Outcome: reverse-first P1 still failed at `17.3/15.3 Mbit/s`, worse than
+  Knife14bt's `18.4/17.4 Mbit/s`, while direct `.27 <-> .77` and
+  `.33 <-> .77` baselines stayed around `277-320 Mbit/s`.
+- Signals: `tun_tx_dropped_delta=0`, `terminal_pending_reap=0`,
+  `terminal_late_remote_payload=0`, `send_slice_zero=0`,
+  `send_slice_errors=0`, `tun_flush_failures=0`, and QUIC
+  loss/congestion/blocking all stayed zero. Backpressure churn increased to
+  `63/62`, `tun_flush_deferred=62`, and the data close line showed
+  `tcp_state=CloseWait`, `may_recv=false`, `send_queue=524288`, and no app
+  pending.
+- Reusable rule: do not lengthen the pressure hold as the next guess. The hold
+  removed the prior TUN drop signal without improving throughput, so the next
+  code slice must target close/receive-window/egress-drain accounting for a
+  send-capable `CloseWait` socket with queued downlink bytes.

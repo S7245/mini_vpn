@@ -1492,3 +1492,35 @@
   throughput fix without TUN/qdisc-capacity evidence. The next patch must make
   local egress pressure durable across poll/flush or explicitly tune high/low
   against measured TUN egress capacity.
+
+## 2026-07-06 - Knife14bu pressure hold failed VPS acceptance
+
+- Stage: Knife14bu durable egress pressure acceptance for commit `fd3f2ed`.
+- Failed bundle:
+  `/tmp/mini_vpn/knife14bu_durable_20260706/mvpn_knife14bu_durable_usclient_suite_20260706_190244.tar.gz`
+- Symptom: reverse-first P1 reached only `17.3/15.3 Mbit/s` with the same
+  low-average stop/go profile.
+- Important discriminator: the pressure hold eliminated TUN tx drops
+  (`tun_tx_dropped_delta=0`) and terminal late payload
+  (`terminal_late_remote_payload=0`), but throughput worsened, pause/resume
+  churn increased to `63/62`, and `tun_flush_deferred` rose to `62`.
+- Close-boundary signal: the data handle closed with `tcp_state=CloseWait`,
+  `may_recv=false`, `can_send=true`, `may_send=true`, `send_queue=524288`,
+  `pending=0`, and `terminal_pending_reap_bytes=0`.
+- Rejected next moves: do not keep extending the pressure hold, changing
+  scripts, tuning stale pool, iperf3, sing-box, TUN qlen, or QUIC from this
+  evidence.
+- Correct behavior: stop before the next behavior edit. First clean the release
+  warning, add raw/effective pressure and close-time egress observability, then
+  TDD a bounded close/egress-drain rule for send-capable `CloseWait` sockets.
+
+## 2026-07-06 - Release build warnings must be cleaned before VPS evidence
+
+- Symptom: the `.27` release build for Knife14bu succeeded but printed
+  `warning: method observe_pressure is never used`.
+- Cause: the compatibility wrapper is used only by tests after production code
+  moved to the timestamped `observe_pressure_at` path.
+- Correct behavior: future VPS-bound commits should leave release builds
+  warning-clean. Remove unused wrappers or gate test-only helpers with
+  `#[cfg(test)]` before running acceptance, so warning noise does not blur
+  operational evidence.
