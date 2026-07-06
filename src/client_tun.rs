@@ -84,9 +84,13 @@ const TUN_RX_PRESSURE_DRAIN_MAX_PACKETS: usize = 256;
 /// Knife14co: active reverse flows get a smaller event-driven ACK/window drain
 /// before the pressure edge so sender windows can progress without background polling.
 const TUN_RX_ACTIVE_FLOW_DRAIN_MAX_PACKETS: usize = 32;
+/// Knife14cp: keep a short timer-driven ACK/window drain window after downlink
+/// work, covering delayed ACKs that arrive after the immediate payload-triggered drain.
+const TUN_RX_ACTIVE_FLOW_TIMER_DRAIN_MS: u64 = 250;
 const TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_PRE: &str = "remote_payload_pre";
 const TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD: &str = "remote_payload";
 const TUN_RX_DRAIN_SOURCE_TIMER_PRESSURE: &str = "timer_pressure";
+const TUN_RX_DRAIN_SOURCE_TIMER_ACTIVE_FLOW: &str = "timer_active_flow";
 
 /// 刀13 ①：解析 `MINI_VPN_TRACE`（`1`/`true`，去空白、不区分大小写 → 开；其它/缺省 → 关）。
 /// 对齐 [`parse_profile_loop`] 惯用法；抽纯函数便于单测（`trace_enabled` 只是它 + `OnceLock` 包壳）。
@@ -2674,6 +2678,7 @@ struct TunRxDrainDiag {
     pre_payload_attempts: u64,
     remote_payload_attempts: u64,
     maintenance_attempts: u64,
+    timer_active_flow_attempts: u64,
     other_attempts: u64,
     packets: u64,
     tcp_packets: u64,
@@ -2696,6 +2701,10 @@ impl TunRxDrainDiag {
             }
             TUN_RX_DRAIN_SOURCE_TIMER_PRESSURE => {
                 self.maintenance_attempts = self.maintenance_attempts.saturating_add(1);
+            }
+            TUN_RX_DRAIN_SOURCE_TIMER_ACTIVE_FLOW => {
+                self.timer_active_flow_attempts =
+                    self.timer_active_flow_attempts.saturating_add(1);
             }
             _ => {
                 self.other_attempts = self.other_attempts.saturating_add(1);
@@ -2733,11 +2742,12 @@ impl TunRxDrainDiag {
 
 fn format_tun_rx_drain_diag(diag: &TunRxDrainDiag) -> String {
     format!(
-        "🔎 tcp-tun-rx-drain attempts={} pre_payload_attempts={} remote_payload_attempts={} maintenance_attempts={} other_attempts={} packets={} tcp={} dns={} udp={} budget_exhausted={} would_block={} errors={}",
+        "🔎 tcp-tun-rx-drain attempts={} pre_payload_attempts={} remote_payload_attempts={} maintenance_attempts={} timer_active_flow_attempts={} other_attempts={} packets={} tcp={} dns={} udp={} budget_exhausted={} would_block={} errors={}",
         diag.attempts,
         diag.pre_payload_attempts,
         diag.remote_payload_attempts,
         diag.maintenance_attempts,
+        diag.timer_active_flow_attempts,
         diag.other_attempts,
         diag.packets,
         diag.tcp_packets,
@@ -2836,6 +2846,22 @@ fn tun_rx_drain_budget_for_dirty_pressure(
         configured_budget
     } else {
         pressure_tun_rx_drain_budget(cfg, tun_mtu)
+    }
+}
+
+fn tun_rx_drain_budget_for_recent_active_flow(
+    has_recent_downlink_work: bool,
+    configured_budget: usize,
+    cfg: DownlinkBackpressureConfig,
+    tun_mtu: usize,
+) -> usize {
+    if !has_recent_downlink_work {
+        return 0;
+    }
+    if configured_budget > 0 {
+        configured_budget
+    } else {
+        active_flow_tun_rx_drain_budget(cfg, tun_mtu)
     }
 }
 
@@ -3563,6 +3589,7 @@ pub async fn run_event_loop<D, U, M>(
     let mut downlink_egress_pacer =
         DownlinkEgressPacer::new(runtime_config.downlink_egress_immediate_bytes);
     let mut downlink_egress_drop_debt = DownlinkEgressDropDebt::default();
+    let mut active_flow_tun_rx_drain_until: Option<std::time::Instant> = None;
     let mut tun_egress_drop_sampler = TunEgressDropSampler::new(device.interface_name());
     let mut tun_egress_feedback = TunEgressFeedbackState::default();
     let mut tun_rx_drain_diag = TunRxDrainDiag::default();
@@ -3739,6 +3766,14 @@ pub async fn run_event_loop<D, U, M>(
                             socket_ctxs.get(&handle),
                             accepted_bytes,
                         );
+                        if has_downlink_work {
+                            active_flow_tun_rx_drain_until = Some(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_millis(
+                                        TUN_RX_ACTIVE_FLOW_TIMER_DRAIN_MS,
+                                    ),
+                            );
+                        }
                         let tun_rx_budget = if has_downlink_work {
                             let send_queue_bytes = sockets.get::<TcpSocket>(handle).send_queue();
                             tun_rx_drain_budget_after_remote_payload(
@@ -3983,6 +4018,15 @@ pub async fn run_event_loop<D, U, M>(
                 }
                 metrics.leave_poll();
 
+                let timer_now = std::time::Instant::now();
+                let has_recent_active_flow = match active_flow_tun_rx_drain_until {
+                    Some(deadline) if timer_now <= deadline => true,
+                    Some(_) => {
+                        active_flow_tun_rx_drain_until = None;
+                        false
+                    }
+                    None => false,
+                };
                 let maintenance_tun_rx_budget = tun_rx_drain_budget_for_dirty_pressure(
                     !dirty.is_empty(),
                     downlink_pressure_stats(&dirty, &socket_ctxs, &sockets),
@@ -3990,7 +4034,23 @@ pub async fn run_event_loop<D, U, M>(
                     downlink_backpressure,
                     runtime_config.tun_mtu,
                 );
-                if maintenance_tun_rx_budget > 0 {
+                let (timer_tun_rx_budget, timer_tun_rx_source) = if maintenance_tun_rx_budget > 0 {
+                    (
+                        maintenance_tun_rx_budget,
+                        TUN_RX_DRAIN_SOURCE_TIMER_PRESSURE,
+                    )
+                } else {
+                    (
+                        tun_rx_drain_budget_for_recent_active_flow(
+                            has_recent_active_flow,
+                            tun_rx_drain_budget,
+                            downlink_backpressure,
+                            runtime_config.tun_mtu,
+                        ),
+                        TUN_RX_DRAIN_SOURCE_TIMER_ACTIVE_FLOW,
+                    )
+                };
+                if timer_tun_rx_budget > 0 {
                     drain_ready_tun_rx(
                         &mut device,
                         &mut assoc_table,
@@ -4012,8 +4072,8 @@ pub async fn run_event_loop<D, U, M>(
                         &mut tcp_loop_flush_tx_calls,
                         &mut tcp_loop_flush_tx_failures,
                         &mut tun_rx_drain_diag,
-                        maintenance_tun_rx_budget,
-                        TUN_RX_DRAIN_SOURCE_TIMER_PRESSURE,
+                        timer_tun_rx_budget,
+                        timer_tun_rx_source,
                     )
                     .await;
                 }
@@ -9076,6 +9136,7 @@ mod tests {
         diag.note_attempt(TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_PRE);
         diag.note_attempt(TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD);
         diag.note_attempt(TUN_RX_DRAIN_SOURCE_TIMER_PRESSURE);
+        diag.note_attempt(TUN_RX_DRAIN_SOURCE_TIMER_ACTIVE_FLOW);
         diag.note_attempt("other");
         diag.note_packet(TunRxPacketKind::Tcp);
         diag.note_packet(TunRxPacketKind::Dns);
@@ -9086,10 +9147,11 @@ mod tests {
 
         let line = format_tun_rx_drain_diag(&diag);
         assert!(line.contains("tcp-tun-rx-drain"));
-        assert!(line.contains("attempts=4"), "{line}");
+        assert!(line.contains("attempts=5"), "{line}");
         assert!(line.contains("pre_payload_attempts=1"), "{line}");
         assert!(line.contains("remote_payload_attempts=1"), "{line}");
         assert!(line.contains("maintenance_attempts=1"), "{line}");
+        assert!(line.contains("timer_active_flow_attempts=1"), "{line}");
         assert!(line.contains("other_attempts=1"), "{line}");
         assert!(line.contains("packets=3"), "{line}");
         assert!(line.contains("tcp=1"), "{line}");
@@ -9356,6 +9418,30 @@ mod tests {
             tun_rx_drain_budget_for_dirty_pressure(true, pending_with_flush_edge, 0, cfg, 1_200),
             1,
             "pending pressure plus flush-edge tx queue should maintain ACK drain"
+        );
+    }
+
+    #[test]
+    fn recent_active_timer_drain_budget_requires_recent_downlink_work() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+
+        assert_eq!(
+            tun_rx_drain_budget_for_recent_active_flow(false, 0, cfg, 1_200),
+            0,
+            "timer drain must stay off with no recent downlink work"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_recent_active_flow(true, 0, cfg, 1_200),
+            active_flow_tun_rx_drain_budget(cfg, 1_200),
+            "recent active downlink work should get the bounded active-flow budget"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_recent_active_flow(true, 9, cfg, 1_200),
+            9,
+            "explicit drain budget remains an operator override inside the recent-active window"
         );
     }
 
