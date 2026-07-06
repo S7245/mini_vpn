@@ -77,6 +77,9 @@ const TCP_REVERSE_WINDOW_DIAG_INTERVAL_SECS: u64 = 5;
 const DEFAULT_TUN_RX_DRAIN_BUDGET: usize = 0;
 /// Knife14bh：TUN RX drain 是诊断/公平性路径，允许 A/B 关闭或小幅放大，禁止无界热路径扫描。
 const MAX_TUN_RX_DRAIN_BUDGET: usize = 64;
+/// Knife14ci: keep default TUN RX drain off, but allow a small MTU-derived ACK
+/// drain budget when downlink egress reaches the existing credit edge.
+const TUN_RX_PRESSURE_DRAIN_MAX_PACKETS: usize = 32;
 
 /// 刀13 ①：解析 `MINI_VPN_TRACE`（`1`/`true`，去空白、不区分大小写 → 开；其它/缺省 → 关）。
 /// 对齐 [`parse_profile_loop`] 惯用法；抽纯函数便于单测（`trace_enabled` 只是它 + `OnceLock` 包壳）。
@@ -2710,6 +2713,36 @@ fn should_drain_tun_rx_after_remote_payload(ctx: Option<&SocketCtx>, accepted_by
     accepted_bytes > 0 || ctx.map(|c| !c.downlink_pending.is_empty()).unwrap_or(false)
 }
 
+fn pressure_tun_rx_drain_budget(cfg: DownlinkBackpressureConfig, tun_mtu: usize) -> usize {
+    let guard = tx_queue_credit_guard_bytes(cfg);
+    if guard == 0 {
+        return 0;
+    }
+    let packet_bytes = tun_mtu.max(1);
+    let packets = guard.saturating_add(packet_bytes.saturating_sub(1)) / packet_bytes;
+    packets.clamp(1, TUN_RX_PRESSURE_DRAIN_MAX_PACKETS)
+}
+
+fn tun_rx_drain_budget_after_remote_payload(
+    has_downlink_work: bool,
+    send_queue_bytes: usize,
+    configured_budget: usize,
+    cfg: DownlinkBackpressureConfig,
+    tun_mtu: usize,
+) -> usize {
+    if !has_downlink_work {
+        return 0;
+    }
+    if configured_budget > 0 {
+        return configured_budget;
+    }
+    if send_queue_bytes >= tx_queue_credit_spend_threshold(cfg) {
+        pressure_tun_rx_drain_budget(cfg, tun_mtu)
+    } else {
+        0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DownlinkEgressPacer {
     immediate_budget_bytes: usize,
@@ -3159,9 +3192,14 @@ pub async fn start_tun_proxy() {
         runtime_config.tcp_socket_buffers.rx_bytes,
         runtime_config.tcp_socket_buffers.tx_bytes
     );
+    let adaptive_tun_rx_pressure_budget = pressure_tun_rx_drain_budget(
+        runtime_config.downlink_backpressure,
+        runtime_config.tun_mtu,
+    );
     println!(
-        "🧺 TUN RX drain budget: {} packets/pass（默认关闭；MINI_VPN_TUN_RX_DRAIN_BUDGET>0 仅用于显式 A/B）",
-        runtime_config.tun_rx_drain_budget
+        "🧺 TUN RX drain budget: {} packets/pass（0=仅 pressure-adaptive；pressure-adaptive={} packets near tx_queue_credit_high；MINI_VPN_TUN_RX_DRAIN_BUDGET>0 显式覆盖）",
+        runtime_config.tun_rx_drain_budget,
+        adaptive_tun_rx_pressure_budget
     );
     println!(
         "🧪 bounded global_rx receive window: {}（MINI_VPN_BOUNDED_GLOBAL_RX_RECEIVE_WINDOW=1 仅用于 Knife14cg A/B）",
@@ -3530,10 +3568,23 @@ pub async fn run_event_loop<D, U, M>(
                         {
                             dirty.insert(handle);
                         }
-                        if should_drain_tun_rx_after_remote_payload(
+                        let has_downlink_work = should_drain_tun_rx_after_remote_payload(
                             socket_ctxs.get(&handle),
                             accepted_bytes,
-                        ) {
+                        );
+                        let tun_rx_budget = if has_downlink_work {
+                            let send_queue_bytes = sockets.get::<TcpSocket>(handle).send_queue();
+                            tun_rx_drain_budget_after_remote_payload(
+                                has_downlink_work,
+                                send_queue_bytes,
+                                tun_rx_drain_budget,
+                                downlink_backpressure,
+                                runtime_config.tun_mtu,
+                            )
+                        } else {
+                            0
+                        };
+                        if tun_rx_budget > 0 {
                             drain_ready_tun_rx(
                                 &mut device,
                                 &mut assoc_table,
@@ -3555,7 +3606,7 @@ pub async fn run_event_loop<D, U, M>(
                                 &mut tcp_loop_flush_tx_calls,
                                 &mut tcp_loop_flush_tx_failures,
                                 &mut tun_rx_drain_diag,
-                                tun_rx_drain_budget,
+                                tun_rx_budget,
                                 "remote_payload",
                             )
                             .await;
@@ -8749,6 +8800,102 @@ mod tests {
 
         ctx.downlink_pending.extend_from_slice(&[1, 2, 3]);
         assert!(should_drain_tun_rx_after_remote_payload(Some(&ctx), 0));
+    }
+
+    #[test]
+    fn tun_rx_drain_budget_keeps_explicit_override() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        assert_eq!(
+            tun_rx_drain_budget_after_remote_payload(false, 0, 7, cfg, 1200),
+            0,
+            "explicit budget should not drain when the payload has no local work"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_after_remote_payload(true, 0, 7, cfg, 1200),
+            7,
+            "explicit MINI_VPN_TUN_RX_DRAIN_BUDGET remains an override"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_after_remote_payload(
+                true,
+                tx_queue_credit_spend_threshold(cfg),
+                7,
+                cfg,
+                1200,
+            ),
+            7,
+            "explicit override should not be reshaped by adaptive pressure"
+        );
+    }
+
+    #[test]
+    fn tun_rx_drain_budget_stays_off_without_work_or_pressure() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let credit_edge = tx_queue_credit_spend_threshold(cfg);
+
+        assert_eq!(
+            tun_rx_drain_budget_after_remote_payload(false, credit_edge, 0, cfg, 1200),
+            0,
+            "pressure alone should not scan TUN RX without downlink work"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_after_remote_payload(
+                true,
+                credit_edge.saturating_sub(1),
+                0,
+                cfg,
+                1200,
+            ),
+            0,
+            "default budget should stay off below the credit edge"
+        );
+    }
+
+    #[test]
+    fn tun_rx_drain_budget_enables_adaptive_at_credit_edge() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        assert_eq!(tx_queue_credit_guard_bytes(cfg), 3);
+        assert_eq!(tx_queue_credit_spend_threshold(cfg), 157);
+
+        assert_eq!(
+            tun_rx_drain_budget_after_remote_payload(
+                true,
+                tx_queue_credit_spend_threshold(cfg),
+                0,
+                cfg,
+                1200,
+            ),
+            1,
+            "small guards should still get one pressure ACK drain packet"
+        );
+    }
+
+    #[test]
+    fn tun_rx_pressure_drain_budget_is_guard_mtu_derived_and_capped() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 512 * 1024,
+            low_bytes: 128 * 1024,
+        };
+        assert_eq!(tx_queue_credit_guard_bytes(cfg), 24 * 1024);
+        assert_eq!(
+            pressure_tun_rx_drain_budget(cfg, 1200),
+            21,
+            "default guard should be rounded up by TUN MTU"
+        );
+        assert_eq!(
+            pressure_tun_rx_drain_budget(cfg, 1),
+            TUN_RX_PRESSURE_DRAIN_MAX_PACKETS,
+            "adaptive pressure drain remains bounded even with tiny MTU input"
+        );
     }
 
     #[test]
