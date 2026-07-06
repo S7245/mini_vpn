@@ -1,5 +1,29 @@
 # Learnings
 
+## 2026-07-06 - Knife14cl removes hidden local-close rearm but exposes pressure debt recovery
+
+- Stage docs:
+  `docs/tech/2026-07-06-knife14cl-local-uplink-close-pending-deferral-spec.md`,
+  `docs/tech/2026-07-06-knife14cl-local-uplink-close-pending-deferral-plan.md`,
+  `docs/tech/2026-07-06-knife14cl-local-uplink-close-pending-deferral-results.md`
+- Code commit: `877c05a`.
+- Log bundle:
+  `/tmp/mini_vpn/knife14cl_local_close_pending_20260706_1852/mvpn_knife14cl_local_close_pending_usclient_suite_20260707_025232.tar.gz`
+- Outcome: local gates passed and reverse-first P1 improved to
+  `32.9/31.9 Mbit/s`, but still failed as `low_average local_pressure=1`.
+- What worked: `uplink_channel_closed` with pending downlink now defers close
+  explicitly (`tcp-deferred-close-pending ... pending=528364`) instead of
+  rearming. Parser close accounting reported `pending_at_close=0` and
+  `egress_at_close=0`.
+- What improved: the run left the former 10-20 Mbit/s band.
+- What did not work: pending remained dirty after deferral and TUN drop
+  feedback paused without recovery (`drop_delta_total=4334`,
+  `drop_credit_debt_paid_bytes=0`, `pressure_credit_debt_paid_bytes=0`,
+  `send_queue_max=892928`, `may_recv_false=8333`).
+- Reusable rule: after hidden close/rearm is removed, do not keep editing close
+  accounting. If useful pending is dirty and send-capable but drop/pressure
+  debt is never paid, the next repair belongs in pressure credit recovery.
+
 ## 2026-07-06 - Knife14ck closes the ACK-drain budget branch
 
 - Stage docs:

@@ -1,5 +1,34 @@
 # Errors
 
+## 2026-07-06 - Knife14cl VPS failed after local-close deferral exposed unpaid drop debt
+
+- Stage: Knife14cl local uplink close pending deferral VPS acceptance.
+- Failed bundle:
+  `/tmp/mini_vpn/knife14cl_local_close_pending_20260706_1852/mvpn_knife14cl_local_close_pending_usclient_suite_20260707_025232.tar.gz`
+- Symptom: reverse-first P1 improved to `32.9/31.9 Mbit/s` but remained
+  `low_average local_pressure=1`.
+- Important discriminator: the code change worked. The data flow produced
+  `tcp-deferred-close-pending ... direction=local_to_remote
+  reason=uplink_channel_closed pending=528364`, while parser close accounting
+  reported `pending_at_close=0` and `egress_at_close=0`.
+- Remaining local loss/backlog: TUN egress drops returned
+  (`tun_tx_dropped_delta=4604`, runtime `drop_delta_total=4334`), pending stayed
+  dirty at `528364`, and feedback paused without resume.
+- Debt dead-end: final downlink diagnostics had
+  `drop_credit_debt_bytes=167956 drop_credit_debt_paid_bytes=0` and
+  `pressure_credit_debt_bytes=28652 pressure_credit_debt_paid_bytes=0`, while
+  `send_queue_max=892928`, `may_recv_false=8333`, and
+  `headroom_limited=8444`.
+- Clean surfaces: no current `.33` `fail auth`, no QUIC loss/congestion/blocking
+  deltas, no send-slice zero/errors, no TUN flush failure, no terminal pending
+  reap, and no terminal late remote payload.
+- Rejected next moves: do not continue close-accounting edits, ACK drain budget
+  increases, stale pool work, sing-box auth/time/config work, iperf3 tuning,
+  receive-window expansion, or static threshold widening from this evidence.
+- Correct behavior: repair pressure debt recovery so observed local egress
+  drain can retire drop/pressure debt and release bounded flush credit for
+  dirty send-capable pending bytes.
+
 ## 2026-07-06 - Knife14ck VPS failed after ACK-sized drain reached would_block
 
 - Stage: Knife14ck ACK-sized pressure drain budget VPS acceptance.
