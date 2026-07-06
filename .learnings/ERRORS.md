@@ -1,5 +1,32 @@
 # Errors
 
+## 2026-07-06 - Knife14ck VPS failed after ACK-sized drain reached would_block
+
+- Stage: Knife14ck ACK-sized pressure drain budget VPS acceptance.
+- Failed bundle:
+  `/tmp/mini_vpn/knife14ck_ack_sized_drain_20260707_0240/mvpn_knife14ck_ack_sized_drain_usclient_suite_20260707_024026.tar.gz`
+- Symptom: reverse-first P1 reached only `16.5/15.7 Mbit/s`, with
+  `throughput_shape=low_average local_pressure=1`, despite healthy direct
+  `.27 -> .77`, `.27 <- .77`, `.33 -> .77`, and `.33 <- .77` baselines.
+- Important discriminator: ACK-sized pressure drain was no longer starved by
+  budget. The final summary showed `tun_rx_drain attempts=764`,
+  `budget_exhausted=1`, and `would_block=763`.
+- Remaining local loss/backlog: runtime TUN egress feedback saw
+  `drop_events=1 drop_delta_total=273`, and final close still had active
+  send-capable backlog with `pending=524906`, `send_queue=892928`,
+  `close_egress_drain_candidate=true`, `tcp_state=CloseWait`,
+  `can_send=true`, and `may_send=true`.
+- Clean surfaces: no QUIC loss/congestion/blocking deltas, no send-slice
+  zero/errors, no TUN flush failure, no terminal pending reap, no terminal late
+  remote payload, and no current `.33` `fail auth` evidence.
+- Rejected next moves: do not keep raising the TUN RX drain budget or tuning
+  static ACK-drain values. Do not redirect this result to iperf3, sing-box
+  config/time/auth, stale pool slots, QUIC congestion, or receive-window
+  expansion.
+- Correct behavior: inspect and repair dirty-relay egress retention and
+  close-drain lifecycle so active send-capable queued bytes keep receiving
+  bounded flush opportunities before close/reap.
+
 ## 2026-07-06 - Knife14ci VPS failed because ACK drain runs after the burst
 
 - Stage: Knife14ci adaptive TUN RX ACK drain VPS acceptance.

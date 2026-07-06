@@ -1,5 +1,30 @@
 # Learnings
 
+## 2026-07-06 - Knife14ck closes the ACK-drain budget branch
+
+- Stage docs:
+  `docs/tech/2026-07-06-knife14ck-ack-sized-pressure-drain-budget-spec.md`,
+  `docs/tech/2026-07-06-knife14ck-ack-sized-pressure-drain-budget-plan.md`,
+  `docs/tech/2026-07-06-knife14ck-ack-sized-pressure-drain-budget-results.md`
+- Code commit: `d69ee27`.
+- Log bundle:
+  `/tmp/mini_vpn/knife14ck_ack_sized_drain_20260707_0240/mvpn_knife14ck_ack_sized_drain_usclient_suite_20260707_024026.tar.gz`
+- Outcome: local gates passed and ACK-sized adaptive pressure drain behaved as
+  intended, but reverse-first P1 stayed low at `16.5/15.7 Mbit/s`.
+- What worked: the adaptive budget reached `would_block` instead of exhausting
+  every pass (`attempts=764`, `budget_exhausted=1`, `would_block=763`), and
+  the new source counters proved pre-payload, remote-payload, and maintenance
+  drain paths all ran.
+- What improved: runtime TUN egress drops fell from Knife14cj's thousands-level
+  drop feedback to one event with `drop_delta_total=273`.
+- What did not work: throughput stayed in the 10-20 Mbit/s band and the close
+  tail still had active send-capable backlog:
+  `close_pending_bytes=524906`, `close_egress_bytes=892928`,
+  `tcp_state=CloseWait`, `can_send=true`, `may_send=true`.
+- Reusable rule: once pressure TUN RX drain reaches `would_block`, do not keep
+  increasing the ACK budget. The next repair must focus on local egress
+  dirty-retention/flush cadence and active send-capable close drain.
+
 ## 2026-07-06 - Knife14ci proves ACK drain is real but post-payload is too late
 
 - Stage docs:
