@@ -2656,3 +2656,26 @@ worth cleaning up separately.
 - Reusable rule: after separating tx_queue-only remote-read backpressure from
   app pending, immediate flush cadence must use the same tx_queue-only hard cap
   or a second soft-high gate will continue producing burst/idle behavior.
+
+## 2026-07-06 - Knife14by reduces flush deferral but exposes TUN edge
+
+- Stage: Knife14by scoped VPS acceptance for commit `ee28d0f`.
+- Result doc:
+  `docs/tech/2026-07-06-knife14by-egress-flush-headroom-results.md`
+- Bundle:
+  `/tmp/mini_vpn/knife14by_flush_headroom_20260706/mvpn_knife14by_flush_headroom_usclient_suite_20260706_220250.tar.gz`
+- Outcome: reverse-first P1 improved only slightly from Knife14bx's
+  `27.4/26.4 Mbit/s` to `30.0/29.0 Mbit/s`, but stayed
+  `throughput_shape=low_average` with repeated zero-throughput intervals.
+- Positive signal: the intended metric moved strongly; `tun_flush_deferred`
+  dropped from `446` to `25`, while app-owned pending, send-slice errors,
+  TUN flush failures, QUIC loss/congestion/blocking, terminal pending reap,
+  and pending-at-close stayed clean.
+- New discriminator: opening no-pending immediate flush all the way to the
+  tx_queue hard cap reintroduced small TUN egress loss:
+  `tun_tx_dropped_delta=37`, with `max_tx_queue_bytes=975399` and
+  `tx_queue_pause_high=917504`.
+- Reusable rule: the old soft-high flush gate was real, but the hard-cap gate
+  is too permissive for default TUN/qdisc capacity. The next patch should find
+  a bounded middle or drop-aware egress-capacity guard, not return to scripts,
+  stale pool, iperf3, sing-box, QUIC, or close/reap tuning.

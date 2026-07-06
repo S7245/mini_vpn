@@ -1633,3 +1633,23 @@
   close/reap loss. Before the next behavior edit, propose a TDD patch that keeps
   app pending strict but aligns tx_queue-only egress flush deferral with the
   tx_queue hard cap.
+
+## 2026-07-06 - Hard-cap no-pending flush headroom is too permissive
+
+- Symptom: Knife14by reduced `tun_flush_deferred` from `446` to `25`, but
+  reverse-first P1 only improved to `30.0/29.0 Mbit/s` and still failed as
+  `throughput_shape=low_average`.
+- Evidence: direct `.27/.33/.77` baselines were healthy, `.33` current-window
+  TUIC auth was clean, QUIC loss/congestion/blocking deltas were zero, app
+  pending and pending-at-close were zero, and terminal pending reap stayed
+  zero. The new signal was `tun_tx_dropped_delta=37` while tx_queue pressure
+  reached `975399B` against `tx_queue_pause_high=917504B`.
+- Cause: aligning no-pending flush deferral with the tx_queue hard cap removed
+  one cadence bottleneck but allowed the local TUN/qdisc side to be pushed past
+  its clean capacity.
+- Correct behavior: do not simply widen immediate flush headroom again and do
+  not revert to external-service hypotheses. Before the next behavior edit,
+  propose a TDD patch that uses a middle or drop-aware no-pending flush guard:
+  above the old soft high, below the hard cap under saturation evidence, while
+  preserving strict app-pending semantics and the existing tx_queue read
+  headroom.
