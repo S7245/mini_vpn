@@ -1,5 +1,31 @@
 # Learnings
 
+## 2026-07-06 - Knife14bw narrows reverse failure to local tx-queue cadence
+
+- Code commit: `4a12b18`
+- Result doc:
+  `docs/tech/2026-07-06-knife14bw-stream-starvation-diagnostics-results.md`
+- Log bundle:
+  `/tmp/mini_vpn/knife14bw_starvation_diag_20260706/mvpn_knife14bw_starvation_diag_usclient_suite_20260706_212704.tar.gz`
+- Outcome: diagnostic-only VPS acceptance still failed the throughput target
+  (`19.8/18.9 Mbit/s`), but the result was no longer a complete no-data
+  window. The reverse flow showed burst/idle intervals and about `72.7MB`
+  delivered on the TUIC data stream.
+- Key signal: new `tcp_reverse_window` samples showed live local TCP accepted
+  reverse payloads with `send_capacity=1048576`, `pending=0`, `active=true`,
+  `can_send=true`, and `may_recv=true` until the close tail. At the same time
+  `downlink_backpressure` toggled `51/51` times on smoltcp tx-queue pressure
+  (`max_tx_queue_bytes=588901`) while app-owned pending stayed `0`.
+- Clean surfaces: current-window TUIC auth succeeded, direct `.27/.33 -> .77`
+  reverse baselines were healthy, QUIC loss/congestion/blocking deltas were
+  `0`, TUN drops were `0`, send-slice errors were `0`, and terminal pending
+  reap stayed `0`.
+- Reusable rule: if reverse throughput is low with non-tiny data-stream bytes,
+  full local send capacity, no app pending, and many tx-queue backpressure
+  pause/resume edges, stop pursuing TUIC stream starvation and close-drain
+  roots. The next behavior patch should smooth local tx-queue pressure cadence
+  while preserving bounded read-ahead.
+
 ## 2026-07-06 - Knife14bw adds reverse stream starvation diagnostics before behavior changes
 
 - Stage docs:

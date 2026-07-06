@@ -1,5 +1,27 @@
 # Errors
 
+## 2026-07-06 - Knife14bw VPS acceptance failed with tx-queue pressure oscillation
+
+- Stage: Knife14bw reverse starvation diagnostics acceptance for commit
+  `4a12b18`.
+- Failed bundle:
+  `/tmp/mini_vpn/knife14bw_starvation_diag_20260706/mvpn_knife14bw_starvation_diag_usclient_suite_20260706_212704.tar.gz`
+- Symptom: reverse-first P1 reached only `19.8/18.9 Mbit/s`, with burst/idle
+  intervals rather than stable high throughput.
+- Important discriminator: data stream delivery was not tiny
+  (`tuic_tcp_stream data_rx_bytes_max=72662685`), and live
+  `tcp_reverse_window` samples showed `send_capacity=1048576`, `pending=0`,
+  `active=true`, `can_send=true`, and mostly `may_recv=true`.
+- Active limiter: `downlink_backpressure` toggled `pause_edges=51` and
+  `resume_edges=51` on smoltcp tx-queue pressure
+  (`max_tx_queue_bytes=588901`) while app-owned pending stayed `0`.
+- Rejected next moves: do not treat this run as stale pool, iperf3, sing-box,
+  TUIC auth, TUN drop, QUIC congestion, terminal pending, or close-drain
+  evidence.
+- Correct behavior: before the next behavior patch, propose and confirm a
+  tx-queue pressure cadence change with focused TDD. The patch must reduce
+  pause/resume oscillation without allowing unbounded read-ahead.
+
 ## 2026-07-06 - Knife14bw clippy caught wide diagnostic formatter arguments
 
 - Stage: Knife14bw reverse-window diagnostic local gate.
