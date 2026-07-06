@@ -1785,3 +1785,32 @@
   semantic safeguard, but do not attribute TUIC VPS throughput changes to it.
   For current TUIC acceptance, use TCP pool isolation and stream metrics as the
   causal evidence.
+
+## 2026-07-06 - Default pool=2 can restore throughput while worsening TUN drops
+
+- Stage: Knife14cd default pool=2 VPS acceptance for commit `f219044`.
+- Bundle:
+  `/tmp/mini_vpn/knife14cd_default_pool2_20260707_0028/mvpn_knife14cd_default_pool2_usclient_suite_20260707_002800.tar.gz`
+- Symptom: reverse-first P1 reached `180/179 Mbit/s` and
+  `throughput_shape=stable_high`, but final egress was not clean:
+  `tun_tx_dropped_delta=6754`, `drop_events=8`, `max_delta=1723`,
+  `final_egress_at_close=892928`, and final send-capable pending `7680B`.
+- Important discriminator: data stream starvation was gone (`conns=0,1`,
+  `data_first_rx_max_ms=3`, `data_rx_bytes_max=674859752`), QUIC loss and
+  congestion were zero, and terminal pending reap stayed zero.
+- Cause: restoring data volume exposes the remaining local downlink egress
+  limiter. Drain credit and hard-edge guard still allow repeated pressure at
+  `892928B`, followed by TUN drop feedback.
+- Correct behavior: do not call Knife14 done from throughput alone, and do not
+  increase pool size. The next repair should add TDD for drop-aware credit debt
+  or credit freeze after TUN egress drops, preserving bounded pending and final
+  lifecycle visibility.
+
+## 2026-07-06 - .27 VPS image does not have ripgrep
+
+- Stage: Knife14cd `.27` preflight after deploying `f219044`.
+- Symptom: a remote preflight command failed with `bash: rg: command not found`
+  after the useful environment checks had already printed.
+- Correct behavior: on `.27`, use POSIX tools such as `grep`, `find`, and
+  `sed` for remote smoke/preflight checks unless `rg` is deliberately
+  installed. Keep using local `rg` on the Mac workspace.

@@ -2902,3 +2902,27 @@ worth cleaning up separately.
   iperf control/data streams on one TUIC connection, test pool isolation before
   editing local drain/close/egress code. Once pool=2 restores immediate data,
   stop increasing pool size and return to the newly visible local limiter.
+
+## 2026-07-06 - Knife14cd default pool=2 restores high throughput but not clean egress
+
+- Code commits: `3135d68` and `f219044`.
+- Result doc:
+  `docs/tech/2026-07-06-knife14cd-default-pool2-results.md`
+- Bundle:
+  `/tmp/mini_vpn/knife14cd_default_pool2_20260707_0028/mvpn_knife14cd_default_pool2_usclient_suite_20260707_002800.tar.gz`
+- Outcome: the default suite/product pool=2 run reached `180/179 Mbit/s` and
+  `throughput_shape=stable_high`, with `tcp_pool conns=0,1` and data stream
+  `first_rx_ms=3`. This closes the pool=1 no-data branch under default config.
+- Clean surfaces: direct `.27/.33 -> .77` baselines were healthy, current
+  sing-box evidence had TUIC inbound/direct outbound entries with no current
+  `fail auth`, QUIC loss/congestion/blocking deltas were zero, send-slice
+  errors were zero, TUN flush failures were zero, and terminal pending reap
+  stayed zero.
+- Remaining blocker: local egress/drop pressure was worse at restored
+  throughput (`tun_tx_dropped_delta=6754`, `drop_events=8`,
+  `max_delta=1723`, `downlink_backpressure pause/resume=317/317`,
+  `final_egress_at_close=892928`, and final send-capable pending `7680B`).
+- Reusable rule: high average throughput is not Knife14 acceptance if final
+  TUN drop and egress-at-close signals remain. After pool=2 default, the next
+  patch should make egress drain credit drop-aware instead of changing pool
+  size or static thresholds.
