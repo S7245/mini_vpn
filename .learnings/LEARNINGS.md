@@ -2700,3 +2700,28 @@ worth cleaning up separately.
 - Reusable rule: do not collapse all local egress thresholds into one number.
   App-pending safety, no-pending flush cadence, and remote-read pause capacity
   are separate controls and need separate diagnostics.
+
+## 2026-07-06 - Knife14bz rejects static midpoint egress threshold
+
+- Stage: Knife14bz scoped VPS acceptance for commit `3d88212`.
+- Result doc:
+  `docs/tech/2026-07-06-knife14bz-bounded-egress-flush-results.md`
+- Bundle:
+  `/tmp/mini_vpn/knife14bz_bounded_flush_20260706/mvpn_knife14bz_bounded_flush_usclient_suite_20260706_221933.tar.gz`
+- Outcome: reverse-first P1 regressed to `20.7/19.5 Mbit/s` and stayed
+  `throughput_shape=low_average`.
+- Positive signal: startup confirmed the new split thresholds were active:
+  app pending high `524288B`, no-pending flush high `720896B`, and tx_queue
+  read pause high `917504B`.
+- Rejecting signal: even with the bounded flush threshold, tx_queue pressure
+  still reached `983022B`, `tun_flush_deferred` rose to `162`, and
+  `tun_tx_dropped_delta` rose to `340`.
+- Clean exclusions: direct `.27/.33/.77` baselines stayed healthy, `.33` had
+  current-window TUIC inbound/direct outbound evidence and no TUIC `fail auth`,
+  QUIC loss/congestion/blocking deltas stayed zero, app pending stayed zero,
+  send-slice errors stayed zero, and pending/close/reap accounting did not hide
+  a pending buffer.
+- Reusable rule: after a static midpoint threshold is disproved, stop tuning
+  soft/mid/hard numbers. The next core fix should bound remote payload
+  acceptance by remaining egress headroom before `send_slice` can push the
+  local TUN/qdisc path past clean capacity.

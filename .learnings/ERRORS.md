@@ -1653,3 +1653,30 @@
   above the old soft high, below the hard cap under saturation evidence, while
   preserving strict app-pending semantics and the existing tx_queue read
   headroom.
+
+## 2026-07-06 - Static midpoint no-pending flush threshold was not enough
+
+- Symptom: Knife14bz bounded no-pending flush at `tx_queue_flush_high=720896B`,
+  but reverse-first P1 regressed to `20.7/19.5 Mbit/s`.
+- Evidence: `tun_flush_deferred=162`, `tun_tx_dropped_delta=340`,
+  `max_tx_queue_bytes=983022`, `send_queue_max=917489`, and
+  `throughput_shape=low_average`. App pending stayed `0`, pending-at-close and
+  terminal pending reap stayed `0`, QUIC loss/congestion/blocking stayed `0`,
+  and `.33` current-window TUIC auth was clean.
+- Cause: the threshold took effect, but the system can still accept enough
+  remote payload in bursts to overshoot the clean local TUN egress capacity
+  before the remote-read pause/flush cadence catches up.
+- Correct behavior: stop threshold-only tuning. The next behavior patch should
+  add TDD for bounded remote payload acceptance by remaining egress headroom,
+  with explicit counters for headroom-limited accepts, before another VPS run.
+
+## 2026-07-06 - .27 cannot rely on one-shot SSH git pull
+
+- Symptom: syncing `.27` with `git pull git@github.com:S7245/mini_vpn.git`
+  failed with `Permission denied (publickey)` while the local Mac one-shot SSH
+  push path worked.
+- Cause: `.27` did not have GitHub SSH authentication for that pull path.
+- Correct behavior: on `.27`, use its existing HTTPS fetch/tracking state and
+  fast-forward from `origin/codex/knife14d-downlink-reap-open`, or configure
+  deploy-key access deliberately outside the test path. Do not change the repo
+  origin or retry interactive HTTPS pushes during Knife14 acceptance.
