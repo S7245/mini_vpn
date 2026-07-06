@@ -2109,3 +2109,36 @@
 - Correct behavior: the next repair should make active drop/pressure debt part
   of receive gating. Do not keep moving thresholds or only changing debt
   sizing without proving receive pause/resume and debt repayment.
+
+## 2026-07-06 - .27 VPS suite must source repo .env explicitly
+
+- Stage: Knife14cn first VPS launch.
+- Failed bundle:
+  `/tmp/mini_vpn/knife14cn_debt_receive_gate_20260706_1927/mvpn_knife14c_usclient_suite_20260707_032726.tar.gz`
+- Symptom: the suite exited before tunnel startup with missing TUIC variables:
+  `MINI_VPN_TUIC_SERVER`, `MINI_VPN_TUIC_UUID`,
+  `MINI_VPN_TUIC_PASSWORD`, `MINI_VPN_TUIC_SNI`,
+  `MINI_VPN_TUIC_CA_PATH`, and `MINI_VPN_TUIC_ALPN`.
+- Cause: the SSH command launched the suite without loading
+  `/home/ubuntu/mini_vpn/.env`; the file exists and uses `export KEY=...`
+  lines.
+- Correct behavior: run `.27` acceptance commands from the repo root with
+  `. ./.env` before invoking the suite. Continue redacting values; only inspect
+  key names or lengths when diagnosing env loading.
+
+## 2026-07-06 - Debt-coupled receive gate does not restore throughput by itself
+
+- Stage: Knife14cn valid VPS acceptance.
+- Bundle:
+  `/tmp/mini_vpn/knife14cn_debt_receive_gate_env_20260706_1930/mvpn_knife14c_usclient_suite_20260707_032833.tar.gz`
+- Symptom: active debt paused receive at `pending=2035`, but reverse-first P1
+  still stayed low at `20.5/19.2 Mbit/s` and TUN egress still dropped at the
+  end.
+- Cause: the previous pending-growth failure is repaired, but most of the
+  30-second window still has long remote-read gaps with pending near zero and
+  little TUN RX drain before pressure. The remaining bottleneck is likely
+  progress cadence/ACK-window feedback before the credit edge, not more debt
+  accounting.
+- Correct behavior: the next repair should add a bounded, observable
+  active-flow ACK/window drain path before pressure. Do not lower static
+  thresholds or keep installing more debt without proving sender progress.

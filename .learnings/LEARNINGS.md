@@ -3156,3 +3156,25 @@ worth cleaning up separately.
   receive-window decision. The next patch should make active drop/pressure
   debt pause or gate remote receive until observed local egress progress pays
   the debt or pressure recovers.
+
+## 2026-07-06 - Knife14cn bounds pending but exposes pre-pressure progress gaps
+
+- Code commit: `b6981ad`.
+- Result doc:
+  `docs/tech/2026-07-06-knife14cn-debt-coupled-receive-gate-results.md`
+- Valid VPS bundle:
+  `/tmp/mini_vpn/knife14cn_debt_receive_gate_env_20260706_1930/mvpn_knife14c_usclient_suite_20260707_032833.tar.gz`
+- Outcome: local gates passed and VPS proved the active debt receive gate:
+  `tcp-egress-credit-debt reason=pressure_credit_edge installed_bytes=24576`
+  was followed by `tcp-downlink-backpressure paused=true` at
+  `max_pending=2035 max_tx_queue=892928`.
+- Improvement: final useful pending dropped from Knife14cm's `541802B` to
+  `2035B`, and close/reap accounting stayed clean (`pending_at_close=0`,
+  `egress_at_close=0`, `terminal_pending_reap=0`).
+- Remaining failure: reverse-first P1 stayed low at `20.5/19.2 Mbit/s`; TUN
+  egress still dropped (`tun_tx_dropped_delta=3524` parser,
+  `drop_delta_total=2714` runtime), and `pressure_credit_debt_paid_bytes=0`.
+- Reusable rule: debt-coupled receive gating fixes pending growth, but
+  throughput now needs a pre-pressure progress-cadence repair. Do not keep
+  adding debt or moving thresholds; test bounded TUN RX ACK/window drain while
+  reverse data is active before local egress reaches the credit edge.
