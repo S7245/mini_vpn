@@ -2079,3 +2079,33 @@
 - Correct behavior: derive pressure-drain packet budget from ACK-sized packets
   with a hard cap, and prove it can reach `would_block` under pressure without
   becoming unconditional TUN RX polling.
+
+## 2026-07-06 - rsync mtime preservation can leave stale cargo artifacts on .27
+
+- Stage: Knife14cm A/B and restore on `.27`.
+- Symptom: after restoring the current `src/client_tun.rs`, the remote file
+  hash and source content were correct, but `cargo test pressure_credit --lib`
+  initially ran the old focused test set because cargo reused prior build
+  artifacts.
+- Cause: the deployment copy preserved mtimes, so cargo did not see the source
+  file as newer than the artifact.
+- Correct behavior: when swapping Rust source files on `.27` for A/B or VPS
+  validation, force rebuild freshness with `touch src/client_tun.rs`, avoid
+  mtime-preserving sync for edited core files, or clean the affected target
+  artifact before trusting test counts or release binaries.
+
+## 2026-07-06 - Pressure debt without receive gating is too late to recover
+
+- Stage: Knife14cm valid VPS acceptance.
+- Bundle:
+  `/tmp/mini_vpn/knife14cm_pressure_credit_edge_valid_20260706_1916/mvpn_knife14cm_pressure_credit_edge_valid_usclient_suite_20260707_031619.tar.gz`
+- Symptom: `pressure_credit_edge` debt installed at `pending=9074`, but remote
+  payload continued after debt was active, `accepted_bytes=0` accumulated,
+  pending grew to `541802`, TUN drops reached `4056`, and
+  `pressure_credit_debt_paid_bytes=0`.
+- Cause: credit debt limited future extra write credit, but it did not feed
+  the downlink receive-window/backpressure decision. The remote reader could
+  continue adding useful bytes while local egress was already pinned.
+- Correct behavior: the next repair should make active drop/pressure debt part
+  of receive gating. Do not keep moving thresholds or only changing debt
+  sizing without proving receive pause/resume and debt repayment.

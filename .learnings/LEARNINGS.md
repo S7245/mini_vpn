@@ -3135,3 +3135,24 @@ worth cleaning up separately.
 - Reusable rule: pressure-gated TUN RX drain is the right timing, but deriving
   packet budget from `guard_bytes / MTU` underestimates ACK/window traffic. The
   next budget should be ACK-sized and bounded, not a static env override.
+
+## 2026-07-06 - Knife14cm installs pressure debt early but does not couple receive
+
+- Code commit: `e8f0a50`.
+- Result doc:
+  `docs/tech/2026-07-06-knife14cm-proactive-pressure-credit-edge-results.md`
+- Valid VPS bundle:
+  `/tmp/mini_vpn/knife14cm_pressure_credit_edge_valid_20260706_1916/mvpn_knife14cm_pressure_credit_edge_valid_usclient_suite_20260707_031619.tar.gz`
+- Outcome: local gates passed, and the valid `.27` run exercised the intended
+  path, but reverse-first P1 still failed at `20.4/19.1 Mbit/s`.
+- Positive signal: pressure debt now appears before the pause edge:
+  `tcp-egress-credit-debt reason=pressure_credit_edge installed_bytes=24576`.
+- Failure signal: after that debt, remote payload was still accepted while the
+  local send queue stayed pinned at `892928B`; pending grew to `541802B`, TUN
+  drops reached `4056`, and `pressure_credit_debt_paid_bytes=0`.
+- Discriminator: `.33` remained healthy with no current TUIC `fail auth`;
+  direct baselines were healthy and QUIC loss/congestion/blocking stayed zero.
+- Reusable rule: debt installation is only accounting unless it feeds the
+  receive-window decision. The next patch should make active drop/pressure
+  debt pause or gate remote receive until observed local egress progress pays
+  the debt or pressure recovers.
