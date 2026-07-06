@@ -1616,3 +1616,20 @@
   drop attribution whenever raw pressure reaches the conservative soft high,
   but install the 25ms egress hold only when app pending reaches high or
   tx_queue-only pressure reaches its derived hard cap.
+
+## 2026-07-06 - Knife14bx tx_queue headroom still left flush deferral at soft high
+
+- Symptom: Knife14bx VPS acceptance improved reverse-first P1 to
+  `27.4/26.4 Mbit/s`, but it still failed with `throughput_shape=low_average`.
+- Evidence: app pending stayed `0`, TUN drops stayed `0`, QUIC
+  loss/congestion/blocking deltas stayed `0`, send-slice zero/errors stayed
+  `0`, and terminal pending reap stayed `0`. The new tx_queue hard cap was
+  active (`tx_queue_pause_high=917504`, `max_tx_queue_bytes=980698`), but
+  `tun_flush_deferred` reached `446` while `send_queue_max=917482`.
+- Cause: the remote-read backpressure threshold moved to the tx_queue hard cap,
+  but immediate downlink flush deferral still used the soft high watermark.
+  This left a second local cadence gate at the old `524288` threshold.
+- Correct behavior: do not treat this as sing-box, iperf3, stale pool, QUIC, or
+  close/reap loss. Before the next behavior edit, propose a TDD patch that keeps
+  app pending strict but aligns tx_queue-only egress flush deferral with the
+  tx_queue hard cap.

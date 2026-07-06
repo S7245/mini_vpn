@@ -2615,3 +2615,26 @@ worth cleaning up separately.
 - Reusable rule: when app pending is empty and only smoltcp `send_queue`
   touches soft high, do not collapse it into the same hard stop as app-owned
   pending bytes. Preserve drop attribution separately from read-pause cadence.
+
+## 2026-07-06 - Knife14bx partially improves but does not pass VPS
+
+- Stage: Knife14bx scoped VPS acceptance for commit `b4fc5b4`.
+- Result doc:
+  `docs/tech/2026-07-06-knife14bx-tx-queue-cadence-results.md`
+- Bundle:
+  `/tmp/mini_vpn/knife14bx_tx_queue_20260706/mvpn_knife14bx_tx_queue_usclient_suite_20260706_214754.tar.gz`
+- Outcome: reverse-first P1 improved from Knife14bw's `19.8/18.9 Mbit/s` to
+  `27.4/26.4 Mbit/s`, and backpressure churn dropped from `51/51` to `28/28`,
+  but the run remained `throughput_shape=low_average` with burst/idle seconds.
+- Healthy exclusions: `.27 -> .77` and `.33 -> .77` direct baselines were
+  around `253-319 Mbit/s`, `.33` had current-window TUIC inbound/direct
+  outbound lines and no `fail auth`, QUIC loss/congestion/blocking stayed zero,
+  TUN drops stayed zero, send-slice zero/errors stayed zero, and terminal
+  pending reap stayed zero.
+- New discriminator: `tun_flush_deferred` rose to `446` while app pending stayed
+  `0`. The remote-read hard cap was `917504`, but the egress pacer still
+  deferred immediate flushes at the soft high `524288`.
+- Reusable rule: after adding tx_queue read headroom, align any tx_queue-only
+  flush deferral with the same hard cap before adding broader architecture or
+  service changes. Keep app pending and real TUN-drop feedback on their stricter
+  paths.
