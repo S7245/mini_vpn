@@ -2750,3 +2750,30 @@ worth cleaning up separately.
 - Reusable rule: when post-send egress pacing is too late, move the guard to
   the pre-`send_slice` accept boundary and keep overflow as pending data. This
   is an algorithmic capacity-match change, not another threshold-only tweak.
+
+## 2026-07-06 - Knife14ca rejects fixed pre-send headroom caps
+
+- Stage: Knife14ca scoped VPS acceptance for commit `82003b8`.
+- Result doc:
+  `docs/tech/2026-07-06-knife14ca-headroom-bounded-accept-results.md`
+- Bundle:
+  `/tmp/mini_vpn/knife14ca_headroom_accept_20260706/mvpn_knife14ca_headroom_accept_usclient_suite_20260706_224238.tar.gz`
+- Outcome: reverse-first P1 regressed to `16.1/14.8 Mbit/s`, with burst/idle
+  throughput and `throughput_shape=low_average`.
+- Positive signal: the new cap worked mechanically. `send_queue_max` stayed at
+  `720896B` instead of overshooting toward the hard-pause region, and clean
+  P1 summary still had no QUIC loss/congestion/blocking, no send-slice errors,
+  and no TUN flush failures.
+- Rejecting signal: the cap created a receive-window stall. The final close
+  line showed `pending=566509`, `may_recv_false=11897`,
+  `headroom_limited_calls=12973`, and
+  `headroom_deferred_bytes=3317103134` while the socket remained
+  `CloseWait` and send-capable.
+- Additional discriminator: final suite logs showed TUN egress feedback
+  `drop_delta_total=2691` despite `send_queue_max=720896`, so a static
+  occupancy cap neither preserved throughput nor fully prevented late local
+  egress loss.
+- Reusable rule: do not continue soft/mid/hard threshold tuning. The next
+  design must clock downlink acceptance from actual local egress progress and
+  must parse final lifecycle/drop snapshots before declaring pending/close/reap
+  accounting clean.

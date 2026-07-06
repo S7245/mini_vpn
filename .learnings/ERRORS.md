@@ -1691,3 +1691,33 @@
 - Correct behavior: run exact test filters in separate commands, or use one
   broader substring filter that matches the desired group. Do not combine
   multiple exact test names in one `cargo test` invocation.
+
+## 2026-07-06 - Fixed pre-send headroom caps can starve receive progress
+
+- Symptom: Knife14ca commit `82003b8` capped `send_queue_max` at `720896B`,
+  but VPS reverse-first P1 regressed to `16.1/14.8 Mbit/s`.
+- Evidence: final close showed `pending=566509`, `may_recv_false=11897`,
+  `headroom_limited_calls=12973`, and
+  `headroom_deferred_bytes=3317103134` with `tcp_state=CloseWait`,
+  `can_send=true`, and `send_queue=720896`.
+- Cause: a fixed queue-occupancy cap can become sticky under saturation. It
+  prevents overshoot above the cap, but it does not prove the local TUN path is
+  actually draining; remote accept becomes threshold-clocked rather than
+  egress-progress-clocked.
+- Correct behavior: do not repair this by only moving cap values. Before the
+  next behavior patch, propose and test an algorithm that resumes remote
+  acceptance based on observed local egress progress plus a bounded per-loop
+  quantum.
+
+## 2026-07-06 - Low-RTT summary can miss final lifecycle/drop lines
+
+- Symptom: the Knife14ca low-RTT attribution summary reported
+  `pending_at_close=0` and `tun_drops=0`, but suite-level lines after that
+  summary showed `pending=566509` and TUN egress feedback
+  `drop_delta_total=2691`.
+- Cause: the parser summary was generated before the final post-P1
+  close/drop snapshots were emitted.
+- Correct behavior: parse the whole returned bundle, not just the low-RTT
+  attribution block, before declaring pending, close, reap, or TUN-drop
+  accounting clean. Add parser/self-test coverage for final post-summary
+  lifecycle and egress feedback lines before the next expensive VPS run.
