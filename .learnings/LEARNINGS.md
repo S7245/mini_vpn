@@ -2589,3 +2589,29 @@ worth cleaning up separately.
   drops, no QUIC client loss, and no deferred-close-egress candidate, do not
   keep tuning close/reap. Add diagnostics that separate TUIC server-to-client
   starvation from mini_vpn local TCP ACK/receive-window behavior.
+
+## 2026-07-06 - Knife14bx splits tx_queue-only backpressure cadence
+
+- Stage: Knife14bx core behavior patch after Knife14bw showed useful TUIC
+  stream bytes, app pending `0`, clean QUIC/TUN/error signals, but low-average
+  reverse throughput with downlink pause/resume churn around smoltcp
+  `send_queue` pressure.
+- Outcome: app-owned pending still uses the conservative high/low guard, while
+  tx_queue-only pressure now gets bounded headroom before `global_rx` pauses.
+  With the default `524288/131072` config, app pending pauses at `512 KiB`,
+  tx_queue-only pauses at `896 KiB`, and tx_queue-only resumes at the soft
+  `512 KiB` high watermark.
+- TDD: the new tx_queue headroom test first failed because the old logic
+  paused immediately at soft high. The implementation then added derived
+  tx_queue pause/resume thresholds and a regression test proving soft
+  tx_queue-only pressure no longer installs the 25ms egress hold.
+- Guardrail: TUN drop feedback still records recent soft-high pressure for
+  post-sample drop attribution, but remote-read pressure hold only engages for
+  app pending high or tx_queue hard cap.
+- Local gates passed: focused backpressure tests, focused TUN feedback tests,
+  full `cargo test --lib`, harness test target, low-RTT and US-client suite
+  self-tests, shell syntax checks, release build, clippy with harness, and
+  `git diff --check`.
+- Reusable rule: when app pending is empty and only smoltcp `send_queue`
+  touches soft high, do not collapse it into the same hard stop as app-owned
+  pending bytes. Preserve drop attribution separately from read-pause cadence.

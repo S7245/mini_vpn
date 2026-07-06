@@ -1467,6 +1467,22 @@ impl DownlinkPressureStats {
     }
 }
 
+fn tx_queue_pause_threshold(cfg: DownlinkBackpressureConfig) -> usize {
+    let headroom = cfg.high_bytes.saturating_sub(cfg.low_bytes);
+    cfg.high_bytes.saturating_add(headroom)
+}
+
+fn tx_queue_resume_threshold(cfg: DownlinkBackpressureConfig) -> usize {
+    cfg.high_bytes
+}
+
+fn reaches_downlink_pressure_hold_threshold(
+    stats: DownlinkPressureStats,
+    cfg: DownlinkBackpressureConfig,
+) -> bool {
+    stats.max_pending >= cfg.high_bytes || stats.max_tx_queue >= tx_queue_pause_threshold(cfg)
+}
+
 #[cfg(test)]
 fn downlink_pending_stats<'a>(
     ctxs: impl IntoIterator<Item = &'a SocketCtx>,
@@ -1794,6 +1810,9 @@ impl TunEgressFeedbackState {
         }
         self.recent_max_pressure = self.recent_max_pressure.max(stats.max_pressure());
         self.recent_total_pressure = self.recent_total_pressure.max(stats.total_pressure());
+        if !reaches_downlink_pressure_hold_threshold(stats, cfg) {
+            return;
+        }
         self.egress_hold_max_pressure =
             self.egress_hold_max_pressure.max(stats.max_pressure());
         self.egress_hold_total_pressure =
@@ -2089,10 +2108,17 @@ fn next_downlink_backpressure(
     stats: DownlinkPressureStats,
     cfg: DownlinkBackpressureConfig,
 ) -> bool {
+    if was_paused && stats.max_pending > cfg.low_bytes {
+        return true;
+    }
+    if !was_paused && stats.max_pending >= cfg.high_bytes {
+        return true;
+    }
+
     if was_paused {
-        stats.max_pressure() > cfg.low_bytes
+        stats.max_tx_queue > tx_queue_resume_threshold(cfg)
     } else {
-        stats.max_pressure() >= cfg.high_bytes
+        stats.max_tx_queue >= tx_queue_pause_threshold(cfg)
     }
 }
 
@@ -2103,7 +2129,7 @@ fn format_tcp_downlink_backpressure_diag(
     cfg: DownlinkBackpressureConfig,
 ) -> String {
     format!(
-        "🔎 tcp-downlink-backpressure paused={} max_pending={} total_pending={} max_tx_queue={} total_tx_queue={} max_pressure={} total_pressure={} high={} low={} raw_max_pending={} raw_total_pending={} raw_max_tx_queue={} raw_total_tx_queue={} raw_max_pressure={} raw_total_pressure={} effective_max_pending={} effective_total_pending={} effective_max_tx_queue={} effective_total_tx_queue={} effective_max_pressure={} effective_total_pressure={} held_pressure={}",
+        "🔎 tcp-downlink-backpressure paused={} max_pending={} total_pending={} max_tx_queue={} total_tx_queue={} max_pressure={} total_pressure={} high={} low={} tx_queue_pause_high={} tx_queue_resume_high={} raw_max_pending={} raw_total_pending={} raw_max_tx_queue={} raw_total_tx_queue={} raw_max_pressure={} raw_total_pressure={} effective_max_pending={} effective_total_pending={} effective_max_tx_queue={} effective_total_tx_queue={} effective_max_pressure={} effective_total_pressure={} held_pressure={}",
         paused,
         effective.max_pending,
         effective.total_pending,
@@ -2113,6 +2139,8 @@ fn format_tcp_downlink_backpressure_diag(
         effective.total_pressure(),
         cfg.high_bytes,
         cfg.low_bytes,
+        tx_queue_pause_threshold(cfg),
+        tx_queue_resume_threshold(cfg),
         raw.max_pending,
         raw.total_pending,
         raw.max_tx_queue,
@@ -7131,20 +7159,49 @@ mod tests {
         };
 
         assert!(
-            !next_downlink_backpressure(false, DownlinkPressureStats::new(0, 0, 99, 99), cfg),
-            "below high watermark keeps global_rx enabled even with tx queue pressure"
+            !next_downlink_backpressure(false, DownlinkPressureStats::new(0, 0, 159, 159), cfg),
+            "below the tx-queue-only hard cap keeps global_rx enabled when app pending is empty"
         );
         assert!(
-            next_downlink_backpressure(false, DownlinkPressureStats::new(0, 0, 100, 100), cfg),
-            "hitting high watermark via smoltcp tx queue pauses global_rx"
+            next_downlink_backpressure(false, DownlinkPressureStats::new(0, 0, 160, 160), cfg),
+            "hitting the tx-queue-only hard cap pauses global_rx"
         );
         assert!(
-            next_downlink_backpressure(true, DownlinkPressureStats::new(0, 0, 41, 41), cfg),
-            "while paused, tx queue pressure keeps global_rx paused until low watermark"
+            next_downlink_backpressure(true, DownlinkPressureStats::new(0, 0, 101, 101), cfg),
+            "while paused, tx queue pressure stays paused above the soft high watermark"
         );
         assert!(
-            !next_downlink_backpressure(true, DownlinkPressureStats::new(0, 0, 40, 40), cfg),
-            "low tx queue watermark resumes global_rx when app pending is empty"
+            !next_downlink_backpressure(true, DownlinkPressureStats::new(0, 0, 100, 100), cfg),
+            "soft high watermark resumes global_rx when app pending is empty"
+        );
+    }
+
+    #[test]
+    fn downlink_backpressure_uses_tx_queue_headroom_before_pausing() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+
+        assert!(
+            !next_downlink_backpressure(false, DownlinkPressureStats::new(0, 0, 100, 100), cfg),
+            "tx-queue-only pressure at the soft high watermark should not pause immediately"
+        );
+        assert!(
+            !next_downlink_backpressure(false, DownlinkPressureStats::new(0, 0, 159, 159), cfg),
+            "bounded tx-queue-only headroom should keep global_rx enabled"
+        );
+        assert!(
+            next_downlink_backpressure(false, DownlinkPressureStats::new(0, 0, 160, 160), cfg),
+            "tx-queue-only pressure still pauses at the derived hard cap"
+        );
+        assert!(
+            next_downlink_backpressure(true, DownlinkPressureStats::new(0, 0, 101, 101), cfg),
+            "while paused by tx queue pressure, stay paused above the soft high watermark"
+        );
+        assert!(
+            !next_downlink_backpressure(true, DownlinkPressureStats::new(0, 0, 100, 100), cfg),
+            "tx-queue-only pressure resumes once it drains to the soft high watermark"
         );
     }
 
@@ -7157,16 +7214,16 @@ mod tests {
         let mut feedback = TunEgressFeedbackState::default();
         let now = std::time::Instant::now();
 
-        feedback.observe_pressure_at(DownlinkPressureStats::new(0, 0, 100, 100), cfg, now);
+        feedback.observe_pressure_at(DownlinkPressureStats::new(0, 0, 160, 160), cfg, now);
 
         let held = feedback.effective_downlink_pressure_at(
             DownlinkPressureStats::default(),
             now + std::time::Duration::from_millis(TUN_EGRESS_PRESSURE_HOLD_MS - 1),
         );
-        assert_eq!(held.max_pressure(), 100);
+        assert_eq!(held.max_pressure(), 160);
         assert!(
             next_downlink_backpressure(true, held, cfg),
-            "recent high egress pressure keeps global_rx paused briefly after raw pressure drains"
+            "recent hard egress pressure keeps global_rx paused briefly after raw pressure drains"
         );
 
         let expired = feedback.effective_downlink_pressure_at(
@@ -7177,6 +7234,28 @@ mod tests {
         assert!(
             !next_downlink_backpressure(true, expired, cfg),
             "after the bounded hold expires, ordinary low watermark resume applies"
+        );
+    }
+
+    #[test]
+    fn downlink_backpressure_does_not_hold_soft_tx_queue_pressure() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let mut feedback = TunEgressFeedbackState::default();
+        let now = std::time::Instant::now();
+
+        feedback.observe_pressure_at(DownlinkPressureStats::new(0, 0, 100, 100), cfg, now);
+
+        let effective = feedback.effective_downlink_pressure_at(
+            DownlinkPressureStats::default(),
+            now + std::time::Duration::from_millis(TUN_EGRESS_PRESSURE_HOLD_MS - 1),
+        );
+        assert_eq!(
+            effective,
+            DownlinkPressureStats::default(),
+            "soft tx-queue-only pressure should not install an egress hold"
         );
     }
 
@@ -7194,6 +7273,8 @@ mod tests {
         assert!(line.contains("tcp-downlink-backpressure"), "{line}");
         assert!(line.contains("paused=true"), "{line}");
         assert!(line.contains("max_tx_queue=100"), "{line}");
+        assert!(line.contains("tx_queue_pause_high=160"), "{line}");
+        assert!(line.contains("tx_queue_resume_high=100"), "{line}");
         assert!(line.contains("raw_max_tx_queue=0"), "{line}");
         assert!(line.contains("effective_max_tx_queue=100"), "{line}");
         assert!(line.contains("held_pressure=true"), "{line}");

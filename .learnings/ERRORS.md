@@ -1601,3 +1601,18 @@
   that distinguish TUIC server-to-client stream starvation from mini_vpn local
   TCP ACK/receive-window collapse, then run one scoped acceptance before
   choosing a behavior patch.
+
+## 2026-07-06 - Soft tx_queue pressure must still feed TUN drop attribution
+
+- Symptom: during Knife14bx local gates, after splitting tx_queue-only
+  backpressure to use a hard cap, the focused
+  `tun_egress_feedback_pauses_on_drop_delta_with_recent_high_pressure` test
+  failed.
+- Cause: the first implementation reused the new hard-cap predicate for both
+  the 25ms remote-read pressure hold and the recent-pressure sample used by
+  TUN drop feedback. That made a real TUN `tx_dropped` sample after soft-high
+  pressure look pressure-free.
+- Correct behavior: keep these two roles separate. Record recent pressure for
+  drop attribution whenever raw pressure reaches the conservative soft high,
+  but install the 25ms egress hold only when app pending reaches high or
+  tx_queue-only pressure reaches its derived hard cap.
