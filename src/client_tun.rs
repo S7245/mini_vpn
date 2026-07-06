@@ -1476,6 +1476,12 @@ fn tx_queue_resume_threshold(cfg: DownlinkBackpressureConfig) -> usize {
     cfg.high_bytes
 }
 
+fn tx_queue_flush_threshold(cfg: DownlinkBackpressureConfig) -> usize {
+    let headroom = cfg.high_bytes.saturating_sub(cfg.low_bytes);
+    let bounded_flush_headroom = (headroom / 2).max(1);
+    cfg.high_bytes.saturating_add(bounded_flush_headroom)
+}
+
 fn reaches_downlink_pressure_hold_threshold(
     stats: DownlinkPressureStats,
     cfg: DownlinkBackpressureConfig,
@@ -2082,7 +2088,7 @@ impl DownlinkEgressPacer {
         let send_queue_defer_threshold = if pending_bytes > 0 {
             backpressure.high_bytes
         } else {
-            tx_queue_pause_threshold(backpressure)
+            tx_queue_flush_threshold(backpressure)
         };
         if send_queue_bytes >= send_queue_defer_threshold {
             self.debit_budget(accepted_bytes);
@@ -2134,7 +2140,7 @@ fn format_tcp_downlink_backpressure_diag(
     cfg: DownlinkBackpressureConfig,
 ) -> String {
     format!(
-        "🔎 tcp-downlink-backpressure paused={} max_pending={} total_pending={} max_tx_queue={} total_tx_queue={} max_pressure={} total_pressure={} high={} low={} tx_queue_pause_high={} tx_queue_resume_high={} raw_max_pending={} raw_total_pending={} raw_max_tx_queue={} raw_total_tx_queue={} raw_max_pressure={} raw_total_pressure={} effective_max_pending={} effective_total_pending={} effective_max_tx_queue={} effective_total_tx_queue={} effective_max_pressure={} effective_total_pressure={} held_pressure={}",
+        "🔎 tcp-downlink-backpressure paused={} max_pending={} total_pending={} max_tx_queue={} total_tx_queue={} max_pressure={} total_pressure={} high={} low={} tx_queue_flush_high={} tx_queue_pause_high={} tx_queue_resume_high={} raw_max_pending={} raw_total_pending={} raw_max_tx_queue={} raw_total_tx_queue={} raw_max_pressure={} raw_total_pressure={} effective_max_pending={} effective_total_pending={} effective_max_tx_queue={} effective_total_tx_queue={} effective_max_pressure={} effective_total_pressure={} held_pressure={}",
         paused,
         effective.max_pending,
         effective.total_pending,
@@ -2144,6 +2150,7 @@ fn format_tcp_downlink_backpressure_diag(
         effective.total_pressure(),
         cfg.high_bytes,
         cfg.low_bytes,
+        tx_queue_flush_threshold(cfg),
         tx_queue_pause_threshold(cfg),
         tx_queue_resume_threshold(cfg),
         raw.max_pending,
@@ -2446,8 +2453,9 @@ pub async fn start_tun_proxy() {
         runtime_config.downlink_flush_max_bytes
     );
     println!(
-        "🚦 TCP 下行 egress pacing: immediate={}B/tick（MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES 可调；pending backlog 在本地 egress 压力低于 high 时强制 immediate flush）",
-        runtime_config.downlink_egress_immediate_bytes
+        "🚦 TCP 下行 egress pacing: immediate={}B/tick tx_queue_flush_high={}B（MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES 可调；pending backlog 在本地 egress 压力低于 high 时强制 immediate flush）",
+        runtime_config.downlink_egress_immediate_bytes,
+        tx_queue_flush_threshold(runtime_config.downlink_backpressure)
     );
     println!(
         "🧱 TCP socket buffers: rx={}B tx={}B（MINI_VPN_TCP_*_BUFFER_BYTES 可调）",
@@ -7110,17 +7118,41 @@ mod tests {
 
         pacer.on_timer_tick();
         assert!(
-            pacer.allow_remote_payload_flush(32, 0, 159, cfg),
-            "tx-queue-only pressure below the hard cap should still allow immediate flush"
+            pacer.allow_remote_payload_flush(32, 0, 129, cfg),
+            "tx-queue-only pressure below the bounded flush cap should still allow immediate flush"
         );
 
         pacer.on_timer_tick();
         assert!(
-            !pacer.allow_remote_payload_flush(32, 0, 160, cfg),
-            "tx-queue-only pressure at the hard cap should defer immediate flush"
+            !pacer.allow_remote_payload_flush(32, 0, 130, cfg),
+            "tx-queue-only pressure at the bounded flush cap should defer immediate flush"
         );
         assert_eq!(
             pacer.remaining_immediate_bytes, 68,
+            "bytes accepted into smoltcp should still consume budget when deferred"
+        );
+    }
+
+    #[test]
+    fn downlink_egress_pacer_bounds_no_pending_flush_before_hard_cap() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let mut pacer = DownlinkEgressPacer::new(100);
+
+        assert!(
+            pacer.allow_remote_payload_flush(16, 0, 129, cfg),
+            "no-pending flush should keep some headroom above soft high"
+        );
+
+        pacer.on_timer_tick();
+        assert!(
+            !pacer.allow_remote_payload_flush(16, 0, 130, cfg),
+            "no-pending flush should stop at the bounded midpoint before hard cap"
+        );
+        assert_eq!(
+            pacer.remaining_immediate_bytes, 84,
             "bytes accepted into smoltcp should still consume budget when deferred"
         );
     }
@@ -7312,6 +7344,7 @@ mod tests {
         assert!(line.contains("tcp-downlink-backpressure"), "{line}");
         assert!(line.contains("paused=true"), "{line}");
         assert!(line.contains("max_tx_queue=100"), "{line}");
+        assert!(line.contains("tx_queue_flush_high=130"), "{line}");
         assert!(line.contains("tx_queue_pause_high=160"), "{line}");
         assert!(line.contains("tx_queue_resume_high=100"), "{line}");
         assert!(line.contains("raw_max_tx_queue=0"), "{line}");

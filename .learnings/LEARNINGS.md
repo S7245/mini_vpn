@@ -2679,3 +2679,24 @@ worth cleaning up separately.
   is too permissive for default TUN/qdisc capacity. The next patch should find
   a bounded middle or drop-aware egress-capacity guard, not return to scripts,
   stale pool, iperf3, sing-box, QUIC, or close/reap tuning.
+
+## 2026-07-06 - Knife14bz splits flush headroom from read-pause headroom
+
+- Stage: Knife14bz code patch after Knife14by showed hard-cap no-pending flush
+  reduced `tun_flush_deferred` but reintroduced small TUN drops.
+- Outcome: core downlink egress now has three explicit thresholds:
+  app-owned pending stays strict at `high`, no-pending immediate flush defers at
+  a bounded midpoint between `high` and the tx_queue hard cap, and remote-read
+  pause still uses the tx_queue hard cap. With default settings that is
+  `524288B`, `720896B`, and `917504B`.
+- TDD: the new RED test first failed because `send_queue=130` still flushed
+  under the old hard-cap rule. The implementation added
+  `tx_queue_flush_threshold`, updated pacer expectations, and exposed
+  `tx_queue_flush_high` in diagnostics/startup logs.
+- Local gates passed: focused pacer/backpressure/TUN feedback tests, full
+  `cargo test --lib`, low-RTT and US-client suite self-tests, shell syntax
+  checks, harness tests, release build, clippy with harness, and
+  `git diff --check`.
+- Reusable rule: do not collapse all local egress thresholds into one number.
+  App-pending safety, no-pending flush cadence, and remote-read pause capacity
+  are separate controls and need separate diagnostics.
