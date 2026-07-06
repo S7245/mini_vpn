@@ -1,5 +1,39 @@
 # Errors
 
+## 2026-07-06 - Knife14cp VPS regressed after recent-active timer ACK drain engaged
+
+- Stage: Knife14cp recent-active timer ACK drain VPS acceptance.
+- Failed bundle:
+  `/tmp/mini_vpn/knife14cp_recent_active_timer_retry_20260706_035508/mvpn_knife14cp_recent_active_timer_retry_usclient_suite_20260707_035508.tar.gz`
+- Symptom: reverse-first P1 reached only `19.2/18.0 Mbit/s`, worse than
+  Knife14co's `25.5/24.3 Mbit/s`, while still `low_average`.
+- Important discriminator: the new code path definitely engaged:
+  `timer_active_flow_attempts=1321`, `tun_rx_drain attempts=10633`,
+  `would_block=10542`, and `errors=0`.
+- Clean surfaces: `local_pressure=0`, `downlink_backpressure pause_edges=0`,
+  `tun_tx_dropped_delta=0`, runtime `drop_delta_total=0`,
+  `pending_at_close=0`, `egress_at_close=0`, `terminal_pending_reap=0`,
+  `terminal_late_remote_payload=0`, no QUIC loss/congestion/blocking deltas,
+  no send-slice or TUN flush errors, and no current `.33` TUIC `fail auth`.
+- Rejected next moves: do not keep extending recent-active timer drain windows,
+  increasing below-pressure ACK budgets, or adding more timer ACK-drain
+  variants from this evidence.
+- Correct behavior: remove or disable this path as a default, keep the evidence
+  as an A/B rejection, and continue with the no-pressure burst/idle branch at
+  the TUIC stream read/wake or remote-to-local scheduling boundary.
+
+## 2026-07-06 - Knife14cp suite setup needs explicit exit SSH when server evidence is off
+
+- Stage: first Knife14cp VPS suite attempt.
+- Failed bundle:
+  `/tmp/mini_vpn/knife14cp_recent_active_timer_20260706_035349/mvpn_knife14cp_recent_active_timer_usclient_suite_20260707_035349.tar.gz`
+- Symptom: the suite failed before P1 because `SERVER_EVIDENCE_CHECK=0` skipped
+  default SSH host setup, but `EXIT_TO_TARGET_IPERF_CHECK=1` still required
+  exit-side SSH variables.
+- Correct behavior: when disabling server evidence to avoid `.77:22` tail
+  pollution, explicitly set `EXIT_SSH_HOST=ubuntu@43.153.32.33` and
+  `EXIT_SSH_KEY=/home/ubuntu/.ssh/vpn` if exit-side baseline checks remain on.
+
 ## 2026-07-06 - Knife14co VPS still failed after active-flow drain removed local pressure
 
 - Stage: Knife14co active-flow ACK drain VPS acceptance.

@@ -1,5 +1,31 @@
 # Learnings
 
+## 2026-07-06 - Knife14cp rejects recent-active timer ACK drain as default
+
+- Stage docs:
+  `docs/tech/2026-07-06-knife14cp-recent-active-ack-drain-spec.md`,
+  `docs/tech/2026-07-06-knife14cp-recent-active-ack-drain-plan.md`,
+  `docs/tech/2026-07-06-knife14cp-recent-active-ack-drain-results.md`
+- Code commit: `5a3f4e9`.
+- Valid log bundle:
+  `/tmp/mini_vpn/knife14cp_recent_active_timer_retry_20260706_035508/mvpn_knife14cp_recent_active_timer_retry_usclient_suite_20260707_035508.tar.gz`
+- Outcome: local gates passed and the new timer source engaged, but
+  reverse-first P1 regressed to `19.2/18.0 Mbit/s`.
+- What worked: the timer path was observable and bounded:
+  `timer_active_flow_attempts=1321`, with clean pressure and lifecycle
+  surfaces (`pause_edges=0`, `tun_tx_dropped_delta=0`, `pending_at_close=0`,
+  `terminal_pending_reap=0`).
+- What stayed clean: direct `.27/.33 <-> .77` baselines were healthy, current
+  `.33` logs had no TUIC `fail auth`, QUIC loss/congestion/blocking stayed
+  zero, and no send-slice or TUN flush errors appeared.
+- What did not work: throughput was worse than Knife14co's `25.5/24.3 Mbit/s`,
+  tail average fell to `5.950 Mbit/s`, and attribution remained
+  `no_pressure_signal`.
+- Reusable rule: do not keep adding below-pressure ACK-drain timer variants
+  once diagnostics prove they run and throughput gets worse. Restore the
+  cleaner active-flow-only default and move the next investigation to the
+  no-pressure burst/idle stream scheduling or wake/read cadence branch.
+
 ## 2026-07-06 - Knife14co removes local pressure from P1 but exposes burst/idle without pressure
 
 - Stage docs:
