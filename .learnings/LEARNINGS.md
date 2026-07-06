@@ -2340,3 +2340,21 @@ worth cleaning up separately.
   `throughput_shape` is `stable_high` or a deliberate acceptance note explains
   why the tail is irrelevant. A high aggregate with `tail_collapse_*` remains a
   Knife14 failure shape.
+
+## 2026-07-06 — Knife14bs protects auto backpressure from stale env
+
+- Stage: Knife14bs acceptance config-lifecycle patch after Knife14bq/Knife14br
+  showed local downlink/TUN pressure and tail collapse.
+- Outcome: the US-client suite now detects the old `524288/131072` downlink
+  backpressure pair when TCP tx buffer is larger, blanks it back to binary
+  `<auto>`, and reports `downlink_backpressure_auto_reset` so the run cannot
+  silently exercise stale receive-window settings.
+- TDD: suite self-test first failed on the missing normalization path, then
+  passed with coverage for legacy-to-auto normalization, the explicit keep flag,
+  and non-legacy explicit A/B preservation. Focused Rust tests still confirm
+  binary auto defaults scale a 1 MiB tx buffer to high `1048576` / low
+  `262144`.
+- Reusable rule: when a suite relies on binary auto defaults, inherited `.env`
+  values must be treated as part of the test surface and made visible in the
+  report. Always verify both the suite config lines and the mini_vpn startup
+  high/low log before interpreting throughput.

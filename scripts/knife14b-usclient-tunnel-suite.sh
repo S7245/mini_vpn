@@ -12,6 +12,8 @@ readonly DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES=""
 readonly DEFAULT_DOWNLINK_FLUSH_MAX_BYTES=262144
 readonly DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES=16777216
 readonly DEFAULT_TUN_RX_DRAIN_BUDGET=0
+readonly LEGACY_DOWNLINK_BACKPRESSURE_HIGH_BYTES=524288
+readonly LEGACY_DOWNLINK_BACKPRESSURE_LOW_BYTES=131072
 readonly DEFAULT_SERVER_EVIDENCE_SING_BOX_TAIL=220
 readonly DEFAULT_SERVER_EVIDENCE_TARGET_JOURNAL_TAIL=260
 readonly DEFAULT_KNIFE14_EXIT_HOST=43.153.32.33
@@ -194,6 +196,40 @@ apply_server_evidence_ssh_defaults() {
   fi
 }
 
+is_positive_integer() {
+  local value="${1:-}"
+  [[ "$value" =~ ^[0-9]+$ ]] && ((10#$value > 0))
+}
+
+normalize_downlink_backpressure_env() {
+  DOWNLINK_BACKPRESSURE_AUTO_REASON=""
+  if [[ "${KNIFE14_KEEP_EXPLICIT_DOWNLINK_BACKPRESSURE:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  local tx_bytes="${MINI_VPN_TCP_TX_BUFFER_BYTES:-}"
+  local high_bytes="${MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES:-}"
+  local low_bytes="${MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES:-}"
+  if ! is_positive_integer "$tx_bytes" || ! is_positive_integer "$high_bytes"; then
+    return 0
+  fi
+  if ((10#$tx_bytes <= LEGACY_DOWNLINK_BACKPRESSURE_HIGH_BYTES)); then
+    return 0
+  fi
+  if [[ "$high_bytes" != "$LEGACY_DOWNLINK_BACKPRESSURE_HIGH_BYTES" ]]; then
+    return 0
+  fi
+  if [[ -n "$low_bytes" && "$low_bytes" != "$LEGACY_DOWNLINK_BACKPRESSURE_LOW_BYTES" ]]; then
+    return 0
+  fi
+
+  MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=""
+  MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=""
+  export MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES
+  export MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES
+  DOWNLINK_BACKPRESSURE_AUTO_REASON="legacy_512k_for_scaled_tx_buffer"
+}
+
 suite_self_test() {
   local sample expected actual help_text
 
@@ -244,8 +280,54 @@ EOF
     echo "suite self-test failed: tun rx drain budget help default drifted" >&2
     return 1
   fi
+  if ! grep -q "KNIFE14_KEEP_EXPLICIT_DOWNLINK_BACKPRESSURE=0" <<<"$help_text"; then
+    echo "suite self-test failed: downlink backpressure normalization help missing" >&2
+    return 1
+  fi
   if ! grep -q "STOP_AFTER_REVERSE_FIRST_P1=0" <<<"$help_text"; then
     echo "suite self-test failed: reverse-only stop help missing" >&2
+    return 1
+  fi
+
+  if ! (
+    MINI_VPN_TCP_TX_BUFFER_BYTES=1048576
+    MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=524288
+    MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=131072
+    KNIFE14_KEEP_EXPLICIT_DOWNLINK_BACKPRESSURE=0
+    normalize_downlink_backpressure_env &&
+      [[ -z "${MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES:-}" ]] &&
+      [[ -z "${MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES:-}" ]] &&
+      [[ "${DOWNLINK_BACKPRESSURE_AUTO_REASON:-}" == legacy_512k_for_scaled_tx_buffer ]]
+  ); then
+    echo "suite self-test failed: legacy downlink backpressure should normalize to auto under scaled tx buffer" >&2
+    return 1
+  fi
+
+  if ! (
+    MINI_VPN_TCP_TX_BUFFER_BYTES=1048576
+    MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=524288
+    MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=131072
+    KNIFE14_KEEP_EXPLICIT_DOWNLINK_BACKPRESSURE=1
+    normalize_downlink_backpressure_env &&
+      [[ "${MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES:-}" == "524288" ]] &&
+      [[ "${MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES:-}" == "131072" ]] &&
+      [[ -z "${DOWNLINK_BACKPRESSURE_AUTO_REASON:-}" ]]
+  ); then
+    echo "suite self-test failed: keep flag should preserve explicit legacy backpressure" >&2
+    return 1
+  fi
+
+  if ! (
+    MINI_VPN_TCP_TX_BUFFER_BYTES=1048576
+    MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=786432
+    MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=196608
+    KNIFE14_KEEP_EXPLICIT_DOWNLINK_BACKPRESSURE=0
+    normalize_downlink_backpressure_env &&
+      [[ "${MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES:-}" == "786432" ]] &&
+      [[ "${MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES:-}" == "196608" ]] &&
+      [[ -z "${DOWNLINK_BACKPRESSURE_AUTO_REASON:-}" ]]
+  ); then
+    echo "suite self-test failed: non-legacy explicit backpressure should be preserved" >&2
     return 1
   fi
   if ! grep -q "SERVER_EVIDENCE_CHECK=0" <<<"$help_text"; then
@@ -424,6 +506,7 @@ Optional env:
   MINI_VPN_TCP_TX_BUFFER_BYTES=1048576
   MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=<auto>  empty/unset lets mini_vpn scale to TCP tx buffer
   MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=<auto>   empty/unset lets mini_vpn scale to TCP tx buffer / 4
+  KNIFE14_KEEP_EXPLICIT_DOWNLINK_BACKPRESSURE=0     set 1 to preserve inherited 524288/131072 legacy A/B values
   MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=262144
   MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=16777216
   MINI_VPN_TUN_RX_DRAIN_BUDGET=0   default off; set >0 only for explicit TUN ingress drain A/B
@@ -1499,6 +1582,8 @@ export MINI_VPN_TCP_RX_BUFFER_BYTES="${MINI_VPN_TCP_RX_BUFFER_BYTES:-1048576}"
 export MINI_VPN_TCP_TX_BUFFER_BYTES="${MINI_VPN_TCP_TX_BUFFER_BYTES:-1048576}"
 export MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES="${MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES:-$DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES}"
 export MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES="${MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES:-$DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES}"
+export KNIFE14_KEEP_EXPLICIT_DOWNLINK_BACKPRESSURE="${KNIFE14_KEEP_EXPLICIT_DOWNLINK_BACKPRESSURE:-0}"
+normalize_downlink_backpressure_env
 export MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES="${MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES:-$DEFAULT_DOWNLINK_FLUSH_MAX_BYTES}"
 export MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES="${MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES:-$DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES}"
 export MINI_VPN_TUN_RX_DRAIN_BUDGET="${MINI_VPN_TUN_RX_DRAIN_BUDGET:-$DEFAULT_TUN_RX_DRAIN_BUDGET}"
@@ -1528,6 +1613,10 @@ append "- MINI_VPN_TUIC_ZERO_RTT=$MINI_VPN_TUIC_ZERO_RTT"
 append "- MINI_VPN_TUIC_TCP_POOL=$MINI_VPN_TUIC_TCP_POOL"
 append "- MINI_VPN_TCP_RX_BUFFER_BYTES=$MINI_VPN_TCP_RX_BUFFER_BYTES"
 append "- MINI_VPN_TCP_TX_BUFFER_BYTES=$MINI_VPN_TCP_TX_BUFFER_BYTES"
+append "- KNIFE14_KEEP_EXPLICIT_DOWNLINK_BACKPRESSURE=$KNIFE14_KEEP_EXPLICIT_DOWNLINK_BACKPRESSURE"
+if [[ -n "$DOWNLINK_BACKPRESSURE_AUTO_REASON" ]]; then
+  append "- downlink_backpressure_auto_reset=$DOWNLINK_BACKPRESSURE_AUTO_REASON"
+fi
 append "- MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=${MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES:-<auto>}"
 append "- MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=${MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES:-<auto>}"
 append "- MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=$MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES"

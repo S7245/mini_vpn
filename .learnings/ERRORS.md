@@ -1431,3 +1431,19 @@
 - Correct behavior: put `no_data`, `tail_collapse`, and `stable_high`
   throughput-shape assertions on reverse TCP fixtures only. Use forward fixtures
   for relay/late-remote behavior, not reverse-throughput acceptance shape.
+
+## 2026-07-06 — Stale downlink backpressure env can bypass auto defaults
+
+- Symptom: Knife14bq was expected to exercise tx-buffer-scaled downlink
+  backpressure, but the report and startup log showed
+  `MINI_VPN_TCP_TX_BUFFER_BYTES=1048576` with high `524288` and low `131072`.
+  The run then produced `downlink_backpressure=693/693`, TUN drops, and tail
+  collapse.
+- Cause: inherited `.env` or shell variables explicitly set the old
+  `524288/131072` pair, so `client_tun.rs` correctly honored explicit config
+  instead of applying its `<auto>` scaling.
+- Correct behavior: Knife14 acceptance suites must normalize only this legacy
+  pair back to `<auto>` under a larger tx buffer unless
+  `KNIFE14_KEEP_EXPLICIT_DOWNLINK_BACKPRESSURE=1` is set. Future result
+  analysis must check the actual startup high/low line before blaming
+  receive-window code.
