@@ -2079,7 +2079,12 @@ impl DownlinkEgressPacer {
         send_queue_bytes: usize,
         backpressure: DownlinkBackpressureConfig,
     ) -> bool {
-        if send_queue_bytes >= backpressure.high_bytes {
+        let send_queue_defer_threshold = if pending_bytes > 0 {
+            backpressure.high_bytes
+        } else {
+            tx_queue_pause_threshold(backpressure)
+        };
+        if send_queue_bytes >= send_queue_defer_threshold {
             self.debit_budget(accepted_bytes);
             return false;
         }
@@ -7083,6 +7088,40 @@ mod tests {
         assert!(
             pacer.allow_remote_payload_flush(65_537, 1, 0, cfg),
             "pending backlog must force immediate egress even when accepted bytes exceed budget"
+        );
+    }
+
+    #[test]
+    fn downlink_egress_pacer_uses_tx_queue_headroom_when_no_pending_remains() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let mut pacer = DownlinkEgressPacer::new(100);
+
+        assert!(
+            pacer.allow_remote_payload_flush(32, 0, 100, cfg),
+            "tx-queue-only pressure at soft high should still allow immediate flush"
+        );
+        assert_eq!(
+            pacer.remaining_immediate_bytes, 68,
+            "allowed no-pending flush should consume the immediate budget"
+        );
+
+        pacer.on_timer_tick();
+        assert!(
+            pacer.allow_remote_payload_flush(32, 0, 159, cfg),
+            "tx-queue-only pressure below the hard cap should still allow immediate flush"
+        );
+
+        pacer.on_timer_tick();
+        assert!(
+            !pacer.allow_remote_payload_flush(32, 0, 160, cfg),
+            "tx-queue-only pressure at the hard cap should defer immediate flush"
+        );
+        assert_eq!(
+            pacer.remaining_immediate_bytes, 68,
+            "bytes accepted into smoltcp should still consume budget when deferred"
         );
     }
 

@@ -2638,3 +2638,21 @@ worth cleaning up separately.
   flush deferral with the same hard cap before adding broader architecture or
   service changes. Keep app pending and real TUN-drop feedback on their stricter
   paths.
+
+## 2026-07-06 - Knife14by aligns tx_queue-only egress flush headroom
+
+- Stage: Knife14by core behavior patch after Knife14bx showed partial
+  improvement but left `tun_flush_deferred=446` with app pending `0`.
+- Outcome: `DownlinkEgressPacer` now uses the Knife14bx tx_queue hard cap for
+  no-pending immediate flush deferral. App pending behavior stays stricter:
+  pending backlog can still force flush below soft high, but send_queue at soft
+  high still defers when app-owned backlog remains.
+- TDD: the new pacer test first failed because no-pending tx_queue pressure at
+  soft high still deferred. The implementation then split the pacer threshold
+  by `pending_bytes == 0` vs non-empty pending.
+- Local gates passed: focused pacer/backpressure tests, full `cargo test
+  --lib`, low-RTT and US-client suite self-tests, shell syntax checks, harness
+  test target, release build, clippy with harness, and `git diff --check`.
+- Reusable rule: after separating tx_queue-only remote-read backpressure from
+  app pending, immediate flush cadence must use the same tx_queue-only hard cap
+  or a second soft-high gate will continue producing burst/idle behavior.
