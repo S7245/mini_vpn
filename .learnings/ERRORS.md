@@ -1,5 +1,29 @@
 # Errors
 
+## 2026-07-06 - Knife14cq remote sync must target repository subdirectories
+
+- Stage: Knife14cq `.27` sync before VPS acceptance.
+- Symptom: an initial `rsync` sent `src/client_tun.rs` and docs to
+  `/home/ubuntu/mini_vpn/` instead of `src/` and `docs/tech/`.
+- Resolution: the misplaced files created by this sync were removed, then
+  `src/client_tun.rs` and docs were copied to their exact target directories.
+- Correct behavior: when syncing scoped source to `.27`, use explicit remote
+  paths such as `/home/ubuntu/mini_vpn/src/client_tun.rs` and
+  `/home/ubuntu/mini_vpn/docs/tech/`, or use a tested `--relative` pattern.
+  Verify the remote source hash before building.
+
+## 2026-07-06 - Knife14cq clippy caught a nested if in the opt-in gate
+
+- Stage: Knife14cq local gates.
+- Symptom: `cargo clippy --all-targets --features harness -- -D warnings`
+  failed with `clippy::collapsible-if` in the recent-active timer deadline
+  gate.
+- Resolution: collapse the condition to `has_downlink_work && let
+  Some(duration) = ...`, then rerun focused tests, clippy, full tests, release
+  build, harness, and `git diff --check`.
+- Correct behavior: keep clippy in the Knife14 gate set after code changes that
+  touch runtime control flow; small style failures are cheap to fix before VPS.
+
 ## 2026-07-06 - Knife14cp VPS regressed after recent-active timer ACK drain engaged
 
 - Stage: Knife14cp recent-active timer ACK drain VPS acceptance.

@@ -84,9 +84,11 @@ const TUN_RX_PRESSURE_DRAIN_MAX_PACKETS: usize = 256;
 /// Knife14co: active reverse flows get a smaller event-driven ACK/window drain
 /// before the pressure edge so sender windows can progress without background polling.
 const TUN_RX_ACTIVE_FLOW_DRAIN_MAX_PACKETS: usize = 32;
-/// Knife14cp: keep a short timer-driven ACK/window drain window after downlink
-/// work, covering delayed ACKs that arrive after the immediate payload-triggered drain.
-const TUN_RX_ACTIVE_FLOW_TIMER_DRAIN_MS: u64 = 250;
+/// Knife14cq: Knife14cp proved timer-driven below-pressure ACK drain runs but
+/// regresses VPS throughput, so the product default is disabled. Keep a bounded
+/// opt-in A/B knob for follow-up diagnostics only.
+const DEFAULT_TUN_RX_ACTIVE_FLOW_TIMER_DRAIN_MS: u64 = 0;
+const MAX_TUN_RX_ACTIVE_FLOW_TIMER_DRAIN_MS: u64 = 1_000;
 const TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_PRE: &str = "remote_payload_pre";
 const TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD: &str = "remote_payload";
 const TUN_RX_DRAIN_SOURCE_TIMER_PRESSURE: &str = "timer_pressure";
@@ -2851,11 +2853,12 @@ fn tun_rx_drain_budget_for_dirty_pressure(
 
 fn tun_rx_drain_budget_for_recent_active_flow(
     has_recent_downlink_work: bool,
+    active_flow_timer_ms: u64,
     configured_budget: usize,
     cfg: DownlinkBackpressureConfig,
     tun_mtu: usize,
 ) -> usize {
-    if !has_recent_downlink_work {
+    if !has_recent_downlink_work || active_flow_timer_ms == 0 {
         return 0;
     }
     if configured_budget > 0 {
@@ -3135,6 +3138,7 @@ pub struct TunRuntimeConfig {
     downlink_egress_immediate_bytes: usize,
     tcp_socket_buffers: TcpSocketBufferConfig,
     tun_rx_drain_budget: usize,
+    tun_rx_active_flow_timer_ms: u64,
     bounded_global_rx_receive_window: bool,
 }
 
@@ -3151,6 +3155,7 @@ impl TunRuntimeConfig {
             downlink_egress_immediate_bytes: DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES,
             tcp_socket_buffers: TcpSocketBufferConfig::default(),
             tun_rx_drain_budget: DEFAULT_TUN_RX_DRAIN_BUDGET,
+            tun_rx_active_flow_timer_ms: DEFAULT_TUN_RX_ACTIVE_FLOW_TIMER_DRAIN_MS,
             bounded_global_rx_receive_window: false,
         })
     }
@@ -3200,6 +3205,11 @@ impl TunRuntimeConfig {
                 .ok()
                 .as_deref(),
         );
+        cfg.tun_rx_active_flow_timer_ms = parse_tun_rx_active_flow_timer_ms(
+            std::env::var("MINI_VPN_TUN_RX_ACTIVE_FLOW_TIMER_MS")
+                .ok()
+                .as_deref(),
+        );
         cfg.bounded_global_rx_receive_window = parse_trace(
             std::env::var("MINI_VPN_BOUNDED_GLOBAL_RX_RECEIVE_WINDOW")
                 .ok()
@@ -3229,6 +3239,13 @@ fn parse_tun_rx_drain_budget(s: Option<&str>) -> usize {
     s.and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n <= MAX_TUN_RX_DRAIN_BUDGET)
         .unwrap_or(DEFAULT_TUN_RX_DRAIN_BUDGET)
+}
+
+/// Knife14cq：Knife14cp timer drain 被 VPS 证伪为默认路径；0 表示关闭，正值仅用于显式 A/B。
+fn parse_tun_rx_active_flow_timer_ms(s: Option<&str>) -> u64 {
+    s.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n <= MAX_TUN_RX_ACTIVE_FLOW_TIMER_DRAIN_MS)
+        .unwrap_or(DEFAULT_TUN_RX_ACTIVE_FLOW_TIMER_DRAIN_MS)
 }
 
 /// 刀12：解析 `MINI_VPN_PROFILE_LOOP`：`1`/`true`（不区分大小写、去空白）→ 开；其它/缺省 → 关。
@@ -3335,6 +3352,10 @@ pub async fn start_tun_proxy() {
         "🧺 TUN RX drain budget: {} packets/pass（0=仅 pressure-adaptive；pressure-adaptive={} packets near tx_queue_credit_high；MINI_VPN_TUN_RX_DRAIN_BUDGET>0 显式覆盖）",
         runtime_config.tun_rx_drain_budget,
         adaptive_tun_rx_pressure_budget
+    );
+    println!(
+        "🧪 TUN RX active-flow timer drain: {}ms（0=disabled；MINI_VPN_TUN_RX_ACTIVE_FLOW_TIMER_MS>0 仅用于 Knife14cp A/B）",
+        runtime_config.tun_rx_active_flow_timer_ms
     );
     println!(
         "🧪 bounded global_rx receive window: {}（MINI_VPN_BOUNDED_GLOBAL_RX_RECEIVE_WINDOW=1 仅用于 Knife14cg A/B）",
@@ -3585,6 +3606,9 @@ pub async fn run_event_loop<D, U, M>(
     let downlink_backpressure = runtime_config.downlink_backpressure;
     let downlink_flush_max_bytes = runtime_config.downlink_flush_max_bytes;
     let tun_rx_drain_budget = runtime_config.tun_rx_drain_budget;
+    let tun_rx_active_flow_timer_ms = runtime_config.tun_rx_active_flow_timer_ms;
+    let tun_rx_active_flow_timer_duration = (tun_rx_active_flow_timer_ms > 0)
+        .then(|| std::time::Duration::from_millis(tun_rx_active_flow_timer_ms));
     let bounded_global_rx_receive_window = runtime_config.bounded_global_rx_receive_window;
     let mut downlink_egress_pacer =
         DownlinkEgressPacer::new(runtime_config.downlink_egress_immediate_bytes);
@@ -3766,13 +3790,11 @@ pub async fn run_event_loop<D, U, M>(
                             socket_ctxs.get(&handle),
                             accepted_bytes,
                         );
-                        if has_downlink_work {
-                            active_flow_tun_rx_drain_until = Some(
-                                std::time::Instant::now()
-                                    + std::time::Duration::from_millis(
-                                        TUN_RX_ACTIVE_FLOW_TIMER_DRAIN_MS,
-                                    ),
-                            );
+                        if has_downlink_work
+                            && let Some(duration) = tun_rx_active_flow_timer_duration
+                        {
+                            active_flow_tun_rx_drain_until =
+                                Some(std::time::Instant::now() + duration);
                         }
                         let tun_rx_budget = if has_downlink_work {
                             let send_queue_bytes = sockets.get::<TcpSocket>(handle).send_queue();
@@ -4043,6 +4065,7 @@ pub async fn run_event_loop<D, U, M>(
                     (
                         tun_rx_drain_budget_for_recent_active_flow(
                             has_recent_active_flow,
+                            tun_rx_active_flow_timer_ms,
                             tun_rx_drain_budget,
                             downlink_backpressure,
                             runtime_config.tun_mtu,
@@ -8056,6 +8079,11 @@ mod tests {
             DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES
         );
         assert_eq!(config.tun_rx_drain_budget, DEFAULT_TUN_RX_DRAIN_BUDGET);
+        assert_eq!(
+            config.tun_rx_active_flow_timer_ms,
+            DEFAULT_TUN_RX_ACTIVE_FLOW_TIMER_DRAIN_MS,
+            "Knife14cp timer drain regressed VPS throughput and must stay opt-in"
+        );
         assert!(
             !config.bounded_global_rx_receive_window,
             "Knife14cg bounded receive window is opt-in after VPS rejected it as a default"
@@ -8119,6 +8147,28 @@ mod tests {
         assert_eq!(
             parse_tun_rx_drain_budget(Some("65")),
             DEFAULT_TUN_RX_DRAIN_BUDGET
+        );
+    }
+
+    #[test]
+    fn parse_tun_rx_active_flow_timer_ms_is_opt_in_and_bounded() {
+        assert_eq!(
+            parse_tun_rx_active_flow_timer_ms(None),
+            DEFAULT_TUN_RX_ACTIVE_FLOW_TIMER_DRAIN_MS
+        );
+        assert_eq!(
+            parse_tun_rx_active_flow_timer_ms(Some("abc")),
+            DEFAULT_TUN_RX_ACTIVE_FLOW_TIMER_DRAIN_MS
+        );
+        assert_eq!(parse_tun_rx_active_flow_timer_ms(Some("0")), 0);
+        assert_eq!(parse_tun_rx_active_flow_timer_ms(Some(" 250 ")), 250);
+        assert_eq!(
+            parse_tun_rx_active_flow_timer_ms(Some("1000")),
+            MAX_TUN_RX_ACTIVE_FLOW_TIMER_DRAIN_MS
+        );
+        assert_eq!(
+            parse_tun_rx_active_flow_timer_ms(Some("1001")),
+            DEFAULT_TUN_RX_ACTIVE_FLOW_TIMER_DRAIN_MS
         );
     }
 
@@ -9429,17 +9479,22 @@ mod tests {
         };
 
         assert_eq!(
-            tun_rx_drain_budget_for_recent_active_flow(false, 0, cfg, 1_200),
+            tun_rx_drain_budget_for_recent_active_flow(false, 250, 0, cfg, 1_200),
             0,
             "timer drain must stay off with no recent downlink work"
         );
         assert_eq!(
-            tun_rx_drain_budget_for_recent_active_flow(true, 0, cfg, 1_200),
-            active_flow_tun_rx_drain_budget(cfg, 1_200),
-            "recent active downlink work should get the bounded active-flow budget"
+            tun_rx_drain_budget_for_recent_active_flow(true, 0, 0, cfg, 1_200),
+            0,
+            "Knife14cp timer drain is disabled by default after VPS regression"
         );
         assert_eq!(
-            tun_rx_drain_budget_for_recent_active_flow(true, 9, cfg, 1_200),
+            tun_rx_drain_budget_for_recent_active_flow(true, 250, 0, cfg, 1_200),
+            active_flow_tun_rx_drain_budget(cfg, 1_200),
+            "explicit recent-active timer A/B should get the bounded active-flow budget"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_recent_active_flow(true, 250, 9, cfg, 1_200),
             9,
             "explicit drain budget remains an operator override inside the recent-active window"
         );

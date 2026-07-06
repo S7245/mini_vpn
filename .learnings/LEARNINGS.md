@@ -1,5 +1,34 @@
 # Learnings
 
+## 2026-07-06 - Knife14cq restores stable high reverse P1 by disabling timer drain default
+
+- Stage docs:
+  `docs/tech/2026-07-06-knife14cq-recent-active-timer-opt-in-spec.md`,
+  `docs/tech/2026-07-06-knife14cq-recent-active-timer-opt-in-plan.md`,
+  `docs/tech/2026-07-06-knife14cq-recent-active-timer-opt-in-results.md`
+- Log bundle:
+  `/tmp/mini_vpn/knife14cq_timer_optin_off_20260707_040635/mvpn_knife14cq_timer_optin_off_usclient_suite_20260707_040635.tar.gz`
+- Outcome: local gates passed and reverse-first P1 recovered to stable high
+  throughput: `182/181 Mbit/s`, `overall_avg_mbps=180.833`,
+  `tail_avg_mbps=179.333`, `tail_collapse=0`.
+- What worked: `MINI_VPN_TUN_RX_ACTIVE_FLOW_TIMER_MS` defaults to `0`, startup
+  printed `TUN RX active-flow timer drain: 0ms`, and runtime diagnostics kept
+  `timer_active_flow_attempts=0`.
+- What stayed clean: direct `.27/.33 <-> .77` baselines were healthy, current
+  `.33` checks had no TUIC `fail auth`, QUIC loss/congestion/blocking stayed
+  zero, `tun_tx_dropped_delta=0`, `drop_delta_total=0`, `pending_at_close=0`,
+  `terminal_pending_reap=0`, and `terminal_late_remote_payload=0`.
+- What remains visible: `egress_at_close=443898` was still reported as
+  `active_send_capable` and `close_egress_drain_candidate=true`, but this was
+  not terminal pending/reap loss and did not prevent stable high receiver
+  throughput.
+- Reusable rule: when a VPS A/B proves a timer/background drain path runs and
+  regresses throughput, keep it opt-in and restore the event-driven default.
+  A clean stable-high P1 with explicit close-tail accounting is stronger than
+  another hidden timer heuristic.
+- Overall Knife14 estimate after this run: `91%`; remaining work is repeat
+  stability and broader TCP regression, not another close/reap root hunt.
+
 ## 2026-07-06 - Knife14cp rejects recent-active timer ACK drain as default
 
 - Stage docs:
