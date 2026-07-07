@@ -33,6 +33,7 @@ const _: () = assert!(RELAY_CHANNEL_CAPACITY >= 1);
 const RELAY_REMOTE_READ_BURST_MAX_CHUNKS: usize = 16;
 const RELAY_REMOTE_READ_BURST_MAX_BYTES: usize = 512 * 1024;
 const RELAY_REMOTE_READ_MIN_BATCH_BYTES: usize = 64 * 1024;
+const RELAY_REMOTE_READ_ACK_DRAIN_PACKETS: usize = 1;
 const RELAY_REMOTE_READ_PRESSURE_MIN_PACKETS: usize = 16;
 const RELAY_REMOTE_READ_PRESSURE_MIN_BYTES_FLOOR: usize = 8 * 1024;
 const DOWNLINK_CREDIT_INITIAL_BATCH_BYTES: usize = RELAY_REMOTE_READ_MIN_BATCH_BYTES;
@@ -41,6 +42,7 @@ const DOWNLINK_CREDIT_MAX_NO_PROGRESS_STREAK: u8 = 8;
 const _: () = assert!(RELAY_REMOTE_READ_BURST_MAX_CHUNKS >= 1);
 const _: () = assert!(RELAY_REMOTE_READ_BURST_MAX_BYTES >= TCP_SOCKET_BUFFER_SIZE);
 const _: () = assert!(RELAY_REMOTE_READ_BURST_MAX_BYTES >= RELAY_REMOTE_READ_MIN_BATCH_BYTES);
+const _: () = assert!(RELAY_REMOTE_READ_ACK_DRAIN_PACKETS >= 1);
 const _: () = assert!(RELAY_REMOTE_READ_PRESSURE_MIN_PACKETS >= 1);
 const _: () =
     assert!(RELAY_REMOTE_READ_PRESSURE_MIN_BYTES_FLOOR <= RELAY_REMOTE_READ_MIN_BATCH_BYTES);
@@ -1060,6 +1062,14 @@ fn relay_remote_read_pressure_floor_bytes(tun_mtu: usize) -> usize {
         )
 }
 
+fn relay_remote_read_ack_drain_floor_bytes(tun_mtu: usize) -> usize {
+    tun_mtu
+        .max(MIN_TUN_MTU)
+        .saturating_mul(RELAY_REMOTE_READ_ACK_DRAIN_PACKETS)
+        .min(relay_remote_read_pressure_floor_bytes(tun_mtu))
+        .max(1)
+}
+
 fn format_relay_live_diag(
     handle: SocketHandle,
     epoch: u64,
@@ -1355,14 +1365,31 @@ fn relay_read_credit_for_local_pressure(
         };
     }
 
+    let cap_pressure_region = |credit: RelayReadCredit| -> RelayReadCredit {
+        if credit.paused || local_pressure_bytes <= cfg.high_bytes {
+            return credit;
+        }
+        let pressure_edge = tx_queue_flush_threshold(cfg);
+        let predictive_ceiling = if local_pressure_bytes < pressure_edge {
+            pressure_edge.saturating_sub(local_pressure_bytes)
+        } else {
+            relay_remote_read_ack_drain_floor_bytes(tun_mtu)
+        };
+        let max_batch_bytes = credit.max_batch_bytes.min(predictive_ceiling);
+        RelayReadCredit {
+            paused: max_batch_bytes == 0,
+            max_batch_bytes,
+        }
+    };
+
     if egress_recovery_active
         || pending_bytes > 0
         || local_pressure_bytes >= tx_queue_flush_threshold(cfg)
     {
-        return RelayReadCredit {
+        return cap_pressure_region(RelayReadCredit {
             paused: false,
             max_batch_bytes: pressure_floor,
-        };
+        });
     }
 
     let full_credit_edge = cfg.high_bytes;
@@ -1380,10 +1407,10 @@ fn relay_read_credit_for_local_pressure(
     }
     let headroom = taper_edge.saturating_sub(local_pressure_bytes);
     let elastic = RELAY_REMOTE_READ_BURST_MAX_BYTES.saturating_sub(pressure_floor);
-    RelayReadCredit {
+    cap_pressure_region(RelayReadCredit {
         paused: false,
         max_batch_bytes: pressure_floor + elastic.saturating_mul(headroom).saturating_div(span),
-    }
+    })
 }
 
 fn relay_read_credit_for_local_egress(
@@ -1606,6 +1633,7 @@ impl DownlinkCreditController {
         tun_mtu: usize,
     ) {
         let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        let ack_drain_floor = relay_remote_read_ack_drain_floor_bytes(tun_mtu);
         let observed_progress = limit
             .drain_credit_granted_bytes
             .saturating_add(limit.drop_credit_debt_paid_bytes)
@@ -1645,7 +1673,7 @@ impl DownlinkCreditController {
         self.read_credit_ceiling_bytes = self
             .read_credit_ceiling_bytes
             .saturating_div(2)
-            .max(pressure_floor);
+            .max(ack_drain_floor);
     }
 
     fn flush_budget(
@@ -1660,7 +1688,7 @@ impl DownlinkCreditController {
         }
         configured_budget.min(
             self.read_credit_ceiling_bytes
-                .max(relay_remote_read_pressure_floor_bytes(tun_mtu)),
+                .max(relay_remote_read_ack_drain_floor_bytes(tun_mtu)),
         )
     }
 
@@ -1675,7 +1703,7 @@ impl DownlinkCreditController {
             return base;
         }
 
-        let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        let ack_drain_floor = relay_remote_read_ack_drain_floor_bytes(tun_mtu);
         let staging_constrained =
             self.headroom_debt_bytes > 0 || self.no_egress_progress_streak >= 2;
         let batch_constrained = self.no_egress_progress_streak >= 2;
@@ -1693,9 +1721,9 @@ impl DownlinkCreditController {
 
         let staging_remaining = staging_limit.saturating_sub(pending_bytes);
         let progress_ceiling = if batch_constrained {
-            pressure_floor
+            ack_drain_floor
         } else {
-            self.read_credit_ceiling_bytes.max(pressure_floor)
+            self.read_credit_ceiling_bytes.max(ack_drain_floor)
         };
         let max_batch_bytes = base
             .max_batch_bytes
@@ -2176,11 +2204,8 @@ fn flush_downlink(
         controlled_max_bytes_per_flush,
         flush_limit,
     );
-    ctx.downlink_credit_controller.note_flush_feedback(
-        flush_limit,
-        downlink_backpressure,
-        tun_mtu,
-    );
+    ctx.downlink_credit_controller
+        .note_flush_feedback(flush_limit, downlink_backpressure, tun_mtu);
     if flush_limit.len == 0 {
         let used =
             ctx.downlink_egress_clock
@@ -2770,9 +2795,12 @@ fn publish_relay_read_credit_for_handle(
         cfg,
         tun_mtu,
     );
-    let credit =
-        ctx.downlink_credit_controller
-            .read_credit_for(credit, ctx.downlink_pending.len(), cfg, tun_mtu);
+    let credit = ctx.downlink_credit_controller.read_credit_for(
+        credit,
+        ctx.downlink_pending.len(),
+        cfg,
+        tun_mtu,
+    );
     let changed = *tx.borrow() != credit;
     if changed {
         let _ = tx.send(credit);
@@ -8325,6 +8353,7 @@ mod tests {
         let cfg = DownlinkBackpressureConfig::default();
         let tun_mtu = 1200;
         let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        let ack_drain_floor = relay_remote_read_ack_drain_floor_bytes(tun_mtu);
         assert_eq!(
             relay_read_credit_for_local_egress(0, 0, false, false, cfg, tun_mtu),
             RelayReadCredit::default()
@@ -8360,7 +8389,7 @@ mod tests {
             ),
             RelayReadCredit {
                 paused: false,
-                max_batch_bytes: pressure_floor,
+                max_batch_bytes: ack_drain_floor,
             }
         );
         assert_eq!(
@@ -8374,7 +8403,7 @@ mod tests {
             ),
             RelayReadCredit {
                 paused: false,
-                max_batch_bytes: pressure_floor,
+                max_batch_bytes: ack_drain_floor,
             }
         );
         assert_eq!(
@@ -8451,7 +8480,7 @@ mod tests {
     fn projected_relay_read_credit_accounts_for_incoming_payload() {
         let cfg = DownlinkBackpressureConfig::default();
         let tun_mtu = 1200;
-        let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        let ack_drain_floor = relay_remote_read_ack_drain_floor_bytes(tun_mtu);
 
         assert_eq!(
             relay_read_credit_for_projected_local_egress(
@@ -8494,9 +8523,34 @@ mod tests {
             ),
             RelayReadCredit {
                 paused: false,
-                max_batch_bytes: pressure_floor,
+                max_batch_bytes: ack_drain_floor,
             },
-            "a projected credit-edge overshoot should keep draining the QUIC stream with minimum credit"
+            "a projected credit-edge overshoot should keep draining the QUIC stream with a tiny ACK/window batch"
+        );
+    }
+
+    #[test]
+    fn projected_relay_read_credit_shrinks_below_pressure_floor_near_drop_edge() {
+        let cfg = DownlinkBackpressureConfig::default();
+        let tun_mtu = 1200;
+        let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        let credit = relay_read_credit_for_projected_local_egress(
+            tx_queue_flush_threshold(cfg).saturating_sub(1),
+            0,
+            1,
+            false,
+            false,
+            cfg,
+            tun_mtu,
+        );
+
+        assert!(
+            !credit.paused,
+            "local pressure should keep a tiny ACK/window drain instead of hard-pausing QUIC reads"
+        );
+        assert!(
+            credit.max_batch_bytes > 0 && credit.max_batch_bytes < pressure_floor,
+            "near the local egress edge, projected credit must be below the old pressure floor: {credit:?}, pressure_floor={pressure_floor}"
         );
     }
 
@@ -8504,7 +8558,7 @@ mod tests {
     fn relay_read_credit_preserves_quic_window_drain_until_staging_is_full() {
         let cfg = DownlinkBackpressureConfig::default();
         let tun_mtu = 1200;
-        let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        let ack_drain_floor = relay_remote_read_ack_drain_floor_bytes(tun_mtu);
 
         assert_eq!(
             relay_read_credit_for_local_egress(
@@ -8517,7 +8571,7 @@ mod tests {
             ),
             RelayReadCredit {
                 paused: false,
-                max_batch_bytes: pressure_floor,
+                max_batch_bytes: ack_drain_floor,
             },
             "local egress pressure should slow relay reads without starving the QUIC stream"
         );
@@ -8532,7 +8586,7 @@ mod tests {
             ),
             RelayReadCredit {
                 paused: false,
-                max_batch_bytes: pressure_floor,
+                max_batch_bytes: ack_drain_floor,
             },
             "pending staging below the receive window should keep minimum drain credit"
         );
@@ -8558,6 +8612,7 @@ mod tests {
         let cfg = DownlinkBackpressureConfig::default();
         let tun_mtu = 1200;
         let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        let ack_drain_floor = relay_remote_read_ack_drain_floor_bytes(tun_mtu);
         let staging_limit = downlink_pressure_staging_limit(cfg, tun_mtu);
         let mut controller = DownlinkCreditController::default();
         let stalled = DownlinkFlushLimit {
@@ -8583,22 +8638,17 @@ mod tests {
         assert!(controller.headroom_debt_bytes > 0);
         assert!(controller.no_egress_progress_streak >= 2);
         assert_eq!(
-                controller.read_credit_for(
-                    RelayReadCredit::default(),
-                    staging_limit,
-                    cfg,
-                    tun_mtu
-                ),
+            controller.read_credit_for(RelayReadCredit::default(), staging_limit, cfg, tun_mtu),
             RelayReadCredit {
                 paused: true,
                 max_batch_bytes: 0,
             },
             "stalled egress may keep only bounded staging and must not keep expanding pending"
         );
-        assert_eq!(
-            controller.flush_budget(262_144, cfg, tun_mtu),
-            pressure_floor,
-            "headroom deferral should become hard feedback on the next flush budget"
+        let budget = controller.flush_budget(262_144, cfg, tun_mtu);
+        assert!(
+            budget >= ack_drain_floor && budget < pressure_floor,
+            "headroom deferral should shrink the next flush budget below the old pressure floor: budget={budget}, ack_floor={ack_drain_floor}, pressure_floor={pressure_floor}"
         );
     }
 

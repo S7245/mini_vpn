@@ -2500,3 +2500,20 @@
   payload overrun and make pressure/drop debt predictive for the next control
   epoch. Do not rerun full VPS acceptance on the same controller without a code
   change that caps projected payload credit before `tx_queue_pause_high`.
+
+## 2026-07-07 - Static one-MTU ACK drain floor over-throttles clean egress
+
+- Stage: Knife14ep VPS reverse-first P1.
+- Symptom: the predictive drop-edge controller removed TUN drops
+  (`tun_tx_dropped_delta=0`) but throughput stayed low at `30.3/28.7 Mbit/s`,
+  with repeated zero-throughput intervals, `may_recv_false=8335`, and data
+  stream read/pending gaps around `3.47s`.
+- Cause: shrinking relay read credit below the old pressure floor was
+  necessary near the drop edge, but a static one-packet ACK/window floor is too
+  small once egress is clean and making progress. It protects the edge while
+  starving reverse TCP receive cadence.
+- Correct behavior: do not continue by shrinking the floor further or by
+  re-running the same fixed-floor controller. Keep the predictive edge cap, but
+  add adaptive growth from observed clean egress progress, with bounded
+  multi-MTU non-paused drain credit and fast shrink only near high water or
+  no-progress pressure.

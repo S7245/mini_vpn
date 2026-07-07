@@ -3511,3 +3511,26 @@ worth cleaning up separately.
   local egress edge. Cap projected payload credit before `tx_queue_pause_high`
   and make fresh pressure/drop debt shrink read credit and flush budget for the
   next control epoch, while preserving bounded ACK/window drain.
+
+## 2026-07-07 - Knife14ep clears the drop edge but exposes ACK/window cadence starvation
+
+- Result doc:
+  `docs/tech/2026-07-07-knife14ep-predictive-drop-edge-controller-results.md`
+- VPS bundle:
+  `/tmp/mini_vpn/knife14ep_predictive_drop_edge_p1_30/mvpn_knife14ep_predictive_drop_edge_p1_30_usclient_suite_20260707_173838.tar.gz`
+- Outcome: local TDD, full local gates, `.27` focused gates, and release build
+  passed. The scoped safe1200 reverse-first P1 completed but failed acceptance
+  at `30.3/28.7 Mbit/s`.
+- Useful positive signal: the predictive sub-floor controller removed the TUN
+  drop edge (`tun_tx_dropped_delta=0`) while keeping QUIC
+  loss/congestion/blocking and close/reap counters clean
+  (`terminal_pending_reap=0`, `pending_at_close=0`, `egress_at_close=0`).
+- Useful negative signal: the fixed tiny ACK/window floor over-throttled the
+  receive cadence. The run still had bursty zero-throughput iperf windows,
+  `may_recv_false=8335`, `headroom_deferred_bytes=20226670`,
+  `send_queue_max=557240`, and data stream gaps around `3.47s`.
+- Reusable rule: after the drop edge is clean, do not keep shrinking relay
+  read credit. The next controller should make the ACK/window drain floor
+  adaptive: stay tiny only under no-progress edge pressure, then grow to a
+  bounded multi-MTU drain when egress progress is observed and TUN drops remain
+  zero.
