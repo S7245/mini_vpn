@@ -3315,3 +3315,174 @@ worth cleaning up separately.
   the relay/TUIC stream read-wakeup path. In particular, do not manually poll a
   live async stream with a no-op waker unless a deterministic test proves the
   real task waker cannot be clobbered.
+
+## 2026-07-07 - Knife14dx caps relay batches but proves mpsc pressure is not enough
+
+- Result doc:
+  `docs/tech/2026-07-07-knife14dx-relay-credit-results.md`
+- VPS bundle:
+  `/tmp/mini_vpn/knife14dx_relay_credit_p1_30/mvpn_knife14dx_relay_credit_p1_30_usclient_suite_20260707_125810.tar.gz`
+- Outcome: local tests and `.27` focused tests passed. The clean
+  reverse-first P1 still failed at `25.7/24.8 Mbit/s`.
+- Improvement: lifecycle accounting stayed clean in the failing window:
+  `terminal_pending_reap=0`, `pending_at_close=0`, `egress_at_close=0`, and
+  `terminal_late_remote_payload=0`. The relay batch cap held at
+  `remote_batch_bytes_max=524288`.
+- Discriminator: the relay -> main-loop queue was not the bottleneck:
+  `global_rx_queue_used_max=106/1024`, `remote_batch_limited=0`, and
+  `remote_batch_limit_bytes_min=524288`.
+- Remaining root: local socket/TUN egress pressure returned during the live
+  window: `tun_tx_dropped_delta=591`, `send_queue_max=892928`,
+  `headroom_limited_calls=336`, and `headroom_deferred_bytes=28883630`, while
+  QUIC loss/congestion/blocking remained zero.
+- Reusable rule: relay read-side credit must follow per-flow local egress
+  state, not only bounded-channel occupancy. The next patch should add an
+  explicit main-loop -> relay read-credit signal based on socket send queue /
+  TUN feedback, instead of changing pool size, sing-box, iperf3, or static
+  threshold values.
+
+## 2026-07-07 - Knife14dy proves read-credit wiring but rejects post-accept policy
+
+- Result doc:
+  `docs/tech/2026-07-07-knife14dy-read-credit-results.md`
+- VPS bundle:
+  `/tmp/mini_vpn/knife14dy_read_credit_p1_30/mvpn_knife14dy_read_credit_p1_30_usclient_suite_20260707_131037.tar.gz`
+- Outcome: local and `.27` focused tests passed, but clean reverse-first P1
+  remained low at `22.8/21.6 Mbit/s`.
+- What worked: the per-flow read-credit channel was live. The data stream
+  recorded `read_credit_updates=86`, `read_credit_limit_bytes_min=65536`, and
+  `remote_batch_limited=6`.
+- What stayed clean: close/lifecycle accounting still reported
+  `terminal_pending_reap=0`, `pending_at_close=0`, `egress_at_close=0`, and
+  no terminal late remote payload; QUIC loss/congestion/blocking stayed clean.
+- Remaining root: the first read-credit policy reacted after payload acceptance,
+  so a large batch could still consume stale drain-credit and drive local
+  egress to `send_queue_max=892928` with TUN drops
+  (`tun_tx_dropped_delta=2973` parser, `2163` runtime).
+- Reusable rule: read-credit and flush debt must share projected pressure:
+  `send_queue + pending + incoming`. Publish projected credit before handling a
+  remote payload and install projected pressure debt before `flush_downlink`
+  can spend old smoltcp drain-credit.
+
+## 2026-07-07 - Knife14dz separates projected credit from QUIC receive progress
+
+- Result doc:
+  `docs/tech/2026-07-07-knife14dz-projected-credit-results.md`
+- VPS bundle:
+  `/tmp/mini_vpn/mvpn_knife14dz_projected_credit_p1_30_usclient_suite_20260707_132432.tar.gz`
+- Outcome: projected credit/debt engaged, but reverse-first P1 regressed to
+  `6.05 Mbit/s` receiver and timed out.
+- Closed surface: pending/close/reap accounting stayed clean, with
+  `terminal_pending_reap=0`, `pending_at_close=0`, and `egress_at_close=0`.
+- Rejected policy: including local pressure debt in the relay read hard pause
+  protected egress too aggressively and introduced QUIC stream receive
+  blocking (`max_rx_blocked_stream_delta=1`).
+- Reusable rule: local flush pressure and QUIC stream receive-window progress
+  are separate control loops. Pressure debt may gate smoltcp/TUN flush credit,
+  but relay reads should only hard-pause when receive staging is full or TUN
+  feedback is paused.
+
+## 2026-07-07 - Knife14ea proves staging drain but exposes ACK/window cadence
+
+- Result doc:
+  `docs/tech/2026-07-07-knife14ea-staging-drain-results.md`
+- VPS bundle:
+  `/tmp/mini_vpn/mvpn_knife14ea_staging_drain_p1_30_usclient_suite_20260707_133922.tar.gz`
+- Outcome: removing pressure debt from relay-read hard pause improved
+  reverse-first P1 from `6.05` to `26.3 Mbit/s` and cleared QUIC
+  receive-blocking.
+- Clean surfaces: TUN drops, QUIC loss/congestion/blocking, terminal pending
+  reap, and pending at close stayed zero.
+- Remaining root: second-scale data stream read/pending gaps persisted with
+  repeated iperf zero windows; relay gap hints existed but used the smaller
+  active-flow ACK drain budget.
+- Reusable rule: when the local egress surfaces are clean but cadence gaps
+  remain, treat relay read gaps as ACK/window starvation evidence and let that
+  path use pressure-sized drain budget under the same headroom safety curve.
+
+## 2026-07-07 - Knife14eb validates stronger gap ACK drain but needs follow-up
+
+- Result doc:
+  `docs/tech/2026-07-07-knife14eb-gap-hint-pressure-drain-results.md`
+- VPS bundle:
+  `/tmp/mini_vpn/mvpn_knife14eb_gap_hint_pressure_drain_p1_30_usclient_suite_20260707_134432.tar.gz`
+- Outcome: relay-gap pressure ACK drain improved reverse-first P1 to
+  `38.3/37.4 Mbit/s` while keeping TUN drops, QUIC blocked/loss/congestion,
+  headroom debt, pending-at-close, and terminal pending reap clean.
+- Remaining root: the data stream still had `data_read_gap_max_ms=3593` and
+  `data_pending_gap_max_ms=3437`, with `tun_rx_drain budget_exhausted=180`.
+- `.33` discriminator: current-window logs showed TUIC inbound/direct outbound
+  for `.27 -> .77`, no TUIC `fail auth`, active sing-box, and synchronized
+  time. VLESS REALITY invalid-connection logs were unrelated scanner noise.
+- Reusable rule: do not raise the static packet budget blindly. When a valid
+  relay-gap ACK drain exhausts its budget, arm a bounded follow-up drain that
+  repeats until TUN RX would-blocks or the egress headroom curve suppresses it.
+
+## 2026-07-07 - Knife14ec proves relay-gap follow-up is the wrong trigger
+
+- Result doc:
+  `docs/tech/2026-07-07-knife14ec-gap-followup-results.md`
+- VPS bundle:
+  `/tmp/mini_vpn/mvpn_knife14ec_gap_followup_p1_30_usclient_suite_20260707_135859.tar.gz`
+- Outcome: local tests and `.27` focused tests passed, but reverse-first P1
+  fell to `23.2/21.5 Mbit/s`.
+- Useful negative signal: `relay_gap_hint_followup_attempts=0`, so the new
+  follow-up path did not trigger in the failing VPS window.
+- Remaining root: `budget_exhausted=210` occurred with many
+  `remote_payload_deferred_attempts=812`, and local pressure returned
+  (`send_queue_max=724376`, `headroom_limited=706`,
+  `pressure_credit_debt_bytes=196608`) without TUN drops or QUIC blocking.
+- Reusable rule: a code-level algorithm can be correct but attached to the
+  wrong event. For this branch, adaptive escalation belongs to exhausted
+  deferred ACK drains after remote payloads, not only to relay-gap hints.
+
+## 2026-07-07 - Knife14en rejects QUIC MTU black-hole as the main root
+
+- Result doc:
+  `docs/tech/2026-07-07-knife14en-quic-safe1200-results.md`
+- VPS bundle:
+  `/tmp/mini_vpn/knife14en_quic_safe1200_tail12/mvpn_knife14en_quic_safe1200_tail12_usclient_suite_20260707_160539.tar.gz`
+- Code outcome: added `MtuPolicy` with `default` and `safe1200`, wired
+  `MINI_VPN_TUIC_MTU_MODE` / `MINI_VPN_TUIC_MTU_POLICY`, and added per-stream
+  transport delivery counters to TUIC TCP pending diagnostics.
+- Local and `.27` focused gates passed; release build and script self-tests
+  passed.
+- VPS outcome: `safe1200` applied (`dg_max=Some(1166)`, PLPMTUD disabled),
+  but reverse-first P1 remained low at `24.3/23.1 Mbit/s`.
+- Key discriminator: QUIC transport delivery remained active while pending
+  gaps occurred. The data connection ended with `frames(rx_stream=68905)`,
+  `udp_rx=104392/148771086B`, and `plpmtud(sent=0,lost=0,black_holes=0)`.
+- Remaining root: the failure shifted back to local downlink pressure:
+  `downlink_backpressure pause/resume=4/3`, `max_pending=725572`,
+  `send_queue_max=556664`, `headroom_limited=15691`, and
+  `headroom_deferred_bytes=4018847472`, while TUN drops, send-slice errors,
+  pending-at-close, egress-at-close, terminal pending reap, QUIC loss,
+  congestion, and blocked frames stayed clean.
+- Reusable rule: do not keep tuning QUIC MTU/PLPMTUD for Knife14 unless new
+  evidence contradicts this run. The next patch should redesign local
+  downlink credit so read-credit, flush budget, and headroom debt are coupled
+  around observed egress progress instead of passively accumulating headroom
+  deferrals.
+
+## 2026-07-07 - Knife14eo reaches 95% with per-flow local downlink credit control
+
+- Result doc:
+  `docs/tech/2026-07-07-knife14eo-local-downlink-credit-controller-results.md`
+- Outcome: Knife14eo code, deterministic local coverage, local quality gates,
+  and `.27` focused gates passed. Full VPS reverse-first acceptance has not
+  been run yet; this is the requested 95% stop point.
+- Code result: each `SocketCtx` now owns a `DownlinkCreditController` that
+  couples relay read credit, flush budget, bounded staging, headroom deferral,
+  and observed smoltcp egress progress. Headroom deferral now shrinks future
+  read/flush work instead of remaining passive accounting; observed egress
+  progress grows credit additively.
+- Clean local gates: focused controller/read-credit/pressure-credit/deferred
+  ACK/relay burst tests, full `cargo test --lib`, harness tests, clippy with
+  harness, script self-tests, release build, and `git diff --check`.
+- Remote focused gates on `.27`: controller/read-credit/pressure-credit tests
+  and release build passed after rsync excluding `.env`, `.git`, and `target`,
+  followed by `touch` on edited source files.
+- Reusable rule: local downlink pressure should be treated as a per-flow
+  control loop. Keep hard relay-read pauses for receive-window high water or
+  TUN feedback pause; use headroom deferral to shrink bounded staging and
+  flush/read budgets, then reopen credit only from observed egress progress.

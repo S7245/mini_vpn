@@ -1,33 +1,51 @@
 use crate::device::{TunIo, VirtualTunDevice};
+use crate::dns::{self, Answer};
+use crate::failover::FailoverUpstream;
+use crate::fake_ip::FakeIpPool;
+use crate::loop_profiler::LoopProfiler;
+use crate::metrics::Metrics;
+use crate::reality_upstream::RealityUpstream;
 use crate::shared::{ClientError, TargetAddr};
 use crate::tuic::{
     AssocTable, FragReassembler, TuicClientConfig, TuicUpstream, decode_packet_meta, encode_packet,
 };
-use crate::upstream::{DatagramUpstream, ProxyUpstream, RelayStream};
-use crate::reality_upstream::RealityUpstream;
-use crate::failover::FailoverUpstream;
 use crate::udp_relay::{
     FourTuple, UDP_FLOW_IDLE_SECS, UdpInbound, build_udp_ip_packet, parse_inbound_udp,
 };
-use crate::dns::{self, Answer};
-use crate::fake_ip::FakeIpPool;
-use crate::loop_profiler::LoopProfiler;
-use crate::metrics::Metrics;
-use std::net::Ipv4Addr;
+use crate::upstream::{DatagramUpstream, ProxyUpstream, RelayStream};
 use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
-use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState};
+use smoltcp::socket::tcp::{
+    Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState,
+};
 use smoltcp::wire::{IpAddress, IpCidr};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::net::Ipv4Addr;
 use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 
 use std::collections::{HashMap, HashSet};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 pub(crate) const TCP_SOCKET_BUFFER_SIZE: usize = 65_535;
 const MIN_TCP_SOCKET_BUFFER_BYTES: usize = 4 * 1024;
 const MAX_TCP_SOCKET_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 const RELAY_CHANNEL_CAPACITY: usize = 1024;
 const _: () = assert!(RELAY_CHANNEL_CAPACITY >= 1);
+const RELAY_REMOTE_READ_BURST_MAX_CHUNKS: usize = 16;
+const RELAY_REMOTE_READ_BURST_MAX_BYTES: usize = 512 * 1024;
+const RELAY_REMOTE_READ_MIN_BATCH_BYTES: usize = 64 * 1024;
+const RELAY_REMOTE_READ_PRESSURE_MIN_PACKETS: usize = 16;
+const RELAY_REMOTE_READ_PRESSURE_MIN_BYTES_FLOOR: usize = 8 * 1024;
+const DOWNLINK_CREDIT_INITIAL_BATCH_BYTES: usize = RELAY_REMOTE_READ_MIN_BATCH_BYTES;
+const DOWNLINK_CREDIT_PROGRESS_GAIN: usize = 2;
+const DOWNLINK_CREDIT_MAX_NO_PROGRESS_STREAK: u8 = 8;
+const _: () = assert!(RELAY_REMOTE_READ_BURST_MAX_CHUNKS >= 1);
+const _: () = assert!(RELAY_REMOTE_READ_BURST_MAX_BYTES >= TCP_SOCKET_BUFFER_SIZE);
+const _: () = assert!(RELAY_REMOTE_READ_BURST_MAX_BYTES >= RELAY_REMOTE_READ_MIN_BATCH_BYTES);
+const _: () = assert!(RELAY_REMOTE_READ_PRESSURE_MIN_PACKETS >= 1);
+const _: () =
+    assert!(RELAY_REMOTE_READ_PRESSURE_MIN_BYTES_FLOOR <= RELAY_REMOTE_READ_MIN_BATCH_BYTES);
+const _: () = assert!(DOWNLINK_CREDIT_INITIAL_BATCH_BYTES <= RELAY_REMOTE_READ_BURST_MAX_BYTES);
+const _: () = assert!(DOWNLINK_CREDIT_PROGRESS_GAIN >= 1);
 const MAX_ESTABLISHED_UPLINK_BATCH: usize = 64;
 const _: () = assert!(MAX_ESTABLISHED_UPLINK_BATCH >= 1);
 const RELAY_WRITER_COALESCE_MAX_MESSAGES: usize = MAX_ESTABLISHED_UPLINK_BATCH;
@@ -36,6 +54,24 @@ const DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES: usize = 512 * 1024;
 const DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES: usize = 128 * 1024;
 const _: () =
     assert!(DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES < DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES);
+/// Linux TUN commonly starts with txqueuelen 500. The runtime may not know the
+/// actual qdisc length yet, so the product default sizes local TCP backpressure
+/// against this conservative estimate unless the operator supplies an override.
+const DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE: usize = 500;
+const MAX_TUN_TX_QUEUE_LEN_ESTIMATE: usize = 1_000_000;
+const TUN_EGRESS_SAFE_FLUSH_NUMERATOR: usize = 3;
+const TUN_EGRESS_SAFE_FLUSH_DENOMINATOR: usize = 4;
+const DEFAULT_DOWNLINK_BACKPRESSURE_LOW_RATIO: usize = 4;
+const TX_QUEUE_FLUSH_RATIO_NUMERATOR: usize = 11;
+const TX_QUEUE_FLUSH_RATIO_DENOMINATOR: usize = 8;
+const TX_QUEUE_PAUSE_RATIO_NUMERATOR: usize = 7;
+const TX_QUEUE_PAUSE_RATIO_DENOMINATOR: usize = 4;
+const _: () = assert!(DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE >= 1);
+const _: () = assert!(MAX_TUN_TX_QUEUE_LEN_ESTIMATE >= DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE);
+const _: () = assert!(TUN_EGRESS_SAFE_FLUSH_NUMERATOR < TUN_EGRESS_SAFE_FLUSH_DENOMINATOR);
+const _: () = assert!(DEFAULT_DOWNLINK_BACKPRESSURE_LOW_RATIO >= 2);
+const _: () = assert!(TX_QUEUE_FLUSH_RATIO_DENOMINATOR >= 1);
+const _: () = assert!(TX_QUEUE_PAUSE_RATIO_DENOMINATOR >= 1);
 const DEFAULT_DOWNLINK_FLUSH_MAX_BYTES: usize = 256 * 1024;
 const MIN_DOWNLINK_FLUSH_MAX_BYTES: usize = 4 * 1024;
 const MAX_DOWNLINK_FLUSH_MAX_BYTES: usize = MAX_TCP_SOCKET_BUFFER_BYTES;
@@ -63,6 +99,13 @@ const RELAY_WRITER_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// Knife14o/14r：relay 已关闭但仍有 downlink_pending 时，给 dirty flush 一个短窗口；
 /// 14r 起窗口按“最近一次 pending 下降”刷新。无进展超过窗口才 hard reap，防永久脏槽。
 const DEFERRED_CLOSE_PENDING_GRACE_SECS: u64 = 5;
+/// Knife14as：TUN/qdisc drop feedback 后，本地 egress tail 可能需要一轮 TCP 重传/ACK
+/// 才能下降；给它一个更长但仍有界的 close-drain 窗口，避免 dead-slot reap 抢跑。
+const DEFERRED_CLOSE_EGRESS_DROP_GRACE_SECS: u64 = 15;
+const DEFERRED_CLOSE_EGRESS_MAX_GRACE_SECS: u64 = 30;
+/// Knife14as：relay 已结束后，只剩少量 terminal pending 时，允许这些字节在
+/// hard egress guard 内进入 smoltcp，这样本地 FIN 可以排在真实尾包之后发出。
+const CLOSE_DRAIN_TERMINAL_PENDING_MAX_BYTES: usize = 64 * 1024;
 /// 刀11：数据面可观测性快照周期（30s，对齐 TuicUpstream UDP_STATS_LOG_SECS）。仅周期采样/打印，不进热路径。
 const METRICS_SNAPSHOT_SECS: u64 = 30;
 /// Knife14bf：低频 TUN egress drop feedback 控制周期。1s 足够覆盖 30s reverse probe，
@@ -91,8 +134,24 @@ const DEFAULT_TUN_RX_ACTIVE_FLOW_TIMER_DRAIN_MS: u64 = 0;
 const MAX_TUN_RX_ACTIVE_FLOW_TIMER_DRAIN_MS: u64 = 1_000;
 const TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_PRE: &str = "remote_payload_pre";
 const TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD: &str = "remote_payload";
+const TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_DEFERRED: &str = "remote_payload_deferred";
+const TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_DEFERRED_DELAYED: &str = "remote_payload_deferred_delayed";
+const TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_DEFERRED_PRESSURE: &str =
+    "remote_payload_deferred_pressure";
+const TUN_RX_DRAIN_SOURCE_RELAY_GAP_HINT: &str = "relay_gap_hint";
+const TUN_RX_DRAIN_SOURCE_RELAY_GAP_HINT_FOLLOWUP: &str = "relay_gap_hint_followup";
 const TUN_RX_DRAIN_SOURCE_TIMER_PRESSURE: &str = "timer_pressure";
 const TUN_RX_DRAIN_SOURCE_TIMER_ACTIVE_FLOW: &str = "timer_active_flow";
+const DEFERRED_ACK_DRAIN_DELAY_MS: u64 = 1;
+const DEFERRED_ACK_DRAIN_DELAYED_PROBE_MS: u64 = 40;
+const RELAY_GAP_ACK_DRAIN_FOLLOWUP_DELAY_MS: u64 = 1;
+const RELAY_GAP_ACK_DRAIN_EMPTY_FOLLOWUPS: u8 = 2;
+const RELAY_GAP_ACK_DRAIN_PROGRESS_FOLLOWUPS: u8 = 1;
+const RELAY_ACK_DRAIN_HINT_GAP_MS: u128 = 500;
+const RELAY_REMOTE_READ_PROBE_INTERVAL_MS: u64 = 250;
+const RELAY_ACK_DRAIN_HINT_INTERVAL_MS: u64 = RELAY_REMOTE_READ_PROBE_INTERVAL_MS;
+const RELAY_ACK_DRAIN_HINT_MIN_DATA_BYTES: u64 = 64 * 1024;
+const RELAY_REMOTE_READ_PROBE_MIN_BATCH_BYTES: usize = 1024;
 
 /// 刀13 ①：解析 `MINI_VPN_TRACE`（`1`/`true`，去空白、不区分大小写 → 开；其它/缺省 → 关）。
 /// 对齐 [`parse_profile_loop`] 惯用法；抽纯函数便于单测（`trace_enabled` 只是它 + `OnceLock` 包壳）。
@@ -309,8 +368,7 @@ impl TcpSendWindowSnapshot {
 
 impl TcpDownlinkDiag {
     fn note_pending(&mut self, pending_current: usize) {
-        self.downlink_pending_high_water =
-            self.downlink_pending_high_water.max(pending_current);
+        self.downlink_pending_high_water = self.downlink_pending_high_water.max(pending_current);
     }
 
     fn note_remote_payload(&mut self, bytes: usize, pending_current: usize) {
@@ -322,9 +380,8 @@ impl TcpDownlinkDiag {
         self.terminal_late_remote_payload_bytes = self
             .terminal_late_remote_payload_bytes
             .saturating_add(bytes as u64);
-        self.terminal_late_remote_payload_events = self
-            .terminal_late_remote_payload_events
-            .saturating_add(1);
+        self.terminal_late_remote_payload_events =
+            self.terminal_late_remote_payload_events.saturating_add(1);
     }
 
     fn note_flush_attempt(&mut self, pending_current: usize, max_bytes_per_flush: usize) {
@@ -343,8 +400,7 @@ impl TcpDownlinkDiag {
     ) {
         self.note_flush_attempt(pending_current, max_bytes_per_flush);
         if limit.headroom_limited {
-            self.send_slice_headroom_limited =
-                self.send_slice_headroom_limited.saturating_add(1);
+            self.send_slice_headroom_limited = self.send_slice_headroom_limited.saturating_add(1);
             self.send_slice_headroom_deferred_bytes = self
                 .send_slice_headroom_deferred_bytes
                 .saturating_add(limit.headroom_deferred_bytes as u64);
@@ -377,9 +433,8 @@ impl TcpDownlinkDiag {
             .send_slice_hard_edge_guard_bytes
             .max(limit.hard_edge_guard_bytes);
         if limit.hard_edge_guard_deferred_bytes > 0 {
-            self.send_slice_hard_edge_guard_limited = self
-                .send_slice_hard_edge_guard_limited
-                .saturating_add(1);
+            self.send_slice_hard_edge_guard_limited =
+                self.send_slice_hard_edge_guard_limited.saturating_add(1);
             self.send_slice_hard_edge_guard_deferred_bytes = self
                 .send_slice_hard_edge_guard_deferred_bytes
                 .saturating_add(limit.hard_edge_guard_deferred_bytes as u64);
@@ -423,8 +478,7 @@ impl TcpDownlinkDiag {
     fn note_send_slice_ok(&mut self, accepted: usize, pending_current: usize) {
         self.send_slice_calls += 1;
         self.send_slice_accepted_bytes += accepted as u64;
-        self.send_slice_max_accepted_bytes =
-            self.send_slice_max_accepted_bytes.max(accepted);
+        self.send_slice_max_accepted_bytes = self.send_slice_max_accepted_bytes.max(accepted);
         if accepted == 0 {
             self.send_slice_zero += 1;
         }
@@ -676,8 +730,7 @@ fn should_log_tcp_reverse_window(
     let due = ctx
         .reverse_window_last_log_secs
         .map(|last| {
-            urgent
-                || now_secs.saturating_sub(last) >= TCP_REVERSE_WINDOW_DIAG_INTERVAL_SECS
+            urgent || now_secs.saturating_sub(last) >= TCP_REVERSE_WINDOW_DIAG_INTERVAL_SECS
         })
         .unwrap_or(true);
     if due {
@@ -700,10 +753,28 @@ struct RelayTaskDiag {
     uplink_bytes: u64,
     /// Bytes read from the remote stream and accepted into the global_rx path.
     remote_to_global_rx_bytes: u64,
+    /// Number of remote-to-main data batches sent after bounded ready-read coalescing.
+    remote_batches: u64,
+    /// Largest remote-to-main batch in bytes.
+    remote_batch_bytes_max: usize,
+    /// Largest number of remote read chunks coalesced into one remote-to-main batch.
+    remote_batch_chunks_max: usize,
+    /// Lowest ready-read byte budget observed from relay -> main-loop channel pressure.
+    remote_batch_limit_bytes_min: usize,
+    /// Count of remote ready-read batches whose byte budget was reduced by downstream pressure.
+    remote_batch_limited: u64,
+    /// Number of main-loop read-credit updates observed by the relay read half.
+    read_credit_updates: u64,
+    /// Number of read-credit updates that paused remote reads.
+    read_credit_pause_updates: u64,
+    /// Lowest egress-derived read-credit batch budget observed.
+    read_credit_limit_bytes_min: usize,
     /// Bytes read from the remote stream after local `Finish` was observed.
     remote_after_local_finish_bytes: u64,
     /// Number of successful remote stream reads.
     remote_reads: u64,
+    /// Number of periodic wakeups used only to keep payload-shaped remote reads polled.
+    remote_read_probe_ticks: u64,
     /// Number of successful remote stream reads after local `Finish`.
     remote_after_local_finish_reads: u64,
     /// Number of successful local payload writes to the remote stream.
@@ -720,6 +791,12 @@ struct RelayTaskDiag {
     local_write_wait_max_micros: u128,
     /// Count of local writer batches whose wait crossed the diagnostic threshold.
     local_write_pressure_events: u64,
+    /// Number of relay read-gap ACK drain hints that became due.
+    ack_drain_hint_due: u64,
+    /// Number of ACK drain hints accepted by the relay -> main-loop channel.
+    ack_drain_hint_sent: u64,
+    /// Number of ACK drain hints dropped because the relay -> main-loop channel could not accept them.
+    ack_drain_hint_dropped: u64,
     local_finish_seen: bool,
 }
 
@@ -738,8 +815,17 @@ impl RelayTaskDiag {
             max_remote_read_gap_millis: 0,
             uplink_bytes: 0,
             remote_to_global_rx_bytes: 0,
+            remote_batches: 0,
+            remote_batch_bytes_max: 0,
+            remote_batch_chunks_max: 0,
+            remote_batch_limit_bytes_min: 0,
+            remote_batch_limited: 0,
+            read_credit_updates: 0,
+            read_credit_pause_updates: 0,
+            read_credit_limit_bytes_min: 0,
             remote_after_local_finish_bytes: 0,
             remote_reads: 0,
+            remote_read_probe_ticks: 0,
             remote_after_local_finish_reads: 0,
             local_writes: 0,
             global_rx_wait_max_micros: 0,
@@ -748,6 +834,9 @@ impl RelayTaskDiag {
             global_rx_queue_capacity: 0,
             local_write_wait_max_micros: 0,
             local_write_pressure_events: 0,
+            ack_drain_hint_due: 0,
+            ack_drain_hint_sent: 0,
+            ack_drain_hint_dropped: 0,
             local_finish_seen: false,
         }
     }
@@ -784,6 +873,46 @@ impl RelayTaskDiag {
         }
     }
 
+    fn note_remote_batch(&mut self, chunks: usize, bytes: usize) {
+        if chunks == 0 || bytes == 0 {
+            return;
+        }
+        self.remote_batches = self.remote_batches.saturating_add(1);
+        self.remote_batch_bytes_max = self.remote_batch_bytes_max.max(bytes);
+        self.remote_batch_chunks_max = self.remote_batch_chunks_max.max(chunks);
+    }
+
+    fn note_remote_batch_limit(&mut self, byte_limit: usize) {
+        if byte_limit == 0 {
+            return;
+        }
+        if self.remote_batch_limit_bytes_min == 0 {
+            self.remote_batch_limit_bytes_min = byte_limit;
+        } else {
+            self.remote_batch_limit_bytes_min = self.remote_batch_limit_bytes_min.min(byte_limit);
+        }
+        if byte_limit < RELAY_REMOTE_READ_BURST_MAX_BYTES {
+            self.remote_batch_limited = self.remote_batch_limited.saturating_add(1);
+        }
+    }
+
+    fn note_read_credit(&mut self, credit: RelayReadCredit) {
+        self.read_credit_updates = self.read_credit_updates.saturating_add(1);
+        if credit.paused {
+            self.read_credit_pause_updates = self.read_credit_pause_updates.saturating_add(1);
+            return;
+        }
+        if credit.max_batch_bytes == 0 {
+            return;
+        }
+        if self.read_credit_limit_bytes_min == 0 {
+            self.read_credit_limit_bytes_min = credit.max_batch_bytes;
+        } else {
+            self.read_credit_limit_bytes_min =
+                self.read_credit_limit_bytes_min.min(credit.max_batch_bytes);
+        }
+    }
+
     fn first_remote_read_millis(&self) -> u128 {
         self.first_remote_read_millis.unwrap_or(0)
     }
@@ -798,8 +927,7 @@ impl RelayTaskDiag {
         elapsed: std::time::Duration,
         pressure_threshold: std::time::Duration,
     ) {
-        self.global_rx_wait_max_micros =
-            self.global_rx_wait_max_micros.max(elapsed.as_micros());
+        self.global_rx_wait_max_micros = self.global_rx_wait_max_micros.max(elapsed.as_micros());
         if elapsed >= pressure_threshold {
             self.global_rx_pressure_events += 1;
         }
@@ -821,15 +949,115 @@ impl RelayTaskDiag {
             self.local_write_pressure_events += 1;
         }
     }
+
+    fn note_ack_drain_hint_due(&mut self) {
+        self.ack_drain_hint_due = self.ack_drain_hint_due.saturating_add(1);
+    }
+
+    fn note_ack_drain_hint_sent(&mut self) {
+        self.ack_drain_hint_sent = self.ack_drain_hint_sent.saturating_add(1);
+    }
+
+    fn note_ack_drain_hint_dropped(&mut self) {
+        self.ack_drain_hint_dropped = self.ack_drain_hint_dropped.saturating_add(1);
+    }
+
+    fn note_remote_read_probe_tick(&mut self) {
+        self.remote_read_probe_ticks = self.remote_read_probe_ticks.saturating_add(1);
+    }
 }
 
-fn note_global_rx_channel_occupancy<T>(
-    diag: &mut RelayTaskDiag,
-    tx: &mpsc::Sender<T>,
-) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelayAckDrainHintDue {
+    gap_ms: u128,
+    remote_to_global_rx_bytes: u64,
+}
+
+fn relay_ack_drain_hint_due(
+    diag: &RelayTaskDiag,
+    now: std::time::Instant,
+    last_hint_at: Option<std::time::Instant>,
+) -> Option<RelayAckDrainHintDue> {
+    if diag.remote_reads == 0
+        || diag.remote_to_global_rx_bytes < RELAY_ACK_DRAIN_HINT_MIN_DATA_BYTES
+    {
+        return None;
+    }
+    let gap_ms = diag.current_remote_read_gap_millis_at(now);
+    if gap_ms < RELAY_ACK_DRAIN_HINT_GAP_MS {
+        return None;
+    }
+    if let Some(last) = last_hint_at
+        && now.saturating_duration_since(last)
+            < std::time::Duration::from_millis(RELAY_ACK_DRAIN_HINT_INTERVAL_MS)
+    {
+        return None;
+    }
+
+    Some(RelayAckDrainHintDue {
+        gap_ms,
+        remote_to_global_rx_bytes: diag.remote_to_global_rx_bytes,
+    })
+}
+
+fn should_poll_relay_ack_drain_hint(diag: &RelayTaskDiag, writer_done: bool) -> bool {
+    !writer_done
+        && diag.remote_reads > 0
+        && diag.remote_to_global_rx_bytes >= RELAY_ACK_DRAIN_HINT_MIN_DATA_BYTES
+}
+
+fn should_poll_relay_remote_read_probe(diag: &RelayTaskDiag, read_credit: RelayReadCredit) -> bool {
+    !read_credit.paused
+        && read_credit.max_batch_bytes > 0
+        && diag.remote_reads > 0
+        && diag.remote_to_global_rx_bytes > 0
+        && diag.remote_batch_bytes_max >= RELAY_REMOTE_READ_PROBE_MIN_BATCH_BYTES
+}
+
+fn note_global_rx_channel_occupancy<T>(diag: &mut RelayTaskDiag, tx: &mpsc::Sender<T>) {
     let max_capacity = tx.max_capacity();
     let used = max_capacity.saturating_sub(tx.capacity());
     diag.note_global_rx_queue(used, max_capacity);
+}
+
+fn relay_remote_ready_batch_byte_limit_for_queue(used: usize, max_capacity: usize) -> usize {
+    if max_capacity == 0 {
+        return RELAY_REMOTE_READ_BURST_MAX_BYTES;
+    }
+
+    let used = used.min(max_capacity);
+    let low_water = max_capacity / 4;
+    let high_water = max_capacity.saturating_mul(3) / 4;
+    if used <= low_water {
+        return RELAY_REMOTE_READ_BURST_MAX_BYTES;
+    }
+    if used >= high_water {
+        return RELAY_REMOTE_READ_MIN_BATCH_BYTES;
+    }
+    let span = high_water.saturating_sub(low_water);
+    if span == 0 {
+        return RELAY_REMOTE_READ_MIN_BATCH_BYTES;
+    }
+
+    let remaining = high_water.saturating_sub(used);
+    let elastic = RELAY_REMOTE_READ_BURST_MAX_BYTES - RELAY_REMOTE_READ_MIN_BATCH_BYTES;
+    RELAY_REMOTE_READ_MIN_BATCH_BYTES + (elastic.saturating_mul(remaining) / span)
+}
+
+fn relay_remote_ready_batch_byte_limit<T>(tx: &mpsc::Sender<T>) -> usize {
+    let max_capacity = tx.max_capacity();
+    let used = max_capacity.saturating_sub(tx.capacity());
+    relay_remote_ready_batch_byte_limit_for_queue(used, max_capacity)
+}
+
+fn relay_remote_read_pressure_floor_bytes(tun_mtu: usize) -> usize {
+    tun_mtu
+        .max(MIN_TUN_MTU)
+        .saturating_mul(RELAY_REMOTE_READ_PRESSURE_MIN_PACKETS)
+        .clamp(
+            RELAY_REMOTE_READ_PRESSURE_MIN_BYTES_FLOOR,
+            RELAY_REMOTE_READ_MIN_BATCH_BYTES,
+        )
 }
 
 fn format_relay_live_diag(
@@ -860,9 +1088,11 @@ fn format_relay_live_diag_at(
     format!(
         "🔎 tcp-relay-live handle={handle:?} epoch={epoch} writer_done={writer_done} \
          read_only_after_local_finish={read_only_after_local_finish} \
-         uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} \
+         uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} remote_read_probe_ticks={} \
+         remote_batches={} remote_batch_bytes_max={} remote_batch_chunks_max={} remote_batch_limit_bytes_min={} remote_batch_limited={} read_credit_updates={} read_credit_pause_updates={} read_credit_limit_bytes_min={} \
          remote_after_local_finish_bytes={} remote_after_local_finish_reads={} \
          first_remote_read_ms={} max_remote_read_gap_ms={} current_remote_read_gap_ms={} \
+         ack_drain_hint_due={} ack_drain_hint_sent={} ack_drain_hint_dropped={} \
          global_rx_wait_max_us={} global_rx_pressure_events={} \
          global_rx_queue_used_max={} global_rx_queue_capacity={} \
          local_write_wait_max_us={} local_write_pressure_events={}",
@@ -870,11 +1100,23 @@ fn format_relay_live_diag_at(
         diag.local_writes,
         diag.remote_to_global_rx_bytes,
         diag.remote_reads,
+        diag.remote_read_probe_ticks,
+        diag.remote_batches,
+        diag.remote_batch_bytes_max,
+        diag.remote_batch_chunks_max,
+        diag.remote_batch_limit_bytes_min,
+        diag.remote_batch_limited,
+        diag.read_credit_updates,
+        diag.read_credit_pause_updates,
+        diag.read_credit_limit_bytes_min,
         diag.remote_after_local_finish_bytes,
         diag.remote_after_local_finish_reads,
         diag.first_remote_read_millis(),
         diag.max_remote_read_gap_millis,
         diag.current_remote_read_gap_millis_at(now),
+        diag.ack_drain_hint_due,
+        diag.ack_drain_hint_sent,
+        diag.ack_drain_hint_dropped,
         diag.global_rx_wait_max_micros,
         diag.global_rx_pressure_events,
         diag.global_rx_queue_used_max,
@@ -891,7 +1133,7 @@ fn format_relay_close_diag(
     diag: &RelayTaskDiag,
 ) -> String {
     format!(
-        "🔎 tcp-relay-close handle={:?} direction={} reason={} uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} remote_after_local_finish_bytes={} remote_after_local_finish_reads={} first_remote_read_ms={} max_remote_read_gap_ms={} current_remote_read_gap_ms={} global_rx_wait_max_us={} global_rx_pressure_events={} global_rx_queue_used_max={} global_rx_queue_capacity={} local_write_wait_max_us={} local_write_pressure_events={}",
+        "🔎 tcp-relay-close handle={:?} direction={} reason={} uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} remote_read_probe_ticks={} remote_batches={} remote_batch_bytes_max={} remote_batch_chunks_max={} remote_batch_limit_bytes_min={} remote_batch_limited={} read_credit_updates={} read_credit_pause_updates={} read_credit_limit_bytes_min={} remote_after_local_finish_bytes={} remote_after_local_finish_reads={} first_remote_read_ms={} max_remote_read_gap_ms={} current_remote_read_gap_ms={} ack_drain_hint_due={} ack_drain_hint_sent={} ack_drain_hint_dropped={} global_rx_wait_max_us={} global_rx_pressure_events={} global_rx_queue_used_max={} global_rx_queue_capacity={} local_write_wait_max_us={} local_write_pressure_events={}",
         handle,
         close_direction,
         close_reason,
@@ -899,11 +1141,23 @@ fn format_relay_close_diag(
         diag.local_writes,
         diag.remote_to_global_rx_bytes,
         diag.remote_reads,
+        diag.remote_read_probe_ticks,
+        diag.remote_batches,
+        diag.remote_batch_bytes_max,
+        diag.remote_batch_chunks_max,
+        diag.remote_batch_limit_bytes_min,
+        diag.remote_batch_limited,
+        diag.read_credit_updates,
+        diag.read_credit_pause_updates,
+        diag.read_credit_limit_bytes_min,
         diag.remote_after_local_finish_bytes,
         diag.remote_after_local_finish_reads,
         diag.first_remote_read_millis(),
         diag.max_remote_read_gap_millis,
         diag.current_remote_read_gap_millis_at(std::time::Instant::now()),
+        diag.ack_drain_hint_due,
+        diag.ack_drain_hint_sent,
+        diag.ack_drain_hint_dropped,
         diag.global_rx_wait_max_micros,
         diag.global_rx_pressure_events,
         diag.global_rx_queue_used_max,
@@ -958,7 +1212,9 @@ enum RelayWriterSignal {
         bytes: usize,
         write_wait: std::time::Duration,
     },
-    WriteHalfClosed { reason: &'static str },
+    WriteHalfClosed {
+        reason: &'static str,
+    },
     Closed {
         direction: &'static str,
         reason: &'static str,
@@ -1056,8 +1312,134 @@ struct TcpLifecycleObservation {
 /// the socket state machine instead of relying on smoltcp to notice the local side later.
 #[derive(Debug)]
 enum RelayEvent {
-    Data { epoch: u64, bytes: Vec<u8> },
+    Data {
+        epoch: u64,
+        bytes: Vec<u8>,
+    },
+    AckDrainHint {
+        epoch: u64,
+        gap_ms: u128,
+        remote_to_global_rx_bytes: u64,
+    },
     Closed(RelayClose),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelayReadCredit {
+    paused: bool,
+    max_batch_bytes: usize,
+}
+
+impl Default for RelayReadCredit {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            max_batch_bytes: RELAY_REMOTE_READ_BURST_MAX_BYTES,
+        }
+    }
+}
+
+fn relay_read_credit_for_local_pressure(
+    local_pressure_bytes: usize,
+    pending_bytes: usize,
+    egress_recovery_active: bool,
+    hard_pause_active: bool,
+    cfg: DownlinkBackpressureConfig,
+    tun_mtu: usize,
+) -> RelayReadCredit {
+    let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+    if hard_pause_active || pending_bytes >= downlink_receive_window_high(cfg) {
+        return RelayReadCredit {
+            paused: true,
+            max_batch_bytes: 0,
+        };
+    }
+
+    if egress_recovery_active
+        || pending_bytes > 0
+        || local_pressure_bytes >= tx_queue_flush_threshold(cfg)
+    {
+        return RelayReadCredit {
+            paused: false,
+            max_batch_bytes: pressure_floor,
+        };
+    }
+
+    let full_credit_edge = cfg.high_bytes;
+    if local_pressure_bytes <= full_credit_edge {
+        return RelayReadCredit::default();
+    }
+
+    let taper_edge = tx_queue_flush_threshold(cfg);
+    let span = taper_edge.saturating_sub(full_credit_edge);
+    if span == 0 {
+        return RelayReadCredit {
+            paused: false,
+            max_batch_bytes: pressure_floor,
+        };
+    }
+    let headroom = taper_edge.saturating_sub(local_pressure_bytes);
+    let elastic = RELAY_REMOTE_READ_BURST_MAX_BYTES.saturating_sub(pressure_floor);
+    RelayReadCredit {
+        paused: false,
+        max_batch_bytes: pressure_floor + elastic.saturating_mul(headroom).saturating_div(span),
+    }
+}
+
+fn relay_read_credit_for_local_egress(
+    send_queue_bytes: usize,
+    pending_bytes: usize,
+    egress_recovery_active: bool,
+    hard_pause_active: bool,
+    cfg: DownlinkBackpressureConfig,
+    tun_mtu: usize,
+) -> RelayReadCredit {
+    relay_read_credit_for_local_pressure(
+        send_queue_bytes.saturating_add(pending_bytes),
+        pending_bytes,
+        egress_recovery_active,
+        hard_pause_active,
+        cfg,
+        tun_mtu,
+    )
+}
+
+fn relay_read_credit_for_projected_local_egress(
+    send_queue_bytes: usize,
+    pending_bytes: usize,
+    incoming_bytes: usize,
+    egress_recovery_active: bool,
+    hard_pause_active: bool,
+    cfg: DownlinkBackpressureConfig,
+    tun_mtu: usize,
+) -> RelayReadCredit {
+    relay_read_credit_for_local_pressure(
+        send_queue_bytes
+            .saturating_add(pending_bytes)
+            .saturating_add(incoming_bytes),
+        pending_bytes,
+        egress_recovery_active,
+        hard_pause_active,
+        cfg,
+        tun_mtu,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DownlinkCreditController {
+    read_credit_ceiling_bytes: usize,
+    headroom_debt_bytes: usize,
+    no_egress_progress_streak: u8,
+}
+
+impl Default for DownlinkCreditController {
+    fn default() -> Self {
+        Self {
+            read_credit_ceiling_bytes: DOWNLINK_CREDIT_INITIAL_BATCH_BYTES,
+            headroom_debt_bytes: 0,
+            no_egress_progress_streak: 0,
+        }
+    }
 }
 
 /// Per-handle runtime context owned by a single listener slot.
@@ -1070,8 +1452,12 @@ struct SocketCtx {
     state: SocketState,
     /// Sender used to push local payloads into the remote relay task for this slot only.
     uplink_tx: Option<mpsc::Sender<RelayCommand>>,
+    /// Sender used to feed local egress pressure back to the relay read half.
+    relay_read_credit_tx: Option<watch::Sender<RelayReadCredit>>,
     /// Whether this flow has already propagated the local TCP finish into the relay write half.
     local_fin_sent: bool,
+    /// Whether remote EOF has been propagated to the intercepted local TCP peer with a FIN.
+    local_eof_sent: bool,
     /// Monotonic event-loop seconds when local finish became pending but was deferred for reverse traffic.
     local_fin_pending_since_secs: Option<u64>,
     /// Latest remote-to-local progress while a local finish is pending.
@@ -1111,6 +1497,8 @@ struct SocketCtx {
     downlink_diag: TcpDownlinkDiag,
     /// Knife14cb：observed local egress progress grants bounded extra downlink accept credit.
     downlink_egress_clock: DownlinkEgressClock,
+    /// Knife14eo：per-flow controller coupling relay read credit, flush budget, and headroom debt.
+    downlink_credit_controller: DownlinkCreditController,
     /// Last observed TCP socket lifecycle snapshot for transition diagnostics.
     last_tcp_lifecycle: Option<TcpLifecycleObservation>,
     /// Latest event-loop second when live reverse TCP window diagnostics were logged.
@@ -1126,7 +1514,9 @@ impl SocketCtx {
             local_port,
             state: SocketState::Listening,
             uplink_tx: None,
+            relay_read_credit_tx: None,
             local_fin_sent: false,
+            local_eof_sent: false,
             local_fin_pending_since_secs: None,
             local_fin_last_remote_progress_secs: None,
             downlink_pending: Vec::new(),
@@ -1143,6 +1533,7 @@ impl SocketCtx {
             uplink_buffer: Vec::new(),
             downlink_diag: TcpDownlinkDiag::default(),
             downlink_egress_clock: DownlinkEgressClock::default(),
+            downlink_credit_controller: DownlinkCreditController::default(),
             last_tcp_lifecycle: None,
             reverse_window_last_log_secs: None,
         }
@@ -1197,6 +1588,124 @@ struct DownlinkFlushLimit {
     pressure_credit_blocked_bytes: usize,
     hard_edge_guard_bytes: usize,
     hard_edge_guard_deferred_bytes: usize,
+}
+
+fn downlink_pressure_staging_limit(cfg: DownlinkBackpressureConfig, tun_mtu: usize) -> usize {
+    let floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+    floor
+        .saturating_mul(2)
+        .max(cfg.low_bytes)
+        .min(downlink_receive_window_high(cfg))
+}
+
+impl DownlinkCreditController {
+    fn note_flush_feedback(
+        &mut self,
+        limit: DownlinkFlushLimit,
+        cfg: DownlinkBackpressureConfig,
+        tun_mtu: usize,
+    ) {
+        let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        let observed_progress = limit
+            .drain_credit_granted_bytes
+            .saturating_add(limit.drop_credit_debt_paid_bytes)
+            .saturating_add(limit.pressure_credit_debt_paid_bytes);
+        if observed_progress > 0 {
+            self.no_egress_progress_streak = 0;
+            self.headroom_debt_bytes = self.headroom_debt_bytes.saturating_sub(observed_progress);
+            let grown = observed_progress
+                .saturating_mul(DOWNLINK_CREDIT_PROGRESS_GAIN)
+                .max(pressure_floor);
+            self.read_credit_ceiling_bytes = self
+                .read_credit_ceiling_bytes
+                .saturating_add(grown)
+                .min(RELAY_REMOTE_READ_BURST_MAX_BYTES)
+                .max(pressure_floor);
+        }
+
+        let deferred = limit
+            .headroom_deferred_bytes
+            .saturating_add(limit.hard_edge_guard_deferred_bytes)
+            .saturating_add(limit.drop_credit_blocked_bytes)
+            .saturating_add(limit.pressure_credit_blocked_bytes);
+        if deferred == 0 {
+            return;
+        }
+
+        self.headroom_debt_bytes = self
+            .headroom_debt_bytes
+            .saturating_add(deferred)
+            .min(downlink_receive_window_high(cfg));
+        if observed_progress == 0 {
+            self.no_egress_progress_streak = self
+                .no_egress_progress_streak
+                .saturating_add(1)
+                .min(DOWNLINK_CREDIT_MAX_NO_PROGRESS_STREAK);
+        }
+        self.read_credit_ceiling_bytes = self
+            .read_credit_ceiling_bytes
+            .saturating_div(2)
+            .max(pressure_floor);
+    }
+
+    fn flush_budget(
+        self,
+        configured_budget: usize,
+        _cfg: DownlinkBackpressureConfig,
+        tun_mtu: usize,
+    ) -> usize {
+        let configured_budget = configured_budget.max(1);
+        if self.headroom_debt_bytes == 0 && self.no_egress_progress_streak == 0 {
+            return configured_budget;
+        }
+        configured_budget.min(
+            self.read_credit_ceiling_bytes
+                .max(relay_remote_read_pressure_floor_bytes(tun_mtu)),
+        )
+    }
+
+    fn read_credit_for(
+        self,
+        base: RelayReadCredit,
+        pending_bytes: usize,
+        cfg: DownlinkBackpressureConfig,
+        tun_mtu: usize,
+    ) -> RelayReadCredit {
+        if base.paused {
+            return base;
+        }
+
+        let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        let staging_constrained =
+            self.headroom_debt_bytes > 0 || self.no_egress_progress_streak >= 2;
+        let batch_constrained = self.no_egress_progress_streak >= 2;
+        let staging_limit = if staging_constrained {
+            downlink_pressure_staging_limit(cfg, tun_mtu)
+        } else {
+            downlink_receive_window_high(cfg)
+        };
+        if pending_bytes >= staging_limit {
+            return RelayReadCredit {
+                paused: true,
+                max_batch_bytes: 0,
+            };
+        }
+
+        let staging_remaining = staging_limit.saturating_sub(pending_bytes);
+        let progress_ceiling = if batch_constrained {
+            pressure_floor
+        } else {
+            self.read_credit_ceiling_bytes.max(pressure_floor)
+        };
+        let max_batch_bytes = base
+            .max_batch_bytes
+            .min(progress_ceiling)
+            .min(staging_remaining);
+        RelayReadCredit {
+            paused: max_batch_bytes == 0,
+            max_batch_bytes,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1269,6 +1778,23 @@ impl DownlinkEgressCreditDebt {
         added
     }
 
+    fn note_projected_egress_pressure(
+        &mut self,
+        projected_pressure_bytes: usize,
+        cfg: DownlinkBackpressureConfig,
+    ) -> usize {
+        let debt_bytes =
+            downlink_egress_projected_pressure_debt_bytes(projected_pressure_bytes, cfg);
+        if debt_bytes == 0 {
+            return 0;
+        }
+        let added = self.install(EgressCreditDebtSource::Pressure, debt_bytes);
+        if added > 0 {
+            self.pressure_events = self.pressure_events.saturating_add(1);
+        }
+        added
+    }
+
     fn install(&mut self, source: EgressCreditDebtSource, installed: usize) -> usize {
         if installed == 0 {
             return 0;
@@ -1325,7 +1851,10 @@ impl DownlinkEgressClock {
         let mut observation = DownlinkEgressCreditObservation::default();
         if self.drop_debt_generation_seen != drop_debt.generation {
             self.drop_debt_generation_seen = drop_debt.generation;
-            match drop_debt.last_source.unwrap_or(EgressCreditDebtSource::Drop) {
+            match drop_debt
+                .last_source
+                .unwrap_or(EgressCreditDebtSource::Drop)
+            {
                 EgressCreditDebtSource::Drop => {
                     observation.drop_credit_blocked_bytes = self.drain_credit_bytes;
                 }
@@ -1418,6 +1947,29 @@ fn downlink_egress_pressure_debt_bytes(
         .min(span)
 }
 
+fn downlink_projected_local_pressure_bytes(send_queue_bytes: usize, pending_bytes: usize) -> usize {
+    send_queue_bytes.saturating_add(pending_bytes)
+}
+
+fn downlink_egress_projected_pressure_debt_bytes(
+    projected_pressure_bytes: usize,
+    cfg: DownlinkBackpressureConfig,
+) -> usize {
+    let credit_edge = tx_queue_credit_spend_threshold(cfg);
+    if projected_pressure_bytes < credit_edge {
+        return 0;
+    }
+    let span = downlink_egress_credit_span(cfg);
+    if span == 0 {
+        return 0;
+    }
+    tx_queue_credit_guard_bytes(cfg)
+        .max(1)
+        .min(span)
+        .saturating_add(projected_pressure_bytes.saturating_sub(credit_edge))
+        .min(span)
+}
+
 #[cfg(test)]
 fn bounded_downlink_flush_limit_for_window(
     pending_len: usize,
@@ -1493,9 +2045,7 @@ fn bounded_downlink_flush_limit_for_window_with_clock_and_drop(
     let available = unguarded_available.min(guarded_hard_headroom);
     let unguarded_len = socket_len.min(unguarded_available);
     let len = socket_len.min(available);
-    let drain_credit_planned = len
-        .saturating_sub(clean_headroom)
-        .min(usable_credit);
+    let drain_credit_planned = len.saturating_sub(clean_headroom).min(usable_credit);
     DownlinkFlushLimit {
         len,
         headroom_limited: len < socket_len,
@@ -1512,6 +2062,34 @@ fn bounded_downlink_flush_limit_for_window_with_clock_and_drop(
         hard_edge_guard_bytes: hard_edge_guard,
         hard_edge_guard_deferred_bytes: unguarded_len.saturating_sub(len),
     }
+}
+
+fn close_drain_terminal_pending_flush_limit(
+    pending_len: usize,
+    max_bytes_per_flush: usize,
+    send_window: TcpSendWindowSnapshot,
+    cfg: DownlinkBackpressureConfig,
+    mut limit: DownlinkFlushLimit,
+) -> DownlinkFlushLimit {
+    let terminal_pending = pending_len.min(CLOSE_DRAIN_TERMINAL_PENDING_MAX_BYTES);
+    if terminal_pending == 0 {
+        return limit;
+    }
+
+    let budget_len = bounded_downlink_flush_len(terminal_pending, max_bytes_per_flush);
+    let socket_len = budget_len.min(send_window.send_capacity);
+    let close_drain_headroom =
+        tx_queue_credit_spend_threshold(cfg).saturating_sub(send_window.send_queue);
+    let close_drain_len = socket_len.min(close_drain_headroom);
+    if close_drain_len <= limit.len {
+        return limit;
+    }
+
+    limit.len = close_drain_len;
+    limit.headroom_limited = close_drain_len < socket_len;
+    limit.headroom_deferred_bytes = socket_len.saturating_sub(close_drain_len);
+    limit.hard_edge_guard_deferred_bytes = 0;
+    limit
 }
 
 #[cfg(test)]
@@ -1536,6 +2114,7 @@ fn flush_downlink(
     ctx: &mut SocketCtx,
     max_bytes_per_flush: usize,
     downlink_backpressure: DownlinkBackpressureConfig,
+    tun_mtu: usize,
     downlink_egress_drop_debt: &mut DownlinkEgressDropDebt,
 ) -> DownlinkFlushOutcome {
     if ctx.downlink_pending.is_empty() {
@@ -1557,23 +2136,55 @@ fn flush_downlink(
             headroom_limited: false,
         };
     }
-    let flush_limit = bounded_downlink_flush_limit_for_window_with_clock_and_drop(
-        ctx.downlink_pending.len(),
+    let controlled_max_bytes_per_flush = ctx.downlink_credit_controller.flush_budget(
         max_bytes_per_flush,
+        downlink_backpressure,
+        tun_mtu,
+    );
+    let mut flush_limit = bounded_downlink_flush_limit_for_window_with_clock_and_drop(
+        ctx.downlink_pending.len(),
+        controlled_max_bytes_per_flush,
         send_window,
         downlink_backpressure,
         &mut ctx.downlink_egress_clock,
         downlink_egress_drop_debt,
     );
+    if ctx.pending_relay_close.is_some() && !ctx.local_eof_sent {
+        let expanded = close_drain_terminal_pending_flush_limit(
+            ctx.downlink_pending.len(),
+            max_bytes_per_flush,
+            send_window,
+            downlink_backpressure,
+            flush_limit,
+        );
+        if expanded.len > flush_limit.len {
+            tcp_diag_log!(
+                "🔎 tcp-close-drain-flush-credit handle={:?} pending={} send_queue={} len={} clean_high={} credit_high={} pause_high={}",
+                handle,
+                ctx.downlink_pending.len(),
+                send_window.send_queue,
+                expanded.len,
+                tx_queue_flush_threshold(downlink_backpressure),
+                tx_queue_credit_spend_threshold(downlink_backpressure),
+                tx_queue_pause_threshold(downlink_backpressure)
+            );
+            flush_limit = expanded;
+        }
+    }
     ctx.downlink_diag.note_flush_limit(
         ctx.downlink_pending.len(),
-        max_bytes_per_flush,
+        controlled_max_bytes_per_flush,
         flush_limit,
     );
+    ctx.downlink_credit_controller.note_flush_feedback(
+        flush_limit,
+        downlink_backpressure,
+        tun_mtu,
+    );
     if flush_limit.len == 0 {
-        let used = ctx
-            .downlink_egress_clock
-            .note_flush_result(send_window.send_queue, 0, flush_limit);
+        let used =
+            ctx.downlink_egress_clock
+                .note_flush_result(send_window.send_queue, 0, flush_limit);
         ctx.downlink_diag.note_drain_credit_used(used);
         return DownlinkFlushOutcome {
             accepted_bytes: 0,
@@ -1583,9 +2194,9 @@ fn flush_downlink(
     let flush_len = flush_limit.len;
     match tcp_socket.send_slice(&ctx.downlink_pending[..flush_len]) {
         Ok(0) => {
-            let used = ctx
-                .downlink_egress_clock
-                .note_flush_result(send_window.send_queue, 0, flush_limit);
+            let used =
+                ctx.downlink_egress_clock
+                    .note_flush_result(send_window.send_queue, 0, flush_limit);
             ctx.downlink_diag.note_drain_credit_used(used);
             ctx.downlink_diag
                 .note_send_slice_ok(0, ctx.downlink_pending.len());
@@ -1595,9 +2206,9 @@ fn flush_downlink(
             }
         }
         Ok(n) => {
-            let used = ctx
-                .downlink_egress_clock
-                .note_flush_result(send_window.send_queue, n, flush_limit);
+            let used =
+                ctx.downlink_egress_clock
+                    .note_flush_result(send_window.send_queue, n, flush_limit);
             ctx.downlink_diag.note_drain_credit_used(used);
             ctx.downlink_pending.drain(..n);
             ctx.downlink_diag
@@ -1608,9 +2219,9 @@ fn flush_downlink(
             }
         }
         Err(_) => {
-            let used = ctx
-                .downlink_egress_clock
-                .note_flush_result(send_window.send_queue, 0, flush_limit);
+            let used =
+                ctx.downlink_egress_clock
+                    .note_flush_result(send_window.send_queue, 0, flush_limit);
             ctx.downlink_diag.note_drain_credit_used(used);
             tcp_diag_log!(
                 "🔎 tcp-send-slice-error handle={:?} pending={} state={:?} → clear",
@@ -1669,11 +2280,7 @@ fn note_local_finish_remote_progress(ctx: &mut SocketCtx, now_secs: u64) {
     }
 }
 
-fn note_deferred_close_drain_progress(
-    ctx: &mut SocketCtx,
-    now_secs: u64,
-    accepted_bytes: usize,
-) {
+fn note_deferred_close_drain_progress(ctx: &mut SocketCtx, now_secs: u64, accepted_bytes: usize) {
     if ctx.pending_relay_close.is_none() {
         return;
     }
@@ -1903,6 +2510,44 @@ impl Default for DownlinkBackpressureConfig {
     }
 }
 
+fn tun_egress_capacity_bytes(tun_mtu: usize, tun_tx_queue_len: usize) -> usize {
+    tun_mtu.max(1).saturating_mul(tun_tx_queue_len.max(1))
+}
+
+fn tun_egress_safe_flush_threshold(tun_mtu: usize, tun_tx_queue_len: usize) -> usize {
+    tun_egress_capacity_bytes(tun_mtu, tun_tx_queue_len)
+        .saturating_mul(TUN_EGRESS_SAFE_FLUSH_NUMERATOR)
+        / TUN_EGRESS_SAFE_FLUSH_DENOMINATOR
+}
+
+fn low_watermark_for_high(high_bytes: usize) -> usize {
+    (high_bytes / DEFAULT_DOWNLINK_BACKPRESSURE_LOW_RATIO)
+        .max(1)
+        .min(high_bytes.saturating_sub(1).max(1))
+}
+
+fn default_downlink_backpressure_for_tun_egress(
+    tun_mtu: usize,
+    tun_tx_queue_len: usize,
+) -> DownlinkBackpressureConfig {
+    let default = DownlinkBackpressureConfig::default();
+    let safe_flush = tun_egress_safe_flush_threshold(tun_mtu, tun_tx_queue_len);
+    let capacity = tun_egress_capacity_bytes(tun_mtu, tun_tx_queue_len);
+    let high_by_flush = safe_flush.saturating_mul(TX_QUEUE_FLUSH_RATIO_DENOMINATOR)
+        / TX_QUEUE_FLUSH_RATIO_NUMERATOR;
+    let high_by_pause =
+        capacity.saturating_mul(TX_QUEUE_PAUSE_RATIO_DENOMINATOR) / TX_QUEUE_PAUSE_RATIO_NUMERATOR;
+    let high_bytes = default
+        .high_bytes
+        .min(high_by_flush)
+        .min(high_by_pause)
+        .max(2);
+    DownlinkBackpressureConfig {
+        high_bytes,
+        low_bytes: low_watermark_for_high(high_bytes),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TcpSocketBufferConfig {
     rx_bytes: usize,
@@ -2098,6 +2743,128 @@ fn downlink_pressure_stats(
     stats
 }
 
+fn publish_relay_read_credit_for_handle(
+    handle: SocketHandle,
+    sockets: &SocketSet<'_>,
+    socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
+    cfg: DownlinkBackpressureConfig,
+    tun_mtu: usize,
+    egress_recovery_active: bool,
+    hard_pause_active: bool,
+) {
+    let snapshot = {
+        let socket = sockets.get::<TcpSocket>(handle);
+        SocketCloseSnapshot::from_socket(socket)
+    };
+    let Some(ctx) = socket_ctxs.get_mut(&handle) else {
+        return;
+    };
+    let Some(tx) = ctx.relay_read_credit_tx.as_ref() else {
+        return;
+    };
+    let credit = relay_read_credit_for_local_egress(
+        snapshot.send_queue,
+        ctx.downlink_pending.len(),
+        egress_recovery_active,
+        hard_pause_active,
+        cfg,
+        tun_mtu,
+    );
+    let credit =
+        ctx.downlink_credit_controller
+            .read_credit_for(credit, ctx.downlink_pending.len(), cfg, tun_mtu);
+    let changed = *tx.borrow() != credit;
+    if changed {
+        let _ = tx.send(credit);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_projected_relay_read_credit_for_payload(
+    handle: SocketHandle,
+    epoch: u64,
+    incoming_bytes: usize,
+    sockets: &SocketSet<'_>,
+    socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
+    cfg: DownlinkBackpressureConfig,
+    tun_mtu: usize,
+    egress_recovery_active: bool,
+    hard_pause_active: bool,
+) {
+    if incoming_bytes == 0 {
+        return;
+    }
+    let snapshot = {
+        let socket = sockets.get::<TcpSocket>(handle);
+        SocketCloseSnapshot::from_socket(socket)
+    };
+    let Some(ctx) = socket_ctxs.get_mut(&handle) else {
+        return;
+    };
+    if ctx.conn_epoch != epoch
+        || remote_payload_disposition(ctx, snapshot) != RemotePayloadDisposition::Accept
+    {
+        return;
+    }
+    let Some(tx) = ctx.relay_read_credit_tx.as_ref() else {
+        return;
+    };
+    let credit = relay_read_credit_for_projected_local_egress(
+        snapshot.send_queue,
+        ctx.downlink_pending.len(),
+        incoming_bytes,
+        egress_recovery_active,
+        hard_pause_active,
+        cfg,
+        tun_mtu,
+    );
+    let projected_pending = ctx.downlink_pending.len().saturating_add(incoming_bytes);
+    let credit =
+        ctx.downlink_credit_controller
+            .read_credit_for(credit, projected_pending, cfg, tun_mtu);
+    if *tx.borrow() != credit {
+        let _ = tx.send(credit);
+    }
+}
+
+fn publish_relay_read_credit_for_dirty_handles(
+    dirty: &HashSet<SocketHandle>,
+    sockets: &SocketSet<'_>,
+    socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
+    cfg: DownlinkBackpressureConfig,
+    tun_mtu: usize,
+    egress_recovery_active: bool,
+    hard_pause_active: bool,
+) {
+    let handles: Vec<SocketHandle> = dirty.iter().copied().collect();
+    for handle in handles {
+        publish_relay_read_credit_for_handle(
+            handle,
+            sockets,
+            socket_ctxs,
+            cfg,
+            tun_mtu,
+            egress_recovery_active,
+            hard_pause_active,
+        );
+    }
+}
+
+fn has_dirty_close_drain(
+    dirty: &HashSet<SocketHandle>,
+    socket_ctxs: &HashMap<SocketHandle, SocketCtx>,
+    cfg: DownlinkBackpressureConfig,
+) -> bool {
+    dirty.iter().any(|handle| {
+        let Some(ctx) = socket_ctxs.get(handle) else {
+            return false;
+        };
+        ctx.pending_relay_close.is_some()
+            && (!ctx.downlink_pending.is_empty()
+                || ctx.pending_relay_close_last_egress_queue_bytes > cfg.low_bytes)
+    })
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct TcpDownlinkAggregate {
     pending_total: usize,
@@ -2150,8 +2917,9 @@ fn tcp_downlink_aggregate<'a>(
         let pending = ctx.downlink_pending.len();
         aggregate.pending_total = aggregate.pending_total.saturating_add(pending);
         aggregate.pending_max = aggregate.pending_max.max(pending);
-        aggregate.pending_high =
-            aggregate.pending_high.max(ctx.downlink_diag.downlink_pending_high_water);
+        aggregate.pending_high = aggregate
+            .pending_high
+            .max(ctx.downlink_diag.downlink_pending_high_water);
         aggregate.remote_to_global_rx_bytes = aggregate
             .remote_to_global_rx_bytes
             .saturating_add(ctx.downlink_diag.remote_to_global_rx_bytes);
@@ -2464,13 +3232,11 @@ impl TunEgressFeedbackState {
         if !reaches_downlink_pressure_hold_threshold(stats, cfg) {
             return;
         }
-        self.egress_hold_max_pressure =
-            self.egress_hold_max_pressure.max(stats.max_pressure());
+        self.egress_hold_max_pressure = self.egress_hold_max_pressure.max(stats.max_pressure());
         self.egress_hold_total_pressure =
             self.egress_hold_total_pressure.max(stats.total_pressure());
-        self.egress_hold_until = Some(
-            now + std::time::Duration::from_millis(TUN_EGRESS_PRESSURE_HOLD_MS),
-        );
+        self.egress_hold_until =
+            Some(now + std::time::Duration::from_millis(TUN_EGRESS_PRESSURE_HOLD_MS));
     }
 
     fn effective_downlink_pressure_at(
@@ -2679,6 +3445,11 @@ struct TunRxDrainDiag {
     attempts: u64,
     pre_payload_attempts: u64,
     remote_payload_attempts: u64,
+    remote_payload_deferred_attempts: u64,
+    remote_payload_deferred_delayed_attempts: u64,
+    remote_payload_deferred_pressure_attempts: u64,
+    relay_gap_hint_attempts: u64,
+    relay_gap_hint_followup_attempts: u64,
     maintenance_attempts: u64,
     timer_active_flow_attempts: u64,
     other_attempts: u64,
@@ -2701,12 +3472,32 @@ impl TunRxDrainDiag {
             TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD => {
                 self.remote_payload_attempts = self.remote_payload_attempts.saturating_add(1);
             }
+            TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_DEFERRED => {
+                self.remote_payload_deferred_attempts =
+                    self.remote_payload_deferred_attempts.saturating_add(1);
+            }
+            TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_DEFERRED_DELAYED => {
+                self.remote_payload_deferred_delayed_attempts = self
+                    .remote_payload_deferred_delayed_attempts
+                    .saturating_add(1);
+            }
+            TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_DEFERRED_PRESSURE => {
+                self.remote_payload_deferred_pressure_attempts = self
+                    .remote_payload_deferred_pressure_attempts
+                    .saturating_add(1);
+            }
+            TUN_RX_DRAIN_SOURCE_RELAY_GAP_HINT => {
+                self.relay_gap_hint_attempts = self.relay_gap_hint_attempts.saturating_add(1);
+            }
+            TUN_RX_DRAIN_SOURCE_RELAY_GAP_HINT_FOLLOWUP => {
+                self.relay_gap_hint_followup_attempts =
+                    self.relay_gap_hint_followup_attempts.saturating_add(1);
+            }
             TUN_RX_DRAIN_SOURCE_TIMER_PRESSURE => {
                 self.maintenance_attempts = self.maintenance_attempts.saturating_add(1);
             }
             TUN_RX_DRAIN_SOURCE_TIMER_ACTIVE_FLOW => {
-                self.timer_active_flow_attempts =
-                    self.timer_active_flow_attempts.saturating_add(1);
+                self.timer_active_flow_attempts = self.timer_active_flow_attempts.saturating_add(1);
             }
             _ => {
                 self.other_attempts = self.other_attempts.saturating_add(1);
@@ -2744,10 +3535,15 @@ impl TunRxDrainDiag {
 
 fn format_tun_rx_drain_diag(diag: &TunRxDrainDiag) -> String {
     format!(
-        "🔎 tcp-tun-rx-drain attempts={} pre_payload_attempts={} remote_payload_attempts={} maintenance_attempts={} timer_active_flow_attempts={} other_attempts={} packets={} tcp={} dns={} udp={} budget_exhausted={} would_block={} errors={}",
+        "🔎 tcp-tun-rx-drain attempts={} pre_payload_attempts={} remote_payload_attempts={} remote_payload_deferred_attempts={} remote_payload_deferred_delayed_attempts={} remote_payload_deferred_pressure_attempts={} relay_gap_hint_attempts={} relay_gap_hint_followup_attempts={} maintenance_attempts={} timer_active_flow_attempts={} other_attempts={} packets={} tcp={} dns={} udp={} budget_exhausted={} would_block={} errors={}",
         diag.attempts,
         diag.pre_payload_attempts,
         diag.remote_payload_attempts,
+        diag.remote_payload_deferred_attempts,
+        diag.remote_payload_deferred_delayed_attempts,
+        diag.remote_payload_deferred_pressure_attempts,
+        diag.relay_gap_hint_attempts,
+        diag.relay_gap_hint_followup_attempts,
         diag.maintenance_attempts,
         diag.timer_active_flow_attempts,
         diag.other_attempts,
@@ -2761,8 +3557,152 @@ fn format_tun_rx_drain_diag(diag: &TunRxDrainDiag) -> String {
     )
 }
 
-fn should_drain_tun_rx_after_remote_payload(ctx: Option<&SocketCtx>, accepted_bytes: usize) -> bool {
+fn should_drain_tun_rx_after_remote_payload(
+    ctx: Option<&SocketCtx>,
+    accepted_bytes: usize,
+) -> bool {
     accepted_bytes > 0 || ctx.map(|c| !c.downlink_pending.is_empty()).unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredAckDrainMode {
+    ActiveFlow,
+    DelayedAck,
+    Pressure,
+}
+
+impl DeferredAckDrainMode {
+    fn source(self) -> &'static str {
+        match self {
+            Self::ActiveFlow => TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_DEFERRED,
+            Self::DelayedAck => TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_DEFERRED_DELAYED,
+            Self::Pressure => TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_DEFERRED_PRESSURE,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DeferredAckDrainState {
+    armed: Option<DeferredAckDrainMode>,
+}
+
+impl DeferredAckDrainState {
+    fn is_armed(&self) -> bool {
+        self.armed.is_some()
+    }
+
+    fn arm_after_remote_payload(&mut self) -> bool {
+        if self.armed.is_some() {
+            return false;
+        }
+        self.armed = Some(DeferredAckDrainMode::ActiveFlow);
+        true
+    }
+
+    fn arm_after_budget_exhausted(&mut self) -> bool {
+        match self.armed {
+            None => {
+                self.armed = Some(DeferredAckDrainMode::Pressure);
+                true
+            }
+            Some(DeferredAckDrainMode::ActiveFlow | DeferredAckDrainMode::DelayedAck) => {
+                self.armed = Some(DeferredAckDrainMode::Pressure);
+                false
+            }
+            Some(DeferredAckDrainMode::Pressure) => false,
+        }
+    }
+
+    fn arm_after_delayed_ack_probe(&mut self) -> bool {
+        if self.armed.is_some() {
+            return false;
+        }
+        self.armed = Some(DeferredAckDrainMode::DelayedAck);
+        true
+    }
+
+    fn take_due(&mut self) -> Option<DeferredAckDrainMode> {
+        let mode = self.armed?;
+        self.armed = None;
+        Some(mode)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayGapAckDrainFollowup {
+    BudgetExhausted,
+    Probe,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RelayGapAckDrainState {
+    armed: Option<RelayGapAckDrainFollowup>,
+    probe_followups_remaining: u8,
+}
+
+impl RelayGapAckDrainState {
+    fn is_armed(&self) -> bool {
+        self.armed.is_some()
+    }
+
+    fn arm_after_budget_exhausted(&mut self) -> bool {
+        if self.armed.is_some() {
+            return false;
+        }
+        self.armed = Some(RelayGapAckDrainFollowup::BudgetExhausted);
+        self.probe_followups_remaining = 0;
+        true
+    }
+
+    fn arm_after_hint_drain(&mut self, drained: usize, budget: usize) -> bool {
+        if budget == 0 || self.armed.is_some() {
+            return false;
+        }
+        if drained >= budget {
+            return self.arm_after_budget_exhausted();
+        }
+        self.probe_followups_remaining = if drained == 0 {
+            RELAY_GAP_ACK_DRAIN_EMPTY_FOLLOWUPS
+        } else {
+            RELAY_GAP_ACK_DRAIN_PROGRESS_FOLLOWUPS
+        };
+        self.armed = Some(RelayGapAckDrainFollowup::Probe);
+        true
+    }
+
+    fn arm_after_followup_drain(
+        &mut self,
+        mode: RelayGapAckDrainFollowup,
+        drained: usize,
+        budget: usize,
+    ) -> bool {
+        if budget == 0 || self.armed.is_some() {
+            return false;
+        }
+        if drained >= budget {
+            return self.arm_after_budget_exhausted();
+        }
+        match mode {
+            RelayGapAckDrainFollowup::BudgetExhausted => false,
+            RelayGapAckDrainFollowup::Probe => {
+                if drained > 0 {
+                    self.probe_followups_remaining = RELAY_GAP_ACK_DRAIN_PROGRESS_FOLLOWUPS;
+                } else if self.probe_followups_remaining > 0 {
+                    self.probe_followups_remaining -= 1;
+                } else {
+                    return false;
+                }
+                self.armed = Some(RelayGapAckDrainFollowup::Probe);
+                true
+            }
+        }
+    }
+
+    fn take_due(&mut self) -> Option<RelayGapAckDrainFollowup> {
+        let mode = self.armed?;
+        self.armed = None;
+        Some(mode)
+    }
 }
 
 fn pressure_tun_rx_drain_budget(cfg: DownlinkBackpressureConfig, tun_mtu: usize) -> usize {
@@ -2834,14 +3774,113 @@ fn tun_rx_drain_budget_before_remote_payload(
     )
 }
 
+fn active_ack_drain_budget_for_egress_headroom(
+    stats: DownlinkPressureStats,
+    cfg: DownlinkBackpressureConfig,
+    tun_feedback_paused: bool,
+    max_budget: usize,
+) -> usize {
+    if tun_feedback_paused || max_budget == 0 {
+        return 0;
+    }
+
+    let pause_edge = tx_queue_pause_threshold(cfg);
+    if stats.max_tx_queue >= pause_edge {
+        return 0;
+    }
+
+    let credit_edge = tx_queue_credit_spend_threshold(cfg);
+    if stats.max_tx_queue >= credit_edge {
+        return max_budget.min(1);
+    }
+
+    let full_budget_edge = tx_queue_flush_threshold(cfg);
+    if stats.max_tx_queue <= full_budget_edge {
+        return max_budget;
+    }
+
+    let span = credit_edge.saturating_sub(full_budget_edge);
+    if span == 0 {
+        return max_budget.min(1);
+    }
+    let headroom = credit_edge.saturating_sub(stats.max_tx_queue);
+    1 + max_budget
+        .saturating_sub(1)
+        .saturating_mul(headroom)
+        .saturating_div(span)
+}
+
+fn tun_rx_drain_budget_for_deferred_ack_drain(
+    mode: DeferredAckDrainMode,
+    stats: DownlinkPressureStats,
+    tun_feedback_paused: bool,
+    configured_budget: usize,
+    cfg: DownlinkBackpressureConfig,
+    tun_mtu: usize,
+) -> usize {
+    let max_budget = if configured_budget > 0 {
+        configured_budget
+    } else {
+        match mode {
+            DeferredAckDrainMode::ActiveFlow | DeferredAckDrainMode::DelayedAck => {
+                active_flow_tun_rx_drain_budget(cfg, tun_mtu)
+            }
+            DeferredAckDrainMode::Pressure => pressure_tun_rx_drain_budget(cfg, tun_mtu),
+        }
+    };
+    active_ack_drain_budget_for_egress_headroom(stats, cfg, tun_feedback_paused, max_budget)
+}
+
+fn tun_rx_drain_budget_for_relay_gap_hint(
+    ctx: Option<&SocketCtx>,
+    epoch: u64,
+    stats: DownlinkPressureStats,
+    tun_feedback_paused: bool,
+    configured_budget: usize,
+    cfg: DownlinkBackpressureConfig,
+    tun_mtu: usize,
+) -> usize {
+    let Some(ctx) = ctx else {
+        return 0;
+    };
+    if ctx.conn_epoch != epoch || !matches!(ctx.state, SocketState::Relaying | SocketState::Closing)
+    {
+        return 0;
+    }
+    let max_budget = if configured_budget > 0 {
+        configured_budget
+    } else {
+        pressure_tun_rx_drain_budget(cfg, tun_mtu)
+    };
+    active_ack_drain_budget_for_egress_headroom(stats, cfg, tun_feedback_paused, max_budget)
+}
+
+fn tun_rx_drain_budget_for_relay_gap_followup(
+    stats: DownlinkPressureStats,
+    tun_feedback_paused: bool,
+    configured_budget: usize,
+    cfg: DownlinkBackpressureConfig,
+    tun_mtu: usize,
+) -> usize {
+    let max_budget = if configured_budget > 0 {
+        configured_budget
+    } else {
+        pressure_tun_rx_drain_budget(cfg, tun_mtu)
+    };
+    active_ack_drain_budget_for_egress_headroom(stats, cfg, tun_feedback_paused, max_budget)
+}
+
 fn tun_rx_drain_budget_for_dirty_pressure(
     has_dirty_downlink: bool,
+    has_dirty_close_drain: bool,
     stats: DownlinkPressureStats,
     configured_budget: usize,
     cfg: DownlinkBackpressureConfig,
     tun_mtu: usize,
 ) -> usize {
-    if !has_dirty_downlink || !reaches_downlink_credit_debt_pressure_threshold(stats, cfg) {
+    if !has_dirty_downlink
+        || (!has_dirty_close_drain && !reaches_downlink_credit_debt_pressure_threshold(stats, cfg))
+    {
         return 0;
     }
     if configured_budget > 0 {
@@ -2883,8 +3922,9 @@ impl DownlinkEgressPacer {
     }
 
     fn debit_budget(&mut self, accepted_bytes: usize) {
-        self.remaining_immediate_bytes =
-            self.remaining_immediate_bytes.saturating_sub(accepted_bytes);
+        self.remaining_immediate_bytes = self
+            .remaining_immediate_bytes
+            .saturating_sub(accepted_bytes);
     }
 
     fn allow_headroom_limited_flush(&mut self, accepted_bytes: usize) -> bool {
@@ -3046,21 +4086,28 @@ fn parse_downlink_backpressure_config(
     )
 }
 
-fn default_downlink_backpressure_for_tx_buffer(_tx_bytes: usize) -> DownlinkBackpressureConfig {
-    // Knife14bs showed tx-buffer-sized auto high watermarks can create stop/go
-    // reverse throughput.
-    DownlinkBackpressureConfig::default()
+fn default_downlink_backpressure_for_tx_buffer(
+    _tx_bytes: usize,
+    tun_mtu: usize,
+    tun_tx_queue_len: usize,
+) -> DownlinkBackpressureConfig {
+    // Knife14bs rejected tx-buffer-sized auto high watermarks. Knife14ed then
+    // showed the fixed 512 KiB default can overrun a 1200-byte MTU TUN qdisc,
+    // so the runtime default is now capped by estimated local egress capacity.
+    default_downlink_backpressure_for_tun_egress(tun_mtu, tun_tx_queue_len)
 }
 
 fn parse_downlink_backpressure_config_for_tx_buffer(
     high: Option<&str>,
     low: Option<&str>,
     tx_bytes: usize,
+    tun_mtu: usize,
+    tun_tx_queue_len: usize,
 ) -> DownlinkBackpressureConfig {
     parse_downlink_backpressure_config_with_default(
         high,
         low,
-        default_downlink_backpressure_for_tx_buffer(tx_bytes),
+        default_downlink_backpressure_for_tx_buffer(tx_bytes, tun_mtu, tun_tx_queue_len),
     )
 }
 
@@ -3099,16 +4146,11 @@ fn parse_downlink_egress_immediate_bytes(s: Option<&str>) -> usize {
 
 fn parse_tcp_socket_buffer_bytes(s: Option<&str>, default: usize) -> usize {
     s.and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| {
-            (MIN_TCP_SOCKET_BUFFER_BYTES..=MAX_TCP_SOCKET_BUFFER_BYTES).contains(value)
-        })
+        .filter(|value| (MIN_TCP_SOCKET_BUFFER_BYTES..=MAX_TCP_SOCKET_BUFFER_BYTES).contains(value))
         .unwrap_or(default)
 }
 
-fn parse_tcp_socket_buffer_config(
-    rx: Option<&str>,
-    tx: Option<&str>,
-) -> TcpSocketBufferConfig {
+fn parse_tcp_socket_buffer_config(rx: Option<&str>, tx: Option<&str>) -> TcpSocketBufferConfig {
     let default = TcpSocketBufferConfig::default();
     TcpSocketBufferConfig {
         rx_bytes: parse_tcp_socket_buffer_bytes(rx, default.rx_bytes),
@@ -3125,6 +4167,10 @@ pub struct TunRuntimeConfig {
     /// 刀14c：本进程创建 TUN 时使用的 IP MTU，同时喂给 smoltcp DeviceCapabilities。
     /// 默认保持 1500；真实 14c US-client 测试由脚本显式设 `MINI_VPN_TUN_MTU=1200`。
     pub tun_mtu: usize,
+    /// Estimated Linux TUN qdisc length used to derive safe default downlink
+    /// egress watermarks. It is an estimate because the actual interface is
+    /// created after config parsing; operators can override it for harnesses.
+    tun_tx_queue_len: usize,
     /// 刀11：数据面可观测性 `📊` 快照周期（秒）。默认 [`METRICS_SNAPSHOT_SECS`]（30）；
     /// env `MINI_VPN_METRICS_SECS` 可调（acceptance 设小值如 5 秒级看指标；0/非法回落默认，**绝不为 0**
     /// 否则 `tokio::time::interval` panic）。仅 `from_env` 读 env，`from_sources`（harness/测试）恒用默认。
@@ -3148,9 +4194,13 @@ impl TunRuntimeConfig {
         Ok(Self {
             listener: TunListenerConfig::from_sources(pool_size)?,
             tun_mtu: DEFAULT_TUN_MTU,
+            tun_tx_queue_len: DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE,
             metrics_secs: METRICS_SNAPSHOT_SECS,
             profile_loop: false,
-            downlink_backpressure: DownlinkBackpressureConfig::default(),
+            downlink_backpressure: default_downlink_backpressure_for_tun_egress(
+                DEFAULT_TUN_MTU,
+                DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE,
+            ),
             downlink_flush_max_bytes: DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
             downlink_egress_immediate_bytes: DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES,
             tcp_socket_buffers: TcpSocketBufferConfig::default(),
@@ -3173,14 +4223,16 @@ impl TunRuntimeConfig {
     fn from_env() -> Result<Self, ClientError> {
         let mut cfg = Self::from_sources(std::env::var("MINI_VPN_TUN_POOL_SIZE").ok().as_deref())?;
         cfg.tun_mtu = parse_tun_mtu(std::env::var("MINI_VPN_TUN_MTU").ok().as_deref());
-        cfg.metrics_secs = parse_metrics_secs(std::env::var("MINI_VPN_METRICS_SECS").ok().as_deref());
-        cfg.profile_loop = parse_profile_loop(std::env::var("MINI_VPN_PROFILE_LOOP").ok().as_deref());
+        cfg.tun_tx_queue_len =
+            parse_tun_tx_queue_len(std::env::var("MINI_VPN_TUN_TX_QUEUE_LEN").ok().as_deref());
+        cfg.metrics_secs =
+            parse_metrics_secs(std::env::var("MINI_VPN_METRICS_SECS").ok().as_deref());
+        cfg.profile_loop =
+            parse_profile_loop(std::env::var("MINI_VPN_PROFILE_LOOP").ok().as_deref());
         let tcp_rx_buffer = std::env::var("MINI_VPN_TCP_RX_BUFFER_BYTES").ok();
         let tcp_tx_buffer = std::env::var("MINI_VPN_TCP_TX_BUFFER_BYTES").ok();
-        cfg.tcp_socket_buffers = parse_tcp_socket_buffer_config(
-            tcp_rx_buffer.as_deref(),
-            tcp_tx_buffer.as_deref(),
-        );
+        cfg.tcp_socket_buffers =
+            parse_tcp_socket_buffer_config(tcp_rx_buffer.as_deref(), tcp_tx_buffer.as_deref());
         let downlink_backpressure_high =
             std::env::var("MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES").ok();
         let downlink_backpressure_low =
@@ -3189,6 +4241,8 @@ impl TunRuntimeConfig {
             downlink_backpressure_high.as_deref(),
             downlink_backpressure_low.as_deref(),
             cfg.tcp_socket_buffers.tx_bytes,
+            cfg.tun_mtu,
+            cfg.tun_tx_queue_len,
         );
         cfg.downlink_flush_max_bytes = parse_downlink_flush_max_bytes(
             std::env::var("MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES")
@@ -3232,6 +4286,12 @@ fn parse_tun_mtu(s: Option<&str>) -> usize {
     s.and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| (MIN_TUN_MTU..=MAX_TUN_MTU).contains(&n))
         .unwrap_or(DEFAULT_TUN_MTU)
+}
+
+fn parse_tun_tx_queue_len(s: Option<&str>) -> usize {
+    s.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| (1..=MAX_TUN_TX_QUEUE_LEN_ESTIMATE).contains(&n))
+        .unwrap_or(DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE)
 }
 
 /// Knife14bh：`0` 明确关闭 opportunistic drain；非法/越界回落默认，避免误把热路径扫成无界循环。
@@ -3308,8 +4368,8 @@ pub async fn start_tun_proxy() {
         }
     };
     println!(
-        "🚀 TUN runtime started with pool_size={}, tun_mtu={}",
-        runtime_config.listener.pool_size, runtime_config.tun_mtu
+        "🚀 TUN runtime started with pool_size={}, tun_mtu={}, tun_tx_queue_len_estimate={}",
+        runtime_config.listener.pool_size, runtime_config.tun_mtu, runtime_config.tun_tx_queue_len
     );
     // 刀11：数据面 📊 快照周期（MINI_VPN_METRICS_SECS 可调；acceptance 设 5 即秒级看指标）。
     println!(
@@ -3324,9 +4384,11 @@ pub async fn start_tun_proxy() {
         );
     }
     println!(
-        "🧯 TCP 下行背压: high={}B low={}B（MINI_VPN_DOWNLINK_BACKPRESSURE_* 可调）",
+        "🧯 TCP 下行背压: high={}B low={}B egress_safe_flush={}B egress_capacity={}B（auto 按 MINI_VPN_TUN_MTU/MINI_VPN_TUN_TX_QUEUE_LEN 估算；MINI_VPN_DOWNLINK_BACKPRESSURE_* 可显式覆盖）",
         runtime_config.downlink_backpressure.high_bytes,
-        runtime_config.downlink_backpressure.low_bytes
+        runtime_config.downlink_backpressure.low_bytes,
+        tun_egress_safe_flush_threshold(runtime_config.tun_mtu, runtime_config.tun_tx_queue_len),
+        tun_egress_capacity_bytes(runtime_config.tun_mtu, runtime_config.tun_tx_queue_len)
     );
     println!(
         "🚰 TCP 下行 flush budget: max={}B（MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES 可调）",
@@ -3341,17 +4403,13 @@ pub async fn start_tun_proxy() {
     );
     println!(
         "🧱 TCP socket buffers: rx={}B tx={}B（MINI_VPN_TCP_*_BUFFER_BYTES 可调）",
-        runtime_config.tcp_socket_buffers.rx_bytes,
-        runtime_config.tcp_socket_buffers.tx_bytes
+        runtime_config.tcp_socket_buffers.rx_bytes, runtime_config.tcp_socket_buffers.tx_bytes
     );
-    let adaptive_tun_rx_pressure_budget = pressure_tun_rx_drain_budget(
-        runtime_config.downlink_backpressure,
-        runtime_config.tun_mtu,
-    );
+    let adaptive_tun_rx_pressure_budget =
+        pressure_tun_rx_drain_budget(runtime_config.downlink_backpressure, runtime_config.tun_mtu);
     println!(
         "🧺 TUN RX drain budget: {} packets/pass（0=仅 pressure-adaptive；pressure-adaptive={} packets near tx_queue_credit_high；MINI_VPN_TUN_RX_DRAIN_BUDGET>0 显式覆盖）",
-        runtime_config.tun_rx_drain_budget,
-        adaptive_tun_rx_pressure_budget
+        runtime_config.tun_rx_drain_budget, adaptive_tun_rx_pressure_budget
     );
     println!(
         "🧪 TUN RX active-flow timer drain: {}ms（0=disabled；MINI_VPN_TUN_RX_ACTIVE_FLOW_TIMER_MS>0 仅用于 Knife14cp A/B）",
@@ -3421,7 +4479,9 @@ pub async fn start_tun_proxy() {
             // （REALITY 无 UDP 下行；分离上游/UDP-over-VLESS/failover 留刀9）。
             let upstream = match RealityUpstream::from_env() {
                 Ok(u) => {
-                    println!("✅ 已配置 REALITY 出口（VLESS over REALITY over TCP；TCP-only，UDP no-op）");
+                    println!(
+                        "✅ 已配置 REALITY 出口（VLESS over REALITY over TCP；TCP-only，UDP no-op）"
+                    );
                     Arc::new(u)
                 }
                 Err(e) => {
@@ -3465,11 +4525,15 @@ pub async fn start_tun_proxy() {
             let tuic_downlink_rx = tuic.start_udp();
             let reality = match RealityUpstream::from_env() {
                 Ok(u) => {
-                    println!("✅ 已配置 REALITY 出口（failover 备腿；VLESS over REALITY over TCP）");
+                    println!(
+                        "✅ 已配置 REALITY 出口（failover 备腿；VLESS over REALITY over TCP）"
+                    );
                     Arc::new(u)
                 }
                 Err(e) => {
-                    println!("加载 REALITY 客户端配置失败（failover 需两腿都配齐，启动中止）: {e:?}");
+                    println!(
+                        "加载 REALITY 客户端配置失败（failover 需两腿都配齐，启动中止）: {e:?}"
+                    );
                     return;
                 }
             };
@@ -3543,10 +4607,8 @@ pub async fn run_event_loop<D, U, M>(
 
     // Stage 9: 监听端口不再固定，由 SYN inspector 在 rx 热路径按需注册。
     // 中文要点：启动时 registry 是空的；第一条到任意端口的 SYN 会触发该端口建池。
-    let mut registry = ListenerRegistry::with_socket_buffers(
-        pool_size,
-        runtime_config.tcp_socket_buffers,
-    );
+    let mut registry =
+        ListenerRegistry::with_socket_buffers(pool_size, runtime_config.tcp_socket_buffers);
     let mut socket_ctxs: HashMap<SocketHandle, SocketCtx> = HashMap::new();
 
     // #1 脏集合驱动：只有「本 tick 有活动」的 listener handle 进集合，relay 段仅处理它们，
@@ -3599,8 +4661,9 @@ pub async fn run_event_loop<D, U, M>(
     // 与 TuicUpstream::start_udp 的 UDP-path 📊 行（RTT/cwnd/背压）是两条独立日志、各司其职（见 ADR-0012 §5）。
     let mut metrics_tick =
         tokio::time::interval(std::time::Duration::from_secs(runtime_config.metrics_secs));
-    let mut tun_egress_feedback_tick =
-        tokio::time::interval(std::time::Duration::from_secs(TUN_EGRESS_FEEDBACK_SAMPLE_SECS));
+    let mut tun_egress_feedback_tick = tokio::time::interval(std::time::Duration::from_secs(
+        TUN_EGRESS_FEEDBACK_SAMPLE_SECS,
+    ));
     let mut tcp_loop_flush_tx_calls: u64 = 0;
     let mut tcp_loop_flush_tx_failures: u64 = 0;
     let downlink_backpressure = runtime_config.downlink_backpressure;
@@ -3617,14 +4680,20 @@ pub async fn run_event_loop<D, U, M>(
     let mut tun_egress_drop_sampler = TunEgressDropSampler::new(device.interface_name());
     let mut tun_egress_feedback = TunEgressFeedbackState::default();
     let mut tun_rx_drain_diag = TunRxDrainDiag::default();
+    let deferred_ack_drain_sleep = tokio::time::sleep(std::time::Duration::from_secs(60 * 60));
+    tokio::pin!(deferred_ack_drain_sleep);
+    let mut deferred_ack_drain = DeferredAckDrainState::default();
+    let relay_gap_ack_drain_sleep = tokio::time::sleep(std::time::Duration::from_secs(60 * 60));
+    tokio::pin!(relay_gap_ack_drain_sleep);
+    let mut relay_gap_ack_drain = RelayGapAckDrainState::default();
     let mut downlink_rx_paused = false;
     let mut global_rx_receive_paused = false;
 
     loop {
         let downlink_stats_raw = downlink_pressure_stats(&dirty, &socket_ctxs, &sockets);
         let pressure_now = std::time::Instant::now();
-        let downlink_stats = tun_egress_feedback
-            .effective_downlink_pressure_at(downlink_stats_raw, pressure_now);
+        let downlink_stats =
+            tun_egress_feedback.effective_downlink_pressure_at(downlink_stats_raw, pressure_now);
         tun_egress_feedback.observe_pressure_at(
             downlink_stats_raw,
             downlink_backpressure,
@@ -3639,8 +4708,8 @@ pub async fn run_event_loop<D, U, M>(
             downlink_stats_raw,
             downlink_backpressure,
         ) {
-            let installed_bytes =
-                downlink_egress_drop_debt.note_egress_pressure(downlink_stats_raw, downlink_backpressure);
+            let installed_bytes = downlink_egress_drop_debt
+                .note_egress_pressure(downlink_stats_raw, downlink_backpressure);
             if installed_bytes > 0 {
                 tcp_diag_log!(
                     "{}",
@@ -3700,6 +4769,15 @@ pub async fn run_event_loop<D, U, M>(
         } else {
             downlink_rx_paused || tun_egress_feedback.is_paused()
         };
+        publish_relay_read_credit_for_dirty_handles(
+            &dirty,
+            &sockets,
+            &mut socket_ctxs,
+            downlink_backpressure,
+            runtime_config.tun_mtu,
+            downlink_egress_drop_debt.has_active_debt(),
+            downlink_rx_paused || tun_egress_feedback.is_paused(),
+        );
         tokio::select! {
             // TCP relay 回程：后台车厢把远端回传字节送回主循环 → 注入对应 smoltcp socket。
             //   TUIC 自重连（live_conn），不需要 legacy 的 disconnect/复位分支。
@@ -3745,15 +4823,28 @@ pub async fn run_event_loop<D, U, M>(
                                 &mut metrics,
                                 downlink_flush_max_bytes,
                                 downlink_backpressure,
+                                runtime_config.tun_mtu,
                                 &mut downlink_egress_drop_debt,
-                                &mut tcp_loop_flush_tx_calls,
-                                &mut tcp_loop_flush_tx_failures,
-                                &mut tun_rx_drain_diag,
-                                pre_payload_tun_rx_budget,
-                                TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_PRE,
-                            )
-                            .await;
-                        }
+                            &mut tcp_loop_flush_tx_calls,
+                            &mut tcp_loop_flush_tx_failures,
+                            &mut tun_rx_drain_diag,
+                            pre_payload_tun_rx_budget,
+                            TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_PRE,
+                            downlink_rx_paused || tun_egress_feedback.is_paused(),
+                        )
+                        .await;
+                    }
+                    publish_projected_relay_read_credit_for_payload(
+                        handle,
+                            epoch,
+                            payload.len(),
+                            &sockets,
+                            &mut socket_ctxs,
+                            downlink_backpressure,
+                            runtime_config.tun_mtu,
+                            downlink_egress_drop_debt.has_active_debt(),
+                            downlink_rx_paused || tun_egress_feedback.is_paused(),
+                        );
                         let accepted_bytes = match handle_remote_payload(
                             handle,
                             epoch,
@@ -3768,6 +4859,7 @@ pub async fn run_event_loop<D, U, M>(
                             &mut downlink_egress_pacer,
                             &mut downlink_egress_drop_debt,
                             downlink_backpressure,
+                            runtime_config.tun_mtu,
                         )
                         .await
                         {
@@ -3786,6 +4878,15 @@ pub async fn run_event_loop<D, U, M>(
                         {
                             dirty.insert(handle);
                         }
+                        publish_relay_read_credit_for_handle(
+                            handle,
+                            &sockets,
+                            &mut socket_ctxs,
+                            downlink_backpressure,
+                            runtime_config.tun_mtu,
+                            downlink_egress_drop_debt.has_active_debt(),
+                            downlink_rx_paused || tun_egress_feedback.is_paused(),
+                        );
                         let has_downlink_work = should_drain_tun_rx_after_remote_payload(
                             socket_ctxs.get(&handle),
                             accepted_bytes,
@@ -3826,14 +4927,82 @@ pub async fn run_event_loop<D, U, M>(
                                 &mut metrics,
                                 downlink_flush_max_bytes,
                                 downlink_backpressure,
+                                runtime_config.tun_mtu,
+                                &mut downlink_egress_drop_debt,
+                                &mut tcp_loop_flush_tx_calls,
+                                &mut tcp_loop_flush_tx_failures,
+                            &mut tun_rx_drain_diag,
+                            tun_rx_budget,
+                            TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD,
+                            downlink_rx_paused || tun_egress_feedback.is_paused(),
+                        )
+                        .await;
+                    }
+                        if has_downlink_work && deferred_ack_drain.arm_after_remote_payload() {
+                            deferred_ack_drain_sleep.as_mut().reset(
+                                tokio::time::Instant::now()
+                                    + std::time::Duration::from_millis(DEFERRED_ACK_DRAIN_DELAY_MS),
+                            );
+                        }
+                    }
+                    RelayEvent::AckDrainHint {
+                        epoch,
+                        gap_ms,
+                        remote_to_global_rx_bytes,
+                    } => {
+                        let tun_rx_budget = tun_rx_drain_budget_for_relay_gap_hint(
+                            socket_ctxs.get(&handle),
+                            epoch,
+                            downlink_pressure_stats(&dirty, &socket_ctxs, &sockets),
+                            tun_egress_feedback.is_paused(),
+                            tun_rx_drain_budget,
+                            downlink_backpressure,
+                            runtime_config.tun_mtu,
+                        );
+                        if tun_rx_budget > 0 {
+                            tcp_diag_log!(
+                                "🔎 tcp-relay-ack-drain-hint handle={:?} epoch={} gap_ms={} remote_to_global_rx_bytes={} budget={}",
+                                handle,
+                                epoch,
+                                gap_ms,
+                                remote_to_global_rx_bytes,
+                                tun_rx_budget
+                            );
+                            let drained = drain_ready_tun_rx(
+                                &mut device,
+                                &mut assoc_table,
+                                &mut fake_pool,
+                                &upstream,
+                                udp_clock.elapsed().as_secs(),
+                                &metrics_handle,
+                                &mut registry,
+                                &mut sockets,
+                                &mut socket_ctxs,
+                                &mut iface,
+                                &mut dirty,
+                                &handshake_done_tx,
+                                &global_tx,
+                                &mut metrics,
+                                downlink_flush_max_bytes,
+                                downlink_backpressure,
+                                runtime_config.tun_mtu,
                                 &mut downlink_egress_drop_debt,
                                 &mut tcp_loop_flush_tx_calls,
                                 &mut tcp_loop_flush_tx_failures,
                                 &mut tun_rx_drain_diag,
                                 tun_rx_budget,
-                                TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD,
+                                TUN_RX_DRAIN_SOURCE_RELAY_GAP_HINT,
+                                downlink_rx_paused || tun_egress_feedback.is_paused(),
                             )
                             .await;
+                            if relay_gap_ack_drain.arm_after_hint_drain(drained, tun_rx_budget) {
+                                relay_gap_ack_drain_sleep.as_mut().reset(
+                                    tokio::time::Instant::now()
+                                        + std::time::Duration::from_millis(
+                                            RELAY_GAP_ACK_DRAIN_FOLLOWUP_DELAY_MS,
+                                        ),
+                                );
+                            }
                         }
                     }
                     RelayEvent::Closed(close) => {
@@ -3849,6 +5018,118 @@ pub async fn run_event_loop<D, U, M>(
                             dirty.insert(handle);
                         } else {
                             dirty.remove(&handle);
+                        }
+                    }
+                }
+            }
+            _ = &mut relay_gap_ack_drain_sleep, if relay_gap_ack_drain.is_armed() => {
+                metrics.loop_park_end();
+                if let Some(mode) = relay_gap_ack_drain.take_due() {
+                    let tun_rx_budget = tun_rx_drain_budget_for_relay_gap_followup(
+                        downlink_pressure_stats(&dirty, &socket_ctxs, &sockets),
+                        tun_egress_feedback.is_paused(),
+                        tun_rx_drain_budget,
+                        downlink_backpressure,
+                        runtime_config.tun_mtu,
+                    );
+                    if tun_rx_budget > 0 {
+                        let drained = drain_ready_tun_rx(
+                            &mut device,
+                            &mut assoc_table,
+                            &mut fake_pool,
+                            &upstream,
+                            udp_clock.elapsed().as_secs(),
+                            &metrics_handle,
+                            &mut registry,
+                            &mut sockets,
+                            &mut socket_ctxs,
+                            &mut iface,
+                            &mut dirty,
+                            &handshake_done_tx,
+                            &global_tx,
+                            &mut metrics,
+                            downlink_flush_max_bytes,
+                            downlink_backpressure,
+                            runtime_config.tun_mtu,
+                            &mut downlink_egress_drop_debt,
+                            &mut tcp_loop_flush_tx_calls,
+                            &mut tcp_loop_flush_tx_failures,
+                            &mut tun_rx_drain_diag,
+                            tun_rx_budget,
+                            TUN_RX_DRAIN_SOURCE_RELAY_GAP_HINT_FOLLOWUP,
+                            downlink_rx_paused || tun_egress_feedback.is_paused(),
+                        )
+                        .await;
+                        if relay_gap_ack_drain.arm_after_followup_drain(
+                            mode,
+                            drained,
+                            tun_rx_budget,
+                        ) {
+                            relay_gap_ack_drain_sleep.as_mut().reset(
+                                tokio::time::Instant::now()
+                                    + std::time::Duration::from_millis(
+                                        RELAY_GAP_ACK_DRAIN_FOLLOWUP_DELAY_MS,
+                                    ),
+                            );
+                        }
+                    }
+                }
+            }
+            _ = &mut deferred_ack_drain_sleep, if deferred_ack_drain.is_armed() => {
+                metrics.loop_park_end();
+                if let Some(mode) = deferred_ack_drain.take_due() {
+                    let tun_rx_budget = tun_rx_drain_budget_for_deferred_ack_drain(
+                        mode,
+                        downlink_pressure_stats(&dirty, &socket_ctxs, &sockets),
+                        tun_egress_feedback.is_paused(),
+                        tun_rx_drain_budget,
+                        downlink_backpressure,
+                        runtime_config.tun_mtu,
+                    );
+                    if tun_rx_budget > 0 {
+                        let drained = drain_ready_tun_rx(
+                            &mut device,
+                            &mut assoc_table,
+                            &mut fake_pool,
+                            &upstream,
+                            udp_clock.elapsed().as_secs(),
+                            &metrics_handle,
+                            &mut registry,
+                            &mut sockets,
+                            &mut socket_ctxs,
+                            &mut iface,
+                            &mut dirty,
+                            &handshake_done_tx,
+                            &global_tx,
+                            &mut metrics,
+                            downlink_flush_max_bytes,
+                            downlink_backpressure,
+                            runtime_config.tun_mtu,
+                            &mut downlink_egress_drop_debt,
+                            &mut tcp_loop_flush_tx_calls,
+                            &mut tcp_loop_flush_tx_failures,
+                            &mut tun_rx_drain_diag,
+                            tun_rx_budget,
+                            mode.source(),
+                            downlink_rx_paused || tun_egress_feedback.is_paused(),
+                        )
+                        .await;
+                        if drained >= tun_rx_budget
+                            && deferred_ack_drain.arm_after_budget_exhausted()
+                        {
+                            deferred_ack_drain_sleep.as_mut().reset(
+                                tokio::time::Instant::now()
+                                    + std::time::Duration::from_millis(DEFERRED_ACK_DRAIN_DELAY_MS),
+                            );
+                        } else if matches!(mode, DeferredAckDrainMode::ActiveFlow)
+                            && deferred_ack_drain.arm_after_delayed_ack_probe()
+                        {
+                            deferred_ack_drain_sleep.as_mut().reset(
+                                tokio::time::Instant::now()
+                                    + std::time::Duration::from_millis(
+                                        DEFERRED_ACK_DRAIN_DELAYED_PROBE_MS,
+                                    ),
+                            );
                         }
                     }
                 }
@@ -3875,9 +5156,11 @@ pub async fn run_event_loop<D, U, M>(
                         &mut metrics,
                         downlink_flush_max_bytes,
                         downlink_backpressure,
+                        runtime_config.tun_mtu,
                         &mut downlink_egress_drop_debt,
                         &mut tcp_loop_flush_tx_calls,
                         &mut tcp_loop_flush_tx_failures,
+                        downlink_rx_paused || tun_egress_feedback.is_paused(),
                         "inbound_poll",
                     )
                     .await;
@@ -3935,7 +5218,16 @@ pub async fn run_event_loop<D, U, M>(
                 reassembler.sweep(now, crate::tuic::FRAG_REASSEMBLY_TTL_SECS);
                 // review #1/#2：回收已死/卡住的 TCP listener 槽（本地关闭/开远端失败的 teardown 缺口），
                 // 释放其 fake-IP refcount 并让槽回 Listen 复用，防 refcount 泄漏 + 槽数涨到 Capped。
-                reap_dead_slots(&registry, &mut sockets, &mut socket_ctxs, &mut fake_pool, now);
+                reap_dead_slots(
+                    &registry,
+                    &mut sockets,
+                    &mut socket_ctxs,
+                    &mut fake_pool,
+                    now,
+                    downlink_backpressure,
+                    downlink_egress_drop_debt.has_active_debt()
+                        || tun_egress_feedback.is_paused(),
+                );
             }
             // review #7：低频回收 idle 且 refcount==0 超 TTL 的 fake-IP 映射（长稳防泄漏）。
             _ = fake_ip_sweep.tick() => {
@@ -4049,9 +5341,13 @@ pub async fn run_event_loop<D, U, M>(
                     }
                     None => false,
                 };
+                let dirty_downlink_stats = downlink_pressure_stats(&dirty, &socket_ctxs, &sockets);
+                let dirty_close_drain =
+                    has_dirty_close_drain(&dirty, &socket_ctxs, downlink_backpressure);
                 let maintenance_tun_rx_budget = tun_rx_drain_budget_for_dirty_pressure(
                     !dirty.is_empty(),
-                    downlink_pressure_stats(&dirty, &socket_ctxs, &sockets),
+                    dirty_close_drain,
+                    dirty_downlink_stats,
                     tun_rx_drain_budget,
                     downlink_backpressure,
                     runtime_config.tun_mtu,
@@ -4091,18 +5387,24 @@ pub async fn run_event_loop<D, U, M>(
                         &mut metrics,
                         downlink_flush_max_bytes,
                         downlink_backpressure,
+                        runtime_config.tun_mtu,
                         &mut downlink_egress_drop_debt,
                         &mut tcp_loop_flush_tx_calls,
                         &mut tcp_loop_flush_tx_failures,
                         &mut tun_rx_drain_diag,
                         timer_tun_rx_budget,
                         timer_tun_rx_source,
+                        downlink_rx_paused || tun_egress_feedback.is_paused(),
                     )
                     .await;
                 }
 
                 // #1：timer tick 无新 inbound 包，只续推进脏集合（主要是下行 pending flush +
                 // smoltcp 超时重传释放 tx buffer 后继续写）。不再全量 sweep。
+                let close_egress_guard = tun_egress_feedback.is_paused()
+                    || downlink_egress_drop_debt.has_active_debt();
+                let relay_read_recovery_active = downlink_egress_drop_debt.has_active_debt();
+                let relay_read_hard_pause = downlink_rx_paused || tun_egress_feedback.is_paused();
                 process_dirty_relay(
                     &mut dirty,
                     &mut sockets,
@@ -4116,7 +5418,11 @@ pub async fn run_event_loop<D, U, M>(
                     &mut metrics,
                     downlink_flush_max_bytes,
                     downlink_backpressure,
+                    runtime_config.tun_mtu,
                     &mut downlink_egress_drop_debt,
+                    close_egress_guard,
+                    relay_read_recovery_active,
+                    relay_read_hard_pause,
                 )
                 .await;
             }
@@ -4145,9 +5451,11 @@ async fn process_ready_tun_rx_packet<D, U, M>(
     metrics: &mut M,
     downlink_flush_max_bytes: usize,
     downlink_backpressure: DownlinkBackpressureConfig,
+    tun_mtu: usize,
     downlink_egress_drop_debt: &mut DownlinkEgressDropDebt,
     tcp_loop_flush_tx_calls: &mut u64,
     tcp_loop_flush_tx_failures: &mut u64,
+    relay_read_hard_pause: bool,
     poll_stage: &str,
 ) -> TunRxPacketKind
 where
@@ -4184,12 +5492,9 @@ where
                     e
                 );
             }
-            if let Err(e) = registry.ensure_spare_listeners(
-                port,
-                MIN_SPARE_LISTENERS,
-                sockets,
-                socket_ctxs,
-            ) {
+            if let Err(e) =
+                registry.ensure_spare_listeners(port, MIN_SPARE_LISTENERS, sockets, socket_ctxs)
+            {
                 println!(
                     "⚠️ global listener cap reached, 端口 {port} 无法弹性扩容: {:?}",
                     e
@@ -4216,6 +5521,8 @@ where
     }
     metrics.leave_poll();
 
+    let close_egress_guard = downlink_egress_drop_debt.has_active_debt();
+    let relay_read_recovery_active = downlink_egress_drop_debt.has_active_debt();
     process_dirty_relay(
         dirty,
         sockets,
@@ -4229,7 +5536,11 @@ where
         metrics,
         downlink_flush_max_bytes,
         downlink_backpressure,
+        tun_mtu,
         downlink_egress_drop_debt,
+        close_egress_guard,
+        relay_read_recovery_active,
+        relay_read_hard_pause,
     )
     .await;
 
@@ -4254,12 +5565,14 @@ async fn drain_ready_tun_rx<D, U, M>(
     metrics: &mut M,
     downlink_flush_max_bytes: usize,
     downlink_backpressure: DownlinkBackpressureConfig,
+    tun_mtu: usize,
     downlink_egress_drop_debt: &mut DownlinkEgressDropDebt,
     tcp_loop_flush_tx_calls: &mut u64,
     tcp_loop_flush_tx_failures: &mut u64,
     diag: &mut TunRxDrainDiag,
     budget: usize,
     source: &str,
+    relay_read_hard_pause: bool,
 ) -> usize
 where
     D: TunIo,
@@ -4292,9 +5605,11 @@ where
                     metrics,
                     downlink_flush_max_bytes,
                     downlink_backpressure,
+                    tun_mtu,
                     downlink_egress_drop_debt,
                     tcp_loop_flush_tx_calls,
                     tcp_loop_flush_tx_failures,
+                    relay_read_hard_pause,
                     "tun_rx_drain",
                 )
                 .await;
@@ -4340,7 +5655,11 @@ async fn process_dirty_relay<U, M>(
     metrics: &mut M,
     downlink_flush_max_bytes: usize,
     downlink_backpressure: DownlinkBackpressureConfig,
+    tun_mtu: usize,
     downlink_egress_drop_debt: &mut DownlinkEgressDropDebt,
+    close_egress_drop_guard: bool,
+    relay_read_recovery_active: bool,
+    relay_read_hard_pause: bool,
 ) where
     U: ProxyUpstream + 'static,
     M: MetricsSink,
@@ -4362,7 +5681,9 @@ async fn process_dirty_relay<U, M>(
             metrics_handle,
             downlink_flush_max_bytes,
             downlink_backpressure,
+            tun_mtu,
             downlink_egress_drop_debt,
+            close_egress_drop_guard,
         )
         .await
         {
@@ -4376,13 +5697,7 @@ async fn process_dirty_relay<U, M>(
             let (has_pending, needs_local_finish) = socket_ctxs
                 .get_mut(&handle)
                 .map(|c| {
-                    log_tcp_lifecycle_observation(
-                        handle,
-                        c,
-                        snapshot,
-                        now_secs,
-                        "dirty_relay",
-                    );
+                    log_tcp_lifecycle_observation(handle, c, snapshot, now_secs, "dirty_relay");
                     (
                         !c.downlink_pending.is_empty(),
                         snapshot.tcp_state == TcpState::CloseWait
@@ -4396,6 +5711,15 @@ async fn process_dirty_relay<U, M>(
                 || needs_local_finish
                 || snapshot.send_queue > downlink_backpressure.low_bytes
         };
+        publish_relay_read_credit_for_handle(
+            handle,
+            sockets,
+            socket_ctxs,
+            downlink_backpressure,
+            tun_mtu,
+            relay_read_recovery_active,
+            relay_read_hard_pause,
+        );
         if !still_active {
             dirty.remove(&handle);
         }
@@ -4427,6 +5751,8 @@ fn reap_dead_slots(
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
+    downlink_backpressure: DownlinkBackpressureConfig,
+    close_egress_drop_guard: bool,
 ) -> usize {
     let handles: Vec<SocketHandle> = registry.all_handles().collect();
     let mut reaped = 0;
@@ -4435,12 +5761,14 @@ fn reap_dead_slots(
             let s = sockets.get::<TcpSocket>(h);
             let snapshot = SocketCloseSnapshot::from_socket(s);
             socket_ctxs.get_mut(&h).and_then(|ctx| {
-                let should_reap = should_reap_slot(
+                let close_egress_guard =
+                    close_egress_drop_guard || ctx_has_close_egress_pressure_evidence(ctx);
+                let should_reap = should_reap_slot_with_snapshot(
                     ctx,
-                    snapshot.tcp_state,
-                    snapshot.active,
-                    snapshot.can_send,
+                    snapshot,
                     now_secs,
+                    downlink_backpressure,
+                    close_egress_guard,
                 );
                 let source = if should_reap {
                     "dead_slot_reap"
@@ -4471,6 +5799,26 @@ fn reap_dead_slots(
     reaped
 }
 
+fn should_reap_slot_with_snapshot(
+    ctx: &mut SocketCtx,
+    snapshot: SocketCloseSnapshot,
+    now_secs: u64,
+    _cfg: DownlinkBackpressureConfig,
+    _close_egress_drop_guard: bool,
+) -> bool {
+    if ctx.pending_relay_close.is_some() && snapshot.active && snapshot.can_send {
+        note_deferred_close_egress_progress(ctx, snapshot.send_queue, now_secs);
+        return false;
+    }
+    should_reap_slot(
+        ctx,
+        snapshot.tcp_state,
+        snapshot.active,
+        snapshot.can_send,
+        now_secs,
+    )
+}
+
 fn should_reap_slot(
     ctx: &SocketCtx,
     tcp_state: TcpState,
@@ -4497,15 +5845,8 @@ fn should_reap_slot(
         };
         return now_secs.saturating_sub(deadline_base) >= DEFERRED_CLOSE_PENDING_GRACE_SECS;
     }
-    if ctx.pending_relay_close.is_some()
-        && active
-        && can_send
-        && ctx.pending_relay_close_last_egress_queue_bytes > 0
-    {
-        let Some(deadline_base) = deferred_close_egress_deadline_base(ctx) else {
-            return false;
-        };
-        return now_secs.saturating_sub(deadline_base) >= DEFERRED_CLOSE_PENDING_GRACE_SECS;
+    if ctx.pending_relay_close.is_some() && active && can_send {
+        return false;
     }
     if !active {
         return true;
@@ -4524,7 +5865,7 @@ fn should_start_deferred_close_for_egress(
     snapshot: SocketCloseSnapshot,
     cfg: DownlinkBackpressureConfig,
 ) -> bool {
-    snapshot.active && snapshot.can_send && snapshot.send_queue >= cfg.high_bytes
+    snapshot.active && snapshot.can_send && snapshot.send_queue > cfg.low_bytes
 }
 
 fn start_deferred_close_for_egress_if_needed(
@@ -4534,9 +5875,7 @@ fn start_deferred_close_for_egress_if_needed(
     cfg: DownlinkBackpressureConfig,
     now_secs: u64,
 ) -> bool {
-    if !ctx.downlink_pending.is_empty()
-        || !should_start_deferred_close_for_egress(snapshot, cfg)
-    {
+    if !ctx.downlink_pending.is_empty() || !should_start_deferred_close_for_egress(snapshot, cfg) {
         return false;
     }
 
@@ -4576,11 +5915,23 @@ fn deferred_close_egress_deadline_base(ctx: &SocketCtx) -> Option<u64> {
         .max(ctx.pending_relay_close_last_egress_progress_secs)
 }
 
-fn note_deferred_close_egress_progress(
-    ctx: &mut SocketCtx,
-    send_queue: usize,
-    now_secs: u64,
-) {
+fn ctx_has_close_egress_pressure_evidence(ctx: &SocketCtx) -> bool {
+    ctx.downlink_diag.tun_flush_deferred > 0
+        || ctx.downlink_diag.send_slice_drop_credit_debt_bytes > 0
+        || ctx.downlink_diag.send_slice_pressure_credit_debt_bytes > 0
+        || ctx.downlink_diag.send_slice_drop_credit_blocked_bytes > 0
+        || ctx.downlink_diag.send_slice_pressure_credit_blocked_bytes > 0
+}
+
+fn deferred_close_egress_grace_secs(close_egress_drop_guard: bool) -> u64 {
+    if close_egress_drop_guard {
+        DEFERRED_CLOSE_EGRESS_DROP_GRACE_SECS
+    } else {
+        DEFERRED_CLOSE_PENDING_GRACE_SECS
+    }
+}
+
+fn note_deferred_close_egress_progress(ctx: &mut SocketCtx, send_queue: usize, now_secs: u64) {
     if send_queue == 0 {
         ctx.pending_relay_close_last_egress_progress_secs = None;
         ctx.pending_relay_close_last_egress_queue_bytes = 0;
@@ -4600,6 +5951,7 @@ fn should_keep_deferred_close_for_egress(
     snapshot: SocketCloseSnapshot,
     cfg: DownlinkBackpressureConfig,
     now_secs: u64,
+    close_egress_drop_guard: bool,
 ) -> bool {
     if ctx.pending_relay_close.is_none()
         || !snapshot.active
@@ -4612,7 +5964,25 @@ fn should_keep_deferred_close_for_egress(
     let Some(deadline_base) = deferred_close_egress_deadline_base(ctx) else {
         return false;
     };
-    now_secs.saturating_sub(deadline_base) < DEFERRED_CLOSE_PENDING_GRACE_SECS
+    let Some(started_secs) = ctx.pending_relay_close_since_secs else {
+        return false;
+    };
+    if now_secs.saturating_sub(started_secs) >= DEFERRED_CLOSE_EGRESS_MAX_GRACE_SECS {
+        return false;
+    }
+    now_secs.saturating_sub(deadline_base)
+        < deferred_close_egress_grace_secs(close_egress_drop_guard)
+}
+
+fn should_send_local_eof_for_deferred_close(
+    ctx: &SocketCtx,
+    snapshot: SocketCloseSnapshot,
+) -> bool {
+    ctx.pending_relay_close.is_some()
+        && ctx.downlink_pending.is_empty()
+        && !ctx.local_eof_sent
+        && snapshot.active
+        && snapshot.can_send
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4748,7 +6118,11 @@ fn resolve_target(endpoint: smoltcp::wire::IpEndpoint, fake_pool: &FakeIpPool) -
 /// resolver（`udp.dst_ip:53`），目的 = app 原端点；否则 app 的 socket 认不出回包而丢弃。裸包能任意
 /// 设 src（smoltcp 受限于本接口 IP、对无界 resolver 集合做不到，见 ADR-0007）。纯逻辑（只依赖
 /// `UdpInbound` + `&mut FakeIpPool`），无 device/async，便于单测。
-fn forge_dns_reply(udp: &UdpInbound<'_>, fake_pool: &mut FakeIpPool, now_secs: u64) -> Option<Vec<u8>> {
+fn forge_dns_reply(
+    udp: &UdpInbound<'_>,
+    fake_pool: &mut FakeIpPool,
+    now_secs: u64,
+) -> Option<Vec<u8>> {
     let q = dns::parse_query(udp.payload)?;
     let resp = if q.qtype == dns::QTYPE_A {
         let ip = fake_pool.alloc(&q.qname, now_secs);
@@ -4839,9 +6213,8 @@ fn pump_established_uplink(
                     ctx.state = SocketState::Relaying;
                 } else {
                     if tcp_state == TcpState::CloseWait && !ctx.local_fin_sent {
-                        let pending_since = *ctx
-                            .local_fin_pending_since_secs
-                            .get_or_insert(now_secs);
+                        let pending_since =
+                            *ctx.local_fin_pending_since_secs.get_or_insert(now_secs);
                         let deadline_base = ctx
                             .local_fin_last_remote_progress_secs
                             .unwrap_or(pending_since)
@@ -5038,7 +6411,9 @@ fn rearm_socket(
     ctx.state = SocketState::Closing;
     socket.abort();
     ctx.uplink_tx = None;
+    ctx.relay_read_credit_tx = None;
     ctx.local_fin_sent = false;
+    ctx.local_eof_sent = false;
     ctx.local_fin_pending_since_secs = None;
     ctx.local_fin_last_remote_progress_secs = None;
     ctx.downlink_pending.clear();
@@ -5052,6 +6427,7 @@ fn rearm_socket(
     ctx.downlink_pending_last_pending_bytes = 0;
     ctx.downlink_diag = TcpDownlinkDiag::default();
     ctx.downlink_egress_clock = DownlinkEgressClock::default();
+    ctx.downlink_credit_controller = DownlinkCreditController::default();
     ctx.last_tcp_lifecycle = None;
     ctx.reverse_window_last_log_secs = None;
     // 清 async-open 在飞缓存 + bump epoch——让任何迟到 `HandshakeDone` 失配被丢
@@ -5084,7 +6460,9 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
     metrics_handle: &Metrics,
     downlink_flush_max_bytes: usize,
     downlink_backpressure: DownlinkBackpressureConfig,
+    tun_mtu: usize,
     downlink_egress_drop_debt: &mut DownlinkEgressDropDebt,
+    close_egress_drop_guard: bool,
 ) -> Result<(), ClientError> {
     // 每轮先推进该 handle 的下行 pending：TCP ACK 释放 tx buffer 空间后继续写，
     // 直到把上一轮没写完的回程字节全部交付，绝不丢字节（修 bad decrypt 的另一半）。
@@ -5097,6 +6475,7 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
                 ctx,
                 downlink_flush_max_bytes,
                 downlink_backpressure,
+                tun_mtu,
                 downlink_egress_drop_debt,
             );
             note_downlink_pending_progress(ctx, now_secs, flush_outcome.accepted_bytes);
@@ -5107,6 +6486,7 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
                 fake_pool,
                 now_secs,
                 downlink_backpressure,
+                close_egress_drop_guard || ctx_has_close_egress_pressure_evidence(ctx),
             ) {
                 return Ok(());
             }
@@ -5122,7 +6502,9 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
         };
         let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
         let tcp_state = tcp_socket.state();
-        pump_established_uplink(ctx, tcp_state, now_secs, || extract_socket_payload(tcp_socket))
+        pump_established_uplink(ctx, tcp_state, now_secs, || {
+            extract_socket_payload(tcp_socket)
+        })
     };
     match established_uplink {
         EstablishedUplink::Handled => return Ok(()),
@@ -5225,12 +6607,15 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
             // 解析 fake-IP 回域名供日志（low-rate TCP block 路径，便于核对命中端点 / 调 DoH 名单）；
             // :853/DoH-IP（非 fake-IP）则显示 IP。
             let who = match std::net::IpAddr::from(endpoint.addr) {
-                std::net::IpAddr::V4(v4) => {
-                    fake_pool.resolve(v4).unwrap_or_else(|| endpoint.addr.to_string())
-                }
+                std::net::IpAddr::V4(v4) => fake_pool
+                    .resolve(v4)
+                    .unwrap_or_else(|| endpoint.addr.to_string()),
                 _ => endpoint.addr.to_string(),
             };
-            println!("🛡️ 阻断加密 DNS {who} (@{}:{})（→ RST，逼回落明文 DNS）", endpoint.addr, endpoint.port);
+            println!(
+                "🛡️ 阻断加密 DNS {who} (@{}:{})（→ RST，逼回落明文 DNS）",
+                endpoint.addr, endpoint.port
+            );
             let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
             if let Some(ctx) = socket_ctxs.get_mut(&handle) {
                 rearm_socket_with_reason(
@@ -5306,14 +6691,21 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
     if upstream.open_is_cheap() {
         // —— 明确廉价的上游：inline 开远端（主要用于测试/mock 轻路径）。——
         ctx.state = SocketState::OpeningRemote;
-        trace_log!("🎯 handle {:?} extracted target {}", handle, target.to_wire_string());
+        trace_log!(
+            "🎯 handle {:?} extracted target {}",
+            handle,
+            target.to_wire_string()
+        );
         trace_log!("🔄 handle {:?} entering {:?}", handle, ctx.state);
         let stream = upstream.open_tcp(&target).await?;
         trace_log!("🚪 handle {:?} remote session opened", handle);
 
         let (tx, rx) = tokio::sync::mpsc::channel(RELAY_CHANNEL_CAPACITY);
         if let Err(e) = tx.try_send(RelayCommand::Data(payload)) {
-            trace_log!("❌ handle {:?} 新建中继通道写入失败({e}) → rearm（不静默丢首包）", handle);
+            trace_log!(
+                "❌ handle {:?} 新建中继通道写入失败({e}) → rearm（不静默丢首包）",
+                handle
+            );
             let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
             rearm_socket_with_reason(
                 handle,
@@ -5333,7 +6725,14 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
             fake_pool.acquire(ip, now_secs);
             ctx.fake_ip = Some(ip);
         }
-        spawn_remote_relay(handle, ctx.conn_epoch, stream, rx, global_tx.clone(), metrics_handle);
+        ctx.relay_read_credit_tx = Some(spawn_remote_relay(
+            handle,
+            ctx.conn_epoch,
+            stream,
+            rx,
+            global_tx.clone(),
+            metrics_handle,
+        ));
         Ok(())
     } else {
         // —— 不廉价上游：把远端 TCP open spawn 出主循环并发化（刀9 M3 / 刀14d）——
@@ -5349,16 +6748,30 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
         }
         if !ctx.buffer_uplink(&payload) {
             // 理论不可达（spawn 入口 buffer 必空、首包 << 256KB）；防御性对称上面 HandshakePending 分支。
-            trace_log!("⚠️ handle {:?} spawn 入口缓存首包失败（{}B），丢弃", handle, payload.len());
+            trace_log!(
+                "⚠️ handle {:?} spawn 入口缓存首包失败（{}B），丢弃",
+                handle,
+                payload.len()
+            );
         }
-        trace_log!("🎯 handle {:?} target {} → spawn remote open（并发化，不 stall 主循环）", handle, target.to_wire_string());
+        trace_log!(
+            "🎯 handle {:?} target {} → spawn remote open（并发化，不 stall 主循环）",
+            handle,
+            target.to_wire_string()
+        );
 
         let up = Arc::clone(upstream);
         let done_tx = handshake_done_tx.clone();
         tokio::spawn(async move {
             let result = up.open_tcp(&target).await; // production open_tcp implementations carry their own timeout budget
             // channel 满 → send().await 背压（不丢，等主循环排空）；主循环已退出 → send 失败、忽略。
-            let _ = done_tx.send(HandshakeDone { handle, epoch, result }).await;
+            let _ = done_tx
+                .send(HandshakeDone {
+                    handle,
+                    epoch,
+                    result,
+                })
+                .await;
         });
         Ok(())
     }
@@ -5375,7 +6788,11 @@ fn handle_handshake_done(
     now_secs: u64,
     metrics_handle: &Metrics,
 ) {
-    let HandshakeDone { handle, epoch, result } = done;
+    let HandshakeDone {
+        handle,
+        epoch,
+        result,
+    } = done;
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
         return; // 槽已不存在：丢弃（Ok 的流随作用域 drop 关闭）
     };
@@ -5383,7 +6800,11 @@ fn handle_handshake_done(
     // 迟到的 open 结果丢弃，绝不装到新一代 socket。Ok 的流随作用域结束 drop 而干净关闭。
     if ctx.conn_epoch != epoch {
         if result.is_ok() {
-            trace_log!("🗑️ handle {:?} 迟到 open 结果(epoch {epoch}≠{}) 丢弃，不装到新代 socket", handle, ctx.conn_epoch);
+            trace_log!(
+                "🗑️ handle {:?} 迟到 open 结果(epoch {epoch}≠{}) 丢弃，不装到新代 socket",
+                handle,
+                ctx.conn_epoch
+            );
         }
         return;
     }
@@ -5400,7 +6821,10 @@ fn handle_handshake_done(
             if !ctx.uplink_buffer.is_empty() {
                 let buffered = std::mem::take(&mut ctx.uplink_buffer);
                 if let Err(e) = tx.try_send(RelayCommand::Data(buffered)) {
-                    trace_log!("❌ handle {:?} flush open 缓存失败({e}) → rearm（不静默丢字节）", handle);
+                    trace_log!(
+                        "❌ handle {:?} flush open 缓存失败({e}) → rearm（不静默丢字节）",
+                        handle
+                    );
                     let socket = sockets.get_mut::<TcpSocket>(handle);
                     rearm_socket_with_reason(
                         handle,
@@ -5416,11 +6840,24 @@ fn handle_handshake_done(
             }
             ctx.uplink_tx = Some(tx);
             ctx.state = SocketState::Relaying;
-            trace_log!("🚪 handle {:?} remote session opened（spawn open 成功）", handle);
-            spawn_remote_relay(handle, epoch, stream, rx, global_tx.clone(), metrics_handle);
+            trace_log!(
+                "🚪 handle {:?} remote session opened（spawn open 成功）",
+                handle
+            );
+            ctx.relay_read_credit_tx = Some(spawn_remote_relay(
+                handle,
+                epoch,
+                stream,
+                rx,
+                global_tx.clone(),
+                metrics_handle,
+            ));
         }
         Err(e) => {
-            println!("❌ handle {:?} spawned remote open failed: {e} → rearm", handle);
+            println!(
+                "❌ handle {:?} spawned remote open failed: {e} → rearm",
+                handle
+            );
             let socket = sockets.get_mut::<TcpSocket>(handle);
             rearm_socket_with_reason(
                 handle,
@@ -5451,6 +6888,7 @@ async fn handle_remote_payload<D: TunIo>(
     downlink_egress_pacer: &mut DownlinkEgressPacer,
     downlink_egress_drop_debt: &mut DownlinkEgressDropDebt,
     downlink_backpressure: DownlinkBackpressureConfig,
+    tun_mtu: usize,
 ) -> std::io::Result<usize> {
     let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
@@ -5494,13 +6932,6 @@ async fn handle_remote_payload<D: TunIo>(
         RemotePayloadDisposition::TerminalNoSend => {
             ctx.downlink_diag
                 .note_terminal_late_remote_payload(payload.len());
-            log_tcp_lifecycle_observation(
-                handle,
-                ctx,
-                before_payload_snapshot,
-                now_secs,
-                "terminal_remote_payload",
-            );
             tcp_diag_log!(
                 "🔎 tcp-terminal-remote-payload handle={:?} bytes={} total_bytes={} events={} pending={} tcp_state={:?} active={} can_send={} can_recv={} may_send={} may_recv={} send_capacity={} send_queue={} recv_queue={}",
                 handle,
@@ -5518,6 +6949,16 @@ async fn handle_remote_payload<D: TunIo>(
                 before_payload_snapshot.send_queue,
                 before_payload_snapshot.recv_queue
             );
+            rearm_socket_with_reason_and_snapshot(
+                handle,
+                tcp_socket,
+                ctx,
+                fake_pool,
+                now_secs,
+                "remote_to_local",
+                "terminal_remote_payload",
+                Some(before_payload_snapshot),
+            );
             return Ok(0);
         }
     }
@@ -5528,12 +6969,36 @@ async fn handle_remote_payload<D: TunIo>(
     ctx.downlink_diag
         .note_remote_payload(payload.len(), ctx.downlink_pending.len());
     note_local_finish_remote_progress(ctx, now_secs);
+    let projected_pressure = downlink_projected_local_pressure_bytes(
+        before_payload_snapshot.send_queue,
+        ctx.downlink_pending.len(),
+    );
+    let installed_projected_debt = downlink_egress_drop_debt
+        .note_projected_egress_pressure(projected_pressure, downlink_backpressure);
+    if installed_projected_debt > 0 {
+        tcp_diag_log!(
+            "{}",
+            format_downlink_egress_credit_debt_diag(
+                "projected_payload_credit_edge",
+                installed_projected_debt,
+                DownlinkPressureStats {
+                    max_pending: ctx.downlink_pending.len(),
+                    total_pending: ctx.downlink_pending.len(),
+                    max_tx_queue: projected_pressure,
+                    total_tx_queue: projected_pressure,
+                },
+                downlink_backpressure,
+                *downlink_egress_drop_debt,
+            )
+        );
+    }
     let flush_outcome = flush_downlink(
         handle,
         tcp_socket,
         ctx,
         downlink_flush_max_bytes,
         downlink_backpressure,
+        tun_mtu,
         downlink_egress_drop_debt,
     );
     let accepted_bytes = flush_outcome.accepted_bytes;
@@ -5584,7 +7049,10 @@ async fn handle_remote_payload<D: TunIo>(
         ctx.downlink_diag.note_tun_flush(ok);
     }
     if let Err(e) = &result {
-        tcp_diag_log!("🔎 tcp-tun-flush-fail handle={:?} stage=remote_payload err={e}", handle);
+        tcp_diag_log!(
+            "🔎 tcp-tun-flush-fail handle={:?} stage=remote_payload err={e}",
+            handle
+        );
     }
     // Even if this flush fails, accepted bytes are already queued in smoltcp and
     // must keep the handle dirty for tx-queue-aware backpressure.
@@ -5687,6 +7155,7 @@ fn finish_deferred_relay_close_if_drained(
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
     downlink_backpressure: DownlinkBackpressureConfig,
+    close_egress_drop_guard: bool,
 ) -> bool {
     let Some(close) = ctx.pending_relay_close else {
         return false;
@@ -5695,7 +7164,34 @@ fn finish_deferred_relay_close_if_drained(
         return true;
     }
     let snapshot = SocketCloseSnapshot::from_socket(socket);
-    if should_keep_deferred_close_for_egress(ctx, snapshot, downlink_backpressure, now_secs) {
+    if should_send_local_eof_for_deferred_close(ctx, snapshot) {
+        tcp_diag_log!(
+            "🔎 tcp-local-eof-close handle={:?} direction={} reason={} send_queue={} tcp_state={:?} active={} can_send={} can_recv={} may_send={} may_recv={}",
+            handle,
+            close.direction,
+            close.reason,
+            snapshot.send_queue,
+            snapshot.tcp_state,
+            snapshot.active,
+            snapshot.can_send,
+            snapshot.can_recv,
+            snapshot.may_send,
+            snapshot.may_recv
+        );
+        socket.close();
+        ctx.local_eof_sent = true;
+        return true;
+    }
+    if ctx.local_eof_sent && snapshot.active {
+        return true;
+    }
+    if should_keep_deferred_close_for_egress(
+        ctx,
+        snapshot,
+        downlink_backpressure,
+        now_secs,
+        close_egress_drop_guard,
+    ) {
         return true;
     }
     rearm_socket_with_reason(
@@ -5735,10 +7231,171 @@ fn spawn_remote_relay(
     rx: mpsc::Receiver<RelayCommand>,
     back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
     metrics_handle: &Metrics,
-) {
+) -> watch::Sender<RelayReadCredit> {
     // 刀11：每条新 TCP flow 开远端成功后在此唯一入口计一次（覆盖 inline + spawned remote-open 两条路）。
     metrics_handle.inc_relays_spawned();
-    tokio::spawn(run_relay(handle, epoch, stream, rx, back_tx));
+    let (read_credit_tx, read_credit_rx) = watch::channel(RelayReadCredit::default());
+    tokio::spawn(run_relay(
+        handle,
+        epoch,
+        stream,
+        rx,
+        back_tx,
+        read_credit_rx,
+    ));
+    read_credit_tx
+}
+
+type RelayCloseReason = (&'static str, &'static str);
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RemoteReadBurst {
+    chunks: usize,
+    bytes: usize,
+}
+
+async fn send_remote_payload_batch_to_main(
+    handle: SocketHandle,
+    epoch: u64,
+    payload: Vec<u8>,
+    batch_chunks: usize,
+    back_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    diag: &mut RelayTaskDiag,
+    global_rx_pressure_threshold: std::time::Duration,
+) -> Result<(), RelayCloseReason> {
+    let payload_len = payload.len();
+    diag.note_remote_batch(batch_chunks, payload_len);
+    note_global_rx_channel_occupancy(diag, back_tx);
+    let wait_started = std::time::Instant::now();
+    let send_result = back_tx
+        .send((
+            handle,
+            RelayEvent::Data {
+                epoch,
+                bytes: payload,
+            },
+        ))
+        .await;
+    let waited = wait_started.elapsed();
+    note_global_rx_channel_occupancy(diag, back_tx);
+    diag.note_global_rx_wait(waited, global_rx_pressure_threshold);
+    if waited >= global_rx_pressure_threshold {
+        tcp_diag_log!(
+            "🔎 tcp-global-rx-pressure handle={:?} wait_us={} payload_bytes={} pressure_events={}",
+            handle,
+            waited.as_micros(),
+            payload_len,
+            diag.global_rx_pressure_events
+        );
+    }
+    if send_result.is_err() {
+        return Err(("remote_to_local", "global_rx_closed"));
+    }
+    Ok(())
+}
+
+fn append_remote_read_to_batch(
+    diag: &mut RelayTaskDiag,
+    burst: &mut RemoteReadBurst,
+    batch: &mut Vec<u8>,
+    chunk: &[u8],
+) {
+    if chunk.is_empty() {
+        return;
+    }
+    diag.note_remote_read(chunk.len());
+    burst.chunks = burst.chunks.saturating_add(1);
+    burst.bytes = burst.bytes.saturating_add(chunk.len());
+    batch.extend_from_slice(chunk);
+}
+
+fn relay_remote_awaited_read_len(read_credit: RelayReadCredit, buffer_len: usize) -> usize {
+    if read_credit.paused {
+        return 0;
+    }
+    read_credit.max_batch_bytes.min(buffer_len)
+}
+
+async fn poll_ready_remote_read(
+    remote_reader: &mut tokio::io::ReadHalf<RelayStream>,
+    buf: &mut [u8],
+) -> Option<std::io::Result<usize>> {
+    std::future::poll_fn(|cx| {
+        let mut read_buf = ReadBuf::new(&mut *buf);
+        match std::pin::Pin::new(&mut *remote_reader).poll_read(cx, &mut read_buf) {
+            std::task::Poll::Ready(Ok(())) => {
+                std::task::Poll::Ready(Some(Ok(read_buf.filled().len())))
+            }
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Some(Err(e))),
+            std::task::Poll::Pending => std::task::Poll::Ready(None),
+        }
+    })
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drain_ready_remote_reads(
+    remote_reader: &mut tokio::io::ReadHalf<RelayStream>,
+    handle: SocketHandle,
+    epoch: u64,
+    initial_payload: Vec<u8>,
+    buf: &mut [u8],
+    back_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    diag: &mut RelayTaskDiag,
+    read_credit: RelayReadCredit,
+    global_rx_pressure_threshold: std::time::Duration,
+) -> Result<(RemoteReadBurst, Option<RelayCloseReason>), RelayCloseReason> {
+    let mut burst = RemoteReadBurst::default();
+    let byte_limit = relay_remote_ready_batch_byte_limit(back_tx)
+        .min(read_credit.max_batch_bytes)
+        .max(initial_payload.len());
+    diag.note_remote_batch_limit(byte_limit);
+    let mut batch = Vec::with_capacity(initial_payload.len().min(byte_limit));
+    append_remote_read_to_batch(diag, &mut burst, &mut batch, &initial_payload);
+    let mut close_after_batch = None;
+    while burst.chunks < RELAY_REMOTE_READ_BURST_MAX_CHUNKS && burst.bytes < byte_limit {
+        let remaining = byte_limit.saturating_sub(burst.bytes);
+        if remaining == 0 {
+            break;
+        }
+        let read_len = remaining.min(buf.len());
+        match poll_ready_remote_read(remote_reader, &mut buf[..read_len]).await {
+            None => break,
+            Some(Ok(0)) => {
+                println!("远端服务器关闭了车厢 {:?}", handle);
+                close_after_batch = Some(("remote_to_local", "remote_eof"));
+                break;
+            }
+            Some(Ok(n)) => {
+                append_remote_read_to_batch(diag, &mut burst, &mut batch, &buf[..n]);
+            }
+            Some(Err(e)) => {
+                println!(
+                    "读取上游流失败 direction=remote_to_local handle={:?} err={:?}",
+                    handle, e
+                );
+                close_after_batch = Some(("remote_to_local", "remote_read_failed"));
+                break;
+            }
+        }
+    }
+    if batch.is_empty() {
+        if let Some(reason) = close_after_batch {
+            return Err(reason);
+        }
+        return Ok((burst, None));
+    }
+    send_remote_payload_batch_to_main(
+        handle,
+        epoch,
+        batch,
+        burst.chunks,
+        back_tx,
+        diag,
+        global_rx_pressure_threshold,
+    )
+    .await?;
+    Ok((burst, close_after_batch))
 }
 
 /// 一条 TCP relay 的双向泵（独立 task body；抽出便于 idle 超时单测）。
@@ -5751,6 +7408,7 @@ async fn run_relay(
     stream: RelayStream,
     rx: mpsc::Receiver<RelayCommand>,
     back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
+    mut read_credit_rx: watch::Receiver<RelayReadCredit>,
 ) {
     let (mut remote_reader, remote_writer) = tokio::io::split(stream);
     let (writer_signal_tx, mut writer_signal_rx) =
@@ -5765,6 +7423,8 @@ async fn run_relay(
     ));
     let mut buf = [0u8; 65_536];
     let mut diag = RelayTaskDiag::default();
+    let mut read_credit = *read_credit_rx.borrow();
+    diag.note_read_credit(read_credit);
     let global_rx_pressure_threshold = std::time::Duration::from_millis(5);
     let local_write_pressure_threshold = std::time::Duration::from_millis(5);
     let idle = tokio::time::sleep(RELAY_IDLE_TIMEOUT);
@@ -5772,9 +7432,17 @@ async fn run_relay(
     let mut diag_tick = tokio::time::interval(std::time::Duration::from_secs(RELAY_LIVE_DIAG_SECS));
     diag_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     diag_tick.tick().await;
+    let mut remote_read_probe_tick = tokio::time::interval(std::time::Duration::from_millis(
+        RELAY_REMOTE_READ_PROBE_INTERVAL_MS,
+    ));
+    remote_read_probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    remote_read_probe_tick.tick().await;
     let mut writer_done = false;
     let mut read_only_after_local_finish = false;
+    let mut last_ack_drain_hint_at = None;
+    let mut read_credit_closed = false;
     let (close_direction, close_reason) = loop {
+        let remote_read_len = relay_remote_awaited_read_len(read_credit, buf.len());
         tokio::select! {
             _ = diag_tick.tick(), if tcp_diag_enabled() => {
                 tcp_diag_log!(
@@ -5787,6 +7455,48 @@ async fn run_relay(
                         &diag
                     )
                 );
+            }
+            _ = remote_read_probe_tick.tick(), if should_poll_relay_remote_read_probe(&diag, read_credit) => {
+                diag.note_remote_read_probe_tick();
+                let now = std::time::Instant::now();
+                if should_poll_relay_ack_drain_hint(&diag, writer_done)
+                    && let Some(hint) = relay_ack_drain_hint_due(&diag, now, last_ack_drain_hint_at)
+                {
+                    last_ack_drain_hint_at = Some(now);
+                    diag.note_ack_drain_hint_due();
+                    match back_tx.try_send((
+                        handle,
+                        RelayEvent::AckDrainHint {
+                            epoch,
+                            gap_ms: hint.gap_ms,
+                            remote_to_global_rx_bytes: hint.remote_to_global_rx_bytes,
+                        },
+                    )) {
+                        Ok(()) => diag.note_ack_drain_hint_sent(),
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            diag.note_ack_drain_hint_dropped();
+                            tcp_diag_log!(
+                                "🔎 tcp-relay-ack-drain-hint-drop handle={:?} epoch={} reason=global_rx_full gap_ms={} remote_to_global_rx_bytes={} dropped={}",
+                                handle,
+                                epoch,
+                                hint.gap_ms,
+                                hint.remote_to_global_rx_bytes,
+                                diag.ack_drain_hint_dropped
+                            );
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            diag.note_ack_drain_hint_dropped();
+                            tcp_diag_log!(
+                                "🔎 tcp-relay-ack-drain-hint-drop handle={:?} epoch={} reason=global_rx_closed gap_ms={} remote_to_global_rx_bytes={} dropped={}",
+                                handle,
+                                epoch,
+                                hint.gap_ms,
+                                hint.remote_to_global_rx_bytes,
+                                diag.ack_drain_hint_dropped
+                            );
+                        }
+                    }
+                }
             }
             signal = writer_signal_rx.recv(), if !writer_done => {
                 match signal {
@@ -5825,34 +7535,47 @@ async fn run_relay(
                     }
                 }
             }
-            remote_msg = remote_reader.read(&mut buf) => {
+            credit_update = read_credit_rx.changed(), if !read_credit_closed => {
+                if credit_update.is_err() {
+                    read_credit_closed = true;
+                } else {
+                    read_credit = *read_credit_rx.borrow_and_update();
+                    diag.note_read_credit(read_credit);
+                    if read_credit.paused {
+                        tcp_diag_log!(
+                            "🔎 tcp-relay-read-credit handle={:?} epoch={} paused=true max_batch_bytes=0 updates={} pause_updates={}",
+                            handle,
+                            epoch,
+                            diag.read_credit_updates,
+                            diag.read_credit_pause_updates
+                        );
+                    }
+                }
+            }
+            remote_msg = remote_reader.read(&mut buf[..remote_read_len]), if remote_read_len > 0 => {
                 match remote_msg {
                     Ok(0) => {
                         println!("远端服务器关闭了车厢 {:?}", handle);
                         break ("remote_to_local", "remote_eof");
                     }
                     Ok(n) => {
-                        diag.note_remote_read(n);
-                        let data = buf[..n].to_vec();
-                        note_global_rx_channel_occupancy(&mut diag, &back_tx);
-                        let wait_started = std::time::Instant::now();
-                        let send_result = back_tx
-                            .send((handle, RelayEvent::Data { epoch, bytes: data }))
-                            .await;
-                        let waited = wait_started.elapsed();
-                        note_global_rx_channel_occupancy(&mut diag, &back_tx);
-                        diag.note_global_rx_wait(waited, global_rx_pressure_threshold);
-                        if waited >= global_rx_pressure_threshold {
-                            tcp_diag_log!(
-                                "🔎 tcp-global-rx-pressure handle={:?} wait_us={} payload_bytes={} pressure_events={}",
-                                handle,
-                                waited.as_micros(),
-                                n,
-                                diag.global_rx_pressure_events
-                            );
-                        }
-                        if send_result.is_err() {
-                            break ("remote_to_local", "global_rx_closed");
+                        let initial_payload = buf[..n].to_vec();
+                        match drain_ready_remote_reads(
+                            &mut remote_reader,
+                            handle,
+                            epoch,
+                            initial_payload,
+                            &mut buf,
+                            &back_tx,
+                            &mut diag,
+                            read_credit,
+                            global_rx_pressure_threshold,
+                        )
+                        .await
+                        {
+                            Ok((_burst, Some(reason))) => break reason,
+                            Ok((_burst, None)) => {}
+                            Err(reason) => break reason,
                         }
                         let timeout = if read_only_after_local_finish {
                             RELAY_HALF_CLOSED_IDLE_TIMEOUT
@@ -5891,7 +7614,10 @@ async fn run_relay(
         writer_task.abort();
         let _ = writer_task.await;
     }
-    tcp_diag_log!("{}", format_relay_close_diag(handle, close_direction, close_reason, &diag));
+    tcp_diag_log!(
+        "{}",
+        format_relay_close_diag(handle, close_direction, close_reason, &diag)
+    );
     let _ = back_tx
         .send((
             handle,
@@ -5993,11 +7719,10 @@ async fn run_relay_writer(
                 let write_wait = write_started.elapsed();
                 match write_result {
                     Ok(_) => {
-                        let _ = signal_tx
-                            .try_send(RelayWriterSignal::Progress {
-                                bytes: payload_len,
-                                write_wait,
-                            });
+                        let _ = signal_tx.try_send(RelayWriterSignal::Progress {
+                            bytes: payload_len,
+                            write_wait,
+                        });
                         if coalesced.finish_after {
                             shutdown_relay_writer_after_finish(
                                 handle,
@@ -6026,13 +7751,8 @@ async fn run_relay_writer(
                 }
             }
             Some(RelayCommand::Finish) => {
-                shutdown_relay_writer_after_finish(
-                    handle,
-                    &mut writer,
-                    &signal_tx,
-                    &mut stop_rx,
-                )
-                .await;
+                shutdown_relay_writer_after_finish(handle, &mut writer, &signal_tx, &mut stop_rx)
+                    .await;
                 return;
             }
             None => {
@@ -6094,7 +7814,10 @@ async fn handle_tuic_udp_uplink<U: DatagramUpstream>(
     let (target, fake_ip) = match resolve_target(dst_ep, fake_pool) {
         TargetResolve::Direct { target, fake_ip } => (target, fake_ip),
         TargetResolve::Refuse => {
-            trace_log!("🚫 UDP fake-IP {} 无映射，丢弃（待应用重新解析）", udp.dst_ip);
+            trace_log!(
+                "🚫 UDP fake-IP {} 无映射，丢弃（待应用重新解析）",
+                udp.dst_ip
+            );
             return;
         }
         // 刀4：加密 DNS（DoQ :853 / DoH3 :443）→ **静默丢包**，逼应用回落明文 DNS。
@@ -6130,7 +7853,9 @@ async fn handle_tuic_udp_uplink<U: DatagramUpstream>(
     for ip in assoc_table.take_reclaimed_fake_ips() {
         fake_pool.release(ip, now_secs);
     }
-    upstream.send_udp(encode_packet(assoc_id, &target, udp.payload)).await;
+    upstream
+        .send_udp(encode_packet(assoc_id, &target, udp.payload))
+        .await;
 }
 
 pub async fn create_tun_device(tun_mtu: usize) -> tun::Result<tun::AsyncDevice> {
@@ -6165,17 +7890,34 @@ mod tests {
     #[test]
     fn upstream_kind_selector() {
         assert_eq!(select_upstream_kind(Some("reality")), UpstreamKind::Reality);
-        assert_eq!(select_upstream_kind(Some("  REALITY ")), UpstreamKind::Reality);
-        assert_eq!(select_upstream_kind(Some("failover")), UpstreamKind::Failover);
-        assert_eq!(select_upstream_kind(Some(" Failover ")), UpstreamKind::Failover);
+        assert_eq!(
+            select_upstream_kind(Some("  REALITY ")),
+            UpstreamKind::Reality
+        );
+        assert_eq!(
+            select_upstream_kind(Some("failover")),
+            UpstreamKind::Failover
+        );
+        assert_eq!(
+            select_upstream_kind(Some(" Failover ")),
+            UpstreamKind::Failover
+        );
         assert_eq!(select_upstream_kind(Some("tuic")), UpstreamKind::Tuic);
-        assert_eq!(select_upstream_kind(None), UpstreamKind::Tuic, "缺省 → TUIC（failover opt-in）");
-        assert_eq!(select_upstream_kind(Some("bogus")), UpstreamKind::Tuic, "未知 → TUIC（零回归）");
+        assert_eq!(
+            select_upstream_kind(None),
+            UpstreamKind::Tuic,
+            "缺省 → TUIC（failover opt-in）"
+        );
+        assert_eq!(
+            select_upstream_kind(Some("bogus")),
+            UpstreamKind::Tuic,
+            "未知 → TUIC（零回归）"
+        );
     }
 
     // ---- 刀9 F4：relay idle 超时（L2）----
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Poll, Waker};
 
     /// 一条永不产数据的 mock 上游流：read 恒 Pending、write/flush 即成、shutdown 记账。
@@ -6200,10 +7942,16 @@ mod tests {
         ) -> Poll<std::io::Result<usize>> {
             Poll::Ready(Ok(buf.len())) // 上行 write 即成（活动 → 重置 idle）
         }
-        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
-        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
             self.shutdown_called.store(true, Ordering::SeqCst);
             Poll::Ready(Ok(()))
         }
@@ -6231,10 +7979,16 @@ mod tests {
             self.writes.lock().unwrap().push(buf.to_vec());
             Poll::Ready(Ok(buf.len()))
         }
-        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
-        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
             self.shutdown_called.store(true, Ordering::SeqCst);
             Poll::Ready(Ok(()))
         }
@@ -6282,6 +8036,59 @@ mod tests {
             if let Some(waker) = self.read_waker.lock().unwrap().take() {
                 waker.wake();
             }
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.shutdown_called.store(true, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct BurstReadableStream {
+        shutdown_called: Arc<AtomicBool>,
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        eof_after_chunks: bool,
+    }
+    impl tokio::io::AsyncRead for BurstReadableStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let Some(mut chunk) = self.chunks.pop_front() else {
+                if self.eof_after_chunks {
+                    return Poll::Ready(Ok(()));
+                }
+                return Poll::Pending;
+            };
+            let take = chunk.len().min(buf.remaining());
+            if take == 0 {
+                self.chunks.push_front(chunk);
+                return Poll::Pending;
+            }
+            buf.put_slice(&chunk[..take]);
+            if take < chunk.len() {
+                chunk.drain(..take);
+                self.chunks.push_front(chunk);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl tokio::io::AsyncWrite for BurstReadableStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
         fn poll_shutdown(
@@ -6355,10 +8162,16 @@ mod tests {
             cx.waker().wake_by_ref();
             Poll::Pending
         }
-        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
-        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
             self.shutdown_called.store(true, Ordering::SeqCst);
             Poll::Ready(Ok(()))
         }
@@ -6395,10 +8208,16 @@ mod tests {
         ) -> Poll<std::io::Result<usize>> {
             Poll::Ready(Ok(buf.len()))
         }
-        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
-        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
             self.shutdown_called.store(true, Ordering::SeqCst);
             Poll::Ready(Ok(()))
         }
@@ -6411,10 +8230,16 @@ mod tests {
         ) -> Poll<std::io::Result<usize>> {
             Poll::Pending
         }
-        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
-        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
             self.shutdown_called.store(true, Ordering::SeqCst);
             Poll::Ready(Ok(()))
         }
@@ -6430,10 +8255,16 @@ mod tests {
                 "test write reset",
             )))
         }
-        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
-        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
             self.shutdown_called.store(true, Ordering::SeqCst);
             Poll::Ready(Ok(()))
         }
@@ -6441,6 +8272,380 @@ mod tests {
 
     fn mk_test_handle(sockets: &mut SocketSet<'static>) -> SocketHandle {
         sockets.add(build_listener_socket(&ListenerSpec { local_port: 12345 }))
+    }
+
+    fn relay_read_credit_channel() -> (
+        watch::Sender<RelayReadCredit>,
+        watch::Receiver<RelayReadCredit>,
+    ) {
+        watch::channel(RelayReadCredit::default())
+    }
+
+    #[test]
+    fn relay_ready_batch_limit_tapers_with_global_rx_queue_pressure() {
+        assert_eq!(
+            relay_remote_ready_batch_byte_limit_for_queue(0, RELAY_CHANNEL_CAPACITY),
+            RELAY_REMOTE_READ_BURST_MAX_BYTES
+        );
+        assert_eq!(
+            relay_remote_ready_batch_byte_limit_for_queue(
+                RELAY_CHANNEL_CAPACITY / 4,
+                RELAY_CHANNEL_CAPACITY
+            ),
+            RELAY_REMOTE_READ_BURST_MAX_BYTES
+        );
+
+        let mid_limit = relay_remote_ready_batch_byte_limit_for_queue(
+            RELAY_CHANNEL_CAPACITY / 2,
+            RELAY_CHANNEL_CAPACITY,
+        );
+        assert!(
+            mid_limit > RELAY_REMOTE_READ_MIN_BATCH_BYTES
+                && mid_limit < RELAY_REMOTE_READ_BURST_MAX_BYTES,
+            "middle queue pressure should reduce but not clamp the read batch: {mid_limit}"
+        );
+        assert_eq!(
+            relay_remote_ready_batch_byte_limit_for_queue(
+                RELAY_CHANNEL_CAPACITY * 3 / 4,
+                RELAY_CHANNEL_CAPACITY
+            ),
+            RELAY_REMOTE_READ_MIN_BATCH_BYTES
+        );
+        assert_eq!(
+            relay_remote_ready_batch_byte_limit_for_queue(
+                RELAY_CHANNEL_CAPACITY,
+                RELAY_CHANNEL_CAPACITY
+            ),
+            RELAY_REMOTE_READ_MIN_BATCH_BYTES
+        );
+    }
+
+    #[test]
+    fn relay_read_credit_tapers_and_pauses_for_local_egress() {
+        let cfg = DownlinkBackpressureConfig::default();
+        let tun_mtu = 1200;
+        let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        assert_eq!(
+            relay_read_credit_for_local_egress(0, 0, false, false, cfg, tun_mtu),
+            RelayReadCredit::default()
+        );
+        assert_eq!(
+            relay_read_credit_for_local_egress(cfg.high_bytes, 0, false, false, cfg, tun_mtu),
+            RelayReadCredit::default()
+        );
+
+        let mid = relay_read_credit_for_local_egress(
+            (cfg.high_bytes + tx_queue_flush_threshold(cfg)) / 2,
+            0,
+            false,
+            false,
+            cfg,
+            tun_mtu,
+        );
+        assert!(!mid.paused);
+        assert!(
+            mid.max_batch_bytes > pressure_floor
+                && mid.max_batch_bytes < RELAY_REMOTE_READ_BURST_MAX_BYTES,
+            "mid-credit send queue should taper read credit: {mid:?}"
+        );
+
+        assert_eq!(
+            relay_read_credit_for_local_egress(
+                tx_queue_flush_threshold(cfg),
+                0,
+                false,
+                false,
+                cfg,
+                tun_mtu,
+            ),
+            RelayReadCredit {
+                paused: false,
+                max_batch_bytes: pressure_floor,
+            }
+        );
+        assert_eq!(
+            relay_read_credit_for_local_egress(
+                tx_queue_credit_spend_threshold(cfg),
+                0,
+                false,
+                false,
+                cfg,
+                tun_mtu,
+            ),
+            RelayReadCredit {
+                paused: false,
+                max_batch_bytes: pressure_floor,
+            }
+        );
+        assert_eq!(
+            relay_read_credit_for_local_egress(0, cfg.high_bytes, false, false, cfg, tun_mtu),
+            RelayReadCredit {
+                paused: false,
+                max_batch_bytes: pressure_floor,
+            }
+        );
+        assert_eq!(
+            relay_read_credit_for_local_egress(0, 0, true, false, cfg, tun_mtu),
+            RelayReadCredit {
+                paused: false,
+                max_batch_bytes: pressure_floor,
+            },
+            "active egress debt should keep QUIC reads draining with minimum credit, not hard-pause them"
+        );
+        assert_eq!(
+            relay_read_credit_for_local_egress(
+                0,
+                downlink_receive_window_high(cfg),
+                false,
+                false,
+                cfg,
+                tun_mtu,
+            ),
+            RelayReadCredit {
+                paused: true,
+                max_batch_bytes: 0,
+            }
+        );
+        assert_eq!(
+            relay_read_credit_for_local_egress(0, 0, false, true, cfg, tun_mtu),
+            RelayReadCredit {
+                paused: true,
+                max_batch_bytes: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn relay_pressure_floor_tracks_tun_mtu_below_legacy_min_batch() {
+        let pressure_floor = relay_remote_read_pressure_floor_bytes(1200);
+
+        assert_eq!(
+            pressure_floor,
+            1200 * RELAY_REMOTE_READ_PRESSURE_MIN_PACKETS
+        );
+        assert!(pressure_floor < RELAY_REMOTE_READ_MIN_BATCH_BYTES);
+        assert_eq!(
+            relay_remote_awaited_read_len(
+                RelayReadCredit {
+                    paused: false,
+                    max_batch_bytes: pressure_floor,
+                },
+                65_536,
+            ),
+            pressure_floor,
+            "the first awaited remote read must obey pressure credit, not the old 64 KiB buffer size"
+        );
+        assert_eq!(
+            relay_remote_awaited_read_len(
+                RelayReadCredit {
+                    paused: true,
+                    max_batch_bytes: pressure_floor,
+                },
+                65_536,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn projected_relay_read_credit_accounts_for_incoming_payload() {
+        let cfg = DownlinkBackpressureConfig::default();
+        let tun_mtu = 1200;
+        let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+
+        assert_eq!(
+            relay_read_credit_for_projected_local_egress(
+                cfg.low_bytes,
+                0,
+                RELAY_REMOTE_READ_MIN_BATCH_BYTES,
+                false,
+                false,
+                cfg,
+                tun_mtu,
+            ),
+            RelayReadCredit::default(),
+            "small incoming payloads below the high watermark keep full read credit"
+        );
+
+        let tapered = relay_read_credit_for_projected_local_egress(
+            cfg.high_bytes.saturating_sub(1),
+            0,
+            RELAY_REMOTE_READ_MIN_BATCH_BYTES,
+            false,
+            false,
+            cfg,
+            tun_mtu,
+        );
+        assert!(!tapered.paused);
+        assert!(
+            tapered.max_batch_bytes < RELAY_REMOTE_READ_BURST_MAX_BYTES,
+            "projected pressure should reduce the next relay batch before the current payload is flushed: {tapered:?}"
+        );
+
+        assert_eq!(
+            relay_read_credit_for_projected_local_egress(
+                tx_queue_flush_threshold(cfg),
+                0,
+                RELAY_REMOTE_READ_BURST_MAX_BYTES,
+                false,
+                false,
+                cfg,
+                tun_mtu,
+            ),
+            RelayReadCredit {
+                paused: false,
+                max_batch_bytes: pressure_floor,
+            },
+            "a projected credit-edge overshoot should keep draining the QUIC stream with minimum credit"
+        );
+    }
+
+    #[test]
+    fn relay_read_credit_preserves_quic_window_drain_until_staging_is_full() {
+        let cfg = DownlinkBackpressureConfig::default();
+        let tun_mtu = 1200;
+        let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+
+        assert_eq!(
+            relay_read_credit_for_local_egress(
+                tx_queue_credit_spend_threshold(cfg),
+                0,
+                false,
+                false,
+                cfg,
+                tun_mtu,
+            ),
+            RelayReadCredit {
+                paused: false,
+                max_batch_bytes: pressure_floor,
+            },
+            "local egress pressure should slow relay reads without starving the QUIC stream"
+        );
+        assert_eq!(
+            relay_read_credit_for_local_egress(
+                tx_queue_credit_spend_threshold(cfg),
+                cfg.high_bytes,
+                false,
+                false,
+                cfg,
+                tun_mtu,
+            ),
+            RelayReadCredit {
+                paused: false,
+                max_batch_bytes: pressure_floor,
+            },
+            "pending staging below the receive window should keep minimum drain credit"
+        );
+        assert_eq!(
+            relay_read_credit_for_local_egress(
+                tx_queue_credit_spend_threshold(cfg),
+                downlink_receive_window_high(cfg),
+                false,
+                false,
+                cfg,
+                tun_mtu,
+            ),
+            RelayReadCredit {
+                paused: true,
+                max_batch_bytes: 0,
+            },
+            "the bounded staging receive window remains the actual relay-read pause edge"
+        );
+    }
+
+    #[test]
+    fn downlink_credit_controller_shrinks_staging_after_headroom_without_progress() {
+        let cfg = DownlinkBackpressureConfig::default();
+        let tun_mtu = 1200;
+        let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        let staging_limit = downlink_pressure_staging_limit(cfg, tun_mtu);
+        let mut controller = DownlinkCreditController::default();
+        let stalled = DownlinkFlushLimit {
+            len: 0,
+            headroom_limited: true,
+            headroom_deferred_bytes: 64,
+            clean_headroom_bytes: 0,
+            drain_credit_granted_bytes: 0,
+            drain_credit_planned_bytes: 0,
+            drop_credit_debt_bytes: 0,
+            drop_credit_debt_paid_bytes: 0,
+            drop_credit_blocked_bytes: 0,
+            pressure_credit_debt_bytes: 0,
+            pressure_credit_debt_paid_bytes: 0,
+            pressure_credit_blocked_bytes: 0,
+            hard_edge_guard_bytes: 3,
+            hard_edge_guard_deferred_bytes: 64,
+        };
+
+        controller.note_flush_feedback(stalled, cfg, tun_mtu);
+        controller.note_flush_feedback(stalled, cfg, tun_mtu);
+
+        assert!(controller.headroom_debt_bytes > 0);
+        assert!(controller.no_egress_progress_streak >= 2);
+        assert_eq!(
+                controller.read_credit_for(
+                    RelayReadCredit::default(),
+                    staging_limit,
+                    cfg,
+                    tun_mtu
+                ),
+            RelayReadCredit {
+                paused: true,
+                max_batch_bytes: 0,
+            },
+            "stalled egress may keep only bounded staging and must not keep expanding pending"
+        );
+        assert_eq!(
+            controller.flush_budget(262_144, cfg, tun_mtu),
+            pressure_floor,
+            "headroom deferral should become hard feedback on the next flush budget"
+        );
+    }
+
+    #[test]
+    fn downlink_credit_controller_grows_credit_from_observed_egress_progress() {
+        let cfg = DownlinkBackpressureConfig::default();
+        let tun_mtu = 1200;
+        let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        let mut controller = DownlinkCreditController::default();
+        let stalled = DownlinkFlushLimit {
+            len: 0,
+            headroom_limited: true,
+            headroom_deferred_bytes: 64,
+            clean_headroom_bytes: 0,
+            drain_credit_granted_bytes: 0,
+            drain_credit_planned_bytes: 0,
+            drop_credit_debt_bytes: 0,
+            drop_credit_debt_paid_bytes: 0,
+            drop_credit_blocked_bytes: 0,
+            pressure_credit_debt_bytes: 0,
+            pressure_credit_debt_paid_bytes: 0,
+            pressure_credit_blocked_bytes: 0,
+            hard_edge_guard_bytes: 3,
+            hard_edge_guard_deferred_bytes: 64,
+        };
+        controller.note_flush_feedback(stalled, cfg, tun_mtu);
+        let shrunk = controller.flush_budget(262_144, cfg, tun_mtu);
+
+        let progressed = DownlinkFlushLimit {
+            drain_credit_granted_bytes: pressure_floor,
+            headroom_limited: false,
+            headroom_deferred_bytes: 0,
+            hard_edge_guard_deferred_bytes: 0,
+            ..stalled
+        };
+        controller.note_flush_feedback(progressed, cfg, tun_mtu);
+
+        assert_eq!(controller.no_egress_progress_streak, 0);
+        assert!(
+            controller.flush_budget(262_144, cfg, tun_mtu) > shrunk,
+            "observed send_queue drain should reopen the local flush budget additively"
+        );
+        let credit = controller.read_credit_for(RelayReadCredit::default(), 0, cfg, tun_mtu);
+        assert!(
+            credit.max_batch_bytes > pressure_floor,
+            "observed egress progress should grow relay read credit"
+        );
     }
 
     #[test]
@@ -6463,17 +8668,26 @@ mod tests {
         let mut sockets = SocketSet::new(vec![]);
         let handle = mk_test_handle(&mut sockets);
         let flag = Arc::new(AtomicBool::new(false));
-        let stream: RelayStream = Box::new(IdleStream { shutdown_called: flag.clone() });
+        let stream: RelayStream = Box::new(IdleStream {
+            shutdown_called: flag.clone(),
+        });
         let (_tx, rx) = mpsc::channel::<RelayCommand>(8); // 持 _tx → rx 不关、永不收（无活动）
         let (back_tx, mut back_rx) = mpsc::channel(8);
-        let task = tokio::spawn(run_relay(handle, 7, stream, rx, back_tx));
+        let (_credit_tx, credit_rx) = relay_read_credit_channel();
+        let task = tokio::spawn(run_relay(handle, 7, stream, rx, back_tx, credit_rx));
 
         tokio::time::advance(std::time::Duration::from_secs(89)).await;
         assert!(!task.is_finished(), "89s < 90s idle 阈值，relay 不应退出");
         tokio::time::advance(std::time::Duration::from_secs(2)).await;
         task.await.unwrap();
-        assert!(flag.load(Ordering::SeqCst), "idle 超时应退出并调用 stream.shutdown（L2）");
-        match back_rx.try_recv().expect("relay close should notify main loop") {
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "idle 超时应退出并调用 stream.shutdown（L2）"
+        );
+        match back_rx
+            .try_recv()
+            .expect("relay close should notify main loop")
+        {
             (h, RelayEvent::Closed(close)) => {
                 assert_eq!(h, handle);
                 assert_eq!(close.epoch, 7);
@@ -6493,9 +8707,15 @@ mod tests {
         let coalesced = coalesce_relay_payload(b"one".to_vec(), &mut rx);
 
         assert_eq!(coalesced.payload, b"onetwo");
-        assert!(coalesced.finish_after, "queued Finish must run after queued data");
+        assert!(
+            coalesced.finish_after,
+            "queued Finish must run after queued data"
+        );
         assert!(coalesced.deferred.is_none());
-        assert!(rx.try_recv().is_err(), "Finish should be consumed into finish_after");
+        assert!(
+            rx.try_recv().is_err(),
+            "Finish should be consumed into finish_after"
+        );
     }
 
     #[test]
@@ -6503,10 +8723,14 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         tx.try_send(RelayCommand::Data(vec![2; 2])).unwrap();
 
-        let coalesced = coalesce_relay_payload(vec![1; RELAY_WRITER_COALESCE_MAX_BYTES - 1], &mut rx);
+        let coalesced =
+            coalesce_relay_payload(vec![1; RELAY_WRITER_COALESCE_MAX_BYTES - 1], &mut rx);
 
         assert_eq!(coalesced.payload.len(), RELAY_WRITER_COALESCE_MAX_BYTES - 1);
-        match coalesced.deferred.expect("oversized next data should be deferred") {
+        match coalesced
+            .deferred
+            .expect("oversized next data should be deferred")
+        {
             RelayCommand::Data(bytes) => assert_eq!(bytes, vec![2; 2]),
             other => panic!("expected deferred data, got {other:?}"),
         }
@@ -6525,11 +8749,14 @@ mod tests {
         let (tx, rx) = mpsc::channel::<RelayCommand>(8);
         tx.send(RelayCommand::Data(b"one".to_vec())).await.unwrap();
         tx.send(RelayCommand::Data(b"two".to_vec())).await.unwrap();
-        tx.send(RelayCommand::Data(b"three".to_vec())).await.unwrap();
+        tx.send(RelayCommand::Data(b"three".to_vec()))
+            .await
+            .unwrap();
         drop(tx);
         let (back_tx, mut back_rx) = mpsc::channel(8);
+        let (_credit_tx, credit_rx) = relay_read_credit_channel();
 
-        let task = tokio::spawn(run_relay(handle, 41, stream, rx, back_tx));
+        let task = tokio::spawn(run_relay(handle, 41, stream, rx, back_tx, credit_rx));
         task.await.unwrap();
 
         assert_eq!(
@@ -6537,8 +8764,14 @@ mod tests {
             vec![b"onetwothree".to_vec()],
             "queued data should become one upstream write batch"
         );
-        assert!(shutdown_called.load(Ordering::SeqCst), "local channel close still shuts down writer");
-        match back_rx.try_recv().expect("local channel close should notify main loop") {
+        assert!(
+            shutdown_called.load(Ordering::SeqCst),
+            "local channel close still shuts down writer"
+        );
+        match back_rx
+            .try_recv()
+            .expect("local channel close should notify main loop")
+        {
             (h, RelayEvent::Closed(close)) => {
                 assert_eq!(h, handle);
                 assert_eq!(close.epoch, 41);
@@ -6566,7 +8799,8 @@ mod tests {
         });
         let (tx, rx) = mpsc::channel::<RelayCommand>(8);
         let (back_tx, mut back_rx) = mpsc::channel(8);
-        let task = tokio::spawn(run_relay(handle, 43, stream, rx, back_tx));
+        let (_credit_tx, credit_rx) = relay_read_credit_channel();
+        let task = tokio::spawn(run_relay(handle, 43, stream, rx, back_tx, credit_rx));
 
         tx.send(RelayCommand::Data(b"reverse-control".to_vec()))
             .await
@@ -6600,20 +8834,383 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_remote_ready_burst_forwards_immediate_chunks() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let stream: RelayStream = Box::new(BurstReadableStream {
+            shutdown_called: Arc::new(AtomicBool::new(false)),
+            chunks: std::collections::VecDeque::from([
+                b"one".to_vec(),
+                b"two".to_vec(),
+                b"three".to_vec(),
+            ]),
+            eof_after_chunks: false,
+        });
+        let (mut remote_reader, _remote_writer) = tokio::io::split(stream);
+        let (back_tx, mut back_rx) = mpsc::channel(8);
+        let mut diag = RelayTaskDiag::default();
+        let mut buf = [0u8; 65_536];
+
+        let (burst, close_after_batch) = drain_ready_remote_reads(
+            &mut remote_reader,
+            handle,
+            77,
+            Vec::new(),
+            &mut buf,
+            &back_tx,
+            &mut diag,
+            RelayReadCredit::default(),
+            std::time::Duration::from_millis(5),
+        )
+        .await
+        .expect("ready burst should forward without closing");
+
+        assert_eq!(close_after_batch, None);
+        assert_eq!(burst.chunks, 3);
+        assert_eq!(burst.bytes, b"onetwothree".len());
+        assert_eq!(diag.remote_reads, 3);
+        assert_eq!(diag.remote_to_global_rx_bytes, b"onetwothree".len() as u64);
+        assert_eq!(diag.remote_batches, 1);
+        assert_eq!(diag.remote_batch_bytes_max, b"onetwothree".len());
+        assert_eq!(diag.remote_batch_chunks_max, 3);
+        match back_rx
+            .recv()
+            .await
+            .expect("burst payload should be queued")
+        {
+            (h, RelayEvent::Data { epoch, bytes }) => {
+                assert_eq!(h, handle);
+                assert_eq!(epoch, 77);
+                assert_eq!(bytes, b"onetwothree");
+            }
+            other => panic!("expected coalesced burst data, got {other:?}"),
+        }
+        assert!(back_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn relay_remote_ready_burst_respects_byte_limit_without_overshoot() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let chunks: std::collections::VecDeque<_> = std::iter::repeat_with(|| vec![7; 100_000])
+            .take(8)
+            .collect();
+        let stream: RelayStream = Box::new(BurstReadableStream {
+            shutdown_called: Arc::new(AtomicBool::new(false)),
+            chunks,
+            eof_after_chunks: false,
+        });
+        let (mut remote_reader, _remote_writer) = tokio::io::split(stream);
+        let (back_tx, mut back_rx) = mpsc::channel(8);
+        let mut diag = RelayTaskDiag::default();
+        let mut buf = [0u8; 65_536];
+
+        let (burst, close_after_batch) = drain_ready_remote_reads(
+            &mut remote_reader,
+            handle,
+            79,
+            Vec::new(),
+            &mut buf,
+            &back_tx,
+            &mut diag,
+            RelayReadCredit::default(),
+            std::time::Duration::from_millis(5),
+        )
+        .await
+        .expect("first ready burst should forward");
+
+        assert_eq!(close_after_batch, None);
+        assert_eq!(burst.bytes, RELAY_REMOTE_READ_BURST_MAX_BYTES);
+        assert_eq!(
+            diag.remote_batch_bytes_max,
+            RELAY_REMOTE_READ_BURST_MAX_BYTES
+        );
+        match back_rx
+            .recv()
+            .await
+            .expect("first capped batch should be queued")
+        {
+            (h, RelayEvent::Data { epoch, bytes }) => {
+                assert_eq!(h, handle);
+                assert_eq!(epoch, 79);
+                assert_eq!(bytes.len(), RELAY_REMOTE_READ_BURST_MAX_BYTES);
+            }
+            other => panic!("expected capped data batch, got {other:?}"),
+        }
+
+        let (next_burst, next_close) = drain_ready_remote_reads(
+            &mut remote_reader,
+            handle,
+            79,
+            Vec::new(),
+            &mut buf,
+            &back_tx,
+            &mut diag,
+            RelayReadCredit::default(),
+            std::time::Duration::from_millis(5),
+        )
+        .await
+        .expect("remaining bytes should stay readable after the cap");
+
+        assert_eq!(next_close, None);
+        assert_eq!(
+            next_burst.bytes,
+            800_000 - RELAY_REMOTE_READ_BURST_MAX_BYTES
+        );
+        match back_rx
+            .recv()
+            .await
+            .expect("second remainder batch should be queued")
+        {
+            (h, RelayEvent::Data { epoch, bytes }) => {
+                assert_eq!(h, handle);
+                assert_eq!(epoch, 79);
+                assert_eq!(bytes.len(), 800_000 - RELAY_REMOTE_READ_BURST_MAX_BYTES);
+            }
+            other => panic!("expected remainder data batch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_remote_ready_burst_tapers_when_global_rx_queue_is_busy() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let chunks: std::collections::VecDeque<_> = std::iter::repeat_with(|| vec![5; 16 * 1024])
+            .take(16)
+            .collect();
+        let stream: RelayStream = Box::new(BurstReadableStream {
+            shutdown_called: Arc::new(AtomicBool::new(false)),
+            chunks,
+            eof_after_chunks: false,
+        });
+        let (mut remote_reader, _remote_writer) = tokio::io::split(stream);
+        let (back_tx, mut back_rx) = mpsc::channel(4);
+        for _ in 0..3 {
+            back_tx
+                .try_send((
+                    handle,
+                    RelayEvent::AckDrainHint {
+                        epoch: 80,
+                        gap_ms: 500,
+                        remote_to_global_rx_bytes: 1,
+                    },
+                ))
+                .unwrap();
+        }
+        let mut diag = RelayTaskDiag::default();
+        let mut buf = [0u8; 65_536];
+
+        let (burst, close_after_batch) = drain_ready_remote_reads(
+            &mut remote_reader,
+            handle,
+            80,
+            Vec::new(),
+            &mut buf,
+            &back_tx,
+            &mut diag,
+            RelayReadCredit::default(),
+            std::time::Duration::from_millis(5),
+        )
+        .await
+        .expect("pressure-limited ready burst should forward");
+
+        assert_eq!(close_after_batch, None);
+        assert_eq!(burst.bytes, RELAY_REMOTE_READ_MIN_BATCH_BYTES);
+        assert_eq!(
+            diag.remote_batch_bytes_max,
+            RELAY_REMOTE_READ_MIN_BATCH_BYTES
+        );
+        assert_eq!(
+            diag.remote_batch_limit_bytes_min,
+            RELAY_REMOTE_READ_MIN_BATCH_BYTES
+        );
+        assert_eq!(diag.remote_batch_limited, 1);
+
+        for _ in 0..3 {
+            match back_rx
+                .recv()
+                .await
+                .expect("prefilled hint should remain ahead of data")
+            {
+                (_, RelayEvent::AckDrainHint { .. }) => {}
+                other => panic!("expected prefilled ack hint, got {other:?}"),
+            }
+        }
+        match back_rx
+            .recv()
+            .await
+            .expect("limited batch should use the last free slot")
+        {
+            (h, RelayEvent::Data { epoch, bytes }) => {
+                assert_eq!(h, handle);
+                assert_eq!(epoch, 80);
+                assert_eq!(bytes.len(), RELAY_REMOTE_READ_MIN_BATCH_BYTES);
+            }
+            other => panic!("expected pressure-limited data batch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_ready_burst_delivers_data_before_eof_close() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let stream: RelayStream = Box::new(BurstReadableStream {
+            shutdown_called: shutdown_called.clone(),
+            chunks: std::collections::VecDeque::from([b"one".to_vec(), b"two".to_vec()]),
+            eof_after_chunks: true,
+        });
+        let (_tx, rx) = mpsc::channel::<RelayCommand>(8);
+        let (back_tx, mut back_rx) = mpsc::channel(8);
+        let (_credit_tx, credit_rx) = relay_read_credit_channel();
+
+        run_relay(handle, 78, stream, rx, back_tx, credit_rx).await;
+
+        match back_rx
+            .recv()
+            .await
+            .expect("coalesced data should arrive first")
+        {
+            (h, RelayEvent::Data { epoch, bytes }) => {
+                assert_eq!(h, handle);
+                assert_eq!(epoch, 78);
+                assert_eq!(bytes, b"onetwo");
+            }
+            other => panic!("expected data before close, got {other:?}"),
+        }
+        match back_rx
+            .recv()
+            .await
+            .expect("EOF should notify main loop after data")
+        {
+            (h, RelayEvent::Closed(close)) => {
+                assert_eq!(h, handle);
+                assert_eq!(close.epoch, 78);
+                assert_eq!(close.direction, "remote_to_local");
+                assert_eq!(close.reason, "remote_eof");
+            }
+            other => panic!("expected close after data, got {other:?}"),
+        }
+        assert!(
+            shutdown_called.load(Ordering::SeqCst),
+            "EOF path should stop the writer half"
+        );
+        assert!(back_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn relay_read_credit_pause_stops_remote_reads_until_resumed() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let stream: RelayStream = Box::new(BurstReadableStream {
+            shutdown_called: shutdown_called.clone(),
+            chunks: std::collections::VecDeque::from([b"after-credit".to_vec()]),
+            eof_after_chunks: true,
+        });
+        let (_tx, rx) = mpsc::channel::<RelayCommand>(8);
+        let (back_tx, mut back_rx) = mpsc::channel(8);
+        let (credit_tx, credit_rx) = watch::channel(RelayReadCredit {
+            paused: true,
+            max_batch_bytes: 0,
+        });
+        let task = tokio::spawn(run_relay(handle, 81, stream, rx, back_tx, credit_rx));
+
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), back_rx.recv())
+                .await
+                .is_err(),
+            "paused read credit must keep ready remote bytes unread"
+        );
+
+        credit_tx.send(RelayReadCredit::default()).unwrap();
+        match tokio::time::timeout(std::time::Duration::from_millis(200), back_rx.recv())
+            .await
+            .expect("remote data should arrive after credit resumes")
+            .expect("relay should still be alive")
+        {
+            (h, RelayEvent::Data { epoch, bytes }) => {
+                assert_eq!(h, handle);
+                assert_eq!(epoch, 81);
+                assert_eq!(bytes, b"after-credit");
+            }
+            other => panic!("expected data after read credit resumes, got {other:?}"),
+        }
+        task.await.unwrap();
+        assert!(
+            shutdown_called.load(Ordering::SeqCst),
+            "remote EOF after resumed read should stop the writer half"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_pressure_credit_caps_first_awaited_remote_read() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let pressure_floor = relay_remote_read_pressure_floor_bytes(1200);
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let stream: RelayStream = Box::new(BurstReadableStream {
+            shutdown_called: shutdown_called.clone(),
+            chunks: std::collections::VecDeque::from([vec![9; pressure_floor + 777]]),
+            eof_after_chunks: true,
+        });
+        let (_tx, rx) = mpsc::channel::<RelayCommand>(8);
+        let (back_tx, mut back_rx) = mpsc::channel(8);
+        let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit {
+            paused: false,
+            max_batch_bytes: pressure_floor,
+        });
+        let task = tokio::spawn(run_relay(handle, 82, stream, rx, back_tx, credit_rx));
+
+        match tokio::time::timeout(std::time::Duration::from_millis(200), back_rx.recv())
+            .await
+            .expect("pressure-limited first remote read should arrive")
+            .expect("relay should still be alive")
+        {
+            (h, RelayEvent::Data { epoch, bytes }) => {
+                assert_eq!(h, handle);
+                assert_eq!(epoch, 82);
+                assert_eq!(
+                    bytes.len(),
+                    pressure_floor,
+                    "pressure credit must cap the first awaited remote read before ready-drain batching"
+                );
+            }
+            other => panic!("expected pressure-limited data batch, got {other:?}"),
+        }
+
+        task.await.unwrap();
+        assert!(
+            shutdown_called.load(Ordering::SeqCst),
+            "EOF path should stop the writer half"
+        );
+    }
+
+    #[tokio::test]
     async fn relay_remote_write_failed_notifies_main_loop() {
         let mut sockets = SocketSet::new(vec![]);
         let handle = mk_test_handle(&mut sockets);
         let flag = Arc::new(AtomicBool::new(false));
-        let stream: RelayStream = Box::new(FailingWriteStream { shutdown_called: flag.clone() });
+        let stream: RelayStream = Box::new(FailingWriteStream {
+            shutdown_called: flag.clone(),
+        });
         let (tx, rx) = mpsc::channel::<RelayCommand>(8);
         let (back_tx, mut back_rx) = mpsc::channel(8);
-        let task = tokio::spawn(run_relay(handle, 11, stream, rx, back_tx));
+        let (_credit_tx, credit_rx) = relay_read_credit_channel();
+        let task = tokio::spawn(run_relay(handle, 11, stream, rx, back_tx, credit_rx));
 
         tx.send(RelayCommand::Data(vec![1, 2, 3])).await.unwrap();
         task.await.unwrap();
 
-        assert!(flag.load(Ordering::SeqCst), "write failure should still call stream.shutdown");
-        match back_rx.try_recv().expect("write failure should notify main loop") {
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "write failure should still call stream.shutdown"
+        );
+        match back_rx
+            .try_recv()
+            .expect("write failure should notify main loop")
+        {
             (h, RelayEvent::Closed(close)) => {
                 assert_eq!(h, handle);
                 assert_eq!(close.epoch, 11);
@@ -6629,15 +9226,21 @@ mod tests {
         let mut sockets = SocketSet::new(vec![]);
         let handle = mk_test_handle(&mut sockets);
         let flag = Arc::new(AtomicBool::new(false));
-        let stream: RelayStream = Box::new(PendingWriteStream { shutdown_called: flag.clone() });
+        let stream: RelayStream = Box::new(PendingWriteStream {
+            shutdown_called: flag.clone(),
+        });
         let (tx, rx) = mpsc::channel::<RelayCommand>(8);
         let (back_tx, mut back_rx) = mpsc::channel(8);
-        let task = tokio::spawn(run_relay(handle, 17, stream, rx, back_tx));
+        let (_credit_tx, credit_rx) = relay_read_credit_channel();
+        let task = tokio::spawn(run_relay(handle, 17, stream, rx, back_tx, credit_rx));
 
         tx.send(RelayCommand::Data(vec![1, 2, 3])).await.unwrap();
         tokio::task::yield_now().await;
         tokio::time::advance(RELAY_WRITER_STOP_TIMEOUT - std::time::Duration::from_secs(1)).await;
-        assert!(!task.is_finished(), "relay should not close before the former per-write timeout");
+        assert!(
+            !task.is_finished(),
+            "relay should not close before the former per-write timeout"
+        );
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
         assert!(
             !task.is_finished(),
@@ -6651,8 +9254,14 @@ mod tests {
         tokio::time::advance(RELAY_IDLE_TIMEOUT).await;
         task.await.unwrap();
 
-        assert!(flag.load(Ordering::SeqCst), "relay idle cleanup should still call stream.shutdown");
-        match back_rx.try_recv().expect("idle timeout should notify main loop") {
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "relay idle cleanup should still call stream.shutdown"
+        );
+        match back_rx
+            .try_recv()
+            .expect("idle timeout should notify main loop")
+        {
             (h, RelayEvent::Closed(close)) => {
                 assert_eq!(h, handle);
                 assert_eq!(close.epoch, 17);
@@ -6676,7 +9285,8 @@ mod tests {
         });
         let (tx, rx) = mpsc::channel::<RelayCommand>(8);
         let (back_tx, mut back_rx) = mpsc::channel(8);
-        let task = tokio::spawn(run_relay(handle, 23, stream, rx, back_tx));
+        let (_credit_tx, credit_rx) = relay_read_credit_channel();
+        let task = tokio::spawn(run_relay(handle, 23, stream, rx, back_tx, credit_rx));
 
         tx.send(RelayCommand::Data(vec![1, 2, 3])).await.unwrap();
         tokio::task::yield_now().await;
@@ -6686,7 +9296,10 @@ mod tests {
             write_polled.load(Ordering::SeqCst),
             "test stream should have entered the pending write"
         );
-        match back_rx.try_recv().expect("remote read should not wait for write timeout") {
+        match back_rx
+            .try_recv()
+            .expect("remote read should not wait for write timeout")
+        {
             (h, RelayEvent::Data { epoch, bytes }) => {
                 assert_eq!(h, handle);
                 assert_eq!(epoch, 23);
@@ -6714,7 +9327,8 @@ mod tests {
         });
         let (tx, rx) = mpsc::channel::<RelayCommand>(8);
         let (back_tx, mut back_rx) = mpsc::channel(8);
-        let task = tokio::spawn(run_relay(handle, 29, stream, rx, back_tx));
+        let (_credit_tx, credit_rx) = relay_read_credit_channel();
+        let task = tokio::spawn(run_relay(handle, 29, stream, rx, back_tx, credit_rx));
 
         tx.send(RelayCommand::Finish).await.unwrap();
         tokio::task::yield_now().await;
@@ -6724,7 +9338,11 @@ mod tests {
             shutdown_called.load(Ordering::SeqCst),
             "local finish should shutdown only the remote write half"
         );
-        match back_rx.recv().await.expect("remote data should still reach main loop") {
+        match back_rx
+            .recv()
+            .await
+            .expect("remote data should still reach main loop")
+        {
             (h, RelayEvent::Data { epoch, bytes }) => {
                 assert_eq!(h, handle);
                 assert_eq!(epoch, 29);
@@ -6741,22 +9359,35 @@ mod tests {
         let mut sockets = SocketSet::new(vec![]);
         let handle = mk_test_handle(&mut sockets);
         let shutdown_called = Arc::new(AtomicBool::new(false));
-        let stream: RelayStream = Box::new(IdleStream { shutdown_called: shutdown_called.clone() });
+        let stream: RelayStream = Box::new(IdleStream {
+            shutdown_called: shutdown_called.clone(),
+        });
         let (tx, rx) = mpsc::channel::<RelayCommand>(8);
         let (back_tx, mut back_rx) = mpsc::channel(8);
-        let task = tokio::spawn(run_relay(handle, 31, stream, rx, back_tx));
+        let (_credit_tx, credit_rx) = relay_read_credit_channel();
+        let task = tokio::spawn(run_relay(handle, 31, stream, rx, back_tx, credit_rx));
 
         tx.send(RelayCommand::Finish).await.unwrap();
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
-        assert!(shutdown_called.load(Ordering::SeqCst), "Finish should shutdown the remote write half");
+        assert!(
+            shutdown_called.load(Ordering::SeqCst),
+            "Finish should shutdown the remote write half"
+        );
 
-        tokio::time::advance(RELAY_HALF_CLOSED_IDLE_TIMEOUT - std::time::Duration::from_secs(1)).await;
-        assert!(!task.is_finished(), "half-closed relay should stay open before the short idle timeout");
+        tokio::time::advance(RELAY_HALF_CLOSED_IDLE_TIMEOUT - std::time::Duration::from_secs(1))
+            .await;
+        assert!(
+            !task.is_finished(),
+            "half-closed relay should stay open before the short idle timeout"
+        );
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
         task.await.unwrap();
 
-        match back_rx.try_recv().expect("half-closed idle should notify main loop") {
+        match back_rx
+            .try_recv()
+            .expect("half-closed idle should notify main loop")
+        {
             (h, RelayEvent::Closed(close)) => {
                 assert_eq!(h, handle);
                 assert_eq!(close.epoch, 31);
@@ -6773,16 +9404,22 @@ mod tests {
         let mut sockets = SocketSet::new(vec![]);
         let handle = mk_test_handle(&mut sockets);
         let flag = Arc::new(AtomicBool::new(false));
-        let stream: RelayStream = Box::new(IdleStream { shutdown_called: flag.clone() });
+        let stream: RelayStream = Box::new(IdleStream {
+            shutdown_called: flag.clone(),
+        });
         let (tx, rx) = mpsc::channel::<RelayCommand>(8);
         let (back_tx, _back_rx) = mpsc::channel(8);
-        let task = tokio::spawn(run_relay(handle, 13, stream, rx, back_tx));
+        let (_credit_tx, credit_rx) = relay_read_credit_channel();
+        let task = tokio::spawn(run_relay(handle, 13, stream, rx, back_tx, credit_rx));
 
         tokio::time::advance(std::time::Duration::from_secs(89)).await;
         tx.send(RelayCommand::Data(vec![1, 2, 3])).await.unwrap(); // 活动（上行 write）→ 重置 idle 计时
         tokio::task::yield_now().await; // 让 relay 消费该活动并重建 sleep
         tokio::time::advance(std::time::Duration::from_secs(89)).await;
-        assert!(!task.is_finished(), "活动重置了 idle 计时，第二个 89s 窗口内不应退出");
+        assert!(
+            !task.is_finished(),
+            "活动重置了 idle 计时，第二个 89s 窗口内不应退出"
+        );
         tokio::time::advance(std::time::Duration::from_secs(2)).await;
         task.await.unwrap();
         assert!(flag.load(Ordering::SeqCst), "重置后再满 90s 静默才退出");
@@ -6975,7 +9612,15 @@ mod tests {
         }
         // idle_listen 槽：空闲监听（ctx.state 默认 Listening）→ 不该被回收。
 
-        let reaped = reap_dead_slots(&reg, &mut sockets, &mut ctxs, &mut pool, 1);
+        let reaped = reap_dead_slots(
+            &reg,
+            &mut sockets,
+            &mut ctxs,
+            &mut pool,
+            1,
+            DownlinkBackpressureConfig::default(),
+            false,
+        );
         assert_eq!(reaped, 1, "只回收 1 个死槽");
         let dead_ctx = ctxs.get(&dead).unwrap();
         assert_eq!(dead_ctx.state, SocketState::Listening, "死槽回 Listening");
@@ -7078,7 +9723,7 @@ mod tests {
     }
 
     #[test]
-    fn reap_predicate_preserves_deferred_close_egress_until_grace() {
+    fn reap_predicate_preserves_deferred_close_egress_from_dead_reap() {
         let mut ctx = SocketCtx::new(443);
         ctx.state = SocketState::Closing;
         ctx.pending_relay_close = Some(RelayClose {
@@ -7090,13 +9735,111 @@ mod tests {
         ctx.pending_relay_close_last_egress_progress_secs = Some(10);
         ctx.pending_relay_close_last_egress_queue_bytes = 524_288;
 
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 524_288,
+            low_bytes: 131_072,
+        };
+        let snapshot = SocketCloseSnapshot {
+            tcp_state: TcpState::CloseWait,
+            active: true,
+            can_send: true,
+            can_recv: false,
+            may_send: true,
+            may_recv: false,
+            send_capacity: 1_048_576,
+            send_queue: 524_288,
+            recv_queue: 0,
+        };
+
         assert!(
-            !should_reap_slot(&ctx, TcpState::CloseWait, true, true, 14),
+            !should_reap_slot_with_snapshot(&mut ctx, snapshot, 14, cfg, false),
             "deferred egress close should not be reaped inside the bounded grace"
         );
         assert!(
-            should_reap_slot(&ctx, TcpState::CloseWait, true, true, 15),
-            "deferred egress close remains bounded when the queue makes no progress"
+            !should_reap_slot_with_snapshot(&mut ctx, snapshot, 15, cfg, false),
+            "active send-capable close egress remains deliverable after the defer grace expires"
+        );
+    }
+
+    #[test]
+    fn reap_predicate_preserves_deferred_close_egress_after_drop_guard() {
+        let mut ctx = SocketCtx::new(443);
+        ctx.state = SocketState::Closing;
+        ctx.pending_relay_close = Some(RelayClose {
+            epoch: 7,
+            direction: "local_to_remote",
+            reason: "uplink_channel_closed",
+        });
+        ctx.pending_relay_close_since_secs = Some(10);
+        ctx.pending_relay_close_last_egress_progress_secs = Some(10);
+        ctx.pending_relay_close_last_egress_queue_bytes = 524_288;
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 524_288,
+            low_bytes: 131_072,
+        };
+        let snapshot = SocketCloseSnapshot {
+            tcp_state: TcpState::CloseWait,
+            active: true,
+            can_send: true,
+            can_recv: false,
+            may_send: true,
+            may_recv: false,
+            send_capacity: 1_048_576,
+            send_queue: 524_288,
+            recv_queue: 0,
+        };
+
+        assert!(
+            !should_reap_slot_with_snapshot(&mut ctx, snapshot, 24, cfg, true),
+            "drop/pressure close-drain gets the extended bounded grace"
+        );
+        assert!(
+            !should_reap_slot_with_snapshot(&mut ctx, snapshot, 25, cfg, true),
+            "drop/pressure close-drain expiry does not authorize dead reap while the socket can still send"
+        );
+
+        ctx.pending_relay_close_last_egress_progress_secs = Some(39);
+        ctx.pending_relay_close_last_egress_queue_bytes = 400_000;
+        assert!(
+            !should_reap_slot_with_snapshot(&mut ctx, snapshot, 40, cfg, true),
+            "the hard close-egress defer bound belongs to finish/rearm, not data-dropping dead reap"
+        );
+    }
+
+    #[test]
+    fn reap_predicate_preserves_active_send_capable_deferred_close_tail() {
+        let mut ctx = SocketCtx::new(443);
+        ctx.state = SocketState::Closing;
+        ctx.downlink_pending = vec![0; 376_912];
+        ctx.pending_relay_close = Some(RelayClose {
+            epoch: 7,
+            direction: "local_to_remote",
+            reason: "uplink_channel_closed",
+        });
+        ctx.pending_relay_close_since_secs = Some(10);
+        ctx.pending_relay_close_last_progress_secs = Some(38);
+        ctx.pending_relay_close_last_pending_bytes = 548_944;
+        ctx.pending_relay_close_last_egress_progress_secs = Some(38);
+        ctx.pending_relay_close_last_egress_queue_bytes = 892_928;
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 524_288,
+            low_bytes: 131_072,
+        };
+        let snapshot = SocketCloseSnapshot {
+            tcp_state: TcpState::Established,
+            active: true,
+            can_send: true,
+            can_recv: false,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 1_048_576,
+            send_queue: 892_928,
+            recv_queue: 0,
+        };
+
+        assert!(
+            !should_reap_slot_with_snapshot(&mut ctx, snapshot, 68, cfg, true),
+            "active send-capable deferred close still has deliverable tail bytes and must not be dead-reaped"
         );
     }
 
@@ -7374,7 +10117,10 @@ mod tests {
         assert!(line.contains("tcp-lifecycle-transition"), "{line}");
         assert!(line.contains("source=dead_slot_reap"), "{line}");
         assert!(line.contains("prev_source=remote_payload"), "{line}");
-        assert!(line.contains("prev_state=Established state=Closed"), "{line}");
+        assert!(
+            line.contains("prev_state=Established state=Closed"),
+            "{line}"
+        );
         assert!(line.contains("prev_active=true active=false"), "{line}");
         assert!(line.contains("ctx_state=Relaying"), "{line}");
         assert!(line.contains("uplink_tx=true"), "{line}");
@@ -7439,6 +10185,95 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn terminal_remote_payload_rearms_slot_and_stales_followup_payloads() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(build_listener_socket(&ListenerSpec { local_port: 443 }));
+        sockets.get_mut::<TcpSocket>(handle).abort();
+
+        let (tx, _rx) = mpsc::channel(1);
+        let mut ctx = SocketCtx::new(443);
+        ctx.state = SocketState::Relaying;
+        ctx.conn_epoch = 9;
+        ctx.uplink_tx = Some(tx);
+        let mut ctxs = HashMap::from([(handle, ctx)]);
+        let mut pool = FakeIpPool::new();
+        let mut device = DnsInjectRecorder::default();
+        let mut iface = Interface::new(
+            SmolConfig::new(smoltcp::wire::HardwareAddress::Ip),
+            &mut device,
+            smoltcp::time::Instant::now(),
+        );
+        iface.update_ip_addrs(|addrs| {
+            addrs
+                .push(IpCidr::new(IpAddress::v4(10, 0, 0, 2), 24))
+                .unwrap();
+        });
+        let mut pacer = DownlinkEgressPacer::new(DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES);
+        let mut drop_debt = DownlinkEgressDropDebt::default();
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 524_288,
+            low_bytes: 131_072,
+        };
+
+        let accepted = handle_remote_payload(
+            handle,
+            9,
+            vec![7; 4096],
+            &mut sockets,
+            &mut ctxs,
+            &mut iface,
+            &mut device,
+            &mut pool,
+            42,
+            DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
+            &mut pacer,
+            &mut drop_debt,
+            cfg,
+            1200,
+        )
+        .await
+        .unwrap();
+
+        let ctx = ctxs.get(&handle).unwrap();
+        assert_eq!(accepted, 0);
+        assert_eq!(ctx.state, SocketState::Listening);
+        assert_eq!(
+            ctx.conn_epoch, 10,
+            "terminal late payload must retire the old relay epoch"
+        );
+        assert!(ctx.uplink_tx.is_none());
+        assert!(ctx.downlink_pending.is_empty());
+
+        let accepted = handle_remote_payload(
+            handle,
+            9,
+            vec![8; 4096],
+            &mut sockets,
+            &mut ctxs,
+            &mut iface,
+            &mut device,
+            &mut pool,
+            43,
+            DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
+            &mut pacer,
+            &mut drop_debt,
+            cfg,
+            1200,
+        )
+        .await
+        .unwrap();
+
+        let ctx = ctxs.get(&handle).unwrap();
+        assert_eq!(accepted, 0);
+        assert_eq!(ctx.state, SocketState::Listening);
+        assert_eq!(
+            ctx.conn_epoch, 10,
+            "old relay payloads after terminal rearm must stay stale"
+        );
+        assert!(ctx.downlink_pending.is_empty());
+    }
+
     /// 刀14d：本地已关闭的 in-flight open 必须回收、bump epoch，并让迟到 `HandshakeDone`
     /// 被 epoch guard 丢弃。
     #[tokio::test]
@@ -7462,7 +10297,15 @@ mod tests {
         }
         sockets.get_mut::<TcpSocket>(closed_pending).abort();
 
-        let reaped = reap_dead_slots(&reg, &mut sockets, &mut ctxs, &mut pool, 1);
+        let reaped = reap_dead_slots(
+            &reg,
+            &mut sockets,
+            &mut ctxs,
+            &mut pool,
+            1,
+            DownlinkBackpressureConfig::default(),
+            false,
+        );
         assert_eq!(reaped, 1, "应回收本地已关闭的 async-open 槽");
 
         let closed_ctx = ctxs.get(&closed_pending).unwrap();
@@ -7471,7 +10314,10 @@ mod tests {
             closed_ctx.conn_epoch, 10,
             "reap 应 bump epoch 让迟到 open 结果失效"
         );
-        assert!(closed_ctx.fake_ip.is_none(), "reap 应释放 in-flight flow fake-IP");
+        assert!(
+            closed_ctx.fake_ip.is_none(),
+            "reap 应释放 in-flight flow fake-IP"
+        );
         assert_eq!(pool.sweep(1000, 300), 1, "release 后映射可回收");
 
         let (global_tx, _grx) = mpsc::channel(8);
@@ -7514,7 +10360,9 @@ mod tests {
             local_port: 80,
             state: SocketState::Relaying,
             uplink_tx: Some(tx),
+            relay_read_credit_tx: None,
             local_fin_sent: true,
+            local_eof_sent: true,
             local_fin_pending_since_secs: Some(3),
             local_fin_last_remote_progress_secs: Some(4),
             downlink_pending: Vec::new(),
@@ -7535,6 +10383,11 @@ mod tests {
                 drain_credit_bytes: 1024,
                 drop_debt_generation_seen: 3,
             },
+            downlink_credit_controller: DownlinkCreditController {
+                read_credit_ceiling_bytes: 32 * 1024,
+                headroom_debt_bytes: 4096,
+                no_egress_progress_streak: 3,
+            },
             last_tcp_lifecycle: None,
             reverse_window_last_log_secs: Some(12),
         };
@@ -7543,7 +10396,9 @@ mod tests {
 
         assert_eq!(ctx.state, SocketState::Listening);
         assert!(ctx.uplink_tx.is_none());
+        assert!(ctx.relay_read_credit_tx.is_none());
         assert!(!ctx.local_fin_sent, "rearm 应清空本地 FIN 发送状态");
+        assert!(!ctx.local_eof_sent, "rearm 应清空本地 EOF 发送状态");
         assert!(
             ctx.local_fin_pending_since_secs.is_none(),
             "rearm 应清空 deferred local FIN 状态"
@@ -7561,7 +10416,10 @@ mod tests {
             "rearm 应清空 deferred close egress 队列状态"
         );
         assert!(ctx.fake_ip.is_none(), "rearm 应清空 fake_ip");
-        assert!(ctx.uplink_buffer.is_empty(), "rearm 应清空 uplink_buffer（M3 patch）");
+        assert!(
+            ctx.uplink_buffer.is_empty(),
+            "rearm 应清空 uplink_buffer（M3 patch）"
+        );
         assert_eq!(
             ctx.downlink_diag.downlink_pending_high_water, 0,
             "rearm 应清空当前 flow 的 downlink diagnostics"
@@ -7571,11 +10429,19 @@ mod tests {
             DownlinkEgressClock::default(),
             "rearm 应清空当前 flow 的 egress progress clock"
         );
+        assert_eq!(
+            ctx.downlink_credit_controller,
+            DownlinkCreditController::default(),
+            "rearm 应清空当前 flow 的 local credit controller"
+        );
         assert!(
             ctx.reverse_window_last_log_secs.is_none(),
             "rearm 应清空 reverse-window diagnostics 限流状态"
         );
-        assert_eq!(ctx.conn_epoch, 8, "rearm 应 bump conn_epoch（让在飞 open 失效，M3）");
+        assert_eq!(
+            ctx.conn_epoch, 8,
+            "rearm 应 bump conn_epoch（让在飞 open 失效，M3）"
+        );
         assert!(
             !socket.nagle_enabled(),
             "rearm 应恢复本地 virtual-link TCP no-Nagle 策略"
@@ -7616,7 +10482,11 @@ mod tests {
         );
 
         let ctx = socket_ctxs.get(&handle).unwrap();
-        assert_eq!(ctx.state, SocketState::Relaying, "stale close must not rearm a new epoch");
+        assert_eq!(
+            ctx.state,
+            SocketState::Relaying,
+            "stale close must not rearm a new epoch"
+        );
         assert_eq!(ctx.conn_epoch, 22);
         assert!(ctx.uplink_tx.is_some());
     }
@@ -7650,7 +10520,10 @@ mod tests {
         );
 
         let ctx = socket_ctxs.get_mut(&handle).unwrap();
-        assert!(keep_dirty, "pending downlink must stay dirty until it drains");
+        assert!(
+            keep_dirty,
+            "pending downlink must stay dirty until it drains"
+        );
         assert_eq!(ctx.state, SocketState::Closing);
         assert!(ctx.uplink_tx.is_none());
         assert_eq!(ctx.downlink_pending, vec![1, 2, 3]);
@@ -7660,7 +10533,10 @@ mod tests {
         assert_eq!(ctx.pending_relay_close_last_pending_bytes, 3);
         assert_eq!(ctx.downlink_pending_last_progress_secs, Some(1));
         assert_eq!(ctx.downlink_pending_last_pending_bytes, 3);
-        assert_eq!(ctx.conn_epoch, 5, "deferred close must not bump epoch before drain");
+        assert_eq!(
+            ctx.conn_epoch, 5,
+            "deferred close must not bump epoch before drain"
+        );
 
         ctx.downlink_pending.clear();
         let socket = sockets.get_mut::<TcpSocket>(handle);
@@ -7670,7 +10546,8 @@ mod tests {
             ctx,
             &mut pool,
             2,
-            DownlinkBackpressureConfig::default()
+            DownlinkBackpressureConfig::default(),
+            false
         ));
         assert_eq!(ctx.state, SocketState::Listening);
         assert!(ctx.pending_relay_close.is_none());
@@ -7715,10 +10592,56 @@ mod tests {
         ));
         assert_eq!(ctx.state, SocketState::Closing);
         assert!(ctx.uplink_tx.is_none());
-        assert_eq!(ctx.pending_relay_close.map(|c| c.reason), Some("uplink_channel_closed"));
+        assert_eq!(
+            ctx.pending_relay_close.map(|c| c.reason),
+            Some("uplink_channel_closed")
+        );
         assert_eq!(ctx.pending_relay_close_since_secs, Some(10));
         assert_eq!(ctx.pending_relay_close_last_egress_progress_secs, Some(10));
         assert_eq!(ctx.pending_relay_close_last_egress_queue_bytes, 524_288);
+    }
+
+    #[test]
+    fn deferred_close_egress_starts_for_send_capable_tail_above_low_watermark() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut ctx = SocketCtx::new(12345);
+        ctx.state = SocketState::Relaying;
+        ctx.conn_epoch = 5;
+        ctx.uplink_tx = Some(tx);
+        let snapshot = SocketCloseSnapshot {
+            tcp_state: TcpState::CloseWait,
+            active: true,
+            can_send: true,
+            can_recv: false,
+            may_send: true,
+            may_recv: false,
+            send_capacity: 1_048_576,
+            send_queue: 217_725,
+            recv_queue: 0,
+        };
+        let close = RelayClose {
+            epoch: 5,
+            direction: "local_to_remote",
+            reason: "uplink_channel_closed",
+        };
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 524_288,
+            low_bytes: 131_072,
+        };
+
+        assert!(
+            start_deferred_close_for_egress_if_needed(&mut ctx, close, snapshot, cfg, 10),
+            "send-capable close tails above the drain-complete low watermark must enter close-drain even when below high pressure"
+        );
+        assert_eq!(ctx.state, SocketState::Closing);
+        assert!(ctx.uplink_tx.is_none());
+        assert_eq!(
+            ctx.pending_relay_close.map(|c| c.reason),
+            Some("uplink_channel_closed")
+        );
+        assert_eq!(ctx.pending_relay_close_since_secs, Some(10));
+        assert_eq!(ctx.pending_relay_close_last_egress_progress_secs, Some(10));
+        assert_eq!(ctx.pending_relay_close_last_egress_queue_bytes, 217_725);
     }
 
     #[test]
@@ -7735,16 +10658,24 @@ mod tests {
             reason: "uplink_channel_closed",
         };
 
-        assert!(start_deferred_close_for_pending_downlink(&mut ctx, close, 12));
+        assert!(start_deferred_close_for_pending_downlink(
+            &mut ctx, close, 12
+        ));
         assert_eq!(ctx.state, SocketState::Closing);
         assert!(ctx.uplink_tx.is_none());
-        assert_eq!(ctx.pending_relay_close.map(|c| c.reason), Some("uplink_channel_closed"));
+        assert_eq!(
+            ctx.pending_relay_close.map(|c| c.reason),
+            Some("uplink_channel_closed")
+        );
         assert_eq!(ctx.pending_relay_close_since_secs, Some(12));
         assert_eq!(ctx.pending_relay_close_last_progress_secs, Some(12));
         assert_eq!(ctx.pending_relay_close_last_pending_bytes, 4);
         assert_eq!(ctx.downlink_pending_last_progress_secs, Some(12));
         assert_eq!(ctx.downlink_pending_last_pending_bytes, 4);
-        assert_eq!(ctx.conn_epoch, 5, "pending deferral must not rearm or bump epoch");
+        assert_eq!(
+            ctx.conn_epoch, 5,
+            "pending deferral must not rearm or bump epoch"
+        );
     }
 
     #[test]
@@ -7760,7 +10691,9 @@ mod tests {
             reason: "uplink_channel_closed",
         };
 
-        assert!(!start_deferred_close_for_pending_downlink(&mut ctx, close, 12));
+        assert!(!start_deferred_close_for_pending_downlink(
+            &mut ctx, close, 12
+        ));
         assert_eq!(ctx.state, SocketState::Relaying);
         assert!(ctx.uplink_tx.is_some());
         assert!(ctx.pending_relay_close.is_none());
@@ -7797,31 +10730,71 @@ mod tests {
         };
 
         assert!(
-            should_keep_deferred_close_for_egress(&mut ctx, snapshot, cfg, 14),
+            should_keep_deferred_close_for_egress(&mut ctx, snapshot, cfg, 14, false),
             "high egress queue within grace should keep the close deferred"
         );
 
         snapshot.send_queue = 300_000;
         assert!(
-            should_keep_deferred_close_for_egress(&mut ctx, snapshot, cfg, 14),
+            should_keep_deferred_close_for_egress(&mut ctx, snapshot, cfg, 14, false),
             "queue drain progress should refresh the bounded grace"
         );
         assert_eq!(ctx.pending_relay_close_last_egress_progress_secs, Some(14));
         assert_eq!(ctx.pending_relay_close_last_egress_queue_bytes, 300_000);
 
         assert!(
-            should_keep_deferred_close_for_egress(&mut ctx, snapshot, cfg, 18),
+            should_keep_deferred_close_for_egress(&mut ctx, snapshot, cfg, 18, false),
             "still above low but within refreshed grace should keep waiting"
         );
         assert!(
-            !should_keep_deferred_close_for_egress(&mut ctx, snapshot, cfg, 19),
+            !should_keep_deferred_close_for_egress(&mut ctx, snapshot, cfg, 19, false),
             "above low without progress must remain bounded"
         );
 
         snapshot.send_queue = 131_072;
         assert!(
-            !should_keep_deferred_close_for_egress(&mut ctx, snapshot, cfg, 20),
+            !should_keep_deferred_close_for_egress(&mut ctx, snapshot, cfg, 20, false),
             "low watermark means queued egress drained enough to finish close"
+        );
+    }
+
+    #[test]
+    fn deferred_close_sends_local_eof_after_pending_drains() {
+        let mut ctx = SocketCtx::new(12345);
+        ctx.state = SocketState::Closing;
+        ctx.pending_relay_close = Some(RelayClose {
+            epoch: 5,
+            direction: "remote_to_local",
+            reason: "remote_eof",
+        });
+        ctx.downlink_pending = vec![1, 2, 3];
+        let snapshot = SocketCloseSnapshot {
+            tcp_state: TcpState::Established,
+            active: true,
+            can_send: true,
+            can_recv: false,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 1_048_576,
+            send_queue: 720_896,
+            recv_queue: 0,
+        };
+
+        assert!(
+            !should_send_local_eof_for_deferred_close(&ctx, snapshot),
+            "remote EOF must not send local FIN before terminal pending bytes enter smoltcp"
+        );
+
+        ctx.downlink_pending.clear();
+        assert!(
+            should_send_local_eof_for_deferred_close(&ctx, snapshot),
+            "once terminal pending is accepted, local FIN should be queued behind the egress tail"
+        );
+
+        ctx.local_eof_sent = true;
+        assert!(
+            !should_send_local_eof_for_deferred_close(&ctx, snapshot),
+            "local FIN must be idempotent while the TCP state machine drains"
         );
     }
 
@@ -7837,7 +10810,11 @@ mod tests {
         assert!(ctx.buffer_uplink(&fill), "恰好填到上限应接受");
         assert_eq!(ctx.uplink_buffer.len(), MAX_UPLINK_BUFFER);
         assert!(!ctx.buffer_uplink(&[0u8; 1]), "超上限 1B 应丢弃");
-        assert_eq!(ctx.uplink_buffer.len(), MAX_UPLINK_BUFFER, "丢弃不改变 buffer");
+        assert_eq!(
+            ctx.uplink_buffer.len(),
+            MAX_UPLINK_BUFFER,
+            "丢弃不改变 buffer"
+        );
     }
 
     #[test]
@@ -7854,7 +10831,10 @@ mod tests {
             pump_established_uplink(&mut ctx, TcpState::Established, 0, || payloads.pop_front()),
             EstablishedUplink::Handled
         ));
-        assert!(payloads.is_empty(), "one dirty pass should drain the readable batch");
+        assert!(
+            payloads.is_empty(),
+            "one dirty pass should drain the readable batch"
+        );
         assert_eq!(ctx.state, SocketState::Relaying);
 
         for expected in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()] {
@@ -7900,7 +10880,8 @@ mod tests {
         use std::collections::VecDeque;
 
         let (tx, _rx) = mpsc::channel(1);
-        tx.try_send(RelayCommand::Data(b"occupied".to_vec())).unwrap();
+        tx.try_send(RelayCommand::Data(b"occupied".to_vec()))
+            .unwrap();
         let mut ctx = SocketCtx::new(80);
         ctx.uplink_tx = Some(tx);
         let mut payloads: VecDeque<Vec<u8>> = VecDeque::from([b"must-stay".to_vec()]);
@@ -7928,7 +10909,10 @@ mod tests {
         ));
         assert!(!ctx.local_fin_sent);
         assert_eq!(ctx.local_fin_pending_since_secs, Some(10));
-        assert!(rx.try_recv().is_err(), "initial CloseWait should defer Finish");
+        assert!(
+            rx.try_recv().is_err(),
+            "initial CloseWait should defer Finish"
+        );
 
         assert!(matches!(
             pump_established_uplink(&mut ctx, TcpState::CloseWait, 14, || None),
@@ -7966,7 +10950,10 @@ mod tests {
             EstablishedUplink::Handled
         ));
         assert!(!ctx.local_fin_sent);
-        assert!(rx.try_recv().is_err(), "remote progress should extend Finish defer");
+        assert!(
+            rx.try_recv().is_err(),
+            "remote progress should extend Finish defer"
+        );
 
         assert!(matches!(
             pump_established_uplink(&mut ctx, TcpState::CloseWait, 18, || None),
@@ -7974,7 +10961,8 @@ mod tests {
         ));
         assert!(ctx.local_fin_sent);
         assert!(matches!(
-            rx.try_recv().expect("finish should be sent after remote quiet"),
+            rx.try_recv()
+                .expect("finish should be sent after remote quiet"),
             RelayCommand::Finish
         ));
     }
@@ -7997,17 +10985,49 @@ mod tests {
         let mut pool = FakeIpPool::new();
 
         // 迟到 epoch 3 ≠ 5 → 丢弃，状态/uplink_tx 不变。
-        let stale = HandshakeDone { handle, epoch: 3, result: Ok(Box::new(tokio::io::duplex(64).0)) };
-        handle_handshake_done(stale, &mut sockets, &mut socket_ctxs, &global_tx, &mut pool, 0, &Metrics::new());
+        let stale = HandshakeDone {
+            handle,
+            epoch: 3,
+            result: Ok(Box::new(tokio::io::duplex(64).0)),
+        };
+        handle_handshake_done(
+            stale,
+            &mut sockets,
+            &mut socket_ctxs,
+            &global_tx,
+            &mut pool,
+            0,
+            &Metrics::new(),
+        );
         let ctx = socket_ctxs.get(&handle).unwrap();
-        assert_eq!(ctx.state, SocketState::HandshakePending, "迟到 epoch → 不装、状态不变");
+        assert_eq!(
+            ctx.state,
+            SocketState::HandshakePending,
+            "迟到 epoch → 不装、状态不变"
+        );
         assert!(ctx.uplink_tx.is_none(), "迟到 epoch → 不安装 uplink_tx");
 
         // 匹配 epoch 5 + Ok → 安装 relay。
-        let ok = HandshakeDone { handle, epoch: 5, result: Ok(Box::new(tokio::io::duplex(64).0)) };
-        handle_handshake_done(ok, &mut sockets, &mut socket_ctxs, &global_tx, &mut pool, 0, &Metrics::new());
+        let ok = HandshakeDone {
+            handle,
+            epoch: 5,
+            result: Ok(Box::new(tokio::io::duplex(64).0)),
+        };
+        handle_handshake_done(
+            ok,
+            &mut sockets,
+            &mut socket_ctxs,
+            &global_tx,
+            &mut pool,
+            0,
+            &Metrics::new(),
+        );
         let ctx = socket_ctxs.get(&handle).unwrap();
-        assert_eq!(ctx.state, SocketState::Relaying, "匹配 epoch → 安装 relay 进 Relaying");
+        assert_eq!(
+            ctx.state,
+            SocketState::Relaying,
+            "匹配 epoch → 安装 relay 进 Relaying"
+        );
         assert!(ctx.uplink_tx.is_some(), "匹配 epoch → 安装 uplink_tx");
     }
 
@@ -8026,13 +11046,36 @@ mod tests {
         socket_ctxs.insert(handle, ctx);
         let (global_tx, _grx) = mpsc::channel(8);
 
-        let err = HandshakeDone { handle, epoch: 2, result: Err(ClientError::Reality("open 失败".into())) };
-        handle_handshake_done(err, &mut sockets, &mut socket_ctxs, &global_tx, &mut pool, 1, &Metrics::new());
+        let err = HandshakeDone {
+            handle,
+            epoch: 2,
+            result: Err(ClientError::Reality("open 失败".into())),
+        };
+        handle_handshake_done(
+            err,
+            &mut sockets,
+            &mut socket_ctxs,
+            &global_tx,
+            &mut pool,
+            1,
+            &Metrics::new(),
+        );
         let ctx = socket_ctxs.get(&handle).unwrap();
-        assert_eq!(ctx.state, SocketState::Listening, "失败 → rearm 回 Listening");
-        assert!(ctx.fake_ip.is_none(), "失败 rearm 释放 fake-IP（平衡 spawn 的 acquire）");
+        assert_eq!(
+            ctx.state,
+            SocketState::Listening,
+            "失败 → rearm 回 Listening"
+        );
+        assert!(
+            ctx.fake_ip.is_none(),
+            "失败 rearm 释放 fake-IP（平衡 spawn 的 acquire）"
+        );
         assert!(ctx.uplink_buffer.is_empty(), "rearm 清 buffer");
-        assert_eq!(pool.sweep(1000, 300), 1, "refcount 归零 → 可回收（acquire/release 平衡）");
+        assert_eq!(
+            pool.sweep(1000, 300),
+            1,
+            "refcount 归零 → 可回收（acquire/release 平衡）"
+        );
     }
 
     /// Async open 成功 → 按序 flush open 期间缓存的上行字节到 relay 流。
@@ -8050,12 +11093,27 @@ mod tests {
 
         // near = relay 写入端（上游流）；far = 测试读端（模拟出口收到的上行）。
         let (near, mut far) = tokio::io::duplex(1024);
-        let ok = HandshakeDone { handle, epoch: 1, result: Ok(Box::new(near)) };
-        handle_handshake_done(ok, &mut sockets, &mut socket_ctxs, &global_tx, &mut pool, 0, &Metrics::new());
+        let ok = HandshakeDone {
+            handle,
+            epoch: 1,
+            result: Ok(Box::new(near)),
+        };
+        handle_handshake_done(
+            ok,
+            &mut sockets,
+            &mut socket_ctxs,
+            &global_tx,
+            &mut pool,
+            0,
+            &Metrics::new(),
+        );
 
         let mut got = vec![0u8; b"HELLO-BUFFERED".len()];
         far.read_exact(&mut got).await.unwrap();
-        assert_eq!(&got, b"HELLO-BUFFERED", "open 成功后按序 flush 缓存的上行字节");
+        assert_eq!(
+            &got, b"HELLO-BUFFERED",
+            "open 成功后按序 flush 缓存的上行字节"
+        );
     }
 
     #[test]
@@ -8080,8 +11138,7 @@ mod tests {
         );
         assert_eq!(config.tun_rx_drain_budget, DEFAULT_TUN_RX_DRAIN_BUDGET);
         assert_eq!(
-            config.tun_rx_active_flow_timer_ms,
-            DEFAULT_TUN_RX_ACTIVE_FLOW_TIMER_DRAIN_MS,
+            config.tun_rx_active_flow_timer_ms, DEFAULT_TUN_RX_ACTIVE_FLOW_TIMER_DRAIN_MS,
             "Knife14cp timer drain regressed VPS throughput and must stay opt-in"
         );
         assert!(
@@ -8095,7 +11152,11 @@ mod tests {
     fn parse_metrics_secs_clamps_and_defaults() {
         assert_eq!(parse_metrics_secs(Some("5")), 5);
         assert_eq!(parse_metrics_secs(Some("  10 ")), 10);
-        assert_eq!(parse_metrics_secs(Some("0")), METRICS_SNAPSHOT_SECS, "0 必回落（否则 interval panic）");
+        assert_eq!(
+            parse_metrics_secs(Some("0")),
+            METRICS_SNAPSHOT_SECS,
+            "0 必回落（否则 interval panic）"
+        );
         assert_eq!(parse_metrics_secs(Some("abc")), METRICS_SNAPSHOT_SECS);
         assert_eq!(parse_metrics_secs(Some("")), METRICS_SNAPSHOT_SECS);
         assert_eq!(parse_metrics_secs(None), METRICS_SNAPSHOT_SECS);
@@ -8110,7 +11171,10 @@ mod tests {
         assert!(!parse_profile_loop(Some("false")));
         assert!(!parse_profile_loop(Some("yes")));
         assert!(!parse_profile_loop(Some("")));
-        assert!(!parse_profile_loop(None), "缺省关——默认 NoopSink 零开销路径");
+        assert!(
+            !parse_profile_loop(None),
+            "缺省关——默认 NoopSink 零开销路径"
+        );
     }
 
     /// 刀14c：TUN MTU 解析。1200 是 US-client suite 的测试基准；默认仍 1500 以保持零惊喜。
@@ -8129,11 +11193,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_tun_rx_drain_budget_allows_zero_and_bounds() {
+    fn parse_tun_tx_queue_len_accepts_positive_estimates_and_defaults() {
+        assert_eq!(parse_tun_tx_queue_len(Some("5000")), 5000);
+        assert_eq!(parse_tun_tx_queue_len(Some(" 500 ")), 500);
         assert_eq!(
-            parse_tun_rx_drain_budget(None),
-            DEFAULT_TUN_RX_DRAIN_BUDGET
+            parse_tun_tx_queue_len(Some("0")),
+            DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE
         );
+        assert_eq!(
+            parse_tun_tx_queue_len(Some("abc")),
+            DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE
+        );
+        assert_eq!(
+            parse_tun_tx_queue_len(None),
+            DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE
+        );
+    }
+
+    #[test]
+    fn parse_tun_rx_drain_budget_allows_zero_and_bounds() {
+        assert_eq!(parse_tun_rx_drain_budget(None), DEFAULT_TUN_RX_DRAIN_BUDGET);
         assert_eq!(
             parse_tun_rx_drain_budget(Some("abc")),
             DEFAULT_TUN_RX_DRAIN_BUDGET
@@ -8550,13 +11629,13 @@ mod tests {
 
         pacer.on_timer_tick();
         assert!(
-            pacer.allow_remote_payload_flush(32, 0, 129, cfg),
+            pacer.allow_remote_payload_flush(32, 0, tx_queue_flush_threshold(cfg) - 1, cfg),
             "tx-queue-only pressure below the bounded flush cap should still allow immediate flush"
         );
 
         pacer.on_timer_tick();
         assert!(
-            !pacer.allow_remote_payload_flush(32, 0, 130, cfg),
+            !pacer.allow_remote_payload_flush(32, 0, tx_queue_flush_threshold(cfg), cfg),
             "tx-queue-only pressure at the bounded flush cap should defer immediate flush"
         );
         assert_eq!(
@@ -8574,13 +11653,13 @@ mod tests {
         let mut pacer = DownlinkEgressPacer::new(100);
 
         assert!(
-            pacer.allow_remote_payload_flush(16, 0, 129, cfg),
+            pacer.allow_remote_payload_flush(16, 0, tx_queue_flush_threshold(cfg) - 1, cfg),
             "no-pending flush should keep some headroom above soft high"
         );
 
         pacer.on_timer_tick();
         assert!(
-            !pacer.allow_remote_payload_flush(16, 0, 130, cfg),
+            !pacer.allow_remote_payload_flush(16, 0, tx_queue_flush_threshold(cfg), cfg),
             "no-pending flush should stop at the bounded midpoint before hard cap"
         );
         assert_eq!(
@@ -8662,11 +11741,29 @@ mod tests {
         };
 
         assert!(
-            !next_downlink_backpressure(false, DownlinkPressureStats::new(0, 0, 159, 159), cfg),
+            !next_downlink_backpressure(
+                false,
+                DownlinkPressureStats::new(
+                    0,
+                    0,
+                    tx_queue_pause_threshold(cfg) - 1,
+                    tx_queue_pause_threshold(cfg) - 1
+                ),
+                cfg
+            ),
             "below the tx-queue-only hard cap keeps global_rx enabled when app pending is empty"
         );
         assert!(
-            next_downlink_backpressure(false, DownlinkPressureStats::new(0, 0, 160, 160), cfg),
+            next_downlink_backpressure(
+                false,
+                DownlinkPressureStats::new(
+                    0,
+                    0,
+                    tx_queue_pause_threshold(cfg),
+                    tx_queue_pause_threshold(cfg)
+                ),
+                cfg
+            ),
             "hitting the tx-queue-only hard cap pauses global_rx"
         );
         assert!(
@@ -8691,11 +11788,29 @@ mod tests {
             "tx-queue-only pressure at the soft high watermark should not pause immediately"
         );
         assert!(
-            !next_downlink_backpressure(false, DownlinkPressureStats::new(0, 0, 159, 159), cfg),
+            !next_downlink_backpressure(
+                false,
+                DownlinkPressureStats::new(
+                    0,
+                    0,
+                    tx_queue_pause_threshold(cfg) - 1,
+                    tx_queue_pause_threshold(cfg) - 1
+                ),
+                cfg
+            ),
             "bounded tx-queue-only headroom should keep global_rx enabled"
         );
         assert!(
-            next_downlink_backpressure(false, DownlinkPressureStats::new(0, 0, 160, 160), cfg),
+            next_downlink_backpressure(
+                false,
+                DownlinkPressureStats::new(
+                    0,
+                    0,
+                    tx_queue_pause_threshold(cfg),
+                    tx_queue_pause_threshold(cfg)
+                ),
+                cfg
+            ),
             "tx-queue-only pressure still pauses at the derived hard cap"
         );
         assert!(
@@ -8714,7 +11829,12 @@ mod tests {
             high_bytes: 100,
             low_bytes: 40,
         };
-        let credit_edge = DownlinkPressureStats::new(0, 0, 157, 157);
+        let credit_edge = DownlinkPressureStats::new(
+            0,
+            0,
+            tx_queue_credit_spend_threshold(cfg),
+            tx_queue_credit_spend_threshold(cfg),
+        );
         let recovered = DownlinkPressureStats::new(0, 0, 100, 100);
 
         assert!(
@@ -8931,14 +12051,8 @@ mod tests {
             low_bytes: 1_048_576,
         };
         let mut feedback = TunEgressFeedbackState::default();
-        feedback.observe_pressure(
-            DownlinkPressureStats::new(0, 0, 3_786_786, 3_786_786),
-            cfg,
-        );
-        feedback.observe_pressure(
-            DownlinkPressureStats::new(0, 0, 4_194_304, 4_194_304),
-            cfg,
-        );
+        feedback.observe_pressure(DownlinkPressureStats::new(0, 0, 3_786_786, 3_786_786), cfg);
+        feedback.observe_pressure(DownlinkPressureStats::new(0, 0, 4_194_304, 4_194_304), cfg);
 
         let event = feedback.update(
             &TunEgressDropSample::Delta {
@@ -9004,7 +12118,10 @@ mod tests {
             }),
             "drops while already paused should remain visible"
         );
-        assert_eq!(feedback.pause_edges, 1, "already-paused drops must not add pause edges");
+        assert_eq!(
+            feedback.pause_edges, 1,
+            "already-paused drops must not add pause edges"
+        );
 
         assert_eq!(
             feedback.update(
@@ -9116,8 +12233,14 @@ mod tests {
                 previous: 10,
                 total: 1,
             },
-            TunEgressDropSample::Delta { total: 10, delta: 0 },
-            TunEgressDropSample::Delta { total: 20, delta: 10 },
+            TunEgressDropSample::Delta {
+                total: 10,
+                delta: 0,
+            },
+            TunEgressDropSample::Delta {
+                total: 20,
+                delta: 10,
+            },
         ];
         let stats = [
             DownlinkPressureStats::new(0, 0, 99, 99),
@@ -9185,6 +12308,11 @@ mod tests {
 
         diag.note_attempt(TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_PRE);
         diag.note_attempt(TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD);
+        diag.note_attempt(TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_DEFERRED);
+        diag.note_attempt(TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_DEFERRED_DELAYED);
+        diag.note_attempt(TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_DEFERRED_PRESSURE);
+        diag.note_attempt(TUN_RX_DRAIN_SOURCE_RELAY_GAP_HINT);
+        diag.note_attempt(TUN_RX_DRAIN_SOURCE_RELAY_GAP_HINT_FOLLOWUP);
         diag.note_attempt(TUN_RX_DRAIN_SOURCE_TIMER_PRESSURE);
         diag.note_attempt(TUN_RX_DRAIN_SOURCE_TIMER_ACTIVE_FLOW);
         diag.note_attempt("other");
@@ -9197,9 +12325,26 @@ mod tests {
 
         let line = format_tun_rx_drain_diag(&diag);
         assert!(line.contains("tcp-tun-rx-drain"));
-        assert!(line.contains("attempts=5"), "{line}");
+        assert!(line.contains("attempts=10"), "{line}");
         assert!(line.contains("pre_payload_attempts=1"), "{line}");
         assert!(line.contains("remote_payload_attempts=1"), "{line}");
+        assert!(
+            line.contains("remote_payload_deferred_attempts=1"),
+            "{line}"
+        );
+        assert!(
+            line.contains("remote_payload_deferred_delayed_attempts=1"),
+            "{line}"
+        );
+        assert!(
+            line.contains("remote_payload_deferred_pressure_attempts=1"),
+            "{line}"
+        );
+        assert!(line.contains("relay_gap_hint_attempts=1"), "{line}");
+        assert!(
+            line.contains("relay_gap_hint_followup_attempts=1"),
+            "{line}"
+        );
         assert!(line.contains("maintenance_attempts=1"), "{line}");
         assert!(line.contains("timer_active_flow_attempts=1"), "{line}");
         assert!(line.contains("other_attempts=1"), "{line}");
@@ -9222,6 +12367,450 @@ mod tests {
 
         ctx.downlink_pending.extend_from_slice(&[1, 2, 3]);
         assert!(should_drain_tun_rx_after_remote_payload(Some(&ctx), 0));
+    }
+
+    #[test]
+    fn relay_gap_ack_drain_state_coalesces_budget_exhausted_followups() {
+        let mut state = RelayGapAckDrainState::default();
+
+        assert!(!state.is_armed());
+        assert!(state.arm_after_budget_exhausted());
+        assert!(state.is_armed());
+        assert!(
+            !state.arm_after_budget_exhausted(),
+            "additional exhausted gap drains should share the already armed follow-up"
+        );
+        assert_eq!(
+            state.take_due(),
+            Some(RelayGapAckDrainFollowup::BudgetExhausted)
+        );
+        assert!(!state.is_armed());
+        assert!(
+            state.take_due().is_none(),
+            "a consumed follow-up should not fire again without another exhausted drain"
+        );
+        assert!(state.arm_after_budget_exhausted());
+    }
+
+    #[test]
+    fn relay_gap_ack_drain_state_probes_after_empty_hints_then_stops() {
+        let mut state = RelayGapAckDrainState::default();
+
+        assert!(state.arm_after_hint_drain(0, 240));
+        assert_eq!(state.take_due(), Some(RelayGapAckDrainFollowup::Probe));
+
+        for remaining in (0..=RELAY_GAP_ACK_DRAIN_EMPTY_FOLLOWUPS).rev() {
+            let should_rearm = remaining > 0;
+            assert_eq!(
+                state.arm_after_followup_drain(RelayGapAckDrainFollowup::Probe, 0, 240),
+                should_rearm,
+                "empty relay-gap probes must be bounded"
+            );
+            if should_rearm {
+                assert_eq!(state.take_due(), Some(RelayGapAckDrainFollowup::Probe));
+            }
+        }
+        assert!(!state.is_armed());
+    }
+
+    #[test]
+    fn relay_gap_ack_drain_state_keeps_progress_probes_short() {
+        let mut state = RelayGapAckDrainState::default();
+
+        assert!(state.arm_after_hint_drain(1, 240));
+        assert_eq!(state.take_due(), Some(RelayGapAckDrainFollowup::Probe));
+        assert!(state.arm_after_followup_drain(RelayGapAckDrainFollowup::Probe, 0, 240));
+        assert_eq!(state.take_due(), Some(RelayGapAckDrainFollowup::Probe));
+        assert!(
+            !state.arm_after_followup_drain(RelayGapAckDrainFollowup::Probe, 0, 240),
+            "a progress probe gets one trailing empty retry, not an unbounded timer"
+        );
+    }
+
+    #[test]
+    fn relay_gap_ack_drain_state_escalates_probe_back_to_budget_followup() {
+        let mut state = RelayGapAckDrainState::default();
+
+        assert!(state.arm_after_hint_drain(0, 240));
+        assert_eq!(state.take_due(), Some(RelayGapAckDrainFollowup::Probe));
+        assert!(state.arm_after_followup_drain(RelayGapAckDrainFollowup::Probe, 240, 240));
+        assert_eq!(
+            state.take_due(),
+            Some(RelayGapAckDrainFollowup::BudgetExhausted),
+            "a probe that drains a full budget must switch to the existing pressure follow-up path"
+        );
+    }
+
+    #[test]
+    fn deferred_ack_drain_state_coalesces_remote_payload_bursts() {
+        let mut state = DeferredAckDrainState::default();
+
+        assert!(!state.is_armed());
+        assert!(state.arm_after_remote_payload());
+        assert!(state.is_armed());
+        assert!(
+            !state.arm_after_remote_payload(),
+            "additional remote payloads should share the already armed one-shot drain"
+        );
+        assert_eq!(state.take_due(), Some(DeferredAckDrainMode::ActiveFlow));
+        assert!(state.arm_after_delayed_ack_probe());
+        assert_eq!(state.take_due(), Some(DeferredAckDrainMode::DelayedAck));
+        assert!(
+            state.take_due().is_none(),
+            "a delayed ACK probe is a bounded second chance, not a repeating timer"
+        );
+        assert!(!state.is_armed());
+        assert!(
+            state.take_due().is_none(),
+            "a consumed one-shot should not fire again without new downlink work"
+        );
+        assert!(state.arm_after_remote_payload());
+    }
+
+    #[test]
+    fn deferred_ack_drain_state_escalates_after_budget_exhaustion() {
+        let mut state = DeferredAckDrainState::default();
+
+        assert!(state.take_due().is_none());
+        assert!(state.arm_after_remote_payload());
+        assert_eq!(state.take_due(), Some(DeferredAckDrainMode::ActiveFlow));
+
+        assert!(state.arm_after_budget_exhausted());
+        assert_eq!(state.take_due(), Some(DeferredAckDrainMode::Pressure));
+        assert!(state.arm_after_delayed_ack_probe());
+        assert_eq!(state.take_due(), Some(DeferredAckDrainMode::DelayedAck));
+        assert!(state.arm_after_budget_exhausted());
+        assert_eq!(
+            state.take_due(),
+            Some(DeferredAckDrainMode::Pressure),
+            "a delayed ACK probe that exhausts its budget should reuse the bounded pressure path"
+        );
+        assert!(state.arm_after_budget_exhausted());
+        assert_eq!(
+            state.take_due(),
+            Some(DeferredAckDrainMode::Pressure),
+            "pressure follow-up should stay pressure-sized while it continues exhausting"
+        );
+
+        assert!(state.arm_after_remote_payload());
+        assert_eq!(
+            state.take_due(),
+            Some(DeferredAckDrainMode::ActiveFlow),
+            "a fresh remote payload starts with the normal active-flow budget"
+        );
+    }
+
+    #[test]
+    fn deferred_ack_drain_budget_tapers_with_egress_headroom() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 524_288,
+            low_bytes: 131_072,
+        };
+        let healthy = DownlinkPressureStats::new(
+            0,
+            0,
+            tx_queue_flush_threshold(cfg).saturating_sub(1),
+            tx_queue_flush_threshold(cfg).saturating_sub(1),
+        );
+        let near_credit = DownlinkPressureStats::new(
+            0,
+            0,
+            tx_queue_credit_spend_threshold(cfg).saturating_sub(1),
+            tx_queue_credit_spend_threshold(cfg).saturating_sub(1),
+        );
+        let credit_edge = DownlinkPressureStats::new(
+            0,
+            0,
+            tx_queue_credit_spend_threshold(cfg),
+            tx_queue_credit_spend_threshold(cfg),
+        );
+        let pause_edge = DownlinkPressureStats::new(
+            0,
+            0,
+            tx_queue_pause_threshold(cfg),
+            tx_queue_pause_threshold(cfg),
+        );
+
+        assert_eq!(
+            tun_rx_drain_budget_for_deferred_ack_drain(
+                DeferredAckDrainMode::ActiveFlow,
+                healthy,
+                false,
+                0,
+                cfg,
+                1_200
+            ),
+            active_flow_tun_rx_drain_budget(cfg, 1_200),
+            "deferred ACK drain may run at full budget while egress has flush headroom"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_deferred_ack_drain(
+                DeferredAckDrainMode::ActiveFlow,
+                near_credit,
+                false,
+                0,
+                cfg,
+                1_200
+            ),
+            1,
+            "deferred ACK drain should taper to a single ACK/window packet near the credit edge"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_deferred_ack_drain(
+                DeferredAckDrainMode::ActiveFlow,
+                credit_edge,
+                false,
+                0,
+                cfg,
+                1_200
+            ),
+            1,
+            "credit edge still needs a trickle ACK drain to avoid TUIC stream starvation"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_deferred_ack_drain(
+                DeferredAckDrainMode::ActiveFlow,
+                pause_edge,
+                false,
+                0,
+                cfg,
+                1_200
+            ),
+            0,
+            "deferred ACK drain must stop at the hard local egress pause edge"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_deferred_ack_drain(
+                DeferredAckDrainMode::ActiveFlow,
+                healthy,
+                true,
+                0,
+                cfg,
+                1_200
+            ),
+            0,
+            "TUN egress feedback pause should suppress active ACK drain"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_deferred_ack_drain(
+                DeferredAckDrainMode::ActiveFlow,
+                healthy,
+                false,
+                9,
+                cfg,
+                1_200
+            ),
+            9,
+            "explicit operator budget still controls the healthy maximum"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_deferred_ack_drain(
+                DeferredAckDrainMode::ActiveFlow,
+                credit_edge,
+                false,
+                9,
+                cfg,
+                1_200
+            ),
+            1,
+            "explicit operator budget is still clamped by the safety headroom curve"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_deferred_ack_drain(
+                DeferredAckDrainMode::DelayedAck,
+                healthy,
+                false,
+                0,
+                cfg,
+                1_200
+            ),
+            active_flow_tun_rx_drain_budget(cfg, 1_200),
+            "delayed ACK probe uses the same small active-flow budget as the immediate deferred drain"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_deferred_ack_drain(
+                DeferredAckDrainMode::Pressure,
+                healthy,
+                false,
+                0,
+                cfg,
+                1_200
+            ),
+            pressure_tun_rx_drain_budget(cfg, 1_200),
+            "a budget-exhausted deferred drain escalates to pressure budget"
+        );
+    }
+
+    #[test]
+    fn relay_gap_hint_tun_rx_drain_budget_requires_current_relay_epoch() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 524_288,
+            low_bytes: 131_072,
+        };
+        let healthy = DownlinkPressureStats::new(
+            0,
+            0,
+            tx_queue_flush_threshold(cfg).saturating_sub(1),
+            tx_queue_flush_threshold(cfg).saturating_sub(1),
+        );
+        let near_credit = DownlinkPressureStats::new(
+            0,
+            0,
+            tx_queue_credit_spend_threshold(cfg).saturating_sub(1),
+            tx_queue_credit_spend_threshold(cfg).saturating_sub(1),
+        );
+        let credit_edge = DownlinkPressureStats::new(
+            0,
+            0,
+            tx_queue_credit_spend_threshold(cfg),
+            tx_queue_credit_spend_threshold(cfg),
+        );
+        let pause_edge = DownlinkPressureStats::new(
+            0,
+            0,
+            tx_queue_pause_threshold(cfg),
+            tx_queue_pause_threshold(cfg),
+        );
+        let mut ctx = SocketCtx::new(443);
+        ctx.state = SocketState::Relaying;
+        ctx.conn_epoch = 7;
+
+        assert_eq!(
+            tun_rx_drain_budget_for_relay_gap_hint(Some(&ctx), 6, healthy, false, 0, cfg, 1_200),
+            0,
+            "stale relay gap hints must not scan TUN RX"
+        );
+
+        ctx.state = SocketState::Listening;
+        assert_eq!(
+            tun_rx_drain_budget_for_relay_gap_hint(Some(&ctx), 7, healthy, false, 0, cfg, 1_200),
+            0,
+            "non-relay slots must ignore late gap hints"
+        );
+
+        ctx.state = SocketState::Relaying;
+        assert_eq!(
+            tun_rx_drain_budget_for_relay_gap_hint(Some(&ctx), 7, healthy, false, 0, cfg, 1_200),
+            pressure_tun_rx_drain_budget(cfg, 1_200),
+            "current relay read gaps are a strong ACK/window starvation signal"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_relay_gap_hint(
+                Some(&ctx),
+                7,
+                near_credit,
+                false,
+                0,
+                cfg,
+                1_200
+            ),
+            1,
+            "relay gap hints should taper to a single packet near the credit edge"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_relay_gap_hint(
+                Some(&ctx),
+                7,
+                credit_edge,
+                false,
+                0,
+                cfg,
+                1_200
+            ),
+            1,
+            "relay gap hints must keep a trickle ACK drain at the credit edge"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_relay_gap_hint(Some(&ctx), 7, pause_edge, false, 0, cfg, 1_200),
+            0,
+            "relay gap hints should stop once local egress reaches the hard pause edge"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_relay_gap_hint(Some(&ctx), 7, healthy, true, 0, cfg, 1_200),
+            0,
+            "TUN feedback pause should suppress relay gap hints"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_relay_gap_hint(Some(&ctx), 7, healthy, false, 9, cfg, 1_200),
+            9,
+            "explicit operator drain budget still controls the healthy maximum"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_relay_gap_hint(
+                Some(&ctx),
+                7,
+                credit_edge,
+                false,
+                9,
+                cfg,
+                1_200
+            ),
+            1,
+            "explicit operator drain budget is still clamped by the safety headroom curve"
+        );
+    }
+
+    #[test]
+    fn relay_gap_followup_tun_rx_drain_budget_tapers_with_egress_headroom() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 524_288,
+            low_bytes: 131_072,
+        };
+        let healthy = DownlinkPressureStats::new(
+            0,
+            0,
+            tx_queue_flush_threshold(cfg).saturating_sub(1),
+            tx_queue_flush_threshold(cfg).saturating_sub(1),
+        );
+        let near_credit = DownlinkPressureStats::new(
+            0,
+            0,
+            tx_queue_credit_spend_threshold(cfg).saturating_sub(1),
+            tx_queue_credit_spend_threshold(cfg).saturating_sub(1),
+        );
+        let credit_edge = DownlinkPressureStats::new(
+            0,
+            0,
+            tx_queue_credit_spend_threshold(cfg),
+            tx_queue_credit_spend_threshold(cfg),
+        );
+        let pause_edge = DownlinkPressureStats::new(
+            0,
+            0,
+            tx_queue_pause_threshold(cfg),
+            tx_queue_pause_threshold(cfg),
+        );
+
+        assert_eq!(
+            tun_rx_drain_budget_for_relay_gap_followup(healthy, false, 0, cfg, 1_200),
+            pressure_tun_rx_drain_budget(cfg, 1_200),
+            "gap follow-up should continue at pressure budget while egress is healthy"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_relay_gap_followup(near_credit, false, 0, cfg, 1_200),
+            1,
+            "gap follow-up should taper to a single ACK/window packet near credit edge"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_relay_gap_followup(credit_edge, false, 0, cfg, 1_200),
+            1,
+            "credit edge still keeps a trickle ACK drain for window recovery"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_relay_gap_followup(pause_edge, false, 0, cfg, 1_200),
+            0,
+            "gap follow-up must stop at the hard local egress pause edge"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_relay_gap_followup(healthy, true, 0, cfg, 1_200),
+            0,
+            "TUN feedback pause should suppress gap follow-up"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_relay_gap_followup(healthy, false, 9, cfg, 1_200),
+            9,
+            "explicit operator budget still controls the healthy maximum"
+        );
     }
 
     #[test]
@@ -9440,34 +13029,101 @@ mod tests {
         );
 
         assert_eq!(
-            tun_rx_drain_budget_for_dirty_pressure(false, credit_edge, 0, cfg, 1_200),
+            tun_rx_drain_budget_for_dirty_pressure(false, false, credit_edge, 0, cfg, 1_200),
             0,
             "pressure without dirty downlink work should not scan TUN RX"
         );
         assert_eq!(
-            tun_rx_drain_budget_for_dirty_pressure(true, below_credit, 0, cfg, 1_200),
+            tun_rx_drain_budget_for_dirty_pressure(true, false, below_credit, 0, cfg, 1_200),
             0,
             "maintenance drain should stay off below the credit edge"
         );
         assert_eq!(
-            tun_rx_drain_budget_for_dirty_pressure(true, credit_edge, 0, cfg, 1_200),
+            tun_rx_drain_budget_for_dirty_pressure(true, true, below_credit, 0, cfg, 1_200),
+            1,
+            "deferred close drain should keep ACK/window service even below the pressure edge"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_dirty_pressure(true, false, credit_edge, 0, cfg, 1_200),
             1,
             "maintenance drain should enable bounded adaptive ACK drain at the credit edge"
         );
         assert_eq!(
-            tun_rx_drain_budget_for_dirty_pressure(true, credit_edge, 9, cfg, 1_200),
+            tun_rx_drain_budget_for_dirty_pressure(true, false, credit_edge, 9, cfg, 1_200),
             9,
             "explicit drain budget remains an operator override once pressure is eligible"
         );
         assert_eq!(
-            tun_rx_drain_budget_for_dirty_pressure(true, pending_with_low_tx, 0, cfg, 1_200),
+            tun_rx_drain_budget_for_dirty_pressure(true, false, pending_with_low_tx, 0, cfg, 1_200),
             0,
             "pending-only pressure should not drain ACKs without egress queue pressure"
         );
         assert_eq!(
-            tun_rx_drain_budget_for_dirty_pressure(true, pending_with_flush_edge, 0, cfg, 1_200),
+            tun_rx_drain_budget_for_dirty_pressure(
+                true,
+                false,
+                pending_with_flush_edge,
+                0,
+                cfg,
+                1_200
+            ),
             1,
             "pending pressure plus flush-edge tx queue should maintain ACK drain"
+        );
+    }
+
+    #[test]
+    fn dirty_close_drain_tracks_pending_or_egress_tail() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(build_listener_socket(&ListenerSpec { local_port: 443 }));
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let mut dirty = HashSet::from([handle]);
+        let mut ctxs = HashMap::from([(handle, SocketCtx::new(443))]);
+
+        assert!(
+            !has_dirty_close_drain(&dirty, &ctxs, cfg),
+            "ordinary dirty handles should not trigger close-drain maintenance"
+        );
+
+        {
+            let ctx = ctxs.get_mut(&handle).unwrap();
+            ctx.pending_relay_close = Some(RelayClose {
+                epoch: 1,
+                direction: "local_to_remote",
+                reason: "uplink_channel_closed",
+            });
+            ctx.downlink_pending = vec![1, 2, 3];
+        }
+        assert!(
+            has_dirty_close_drain(&dirty, &ctxs, cfg),
+            "pending deferred close should keep ACK/window maintenance active"
+        );
+
+        {
+            let ctx = ctxs.get_mut(&handle).unwrap();
+            ctx.downlink_pending.clear();
+            ctx.pending_relay_close_last_egress_queue_bytes = cfg.low_bytes + 1;
+        }
+        assert!(
+            has_dirty_close_drain(&dirty, &ctxs, cfg),
+            "egress-only deferred close above low watermark should keep maintenance active"
+        );
+
+        ctxs.get_mut(&handle)
+            .unwrap()
+            .pending_relay_close_last_egress_queue_bytes = cfg.low_bytes;
+        assert!(
+            !has_dirty_close_drain(&dirty, &ctxs, cfg),
+            "close-drain maintenance can stop once pending is empty and egress reaches low"
+        );
+
+        dirty.clear();
+        assert!(
+            !has_dirty_close_drain(&dirty, &ctxs, cfg),
+            "non-dirty close state should not scan TUN RX"
         );
     }
 
@@ -9577,7 +13233,7 @@ mod tests {
             may_send: true,
             may_recv: true,
             send_capacity: 64,
-            send_queue: 128,
+            send_queue: tx_queue_flush_threshold(cfg) - 2,
             recv_queue: 0,
         };
 
@@ -9585,6 +13241,70 @@ mod tests {
             bounded_downlink_flush_len_for_window(64, 64, send_window, cfg),
             2,
             "flush should only accept the remaining clean tx_queue headroom"
+        );
+    }
+
+    #[test]
+    fn auto_tx_queue_thresholds_fit_default_tun_egress_capacity() {
+        let tun_mtu = 1_200;
+        let tun_tx_queue_len = DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE;
+        let cfg = default_downlink_backpressure_for_tun_egress(tun_mtu, tun_tx_queue_len);
+
+        assert!(
+            cfg.high_bytes < DownlinkBackpressureConfig::default().high_bytes,
+            "1200-byte MTU with Linux default qlen must cap the old fixed high watermark"
+        );
+        assert!(
+            tx_queue_flush_threshold(cfg)
+                <= tun_egress_safe_flush_threshold(tun_mtu, tun_tx_queue_len),
+            "clean flush edge must stay below the safe TUN qdisc fill level"
+        );
+        assert!(
+            tx_queue_pause_threshold(cfg) <= tun_egress_capacity_bytes(tun_mtu, tun_tx_queue_len),
+            "hard pause edge must fit inside the estimated TUN qdisc capacity"
+        );
+    }
+
+    #[test]
+    fn close_drain_flush_limit_accepts_terminal_tail_inside_credit_guard() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 524_288,
+            low_bytes: 131_072,
+        };
+        let mut clock = DownlinkEgressClock::default();
+        let mut drop_debt = DownlinkEgressDropDebt::default();
+        drop_debt.install(EgressCreditDebtSource::Pressure, 36_431);
+        let send_window = TcpSendWindowSnapshot {
+            can_send: true,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 1_048_576,
+            send_queue: tx_queue_flush_threshold(cfg),
+            recv_queue: 0,
+        };
+        let normal = bounded_downlink_flush_limit_for_window_with_clock_and_drop(
+            56_911,
+            262_144,
+            send_window,
+            cfg,
+            &mut clock,
+            &mut drop_debt,
+        );
+
+        assert_eq!(
+            normal.len, 0,
+            "ordinary downlink flush stays blocked at clean high while pressure debt is active"
+        );
+
+        let close_drain =
+            close_drain_terminal_pending_flush_limit(56_911, 262_144, send_window, cfg, normal);
+        assert_eq!(
+            close_drain.len, 56_911,
+            "terminal close-drain may accept the small tail so FIN can follow real data"
+        );
+        assert!(
+            send_window.send_queue + close_drain.len <= tx_queue_credit_spend_threshold(cfg),
+            "close-drain tail remains below the hard credit guard"
         );
     }
 
@@ -9600,7 +13320,7 @@ mod tests {
             may_send: true,
             may_recv: true,
             send_capacity: 100,
-            send_queue: 130,
+            send_queue: tx_queue_flush_threshold(cfg),
             recv_queue: 0,
         };
 
@@ -9636,7 +13356,7 @@ mod tests {
         clock.note_flush_result(after_drain.send_queue, 57, second);
 
         let at_hard_pause = TcpSendWindowSnapshot {
-            send_queue: 160,
+            send_queue: tx_queue_pause_threshold(cfg),
             ..after_drain
         };
         let third = bounded_downlink_flush_limit_for_window_with_clock(
@@ -9664,7 +13384,7 @@ mod tests {
             may_send: true,
             may_recv: true,
             send_capacity: 100,
-            send_queue: 130,
+            send_queue: tx_queue_flush_threshold(cfg),
             recv_queue: 0,
         };
 
@@ -9695,8 +13415,8 @@ mod tests {
         );
         assert_eq!(
             after_drain.send_queue + second.len,
-            157,
-            "planned send queue should stay below pause=160"
+            tx_queue_credit_spend_threshold(cfg),
+            "planned send queue should stay below the pause threshold"
         );
     }
 
@@ -9716,8 +13436,13 @@ mod tests {
             recv_queue: 0,
         };
 
-        let limit =
-            bounded_downlink_flush_limit_for_window_with_clock(10, 10, send_window, cfg, &mut clock);
+        let limit = bounded_downlink_flush_limit_for_window_with_clock(
+            10,
+            10,
+            send_window,
+            cfg,
+            &mut clock,
+        );
 
         assert_eq!(
             tx_queue_credit_guard_bytes(cfg),
@@ -9744,7 +13469,7 @@ mod tests {
             may_send: true,
             may_recv: true,
             send_capacity: 100,
-            send_queue: 130,
+            send_queue: tx_queue_flush_threshold(cfg),
             recv_queue: 0,
         };
         let first = bounded_downlink_flush_limit_for_window_with_clock(
@@ -9801,7 +13526,7 @@ mod tests {
             low_bytes: 40,
         };
         let mut clock = DownlinkEgressClock {
-            last_send_queue: Some(130),
+            last_send_queue: Some(tx_queue_flush_threshold(cfg)),
             drain_credit_bytes: 27,
             drop_debt_generation_seen: 0,
         };
@@ -9847,7 +13572,7 @@ mod tests {
             low_bytes: 40,
         };
         let mut clock = DownlinkEgressClock {
-            last_send_queue: Some(160),
+            last_send_queue: Some(tx_queue_pause_threshold(cfg)),
             drain_credit_bytes: 0,
             drop_debt_generation_seen: 0,
         };
@@ -9859,7 +13584,7 @@ mod tests {
             may_send: true,
             may_recv: true,
             send_capacity: 100,
-            send_queue: 130,
+            send_queue: tx_queue_flush_threshold(cfg),
             recv_queue: 0,
         };
         let debt_payment = bounded_downlink_flush_limit_for_window_with_clock_and_drop(
@@ -9902,10 +13627,25 @@ mod tests {
             high_bytes: 100,
             low_bytes: 40,
         };
-        let clean_edge = DownlinkPressureStats::new(0, 0, 130, 130);
-        let credit_edge = DownlinkPressureStats::new(0, 0, 157, 157);
+        let clean_edge = DownlinkPressureStats::new(
+            0,
+            0,
+            tx_queue_flush_threshold(cfg),
+            tx_queue_flush_threshold(cfg),
+        );
+        let credit_edge = DownlinkPressureStats::new(
+            0,
+            0,
+            tx_queue_credit_spend_threshold(cfg),
+            tx_queue_credit_spend_threshold(cfg),
+        );
         let pending_with_low_tx_queue = DownlinkPressureStats::new(100, 100, 1, 1);
-        let pending_with_flush_edge = DownlinkPressureStats::new(100, 100, 130, 130);
+        let pending_with_flush_edge = DownlinkPressureStats::new(
+            100,
+            100,
+            tx_queue_flush_threshold(cfg),
+            tx_queue_flush_threshold(cfg),
+        );
 
         assert!(!should_install_downlink_pressure_credit_debt(
             false, true, clean_edge, cfg
@@ -9940,7 +13680,12 @@ mod tests {
             high_bytes: 100,
             low_bytes: 40,
         };
-        let credit_edge = DownlinkPressureStats::new(0, 0, 157, 157);
+        let credit_edge = DownlinkPressureStats::new(
+            0,
+            0,
+            tx_queue_credit_spend_threshold(cfg),
+            tx_queue_credit_spend_threshold(cfg),
+        );
 
         assert!(
             should_install_downlink_pressure_credit_debt(false, false, credit_edge, cfg),
@@ -9954,7 +13699,12 @@ mod tests {
             high_bytes: 100,
             low_bytes: 40,
         };
-        let credit_edge = DownlinkPressureStats::new(0, 0, 157, 157);
+        let credit_edge = DownlinkPressureStats::new(
+            0,
+            0,
+            tx_queue_credit_spend_threshold(cfg),
+            tx_queue_credit_spend_threshold(cfg),
+        );
         let mut credit_debt = DownlinkEgressCreditDebt::default();
 
         assert_eq!(credit_debt.note_egress_pressure(credit_edge, cfg), 3);
@@ -9982,32 +13732,153 @@ mod tests {
         assert_eq!(tx_queue_credit_spend_threshold(cfg), 157);
 
         assert_eq!(
-            downlink_egress_pressure_debt_bytes(DownlinkPressureStats::new(0, 0, 156, 156), cfg),
+            downlink_egress_pressure_debt_bytes(
+                DownlinkPressureStats::new(
+                    0,
+                    0,
+                    tx_queue_credit_spend_threshold(cfg) - 1,
+                    tx_queue_credit_spend_threshold(cfg) - 1,
+                ),
+                cfg,
+            ),
             0,
             "below the credit edge should not install pressure debt"
         );
         assert_eq!(
-            downlink_egress_pressure_debt_bytes(DownlinkPressureStats::new(0, 0, 157, 157), cfg),
+            downlink_egress_pressure_debt_bytes(
+                DownlinkPressureStats::new(
+                    0,
+                    0,
+                    tx_queue_credit_spend_threshold(cfg),
+                    tx_queue_credit_spend_threshold(cfg),
+                ),
+                cfg,
+            ),
             3,
             "the credit edge is an early warning, so it installs a guard-sized nudge"
         );
         assert_eq!(
-            downlink_egress_pressure_debt_bytes(DownlinkPressureStats::new(0, 0, 170, 170), cfg),
-            16,
+            downlink_egress_pressure_debt_bytes(
+                DownlinkPressureStats::new(
+                    0,
+                    0,
+                    tx_queue_pause_threshold(cfg) + 5,
+                    tx_queue_pause_threshold(cfg) + 5,
+                ),
+                cfg,
+            ),
+            11,
             "pressure overshoot should scale debt above the guard"
         );
         assert_eq!(
-            downlink_egress_pressure_debt_bytes(DownlinkPressureStats::new(0, 0, 220, 220), cfg),
+            downlink_egress_pressure_debt_bytes(
+                DownlinkPressureStats::new(
+                    0,
+                    0,
+                    tx_queue_pause_threshold(cfg) + 50,
+                    tx_queue_pause_threshold(cfg) + 50,
+                ),
+                cfg,
+            ),
             30,
             "pressure debt remains bounded by the original full credit span"
         );
         assert_eq!(
             downlink_egress_pressure_debt_bytes(
-                DownlinkPressureStats::new(125, 125, 130, 130),
+                DownlinkPressureStats::new(
+                    110,
+                    110,
+                    tx_queue_flush_threshold(cfg),
+                    tx_queue_flush_threshold(cfg),
+                ),
                 cfg,
             ),
-            28,
+            13,
             "pending pressure at the flush edge should also scale the early debt"
+        );
+    }
+
+    #[test]
+    fn projected_pressure_debt_sizes_from_combined_send_queue_and_pending() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+
+        assert_eq!(
+            downlink_egress_projected_pressure_debt_bytes(
+                tx_queue_credit_spend_threshold(cfg) - 1,
+                cfg,
+            ),
+            0,
+            "projected pressure below the credit edge should not install debt"
+        );
+        assert_eq!(
+            downlink_egress_projected_pressure_debt_bytes(
+                tx_queue_credit_spend_threshold(cfg),
+                cfg,
+            ),
+            tx_queue_credit_guard_bytes(cfg),
+            "the projected credit edge installs the same guard-sized pressure debt"
+        );
+        assert_eq!(
+            downlink_egress_projected_pressure_debt_bytes(
+                tx_queue_pause_threshold(cfg).saturating_add(50),
+                cfg,
+            ),
+            downlink_egress_credit_span(cfg),
+            "projected pressure debt remains bounded by the credit span"
+        );
+    }
+
+    #[test]
+    fn projected_payload_pressure_blocks_stale_drain_credit_before_flush() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let mut clock = DownlinkEgressClock {
+            last_send_queue: Some(tx_queue_flush_threshold(cfg)),
+            drain_credit_bytes: downlink_egress_credit_span(cfg),
+            drop_debt_generation_seen: 0,
+        };
+        let mut credit_debt = DownlinkEgressCreditDebt::default();
+        let send_window = TcpSendWindowSnapshot {
+            can_send: true,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 100,
+            send_queue: tx_queue_flush_threshold(cfg) - 1,
+            recv_queue: 0,
+        };
+        let pending_after_payload =
+            tx_queue_credit_spend_threshold(cfg).saturating_sub(send_window.send_queue);
+        let projected_pressure =
+            downlink_projected_local_pressure_bytes(send_window.send_queue, pending_after_payload);
+
+        assert_eq!(
+            credit_debt.note_projected_egress_pressure(projected_pressure, cfg),
+            3
+        );
+        let limit = bounded_downlink_flush_limit_for_window_with_clock_and_drop(
+            pending_after_payload,
+            100,
+            send_window,
+            cfg,
+            &mut clock,
+            &mut credit_debt,
+        );
+
+        assert_eq!(
+            limit.len,
+            tx_queue_flush_threshold(cfg).saturating_sub(send_window.send_queue),
+            "current payload may use clean headroom, but projected pressure must block old drain credit"
+        );
+        assert_eq!(limit.drain_credit_granted_bytes, 0);
+        assert_eq!(limit.drain_credit_planned_bytes, 0);
+        assert!(
+            limit.pressure_credit_debt_bytes > 0,
+            "the projected debt should remain visible until observed egress drain pays it"
         );
     }
 
@@ -10018,13 +13889,21 @@ mod tests {
             low_bytes: 40,
         };
         let mut clock = DownlinkEgressClock {
-            last_send_queue: Some(130),
+            last_send_queue: Some(tx_queue_flush_threshold(cfg)),
             drain_credit_bytes: 27,
             drop_debt_generation_seen: 0,
         };
         let mut credit_debt = DownlinkEgressCreditDebt::default();
         assert_eq!(
-            credit_debt.note_egress_pressure(DownlinkPressureStats::new(0, 0, 157, 157), cfg),
+            credit_debt.note_egress_pressure(
+                DownlinkPressureStats::new(
+                    0,
+                    0,
+                    tx_queue_credit_spend_threshold(cfg),
+                    tx_queue_credit_spend_threshold(cfg),
+                ),
+                cfg
+            ),
             3
         );
 
@@ -10065,12 +13944,20 @@ mod tests {
             low_bytes: 40,
         };
         let mut clock = DownlinkEgressClock {
-            last_send_queue: Some(160),
+            last_send_queue: Some(tx_queue_pause_threshold(cfg)),
             drain_credit_bytes: 0,
             drop_debt_generation_seen: 0,
         };
         let mut credit_debt = DownlinkEgressCreditDebt::default();
-        credit_debt.note_egress_pressure(DownlinkPressureStats::new(0, 0, 157, 157), cfg);
+        credit_debt.note_egress_pressure(
+            DownlinkPressureStats::new(
+                0,
+                0,
+                tx_queue_credit_spend_threshold(cfg),
+                tx_queue_credit_spend_threshold(cfg),
+            ),
+            cfg,
+        );
 
         let large_drain_window = TcpSendWindowSnapshot {
             can_send: true,
@@ -10137,21 +14024,46 @@ mod tests {
     }
 
     #[test]
-    fn parse_downlink_backpressure_config_keeps_safe_defaults_with_large_tcp_tx_buffer() {
-        let auto =
-            parse_downlink_backpressure_config_for_tx_buffer(None, None, 1_048_576);
-        assert_eq!(auto, DownlinkBackpressureConfig::default());
+    fn parse_downlink_backpressure_config_caps_auto_defaults_to_tun_egress() {
+        let auto = parse_downlink_backpressure_config_for_tx_buffer(
+            None,
+            None,
+            1_048_576,
+            1_200,
+            DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE,
+        );
+        assert_eq!(
+            auto,
+            default_downlink_backpressure_for_tun_egress(1_200, DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE)
+        );
+        assert!(
+            tx_queue_flush_threshold(auto)
+                <= tun_egress_safe_flush_threshold(1_200, DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE)
+        );
+        assert!(
+            tx_queue_pause_threshold(auto)
+                <= tun_egress_capacity_bytes(1_200, DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE)
+        );
 
-        let legacy =
-            parse_downlink_backpressure_config_for_tx_buffer(None, None, 65_535);
-        assert_eq!(legacy, DownlinkBackpressureConfig::default());
+        let legacy = parse_downlink_backpressure_config_for_tx_buffer(
+            None,
+            None,
+            65_535,
+            1_200,
+            DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE,
+        );
+        assert_eq!(
+            legacy, auto,
+            "TCP tx buffer size must not drive auto defaults"
+        );
 
-        let explicit =
-            parse_downlink_backpressure_config_for_tx_buffer(
-                Some("4096"),
-                Some("1024"),
-                1_048_576,
-            );
+        let explicit = parse_downlink_backpressure_config_for_tx_buffer(
+            Some("4096"),
+            Some("1024"),
+            1_048_576,
+            1_200,
+            DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE,
+        );
         assert_eq!(explicit.high_bytes, 4096);
         assert_eq!(explicit.low_bytes, 1024);
     }
@@ -10170,8 +14082,7 @@ mod tests {
         assert_eq!(custom.rx_bytes, 1_048_576);
         assert_eq!(custom.tx_bytes, 2_097_152);
 
-        let above_max =
-            parse_tcp_socket_buffer_config(Some("33554432"), Some("33554432"));
+        let above_max = parse_tcp_socket_buffer_config(Some("33554432"), Some("33554432"));
         assert_eq!(
             above_max, default,
             "oversized socket buffers must not be accepted silently"
@@ -10208,8 +14119,7 @@ mod tests {
     #[test]
     fn parse_downlink_egress_immediate_bytes_defaults_and_bounds() {
         assert_eq!(
-            DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES,
-            MAX_DOWNLINK_EGRESS_IMMEDIATE_BYTES,
+            DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES, MAX_DOWNLINK_EGRESS_IMMEDIATE_BYTES,
             "Knife14ar default must preserve old immediate-flush behavior; small budgets are explicit A/B only"
         );
         assert_eq!(
@@ -10260,6 +14170,7 @@ mod tests {
         diag.note_remote_read(100);
         diag.note_local_finish();
         diag.note_remote_read(28);
+        diag.note_remote_batch(2, 128);
         diag.note_global_rx_wait(
             std::time::Duration::from_micros(25),
             std::time::Duration::from_micros(10),
@@ -10282,6 +14193,9 @@ mod tests {
         assert_eq!(diag.uplink_bytes, 40);
         assert_eq!(diag.remote_to_global_rx_bytes, 128);
         assert_eq!(diag.remote_reads, 2);
+        assert_eq!(diag.remote_batches, 1);
+        assert_eq!(diag.remote_batch_bytes_max, 128);
+        assert_eq!(diag.remote_batch_chunks_max, 2);
         assert_eq!(diag.remote_after_local_finish_bytes, 28);
         assert_eq!(diag.remote_after_local_finish_reads, 1);
         assert_eq!(diag.global_rx_wait_max_micros, 25);
@@ -10303,22 +14217,31 @@ mod tests {
         diag.note_uplink_write(64);
         diag.note_local_finish();
         diag.note_remote_read(128);
+        diag.note_remote_batch(1, 128);
         diag.note_global_rx_queue(5, 1024);
+        diag.note_ack_drain_hint_due();
+        diag.note_ack_drain_hint_sent();
 
         let line = format_relay_live_diag(handle, 7, true, true, &diag);
 
         assert!(line.contains("tcp-relay-live"), "{line}");
         assert!(line.contains("epoch=7"), "{line}");
         assert!(line.contains("writer_done=true"), "{line}");
-        assert!(
-            line.contains("read_only_after_local_finish=true"),
-            "{line}"
-        );
+        assert!(line.contains("read_only_after_local_finish=true"), "{line}");
         assert!(line.contains("uplink_bytes=64"), "{line}");
         assert!(line.contains("remote_to_global_rx_bytes=128"), "{line}");
         assert!(line.contains("remote_reads=1"), "{line}");
-        assert!(line.contains("remote_after_local_finish_bytes=128"), "{line}");
+        assert!(line.contains("remote_batches=1"), "{line}");
+        assert!(line.contains("remote_batch_bytes_max=128"), "{line}");
+        assert!(line.contains("remote_batch_chunks_max=1"), "{line}");
+        assert!(
+            line.contains("remote_after_local_finish_bytes=128"),
+            "{line}"
+        );
         assert!(line.contains("remote_after_local_finish_reads=1"), "{line}");
+        assert!(line.contains("ack_drain_hint_due=1"), "{line}");
+        assert!(line.contains("ack_drain_hint_sent=1"), "{line}");
+        assert!(line.contains("ack_drain_hint_dropped=0"), "{line}");
         assert!(line.contains("global_rx_queue_used_max=5"), "{line}");
         assert!(line.contains("global_rx_queue_capacity=1024"), "{line}");
     }
@@ -10350,6 +14273,131 @@ mod tests {
     }
 
     #[test]
+    fn relay_ack_drain_hint_only_fires_for_rate_limited_remote_read_gap() {
+        let start = std::time::Instant::now();
+        let mut diag = RelayTaskDiag::new(start);
+        let gap_due = start + std::time::Duration::from_millis(750);
+        let mut last_hint_at = None;
+
+        assert_eq!(
+            relay_ack_drain_hint_due(&diag, gap_due, last_hint_at),
+            None,
+            "a relay with no remote data should not request ACK drain"
+        );
+        assert!(
+            !should_poll_relay_remote_read_probe(&diag, RelayReadCredit::default()),
+            "idle relays must not wake periodically before the first remote payload"
+        );
+
+        diag.note_remote_read_at(512, start);
+        diag.note_remote_batch(1, 512);
+        assert!(
+            !should_poll_relay_remote_read_probe(&diag, RelayReadCredit::default()),
+            "tiny control streams must not wake periodic remote-read probing"
+        );
+        assert!(
+            !should_poll_relay_ack_drain_hint(&diag, false),
+            "tiny control streams must not wake periodic ACK-drain hint polling"
+        );
+        assert_eq!(
+            relay_ack_drain_hint_due(&diag, gap_due, last_hint_at),
+            None,
+            "tiny control-stream gaps should not scan TUN RX"
+        );
+
+        diag.note_remote_read_at(1412, start);
+        diag.note_remote_batch(1, 1412);
+        assert!(
+            should_poll_relay_remote_read_probe(&diag, RelayReadCredit::default()),
+            "payload-shaped streams should keep the remote read future polled before ACK hints are due"
+        );
+        assert!(
+            should_poll_relay_remote_read_probe(
+                &diag,
+                RelayReadCredit {
+                    paused: false,
+                    max_batch_bytes: 1
+                }
+            ),
+            "remote-read probing should respect the same non-paused credit gate as awaited reads"
+        );
+        assert!(
+            !should_poll_relay_remote_read_probe(
+                &diag,
+                RelayReadCredit {
+                    paused: true,
+                    max_batch_bytes: RELAY_REMOTE_READ_BURST_MAX_BYTES
+                }
+            ),
+            "paused receive credit must suppress probe wakeups"
+        );
+        assert!(
+            !should_poll_relay_remote_read_probe(
+                &diag,
+                RelayReadCredit {
+                    paused: false,
+                    max_batch_bytes: 0
+                }
+            ),
+            "zero receive credit must suppress probe wakeups"
+        );
+        assert!(
+            !should_poll_relay_ack_drain_hint(&diag, false),
+            "early payload-shaped streams should probe reads without emitting ACK-drain hints"
+        );
+
+        let remaining =
+            (RELAY_ACK_DRAIN_HINT_MIN_DATA_BYTES - diag.remote_to_global_rx_bytes) as usize;
+        diag.note_remote_read_at(remaining, start);
+        diag.note_remote_batch(1, remaining);
+        assert!(
+            should_poll_relay_ack_drain_hint(&diag, false),
+            "data-bearing relays may poll read-gap hints"
+        );
+        assert!(
+            !should_poll_relay_ack_drain_hint(&diag, true),
+            "once the local writer is done, close-drain paths own terminal accounting"
+        );
+        assert_eq!(
+            relay_ack_drain_hint_due(
+                &diag,
+                start + std::time::Duration::from_millis(499),
+                last_hint_at
+            ),
+            None,
+            "remote read gaps below the stall threshold should not scan TUN RX"
+        );
+
+        let due = relay_ack_drain_hint_due(&diag, gap_due, last_hint_at)
+            .expect("gap above threshold should request one ACK/window drain");
+        assert_eq!(due.gap_ms, 750);
+        assert_eq!(
+            due.remote_to_global_rx_bytes,
+            RELAY_ACK_DRAIN_HINT_MIN_DATA_BYTES
+        );
+        last_hint_at = Some(gap_due);
+
+        assert_eq!(
+            relay_ack_drain_hint_due(
+                &diag,
+                gap_due + std::time::Duration::from_millis(249),
+                last_hint_at
+            ),
+            None,
+            "hint emission must be rate-limited while the same stream remains stalled"
+        );
+        assert!(
+            relay_ack_drain_hint_due(
+                &diag,
+                gap_due + std::time::Duration::from_millis(250),
+                last_hint_at
+            )
+            .is_some(),
+            "once the rate limit expires, a still-stalled stream may request another bounded drain"
+        );
+    }
+
+    #[test]
     fn relay_close_diag_line_includes_post_finish_remote_counters() {
         let mut sockets = SocketSet::new(vec![]);
         let handle = sockets.add(TcpSocket::new(
@@ -10360,6 +14408,7 @@ mod tests {
         diag.note_uplink_write(37);
         diag.note_local_finish();
         diag.note_remote_read(43_772);
+        diag.note_remote_batch(3, 43_772);
         diag.note_global_rx_queue(9, 1024);
 
         let line = format_relay_close_diag(handle, "timer", "half_closed_idle_timeout", &diag);
@@ -10367,8 +14416,14 @@ mod tests {
         assert!(line.contains("tcp-relay-close"), "{line}");
         assert!(line.contains("direction=timer"), "{line}");
         assert!(line.contains("reason=half_closed_idle_timeout"), "{line}");
-        assert!(line.contains("remote_after_local_finish_bytes=43772"), "{line}");
+        assert!(
+            line.contains("remote_after_local_finish_bytes=43772"),
+            "{line}"
+        );
         assert!(line.contains("remote_after_local_finish_reads=1"), "{line}");
+        assert!(line.contains("remote_batches=1"), "{line}");
+        assert!(line.contains("remote_batch_bytes_max=43772"), "{line}");
+        assert!(line.contains("remote_batch_chunks_max=3"), "{line}");
         assert!(line.contains("first_remote_read_ms="), "{line}");
         assert!(line.contains("max_remote_read_gap_ms="), "{line}");
         assert!(line.contains("current_remote_read_gap_ms="), "{line}");
@@ -10459,7 +14514,10 @@ mod tests {
         assert!(parse_trace(Some("1")));
         assert!(parse_trace(Some("true")));
         assert!(parse_trace(Some(" TRUE ")));
-        assert!(!parse_trace(Some("0")), "0 必须关——否则 MINI_VPN_TRACE=0 反而开是 footgun");
+        assert!(
+            !parse_trace(Some("0")),
+            "0 必须关——否则 MINI_VPN_TRACE=0 反而开是 footgun"
+        );
         assert!(!parse_trace(Some("false")));
         assert!(!parse_trace(Some("yes")));
         assert!(!parse_trace(Some("")));
@@ -10475,7 +14533,8 @@ mod tests {
 
     #[test]
     fn tun_runtime_config_rejects_zero_pool_size() {
-        let err = TunRuntimeConfig::from_sources(Some("0")).expect_err("zero pool size should fail");
+        let err =
+            TunRuntimeConfig::from_sources(Some("0")).expect_err("zero pool size should fail");
         assert!(err.to_string().contains("at least 1"));
     }
 
@@ -10498,7 +14557,10 @@ mod tests {
     #[test]
     fn classify_routes_dns_relay_and_other() {
         // 任意 resolver 的 :53 → Dns（不再只限 198.18.0.1）。
-        assert_eq!(classify_inbound(&udp_pkt([198, 18, 0, 1], 53)), Inbound::Dns);
+        assert_eq!(
+            classify_inbound(&udp_pkt([198, 18, 0, 1], 53)),
+            Inbound::Dns
+        );
         assert_eq!(classify_inbound(&udp_pkt([8, 8, 8, 8], 53)), Inbound::Dns);
         assert_eq!(classify_inbound(&udp_pkt([1, 1, 1, 1], 53)), Inbound::Dns);
         // 其它 UDP（含 DoT/DoQ :853、DoH3/视频 :443）→ UdpRelay（刀4 Block 由 resolve_target 判）。
@@ -10506,7 +14568,10 @@ mod tests {
             classify_inbound(&udp_pkt([198, 18, 0, 5], 443)),
             Inbound::UdpRelay
         );
-        assert_eq!(classify_inbound(&udp_pkt([1, 1, 1, 1], 853)), Inbound::UdpRelay);
+        assert_eq!(
+            classify_inbound(&udp_pkt([1, 1, 1, 1], 853)),
+            Inbound::UdpRelay
+        );
         // TCP SYN / 垃圾 → Other。
         let pkt = build_ipv4_tcp([10, 0, 0, 1], [1, 1, 1, 1], 60000, 443, true, false);
         assert_eq!(classify_inbound(&pkt), Inbound::Other);
@@ -10534,7 +14599,12 @@ mod tests {
     fn reply_rdata_ip(reply: &[u8]) -> Ipv4Addr {
         let g = parse_inbound_udp(reply).expect("回包应是合法 IPv4/UDP");
         let p = g.payload;
-        Ipv4Addr::new(p[p.len() - 4], p[p.len() - 3], p[p.len() - 2], p[p.len() - 1])
+        Ipv4Addr::new(
+            p[p.len() - 4],
+            p[p.len() - 3],
+            p[p.len() - 2],
+            p[p.len() - 1],
+        )
     }
 
     /// 刀5 T1：任意 resolver 的明文 A 查询 → 本地伪造 fake-IP 回包；
@@ -10585,7 +14655,11 @@ mod tests {
         let reply = forge_dns_reply(&udp, &mut pool, 0).expect("AAAA 应回 NODATA（非 None）");
         let r = parse_inbound_udp(&reply).unwrap();
         // 响应 payload 偏移 6..8 = ANCOUNT。
-        assert_eq!(u16::from_be_bytes([r.payload[6], r.payload[7]]), 0, "NODATA ANCOUNT=0");
+        assert_eq!(
+            u16::from_be_bytes([r.payload[6], r.payload[7]]),
+            0,
+            "NODATA ANCOUNT=0"
+        );
     }
 
     /// 刀5 T1：不可解析的 :53 payload → None（调用方丢弃，绝不转发真 DNS = 不泄漏）。
@@ -10732,7 +14806,10 @@ mod tests {
         };
 
         // DoT/DoQ :853（任意 IP）→ Block。
-        assert!(matches!(resolve_target(ep([1, 1, 1, 1], 853), &pool), TargetResolve::Block));
+        assert!(matches!(
+            resolve_target(ep([1, 1, 1, 1], 853), &pool),
+            TargetResolve::Block
+        ));
         assert!(matches!(
             resolve_target(ep([93, 184, 216, 34], 853), &pool),
             TargetResolve::Block
@@ -10740,7 +14817,10 @@ mod tests {
 
         // 刀5：TCP :53（明文 DNS over TCP，任意 IP）→ Block（RST，逼回落 UDP :53）。
         // 不变量：UDP :53 已被 classify_inbound 截到 Dns 路径、不到 resolve_target，故 port==53 只命中 TCP。
-        assert!(matches!(resolve_target(ep([8, 8, 8, 8], 53), &pool), TargetResolve::Block));
+        assert!(matches!(
+            resolve_target(ep([8, 8, 8, 8], 53), &pool),
+            TargetResolve::Block
+        ));
         assert!(matches!(
             resolve_target(ep([198, 18, 0, 1], 53), &pool),
             TargetResolve::Block
@@ -10748,8 +14828,14 @@ mod tests {
 
         // DoH 经 fake-IP：dns.google:443 → Block；普通域名:443 → Direct；DoH 域名但 :80 → Direct（仅 :443）。
         let doh_fake = pool.alloc("dns.google", 0);
-        assert!(matches!(resolve_target(ep(doh_fake.octets(), 443), &pool), TargetResolve::Block));
-        assert!(matches!(resolve_target(ep(doh_fake.octets(), 80), &pool), TargetResolve::Direct { .. }));
+        assert!(matches!(
+            resolve_target(ep(doh_fake.octets(), 443), &pool),
+            TargetResolve::Block
+        ));
+        assert!(matches!(
+            resolve_target(ep(doh_fake.octets(), 80), &pool),
+            TargetResolve::Direct { .. }
+        ));
         let normal_fake = pool.alloc("example.com", 0);
         assert!(matches!(
             resolve_target(ep(normal_fake.octets(), 443), &pool),
@@ -10757,7 +14843,10 @@ mod tests {
         ));
 
         // DoH 硬编 IP 1.1.1.1:443 → Block；普通真实 IP:443 → Direct。
-        assert!(matches!(resolve_target(ep([1, 1, 1, 1], 443), &pool), TargetResolve::Block));
+        assert!(matches!(
+            resolve_target(ep([1, 1, 1, 1], 443), &pool),
+            TargetResolve::Block
+        ));
         assert!(matches!(
             resolve_target(ep([93, 184, 216, 34], 443), &pool),
             TargetResolve::Direct { .. }

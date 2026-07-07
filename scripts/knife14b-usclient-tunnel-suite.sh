@@ -881,7 +881,7 @@ Optional env:
   CC_SWEEP=""                optional space-separated CC variants, e.g. "cubic bbr"; empty keeps single-run behavior
   SUITE_TAG=knife14c        report/bundle filename tag
   MTU=1200                  TUN MTU passed to mini_vpn before client-tun starts
-  TUN_TX_QUEUE_LEN=""       optional Linux TUN txqueuelen after startup; empty keeps OS default
+  TUN_TX_QUEUE_LEN=""       optional Linux TUN txqueuelen; also passed to mini_vpn as MINI_VPN_TUN_TX_QUEUE_LEN
   MINI_VPN_TCP_DIAG=1       emit knife14c per-handle TCP diagnostics
   RUN_BASE_MTU_P1=0         14c keeps one aligned MTU per process; use a separate MTU=1500 run for baseline
   BUILD_RELEASE=1           build target/release/mini_vpn before running; set 0 to reuse existing binary
@@ -920,11 +920,11 @@ Optional env:
   QUIET_POLL_SECS=1
   IPERF_BUSY_RETRIES=3      retry each iperf sub-run when Target reports "server is busy"
   IPERF_BUSY_WAIT_SECS=5    seconds to wait between iperf busy retries
-  MINI_VPN_TUIC_TCP_POOL=2  TUIC TCP connection pool; set 1 for single-connection A/B diagnostics
+  MINI_VPN_TUIC_TCP_POOL=2  TUIC TCP connection pool; set 1 only for explicit single-connection A/B diagnostics
   MINI_VPN_TCP_RX_BUFFER_BYTES=1048576
   MINI_VPN_TCP_TX_BUFFER_BYTES=1048576
-  MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=<auto>  empty/unset lets mini_vpn scale to TCP tx buffer
-  MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=<auto>   empty/unset lets mini_vpn scale to TCP tx buffer / 4
+  MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=<auto>  empty/unset lets mini_vpn derive safe defaults from TUN egress capacity
+  MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=<auto>   empty/unset lets mini_vpn derive safe defaults from TUN egress capacity
   KNIFE14_KEEP_EXPLICIT_DOWNLINK_BACKPRESSURE=0     set 1 to preserve inherited 524288/131072 legacy A/B values
   MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=262144
   MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=16777216
@@ -1828,7 +1828,7 @@ run_lowrtt_probe() {
   append "### Probe $label Summary"
   if [[ -f "$probe_out" ]]; then
     append '```text'
-    grep -E 'Attribution Summary|iperf_sender_mbps|iperf_receiver_mbps|iperf_interval_profile:|throughput_shape:|tcp_pool:|local_write_pressure:|global_rx_pressure:|global_rx_receive:|downlink_backpressure:|downlink_flush:|tcp_reverse_window:|terminal_pending_reap:|pending_at_close:|egress_at_close:|relay_late_remote:|tun_drops:|runtime_tun_egress:|tun_egress_feedback:|tun_rx_drain:|quic:|attribution:|local 10[.]0[.]0[.]1|receiver$|sender$|error -|Connection reset|log not found|📊|🔬|TUIC datagram|UDP relay mode|tuic-tcp-pool-reconnect|tcp-(relay-live|relay-write-half-closed|relay-close|handle-close|deferred-close-egress|reverse-window|local-write-pressure|global-rx-pressure|global-rx-backpressure|downlink-backpressure|downlink-flush|egress-credit-debt|tun-rx-drain|tun-egress|loop-flush-tx|tun-flush-fail|send-slice-error)|exit=' "$probe_out" | tail -200 | tee -a "$REPORT" || true
+    grep -E 'Attribution Summary|iperf_sender_mbps|iperf_receiver_mbps|iperf_interval_profile:|throughput_shape:|tcp_pool:|local_write_pressure:|global_rx_pressure:|global_rx_receive:|downlink_backpressure:|downlink_flush:|tcp_reverse_window:|terminal_pending_reap:|pending_at_close:|egress_at_close:|relay_late_remote:|tun_drops:|runtime_tun_egress:|tun_egress_feedback:|tun_rx_drain:|quic:|attribution:|local 10[.]0[.]0[.]1|receiver$|sender$|error -|Connection reset|log not found|📊|🔬|TUIC datagram|UDP relay mode|tuic-tcp-pool-reconnect|tcp-(relay-live|relay-ack-drain-hint|relay-write-half-closed|relay-close|handle-close|deferred-close-egress|reverse-window|local-write-pressure|global-rx-pressure|global-rx-backpressure|downlink-backpressure|downlink-flush|egress-credit-debt|tun-rx-drain|tun-egress|loop-flush-tx|tun-flush-fail|send-slice-error)|exit=' "$probe_out" | tail -200 | tee -a "$REPORT" || true
     append '```'
   else
     append "probe report missing: $probe_out"
@@ -2007,6 +2007,7 @@ if [[ "${MINI_VPN_UPSTREAM:-tuic}" != "tuic" ]]; then
 fi
 export MINI_VPN_UPSTREAM=tuic
 export MINI_VPN_TUN_MTU="$MTU"
+export MINI_VPN_TUN_TX_QUEUE_LEN="${TUN_TX_QUEUE_LEN:-}"
 export MINI_VPN_TCP_DIAG="${MINI_VPN_TCP_DIAG:-1}"
 export MINI_VPN_TUIC_CC="${MINI_VPN_TUIC_CC:-cubic}"
 export MINI_VPN_TUIC_UDP_MODE="${MINI_VPN_TUIC_UDP_MODE:-native}"
@@ -2035,6 +2036,7 @@ append "- EXIT_HOST=$EXIT_HOST"
 append "- EXIT_PORT=$EXIT_PORT"
 append "- MINI_VPN_UPSTREAM=$MINI_VPN_UPSTREAM"
 append "- MINI_VPN_TUN_MTU=$MINI_VPN_TUN_MTU"
+append "- MINI_VPN_TUN_TX_QUEUE_LEN=${MINI_VPN_TUN_TX_QUEUE_LEN:-<auto>}"
 append "- MINI_VPN_TCP_DIAG=$MINI_VPN_TCP_DIAG"
 append "- MINI_VPN_TUIC_CC=$MINI_VPN_TUIC_CC"
 append "- CC_SWEEP=${CC_SWEEP:-<single>}"
@@ -2165,8 +2167,9 @@ append ""
 append "## Start mini_vpn client-tun"
 : > "$CLIENT_LOG"
 append "- client_log: $CLIENT_LOG"
-append "- command: sudo -E env MINI_VPN_TUN_MTU=$MTU MINI_VPN_TCP_DIAG=$MINI_VPN_TCP_DIAG MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS=$METRICS_SECS MINI_VPN_TUIC_CC=$MINI_VPN_TUIC_CC MINI_VPN_TUIC_TCP_POOL=$MINI_VPN_TUIC_TCP_POOL MINI_VPN_TCP_RX_BUFFER_BYTES=$MINI_VPN_TCP_RX_BUFFER_BYTES MINI_VPN_TCP_TX_BUFFER_BYTES=$MINI_VPN_TCP_TX_BUFFER_BYTES MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=$MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=$MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES MINI_VPN_TUN_RX_DRAIN_BUDGET=$MINI_VPN_TUN_RX_DRAIN_BUDGET $BIN client-tun"
-sudo -E env MINI_VPN_TUN_MTU="$MTU" MINI_VPN_TCP_DIAG="$MINI_VPN_TCP_DIAG" MINI_VPN_PROFILE_LOOP=1 \
+append "- command: sudo -E env MINI_VPN_TUN_MTU=$MTU MINI_VPN_TUN_TX_QUEUE_LEN=${MINI_VPN_TUN_TX_QUEUE_LEN:-} MINI_VPN_TCP_DIAG=$MINI_VPN_TCP_DIAG MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS=$METRICS_SECS MINI_VPN_TUIC_CC=$MINI_VPN_TUIC_CC MINI_VPN_TUIC_TCP_POOL=$MINI_VPN_TUIC_TCP_POOL MINI_VPN_TCP_RX_BUFFER_BYTES=$MINI_VPN_TCP_RX_BUFFER_BYTES MINI_VPN_TCP_TX_BUFFER_BYTES=$MINI_VPN_TCP_TX_BUFFER_BYTES MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=$MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=$MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES MINI_VPN_TUN_RX_DRAIN_BUDGET=$MINI_VPN_TUN_RX_DRAIN_BUDGET $BIN client-tun"
+sudo -E env MINI_VPN_TUN_MTU="$MTU" MINI_VPN_TUN_TX_QUEUE_LEN="$MINI_VPN_TUN_TX_QUEUE_LEN" \
+  MINI_VPN_TCP_DIAG="$MINI_VPN_TCP_DIAG" MINI_VPN_PROFILE_LOOP=1 \
   MINI_VPN_METRICS_SECS="$METRICS_SECS" MINI_VPN_TUIC_CC="$MINI_VPN_TUIC_CC" \
   MINI_VPN_TUIC_TCP_POOL="$MINI_VPN_TUIC_TCP_POOL" \
   MINI_VPN_TCP_RX_BUFFER_BYTES="$MINI_VPN_TCP_RX_BUFFER_BYTES" \

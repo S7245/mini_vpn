@@ -31,11 +31,14 @@ const DEFAULT_TUIC_CA_PATH: &str = "cert.pem";
 /// 对 unreliable datagram 有害。BBR 仍可经 `MINI_VPN_TUIC_CC=bbr` 显式选用（实验/特定链路）。
 const DEFAULT_TUIC_CC: &str = "cubic";
 const DEFAULT_TUIC_UDP_MODE: &str = "native";
+const DEFAULT_TUIC_MTU_POLICY: &str = "default";
 const MIN_TUIC_TCP_POOL: usize = 1;
-// Knife14cd: pool=2 keeps concurrent TCP control/data streams off the same QUIC connection by default.
-// Explicit pool=1 remains supported for constrained servers and single-connection A/B diagnostics.
+// Knife14cd/dq: keep TCP control/data streams separated by default. Pool=1
+// remains an explicit A/B knob, but one high pool=1 run was not stable evidence.
 const DEFAULT_TUIC_TCP_POOL: usize = 2;
 const MAX_TUIC_TCP_POOL: usize = 16;
+const TUIC_TCP_POOL_AUX_CONNECT_ATTEMPTS: usize = 3;
+const TUIC_TCP_POOL_AUX_CONNECT_RETRY_BASE_MS: u64 = 250;
 const DEFAULT_TUIC_QUIC_STATS_SECS: u64 = 30;
 const TUIC_TCP_STREAM_READ_GAP_LOG_MS: u128 = 1_000;
 const TUIC_TCP_STREAM_PENDING_LOG_MS: u128 = TUIC_TCP_STREAM_READ_GAP_LOG_MS;
@@ -52,6 +55,9 @@ pub struct TuicClientConfig {
     pub alpn: String,
     pub congestion_control: String,
     pub udp_relay_mode: String,
+    /// QUIC MTU policy. `default` keeps the production 1280 + PLPMTUD behavior; `safe1200`
+    /// is a bounded diagnostic/product profile for problematic paths.
+    pub mtu_policy: String,
     pub tcp_pool: usize,
     /// QUIC connection stats logging interval. `None` keeps normal runtime quiet; acceptance
     /// enables it through `MINI_VPN_TCP_DIAG=1`, or explicitly via
@@ -73,6 +79,7 @@ impl std::fmt::Debug for TuicClientConfig {
             .field("alpn", &self.alpn)
             .field("congestion_control", &self.congestion_control)
             .field("udp_relay_mode", &self.udp_relay_mode)
+            .field("mtu_policy", &self.mtu_policy)
             .field("tcp_pool", &self.tcp_pool)
             .field("quic_stats_secs", &self.quic_stats_secs)
             .field("zero_rtt", &self.zero_rtt)
@@ -124,6 +131,7 @@ impl TuicClientConfig {
             alpn: alpn.unwrap_or(DEFAULT_TUIC_ALPN).to_string(),
             congestion_control: DEFAULT_TUIC_CC.to_string(),
             udp_relay_mode: DEFAULT_TUIC_UDP_MODE.to_string(),
+            mtu_policy: DEFAULT_TUIC_MTU_POLICY.to_string(),
             tcp_pool: DEFAULT_TUIC_TCP_POOL,
             quic_stats_secs: None,
             // 默认关：quinn 0.10 在 0-RTT 阶段不支持 export_keying_material（TUIC auth 必失败回落）。
@@ -148,6 +156,10 @@ impl TuicClientConfig {
         // 解析+回落在使用点（`parse_cc` / `UdpRelayMode::parse`）——存而未用的字段终于接上。
         cfg.congestion_control = override_field(cfg.congestion_control, g("MINI_VPN_TUIC_CC"));
         cfg.udp_relay_mode = override_field(cfg.udp_relay_mode, g("MINI_VPN_TUIC_UDP_MODE"));
+        cfg.mtu_policy = override_field(
+            cfg.mtu_policy,
+            g("MINI_VPN_TUIC_MTU_MODE").or_else(|| g("MINI_VPN_TUIC_MTU_POLICY")),
+        );
         cfg.tcp_pool = parse_tcp_pool(g("MINI_VPN_TUIC_TCP_POOL").as_deref());
         cfg.quic_stats_secs = parse_quic_stats_secs(
             g("MINI_VPN_TUIC_QUIC_STATS_SECS").as_deref(),
@@ -168,7 +180,7 @@ fn override_field(default: String, env_val: Option<String>) -> String {
 }
 
 /// 解析 `MINI_VPN_TUIC_TCP_POOL`：默认 2；非法/空白回默认；0 裁到最小 1；大值裁到上限。
-/// 中文要点：Knife14cd 默认隔离并发 TCP streams；显式 1 仍可复现单连接 A/B，且永不产生空连接池。
+/// 中文要点：默认隔离控制/数据 TCP streams；显式 1 仍可复现单连接 A/B，且永不产生空连接池。
 fn parse_tcp_pool(s: Option<&str>) -> usize {
     s.and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_TUIC_TCP_POOL)
@@ -239,6 +251,29 @@ fn tcp_pool_stale_reconnect_reason(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpPoolAuxFailureAction {
+    FailStartup,
+    ContinueWithEstablished,
+}
+
+fn tcp_pool_aux_failure_action(established_conns: usize) -> TcpPoolAuxFailureAction {
+    if established_conns == 0 {
+        TcpPoolAuxFailureAction::FailStartup
+    } else {
+        TcpPoolAuxFailureAction::ContinueWithEstablished
+    }
+}
+
+fn tcp_pool_aux_retry_delay(attempt: usize) -> Option<Duration> {
+    if attempt + 1 >= TUIC_TCP_POOL_AUX_CONNECT_ATTEMPTS {
+        return None;
+    }
+    Some(Duration::from_millis(
+        TUIC_TCP_POOL_AUX_CONNECT_RETRY_BASE_MS.saturating_mul((attempt as u64) + 1),
+    ))
+}
+
 struct TcpPoolSlotLease {
     active: Arc<AtomicU64>,
 }
@@ -264,14 +299,31 @@ impl Drop for TcpPoolSlotLease {
 struct TrackedRelayStream<S> {
     inner: S,
     tcp_diag: Option<TuicTcpStreamDiag>,
+    transport_conn: Option<Connection>,
     _lease: TcpPoolSlotLease,
 }
 
 impl<S> TrackedRelayStream<S> {
+    #[cfg(test)]
     fn new(inner: S, lease: TcpPoolSlotLease, tcp_diag: Option<TuicTcpStreamDiag>) -> Self {
         Self {
             inner,
             tcp_diag,
+            transport_conn: None,
+            _lease: lease,
+        }
+    }
+
+    fn new_with_transport(
+        inner: S,
+        lease: TcpPoolSlotLease,
+        tcp_diag: Option<TuicTcpStreamDiag>,
+        transport_conn: Connection,
+    ) -> Self {
+        Self {
+            inner,
+            tcp_diag,
+            transport_conn: Some(transport_conn),
             _lease: lease,
         }
     }
@@ -292,10 +344,14 @@ impl<S: AsyncRead + Unpin> AsyncRead for TrackedRelayStream<S> {
         match &poll {
             Poll::Ready(Ok(())) => {
                 let read_bytes = buf.filled().len().saturating_sub(before_len);
+                let transport = self
+                    .transport_conn
+                    .as_ref()
+                    .map(sample_tuic_stream_transport);
                 if read_bytes > 0
                     && let Some(diag) = self.tcp_diag.as_mut()
                 {
-                    let event = diag.note_read_at(read_bytes, now);
+                    let event = diag.note_read_at(read_bytes, now, transport);
                     let meta = diag.meta.clone();
                     if let Some(first_rx_ms) = event.first_rx_ms {
                         println!(
@@ -325,8 +381,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for TrackedRelayStream<S> {
                 }
             }
             Poll::Pending => {
+                let transport = self
+                    .transport_conn
+                    .as_ref()
+                    .map(sample_tuic_stream_transport);
                 if let Some(diag) = self.tcp_diag.as_mut()
-                    && let Some(event) = diag.note_pending_at(now)
+                    && let Some(event) = diag.note_pending_at(now, transport)
                 {
                     let meta = diag.meta.clone();
                     println!(
@@ -338,7 +398,8 @@ impl<S: AsyncRead + Unpin> AsyncRead for TrackedRelayStream<S> {
                             event.polls,
                             event.max_poll_gap_ms,
                             event.rx_bytes,
-                            event.reads
+                            event.reads,
+                            event.transport
                         )
                     );
                 }
@@ -886,6 +947,12 @@ struct QuicStatsSnapshot {
     sent_packets: u64,
     lost_bytes: u64,
     congestion_events: u64,
+    sent_plpmtud_probes: u64,
+    lost_plpmtud_probes: u64,
+    black_holes_detected: u64,
+    tx_ack_frames: u64,
+    rx_ack_frames: u64,
+    rx_stream_frames: u64,
     tx_data_blocked: u64,
     tx_stream_data_blocked: u64,
     tx_streams_blocked_bidi: u64,
@@ -904,6 +971,31 @@ struct QuicStatsSnapshot {
     datagram_send_buffer_space: usize,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TuicStreamTransportSample {
+    udp_rx_datagrams: u64,
+    udp_rx_bytes: u64,
+    rx_stream_frames: u64,
+    rx_ack_frames: u64,
+    tx_ack_frames: u64,
+    sent_plpmtud_probes: u64,
+    lost_plpmtud_probes: u64,
+    black_holes_detected: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TuicStreamTransportDelta {
+    udp_rx_datagrams: u64,
+    udp_rx_bytes: u64,
+    rx_stream_frames: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TuicStreamTransportPending {
+    sample: TuicStreamTransportSample,
+    since_last_read: TuicStreamTransportDelta,
+}
+
 /// 格式化 QUIC 连接级诊断（刀14y）。
 /// 中文要点：`tx_blocked` 是本端发送 DATA_BLOCKED/STREAM_DATA_BLOCKED，直接指向对端 flow-control；
 /// `cwnd/lost/congestion_events` 指向拥塞/丢包。两组指标一起看，下一轮 acceptance 不再盲猜。
@@ -911,6 +1003,7 @@ fn format_quic_stats_line(conn_index: usize, stable_id: usize, stats: QuicStatsS
     format!(
         "📊 TUIC QUIC stats conn={conn_index} id={stable_id} \
          rtt={}ms cwnd={} lost={}/{} lost_bytes={} congestion_events={} \
+         plpmtud(sent={},lost={},black_holes={}) frames(rx_stream={},rx_ack={},tx_ack={}) \
          tx_blocked(data={},stream={},streams_bidi={},streams_uni={}) \
          rx_blocked(data={},stream={}) tx_window(max_data={},max_stream_data={}) \
          rx_window(max_data={},max_stream_data={}) udp_tx={}/{}B udp_rx={}/{}B \
@@ -921,6 +1014,12 @@ fn format_quic_stats_line(conn_index: usize, stable_id: usize, stats: QuicStatsS
         stats.sent_packets,
         stats.lost_bytes,
         stats.congestion_events,
+        stats.sent_plpmtud_probes,
+        stats.lost_plpmtud_probes,
+        stats.black_holes_detected,
+        stats.rx_stream_frames,
+        stats.rx_ack_frames,
+        stats.tx_ack_frames,
         stats.tx_data_blocked,
         stats.tx_stream_data_blocked,
         stats.tx_streams_blocked_bidi,
@@ -997,6 +1096,7 @@ struct TuicTcpStreamPendingEvent {
     max_poll_gap_ms: u128,
     rx_bytes: u64,
     reads: u64,
+    transport: Option<TuicStreamTransportPending>,
 }
 
 #[derive(Debug, Clone)]
@@ -1014,6 +1114,7 @@ struct TuicTcpStreamDiag {
     pending_polls: u64,
     max_pending_gap_ms: u128,
     last_pending_log_at: Option<Instant>,
+    last_read_transport_sample: Option<TuicStreamTransportSample>,
 }
 
 impl TuicTcpStreamDiag {
@@ -1032,6 +1133,7 @@ impl TuicTcpStreamDiag {
             pending_polls: 0,
             max_pending_gap_ms: 0,
             last_pending_log_at: None,
+            last_read_transport_sample: None,
         }
     }
 
@@ -1045,7 +1147,12 @@ impl TuicTcpStreamDiag {
         self.last_poll_at = Some(now);
     }
 
-    fn note_read_at(&mut self, read_bytes: usize, now: Instant) -> TuicTcpStreamReadEvent {
+    fn note_read_at(
+        &mut self,
+        read_bytes: usize,
+        now: Instant,
+        transport: Option<TuicStreamTransportSample>,
+    ) -> TuicTcpStreamReadEvent {
         let first_rx_ms = if self.first_rx_ms.is_none() {
             let elapsed = now.saturating_duration_since(self.opened_at).as_millis();
             self.first_rx_ms = Some(elapsed);
@@ -1062,6 +1169,9 @@ impl TuicTcpStreamDiag {
         self.last_rx_at = Some(now);
         self.reads += 1;
         self.rx_bytes += read_bytes as u64;
+        if let Some(sample) = transport {
+            self.last_read_transport_sample = Some(sample);
+        }
 
         TuicTcpStreamReadEvent {
             first_rx_ms,
@@ -1072,7 +1182,11 @@ impl TuicTcpStreamDiag {
         }
     }
 
-    fn note_pending_at(&mut self, now: Instant) -> Option<TuicTcpStreamPendingEvent> {
+    fn note_pending_at(
+        &mut self,
+        now: Instant,
+        transport: Option<TuicStreamTransportSample>,
+    ) -> Option<TuicTcpStreamPendingEvent> {
         self.pending_polls += 1;
         let gap_base = self.last_rx_at.unwrap_or(self.opened_at);
         let pending_gap_ms = now.saturating_duration_since(gap_base).as_millis();
@@ -1091,6 +1205,13 @@ impl TuicTcpStreamDiag {
             return None;
         }
         self.last_pending_log_at = Some(now);
+        let transport = transport.map(|sample| TuicStreamTransportPending {
+            sample,
+            since_last_read: transport_delta(
+                self.last_read_transport_sample.unwrap_or_default(),
+                sample,
+            ),
+        });
         Some(TuicTcpStreamPendingEvent {
             pending_gap_ms,
             pending_polls: self.pending_polls,
@@ -1098,6 +1219,7 @@ impl TuicTcpStreamDiag {
             max_poll_gap_ms: self.max_poll_gap_ms,
             rx_bytes: self.rx_bytes,
             reads: self.reads,
+            transport,
         })
     }
 
@@ -1112,6 +1234,21 @@ impl TuicTcpStreamDiag {
             polls: self.polls,
             max_poll_gap_ms: self.max_poll_gap_ms,
         }
+    }
+}
+
+fn transport_delta(
+    last: TuicStreamTransportSample,
+    current: TuicStreamTransportSample,
+) -> TuicStreamTransportDelta {
+    TuicStreamTransportDelta {
+        udp_rx_datagrams: current
+            .udp_rx_datagrams
+            .saturating_sub(last.udp_rx_datagrams),
+        udp_rx_bytes: current.udp_rx_bytes.saturating_sub(last.udp_rx_bytes),
+        rx_stream_frames: current
+            .rx_stream_frames
+            .saturating_sub(last.rx_stream_frames),
     }
 }
 
@@ -1153,6 +1290,7 @@ fn format_tuic_tcp_stream_read_gap_line(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_tuic_tcp_stream_pending_line(
     meta: &TuicTcpStreamDiagMeta,
     pending_gap_ms: u128,
@@ -1161,8 +1299,9 @@ fn format_tuic_tcp_stream_pending_line(
     max_poll_gap_ms: u128,
     rx_bytes: u64,
     reads: u64,
+    transport: Option<TuicStreamTransportPending>,
 ) -> String {
-    format!(
+    let mut line = format!(
         "🔎 tuic-tcp-stream-pending target={} conn={} id={} stream={} pending_gap_ms={} pending_polls={} polls={} max_poll_gap_ms={} rx_bytes={} reads={}",
         meta.target,
         meta.conn_index,
@@ -1174,7 +1313,24 @@ fn format_tuic_tcp_stream_pending_line(
         max_poll_gap_ms,
         rx_bytes,
         reads
-    )
+    );
+    if let Some(transport) = transport {
+        line.push_str(&format!(
+            " conn_udp_rx={}/{}B conn_udp_rx_since_read={}/{}B conn_rx_stream_frames={} conn_rx_stream_frames_since_read={} conn_ack_frames(rx={},tx={}) conn_plpmtud(sent={},lost={},black_holes={})",
+            transport.sample.udp_rx_datagrams,
+            transport.sample.udp_rx_bytes,
+            transport.since_last_read.udp_rx_datagrams,
+            transport.since_last_read.udp_rx_bytes,
+            transport.sample.rx_stream_frames,
+            transport.since_last_read.rx_stream_frames,
+            transport.sample.rx_ack_frames,
+            transport.sample.tx_ack_frames,
+            transport.sample.sent_plpmtud_probes,
+            transport.sample.lost_plpmtud_probes,
+            transport.sample.black_holes_detected
+        ));
+    }
+    line
 }
 
 fn format_tuic_tcp_stream_close_line(
@@ -1207,6 +1363,12 @@ fn quic_stats_snapshot(conn: &Connection) -> QuicStatsSnapshot {
         sent_packets: stats.path.sent_packets,
         lost_bytes: stats.path.lost_bytes,
         congestion_events: stats.path.congestion_events,
+        sent_plpmtud_probes: stats.path.sent_plpmtud_probes,
+        lost_plpmtud_probes: stats.path.lost_plpmtud_probes,
+        black_holes_detected: stats.path.black_holes_detected,
+        tx_ack_frames: stats.frame_tx.acks,
+        rx_ack_frames: stats.frame_rx.acks,
+        rx_stream_frames: stats.frame_rx.stream,
         tx_data_blocked: stats.frame_tx.data_blocked,
         tx_stream_data_blocked: stats.frame_tx.stream_data_blocked,
         tx_streams_blocked_bidi: stats.frame_tx.streams_blocked_bidi,
@@ -1223,6 +1385,20 @@ fn quic_stats_snapshot(conn: &Connection) -> QuicStatsSnapshot {
         udp_rx_bytes: stats.udp_rx.bytes,
         datagram_max: conn.max_datagram_size(),
         datagram_send_buffer_space: conn.datagram_send_buffer_space(),
+    }
+}
+
+fn sample_tuic_stream_transport(conn: &Connection) -> TuicStreamTransportSample {
+    let stats = conn.stats();
+    TuicStreamTransportSample {
+        udp_rx_datagrams: stats.udp_rx.datagrams,
+        udp_rx_bytes: stats.udp_rx.bytes,
+        rx_stream_frames: stats.frame_rx.stream,
+        rx_ack_frames: stats.frame_rx.acks,
+        tx_ack_frames: stats.frame_tx.acks,
+        sent_plpmtud_probes: stats.path.sent_plpmtud_probes,
+        lost_plpmtud_probes: stats.path.lost_plpmtud_probes,
+        black_holes_detected: stats.path.black_holes_detected,
     }
 }
 
@@ -1341,9 +1517,20 @@ impl TuicUpstream {
             );
             UdpRelayMode::Native
         });
-        let qcfg =
-            quic::client_quic_config_alpn(&cfg.ca_path, vec![cfg.alpn.as_bytes().to_vec()], cc)
-                .map_err(ClientError::InvalidTarget)?;
+        let (mtu_policy, mtu_fell_back) = quic::parse_mtu_policy(Some(&cfg.mtu_policy));
+        if mtu_fell_back {
+            println!(
+                "⚠️ TUIC 未知 mtu_policy={:?}，回落 default（1280 + PLPMTUD）",
+                cfg.mtu_policy
+            );
+        }
+        let qcfg = quic::client_quic_config_alpn(
+            &cfg.ca_path,
+            vec![cfg.alpn.as_bytes().to_vec()],
+            cc,
+            mtu_policy,
+        )
+        .map_err(ClientError::InvalidTarget)?;
         let endpoint = quic::client_endpoint(qcfg).map_err(ClientError::InvalidTarget)?;
         let conn = Self::handshake(
             &endpoint,
@@ -1361,7 +1548,10 @@ impl TuicUpstream {
             conn.max_datagram_size()
         );
         // 刀3.5：打实际生效的 CC + relay mode，供 acceptance 确认 BBR/quic 真装上（A/B 归因）。
-        println!("🧭 TUIC 拥塞控制器={cc:?} | UDP relay mode={udp_relay_mode:?}");
+        println!(
+            "🧭 TUIC 拥塞控制器={cc:?} | UDP relay mode={udp_relay_mode:?} | QUIC MTU policy={}",
+            mtu_policy.label()
+        );
         println!(
             "🪟 QUIC flow windows: bidi={} uni={} stream_rx={}B conn_rx={}B send={}B",
             quic::QUIC_MAX_CONCURRENT_BIDI_STREAMS,
@@ -1381,15 +1571,29 @@ impl TuicUpstream {
         }
         conns.push(Mutex::new(conn));
         for index in 1..tcp_pool {
-            let extra = Self::handshake(
+            let extra = match Self::handshake_aux_with_retries(
                 &endpoint,
                 cfg.server,
                 &cfg.sni,
                 &cfg.uuid,
                 &cfg.password,
                 cfg.zero_rtt,
+                index,
             )
-            .await?;
+            .await
+            {
+                Ok(conn) => conn,
+                Err(e) => match tcp_pool_aux_failure_action(conns.len()) {
+                    TcpPoolAuxFailureAction::FailStartup => return Err(e),
+                    TcpPoolAuxFailureAction::ContinueWithEstablished => {
+                        println!(
+                            "⚠️ TUIC TCP connection pool auxiliary slot {index} failed to authenticate/connect; continuing with {} established connection(s): {e:?}",
+                            conns.len()
+                        );
+                        break;
+                    }
+                },
+            };
             if let Some(secs) = cfg.quic_stats_secs
                 && let Some(stop) = &quic_stats_stop
             {
@@ -1397,6 +1601,7 @@ impl TuicUpstream {
             }
             conns.push(Mutex::new(extra));
         }
+        let tcp_pool = conns.len();
         if tcp_pool > 1 {
             println!(
                 "🧵 TUIC TCP connection pool={tcp_pool}（UDP/health 仍走 primary connection）"
@@ -1490,6 +1695,43 @@ impl TuicUpstream {
             .map_err(|e| io_err("tuic handshake", e))?;
         Self::authenticate(&conn, uuid, password).await?;
         Ok(conn)
+    }
+
+    async fn handshake_aux_with_retries(
+        endpoint: &Endpoint,
+        server: SocketAddr,
+        sni: &str,
+        uuid: &[u8; 16],
+        password: &str,
+        zero_rtt: bool,
+        index: usize,
+    ) -> Result<Connection, ClientError> {
+        for attempt in 0..TUIC_TCP_POOL_AUX_CONNECT_ATTEMPTS {
+            match Self::handshake(endpoint, server, sni, uuid, password, zero_rtt).await {
+                Ok(conn) => {
+                    if attempt > 0 {
+                        println!(
+                            "✅ TUIC TCP connection pool auxiliary slot {index} recovered after {} attempt(s)",
+                            attempt + 1
+                        );
+                    }
+                    return Ok(conn);
+                }
+                Err(e) => {
+                    let Some(delay) = tcp_pool_aux_retry_delay(attempt) else {
+                        return Err(e);
+                    };
+                    println!(
+                        "⚠️ TUIC TCP connection pool auxiliary slot {index} failed to authenticate/connect on attempt {}/{}; retrying in {}ms: {e:?}",
+                        attempt + 1,
+                        TUIC_TCP_POOL_AUX_CONNECT_ATTEMPTS,
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+        unreachable!("auxiliary TCP pool retry loop must return on success or final error")
     }
 
     /// 在已建立(0-RTT 或 1-RTT)的连接上发 TUIC Authenticate（单向流）。
@@ -1878,10 +2120,11 @@ impl ProxyUpstream for TuicUpstream {
                 None
             };
             // 把双向流的收/发两半合成一条 AsyncRead+AsyncWrite，喂给现有双向泵。
-            Ok::<RelayStream, ClientError>(Box::new(TrackedRelayStream::new(
+            Ok::<RelayStream, ClientError>(Box::new(TrackedRelayStream::new_with_transport(
                 tokio::io::join(recv, send),
                 lease,
                 tcp_stream_diag,
+                conn.clone(),
             )))
         };
         tokio::time::timeout(TUIC_OPEN_TIMEOUT, open)
@@ -2064,6 +2307,7 @@ mod tests {
         assert_eq!(parse_tcp_pool(Some("0")), 1);
         assert_eq!(parse_tcp_pool(Some("nope")), 2);
         assert_eq!(parse_tcp_pool(Some("1")), 1);
+        assert_eq!(parse_tcp_pool(Some("2")), 2);
         assert_eq!(parse_tcp_pool(Some("4")), 4);
         assert_eq!(parse_tcp_pool(Some("999")), MAX_TUIC_TCP_POOL);
     }
@@ -2099,6 +2343,12 @@ mod tests {
                 sent_packets: 100,
                 lost_bytes: 4096,
                 congestion_events: 2,
+                sent_plpmtud_probes: 19,
+                lost_plpmtud_probes: 20,
+                black_holes_detected: 21,
+                tx_ack_frames: 22,
+                rx_ack_frames: 23,
+                rx_stream_frames: 24,
                 tx_data_blocked: 4,
                 tx_stream_data_blocked: 5,
                 tx_streams_blocked_bidi: 6,
@@ -2123,6 +2373,14 @@ mod tests {
         assert!(line.contains("cwnd=65535"), "{line}");
         assert!(line.contains("lost=3/100"), "{line}");
         assert!(line.contains("congestion_events=2"), "{line}");
+        assert!(
+            line.contains("plpmtud(sent=19,lost=20,black_holes=21)"),
+            "{line}"
+        );
+        assert!(
+            line.contains("frames(rx_stream=24,rx_ack=23,tx_ack=22)"),
+            "{line}"
+        );
         assert!(line.contains("tx_blocked(data=4,stream=5"), "{line}");
         assert!(line.contains("rx_blocked(data=10,stream=11"), "{line}");
         assert!(
@@ -2151,7 +2409,7 @@ mod tests {
         let first = format_tuic_tcp_stream_first_rx_line(&meta, 20_500, 35_244, 1);
         let gap = format_tuic_tcp_stream_read_gap_line(&meta, 15_000, 39_884, 2, 75_128);
         let pending =
-            format_tuic_tcp_stream_pending_line(&meta, 12_000, 24, 31, 5_000, 75_128, 2);
+            format_tuic_tcp_stream_pending_line(&meta, 12_000, 24, 31, 5_000, 75_128, 2, None);
         let close_snapshot = TuicTcpStreamCloseSnapshot {
             first_rx_ms: 20_500,
             max_read_gap_ms: 15_000,
@@ -2198,6 +2456,58 @@ mod tests {
     }
 
     #[test]
+    fn format_tuic_tcp_stream_pending_line_includes_transport_delivery_counters() {
+        let target = TargetAddr::parse("1.2.3.4:5201").unwrap();
+        let meta = TuicTcpStreamDiagMeta::new(&target, 3, 42, 8);
+        let transport = TuicStreamTransportPending {
+            sample: TuicStreamTransportSample {
+                udp_rx_datagrams: 101,
+                udp_rx_bytes: 200_000,
+                rx_stream_frames: 37,
+                rx_ack_frames: 41,
+                tx_ack_frames: 43,
+                sent_plpmtud_probes: 5,
+                lost_plpmtud_probes: 2,
+                black_holes_detected: 1,
+            },
+            since_last_read: TuicStreamTransportDelta {
+                udp_rx_datagrams: 11,
+                udp_rx_bytes: 35_000,
+                rx_stream_frames: 7,
+            },
+        };
+        let pending = format_tuic_tcp_stream_pending_line(
+            &meta,
+            12_000,
+            24,
+            31,
+            250,
+            75_128,
+            2,
+            Some(transport),
+        );
+
+        assert!(pending.contains("conn_udp_rx=101/200000B"), "{pending}");
+        assert!(
+            pending.contains("conn_udp_rx_since_read=11/35000B"),
+            "{pending}"
+        );
+        assert!(pending.contains("conn_rx_stream_frames=37"), "{pending}");
+        assert!(
+            pending.contains("conn_rx_stream_frames_since_read=7"),
+            "{pending}"
+        );
+        assert!(
+            pending.contains("conn_ack_frames(rx=41,tx=43)"),
+            "{pending}"
+        );
+        assert!(
+            pending.contains("conn_plpmtud(sent=5,lost=2,black_holes=1)"),
+            "{pending}"
+        );
+    }
+
+    #[test]
     fn tuic_tcp_stream_diag_tracks_first_rx_and_read_gaps() {
         let target = TargetAddr::parse("1.2.3.4:5201").unwrap();
         let meta = TuicTcpStreamDiagMeta::new(&target, 3, 42, 8);
@@ -2205,14 +2515,22 @@ mod tests {
         let mut diag = TuicTcpStreamDiag::new(meta, start);
 
         diag.note_poll_at(start + std::time::Duration::from_millis(20_500));
-        let first = diag.note_read_at(35_244, start + std::time::Duration::from_millis(20_500));
+        let first = diag.note_read_at(
+            35_244,
+            start + std::time::Duration::from_millis(20_500),
+            None,
+        );
         assert_eq!(first.first_rx_ms, Some(20_500));
         assert_eq!(first.gap_ms, None);
         assert_eq!(first.rx_bytes, 35_244);
         assert_eq!(first.reads, 1);
 
         diag.note_poll_at(start + std::time::Duration::from_millis(35_500));
-        let second = diag.note_read_at(39_884, start + std::time::Duration::from_millis(35_500));
+        let second = diag.note_read_at(
+            39_884,
+            start + std::time::Duration::from_millis(35_500),
+            None,
+        );
         assert_eq!(second.first_rx_ms, None);
         assert_eq!(second.gap_ms, Some(15_000));
         assert_eq!(second.rx_bytes, 75_128);
@@ -2236,12 +2554,12 @@ mod tests {
 
         diag.note_poll_at(start + std::time::Duration::from_millis(999));
         assert_eq!(
-            diag.note_pending_at(start + std::time::Duration::from_millis(999)),
+            diag.note_pending_at(start + std::time::Duration::from_millis(999), None),
             None
         );
         diag.note_poll_at(start + std::time::Duration::from_millis(1_000));
         let first = diag
-            .note_pending_at(start + std::time::Duration::from_millis(1_000))
+            .note_pending_at(start + std::time::Duration::from_millis(1_000), None)
             .expect("first threshold-crossing pending poll logs");
         assert_eq!(first.pending_gap_ms, 1_000);
         assert_eq!(first.pending_polls, 2);
@@ -2251,13 +2569,13 @@ mod tests {
         assert_eq!(first.reads, 0);
         diag.note_poll_at(start + std::time::Duration::from_millis(1_500));
         assert_eq!(
-            diag.note_pending_at(start + std::time::Duration::from_millis(1_500)),
+            diag.note_pending_at(start + std::time::Duration::from_millis(1_500), None),
             None,
             "pending logs are rate limited"
         );
         diag.note_poll_at(start + std::time::Duration::from_millis(2_100));
         let second = diag
-            .note_pending_at(start + std::time::Duration::from_millis(2_100))
+            .note_pending_at(start + std::time::Duration::from_millis(2_100), None)
             .expect("second pending log after the log interval");
         assert_eq!(second.pending_gap_ms, 2_100);
         assert_eq!(second.pending_polls, 4);
@@ -2265,11 +2583,11 @@ mod tests {
         assert_eq!(second.max_poll_gap_ms, 600);
 
         diag.note_poll_at(start + std::time::Duration::from_millis(2_200));
-        let read = diag.note_read_at(128, start + std::time::Duration::from_millis(2_200));
+        let read = diag.note_read_at(128, start + std::time::Duration::from_millis(2_200), None);
         assert_eq!(read.rx_bytes, 128);
         diag.note_poll_at(start + std::time::Duration::from_millis(3_300));
         let after_read = diag
-            .note_pending_at(start + std::time::Duration::from_millis(3_300))
+            .note_pending_at(start + std::time::Duration::from_millis(3_300), None)
             .expect("pending gap is measured from the latest data read");
         assert_eq!(after_read.pending_gap_ms, 1_100);
         assert_eq!(after_read.polls, 6);
@@ -2282,6 +2600,55 @@ mod tests {
         assert_eq!(close.max_pending_gap_ms, 2_100);
         assert_eq!(close.polls, 6);
         assert_eq!(close.max_poll_gap_ms, 1_100);
+    }
+
+    #[test]
+    fn tuic_tcp_stream_diag_reports_transport_delta_since_last_read() {
+        let target = TargetAddr::parse("1.2.3.4:5201").unwrap();
+        let meta = TuicTcpStreamDiagMeta::new(&target, 3, 42, 8);
+        let start = std::time::Instant::now();
+        let mut diag = TuicTcpStreamDiag::new(meta, start);
+
+        diag.note_poll_at(start + std::time::Duration::from_millis(100));
+        diag.note_read_at(
+            128,
+            start + std::time::Duration::from_millis(100),
+            Some(TuicStreamTransportSample {
+                udp_rx_datagrams: 10,
+                udp_rx_bytes: 20_000,
+                rx_stream_frames: 5,
+                rx_ack_frames: 1,
+                tx_ack_frames: 2,
+                sent_plpmtud_probes: 3,
+                lost_plpmtud_probes: 0,
+                black_holes_detected: 0,
+            }),
+        );
+        diag.note_poll_at(start + std::time::Duration::from_millis(1_200));
+        let pending = diag
+            .note_pending_at(
+                start + std::time::Duration::from_millis(1_200),
+                Some(TuicStreamTransportSample {
+                    udp_rx_datagrams: 17,
+                    udp_rx_bytes: 44_000,
+                    rx_stream_frames: 8,
+                    rx_ack_frames: 4,
+                    tx_ack_frames: 6,
+                    sent_plpmtud_probes: 4,
+                    lost_plpmtud_probes: 1,
+                    black_holes_detected: 1,
+                }),
+            )
+            .expect("pending over threshold logs");
+        let transport = pending.transport.expect("transport sample is attached");
+
+        assert_eq!(transport.since_last_read.udp_rx_datagrams, 7);
+        assert_eq!(transport.since_last_read.udp_rx_bytes, 24_000);
+        assert_eq!(transport.since_last_read.rx_stream_frames, 3);
+        assert_eq!(transport.sample.rx_ack_frames, 4);
+        assert_eq!(transport.sample.tx_ack_frames, 6);
+        assert_eq!(transport.sample.lost_plpmtud_probes, 1);
+        assert_eq!(transport.sample.black_holes_detected, 1);
     }
 
     #[tokio::test]
@@ -2349,6 +2716,43 @@ mod tests {
         );
         assert_eq!(tcp_pool_stale_reconnect_reason(1, 99, 90, true), None);
         assert_eq!(tcp_pool_stale_reconnect_reason(1, 100, 90, false), None);
+    }
+
+    #[test]
+    fn tcp_pool_aux_failure_degrades_after_primary_connection() {
+        assert_eq!(
+            tcp_pool_aux_failure_action(0),
+            TcpPoolAuxFailureAction::FailStartup,
+            "without an authenticated primary connection startup must still fail"
+        );
+        assert_eq!(
+            tcp_pool_aux_failure_action(1),
+            TcpPoolAuxFailureAction::ContinueWithEstablished,
+            "auxiliary TCP pool auth failure should not kill a usable TUIC data plane"
+        );
+        assert_eq!(
+            tcp_pool_aux_failure_action(2),
+            TcpPoolAuxFailureAction::ContinueWithEstablished,
+            "later auxiliary failures should keep the already established pool"
+        );
+    }
+
+    #[test]
+    fn tcp_pool_aux_retry_delay_is_short_and_bounded() {
+        assert_eq!(
+            tcp_pool_aux_retry_delay(0),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            tcp_pool_aux_retry_delay(1),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            tcp_pool_aux_retry_delay(2),
+            None,
+            "the final configured attempt should surface the original failure"
+        );
+        assert_eq!(tcp_pool_aux_retry_delay(99), None);
     }
 
     #[test]
@@ -2755,6 +3159,7 @@ mod tests {
                 "certs/dev/ca-cert.pem",
                 vec![b"h3".to_vec()],
                 crate::quic::CcChoice::Bbr,
+                crate::quic::MtuPolicy::Default,
             )
             .is_ok()
         );

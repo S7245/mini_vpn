@@ -2288,3 +2288,187 @@
 - Correct behavior: before the next patch, add a deterministic waker-safety
   test and then either replace the ready-drain helper with a real-waker-safe
   pattern or remove the speculative ready-drain path.
+
+## 2026-07-07 - Relay batch cap without egress credit still overdrives TUN
+
+- Stage: Knife14dx reverse-first VPS acceptance.
+- Bundle:
+  `/tmp/mini_vpn/knife14dx_relay_credit_p1_30/mvpn_knife14dx_relay_credit_p1_30_usclient_suite_20260707_125810.tar.gz`
+- Symptom: reverse-first P1 stayed low at `25.7/24.8 Mbit/s`, with repeated
+  zero-throughput intervals.
+- Rejected explanations: close/reap/pending accounting was clean, QUIC
+  loss/congestion/blocking was clean, `.33` logs showed no current `fail auth`,
+  and the relay -> main-loop channel never approached capacity.
+- Cause: the relay read-side batch cap was only tied to `mpsc` channel
+  occupancy. The actual pressure was downstream in smoltcp/TUN egress:
+  `tun_tx_dropped_delta=591`, `send_queue_max=892928`, and
+  `headroom_deferred_bytes=28883630`.
+- Correct behavior: read credit must be fed from per-flow egress/send-queue
+  state back to the relay reader. Do not treat a clean `global_rx_queue` as
+  proof that it is safe to keep pulling full 512KiB ready batches.
+
+## 2026-07-07 - Post-accept read credit is one batch late
+
+- Stage: Knife14dy reverse-first VPS acceptance.
+- Bundle:
+  `/tmp/mini_vpn/knife14dy_read_credit_p1_30/mvpn_knife14dy_read_credit_p1_30_usclient_suite_20260707_131037.tar.gz`
+- Symptom: the data relay showed read-credit updates and 64KiB minimum batch
+  limits, but reverse-first P1 still failed at `22.8/21.6 Mbit/s`.
+- Important discriminator: read-credit paused only at the tail
+  (`read_credit_pause_updates=1`) after local pressure already hit
+  `send_queue_max=892928` and TUN egress drops appeared.
+- Cause: credit was computed from actual `send_queue`/`pending` after the
+  current remote payload had entered the main loop. The current batch could
+  still spend stale drain-credit before the relay reader saw the pressure.
+- Correct behavior: compute read-credit and pressure debt from projected local
+  pressure (`send_queue + pending + incoming`) before accepting/flushing the
+  payload. Do not treat a working credit channel as sufficient if its policy is
+  one payload behind.
+
+## 2026-07-07 - Pressure debt must not hard-pause QUIC stream reads
+
+- Stage: Knife14dz projected-credit VPS acceptance.
+- Bundle:
+  `/tmp/mini_vpn/mvpn_knife14dz_projected_credit_p1_30_usclient_suite_20260707_132432.tar.gz`
+- Symptom: reverse-first P1 regressed to `6.05 Mbit/s` receiver and timed out
+  while `read_credit_pause_updates=2` and `max_rx_blocked_stream_delta=1`
+  appeared.
+- Cause: projected local pressure was installed correctly, but active pressure
+  debt was fed into the relay-read hard pause. This starved QUIC stream receive
+  progress instead of merely bounding smoltcp/TUN flush.
+- Correct behavior: use pressure debt to constrain local flush/close credit,
+  not to stop relay reads. Relay reads should drain QUIC into bounded staging
+  until receive-window high water or TUN drop feedback requires a real pause.
+
+## 2026-07-07 - Do not kill remote mini_vpn with broad pkill patterns
+
+- Stage: Knife14ea remote cleanup around `.27`.
+- Symptom: a broad cleanup command matching `mini_vpn client-tun` could match
+  its own SSH command line and disrupt the control session.
+- Cause: process-name cleanup was expressed as a loose full-command pattern.
+- Correct behavior: prefer suite-managed cleanup or narrow `pgrep`/`pkill`
+  patterns that cannot match the SSH wrapper command. Verify with a non-killing
+  process list before using `pkill` on VPS hosts.
+
+## 2026-07-07 - Sing-box auth transient was service state, not config/time
+
+- Stage: Knife14ea startup after Knife14dz.
+- Symptom: `client-tun` startup failed at `tuic auth finish: sending stopped by
+  peer: error 0`, while `.33` had no matching current TUIC inbound log.
+- Checks: `.27` env and `.33` sing-box config matched by key length and fields,
+  all hosts had synchronized time, and no TUIC `fail auth` appeared in the
+  current `.33` window.
+- Cause: likely transient sing-box/TUIC service state. Restarting sing-box
+  restored primary startup. The auxiliary TUIC pool slot still can fail first
+  auth once and recover through retry.
+- Correct behavior: when this exact auth-finish/no-server-log pattern appears,
+  verify env/config/time once, then inspect or restart sing-box before
+  changing mini_vpn auth code.
+
+## 2026-07-07 - Patch the intended ACK drain path, not the adjacent one
+
+- Stage: Knife14eb local patch.
+- Symptom: the first attempt to make relay read gaps use a larger ACK drain
+  budget changed deferred remote-payload ACK drain instead. Focused
+  `relay_gap_hint` and `tun_rx_drain_budget` tests caught the mismatch.
+- Cause: similarly named budget helpers sit next to each other:
+  `tun_rx_drain_budget_for_deferred_ack_drain` and
+  `tun_rx_drain_budget_for_relay_gap_hint`.
+- Correct behavior: for cadence fixes, add or update focused tests that name
+  the exact source (`relay_gap_hint`, `remote_payload_deferred`, etc.) before
+  accepting a budget change.
+
+## 2026-07-07 - Relay-gap follow-up did not trigger in VPS
+
+- Stage: Knife14ec reverse-first VPS acceptance.
+- Bundle:
+  `/tmp/mini_vpn/mvpn_knife14ec_gap_followup_p1_30_usclient_suite_20260707_135859.tar.gz`
+- Symptom: the relay-gap follow-up implementation passed local tests but the
+  VPS run fell to `23.2/21.5 Mbit/s` and recorded
+  `relay_gap_hint_followup_attempts=0`.
+- Cause: the exhaustion evidence was aggregate. The drains that exhausted
+  budget were not relay-gap drains; the active/deferred remote-payload drain
+  path still hit `budget_exhausted=210` with
+  `remote_payload_deferred_attempts=812`.
+- Correct behavior: after aggregate drain exhaustion, add source-specific
+  diagnostics or attach escalation to the source that actually exhausts. The
+  next patch should make deferred ACK drain escalate from active-flow budget to
+  pressure budget only after it really exhausts.
+
+## 2026-07-07 - Remote cargo needs explicit environment in non-login SSH
+
+- Stage: Knife14ec `.27` focused tests.
+- Symptom: `ssh ... cargo test` failed with `cargo: command not found`; a
+  second attempt accidentally expanded `$HOME` on the Mac and looked for
+  `/Users/liushan/.cargo/env` on `.27`.
+- Cause: non-login SSH shells do not load `.cargo/env`, and double-quoted
+  local commands expand `$HOME` before SSH.
+- Correct behavior: run remote cargo commands with single-quoted SSH payloads
+  and source the remote cargo environment inside the remote shell:
+  `. "$HOME/.cargo/env"`.
+
+## 2026-07-07 - Cargo accepts only one positional test filter
+
+- Stage: Knife14en local gates.
+- Symptom: `cargo test --lib <test1> <test2> ...` failed with
+  `unexpected argument`.
+- Cause: Cargo accepts one positional `TESTNAME` filter before `--`; multiple
+  independent filters must be run as separate commands or replaced with a
+  broader shared substring.
+- Correct behavior: use a shared filter such as `mtu_policy` /
+  `tuic_tcp_stream_diag`, run separate focused commands, or run
+  `cargo test --lib --quiet`.
+
+## 2026-07-07 - Do not test quinn MTU config through opaque Debug output
+
+- Stage: Knife14en MTU policy TDD.
+- Symptom: the first `safe1200` test failed because `TransportConfig` Debug
+  output did not include `initial_mtu`, `min_mtu`, or
+  `mtu_discovery_config`.
+- Cause: quinn intentionally formats parts of `TransportConfig` opaquely, so
+  Debug output is not a stable public observation point for MTU behavior.
+- Correct behavior: keep mini_vpn-owned MTU policy as a pure profile function
+  and test that profile directly; use the quinn config build only as a smoke
+  check that shared VPN flow-control settings are still installed.
+
+## 2026-07-07 - rsync to VPS must carry the project SSH key
+
+- Stage: Knife14en `.27` sync.
+- Symptom: the first `rsync` to `.27` failed with
+  `Permission denied (publickey,password)`.
+- Cause: the command omitted the required SSH identity from AGENTS.md.
+- Correct behavior: use `rsync -e "ssh -i ~/.ssh/vpn ..."` and keep excluding
+  `.env`, `.git`, and `target` when syncing the working tree to
+  `/home/ubuntu/mini_vpn`.
+
+## 2026-07-07 - TUN-MTU-derived controller tests need production-scale pressure config
+
+- Stage: Knife14eo TDD.
+- Symptom: the first `downlink_credit_controller_grows_credit_from_observed_egress_progress`
+  test still failed after the controller allowed progress-based growth.
+- Cause: the test used a tiny synthetic `DownlinkBackpressureConfig`
+  (`high_bytes=100`) while the pressure floor is derived from TUN MTU
+  (`1200 * RELAY_REMOTE_READ_PRESSURE_MIN_PACKETS`). The staging limit was
+  therefore smaller than the pressure floor, so the test asserted credit growth
+  in an impossible configuration.
+- Correct behavior: controller tests that involve TUN-MTU-derived floors should
+  either use production-scale/default backpressure config or explicitly assert
+  the staging-limit clamp. Do not infer controller failure from a synthetic
+  config whose watermarks are below the minimum ACK/window drain floor.
+
+## 2026-07-07 - Hot-path projected credit helper may need a narrow clippy allow
+
+- Stage: Knife14 downlink credit controller follow-up.
+- Symptom: `cargo clippy ... -D warnings` can fail with
+  `clippy::too_many_arguments` on
+  `publish_projected_relay_read_credit_for_payload`.
+- Cause: this helper sits on the `client_tun.rs` main-loop hot path and passes
+  several already-owned local state references to avoid broad restructuring or
+  allocation while iterating on the downlink credit algorithm. This file
+  already has several narrow `#[allow(clippy::too_many_arguments)]` annotations
+  for equivalent hot-path helpers and diagnostic formatters.
+- Correct behavior: if the helper remains a local hot-path helper and the
+  focused tests prove the behavior, add a narrow
+  `#[allow(clippy::too_many_arguments)]` directly on that function rather than
+  performing a cosmetic argument-object refactor during the performance fix.
+  Revisit the signature only after the control-loop design stabilizes.

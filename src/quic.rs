@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use quinn::congestion::{BbrConfig, CubicConfig};
-use quinn::{ClientConfig, Endpoint, IdleTimeout, TransportConfig};
+use quinn::{ClientConfig, Endpoint, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
 use rustls::{Certificate, RootCertStore};
 
 /// QUIC ALPN：握手必须协商；client/server 一致。
@@ -50,6 +50,31 @@ pub enum CcChoice {
     Cubic,
 }
 
+/// QUIC MTU policy. Default keeps the production path at IPv6-safe 1280 with PLPMTUD enabled;
+/// Safe1200 is a bounded diagnostic/product profile for paths where post-handshake MTU probing may
+/// be causing stream delivery stalls.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum MtuPolicy {
+    Default,
+    Safe1200,
+}
+
+impl MtuPolicy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Safe1200 => "safe1200",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+struct MtuPolicyProfile {
+    initial_mtu: u16,
+    min_mtu: u16,
+    plpmtud_enabled: bool,
+}
+
 /// 纯解析：拥塞控制器名（大小写不敏感）→ `(选择, 是否回落)`。
 /// 未知/空名回落 Cubic（quinn 默认），第二位 `true` 供调用方打一行告警（失败自愈不致命）。
 pub fn parse_cc(name: &str) -> (CcChoice, bool) {
@@ -57,6 +82,19 @@ pub fn parse_cc(name: &str) -> (CcChoice, bool) {
         "bbr" => (CcChoice::Bbr, false),
         "cubic" => (CcChoice::Cubic, false),
         _ => (CcChoice::Cubic, true),
+    }
+}
+
+/// 纯解析：MTU policy 名（大小写不敏感）→ `(策略, 是否回落)`。
+/// 未知值回落 default；空/缺省不是错误，保持默认生产策略。
+pub fn parse_mtu_policy(name: Option<&str>) -> (MtuPolicy, bool) {
+    match name.map(str::trim).filter(|v| !v.is_empty()) {
+        None => (MtuPolicy::Default, false),
+        Some(v) => match v.to_ascii_lowercase().replace(['_', '-'], "").as_str() {
+            "default" => (MtuPolicy::Default, false),
+            "safe1200" | "mtu1200" | "safe" => (MtuPolicy::Safe1200, false),
+            _ => (MtuPolicy::Default, true),
+        },
     }
 }
 
@@ -82,14 +120,13 @@ pub const QUIC_SEND_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
 /// 共享的 QUIC 传输参数：keep-alive + 拉长 idle + 起步 MTU + CC + uni-stream 配额（datagram 等其余默认）。
 /// 中文要点（刀3.5）：装 `congestion_controller_factory`（quinn 默认 Cubic；高 RTT/丢包跨境 BBR 通常更优）
 /// + 抬 `max_concurrent_uni_streams`（避 #221）。
-fn quic_transport_config(cc: CcChoice) -> Arc<TransportConfig> {
+fn quic_transport_config(cc: CcChoice, mtu_policy: MtuPolicy) -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
     let idle = IdleTimeout::try_from(Duration::from_secs(QUIC_MAX_IDLE_SECS))
         .expect("idle timeout fits VarInt");
     t.max_idle_timeout(Some(idle));
     t.keep_alive_interval(Some(Duration::from_secs(QUIC_KEEPALIVE_SECS)));
-    t.initial_mtu(QUIC_INITIAL_MTU);
-    t.min_mtu(QUIC_INITIAL_MTU);
+    apply_mtu_policy(&mut t, mtu_policy);
     t.max_concurrent_bidi_streams(QUIC_MAX_CONCURRENT_BIDI_STREAMS.into());
     t.max_concurrent_uni_streams(QUIC_MAX_CONCURRENT_UNI_STREAMS.into());
     t.stream_receive_window(QUIC_STREAM_RECEIVE_WINDOW_BYTES.into());
@@ -102,13 +139,43 @@ fn quic_transport_config(cc: CcChoice) -> Arc<TransportConfig> {
     Arc::new(t)
 }
 
+fn apply_mtu_policy(t: &mut TransportConfig, mtu_policy: MtuPolicy) {
+    let profile = mtu_policy_profile(mtu_policy);
+    t.initial_mtu(profile.initial_mtu);
+    t.min_mtu(profile.min_mtu);
+    if profile.plpmtud_enabled {
+        t.mtu_discovery_config(Some(MtuDiscoveryConfig::default()));
+    } else {
+        t.mtu_discovery_config(None);
+    }
+}
+
+fn mtu_policy_profile(mtu_policy: MtuPolicy) -> MtuPolicyProfile {
+    match mtu_policy {
+        MtuPolicy::Default => MtuPolicyProfile {
+            initial_mtu: QUIC_INITIAL_MTU,
+            min_mtu: QUIC_INITIAL_MTU,
+            plpmtud_enabled: true,
+        },
+        MtuPolicy::Safe1200 => MtuPolicyProfile {
+            initial_mtu: 1200,
+            min_mtu: 1200,
+            plpmtud_enabled: false,
+        },
+    }
+}
+
 /// 构建 QUIC 客户端 config（信任给定 CA），ALPN 用本项目自有的 `mvpn`（Stage 12 数据面）。
 /// 中文要点：legacy 数据面(`run_quic_pump` 不调 `into_0rtt`)**不需要也不开** 0-RTT——
 /// `enable_0rtt=false` 严格保持 Stage-12 原行为（零回归），不把 0-RTT 能力泄漏到 legacy。
 pub fn client_quic_config(ca_path: &str) -> Result<ClientConfig, String> {
     let crypto = client_crypto(ca_path, vec![QUIC_ALPN.to_vec()], false)?;
     // legacy 路径保持 quinn 默认 CC（Cubic），零回归——CC 选择只对 TUIC 数据面开放。
-    Ok(finish_client_config(crypto, CcChoice::Cubic))
+    Ok(finish_client_config(
+        crypto,
+        CcChoice::Cubic,
+        MtuPolicy::Default,
+    ))
 }
 
 /// 构建 QUIC 客户端 config，**ALPN + 拥塞控制器可指定**（TUIC 对接 sing-box 需用 `h3` 等，见 Stage 13a）。
@@ -118,15 +185,20 @@ pub fn client_quic_config_alpn(
     ca_path: &str,
     alpn_protocols: Vec<Vec<u8>>,
     cc: CcChoice,
+    mtu_policy: MtuPolicy,
 ) -> Result<ClientConfig, String> {
     let crypto = client_crypto(ca_path, alpn_protocols, true)?;
-    Ok(finish_client_config(crypto, cc))
+    Ok(finish_client_config(crypto, cc, mtu_policy))
 }
 
 /// 把 rustls 客户端配置包成 quinn `ClientConfig` 并装上共享传输参数（含选定 CC）。
-fn finish_client_config(crypto: rustls::ClientConfig, cc: CcChoice) -> ClientConfig {
+fn finish_client_config(
+    crypto: rustls::ClientConfig,
+    cc: CcChoice,
+    mtu_policy: MtuPolicy,
+) -> ClientConfig {
     let mut cfg = ClientConfig::new(Arc::new(crypto));
-    cfg.transport_config(quic_transport_config(cc));
+    cfg.transport_config(quic_transport_config(cc, mtu_policy));
     cfg
 }
 
@@ -197,6 +269,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_mtu_policy_maps_safe_profile_and_falls_back() {
+        assert_eq!(parse_mtu_policy(None), (MtuPolicy::Default, false));
+        assert_eq!(parse_mtu_policy(Some("")), (MtuPolicy::Default, false));
+        assert_eq!(
+            parse_mtu_policy(Some("default")),
+            (MtuPolicy::Default, false)
+        );
+        assert_eq!(
+            parse_mtu_policy(Some("safe1200")),
+            (MtuPolicy::Safe1200, false)
+        );
+        assert_eq!(
+            parse_mtu_policy(Some("safe-1200")),
+            (MtuPolicy::Safe1200, false)
+        );
+        assert_eq!(
+            parse_mtu_policy(Some("mtu1200")),
+            (MtuPolicy::Safe1200, false)
+        );
+        assert_eq!(parse_mtu_policy(Some("jumbo")), (MtuPolicy::Default, true));
+    }
+
+    #[test]
     fn client_config_builds_with_dev_ca() {
         let cfg = client_quic_config("certs/dev/ca-cert.pem");
         assert!(cfg.is_ok(), "{:?}", cfg.err());
@@ -224,15 +319,20 @@ mod tests {
     #[tokio::test]
     async fn client_endpoint_binds_with_each_cc() {
         for cc in [CcChoice::Bbr, CcChoice::Cubic] {
-            let cfg =
-                client_quic_config_alpn("certs/dev/ca-cert.pem", vec![b"h3".to_vec()], cc).unwrap();
+            let cfg = client_quic_config_alpn(
+                "certs/dev/ca-cert.pem",
+                vec![b"h3".to_vec()],
+                cc,
+                MtuPolicy::Default,
+            )
+            .unwrap();
             assert!(client_endpoint(cfg).is_ok(), "bind failed for {cc:?}");
         }
     }
 
     #[test]
     fn transport_config_sets_vpn_flow_control_windows() {
-        let cfg = quic_transport_config(CcChoice::Cubic);
+        let cfg = quic_transport_config(CcChoice::Cubic, MtuPolicy::Default);
         let dbg = format!("{cfg:?}");
         assert!(
             dbg.contains(&format!(
@@ -262,6 +362,32 @@ mod tests {
         assert!(
             dbg.contains(&format!("send_window: {}", QUIC_SEND_WINDOW_BYTES)),
             "{dbg}"
+        );
+    }
+
+    #[test]
+    fn safe1200_mtu_policy_disables_plpmtud_and_keeps_floor() {
+        assert_eq!(
+            mtu_policy_profile(MtuPolicy::Default),
+            MtuPolicyProfile {
+                initial_mtu: QUIC_INITIAL_MTU,
+                min_mtu: QUIC_INITIAL_MTU,
+                plpmtud_enabled: true,
+            }
+        );
+        assert_eq!(
+            mtu_policy_profile(MtuPolicy::Safe1200),
+            MtuPolicyProfile {
+                initial_mtu: 1200,
+                min_mtu: 1200,
+                plpmtud_enabled: false,
+            }
+        );
+
+        let cfg = quic_transport_config(CcChoice::Cubic, MtuPolicy::Safe1200);
+        assert!(
+            format!("{cfg:?}").contains(&format!("send_window: {}", QUIC_SEND_WINDOW_BYTES)),
+            "safe1200 policy must still keep the shared VPN flow-control windows"
         );
     }
 }
