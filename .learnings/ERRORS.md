@@ -2248,3 +2248,43 @@
 - Correct behavior: the next repair should add a bounded, observable
   active-flow ACK/window drain path before pressure. Do not lower static
   thresholds or keep installing more debt without proving sender progress.
+
+## 2026-07-07 - Single high pool=1 run was not stable evidence
+
+- Stage: Knife14dk/dl/dm discriminator sequence.
+- Symptom: one pool=1 run reached `166/165 Mbit/s`, but the same current code
+  and default pool=1 later fell to `23.4/22.4 Mbit/s` and then near no-data.
+- Cause: the single high run was a transient acceptance sample, not a stable
+  causal fix. Pool size alone did not explain the remaining failure.
+- Correct behavior: do not change product defaults or acceptance status from a
+  single high VPS run. Require repeat evidence and clean parsed surfaces before
+  treating a pool/config discriminator as causal.
+
+## 2026-07-07 - Sing-box restart did not restore stable high throughput
+
+- Stage: Knife14dp/dq after `.33` sing-box restart.
+- Symptom: `.33` restart succeeded and direct `.33 <-> .77` baselines stayed
+  healthy, but d85 reached only `20.8/19.9 Mbit/s` and current code only
+  `30.9/29.9 Mbit/s`.
+- Cause: the failure is not just stale sing-box service state, target iperf3,
+  `.33 -> .77` TCP path, time sync, or TUIC auth. Current evidence points to
+  TUIC stream read cadence on the tunnel path.
+- Correct behavior: after restart, still parse the mini_vpn bundle before
+  editing. If pending/close/reap/TUN/QUIC surfaces are clean and stream gaps
+  remain second-scale, move to relay/TUIC read-wakeup tests instead of more
+  service restarts.
+
+## 2026-07-07 - No-op waker polling is a risky ready-drain pattern
+
+- Stage: Knife14dq code review after stream-gap evidence.
+- Symptom: current code contains `drain_ready_remote_reads`, which polls the
+  split relay reader with a no-op waker to pull extra ready chunks after a real
+  async read. The failing bundle still shows `tuic_stream_pending` and
+  `tuic-tcp-stream-read-gap` in the `1.7-3.4s` range.
+- Cause: if a manual ready-drain poll reaches `Pending`, async IO
+  implementations may store that no-op waker as the current wake target. The
+  relay task can then wait for a timer tick or unrelated event before polling
+  again, producing bursty reads even with no local pressure.
+- Correct behavior: before the next patch, add a deterministic waker-safety
+  test and then either replace the ready-drain helper with a real-waker-safe
+  pattern or remove the speculative ready-drain path.

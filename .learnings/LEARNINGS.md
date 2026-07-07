@@ -3288,3 +3288,30 @@ worth cleaning up separately.
   throughput now needs a pre-pressure progress-cadence repair. Do not keep
   adding debt or moving thresholds; test bounded TUN RX ACK/window drain while
   reverse data is active before local egress reaches the credit edge.
+
+## 2026-07-07 - Knife14dq closes lifecycle attribution but exposes TUIC read cadence
+
+- Result doc:
+  `docs/tech/2026-07-07-knife14dq-tuic-stream-read-gap-results.md`
+- Main bundles:
+  `/tmp/mini_vpn/knife14do_d85_clean_baseline_p1_30_20260707_101108/mvpn_knife14do_d85_clean_baseline_p1_30_usclient_suite_20260707_101108.tar.gz`,
+  `/tmp/mini_vpn/knife14dp_d85_after_singbox_restart_p1_30/mvpn_knife14dp_d85_after_singbox_restart_p1_30_usclient_suite_20260707_101638.tar.gz`,
+  and
+  `/tmp/mini_vpn/knife14dq_current_after_singbox_restart_pool2_p1_30/mvpn_knife14dq_current_after_singbox_restart_pool2_p1_30_usclient_suite_20260707_101838.tar.gz`.
+- Outcome: clean d85 before restart reproduced near no-data, d85 after
+  sing-box restart improved only to `20.8/19.9 Mbit/s`, and current code with
+  pool=2 reached `30.9/29.9 Mbit/s` but remained low average.
+- Closed branch: current code kept the failing reverse-first window clean for
+  lifecycle accounting: `pending_at_close=0`, `egress_at_close=0`,
+  `terminal_pending_reap=0`, no terminal late remote payload, no send-slice
+  errors, no TUN flush failures, no TUN drops, no local/global RX pressure, and
+  no QUIC loss/congestion/blocking.
+- Remaining signal: the data stream still had second-scale cadence gaps
+  (`data_pending_gap_max_ms=3413`, `max_read_gap_ms=3414`) while direct
+  `.27/.33 <-> .77` baselines were healthy and `.33` had no current TUIC
+  `fail auth`.
+- Reusable rule: when close/pending/reap/TUN/QUIC surfaces are clean but
+  interval throughput repeatedly hits zero, stop tuning thresholds and inspect
+  the relay/TUIC stream read-wakeup path. In particular, do not manually poll a
+  live async stream with a no-op waker unless a deterministic test proves the
+  real task waker cannot be clobbered.
