@@ -34,6 +34,8 @@ const RELAY_REMOTE_READ_BURST_MAX_CHUNKS: usize = 16;
 const RELAY_REMOTE_READ_BURST_MAX_BYTES: usize = 512 * 1024;
 const RELAY_REMOTE_READ_MIN_BATCH_BYTES: usize = 64 * 1024;
 const RELAY_REMOTE_READ_ACK_DRAIN_PACKETS: usize = 1;
+const RELAY_REMOTE_READ_ADAPTIVE_ACK_DRAIN_MAX_PACKETS: usize =
+    RELAY_REMOTE_READ_PRESSURE_MIN_PACKETS;
 const RELAY_REMOTE_READ_PRESSURE_MIN_PACKETS: usize = 16;
 const RELAY_REMOTE_READ_PRESSURE_MIN_BYTES_FLOOR: usize = 8 * 1024;
 const DOWNLINK_CREDIT_INITIAL_BATCH_BYTES: usize = RELAY_REMOTE_READ_MIN_BATCH_BYTES;
@@ -44,6 +46,9 @@ const _: () = assert!(RELAY_REMOTE_READ_BURST_MAX_BYTES >= TCP_SOCKET_BUFFER_SIZ
 const _: () = assert!(RELAY_REMOTE_READ_BURST_MAX_BYTES >= RELAY_REMOTE_READ_MIN_BATCH_BYTES);
 const _: () = assert!(RELAY_REMOTE_READ_ACK_DRAIN_PACKETS >= 1);
 const _: () = assert!(RELAY_REMOTE_READ_PRESSURE_MIN_PACKETS >= 1);
+const _: () = assert!(
+    RELAY_REMOTE_READ_ADAPTIVE_ACK_DRAIN_MAX_PACKETS >= RELAY_REMOTE_READ_ACK_DRAIN_PACKETS
+);
 const _: () =
     assert!(RELAY_REMOTE_READ_PRESSURE_MIN_BYTES_FLOOR <= RELAY_REMOTE_READ_MIN_BATCH_BYTES);
 const _: () = assert!(DOWNLINK_CREDIT_INITIAL_BATCH_BYTES <= RELAY_REMOTE_READ_BURST_MAX_BYTES);
@@ -1070,6 +1075,21 @@ fn relay_remote_read_ack_drain_floor_bytes(tun_mtu: usize) -> usize {
         .max(1)
 }
 
+fn relay_remote_read_adaptive_ack_drain_max_bytes(tun_mtu: usize) -> usize {
+    tun_mtu
+        .max(MIN_TUN_MTU)
+        .saturating_mul(RELAY_REMOTE_READ_ADAPTIVE_ACK_DRAIN_MAX_PACKETS)
+        .min(relay_remote_read_pressure_floor_bytes(tun_mtu))
+        .max(relay_remote_read_ack_drain_floor_bytes(tun_mtu))
+}
+
+fn clamp_relay_remote_read_ack_drain_bytes(bytes: usize, tun_mtu: usize) -> usize {
+    bytes.clamp(
+        relay_remote_read_ack_drain_floor_bytes(tun_mtu),
+        relay_remote_read_adaptive_ack_drain_max_bytes(tun_mtu),
+    )
+}
+
 fn format_relay_live_diag(
     handle: SocketHandle,
     epoch: u64,
@@ -1349,15 +1369,19 @@ impl Default for RelayReadCredit {
     }
 }
 
-fn relay_read_credit_for_local_pressure(
+fn relay_read_credit_for_local_pressure_with_ack_drain_floor(
     local_pressure_bytes: usize,
     pending_bytes: usize,
     egress_recovery_active: bool,
     hard_pause_active: bool,
     cfg: DownlinkBackpressureConfig,
     tun_mtu: usize,
+    pressure_ack_drain_bytes: usize,
 ) -> RelayReadCredit {
     let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+    let ack_drain_floor = relay_remote_read_ack_drain_floor_bytes(tun_mtu);
+    let pressure_ack_drain_bytes =
+        clamp_relay_remote_read_ack_drain_bytes(pressure_ack_drain_bytes, tun_mtu);
     if hard_pause_active || pending_bytes >= downlink_receive_window_high(cfg) {
         return RelayReadCredit {
             paused: true,
@@ -1372,8 +1396,10 @@ fn relay_read_credit_for_local_pressure(
         let pressure_edge = tx_queue_flush_threshold(cfg);
         let predictive_ceiling = if local_pressure_bytes < pressure_edge {
             pressure_edge.saturating_sub(local_pressure_bytes)
+        } else if local_pressure_bytes < tx_queue_credit_spend_threshold(cfg) {
+            pressure_ack_drain_bytes
         } else {
-            relay_remote_read_ack_drain_floor_bytes(tun_mtu)
+            ack_drain_floor
         };
         let max_batch_bytes = credit.max_batch_bytes.min(predictive_ceiling);
         RelayReadCredit {
@@ -1413,6 +1439,48 @@ fn relay_read_credit_for_local_pressure(
     })
 }
 
+#[cfg(test)]
+fn relay_read_credit_for_local_pressure(
+    local_pressure_bytes: usize,
+    pending_bytes: usize,
+    egress_recovery_active: bool,
+    hard_pause_active: bool,
+    cfg: DownlinkBackpressureConfig,
+    tun_mtu: usize,
+) -> RelayReadCredit {
+    relay_read_credit_for_local_pressure_with_ack_drain_floor(
+        local_pressure_bytes,
+        pending_bytes,
+        egress_recovery_active,
+        hard_pause_active,
+        cfg,
+        tun_mtu,
+        relay_remote_read_ack_drain_floor_bytes(tun_mtu),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn relay_read_credit_for_local_egress_with_ack_drain_floor(
+    send_queue_bytes: usize,
+    pending_bytes: usize,
+    egress_recovery_active: bool,
+    hard_pause_active: bool,
+    cfg: DownlinkBackpressureConfig,
+    tun_mtu: usize,
+    pressure_ack_drain_bytes: usize,
+) -> RelayReadCredit {
+    relay_read_credit_for_local_pressure_with_ack_drain_floor(
+        send_queue_bytes.saturating_add(pending_bytes),
+        pending_bytes,
+        egress_recovery_active,
+        hard_pause_active,
+        cfg,
+        tun_mtu,
+        pressure_ack_drain_bytes,
+    )
+}
+
+#[cfg(test)]
 fn relay_read_credit_for_local_egress(
     send_queue_bytes: usize,
     pending_bytes: usize,
@@ -1431,6 +1499,31 @@ fn relay_read_credit_for_local_egress(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn relay_read_credit_for_projected_local_egress_with_ack_drain_floor(
+    send_queue_bytes: usize,
+    pending_bytes: usize,
+    incoming_bytes: usize,
+    egress_recovery_active: bool,
+    hard_pause_active: bool,
+    cfg: DownlinkBackpressureConfig,
+    tun_mtu: usize,
+    pressure_ack_drain_bytes: usize,
+) -> RelayReadCredit {
+    relay_read_credit_for_local_pressure_with_ack_drain_floor(
+        send_queue_bytes
+            .saturating_add(pending_bytes)
+            .saturating_add(incoming_bytes),
+        pending_bytes,
+        egress_recovery_active,
+        hard_pause_active,
+        cfg,
+        tun_mtu,
+        pressure_ack_drain_bytes,
+    )
+}
+
+#[cfg(test)]
 fn relay_read_credit_for_projected_local_egress(
     send_queue_bytes: usize,
     pending_bytes: usize,
@@ -1455,6 +1548,7 @@ fn relay_read_credit_for_projected_local_egress(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DownlinkCreditController {
     read_credit_ceiling_bytes: usize,
+    adaptive_ack_drain_bytes: usize,
     headroom_debt_bytes: usize,
     no_egress_progress_streak: u8,
 }
@@ -1463,6 +1557,7 @@ impl Default for DownlinkCreditController {
     fn default() -> Self {
         Self {
             read_credit_ceiling_bytes: DOWNLINK_CREDIT_INITIAL_BATCH_BYTES,
+            adaptive_ack_drain_bytes: 0,
             headroom_debt_bytes: 0,
             no_egress_progress_streak: 0,
         }
@@ -1626,6 +1721,21 @@ fn downlink_pressure_staging_limit(cfg: DownlinkBackpressureConfig, tun_mtu: usi
 }
 
 impl DownlinkCreditController {
+    fn adaptive_ack_drain_floor_for(
+        self,
+        local_pressure_bytes: usize,
+        cfg: DownlinkBackpressureConfig,
+        tun_mtu: usize,
+    ) -> usize {
+        let ack_drain_floor = relay_remote_read_ack_drain_floor_bytes(tun_mtu);
+        if self.no_egress_progress_streak >= 2
+            || local_pressure_bytes >= tx_queue_credit_spend_threshold(cfg)
+        {
+            return ack_drain_floor;
+        }
+        clamp_relay_remote_read_ack_drain_bytes(self.adaptive_ack_drain_bytes, tun_mtu)
+    }
+
     fn note_flush_feedback(
         &mut self,
         limit: DownlinkFlushLimit,
@@ -1634,6 +1744,7 @@ impl DownlinkCreditController {
     ) {
         let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
         let ack_drain_floor = relay_remote_read_ack_drain_floor_bytes(tun_mtu);
+        let adaptive_ack_drain_max = relay_remote_read_adaptive_ack_drain_max_bytes(tun_mtu);
         let observed_progress = limit
             .drain_credit_granted_bytes
             .saturating_add(limit.drop_credit_debt_paid_bytes)
@@ -1649,6 +1760,14 @@ impl DownlinkCreditController {
                 .saturating_add(grown)
                 .min(RELAY_REMOTE_READ_BURST_MAX_BYTES)
                 .max(pressure_floor);
+            let grow_by = observed_progress
+                .min(ack_drain_floor.saturating_mul(2))
+                .max(ack_drain_floor);
+            self.adaptive_ack_drain_bytes = self
+                .adaptive_ack_drain_bytes
+                .max(ack_drain_floor)
+                .saturating_add(grow_by)
+                .min(adaptive_ack_drain_max);
         }
 
         let deferred = limit
@@ -1674,6 +1793,19 @@ impl DownlinkCreditController {
             .read_credit_ceiling_bytes
             .saturating_div(2)
             .max(ack_drain_floor);
+        let hard_or_blocked = limit
+            .hard_edge_guard_deferred_bytes
+            .saturating_add(limit.drop_credit_blocked_bytes)
+            .saturating_add(limit.pressure_credit_blocked_bytes);
+        if observed_progress == 0 || hard_or_blocked > 0 {
+            self.adaptive_ack_drain_bytes = self
+                .adaptive_ack_drain_bytes
+                .saturating_div(2)
+                .max(ack_drain_floor);
+            if self.no_egress_progress_streak >= 2 {
+                self.adaptive_ack_drain_bytes = ack_drain_floor;
+            }
+        }
     }
 
     fn flush_budget(
@@ -2787,20 +2919,25 @@ fn publish_relay_read_credit_for_handle(
     let Some(tx) = ctx.relay_read_credit_tx.as_ref() else {
         return;
     };
-    let credit = relay_read_credit_for_local_egress(
+    let pending_bytes = ctx.downlink_pending.len();
+    let local_pressure_bytes = snapshot.send_queue.saturating_add(pending_bytes);
+    let pressure_ack_drain_bytes = ctx.downlink_credit_controller.adaptive_ack_drain_floor_for(
+        local_pressure_bytes,
+        cfg,
+        tun_mtu,
+    );
+    let credit = relay_read_credit_for_local_egress_with_ack_drain_floor(
         snapshot.send_queue,
-        ctx.downlink_pending.len(),
+        pending_bytes,
         egress_recovery_active,
         hard_pause_active,
         cfg,
         tun_mtu,
+        pressure_ack_drain_bytes,
     );
-    let credit = ctx.downlink_credit_controller.read_credit_for(
-        credit,
-        ctx.downlink_pending.len(),
-        cfg,
-        tun_mtu,
-    );
+    let credit =
+        ctx.downlink_credit_controller
+            .read_credit_for(credit, pending_bytes, cfg, tun_mtu);
     let changed = *tx.borrow() != credit;
     if changed {
         let _ = tx.send(credit);
@@ -2837,16 +2974,27 @@ fn publish_projected_relay_read_credit_for_payload(
     let Some(tx) = ctx.relay_read_credit_tx.as_ref() else {
         return;
     };
-    let credit = relay_read_credit_for_projected_local_egress(
+    let pending_bytes = ctx.downlink_pending.len();
+    let projected_pending = pending_bytes.saturating_add(incoming_bytes);
+    let projected_pressure_bytes = snapshot
+        .send_queue
+        .saturating_add(pending_bytes)
+        .saturating_add(incoming_bytes);
+    let pressure_ack_drain_bytes = ctx.downlink_credit_controller.adaptive_ack_drain_floor_for(
+        projected_pressure_bytes,
+        cfg,
+        tun_mtu,
+    );
+    let credit = relay_read_credit_for_projected_local_egress_with_ack_drain_floor(
         snapshot.send_queue,
-        ctx.downlink_pending.len(),
+        pending_bytes,
         incoming_bytes,
         egress_recovery_active,
         hard_pause_active,
         cfg,
         tun_mtu,
+        pressure_ack_drain_bytes,
     );
-    let projected_pending = ctx.downlink_pending.len().saturating_add(incoming_bytes);
     let credit =
         ctx.downlink_credit_controller
             .read_credit_for(credit, projected_pending, cfg, tun_mtu);
@@ -8699,6 +8847,165 @@ mod tests {
     }
 
     #[test]
+    fn downlink_credit_controller_grows_pressure_ack_drain_from_clean_egress_progress() {
+        let cfg = DownlinkBackpressureConfig::default();
+        let tun_mtu = 1200;
+        let ack_drain_floor = relay_remote_read_ack_drain_floor_bytes(tun_mtu);
+        let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        let mut controller = DownlinkCreditController::default();
+        let progressed = DownlinkFlushLimit {
+            len: pressure_floor,
+            headroom_limited: false,
+            headroom_deferred_bytes: 0,
+            clean_headroom_bytes: pressure_floor,
+            drain_credit_granted_bytes: pressure_floor,
+            drain_credit_planned_bytes: 0,
+            drop_credit_debt_bytes: 0,
+            drop_credit_debt_paid_bytes: 0,
+            drop_credit_blocked_bytes: 0,
+            pressure_credit_debt_bytes: 0,
+            pressure_credit_debt_paid_bytes: 0,
+            pressure_credit_blocked_bytes: 0,
+            hard_edge_guard_bytes: 0,
+            hard_edge_guard_deferred_bytes: 0,
+        };
+
+        controller.note_flush_feedback(progressed, cfg, tun_mtu);
+        controller.note_flush_feedback(progressed, cfg, tun_mtu);
+
+        let local_pressure_bytes = tx_queue_flush_threshold(cfg);
+        let pressure_ack_drain_bytes =
+            controller.adaptive_ack_drain_floor_for(local_pressure_bytes, cfg, tun_mtu);
+        let base = relay_read_credit_for_local_egress_with_ack_drain_floor(
+            local_pressure_bytes,
+            0,
+            false,
+            false,
+            cfg,
+            tun_mtu,
+            pressure_ack_drain_bytes,
+        );
+        let credit = controller.read_credit_for(base, 0, cfg, tun_mtu);
+
+        assert!(
+            credit.max_batch_bytes > ack_drain_floor,
+            "clean egress progress should reopen pressure ACK/window drain above the tiny floor: credit={credit:?}, ack_floor={ack_drain_floor}"
+        );
+        assert!(
+            credit.max_batch_bytes <= pressure_floor,
+            "adaptive pressure drain must remain bounded by the old pressure floor: credit={credit:?}, pressure_floor={pressure_floor}"
+        );
+    }
+
+    #[test]
+    fn downlink_credit_controller_clamps_adaptive_ack_drain_near_high_water() {
+        let cfg = DownlinkBackpressureConfig::default();
+        let tun_mtu = 1200;
+        let ack_drain_floor = relay_remote_read_ack_drain_floor_bytes(tun_mtu);
+        let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        let mut controller = DownlinkCreditController::default();
+        let progressed = DownlinkFlushLimit {
+            len: pressure_floor,
+            headroom_limited: false,
+            headroom_deferred_bytes: 0,
+            clean_headroom_bytes: pressure_floor,
+            drain_credit_granted_bytes: pressure_floor,
+            drain_credit_planned_bytes: 0,
+            drop_credit_debt_bytes: 0,
+            drop_credit_debt_paid_bytes: 0,
+            drop_credit_blocked_bytes: 0,
+            pressure_credit_debt_bytes: 0,
+            pressure_credit_debt_paid_bytes: 0,
+            pressure_credit_blocked_bytes: 0,
+            hard_edge_guard_bytes: 0,
+            hard_edge_guard_deferred_bytes: 0,
+        };
+
+        controller.note_flush_feedback(progressed, cfg, tun_mtu);
+        controller.note_flush_feedback(progressed, cfg, tun_mtu);
+
+        let local_pressure_bytes = tx_queue_credit_spend_threshold(cfg);
+        let pressure_ack_drain_bytes =
+            controller.adaptive_ack_drain_floor_for(local_pressure_bytes, cfg, tun_mtu);
+        let base = relay_read_credit_for_local_egress_with_ack_drain_floor(
+            local_pressure_bytes,
+            0,
+            false,
+            false,
+            cfg,
+            tun_mtu,
+            pressure_ack_drain_bytes,
+        );
+        let credit = controller.read_credit_for(base, 0, cfg, tun_mtu);
+
+        assert_eq!(
+            credit,
+            RelayReadCredit {
+                paused: false,
+                max_batch_bytes: ack_drain_floor,
+            },
+            "near the credit high-water edge, adaptive drain must clamp back to the tiny floor"
+        );
+    }
+
+    #[test]
+    fn downlink_credit_controller_shrinks_adaptive_ack_drain_after_no_progress() {
+        let cfg = DownlinkBackpressureConfig::default();
+        let tun_mtu = 1200;
+        let ack_drain_floor = relay_remote_read_ack_drain_floor_bytes(tun_mtu);
+        let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        let mut controller = DownlinkCreditController::default();
+        let progressed = DownlinkFlushLimit {
+            len: pressure_floor,
+            headroom_limited: false,
+            headroom_deferred_bytes: 0,
+            clean_headroom_bytes: pressure_floor,
+            drain_credit_granted_bytes: pressure_floor,
+            drain_credit_planned_bytes: 0,
+            drop_credit_debt_bytes: 0,
+            drop_credit_debt_paid_bytes: 0,
+            drop_credit_blocked_bytes: 0,
+            pressure_credit_debt_bytes: 0,
+            pressure_credit_debt_paid_bytes: 0,
+            pressure_credit_blocked_bytes: 0,
+            hard_edge_guard_bytes: 0,
+            hard_edge_guard_deferred_bytes: 0,
+        };
+        let stalled = DownlinkFlushLimit {
+            len: 0,
+            headroom_limited: true,
+            headroom_deferred_bytes: pressure_floor,
+            clean_headroom_bytes: 0,
+            drain_credit_granted_bytes: 0,
+            drain_credit_planned_bytes: 0,
+            drop_credit_debt_bytes: 0,
+            drop_credit_debt_paid_bytes: 0,
+            drop_credit_blocked_bytes: 0,
+            pressure_credit_debt_bytes: 0,
+            pressure_credit_debt_paid_bytes: 0,
+            pressure_credit_blocked_bytes: 0,
+            hard_edge_guard_bytes: 0,
+            hard_edge_guard_deferred_bytes: 0,
+        };
+
+        controller.note_flush_feedback(progressed, cfg, tun_mtu);
+        controller.note_flush_feedback(progressed, cfg, tun_mtu);
+        assert!(
+            controller.adaptive_ack_drain_floor_for(tx_queue_flush_threshold(cfg), cfg, tun_mtu)
+                > ack_drain_floor
+        );
+
+        controller.note_flush_feedback(stalled, cfg, tun_mtu);
+        controller.note_flush_feedback(stalled, cfg, tun_mtu);
+
+        assert_eq!(
+            controller.adaptive_ack_drain_floor_for(tx_queue_flush_threshold(cfg), cfg, tun_mtu),
+            ack_drain_floor,
+            "consecutive no-progress feedback should shrink adaptive drain back to the tiny floor"
+        );
+    }
+
+    #[test]
     fn listener_socket_uses_local_virtual_link_tcp_policy() {
         let socket = build_listener_socket(&ListenerSpec { local_port: 12345 });
 
@@ -10435,6 +10742,7 @@ mod tests {
             },
             downlink_credit_controller: DownlinkCreditController {
                 read_credit_ceiling_bytes: 32 * 1024,
+                adaptive_ack_drain_bytes: 4 * 1024,
                 headroom_debt_bytes: 4096,
                 no_egress_progress_streak: 3,
             },

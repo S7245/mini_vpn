@@ -2517,3 +2517,31 @@
   add adaptive growth from observed clean egress progress, with bounded
   multi-MTU non-paused drain credit and fast shrink only near high water or
   no-progress pressure.
+
+## 2026-07-07 - Exit-to-target iperf preflight needs explicit exit SSH settings
+
+- Stage: Knife14eq first VPS suite attempt.
+- Symptom: the suite failed before tunnel P1 when
+  `EXIT_TO_TARGET_IPERF_CHECK=1` was enabled.
+- Cause: `SERVER_EVIDENCE_CHECK=0` meant the expected exit SSH defaults were
+  not populated, and the command omitted `EXIT_SSH_HOST` / `EXIT_SSH_KEY`.
+- Correct behavior: whenever enabling `EXIT_TO_TARGET_IPERF_CHECK=1`, set the
+  matching exit SSH host and key explicitly, along with the target SSH host and
+  key. Do not assume server-evidence defaults are active when
+  `SERVER_EVIDENCE_CHECK=0`.
+
+## 2026-07-07 - No-pressure reverse stalls are not pressure-controller evidence
+
+- Stage: Knife14eq VPS reverse-first P1.
+- Symptom: the scoped safe1200 P1 failed at `0.699/0.030 Mbit/s`, but local
+  pressure and pending stayed near zero and read credit never fell below
+  `65536` bytes.
+- Cause: the failed window was a no-data / late-remote-after-local-finish /
+  TUIC stream pending-read-gap branch, not an active adaptive ACK drain pressure
+  clamp.
+- Correct behavior: before attributing a low-throughput reverse-first run to
+  read-credit pressure logic, check `throughput_shape`, `max_pressure_bytes`,
+  `pending_max`, `headroom_deferred_bytes`, and `read_credit_limit_bytes_min`.
+  If pressure is zero and read credit is still at the old floor, shift to local
+  FIN ordering and stream wakeup diagnostics instead of tuning controller
+  thresholds.

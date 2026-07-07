@@ -3534,3 +3534,29 @@ worth cleaning up separately.
   adaptive: stay tiny only under no-progress edge pressure, then grow to a
   bounded multi-MTU drain when egress progress is observed and TUN drops remain
   zero.
+
+## 2026-07-07 - Knife14eq exposes a no-pressure reverse no-data branch
+
+- Result doc:
+  `docs/tech/2026-07-07-knife14eq-adaptive-ack-drain-results.md`
+- VPS bundle:
+  `/tmp/mini_vpn/knife14eq_adaptive_ack_drain_p1_30b/mvpn_knife14eq_adaptive_ack_drain_p1_30b_usclient_suite_20260707_180324.tar.gz`
+- Outcome: adaptive ACK/window drain passed local TDD, full local gates, `.27`
+  focused gates, script self-tests, clippy, and release build, but the scoped
+  safe1200 reverse-first P1 failed at `0.699/0.030 Mbit/s`.
+- Useful discriminator: this was not the Knife14ep pressure-starvation shape.
+  Local pressure stayed at zero, backpressure pause/resume stayed `0/0`,
+  `headroom_deferred_bytes=0`, `pending_max=0`, and read credit never collapsed
+  below the old pressure floor (`read_credit_limit_bytes_min=65536`).
+- Clean surfaces remained clean: `tun_tx_dropped_delta=0`, QUIC
+  loss/congestion/blocking `0`, `terminal_pending_reap=0`,
+  `pending_at_close=0`, and `egress_at_close=0`.
+- New root surface: reverse data stalled before local pressure existed, with
+  `tuic_stream_pending data_pending_gap_max_ms=19922`,
+  `tuic_tcp_stream data_read_gap_max_ms=20491`, and
+  `relay_late_remote post_finish_bytes=92288` after one local finish event.
+- Reusable rule: when a failed reverse-first run reports no local pressure and
+  `read_credit_limit_bytes_min=65536`, do not tune the pressure floor or
+  adaptive ACK drain again. The next discriminator belongs around local FIN
+  ordering, read-only-after-local-finish behavior, and TUIC stream pending/read
+  wakeups while remote payload is still expected.
