@@ -3486,3 +3486,28 @@ worth cleaning up separately.
   control loop. Keep hard relay-read pauses for receive-window high water or
   TUN feedback pause; use headroom deferral to shrink bounded staging and
   flush/read budgets, then reopen credit only from observed egress progress.
+
+## 2026-07-07 - Knife14eo 97% VPS run proves the controller direction but not acceptance
+
+- Result doc:
+  `docs/tech/2026-07-07-knife14eo-local-downlink-credit-controller-results.md`
+- VPS bundle:
+  `/tmp/mini_vpn/knife14eo_credit_controller_p1_30/mvpn_knife14eo_credit_controller_p1_30_usclient_suite_20260707_171633.tar.gz`
+- Outcome: the scoped `.27 -> .33 -> .77` safe1200 reverse-first P1 ran and
+  completed, but failed acceptance at `32.3/30.8 Mbit/s` and
+  `tun_tx_dropped_delta=117`.
+- Useful positive signal: QUIC stayed clean (`lost/congestion/blocked=0`,
+  PLPMTUD disabled and clean), and close/lifecycle stayed clean
+  (`terminal_pending_reap=0`, `pending_at_close=0`, `egress_at_close=0`).
+- Useful controller signal: the new controller reduced the prior passive
+  pressure spiral (`may_recv_false=2129` from `14700`,
+  `headroom_deferred_bytes=50881438` from `4018847472`), so the design
+  direction is not rejected.
+- Remaining root: local projected payload debt still lets
+  `send_queue + pending` cross the TUN egress edge (`send_queue_max=553848`,
+  `pending_high=576836`) before hard clamp, causing a drop-edge feedback pause
+  and bursty low-average throughput.
+- Reusable rule: the next Knife14 controller change must be predictive at the
+  local egress edge. Cap projected payload credit before `tx_queue_pause_high`
+  and make fresh pressure/drop debt shrink read credit and flush budget for the
+  next control epoch, while preserving bounded ACK/window drain.

@@ -2472,3 +2472,31 @@
   `#[allow(clippy::too_many_arguments)]` directly on that function rather than
   performing a cosmetic argument-object refactor during the performance fix.
   Revisit the signature only after the control-loop design stabilizes.
+
+## 2026-07-07 - mini_vpn does not support `--help` as a safe preflight
+
+- Stage: Knife14eo 97% `.27` preflight.
+- Symptom: a lightweight remote preflight using `target/release/mini_vpn --help`
+  exited `101` because `main.rs` treats unknown modes as a panic and supports
+  only `client-tun` and `reality-probe`.
+- Cause: the binary does not implement a help mode yet; the suite also records
+  this panic as a non-blocking binary snapshot.
+- Correct behavior: for acceptance preflight, check binary existence with
+  `test -x target/release/mini_vpn` or use a real supported mode when a runtime
+  smoke is required. Do not treat the existing `--help` panic snapshot as a
+  tunnel failure unless it starts blocking the suite.
+
+## 2026-07-07 - Knife14eo controller still reacts after the TUN drop edge
+
+- Stage: Knife14eo 97% VPS reverse-first P1.
+- Symptom: the scoped safe1200 P1 completed at only `32.3/30.8 Mbit/s` and
+  had `tun_tx_dropped_delta=117`, despite clean QUIC loss/congestion/blocking
+  and clean close lifecycle counters.
+- Cause: the per-flow credit controller reduced the huge headroom-debt spiral
+  but still allowed projected payload debt to push local pressure beyond the
+  egress pause edge (`send_queue_max=553848`, `pending_high=576836`) before
+  the hard clamp took effect.
+- Correct behavior: the next patch must add a focused TDD case for projected
+  payload overrun and make pressure/drop debt predictive for the next control
+  epoch. Do not rerun full VPS acceptance on the same controller without a code
+  change that caps projected payload credit before `tx_queue_pause_high`.
