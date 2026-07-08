@@ -92,6 +92,13 @@ const DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES: usize = MAX_TCP_SOCKET_BUFFER_BYT
 const MAX_DOWNLINK_EGRESS_IMMEDIATE_BYTES: usize = MAX_TCP_SOCKET_BUFFER_BYTES;
 const _: () =
     assert!(DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES <= MAX_DOWNLINK_EGRESS_IMMEDIATE_BYTES);
+const BUFFERED_DOWNLINK_PER_FLOW_HIGH_MULTIPLIER: usize = 4;
+const BUFFERED_DOWNLINK_PER_FLOW_HARD_MULTIPLIER: usize = 8;
+const BUFFERED_DOWNLINK_GLOBAL_FLOW_SCALE_MAX: usize = 64;
+const _: () = assert!(BUFFERED_DOWNLINK_PER_FLOW_HIGH_MULTIPLIER >= 2);
+const _: () = assert!(
+    BUFFERED_DOWNLINK_PER_FLOW_HARD_MULTIPLIER > BUFFERED_DOWNLINK_PER_FLOW_HIGH_MULTIPLIER
+);
 /// L2（刀9 F4）：一条 relay 双向静默多久判 idle → 退出 + shutdown。防慢/卡死上游（尤其 REALITY
 /// TCP-only 手写 TLS 遇 server 不返回）长期挂住 relay task 泄漏。90s 偏宽松保稳（长轮询/SSE 不误杀）。
 const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
@@ -3075,6 +3082,63 @@ impl Default for DownlinkBackpressureConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BufferedDownlinkConfig {
+    enabled: bool,
+    per_flow_low_bytes: usize,
+    per_flow_high_bytes: usize,
+    per_flow_hard_bytes: usize,
+    global_low_bytes: usize,
+    global_high_bytes: usize,
+    global_hard_bytes: usize,
+}
+
+impl BufferedDownlinkConfig {
+    fn disabled(backpressure: DownlinkBackpressureConfig, pool_size: usize) -> Self {
+        Self::from_backpressure(false, backpressure, pool_size)
+    }
+
+    fn from_backpressure(
+        enabled: bool,
+        backpressure: DownlinkBackpressureConfig,
+        pool_size: usize,
+    ) -> Self {
+        let per_flow_low_bytes = backpressure.high_bytes.max(1);
+        let per_flow_high_bytes = backpressure
+            .high_bytes
+            .saturating_mul(BUFFERED_DOWNLINK_PER_FLOW_HIGH_MULTIPLIER)
+            .max(per_flow_low_bytes.saturating_add(1))
+            .min(MAX_TCP_SOCKET_BUFFER_BYTES);
+        let per_flow_hard_bytes = backpressure
+            .high_bytes
+            .saturating_mul(BUFFERED_DOWNLINK_PER_FLOW_HARD_MULTIPLIER)
+            .max(per_flow_high_bytes.saturating_add(1))
+            .min(MAX_TCP_SOCKET_BUFFER_BYTES);
+        let global_scale = pool_size.clamp(1, BUFFERED_DOWNLINK_GLOBAL_FLOW_SCALE_MAX);
+        let global_low_bytes = per_flow_low_bytes
+            .saturating_mul(global_scale)
+            .max(per_flow_low_bytes)
+            .min(MAX_TCP_SOCKET_BUFFER_BYTES);
+        let global_high_bytes = per_flow_high_bytes
+            .saturating_mul(global_scale)
+            .max(per_flow_high_bytes)
+            .min(MAX_TCP_SOCKET_BUFFER_BYTES);
+        let global_hard_bytes = per_flow_hard_bytes
+            .saturating_mul(global_scale)
+            .max(per_flow_hard_bytes)
+            .min(MAX_TCP_SOCKET_BUFFER_BYTES);
+        Self {
+            enabled,
+            per_flow_low_bytes,
+            per_flow_high_bytes,
+            per_flow_hard_bytes,
+            global_low_bytes,
+            global_high_bytes,
+            global_hard_bytes,
+        }
+    }
+}
+
 fn tun_egress_capacity_bytes(tun_mtu: usize, tun_tx_queue_len: usize) -> usize {
     tun_mtu.max(1).saturating_mul(tun_tx_queue_len.max(1))
 }
@@ -3324,6 +3388,8 @@ fn publish_relay_read_credit_for_handle(
     downlink_flush_max_bytes: usize,
     egress_recovery_active: bool,
     hard_pause_active: bool,
+    buffered_downlink: BufferedDownlinkConfig,
+    global_pending_bytes: usize,
 ) {
     let snapshot = {
         let socket = sockets.get::<TcpSocket>(handle);
@@ -3341,6 +3407,32 @@ fn publish_relay_read_credit_for_handle(
     {
         if *tx.borrow() != credit {
             let _ = tx.send(credit);
+        }
+        return;
+    }
+    if buffered_downlink.enabled {
+        let global_pending_bytes = global_pending_bytes.max(pending_bytes);
+        let decision = buffered_downlink_read_credit(
+            tx.borrow().paused,
+            pending_bytes,
+            global_pending_bytes,
+            false,
+            hard_pause_active,
+            buffered_downlink,
+        );
+        if *tx.borrow() != decision.credit {
+            let _ = tx.send(decision.credit);
+            tcp_diag_log!(
+                "{}",
+                format_buffered_downlink_read_credit_diag(
+                    handle,
+                    ctx.conn_epoch,
+                    decision,
+                    pending_bytes,
+                    global_pending_bytes,
+                    buffered_downlink,
+                )
+            );
         }
         return;
     }
@@ -3511,6 +3603,8 @@ fn publish_relay_read_credit_for_dirty_handles(
     downlink_flush_max_bytes: usize,
     egress_recovery_active: bool,
     hard_pause_active: bool,
+    buffered_downlink: BufferedDownlinkConfig,
+    global_pending_bytes: usize,
 ) {
     let handles: Vec<SocketHandle> = dirty.iter().copied().collect();
     for handle in handles {
@@ -3523,6 +3617,8 @@ fn publish_relay_read_credit_for_dirty_handles(
             downlink_flush_max_bytes,
             egress_recovery_active,
             hard_pause_active,
+            buffered_downlink,
+            global_pending_bytes,
         );
     }
 }
@@ -4693,6 +4789,124 @@ fn next_downlink_backpressure_with_credit_debt(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BufferedDownlinkCreditReason {
+    Open,
+    SoftHigh,
+    TerminalNoRecv,
+    HardFeedback,
+    PerFlowHard,
+    GlobalHard,
+}
+
+impl BufferedDownlinkCreditReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::SoftHigh => "soft_high",
+            Self::TerminalNoRecv => "terminal_no_recv",
+            Self::HardFeedback => "hard_feedback",
+            Self::PerFlowHard => "per_flow_hard",
+            Self::GlobalHard => "global_hard",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BufferedDownlinkCreditDecision {
+    credit: RelayReadCredit,
+    reason: BufferedDownlinkCreditReason,
+}
+
+fn buffered_downlink_read_credit(
+    was_paused: bool,
+    per_flow_pending_bytes: usize,
+    global_pending_bytes: usize,
+    terminal_no_recv: bool,
+    hard_feedback_active: bool,
+    cfg: BufferedDownlinkConfig,
+) -> BufferedDownlinkCreditDecision {
+    let paused = |reason| BufferedDownlinkCreditDecision {
+        credit: RelayReadCredit {
+            paused: true,
+            max_batch_bytes: 0,
+        },
+        reason,
+    };
+
+    if terminal_no_recv {
+        return paused(BufferedDownlinkCreditReason::TerminalNoRecv);
+    }
+    if hard_feedback_active {
+        return paused(BufferedDownlinkCreditReason::HardFeedback);
+    }
+    if per_flow_pending_bytes >= cfg.per_flow_hard_bytes
+        || (was_paused && per_flow_pending_bytes > cfg.per_flow_low_bytes)
+    {
+        return paused(BufferedDownlinkCreditReason::PerFlowHard);
+    }
+    if global_pending_bytes >= cfg.global_hard_bytes
+        || (was_paused && global_pending_bytes > cfg.global_low_bytes)
+    {
+        return paused(BufferedDownlinkCreditReason::GlobalHard);
+    }
+
+    let soft_limited = per_flow_pending_bytes >= cfg.per_flow_high_bytes
+        || global_pending_bytes >= cfg.global_high_bytes;
+    let max_batch_bytes = if soft_limited {
+        RELAY_REMOTE_READ_MIN_BATCH_BYTES
+    } else {
+        RELAY_REMOTE_READ_BURST_MAX_BYTES
+    };
+    BufferedDownlinkCreditDecision {
+        credit: RelayReadCredit {
+            paused: false,
+            max_batch_bytes,
+        },
+        reason: if soft_limited {
+            BufferedDownlinkCreditReason::SoftHigh
+        } else {
+            BufferedDownlinkCreditReason::Open
+        },
+    }
+}
+
+fn next_buffered_global_rx_receive_backpressure(
+    was_paused: bool,
+    stats: DownlinkPressureStats,
+    cfg: BufferedDownlinkConfig,
+) -> bool {
+    if was_paused {
+        return stats.max_pending > cfg.per_flow_low_bytes
+            || stats.total_pending > cfg.global_low_bytes;
+    }
+    stats.max_pending >= cfg.per_flow_hard_bytes || stats.total_pending >= cfg.global_hard_bytes
+}
+
+fn format_buffered_downlink_read_credit_diag(
+    handle: SocketHandle,
+    epoch: u64,
+    decision: BufferedDownlinkCreditDecision,
+    per_flow_pending_bytes: usize,
+    global_pending_bytes: usize,
+    cfg: BufferedDownlinkConfig,
+) -> String {
+    format!(
+        "🔎 tcp-buffered-downlink-credit handle={handle:?} epoch={epoch} paused={} max_batch_bytes={} reason={} per_flow_pending={} global_pending={} per_flow_low={} per_flow_high={} per_flow_hard={} global_low={} global_high={} global_hard={}",
+        decision.credit.paused,
+        decision.credit.max_batch_bytes,
+        decision.reason.as_str(),
+        per_flow_pending_bytes,
+        global_pending_bytes,
+        cfg.per_flow_low_bytes,
+        cfg.per_flow_high_bytes,
+        cfg.per_flow_hard_bytes,
+        cfg.global_low_bytes,
+        cfg.global_high_bytes,
+        cfg.global_hard_bytes
+    )
+}
+
 fn format_tcp_downlink_backpressure_diag(
     paused: bool,
     raw: DownlinkPressureStats,
@@ -4872,27 +5086,35 @@ pub struct TunRuntimeConfig {
     tun_rx_drain_budget: usize,
     tun_rx_active_flow_timer_ms: u64,
     bounded_global_rx_receive_window: bool,
+    buffered_downlink: BufferedDownlinkConfig,
 }
 
 impl TunRuntimeConfig {
     /// Build config from optional string sources.（metrics 周期恒默认；env 覆盖只在 `from_env`。）
     pub fn from_sources(pool_size: Option<&str>) -> Result<Self, ClientError> {
+        let listener = TunListenerConfig::from_sources(pool_size)?;
+        let downlink_backpressure = default_downlink_backpressure_for_tun_egress(
+            DEFAULT_TUN_MTU,
+            DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE,
+        );
+        let listener_pool_size = listener.pool_size;
         Ok(Self {
-            listener: TunListenerConfig::from_sources(pool_size)?,
+            listener,
             tun_mtu: DEFAULT_TUN_MTU,
             tun_tx_queue_len: DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE,
             metrics_secs: METRICS_SNAPSHOT_SECS,
             profile_loop: false,
-            downlink_backpressure: default_downlink_backpressure_for_tun_egress(
-                DEFAULT_TUN_MTU,
-                DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE,
-            ),
+            downlink_backpressure,
             downlink_flush_max_bytes: DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
             downlink_egress_immediate_bytes: DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES,
             tcp_socket_buffers: TcpSocketBufferConfig::default(),
             tun_rx_drain_budget: DEFAULT_TUN_RX_DRAIN_BUDGET,
             tun_rx_active_flow_timer_ms: DEFAULT_TUN_RX_ACTIVE_FLOW_TIMER_DRAIN_MS,
             bounded_global_rx_receive_window: false,
+            buffered_downlink: BufferedDownlinkConfig::disabled(
+                downlink_backpressure,
+                listener_pool_size,
+            ),
         })
     }
 
@@ -4954,6 +5176,13 @@ impl TunRuntimeConfig {
             std::env::var("MINI_VPN_BOUNDED_GLOBAL_RX_RECEIVE_WINDOW")
                 .ok()
                 .as_deref(),
+        );
+        let buffered_downlink_enabled =
+            parse_trace(std::env::var("MINI_VPN_BUFFERED_DOWNLINK").ok().as_deref());
+        cfg.buffered_downlink = BufferedDownlinkConfig::from_backpressure(
+            buffered_downlink_enabled,
+            cfg.downlink_backpressure,
+            cfg.listener.pool_size,
         );
         Ok(cfg)
     }
@@ -5108,6 +5337,20 @@ pub async fn start_tun_proxy() {
         } else {
             "disabled"
         }
+    );
+    println!(
+        "🧪 buffered downlink: {} per_flow(low/high/hard)={}/{}/{}B global(low/high/hard)={}/{}/{}B（MINI_VPN_BUFFERED_DOWNLINK=1）",
+        if runtime_config.buffered_downlink.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        runtime_config.buffered_downlink.per_flow_low_bytes,
+        runtime_config.buffered_downlink.per_flow_high_bytes,
+        runtime_config.buffered_downlink.per_flow_hard_bytes,
+        runtime_config.buffered_downlink.global_low_bytes,
+        runtime_config.buffered_downlink.global_high_bytes,
+        runtime_config.buffered_downlink.global_hard_bytes,
     );
 
     // 1. 初始化 TUN 设备 / 创建操作系统的原生异步虚拟网卡。
@@ -5359,6 +5602,7 @@ pub async fn run_event_loop<D, U, M>(
     let tun_rx_active_flow_timer_duration = (tun_rx_active_flow_timer_ms > 0)
         .then(|| std::time::Duration::from_millis(tun_rx_active_flow_timer_ms));
     let bounded_global_rx_receive_window = runtime_config.bounded_global_rx_receive_window;
+    let buffered_downlink = runtime_config.buffered_downlink;
     let mut downlink_egress_pacer =
         DownlinkEgressPacer::new(runtime_config.downlink_egress_immediate_bytes);
     let mut downlink_egress_drop_debt = DownlinkEgressDropDebt::default();
@@ -5388,12 +5632,14 @@ pub async fn run_event_loop<D, U, M>(
         let next_downlink_rx_paused_without_debt =
             next_downlink_backpressure(downlink_rx_paused, downlink_stats, downlink_backpressure);
         let previous_downlink_rx_paused = downlink_rx_paused;
-        if should_install_downlink_pressure_credit_debt(
-            previous_downlink_rx_paused,
-            next_downlink_rx_paused_without_debt,
-            downlink_stats_raw,
-            downlink_backpressure,
-        ) {
+        if !buffered_downlink.enabled
+            && should_install_downlink_pressure_credit_debt(
+                previous_downlink_rx_paused,
+                next_downlink_rx_paused_without_debt,
+                downlink_stats_raw,
+                downlink_backpressure,
+            )
+        {
             let installed_bytes = downlink_egress_drop_debt
                 .note_egress_pressure(downlink_stats_raw, downlink_backpressure);
             if installed_bytes > 0 {
@@ -5431,7 +5677,28 @@ pub async fn run_event_loop<D, U, M>(
                 )
             );
         }
-        let global_rx_paused = if bounded_global_rx_receive_window {
+        let global_rx_paused = if buffered_downlink.enabled {
+            let previous_global_rx_receive_paused = global_rx_receive_paused;
+            let next_global_rx_receive_paused = next_buffered_global_rx_receive_backpressure(
+                global_rx_receive_paused,
+                downlink_stats_raw,
+                buffered_downlink,
+            );
+            if next_global_rx_receive_paused != previous_global_rx_receive_paused {
+                global_rx_receive_paused = next_global_rx_receive_paused;
+                tcp_diag_log!(
+                    "{}",
+                    format_tcp_global_rx_backpressure_diag(
+                        global_rx_receive_paused,
+                        downlink_stats_raw,
+                        downlink_backpressure,
+                        false,
+                        tun_egress_feedback.is_paused(),
+                    )
+                );
+            }
+            global_rx_receive_paused
+        } else if bounded_global_rx_receive_window {
             let previous_global_rx_receive_paused = global_rx_receive_paused;
             let next_global_rx_receive_paused = next_global_rx_receive_backpressure(
                 global_rx_receive_paused,
@@ -5463,7 +5730,13 @@ pub async fn run_event_loop<D, U, M>(
             runtime_config.tun_mtu,
             downlink_flush_max_bytes,
             downlink_egress_drop_debt.has_active_drop_debt(),
-            downlink_rx_paused || tun_egress_feedback.is_paused(),
+            if buffered_downlink.enabled {
+                tun_egress_feedback.is_paused()
+            } else {
+                downlink_rx_paused || tun_egress_feedback.is_paused()
+            },
+            buffered_downlink,
+            downlink_stats_raw.total_pending,
         );
         tokio::select! {
             // TCP relay 回程：后台车厢把远端回传字节送回主循环 → 注入对应 smoltcp socket。
@@ -5517,22 +5790,29 @@ pub async fn run_event_loop<D, U, M>(
                                 &mut tun_rx_drain_diag,
                                 pre_payload_tun_rx_budget,
                                 TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD_PRE,
-                                downlink_rx_paused || tun_egress_feedback.is_paused(),
+                                if buffered_downlink.enabled {
+                                    tun_egress_feedback.is_paused()
+                                } else {
+                                    downlink_rx_paused || tun_egress_feedback.is_paused()
+                                },
+                                buffered_downlink,
                             )
                             .await;
                         }
-                        publish_projected_relay_read_credit_for_payload(
-                            handle,
-                            epoch,
-                            payload.len(),
-                            &sockets,
-                            &mut socket_ctxs,
-                            downlink_backpressure,
-                            runtime_config.tun_mtu,
-                            downlink_flush_max_bytes,
-                            downlink_egress_drop_debt.has_active_drop_debt(),
-                            downlink_rx_paused || tun_egress_feedback.is_paused(),
-                        );
+                        if !buffered_downlink.enabled {
+                            publish_projected_relay_read_credit_for_payload(
+                                handle,
+                                epoch,
+                                payload.len(),
+                                &sockets,
+                                &mut socket_ctxs,
+                                downlink_backpressure,
+                                runtime_config.tun_mtu,
+                                downlink_flush_max_bytes,
+                                downlink_egress_drop_debt.has_active_drop_debt(),
+                                downlink_rx_paused || tun_egress_feedback.is_paused(),
+                            );
+                        }
                         let accepted_bytes = match handle_remote_payload(
                             handle,
                             epoch,
@@ -5548,6 +5828,7 @@ pub async fn run_event_loop<D, U, M>(
                             &mut downlink_egress_drop_debt,
                             downlink_backpressure,
                             runtime_config.tun_mtu,
+                            buffered_downlink.enabled,
                         )
                         .await
                         {
@@ -5566,6 +5847,8 @@ pub async fn run_event_loop<D, U, M>(
                         {
                             dirty.insert(handle);
                         }
+                        let current_global_pending =
+                            downlink_pressure_stats(&dirty, &socket_ctxs, &sockets).total_pending;
                         publish_relay_read_credit_for_handle(
                             handle,
                             &sockets,
@@ -5574,7 +5857,13 @@ pub async fn run_event_loop<D, U, M>(
                             runtime_config.tun_mtu,
                             downlink_flush_max_bytes,
                             downlink_egress_drop_debt.has_active_drop_debt(),
-                            downlink_rx_paused || tun_egress_feedback.is_paused(),
+                            if buffered_downlink.enabled {
+                                tun_egress_feedback.is_paused()
+                            } else {
+                                downlink_rx_paused || tun_egress_feedback.is_paused()
+                            },
+                            buffered_downlink,
+                            current_global_pending,
                         );
                         let has_downlink_work = should_drain_tun_rx_after_remote_payload(
                             socket_ctxs.get(&handle),
@@ -5623,7 +5912,12 @@ pub async fn run_event_loop<D, U, M>(
                                 &mut tun_rx_drain_diag,
                                 tun_rx_budget,
                                 TUN_RX_DRAIN_SOURCE_REMOTE_PAYLOAD,
-                                downlink_rx_paused || tun_egress_feedback.is_paused(),
+                                if buffered_downlink.enabled {
+                                    tun_egress_feedback.is_paused()
+                                } else {
+                                    downlink_rx_paused || tun_egress_feedback.is_paused()
+                                },
+                                buffered_downlink,
                             )
                             .await;
                         }
@@ -5639,8 +5933,11 @@ pub async fn run_event_loop<D, U, M>(
                         gap_ms,
                         remote_to_global_rx_bytes,
                     } => {
-                        let relay_read_hard_pause =
-                            downlink_rx_paused || tun_egress_feedback.is_paused();
+                        let relay_read_hard_pause = if buffered_downlink.enabled {
+                            tun_egress_feedback.is_paused()
+                        } else {
+                            downlink_rx_paused || tun_egress_feedback.is_paused()
+                        };
                         let cadence_floor = note_ack_cadence_gap_hint_for_handle(
                             handle,
                             epoch,
@@ -5651,6 +5948,8 @@ pub async fn run_event_loop<D, U, M>(
                             relay_read_hard_pause,
                         )
                         .unwrap_or(0);
+                        let current_global_pending =
+                            downlink_pressure_stats(&dirty, &socket_ctxs, &sockets).total_pending;
                         publish_relay_read_credit_for_handle(
                             handle,
                             &sockets,
@@ -5660,6 +5959,8 @@ pub async fn run_event_loop<D, U, M>(
                             downlink_flush_max_bytes,
                             downlink_egress_drop_debt.has_active_drop_debt(),
                             relay_read_hard_pause,
+                            buffered_downlink,
+                            current_global_pending,
                         );
                         let current_downlink_stats =
                             downlink_pressure_stats(&dirty, &socket_ctxs, &sockets);
@@ -5706,7 +6007,12 @@ pub async fn run_event_loop<D, U, M>(
                                 &mut tun_rx_drain_diag,
                                 tun_rx_budget,
                                 TUN_RX_DRAIN_SOURCE_RELAY_GAP_HINT,
-                                downlink_rx_paused || tun_egress_feedback.is_paused(),
+                                if buffered_downlink.enabled {
+                                    tun_egress_feedback.is_paused()
+                                } else {
+                                    downlink_rx_paused || tun_egress_feedback.is_paused()
+                                },
+                                buffered_downlink,
                             )
                             .await;
                             if relay_gap_ack_drain.arm_after_hint_drain(drained, tun_rx_budget) {
@@ -5771,7 +6077,12 @@ pub async fn run_event_loop<D, U, M>(
                             &mut tun_rx_drain_diag,
                             tun_rx_budget,
                             TUN_RX_DRAIN_SOURCE_RELAY_GAP_HINT_FOLLOWUP,
-                            downlink_rx_paused || tun_egress_feedback.is_paused(),
+                            if buffered_downlink.enabled {
+                                tun_egress_feedback.is_paused()
+                            } else {
+                                downlink_rx_paused || tun_egress_feedback.is_paused()
+                            },
+                            buffered_downlink,
                         )
                         .await;
                         if relay_gap_ack_drain.arm_after_followup_drain(
@@ -5825,7 +6136,12 @@ pub async fn run_event_loop<D, U, M>(
                             &mut tun_rx_drain_diag,
                             tun_rx_budget,
                             mode.source(),
-                            downlink_rx_paused || tun_egress_feedback.is_paused(),
+                            if buffered_downlink.enabled {
+                                tun_egress_feedback.is_paused()
+                            } else {
+                                downlink_rx_paused || tun_egress_feedback.is_paused()
+                            },
+                            buffered_downlink,
                         )
                         .await;
                         if drained >= tun_rx_budget
@@ -5874,7 +6190,12 @@ pub async fn run_event_loop<D, U, M>(
                         &mut downlink_egress_drop_debt,
                         &mut tcp_loop_flush_tx_calls,
                         &mut tcp_loop_flush_tx_failures,
-                        downlink_rx_paused || tun_egress_feedback.is_paused(),
+                        if buffered_downlink.enabled {
+                            tun_egress_feedback.is_paused()
+                        } else {
+                            downlink_rx_paused || tun_egress_feedback.is_paused()
+                        },
+                        buffered_downlink,
                         "inbound_poll",
                     )
                     .await;
@@ -6000,7 +6321,8 @@ pub async fn run_event_loop<D, U, M>(
                     downlink_backpressure,
                     pressure_now,
                 );
-                let sampled_global_rx_paused = if bounded_global_rx_receive_window {
+                let sampled_global_rx_paused =
+                    if buffered_downlink.enabled || bounded_global_rx_receive_window {
                     global_rx_receive_paused
                 } else {
                     downlink_rx_paused || tun_egress_feedback.is_paused()
@@ -6110,7 +6432,12 @@ pub async fn run_event_loop<D, U, M>(
                         &mut tun_rx_drain_diag,
                         timer_tun_rx_budget,
                         timer_tun_rx_source,
-                        downlink_rx_paused || tun_egress_feedback.is_paused(),
+                        if buffered_downlink.enabled {
+                            tun_egress_feedback.is_paused()
+                        } else {
+                            downlink_rx_paused || tun_egress_feedback.is_paused()
+                        },
+                        buffered_downlink,
                     )
                     .await;
                 }
@@ -6120,7 +6447,11 @@ pub async fn run_event_loop<D, U, M>(
                 let close_egress_guard = tun_egress_feedback.is_paused()
                     || downlink_egress_drop_debt.has_active_drop_debt();
                 let relay_read_recovery_active = downlink_egress_drop_debt.has_active_drop_debt();
-                let relay_read_hard_pause = downlink_rx_paused || tun_egress_feedback.is_paused();
+                let relay_read_hard_pause = if buffered_downlink.enabled {
+                    tun_egress_feedback.is_paused()
+                } else {
+                    downlink_rx_paused || tun_egress_feedback.is_paused()
+                };
                 process_dirty_relay(
                     &mut dirty,
                     &mut sockets,
@@ -6139,6 +6470,7 @@ pub async fn run_event_loop<D, U, M>(
                     close_egress_guard,
                     relay_read_recovery_active,
                     relay_read_hard_pause,
+                    buffered_downlink,
                 )
                 .await;
             }
@@ -6172,6 +6504,7 @@ async fn process_ready_tun_rx_packet<D, U, M>(
     tcp_loop_flush_tx_calls: &mut u64,
     tcp_loop_flush_tx_failures: &mut u64,
     relay_read_hard_pause: bool,
+    buffered_downlink: BufferedDownlinkConfig,
     poll_stage: &str,
 ) -> TunRxPacketKind
 where
@@ -6257,6 +6590,7 @@ where
         close_egress_guard,
         relay_read_recovery_active,
         relay_read_hard_pause,
+        buffered_downlink,
     )
     .await;
 
@@ -6289,6 +6623,7 @@ async fn drain_ready_tun_rx<D, U, M>(
     budget: usize,
     source: &str,
     relay_read_hard_pause: bool,
+    buffered_downlink: BufferedDownlinkConfig,
 ) -> usize
 where
     D: TunIo,
@@ -6326,6 +6661,7 @@ where
                     tcp_loop_flush_tx_calls,
                     tcp_loop_flush_tx_failures,
                     relay_read_hard_pause,
+                    buffered_downlink,
                     "tun_rx_drain",
                 )
                 .await;
@@ -6376,6 +6712,7 @@ async fn process_dirty_relay<U, M>(
     close_egress_drop_guard: bool,
     relay_read_recovery_active: bool,
     relay_read_hard_pause: bool,
+    buffered_downlink: BufferedDownlinkConfig,
 ) where
     U: ProxyUpstream + 'static,
     M: MetricsSink,
@@ -6427,6 +6764,8 @@ async fn process_dirty_relay<U, M>(
                 || needs_local_finish
                 || snapshot.send_queue > downlink_backpressure.low_bytes
         };
+        let current_global_pending =
+            downlink_pressure_stats(dirty, socket_ctxs, sockets).total_pending;
         publish_relay_read_credit_for_handle(
             handle,
             sockets,
@@ -6436,6 +6775,8 @@ async fn process_dirty_relay<U, M>(
             downlink_flush_max_bytes,
             relay_read_recovery_active,
             relay_read_hard_pause,
+            buffered_downlink,
+            current_global_pending,
         );
         if !still_active {
             dirty.remove(&handle);
@@ -7606,6 +7947,7 @@ async fn handle_remote_payload<D: TunIo>(
     downlink_egress_drop_debt: &mut DownlinkEgressDropDebt,
     downlink_backpressure: DownlinkBackpressureConfig,
     tun_mtu: usize,
+    buffered_downlink_enabled: bool,
 ) -> std::io::Result<usize> {
     let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
@@ -7699,13 +8041,16 @@ async fn handle_remote_payload<D: TunIo>(
     let snapshot = SocketCloseSnapshot::from_socket(tcp_socket);
     let post_flush_projected_pressure =
         downlink_projected_local_pressure_bytes(snapshot.send_queue, ctx.downlink_pending.len());
-    let installed_projected_debt = downlink_egress_drop_debt
-        .note_post_flush_projected_egress_pressure(
+    let installed_projected_debt = if buffered_downlink_enabled {
+        0
+    } else {
+        downlink_egress_drop_debt.note_post_flush_projected_egress_pressure(
             snapshot.send_queue,
             ctx.downlink_pending.len(),
             accepted_bytes,
             downlink_backpressure,
-        );
+        )
+    };
     if installed_projected_debt > 0 {
         tcp_diag_log!(
             "{}",
@@ -10526,6 +10871,8 @@ mod tests {
             DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
             false,
             false,
+            BufferedDownlinkConfig::disabled(cfg, DEFAULT_TUN_POOL_SIZE),
+            0,
         );
 
         tokio::time::timeout(std::time::Duration::from_millis(20), credit_rx.changed())
@@ -12214,6 +12561,7 @@ mod tests {
             &mut drop_debt,
             cfg,
             1200,
+            false,
         )
         .await
         .unwrap();
@@ -12243,6 +12591,7 @@ mod tests {
             &mut drop_debt,
             cfg,
             1200,
+            false,
         )
         .await
         .unwrap();
@@ -13700,6 +14049,196 @@ mod tests {
         assert_eq!(stats.total_tx_queue, 0);
         assert_eq!(stats.max_pressure(), 25);
         assert_eq!(stats.total_pressure(), 35);
+    }
+
+    #[test]
+    fn buffered_downlink_config_derives_bounded_watermarks_from_backpressure() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let buffered = BufferedDownlinkConfig::from_backpressure(true, cfg, 3);
+
+        assert!(buffered.enabled);
+        assert_eq!(buffered.per_flow_low_bytes, 100);
+        assert_eq!(buffered.per_flow_high_bytes, 400);
+        assert_eq!(buffered.per_flow_hard_bytes, 800);
+        assert_eq!(buffered.global_low_bytes, 300);
+        assert_eq!(buffered.global_high_bytes, 1200);
+        assert_eq!(buffered.global_hard_bytes, 2400);
+    }
+
+    #[test]
+    fn buffered_downlink_read_credit_ignores_transient_local_headroom_pressure() {
+        let cfg = BufferedDownlinkConfig::from_backpressure(
+            true,
+            DownlinkBackpressureConfig {
+                high_bytes: 100,
+                low_bytes: 40,
+            },
+            1,
+        );
+
+        let decision = buffered_downlink_read_credit(false, 0, 0, false, false, cfg);
+
+        assert_eq!(decision.reason, BufferedDownlinkCreditReason::Open);
+        assert_eq!(
+            decision.credit,
+            RelayReadCredit {
+                paused: false,
+                max_batch_bytes: RELAY_REMOTE_READ_BURST_MAX_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn buffered_downlink_soft_high_keeps_useful_read_floor() {
+        let cfg = BufferedDownlinkConfig::from_backpressure(
+            true,
+            DownlinkBackpressureConfig {
+                high_bytes: 100,
+                low_bytes: 40,
+            },
+            1,
+        );
+
+        let decision =
+            buffered_downlink_read_credit(false, cfg.per_flow_high_bytes, 0, false, false, cfg);
+
+        assert_eq!(decision.reason, BufferedDownlinkCreditReason::SoftHigh);
+        assert_eq!(
+            decision.credit,
+            RelayReadCredit {
+                paused: false,
+                max_batch_bytes: RELAY_REMOTE_READ_MIN_BATCH_BYTES,
+            },
+            "soft buffered pressure must not collapse remote reads to MTU-sized 1200B service"
+        );
+    }
+
+    #[test]
+    fn buffered_downlink_pauses_only_at_hard_watermarks_and_resumes_at_low() {
+        let cfg = BufferedDownlinkConfig::from_backpressure(
+            true,
+            DownlinkBackpressureConfig {
+                high_bytes: 100,
+                low_bytes: 40,
+            },
+            2,
+        );
+
+        assert!(
+            !buffered_downlink_read_credit(
+                false,
+                cfg.per_flow_hard_bytes - 1,
+                0,
+                false,
+                false,
+                cfg
+            )
+            .credit
+            .paused
+        );
+        let hard =
+            buffered_downlink_read_credit(false, cfg.per_flow_hard_bytes, 0, false, false, cfg);
+        assert_eq!(hard.reason, BufferedDownlinkCreditReason::PerFlowHard);
+        assert!(hard.credit.paused);
+        assert!(
+            buffered_downlink_read_credit(true, cfg.per_flow_low_bytes + 1, 0, false, false, cfg)
+                .credit
+                .paused,
+            "paused flow stays paused above low watermark"
+        );
+        assert!(
+            !buffered_downlink_read_credit(true, cfg.per_flow_low_bytes, 0, false, false, cfg)
+                .credit
+                .paused,
+            "flow resumes once buffered bytes drain to low watermark"
+        );
+    }
+
+    #[test]
+    fn buffered_downlink_global_hard_protects_memory_without_tx_queue_pressure() {
+        let cfg = BufferedDownlinkConfig::from_backpressure(
+            true,
+            DownlinkBackpressureConfig {
+                high_bytes: 100,
+                low_bytes: 40,
+            },
+            2,
+        );
+
+        let hard = buffered_downlink_read_credit(
+            false,
+            cfg.per_flow_low_bytes,
+            cfg.global_hard_bytes,
+            false,
+            false,
+            cfg,
+        );
+        assert_eq!(hard.reason, BufferedDownlinkCreditReason::GlobalHard);
+        assert!(hard.credit.paused);
+    }
+
+    #[test]
+    fn buffered_global_rx_window_uses_buffer_watermarks_not_tx_queue_pressure() {
+        let cfg = BufferedDownlinkConfig::from_backpressure(
+            true,
+            DownlinkBackpressureConfig {
+                high_bytes: 100,
+                low_bytes: 40,
+            },
+            2,
+        );
+        let tx_queue_only = DownlinkPressureStats::new(0, 0, usize::MAX / 4, usize::MAX / 4);
+
+        assert!(
+            !next_buffered_global_rx_receive_backpressure(false, tx_queue_only, cfg),
+            "buffered global receive is governed by pending bytes, not smoltcp tx_queue-only pressure"
+        );
+        assert!(
+            next_buffered_global_rx_receive_backpressure(
+                false,
+                DownlinkPressureStats::pending_only(cfg.per_flow_hard_bytes, cfg.global_low_bytes),
+                cfg,
+            ),
+            "per-flow hard buffered bytes pause global_rx receive"
+        );
+        assert!(
+            next_buffered_global_rx_receive_backpressure(
+                false,
+                DownlinkPressureStats::pending_only(cfg.per_flow_low_bytes, cfg.global_hard_bytes),
+                cfg,
+            ),
+            "global hard buffered bytes pause global_rx receive"
+        );
+    }
+
+    #[test]
+    fn buffered_downlink_credit_diag_reports_attribution_fields() {
+        let cfg = BufferedDownlinkConfig::from_backpressure(
+            true,
+            DownlinkBackpressureConfig {
+                high_bytes: 100,
+                low_bytes: 40,
+            },
+            2,
+        );
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let decision = buffered_downlink_read_credit(false, 401, 500, false, false, cfg);
+
+        let line = format_buffered_downlink_read_credit_diag(handle, 7, decision, 401, 500, cfg);
+
+        assert!(line.contains("tcp-buffered-downlink-credit"), "{line}");
+        assert!(line.contains("epoch=7"), "{line}");
+        assert!(line.contains("paused=false"), "{line}");
+        assert!(line.contains("max_batch_bytes=65536"), "{line}");
+        assert!(line.contains("reason=soft_high"), "{line}");
+        assert!(line.contains("per_flow_pending=401"), "{line}");
+        assert!(line.contains("global_pending=500"), "{line}");
+        assert!(line.contains("per_flow_hard=800"), "{line}");
+        assert!(line.contains("global_hard=1600"), "{line}");
     }
 
     #[test]
@@ -17097,6 +17636,25 @@ mod tests {
     fn tun_runtime_config_accepts_pool_size_override() {
         let config = TunRuntimeConfig::from_sources(Some("3")).expect("valid config should load");
         assert_eq!(config.listener.pool_size, 3);
+    }
+
+    #[test]
+    fn tun_runtime_config_disables_buffered_downlink_by_default() {
+        let config = TunRuntimeConfig::from_sources(Some("3")).expect("valid config should load");
+
+        assert!(!config.buffered_downlink.enabled);
+        assert_eq!(
+            config.buffered_downlink.per_flow_low_bytes,
+            config.downlink_backpressure.high_bytes
+        );
+        assert_eq!(
+            config.buffered_downlink.global_hard_bytes,
+            config
+                .buffered_downlink
+                .per_flow_hard_bytes
+                .saturating_mul(3)
+                .min(MAX_TCP_SOCKET_BUFFER_BYTES)
+        );
     }
 
     fn udp_pkt(dst: [u8; 4], dst_port: u16) -> Vec<u8> {
