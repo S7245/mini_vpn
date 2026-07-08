@@ -4079,3 +4079,27 @@ worth cleaning up separately.
   probe gate.
 - Open gate note: `cargo clippy --lib -- -D warnings` currently fails on two
   pre-existing `collapsible_if` warnings outside this diff.
+
+## 2026-07-08 - Knife14gm restores data movement but not 30M
+
+- Result doc:
+  `docs/tech/2026-07-08-knife14gm-low-byte-gap-results.md`
+- Code commit:
+  `9e50a32` (`fix(knife14gm): service low-byte ordered stream gaps`)
+- VPS bundle:
+  `/tmp/mini_vpn/knife14gm_lowbyte_gap_safe1200_p1_30_retry1/mvpn_knife14gm_lowbyte_gap_safe1200_p1_30_retry1_usclient_suite_20260708_185002.tar.gz`
+- Outcome: the focused safe1200 reverse-first P1 reached `23.2 Mbit/s` sender
+  and `21.2 Mbit/s` receiver. It did not exceed `30 Mbit/s`.
+- Useful progress: the data stream is no longer stuck at the Knife14gl
+  `60704B` low-byte no-data edge. The retry run moved
+  `remote_to_global_rx_bytes` to `79482037`, emitted `204` relay gap hints, and
+  kept TUN drops, close-tail accounting, and QUIC loss/blocking clean.
+- Remaining root: local pressure-credit / egress-progress feedback is again
+  the active branch. The run stayed `low_average` with multi-second
+  `connection_stream_frames_pending` gaps and later `projected_payload_credit_edge`
+  debt, despite clean QUIC and TUN surfaces.
+- Reusable rule: after low-byte ACK hint service, do not keep adding ACK hint
+  triggers. The next TDD slice should connect useful local egress progress and
+  credit repayment to read-credit publishing/read-service cadence, with the
+  immediate acceptance target of clearing `30 Mbit/s` before returning to
+  `100+ Mbit/s`.

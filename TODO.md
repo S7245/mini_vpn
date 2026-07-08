@@ -47,23 +47,29 @@ Latest discriminator:
 - Knife14fx ran a mature sing-box `v1.13.14` client in the same current
   environment and reached `173/173 Mbit/s`. Therefore VPS config can reach
   `100+`; the remaining blocker is mini_vpn client/data-plane behavior.
+- Knife14gm added local TDD and code for the Knife14gl low-byte ordered stream
+  gap. Commit `9e50a32` made active payload-shaped ordered streams below the
+  old `64KiB` ACK/window service gate reach both the ACK-drain due predicate
+  and the relay supervisor polling gate. The focused safe1200 reverse-first P1
+  retry restored data movement (`23.2/21.2 Mbit/s`) but did **not** exceed
+  `30 Mbit/s`; the run stayed `low_average` with local-pressure/credit-edge
+  signals and clean TUN/QUIC surfaces.
 
 Current result doc:
 
-- `docs/tech/2026-07-08-knife14fu-fw-fx-reverse-discriminator-results.md`
+- `docs/tech/2026-07-08-knife14gm-low-byte-gap-results.md`
 
 Current follow-up queue:
 
-1. Keep `6eb52e9`'s ordered-default gate: unordered reassembly is diagnostic
-   only and must not be the default data path.
-2. Diff current branch against `f8765c1` around TUIC stream read service, relay
-   receive cadence, self-wake diagnostics, and local egress-progress feedback to
-   explain the regression from data-moving `18.7 Mbit/s` to no-data `0.046`.
-3. Add a focused ordered stream readiness/progress discriminator: QUIC stream
-   readable state, ordered offset progress, remote read future lifetime, and
-   local egress progress in one timeline.
-4. After current code returns to a data-moving shape, resume the local
-   pressure-credit/controller fix for the remaining reverse throughput gap.
+1. Keep the ordered-default gate and the Knife14gm low-byte ACK/window service
+   fix; unordered reassembly remains diagnostic only.
+2. Resume the local pressure-credit/controller branch. Add TDD around useful
+   egress progress, credit repayment, and read-credit publishing when the data
+   stream is still `connection_stream_frames_pending`.
+3. The next focused acceptance target is first `>30 Mbit/s` on the same
+   safe1200 reverse-first P1, not yet `100+`.
+4. Once `>30 Mbit/s` is stable, continue the controller/frame-cadence path
+   toward clean `100+ Mbit/s`.
 5. Only after a clean `100+ Mbit/s` repeat exits normally should Knife14 broaden
    to longer-duration or concurrency sweeps.
 

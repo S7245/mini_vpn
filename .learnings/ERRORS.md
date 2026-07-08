@@ -2950,3 +2950,18 @@ active root unless it repeats.
   because relay-reader cancellation and pressure-credit tests pass. Before the
   next VPS run, add a focused test for low-byte ordered-stream gap ACK/window
   service while preserving no-read-while-paused and bounded pending invariants.
+
+## 2026-07-08 - Knife14gm first VPS attempt failed before the data plane
+
+- Stage: Knife14gm focused safe1200 reverse-first P1 acceptance.
+- Symptom: the first suite attempt
+  `knife14gm_lowbyte_gap_safe1200_p1_30` exited before routing/probing because
+  client startup failed at `tuic auth finish: sending stopped by peer: error 0`.
+  sing-box and iperf3 were active, and no code/data-plane evidence was produced.
+- Cause: not proven; the same command shape retried immediately as
+  `knife14gm_lowbyte_gap_safe1200_p1_30_retry1` started TUIC successfully and
+  completed the reverse-first P1.
+- Correct behavior: treat this as a pre-data-plane startup failure, not as
+  throughput evidence. Do read-only diagnostics, avoid restarting or retuning
+  VPS services by default, then retry once with the same command before
+  attributing it to code.
