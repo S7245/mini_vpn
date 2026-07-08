@@ -8188,23 +8188,6 @@ async fn run_relay_reader(
         diag.note_remote_read_service_tick(remote_read_len);
         let remote_msg = tokio::select! {
             _ = &mut stop_rx => return,
-            update = read_credit_rx.changed() => {
-                if update.is_err() {
-                    return;
-                }
-                read_credit = *read_credit_rx.borrow_and_update();
-                diag.note_read_credit(read_credit);
-                if read_credit.paused {
-                    tcp_diag_log!(
-                        "🔎 tcp-relay-read-credit handle={:?} epoch={} paused=true max_batch_bytes=0 updates={} pause_updates={}",
-                        handle,
-                        epoch,
-                        diag.read_credit_updates,
-                        diag.read_credit_pause_updates
-                    );
-                }
-                continue;
-            }
             remote_msg = remote_reader.read(&mut buf[..remote_read_len]) => remote_msg,
         };
         match remote_msg {
@@ -8948,19 +8931,22 @@ mod tests {
     struct CreditWakeReadableStream {
         shutdown_called: Arc<AtomicBool>,
         poll_count: Arc<AtomicU64>,
+        ready: Arc<AtomicBool>,
+        read_waker: Arc<Mutex<Option<std::task::Waker>>>,
         read_sent: bool,
     }
     impl tokio::io::AsyncRead for CreditWakeReadableStream {
         fn poll_read(
             mut self: std::pin::Pin<&mut Self>,
-            _cx: &mut Context<'_>,
+            cx: &mut Context<'_>,
             buf: &mut tokio::io::ReadBuf<'_>,
         ) -> Poll<std::io::Result<()>> {
             self.poll_count.fetch_add(1, Ordering::SeqCst);
+            if !self.ready.load(Ordering::SeqCst) {
+                *self.read_waker.lock().unwrap() = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
             if !self.read_sent {
-                if self.poll_count.load(Ordering::SeqCst) == 1 {
-                    return Poll::Pending;
-                }
                 buf.put_slice(b"after-egress-wake");
                 self.read_sent = true;
                 return Poll::Ready(Ok(()));
@@ -10927,14 +10913,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_read_credit_update_repolls_pending_remote_read() {
+    async fn relay_read_credit_update_keeps_inflight_remote_read_armed() {
         let mut sockets = SocketSet::new(vec![]);
         let handle = mk_test_handle(&mut sockets);
         let shutdown_called = Arc::new(AtomicBool::new(false));
         let poll_count = Arc::new(AtomicU64::new(0));
+        let ready = Arc::new(AtomicBool::new(false));
+        let read_waker = Arc::new(Mutex::new(None));
         let stream: RelayStream = Box::new(CreditWakeReadableStream {
             shutdown_called: shutdown_called.clone(),
             poll_count: poll_count.clone(),
+            ready: ready.clone(),
+            read_waker: read_waker.clone(),
             read_sent: false,
         });
         let (_tx, rx) = mpsc::channel::<RelayCommand>(8);
@@ -10952,13 +10942,37 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(20), back_rx.recv())
                 .await
                 .is_err(),
-            "a pending remote read should not progress before the read-service wake"
+            "a pending remote read should not progress before the remote stream wakes it"
         );
 
-        credit_tx.send(RelayReadCredit::default()).unwrap();
+        credit_tx
+            .send(RelayReadCredit {
+                paused: false,
+                max_batch_bytes: relay_remote_read_pressure_floor_bytes(1200),
+            })
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), back_rx.recv())
+                .await
+                .is_err(),
+            "non-pausing credit updates must not cancel and recreate an in-flight remote read"
+        );
+        assert_eq!(
+            poll_count.load(Ordering::SeqCst),
+            1,
+            "non-pausing credit updates should be applied before the next remote read, not by repolling the current one"
+        );
+
+        ready.store(true, Ordering::SeqCst);
+        read_waker
+            .lock()
+            .unwrap()
+            .take()
+            .expect("pending remote read should have registered a waker")
+            .wake();
         match tokio::time::timeout(std::time::Duration::from_millis(200), back_rx.recv())
             .await
-            .expect("read-credit wake should repoll the pending remote read")
+            .expect("remote stream wake should complete the pending read")
             .expect("relay should still be alive")
         {
             (h, RelayEvent::Data { epoch, bytes }) => {
