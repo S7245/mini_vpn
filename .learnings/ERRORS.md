@@ -1,5 +1,18 @@
 # Errors
 
+## 2026-07-08 - Target branch was already attached to another worktree
+
+- Stage: VPS QUIC preflight helper setup.
+- Symptom: `git switch codex/knife14d-downlink-reap-open` failed because that
+  branch was already used by another local worktree at
+  `/Users/liushan/Documents/Personal/Languages/Rust/mini_vpn`.
+- Resolution: created the task branch `codex/knife14d-vps-readiness` from the
+  same base commit `d61ab47` and kept the change scoped there.
+- Correct behavior: when a delegated branch is already checked out elsewhere,
+  do not force-switch or detach/reattach it. Create a narrow `codex/` task
+  branch from the requested base commit and mention the branch in the final
+  handoff.
+
 ## 2026-07-08 - Knife14fq timeout120 repeat regressed throughput
 
 - Stage: Knife14fq high-buffer clean-tail repeat.

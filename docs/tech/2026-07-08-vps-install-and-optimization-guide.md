@@ -114,6 +114,20 @@ an explicit TUIC congestion-control value before the socket-buffer fix.
 Apply this on every Linux VPS that runs the TUIC exit:
 
 ```bash
+sudo bash scripts/vps-quic-preflight.sh check-exit
+sudo bash scripts/vps-quic-preflight.sh install-exit
+```
+
+`check-exit` is read-only but uses `sudo` so config/socket visibility is not
+partial. `install-exit` writes the sysctl file below, applies `sysctl
+--system`, and restarts sing-box so the TUIC UDP socket is recreated under the
+larger kernel buffers. If you need to stage the sysctl without a service
+restart, run `RESTART_SING_BOX=0 sudo bash scripts/vps-quic-preflight.sh
+install-exit`, then restart sing-box before any throughput acceptance.
+
+Equivalent manual commands:
+
+```bash
 sudo install -d -m 0755 /etc/sysctl.d
 sudo tee /etc/sysctl.d/99-mini-vpn-quic.conf >/dev/null <<'EOF'
 net.core.rmem_max = 16777216
@@ -132,6 +146,7 @@ socket inherited the larger buffers.
 Verify:
 
 ```bash
+sudo bash scripts/vps-quic-preflight.sh check-exit
 sysctl -n net.core.rmem_max
 sysctl -n net.core.wmem_max
 sysctl -n net.core.rmem_default
@@ -161,6 +176,19 @@ If a Linux test client reports tiny receive/send buffers, apply the same
 sysctl values there as well. For future mobile/desktop apps, this may not be
 available; the exit-side requirement remains the first production gate.
 
+The helper has role-specific checks:
+
+```bash
+bash scripts/vps-quic-preflight.sh check-client
+bash scripts/vps-quic-preflight.sh check-target
+sudo bash scripts/vps-quic-preflight.sh diagnose-exit
+bash scripts/vps-quic-preflight.sh checklist
+```
+
+`diagnose-exit` prints bounded service/socket/timing diagnostics and a redacted
+sing-box log tail. It deliberately does not read `.env`, dump sing-box JSON,
+print certificates, or print TUIC UUIDs/passwords.
+
 ## Firewall And Security Group
 
 For TUIC-only exits:
@@ -179,6 +207,7 @@ TUIC and REALITY credentials separate and rotate them outside the repository.
 Run this before every expensive throughput suite:
 
 ```bash
+sudo bash scripts/vps-quic-preflight.sh check-exit
 sing-box version
 sudo sing-box check -c /etc/sing-box/config.json
 systemctl is-active sing-box
@@ -190,6 +219,7 @@ timedatectl show -p NTPSynchronized -p SystemClockSynchronized
 Target host:
 
 ```bash
+bash scripts/vps-quic-preflight.sh check-target
 systemctl is-active iperf3
 ss -ltnp | grep ':5201'
 ```

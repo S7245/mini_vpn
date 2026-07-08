@@ -1,5 +1,31 @@
 # Learnings
 
+## 2026-07-08 - VPS QUIC preflight is now a repo-local deployment gate
+
+- Stage docs:
+  `docs/tech/2026-07-08-vps-quic-preflight-helper.md`,
+  `docs/tech/2026-07-08-vps-install-and-optimization-guide.md`
+- Helper: `scripts/vps-quic-preflight.sh`
+- Outcome: added a no-secret Linux helper for production/acceptance VPS
+  readiness. It supports `check-exit`, `install-exit`, `diagnose-exit`,
+  `check-client`, `check-target`, `checklist`, and `--self-test`.
+- What worked: the exit check now makes the Knife14fp socket-buffer floors
+  explicit and repeatable:
+  `rmem_max/wmem_max >= 16777216` and
+  `rmem_default/wmem_default >= 1048576`. `install-exit` persists the sysctl
+  file and restarts sing-box so the TUIC UDP socket is recreated.
+- Safety rule: the helper does not read `.env`, dump sing-box JSON, print
+  certificates, or print TUIC UUIDs/passwords. Diagnostics stay limited to
+  service/socket/time facts and a bounded redacted log tail.
+- Validation: `bash -n scripts/vps-quic-preflight.sh`,
+  `bash scripts/vps-quic-preflight.sh --self-test`, helper checklist output,
+  and `git diff --check` passed locally. `shellcheck` was not installed in the
+  local environment.
+- Reusable rule: before any expensive Knife14 or production TUIC throughput
+  run, check the exit socket-buffer floor and service/listen state first; if a
+  mature sing-box client and mini_vpn both sit in the `20-30 Mbit/s` band,
+  inspect the VPS preflight before retuning mini_vpn.
+
 ## 2026-07-08 - Knife14fq cleans timeout tail but does not close final acceptance
 
 - Stage docs:
