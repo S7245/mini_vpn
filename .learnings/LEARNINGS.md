@@ -3938,3 +3938,25 @@ worth cleaning up separately.
   high-sensitivity throughput A/B. Keep the next run's log surface narrow enough
   to attribute stream read service, self-wake, relay cadence, startup pool
   recovery, or egress progress without experimental branch ambiguity.
+
+## 2026-07-08 - Knife14fy acceptance was blocked before the data plane
+
+- Result doc:
+  `docs/tech/2026-07-08-knife14fy-ordered-read-service-restore-results.md`
+- Code commit:
+  `653d62bf` (`fix(knife14fy): restore ordered TUIC read diagnostics`)
+- VPS bundle:
+  `/tmp/mini_vpn/knife14fy_ordered_readsvc_p1_30/mvpn_knife14fy_ordered_readsvc_p1_30_usclient_suite_20260708_115629.tar.gz`
+- Outcome: local gates, remote `.27` focused tests, remote release build, and
+  `git diff --check` passed in a clean detached worktree. The acceptance did
+  not reach reverse-first iperf because `client-tun` failed at TUIC startup with
+  `tuic auth finish: sending stopped by peer: error 0`.
+- Useful discriminator: direct `.27/.33/.77` baselines were healthy, `.33`
+  `sing-box` was active with the expected high-throughput socket buffers, and
+  no-secret config matching reported UUID/password/SNI/ALPN matches. The `.33`
+  log tail did not show a contemporaneous TUIC inbound record in the failure
+  window.
+- Reusable rule: do not read this failed suite as a stream read-service,
+  relay cadence, self-wake, or pressure-credit result. First run a bounded
+  startup-only discriminator on `653d62bf` with pool `1`, then pool `2`, and
+  only compare against a clean `f8765c1` startup probe if the failure repeats.

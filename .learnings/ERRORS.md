@@ -2886,3 +2886,30 @@
 - Correct behavior: for scoped stages, run targeted formatting/checks such as
   `rustfmt --edition 2024 --check src/tuic.rs src/client_tun.rs`, and avoid
   full `cargo fmt` unless the stage explicitly includes full-repo formatting.
+
+## 2026-07-08 - Do not treat a startup-auth failure as throughput evidence
+
+- Stage: Knife14fy ordered read-service restore acceptance.
+- Symptom: the focused reverse-first suite on `.27` commit `653d62bf` failed
+  before iperf because `client-tun` exited with
+  `tuic auth finish: sending stopped by peer: error 0`.
+- Cause: not proven. The immediate evidence showed healthy direct baselines,
+  active `.33` `sing-box`, expected `.33` socket buffers, valid no-secret config
+  matches, and no contemporaneous TUIC inbound record in the inspected `.33`
+  log tail.
+- Correct behavior: do not tune read-service, local pressure-credit, MTU,
+  iperf3, stale pool, or VPS settings from this result. First run a bounded
+  startup-only probe on the same commit, then isolate `MINI_VPN_TUIC_TCP_POOL=1`
+  vs `2`; compare with clean `f8765c1` startup only if the failure repeats.
+
+## 2026-07-08 - `.27` may not have GitHub SSH fetch credentials
+
+- Stage: Knife14fy remote clean worktree setup.
+- Symptom: `git fetch` from `.27` using the repository's SSH remote failed with
+  public-key authentication, while HTTPS fetch of the same branch succeeded.
+- Cause: the `.27` machine did not have a usable GitHub SSH identity for that
+  fetch path.
+- Correct behavior: for clean remote acceptance worktrees, use HTTPS fetch or
+  an explicit local-to-remote sync path when `.27` lacks GitHub SSH access. Do
+  not change the repository origin or keep retrying an interactive credential
+  path during acceptance setup.
