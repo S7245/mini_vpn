@@ -1718,6 +1718,7 @@ struct DownlinkCreditController {
     adaptive_ack_drain_bytes: usize,
     ack_cadence_boost_bytes: usize,
     egress_payload_credit_bytes: usize,
+    egress_progress_generation: u64,
     headroom_debt_bytes: usize,
     no_egress_progress_streak: u8,
 }
@@ -1729,6 +1730,7 @@ impl Default for DownlinkCreditController {
             adaptive_ack_drain_bytes: 0,
             ack_cadence_boost_bytes: 0,
             egress_payload_credit_bytes: 0,
+            egress_progress_generation: 0,
             headroom_debt_bytes: 0,
             no_egress_progress_streak: 0,
         }
@@ -1747,6 +1749,8 @@ struct SocketCtx {
     uplink_tx: Option<mpsc::Sender<RelayCommand>>,
     /// Sender used to feed local egress pressure back to the relay read half.
     relay_read_credit_tx: Option<watch::Sender<RelayReadCredit>>,
+    /// Latest egress-progress generation published to the relay read half.
+    relay_read_credit_progress_generation_sent: u64,
     /// Whether this flow has already propagated the local TCP finish into the relay write half.
     local_fin_sent: bool,
     /// Whether remote EOF has been propagated to the intercepted local TCP peer with a FIN.
@@ -1808,6 +1812,7 @@ impl SocketCtx {
             state: SocketState::Listening,
             uplink_tx: None,
             relay_read_credit_tx: None,
+            relay_read_credit_progress_generation_sent: 0,
             local_fin_sent: false,
             local_eof_sent: false,
             local_fin_pending_since_secs: None,
@@ -2026,6 +2031,7 @@ impl DownlinkCreditController {
             .saturating_add(limit.drop_credit_debt_paid_bytes)
             .saturating_add(limit.pressure_credit_debt_paid_bytes);
         if observed_progress > 0 {
+            self.egress_progress_generation = self.egress_progress_generation.saturating_add(1);
             self.no_egress_progress_streak = 0;
             self.headroom_debt_bytes = self.headroom_debt_bytes.saturating_sub(observed_progress);
             self.egress_payload_credit_bytes = self
@@ -3296,9 +3302,15 @@ fn publish_relay_read_credit_for_handle(
     let credit = ctx
         .downlink_credit_controller
         .read_credit_for_local_pressure(credit, pending_bytes, local_pressure_bytes, cfg, tun_mtu);
+    let progress_generation = ctx.downlink_credit_controller.egress_progress_generation;
+    let progress_wake = progress_generation != ctx.relay_read_credit_progress_generation_sent
+        && !credit.paused
+        && credit.max_batch_bytes > 0;
     let changed = *tx.borrow() != credit;
-    if changed {
-        let _ = tx.send(credit);
+    if changed || progress_wake {
+        if tx.send(credit).is_ok() && progress_wake {
+            ctx.relay_read_credit_progress_generation_sent = progress_generation;
+        }
     }
 }
 
@@ -3408,8 +3420,14 @@ fn publish_projected_relay_read_credit_for_payload(
             cfg,
             tun_mtu,
         );
-    if *tx.borrow() != credit {
-        let _ = tx.send(credit);
+    let progress_generation = ctx.downlink_credit_controller.egress_progress_generation;
+    let progress_wake = progress_generation != ctx.relay_read_credit_progress_generation_sent
+        && !credit.paused
+        && credit.max_batch_bytes > 0;
+    if *tx.borrow() != credit || progress_wake {
+        if tx.send(credit).is_ok() && progress_wake {
+            ctx.relay_read_credit_progress_generation_sent = progress_generation;
+        }
     }
 }
 
@@ -8168,6 +8186,23 @@ async fn run_relay_reader(
         diag.note_remote_read_service_tick(remote_read_len);
         let remote_msg = tokio::select! {
             _ = &mut stop_rx => return,
+            update = read_credit_rx.changed() => {
+                if update.is_err() {
+                    return;
+                }
+                read_credit = *read_credit_rx.borrow_and_update();
+                diag.note_read_credit(read_credit);
+                if read_credit.paused {
+                    tcp_diag_log!(
+                        "🔎 tcp-relay-read-credit handle={:?} epoch={} paused=true max_batch_bytes=0 updates={} pause_updates={}",
+                        handle,
+                        epoch,
+                        diag.read_credit_updates,
+                        diag.read_credit_pause_updates
+                    );
+                }
+                continue;
+            }
             remote_msg = remote_reader.read(&mut buf[..remote_read_len]) => remote_msg,
         };
         match remote_msg {
@@ -8691,6 +8726,7 @@ fn tun_mtu_for_config(tun_mtu: usize) -> i32 {
 mod tests {
     use super::*;
     use smoltcp::iface::SocketSet;
+    use std::sync::atomic::AtomicU64;
 
     /// 刀8/刀9：上游选择器——reality→Reality、failover→Failover（大小写/空白不敏感）；
     /// 其余（含 tuic/缺省/未知）→ Tuic（零回归，failover opt-in）。
@@ -8885,6 +8921,52 @@ mod tests {
         }
     }
     impl tokio::io::AsyncWrite for BurstReadableStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.shutdown_called.store(true, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct CreditWakeReadableStream {
+        shutdown_called: Arc<AtomicBool>,
+        poll_count: Arc<AtomicU64>,
+        read_sent: bool,
+    }
+    impl tokio::io::AsyncRead for CreditWakeReadableStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.poll_count.fetch_add(1, Ordering::SeqCst);
+            if !self.read_sent {
+                if self.poll_count.load(Ordering::SeqCst) == 1 {
+                    return Poll::Pending;
+                }
+                buf.put_slice(b"after-egress-wake");
+                self.read_sent = true;
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl tokio::io::AsyncWrite for CreditWakeReadableStream {
         fn poll_write(
             self: std::pin::Pin<&mut Self>,
             _cx: &mut Context<'_>,
@@ -10245,6 +10327,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn relay_read_credit_publish_wakes_on_egress_progress_even_when_credit_is_unchanged() {
+        let cfg = DownlinkBackpressureConfig::default();
+        let tun_mtu = 1200;
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(TcpSocket::new(
+            TcpSocketBuffer::new(vec![0; 4096]),
+            TcpSocketBuffer::new(vec![0; 4096]),
+        ));
+        let (credit_tx, mut credit_rx) = watch::channel(RelayReadCredit::default());
+        let mut ctx = SocketCtx::new(443);
+        ctx.state = SocketState::Relaying;
+        ctx.relay_read_credit_tx = Some(credit_tx);
+        ctx.downlink_credit_controller.note_flush_feedback(
+            DownlinkFlushLimit {
+                len: 0,
+                headroom_limited: false,
+                headroom_deferred_bytes: 0,
+                clean_headroom_bytes: 0,
+                drain_credit_granted_bytes: relay_remote_read_pressure_floor_bytes(tun_mtu),
+                drain_credit_planned_bytes: 0,
+                drop_credit_debt_bytes: 0,
+                drop_credit_debt_paid_bytes: 0,
+                drop_credit_blocked_bytes: 0,
+                pressure_credit_debt_bytes: 0,
+                pressure_credit_debt_paid_bytes: 0,
+                pressure_credit_blocked_bytes: 0,
+                hard_edge_guard_bytes: 0,
+                hard_edge_guard_deferred_bytes: 0,
+            },
+            cfg,
+            tun_mtu,
+        );
+        let mut ctxs = HashMap::from([(handle, ctx)]);
+
+        publish_relay_read_credit_for_handle(
+            handle,
+            &sockets,
+            &mut ctxs,
+            cfg,
+            tun_mtu,
+            DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
+            false,
+            false,
+        );
+
+        tokio::time::timeout(std::time::Duration::from_millis(20), credit_rx.changed())
+            .await
+            .expect("egress progress must wake the relay reader even if credit bytes stay open")
+            .expect("relay read-credit channel should remain open");
+        assert_eq!(*credit_rx.borrow_and_update(), RelayReadCredit::default());
+    }
+
     #[test]
     fn listener_socket_uses_local_virtual_link_tcp_policy() {
         let socket = build_listener_socket(&ListenerSpec { local_port: 12345 });
@@ -10757,6 +10892,55 @@ mod tests {
         assert!(
             shutdown_called.load(Ordering::SeqCst),
             "remote EOF after resumed read should stop the writer half"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_read_credit_update_repolls_pending_remote_read() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let poll_count = Arc::new(AtomicU64::new(0));
+        let stream: RelayStream = Box::new(CreditWakeReadableStream {
+            shutdown_called: shutdown_called.clone(),
+            poll_count: poll_count.clone(),
+            read_sent: false,
+        });
+        let (_tx, rx) = mpsc::channel::<RelayCommand>(8);
+        let (back_tx, mut back_rx) = mpsc::channel(8);
+        let (credit_tx, credit_rx) = relay_read_credit_channel();
+        let task = tokio::spawn(run_relay(handle, 83, stream, rx, back_tx, credit_rx));
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            poll_count.load(Ordering::SeqCst),
+            1,
+            "test stream should have one pending read before egress wake"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), back_rx.recv())
+                .await
+                .is_err(),
+            "a pending remote read should not progress before the read-service wake"
+        );
+
+        credit_tx.send(RelayReadCredit::default()).unwrap();
+        match tokio::time::timeout(std::time::Duration::from_millis(200), back_rx.recv())
+            .await
+            .expect("read-credit wake should repoll the pending remote read")
+            .expect("relay should still be alive")
+        {
+            (h, RelayEvent::Data { epoch, bytes }) => {
+                assert_eq!(h, handle);
+                assert_eq!(epoch, 83);
+                assert_eq!(bytes, b"after-egress-wake");
+            }
+            other => panic!("expected remote data after read-credit wake, got {other:?}"),
+        }
+        task.await.unwrap();
+        assert!(
+            shutdown_called.load(Ordering::SeqCst),
+            "EOF after the test payload should stop the writer half"
         );
     }
 
@@ -11977,6 +12161,7 @@ mod tests {
             state: SocketState::Relaying,
             uplink_tx: Some(tx),
             relay_read_credit_tx: None,
+            relay_read_credit_progress_generation_sent: 0,
             local_fin_sent: true,
             local_eof_sent: true,
             local_fin_pending_since_secs: Some(3),
@@ -12004,6 +12189,7 @@ mod tests {
                 adaptive_ack_drain_bytes: 4 * 1024,
                 ack_cadence_boost_bytes: 4 * 1024,
                 egress_payload_credit_bytes: 0,
+                egress_progress_generation: 0,
                 headroom_debt_bytes: 4096,
                 no_egress_progress_streak: 3,
             },
