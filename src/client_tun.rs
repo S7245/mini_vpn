@@ -2056,11 +2056,15 @@ impl DownlinkCreditController {
                 .min(adaptive_ack_drain_max);
         }
 
+        let hard_edge_guard_feedback_bytes = if observed_progress == 0 {
+            limit.hard_edge_guard_deferred_bytes
+        } else {
+            0
+        };
         let deferred = limit
             .headroom_deferred_bytes
-            .saturating_add(limit.hard_edge_guard_deferred_bytes)
-            .saturating_add(limit.drop_credit_blocked_bytes)
-            .saturating_add(limit.pressure_credit_blocked_bytes);
+            .saturating_add(hard_edge_guard_feedback_bytes)
+            .saturating_add(limit.drop_credit_blocked_bytes);
         if deferred == 0 {
             return;
         }
@@ -2079,10 +2083,8 @@ impl DownlinkCreditController {
             .read_credit_ceiling_bytes
             .saturating_div(2)
             .max(ack_drain_floor);
-        let hard_or_blocked = limit
-            .hard_edge_guard_deferred_bytes
-            .saturating_add(limit.drop_credit_blocked_bytes)
-            .saturating_add(limit.pressure_credit_blocked_bytes);
+        let hard_or_blocked =
+            hard_edge_guard_feedback_bytes.saturating_add(limit.drop_credit_blocked_bytes);
         if observed_progress == 0 || hard_or_blocked > 0 {
             self.ack_cadence_boost_bytes = 0;
             self.egress_payload_credit_bytes = if self.no_egress_progress_streak >= 2 {
@@ -16019,6 +16021,117 @@ mod tests {
             drop_limit.drop_credit_blocked_bytes,
             downlink_egress_credit_span(cfg)
         );
+    }
+
+    #[test]
+    fn pressure_debt_payment_with_progress_does_not_train_blocking_feedback() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let tun_mtu = 1200;
+        let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        let initial_ceiling = pressure_floor * 4;
+        let initial_boost = pressure_floor;
+        let mut controller = DownlinkCreditController {
+            read_credit_ceiling_bytes: initial_ceiling,
+            adaptive_ack_drain_bytes: initial_boost,
+            ack_cadence_boost_bytes: initial_boost,
+            egress_payload_credit_bytes: 0,
+            egress_progress_generation: 0,
+            headroom_debt_bytes: 0,
+            no_egress_progress_streak: 0,
+        };
+
+        controller.note_flush_feedback(
+            DownlinkFlushLimit {
+                len: 30,
+                headroom_limited: false,
+                headroom_deferred_bytes: 0,
+                clean_headroom_bytes: 30,
+                drain_credit_granted_bytes: 0,
+                drain_credit_planned_bytes: 0,
+                drop_credit_debt_bytes: 0,
+                drop_credit_debt_paid_bytes: 0,
+                drop_credit_blocked_bytes: 0,
+                pressure_credit_debt_bytes: 0,
+                pressure_credit_debt_paid_bytes: 17,
+                pressure_credit_blocked_bytes: 17,
+                hard_edge_guard_bytes: 0,
+                hard_edge_guard_deferred_bytes: 0,
+            },
+            cfg,
+            tun_mtu,
+        );
+
+        assert_eq!(controller.egress_progress_generation, 1);
+        assert_eq!(
+            controller.headroom_debt_bytes, 0,
+            "soft pressure debt that was paid by observed egress progress is not deferred backlog"
+        );
+        assert!(
+            controller.read_credit_ceiling_bytes >= initial_ceiling,
+            "progress must not immediately train the read-credit ceiling downward"
+        );
+        assert_eq!(
+            controller.ack_cadence_boost_bytes, initial_boost,
+            "a paid soft-pressure sample must not clear the cadence boost as if it were a hard block"
+        );
+        assert_eq!(controller.no_egress_progress_streak, 0);
+    }
+
+    #[test]
+    fn hard_edge_guard_with_progress_does_not_train_stalled_read_credit() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let tun_mtu = 1200;
+        let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        let initial_ceiling = pressure_floor * 4;
+        let initial_boost = pressure_floor;
+        let mut controller = DownlinkCreditController {
+            read_credit_ceiling_bytes: initial_ceiling,
+            adaptive_ack_drain_bytes: initial_boost,
+            ack_cadence_boost_bytes: initial_boost,
+            egress_payload_credit_bytes: 0,
+            egress_progress_generation: 0,
+            headroom_debt_bytes: 0,
+            no_egress_progress_streak: 0,
+        };
+
+        controller.note_flush_feedback(
+            DownlinkFlushLimit {
+                len: pressure_floor,
+                headroom_limited: true,
+                headroom_deferred_bytes: 0,
+                clean_headroom_bytes: 0,
+                drain_credit_granted_bytes: pressure_floor,
+                drain_credit_planned_bytes: pressure_floor,
+                drop_credit_debt_bytes: 0,
+                drop_credit_debt_paid_bytes: 0,
+                drop_credit_blocked_bytes: 0,
+                pressure_credit_debt_bytes: 0,
+                pressure_credit_debt_paid_bytes: 0,
+                pressure_credit_blocked_bytes: 0,
+                hard_edge_guard_bytes: 3,
+                hard_edge_guard_deferred_bytes: pressure_floor,
+            },
+            cfg,
+            tun_mtu,
+        );
+
+        assert_eq!(controller.egress_progress_generation, 1);
+        assert_eq!(
+            controller.headroom_debt_bytes, 0,
+            "a bounded guard deferral with observed drain is not a stalled-egress backlog"
+        );
+        assert!(
+            controller.read_credit_ceiling_bytes >= initial_ceiling,
+            "the guard should keep local safety without training the TUIC read side downward while egress drains"
+        );
+        assert_eq!(controller.ack_cadence_boost_bytes, initial_boost);
+        assert_eq!(controller.no_egress_progress_streak, 0);
     }
 
     #[test]
