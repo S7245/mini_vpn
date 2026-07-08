@@ -2918,3 +2918,18 @@ active root unless it repeats.
   an explicit local-to-remote sync path when `.27` lacks GitHub SSH access. Do
   not change the repository origin or keep retrying an interactive credential
   path during acceptance setup.
+
+## 2026-07-08 - Soft target-edge alone does not close Knife14 throughput
+
+- Stage: Knife14fz soft pressure-credit acceptance.
+- Symptom: commit `52f2bae0` restored clean reverse-first data movement, but
+  the focused safe1200 P1 still reached only `24.6/22.9 Mbit/s` against a
+  healthy direct reverse baseline around `278 Mbit/s`.
+- Cause: target-edge debt was no longer the only limiter. The run showed
+  clean TUN drop, close-tail, and QUIC loss/blocking surfaces, while local
+  downlink still had one pause/resume edge and the data TUIC stream repeatedly
+  reported `connection_stream_frames_pending` with read gaps up to `3522ms`.
+- Correct behavior: do not keep iterating only pressure-credit constants after
+  this result. The next repair must add tests and code for egress-progress
+  feedback into TUIC stream read service/self-wake, while preserving bounded
+  pending and hard drop/pause safety.

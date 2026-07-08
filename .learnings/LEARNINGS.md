@@ -4010,3 +4010,33 @@ worth cleaning up separately.
   remove mini_vpn's own premature local gates. For Knife14 reverse-first,
   target-edge should be treated as a soft warning until sustained pressure,
   actual drops, flush failures, or the hard pause edge justify stronger debt.
+
+## 2026-07-08 - Knife14fz soft target-edge restores data movement but not throughput
+
+- Result doc:
+  `docs/tech/2026-07-08-knife14fz-soft-pressure-credit-results.md`
+- Code commit:
+  `52f2bae0` (`fix(knife14fz): soften target-edge pressure credit`)
+- VPS bundle:
+  `/tmp/mini_vpn/knife14fz_soft_pressure_p1_30/mvpn_knife14fz_soft_pressure_p1_30_usclient_suite_20260708_141720.tar.gz`
+- Outcome: local TDD gates, full local `cargo test --lib`, local release
+  build, remote `.27` focused gates, and remote release build passed. The
+  focused safe1200 reverse-first P1 entered the data plane and reached
+  `24.6/22.9 Mbit/s`, so the current branch is no longer a Knife14fu no-data
+  shape.
+- Useful discriminator: `remote_to_global_rx_bytes=85881616`,
+  `send_slice_accepted=85881616`, `may_recv_false=0`,
+  `send_slice_zero=0`, `send_slice_errors=0`, `pending_at_close=0`,
+  `terminal_pending_reap=0`, TUN rx/tx drops `0`, and QUIC
+  loss/congestion/blocking deltas `0`.
+- Remaining root: the low average is burst/idle local cadence, not VPS or QUIC
+  loss. The run reported `downlink_backpressure pause_edges=1`,
+  `headroom_deferred_bytes=363494`,
+  `pressure_credit_blocked_bytes=161309`, and repeated
+  `connection_stream_frames_pending` with data-stream read gaps up to
+  `3522ms`.
+- Reusable rule: softening target-edge pressure is necessary but not sufficient.
+  The next code slice should connect local egress progress/pressure recovery to
+  TUIC stream read-service wakeups, and should prove with tests that pending
+  stream frames plus available local send capacity cause an immediate bounded
+  read-service tick.
