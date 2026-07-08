@@ -2443,7 +2443,7 @@ fn downlink_egress_projected_pressure_debt_bytes(
     cfg: DownlinkBackpressureConfig,
 ) -> usize {
     let target_edge = tx_queue_egress_target_threshold(cfg);
-    if projected_pressure_bytes < target_edge {
+    if projected_pressure_bytes < tx_queue_credit_spend_threshold(cfg) {
         return 0;
     }
     let span = downlink_egress_credit_span(cfg);
@@ -2518,9 +2518,14 @@ fn bounded_downlink_flush_limit_for_window_with_clock_and_drop(
     let clean_headroom = tx_queue_flush_threshold(cfg).saturating_sub(send_window.send_queue);
     let hard_headroom = tx_queue_pause_threshold(cfg).saturating_sub(send_window.send_queue);
     let target_edge = tx_queue_egress_target_threshold(cfg);
-    let hard_edge_guard = tx_queue_pause_threshold(cfg).saturating_sub(target_edge);
-    let guarded_hard_headroom = target_edge.saturating_sub(send_window.send_queue);
     let credit_observation = clock.note_observed_send_queue(send_window.send_queue, cfg, drop_debt);
+    let hard_limit_edge = if drop_debt.debt_bytes == 0 {
+        tx_queue_credit_spend_threshold(cfg)
+    } else {
+        target_edge
+    };
+    let hard_edge_guard = tx_queue_pause_threshold(cfg).saturating_sub(hard_limit_edge);
+    let guarded_hard_headroom = hard_limit_edge.saturating_sub(send_window.send_queue);
     let usable_credit = if drop_debt.debt_bytes == 0 {
         clock.drain_credit_bytes
     } else {
@@ -3152,7 +3157,7 @@ fn reaches_downlink_credit_debt_pressure_threshold(
     stats: DownlinkPressureStats,
     cfg: DownlinkBackpressureConfig,
 ) -> bool {
-    stats.max_tx_queue >= tx_queue_egress_target_threshold(cfg)
+    stats.max_tx_queue >= tx_queue_credit_spend_threshold(cfg)
         || (stats.max_pending >= cfg.high_bytes
             && stats.max_tx_queue >= tx_queue_flush_threshold(cfg))
 }
@@ -14671,8 +14676,8 @@ mod tests {
         );
         assert_eq!(
             tun_rx_drain_budget_for_dirty_pressure(true, false, target_edge, 0, cfg, 1_200),
-            1,
-            "maintenance drain should enable bounded adaptive ACK drain at the egress target"
+            0,
+            "maintenance drain should treat the egress target as soft pressure"
         );
         assert_eq!(
             tun_rx_drain_budget_for_dirty_pressure(true, false, credit_edge, 0, cfg, 1_200),
@@ -15062,21 +15067,21 @@ mod tests {
         );
         assert_eq!(
             after_drain.send_queue + second.len,
-            tx_queue_egress_target_threshold(cfg),
-            "observed drain should grant one-shot credit up to the egress target"
+            tx_queue_credit_spend_threshold(cfg),
+            "observed drain should grant one-shot credit up to the credit edge"
         );
         assert_eq!(second.drain_credit_granted_bytes, 30);
         assert_eq!(
             second.drain_credit_planned_bytes,
-            tx_queue_egress_target_threshold(cfg) - tx_queue_flush_threshold(cfg)
+            tx_queue_credit_spend_threshold(cfg) - tx_queue_flush_threshold(cfg)
         );
         assert_eq!(
             second.hard_edge_guard_bytes,
-            tx_queue_pause_threshold(cfg) - tx_queue_egress_target_threshold(cfg)
+            tx_queue_pause_threshold(cfg) - tx_queue_credit_spend_threshold(cfg)
         );
         assert_eq!(
             second.hard_edge_guard_deferred_bytes,
-            tx_queue_pause_threshold(cfg) - tx_queue_egress_target_threshold(cfg)
+            tx_queue_pause_threshold(cfg) - tx_queue_credit_spend_threshold(cfg)
         );
         clock.note_flush_result(after_drain.send_queue, second.len, second);
 
@@ -15094,6 +15099,45 @@ mod tests {
         assert_eq!(
             third.len, 0,
             "drain credit must not let a pass plan beyond the hard pause threshold"
+        );
+    }
+
+    #[test]
+    fn downlink_flush_len_spends_clean_drain_credit_to_credit_edge() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let mut clock = DownlinkEgressClock {
+            last_send_queue: Some(tx_queue_flush_threshold(cfg)),
+            drain_credit_bytes: downlink_egress_credit_span(cfg),
+            drop_debt_generation_seen: 0,
+        };
+        let send_window = TcpSendWindowSnapshot {
+            can_send: true,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 100,
+            send_queue: tx_queue_flush_threshold(cfg),
+            recv_queue: 0,
+        };
+
+        let limit = bounded_downlink_flush_limit_for_window_with_clock(
+            100,
+            100,
+            send_window,
+            cfg,
+            &mut clock,
+        );
+
+        assert_eq!(
+            send_window.send_queue + limit.len,
+            tx_queue_credit_spend_threshold(cfg),
+            "without active debt or drops, clean drain credit should spend up to the credit edge"
+        );
+        assert_eq!(
+            limit.drain_credit_planned_bytes,
+            tx_queue_credit_spend_threshold(cfg) - tx_queue_flush_threshold(cfg)
         );
     }
 
@@ -15136,13 +15180,13 @@ mod tests {
 
         assert_eq!(
             after_drain.send_queue + second.len,
-            tx_queue_egress_target_threshold(cfg),
-            "credit should leave a derived target guard below hard pause"
+            tx_queue_credit_spend_threshold(cfg),
+            "credit should leave a guard below hard pause"
         );
         assert_eq!(
             after_drain.send_queue + second.len,
-            tx_queue_egress_target_threshold(cfg),
-            "planned send queue should stay at the egress target, not at the credit edge"
+            tx_queue_credit_spend_threshold(cfg),
+            "planned send queue may reach the credit edge without active debt"
         );
     }
 
@@ -15220,11 +15264,11 @@ mod tests {
         );
         assert_eq!(
             after_drain.send_queue + second.len,
-            tx_queue_egress_target_threshold(cfg)
+            tx_queue_credit_spend_threshold(cfg)
         );
         assert_eq!(
             second.drain_credit_planned_bytes,
-            tx_queue_egress_target_threshold(cfg) - tx_queue_flush_threshold(cfg)
+            tx_queue_credit_spend_threshold(cfg) - tx_queue_flush_threshold(cfg)
         );
         assert_eq!(
             clock.note_flush_result(after_drain.send_queue, 40, second),
@@ -15245,13 +15289,13 @@ mod tests {
         );
         assert_eq!(
             after_partial_accept.send_queue + third.len,
-            tx_queue_egress_target_threshold(cfg),
-            "unused drain credit should remain available but still stop at the egress target"
+            tx_queue_credit_spend_threshold(cfg),
+            "unused drain credit should remain available up to the credit edge"
         );
         assert_eq!(third.drain_credit_planned_bytes, third.len);
         assert_eq!(
             third.hard_edge_guard_deferred_bytes,
-            tx_queue_pause_threshold(cfg) - tx_queue_egress_target_threshold(cfg)
+            tx_queue_pause_threshold(cfg) - tx_queue_credit_spend_threshold(cfg)
         );
     }
 
@@ -15355,16 +15399,16 @@ mod tests {
         assert_eq!(clean_drain.drop_credit_debt_paid_bytes, 0);
         assert_eq!(
             clean_drain.drain_credit_planned_bytes,
-            tx_queue_egress_target_threshold(cfg) - tx_queue_flush_threshold(cfg)
+            tx_queue_credit_spend_threshold(cfg) - tx_queue_flush_threshold(cfg)
         );
         assert_eq!(
             clean_drain_window.send_queue + clean_drain.len,
-            tx_queue_egress_target_threshold(cfg)
+            tx_queue_credit_spend_threshold(cfg)
         );
     }
 
     #[test]
-    fn downlink_pressure_credit_debt_installs_on_egress_target() {
+    fn downlink_pressure_credit_debt_treats_single_target_edge_as_soft_pressure() {
         let cfg = DownlinkBackpressureConfig {
             high_bytes: 100,
             low_bytes: 40,
@@ -15398,12 +15442,10 @@ mod tests {
         assert!(!should_install_downlink_pressure_credit_debt(
             false, true, clean_edge, cfg
         ));
-        assert!(should_install_downlink_pressure_credit_debt(
-            false,
-            true,
-            target_edge,
-            cfg
-        ));
+        assert!(
+            !should_install_downlink_pressure_credit_debt(false, true, target_edge, cfg),
+            "a single target-edge sample should not install pressure debt without stronger pressure evidence"
+        );
         assert!(should_install_downlink_pressure_credit_debt(
             false,
             true,
@@ -15429,7 +15471,7 @@ mod tests {
     }
 
     #[test]
-    fn downlink_pressure_credit_debt_installs_before_credit_edge_at_target() {
+    fn downlink_pressure_credit_debt_waits_for_credit_edge_after_target() {
         let cfg = DownlinkBackpressureConfig {
             high_bytes: 100,
             low_bytes: 40,
@@ -15442,32 +15484,33 @@ mod tests {
         );
 
         assert!(
-            should_install_downlink_pressure_credit_debt(false, false, target_edge, cfg),
-            "target-edge pressure should install bounded debt before the old credit edge"
+            !should_install_downlink_pressure_credit_debt(false, false, target_edge, cfg),
+            "target-edge pressure is a soft warning; stronger pressure should install debt"
         );
     }
 
     #[test]
-    fn downlink_pressure_credit_debt_repeated_edge_is_idempotent() {
+    fn downlink_pressure_credit_debt_repeated_credit_edge_is_idempotent() {
         let cfg = DownlinkBackpressureConfig {
             high_bytes: 100,
             low_bytes: 40,
         };
-        let target_edge = DownlinkPressureStats::new(
+        let credit_edge = DownlinkPressureStats::new(
             0,
             0,
-            tx_queue_egress_target_threshold(cfg),
-            tx_queue_egress_target_threshold(cfg),
+            tx_queue_credit_spend_threshold(cfg),
+            tx_queue_credit_spend_threshold(cfg),
         );
         let mut credit_debt = DownlinkEgressCreditDebt::default();
+        let expected_debt = downlink_egress_pressure_debt_bytes(credit_edge, cfg);
 
         assert_eq!(
-            credit_debt.note_egress_pressure(target_edge, cfg),
-            tx_queue_credit_guard_bytes(cfg)
+            credit_debt.note_egress_pressure(credit_edge, cfg),
+            expected_debt
         );
         assert_eq!(credit_debt.generation, 1);
         assert_eq!(credit_debt.pressure_events, 1);
-        assert_eq!(credit_debt.note_egress_pressure(target_edge, cfg), 0);
+        assert_eq!(credit_debt.note_egress_pressure(credit_edge, cfg), 0);
         assert_eq!(
             credit_debt.generation, 1,
             "same-sized pressure debt should not create a new generation"
@@ -15512,8 +15555,8 @@ mod tests {
                 ),
                 cfg,
             ),
-            3,
-            "the egress target is an early warning, so it installs a guard-sized nudge"
+            0,
+            "the egress target is a soft warning and does not install pressure debt"
         );
         assert_eq!(
             downlink_egress_pressure_debt_bytes(
@@ -15589,8 +15632,19 @@ mod tests {
                 tx_queue_egress_target_threshold(cfg),
                 cfg,
             ),
-            tx_queue_credit_guard_bytes(cfg),
-            "the projected target edge installs the same guard-sized pressure debt"
+            0,
+            "the projected target edge is a soft warning and does not install pressure debt"
+        );
+        assert_eq!(
+            downlink_egress_projected_pressure_debt_bytes(
+                tx_queue_credit_spend_threshold(cfg),
+                cfg,
+            ),
+            tx_queue_credit_guard_bytes(cfg).saturating_add(
+                tx_queue_credit_spend_threshold(cfg)
+                    .saturating_sub(tx_queue_egress_target_threshold(cfg))
+            ),
+            "the projected credit edge installs bounded pressure debt"
         );
         assert_eq!(
             downlink_egress_projected_pressure_debt_bytes(
@@ -15603,7 +15657,7 @@ mod tests {
     }
 
     #[test]
-    fn projected_payload_pressure_blocks_stale_drain_credit_before_flush() {
+    fn projected_payload_target_edge_does_not_block_stale_drain_credit_before_flush() {
         let cfg = DownlinkBackpressureConfig {
             high_bytes: 100,
             low_bytes: 40,
@@ -15629,7 +15683,7 @@ mod tests {
 
         assert_eq!(
             credit_debt.note_projected_egress_pressure(projected_pressure, cfg),
-            3
+            0
         );
         let limit = bounded_downlink_flush_limit_for_window_with_clock_and_drop(
             pending_after_payload,
@@ -15642,15 +15696,15 @@ mod tests {
 
         assert_eq!(
             limit.len,
-            tx_queue_flush_threshold(cfg).saturating_sub(send_window.send_queue),
-            "current payload may use clean headroom, but projected pressure must block old drain credit"
+            tx_queue_egress_target_threshold(cfg).saturating_sub(send_window.send_queue),
+            "target-edge projected pressure may still use drain credit up to the current hard target"
         );
-        assert_eq!(limit.drain_credit_granted_bytes, 0);
-        assert_eq!(limit.drain_credit_planned_bytes, 0);
-        assert!(
-            limit.pressure_credit_debt_bytes > 0,
-            "the projected debt should remain visible until observed egress drain pays it"
+        assert_eq!(limit.drain_credit_granted_bytes, 1);
+        assert_eq!(
+            limit.drain_credit_planned_bytes,
+            tx_queue_egress_target_threshold(cfg).saturating_sub(tx_queue_flush_threshold(cfg))
         );
+        assert_eq!(limit.pressure_credit_debt_bytes, 0);
     }
 
     #[test]
@@ -15769,11 +15823,11 @@ mod tests {
         assert_eq!(clean_credit.drain_credit_granted_bytes, 30);
         assert_eq!(
             clean_credit.drain_credit_planned_bytes,
-            tx_queue_egress_target_threshold(cfg) - tx_queue_flush_threshold(cfg)
+            tx_queue_credit_spend_threshold(cfg) - tx_queue_flush_threshold(cfg)
         );
         assert_eq!(
             later_clean_drain.send_queue + clean_credit.len,
-            tx_queue_egress_target_threshold(cfg)
+            tx_queue_credit_spend_threshold(cfg)
         );
     }
 
