@@ -1387,7 +1387,12 @@ fn should_arm_tuic_stream_pending_self_wake(
     armed_deadline: Option<Instant>,
     now: Instant,
 ) -> bool {
-    if cause != TuicTcpStreamPendingCause::ConnectionStreamFramesPending {
+    let active_connection_rx = matches!(
+        cause,
+        TuicTcpStreamPendingCause::ConnectionRxNoStreamFrames
+            | TuicTcpStreamPendingCause::ConnectionStreamFramesPending
+    );
+    if !active_connection_rx {
         return false;
     }
     match armed_deadline {
@@ -3182,7 +3187,7 @@ mod tests {
     }
 
     #[test]
-    fn tuic_stream_pending_self_wake_only_arms_for_stream_frames_after_deadline() {
+    fn tuic_stream_pending_self_wake_arms_for_active_connection_rx_after_deadline() {
         let now = Instant::now();
         let future = now + Duration::from_millis(10);
         let past = now - Duration::from_millis(1);
@@ -3202,9 +3207,19 @@ mod tests {
             Some(past),
             now
         ));
-        assert!(!should_arm_tuic_stream_pending_self_wake(
+        assert!(should_arm_tuic_stream_pending_self_wake(
             TuicTcpStreamPendingCause::ConnectionRxNoStreamFrames,
             None,
+            now
+        ));
+        assert!(!should_arm_tuic_stream_pending_self_wake(
+            TuicTcpStreamPendingCause::ConnectionRxNoStreamFrames,
+            Some(future),
+            now
+        ));
+        assert!(should_arm_tuic_stream_pending_self_wake(
+            TuicTcpStreamPendingCause::ConnectionRxNoStreamFrames,
+            Some(past),
             now
         ));
         assert!(!should_arm_tuic_stream_pending_self_wake(
@@ -3212,6 +3227,20 @@ mod tests {
             Some(past),
             now
         ));
+    }
+
+    #[test]
+    fn tuic_stream_pending_self_wake_services_active_connection_rx() {
+        let now = Instant::now();
+
+        assert!(
+            should_arm_tuic_stream_pending_self_wake(
+                TuicTcpStreamPendingCause::ConnectionRxNoStreamFrames,
+                None,
+                now,
+            ),
+            "active QUIC receive without yet-deliverable stream frames should still wake pending reads"
+        );
     }
 
     #[test]
