@@ -1085,9 +1085,7 @@ fn relay_ack_drain_hint_due(
     now: std::time::Instant,
     last_hint_at: Option<std::time::Instant>,
 ) -> Option<RelayAckDrainHintDue> {
-    if diag.remote_reads == 0
-        || diag.remote_to_global_rx_bytes < RELAY_ACK_DRAIN_HINT_MIN_DATA_BYTES
-    {
+    if diag.remote_reads == 0 || !relay_ack_drain_hint_has_serviceable_payload(diag) {
         return None;
     }
     let gap_ms = diag.current_remote_read_gap_millis_at(now);
@@ -1107,8 +1105,15 @@ fn relay_ack_drain_hint_due(
     })
 }
 
+fn relay_ack_drain_hint_has_serviceable_payload(diag: &RelayTaskDiag) -> bool {
+    diag.remote_to_global_rx_bytes >= RELAY_ACK_DRAIN_HINT_MIN_DATA_BYTES
+        || (diag.remote_to_global_rx_bytes > 0
+            && diag.remote_read_service_ticks > 0
+            && diag.remote_batch_bytes_max >= RELAY_REMOTE_READ_PROBE_MIN_BATCH_BYTES)
+}
+
 fn should_poll_relay_ack_drain_hint(diag: &RelayTaskDiag, _writer_done: bool) -> bool {
-    diag.remote_reads > 0 && diag.remote_to_global_rx_bytes >= RELAY_ACK_DRAIN_HINT_MIN_DATA_BYTES
+    diag.remote_reads > 0 && relay_ack_drain_hint_has_serviceable_payload(diag)
 }
 
 fn should_poll_relay_remote_read_probe(diag: &RelayTaskDiag, read_credit: RelayReadCredit) -> bool {
@@ -16602,6 +16607,52 @@ mod tests {
         assert!(
             line.contains("max_remote_read_gap_after_local_finish_ms=1800"),
             "{line}"
+        );
+    }
+
+    #[test]
+    fn relay_ack_drain_hint_services_low_byte_ordered_stream_gap() {
+        let start = std::time::Instant::now();
+        let mut diag = RelayTaskDiag::new(start);
+        let low_byte_progress = 60_704usize;
+
+        assert!(
+            (low_byte_progress as u64) < RELAY_ACK_DRAIN_HINT_MIN_DATA_BYTES,
+            "fixture must stay below the historical 64KiB ACK/window service gate"
+        );
+
+        diag.note_remote_read_at(low_byte_progress, start);
+        diag.note_remote_batch(5, low_byte_progress);
+        diag.note_remote_read_service_tick(RELAY_REMOTE_READ_BURST_MAX_BYTES);
+
+        let due = relay_ack_drain_hint_due(
+            &diag,
+            start + std::time::Duration::from_millis(RELAY_ACK_DRAIN_HINT_GAP_MS as u64 + 50),
+            None,
+        )
+        .expect(
+            "active ordered-stream gaps below 64KiB should still request ACK/window service",
+        );
+
+        assert_eq!(due.gap_ms, RELAY_ACK_DRAIN_HINT_GAP_MS + 50);
+        assert_eq!(due.remote_to_global_rx_bytes, low_byte_progress as u64);
+    }
+
+    #[test]
+    fn relay_ack_drain_hint_polling_includes_low_byte_active_read_service() {
+        let start = std::time::Instant::now();
+        let mut diag = RelayTaskDiag::new(start);
+        diag.note_remote_read_at(60_704, start);
+        diag.note_remote_batch(5, 60_704);
+        diag.note_remote_read_service_tick(RELAY_REMOTE_READ_BURST_MAX_BYTES);
+
+        assert!(
+            should_poll_relay_remote_read_probe(&diag, RelayReadCredit::default()),
+            "payload-shaped active relays should keep the remote read probe armed"
+        );
+        assert!(
+            should_poll_relay_ack_drain_hint(&diag, false),
+            "low-byte active ordered stream gaps must reach the ACK/window hint branch"
         );
     }
 

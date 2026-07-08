@@ -4063,3 +4063,19 @@ worth cleaning up separately.
   `ack_drain_hint_due` stays `0` even while ordered QUIC stream frames are
   pending. The next TDD slice should cover low-byte ordered-stream gap service
   before another VPS run.
+
+## 2026-07-08 - Knife14gm services low-byte ordered stream gaps locally
+
+- Stage: T1-T5 local TDD for the Knife14gl follow-up.
+- Outcome: T1 reproduced the `60704B` ordered-stream gap below
+  `RELAY_ACK_DRAIN_HINT_MIN_DATA_BYTES=64KiB`. T2/T3 made both the direct
+  ACK-drain due predicate and the relay supervisor polling gate recognize
+  payload-shaped streams with active read-service ticks below 64KiB.
+- Tests:
+  `cargo test relay_ack_drain_hint -- --nocapture` and `cargo test --lib`
+  pass locally.
+- Guardrails preserved: tiny `512B` control streams still do not emit ACK hints,
+  and paused/zero-credit receive credit still suppresses the outer remote-read
+  probe gate.
+- Open gate note: `cargo clippy --lib -- -D warnings` currently fails on two
+  pre-existing `collapsible_if` warnings outside this diff.
