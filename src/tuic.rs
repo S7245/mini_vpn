@@ -10,9 +10,7 @@ use crate::shared::{ClientError, TargetAddr};
 use crate::udp_relay::{FlowEntry, FourTuple, MAX_UDP_FLOWS};
 use crate::upstream::{DatagramUpstream, ProxyUpstream, RelayStream};
 use quinn::{Connection, Endpoint, VarInt};
-use std::collections::{BTreeMap, HashMap};
-use std::future::Future;
-use std::io;
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -45,15 +43,7 @@ const DEFAULT_TUIC_QUIC_STATS_SECS: u64 = 30;
 const TUIC_TCP_STREAM_READ_GAP_LOG_MS: u128 = 1_000;
 const TUIC_TCP_STREAM_PENDING_LOG_MS: u128 = TUIC_TCP_STREAM_READ_GAP_LOG_MS;
 const TUIC_TCP_STREAM_PENDING_SELF_WAKE_MS: u64 = 2;
-const TUIC_TCP_UNORDERED_CHUNK_READ_MAX_BYTES: usize = 64 * 1024;
-const TUIC_TCP_UNORDERED_REASSEMBLY_MAX_BYTES: usize = 4 * 1024 * 1024;
-const TUIC_TCP_UNORDERED_STAGING_LOG_MS: u128 = 1_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TuicTcpRelayMode {
-    Ordered,
-    UnorderedReassembly,
-}
+const TUIC_TCP_RELAY_MODE_ORDERED: &str = "ordered_join";
 
 /// TUIC 客户端配置（单一事实源；桌面从 env 加载，移动端将来从 file/FFI 注入）。
 /// 中文要点：凭据(uuid/password)经自定义 Debug **脱敏**，绝不随日志泄漏。
@@ -237,25 +227,6 @@ fn tcp_diag_enabled() -> bool {
     *TCP_DIAG.get_or_init(|| parse_truthy(std::env::var("MINI_VPN_TCP_DIAG").ok().as_deref()))
 }
 
-fn parse_tuic_tcp_relay_mode(unordered_reassembly: Option<&str>) -> TuicTcpRelayMode {
-    if parse_truthy(unordered_reassembly) {
-        TuicTcpRelayMode::UnorderedReassembly
-    } else {
-        TuicTcpRelayMode::Ordered
-    }
-}
-
-fn tuic_tcp_relay_mode() -> TuicTcpRelayMode {
-    static MODE: std::sync::OnceLock<TuicTcpRelayMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        parse_tuic_tcp_relay_mode(
-            std::env::var("MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY")
-                .ok()
-                .as_deref(),
-        )
-    })
-}
-
 /// TCP pool 轮询选择。`pool_len` 在生产中恒非 0；纯函数保底处理 0，避免测试/未来误用 panic。
 fn tcp_pool_index(pool_len: usize, cursor: u64) -> usize {
     if pool_len == 0 {
@@ -327,264 +298,6 @@ impl Drop for TcpPoolSlotLease {
     }
 }
 
-#[derive(Debug, Default)]
-struct OrderedQuicChunkAssembler {
-    next_offset: u64,
-    chunks: BTreeMap<u64, bytes::Bytes>,
-    buffered_bytes: usize,
-    max_buffered_bytes: usize,
-}
-
-impl OrderedQuicChunkAssembler {
-    fn next_offset(&self) -> u64 {
-        self.next_offset
-    }
-
-    fn buffered_bytes(&self) -> usize {
-        self.buffered_bytes
-    }
-
-    fn buffered_chunks(&self) -> usize {
-        self.chunks.len()
-    }
-
-    fn max_buffered_bytes(&self) -> usize {
-        self.max_buffered_bytes
-    }
-
-    fn push_chunk(&mut self, mut offset: u64, mut bytes: bytes::Bytes) {
-        if bytes.is_empty() {
-            return;
-        }
-        let end = offset.saturating_add(bytes.len() as u64);
-        if end <= self.next_offset {
-            return;
-        }
-        if offset < self.next_offset {
-            let trim = (self.next_offset - offset) as usize;
-            bytes = bytes.slice(trim..);
-            offset = self.next_offset;
-        }
-        if let Some(old) = self.chunks.insert(offset, bytes.clone()) {
-            self.buffered_bytes = self.buffered_bytes.saturating_sub(old.len());
-        }
-        self.buffered_bytes = self.buffered_bytes.saturating_add(bytes.len());
-        self.max_buffered_bytes = self.max_buffered_bytes.max(self.buffered_bytes);
-    }
-
-    fn drain_into(&mut self, buf: &mut ReadBuf<'_>) -> usize {
-        let before = buf.filled().len();
-        while buf.remaining() > 0 {
-            let Some((&offset, _)) = self.chunks.first_key_value() else {
-                break;
-            };
-            if offset > self.next_offset {
-                break;
-            }
-            let Some((_, mut bytes)) = self.chunks.remove_entry(&offset) else {
-                break;
-            };
-            self.buffered_bytes = self.buffered_bytes.saturating_sub(bytes.len());
-            if offset < self.next_offset {
-                let trim = (self.next_offset - offset) as usize;
-                if trim >= bytes.len() {
-                    continue;
-                }
-                bytes = bytes.slice(trim..);
-            }
-            let n = bytes.len().min(buf.remaining());
-            buf.put_slice(&bytes[..n]);
-            self.next_offset = self.next_offset.saturating_add(n as u64);
-            if n < bytes.len() {
-                let rest = bytes.slice(n..);
-                self.buffered_bytes = self.buffered_bytes.saturating_add(rest.len());
-                self.chunks.insert(self.next_offset, rest);
-            }
-        }
-        buf.filled().len().saturating_sub(before)
-    }
-}
-
-struct TuicChunkRelayStream {
-    recv: quinn::RecvStream,
-    send: quinn::SendStream,
-    rx: OrderedQuicChunkAssembler,
-    recv_eof: bool,
-    diag_meta: Option<TuicTcpStreamDiagMeta>,
-    last_staging_log_at: Option<Instant>,
-    unordered_chunks: u64,
-    unordered_bytes: u64,
-    out_of_order_chunks: u64,
-    max_gap_bytes: u64,
-    staging_cap_hits: u64,
-}
-
-impl TuicChunkRelayStream {
-    fn new(
-        recv: quinn::RecvStream,
-        send: quinn::SendStream,
-        diag_meta: Option<TuicTcpStreamDiagMeta>,
-    ) -> Self {
-        Self {
-            recv,
-            send,
-            rx: OrderedQuicChunkAssembler::default(),
-            recv_eof: false,
-            diag_meta,
-            last_staging_log_at: None,
-            unordered_chunks: 0,
-            unordered_bytes: 0,
-            out_of_order_chunks: 0,
-            max_gap_bytes: 0,
-            staging_cap_hits: 0,
-        }
-    }
-
-    fn read_error(err: quinn::ReadError) -> io::Error {
-        io::Error::new(io::ErrorKind::Other, format!("tuic unordered read: {err}"))
-    }
-
-    fn note_staging_cap_hit(&mut self, now: Instant) {
-        self.staging_cap_hits = self.staging_cap_hits.saturating_add(1);
-        self.maybe_log_staging("cap", now, self.rx.next_offset(), 0, 0);
-    }
-
-    fn note_chunk_staged(&mut self, now: Instant, offset: u64, chunk_len: usize) {
-        let expected = self.rx.next_offset();
-        let gap = offset.saturating_sub(expected);
-        self.unordered_chunks = self.unordered_chunks.saturating_add(1);
-        self.unordered_bytes = self.unordered_bytes.saturating_add(chunk_len as u64);
-        if gap > 0 {
-            self.out_of_order_chunks = self.out_of_order_chunks.saturating_add(1);
-            self.max_gap_bytes = self.max_gap_bytes.max(gap);
-        }
-        self.maybe_log_staging("chunk", now, offset, chunk_len, gap);
-    }
-
-    fn maybe_log_staging(
-        &mut self,
-        reason: &'static str,
-        now: Instant,
-        chunk_offset: u64,
-        chunk_len: usize,
-        gap_bytes: u64,
-    ) {
-        let should_log = reason == "cap" || gap_bytes > 0;
-        if !should_log {
-            return;
-        }
-        let Some(meta) = self.diag_meta.as_ref() else {
-            return;
-        };
-        let rate_limited = self
-            .last_staging_log_at
-            .map(|last| {
-                now.saturating_duration_since(last).as_millis() < TUIC_TCP_UNORDERED_STAGING_LOG_MS
-            })
-            .unwrap_or(false);
-        if rate_limited {
-            return;
-        }
-        self.last_staging_log_at = Some(now);
-        println!(
-            "{}",
-            format_tuic_tcp_unordered_staging_line(
-                meta,
-                reason,
-                self.rx.next_offset(),
-                chunk_offset,
-                chunk_len,
-                self.rx.buffered_bytes(),
-                self.rx.buffered_chunks(),
-                self.rx.max_buffered_bytes(),
-                self.unordered_chunks,
-                self.unordered_bytes,
-                self.out_of_order_chunks,
-                self.max_gap_bytes,
-                gap_bytes,
-                self.staging_cap_hits,
-                TUIC_TCP_UNORDERED_REASSEMBLY_MAX_BYTES,
-            )
-        );
-    }
-}
-
-impl AsyncRead for TuicChunkRelayStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        if buf.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
-        if self.rx.drain_into(buf) > 0 {
-            return Poll::Ready(Ok(()));
-        }
-        if self.recv_eof {
-            return Poll::Ready(Ok(()));
-        }
-
-        let mut polls = 0usize;
-        loop {
-            if self.rx.buffered_bytes() >= TUIC_TCP_UNORDERED_REASSEMBLY_MAX_BYTES {
-                self.note_staging_cap_hit(Instant::now());
-                return Poll::Pending;
-            }
-            let read_len = TUIC_TCP_UNORDERED_CHUNK_READ_MAX_BYTES
-                .min(TUIC_TCP_UNORDERED_REASSEMBLY_MAX_BYTES - self.rx.buffered_bytes());
-            let chunk = {
-                let fut = self.recv.read_chunk(read_len, false);
-                tokio::pin!(fut);
-                match fut.poll(cx) {
-                    Poll::Ready(Ok(chunk)) => chunk,
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(Self::read_error(err))),
-                    Poll::Pending => return Poll::Pending,
-                }
-            };
-            match chunk {
-                Some(chunk) => {
-                    let now = Instant::now();
-                    let offset = chunk.offset;
-                    let chunk_len = chunk.bytes.len();
-                    self.rx.push_chunk(offset, chunk.bytes);
-                    self.note_chunk_staged(now, offset, chunk_len);
-                    if self.rx.drain_into(buf) > 0 {
-                        return Poll::Ready(Ok(()));
-                    }
-                }
-                None => {
-                    self.recv_eof = true;
-                    return Poll::Ready(Ok(()));
-                }
-            }
-            polls += 1;
-            if polls >= 32 {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-        }
-    }
-}
-
-impl AsyncWrite for TuicChunkRelayStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.send).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.send).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.send).poll_shutdown(cx)
-    }
-}
-
 struct TrackedRelayStream<S> {
     inner: S,
     tcp_diag: Option<TuicTcpStreamDiag>,
@@ -623,6 +336,9 @@ impl<S> TrackedRelayStream<S> {
     fn arm_pending_self_wake(&mut self, cx: &Context<'_>, now: Instant) {
         let deadline = now + Duration::from_millis(TUIC_TCP_STREAM_PENDING_SELF_WAKE_MS);
         self.pending_self_wake_deadline = Some(deadline);
+        if let Some(diag) = self.tcp_diag.as_mut() {
+            diag.note_self_wake_armed();
+        }
         let waker = cx.waker().clone();
         tokio::spawn(async move {
             tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
@@ -641,6 +357,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for TrackedRelayStream<S> {
         let now = Instant::now();
         if matches!(self.pending_self_wake_deadline, Some(deadline) if deadline <= now) {
             self.pending_self_wake_deadline = None;
+            if let Some(diag) = self.tcp_diag.as_mut() {
+                diag.note_self_wake_fired();
+            }
         }
         if let Some(diag) = self.tcp_diag.as_mut() {
             diag.note_poll_at(now);
@@ -727,7 +446,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for TrackedRelayStream<S> {
                             event.rx_bytes,
                             event.reads,
                             event.pending_cause,
-                            event.transport
+                            event.transport,
+                            event.self_wake_armed,
+                            event.self_wake_fired,
                         )
                     );
                 }
@@ -1416,12 +1137,21 @@ fn format_quic_stats_line(conn_index: usize, stable_id: usize, stats: QuicStatsS
     )
 }
 
-fn format_tuic_tcp_open_line(target: &TargetAddr, conn_index: usize, stable_id: usize) -> String {
+fn format_tuic_tcp_open_line(
+    target: &TargetAddr,
+    conn_index: usize,
+    stable_id: usize,
+    stream_id: u64,
+    startup_auth_attempts: u64,
+) -> String {
     format!(
-        "🔎 tuic-open-tcp target={} conn={} id={}",
+        "🔎 tuic-open-tcp target={} conn={} id={} stream={} relay_mode={} startup_auth_attempts={}",
         target.to_wire_string(),
         conn_index,
-        stable_id
+        stable_id,
+        stream_id,
+        TUIC_TCP_RELAY_MODE_ORDERED,
+        startup_auth_attempts
     )
 }
 
@@ -1463,6 +1193,8 @@ struct TuicTcpStreamCloseSnapshot {
     max_pending_gap_ms: u128,
     polls: u64,
     max_poll_gap_ms: u128,
+    self_wake_armed: u64,
+    self_wake_fired: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1475,6 +1207,8 @@ struct TuicTcpStreamPendingEvent {
     reads: u64,
     pending_cause: TuicTcpStreamPendingCause,
     transport: Option<TuicStreamTransportPending>,
+    self_wake_armed: u64,
+    self_wake_fired: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1493,6 +1227,8 @@ struct TuicTcpStreamDiag {
     max_pending_gap_ms: u128,
     last_pending_log_at: Option<Instant>,
     last_read_transport_sample: Option<TuicStreamTransportSample>,
+    self_wake_armed: u64,
+    self_wake_fired: u64,
 }
 
 impl TuicTcpStreamDiag {
@@ -1512,7 +1248,17 @@ impl TuicTcpStreamDiag {
             max_pending_gap_ms: 0,
             last_pending_log_at: None,
             last_read_transport_sample: None,
+            self_wake_armed: 0,
+            self_wake_fired: 0,
         }
+    }
+
+    fn note_self_wake_armed(&mut self) {
+        self.self_wake_armed = self.self_wake_armed.saturating_add(1);
+    }
+
+    fn note_self_wake_fired(&mut self) {
+        self.self_wake_fired = self.self_wake_fired.saturating_add(1);
     }
 
     fn note_poll_at(&mut self, now: Instant) {
@@ -1600,6 +1346,8 @@ impl TuicTcpStreamDiag {
             reads: self.reads,
             pending_cause,
             transport,
+            self_wake_armed: self.self_wake_armed,
+            self_wake_fired: self.self_wake_fired,
         })
     }
 
@@ -1613,6 +1361,8 @@ impl TuicTcpStreamDiag {
             max_pending_gap_ms: self.max_pending_gap_ms,
             polls: self.polls,
             max_poll_gap_ms: self.max_poll_gap_ms,
+            self_wake_armed: self.self_wake_armed,
+            self_wake_fired: self.self_wake_fired,
         }
     }
 }
@@ -1681,9 +1431,11 @@ fn format_tuic_tcp_stream_pending_line(
     reads: u64,
     pending_cause: TuicTcpStreamPendingCause,
     transport: Option<TuicStreamTransportPending>,
+    self_wake_armed: u64,
+    self_wake_fired: u64,
 ) -> String {
     let mut line = format!(
-        "🔎 tuic-tcp-stream-pending target={} conn={} id={} stream={} pending_gap_ms={} pending_polls={} polls={} max_poll_gap_ms={} rx_bytes={} reads={} pending_cause={}",
+        "🔎 tuic-tcp-stream-pending target={} conn={} id={} stream={} pending_gap_ms={} pending_polls={} polls={} max_poll_gap_ms={} rx_bytes={} reads={} pending_cause={} self_wake_armed={} self_wake_fired={}",
         meta.target,
         meta.conn_index,
         meta.stable_id,
@@ -1694,7 +1446,9 @@ fn format_tuic_tcp_stream_pending_line(
         max_poll_gap_ms,
         rx_bytes,
         reads,
-        pending_cause.as_str()
+        pending_cause.as_str(),
+        self_wake_armed,
+        self_wake_fired
     );
     if let Some(transport) = transport {
         line.push_str(&format!(
@@ -1715,53 +1469,12 @@ fn format_tuic_tcp_stream_pending_line(
     line
 }
 
-#[allow(clippy::too_many_arguments)]
-fn format_tuic_tcp_unordered_staging_line(
-    meta: &TuicTcpStreamDiagMeta,
-    reason: &str,
-    next_offset: u64,
-    chunk_offset: u64,
-    chunk_bytes: usize,
-    buffered_bytes: usize,
-    buffered_chunks: usize,
-    max_buffered_bytes: usize,
-    unordered_chunks: u64,
-    unordered_bytes: u64,
-    out_of_order_chunks: u64,
-    max_gap_bytes: u64,
-    gap_bytes: u64,
-    staging_cap_hits: u64,
-    cap_bytes: usize,
-) -> String {
-    format!(
-        "🔎 tuic-tcp-unordered-staging target={} conn={} id={} stream={} reason={} next_offset={} chunk_offset={} chunk_bytes={} gap_bytes={} max_gap_bytes={} buffered={}B buffered_chunks={} max_buffered={}B unordered_chunks={} unordered_bytes={} out_of_order_chunks={} cap_hits={} cap={}B",
-        meta.target,
-        meta.conn_index,
-        meta.stable_id,
-        meta.stream_id,
-        reason,
-        next_offset,
-        chunk_offset,
-        chunk_bytes,
-        gap_bytes,
-        max_gap_bytes,
-        buffered_bytes,
-        buffered_chunks,
-        max_buffered_bytes,
-        unordered_chunks,
-        unordered_bytes,
-        out_of_order_chunks,
-        staging_cap_hits,
-        cap_bytes
-    )
-}
-
 fn format_tuic_tcp_stream_close_line(
     meta: &TuicTcpStreamDiagMeta,
     snapshot: &TuicTcpStreamCloseSnapshot,
 ) -> String {
     format!(
-        "🔎 tuic-tcp-stream-close target={} conn={} id={} stream={} first_rx_ms={} max_read_gap_ms={} rx_bytes={} reads={} pending_polls={} max_pending_gap_ms={} polls={} max_poll_gap_ms={}",
+        "🔎 tuic-tcp-stream-close target={} conn={} id={} stream={} first_rx_ms={} max_read_gap_ms={} rx_bytes={} reads={} pending_polls={} max_pending_gap_ms={} polls={} max_poll_gap_ms={} self_wake_armed={} self_wake_fired={}",
         meta.target,
         meta.conn_index,
         meta.stable_id,
@@ -1773,7 +1486,9 @@ fn format_tuic_tcp_stream_close_line(
         snapshot.pending_polls,
         snapshot.max_pending_gap_ms,
         snapshot.polls,
-        snapshot.max_poll_gap_ms
+        snapshot.max_poll_gap_ms,
+        snapshot.self_wake_armed,
+        snapshot.self_wake_fired
     )
 }
 
@@ -1892,6 +1607,9 @@ pub struct TuicUpstream {
     /// Per-slot last TCP use, measured against `clock`. A stale TCP-only pool slot is reconnected
     /// before opening a new stream so the data relay does not inherit a just-timed-out connection.
     tcp_last_used_secs: Vec<AtomicU64>,
+    /// Per-slot startup authentication attempts. A recovered auxiliary slot is still usable, but
+    /// reverse-throughput diagnostics must distinguish it from a first-attempt-clean slot.
+    tcp_startup_auth_attempts: Vec<AtomicU64>,
     /// Active or opening TCP relay count per pool slot. Stale reconnect is only safe when a slot is
     /// idle; closing an active QUIC connection would cut every stream multiplexed on that slot.
     tcp_active_streams: Vec<Arc<AtomicU64>>,
@@ -1993,8 +1711,10 @@ impl TuicUpstream {
             }
         }
         conns.push(Mutex::new(conn));
+        let mut tcp_startup_auth_attempts = Vec::with_capacity(tcp_pool);
+        tcp_startup_auth_attempts.push(AtomicU64::new(1));
         for index in 1..tcp_pool {
-            let extra = match Self::handshake_aux_with_retries(
+            let (extra, auth_attempts) = match Self::handshake_aux_with_retries(
                 &endpoint,
                 cfg.server,
                 &cfg.sni,
@@ -2017,6 +1737,7 @@ impl TuicUpstream {
                     }
                 },
             };
+            tcp_startup_auth_attempts.push(AtomicU64::new(auth_attempts as u64));
             if let Some(secs) = cfg.quic_stats_secs
                 && let Some(stop) = &quic_stats_stop
             {
@@ -2025,6 +1746,7 @@ impl TuicUpstream {
             conns.push(Mutex::new(extra));
         }
         let tcp_pool = conns.len();
+        debug_assert_eq!(tcp_startup_auth_attempts.len(), tcp_pool);
         if tcp_pool > 1 {
             println!(
                 "🧵 TUIC TCP connection pool={tcp_pool}（UDP/health 仍走 primary connection）"
@@ -2041,6 +1763,7 @@ impl TuicUpstream {
             conns,
             tcp_next: AtomicU64::new(0),
             tcp_last_used_secs,
+            tcp_startup_auth_attempts,
             tcp_active_streams,
             udp_drops: AtomicU64::new(0),
             udp_stream_fallbacks: AtomicU64::new(0),
@@ -2128,7 +1851,7 @@ impl TuicUpstream {
         password: &str,
         zero_rtt: bool,
         index: usize,
-    ) -> Result<Connection, ClientError> {
+    ) -> Result<(Connection, usize), ClientError> {
         for attempt in 0..TUIC_TCP_POOL_AUX_CONNECT_ATTEMPTS {
             match Self::handshake(endpoint, server, sni, uuid, password, zero_rtt).await {
                 Ok(conn) => {
@@ -2138,7 +1861,7 @@ impl TuicUpstream {
                             attempt + 1
                         );
                     }
-                    return Ok(conn);
+                    return Ok((conn, attempt + 1));
                 }
                 Err(e) => {
                     let Some(delay) = tcp_pool_aux_retry_delay(attempt) else {
@@ -2530,10 +2253,21 @@ impl ProxyUpstream for TuicUpstream {
             send.write_all(&encode_connect(target))
                 .await
                 .map_err(|e| io_err("tuic connect write", e))?;
+            let startup_auth_attempts = self
+                .tcp_startup_auth_attempts
+                .get(conn_index)
+                .map(|attempts| attempts.load(Ordering::Relaxed))
+                .unwrap_or(0);
             let diag_meta = if tcp_diag_enabled() {
                 println!(
                     "{}",
-                    format_tuic_tcp_open_line(target, conn_index, stable_id)
+                    format_tuic_tcp_open_line(
+                        target,
+                        conn_index,
+                        stable_id,
+                        stream_id,
+                        startup_auth_attempts,
+                    )
                 );
                 Some(TuicTcpStreamDiagMeta::new(
                     target, conn_index, stable_id, stream_id,
@@ -2544,24 +2278,12 @@ impl ProxyUpstream for TuicUpstream {
             let tcp_stream_diag = diag_meta
                 .clone()
                 .map(|meta| TuicTcpStreamDiag::new(meta, Instant::now()));
-            let relay: RelayStream = match tuic_tcp_relay_mode() {
-                TuicTcpRelayMode::Ordered => Box::new(TrackedRelayStream::new_with_transport(
-                    tokio::io::join(recv, send),
-                    lease,
-                    tcp_stream_diag,
-                    conn.clone(),
-                )),
-                TuicTcpRelayMode::UnorderedReassembly => {
-                    // Knife14ft：unordered chunk reassembly is diagnostic-only. It exposes
-                    // stream offset gaps, but must not be the default data path.
-                    Box::new(TrackedRelayStream::new_with_transport(
-                        TuicChunkRelayStream::new(recv, send, diag_meta),
-                        lease,
-                        tcp_stream_diag,
-                        conn.clone(),
-                    ))
-                }
-            };
+            let relay: RelayStream = Box::new(TrackedRelayStream::new_with_transport(
+                tokio::io::join(recv, send),
+                lease,
+                tcp_stream_diag,
+                conn.clone(),
+            ));
             Ok::<RelayStream, ClientError>(relay)
         };
         tokio::time::timeout(TUIC_OPEN_TIMEOUT, open)
@@ -2769,40 +2491,6 @@ mod tests {
     }
 
     #[test]
-    fn tuic_tcp_relay_mode_defaults_to_ordered_and_gates_unordered_reassembly() {
-        assert_eq!(parse_tuic_tcp_relay_mode(None), TuicTcpRelayMode::Ordered);
-        assert_eq!(
-            parse_tuic_tcp_relay_mode(Some("")),
-            TuicTcpRelayMode::Ordered
-        );
-        assert_eq!(
-            parse_tuic_tcp_relay_mode(Some("0")),
-            TuicTcpRelayMode::Ordered
-        );
-        assert_eq!(
-            parse_tuic_tcp_relay_mode(Some("false")),
-            TuicTcpRelayMode::Ordered
-        );
-
-        assert_eq!(
-            parse_tuic_tcp_relay_mode(Some("1")),
-            TuicTcpRelayMode::UnorderedReassembly
-        );
-        assert_eq!(
-            parse_tuic_tcp_relay_mode(Some("true")),
-            TuicTcpRelayMode::UnorderedReassembly
-        );
-        assert_eq!(
-            parse_tuic_tcp_relay_mode(Some("on")),
-            TuicTcpRelayMode::UnorderedReassembly
-        );
-        assert_eq!(
-            parse_tuic_tcp_relay_mode(Some("yes")),
-            TuicTcpRelayMode::UnorderedReassembly
-        );
-    }
-
-    #[test]
     fn format_quic_stats_line_includes_flow_and_congestion_signals() {
         let line = format_quic_stats_line(
             2,
@@ -2865,12 +2553,15 @@ mod tests {
     #[test]
     fn format_tuic_tcp_open_line_includes_target_pool_and_id() {
         let target = TargetAddr::parse("1.2.3.4:5201").unwrap();
-        let line = format_tuic_tcp_open_line(&target, 3, 42);
+        let line = format_tuic_tcp_open_line(&target, 3, 42, 8, 2);
 
         assert!(line.contains("tuic-open-tcp"), "{line}");
         assert!(line.contains("target=1.2.3.4:5201"), "{line}");
         assert!(line.contains("conn=3"), "{line}");
         assert!(line.contains("id=42"), "{line}");
+        assert!(line.contains("stream=8"), "{line}");
+        assert!(line.contains("relay_mode=ordered_join"), "{line}");
+        assert!(line.contains("startup_auth_attempts=2"), "{line}");
     }
 
     #[test]
@@ -2889,6 +2580,8 @@ mod tests {
             2,
             TuicTcpStreamPendingCause::NoTransportSample,
             None,
+            5,
+            4,
         );
         let close_snapshot = TuicTcpStreamCloseSnapshot {
             first_rx_ms: 20_500,
@@ -2899,6 +2592,8 @@ mod tests {
             max_pending_gap_ms: 12_000,
             polls: 31,
             max_poll_gap_ms: 5_000,
+            self_wake_armed: 5,
+            self_wake_fired: 4,
         };
         let close = format_tuic_tcp_stream_close_line(&meta, &close_snapshot);
 
@@ -2923,6 +2618,8 @@ mod tests {
         assert!(pending.contains("max_poll_gap_ms=5000"), "{pending}");
         assert!(pending.contains("rx_bytes=75128"), "{pending}");
         assert!(pending.contains("reads=2"), "{pending}");
+        assert!(pending.contains("self_wake_armed=5"), "{pending}");
+        assert!(pending.contains("self_wake_fired=4"), "{pending}");
 
         assert!(close.contains("tuic-tcp-stream-close"), "{close}");
         assert!(close.contains("first_rx_ms=20500"), "{close}");
@@ -2933,6 +2630,8 @@ mod tests {
         assert!(close.contains("max_pending_gap_ms=12000"), "{close}");
         assert!(close.contains("polls=31"), "{close}");
         assert!(close.contains("max_poll_gap_ms=5000"), "{close}");
+        assert!(close.contains("self_wake_armed=5"), "{close}");
+        assert!(close.contains("self_wake_fired=4"), "{close}");
     }
 
     #[test]
@@ -2966,6 +2665,8 @@ mod tests {
             2,
             TuicTcpStreamPendingCause::ConnectionStreamFramesPending,
             Some(transport),
+            13,
+            12,
         );
 
         assert!(
@@ -2978,6 +2679,8 @@ mod tests {
             "{pending}"
         );
         assert!(pending.contains("conn_rx_stream_frames=37"), "{pending}");
+        assert!(pending.contains("self_wake_armed=13"), "{pending}");
+        assert!(pending.contains("self_wake_fired=12"), "{pending}");
         assert!(
             pending.contains("conn_rx_stream_frames_since_read=7"),
             "{pending}"
@@ -2990,50 +2693,6 @@ mod tests {
             pending.contains("conn_plpmtud(sent=5,lost=2,black_holes=1)"),
             "{pending}"
         );
-    }
-
-    #[test]
-    fn format_tuic_tcp_unordered_staging_line_includes_reassembly_pressure() {
-        let target = TargetAddr::parse("1.2.3.4:5201").unwrap();
-        let meta = TuicTcpStreamDiagMeta::new(&target, 3, 42, 8);
-
-        let line = format_tuic_tcp_unordered_staging_line(
-            &meta,
-            "chunk",
-            1024,
-            4096,
-            1200,
-            3600,
-            3,
-            4800,
-            7,
-            8400,
-            2,
-            4096,
-            3072,
-            1,
-            4 * 1024 * 1024,
-        );
-
-        assert!(line.contains("tuic-tcp-unordered-staging"), "{line}");
-        assert!(line.contains("target=1.2.3.4:5201"), "{line}");
-        assert!(line.contains("conn=3"), "{line}");
-        assert!(line.contains("id=42"), "{line}");
-        assert!(line.contains("stream=8"), "{line}");
-        assert!(line.contains("reason=chunk"), "{line}");
-        assert!(line.contains("next_offset=1024"), "{line}");
-        assert!(line.contains("chunk_offset=4096"), "{line}");
-        assert!(line.contains("chunk_bytes=1200"), "{line}");
-        assert!(line.contains("gap_bytes=3072"), "{line}");
-        assert!(line.contains("max_gap_bytes=4096"), "{line}");
-        assert!(line.contains("buffered=3600B"), "{line}");
-        assert!(line.contains("buffered_chunks=3"), "{line}");
-        assert!(line.contains("max_buffered=4800B"), "{line}");
-        assert!(line.contains("unordered_chunks=7"), "{line}");
-        assert!(line.contains("unordered_bytes=8400"), "{line}");
-        assert!(line.contains("out_of_order_chunks=2"), "{line}");
-        assert!(line.contains("cap_hits=1"), "{line}");
-        assert!(line.contains("cap=4194304B"), "{line}");
     }
 
     #[test]
@@ -3263,40 +2922,6 @@ mod tests {
         assert_eq!(transport.sample.tx_ack_frames, 6);
         assert_eq!(transport.sample.lost_plpmtud_probes, 1);
         assert_eq!(transport.sample.black_holes_detected, 1);
-    }
-
-    #[test]
-    fn ordered_quic_chunk_assembler_buffers_gap_then_drains_contiguously() {
-        let mut assembler = OrderedQuicChunkAssembler::default();
-        let mut out = [0u8; 6];
-        let mut read_buf = ReadBuf::new(&mut out);
-
-        assembler.push_chunk(3, bytes::Bytes::from_static(b"def"));
-        assert_eq!(assembler.drain_into(&mut read_buf), 0);
-        assert_eq!(read_buf.filled(), b"");
-
-        assembler.push_chunk(0, bytes::Bytes::from_static(b"abc"));
-        assert_eq!(assembler.drain_into(&mut read_buf), 6);
-        assert_eq!(read_buf.filled(), b"abcdef");
-        assert_eq!(assembler.next_offset(), 6);
-        assert_eq!(assembler.buffered_bytes(), 0);
-    }
-
-    #[test]
-    fn ordered_quic_chunk_assembler_trims_already_delivered_prefix() {
-        let mut assembler = OrderedQuicChunkAssembler::default();
-        let mut first_out = [0u8; 3];
-        let mut first = ReadBuf::new(&mut first_out);
-        assembler.push_chunk(0, bytes::Bytes::from_static(b"abc"));
-        assert_eq!(assembler.drain_into(&mut first), 3);
-
-        let mut second_out = [0u8; 3];
-        let mut second = ReadBuf::new(&mut second_out);
-        assembler.push_chunk(1, bytes::Bytes::from_static(b"bcdef"));
-        assert_eq!(assembler.drain_into(&mut second), 3);
-        assert_eq!(second.filled(), b"def");
-        assert_eq!(assembler.next_offset(), 6);
-        assert_eq!(assembler.buffered_bytes(), 0);
     }
 
     #[tokio::test]

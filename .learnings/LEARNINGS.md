@@ -3911,3 +3911,30 @@ worth cleaning up separately.
   The next repair needs server-side sending cadence / qlog-style evidence,
   quinn ordered-offset readiness tracing, or a custom-exit/TUIC data-channel
   discriminator.
+
+## 2026-07-08 - Knife14fy restores a single ordered TUIC TCP path before pressure-credit work
+
+- Stage doc:
+  `docs/tech/2026-07-08-knife14fy-ordered-read-service-restore-plan.md`
+- Outcome: local stage only. The rejected unordered `RecvStream::read_chunk(false)`
+  TCP branch and `MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY` env gate were removed
+  from `src/tuic.rs`, leaving TUIC TCP on a single ordered
+  `tokio::io::join(recv, send)` path again.
+- Diagnostics added: `tuic-open-tcp` now reports `stream`,
+  `relay_mode=ordered_join`, and per-slot `startup_auth_attempts`; TUIC stream
+  pending/close logs report `self_wake_armed` and `self_wake_fired`; relay
+  live/close logs report awaited remote read-service tick count and read-window
+  min/max.
+- Existing bundle contrast: Knife14fu current branch had clean local
+  pressure/headroom/TUN surfaces but only `176260` data bytes and sparse reads,
+  while f8765c1 moved `70141010` bytes and failed later as local-pressure-credit.
+  Therefore the next acceptance should first prove data-moving restoration
+  before changing credit constants.
+- Gates passed: `cargo test --lib tuic`, focused relay/read-service tests,
+  `cargo test --lib`, `cargo build --release`, `git diff --check`, and
+  `rustfmt --edition 2024 --check src/tuic.rs src/client_tun.rs`.
+- Reusable rule: after a diagnostic data-channel experiment is rejected by VPS
+  evidence, remove it from the default code surface before the next
+  high-sensitivity throughput A/B. Keep the next run's log surface narrow enough
+  to attribute stream read service, self-wake, relay cadence, startup pool
+  recovery, or egress progress without experimental branch ambiguity.

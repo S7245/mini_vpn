@@ -2873,3 +2873,16 @@
   behind an explicit diagnostic env flag with the default path restored to the
   ordered stream reader. Use unordered staging only to collect offset-gap
   evidence, not as the production data path.
+
+## 2026-07-08 - Do not run full `cargo fmt` in a narrow Knife14 stage
+
+- Stage: Knife14fy ordered read-service restore.
+- Symptom: running full `cargo fmt` reformatted many unrelated files
+  (`src/device.rs`, `src/failover.rs`, `src/reality_*`, and others), creating
+  noisy churn outside the two intended files.
+- Cause: the repository has pre-existing non-target files that rustfmt would
+  rewrite. A narrow diagnostic/data-plane stage should not accept full-repo
+  formatting changes.
+- Correct behavior: for scoped stages, run targeted formatting/checks such as
+  `rustfmt --edition 2024 --check src/tuic.rs src/client_tun.rs`, and avoid
+  full `cargo fmt` unless the stage explicitly includes full-repo formatting.

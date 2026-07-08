@@ -790,6 +790,10 @@ struct RelayTaskDiag {
     remote_read_probe_ticks: u64,
     /// Number of read-service retry ticks while an active remote stream was awaiting readiness.
     remote_read_service_ticks: u64,
+    /// Smallest awaited remote read buffer length while read service was active.
+    remote_read_service_len_min: usize,
+    /// Largest awaited remote read buffer length while read service was active.
+    remote_read_service_len_max: usize,
     /// Number of successful remote stream reads after local `Finish`.
     remote_after_local_finish_reads: u64,
     /// Number of local `Finish` signals observed by the relay writer half.
@@ -851,6 +855,8 @@ impl RelayTaskDiag {
             remote_reads: 0,
             remote_read_probe_ticks: 0,
             remote_read_service_ticks: 0,
+            remote_read_service_len_min: 0,
+            remote_read_service_len_max: 0,
             remote_after_local_finish_reads: 0,
             local_finish_events: 0,
             first_local_finish_after_first_remote_read_millis: None,
@@ -1022,6 +1028,19 @@ impl RelayTaskDiag {
         self.remote_read_probe_ticks = self.remote_read_probe_ticks.saturating_add(1);
     }
 
+    fn note_remote_read_service_tick(&mut self, read_len: usize) {
+        if read_len == 0 {
+            return;
+        }
+        self.remote_read_service_ticks = self.remote_read_service_ticks.saturating_add(1);
+        if self.remote_read_service_len_min == 0 {
+            self.remote_read_service_len_min = read_len;
+        } else {
+            self.remote_read_service_len_min = self.remote_read_service_len_min.min(read_len);
+        }
+        self.remote_read_service_len_max = self.remote_read_service_len_max.max(read_len);
+    }
+
     fn copy_reader_fields_from(&mut self, reader: &RelayTaskDiag) {
         self.first_remote_read_millis = reader.first_remote_read_millis;
         self.first_remote_read_at = reader.first_remote_read_at;
@@ -1039,6 +1058,8 @@ impl RelayTaskDiag {
         self.remote_after_local_finish_bytes = reader.remote_after_local_finish_bytes;
         self.remote_reads = reader.remote_reads;
         self.remote_read_service_ticks = reader.remote_read_service_ticks;
+        self.remote_read_service_len_min = reader.remote_read_service_len_min;
+        self.remote_read_service_len_max = reader.remote_read_service_len_max;
         self.remote_after_local_finish_reads = reader.remote_after_local_finish_reads;
         self.first_local_finish_after_first_remote_read_millis =
             reader.first_local_finish_after_first_remote_read_millis;
@@ -1194,7 +1215,7 @@ fn format_relay_live_diag_at(
     format!(
         "🔎 tcp-relay-live handle={handle:?} epoch={epoch} writer_done={writer_done} \
          read_only_after_local_finish={read_only_after_local_finish} \
-         uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} remote_read_probe_ticks={} remote_read_service_ticks={} \
+         uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} remote_read_probe_ticks={} remote_read_service_ticks={} remote_read_service_len_min={} remote_read_service_len_max={} \
          remote_batches={} remote_batch_bytes_max={} remote_batch_chunks_max={} remote_batch_limit_bytes_min={} remote_batch_limited={} read_credit_updates={} read_credit_pause_updates={} read_credit_limit_bytes_min={} \
          local_finish_events={} first_local_finish_after_first_remote_read_ms={} \
          remote_after_local_finish_bytes={} remote_after_local_finish_reads={} \
@@ -1209,6 +1230,8 @@ fn format_relay_live_diag_at(
         diag.remote_reads,
         diag.remote_read_probe_ticks,
         diag.remote_read_service_ticks,
+        diag.remote_read_service_len_min,
+        diag.remote_read_service_len_max,
         diag.remote_batches,
         diag.remote_batch_bytes_max,
         diag.remote_batch_chunks_max,
@@ -1245,7 +1268,7 @@ fn format_relay_close_diag(
     diag: &RelayTaskDiag,
 ) -> String {
     format!(
-        "🔎 tcp-relay-close handle={:?} direction={} reason={} uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} remote_read_probe_ticks={} remote_read_service_ticks={} remote_batches={} remote_batch_bytes_max={} remote_batch_chunks_max={} remote_batch_limit_bytes_min={} remote_batch_limited={} read_credit_updates={} read_credit_pause_updates={} read_credit_limit_bytes_min={} local_finish_events={} first_local_finish_after_first_remote_read_ms={} remote_after_local_finish_bytes={} remote_after_local_finish_reads={} first_remote_read_ms={} max_remote_read_gap_ms={} max_remote_read_gap_before_local_finish_ms={} max_remote_read_gap_after_local_finish_ms={} current_remote_read_gap_ms={} ack_drain_hint_due={} ack_drain_hint_sent={} ack_drain_hint_dropped={} global_rx_wait_max_us={} global_rx_pressure_events={} global_rx_queue_used_max={} global_rx_queue_capacity={} local_write_wait_max_us={} local_write_pressure_events={}",
+        "🔎 tcp-relay-close handle={:?} direction={} reason={} uplink_bytes={} uplink_writes={} remote_to_global_rx_bytes={} remote_reads={} remote_read_probe_ticks={} remote_read_service_ticks={} remote_read_service_len_min={} remote_read_service_len_max={} remote_batches={} remote_batch_bytes_max={} remote_batch_chunks_max={} remote_batch_limit_bytes_min={} remote_batch_limited={} read_credit_updates={} read_credit_pause_updates={} read_credit_limit_bytes_min={} local_finish_events={} first_local_finish_after_first_remote_read_ms={} remote_after_local_finish_bytes={} remote_after_local_finish_reads={} first_remote_read_ms={} max_remote_read_gap_ms={} max_remote_read_gap_before_local_finish_ms={} max_remote_read_gap_after_local_finish_ms={} current_remote_read_gap_ms={} ack_drain_hint_due={} ack_drain_hint_sent={} ack_drain_hint_dropped={} global_rx_wait_max_us={} global_rx_pressure_events={} global_rx_queue_used_max={} global_rx_queue_capacity={} local_write_wait_max_us={} local_write_pressure_events={}",
         handle,
         close_direction,
         close_reason,
@@ -1255,6 +1278,8 @@ fn format_relay_close_diag(
         diag.remote_reads,
         diag.remote_read_probe_ticks,
         diag.remote_read_service_ticks,
+        diag.remote_read_service_len_min,
+        diag.remote_read_service_len_max,
         diag.remote_batches,
         diag.remote_batch_bytes_max,
         diag.remote_batch_chunks_max,
@@ -8135,6 +8160,7 @@ async fn run_relay_reader(
             continue;
         }
 
+        diag.note_remote_read_service_tick(remote_read_len);
         let remote_msg = tokio::select! {
             _ = &mut stop_rx => return,
             remote_msg = remote_reader.read(&mut buf[..remote_read_len]) => remote_msg,
@@ -15968,6 +15994,7 @@ mod tests {
         diag.note_uplink_write(64);
         diag.note_local_finish();
         diag.note_remote_read(128);
+        diag.note_remote_read_service_tick(65_536);
         diag.note_remote_batch(1, 128);
         diag.note_global_rx_queue(5, 1024);
         diag.note_ack_drain_hint_due();
@@ -15982,6 +16009,9 @@ mod tests {
         assert!(line.contains("uplink_bytes=64"), "{line}");
         assert!(line.contains("remote_to_global_rx_bytes=128"), "{line}");
         assert!(line.contains("remote_reads=1"), "{line}");
+        assert!(line.contains("remote_read_service_ticks=1"), "{line}");
+        assert!(line.contains("remote_read_service_len_min=65536"), "{line}");
+        assert!(line.contains("remote_read_service_len_max=65536"), "{line}");
         assert!(line.contains("remote_batches=1"), "{line}");
         assert!(line.contains("remote_batch_bytes_max=128"), "{line}");
         assert!(line.contains("remote_batch_chunks_max=1"), "{line}");
@@ -15995,6 +16025,20 @@ mod tests {
         assert!(line.contains("ack_drain_hint_dropped=0"), "{line}");
         assert!(line.contains("global_rx_queue_used_max=5"), "{line}");
         assert!(line.contains("global_rx_queue_capacity=1024"), "{line}");
+    }
+
+    #[test]
+    fn relay_read_service_diag_records_awaited_read_window_range() {
+        let mut diag = RelayTaskDiag::default();
+
+        diag.note_remote_read_service_tick(65_536);
+        diag.note_remote_read_service_tick(0);
+        diag.note_remote_read_service_tick(8_192);
+        diag.note_remote_read_service_tick(131_072);
+
+        assert_eq!(diag.remote_read_service_ticks, 3);
+        assert_eq!(diag.remote_read_service_len_min, 8_192);
+        assert_eq!(diag.remote_read_service_len_max, 131_072);
     }
 
     #[test]
@@ -16208,6 +16252,7 @@ mod tests {
         diag.note_uplink_write(37);
         diag.note_local_finish();
         diag.note_remote_read(43_772);
+        diag.note_remote_read_service_tick(16_384);
         diag.note_remote_batch(3, 43_772);
         diag.note_global_rx_queue(9, 1024);
 
@@ -16221,6 +16266,9 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("remote_after_local_finish_reads=1"), "{line}");
+        assert!(line.contains("remote_read_service_ticks=1"), "{line}");
+        assert!(line.contains("remote_read_service_len_min=16384"), "{line}");
+        assert!(line.contains("remote_read_service_len_max=16384"), "{line}");
         assert!(line.contains("remote_batches=1"), "{line}");
         assert!(line.contains("remote_batch_bytes_max=43772"), "{line}");
         assert!(line.contains("remote_batch_chunks_max=3"), "{line}");
