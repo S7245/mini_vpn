@@ -54,23 +54,35 @@ Latest discriminator:
   retry restored data movement (`23.2/21.2 Mbit/s`) but did **not** exceed
   `30 Mbit/s`; the run stayed `low_average` with local-pressure/credit-edge
   signals and clean TUN/QUIC surfaces.
+- Knife14gn added TDD and code for accepted downlink flush progress. Commit
+  `97cb55e` moves downlink credit-controller feedback until after
+  `send_slice`, so bytes accepted into smoltcp count as useful local egress
+  progress and wake read-credit publishers. The focused safe1200 reverse-first
+  P1 completed normally but regressed to `18.8/18.0 Mbit/s`, **not** `>30`.
+  The important discriminator changed: `local_pressure=0`, pressure/drop debt
+  and TUN drops stayed `0`, while `connection_stream_frames_pending` gaps
+  remained at `3405ms`.
 
 Current result doc:
 
-- `docs/tech/2026-07-08-knife14gm-low-byte-gap-results.md`
+- `docs/tech/2026-07-08-knife14gn-accepted-flush-progress-results.md`
 
 Current follow-up queue:
 
 1. Keep the ordered-default gate and the Knife14gm low-byte ACK/window service
-   fix; unordered reassembly remains diagnostic only.
-2. Resume the local pressure-credit/controller branch. Add TDD around useful
-   egress progress, credit repayment, and read-credit publishing when the data
-   stream is still `connection_stream_frames_pending`.
-3. The next focused acceptance target is first `>30 Mbit/s` on the same
+   fix, plus the Knife14gn accepted-flush progress feedback; unordered
+   reassembly remains diagnostic only.
+2. Do not keep changing local pressure-credit constants from Knife14gn: the
+   latest low run has `local_pressure=0`, no pressure/drop debt, no TUN drops,
+   no QUIC loss/blocking, and zero read-credit pause updates.
+3. Next code slice should focus on TUIC ordered-stream receive cadence and
+   self-wake diagnostics when `pending_cause=connection_stream_frames_pending`
+   repeats for multi-second gaps despite available read credit.
+4. The next focused acceptance target is still first `>30 Mbit/s` on the same
    safe1200 reverse-first P1, not yet `100+`.
-4. Once `>30 Mbit/s` is stable, continue the controller/frame-cadence path
+5. Once `>30 Mbit/s` is stable, continue the controller/frame-cadence path
    toward clean `100+ Mbit/s`.
-5. Only after a clean `100+ Mbit/s` repeat exits normally should Knife14 broaden
+6. Only after a clean `100+ Mbit/s` repeat exits normally should Knife14 broaden
    to longer-duration or concurrency sweeps.
 
 ## Roadmap: TUN transparent proxy (Target extraction)

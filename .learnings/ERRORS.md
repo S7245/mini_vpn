@@ -1,5 +1,19 @@
 # Errors
 
+## 2026-07-08 - Codex exec must allocate a writable PTY for sudo suites
+
+- Stage: Knife14gn focused safe1200 reverse-first P1 acceptance.
+- Symptom: the first suite launch used remote `ssh -tt`, reached
+  `[sudo] password for ubuntu:`, but `write_stdin` failed with `stdin is
+  closed for this session`.
+- Cause: the local Codex `exec_command` call did not set `tty=true`; remote
+  `ssh -tt` alone was not enough to keep a writable stdin in this tool session.
+- Correct behavior: for any suite that may run `sudo -v`, set both remote
+  `ssh -tt` and local tool `tty=true` from the initial `exec_command`. If this
+  mistake happens, kill only the hung ssh process, then rerun with a writable
+  TTY. Never place sudo passwords in commands, scripts, logs, docs, or
+  summaries.
+
 ## 2026-07-08 - Older Knife14 suite env flags are easy to mis-set
 
 - Stage: Knife14fv/fx acceptance discriminators.

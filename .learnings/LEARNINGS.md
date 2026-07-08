@@ -1,5 +1,31 @@
 # Learnings
 
+## 2026-07-08 - Knife14gn clears local pressure but leaves ordered stream gaps
+
+- Result doc:
+  `docs/tech/2026-07-08-knife14gn-accepted-flush-progress-results.md`
+- Code commit:
+  `97cb55e` feeds downlink credit-controller feedback after `send_slice`, so
+  bytes accepted into smoltcp count as useful local egress progress and can wake
+  read-credit publishers.
+- Log bundle:
+  `/tmp/mini_vpn/mvpn_knife14gn_accepted_flush_progress_safe1200_p1_30_usclient_suite_20260708_200258.tar.gz`
+- Outcome: focused safe1200 reverse-first P1 completed but reached only
+  `18.8/18.0 Mbit/s`, below the `>30 Mbit/s` T11 target.
+- What worked: the local pressure-credit surface was cleaned in this run:
+  `local_pressure=0`, `downlink_backpressure pause_edges=0`,
+  `global_rx_receive pause_edges=0`, `read_credit_pause_updates=0`,
+  pressure/drop debt `0`, TUN drops `0`, and QUIC loss/blocking `0`.
+- What failed: throughput stayed low-average and burst/idle. The data stream
+  still had `connection_stream_frames_pending=10`,
+  `data_read_gap_max_ms=3405`, and `data_pending_gap_max_ms=3405` despite open
+  read credit and clean local pressure.
+- Reusable rule: after accepted-flush progress clears local pressure, do not
+  keep changing pressure-credit constants. The next slice should test and fix
+  ordered TUIC stream receive cadence/self-wake when transport has stream-frame
+  progress since the last application read but the relay reader remains in a
+  multi-second pending gap.
+
 ## 2026-07-08 - Knife14fu/fw/fx proves VPS can 100M while mini_vpn remains low
 
 - Result doc:
