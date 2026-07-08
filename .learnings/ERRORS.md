@@ -3013,3 +3013,37 @@ active root unless it repeats.
   this result. The next fix must be TDD-first around stale repeated
   STREAM-pending classification plus a useful read-service floor during
   accepted egress progress when hard drop/failure signals are absent.
+
+## 2026-07-08 - Knife14gq B7 failed after buffered read-credit isolation
+
+- Stage: Knife14gq buffered downlink architecture B7.
+- Symptom: commit `8a85ce7` passed local/remote gates and enabled buffered
+  downlink, but focused safe1200 reverse-first P1 reached only
+  `18.3/17.2 Mbit/s`, below the `>30 Mbit/s` B7 gate.
+- Cause: the original `1200B` read-credit collapse was no longer present:
+  `remote_read_service_len_min=65536`,
+  `remote_batch_limit_bytes_min=524288`, and `read_credit_pause_updates=0`.
+  The remaining low-average shape was attributed to local downlink
+  writer/egress cadence (`local_downlink_backpressure`) with clean TUN drops,
+  send errors, close-tail accounting, and QUIC loss/blocking.
+- Correct behavior: stop at B7 and do not continue to B8/B9 without a new
+  confirmed design. Do not keep tuning credit floors, self-wake cadence,
+  VPS services, MTU/PLPMTUD, stale pool, or broad QUIC windows from this
+  result. Any next attempt must be TDD-first around local writer/TUN egress
+  cadence and must include diagnostics that show whether smoltcp/TUN drain is
+  continuous or burst/idle.
+
+## 2026-07-08 - Buffered credit diagnostics may not log when the open decision is unchanged
+
+- Stage: Knife14gq B7 parsing.
+- Symptom: startup confirmed buffered mode and relay metrics showed useful
+  read service, but the expected `tcp-buffered-downlink-credit` lines did not
+  appear in the B7 log because the open buffered decision did not require a
+  later credit change.
+- Cause: the diagnostic is change-oriented. If the controller starts and stays
+  at the open default, the run still has evidence in `tcp-relay-live`, but it
+  lacks a direct per-flow buffered-credit attribution line.
+- Correct behavior: before relying on buffered-credit diagnostics in another
+  acceptance gate, make the controller emit an initial per-flow decision when a
+  relay enters buffered mode, or update the gate parser to treat startup mode
+  plus relay-live read-credit fields as the explicit evidence.

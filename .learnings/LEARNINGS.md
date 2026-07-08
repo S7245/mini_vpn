@@ -4183,3 +4183,30 @@ worth cleaning up separately.
   Knife14gp. The next TDD slice should classify stale repeated STREAM-pending
   samples and preserve a useful read-service floor while accepted egress is
   progressing and hard pressure/drop/failure signals are absent.
+
+## 2026-07-08 - Knife14gq buffered read service fixed 1200B collapse but failed B7
+
+- Result doc:
+  `docs/tech/2026-07-08-knife14gq-buffered-downlink-results.md`
+- Code commit:
+  `8a85ce7` (`fix(knife14gq): add buffered downlink controller`)
+- VPS bundle:
+  `/tmp/mini_vpn/knife14gq_buffered_downlink_20260708/mvpn_knife14gq_buffered_downlink_safe1200_p1_30_usclient_suite_20260708_235459.tar.gz`
+- Outcome: local full gates, remote `.27` focused gates, remote release build,
+  and B7 safe1200 reverse-first P1 all executed. B7 failed the `>30 Mbit/s`
+  gate with `18.3/17.2 Mbit/s`.
+- Useful progress: buffered mode was enabled and fixed the Knife14gp
+  read-credit collapse: `remote_read_service_len_min=65536`,
+  `remote_batch_limit_bytes_min=524288`, `read_credit_pause_updates=0`,
+  `read_credit_limit_bytes_min=524288`.
+- Clean surfaces: direct reverse baseline `278 Mbit/s`, TUN rx/tx drops `0`,
+  send_slice zero/errors `0`, close-tail accounting `0`, and QUIC
+  loss/congestion/blocking deltas `0`.
+- Remaining root: throughput stayed burst/idle with
+  `attribution: local_downlink_backpressure`, one downlink pressure
+  pause/resume edge, `headroom_deferred_bytes=603544`, and data-stream ordered
+  gaps up to about `3581ms`.
+- Reusable rule: preserving a useful TUIC read-service floor is necessary but
+  not sufficient. The next architecture work must target local writer/TUN
+  egress cadence directly and prove continuous drain before claiming a path to
+  `100+ Mbit/s`.

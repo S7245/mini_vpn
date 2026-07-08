@@ -53,6 +53,17 @@
   不再被视为 cheap，统一走已有 async remote-open 状态机；新增 slow-open harness 锁住“一条慢 open 不阻塞另一条 flow”，
   并补 reap epoch 守卫。下一步是复跑 US-client suite 验证 reverse/P2。
   **一个分支只能一个 writer**，每次 commit 后立即 `git push`（曾发生过并发会话 clobber commit）。
+- **2026-07-08 Knife14gq B7 stopped below gate（分支 `codex/knife14d-downlink-reap-open`，commit `8a85ce7`）**：
+  feature-flagged buffered downlink controller passed local/remote gates and
+  fixed the old `1200B` read-service collapse in focused safe1200
+  reverse-first P1 (`remote_read_service_len_min=65536`,
+  `remote_batch_limit_bytes_min=524288`, `read_credit_pause_updates=0`), but
+  B7 still reached only `18.3/17.2 Mbit/s`, below the `>30 Mbit/s` gate.
+  Direct baselines were healthy (`297 Mbit/s` forward receiver,
+  `278 Mbit/s` reverse receiver), TUN/QUIC/close-tail/send-error surfaces were
+  clean, and attribution stayed `local_downlink_backpressure`. Stop condition
+  honored: no B8/B9 was started. Current result doc:
+  `docs/tech/2026-07-08-knife14gq-buffered-downlink-results.md`.
 
 ## 目标（唯一北极星）：`Rules.md`
 

@@ -85,34 +85,45 @@ Latest discriminator:
   collapse to `1200B` under residual local pressure/headroom evidence, not VPS
   capacity, iperf3, MTU, stale pool, broad QUIC windows, or simply sleeping
   stream polling.
+- Knife14gq implemented the B0-B7 feature-flagged buffered downlink
+  architecture. Commit `8a85ce7` promoted `SocketCtx.downlink_pending` into an
+  explicit buffered layer for TUIC read-credit decisions. The B7 focused
+  safe1200 reverse-first P1 did **not** pass: `18.3/17.2 Mbit/s`, below the
+  `>30 Mbit/s` gate. The old read-service collapse was fixed
+  (`remote_read_service_len_min=65536`,
+  `remote_batch_limit_bytes_min=524288`, `read_credit_pause_updates=0`), but
+  throughput stayed `low_average` with
+  `attribution: local_downlink_backpressure`, one local pressure pause/resume
+  edge, and multi-second ordered-stream pending gaps. Buffered read credit is
+  useful but not sufficient; the next architecture target is local
+  writer/egress cadence, not another credit-floor or self-wake tweak.
 
 Current result doc:
 
-- `docs/tech/2026-07-08-knife14gp-post-flush-pressure-debt-results.md`
+- `docs/tech/2026-07-08-knife14gq-buffered-downlink-results.md`
 
 Current follow-up queue:
 
 1. Keep the ordered-default gate, Knife14gm low-byte ACK/window service,
    Knife14gn accepted-flush progress feedback, Knife14go active connection-RX
-   self-wake, and Knife14gp since-last-pending diagnostics/post-flush debt
-   separation; unordered reassembly remains diagnostic only.
+   self-wake, Knife14gp since-last-pending diagnostics/post-flush debt
+   separation, and Knife14gq buffered read-credit isolation; unordered
+   reassembly remains diagnostic only.
 2. Do not continue self-wake timer work as the main branch. Knife14go proved
-   frequent polling, and Knife14gp proved repeated pending windows often have
-   no fresh `conn_rx_stream_frames_since_pending` progress.
-3. Do not keep changing local pressure-credit constants blindly. Knife14gp
-   removed obvious pause/resume edges, but useful read service still collapsed
-   to `1200B` under residual pressure/headroom evidence while TUN drops,
-   send failures, close-tail reaping, and QUIC blocking stayed clean.
-4. Next code slice should classify stale repeated STREAM-pending samples
-   separately from fresh connection progress, then preserve a useful
-   read-service floor during accepted egress progress when hard drop/failure
-   signals are absent.
+   frequent polling, Knife14gp proved repeated pending windows often have no
+   fresh `conn_rx_stream_frames_since_pending` progress, and Knife14gq proved
+   preserving a useful read-service floor alone does not clear `30 Mbit/s`.
+3. Do not keep changing local pressure-credit constants blindly. Knife14gq
+   removed the `1200B` credit-collapse symptom but still failed at
+   `17.2 Mbit/s`.
+4. The next architecture slice, if pursued, must target local writer/egress
+   cadence directly: prove the smoltcp/TUN egress path can drain continuously
+   under reverse TCP pressure without second-scale burst/idle gaps, while
+   keeping bounded pending and hard drop/terminal guards.
 5. The next focused acceptance target is still first `>30 Mbit/s` on the same
-   safe1200 reverse-first P1, not yet `100+`.
-6. After the stale-pending/read-credit-collapse branch clears `>30 Mbit/s`,
-   continue toward clean `100+ Mbit/s`; only after a clean `100+ Mbit/s` repeat
-   exits normally should Knife14 broaden to longer-duration or concurrency
-   sweeps.
+   safe1200 reverse-first P1, not yet `100+`. Do not claim the `100+ Mbit/s`
+   path is clear until a later slice passes `>30` and then a clean `100+`
+   repeat exits normally.
 
 ## Roadmap: TUN transparent proxy (Target extraction)
 
