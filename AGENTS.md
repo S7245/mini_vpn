@@ -87,25 +87,31 @@ results documents.
 
 Current Knife14 summary, as of 2026-07-08:
 
-- Knife14fp changed the throughput root: the final `100+ Mbit/s` bottleneck was
-  not mini_vpn local credit/backpressure after all. The decisive A/B was
-  exit-side Linux socket buffers on `.33`: default `212992B` caps/defaults kept
-  both mini_vpn and a mature sing-box client in the `20-30 Mbit/s` band.
-  Raising `.33` to `rmem_max/wmem_max=16777216` and
+- Knife14fp changed the server-side preflight: exit-side Linux socket buffers
+  are mandatory for `100+ Mbit/s` TUIC acceptance. With the old `.33` defaults
+  (`212992B` caps/defaults), both mini_vpn and a mature sing-box client stayed
+  in the `20-30 Mbit/s` band. Raising `.33` to
+  `rmem_max/wmem_max=16777216` and
   `rmem_default/wmem_default=1048576`, then restarting sing-box, moved the
-  mature sing-box client to `185.242 Mbit/s` receiver and mini_vpn safe1200
-  reverse-first P1 to `114.000 Mbit/s` reported receiver with `stable_high`
-  intervals averaging `189.483 Mbit/s`.
+  mature sing-box client to `185.242 Mbit/s` receiver.
 - The `.33` setting is now persisted in
   `/etc/sysctl.d/99-mini-vpn-quic.conf`. Future VPS acceptance must check
   `net.core.rmem_max`, `net.core.wmem_max`, `net.core.rmem_default`, and
   `net.core.wmem_default` before blaming mini_vpn credit, QUIC MTU, pool size,
-  sing-box version, or TUIC single-stream behavior.
-- Do not lower the target to `30 Mbit/s`. Keep `100+ Mbit/s` as the throughput
-  target. The remaining Knife14 work is high-rate close-tail cleanliness:
-  remove timeout-driven terminal pending reaping and keep `pending_at_close=0`,
-  `terminal_pending_reap=0`, `tun_tx_dropped_delta=0`, and
-  `rx_blocked_stream=0` under the high socket-buffer preflight.
+  sing-box version, or TUIC single-stream behavior. The production install
+  guidance is `docs/tech/2026-07-08-vps-install-and-optimization-guide.md`.
+- Do not lower the target to `30 Mbit/s`; keep `100+ Mbit/s` as the target.
+  However, Knife14fq proved the final 1% is not closed yet: a clean
+  `f8765c1` repeat with `IPERF_TIMEOUT_SECS=120` exited normally and cleaned
+  close-tail accounting (`pending_at_close=0`, `terminal_pending_reap=0`,
+  `tun_tx_dropped_delta=0`, QUIC loss/blocking `0`), but throughput regressed
+  to `35.7 Mbit/s` receiver with local pressure/headroom gating. The earlier
+  Knife14fp mini_vpn `114 Mbit/s` run was high-throughput evidence but exited
+  by timeout and is not sufficient final acceptance by itself.
+- Next Knife14 work must be a focused repeat/A-B and then a local pressure-edge
+  fix if the low result repeats. Do not restart stale pool, iperf3, sing-box
+  liveness/auth, QUIC MTU/PLPMTUD, receive-window shrink, or broad pool work
+  unless new evidence contradicts the Knife14fp/fq bundle pair.
 
 Historical Knife14 summary, as of 2026-07-04:
 

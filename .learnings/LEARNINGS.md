@@ -1,5 +1,33 @@
 # Learnings
 
+## 2026-07-08 - Knife14fq cleans timeout tail but does not close final acceptance
+
+- Stage docs:
+  `docs/tech/2026-07-08-knife14fq-timeout120-clean-tail-regression-results.md`,
+  `docs/tech/2026-07-08-vps-install-and-optimization-guide.md`
+- Log bundle:
+  `/tmp/mini_vpn/knife14fq_socketbuf_timeout120_p1_30/mvpn_knife14fq_socketbuf_timeout120_p1_30_usclient_suite_20260708_094207.tar.gz`
+- Outcome: the clean `f8765c1` repeat used `IPERF_TIMEOUT_SECS=120` and iperf
+  exited normally, but reverse-first P1 regressed to `37.0/35.7 Mbit/s`.
+- What worked: the timeout-driven close-tail was cleaned:
+  `pending_at_close=0`, `terminal_pending_reap=0`, `egress_at_close=0`,
+  `tun_tx_dropped_delta=0`, and QUIC loss/blocking/congestion stayed `0`.
+- What failed: throughput was burst/idle and local pressure returned:
+  `downlink_backpressure pause_edges=1 resume_edges=0`,
+  `may_recv_false=13594`, `headroom_deferred_bytes=17512861`,
+  `pressure_credit_blocked_bytes=923353`, and
+  `hard_edge_guard_deferred_bytes=10524`.
+- What stayed true: exit-side socket buffers are still a mandatory production
+  and acceptance preflight. The mature sing-box client A/B remains valid server
+  evidence, but the mini_vpn high-throughput run must be repeated cleanly before
+  final completion.
+- Reusable rule: do not treat a `100+ Mbit/s` run that exits by external iperf
+  timeout as final acceptance. Require normal iperf exit plus clean close-tail,
+  then only chase local pressure edges that repeat under the high-buffer
+  preflight.
+- Overall Knife14 estimate after this run: `99%`; remaining work is focused
+  repeat/A-B plus a small local pressure-edge fix if the low result repeats.
+
 ## 2026-07-06 - Knife14cr repeats stable high reverse P1 with timer drain off
 
 - Stage docs:

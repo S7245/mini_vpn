@@ -1,5 +1,32 @@
 # Errors
 
+## 2026-07-08 - Knife14fq timeout120 repeat regressed throughput
+
+- Stage: Knife14fq high-buffer clean-tail repeat.
+- Failed bundle:
+  `/tmp/mini_vpn/knife14fq_socketbuf_timeout120_p1_30/mvpn_knife14fq_socketbuf_timeout120_p1_30_usclient_suite_20260708_094207.tar.gz`
+- Symptom: extending `IPERF_TIMEOUT_SECS` from the previous `50s` to `120s`
+  made iperf exit normally and cleaned close-tail metrics, but reverse-first P1
+  reached only `37.0/35.7 Mbit/s` with `throughput_shape=low_average`.
+- Important discriminator: the clean clone at `/home/ubuntu/mini_vpn_accept`
+  used `f8765c1`, and key source/script hashes matched the existing dirty
+  `/home/ubuntu/mini_vpn` working tree. This was not a different-code
+  artifact.
+- Clean surfaces: `pending_at_close=0`, `terminal_pending_reap=0`,
+  `egress_at_close=0`, `tun_tx_dropped_delta=0`, QUIC
+  loss/congestion/blocking/rx_blocked deltas `0`, no send-slice errors, and no
+  TUN flush failures.
+- Remaining failure: local pressure/headroom gating returned during the data
+  window: `downlink_backpressure pause_edges=1 resume_edges=0`,
+  `may_recv_false=13594`, `headroom_deferred_bytes=17512861`,
+  `pressure_credit_blocked_bytes=923353`, and
+  `hard_edge_guard_deferred_bytes=10524`.
+- Correct behavior: stop claiming final `100+ Mbit/s` completion from the
+  Knife14fp timeout-killed high-throughput run. Run a focused repeat/A-B before
+  code changes; if the low shape repeats, fix the local pressure edge rather
+  than changing sing-box, iperf3, stale pools, MTU/PLPMTUD, receive windows, or
+  broad pool settings.
+
 ## 2026-07-06 - Knife14cq remote sync must target repository subdirectories
 
 - Stage: Knife14cq `.27` sync before VPS acceptance.
