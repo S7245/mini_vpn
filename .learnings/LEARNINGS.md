@@ -3987,3 +3987,26 @@ worth cleaning up separately.
   close as transient and continue to the data-plane discriminator. The next
   code stage should be narrow pressure-credit TDD, not TUIC stream/read-service,
   VPS, iperf3, MTU, stale-pool, or broad QUIC-window work.
+
+## 2026-07-08 - Knife14fz sing-box comparison narrows the next fix
+
+- Result doc:
+  `docs/tech/2026-07-08-knife14fz-singbox-client-comparison-and-pressure-credit-plan.md`
+- Evidence compared:
+  current branch `653d62bf`, known data-moving `f8765c1`, and the mature
+  sing-box client path that reached `173/173 Mbit/s` in the same `.27/.33/.77`
+  service window.
+- Outcome: the most useful sing-box lesson is not "copy its QUIC knobs" but
+  "stop suppressing reverse downlink before real pressure arrives." sing-box
+  keeps the TUIC TCP path thin, uses plain full-duplex copy loops, hands
+  backpressure to `net.Conn`/gVisor/TUN, and batches Linux TUN writes.
+- mini_vpn-specific diagnosis: the current branch installs pressure debt on a
+  single target-edge sample and clamps flushes at the derived egress target,
+  even while TUN drops stay `0` and the true pause edge is not reached. This
+  matches the retry signals `may_recv_false=7655`,
+  `headroom_deferred_bytes=10188203`, and
+  `pressure_credit_blocked_bytes=960157`.
+- Reusable rule: before borrowing architecture from a mature client, first
+  remove mini_vpn's own premature local gates. For Knife14 reverse-first,
+  target-edge should be treated as a soft warning until sustained pressure,
+  actual drops, flush failures, or the hard pause edge justify stronger debt.
