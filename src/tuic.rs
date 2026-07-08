@@ -49,6 +49,12 @@ const TUIC_TCP_UNORDERED_CHUNK_READ_MAX_BYTES: usize = 64 * 1024;
 const TUIC_TCP_UNORDERED_REASSEMBLY_MAX_BYTES: usize = 4 * 1024 * 1024;
 const TUIC_TCP_UNORDERED_STAGING_LOG_MS: u128 = 1_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuicTcpRelayMode {
+    Ordered,
+    UnorderedReassembly,
+}
+
 /// TUIC 客户端配置（单一事实源；桌面从 env 加载，移动端将来从 file/FFI 注入）。
 /// 中文要点：凭据(uuid/password)经自定义 Debug **脱敏**，绝不随日志泄漏。
 #[derive(Clone)]
@@ -229,6 +235,25 @@ fn parse_truthy(s: Option<&str>) -> bool {
 fn tcp_diag_enabled() -> bool {
     static TCP_DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *TCP_DIAG.get_or_init(|| parse_truthy(std::env::var("MINI_VPN_TCP_DIAG").ok().as_deref()))
+}
+
+fn parse_tuic_tcp_relay_mode(unordered_reassembly: Option<&str>) -> TuicTcpRelayMode {
+    if parse_truthy(unordered_reassembly) {
+        TuicTcpRelayMode::UnorderedReassembly
+    } else {
+        TuicTcpRelayMode::Ordered
+    }
+}
+
+fn tuic_tcp_relay_mode() -> TuicTcpRelayMode {
+    static MODE: std::sync::OnceLock<TuicTcpRelayMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        parse_tuic_tcp_relay_mode(
+            std::env::var("MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY")
+                .ok()
+                .as_deref(),
+        )
+    })
 }
 
 /// TCP pool 轮询选择。`pool_len` 在生产中恒非 0；纯函数保底处理 0，避免测试/未来误用 panic。
@@ -2519,13 +2544,25 @@ impl ProxyUpstream for TuicUpstream {
             let tcp_stream_diag = diag_meta
                 .clone()
                 .map(|meta| TuicTcpStreamDiag::new(meta, Instant::now()));
-            // 用 unordered QUIC chunks 释放流内 HoL，再在本地按 offset 重组成有序字节流。
-            Ok::<RelayStream, ClientError>(Box::new(TrackedRelayStream::new_with_transport(
-                TuicChunkRelayStream::new(recv, send, diag_meta),
-                lease,
-                tcp_stream_diag,
-                conn.clone(),
-            )))
+            let relay: RelayStream = match tuic_tcp_relay_mode() {
+                TuicTcpRelayMode::Ordered => Box::new(TrackedRelayStream::new_with_transport(
+                    tokio::io::join(recv, send),
+                    lease,
+                    tcp_stream_diag,
+                    conn.clone(),
+                )),
+                TuicTcpRelayMode::UnorderedReassembly => {
+                    // Knife14ft：unordered chunk reassembly is diagnostic-only. It exposes
+                    // stream offset gaps, but must not be the default data path.
+                    Box::new(TrackedRelayStream::new_with_transport(
+                        TuicChunkRelayStream::new(recv, send, diag_meta),
+                        lease,
+                        tcp_stream_diag,
+                        conn.clone(),
+                    ))
+                }
+            };
+            Ok::<RelayStream, ClientError>(relay)
         };
         tokio::time::timeout(TUIC_OPEN_TIMEOUT, open)
             .await
@@ -2728,6 +2765,40 @@ mod tests {
         assert_eq!(
             parse_quic_stats_secs(Some("nope"), Some("1"), Some("5")),
             None
+        );
+    }
+
+    #[test]
+    fn tuic_tcp_relay_mode_defaults_to_ordered_and_gates_unordered_reassembly() {
+        assert_eq!(parse_tuic_tcp_relay_mode(None), TuicTcpRelayMode::Ordered);
+        assert_eq!(
+            parse_tuic_tcp_relay_mode(Some("")),
+            TuicTcpRelayMode::Ordered
+        );
+        assert_eq!(
+            parse_tuic_tcp_relay_mode(Some("0")),
+            TuicTcpRelayMode::Ordered
+        );
+        assert_eq!(
+            parse_tuic_tcp_relay_mode(Some("false")),
+            TuicTcpRelayMode::Ordered
+        );
+
+        assert_eq!(
+            parse_tuic_tcp_relay_mode(Some("1")),
+            TuicTcpRelayMode::UnorderedReassembly
+        );
+        assert_eq!(
+            parse_tuic_tcp_relay_mode(Some("true")),
+            TuicTcpRelayMode::UnorderedReassembly
+        );
+        assert_eq!(
+            parse_tuic_tcp_relay_mode(Some("on")),
+            TuicTcpRelayMode::UnorderedReassembly
+        );
+        assert_eq!(
+            parse_tuic_tcp_relay_mode(Some("yes")),
+            TuicTcpRelayMode::UnorderedReassembly
         );
     }
 
