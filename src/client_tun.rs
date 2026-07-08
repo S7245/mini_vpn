@@ -1951,15 +1951,20 @@ impl DownlinkCreditController {
             return ack_drain_floor;
         }
         let adaptive_ack_drain_max = relay_remote_read_adaptive_ack_drain_max_bytes(tun_mtu);
+        let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
         let pause_headroom = tx_queue_pause_threshold(cfg).saturating_sub(local_pressure_bytes);
         let adaptive = if local_pressure_bytes >= tx_queue_egress_target_threshold(cfg) {
-            if local_pressure_bytes >= tx_queue_credit_spend_threshold(cfg)
-                || self.adaptive_ack_drain_bytes <= ack_drain_floor
-            {
+            if self.adaptive_ack_drain_bytes <= ack_drain_floor {
                 ack_drain_floor
             } else {
+                let adaptive_cap = if local_pressure_bytes >= tx_queue_credit_spend_threshold(cfg) {
+                    pressure_floor
+                } else {
+                    adaptive_ack_drain_max
+                };
                 self.adaptive_ack_drain_bytes
                     .min(adaptive_ack_drain_max)
+                    .min(adaptive_cap)
                     .min(pause_headroom.max(ack_drain_floor))
                     .max(ack_drain_floor)
             }
@@ -10080,11 +10085,12 @@ mod tests {
     }
 
     #[test]
-    fn downlink_credit_controller_clamps_adaptive_ack_drain_near_high_water() {
+    fn downlink_credit_controller_keeps_adaptive_ack_drain_at_credit_edge_while_progressing() {
         let cfg = DownlinkBackpressureConfig::default();
         let tun_mtu = 1200;
         let ack_drain_floor = relay_remote_read_ack_drain_floor_bytes(tun_mtu);
         let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        let pause_edge = tx_queue_pause_threshold(cfg);
         let mut controller = DownlinkCreditController::default();
         let progressed = DownlinkFlushLimit {
             len: pressure_floor,
@@ -10121,13 +10127,17 @@ mod tests {
         );
         let credit = controller.read_credit_for(base, 0, cfg, tun_mtu);
 
-        assert_eq!(
-            credit,
-            RelayReadCredit {
-                paused: false,
-                max_batch_bytes: ack_drain_floor,
-            },
-            "near the credit high-water edge, adaptive drain must clamp back to the tiny floor"
+        assert!(
+            !credit.paused && credit.max_batch_bytes > ack_drain_floor,
+            "clean egress progress should keep useful ACK/window drain at the credit edge: credit={credit:?}, ack_floor={ack_drain_floor}"
+        );
+        assert!(
+            credit.max_batch_bytes <= pressure_floor,
+            "credit edge ACK/window drain must stay pressure bounded: credit={credit:?}, pressure_floor={pressure_floor}"
+        );
+        assert!(
+            credit.max_batch_bytes <= pause_edge - local_pressure_bytes,
+            "credit edge ACK/window drain must not project past the hard pause edge"
         );
     }
 
