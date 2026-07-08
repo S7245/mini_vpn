@@ -42,6 +42,7 @@ const TUIC_TCP_POOL_AUX_CONNECT_RETRY_BASE_MS: u64 = 250;
 const DEFAULT_TUIC_QUIC_STATS_SECS: u64 = 30;
 const TUIC_TCP_STREAM_READ_GAP_LOG_MS: u128 = 1_000;
 const TUIC_TCP_STREAM_PENDING_LOG_MS: u128 = TUIC_TCP_STREAM_READ_GAP_LOG_MS;
+const TUIC_TCP_STREAM_PENDING_SELF_WAKE_MS: u64 = 2;
 
 /// TUIC 客户端配置（单一事实源；桌面从 env 加载，移动端将来从 file/FFI 注入）。
 /// 中文要点：凭据(uuid/password)经自定义 Debug **脱敏**，绝不随日志泄漏。
@@ -300,6 +301,7 @@ struct TrackedRelayStream<S> {
     inner: S,
     tcp_diag: Option<TuicTcpStreamDiag>,
     transport_conn: Option<Connection>,
+    pending_self_wake_deadline: Option<Instant>,
     _lease: TcpPoolSlotLease,
 }
 
@@ -310,6 +312,7 @@ impl<S> TrackedRelayStream<S> {
             inner,
             tcp_diag,
             transport_conn: None,
+            pending_self_wake_deadline: None,
             _lease: lease,
         }
     }
@@ -324,8 +327,19 @@ impl<S> TrackedRelayStream<S> {
             inner,
             tcp_diag,
             transport_conn: Some(transport_conn),
+            pending_self_wake_deadline: None,
             _lease: lease,
         }
+    }
+
+    fn arm_pending_self_wake(&mut self, cx: &Context<'_>, now: Instant) {
+        let deadline = now + Duration::from_millis(TUIC_TCP_STREAM_PENDING_SELF_WAKE_MS);
+        self.pending_self_wake_deadline = Some(deadline);
+        let waker = cx.waker().clone();
+        tokio::spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            waker.wake();
+        });
     }
 }
 
@@ -337,6 +351,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for TrackedRelayStream<S> {
     ) -> Poll<std::io::Result<()>> {
         let before_len = buf.filled().len();
         let now = Instant::now();
+        if matches!(self.pending_self_wake_deadline, Some(deadline) if deadline <= now) {
+            self.pending_self_wake_deadline = None;
+        }
         if let Some(diag) = self.tcp_diag.as_mut() {
             diag.note_poll_at(now);
         }
@@ -344,6 +361,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for TrackedRelayStream<S> {
         match &poll {
             Poll::Ready(Ok(())) => {
                 let read_bytes = buf.filled().len().saturating_sub(before_len);
+                if read_bytes > 0 {
+                    self.pending_self_wake_deadline = None;
+                }
                 let transport = self
                     .transport_conn
                     .as_ref()
@@ -385,6 +405,25 @@ impl<S: AsyncRead + Unpin> AsyncRead for TrackedRelayStream<S> {
                     .transport_conn
                     .as_ref()
                     .map(sample_tuic_stream_transport);
+                let pending_cause =
+                    if let (Some(diag), Some(sample)) = (self.tcp_diag.as_ref(), transport) {
+                        classify_tuic_stream_pending_cause(Some(TuicStreamTransportPending {
+                            sample,
+                            since_last_read: transport_delta(
+                                diag.last_read_transport_sample.unwrap_or_default(),
+                                sample,
+                            ),
+                        }))
+                    } else {
+                        TuicTcpStreamPendingCause::NoTransportSample
+                    };
+                if should_arm_tuic_stream_pending_self_wake(
+                    pending_cause,
+                    self.pending_self_wake_deadline,
+                    now,
+                ) {
+                    self.arm_pending_self_wake(cx, now);
+                }
                 if let Some(diag) = self.tcp_diag.as_mut()
                     && let Some(event) = diag.note_pending_at(now, transport)
                 {
@@ -399,6 +438,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for TrackedRelayStream<S> {
                             event.max_poll_gap_ms,
                             event.rx_bytes,
                             event.reads,
+                            event.pending_cause,
                             event.transport
                         )
                     );
@@ -996,6 +1036,55 @@ struct TuicStreamTransportPending {
     since_last_read: TuicStreamTransportDelta,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuicTcpStreamPendingCause {
+    NoTransportSample,
+    NoConnectionRx,
+    ConnectionRxNoStreamFrames,
+    ConnectionStreamFramesPending,
+}
+
+impl TuicTcpStreamPendingCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoTransportSample => "no_transport_sample",
+            Self::NoConnectionRx => "no_connection_rx",
+            Self::ConnectionRxNoStreamFrames => "connection_rx_no_stream_frames",
+            Self::ConnectionStreamFramesPending => "connection_stream_frames_pending",
+        }
+    }
+}
+
+fn classify_tuic_stream_pending_cause(
+    transport: Option<TuicStreamTransportPending>,
+) -> TuicTcpStreamPendingCause {
+    let Some(transport) = transport else {
+        return TuicTcpStreamPendingCause::NoTransportSample;
+    };
+    if transport.since_last_read.rx_stream_frames > 0 {
+        return TuicTcpStreamPendingCause::ConnectionStreamFramesPending;
+    }
+    if transport.since_last_read.udp_rx_datagrams > 0 || transport.since_last_read.udp_rx_bytes > 0
+    {
+        return TuicTcpStreamPendingCause::ConnectionRxNoStreamFrames;
+    }
+    TuicTcpStreamPendingCause::NoConnectionRx
+}
+
+fn should_arm_tuic_stream_pending_self_wake(
+    cause: TuicTcpStreamPendingCause,
+    armed_deadline: Option<Instant>,
+    now: Instant,
+) -> bool {
+    if cause != TuicTcpStreamPendingCause::ConnectionStreamFramesPending {
+        return false;
+    }
+    match armed_deadline {
+        Some(deadline) => deadline <= now,
+        None => true,
+    }
+}
+
 /// 格式化 QUIC 连接级诊断（刀14y）。
 /// 中文要点：`tx_blocked` 是本端发送 DATA_BLOCKED/STREAM_DATA_BLOCKED，直接指向对端 flow-control；
 /// `cwnd/lost/congestion_events` 指向拥塞/丢包。两组指标一起看，下一轮 acceptance 不再盲猜。
@@ -1096,6 +1185,7 @@ struct TuicTcpStreamPendingEvent {
     max_poll_gap_ms: u128,
     rx_bytes: u64,
     reads: u64,
+    pending_cause: TuicTcpStreamPendingCause,
     transport: Option<TuicStreamTransportPending>,
 }
 
@@ -1212,6 +1302,7 @@ impl TuicTcpStreamDiag {
                 sample,
             ),
         });
+        let pending_cause = classify_tuic_stream_pending_cause(transport);
         Some(TuicTcpStreamPendingEvent {
             pending_gap_ms,
             pending_polls: self.pending_polls,
@@ -1219,6 +1310,7 @@ impl TuicTcpStreamDiag {
             max_poll_gap_ms: self.max_poll_gap_ms,
             rx_bytes: self.rx_bytes,
             reads: self.reads,
+            pending_cause,
             transport,
         })
     }
@@ -1299,10 +1391,11 @@ fn format_tuic_tcp_stream_pending_line(
     max_poll_gap_ms: u128,
     rx_bytes: u64,
     reads: u64,
+    pending_cause: TuicTcpStreamPendingCause,
     transport: Option<TuicStreamTransportPending>,
 ) -> String {
     let mut line = format!(
-        "🔎 tuic-tcp-stream-pending target={} conn={} id={} stream={} pending_gap_ms={} pending_polls={} polls={} max_poll_gap_ms={} rx_bytes={} reads={}",
+        "🔎 tuic-tcp-stream-pending target={} conn={} id={} stream={} pending_gap_ms={} pending_polls={} polls={} max_poll_gap_ms={} rx_bytes={} reads={} pending_cause={}",
         meta.target,
         meta.conn_index,
         meta.stable_id,
@@ -1312,7 +1405,8 @@ fn format_tuic_tcp_stream_pending_line(
         polls,
         max_poll_gap_ms,
         rx_bytes,
-        reads
+        reads,
+        pending_cause.as_str()
     );
     if let Some(transport) = transport {
         line.push_str(&format!(
@@ -1556,8 +1650,8 @@ impl TuicUpstream {
             "🪟 QUIC flow windows: bidi={} uni={} stream_rx={}B conn_rx={}B send={}B",
             quic::QUIC_MAX_CONCURRENT_BIDI_STREAMS,
             quic::QUIC_MAX_CONCURRENT_UNI_STREAMS,
-            quic::QUIC_STREAM_RECEIVE_WINDOW_BYTES,
-            quic::QUIC_RECEIVE_WINDOW_BYTES,
+            quic::quic_stream_receive_window_bytes(mtu_policy),
+            quic::quic_receive_window_bytes(mtu_policy),
             quic::QUIC_SEND_WINDOW_BYTES
         );
         let tcp_pool = cfg.tcp_pool.clamp(MIN_TUIC_TCP_POOL, MAX_TUIC_TCP_POOL);
@@ -2408,8 +2502,17 @@ mod tests {
         let meta = TuicTcpStreamDiagMeta::new(&target, 3, 42, 8);
         let first = format_tuic_tcp_stream_first_rx_line(&meta, 20_500, 35_244, 1);
         let gap = format_tuic_tcp_stream_read_gap_line(&meta, 15_000, 39_884, 2, 75_128);
-        let pending =
-            format_tuic_tcp_stream_pending_line(&meta, 12_000, 24, 31, 5_000, 75_128, 2, None);
+        let pending = format_tuic_tcp_stream_pending_line(
+            &meta,
+            12_000,
+            24,
+            31,
+            5_000,
+            75_128,
+            2,
+            TuicTcpStreamPendingCause::NoTransportSample,
+            None,
+        );
         let close_snapshot = TuicTcpStreamCloseSnapshot {
             first_rx_ms: 20_500,
             max_read_gap_ms: 15_000,
@@ -2484,9 +2587,14 @@ mod tests {
             250,
             75_128,
             2,
+            TuicTcpStreamPendingCause::ConnectionStreamFramesPending,
             Some(transport),
         );
 
+        assert!(
+            pending.contains("pending_cause=connection_stream_frames_pending"),
+            "{pending}"
+        );
         assert!(pending.contains("conn_udp_rx=101/200000B"), "{pending}");
         assert!(
             pending.contains("conn_udp_rx_since_read=11/35000B"),
@@ -2505,6 +2613,91 @@ mod tests {
             pending.contains("conn_plpmtud(sent=5,lost=2,black_holes=1)"),
             "{pending}"
         );
+    }
+
+    #[test]
+    fn tuic_tcp_stream_pending_cause_classifies_transport_progress_since_read() {
+        assert_eq!(
+            classify_tuic_stream_pending_cause(None),
+            TuicTcpStreamPendingCause::NoTransportSample
+        );
+
+        let no_connection_rx = TuicStreamTransportPending {
+            sample: TuicStreamTransportSample {
+                udp_rx_datagrams: 100,
+                udp_rx_bytes: 200_000,
+                rx_stream_frames: 30,
+                rx_ack_frames: 40,
+                tx_ack_frames: 50,
+                sent_plpmtud_probes: 0,
+                lost_plpmtud_probes: 0,
+                black_holes_detected: 0,
+            },
+            since_last_read: TuicStreamTransportDelta::default(),
+        };
+        assert_eq!(
+            classify_tuic_stream_pending_cause(Some(no_connection_rx)),
+            TuicTcpStreamPendingCause::NoConnectionRx
+        );
+
+        let connection_rx_no_stream_frames = TuicStreamTransportPending {
+            since_last_read: TuicStreamTransportDelta {
+                udp_rx_datagrams: 12,
+                udp_rx_bytes: 14_000,
+                rx_stream_frames: 0,
+            },
+            ..no_connection_rx
+        };
+        assert_eq!(
+            classify_tuic_stream_pending_cause(Some(connection_rx_no_stream_frames)),
+            TuicTcpStreamPendingCause::ConnectionRxNoStreamFrames
+        );
+
+        let stream_frames_pending = TuicStreamTransportPending {
+            since_last_read: TuicStreamTransportDelta {
+                udp_rx_datagrams: 12,
+                udp_rx_bytes: 14_000,
+                rx_stream_frames: 3,
+            },
+            ..no_connection_rx
+        };
+        assert_eq!(
+            classify_tuic_stream_pending_cause(Some(stream_frames_pending)),
+            TuicTcpStreamPendingCause::ConnectionStreamFramesPending
+        );
+    }
+
+    #[test]
+    fn tuic_stream_pending_self_wake_only_arms_for_stream_frames_after_deadline() {
+        let now = Instant::now();
+        let future = now + Duration::from_millis(10);
+        let past = now - Duration::from_millis(1);
+
+        assert!(should_arm_tuic_stream_pending_self_wake(
+            TuicTcpStreamPendingCause::ConnectionStreamFramesPending,
+            None,
+            now
+        ));
+        assert!(!should_arm_tuic_stream_pending_self_wake(
+            TuicTcpStreamPendingCause::ConnectionStreamFramesPending,
+            Some(future),
+            now
+        ));
+        assert!(should_arm_tuic_stream_pending_self_wake(
+            TuicTcpStreamPendingCause::ConnectionStreamFramesPending,
+            Some(past),
+            now
+        ));
+        assert!(!should_arm_tuic_stream_pending_self_wake(
+            TuicTcpStreamPendingCause::ConnectionRxNoStreamFrames,
+            None,
+            now
+        ));
+        assert!(!should_arm_tuic_stream_pending_self_wake(
+            TuicTcpStreamPendingCause::NoConnectionRx,
+            Some(past),
+            now
+        ));
     }
 
     #[test]

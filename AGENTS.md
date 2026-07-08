@@ -85,7 +85,29 @@ throughput branch, prioritize the 2026 Knife14 documents, especially the
 US-client results, downlink/backpressure/lifecycle specs, and the latest
 results documents.
 
-Current Knife14 summary, as of 2026-07-04:
+Current Knife14 summary, as of 2026-07-08:
+
+- Knife14fp changed the throughput root: the final `100+ Mbit/s` bottleneck was
+  not mini_vpn local credit/backpressure after all. The decisive A/B was
+  exit-side Linux socket buffers on `.33`: default `212992B` caps/defaults kept
+  both mini_vpn and a mature sing-box client in the `20-30 Mbit/s` band.
+  Raising `.33` to `rmem_max/wmem_max=16777216` and
+  `rmem_default/wmem_default=1048576`, then restarting sing-box, moved the
+  mature sing-box client to `185.242 Mbit/s` receiver and mini_vpn safe1200
+  reverse-first P1 to `114.000 Mbit/s` reported receiver with `stable_high`
+  intervals averaging `189.483 Mbit/s`.
+- The `.33` setting is now persisted in
+  `/etc/sysctl.d/99-mini-vpn-quic.conf`. Future VPS acceptance must check
+  `net.core.rmem_max`, `net.core.wmem_max`, `net.core.rmem_default`, and
+  `net.core.wmem_default` before blaming mini_vpn credit, QUIC MTU, pool size,
+  sing-box version, or TUIC single-stream behavior.
+- Do not lower the target to `30 Mbit/s`. Keep `100+ Mbit/s` as the throughput
+  target. The remaining Knife14 work is high-rate close-tail cleanliness:
+  remove timeout-driven terminal pending reaping and keep `pending_at_close=0`,
+  `terminal_pending_reap=0`, `tun_tx_dropped_delta=0`, and
+  `rx_blocked_stream=0` under the high socket-buffer preflight.
+
+Historical Knife14 summary, as of 2026-07-04:
 
 - Stale TUIC TCP pool slot diagnosis is closed. The accepted fix was
   `7c683b0` plus acceptance record `afb18f5`, with the key signal

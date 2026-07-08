@@ -3560,3 +3560,237 @@ worth cleaning up separately.
   adaptive ACK drain again. The next discriminator belongs around local FIN
   ordering, read-only-after-local-finish behavior, and TUIC stream pending/read
   wakeups while remote payload is still expected.
+
+## 2026-07-07 - Knife14er-es-et separates pressure control from ACK/window cadence
+
+- Result doc:
+  `docs/tech/2026-07-07-knife14er-et-downlink-credit-followup-results.md`
+- Bundles:
+  `/tmp/mini_vpn/knife14er_half_closed_gap_hint_p1_30/mvpn_knife14er_half_closed_gap_hint_p1_30_usclient_suite_20260707_182258.tar.gz`,
+  `/tmp/mini_vpn/knife14es_floor_aware_credit_p1_30/mvpn_knife14es_floor_aware_credit_p1_30_usclient_suite_20260707_182841.tar.gz`,
+  `/tmp/mini_vpn/knife14et_progress_staging_p1_30b/mvpn_knife14et_progress_staging_p1_30b_usclient_suite_20260707_183653.tar.gz`
+- Outcome: local TDD, full local gates, `.27` focused tests, and release build
+  passed, but VPS acceptance did not reach the `100+ Mbit/s` receiver target.
+- Useful sequence: Knife14er cleared the half-closed no-data shape but returned
+  to local pressure (`22.8/21.7 Mbit/s`, `read_credit_limit_bytes_min=24`);
+  Knife14es removed tiny residual credit but stayed local-pressure-limited
+  (`23.5/21.7 Mbit/s`); Knife14et removed local pressure entirely but fell into
+  a no-data stream-starvation shape (`0.769/0.042 Mbit/s`).
+- Clean surfaces in the valid final run: direct and exit-to-target baselines
+  were healthy, `tun_tx_dropped_delta=0`, QUIC loss/congestion/blocking `0`,
+  `pending_at_close=0`, `egress_at_close=0`, and
+  `terminal_pending_reap=0`.
+- Root refinement: local egress pressure and reverse TCP ACK/window cadence are
+  different control loops. A clean local pressure surface does not imply the
+  target sender is receiving enough upstream ACK/window progress.
+- Reusable rule: pause threshold tuning when the run reports
+  `local_pressure=0`, `pending_total_max=0`,
+  `headroom_deferred_bytes=0`, and `read_credit_limit_bytes_min=65536` but
+  still has large `tuic_stream_pending` / `relay_remote_read_gap` values. The
+  next stage needs ACK propagation / FIN-ordering diagnostics or a split
+  controller architecture, not another headroom constant.
+
+## 2026-07-07 - Knife14eu rejects FIN deferral and narrows the last branch
+
+- Result doc:
+  `docs/tech/2026-07-07-knife14eu-ack-window-discriminator-results.md`
+- VPS bundle:
+  `/tmp/mini_vpn/knife14eu_ack_window_discriminator_p1_30/mvpn_knife14eu_ack_window_discriminator_p1_30_usclient_suite_20260707_193254.tar.gz`
+- Outcome: local gates, `.27` focused gates, release build, and safe1200
+  reverse-first P1 completed, but acceptance failed at `20.8/19.8 Mbit/s`.
+- Useful discriminator: the data stream had `local_finish_events=0`,
+  `remote_after_local_finish_bytes=0`, and
+  `data_max_read_gap_after_finish_ms=0`; the largest data read gap
+  (`7002ms`) happened before local finish. The optional FIN-deferral A/B is
+  therefore not the next code path.
+- Remaining root: local pressure returned (`pause_edges=3/2`,
+  `may_recv_false=14046`, `headroom_deferred_bytes=41455269`,
+  `send_queue_max=557386`) while QUIC remained clean and stream frames were
+  present. TUN RX gap-hint drains alone did not prevent multi-second sender
+  stalls.
+- Reusable rule: after Knife14eu, split payload egress pressure from
+  ACK/window cadence. Keep payload staging bounded near the TUN edge, but give
+  a separate bounded multi-MTU ACK/window drain path when QUIC is clean and
+  stream read/pending gaps grow. Do not spend the next stage on FIN deferral,
+  MTU/PLPMTUD, stale pool, sing-box, or iperf3.
+
+## 2026-07-07 - Knife14ev rejects short-lived ACK cadence boost as the final fix
+
+- Result doc:
+  `docs/tech/2026-07-07-knife14ev-ack-cadence-controller-results.md`
+- VPS bundle:
+  `/tmp/mini_vpn/knife14ev_ack_cadence_p1_30/mvpn_knife14ev_ack_cadence_p1_30_usclient_suite_20260707_210539.tar.gz`
+- Outcome: local gates, `.27` focused gates, release build, and safe1200
+  reverse-first P1 completed, but acceptance failed at `16.0/14.9 Mbit/s`.
+- Useful discriminator: the new hook was wired and active
+  (`relay_gap_hints events=59`, `max_cadence_floor=19200`), but throughput
+  still stayed low and the data relay still reported
+  `read_credit_limit_bytes_min=1200`.
+- Clean surfaces stayed clean: direct and exit-to-target baselines were
+  healthy, QUIC loss/congestion/blocking stayed `0`, `tun_tx_dropped_delta=0`,
+  `terminal_pending_reap=0`, `pending_at_close=0`, and `egress_at_close=0`.
+- Remaining root: the pressure edge still controls the effective payload read
+  lane. Repeated `projected_payload_credit_edge` debt pushed pressure beyond
+  the credit edge, then relay credit paused even though the ACK cadence boost
+  had fired.
+- Reusable rule: do not keep increasing the short-lived cadence boost or TUN RX
+  drain budget after Knife14ev. The next branch needs an explicit continuous
+  ACK/window service lane separated from payload staging, with payload credit
+  granted from measured TUN egress progress rather than one-shot gap hints.
+
+## 2026-07-07 - Knife14ew rejects egress-earned payload credit as the final fix
+
+- Result doc:
+  `docs/tech/2026-07-07-knife14ew-egress-earned-payload-credit-results.md`
+- VPS bundle:
+  `/tmp/mini_vpn/knife14ew_egress_tokens_p1_30/mvpn_knife14ew_egress_tokens_p1_30_usclient_suite_20260707_220735.tar.gz`
+- Outcome: local TDD, full local gates, `.27` focused gates, release build, and
+  safe1200 reverse-first P1 completed, but acceptance failed at
+  `0.979/0.046 Mbit/s`.
+- Useful discriminator: the new payload token reservoir earned credit
+  (`egress_payload_credit_bytes=122727`) and local pressure was gone
+  (`pending_total_max=0`, `headroom_deferred_bytes=0`,
+  `pressure_credit_debt_bytes=0`), so the failure was not caused by the local
+  pending/backpressure controller being too tight.
+- Clean surfaces stayed clean: direct and exit-to-target baselines were
+  healthy, QUIC client-side loss/congestion/blocking stayed `0`,
+  `tun_tx_dropped_delta=0`, `terminal_pending_reap=0`, `pending_at_close=0`,
+  and `egress_at_close=0`.
+- Remaining root: pressure-free TUIC stream starvation or ACK/window service.
+  The data stream had `read_credit_limit_bytes_min=65536`, but still saw
+  `data_max_read_gap_ms=23974`, `data_pending_gap_max_ms=23247`, and
+  target-sender-stalled/no-data throughput.
+- Reusable rule: when a reverse-first run has clean local pressure and earned
+  egress tokens but `conn_udp_rx_since_read` / connection stream-frame counters
+  grow while the active stream read remains pending, stop tuning payload credit.
+  The next branch needs stream-pending diagnostics and ACK/window uplink service
+  evidence, not larger downlink credit caps.
+
+## 2026-07-07 - Knife14ex validates ACK service but rejects widening it as the final fix
+
+- Result doc:
+  `docs/tech/2026-07-07-knife14ex-active-flow-ack-window-service-results.md`
+- VPS bundle:
+  `/tmp/mini_vpn/knife14ex_active_ack_lane_p1_30/mvpn_knife14ex_active_ack_lane_p1_30_usclient_suite_20260707_231150.tar.gz`
+- Outcome: local gates, `.27` focused gates, release build, clippy, and
+  safe1200 reverse-first P1 completed, but acceptance failed at
+  `17.8/16.7 Mbit/s`.
+- Useful progress: the bounded default active-flow ACK/window lane was active
+  (`10ms`) and raised TUN RX service to `11770` attempts / `14090` TCP packets.
+  The run moved from Knife14ew's `no_data` shape to `low_average`.
+- Useful discriminator: `tuic_stream_pending_causes` was dominated by
+  `connection_stream_frames_pending=18`, with `no_connection_rx=0`. The active
+  stream was pending while connection-level stream frames advanced; this is not
+  solved by more TUN ACK drain alone.
+- Remaining root: once data moved again, local egress/headroom pressure returned
+  (`send_queue_max=557386`, `may_recv_false=13443`,
+  `headroom_deferred_bytes=16754655`, `pending_total_max=212852`) while QUIC
+  loss/congestion/blocking and TUN drops stayed clean.
+- Reusable rule: keep the bounded ACK/window lane because it helped, but stop
+  widening timer duration, TUN RX budget, cadence floor, or payload-token caps
+  for this evidence. The next branch should stabilize relay/TUIC stream read
+  service and the local egress target/headroom loop together, with deterministic
+  tests before another VPS run.
+
+## 2026-07-08 - Knife14ey localizes read-service and adds an egress target
+
+- Result doc:
+  `docs/tech/2026-07-08-knife14ey-read-service-egress-target-local-results.md`
+- Outcome: local implementation, full local gates, `.27` focused gates, release
+  build, clippy, and safe1200 reverse-first P1 completed. Acceptance still
+  failed at `25.5/24.2 Mbit/s`.
+- Useful local change: `run_relay_reader` now owns the remote
+  `read(...).await` future. Relay supervisor events such as writer signals,
+  diagnostics, ACK hint ticks, and ordinary credit updates no longer rebuild
+  the pending remote read future. ACK hint timing remains in the supervisor so
+  it can request TUN RX service without cancelling stream reads.
+- Useful control change: ordinary payload drain credit and projected pressure
+  debt now target `tx_queue_egress_target_threshold`, halfway between clean
+  flush and the old credit-spend edge. At/above that target, cadence boosts
+  collapse to the ACK/window floor instead of allowing multi-MTU payload
+  staging.
+- Useful VPS improvement: during active transfer the ordinary payload loop was
+  better behaved (`send_queue_max=447679`, `may_recv_false=0`,
+  `headroom_deferred_bytes=72259` at roughly `72MB` delivered), so the
+  read-service split plus egress target is not a no-op.
+- Remaining root: the failure moved to the terminal/CloseWait tail. After
+  iperf close, local TCP reported `may_recv=false`, pending stayed nonzero,
+  and close-drain pushed `send_queue_max` back to the old credit edge
+  (`557386`) with `may_recv_false=11961` and
+  `headroom_deferred_bytes=14717970`.
+- Reusable rule: when active-transfer pressure improves but close-tail pressure
+  returns, do not widen ACK cadence or target constants. Make terminal
+  CloseWait drain target-aware and driven by measured local egress progress
+  before the next VPS acceptance run.
+
+## 2026-07-08 - Knife14fi-fo closes local credit as the primary root
+
+- Result doc:
+  `docs/tech/2026-07-08-knife14fi-fo-downlink-credit-stream-gap-results.md`
+- Outcome: local TDD, full local gates, `.27` focused gates, release build,
+  clippy, direct `.33 <-> .77` baselines, and five scoped reverse-first P1
+  suites completed. Acceptance still failed; the best kept code path was
+  Knife14fm at `25.9/24.7 Mbit/s`.
+- Useful kept changes: progress-sensitive downlink credit, QUIC UDP socket
+  buffer configuration, clean empty-staging full-batch read credit, and TUIC
+  stream-pending diagnostics/self-wake. Safe1200 keeps normal QUIC receive
+  windows.
+- Rejected branches: relay read-service ticks did not fix the remote read gap
+  and reintroduced pressure; unordered TUIC chunk reads collapsed throughput;
+  safe1200 `1MB/4MB` receive windows introduced `rx_blocked`; pool size `1`
+  was worse; default MTU/PLPMTUD was not better than safe1200.
+- Strong discriminator: after local pressure was clean or near clean
+  (`pending_max=0`, `may_recv_false` near `0`, no TUN drops, no QUIC
+  loss/congestion/blocking), the active TUIC data stream still had repeated
+  multi-second remote read/pending gaps around `3.4s` to `5.6s`.
+- Reusable rule: once pending/headroom/may_recv are clean but TUIC stream read
+  gaps remain, stop tuning local credit, egress pacer, TUN RX budgets,
+  MTU/PLPMTUD, receive-window shrink, or pool size. The next branch must be a
+  mature TUIC/sing-box client A/B or protocol-level QUIC stream delivery trace
+  on the `.33 -> .27` leg.
+
+## 2026-07-08 - Mature sing-box client A/B is also slow
+
+- Result doc:
+  `docs/tech/2026-07-08-knife14fi-fo-downlink-credit-stream-gap-results.md`
+- Outcome: the mature-client A/B completed on `.27` with official sing-box
+  `v1.13.14`. A TUN inbound routed only `.77/32` through TUIC to `.33`; the
+  route to `.33` stayed on `eth0`, avoiding a proxy loop. Temporary runtime
+  configs with TUIC credentials were removed after the run.
+- Results: sing-box client MTU `1200` reached `18.278/17.196 Mbit/s`; sing-box
+  client MTU `1500` reached `29.497/27.751 Mbit/s`; same-window direct
+  `.33 -> .77` reverse control reached `209.141/205.814 Mbit/s`.
+- Server-side discriminator: `.33` TUIC inbound was configured with
+  `congestion_control=bbr` and `zero_rtt_handshake=true`, so the reverse
+  QUIC sender was not simply stuck on a conservative cubic-only server default.
+- Reusable rule: if a mature sing-box client on the same `.27/.33/.77` topology
+  is also capped around `20-30 Mbit/s`, stop treating the last 100M gap as a
+  mini_vpn client-local controller bug. Move to sing-box server-side behavior,
+  TUIC single-stream delivery limits, provider/path UDP behavior on `.33 -> .27`,
+  or a controlled custom-exit architecture.
+
+## 2026-07-08 - Knife14fp unlocks 100M with exit-side socket buffers
+
+- Result doc:
+  `docs/tech/2026-07-08-knife14fp-server-socket-buffer-results.md`
+- Outcome: the server-side socket buffer A/B succeeded. `.33` defaults were
+  only `212992B` for `net.core.rmem_max`, `wmem_max`, `rmem_default`, and
+  `wmem_default`. Raising max to `16777216` and defaults to `1048576`, then
+  restarting sing-box, moved the mature sing-box client from `27.751 Mbit/s`
+  receiver to `185.242 Mbit/s`.
+- mini_vpn validation: with the same `.33` high-buffer setting, safe1200
+  reverse-first P1 reached a reported `114.000 Mbit/s` receiver and
+  `throughput_shape=stable_high`; the 29 non-zero data intervals averaged
+  `189.483 Mbit/s`. QUIC loss/congestion and tx blocking stayed zero, and the
+  data stream pending/read gap fell to `189ms`.
+- Persistent environment change: `.33` now has
+  `/etc/sysctl.d/99-mini-vpn-quic.conf` with
+  `rmem_max/wmem_max=16777216` and `rmem_default/wmem_default=1048576`.
+- Remaining work: the high-rate run was not a fully clean acceptance because
+  iperf was timeout-killed after the data phase and the close tail had
+  `terminal_pending_reap=349932`, `pending_at_close=349932`,
+  `tun_tx_dropped_delta=16`, and `rx_blocked_stream=1`.
+- Reusable rule: do not lower the target to `30 Mbit/s`. When `.33` socket
+  buffers are high, `100+ Mbit/s` is reachable on this topology. The next mini_vpn
+  work is close-tail cleanliness under high throughput, not more local credit,
+  MTU/PLPMTUD, pool, or sing-box version chasing.

@@ -6,6 +6,8 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -116,6 +118,84 @@ pub const QUIC_RECEIVE_WINDOW_BYTES: u32 = 32 * 1024 * 1024;
 /// 本端发送窗口上限。默认约 10MB，长 RTT 或多 stream forward 时容易在应用写入处表现成
 /// `tcp-local-write-pressure`。32MB 给高吞吐 TCP 留出更接近真实 BDP 的在飞空间。
 pub const QUIC_SEND_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
+/// QUIC UDP socket recv/send buffer 目标。Knife14ff/fg 证明本地 stream polling 已足够勤快，
+/// 但仍有秒级 ordered-read gap；给 UDP ingress 留 8MB OS 缓冲，避免短调度抖动或 burst 重排把
+/// QUIC stream 卡成 HOL。Linux root 下会尝试 `SO_*BUFFORCE` 突破较小的 net.core 上限。
+pub const QUIC_UDP_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+pub const QUIC_MIN_UDP_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
+pub const QUIC_MAX_UDP_SOCKET_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuicUdpSocketBufferSizes {
+    pub requested_bytes: usize,
+    pub recv_bytes: usize,
+    pub send_bytes: usize,
+}
+
+fn parse_quic_udp_socket_buffer_bytes(raw: Option<&str>) -> (usize, bool) {
+    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (QUIC_UDP_SOCKET_BUFFER_BYTES, false);
+    };
+    match value.parse::<usize>() {
+        Ok(bytes) => (
+            bytes.clamp(
+                QUIC_MIN_UDP_SOCKET_BUFFER_BYTES,
+                QUIC_MAX_UDP_SOCKET_BUFFER_BYTES,
+            ),
+            false,
+        ),
+        Err(_) => (QUIC_UDP_SOCKET_BUFFER_BYTES, true),
+    }
+}
+
+fn configure_quic_udp_socket_buffers(
+    socket: &std::net::UdpSocket,
+    requested_bytes: usize,
+) -> Result<QuicUdpSocketBufferSizes, String> {
+    let socket_ref = socket2::SockRef::from(socket);
+    socket_ref
+        .set_recv_buffer_size(requested_bytes)
+        .map_err(|e| format!("set SO_RCVBUF={requested_bytes}: {e}"))?;
+    socket_ref
+        .set_send_buffer_size(requested_bytes)
+        .map_err(|e| format!("set SO_SNDBUF={requested_bytes}: {e}"))?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let recv = socket_ref.recv_buffer_size().unwrap_or(0);
+        if recv < requested_bytes {
+            force_linux_socket_buffer(socket, libc::SO_RCVBUFFORCE, requested_bytes);
+        }
+        let send = socket_ref.send_buffer_size().unwrap_or(0);
+        if send < requested_bytes {
+            force_linux_socket_buffer(socket, libc::SO_SNDBUFFORCE, requested_bytes);
+        }
+    }
+
+    Ok(QuicUdpSocketBufferSizes {
+        requested_bytes,
+        recv_bytes: socket_ref
+            .recv_buffer_size()
+            .map_err(|e| format!("get SO_RCVBUF: {e}"))?,
+        send_bytes: socket_ref
+            .send_buffer_size()
+            .map_err(|e| format!("get SO_SNDBUF: {e}"))?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn force_linux_socket_buffer(socket: &std::net::UdpSocket, opt: libc::c_int, bytes: usize) {
+    let value = bytes as libc::c_int;
+    unsafe {
+        let _ = libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            opt,
+            (&value as *const libc::c_int).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        );
+    }
+}
 
 /// 共享的 QUIC 传输参数：keep-alive + 拉长 idle + 起步 MTU + CC + uni-stream 配额（datagram 等其余默认）。
 /// 中文要点（刀3.5）：装 `congestion_controller_factory`（quinn 默认 Cubic；高 RTT/丢包跨境 BBR 通常更优）
@@ -129,14 +209,26 @@ fn quic_transport_config(cc: CcChoice, mtu_policy: MtuPolicy) -> Arc<TransportCo
     apply_mtu_policy(&mut t, mtu_policy);
     t.max_concurrent_bidi_streams(QUIC_MAX_CONCURRENT_BIDI_STREAMS.into());
     t.max_concurrent_uni_streams(QUIC_MAX_CONCURRENT_UNI_STREAMS.into());
-    t.stream_receive_window(QUIC_STREAM_RECEIVE_WINDOW_BYTES.into());
-    t.receive_window(QUIC_RECEIVE_WINDOW_BYTES.into());
+    t.stream_receive_window(quic_stream_receive_window_bytes(mtu_policy).into());
+    t.receive_window(quic_receive_window_bytes(mtu_policy).into());
     t.send_window(QUIC_SEND_WINDOW_BYTES);
     match cc {
         CcChoice::Bbr => t.congestion_controller_factory(Arc::new(BbrConfig::default())),
         CcChoice::Cubic => t.congestion_controller_factory(Arc::new(CubicConfig::default())),
     };
     Arc::new(t)
+}
+
+pub fn quic_stream_receive_window_bytes(mtu_policy: MtuPolicy) -> u32 {
+    match mtu_policy {
+        MtuPolicy::Default | MtuPolicy::Safe1200 => QUIC_STREAM_RECEIVE_WINDOW_BYTES,
+    }
+}
+
+pub fn quic_receive_window_bytes(mtu_policy: MtuPolicy) -> u32 {
+    match mtu_policy {
+        MtuPolicy::Default | MtuPolicy::Safe1200 => QUIC_RECEIVE_WINDOW_BYTES,
+    }
 }
 
 fn apply_mtu_policy(t: &mut TransportConfig, mtu_policy: MtuPolicy) {
@@ -231,6 +323,24 @@ fn client_crypto(
 pub fn client_endpoint(cfg: ClientConfig) -> Result<Endpoint, String> {
     let bind: SocketAddr = "0.0.0.0:0".parse().expect("valid bind addr");
     let socket = std::net::UdpSocket::bind(bind).map_err(|e| format!("quic client bind: {e}"))?;
+    let (udp_buffer_bytes, udp_buffer_fell_back) = parse_quic_udp_socket_buffer_bytes(
+        std::env::var("MINI_VPN_QUIC_UDP_SOCKET_BUFFER_BYTES")
+            .ok()
+            .as_deref(),
+    );
+    if udp_buffer_fell_back {
+        println!(
+            "⚠️ MINI_VPN_QUIC_UDP_SOCKET_BUFFER_BYTES 无效，回落 {}B",
+            QUIC_UDP_SOCKET_BUFFER_BYTES
+        );
+    }
+    match configure_quic_udp_socket_buffers(&socket, udp_buffer_bytes) {
+        Ok(sizes) => println!(
+            "🧺 QUIC UDP socket buffers: requested={}B recv={}B send={}B",
+            sizes.requested_bytes, sizes.recv_bytes, sizes.send_bytes
+        ),
+        Err(e) => println!("⚠️ QUIC UDP socket buffer 配置失败，继续使用系统默认: {e}"),
+    }
     let runtime =
         quinn::default_runtime().ok_or_else(|| "no async runtime for quic endpoint".to_string())?;
     let mut ep_cfg = quinn::EndpointConfig::default();
@@ -334,6 +444,14 @@ mod tests {
     fn transport_config_sets_vpn_flow_control_windows() {
         let cfg = quic_transport_config(CcChoice::Cubic, MtuPolicy::Default);
         let dbg = format!("{cfg:?}");
+        assert_eq!(
+            quic_stream_receive_window_bytes(MtuPolicy::Default),
+            QUIC_STREAM_RECEIVE_WINDOW_BYTES
+        );
+        assert_eq!(
+            quic_receive_window_bytes(MtuPolicy::Default),
+            QUIC_RECEIVE_WINDOW_BYTES
+        );
         assert!(
             dbg.contains(&format!(
                 "max_concurrent_bidi_streams: {}",
@@ -385,9 +503,64 @@ mod tests {
         );
 
         let cfg = quic_transport_config(CcChoice::Cubic, MtuPolicy::Safe1200);
-        assert!(
-            format!("{cfg:?}").contains(&format!("send_window: {}", QUIC_SEND_WINDOW_BYTES)),
-            "safe1200 policy must still keep the shared VPN flow-control windows"
+        let dbg = format!("{cfg:?}");
+        assert_eq!(
+            quic_stream_receive_window_bytes(MtuPolicy::Safe1200),
+            QUIC_STREAM_RECEIVE_WINDOW_BYTES
         );
+        assert_eq!(
+            quic_receive_window_bytes(MtuPolicy::Safe1200),
+            QUIC_RECEIVE_WINDOW_BYTES
+        );
+        assert!(
+            dbg.contains(&format!(
+                "stream_receive_window: {}",
+                QUIC_STREAM_RECEIVE_WINDOW_BYTES
+            )),
+            "{dbg}"
+        );
+        assert!(
+            dbg.contains(&format!("receive_window: {}", QUIC_RECEIVE_WINDOW_BYTES)),
+            "{dbg}"
+        );
+        assert!(
+            dbg.contains(&format!("send_window: {}", QUIC_SEND_WINDOW_BYTES)),
+            "safe1200 policy must still keep the shared VPN send window"
+        );
+    }
+
+    #[test]
+    fn parse_quic_udp_socket_buffer_bytes_defaults_and_clamps() {
+        assert_eq!(
+            parse_quic_udp_socket_buffer_bytes(None),
+            (QUIC_UDP_SOCKET_BUFFER_BYTES, false)
+        );
+        assert_eq!(
+            parse_quic_udp_socket_buffer_bytes(Some("")),
+            (QUIC_UDP_SOCKET_BUFFER_BYTES, false)
+        );
+        assert_eq!(
+            parse_quic_udp_socket_buffer_bytes(Some("1024")),
+            (QUIC_MIN_UDP_SOCKET_BUFFER_BYTES, false)
+        );
+        assert_eq!(
+            parse_quic_udp_socket_buffer_bytes(Some("999999999999")),
+            (QUIC_MAX_UDP_SOCKET_BUFFER_BYTES, false)
+        );
+        assert_eq!(
+            parse_quic_udp_socket_buffer_bytes(Some("nope")),
+            (QUIC_UDP_SOCKET_BUFFER_BYTES, true)
+        );
+    }
+
+    #[test]
+    fn quic_udp_socket_buffer_config_sets_observable_socket_buffers() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sizes =
+            configure_quic_udp_socket_buffers(&socket, QUIC_MIN_UDP_SOCKET_BUFFER_BYTES).unwrap();
+
+        assert_eq!(sizes.requested_bytes, QUIC_MIN_UDP_SOCKET_BUFFER_BYTES);
+        assert!(sizes.recv_bytes > 0, "{sizes:?}");
+        assert!(sizes.send_bytes > 0, "{sizes:?}");
     }
 }

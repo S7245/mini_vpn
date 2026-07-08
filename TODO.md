@@ -1,5 +1,38 @@
 # TODO
 
+## Current Knife14 Status (2026-07-08)
+
+Knife14fp found the missing high-throughput prerequisite: the exit VPS `.33`
+had Linux socket buffer caps/defaults of only `212992B`, which capped both
+mini_vpn and a mature sing-box client around the `20-30 Mbit/s` band. After
+raising `.33` to:
+
+```text
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+```
+
+and restarting sing-box, the mature sing-box client reached `185.242 Mbit/s`
+receiver and mini_vpn safe1200 reverse-first P1 reached a reported
+`114.000 Mbit/s` receiver with `stable_high` intervals averaging
+`189.483 Mbit/s`.
+
+Do **not** lower the target to `30 Mbit/s`. The `100+ Mbit/s` target is
+reachable on the current `.27/.33/.77` topology when the exit-side socket
+buffer preflight is satisfied.
+
+Current follow-up queue:
+
+1. Make exit-side socket buffer preflight explicit in acceptance/deployment
+   tooling.
+2. Clean the high-throughput close tail: remove timeout-driven terminal pending
+   reaping, keep `pending_at_close=0`, `terminal_pending_reap=0`,
+   `tun_tx_dropped_delta=0`, and `rx_blocked_stream=0`.
+3. Re-run a clean reverse-first P1 after the close-tail fix before broadening to
+   longer-duration or concurrency sweeps.
+
 ## Roadmap: TUN transparent proxy (Target extraction)
 
 The TUN client must relay each intercepted connection to its real **Target**

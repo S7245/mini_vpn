@@ -2545,3 +2545,234 @@
   If pressure is zero and read credit is still at the old floor, shift to local
   FIN ordering and stream wakeup diagnostics instead of tuning controller
   thresholds.
+
+## 2026-07-07 - Repeating exit-to-target checks still needs explicit SSH env
+
+- Stage: Knife14et first VPS suite attempt.
+- Symptom: the suite failed before tunnel P1 with
+  `EXIT_TO_TARGET_IPERF_CHECK=1` because `EXIT_SSH_HOST` was unset.
+- Cause: the rerun command omitted explicit exit SSH settings even though
+  `SERVER_EVIDENCE_CHECK=0` was used, so the suite had no source for exit SSH
+  defaults.
+- Correct behavior: always pass `EXIT_SSH_HOST`, `EXIT_SSH_KEY`,
+  `EXIT_SSH_STRICT_HOST_KEY_CHECKING`, and `EXIT_SSH_KNOWN_HOSTS_FILE` when
+  enabling `EXIT_TO_TARGET_IPERF_CHECK=1`. Do not rely on remembered defaults
+  across handoffs or compactions.
+
+## 2026-07-07 - Do not continue headroom tuning after pressure-free no-data
+
+- Stage: Knife14et valid VPS reverse-first P1.
+- Symptom: the scoped safe1200 P1 failed at `0.769/0.042 Mbit/s` while local
+  pressure was gone: `pause_edges=0`, `pending_total_max=0`,
+  `headroom_deferred_bytes=0`, and `read_credit_limit_bytes_min=65536`.
+- Cause: the run was a reverse ACK/window cadence or stream wakeup starvation
+  problem, not a local egress pressure problem. The data stream only received
+  `210912B`, with `data_read_gap_max_ms=20500` and
+  `data_pending_gap_max_ms=20383`.
+- Correct behavior: stop the threshold-tuning loop when this shape appears.
+  Analyze ACK propagation, local FIN ordering, and TUIC stream pending/read
+  wakeups, or split local egress pressure control from ACK/window cadence
+  control before another VPS acceptance attempt.
+
+## 2026-07-07 - Do not implement FIN deferral when gaps are pre-FIN
+
+- Stage: Knife14eu VPS reverse-first P1.
+- Symptom: the scoped safe1200 P1 failed at `20.8/19.8 Mbit/s` with a
+  `7002ms` data-stream read gap, but the new FIN-boundary diagnostics reported
+  `local_finish_events=0`, `remote_after_local_finish_bytes=0`, and
+  `data_max_read_gap_after_finish_ms=0`.
+- Cause: the slow window was not caused by payload arriving after local FIN.
+  The stall happened before local finish while local pressure and TUIC stream
+  pending/read gaps coexisted.
+- Correct behavior: do not add bounded FIN deferral as the next fix for this
+  evidence shape. Move to a split controller: payload egress pressure remains
+  bounded by pending/send_queue, while ACK/window cadence gets a separate
+  bounded drain path driven by clean QUIC stream pending gaps and observed
+  egress progress.
+
+## 2026-07-07 - Do not repeat short-lived ACK cadence boost after it is active
+
+- Stage: Knife14ev VPS reverse-first P1.
+- Symptom: the scoped safe1200 P1 failed at `16.0/14.9 Mbit/s` even though the
+  new relay gap-hint hook fired (`relay_gap_hints events=59`,
+  `max_cadence_floor=19200`). QUIC loss/congestion/blocking, TUN drops, and
+  terminal pending remained clean.
+- Cause: the boost was wired but too episodic and still coupled to the same
+  local pressure edge. The effective relay read-credit floor still collapsed
+  to `1200`, then repeated `projected_payload_credit_edge` debt pushed
+  pressure past the credit edge and paused read credit.
+- Correct behavior: do not raise `cadence_floor`, TUN RX drain budget, or MTU
+  knobs for this shape. The next fix must separate a continuously serviced
+  ACK/window lane from payload staging and grant payload read credit only from
+  measured TUN egress progress below a safe target.
+
+## 2026-07-07 - Do not keep tuning payload credit after pressure-free stream starvation
+
+- Stage: Knife14ew VPS reverse-first P1.
+- Symptom: the scoped safe1200 P1 failed at `0.979/0.046 Mbit/s` even though
+  the new egress-earned reservoir was active (`egress_payload_credit_bytes=122727`)
+  and local pressure/backpressure was clean (`pending_total_max=0`,
+  `headroom_deferred_bytes=0`, `pressure_credit_debt_bytes=0`,
+  `tun_tx_dropped_delta=0`).
+- Cause: this was not a payload credit shortage. The active data stream kept
+  `read_credit_limit_bytes_min=65536`, yet `tuic_stream_pending` reached
+  `23247ms` on the data stream and relay data read gaps reached `23974ms`.
+  Connection-level UDP receive and stream-frame counters advanced while the
+  active stream read remained pending.
+- Correct behavior: pause code changes after this shape and design the next
+  branch around TUIC stream pending/read wakeup and reverse ACK/window uplink
+  service diagnostics. Do not raise payload-token caps, cadence floor, egress
+  pacer, TUN queue length, MTU/PLPMTUD, stale-pool, iperf3, or sing-box knobs
+  for this evidence.
+
+## 2026-07-07 - Direct rustfmt needs the repository edition
+
+- Stage: Knife14ew local gates.
+- Symptom: `rustfmt src/client_tun.rs` failed with Rust 2015 parsing errors
+  (`async fn` and let-chains rejected) because direct rustfmt did not read the
+  Cargo manifest edition.
+- Cause: this repository uses edition `2024`, and direct file-level rustfmt
+  defaults were insufficient.
+- Correct behavior: when formatting only one Rust file to avoid unrelated
+  `cargo fmt --check` churn, run `rustfmt --edition 2024 <file>` and verify
+  with `rustfmt --edition 2024 --check <file>`.
+
+## 2026-07-07 - Do not widen ACK/window drain after Knife14ex
+
+- Stage: Knife14ex VPS reverse-first P1.
+- Symptom: the scoped safe1200 P1 failed at `17.8/16.7 Mbit/s` even though the
+  default active-flow ACK/window service lane was enabled and clearly active:
+  `timer_active_flow_attempts=598`, `tun_rx_drain attempts=11770`, and
+  `tun_rx_drain packets=14090`.
+- Cause: ACK servicing helped but was not the final limiter. The new
+  `tuic_stream_pending_causes` discriminator reported
+  `connection_stream_frames_pending=18` and `no_connection_rx=0`, while local
+  egress/headroom pressure returned (`send_queue_max=557386`,
+  `may_recv_false=13443`, `headroom_deferred_bytes=16754655`). QUIC
+  loss/congestion/blocking and TUN drops remained zero.
+- Correct behavior: do not increase active-flow timer duration, TUN RX drain
+  budget, cadence floor, payload-token caps, TUN queue length, MTU/PLPMTUD,
+  stale-pool logic, iperf3, or sing-box settings for this evidence. The next
+  repair must first design/test relay or TUIC stream read-service stability and
+  an egress target/headroom loop that does not park send_queue at the credit
+  edge.
+
+## 2026-07-08 - Treat all-VPS SSH pre-banner closes as environment blocked
+
+- Stage: Knife14ey remote focused gate attempt.
+- Symptom: `.27`, `.33`, and `.77` all accepted TCP/22 but closed before
+  sending an SSH banner. SSH failed with
+  `kex_exchange_identification: Connection closed by remote host` before
+  authentication; `nc` confirmed the port was reachable but no banner was
+  returned.
+- Cause: this is not a mini_vpn code failure, not sudo, not `.env`, and not
+  host-key or public-key authentication. It happens before authentication on
+  every acceptance host, which points to a transient SSH service, source-IP
+  policy, network middlebox, or provider-side limit.
+- Correct behavior: do not rerun suites or rsync in a loop while this shape is
+  present. First wait or fix SSH/banner availability, then resume with focused
+  gates and the safe1200 reverse-first P1 suite.
+
+## 2026-07-08 - Do not widen ordinary ACK/target knobs after Knife14ey
+
+- Stage: Knife14ey VPS reverse-first P1.
+- Symptom: the scoped safe1200 P1 failed at `25.5/24.2 Mbit/s` even though
+  active-transfer pressure improved: before the close tail,
+  `send_queue_max=447679`, `may_recv_false=0`, and
+  `headroom_deferred_bytes=72259`. QUIC loss/congestion/blocking, TUN drops,
+  send-slice errors, and global RX pressure stayed clean.
+- Cause: the failure returned after the iperf close tail. Local TCP entered a
+  `may_recv=false` shape with pending downlink, and terminal close-drain pushed
+  the flow back to the old credit edge (`send_queue_max=557386`,
+  `may_recv_false=11961`, `headroom_deferred_bytes=14717970`).
+- Correct behavior: do not keep raising ACK cadence, TUN RX budgets,
+  payload-credit caps, MTU/PLPMTUD, or ordinary egress target constants for
+  this evidence. The next repair must make terminal/CloseWait close-drain
+  target-aware and only expand payload drain credit when measured local egress
+  progress creates room.
+
+## 2026-07-08 - Do not run bidirectional iperf3 baselines concurrently
+
+- Stage: Knife14fi-fo direct `.33 <-> .77` discriminator.
+- Symptom: the first attempt to run forward and reverse direct iperf3 baselines
+  at the same time failed one side with `iperf3: server is busy running a test`.
+- Cause: the `.77` iperf3 service accepts only one active test in this mode.
+- Correct behavior: run `.33 -> .77` and `.77 -> .33` direct baselines
+  sequentially when using the shared iperf3 service.
+
+## 2026-07-08 - Treat isolated TUIC auth close as retryable before changing code
+
+- Stage: Knife14fl safe1200 receive-window shrink.
+- Symptom: the first FL suite failed during startup with
+  `tuic auth finish: sending stopped by peer: error 0`, while the `.33`
+  service was active and a scoped minimal startup succeeded afterward.
+- Cause: the evidence matched a transient peer close or environment hiccup, not
+  a deterministic local code regression.
+- Correct behavior: for a single startup auth close with healthy services,
+  retry or run a minimal startup probe before redesigning the transport branch.
+
+## 2026-07-08 - Avoid ad-hoc inbound iperf on `.27` as throughput evidence
+
+- Stage: Knife14fi-fo path discriminator.
+- Symptom: a `.33 -> .27` ad-hoc iperf test to a temporary listener timed out
+  despite the listener being started.
+- Cause: the result is likely firewall or security-group related and does not
+  isolate mini_vpn's TUIC data path.
+- Correct behavior: do not use `.33 -> .27` temporary inbound iperf as a
+  blocker or root-cause signal unless the network policy is explicitly verified.
+
+## 2026-07-08 - Use precise process cleanup for one-shot remote helpers
+
+- Stage: Knife14fi-fo path discriminator cleanup.
+- Symptom: `pkill -f "iperf3 -s -1 -p 5209"` can match and kill the shell that
+  issued it, producing confusing remote command termination.
+- Cause: broad `pkill -f` patterns can match their own command line on the
+  remote host.
+- Correct behavior: prefer a captured PID or a narrower process-selection
+  method for temporary remote helper cleanup.
+
+## 2026-07-08 - Include SSH identity when syncing to `.27`
+
+- Stage: Knife14fi-fo remote focused gates.
+- Symptom: `rsync` to `.27` without an explicit SSH command failed because it
+  did not use the required identity.
+- Cause: the default SSH identity was not the VPS key for this environment.
+- Correct behavior: use `rsync -e 'ssh -i ~/.ssh/vpn' ...` for `.27` syncs.
+
+## 2026-07-08 - Avoid large cross-VPS scp for sing-box A/B binaries
+
+- Stage: mature sing-box client A/B.
+- Symptom: copying `/usr/bin/sing-box` from `.33` through local scp was slow and
+  appeared to leave a partial local file before the process exited.
+- Cause: cross-VPS scp through the local machine was unnecessary and introduced
+  noisy transfer state.
+- Correct behavior: for this A/B, download the official sing-box release
+  directly on `.27`, verify `sing-box version`, and keep the binary in a remote
+  temp directory outside the repository.
+
+## 2026-07-08 - Do not use fragile remote f-strings inside nested SSH heredocs
+
+- Stage: mature sing-box client A/B summary parsing.
+- Symptom: the iperf run completed, but the remote summary step failed with
+  Python `NameError` after shell quoting stripped intended string literals in
+  f-string expressions.
+- Cause: nested SSH single quotes, heredocs, and Python f-strings with quoted
+  dictionary keys are easy to mangle.
+- Correct behavior: pull iperf JSON/log artifacts locally and parse them there,
+  or use a single correctly quoted heredoc with no nested shell interpolation.
+
+## 2026-07-08 - Check exit-side socket buffers before lowering throughput target
+
+- Stage: Knife14fp server-side A/B.
+- Symptom: both mini_vpn and a mature sing-box client stayed around
+  `20-30 Mbit/s` even though `.33 -> .77` direct reverse was above
+  `200 Mbit/s`, QUIC loss/congestion was clean, and `.33` sing-box was active
+  with TUIC `congestion_control=bbr`.
+- Cause: `.33` Linux socket buffer caps/defaults were only `212992B`. After
+  raising `net.core.rmem_max` and `net.core.wmem_max` to `16777216`, and
+  `net.core.rmem_default` and `net.core.wmem_default` to `1048576`, then
+  restarting sing-box, the mature client reached `185.242 Mbit/s` and mini_vpn
+  reached a reported `114.000 Mbit/s`.
+- Correct behavior: before lowering the target or declaring TUIC single-stream
+  architecture blocked, check and fix exit-side Linux socket buffers, then
+  restart sing-box. Treat this as a mandatory high-throughput preflight.

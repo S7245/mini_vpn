@@ -7,6 +7,8 @@ edition = "2024"
 tokio = { version = "1", features = ["full"] }
 bytes = "1.0"
 thiserror = "1.0"
+libc = "0.2"
+socket2 = "0.5"
 
 # TLS 信任材料 / 证书加载（quinn 数据面用）。Stage 13d 退役 legacy 后不再需要
 # tokio-rustls（裸 TLS 流）/ yamux（多路复用）/ rand / tokio-util / futures / chacha。
