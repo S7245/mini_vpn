@@ -722,6 +722,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for TrackedRelayStream<S> {
                                 diag.last_read_transport_sample.unwrap_or_default(),
                                 sample,
                             ),
+                            since_last_pending: transport_delta(
+                                diag.last_pending_transport_sample.unwrap_or_default(),
+                                sample,
+                            ),
                         }))
                     } else {
                         TuicTcpStreamPendingCause::NoTransportSample
@@ -1345,6 +1349,7 @@ struct TuicStreamTransportDelta {
 struct TuicStreamTransportPending {
     sample: TuicStreamTransportSample,
     since_last_read: TuicStreamTransportDelta,
+    since_last_pending: TuicStreamTransportDelta,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1535,6 +1540,7 @@ struct TuicTcpStreamDiag {
     max_pending_gap_ms: u128,
     last_pending_log_at: Option<Instant>,
     last_read_transport_sample: Option<TuicStreamTransportSample>,
+    last_pending_transport_sample: Option<TuicStreamTransportSample>,
     self_wake_armed: u64,
     self_wake_fired: u64,
 }
@@ -1556,6 +1562,7 @@ impl TuicTcpStreamDiag {
             max_pending_gap_ms: 0,
             last_pending_log_at: None,
             last_read_transport_sample: None,
+            last_pending_transport_sample: None,
             self_wake_armed: 0,
             self_wake_fired: 0,
         }
@@ -1637,12 +1644,20 @@ impl TuicTcpStreamDiag {
             return None;
         }
         self.last_pending_log_at = Some(now);
-        let transport = transport.map(|sample| TuicStreamTransportPending {
-            sample,
-            since_last_read: transport_delta(
-                self.last_read_transport_sample.unwrap_or_default(),
+        let transport = transport.map(|sample| {
+            let pending = TuicStreamTransportPending {
                 sample,
-            ),
+                since_last_read: transport_delta(
+                    self.last_read_transport_sample.unwrap_or_default(),
+                    sample,
+                ),
+                since_last_pending: transport_delta(
+                    self.last_pending_transport_sample.unwrap_or_default(),
+                    sample,
+                ),
+            };
+            self.last_pending_transport_sample = Some(sample);
+            pending
         });
         let pending_cause = classify_tuic_stream_pending_cause(transport);
         Some(TuicTcpStreamPendingEvent {
@@ -1760,13 +1775,16 @@ fn format_tuic_tcp_stream_pending_line(
     );
     if let Some(transport) = transport {
         line.push_str(&format!(
-            " conn_udp_rx={}/{}B conn_udp_rx_since_read={}/{}B conn_rx_stream_frames={} conn_rx_stream_frames_since_read={} conn_ack_frames(rx={},tx={}) conn_plpmtud(sent={},lost={},black_holes={})",
+            " conn_udp_rx={}/{}B conn_udp_rx_since_read={}/{}B conn_udp_rx_since_pending={}/{}B conn_rx_stream_frames={} conn_rx_stream_frames_since_read={} conn_rx_stream_frames_since_pending={} conn_ack_frames(rx={},tx={}) conn_plpmtud(sent={},lost={},black_holes={})",
             transport.sample.udp_rx_datagrams,
             transport.sample.udp_rx_bytes,
             transport.since_last_read.udp_rx_datagrams,
             transport.since_last_read.udp_rx_bytes,
+            transport.since_last_pending.udp_rx_datagrams,
+            transport.since_last_pending.udp_rx_bytes,
             transport.sample.rx_stream_frames,
             transport.since_last_read.rx_stream_frames,
+            transport.since_last_pending.rx_stream_frames,
             transport.sample.rx_ack_frames,
             transport.sample.tx_ack_frames,
             transport.sample.sent_plpmtud_probes,
@@ -3049,6 +3067,11 @@ mod tests {
                 udp_rx_bytes: 35_000,
                 rx_stream_frames: 7,
             },
+            since_last_pending: TuicStreamTransportDelta {
+                udp_rx_datagrams: 3,
+                udp_rx_bytes: 9_000,
+                rx_stream_frames: 2,
+            },
         };
         let pending = format_tuic_tcp_stream_pending_line(
             &meta,
@@ -3073,11 +3096,19 @@ mod tests {
             pending.contains("conn_udp_rx_since_read=11/35000B"),
             "{pending}"
         );
+        assert!(
+            pending.contains("conn_udp_rx_since_pending=3/9000B"),
+            "{pending}"
+        );
         assert!(pending.contains("conn_rx_stream_frames=37"), "{pending}");
         assert!(pending.contains("self_wake_armed=13"), "{pending}");
         assert!(pending.contains("self_wake_fired=12"), "{pending}");
         assert!(
             pending.contains("conn_rx_stream_frames_since_read=7"),
+            "{pending}"
+        );
+        assert!(
+            pending.contains("conn_rx_stream_frames_since_pending=2"),
             "{pending}"
         );
         assert!(
@@ -3153,6 +3184,7 @@ mod tests {
                 black_holes_detected: 0,
             },
             since_last_read: TuicStreamTransportDelta::default(),
+            since_last_pending: TuicStreamTransportDelta::default(),
         };
         assert_eq!(
             classify_tuic_stream_pending_cause(Some(no_connection_rx)),
@@ -3381,10 +3413,61 @@ mod tests {
         assert_eq!(transport.since_last_read.udp_rx_datagrams, 7);
         assert_eq!(transport.since_last_read.udp_rx_bytes, 24_000);
         assert_eq!(transport.since_last_read.rx_stream_frames, 3);
+        assert_eq!(transport.since_last_pending.udp_rx_datagrams, 17);
+        assert_eq!(transport.since_last_pending.udp_rx_bytes, 44_000);
+        assert_eq!(transport.since_last_pending.rx_stream_frames, 8);
         assert_eq!(transport.sample.rx_ack_frames, 4);
         assert_eq!(transport.sample.tx_ack_frames, 6);
         assert_eq!(transport.sample.lost_plpmtud_probes, 1);
         assert_eq!(transport.sample.black_holes_detected, 1);
+    }
+
+    #[test]
+    fn tuic_tcp_stream_pending_event_reports_since_last_pending_delta() {
+        let target = TargetAddr::parse("1.2.3.4:5201").unwrap();
+        let meta = TuicTcpStreamDiagMeta::new(&target, 3, 42, 8);
+        let start = std::time::Instant::now();
+        let mut diag = TuicTcpStreamDiag::new(meta, start);
+
+        diag.note_pending_at(
+            start + std::time::Duration::from_millis(1_000),
+            Some(TuicStreamTransportSample {
+                udp_rx_datagrams: 10,
+                udp_rx_bytes: 20_000,
+                rx_stream_frames: 5,
+                rx_ack_frames: 1,
+                tx_ack_frames: 2,
+                sent_plpmtud_probes: 0,
+                lost_plpmtud_probes: 0,
+                black_holes_detected: 0,
+            }),
+        )
+        .expect("first pending log arms the pending baseline");
+
+        let pending = diag
+            .note_pending_at(
+                start + std::time::Duration::from_millis(2_000),
+                Some(TuicStreamTransportSample {
+                    udp_rx_datagrams: 12,
+                    udp_rx_bytes: 22_882,
+                    rx_stream_frames: 5,
+                    rx_ack_frames: 2,
+                    tx_ack_frames: 3,
+                    sent_plpmtud_probes: 0,
+                    lost_plpmtud_probes: 0,
+                    black_holes_detected: 0,
+                }),
+            )
+            .expect("second pending log reports delta since previous pending log");
+        let transport = pending.transport.expect("transport sample is attached");
+
+        assert_eq!(transport.since_last_read.udp_rx_datagrams, 12);
+        assert_eq!(transport.since_last_pending.udp_rx_datagrams, 2);
+        assert_eq!(transport.since_last_pending.udp_rx_bytes, 2_882);
+        assert_eq!(
+            transport.since_last_pending.rx_stream_frames, 0,
+            "connection stream frames may be stale even when the since-read cause remains stream-frame-pending"
+        );
     }
 
     #[test]

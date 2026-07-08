@@ -2292,6 +2292,7 @@ impl DownlinkEgressCreditDebt {
         added
     }
 
+    #[cfg(test)]
     fn note_projected_egress_pressure(
         &mut self,
         projected_pressure_bytes: usize,
@@ -2299,6 +2300,29 @@ impl DownlinkEgressCreditDebt {
     ) -> usize {
         let debt_bytes =
             downlink_egress_projected_pressure_debt_bytes(projected_pressure_bytes, cfg);
+        if debt_bytes == 0 {
+            return 0;
+        }
+        let added = self.install(EgressCreditDebtSource::Pressure, debt_bytes);
+        if added > 0 {
+            self.pressure_events = self.pressure_events.saturating_add(1);
+        }
+        added
+    }
+
+    fn note_post_flush_projected_egress_pressure(
+        &mut self,
+        send_queue_bytes: usize,
+        pending_bytes: usize,
+        accepted_bytes: usize,
+        cfg: DownlinkBackpressureConfig,
+    ) -> usize {
+        let debt_bytes = post_flush_projected_pressure_debt_bytes(
+            send_queue_bytes,
+            pending_bytes,
+            accepted_bytes,
+            cfg,
+        );
         if debt_bytes == 0 {
             return 0;
         }
@@ -2479,6 +2503,21 @@ fn downlink_egress_projected_pressure_debt_bytes(
         .min(span)
         .saturating_add(projected_pressure_bytes.saturating_sub(target_edge))
         .min(span)
+}
+
+fn post_flush_projected_pressure_debt_bytes(
+    send_queue_bytes: usize,
+    pending_bytes: usize,
+    accepted_bytes: usize,
+    cfg: DownlinkBackpressureConfig,
+) -> usize {
+    if accepted_bytes > 0 && pending_bytes == 0 {
+        return 0;
+    }
+    downlink_egress_projected_pressure_debt_bytes(
+        downlink_projected_local_pressure_bytes(send_queue_bytes, pending_bytes),
+        cfg,
+    )
 }
 
 #[cfg(test)]
@@ -7647,29 +7686,6 @@ async fn handle_remote_payload<D: TunIo>(
     ctx.downlink_diag
         .note_remote_payload(payload.len(), ctx.downlink_pending.len());
     note_local_finish_remote_progress(ctx, now_secs);
-    let projected_pressure = downlink_projected_local_pressure_bytes(
-        before_payload_snapshot.send_queue,
-        ctx.downlink_pending.len(),
-    );
-    let installed_projected_debt = downlink_egress_drop_debt
-        .note_projected_egress_pressure(projected_pressure, downlink_backpressure);
-    if installed_projected_debt > 0 {
-        tcp_diag_log!(
-            "{}",
-            format_downlink_egress_credit_debt_diag(
-                "projected_payload_credit_edge",
-                installed_projected_debt,
-                DownlinkPressureStats {
-                    max_pending: ctx.downlink_pending.len(),
-                    total_pending: ctx.downlink_pending.len(),
-                    max_tx_queue: projected_pressure,
-                    total_tx_queue: projected_pressure,
-                },
-                downlink_backpressure,
-                *downlink_egress_drop_debt,
-            )
-        );
-    }
     let flush_outcome = flush_downlink(
         handle,
         tcp_socket,
@@ -7680,9 +7696,35 @@ async fn handle_remote_payload<D: TunIo>(
         downlink_egress_drop_debt,
     );
     let accepted_bytes = flush_outcome.accepted_bytes;
+    let snapshot = SocketCloseSnapshot::from_socket(tcp_socket);
+    let post_flush_projected_pressure =
+        downlink_projected_local_pressure_bytes(snapshot.send_queue, ctx.downlink_pending.len());
+    let installed_projected_debt = downlink_egress_drop_debt
+        .note_post_flush_projected_egress_pressure(
+            snapshot.send_queue,
+            ctx.downlink_pending.len(),
+            accepted_bytes,
+            downlink_backpressure,
+        );
+    if installed_projected_debt > 0 {
+        tcp_diag_log!(
+            "{}",
+            format_downlink_egress_credit_debt_diag(
+                "post_flush_projected_payload_credit_edge",
+                installed_projected_debt,
+                DownlinkPressureStats {
+                    max_pending: ctx.downlink_pending.len(),
+                    total_pending: ctx.downlink_pending.len(),
+                    max_tx_queue: post_flush_projected_pressure,
+                    total_tx_queue: post_flush_projected_pressure,
+                },
+                downlink_backpressure,
+                *downlink_egress_drop_debt,
+            )
+        );
+    }
     note_downlink_pending_progress(ctx, now_secs, accepted_bytes);
     ctx.state = SocketState::Relaying;
-    let snapshot = SocketCloseSnapshot::from_socket(tcp_socket);
     log_tcp_lifecycle_observation(handle, ctx, snapshot, now_secs, "remote_payload");
     if should_log_tcp_reverse_window(ctx, snapshot, now_secs) {
         tcp_diag_log!(
@@ -15835,6 +15877,42 @@ mod tests {
     }
 
     #[test]
+    fn post_flush_projected_pressure_debt_ignores_fully_accepted_transient_payload() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let post_flush_send_queue = tx_queue_pause_threshold(cfg).saturating_add(1);
+
+        assert_eq!(
+            post_flush_projected_pressure_debt_bytes(post_flush_send_queue, 0, 64 * 1024, cfg),
+            0,
+            "payload bytes already accepted by smoltcp are real egress progress, not residual pending debt"
+        );
+    }
+
+    #[test]
+    fn post_flush_projected_pressure_debt_installs_for_residual_pending_pressure() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let post_flush_send_queue = tx_queue_credit_spend_threshold(cfg);
+        let pending_bytes = 17;
+        let debt = post_flush_projected_pressure_debt_bytes(
+            post_flush_send_queue,
+            pending_bytes,
+            64 * 1024,
+            cfg,
+        );
+
+        assert!(
+            debt > 0,
+            "residual pending after a flush is still local pressure and must keep pressure debt protection"
+        );
+    }
+
+    #[test]
     fn downlink_pressure_credit_debt_repeated_credit_edge_is_idempotent() {
         let cfg = DownlinkBackpressureConfig {
             high_bytes: 100,
@@ -16721,9 +16799,7 @@ mod tests {
             start + std::time::Duration::from_millis(RELAY_ACK_DRAIN_HINT_GAP_MS as u64 + 50),
             None,
         )
-        .expect(
-            "active ordered-stream gaps below 64KiB should still request ACK/window service",
-        );
+        .expect("active ordered-stream gaps below 64KiB should still request ACK/window service");
 
         assert_eq!(due.gap_ms, RELAY_ACK_DRAIN_HINT_GAP_MS + 50);
         assert_eq!(due.remote_to_global_rx_bytes, low_byte_progress as u64);
