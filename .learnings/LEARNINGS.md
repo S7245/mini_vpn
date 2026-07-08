@@ -4210,3 +4210,17 @@ worth cleaning up separately.
   not sufficient. The next architecture work must target local writer/TUN
   egress cadence directly and prove continuous drain before claiming a path to
   `100+ Mbit/s`.
+
+## 2026-07-09 - Knife14gr performance gate blocks more read-credit work
+
+- Gate doc:
+  `docs/tech/2026-07-09-knife14gr-egress-cadence-reachability.md`
+- Outcome: applying the new performance architecture gate showed the B7-era
+  code has nominal batch capacity but no sufficient local egress cadence path
+  as-is. `flush_downlink` can admit large batches, but sustained progress still
+  depends on scattered remote-payload, timer, dirty, and TUN-RX drain paths.
+- Reusable rule: before another VPS run, implement and test a single bounded
+  main-loop egress service lane that alternates TUN RX ACK intake,
+  `iface.poll`, dirty downlink flush, and `flush_tx` until progress stops or a
+  hard budget is reached. Do not return to read-credit floor, self-wake, VPS,
+  MTU, stale-pool, or broad QUIC-window changes as the next step.

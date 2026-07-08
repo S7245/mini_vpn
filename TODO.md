@@ -101,6 +101,8 @@ Latest discriminator:
 Current result doc:
 
 - `docs/tech/2026-07-08-knife14gq-buffered-downlink-results.md`
+- Performance gate for the next slice:
+  `docs/tech/2026-07-09-knife14gr-egress-cadence-reachability.md`
 
 Current follow-up queue:
 
@@ -124,6 +126,11 @@ Current follow-up queue:
    safe1200 reverse-first P1, not yet `100+`. Do not claim the `100+ Mbit/s`
    path is clear until a later slice passes `>30` and then a clean `100+`
    repeat exits normally.
+6. Knife14gr reachability gate says the current B7-era code is not sufficient
+   as-is. The next implementable slice must add an explicit bounded local
+   egress service lane in the main loop, with TDD proving continuous ACK/TUN/
+   smoltcp drain and at least `128KiB` per active service window in harness
+   terms before a VPS run.
 
 ## Roadmap: TUN transparent proxy (Target extraction)
 
