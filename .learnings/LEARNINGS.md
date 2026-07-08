@@ -1,5 +1,40 @@
 # Learnings
 
+## 2026-07-08 - Knife14fu/fw/fx proves VPS can 100M while mini_vpn remains low
+
+- Result doc:
+  `docs/tech/2026-07-08-knife14fu-fw-fx-reverse-discriminator-results.md`
+- Code commit:
+  `6eb52e9` restored ordered TUIC stream reading as the default and gated
+  unordered chunk reassembly behind
+  `MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY=1`.
+- Current-branch bundle:
+  `/tmp/mini_vpn/knife14fu_ordered_default_p1_30/mvpn_knife14fu_ordered_default_p1_30_usclient_suite_20260708_105526.tar.gz`
+- Known-good A/B bundle:
+  `/tmp/mini_vpn/knife14fw_fp_commit_reverse_first_p1_30/mvpn_knife14fw_fp_commit_reverse_first_p1_30_usclient_suite_20260708_110632.tar.gz`
+- Mature-client artifacts:
+  `/tmp/mini_vpn/knife14fx_singbox_client_current/iperf3-reverse-30s.txt`,
+  `/tmp/mini_vpn/knife14fx_singbox_client_current/sing-box-client.log`
+- Outcome: current mini_vpn ordered-default reverse-first P1 collapsed to
+  `0.349/0.046 Mbit/s` with clean local pending/headroom/TUN and QUIC
+  loss/blocking surfaces; the `f8765c1` fp-era clean worktree reached
+  `19.900/18.700 Mbit/s`; a mature sing-box `v1.13.14` client in the same
+  current VPS window reached `173/173 Mbit/s`.
+- What worked: the unordered branch is no longer a default-path risk, and the
+  mature-client A/B gives a decisive answer to the VPS question: `.33` high
+  socket buffers plus current sing-box can still carry `100+ Mbit/s`.
+- What failed: mini_vpn still does not meet clean `100+ Mbit/s` reverse-first
+  acceptance. The current branch is worse than `f8765c1` because it shows a
+  no-data TUIC stream-read/starvation shape; the fp-era code still shows the
+  older local-pressure-credit throughput gap.
+- Reusable rule: when mature sing-box reaches `100+` in the same current window
+  and mini_vpn does not, stop changing VPS config, iperf3, stale pools,
+  MTU/PLPMTUD, or broad QUIC windows. First restore the current branch to a
+  data-moving ordered-stream shape, then resume the mini_vpn controller work.
+- Overall Knife14 estimate: `99%` for diagnosis/ops hardening, but final
+  product acceptance is not `100%` until mini_vpn itself repeats clean
+  `100+ Mbit/s`.
+
 ## 2026-07-08 - Knife14fq cleans timeout tail but does not close final acceptance
 
 - Stage docs:

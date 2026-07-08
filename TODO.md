@@ -2,10 +2,10 @@
 
 ## Current Knife14 Status (2026-07-08)
 
-Knife14fp found a missing high-throughput prerequisite: the exit VPS `.33` had
-Linux socket buffer caps/defaults of only `212992B`, which capped both mini_vpn
-and a mature sing-box client around the `20-30 Mbit/s` band. After raising
-`.33` to:
+Knife14fp found a mandatory high-throughput prerequisite: the exit VPS `.33`
+had Linux socket buffer caps/defaults of only `212992B`, which capped both
+mini_vpn and a mature sing-box client around the `20-30 Mbit/s` band. `.33` is
+now persistently raised to:
 
 ```text
 net.core.rmem_max = 16777216
@@ -14,13 +14,16 @@ net.core.rmem_default = 1048576
 net.core.wmem_default = 1048576
 ```
 
-and restarting sing-box, the mature sing-box client reached `185.242 Mbit/s`
-receiver. The VPS install/optimization checklist is now captured in
+After restarting sing-box under those limits, the mature sing-box client reached
+`185.242 Mbit/s` receiver and a later current-window mature sing-box repeat
+still reached `173/173 Mbit/s`. The VPS install/optimization checklist is
+captured in
 `docs/tech/2026-07-08-vps-install-and-optimization-guide.md`.
 
 Do **not** lower the target to `30 Mbit/s`. The `100+ Mbit/s` target is
-reachable on the current `.27/.33/.77` topology, but the final acceptance is
-not closed yet.
+reachable on the current `.27/.33/.77` topology. Final mini_vpn acceptance is
+not closed because mini_vpn's reverse TUIC TCP data path is still below the
+mature-client baseline.
 
 Latest discriminator:
 
@@ -32,16 +35,36 @@ Latest discriminator:
   `35.700 Mbit/s` receiver with local pressure/headroom gating
   (`may_recv_false=13594`, `headroom_deferred_bytes=17512861`) while QUIC
   loss/blocking and TUN drops stayed `0`.
+- Knife14fu restored the ordered default after rejecting unordered TUIC chunk
+  reassembly, but the current branch at `6eb52e9` collapsed to a no-data
+  reverse-first shape: `0.349/0.046 Mbit/s`, with local pending/headroom/TUN
+  and QUIC loss/blocking surfaces clean.
+- Knife14fw reran the known Knife14fp-era commit `f8765c1` from a clean
+  detached worktree and got `19.900/18.700 Mbit/s` with clean close-tail and
+  healthy direct baselines. This shows the current branch has a worse no-data
+  regression, but the fp-era code still does not reliably reproduce `100+` in
+  the current window.
+- Knife14fx ran a mature sing-box `v1.13.14` client in the same current
+  environment and reached `173/173 Mbit/s`. Therefore VPS config can reach
+  `100+`; the remaining blocker is mini_vpn client/data-plane behavior.
+
+Current result doc:
+
+- `docs/tech/2026-07-08-knife14fu-fw-fx-reverse-discriminator-results.md`
 
 Current follow-up queue:
 
-1. Repeat a focused high-buffer reverse-first A/B with the same clean binary,
-   controlling only timeout/settle and avoiding target SSH evidence pollution
-   where possible.
-2. If low throughput repeats, fix the local pressure edge where small pending
-   plus `send_queue` near the flush/credit high produces `may_recv_false` and
-   headroom deferral despite `tun_tx_dropped_delta=0` and QUIC blocking `0`.
-3. Only after a clean `100+ Mbit/s` repeat exits normally should Knife14 broaden
+1. Keep `6eb52e9`'s ordered-default gate: unordered reassembly is diagnostic
+   only and must not be the default data path.
+2. Diff current branch against `f8765c1` around TUIC stream read service, relay
+   receive cadence, self-wake diagnostics, and local egress-progress feedback to
+   explain the regression from data-moving `18.7 Mbit/s` to no-data `0.046`.
+3. Add a focused ordered stream readiness/progress discriminator: QUIC stream
+   readable state, ordered offset progress, remote read future lifetime, and
+   local egress progress in one timeline.
+4. After current code returns to a data-moving shape, resume the local
+   pressure-credit/controller fix for the remaining reverse throughput gap.
+5. Only after a clean `100+ Mbit/s` repeat exits normally should Knife14 broaden
    to longer-duration or concurrency sweeps.
 
 ## Roadmap: TUN transparent proxy (Target extraction)

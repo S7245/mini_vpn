@@ -26,14 +26,17 @@ net.core.wmem_default = 212992
 After raising only the exit VPS socket buffers and restarting sing-box, the
 same mature sing-box client reached `185.242 Mbit/s` receiver and mini_vpn
 safe1200 reverse-first P1 reached a reported `114.000 Mbit/s` receiver with
-stable high intervals.
+stable high intervals. A later same-topology mature sing-box repeat still
+reached `173/173 Mbit/s`, confirming that the current VPS configuration can
+cross the `100+ Mbit/s` target.
 
 This optimization is necessary, not a standalone bandwidth guarantee. A later
 clean-repeat run exited normally and cleaned close-tail accounting, but fell
-back to `35.700 Mbit/s` with local pressure/headroom gating. Treat the
-socket-buffer preflight as mandatory before blaming mini_vpn credit control,
-TUIC pool size, MTU/PLPMTUD, iperf3, or the VPS path; then still require a
-clean `100+ Mbit/s` acceptance repeat for production.
+back below target with mini_vpn-local pressure/headroom or stream-read
+starvation. Treat the socket-buffer preflight as mandatory before blaming
+mini_vpn credit control, TUIC pool size, MTU/PLPMTUD, iperf3, or the VPS path;
+then use a mature-client A/B to distinguish VPS capacity from mini_vpn
+client/data-plane behavior.
 
 ## Roles
 
@@ -308,3 +311,6 @@ acceptance to regress on paths similar to Knife14fp.
 - Knife14fq showed that longer timeout cleans the close tail but does not yet
   provide stable final acceptance:
   `docs/tech/2026-07-08-knife14fq-timeout120-clean-tail-regression-results.md`.
+- Knife14fu/fw/fx proved the current VPS configuration still reaches
+  `173/173 Mbit/s` with a mature sing-box client while mini_vpn remains low:
+  `docs/tech/2026-07-08-knife14fu-fw-fx-reverse-discriminator-results.md`.

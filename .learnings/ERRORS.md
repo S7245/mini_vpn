@@ -1,5 +1,41 @@
 # Errors
 
+## 2026-07-08 - Older Knife14 suite env flags are easy to mis-set
+
+- Stage: Knife14fv/fx acceptance discriminators.
+- Symptom: the first `f8765c1` clean-worktree run failed before tunnel startup
+  because `EXIT_TO_TARGET_IPERF_CHECK=1` was set without the expected exit SSH
+  host/key env. A second run unintentionally executed the normal forward-first
+  suite because only the stop-after flag was set, not
+  `RUN_REVERSE_FIRST_P1=1`.
+- Cause: the older `knife14b-usclient-tunnel-suite.sh` env contract is strict
+  and does not infer reverse-first mode from `STOP_AFTER_REVERSE_FIRST_P1=1`.
+- Correct behavior: when exit-to-target evidence is enabled, set the required
+  exit SSH env explicitly. For a clean reverse-first P1 run, set both
+  `RUN_REVERSE_FIRST_P1=1` and `STOP_AFTER_REVERSE_FIRST_P1=1`.
+
+## 2026-07-08 - sing-box v1.13 TUN config uses `address`, not `inet4_address`
+
+- Stage: Knife14fx mature sing-box current A/B.
+- Symptom: the temporary sing-box client config check failed when using the old
+  TUN field `inet4_address`.
+- Cause: sing-box `v1.13.14` uses the current TUN schema with `address`, for
+  example `address = ["172.19.0.1/30"]`.
+- Correct behavior: for future mature-client A/B configs, use the v1.13
+  `address` field and run `sing-box check` before starting the temporary TUN
+  client.
+
+## 2026-07-08 - Avoid interactive heredoc helpers when sudo may prompt
+
+- Stage: Knife14fx mature sing-box current A/B.
+- Symptom: an interactive SSH heredoc helper got stuck around the sudo prompt
+  and had to be interrupted.
+- Cause: combining `ssh -tt`, heredoc-fed shell scripts, and sudo prompts makes
+  terminal state and input echo hard to reason about.
+- Correct behavior: copy or create a non-secret temporary helper on the remote
+  host, mark it executable, then run it through a true TTY. Type sudo passwords
+  only at prompts, never in commands, scripts, docs, logs, or summaries.
+
 ## 2026-07-08 - Knife14fq timeout120 repeat regressed throughput
 
 - Stage: Knife14fq high-buffer clean-tail repeat.
