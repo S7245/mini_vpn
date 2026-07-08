@@ -3960,3 +3960,30 @@ worth cleaning up separately.
   relay cadence, self-wake, or pressure-credit result. First run a bounded
   startup-only discriminator on `653d62bf` with pool `1`, then pool `2`, and
   only compare against a clean `f8765c1` startup probe if the failure repeats.
+
+## 2026-07-08 - Knife14fy retry restores data-moving and reopens local pressure-credit
+
+- Result doc:
+  `docs/tech/2026-07-08-knife14fy-ordered-read-service-restore-results.md`
+- Code commit:
+  `653d62bf` (`fix(knife14fy): restore ordered TUIC read diagnostics`)
+- VPS bundle:
+  `/tmp/mini_vpn/knife14fy_ordered_readsvc_p1_30_retry1/mvpn_knife14fy_ordered_readsvc_p1_30_retry1_usclient_suite_20260708_133658.tar.gz`
+- Outcome: startup-only probes with `MINI_VPN_TUIC_TCP_POOL=1` and `2` both
+  succeeded, then the focused safe1200 reverse-first P1 retry entered the data
+  plane and reached `21.4/20.0 Mbit/s`.
+- Useful discriminator: `remote_to_global_rx_bytes=75502079`,
+  `remote_reads=3319`, `remote_read_service_ticks=2763`, and
+  `tuic-tcp-stream-close self_wake_armed=9921 self_wake_fired=8857` prove the
+  ordered path is data-moving again rather than Knife14fu no-data.
+- Clean surfaces: `pending_at_close=0`, `terminal_pending_reap=0`,
+  TUN rx/tx drops `0`, `send_slice_zero=0`, `send_slice_errors=0`, and QUIC
+  loss/congestion/blocking deltas `0`.
+- Remaining root: local pressure-credit/downlink backpressure. The run reported
+  `downlink_backpressure pause_edges=3`, `may_recv_false=7655`,
+  `headroom_deferred_bytes=10188203`, and
+  `pressure_credit_blocked_bytes=960157`.
+- Reusable rule: after startup-only probes pass, treat a single startup-auth
+  close as transient and continue to the data-plane discriminator. The next
+  code stage should be narrow pressure-credit TDD, not TUIC stream/read-service,
+  VPS, iperf3, MTU, stale-pool, or broad QUIC-window work.

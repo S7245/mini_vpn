@@ -2902,6 +2902,11 @@
   startup-only probe on the same commit, then isolate `MINI_VPN_TUIC_TCP_POOL=1`
   vs `2`; compare with clean `f8765c1` startup only if the failure repeats.
 
+Follow-up: the recommended startup-only probes on `653d62bf` with pool `1` and
+pool `2` both succeeded, and the retry acceptance entered the data plane. This
+confirms the first startup-auth close should not be carried forward as the
+active root unless it repeats.
+
 ## 2026-07-08 - `.27` may not have GitHub SSH fetch credentials
 
 - Stage: Knife14fy remote clean worktree setup.

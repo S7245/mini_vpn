@@ -11,7 +11,7 @@ window with `safe1200`, TCP diagnostics enabled, and `MINI_VPN_TUIC_TCP_POOL=2`.
 No VPS tuning, iperf3 changes, MTU/PLPMTUD work, stale-pool work, or broad QUIC
 window changes were part of this stage.
 
-## Artifacts
+## First-Attempt Artifacts
 
 - Remote report:
   `/tmp/conn/mvpn_knife14fy_ordered_readsvc_p1_30_usclient_suite_20260708_115629.md`
@@ -68,7 +68,7 @@ The suite's direct baselines were healthy:
 - `.33 -> .77` forward: `323 Mbit/s` sender, `289 Mbit/s` receiver.
 - `.33 <- .77` reverse: `322 Mbit/s` sender, `297 Mbit/s` receiver.
 
-## Acceptance Outcome
+## First Acceptance Outcome
 
 The acceptance did not reach the reverse-first iperf window. `client-tun`
 failed during TUIC startup:
@@ -90,33 +90,103 @@ the `11:56-11:59 CST` failure window. The latest TUIC records in the inspected
 tail were from earlier successful tests around `11:13 CST`; later visible noise
 was unrelated VLESS/REALITY invalid-handshake traffic.
 
+## Follow-Up Startup Probes
+
+After the first startup-auth failure, two bounded startup-only probes were run
+on the same clean `.27` worktree and the same `653d62bf` binary:
+
+- `MINI_VPN_TUIC_TCP_POOL=1`
+  - log: `/tmp/conn/knife14fy_startup_pool1_20260708_053528.log`
+  - outcome: startup succeeded, `✅ 已连接 TUIC 出口` and
+    `🌊 UDP relay 数据面就绪` were present.
+- `MINI_VPN_TUIC_TCP_POOL=2`
+  - log: `/tmp/conn/knife14fy_startup_pool2_20260708_053626.log`
+  - outcome: startup succeeded, the auxiliary TCP pool slot was established,
+    and both QUIC stats streams were visible.
+
+This demotes the first `tuic auth finish: sending stopped by peer: error 0`
+result from a deterministic code failure to a transient startup/environment
+failure unless it repeats in a future controlled run.
+
+## Retry Acceptance Artifacts
+
+- Remote report:
+  `/tmp/conn/mvpn_knife14fy_ordered_readsvc_p1_30_retry1_usclient_suite_20260708_133658.md`
+- Remote bundle:
+  `/tmp/conn/mvpn_knife14fy_ordered_readsvc_p1_30_retry1_usclient_suite_20260708_133658.tar.gz`
+- Local report:
+  `/tmp/mini_vpn/knife14fy_ordered_readsvc_p1_30_retry1/mvpn_knife14fy_ordered_readsvc_p1_30_retry1_usclient_suite_20260708_133658.md`
+- Local bundle:
+  `/tmp/mini_vpn/knife14fy_ordered_readsvc_p1_30_retry1/mvpn_knife14fy_ordered_readsvc_p1_30_retry1_usclient_suite_20260708_133658.tar.gz`
+- Client log:
+  `/tmp/conn/mvpn_accept_20260708_133658.log`
+
+## Retry Acceptance Outcome
+
+The retry reached the reverse-first data plane and restored the current branch
+from the Knife14fu no-data shape to a data-moving shape:
+
+- reverse-first P1: `21.4 Mbit/s` sender, `20.0 Mbit/s` receiver.
+- `throughput_shape=low_average`, `no_data=0`, `local_pressure=1`.
+- `remote_to_global_rx_bytes=75502079`.
+- `remote_reads=3319`.
+- `remote_read_service_ticks=2763`.
+- `remote_read_service_len_min=1200`, `remote_read_service_len_max=65536`.
+- `tuic-open-tcp` showed `relay_mode=ordered_join` and
+  `startup_auth_attempts=1` on the data stream.
+- `tuic-tcp-stream-close` showed `self_wake_armed=9921` and
+  `self_wake_fired=8857`.
+
+Clean surfaces stayed clean:
+
+- `pending_at_close=0`.
+- `terminal_pending_reap=0`.
+- `tun_rx_dropped_delta=0`, `tun_tx_dropped_delta=0`.
+- QUIC loss, congestion, tx-blocking, and rx-blocking deltas were zero.
+
+The limiting surfaces were local pressure and downlink backpressure:
+
+- `downlink_backpressure pause_edges=3 resume_edges=2`.
+- `send_queue_max=503160`.
+- `may_recv_false=7655`.
+- `budget_limited=7321`.
+- `headroom_limited=7330`.
+- `headroom_deferred_bytes=10188203`.
+- `pressure_credit_blocked_bytes=960157`.
+- final attribution:
+  `final_headroom_limited+final_drain_credit+final_pressure_credit+final_hard_edge_guard`.
+
 ## Interpretation
 
-This run is not a throughput result and does not prove or disprove the ordered
-read-service restoration. It only proves that this acceptance attempt was
-blocked before the data plane could be exercised.
+The first run alone was not a throughput result and did not prove or disprove
+the ordered read-service restoration. The startup-only probes and retry
+acceptance completed that discriminator.
 
-The current branch did not materially change the primary 1-RTT authenticate
-path compared with `f8765c1`; the code change there is diagnostic accounting for
-auxiliary TCP pool startup attempts. Because the failure happened while
-finishing TUIC Authenticate and produced no contemporaneous sing-box TUIC
-inbound log, the next discriminator must isolate startup/auth repeatability
-before changing read cadence, egress credit, or throughput controls.
+The ordered read-service restore succeeded at the stage goal: the current
+branch is no longer in a no-data state. It now matches the expected next branch:
+data moves in the tens of megabits range, while local pressure-credit and
+downlink backpressure keep the reverse-first window below the `100+ Mbit/s`
+target.
 
 ## Proposed Next Step
 
-Wait for confirmation before further execution or code changes. The next safe
-diagnostic should be startup-only:
+Wait for confirmation before code changes. The next code stage should target
+local pressure-credit only:
 
-1. Run a short `.27` startup probe on the same `653d62bf` clean worktree with
-   `MINI_VPN_TUIC_TCP_POOL=1`, no iperf window, and a bounded timeout.
-2. If pool `1` starts, repeat startup-only with `MINI_VPN_TUIC_TCP_POOL=2` to
-   separate primary authenticate from auxiliary-slot behavior.
-3. If startup succeeds, rerun the same focused reverse-first P1 acceptance once.
-4. If startup still fails, run the same startup-only probe on a clean
-   `f8765c1` worktree before touching code. Only if `f8765c1` starts and
-   `653d62bf` does not should the next code change instrument or adjust the
-   startup authenticate/open-uni path.
+1. Add focused tests for the pressure-credit/backpressure decision when the TUN
+   send queue is high but kernel drops are zero and TCP send capacity remains
+   available.
+2. Preserve the existing hard safety invariants: bounded pending bytes, no
+   terminal pending leak, no `send_slice_zero`/errors, and clean TUN drop
+   accounting.
+3. Adjust the local credit/headroom gate so short-lived TUN queue pressure does
+   not suppress useful reverse downlink reads for multi-second windows when
+   send capacity and drop signals are healthy.
+4. Re-run local tests, then one focused reverse-first P1 acceptance. Success is
+   data-moving with materially fewer `may_recv_false`,
+   `headroom_deferred_bytes`, and `pressure_credit_blocked_bytes`, while keeping
+   pending/terminal/TUN/QUIC surfaces clean.
 
 Do not tune VPS settings, iperf3, MTU/PLPMTUD, stale pool, or broad QUIC windows
-for this failure unless new evidence contradicts the startup-auth diagnosis.
+for the next stage unless new evidence contradicts the local pressure-credit
+diagnosis.
