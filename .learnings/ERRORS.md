@@ -2820,3 +2820,20 @@
   branch, then design a deeper discriminator around quinn per-stream readiness,
   ordered stream offsets, server-side sending cadence, or a custom-exit data
   channel.
+
+## 2026-07-08 - Do not keep unordered TUIC reassembly enabled by default
+
+- Stage: Knife14ft unordered TUIC chunk reassembly.
+- Symptom: commit `a4bfbe6` consumed `RecvStream::read_chunk(..., false)` and
+  locally reassembled by stream offset, but the focused safe1200 P1 collapsed to
+  `0.280/0.004 Mbit/s`, worse than the prior ordered stream path.
+- Cause: unordered reads exposed real stream offset gaps, but local staging did
+  not turn later-offset chunks into useful ordered TCP payload. The run showed
+  `tuic-tcp-unordered-staging` with `gap_bytes=47972`, `max_buffered=29702B`,
+  and `cap_hits=0`, while the active stream still had
+  `connection_stream_frames_pending=34`, `data_pending_gap_max_ms=23033`, and
+  clean local pending/headroom/TUN/QUIC blocking surfaces.
+- Correct behavior: before the next VPS acceptance, revert `a4bfbe6` or gate it
+  behind an explicit diagnostic env flag with the default path restored to the
+  ordered stream reader. Use unordered staging only to collect offset-gap
+  evidence, not as the production data path.

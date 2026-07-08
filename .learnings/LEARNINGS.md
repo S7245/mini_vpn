@@ -3847,3 +3847,32 @@ worth cleaning up separately.
   this evidence. The next branch must go below the wrapper layer: quinn
   per-stream readiness/ordered-offset tracing, server-side sending trace, or a
   controlled custom-exit/TUIC data-channel discriminator.
+
+## 2026-07-08 - Knife14ft rejects default unordered TUIC reassembly as the final fix
+
+- Result doc:
+  `docs/tech/2026-07-08-knife14ft-unordered-reassembly-results.md`
+- Code commits:
+  `8b1d86d` reverted the failed explicit wrapper, and `a4bfbe6` added bounded
+  unordered `RecvStream::read_chunk(false)` consumption with local offset
+  reassembly before exposing ordered bytes to the relay.
+- VPS bundle:
+  `/tmp/mini_vpn/knife14ft_unordered_reassembly_p1_30/mvpn_knife14ft_unordered_reassembly_p1_30_usclient_suite_20260708_103800.tar.gz`
+- Outcome: local TDD, `cargo test tuic --lib`, `cargo test --lib`, release
+  build, and the focused `.27 -> .33 -> .77` safe1200 reverse-first P1 ran, but
+  acceptance failed badly at `0.280/0.004 Mbit/s` with a no-data shape.
+- Useful discriminator: new `tuic-tcp-unordered-staging` logs proved real
+  stream-offset gaps (`next_offset=14120`, `chunk_offset=62092`,
+  `gap_bytes=47972`) while local staging remained bounded
+  (`max_buffered=29702B`, `cap_hits=0`). The active data stream still showed
+  `connection_stream_frames_pending=34`, `data_pending_gap_max_ms=23033`, and
+  `data_read_gap_max_ms=23935`.
+- Clean surfaces stayed clean: `pending_total_max=0`, `may_recv_false=0`,
+  `headroom_deferred_bytes=0`, `pending_at_close=0`,
+  `terminal_pending_reap=0`, `tun_tx_dropped_delta=0`, and QUIC
+  loss/congestion/blocking stayed zero.
+- Reusable rule: do not keep `a4bfbe6` as the default data path. Revert it or
+  gate it behind an explicit diagnostic env flag before another acceptance run.
+  The next repair needs server-side sending cadence / qlog-style evidence,
+  quinn ordered-offset readiness tracing, or a custom-exit/TUIC data-channel
+  discriminator.
