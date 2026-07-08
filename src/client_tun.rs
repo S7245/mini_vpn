@@ -2240,8 +2240,8 @@ struct DownlinkEgressCreditDebt {
 type DownlinkEgressDropDebt = DownlinkEgressCreditDebt;
 
 impl DownlinkEgressCreditDebt {
-    fn has_active_debt(&self) -> bool {
-        self.debt_bytes > 0
+    fn has_active_drop_debt(&self) -> bool {
+        self.drop_debt_bytes > 0
     }
 
     fn note_tun_drop(&mut self, cfg: DownlinkBackpressureConfig) -> usize {
@@ -2344,18 +2344,15 @@ impl DownlinkEgressClock {
         let mut observation = DownlinkEgressCreditObservation::default();
         if self.drop_debt_generation_seen != drop_debt.generation {
             self.drop_debt_generation_seen = drop_debt.generation;
-            match drop_debt
-                .last_source
-                .unwrap_or(EgressCreditDebtSource::Drop)
-            {
-                EgressCreditDebtSource::Drop => {
-                    observation.drop_credit_blocked_bytes = self.drain_credit_bytes;
-                }
-                EgressCreditDebtSource::Pressure => {
-                    observation.pressure_credit_blocked_bytes = self.drain_credit_bytes;
-                }
+            if drop_debt.has_active_drop_debt() {
+                observation.drop_credit_blocked_bytes = self.drain_credit_bytes;
+                self.drain_credit_bytes = 0;
+            } else if matches!(
+                drop_debt.last_source,
+                Some(EgressCreditDebtSource::Pressure)
+            ) {
+                observation.pressure_credit_blocked_bytes = 0;
             }
-            self.drain_credit_bytes = 0;
         }
 
         let Some(last_send_queue) = self.last_send_queue else {
@@ -2380,7 +2377,7 @@ impl DownlinkEgressClock {
             .pressure_credit_blocked_bytes
             .saturating_add(debt_payment.pressure_bytes.min(max_credit));
         let creditable_drain = if debt_paid == 0 { observed_drain } else { 0 };
-        let granted = if drop_debt.debt_bytes == 0 {
+        let granted = if !drop_debt.has_active_drop_debt() {
             creditable_drain.min(max_credit)
         } else {
             0
@@ -2525,17 +2522,18 @@ fn bounded_downlink_flush_limit_for_window_with_clock_and_drop(
     let hard_headroom = tx_queue_pause_threshold(cfg).saturating_sub(send_window.send_queue);
     let target_edge = tx_queue_egress_target_threshold(cfg);
     let credit_observation = clock.note_observed_send_queue(send_window.send_queue, cfg, drop_debt);
-    let hard_limit_edge = if drop_debt.debt_bytes == 0 {
-        tx_queue_credit_spend_threshold(cfg)
-    } else {
+    let hard_credit_blocked = drop_debt.has_active_drop_debt();
+    let hard_limit_edge = if hard_credit_blocked {
         target_edge
+    } else {
+        tx_queue_credit_spend_threshold(cfg)
     };
     let hard_edge_guard = tx_queue_pause_threshold(cfg).saturating_sub(hard_limit_edge);
     let guarded_hard_headroom = hard_limit_edge.saturating_sub(send_window.send_queue);
-    let usable_credit = if drop_debt.debt_bytes == 0 {
-        clock.drain_credit_bytes
-    } else {
+    let usable_credit = if hard_credit_blocked {
         0
+    } else {
+        clock.drain_credit_bytes
     };
     let unguarded_available = clean_headroom
         .saturating_add(usable_credit)
@@ -5346,7 +5344,7 @@ pub async fn run_event_loop<D, U, M>(
             downlink_rx_paused,
             downlink_stats,
             downlink_backpressure,
-            downlink_egress_drop_debt.has_active_debt(),
+            downlink_egress_drop_debt.has_active_drop_debt(),
         );
         if next_downlink_rx_paused != previous_downlink_rx_paused {
             downlink_rx_paused = next_downlink_rx_paused;
@@ -5391,7 +5389,7 @@ pub async fn run_event_loop<D, U, M>(
             downlink_backpressure,
             runtime_config.tun_mtu,
             downlink_flush_max_bytes,
-            downlink_egress_drop_debt.has_active_debt(),
+            downlink_egress_drop_debt.has_active_drop_debt(),
             downlink_rx_paused || tun_egress_feedback.is_paused(),
         );
         tokio::select! {
@@ -5459,7 +5457,7 @@ pub async fn run_event_loop<D, U, M>(
                             downlink_backpressure,
                             runtime_config.tun_mtu,
                             downlink_flush_max_bytes,
-                            downlink_egress_drop_debt.has_active_debt(),
+                            downlink_egress_drop_debt.has_active_drop_debt(),
                             downlink_rx_paused || tun_egress_feedback.is_paused(),
                         );
                         let accepted_bytes = match handle_remote_payload(
@@ -5502,7 +5500,7 @@ pub async fn run_event_loop<D, U, M>(
                             downlink_backpressure,
                             runtime_config.tun_mtu,
                             downlink_flush_max_bytes,
-                            downlink_egress_drop_debt.has_active_debt(),
+                            downlink_egress_drop_debt.has_active_drop_debt(),
                             downlink_rx_paused || tun_egress_feedback.is_paused(),
                         );
                         let has_downlink_work = should_drain_tun_rx_after_remote_payload(
@@ -5587,7 +5585,7 @@ pub async fn run_event_loop<D, U, M>(
                             downlink_backpressure,
                             runtime_config.tun_mtu,
                             downlink_flush_max_bytes,
-                            downlink_egress_drop_debt.has_active_debt(),
+                            downlink_egress_drop_debt.has_active_drop_debt(),
                             relay_read_hard_pause,
                         );
                         let current_downlink_stats =
@@ -5868,7 +5866,7 @@ pub async fn run_event_loop<D, U, M>(
                     &mut fake_pool,
                     now,
                     downlink_backpressure,
-                    downlink_egress_drop_debt.has_active_debt()
+                    downlink_egress_drop_debt.has_active_drop_debt()
                         || tun_egress_feedback.is_paused(),
                 );
             }
@@ -6047,8 +6045,8 @@ pub async fn run_event_loop<D, U, M>(
                 // #1：timer tick 无新 inbound 包，只续推进脏集合（主要是下行 pending flush +
                 // smoltcp 超时重传释放 tx buffer 后继续写）。不再全量 sweep。
                 let close_egress_guard = tun_egress_feedback.is_paused()
-                    || downlink_egress_drop_debt.has_active_debt();
-                let relay_read_recovery_active = downlink_egress_drop_debt.has_active_debt();
+                    || downlink_egress_drop_debt.has_active_drop_debt();
+                let relay_read_recovery_active = downlink_egress_drop_debt.has_active_drop_debt();
                 let relay_read_hard_pause = downlink_rx_paused || tun_egress_feedback.is_paused();
                 process_dirty_relay(
                     &mut dirty,
@@ -6166,8 +6164,8 @@ where
     }
     metrics.leave_poll();
 
-    let close_egress_guard = downlink_egress_drop_debt.has_active_debt();
-    let relay_read_recovery_active = downlink_egress_drop_debt.has_active_debt();
+    let close_egress_guard = downlink_egress_drop_debt.has_active_drop_debt();
+    let relay_read_recovery_active = downlink_egress_drop_debt.has_active_drop_debt();
     process_dirty_relay(
         dirty,
         sockets,
@@ -15894,7 +15892,7 @@ mod tests {
     }
 
     #[test]
-    fn downlink_pressure_credit_debt_blocks_stale_credit_before_tun_drop() {
+    fn downlink_pressure_credit_debt_preserves_healthy_credit_before_tun_drop() {
         let cfg = DownlinkBackpressureConfig {
             high_bytes: 100,
             low_bytes: 40,
@@ -15935,17 +15933,92 @@ mod tests {
             &mut credit_debt,
         );
 
-        assert_eq!(limit.len, 30);
+        assert_eq!(limit.len, 57);
         assert_eq!(limit.clean_headroom_bytes, 30);
         assert_eq!(limit.drain_credit_granted_bytes, 0);
-        assert_eq!(limit.drain_credit_planned_bytes, 0);
+        assert_eq!(limit.drain_credit_planned_bytes, 27);
         assert_eq!(limit.pressure_credit_debt_paid_bytes, 17);
         assert_eq!(limit.pressure_credit_debt_bytes, 0);
         assert_eq!(
-            limit.pressure_credit_blocked_bytes, 44,
-            "stale credit plus pressure-paid drain should be attributed to pressure debt"
+            limit.pressure_credit_blocked_bytes, 17,
+            "the drain that pays pressure debt is still attributed, but existing healthy credit remains usable before an actual TUN drop"
         );
         assert_eq!(limit.drop_credit_blocked_bytes, 0);
+    }
+
+    #[test]
+    fn downlink_pressure_debt_keeps_healthy_drain_credit_usable() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let mut pressure_clock = DownlinkEgressClock {
+            last_send_queue: Some(tx_queue_flush_threshold(cfg)),
+            drain_credit_bytes: downlink_egress_credit_span(cfg),
+            drop_debt_generation_seen: 0,
+        };
+        let mut pressure_debt = DownlinkEgressCreditDebt::default();
+        pressure_debt.note_egress_pressure(
+            DownlinkPressureStats::new(
+                0,
+                0,
+                tx_queue_credit_spend_threshold(cfg),
+                tx_queue_credit_spend_threshold(cfg),
+            ),
+            cfg,
+        );
+        let pressure_window = TcpSendWindowSnapshot {
+            can_send: true,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 100,
+            send_queue: tx_queue_egress_target_threshold(cfg) + 2,
+            recv_queue: 0,
+        };
+        let pressure_limit = bounded_downlink_flush_limit_for_window_with_clock_and_drop(
+            100,
+            100,
+            pressure_window,
+            cfg,
+            &mut pressure_clock,
+            &mut pressure_debt,
+        );
+
+        assert_eq!(
+            pressure_limit.len,
+            tx_queue_credit_spend_threshold(cfg) - pressure_window.send_queue,
+            "soft pressure debt must not turn healthy drain credit into a zero-write freeze"
+        );
+        assert_eq!(
+            pressure_limit.drain_credit_planned_bytes,
+            pressure_limit.len
+        );
+        assert_eq!(pressure_limit.drop_credit_blocked_bytes, 0);
+
+        let mut drop_clock = DownlinkEgressClock {
+            last_send_queue: Some(tx_queue_flush_threshold(cfg)),
+            drain_credit_bytes: downlink_egress_credit_span(cfg),
+            drop_debt_generation_seen: 0,
+        };
+        let mut drop_debt = DownlinkEgressCreditDebt::default();
+        drop_debt.note_tun_drop(cfg);
+        let drop_limit = bounded_downlink_flush_limit_for_window_with_clock_and_drop(
+            100,
+            100,
+            pressure_window,
+            cfg,
+            &mut drop_clock,
+            &mut drop_debt,
+        );
+
+        assert_eq!(
+            drop_limit.len, 0,
+            "real drop debt still blocks credit once the queue is already beyond the target edge"
+        );
+        assert_eq!(
+            drop_limit.drop_credit_blocked_bytes,
+            downlink_egress_credit_span(cfg)
+        );
     }
 
     #[test]
