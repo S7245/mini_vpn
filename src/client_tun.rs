@@ -1998,11 +1998,7 @@ impl DownlinkCreditController {
         let ack_drain_floor = relay_remote_read_ack_drain_floor_bytes(tun_mtu);
         let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
         let pause_headroom = tx_queue_pause_threshold(cfg).saturating_sub(local_pressure_bytes);
-        let target = if local_pressure_bytes >= tx_queue_egress_target_threshold(cfg) {
-            ack_drain_floor
-        } else {
-            pressure_floor.min(pause_headroom.max(ack_drain_floor))
-        };
+        let target = pressure_floor.min(pause_headroom.max(ack_drain_floor));
         self.ack_cadence_boost_bytes =
             clamp_relay_remote_read_ack_drain_bytes(target.max(ack_drain_floor), tun_mtu);
     }
@@ -10285,6 +10281,30 @@ mod tests {
             controller.adaptive_ack_drain_floor_for(tx_queue_flush_threshold(cfg), cfg, tun_mtu),
             ack_drain_floor,
             "hard pause feedback must clear cadence boost"
+        );
+    }
+
+    #[test]
+    fn downlink_credit_controller_gap_hint_at_credit_edge_keeps_headroom_sized_boost() {
+        let cfg = DownlinkBackpressureConfig::default();
+        let tun_mtu = 1200;
+        let ack_drain_floor = relay_remote_read_ack_drain_floor_bytes(tun_mtu);
+        let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        let credit_edge = tx_queue_credit_spend_threshold(cfg);
+        let pause_headroom = tx_queue_pause_threshold(cfg).saturating_sub(credit_edge);
+        let mut controller = DownlinkCreditController::default();
+
+        controller.note_ack_cadence_gap_hint(credit_edge, false, cfg, tun_mtu);
+        let boosted = controller.adaptive_ack_drain_floor_for(credit_edge, cfg, tun_mtu);
+
+        assert!(
+            boosted > ack_drain_floor,
+            "a relay-read gap observed at the credit edge should not collapse to the single-MTU ACK floor: boosted={boosted}, ack_floor={ack_drain_floor}"
+        );
+        assert_eq!(
+            boosted,
+            pressure_floor.min(pause_headroom.max(ack_drain_floor)),
+            "credit-edge gap boost should spend only the remaining pause headroom"
         );
     }
 
