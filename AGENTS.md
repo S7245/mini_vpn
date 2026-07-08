@@ -66,6 +66,46 @@ Small related issues found during review should be fixed together before a
 concentrated integration test, instead of running a full VPS suite after every
 tiny edit.
 
+## Performance Architecture Gate
+
+For any throughput stage, especially one that predicts `>30 Mbit/s`,
+`>100 Mbit/s`, or claims to be an architecture change, the agent must complete
+a code-level reachability review before implementation or VPS acceptance. Do
+not rely on "try it and see" as the primary design method.
+
+Required gate contents:
+
+- Target capacity math: translate the target into bytes/sec and compare it
+  with the planned loop, batch, flush, queue, and timer capacities.
+- End-to-end hot path inventory: list the exact code path from remote TUIC read
+  through buffering, local TCP/smoltcp write, `iface.poll`, `flush_tx`, and TUN
+  egress. Name the functions that will provide continuous progress.
+- Necessary vs sufficient classification: explicitly state whether the change
+  fixes only a necessary precondition or is intended to be sufficient for the
+  next Mbps gate. A necessary-only fix must not be described as likely to reach
+  `30 Mbit/s` or `100+ Mbit/s`.
+- Old-path audit: list the old throttling, pacing, credit, timer, or writer
+  paths that remain active. If the old local egress path remains active, do not
+  claim a full data-plane architecture replacement.
+- Failure discriminators: define which logs/counters will prove the bottleneck
+  is remote read service, local buffer growth, local writer/egress cadence,
+  smoltcp/TUN drain, QUIC/path behavior, or lifecycle/close-tail handling.
+- TDD plan: add deterministic tests or harness checks for the code-level
+  invariant before asking a VPS run to quantify throughput.
+- Stop rule: if the gate cannot show a plausible sufficient path to the next
+  Mbps target, say that directly, write the limitation down, and do not proceed
+  with implementation as if the target were likely.
+
+VPS acceptance is still required for the final Mbps number, because real QUIC,
+kernel, TUN, smoltcp, RTT, and scheduler behavior cannot be proven statically.
+However, VPS acceptance must validate a design that already passed the
+code-level reachability gate; it must not substitute for that gate.
+
+After a failed performance run, compare the expected gate invariants with the
+observed counters before modifying code again. Do not continue with the same
+class of tweak if the run proves that class of fix was only necessary, not
+sufficient.
+
 ## Current Agent Role And Knife14 Position
 
 The agent's role in this repository is data-plane engineering for the
