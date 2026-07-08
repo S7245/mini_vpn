@@ -2803,3 +2803,20 @@
 - Correct behavior: before lowering the target or declaring TUIC single-stream
   architecture blocked, check and fix exit-side Linux socket buffers, then
   restart sing-box. Treat this as a mandatory high-throughput preflight.
+
+## 2026-07-08 - Do not treat `tokio::io::join` as the remaining stream starvation root
+
+- Stage: Knife14fs explicit TUIC relay stream wrapper.
+- Symptom: commit `f25c952` replaced `tokio::io::join(recv, send)` with an
+  explicit `TuicTcpRelayStream { recv, send }`, but the focused safe1200 P1
+  regressed to `1.29/0.132 Mbit/s` and remained a no-data shape.
+- Cause: the failure persisted below the wrapper layer. Local pressure was
+  clean (`pending_total_max=0`, `may_recv_false=0`,
+  `headroom_deferred_bytes=0`) and QUIC loss/blocking/rx-blocked stayed zero,
+  while the active stream still showed `connection_stream_frames_pending` and
+  multi-second read gaps.
+- Correct behavior: do not continue join-vs-wrapper edits or local credit
+  tuning for this shape. Revert or isolate `f25c952` before the next code
+  branch, then design a deeper discriminator around quinn per-stream readiness,
+  ordered stream offsets, server-side sending cadence, or a custom-exit data
+  channel.

@@ -3822,3 +3822,28 @@ worth cleaning up separately.
   buffers are high, `100+ Mbit/s` is reachable on this topology. The next mini_vpn
   work is close-tail cleanliness under high throughput, not more local credit,
   MTU/PLPMTUD, pool, or sing-box version chasing.
+
+## 2026-07-08 - Knife14fs rejects the explicit TUIC stream wrapper as the final fix
+
+- Result doc:
+  `docs/tech/2026-07-08-knife14fs-explicit-tuic-relay-stream-results.md`
+- Code commit:
+  `f25c952` (`fix: use explicit TUIC TCP relay stream`)
+- VPS bundle:
+  `/tmp/mini_vpn/knife14fs_explicit_tuic_stream_p1_30/mvpn_knife14fs_explicit_tuic_stream_p1_30_usclient_suite_20260708_101623.tar.gz`
+- Outcome: local TDD, `cargo test tuic --lib`, `cargo test --lib`, release
+  build, and the focused `.27 -> .33 -> .77` safe1200 reverse-first P1 ran
+  cleanly, but acceptance failed badly at `1.29/0.132 Mbit/s`.
+- Useful discriminator: replacing `tokio::io::join(recv, send)` with an
+  explicit `TuicTcpRelayStream { recv, send }` did not reduce starvation. The
+  active data stream still reported `connection_stream_frames_pending=21`,
+  `data_pending_gap_max_ms=17024`, and `data_read_gap_max_ms=13776`.
+- Clean surfaces stayed clean: `pending_total_max=0`, `may_recv_false=0`,
+  `headroom_deferred_bytes=0`, `pending_at_close=0`,
+  `terminal_pending_reap=0`, `tun_tx_dropped_delta=0`, and QUIC
+  loss/congestion/blocking/rx-blocked stayed zero.
+- Reusable rule: do not keep tuning local downlink credit, egress pacer,
+  TUN RX/ACK drain, pool size, MTU/PLPMTUD, or the join-vs-wrapper layer for
+  this evidence. The next branch must go below the wrapper layer: quinn
+  per-stream readiness/ordered-offset tracing, server-side sending trace, or a
+  controlled custom-exit/TUIC data-channel discriminator.
