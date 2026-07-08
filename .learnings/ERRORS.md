@@ -2933,3 +2933,20 @@ active root unless it repeats.
   this result. The next repair must add tests and code for egress-progress
   feedback into TUIC stream read service/self-wake, while preserving bounded
   pending and hard drop/pause safety.
+
+## 2026-07-08 - Keep-read-armed alone does not cover low-byte ordered stream gaps
+
+- Stage: Knife14gl keep relay reads armed across credit updates.
+- Symptom: commit `18ed16ef` fixed the local TDD regression and restored the
+  data stream's first useful read to `first_rx_ms=3`, but the focused safe1200
+  reverse-first P1 still failed at `280 Kbit/s` sender and `16.2 Kbit/s`
+  receiver.
+- Cause: the run stalled after only `remote_to_global_rx_bytes=60704`, below
+  `RELAY_ACK_DRAIN_HINT_MIN_DATA_BYTES=64KiB`. With
+  `pending_cause=connection_stream_frames_pending` and no local pressure,
+  `ack_drain_hint_due=0`/`ack_drain_hint_sent=0` left the ordered stream in a
+  low-byte early-gap shape that the local TDD suite did not cover.
+- Correct behavior: do not claim the `20M -> 100M+` path is closed merely
+  because relay-reader cancellation and pressure-credit tests pass. Before the
+  next VPS run, add a focused test for low-byte ordered-stream gap ACK/window
+  service while preserving no-read-while-paused and bounded pending invariants.

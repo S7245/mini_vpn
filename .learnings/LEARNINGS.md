@@ -4040,3 +4040,26 @@ worth cleaning up separately.
   TUIC stream read-service wakeups, and should prove with tests that pending
   stream frames plus available local send capacity cause an immediate bounded
   read-service tick.
+
+## 2026-07-08 - Knife14gl keep-read-armed restores first_rx but not data-moving
+
+- Result doc:
+  `docs/tech/2026-07-08-knife14gl-keep-read-armed-results.md`
+- Code commit:
+  `18ed16ef` (`fix(knife14gl): keep relay reads armed across credit updates`)
+- VPS bundle:
+  `/tmp/mini_vpn/knife14gl_keep_read_armed_safe1200_p1_30/mvpn_knife14gl_keep_read_armed_safe1200_p1_30_usclient_suite_20260708_164002.tar.gz`
+- Outcome: local TDD proved and fixed a real current-vs-`f8765c1` regression:
+  non-pausing read-credit updates no longer cancel an in-flight ordered stream
+  read. The data stream `first_rx_ms` improved from `17266ms` in `knife14gj` to
+  `3ms` in `knife14gl`, matching the `f8765c1` shape.
+- Acceptance still failed: reverse-first P1 reached only `280 Kbit/s` sender
+  and `16.2 Kbit/s` receiver. The stream stalled at
+  `remote_to_global_rx_bytes=60704`, with `pending_cause=connection_stream_frames_pending`,
+  `max_remote_read_gap_ms=17096`, no local pressure, no TUN drops, and no QUIC
+  loss/blocking.
+- Reusable rule: the next root is not local pressure-credit yet. The early data
+  stream gap can sit below `RELAY_ACK_DRAIN_HINT_MIN_DATA_BYTES=64KiB`, so
+  `ack_drain_hint_due` stays `0` even while ordered QUIC stream frames are
+  pending. The next TDD slice should cover low-byte ordered-stream gap service
+  before another VPS run.
