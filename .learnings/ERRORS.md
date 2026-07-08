@@ -1,5 +1,18 @@
 # Errors
 
+## 2026-07-08 - Use `env` rather than long `export ... bash script` suite launches
+
+- Stage: Knife14go focused safe1200 reverse-first P1 acceptance.
+- Symptom: the first suite launch failed immediately with
+  `bash: line 1: export: 'scripts/knife14b-usclient-tunnel-suite.sh': not a valid identifier`.
+- Cause: the command used `export VAR=... bash scripts/...`; shell `export`
+  treated `bash` and the script path as identifiers instead of executing the
+  suite.
+- Correct behavior: after sourcing `.env`, launch one-shot suite environment
+  overrides as `env VAR=... bash scripts/knife14b-usclient-tunnel-suite.sh`.
+  This keeps secrets in sourced environment variables and avoids malformed
+  export syntax.
+
 ## 2026-07-08 - Codex exec must allocate a writable PTY for sudo suites
 
 - Stage: Knife14gn focused safe1200 reverse-first P1 acceptance.

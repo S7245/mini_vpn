@@ -62,26 +62,38 @@ Latest discriminator:
   The important discriminator changed: `local_pressure=0`, pressure/drop debt
   and TUN drops stayed `0`, while `connection_stream_frames_pending` gaps
   remained at `3405ms`.
+- Knife14go added TDD and code for active connection-RX self-wake. Commit
+  `39112ca` makes pending TUIC reads self-wake for both
+  `connection_stream_frames_pending` and `connection_rx_no_stream_frames`.
+  Focused safe1200 reverse-first P1 improved only to `24.6/22.4 Mbit/s`, still
+  **not** `>30`. The useful discriminator: data-stream polling cadence improved
+  (`data_poll_gap_max_ms=43`, `self_wake_armed=11702`,
+  `self_wake_fired=8726`), but ordered delivery still had multi-second gaps
+  (`data_read_gap_max_ms=3872`, `data_pending_gap_max_ms=3006`) and the final
+  burst reintroduced one local pressure edge (`downlink_backpressure
+  pause_edges=1`, `read_credit_pause_updates=1`).
 
 Current result doc:
 
-- `docs/tech/2026-07-08-knife14gn-accepted-flush-progress-results.md`
+- `docs/tech/2026-07-08-knife14go-active-conn-rx-self-wake-results.md`
 
 Current follow-up queue:
 
 1. Keep the ordered-default gate and the Knife14gm low-byte ACK/window service
-   fix, plus the Knife14gn accepted-flush progress feedback; unordered
-   reassembly remains diagnostic only.
-2. Do not keep changing local pressure-credit constants from Knife14gn: the
-   latest low run has `local_pressure=0`, no pressure/drop debt, no TUN drops,
-   no QUIC loss/blocking, and zero read-credit pause updates.
-3. Next code slice should focus on TUIC ordered-stream receive cadence and
-   self-wake diagnostics when `pending_cause=connection_stream_frames_pending`
-   repeats for multi-second gaps despite available read credit.
+   fix, Knife14gn accepted-flush progress feedback, and Knife14go active
+   connection-RX self-wake; unordered reassembly remains diagnostic only.
+2. Do not keep changing local pressure-credit constants blindly. Knife14go
+   shows the relay is now polled frequently, but ordered delivery still stalls
+   for seconds before the late catch-up burst produces a local pressure edge.
+3. Next code slice should distinguish connection-level STREAM frame progress
+   from current-stream deliverable progress when
+   `pending_cause=connection_stream_frames_pending` repeats for multi-second
+   gaps despite frequent polling.
 4. The next focused acceptance target is still first `>30 Mbit/s` on the same
    safe1200 reverse-first P1, not yet `100+`.
-5. Once `>30 Mbit/s` is stable, continue the controller/frame-cadence path
-   toward clean `100+ Mbit/s`.
+5. After the ordered deliverability discriminator is clear, handle the late
+   local pressure-credit edge during catch-up bursts, then continue toward clean
+   `100+ Mbit/s`.
 6. Only after a clean `100+ Mbit/s` repeat exits normally should Knife14 broaden
    to longer-duration or concurrency sweeps.
 

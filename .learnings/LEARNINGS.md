@@ -1,5 +1,31 @@
 # Learnings
 
+## 2026-07-08 - Knife14go self-wake improves polling but not ordered delivery
+
+- Result doc:
+  `docs/tech/2026-07-08-knife14go-active-conn-rx-self-wake-results.md`
+- Code commit:
+  `39112ca` makes TUIC pending reads arm bounded self-wake for active
+  connection RX, not only for `connection_stream_frames_pending`.
+- Log bundle:
+  `/tmp/mini_vpn/knife14go_active_connrx_selfwake_20260708/mvpn_knife14go_active_connrx_selfwake_safe1200_p1_30_usclient_suite_20260708_213110.tar.gz`
+- Outcome: focused safe1200 reverse-first P1 completed but reached only
+  `24.6/22.4 Mbit/s`, below the `>30 Mbit/s` stage target.
+- What worked: data-stream poll service improved; the final summary showed
+  `data_poll_gap_max_ms=43`, `self_wake_armed=11702`, and
+  `self_wake_fired=8726`, with no TUN drops and no QUIC loss/congestion or
+  tx/rx blocking.
+- What failed: ordered delivery still had multi-second gaps:
+  `data_read_gap_max_ms=3872`, `data_pending_gap_max_ms=3006`, and
+  `connection_stream_frames_pending=20`. A late catch-up burst also
+  reintroduced one local pressure edge:
+  `downlink_backpressure pause_edges=1`, `read_credit_pause_updates=1`, and
+  `pressure_credit_blocked_bytes=122727`.
+- Reusable rule: once self-wake reduces poll gaps but read gaps remain in the
+  seconds range, stop treating the root as a sleeping relay reader. The next
+  slice must separate connection-level STREAM frame progress from current-stream
+  deliverable progress before tuning pressure-credit constants.
+
 ## 2026-07-08 - Knife14gn clears local pressure but leaves ordered stream gaps
 
 - Result doc:
