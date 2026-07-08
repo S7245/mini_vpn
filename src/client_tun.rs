@@ -4491,9 +4491,10 @@ fn tun_rx_drain_budget_for_dirty_pressure(
     cfg: DownlinkBackpressureConfig,
     tun_mtu: usize,
 ) -> usize {
-    if !has_dirty_downlink
-        || (!has_dirty_close_drain && !reaches_downlink_credit_debt_pressure_threshold(stats, cfg))
-    {
+    let pressure_eligible = has_dirty_close_drain
+        || reaches_downlink_credit_debt_pressure_threshold(stats, cfg)
+        || (stats.max_pending > 0 && stats.max_tx_queue >= tx_queue_flush_threshold(cfg));
+    if !has_dirty_downlink || !pressure_eligible {
         return 0;
     }
     if configured_budget > 0 {
@@ -14874,6 +14875,12 @@ mod tests {
             tx_queue_flush_threshold(cfg),
             tx_queue_flush_threshold(cfg),
         );
+        let pending_tail_below_high_at_flush_edge = DownlinkPressureStats::new(
+            cfg.low_bytes,
+            cfg.low_bytes,
+            tx_queue_flush_threshold(cfg),
+            tx_queue_flush_threshold(cfg),
+        );
 
         assert_eq!(
             tun_rx_drain_budget_for_dirty_pressure(false, false, credit_edge, 0, cfg, 1_200),
@@ -14921,6 +14928,18 @@ mod tests {
             ),
             1,
             "pending pressure plus flush-edge tx queue should maintain ACK drain"
+        );
+        assert_eq!(
+            tun_rx_drain_budget_for_dirty_pressure(
+                true,
+                false,
+                pending_tail_below_high_at_flush_edge,
+                0,
+                cfg,
+                1_200
+            ),
+            1,
+            "a dirty tail with pending below high but tx queue at the flush edge should keep ACK/window maintenance alive"
         );
     }
 
