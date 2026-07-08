@@ -158,8 +158,8 @@ const DEFERRED_ACK_DRAIN_DELAYED_PROBE_MS: u64 = 40;
 const RELAY_GAP_ACK_DRAIN_FOLLOWUP_DELAY_MS: u64 = 1;
 const RELAY_GAP_ACK_DRAIN_EMPTY_FOLLOWUPS: u8 = 2;
 const RELAY_GAP_ACK_DRAIN_PROGRESS_FOLLOWUPS: u8 = 1;
-const RELAY_ACK_DRAIN_HINT_GAP_MS: u128 = 500;
-const RELAY_REMOTE_READ_PROBE_INTERVAL_MS: u64 = 250;
+const RELAY_ACK_DRAIN_HINT_GAP_MS: u128 = 100;
+const RELAY_REMOTE_READ_PROBE_INTERVAL_MS: u64 = 100;
 const RELAY_ACK_DRAIN_HINT_INTERVAL_MS: u64 = RELAY_REMOTE_READ_PROBE_INTERVAL_MS;
 const RELAY_ACK_DRAIN_HINT_MIN_DATA_BYTES: u64 = 64 * 1024;
 const RELAY_REMOTE_READ_PROBE_MIN_BATCH_BYTES: usize = 1024;
@@ -16595,7 +16595,7 @@ mod tests {
     fn relay_ack_drain_hint_only_fires_for_rate_limited_remote_read_gap() {
         let start = std::time::Instant::now();
         let mut diag = RelayTaskDiag::new(start);
-        let gap_due = start + std::time::Duration::from_millis(750);
+        let gap_due = start + std::time::Duration::from_millis(150);
         let mut last_hint_at = None;
 
         assert_eq!(
@@ -16680,16 +16680,16 @@ mod tests {
         assert_eq!(
             relay_ack_drain_hint_due(
                 &diag,
-                start + std::time::Duration::from_millis(499),
+                start + std::time::Duration::from_millis(99),
                 last_hint_at
             ),
             None,
-            "remote read gaps below the stall threshold should not scan TUN RX"
+            "remote read gaps below the short ACK/window service threshold should not scan TUN RX"
         );
 
         let due = relay_ack_drain_hint_due(&diag, gap_due, last_hint_at)
-            .expect("gap above threshold should request one ACK/window drain");
-        assert_eq!(due.gap_ms, 750);
+            .expect("short relay read gaps should request one ACK/window drain");
+        assert_eq!(due.gap_ms, 150);
         assert_eq!(
             due.remote_to_global_rx_bytes,
             RELAY_ACK_DRAIN_HINT_MIN_DATA_BYTES
@@ -16699,7 +16699,7 @@ mod tests {
         assert_eq!(
             relay_ack_drain_hint_due(
                 &diag,
-                gap_due + std::time::Duration::from_millis(249),
+                gap_due + std::time::Duration::from_millis(99),
                 last_hint_at
             ),
             None,
@@ -16708,7 +16708,7 @@ mod tests {
         assert!(
             relay_ack_drain_hint_due(
                 &diag,
-                gap_due + std::time::Duration::from_millis(250),
+                gap_due + std::time::Duration::from_millis(100),
                 last_hint_at
             )
             .is_some(),

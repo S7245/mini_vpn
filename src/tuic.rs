@@ -375,6 +375,11 @@ impl OrderedQuicChunkAssembler {
             bytes = bytes.slice(trim..);
             offset = self.next_offset;
         }
+        if let Some(old) = self.chunks.get(&offset)
+            && old.len() >= bytes.len()
+        {
+            return;
+        }
         if let Some(old) = self.chunks.insert(offset, bytes.clone()) {
             self.buffered_bytes = self.buffered_bytes.saturating_sub(old.len());
         }
@@ -3383,6 +3388,36 @@ mod tests {
         assembler.push_chunk(1, bytes::Bytes::from_static(b"bcdef"));
         assert_eq!(assembler.drain_into(&mut second), 3);
         assert_eq!(second.filled(), b"def");
+        assert_eq!(assembler.next_offset(), 6);
+        assert_eq!(assembler.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn ordered_quic_chunk_assembler_keeps_longer_duplicate_at_same_offset() {
+        let mut assembler = OrderedQuicChunkAssembler::default();
+        let mut out = [0u8; 6];
+        let mut read_buf = ReadBuf::new(&mut out);
+
+        assembler.push_chunk(0, bytes::Bytes::from_static(b"abcdef"));
+        assembler.push_chunk(0, bytes::Bytes::from_static(b"ab"));
+
+        assert_eq!(assembler.drain_into(&mut read_buf), 6);
+        assert_eq!(read_buf.filled(), b"abcdef");
+        assert_eq!(assembler.next_offset(), 6);
+        assert_eq!(assembler.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn ordered_quic_chunk_assembler_replaces_short_duplicate_with_longer() {
+        let mut assembler = OrderedQuicChunkAssembler::default();
+        let mut out = [0u8; 6];
+        let mut read_buf = ReadBuf::new(&mut out);
+
+        assembler.push_chunk(0, bytes::Bytes::from_static(b"ab"));
+        assembler.push_chunk(0, bytes::Bytes::from_static(b"abcdef"));
+
+        assert_eq!(assembler.drain_into(&mut read_buf), 6);
+        assert_eq!(read_buf.filled(), b"abcdef");
         assert_eq!(assembler.next_offset(), 6);
         assert_eq!(assembler.buffered_bytes(), 0);
     }
