@@ -2023,19 +2023,32 @@ impl DownlinkCreditController {
         floor
     }
 
+    #[cfg(test)]
     fn note_flush_feedback(
         &mut self,
         limit: DownlinkFlushLimit,
         cfg: DownlinkBackpressureConfig,
         tun_mtu: usize,
     ) {
+        self.note_flush_feedback_with_accepted(limit, 0, cfg, tun_mtu);
+    }
+
+    fn note_flush_feedback_with_accepted(
+        &mut self,
+        limit: DownlinkFlushLimit,
+        accepted_egress_bytes: usize,
+        cfg: DownlinkBackpressureConfig,
+        tun_mtu: usize,
+    ) {
         let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
         let ack_drain_floor = relay_remote_read_ack_drain_floor_bytes(tun_mtu);
         let adaptive_ack_drain_max = relay_remote_read_adaptive_ack_drain_max_bytes(tun_mtu);
+        let accepted_egress_bytes = accepted_egress_bytes.min(limit.len);
         let observed_progress = limit
             .drain_credit_granted_bytes
             .saturating_add(limit.drop_credit_debt_paid_bytes)
-            .saturating_add(limit.pressure_credit_debt_paid_bytes);
+            .saturating_add(limit.pressure_credit_debt_paid_bytes)
+            .saturating_add(accepted_egress_bytes);
         if observed_progress > 0 {
             self.egress_progress_generation = self.egress_progress_generation.saturating_add(1);
             self.no_egress_progress_streak = 0;
@@ -2686,13 +2699,13 @@ fn flush_downlink(
         controlled_max_bytes_per_flush,
         flush_limit,
     );
-    ctx.downlink_credit_controller
-        .note_flush_feedback(flush_limit, downlink_backpressure, tun_mtu);
     if flush_limit.len == 0 {
         let used =
             ctx.downlink_egress_clock
                 .note_flush_result(send_window.send_queue, 0, flush_limit);
         ctx.downlink_diag.note_drain_credit_used(used);
+        ctx.downlink_credit_controller
+            .note_flush_feedback_with_accepted(flush_limit, 0, downlink_backpressure, tun_mtu);
         return DownlinkFlushOutcome {
             accepted_bytes: 0,
             headroom_limited: flush_limit.headroom_limited,
@@ -2707,6 +2720,8 @@ fn flush_downlink(
             ctx.downlink_diag.note_drain_credit_used(used);
             ctx.downlink_diag
                 .note_send_slice_ok(0, ctx.downlink_pending.len());
+            ctx.downlink_credit_controller
+                .note_flush_feedback_with_accepted(flush_limit, 0, downlink_backpressure, tun_mtu);
             DownlinkFlushOutcome {
                 accepted_bytes: 0,
                 headroom_limited: flush_limit.headroom_limited,
@@ -2720,6 +2735,8 @@ fn flush_downlink(
             ctx.downlink_pending.drain(..n);
             ctx.downlink_diag
                 .note_send_slice_ok(n, ctx.downlink_pending.len());
+            ctx.downlink_credit_controller
+                .note_flush_feedback_with_accepted(flush_limit, n, downlink_backpressure, tun_mtu);
             DownlinkFlushOutcome {
                 accepted_bytes: n,
                 headroom_limited: flush_limit.headroom_limited,
@@ -2740,6 +2757,8 @@ fn flush_downlink(
             // socket 不可发（已关闭/复位）：丢弃残留，避免无限堆积。
             ctx.downlink_pending.clear();
             ctx.downlink_diag.note_pending(0);
+            ctx.downlink_credit_controller
+                .note_flush_feedback_with_accepted(flush_limit, 0, downlink_backpressure, tun_mtu);
             DownlinkFlushOutcome {
                 accepted_bytes: 0,
                 headroom_limited: flush_limit.headroom_limited,
@@ -3314,8 +3333,11 @@ fn publish_relay_read_credit_for_handle(
         && credit.max_batch_bytes > 0;
     let changed = *tx.borrow() != credit;
     if changed || progress_wake {
-        if tx.send(credit).is_ok() && progress_wake {
-            ctx.relay_read_credit_progress_generation_sent = progress_generation;
+        match tx.send(credit) {
+            Ok(()) if progress_wake => {
+                ctx.relay_read_credit_progress_generation_sent = progress_generation;
+            }
+            _ => {}
         }
     }
 }
@@ -3431,8 +3453,11 @@ fn publish_projected_relay_read_credit_for_payload(
         && !credit.paused
         && credit.max_batch_bytes > 0;
     if *tx.borrow() != credit || progress_wake {
-        if tx.send(credit).is_ok() && progress_wake {
-            ctx.relay_read_credit_progress_generation_sent = progress_generation;
+        match tx.send(credit) {
+            Ok(()) if progress_wake => {
+                ctx.relay_read_credit_progress_generation_sent = progress_generation;
+            }
+            _ => {}
         }
     }
 }
@@ -9899,6 +9924,72 @@ mod tests {
         assert!(
             credit.max_batch_bytes >= RELAY_REMOTE_READ_MIN_BATCH_BYTES,
             "progressing headroom deferral should keep a useful compressed batch instead of collapsing to the 19KB pressure floor: credit={credit:?}, pressure_floor={pressure_floor}"
+        );
+    }
+
+    #[test]
+    fn downlink_credit_controller_treats_accepted_flush_bytes_as_egress_progress() {
+        let cfg = DownlinkBackpressureConfig::default();
+        let tun_mtu = 1200;
+        let ack_drain_floor = relay_remote_read_ack_drain_floor_bytes(tun_mtu);
+        let pressure_floor = relay_remote_read_pressure_floor_bytes(tun_mtu);
+        let mut controller = DownlinkCreditController::default();
+        let accepted_deferral = DownlinkFlushLimit {
+            len: pressure_floor,
+            headroom_limited: true,
+            headroom_deferred_bytes: pressure_floor,
+            clean_headroom_bytes: pressure_floor,
+            drain_credit_granted_bytes: 0,
+            drain_credit_planned_bytes: 0,
+            drop_credit_debt_bytes: 0,
+            drop_credit_debt_paid_bytes: 0,
+            drop_credit_blocked_bytes: 0,
+            pressure_credit_debt_bytes: 0,
+            pressure_credit_debt_paid_bytes: 0,
+            pressure_credit_blocked_bytes: 0,
+            hard_edge_guard_bytes: 0,
+            hard_edge_guard_deferred_bytes: pressure_floor,
+        };
+
+        controller.note_flush_feedback_with_accepted(
+            accepted_deferral,
+            pressure_floor,
+            cfg,
+            tun_mtu,
+        );
+        controller.note_flush_feedback_with_accepted(
+            accepted_deferral,
+            pressure_floor,
+            cfg,
+            tun_mtu,
+        );
+
+        assert_eq!(
+            controller.no_egress_progress_streak, 0,
+            "bytes accepted by smoltcp are useful local egress progress, not a stalled flush"
+        );
+        assert!(
+            controller.egress_progress_generation >= 2,
+            "accepted flush progress must wake relay read-credit publishers"
+        );
+        let local_pressure_bytes = tx_queue_credit_spend_threshold(cfg);
+        let pressure_ack_drain_bytes =
+            controller.adaptive_ack_drain_floor_for(local_pressure_bytes, cfg, tun_mtu);
+        let base = relay_read_credit_for_local_egress_with_ack_drain_floor(
+            local_pressure_bytes,
+            0,
+            false,
+            false,
+            cfg,
+            tun_mtu,
+            pressure_ack_drain_bytes,
+            DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
+        );
+        let credit = controller.read_credit_for(base, 0, cfg, tun_mtu);
+
+        assert!(
+            !credit.paused && credit.max_batch_bytes > ack_drain_floor,
+            "accepted flush progress should keep a useful read-credit cadence at the credit edge: credit={credit:?}, ack_floor={ack_drain_floor}"
         );
     }
 
