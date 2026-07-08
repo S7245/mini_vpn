@@ -4224,3 +4224,27 @@ worth cleaning up separately.
   `iface.poll`, dirty downlink flush, and `flush_tx` until progress stops or a
   hard budget is reached. Do not return to read-credit floor, self-wake, VPS,
   MTU, stale-pool, or broad QUIC-window changes as the next step.
+
+## 2026-07-09 - Knife14gs local egress service passes G5
+
+- Result doc:
+  `docs/tech/2026-07-09-knife14gs-local-egress-service-g5-results.md`
+- Outcome: implemented an explicit bounded local egress service lane in
+  `src/client_tun.rs`. The lane runs in the main loop and can repeat TUN RX
+  ACK intake, `iface.poll`, `flush_tx`, and dirty downlink flush until target,
+  no-progress, hard-pause, no-work, or cycle-budget stop.
+- G5 local capacity gate: `128KiB` per `5ms` active window, about
+  `25.6 MB/s` / `204 Mbit/s` nominal local service capacity before real VPS
+  overhead. This is sufficient to proceed to VPS G6, but is not itself a
+  throughput acceptance result.
+- Tests/gates passed: `cargo test local_egress_service -- --nocapture`,
+  `cargo test --lib`, `cargo test`,
+  `cargo test --features harness --test concurrency_harness -- --nocapture`,
+  `rustfmt --edition 2024 --check src/client_tun.rs`, `git diff --check`,
+  `cargo clippy --all-targets --all-features -- -D warnings`, and
+  `cargo build --release`.
+- Reusable rule: after local egress service changes, parse
+  `tcp-local-egress-service` together with `tcp-tun-rx-drain` and
+  `tcp-downlink-flush`. A low VPS Mbps result is not actionable until those
+  counters say whether the service lane hit target, no-progress, hard-pause,
+  or cycle budget.

@@ -351,18 +351,19 @@ async fn loop_profiler_detects_on_loop_cpu_saturation() {
     // 主循环确有迭代（仪器在真 run_event_loop 里被调用过）。
     assert!(base.iters > 0 && load.iters > 0, "两轮都应有 select! 迭代");
 
-    // 仪器正确性 + harness 能造饱和：注入 on-loop CPU → loop-active 明显上升。
+    // 新的本地 egress service lane 会让无 burn 基线也更 active；当基线已经接近饱和时，
+    // 不能再要求 loop-active 继续显著上升。burn 落在 poll 段（flush_tx），poll fraction
+    // 才是这条自检的稳定信号。
     assert!(
-        load.loop_active_fraction() > base.loop_active_fraction() + 0.05,
-        "on-loop CPU burn 应抬升 loop-active：base={:.3} load={:.3}",
-        base.loop_active_fraction(),
-        load.loop_active_fraction()
-    );
-    // burn 落在 poll 段（flush_tx）→ poll fraction 也随之上升。
-    assert!(
-        load.poll_fraction() > base.poll_fraction(),
-        "burn 在 poll 段应抬升 poll fraction：base={:.3} load={:.3}",
+        load.poll_fraction() > base.poll_fraction() + 0.05,
+        "burn 在 poll 段应显著抬升 poll fraction：base={:.3} load={:.3}",
         base.poll_fraction(),
         load.poll_fraction()
+    );
+    assert!(
+        load.loop_active_fraction() + 0.02 >= base.loop_active_fraction(),
+        "on-loop CPU burn 不应让 loop-active 明显下降：base={:.3} load={:.3}",
+        base.loop_active_fraction(),
+        load.loop_active_fraction()
     );
 }

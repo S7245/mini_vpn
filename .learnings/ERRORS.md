@@ -3047,3 +3047,18 @@ active root unless it repeats.
   acceptance gate, make the controller emit an initial per-flow decision when a
   relay enters buffered mode, or update the gate parser to treat startup mode
   plus relay-live read-credit fields as the explicit evidence.
+
+## 2026-07-09 - Loop profiler self-test must not require extra loop-active headroom after egress service
+
+- Stage: Knife14gs local egress service G5.
+- Symptom: after adding the bounded local egress service lane, the harness test
+  `loop_profiler_detects_on_loop_cpu_saturation` failed because the no-burn
+  baseline loop-active fraction was already high (`0.980`) and the synthetic
+  burn only moved it to `0.992`, below the old `+0.05` assertion.
+- Cause: the new service lane legitimately makes the baseline main loop more
+  active in the harness. The profiler was still detecting synthetic work: the
+  burn's stable signal, `poll_fraction`, increased strongly.
+- Correct behavior: for profiler self-tests after local egress scheduler
+  changes, keep loop-active boundedness/iteration checks, but use
+  `poll_fraction` as the stable synthetic burn attribution signal when the
+  no-burn baseline is already near active saturation.

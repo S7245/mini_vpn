@@ -83,6 +83,13 @@ const MIN_DOWNLINK_FLUSH_MAX_BYTES: usize = 4 * 1024;
 const MAX_DOWNLINK_FLUSH_MAX_BYTES: usize = MAX_TCP_SOCKET_BUFFER_BYTES;
 const _: () = assert!(MIN_DOWNLINK_FLUSH_MAX_BYTES <= DEFAULT_DOWNLINK_FLUSH_MAX_BYTES);
 const _: () = assert!(DEFAULT_DOWNLINK_FLUSH_MAX_BYTES <= MAX_DOWNLINK_FLUSH_MAX_BYTES);
+const LOCAL_EGRESS_SERVICE_TARGET_BYTES_PER_WINDOW: usize = 128 * 1024;
+const LOCAL_EGRESS_SERVICE_MAX_CYCLES: usize = 8;
+const LOCAL_EGRESS_SERVICE_TUN_RX_PACKETS_PER_CYCLE: usize = 16;
+const _: () =
+    assert!(LOCAL_EGRESS_SERVICE_TARGET_BYTES_PER_WINDOW <= DEFAULT_DOWNLINK_FLUSH_MAX_BYTES);
+const _: () = assert!(LOCAL_EGRESS_SERVICE_MAX_CYCLES > 0);
+const _: () = assert!(LOCAL_EGRESS_SERVICE_TUN_RX_PACKETS_PER_CYCLE > 0);
 /// Knife14fa: drain QUIC streams with a healthy read window, but stage delivery
 /// into the main loop so one ready remote burst cannot become one oversized
 /// smoltcp/send_queue injection.
@@ -160,6 +167,7 @@ const TUN_RX_DRAIN_SOURCE_RELAY_GAP_HINT: &str = "relay_gap_hint";
 const TUN_RX_DRAIN_SOURCE_RELAY_GAP_HINT_FOLLOWUP: &str = "relay_gap_hint_followup";
 const TUN_RX_DRAIN_SOURCE_TIMER_PRESSURE: &str = "timer_pressure";
 const TUN_RX_DRAIN_SOURCE_TIMER_ACTIVE_FLOW: &str = "timer_active_flow";
+const TUN_RX_DRAIN_SOURCE_LOCAL_EGRESS_SERVICE: &str = "local_egress_service";
 const DEFERRED_ACK_DRAIN_DELAY_MS: u64 = 1;
 const DEFERRED_ACK_DRAIN_DELAYED_PROBE_MS: u64 = 40;
 const RELAY_GAP_ACK_DRAIN_FOLLOWUP_DELAY_MS: u64 = 1;
@@ -4230,6 +4238,7 @@ struct TunRxDrainDiag {
     relay_gap_hint_followup_attempts: u64,
     maintenance_attempts: u64,
     timer_active_flow_attempts: u64,
+    local_egress_service_attempts: u64,
     other_attempts: u64,
     packets: u64,
     tcp_packets: u64,
@@ -4277,6 +4286,10 @@ impl TunRxDrainDiag {
             TUN_RX_DRAIN_SOURCE_TIMER_ACTIVE_FLOW => {
                 self.timer_active_flow_attempts = self.timer_active_flow_attempts.saturating_add(1);
             }
+            TUN_RX_DRAIN_SOURCE_LOCAL_EGRESS_SERVICE => {
+                self.local_egress_service_attempts =
+                    self.local_egress_service_attempts.saturating_add(1);
+            }
             _ => {
                 self.other_attempts = self.other_attempts.saturating_add(1);
             }
@@ -4313,7 +4326,7 @@ impl TunRxDrainDiag {
 
 fn format_tun_rx_drain_diag(diag: &TunRxDrainDiag) -> String {
     format!(
-        "🔎 tcp-tun-rx-drain attempts={} pre_payload_attempts={} remote_payload_attempts={} remote_payload_deferred_attempts={} remote_payload_deferred_delayed_attempts={} remote_payload_deferred_pressure_attempts={} relay_gap_hint_attempts={} relay_gap_hint_followup_attempts={} maintenance_attempts={} timer_active_flow_attempts={} other_attempts={} packets={} tcp={} dns={} udp={} budget_exhausted={} would_block={} errors={}",
+        "🔎 tcp-tun-rx-drain attempts={} pre_payload_attempts={} remote_payload_attempts={} remote_payload_deferred_attempts={} remote_payload_deferred_delayed_attempts={} remote_payload_deferred_pressure_attempts={} relay_gap_hint_attempts={} relay_gap_hint_followup_attempts={} maintenance_attempts={} timer_active_flow_attempts={} local_egress_service_attempts={} other_attempts={} packets={} tcp={} dns={} udp={} budget_exhausted={} would_block={} errors={}",
         diag.attempts,
         diag.pre_payload_attempts,
         diag.remote_payload_attempts,
@@ -4324,6 +4337,7 @@ fn format_tun_rx_drain_diag(diag: &TunRxDrainDiag) -> String {
         diag.relay_gap_hint_followup_attempts,
         diag.maintenance_attempts,
         diag.timer_active_flow_attempts,
+        diag.local_egress_service_attempts,
         diag.other_attempts,
         diag.packets,
         diag.tcp_packets,
@@ -4332,6 +4346,123 @@ fn format_tun_rx_drain_diag(diag: &TunRxDrainDiag) -> String {
         diag.budget_exhausted,
         diag.would_block,
         diag.errors
+    )
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum LocalEgressServiceStopReason {
+    TargetReached,
+    NoProgress,
+    CycleBudget,
+    HardPause,
+    #[default]
+    NoWork,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalEgressServiceConfig {
+    max_cycles: usize,
+    target_bytes_per_window: usize,
+    tun_rx_packets_per_cycle: usize,
+}
+
+impl Default for LocalEgressServiceConfig {
+    fn default() -> Self {
+        Self {
+            max_cycles: LOCAL_EGRESS_SERVICE_MAX_CYCLES,
+            target_bytes_per_window: LOCAL_EGRESS_SERVICE_TARGET_BYTES_PER_WINDOW,
+            tun_rx_packets_per_cycle: LOCAL_EGRESS_SERVICE_TUN_RX_PACKETS_PER_CYCLE,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct LocalEgressServiceProgress {
+    cycles: usize,
+    accepted_bytes: usize,
+    tun_rx_packets: usize,
+    flush_tx_calls: usize,
+    flush_tx_failures: usize,
+    dirty_passes: usize,
+    stop_reason: LocalEgressServiceStopReason,
+}
+
+impl LocalEgressServiceProgress {
+    fn has_progress(&self) -> bool {
+        self.accepted_bytes > 0 || self.tun_rx_packets > 0
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct LocalEgressServiceDiag {
+    windows: u64,
+    cycles: u64,
+    accepted_bytes: u64,
+    tun_rx_packets: u64,
+    flush_tx_calls: u64,
+    flush_tx_failures: u64,
+    dirty_passes: u64,
+    target_reached: u64,
+    no_progress: u64,
+    cycle_budget: u64,
+    hard_pause: u64,
+    no_work: u64,
+}
+
+impl LocalEgressServiceDiag {
+    fn note_window(&mut self, progress: LocalEgressServiceProgress) {
+        self.windows = self.windows.saturating_add(1);
+        self.cycles = self.cycles.saturating_add(progress.cycles as u64);
+        self.accepted_bytes = self
+            .accepted_bytes
+            .saturating_add(progress.accepted_bytes as u64);
+        self.tun_rx_packets = self
+            .tun_rx_packets
+            .saturating_add(progress.tun_rx_packets as u64);
+        self.flush_tx_calls = self
+            .flush_tx_calls
+            .saturating_add(progress.flush_tx_calls as u64);
+        self.flush_tx_failures = self
+            .flush_tx_failures
+            .saturating_add(progress.flush_tx_failures as u64);
+        self.dirty_passes = self
+            .dirty_passes
+            .saturating_add(progress.dirty_passes as u64);
+        match progress.stop_reason {
+            LocalEgressServiceStopReason::TargetReached => {
+                self.target_reached = self.target_reached.saturating_add(1);
+            }
+            LocalEgressServiceStopReason::NoProgress => {
+                self.no_progress = self.no_progress.saturating_add(1);
+            }
+            LocalEgressServiceStopReason::CycleBudget => {
+                self.cycle_budget = self.cycle_budget.saturating_add(1);
+            }
+            LocalEgressServiceStopReason::HardPause => {
+                self.hard_pause = self.hard_pause.saturating_add(1);
+            }
+            LocalEgressServiceStopReason::NoWork => {
+                self.no_work = self.no_work.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn format_local_egress_service_diag(diag: &LocalEgressServiceDiag) -> String {
+    format!(
+        "🔎 tcp-local-egress-service windows={} cycles={} accepted_bytes={} tun_rx_packets={} flush_tx_calls={} flush_tx_failures={} dirty_passes={} target_reached={} no_progress={} cycle_budget={} hard_pause={} no_work={}",
+        diag.windows,
+        diag.cycles,
+        diag.accepted_bytes,
+        diag.tun_rx_packets,
+        diag.flush_tx_calls,
+        diag.flush_tx_failures,
+        diag.dirty_passes,
+        diag.target_reached,
+        diag.no_progress,
+        diag.cycle_budget,
+        diag.hard_pause,
+        diag.no_work
     )
 }
 
@@ -5610,6 +5741,8 @@ pub async fn run_event_loop<D, U, M>(
     let mut tun_egress_drop_sampler = TunEgressDropSampler::new(device.interface_name());
     let mut tun_egress_feedback = TunEgressFeedbackState::default();
     let mut tun_rx_drain_diag = TunRxDrainDiag::default();
+    let local_egress_service_config = LocalEgressServiceConfig::default();
+    let mut local_egress_service_diag = LocalEgressServiceDiag::default();
     let deferred_ack_drain_sleep = tokio::time::sleep(std::time::Duration::from_secs(60 * 60));
     tokio::pin!(deferred_ack_drain_sleep);
     let mut deferred_ack_drain = DeferredAckDrainState::default();
@@ -5918,6 +6051,41 @@ pub async fn run_event_loop<D, U, M>(
                                     downlink_rx_paused || tun_egress_feedback.is_paused()
                                 },
                                 buffered_downlink,
+                            )
+                            .await;
+                        }
+                        if has_downlink_work {
+                            let relay_read_hard_pause = if buffered_downlink.enabled {
+                                tun_egress_feedback.is_paused()
+                            } else {
+                                downlink_rx_paused || tun_egress_feedback.is_paused()
+                            };
+                            service_local_egress_until(
+                                &mut device,
+                                &mut assoc_table,
+                                &mut fake_pool,
+                                &upstream,
+                                udp_clock.elapsed().as_secs(),
+                                &metrics_handle,
+                                &mut registry,
+                                &mut sockets,
+                                &mut socket_ctxs,
+                                &mut iface,
+                                &mut dirty,
+                                &handshake_done_tx,
+                                &global_tx,
+                                &mut metrics,
+                                downlink_flush_max_bytes,
+                                downlink_backpressure,
+                                runtime_config.tun_mtu,
+                                &mut downlink_egress_drop_debt,
+                                &mut tcp_loop_flush_tx_calls,
+                                &mut tcp_loop_flush_tx_failures,
+                                &mut tun_rx_drain_diag,
+                                &mut local_egress_service_diag,
+                                relay_read_hard_pause,
+                                buffered_downlink,
+                                local_egress_service_config,
                             )
                             .await;
                         }
@@ -6293,6 +6461,10 @@ pub async fn run_event_loop<D, U, M>(
                     format_tcp_downlink_flush_diag(&tcp_downlink, dirty.len())
                 );
                 tcp_diag_log!("{}", format_tun_rx_drain_diag(&tun_rx_drain_diag));
+                tcp_diag_log!(
+                    "{}",
+                    format_local_egress_service_diag(&local_egress_service_diag)
+                );
                 // 刀12：紧挨 📊 行打 🔬 主循环归因行（profiler 关闭时 NoopSink::report 空、零开销）。
                 metrics.report();
             }
@@ -6473,6 +6645,36 @@ pub async fn run_event_loop<D, U, M>(
                     buffered_downlink,
                 )
                 .await;
+                if !dirty.is_empty() {
+                    service_local_egress_until(
+                        &mut device,
+                        &mut assoc_table,
+                        &mut fake_pool,
+                        &upstream,
+                        udp_clock.elapsed().as_secs(),
+                        &metrics_handle,
+                        &mut registry,
+                        &mut sockets,
+                        &mut socket_ctxs,
+                        &mut iface,
+                        &mut dirty,
+                        &handshake_done_tx,
+                        &global_tx,
+                        &mut metrics,
+                        downlink_flush_max_bytes,
+                        downlink_backpressure,
+                        runtime_config.tun_mtu,
+                        &mut downlink_egress_drop_debt,
+                        &mut tcp_loop_flush_tx_calls,
+                        &mut tcp_loop_flush_tx_failures,
+                        &mut tun_rx_drain_diag,
+                        &mut local_egress_service_diag,
+                        relay_read_hard_pause,
+                        buffered_downlink,
+                        local_egress_service_config,
+                    )
+                    .await;
+                }
             }
         }
         // 刀12：循环底部——即将停在 select! 空等下一个事件，标记 park 开始
@@ -6685,6 +6887,169 @@ where
     }
     diag.note_budget_exhausted();
     drained
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn service_local_egress_until<D, U, M>(
+    device: &mut D,
+    assoc_table: &mut AssocTable,
+    fake_pool: &mut FakeIpPool,
+    upstream: &Arc<U>,
+    now_secs: u64,
+    metrics_handle: &Metrics,
+    registry: &mut ListenerRegistry,
+    sockets: &mut SocketSet<'static>,
+    socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
+    iface: &mut Interface,
+    dirty: &mut HashSet<SocketHandle>,
+    handshake_done_tx: &mpsc::Sender<HandshakeDone>,
+    global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    metrics: &mut M,
+    downlink_flush_max_bytes: usize,
+    downlink_backpressure: DownlinkBackpressureConfig,
+    tun_mtu: usize,
+    downlink_egress_drop_debt: &mut DownlinkEgressDropDebt,
+    tcp_loop_flush_tx_calls: &mut u64,
+    tcp_loop_flush_tx_failures: &mut u64,
+    tun_rx_drain_diag: &mut TunRxDrainDiag,
+    local_egress_diag: &mut LocalEgressServiceDiag,
+    relay_read_hard_pause: bool,
+    buffered_downlink: BufferedDownlinkConfig,
+    config: LocalEgressServiceConfig,
+) -> LocalEgressServiceProgress
+where
+    D: TunIo,
+    U: ProxyUpstream + DatagramUpstream + 'static,
+    M: MetricsSink,
+{
+    let mut total = LocalEgressServiceProgress::default();
+    if dirty.is_empty() {
+        total.stop_reason = LocalEgressServiceStopReason::NoWork;
+        local_egress_diag.note_window(total);
+        return total;
+    }
+    if relay_read_hard_pause || downlink_egress_drop_debt.has_active_drop_debt() {
+        total.stop_reason = LocalEgressServiceStopReason::HardPause;
+        local_egress_diag.note_window(total);
+        return total;
+    }
+
+    for _ in 0..config.max_cycles {
+        let accepted_before =
+            tcp_downlink_aggregate(socket_ctxs.values()).send_slice_accepted_bytes;
+        let mut cycle = LocalEgressServiceProgress {
+            cycles: 1,
+            ..LocalEgressServiceProgress::default()
+        };
+
+        let drained = drain_ready_tun_rx(
+            device,
+            assoc_table,
+            fake_pool,
+            upstream,
+            now_secs,
+            metrics_handle,
+            registry,
+            sockets,
+            socket_ctxs,
+            iface,
+            dirty,
+            handshake_done_tx,
+            global_tx,
+            metrics,
+            downlink_flush_max_bytes,
+            downlink_backpressure,
+            tun_mtu,
+            downlink_egress_drop_debt,
+            tcp_loop_flush_tx_calls,
+            tcp_loop_flush_tx_failures,
+            tun_rx_drain_diag,
+            config.tun_rx_packets_per_cycle,
+            TUN_RX_DRAIN_SOURCE_LOCAL_EGRESS_SERVICE,
+            relay_read_hard_pause,
+            buffered_downlink,
+        )
+        .await;
+        cycle.tun_rx_packets = drained;
+
+        metrics.enter_poll();
+        let timestamp = smoltcp::time::Instant::now();
+        iface.poll(timestamp, device, sockets);
+        *tcp_loop_flush_tx_calls = tcp_loop_flush_tx_calls.saturating_add(1);
+        cycle.flush_tx_calls = 1;
+        if let Err(e) = device.flush_tx().await {
+            *tcp_loop_flush_tx_failures = tcp_loop_flush_tx_failures.saturating_add(1);
+            cycle.flush_tx_failures = 1;
+            tcp_diag_log!(
+                "🔎 tcp-loop-flush-tx-fail stage=local_egress_service calls={} failures={} err={e}",
+                *tcp_loop_flush_tx_calls,
+                *tcp_loop_flush_tx_failures
+            );
+        }
+        metrics.leave_poll();
+
+        let close_egress_guard = downlink_egress_drop_debt.has_active_drop_debt();
+        let relay_read_recovery_active = downlink_egress_drop_debt.has_active_drop_debt();
+        process_dirty_relay(
+            dirty,
+            sockets,
+            socket_ctxs,
+            upstream,
+            handshake_done_tx,
+            global_tx,
+            fake_pool,
+            now_secs,
+            metrics_handle,
+            metrics,
+            downlink_flush_max_bytes,
+            downlink_backpressure,
+            tun_mtu,
+            downlink_egress_drop_debt,
+            close_egress_guard,
+            relay_read_recovery_active,
+            relay_read_hard_pause,
+            buffered_downlink,
+        )
+        .await;
+        cycle.dirty_passes = 1;
+
+        let accepted_after = tcp_downlink_aggregate(socket_ctxs.values()).send_slice_accepted_bytes;
+        cycle.accepted_bytes = accepted_after.saturating_sub(accepted_before) as usize;
+
+        total.cycles = total.cycles.saturating_add(cycle.cycles);
+        total.accepted_bytes = total.accepted_bytes.saturating_add(cycle.accepted_bytes);
+        total.tun_rx_packets = total.tun_rx_packets.saturating_add(cycle.tun_rx_packets);
+        total.flush_tx_calls = total.flush_tx_calls.saturating_add(cycle.flush_tx_calls);
+        total.flush_tx_failures = total
+            .flush_tx_failures
+            .saturating_add(cycle.flush_tx_failures);
+        total.dirty_passes = total.dirty_passes.saturating_add(cycle.dirty_passes);
+
+        if total.accepted_bytes >= config.target_bytes_per_window {
+            total.stop_reason = LocalEgressServiceStopReason::TargetReached;
+            local_egress_diag.note_window(total);
+            return total;
+        }
+        if !cycle.has_progress() {
+            total.stop_reason = LocalEgressServiceStopReason::NoProgress;
+            local_egress_diag.note_window(total);
+            return total;
+        }
+        if dirty.is_empty() {
+            total.stop_reason = LocalEgressServiceStopReason::NoWork;
+            local_egress_diag.note_window(total);
+            return total;
+        }
+        if relay_read_hard_pause || downlink_egress_drop_debt.has_active_drop_debt() {
+            total.stop_reason = LocalEgressServiceStopReason::HardPause;
+            local_egress_diag.note_window(total);
+            return total;
+        }
+    }
+
+    total.stop_reason = LocalEgressServiceStopReason::CycleBudget;
+    local_egress_diag.note_window(total);
+    total
 }
 
 /// #1 脏集合驱动的 relay 调度段：只处理本 tick 标脏的 handle，替代每 tick 全量 `all_handles()`。
@@ -13885,6 +14250,59 @@ mod tests {
     }
 
     #[test]
+    fn local_egress_service_diag_reports_capacity_progress_and_stop_reason() {
+        let mut diag = LocalEgressServiceDiag::default();
+        let progress = LocalEgressServiceProgress {
+            cycles: 3,
+            accepted_bytes: LOCAL_EGRESS_SERVICE_TARGET_BYTES_PER_WINDOW,
+            tun_rx_packets: 12,
+            flush_tx_calls: 3,
+            flush_tx_failures: 0,
+            dirty_passes: 3,
+            stop_reason: LocalEgressServiceStopReason::TargetReached,
+        };
+
+        diag.note_window(progress);
+        let line = format_local_egress_service_diag(&diag);
+
+        assert_eq!(diag.windows, 1);
+        assert_eq!(diag.cycles, 3);
+        assert_eq!(
+            diag.accepted_bytes,
+            LOCAL_EGRESS_SERVICE_TARGET_BYTES_PER_WINDOW as u64
+        );
+        assert_eq!(diag.target_reached, 1);
+        assert!(line.contains("tcp-local-egress-service"));
+        assert!(line.contains("windows=1"));
+        assert!(line.contains("cycles=3"));
+        assert!(line.contains("accepted_bytes=131072"));
+        assert!(line.contains("tun_rx_packets=12"));
+        assert!(line.contains("target_reached=1"));
+        assert!(line.contains("no_progress=0"));
+        assert!(line.contains("cycle_budget=0"));
+    }
+
+    #[test]
+    fn local_egress_service_default_capacity_floor_covers_100mbit_path() {
+        let cfg = LocalEgressServiceConfig::default();
+        let bytes_per_second = cfg.target_bytes_per_window * 1000 / 5;
+
+        assert_eq!(
+            cfg.target_bytes_per_window,
+            LOCAL_EGRESS_SERVICE_TARGET_BYTES_PER_WINDOW
+        );
+        assert_eq!(cfg.target_bytes_per_window, 128 * 1024);
+        assert!(
+            bytes_per_second >= 13_000_000,
+            "G5 code-level floor must exceed the 100M path requirement: {bytes_per_second}B/s"
+        );
+        assert!(
+            cfg.max_cycles >= 2,
+            "service lane must be allowed to repeat inside one active window"
+        );
+    }
+
+    #[test]
     fn downlink_egress_pacer_allows_budget_then_defers_until_timer_reset() {
         let cfg = DownlinkBackpressureConfig {
             high_bytes: 1_000_000,
@@ -17850,6 +18268,159 @@ mod tests {
         fn inject_ip_packet(&mut self, pkt: &[u8]) {
             self.injected.push(pkt.to_vec());
         }
+    }
+
+    struct NoopTestUpstream;
+
+    #[async_trait::async_trait]
+    impl ProxyUpstream for NoopTestUpstream {
+        async fn open_tcp(&self, _target: &TargetAddr) -> Result<RelayStream, ClientError> {
+            Ok(Box::new(tokio::io::duplex(64).0))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DatagramUpstream for NoopTestUpstream {
+        async fn send_udp(&self, _datagram: Vec<u8>) {}
+    }
+
+    #[tokio::test]
+    async fn local_egress_service_stops_on_no_work_hard_pause_and_no_progress() {
+        let upstream = Arc::new(NoopTestUpstream);
+        let metrics = Metrics::new();
+        let mut device = DnsInjectRecorder::default();
+        let mut iface = Interface::new(
+            SmolConfig::new(smoltcp::wire::HardwareAddress::Ip),
+            &mut device,
+            smoltcp::time::Instant::now(),
+        );
+        let mut assoc_table = AssocTable::new();
+        let mut fake_pool = FakeIpPool::new();
+        let mut registry = ListenerRegistry::new(1);
+        let mut sockets = SocketSet::new(vec![]);
+        let mut socket_ctxs = HashMap::new();
+        let mut dirty = HashSet::new();
+        let (handshake_done_tx, _handshake_done_rx) = mpsc::channel(1);
+        let (global_tx, _global_rx) = mpsc::channel(1);
+        let mut sink = NoopSink;
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let mut drop_debt = DownlinkEgressDropDebt::default();
+        let mut tcp_loop_flush_tx_calls = 0;
+        let mut tcp_loop_flush_tx_failures = 0;
+        let mut tun_rx_diag = TunRxDrainDiag::default();
+        let mut local_diag = LocalEgressServiceDiag::default();
+        let service_cfg = LocalEgressServiceConfig {
+            max_cycles: 2,
+            target_bytes_per_window: 128,
+            tun_rx_packets_per_cycle: 1,
+        };
+
+        let no_work = service_local_egress_until(
+            &mut device,
+            &mut assoc_table,
+            &mut fake_pool,
+            &upstream,
+            0,
+            &metrics,
+            &mut registry,
+            &mut sockets,
+            &mut socket_ctxs,
+            &mut iface,
+            &mut dirty,
+            &handshake_done_tx,
+            &global_tx,
+            &mut sink,
+            DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
+            cfg,
+            1200,
+            &mut drop_debt,
+            &mut tcp_loop_flush_tx_calls,
+            &mut tcp_loop_flush_tx_failures,
+            &mut tun_rx_diag,
+            &mut local_diag,
+            false,
+            BufferedDownlinkConfig::disabled(cfg, 1),
+            service_cfg,
+        )
+        .await;
+        assert_eq!(no_work.stop_reason, LocalEgressServiceStopReason::NoWork);
+        assert_eq!(local_diag.no_work, 1);
+
+        let handle = sockets.add(build_listener_socket(&ListenerSpec { local_port: 443 }));
+        socket_ctxs.insert(handle, SocketCtx::new(443));
+        dirty.insert(handle);
+        let hard_pause = service_local_egress_until(
+            &mut device,
+            &mut assoc_table,
+            &mut fake_pool,
+            &upstream,
+            0,
+            &metrics,
+            &mut registry,
+            &mut sockets,
+            &mut socket_ctxs,
+            &mut iface,
+            &mut dirty,
+            &handshake_done_tx,
+            &global_tx,
+            &mut sink,
+            DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
+            cfg,
+            1200,
+            &mut drop_debt,
+            &mut tcp_loop_flush_tx_calls,
+            &mut tcp_loop_flush_tx_failures,
+            &mut tun_rx_diag,
+            &mut local_diag,
+            true,
+            BufferedDownlinkConfig::disabled(cfg, 1),
+            service_cfg,
+        )
+        .await;
+        assert_eq!(
+            hard_pause.stop_reason,
+            LocalEgressServiceStopReason::HardPause
+        );
+        assert_eq!(hard_pause.cycles, 0);
+        assert_eq!(local_diag.hard_pause, 1);
+
+        let no_progress = service_local_egress_until(
+            &mut device,
+            &mut assoc_table,
+            &mut fake_pool,
+            &upstream,
+            0,
+            &metrics,
+            &mut registry,
+            &mut sockets,
+            &mut socket_ctxs,
+            &mut iface,
+            &mut dirty,
+            &handshake_done_tx,
+            &global_tx,
+            &mut sink,
+            DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
+            cfg,
+            1200,
+            &mut drop_debt,
+            &mut tcp_loop_flush_tx_calls,
+            &mut tcp_loop_flush_tx_failures,
+            &mut tun_rx_diag,
+            &mut local_diag,
+            false,
+            BufferedDownlinkConfig::disabled(cfg, 1),
+            service_cfg,
+        )
+        .await;
+        assert_eq!(
+            no_progress.stop_reason,
+            LocalEgressServiceStopReason::NoProgress
+        );
+        assert_eq!(no_progress.cycles, 1);
+        assert_eq!(local_diag.no_progress, 1);
     }
 
     /// 刀11 T4：`handle_dns_hijack` 把 forge/drop 结局映射到 dns_forged/dns_dropped 计数。

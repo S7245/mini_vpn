@@ -97,12 +97,22 @@ Latest discriminator:
   edge, and multi-second ordered-stream pending gaps. Buffered read credit is
   useful but not sufficient; the next architecture target is local
   writer/egress cadence, not another credit-floor or self-wake tweak.
+- Knife14gs implemented the next G2-G5 local egress service lane after the
+  Knife14gr performance gate. The main loop now has an explicit bounded local
+  egress window that can alternate TUN RX ACK intake, `iface.poll`, dirty
+  downlink flush, and `flush_tx` until a target, no-progress, hard-pause, or
+  cycle-budget stop. Local gates passed, including the code-level G5 capacity
+  floor of `128KiB/5ms` active window. This is a local architecture/capacity
+  gate only; VPS acceptance still must prove first `>30 Mbit/s` before any
+  `100+ Mbit/s` claim.
 
 Current result doc:
 
 - `docs/tech/2026-07-08-knife14gq-buffered-downlink-results.md`
 - Performance gate for the next slice:
   `docs/tech/2026-07-09-knife14gr-egress-cadence-reachability.md`
+- Local G2-G5 result:
+  `docs/tech/2026-07-09-knife14gs-local-egress-service-g5-results.md`
 
 Current follow-up queue:
 
@@ -118,19 +128,17 @@ Current follow-up queue:
 3. Do not keep changing local pressure-credit constants blindly. Knife14gq
    removed the `1200B` credit-collapse symptom but still failed at
    `17.2 Mbit/s`.
-4. The next architecture slice, if pursued, must target local writer/egress
-   cadence directly: prove the smoltcp/TUN egress path can drain continuously
-   under reverse TCP pressure without second-scale burst/idle gaps, while
-   keeping bounded pending and hard drop/terminal guards.
+4. Knife14gs added the first explicit local writer/egress service lane. Keep
+   its bounded stop reasons and diagnostics; do not convert it into an
+   unbounded pump or bypass hard pending/drop/terminal guards.
 5. The next focused acceptance target is still first `>30 Mbit/s` on the same
    safe1200 reverse-first P1, not yet `100+`. Do not claim the `100+ Mbit/s`
    path is clear until a later slice passes `>30` and then a clean `100+`
    repeat exits normally.
-6. Knife14gr reachability gate says the current B7-era code is not sufficient
-   as-is. The next implementable slice must add an explicit bounded local
-   egress service lane in the main loop, with TDD proving continuous ACK/TUN/
-   smoltcp drain and at least `128KiB` per active service window in harness
-   terms before a VPS run.
+6. For G6 parsing, require the new `tcp-local-egress-service` diagnostics to
+   show useful cycles/accepted bytes and a low no-progress share. If VPS still
+   stays below `30 Mbit/s`, compare those counters against `tcp-tun-rx-drain`,
+   `tcp-downlink-flush`, TUN drops, and QUIC blocking before changing code.
 
 ## Roadmap: TUN transparent proxy (Target extraction)
 
