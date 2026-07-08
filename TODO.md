@@ -72,30 +72,47 @@ Latest discriminator:
   (`data_read_gap_max_ms=3872`, `data_pending_gap_max_ms=3006`) and the final
   burst reintroduced one local pressure edge (`downlink_backpressure
   pause_edges=1`, `read_credit_pause_updates=1`).
+- Knife14gp added T13/T14 TDD and code for since-last-pending TUIC stream
+  diagnostics plus post-flush residual pressure debt. Commit `bd0d264` removed
+  the obvious false pre-flush debt shape: the focused run had
+  `downlink_backpressure pause_edges=0 resume_edges=0`, clean TUN drops,
+  clean close-tail accounting, and clean QUIC loss/blocking. It still regressed
+  to `15.0/13.5 Mbit/s`, **not** `>30`. The new discriminator showed many
+  repeated multi-second pending windows with
+  `conn_rx_stream_frames_since_pending=0`, meaning older
+  `connection_stream_frames_pending` evidence was often stale since the last
+  successful stream read. The remaining active branch is useful read-credit
+  collapse to `1200B` under residual local pressure/headroom evidence, not VPS
+  capacity, iperf3, MTU, stale pool, broad QUIC windows, or simply sleeping
+  stream polling.
 
 Current result doc:
 
-- `docs/tech/2026-07-08-knife14go-active-conn-rx-self-wake-results.md`
+- `docs/tech/2026-07-08-knife14gp-post-flush-pressure-debt-results.md`
 
 Current follow-up queue:
 
-1. Keep the ordered-default gate and the Knife14gm low-byte ACK/window service
-   fix, Knife14gn accepted-flush progress feedback, and Knife14go active
-   connection-RX self-wake; unordered reassembly remains diagnostic only.
-2. Do not keep changing local pressure-credit constants blindly. Knife14go
-   shows the relay is now polled frequently, but ordered delivery still stalls
-   for seconds before the late catch-up burst produces a local pressure edge.
-3. Next code slice should distinguish connection-level STREAM frame progress
-   from current-stream deliverable progress when
-   `pending_cause=connection_stream_frames_pending` repeats for multi-second
-   gaps despite frequent polling.
-4. The next focused acceptance target is still first `>30 Mbit/s` on the same
+1. Keep the ordered-default gate, Knife14gm low-byte ACK/window service,
+   Knife14gn accepted-flush progress feedback, Knife14go active connection-RX
+   self-wake, and Knife14gp since-last-pending diagnostics/post-flush debt
+   separation; unordered reassembly remains diagnostic only.
+2. Do not continue self-wake timer work as the main branch. Knife14go proved
+   frequent polling, and Knife14gp proved repeated pending windows often have
+   no fresh `conn_rx_stream_frames_since_pending` progress.
+3. Do not keep changing local pressure-credit constants blindly. Knife14gp
+   removed obvious pause/resume edges, but useful read service still collapsed
+   to `1200B` under residual pressure/headroom evidence while TUN drops,
+   send failures, close-tail reaping, and QUIC blocking stayed clean.
+4. Next code slice should classify stale repeated STREAM-pending samples
+   separately from fresh connection progress, then preserve a useful
+   read-service floor during accepted egress progress when hard drop/failure
+   signals are absent.
+5. The next focused acceptance target is still first `>30 Mbit/s` on the same
    safe1200 reverse-first P1, not yet `100+`.
-5. After the ordered deliverability discriminator is clear, handle the late
-   local pressure-credit edge during catch-up bursts, then continue toward clean
-   `100+ Mbit/s`.
-6. Only after a clean `100+ Mbit/s` repeat exits normally should Knife14 broaden
-   to longer-duration or concurrency sweeps.
+6. After the stale-pending/read-credit-collapse branch clears `>30 Mbit/s`,
+   continue toward clean `100+ Mbit/s`; only after a clean `100+ Mbit/s` repeat
+   exits normally should Knife14 broaden to longer-duration or concurrency
+   sweeps.
 
 ## Roadmap: TUN transparent proxy (Target extraction)
 

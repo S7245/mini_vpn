@@ -4155,3 +4155,31 @@ worth cleaning up separately.
   credit repayment to read-credit publishing/read-service cadence, with the
   immediate acceptance target of clearing `30 Mbit/s` before returning to
   `100+ Mbit/s`.
+
+## 2026-07-08 - Knife14gp post-flush pressure debt did not clear 30M
+
+- Result doc:
+  `docs/tech/2026-07-08-knife14gp-post-flush-pressure-debt-results.md`
+- Code commit:
+  `bd0d264` (`fix(knife14gp): defer projected pressure debt post-flush`)
+- VPS bundle:
+  `/tmp/mini_vpn/knife14gp_postflush_debt_20260708/mvpn_knife14gp_postflush_debt_safe1200_p1_30_usclient_suite_20260708_222938.tar.gz`
+- Outcome: local full gates, focused remote `.27` gates, and the focused
+  safe1200 reverse-first P1 completed. The run reached only `15.0 Mbit/s`
+  sender and `13.5 Mbit/s` receiver, so it did not exceed `30 Mbit/s`.
+- Useful progress: T13 added since-last-pending transport counters, and T14
+  moved projected pressure debt from pre-flush transient pending to post-flush
+  residual pressure. In the VPS run, `downlink_backpressure pause_edges=0
+  resume_edges=0`, while TUN drops, close-tail accounting, send errors, and
+  QUIC loss/blocking stayed clean.
+- Remaining root: useful read service still collapsed to `1200B` under
+  residual pressure/headroom evidence (`may_recv_false=13`,
+  `headroom_limited=3`, `hard_edge_guard_limited=3`) even though there were no
+  hard drop/failure signals. Repeated pending diagnostics often showed
+  `conn_rx_stream_frames_since_pending=0`, so older
+  `connection_stream_frames_pending` evidence was stale since the last
+  successful stream read.
+- Reusable rule: do not keep chasing self-wake or pause-edge counters after
+  Knife14gp. The next TDD slice should classify stale repeated STREAM-pending
+  samples and preserve a useful read-service floor while accepted egress is
+  progressing and hard pressure/drop/failure signals are absent.

@@ -2992,3 +2992,24 @@ active root unless it repeats.
   throughput evidence. Do read-only diagnostics, avoid restarting or retuning
   VPS services by default, then retry once with the same command before
   attributing it to code.
+
+## 2026-07-08 - Knife14gp T14 failed below 30M after post-flush debt
+
+- Stage: Knife14gp post-flush projected pressure debt acceptance.
+- Symptom: commit `bd0d264` passed local and remote focused gates, and the
+  focused safe1200 reverse-first P1 completed with healthy direct baselines,
+  but throughput regressed to `15.0/13.5 Mbit/s` instead of exceeding
+  `30 Mbit/s`.
+- Cause: post-flush residual-pressure debt removed the obvious
+  `downlink_backpressure` pause/resume edge (`0/0`), but read service still
+  collapsed to `1200B` under residual pressure/headroom evidence while TUN
+  drops, send failures, close-tail accounting, and QUIC loss/blocking stayed
+  clean. The new since-last-pending diagnostics also showed repeated
+  multi-second pending windows with `conn_rx_stream_frames_since_pending=0`,
+  so prior `connection_stream_frames_pending` evidence could be stale since
+  the last successful stream read.
+- Correct behavior: do not repeat T14 as a completion fix, do not chase
+  pause-edge counters alone, and do not broaden VPS/MTU/window/pool work from
+  this result. The next fix must be TDD-first around stale repeated
+  STREAM-pending classification plus a useful read-service floor during
+  accepted egress progress when hard drop/failure signals are absent.
