@@ -305,45 +305,6 @@ struct TrackedRelayStream<S> {
     _lease: TcpPoolSlotLease,
 }
 
-struct TuicTcpRelayStream<R, W> {
-    recv: R,
-    send: W,
-}
-
-impl<R, W> TuicTcpRelayStream<R, W> {
-    fn new(recv: R, send: W) -> Self {
-        Self { recv, send }
-    }
-}
-
-impl<R: AsyncRead + Unpin, W: Unpin> AsyncRead for TuicTcpRelayStream<R, W> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.recv).poll_read(cx, buf)
-    }
-}
-
-impl<R: Unpin, W: AsyncWrite + Unpin> AsyncWrite for TuicTcpRelayStream<R, W> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.send).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.send).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.send).poll_shutdown(cx)
-    }
-}
-
 impl<S> TrackedRelayStream<S> {
     #[cfg(test)]
     fn new(inner: S, lease: TcpPoolSlotLease, tcp_diag: Option<TuicTcpStreamDiag>) -> Self {
@@ -2252,9 +2213,9 @@ impl ProxyUpstream for TuicUpstream {
             } else {
                 None
             };
-            // 把双向流的收/发两半显式收成一条 AsyncRead+AsyncWrite，喂给现有双向泵。
+            // 把双向流的收/发两半合成一条 AsyncRead+AsyncWrite，喂给现有双向泵。
             Ok::<RelayStream, ClientError>(Box::new(TrackedRelayStream::new_with_transport(
-                TuicTcpRelayStream::new(recv, send),
+                tokio::io::join(recv, send),
                 lease,
                 tcp_stream_diag,
                 conn.clone(),
@@ -2916,29 +2877,6 @@ mod tests {
             snapshot.first_rx_ms < 1_000,
             "first_rx_ms should be immediate in the in-memory stream: {snapshot:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn tuic_tcp_relay_stream_uses_recv_for_reads_and_send_for_writes() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let (mut peer_downlink, relay_recv) = tokio::io::duplex(64);
-        let (relay_send, mut peer_uplink) = tokio::io::duplex(64);
-        let mut stream = TuicTcpRelayStream::new(relay_recv, relay_send);
-
-        peer_downlink.write_all(b"down").await.unwrap();
-        let mut down = [0u8; 4];
-        stream.read_exact(&mut down).await.unwrap();
-        assert_eq!(&down, b"down");
-
-        stream.write_all(b"up").await.unwrap();
-        let mut up = [0u8; 2];
-        peer_uplink.read_exact(&mut up).await.unwrap();
-        assert_eq!(&up, b"up");
-
-        stream.shutdown().await.unwrap();
-        let mut eof = [0u8; 1];
-        assert_eq!(peer_uplink.read(&mut eof).await.unwrap(), 0);
     }
 
     #[test]
