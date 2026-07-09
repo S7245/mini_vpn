@@ -3162,3 +3162,22 @@ active root unless it repeats.
   proves sustained TUIC ordered-stream polling and local admission progress
   remain coupled under local pressure before claiming a path to `>30M` or
   `100+M`.
+
+## 2026-07-09 - Split-poll credit decoupling did not clear local pressure
+
+- Stage: Knife14gy ordered stream polling versus local pressure-credit/headroom.
+- Symptom: commit `372d6e3` passed local and remote focused gates, and the data
+  stream kept `remote_read_service_len_min=max=65536` even when
+  `read_credit_limit_bytes_min=6686`, but focused reverse-first P1 reached only
+  `24.1/22.7 Mbit/s`.
+- Cause: the split-poll fix removed one direct read-length clamp, but the
+  local admission/headroom path still installed pressure debt and stopped
+  useful admission at the tail:
+  `may_recv_false=5190`, `headroom_limited=5185`,
+  `pressure_credit_debt_bytes=122727`, `send_queue_max=557386`, and
+  `tcp-local-egress-service accepted_bytes=0`.
+- Correct behavior: do not claim throughput recovery from stream-poll cadence
+  alone. The next implementation must directly change and test local
+  admission/headroom egress progress under pressure, with an acceptance signal
+  requiring both remote read progress and local accepted/flush progress in the
+  same active window.

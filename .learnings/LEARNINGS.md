@@ -4419,3 +4419,30 @@ worth cleaning up separately.
   pressure-credit/headroom feedback contract directly, and must have a
   code-level gate for sustained remote-read cadence plus local admission
   progress before another VPS acceptance claim.
+
+## 2026-07-09 - Knife14gy split-poll credit fix was necessary but not sufficient
+
+- Result doc:
+  `docs/tech/2026-07-09-knife14gy-split-poll-credit-results.md`
+- Code commit:
+  `372d6e3` (`fix(knife14): decouple stream polling from local credit`)
+- VPS bundle:
+  `/tmp/mini_vpn_knife14gy_splitpoll/mvpn_knife14gy_splitpoll_safe1200_p1_usclient_suite_20260709_115932.tar.gz`
+- Outcome: local gates, remote focused gates, release build, and focused
+  reverse-first P1 ran. The P1 result was `24.1/22.7 Mbit/s`, so it did not
+  exceed `30 Mbit/s` and did not approach `100+ Mbit/s`.
+- Useful progress: ordered stream polling is no longer capped below the
+  dispatch segment by small local pressure credit. The data stream reported
+  `remote_read_service_len_min=65536`,
+  `remote_read_service_len_max=65536`,
+  `remote_batch_bytes_max=131072`, and
+  `read_credit_limit_bytes_min=6686`.
+- Remaining root shape: the failure is still `local_pressure_credit`.
+  The final report had `may_recv_false=5190`, `headroom_limited=5185`,
+  `pressure_credit_debt_bytes=122727`, `send_queue_max=557386`, and
+  `tcp-local-egress-service accepted_bytes=0`, while TUN drops, global-rx
+  pressure, close-tail pending, and QUIC loss/congestion/blocking stayed clean.
+- Reusable rule: split the terms carefully. Frequent ordered stream polling and
+  large read length are necessary, but they are not acceptance. The next slice
+  must make local admission/headroom produce sustained egress progress after
+  remote reads; do not spend another VPS run on split-poll-only changes.
