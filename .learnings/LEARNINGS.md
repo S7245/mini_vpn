@@ -4446,3 +4446,27 @@ worth cleaning up separately.
   large read length are necessary, but they are not acceptance. The next slice
   must make local admission/headroom produce sustained egress progress after
   remote reads; do not spend another VPS run on split-poll-only changes.
+
+## 2026-07-09 - Knife14hz local egress drain progress did not restore throughput
+
+- Result doc:
+  `docs/tech/2026-07-09-knife14hz-egress-drain-progress-results.md`
+- Code commit:
+  `8fc0cdb` (`fix(knife14): count local egress drain progress`)
+- VPS bundle:
+  `/tmp/mini_vpn_knife14hz_egress_drain/mvpn_knife14hz_egress_drain_p1_usclient_suite_20260709_132051.tar.gz`
+- Outcome: H1/H2/H3 completed. Local full gates, remote focused gates, release
+  build, and the focused reverse-first P1 ran. The P1 result was
+  `15.3/14.3 Mbit/s`, so it did not exceed `30 Mbit/s`.
+- Useful progress: local egress and stream-service diagnostics now count
+  successful TUN TX queue drain as local progress, so future logs can
+  distinguish accepted bytes from drain-only progress.
+- Discriminator: the H3 run had clean TUN drops, clean global-rx pressure,
+  clean local pressure/headroom debt, clean QUIC loss/congestion/blocking, and
+  `pending_at_close=0`, but still showed bursty iperf output and ordered TUIC
+  data stream read/pending gaps up to `5086ms`.
+- Reusable rule: do not continue local egress-drain or pressure-credit tuning
+  when the run shows `accepted_bytes=52039183`, `pressure_credit_debt_bytes=0`,
+  `headroom_limited=0`, and `tcp-local-egress-service egress_drain_bytes=0`.
+  The next slice must target ordered TUIC stream pending/read self-wake cadence
+  directly.

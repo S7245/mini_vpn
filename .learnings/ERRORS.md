@@ -3181,3 +3181,22 @@ active root unless it repeats.
   admission/headroom egress progress under pressure, with an acceptance signal
   requiring both remote read progress and local accepted/flush progress in the
   same active window.
+
+## 2026-07-09 - TUN TX drain-progress hypothesis was not sufficient
+
+- Stage: Knife14hz local egress drain progress H1/H2/H3.
+- Symptom: commit `8fc0cdb` passed local and remote focused gates, but focused
+  reverse-first P1 reached only `15.3/14.3 Mbit/s`, below the `30 Mbit/s`
+  first threshold.
+- Cause: the code-level contract was valid, but the VPS run showed it was not
+  the active throughput root. `tcp-local-egress-service` reported
+  `egress_drain_bytes=0` and `accepted_bytes=0`, while the main downlink flush
+  had already accepted `52039183` bytes with no pressure debt or headroom
+  limiting. The remaining bad signal was ordered TUIC stream read/pending gaps
+  up to `5086ms` with fresh/stale pending evidence.
+- Correct behavior: stop extending this branch through local egress-drain,
+  headroom, pressure-credit, VPS service, iperf3, MTU/PLPMTUD, stale-pool, or
+  broad QUIC-window changes. The next design must instrument and fix the
+  ordered TUIC stream `read().await` / pending self-wake path, with acceptance
+  requiring active data-read gaps below `500ms` before another `100+ Mbit/s`
+  claim.
