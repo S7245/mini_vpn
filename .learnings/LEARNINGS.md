@@ -4303,3 +4303,26 @@ worth cleaning up separately.
   should preserve the new dispatch/egress cadence while making the close-tail
   clean, not return to VPS, MTU, stale pool, broad QUIC windows, or unordered
   reassembly.
+
+## 2026-07-09 - Knife14gu G8 RX-edge guard did not preserve 100M cadence
+
+- Result doc:
+  `docs/tech/2026-07-09-knife14gu-rx-edge-g8-results.md`
+- Code commit:
+  `1a3c5cb` (`fix(knife14gu): stop relay ready bursts at rx edge`)
+- VPS bundle:
+  `/tmp/mini_vpn_knife14gu_g8/mvpn_knife14gu_rxedge_safe1200_p1_usclient_suite_20260709_092357.tar.gz`
+- Outcome: local full gates, remote focused gates, and the focused safe1200
+  reverse-first P1 ran. The result regressed to `20.2/19.2 Mbit/s`, so it did
+  not preserve G7's `100+ Mbit/s` cadence and did not exceed `30 Mbit/s`.
+- Useful progress: tail-drop surfaces were cleaner than G7:
+  `tx_dropped_delta=0`, no parsed TUN feedback pause, and data relay
+  `global_rx_queue_used_max=210/1024` instead of `1019/1024`.
+- Failed assumption: the new near-full limiter was not the active runtime
+  factor. The run logged `remote_batch_limited=0` and
+  `remote_batch_limit_bytes_min=524288`, while ordered TUIC stream read gaps
+  returned to multi-second values up to `3610ms`.
+- Reusable rule: do not infer G7's dirty tail root from global RX edge pressure
+  alone. After a high-throughput but dirty run, the next cleanup must be A/B
+  verified before another code change; otherwise it can clean one tail surface
+  while losing the stream-service cadence that produced throughput.

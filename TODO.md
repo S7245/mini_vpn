@@ -126,6 +126,18 @@ Latest discriminator:
   (`close_pending_class=terminal_closed_no_send`). Next work must preserve this
   dispatch/egress cadence while cleaning tail drop/pending, not return to VPS,
   MTU/PLPMTUD, stale pool, broad QUIC windows, or unordered reassembly.
+- Knife14gu G8 tried the first close-tail cleanup slice at commit `1a3c5cb`:
+  stop extra relay ready-burst reads when the relay-to-main `global_rx` queue
+  is at the critical edge. The focused safe1200 reverse-first P1 did **not**
+  preserve G7 throughput; it regressed to `20.2/19.2 Mbit/s`, below even the
+  earlier `>30 Mbit/s` discriminator. Tail-drop surfaces improved
+  (`tx_dropped_delta=0`, data relay `global_rx_queue_used_max=210/1024`), but
+  the new limiter did not actually activate (`remote_batch_limited=0`). The
+  active failure returned to multi-second ordered TUIC stream read gaps
+  (`max_remote_read_gap_ms=3610`) and `tcp-local-egress-service
+  accepted_bytes=0`. Stop condition: no more code changes from this result
+  alone; next step is A/B repeat of `1a3c5cb` vs parent `4caf60a` before
+  choosing another implementation direction.
 
 Current result doc:
 
@@ -138,6 +150,8 @@ Current result doc:
   `docs/tech/2026-07-09-knife14gs-g6-local-egress-vps-results.md`
 - G7 VPS result:
   `docs/tech/2026-07-09-knife14gt-dispatch-window-g7-results.md`
+- G8 VPS result:
+  `docs/tech/2026-07-09-knife14gu-rx-edge-g8-results.md`
 
 Current follow-up queue:
 
@@ -161,11 +175,16 @@ Current follow-up queue:
    `accepted_bytes=0`; this does not address TUIC ordered stream read cadence.
 6. Knife14gt proved the first TUIC-read/main-loop cadence slice can exceed both
    `30 Mbit/s` and `100 Mbit/s`; preserve that dispatch-window alignment.
-7. The next focused implementation target is close-tail cleanliness under the
-   same cadence: keep `>100 Mbit/s` while eliminating TUN drop feedback,
-   global RX queue edge saturation, and terminal pending reaps.
-8. The next focused VPS acceptance target is a clean safe1200 reverse-first P1
-   repeat with receiver `>100 Mbit/s`, `tx_dropped_delta=0`,
+7. Knife14gu proved that a `global_rx` critical-edge read guard alone is not
+   enough to preserve the G7 cadence. Do not keep editing queue-edge guards
+   without an A/B repeat.
+8. The next non-code step is A/B verification: repeat `1a3c5cb` once, then
+   rerun parent `4caf60a` under the same clean safe1200 reverse-first P1 suite
+   if the repeat stays low. Only then choose whether the next code target is an
+   indirect scheduling regression or the broader TUIC ordered stream
+   service/local admission contract.
+9. The next focused VPS acceptance target remains a clean safe1200
+   reverse-first P1 with receiver `>100 Mbit/s`, `tx_dropped_delta=0`,
    `terminal_pending_reap_bytes=0`, and no data-relay
    `terminal_closed_no_send`. Only after that should longer duration, P2/P4, or
    concurrency stability work resume.

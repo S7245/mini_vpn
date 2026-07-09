@@ -3094,3 +3094,21 @@ active root unless it repeats.
   close-tail are both clean. The next acceptance must preserve `>100 Mbit/s`
   while proving `tx_dropped_delta=0`, `terminal_pending_reap_bytes=0`, and no
   data-relay `terminal_closed_no_send`.
+
+## 2026-07-09 - RX-edge tail cleanup overfit the visible G7 queue edge
+
+- Stage: Knife14gu G8 RX-edge cleanup.
+- Symptom: commit `1a3c5cb` passed local/remote gates but focused safe1200
+  reverse-first P1 regressed to `20.2/19.2 Mbit/s` after G7's
+  `147/144 Mbit/s`.
+- Cause: the cleanup guarded extra relay ready-burst reads only when
+  `global_rx` was critically near full. In the failed run the data relay queue
+  stayed at `210/1024`, the limiter did not activate
+  (`remote_batch_limited=0`), and throughput instead failed with repeated
+  multi-second TUIC ordered stream read gaps plus
+  `tcp-local-egress-service accepted_bytes=0`.
+- Correct behavior: do not make another code change from a single dirty-tail
+  hypothesis after a high-throughput run. First repeat the candidate commit,
+  then A/B the parent high-throughput commit under the same suite shape. Only
+  code after the A/B says whether this was run variance, an indirect scheduling
+  regression, or the broader TUIC stream-service/local-admission contract.

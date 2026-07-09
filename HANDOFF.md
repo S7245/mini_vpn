@@ -75,6 +75,20 @@
   (`close_pending_class=terminal_closed_no_send`). Next work is to preserve
   this dispatch/egress cadence and make the tail clean. Current result doc:
   `docs/tech/2026-07-09-knife14gt-dispatch-window-g7-results.md`.
+- **2026-07-09 Knife14gu G8 failed after RX-edge cleanup attempt
+  （分支 `codex/knife14d-downlink-reap-open`，commit `1a3c5cb`）**：
+  the first close-tail cleanup stopped extra relay ready-burst reads at the
+  `global_rx` critical edge. Local/remote gates passed, but focused safe1200
+  reverse-first P1 regressed to `20.2/19.2 Mbit/s`, below `30M`. Tail-drop
+  surfaces improved (`tx_dropped_delta=0`, data relay
+  `global_rx_queue_used_max=210/1024`), yet the new limiter did not activate
+  (`remote_batch_limited=0`). The failure returned to multi-second ordered TUIC
+  stream read gaps (`max_remote_read_gap_ms=3610`) and
+  `tcp-local-egress-service accepted_bytes=0`. Stop condition: do not start
+  another code change from this result alone. Next step is A/B repeat:
+  `1a3c5cb` once, then parent `4caf60a` in the same suite shape if the repeat
+  stays low. Current result doc:
+  `docs/tech/2026-07-09-knife14gu-rx-edge-g8-results.md`.
 
 ## 目标（唯一北极星）：`Rules.md`
 
