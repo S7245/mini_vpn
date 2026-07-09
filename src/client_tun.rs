@@ -112,6 +112,10 @@ const _: () = assert!(BUFFERED_DOWNLINK_PER_FLOW_HIGH_MULTIPLIER >= 2);
 const _: () = assert!(
     BUFFERED_DOWNLINK_PER_FLOW_HARD_MULTIPLIER > BUFFERED_DOWNLINK_PER_FLOW_HIGH_MULTIPLIER
 );
+/// Knife14: feature-gated relay reader/dispatcher decoupling. The cap is in
+/// staged payload messages; dispatch segmentation bounds each message size.
+const THIN_TCP_RELAY_STAGING_CAPACITY: usize = 64;
+const _: () = assert!(THIN_TCP_RELAY_STAGING_CAPACITY >= 1);
 /// L2（刀9 F4）：一条 relay 双向静默多久判 idle → 退出 + shutdown。防慢/卡死上游（尤其 REALITY
 /// TCP-only 手写 TLS 遇 server 不返回）长期挂住 relay task 泄漏。90s 偏宽松保稳（长轮询/SSE 不误杀）。
 const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
@@ -5282,6 +5286,7 @@ pub struct TunRuntimeConfig {
     tun_rx_active_flow_timer_ms: u64,
     bounded_global_rx_receive_window: bool,
     buffered_downlink: BufferedDownlinkConfig,
+    thin_tcp_relay: bool,
 }
 
 impl TunRuntimeConfig {
@@ -5310,6 +5315,7 @@ impl TunRuntimeConfig {
                 downlink_backpressure,
                 listener_pool_size,
             ),
+            thin_tcp_relay: false,
         })
     }
 
@@ -5379,6 +5385,7 @@ impl TunRuntimeConfig {
             cfg.downlink_backpressure,
             cfg.listener.pool_size,
         );
+        cfg.thin_tcp_relay = parse_trace(std::env::var("MINI_VPN_THIN_TCP_RELAY").ok().as_deref());
         Ok(cfg)
     }
 }
@@ -5546,6 +5553,15 @@ pub async fn start_tun_proxy() {
         runtime_config.buffered_downlink.global_low_bytes,
         runtime_config.buffered_downlink.global_high_bytes,
         runtime_config.buffered_downlink.global_hard_bytes,
+    );
+    println!(
+        "🧪 thin TCP relay staging: {} capacity={} messages（MINI_VPN_THIN_TCP_RELAY=1）",
+        if runtime_config.thin_tcp_relay {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        THIN_TCP_RELAY_STAGING_CAPACITY
     );
 
     // 1. 初始化 TUN 设备 / 创建操作系统的原生异步虚拟网卡。
@@ -8764,14 +8780,28 @@ fn spawn_remote_relay(
     // 刀11：每条新 TCP flow 开远端成功后在此唯一入口计一次（覆盖 inline + spawned remote-open 两条路）。
     metrics_handle.inc_relays_spawned();
     let (read_credit_tx, read_credit_rx) = watch::channel(RelayReadCredit::initial());
-    tokio::spawn(run_relay(
-        handle,
-        epoch,
-        stream,
-        rx,
-        back_tx,
-        read_credit_rx,
-    ));
+    match TcpRelayEngine::from_env() {
+        TcpRelayEngine::Legacy => {
+            tokio::spawn(run_relay(
+                handle,
+                epoch,
+                stream,
+                rx,
+                back_tx,
+                read_credit_rx,
+            ));
+        }
+        TcpRelayEngine::ThinStaging => {
+            tokio::spawn(run_relay_thin(
+                handle,
+                epoch,
+                stream,
+                rx,
+                back_tx,
+                read_credit_rx,
+            ));
+        }
+    }
     read_credit_tx
 }
 
@@ -8793,6 +8823,36 @@ enum RelayReaderSignal {
         reason: &'static str,
         diag: RelayTaskDiag,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpRelayEngine {
+    Legacy,
+    ThinStaging,
+}
+
+impl TcpRelayEngine {
+    fn from_env() -> Self {
+        if parse_trace(std::env::var("MINI_VPN_THIN_TCP_RELAY").ok().as_deref()) {
+            Self::ThinStaging
+        } else {
+            Self::Legacy
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::ThinStaging => "thin_staging",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ThinRelayPayload {
+    epoch: u64,
+    payload: Vec<u8>,
+    stream_service_window: StreamServiceWindow,
 }
 
 async fn send_remote_payload_batch_to_main(
@@ -8836,6 +8896,48 @@ async fn send_remote_payload_batch_to_main(
     Ok(())
 }
 
+async fn dispatch_thin_payload_to_main(
+    handle: SocketHandle,
+    payload: ThinRelayPayload,
+    back_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    diag: &mut RelayTaskDiag,
+    global_rx_pressure_threshold: std::time::Duration,
+) -> Result<(), RelayCloseReason> {
+    let payload_len = payload.payload.len();
+    note_global_rx_channel_occupancy(diag, back_tx);
+    let wait_started = std::time::Instant::now();
+    let permit_result = back_tx.reserve().await;
+    let waited = wait_started.elapsed();
+    diag.note_global_rx_wait(waited, global_rx_pressure_threshold);
+    let Ok(permit) = permit_result else {
+        return Err(("remote_to_local", "global_rx_closed"));
+    };
+    note_global_rx_channel_occupancy(diag, back_tx);
+    let mut stream_service_window = payload.stream_service_window;
+    stream_service_window.note_global_rx_wait(waited, global_rx_pressure_threshold);
+    stream_service_window
+        .note_global_rx_queue(diag.global_rx_queue_used_max, diag.global_rx_queue_capacity);
+    permit.send((
+        handle,
+        RelayEvent::Data {
+            epoch: payload.epoch,
+            bytes: payload.payload,
+            stream_service_window,
+        },
+    ));
+    note_global_rx_channel_occupancy(diag, back_tx);
+    if waited >= global_rx_pressure_threshold {
+        tcp_diag_log!(
+            "🔎 tcp-global-rx-pressure handle={:?} wait_us={} payload_bytes={} pressure_events={} engine=thin_staging",
+            handle,
+            waited.as_micros(),
+            payload_len,
+            diag.global_rx_pressure_events
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_remote_payload_staged_to_main(
     handle: SocketHandle,
@@ -8865,6 +8967,76 @@ async fn send_remote_payload_staged_to_main(
             back_tx,
             diag,
             global_rx_pressure_threshold,
+        )
+        .await?;
+        offset = end;
+        if offset < payload.len() {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(())
+}
+
+async fn send_remote_payload_batch_to_thin_stage(
+    handle: SocketHandle,
+    epoch: u64,
+    payload: Vec<u8>,
+    batch_chunks: usize,
+    thin_tx: &mpsc::Sender<ThinRelayPayload>,
+    diag: &mut RelayTaskDiag,
+) -> Result<(), RelayCloseReason> {
+    let payload_len = payload.len();
+    diag.note_remote_batch(batch_chunks, payload_len);
+    let wait_started = std::time::Instant::now();
+    let permit_result = thin_tx.reserve().await;
+    let waited = wait_started.elapsed();
+    let Ok(permit) = permit_result else {
+        return Err(("remote_to_local", "thin_stage_closed"));
+    };
+    if waited >= std::time::Duration::from_millis(5) {
+        tcp_diag_log!(
+            "🔎 tcp-thin-relay-stage-pressure handle={:?} wait_us={} payload_bytes={} staged_capacity={}",
+            handle,
+            waited.as_micros(),
+            payload_len,
+            thin_tx.max_capacity()
+        );
+    }
+    permit.send(ThinRelayPayload {
+        epoch,
+        payload,
+        stream_service_window: diag.stream_service_window(),
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_remote_payload_staged_to_thin_stage(
+    handle: SocketHandle,
+    epoch: u64,
+    payload: Vec<u8>,
+    batch_chunks: usize,
+    dispatch_segment_max_bytes: usize,
+    thin_tx: &mpsc::Sender<ThinRelayPayload>,
+    diag: &mut RelayTaskDiag,
+) -> Result<(), RelayCloseReason> {
+    let segment_max = dispatch_segment_max_bytes.max(1);
+    let mut offset = 0;
+    while offset < payload.len() {
+        let end = offset.saturating_add(segment_max).min(payload.len());
+        let segment_chunks = if offset == 0 && end == payload.len() {
+            batch_chunks
+        } else {
+            1
+        };
+        let segment = payload[offset..end].to_vec();
+        send_remote_payload_batch_to_thin_stage(
+            handle,
+            epoch,
+            segment,
+            segment_chunks,
+            thin_tx,
+            diag,
         )
         .await?;
         offset = end;
@@ -8993,6 +9165,70 @@ async fn drain_ready_remote_reads(
     Ok((burst, close_after_batch))
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn drain_ready_remote_reads_to_thin_stage(
+    remote_reader: &mut tokio::io::ReadHalf<RelayStream>,
+    handle: SocketHandle,
+    epoch: u64,
+    initial_payload: Vec<u8>,
+    buf: &mut [u8],
+    thin_tx: &mpsc::Sender<ThinRelayPayload>,
+    diag: &mut RelayTaskDiag,
+    read_credit: RelayReadCredit,
+) -> Result<(RemoteReadBurst, Option<RelayCloseReason>), RelayCloseReason> {
+    let mut burst = RemoteReadBurst::default();
+    let byte_limit = RELAY_REMOTE_READ_BURST_MAX_BYTES
+        .min(read_credit.max_batch_bytes)
+        .max(initial_payload.len());
+    diag.note_remote_batch_limit(byte_limit);
+    let mut batch = Vec::with_capacity(initial_payload.len().min(byte_limit));
+    append_remote_read_to_batch(diag, &mut burst, &mut batch, &initial_payload);
+    let mut close_after_batch = None;
+    while burst.chunks < RELAY_REMOTE_READ_BURST_MAX_CHUNKS && burst.bytes < byte_limit {
+        let remaining = byte_limit.saturating_sub(burst.bytes);
+        if remaining == 0 {
+            break;
+        }
+        let read_len = remaining.min(buf.len());
+        match poll_ready_remote_read(remote_reader, &mut buf[..read_len]).await {
+            None => break,
+            Some(Ok(0)) => {
+                println!("远端服务器关闭了车厢 {:?}", handle);
+                close_after_batch = Some(("remote_to_local", "remote_eof"));
+                break;
+            }
+            Some(Ok(n)) => {
+                append_remote_read_to_batch(diag, &mut burst, &mut batch, &buf[..n]);
+            }
+            Some(Err(e)) => {
+                println!(
+                    "读取上游流失败 direction=remote_to_local handle={:?} err={:?}",
+                    handle, e
+                );
+                close_after_batch = Some(("remote_to_local", "remote_read_failed"));
+                break;
+            }
+        }
+    }
+    if batch.is_empty() {
+        if let Some(reason) = close_after_batch {
+            return Err(reason);
+        }
+        return Ok((burst, None));
+    }
+    send_remote_payload_staged_to_thin_stage(
+        handle,
+        epoch,
+        batch,
+        burst.chunks,
+        RELAY_REMOTE_DISPATCH_SEGMENT_MAX_BYTES,
+        thin_tx,
+        diag,
+    )
+    .await?;
+    Ok((burst, close_after_batch))
+}
+
 async fn send_relay_reader_progress(
     signal_tx: &mpsc::Sender<RelayReaderSignal>,
     diag: &RelayTaskDiag,
@@ -9114,6 +9350,123 @@ async fn run_relay_reader(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_relay_thin_reader(
+    handle: SocketHandle,
+    epoch: u64,
+    mut remote_reader: tokio::io::ReadHalf<RelayStream>,
+    thin_tx: mpsc::Sender<ThinRelayPayload>,
+    mut read_credit_rx: watch::Receiver<RelayReadCredit>,
+    signal_tx: mpsc::Sender<RelayReaderSignal>,
+    local_finish_seen: Arc<std::sync::atomic::AtomicBool>,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    let mut buf = [0u8; 65_536];
+    let mut diag = RelayTaskDiag::default();
+    let mut read_credit = *read_credit_rx.borrow();
+    diag.note_read_credit(read_credit);
+    loop {
+        note_reader_local_finish_if_needed(&local_finish_seen, &mut diag);
+        drain_relay_read_credit_updates(&mut read_credit_rx, &mut read_credit, &mut diag);
+        let remote_read_len = diag.next_remote_read_len(read_credit, buf.len());
+        if remote_read_len == 0 {
+            let credit_update = tokio::select! {
+                _ = &mut stop_rx => return,
+                update = read_credit_rx.changed() => update,
+            };
+            if credit_update.is_err() {
+                return;
+            }
+            read_credit = *read_credit_rx.borrow_and_update();
+            diag.note_read_credit(read_credit);
+            if read_credit.paused {
+                tcp_diag_log!(
+                    "🔎 tcp-relay-read-credit handle={:?} epoch={} paused=true max_batch_bytes=0 updates={} pause_updates={} engine=thin_staging",
+                    handle,
+                    epoch,
+                    diag.read_credit_updates,
+                    diag.read_credit_pause_updates
+                );
+            }
+            continue;
+        }
+
+        let remote_msg = tokio::select! {
+            _ = &mut stop_rx => return,
+            remote_msg = remote_reader.read(&mut buf[..remote_read_len]) => remote_msg,
+        };
+        match remote_msg {
+            Ok(0) => {
+                println!("远端服务器关闭了车厢 {:?}", handle);
+                send_relay_reader_close(&signal_tx, "remote_to_local", "remote_eof", diag).await;
+                return;
+            }
+            Ok(n) => {
+                note_reader_local_finish_if_needed(&local_finish_seen, &mut diag);
+                let initial_payload = buf[..n].to_vec();
+                match drain_ready_remote_reads_to_thin_stage(
+                    &mut remote_reader,
+                    handle,
+                    epoch,
+                    initial_payload,
+                    &mut buf,
+                    &thin_tx,
+                    &mut diag,
+                    read_credit,
+                )
+                .await
+                {
+                    Ok((_burst, close_after_batch)) => {
+                        if !send_relay_reader_progress(&signal_tx, &diag).await {
+                            return;
+                        }
+                        if let Some((direction, reason)) = close_after_batch {
+                            send_relay_reader_close(&signal_tx, direction, reason, diag).await;
+                            return;
+                        }
+                    }
+                    Err((direction, reason)) => {
+                        send_relay_reader_close(&signal_tx, direction, reason, diag).await;
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                println!(
+                    "读取上游流失败 direction=remote_to_local handle={:?} err={:?}",
+                    handle, e
+                );
+                send_relay_reader_close(&signal_tx, "remote_to_local", "remote_read_failed", diag)
+                    .await;
+                return;
+            }
+        }
+    }
+}
+
+async fn run_thin_relay_dispatcher(
+    handle: SocketHandle,
+    back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
+    mut thin_rx: mpsc::Receiver<ThinRelayPayload>,
+) {
+    let mut diag = RelayTaskDiag::default();
+    let global_rx_pressure_threshold = std::time::Duration::from_millis(5);
+    while let Some(payload) = thin_rx.recv().await {
+        if dispatch_thin_payload_to_main(
+            handle,
+            payload,
+            &back_tx,
+            &mut diag,
+            global_rx_pressure_threshold,
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
+    }
+}
+
 /// 一条 TCP relay 的双向泵（独立 task body；抽出便于 idle 超时单测）。
 /// 中文要点：L2（刀9 F4）select 加 idle 超时分支——双向 `RELAY_IDLE_TIMEOUT` 无活动 → 退出 + shutdown。
 /// 任一方向有活动（本地→上游 write 成功 / 上游→本地 read）即重置（每轮 select 重建 sleep，计「距上次活动」）。
@@ -9126,6 +9479,47 @@ async fn run_relay(
     back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
     read_credit_rx: watch::Receiver<RelayReadCredit>,
 ) {
+    run_relay_with_engine(
+        handle,
+        epoch,
+        stream,
+        rx,
+        back_tx,
+        read_credit_rx,
+        TcpRelayEngine::Legacy,
+    )
+    .await;
+}
+
+async fn run_relay_thin(
+    handle: SocketHandle,
+    epoch: u64,
+    stream: RelayStream,
+    rx: mpsc::Receiver<RelayCommand>,
+    back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
+    read_credit_rx: watch::Receiver<RelayReadCredit>,
+) {
+    run_relay_with_engine(
+        handle,
+        epoch,
+        stream,
+        rx,
+        back_tx,
+        read_credit_rx,
+        TcpRelayEngine::ThinStaging,
+    )
+    .await;
+}
+
+async fn run_relay_with_engine(
+    handle: SocketHandle,
+    epoch: u64,
+    stream: RelayStream,
+    rx: mpsc::Receiver<RelayCommand>,
+    back_tx: mpsc::Sender<(SocketHandle, RelayEvent)>,
+    read_credit_rx: watch::Receiver<RelayReadCredit>,
+    engine: TcpRelayEngine,
+) {
     let (remote_reader, remote_writer) = tokio::io::split(stream);
     let (writer_signal_tx, mut writer_signal_rx) =
         mpsc::channel::<RelayWriterSignal>(RELAY_CHANNEL_CAPACITY);
@@ -9135,16 +9529,44 @@ async fn run_relay(
     let (reader_stop_tx, reader_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let local_finish_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let read_credit_probe_rx = read_credit_rx.clone();
-    let mut reader_task = tokio::spawn(run_relay_reader(
-        handle,
-        epoch,
-        remote_reader,
-        back_tx.clone(),
-        read_credit_rx,
-        reader_signal_tx,
-        local_finish_seen.clone(),
-        reader_stop_rx,
-    ));
+    let mut dispatcher_task = None;
+    let mut reader_task = match engine {
+        TcpRelayEngine::Legacy => tokio::spawn(run_relay_reader(
+            handle,
+            epoch,
+            remote_reader,
+            back_tx.clone(),
+            read_credit_rx,
+            reader_signal_tx,
+            local_finish_seen.clone(),
+            reader_stop_rx,
+        )),
+        TcpRelayEngine::ThinStaging => {
+            tcp_diag_log!(
+                "🔎 tcp-relay-engine handle={:?} epoch={} engine={} staging_capacity={}",
+                handle,
+                epoch,
+                engine.as_str(),
+                THIN_TCP_RELAY_STAGING_CAPACITY
+            );
+            let (thin_tx, thin_rx) = mpsc::channel(THIN_TCP_RELAY_STAGING_CAPACITY);
+            dispatcher_task = Some(tokio::spawn(run_thin_relay_dispatcher(
+                handle,
+                back_tx.clone(),
+                thin_rx,
+            )));
+            tokio::spawn(run_relay_thin_reader(
+                handle,
+                epoch,
+                remote_reader,
+                thin_tx,
+                read_credit_rx,
+                reader_signal_tx,
+                local_finish_seen.clone(),
+                reader_stop_rx,
+            ))
+        }
+    };
     let mut writer_task = tokio::spawn(run_relay_writer(
         handle,
         remote_writer,
@@ -9314,6 +9736,17 @@ async fn run_relay(
     {
         writer_task.abort();
         let _ = writer_task.await;
+    }
+    if let Some(mut task) = dispatcher_task {
+        if task.is_finished() {
+            let _ = task.await;
+        } else if tokio::time::timeout(RELAY_WRITER_STOP_TIMEOUT, &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
     }
     tcp_diag_log!(
         "{}",
@@ -11873,6 +12306,62 @@ mod tests {
             }
             other => panic!("expected initial data batch, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn thin_relay_reader_stages_payloads_without_global_rx_admission() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let chunks: std::collections::VecDeque<_> = std::iter::repeat_with(|| vec![7; 16 * 1024])
+            .take(THIN_TCP_RELAY_STAGING_CAPACITY + 2)
+            .collect();
+        let stream: RelayStream = Box::new(BurstReadableStream {
+            shutdown_called: Arc::new(AtomicBool::new(false)),
+            chunks,
+            eof_after_chunks: false,
+        });
+        let (remote_reader, _remote_writer) = tokio::io::split(stream);
+        let (thin_tx, mut thin_rx) = mpsc::channel(THIN_TCP_RELAY_STAGING_CAPACITY);
+        let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit {
+            paused: false,
+            max_batch_bytes: 16 * 1024,
+        });
+        let (signal_tx, _signal_rx) = mpsc::channel(RELAY_CHANNEL_CAPACITY);
+        let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let local_finish_seen = Arc::new(AtomicBool::new(false));
+
+        let task = tokio::spawn(run_relay_thin_reader(
+            handle,
+            91,
+            remote_reader,
+            thin_tx,
+            credit_rx,
+            signal_tx,
+            local_finish_seen,
+            stop_rx,
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            while thin_rx.len() < THIN_TCP_RELAY_STAGING_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("thin reader should fill its bounded staging queue without global_rx admission");
+
+        assert_eq!(
+            thin_rx.len(),
+            THIN_TCP_RELAY_STAGING_CAPACITY,
+            "thin staging capacity is the explicit reader-side pressure edge"
+        );
+        task.abort();
+        let _ = task.await;
+
+        let mut staged = 0;
+        while thin_rx.try_recv().is_ok() {
+            staged += 1;
+        }
+        assert_eq!(staged, THIN_TCP_RELAY_STAGING_CAPACITY);
     }
 
     #[tokio::test]
