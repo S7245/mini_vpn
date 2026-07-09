@@ -30,6 +30,8 @@ const MIN_TCP_SOCKET_BUFFER_BYTES: usize = 4 * 1024;
 const MAX_TCP_SOCKET_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 const RELAY_CHANNEL_CAPACITY: usize = 1024;
 const _: () = assert!(RELAY_CHANNEL_CAPACITY >= 1);
+const RELAY_GLOBAL_RX_CRITICAL_FREE_SLOTS: usize = 8;
+const _: () = assert!(RELAY_GLOBAL_RX_CRITICAL_FREE_SLOTS > 0);
 const RELAY_REMOTE_READ_BURST_MAX_CHUNKS: usize = 16;
 const RELAY_REMOTE_READ_BURST_MAX_BYTES: usize = 512 * 1024;
 const RELAY_REMOTE_READ_MIN_BATCH_BYTES: usize = 64 * 1024;
@@ -1151,6 +1153,12 @@ fn relay_remote_ready_batch_byte_limit_for_queue(used: usize, max_capacity: usiz
     }
 
     let used = used.min(max_capacity);
+    let free_slots = max_capacity.saturating_sub(used);
+    if max_capacity >= RELAY_GLOBAL_RX_CRITICAL_FREE_SLOTS * 2
+        && free_slots <= RELAY_GLOBAL_RX_CRITICAL_FREE_SLOTS
+    {
+        return 0;
+    }
     let low_water = max_capacity / 4;
     let high_water = max_capacity.saturating_mul(3) / 4;
     if used <= low_water {
@@ -9975,7 +9983,7 @@ mod tests {
                 RELAY_CHANNEL_CAPACITY,
                 RELAY_CHANNEL_CAPACITY
             ),
-            RELAY_REMOTE_READ_MIN_BATCH_BYTES
+            0
         );
     }
 
@@ -11665,6 +11673,85 @@ mod tests {
                 assert_eq!(bytes.len(), RELAY_REMOTE_READ_MIN_BATCH_BYTES);
             }
             other => panic!("expected pressure-limited data batch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_remote_ready_burst_stops_extra_reads_at_global_rx_critical_edge() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let chunks: std::collections::VecDeque<_> = std::iter::repeat_with(|| vec![6; 16 * 1024])
+            .take(8)
+            .collect();
+        let stream: RelayStream = Box::new(BurstReadableStream {
+            shutdown_called: Arc::new(AtomicBool::new(false)),
+            chunks,
+            eof_after_chunks: false,
+        });
+        let (mut remote_reader, _remote_writer) = tokio::io::split(stream);
+        let (back_tx, mut back_rx) = mpsc::channel(1024);
+        for _ in 0..1019 {
+            back_tx
+                .try_send((
+                    handle,
+                    RelayEvent::AckDrainHint {
+                        epoch: 81,
+                        gap_ms: 500,
+                        remote_to_global_rx_bytes: 1,
+                    },
+                ))
+                .unwrap();
+        }
+        let mut diag = RelayTaskDiag::default();
+        let mut buf = [0u8; 65_536];
+        let initial_payload = vec![9; 16 * 1024];
+
+        let (burst, close_after_batch) = drain_ready_remote_reads(
+            &mut remote_reader,
+            handle,
+            81,
+            initial_payload.clone(),
+            &mut buf,
+            &back_tx,
+            &mut diag,
+            RelayReadCredit::default(),
+            std::time::Duration::from_millis(5),
+        )
+        .await
+        .expect("critical-edge initial payload should still forward");
+
+        assert_eq!(close_after_batch, None);
+        assert_eq!(
+            burst.bytes,
+            initial_payload.len(),
+            "critical global_rx occupancy must stop extra ready reads beyond the payload already read"
+        );
+        assert_eq!(burst.chunks, 1);
+        assert_eq!(diag.remote_batch_bytes_max, initial_payload.len());
+        assert_eq!(diag.remote_batch_limit_bytes_min, initial_payload.len());
+        assert_eq!(diag.remote_batch_limited, 1);
+
+        for _ in 0..1019 {
+            match back_rx
+                .recv()
+                .await
+                .expect("prefilled hint should remain ahead of data")
+            {
+                (_, RelayEvent::AckDrainHint { .. }) => {}
+                other => panic!("expected prefilled ack hint, got {other:?}"),
+            }
+        }
+        match back_rx
+            .recv()
+            .await
+            .expect("initial payload should use one remaining slot")
+        {
+            (h, RelayEvent::Data { epoch, bytes }) => {
+                assert_eq!(h, handle);
+                assert_eq!(epoch, 81);
+                assert_eq!(bytes, initial_payload);
+            }
+            other => panic!("expected initial data batch, got {other:?}"),
         }
     }
 
