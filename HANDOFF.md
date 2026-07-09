@@ -89,6 +89,16 @@
   `1a3c5cb` once, then parent `4caf60a` in the same suite shape if the repeat
   stays low. Current result doc:
   `docs/tech/2026-07-09-knife14gu-rx-edge-g8-results.md`.
+- **2026-07-09 Knife14gv A/B completed; G7 is not yet reproducible**：
+  no code changed. `1a3c5cb` repeat reached `41.4/39.9 Mbit/s`, above `30M`
+  but still below `100M`; the RX-edge limiter still did not activate
+  (`remote_batch_limited=0`) and the tail showed local downlink backpressure.
+  Parent `4caf60a` under the same suite shape did not reproduce G7; it
+  collapsed to `0.349/0.151 Mbit/s` with
+  `tuic_stream_read_gap+tuic_stream_read_pending+relay_remote_read_gap+target_sender_stalled+tuic_stream_starved`.
+  The current active branch is TUIC ordered stream service stability, not
+  `global_rx` queue-edge cleanup. Result doc:
+  `docs/tech/2026-07-09-knife14gv-ab-repeat-results.md`.
 
 ## 目标（唯一北极星）：`Rules.md`
 

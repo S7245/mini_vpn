@@ -3112,3 +3112,20 @@ active root unless it repeats.
   then A/B the parent high-throughput commit under the same suite shape. Only
   code after the A/B says whether this was run variance, an indirect scheduling
   regression, or the broader TUIC stream-service/local-admission contract.
+
+## 2026-07-09 - G7 high-throughput parent did not reproduce in A/B
+
+- Stage: Knife14gv A/B repeat after G8.
+- Symptom: parent commit `4caf60a`, previously observed at `147/144 Mbit/s`,
+  reached only `0.349/0.151 Mbit/s` in the same safe1200 reverse-first P1
+  suite shape. The direct baselines were healthy, and local/TUN pressure
+  surfaces were clean.
+- Cause: not a proven external VPS bottleneck and not `global_rx` pressure.
+  The run was dominated by TUIC ordered stream starvation:
+  `max_remote_read_gap_ms=10457`,
+  `pending_cause=connection_stream_frames_pending`, and tunnel attribution
+  included `tuic_stream_starved`.
+- Correct behavior: do not use G7 as a stable parent baseline or design solely
+  around its tail counters. Require repeatability before cleanup work. The next
+  design must target TUIC ordered stream service stability and distinguish
+  fresh versus stale stream-frame pending evidence before another code change.

@@ -4326,3 +4326,24 @@ worth cleaning up separately.
   alone. After a high-throughput but dirty run, the next cleanup must be A/B
   verified before another code change; otherwise it can clean one tail surface
   while losing the stream-service cadence that produced throughput.
+
+## 2026-07-09 - Knife14gv A/B shows G7 is high evidence, not stable baseline
+
+- Result doc:
+  `docs/tech/2026-07-09-knife14gv-ab-repeat-results.md`
+- Candidate bundle:
+  `/tmp/mini_vpn_knife14gv_ab/mvpn_knife14gu_rxedge_repeat1_safe1200_p1_usclient_suite_20260709_093320.tar.gz`
+- Parent bundle:
+  `/tmp/mini_vpn_knife14gv_ab/mvpn_knife14gt_parent_ab_safe1200_p1_usclient_suite_20260709_093511.tar.gz`
+- Outcome: no code changed. `1a3c5cb` repeated at `41.4/39.9 Mbit/s`, above
+  `30M` but below `100M`. Parent `4caf60a` did not reproduce G7 and collapsed
+  to `0.349/0.151 Mbit/s`.
+- Useful discriminator: `1a3c5cb` still did not activate the RX-edge limiter
+  (`remote_batch_limited=0`, data relay `global_rx_queue_used_max=161/1024`),
+  so the G8/GV variance is not explained by that limiter firing.
+- Parent failure shape: `remote_to_global_rx_bytes=667766`,
+  `max_remote_read_gap_ms=10457`, pending/read-gap attribution, clean TUN
+  drops, clean local pressure, and `global_rx_queue_used_max=1/1024`.
+- Reusable rule: a single high-throughput VPS run must be treated as capability
+  evidence, not a stable baseline. Before designing cleanup around a high run's
+  tail counters, first repeat the high code point in the same suite shape.

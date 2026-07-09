@@ -138,6 +138,17 @@ Latest discriminator:
   accepted_bytes=0`. Stop condition: no more code changes from this result
   alone; next step is A/B repeat of `1a3c5cb` vs parent `4caf60a` before
   choosing another implementation direction.
+- Knife14gv ran that A/B without code changes. `1a3c5cb` repeat improved to
+  `41.4/39.9 Mbit/s`, so it exceeded `30M` but still did not preserve
+  `100M+`; the RX-edge limiter still did not activate
+  (`remote_batch_limited=0`) and the run ended with local downlink
+  backpressure/pending (`pending_high=734035`, `may_recv_false=6519`).
+  Parent `4caf60a` did **not** reproduce the prior G7 high-throughput result;
+  it collapsed to `0.349/0.151 Mbit/s` with attribution
+  `tuic_stream_read_gap+tuic_stream_read_pending+relay_remote_read_gap+target_sender_stalled+tuic_stream_starved`.
+  This means G7 remains high-throughput evidence but not a stable baseline.
+  The active branch is now TUIC ordered stream service stability, not
+  `global_rx` queue-edge cleanup.
 
 Current result doc:
 
@@ -152,6 +163,8 @@ Current result doc:
   `docs/tech/2026-07-09-knife14gt-dispatch-window-g7-results.md`
 - G8 VPS result:
   `docs/tech/2026-07-09-knife14gu-rx-edge-g8-results.md`
+- G8/G7 A/B repeat:
+  `docs/tech/2026-07-09-knife14gv-ab-repeat-results.md`
 
 Current follow-up queue:
 
@@ -178,16 +191,20 @@ Current follow-up queue:
 7. Knife14gu proved that a `global_rx` critical-edge read guard alone is not
    enough to preserve the G7 cadence. Do not keep editing queue-edge guards
    without an A/B repeat.
-8. The next non-code step is A/B verification: repeat `1a3c5cb` once, then
-   rerun parent `4caf60a` under the same clean safe1200 reverse-first P1 suite
-   if the repeat stays low. Only then choose whether the next code target is an
-   indirect scheduling regression or the broader TUIC ordered stream
-   service/local admission contract.
-9. The next focused VPS acceptance target remains a clean safe1200
+8. Knife14gv A/B is complete. Do not treat parent `4caf60a` as a stable
+   `100M+` baseline until it repeats; in the latest same-window run it produced
+   only `0.151 Mbit/s` receiver.
+9. The next implementation target must be TUIC ordered stream service
+   stability: classify fresh/stale `connection_stream_frames_pending`, explain
+   multi-second pending/read gaps while connection UDP/frame counters move, and
+   bind useful remote reads plus local admission in one measured service
+   contract.
+10. The next focused VPS acceptance target remains a clean safe1200
    reverse-first P1 with receiver `>100 Mbit/s`, `tx_dropped_delta=0`,
    `terminal_pending_reap_bytes=0`, and no data-relay
-   `terminal_closed_no_send`. Only after that should longer duration, P2/P4, or
-   concurrency stability work resume.
+   `terminal_closed_no_send`, but any `100M+` claim must now repeat at least
+   twice before being promoted to a stable baseline. Only after that should
+   longer duration, P2/P4, or concurrency stability work resume.
 
 ## Roadmap: TUN transparent proxy (Target extraction)
 
