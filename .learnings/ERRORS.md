@@ -3129,3 +3129,18 @@ active root unless it repeats.
   around its tail counters. Require repeatability before cleanup work. The next
   design must target TUIC ordered stream service stability and distinguish
   fresh versus stale stream-frame pending evidence before another code change.
+
+## 2026-07-09 - Suite attribution parser missed Knife14gw fresh/stale pending causes
+
+- Stage: Knife14gw stream-service diagnostics.
+- Symptom: raw `tuic-tcp-stream-pending` lines correctly logged
+  `connection_fresh_stream_frames_pending` and
+  `connection_stale_stream_frames_pending`, but the suite attribution summary
+  still reported only the legacy `connection_stream_frames_pending` field and
+  showed it as `0`.
+- Cause: code-side pending cause names changed, but the suite attribution
+  parser has not yet been taught the new fresh/stale names.
+- Correct behavior: until the parser is updated, do not trust the summary line
+  `tuic_stream_pending_causes` for Knife14gw+ freshness counts. Inspect raw
+  `tuic-tcp-stream-pending` lines, or update the parser and self-test before
+  using the summary for decisions.

@@ -4364,3 +4364,29 @@ worth cleaning up separately.
 - Reusable rule: a single high-throughput VPS run must be treated as capability
   evidence, not a stable baseline. Before designing cleanup around a high run's
   tail counters, first repeat the high code point in the same suite shape.
+
+## 2026-07-09 - Knife14gw diagnostics slice did not lift throughput
+
+- Result doc:
+  `docs/tech/2026-07-09-knife14gw-stream-service-diagnostics-results.md`
+- Code commit:
+  `946e2a8` (`feat(knife14): add stream service diagnostics`)
+- VPS bundle:
+  `/tmp/mini_vpn_knife14gw_stream_service_946e2a8/mvpn_knife14gw_stream_service_946e2a8_usclient_suite_20260709_102512.tar.gz`
+- Outcome: local tests, remote focused gates, release build, suite self-test,
+  and the focused safe1200 reverse-first P1 ran. The P1 result was
+  `17.7/17.1 Mbit/s`, below `30M` and far below `100M+`.
+- Useful progress: raw logs now distinguish TUIC pending freshness
+  (`connection_fresh_stream_frames_pending` vs
+  `connection_stale_stream_frames_pending`) and emit
+  `tcp-stream-service-window` records combining remote read service,
+  global-rx wait/occupancy, and local-admission progress.
+- Root shape: direct baselines were healthy, `.33` socket buffers remained
+  high, TUN drops were `0`, QUIC loss/congestion/blocking deltas were `0`,
+  `global_rx_queue_used_max=126/1024`, and local send capacity stayed clean.
+  Throughput still had multi-second ordered stream gaps
+  (`data_max_read_gap_ms=3464`) with bursty iperf intervals.
+- Reusable rule: diagnostics/framework slices are not throughput fixes unless
+  the VPS gate shows stable cadence. The next code slice should target ordered
+  TUIC stream service cadence directly, not more VPS/MTU/stale-pool/global-rx
+  tuning.
