@@ -101,6 +101,7 @@ const _: () = assert!(LOCAL_EGRESS_SERVICE_TUN_RX_PACKETS_PER_CYCLE > 0);
 /// smoltcp/send_queue injection.
 const RELAY_REMOTE_DISPATCH_SEGMENT_MAX_BYTES: usize = LOCAL_EGRESS_SERVICE_TARGET_BYTES_PER_WINDOW;
 const _: () = assert!(RELAY_REMOTE_DISPATCH_SEGMENT_MAX_BYTES < DEFAULT_DOWNLINK_FLUSH_MAX_BYTES);
+const _: () = assert!(RELAY_REMOTE_DISPATCH_SEGMENT_MAX_BYTES <= RELAY_REMOTE_READ_BURST_MAX_BYTES);
 const DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES: usize = MAX_TCP_SOCKET_BUFFER_BYTES;
 const MAX_DOWNLINK_EGRESS_IMMEDIATE_BYTES: usize = MAX_TCP_SOCKET_BUFFER_BYTES;
 const _: () =
@@ -1164,8 +1165,9 @@ fn should_poll_relay_ack_drain_hint(diag: &RelayTaskDiag, _writer_done: bool) ->
 }
 
 fn should_poll_relay_remote_read_probe(diag: &RelayTaskDiag, read_credit: RelayReadCredit) -> bool {
-    !read_credit.paused
-        && read_credit.max_batch_bytes > 0
+    let stream_poll_credit = relay_stream_poll_credit_for_local_admission(read_credit);
+    !stream_poll_credit.paused
+        && stream_poll_credit.max_batch_bytes > 0
         && diag.remote_reads > 0
         && diag.remote_to_global_rx_bytes > 0
         && diag.remote_batch_bytes_max >= RELAY_REMOTE_READ_PROBE_MIN_BATCH_BYTES
@@ -1543,6 +1545,23 @@ impl Default for RelayReadCredit {
 impl RelayReadCredit {
     fn initial() -> Self {
         Self::default()
+    }
+}
+
+fn relay_stream_poll_credit_for_local_admission(read_credit: RelayReadCredit) -> RelayReadCredit {
+    if read_credit.paused || read_credit.max_batch_bytes == 0 {
+        return RelayReadCredit {
+            paused: true,
+            max_batch_bytes: 0,
+        };
+    }
+
+    RelayReadCredit {
+        paused: false,
+        max_batch_bytes: read_credit.max_batch_bytes.clamp(
+            RELAY_REMOTE_DISPATCH_SEGMENT_MAX_BYTES,
+            RELAY_REMOTE_READ_BURST_MAX_BYTES,
+        ),
     }
 }
 
@@ -9273,7 +9292,8 @@ async fn run_relay_reader(
     loop {
         note_reader_local_finish_if_needed(&local_finish_seen, &mut diag);
         drain_relay_read_credit_updates(&mut read_credit_rx, &mut read_credit, &mut diag);
-        let remote_read_len = diag.next_remote_read_len(read_credit, buf.len());
+        let stream_poll_credit = relay_stream_poll_credit_for_local_admission(read_credit);
+        let remote_read_len = diag.next_remote_read_len(stream_poll_credit, buf.len());
         if remote_read_len == 0 {
             let credit_update = tokio::select! {
                 _ = &mut stop_rx => return,
@@ -9317,7 +9337,7 @@ async fn run_relay_reader(
                     &mut buf,
                     &back_tx,
                     &mut diag,
-                    read_credit,
+                    stream_poll_credit,
                     global_rx_pressure_threshold,
                 )
                 .await
@@ -9368,7 +9388,8 @@ async fn run_relay_thin_reader(
     loop {
         note_reader_local_finish_if_needed(&local_finish_seen, &mut diag);
         drain_relay_read_credit_updates(&mut read_credit_rx, &mut read_credit, &mut diag);
-        let remote_read_len = diag.next_remote_read_len(read_credit, buf.len());
+        let stream_poll_credit = relay_stream_poll_credit_for_local_admission(read_credit);
+        let remote_read_len = diag.next_remote_read_len(stream_poll_credit, buf.len());
         if remote_read_len == 0 {
             let credit_update = tokio::select! {
                 _ = &mut stop_rx => return,
@@ -9412,7 +9433,7 @@ async fn run_relay_thin_reader(
                     &mut buf,
                     &thin_tx,
                     &mut diag,
-                    read_credit,
+                    stream_poll_credit,
                 )
                 .await
                 {
@@ -12312,8 +12333,10 @@ mod tests {
     async fn thin_relay_reader_stages_payloads_without_global_rx_admission() {
         let mut sockets = SocketSet::new(vec![]);
         let handle = mk_test_handle(&mut sockets);
-        let chunks: std::collections::VecDeque<_> = std::iter::repeat_with(|| vec![7; 16 * 1024])
-            .take(THIN_TCP_RELAY_STAGING_CAPACITY + 2)
+        let chunk_len = 16 * 1024;
+        let chunks_per_dispatch = RELAY_REMOTE_DISPATCH_SEGMENT_MAX_BYTES / chunk_len;
+        let chunks: std::collections::VecDeque<_> = std::iter::repeat_with(|| vec![7; chunk_len])
+            .take(THIN_TCP_RELAY_STAGING_CAPACITY * chunks_per_dispatch + chunks_per_dispatch)
             .collect();
         let stream: RelayStream = Box::new(BurstReadableStream {
             shutdown_called: Arc::new(AtomicBool::new(false)),
@@ -12565,14 +12588,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_pressure_credit_caps_first_awaited_remote_read() {
+    async fn local_pressure_credit_does_not_cap_ordered_stream_poll_below_dispatch_window() {
         let mut sockets = SocketSet::new(vec![]);
         let handle = mk_test_handle(&mut sockets);
         let pressure_floor = relay_remote_read_pressure_floor_bytes(1200);
         let shutdown_called = Arc::new(AtomicBool::new(false));
         let stream: RelayStream = Box::new(BurstReadableStream {
             shutdown_called: shutdown_called.clone(),
-            chunks: std::collections::VecDeque::from([vec![9; pressure_floor + 777]]),
+            chunks: std::iter::repeat_with(|| vec![9; 16 * 1024])
+                .take(16)
+                .collect(),
             eof_after_chunks: true,
         });
         let (_tx, rx) = mpsc::channel::<RelayCommand>(8);
@@ -12585,7 +12610,7 @@ mod tests {
 
         match tokio::time::timeout(std::time::Duration::from_millis(200), back_rx.recv())
             .await
-            .expect("pressure-limited first remote read should arrive")
+            .expect("stream-poll-service first remote read should arrive")
             .expect("relay should still be alive")
         {
             (
@@ -12600,8 +12625,8 @@ mod tests {
                 assert_eq!(epoch, 82);
                 assert_eq!(
                     bytes.len(),
-                    pressure_floor,
-                    "pressure credit must cap the first awaited remote read before ready-drain batching"
+                    RELAY_REMOTE_DISPATCH_SEGMENT_MAX_BYTES,
+                    "local pressure credit should not cap ordered stream polling below one dispatch/egress window"
                 );
             }
             other => panic!("expected pressure-limited data batch, got {other:?}"),
