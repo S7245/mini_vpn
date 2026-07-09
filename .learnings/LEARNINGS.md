@@ -4390,3 +4390,32 @@ worth cleaning up separately.
   the VPS gate shows stable cadence. The next code slice should target ordered
   TUIC stream service cadence directly, not more VPS/MTU/stale-pool/global-rx
   tuning.
+
+## 2026-07-09 - Knife14gx thin relay staging did not pass the first threshold
+
+- Result doc:
+  `docs/tech/2026-07-09-knife14gx-thin-relay-staging-results.md`
+- Code commits:
+  `f0944e8` (`test(knife14): parse fresh stale TUIC pending causes`) and
+  `1bda549` (`feat(knife14): add thin TCP relay staging gate`)
+- VPS bundle:
+  `/tmp/mini_vpn_knife14_thin_gate/mvpn_knife14thin_g1_usclient_suite_20260709_112459.tar.gz`
+- Outcome: the feature flag was active (`MINI_VPN_THIN_TCP_RELAY=1`,
+  `tcp-relay-engine ... engine=thin_staging`), but the focused reverse-first
+  P1 reached only `17.6/15.2 Mbit/s`, below the `30 Mbit/s` first threshold.
+- Useful discriminator: direct baselines were healthy, TUN drops were `0`,
+  QUIC loss/congestion/blocking deltas were `0`, and `global_rx_pressure=0`.
+  The parser now reports fresh/stale pending causes correctly:
+  `connection_fresh_stream_frames_pending=7`,
+  `connection_stale_stream_frames_pending=10`,
+  `connection_rx_no_stream_frames=3`.
+- Root shape: thin staging removed one possible `global_rx.reserve()` coupling,
+  but ordered TUIC stream reads still had multi-second gaps
+  (`data_read_gap_max_ms=4038`, `data_pending_gap_max_ms=4006`) while local
+  pressure/headroom guards constrained egress (`may_recv_false=4649`,
+  `headroom_limited=4609`, attribution `local_pressure_credit`).
+- Reusable rule: a per-flow staging/dispatcher split is not sufficient by
+  itself. The next design must target the ordered TUIC stream polling and local
+  pressure-credit/headroom feedback contract directly, and must have a
+  code-level gate for sustained remote-read cadence plus local admission
+  progress before another VPS acceptance claim.

@@ -3144,3 +3144,21 @@ active root unless it repeats.
   `tuic_stream_pending_causes` for Knife14gw+ freshness counts. Inspect raw
   `tuic-tcp-stream-pending` lines, or update the parser and self-test before
   using the summary for decisions.
+
+## 2026-07-09 - Thin relay staging alone did not restore throughput cadence
+
+- Stage: Knife14gx thin TCP relay staging first threshold.
+- Symptom: commit `1bda549` enabled `MINI_VPN_THIN_TCP_RELAY=1` and passed
+  local gates, but focused reverse-first P1 reached only `17.6/15.2 Mbit/s`,
+  below the `30 Mbit/s` threshold.
+- Cause: the design removed relay-reader waiting on `global_rx.reserve()` but
+  did not address the remaining ordered TUIC stream-service/local-admission
+  coupling. The run had `global_rx_pressure=0`, TUN drops `0`, and clean QUIC
+  loss/blocking, yet still showed `data_read_gap_max_ms=4038`,
+  `data_pending_gap_max_ms=4006`, fresh/stale pending causes, and attribution
+  `local_pressure_credit`.
+- Correct behavior: do not spend another VPS run on relay staging, global_rx
+  admission, or dispatcher shape alone. Require a design and TDD gate that
+  proves sustained TUIC ordered-stream polling and local admission progress
+  remain coupled under local pressure before claiming a path to `>30M` or
+  `100+M`.
