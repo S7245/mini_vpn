@@ -1480,6 +1480,10 @@ summarize_metrics_window() {
       }
       if (pending_cause == "connection_stream_frames_pending") {
         tuic_pending_cause_connection_stream_frames_pending++
+      } else if (pending_cause == "connection_fresh_stream_frames_pending") {
+        tuic_pending_cause_connection_fresh_stream_frames_pending++
+      } else if (pending_cause == "connection_stale_stream_frames_pending") {
+        tuic_pending_cause_connection_stale_stream_frames_pending++
       } else if (pending_cause == "connection_rx_no_stream_frames") {
         tuic_pending_cause_connection_rx_no_stream_frames++
       } else if (pending_cause == "no_connection_rx") {
@@ -2019,7 +2023,7 @@ summarize_metrics_window() {
       printf "- relay_gap_hints: events=%d max_gap_ms=%d max_budget=%d cadence_events=%d max_cadence_floor=%d\n", relay_gap_hint_events, max_relay_gap_hint_gap_ms, max_relay_gap_hint_budget, relay_gap_hint_cadence_events, max_relay_gap_hint_cadence_floor
       printf "- tuic_tcp_stream: first_rx_events=%d first_rx_max_ms=%d read_gap_events=%d read_gap_max_ms=%d close_events=%d close_first_rx_max_ms=%d close_gap_max_ms=%d rx_bytes_max=%d reads_max=%d zero_rx_closes=%d data_streams=%d data_first_rx_max_ms=%d data_read_gap_max_ms=%d data_close_gap_max_ms=%d data_rx_bytes_max=%d data_rx_min_bytes=%d\n", tuic_first_rx_events, max_tuic_first_rx_ms, tuic_read_gap_events, max_tuic_read_gap_ms, tuic_stream_close_events, max_tuic_close_first_rx_ms, max_tuic_close_gap_ms, max_tuic_close_rx_bytes, max_tuic_close_reads, tuic_zero_rx_closes, tuic_data_streams, max_tuic_data_first_rx_ms, max_tuic_data_read_gap_ms, max_tuic_data_close_gap_ms, max_tuic_data_rx_bytes, data_stream_min_rx_bytes
       printf "- tuic_stream_pending: events=%d max_pending_gap_ms=%d pending_polls_max=%d data_streams=%d data_pending_gap_max_ms=%d data_rx_bytes_max=%d data_rx_min_bytes=%d\n", tuic_pending_events, max_tuic_pending_gap_ms, max_tuic_pending_polls, tuic_data_streams, max_tuic_data_pending_gap_ms, max_tuic_data_rx_bytes, data_stream_min_rx_bytes
-      printf "- tuic_stream_pending_causes: connection_stream_frames_pending=%d connection_rx_no_stream_frames=%d no_connection_rx=%d no_transport_sample=%d\n", tuic_pending_cause_connection_stream_frames_pending, tuic_pending_cause_connection_rx_no_stream_frames, tuic_pending_cause_no_connection_rx, tuic_pending_cause_no_transport_sample
+      printf "- tuic_stream_pending_causes: connection_stream_frames_pending=%d connection_fresh_stream_frames_pending=%d connection_stale_stream_frames_pending=%d connection_rx_no_stream_frames=%d no_connection_rx=%d no_transport_sample=%d\n", tuic_pending_cause_connection_stream_frames_pending, tuic_pending_cause_connection_fresh_stream_frames_pending, tuic_pending_cause_connection_stale_stream_frames_pending, tuic_pending_cause_connection_rx_no_stream_frames, tuic_pending_cause_no_connection_rx, tuic_pending_cause_no_transport_sample
       printf "- tuic_stream_polling: polls_max=%d max_poll_gap_ms=%d data_streams=%d data_polls_max=%d data_poll_gap_max_ms=%d data_rx_bytes_max=%d data_rx_min_bytes=%d\n", max_tuic_polls, max_tuic_poll_gap_ms, tuic_data_streams, max_tuic_data_polls, max_tuic_data_poll_gap_ms, max_tuic_data_rx_bytes, data_stream_min_rx_bytes
       printf "- tun_drops: if=%s tun_rx_dropped_delta=%s tun_tx_dropped_delta=%s\n", tun_if, tun_rx_delta, tun_tx_delta
       printf "- runtime_tun_egress: samples=%d drop_events=%d drop_delta_total=%d max_delta=%d unavailable=%d resets=%d\n", runtime_tun_samples, runtime_tun_drop_events, runtime_tun_drop_delta_total, max_runtime_tun_delta, runtime_tun_unavailable, runtime_tun_resets
@@ -2123,7 +2127,7 @@ EOF_LOG
   assert_contains "$summary" "relay_gap_hints: events=1 max_gap_ms=7002 max_budget=240 cadence_events=1 max_cadence_floor=15340"
   assert_contains "$summary" "tuic_tcp_stream: first_rx_events=0 first_rx_max_ms=0 read_gap_events=0 read_gap_max_ms=0 close_events=0 close_first_rx_max_ms=0 close_gap_max_ms=0 rx_bytes_max=0 reads_max=0 zero_rx_closes=0"
   assert_contains "$summary" "tuic_stream_pending: events=0 max_pending_gap_ms=0 pending_polls_max=0 data_streams=0 data_pending_gap_max_ms=0 data_rx_bytes_max=0"
-  assert_contains "$summary" "tuic_stream_pending_causes: connection_stream_frames_pending=0 connection_rx_no_stream_frames=0 no_connection_rx=0 no_transport_sample=0"
+  assert_contains "$summary" "tuic_stream_pending_causes: connection_stream_frames_pending=0 connection_fresh_stream_frames_pending=0 connection_stale_stream_frames_pending=0 connection_rx_no_stream_frames=0 no_connection_rx=0 no_transport_sample=0"
   assert_contains "$summary" "tuic_stream_polling: polls_max=0 max_poll_gap_ms=0 data_streams=0 data_polls_max=0 data_poll_gap_max_ms=0 data_rx_bytes_max=0"
   assert_contains "$summary" "runtime_tun_egress: samples=1 drop_events=1 drop_delta_total=1423 max_delta=1423 unavailable=0 resets=0"
   assert_contains "$summary" "tun_rx_drain: attempts=4 packets=11 tcp=9 dns=1 udp=1 budget_exhausted=1 would_block=3 errors=0"
@@ -2337,6 +2341,8 @@ EOF_IPERF
 🔎 tuic-tcp-stream-first-rx target=43.130.32.77:5201 conn=3 id=99 stream=8 first_rx_ms=20500 read_bytes=35244 reads=1
 🔎 tcp-relay-live handle=SocketHandle(1) epoch=1 writer_done=false read_only_after_local_finish=false uplink_bytes=37 uplink_writes=1 remote_to_global_rx_bytes=75128 remote_reads=2 local_finish_events=1 first_local_finish_after_first_remote_read_ms=1100 remote_after_local_finish_bytes=0 remote_after_local_finish_reads=0 first_remote_read_ms=20500 max_remote_read_gap_ms=15000 max_remote_read_gap_before_local_finish_ms=7000 max_remote_read_gap_after_local_finish_ms=15000 current_remote_read_gap_ms=100 global_rx_wait_max_us=4 global_rx_pressure_events=0 global_rx_queue_used_max=1 global_rx_queue_capacity=1024 local_write_wait_max_us=0 local_write_pressure_events=0
 🔎 tuic-tcp-stream-read-gap target=43.130.32.77:5201 conn=3 id=99 stream=8 gap_ms=15000 read_bytes=39884 reads=2 rx_bytes=75128
+🔎 tuic-tcp-stream-pending target=43.130.32.77:5201 conn=3 id=99 stream=8 pending_gap_ms=1000 pending_polls=10 polls=40 max_poll_gap_ms=500 rx_bytes=75128 reads=2 pending_cause=connection_fresh_stream_frames_pending
+🔎 tuic-tcp-stream-pending target=43.130.32.77:5201 conn=3 id=99 stream=8 pending_gap_ms=2000 pending_polls=20 polls=80 max_poll_gap_ms=1000 rx_bytes=75128 reads=2 pending_cause=connection_stale_stream_frames_pending
 🔎 tuic-tcp-stream-pending target=43.130.32.77:5201 conn=3 id=99 stream=8 pending_gap_ms=12000 pending_polls=97 polls=112 max_poll_gap_ms=5000 rx_bytes=75128 reads=2 pending_cause=connection_stream_frames_pending
 🔎 tuic-tcp-stream-close target=43.130.32.77:5201 conn=3 id=99 stream=8 first_rx_ms=20500 max_read_gap_ms=15000 rx_bytes=109304 reads=3 pending_polls=97 max_pending_gap_ms=12000 polls=126 max_poll_gap_ms=5000
 📊 TUIC QUIC stats conn=3 id=99 rtt=5ms cwnd=247289 lost=0/105 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=103/14703B udp_rx=535/734789B dg_max=Some(1418) dg_space=1048576B
@@ -2345,8 +2351,8 @@ EOF_LOG
   assert_contains "$summary" "relay_remote_timing: first_read_max_ms=20500 max_read_gap_ms=15000 current_gap_max_ms=12000 no_first_read_gap_max_ms=12000"
   assert_contains "$summary" "max_read_gap_before_finish_ms=7000 max_read_gap_after_finish_ms=15000 data_max_read_gap_before_finish_ms=7000 data_max_read_gap_after_finish_ms=15000 first_local_finish_after_first_remote_read_max_ms=1100"
   assert_contains "$summary" "tuic_tcp_stream: first_rx_events=1 first_rx_max_ms=20500 read_gap_events=1 read_gap_max_ms=15000 close_events=1 close_first_rx_max_ms=20500 close_gap_max_ms=15000 rx_bytes_max=109304 reads_max=3 zero_rx_closes=0"
-  assert_contains "$summary" "tuic_stream_pending: events=1 max_pending_gap_ms=12000 pending_polls_max=97 data_streams=1 data_pending_gap_max_ms=12000 data_rx_bytes_max=109304"
-  assert_contains "$summary" "tuic_stream_pending_causes: connection_stream_frames_pending=1 connection_rx_no_stream_frames=0 no_connection_rx=0 no_transport_sample=0"
+  assert_contains "$summary" "tuic_stream_pending: events=3 max_pending_gap_ms=12000 pending_polls_max=97 data_streams=1 data_pending_gap_max_ms=12000 data_rx_bytes_max=109304"
+  assert_contains "$summary" "tuic_stream_pending_causes: connection_stream_frames_pending=1 connection_fresh_stream_frames_pending=1 connection_stale_stream_frames_pending=1 connection_rx_no_stream_frames=0 no_connection_rx=0 no_transport_sample=0"
   assert_contains "$summary" "tuic_stream_polling: polls_max=126 max_poll_gap_ms=5000 data_streams=1 data_polls_max=126 data_poll_gap_max_ms=5000 data_rx_bytes_max=109304"
   assert_contains "$summary" "attribution: tuic_stream_first_byte_slow+tuic_stream_read_gap+tuic_stream_read_pending+relay_remote_first_byte_slow+relay_remote_read_gap"
   assert_not_contains "$summary" "reverse_sender_backpressured"
