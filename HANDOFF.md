@@ -64,6 +64,17 @@
   clean, and attribution stayed `local_downlink_backpressure`. Stop condition
   honored: no B8/B9 was started. Current result doc:
   `docs/tech/2026-07-08-knife14gq-buffered-downlink-results.md`.
+- **2026-07-09 Knife14gt G7 passed `30M` and reached `100M+`
+  （分支 `codex/knife14d-downlink-reap-open`，commit `4caf60a`）**：
+  relay dispatch was aligned with one local egress service window
+  (`64KiB -> 128KiB`). The focused safe1200 reverse-first P1 on `.27/.33/.77`
+  reached `147/144 Mbit/s`, proving the current branch can move data in the
+  `100+ Mbit/s` band. This is not final clean acceptance: the tail logged
+  `tx_dropped_delta=783`, `global_rx_queue_used_max=1019/1024`, and
+  `terminal_pending_reap_bytes=2653878`
+  (`close_pending_class=terminal_closed_no_send`). Next work is to preserve
+  this dispatch/egress cadence and make the tail clean. Current result doc:
+  `docs/tech/2026-07-09-knife14gt-dispatch-window-g7-results.md`.
 
 ## 目标（唯一北极星）：`Rules.md`
 

@@ -4276,3 +4276,30 @@ worth cleaning up separately.
   slice must couple remote read service and main-loop local injection/egress in
   one measured contract; do not continue with local-only flush, qlen, MTU,
   VPS, stale-pool, broad-window, or self-wake-only changes.
+
+## 2026-07-09 - Knife14gt G7 passed 30M and 100M after dispatch-window alignment
+
+- Result doc:
+  `docs/tech/2026-07-09-knife14gt-dispatch-window-g7-results.md`
+- Code commit:
+  `4caf60a` (`fix(knife14gt): align relay dispatch with egress window`)
+- VPS bundle:
+  `/tmp/mini_vpn_knife14gt_g7/mvpn_knife14gt_dispatch128_safe1200_p1_usclient_suite_20260709_085329.tar.gz`
+- Outcome: the focused safe1200 reverse-first P1 reached `147/144 Mbit/s`,
+  clearly passing the previous `>30 Mbit/s` discriminator and entering the
+  `100+ Mbit/s` band on the current `.27/.33/.77` topology.
+- Useful progress: raising the relay dispatch segment from `64KiB` to one
+  local egress service window (`128KiB`) produced
+  `remote_batch_bytes_max=131072` and restored stable ordered-stream cadence
+  during the main run (`max_remote_read_gap_ms` around `190-203ms` before the
+  tail). The main downlink path accepted `539681529` bytes with
+  `send_slice_zero=0` and `send_slice_errors=0`.
+- Remaining risk: this is not clean final acceptance. The tail had
+  `tx_dropped_delta=783`, `global_rx_queue_used_max=1019/1024`, and
+  `terminal_pending_reap_bytes=2653878` with
+  `close_pending_class=terminal_closed_no_send`.
+- Reusable rule: after a high-throughput run, do not stop at iperf Mbps. Parse
+  TUN drop feedback, global RX queue edge, and terminal pending. The next slice
+  should preserve the new dispatch/egress cadence while making the close-tail
+  clean, not return to VPS, MTU, stale pool, broad QUIC windows, or unordered
+  reassembly.

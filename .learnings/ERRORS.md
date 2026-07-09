@@ -3079,3 +3079,18 @@ active root unless it repeats.
   `>30 Mbit/s` or `100+ Mbit/s`. A performance gate must require remote-read
   bytes and local accepted bytes to make progress in the same measured active
   window before another VPS acceptance claim.
+
+## 2026-07-09 - High Mbps is not clean acceptance when tail drops or terminal pending remain
+
+- Stage: Knife14gt G7 VPS acceptance.
+- Symptom: commit `4caf60a` reached `147/144 Mbit/s` on focused safe1200
+  reverse-first P1, but the tail still logged `tx_dropped_delta=783`,
+  `global_rx_queue_used_max=1019/1024`, and
+  `terminal_pending_reap_bytes=2653878`.
+- Cause: the dispatch-window alignment restored high data movement, but the
+  local egress/feedback path still allowed a late queue edge and terminal
+  close with unsent pending data.
+- Correct behavior: do not call a `100+ Mbit/s` run final unless throughput and
+  close-tail are both clean. The next acceptance must preserve `>100 Mbit/s`
+  while proving `tx_dropped_delta=0`, `terminal_pending_reap_bytes=0`, and no
+  data-relay `terminal_closed_no_send`.

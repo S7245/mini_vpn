@@ -1,6 +1,6 @@
 # TODO
 
-## Current Knife14 Status (2026-07-08)
+## Current Knife14 Status (2026-07-09)
 
 Knife14fp found a mandatory high-throughput prerequisite: the exit VPS `.33`
 had Linux socket buffer caps/defaults of only `212992B`, which capped both
@@ -115,6 +115,17 @@ Latest discriminator:
   repeated `connection_stream_frames_pending`). The next slice must join TUIC
   stream read service and main-loop local injection/egress under one measured
   service contract before another VPS claim.
+- Knife14gt G7 ran commit `4caf60a` on `.27` from a clean `/tmp` workdir after
+  aligning relay dispatch with one local egress service window
+  (`64KiB -> 128KiB`). The focused safe1200 reverse-first P1 reached
+  `147/144 Mbit/s`, so the current branch has now passed the `>30 Mbit/s`
+  discriminator and demonstrated `100+ Mbit/s` data movement on this topology.
+  This is **not** final clean acceptance: the tail logged
+  `tx_dropped_delta=783`, `global_rx_queue_used_max=1019/1024`, and
+  `terminal_pending_reap_bytes=2653878`
+  (`close_pending_class=terminal_closed_no_send`). Next work must preserve this
+  dispatch/egress cadence while cleaning tail drop/pending, not return to VPS,
+  MTU/PLPMTUD, stale pool, broad QUIC windows, or unordered reassembly.
 
 Current result doc:
 
@@ -125,6 +136,8 @@ Current result doc:
   `docs/tech/2026-07-09-knife14gs-local-egress-service-g5-results.md`
 - G6 VPS result:
   `docs/tech/2026-07-09-knife14gs-g6-local-egress-vps-results.md`
+- G7 VPS result:
+  `docs/tech/2026-07-09-knife14gt-dispatch-window-g7-results.md`
 
 Current follow-up queue:
 
@@ -146,14 +159,16 @@ Current follow-up queue:
 5. Do not repeat G5-style local-only egress work as the next slice.
    Knife14gs G6 proved that `tcp-local-egress-service` can run heavily while
    `accepted_bytes=0`; this does not address TUIC ordered stream read cadence.
-6. The next focused implementation target is a TUIC-read plus main-loop
-   injection service contract. Tests must fail if remote-read gaps exceed the
-   service window while local surfaces are clean, and diagnostics must show
-   useful remote-read bytes and local accepted bytes in the same active window.
-7. The next focused VPS acceptance target is still first `>30 Mbit/s` on the
-   same safe1200 reverse-first P1, not yet `100+`. Do not claim the `100+`
-   path is clear until a later slice passes `>30` and then a clean `100+`
-   repeat exits normally.
+6. Knife14gt proved the first TUIC-read/main-loop cadence slice can exceed both
+   `30 Mbit/s` and `100 Mbit/s`; preserve that dispatch-window alignment.
+7. The next focused implementation target is close-tail cleanliness under the
+   same cadence: keep `>100 Mbit/s` while eliminating TUN drop feedback,
+   global RX queue edge saturation, and terminal pending reaps.
+8. The next focused VPS acceptance target is a clean safe1200 reverse-first P1
+   repeat with receiver `>100 Mbit/s`, `tx_dropped_delta=0`,
+   `terminal_pending_reap_bytes=0`, and no data-relay
+   `terminal_closed_no_send`. Only after that should longer duration, P2/P4, or
+   concurrency stability work resume.
 
 ## Roadmap: TUN transparent proxy (Target extraction)
 
