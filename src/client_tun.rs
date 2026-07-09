@@ -93,7 +93,7 @@ const _: () = assert!(LOCAL_EGRESS_SERVICE_TUN_RX_PACKETS_PER_CYCLE > 0);
 /// Knife14fa: drain QUIC streams with a healthy read window, but stage delivery
 /// into the main loop so one ready remote burst cannot become one oversized
 /// smoltcp/send_queue injection.
-const RELAY_REMOTE_DISPATCH_SEGMENT_MAX_BYTES: usize = RELAY_REMOTE_READ_MIN_BATCH_BYTES;
+const RELAY_REMOTE_DISPATCH_SEGMENT_MAX_BYTES: usize = LOCAL_EGRESS_SERVICE_TARGET_BYTES_PER_WINDOW;
 const _: () = assert!(RELAY_REMOTE_DISPATCH_SEGMENT_MAX_BYTES < DEFAULT_DOWNLINK_FLUSH_MAX_BYTES);
 const DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES: usize = MAX_TCP_SOCKET_BUFFER_BYTES;
 const MAX_DOWNLINK_EGRESS_IMMEDIATE_BYTES: usize = MAX_TCP_SOCKET_BUFFER_BYTES;
@@ -17659,6 +17659,15 @@ mod tests {
         assert_eq!(diag.remote_read_service_ticks, 3);
         assert_eq!(diag.remote_read_service_len_min, 8_192);
         assert_eq!(diag.remote_read_service_len_max, 131_072);
+    }
+
+    #[test]
+    fn relay_dispatch_segment_covers_one_local_egress_service_window() {
+        const _: () = assert!(
+            RELAY_REMOTE_DISPATCH_SEGMENT_MAX_BYTES >= LOCAL_EGRESS_SERVICE_TARGET_BYTES_PER_WINDOW
+        );
+        const _: () =
+            assert!(RELAY_REMOTE_DISPATCH_SEGMENT_MAX_BYTES <= DEFAULT_DOWNLINK_FLUSH_MAX_BYTES);
     }
 
     #[test]
