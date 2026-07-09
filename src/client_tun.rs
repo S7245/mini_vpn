@@ -6,6 +6,10 @@ use crate::loop_profiler::LoopProfiler;
 use crate::metrics::Metrics;
 use crate::reality_upstream::RealityUpstream;
 use crate::shared::{ClientError, TargetAddr};
+use crate::tcp_stream_service::{
+    StreamServiceBlockedReason, StreamServiceController, StreamServiceWindow,
+    format_stream_service_window_fields,
+};
 use crate::tuic::{
     AssocTable, FragReassembler, TuicClientConfig, TuicUpstream, decode_packet_meta, encode_packet,
 };
@@ -785,6 +789,8 @@ struct RelayTaskDiag {
     remote_to_global_rx_bytes: u64,
     /// Number of remote-to-main data batches sent after bounded ready-read coalescing.
     remote_batches: u64,
+    /// Combined stream-service state since this relay reader started.
+    stream_service: StreamServiceController,
     /// Largest remote-to-main batch in bytes.
     remote_batch_bytes_max: usize,
     /// Largest number of remote read chunks coalesced into one remote-to-main batch.
@@ -861,6 +867,7 @@ impl RelayTaskDiag {
             uplink_bytes: 0,
             remote_to_global_rx_bytes: 0,
             remote_batches: 0,
+            stream_service: StreamServiceController::new(),
             remote_batch_bytes_max: 0,
             remote_batch_chunks_max: 0,
             remote_batch_limit_bytes_min: 0,
@@ -922,6 +929,7 @@ impl RelayTaskDiag {
     }
 
     fn note_remote_read_at(&mut self, bytes: usize, now: std::time::Instant) {
+        self.stream_service.note_remote_read(bytes);
         self.remote_reads += 1;
         self.remote_to_global_rx_bytes += bytes as u64;
         if self.first_remote_read_millis.is_none() {
@@ -1006,6 +1014,8 @@ impl RelayTaskDiag {
         elapsed: std::time::Duration,
         pressure_threshold: std::time::Duration,
     ) {
+        self.stream_service
+            .note_global_rx_wait(elapsed, pressure_threshold);
         self.global_rx_wait_max_micros = self.global_rx_wait_max_micros.max(elapsed.as_micros());
         if elapsed >= pressure_threshold {
             self.global_rx_pressure_events += 1;
@@ -1013,6 +1023,7 @@ impl RelayTaskDiag {
     }
 
     fn note_global_rx_queue(&mut self, used: usize, max_capacity: usize) {
+        self.stream_service.note_global_rx_queue(used, max_capacity);
         self.global_rx_queue_used_max = self.global_rx_queue_used_max.max(used);
         self.global_rx_queue_capacity = self.global_rx_queue_capacity.max(max_capacity);
     }
@@ -1058,6 +1069,20 @@ impl RelayTaskDiag {
         self.remote_read_service_len_max = self.remote_read_service_len_max.max(read_len);
     }
 
+    fn next_remote_read_len(&mut self, read_credit: RelayReadCredit, buffer_len: usize) -> usize {
+        let read_len = self.stream_service.next_remote_read_len(
+            read_credit.paused,
+            read_credit.max_batch_bytes,
+            buffer_len,
+        );
+        self.note_remote_read_service_tick(read_len);
+        read_len
+    }
+
+    fn stream_service_window(&self) -> StreamServiceWindow {
+        self.stream_service.window()
+    }
+
     fn copy_reader_fields_from(&mut self, reader: &RelayTaskDiag) {
         self.first_remote_read_millis = reader.first_remote_read_millis;
         self.first_remote_read_at = reader.first_remote_read_at;
@@ -1065,6 +1090,7 @@ impl RelayTaskDiag {
         self.max_remote_read_gap_millis = reader.max_remote_read_gap_millis;
         self.remote_to_global_rx_bytes = reader.remote_to_global_rx_bytes;
         self.remote_batches = reader.remote_batches;
+        self.stream_service = reader.stream_service.clone();
         self.remote_batch_bytes_max = reader.remote_batch_bytes_max;
         self.remote_batch_chunks_max = reader.remote_batch_chunks_max;
         self.remote_batch_limit_bytes_min = reader.remote_batch_limit_bytes_min;
@@ -1485,6 +1511,7 @@ enum RelayEvent {
     Data {
         epoch: u64,
         bytes: Vec<u8>,
+        stream_service_window: StreamServiceWindow,
     },
     AckDrainHint {
         epoch: u64,
@@ -4474,6 +4501,35 @@ fn format_local_egress_service_diag(diag: &LocalEgressServiceDiag) -> String {
     )
 }
 
+fn stream_service_blocked_reason_for_local_egress(
+    reason: LocalEgressServiceStopReason,
+) -> StreamServiceBlockedReason {
+    match reason {
+        LocalEgressServiceStopReason::TargetReached => StreamServiceBlockedReason::None,
+        LocalEgressServiceStopReason::NoProgress => {
+            StreamServiceBlockedReason::LocalAdmissionNoProgress
+        }
+        LocalEgressServiceStopReason::CycleBudget => {
+            StreamServiceBlockedReason::LocalAdmissionCycleBudget
+        }
+        LocalEgressServiceStopReason::HardPause => {
+            StreamServiceBlockedReason::LocalAdmissionHardPause
+        }
+        LocalEgressServiceStopReason::NoWork => StreamServiceBlockedReason::LocalAdmissionNoWork,
+    }
+}
+
+fn format_stream_service_window_diag(
+    handle: SocketHandle,
+    epoch: u64,
+    window: &StreamServiceWindow,
+) -> String {
+    format!(
+        "🔎 tcp-stream-service-window handle={handle:?} epoch={epoch} {}",
+        format_stream_service_window_fields(window)
+    )
+}
+
 fn should_drain_tun_rx_after_remote_payload(
     ctx: Option<&SocketCtx>,
     accepted_bytes: usize,
@@ -5885,7 +5941,12 @@ pub async fn run_event_loop<D, U, M>(
             Some((handle, event)) = global_rx.recv(), if !global_rx_paused =>{
                 metrics.loop_park_end();
                 match event {
-                    RelayEvent::Data { epoch, bytes: payload } => {
+                    RelayEvent::Data {
+                        epoch,
+                        bytes: payload,
+                        stream_service_window,
+                    } => {
+                        let mut stream_service_window = stream_service_window;
                         trace_log!("📬 从大邮筒收到 {} 字节数据，准备送往房间 {:?}", payload.len(), handle);
                         let pre_payload_tun_rx_budget = if payload.is_empty() {
                             0
@@ -5979,6 +6040,18 @@ pub async fn run_event_loop<D, U, M>(
                                 0
                             }
                         };
+                        stream_service_window.note_local_admission(
+                            accepted_bytes,
+                            0,
+                            0,
+                            0,
+                            0,
+                            if accepted_bytes > 0 {
+                                StreamServiceBlockedReason::None
+                            } else {
+                                StreamServiceBlockedReason::LocalAdmissionNoWork
+                            },
+                        );
                         // #1：回程下行可能留在 app pending，也可能已进入 smoltcp tx queue。
                         // 两者都需要继续标脏，直到本地 TCP/TUN egress 压力退到 low watermark。
                         if socket_ctxs
@@ -6068,7 +6141,7 @@ pub async fn run_event_loop<D, U, M>(
                             } else {
                                 downlink_rx_paused || tun_egress_feedback.is_paused()
                             };
-                            service_local_egress_until(
+                            let local_progress = service_local_egress_until(
                                 &mut device,
                                 &mut assoc_table,
                                 &mut fake_pool,
@@ -6096,7 +6169,25 @@ pub async fn run_event_loop<D, U, M>(
                                 local_egress_service_config,
                             )
                             .await;
+                            stream_service_window.note_local_admission(
+                                local_progress.accepted_bytes,
+                                local_progress.tun_rx_packets,
+                                local_progress.flush_tx_calls,
+                                local_progress.flush_tx_failures,
+                                local_progress.dirty_passes,
+                                stream_service_blocked_reason_for_local_egress(
+                                    local_progress.stop_reason,
+                                ),
+                            );
                         }
+                        tcp_diag_log!(
+                            "{}",
+                            format_stream_service_window_diag(
+                                handle,
+                                epoch,
+                                &stream_service_window
+                            )
+                        );
                         if has_downlink_work && deferred_ack_drain.arm_after_remote_payload() {
                             deferred_ack_drain_sleep.as_mut().reset(
                                 tokio::time::Instant::now()
@@ -8717,18 +8808,22 @@ async fn send_remote_payload_batch_to_main(
     diag.note_remote_batch(batch_chunks, payload_len);
     note_global_rx_channel_occupancy(diag, back_tx);
     let wait_started = std::time::Instant::now();
-    let send_result = back_tx
-        .send((
-            handle,
-            RelayEvent::Data {
-                epoch,
-                bytes: payload,
-            },
-        ))
-        .await;
+    let permit_result = back_tx.reserve().await;
     let waited = wait_started.elapsed();
-    note_global_rx_channel_occupancy(diag, back_tx);
     diag.note_global_rx_wait(waited, global_rx_pressure_threshold);
+    let Ok(permit) = permit_result else {
+        return Err(("remote_to_local", "global_rx_closed"));
+    };
+    note_global_rx_channel_occupancy(diag, back_tx);
+    permit.send((
+        handle,
+        RelayEvent::Data {
+            epoch,
+            bytes: payload,
+            stream_service_window: diag.stream_service_window(),
+        },
+    ));
+    note_global_rx_channel_occupancy(diag, back_tx);
     if waited >= global_rx_pressure_threshold {
         tcp_diag_log!(
             "🔎 tcp-global-rx-pressure handle={:?} wait_us={} payload_bytes={} pressure_events={}",
@@ -8737,9 +8832,6 @@ async fn send_remote_payload_batch_to_main(
             payload_len,
             diag.global_rx_pressure_events
         );
-    }
-    if send_result.is_err() {
-        return Err(("remote_to_local", "global_rx_closed"));
     }
     Ok(())
 }
@@ -8796,13 +8888,6 @@ fn append_remote_read_to_batch(
     burst.chunks = burst.chunks.saturating_add(1);
     burst.bytes = burst.bytes.saturating_add(chunk.len());
     batch.extend_from_slice(chunk);
-}
-
-fn relay_remote_awaited_read_len(read_credit: RelayReadCredit, buffer_len: usize) -> usize {
-    if read_credit.paused {
-        return 0;
-    }
-    read_credit.max_batch_bytes.min(buffer_len)
 }
 
 fn note_reader_local_finish_if_needed(
@@ -8952,7 +9037,7 @@ async fn run_relay_reader(
     loop {
         note_reader_local_finish_if_needed(&local_finish_seen, &mut diag);
         drain_relay_read_credit_updates(&mut read_credit_rx, &mut read_credit, &mut diag);
-        let remote_read_len = relay_remote_awaited_read_len(read_credit, buf.len());
+        let remote_read_len = diag.next_remote_read_len(read_credit, buf.len());
         if remote_read_len == 0 {
             let credit_update = tokio::select! {
                 _ = &mut stop_rx => return,
@@ -8975,7 +9060,6 @@ async fn run_relay_reader(
             continue;
         }
 
-        diag.note_remote_read_service_tick(remote_read_len);
         let remote_msg = tokio::select! {
             _ = &mut stop_rx => return,
             remote_msg = remote_reader.read(&mut buf[..remote_read_len]) => remote_msg,
@@ -10104,6 +10188,7 @@ mod tests {
     #[test]
     fn relay_pressure_floor_tracks_tun_mtu_below_legacy_min_batch() {
         let pressure_floor = relay_remote_read_pressure_floor_bytes(1200);
+        let mut controller = StreamServiceController::new();
 
         assert_eq!(
             pressure_floor,
@@ -10111,24 +10196,12 @@ mod tests {
         );
         assert!(pressure_floor < RELAY_REMOTE_READ_MIN_BATCH_BYTES);
         assert_eq!(
-            relay_remote_awaited_read_len(
-                RelayReadCredit {
-                    paused: false,
-                    max_batch_bytes: pressure_floor,
-                },
-                65_536,
-            ),
+            controller.next_remote_read_len(false, pressure_floor, 65_536,),
             pressure_floor,
             "the first awaited remote read must obey pressure credit, not the old 64 KiB buffer size"
         );
         assert_eq!(
-            relay_remote_awaited_read_len(
-                RelayReadCredit {
-                    paused: true,
-                    max_batch_bytes: pressure_floor,
-                },
-                65_536,
-            ),
+            controller.next_remote_read_len(true, pressure_floor, 65_536,),
             0
         );
     }
@@ -11424,7 +11497,14 @@ mod tests {
         );
         assert_eq!(*writes.lock().unwrap(), vec![b"reverse-control".to_vec()]);
         match event {
-            (h, RelayEvent::Data { epoch, bytes }) => {
+            (
+                h,
+                RelayEvent::Data {
+                    epoch,
+                    bytes,
+                    stream_service_window: _,
+                },
+            ) => {
                 assert_eq!(h, handle);
                 assert_eq!(epoch, 43);
                 assert_eq!(bytes, b"remote-after-flush");
@@ -11485,10 +11565,22 @@ mod tests {
             .await
             .expect("burst payload should be queued")
         {
-            (h, RelayEvent::Data { epoch, bytes }) => {
+            (
+                h,
+                RelayEvent::Data {
+                    epoch,
+                    bytes,
+                    stream_service_window,
+                },
+            ) => {
                 assert_eq!(h, handle);
                 assert_eq!(epoch, 77);
                 assert_eq!(bytes, b"onetwothree");
+                assert_eq!(
+                    stream_service_window.remote_read_bytes,
+                    b"onetwothree".len() as u64
+                );
+                assert_eq!(stream_service_window.remote_read_chunks, 3);
             }
             other => panic!("expected coalesced burst data, got {other:?}"),
         }
@@ -11539,7 +11631,14 @@ mod tests {
                 .await
                 .expect("capped batch segment should be queued")
             {
-                (h, RelayEvent::Data { epoch, bytes }) => {
+                (
+                    h,
+                    RelayEvent::Data {
+                        epoch,
+                        bytes,
+                        stream_service_window: _,
+                    },
+                ) => {
                     assert_eq!(h, handle);
                     assert_eq!(epoch, 79);
                     assert!(
@@ -11579,7 +11678,14 @@ mod tests {
                 .await
                 .expect("second remainder segment should be queued")
             {
-                (h, RelayEvent::Data { epoch, bytes }) => {
+                (
+                    h,
+                    RelayEvent::Data {
+                        epoch,
+                        bytes,
+                        stream_service_window: _,
+                    },
+                ) => {
                     assert_eq!(h, handle);
                     assert_eq!(epoch, 79);
                     assert!(
@@ -11667,7 +11773,14 @@ mod tests {
             .await
             .expect("limited batch should use the last free slot")
         {
-            (h, RelayEvent::Data { epoch, bytes }) => {
+            (
+                h,
+                RelayEvent::Data {
+                    epoch,
+                    bytes,
+                    stream_service_window: _,
+                },
+            ) => {
                 assert_eq!(h, handle);
                 assert_eq!(epoch, 80);
                 assert_eq!(bytes.len(), RELAY_REMOTE_READ_MIN_BATCH_BYTES);
@@ -11746,7 +11859,14 @@ mod tests {
             .await
             .expect("initial payload should use one remaining slot")
         {
-            (h, RelayEvent::Data { epoch, bytes }) => {
+            (
+                h,
+                RelayEvent::Data {
+                    epoch,
+                    bytes,
+                    stream_service_window: _,
+                },
+            ) => {
                 assert_eq!(h, handle);
                 assert_eq!(epoch, 81);
                 assert_eq!(bytes, initial_payload);
@@ -11776,7 +11896,14 @@ mod tests {
             .await
             .expect("coalesced data should arrive first")
         {
-            (h, RelayEvent::Data { epoch, bytes }) => {
+            (
+                h,
+                RelayEvent::Data {
+                    epoch,
+                    bytes,
+                    stream_service_window: _,
+                },
+            ) => {
                 assert_eq!(h, handle);
                 assert_eq!(epoch, 78);
                 assert_eq!(bytes, b"onetwo");
@@ -11835,10 +11962,25 @@ mod tests {
             .expect("remote data should arrive after credit resumes")
             .expect("relay should still be alive")
         {
-            (h, RelayEvent::Data { epoch, bytes }) => {
+            (
+                h,
+                RelayEvent::Data {
+                    epoch,
+                    bytes,
+                    stream_service_window,
+                },
+            ) => {
                 assert_eq!(h, handle);
                 assert_eq!(epoch, 81);
                 assert_eq!(bytes, b"after-credit");
+                assert_eq!(
+                    stream_service_window.remote_read_bytes,
+                    b"after-credit".len() as u64
+                );
+                assert!(
+                    stream_service_window.remote_poll_ticks >= 1,
+                    "resumed credit should have driven at least one remote poll: {stream_service_window:?}"
+                );
             }
             other => panic!("expected data after read credit resumes, got {other:?}"),
         }
@@ -11912,7 +12054,14 @@ mod tests {
             .expect("remote stream wake should complete the pending read")
             .expect("relay should still be alive")
         {
-            (h, RelayEvent::Data { epoch, bytes }) => {
+            (
+                h,
+                RelayEvent::Data {
+                    epoch,
+                    bytes,
+                    stream_service_window: _,
+                },
+            ) => {
                 assert_eq!(h, handle);
                 assert_eq!(epoch, 83);
                 assert_eq!(bytes, b"after-egress-wake");
@@ -11950,7 +12099,14 @@ mod tests {
             .expect("pressure-limited first remote read should arrive")
             .expect("relay should still be alive")
         {
-            (h, RelayEvent::Data { epoch, bytes }) => {
+            (
+                h,
+                RelayEvent::Data {
+                    epoch,
+                    bytes,
+                    stream_service_window: _,
+                },
+            ) => {
                 assert_eq!(h, handle);
                 assert_eq!(epoch, 82);
                 assert_eq!(
@@ -12082,7 +12238,14 @@ mod tests {
             .try_recv()
             .expect("remote read should not wait for write timeout")
         {
-            (h, RelayEvent::Data { epoch, bytes }) => {
+            (
+                h,
+                RelayEvent::Data {
+                    epoch,
+                    bytes,
+                    stream_service_window: _,
+                },
+            ) => {
                 assert_eq!(h, handle);
                 assert_eq!(epoch, 23);
                 assert_eq!(bytes, b"remote-progress");
@@ -12125,7 +12288,14 @@ mod tests {
             .await
             .expect("remote data should still reach main loop")
         {
-            (h, RelayEvent::Data { epoch, bytes }) => {
+            (
+                h,
+                RelayEvent::Data {
+                    epoch,
+                    bytes,
+                    stream_service_window: _,
+                },
+            ) => {
                 assert_eq!(h, handle);
                 assert_eq!(epoch, 29);
                 assert_eq!(bytes, b"after-local-finish");
@@ -17746,6 +17916,28 @@ mod tests {
         assert_eq!(diag.remote_read_service_ticks, 3);
         assert_eq!(diag.remote_read_service_len_min, 8_192);
         assert_eq!(diag.remote_read_service_len_max, 131_072);
+    }
+
+    #[test]
+    fn stream_service_window_diag_line_includes_remote_and_local_progress() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(TcpSocket::new(
+            TcpSocketBuffer::new(vec![0; 16]),
+            TcpSocketBuffer::new(vec![0; 16]),
+        ));
+        let mut window = StreamServiceWindow::default();
+        window.note_remote_poll(65_536);
+        window.note_remote_read(65_536);
+        window.note_local_admission(32_768, 2, 1, 0, 1, StreamServiceBlockedReason::None);
+
+        let line = format_stream_service_window_diag(handle, 9, &window);
+
+        assert!(line.contains("tcp-stream-service-window"), "{line}");
+        assert!(line.contains("epoch=9"), "{line}");
+        assert!(line.contains("remote_poll_ticks=1"), "{line}");
+        assert!(line.contains("remote_read_bytes=65536"), "{line}");
+        assert!(line.contains("local_accepted_bytes=32768"), "{line}");
+        assert!(line.contains("last_blocked_reason=none"), "{line}");
     }
 
     #[test]

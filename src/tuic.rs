@@ -7,6 +7,7 @@
 use crate::metrics::{Metrics, note_pressure_edge};
 use crate::quic;
 use crate::shared::{ClientError, TargetAddr};
+use crate::tcp_stream_service::StreamPendingFreshness;
 use crate::udp_relay::{FlowEntry, FourTuple, MAX_UDP_FLOWS};
 use crate::upstream::{DatagramUpstream, ProxyUpstream, RelayStream};
 use quinn::{Connection, Endpoint, VarInt};
@@ -1352,24 +1353,7 @@ struct TuicStreamTransportPending {
     since_last_pending: TuicStreamTransportDelta,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TuicTcpStreamPendingCause {
-    NoTransportSample,
-    NoConnectionRx,
-    ConnectionRxNoStreamFrames,
-    ConnectionStreamFramesPending,
-}
-
-impl TuicTcpStreamPendingCause {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::NoTransportSample => "no_transport_sample",
-            Self::NoConnectionRx => "no_connection_rx",
-            Self::ConnectionRxNoStreamFrames => "connection_rx_no_stream_frames",
-            Self::ConnectionStreamFramesPending => "connection_stream_frames_pending",
-        }
-    }
-}
+type TuicTcpStreamPendingCause = StreamPendingFreshness;
 
 fn classify_tuic_stream_pending_cause(
     transport: Option<TuicStreamTransportPending>,
@@ -1378,7 +1362,11 @@ fn classify_tuic_stream_pending_cause(
         return TuicTcpStreamPendingCause::NoTransportSample;
     };
     if transport.since_last_read.rx_stream_frames > 0 {
-        return TuicTcpStreamPendingCause::ConnectionStreamFramesPending;
+        return if transport.since_last_pending.rx_stream_frames > 0 {
+            TuicTcpStreamPendingCause::ConnectionFreshStreamFramesPending
+        } else {
+            TuicTcpStreamPendingCause::ConnectionStaleStreamFramesPending
+        };
     }
     if transport.since_last_read.udp_rx_datagrams > 0 || transport.since_last_read.udp_rx_bytes > 0
     {
@@ -1395,7 +1383,8 @@ fn should_arm_tuic_stream_pending_self_wake(
     let active_connection_rx = matches!(
         cause,
         TuicTcpStreamPendingCause::ConnectionRxNoStreamFrames
-            | TuicTcpStreamPendingCause::ConnectionStreamFramesPending
+            | TuicTcpStreamPendingCause::ConnectionFreshStreamFramesPending
+            | TuicTcpStreamPendingCause::ConnectionStaleStreamFramesPending
     );
     if !active_connection_rx {
         return false;
@@ -3081,14 +3070,14 @@ mod tests {
             250,
             75_128,
             2,
-            TuicTcpStreamPendingCause::ConnectionStreamFramesPending,
+            TuicTcpStreamPendingCause::ConnectionFreshStreamFramesPending,
             Some(transport),
             13,
             12,
         );
 
         assert!(
-            pending.contains("pending_cause=connection_stream_frames_pending"),
+            pending.contains("pending_cause=connection_fresh_stream_frames_pending"),
             "{pending}"
         );
         assert!(pending.contains("conn_udp_rx=101/200000B"), "{pending}");
@@ -3166,7 +3155,7 @@ mod tests {
     }
 
     #[test]
-    fn tuic_tcp_stream_pending_cause_classifies_transport_progress_since_read() {
+    fn tuic_tcp_stream_pending_cause_classifies_transport_freshness() {
         assert_eq!(
             classify_tuic_stream_pending_cause(None),
             TuicTcpStreamPendingCause::NoTransportSample
@@ -3204,17 +3193,40 @@ mod tests {
             TuicTcpStreamPendingCause::ConnectionRxNoStreamFrames
         );
 
-        let stream_frames_pending = TuicStreamTransportPending {
+        let fresh_stream_frames_pending = TuicStreamTransportPending {
             since_last_read: TuicStreamTransportDelta {
                 udp_rx_datagrams: 12,
                 udp_rx_bytes: 14_000,
                 rx_stream_frames: 3,
             },
+            since_last_pending: TuicStreamTransportDelta {
+                udp_rx_datagrams: 2,
+                udp_rx_bytes: 4_000,
+                rx_stream_frames: 1,
+            },
             ..no_connection_rx
         };
         assert_eq!(
-            classify_tuic_stream_pending_cause(Some(stream_frames_pending)),
-            TuicTcpStreamPendingCause::ConnectionStreamFramesPending
+            classify_tuic_stream_pending_cause(Some(fresh_stream_frames_pending)),
+            TuicTcpStreamPendingCause::ConnectionFreshStreamFramesPending
+        );
+
+        let stale_stream_frames_pending = TuicStreamTransportPending {
+            since_last_read: TuicStreamTransportDelta {
+                udp_rx_datagrams: 12,
+                udp_rx_bytes: 14_000,
+                rx_stream_frames: 3,
+            },
+            since_last_pending: TuicStreamTransportDelta {
+                udp_rx_datagrams: 2,
+                udp_rx_bytes: 4_000,
+                rx_stream_frames: 0,
+            },
+            ..no_connection_rx
+        };
+        assert_eq!(
+            classify_tuic_stream_pending_cause(Some(stale_stream_frames_pending)),
+            TuicTcpStreamPendingCause::ConnectionStaleStreamFramesPending
         );
     }
 
@@ -3225,17 +3237,17 @@ mod tests {
         let past = now - Duration::from_millis(1);
 
         assert!(should_arm_tuic_stream_pending_self_wake(
-            TuicTcpStreamPendingCause::ConnectionStreamFramesPending,
+            TuicTcpStreamPendingCause::ConnectionFreshStreamFramesPending,
             None,
             now
         ));
         assert!(!should_arm_tuic_stream_pending_self_wake(
-            TuicTcpStreamPendingCause::ConnectionStreamFramesPending,
+            TuicTcpStreamPendingCause::ConnectionFreshStreamFramesPending,
             Some(future),
             now
         ));
         assert!(should_arm_tuic_stream_pending_self_wake(
-            TuicTcpStreamPendingCause::ConnectionStreamFramesPending,
+            TuicTcpStreamPendingCause::ConnectionFreshStreamFramesPending,
             Some(past),
             now
         ));

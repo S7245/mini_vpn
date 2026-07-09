@@ -12,6 +12,7 @@ pub mod quic;
 pub mod reality;
 pub mod reality_upstream;
 pub mod shared;
+pub mod tcp_stream_service;
 pub mod tuic;
 pub mod udp_relay;
 pub mod upstream;
