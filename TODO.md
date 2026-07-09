@@ -105,6 +105,16 @@ Latest discriminator:
   floor of `128KiB/5ms` active window. This is a local architecture/capacity
   gate only; VPS acceptance still must prove first `>30 Mbit/s` before any
   `100+ Mbit/s` claim.
+- Knife14gs G6 ran commit `4a44a11` on `.27` from a clean `/tmp` workdir. The
+  focused safe1200 reverse-first P1 improved to `28.6/27.6 Mbit/s` but still
+  did **not** exceed the `>30 Mbit/s` gate. The new local egress service ran
+  (`windows=6024`, `cycles=1718`) but reported `accepted_bytes=0` with dominant
+  `no_progress/no_work` exits. The useful discriminator is now clear: G5
+  serviced only local dirty/flush work; it did not fix the TUIC stream
+  read-cadence gap (`max_remote_read_gap_ms=5029`,
+  repeated `connection_stream_frames_pending`). The next slice must join TUIC
+  stream read service and main-loop local injection/egress under one measured
+  service contract before another VPS claim.
 
 Current result doc:
 
@@ -113,6 +123,8 @@ Current result doc:
   `docs/tech/2026-07-09-knife14gr-egress-cadence-reachability.md`
 - Local G2-G5 result:
   `docs/tech/2026-07-09-knife14gs-local-egress-service-g5-results.md`
+- G6 VPS result:
+  `docs/tech/2026-07-09-knife14gs-g6-local-egress-vps-results.md`
 
 Current follow-up queue:
 
@@ -131,14 +143,17 @@ Current follow-up queue:
 4. Knife14gs added the first explicit local writer/egress service lane. Keep
    its bounded stop reasons and diagnostics; do not convert it into an
    unbounded pump or bypass hard pending/drop/terminal guards.
-5. The next focused acceptance target is still first `>30 Mbit/s` on the same
-   safe1200 reverse-first P1, not yet `100+`. Do not claim the `100+ Mbit/s`
+5. Do not repeat G5-style local-only egress work as the next slice.
+   Knife14gs G6 proved that `tcp-local-egress-service` can run heavily while
+   `accepted_bytes=0`; this does not address TUIC ordered stream read cadence.
+6. The next focused implementation target is a TUIC-read plus main-loop
+   injection service contract. Tests must fail if remote-read gaps exceed the
+   service window while local surfaces are clean, and diagnostics must show
+   useful remote-read bytes and local accepted bytes in the same active window.
+7. The next focused VPS acceptance target is still first `>30 Mbit/s` on the
+   same safe1200 reverse-first P1, not yet `100+`. Do not claim the `100+`
    path is clear until a later slice passes `>30` and then a clean `100+`
    repeat exits normally.
-6. For G6 parsing, require the new `tcp-local-egress-service` diagnostics to
-   show useful cycles/accepted bytes and a low no-progress share. If VPS still
-   stays below `30 Mbit/s`, compare those counters against `tcp-tun-rx-drain`,
-   `tcp-downlink-flush`, TUN drops, and QUIC blocking before changing code.
 
 ## Roadmap: TUN transparent proxy (Target extraction)
 

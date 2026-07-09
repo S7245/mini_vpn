@@ -4248,3 +4248,31 @@ worth cleaning up separately.
   `tcp-downlink-flush`. A low VPS Mbps result is not actionable until those
   counters say whether the service lane hit target, no-progress, hard-pause,
   or cycle budget.
+
+## 2026-07-09 - Knife14gs G6 failed below 30M after local egress service
+
+- Result doc:
+  `docs/tech/2026-07-09-knife14gs-g6-local-egress-vps-results.md`
+- Code commit:
+  `4a44a11` (`fix(knife14gs): add local egress service lane`)
+- VPS bundle:
+  `/tmp/mini_vpn_knife14gs_g6/mvpn_knife14gs_g6_local_egress_safe1200_p1_usclient_suite_20260709_075624.tar.gz`
+- Outcome: remote `.27` focused gates passed, then the focused safe1200
+  reverse-first P1 reached `28.6/27.6 Mbit/s`, below the `>30 Mbit/s` gate.
+- Useful progress: the current branch stayed data-moving and improved over the
+  `18-22 Mbit/s` band in several recent runs, with direct reverse baseline
+  `280 Mbit/s`, TUN drops `0`, send errors `0`, QUIC loss/blocking `0`, and
+  reader credit preserved at `65536B` service / `524288B` batch floor.
+- Failed assumption: the local egress lane did not prove continuous throughput.
+  It ran often (`windows=6024`, `cycles=1718`) but had `accepted_bytes=0`,
+  `no_progress=1620`, and `no_work=4400`. Useful socket admission still came
+  from the remote-payload path, not from the new service lane.
+- Remaining root: TUIC ordered stream read cadence still has multi-second
+  gaps (`max_remote_read_gap_ms=5029`) with repeated
+  `connection_stream_frames_pending`, while local TUN/QUIC/drop surfaces stay
+  clean.
+- Reusable rule: a local egress capacity proof is not sufficient unless the
+  same service window also includes useful TUIC remote reads. The next TDD
+  slice must couple remote read service and main-loop local injection/egress in
+  one measured contract; do not continue with local-only flush, qlen, MTU,
+  VPS, stale-pool, broad-window, or self-wake-only changes.

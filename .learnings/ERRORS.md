@@ -3062,3 +3062,20 @@ active root unless it repeats.
   changes, keep loop-active boundedness/iteration checks, but use
   `poll_fraction` as the stable synthetic burn attribution signal when the
   no-burn baseline is already near active saturation.
+
+## 2026-07-09 - Local-only egress service capacity was over-predicted for G6
+
+- Stage: Knife14gs G6 VPS acceptance.
+- Symptom: commit `4a44a11` passed local and remote focused gates, but the
+  focused safe1200 reverse-first P1 reached only `28.6/27.6 Mbit/s`, below
+  the `>30 Mbit/s` gate.
+- Cause: the G5 code-level capacity gate counted the new main-loop local
+  egress lane as sufficient for throughput, but that lane only services dirty
+  local state already visible to the main loop. It does not actively pull new
+  remote bytes from the TUIC stream. The VPS run showed
+  `tcp-local-egress-service accepted_bytes=0` while useful throughput remained
+  limited by multi-second TUIC stream read gaps.
+- Correct behavior: do not use local-only egress capacity math to predict
+  `>30 Mbit/s` or `100+ Mbit/s`. A performance gate must require remote-read
+  bytes and local accepted bytes to make progress in the same measured active
+  window before another VPS acceptance claim.
