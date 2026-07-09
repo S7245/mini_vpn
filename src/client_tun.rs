@@ -7,8 +7,8 @@ use crate::metrics::Metrics;
 use crate::reality_upstream::RealityUpstream;
 use crate::shared::{ClientError, TargetAddr};
 use crate::tcp_stream_service::{
-    StreamServiceBlockedReason, StreamServiceController, StreamServiceWindow,
-    format_stream_service_window_fields,
+    LocalAdmissionProgress, StreamServiceBlockedReason, StreamServiceController,
+    StreamServiceWindow, format_stream_service_window_fields,
 };
 use crate::tuic::{
     AssocTable, FragReassembler, TuicClientConfig, TuicUpstream, decode_packet_meta, encode_packet,
@@ -4438,6 +4438,7 @@ impl Default for LocalEgressServiceConfig {
 struct LocalEgressServiceProgress {
     cycles: usize,
     accepted_bytes: usize,
+    egress_drain_bytes: usize,
     tun_rx_packets: usize,
     flush_tx_calls: usize,
     flush_tx_failures: usize,
@@ -4447,7 +4448,7 @@ struct LocalEgressServiceProgress {
 
 impl LocalEgressServiceProgress {
     fn has_progress(&self) -> bool {
-        self.accepted_bytes > 0 || self.tun_rx_packets > 0
+        self.accepted_bytes > 0 || self.egress_drain_bytes > 0 || self.tun_rx_packets > 0
     }
 }
 
@@ -4456,6 +4457,7 @@ struct LocalEgressServiceDiag {
     windows: u64,
     cycles: u64,
     accepted_bytes: u64,
+    egress_drain_bytes: u64,
     tun_rx_packets: u64,
     flush_tx_calls: u64,
     flush_tx_failures: u64,
@@ -4474,6 +4476,9 @@ impl LocalEgressServiceDiag {
         self.accepted_bytes = self
             .accepted_bytes
             .saturating_add(progress.accepted_bytes as u64);
+        self.egress_drain_bytes = self
+            .egress_drain_bytes
+            .saturating_add(progress.egress_drain_bytes as u64);
         self.tun_rx_packets = self
             .tun_rx_packets
             .saturating_add(progress.tun_rx_packets as u64);
@@ -4508,10 +4513,11 @@ impl LocalEgressServiceDiag {
 
 fn format_local_egress_service_diag(diag: &LocalEgressServiceDiag) -> String {
     format!(
-        "🔎 tcp-local-egress-service windows={} cycles={} accepted_bytes={} tun_rx_packets={} flush_tx_calls={} flush_tx_failures={} dirty_passes={} target_reached={} no_progress={} cycle_budget={} hard_pause={} no_work={}",
+        "🔎 tcp-local-egress-service windows={} cycles={} accepted_bytes={} egress_drain_bytes={} tun_rx_packets={} flush_tx_calls={} flush_tx_failures={} dirty_passes={} target_reached={} no_progress={} cycle_budget={} hard_pause={} no_work={}",
         diag.windows,
         diag.cycles,
         diag.accepted_bytes,
+        diag.egress_drain_bytes,
         diag.tun_rx_packets,
         diag.flush_tx_calls,
         diag.flush_tx_failures,
@@ -6076,11 +6082,10 @@ pub async fn run_event_loop<D, U, M>(
                             }
                         };
                         stream_service_window.note_local_admission(
-                            accepted_bytes,
-                            0,
-                            0,
-                            0,
-                            0,
+                            LocalAdmissionProgress {
+                                accepted_bytes,
+                                ..LocalAdmissionProgress::default()
+                            },
                             if accepted_bytes > 0 {
                                 StreamServiceBlockedReason::None
                             } else {
@@ -6205,11 +6210,14 @@ pub async fn run_event_loop<D, U, M>(
                             )
                             .await;
                             stream_service_window.note_local_admission(
-                                local_progress.accepted_bytes,
-                                local_progress.tun_rx_packets,
-                                local_progress.flush_tx_calls,
-                                local_progress.flush_tx_failures,
-                                local_progress.dirty_passes,
+                                LocalAdmissionProgress {
+                                    accepted_bytes: local_progress.accepted_bytes,
+                                    egress_drain_bytes: local_progress.egress_drain_bytes,
+                                    tun_rx_packets: local_progress.tun_rx_packets,
+                                    flush_tx_calls: local_progress.flush_tx_calls,
+                                    flush_tx_failures: local_progress.flush_tx_failures,
+                                    dirty_passes: local_progress.dirty_passes,
+                                },
                                 stream_service_blocked_reason_for_local_egress(
                                     local_progress.stop_reason,
                                 ),
@@ -7109,9 +7117,16 @@ where
         metrics.enter_poll();
         let timestamp = smoltcp::time::Instant::now();
         iface.poll(timestamp, device, sockets);
+        let queued_tx_before_flush = device.queued_tx_bytes();
+        let send_queue_before_flush =
+            downlink_pressure_stats(dirty, socket_ctxs, sockets).total_tx_queue;
         *tcp_loop_flush_tx_calls = tcp_loop_flush_tx_calls.saturating_add(1);
         cycle.flush_tx_calls = 1;
-        if let Err(e) = device.flush_tx().await {
+        let flush_result = device.flush_tx().await;
+        let queued_tx_after_flush = device.queued_tx_bytes();
+        let send_queue_after_flush =
+            downlink_pressure_stats(dirty, socket_ctxs, sockets).total_tx_queue;
+        if let Err(e) = flush_result {
             *tcp_loop_flush_tx_failures = tcp_loop_flush_tx_failures.saturating_add(1);
             cycle.flush_tx_failures = 1;
             tcp_diag_log!(
@@ -7119,6 +7134,11 @@ where
                 *tcp_loop_flush_tx_calls,
                 *tcp_loop_flush_tx_failures
             );
+        } else {
+            let tun_tx_drain_bytes = queued_tx_before_flush.saturating_sub(queued_tx_after_flush);
+            let send_queue_drain_bytes =
+                send_queue_before_flush.saturating_sub(send_queue_after_flush);
+            cycle.egress_drain_bytes = tun_tx_drain_bytes.max(send_queue_drain_bytes);
         }
         metrics.leave_poll();
 
@@ -7152,6 +7172,9 @@ where
 
         total.cycles = total.cycles.saturating_add(cycle.cycles);
         total.accepted_bytes = total.accepted_bytes.saturating_add(cycle.accepted_bytes);
+        total.egress_drain_bytes = total
+            .egress_drain_bytes
+            .saturating_add(cycle.egress_drain_bytes);
         total.tun_rx_packets = total.tun_rx_packets.saturating_add(cycle.tun_rx_packets);
         total.flush_tx_calls = total.flush_tx_calls.saturating_add(cycle.flush_tx_calls);
         total.flush_tx_failures = total
@@ -15026,6 +15049,7 @@ mod tests {
         let progress = LocalEgressServiceProgress {
             cycles: 3,
             accepted_bytes: LOCAL_EGRESS_SERVICE_TARGET_BYTES_PER_WINDOW,
+            egress_drain_bytes: 4096,
             tun_rx_packets: 12,
             flush_tx_calls: 3,
             flush_tx_failures: 0,
@@ -15047,10 +15071,24 @@ mod tests {
         assert!(line.contains("windows=1"));
         assert!(line.contains("cycles=3"));
         assert!(line.contains("accepted_bytes=131072"));
+        assert!(line.contains("egress_drain_bytes=4096"));
         assert!(line.contains("tun_rx_packets=12"));
         assert!(line.contains("target_reached=1"));
         assert!(line.contains("no_progress=0"));
         assert!(line.contains("cycle_budget=0"));
+    }
+
+    #[test]
+    fn local_egress_service_progress_counts_tun_tx_drain_as_progress() {
+        let progress = LocalEgressServiceProgress {
+            egress_drain_bytes: 1200,
+            ..LocalEgressServiceProgress::default()
+        };
+
+        assert!(
+            progress.has_progress(),
+            "TUN TX drain is useful local egress progress even when no new socket bytes were accepted"
+        );
     }
 
     #[test]
@@ -18442,7 +18480,17 @@ mod tests {
         let mut window = StreamServiceWindow::default();
         window.note_remote_poll(65_536);
         window.note_remote_read(65_536);
-        window.note_local_admission(32_768, 2, 1, 0, 1, StreamServiceBlockedReason::None);
+        window.note_local_admission(
+            LocalAdmissionProgress {
+                accepted_bytes: 32_768,
+                egress_drain_bytes: 4096,
+                tun_rx_packets: 2,
+                flush_tx_calls: 1,
+                dirty_passes: 1,
+                ..LocalAdmissionProgress::default()
+            },
+            StreamServiceBlockedReason::None,
+        );
 
         let line = format_stream_service_window_diag(handle, 9, &window);
 
@@ -18451,6 +18499,7 @@ mod tests {
         assert!(line.contains("remote_poll_ticks=1"), "{line}");
         assert!(line.contains("remote_read_bytes=65536"), "{line}");
         assert!(line.contains("local_accepted_bytes=32768"), "{line}");
+        assert!(line.contains("local_egress_drain_bytes=4096"), "{line}");
         assert!(line.contains("last_blocked_reason=none"), "{line}");
     }
 

@@ -182,6 +182,9 @@ impl TunIo for LoopbackTunDevice {
         }
         Ok(())
     }
+    fn queued_tx_bytes(&self) -> usize {
+        self.tx_queue.iter().map(BytesMut::len).sum()
+    }
     fn inject_ip_packet(&mut self, pkt: &[u8]) {
         self.tx_queue.push_back(BytesMut::from(pkt));
     }

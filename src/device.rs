@@ -1,5 +1,5 @@
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use bytes::BytesMut;
+use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read};
 use tokio::io::{AsyncReadExt, AsyncWriteExt}; // ⚠️ 极其重要：引入异步读写魔法
@@ -144,6 +144,10 @@ pub trait TunIo: Device {
     fn rx_take(&mut self) -> Option<BytesMut>;
     /// 异步发货：把发货队列里排队的包全部写出。
     async fn flush_tx(&mut self) -> std::io::Result<()>;
+    /// 当前等待写入 OS TUN 的 IP 包字节数。默认 0，真实/回环设备可覆盖用于诊断本地 egress 进展。
+    fn queued_tx_bytes(&self) -> usize {
+        0
+    }
     /// 下行注入：裸 IP 包入发货队列，等 `flush_tx` 发出。
     fn inject_ip_packet(&mut self, pkt: &[u8]);
     /// OS interface name when available. Diagnostics only; behavior must not depend on it.
@@ -168,6 +172,9 @@ impl TunIo for VirtualTunDevice {
     }
     async fn flush_tx(&mut self) -> std::io::Result<()> {
         VirtualTunDevice::flush_tx(self).await
+    }
+    fn queued_tx_bytes(&self) -> usize {
+        self.tx_queue.iter().map(BytesMut::len).sum()
     }
     fn inject_ip_packet(&mut self, pkt: &[u8]) {
         VirtualTunDevice::inject_ip_packet(self, pkt)
@@ -325,7 +332,6 @@ fn device_capabilities_for_mtu(mtu: usize) -> DeviceCapabilities {
 
     caps
 }
-
 
 /*
 设备能力：DeviceCapabilities { medium: Ip, max_transmission_unit: 1500, max_burst_size: None, checksum: ChecksumCapabilities { ipv4: Both, udp: Both, tcp: Both, icmpv4: Both } }

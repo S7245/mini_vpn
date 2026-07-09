@@ -46,6 +46,16 @@ impl StreamServiceBlockedReason {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LocalAdmissionProgress {
+    pub accepted_bytes: usize,
+    pub egress_drain_bytes: usize,
+    pub tun_rx_packets: usize,
+    pub flush_tx_calls: usize,
+    pub flush_tx_failures: usize,
+    pub dirty_passes: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StreamServiceWindow {
     pub remote_poll_ticks: u64,
     pub remote_poll_len_min: usize,
@@ -62,6 +72,7 @@ pub struct StreamServiceWindow {
     pub global_rx_queue_used_max: usize,
     pub global_rx_queue_capacity: usize,
     pub local_accepted_bytes: u64,
+    pub local_egress_drain_bytes: u64,
     pub local_tun_rx_packets: u64,
     pub local_flush_tx_calls: u64,
     pub local_flush_tx_failures: u64,
@@ -134,26 +145,27 @@ impl StreamServiceWindow {
 
     pub fn note_local_admission(
         &mut self,
-        accepted_bytes: usize,
-        tun_rx_packets: usize,
-        flush_tx_calls: usize,
-        flush_tx_failures: usize,
-        dirty_passes: usize,
+        progress: LocalAdmissionProgress,
         blocked_reason: StreamServiceBlockedReason,
     ) {
         self.local_accepted_bytes = self
             .local_accepted_bytes
-            .saturating_add(accepted_bytes as u64);
+            .saturating_add(progress.accepted_bytes as u64);
+        self.local_egress_drain_bytes = self
+            .local_egress_drain_bytes
+            .saturating_add(progress.egress_drain_bytes as u64);
         self.local_tun_rx_packets = self
             .local_tun_rx_packets
-            .saturating_add(tun_rx_packets as u64);
+            .saturating_add(progress.tun_rx_packets as u64);
         self.local_flush_tx_calls = self
             .local_flush_tx_calls
-            .saturating_add(flush_tx_calls as u64);
+            .saturating_add(progress.flush_tx_calls as u64);
         self.local_flush_tx_failures = self
             .local_flush_tx_failures
-            .saturating_add(flush_tx_failures as u64);
-        self.local_dirty_passes = self.local_dirty_passes.saturating_add(dirty_passes as u64);
+            .saturating_add(progress.flush_tx_failures as u64);
+        self.local_dirty_passes = self
+            .local_dirty_passes
+            .saturating_add(progress.dirty_passes as u64);
         self.note_blocked(blocked_reason);
     }
 
@@ -164,7 +176,9 @@ impl StreamServiceWindow {
     }
 
     pub fn has_useful_progress(&self) -> bool {
-        self.remote_read_bytes > 0 || self.local_accepted_bytes > 0
+        self.remote_read_bytes > 0
+            || self.local_accepted_bytes > 0
+            || self.local_egress_drain_bytes > 0
     }
 }
 
@@ -224,7 +238,7 @@ pub fn format_stream_service_window_fields(window: &StreamServiceWindow) -> Stri
         "remote_poll_ticks={} remote_poll_len_min={} remote_poll_len_max={} \
          pending_no_transport_sample={} pending_no_connection_rx={} pending_rx_no_stream_frames={} pending_fresh_stream_frames={} pending_stale_stream_frames={} \
          remote_read_chunks={} remote_read_bytes={} global_rx_wait_max_us={} global_rx_pressure_events={} global_rx_queue_used_max={} global_rx_queue_capacity={} \
-         local_accepted_bytes={} local_tun_rx_packets={} local_flush_tx_calls={} local_flush_tx_failures={} local_dirty_passes={} last_blocked_reason={} useful_progress={}",
+         local_accepted_bytes={} local_egress_drain_bytes={} local_tun_rx_packets={} local_flush_tx_calls={} local_flush_tx_failures={} local_dirty_passes={} last_blocked_reason={} useful_progress={}",
         window.remote_poll_ticks,
         window.remote_poll_len_min,
         window.remote_poll_len_max,
@@ -240,6 +254,7 @@ pub fn format_stream_service_window_fields(window: &StreamServiceWindow) -> Stri
         window.global_rx_queue_used_max,
         window.global_rx_queue_capacity,
         window.local_accepted_bytes,
+        window.local_egress_drain_bytes,
         window.local_tun_rx_packets,
         window.local_flush_tx_calls,
         window.local_flush_tx_failures,
@@ -267,11 +282,14 @@ mod tests {
         );
         window.note_global_rx_queue(9, 1024);
         window.note_local_admission(
-            16_384,
-            3,
-            2,
-            0,
-            1,
+            LocalAdmissionProgress {
+                accepted_bytes: 16_384,
+                egress_drain_bytes: 4096,
+                tun_rx_packets: 3,
+                flush_tx_calls: 2,
+                dirty_passes: 1,
+                ..LocalAdmissionProgress::default()
+            },
             StreamServiceBlockedReason::LocalAdmissionCycleBudget,
         );
 
@@ -282,6 +300,7 @@ mod tests {
         assert_eq!(window.global_rx_pressure_events, 1);
         assert_eq!(window.global_rx_queue_used_max, 9);
         assert_eq!(window.local_accepted_bytes, 16_384);
+        assert_eq!(window.local_egress_drain_bytes, 4096);
         assert_eq!(
             window.last_blocked_reason,
             StreamServiceBlockedReason::LocalAdmissionCycleBudget
@@ -315,13 +334,22 @@ mod tests {
         window.note_pending(StreamPendingFreshness::ConnectionFreshStreamFramesPending);
         window.note_remote_poll(65_536);
         window.note_remote_read(65_536);
-        window.note_local_admission(65_536, 0, 1, 0, 1, StreamServiceBlockedReason::None);
+        window.note_local_admission(
+            LocalAdmissionProgress {
+                egress_drain_bytes: 4096,
+                flush_tx_calls: 1,
+                dirty_passes: 1,
+                ..LocalAdmissionProgress::default()
+            },
+            StreamServiceBlockedReason::None,
+        );
 
         let line = format_stream_service_window_fields(&window);
 
         assert!(line.contains("pending_fresh_stream_frames=1"), "{line}");
         assert!(line.contains("remote_read_bytes=65536"), "{line}");
-        assert!(line.contains("local_accepted_bytes=65536"), "{line}");
+        assert!(line.contains("local_accepted_bytes=0"), "{line}");
+        assert!(line.contains("local_egress_drain_bytes=4096"), "{line}");
         assert!(line.contains("last_blocked_reason=none"), "{line}");
         assert!(line.contains("useful_progress=true"), "{line}");
     }
