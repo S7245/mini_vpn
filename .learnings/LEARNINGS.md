@@ -1,5 +1,22 @@
 # Learnings
 
+## 2026-07-09 - Promote skill gates before the next Knife14 architecture slice
+
+- Stage: post-Knife14gv self-review and project-rule update.
+- Changed file: `AGENTS.md`.
+- Outcome: project memory now treats `diagnose`, `tdd`,
+  `improve-codebase-architecture`, `code-review`, and `self-improving-agent` as
+  the default skill-assisted workflow for throughput work, with additional
+  architecture, refactoring, systems, release, and Go-reading skills for their
+  relevant stages.
+- What worked: the rule now requires a feedback loop, capacity/reachability
+  gate, and focused TDD seam before claiming a stage can reach `30 Mbit/s` or
+  `100+ Mbit/s`.
+- Reusable rule: after a code-review says the current seam cannot prove the
+  bottleneck, the next step is architecture extraction and a deterministic
+  stream-service harness, not another local pressure-credit or queue-window
+  tweak.
+
 ## 2026-07-08 - Knife14go self-wake improves polling but not ordered delivery
 
 - Result doc:

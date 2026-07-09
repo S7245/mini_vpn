@@ -66,6 +66,68 @@ Small related issues found during review should be fixed together before a
 concentrated integration test, instead of running a full VPS suite after every
 tiny edit.
 
+## Skill-Assisted Workflow
+
+Use skills as explicit engineering tools, not as optional labels. For Knife14
+throughput work, the default assistant set is:
+
+- `diagnose`: build a feedback loop first, rank falsifiable hypotheses, and map
+  each probe to a prediction before changing code.
+- `tdd`: add one focused red/green tracer-bullet test or harness check at a time
+  for the behavior being changed. Avoid bulk speculative tests.
+- `improve-codebase-architecture`: when the current seam cannot reproduce or
+  lock down the bug, identify deepening opportunities before adding more logic.
+- `code-review`: after each coherent code stage, review for correctness,
+  performance, lifecycle, bounded-backpressure, TUN/UDP/TCP regression, and
+  missing-test risk before requesting VPS acceptance.
+- `self-improving-agent`: after each meaningful stage, update
+  `.learnings/LEARNINGS.md`; update `.learnings/ERRORS.md` for failures that
+  change future behavior.
+
+For architecture-replacement stages, additionally use:
+
+- `clean-architecture`: keep TUIC/anti-censorship transport details, TCP relay
+  hot path, TUN/smoltcp integration, and local backpressure behind clear seams.
+- `refactoring-patterns`: prefer branch-by-abstraction, parallel change, and
+  behavior-preserving extraction over big-bang rewrites.
+- `system-design`: state throughput, latency, queue, lifecycle, observability,
+  and acceptance requirements before selecting mechanisms.
+- `ddia-systems`: reason about bounded queues, flow-control, backpressure,
+  fault tolerance, and data-plane consistency under pressure.
+
+For engineering discipline and release cleanup, use:
+
+- `pragmatic-programmer`: favor tracer bullets, reversible steps, and explicit
+  contracts over speculative complexity.
+- `clean-code`: keep hot-path names and functions readable; remove diagnostic
+  noise that no longer distinguishes active hypotheses.
+- `git-commit`: when committing, keep one coherent task per conventional commit
+  and never stage secrets.
+- `release-it`: after `100+ Mbit/s` is stable, organize resilience,
+  observability, regression, and release-readiness checks.
+
+When studying sing-box or other Go clients for design comparison, use:
+
+- `go-code-review`: read Go changes and mature-client code with concrete
+  correctness, performance, lifecycle, and logging checks.
+- `go-concurrency`: inspect goroutine lifetimes, copy loops, channel/pool
+  backpressure, and shutdown paths.
+- `go-context`: inspect cancellation, timeout propagation, and request/flow
+  lifecycle management.
+
+Skill gates for performance stages:
+
+- A stage that claims it can improve throughput must start with `diagnose` and
+  `tdd`: either a deterministic local feedback loop, a focused replay/harness,
+  or an explicit statement that no correct seam exists yet.
+- If no correct seam exists, the next step is architecture extraction with
+  `improve-codebase-architecture` and `refactoring-patterns`, not another
+  parameter tweak.
+- Do not claim a design can reach `30 Mbit/s` or `100+ Mbit/s` unless the code
+  reachability gate, capacity math, and tests show a plausible sufficient path.
+- After a failed run, compare expected invariants to observed counters and
+  propose the next modification plan before editing code again.
+
 ## Performance Architecture Gate
 
 For any throughput stage, especially one that predicts `>30 Mbit/s`,
