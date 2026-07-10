@@ -1012,6 +1012,22 @@ Post-review gates passed: normal library `582/582`; harness library `589/589`;
 integration `2/2`; harness targets `10 passed/4 ignored`; default and harness
 checks; fmt; diff-check; US-client suite self-test; and low-RTT probe self-test.
 
+Capacity follow-up (2026-07-10): review found that the prior 50/50 result was a
+cleanliness proof, not a `170 Mbit/s` reachability proof. The release 64 MiB
+production seam took `9.51s` (`56.4 Mbit/s`). Frozen-time RED showed one
+coalesced readiness stopped after exactly one 24-packet admission, and the
+full seam showed the 16-packet local drain misclassified every normal feedback
+batch as backlog (`1915` pause/resume episodes), making the two-epoch guard a
+5ms primary pacer.
+
+Commit `f7847dd` adds ACK-driven bounded actor re-entry, rounds partial
+unacknowledged segments to packet slots, and aligns local TUN RX service with
+the 48-packet feedback allowance. The 64 MiB seam improved to about `2.40s` /
+`224 Mbit/s`, with zero drop/bypass/tail and at most 24 payload packets per
+flush. Fifty consecutive capacity-qualified repeats passed, followed by lib
+`583/583`, harness `591/591`, integration `2/2`, harness targets `10 passed/4
+ignored`, checks, fmt, clippy, diff-check, and both script self-tests.
+
 - [x] **Step 7: Preserve commit and acceptance gates**
 
 Before the first commit, list every pre-D16 diff that would be included and ask

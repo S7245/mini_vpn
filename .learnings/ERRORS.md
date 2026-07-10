@@ -3672,6 +3672,21 @@ active root unless it repeats.
   change Quinn windows, add self-wake, or impose a global all-flows-zero barrier
   to hide this ownership error.
 
+## 2026-07-10 - Clean 50/50 repeats hid a 56 Mbit/s architecture ceiling
+
+- Symptom: the bounded 64 MiB production seam passed 50/50 for ownership,
+  zero drop, actor exclusivity, and EOF, but a release measurement still took
+  `9.51s` (`56.4 Mbit/s`), far below the `170 Mbit/s` target.
+- Root cause: the test had a 15-second completion timeout but no rate
+  assertion. The 16-packet local TUN RX budget also treated every normal
+  feedback batch from one safe 24-payload window as backlog, producing `1915`
+  pause/resume episodes and making the two-epoch circuit breaker a 5ms pacer.
+- Correct behavior: add a capacity value to the same production report and
+  require `>=170 Mbit/s`. Consume the modeled 48-packet feedback allowance
+  before declaring backlog; only a further ready packet may trip DrainOnly.
+  Keep the 24-payload cap and verify partial `send_queue` segments consume a
+  full packet slot.
+
 ## 2026-07-10 - Dropping a split duplex WriteHalf did not publish mock EOF
 
 - Symptom: the full reverse payload arrived with zero drop, but the D16 queue

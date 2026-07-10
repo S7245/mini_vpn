@@ -28,12 +28,14 @@ This section overrides the older G7/G8/GV next-step text below.
   - `docs/tech/2026-07-09-knife14h10d16-byte-owned-egress-implementation-plan.md`
   - `docs/tech/2026-07-09-knife14h10d16-session-handoff.md`
 - Stage position: nominally stage 8 because capacity passed but clean Gate A
-  failed. D16 code baseline `8496b8f` is pushed on
+  failed. D16 code baseline `8496b8f` and ACK-capacity repair `f7847dd` are
+  pushed on
   `codex/knife14d-downlink-reap-open`. Stages 3-7 and mandatory Task 11A are
   now closed locally: the 64 MiB
-  bounded-ring production seam passed 50 consecutive repeats with complete
-  delivery, real guard pause/resume edges, at most 24 payload packets per
-  flush, zero modeled drop/bypass, and clean EOF/close-tail accounting. The
+  bounded-ring production seam passed 50 consecutive capacity-qualified
+  repeats with complete delivery, about `224 Mbit/s` local receiver capacity,
+  at most 24 payload packets per flush, zero modeled drop/bypass, and clean
+  EOF/close-tail accounting. The
   closed design uses a two-epoch device guard, a per-flow ACK-completion
   barrier, and an MTU-derived sliding admission window that deducts the current
   smoltcp send queue. The next remote action is one strict replacement Gate A;

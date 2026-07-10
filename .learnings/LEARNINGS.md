@@ -5594,3 +5594,24 @@ worth cleaning up separately.
   capacity are different invariants. Close them with a two-epoch device guard,
   per-flow barriers, and a cumulative outstanding-byte window; do not use a
   global all-flows-zero condition or a nominal per-call burst alone.
+
+## 2026-07-10 - ACK capacity gate keeps the backlog guard exceptional
+
+- The first 50/50 Task 11A proof was clean but completed 64 MiB in about
+  `9.5s`, only `56 Mbit/s`. A local correctness/stability gate does not prove
+  the code-level path can reach the remote throughput target.
+- Frozen Tokio time reproduced the missing progress without a timer: after one
+  coalesced readiness the flow stopped at exactly one 24-packet admission.
+  Re-entering the existing bounded actor on a ready local TCP packet fixed that
+  edge without adding self-wake or bypass admission.
+- The full-flow limiter was separate: a normal 24-payload window produced more
+  than the old 16-packet TUN RX service budget, so every window installed and
+  recovered the device guard. `1915` episodes over 64 MiB created an exact 5ms
+  pacing pattern.
+- Aligning local service with the modeled 48-packet ACK/window-update allowance
+  kept the 24-payload admission cap unchanged and moved the same seam to about
+  `224 Mbit/s` with ring high-water below 64 and zero drop/tail/bypass.
+- Fifty consecutive runs passed the new `>=170 Mbit/s` capacity gate. Reusable
+  rule: every stability harness for a performance architecture must assert the
+  target service rate, and an emergency guard must be measured as exceptional,
+  not merely shown to pause and resume correctly.

@@ -103,8 +103,10 @@ available admission = 24 * (TUN MTU - IPv4/TCP minimum headers)
 At MTU 1200 this is at most `27,840B` per admission edge; at MTU 1500 it is at
 most `35,040B`. Eight actor cycles still cover the `128 KiB` service target.
 The 24-packet bound reserves room in the modeled 64-packet TUN RX ring for up
-to two ACK/window-update feedback packets per admitted payload packet plus the
-ordinary 16-packet drain budget. Running keeps its `512 KiB` read reservoir and
+to two ACK/window-update feedback packets per admitted payload packet. The
+local actor therefore consumes up to 48 feedback packets before treating a
+further ready packet as device backlog; the remaining 16 ring slots are
+pre-existing-backlog headroom. Running keeps its `512 KiB` read reservoir and
 Recovery keeps its `128 KiB` read quantum; neither value is permission to
 inject that many bytes into smoltcp in one edge.
 
@@ -263,9 +265,11 @@ Task 11A implementation clarification, accepted from the production-seam RED:
 
 - the device backlog guard is authoritative for phase transitions, published
   read credit, and the initial credit/phase of a newly installed relay;
-- reaching the ordinary reader budget with another packet ready upgrades that
-  same call to the existing bounded pressure budget (maximum 256 packets), so
-  ACK backlog is consumed before the actor flushes the already-admitted tail;
+- local actor service consumes the full 48-packet feedback allowance for one
+  24-payload-packet window. Only a further ready packet after that allowance
+  proves backlog and upgrades the same call to the existing bounded pressure
+  budget (maximum 256 packets), so normal ACK batches do not trip the circuit
+  breaker while real backlog is consumed before new admission;
 - a first clean `WouldBlock` after backlog only arms recovery. The device guard
   stays active through one `ControlOnly` poll/flush epoch with zero admission;
   only a later independent clean `WouldBlock` releases the device guard;
@@ -380,6 +384,10 @@ must be reopened and closed against this spec:
   device-global all-flows-zero condition.
 - D16 Running and Recovery never exceed 24 modeled payload packets outstanding
   after deducting the current smoltcp send queue.
+- A ready local TCP packet can schedule the same bounded actor without waiting
+  for the 5ms timer; no TUN-RX call site may admit outside that actor.
+- The 64 MiB production seam exceeds `170 Mbit/s` while the circuit breaker
+  remains exceptional rather than firing once per admission window.
 - EOF is observed after payload drain, with zero permit leak or double release.
 - Full lib tests, check, fmt, diff-check, and suite self-test pass.
 
