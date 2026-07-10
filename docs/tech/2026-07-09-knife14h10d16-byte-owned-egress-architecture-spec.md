@@ -3,6 +3,11 @@
 Date: 2026-07-09
 Status: approved for implementation
 
+Amended: 2026-07-10 after the credit-rearm Gate A. This amendment corrects
+Linux TUN counter direction, closes the global-drop/per-flow-Recovery scope
+gap, and adds a required TUN RX starvation falsifier. It preserves the D16
+ownership, actor, EOF, Gate A, and Gate B decisions.
+
 ## Decision
 
 Keep the H10d15 capability that mattered: a continuously serviced, independent
@@ -85,6 +90,23 @@ process-wide TCP reservoir cap    = 64 MiB
 actor service target              = 128 KiB per service window
 actor max cycles                  = 8 per bounded invocation
 ```
+
+The service target is cumulative, not one smoltcp admission burst. The local
+TUN feedback boundary adds a second, MTU-derived sliding limit:
+
+```text
+maximum unacknowledged payload packets per D16 flow = 24
+available admission = 24 * (TUN MTU - IPv4/TCP minimum headers)
+                      - current smoltcp send_queue bytes
+```
+
+At MTU 1200 this is at most `27,840B` per admission edge; at MTU 1500 it is at
+most `35,040B`. Eight actor cycles still cover the `128 KiB` service target.
+The 24-packet bound reserves room in the modeled 64-packet TUN RX ring for up
+to two ACK/window-update feedback packets per admitted payload packet plus the
+ordinary 16-packet drain budget. Running keeps its `512 KiB` read reservoir and
+Recovery keeps its `128 KiB` read quantum; neither value is permission to
+inject that many bytes into smoltcp in one edge.
 
 Reservations are demand-allocated. Idle flows hold zero payload reservation,
 so the per-flow cap does not imply `512 KiB * all listener slots`. The shared
@@ -194,6 +216,73 @@ The key rule is that `DrainOnly` never disables ACK/TUN RX, `iface.poll`,
 `flush_tx`, permit release, or close-tail drain. Drop feedback is an emergency
 circuit breaker, not the primary throughput pacer.
 
+### Post-Gate-A device-pressure amendment
+
+Linux `tun0` direction is part of the contract:
+
+- `tx_dropped` is the kernel-to-userspace TUN transmit-ring drop counter. In
+  this product path it means local ACK/control/uplink packets were not read by
+  mini_vpn in time.
+- `VirtualTunDevice::flush_tx` writes remote/downlink packets in the opposite
+  userspace-to-kernel direction. A zero `flush_tx` failure count does not make
+  `tx_dropped` a TUN-write failure.
+- Therefore TUN-drop prevention must be tested at the TUN RX service boundary,
+  not implemented by assuming OS write backpressure in `flush_tx`.
+
+Drop recovery has one ownership scope:
+
+- a TUN drop episode and its debt are device-global;
+- measured aggregate pressure reduction across feedback samples may pay that
+  global debt exactly once, up to the observed drain, without minting actor
+  admission credit;
+- the same one-shot clean-drain evidence is offered to every active D16 flow
+  held by that global episode; each flow still applies its own terminal and
+  low-watermark guards before entering Recovery;
+- ordinary actor-cycle `drain_progress` means strictly positive completed
+  drain bytes. A successful zero-byte poll/flush cycle remains observable but
+  does not advance Recovery.
+
+Before another Gate A, a deterministic production-seam harness must model a
+bounded kernel-to-userspace TUN RX ring and reproduce or falsify the observed
+starvation shape. The required behavior is:
+
+1. sustained D16 downlink admission causes local ACK/control packets to enter
+   the modeled TUN RX ring;
+2. reader service, actor admission, `iface.poll`, and close use the production
+   scheduling seam;
+3. the current implementation must demonstrate the drop/backlog failure before
+   a preventive mechanism is selected;
+4. if reproduced, use device-wide, self-resetting backlog evidence at the TUN
+   RX boundary to stop D16 reads/admission while TUN RX/poll/flush continues;
+5. recovery requires two independent clean observations separated by one
+   admission-free control epoch, not a timer or arbitrary debt forgiveness;
+6. a flow that still has unacknowledged smoltcp `send_queue` bytes remains in
+   DrainOnly until its own queue reaches zero, without blocking clean flows.
+
+Task 11A implementation clarification, accepted from the production-seam RED:
+
+- the device backlog guard is authoritative for phase transitions, published
+  read credit, and the initial credit/phase of a newly installed relay;
+- reaching the ordinary reader budget with another packet ready upgrades that
+  same call to the existing bounded pressure budget (maximum 256 packets), so
+  ACK backlog is consumed before the actor flushes the already-admitted tail;
+- a first clean `WouldBlock` after backlog only arms recovery. The device guard
+  stays active through one `ControlOnly` poll/flush epoch with zero admission;
+  only a later independent clean `WouldBlock` releases the device guard;
+- forcing a flow to DrainOnly records a per-flow ACK-completion barrier when
+  its smoltcp `send_queue` is nonzero. Device recovery is readiness-only: each
+  flow clears its own barrier and enters Recovery only after its own
+  `send_queue` reaches zero, so one slow flow cannot impose global head-of-line
+  blocking;
+- read-reservoir capacity and actor-admission quantum are distinct. `Running`
+  may keep a `512 KiB` owned read opportunity and Recovery a `128 KiB` read
+  opportunity, while both phases use the cumulative 24-packet sliding
+  admission window described above.
+
+This falsifier does not authorize a raw-splice path, deletion of D16 phases,
+MTU/PLPMTUD changes, broad QUIC-window changes, chunk-size changes, or
+self-wake tuning.
+
 ## Read Service Policy
 
 - `paused` or `DrainOnly` means no Quinn read is armed.
@@ -246,7 +335,7 @@ conservation at close.
 - Local gates pass, actor drains, but remote read gaps return: Quinn read wake
   or reservation rearm is the limiter.
 - Throughput is high but TUN drops remain: local commit/release semantics or
-  proactive TUN pressure model is insufficient.
+  proactive kernel-to-userspace TUN RX service/backpressure is insufficient.
 - TUN drops are zero but close bytes remain: EOF/local lifecycle ordering is
   insufficient.
 - One clean high run followed by large variance: architecture capacity exists,
@@ -281,6 +370,16 @@ must be reopened and closed against this spec:
 - D3 actor admission equals total D3 `send_slice` admission.
 - DrainOnly produces zero read/admission bytes and positive drain progress when
   local work exists.
+- A device-global drop episode can consume measured aggregate drain exactly
+  once and cannot strand eligible flows in DrainOnly after pressure is clean.
+- A zero-byte drain cycle does not count as Recovery progress.
+- The bounded TUN RX starvation production seam passes before another VPS run.
+- A first clean TUN RX probe cannot reopen admission before an admission-free
+  control epoch and a later independent clean probe.
+- Per-flow ACK-completion barriers isolate a slow flow rather than requiring a
+  device-global all-flows-zero condition.
+- D16 Running and Recovery never exceed 24 modeled payload packets outstanding
+  after deducting the current smoltcp send queue.
 - EOF is observed after payload drain, with zero permit leak or double release.
 - Full lib tests, check, fmt, diff-check, and suite self-test pass.
 
@@ -313,7 +412,8 @@ must be reopened and closed against this spec:
 ## Stop Rules
 
 - Do not run VPS Gate A until the local ownership, actor-exclusivity,
-  DrainOnly, and EOF tests all pass.
+  DrainOnly, EOF, global-drop recovery, and bounded TUN RX starvation tests all
+  pass.
 - Do not tune reservoir size or actor quantum after a failed VPS run until the
   failure discriminator identifies capacity or cadence as the active limiter.
 - Do not call one `>170 Mbit/s` run stable acceptance.

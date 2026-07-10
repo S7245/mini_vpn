@@ -3200,3 +3200,487 @@ active root unless it repeats.
   ordered TUIC stream `read().await` / pending self-wake path, with acceptance
   requiring active data-read gaps below `500ms` before another `100+ Mbit/s`
   claim.
+
+## 2026-07-09 - Ordered chunk adapter alone did not break the throughput band
+
+- Stage: Knife14h4 ordered TUIC chunk adapter.
+- Symptom: the experimental H4 code replaced default ordered TCP reads with a
+  Quinn `read_chunk(max, true)` adapter and passed local/remote gates, but the
+  focused reverse-first P1 reached only `17.1/15.7 Mbit/s`.
+- Cause: the seam was real but not sufficient. The run proved
+  `relay_mode=ordered_chunk` was active and slightly reduced data read gap
+  (`3685ms` versus Knife14hz `5086ms`), yet the same bursty/idle iperf shape
+  remained with clean TUN drops, clean global-rx/local-write pressure, clean
+  pressure/headroom debt, clean close-tail, and clean QUIC loss/blocking.
+- Correct behavior: do not repeat H4 by tuning ordered chunk sizes,
+  `read_chunk(true)` polling shape, or self-wake timers as standalone fixes.
+  Before another VPS run, either revert/gate the H4 adapter or use it only as a
+  diagnostic seam in a design that explains bursty remote delivery under clean
+  local and QUIC counters.
+
+## 2026-07-09 - Knife14h8 VPS smoke was blocked before throughput by sudo TTY
+
+- Stage: Knife14h8 continuous pump product gate remote smoke.
+- Symptom: the first VPS suite attempt on `.27` received
+  `MINI_VPN_CONTINUOUS_TCP_RELAY=1` and passed early environment checks, but
+  failed at the suite's `sudo -v` preflight with:
+  `sudo: a terminal is required to read the password`.
+- Artifact:
+  `/tmp/conn/mvpn_knife14h8_continuous_pump_p1_usclient_suite_20260709_173738.tar.gz`
+- Cause: the suite was launched through non-TTY SSH. A later `ssh -tt` sudo
+  probe reached an interactive password prompt and was interrupted without
+  entering or storing a password.
+- Correct behavior: do not treat this artifact as throughput evidence. For
+  future `.27` suites, start from a real TTY and complete `sudo -v` at the
+  prompt, or explicitly design a non-interactive sudo preflight. Never put the
+  sudo password in commands, scripts, docs, logs, learning memory, or summaries.
+
+## 2026-07-09 - Remote `.27` shell differs from the local dev shell
+
+- Stage: Knife14h8 remote preparation.
+- Symptom: `.27` did not have `rg` in PATH, and non-login SSH did not have
+  `cargo` in PATH. A single `cargo test` invocation with multiple bare filters
+  also failed because Cargo accepts only one positional test filter.
+- Cause: VPS command environment differs from the Mac development shell, and
+  the Cargo CLI filter syntax was misused.
+- Correct behavior: use `grep`/`find` on `.27` unless `rg` is confirmed
+  installed; run Rust commands through `bash -lc`; run multiple focused Cargo
+  filters as separate commands or use one broader filter such as
+  `cargo test -q continuous_relay_reader`.
+
+## 2026-07-09 - Continuous relay pump did not clear the first throughput gate
+
+- Stage: Knife14h8 continuous relay pump VPS smoke.
+- Symptom: with `MINI_VPN_CONTINUOUS_TCP_RELAY=1` active and
+  `engine=continuous_pump` confirmed, reverse-first P1 reached only
+  `30.7/29.6 Mbit/s`. The receiver did not clear the `>30 Mbit/s` first gate,
+  and the run remained far from `100+ Mbit/s`.
+- Artifact:
+  `/tmp/conn/mvpn_knife14h8_continuous_pump_p1_usclient_suite_20260709_174648.tar.gz`
+- Local copy:
+  `/tmp/mini_vpn_knife14h8_continuous_pump/mvpn_knife14h8_continuous_pump_p1_usclient_suite_20260709_174648.tar.gz`
+- Cause: the H8 change removed normal local `RelayReadCredit` as the remote
+  read clock, but that was not the main remaining bottleneck. The active data
+  stream still had `data_read_gap_max_ms=3823`,
+  `data_pending_gap_max_ms=3408`, and `data_poll_gap_max_ms=3406` while
+  `continuous_queue_wait_events=0`, QUIC loss/congestion/blocking were clean,
+  TUN drops were `0`, global-rx/local-write pressure were `0`, and close-tail
+  pending was `0`.
+- Correct behavior: do not keep tuning the continuous queue, relay-reader
+  read-credit decoupling, chunk size, self-wake timers, broad QUIC windows, VPS
+  buffers, MTU/PLPMTUD, stale pool, sing-box liveness, or iperf3 for this
+  branch. The next design must explain why TUIC reports
+  `connection_stream_frames_pending` and multi-second active data poll/read
+  gaps while the relay byte queue is not full and local/QUIC counters are
+  mostly clean; focus on the seam between `tuic.rs` ordered stream readiness
+  and `client_tun.rs` local downlink backpressure/`flush_downlink` pressure
+  transitions.
+
+## 2026-07-09 - D2.1c joined-flow VPS gate still failed throughput
+
+- Stage: Knife14h9/D2.1c canonical bridge gate.
+- Symptom: real VPS logs successfully joined TUIC `conn/id/stream` to local
+  `handle/epoch`, but reverse-first P1 reached only `1.500/0.615 Mbit/s`
+  sender/receiver.
+- Artifact:
+  `/tmp/conn/mvpn_knife14h9_d2_bridge_p1_usclient_suite_20260709_190629.tar.gz`
+- Local copy:
+  `/tmp/mini_vpn_knife14h9_d2_bridge/mvpn_knife14h9_d2_bridge_p1_usclient_suite_20260709_190629.tar.gz`
+- Cause status: not fully solved. This run falsified "the relay task is not
+  polling the data stream" because `data_poll_gap_max_ms=4`, but
+  `data_read_gap_max_ms=6837` and `data_pending_gap_max_ms=6010` remained.
+  Local pressure, TUN drops, QUIC loss/congestion/blocking, pressure credit
+  debt, headroom limiting, TUN flush failures, and close-tail pending were
+  clean in the summary.
+- Correct behavior: do not respond by tuning chunk size, self-wake, read
+  batching, VPS buffers, MTU/PLPMTUD, stale pool, or broad QUIC windows. The
+  next probe/design must distinguish whether connection-level stream frames
+  are for the joined data stream, and whether local egress service is actually
+  draining TUN/smoltcp progress or only accepting bytes into the local TCP send
+  queue.
+
+## 2026-07-09 - D2.2a local egress drain metric had a snapshot-order blind spot
+
+- Stage: Knife14h9/D2.2b local egress discriminator.
+- Symptom: D2.2a re-summary reported
+  `local_egress_drain_bytes_max=0` and
+  `local_egress_service.egress_drain_bytes_max=0`, which was tempting to read
+  as proof that no local smoltcp/TUN egress drain happened.
+- Cause: `service_local_egress_until` measured pressure after
+  `drain_ready_tun_rx`, but `drain_ready_tun_rx` itself can call
+  `iface.poll`, `flush_tx`, and dirty relay processing. ACK/TUN RX can reduce
+  smoltcp send-queue or queued TUN TX pressure before the old before/after
+  snapshot window starts.
+- Correct behavior: do not treat old `egress_drain_bytes=0` as proof of no
+  local drain unless the snapshot covers the full ACK/TUN RX plus poll/flush
+  service cycle. The D2.2b `LocalEgressPressureSnapshot` test family is the
+  local guard for this metric.
+
+## 2026-07-09 - Unordered TUIC reassembly diagnostic is evidence, not an accepted fix
+
+- Stage: Knife14h9/D2.2b VPS unordered discriminator.
+- Symptom: with `MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY=1` and
+  `relay_mode=unordered_reassembly_diag`, reverse-first P1 still reached only
+  `18.400/17.500 Mbit/s` and kept multi-second read/pending gaps.
+- Artifact:
+  `/tmp/conn/mvpn_knife14c_usclient_suite_20260709_193528.tar.gz`
+- Local copy:
+  `/tmp/mini_vpn_knife14h9_d2_2b_unordered_diag/mvpn_knife14c_usclient_suite_20260709_193528.tar.gz`
+- Cause status: not fully solved. The diagnostic proved same-stream
+  out-of-order chunks (`max_gap_bytes=1169774`,
+  `out_of_order_chunks=30287`, `cap_hits=0`), but the current implementation
+  is still an in-`poll_read` staging adapter, not a full per-flow copy contract
+  with downstream permit lifetime and local egress feedback.
+- Correct behavior: do not flip unordered reassembly on as the product answer,
+  and do not keep tuning chunk size/self-wake/read batching from this result.
+  The next change must be a bounded per-flow reassembly/copy contract with TDD
+  and a falsifiable VPS `>30 Mbit/s` first gate.
+
+## 2026-07-09 - Tooling and VPS startup failures during D2.3
+
+- `rustfmt src/client_tun.rs src/tcp_downlink_pump.rs` failed because direct
+  `rustfmt` did not inherit the crate edition and parsed the files as Rust
+  2015. Use `cargo fmt -- ...` or `cargo fmt --check` from the repo root for
+  this project.
+- One hand-written nested SSH/Python here-doc for TUIC config comparison broke
+  in shell quoting and ran partially in the local shell. For no-secret remote
+  comparison scripts, send Python over SSH stdin instead of embedding nested
+  here-docs inside a quoted command.
+- The first D2.3 suite attempt failed during TUIC startup with
+  `tuic auth finish: sending stopped by peer: error 0`, but immediate baseline
+  and D2.3 smoke starts succeeded and no-secret UUID/password/SNI/ALPN
+  comparison matched. Treat a single startup auth failure as a retry/smoke
+  condition before changing code or VPS config.
+
+## 2026-07-09 - D2.4 high-port byte-source probe was an invalid capacity signal
+
+- Failed run: a temporary byte source on `.77:5297` produced a
+  `tuic_tcp_sink_probe` result of `0` bytes and EOF after about `5s`.
+- Correct interpretation: sing-box logs showed it attempted `.77:5297` but
+  failed with a dial timeout. The target byte source had not accepted the
+  connection, so this was a target-port reachability/security-group issue, not
+  mini_vpn TUIC read capacity.
+- Fix used for the valid discriminator: temporarily stop `.77` iperf3, bind the
+  byte source to the already-open `.77:5201`, run the probe, then restart and
+  confirm iperf3 active/listening.
+- Future behavior: do not use arbitrary high target ports for VPS capacity
+  probes unless direct reachability from the exit side has been proven first.
+  A zero-byte sink result must be checked against exit-side sing-box logs and
+  target-side accept logs before being treated as a data-plane result.
+
+## 2026-07-09 - rsync without relative paths copied H10 files to the remote repo root
+
+- Stage: Knife14h10/H10d remote preparation.
+- Symptom: the first `.27` sync command sent `src/client_tun.rs`,
+  `src/tcp_egress.rs`, `src/tcp_downlink_pump.rs`, `src/lib.rs`, and the suite
+  script to `/home/ubuntu/mini_vpn/` by basename instead of preserving
+  `src/` and `scripts/`.
+- Fix used: reran sync with `rsync -R` for the intended paths and removed the
+  mistaken root-level copies.
+- Correct behavior: for partial repo syncs to `.27`, use `rsync -R` from the
+  repo root or explicit destination paths. After syncing, run remote
+  `git status --short -- <expected paths> <known accidental basenames>` before
+  building.
+
+## 2026-07-09 - H10d high-throughput actor run is not clean acceptance
+
+- Stage: Knife14h10/H10d D3 egress actor VPS first gate.
+- Symptom: with `MINI_VPN_D3_EGRESS_ACTOR=1`, reverse-first P1 reached
+  `iperf_receiver_mbps=102.000` and active interval averages above `170M`, but
+  the iperf command exited by timeout (`exit=124`).
+- Artifact:
+  `/tmp/conn/mvpn_knife14h10c_d3_actor_p1_usclient_suite_20260709_215654.tar.gz`
+- Local copy:
+  `/tmp/mini_vpn_knife14h10c_d3_actor/mvpn_knife14h10c_d3_actor_p1_usclient_suite_20260709_215654.tar.gz`
+- Acceptance blockers: `tun_tx_dropped_delta=97`,
+  `pending_at_close=421577`, and `terminal_pending_reap=421577`.
+- Correct behavior: treat H10d as architecture-capacity proof, not an accepted
+  fix. The next stage must analyze D3 actor close-tail/TUN egress-drop cleanup
+  before another "final" repeat; do not return to TUIC chunk size, read-credit,
+  VPS buffers, MTU/PLPMTUD, stale pool, or broad QUIC window tuning.
+
+## 2026-07-09 - Pure clean-headroom actor pacing is too conservative
+
+- Stage: Knife14h10/H10d2 actor clean-headroom local pacing.
+- Symptom: the focused reverse-first P1 with `MINI_VPN_D3_EGRESS_ACTOR=1`
+  regressed to `sender=11.6 Mbit/s` and `receiver=9.72 Mbit/s`.
+- Artifact:
+  `/tmp/conn/mvpn_knife14h10d2_actor_clean_headroom_usclient_suite_20260709_221940.tar.gz`
+- Local copy:
+  `/tmp/mini_vpn_knife14h10d2_actor_clean_headroom/mvpn_knife14h10d2_actor_clean_headroom_usclient_suite_20260709_221940.tar.gz`
+- What the failed run proved: clean-headroom-only eliminated the H10d tail
+  blockers (`tun_tx_dropped_delta=0`, `pending_at_close=0`,
+  `terminal_pending_reap=0`), but it also forced
+  `drain_credit_planned_bytes=0`, `send_queue_max=449999`,
+  `headroom_limited_calls=13881`, and low throughput.
+- Correct behavior: do not accept or keep extending pure clean-headroom-only
+  pacing as the product fix. The next design must preserve H10d's bounded
+  elastic credit above clean headroom while making that credit drop-aware and
+  recent-drain-backed.
+
+## 2026-07-09 - Target-edge actor hybrid credit is still below the 100M capacity gate
+
+- Stage: Knife14h10/H10d3 actor hybrid target-edge credit.
+- Symptom: reverse-first P1 improved to `receiver=29.8 Mbit/s` but stayed below
+  `100M+`.
+- Artifact:
+  `/tmp/conn/mvpn_knife14h10d3_actor_hybrid_target_usclient_suite_20260709_224720.tar.gz`
+- Local copy:
+  `/tmp/mini_vpn_knife14h10d3_actor_hybrid_target/mvpn_knife14h10d3_actor_hybrid_target_usclient_suite_20260709_224720.tar.gz`
+- What the failed run proved: target-edge credit preserved the H10d2 safety
+  wins (`tun_tx_dropped_delta=0`, `pending_at_close=0`,
+  `terminal_pending_reap=0`) but remained locally pressure-limited
+  (`send_queue_max=503692`, `pending_total_max=454619`,
+  `hard_edge_guard_limited=18275`, `pressure_credit_debt_bytes=122727`).
+- Correct behavior: do not accept target-edge actor hybrid as the final H10 fix.
+  The next design must allow a higher adaptive elastic edge between target and
+  credit edge while retaining drop-debt clean-headroom backoff.
+
+## 2026-07-09 - Actor adaptive credit edge did not address the active Gate A bottleneck
+
+- Stage: Knife14h10/H10d4 actor adaptive credit edge.
+- Symptom: reverse-first P1 regressed to `receiver=20.6 Mbit/s`, below the
+  `>30M` Gate A target.
+- Artifact:
+  `/tmp/conn/mvpn_knife14h10d4_actor_adaptive_credit_usclient_suite_20260709_231822.tar.gz`
+- Local copy:
+  `/tmp/mini_vpn_knife14h10d4_actor_adaptive_credit/mvpn_knife14h10d4_actor_adaptive_credit_usclient_suite_20260709_231822.tar.gz`
+- What the failed run proved: target-to-credit elasticity was not the active
+  limiter. `send_queue_max=390896` stayed below `tx_queue_flush_high=449999`,
+  `headroom_limited=0`, `pressure_credit_debt_bytes=0`, and
+  `hard_edge_guard_limited=0`.
+- Correct behavior: do not continue with actor credit threshold variants as the
+  next fix. The next discriminator must explain TUIC data read/pending/poll
+  gaps (`3849/3848/3394ms`) while local egress pressure, TUN drops, close-tail,
+  global_rx pressure, and QUIC loss/blocking are clean.
+
+## 2026-07-09 - SSH TTY must be tool-writable before sudo suites
+
+- Stage: Knife14h10/H10d15 Gate A launch.
+- Symptom: running `ssh -tt ... sudo -v ...` without tool-level `tty=true`
+  reached the sudo prompt, but `write_stdin` reported stdin was closed and
+  could not enter the password.
+- Impact: the first suite launch had to be interrupted with Ctrl-C and rerun.
+- Correct behavior: for any suite that may invoke `sudo -v`, start the
+  `exec_command` with both remote `ssh -tt` and tool `tty=true` from the
+  beginning. Never put sudo passwords in commands, files, docs, logs, or
+  summaries.
+
+## 2026-07-09 - H10d15 passes 100M capacity but is not clean final acceptance
+
+- Stage: Knife14h10/H10d15 native permit read floor Gate A.
+- Artifact:
+  `/tmp/conn/mvpn_knife14h10d15_native_read_floor_gatea_usclient_suite_20260710_070433.tar.gz`
+- Local copy:
+  `/tmp/mini_vpn_knife14h10d15_native_read_floor/mvpn_knife14h10d15_native_read_floor_gatea_usclient_suite_20260710_070433.tar.gz`
+- Positive result: reverse-first P1 reached `sender=186 Mbit/s` and
+  `receiver=185 Mbit/s`, proving the native read floor plus D6 bounded permit
+  queue can exceed `100M+`.
+- Acceptance blocker: after the high-throughput window, TUN egress reported
+  `tx_dropped_delta=229`, `global_rx_paused=true`, and the data handle closed
+  through `dead_slot_reap` with `close_egress_class=terminal_closed_no_send`,
+  `close_egress_bytes=327272`, and `send_queue=327272`. QUIC also showed
+  `rx_blocked(stream=1)` near the tail, though loss/congestion stayed zero.
+- Correct behavior: do not call H10d15 the final accepted fix yet. Next stage
+  must make the high-throughput path drop-aware/close-clean and then repeat
+  reverse-first `>100M` at least twice with `tx_dropped_delta=0`,
+  no dead-slot close-tail blocker, and clean close accounting.
+
+## 2026-07-09 - Pre-D16 staged tree is not self-contained on HEAD dependencies
+
+- Stage: H10d16 first-commit baseline verification.
+- Symptom: the current mixed working tree passed `518` lib tests, but an
+  archive of only the approved staged TCP/TUN files failed to compile at two
+  TUIC `SendStream::finish` call sites.
+- Root cause: the existing pre-D16 `src/tuic.rs` diff targets Quinn `0.11`,
+  while HEAD still declares Quinn `0.10`. The uncommitted dependency upgrade
+  also changes rustls and overlaps separate QUIC/REALITY work.
+- Correct behavior: verify the staged tree independently before committing a
+  dirty baseline. Do not widen a TCP/TUN commit to Cargo/QUIC/REALITY merely to
+  make it compile. Preserve the working tree and continue uncommitted only
+  after explicit user approval.
+
+## 2026-07-10 - D16 terminal publication preceded pending-read refund
+
+- Stage: H10d16 Task 10 lifecycle review.
+- Symptom: the deterministic writer-error test observed the owned queue closed
+  while `reserved_bytes=65536`; the supervisor sent terminal events before it
+  cancelled the reader task holding that reservation.
+- Risk: terminal close could race a second reader-produced event, and local
+  lifecycle code could observe a closed relay before the byte ledger was closed.
+- Correct behavior: on supervisor-owned terminal paths, stop and join the Quinn
+  read owner first, verify RAII reservation refund, then publish readiness/close
+  in order. Await Tokio `JoinHandle`s through `&mut` when later structured
+  cleanup still references the handle; consuming the handle creates a Rust
+  ownership error even when a runtime boolean makes the later branch unreachable.
+
+## 2026-07-10 - D16 Gate A stalled before the reverse data stream
+
+- Stage: H10d16 Task 11 single Gate A.
+- Symptom: iperf emitted no interval samples and timed out. The first remote
+  byte arrived in `3ms`, was actor-admitted and TUN-flushed, but the stream then
+  had a `39995ms` read gap and closed with only `2` received bytes.
+- Rejected roots: direct path capacity (`277 Mbit/s` reverse baseline), TUIC
+  auth/connect, QUIC loss/congestion/blocking, actor bypass, send-slice/flush
+  errors, queue pressure, and TUN qdisc drops were clean.
+- Correct behavior: do not tune VPS, MTU, QUIC windows, pool, chunk size, or
+  self-wake. First add a deterministic bidirectional seam proving that a D16
+  response flushed to TUN is followed by local ACK/control ingestion and relay
+  writer progress.
+- Operational failure: server-evidence collection disconnected the SSH session
+  while reading the target clock. The suite cleanup succeeded and the bundle
+  was preserved; future collectors must bound each cross-host evidence command
+  so evidence failure cannot terminate the parent suite session.
+- Local confirmation: the two-smoltcp red test reproduced the stall when the
+  post-flush async TUN wait edge was suppressed. Reusing the existing bounded
+  active-flow TUN RX follow-up made the second control message round-trip in
+  about `20ms`; future D16 composition changes must keep this test green.
+
+## 2026-07-10 - D16 real Quinn read stayed pending while stream frames accumulated
+
+- Stage: H10d16 explicitly authorized replacement Gate A.
+- Symptom: the data connection accumulated thousands of Quinn stream frames
+  and filled its receive window while the D16 ordered reader showed a
+  `20001ms` poll gap and no first chunk until `20004ms`. Iperf receiver stayed
+  at zero and close left both pending and smoltcp egress bytes.
+- Rejected roots: target/exit service state, direct path capacity, TUIC
+  connect/auth, QUIC loss/congestion, TUN qdisc drops, actor bypass, and byte
+  ledger leaks. The final queue was closed and exactly empty.
+- Correct behavior: add a real Quinn delayed-readability red test at the direct
+  adapter, then a reservation/feedback test around `run_d16_native_reader`.
+  Preserve one owner, bounded ordered read, cancellation refund, and
+  readiness-only queueing; do not mask the defect with a periodic self-wake.
+- Confirmed root: the real Quinn adapter test passed. Running feedback had
+  subtracted the pending read's own full-capacity reservation, published pause,
+  cancelled/refunded the read, and then had no readiness event to publish
+  resume. Running feedback must include its own reservation as an already-armed
+  opportunity while leaving the ownership ledger unchanged.
+
+## 2026-07-10 - Target evidence SSH followed the active target TUN route
+
+- Stage: H10d16 replacement Gate A evidence collection.
+- Symptom: after the probe, the suite's SSH to the target host used the same
+  target `/32` route that was intentionally installed on `tun0`. It opened
+  extra D16 port-22 flows, the target clock command hung, and the parent SSH
+  eventually exited `255` even though cleanup restored the route and stopped
+  client-tun.
+- Correct behavior: never collect target management evidence directly through
+  the data-plane route under test. Use a bounded out-of-band path such as an
+  Exit-host ProxyJump, or defer target collection until the target route has
+  been restored. Evidence failure must remain isolated from suite cleanup and
+  bundle creation.
+- Local repair: known-topology Target evidence now uses an explicit bounded
+  Exit proxy carrying the Exit SSH identity and host-key options; every raw
+  evidence SSH command also has a `20s` outer timeout. Keep this suite self-test
+  green before another remote acceptance request.
+
+## 2026-07-10 - D16 Gate A froze in DrainOnly after global drop debt missed drain
+
+- Stage: H10d16 explicitly authorized credit-rearm Gate A.
+- Symptom: the data reader started in 3ms and the actor admitted 60,928,613
+  bytes, but a single `tx_dropped_delta=2029` event installed 122,727 bytes of
+  global drop debt. Feedback subsequently resumed at zero pressure, while both
+  D16 flows remained DrainOnly for 8,283 cycles and receiver throughput ended
+  at 12.2 Mbit/s over the timeout window.
+- Root cause: aggregate pressure fell from 994,674 bytes to zero between TUN
+  feedback samples. The only debt-payment path was a per-flow send-limit clock,
+  which did not observe that decrease. DrainOnly prohibited new admission, so
+  it also prohibited creation of a future queue decrease that could pay debt.
+- Secondary defect: the production adapter treats `Some(0)` completed drain as
+  `drain_progress=true`; this violates the positive-progress Recovery contract,
+  although active debt masked it in this run.
+- Correct behavior: add an exact red composition test, pay debt once from
+  measured drop-episode aggregate drain, propagate the same clean-drain edge to
+  eligible D16 flows, and require positive bytes for normal actor-cycle
+  recovery. Do not bypass debt, tune capacity/cadence parameters, rerun Gate A,
+  or start Gate B before local red/green and review are complete.
+
+## 2026-07-10 - Reverse-only TUN RX harness never opened the remote relay
+
+- Stage: H10d16 Task 11A bounded kernel-to-userspace TUN RX starvation harness.
+- Symptom: the new scenario timed out with `tcp_opens=0`, `received_bytes=0`,
+  zero modeled drops, and a one-packet ring high-water mark. Increasing runtime
+  scheduling interleave did not change the result.
+- Root cause: the TUN TCP path opens `open_tcp_relay` only after
+  `process_listener_activity` extracts the first local application payload;
+  SYN and handshake completion alone do not open the upstream. A generator
+  that waits for reverse data before sending any payload therefore cannot
+  reach the D16 reader/actor/TUN egress path.
+- Correct behavior: every deterministic reverse-first harness must send a
+  minimal bootstrap application payload, confirm one upstream open, and have
+  the mock consume that bootstrap without echoing it before measuring the
+  reverse payload and bounded TUN RX ring. Treat `tcp_opens=0` as a fixture
+  failure, never as a valid drop/starvation RED.
+
+## 2026-07-10 - TUN RX guard GREEN lacked proof of its recovery edges
+
+- Stage: H10d16 Task 11A bounded TUN RX starvation RED/GREEN.
+- Evidence: the calibrated 64 MiB, 64-packet stress reached ring capacity in
+  every five-run RED sample and recorded modeled drops in four runs. The first
+  backlog-latch implementation then completed the payload with zero modeled
+  drops in an observed failure, but still reached a high-water mark equal to
+  capacity; a five-run repeat was not uniformly green under the test's stricter
+  `high_water < capacity` assertion.
+- Diagnostic distinction: a ring becoming exactly full is risk evidence but
+  is not itself the Linux `tx_dropped` condition; the kernel increments the
+  counter when producing into the already-full `ptr_ring` fails. Removing the
+  high-water assertion alone would nevertheless create false confidence unless
+  the harness proves budget exhaustion latched the device-global pause and a
+  clean `WouldBlock` edge released it.
+- Correct behavior: expose backlog pause/resume edges, budget exhaustion, and
+  actor-bypass accounting in the integrated report. Require zero modeled drop,
+  complete delivery, zero actor bypass, at least one pause edge, and at least
+  one clean resume edge across repeats. Keep high-water diagnostic; if any
+  modeled drop remains, re-evaluate the seam instead of tuning ring size or
+  timing.
+
+## 2026-07-10 - Initial/final guard booleans lost a transient backlog episode
+
+- Symptom: an enlarged bounded drain could prove backlog and then reach clean
+  WouldBlock in the same call. Comparing only `active_before` and
+  `active_after` saw false→false, skipped the pause action, or left a flow in
+  DrainOnly without a recoverable edge.
+- Root cause: the guard already carried monotonic pause/resume generations, but
+  orchestration discarded them and classified only the final boolean state.
+- Superseded intermediate behavior: classifying the edge pair as an immediate
+  ForceDrainOnlyThenRecover action still allowed admission to reopen before
+  the flow's already-admitted bytes completed their ACK feedback.
+- Correct behavior: preserve the pause generation, but let the first clean
+  probe only arm recovery. Complete one admission-free ControlOnly poll/flush
+  epoch, then require a later independent clean probe. Recovery must still pass
+  each flow's own ACK-completion barrier.
+
+## 2026-07-10 - Per-call burst caps did not bound outstanding ACK feedback
+
+- Stage: H10d16 Task 11A stability closure after the first 20-run green.
+- Evidence: a nominal 48-payload-packet per-flush cap still failed the bounded
+  64-packet production seam (`run 4/50`, modeled drop `88`). Adding a per-flow
+  ACK barrier without a cumulative window could stall around `590 KiB` in
+  DrainOnly, and a 48-packet window that deducted existing `send_queue` still
+  produced a one-packet modeled drop in a repeat.
+- Root cause: a per-call cap is not an outstanding-byte cap; prior smoltcp
+  `send_queue` bytes survive into the next actor edge. The ring model can also
+  produce both an ACK and a window update for one payload packet, so the
+  original one-feedback-packet assumption had no safety margin.
+- Correct behavior: calculate available admission as an MTU-derived
+  24-payload-packet maximum minus the current per-flow smoltcp `send_queue`.
+  Keep the read reservoir and actor service target unchanged, and use up to
+  eight bounded cycles to reach the service target. Lock the production seam
+  to `max_tcp_payload_packets_per_flush <= 24` and require 50/50 complete,
+  zero-drop repeats before another VPS run.
+- Rejected alternatives: do not enlarge the modeled/kernel ring, tune MTU,
+  change Quinn windows, add self-wake, or impose a global all-flows-zero barrier
+  to hide this ownership error.
+
+## 2026-07-10 - Dropping a split duplex WriteHalf did not publish mock EOF
+
+- Symptom: the full reverse payload arrived with zero drop, but the D16 queue
+  retained exactly one 128 KiB pending-read reservation and local EOF never
+  became observable before timeout.
+- Root cause: the mock retained the duplex ReadHalf; dropping only the split
+  WriteHalf did not explicitly shut down the write direction, so the real D16
+  reader correctly remained pending instead of seeing EOF.
+- Correct behavior: deterministic EOF fixtures must call AsyncWrite shutdown
+  after their final byte. Then assert reservation refund, queue close/empty,
+  pending/inflight zero, local EOF, and terminal/close-tail zero through the
+  production actor seam.

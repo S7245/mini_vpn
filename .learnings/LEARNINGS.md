@@ -4470,3 +4470,1127 @@ worth cleaning up separately.
   `headroom_limited=0`, and `tcp-local-egress-service egress_drain_bytes=0`.
   The next slice must target ordered TUIC stream pending/read self-wake cadence
   directly.
+
+## 2026-07-09 - Knife14h4 ordered chunk adapter was not sufficient
+
+- Result doc:
+  `docs/tech/2026-07-09-knife14h4-ordered-chunk-results.md`
+- Experimental code:
+  local `src/tuic.rs` diff replacing the default ordered TUIC TCP read adapter
+  with `TuicOrderedRelayStream` backed by Quinn `read_chunk(max, true)`.
+- VPS bundle:
+  `/tmp/mini_vpn_knife14h4_ordered_chunk/mvpn_knife14h4_ordered_chunk_p1_usclient_suite_20260709_135541.tar.gz`
+- Outcome: local gates, remote focused gates, release build, and focused
+  reverse-first P1 ran. The H4 path was active (`relay_mode=ordered_chunk`),
+  but P1 reached only `17.1/15.7 Mbit/s`, below the `30 Mbit/s` first
+  threshold.
+- Useful progress: H4 reduced the worst data read gap versus Knife14hz from
+  about `5086ms` to `3685ms`, proving the ordered read adapter is a real seam.
+- Discriminator: throughput did not improve materially, while TUN drops,
+  global-rx pressure, local write pressure, pressure-credit debt,
+  headroom-limiting, close-tail pending, and QUIC loss/congestion/blocking all
+  stayed clean. Fresh/stale pending remained
+  (`fresh=9`, `stale=10`, `rx_no_stream_frames=2`).
+- Reusable rule: do not keep spending VPS runs on ordered chunk size, generic
+  read-vs-chunk adapter swaps, or self-wake timing alone. The next design must
+  explain the bursty remote delivery/read cadence under clean local and QUIC
+  counters before claiming a path to `>30M` or `100+M`.
+
+## 2026-07-09 - Knife14h5 reachability gate reframed the next slice as a continuous pump
+
+- Design doc:
+  `docs/tech/2026-07-09-knife14h5-continuous-pump-reachability.md`
+- Outcome: froze the HZ/H4 evidence and capacity math before coding. The
+  decisive observation is that mini_vpn already has enough nominal batch size
+  for `100+ Mbit/s`; the failing signal is multi-second active-flow
+  read/pending gaps under otherwise clean TUN, global-rx, local pressure,
+  close-tail, and QUIC counters.
+- Architecture rule: the next implementation must be a Rust-native equivalent
+  of sing-box's continuous per-flow download copy contract:
+  `QUIC read pump -> bounded per-flow byte queue -> smoltcp-owner drain`.
+  Remote reads should pause only for queue-full, EOF, cancellation, or hard
+  terminal lifecycle state, not for predictive headroom/debt credit in the
+  normal fast path.
+- Reusable rule: do not run another VPS suite or edit relay parameters before a
+  local tracer-bullet harness can prove active-window remote read gaps stay
+  below `50ms` while queue capacity exists. If that seam cannot be built, the
+  next task is seam extraction, not another throughput tweak.
+
+## 2026-07-09 - Knife14h6 added the continuous pump tracer-bullet harness
+
+- Result doc:
+  `docs/tech/2026-07-09-knife14h6-continuous-pump-harness-results.md`
+- Code:
+  `src/tcp_downlink_pump.rs`, exposed through `src/lib.rs`.
+- Outcome: Stage A from the H5 reachability gate is complete locally. The new
+  `ByteBoundedFlowQueue` and `ContinuousPumpProbe` model the target
+  `QUIC read pump -> bounded per-flow byte queue -> smoltcp-owner drain`
+  contract without wiring it into the product relay path yet.
+- Gates passed:
+  `cargo test -q tcp_downlink_pump`, `cargo fmt --check`, `cargo check -q`,
+  and `cargo test -q --lib` (`441` tests).
+- Useful proof: the tracer-bullet test simulates `30s` of `64KiB` reads every
+  `5ms` (`~104.9 Mbit/s`) and proves the model has no capacity-window read
+  gap above the read cadence. A separate `200ms` drain-stall test proves a
+  `4MiB` queue absorbs short local drain jitter without remote read gaps, while
+  a tiny-queue test proves pauses are explicit queue-full backpressure.
+- Reusable rule: Stage B may now implement the real async/product path, but
+  only behind a gate and only if it preserves the same invariant with real
+  waiters: when the byte queue can accept the planned read chunk, one remote
+  read future must remain armed. If that cannot be tested through
+  `run_relay_reader`, extract the seam first.
+
+## 2026-07-09 - Knife14h7 added the async byte-queue seam
+
+- Result doc:
+  `docs/tech/2026-07-09-knife14h7-async-byte-queue-results.md`
+- Code:
+  `src/tcp_downlink_pump.rs`.
+- Outcome: Stage B0 is complete locally. `AsyncByteBoundedFlowQueue` turns the
+  H6 pure model into a real async Rust primitive with byte-capacity waits,
+  async producer/consumer wakeups, `wait_read_len`, and close wakeups.
+- Gates passed:
+  `cargo test -q tcp_downlink_pump`, `cargo fmt --check`, `cargo check -q`,
+  and `cargo test -q --lib` (`446` tests).
+- Useful proof: a producer blocks only at byte-capacity full, draining bytes
+  wakes it, `wait_read_len` blocks while read capacity is zero and returns
+  available read size after drain, `recv_up_to` releases byte capacity, and
+  `close` releases full-queue producers with an explicit `Closed` error.
+- Limitation: the product path is still unchanged. `run_relay_reader` still
+  uses `RelayReadCredit`, and `RelayEvent::Data`/`SocketCtx.downlink_pending`
+  do not yet hold or release byte-capacity permits. Therefore H7 is a necessary
+  seam, not a throughput fix, and VPS acceptance would not exercise it.
+- Reusable rule: the next stage must be feature-gated product wiring with a
+  local test showing normal local-admission read-credit pauses no longer stop
+  remote reads while the byte queue has capacity. Do not run a VPS throughput
+  suite until that product-path invariant is proven locally.
+
+## 2026-07-09 - Knife14h8 wired a feature-gated continuous relay engine
+
+- Result doc:
+  `docs/tech/2026-07-09-knife14h8-continuous-pump-product-gate-results.md`
+- Code:
+  `src/client_tun.rs`, using `src/tcp_downlink_pump.rs`.
+- Outcome: Stage B1 is complete locally. `MINI_VPN_CONTINUOUS_TCP_RELAY=1`
+  selects a new `continuous_pump` relay engine. It uses
+  `run_relay_continuous_reader -> AsyncByteBoundedFlowQueue ->
+  run_continuous_relay_dispatcher -> RelayEvent::Data`, while legacy and thin
+  staging remain unchanged by default.
+- Gates passed:
+  `cargo test -q continuous_relay_reader`,
+  `cargo test -q tcp_relay_engine_selector`, `cargo test -q relay_task_diag`,
+  `cargo test -q relay_close_diag`,
+  `bash -n scripts/knife14b-usclient-tunnel-suite.sh`,
+  `bash scripts/knife14b-usclient-tunnel-suite.sh --self-test`,
+  `cargo fmt --check`, `cargo check -q`, `cargo test -q --lib`
+  (`450` tests), and `git diff --check`.
+- Useful proof: local product-path tests now prove paused normal
+  `RelayReadCredit` does not block ready remote bytes under the continuous
+  engine, and that the reader stops/resumes at the explicit byte-queue-full
+  edge. The async queue close/drain test locks that close stops new producer
+  work but still lets already queued bytes drain. The engine selector test
+  locks continuous-pump priority over thin staging when both experimental env
+  flags are set.
+- Observability: relay live/close diagnostics now include
+  `continuous_queue_wait_max_us` and `continuous_queue_wait_events`, plus a
+  `tcp-continuous-queue-wait` log when queue-capacity wait crosses the
+  threshold.
+- Suite support: the US-client VPS suite now exposes and explicitly forwards
+  `MINI_VPN_CONTINUOUS_TCP_RELAY` through `sudo -E env`, so a smoke run can
+  prove it is exercising the new engine instead of silently falling back to
+  legacy.
+- Remote prep: the minimal H8 file set was synced to `.27`; remote
+  `bash scripts/knife14b-usclient-tunnel-suite.sh --self-test`,
+  `cargo check -q`, `cargo test -q continuous_relay_reader`,
+  `cargo test -q tcp_relay_engine_selector`, and
+  `cargo test -q async_byte_queue_close_allows_draining_already_queued_bytes`
+  passed after using `bash -lc` for Cargo.
+- VPS status: the first reverse-first smoke did not reach mini_vpn or iperf.
+  It failed at the suite `sudo -v` preflight because the launch was non-TTY;
+  the follow-up `ssh -tt` probe asked for a sudo password and was interrupted
+  without entering one. Artifact
+  `/tmp/conn/mvpn_knife14h8_continuous_pump_p1_usclient_suite_20260709_173738.tar.gz`
+  is preflight-failure evidence only, not throughput evidence.
+- VPS result: after rerunning through a real TTY, H8 did reach the tunnel
+  window with `engine=continuous_pump`. Reverse-first P1 reached only
+  `30.7/29.6 Mbit/s` and the suite remained `FAILED`. Artifact:
+  `/tmp/conn/mvpn_knife14h8_continuous_pump_p1_usclient_suite_20260709_174648.tar.gz`;
+  local copy:
+  `/tmp/mini_vpn_knife14h8_continuous_pump/mvpn_knife14h8_continuous_pump_p1_usclient_suite_20260709_174648.tar.gz`.
+- Discriminator: `continuous_queue_wait_events=0` and
+  `continuous_queue_wait_max_us=101`, while data stream gaps remained high:
+  `data_read_gap_max_ms=3823`, `data_pending_gap_max_ms=3408`, and
+  `data_poll_gap_max_ms=3406`. The run also had clean `global_rx_pressure`,
+  `local_write_pressure`, TUN drops, close-tail pending, and QUIC
+  loss/congestion/blocking.
+- Interpretation: B1 falsified ordinary local `RelayReadCredit` as the main
+  remaining root. The continuous byte queue was active and not full, but TUIC
+  still reported `connection_stream_frames_pending` and multi-second active
+  data gaps. Continuous pump is useful as an opt-in diagnostic/product seam,
+  not an accepted throughput fix.
+- Limitation: B1 releases byte capacity when the dispatcher pops into
+  `RelayEvent::Data`; it does not yet hold capacity through
+  `SocketCtx.downlink_pending` until smoltcp/`flush_downlink` accepts the
+  bytes. Therefore B1 can test the remote-read clocking hypothesis, but it is
+  still not the full `QUIC read pump -> byte queue -> smoltcp-owner drain`
+  architecture.
+- Reusable rule: do not keep iterating on relay-reader read credit, chunk size,
+  self-wake timers, broad QUIC windows, VPS buffers, MTU/PLPMTUD, iperf3,
+  stale pool, or sing-box liveness for this branch. The next design must
+  explain the coupling between `tuic.rs` ordered-stream pending/read readiness
+  and `client_tun.rs` local downlink backpressure / `flush_downlink` /
+  `pressure_credit_debt` transitions.
+
+## 2026-07-09 - Knife14h9/D2 defines the stream-readiness x local-egress coupling gate
+
+- Design doc:
+  `docs/tech/2026-07-09-knife14h9-d2-stream-egress-coupling-design.md`
+- Outcome: design-only stage. No runtime code was changed. The D2 plan turns
+  the H8 failure into a falsifiable branch: correlate `tuic.rs` ordered stream
+  `poll/read/pending` cadence with `client_tun.rs` `downlink_backpressure`,
+  `flush_downlink`, `pressure_credit_debt`, headroom, and TUN flush transitions.
+- Key gate: D2 must first decide the H4 ordered-chunk state
+  (revert/default-off diagnostic gate) and add a per-flow timeline plus local
+  coupling harness before another canonical VPS acceptance.
+- Capacity rule: `100 Mbit/s` needs about one `64KiB` read every `5.2ms`; any
+  active-flow `poll/read/pending` gap above `500ms` is already incompatible
+  with a stable `100+ Mbit/s` design. Local harness gates should aim below
+  `50ms` under synthetic pressure.
+- Reusable rule: H8's byte queue proves reader-to-dispatcher capacity, not
+  end-to-end smoltcp/TUN admission. Do not interpret
+  `continuous_queue_wait_events=0` as proof that downstream local egress is
+  healthy; the permit lifetime currently ends at `RelayEvent::Data`, before
+  `SocketCtx.downlink_pending` and `flush_downlink`.
+
+## 2026-07-09 - Knife14h9/D2.0 gates H4 ordered chunk as diagnostic-only
+
+- Updated design doc:
+  `docs/tech/2026-07-09-knife14h9-d2-stream-egress-coupling-design.md`
+- Code:
+  `src/tuic.rs`,
+  `scripts/knife14b-usclient-tunnel-suite.sh`
+- Outcome: D2.0 is complete locally. TUIC TCP relay mode now reports
+  `ordered_join` for the default canonical path, `ordered_chunk` only when
+  `MINI_VPN_TUIC_TCP_ORDERED_CHUNK=1` is set, and
+  `unordered_reassembly_diag` for the existing unordered diagnostic. The suite
+  help/report/sudo launcher now preserves the new ordered-chunk diagnostic
+  flag.
+- Gates passed:
+  `cargo test -q tuic_tcp_relay_mode_defaults_to_ordered_join_and_gates_diagnostics --lib`,
+  `cargo test -q format_tuic_tcp_open_line_includes_target_pool_and_id --lib`,
+  `cargo test -q ordered_relay_stream_ --lib`,
+  `cargo test -q tuic_tcp_relay_mode --lib`,
+  `bash -n scripts/knife14b-usclient-tunnel-suite.sh`,
+  `bash scripts/knife14b-usclient-tunnel-suite.sh --self-test`,
+  `cargo fmt --check`, `cargo check -q`,
+  `cargo test -q tuic::tests:: --lib`, `cargo test -q --lib`
+  (`450` tests), and `git diff --check`.
+- Reusable rule: canonical D2 VPS evidence must show `relay_mode=ordered_join`
+  unless the run is explicitly marked as an H4 ordered-chunk diagnostic with
+  `MINI_VPN_TUIC_TCP_ORDERED_CHUNK=1`. This avoids mixing the rejected H4
+  adapter into future default-path conclusions.
+
+## 2026-07-09 - Knife14h9/D2.1a exposes the missing TUIC-to-local join key
+
+- Updated design doc:
+  `docs/tech/2026-07-09-knife14h9-d2-stream-egress-coupling-design.md`
+- Code:
+  `scripts/knife14b-lowrtt-probe.sh`,
+  `scripts/knife14b-usclient-tunnel-suite.sh`
+- Outcome: the low RTT probe now parses `tcp-stream-service-window` and emits
+  `stream_service_window` plus `d2_flow_timeline` summaries next to the
+  existing TUIC stream timing metrics. The parent VPS suite report preserves
+  those summaries and the raw `tcp-stream-service-window` lines.
+- Gates passed:
+  `bash scripts/knife14b-lowrtt-probe.sh --self-test`,
+  `bash -n scripts/knife14b-lowrtt-probe.sh scripts/knife14b-usclient-tunnel-suite.sh`,
+  `bash scripts/knife14b-usclient-tunnel-suite.sh --self-test`,
+  `cargo test -q stream_service_window_diag_line_includes_remote_and_local_progress --lib`,
+  `cargo fmt --check`, `cargo check -q`, `cargo test -q --lib`
+  (`450` tests), and `git diff --check`.
+- Key finding: existing logs cannot prove a per-flow causal timeline because
+  TUIC stream timing is keyed by `conn/id/stream`, while local stream-service
+  windows are keyed by `handle/epoch`. The D2 self-test therefore intentionally
+  reports `joinable=0 reason=missing_tuic_handle_epoch_bridge`.
+- Reusable rule: before another canonical VPS throughput run, add an
+  observability-only bridge from local `handle/epoch` to TUIC `conn/id/stream`
+  and require the parser self-test to reach `joinable=1`. Do not use
+  time-neighbor correlation alone to justify a throughput architecture change.
+
+## 2026-07-09 - Knife14h9/D2.1b adds an observability-only TUIC/local bridge
+
+- Updated design doc:
+  `docs/tech/2026-07-09-knife14h9-d2-stream-egress-coupling-design.md`
+- Code:
+  `src/upstream.rs`,
+  `src/client_tun.rs`,
+  `src/tuic.rs`,
+  `scripts/knife14b-lowrtt-probe.sh`
+- Outcome: local TCP `handle/epoch` is now passed to the TUIC `open_tcp`
+  diagnostic path through a task-local `TcpRelayOpenDiag`. `tuic-open-tcp`
+  lines include `handle=... epoch=...` only when the caller scopes the open
+  with that diagnostic context. The low RTT probe can now mark
+  `d2_flow_timeline: joinable=1 reason=joined_by_bridge` in the bridge
+  self-test.
+- Gates passed:
+  `cargo test -q tcp_relay_open_diag_context_is_task_scoped --lib`,
+  `cargo test -q format_tuic_tcp_open_line --lib`,
+  `bash scripts/knife14b-lowrtt-probe.sh --self-test`,
+  `bash -n scripts/knife14b-lowrtt-probe.sh scripts/knife14b-usclient-tunnel-suite.sh`,
+  `bash scripts/knife14b-usclient-tunnel-suite.sh --self-test`,
+  `cargo fmt --check`, `cargo check -q`, `cargo test -q --lib`
+  (`452` tests), and `git diff --check`.
+- Reusable rule: when a generic boxed stream boundary loses transport-specific
+  diagnostic identity, prefer a scoped observability context over changing the
+  stream data-plane type. The bridge must be tested at both ends: context
+  scoping in Rust and `joinable=1` in the log parser.
+- Next discriminator: a focused canonical VPS run should first prove real
+  reports contain bridged `tuic-open-tcp` lines and
+  `d2_flow_timeline: joinable=1`; only then interpret whether low throughput
+  aligns with local service-window/backpressure windows or remains a TUIC
+  readiness issue.
+
+## 2026-07-09 - Knife14h9/D2.1c VPS bridge gate joins the flow but throughput collapses
+
+- Updated design doc:
+  `docs/tech/2026-07-09-knife14h9-d2-stream-egress-coupling-design.md`
+- Remote bundle:
+  `/tmp/conn/mvpn_knife14h9_d2_bridge_p1_usclient_suite_20260709_190629.tar.gz`
+- Local bundle copy:
+  `/tmp/mini_vpn_knife14h9_d2_bridge/mvpn_knife14h9_d2_bridge_p1_usclient_suite_20260709_190629.tar.gz`
+- Outcome: the focused canonical VPS gate succeeded as an observability
+  discriminator and failed as throughput acceptance. Real logs showed bridged
+  `tuic-open-tcp` lines with `conn/id/stream` plus `handle/epoch`, and the
+  probe emitted `d2_flow_timeline: joinable=1 reason=joined_by_bridge`.
+- Throughput: reverse-first P1 was only `1.500/0.615 Mbit/s`
+  sender/receiver with `throughput_shape=no_data`.
+- Discriminator: data stream poll cadence was healthy
+  (`data_poll_gap_max_ms=4`), but reads and pending still had multi-second
+  gaps (`data_read_gap_max_ms=6837`, `data_pending_gap_max_ms=6010`) while
+  pending causes were fresh/stale connection stream-frame samples. QUIC
+  loss/congestion/blocking, TUN drops, global-rx pressure, pressure credit
+  debt, headroom limiting, TUN flush failures, and close-tail pending were all
+  clean in the summary.
+- Local side: stream-service windows were joined and active
+  (`stream_service_windows=1018`, `local_accepted_bytes_max=131072`), but
+  `local_egress_drain_bytes_max=0` and
+  `last_blocked_reason=local_admission_no_progress` point to a sharper
+  discriminator: separate actual TUN/smoltcp egress drain progress from merely
+  admitting bytes into the local TCP send queue.
+- Reusable rule: after D2.1c, do not describe the root as "relay task not
+  polling." The stream is polled frequently. The next stage must explain why a
+  frequently polled Quinn stream remains pending with connection-level stream
+  frames present, and whether those frames belong to the joined stream or are
+  unrelated connection traffic.
+
+## 2026-07-09 - Knife14h9/D2.2a makes the joined-flow discriminator falsifiable
+
+- Updated design doc:
+  `docs/tech/2026-07-09-knife14h9-d2-stream-egress-coupling-design.md`
+- Code:
+  `scripts/knife14b-lowrtt-probe.sh`,
+  `scripts/knife14b-usclient-tunnel-suite.sh`
+- Outcome: the low RTT parser now emits `tuic_stream_frame_delta` from
+  `conn_rx_stream_frames_since_read` and
+  `conn_rx_stream_frames_since_pending`, emits aggregate
+  `local_egress_service`, and includes `local_egress_drain_bytes_max` in
+  `d2_flow_timeline`. The parent suite preserves the new summary/raw metrics.
+- Gates passed:
+  `bash scripts/knife14b-lowrtt-probe.sh --self-test`,
+  `bash scripts/knife14b-usclient-tunnel-suite.sh --self-test`,
+  `bash -n scripts/knife14b-lowrtt-probe.sh scripts/knife14b-usclient-tunnel-suite.sh`,
+  `cargo fmt --check`, `cargo check -q`, `cargo test -q --lib`
+  (`452` tests), and `git diff --check`.
+- Re-summarized artifact:
+  `/tmp/mini_vpn_knife14h9_d2_bridge/d2_2a_resummary.md`
+- Key finding from the existing D2.1c bundle: the joined data stream had
+  `data_poll_gap_max_ms=4` and fresh connection stream-frame deltas
+  (`conn_rx_stream_frames_since_pending_max=1201`,
+  `fresh_nonzero_since_pending=10`), but local egress drain remained absent
+  (`local_egress_drain_bytes_max=0`,
+  `local_egress_service.egress_drain_bytes_max=0`) while local admission still
+  reached `131072` bytes.
+- Reusable rule: a future throughput design must improve or explain one of
+  three primary discriminators: local egress drain progress, delivery of fresh
+  connection stream frames to the joined data stream, or proof that those fresh
+  frames are unrelated to the joined stream. Poll cadence alone is no longer a
+  sufficient acceptance signal.
+
+## 2026-07-09 - Knife14h9/D2.2b proves same-stream offset gaps but not a fix
+
+- Updated design doc:
+  `docs/tech/2026-07-09-knife14h9-d2-stream-egress-coupling-design.md`
+- Code:
+  `src/client_tun.rs`,
+  `scripts/knife14b-lowrtt-probe.sh`,
+  `scripts/knife14b-usclient-tunnel-suite.sh`
+- Remote bundle:
+  `/tmp/conn/mvpn_knife14c_usclient_suite_20260709_193528.tar.gz`
+- Local bundle copy:
+  `/tmp/mini_vpn_knife14h9_d2_2b_unordered_diag/mvpn_knife14c_usclient_suite_20260709_193528.tar.gz`
+- Outcome: D2.2b fixed a local egress observability blind spot and ran one
+  focused `unordered_reassembly_diag` VPS discriminator. Throughput remained
+  low (`18.400/17.500 Mbit/s`), so the diagnostic path is not an accepted fix.
+- Key evidence: the joined TUIC stream itself produced out-of-order chunks:
+  initial `next_offset=0 chunk_offset=14102 gap_bytes=14102`, later
+  `max_gap_bytes=1169774`, `max_buffered=1057134B`,
+  `unordered_chunks=47070`, `out_of_order_chunks=30287`, `cap_hits=0`.
+  This proves fresh connection stream-frame samples can belong to the joined
+  data stream; they are not only unrelated connection noise.
+- Local egress reinterpretation: the corrected snapshot showed nonzero drain
+  (`stream_service_window.local_egress_drain_bytes_max=9215`,
+  `local_egress_service.egress_drain_bytes_max=672066`), so D2.2a's
+  zero-drain result was an observability false negative. It is still too small
+  to explain a healthy `100+ Mbit/s` pipeline.
+- Sing-box contrast: official sing-box `f3b0c77` uses a TUIC `net.Conn` and
+  two independent copy goroutines via `route/conn.go` and
+  `bufio.CopyWithIncreateBuffer`; mini_vpn still spreads reverse data across
+  TUIC read task, global queue, TUN/smoltcp main loop, downlink pending,
+  `flush_downlink`, dirty handles, and local egress service.
+- Reusable rule: the next plausible design is a bounded per-flow copy contract
+  with a pure same-stream reassembly state machine, explicit downstream
+  permits, and lifecycle/half-close accounting. Do not present
+  `MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY=1` as a product fix; use it as a
+  discriminator until the bounded contract passes local TDD and the VPS
+  `>30 Mbit/s` first gate with sub-`500ms` active data gaps.
+
+## 2026-07-09 - Knife14h9/D2.3 permit pump falsified early queue-release as sufficient root
+
+- Updated design doc:
+  `docs/tech/2026-07-09-knife14h9-d2-stream-egress-coupling-design.md`
+- Code:
+  `src/tcp_downlink_pump.rs`, `src/client_tun.rs`, `src/lib.rs`,
+  `scripts/knife14b-lowrtt-probe.sh`,
+  `scripts/knife14b-usclient-tunnel-suite.sh`
+- Remote bundle:
+  `/tmp/conn/mvpn_knife14h9_d23_permit_p1_retry1_usclient_suite_20260709_202637.tar.gz`
+- Local copy:
+  `/tmp/mini_vpn_knife14h9_d23_permit_p1/mvpn_knife14h9_d23_permit_p1_retry1_usclient_suite_20260709_202637.tar.gz`
+- Outcome: local gates passed, but VPS reverse-first P1 failed badly:
+  sender `0.699 Mbit/s`, receiver `0.489 Mbit/s`.
+- Key evidence: `permit_pump` and `unordered_reassembly_diag` were active, and
+  downstream permits were not stuck (`downstream_permit_bytes=1867790`,
+  `downstream_permit_released_bytes=1867790`). Local pressure stayed clean
+  (`global_rx_pressure=0`, `downlink_backpressure=0`,
+  `pressure_credit_debt_bytes=0`, `headroom_limited=0`,
+  `tun_flush_deferred=0`), TUN drops were `0/0`, QUIC loss/congestion/blocking
+  were `0`, and close-tail pending was `0`.
+- Falsified branch: returning queue capacity at dispatcher pop was a real
+  architectural weakness, but not the sufficient root for the current
+  `15-30 Mbit/s` ceiling. The first gate failed with
+  `data_read_gap_max_ms=6836` and `data_pending_gap_max_ms=6006` while
+  `data_poll_gap_max_ms=3`.
+- Reusable rule: do not tune D2.3 permit queue size, permit release cadence, or
+  read-credit coupling next. The next design must isolate TUIC/Quinn stream
+  readiness and same-stream reassembly ownership below `client_tun.rs`; the
+  proof target is continuous contiguous output from the joined TUIC stream
+  before local admission is allowed to be blamed again.
+
+## 2026-07-09 - Knife14h9/D2.4 raw TUIC sink proves 100M transport capacity
+
+- Updated design doc:
+  `docs/tech/2026-07-09-knife14h9-d2-stream-egress-coupling-design.md`
+- Code:
+  `src/main.rs` diagnostic mode
+  `mini_vpn tuic-tcp-sink-probe <host:port> [duration_secs]`
+- Local gates:
+  `cargo fmt --check`, `cargo test -q --bin mini_vpn`,
+  `cargo test -q --lib`, and `cargo check -q`.
+- VPS diagnostic: `.77` iperf3 was briefly stopped, a one-shot byte source was
+  bound to the already-open `.77:5201`, and iperf3 was restarted and confirmed
+  active/listening afterward.
+- Result: with `MINI_VPN_TUIC_TCP_POOL=1`,
+  `MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY=1`, and a 30s raw sink read,
+  mini_vpn received `477101276` bytes at `127.227 Mbit/s`; first receive was
+  `3ms`, max read gap was `196ms`, and EOF was false. The target byte source
+  reported `481820672` sent bytes.
+- Conclusion: mini_vpn's Rust/TUIC/Quinn TCP receive path has demonstrated
+  `100+ Mbit/s` capacity on the same `.27 -> .33 -> .77` route. The persistent
+  reverse-first low throughput is now attributed to the local TCP/TUN egress
+  architecture, not to raw TUIC stream read capacity, VPS buffers, MTU/PLPMTUD,
+  stale pools, sing-box, iperf3, or broad QUIC windows.
+- Reusable rule: the next throughput design should preserve the D2.4 raw-stream
+  cadence through local admission, smoltcp/TUN egress, lifecycle, and bounded
+  backpressure. Do not spend the next stage on chunk-size/self-wake/permit-size
+  tuning unless new counters contradict this gate.
+
+## 2026-07-09 - Knife14h10/H10a created executable TCP/TUN egress actor contract
+
+- Added spec:
+  `docs/tech/2026-07-09-knife14h10-tcp-tun-egress-actor-spec.md`
+- Added pure contract model:
+  `src/tcp_egress.rs`
+- Exported module:
+  `src/lib.rs`
+- Outcome: no production hot-path behavior changed. The new model defines the
+  intended egress actor semantics before wiring it into `client_tun.rs`.
+- Local gates passed:
+  `cargo test -q tcp_egress --lib`, `cargo fmt --check`,
+  `cargo check -q`, `cargo test -q --lib`, and `git diff --check`.
+- New tests cover five invariants: repeated backlog admission until window
+  target, drain-then-admit in the same service window, no-progress preserving
+  pending/lease bytes, explicit drop releasing lease bytes, and rejecting zero
+  budgets before service starts.
+- Reusable rule: the next implementation step should be H10b branch-by-
+  abstraction: wrap existing `flush_downlink`/pending/permit behavior behind a
+  production-facing facade that matches `TcpEgressFlowModel`, while keeping
+  default behavior unchanged. Do not jump straight to a VPS run until the
+  facade proves the same ownership and wake invariants locally.
+
+## 2026-07-09 - Knife14h10/H10b extracted pending/permit facade without switching runtime behavior
+
+- Updated spec:
+  `docs/tech/2026-07-09-knife14h10-tcp-tun-egress-actor-spec.md`
+- Code:
+  `src/tcp_egress.rs`, `src/tcp_downlink_pump.rs`, `src/client_tun.rs`
+- Outcome: added `TcpEgressLease`, `TcpEgressPendingQueueView`,
+  `TcpEgressPendingSnapshot`, `TcpEgressPendingAppend`, and
+  `TcpEgressPendingConsume`; implemented `TcpEgressLease` for
+  `DownstreamBytePermit`; routed `SocketCtx` append/consume/clear through the
+  facade while keeping external callers and default control flow unchanged.
+- New local invariants: append retains only payload-sized lease, prefix consume
+  releases only admitted bytes, zero consume/no-progress releases nothing, and
+  clear/drop releases all remaining lease.
+- Gates passed:
+  `cargo test -q tcp_egress --lib`, `cargo test -q --lib`,
+  `cargo fmt --check`, `cargo check -q`, and `git diff --check`.
+- Reusable rule: H10c can now add a feature-gated actor using the facade rather
+  than editing every `downlink_pending` call site at once. The next local gate
+  should prove immediate backlog service and external-readiness waits before
+  any VPS run.
+
+## 2026-07-09 - Knife14h10/H10c added the feature-gated local egress actor entry
+
+- Updated spec:
+  `docs/tech/2026-07-09-knife14h10-tcp-tun-egress-actor-spec.md`
+- Code:
+  `src/client_tun.rs`
+- Outcome: added opt-in `MINI_VPN_D3_EGRESS_ACTOR=1`; default remains disabled.
+  In actor mode, remote payload handling now appends bytes and downstream
+  permits into `downlink_pending`, records remote progress, and returns without
+  inline `flush_downlink`/`send_slice`/TUN flush calls.
+- Local ownership proof: the production call site still marks a flow dirty when
+  pending bytes remain, and `should_drain_tun_rx_after_remote_payload` treats
+  pending bytes as immediate local-egress work even when actor mode returns
+  `accepted_bytes=0`. This preserves the single smoltcp/TUN owner while
+  bypassing the old remote-payload inline writer.
+- Observability: `tcp-local-egress-service` now includes actor-subset counters:
+  `egress_actor_windows`, `egress_actor_cycles`,
+  `egress_actor_admitted_bytes`, `egress_actor_drain_bytes`,
+  `egress_actor_no_progress`, `egress_actor_immediate_wake`, and
+  `egress_actor_external_wait`.
+- Gates passed:
+  `cargo test -q d3_egress_actor --lib`,
+  `cargo test -q local_egress_service_diag_reports_egress_actor_subset --lib`,
+  `cargo test -q tcp_egress --lib`, `cargo test -q --lib` (`471` tests),
+  `cargo fmt --check`, `cargo check -q`, and `git diff --check`.
+- Reusable rule: H10c is not a throughput proof. It is the first executable
+  actor wiring slice that makes H10d VPS first-gate evidence meaningful. If H10d
+  fails, compare actor `immediate_wake`, admitted/drain bytes, no-progress, and
+  external-wait counters before changing TUIC read cadence, chunk size, VPS
+  config, MTU, or queue sizes.
+
+## 2026-07-09 - Knife14h10/H10d proved D3 actor can exceed 100M but did not pass clean acceptance
+
+- Updated spec:
+  `docs/tech/2026-07-09-knife14h10-tcp-tun-egress-actor-spec.md`
+- Code exercised:
+  `src/client_tun.rs`, `src/tcp_egress.rs`, `src/tcp_downlink_pump.rs`,
+  `src/lib.rs`, `scripts/knife14b-usclient-tunnel-suite.sh`
+- Remote bundle:
+  `/tmp/conn/mvpn_knife14h10c_d3_actor_p1_usclient_suite_20260709_215654.tar.gz`
+- Local copy:
+  `/tmp/mini_vpn_knife14h10c_d3_actor/mvpn_knife14h10c_d3_actor_p1_usclient_suite_20260709_215654.tar.gz`
+- Outcome: `MINI_VPN_D3_EGRESS_ACTOR=1` was active and reverse-first P1 reached
+  `iperf_receiver_mbps=102.000`; the interval profile showed
+  `overall_avg_mbps=170.172` and `prefix_avg_mbps=189.130`.
+- Actor proof: `egress_actor_admitted_bytes=620309763`,
+  `egress_actor_drain_bytes=139651239`, and
+  `egress_actor_immediate_wake=31938`. This is the first Knife14 run where the
+  mini_vpn local TCP/TUN path demonstrates `100+ Mbit/s` capability on the
+  `.27 -> .33 -> .77` route.
+- Non-roots stayed non-root: QUIC loss/congestion/blocking remained clean
+  (`max_lost_bytes_delta=0`, `max_congestion_events_delta=0`, no tx/rx blocked
+  deltas), and global/local channel pressure stayed clean.
+- Not accepted yet: the iperf command exited by timeout (`exit=124`) and the
+  tail had `tun_tx_dropped_delta=97`, `pending_at_close=421577`, and
+  `terminal_pending_reap=421577`.
+- Reusable rule: D3 actor answers the architecture-capacity question: yes,
+  mini_vpn can exceed `100M` when remote payload inline flush is removed and
+  local egress is serviced by the smoltcp/TUN owner. The next work is not more
+  TUIC chunk/read-credit/VPS tuning; it is close-tail and TUN egress-drop
+  cleanup under the now-high-throughput actor path.
+
+## 2026-07-09 - Knife14h10/H10d2 added actor clean-headroom local pacing
+
+- Updated spec:
+  `docs/tech/2026-07-09-knife14h10-tcp-tun-egress-actor-spec.md`
+- Code:
+  `src/client_tun.rs`
+- Outcome: D3 actor flows now mark their downlink path as clean-headroom-only
+  after remote payload bytes are appended into `downlink_pending`. In that
+  mode, `flush_downlink` does not spend `DownlinkEgressClock` drain credit past
+  `tx_queue_flush_threshold`; legacy/default behavior still spends drain credit
+  up to the old credit edge.
+- Lifecycle proof: `rearm_socket` clears the clean-headroom flag, so the actor
+  pacing policy cannot leak from one flow into the next.
+- Local proof: added a policy test showing legacy credit reaches
+  `tx_queue_credit_spend_threshold` while D3 actor clean-headroom leaves the
+  same bytes pending at `tx_queue_flush_threshold`.
+- Gates passed:
+  `cargo test -q d3_actor_clean_headroom_policy_does_not_spend_drain_credit_to_credit_edge --lib`,
+  `cargo test -q d3_egress_actor --lib`, `cargo test -q tcp_egress --lib`,
+  `cargo test -q --lib` (`472` tests), `cargo check -q`,
+  `cargo fmt --check`, and `git diff --check`.
+- Reusable rule: after H10d, the target is not more raw throughput; it is
+  keeping the high-throughput actor path below local TUN/qdisc drop pressure.
+  The next VPS run should falsify this directly: if `tun_tx_dropped_delta`,
+  `pending_at_close`, and `terminal_pending_reap` do not fall to `0`, the
+  bottleneck is not remote-read cadence or legacy credit edge alone.
+
+## 2026-07-09 - Knife14h10/H10d2 VPS falsified pure clean-headroom actor pacing
+
+- Remote bundle:
+  `/tmp/conn/mvpn_knife14h10d2_actor_clean_headroom_usclient_suite_20260709_221940.tar.gz`
+- Local copy:
+  `/tmp/mini_vpn_knife14h10d2_actor_clean_headroom/mvpn_knife14h10d2_actor_clean_headroom_usclient_suite_20260709_221940.tar.gz`
+- Outcome: with `MINI_VPN_D3_EGRESS_ACTOR=1`, reverse-first P1 regressed to
+  `sender=11.6 Mbit/s` and `receiver=9.72 Mbit/s`.
+- What improved: `tun_tx_dropped_delta=0`, `pending_at_close=0`, and
+  `terminal_pending_reap=0`.
+- What broke capacity: the actor path planned no drain credit
+  (`drain_credit_planned_bytes=0`), capped `send_queue_max` at `449999`,
+  and accumulated `headroom_limited_calls=13881` /
+  `headroom_deferred_bytes=16864356`. H10d had used credit up to
+  `send_queue_max=557386`, accepted `620309763` actor bytes, and reached
+  `100M+`, but paid with a qdisc drop and terminal pending.
+- Reusable rule: the accepted H10 design cannot be "no credit above clean
+  headroom." It needs a hybrid actor policy: keep a single local egress owner,
+  but spend bounded, recent-drain-backed credit above clean headroom, with fast
+  drop/hard-pause backoff. Do not continue with pure clean-headroom-only as a
+  product fix.
+
+## 2026-07-09 - Knife14h10/H10d3 added actor hybrid target-edge credit
+
+- Updated spec:
+  `docs/tech/2026-07-09-knife14h10-tcp-tun-egress-actor-spec.md`
+- Code:
+  `src/client_tun.rs`
+- Outcome: D3 actor flows now use `ActorHybridCredit`: they can spend recent
+  `DownlinkEgressClock` drain credit above clean headroom, but only up to
+  `tx_queue_egress_target_threshold`. Legacy/default flows still use the old
+  credit edge, while the pure clean-headroom policy remains test-only as the
+  H10d2 rejected discriminator.
+- Drop safety: active TUN drop debt blocks actor drain-credit planning and
+  forces actor admission back to clean headroom. Close-drain terminal expansion
+  remains legacy-only.
+- Local proof: added focused tests for target-edge actor credit and drop-debt
+  backoff.
+- Gates passed:
+  `cargo test -q d3_actor_hybrid_policy --lib`,
+  `cargo test -q d3_egress_actor --lib`, `cargo test -q --lib` (`474` tests),
+  `cargo check -q`, `cargo fmt --check`, and `git diff --check`.
+- Reusable rule: H10d3 is the first local design after H10d2 that preserves both
+  sides of the requirement in code: bounded elasticity for `100M+` capacity and
+  an explicit drop-debt path back to clean headroom. The next VPS run should be
+  one focused reverse-first P1 with `MINI_VPN_D3_EGRESS_ACTOR=1`.
+
+## 2026-07-09 - Knife14h10/H10d3 target-edge actor hybrid was safe but not sufficient
+
+- Remote bundle:
+  `/tmp/conn/mvpn_knife14h10d3_actor_hybrid_target_usclient_suite_20260709_224720.tar.gz`
+- Local copy:
+  `/tmp/mini_vpn_knife14h10d3_actor_hybrid_target/mvpn_knife14h10d3_actor_hybrid_target_usclient_suite_20260709_224720.tar.gz`
+- Outcome: `MINI_VPN_D3_EGRESS_ACTOR=1` reverse-first P1 reached
+  `sender=32.2 Mbit/s` and `receiver=29.8 Mbit/s`, improving over H10d2 but
+  still far below the `100M+` gate.
+- What worked: `tun_tx_dropped_delta=0`, `pending_at_close=0`, and
+  `terminal_pending_reap=0`; QUIC loss/congestion/blocking remained non-root.
+- What failed: local pressure/backpressure stayed active with
+  `send_queue_max=503692`, `pending_total_max=454619`,
+  `headroom_limited=18275`, `hard_edge_guard_limited=18275`, and
+  `pressure_credit_debt_bytes=122727`.
+- Reusable rule: target-edge hybrid is safe but still too conservative. The
+  next actor credit design must be more elastic than target-edge but retain
+  active-drop-debt clean-headroom backoff and legacy-only close-drain expansion.
+
+## 2026-07-09 - Knife14h10/H10d4 actor adaptive credit did not clear Gate A
+
+- Remote bundle:
+  `/tmp/conn/mvpn_knife14h10d4_actor_adaptive_credit_usclient_suite_20260709_231822.tar.gz`
+- Local copy:
+  `/tmp/mini_vpn_knife14h10d4_actor_adaptive_credit/mvpn_knife14h10d4_actor_adaptive_credit_usclient_suite_20260709_231822.tar.gz`
+- Outcome: `MINI_VPN_D3_EGRESS_ACTOR=1` reverse-first P1 reached
+  `sender=22.5 Mbit/s` and `receiver=20.6 Mbit/s`, below both H10d3
+  (`29.8 Mbit/s`) and the Gate A `>30M` target.
+- What worked: `tun_tx_dropped_delta=0`, `pending_at_close=0`, and
+  `terminal_pending_reap=0`; QUIC loss/congestion/blocking remained non-root.
+- What the run proved: the active limiter was not the target-to-credit actor
+  edge. `send_queue_max=390896` stayed below `tx_queue_flush_high=449999`,
+  with `headroom_limited=0`, `pressure_credit_debt_bytes=0`, and
+  `hard_edge_guard_limited=0`.
+- Remaining signal: TUIC data stream cadence still had multi-second gaps
+  (`data_read_gap_max_ms=3849`, `data_pending_gap_max_ms=3848`,
+  `data_poll_gap_max_ms=3394`) while local pressure, TUN drops, close-tail,
+  global_rx pressure, and QUIC path counters were clean.
+- Reusable rule: stop spending stages on actor credit threshold variants until
+  there is a discriminator for the TUIC data read/pending/poll gap under a
+  clean local egress path.
+
+## 2026-07-09 - Knife14h10/H10d15 native permit read floor proved 100M+ capacity
+
+- Code: `src/client_tun.rs`.
+- Local proof: added `native_tcp_read_service_floor_lifts_tiny_credit_only_when_enabled`
+  and `native_permit_relay_read_floor_services_full_quantum_from_tiny_credit`.
+  Focused native permit, D6 permit rearm, ordered permit clamp, `cargo check -q`,
+  suite self-test, and non-sandbox `cargo test -q --lib` all passed.
+- Remote bundle:
+  `/tmp/conn/mvpn_knife14h10d15_native_read_floor_gatea_usclient_suite_20260710_070433.tar.gz`
+- Local copy:
+  `/tmp/mini_vpn_knife14h10d15_native_read_floor/mvpn_knife14h10d15_native_read_floor_gatea_usclient_suite_20260710_070433.tar.gz`
+- Outcome: reverse-first P1 reached `sender=186 Mbit/s` and
+  `receiver=185 Mbit/s`, close to the mature sing-box client baseline and well
+  above the `100M+` capacity gate.
+- Mechanism proven: data flow used `engine=native_permit_pump` with
+  `native_read_floor=true`; D6 bounded permit ownership let remote QUIC reads
+  stay serviced while local egress drained permits. The maximum data-stream
+  read gap dropped to sub-second scale (`tcp-relay max_remote_read_gap_ms=420`,
+  `tuic max_read_gap_ms=564`) instead of the earlier multi-second H10d14 gap.
+- What stayed healthy during the main throughput window: QUIC loss and
+  congestion stayed zero, global_rx pressure stayed zero, local write pressure
+  stayed zero, and downlink pressure debt stayed zero.
+- Reusable rule: the missing architectural capability was not another VPS,
+  MTU, stale-pool, broad-window, or chunk-size tweak. mini_vpn needed a
+  sing-box-like separation where the native QUIC read side keeps a service-sized
+  drain into a bounded byte/permit queue, instead of letting transient local
+  read credit shrink the remote read service down to tiny ACK-sized chunks.
+- Not final acceptance yet: the same run ended with a TUN drop/dead-slot tail.
+  Treat H10d15 as the first strong capacity proof and proceed to stability
+  cleanup plus at least two clean `>100M` repeats before accepting the fix.
+
+## 2026-07-09 - H10d16 architecture approved after post-H10d15 code review
+
+- Approved source of truth:
+  `docs/tech/2026-07-09-knife14h10d16-byte-owned-egress-architecture-spec.md`
+  and
+  `docs/tech/2026-07-09-knife14h10d16-byte-owned-egress-implementation-plan.md`.
+- The review changed the next stage from a narrow drop-aware read-floor cleanup
+  into an end-to-end ownership closure. H10d15's independent read pump is kept,
+  but every Quinn read must reserve bytes before polling and commit them into
+  one per-flow leased queue.
+- The final actor contract requires readiness-only global events,
+  actor-exclusive D16 `send_slice`, and a `DrainOnly` state that stops new reads
+  and admission while continuing ACK/TUN RX, poll, flush, and permit release.
+- Reusable rule: a message-count bounded channel is not a sufficient byte bound
+  for high-concurrency transport payload, especially when the producer ignores
+  its requested maximum. Capacity permits must cover all payload staging from
+  the first transport read through terminal release.
+- Stage position remains stage 8: capacity is proven, but clean Gate A failed.
+  Reopen stages 3-7 locally before another VPS run; Gate A now requires one
+  clean `>150 Mbit/s` result and Gate B targets a clean three-run median near
+  `170 Mbit/s`.
+
+## 2026-07-09 - H10d16 Task 2 closed pre-read byte reservation locally
+
+- Code: `src/tcp_downlink_pump.rs`; reachability test: `src/tuic.rs`.
+- Outcome: `AsyncLeasedByteFlowQueue` now counts `reserved_bytes` before a
+  remote read can be armed. `ByteQueueReadReservation` refunds on drop/error,
+  rejects over-commit, converts only produced bytes into queued ownership, and
+  immediately refunds unused reservation capacity.
+- Conservation proof: focused tests cover reserve, commit, queue, lease,
+  partial release, and drop while asserting
+  `reserved + queued + leased <= capacity` throughout.
+- Review fix: `reserve_read_up_to` registers and enables its `Notify` waiter
+  before inspecting capacity, preventing a `notify_waiters` release from being
+  lost between mutex unlock and the first future poll.
+- Local gates: `7` reservation tests, `15` `tcp_downlink_pump` tests,
+  `cargo test -q --lib` (`525` tests), `cargo check -q`, `cargo fmt --check`,
+  `git diff --check`, and suite self-test all passed.
+- Commit status: intentionally uncommitted. A staged-tree check proved the
+  pre-D16 source baseline depends on separate Cargo/QUIC/REALITY working-tree
+  changes, so the user approved continuing local D16 work without broadening
+  commit scope.
+- Reusable rule: a byte reservation wait must close both safety and liveness:
+  count capacity before transport polling, release it by RAII, and register
+  capacity wakeups before checking the predicate.
+
+## 2026-07-09 - H10d16 Task 3 added a direct byte-bounded ordered reader
+
+- Code: `src/tuic.rs`, with the transport-neutral reader contract documented
+  in `src/upstream.rs`.
+- Outcome: `TuicNativeOrderedReader` polls one owner-held Quinn receive stream
+  directly through a cancel-safe ordered adapter. It has no nested payload
+  task, message-count channel, or shared `Arc<Mutex<RecvStream>>`.
+- Byte contract: a `128 KiB` caller limit reaches the adapter unchanged, an
+  oversized returned chunk is rejected, and ordered offsets must remain
+  contiguous from zero.
+- Pending contract: repeated polls operate on one pending read operation; no
+  second concurrent read is started while the first is pending.
+- Old-path audit: the H10d15 `TuicNativeOrderedPumpReader` and its channel stay
+  available only as pre-D16 diagnostic code. The new direct constructor is
+  intentionally not selected until the Task 9 D16 composition gate.
+- Local gates: four `d16_direct_ordered_reader` tests, legacy native ordered
+  tests, H4 ordered relay tests, all `80` TUIC tests, `cargo test -q --lib`
+  (`529` tests), check/fmt/diff, and suite self-test passed.
+- Reusable rule: ordered transport adapters should propagate the byte budget
+  to the actual read call and verify both length and offset at their boundary;
+  channel removal is necessary but not production-reachable until composition
+  selects the direct reader.
+
+## 2026-07-09 - H10d16 Task 4 made the per-flow queue readiness-owned
+
+- Code: `src/tcp_downlink_pump.rs` and the D16 composition seams in
+  `src/client_tun.rs`.
+- Outcome: the leased queue now has a nonblocking `Data / Empty / Closed` poll,
+  coalesced `wake_pending` state, and idempotent close readiness. `Closed` is
+  visible only after queued and reserved bytes are zero; leased bytes remain
+  accounted until the local egress path releases their permits.
+- Reader contract: the D16 reader reserves before polling, commits directly to
+  the per-flow queue, emits only `DataReady`, refunds a pending reservation when
+  read credit pauses, and turns clean transport EOF into queue closure rather
+  than a payload-bearing or clean terminal event.
+- Progress proof: four `64 KiB` remote chunks coalesce to one readiness event;
+  that event drives two `128 KiB` actor drains, after which observing open-empty
+  rearms the next wake. Ownership remains at or below the `512 KiB` flow cap.
+- Old-path audit: legacy `RelayEvent::Data` and the permit dispatcher remain for
+  diagnostics, while the D16 reader bypasses both. Production selection remains
+  deliberately deferred to the Task 9 composition gate.
+- Local gates: `8` D16 focused tests, `19` queue tests, `4` permit tests,
+  `cargo test -q --lib` (`534` tests), `cargo check -q`, format/diff checks, and
+  suite self-test all passed.
+- Reusable rule: readiness coalescing must be tied to observing the queue
+  predicate, not merely consuming an event. Otherwise one wake cannot safely
+  drive multiple bounded actor quanta or rearm after an exact-quantum drain.
+
+## 2026-07-09 - H10d16 Task 5 made D16 downlink admission actor-exclusive
+
+- Code: `src/client_tun.rs`, with a synchronous queue snapshot seam in
+  `src/tcp_downlink_pump.rs` for dirty-work retention.
+- Outcome: every downlink admission call now carries an explicit
+  `Legacy / EgressActor / ControlOnly` origin. D16 flows may reach the sole
+  `send_slice` primitive only through `EgressActor`; non-D16 flows normalize to
+  `Legacy` and preserve the existing behavior.
+- Accounting: per-flow and aggregate diagnostics expose exact
+  `actor_admitted_bytes` and `actor_bypass_admitted_bytes`; the local-egress
+  diagnostic line also reports the bypass total. Focused tests prove timer and
+  TUN control passes execute no admission, actor accepted bytes equal total D16
+  `send_slice` accepted bytes, and bypass remains zero.
+- Review fix: `DataReady` initially marked a D16 handle dirty, but a later
+  `ControlOnly` pass could remove it because legacy dirty retention inspected
+  pending/send-queue state only. Dirty retention now treats queued D16 bytes as
+  actor work until the actor drains them.
+- Old-path audit: there is one `tcp_socket.send_slice` call, inside
+  `flush_downlink`; both listener maintenance and legacy remote-payload fast
+  paths enter it through the origin gate. Legacy payload events remain
+  diagnostic-only for D16 and do not bypass the guard.
+- Local gates: the four planned D16 actor tests plus the dirty-retention test,
+  six D3 actor regressions, `cargo test -q --lib` (`540` tests), check/fmt/diff,
+  and suite self-test all passed.
+- Reusable rule: exclusive ownership requires guarding both the write primitive
+  and the scheduler predicate that keeps its work reachable; an origin enum
+  alone is insufficient if a control pass can discard readiness before the
+  owner runs.
+
+## 2026-07-09 - H10d16 Task 6 separated pressure pause from local drain
+
+- Code: pure phase/permission state machine in `src/tcp_egress.rs`; per-flow
+  phase, admission/read-credit coupling, and local-drain integration in
+  `src/client_tun.rs`.
+- Outcome: D16 now uses `Running -> DrainOnly -> Recovery`. Running permits up
+  to `512 KiB`; DrainOnly publishes read credit `paused/0` and blocks queue and
+  smoltcp admission while preserving TUN RX, `iface.poll`, `flush_tx`, and
+  permit release; Recovery caps each read/admission quantum at `128 KiB` and
+  requires four clean cycles before Running.
+- Pressure inputs: active drop debt, TUN hard pause, the per-flow smoltcp hard
+  pause edge, and terminal closed/no-send enter DrainOnly. Recovery begins only
+  below the low watermark after a successful local drain cycle and resets
+  immediately on renewed hard pressure or drop evidence.
+- Cancellation proof: a phase credit change remains in the pending Quinn-read
+  `select!`; entering DrainOnly cancels that future and refunds the pre-read
+  reservation before any later read can arm.
+- Review fixes: phase-non-Running flows remain dirty until recovery completes,
+  preventing an empty DrainOnly pass from losing the only future credit wake.
+  A successful poll/flush cycle counts as drain progress even when byte drain is
+  zero, so a clean idle flow cannot remain paused forever; failed flushes do not
+  advance recovery.
+- Observability: aggregate diagnostics expose current Running/DrainOnly/Recovery
+  flow counts, transition and recovery-reset counts, DrainOnly cycles, and
+  DrainOnly drain bytes.
+- Capacity reachability: the `128 KiB` Recovery quantum at the existing `5 ms`
+  service cadence is about `209.7 Mbit/s` before overhead, while Running can use
+  the available per-flow reservation up to `512 KiB`; this remains a plausible
+  sufficient path for the later `170 Mbit/s` gate rather than a timer-limited
+  necessary-only fix.
+- Local gates: `22` D16 tests, `15` `tcp_egress` tests, `6` D3 actor tests,
+  `cargo test -q --lib` (`548` tests), check/fmt/diff, and suite self-test all
+  passed.
+- Reusable rule: pressure feedback must disable production, not cleanup. A
+  drain-only state must keep the scheduler work item alive long enough to
+  publish bounded recovery credit after local egress becomes clean.
+
+## 2026-07-09 - H10d16 Task 7 ordered clean EOF behind owned bytes
+
+- Code: queue close/terminal-drop semantics in `src/tcp_downlink_pump.rs` and
+  D16 EOF/lifecycle integration in `src/client_tun.rs`.
+- Outcome: the D16 reader still emits only coalesced `DataReady` for clean EOF.
+  The actor installs `pending_relay_close(remote_eof)` only after observing the
+  queue closed with queued and reserved bytes at zero. Local FIN then waits for
+  both local pending bytes and TUN-inflight permit bytes to reach zero.
+- Half-close proof: a local `Finish` closes only the remote write half; the
+  attached reverse queue remains actor-drainable and retains exact permits.
+- Terminal proof: explicit local termination closes and drops queued bytes,
+  releases pending and inflight leases, and records their exact sum once.
+  The deterministic case released `128 KiB` (`64 KiB` queued plus `64 KiB`
+  leased); a second drop released and counted zero.
+- Epoch proof: rearm terminal-drops the old reservoir, detaches it, resets the
+  phase, increments the epoch, and rejects both old-epoch and new-epoch late
+  readiness while no D16 queue is attached.
+- Observability: periodic and close diagnostics include actor admitted/bypass
+  plus `permit_terminal_drop_bytes/events`; close taxonomy is captured before
+  ownership release so terminal-pending evidence is not erased by cleanup.
+- Local gates: the five planned D16 lifecycle tests, queue close/reservation and
+  idempotent terminal-drop tests, `cargo test -q --lib` (`556` tests),
+  check/fmt/diff, and suite self-test all passed.
+- Reusable rule: transport EOF is queue state, not an independent event. Make
+  it visible only after every preceding ownership state has either committed to
+  egress or been explicitly and exactly dropped.
+
+## 2026-07-09 - H10d16 Task 8 added the global budget and integrated harness
+
+- Code: shared byte budget in `src/tcp_downlink_pump.rs`, a feature-gated
+  production-seam flow driver in `src/client_tun.rs`, and deterministic
+  scenarios in `src/harness.rs`.
+- Outcome: every shared D16 reservation now counts against both the `512 KiB`
+  per-flow cap and a demand-allocated process budget whose default is `64 MiB`.
+  Commit moves global reservation to owned bytes; unused reservation, RAII
+  cancellation, TUN permit release, terminal queued drop, direct shared push,
+  and final queue Drop all refund the exact corresponding state.
+- Integrated capacity proof: `6000` virtual `5 ms` steps at `128 KiB` over
+  `30 s` delivered the full stream and clean EOF at about `209.7 Mbit/s`, with
+  actor bypass, simulated TUN drops, and close egress all zero. Per-flow high
+  water stayed below `512 KiB` and global high water below `64 MiB`.
+- Pressure/fairness proof: one DrainOnly flow stopped read/admission while
+  continuing drain; another flow sharing the budget still admitted data. A
+  saturated multi-flow budget kept all waiters pending without spinning, then
+  woke every waiter as other flows released ownership. Four clean cycles
+  restored Running after pressure cleared.
+- Review fix: the inherited direct `push()` path initially bypassed global
+  accounting. Shared queues now wait on both enabled flow/global notifications
+  and acquire global owned bytes before enqueue, preventing an alternate
+  insertion path or final Drop from corrupting another flow's ledger.
+- Local gates: `3` global-budget tests, `34` feature D16 tests,
+  `cargo test -q --lib` (`559` tests), full `cargo test -q --features harness`
+  (`564` library tests plus existing integration targets), normal/feature
+  checks, fmt/diff, and suite self-test all passed.
+- Reusable rule: a process cap is part of the ownership ledger, not a separate
+  advisory metric. Every insertion and every terminal/destructor path must move
+  both the per-flow and global counters together.
+
+## 2026-07-10 - H10d16 Task 9 exposed one complete runtime profile
+
+- Code: the single `MINI_VPN_H10D16_BYTE_OWNED_EGRESS=1` gate now selects the
+  direct ordered Quinn reader, process-shared byte budget, per-flow owned queue,
+  readiness-only relay, D16 actor, phase feedback, and EOF lifecycle without
+  requiring D3/D4/D5/D6/D15 flags.
+- Startup/suite contract: the client reports the fixed `512 KiB` per-flow cap,
+  `64 MiB` global cap, and `128 KiB` actor quantum. The US-client suite defaults
+  the gate off, documents it, exports it, records it in the environment summary,
+  and passes it through the actual `sudo -E env` launch without exposing secret
+  configuration.
+- Production reachability: `OpenedTcpRelay::NativeByteOwned` is returned only
+  by the D16 TUIC selector, attaches the shared owned queue at the socket epoch,
+  and emits `DataReady` rather than payload-bearing `RelayEvent::Data`. The
+  readiness branch immediately invokes the bounded local egress actor.
+- Focused proof: four `h10d16` configuration/composition tests passed, including
+  priority over older diagnostic flags and a mock native relay that attached the
+  queue, coalesced payload into one readiness event, and represented clean EOF
+  only by closed queue state.
+- Reusable rule: a product architecture profile must be one reproducible gate;
+  older experimental flags may remain available for diagnostics but cannot be
+  hidden prerequisites for the selected production path.
+
+## 2026-07-10 - H10d16 Task 10 local review closed terminal ordering
+
+- Review finding: on writer failure or idle timeout, the D16 supervisor closed
+  the queue and published terminal events before cancelling a pending reserved
+  Quinn read. A deterministic red test observed `reserved_bytes=65536` after
+  queue close, so terminal visibility did not yet imply a closed ownership
+  ledger and reader/supervisor producers could race.
+- Fix: terminal supervisor paths now stop and join the reader first. RAII refunds
+  the pending reservation, any prior readiness send finishes before the join,
+  and only then does the supervisor publish its single terminal `Closed` event.
+  The activity channel also disables its select branch after sender closure, so
+  reader completion cannot create an empty-channel hot loop.
+- Review result: every D16 Quinn read is preceded by a per-flow/global byte
+  reservation; `global_rx` carries readiness rather than D16 payload; the only
+  production `send_slice` remains behind actor-origin admission; DrainOnly keeps
+  poll/flush/permit release active; clean EOF waits for queue, pending, and
+  inflight ownership to drain; explicit terminal drop remains exact and
+  idempotent.
+- Final local gates: `36` D16 focused tests, normal library `564/564`, harness
+  library `569/569`, integration targets `2/2` and `10 passed` with `4` existing
+  non-D16 ignored tests, formatting/check/diff gates, and suite self-test all
+  passed.
+- Reusable rule: terminal publication is a ledger barrier. Cancel and join the
+  read owner before making terminal state visible; do not rely on queue close to
+  retroactively refund an in-flight reservation.
+
+## 2026-07-10 - H10d16 Gate A exposed a missing bidirectional harness seam
+
+- Artifact:
+  `/tmp/mini_vpn_knife14h10d16_byte_owned_gatea/mvpn_knife14h10d16_byte_owned_gatea_usclient_suite_20260710_133358.tar.gz`.
+- Outcome: the single reverse-first P1 had no throughput samples and timed out.
+  D16 reached its production selector, received the first remote byte in `3ms`,
+  admitted/flushed it with actor bypass and TUN drops both zero, then saw no
+  useful remote data for `39995ms`.
+- Cross-host proof: sing-box opened the target connection without path/auth
+  error; iperf3 accepted it and later reported client termination. QUIC loss,
+  congestion, and blocking were zero, so transport capacity was not exercised.
+- Local discriminator: the one-byte response was written to TUN and its permit
+  released, but the smoltcp socket still closed with `send_queue=1` and
+  `close_egress_bytes=1`. The target waited for the next iperf control message,
+  so the unproven seam is TUN flush -> local ACK/control -> relay writer.
+- Reusable rule: a reverse-throughput harness must first prove a bidirectional
+  control handshake. A one-way byte-owned capacity simulation can validate
+  ownership math while still missing the ACK/uplink loop required to start the
+  data stream.
+
+## 2026-07-10 - H10d16 bidirectional tracer closed the startup loop locally
+
+- Red proof: a full run-event-loop harness used two real smoltcp stacks and a
+  native byte-owned mock relay. After the first TCP payload flush it suppressed
+  the async TUN wait edge, matching Gate A's first-response/unacknowledged-tail
+  shape. The first response arrived and TCP opens stayed `1`, but the second
+  control message did not echo within `2s`.
+- Root cause: D16 readiness invoked the actor but omitted the existing bounded
+  active-flow TUN RX follow-up used by the legacy payload branch. Once the first
+  response was flushed and the flow left `dirty`, the ACK/control packet could
+  depend entirely on an async wait edge.
+- Green fix: useful D16 actor progress now arms the existing `10ms` active-flow
+  window. The same test completed the one-byte response plus `1532B` second
+  control round-trip intact in about `20ms`. No new timer, value change, D3
+  self-wake, MTU, QUIC, chunk, or capacity adjustment was introduced.
+- Observability: D16 relay close diagnostics now report writer progress
+  events/bytes, max writer wait, and final queued/leased/reserved ledger counts;
+  they never log payload.
+- Local gates: D16 focused feature tests `40/40`, normal library `564/564`,
+  feature library `570/570`, integration targets `2/2` and `10 passed` with `4`
+  existing non-D16 ignored tests, plus check/fmt/diff and suite self-test.
+- Reusable rule: after actor-owned downlink flush, keep bounded local ingress
+  service alive long enough to ingest its ACK/control consequence. Readiness
+  robustness must not depend on one cancellable async wait edge.
+
+## 2026-07-10 - H10d16 replacement Gate A isolated the real Quinn wake seam
+
+- Artifact:
+  `/tmp/mini_vpn_knife14h10d16_bidirectional_followup_gatea_local/mvpn_knife14h10d16_bidirectional_followup_gatea_usclient_suite_20260710_140124.tar.gz`.
+- Outcome: the authorized replacement `20s` reverse-first P1 completed with
+  `0.000 Mbit/s` receiver. Gate B was not started. TUN drops, actor bypass,
+  QUIC loss, and congestion were zero, but terminal pending was `106710B` and
+  close egress was `557386B`.
+- Progress over the first Gate A: the control flow received its first byte in
+  `3ms`, opened the second iperf data flow, made six writer-progress events,
+  and closed with an exact empty D16 queue ledger. The bidirectional startup
+  fix therefore moved the failure beyond the original one-byte control stall.
+- Decisive discriminator: the target sent `10.5 MiB` in its first second and
+  client Quinn metrics accumulated about `18.3 MiB` of receive traffic and
+  `7225` then `7692` stream frames, but the D16 data reader's first chunk did
+  not complete until `20004ms`. Once awake, it read about `800 KiB` in `596`
+  reads and the actor admitted about `693 KiB`.
+- Test-gap finding: the test named
+  `d16_direct_ordered_reader_keeps_one_pending_read_future` uses a mock whose
+  own `in_flight` bit persists across polls. It does not prove delayed wake and
+  re-poll behavior for the production Quinn `RecvStream` adapter.
+- Reusable rule: connection-level QUIC stream frames plus an application read
+  poll gap distinguish transport delivery from application read service. Lock
+  this boundary down with a real local Quinn delayed-write test before changing
+  any timer, self-wake, window, MTU, pool, or chunk parameter.
+
+## 2026-07-10 - H10d16 Running credit must include its own armed reservation
+
+- Real-Quinn discriminator: the exact direct ordered adapter woke and returned
+  payload written `20ms` after its first Pending poll. Quinn wake registration
+  was not the active root of the replacement Gate A stall.
+- Red production seam: initial Running credit and per-flow capacity were both
+  `512 KiB`. After the reader reserved the full credit, feedback computed only
+  unreserved availability and published `paused=true, max_batch_bytes=0`.
+  Cancelling the read refunded the reservation, but no `DataReady` existed to
+  publish resume, reproducing the eventless `20s` stall.
+- Fix: D16 feedback now derives the already-armed opportunity as
+  `available_bytes + own_reserved_bytes`. The value remains at or below flow
+  capacity, and actual reads still require exact per-flow/global reservation.
+  Recovery remains capped at `128 KiB`; DrainOnly still cancels and refunds.
+- Local proof: D16 focused `39/39`, normal library `567/567`, harness library
+  `573/573`, integration `2/2` and `10 passed` with `4` existing ignores, plus
+  fmt/check/diff and suite self-test.
+- Reusable rule: capacity feedback must distinguish bytes owned by the pending
+  operation itself from bytes owned by queued or downstream work. Otherwise an
+  exact full-capacity reservation can revoke its own permission and create a
+  wake-free deadlock while the transport continues buffering data.
+
+## 2026-07-10 - Target evidence now bypasses the data-plane route under test
+
+- The known Knife14 topology defaults Target management SSH through the Exit
+  host using an explicit proxy command that carries Exit identity, port, and
+  host-key policy. Target identity and host-key settings remain separate.
+- Each raw server-evidence SSH command is wrapped in a `20s` outer timeout, so
+  an evidence failure cannot indefinitely block cleanup or bundle creation.
+- The suite self-test covers default proxy selection, explicit override
+  preservation, disabled/unknown topology behavior, Exit option propagation,
+  help text, and timeout reporting.
+- Reusable rule: never collect management evidence through the same target
+  route being tested. Evidence is observational and must not create additional
+  data-plane flows or own the suite lifecycle.
+
+## 2026-07-10 - D16 drop recovery must account for drain across feedback samples
+
+- The credit-rearm Gate A proved the direct reader now starts promptly and the
+  single actor admitted 60,928,613 bytes with zero bypass, but one 2,029-packet
+  TUN drop moved both flows into DrainOnly and throughput stopped.
+- The drop edge recorded 994,674 bytes of total pressure and installed 122,727
+  bytes of global drop debt. The next feedback sample recorded zero pressure,
+  which is positive aggregate drain evidence, but the old per-flow send-limit
+  clocks did not observe that decrease and therefore could not pay the debt.
+- DrainOnly then prevented new admission, so no later per-flow queue decrease
+  could be created. Both flows remained DrainOnly for 8,283 cycles even though
+  queues were empty and feedback had resumed.
+- Reusable rule: a global circuit breaker must consume drain evidence at the
+  same scope at which pressure is observed. Preserve the drop-episode pressure
+  baseline, apply its measured decrease once to debt, and pass the same clean
+  drain edge into flow Recovery without minting new admission credit.
+- A completed zero-byte poll/flush cycle is service, not drain progress. Keep
+  `drain_only_cycles` observable, but require strictly positive drain evidence
+  for the ordinary Recovery transition.
+
+## 2026-07-10 - Task 11A closed the bounded TUN RX and EOF gates locally
+
+- Root cause: the first backlog latch and its later one-clean-edge recovery
+  tracked only device readiness. They did not prove that payload already
+  admitted for each flow had produced and drained its ACK/window feedback. A
+  fixed per-flush cap also ignored bytes still outstanding in smoltcp.
+- Fix: the device guard now requires two independent clean `WouldBlock`
+  observations separated by one admission-free `ControlOnly` poll/flush epoch.
+  A pause also arms a per-flow ACK-completion barrier when that flow's
+  `send_queue` is nonzero; only that flow remains DrainOnly until its own queue
+  reaches zero.
+- Running keeps a `512 KiB` read reservoir and Recovery a `128 KiB` read
+  opportunity, but actor admission is a separate cumulative sliding window:
+  at most 24 MTU-sized payload packets minus the current smoltcp `send_queue`.
+  The 64-packet model therefore reserves 48 feedback slots for up to two
+  ACK/window-update packets per payload packet and 16 slots for ordinary TUN RX
+  drain. Up to eight actor cycles still cover the `128 KiB` service target.
+- The integrated 64 MiB/64-packet scenario now records budget exhaustion,
+  guard pause/resume, the maximum payload packets per flush, phase state, actor
+  bypass, modeled drops, owned/pending/inflight tail, terminal drops, remote
+  EOF, and local EOF ordering. A separate two-flow test proves that one slow
+  flow does not block a zero-queue peer from Recovery.
+- Stable proof: 50 consecutive full scenarios passed with complete 64 MiB
+  delivery, at most 24 payload packets per flush, zero modeled drop, zero actor
+  bypass, and zero EOF/close-tail bytes. Full gates passed: lib `582/582`;
+  harness lib `589/589`; integration `2/2`; harness targets `10 passed/4
+  ignored`; both cargo checks; fmt; diff-check; US-client suite self-test; and
+  low-RTT probe self-test.
+- Reusable rule: device readiness, per-flow ACK completion, and admission
+  capacity are different invariants. Close them with a two-epoch device guard,
+  per-flow barriers, and a cumulative outstanding-byte window; do not use a
+  global all-flows-zero condition or a nominal per-call burst alone.

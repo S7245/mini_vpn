@@ -885,6 +885,149 @@ Copy the generated bundle to a local `/tmp/mini_vpn_knife14h10d16_*`
 directory, write a dated result document with no secrets, and record the exact
 pass/fail discriminator.
 
+### Task 11A: Close Global Drop Recovery And TUN RX Starvation Locally
+
+This task is mandatory after the failed credit-rearm Gate A and before any
+replacement Gate A. It adopts the evidence-backed parts of the 2026-07-10
+egress architecture review while preserving the approved D16 ownership,
+single-actor, EOF, and strict acceptance contracts.
+
+**Files:**
+- Modify: `src/client_tun.rs`
+- Modify only if the production seam requires it: `src/harness.rs`,
+  `src/device.rs`, `src/tcp_egress.rs`
+- Modify: this plan and the D16 architecture spec
+- Update after green/review: `.learnings/LEARNINGS.md`,
+  `.learnings/ERRORS.md`
+
+- [x] **Step 1: Lock the Linux TUN direction into the design**
+
+Treat `tun0 tx_dropped` as kernel-to-userspace TUN RX ring loss: local
+ACK/control/uplink packets were not consumed by mini_vpn in time. Do not use it
+as proof that `VirtualTunDevice::flush_tx` dropped a userspace-to-kernel write.
+
+Keep Gate A strict. Diagnostic `capacity`, `clean`, and `gap` sub-results may be
+reported, but all approved Gate A conditions remain an AND gate.
+
+- [x] **Step 2: RED — reproduce global drop debt missing cross-sample drain**
+
+Add one deterministic production-composition test with this sequence:
+
+```text
+two active D16 flows in Running
+-> global drop edge at nonzero aggregate pressure
+-> both flows enter DrainOnly and global drop debt is installed
+-> aggregate pressure falls below low before another per-flow send-limit call
+-> pressure-low edge carries positive observed drain
+```
+
+The assertion is behavioral: the episode must pay no more than the measured
+global drain, must pay each byte once, must not mint admission credit, and must
+make every non-terminal eligible D16 flow enter Recovery. The current code
+must fail this test by leaving the flows in DrainOnly.
+
+- [x] **Step 3: GREEN — close the global episode at one scope**
+
+Introduce one small drop-episode policy object or equivalent pure seam owned by
+the event loop. It records the pressure baseline and debt generation at the
+drop edge, consumes the matching aggregate drain once at pressure-low, and
+returns explicit recovery evidence. Per-flow code consumes that evidence but
+does not independently pay global debt.
+
+Correct ordinary transition evidence from `completed_drain_bytes.is_some()` to
+strictly positive completed bytes. Keep zero-byte DrainOnly service cycles in
+diagnostics without advancing Recovery.
+
+- [x] **Step 4: RED — reproduce bounded TUN RX starvation at the production seam**
+
+Build a deterministic `TunIo`/event-loop harness that models the Linux
+kernel-to-userspace TUN ring as bounded. Sustained D16 downlink must cause the
+local TCP side to enqueue ACK/control packets into that ring. Drive the same
+actor, TUN read, `iface.poll`, writer, and close paths as production.
+
+Required red observation:
+
+```text
+actor_bypass_admitted_bytes = 0
+TUN RX ring reaches capacity or records a modeled drop
+TUN RX drain reports repeated budget exhaustion/backlog
+useful reverse progress or close cleanliness fails
+```
+
+Do not use an inflight-permit literal as the pressure source and do not add a
+timer/self-wake to manufacture progress.
+
+- [x] **Step 5: GREEN — add only the proven device-level self-resetting guard**
+
+Only if Step 4 reproduces the production failure, expose a device-level TUN RX
+backlog observation from the adapter seam. While backlog remains proven, stop
+D16 Quinn reads and actor admission for all affected flows but continue TUN RX,
+`iface.poll`, `flush_tx`, permit release, and close drain. A first clean
+nonblocking `WouldBlock` only arms recovery; require one admission-free
+`ControlOnly` poll/flush epoch and a later independent clean probe before
+clearing the device guard.
+
+At the pause edge, arm a per-flow ACK-completion barrier only when that flow's
+smoltcp `send_queue` is nonzero. After device recovery, keep only that flow in
+DrainOnly until its own `send_queue` reaches zero. Do not replace this with a
+global all-flows-zero barrier. Bound Running and Recovery admission by an
+MTU-derived 24-payload-packet sliding window after deducting existing
+`send_queue`; this leaves room for up to two ACK/window-update packets per
+payload packet plus the ordinary 16-packet TUN RX drain in the modeled
+64-packet ring. Do not create another debt/credit clock and do not infer device
+pressure from `flush_tx` writability.
+
+- [x] **Step 6: Run local gates and architecture review**
+
+Run the focused D16/drop/TUN-RX tests first, then:
+
+```bash
+cargo test -q --lib
+cargo test -q --features harness
+cargo check -q
+cargo fmt --check
+bash scripts/knife14b-usclient-tunnel-suite.sh --self-test
+git diff --check
+```
+
+Review byte conservation, actor exclusivity, device-vs-flow ownership,
+zero-byte progress, EOF/close ordering, TCP/UDP fairness, bounded queues, and
+hot-path wake behavior. No VPS run is permitted from this task.
+
+Local result (2026-07-10): the calibrated 64 MiB/64-packet production-seam
+scenario first reproduced modeled drops and premature/unstable recovery. A
+single clean edge and a fixed per-flush byte cap were necessary but not
+sufficient: later admission could reopen before its own ACK feedback drained,
+and prior `send_queue` bytes accumulated outside the nominal burst limit. The
+GREEN path now combines an authoritative two-epoch device guard, per-flow
+ACK-completion barriers, and the cumulative 24-packet sliding admission window.
+The slow-flow isolation test proves one nonzero `send_queue` remains DrainOnly
+while a zero-queue peer independently enters Recovery.
+
+The final production-seam scenario proves complete 64 MiB delivery, real
+pause/resume edges, at most 24 TCP payload packets per flush, zero actor bypass,
+zero modeled drop, remote EOF after owned/pending/inflight bytes reach zero,
+and zero terminal/close-tail bytes. It passed 50 consecutive full repeats.
+Post-review gates passed: normal library `582/582`; harness library `589/589`;
+integration `2/2`; harness targets `10 passed/4 ignored`; default and harness
+checks; fmt; diff-check; US-client suite self-test; and low-RTT probe self-test.
+
+- [x] **Step 7: Preserve commit and acceptance gates**
+
+Before the first commit, list every pre-D16 diff that would be included and ask
+the user to confirm the commit strategy. The user confirmed the cumulative D16
+code-baseline commit followed by a separate docs/learnings commit; both staged
+trees must be validated from a clean detached worktree. After local
+green/review, request separate authorization for one strict replacement Gate A.
+Gate B remains frozen until that Gate A passes.
+
+Commit result (2026-07-10): the independently validated cumulative D16 code
+baseline was committed as `8496b8f` and pushed to
+`codex/knife14d-downlink-reap-open`. Unrelated Reality, DNS, failover, main,
+metrics, script, and historical-result diffs remained unstaged. The next remote
+step is still exactly one strict Gate A; no Gate B run is authorized by this
+commit.
+
 ### Task 12: Prove 170M Parity, Regress Product Paths, And Clean Experiments
 
 **Files:**
