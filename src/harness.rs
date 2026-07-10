@@ -817,6 +817,7 @@ struct Recorded {
     d16_running_flows: usize,
     d16_drain_only_flows: usize,
     d16_recovery_flows: usize,
+    d16_tun_rx_actor_wakes: u64,
     d16_eof_observed: bool,
     d16_eof_tail_bytes: usize,
     terminal_drop_bytes: u64,
@@ -916,6 +917,10 @@ impl MetricsSink for RecordingSink {
         r.d16_running_flows = running_flows;
         r.d16_drain_only_flows = drain_only_flows;
         r.d16_recovery_flows = recovery_flows;
+    }
+    fn note_d16_tun_rx_actor_wake(&mut self) {
+        let mut r = self.shared.lock().unwrap();
+        r.d16_tun_rx_actor_wakes = r.d16_tun_rx_actor_wakes.saturating_add(1);
     }
     fn note_d16_flow_lifecycle(
         &mut self,
@@ -1920,6 +1925,8 @@ pub struct D16TunRxStarvationReport {
     pub payload_bytes: usize,
     pub bootstrap_sent_bytes: usize,
     pub received_bytes: usize,
+    pub payload_elapsed: Duration,
+    pub receiver_mbps: f64,
     pub modeled_tx_dropped: u64,
     pub ring_high_water_packets: u64,
     pub downlink_high_water_packets: u64,
@@ -1929,6 +1936,7 @@ pub struct D16TunRxStarvationReport {
     pub backlog_pause_edges: u64,
     pub backlog_resume_edges: u64,
     pub actor_bypass_admitted_bytes: u64,
+    pub tun_rx_actor_wakes: u64,
     pub first_drop_backlog_active: bool,
     pub first_drop_running_flows: usize,
     pub first_drop_drain_only_flows: usize,
@@ -1948,6 +1956,25 @@ pub struct D16TunRxStarvationReport {
     pub final_local_eof_sent_flows: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum D16TunRxScenarioLimit {
+    Wall(Duration),
+    #[cfg(test)]
+    SchedulerYields(usize),
+}
+
+impl D16TunRxScenarioLimit {
+    fn permits_next_iteration(self, started: Instant, scheduler_yields: usize) -> bool {
+        #[cfg(not(test))]
+        let _ = scheduler_yields;
+        match self {
+            Self::Wall(timeout) => started.elapsed() < timeout,
+            #[cfg(test)]
+            Self::SchedulerYields(limit) => scheduler_yields < limit,
+        }
+    }
+}
+
 /// Model the Linux kernel-to-userspace TUN transmit ring as a bounded packet
 /// queue while a native D16 relay sends a reverse-only payload. Generator TCP
 /// ACK/control packets enter this bounded ring; mini_vpn must drain them through
@@ -1956,6 +1983,19 @@ pub async fn run_d16_tun_rx_starvation_scenario(
     payload_bytes: usize,
     ring_capacity_packets: usize,
     timeout: Duration,
+) -> D16TunRxStarvationReport {
+    run_d16_tun_rx_starvation_scenario_with_limit(
+        payload_bytes,
+        ring_capacity_packets,
+        D16TunRxScenarioLimit::Wall(timeout),
+    )
+    .await
+}
+
+async fn run_d16_tun_rx_starvation_scenario_with_limit(
+    payload_bytes: usize,
+    ring_capacity_packets: usize,
+    limit: D16TunRxScenarioLimit,
 ) -> D16TunRxStarvationReport {
     let gen_to_sut = PacketLink::bounded(ring_capacity_packets);
     let sut_to_gen = PacketLink::new();
@@ -2010,10 +2050,12 @@ pub async fn run_d16_tun_rx_starvation_scenario(
     let bootstrap = [0xA5u8];
     let mut bootstrap_sent_bytes = 0usize;
     let mut received_bytes = 0usize;
+    let mut payload_completed_elapsed = None;
     let mut remote_eof_seen = false;
     let mut first_drop_state: Option<(bool, usize, usize, usize)> = None;
     let mut scratch = vec![0u8; 64 * 1024];
-    while started.elapsed() < timeout {
+    let mut scheduler_yields = 0usize;
+    while limit.permits_next_iteration(started, scheduler_yields) {
         gen_device.begin_poll();
         gen_iface.poll(SmolInstant::now(), &mut gen_device, &mut sockets);
         let socket = sockets.get_mut::<tcp::Socket>(handle);
@@ -2027,6 +2069,9 @@ pub async fn run_d16_tun_rx_starvation_scenario(
                 Ok(0) | Err(_) => break,
                 Ok(read) => received_bytes = received_bytes.saturating_add(read),
             }
+        }
+        if received_bytes >= payload_bytes && payload_completed_elapsed.is_none() {
+            payload_completed_elapsed = Some(started.elapsed());
         }
         remote_eof_seen |= received_bytes >= payload_bytes && !socket.may_recv();
         if first_drop_state.is_none() && gen_to_sut.dropped_packets() > 0 {
@@ -2043,12 +2088,19 @@ pub async fn run_d16_tun_rx_starvation_scenario(
             break;
         }
         tokio::task::yield_now().await;
+        scheduler_yields = scheduler_yields.saturating_add(1);
     }
     if sockets.get::<tcp::Socket>(handle).is_active() {
         sockets.get_mut::<tcp::Socket>(handle).close();
     }
     sut.abort();
     let _ = sut.await;
+    let payload_elapsed = payload_completed_elapsed.unwrap_or_else(|| started.elapsed());
+    let receiver_mbps = if payload_elapsed.is_zero() {
+        f64::INFINITY
+    } else {
+        received_bytes as f64 * 8.0 / payload_elapsed.as_secs_f64() / 1_000_000.0
+    };
     let recorded = recorded.lock().unwrap();
     let (
         first_drop_backlog_active,
@@ -2061,6 +2113,8 @@ pub async fn run_d16_tun_rx_starvation_scenario(
         payload_bytes,
         bootstrap_sent_bytes,
         received_bytes,
+        payload_elapsed,
+        receiver_mbps,
         modeled_tx_dropped: gen_to_sut.dropped_packets(),
         ring_high_water_packets: gen_to_sut.high_water_packets(),
         downlink_high_water_packets: sut_to_gen.high_water_packets(),
@@ -2071,6 +2125,7 @@ pub async fn run_d16_tun_rx_starvation_scenario(
         backlog_pause_edges: recorded.backlog_pause_edges,
         backlog_resume_edges: recorded.backlog_resume_edges,
         actor_bypass_admitted_bytes: recorded.actor_bypass_admitted_bytes,
+        tun_rx_actor_wakes: recorded.d16_tun_rx_actor_wakes,
         first_drop_backlog_active,
         first_drop_running_flows,
         first_drop_drain_only_flows,
@@ -2254,9 +2309,13 @@ mod tests {
         assert_eq!(report.bootstrap_sent_bytes, 1, "{report:?}");
         assert_eq!(report.tcp_opens, 1, "{report:?}");
         assert_eq!(report.modeled_tx_dropped, 0, "{report:?}");
-        assert!(report.tun_rx_budget_exhausted > 0, "{report:?}");
-        assert!(report.backlog_pause_edges > 0, "{report:?}");
-        assert!(report.backlog_resume_edges > 0, "{report:?}");
+        assert!(report.tun_rx_budget_exhausted <= 8, "{report:?}");
+        assert!(report.backlog_pause_edges <= 4, "{report:?}");
+        assert_eq!(
+            report.backlog_pause_edges, report.backlog_resume_edges,
+            "{report:?}"
+        );
+        assert!(!report.final_backlog_active, "{report:?}");
         assert_eq!(report.actor_bypass_admitted_bytes, 0, "{report:?}");
         assert!(report.remote_eof_seen, "{report:?}");
         assert!(report.eof_after_owned_queue_drain, "{report:?}");
@@ -2269,6 +2328,28 @@ mod tests {
             report.max_tcp_payload_packets_per_flush
                 <= crate::tcp_egress::D16_ACTOR_PAYLOAD_PACKET_BUDGET as u64,
             "{report:?}"
+        );
+        assert!(report.receiver_mbps >= 170.0, "{report:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn d16_tun_rx_ack_reenters_actor_without_timer_tick() {
+        const PAYLOAD_BYTES: usize = 256 * 1024;
+        const RING_CAPACITY_PACKETS: usize = 64;
+        let report = run_d16_tun_rx_starvation_scenario_with_limit(
+            PAYLOAD_BYTES,
+            RING_CAPACITY_PACKETS,
+            D16TunRxScenarioLimit::SchedulerYields(50_000),
+        )
+        .await;
+
+        assert_eq!(report.bootstrap_sent_bytes, 1, "{report:?}");
+        assert_eq!(report.tcp_opens, 1, "{report:?}");
+        assert_eq!(report.modeled_tx_dropped, 0, "{report:?}");
+        assert!(report.tun_rx_actor_wakes > 0, "{report:?}");
+        assert_eq!(
+            report.received_bytes, report.payload_bytes,
+            "ACK arrival must continue D16 actor admission without advancing the 5ms timer: {report:?}"
         );
     }
 

@@ -110,14 +110,13 @@ const LOCAL_EGRESS_SERVICE_TARGET_BYTES_PER_WINDOW: usize = 128 * 1024;
 const D16_PER_FLOW_BYTE_CAPACITY: usize = 512 * 1024;
 const D16_ACTOR_QUANTUM_BYTES: usize = 128 * 1024;
 const LOCAL_EGRESS_SERVICE_MAX_CYCLES: usize = 8;
-const LOCAL_EGRESS_SERVICE_TUN_RX_PACKETS_PER_CYCLE: usize = 16;
+const LOCAL_EGRESS_SERVICE_TUN_RX_PACKETS_PER_CYCLE: usize = D16_ACTOR_PAYLOAD_PACKET_BUDGET * 2;
 const _: () =
     assert!(LOCAL_EGRESS_SERVICE_TARGET_BYTES_PER_WINDOW <= DEFAULT_DOWNLINK_FLUSH_MAX_BYTES);
 const _: () = assert!(LOCAL_EGRESS_SERVICE_MAX_CYCLES > 0);
 const _: () = assert!(LOCAL_EGRESS_SERVICE_TUN_RX_PACKETS_PER_CYCLE > 0);
-const _: () = assert!(
-    D16_ACTOR_PAYLOAD_PACKET_BUDGET * 2 == LOCAL_EGRESS_SERVICE_TUN_RX_PACKETS_PER_CYCLE * 3
-);
+const _: () =
+    assert!(D16_ACTOR_PAYLOAD_PACKET_BUDGET * 2 == LOCAL_EGRESS_SERVICE_TUN_RX_PACKETS_PER_CYCLE);
 /// Knife14fa: drain QUIC streams with a healthy read window, but stage delivery
 /// into the main loop so one ready remote burst cannot become one oversized
 /// smoltcp/send_queue injection.
@@ -308,6 +307,9 @@ pub trait MetricsSink {
         _recovery_flows: usize,
     ) {
     }
+    /// H10d16 Task 11A follow-up: a ready local TCP packet directly scheduled
+    /// bounded D16 actor service instead of waiting for the 5ms timer.
+    fn note_d16_tun_rx_actor_wake(&mut self) {}
     /// H10d16 Task 11A: observe the exact byte tail at the local EOF boundary.
     fn note_d16_flow_lifecycle(
         &mut self,
@@ -8543,7 +8545,7 @@ pub async fn run_event_loop<D, U, M>(
             res = device.wait_for_rx() =>{
                 metrics.loop_park_end();
                 if res.is_ok(){
-                    process_ready_tun_rx_packet(
+                    let packet_kind = process_ready_tun_rx_packet(
                         &mut device,
                         &mut assoc_table,
                         &mut fake_pool,
@@ -8574,6 +8576,55 @@ pub async fn run_event_loop<D, U, M>(
                         "inbound_poll",
                     )
                     .await;
+                    if packet_kind == TunRxPacketKind::Tcp
+                        && dirty_contains_d16_flow(&dirty, &socket_ctxs)
+                    {
+                        metrics.note_d16_tun_rx_actor_wake();
+                        local_egress_service_diag.note_egress_actor_immediate_wake();
+                        let relay_read_hard_pause = tun_rx_drain_diag
+                            .backlog_guard()
+                            .is_active()
+                            || if buffered_downlink.enabled {
+                                tun_egress_feedback.is_paused()
+                            } else {
+                                downlink_rx_paused || tun_egress_feedback.is_paused()
+                            };
+                        let egress_actor = local_egress_actor_enabled(
+                            &runtime_config,
+                            &dirty,
+                            &socket_ctxs,
+                        );
+                        let _ = service_local_egress_until(
+                            &mut device,
+                            &mut assoc_table,
+                            &mut fake_pool,
+                            &upstream,
+                            udp_clock.elapsed().as_secs(),
+                            &metrics_handle,
+                            &mut registry,
+                            &mut sockets,
+                            &mut socket_ctxs,
+                            &mut iface,
+                            &mut dirty,
+                            &handshake_done_tx,
+                            &global_tx,
+                            &mut metrics,
+                            downlink_flush_max_bytes,
+                            downlink_backpressure,
+                            runtime_config.tun_mtu,
+                            &mut downlink_egress_drop_debt,
+                            &mut tcp_loop_flush_tx_calls,
+                            &mut tcp_loop_flush_tx_failures,
+                            &mut tun_rx_drain_diag,
+                            &mut local_egress_service_diag,
+                            relay_read_hard_pause,
+                            tun_egress_feedback.is_paused(),
+                            buffered_downlink,
+                            local_egress_service_config,
+                            egress_actor,
+                        )
+                        .await;
+                    }
                 }
             }
             // 刀9 M3 / 刀14d：spawn 出主循环的 remote-open 完成 → 安装 relay（成功）/ rearm（失败），

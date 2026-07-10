@@ -58,8 +58,12 @@ impl EgressPermissions {
         tun_mtu: usize,
         existing_send_queue_bytes: usize,
     ) -> usize {
+        let tcp_payload_bytes = tun_mtu.saturating_sub(IPV4_TCP_MIN_HEADER_BYTES).max(1);
+        let occupied_packet_bytes = existing_send_queue_bytes
+            .div_ceil(tcp_payload_bytes)
+            .saturating_mul(tcp_payload_bytes);
         self.max_admit_bytes_for_tun_mtu(tun_mtu)
-            .saturating_sub(existing_send_queue_bytes)
+            .saturating_sub(occupied_packet_bytes)
     }
 }
 
@@ -634,6 +638,22 @@ mod tests {
                 2 * D16_ACTOR_PAYLOAD_PACKET_BUDGET * tcp_payload_bytes,
             ),
             0,
+        );
+    }
+
+    #[test]
+    fn d16_actor_packet_budget_rounds_partial_unacked_segment_to_one_slot() {
+        let tun_mtu = 1500;
+        let tcp_payload_bytes = tun_mtu - 40;
+        let permissions = EgressPermissions::for_phase(EgressPhase::Running);
+
+        assert_eq!(
+            permissions.available_admit_bytes_for_tun_mtu(tun_mtu, 1),
+            (D16_ACTOR_PAYLOAD_PACKET_BUDGET - 1) * tcp_payload_bytes,
+        );
+        assert_eq!(
+            permissions.available_admit_bytes_for_tun_mtu(tun_mtu, tcp_payload_bytes + 1),
+            (D16_ACTOR_PAYLOAD_PACKET_BUDGET - 2) * tcp_payload_bytes,
         );
     }
 
