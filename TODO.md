@@ -2,6 +2,39 @@
 
 ## Current Knife14 Status (2026-07-09)
 
+### Approved next stage: H10d16 byte-owned egress
+
+H10d15 reached `186/185 Mbit/s` sender/receiver and proved that mini_vpn has
+sing-box-class single-flow capacity when the native QUIC read side maintains a
+service-sized independent pump. It did not pass clean acceptance: the tail had
+`tx_dropped_delta=229`, `global_rx_paused=true`,
+`close_egress_class=terminal_closed_no_send`, and
+`close_egress_bytes=327272`.
+
+The next step is not another floor, chunk, self-wake, pressure-threshold, VPS,
+MTU, or QUIC-window adjustment. The approved architecture closes the code-level
+contracts exposed by review:
+
+1. acquire an RAII byte reservation before every ordered Quinn read;
+2. remove the message-count TUIC payload channel before the D6 queue;
+3. keep payload in one per-flow leased byte queue and use `global_rx` for
+   coalesced readiness;
+4. make D16 actor mode the only downlink `send_slice` owner;
+5. use `Running -> DrainOnly -> Recovery`, where pressure stops read/admission
+   but never stops ACK/TUN RX, poll, flush, or permit release;
+6. expose remote EOF only after the owned queue and local inflight bytes drain.
+
+Source of truth:
+
+- `docs/tech/2026-07-09-knife14h10d16-byte-owned-egress-architecture-spec.md`
+- `docs/tech/2026-07-09-knife14h10d16-byte-owned-egress-implementation-plan.md`
+- `docs/tech/2026-07-09-knife14h10d16-session-handoff.md`
+
+Current stage remains stage 8 with the capacity half passed and the clean half
+failed. Reopen stages 3-7 for local TDD. Do not run another VPS suite until
+ownership conservation, actor-exclusive admission, DrainOnly progress, and EOF
+ordering all pass locally.
+
 Knife14fp found a mandatory high-throughput prerequisite: the exit VPS `.33`
 had Linux socket buffer caps/defaults of only `212992B`, which capped both
 mini_vpn and a mature sing-box client around the `20-30 Mbit/s` band. `.33` is

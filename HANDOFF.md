@@ -2,6 +2,41 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
+## Current Override — Knife14h10d16 Byte-Owned Egress (2026-07-09)
+
+This section overrides the older G7/G8/GV next-step text below.
+
+- H10d15 produced the first strong parity-capacity proof: reverse-first P1
+  reached `186 Mbit/s` sender and `185 Mbit/s` receiver with the native permit
+  path and service-sized read progress. Active read gaps fell below one second.
+- H10d15 is not accepted: its tail reported `tx_dropped_delta=229`,
+  `global_rx_paused=true`, `terminal_closed_no_send`, and
+  `close_egress_bytes=327272`.
+- A follow-up code review found three architecture contract breaks:
+  1. the TUIC native ordered pump stages payload in a message-count channel
+     before the D6 byte queue and ignores its `_max_len` input;
+  2. D3 mode still reaches `send_slice` through legacy dirty/timer/TUN-RX
+     paths outside the actor service window;
+  3. hard pause returns before ACK/TUN RX, `iface.poll`, and `flush_tx`, so it
+     stops recovery drain and depends on the old timer path.
+- The approved next architecture is H10d16: one RAII byte ledger beginning
+  before Quinn reads, a per-flow leased byte queue, readiness-only global
+  events, actor-exclusive D16 admission, and
+  `Running -> DrainOnly -> Recovery` feedback.
+- Approved source of truth:
+  - `docs/tech/2026-07-09-knife14h10d16-byte-owned-egress-architecture-spec.md`
+  - `docs/tech/2026-07-09-knife14h10d16-byte-owned-egress-implementation-plan.md`
+  - `docs/tech/2026-07-09-knife14h10d16-session-handoff.md`
+- Stage position: nominally stage 8 because capacity passed but clean Gate A
+  failed. Reopen and close stages 3-7 locally before another VPS run. Do not
+  proceed directly to stage 9.
+- Gate A is now one clean focused run above `150 Mbit/s`; Gate B is three clean
+  repeats with a median target of `170 Mbit/s` and a same-window sing-box
+  parity fallback.
+- The worktree is intentionally dirty and overlapping D16 files contain older
+  experiments. Do not revert user changes and do not commit whole files without
+  first showing which pre-D16 diffs would be included.
+
 ## 当前状态（基线）
 
 - **Stage 13 + 刀1 + 刀2 + 刀3 + 刀3.5 + 刀4 + 刀5 全部已在 `main`**（`e589767`，2026-06-22 fast-forward 合入，与 origin 同步）。
