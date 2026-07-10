@@ -826,12 +826,12 @@ unrelated pre-existing file.
 - Add after analysis: a dated D16 result document in `docs/tech/`
 - Update: `.learnings/LEARNINGS.md`; update `.learnings/ERRORS.md` only for reusable failures
 
-- [ ] **Step 1: Sync only reviewed D16 files to `.27`**
+- [x] **Step 1: Sync only reviewed D16 files to `.27`**
 
 Use `rsync -R` from the repository root so `src/` and `scripts/` paths are
 preserved. Verify remote `git status --short` for expected paths before build.
 
-- [ ] **Step 2: Run no-secret service preflight**
+- [x] **Step 2: Run no-secret service preflight**
 
 ```bash
 ssh -i ~/.ssh/vpn ubuntu@43.153.32.33 'systemctl is-active sing-box'
@@ -840,7 +840,7 @@ ssh -i ~/.ssh/vpn ubuntu@43.130.32.77 'systemctl is-active iperf3'
 
 Check the persisted `.33` socket-buffer values, but do not tune them.
 
-- [ ] **Step 3: Build and run focused Gate A with a true writable TTY**
+- [x] **Step 3: Build and run focused Gate A with a true writable TTY**
 
 Start the command with tool-level `tty=true` and remote `ssh -tt`. Source the
 existing remote `.env` without printing it:
@@ -852,7 +852,7 @@ ssh -tt -i ~/.ssh/vpn ubuntu@43.172.75.27 'cd /home/ubuntu/mini_vpn && . "$HOME/
 Enter sudo credentials only at the interactive prompt. Never place them in a
 command, file, documentation, log, or summary.
 
-- [ ] **Step 4: Apply the Gate A decision table**
+- [x] **Step 4: Apply the Gate A decision table**
 
 Pass only if all are true:
 
@@ -879,11 +879,32 @@ Failure interpretation:
 Per project rules, analyze a failed run and present the next modification plan
 before editing again.
 
-- [ ] **Step 5: Save evidence and stage learning**
+- [x] **Step 5: Save evidence and stage learning**
 
 Copy the generated bundle to a local `/tmp/mini_vpn_knife14h10d16_*`
 directory, write a dated result document with no secrets, and record the exact
 pass/fail discriminator.
+
+Gate result (2026-07-10): the clean `f7847dd` build completed the authorized
+20-second reverse-first P1 at `19.2/17.9 Mbit/s`, so Gate A failed and Gate B
+remains frozen. Local egress discriminators stayed clean: TUN drops, actor
+bypass, pressure/backlog edges, send/flush failures, and QUIC loss/congestion/
+blocking were zero. The actor admitted all bytes delivered to it, while the
+ordered data stream had repeated read gaps up to `3548ms` despite active
+polling. Observed close-tail counters were zero, but the data flow remained
+active at the final snapshot, so natural EOF/close was not established.
+
+To preserve the existing dirty `.27` repository, Step 1 used a separate remote
+clean worktree at exact commit `f7847dd` rather than overwriting the dirty
+tree. The suite script remained in its existing repository and its SHA-256 was
+verified equal to the local script before launch; the release binary came only
+from the clean worktree.
+
+The next red-first task is a sustained same-stream discriminator through the
+exact Quinn/TUIC/D16 ordered-reader composition. It must separate contiguous
+same-stream availability from connection-global frame progress before any
+production fix. Result:
+`docs/tech/2026-07-10-knife14h10d16-ack-capacity-gate-a-results.md`.
 
 ### Task 11A: Close Global Drop Recovery And TUN RX Starvation Locally
 

@@ -345,6 +345,22 @@ conservation at close.
 - One clean high run followed by large variance: architecture capacity exists,
   but scheduling/fairness stability is not accepted.
 
+### 2026-07-10 ACK-capacity Gate A observation
+
+The repaired 64 MiB production seam passed 50 capacity-qualified repeats at
+about `224 Mbit/s`, then the single authorized VPS Gate A reached only
+`19.2/17.9 Mbit/s` sender/receiver. The VPS run kept TUN drops, actor bypass,
+local pressure/backlog, send/flush failures, and QUIC loss/congestion/blocking
+at zero. The actor admitted all bytes it received, but the ordered data reader
+showed repeated gaps up to `3548ms` despite active polling.
+
+This selects the existing “actor drains, but remote read gaps return” branch.
+It does not invalidate the byte-owned queue, actor exclusivity, DrainOnly, or
+24-packet admission contracts. The next local seam must provide same-stream
+evidence: connection-global STREAM frame progress alone cannot prove that
+contiguous bytes were deliverable on the data stream. Gate B remains frozen
+until a future Gate A passes.
+
 ## Stage Mapping
 
 The project remains nominally at stage 8 because H10d15 proved capacity but

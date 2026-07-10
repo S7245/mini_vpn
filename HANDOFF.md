@@ -29,20 +29,34 @@ This section overrides the older G7/G8/GV next-step text below.
   - `docs/tech/2026-07-09-knife14h10d16-session-handoff.md`
 - Stage position: nominally stage 8 because capacity passed but clean Gate A
   failed. D16 code baseline `8496b8f` and ACK-capacity repair `f7847dd` are
-  pushed on
-  `codex/knife14d-downlink-reap-open`. Stages 3-7 and mandatory Task 11A are
-  now closed locally: the 64 MiB
+  pushed on `codex/knife14d-downlink-reap-open`. Stages 3-7 and mandatory Task
+  11A are now closed locally: the 64 MiB
   bounded-ring production seam passed 50 consecutive capacity-qualified
   repeats with complete delivery, about `224 Mbit/s` local receiver capacity,
   at most 24 payload packets per flush, zero modeled drop/bypass, and clean
-  EOF/close-tail accounting. The
-  closed design uses a two-epoch device guard, a per-flow ACK-completion
+  EOF/close-tail accounting. The closed design uses a two-epoch device guard,
+  a per-flow ACK-completion
   barrier, and an MTU-derived sliding admission window that deducts the current
-  smoltcp send queue. The next remote action is one strict replacement Gate A;
-  do not proceed directly to Gate B/stage 9.
-- Gate A is now one clean focused run above `150 Mbit/s`; Gate B is three clean
-  repeats with a median target of `170 Mbit/s` and a same-window sing-box
-  parity fallback.
+  smoltcp send queue.
+- The single authorized ACK-capacity replacement Gate A has now run and
+  failed throughput at `19.2/17.9 Mbit/s` sender/receiver. The repaired local
+  path stayed clean: `tx_dropped_delta=0`, actor bypass `0`, pressure/backlog
+  edges `0`, send/flush errors `0`, and observed pending/egress/terminal-tail
+  counters `0`. The data flow remained active at final snapshot, so natural
+  EOF/close was not established. Repeated ordered read gaps reached `3548ms`
+  despite active polling, while local actor drain and QUIC loss/congestion/
+  blocking surfaces were healthy. Gate B remains frozen.
+- Next stage is a diagnose/TDD same-stream service discriminator at
+  `QuinnDirectOrderedNativeChunkRecv -> TuicNativeOrderedReader -> D16 reader`.
+  First distinguish same-stream ordered offset availability, RecvStream
+  sustained wake/composition, and TUIC/server burst service. Retain the
+  byte-owned egress architecture and do not reopen local 24/48 budgets or tune
+  VPS, MTU/PLPMTUD, broad QUIC windows, pool, chunk size, or self-wake.
+- Current result:
+  `docs/tech/2026-07-10-knife14h10d16-ack-capacity-gate-a-results.md`.
+- A future Gate A remains one clean focused run above `150 Mbit/s`; Gate B is
+  three clean repeats with a median target of `170 Mbit/s` and a same-window
+  sing-box parity fallback.
 - The worktree is intentionally dirty and overlapping D16 files contain older
   experiments. Do not revert user changes and do not commit whole files without
   first showing which pre-D16 diffs would be included.

@@ -31,17 +31,33 @@ Source of truth:
 - `docs/tech/2026-07-09-knife14h10d16-session-handoff.md`
 
 Current stage remains stage 8 with the capacity half passed and the clean half
-failed. D16 code baseline `8496b8f` and ACK-capacity repair `f7847dd` are pushed on
-`codex/knife14d-downlink-reap-open`. The reopened stages 3-7 and Task 11A local
+failed. D16 code baseline `8496b8f` and ACK-capacity repair `f7847dd` are pushed
+on `codex/knife14d-downlink-reap-open`. The reopened stages 3-7 and Task 11A local
 TDD are now complete.
 Ownership conservation, actor-exclusive admission, authoritative DrainOnly
 recovery, bounded TUN RX service, per-flow ACK-completion isolation, and EOF
 ordering pass locally. The final 64 MiB/64-packet production seam passed 50/50
 capacity-qualified repeats at about `224 Mbit/s`, with a cumulative MTU-derived
 24-payload-packet admission window, zero modeled drop/bypass, and zero tail
-bytes. The next remote step is one strict
-`20s` replacement Gate A; Gate B remains frozen until that run exceeds
-`150 Mbit/s` with every drop/tail counter at zero.
+bytes.
+
+The single authorized ACK-capacity replacement Gate A has completed and
+failed at `19.2/17.9 Mbit/s` sender/receiver. It kept
+`tx_dropped_delta=0`, actor bypass `0`, pressure/backlog edges `0`, and
+send/flush failures `0`. Observed pending/egress/terminal-tail counters were
+zero, but the data flow was still active at final snapshot, so natural
+EOF/close was not established. The active failure was repeated ordered stream
+read starvation: data read gaps reached `3548ms` while application polling,
+local actor drain, smoltcp capacity, and QUIC loss/congestion/blocking were
+healthy.
+
+Next task is a same-stream, sustained real-Quinn discriminator through
+`QuinnDirectOrderedNativeChunkRecv -> TuicNativeOrderedReader -> D16 reader`.
+It must distinguish ordered offset/reassembly gaps, RecvStream sustained
+wake/composition, and TUIC/server burst service before any production edit.
+Do not reopen the local 24/48 packet budgets or replace the byte-owned egress
+architecture. Gate B remains frozen. Result:
+`docs/tech/2026-07-10-knife14h10d16-ack-capacity-gate-a-results.md`.
 
 Knife14fp found a mandatory high-throughput prerequisite: the exit VPS `.33`
 had Linux socket buffer caps/defaults of only `212992B`, which capped both

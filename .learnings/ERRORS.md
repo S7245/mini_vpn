@@ -1,5 +1,29 @@
 # Errors
 
+## 2026-07-10 - ACK-capacity Gate A still failed on ordered stream service
+
+- Stage: H10d16 ACK-capacity replacement Gate A.
+- Failed bundle:
+  `/tmp/mini_vpn_knife14h10d16_ack_capacity_gatea_local/mvpn_knife14h10d16_ack_capacity_gatea_usclient_suite_20260710_233419.tar.gz`.
+- Symptom: the clean `f7847dd` build completed reverse-first P1 at
+  `19.2/17.9 Mbit/s`, with burst/idle intervals and data read gaps up to
+  `3548ms`, below the `>150 Mbit/s` Gate A requirement.
+- Rejected roots in this run: TUN drop, actor bypass, local pressure/backlog,
+  smoltcp send capacity, send-slice/flush errors, main-loop CPU saturation,
+  and client-observed QUIC loss/congestion/blocking.
+- Evidence limit: six pending samples had fresh connection-level STREAM-frame
+  progress, but connection-global counters cannot prove those frames completed
+  the missing ordered offset on the data stream. Do not label this a Quinn
+  wake bug without a same-stream RED.
+- Lifecycle limit: pending/egress/terminal-tail counters were zero, but the
+  data handle was still active/dirty at shutdown and produced no natural close
+  event. Do not record the close gate as passed.
+- Correct behavior: build a sustained real-Quinn same-stream test through the
+  exact direct adapter, reservation owner, TUIC ordered reader, and D16 actor;
+  compare it with direct RecvStream consumption; repair only the first seam
+  that reproduces the burst/idle gap. Do not tune VPS, MTU/PLPMTUD, broad QUIC
+  windows, pool, chunk size, self-wake, or the clean local 24/48 budgets.
+
 ## 2026-07-08 - Use `env` rather than long `export ... bash script` suite launches
 
 - Stage: Knife14go focused safe1200 reverse-first P1 acceptance.

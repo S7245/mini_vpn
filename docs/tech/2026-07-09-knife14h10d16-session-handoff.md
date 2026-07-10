@@ -1,5 +1,24 @@
 # Knife14h10d16 New Session Handoff
 
+## Current Resolution Addendum (2026-07-10)
+
+The implementation prompt below is historical: Tasks 1-10 and mandatory Task
+11A are locally closed, including 50 capacity-qualified 64 MiB repeats at about
+`224 Mbit/s`. The single authorized ACK-capacity Gate A then failed at
+`19.2/17.9 Mbit/s` sender/receiver. TUN drops, actor bypass, local pressure,
+send/flush failures, and QUIC loss/congestion/blocking were zero, but ordered
+data reads had gaps up to `3548ms`. The data flow remained active at the final
+snapshot, so natural EOF/close was not established despite zero observed tail
+counters.
+
+Do not restart Task 1 or Gate B. Start a diagnose/TDD sustained same-stream
+discriminator at
+`QuinnDirectOrderedNativeChunkRecv -> TuicNativeOrderedReader -> D16 reader`.
+Preserve the byte-owned architecture and distinguish same-stream contiguous
+availability from connection-global frame progress before editing production
+code. Current result:
+`docs/tech/2026-07-10-knife14h10d16-ack-capacity-gate-a-results.md`.
+
 Use the following prompt to start the implementation session.
 
 ```text

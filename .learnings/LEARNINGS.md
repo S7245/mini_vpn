@@ -1,5 +1,31 @@
 # Learnings
 
+## 2026-07-10 - D16 local capacity closure moves Gate A upstream
+
+- Code commits: `f7847dd` repairs ACK-driven actor re-entry and the feedback
+  service budget; `67c5122` records the local capacity closure.
+- Local outcome: the exact 64 MiB production seam improved from about
+  `56 Mbit/s` to `224 Mbit/s` and passed 50 consecutive capacity-qualified
+  repeats with zero modeled drop, actor bypass, and EOF/tail bytes.
+- VPS outcome: the single authorized 20-second reverse-first P1 reached only
+  `19.2/17.9 Mbit/s`. It nevertheless kept TUN drops, local pressure/backlog,
+  actor bypass, send/flush failures, and QUIC loss/congestion/blocking at zero.
+- Discriminator: the actor admitted all bytes delivered to it, while the
+  ordered data reader showed repeated `1.6-3.5s` read gaps despite active
+  polling. This moves the active bottleneck upstream of the local egress actor.
+- Evidence limit: connection-global STREAM frame progress does not prove
+  contiguous bytes were deliverable on this exact data stream. The next seam
+  must add sustained same-stream evidence before assigning the defect to Quinn
+  wake, ordered reassembly, or TUIC/server service.
+- Lifecycle limit: zero observed close-tail counters are not a natural EOF
+  proof when the data handle remains active at the final snapshot.
+- Reusable rule: a local architecture can be both necessary and capacity-safe
+  without being the final end-to-end limiter. When its pressure and drain
+  surfaces are clean, preserve it and move the RED seam one boundary upstream
+  instead of reopening its budgets.
+- Result:
+  `docs/tech/2026-07-10-knife14h10d16-ack-capacity-gate-a-results.md`.
+
 ## 2026-07-09 - Promote skill gates before the next Knife14 architecture slice
 
 - Stage: post-Knife14gv self-review and project-rule update.
