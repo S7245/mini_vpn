@@ -9,7 +9,10 @@ use crate::quic;
 use crate::shared::{ClientError, TargetAddr};
 use crate::tcp_stream_service::StreamPendingFreshness;
 use crate::udp_relay::{FlowEntry, FourTuple, MAX_UDP_FLOWS};
-use crate::upstream::{DatagramUpstream, ProxyUpstream, RelayStream};
+use crate::upstream::{
+    DatagramUpstream, NativeTcpChunk, NativeTcpReadHalf, NativeTcpReader, NativeTcpRelayStream,
+    OpenedTcpRelay, ProxyUpstream, RelayStream, TcpRelayOpenDiag, current_tcp_relay_open_diag,
+};
 use quinn::{Connection, Endpoint, VarInt};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -45,23 +48,38 @@ const DEFAULT_TUIC_QUIC_STATS_SECS: u64 = 30;
 const TUIC_TCP_STREAM_READ_GAP_LOG_MS: u128 = 1_000;
 const TUIC_TCP_STREAM_PENDING_LOG_MS: u128 = TUIC_TCP_STREAM_READ_GAP_LOG_MS;
 const TUIC_TCP_STREAM_PENDING_SELF_WAKE_MS: u64 = 2;
-const TUIC_TCP_RELAY_MODE_ORDERED: &str = "ordered_join";
+const TUIC_TCP_RELAY_MODE_ORDERED_JOIN: &str = "ordered_join";
+const TUIC_TCP_RELAY_MODE_ORDERED_CHUNK: &str = "ordered_chunk";
 const TUIC_TCP_RELAY_MODE_UNORDERED_REASSEMBLY: &str = "unordered_reassembly_diag";
+const TUIC_TCP_RELAY_MODE_NATIVE_CHUNK_PUMP: &str = "native_chunk_pump_diag";
+const TUIC_TCP_RELAY_MODE_NATIVE_ORDERED_PUMP: &str = "native_ordered_pump_diag";
+const TUIC_TCP_RELAY_MODE_D16_DIRECT_ORDERED: &str = "d16_direct_ordered";
 const TUIC_TCP_UNORDERED_CHUNK_READ_MAX_BYTES: usize = 64 * 1024;
+const TUIC_TCP_DIRECT_ORDERED_READ_MAX_BYTES: usize = TUIC_TCP_UNORDERED_CHUNK_READ_MAX_BYTES * 2;
 const TUIC_TCP_UNORDERED_REASSEMBLY_MAX_BYTES: usize = 4 * 1024 * 1024;
 const TUIC_TCP_UNORDERED_STAGING_LOG_MS: u128 = 1_000;
+const TUIC_TCP_NATIVE_ORDERED_PUMP_CHANNEL_CHUNKS: usize = 64;
+const TUIC_TCP_NATIVE_ORDERED_PUMP_READ_CHUNKS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TuicTcpRelayMode {
-    Ordered,
+    OrderedJoin,
+    OrderedChunk,
     UnorderedReassembly,
+    NativeChunkPump,
+    NativeOrderedPump,
+    D16DirectOrdered,
 }
 
 impl TuicTcpRelayMode {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Ordered => TUIC_TCP_RELAY_MODE_ORDERED,
+            Self::OrderedJoin => TUIC_TCP_RELAY_MODE_ORDERED_JOIN,
+            Self::OrderedChunk => TUIC_TCP_RELAY_MODE_ORDERED_CHUNK,
             Self::UnorderedReassembly => TUIC_TCP_RELAY_MODE_UNORDERED_REASSEMBLY,
+            Self::NativeChunkPump => TUIC_TCP_RELAY_MODE_NATIVE_CHUNK_PUMP,
+            Self::NativeOrderedPump => TUIC_TCP_RELAY_MODE_NATIVE_ORDERED_PUMP,
+            Self::D16DirectOrdered => TUIC_TCP_RELAY_MODE_D16_DIRECT_ORDERED,
         }
     }
 }
@@ -248,11 +266,16 @@ fn tcp_diag_enabled() -> bool {
     *TCP_DIAG.get_or_init(|| parse_truthy(std::env::var("MINI_VPN_TCP_DIAG").ok().as_deref()))
 }
 
-fn parse_tuic_tcp_relay_mode(unordered_reassembly: Option<&str>) -> TuicTcpRelayMode {
+fn parse_tuic_tcp_relay_mode(
+    unordered_reassembly: Option<&str>,
+    ordered_chunk: Option<&str>,
+) -> TuicTcpRelayMode {
     if parse_truthy(unordered_reassembly) {
         TuicTcpRelayMode::UnorderedReassembly
+    } else if parse_truthy(ordered_chunk) {
+        TuicTcpRelayMode::OrderedChunk
     } else {
-        TuicTcpRelayMode::Ordered
+        TuicTcpRelayMode::OrderedJoin
     }
 }
 
@@ -263,8 +286,51 @@ fn tuic_tcp_relay_mode() -> TuicTcpRelayMode {
             std::env::var("MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY")
                 .ok()
                 .as_deref(),
+            std::env::var("MINI_VPN_TUIC_TCP_ORDERED_CHUNK")
+                .ok()
+                .as_deref(),
         )
     })
+}
+
+fn tuic_tcp_native_chunk_pump_enabled() -> bool {
+    parse_truthy(
+        std::env::var("MINI_VPN_TUIC_TCP_NATIVE_CHUNK_PUMP")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn tuic_tcp_native_ordered_pump_enabled() -> bool {
+    parse_truthy(
+        std::env::var("MINI_VPN_TUIC_TCP_NATIVE_ORDERED_PUMP")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn h10d16_byte_owned_egress_enabled() -> bool {
+    parse_truthy(
+        std::env::var("MINI_VPN_H10D16_BYTE_OWNED_EGRESS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn select_tuic_native_relay_mode(
+    d16_byte_owned: bool,
+    native_ordered_pump: bool,
+    native_chunk_pump: bool,
+) -> Option<TuicTcpRelayMode> {
+    if d16_byte_owned {
+        Some(TuicTcpRelayMode::D16DirectOrdered)
+    } else if native_ordered_pump {
+        Some(TuicTcpRelayMode::NativeOrderedPump)
+    } else if native_chunk_pump {
+        Some(TuicTcpRelayMode::NativeChunkPump)
+    } else {
+        None
+    }
 }
 
 /// TCP pool 轮询选择。`pool_len` 在生产中恒非 0；纯函数保底处理 0，避免测试/未来误用 panic。
@@ -335,6 +401,148 @@ impl TcpPoolSlotLease {
 impl Drop for TcpPoolSlotLease {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl Clone for TcpPoolSlotLease {
+    fn clone(&self) -> Self {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        Self {
+            active: self.active.clone(),
+        }
+    }
+}
+
+trait OrderedChunkRecv: Unpin {
+    fn poll_read_ordered_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<io::Result<Option<bytes::Bytes>>>;
+}
+
+struct QuinnOrderedChunkRecv {
+    recv: quinn::RecvStream,
+}
+
+impl QuinnOrderedChunkRecv {
+    fn new(recv: quinn::RecvStream) -> Self {
+        Self { recv }
+    }
+}
+
+impl OrderedChunkRecv for QuinnOrderedChunkRecv {
+    fn poll_read_ordered_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<io::Result<Option<bytes::Bytes>>> {
+        let fut = self.recv.read_chunk(max_len, true);
+        tokio::pin!(fut);
+        match fut.poll(cx) {
+            Poll::Ready(Ok(Some(chunk))) => Poll::Ready(Ok(Some(chunk.bytes))),
+            Poll::Ready(Ok(None)) => Poll::Ready(Ok(None)),
+            Poll::Ready(Err(err)) => {
+                Poll::Ready(Err(io::Error::other(format!("tuic ordered read: {err}"))))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+struct TuicOrderedRelayStream<R = QuinnOrderedChunkRecv, S = quinn::SendStream> {
+    recv: R,
+    send: S,
+    pending: bytes::Bytes,
+    recv_eof: bool,
+}
+
+impl TuicOrderedRelayStream<QuinnOrderedChunkRecv, quinn::SendStream> {
+    fn from_quinn(recv: quinn::RecvStream, send: quinn::SendStream) -> Self {
+        Self::new(QuinnOrderedChunkRecv::new(recv), send)
+    }
+}
+
+impl<R, S> TuicOrderedRelayStream<R, S> {
+    fn new(recv: R, send: S) -> Self {
+        Self {
+            recv,
+            send,
+            pending: bytes::Bytes::new(),
+            recv_eof: false,
+        }
+    }
+
+    fn drain_pending_into(&mut self, buf: &mut ReadBuf<'_>) -> usize {
+        let n = self.pending.len().min(buf.remaining());
+        if n == 0 {
+            return 0;
+        }
+        let rest = if n < self.pending.len() {
+            Some(self.pending.slice(n..))
+        } else {
+            None
+        };
+        buf.put_slice(&self.pending[..n]);
+        self.pending = rest.unwrap_or_else(bytes::Bytes::new);
+        n
+    }
+}
+
+impl<R: OrderedChunkRecv, S: Unpin> AsyncRead for TuicOrderedRelayStream<R, S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if self.drain_pending_into(buf) > 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if self.recv_eof {
+            return Poll::Ready(Ok(()));
+        }
+
+        match self
+            .recv
+            .poll_read_ordered_chunk(cx, buf.remaining().max(1))
+        {
+            Poll::Ready(Ok(Some(chunk))) => {
+                if chunk.is_empty() {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                self.pending = chunk;
+                self.drain_pending_into(buf);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(None)) => {
+                self.recv_eof = true;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<R: Unpin, S: AsyncWrite + Unpin> AsyncWrite for TuicOrderedRelayStream<R, S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.send).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.send).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.send).poll_shutdown(cx)
     }
 }
 
@@ -589,15 +797,828 @@ impl AsyncWrite for TuicChunkRelayStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.send).poll_write(cx, buf)
+        <quinn::SendStream as AsyncWrite>::poll_write(Pin::new(&mut self.send), cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.send).poll_flush(cx)
+        <quinn::SendStream as AsyncWrite>::poll_flush(Pin::new(&mut self.send), cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.send).poll_shutdown(cx)
+        <quinn::SendStream as AsyncWrite>::poll_shutdown(Pin::new(&mut self.send), cx)
+    }
+}
+
+trait DirectOrderedNativeChunkRecv: Unpin + Send {
+    fn poll_read_ordered_native_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<io::Result<Option<NativeTcpChunk>>>;
+}
+
+struct QuinnDirectOrderedNativeChunkRecv {
+    recv: quinn::RecvStream,
+}
+
+impl QuinnDirectOrderedNativeChunkRecv {
+    fn new(recv: quinn::RecvStream) -> Self {
+        Self { recv }
+    }
+}
+
+impl DirectOrderedNativeChunkRecv for QuinnDirectOrderedNativeChunkRecv {
+    fn poll_read_ordered_native_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<io::Result<Option<NativeTcpChunk>>> {
+        let poll = {
+            // Quinn documents `read_chunk` as cancellation-safe. Polling one
+            // short-lived future here keeps RecvStream ownership local and
+            // introduces no payload task or message-count channel.
+            let fut = self.recv.read_chunk(max_len, true);
+            tokio::pin!(fut);
+            fut.poll(cx)
+        };
+        match poll {
+            Poll::Ready(Ok(Some(chunk))) => Poll::Ready(Ok(Some(NativeTcpChunk {
+                offset: chunk.offset,
+                bytes: chunk.bytes,
+            }))),
+            Poll::Ready(Ok(None)) => Poll::Ready(Ok(None)),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(io::Error::other(format!(
+                "tuic direct ordered read: {err}"
+            )))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+struct TuicNativeOrderedReader<R = QuinnDirectOrderedNativeChunkRecv> {
+    recv: R,
+    tcp_diag: Option<TuicTcpStreamDiag>,
+    transport_conn: Option<Connection>,
+    next_offset: u64,
+    pending_self_wake_deadline: Option<Instant>,
+    _lease: TcpPoolSlotLease,
+}
+
+impl TuicNativeOrderedReader<QuinnDirectOrderedNativeChunkRecv> {
+    fn new(
+        recv: quinn::RecvStream,
+        lease: TcpPoolSlotLease,
+        tcp_diag: Option<TuicTcpStreamDiag>,
+        transport_conn: Connection,
+    ) -> Self {
+        Self::from_recv(
+            QuinnDirectOrderedNativeChunkRecv::new(recv),
+            lease,
+            tcp_diag,
+            Some(transport_conn),
+        )
+    }
+}
+
+impl<R> TuicNativeOrderedReader<R> {
+    fn from_recv(
+        recv: R,
+        lease: TcpPoolSlotLease,
+        tcp_diag: Option<TuicTcpStreamDiag>,
+        transport_conn: Option<Connection>,
+    ) -> Self {
+        Self {
+            recv,
+            tcp_diag,
+            transport_conn,
+            next_offset: 0,
+            pending_self_wake_deadline: None,
+            _lease: lease,
+        }
+    }
+
+    fn arm_pending_self_wake(&mut self, cx: &Context<'_>, now: Instant) {
+        let deadline = now + Duration::from_millis(TUIC_TCP_STREAM_PENDING_SELF_WAKE_MS);
+        self.pending_self_wake_deadline = Some(deadline);
+        if let Some(diag) = self.tcp_diag.as_mut() {
+            diag.note_self_wake_armed();
+        }
+        let waker = cx.waker().clone();
+        tokio::spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            waker.wake();
+        });
+    }
+
+    fn note_pending(&mut self, cx: &Context<'_>, now: Instant) {
+        let transport = self
+            .transport_conn
+            .as_ref()
+            .map(sample_tuic_stream_transport);
+        let pending_cause =
+            if let (Some(diag), Some(transport)) = (self.tcp_diag.as_ref(), transport) {
+                classify_tuic_stream_pending_cause(Some(TuicStreamTransportPending {
+                    sample: transport,
+                    since_last_read: transport_delta(
+                        diag.last_read_transport_sample.unwrap_or_default(),
+                        transport,
+                    ),
+                    since_last_pending: transport_delta(
+                        diag.last_pending_transport_sample.unwrap_or_default(),
+                        transport,
+                    ),
+                }))
+            } else {
+                TuicTcpStreamPendingCause::NoTransportSample
+            };
+        if should_arm_tuic_stream_pending_self_wake(
+            pending_cause,
+            self.pending_self_wake_deadline,
+            now,
+        ) {
+            self.arm_pending_self_wake(cx, now);
+        }
+        if let Some(diag) = self.tcp_diag.as_mut()
+            && let Some(event) = diag.note_pending_at(now, transport)
+        {
+            let meta = diag.meta.clone();
+            println!(
+                "{}",
+                format_tuic_tcp_stream_pending_line(
+                    &meta,
+                    event.pending_gap_ms,
+                    event.pending_polls,
+                    event.polls,
+                    event.max_poll_gap_ms,
+                    event.rx_bytes,
+                    event.reads,
+                    event.pending_cause,
+                    event.transport,
+                    event.self_wake_armed,
+                    event.self_wake_fired,
+                )
+            );
+        }
+    }
+
+    fn note_chunk_read(&mut self, bytes: usize, now: Instant) {
+        self.pending_self_wake_deadline = None;
+        let transport = self
+            .transport_conn
+            .as_ref()
+            .map(sample_tuic_stream_transport);
+        if let Some(diag) = self.tcp_diag.as_mut() {
+            let event = diag.note_read_at(bytes, now, transport);
+            let meta = diag.meta.clone();
+            if let Some(first_rx_ms) = event.first_rx_ms {
+                println!(
+                    "{}",
+                    format_tuic_tcp_stream_first_rx_line(
+                        &meta,
+                        first_rx_ms,
+                        event.read_bytes,
+                        event.reads,
+                    )
+                );
+            }
+            if let Some(gap_ms) = event.gap_ms
+                && gap_ms >= TUIC_TCP_STREAM_READ_GAP_LOG_MS
+            {
+                println!(
+                    "{}",
+                    format_tuic_tcp_stream_read_gap_line(
+                        &meta,
+                        gap_ms,
+                        event.read_bytes,
+                        event.reads,
+                        event.rx_bytes,
+                    )
+                );
+            }
+        }
+    }
+}
+
+impl<R> NativeTcpReader for TuicNativeOrderedReader<R>
+where
+    R: DirectOrderedNativeChunkRecv,
+{
+    fn poll_read_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<io::Result<Option<NativeTcpChunk>>> {
+        let now = Instant::now();
+        if matches!(self.pending_self_wake_deadline, Some(deadline) if deadline <= now) {
+            self.pending_self_wake_deadline = None;
+            if let Some(diag) = self.tcp_diag.as_mut() {
+                diag.note_self_wake_fired();
+            }
+        }
+        if let Some(diag) = self.tcp_diag.as_mut() {
+            diag.note_poll_at(now);
+        }
+
+        let read_len = max_len.max(1).min(TUIC_TCP_DIRECT_ORDERED_READ_MAX_BYTES);
+        let chunk = match self.recv.poll_read_ordered_native_chunk(cx, read_len) {
+            Poll::Ready(Ok(chunk)) => chunk,
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => {
+                self.note_pending(cx, now);
+                return Poll::Pending;
+            }
+        };
+        let Some(chunk) = chunk else {
+            return Poll::Ready(Ok(None));
+        };
+        if chunk.bytes.len() > read_len {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "tuic direct ordered chunk exceeds max_len: bytes={} max_len={read_len}",
+                    chunk.bytes.len()
+                ),
+            )));
+        }
+        if chunk.offset != self.next_offset {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "tuic direct ordered offset discontinuity: expected={} actual={}",
+                    self.next_offset, chunk.offset
+                ),
+            )));
+        }
+
+        self.next_offset = self.next_offset.saturating_add(chunk.bytes.len() as u64);
+        if !chunk.bytes.is_empty() {
+            self.note_chunk_read(chunk.bytes.len(), now);
+        }
+        Poll::Ready(Ok(Some(chunk)))
+    }
+}
+
+impl<R> Drop for TuicNativeOrderedReader<R> {
+    fn drop(&mut self) {
+        if let Some(diag) = &self.tcp_diag {
+            let snapshot = diag.close_snapshot();
+            println!(
+                "{}",
+                format_tuic_tcp_stream_close_line(&diag.meta, &snapshot)
+            );
+        }
+    }
+}
+
+#[async_trait::async_trait]
+trait TuicOrderedNativeChunkSource: Send + 'static {
+    async fn read_ordered_native_chunk(
+        &mut self,
+        max_len: usize,
+    ) -> io::Result<Option<NativeTcpChunk>>;
+}
+
+struct QuinnOrderedNativeChunkSource {
+    recv: quinn::RecvStream,
+    next_offset: u64,
+}
+
+impl QuinnOrderedNativeChunkSource {
+    fn new(recv: quinn::RecvStream) -> Self {
+        Self {
+            recv,
+            next_offset: 0,
+        }
+    }
+}
+
+fn combine_ordered_native_chunks(
+    next_offset: &mut u64,
+    chunks: &[bytes::Bytes],
+) -> Option<NativeTcpChunk> {
+    let total_len = chunks.iter().map(bytes::Bytes::len).sum::<usize>();
+    if total_len == 0 {
+        return None;
+    }
+    let offset = *next_offset;
+    *next_offset = next_offset.saturating_add(total_len as u64);
+    if chunks.len() == 1 {
+        return Some(NativeTcpChunk {
+            offset,
+            bytes: chunks[0].clone(),
+        });
+    }
+    let mut combined = bytes::BytesMut::with_capacity(total_len);
+    for chunk in chunks {
+        combined.extend_from_slice(chunk);
+    }
+    Some(NativeTcpChunk {
+        offset,
+        bytes: combined.freeze(),
+    })
+}
+
+#[async_trait::async_trait]
+impl TuicOrderedNativeChunkSource for QuinnOrderedNativeChunkSource {
+    async fn read_ordered_native_chunk(
+        &mut self,
+        _max_len: usize,
+    ) -> io::Result<Option<NativeTcpChunk>> {
+        let mut chunks = vec![bytes::Bytes::new(); TUIC_TCP_NATIVE_ORDERED_PUMP_READ_CHUNKS];
+        match self.recv.read_chunks(&mut chunks).await {
+            Ok(Some(n)) => Ok(combine_ordered_native_chunks(
+                &mut self.next_offset,
+                &chunks[..n],
+            )),
+            Ok(None) => Ok(None),
+            Err(err) => Err(io::Error::other(format!("tuic native ordered read: {err}"))),
+        }
+    }
+}
+
+struct TuicNativeOrderedPumpReader {
+    rx: mpsc::Receiver<io::Result<Option<NativeTcpChunk>>>,
+    task: tokio::task::JoinHandle<()>,
+    tcp_diag: Option<TuicTcpStreamDiag>,
+    transport_conn: Option<Connection>,
+    pending_self_wake_deadline: Option<Instant>,
+    pending_chunk: Option<NativeTcpChunk>,
+    pending_eof: bool,
+    pending_error: Option<io::Error>,
+    _lease: TcpPoolSlotLease,
+}
+
+impl TuicNativeOrderedPumpReader {
+    fn spawn(
+        recv: quinn::RecvStream,
+        lease: TcpPoolSlotLease,
+        tcp_diag: Option<TuicTcpStreamDiag>,
+        transport_conn: Connection,
+    ) -> Self {
+        Self::spawn_from_source(
+            QuinnOrderedNativeChunkSource::new(recv),
+            lease,
+            tcp_diag,
+            Some(transport_conn),
+        )
+    }
+
+    fn spawn_from_source<S>(
+        mut source: S,
+        lease: TcpPoolSlotLease,
+        tcp_diag: Option<TuicTcpStreamDiag>,
+        transport_conn: Option<Connection>,
+    ) -> Self
+    where
+        S: TuicOrderedNativeChunkSource,
+    {
+        let (tx, rx) = mpsc::channel::<io::Result<Option<NativeTcpChunk>>>(
+            TUIC_TCP_NATIVE_ORDERED_PUMP_CHANNEL_CHUNKS,
+        );
+        let task = tokio::spawn(async move {
+            loop {
+                let result = source
+                    .read_ordered_native_chunk(TUIC_TCP_UNORDERED_CHUNK_READ_MAX_BYTES)
+                    .await;
+                let terminal = !matches!(result, Ok(Some(_)));
+                if tx.send(result).await.is_err() || terminal {
+                    break;
+                }
+            }
+        });
+        Self {
+            rx,
+            task,
+            tcp_diag,
+            transport_conn,
+            pending_self_wake_deadline: None,
+            pending_chunk: None,
+            pending_eof: false,
+            pending_error: None,
+            _lease: lease,
+        }
+    }
+
+    fn arm_pending_self_wake(&mut self, cx: &Context<'_>, now: Instant) {
+        let deadline = now + Duration::from_millis(TUIC_TCP_STREAM_PENDING_SELF_WAKE_MS);
+        self.pending_self_wake_deadline = Some(deadline);
+        if let Some(diag) = self.tcp_diag.as_mut() {
+            diag.note_self_wake_armed();
+        }
+        let waker = cx.waker().clone();
+        tokio::spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            waker.wake();
+        });
+    }
+
+    fn note_pending(&mut self, cx: &Context<'_>, now: Instant) {
+        let transport = self
+            .transport_conn
+            .as_ref()
+            .map(sample_tuic_stream_transport);
+        let pending_cause =
+            if let (Some(diag), Some(transport)) = (self.tcp_diag.as_ref(), transport) {
+                classify_tuic_stream_pending_cause(Some(TuicStreamTransportPending {
+                    sample: transport,
+                    since_last_read: transport_delta(
+                        diag.last_read_transport_sample.unwrap_or_default(),
+                        transport,
+                    ),
+                    since_last_pending: transport_delta(
+                        diag.last_pending_transport_sample.unwrap_or_default(),
+                        transport,
+                    ),
+                }))
+            } else {
+                TuicTcpStreamPendingCause::NoTransportSample
+            };
+        if should_arm_tuic_stream_pending_self_wake(
+            pending_cause,
+            self.pending_self_wake_deadline,
+            now,
+        ) {
+            self.arm_pending_self_wake(cx, now);
+        }
+        if let Some(diag) = self.tcp_diag.as_mut()
+            && let Some(event) = diag.note_pending_at(now, transport)
+        {
+            let meta = diag.meta.clone();
+            println!(
+                "{}",
+                format_tuic_tcp_stream_pending_line(
+                    &meta,
+                    event.pending_gap_ms,
+                    event.pending_polls,
+                    event.polls,
+                    event.max_poll_gap_ms,
+                    event.rx_bytes,
+                    event.reads,
+                    event.pending_cause,
+                    event.transport,
+                    event.self_wake_armed,
+                    event.self_wake_fired,
+                )
+            );
+        }
+    }
+
+    fn note_chunk_read(&mut self, bytes: usize, now: Instant) {
+        self.pending_self_wake_deadline = None;
+        let transport = self
+            .transport_conn
+            .as_ref()
+            .map(sample_tuic_stream_transport);
+        if let Some(diag) = self.tcp_diag.as_mut() {
+            let event = diag.note_read_at(bytes, now, transport);
+            let meta = diag.meta.clone();
+            if let Some(first_rx_ms) = event.first_rx_ms {
+                println!(
+                    "{}",
+                    format_tuic_tcp_stream_first_rx_line(
+                        &meta,
+                        first_rx_ms,
+                        event.read_bytes,
+                        event.reads,
+                    )
+                );
+            }
+            if let Some(gap_ms) = event.gap_ms
+                && gap_ms >= TUIC_TCP_STREAM_READ_GAP_LOG_MS
+            {
+                println!(
+                    "{}",
+                    format_tuic_tcp_stream_read_gap_line(
+                        &meta,
+                        gap_ms,
+                        event.read_bytes,
+                        event.reads,
+                        event.rx_bytes,
+                    )
+                );
+            }
+        }
+    }
+}
+
+impl NativeTcpReader for TuicNativeOrderedPumpReader {
+    fn poll_read_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<io::Result<Option<NativeTcpChunk>>> {
+        let now = Instant::now();
+        if matches!(self.pending_self_wake_deadline, Some(deadline) if deadline <= now) {
+            self.pending_self_wake_deadline = None;
+            if let Some(diag) = self.tcp_diag.as_mut() {
+                diag.note_self_wake_fired();
+            }
+        }
+        if let Some(diag) = self.tcp_diag.as_mut() {
+            diag.note_poll_at(now);
+        }
+
+        if let Some(err) = self.pending_error.take() {
+            return Poll::Ready(Err(err));
+        }
+        if self.pending_eof {
+            self.pending_eof = false;
+            return Poll::Ready(Ok(None));
+        }
+
+        let max_len = max_len.max(1);
+        let first = if let Some(chunk) = self.pending_chunk.take() {
+            chunk
+        } else {
+            match self.rx.poll_recv(cx) {
+                Poll::Ready(Some(Ok(Some(chunk)))) => chunk,
+                Poll::Ready(Some(Ok(None))) | Poll::Ready(None) => {
+                    return Poll::Ready(Ok(None));
+                }
+                Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(err)),
+                Poll::Pending => {
+                    self.note_pending(cx, now);
+                    return Poll::Pending;
+                }
+            }
+        };
+
+        let offset = first.offset;
+        let mut next_offset = offset;
+        let mut combined = bytes::BytesMut::with_capacity(max_len.min(first.bytes.len().max(1)));
+        let mut chunk = first;
+
+        loop {
+            if !chunk.bytes.is_empty() && chunk.offset == next_offset {
+                let remaining = max_len.saturating_sub(combined.len());
+                let take = remaining.min(chunk.bytes.len());
+                combined.extend_from_slice(&chunk.bytes[..take]);
+                next_offset = next_offset.saturating_add(take as u64);
+                if take < chunk.bytes.len() {
+                    self.pending_chunk = Some(NativeTcpChunk {
+                        offset: chunk.offset.saturating_add(take as u64),
+                        bytes: chunk.bytes.slice(take..),
+                    });
+                    break;
+                }
+            } else if !chunk.bytes.is_empty() {
+                self.pending_chunk = Some(chunk);
+                break;
+            }
+
+            if combined.len() >= max_len {
+                break;
+            }
+
+            match self.rx.poll_recv(cx) {
+                Poll::Ready(Some(Ok(Some(next)))) => {
+                    chunk = next;
+                }
+                Poll::Ready(Some(Ok(None))) | Poll::Ready(None) => {
+                    self.pending_eof = true;
+                    break;
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    self.pending_error = Some(err);
+                    break;
+                }
+                Poll::Pending => break,
+            }
+        }
+
+        if combined.is_empty() {
+            self.note_pending(cx, now);
+            return Poll::Pending;
+        }
+        let bytes = combined.freeze();
+        self.note_chunk_read(bytes.len(), now);
+        Poll::Ready(Ok(Some(NativeTcpChunk { offset, bytes })))
+    }
+}
+
+impl Drop for TuicNativeOrderedPumpReader {
+    fn drop(&mut self) {
+        self.task.abort();
+        if let Some(diag) = &self.tcp_diag {
+            let snapshot = diag.close_snapshot();
+            println!(
+                "{}",
+                format_tuic_tcp_stream_close_line(&diag.meta, &snapshot)
+            );
+        }
+    }
+}
+
+struct TuicNativeTcpReader {
+    recv: quinn::RecvStream,
+    tcp_diag: Option<TuicTcpStreamDiag>,
+    transport_conn: Connection,
+    pending_self_wake_deadline: Option<Instant>,
+    _lease: TcpPoolSlotLease,
+}
+
+impl TuicNativeTcpReader {
+    fn new(
+        recv: quinn::RecvStream,
+        lease: TcpPoolSlotLease,
+        tcp_diag: Option<TuicTcpStreamDiag>,
+        transport_conn: Connection,
+    ) -> Self {
+        Self {
+            recv,
+            tcp_diag,
+            transport_conn,
+            pending_self_wake_deadline: None,
+            _lease: lease,
+        }
+    }
+
+    fn read_error(err: quinn::ReadError) -> io::Error {
+        io::Error::other(format!("tuic native unordered read: {err}"))
+    }
+
+    fn arm_pending_self_wake(&mut self, cx: &Context<'_>, now: Instant) {
+        let deadline = now + Duration::from_millis(TUIC_TCP_STREAM_PENDING_SELF_WAKE_MS);
+        self.pending_self_wake_deadline = Some(deadline);
+        if let Some(diag) = self.tcp_diag.as_mut() {
+            diag.note_self_wake_armed();
+        }
+        let waker = cx.waker().clone();
+        tokio::spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            waker.wake();
+        });
+    }
+
+    fn note_pending(&mut self, cx: &Context<'_>, now: Instant) {
+        let transport = sample_tuic_stream_transport(&self.transport_conn);
+        let pending_cause = if let Some(diag) = self.tcp_diag.as_ref() {
+            classify_tuic_stream_pending_cause(Some(TuicStreamTransportPending {
+                sample: transport,
+                since_last_read: transport_delta(
+                    diag.last_read_transport_sample.unwrap_or_default(),
+                    transport,
+                ),
+                since_last_pending: transport_delta(
+                    diag.last_pending_transport_sample.unwrap_or_default(),
+                    transport,
+                ),
+            }))
+        } else {
+            TuicTcpStreamPendingCause::NoTransportSample
+        };
+        if should_arm_tuic_stream_pending_self_wake(
+            pending_cause,
+            self.pending_self_wake_deadline,
+            now,
+        ) {
+            self.arm_pending_self_wake(cx, now);
+        }
+        if let Some(diag) = self.tcp_diag.as_mut()
+            && let Some(event) = diag.note_pending_at(now, Some(transport))
+        {
+            let meta = diag.meta.clone();
+            println!(
+                "{}",
+                format_tuic_tcp_stream_pending_line(
+                    &meta,
+                    event.pending_gap_ms,
+                    event.pending_polls,
+                    event.polls,
+                    event.max_poll_gap_ms,
+                    event.rx_bytes,
+                    event.reads,
+                    event.pending_cause,
+                    event.transport,
+                    event.self_wake_armed,
+                    event.self_wake_fired,
+                )
+            );
+        }
+    }
+
+    fn note_chunk_read(&mut self, bytes: usize, now: Instant) {
+        self.pending_self_wake_deadline = None;
+        let transport = sample_tuic_stream_transport(&self.transport_conn);
+        if let Some(diag) = self.tcp_diag.as_mut() {
+            let event = diag.note_read_at(bytes, now, Some(transport));
+            let meta = diag.meta.clone();
+            if let Some(first_rx_ms) = event.first_rx_ms {
+                println!(
+                    "{}",
+                    format_tuic_tcp_stream_first_rx_line(
+                        &meta,
+                        first_rx_ms,
+                        event.read_bytes,
+                        event.reads,
+                    )
+                );
+            }
+            if let Some(gap_ms) = event.gap_ms
+                && gap_ms >= TUIC_TCP_STREAM_READ_GAP_LOG_MS
+            {
+                println!(
+                    "{}",
+                    format_tuic_tcp_stream_read_gap_line(
+                        &meta,
+                        gap_ms,
+                        event.read_bytes,
+                        event.reads,
+                        event.rx_bytes,
+                    )
+                );
+            }
+        }
+    }
+}
+
+impl NativeTcpReader for TuicNativeTcpReader {
+    fn poll_read_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<io::Result<Option<NativeTcpChunk>>> {
+        let now = Instant::now();
+        if matches!(self.pending_self_wake_deadline, Some(deadline) if deadline <= now) {
+            self.pending_self_wake_deadline = None;
+            if let Some(diag) = self.tcp_diag.as_mut() {
+                diag.note_self_wake_fired();
+            }
+        }
+        if let Some(diag) = self.tcp_diag.as_mut() {
+            diag.note_poll_at(now);
+        }
+        let read_len = max_len.max(1).min(TUIC_TCP_UNORDERED_CHUNK_READ_MAX_BYTES);
+        let poll = {
+            let fut = self.recv.read_chunk(read_len, false);
+            tokio::pin!(fut);
+            fut.poll(cx)
+        };
+        let chunk = match poll {
+            Poll::Ready(Ok(chunk)) => chunk,
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(Self::read_error(err))),
+            Poll::Pending => {
+                self.note_pending(cx, now);
+                return Poll::Pending;
+            }
+        };
+        match chunk {
+            Some(chunk) => {
+                let bytes_len = chunk.bytes.len();
+                if bytes_len > 0 {
+                    self.note_chunk_read(bytes_len, now);
+                }
+                Poll::Ready(Ok(Some(NativeTcpChunk {
+                    offset: chunk.offset,
+                    bytes: chunk.bytes,
+                })))
+            }
+            None => Poll::Ready(Ok(None)),
+        }
+    }
+}
+
+impl Drop for TuicNativeTcpReader {
+    fn drop(&mut self) {
+        if let Some(diag) = &self.tcp_diag {
+            let snapshot = diag.close_snapshot();
+            println!(
+                "{}",
+                format_tuic_tcp_stream_close_line(&diag.meta, &snapshot)
+            );
+        }
+    }
+}
+
+struct TuicNativeTcpWriter {
+    send: quinn::SendStream,
+    _lease: TcpPoolSlotLease,
+}
+
+impl TuicNativeTcpWriter {
+    fn new(send: quinn::SendStream, lease: TcpPoolSlotLease) -> Self {
+        Self {
+            send,
+            _lease: lease,
+        }
+    }
+}
+
+impl AsyncWrite for TuicNativeTcpWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        <quinn::SendStream as AsyncWrite>::poll_write(Pin::new(&mut self.send), cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        <quinn::SendStream as AsyncWrite>::poll_flush(Pin::new(&mut self.send), cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        <quinn::SendStream as AsyncWrite>::poll_shutdown(Pin::new(&mut self.send), cx)
     }
 }
 
@@ -1446,14 +2467,39 @@ fn format_tuic_tcp_open_line(
     startup_auth_attempts: u64,
     relay_mode: TuicTcpRelayMode,
 ) -> String {
+    let open_diag = current_tcp_relay_open_diag();
+    format_tuic_tcp_open_line_with_diag(
+        target,
+        conn_index,
+        stable_id,
+        stream_id,
+        startup_auth_attempts,
+        relay_mode,
+        open_diag.as_ref(),
+    )
+}
+
+fn format_tuic_tcp_open_line_with_diag(
+    target: &TargetAddr,
+    conn_index: usize,
+    stable_id: usize,
+    stream_id: u64,
+    startup_auth_attempts: u64,
+    relay_mode: TuicTcpRelayMode,
+    open_diag: Option<&TcpRelayOpenDiag>,
+) -> String {
+    let bridge = open_diag.map_or_else(String::new, |diag| {
+        format!(" handle={} epoch={}", diag.handle, diag.epoch)
+    });
     format!(
-        "🔎 tuic-open-tcp target={} conn={} id={} stream={} relay_mode={} startup_auth_attempts={}",
+        "🔎 tuic-open-tcp target={} conn={} id={} stream={} relay_mode={} startup_auth_attempts={}{}",
         target.to_wire_string(),
         conn_index,
         stable_id,
         stream_id,
         relay_mode.as_str(),
-        startup_auth_attempts
+        startup_auth_attempts,
+        bridge
     )
 }
 
@@ -2253,9 +3299,7 @@ impl TuicUpstream {
         uni.write_all(&encode_authenticate(uuid, &token))
             .await
             .map_err(|e| io_err("tuic auth write", e))?;
-        uni.finish()
-            .await
-            .map_err(|e| io_err("tuic auth finish", e))?;
+        uni.finish().map_err(|e| io_err("tuic auth finish", e))?;
         Ok(())
     }
 
@@ -2420,9 +3464,7 @@ impl TuicUpstream {
         uni.write_all(packet)
             .await
             .map_err(|e| io_err("udp uni write", e))?;
-        uni.finish()
-            .await
-            .map_err(|e| io_err("udp uni finish", e))?;
+        uni.finish().map_err(|e| io_err("udp uni finish", e))?;
         Ok(())
     }
 
@@ -2605,7 +3647,7 @@ impl ProxyUpstream for TuicUpstream {
                 .await
                 .map_err(|e| io_err("tuic open_bi", e))?;
             let stable_id = conn.stable_id();
-            let stream_id = recv.id().0;
+            let stream_id = recv.id().index();
             send.write_all(&encode_connect(target))
                 .await
                 .map_err(|e| io_err("tuic connect write", e))?;
@@ -2637,8 +3679,14 @@ impl ProxyUpstream for TuicUpstream {
                 .clone()
                 .map(|meta| TuicTcpStreamDiag::new(meta, Instant::now()));
             let relay: RelayStream = match relay_mode {
-                TuicTcpRelayMode::Ordered => Box::new(TrackedRelayStream::new_with_transport(
+                TuicTcpRelayMode::OrderedJoin => Box::new(TrackedRelayStream::new_with_transport(
                     tokio::io::join(recv, send),
+                    lease,
+                    tcp_stream_diag,
+                    conn.clone(),
+                )),
+                TuicTcpRelayMode::OrderedChunk => Box::new(TrackedRelayStream::new_with_transport(
+                    TuicOrderedRelayStream::from_quinn(recv, send),
                     lease,
                     tcp_stream_diag,
                     conn.clone(),
@@ -2651,8 +3699,104 @@ impl ProxyUpstream for TuicUpstream {
                         conn.clone(),
                     ))
                 }
+                TuicTcpRelayMode::NativeChunkPump => {
+                    unreachable!("native TUIC TCP relay is returned by open_tcp_relay")
+                }
+                TuicTcpRelayMode::NativeOrderedPump => {
+                    unreachable!("native ordered TUIC TCP relay is returned by open_tcp_relay")
+                }
+                TuicTcpRelayMode::D16DirectOrdered => {
+                    unreachable!("D16 direct TUIC TCP relay is returned by open_tcp_relay")
+                }
             };
             Ok::<RelayStream, ClientError>(relay)
+        };
+        tokio::time::timeout(TUIC_OPEN_TIMEOUT, open)
+            .await
+            .map_err(|_| {
+                io_err(
+                    "tuic open_tcp",
+                    "5s 超时（黑洞/send 窗口满无 ACK；failover 慢路据此累计切备腿）",
+                )
+            })?
+    }
+
+    async fn open_tcp_relay(&self, target: &TargetAddr) -> Result<OpenedTcpRelay, ClientError> {
+        let Some(relay_mode) = select_tuic_native_relay_mode(
+            h10d16_byte_owned_egress_enabled(),
+            tuic_tcp_native_ordered_pump_enabled(),
+            tuic_tcp_native_chunk_pump_enabled(),
+        ) else {
+            return self.open_tcp(target).await.map(OpenedTcpRelay::Generic);
+        };
+        let d16_byte_owned = relay_mode == TuicTcpRelayMode::D16DirectOrdered;
+
+        let (conn_index, conn, lease) = self.live_tcp_conn().await?;
+        let open = async {
+            let (mut send, recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| io_err("tuic open_bi", e))?;
+            let stable_id = conn.stable_id();
+            let stream_id = recv.id().index();
+            send.write_all(&encode_connect(target))
+                .await
+                .map_err(|e| io_err("tuic connect write", e))?;
+            let startup_auth_attempts = self
+                .tcp_startup_auth_attempts
+                .get(conn_index)
+                .map(|attempts| attempts.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            let diag_meta = if tcp_diag_enabled() {
+                println!(
+                    "{}",
+                    format_tuic_tcp_open_line(
+                        target,
+                        conn_index,
+                        stable_id,
+                        stream_id,
+                        startup_auth_attempts,
+                        relay_mode,
+                    )
+                );
+                Some(TuicTcpStreamDiagMeta::new(
+                    target, conn_index, stable_id, stream_id,
+                ))
+            } else {
+                None
+            };
+            let tcp_stream_diag = diag_meta
+                .clone()
+                .map(|meta| TuicTcpStreamDiag::new(meta, Instant::now()));
+            let reader: NativeTcpReadHalf = if d16_byte_owned {
+                Box::new(TuicNativeOrderedReader::new(
+                    recv,
+                    lease.clone(),
+                    tcp_stream_diag,
+                    conn.clone(),
+                ))
+            } else if relay_mode == TuicTcpRelayMode::NativeOrderedPump {
+                Box::new(TuicNativeOrderedPumpReader::spawn(
+                    recv,
+                    lease.clone(),
+                    tcp_stream_diag,
+                    conn.clone(),
+                ))
+            } else {
+                Box::new(TuicNativeTcpReader::new(
+                    recv,
+                    lease.clone(),
+                    tcp_stream_diag,
+                    conn.clone(),
+                ))
+            };
+            let writer = Box::new(TuicNativeTcpWriter::new(send, lease));
+            let relay = NativeTcpRelayStream { reader, writer };
+            Ok::<OpenedTcpRelay, ClientError>(if d16_byte_owned {
+                OpenedTcpRelay::NativeByteOwned(relay)
+            } else {
+                OpenedTcpRelay::Native(relay)
+            })
         };
         tokio::time::timeout(TUIC_OPEN_TIMEOUT, open)
             .await
@@ -2734,6 +3878,7 @@ impl crate::failover::HealthProbe for TuicUpstream {
 mod tests {
     use super::*;
     use crate::shared::TargetAddr;
+    use crate::tcp_downlink_pump::{AsyncLeasedByteFlowQueue, DownstreamPermitReleaseMode};
 
     #[test]
     fn address_ipv4() {
@@ -2859,37 +4004,497 @@ mod tests {
     }
 
     #[test]
-    fn tuic_tcp_relay_mode_defaults_to_ordered_and_gates_unordered_reassembly() {
-        assert_eq!(parse_tuic_tcp_relay_mode(None), TuicTcpRelayMode::Ordered);
+    fn tuic_tcp_relay_mode_defaults_to_ordered_join_and_gates_diagnostics() {
         assert_eq!(
-            parse_tuic_tcp_relay_mode(Some("")),
-            TuicTcpRelayMode::Ordered
+            parse_tuic_tcp_relay_mode(None, None),
+            TuicTcpRelayMode::OrderedJoin
         );
         assert_eq!(
-            parse_tuic_tcp_relay_mode(Some("0")),
-            TuicTcpRelayMode::Ordered
+            parse_tuic_tcp_relay_mode(Some(""), Some("")),
+            TuicTcpRelayMode::OrderedJoin
         );
         assert_eq!(
-            parse_tuic_tcp_relay_mode(Some("false")),
-            TuicTcpRelayMode::Ordered
+            parse_tuic_tcp_relay_mode(Some("0"), Some("0")),
+            TuicTcpRelayMode::OrderedJoin
+        );
+        assert_eq!(
+            parse_tuic_tcp_relay_mode(Some("false"), Some("false")),
+            TuicTcpRelayMode::OrderedJoin
         );
 
         assert_eq!(
-            parse_tuic_tcp_relay_mode(Some("1")),
+            parse_tuic_tcp_relay_mode(None, Some("1")),
+            TuicTcpRelayMode::OrderedChunk
+        );
+        assert_eq!(
+            parse_tuic_tcp_relay_mode(None, Some("true")),
+            TuicTcpRelayMode::OrderedChunk
+        );
+
+        assert_eq!(
+            parse_tuic_tcp_relay_mode(Some("1"), None),
             TuicTcpRelayMode::UnorderedReassembly
         );
         assert_eq!(
-            parse_tuic_tcp_relay_mode(Some("true")),
+            parse_tuic_tcp_relay_mode(Some("true"), None),
             TuicTcpRelayMode::UnorderedReassembly
         );
         assert_eq!(
-            parse_tuic_tcp_relay_mode(Some("on")),
+            parse_tuic_tcp_relay_mode(Some("on"), None),
             TuicTcpRelayMode::UnorderedReassembly
         );
         assert_eq!(
-            parse_tuic_tcp_relay_mode(Some("yes")),
+            parse_tuic_tcp_relay_mode(Some("yes"), None),
             TuicTcpRelayMode::UnorderedReassembly
         );
+        assert_eq!(
+            parse_tuic_tcp_relay_mode(Some("1"), Some("1")),
+            TuicTcpRelayMode::UnorderedReassembly
+        );
+        assert_eq!(
+            TuicTcpRelayMode::NativeChunkPump.as_str(),
+            "native_chunk_pump_diag"
+        );
+        assert_eq!(
+            TuicTcpRelayMode::NativeOrderedPump.as_str(),
+            "native_ordered_pump_diag"
+        );
+    }
+
+    #[test]
+    fn d16_read_reservation_counts_before_remote_read() {
+        let queue = AsyncLeasedByteFlowQueue::new_with_release_mode(
+            512 * 1024,
+            DownstreamPermitReleaseMode::OnEgressDrain,
+        )
+        .unwrap();
+        assert_eq!(queue.blocking_snapshot_for_test().reserved_bytes, 0);
+    }
+
+    struct PendingOnceOrderedSource {
+        calls: Arc<AtomicU64>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        payload: bytes::Bytes,
+    }
+
+    #[async_trait::async_trait]
+    impl TuicOrderedNativeChunkSource for PendingOnceOrderedSource {
+        async fn read_ordered_native_chunk(
+            &mut self,
+            _max_len: usize,
+        ) -> io::Result<Option<NativeTcpChunk>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                self.entered.notify_one();
+                self.release.notified().await;
+                return Ok(Some(NativeTcpChunk {
+                    offset: 0,
+                    bytes: self.payload.clone(),
+                }));
+            }
+            std::future::pending::<io::Result<Option<NativeTcpChunk>>>().await
+        }
+    }
+
+    struct SequenceOrderedSource {
+        calls: Arc<AtomicU64>,
+        chunks: Vec<NativeTcpChunk>,
+    }
+
+    #[async_trait::async_trait]
+    impl TuicOrderedNativeChunkSource for SequenceOrderedSource {
+        async fn read_ordered_native_chunk(
+            &mut self,
+            _max_len: usize,
+        ) -> io::Result<Option<NativeTcpChunk>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) as usize;
+            if call < self.chunks.len() {
+                Ok(Some(self.chunks[call].clone()))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_ordered_pump_holds_pending_read_until_ready() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let source = PendingOnceOrderedSource {
+            calls: calls.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+            payload: bytes::Bytes::from_static(b"ordered-pump"),
+        };
+        let active = Arc::new(AtomicU64::new(0));
+        let (lease, reserved) = TcpPoolSlotLease::reserve(active.clone());
+        assert!(reserved);
+        let mut reader = TuicNativeOrderedPumpReader::spawn_from_source(source, lease, None, None);
+
+        tokio::time::timeout(Duration::from_millis(200), entered.notified())
+            .await
+            .expect("read pump should enter the first source read");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the pump must hold the pending read future instead of starting another read"
+        );
+
+        release.notify_one();
+        let chunk = tokio::time::timeout(Duration::from_millis(200), async {
+            std::future::poll_fn(|cx| reader.poll_read_chunk(cx, 4096)).await
+        })
+        .await
+        .expect("released ordered read should reach the native reader")
+        .expect("pump read should succeed")
+        .expect("released read should produce a chunk");
+        assert_eq!(chunk.offset, 0);
+        assert_eq!(&chunk.bytes[..], b"ordered-pump");
+
+        drop(reader);
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            0,
+            "dropping the ordered pump reader must release its TCP pool lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_ordered_pump_reader_batches_ready_chunks_to_max_len() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let source = SequenceOrderedSource {
+            calls: calls.clone(),
+            chunks: vec![
+                NativeTcpChunk {
+                    offset: 0,
+                    bytes: bytes::Bytes::from_static(b"ab"),
+                },
+                NativeTcpChunk {
+                    offset: 2,
+                    bytes: bytes::Bytes::from_static(b"cdef"),
+                },
+                NativeTcpChunk {
+                    offset: 6,
+                    bytes: bytes::Bytes::from_static(b"gh"),
+                },
+            ],
+        };
+        let active = Arc::new(AtomicU64::new(0));
+        let (lease, reserved) = TcpPoolSlotLease::reserve(active.clone());
+        assert!(reserved);
+        let mut reader = TuicNativeOrderedPumpReader::spawn_from_source(source, lease, None, None);
+
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while calls.load(Ordering::SeqCst) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("source should publish all ready chunks and EOF");
+
+        let first = std::future::poll_fn(|cx| reader.poll_read_chunk(cx, 5))
+            .await
+            .expect("first batched read should succeed")
+            .expect("first batched read should produce data");
+        assert_eq!(first.offset, 0);
+        assert_eq!(&first.bytes[..], b"abcde");
+
+        let second = std::future::poll_fn(|cx| reader.poll_read_chunk(cx, 16))
+            .await
+            .expect("second batched read should succeed")
+            .expect("second batched read should produce stashed remainder");
+        assert_eq!(second.offset, 5);
+        assert_eq!(&second.bytes[..], b"fgh");
+
+        let eof = std::future::poll_fn(|cx| reader.poll_read_chunk(cx, 16))
+            .await
+            .expect("EOF read should succeed");
+        assert!(eof.is_none(), "EOF must be delivered after stashed bytes");
+
+        drop(reader);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    struct RecordingDirectOrderedRecv {
+        max_lens: Arc<std::sync::Mutex<Vec<usize>>>,
+        chunk: Option<NativeTcpChunk>,
+    }
+
+    impl DirectOrderedNativeChunkRecv for RecordingDirectOrderedRecv {
+        fn poll_read_ordered_native_chunk(
+            &mut self,
+            _cx: &mut Context<'_>,
+            max_len: usize,
+        ) -> Poll<io::Result<Option<NativeTcpChunk>>> {
+            self.max_lens.lock().unwrap().push(max_len);
+            Poll::Ready(Ok(self.chunk.take()))
+        }
+    }
+
+    struct PendingDirectOrderedRecv {
+        starts: Arc<AtomicU64>,
+        released: Arc<std::sync::atomic::AtomicBool>,
+        in_flight: bool,
+    }
+
+    impl DirectOrderedNativeChunkRecv for PendingDirectOrderedRecv {
+        fn poll_read_ordered_native_chunk(
+            &mut self,
+            _cx: &mut Context<'_>,
+            _max_len: usize,
+        ) -> Poll<io::Result<Option<NativeTcpChunk>>> {
+            if !self.in_flight {
+                self.in_flight = true;
+                self.starts.fetch_add(1, Ordering::SeqCst);
+            }
+            if !self.released.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
+            self.in_flight = false;
+            Poll::Ready(Ok(Some(NativeTcpChunk {
+                offset: 0,
+                bytes: bytes::Bytes::from_static(b"ready"),
+            })))
+        }
+    }
+
+    #[test]
+    fn d16_direct_ordered_reader_forwards_exact_max_len() {
+        let max_lens = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recv = RecordingDirectOrderedRecv {
+            max_lens: max_lens.clone(),
+            chunk: Some(NativeTcpChunk {
+                offset: 0,
+                bytes: bytes::Bytes::from_static(b"direct"),
+            }),
+        };
+        let active = Arc::new(AtomicU64::new(0));
+        let (lease, reserved) = TcpPoolSlotLease::reserve(active.clone());
+        assert!(reserved);
+        let mut reader = TuicNativeOrderedReader::from_recv(recv, lease, None, None);
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        let Poll::Ready(chunk) = reader.poll_read_chunk(&mut cx, 128 * 1024) else {
+            panic!("recording direct reader should be ready");
+        };
+        let chunk = chunk
+            .expect("recording direct reader should succeed")
+            .expect("recording direct reader should return data");
+        assert_eq!(&chunk.bytes[..], b"direct");
+        assert_eq!(&*max_lens.lock().unwrap(), &[128 * 1024]);
+    }
+
+    #[test]
+    fn h10d16_single_gate_selects_direct_ordered_native_relay() {
+        assert_eq!(
+            select_tuic_native_relay_mode(true, false, false),
+            Some(TuicTcpRelayMode::D16DirectOrdered)
+        );
+        assert_eq!(
+            select_tuic_native_relay_mode(true, true, true),
+            Some(TuicTcpRelayMode::D16DirectOrdered),
+            "the approved D16 gate must not depend on or lose to older diagnostic flags"
+        );
+        assert_eq!(select_tuic_native_relay_mode(false, false, false), None);
+    }
+
+    #[test]
+    fn d16_direct_ordered_reader_never_returns_more_than_max_len() {
+        let max_lens = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recv = RecordingDirectOrderedRecv {
+            max_lens: max_lens.clone(),
+            chunk: Some(NativeTcpChunk {
+                offset: 0,
+                bytes: bytes::Bytes::from(vec![1; 16 * 1024 + 1]),
+            }),
+        };
+        let active = Arc::new(AtomicU64::new(0));
+        let (lease, reserved) = TcpPoolSlotLease::reserve(active);
+        assert!(reserved);
+        let mut reader = TuicNativeOrderedReader::from_recv(recv, lease, None, None);
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        let Poll::Ready(result) = reader.poll_read_chunk(&mut cx, 16 * 1024) else {
+            panic!("oversized direct chunk should be rejected immediately");
+        };
+        let err = result.expect_err("direct reader must reject bytes above max_len");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(&*max_lens.lock().unwrap(), &[16 * 1024]);
+    }
+
+    #[tokio::test]
+    async fn d16_direct_ordered_reader_keeps_one_pending_read_future() {
+        let starts = Arc::new(AtomicU64::new(0));
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let recv = PendingDirectOrderedRecv {
+            starts: starts.clone(),
+            released: released.clone(),
+            in_flight: false,
+        };
+        let active = Arc::new(AtomicU64::new(0));
+        let (lease, reserved) = TcpPoolSlotLease::reserve(active);
+        assert!(reserved);
+        let mut reader = TuicNativeOrderedReader::from_recv(recv, lease, None, None);
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        assert!(reader.poll_read_chunk(&mut cx, 128 * 1024).is_pending());
+        assert!(reader.poll_read_chunk(&mut cx, 128 * 1024).is_pending());
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "re-polling must not start a second concurrent ordered read"
+        );
+
+        released.store(true, Ordering::SeqCst);
+        let Poll::Ready(chunk) = reader.poll_read_chunk(&mut cx, 128 * 1024) else {
+            panic!("released direct read should complete");
+        };
+        assert_eq!(&chunk.unwrap().unwrap().bytes[..], b"ready");
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn d16_real_quinn_reader_wakes_after_delayed_ordered_payload() {
+        let cert_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certs/dev");
+        let mut server_cert_reader =
+            std::io::BufReader::new(std::fs::File::open(cert_dir.join("server-cert.pem")).unwrap());
+        let server_certs = rustls_pemfile::certs(&mut server_cert_reader)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut server_key_reader =
+            std::io::BufReader::new(std::fs::File::open(cert_dir.join("server-key.pem")).unwrap());
+        let server_key = rustls_pemfile::private_key(&mut server_key_reader)
+            .unwrap()
+            .unwrap();
+        let server_config =
+            quinn::ServerConfig::with_single_cert(server_certs, server_key).unwrap();
+        let server_endpoint = quinn::Endpoint::server(
+            server_config,
+            "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        let mut ca_reader =
+            std::io::BufReader::new(std::fs::File::open(cert_dir.join("ca-cert.pem")).unwrap());
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut ca_reader) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let mut client_endpoint =
+            quinn::Endpoint::client("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+                .unwrap();
+        client_endpoint.set_default_client_config(
+            quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+        );
+
+        let reader_polled = Arc::new(tokio::sync::Notify::new());
+        let server_reader_polled = reader_polled.clone();
+        let (client_read_tx, client_read_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let mut marker = [0u8; 1];
+            recv.read_exact(&mut marker).await.unwrap();
+            assert_eq!(marker, [0x5a]);
+            server_reader_polled.notified().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            send.write_all(b"delayed-quinn-payload").await.unwrap();
+            send.finish().unwrap();
+            let _ = client_read_rx.await;
+        });
+
+        let connection = client_endpoint
+            .connect(server_addr, "example.com")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, recv) = connection.open_bi().await.unwrap();
+        send.write_all(&[0x5a]).await.unwrap();
+
+        let active = Arc::new(AtomicU64::new(0));
+        let (lease, reserved) = TcpPoolSlotLease::reserve(active);
+        assert!(reserved);
+        let mut reader = TuicNativeOrderedReader::new(recv, lease, None, connection);
+        let mut first_poll = true;
+        let read = tokio::time::timeout(
+            Duration::from_secs(1),
+            std::future::poll_fn(|cx| {
+                let poll = reader.poll_read_chunk(cx, 128 * 1024);
+                if first_poll {
+                    first_poll = false;
+                    assert!(poll.is_pending(), "server has not released payload yet");
+                    reader_polled.notify_one();
+                }
+                poll
+            }),
+        )
+        .await
+        .expect("real Quinn readability must wake the pending D16 reader")
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(&read.bytes[..], b"delayed-quinn-payload");
+        let _ = client_read_tx.send(());
+        server_task.await.unwrap();
+        client_endpoint.close(0u32.into(), b"test complete");
+    }
+
+    #[test]
+    fn d16_direct_ordered_reader_rejects_offset_discontinuity() {
+        let max_lens = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recv = RecordingDirectOrderedRecv {
+            max_lens,
+            chunk: Some(NativeTcpChunk {
+                offset: 7,
+                bytes: bytes::Bytes::from_static(b"gap"),
+            }),
+        };
+        let active = Arc::new(AtomicU64::new(0));
+        let (lease, reserved) = TcpPoolSlotLease::reserve(active);
+        assert!(reserved);
+        let mut reader = TuicNativeOrderedReader::from_recv(recv, lease, None, None);
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        let Poll::Ready(result) = reader.poll_read_chunk(&mut cx, 128 * 1024) else {
+            panic!("offset discontinuity should be rejected immediately");
+        };
+        let err = result.expect_err("direct ordered reader must reject a gap");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("expected=0 actual=7"), "{err}");
+    }
+
+    #[test]
+    fn native_ordered_chunk_batch_combines_contiguous_bytes_and_advances_offset() {
+        let mut next_offset = 41;
+        let first = combine_ordered_native_chunks(
+            &mut next_offset,
+            &[
+                bytes::Bytes::from_static(b"ab"),
+                bytes::Bytes::from_static(b"cde"),
+            ],
+        )
+        .expect("nonempty chunk batch should combine");
+        assert_eq!(first.offset, 41);
+        assert_eq!(&first.bytes[..], b"abcde");
+        assert_eq!(next_offset, 46);
+
+        let second =
+            combine_ordered_native_chunks(&mut next_offset, &[bytes::Bytes::from_static(b"fg")])
+                .expect("single chunk batch should pass through");
+        assert_eq!(second.offset, 46);
+        assert_eq!(&second.bytes[..], b"fg");
+        assert_eq!(next_offset, 48);
+
+        assert!(combine_ordered_native_chunks(&mut next_offset, &[]).is_none());
+        assert_eq!(next_offset, 48);
     }
 
     #[test]
@@ -2955,7 +4560,7 @@ mod tests {
     #[test]
     fn format_tuic_tcp_open_line_includes_target_pool_and_id() {
         let target = TargetAddr::parse("1.2.3.4:5201").unwrap();
-        let line = format_tuic_tcp_open_line(&target, 3, 42, 8, 2, TuicTcpRelayMode::Ordered);
+        let line = format_tuic_tcp_open_line(&target, 3, 42, 8, 2, TuicTcpRelayMode::OrderedJoin);
 
         assert!(line.contains("tuic-open-tcp"), "{line}");
         assert!(line.contains("target=1.2.3.4:5201"), "{line}");
@@ -2964,6 +4569,47 @@ mod tests {
         assert!(line.contains("stream=8"), "{line}");
         assert!(line.contains("relay_mode=ordered_join"), "{line}");
         assert!(line.contains("startup_auth_attempts=2"), "{line}");
+        assert!(!line.contains("handle="), "{line}");
+        assert!(!line.contains("epoch="), "{line}");
+
+        let diagnostic =
+            format_tuic_tcp_open_line(&target, 3, 42, 8, 2, TuicTcpRelayMode::OrderedChunk);
+        assert!(
+            diagnostic.contains("relay_mode=ordered_chunk"),
+            "{diagnostic}"
+        );
+
+        let bridge = TcpRelayOpenDiag {
+            handle: "SocketHandle(7)".to_string(),
+            epoch: 41,
+        };
+        let bridged = format_tuic_tcp_open_line_with_diag(
+            &target,
+            3,
+            42,
+            8,
+            2,
+            TuicTcpRelayMode::OrderedJoin,
+            Some(&bridge),
+        );
+        assert!(bridged.contains("handle=SocketHandle(7)"), "{bridged}");
+        assert!(bridged.contains("epoch=41"), "{bridged}");
+    }
+
+    #[tokio::test]
+    async fn format_tuic_tcp_open_line_reads_task_local_relay_bridge() {
+        let target = TargetAddr::parse("1.2.3.4:5201").unwrap();
+        let bridge = TcpRelayOpenDiag {
+            handle: "SocketHandle(9)".to_string(),
+            epoch: 17,
+        };
+        let line = crate::upstream::with_tcp_relay_open_diag(bridge, async {
+            format_tuic_tcp_open_line(&target, 3, 42, 8, 2, TuicTcpRelayMode::OrderedJoin)
+        })
+        .await;
+
+        assert!(line.contains("handle=SocketHandle(9)"), "{line}");
+        assert!(line.contains("epoch=17"), "{line}");
     }
 
     #[test]
@@ -3544,6 +5190,95 @@ mod tests {
         assert_eq!(read_buf.filled(), b"abcdef");
         assert_eq!(assembler.next_offset(), 6);
         assert_eq!(assembler.buffered_bytes(), 0);
+    }
+
+    #[derive(Debug)]
+    struct MockOrderedChunkRecv {
+        chunks: std::collections::VecDeque<io::Result<Option<bytes::Bytes>>>,
+        max_lens: Vec<usize>,
+        poll_count: usize,
+    }
+
+    impl MockOrderedChunkRecv {
+        fn new(chunks: impl IntoIterator<Item = io::Result<Option<bytes::Bytes>>>) -> Self {
+            Self {
+                chunks: chunks.into_iter().collect(),
+                max_lens: Vec::new(),
+                poll_count: 0,
+            }
+        }
+    }
+
+    impl OrderedChunkRecv for MockOrderedChunkRecv {
+        fn poll_read_ordered_chunk(
+            &mut self,
+            _cx: &mut Context<'_>,
+            max_len: usize,
+        ) -> Poll<io::Result<Option<bytes::Bytes>>> {
+            self.poll_count += 1;
+            self.max_lens.push(max_len);
+            Poll::Ready(self.chunks.pop_front().unwrap_or(Ok(None)))
+        }
+    }
+
+    #[tokio::test]
+    async fn ordered_relay_stream_reads_ordered_chunks_without_join() {
+        use tokio::io::AsyncReadExt;
+
+        let recv = MockOrderedChunkRecv::new([
+            Ok(Some(bytes::Bytes::from_static(b"abc"))),
+            Ok(Some(bytes::Bytes::from_static(b"def"))),
+            Ok(None),
+        ]);
+        let (send, _peer) = tokio::io::duplex(64);
+        let mut stream = TuicOrderedRelayStream::new(recv, send);
+
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+
+        assert_eq!(out, b"abcdef");
+        assert_eq!(stream.recv.poll_count, 3);
+    }
+
+    #[tokio::test]
+    async fn ordered_relay_stream_keeps_remainder_without_repolling_recv() {
+        use tokio::io::AsyncReadExt;
+
+        let recv =
+            MockOrderedChunkRecv::new([Ok(Some(bytes::Bytes::from_static(b"abcdef"))), Ok(None)]);
+        let (send, _peer) = tokio::io::duplex(64);
+        let mut stream = TuicOrderedRelayStream::new(recv, send);
+
+        let mut first = [0u8; 3];
+        let first_read = stream.read(&mut first).await.unwrap();
+        assert_eq!(first_read, 3);
+        assert_eq!(&first, b"abc");
+        assert_eq!(stream.recv.max_lens, vec![3]);
+
+        let mut second = [0u8; 3];
+        let second_read = stream.read(&mut second).await.unwrap();
+        assert_eq!(second_read, 3);
+        assert_eq!(&second, b"def");
+        assert_eq!(
+            stream.recv.poll_count, 1,
+            "remaining bytes from an oversized chunk must be served locally"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_relay_stream_delegates_writes_to_quic_send_half() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let recv = MockOrderedChunkRecv::new([Ok(None)]);
+        let (send, mut peer) = tokio::io::duplex(64);
+        let mut stream = TuicOrderedRelayStream::new(recv, send);
+
+        stream.write_all(b"ping").await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut out = [0u8; 4];
+        peer.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"ping");
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@ use bytes::BytesMut;
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read};
+use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt}; // ⚠️ 极其重要：引入异步读写魔法
 use tun::Device as TunDevice;
 
@@ -20,6 +21,16 @@ pub struct VirtualTunDevice {
     pub rx_buffer: Option<BytesMut>,
     /// 发货仓库：存放 smoltcp 已经打包好、排队等待发给物理网卡的 IP 包队列
     pub tx_queue: VecDeque<BytesMut>,
+    flushed_tcp_packets: Vec<TunFlushedTcpPacket>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TunFlushedTcpPacket {
+    pub src_addr: Ipv4Addr,
+    pub dst_addr: Ipv4Addr,
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub payload_bytes: usize,
 }
 
 // 让我们稍微打磨一下这个基础结构体，顺便给它加上一个创建实例的关联函数：
@@ -33,6 +44,7 @@ impl VirtualTunDevice {
             mtu,
             rx_buffer: None,
             tx_queue: VecDeque::new(),
+            flushed_tcp_packets: Vec::new(),
         }
     }
 
@@ -103,8 +115,12 @@ impl VirtualTunDevice {
         // // 3. 返回成功
         // Ok(())
         while let Some(packet) = self.tx_queue.pop_front() {
+            let flushed_tcp_packet = summarize_flushed_tcp_packet(&packet);
             // 无论是 macOS 还是 Linux，发货仓库里的包已经是完美形态了，直接发！
             self.device.write_all(&packet).await?;
+            if let Some(packet) = flushed_tcp_packet {
+                self.flushed_tcp_packets.push(packet);
+            }
         }
         Ok(())
     }
@@ -123,6 +139,10 @@ impl VirtualTunDevice {
     /// 取走当前收货仓库（UDP relay 把包 take 走、不进 iface.poll）。
     pub fn rx_take(&mut self) -> Option<BytesMut> {
         self.rx_buffer.take()
+    }
+
+    pub fn take_flushed_tcp_packets(&mut self) -> Vec<TunFlushedTcpPacket> {
+        std::mem::take(&mut self.flushed_tcp_packets)
     }
 }
 
@@ -147,6 +167,10 @@ pub trait TunIo: Device {
     /// 当前等待写入 OS TUN 的 IP 包字节数。默认 0，真实/回环设备可覆盖用于诊断本地 egress 进展。
     fn queued_tx_bytes(&self) -> usize {
         0
+    }
+    /// TCP payload packets successfully written by the latest `flush_tx` calls and not yet consumed.
+    fn take_flushed_tcp_packets(&mut self) -> Vec<TunFlushedTcpPacket> {
+        Vec::new()
     }
     /// 下行注入：裸 IP 包入发货队列，等 `flush_tx` 发出。
     fn inject_ip_packet(&mut self, pkt: &[u8]);
@@ -176,11 +200,50 @@ impl TunIo for VirtualTunDevice {
     fn queued_tx_bytes(&self) -> usize {
         self.tx_queue.iter().map(BytesMut::len).sum()
     }
+    fn take_flushed_tcp_packets(&mut self) -> Vec<TunFlushedTcpPacket> {
+        VirtualTunDevice::take_flushed_tcp_packets(self)
+    }
     fn inject_ip_packet(&mut self, pkt: &[u8]) {
         VirtualTunDevice::inject_ip_packet(self, pkt)
     }
     fn interface_name(&self) -> Option<&str> {
         self.interface_name.as_deref()
+    }
+}
+
+fn summarize_flushed_tcp_packet(packet: &[u8]) -> Option<TunFlushedTcpPacket> {
+    let packet = tun_tx_ip_slice(packet)?;
+    summarize_flushed_ip_tcp_packet(packet)
+}
+
+pub(crate) fn summarize_flushed_ip_tcp_packet(packet: &[u8]) -> Option<TunFlushedTcpPacket> {
+    let parsed = etherparse::PacketHeaders::from_ip_slice(packet).ok()?;
+    let etherparse::IpHeader::Version4(ipv4, _) = parsed.ip? else {
+        return None;
+    };
+    let etherparse::TransportHeader::Tcp(tcp) = parsed.transport? else {
+        return None;
+    };
+    if parsed.payload.is_empty() {
+        return None;
+    }
+    Some(TunFlushedTcpPacket {
+        src_addr: Ipv4Addr::from(ipv4.source),
+        dst_addr: Ipv4Addr::from(ipv4.destination),
+        src_port: tcp.source_port,
+        dst_port: tcp.destination_port,
+        payload_bytes: parsed.payload.len(),
+    })
+}
+
+fn tun_tx_ip_slice(packet: &[u8]) -> Option<&[u8]> {
+    #[cfg(target_os = "macos")]
+    {
+        packet.get(UTUN_IPV4_HEADER.len()..)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Some(packet)
     }
 }
 
@@ -346,6 +409,20 @@ fn device_capabilities_for_mtu(mtu: usize) -> DeviceCapabilities {
 mod tests {
     use super::*;
 
+    fn frame_tx_test_packet(packet: Vec<u8>) -> Vec<u8> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut framed = Vec::with_capacity(UTUN_IPV4_HEADER.len() + packet.len());
+            framed.extend_from_slice(&UTUN_IPV4_HEADER);
+            framed.extend_from_slice(&packet);
+            framed
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            packet
+        }
+    }
+
     #[test]
     fn inject_enqueues_with_platform_header() {
         let mut q: VecDeque<BytesMut> = VecDeque::new();
@@ -377,5 +454,35 @@ mod tests {
         assert!(matches!(caps.checksum.tcp, smoltcp::phy::Checksum::Tx));
         assert!(matches!(caps.checksum.ipv4, smoltcp::phy::Checksum::Tx));
         assert!(matches!(caps.checksum.icmpv4, smoltcp::phy::Checksum::Tx));
+    }
+
+    #[test]
+    fn summarize_flushed_tcp_packet_reports_payload_tuple() {
+        let src = [10, 0, 0, 2];
+        let dst = [203, 0, 113, 9];
+        let payload = b"payload-bytes";
+        let builder = etherparse::PacketBuilder::ipv4(src, dst, 64).tcp(443, 53124, 1, 1024);
+        let mut packet = Vec::with_capacity(builder.size(payload.len()));
+        builder.write(&mut packet, payload).unwrap();
+        let packet = frame_tx_test_packet(packet);
+
+        let summary = summarize_flushed_tcp_packet(&packet).expect("tcp payload summary");
+
+        assert_eq!(summary.src_addr, Ipv4Addr::from(src));
+        assert_eq!(summary.dst_addr, Ipv4Addr::from(dst));
+        assert_eq!(summary.src_port, 443);
+        assert_eq!(summary.dst_port, 53124);
+        assert_eq!(summary.payload_bytes, payload.len());
+    }
+
+    #[test]
+    fn summarize_flushed_tcp_packet_ignores_ack_only_packets() {
+        let builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [203, 0, 113, 9], 64)
+            .tcp(443, 53124, 1, 1024);
+        let mut packet = Vec::with_capacity(builder.size(0));
+        builder.write(&mut packet, &[]).unwrap();
+        let packet = frame_tx_test_packet(packet);
+
+        assert!(summarize_flushed_tcp_packet(&packet).is_none());
     }
 }

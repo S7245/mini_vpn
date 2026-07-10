@@ -12,8 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use quinn::congestion::{BbrConfig, CubicConfig};
+use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Endpoint, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
-use rustls::{Certificate, RootCertStore};
+use rustls::RootCertStore;
+use rustls::pki_types::CertificateDer;
 
 /// QUIC ALPN：握手必须协商；client/server 一致。
 pub const QUIC_ALPN: &[u8] = b"mvpn";
@@ -289,7 +291,9 @@ fn finish_client_config(
     cc: CcChoice,
     mtu_policy: MtuPolicy,
 ) -> ClientConfig {
-    let mut cfg = ClientConfig::new(Arc::new(crypto));
+    let quic_crypto = QuicClientConfig::try_from(crypto)
+        .expect("rustls client config must support QUIC initial cipher suite");
+    let mut cfg = ClientConfig::new(Arc::new(quic_crypto));
     cfg.transport_config(quic_transport_config(cc, mtu_policy));
     cfg
 }
@@ -305,11 +309,10 @@ fn client_crypto(
     let mut roots = RootCertStore::empty();
     for cert in load_certs(ca_path)? {
         roots
-            .add(&cert)
+            .add(cert)
             .map_err(|e| format!("quic add ca {ca_path}: {e}"))?;
     }
     let mut crypto = rustls::ClientConfig::builder()
-        .with_safe_defaults()
         .with_root_certificates(roots)
         .with_no_client_auth();
     crypto.alpn_protocols = alpn_protocols;
@@ -353,14 +356,16 @@ pub fn client_endpoint(cfg: ClientConfig) -> Result<Endpoint, String> {
     Ok(ep)
 }
 
-fn load_certs(path: &str) -> Result<Vec<Certificate>, String> {
+fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
     let f = File::open(path).map_err(|e| format!("open {path}: {e}"))?;
     let mut r = BufReader::new(f);
-    let certs = rustls_pemfile::certs(&mut r).map_err(|e| format!("read certs {path}: {e}"))?;
+    let certs = rustls_pemfile::certs(&mut r)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read certs {path}: {e}"))?;
     if certs.is_empty() {
         return Err(format!("no certificates in {path}"));
     }
-    Ok(certs.into_iter().map(Certificate).collect())
+    Ok(certs)
 }
 
 #[cfg(test)]

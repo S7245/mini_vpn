@@ -5,6 +5,10 @@
 //! 退役前仍走原内联逻辑(零回归),不强行套进 trait。
 
 use crate::shared::{ClientError, TargetAddr};
+use bytes::Bytes;
+use std::future::Future;
+use std::io;
+use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// 统一的中继流类型:legacy(yamux compat)与 tuic(QUIC 双向流 compat)都收成它,喂给同一套双向泵。
@@ -15,11 +19,67 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
 /// 一条到出口的中继流(双向字节)。
 pub type RelayStream = Box<dyn AsyncStream>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeTcpChunk {
+    pub offset: u64,
+    pub bytes: Bytes,
+}
+
+pub trait NativeTcpReader: Unpin + Send {
+    /// Poll one transport-owned TCP chunk. Ordered readers selected by D16
+    /// must return the next contiguous chunk and never return more than
+    /// `max_len` bytes. D16 callers provide a nonzero byte reservation.
+    fn poll_read_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<io::Result<Option<NativeTcpChunk>>>;
+}
+
+pub type NativeTcpReadHalf = Box<dyn NativeTcpReader>;
+pub type NativeTcpWriteHalf = Box<dyn AsyncWrite + Unpin + Send>;
+
+pub struct NativeTcpRelayStream {
+    pub reader: NativeTcpReadHalf,
+    pub writer: NativeTcpWriteHalf,
+}
+
+pub enum OpenedTcpRelay {
+    Generic(RelayStream),
+    Native(NativeTcpRelayStream),
+    NativeByteOwned(NativeTcpRelayStream),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TcpRelayOpenDiag {
+    pub handle: String,
+    pub epoch: u64,
+}
+
+tokio::task_local! {
+    static TCP_RELAY_OPEN_DIAG: TcpRelayOpenDiag;
+}
+
+pub async fn with_tcp_relay_open_diag<F, T>(diag: TcpRelayOpenDiag, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    TCP_RELAY_OPEN_DIAG.scope(diag, future).await
+}
+
+pub fn current_tcp_relay_open_diag() -> Option<TcpRelayOpenDiag> {
+    TCP_RELAY_OPEN_DIAG.try_with(Clone::clone).ok()
+}
+
 /// 代理上游:给一个 Target 开一条到出口的 TCP 中继流。
 /// 中文要点:async fn 要在 `Box<dyn ProxyUpstream>` 上分发,用成熟的 `async-trait`。
 #[async_trait::async_trait]
 pub trait ProxyUpstream: Send + Sync {
     async fn open_tcp(&self, target: &TargetAddr) -> Result<RelayStream, ClientError>;
+
+    async fn open_tcp_relay(&self, target: &TargetAddr) -> Result<OpenedTcpRelay, ClientError> {
+        self.open_tcp(target).await.map(OpenedTcpRelay::Generic)
+    }
 
     /// `open_tcp` 是否足够廉价、可在单任务主循环里 inline await 而不 stall 其它 flow（刀9 M3 / 刀14d）。
     /// 中文要点：默认 **true** 只适合明确不会等待网络/flow-control 的测试或轻量 mock。生产 Transport 若
@@ -97,6 +157,32 @@ mod tests {
         let mut buf = [0u8; 10];
         s.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hello-tuic");
+    }
+
+    #[tokio::test]
+    async fn open_tcp_relay_defaults_to_generic_stream() {
+        let up: Box<dyn ProxyUpstream> = Box::new(EchoUpstream);
+        let relay = up
+            .open_tcp_relay(&TargetAddr::IpPort("1.2.3.4:80".parse().unwrap()))
+            .await
+            .unwrap();
+
+        assert!(matches!(relay, OpenedTcpRelay::Generic(_)));
+    }
+
+    #[tokio::test]
+    async fn tcp_relay_open_diag_context_is_task_scoped() {
+        assert!(current_tcp_relay_open_diag().is_none());
+
+        let diag = TcpRelayOpenDiag {
+            handle: "SocketHandle(7)".to_string(),
+            epoch: 41,
+        };
+        let observed =
+            with_tcp_relay_open_diag(diag.clone(), async { current_tcp_relay_open_diag() }).await;
+
+        assert_eq!(observed, Some(diag));
+        assert!(current_tcp_relay_open_diag().is_none());
     }
 
     /// 一个把上行 datagram 捕获进 Vec 的假上游，验证 DatagramUpstream trait 可被 mock 替代。

@@ -12,11 +12,11 @@ socket2 = "0.5"
 
 # TLS 信任材料 / 证书加载（quinn 数据面用）。Stage 13d 退役 legacy 后不再需要
 # tokio-rustls（裸 TLS 流）/ yamux（多路复用）/ rand / tokio-util / futures / chacha。
-rustls = "0.21"
-rustls-pemfile = "1.0" # 用于读取证书文件
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pemfile = "2.2" # 用于读取证书文件
 
-# Stage 12+：QUIC 数据面（TUIC over quinn）。0.10 依赖 rustls ^0.21，单一 rustls 版本（见 docs/adr/0003）。
-quinn = "0.10"
+# Stage 12+：QUIC 数据面（TUIC over quinn）。H10d12 升到 0.11 作为 TCP stream gap discriminator。
+quinn = "0.11.11"
 
 # Stage 13a：ProxyUpstream trait 的 async fn 需要在 dyn 对象上分发（成熟惯用方案）。
 async-trait = "0.1"

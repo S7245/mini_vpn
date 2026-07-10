@@ -11,13 +11,17 @@
 //! 对外只暴露高层 [`run_tcp_scenario`] / [`run_udp_echo_scenario`] → [`Report`]，所有 smoltcp 复杂度
 //! 封在本模块内，使 `tests/` 整合测试极薄。隔离不了的瓶颈 #3（单条 QUIC 连接）见 spec，deferred。
 
-use crate::client_tun::{MetricsSink, TunRuntimeConfig, run_event_loop};
-use crate::device::TunIo;
+use crate::client_tun::{D16HarnessFlow, MetricsSink, TunRuntimeConfig, run_event_loop};
+use crate::device::{TunFlushedTcpPacket, TunIo, summarize_flushed_ip_tcp_packet};
 use crate::metrics::Metrics;
 use crate::shared::{ClientError, TargetAddr};
-use crate::upstream::{DatagramUpstream, ProxyUpstream, RelayStream};
+use crate::tcp_downlink_pump::{ByteQueuePushError, D16GlobalByteBudget};
+use crate::upstream::{
+    DatagramUpstream, NativeTcpChunk, NativeTcpReader, NativeTcpRelayStream, OpenedTcpRelay,
+    ProxyUpstream, RelayStream,
+};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
@@ -26,6 +30,7 @@ use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc};
@@ -37,18 +42,45 @@ use tokio::sync::{Notify, mpsc};
 pub struct PacketLink {
     queue: Arc<Mutex<VecDeque<BytesMut>>>,
     notify: Arc<Notify>,
+    capacity_packets: Option<usize>,
+    dropped_packets: Arc<AtomicU64>,
+    high_water_packets: Arc<AtomicU64>,
 }
 
 impl PacketLink {
     fn new() -> Self {
         Self::default()
     }
-    fn push(&self, pkt: BytesMut) {
-        self.queue.lock().unwrap().push_back(pkt);
+    fn bounded(capacity_packets: usize) -> Self {
+        Self {
+            capacity_packets: Some(capacity_packets.max(1)),
+            ..Self::default()
+        }
+    }
+    fn push(&self, pkt: BytesMut) -> bool {
+        let mut queue = self.queue.lock().unwrap();
+        if self
+            .capacity_packets
+            .is_some_and(|capacity| queue.len() >= capacity)
+        {
+            self.dropped_packets.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        queue.push_back(pkt);
+        self.high_water_packets
+            .fetch_max(queue.len() as u64, Ordering::Relaxed);
+        drop(queue);
         self.notify.notify_one();
+        true
     }
     fn pop(&self) -> Option<BytesMut> {
         self.queue.lock().unwrap().pop_front()
+    }
+    fn dropped_packets(&self) -> u64 {
+        self.dropped_packets.load(Ordering::Relaxed)
+    }
+    fn high_water_packets(&self) -> u64 {
+        self.high_water_packets.load(Ordering::Relaxed)
     }
 }
 
@@ -123,33 +155,65 @@ fn busy_spin(d: Duration) {
 pub struct LoopbackTunDevice {
     rx_buffer: Option<BytesMut>,
     tx_queue: VecDeque<BytesMut>,
+    flushed_tcp_packets: Vec<TunFlushedTcpPacket>,
     inbound: PacketLink,  // 发生器 → SUT
     outbound: PacketLink, // SUT → 发生器
     /// 刀12：每次 `flush_tx` 注入的合成 on-loop CPU 成本（busy-spin）。默认 ZERO。
     /// `flush_tx` 在主循环 poll 段内（enter_poll/leave_poll 括起）→ 该 burn 计入 poll_time / loop-active，
     /// 用于验证 profiler 能侦测「主循环被 on-loop CPU 拖满」的饱和信号（T4 spike）。
     cpu_burn_per_flush: Duration,
+    suppress_wait_after_tcp_payload_flush: bool,
+    wait_suppressed: bool,
+    max_tcp_payload_packets_per_flush: Arc<AtomicU64>,
 }
 
 impl LoopbackTunDevice {
     fn new(inbound: PacketLink, outbound: PacketLink) -> Self {
-        Self::with_burn(inbound, outbound, Duration::ZERO)
+        Self::with_options(inbound, outbound, Duration::ZERO, false)
     }
 
     /// 带合成 on-loop CPU 成本的回环设备（T4：multi_thread 饱和 spike 用）。
     fn with_burn(inbound: PacketLink, outbound: PacketLink, cpu_burn_per_flush: Duration) -> Self {
+        Self::with_options(inbound, outbound, cpu_burn_per_flush, false)
+    }
+
+    fn with_suppressed_wait_after_tcp_payload_flush(
+        inbound: PacketLink,
+        outbound: PacketLink,
+    ) -> Self {
+        Self::with_options(inbound, outbound, Duration::ZERO, true)
+    }
+
+    fn with_options(
+        inbound: PacketLink,
+        outbound: PacketLink,
+        cpu_burn_per_flush: Duration,
+        suppress_wait_after_tcp_payload_flush: bool,
+    ) -> Self {
         Self {
             rx_buffer: None,
             tx_queue: VecDeque::new(),
+            flushed_tcp_packets: Vec::new(),
             inbound,
             outbound,
             cpu_burn_per_flush,
+            suppress_wait_after_tcp_payload_flush,
+            wait_suppressed: false,
+            max_tcp_payload_packets_per_flush: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    fn with_tcp_payload_flush_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.max_tcp_payload_packets_per_flush = counter;
+        self
     }
 }
 
 impl TunIo for LoopbackTunDevice {
     async fn wait_for_rx(&mut self) -> std::io::Result<()> {
+        if self.wait_suppressed {
+            return std::future::pending::<std::io::Result<()>>().await;
+        }
         loop {
             if let Some(pkt) = self.inbound.pop() {
                 self.rx_buffer = Some(pkt);
@@ -177,13 +241,26 @@ impl TunIo for LoopbackTunDevice {
     }
     async fn flush_tx(&mut self) -> std::io::Result<()> {
         busy_spin(self.cpu_burn_per_flush); // 刀12：合成 on-loop CPU（默认 ZERO 即 no-op）。
+        let mut tcp_payload_packets = 0u64;
         while let Some(pkt) = self.tx_queue.pop_front() {
+            if let Some(packet) = summarize_flushed_ip_tcp_packet(&pkt) {
+                tcp_payload_packets = tcp_payload_packets.saturating_add(1);
+                if self.suppress_wait_after_tcp_payload_flush && packet.payload_bytes > 0 {
+                    self.wait_suppressed = true;
+                }
+                self.flushed_tcp_packets.push(packet);
+            }
             self.outbound.push(pkt);
         }
+        self.max_tcp_payload_packets_per_flush
+            .fetch_max(tcp_payload_packets, Ordering::Relaxed);
         Ok(())
     }
     fn queued_tx_bytes(&self) -> usize {
         self.tx_queue.iter().map(BytesMut::len).sum()
+    }
+    fn take_flushed_tcp_packets(&mut self) -> Vec<TunFlushedTcpPacket> {
+        std::mem::take(&mut self.flushed_tcp_packets)
     }
     fn inject_ip_packet(&mut self, pkt: &[u8]) {
         self.tx_queue.push_back(BytesMut::from(pkt));
@@ -221,6 +298,37 @@ impl Device for LoopbackTunDevice {
 struct GeneratorDevice {
     inbound: PacketLink,  // SUT → 发生器
     outbound: PacketLink, // 发生器 → SUT
+    ingress_packets_per_poll: Option<usize>,
+    ingress_packets_remaining: Option<usize>,
+}
+
+impl GeneratorDevice {
+    fn new(inbound: PacketLink, outbound: PacketLink) -> Self {
+        Self {
+            inbound,
+            outbound,
+            ingress_packets_per_poll: None,
+            ingress_packets_remaining: None,
+        }
+    }
+
+    fn with_ingress_packets_per_poll(
+        inbound: PacketLink,
+        outbound: PacketLink,
+        packets: usize,
+    ) -> Self {
+        let packets = packets.max(1);
+        Self {
+            inbound,
+            outbound,
+            ingress_packets_per_poll: Some(packets),
+            ingress_packets_remaining: Some(packets),
+        }
+    }
+
+    fn begin_poll(&mut self) {
+        self.ingress_packets_remaining = self.ingress_packets_per_poll;
+    }
 }
 
 impl Device for GeneratorDevice {
@@ -230,7 +338,13 @@ impl Device for GeneratorDevice {
         loopback_caps()
     }
     fn receive(&mut self, _t: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if self.ingress_packets_remaining == Some(0) {
+            return None;
+        }
         self.inbound.pop().map(|buffer| {
+            if let Some(remaining) = self.ingress_packets_remaining.as_mut() {
+                *remaining = remaining.saturating_sub(1);
+            }
             (
                 RawRxToken { buffer },
                 LinkTxToken {
@@ -243,6 +357,45 @@ impl Device for GeneratorDevice {
         Some(LinkTxToken {
             outbound: self.outbound.clone(),
         })
+    }
+}
+
+struct HarnessNativeReader<R> {
+    inner: R,
+    next_offset: u64,
+}
+
+impl<R> HarnessNativeReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            next_offset: 0,
+        }
+    }
+}
+
+impl<R> NativeTcpReader for HarnessNativeReader<R>
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+{
+    fn poll_read_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<std::io::Result<Option<NativeTcpChunk>>> {
+        let mut storage = vec![0u8; max_len.max(1)];
+        let mut read_buf = tokio::io::ReadBuf::new(&mut storage);
+        match std::pin::Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
+            Poll::Ready(Ok(())) if read_buf.filled().is_empty() => Poll::Ready(Ok(None)),
+            Poll::Ready(Ok(())) => {
+                let bytes = Bytes::copy_from_slice(read_buf.filled());
+                let offset = self.next_offset;
+                self.next_offset = self.next_offset.saturating_add(bytes.len() as u64);
+                Poll::Ready(Ok(Some(NativeTcpChunk { offset, bytes })))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -264,6 +417,8 @@ pub struct MockUpstream {
     stall: Option<StallConfig>,
     /// 刀14d：指定 TCP 目标端口在 `open_tcp` 阶段等待，用来证明远端开流本身不能 inline 卡住主循环。
     open_stall: Option<OpenStallConfig>,
+    native_byte_owned: bool,
+    native_reverse_payload_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -370,6 +525,8 @@ impl MockUpstream {
             frag_chunk,
             stall: None,
             open_stall: None,
+            native_byte_owned: false,
+            native_reverse_payload_bytes: None,
         }
     }
 
@@ -392,6 +549,8 @@ impl MockUpstream {
                 control,
             }),
             open_stall: None,
+            native_byte_owned: false,
+            native_reverse_payload_bytes: None,
         }
     }
 
@@ -412,7 +571,25 @@ impl MockUpstream {
                 port: open_stall_port,
                 control,
             }),
+            native_byte_owned: false,
+            native_reverse_payload_bytes: None,
         }
+    }
+
+    fn with_d16_byte_owned(echo_buf: usize, downlink_tx: mpsc::Sender<Vec<u8>>) -> Self {
+        let mut upstream = Self::new(echo_buf, downlink_tx);
+        upstream.native_byte_owned = true;
+        upstream
+    }
+
+    fn with_d16_reverse_payload(
+        echo_buf: usize,
+        downlink_tx: mpsc::Sender<Vec<u8>>,
+        payload_bytes: usize,
+    ) -> Self {
+        let mut upstream = Self::with_d16_byte_owned(echo_buf, downlink_tx);
+        upstream.native_reverse_payload_bytes = Some(payload_bytes);
+        upstream
     }
 
     fn tcp_opens(&self) -> u64 {
@@ -507,6 +684,48 @@ impl ProxyUpstream for MockUpstream {
         Ok(Box::new(near))
     }
 
+    async fn open_tcp_relay(&self, target: &TargetAddr) -> Result<OpenedTcpRelay, ClientError> {
+        if let Some(payload_bytes) = self.native_reverse_payload_bytes {
+            self.tcp_opens.fetch_add(1, Ordering::Relaxed);
+            let (near, far) = tokio::io::duplex(self.echo_buf.max(512 * 1024));
+            let (mut far_reader, mut far_writer) = tokio::io::split(far);
+            tokio::spawn(async move {
+                let mut scratch = vec![0u8; 16 * 1024];
+                while let Ok(read) = far_reader.read(&mut scratch).await {
+                    if read == 0 {
+                        break;
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                let chunk = vec![0x5Au8; 64 * 1024];
+                let mut written = 0usize;
+                while written < payload_bytes {
+                    let len = (payload_bytes - written).min(chunk.len());
+                    if far_writer.write_all(&chunk[..len]).await.is_err() {
+                        break;
+                    }
+                    written += len;
+                }
+                let _ = far_writer.shutdown().await;
+            });
+            let (reader, writer) = tokio::io::split(near);
+            return Ok(OpenedTcpRelay::NativeByteOwned(NativeTcpRelayStream {
+                reader: Box::new(HarnessNativeReader::new(reader)),
+                writer: Box::new(writer),
+            }));
+        }
+        let stream = self.open_tcp(target).await?;
+        if !self.native_byte_owned {
+            return Ok(OpenedTcpRelay::Generic(stream));
+        }
+        let (reader, writer) = tokio::io::split(stream);
+        Ok(OpenedTcpRelay::NativeByteOwned(NativeTcpRelayStream {
+            reader: Box::new(HarnessNativeReader::new(reader)),
+            writer: Box::new(writer),
+        }))
+    }
+
     fn open_is_cheap(&self) -> bool {
         self.open_stall.is_none()
     }
@@ -590,6 +809,22 @@ struct Recorded {
     /// 刀12：主循环 park（select! 空等）累计 + 迭代数，用于算 loop-active fraction。
     park_time: Duration,
     iters: u64,
+    tun_rx_budget_exhausted: u64,
+    backlog_pause_edges: u64,
+    backlog_resume_edges: u64,
+    actor_bypass_admitted_bytes: u64,
+    backlog_active: bool,
+    d16_running_flows: usize,
+    d16_drain_only_flows: usize,
+    d16_recovery_flows: usize,
+    d16_eof_observed: bool,
+    d16_eof_tail_bytes: usize,
+    terminal_drop_bytes: u64,
+    terminal_late_payload_bytes: u64,
+    d16_owned_queue_bytes: usize,
+    d16_pending_bytes: usize,
+    d16_inflight_bytes: usize,
+    d16_local_eof_sent_flows: usize,
 }
 
 /// 记录型插桩：把主循环三段耗时 + listener 全量遍历规模汇总进共享 [`Recorded`]，供测试读取。
@@ -613,6 +848,9 @@ impl RecordingSink {
 }
 
 impl MetricsSink for RecordingSink {
+    fn wants_d16_harness_observations(&self) -> bool {
+        true
+    }
     fn enter_poll(&mut self) {
         self.poll_start = Some(Instant::now());
     }
@@ -650,6 +888,61 @@ impl MetricsSink for RecordingSink {
             r.park_time += d;
         }
         r.iters += 1;
+    }
+    fn note_tun_rx_backlog_guard(
+        &mut self,
+        active: bool,
+        budget_exhausted: u64,
+        pause_edges: u64,
+        resume_edges: u64,
+    ) {
+        let mut r = self.shared.lock().unwrap();
+        r.backlog_active = active;
+        r.tun_rx_budget_exhausted = r.tun_rx_budget_exhausted.max(budget_exhausted);
+        r.backlog_pause_edges = r.backlog_pause_edges.max(pause_edges);
+        r.backlog_resume_edges = r.backlog_resume_edges.max(resume_edges);
+    }
+    fn note_d16_actor_observation(
+        &mut self,
+        actor_bypass_admitted_bytes: u64,
+        running_flows: usize,
+        drain_only_flows: usize,
+        recovery_flows: usize,
+    ) {
+        let mut r = self.shared.lock().unwrap();
+        r.actor_bypass_admitted_bytes = r
+            .actor_bypass_admitted_bytes
+            .max(actor_bypass_admitted_bytes);
+        r.d16_running_flows = running_flows;
+        r.d16_drain_only_flows = drain_only_flows;
+        r.d16_recovery_flows = recovery_flows;
+    }
+    fn note_d16_flow_lifecycle(
+        &mut self,
+        owned_queue_bytes: usize,
+        pending_bytes: usize,
+        inflight_bytes: usize,
+        local_eof_sent_flows: usize,
+        terminal_drop_bytes: u64,
+        terminal_late_payload_bytes: u64,
+    ) {
+        let mut r = self.shared.lock().unwrap();
+        r.d16_owned_queue_bytes = owned_queue_bytes;
+        r.d16_pending_bytes = pending_bytes;
+        r.d16_inflight_bytes = inflight_bytes;
+        r.d16_local_eof_sent_flows = local_eof_sent_flows;
+        if local_eof_sent_flows > 0 {
+            r.d16_eof_observed = true;
+            r.d16_eof_tail_bytes = r.d16_eof_tail_bytes.max(
+                owned_queue_bytes
+                    .saturating_add(pending_bytes)
+                    .saturating_add(inflight_bytes),
+            );
+        }
+        r.terminal_drop_bytes = r.terminal_drop_bytes.max(terminal_drop_bytes);
+        r.terminal_late_payload_bytes = r
+            .terminal_late_payload_bytes
+            .max(terminal_late_payload_bytes);
     }
 }
 
@@ -832,10 +1125,7 @@ pub async fn run_tcp_scenario(params: ScenarioParams) -> Report {
     ));
 
     // ---- 3. 发生器：第二 smoltcp 栈，N 路 client 连接 ----
-    let mut gen_device = GeneratorDevice {
-        inbound: sut_to_gen,
-        outbound: gen_to_sut,
-    };
+    let mut gen_device = GeneratorDevice::new(sut_to_gen, gen_to_sut);
     let mut gen_iface = {
         let cfg = SmolConfig::new(smoltcp::wire::HardwareAddress::Ip);
         let mut iface = Interface::new(cfg, &mut gen_device, SmolInstant::now());
@@ -1114,10 +1404,7 @@ pub async fn run_tcp_hol_scenario() -> TcpHolReport {
         RecordingSink::new(shared),
     ));
 
-    let mut gen_device = GeneratorDevice {
-        inbound: sut_to_gen,
-        outbound: gen_to_sut,
-    };
+    let mut gen_device = GeneratorDevice::new(sut_to_gen, gen_to_sut);
     let mut gen_iface = {
         let cfg = SmolConfig::new(smoltcp::wire::HardwareAddress::Ip);
         let mut iface = Interface::new(cfg, &mut gen_device, SmolInstant::now());
@@ -1235,10 +1522,7 @@ pub async fn run_tcp_slow_open_scenario() -> TcpSlowOpenReport {
         RecordingSink::new(shared),
     ));
 
-    let mut gen_device = GeneratorDevice {
-        inbound: sut_to_gen,
-        outbound: gen_to_sut,
-    };
+    let mut gen_device = GeneratorDevice::new(sut_to_gen, gen_to_sut);
     let mut gen_iface = {
         let cfg = SmolConfig::new(smoltcp::wire::HardwareAddress::Ip);
         let mut iface = Interface::new(cfg, &mut gen_device, SmolInstant::now());
@@ -1527,9 +1811,376 @@ pub async fn run_udp_throughput_scenario(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct D16BidirectionalControlReport {
+    pub first_response_seen: bool,
+    pub second_control_echoed: bool,
+    pub round_trip_intact: bool,
+    pub tcp_opens: u64,
+}
+
+/// Exercise the production D16 relay variant with two real smoltcp stacks.
+/// After the first TCP payload is flushed to the generator, async TUN wait
+/// readiness is deliberately suppressed; only the bounded nonblocking TUN RX
+/// follow-up can ingest the generator's ACK and second control payload.
+pub async fn run_d16_bidirectional_control_scenario() -> D16BidirectionalControlReport {
+    let gen_to_sut = PacketLink::new();
+    let sut_to_gen = PacketLink::new();
+    let (downlink_tx, downlink_rx) = mpsc::channel::<Vec<u8>>(8);
+    let mock = Arc::new(MockUpstream::with_d16_byte_owned(64 * 1024, downlink_tx));
+    let sut_device = LoopbackTunDevice::with_suppressed_wait_after_tcp_payload_flush(
+        gen_to_sut.clone(),
+        sut_to_gen.clone(),
+    );
+    let config = TunRuntimeConfig::from_sources(Some("2")).unwrap();
+    let sut = tokio::spawn(run_event_loop(
+        sut_device,
+        mock.clone(),
+        downlink_rx,
+        config,
+        Arc::new(Metrics::new()),
+        RecordingSink::new(Arc::new(Mutex::new(Recorded::default()))),
+    ));
+
+    let mut gen_device = GeneratorDevice::new(sut_to_gen, gen_to_sut);
+    let mut gen_iface = {
+        let cfg = SmolConfig::new(smoltcp::wire::HardwareAddress::Ip);
+        let mut iface = Interface::new(cfg, &mut gen_device, SmolInstant::now());
+        iface.update_ip_addrs(|addrs| {
+            addrs
+                .push(IpCidr::new(IpAddress::Ipv4(GEN_IP), 24))
+                .unwrap();
+        });
+        iface.routes_mut().add_default_ipv4_route(GEN_IP).unwrap();
+        iface
+    };
+    let mut sockets = SocketSet::new(vec![]);
+    let rx = tcp::SocketBuffer::new(vec![0u8; 16 * 1024]);
+    let tx = tcp::SocketBuffer::new(vec![0u8; 16 * 1024]);
+    let mut socket = tcp::Socket::new(rx, tx);
+    socket
+        .connect(
+            gen_iface.context(),
+            (IpAddress::Ipv4(TARGET_IP), TARGET_PORT_BASE),
+            42_000,
+        )
+        .unwrap();
+    let handle = sockets.add(socket);
+
+    let first_control = [0x11u8];
+    let second_control = vec![0x22u8; 1532];
+    let mut first_sent = 0usize;
+    let mut second_sent = 0usize;
+    let mut received = Vec::with_capacity(first_control.len() + second_control.len());
+    let started = Instant::now();
+    while received.len() < first_control.len() + second_control.len()
+        && started.elapsed() < Duration::from_secs(2)
+    {
+        gen_iface.poll(SmolInstant::now(), &mut gen_device, &mut sockets);
+        let socket = sockets.get_mut::<tcp::Socket>(handle);
+        if first_sent < first_control.len() && socket.can_send() {
+            if let Ok(sent) = socket.send_slice(&first_control[first_sent..]) {
+                first_sent += sent;
+            }
+        }
+        let mut scratch = [0u8; 2048];
+        while socket.can_recv() {
+            match socket.recv_slice(&mut scratch) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => received.extend_from_slice(&scratch[..read]),
+            }
+        }
+        if received.len() >= first_control.len()
+            && second_sent < second_control.len()
+            && socket.can_send()
+        {
+            if let Ok(sent) = socket.send_slice(&second_control[second_sent..]) {
+                second_sent += sent;
+            }
+        }
+        tokio::time::sleep(Duration::from_micros(200)).await;
+    }
+    sut.abort();
+
+    let expected: Vec<u8> = first_control
+        .iter()
+        .copied()
+        .chain(second_control.iter().copied())
+        .collect();
+    D16BidirectionalControlReport {
+        first_response_seen: received.starts_with(&first_control),
+        second_control_echoed: received.len() >= expected.len(),
+        round_trip_intact: received == expected,
+        tcp_opens: mock.tcp_opens(),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct D16TunRxStarvationReport {
+    pub payload_bytes: usize,
+    pub bootstrap_sent_bytes: usize,
+    pub received_bytes: usize,
+    pub modeled_tx_dropped: u64,
+    pub ring_high_water_packets: u64,
+    pub downlink_high_water_packets: u64,
+    pub max_tcp_payload_packets_per_flush: u64,
+    pub tcp_opens: u64,
+    pub tun_rx_budget_exhausted: u64,
+    pub backlog_pause_edges: u64,
+    pub backlog_resume_edges: u64,
+    pub actor_bypass_admitted_bytes: u64,
+    pub first_drop_backlog_active: bool,
+    pub first_drop_running_flows: usize,
+    pub first_drop_drain_only_flows: usize,
+    pub first_drop_recovery_flows: usize,
+    pub final_backlog_active: bool,
+    pub final_running_flows: usize,
+    pub final_drain_only_flows: usize,
+    pub final_recovery_flows: usize,
+    pub remote_eof_seen: bool,
+    pub eof_after_owned_queue_drain: bool,
+    pub close_egress_bytes: usize,
+    pub terminal_drop_bytes: u64,
+    pub terminal_late_payload_bytes: u64,
+    pub final_owned_queue_bytes: usize,
+    pub final_pending_bytes: usize,
+    pub final_inflight_bytes: usize,
+    pub final_local_eof_sent_flows: usize,
+}
+
+/// Model the Linux kernel-to-userspace TUN transmit ring as a bounded packet
+/// queue while a native D16 relay sends a reverse-only payload. Generator TCP
+/// ACK/control packets enter this bounded ring; mini_vpn must drain them through
+/// the same `TunIo`/event-loop path as production.
+pub async fn run_d16_tun_rx_starvation_scenario(
+    payload_bytes: usize,
+    ring_capacity_packets: usize,
+    timeout: Duration,
+) -> D16TunRxStarvationReport {
+    let gen_to_sut = PacketLink::bounded(ring_capacity_packets);
+    let sut_to_gen = PacketLink::new();
+    let (downlink_tx, downlink_rx) = mpsc::channel::<Vec<u8>>(8);
+    let mock = Arc::new(MockUpstream::with_d16_reverse_payload(
+        512 * 1024,
+        downlink_tx,
+        payload_bytes,
+    ));
+    let max_tcp_payload_packets_per_flush = Arc::new(AtomicU64::new(0));
+    let sut_device = LoopbackTunDevice::new(gen_to_sut.clone(), sut_to_gen.clone())
+        .with_tcp_payload_flush_counter(Arc::clone(&max_tcp_payload_packets_per_flush));
+    let config = TunRuntimeConfig::from_sources(Some("2")).unwrap();
+    let recorded = Arc::new(Mutex::new(Recorded::default()));
+    let sut = tokio::spawn(run_event_loop(
+        sut_device,
+        mock.clone(),
+        downlink_rx,
+        config,
+        Arc::new(Metrics::new()),
+        RecordingSink::new(recorded.clone()),
+    ));
+
+    let mut gen_device =
+        GeneratorDevice::with_ingress_packets_per_poll(sut_to_gen.clone(), gen_to_sut.clone(), 2);
+    let mut gen_iface = {
+        let cfg = SmolConfig::new(smoltcp::wire::HardwareAddress::Ip);
+        let mut iface = Interface::new(cfg, &mut gen_device, SmolInstant::now());
+        iface.update_ip_addrs(|addrs| {
+            addrs
+                .push(IpCidr::new(IpAddress::Ipv4(GEN_IP), 24))
+                .unwrap();
+        });
+        iface.routes_mut().add_default_ipv4_route(GEN_IP).unwrap();
+        iface
+    };
+    let mut sockets = SocketSet::new(vec![]);
+    let rx = tcp::SocketBuffer::new(vec![0u8; 1024 * 1024]);
+    let tx = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
+    let mut socket = tcp::Socket::new(rx, tx);
+    socket.set_ack_delay(None);
+    socket
+        .connect(
+            gen_iface.context(),
+            (IpAddress::Ipv4(TARGET_IP), TARGET_PORT_BASE),
+            42_000,
+        )
+        .unwrap();
+    let handle = sockets.add(socket);
+
+    let started = Instant::now();
+    let bootstrap = [0xA5u8];
+    let mut bootstrap_sent_bytes = 0usize;
+    let mut received_bytes = 0usize;
+    let mut remote_eof_seen = false;
+    let mut first_drop_state: Option<(bool, usize, usize, usize)> = None;
+    let mut scratch = vec![0u8; 64 * 1024];
+    while started.elapsed() < timeout {
+        gen_device.begin_poll();
+        gen_iface.poll(SmolInstant::now(), &mut gen_device, &mut sockets);
+        let socket = sockets.get_mut::<tcp::Socket>(handle);
+        if bootstrap_sent_bytes < bootstrap.len() && socket.can_send() {
+            if let Ok(sent) = socket.send_slice(&bootstrap[bootstrap_sent_bytes..]) {
+                bootstrap_sent_bytes = bootstrap_sent_bytes.saturating_add(sent);
+            }
+        }
+        while socket.can_recv() {
+            match socket.recv_slice(&mut scratch) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => received_bytes = received_bytes.saturating_add(read),
+            }
+        }
+        remote_eof_seen |= received_bytes >= payload_bytes && !socket.may_recv();
+        if first_drop_state.is_none() && gen_to_sut.dropped_packets() > 0 {
+            let recorded = recorded.lock().unwrap();
+            first_drop_state = Some((
+                recorded.backlog_active,
+                recorded.d16_running_flows,
+                recorded.d16_drain_only_flows,
+                recorded.d16_recovery_flows,
+            ));
+        }
+        let eof_observed = recorded.lock().unwrap().d16_eof_observed;
+        if received_bytes >= payload_bytes && remote_eof_seen && eof_observed {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    if sockets.get::<tcp::Socket>(handle).is_active() {
+        sockets.get_mut::<tcp::Socket>(handle).close();
+    }
+    sut.abort();
+    let _ = sut.await;
+    let recorded = recorded.lock().unwrap();
+    let (
+        first_drop_backlog_active,
+        first_drop_running_flows,
+        first_drop_drain_only_flows,
+        first_drop_recovery_flows,
+    ) = first_drop_state.unwrap_or_default();
+
+    D16TunRxStarvationReport {
+        payload_bytes,
+        bootstrap_sent_bytes,
+        received_bytes,
+        modeled_tx_dropped: gen_to_sut.dropped_packets(),
+        ring_high_water_packets: gen_to_sut.high_water_packets(),
+        downlink_high_water_packets: sut_to_gen.high_water_packets(),
+        max_tcp_payload_packets_per_flush: max_tcp_payload_packets_per_flush
+            .load(Ordering::Relaxed),
+        tcp_opens: mock.tcp_opens(),
+        tun_rx_budget_exhausted: recorded.tun_rx_budget_exhausted,
+        backlog_pause_edges: recorded.backlog_pause_edges,
+        backlog_resume_edges: recorded.backlog_resume_edges,
+        actor_bypass_admitted_bytes: recorded.actor_bypass_admitted_bytes,
+        first_drop_backlog_active,
+        first_drop_running_flows,
+        first_drop_drain_only_flows,
+        first_drop_recovery_flows,
+        final_backlog_active: recorded.backlog_active,
+        final_running_flows: recorded.d16_running_flows,
+        final_drain_only_flows: recorded.d16_drain_only_flows,
+        final_recovery_flows: recorded.d16_recovery_flows,
+        remote_eof_seen,
+        eof_after_owned_queue_drain: recorded.d16_eof_observed && recorded.d16_eof_tail_bytes == 0,
+        close_egress_bytes: recorded.d16_eof_tail_bytes,
+        terminal_drop_bytes: recorded.terminal_drop_bytes,
+        terminal_late_payload_bytes: recorded.terminal_late_payload_bytes,
+        final_owned_queue_bytes: recorded.d16_owned_queue_bytes,
+        final_pending_bytes: recorded.d16_pending_bytes,
+        final_inflight_bytes: recorded.d16_inflight_bytes,
+        final_local_eof_sent_flows: recorded.d16_local_eof_sent_flows,
+    }
+}
+
+const D16_INTEGRATED_STEP_BYTES: usize = 128 * 1024;
+const D16_INTEGRATED_STEP_MILLIS: u64 = 5;
+const D16_INTEGRATED_DURATION_SECS: u64 = 30;
+const D16_INTEGRATED_STEPS: usize =
+    (D16_INTEGRATED_DURATION_SECS * 1000 / D16_INTEGRATED_STEP_MILLIS) as usize;
+
+#[derive(Debug)]
+pub enum D16IntegratedHarnessError {
+    Config,
+    Queue(ByteQueuePushError),
+    TailDidNotDrain,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct D16IntegratedReport {
+    pub receiver_capacity_mbps: f64,
+    pub remote_bytes: u64,
+    pub actor_admitted_bytes: u64,
+    pub actor_bypass_admitted_bytes: u64,
+    pub tun_drop_bytes: u64,
+    pub close_egress_bytes: usize,
+    pub per_flow_high_water_bytes: usize,
+    pub global_high_water_bytes: usize,
+    pub readiness_wakes: u64,
+}
+
+pub async fn run_d16_byte_owned_pressure_scenario()
+-> Result<D16IntegratedReport, D16IntegratedHarnessError> {
+    let budget = D16GlobalByteBudget::new_default();
+    let mut flow =
+        D16HarnessFlow::new(budget.clone()).map_err(|_| D16IntegratedHarnessError::Config)?;
+    let mut readiness_wakes = 0u64;
+    let mut per_flow_high_water_bytes = 0usize;
+
+    for _ in 0..D16_INTEGRATED_STEPS {
+        if !flow.permissions().allow_read {
+            return Err(D16IntegratedHarnessError::TailDidNotDrain);
+        }
+        if flow
+            .enqueue_remote_chunk(D16_INTEGRATED_STEP_BYTES)
+            .await
+            .map_err(D16IntegratedHarnessError::Queue)?
+        {
+            readiness_wakes = readiness_wakes.saturating_add(1);
+        }
+        let _ = flow.cycle(false, false, D16_INTEGRATED_STEP_BYTES);
+        per_flow_high_water_bytes =
+            per_flow_high_water_bytes.max(flow.snapshot().queue.high_water_bytes);
+    }
+
+    if flow.close_remote().await {
+        readiness_wakes = readiness_wakes.saturating_add(1);
+    }
+    for _ in 0..16 {
+        let _ = flow.cycle(false, false, D16_INTEGRATED_STEP_BYTES);
+        if flow.snapshot().eof_ready {
+            break;
+        }
+    }
+    let snapshot = flow.snapshot();
+    if !snapshot.eof_ready {
+        return Err(D16IntegratedHarnessError::TailDidNotDrain);
+    }
+    let seconds = D16_INTEGRATED_DURATION_SECS as f64;
+    let receiver_capacity_mbps =
+        (snapshot.committed_tun_bytes as f64 * 8.0) / (seconds * 1_000_000.0);
+    Ok(D16IntegratedReport {
+        receiver_capacity_mbps,
+        remote_bytes: (D16_INTEGRATED_STEPS * D16_INTEGRATED_STEP_BYTES) as u64,
+        actor_admitted_bytes: snapshot.actor_admitted_bytes,
+        actor_bypass_admitted_bytes: snapshot.actor_bypass_admitted_bytes,
+        tun_drop_bytes: 0,
+        close_egress_bytes: snapshot
+            .queue
+            .owned_bytes()
+            .saturating_add(snapshot.pending_bytes)
+            .saturating_add(snapshot.inflight_bytes),
+        per_flow_high_water_bytes,
+        global_high_water_bytes: budget.snapshot().high_water_bytes,
+        readiness_wakes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tcp_downlink_pump::{
+        AsyncLeasedByteFlowQueue, D16_GLOBAL_BYTE_BUDGET_DEFAULT_BYTES, DownstreamPermitReleaseMode,
+    };
+    use crate::tcp_egress::EgressPhase;
 
     #[test]
     fn loopback_try_recv_rx_reports_no_ready_packet_without_blocking() {
@@ -1562,5 +2213,162 @@ mod tests {
         assert_eq!(device.rx_take().unwrap(), BytesMut::from(&b"first"[..]));
         assert!(device.try_recv_rx().unwrap());
         assert_eq!(device.rx_take().unwrap(), BytesMut::from(&b"second"[..]));
+    }
+
+    #[tokio::test]
+    async fn d16_integrated_heavy_flow_proves_capacity_ownership_and_clean_eof() {
+        let report = run_d16_byte_owned_pressure_scenario()
+            .await
+            .expect("fixed D16 harness configuration must run");
+
+        assert!(report.receiver_capacity_mbps >= 200.0, "{report:?}");
+        assert_eq!(report.remote_bytes, report.actor_admitted_bytes);
+        assert_eq!(report.actor_bypass_admitted_bytes, 0);
+        assert_eq!(report.tun_drop_bytes, 0);
+        assert_eq!(report.close_egress_bytes, 0);
+        assert!(report.per_flow_high_water_bytes <= 512 * 1024);
+        assert!(report.global_high_water_bytes <= D16_GLOBAL_BYTE_BUDGET_DEFAULT_BYTES);
+        assert!(report.readiness_wakes > 0);
+    }
+
+    #[tokio::test]
+    async fn d16_bidirectional_control_survives_suppressed_tun_wait_edge() {
+        let report = run_d16_bidirectional_control_scenario().await;
+
+        assert!(report.first_response_seen, "{report:?}");
+        assert!(report.second_control_echoed, "{report:?}");
+        assert!(report.round_trip_intact, "{report:?}");
+        assert_eq!(report.tcp_opens, 1, "{report:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn d16_reverse_flow_does_not_overrun_bounded_tun_rx_ring() {
+        const RING_CAPACITY_PACKETS: usize = 64;
+        let report = run_d16_tun_rx_starvation_scenario(
+            64 * 1024 * 1024,
+            RING_CAPACITY_PACKETS,
+            Duration::from_secs(15),
+        )
+        .await;
+
+        assert_eq!(report.bootstrap_sent_bytes, 1, "{report:?}");
+        assert_eq!(report.tcp_opens, 1, "{report:?}");
+        assert_eq!(report.modeled_tx_dropped, 0, "{report:?}");
+        assert!(report.tun_rx_budget_exhausted > 0, "{report:?}");
+        assert!(report.backlog_pause_edges > 0, "{report:?}");
+        assert!(report.backlog_resume_edges > 0, "{report:?}");
+        assert_eq!(report.actor_bypass_admitted_bytes, 0, "{report:?}");
+        assert!(report.remote_eof_seen, "{report:?}");
+        assert!(report.eof_after_owned_queue_drain, "{report:?}");
+        assert_eq!(report.close_egress_bytes, 0, "{report:?}");
+        assert_eq!(report.terminal_drop_bytes, 0, "{report:?}");
+        assert_eq!(report.terminal_late_payload_bytes, 0, "{report:?}");
+        assert_eq!(report.received_bytes, report.payload_bytes, "{report:?}");
+        assert!(report.ring_high_water_packets > 0, "{report:?}");
+        assert!(
+            report.max_tcp_payload_packets_per_flush
+                <= crate::tcp_egress::D16_ACTOR_PAYLOAD_PACKET_BUDGET as u64,
+            "{report:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn d16_pressure_stops_read_and_admission_while_other_flow_progresses() {
+        let budget = D16GlobalByteBudget::new(512 * 1024).unwrap();
+        let mut paused = D16HarnessFlow::new(budget.clone()).unwrap();
+        let mut active = D16HarnessFlow::new(budget.clone()).unwrap();
+
+        paused
+            .enqueue_remote_chunk(D16_INTEGRATED_STEP_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(
+            paused
+                .cycle(false, false, D16_INTEGRATED_STEP_BYTES)
+                .admitted_bytes,
+            D16_INTEGRATED_STEP_BYTES
+        );
+        paused
+            .enqueue_remote_chunk(D16_INTEGRATED_STEP_BYTES)
+            .await
+            .unwrap();
+        let pressure = paused.cycle(true, true, D16_INTEGRATED_STEP_BYTES);
+        assert_eq!(pressure.drained_bytes, D16_INTEGRATED_STEP_BYTES);
+        assert_eq!(pressure.admitted_bytes, 0);
+        assert!(!pressure.allow_read);
+        assert!(!pressure.allow_admission);
+        assert_eq!(pressure.phase, EgressPhase::DrainOnly);
+        assert!(!paused.permissions().allow_read);
+
+        active
+            .enqueue_remote_chunk(D16_INTEGRATED_STEP_BYTES)
+            .await
+            .unwrap();
+        let active_cycle = active.cycle(false, false, D16_INTEGRATED_STEP_BYTES);
+        assert_eq!(active_cycle.admitted_bytes, D16_INTEGRATED_STEP_BYTES);
+        assert_eq!(active_cycle.phase, EgressPhase::Running);
+        assert!(budget.snapshot().total_bytes() <= 512 * 1024);
+
+        let clean = paused.cycle(false, false, D16_INTEGRATED_STEP_BYTES);
+        assert_eq!(clean.admitted_bytes, 0);
+        assert_eq!(clean.phase, EgressPhase::Recovery { clean_cycles: 0 });
+        for _ in 0..4 {
+            paused.cycle(false, false, D16_INTEGRATED_STEP_BYTES);
+        }
+        assert_eq!(paused.snapshot().phase, EgressPhase::Running);
+    }
+
+    #[tokio::test]
+    async fn d16_global_saturation_is_bounded_and_waiters_do_not_busy_spin() {
+        const FLOW_BYTES: usize = 128 * 1024;
+        let budget = D16GlobalByteBudget::new(4 * FLOW_BYTES).unwrap();
+        let queues: Vec<_> = (0..8)
+            .map(|_| {
+                AsyncLeasedByteFlowQueue::new_with_global_budget(
+                    FLOW_BYTES,
+                    DownstreamPermitReleaseMode::OnEgressDrain,
+                    budget.clone(),
+                )
+                .unwrap()
+            })
+            .collect();
+        for queue in &queues[..4] {
+            let reservation = queue.reserve_read_up_to(FLOW_BYTES).await.unwrap();
+            reservation
+                .commit(bytes::Bytes::from(vec![1; FLOW_BYTES]))
+                .unwrap();
+        }
+        assert_eq!(budget.snapshot().total_bytes(), 4 * FLOW_BYTES);
+
+        let waiters: Vec<_> = queues[4..]
+            .iter()
+            .cloned()
+            .map(|queue| tokio::spawn(async move { queue.reserve_read_up_to(FLOW_BYTES).await }))
+            .collect();
+        tokio::task::yield_now().await;
+        assert!(waiters.iter().all(|waiter| !waiter.is_finished()));
+
+        for queue in &queues[..4] {
+            let mut leased = queue.recv_up_to(FLOW_BYTES).await.unwrap();
+            assert_eq!(leased.permit_mut().release(usize::MAX), FLOW_BYTES);
+        }
+        let mut reservations = Vec::new();
+        for waiter in waiters {
+            reservations.push(
+                tokio::time::timeout(Duration::from_millis(200), waiter)
+                    .await
+                    .expect("released global bytes must wake every flow")
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert!(
+            reservations
+                .iter()
+                .all(|reservation| reservation.max_len() == FLOW_BYTES)
+        );
+        drop(reservations);
+        assert_eq!(budget.snapshot().total_bytes(), 0);
+        assert!(budget.snapshot().high_water_bytes <= 4 * FLOW_BYTES);
     }
 }
