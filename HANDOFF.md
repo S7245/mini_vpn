@@ -123,6 +123,22 @@ This section overrides the older G7/G8/GV next-step text below.
   when both windows pass. Gate B is three timed repeats with a median target of
   `170 Mbit/s`, one same-build fixed-byte clean-close repeat, and a same-window
   sing-box parity fallback.
+- The clean `f1627bc` composite Gate A ran in a window where the mature
+  sing-box control passed at `157.650 Mbit/s` receiver and the direct reverse
+  baseline was `212.607 Mbit/s`. Pool-2 mini_vpn nevertheless collapsed to
+  `0.0265 Mbit/s` receiver in A-capacity and the fixed `64 MiB` A-clean flow
+  timed out after about `3.68 MiB`. TUN drop, actor bypass, local pressure,
+  send/flush error, and QUIC loss/blocking surfaces stayed zero. Target-side
+  evidence showed that the TUIC stream stopped supplying data upstream of the
+  D16 actor.
+- A same-server pool-1 discriminator improved to `115 Mbit/s` receiver with
+  zero local drop/pressure but a `3.807s` data-read gap and tail collapse. Code
+  review found that pool 2 had forcibly reconnected an otherwise healthy idle
+  auxiliary slot after `10s`, while primary `conn=0` is exempt. Pool 1 is not
+  the fix and Gate B remains frozen. The next TDD seam is the destructive
+  auxiliary stale-reconnect policy and main/aux lifecycle asymmetry; do not
+  modify the D16 actor/queue/EOF architecture. Result:
+  `docs/tech/2026-07-11-knife14h10d16-composite-gate-a-pool-lifecycle-results.md`.
 - The worktree is intentionally dirty and overlapping D16 files contain older
   experiments. Do not revert user changes and do not commit whole files without
   first showing which pre-D16 diffs would be included.

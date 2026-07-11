@@ -405,6 +405,23 @@ This supersedes the impossible requirement that one abort-capable timed socket
 simultaneously prove graceful EOF. It does not weaken byte ownership or clean
 EOF: each property is now tested by a generator that can actually establish it.
 
+### 2026-07-11 composite Gate A pool-lifecycle observation
+
+The composite run used a capable temporary Exit window: mature control reached
+`157.650 Mbit/s` receiver and direct reverse reached `212.607 Mbit/s`. Pool-2
+mini_vpn stopped receiving sustained TUIC stream data before the D16 actor,
+while every local ownership, pressure, actor, TUN-drop, and QUIC-loss/blocking
+surface stayed clean. Pool 1 improved the same path to `115 Mbit/s`, still below
+Gate A.
+
+This does not amend the byte-owned egress architecture. It exposes an adjacent
+transport-pool lifecycle policy: a healthy-looking idle auxiliary slot is
+forcibly reconnected after `10s`, while the primary connection is exempt. The
+next architecture-safe correction is to use observable connection health,
+close state, or bounded open failure rather than elapsed idle time as the
+reconnect authority. Pool 1 is not an acceptable substitute for pool health or
+concurrency. Gate B remains frozen.
+
 ## Stage Mapping
 
 The project remains nominally at stage 8 because H10d15 proved capacity but

@@ -5855,3 +5855,20 @@ worth cleaning up separately.
 - Reusable rule: preserve architecture when capacity, ownership, and actor
   invariants pass. Change the state model and test generator when the failure is
   an observability/acceptance mismatch, not a hot-path capacity defect.
+
+## 2026-07-11 - Pool-1 recovery selects lifecycle policy, not D16 egress
+
+- A capable mature-client window (`157.650 Mbit/s` receiver) and healthy direct
+  baseline (`212.607 Mbit/s`) removed the shared service precondition, yet the
+  pool-2 D16 flow received only a small burst. Local ownership, actor,
+  pressure, TUN drop, and QUIC loss/blocking evidence stayed clean.
+- On the same server, pool 1 reached `115 Mbit/s` and moved about `274 MiB`.
+  This is a strong connection-selection discriminator but not a fix: it remains
+  below Gate A and gives up connection-pool concurrency.
+- Pool 2 had reconnected its healthy-looking idle auxiliary slot at the fixed
+  `10s` threshold immediately before the data flow; primary is exempt. Time
+  alone is not sufficient evidence that a QUIC connection is stale.
+- Reusable rule: when a persistent primary progresses and a freshly recycled
+  auxiliary stalls with identical egress invariants, TDD the pool lifecycle
+  authority before touching byte ownership, actor cadence, MTU, windows, or
+  queue sizes.

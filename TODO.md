@@ -129,6 +129,25 @@ zero. Both subproofs are an AND gate. Do not try to drain bytes into an already
 MTU/QUIC/pool/chunk/self-wake work. Result:
 `docs/tech/2026-07-11-knife14h10d16-alternate-exit-gate-a-results.md`.
 
+That composite Gate A has now run from clean `f1627bc` in a capable temporary
+Exit window. The mature control passed at `157.650 Mbit/s` receiver and direct
+reverse reached `212.607 Mbit/s`, but pool-2 mini_vpn reached only
+`0.0265 Mbit/s` in A-capacity and the fixed `64 MiB` A-clean flow timed out
+after about `3.68 MiB`. All D16/TUN local drop, bypass, pressure, send/flush,
+and QUIC loss/blocking surfaces stayed clean; the target sender itself stopped
+after a small TUIC-stream burst.
+
+A pool-1 discriminator on the same capable server reached `115 Mbit/s` with
+zero local drop/pressure, selecting TUIC pool lifecycle as the next seam but
+not passing Gate A. Pool 2 had destructively reconnected an idle healthy
+auxiliary slot after `10s`; pool 1 used persistent primary `conn=0`. Before any
+new Gate A, use TDD to replace elapsed-idle reconnect with evidence-based slot
+health, preserve pool-2 concurrency, and prove an auxiliary data flow locally
+and in one scoped same-window A/B. Gate B remains frozen. Do not change D16
+ownership, actor cadence, queue size, EOF, MTU, QUIC windows, or chunk size.
+Result:
+`docs/tech/2026-07-11-knife14h10d16-composite-gate-a-pool-lifecycle-results.md`.
+
 Knife14fp found a mandatory high-throughput prerequisite: the exit VPS `.33`
 had Linux socket buffer caps/defaults of only `212992B`, which capped both
 mini_vpn and a mature sing-box client around the `20-30 Mbit/s` band. `.33` is

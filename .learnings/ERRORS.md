@@ -3837,3 +3837,27 @@ active root unless it repeats.
   the D16 lifecycle fix, record strict clippy as repository/toolchain debt, and
   do not mix a broad mechanical cleanup into overlapping user changes. Schedule
   that cleanup as a separate coherent commit.
+
+## 2026-07-11 - Fixed idle age recycled a healthy auxiliary connection
+
+- Symptom: in a capable Exit window, pool-2 Gate A opened the data stream on an
+  auxiliary connection that had just been forcibly reconnected for
+  `stale_tcp_pool_slot`; the stream delivered a short burst and then stalled.
+  Pool 1 on persistent primary reached `115 Mbit/s` with zero local pressure.
+- Root cause status: the fixed `10s` reconnect is a selected policy defect and
+  the next falsifiable seam, but not yet proven sufficient for `>150 Mbit/s`.
+  A prior auxiliary run reached `183 Mbit/s`, so auxiliary connections are not
+  intrinsically incapable.
+- Correct behavior: never infer transport death from idle time alone. Preserve
+  a healthy authenticated slot until Quinn close state or a bounded transport
+  operation supplies failure evidence; prove the selected slot/generation in
+  the acceptance artifact.
+
+## 2026-07-11 - Minimal temporary TUIC config omitted a required outbound tag
+
+- Symptom: the first minimal temporary Exit failed startup because a route
+  referenced the direct outbound but the generated source outbound had no tag.
+- Correct behavior: when reducing a mature server config for a discriminator,
+  validate every route reference and run a config check before replacing the
+  live temporary process. A reduced config must also pass the mature-client
+  capability floor before it can qualify Gate A.

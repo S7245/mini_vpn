@@ -1128,7 +1128,7 @@ exclusivity. Queue-cap, chunk, MTU, QUIC-window, self-wake, and actor cadence
 changes are rejected. Commits `879e904` and `7a7ca04` remove dead plumbing and
 preserve terminal cause respectively.
 
-- [ ] **Step 6: Run one composite Gate A on `.27`**
+- [x] **Step 6: Run one composite Gate A on `.27`**
 
 Use one clean committed build, exact safe1200 D16 profile, one capable Exit
 window, and one tunnel process:
@@ -1143,6 +1143,56 @@ window, and one tunnel process:
 
 Gate A passes only if both subproofs pass. Any other terminal reason, mixed
 lifecycle window, TUN drop, or incomplete fixed-byte flow stops before Gate B.
+
+Result (2026-07-11): failed before Gate B. The mature control qualified the
+window at `157.650 Mbit/s` receiver, but pool-2 mini_vpn reached only
+`0.0265 Mbit/s` in A-capacity and A-clean received about `3.68 MiB` before
+timeout. D16 ownership, actor, pressure, TUN drop, and QUIC loss/blocking
+surfaces stayed clean. A pool-1 discriminator reached `115 Mbit/s`, selecting
+the TCP pool lifecycle seam rather than D16 egress. See Task 11C.
+
+### Task 11C: Replace Destructive Idle Reconnect With Evidence-Based Pool Health
+
+This is a transport-pool lifecycle correction, not a D16 egress redesign.
+Pool 1 is diagnostic only and must not become the product default to hide the
+auxiliary-slot failure.
+
+**Files:**
+- Modify: `src/tuic.rs`
+- Modify diagnostics/parsers only as required to prove connection generation
+- Add focused tests in the existing TUIC test module
+- Update current result docs and learning memory
+
+- [ ] **Step 1: RED — healthy auxiliary idle is not stale**
+
+Add a pure policy test that distinguishes explicit closed/unhealthy state from
+elapsed idle age. A healthy authenticated auxiliary slot with no close reason
+must remain reusable after `10s`; active-stream exclusion remains mandatory.
+
+- [ ] **Step 2: GREEN — reconnect only from observable health evidence**
+
+Remove time alone as the reconnect cause. Reconnect a slot when Quinn reports
+it closed or a bounded open/transport failure proves it unusable. Preserve the
+per-slot mutex, lease accounting, startup degradation, and primary UDP/health
+semantics.
+
+- [ ] **Step 3: Add bounded connection-generation evidence**
+
+Report slot index, stable connection id/generation, reconnect reason, last-use
+age, and active lease count at open/reconnect. Do not log payload or auth data.
+
+- [ ] **Step 4: Local TDD and review**
+
+Run focused pool tests, all TUIC/D16 libraries and harnesses, checks, focused
+formatting, runner self-tests, and code review. Verify no TCP pool change can
+route UDP away from primary or weaken actor/ownership/EOF invariants.
+
+- [ ] **Step 5: One scoped pool-2 auxiliary A/B**
+
+After a mature control exceeds `150 Mbit/s`, run one clean pool-2 reverse P1
+whose data stream is proven to use an auxiliary slot without destructive idle
+reconnect. This is a discriminator, not Gate B. Require receiver `>150 Mbit/s`
+and zero D16/TUN/QUIC error surfaces before authorizing a new composite Gate A.
 
 ### Task 12: Prove 170M Parity, Regress Product Paths, And Clean Experiments
 
