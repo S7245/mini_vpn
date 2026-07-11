@@ -5783,3 +5783,19 @@ worth cleaning up separately.
 - Reusable rule: a clean startup rehearsal should prove commit identity,
   runtime profile, route isolation, and teardown before a scarce performance
   gate; it can expose deployment drift without spending the gate itself.
+
+## 2026-07-11 - Versioned control confirms the shared burst/idle window
+
+- The first clean, versioned MTU1500 control after R1-R4 had healthy direct
+  reverse capacity on both legs (`216.172` and `213.865 Mbit/s`), correct
+  target-only routing, `16 MiB` client/Exit UDP buffers, and socket drop `0`.
+  Mature sing-box nevertheless reached only `11.219 Mbit/s` receiver.
+- One-second intervals alternated short bursts with long zero-rate gaps. Exit
+  logs showed normal TUIC accepts and direct target opens; the only close error
+  was the expected remote stream cancellation at test completion.
+- Review of the exact-profile test, runner, control, and D16 ownership diff
+  found no new correctness or architecture issue. Gate A and Gate B were
+  correctly left unspent.
+- Reusable rule: when a versioned mature client fails with healthy direct legs,
+  correct routes, full socket buffers, and zero drops, do not use mini_vpn VPS
+  acceptance as a diagnostic and do not modify the local egress architecture.

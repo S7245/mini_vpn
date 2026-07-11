@@ -83,6 +83,16 @@ remains frozen. Review and closure:
 `docs/tech/2026-07-10-knife14h10d16-gate-process-code-review.md` and
 `docs/tech/2026-07-11-knife14h10d16-gate-process-r1-r4-results.md`.
 
+The first versioned post-R1-R4 control ran from clean `044eccb` and did not
+unlock Gate A. Direct reverse baselines were `216.172 Mbit/s` from `.27` and
+`213.865 Mbit/s` from `.33`, while the MTU1500 sing-box TUIC control reached
+only `13.472/11.219 Mbit/s` sender/receiver. Both UDP sockets were `16 MiB` with
+drop `0`, routing was correct, and the receiver intervals were burst/idle with
+many zero-rate seconds. Gate A and Gate B remain unspent. Do not repeat the same
+control, restart services, or change mini_vpn until an independent external
+window change provides a new discriminator. Result:
+`docs/tech/2026-07-11-knife14h10d16-versioned-control-results.md`.
+
 Knife14fp found a mandatory high-throughput prerequisite: the exit VPS `.33`
 had Linux socket buffer caps/defaults of only `212992B`, which capped both
 mini_vpn and a mature sing-box client around the `20-30 Mbit/s` band. `.33` is

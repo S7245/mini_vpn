@@ -3787,3 +3787,15 @@ active root unless it repeats.
   independent formatting debt only with an explicit commit strategy.
 - Command correction: direct `rustfmt` must use this crate's Rust 2024 edition;
   forcing edition 2021 produces false let-chain parse errors.
+
+## 2026-07-11 - Post-R1-R4 mature control remained externally incapable
+
+- Symptom: the versioned historical-MTU1500 control returned receiver
+  `11.219 Mbit/s` despite `216.172/213.865 Mbit/s` direct reverse baselines.
+  Its one-second profile contained repeated zero-rate intervals.
+- Discriminators: target/Exit routes were correct, both UDP sockets reported
+  `rb=tb=16777216` and drop `0`, sing-box accepted the TUIC flows and opened the
+  target, and cleanup restored `.27` sysctls/TUN/routes.
+- Correct behavior: treat the window as shared TUIC incapability, keep Gate A/B
+  unspent, and do not repeat the unchanged control until independent external
+  state has changed.

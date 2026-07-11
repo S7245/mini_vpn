@@ -85,6 +85,14 @@ This section overrides the older G7/G8/GV next-step text below.
   `>150 Mbit/s` and both UDP socket drops `0`; only then spend one `20s`
   safe1200 reverse-first P1 Gate A. Do not edit D16 or repeat control in the
   already-proven incapable window. Gate B remains frozen until Gate A passes.
+- That versioned control ran from clean `044eccb` on 2026-07-11 and the window
+  was still incapable: `.27 -> .77` direct reverse was `216.172 Mbit/s`,
+  `.33 -> .77` was `213.865 Mbit/s`, but sing-box TUIC control was only
+  `13.472/11.219 Mbit/s` sender/receiver. Target/Exit routes were correct, both
+  UDP sockets were `16 MiB` with drop `0`, and the stream was burst/idle with
+  many zero-rate seconds. Gate A and Gate B were not run. Do not repeat this
+  unchanged control until an independent external-window change occurs. Result:
+  `docs/tech/2026-07-11-knife14h10d16-versioned-control-results.md`.
 - A future Gate A remains one clean focused run above `150 Mbit/s`; Gate B is
   three clean repeats with a median target of `170 Mbit/s` and a same-window
   sing-box parity fallback.
