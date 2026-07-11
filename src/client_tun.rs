@@ -6176,39 +6176,45 @@ fn record_local_egress_service_window<M: MetricsSink>(
     progress: LocalEgressServiceProgress,
     egress_actor: bool,
 ) {
-    if metrics.wants_d16_harness_observations() {
-        let aggregate = tcp_downlink_aggregate(socket_ctxs.values());
-        metrics.note_d16_actor_observation(
-            aggregate.actor_bypass_admitted_bytes,
-            aggregate.d16_running_flows,
-            aggregate.d16_drain_only_flows,
-            aggregate.d16_recovery_flows,
-        );
-        let mut owned_queue_bytes = 0usize;
-        let mut pending_bytes = 0usize;
-        let mut inflight_bytes = 0usize;
-        let mut local_eof_sent_flows = 0usize;
-        for ctx in socket_ctxs.values() {
-            let Some(queue) = ctx.d16_downlink_queue.as_ref() else {
-                continue;
-            };
-            owned_queue_bytes =
-                owned_queue_bytes.saturating_add(queue.snapshot_now().owned_bytes());
-            pending_bytes = pending_bytes.saturating_add(ctx.downlink_pending.len());
-            inflight_bytes = inflight_bytes.saturating_add(ctx.downlink_inflight_permit_bytes());
-            local_eof_sent_flows =
-                local_eof_sent_flows.saturating_add(usize::from(ctx.local_eof_sent));
-        }
-        metrics.note_d16_flow_lifecycle(
-            owned_queue_bytes,
-            pending_bytes,
-            inflight_bytes,
-            local_eof_sent_flows,
-            aggregate.permit_terminal_drop_bytes,
-            aggregate.terminal_late_remote_payload_bytes,
-        );
-    }
+    record_d16_harness_observation(metrics, socket_ctxs);
     note_local_egress_service_window(diag, progress, egress_actor);
+}
+
+fn record_d16_harness_observation<M: MetricsSink>(
+    metrics: &mut M,
+    socket_ctxs: &HashMap<SocketHandle, SocketCtx>,
+) {
+    if !metrics.wants_d16_harness_observations() {
+        return;
+    }
+    let aggregate = tcp_downlink_aggregate(socket_ctxs.values());
+    metrics.note_d16_actor_observation(
+        aggregate.actor_bypass_admitted_bytes,
+        aggregate.d16_running_flows,
+        aggregate.d16_drain_only_flows,
+        aggregate.d16_recovery_flows,
+    );
+    let mut owned_queue_bytes = 0usize;
+    let mut pending_bytes = 0usize;
+    let mut inflight_bytes = 0usize;
+    let mut local_eof_sent_flows = 0usize;
+    for ctx in socket_ctxs.values() {
+        let Some(queue) = ctx.d16_downlink_queue.as_ref() else {
+            continue;
+        };
+        owned_queue_bytes = owned_queue_bytes.saturating_add(queue.snapshot_now().owned_bytes());
+        pending_bytes = pending_bytes.saturating_add(ctx.downlink_pending.len());
+        inflight_bytes = inflight_bytes.saturating_add(ctx.downlink_inflight_permit_bytes());
+        local_eof_sent_flows = local_eof_sent_flows.saturating_add(usize::from(ctx.local_eof_sent));
+    }
+    metrics.note_d16_flow_lifecycle(
+        owned_queue_bytes,
+        pending_bytes,
+        inflight_bytes,
+        local_eof_sent_flows,
+        aggregate.permit_terminal_drop_bytes,
+        aggregate.terminal_late_remote_payload_bytes,
+    );
 }
 
 fn stream_service_blocked_reason_for_local_egress(
@@ -9668,6 +9674,7 @@ async fn process_dirty_relay<U, M>(
             dirty.remove(&handle);
         }
     }
+    record_d16_harness_observation(metrics, socket_ctxs);
     metrics.leave_relay();
 }
 
@@ -18582,6 +18589,99 @@ mod tests {
 
         let _ = stop_tx.send(());
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn d16_real_quinn_reader_sustains_byte_owned_queue_progress() {
+        const PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+        const WRITE_BYTES: usize = 64 * 1024;
+
+        let (server_endpoint, client_endpoint, server_addr) =
+            crate::tuic::d16_quinn_test_endpoints();
+
+        let (client_read_tx, client_read_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let mut marker = [0u8; 1];
+            recv.read_exact(&mut marker).await.unwrap();
+            assert_eq!(marker, [0x5c]);
+            let payload = vec![0x7e; WRITE_BYTES];
+            for _ in 0..PAYLOAD_BYTES / WRITE_BYTES {
+                send.write_all(&payload).await.unwrap();
+            }
+            send.finish().unwrap();
+            let _ = client_read_rx.await;
+        });
+
+        let connection = client_endpoint
+            .connect(server_addr, "example.com")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, recv) = connection.open_bi().await.unwrap();
+        send.write_all(&[0x5c]).await.unwrap();
+        let reader = crate::tuic::d16_native_ordered_reader_for_test(recv, connection);
+
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let queue = AsyncLeasedByteFlowQueue::new_with_release_mode(
+            D16_PER_FLOW_BYTE_CAPACITY,
+            DownstreamPermitReleaseMode::OnEgressDrain,
+        )
+        .unwrap();
+        let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit::initial());
+        let (back_tx, mut back_rx) = mpsc::channel(8);
+        let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let reader_task = tokio::spawn(run_d16_native_reader(
+            handle,
+            29,
+            reader,
+            queue.clone(),
+            credit_rx,
+            back_tx,
+            None,
+            stop_rx,
+        ));
+
+        let started = std::time::Instant::now();
+        let mut received = 0usize;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let Some((event_handle, event)) = back_rx.recv().await else {
+                    break;
+                };
+                assert_eq!(event_handle, handle);
+                assert!(matches!(event, RelayEvent::DataReady { epoch: 29 }));
+                loop {
+                    match queue.try_recv_up_to(D16_ACTOR_QUANTUM_BYTES) {
+                        LeasedQueuePoll::Data(bytes) => {
+                            received = received.saturating_add(bytes.bytes().len());
+                            drop(bytes);
+                        }
+                        LeasedQueuePoll::Empty => break,
+                        LeasedQueuePoll::Closed => return,
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the byte-owned D16 reader must not develop a multi-second queue service gap");
+        reader_task.await.unwrap();
+        let elapsed = started.elapsed();
+        let receiver_mbps = received as f64 * 8.0 / elapsed.as_secs_f64() / 1_000_000.0;
+
+        assert_eq!(received, PAYLOAD_BYTES);
+        assert!(queue.snapshot_now().closed);
+        assert_eq!(queue.snapshot_now().owned_bytes(), 0);
+        assert!(
+            receiver_mbps >= 170.0,
+            "real Quinn plus D16 reservation/readiness queue must have plausible Gate B capacity: elapsed={elapsed:?} rate={receiver_mbps:.1}M"
+        );
+
+        let _ = client_read_tx.send(());
+        server_task.await.unwrap();
+        client_endpoint.close(0u32.into(), b"test complete");
     }
 
     #[tokio::test]

@@ -880,6 +880,57 @@ impl TuicNativeOrderedReader<QuinnDirectOrderedNativeChunkRecv> {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn d16_native_ordered_reader_for_test(
+    recv: quinn::RecvStream,
+    transport_conn: Connection,
+) -> NativeTcpReadHalf {
+    let active = Arc::new(AtomicU64::new(0));
+    let (lease, reserved) = TcpPoolSlotLease::reserve(active);
+    assert!(reserved, "test reader must reserve one synthetic pool slot");
+    Box::new(TuicNativeOrderedReader::new(
+        recv,
+        lease,
+        None,
+        transport_conn,
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn d16_quinn_test_endpoints() -> (Endpoint, Endpoint, SocketAddr) {
+    let cert_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certs/dev");
+    let mut server_cert_reader =
+        std::io::BufReader::new(std::fs::File::open(cert_dir.join("server-cert.pem")).unwrap());
+    let server_certs = rustls_pemfile::certs(&mut server_cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut server_key_reader =
+        std::io::BufReader::new(std::fs::File::open(cert_dir.join("server-key.pem")).unwrap());
+    let server_key = rustls_pemfile::private_key(&mut server_key_reader)
+        .unwrap()
+        .unwrap();
+    let server_config = quinn::ServerConfig::with_single_cert(server_certs, server_key).unwrap();
+    let server_endpoint = quinn::Endpoint::server(
+        server_config,
+        "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
+    )
+    .unwrap();
+    let server_addr = server_endpoint.local_addr().unwrap();
+
+    let mut ca_reader =
+        std::io::BufReader::new(std::fs::File::open(cert_dir.join("ca-cert.pem")).unwrap());
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut ca_reader) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let mut client_endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
+    client_endpoint.set_default_client_config(
+        quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+    );
+    (server_endpoint, client_endpoint, server_addr)
+}
+
 impl<R> TuicNativeOrderedReader<R> {
     fn from_recv(
         recv: R,
@@ -4441,6 +4492,83 @@ mod tests {
         .unwrap();
 
         assert_eq!(&read.bytes[..], b"delayed-quinn-payload");
+        let _ = client_read_tx.send(());
+        server_task.await.unwrap();
+        client_endpoint.close(0u32.into(), b"test complete");
+    }
+
+    #[tokio::test]
+    async fn d16_real_quinn_reader_sustains_ordered_progress() {
+        const PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+        const WRITE_BYTES: usize = 64 * 1024;
+
+        let (server_endpoint, client_endpoint, server_addr) = d16_quinn_test_endpoints();
+
+        let (client_read_tx, client_read_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let mut marker = [0u8; 1];
+            recv.read_exact(&mut marker).await.unwrap();
+            assert_eq!(marker, [0x5b]);
+            let payload = vec![0x6d; WRITE_BYTES];
+            for _ in 0..PAYLOAD_BYTES / WRITE_BYTES {
+                send.write_all(&payload).await.unwrap();
+            }
+            send.finish().unwrap();
+            let _ = client_read_rx.await;
+        });
+
+        let connection = client_endpoint
+            .connect(server_addr, "example.com")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, recv) = connection.open_bi().await.unwrap();
+        send.write_all(&[0x5b]).await.unwrap();
+
+        let active = Arc::new(AtomicU64::new(0));
+        let (lease, reserved) = TcpPoolSlotLease::reserve(active);
+        assert!(reserved);
+        let mut reader = TuicNativeOrderedReader::new(recv, lease, None, connection);
+        let started = Instant::now();
+        let mut last_progress = started;
+        let mut max_progress_gap = Duration::ZERO;
+        let mut received = 0usize;
+        let mut reads = 0u64;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let chunk = std::future::poll_fn(|cx| {
+                    reader.poll_read_chunk(cx, TUIC_TCP_DIRECT_ORDERED_READ_MAX_BYTES)
+                })
+                .await
+                .unwrap();
+                let Some(chunk) = chunk else {
+                    break;
+                };
+                let now = Instant::now();
+                max_progress_gap =
+                    max_progress_gap.max(now.saturating_duration_since(last_progress));
+                last_progress = now;
+                received = received.saturating_add(chunk.bytes.len());
+                reads = reads.saturating_add(1);
+            }
+        })
+        .await
+        .expect("the direct ordered Quinn reader must not develop a multi-second service gap");
+        let elapsed = started.elapsed();
+        let receiver_mbps = received as f64 * 8.0 / elapsed.as_secs_f64() / 1_000_000.0;
+
+        assert_eq!(received, PAYLOAD_BYTES);
+        assert!(
+            max_progress_gap < Duration::from_millis(250),
+            "same-stream progress gap must stay sub-250ms: gap={max_progress_gap:?} reads={reads} rate={receiver_mbps:.1}M"
+        );
+        assert!(
+            receiver_mbps >= 170.0,
+            "same-stream direct reader must have plausible Gate B capacity: reads={reads} elapsed={elapsed:?} rate={receiver_mbps:.1}M"
+        );
+
         let _ = client_read_tx.send(());
         server_task.await.unwrap();
         client_endpoint.close(0u32.into(), b"test complete");

@@ -797,7 +797,7 @@ fn fragment_downlink(assoc: u16, payload: &[u8], chunk: usize) -> Vec<Vec<u8>> {
 
 // ============================ 分段插桩 sink ============================
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 struct Recorded {
     poll_time: Duration,
     poll_calls: u64,
@@ -2237,6 +2237,36 @@ mod tests {
     };
     use crate::tcp_egress::EgressPhase;
 
+    struct OneShotRealQuinnD16Upstream {
+        relay: Mutex<Option<NativeTcpRelayStream>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyUpstream for OneShotRealQuinnD16Upstream {
+        async fn open_tcp(&self, _target: &TargetAddr) -> Result<RelayStream, ClientError> {
+            Err(ClientError::InvalidTarget(
+                "real Quinn D16 harness requires native relay open".into(),
+            ))
+        }
+
+        async fn open_tcp_relay(
+            &self,
+            _target: &TargetAddr,
+        ) -> Result<OpenedTcpRelay, ClientError> {
+            self.relay
+                .lock()
+                .unwrap()
+                .take()
+                .map(OpenedTcpRelay::NativeByteOwned)
+                .ok_or_else(|| ClientError::InvalidTarget("real Quinn relay already opened".into()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DatagramUpstream for OneShotRealQuinnD16Upstream {
+        async fn send_udp(&self, _datagram: Vec<u8>) {}
+    }
+
     #[test]
     fn loopback_try_recv_rx_reports_no_ready_packet_without_blocking() {
         let inbound = PacketLink::new();
@@ -2294,6 +2324,185 @@ mod tests {
         assert!(report.second_control_echoed, "{report:?}");
         assert!(report.round_trip_intact, "{report:?}");
         assert_eq!(report.tcp_opens, 1, "{report:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn d16_real_quinn_full_tun_path_sustains_capacity_and_clean_eof() {
+        const PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+        const WRITE_BYTES: usize = 64 * 1024;
+        const RING_CAPACITY_PACKETS: usize = 64;
+
+        let (server_endpoint, client_endpoint, server_addr) =
+            crate::tuic::d16_quinn_test_endpoints();
+
+        let (server_done_tx, server_done_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let mut bootstrap = [0u8; 1];
+            recv.read_exact(&mut bootstrap).await.unwrap();
+            assert_eq!(bootstrap, [0xA5]);
+            let payload = vec![0x5a; WRITE_BYTES];
+            for _ in 0..PAYLOAD_BYTES / WRITE_BYTES {
+                send.write_all(&payload).await.unwrap();
+            }
+            send.finish().unwrap();
+            let _ = server_done_rx.await;
+        });
+
+        let connection = client_endpoint
+            .connect(server_addr, "example.com")
+            .unwrap()
+            .await
+            .unwrap();
+        let (send, recv) = connection.open_bi().await.unwrap();
+        let upstream = Arc::new(OneShotRealQuinnD16Upstream {
+            relay: Mutex::new(Some(NativeTcpRelayStream {
+                reader: crate::tuic::d16_native_ordered_reader_for_test(recv, connection.clone()),
+                writer: Box::new(send),
+            })),
+        });
+
+        let gen_to_sut = PacketLink::bounded(RING_CAPACITY_PACKETS);
+        let sut_to_gen = PacketLink::new();
+        let (_downlink_tx, downlink_rx) = mpsc::channel::<Vec<u8>>(1);
+        let max_tcp_payload_packets_per_flush = Arc::new(AtomicU64::new(0));
+        let sut_device = LoopbackTunDevice::new(gen_to_sut.clone(), sut_to_gen.clone())
+            .with_tcp_payload_flush_counter(Arc::clone(&max_tcp_payload_packets_per_flush));
+        let config = TunRuntimeConfig::from_sources(Some("2")).unwrap();
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let sut = tokio::spawn(run_event_loop(
+            sut_device,
+            upstream,
+            downlink_rx,
+            config,
+            Arc::new(Metrics::new()),
+            RecordingSink::new(recorded.clone()),
+        ));
+
+        let mut gen_device = GeneratorDevice::with_ingress_packets_per_poll(
+            sut_to_gen.clone(),
+            gen_to_sut.clone(),
+            2,
+        );
+        let mut gen_iface = {
+            let cfg = SmolConfig::new(smoltcp::wire::HardwareAddress::Ip);
+            let mut iface = Interface::new(cfg, &mut gen_device, SmolInstant::now());
+            iface.update_ip_addrs(|addrs| {
+                addrs
+                    .push(IpCidr::new(IpAddress::Ipv4(GEN_IP), 24))
+                    .unwrap();
+            });
+            iface.routes_mut().add_default_ipv4_route(GEN_IP).unwrap();
+            iface
+        };
+        let mut sockets = SocketSet::new(vec![]);
+        let rx = tcp::SocketBuffer::new(vec![0u8; 1024 * 1024]);
+        let tx = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
+        let mut socket = tcp::Socket::new(rx, tx);
+        socket.set_ack_delay(None);
+        socket
+            .connect(
+                gen_iface.context(),
+                (IpAddress::Ipv4(TARGET_IP), TARGET_PORT_BASE),
+                42_000,
+            )
+            .unwrap();
+        let handle = sockets.add(socket);
+
+        let started = Instant::now();
+        let mut bootstrap_sent = false;
+        let mut received = 0usize;
+        let mut remote_eof_seen = false;
+        let mut scratch = vec![0u8; 64 * 1024];
+        let completion = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                gen_device.begin_poll();
+                gen_iface.poll(SmolInstant::now(), &mut gen_device, &mut sockets);
+                let socket = sockets.get_mut::<tcp::Socket>(handle);
+                if !bootstrap_sent && socket.can_send() {
+                    bootstrap_sent = socket.send_slice(&[0xA5]).unwrap() == 1;
+                }
+                while socket.can_recv() {
+                    match socket.recv_slice(&mut scratch) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => received = received.saturating_add(read),
+                    }
+                }
+                remote_eof_seen |= received >= PAYLOAD_BYTES && !socket.may_recv();
+                if remote_eof_seen && recorded.lock().unwrap().d16_eof_observed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if completion.is_err() {
+            let socket = sockets.get::<tcp::Socket>(handle);
+            let socket_state = socket.state();
+            let socket_can_recv = socket.can_recv();
+            let socket_may_recv = socket.may_recv();
+            let socket_can_send = socket.can_send();
+            let recorded_snapshot = recorded.lock().unwrap().clone();
+            let gen_to_sut_queued = gen_to_sut.queue.lock().unwrap().len();
+            let sut_to_gen_queued = sut_to_gen.queue.lock().unwrap().len();
+            let quinn_stats = connection.stats();
+            let quinn_close_reason = connection.close_reason();
+            let sut_finished = sut.is_finished();
+            let server_finished = server_task.is_finished();
+
+            if sockets.get::<tcp::Socket>(handle).is_active() {
+                sockets.get_mut::<tcp::Socket>(handle).close();
+            }
+            sut.abort();
+            let _ = sut.await;
+            let _ = server_done_tx.send(());
+            server_task.abort();
+            let _ = server_task.await;
+            client_endpoint.close(0u32.into(), b"test timed out");
+
+            panic!(
+                "real Quinn plus the complete D16 TCP/TUN path timed out: elapsed={:?} received={received}/{PAYLOAD_BYTES} bootstrap_sent={bootstrap_sent} remote_eof_seen={remote_eof_seen} socket_state={socket_state:?} socket_can_recv={socket_can_recv} socket_may_recv={socket_may_recv} socket_can_send={socket_can_send} gen_to_sut_queued={gen_to_sut_queued} gen_to_sut_dropped={} gen_to_sut_high_water={} sut_to_gen_queued={sut_to_gen_queued} sut_to_gen_high_water={} sut_finished={sut_finished} server_finished={server_finished} quinn_close_reason={quinn_close_reason:?} recorded={recorded_snapshot:?} quinn_stats={quinn_stats:?}",
+                started.elapsed(),
+                gen_to_sut.dropped_packets(),
+                gen_to_sut.high_water_packets(),
+                sut_to_gen.high_water_packets(),
+            );
+        }
+        let elapsed = started.elapsed();
+        let receiver_mbps = received as f64 * 8.0 / elapsed.as_secs_f64() / 1_000_000.0;
+
+        if sockets.get::<tcp::Socket>(handle).is_active() {
+            sockets.get_mut::<tcp::Socket>(handle).close();
+        }
+        sut.abort();
+        let _ = sut.await;
+        let (eof_observed, eof_tail_bytes, actor_bypass_admitted_bytes) = {
+            let recorded = recorded.lock().unwrap();
+            (
+                recorded.d16_eof_observed,
+                recorded.d16_eof_tail_bytes,
+                recorded.actor_bypass_admitted_bytes,
+            )
+        };
+        assert_eq!(received, PAYLOAD_BYTES);
+        assert!(remote_eof_seen);
+        assert!(eof_observed);
+        assert_eq!(eof_tail_bytes, 0);
+        assert_eq!(actor_bypass_admitted_bytes, 0);
+        assert_eq!(gen_to_sut.dropped_packets(), 0);
+        assert!(
+            max_tcp_payload_packets_per_flush.load(Ordering::Relaxed)
+                <= crate::tcp_egress::D16_ACTOR_PAYLOAD_PACKET_BUDGET as u64
+        );
+        assert!(
+            receiver_mbps >= 170.0,
+            "real Quinn full D16 TCP/TUN path must retain Gate B capacity: elapsed={elapsed:?} rate={receiver_mbps:.1}M"
+        );
+
+        let _ = server_done_tx.send(());
+        server_task.await.unwrap();
+        client_endpoint.close(0u32.into(), b"test complete");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

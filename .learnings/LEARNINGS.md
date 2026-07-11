@@ -5641,3 +5641,28 @@ worth cleaning up separately.
   rule: every stability harness for a performance architecture must assert the
   target service rate, and an emergency guard must be measured as exceptional,
   not merely shown to pause and resume correctly.
+
+## 2026-07-10 - Real Quinn closes the full D16 ownership path locally
+
+- Three progressively deeper tests now use a real loopback Quinn stream: the
+  direct ordered reader, the RAII reservation/readiness queue, and the complete
+  `run_event_loop` TCP/smoltcp/TUN actor path.
+- The full-path test sends `32 MiB`, requires at least `170 Mbit/s`, bounds each
+  flush to the 24-payload-packet actor allowance, and requires zero modeled TUN
+  drop, zero actor bypass, complete remote EOF, and zero EOF tail.
+- An initial repeat timed out after the generator had received all `32 MiB` and
+  entered `CloseWait`. TUN queues were empty, QUIC loss/congestion was zero, but
+  `Recorded` still showed `34507B` owned/inflight and no local EOF. The actual
+  lifecycle was correct; the observation was only refreshed by local-egress
+  service windows and could remain stale after a control-only dirty-relay pass.
+- The observation snapshot is now shared and refreshed at the end of every
+  `process_dirty_relay` pass when the sink explicitly requests D16 harness
+  observations. Production sinks return before aggregation, and the EOF state
+  machine, queue ownership, permits, and socket behavior are unchanged.
+- Stable proof: the full real-Quinn path passed `30/30` repeats; normal library
+  `585/585`, harness library `594/594`, concurrency harness `10 passed/4
+  ignored`, checks, fmt, diff-check, clippy (existing style warnings only), and
+  both script self-tests passed.
+- Reusable rule: a lifecycle acceptance gate must sample after every state
+  transition path capable of completing the invariant. Never diagnose a stale
+  test sink as retained ownership when the endpoint state already proves FIN.

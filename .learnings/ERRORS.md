@@ -3723,3 +3723,27 @@ active root unless it repeats.
   after their final byte. Then assert reservation refund, queue close/empty,
   pending/inflight zero, local EOF, and terminal/close-tail zero through the
   production actor seam.
+
+## 2026-07-10 - Full-path timeout reported a stale lifecycle snapshot
+
+- Symptom: the real Quinn full TCP/TUN test passed three times, then timed out
+  with only `Elapsed(())`. After diagnostic state was added, a repeat showed all
+  `32 MiB` received, generator `CloseWait`, empty TUN rings, zero drop, and clean
+  QUIC, while the harness snapshot still reported `34507B` owned/inflight and
+  no local EOF.
+- Root cause: D16 harness lifecycle observations were refreshed only by
+  `record_local_egress_service_window`. A later control-only
+  `process_dirty_relay` pass could complete the EOF transition without another
+  egress-service window, leaving the test sink stale.
+- Correct behavior: on timeout capture endpoint, queue, actor, task, and QUIC
+  state before cleanup. Refresh test-only lifecycle observations after every
+  dirty-relay pass; do not change queue/permit/EOF production behavior to make
+  a stale metric green.
+
+## 2026-07-10 - The harness integration target is concurrency_harness
+
+- Symptom: `cargo test --features harness --test integration` failed because
+  the repository has no `integration` test target.
+- Correct behavior: use
+  `cargo test --features harness --test concurrency_harness`; current expected
+  result is `10 passed` with `4` existing ignored tests.
