@@ -919,23 +919,15 @@ trait DirectOrderedNativeChunkRecv: Unpin + Send {
         cx: &mut Context<'_>,
         max_len: usize,
     ) -> Poll<io::Result<Option<NativeTcpChunk>>>;
-
-    fn cancel_pending_read(&mut self) {}
 }
 
 struct QuinnDirectOrderedNativeChunkRecv {
     recv: quinn::RecvStream,
-    next_offset: u64,
-    read_buffer: bytes::BytesMut,
 }
 
 impl QuinnDirectOrderedNativeChunkRecv {
     fn new(recv: quinn::RecvStream) -> Self {
-        Self {
-            recv,
-            next_offset: 0,
-            read_buffer: bytes::BytesMut::new(),
-        }
+        Self { recv }
     }
 }
 
@@ -945,38 +937,25 @@ impl DirectOrderedNativeChunkRecv for QuinnDirectOrderedNativeChunkRecv {
         cx: &mut Context<'_>,
         max_len: usize,
     ) -> Poll<io::Result<Option<NativeTcpChunk>>> {
-        let read_len = max_len.max(1);
-        if self.read_buffer.len() != read_len {
-            self.read_buffer.resize(read_len, 0);
-        }
-        let read_result = {
-            let mut read_buf = ReadBuf::new(&mut self.read_buffer[..]);
-            match Pin::new(&mut self.recv).poll_read(cx, &mut read_buf) {
-                Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
-                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                Poll::Pending => Poll::Pending,
-            }
+        let poll = {
+            // Quinn documents `read_chunk` as cancellation-safe. Polling one
+            // short-lived future here keeps RecvStream ownership local and
+            // introduces no payload task or message-count channel.
+            let fut = self.recv.read_chunk(max_len, true);
+            tokio::pin!(fut);
+            fut.poll(cx)
         };
-        match read_result {
-            Poll::Ready(Ok(bytes_read)) => {
-                if bytes_read == 0 {
-                    return Poll::Ready(Ok(None));
-                }
-                self.read_buffer.truncate(bytes_read);
-                let bytes = self.read_buffer.split_to(bytes_read).freeze();
-                let offset = self.next_offset;
-                self.next_offset = self.next_offset.saturating_add(bytes_read as u64);
-                Poll::Ready(Ok(Some(NativeTcpChunk { offset, bytes })))
-            }
+        match poll {
+            Poll::Ready(Ok(Some(chunk))) => Poll::Ready(Ok(Some(NativeTcpChunk {
+                offset: chunk.offset,
+                bytes: chunk.bytes,
+            }))),
+            Poll::Ready(Ok(None)) => Poll::Ready(Ok(None)),
             Poll::Ready(Err(err)) => Poll::Ready(Err(io::Error::other(format!(
                 "tuic direct ordered read: {err}"
             )))),
             Poll::Pending => Poll::Pending,
         }
-    }
-
-    fn cancel_pending_read(&mut self) {
-        self.read_buffer = bytes::BytesMut::new();
     }
 }
 
@@ -1231,11 +1210,6 @@ where
             self.note_chunk_read(chunk.bytes.len(), now);
         }
         Poll::Ready(Ok(Some(chunk)))
-    }
-
-    fn cancel_pending_read(&mut self) {
-        self.pending_self_wake_deadline = None;
-        self.recv.cancel_pending_read();
     }
 }
 
@@ -4836,8 +4810,8 @@ mod tests {
         );
         let average_read_bytes = received as u64 / reads.max(1);
         assert!(
-            average_read_bytes >= 8 * 1024,
-            "the direct reader must preserve service-sized ordered progress instead of one poll per QUIC frame: reads={reads} average_read_bytes={average_read_bytes} rate={receiver_mbps:.1}M"
+            average_read_bytes <= 4 * 1024,
+            "the D16 reader must hand off cancellation-safe Quinn chunks without retaining a large application read buffer: reads={reads} average_read_bytes={average_read_bytes} rate={receiver_mbps:.1}M"
         );
 
         let _ = client_read_tx.send(());
