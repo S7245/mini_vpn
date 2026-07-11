@@ -3756,3 +3756,21 @@ active root unless it repeats.
 - Correct behavior: run acceptance baselines sequentially when the target has a
   single iperf3 server instance, and fail explicitly on the JSON `error` field
   before reading throughput values.
+
+## 2026-07-10 - Clean D16 commit did not include the D16 acceptance runner
+
+- Symptom: the planned isolated deployment pointed at `1bf1f78`, but that
+  commit's suite script has no H10d16 option/export. The working runner only
+  gains D3-D6/D11/D16 flags and current parsers from uncommitted script diffs.
+- Correct behavior: version the binary source and acceptance runner together,
+  record their hashes, and fail before traffic unless the D16 startup/profile
+  fingerprint is present.
+
+## 2026-07-10 - Full real-Quinn gate used the default runtime config
+
+- Symptom: the test named as the complete D16 TCP/TUN path directly supplied a
+  `NativeByteOwned` relay but used `TunRuntimeConfig::from_sources`, whose TUN
+  MTU is `1500` and H10d16 flag is false. Gate A uses safe1200.
+- Correct behavior: provide one test-only exact Gate A config constructor and
+  assert its fingerprint before running the existing real-Quinn tracer bullet.
+  Keep the relay boundary real; do not compensate with shallow flag tests.

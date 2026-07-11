@@ -5700,3 +5700,18 @@ worth cleaning up separately.
   and basic path loss are clean but the mature TUIC client is still burst/idle,
   classify the acceptance window as externally incapable. Do not spend the
   one-shot product gate or keep changing architecture and VPS parameters.
+
+## 2026-07-10 - Gate proof and deployment must share one exact profile
+
+- A clean detached `1bf1f78` worktree compiled, confirming the D16 production
+  code is committed. Its suite script does not contain the H10d16 profile,
+  while the current functional runner changes remain uncommitted. A clean
+  binary plus an unversioned runner is not a reproducible acceptance unit.
+- The full real-Quinn test forces a `NativeByteOwned` upstream but constructs
+  `TunRuntimeConfig::from_sources`, which uses MTU1500 and leaves the H10d16
+  profile flag false. D16 queue presence still auto-selects the actor, so the
+  ownership proof remains useful, but it is not an exact safe1200 Gate A proof.
+- Reusable rule: a performance gate needs one versioned tuple of source commit,
+  runner scripts, runtime profile, binary hash, and external-control shape.
+  Exact-profile local TDD and a clean deployment rehearsal must precede the
+  one-shot VPS acceptance.

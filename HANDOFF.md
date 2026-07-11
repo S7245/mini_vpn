@@ -73,10 +73,15 @@ This section overrides the older G7/G8/GV next-step text below.
   checks had `0%` loss at about `0.5ms`. Restart and MTU are rejected as
   sufficient explanations.
 - Next stage: wait for a genuinely new external TUIC service window and rerun
-  one mature control. Require reverse P1 above `150 Mbit/s` without changing
-  D16 architecture or VPS parameters. Only then deploy `1bf1f78`
-  from an isolated worktree and spend one `20s` reverse-first P1 Gate A. Keep
-  Gate B frozen until Gate A is clean.
+  one mature control only after the gate process review tasks R1-R4 are closed.
+  The review found two P1 proof/deployment defects: the full real-Quinn test
+  uses default MTU1500/config rather than the safe1200 Gate A profile, and the
+  clean `1bf1f78` suite lacks the H10d16 runner options that currently exist
+  only in uncommitted script diffs. Keep D16 architecture, add an exact-profile
+  tracer bullet, version the runner/control harness, and rehearse one clean
+  deployment. Then require mature reverse P1 above `150 Mbit/s` and spend one
+  `20s` Gate A. Review:
+  `docs/tech/2026-07-10-knife14h10d16-gate-process-code-review.md`.
 - A future Gate A remains one clean focused run above `150 Mbit/s`; Gate B is
   three clean repeats with a median target of `170 Mbit/s` and a same-window
   sing-box parity fallback.

@@ -73,8 +73,14 @@ were `16 MiB` with drop `0`, service logs showed normal opens, and bidirectional
 ICMP had `0%` loss at about `0.5ms`. Do not repeat unchanged controls, restart
 again, tune VPS/CC/MTU, or spend Gate A in this window. When a genuinely new
 external window makes the mature control recover above `150 Mbit/s`,
-deploy `1bf1f78` from an isolated worktree and run exactly one `20s`
-reverse-first P1 Gate A. Gate B remains frozen. Result:
+do not immediately deploy `1bf1f78`: the gate-process code review found that
+the full real-Quinn test uses default MTU1500/config instead of the approved
+safe1200 profile, while the clean commit's suite lacks the D16 options present
+only in current uncommitted scripts. First complete R1 exact-profile TDD, R2
+versioned acceptance runner, R3 versioned mature-control harness, and R4 clean
+deployment rehearsal. Then run exactly one `20s` reverse-first P1 Gate A. Gate
+B remains frozen. Review:
+`docs/tech/2026-07-10-knife14h10d16-gate-process-code-review.md`. Prior result:
 `docs/tech/2026-07-10-knife14h10d16-real-quinn-local-and-control-results.md`.
 
 Knife14fp found a mandatory high-throughput prerequisite: the exit VPS `.33`
