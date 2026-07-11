@@ -76,6 +76,15 @@ fresh mandatory mature control fell to `18.873 Mbit/s` receiver with direct
 until a new control exceeds `150 Mbit/s`; then test clean `bdaa19c` once before
 any further architecture change.
 
+A subsequent clean `ce5a87c` qualification against a same-version temporary
+`.77` Exit remained incapable. The role-reversed `.33` target had healthy
+direct receivers of `216.801 Mbit/s` from `.27` and `212.398 Mbit/s` from
+`.77`; client/Exit UDP socket drops were zero. Mature sing-box reached only
+`0.192 Mbit/s`, with eighteen of twenty one-second intervals at exactly zero.
+The `bdaa19c` scoped run and composite Gate A remain unspent. The next action
+requires an independent Exit-service change or genuinely capable control
+window, not another unchanged restart/retry or a mini_vpn parameter edit.
+
 The next task is now an external same-window capability precondition, not a
 production code edit. Mature sing-box reverse P1 controls fell to
 `14.207 Mbit/s` and then `1.363 Mbit/s` despite correct routing, `16 MiB` client

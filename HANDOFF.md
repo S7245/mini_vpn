@@ -171,6 +171,15 @@ This section overrides the older G7/G8/GV next-step text below.
   `18.873 Mbit/s` receiver despite `217.011 Mbit/s` direct and socket drop `0`.
   Composite Gate A was not spent and Gate B remains frozen. Result:
   `docs/tech/2026-07-12-knife14h10d16-stream-frontier-and-armed-read-results.md`.
+- The next clean `ce5a87c` requalification control also did not authorize the
+  scoped `bdaa19c` run. With a same-version temporary `.77` Exit and `.33` as
+  the role-reversed iperf target, direct receivers were `216.801 Mbit/s`
+  (`.27 -> .33`) and `212.398 Mbit/s` (`.77 -> .33`), and both TUIC UDP socket
+  drops were zero. Mature sing-box nevertheless reached only `0.192 Mbit/s`.
+  Eighteen of twenty one-second intervals were exactly zero; the only bursts
+  were `3.143` and `0.695 Mbit/s`. This is another incapable external TUIC
+  window, not evidence about `bdaa19c`. Do not run scoped mini_vpn or composite
+  Gate A from this window.
 - The worktree is intentionally dirty and overlapping D16 files contain older
   experiments. Do not revert user changes and do not commit whole files without
   first showing which pre-D16 diffs would be included.

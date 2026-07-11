@@ -5910,3 +5910,16 @@ worth cleaning up separately.
   mature controls ranged from `172.167` to `18.873 Mbit/s` with healthy direct
   paths and zero socket drops. The control floor remains mandatory before every
   mini_vpn scoped run.
+
+## 2026-07-12 - Another clean control confirms the external stop rule
+
+- A clean `ce5a87c` mature control through a temporary same-version `.77` Exit
+  reached only `0.192 Mbit/s` receiver even though both direct legs exceeded
+  `212 Mbit/s` and both UDP socket drops were zero.
+- Eighteen of twenty one-second intervals were exactly zero. The mature client
+  had no error and the Exit remained active, so this is the same burst/idle
+  service-window discriminator rather than a `bdaa19c` measurement.
+- Reusable rule: a freshly reconstructed process is not an independent
+  capability change. Never spend the scoped mini_vpn run or Gate A merely
+  because deployment is clean; the immediately preceding mature control must
+  itself pass the floor.

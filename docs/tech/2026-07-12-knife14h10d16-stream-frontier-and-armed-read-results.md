@@ -75,6 +75,26 @@ zero socket drops. Only then run one clean `bdaa19c` scoped safe1200 reverse P1.
 Composite Gate A is authorized only if that scoped run also exceeds
 `150 Mbit/s` with all local invariants clean.
 
+## Current Requalification
+
+A later clean `ce5a87c` control used the same sing-box `1.13.14` binary on a
+temporary `.77` Exit and the role-reversed `.33` iperf target. The source and
+runner were clean/versioned, target-only routing was verified, and both client
+and Exit UDP sockets had `16777216B` receive/transmit buffers with drop `0`.
+
+- `.27 -> .33` direct receiver: `216.801 Mbit/s`;
+- `.77 -> .33` direct receiver: `212.398 Mbit/s`;
+- mature TUIC sender/receiver: `0.996/0.192 Mbit/s`;
+- one-second TUIC intervals: `3.143`, nine zeros, `0.695`, then nine more
+  zeros.
+
+The mature client logged no error. The temporary Exit stayed active and only
+reported the expected remote stream cancellation after the timed test. This
+reproduces the external burst/idle discriminator and does not measure
+`bdaa19c`; the scoped run and composite Gate A remain forbidden in this
+window. Local artifact:
+`/tmp/mini_vpn_h10d16_bdaa19c_control_current.tar.gz`.
+
 External artifacts:
 
 - `/tmp/mini_vpn_h10d16_service_batch_scoped_99ff0f4/`

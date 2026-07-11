@@ -3907,3 +3907,31 @@ active root unless it repeats.
 - Correct behavior: restart is not an acceptance precondition. Require the
   versioned mature control to pass immediately before every scoped mini_vpn
   run, and leave Gate A unspent when it does not.
+
+## 2026-07-12 - Long transfer sessions must be polled to completion
+
+- Symptom: repeated rsync calls were started after the command returned a live
+  session identifier, so multiple writers modified the same binary and caused
+  truncation, checksum changes, and `Text file busy`.
+- Correct behavior: when a long transfer returns a session identifier, poll
+  that one session until it exits before verifying or starting another writer.
+  Treat exact size and SHA-256 equality as deployment prerequisites.
+
+## 2026-07-12 - Nested SSH stdin roles cannot share one `-n` policy
+
+- Symptom: nested SSH first consumed the rest of a heredoc; applying `-n` to
+  every nested SSH then made pipeline sinks read `/dev/null`, producing an
+  empty config FIFO with successful writer status.
+- Correct behavior: use `ssh -n` for control/source commands that must not
+  consume the orchestration script. A pipeline sink that must receive bytes on
+  stdin must omit `-n` and receive only the explicit pipe.
+
+## 2026-07-12 - TLS config checks consume FIFO-backed key material
+
+- Symptom: a standalone sing-box config check blocked after consuming its
+  config FIFO because certificate/key FIFOs had no compatible one-shot reader
+  lifecycle.
+- Correct behavior: do not assume a static check only parses JSON. When TLS
+  material is intentionally non-persistent, let one fail-closed transient run
+  consume all three FIFOs and require an active unit plus the expected UDP
+  listener before capability traffic.
