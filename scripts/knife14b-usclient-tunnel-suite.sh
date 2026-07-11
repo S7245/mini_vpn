@@ -13,6 +13,20 @@ readonly DEFAULT_DOWNLINK_FLUSH_MAX_BYTES=262144
 readonly DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES=16777216
 readonly DEFAULT_TUN_RX_DRAIN_BUDGET=0
 readonly DEFAULT_THIN_TCP_RELAY=0
+readonly DEFAULT_CONTINUOUS_TCP_RELAY=0
+readonly DEFAULT_D2_PERMIT_TCP_RELAY=0
+readonly DEFAULT_D3_EGRESS_ACTOR=0
+readonly DEFAULT_D3_EGRESS_ACTOR_LEGACY_CREDIT=0
+readonly DEFAULT_D3_EGRESS_ACTOR_SELF_WAKE=0
+readonly DEFAULT_D4_STALLED_READ_SERVICE=0
+readonly DEFAULT_D5_CAPACITY_BACKPRESSURE=0
+readonly DEFAULT_D6_NATIVE_EGRESS_PERMIT=0
+readonly DEFAULT_D11_ORDERED_EGRESS_PERMIT=0
+readonly DEFAULT_H10D16_BYTE_OWNED_EGRESS=0
+readonly DEFAULT_TUIC_TCP_ORDERED_CHUNK=0
+readonly DEFAULT_TUIC_TCP_UNORDERED_REASSEMBLY=0
+readonly DEFAULT_TUIC_TCP_NATIVE_CHUNK_PUMP=0
+readonly DEFAULT_TUIC_TCP_NATIVE_ORDERED_PUMP=0
 readonly LEGACY_DOWNLINK_BACKPRESSURE_HIGH_BYTES=524288
 readonly LEGACY_DOWNLINK_BACKPRESSURE_LOW_BYTES=131072
 readonly DEFAULT_SERVER_EVIDENCE_SING_BOX_TAIL=220
@@ -21,6 +35,29 @@ readonly DEFAULT_KNIFE14_EXIT_HOST=43.153.32.33
 readonly DEFAULT_KNIFE14_TARGET_HOST=43.130.32.77
 readonly DEFAULT_KNIFE14_VPS_SSH_USER=ubuntu
 readonly DEFAULT_KNIFE14_VPS_SSH_KEY=/home/ubuntu/.ssh/vpn
+
+h10d16_expected_startup_line() {
+  printf '%s\n' 'H10d16 byte-owned egress: enabled per_flow_cap=524288 global_cap=67108864 quantum=131072'
+}
+
+verify_h10d16_startup_profile() {
+  local log_file="$1"
+  local expected_mtu="$2"
+
+  grep -Fq "TUN runtime started with pool_size=2, tun_mtu=${expected_mtu}," "$log_file" &&
+    grep -Fqx "$(h10d16_expected_startup_line)" "$log_file"
+}
+
+sha256_file() {
+  local path="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print $1}'
+  else
+    return 1
+  fi
+}
 
 extract_client_tun_pids_from_ps() {
   awk '
@@ -167,6 +204,29 @@ server_evidence_default_ssh_key() {
   fi
 }
 
+target_ssh_proxy_command() {
+  local -a proxy_cmd=(
+    ssh
+    -o BatchMode=yes
+    -o ConnectTimeout=8
+    -o "StrictHostKeyChecking=$EXIT_SSH_STRICT_HOST_KEY_CHECKING"
+  )
+  if [[ -n "$EXIT_SSH_KNOWN_HOSTS_FILE" ]]; then
+    proxy_cmd+=(-o "UserKnownHostsFile=$EXIT_SSH_KNOWN_HOSTS_FILE")
+  fi
+  if [[ -n "$EXIT_SSH_KEY" ]]; then
+    proxy_cmd+=(-i "$EXIT_SSH_KEY")
+  fi
+  if [[ -n "$EXIT_SSH_PORT" ]]; then
+    proxy_cmd+=(-p "$EXIT_SSH_PORT")
+  fi
+  proxy_cmd+=(-W '%h:%p' "$TARGET_SSH_PROXY_JUMP")
+
+  local rendered=""
+  printf -v rendered '%q ' "${proxy_cmd[@]}"
+  printf '%s' "${rendered% }"
+}
+
 apply_server_evidence_ssh_defaults() {
   if [[ "$SERVER_EVIDENCE_CHECK" != "1" ]]; then
     return 0
@@ -194,6 +254,12 @@ apply_server_evidence_ssh_defaults() {
     if [[ -n "$(server_evidence_default_ssh_host target "$TARGET")" && -z "$TARGET_SSH_KEY" ]]; then
       TARGET_SSH_KEY="$default_key"
     fi
+  fi
+
+  if [[ -z "$TARGET_SSH_PROXY_JUMP" ]] &&
+    [[ -n "$(server_evidence_default_ssh_host exit "$EXIT_HOST")" ]] &&
+    [[ -n "$(server_evidence_default_ssh_host target "$TARGET")" ]]; then
+    TARGET_SSH_PROXY_JUMP="$EXIT_SSH_HOST"
   fi
 }
 
@@ -613,7 +679,7 @@ summarize_final_lifecycle_window() {
 }
 
 suite_self_test() {
-  local sample expected actual help_text
+  local sample expected actual help_text profile_log
 
   sample="$(cat <<'EOF'
 111 bash ssh ubuntu@43.172.75.27 cd /home/ubuntu/mini_vpn && bash scripts/knife14b-usclient-tunnel-suite.sh
@@ -635,6 +701,27 @@ EOF
     printf '%s\n' "$actual" >&2
     return 1
   fi
+
+  profile_log="$(mktemp)"
+  trap 'rm -f "${profile_log:-}"' RETURN
+  cat > "$profile_log" <<'EOF'
+🚀 TUN runtime started with pool_size=2, tun_mtu=1200, tun_tx_queue_len_estimate=1000
+H10d16 byte-owned egress: enabled per_flow_cap=524288 global_cap=67108864 quantum=131072
+EOF
+  if ! verify_h10d16_startup_profile "$profile_log" 1200; then
+    echo "suite self-test failed: exact H10d16 Gate A profile was rejected" >&2
+    return 1
+  fi
+  cat > "$profile_log" <<'EOF'
+🚀 TUN runtime started with pool_size=2, tun_mtu=1500, tun_tx_queue_len_estimate=1000
+H10d16 byte-owned egress: enabled per_flow_cap=524288 global_cap=67108864 quantum=131072
+EOF
+  if verify_h10d16_startup_profile "$profile_log" 1200; then
+    echo "suite self-test failed: mismatched H10d16 Gate A MTU was accepted" >&2
+    return 1
+  fi
+  rm -f "$profile_log"
+  trap - RETURN
 
   if [[ -n "$DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES$DEFAULT_DOWNLINK_BACKPRESSURE_LOW_BYTES" ]]; then
     echo "suite self-test failed: downlink backpressure defaults should defer to binary auto-scaling" >&2
@@ -666,12 +753,72 @@ EOF
     echo "suite self-test failed: thin tcp relay help default drifted" >&2
     return 1
   fi
+  if ! grep -q "MINI_VPN_CONTINUOUS_TCP_RELAY=$DEFAULT_CONTINUOUS_TCP_RELAY" <<<"$help_text"; then
+    echo "suite self-test failed: continuous tcp relay help default drifted" >&2
+    return 1
+  fi
+  if ! grep -q "MINI_VPN_D2_PERMIT_TCP_RELAY=$DEFAULT_D2_PERMIT_TCP_RELAY" <<<"$help_text"; then
+    echo "suite self-test failed: D2 permit tcp relay help default drifted" >&2
+    return 1
+  fi
+  if ! grep -q "MINI_VPN_D3_EGRESS_ACTOR=$DEFAULT_D3_EGRESS_ACTOR" <<<"$help_text"; then
+    echo "suite self-test failed: D3 egress actor help default drifted" >&2
+    return 1
+  fi
+  if ! grep -q "MINI_VPN_D3_EGRESS_ACTOR_LEGACY_CREDIT=$DEFAULT_D3_EGRESS_ACTOR_LEGACY_CREDIT" <<<"$help_text"; then
+    echo "suite self-test failed: D3 egress actor legacy credit help default drifted" >&2
+    return 1
+  fi
+  if ! grep -q "MINI_VPN_D3_EGRESS_ACTOR_SELF_WAKE=$DEFAULT_D3_EGRESS_ACTOR_SELF_WAKE" <<<"$help_text"; then
+    echo "suite self-test failed: D3 egress actor self-wake help default drifted" >&2
+    return 1
+  fi
+  if ! grep -q "MINI_VPN_D4_STALLED_READ_SERVICE=$DEFAULT_D4_STALLED_READ_SERVICE" <<<"$help_text"; then
+    echo "suite self-test failed: D4 stalled-read service help default drifted" >&2
+    return 1
+  fi
+  if ! grep -q "MINI_VPN_D5_CAPACITY_BACKPRESSURE=$DEFAULT_D5_CAPACITY_BACKPRESSURE" <<<"$help_text"; then
+    echo "suite self-test failed: D5 capacity backpressure help default drifted" >&2
+    return 1
+  fi
+  if ! grep -q "MINI_VPN_D6_NATIVE_EGRESS_PERMIT=$DEFAULT_D6_NATIVE_EGRESS_PERMIT" <<<"$help_text"; then
+    echo "suite self-test failed: D6 native egress permit help default drifted" >&2
+    return 1
+  fi
+  if ! grep -q "MINI_VPN_D11_ORDERED_EGRESS_PERMIT=$DEFAULT_D11_ORDERED_EGRESS_PERMIT" <<<"$help_text"; then
+    echo "suite self-test failed: D11 ordered egress permit help default drifted" >&2
+    return 1
+  fi
+  if ! grep -q "MINI_VPN_H10D16_BYTE_OWNED_EGRESS=$DEFAULT_H10D16_BYTE_OWNED_EGRESS" <<<"$help_text"; then
+    echo "suite self-test failed: H10d16 byte-owned egress help default drifted" >&2
+    return 1
+  fi
+  if ! grep -q "MINI_VPN_TUIC_TCP_ORDERED_CHUNK=$DEFAULT_TUIC_TCP_ORDERED_CHUNK" <<<"$help_text"; then
+    echo "suite self-test failed: ordered chunk diagnostic help default drifted" >&2
+    return 1
+  fi
+  if ! grep -q "MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY=$DEFAULT_TUIC_TCP_UNORDERED_REASSEMBLY" <<<"$help_text"; then
+    echo "suite self-test failed: unordered reassembly diagnostic help default drifted" >&2
+    return 1
+  fi
+  if ! grep -q "MINI_VPN_TUIC_TCP_NATIVE_CHUNK_PUMP=$DEFAULT_TUIC_TCP_NATIVE_CHUNK_PUMP" <<<"$help_text"; then
+    echo "suite self-test failed: native chunk pump diagnostic help default drifted" >&2
+    return 1
+  fi
+  if ! grep -q "MINI_VPN_TUIC_TCP_NATIVE_ORDERED_PUMP=$DEFAULT_TUIC_TCP_NATIVE_ORDERED_PUMP" <<<"$help_text"; then
+    echo "suite self-test failed: native ordered pump diagnostic help default drifted" >&2
+    return 1
+  fi
   if ! grep -q "KNIFE14_KEEP_EXPLICIT_DOWNLINK_BACKPRESSURE=0" <<<"$help_text"; then
     echo "suite self-test failed: downlink backpressure normalization help missing" >&2
     return 1
   fi
   if ! grep -q "STOP_AFTER_REVERSE_FIRST_P1=0" <<<"$help_text"; then
     echo "suite self-test failed: reverse-only stop help missing" >&2
+    return 1
+  fi
+  if ! grep -q "PROFILE_REHEARSAL_ONLY=0" <<<"$help_text"; then
+    echo "suite self-test failed: startup-only profile rehearsal help missing" >&2
     return 1
   fi
 
@@ -722,6 +869,14 @@ EOF
   fi
   if ! grep -q "TARGET_SSH_HOST=\"\"" <<<"$help_text"; then
     echo "suite self-test failed: target ssh help missing" >&2
+    return 1
+  fi
+  if ! grep -q "TARGET_SSH_PROXY_JUMP=\"\"" <<<"$help_text"; then
+    echo "suite self-test failed: target ssh proxy-jump help missing" >&2
+    return 1
+  fi
+  if ! grep -q "SERVER_EVIDENCE_SSH_TIMEOUT=20s" <<<"$help_text"; then
+    echo "suite self-test failed: server evidence SSH timeout help missing" >&2
     return 1
   fi
 
@@ -784,6 +939,22 @@ EOF
 
   local tmp_key
   tmp_key="$(mktemp "${TMPDIR:-/tmp}/knife14bp_vps_key.XXXXXX")" || return 1
+  local rendered_target_proxy
+  rendered_target_proxy="$({
+    EXIT_SSH_STRICT_HOST_KEY_CHECKING=accept-new
+    EXIT_SSH_KNOWN_HOSTS_FILE=/tmp/knife14-test-exit-known-hosts
+    EXIT_SSH_KEY="$tmp_key"
+    EXIT_SSH_PORT=22
+    TARGET_SSH_PROXY_JUMP=ubuntu@43.153.32.33
+    target_ssh_proxy_command
+  })"
+  if ! grep -Fq -- "-i $tmp_key" <<<"$rendered_target_proxy" ||
+    ! grep -Fq -- "-W %h:%p ubuntu@43.153.32.33" <<<"$rendered_target_proxy" ||
+    ! grep -Fq -- "UserKnownHostsFile=/tmp/knife14-test-exit-known-hosts" <<<"$rendered_target_proxy"; then
+    rm -f "$tmp_key"
+    echo "suite self-test failed: target proxy command omitted Exit SSH identity/path options" >&2
+    return 1
+  fi
   if ! (
     SERVER_EVIDENCE_CHECK=1
     EXIT_HOST=43.153.32.33
@@ -792,12 +963,14 @@ EOF
     TARGET_SSH_HOST=""
     EXIT_SSH_KEY=""
     TARGET_SSH_KEY=""
+    TARGET_SSH_PROXY_JUMP=""
     KNIFE14_DEFAULT_VPS_SSH_KEY="$tmp_key"
     apply_server_evidence_ssh_defaults
     [[ "$EXIT_SSH_HOST" == "ubuntu@43.153.32.33" ]] &&
       [[ "$TARGET_SSH_HOST" == "ubuntu@43.130.32.77" ]] &&
       [[ "$EXIT_SSH_KEY" == "$tmp_key" ]] &&
-      [[ "$TARGET_SSH_KEY" == "$tmp_key" ]]
+      [[ "$TARGET_SSH_KEY" == "$tmp_key" ]] &&
+      [[ "$TARGET_SSH_PROXY_JUMP" == "ubuntu@43.153.32.33" ]]
   ); then
     rm -f "$tmp_key"
     echo "suite self-test failed: server evidence defaults for known VPS topology" >&2
@@ -812,12 +985,14 @@ EOF
     TARGET_SSH_HOST="custom-target"
     EXIT_SSH_KEY="/custom/exit/key"
     TARGET_SSH_KEY="/custom/target/key"
+    TARGET_SSH_PROXY_JUMP="custom-jump"
     KNIFE14_DEFAULT_VPS_SSH_KEY="$tmp_key"
     apply_server_evidence_ssh_defaults
     [[ "$EXIT_SSH_HOST" == "custom-exit" ]] &&
       [[ "$TARGET_SSH_HOST" == "custom-target" ]] &&
       [[ "$EXIT_SSH_KEY" == "/custom/exit/key" ]] &&
-      [[ "$TARGET_SSH_KEY" == "/custom/target/key" ]]
+      [[ "$TARGET_SSH_KEY" == "/custom/target/key" ]] &&
+      [[ "$TARGET_SSH_PROXY_JUMP" == "custom-jump" ]]
   ); then
     rm -f "$tmp_key"
     echo "suite self-test failed: server evidence defaults overwrote explicit SSH env" >&2
@@ -832,12 +1007,14 @@ EOF
     TARGET_SSH_HOST=""
     EXIT_SSH_KEY=""
     TARGET_SSH_KEY=""
+    TARGET_SSH_PROXY_JUMP=""
     KNIFE14_DEFAULT_VPS_SSH_KEY="$tmp_key"
     apply_server_evidence_ssh_defaults
     [[ -z "$EXIT_SSH_HOST" ]] &&
       [[ -z "$TARGET_SSH_HOST" ]] &&
       [[ -z "$EXIT_SSH_KEY" ]] &&
-      [[ -z "$TARGET_SSH_KEY" ]]
+      [[ -z "$TARGET_SSH_KEY" ]] &&
+      [[ -z "$TARGET_SSH_PROXY_JUMP" ]]
   ); then
     rm -f "$tmp_key"
     echo "suite self-test failed: server evidence defaults applied while disabled" >&2
@@ -852,12 +1029,14 @@ EOF
     TARGET_SSH_HOST=""
     EXIT_SSH_KEY=""
     TARGET_SSH_KEY=""
+    TARGET_SSH_PROXY_JUMP=""
     KNIFE14_DEFAULT_VPS_SSH_KEY="$tmp_key"
     apply_server_evidence_ssh_defaults
     [[ -z "$EXIT_SSH_HOST" ]] &&
       [[ -z "$TARGET_SSH_HOST" ]] &&
       [[ -z "$EXIT_SSH_KEY" ]] &&
-      [[ -z "$TARGET_SSH_KEY" ]]
+      [[ -z "$TARGET_SSH_KEY" ]] &&
+      [[ -z "$TARGET_SSH_PROXY_JUMP" ]]
   ); then
     rm -f "$tmp_key"
     echo "suite self-test failed: server evidence defaults applied to unknown topology" >&2
@@ -921,16 +1100,23 @@ Optional env:
   TARGET_SSH_HOST=""              SSH destination for Target, e.g. ubuntu@43.130.32.77
   TARGET_SSH_PORT=22
   TARGET_SSH_KEY=""               optional private key for Target SSH; known Knife14 evidence host uses /home/ubuntu/.ssh/vpn if present
+  TARGET_SSH_PROXY_JUMP=""        known Knife14 topology defaults to EXIT_SSH_HOST so Target evidence bypasses the active Target TUN route
   TARGET_SSH_STRICT_HOST_KEY_CHECKING=accept-new
   TARGET_SSH_KNOWN_HOSTS_FILE="$OUT_DIR/target_ssh_known_hosts"
+  SERVER_EVIDENCE_SSH_TIMEOUT=20s  hard outer bound for each Exit/Target evidence SSH command
   RUN_REVERSE_FIRST_P1=0   run a fresh reverse-only P1 probe before the normal forward-first probe
   STOP_AFTER_REVERSE_FIRST_P1=0  stop after the fresh reverse-only P1 and final snapshots
+  PROFILE_REHEARSAL_ONLY=0  verify binary/runner hashes and exact startup profile, then stop before iperf
   WAIT_QUIET_BEFORE_FULL=1  after standalone P1, wait for active relays to drop before full sweep
   QUIET_TIMEOUT_SECS=20
   QUIET_POLL_SECS=1
   IPERF_BUSY_RETRIES=3      retry each iperf sub-run when Target reports "server is busy"
   IPERF_BUSY_WAIT_SECS=5    seconds to wait between iperf busy retries
   MINI_VPN_TUIC_TCP_POOL=2  TUIC TCP connection pool; set 1 only for explicit single-connection A/B diagnostics
+  MINI_VPN_TUIC_TCP_ORDERED_CHUNK=0  set 1 to enable H4 ordered chunk diagnostic path
+  MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY=0  set 1 to enable TUIC unordered reassembly diagnostic path
+  MINI_VPN_TUIC_TCP_NATIVE_CHUNK_PUMP=0  set 1 to enable TUIC native unordered read-pump diagnostic path
+  MINI_VPN_TUIC_TCP_NATIVE_ORDERED_PUMP=0  set 1 to enable TUIC native ordered read-pump diagnostic path
   MINI_VPN_TCP_RX_BUFFER_BYTES=1048576
   MINI_VPN_TCP_TX_BUFFER_BYTES=1048576
   MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=<auto>  empty/unset lets mini_vpn derive safe defaults from TUN egress capacity
@@ -940,6 +1126,16 @@ Optional env:
   MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=16777216
   MINI_VPN_TUN_RX_DRAIN_BUDGET=0   default off; set >0 only for explicit TUN ingress drain A/B
   MINI_VPN_THIN_TCP_RELAY=0        set 1 to enable Knife14 thin relay staging A/B
+  MINI_VPN_CONTINUOUS_TCP_RELAY=0  set 1 to enable Knife14h8 continuous relay pump A/B
+  MINI_VPN_D2_PERMIT_TCP_RELAY=0   set 1 to enable D2.3 downstream-permit relay pump A/B
+  MINI_VPN_D3_EGRESS_ACTOR=0       set 1 to enable H10 local TCP/TUN egress actor A/B
+  MINI_VPN_D3_EGRESS_ACTOR_LEGACY_CREDIT=0  set 1 to replay H10d legacy credit/debt admission for D3 A/B
+  MINI_VPN_D3_EGRESS_ACTOR_SELF_WAKE=0  set 1 to continue D3 local egress service immediately after useful progress
+  MINI_VPN_D4_STALLED_READ_SERVICE=0  set 1 to keep ACK/window service active after relay read-gap hints; requires D3 actor
+  MINI_VPN_D5_CAPACITY_BACKPRESSURE=0  set 1 to use socket-capacity guarded read/flush backpressure; requires D3 actor
+  MINI_VPN_D6_NATIVE_EGRESS_PERMIT=0  set 1 to make native TUIC reads use downstream permits released by local egress drain
+  MINI_VPN_D11_ORDERED_EGRESS_PERMIT=0  set 1 to make ordered TUIC reads use downstream permits released by local egress drain
+  MINI_VPN_H10D16_BYTE_OWNED_EGRESS=0  set 1 to enable the complete H10d16 byte-owned TCP/TUN egress profile
 
 Output:
   /tmp/conn/mvpn_knife14c_usclient_suite_<timestamp>.md
@@ -995,10 +1191,13 @@ SERVER_EVIDENCE_TARGET_JOURNAL_TAIL="${SERVER_EVIDENCE_TARGET_JOURNAL_TAIL:-$DEF
 TARGET_SSH_HOST="${TARGET_SSH_HOST:-}"
 TARGET_SSH_PORT="${TARGET_SSH_PORT:-22}"
 TARGET_SSH_KEY="${TARGET_SSH_KEY:-}"
+TARGET_SSH_PROXY_JUMP="${TARGET_SSH_PROXY_JUMP:-}"
 TARGET_SSH_STRICT_HOST_KEY_CHECKING="${TARGET_SSH_STRICT_HOST_KEY_CHECKING:-accept-new}"
 TARGET_SSH_KNOWN_HOSTS_FILE="${TARGET_SSH_KNOWN_HOSTS_FILE:-$OUT_DIR/target_ssh_known_hosts}"
+SERVER_EVIDENCE_SSH_TIMEOUT="${SERVER_EVIDENCE_SSH_TIMEOUT:-20s}"
 RUN_REVERSE_FIRST_P1="${RUN_REVERSE_FIRST_P1:-0}"
 STOP_AFTER_REVERSE_FIRST_P1="${STOP_AFTER_REVERSE_FIRST_P1:-0}"
+PROFILE_REHEARSAL_ONLY="${PROFILE_REHEARSAL_ONLY:-0}"
 WAIT_QUIET_BEFORE_FULL="${WAIT_QUIET_BEFORE_FULL:-1}"
 QUIET_TIMEOUT_SECS="${QUIET_TIMEOUT_SECS:-20}"
 QUIET_POLL_SECS="${QUIET_POLL_SECS:-1}"
@@ -1367,7 +1566,7 @@ exit_ssh_raw() {
     ssh_cmd+=(-p "$EXIT_SSH_PORT")
   fi
   ssh_cmd+=("$EXIT_SSH_HOST" "$remote_cmd")
-  "${ssh_cmd[@]}"
+  timeout "$SERVER_EVIDENCE_SSH_TIMEOUT" "${ssh_cmd[@]}"
 }
 
 target_ssh_raw() {
@@ -1384,11 +1583,16 @@ target_ssh_raw() {
   if [[ -n "$TARGET_SSH_KEY" ]]; then
     ssh_cmd+=(-i "$TARGET_SSH_KEY")
   fi
+  if [[ -n "$TARGET_SSH_PROXY_JUMP" ]]; then
+    local proxy_command
+    proxy_command="$(target_ssh_proxy_command)"
+    ssh_cmd+=(-o "ProxyCommand=$proxy_command")
+  fi
   if [[ -n "$TARGET_SSH_PORT" ]]; then
     ssh_cmd+=(-p "$TARGET_SSH_PORT")
   fi
   ssh_cmd+=("$TARGET_SSH_HOST" "$remote_cmd")
-  "${ssh_cmd[@]}"
+  timeout "$SERVER_EVIDENCE_SSH_TIMEOUT" "${ssh_cmd[@]}"
 }
 
 positive_int_or_default() {
@@ -1411,6 +1615,7 @@ collect_server_side_evidence() {
   append "- server_evidence_check: $SERVER_EVIDENCE_CHECK"
   append "- exit_ssh_host: ${EXIT_SSH_HOST:-<unset>}"
   append "- target_ssh_host: ${TARGET_SSH_HOST:-<unset>}"
+  append "- target_ssh_proxy_jump: ${TARGET_SSH_PROXY_JUMP:-<unset>}"
 
   if [[ "$SERVER_EVIDENCE_CHECK" != "1" ]]; then
     append "skipped because SERVER_EVIDENCE_CHECK=$SERVER_EVIDENCE_CHECK"
@@ -1449,6 +1654,7 @@ collect_server_side_evidence() {
       echo "- exit_ssh_key: <unset>"
     fi
     echo "- target_ssh_host: ${TARGET_SSH_HOST:-<unset>}"
+    echo "- target_ssh_proxy_jump: ${TARGET_SSH_PROXY_JUMP:-<unset>}"
     if [[ -n "$TARGET_SSH_KEY" ]]; then
       echo "- target_ssh_key: <set>"
     else
@@ -1839,7 +2045,7 @@ run_lowrtt_probe() {
   append "### Probe $label Summary"
   if [[ -f "$probe_out" ]]; then
     append '```text'
-    grep -E 'Attribution Summary|iperf_sender_mbps|iperf_receiver_mbps|iperf_interval_profile:|throughput_shape:|tcp_pool:|local_write_pressure:|global_rx_pressure:|global_rx_receive:|downlink_backpressure:|downlink_flush:|tcp_reverse_window:|terminal_pending_reap:|pending_at_close:|egress_at_close:|relay_late_remote:|relay_remote_timing:|tuic_tcp_stream:|tuic_stream_pending:|tuic_stream_pending_causes:|tuic_stream_polling:|tun_drops:|runtime_tun_egress:|tun_egress_feedback:|tun_rx_drain:|quic:|attribution:|local 10[.]0[.]0[.]1|receiver$|sender$|error -|Connection reset|log not found|📊|🔬|TUIC datagram|UDP relay mode|tuic-tcp-pool-reconnect|tcp-(relay-live|relay-ack-drain-hint|relay-write-half-closed|relay-close|handle-close|deferred-close-egress|reverse-window|local-write-pressure|global-rx-pressure|global-rx-backpressure|downlink-backpressure|downlink-flush|egress-credit-debt|tun-rx-drain|tun-egress|loop-flush-tx|tun-flush-fail|send-slice-error)|exit=' "$probe_out" | tail -200 | tee -a "$REPORT" || true
+    grep -E 'Attribution Summary|iperf_sender_mbps|iperf_receiver_mbps|iperf_interval_profile:|throughput_shape:|tcp_pool:|local_write_pressure:|global_rx_pressure:|global_rx_receive:|downlink_backpressure:|downlink_flush:|stream_service_window:|local_egress_service:|d2_flow_timeline:|tcp_reverse_window:|terminal_pending_reap:|pending_at_close:|egress_at_close:|relay_late_remote:|relay_remote_timing:|tuic_tcp_stream:|tuic_stream_pending:|tuic_stream_pending_causes:|tuic_stream_frame_delta:|tuic_stream_polling:|tun_drops:|runtime_tun_egress:|tun_egress_feedback:|tun_rx_drain:|quic:|attribution:|local 10[.]0[.]0[.]1|receiver$|sender$|error -|Connection reset|log not found|📊|🔬|TUIC datagram|UDP relay mode|tuic-tcp-pool-reconnect|tuic-tcp-unordered-staging|tcp-(relay-live|relay-ack-drain-hint|d4-stalled-read-service|relay-write-half-closed|relay-close|handle-close|deferred-close-egress|reverse-window|stream-service-window|local-egress-service|local-write-pressure|global-rx-pressure|global-rx-backpressure|downlink-backpressure|downlink-flush|egress-credit-debt|tun-rx-drain|tun-egress|loop-flush-tx|tun-flush-fail|send-slice-error)|exit=' "$probe_out" | tail -200 | tee -a "$REPORT" || true
     append '```'
   else
     append "probe report missing: $probe_out"
@@ -2024,6 +2230,10 @@ export MINI_VPN_TUIC_CC="${MINI_VPN_TUIC_CC:-cubic}"
 export MINI_VPN_TUIC_UDP_MODE="${MINI_VPN_TUIC_UDP_MODE:-native}"
 export MINI_VPN_TUIC_ZERO_RTT="${MINI_VPN_TUIC_ZERO_RTT:-false}"
 export MINI_VPN_TUIC_TCP_POOL="${MINI_VPN_TUIC_TCP_POOL:-2}"
+export MINI_VPN_TUIC_TCP_ORDERED_CHUNK="${MINI_VPN_TUIC_TCP_ORDERED_CHUNK:-$DEFAULT_TUIC_TCP_ORDERED_CHUNK}"
+export MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY="${MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY:-$DEFAULT_TUIC_TCP_UNORDERED_REASSEMBLY}"
+export MINI_VPN_TUIC_TCP_NATIVE_CHUNK_PUMP="${MINI_VPN_TUIC_TCP_NATIVE_CHUNK_PUMP:-$DEFAULT_TUIC_TCP_NATIVE_CHUNK_PUMP}"
+export MINI_VPN_TUIC_TCP_NATIVE_ORDERED_PUMP="${MINI_VPN_TUIC_TCP_NATIVE_ORDERED_PUMP:-$DEFAULT_TUIC_TCP_NATIVE_ORDERED_PUMP}"
 export MINI_VPN_TCP_RX_BUFFER_BYTES="${MINI_VPN_TCP_RX_BUFFER_BYTES:-1048576}"
 export MINI_VPN_TCP_TX_BUFFER_BYTES="${MINI_VPN_TCP_TX_BUFFER_BYTES:-1048576}"
 export MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES="${MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES:-$DEFAULT_DOWNLINK_BACKPRESSURE_HIGH_BYTES}"
@@ -2034,6 +2244,17 @@ export MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES="${MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES:-$
 export MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES="${MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES:-$DEFAULT_DOWNLINK_EGRESS_IMMEDIATE_BYTES}"
 export MINI_VPN_TUN_RX_DRAIN_BUDGET="${MINI_VPN_TUN_RX_DRAIN_BUDGET:-$DEFAULT_TUN_RX_DRAIN_BUDGET}"
 export MINI_VPN_THIN_TCP_RELAY="${MINI_VPN_THIN_TCP_RELAY:-$DEFAULT_THIN_TCP_RELAY}"
+export MINI_VPN_CONTINUOUS_TCP_RELAY="${MINI_VPN_CONTINUOUS_TCP_RELAY:-$DEFAULT_CONTINUOUS_TCP_RELAY}"
+export MINI_VPN_D2_PERMIT_TCP_RELAY="${MINI_VPN_D2_PERMIT_TCP_RELAY:-$DEFAULT_D2_PERMIT_TCP_RELAY}"
+export MINI_VPN_D3_EGRESS_ACTOR="${MINI_VPN_D3_EGRESS_ACTOR:-$DEFAULT_D3_EGRESS_ACTOR}"
+export MINI_VPN_D3_EGRESS_ACTOR_ADAPTIVE_CREDIT="${MINI_VPN_D3_EGRESS_ACTOR_ADAPTIVE_CREDIT:-0}"
+export MINI_VPN_D3_EGRESS_ACTOR_LEGACY_CREDIT="${MINI_VPN_D3_EGRESS_ACTOR_LEGACY_CREDIT:-$DEFAULT_D3_EGRESS_ACTOR_LEGACY_CREDIT}"
+export MINI_VPN_D3_EGRESS_ACTOR_SELF_WAKE="${MINI_VPN_D3_EGRESS_ACTOR_SELF_WAKE:-$DEFAULT_D3_EGRESS_ACTOR_SELF_WAKE}"
+export MINI_VPN_D4_STALLED_READ_SERVICE="${MINI_VPN_D4_STALLED_READ_SERVICE:-$DEFAULT_D4_STALLED_READ_SERVICE}"
+export MINI_VPN_D5_CAPACITY_BACKPRESSURE="${MINI_VPN_D5_CAPACITY_BACKPRESSURE:-$DEFAULT_D5_CAPACITY_BACKPRESSURE}"
+export MINI_VPN_D6_NATIVE_EGRESS_PERMIT="${MINI_VPN_D6_NATIVE_EGRESS_PERMIT:-$DEFAULT_D6_NATIVE_EGRESS_PERMIT}"
+export MINI_VPN_D11_ORDERED_EGRESS_PERMIT="${MINI_VPN_D11_ORDERED_EGRESS_PERMIT:-$DEFAULT_D11_ORDERED_EGRESS_PERMIT}"
+export MINI_VPN_H10D16_BYTE_OWNED_EGRESS="${MINI_VPN_H10D16_BYTE_OWNED_EGRESS:-$DEFAULT_H10D16_BYTE_OWNED_EGRESS}"
 
 case "$MINI_VPN_TUIC_SERVER" in
   *:*)
@@ -2055,10 +2276,15 @@ append "- CC_SWEEP=${CC_SWEEP:-<single>}"
 append "- CC_VARIANT_LABEL=${CC_VARIANT_LABEL:-<none>}"
 append "- RUN_REVERSE_FIRST_P1=$RUN_REVERSE_FIRST_P1"
 append "- STOP_AFTER_REVERSE_FIRST_P1=$STOP_AFTER_REVERSE_FIRST_P1"
+append "- PROFILE_REHEARSAL_ONLY=$PROFILE_REHEARSAL_ONLY"
 append "- TUN_TX_QUEUE_LEN=${TUN_TX_QUEUE_LEN:-<default>}"
 append "- MINI_VPN_TUIC_UDP_MODE=$MINI_VPN_TUIC_UDP_MODE"
 append "- MINI_VPN_TUIC_ZERO_RTT=$MINI_VPN_TUIC_ZERO_RTT"
 append "- MINI_VPN_TUIC_TCP_POOL=$MINI_VPN_TUIC_TCP_POOL"
+append "- MINI_VPN_TUIC_TCP_ORDERED_CHUNK=$MINI_VPN_TUIC_TCP_ORDERED_CHUNK"
+append "- MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY=$MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY"
+append "- MINI_VPN_TUIC_TCP_NATIVE_CHUNK_PUMP=$MINI_VPN_TUIC_TCP_NATIVE_CHUNK_PUMP"
+append "- MINI_VPN_TUIC_TCP_NATIVE_ORDERED_PUMP=$MINI_VPN_TUIC_TCP_NATIVE_ORDERED_PUMP"
 append "- MINI_VPN_TCP_RX_BUFFER_BYTES=$MINI_VPN_TCP_RX_BUFFER_BYTES"
 append "- MINI_VPN_TCP_TX_BUFFER_BYTES=$MINI_VPN_TCP_TX_BUFFER_BYTES"
 append "- KNIFE14_KEEP_EXPLICIT_DOWNLINK_BACKPRESSURE=$KNIFE14_KEEP_EXPLICIT_DOWNLINK_BACKPRESSURE"
@@ -2071,6 +2297,17 @@ append "- MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=$MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES"
 append "- MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=$MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES"
 append "- MINI_VPN_TUN_RX_DRAIN_BUDGET=$MINI_VPN_TUN_RX_DRAIN_BUDGET"
 append "- MINI_VPN_THIN_TCP_RELAY=$MINI_VPN_THIN_TCP_RELAY"
+append "- MINI_VPN_CONTINUOUS_TCP_RELAY=$MINI_VPN_CONTINUOUS_TCP_RELAY"
+append "- MINI_VPN_D2_PERMIT_TCP_RELAY=$MINI_VPN_D2_PERMIT_TCP_RELAY"
+append "- MINI_VPN_D3_EGRESS_ACTOR=$MINI_VPN_D3_EGRESS_ACTOR"
+append "- MINI_VPN_D3_EGRESS_ACTOR_ADAPTIVE_CREDIT=$MINI_VPN_D3_EGRESS_ACTOR_ADAPTIVE_CREDIT"
+append "- MINI_VPN_D3_EGRESS_ACTOR_LEGACY_CREDIT=$MINI_VPN_D3_EGRESS_ACTOR_LEGACY_CREDIT"
+append "- MINI_VPN_D3_EGRESS_ACTOR_SELF_WAKE=$MINI_VPN_D3_EGRESS_ACTOR_SELF_WAKE"
+append "- MINI_VPN_D4_STALLED_READ_SERVICE=$MINI_VPN_D4_STALLED_READ_SERVICE"
+append "- MINI_VPN_D5_CAPACITY_BACKPRESSURE=$MINI_VPN_D5_CAPACITY_BACKPRESSURE"
+append "- MINI_VPN_D6_NATIVE_EGRESS_PERMIT=$MINI_VPN_D6_NATIVE_EGRESS_PERMIT"
+append "- MINI_VPN_D11_ORDERED_EGRESS_PERMIT=$MINI_VPN_D11_ORDERED_EGRESS_PERMIT"
+append "- MINI_VPN_H10D16_BYTE_OWNED_EGRESS=$MINI_VPN_H10D16_BYTE_OWNED_EGRESS"
 append "- SERVER_EVIDENCE_CHECK=$SERVER_EVIDENCE_CHECK"
 append "- SERVER_EVIDENCE_SING_BOX_TAIL=$SERVER_EVIDENCE_SING_BOX_TAIL"
 append "- SERVER_EVIDENCE_TARGET_JOURNAL_TAIL=$SERVER_EVIDENCE_TARGET_JOURNAL_TAIL"
@@ -2086,6 +2323,8 @@ if [[ -n "$TARGET_SSH_KEY" ]]; then
 else
   append "- TARGET_SSH_KEY=<unset>"
 fi
+append "- TARGET_SSH_PROXY_JUMP=${TARGET_SSH_PROXY_JUMP:-<unset>}"
+append "- SERVER_EVIDENCE_SSH_TIMEOUT=$SERVER_EVIDENCE_SSH_TIMEOUT"
 
 if [[ "$MINI_VPN_TUIC_ALPN" != "h3" ]]; then
   warn "MINI_VPN_TUIC_ALPN=$MINI_VPN_TUIC_ALPN, but current sing-box config says h3."
@@ -2117,7 +2356,13 @@ fi
 
 append ""
 append "## Git / Binary Snapshot"
-run_cmd git -C "$REPO_ROOT" rev-parse --short HEAD || true
+SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+SOURCE_DIRTY=0
+if [[ -n "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no 2>/dev/null || true)" ]]; then
+  SOURCE_DIRTY=1
+fi
+append "- source_commit: ${SOURCE_COMMIT:-unknown}"
+append "- source_dirty: $SOURCE_DIRTY"
 run_cmd git -C "$REPO_ROOT" status --short || true
 
 if [[ "$BUILD_RELEASE" == "1" ]]; then
@@ -2138,10 +2383,16 @@ elif [[ ! -x "$BIN" ]]; then
 fi
 append "- binary: $BIN"
 run_cmd ls -lh "$BIN" || true
-if command_status sha256sum; then
-  run_cmd sha256sum "$BIN" || true
+if BINARY_SHA256="$(sha256_file "$BIN" 2>/dev/null)"; then
+  append "- binary_sha256: $BINARY_SHA256"
 else
-  warn "sha256sum not found; skipping binary checksum."
+  warn "sha256sum/shasum not found; skipping binary checksum."
+fi
+if SUITE_SHA256="$(sha256_file "$0" 2>/dev/null)"; then
+  append "- suite_sha256: $SUITE_SHA256"
+fi
+if PROBE_SHA256="$(sha256_file "$LOWRTT_SCRIPT" 2>/dev/null)"; then
+  append "- probe_sha256: $PROBE_SHA256"
 fi
 run_cmd "$BIN" --help || true
 
@@ -2180,11 +2431,18 @@ append ""
 append "## Start mini_vpn client-tun"
 : > "$CLIENT_LOG"
 append "- client_log: $CLIENT_LOG"
-append "- command: sudo -E env MINI_VPN_TUN_MTU=$MTU MINI_VPN_TUN_TX_QUEUE_LEN=${MINI_VPN_TUN_TX_QUEUE_LEN:-} MINI_VPN_TCP_DIAG=$MINI_VPN_TCP_DIAG MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS=$METRICS_SECS MINI_VPN_TUIC_CC=$MINI_VPN_TUIC_CC MINI_VPN_TUIC_TCP_POOL=$MINI_VPN_TUIC_TCP_POOL MINI_VPN_TCP_RX_BUFFER_BYTES=$MINI_VPN_TCP_RX_BUFFER_BYTES MINI_VPN_TCP_TX_BUFFER_BYTES=$MINI_VPN_TCP_TX_BUFFER_BYTES MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=$MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=$MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES MINI_VPN_TUN_RX_DRAIN_BUDGET=$MINI_VPN_TUN_RX_DRAIN_BUDGET MINI_VPN_THIN_TCP_RELAY=$MINI_VPN_THIN_TCP_RELAY $BIN client-tun"
+append "- command: sudo -E env MINI_VPN_TUN_MTU=$MTU MINI_VPN_TUN_TX_QUEUE_LEN=${MINI_VPN_TUN_TX_QUEUE_LEN:-} MINI_VPN_TCP_DIAG=$MINI_VPN_TCP_DIAG MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS=$METRICS_SECS MINI_VPN_TUIC_CC=$MINI_VPN_TUIC_CC MINI_VPN_TUIC_TCP_POOL=$MINI_VPN_TUIC_TCP_POOL MINI_VPN_TUIC_TCP_ORDERED_CHUNK=$MINI_VPN_TUIC_TCP_ORDERED_CHUNK MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY=$MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY MINI_VPN_TUIC_TCP_NATIVE_CHUNK_PUMP=$MINI_VPN_TUIC_TCP_NATIVE_CHUNK_PUMP MINI_VPN_TUIC_TCP_NATIVE_ORDERED_PUMP=$MINI_VPN_TUIC_TCP_NATIVE_ORDERED_PUMP MINI_VPN_D6_NATIVE_EGRESS_PERMIT=$MINI_VPN_D6_NATIVE_EGRESS_PERMIT MINI_VPN_D11_ORDERED_EGRESS_PERMIT=$MINI_VPN_D11_ORDERED_EGRESS_PERMIT MINI_VPN_H10D16_BYTE_OWNED_EGRESS=$MINI_VPN_H10D16_BYTE_OWNED_EGRESS MINI_VPN_TCP_RX_BUFFER_BYTES=$MINI_VPN_TCP_RX_BUFFER_BYTES MINI_VPN_TCP_TX_BUFFER_BYTES=$MINI_VPN_TCP_TX_BUFFER_BYTES MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=$MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=$MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES MINI_VPN_TUN_RX_DRAIN_BUDGET=$MINI_VPN_TUN_RX_DRAIN_BUDGET MINI_VPN_THIN_TCP_RELAY=$MINI_VPN_THIN_TCP_RELAY MINI_VPN_CONTINUOUS_TCP_RELAY=$MINI_VPN_CONTINUOUS_TCP_RELAY MINI_VPN_D2_PERMIT_TCP_RELAY=$MINI_VPN_D2_PERMIT_TCP_RELAY MINI_VPN_D3_EGRESS_ACTOR=$MINI_VPN_D3_EGRESS_ACTOR MINI_VPN_D3_EGRESS_ACTOR_ADAPTIVE_CREDIT=$MINI_VPN_D3_EGRESS_ACTOR_ADAPTIVE_CREDIT MINI_VPN_D3_EGRESS_ACTOR_LEGACY_CREDIT=$MINI_VPN_D3_EGRESS_ACTOR_LEGACY_CREDIT MINI_VPN_D3_EGRESS_ACTOR_SELF_WAKE=$MINI_VPN_D3_EGRESS_ACTOR_SELF_WAKE MINI_VPN_D4_STALLED_READ_SERVICE=$MINI_VPN_D4_STALLED_READ_SERVICE MINI_VPN_D5_CAPACITY_BACKPRESSURE=$MINI_VPN_D5_CAPACITY_BACKPRESSURE $BIN client-tun"
 sudo -E env MINI_VPN_TUN_MTU="$MTU" MINI_VPN_TUN_TX_QUEUE_LEN="$MINI_VPN_TUN_TX_QUEUE_LEN" \
   MINI_VPN_TCP_DIAG="$MINI_VPN_TCP_DIAG" MINI_VPN_PROFILE_LOOP=1 \
   MINI_VPN_METRICS_SECS="$METRICS_SECS" MINI_VPN_TUIC_CC="$MINI_VPN_TUIC_CC" \
   MINI_VPN_TUIC_TCP_POOL="$MINI_VPN_TUIC_TCP_POOL" \
+  MINI_VPN_TUIC_TCP_ORDERED_CHUNK="$MINI_VPN_TUIC_TCP_ORDERED_CHUNK" \
+  MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY="$MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY" \
+  MINI_VPN_TUIC_TCP_NATIVE_CHUNK_PUMP="$MINI_VPN_TUIC_TCP_NATIVE_CHUNK_PUMP" \
+  MINI_VPN_TUIC_TCP_NATIVE_ORDERED_PUMP="$MINI_VPN_TUIC_TCP_NATIVE_ORDERED_PUMP" \
+  MINI_VPN_D6_NATIVE_EGRESS_PERMIT="$MINI_VPN_D6_NATIVE_EGRESS_PERMIT" \
+  MINI_VPN_D11_ORDERED_EGRESS_PERMIT="$MINI_VPN_D11_ORDERED_EGRESS_PERMIT" \
+  MINI_VPN_H10D16_BYTE_OWNED_EGRESS="$MINI_VPN_H10D16_BYTE_OWNED_EGRESS" \
   MINI_VPN_TCP_RX_BUFFER_BYTES="$MINI_VPN_TCP_RX_BUFFER_BYTES" \
   MINI_VPN_TCP_TX_BUFFER_BYTES="$MINI_VPN_TCP_TX_BUFFER_BYTES" \
   MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES="$MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES" \
@@ -2193,6 +2451,14 @@ sudo -E env MINI_VPN_TUN_MTU="$MTU" MINI_VPN_TUN_TX_QUEUE_LEN="$MINI_VPN_TUN_TX_
   MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES="$MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES" \
   MINI_VPN_TUN_RX_DRAIN_BUDGET="$MINI_VPN_TUN_RX_DRAIN_BUDGET" \
   MINI_VPN_THIN_TCP_RELAY="$MINI_VPN_THIN_TCP_RELAY" \
+  MINI_VPN_CONTINUOUS_TCP_RELAY="$MINI_VPN_CONTINUOUS_TCP_RELAY" \
+  MINI_VPN_D2_PERMIT_TCP_RELAY="$MINI_VPN_D2_PERMIT_TCP_RELAY" \
+  MINI_VPN_D3_EGRESS_ACTOR="$MINI_VPN_D3_EGRESS_ACTOR" \
+  MINI_VPN_D3_EGRESS_ACTOR_ADAPTIVE_CREDIT="$MINI_VPN_D3_EGRESS_ACTOR_ADAPTIVE_CREDIT" \
+  MINI_VPN_D3_EGRESS_ACTOR_LEGACY_CREDIT="$MINI_VPN_D3_EGRESS_ACTOR_LEGACY_CREDIT" \
+  MINI_VPN_D3_EGRESS_ACTOR_SELF_WAKE="$MINI_VPN_D3_EGRESS_ACTOR_SELF_WAKE" \
+  MINI_VPN_D4_STALLED_READ_SERVICE="$MINI_VPN_D4_STALLED_READ_SERVICE" \
+  MINI_VPN_D5_CAPACITY_BACKPRESSURE="$MINI_VPN_D5_CAPACITY_BACKPRESSURE" \
   "$BIN" client-tun > "$CLIENT_LOG" 2>&1 &
 VPN_PID=$!
 append "- launcher_pid: $VPN_PID"
@@ -2230,6 +2496,17 @@ if [[ "$ready" != "1" ]]; then
   fail "等待 ${STARTUP_TIMEOUT}s 后仍未看到 TUIC ready 日志。"
 fi
 
+if [[ "$MINI_VPN_H10D16_BYTE_OWNED_EGRESS" == "1" ]]; then
+  if [[ "$MTU" != "1200" ]]; then
+    fail "H10d16 Gate A profile requires MTU=1200; got MTU=$MTU."
+  fi
+  if ! verify_h10d16_startup_profile "$CLIENT_LOG" "$MTU"; then
+    fail "H10d16 startup fingerprint mismatch; refusing to run acceptance with an unverified profile."
+  fi
+  append "- h10d16_startup_profile: verified-safe1200"
+  append "- h10d16_startup_fingerprint: $(h10d16_expected_startup_line)"
+fi
+
 route_target_into_tun
 configure_tun_tx_queue_len
 
@@ -2262,6 +2539,17 @@ append ""
 append "## Verified Test MTU"
 run_cmd ip link show "$TUN_IF" || true
 route_target_into_tun
+
+if [[ "$PROFILE_REHEARSAL_ONLY" == "1" ]]; then
+  append ""
+  append "## Profile Rehearsal Complete"
+  append "Verified committed source, binary/runner hashes, safe1200 startup fingerprint, TUN MTU, and target-only routing. No iperf probe was run."
+  run_cmd ip route get "$TARGET" || true
+  run_cmd ip route get "$EXIT_HOST" || true
+  run_cmd ip -s link show "$TUN_IF" || true
+  RESULT_STATUS="COMPLETED"
+  exit 0
+fi
 
 proceed_to_standard_p1=1
 if [[ "$RUN_REVERSE_FIRST_P1" == "1" ]]; then

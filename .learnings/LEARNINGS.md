@@ -5730,3 +5730,19 @@ worth cleaning up separately.
 - Reusable rule: when an exact acceptance profile remains green, preserve the
   production algorithm and fix proof/deployment reproducibility next; do not
   turn a test-fidelity review into a new tuning branch.
+
+## 2026-07-11 - Version the acceptance profile with its evidence chain
+
+- R2 moved the accumulated H4/H10/D3-D6/D11/D16 runner and parser changes into
+  the same versioned unit as the binary they exercise. The suite now records
+  the full source commit plus binary, suite, and probe SHA-256 values.
+- A D16 run fails before routing traffic unless it sees the exact pool-2,
+  MTU1200 runtime line and the byte-owned queue capacities approved for Gate A.
+  A startup-only rehearsal mode verifies that tuple, TUN MTU, and target-only
+  routing without consuming an iperf acceptance window.
+- Both runner self-tests and syntax checks pass. The self-test initially used
+  platform-specific `sed -i`; replacing that mutation with a heredoc kept the
+  contract portable across macOS development and Ubuntu acceptance hosts.
+- Reusable rule: record identity and verify runtime behavior in the artifact;
+  a Git commit name alone cannot prove which binary and runner produced a
+  performance result.
