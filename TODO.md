@@ -71,17 +71,17 @@ Mbit/s`. Restarting `.33` sing-box once improved MTU1200 control only to
 `17.301 Mbit/s`; MTU1500 then reached only `3.146 Mbit/s`. Both UDP sockets
 were `16 MiB` with drop `0`, service logs showed normal opens, and bidirectional
 ICMP had `0%` loss at about `0.5ms`. Do not repeat unchanged controls, restart
-again, tune VPS/CC/MTU, or spend Gate A in this window. When a genuinely new
-external window makes the mature control recover above `150 Mbit/s`,
-do not immediately deploy `1bf1f78`: the gate-process code review found that
-the full real-Quinn test uses default MTU1500/config instead of the approved
-safe1200 profile, while the clean commit's suite lacks the D16 options present
-only in current uncommitted scripts. First complete R1 exact-profile TDD, R2
-versioned acceptance runner, R3 versioned mature-control harness, and R4 clean
-deployment rehearsal. Then run exactly one `20s` reverse-first P1 Gate A. Gate
-B remains frozen. Review:
-`docs/tech/2026-07-10-knife14h10d16-gate-process-code-review.md`. Prior result:
-`docs/tech/2026-07-10-knife14h10d16-real-quinn-local-and-control-results.md`.
+again, tune VPS/CC/MTU, or spend Gate A in this window. Gate-process R1-R4 are
+now complete at `ec112a9`: the real-Quinn test uses the exact safe1200 profile,
+both acceptance runners are versioned and self-tested, artifacts record source/
+binary/runner hashes, and a clean `.27` build/startup rehearsal verified the
+D16 fingerprint, MTU, routing, zero idle TUN drop, and cleanup without iperf.
+In a genuinely new external window, run the versioned historical-MTU1500
+mature control exactly once. Only a receiver result `>150 Mbit/s` with both UDP
+socket drops `0` authorizes exactly one `20s` reverse-first P1 Gate A. Gate B
+remains frozen. Review and closure:
+`docs/tech/2026-07-10-knife14h10d16-gate-process-code-review.md` and
+`docs/tech/2026-07-11-knife14h10d16-gate-process-r1-r4-results.md`.
 
 Knife14fp found a mandatory high-throughput prerequisite: the exit VPS `.33`
 had Linux socket buffer caps/defaults of only `212992B`, which capped both

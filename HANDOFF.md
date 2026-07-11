@@ -72,16 +72,19 @@ This section overrides the older G7/G8/GV next-step text below.
   drop `0`, service logs showed normal opens, and bidirectional 100-packet ICMP
   checks had `0%` loss at about `0.5ms`. Restart and MTU are rejected as
   sufficient explanations.
-- Next stage: wait for a genuinely new external TUIC service window and rerun
-  one mature control only after the gate process review tasks R1-R4 are closed.
-  The review found two P1 proof/deployment defects: the full real-Quinn test
-  uses default MTU1500/config rather than the safe1200 Gate A profile, and the
-  clean `1bf1f78` suite lacks the H10d16 runner options that currently exist
-  only in uncommitted script diffs. Keep D16 architecture, add an exact-profile
-  tracer bullet, version the runner/control harness, and rehearse one clean
-  deployment. Then require mature reverse P1 above `150 Mbit/s` and spend one
-  `20s` Gate A. Review:
-  `docs/tech/2026-07-10-knife14h10d16-gate-process-code-review.md`.
+- Gate-process review tasks R1-R4 are closed at `ec112a9`. The exact safe1200
+  real-Quinn path retained `32 MiB >=170 Mbit/s` capacity in `30/30` repeats;
+  the D16 suite and mature MTU1500 control are versioned with self-tests and
+  hashes. A clean `.27` worktree built the release binary, connected both TUIC
+  pool slots, verified the exact H10d16 fingerprint, MTU1200 and target-only
+  route, observed TUN drop `0`, and cleaned the process/TUN/route without
+  running iperf. Result:
+  `docs/tech/2026-07-11-knife14h10d16-gate-process-r1-r4-results.md`.
+- Next stage: in a genuinely new external TUIC service window, run the
+  versioned historical-MTU1500 mature control exactly once. Require receiver
+  `>150 Mbit/s` and both UDP socket drops `0`; only then spend one `20s`
+  safe1200 reverse-first P1 Gate A. Do not edit D16 or repeat control in the
+  already-proven incapable window. Gate B remains frozen until Gate A passes.
 - A future Gate A remains one clean focused run above `150 Mbit/s`; Gate B is
   three clean repeats with a median target of `170 Mbit/s` and a same-window
   sing-box parity fallback.

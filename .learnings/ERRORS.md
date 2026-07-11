@@ -3774,3 +3774,16 @@ active root unless it repeats.
 - Correct behavior: provide one test-only exact Gate A config constructor and
   assert its fingerprint before running the existing real-Quinn tracer bullet.
   Keep the relay boundary real; do not compensate with shallow flag tests.
+
+## 2026-07-11 - Full formatting is red outside the D16 stage
+
+- Symptom: `cargo fmt --all -- --check` in the clean R4 worktree reported large
+  diffs in previously committed Reality, DNS, failover, metrics, and main files.
+- Root cause: those non-D16 files predate the R1-R4 commits and are not formatted
+  under the current toolchain. The primary worktree also contains overlapping
+  user edits, so a bulk formatter would mix unrelated changes into this stage.
+- Correct behavior: keep the full-format result visible, run focused D16
+  `rustfmt --check --edition 2024 --config skip_children=true`, and schedule the
+  independent formatting debt only with an explicit commit strategy.
+- Command correction: direct `rustfmt` must use this crate's Rust 2024 edition;
+  forcing edition 2021 produces false let-chain parse errors.

@@ -5765,3 +5765,21 @@ worth cleaning up separately.
 - Reusable rule: capability controls should fail closed and restore dependency
   order in reverse; operational cleanup is part of the gate contract, not an
   afterthought.
+
+## 2026-07-11 - Clean deployment closes proof-to-runtime drift
+
+- R4 validated `ec112a9` from clean detached worktrees locally and on `.27`.
+  Default library `586/586`, harness library `595/595`, concurrency harness
+  `10 passed/4 ignored`, both checks, clippy, focused D16 formatting, diff-check,
+  and all three runner self-tests passed.
+- The remote release recorded source-dirty `0`, binary/suite/probe hashes,
+  connected the two TUIC pool slots, and matched the exact safe1200 D16 startup
+  fingerprint. MTU1200 and target-only TUN routing were correct; the Exit route
+  stayed on `eth0`, idle TUN drop stayed `0`, and cleanup removed the process,
+  TUN, and route. No iperf acceptance was consumed.
+- Full-repository formatting remains red only in previously committed
+  Reality/DNS/failover files outside D16 scope. It is not a runtime or Gate A
+  blocker and was not repaired through the user's overlapping dirty files.
+- Reusable rule: a clean startup rehearsal should prove commit identity,
+  runtime profile, route isolation, and teardown before a scarce performance
+  gate; it can expose deployment drift without spending the gate itself.
