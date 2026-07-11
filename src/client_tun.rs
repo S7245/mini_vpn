@@ -8720,9 +8720,6 @@ pub async fn run_event_loop<D, U, M>(
                     &mut socket_ctxs,
                     &mut fake_pool,
                     now,
-                    downlink_backpressure,
-                    downlink_egress_drop_debt.has_active_drop_debt()
-                        || tun_egress_feedback.is_paused(),
                 );
             }
             // review #7：低频回收 idle 且 refcount==0 超 TTL 的 fake-IP 映射（长稳防泄漏）。
@@ -9716,8 +9713,6 @@ fn reap_dead_slots(
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
-    downlink_backpressure: DownlinkBackpressureConfig,
-    close_egress_drop_guard: bool,
 ) -> usize {
     let handles: Vec<SocketHandle> = registry.all_handles().collect();
     let mut reaped = 0;
@@ -9726,15 +9721,7 @@ fn reap_dead_slots(
             let s = sockets.get::<TcpSocket>(h);
             let snapshot = SocketCloseSnapshot::from_socket(s);
             socket_ctxs.get_mut(&h).and_then(|ctx| {
-                let close_egress_guard =
-                    close_egress_drop_guard || ctx_has_close_egress_pressure_evidence(ctx);
-                let should_reap = should_reap_slot_with_snapshot(
-                    ctx,
-                    snapshot,
-                    now_secs,
-                    downlink_backpressure,
-                    close_egress_guard,
-                );
+                let should_reap = should_reap_slot_with_snapshot(ctx, snapshot, now_secs);
                 let source = if should_reap {
                     "dead_slot_reap"
                 } else {
@@ -9768,8 +9755,6 @@ fn should_reap_slot_with_snapshot(
     ctx: &mut SocketCtx,
     snapshot: SocketCloseSnapshot,
     now_secs: u64,
-    _cfg: DownlinkBackpressureConfig,
-    _close_egress_drop_guard: bool,
 ) -> bool {
     if ctx.pending_relay_close.is_some() && snapshot.active && snapshot.can_send {
         note_deferred_close_egress_progress(ctx, snapshot.send_queue, now_secs);
@@ -10442,7 +10427,6 @@ fn rearm_socket(
     now_secs: u64,
 ) {
     ctx.state = SocketState::Closing;
-    let _ = drop_d16_owned_for_terminal(ctx);
     socket.abort();
     ctx.uplink_tx = None;
     ctx.relay_read_credit_tx = None;
@@ -19082,6 +19066,7 @@ mod tests {
         let mut socket = build_listener_socket(&ListenerSpec { local_port: 443 });
         let mut pool = FakeIpPool::new();
 
+        let _ = drop_d16_owned_for_terminal(&mut ctx);
         rearm_socket(&mut socket, &mut ctx, &mut pool, 1);
 
         assert_eq!(ctx.conn_epoch, 22);
@@ -19799,8 +19784,6 @@ mod tests {
             &mut ctxs,
             &mut pool,
             1,
-            DownlinkBackpressureConfig::default(),
-            false,
         );
         assert_eq!(reaped, 1, "只回收 1 个死槽");
         let dead_ctx = ctxs.get(&dead).unwrap();
@@ -19916,10 +19899,6 @@ mod tests {
         ctx.pending_relay_close_last_egress_progress_secs = Some(10);
         ctx.pending_relay_close_last_egress_queue_bytes = 524_288;
 
-        let cfg = DownlinkBackpressureConfig {
-            high_bytes: 524_288,
-            low_bytes: 131_072,
-        };
         let snapshot = SocketCloseSnapshot {
             tcp_state: TcpState::CloseWait,
             active: true,
@@ -19933,11 +19912,11 @@ mod tests {
         };
 
         assert!(
-            !should_reap_slot_with_snapshot(&mut ctx, snapshot, 14, cfg, false),
+            !should_reap_slot_with_snapshot(&mut ctx, snapshot, 14),
             "deferred egress close should not be reaped inside the bounded grace"
         );
         assert!(
-            !should_reap_slot_with_snapshot(&mut ctx, snapshot, 15, cfg, false),
+            !should_reap_slot_with_snapshot(&mut ctx, snapshot, 15),
             "active send-capable close egress remains deliverable after the defer grace expires"
         );
     }
@@ -19954,10 +19933,6 @@ mod tests {
         ctx.pending_relay_close_since_secs = Some(10);
         ctx.pending_relay_close_last_egress_progress_secs = Some(10);
         ctx.pending_relay_close_last_egress_queue_bytes = 524_288;
-        let cfg = DownlinkBackpressureConfig {
-            high_bytes: 524_288,
-            low_bytes: 131_072,
-        };
         let snapshot = SocketCloseSnapshot {
             tcp_state: TcpState::CloseWait,
             active: true,
@@ -19971,18 +19946,18 @@ mod tests {
         };
 
         assert!(
-            !should_reap_slot_with_snapshot(&mut ctx, snapshot, 24, cfg, true),
+            !should_reap_slot_with_snapshot(&mut ctx, snapshot, 24),
             "drop/pressure close-drain gets the extended bounded grace"
         );
         assert!(
-            !should_reap_slot_with_snapshot(&mut ctx, snapshot, 25, cfg, true),
+            !should_reap_slot_with_snapshot(&mut ctx, snapshot, 25),
             "drop/pressure close-drain expiry does not authorize dead reap while the socket can still send"
         );
 
         ctx.pending_relay_close_last_egress_progress_secs = Some(39);
         ctx.pending_relay_close_last_egress_queue_bytes = 400_000;
         assert!(
-            !should_reap_slot_with_snapshot(&mut ctx, snapshot, 40, cfg, true),
+            !should_reap_slot_with_snapshot(&mut ctx, snapshot, 40),
             "the hard close-egress defer bound belongs to finish/rearm, not data-dropping dead reap"
         );
     }
@@ -20002,10 +19977,6 @@ mod tests {
         ctx.pending_relay_close_last_pending_bytes = 548_944;
         ctx.pending_relay_close_last_egress_progress_secs = Some(38);
         ctx.pending_relay_close_last_egress_queue_bytes = 892_928;
-        let cfg = DownlinkBackpressureConfig {
-            high_bytes: 524_288,
-            low_bytes: 131_072,
-        };
         let snapshot = SocketCloseSnapshot {
             tcp_state: TcpState::Established,
             active: true,
@@ -20019,7 +19990,7 @@ mod tests {
         };
 
         assert!(
-            !should_reap_slot_with_snapshot(&mut ctx, snapshot, 68, cfg, true),
+            !should_reap_slot_with_snapshot(&mut ctx, snapshot, 68),
             "active send-capable deferred close still has deliverable tail bytes and must not be dead-reaped"
         );
     }
@@ -20667,8 +20638,6 @@ mod tests {
             &mut ctxs,
             &mut pool,
             1,
-            DownlinkBackpressureConfig::default(),
-            false,
         );
         assert_eq!(reaped, 1, "应回收本地已关闭的 async-open 槽");
 
