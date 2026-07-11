@@ -421,6 +421,31 @@ summarize_metrics_window() {
       }
     }
 
+    /tuic-tcp-pool-selection/ {
+      selection_count++
+      generation = ""
+      probe_result = ""
+      selection_reconnect_reason = ""
+      last_success_age = ""
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^generation=/) {
+          generation = digits_token($i, "generation")
+        } else if ($i ~ /^probe_result=/) {
+          probe_result = string_token($i, "probe_result")
+        } else if ($i ~ /^reconnect_reason=/) {
+          selection_reconnect_reason = string_token($i, "reconnect_reason")
+        } else if ($i ~ /^last_success_age_secs=/) {
+          last_success_age = string_token($i, "last_success_age_secs")
+        }
+      }
+      selection_generations = add_unique(selection_generations, generation)
+      selection_probe_results = add_unique(selection_probe_results, probe_result)
+      selection_reconnect_reasons = add_unique(selection_reconnect_reasons, selection_reconnect_reason)
+      if (last_success_age ~ /^[0-9]+$/ && last_success_age + 0 > max_last_success_age_secs) {
+        max_last_success_age_secs = last_success_age + 0
+      }
+    }
+
     /tuic-open-tcp/ {
       conn = ""
       id = ""
@@ -2279,6 +2304,15 @@ summarize_metrics_window() {
       if (reconnect_reasons == "") {
         reconnect_reasons = "none"
       }
+      if (selection_generations == "") {
+        selection_generations = "none"
+      }
+      if (selection_probe_results == "") {
+        selection_probe_results = "none"
+      }
+      if (selection_reconnect_reasons == "") {
+        selection_reconnect_reasons = "none"
+      }
       if (worst_conn == "") {
         worst_conn = "none"
       }
@@ -2327,6 +2361,7 @@ summarize_metrics_window() {
       printf "- iperf_interval_profile: samples=%d overall_avg_mbps=%.3f prefix_avg_mbps=%.3f tail_samples=%d tail_avg_mbps=%.3f tail_min_mbps=%.3f tail_collapse=%d\n", interval_samples, interval_avg, interval_prefix_avg, interval_tail_samples, interval_tail_avg, interval_tail_min, interval_tail_collapse
       printf "- throughput_shape: shape=%s tail_collapse=%d local_pressure=%d no_data=%d stable_high=%d\n", throughput_shape, tail_collapse_active, local_pressure, no_data_shape, stable_high_shape
       printf "- tcp_pool: opens=%d conns=%s reconnects=%d reasons=%s\n", open_count, open_conns, reconnect_count, reconnect_reasons
+      printf "- tcp_pool_health: selections=%d generations=%s probe_results=%s reconnect_reasons=%s max_last_success_age_secs=%d\n", selection_count, selection_generations, selection_probe_results, selection_reconnect_reasons, max_last_success_age_secs
       printf "- local_write_pressure: events=%d max_wait_ms=%.3f max_payload_bytes=%d\n", local_write_count, max_local_wait_us / 1000, max_local_payload
       printf "- global_rx_pressure: events=%d max_wait_ms=%.3f queue_used_max=%d queue_capacity=%d\n", global_rx_count, max_global_wait_us / 1000, max_global_rx_queue_used, max_global_rx_queue_capacity
       printf "- global_rx_receive: pause_edges=%d resume_edges=%d max_pending_bytes=%d max_total_pending_bytes=%d max_tx_queue_bytes=%d receive_high=%d receive_low=%d receive_total_high=%d receive_total_low=%d local_egress_paused=%d tun_feedback_paused=%d\n", global_receive_pause_count, global_receive_resume_count, max_global_receive_pending, max_global_receive_total_pending, max_global_receive_tx_queue, max_global_receive_high, max_global_receive_low, max_global_receive_total_high, max_global_receive_total_low, global_receive_local_egress_paused, global_receive_tun_feedback_paused
@@ -2393,6 +2428,8 @@ run_self_test() {
 EOF_IPERF
 
   cat > "$log_sample" <<'EOF_LOG'
+🔎 tuic-tcp-pool-probe conn=3 id=99 generation=2 idle_age_secs=12 result=alive
+🔎 tuic-tcp-pool-selection conn=3 id=99 generation=2 last_success_age_secs=12 probe_result=alive reconnect_reason=none
 🔎 tuic-open-tcp target=43.130.32.77:5201 conn=3 id=99 stream=8 relay_mode=ordered_join startup_auth_attempts=0 handle=SocketHandle(1) epoch=1
 📊 TUIC QUIC stats conn=3 id=99 rtt=1ms cwnd=90000 lost=0/12 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=10/1000B udp_rx=2/200B dg_max=Some(1418) dg_space=1048576B
 🔎 tcp-local-write-pressure handle=SocketHandle(1) wait_us=3607684 payload_bytes=64960 pressure_events=1
@@ -2442,6 +2479,7 @@ EOF_LOG
   summary="$(summarize_metrics_window 0 "self-test" "$iperf_sample" "$log_sample")"
   assert_contains "$summary" "iperf_receiver_mbps: 191.000"
   assert_contains "$summary" "tcp_pool: opens=1 conns=3 reconnects=1 reasons=stale_tcp_pool_slot"
+  assert_contains "$summary" "tcp_pool_health: selections=1 generations=2 probe_results=alive reconnect_reasons=none max_last_success_age_secs=12"
   assert_contains "$summary" "local_write_pressure: events=1 max_wait_ms=3607.684"
   assert_contains "$summary" "global_rx_pressure: events=0 max_wait_ms=0.000 queue_used_max=0 queue_capacity=0"
   assert_contains "$summary" "global_rx_receive: pause_edges=1 resume_edges=1 max_pending_bytes=8388480 max_total_pending_bytes=8388480 max_tx_queue_bytes=1048576 receive_high=8388480 receive_low=2097120 receive_total_high=16776960 receive_total_low=4194240 local_egress_paused=1 tun_feedback_paused=0"
@@ -2825,7 +2863,7 @@ IPERF_BUSY_WAIT_SECS="${IPERF_BUSY_WAIT_SECS:-5}"
 POST_IPERF_METRICS_SETTLE_SECS="${POST_IPERF_METRICS_SETTLE_SECS:-2}"
 PROBE_ORDER="${PROBE_ORDER:-forward-first}"
 OUT="${OUT:-/tmp/mvpn_knife14b_lowrtt_$(date +%Y%m%d_%H%M%S).md}"
-METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tuic-open-tcp|tuic-tcp-stream-first-rx|tuic-tcp-stream-read-gap|tuic-tcp-stream-pending|tuic-tcp-stream-close|tuic-tcp-pool-reconnect|tuic-tcp-unordered-staging|tcp-relay-live|tcp-relay-ack-drain-hint|tcp-relay-write-half-closed|tcp-relay-close|tcp-d16-relay-close|tcp-handle-close|tcp-deferred-close-egress|tcp-lifecycle-transition|tcp-reverse-window|tcp-local-egress-service|tcp-local-write-pressure|tcp-global-rx-pressure|tcp-global-rx-backpressure|tcp-downlink-backpressure|tcp-downlink-flush|tcp-tun-rx-drain|tcp-tun-egress'
+METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tuic-open-tcp|tuic-tcp-stream-first-rx|tuic-tcp-stream-read-gap|tuic-tcp-stream-pending|tuic-tcp-stream-close|tuic-tcp-pool-(probe|selection|reconnect)|tuic-tcp-unordered-staging|tcp-relay-live|tcp-relay-ack-drain-hint|tcp-relay-write-half-closed|tcp-relay-close|tcp-d16-relay-close|tcp-handle-close|tcp-deferred-close-egress|tcp-lifecycle-transition|tcp-reverse-window|tcp-local-egress-service|tcp-local-write-pressure|tcp-global-rx-pressure|tcp-global-rx-backpressure|tcp-downlink-backpressure|tcp-downlink-flush|tcp-tun-rx-drain|tcp-tun-egress'
 if [[ "${MINI_VPN_PROBE_INCLUDE_STREAM_SERVICE_WINDOW:-0}" == "1" ]]; then
   METRIC_RE="$METRIC_RE|tcp-stream-service-window"
 fi

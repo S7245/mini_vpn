@@ -19,7 +19,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -346,16 +346,120 @@ fn tcp_pool_slot_stale(now_secs: u64, last_used_secs: u64) -> bool {
     now_secs.saturating_sub(last_used_secs) >= TUIC_TCP_POOL_STALE_RECONNECT_SECS
 }
 
-fn tcp_pool_stale_reconnect_reason(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpPoolIdleAction {
+    Reuse,
+    Probe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpPoolProbeOutcome {
+    Alive { rx_before: u64, rx_after: u64 },
+    Closed,
+    SendFailed,
+    TimedOut { rx_datagrams: u64 },
+}
+
+fn tcp_pool_idle_action(
     index: usize,
     now_secs: u64,
     last_used_secs: u64,
     idle_exclusive: bool,
-) -> Option<&'static str> {
-    if index == 0 || !idle_exclusive {
-        None
+) -> TcpPoolIdleAction {
+    if index == 0 || !idle_exclusive || !tcp_pool_slot_stale(now_secs, last_used_secs) {
+        TcpPoolIdleAction::Reuse
     } else {
-        tcp_pool_slot_stale(now_secs, last_used_secs).then_some("stale_tcp_pool_slot")
+        TcpPoolIdleAction::Probe
+    }
+}
+
+async fn probe_tcp_pool_connection(conn: &Connection, timeout: Duration) -> TcpPoolProbeOutcome {
+    if conn.close_reason().is_some() {
+        return TcpPoolProbeOutcome::Closed;
+    }
+    let rx_before = conn.stats().udp_rx.datagrams;
+    if conn.send_datagram(encode_heartbeat().into()).is_err() {
+        return TcpPoolProbeOutcome::SendFailed;
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if conn.close_reason().is_some() {
+            return TcpPoolProbeOutcome::Closed;
+        }
+        let rx_after = conn.stats().udp_rx.datagrams;
+        if rx_after > rx_before {
+            return TcpPoolProbeOutcome::Alive {
+                rx_before,
+                rx_after,
+            };
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return TcpPoolProbeOutcome::TimedOut {
+                rx_datagrams: rx_after,
+            };
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn tcp_pool_probe_reconnect_reason(outcome: TcpPoolProbeOutcome) -> Option<&'static str> {
+    match outcome {
+        TcpPoolProbeOutcome::Alive { .. } => None,
+        TcpPoolProbeOutcome::Closed => Some("transport_closed"),
+        TcpPoolProbeOutcome::SendFailed => Some("liveness_probe_send_failed"),
+        TcpPoolProbeOutcome::TimedOut { .. } => Some("liveness_probe_timeout"),
+    }
+}
+
+struct TcpPoolOpenState {
+    generation: AtomicU64,
+    last_success_secs_plus_one: AtomicU64,
+    reconnect_required: AtomicBool,
+}
+
+impl TcpPoolOpenState {
+    fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(1),
+            last_success_secs_plus_one: AtomicU64::new(0),
+            reconnect_required: AtomicBool::new(false),
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    fn note_open_success(&self, now_secs: u64) {
+        self.last_success_secs_plus_one
+            .store(now_secs.saturating_add(1), Ordering::Relaxed);
+        self.reconnect_required.store(false, Ordering::Release);
+    }
+
+    fn note_open_failure(&self, index: usize) {
+        if index != 0 {
+            self.reconnect_required.store(true, Ordering::Release);
+        }
+    }
+
+    fn needs_reconnect(&self, index: usize) -> bool {
+        index != 0 && self.reconnect_required.load(Ordering::Acquire)
+    }
+
+    fn note_reconnect_success(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.reconnect_required.store(false, Ordering::Release);
+    }
+
+    fn last_success_age_secs(&self, now_secs: u64) -> Option<u64> {
+        let encoded = self.last_success_secs_plus_one.load(Ordering::Relaxed);
+        (encoded != 0).then(|| now_secs.saturating_sub(encoded - 1))
+    }
+
+    fn last_success_secs(&self) -> Option<u64> {
+        let encoded = self.last_success_secs_plus_one.load(Ordering::Relaxed);
+        (encoded != 0).then_some(encoded - 1)
     }
 }
 
@@ -3040,10 +3144,20 @@ const TUIC_RECONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// 非耦合）；亦**不同于** spec §2.6 的「open_tcp 10s」——那指 **REALITY** open 的 H2 止血超时（reality_upstream.rs），
 /// 此处是 TUIC open 的黑洞探测超时（acceptance 新加，spec 当时未有）。
 const TUIC_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-/// TCP pool slot stale threshold. Some sing-box/TUIC paths can let otherwise healthy-looking
-/// idle pool connections time out only when the next stream is opened. Reconnect idle TCP slots
-/// before reuse; primary UDP/health connection keeps its existing behavior.
+/// An idle auxiliary slot needs fresh transport evidence before reuse. Elapsed time requests a
+/// bounded heartbeat/ACK probe; it never grants permission to destroy a healthy connection.
 const TUIC_TCP_POOL_STALE_RECONNECT_SECS: u64 = 10;
+const TUIC_TCP_POOL_LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+struct TcpPoolConnectionSelection {
+    conn_index: usize,
+    conn: Connection,
+    lease: TcpPoolSlotLease,
+    generation: u64,
+    last_success_age_secs: Option<u64>,
+    probe_result: &'static str,
+    reconnect_reason: Option<&'static str>,
+}
 
 /// TUIC 客户端上游：持有到 sing-box 的 QUIC 连接，每条 TCP 开一条 `Connect` 双向流。
 /// 中文要点：连接断了按需重连+重认证(13a 最小实现;迁移/0-RTT 调优在 13c)。
@@ -3057,9 +3171,9 @@ pub struct TuicUpstream {
     conns: Vec<Mutex<Connection>>,
     /// TCP `open_tcp` 的轮询游标。Relaxed 足够：只需要分散流，不承载同步语义。
     tcp_next: AtomicU64,
-    /// Per-slot last TCP use, measured against `clock`. A stale TCP-only pool slot is reconnected
-    /// before opening a new stream so the data relay does not inherit a just-timed-out connection.
-    tcp_last_used_secs: Vec<AtomicU64>,
+    /// Per-slot generation, successful-open time, and failure invalidation. Failed opens never
+    /// refresh the idle clock; only auxiliary slots can be invalidated by TCP-open evidence.
+    tcp_open_states: Vec<TcpPoolOpenState>,
     /// Per-slot startup authentication attempts. A recovered auxiliary slot is still usable, but
     /// reverse-throughput diagnostics must distinguish it from a first-attempt-clean slot.
     tcp_startup_auth_attempts: Vec<AtomicU64>,
@@ -3205,7 +3319,7 @@ impl TuicUpstream {
                 "🧵 TUIC TCP connection pool={tcp_pool}（UDP/health 仍走 primary connection）"
             );
         }
-        let tcp_last_used_secs = (0..tcp_pool).map(|_| AtomicU64::new(0)).collect();
+        let tcp_open_states = (0..tcp_pool).map(|_| TcpPoolOpenState::new()).collect();
         let tcp_active_streams = (0..tcp_pool).map(|_| Arc::new(AtomicU64::new(0))).collect();
         Ok(Self {
             endpoint,
@@ -3215,7 +3329,7 @@ impl TuicUpstream {
             password: cfg.password.clone(),
             conns,
             tcp_next: AtomicU64::new(0),
-            tcp_last_used_secs,
+            tcp_open_states,
             tcp_startup_auth_attempts,
             tcp_active_streams,
             udp_drops: AtomicU64::new(0),
@@ -3380,60 +3494,134 @@ impl TuicUpstream {
         let mut guard = slot.lock().await;
         let closed = guard.close_reason().is_some();
         if closed || reconnect_reason.is_some() {
-            if let Some(reason) = reconnect_reason {
-                println!("🔁 tuic-tcp-pool-reconnect conn={index} reason={reason}");
-                guard.close(VarInt::from_u32(0), reason.as_bytes());
-            }
-            let hs = Self::handshake(
-                &self.endpoint,
-                self.server,
-                &self.sni,
-                &self.uuid,
-                &self.password,
-                self.zero_rtt,
-            );
-            *guard = tokio::time::timeout(TUIC_RECONNECT_TIMEOUT, hs)
-                .await
-                .map_err(|_| {
-                    io_err(
-                        "tuic reconnect",
-                        "5s 超时（黑洞/不可达；failover 据 is_dead 切备腿）",
-                    )
-                })??;
-            if let Some(secs) = self.quic_stats_secs
-                && let Some(stop) = &self.quic_stats_stop
-            {
-                spawn_quic_stats_logger(guard.clone(), index, secs, stop.subscribe());
+            let reason = reconnect_reason.unwrap_or("transport_closed");
+            self.reconnect_locked(index, &mut guard, reason).await?;
+            if let Some(state) = self.tcp_open_states.get(index) {
+                state.note_reconnect_success();
             }
         }
         Ok(guard.clone())
     }
 
-    /// TCP 专用连接选择：默认 pool=1 时等价旧行为；pool>1 时 round-robin 分散新流。
-    async fn live_tcp_conn(&self) -> Result<(usize, Connection, TcpPoolSlotLease), ClientError> {
+    async fn reconnect_locked(
+        &self,
+        index: usize,
+        conn: &mut Connection,
+        reason: &'static str,
+    ) -> Result<(), ClientError> {
+        println!(
+            "🔁 tuic-tcp-pool-reconnect conn={index} id={} reason={reason}",
+            conn.stable_id()
+        );
+        conn.close(VarInt::from_u32(0), reason.as_bytes());
+        let hs = Self::handshake(
+            &self.endpoint,
+            self.server,
+            &self.sni,
+            &self.uuid,
+            &self.password,
+            self.zero_rtt,
+        );
+        *conn = tokio::time::timeout(TUIC_RECONNECT_TIMEOUT, hs)
+            .await
+            .map_err(|_| {
+                io_err(
+                    "tuic reconnect",
+                    "5s 超时（黑洞/不可达；failover 据 is_dead 切备腿）",
+                )
+            })??;
+        if let Some(secs) = self.quic_stats_secs
+            && let Some(stop) = &self.quic_stats_stop
+        {
+            spawn_quic_stats_logger(conn.clone(), index, secs, stop.subscribe());
+        }
+        Ok(())
+    }
+
+    /// TCP 专用连接选择。Idle age only requests a bounded liveness probe; it is not itself
+    /// permission to destroy an auxiliary connection. Holding the per-slot mutex while reserving
+    /// the lease closes the old race where a second opener could join after an "exclusive" check
+    /// but before the first opener recycled the shared QUIC connection.
+    async fn live_tcp_conn(&self) -> Result<TcpPoolConnectionSelection, ClientError> {
         let cursor = self.tcp_next.fetch_add(1, Ordering::Relaxed);
         let index = tcp_pool_index(self.conns.len(), cursor);
         let now_secs = self.clock.elapsed().as_secs();
-        let last_used = self
-            .tcp_last_used_secs
+        let open_state = self
+            .tcp_open_states
             .get(index)
-            .ok_or_else(|| ClientError::InvalidTarget("tuic tcp pool index out of range".into()))?
-            .load(Ordering::Relaxed);
+            .ok_or_else(|| ClientError::InvalidTarget("tuic tcp pool index out of range".into()))?;
         let active = self
             .tcp_active_streams
             .get(index)
             .ok_or_else(|| ClientError::InvalidTarget("tuic tcp pool index out of range".into()))?
             .clone();
+        let slot = self
+            .conns
+            .get(index)
+            .ok_or_else(|| ClientError::InvalidTarget("tuic tcp pool index out of range".into()))?;
+        let mut guard = slot.lock().await;
         let (lease, idle_exclusive) = TcpPoolSlotLease::reserve(active);
-        let reconnect_reason =
-            tcp_pool_stale_reconnect_reason(index, now_secs, last_used, idle_exclusive);
-        let conn = self
-            .live_conn_at_with_reason(index, reconnect_reason)
-            .await?;
-        if let Some(last) = self.tcp_last_used_secs.get(index) {
-            last.store(now_secs, Ordering::Relaxed);
+        let last_success_age_secs = open_state.last_success_age_secs(now_secs);
+        let last_success_secs = open_state.last_success_secs().unwrap_or(0);
+        let mut probe_result = "not_due";
+        let mut reconnect_reason = guard.close_reason().is_some().then_some("transport_closed");
+
+        if reconnect_reason.is_none() && open_state.needs_reconnect(index) && idle_exclusive {
+            reconnect_reason = Some("previous_open_failure");
         }
-        Ok((index, conn, lease))
+        if reconnect_reason.is_none()
+            && tcp_pool_idle_action(index, now_secs, last_success_secs, idle_exclusive)
+                == TcpPoolIdleAction::Probe
+        {
+            let outcome =
+                probe_tcp_pool_connection(&guard, TUIC_TCP_POOL_LIVENESS_PROBE_TIMEOUT).await;
+            probe_result = match outcome {
+                TcpPoolProbeOutcome::Alive { .. } => "alive",
+                TcpPoolProbeOutcome::Closed => "closed",
+                TcpPoolProbeOutcome::SendFailed => "send_failed",
+                TcpPoolProbeOutcome::TimedOut { .. } => "timeout",
+            };
+            reconnect_reason = tcp_pool_probe_reconnect_reason(outcome);
+            println!(
+                "🔎 tuic-tcp-pool-probe conn={index} id={} generation={} idle_age_secs={} result={probe_result}",
+                guard.stable_id(),
+                open_state.generation(),
+                now_secs.saturating_sub(last_success_secs),
+            );
+        }
+
+        if let Some(reason) = reconnect_reason {
+            self.reconnect_locked(index, &mut guard, reason).await?;
+            open_state.note_reconnect_success();
+            if index != 0 {
+                let ready =
+                    probe_tcp_pool_connection(&guard, TUIC_TCP_POOL_LIVENESS_PROBE_TIMEOUT).await;
+                probe_result = match ready {
+                    TcpPoolProbeOutcome::Alive { .. } => "reconnected_alive",
+                    TcpPoolProbeOutcome::Closed => "reconnected_closed",
+                    TcpPoolProbeOutcome::SendFailed => "reconnected_send_failed",
+                    TcpPoolProbeOutcome::TimedOut { .. } => "reconnected_timeout",
+                };
+                if !matches!(ready, TcpPoolProbeOutcome::Alive { .. }) {
+                    open_state.note_open_failure(index);
+                    guard.close(VarInt::from_u32(0), b"tcp_pool_ready_probe_failed");
+                    return Err(io_err(
+                        "tuic tcp pool ready probe",
+                        format!("conn={index} result={probe_result}"),
+                    ));
+                }
+            }
+        }
+
+        Ok(TcpPoolConnectionSelection {
+            conn_index: index,
+            conn: guard.clone(),
+            lease,
+            generation: open_state.generation(),
+            last_success_age_secs,
+            probe_result,
+            reconnect_reason,
+        })
     }
 
     /// 取当前活连接克隆——**非阻塞、不重连**（刀9，ADR-0011 §3b）。锁被占（后台 start_udp 正在重连，持锁
@@ -3686,7 +3874,16 @@ fn udp_reconnect_backoff(attempt: u32) -> Duration {
 impl ProxyUpstream for TuicUpstream {
     async fn open_tcp(&self, target: &TargetAddr) -> Result<RelayStream, ClientError> {
         // 取 TCP pool 活连接，断了只重连该槽位；pool=1 时等价旧行为。
-        let (conn_index, conn, lease) = self.live_tcp_conn().await?;
+        let selection = self.live_tcp_conn().await?;
+        let TcpPoolConnectionSelection {
+            conn_index,
+            conn,
+            lease,
+            generation,
+            last_success_age_secs,
+            probe_result,
+            reconnect_reason,
+        } = selection;
         // 刀9（真出口 acceptance 修）：open_bi + write Connect 在**黑洞连接**上会 hang——连接尚未被
         // 判死（close_reason 仍 None，因 keepalive/非对称封锁架空 idle 检测），但 QUIC send 窗口满、
         // 收不到 ACK → write_all 无限阻塞，failover 快/慢路都收不到信号。封 5s 超时让黑洞 open **快速失败**
@@ -3702,6 +3899,9 @@ impl ProxyUpstream for TuicUpstream {
             send.write_all(&encode_connect(target))
                 .await
                 .map_err(|e| io_err("tuic connect write", e))?;
+            if let Some(state) = self.tcp_open_states.get(conn_index) {
+                state.note_open_success(self.clock.elapsed().as_secs());
+            }
             let startup_auth_attempts = self
                 .tcp_startup_auth_attempts
                 .get(conn_index)
@@ -3709,6 +3909,13 @@ impl ProxyUpstream for TuicUpstream {
                 .unwrap_or(0);
             let relay_mode = tuic_tcp_relay_mode();
             let diag_meta = if tcp_diag_enabled() {
+                println!(
+                    "🔎 tuic-tcp-pool-selection conn={conn_index} id={stable_id} generation={generation} last_success_age_secs={} probe_result={probe_result} reconnect_reason={}",
+                    last_success_age_secs
+                        .map(|age| age.to_string())
+                        .unwrap_or_else(|| "never".into()),
+                    reconnect_reason.unwrap_or("none")
+                );
                 println!(
                     "{}",
                     format_tuic_tcp_open_line(
@@ -3762,14 +3969,21 @@ impl ProxyUpstream for TuicUpstream {
             };
             Ok::<RelayStream, ClientError>(relay)
         };
-        tokio::time::timeout(TUIC_OPEN_TIMEOUT, open)
+        let result = tokio::time::timeout(TUIC_OPEN_TIMEOUT, open)
             .await
             .map_err(|_| {
                 io_err(
                     "tuic open_tcp",
                     "5s 超时（黑洞/send 窗口满无 ACK；failover 慢路据此累计切备腿）",
                 )
-            })?
+            })
+            .and_then(|result| result);
+        if result.is_err()
+            && let Some(state) = self.tcp_open_states.get(conn_index)
+        {
+            state.note_open_failure(conn_index);
+        }
+        result
     }
 
     async fn open_tcp_relay(&self, target: &TargetAddr) -> Result<OpenedTcpRelay, ClientError> {
@@ -3782,7 +3996,16 @@ impl ProxyUpstream for TuicUpstream {
         };
         let d16_byte_owned = relay_mode == TuicTcpRelayMode::D16DirectOrdered;
 
-        let (conn_index, conn, lease) = self.live_tcp_conn().await?;
+        let selection = self.live_tcp_conn().await?;
+        let TcpPoolConnectionSelection {
+            conn_index,
+            conn,
+            lease,
+            generation,
+            last_success_age_secs,
+            probe_result,
+            reconnect_reason,
+        } = selection;
         let open = async {
             let (mut send, recv) = conn
                 .open_bi()
@@ -3793,12 +4016,22 @@ impl ProxyUpstream for TuicUpstream {
             send.write_all(&encode_connect(target))
                 .await
                 .map_err(|e| io_err("tuic connect write", e))?;
+            if let Some(state) = self.tcp_open_states.get(conn_index) {
+                state.note_open_success(self.clock.elapsed().as_secs());
+            }
             let startup_auth_attempts = self
                 .tcp_startup_auth_attempts
                 .get(conn_index)
                 .map(|attempts| attempts.load(Ordering::Relaxed))
                 .unwrap_or(0);
             let diag_meta = if tcp_diag_enabled() {
+                println!(
+                    "🔎 tuic-tcp-pool-selection conn={conn_index} id={stable_id} generation={generation} last_success_age_secs={} probe_result={probe_result} reconnect_reason={}",
+                    last_success_age_secs
+                        .map(|age| age.to_string())
+                        .unwrap_or_else(|| "never".into()),
+                    reconnect_reason.unwrap_or("none")
+                );
                 println!(
                     "{}",
                     format_tuic_tcp_open_line(
@@ -3849,14 +4082,21 @@ impl ProxyUpstream for TuicUpstream {
                 OpenedTcpRelay::Native(relay)
             })
         };
-        tokio::time::timeout(TUIC_OPEN_TIMEOUT, open)
+        let result = tokio::time::timeout(TUIC_OPEN_TIMEOUT, open)
             .await
             .map_err(|_| {
                 io_err(
                     "tuic open_tcp",
                     "5s 超时（黑洞/send 窗口满无 ACK；failover 慢路据此累计切备腿）",
                 )
-            })?
+            })
+            .and_then(|result| result);
+        if result.is_err()
+            && let Some(state) = self.tcp_open_states.get(conn_index)
+        {
+            state.note_open_failure(conn_index);
+        }
+        result
     }
 
     /// 刀14d：TUIC `open_tcp` 通常很快，但它仍可能 await QUIC reconnect、`open_bi` 或 Connect write
@@ -5466,14 +5706,96 @@ mod tests {
     }
 
     #[test]
-    fn tcp_pool_stale_reconnect_skips_primary_connection() {
-        assert_eq!(tcp_pool_stale_reconnect_reason(0, 100, 0, true), None);
+    fn tcp_pool_idle_auxiliary_requires_liveness_probe_before_reconnect() {
         assert_eq!(
-            tcp_pool_stale_reconnect_reason(1, 100, 90, true),
-            Some("stale_tcp_pool_slot")
+            tcp_pool_idle_action(0, 100, 90, true),
+            TcpPoolIdleAction::Reuse,
+            "primary UDP/health connection keeps its existing lifecycle"
         );
-        assert_eq!(tcp_pool_stale_reconnect_reason(1, 99, 90, true), None);
-        assert_eq!(tcp_pool_stale_reconnect_reason(1, 100, 90, false), None);
+        assert_eq!(
+            tcp_pool_idle_action(1, 99, 90, true),
+            TcpPoolIdleAction::Reuse,
+            "a recently used auxiliary slot is reused"
+        );
+        assert_eq!(
+            tcp_pool_idle_action(1, 100, 90, false),
+            TcpPoolIdleAction::Reuse,
+            "an active shared slot must never be probed or recycled"
+        );
+        assert_eq!(
+            tcp_pool_idle_action(1, 100, 90, true),
+            TcpPoolIdleAction::Probe,
+            "elapsed idle time requests evidence; it is not failure evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_liveness_probe_reuses_an_acked_quinn_connection() {
+        let (server_endpoint, client_endpoint, server_addr) = d16_quinn_test_endpoints();
+        let server_task = tokio::spawn(async move {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            let heartbeat = connection.read_datagram().await.unwrap();
+            assert_eq!(&heartbeat[..], &encode_heartbeat());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+
+        let connection = client_endpoint
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let stable_id = connection.stable_id();
+        let outcome = probe_tcp_pool_connection(&connection, Duration::from_secs(1)).await;
+
+        assert!(matches!(outcome, TcpPoolProbeOutcome::Alive { .. }));
+        assert_eq!(connection.stable_id(), stable_id);
+        server_task.await.unwrap();
+        client_endpoint.close(0u32.into(), b"test complete");
+    }
+
+    #[test]
+    fn tcp_pool_probe_outcome_reconnects_only_without_liveness_evidence() {
+        assert_eq!(
+            tcp_pool_probe_reconnect_reason(TcpPoolProbeOutcome::Alive {
+                rx_before: 10,
+                rx_after: 11,
+            }),
+            None
+        );
+        assert_eq!(
+            tcp_pool_probe_reconnect_reason(TcpPoolProbeOutcome::Closed),
+            Some("transport_closed")
+        );
+        assert_eq!(
+            tcp_pool_probe_reconnect_reason(TcpPoolProbeOutcome::SendFailed),
+            Some("liveness_probe_send_failed")
+        );
+        assert_eq!(
+            tcp_pool_probe_reconnect_reason(TcpPoolProbeOutcome::TimedOut { rx_datagrams: 10 }),
+            Some("liveness_probe_timeout")
+        );
+    }
+
+    #[test]
+    fn tcp_pool_open_state_records_only_success_and_invalidates_failed_auxiliary() {
+        let state = TcpPoolOpenState::new();
+        state.note_open_failure(1);
+        assert!(state.needs_reconnect(1));
+        assert_eq!(state.last_success_age_secs(20), None);
+
+        state.note_reconnect_success();
+        assert!(!state.needs_reconnect(1));
+        assert_eq!(state.generation(), 2);
+
+        state.note_open_success(25);
+        assert_eq!(state.last_success_age_secs(30), Some(5));
+
+        state.note_open_failure(0);
+        assert!(
+            !state.needs_reconnect(0),
+            "TCP opens cannot take authority away from primary UDP health"
+        );
+        assert_eq!(state.last_success_age_secs(30), Some(5));
     }
 
     #[test]
