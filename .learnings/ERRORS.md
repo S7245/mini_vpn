@@ -3879,3 +3879,31 @@ active root unless it repeats.
 - Correct behavior: treat this as host policy, not TUN or transport failure;
   rerun only the Quinn loopback test outside that sandbox. Do not run real TUN
   acceptance on macOS. Use `.27` for TUN and full-path VPS validation.
+
+## 2026-07-12 - Clean worktree runtime and alternate-Exit controls
+
+- Symptom: the first diagnostic command sourced `./.env` inside a clean `/tmp`
+  worktree, where the intentionally untracked file does not exist. A second
+  attempt omitted the suite's `TARGET` variable and correctly tripped recursive
+  routing protection because Exit and Target both resolved to `.77`.
+- Correct behavior: source `/home/ubuntu/mini_vpn/.env` without printing it,
+  and set both `MINI_VPN_TUIC_SERVER` and the independent suite `TARGET` when
+  roles are reversed. Verify that Exit stays on `eth0` before traffic.
+
+## 2026-07-12 - Unordered frontier exhausted the D16 ownership cap
+
+- Symptom: the reservation-owned unordered prototype delivered about `2 MiB`
+  in Quinn loopback, then a missing offset allowed later chunks to consume the
+  full `524288B` per-flow ledger before retransmission arrived.
+- Correct behavior: do not promote the old unordered diagnostic or enlarge the
+  D16 reservoir as a throughput shortcut. Keep direct ordered transport
+  ownership and use unordered offsets only as a bounded discriminator.
+
+## 2026-07-12 - Fresh temporary Exit did not guarantee a capable window
+
+- Symptom: mature controls against rebuilt temporary `.77` Exit instances
+  varied from `172.167` to `18.873 Mbit/s` while direct receivers stayed above
+  `217 Mbit/s` and both UDP socket drops stayed zero.
+- Correct behavior: restart is not an acceptance precondition. Require the
+  versioned mature control to pass immediately before every scoped mini_vpn
+  run, and leave Gate A unspent when it does not.

@@ -60,6 +60,22 @@ All local gates pass. A transient timeout was traced to a stale harness
 lifecycle snapshot after a control-only dirty-relay pass; production queue,
 permit, actor, EOF, and socket behavior was unchanged.
 
+The later stream/frontier follow-up is complete through `bdaa19c`.
+`4bc847b` removed the disproved service-sized application `AsyncRead` buffer
+and restored transport-owned ordered Quinn chunks. In a window where mature
+sing-box reached `172.167 Mbit/s`, the clean scoped mini_vpn run reached only
+`38.5 Mbit/s`; D16 ownership, actor exclusivity, TUN drops, pressure, and tail
+surfaces stayed clean while ordered read gaps reached `5.219s`. A bounded
+unordered-frontier prototype is rejected because it deterministically fills
+the `512 KiB` per-flow ownership cap before a missing offset is retransmitted.
+`bdaa19c` now preserves an already armed reservation across non-pausing Running
+credit changes and cancels only for pause/close/stop. Default `591/591`, harness
+`600/600`, and checks pass. Its scoped VPS run remains unspent because the
+fresh mandatory mature control fell to `18.873 Mbit/s` receiver with direct
+`217.011 Mbit/s` and socket drop `0`. Do not run composite Gate A or Gate B
+until a new control exceeds `150 Mbit/s`; then test clean `bdaa19c` once before
+any further architecture change.
+
 The next task is now an external same-window capability precondition, not a
 production code edit. Mature sing-box reverse P1 controls fell to
 `14.207 Mbit/s` and then `1.363 Mbit/s` despite correct routing, `16 MiB` client

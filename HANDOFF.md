@@ -154,6 +154,23 @@ This section overrides the older G7/G8/GV next-step text below.
   do not modify D16 actor/queue/EOF, MTU, broad windows, chunk size, or
   self-wake. Result:
   `docs/tech/2026-07-11-knife14h10d16-pool-health-probe-results.md`.
+- The stream/frontier follow-up is complete through `bdaa19c`. `99ff0f4`'s
+  application-owned service-sized `AsyncRead` buffer was disproved by a clean
+  scoped run that stopped after `18356B`; `4bc847b` restored cancel-safe,
+  transport-owned ordered Quinn chunks. Against a fresh mature control of
+  `172.167 Mbit/s`, clean `4bc847b` reached `38.5 Mbit/s`: local D16/TUN gates
+  remained clean, but ordered read gaps reached `5.219s` while connection-level
+  STREAM frames arrived. A bounded unordered-frontier prototype was rejected
+  locally because a gap consumed the full `512 KiB` per-flow ownership cap
+  before retransmission, so it is not a product path.
+- `bdaa19c` fixes a separate deterministic cancellation bug: non-pausing
+  Running credit updates no longer refund and resize an already armed RAII
+  read reservation; pause/close/stop remain authoritative. Default `591/591`,
+  harness `600/600`, and both checks pass. Its scoped VPS A/B has not run: after
+  a fresh temporary-Exit rebuild, the mandatory mature control was only
+  `18.873 Mbit/s` receiver despite `217.011 Mbit/s` direct and socket drop `0`.
+  Composite Gate A was not spent and Gate B remains frozen. Result:
+  `docs/tech/2026-07-12-knife14h10d16-stream-frontier-and-armed-read-results.md`.
 - The worktree is intentionally dirty and overlapping D16 files contain older
   experiments. Do not revert user changes and do not commit whole files without
   first showing which pre-D16 diffs would be included.

@@ -5892,3 +5892,21 @@ worth cleaning up separately.
   valid, but do not promote it to a throughput root after an A/B disproves its
   trigger. The next test must distinguish server write starvation, ordered
   frontier blockage, and client reader-service delay without a macOS TUN.
+
+## 2026-07-12 - Transport ownership and armed-read stability
+
+- A large application `AsyncRead` buffer can pass a localhost Mbps test yet
+  regress real ordered-frontier progress. The direct D16 seam should retain
+  Quinn-owned chunk boundaries unless a byte-owned batch mechanism is proven
+  under the real transport.
+- Unordered reads can distinguish a blocked contiguous frontier, but bounded
+  application reassembly is not automatically a product solution. At high
+  rates, one gap filled the entire `512 KiB` per-flow ledger before
+  retransmission; correctness then requires either more memory or termination.
+- A pending reservation is already-owned capacity. Non-pausing Running credit
+  updates must affect the next read, not cancel the current one. Pause/close/
+  stop remain the authoritative cancellation edges.
+- A temporary Exit process restart is not itself a capability change: fresh
+  mature controls ranged from `172.167` to `18.873 Mbit/s` with healthy direct
+  paths and zero socket drops. The control floor remains mandatory before every
+  mini_vpn scoped run.

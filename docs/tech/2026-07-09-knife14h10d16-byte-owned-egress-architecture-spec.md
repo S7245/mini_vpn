@@ -524,3 +524,28 @@ architecture invariant. It rejects destructive idle reconnect as the active
 capacity root and moves the open diagnosis boundary upstream to TUIC stream
 service/frontier progress. Gate A remains frozen until that boundary has a
 deterministic discriminator and a reviewed sufficient path.
+
+## 2026-07-12 Stream Frontier And Armed-Read Amendment
+
+The direct D16 reader remains ordered and transport-owned. A service-sized
+application `AsyncRead` buffer is not part of the architecture: clean VPS
+evidence stopped after `18356B`, while restoring Quinn-owned ordered chunks
+recovered useful burst capacity without adding payload staging. The loopback
+gate now locks down both `>=170 Mbit/s` capacity and native-chunk-sized handoff.
+
+Application-owned unordered reassembly is also rejected for D16. A local
+tracer bullet showed that one missing offset can consume the complete `512 KiB`
+per-flow byte ledger before retransmission arrives. Increasing that reservoir
+would trade away the high-concurrency bound; dropping already consumed
+unordered chunks would violate TCP correctness.
+
+An acquired read reservation is an already-owned opportunity. A quantitative
+credit change within `Running` updates the next reservation but must not cancel
+or resize the pending Quinn read. Only `DrainOnly`/hard pause, channel close,
+reader stop, or transport completion may end that pending operation. The
+reservation remains included in per-flow and global ownership throughout.
+
+The external acceptance stop rule is unchanged. A fresh mature-client control
+above `150 Mbit/s` with zero socket drops is required before one scoped D16 run;
+composite Gate A remains forbidden until that scoped run also exceeds
+`150 Mbit/s` with clean local invariants.
