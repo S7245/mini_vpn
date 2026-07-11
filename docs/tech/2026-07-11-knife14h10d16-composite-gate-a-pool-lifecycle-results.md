@@ -61,16 +61,20 @@ The connection-pool path contains a separate lifecycle policy:
 - the primary connection (`conn=0`) is exempt from idle stale reconnect;
 - an idle auxiliary slot is forcibly closed and re-authenticated after only
   `10s` before reuse;
-- the failed pool-2 data stream ran on the freshly reconnected `conn=1`;
+- a later A-clean flow triggered the ten-second reconnect, but review of the
+  capacity artifact showed that its failed pool-2 data flow used `conn=1`
+  without a reconnect; the earlier statement that the capacity stream was
+  freshly reconnected was incorrect;
 - the pool-1 discriminator ran on persistent `conn=0` and made much more
   progress.
 
 This is evidence against changing the D16 queue cap, actor quantum, MTU,
-receive windows, chunk size, or self-wake. It selects the destructive
-auxiliary stale-reconnect policy and main/aux lifecycle asymmetry as the next
-testable seam. It does not yet prove that removing the reconnect alone is
-sufficient for `>150 Mbit/s`, because the persistent primary result was only
-`115 Mbit/s` and a prior pool-2 run reached `183 Mbit/s`.
+receive windows, chunk size, or self-wake. It selected auxiliary lifecycle as
+a correctness seam, but did not prove that reconnect caused the capacity
+collapse. Task 11C later replaced the time proxy with bounded health evidence;
+its clean generation-1 auxiliary A/B still reached only `108 Mbit/s`, so
+destructive reconnect is now rejected as the active capacity root. See
+`2026-07-11-knife14h10d16-pool-health-probe-results.md`.
 
 ## Proposed Next Stage
 

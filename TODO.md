@@ -138,15 +138,25 @@ and QUIC loss/blocking surfaces stayed clean; the target sender itself stopped
 after a small TUIC-stream burst.
 
 A pool-1 discriminator on the same capable server reached `115 Mbit/s` with
-zero local drop/pressure, selecting TUIC pool lifecycle as the next seam but
-not passing Gate A. Pool 2 had destructively reconnected an idle healthy
-auxiliary slot after `10s`; pool 1 used persistent primary `conn=0`. Before any
-new Gate A, use TDD to replace elapsed-idle reconnect with evidence-based slot
-health, preserve pool-2 concurrency, and prove an auxiliary data flow locally
-and in one scoped same-window A/B. Gate B remains frozen. Do not change D16
-ownership, actor cadence, queue size, EOF, MTU, QUIC windows, or chunk size.
-Result:
-`docs/tech/2026-07-11-knife14h10d16-composite-gate-a-pool-lifecycle-results.md`.
+zero local drop/pressure and selected TUIC pool lifecycle as the next
+correctness seam. Task 11C is complete at `6209910`: idle auxiliary reuse now
+uses a bounded Heartbeat/ACK health probe, slot lease/open races are closed,
+reconnected slots have a ready barrier, and generation/reconnect evidence is
+versioned. All local gates pass without a macOS TUN test.
+
+The scoped capable-window A/B did not authorize Gate A. Mature sing-box reached
+`195.033 Mbit/s` receiver; clean pool-2 mini_vpn used auxiliary `conn=1`,
+generation `1`, with no probe or reconnect, but reached `108 Mbit/s`. The
+middle window sustained `188-190 Mbit/s`, while startup and tail contained
+multi-second starvation. D16 ownership/release, TUN drops, actor bypass,
+pressure, send/flush errors, and QUIC loss/congestion/blocking stayed clean.
+Therefore stale recycle is rejected as the active capacity root. Next build a
+deterministic TUIC stream-service/frontier discriminator that separates server
+write starvation, ordered-frontier blockage, and reader-service delay. Gate B
+remains frozen; do not change D16 ownership, actor cadence, queue size, EOF,
+MTU, broad QUIC windows, chunk size, or self-wake. Results:
+`docs/tech/2026-07-11-knife14h10d16-composite-gate-a-pool-lifecycle-results.md`
+and `docs/tech/2026-07-11-knife14h10d16-pool-health-probe-results.md`.
 
 Knife14fp found a mandatory high-throughput prerequisite: the exit VPS `.33`
 had Linux socket buffer caps/defaults of only `212992B`, which capped both

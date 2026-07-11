@@ -3840,12 +3840,12 @@ active root unless it repeats.
 
 ## 2026-07-11 - Fixed idle age recycled a healthy auxiliary connection
 
-- Symptom: in a capable Exit window, pool-2 Gate A opened the data stream on an
-  auxiliary connection that had just been forcibly reconnected for
-  `stale_tcp_pool_slot`; the stream delivered a short burst and then stalled.
-  Pool 1 on persistent primary reached `115 Mbit/s` with zero local pressure.
-- Root cause status: the fixed `10s` reconnect is a selected policy defect and
-  the next falsifiable seam, but not yet proven sufficient for `>150 Mbit/s`.
+- Symptom correction: pool-2 contained a destructive fixed-idle reconnect and
+  a later A-clean flow exercised it, but the failed capacity flow itself used
+  auxiliary `conn=1` without reconnect. Pool 1 on persistent primary reached
+  `115 Mbit/s` with zero local pressure.
+- Root cause status: the fixed `10s` reconnect is a confirmed policy defect,
+  but the clean no-reconnect A/B later rejected it as the active capacity root.
   A prior auxiliary run reached `183 Mbit/s`, so auxiliary connections are not
   intrinsically incapable.
 - Correct behavior: never infer transport death from idle time alone. Preserve
@@ -3861,3 +3861,21 @@ active root unless it repeats.
   validate every route reference and run a config check before replacing the
   live temporary process. A reduced config must also pass the mature-client
   capability floor before it can qualify Gate A.
+
+## 2026-07-11 - Temporary full Exit config required privileged listeners
+
+- Symptom: the first temporary `.77` Exit start failed because the streamed
+  full sing-box configuration also declared an existing privileged TCP port;
+  running the temporary process as the unprivileged user could not bind it.
+- Correct behavior: validate the exact inherited configuration and listener
+  privileges before replacing a temporary service. If elevated execution is
+  required, keep credentials in mode-0600 FIFOs, use idempotent cleanup, and
+  restore socket defaults before socket maxima.
+
+## 2026-07-11 - macOS sandbox blocked Quinn UDP binds
+
+- Symptom: a full local Rust test run failed every real Quinn UDP bind with
+  `EPERM` inside the command sandbox.
+- Correct behavior: treat this as host policy, not TUN or transport failure;
+  rerun only the Quinn loopback test outside that sandbox. Do not run real TUN
+  acceptance on macOS. Use `.27` for TUN and full-path VPS validation.

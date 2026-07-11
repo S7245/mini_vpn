@@ -514,3 +514,13 @@ must be reopened and closed against this spec:
 - Do not call one `>170 Mbit/s` run stable acceptance.
 - Do not promote the feature gate to default before Gate B and product
   regression pass.
+
+## 2026-07-11 Transport-Service Observation
+
+Evidence-based auxiliary pool health is now implemented at `6209910`, but its
+clean generation-1, no-reconnect pool-2 A/B reached only `108 Mbit/s` against a
+same-window `195.033 Mbit/s` mature control. This does not change any D16
+architecture invariant. It rejects destructive idle reconnect as the active
+capacity root and moves the open diagnosis boundary upstream to TUIC stream
+service/frontier progress. Gate A remains frozen until that boundary has a
+deterministic discriminator and a reviewed sufficient path.

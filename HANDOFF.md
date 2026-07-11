@@ -133,12 +133,27 @@ This section overrides the older G7/G8/GV next-step text below.
   D16 actor.
 - A same-server pool-1 discriminator improved to `115 Mbit/s` receiver with
   zero local drop/pressure but a `3.807s` data-read gap and tail collapse. Code
-  review found that pool 2 had forcibly reconnected an otherwise healthy idle
-  auxiliary slot after `10s`, while primary `conn=0` is exempt. Pool 1 is not
-  the fix and Gate B remains frozen. The next TDD seam is the destructive
-  auxiliary stale-reconnect policy and main/aux lifecycle asymmetry; do not
-  modify the D16 actor/queue/EOF architecture. Result:
+  review found a destructive auxiliary idle-reconnect policy, but later
+  artifact correction showed that the failed capacity flow itself had not
+  reconnected; a later A-clean flow did. Pool 1 is not the fix. Result:
   `docs/tech/2026-07-11-knife14h10d16-composite-gate-a-pool-lifecycle-results.md`.
+- Task 11C is complete and pushed at `6209910`. Idle auxiliary slots now use a
+  bounded Heartbeat/ACK health probe, slot locking precedes lease reservation,
+  reconnect has a ready barrier, failed opens invalidate state, and selection
+  diagnostics expose generation/probe/reconnect evidence. Default library
+  `591/591`, harness library `600/600`, integration `2/2`, concurrency harness
+  `10 passed/4 ignored`, checks, runner self-tests, and focused formatting pass.
+  No real macOS TUN test was run.
+- The scoped A/B failed its `>150 Mbit/s` requirement. A temporary capable Exit
+  carried mature sing-box at `195.033 Mbit/s` receiver, while clean `6209910`
+  pool 2 used auxiliary `conn=1`, generation `1`, without probe/reconnect and
+  reached `108 Mbit/s`. D16/TUN/QUIC error surfaces were zero; the middle
+  window sustained `188-190 Mbit/s`, but startup and tail suffered multi-second
+  starvation. Stale reconnect is rejected as the active capacity root. Gate A
+  and Gate B remain frozen. Next isolate TUIC stream service/frontier progress;
+  do not modify D16 actor/queue/EOF, MTU, broad windows, chunk size, or
+  self-wake. Result:
+  `docs/tech/2026-07-11-knife14h10d16-pool-health-probe-results.md`.
 - The worktree is intentionally dirty and overlapping D16 files contain older
   experiments. Do not revert user changes and do not commit whole files without
   first showing which pre-D16 diffs would be included.

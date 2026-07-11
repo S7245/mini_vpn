@@ -1163,36 +1163,47 @@ auxiliary-slot failure.
 - Add focused tests in the existing TUIC test module
 - Update current result docs and learning memory
 
-- [ ] **Step 1: RED — healthy auxiliary idle is not stale**
+- [x] **Step 1: RED — healthy auxiliary idle is not stale**
 
 Add a pure policy test that distinguishes explicit closed/unhealthy state from
 elapsed idle age. A healthy authenticated auxiliary slot with no close reason
 must remain reusable after `10s`; active-stream exclusion remains mandatory.
 
-- [ ] **Step 2: GREEN — reconnect only from observable health evidence**
+- [x] **Step 2: GREEN — reconnect only from observable health evidence**
 
 Remove time alone as the reconnect cause. Reconnect a slot when Quinn reports
 it closed or a bounded open/transport failure proves it unusable. Preserve the
 per-slot mutex, lease accounting, startup degradation, and primary UDP/health
 semantics.
 
-- [ ] **Step 3: Add bounded connection-generation evidence**
+- [x] **Step 3: Add bounded connection-generation evidence**
 
 Report slot index, stable connection id/generation, reconnect reason, last-use
 age, and active lease count at open/reconnect. Do not log payload or auth data.
 
-- [ ] **Step 4: Local TDD and review**
+- [x] **Step 4: Local TDD and review**
 
 Run focused pool tests, all TUIC/D16 libraries and harnesses, checks, focused
 formatting, runner self-tests, and code review. Verify no TCP pool change can
 route UDP away from primary or weaken actor/ownership/EOF invariants.
 
-- [ ] **Step 5: One scoped pool-2 auxiliary A/B**
+- [x] **Step 5: One scoped pool-2 auxiliary A/B**
 
 After a mature control exceeds `150 Mbit/s`, run one clean pool-2 reverse P1
 whose data stream is proven to use an auxiliary slot without destructive idle
 reconnect. This is a discriminator, not Gate B. Require receiver `>150 Mbit/s`
 and zero D16/TUN/QUIC error surfaces before authorizing a new composite Gate A.
+
+Result (2026-07-11): correctness implementation and local gates passed at
+`6209910`. A capable temporary Exit carried the mature control at
+`195.033 Mbit/s` receiver. The clean pool-2 mini_vpn flow used auxiliary
+`conn=1`, generation `1`, without probe or reconnect, but reached only
+`108 Mbit/s`. D16/TUN/QUIC error surfaces stayed zero and the middle service
+window sustained about `188-190 Mbit/s`; multi-second starvation and tail
+collapse remained upstream of the actor. The A/B failed its throughput
+criterion and does not authorize Gate A. Next isolate auxiliary TUIC stream
+service/frontier progress; do not retune D16. Result:
+`2026-07-11-knife14h10d16-pool-health-probe-results.md`.
 
 ### Task 12: Prove 170M Parity, Regress Product Paths, And Clean Experiments
 

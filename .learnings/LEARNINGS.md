@@ -5865,10 +5865,30 @@ worth cleaning up separately.
 - On the same server, pool 1 reached `115 Mbit/s` and moved about `274 MiB`.
   This is a strong connection-selection discriminator but not a fix: it remains
   below Gate A and gives up connection-pool concurrency.
-- Pool 2 had reconnected its healthy-looking idle auxiliary slot at the fixed
-  `10s` threshold immediately before the data flow; primary is exempt. Time
-  alone is not sufficient evidence that a QUIC connection is stale.
-- Reusable rule: when a persistent primary progresses and a freshly recycled
-  auxiliary stalls with identical egress invariants, TDD the pool lifecycle
-  authority before touching byte ownership, actor cadence, MTU, windows, or
-  queue sizes.
+- Artifact correction: the failed capacity flow used auxiliary `conn=1`
+  without reconnect; a later A-clean flow triggered the fixed `10s` recycle.
+  Time alone is still not sufficient evidence that a QUIC connection is stale,
+  but recycle was not proven to cause the capacity collapse.
+- Reusable rule: connection selection is not reconnect causality. Record slot,
+  generation, probe, and reconnect reason on the exact data flow before
+  changing byte ownership, actor cadence, MTU, windows, or queue sizes.
+
+## 2026-07-11 - Evidence-based pool health is necessary, not sufficient
+
+- `6209910` replaced elapsed-idle recycling with a bounded Heartbeat/ACK probe,
+  fixed lease/exclusive-open ordering, added a reconnect-ready barrier, and
+  made successful Connect the last-success authority. These are reusable
+  product correctness improvements even though they did not pass the capacity
+  discriminator.
+- In one capable temporary Exit window, mature sing-box reached
+  `195.033 Mbit/s` receiver while mini_vpn generation-1 auxiliary `conn=1`
+  reached `108 Mbit/s` without probe or reconnect. Stale recycle is therefore
+  rejected as the active capacity root.
+- The same mini_vpn flow sustained about `188-190 Mbit/s` during its middle
+  window with zero D16/TUN/QUIC error surfaces. Capacity exists when bytes are
+  supplied; multi-second starvation and tail collapse move diagnosis upstream
+  to TUIC stream service/frontier progress.
+- Reusable rule: keep a correctness repair when its original invariant is
+  valid, but do not promote it to a throughput root after an A/B disproves its
+  trigger. The next test must distinguish server write starvation, ordered
+  frontier blockage, and client reader-service delay without a macOS TUN.
