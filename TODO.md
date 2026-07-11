@@ -65,9 +65,12 @@ production code edit. Mature sing-box reverse P1 controls fell to
 `14.207 Mbit/s` and then `1.363 Mbit/s` despite correct routing, `16 MiB` client
 UDP buffers, socket drop `0`, and healthy direct reverse baselines around
 `217/219 Mbit/s`. Do not spend the single post-local Gate A while the mature
-control is below `150 Mbit/s`. When control recovers, deploy `1bf1f78` from an
-isolated worktree and run exactly one `20s` reverse-first P1 Gate A. Gate B
-remains frozen. Result:
+control is below `150 Mbit/s`. A further same-shape retry reached only
+`1.182 Mbit/s` while sequential direct baselines remained `218.898/211.140
+Mbit/s`. The next discriminating external action requires approval: restart
+`.33` sing-box once, then repeat the mature control. When control recovers,
+deploy `1bf1f78` from an isolated worktree and run exactly one `20s`
+reverse-first P1 Gate A. Gate B remains frozen. Result:
 `docs/tech/2026-07-10-knife14h10d16-real-quinn-local-and-control-results.md`.
 
 Knife14fp found a mandatory high-throughput prerequisite: the exit VPS `.33`

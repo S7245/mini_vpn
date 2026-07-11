@@ -5674,8 +5674,8 @@ worth cleaning up separately.
 - A calibrated sing-box TUIC control used the intended target-only TUN route,
   kept the exit route on `eth0`, obtained `16 MiB` client UDP buffers, and
   recorded socket drop `0`, but delivered only `1.363 Mbit/s`. An earlier
-  calibrated control in the same investigation delivered `14.207 Mbit/s`.
-  Both had burst/idle one-second intervals.
+  calibrated controls in the same investigation delivered `14.207 Mbit/s` and
+  `1.182 Mbit/s`. All had burst/idle one-second intervals.
 - Because the mature client failed the same TUIC window while both direct legs
   stayed above `200 Mbit/s`, a mini_vpn Gate A could not distinguish code from
   shared external service. The one-shot Gate A was not run.

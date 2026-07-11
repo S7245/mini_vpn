@@ -78,11 +78,26 @@ helper, TUN interface, and sysctl override were removed; `.27` defaults were
 restored to `212992` bytes. No credential or persistent sing-box config was
 written.
 
+A later same-shape retry confirmed the condition rather than clearing it:
+
+- sequential direct reverse baselines: `218.898 Mbit/s` from `.27` and
+  `211.140 Mbit/s` from `.33`;
+- sing-box sender: `4.508 Mbit/s`;
+- sing-box receiver: `1.182 Mbit/s`;
+- client UDP receive/send buffers: `16 MiB`, drop `0`;
+- most one-second intervals: `0 Mbit/s`.
+
+The next useful external discriminator is one explicitly approved restart of
+the active `.33` sing-box service followed by the same mature control. Repeating
+the unchanged low control or editing D16 code has no additional diagnostic
+value.
+
 Remote artifacts:
 
 ```text
 /tmp/mini_vpn_h10d16_same_window_control/
 /tmp/mini_vpn_h10d16_same_window_control_retry/
+/tmp/mini_vpn_h10d16_same_window_control_window2/
 ```
 
 ## Decision

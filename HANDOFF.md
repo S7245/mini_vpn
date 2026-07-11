@@ -58,15 +58,17 @@ This section overrides the older G7/G8/GV next-step text below.
   snapshots now refresh after each `process_dirty_relay` pass; production EOF,
   queue, permit, actor, and socket behavior did not change.
 - Gate A is currently protected by a mature-client precondition. Same-window
-  sing-box controls reached only `14.207 Mbit/s` and then `1.363 Mbit/s` with
+  sing-box controls reached only `14.207 Mbit/s`, `1.363 Mbit/s`, and
+  `1.182 Mbit/s` with
   correct routing, `16 MiB` client UDP buffers, and socket drop `0`, while
   direct `.27 -> .77` and `.33 -> .77` reverse baselines remained about
   `217/219 Mbit/s`. This is burst/idle TUIC-window evidence shared by both
   clients, so no post-`1bf1f78` Gate A and no Gate B has run.
 - Current result:
   `docs/tech/2026-07-10-knife14h10d16-real-quinn-local-and-control-results.md`.
-- Next stage: restore or observe a same-window sing-box reverse P1 control above
-  `150 Mbit/s` without changing D16 architecture. Only then deploy `1bf1f78`
+- Next stage: after explicit approval, restart `.33` sing-box once and rerun the
+  same-window mature control. Require reverse P1 above `150 Mbit/s` without
+  changing D16 architecture. Only then deploy `1bf1f78`
   from an isolated worktree and spend one `20s` reverse-first P1 Gate A. Keep
   Gate B frozen until Gate A is clean.
 - A future Gate A remains one clean focused run above `150 Mbit/s`; Gate B is
