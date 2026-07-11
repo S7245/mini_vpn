@@ -5666,3 +5666,19 @@ worth cleaning up separately.
 - Reusable rule: a lifecycle acceptance gate must sample after every state
   transition path capable of completing the invariant. Never diagnose a stale
   test sink as retained ownership when the endpoint state already proves FIN.
+
+## 2026-07-10 - Protect Gate A with a same-window mature-client precondition
+
+- After local closure, direct reverse baselines remained healthy at about
+  `217 Mbit/s` from the client and `219 Mbit/s` from the exit to the target.
+- A calibrated sing-box TUIC control used the intended target-only TUN route,
+  kept the exit route on `eth0`, obtained `16 MiB` client UDP buffers, and
+  recorded socket drop `0`, but delivered only `1.363 Mbit/s`. An earlier
+  calibrated control in the same investigation delivered `14.207 Mbit/s`.
+  Both had burst/idle one-second intervals.
+- Because the mature client failed the same TUIC window while both direct legs
+  stayed above `200 Mbit/s`, a mini_vpn Gate A could not distinguish code from
+  shared external service. The one-shot Gate A was not run.
+- Reusable rule: before spending a scarce performance acceptance, require the
+  same-window mature control to exceed the acceptance floor with comparable
+  socket buffers and zero drops. Direct leg capacity alone is insufficient.

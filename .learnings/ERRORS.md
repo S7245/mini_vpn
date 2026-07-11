@@ -3747,3 +3747,12 @@ active root unless it repeats.
 - Correct behavior: use
   `cargo test --features harness --test concurrency_harness`; current expected
   result is `10 passed` with `4` existing ignored tests.
+
+## 2026-07-10 - Parallel direct baselines collided on the iperf3 service
+
+- Symptom: `.27 -> .77` and `.33 -> .77` direct reverse baselines were started
+  concurrently. The first completed, while the second JSON had no
+  `sum_received` field because the target iperf3 service was already occupied.
+- Correct behavior: run acceptance baselines sequentially when the target has a
+  single iperf3 server instance, and fail explicitly on the JSON `error` field
+  before reading throughput values.

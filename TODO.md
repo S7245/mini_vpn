@@ -51,13 +51,24 @@ read starvation: data read gaps reached `3548ms` while application polling,
 local actor drain, smoltcp capacity, and QUIC loss/congestion/blocking were
 healthy.
 
-Next task is a same-stream, sustained real-Quinn discriminator through
-`QuinnDirectOrderedNativeChunkRecv -> TuicNativeOrderedReader -> D16 reader`.
-It must distinguish ordered offset/reassembly gaps, RecvStream sustained
-wake/composition, and TUIC/server burst service before any production edit.
-Do not reopen the local 24/48 packet budgets or replace the byte-owned egress
-architecture. Gate B remains frozen. Result:
-`docs/tech/2026-07-10-knife14h10d16-ack-capacity-gate-a-results.md`.
+The sustained real-Quinn discriminator is complete at `1bf1f78`. Loopback tests
+now cover the direct ordered reader, RAII reservation/readiness queue, and the
+full `run_event_loop` TCP/smoltcp/TUN actor path. The full path delivered
+`32 MiB` above `170 Mbit/s`, respected the 24-payload-packet flush bound, and
+closed with zero modeled drop, actor bypass, and EOF tail in `30/30` repeats.
+All local gates pass. A transient timeout was traced to a stale harness
+lifecycle snapshot after a control-only dirty-relay pass; production queue,
+permit, actor, EOF, and socket behavior was unchanged.
+
+The next task is now an external same-window capability precondition, not a
+production code edit. Mature sing-box reverse P1 controls fell to
+`14.207 Mbit/s` and then `1.363 Mbit/s` despite correct routing, `16 MiB` client
+UDP buffers, socket drop `0`, and healthy direct reverse baselines around
+`217/219 Mbit/s`. Do not spend the single post-local Gate A while the mature
+control is below `150 Mbit/s`. When control recovers, deploy `1bf1f78` from an
+isolated worktree and run exactly one `20s` reverse-first P1 Gate A. Gate B
+remains frozen. Result:
+`docs/tech/2026-07-10-knife14h10d16-real-quinn-local-and-control-results.md`.
 
 Knife14fp found a mandatory high-throughput prerequisite: the exit VPS `.33`
 had Linux socket buffer caps/defaults of only `212992B`, which capped both

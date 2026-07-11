@@ -46,14 +46,29 @@ This section overrides the older G7/G8/GV next-step text below.
   EOF/close was not established. Repeated ordered read gaps reached `3548ms`
   despite active polling, while local actor drain and QUIC loss/congestion/
   blocking surfaces were healthy. Gate B remains frozen.
-- Next stage is a diagnose/TDD same-stream service discriminator at
-  `QuinnDirectOrderedNativeChunkRecv -> TuicNativeOrderedReader -> D16 reader`.
-  First distinguish same-stream ordered offset availability, RecvStream
-  sustained wake/composition, and TUIC/server burst service. Retain the
-  byte-owned egress architecture and do not reopen local 24/48 budgets or tune
-  VPS, MTU/PLPMTUD, broad QUIC windows, pool, chunk size, or self-wake.
+- The same-stream discriminator and full local composition gate are now closed
+  at `1bf1f78`. Real loopback Quinn tests cover the direct ordered reader, its
+  RAII reservation/readiness queue, and the full `run_event_loop` TCP/smoltcp/
+  TUN actor path. The full path delivered `32 MiB` above `170 Mbit/s`, bounded
+  each flush to 24 payload packets, and closed with zero modeled drop, actor
+  bypass, and EOF tail. It passed `30/30` repeats and all local gates.
+- A transient full-path timeout was a stale harness observation, not retained
+  ownership: the generator had all bytes and was already `CloseWait`, while the
+  sink had not sampled the final control-only dirty-relay transition. Harness
+  snapshots now refresh after each `process_dirty_relay` pass; production EOF,
+  queue, permit, actor, and socket behavior did not change.
+- Gate A is currently protected by a mature-client precondition. Same-window
+  sing-box controls reached only `14.207 Mbit/s` and then `1.363 Mbit/s` with
+  correct routing, `16 MiB` client UDP buffers, and socket drop `0`, while
+  direct `.27 -> .77` and `.33 -> .77` reverse baselines remained about
+  `217/219 Mbit/s`. This is burst/idle TUIC-window evidence shared by both
+  clients, so no post-`1bf1f78` Gate A and no Gate B has run.
 - Current result:
-  `docs/tech/2026-07-10-knife14h10d16-ack-capacity-gate-a-results.md`.
+  `docs/tech/2026-07-10-knife14h10d16-real-quinn-local-and-control-results.md`.
+- Next stage: restore or observe a same-window sing-box reverse P1 control above
+  `150 Mbit/s` without changing D16 architecture. Only then deploy `1bf1f78`
+  from an isolated worktree and spend one `20s` reverse-first P1 Gate A. Keep
+  Gate B frozen until Gate A is clean.
 - A future Gate A remains one clean focused run above `150 Mbit/s`; Gate B is
   three clean repeats with a median target of `170 Mbit/s` and a same-window
   sing-box parity fallback.
