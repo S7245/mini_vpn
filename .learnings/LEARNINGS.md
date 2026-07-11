@@ -5715,3 +5715,18 @@ worth cleaning up separately.
   runner scripts, runtime profile, binary hash, and external-control shape.
   Exact-profile local TDD and a clean deployment rehearsal must precede the
   one-shot VPS acceptance.
+
+## 2026-07-11 - Exact safe1200 profile preserves D16 local capacity
+
+- R1 added a test-only Gate A profile constructor with pool `2`, TUN MTU
+  `1200`, production-derived automatic watermarks, the single H10d16 gate, and
+  all legacy/diagnostic D3-D6 flags disabled.
+- The real-Quinn full TCP/smoltcp/TUN path now consumes that exact profile
+  rather than the default MTU1500 config. It retained complete `32 MiB`
+  delivery above `170 Mbit/s`, the 24-payload-packet bound, zero modeled drop,
+  zero actor bypass, and clean EOF tail in `30/30` repeats.
+- Full R1 gates passed: normal library `586/586`, harness library `595/595`,
+  formatting, and diff-check.
+- Reusable rule: when an exact acceptance profile remains green, preserve the
+  production algorithm and fix proof/deployment reproducibility next; do not
+  turn a test-fidelity review into a new tuning branch.

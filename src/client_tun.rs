@@ -7117,6 +7117,20 @@ impl TunRuntimeConfig {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn h10d16_gate_a_for_test() -> Self {
+        let mut config = Self::from_sources(Some("2")).expect("Gate A profile must be valid");
+        config.tun_mtu = 1_200;
+        config.downlink_backpressure =
+            default_downlink_backpressure_for_tun_egress(config.tun_mtu, config.tun_tx_queue_len);
+        config.buffered_downlink = BufferedDownlinkConfig::disabled(
+            config.downlink_backpressure,
+            config.listener.pool_size,
+        );
+        config.h10d16_byte_owned_egress = true;
+        config
+    }
+
     pub fn tcp_socket_buffer_bytes(&self) -> (usize, usize) {
         (
             self.tcp_socket_buffers.rx_bytes,
@@ -20373,6 +20387,25 @@ mod tests {
                 .unwrap()
                 .h10d16_byte_owned_egress
         );
+    }
+
+    #[test]
+    fn h10d16_gate_a_test_profile_matches_approved_safe1200_runtime() {
+        let config = TunRuntimeConfig::h10d16_gate_a_for_test();
+
+        assert_eq!(config.listener.pool_size, 2);
+        assert_eq!(config.tun_mtu, 1_200);
+        assert_eq!(
+            config.downlink_backpressure,
+            default_downlink_backpressure_for_tun_egress(1_200, DEFAULT_TUN_TX_QUEUE_LEN_ESTIMATE,)
+        );
+        assert!(config.h10d16_byte_owned_egress);
+        assert!(!config.d3_egress_actor);
+        assert!(!config.d3_egress_actor_legacy_credit);
+        assert!(!config.d3_egress_actor_self_wake);
+        assert!(!config.d4_stalled_read_service);
+        assert!(!config.d5_capacity_backpressure);
+        assert!(!config.d6_native_egress_permit);
     }
 
     #[test]

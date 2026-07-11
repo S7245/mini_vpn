@@ -2369,7 +2369,7 @@ mod tests {
         let max_tcp_payload_packets_per_flush = Arc::new(AtomicU64::new(0));
         let sut_device = LoopbackTunDevice::new(gen_to_sut.clone(), sut_to_gen.clone())
             .with_tcp_payload_flush_counter(Arc::clone(&max_tcp_payload_packets_per_flush));
-        let config = TunRuntimeConfig::from_sources(Some("2")).unwrap();
+        let config = TunRuntimeConfig::h10d16_gate_a_for_test();
         let recorded = Arc::new(Mutex::new(Recorded::default()));
         let sut = tokio::spawn(run_event_loop(
             sut_device,
