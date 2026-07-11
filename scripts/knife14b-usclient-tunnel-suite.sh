@@ -472,6 +472,25 @@ summarize_final_lifecycle_window() {
       }
     }
 
+    /tcp-d16-relay-close/ {
+      relay_close_reason = ""
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^terminal_reason=/) {
+          relay_close_reason = text_token($i, "terminal_reason")
+        }
+      }
+      if (relay_close_reason == "clean_queue_lifecycle") {
+        d16_clean_close_events++
+      } else {
+        d16_terminal_close_events++
+        if (relay_close_reason == "local_socket_terminal") {
+          d16_local_socket_terminal_events++
+        } else {
+          d16_other_terminal_events++
+        }
+      }
+    }
+
     /tcp-handle-close/ {
       pending = 0
       close_pending_class = ""
@@ -661,6 +680,12 @@ summarize_final_lifecycle_window() {
       if (global_receive_pause_edges > 0) {
         labels = labels == "" ? "final_global_rx_receive_window" : labels "+final_global_rx_receive_window"
       }
+      if (d16_local_socket_terminal_events > 0) {
+        labels = labels == "" ? "final_d16_local_socket_terminal" : labels "+final_d16_local_socket_terminal"
+      }
+      if (d16_other_terminal_events > 0) {
+        labels = labels == "" ? "final_d16_other_terminal" : labels "+final_d16_other_terminal"
+      }
       if (labels == "") {
         labels = "final_no_pressure_signal"
       }
@@ -673,6 +698,7 @@ summarize_final_lifecycle_window() {
       printf "- final_downlink_flush: attempts=%d send_queue_max=%d may_recv_false=%d headroom_limited=%d headroom_deferred_bytes=%d drain_credit_granted_bytes=%d drain_credit_planned_bytes=%d drain_credit_used_bytes=%d egress_payload_credit_bytes=%d drop_credit_debt_bytes=%d drop_credit_debt_paid_bytes=%d drop_credit_blocked_bytes=%d pressure_credit_debt_bytes=%d pressure_credit_debt_paid_bytes=%d pressure_credit_blocked_bytes=%d hard_edge_guard_bytes=%d hard_edge_guard_limited=%d hard_edge_guard_deferred_bytes=%d send_slice_zero=%d send_slice_errors=%d tun_flush_failures=%d tun_flush_deferred=%d\n", max_flush_attempts, max_send_queue_max, max_may_recv_false, max_headroom_limited, max_headroom_deferred_bytes, max_drain_credit_granted_bytes, max_drain_credit_planned_bytes, max_drain_credit_used_bytes, max_egress_payload_credit_bytes, max_drop_credit_debt_bytes, max_drop_credit_debt_paid_bytes, max_drop_credit_blocked_bytes, max_pressure_credit_debt_bytes, max_pressure_credit_debt_paid_bytes, max_pressure_credit_blocked_bytes, max_hard_edge_guard_bytes, max_hard_edge_guard_limited, max_hard_edge_guard_deferred_bytes, max_send_slice_zero, max_send_slice_errors, max_tun_flush_failures, max_tun_flush_deferred
       printf "- final_runtime_tun_egress: samples=%d drop_events=%d drop_delta_total=%d max_delta=%d\n", runtime_tun_samples, runtime_drop_events, runtime_drop_delta_total, max_runtime_delta
       printf "- final_tun_egress_feedback: pause_edges=%d resume_edges=%d drop_events=%d drop_delta_total=%d max_delta=%d max_pressure_bytes=%d\n", feedback_pause_edges, feedback_resume_edges, feedback_drop_events, feedback_drop_delta_total, max_feedback_delta, max_feedback_pressure
+      printf "- final_d16_relay_close: clean_events=%d terminal_events=%d local_socket_terminal_events=%d other_terminal_events=%d\n", d16_clean_close_events, d16_terminal_close_events, d16_local_socket_terminal_events, d16_other_terminal_events
       print "- final_attribution: " labels
     }
   '
@@ -821,6 +847,11 @@ EOF
     echo "suite self-test failed: startup-only profile rehearsal help missing" >&2
     return 1
   fi
+  if ! grep -q "RUN_D16_EOF_CLOSE_PROBE=0" <<<"$help_text" ||
+    ! grep -q "D16_EOF_CLOSE_BYTES=64M" <<<"$help_text"; then
+    echo "suite self-test failed: D16 EOF-close probe help missing" >&2
+    return 1
+  fi
 
   if ! (
     MINI_VPN_TCP_TX_BUFFER_BYTES=1048576
@@ -901,6 +932,8 @@ EOF
 🔎 tcp-global-rx-backpressure paused=false max_pending=524288 total_pending=524288 max_tx_queue=131072 total_tx_queue=131072 max_pressure=524288 total_pressure=655360 receive_high=2097152 receive_low=524288 receive_total_high=4194304 receive_total_low=1048576 local_egress_paused=false tun_feedback_paused=false
 🔎 tcp-tun-egress-feedback paused=true reason=drop_delta tx_dropped_delta=1349 max_pressure=720896 total_pressure=1853914 high=524288 low=131072 drop_events=1 drop_delta_total=1349 max_delta=1349 pause_edges=1 resume_edges=0 egress_credit_generation=1 egress_credit_debt_bytes=196608 drop_credit_debt_bytes=196608 pressure_credit_debt_bytes=0 drop_credit_events=1 pressure_credit_events=0
 🔎 tcp-handle-close handle=SocketHandle(1) direction=local_to_remote reason=uplink_channel_closed state=Relaying pending=566509 pending_high=585869 remote_to_global_rx_bytes=56886483 flush_attempts=16139 no_send_capacity=0 send_window_samples=16139 send_capacity_min=1048576 send_capacity_max=1048576 send_queue_max=720896 recv_queue_max=0 may_send_false=0 may_recv_false=11897 send_slice_calls=4167 send_slice_accepted=56319974 send_slice_zero=0 send_slice_errors=0 budget_limited_calls=12291 headroom_limited_calls=12973 headroom_deferred_bytes=3317103134 drain_credit_granted_bytes=2097152 drain_credit_planned_bytes=1048576 drain_credit_used_bytes=786432 egress_payload_credit_bytes=98304 drop_credit_debt_bytes=196608 drop_credit_debt_paid_bytes=98304 drop_credit_blocked_bytes=229376 pressure_credit_debt_bytes=32768 pressure_credit_debt_paid_bytes=16384 pressure_credit_blocked_bytes=49152 hard_edge_guard_bytes=24576 hard_edge_guard_limited_calls=37 hard_edge_guard_deferred_bytes=131072 send_slice_max_accepted=178048 tun_flush_tx_calls=3167 tun_flush_tx_failures=0 tun_flush_deferred=0 close_pending_class=active_send_capable close_pending_bytes=566509 terminal_pending_reap_bytes=0 close_egress_class=active_send_capable close_egress_bytes=720896 close_egress_drain_candidate=true tcp_state=CloseWait active=true can_send=true can_recv=false may_send=true may_recv=false send_capacity=1048576 send_queue=720896 recv_queue=0
+🔎 tcp-d16-relay-close handle=SocketHandle(1) epoch=31 terminal_direction=local_to_remote terminal_reason=local_socket_terminal queue_queued_bytes=0 queue_leased_bytes=0 queue_reserved_bytes=0 queue_closed=true
+🔎 tcp-d16-relay-close handle=SocketHandle(2) epoch=32 terminal_direction=none terminal_reason=clean_queue_lifecycle queue_queued_bytes=0 queue_leased_bytes=0 queue_reserved_bytes=0 queue_closed=true
 🔎 tcp-tun-egress if=tun0 status=delta tx_dropped_total=2691 tx_dropped_delta=122 global_rx_paused=true pending_total=0 pending_max=0 pending_high=0 remote_to_global_rx_bytes=0 tun_flush_tx_calls=0 dirty_handles=0
 🔎 tcp-tun-egress-feedback paused=true reason=drop_delta tx_dropped_delta=122 max_pressure=720896 total_pressure=1287405 high=524288 low=131072 drop_events=5 drop_delta_total=2691 max_delta=1349 pause_edges=1 resume_edges=0 egress_credit_generation=2 egress_credit_debt_bytes=196608 drop_credit_debt_bytes=196608 pressure_credit_debt_bytes=0 drop_credit_events=2 pressure_credit_events=0
 EOF
@@ -933,6 +966,11 @@ EOF
   fi
   if ! grep -q "final_global_rx_receive_window" <<<"$final_summary"; then
     echo "suite self-test failed: final lifecycle summary missed global receive attribution" >&2
+    printf '%s\n' "$final_summary" >&2
+    return 1
+  fi
+  if ! grep -q "final_d16_relay_close: clean_events=1 terminal_events=1 local_socket_terminal_events=1 other_terminal_events=0" <<<"$final_summary"; then
+    echo "suite self-test failed: final lifecycle summary missed classified D16 relay close causes" >&2
     printf '%s\n' "$final_summary" >&2
     return 1
   fi
@@ -1107,6 +1145,8 @@ Optional env:
   RUN_REVERSE_FIRST_P1=0   run a fresh reverse-only P1 probe before the normal forward-first probe
   STOP_AFTER_REVERSE_FIRST_P1=0  stop after the fresh reverse-only P1 and final snapshots
   PROFILE_REHEARSAL_ONLY=0  verify binary/runner hashes and exact startup profile, then stop before iperf
+  RUN_D16_EOF_CLOSE_PROBE=0  after reverse-first P1 quiets, run one fixed-byte reverse flow to prove graceful EOF
+  D16_EOF_CLOSE_BYTES=64M   fixed reverse payload for the D16 EOF-close proof; passed to iperf3 -n
   WAIT_QUIET_BEFORE_FULL=1  after standalone P1, wait for active relays to drop before full sweep
   QUIET_TIMEOUT_SECS=20
   QUIET_POLL_SECS=1
@@ -1198,6 +1238,8 @@ SERVER_EVIDENCE_SSH_TIMEOUT="${SERVER_EVIDENCE_SSH_TIMEOUT:-20s}"
 RUN_REVERSE_FIRST_P1="${RUN_REVERSE_FIRST_P1:-0}"
 STOP_AFTER_REVERSE_FIRST_P1="${STOP_AFTER_REVERSE_FIRST_P1:-0}"
 PROFILE_REHEARSAL_ONLY="${PROFILE_REHEARSAL_ONLY:-0}"
+RUN_D16_EOF_CLOSE_PROBE="${RUN_D16_EOF_CLOSE_PROBE:-0}"
+D16_EOF_CLOSE_BYTES="${D16_EOF_CLOSE_BYTES:-64M}"
 WAIT_QUIET_BEFORE_FULL="${WAIT_QUIET_BEFORE_FULL:-1}"
 QUIET_TIMEOUT_SECS="${QUIET_TIMEOUT_SECS:-20}"
 QUIET_POLL_SECS="${QUIET_POLL_SECS:-1}"
@@ -2015,6 +2057,7 @@ run_lowrtt_probe() {
   local parallel="$2"
   local duration="$3"
   local probe_order="${4:-forward-first}"
+  local iperf_bytes="${5:-}"
   local probe_out="$OUT_DIR/mvpn_${SUITE_TAG}_usclient_tunnel_${label}_${TS}.md"
   ARTIFACTS+=("$probe_out")
 
@@ -2023,6 +2066,7 @@ run_lowrtt_probe() {
   append "- out: $probe_out"
   append "- parallel_set: $parallel"
   append "- duration: ${duration}s"
+  append "- iperf_bytes: ${iperf_bytes:-<timed>}"
   append "- probe_order: $probe_order"
   append "- client_log: $CLIENT_LOG"
 
@@ -2033,6 +2077,7 @@ run_lowrtt_probe() {
     OUT="$probe_out" \
     PARALLEL_SET="$parallel" \
     DURATION="$duration" \
+    IPERF_BYTES="$iperf_bytes" \
     PROBE_ORDER="$probe_order" \
     TUN_IF="$TUN_IF" \
     IPERF_BUSY_RETRIES="$IPERF_BUSY_RETRIES" \
@@ -2277,6 +2322,8 @@ append "- CC_VARIANT_LABEL=${CC_VARIANT_LABEL:-<none>}"
 append "- RUN_REVERSE_FIRST_P1=$RUN_REVERSE_FIRST_P1"
 append "- STOP_AFTER_REVERSE_FIRST_P1=$STOP_AFTER_REVERSE_FIRST_P1"
 append "- PROFILE_REHEARSAL_ONLY=$PROFILE_REHEARSAL_ONLY"
+append "- RUN_D16_EOF_CLOSE_PROBE=$RUN_D16_EOF_CLOSE_PROBE"
+append "- D16_EOF_CLOSE_BYTES=$D16_EOF_CLOSE_BYTES"
 append "- TUN_TX_QUEUE_LEN=${TUN_TX_QUEUE_LEN:-<default>}"
 append "- MINI_VPN_TUIC_UDP_MODE=$MINI_VPN_TUIC_UDP_MODE"
 append "- MINI_VPN_TUIC_ZERO_RTT=$MINI_VPN_TUIC_ZERO_RTT"
@@ -2506,6 +2553,14 @@ if [[ "$MINI_VPN_H10D16_BYTE_OWNED_EGRESS" == "1" ]]; then
   append "- h10d16_startup_profile: verified-safe1200"
   append "- h10d16_startup_fingerprint: $(h10d16_expected_startup_line)"
 fi
+if [[ "$RUN_D16_EOF_CLOSE_PROBE" == "1" ]]; then
+  if [[ "$MINI_VPN_H10D16_BYTE_OWNED_EGRESS" != "1" ]]; then
+    fail "RUN_D16_EOF_CLOSE_PROBE=1 requires MINI_VPN_H10D16_BYTE_OWNED_EGRESS=1."
+  fi
+  if [[ ! "$D16_EOF_CLOSE_BYTES" =~ ^[1-9][0-9]*([KMG])?$ ]]; then
+    fail "D16_EOF_CLOSE_BYTES must be positive bytes with an optional K/M/G suffix; got $D16_EOF_CLOSE_BYTES."
+  fi
+fi
 
 route_target_into_tun
 configure_tun_tx_queue_len
@@ -2555,6 +2610,21 @@ proceed_to_standard_p1=1
 if [[ "$RUN_REVERSE_FIRST_P1" == "1" ]]; then
   run_lowrtt_probe "mtu${MTU}_reverse_first_p1" "1" "$DURATION" "reverse-only" || true
   REVERSE_FIRST_END_LINE="$(client_log_line_count)"
+  if [[ "$RUN_D16_EOF_CLOSE_PROBE" == "1" ]]; then
+    if wait_for_quiet_tunnel "D16 EOF-close probe" "$REVERSE_FIRST_END_LINE"; then
+      D16_EOF_CLOSE_START_LINE="$(client_log_line_count)"
+      run_lowrtt_probe \
+        "mtu${MTU}_d16_eof_close" \
+        "1" \
+        "$DURATION" \
+        "reverse-only" \
+        "$D16_EOF_CLOSE_BYTES" || true
+    else
+      append ""
+      append "## D16 EOF-Close Probe Skipped"
+      append "Timed capacity flow did not become quiet; a mixed lifecycle window cannot prove clean EOF."
+    fi
+  fi
   if [[ "$STOP_AFTER_REVERSE_FIRST_P1" == "1" ]]; then
     proceed_to_standard_p1=0
     append ""
@@ -2618,6 +2688,9 @@ run_cmd ip -s link show "$TUN_IF" || true
 append_final_lifecycle_summary 0 "whole-suite-final"
 if [[ -n "${REVERSE_FIRST_END_LINE:-}" ]]; then
   append_final_lifecycle_summary "$REVERSE_FIRST_END_LINE" "post-reverse-first-final"
+fi
+if [[ -n "${D16_EOF_CLOSE_START_LINE:-}" ]]; then
+  append_final_lifecycle_summary "$D16_EOF_CLOSE_START_LINE" "d16-eof-close-final"
 fi
 append ""
 append "### Final mini_vpn Log Tail"

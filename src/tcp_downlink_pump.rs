@@ -342,7 +342,33 @@ pub struct LeasedByteQueueSnapshot {
     pub capacity_bytes: usize,
     pub high_water_bytes: usize,
     pub chunks: usize,
-    pub closed: bool,
+    pub closure: LeasedByteQueueClosure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeasedByteQueueTerminalCause {
+    pub direction: &'static str,
+    pub reason: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeasedByteQueueClosure {
+    Open,
+    RemoteEof,
+    Terminal(LeasedByteQueueTerminalCause),
+}
+
+impl LeasedByteQueueClosure {
+    pub fn is_closed(self) -> bool {
+        !matches!(self, Self::Open)
+    }
+
+    pub fn terminal_cause(self) -> Option<LeasedByteQueueTerminalCause> {
+        match self {
+            Self::Terminal(cause) => Some(cause),
+            Self::Open | Self::RemoteEof => None,
+        }
+    }
 }
 
 pub const D16_GLOBAL_BYTE_BUDGET_DEFAULT_BYTES: usize = 64 * 1024 * 1024;
@@ -591,7 +617,7 @@ struct LeasedByteFlowQueueState {
     capacity_bytes: usize,
     high_water_bytes: usize,
     release_mode: DownstreamPermitReleaseMode,
-    closed: bool,
+    closure: LeasedByteQueueClosure,
 }
 
 impl LeasedByteFlowQueueState {
@@ -605,7 +631,7 @@ impl LeasedByteFlowQueueState {
             capacity_bytes,
             high_water_bytes: 0,
             release_mode,
-            closed: false,
+            closure: LeasedByteQueueClosure::Open,
         }
     }
 
@@ -617,7 +643,7 @@ impl LeasedByteFlowQueueState {
             capacity_bytes: self.capacity_bytes,
             high_water_bytes: self.high_water_bytes,
             chunks: self.chunks.len(),
-            closed: self.closed,
+            closure: self.closure,
         }
     }
 
@@ -733,7 +759,7 @@ impl AsyncLeasedByteFlowQueue {
             notified.as_mut().enable();
             let flow_available = {
                 let state = self.inner.lock_state();
-                if state.closed {
+                if state.closure.is_closed() {
                     return Err(AsyncByteQueueWait::Closed);
                 }
                 state.available_bytes()
@@ -752,7 +778,7 @@ impl AsyncLeasedByteFlowQueue {
                 None
             };
             let mut state = self.inner.lock_state();
-            if state.closed {
+            if state.closure.is_closed() {
                 return Err(AsyncByteQueueWait::Closed);
             }
             let global_available = global_reservation
@@ -785,7 +811,7 @@ impl AsyncLeasedByteFlowQueue {
         loop {
             let notified = {
                 let state = self.inner.lock_state();
-                if state.closed {
+                if state.closure.is_closed() {
                     return Err(AsyncByteQueueWait::Closed);
                 }
                 let available = state.available_bytes();
@@ -819,7 +845,7 @@ impl AsyncLeasedByteFlowQueue {
                 global_notified.as_mut().enable();
                 {
                     let mut state = self.inner.lock_state();
-                    if state.closed {
+                    if state.closure.is_closed() {
                         return Err(ByteQueuePushError::Closed);
                     }
                     if len <= state.available_bytes() && global_budget.inner.try_acquire_owned(len)
@@ -841,7 +867,7 @@ impl AsyncLeasedByteFlowQueue {
         loop {
             let notified = {
                 let mut state = self.inner.lock_state();
-                if state.closed {
+                if state.closure.is_closed() {
                     return Err(ByteQueuePushError::Closed);
                 }
                 if len > state.capacity_bytes {
@@ -876,7 +902,7 @@ impl AsyncLeasedByteFlowQueue {
             };
             return LeasedQueuePoll::Data(LeasedBytes { bytes, permit });
         }
-        if state.closed {
+        if state.closure.is_closed() {
             if state.queued_bytes == 0 && state.reserved_bytes == 0 {
                 state.wake_pending = false;
                 return LeasedQueuePoll::Closed;
@@ -904,7 +930,7 @@ impl AsyncLeasedByteFlowQueue {
                     };
                     return Some(LeasedBytes { bytes, permit });
                 }
-                if state.closed {
+                if state.closure.is_closed() {
                     return None;
                 }
                 self.inner.not_empty.notified()
@@ -913,12 +939,12 @@ impl AsyncLeasedByteFlowQueue {
         }
     }
 
-    pub async fn close_and_mark_ready(&self) -> bool {
+    pub async fn close_for_remote_eof_and_mark_ready(&self) -> bool {
         let mut state = self.inner.lock_state();
-        if state.closed {
+        if state.closure.is_closed() {
             return false;
         }
-        state.closed = true;
+        state.closure = LeasedByteQueueClosure::RemoteEof;
         let should_wake = !state.wake_pending;
         state.wake_pending = true;
         drop(state);
@@ -927,13 +953,45 @@ impl AsyncLeasedByteFlowQueue {
         should_wake
     }
 
-    pub async fn close(&self) {
-        let _ = self.close_and_mark_ready().await;
+    pub async fn close_for_terminal_and_mark_ready(
+        &self,
+        direction: &'static str,
+        reason: &'static str,
+    ) -> bool {
+        let mut state = self.inner.lock_state();
+        let was_closed = state.closure.is_closed();
+        if !matches!(state.closure, LeasedByteQueueClosure::Terminal(_)) {
+            state.closure = LeasedByteQueueClosure::Terminal(LeasedByteQueueTerminalCause {
+                direction,
+                reason,
+            });
+        }
+        let should_wake = !was_closed && !state.wake_pending;
+        state.wake_pending = true;
+        drop(state);
+        self.inner.not_empty.notify_waiters();
+        self.inner.not_full.notify_waiters();
+        should_wake
     }
 
-    pub fn close_and_drop_queued(&self) -> usize {
+    pub async fn close(&self) {
+        let _ = self
+            .close_for_terminal_and_mark_ready("internal", "queue_closed")
+            .await;
+    }
+
+    pub fn close_and_drop_queued_for_terminal(
+        &self,
+        direction: &'static str,
+        reason: &'static str,
+    ) -> usize {
         let mut state = self.inner.lock_state();
-        state.closed = true;
+        if !matches!(state.closure, LeasedByteQueueClosure::Terminal(_)) {
+            state.closure = LeasedByteQueueClosure::Terminal(LeasedByteQueueTerminalCause {
+                direction,
+                reason,
+            });
+        }
         let dropped = state.queued_bytes;
         state.chunks.clear();
         state.queued_bytes = 0;
@@ -993,7 +1051,7 @@ impl ByteQueueReadReservation {
         }
 
         let mut state = self.inner.lock_state();
-        if state.closed {
+        if state.closure.is_closed() {
             return Err(ByteQueuePushError::Closed);
         }
         let unused_bytes = self.reserved_bytes.saturating_sub(len);
@@ -1555,7 +1613,9 @@ mod tests {
     async fn read_reservation_closed_commit_refunds_exactly_once() {
         let queue = AsyncLeasedByteFlowQueue::new(128 * 1024).unwrap();
         let reservation = queue.reserve_read_up_to(64 * 1024).await.unwrap();
-        queue.close().await;
+        queue
+            .close_for_terminal_and_mark_ready("test", "reservation_commit_after_close")
+            .await;
 
         assert_eq!(
             reservation.commit(Bytes::from(vec![1; 16 * 1024])),
@@ -1598,7 +1658,7 @@ mod tests {
         let reservation = queue.reserve_read_up_to(16 * 1024).await.unwrap();
         assert!(reservation.commit(Bytes::from(vec![1; 16 * 1024])).unwrap());
         assert!(
-            !queue.close_and_mark_ready().await,
+            !queue.close_for_remote_eof_and_mark_ready().await,
             "the queued payload wake must also carry the later close state"
         );
 
@@ -1610,14 +1670,14 @@ mod tests {
             queue.try_recv_up_to(128 * 1024),
             LeasedQueuePoll::Closed
         ));
-        assert!(!queue.close_and_mark_ready().await);
+        assert!(!queue.close_for_remote_eof_and_mark_ready().await);
     }
 
     #[tokio::test]
     async fn leased_queue_closed_waits_for_reservation_refund() {
         let queue = AsyncLeasedByteFlowQueue::new(128 * 1024).unwrap();
         let reservation = queue.reserve_read_up_to(64 * 1024).await.unwrap();
-        assert!(queue.close_and_mark_ready().await);
+        assert!(queue.close_for_remote_eof_and_mark_ready().await);
         assert!(matches!(
             queue.try_recv_up_to(128 * 1024),
             LeasedQueuePoll::Empty
@@ -1636,13 +1696,34 @@ mod tests {
         let reservation = queue.reserve_read_up_to(32 * 1024).await.unwrap();
         reservation.commit(Bytes::from(vec![1; 32 * 1024])).unwrap();
 
-        assert_eq!(queue.close_and_drop_queued(), 32 * 1024);
+        assert_eq!(
+            queue.close_and_drop_queued_for_terminal("test", "terminal_drop"),
+            32 * 1024
+        );
         let snapshot = queue.snapshot_now();
-        assert!(snapshot.closed);
+        assert!(snapshot.closure.is_closed());
+        assert_eq!(
+            snapshot.closure.terminal_cause(),
+            Some(LeasedByteQueueTerminalCause {
+                direction: "test",
+                reason: "terminal_drop",
+            })
+        );
         assert_eq!(snapshot.queued_bytes, 0);
         assert_eq!(snapshot.leased_bytes, 0);
         assert_eq!(snapshot.reserved_bytes, 0);
-        assert_eq!(queue.close_and_drop_queued(), 0);
+        assert_eq!(
+            queue.close_and_drop_queued_for_terminal("test", "different_reason"),
+            0
+        );
+        assert_eq!(
+            queue.snapshot_now().closure.terminal_cause(),
+            Some(LeasedByteQueueTerminalCause {
+                direction: "test",
+                reason: "terminal_drop",
+            }),
+            "the first terminal cause must remain authoritative"
+        );
     }
 
     #[tokio::test]

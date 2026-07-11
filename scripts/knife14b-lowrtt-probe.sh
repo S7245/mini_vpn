@@ -16,6 +16,7 @@ usage: scripts/knife14b-lowrtt-probe.sh <iperf-target> [port]
 env:
   PARALLEL_SET="1 2 4 8"   iperf parallel sweep
   DURATION=30              seconds per iperf run
+  IPERF_BYTES=""           optional fixed TCP byte goal (for example 64M); replaces -t and permits an EOF-close proof
   LOG=/tmp/mvpn_accept.log mini_vpn soak log
   OUT=/tmp/mvpn_knife14b_lowrtt_<timestamp>.md
   IPERF_TIMEOUT_SECS=DURATION+20 external timeout per iperf command
@@ -171,6 +172,14 @@ iperf_is_reverse_tcp() {
 
 is_uint() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+tcp_transfer_spec() {
+  if [[ -n "${IPERF_BYTES:-}" ]]; then
+    printf '%s %s\n' -n "$IPERF_BYTES"
+  else
+    printf '%s %s\n' -t "$DURATION"
+  fi
 }
 
 counter_delta() {
@@ -2424,6 +2433,12 @@ EOF_LOG
     fi
   }
 
+  local transfer_spec
+  transfer_spec="$(IPERF_BYTES=64M DURATION=20 tcp_transfer_spec)"
+  assert_contains "$transfer_spec" "-n 64M"
+  transfer_spec="$(IPERF_BYTES= DURATION=20 tcp_transfer_spec)"
+  assert_contains "$transfer_spec" "-t 20"
+
   summary="$(summarize_metrics_window 0 "self-test" "$iperf_sample" "$log_sample")"
   assert_contains "$summary" "iperf_receiver_mbps: 191.000"
   assert_contains "$summary" "tcp_pool: opens=1 conns=3 reconnects=1 reasons=stale_tcp_pool_slot"
@@ -2799,6 +2814,7 @@ command -v timeout >/dev/null 2>&1 || { echo "timeout not found" >&2; exit 1; }
 
 PARALLEL_SET="${PARALLEL_SET:-1 2 4 8}"
 DURATION="${DURATION:-30}"
+IPERF_BYTES="${IPERF_BYTES:-}"
 IPERF_TIMEOUT_SECS="${IPERF_TIMEOUT_SECS:-$((DURATION + 20))}"
 LOG="${LOG:-/tmp/mvpn_accept.log}"
 RUN_UDP="${RUN_UDP:-0}"
@@ -2809,7 +2825,7 @@ IPERF_BUSY_WAIT_SECS="${IPERF_BUSY_WAIT_SECS:-5}"
 POST_IPERF_METRICS_SETTLE_SECS="${POST_IPERF_METRICS_SETTLE_SECS:-2}"
 PROBE_ORDER="${PROBE_ORDER:-forward-first}"
 OUT="${OUT:-/tmp/mvpn_knife14b_lowrtt_$(date +%Y%m%d_%H%M%S).md}"
-METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tuic-open-tcp|tuic-tcp-stream-first-rx|tuic-tcp-stream-read-gap|tuic-tcp-stream-pending|tuic-tcp-stream-close|tuic-tcp-pool-reconnect|tuic-tcp-unordered-staging|tcp-relay-live|tcp-relay-ack-drain-hint|tcp-relay-write-half-closed|tcp-relay-close|tcp-handle-close|tcp-deferred-close-egress|tcp-lifecycle-transition|tcp-reverse-window|tcp-local-egress-service|tcp-local-write-pressure|tcp-global-rx-pressure|tcp-global-rx-backpressure|tcp-downlink-backpressure|tcp-downlink-flush|tcp-tun-rx-drain|tcp-tun-egress'
+METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tuic-open-tcp|tuic-tcp-stream-first-rx|tuic-tcp-stream-read-gap|tuic-tcp-stream-pending|tuic-tcp-stream-close|tuic-tcp-pool-reconnect|tuic-tcp-unordered-staging|tcp-relay-live|tcp-relay-ack-drain-hint|tcp-relay-write-half-closed|tcp-relay-close|tcp-d16-relay-close|tcp-handle-close|tcp-deferred-close-egress|tcp-lifecycle-transition|tcp-reverse-window|tcp-local-egress-service|tcp-local-write-pressure|tcp-global-rx-pressure|tcp-global-rx-backpressure|tcp-downlink-backpressure|tcp-downlink-flush|tcp-tun-rx-drain|tcp-tun-egress'
 if [[ "${MINI_VPN_PROBE_INCLUDE_STREAM_SERVICE_WINDOW:-0}" == "1" ]]; then
   METRIC_RE="$METRIC_RE|tcp-stream-service-window"
 fi
@@ -2825,6 +2841,11 @@ if ! is_uint "$POST_IPERF_METRICS_SETTLE_SECS"; then
   echo "invalid POST_IPERF_METRICS_SETTLE_SECS=$POST_IPERF_METRICS_SETTLE_SECS (expected non-negative integer seconds)" >&2
   exit 2
 fi
+if [[ -n "$IPERF_BYTES" && ! "$IPERF_BYTES" =~ ^[1-9][0-9]*([KMG])?$ ]]; then
+  echo "invalid IPERF_BYTES=$IPERF_BYTES (expected positive bytes with optional K/M/G suffix)" >&2
+  exit 2
+fi
+read -r TCP_TRANSFER_FLAG TCP_TRANSFER_VALUE <<< "$(tcp_transfer_spec)"
 
 append_cmd() {
   {
@@ -3020,6 +3041,7 @@ append_iperf_cmd() {
   echo "- target: ${TARGET}:${PORT}"
   echo "- parallel_set: ${PARALLEL_SET}"
   echo "- duration: ${DURATION}s"
+  echo "- iperf_bytes: ${IPERF_BYTES:-<timed>}"
   echo "- iperf_timeout: ${IPERF_TIMEOUT_SECS}s"
   echo "- iperf_busy_retries: ${IPERF_BUSY_RETRIES}"
   echo "- iperf_busy_wait_secs: ${IPERF_BUSY_WAIT_SECS}"
@@ -3055,7 +3077,7 @@ run_tcp_forward_sweep() {
   append_section "TCP Forward Sweep"
   for p in $PARALLEL_SET; do
     append_iperf_cmd "mini_vpn Metrics during TCP Forward P=$p" \
-      iperf3 -c "$TARGET" -p "$PORT" -t "$DURATION" -P "$p"
+      iperf3 -c "$TARGET" -p "$PORT" "$TCP_TRANSFER_FLAG" "$TCP_TRANSFER_VALUE" -P "$p"
   done
 }
 
@@ -3063,7 +3085,7 @@ run_tcp_reverse_sweep() {
   append_section "TCP Reverse Sweep"
   for p in $PARALLEL_SET; do
     append_iperf_cmd "mini_vpn Metrics during TCP Reverse P=$p" \
-      iperf3 -c "$TARGET" -p "$PORT" -t "$DURATION" -P "$p" -R
+      iperf3 -c "$TARGET" -p "$PORT" "$TCP_TRANSFER_FLAG" "$TCP_TRANSFER_VALUE" -P "$p" -R
   done
 }
 

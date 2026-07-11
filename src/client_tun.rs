@@ -2540,12 +2540,16 @@ fn drain_d16_owned_queue_into_pending(ctx: &mut SocketCtx, max_bytes: usize) -> 
     outcome
 }
 
-fn drop_d16_owned_for_terminal(ctx: &mut SocketCtx) -> usize {
+fn drop_d16_owned_for_terminal(
+    ctx: &mut SocketCtx,
+    direction: &'static str,
+    reason: &'static str,
+) -> usize {
     let Some(queue) = ctx.d16_downlink_queue.clone() else {
         return 0;
     };
     let before = queue.snapshot_now();
-    let dropped_queued_bytes = queue.close_and_drop_queued();
+    let dropped_queued_bytes = queue.close_and_drop_queued_for_terminal(direction, reason);
     ctx.clear_downlink_pending();
     let after = queue.snapshot_now();
     let released_leased_bytes = before.leased_bytes.saturating_sub(after.leased_bytes);
@@ -2561,6 +2565,21 @@ fn drop_d16_owned_for_terminal(ctx: &mut SocketCtx) -> usize {
             .saturating_add(1);
     }
     dropped
+}
+
+fn d16_terminal_cause_for_rearm(
+    ctx: &SocketCtx,
+    snapshot: SocketCloseSnapshot,
+    close_direction: &'static str,
+    close_reason: &'static str,
+) -> Option<(&'static str, &'static str)> {
+    if close_reason == "remote_eof" && ctx.local_eof_sent {
+        return None;
+    }
+    if snapshot.tcp_state == TcpState::Closed && !snapshot.active && !snapshot.can_send {
+        return Some(("local_to_remote", "local_socket_terminal"));
+    }
+    Some((close_direction, close_reason))
 }
 
 #[cfg(feature = "harness")]
@@ -2635,7 +2654,7 @@ impl D16HarnessFlow {
     }
 
     pub(crate) async fn close_remote(&self) -> bool {
-        self.queue.close_and_mark_ready().await
+        self.queue.close_for_remote_eof_and_mark_ready().await
     }
 
     pub(crate) fn cycle(
@@ -9960,7 +9979,7 @@ fn remote_eof_ready_for_local_close(
 fn d16_remote_eof_queue_state(ctx: &SocketCtx) -> Option<(bool, bool)> {
     let snapshot = ctx.d16_downlink_queue.as_ref()?.snapshot_now();
     Some((
-        snapshot.closed,
+        snapshot.closure.is_closed(),
         snapshot.queued_bytes == 0 && snapshot.reserved_bytes == 0,
     ))
 }
@@ -10286,7 +10305,11 @@ fn rearm_socket_with_reason_and_snapshot(
         log_tcp_lifecycle_observation(handle, ctx, snapshot, now_secs, close_reason);
         let close_pending = close_pending_accounting(ctx, snapshot);
         let close_egress = close_egress_accounting(snapshot);
-        let _ = drop_d16_owned_for_terminal(ctx);
+        if let Some((direction, reason)) =
+            d16_terminal_cause_for_rearm(ctx, snapshot, close_direction, close_reason)
+        {
+            let _ = drop_d16_owned_for_terminal(ctx, direction, reason);
+        }
         tcp_diag_log!(
             "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} actor_admitted_bytes={} actor_bypass_admitted_bytes={} permit_terminal_drop_bytes={} permit_terminal_drop_events={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} drain_credit_granted_bytes={} drain_credit_planned_bytes={} drain_credit_used_bytes={} drop_credit_debt_bytes={} drop_credit_debt_paid_bytes={} drop_credit_blocked_bytes={} pressure_credit_debt_bytes={} pressure_credit_debt_paid_bytes={} pressure_credit_blocked_bytes={} hard_edge_guard_bytes={} hard_edge_guard_limited_calls={} hard_edge_guard_deferred_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes={} close_egress_class={} close_egress_bytes={} close_egress_drain_candidate={} tcp_state={:?} active={} can_send={} can_recv={} may_send={} may_recv={} send_capacity={} send_queue={} recv_queue={}",
             handle,
@@ -10362,7 +10385,7 @@ fn rearm_socket_with_reason_and_snapshot(
     } else {
         ClosePendingClass::Unknown
     };
-    let _ = drop_d16_owned_for_terminal(ctx);
+    let _ = drop_d16_owned_for_terminal(ctx, close_direction, close_reason);
     tcp_diag_log!(
         "🔎 tcp-handle-close handle={:?} direction={} reason={} state={:?} pending={} pending_high={} remote_to_global_rx_bytes={} terminal_late_remote_payload_bytes={} terminal_late_remote_payload_events={} flush_attempts={} no_send_capacity={} send_window_samples={} send_capacity_min={} send_capacity_max={} send_queue_max={} recv_queue_max={} may_send_false={} may_recv_false={} no_send_capacity_streak_max={} no_send_capacity_pending_max={} send_slice_calls={} send_slice_accepted={} actor_admitted_bytes={} actor_bypass_admitted_bytes={} permit_terminal_drop_bytes={} permit_terminal_drop_events={} send_slice_zero={} send_slice_errors={} budget_limited_calls={} headroom_limited_calls={} headroom_deferred_bytes={} drain_credit_granted_bytes={} drain_credit_planned_bytes={} drain_credit_used_bytes={} drop_credit_debt_bytes={} drop_credit_debt_paid_bytes={} drop_credit_blocked_bytes={} pressure_credit_debt_bytes={} pressure_credit_debt_paid_bytes={} pressure_credit_blocked_bytes={} hard_edge_guard_bytes={} hard_edge_guard_limited_calls={} hard_edge_guard_deferred_bytes={} send_slice_max_accepted={} tun_flush_tx_calls={} tun_flush_tx_failures={} tun_flush_deferred={} close_pending_class={} close_pending_bytes={} terminal_pending_reap_bytes=0 close_egress_class=unknown close_egress_bytes=0 close_egress_drain_candidate=false",
         handle,
@@ -12896,9 +12919,17 @@ async fn run_relay_d16(
                     }
                     Some(RelayWriterSignal::Closed { direction, reason }) => {
                         writer_done = true;
-                        if reason == "local_channel_closed" && queue.snapshot_now().closed {
-                            if reader_done {
-                                break None;
+                        if reason == "local_channel_closed" {
+                            let queue_snapshot = queue.snapshot_now();
+                            if let Some(cause) = queue_snapshot.closure.terminal_cause() {
+                                break Some((cause.direction, cause.reason));
+                            }
+                            if queue_snapshot.closure.is_closed() {
+                                if reader_done {
+                                    break None;
+                                }
+                            } else {
+                                break Some((direction, reason));
                             }
                         } else {
                             break Some((direction, reason));
@@ -12931,6 +12962,11 @@ async fn run_relay_d16(
         }
     };
 
+    if let Some((direction, reason)) = terminal_error {
+        let _ = queue
+            .close_for_terminal_and_mark_ready(direction, reason)
+            .await;
+    }
     let _ = reader_stop_tx.send(());
     if terminal_error.is_some() && !reader_done {
         if tokio::time::timeout(RELAY_WRITER_STOP_TIMEOUT, &mut reader_task)
@@ -12944,10 +12980,6 @@ async fn run_relay_d16(
     }
 
     if let Some((direction, reason)) = terminal_error {
-        let should_wake = queue.close_and_mark_ready().await;
-        if should_wake {
-            let _ = send_d16_data_ready(handle, epoch, &back_tx).await;
-        }
         let _ = back_tx
             .send((
                 handle,
@@ -12990,7 +13022,7 @@ async fn run_relay_d16(
         queue_snapshot.queued_bytes,
         queue_snapshot.leased_bytes,
         queue_snapshot.reserved_bytes,
-        queue_snapshot.closed,
+        queue_snapshot.closure.is_closed(),
     );
 }
 
@@ -13009,13 +13041,17 @@ async fn run_d16_native_reader(
         if read_credit.paused || read_credit.max_batch_bytes == 0 {
             let update = tokio::select! {
                 _ = &mut stop_rx => {
-                    queue.close().await;
+                    queue
+                        .close_for_terminal_and_mark_ready("local_to_remote", "reader_stopped")
+                        .await;
                     return;
                 }
                 update = read_credit_rx.changed() => update,
             };
             if update.is_err() {
-                queue.close().await;
+                queue
+                    .close_for_terminal_and_mark_ready("local_to_remote", "read_credit_closed")
+                    .await;
                 return;
             }
             read_credit = *read_credit_rx.borrow_and_update();
@@ -13024,12 +13060,19 @@ async fn run_d16_native_reader(
 
         let reservation = tokio::select! {
             _ = &mut stop_rx => {
-                queue.close().await;
+                queue
+                    .close_for_terminal_and_mark_ready("local_to_remote", "reader_stopped")
+                    .await;
                 return;
             }
             update = read_credit_rx.changed() => {
                 if update.is_err() {
-                    queue.close().await;
+                    queue
+                        .close_for_terminal_and_mark_ready(
+                            "local_to_remote",
+                            "read_credit_closed",
+                        )
+                        .await;
                     return;
                 }
                 read_credit = *read_credit_rx.borrow_and_update();
@@ -13051,13 +13094,20 @@ async fn run_d16_native_reader(
         let chunk = tokio::select! {
             _ = &mut stop_rx => {
                 drop(reservation);
-                queue.close().await;
+                queue
+                    .close_for_terminal_and_mark_ready("local_to_remote", "reader_stopped")
+                    .await;
                 return;
             }
             update = read_credit_rx.changed() => {
                 drop(reservation);
                 if update.is_err() {
-                    queue.close().await;
+                    queue
+                        .close_for_terminal_and_mark_ready(
+                            "local_to_remote",
+                            "read_credit_closed",
+                        )
+                        .await;
                     return;
                 }
                 read_credit = *read_credit_rx.borrow_and_update();
@@ -13072,12 +13122,22 @@ async fn run_d16_native_reader(
                         let _ = activity_tx.try_send(());
                     }
                     if should_wake && !send_d16_data_ready(handle, epoch, &back_tx).await {
-                        queue.close().await;
+                        queue
+                            .close_for_terminal_and_mark_ready(
+                                "remote_to_local",
+                                "global_rx_closed",
+                            )
+                            .await;
                         return;
                     }
                 }
                 Err(_) => {
-                    let should_wake = queue.close_and_mark_ready().await;
+                    let should_wake = queue
+                        .close_for_terminal_and_mark_ready(
+                            "remote_to_local",
+                            "d16_queue_commit_failed",
+                        )
+                        .await;
                     if should_wake {
                         let _ = send_d16_data_ready(handle, epoch, &back_tx).await;
                     }
@@ -13096,7 +13156,7 @@ async fn run_d16_native_reader(
             },
             Ok(None) => {
                 drop(reservation);
-                let should_wake = queue.close_and_mark_ready().await;
+                let should_wake = queue.close_for_remote_eof_and_mark_ready().await;
                 if should_wake {
                     let _ = send_d16_data_ready(handle, epoch, &back_tx).await;
                 }
@@ -13104,7 +13164,9 @@ async fn run_d16_native_reader(
             }
             Err(_) => {
                 drop(reservation);
-                let should_wake = queue.close_and_mark_ready().await;
+                let should_wake = queue
+                    .close_for_terminal_and_mark_ready("remote_to_local", "remote_read_failed")
+                    .await;
                 if should_wake {
                     let _ = send_d16_data_ready(handle, epoch, &back_tx).await;
                 }
@@ -18670,7 +18732,7 @@ mod tests {
         let receiver_mbps = received as f64 * 8.0 / elapsed.as_secs_f64() / 1_000_000.0;
 
         assert_eq!(received, PAYLOAD_BYTES);
-        assert!(queue.snapshot_now().closed);
+        assert!(queue.snapshot_now().closure.is_closed());
         assert_eq!(queue.snapshot_now().owned_bytes(), 0);
         assert!(
             receiver_mbps >= 170.0,
@@ -18727,7 +18789,7 @@ mod tests {
         );
 
         tokio::time::timeout(std::time::Duration::from_millis(200), async {
-            while !queue.snapshot_now().closed {
+            while !queue.snapshot_now().closure.is_closed() {
                 tokio::task::yield_now().await;
             }
         })
@@ -18791,7 +18853,7 @@ mod tests {
 
         uplink_tx.send(RelayCommand::Data(vec![1])).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_millis(200), async {
-            while !queue.snapshot_now().closed {
+            while !queue.snapshot_now().closure.is_closed() {
                 tokio::task::yield_now().await;
             }
         })
@@ -18801,6 +18863,13 @@ mod tests {
             queue.snapshot_now().reserved_bytes,
             0,
             "terminal publication must wait for pending-read RAII refund"
+        );
+        assert_eq!(
+            queue.snapshot_now().closure.terminal_cause(),
+            Some(crate::tcp_downlink_pump::LeasedByteQueueTerminalCause {
+                direction: "local_to_remote",
+                reason: "remote_write_failed",
+            })
         );
 
         assert!(matches!(
@@ -18814,6 +18883,44 @@ mod tests {
             }))) if h == handle
         ));
         task.await.unwrap();
+        assert!(back_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn d16_local_terminal_cause_survives_writer_shutdown() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let reader: NativeTcpReadHalf = Box::new(BurstNativeReader {
+            chunks: std::collections::VecDeque::new(),
+            eof_after_chunks: true,
+        });
+        let writer: NativeTcpWriteHalf = Box::new(NoopNativeWriter {
+            shutdown_called: Arc::new(AtomicBool::new(false)),
+        });
+        let queue = AsyncLeasedByteFlowQueue::new_with_release_mode(
+            D16_PER_FLOW_BYTE_CAPACITY,
+            DownstreamPermitReleaseMode::OnEgressDrain,
+        )
+        .unwrap();
+        queue.close_and_drop_queued_for_terminal("local_to_remote", "local_socket_terminal");
+        let (uplink_tx, uplink_rx) = mpsc::channel::<RelayCommand>(1);
+        let (back_tx, mut back_rx) = mpsc::channel(1);
+        let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit::initial());
+        drop(uplink_tx);
+
+        run_relay_d16(
+            handle, 24, reader, writer, uplink_rx, back_tx, credit_rx, queue,
+        )
+        .await;
+
+        assert!(matches!(
+            back_rx.recv().await,
+            Some((h, RelayEvent::Closed(RelayClose {
+                epoch: 24,
+                direction: "local_to_remote",
+                reason: "local_socket_terminal",
+            }))) if h == handle
+        ));
         assert!(back_rx.try_recv().is_err());
     }
 
@@ -18875,7 +18982,8 @@ mod tests {
         assert!(drained.queue_closed);
         assert_eq!(ctx.downlink_pending.len(), 64 * 1024);
         let snapshot = queue.snapshot().await;
-        assert!(snapshot.closed);
+        assert!(snapshot.closure.is_closed());
+        assert_eq!(snapshot.closure.terminal_cause(), None);
         assert_eq!(snapshot.queued_bytes, 0);
         assert_eq!(snapshot.leased_bytes, 64 * 1024);
         assert_eq!(snapshot.reserved_bytes, 0);
@@ -18890,7 +18998,7 @@ mod tests {
         .unwrap();
         let reservation = queue.reserve_read_up_to(64 * 1024).await.unwrap();
         reservation.commit(Bytes::from(vec![3; 64 * 1024])).unwrap();
-        queue.close_and_mark_ready().await;
+        queue.close_for_remote_eof_and_mark_ready().await;
         let mut ctx = SocketCtx::new(443);
         ctx.conn_epoch = 12;
         ctx.d16_downlink_queue = Some(queue.clone());
@@ -18933,7 +19041,7 @@ mod tests {
         .unwrap();
         let reservation = queue.reserve_read_up_to(64 * 1024).await.unwrap();
         reservation.commit(Bytes::from(vec![4; 64 * 1024])).unwrap();
-        queue.close_and_mark_ready().await;
+        queue.close_for_remote_eof_and_mark_ready().await;
         let mut ctx = SocketCtx::new(443);
         ctx.conn_epoch = 14;
         ctx.d16_downlink_queue = Some(queue.clone());
@@ -19033,21 +19141,72 @@ mod tests {
         assert_eq!(ctx.downlink_inflight_permit_bytes(), 32 * 1024);
         assert_eq!(queue.snapshot_now().owned_bytes(), 128 * 1024);
 
-        let dropped = drop_d16_owned_for_terminal(&mut ctx);
+        let dropped =
+            drop_d16_owned_for_terminal(&mut ctx, "local_to_remote", "local_socket_terminal");
         assert_eq!(dropped, 128 * 1024);
         assert!(ctx.downlink_pending.is_empty());
         assert_eq!(ctx.downlink_inflight_permit_bytes(), 0);
         let snapshot = queue.snapshot_now();
-        assert!(snapshot.closed);
+        assert!(snapshot.closure.is_closed());
         assert_eq!(snapshot.queued_bytes, 0);
         assert_eq!(snapshot.leased_bytes, 0);
         assert_eq!(snapshot.reserved_bytes, 0);
         assert_eq!(ctx.downlink_diag.permit_terminal_drop_bytes, 128 * 1024);
         assert_eq!(ctx.downlink_diag.permit_terminal_drop_events, 1);
 
-        assert_eq!(drop_d16_owned_for_terminal(&mut ctx), 0);
+        assert_eq!(
+            drop_d16_owned_for_terminal(&mut ctx, "local_to_remote", "local_socket_terminal",),
+            0
+        );
         assert_eq!(ctx.downlink_diag.permit_terminal_drop_bytes, 128 * 1024);
         assert_eq!(ctx.downlink_diag.permit_terminal_drop_events, 1);
+    }
+
+    #[tokio::test]
+    async fn d16_terminal_socket_rearm_preserves_local_terminal_cause() {
+        let queue = AsyncLeasedByteFlowQueue::new_with_release_mode(
+            D16_PER_FLOW_BYTE_CAPACITY,
+            DownstreamPermitReleaseMode::OnEgressDrain,
+        )
+        .unwrap();
+        let reservation = queue
+            .reserve_read_up_to(D16_PER_FLOW_BYTE_CAPACITY)
+            .await
+            .unwrap();
+        reservation
+            .commit(Bytes::from(vec![9; D16_PER_FLOW_BYTE_CAPACITY]))
+            .unwrap();
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(build_listener_socket(&ListenerSpec { local_port: 443 }));
+        sockets.get_mut::<TcpSocket>(handle).abort();
+        let snapshot = SocketCloseSnapshot::from_socket(sockets.get::<TcpSocket>(handle));
+        let mut ctx = SocketCtx::new(443);
+        ctx.state = SocketState::Relaying;
+        ctx.d16_downlink_queue = Some(queue.clone());
+        let mut pool = FakeIpPool::new();
+
+        rearm_socket_with_reason_and_snapshot(
+            handle,
+            sockets.get_mut::<TcpSocket>(handle),
+            &mut ctx,
+            &mut pool,
+            20,
+            "local",
+            "dead_slot_reap",
+            Some(snapshot),
+        );
+
+        let queue_snapshot = queue.snapshot_now();
+        assert_eq!(
+            queue_snapshot.closure.terminal_cause(),
+            Some(crate::tcp_downlink_pump::LeasedByteQueueTerminalCause {
+                direction: "local_to_remote",
+                reason: "local_socket_terminal",
+            })
+        );
+        assert_eq!(queue_snapshot.queued_bytes, 0);
+        assert_eq!(ctx.downlink_diag.permit_terminal_drop_bytes, 0);
+        assert!(ctx.d16_downlink_queue.is_none());
     }
 
     #[tokio::test]
@@ -19066,7 +19225,7 @@ mod tests {
         let mut socket = build_listener_socket(&ListenerSpec { local_port: 443 });
         let mut pool = FakeIpPool::new();
 
-        let _ = drop_d16_owned_for_terminal(&mut ctx);
+        let _ = drop_d16_owned_for_terminal(&mut ctx, "local_to_remote", "test_rearm");
         rearm_socket(&mut socket, &mut ctx, &mut pool, 1);
 
         assert_eq!(ctx.conn_epoch, 22);
@@ -19075,7 +19234,7 @@ mod tests {
         assert!(!d16_data_ready_matches_ctx(&ctx, 21));
         assert!(!d16_data_ready_matches_ctx(&ctx, 22));
         let snapshot = queue.snapshot_now();
-        assert!(snapshot.closed);
+        assert!(snapshot.closure.is_closed());
         assert_eq!(snapshot.queued_bytes, 0);
         assert_eq!(snapshot.leased_bytes, 0);
         assert_eq!(snapshot.reserved_bytes, 0);
@@ -19778,13 +19937,7 @@ mod tests {
         }
         // idle_listen 槽：空闲监听（ctx.state 默认 Listening）→ 不该被回收。
 
-        let reaped = reap_dead_slots(
-            &reg,
-            &mut sockets,
-            &mut ctxs,
-            &mut pool,
-            1,
-        );
+        let reaped = reap_dead_slots(&reg, &mut sockets, &mut ctxs, &mut pool, 1);
         assert_eq!(reaped, 1, "只回收 1 个死槽");
         let dead_ctx = ctxs.get(&dead).unwrap();
         assert_eq!(dead_ctx.state, SocketState::Listening, "死槽回 Listening");
@@ -20632,13 +20785,7 @@ mod tests {
         }
         sockets.get_mut::<TcpSocket>(closed_pending).abort();
 
-        let reaped = reap_dead_slots(
-            &reg,
-            &mut sockets,
-            &mut ctxs,
-            &mut pool,
-            1,
-        );
+        let reaped = reap_dead_slots(&reg, &mut sockets, &mut ctxs, &mut pool, 1);
         assert_eq!(reaped, 1, "应回收本地已关闭的 async-open 槽");
 
         let closed_ctx = ctxs.get(&closed_pending).unwrap();
