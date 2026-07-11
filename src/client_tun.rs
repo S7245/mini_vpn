@@ -13100,6 +13100,7 @@ async fn run_d16_native_reader(
                 return;
             }
             update = read_credit_rx.changed() => {
+                remote_reader.as_mut().cancel_pending_read();
                 drop(reservation);
                 if update.is_err() {
                     queue
@@ -15040,6 +15041,7 @@ mod tests {
 
     struct PendingD16NativeReader {
         entered: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
     }
 
     impl NativeTcpReader for PendingD16NativeReader {
@@ -15050,6 +15052,10 @@ mod tests {
         ) -> Poll<std::io::Result<Option<NativeTcpChunk>>> {
             self.entered.store(true, Ordering::SeqCst);
             Poll::Pending
+        }
+
+        fn cancel_pending_read(&mut self) {
+            self.cancelled.store(true, Ordering::SeqCst);
         }
     }
 
@@ -18524,8 +18530,10 @@ mod tests {
         let mut sockets = SocketSet::new(vec![]);
         let handle = mk_test_handle(&mut sockets);
         let entered = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
         let reader: NativeTcpReadHalf = Box::new(PendingD16NativeReader {
             entered: entered.clone(),
+            cancelled: cancelled.clone(),
         });
         let queue = AsyncLeasedByteFlowQueue::new_with_release_mode(
             128 * 1024,
@@ -18571,6 +18579,10 @@ mod tests {
         })
         .await
         .expect("pause must cancel the pending read and refund its reservation");
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "pause must release transport staging together with the read reservation"
+        );
         assert!(back_rx.try_recv().is_err());
 
         let _ = stop_tx.send(());
@@ -18814,8 +18826,10 @@ mod tests {
         let mut sockets = SocketSet::new(vec![]);
         let handle = mk_test_handle(&mut sockets);
         let entered = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
         let reader: NativeTcpReadHalf = Box::new(PendingD16NativeReader {
             entered: entered.clone(),
+            cancelled,
         });
         let writer: NativeTcpWriteHalf = Box::new(FailingWriteStream {
             shutdown_called: Arc::new(AtomicBool::new(false)),

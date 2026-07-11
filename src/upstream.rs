@@ -34,6 +34,11 @@ pub trait NativeTcpReader: Unpin + Send {
         cx: &mut Context<'_>,
         max_len: usize,
     ) -> Poll<io::Result<Option<NativeTcpChunk>>>;
+
+    /// Release any empty transport staging retained by a pending read when
+    /// the caller cancels that read before it completes. Readers without
+    /// transport-owned staging need no special action.
+    fn cancel_pending_read(&mut self) {}
 }
 
 pub type NativeTcpReadHalf = Box<dyn NativeTcpReader>;
