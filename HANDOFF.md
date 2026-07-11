@@ -93,6 +93,25 @@ This section overrides the older G7/G8/GV next-step text below.
   many zero-rate seconds. Gate A and Gate B were not run. Do not repeat this
   unchanged control until an independent external-window change occurs. Result:
   `docs/tech/2026-07-11-knife14h10d16-versioned-control-results.md`.
+- A bilateral capture and role-reversal review then isolated the incapable
+  window to the `.33` sing-box/TUIC service itself: both captures had identical
+  packet timing, and reversing `.27/.77` roles through `.33` remained slow.
+  A temporary same-version TUIC Exit on `.77` restored the mature control to
+  `163.786 Mbit/s` receiver and unlocked the one authorized Gate A.
+- The clean `5884ac0` safe1200 Gate A reached `187/183 Mbit/s` sender/receiver
+  with stable sub-second read service, TUN drops `0`, actor bypass `0`, and
+  clean QUIC loss/blocking surfaces. It still failed the literal tail gate:
+  the iperf data peer reset directly from `Established` to `Closed` at 20s
+  while the D16 reservoir held exactly `524288B` and smoltcp held `27840B`
+  unacknowledged. This was local abort, not remote EOF; the control flow closed
+  cleanly. Code review also found that the exact terminal drop is recorded but
+  the relay summary incorrectly reports `clean_queue_lifecycle`.
+- Do not tune the 170M architecture from this result. The proposed next stage
+  is a TDD local-reset reason/accounting fix plus separate capacity and
+  EOF-terminated clean-close evidence. This changes the strict Gate A evidence
+  shape and therefore awaits explicit approval before code/spec edits. Gate B
+  remains frozen. Result:
+  `docs/tech/2026-07-11-knife14h10d16-alternate-exit-gate-a-results.md`.
 - A future Gate A remains one clean focused run above `150 Mbit/s`; Gate B is
   three clean repeats with a median target of `170 Mbit/s` and a same-window
   sing-box parity fallback.

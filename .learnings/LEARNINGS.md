@@ -5799,3 +5799,42 @@ worth cleaning up separately.
 - Reusable rule: when a versioned mature client fails with healthy direct legs,
   correct routes, full socket buffers, and zero drops, do not use mini_vpn VPS
   acceptance as a diagnostic and do not modify the local egress architecture.
+
+## 2026-07-11 - Alternate Exit separates service incapability from D16 capacity
+
+- Bilateral captures of the slow mature control had identical packet counts,
+  byte counts, per-second bins, and long gaps on the Exit and client. The Exit
+  itself stopped emitting; the network path did not transform continuous
+  traffic into bursts.
+- Reversing the client and target roles through the same `.33` TUIC service
+  remained slow, while the direct reverse path was above `229 Mbit/s`.
+  Disabling GSO worsened the control and Cubic improved it only to `36.752
+  Mbit/s`; those were discriminators, not fixes.
+- A temporary same-version Exit on `.77` moved the mature control to `163.786
+  Mbit/s` receiver. The clean safe1200 mini_vpn run then reached `183 Mbit/s`
+  receiver with zero TUN drop, actor bypass, send/flush error, and QUIC
+  loss/blocking evidence.
+- Reusable rule: when an Exit-service failure survives role reversal and is
+  visible in the server-side emission trace, replace/rebuild the Exit service
+  before changing the client architecture.
+
+## 2026-07-11 - Timed capacity abort is not a clean EOF proof
+
+- At the 20-second iperf boundary, the data socket changed directly from
+  `Established` to terminal `Closed`; the control socket independently followed
+  clean remote EOF. The data flow therefore ended by local reset/abort, not by
+  the D16 remote-EOF contract.
+- The remote-reader surplus was exactly the full `524288B` bounded reservoir,
+  and the smoltcp tail was one `27840B` maximum actor batch. The first value
+  equaled remote `rx_bytes - actor_admitted_bytes`, proving exact byte-ledger
+  accounting rather than an unexplained leak.
+- A TCP socket that has processed peer RST and entered `Closed` cannot deliver
+  its reservoir or unacknowledged send queue. Shrinking buffers can reduce the
+  number but cannot turn abort into graceful drain without sacrificing the
+  architecture's independent read capacity.
+- Reusable rule: use a timed/abort-capable flow for steady-state capacity and an
+  EOF-terminated finite flow for zero-tail lifecycle. If one strict gate needs
+  both properties, its traffic generator itself must guarantee graceful EOF.
+- The terminal path must preserve one explicit reason through queue cleanup and
+  relay supervision; exact byte counts paired with
+  `clean_queue_lifecycle` are insufficient observability.

@@ -93,6 +93,30 @@ control, restart services, or change mini_vpn until an independent external
 window change provides a new discriminator. Result:
 `docs/tech/2026-07-11-knife14h10d16-versioned-control-results.md`.
 
+An alternate-Exit discriminator has now removed the shared external blocker.
+Bilateral packet capture and role reversal showed that `.33` itself stopped
+emitting during the mature-client gaps. A temporary same-version TUIC Exit on
+`.77` produced a `163.786 Mbit/s` mature receiver and unlocked the one
+authorized Gate A. Clean source `5884ac0` then reached `187/183 Mbit/s`
+sender/receiver under the exact safe1200 profile with TUN drops, actor bypass,
+send/flush errors, QUIC loss/congestion/blocking, and terminal pending reap all
+at zero.
+
+The literal Gate A still failed close-tail: at the timed iperf boundary the
+data socket moved directly from `Established` to terminal `Closed` before data
+remote EOF, leaving an exact `524288B` owned reservoir and `27840B` smoltcp
+send queue. The ledger bounded and released the bytes once, but the relay
+summary lost the terminal reason and mislabeled the lifecycle clean. Gate B
+remains frozen.
+
+The proposed next task requires approval because it corrects the acceptance
+contract rather than tuning capacity: add a RED local-reset ownership test,
+preserve the explicit terminal reason through queue/relay teardown, and split
+the timed capacity proof from an EOF-terminated clean-close proof. Do not try
+to drain bytes into an already `Closed` socket, shrink the reservoir to hide
+the terminal edge, or restart MTU/QUIC/pool/chunk/self-wake work. Result:
+`docs/tech/2026-07-11-knife14h10d16-alternate-exit-gate-a-results.md`.
+
 Knife14fp found a mandatory high-throughput prerequisite: the exit VPS `.33`
 had Linux socket buffer caps/defaults of only `212992B`, which capped both
 mini_vpn and a mature sing-box client around the `20-30 Mbit/s` band. `.33` is

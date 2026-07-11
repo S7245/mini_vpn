@@ -3799,3 +3799,30 @@ active root unless it repeats.
 - Correct behavior: treat the window as shared TUIC incapability, keep Gate A/B
   unspent, and do not repeat the unchanged control until independent external
   state has changed.
+
+## 2026-07-11 - Gate A mixed a timed peer reset with a zero-tail EOF assertion
+
+- Symptom: the alternate-Exit Gate A passed capacity at `183 Mbit/s` receiver
+  with zero TUN/QUIC/actor errors, but reported `524288B` terminal owned bytes
+  and `27840B` terminal smoltcp egress.
+- Root cause: the iperf data socket moved directly from `Established` to
+  `Closed` at its 20-second time boundary before the data TUIC stream observed
+  remote EOF. The peer abort made both remaining reservoirs undeliverable; a
+  later wait cannot drain an already terminal TCP socket.
+- Correct behavior: do not repair this by changing MTU, read chunk, queue cap,
+  pool, QUIC windows, or egress pacing. First preserve the local terminal cause
+  and its exact accounting. Then prove capacity with the timed flow and clean
+  EOF with an EOF-terminated flow, or replace the strict gate's generator with
+  one that guarantees EOF.
+
+## 2026-07-11 - Sudo producer did not make outer FIFO redirection privileged
+
+- Symptom: a transient Exit A/B failed before startup because an unprivileged
+  shell could not redirect configuration into a root-owned mode-0600 FIFO,
+  even though the producer command itself used `sudo`.
+- Root cause: the calling shell opens `>` before executing the elevated
+  producer; privilege does not apply retroactively to the redirection.
+- Correct behavior: create the FIFO with the writer's owner and mode `0600`, or
+  perform the redirection inside an explicitly elevated shell. Keep all
+  cleanup idempotent and verify the original service is restored after failed
+  transient starts.
