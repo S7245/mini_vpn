@@ -92,12 +92,44 @@ the active `.33` sing-box service followed by the same mature control. Repeating
 the unchanged low control or editing D16 code has no additional diagnostic
 value.
 
+## Restart and MTU Follow-Up
+
+The Exit service restart was completed. The service returned active with its
+persistent socket-buffer configuration unchanged. Post-restart sequential
+direct reverse baselines were `216.381 Mbit/s` from `.27` and
+`218.688 Mbit/s` from `.33`.
+
+The post-restart MTU1200 mature control improved, but remained below the floor:
+
+- sender: `20.602 Mbit/s`;
+- receiver: `17.301 Mbit/s`;
+- client and server UDP socket buffers: `16 MiB`;
+- socket drop: `0`;
+- shape: burst/idle with repeated zero intervals.
+
+Because the historical `185.242 Mbit/s` control used TUN MTU1500, the exact
+control-side MTU difference was tested once. It reached only `5.137 Mbit/s`
+sender and `3.146 Mbit/s` receiver, with the same correct route, `16 MiB`
+buffers, and drop `0`. MTU is therefore rejected as the current root.
+
+The Exit service log showed normal TUIC accepts and direct target connections,
+without authentication or target-connect errors. Bidirectional 100-packet ICMP
+checks between `.27` and `.33` both had `0%` packet loss, with average RTT
+`0.515ms` toward `.27` and `0.479ms` toward `.33`.
+
+The remaining condition is specific to the current TUIC/QUIC single-stream
+service window. Gate A remains unspent. No further VPS, CC, MTU, QUIC-window,
+pool, chunk, self-wake, or D16 architecture adjustment is justified by this
+window.
+
 Remote artifacts:
 
 ```text
 /tmp/mini_vpn_h10d16_same_window_control/
 /tmp/mini_vpn_h10d16_same_window_control_retry/
 /tmp/mini_vpn_h10d16_same_window_control_window2/
+/tmp/mini_vpn_h10d16_same_window_control_after_restart/
+/tmp/mini_vpn_h10d16_same_window_control_after_restart_mtu1500/
 ```
 
 ## Decision

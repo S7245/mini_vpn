@@ -66,9 +66,15 @@ This section overrides the older G7/G8/GV next-step text below.
   clients, so no post-`1bf1f78` Gate A and no Gate B has run.
 - Current result:
   `docs/tech/2026-07-10-knife14h10d16-real-quinn-local-and-control-results.md`.
-- Next stage: after explicit approval, restart `.33` sing-box once and rerun the
-  same-window mature control. Require reverse P1 above `150 Mbit/s` without
-  changing D16 architecture. Only then deploy `1bf1f78`
+- `.33` sing-box was restarted once under the persistent high-buffer settings.
+  The next MTU1200 control improved only to `17.301 Mbit/s`; an MTU1500 A/B was
+  worse at `3.146 Mbit/s`. Client/server UDP sockets remained `16 MiB` with
+  drop `0`, service logs showed normal opens, and bidirectional 100-packet ICMP
+  checks had `0%` loss at about `0.5ms`. Restart and MTU are rejected as
+  sufficient explanations.
+- Next stage: wait for a genuinely new external TUIC service window and rerun
+  one mature control. Require reverse P1 above `150 Mbit/s` without changing
+  D16 architecture or VPS parameters. Only then deploy `1bf1f78`
   from an isolated worktree and spend one `20s` reverse-first P1 Gate A. Keep
   Gate B frozen until Gate A is clean.
 - A future Gate A remains one clean focused run above `150 Mbit/s`; Gate B is

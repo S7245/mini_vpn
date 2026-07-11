@@ -5673,7 +5673,7 @@ worth cleaning up separately.
   `217 Mbit/s` from the client and `219 Mbit/s` from the exit to the target.
 - A calibrated sing-box TUIC control used the intended target-only TUN route,
   kept the exit route on `eth0`, obtained `16 MiB` client UDP buffers, and
-  recorded socket drop `0`, but delivered only `1.363 Mbit/s`. An earlier
+  recorded socket drop `0`, but delivered only `1.363 Mbit/s`. Earlier
   calibrated controls in the same investigation delivered `14.207 Mbit/s` and
   `1.182 Mbit/s`. All had burst/idle one-second intervals.
 - Because the mature client failed the same TUIC window while both direct legs
@@ -5682,3 +5682,21 @@ worth cleaning up separately.
 - Reusable rule: before spending a scarce performance acceptance, require the
   same-window mature control to exceed the acceptance floor with comparable
   socket buffers and zero drops. Direct leg capacity alone is insufficient.
+
+## 2026-07-10 - Exit restart and control MTU did not restore the TUIC window
+
+- Restarting `.33` sing-box under the persistent high-buffer configuration
+  improved the MTU1200 mature control only from the `1 Mbit/s` band to
+  `17.301 Mbit/s`. The server remained active and its UDP socket was `16 MiB`
+  with drop `0`.
+- Historical `185.242 Mbit/s` mature evidence used TUN MTU1500, but restoring
+  that control shape reached only `3.146 Mbit/s`; MTU was therefore not the
+  active discriminator in this window.
+- Sequential direct TCP baselines stayed above `216 Mbit/s`. Bidirectional
+  100-packet ICMP checks between `.27` and `.33` had `0%` loss and roughly
+  `0.5ms` RTT, while TUIC remained burst/idle. Service logs showed normal TUIC
+  accepts and direct target opens, with no auth or connect failure.
+- Reusable rule: once restart, MTU, socket buffers, service logs, direct legs,
+  and basic path loss are clean but the mature TUIC client is still burst/idle,
+  classify the acceptance window as externally incapable. Do not spend the
+  one-shot product gate or keep changing architecture and VPS parameters.
