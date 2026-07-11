@@ -5746,3 +5746,22 @@ worth cleaning up separately.
 - Reusable rule: record identity and verify runtime behavior in the artifact;
   a Git commit name alone cannot prove which binary and runner produced a
   performance result.
+
+## 2026-07-11 - Make the mature control a fail-closed, secret-free gate
+
+- R3 adds a versioned sing-box control with the historical MTU1500, one-flow,
+  20-second reverse shape. It asserts target-only routing, the excluded Exit
+  route, client and Exit UDP buffer/drop evidence, and a strict receiver floor
+  above `150 Mbit/s`.
+- TUIC configuration is rendered only into a mode-0600 FIFO. Cleanup removes
+  the FIFO/TUN and restores all four temporary socket sysctls; artifact scanning
+  deletes the bundle if credential material is ever detected. An incapable
+  window returns a distinct nonzero status so automation cannot accidentally
+  continue to Gate A.
+- Code review caught a restoration-order bug: lowering `rmem_max/wmem_max`
+  before restoring their defaults could leave the temporary maxima behind.
+  Cleanup now restores defaults before maxima and signal handling funnels
+  through one idempotent EXIT path.
+- Reusable rule: capability controls should fail closed and restore dependency
+  order in reverse; operational cleanup is part of the gate contract, not an
+  afterthought.
