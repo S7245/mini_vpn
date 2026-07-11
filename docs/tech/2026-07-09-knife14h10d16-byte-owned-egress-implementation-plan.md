@@ -1065,6 +1065,85 @@ metrics, script, and historical-result diffs remained unstaged. The next remote
 step is still exactly one strict Gate A; no Gate B run is authorized by this
 commit.
 
+### Task 11B: Preserve Terminal Cause And Make Gate A Evidence Feasible
+
+This task follows the alternate-Exit capacity run. It does not change the D16
+reservoir, actor quantum, readiness model, DrainOnly recovery, or EOF ordering.
+It corrects one lifecycle-observability defect and replaces an impossible
+same-socket acceptance assertion with two traffic-shaped subproofs under one
+AND gate.
+
+**Files:**
+- Modify: `src/tcp_downlink_pump.rs`, `src/client_tun.rs`
+- Modify: `scripts/knife14b-lowrtt-probe.sh`,
+  `scripts/knife14b-usclient-tunnel-suite.sh`
+- Modify: this plan, the D16 architecture spec, `TODO.md`, `HANDOFF.md`
+- Update: `.learnings/LEARNINGS.md`, `.learnings/ERRORS.md`
+
+- [x] **Step 1: RED — preserve a local terminal cause across teardown**
+
+Add focused tests where a local socket becomes terminal while D16 owns bytes.
+Require the first terminal direction/reason to survive queue cleanup, reader
+shutdown, writer-channel closure, and relay `Closed` publication. Require
+one-shot ownership release and no later cause overwrite.
+
+- [x] **Step 2: GREEN — model closure explicitly**
+
+Replace the ambiguous leased-queue boolean with:
+
+```text
+Open | RemoteEof | Terminal(direction, reason)
+```
+
+Keep remote EOF drain semantics unchanged. Classify an inactive smoltcp
+`Closed`/`!can_send` rearm as
+`local_to_remote/local_socket_terminal`. Do not publish a payload readiness
+event solely because a terminal close woke internal queue waiters.
+
+- [x] **Step 3: Remove dead lifecycle plumbing**
+
+Remove unused reaper backpressure/close-guard parameters and the duplicate
+low-level terminal-drop call. Keep terminal ownership cleanup at one explicit
+rearm boundary.
+
+- [x] **Step 4: RED/GREEN — version terminal classification and fixed-byte TCP**
+
+Extend the versioned lifecycle summary to count clean D16 closes,
+`local_socket_terminal`, and every other terminal cause separately. Add an
+optional `IPERF_BYTES` mode to the low-RTT runner and a
+`RUN_D16_EOF_CLOSE_PROBE=1`, `D16_EOF_CLOSE_BYTES=64M` suite mode. The suite
+runs the fixed-byte reverse probe only after the timed capacity flow becomes
+quiet and emits an isolated final lifecycle window.
+
+- [x] **Step 5: Local regression and review**
+
+Focused RED/GREEN tests, default library `588/588`, harness library `597/597`,
+integration `2/2`, harness targets `10 passed/4 ignored`, default/harness
+checks, focused rustfmt, diff-check, and both runner self-tests passed. Strict
+`clippy -D warnings` remains red on 13 pre-existing lint sites under the current
+toolchain; no new warning points at the terminal-state change.
+
+Review conclusion: D16 has not drifted from byte ownership or actor
+exclusivity. Queue-cap, chunk, MTU, QUIC-window, self-wake, and actor cadence
+changes are rejected. Commits `879e904` and `7a7ca04` remove dead plumbing and
+preserve terminal cause respectively.
+
+- [ ] **Step 6: Run one composite Gate A on `.27`**
+
+Use one clean committed build, exact safe1200 D16 profile, one capable Exit
+window, and one tunnel process:
+
+1. A-capacity: `20s`, reverse-first P1, receiver `>150 Mbit/s`, zero TUN
+   drop/bypass/error, sub-second service gaps; only an exact bounded
+   `local_socket_terminal` is allowed at the timed boundary.
+2. Wait for the capacity flow to become quiet.
+3. A-clean: fixed `64 MiB`, reverse P1 using `iperf3 -n 64M -P 1 -R`; require
+   `clean_queue_lifecycle` and zero queue/pending/inflight/terminal-drop/
+   close-egress bytes.
+
+Gate A passes only if both subproofs pass. Any other terminal reason, mixed
+lifecycle window, TUN drop, or incomplete fixed-byte flow stops before Gate B.
+
 ### Task 12: Prove 170M Parity, Regress Product Paths, And Clean Experiments
 
 **Files:**
@@ -1080,12 +1159,15 @@ iperf3, or broad QUIC settings between control and mini_vpn runs.
 - [ ] **Step 2: Run three focused mini_vpn parity repeats**
 
 Use the same D16 Gate A profile and `20s` reverse-first P1 shape. Stop if a run
-produces TUN drops or terminal close bytes and analyze before continuing.
+produces TUN drops, an unclassified terminal cause, or non-exact terminal
+accounting. A timed `local_socket_terminal` at the generator boundary is
+reported separately from the fixed-byte clean-close proof.
 
 - [ ] **Step 3: Apply Gate B**
 
 Pass when every mini_vpn run exceeds `150 Mbit/s`, median is at least
-`170 Mbit/s`, and all tails are clean. If the same-window control is below
+`170 Mbit/s`, all terminal causes are classified/exact, and one fixed-byte
+clean-close repeat on the same build has a zero tail. If the same-window control is below
 `170 Mbit/s`, accept parity only when mini_vpn median is at least `90%` of the
 control and every run still exceeds `150 Mbit/s`.
 

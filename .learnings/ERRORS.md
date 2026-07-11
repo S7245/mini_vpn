@@ -3826,3 +3826,14 @@ active root unless it repeats.
   perform the redirection inside an explicitly elevated shell. Keep all
   cleanup idempotent and verify the original service is restored after failed
   transient starts.
+
+## 2026-07-11 - Current clippy adds baseline warnings outside the focused fix
+
+- Symptom: `cargo clippy -q --lib -- -D warnings` failed at 13 existing sites:
+  enum postfix naming, pre-existing functions with more than seven arguments,
+  and old min/max clamp forms. The terminal-state diff did not introduce a new
+  warning site.
+- Correct behavior: keep focused compile/tests/fmt/diff gates authoritative for
+  the D16 lifecycle fix, record strict clippy as repository/toolchain debt, and
+  do not mix a broad mechanical cleanup into overlapping user changes. Schedule
+  that cleanup as a separate coherent commit.

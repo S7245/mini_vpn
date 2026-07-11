@@ -109,12 +109,24 @@ send queue. The ledger bounded and released the bytes once, but the relay
 summary lost the terminal reason and mislabeled the lifecycle clean. Gate B
 remains frozen.
 
-The proposed next task requires approval because it corrects the acceptance
-contract rather than tuning capacity: add a RED local-reset ownership test,
-preserve the explicit terminal reason through queue/relay teardown, and split
-the timed capacity proof from an EOF-terminated clean-close proof. Do not try
-to drain bytes into an already `Closed` socket, shrink the reservoir to hide
-the terminal edge, or restart MTU/QUIC/pool/chunk/self-wake work. Result:
+The acceptance correction is now implemented and pushed. Commit `879e904`
+removed unused close-reap parameters and duplicate terminal cleanup. Commit
+`7a7ca04` replaces the ambiguous leased-queue close boolean with
+`Open / RemoteEof / Terminal(cause)`, preserves
+`local_to_remote/local_socket_terminal` through relay teardown, reports D16
+close-cause counts, and versions a fixed-byte reverse `iperf3 -n` mode. Default
+library `588/588`, harness library `597/597`, integration `2/2`, harness targets
+`10 passed/4 ignored`, focused formatting/checks, and both runner self-tests
+pass.
+
+The next task is one composite Gate A from a clean `.27` build and one capable
+Exit window: first the established `20s` reverse-first P1 must exceed
+`150 Mbit/s` with zero TUN/bypass/error and only exact bounded timed-terminal
+accounting; after it becomes quiet, one `64 MiB` fixed-byte reverse flow must
+close by remote EOF with `clean_queue_lifecycle` and every queue/tail counter
+zero. Both subproofs are an AND gate. Do not try to drain bytes into an already
+`Closed` socket, shrink the reservoir to hide the terminal edge, or restart
+MTU/QUIC/pool/chunk/self-wake work. Result:
 `docs/tech/2026-07-11-knife14h10d16-alternate-exit-gate-a-results.md`.
 
 Knife14fp found a mandatory high-throughput prerequisite: the exit VPS `.33`

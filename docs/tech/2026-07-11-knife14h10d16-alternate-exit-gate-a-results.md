@@ -123,7 +123,7 @@ same flow. The newly observed terminal edge makes the mismatch concrete: a
 steady-state throughput generator that aborts at its time boundary cannot also
 prove graceful EOF drain.
 
-## Proposed correction plan (awaiting approval)
+## Accepted correction and implementation
 
 1. RED: add a deterministic production-seam test for a local peer reset while
    one full D16 reservoir and one admitted batch are outstanding. Require exact
@@ -137,16 +137,17 @@ prove graceful EOF drain.
      TUN drop/bypass/error, and exact bounded accounting for any peer reset;
    - clean-close gate: an EOF-terminated finite reverse payload whose queue,
      pending, inflight, terminal-drop, and close-egress values must all be zero.
-4. Amend the architecture spec and versioned runner only after approval, then
-   run the focused local lifecycle tests, full D16 tests, checks, and review.
+4. Amend the architecture spec and versioned runner, then run the focused local
+   lifecycle tests, full D16 tests, checks, and review.
 5. Recreate the temporary alternate Exit only for the approved focused close
    proof or replacement acceptance. Gate B remains frozen until both capacity
    and clean-close evidence pass.
 
-If the single strict AND gate must remain unchanged, the alternative is to
-replace the timed iperf Gate A data flow with an EOF-terminated fixed-byte
-throughput generator. That preserves one gate but loses exact shape parity with
-the Gate B iperf control.
+The user approved this correction. Commits `879e904` and `7a7ca04` remove the
+dead close-reap plumbing, preserve the first terminal cause, classify it in the
+versioned runner, and add a fixed-byte reverse `iperf3 -n 64M` clean-close
+window. Gate A remains a strict AND gate: timed capacity and fixed-byte clean
+EOF must both pass on one build/profile/tunnel.
 
 ## Cleanup
 

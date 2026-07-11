@@ -8,6 +8,10 @@ Linux TUN counter direction, closes the global-drop/per-flow-Recovery scope
 gap, and adds a required TUN RX starvation falsifier. It preserves the D16
 ownership, actor, EOF, Gate A, and Gate B decisions.
 
+Amended: 2026-07-11 after the alternate-Exit capacity run. This amendment
+preserves the data-plane architecture, makes queue closure cause explicit, and
+defines Gate A as timed capacity plus fixed-byte clean EOF under one AND gate.
+
 ## Decision
 
 Keep the H10d15 capability that mattered: a continuously serviced, independent
@@ -361,6 +365,46 @@ evidence: connection-global STREAM frame progress alone cannot prove that
 contiguous bytes were deliverable on the data stream. Gate B remains frozen
 until a future Gate A passes.
 
+### 2026-07-11 terminal-close and Gate A evidence amendment
+
+The alternate-Exit run proved `183 Mbit/s` receiver capacity with zero TUN
+drop, actor bypass, send/flush error, and QUIC loss/blocking evidence. At the
+20-second boundary, however, the iperf data socket moved directly from
+`Established` to terminal `Closed` before the TUIC data stream observed remote
+EOF. The exact remaining ownership was the bounded `524288B` D16 reservoir plus
+`27840B` in the smoltcp send queue. Those bytes cannot be delivered after the
+peer reset and must not be hidden by shrinking the reservoir or changing actor
+cadence.
+
+The architecture remains unchanged. Queue closure is now an explicit state:
+
+```text
+Open | RemoteEof | Terminal(direction, reason)
+```
+
+The first terminal cause is authoritative and survives queue cleanup, reader
+shutdown, relay supervision, and final reporting. `RemoteEof` remains distinct
+and may become visible to the local TCP side only after owned queue, pending,
+and inflight bytes drain.
+
+Gate A remains one AND gate, but it now contains two traffic-shaped evidence
+windows from the same binary, safe1200 profile, Exit service, and tunnel:
+
+1. **A-capacity:** the established 20-second reverse-first P1 proves sustained
+   receiver capacity and cadence. A timed peer abort is not a clean-EOF proof;
+   if it occurs, it must be classified exactly as
+   `local_to_remote/local_socket_terminal`, release ownership once, remain
+   bounded by the configured D16 and smoltcp reservoirs, and produce no other
+   terminal reason.
+2. **A-clean:** after the capacity flow is quiet, one fixed-byte reverse
+   `iperf3 -n 64M -P 1 -R` flow proves natural completion. It must report
+   `clean_queue_lifecycle`, exact receiver completion, and zero queue,
+   reserved, leased, pending, inflight, terminal-drop, and close-egress bytes.
+
+This supersedes the impossible requirement that one abort-capable timed socket
+simultaneously prove graceful EOF. It does not weaken byte ownership or clean
+EOF: each property is now tested by a generator that can actually establish it.
+
 ## Stage Mapping
 
 The project remains nominally at stage 8 because H10d15 proved capacity but
@@ -374,7 +418,7 @@ must be reopened and closed against this spec:
 5. Add Running/DrainOnly/Recovery feedback semantics.
 6. Make EOF and close drain through the same owned queue.
 7. Pass deterministic integrated harness and full local regression gates.
-8. Run one clean `>150 Mbit/s` VPS Gate A.
+8. Run one composite VPS Gate A: timed capacity plus fixed-byte clean EOF.
 9. Run parity/stability Gate B against the `170 Mbit/s` target.
 10. Run TCP concurrency, UDP/live-streaming, fake-IP DNS, and TUN lifecycle
     regressions.
@@ -409,13 +453,20 @@ must be reopened and closed against this spec:
 
 ### VPS Gate A
 
-- One focused 20-second reverse-first P1 receiver result exceeds
-  `150 Mbit/s`.
-- `tx_dropped_delta=0`.
-- `close_egress_bytes=0`, terminal pending reap `0`, and no
-  `terminal_closed_no_send` for the data flow.
-- Active remote read and local egress gaps remain below `1s`.
-- QUIC loss, congestion, and blocking remain non-root.
+- A-capacity uses one focused 20-second reverse-first P1 and exceeds
+  `150 Mbit/s` receiver.
+- A-capacity has `tx_dropped_delta=0`, actor bypass `0`, send/flush error `0`,
+  active remote-read/local-egress gaps below `1s`, and QUIC loss, congestion,
+  and blocking remain non-root.
+- A-capacity may end with exactly one classified `local_socket_terminal` data
+  flow. Its released D16 ownership and smoltcp egress are exact, one-shot, and
+  bounded; `other_terminal_events=0`.
+- After the capacity flow is quiet, A-clean uses one fixed `64 MiB` reverse P1
+  on the same binary/profile/tunnel and completes by remote EOF.
+- A-clean has `clean_queue_lifecycle`, `tx_dropped_delta=0`,
+  `close_egress_bytes=0`, terminal pending/drop `0`, and queue queued/leased/
+  reserved bytes `0`.
+- Gate A passes only when both A-capacity and A-clean pass.
 
 ### VPS Gate B
 
@@ -424,7 +475,10 @@ must be reopened and closed against this spec:
 - Median target is at least `170 Mbit/s`.
 - If the control is below `170 Mbit/s`, mini_vpn median is at least `90%` of
   the control while every run still exceeds `150 Mbit/s`.
-- All runs have zero TUN drops and clean close accounting.
+- All timed runs have zero TUN drops, no unclassified terminal cause, and exact
+  bounded terminal accounting when their time boundary aborts a data socket.
+- One fixed-byte A-clean repeat on the same accepted build has zero close tail
+  and `clean_queue_lifecycle` before product regression begins.
 
 ### Product regression gate
 

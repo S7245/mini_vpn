@@ -5838,3 +5838,20 @@ worth cleaning up separately.
 - The terminal path must preserve one explicit reason through queue cleanup and
   relay supervision; exact byte counts paired with
   `clean_queue_lifecycle` are insufficient observability.
+
+## 2026-07-11 - Explicit closure state keeps capacity and EOF evidence honest
+
+- Code review confirmed the D16 byte-owned reservoir, actor-exclusive
+  `send_slice`, readiness-only events, and DrainOnly recovery were not the
+  source of the alternate-Exit tail. The defect was loss of terminal cause at
+  the queue/relay lifecycle boundary.
+- `Open / RemoteEof / Terminal(cause)` makes graceful EOF and local terminal
+  abort mutually explicit. The first terminal cause remains authoritative
+  across reader stop, writer-channel close, queue drop, and final relay report.
+- A timed `iperf3 -t` reverse run remains the comparable sustained-capacity
+  shape; fixed `iperf3 -n 64M -R` supplies the missing natural-completion shape.
+  Keeping both under one AND gate is stricter and more reproducible than
+  demanding incompatible properties from one socket.
+- Reusable rule: preserve architecture when capacity, ownership, and actor
+  invariants pass. Change the state model and test generator when the failure is
+  an observability/acceptance mismatch, not a hot-path capacity defect.

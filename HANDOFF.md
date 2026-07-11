@@ -106,14 +106,22 @@ This section overrides the older G7/G8/GV next-step text below.
   unacknowledged. This was local abort, not remote EOF; the control flow closed
   cleanly. Code review also found that the exact terminal drop is recorded but
   the relay summary incorrectly reports `clean_queue_lifecycle`.
-- Do not tune the 170M architecture from this result. The proposed next stage
-  is a TDD local-reset reason/accounting fix plus separate capacity and
-  EOF-terminated clean-close evidence. This changes the strict Gate A evidence
-  shape and therefore awaits explicit approval before code/spec edits. Gate B
-  remains frozen. Result:
+- Do not tune the 170M architecture from this result. The approved TDD
+  correction is complete: `879e904` removed dead close-reap plumbing and
+  `7a7ca04` models `Open / RemoteEof / Terminal(cause)`, preserves the first
+  local terminal cause through relay teardown, adds close-cause reporting, and
+  versions fixed-byte reverse `iperf3 -n` evidence. Default library `588/588`,
+  harness library `597/597`, integration `2/2`, harness targets `10 passed/4
+  ignored`, checks, focused fmt, diff-check, and both runner self-tests pass.
+  Gate B remains frozen. Result:
   `docs/tech/2026-07-11-knife14h10d16-alternate-exit-gate-a-results.md`.
-- A future Gate A remains one clean focused run above `150 Mbit/s`; Gate B is
-  three clean repeats with a median target of `170 Mbit/s` and a same-window
+- Next run one composite Gate A from clean committed source on `.27`: the
+  `20s` reverse-first P1 must exceed `150 Mbit/s` with zero TUN/bypass/error and
+  exact bounded terminal classification; after it becomes quiet, the same
+  tunnel runs one `64 MiB` fixed-byte reverse proof that must end in
+  `clean_queue_lifecycle` with every queue/tail counter zero. Gate A passes only
+  when both windows pass. Gate B is three timed repeats with a median target of
+  `170 Mbit/s`, one same-build fixed-byte clean-close repeat, and a same-window
   sing-box parity fallback.
 - The worktree is intentionally dirty and overlapping D16 files contain older
   experiments. Do not revert user changes and do not commit whole files without
