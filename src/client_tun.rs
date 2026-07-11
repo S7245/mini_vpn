@@ -13037,7 +13037,7 @@ async fn run_d16_native_reader(
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     let mut read_credit = *read_credit_rx.borrow_and_update();
-    loop {
+    'reader: loop {
         if read_credit.paused || read_credit.max_batch_bytes == 0 {
             let update = tokio::select! {
                 _ = &mut stop_rx => {
@@ -13091,29 +13091,36 @@ async fn run_d16_native_reader(
             continue;
         }
 
-        let chunk = tokio::select! {
-            _ = &mut stop_rx => {
-                drop(reservation);
-                queue
-                    .close_for_terminal_and_mark_ready("local_to_remote", "reader_stopped")
-                    .await;
-                return;
-            }
-            update = read_credit_rx.changed() => {
-                drop(reservation);
-                if update.is_err() {
+        let chunk = loop {
+            let result = tokio::select! {
+                _ = &mut stop_rx => {
+                    drop(reservation);
                     queue
-                        .close_for_terminal_and_mark_ready(
-                            "local_to_remote",
-                            "read_credit_closed",
-                        )
+                        .close_for_terminal_and_mark_ready("local_to_remote", "reader_stopped")
                         .await;
                     return;
                 }
-                read_credit = *read_credit_rx.borrow_and_update();
-                continue;
-            }
-            chunk = poll_native_tcp_chunk(&mut remote_reader, max_len) => chunk,
+                update = read_credit_rx.changed() => {
+                    if update.is_err() {
+                        drop(reservation);
+                        queue
+                            .close_for_terminal_and_mark_ready(
+                                "local_to_remote",
+                                "read_credit_closed",
+                            )
+                            .await;
+                        return;
+                    }
+                    read_credit = *read_credit_rx.borrow_and_update();
+                    if read_credit.paused || read_credit.max_batch_bytes == 0 {
+                        drop(reservation);
+                        continue 'reader;
+                    }
+                    continue;
+                }
+                chunk = poll_native_tcp_chunk(&mut remote_reader, max_len) => chunk,
+            };
+            break result;
         };
         match chunk {
             Ok(Some(chunk)) => match reservation.commit(chunk.bytes) {
@@ -18617,6 +18624,19 @@ mod tests {
         })
         .await
         .expect("D16 reader should hold one full-capacity pending reservation");
+
+        credit_tx
+            .send(RelayReadCredit {
+                paused: false,
+                max_batch_bytes: D16_ACTOR_QUANTUM_BYTES,
+            })
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert_eq!(
+            queue.snapshot_now().reserved_bytes,
+            D16_PER_FLOW_BYTE_CAPACITY,
+            "a quantitative Running credit update must not cancel or resize the already-armed owned read"
+        );
 
         let mut ctx = SocketCtx::new(443);
         ctx.d16_downlink_queue = Some(queue.clone());
