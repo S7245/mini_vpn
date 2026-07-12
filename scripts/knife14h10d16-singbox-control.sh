@@ -7,13 +7,15 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-usage: scripts/knife14h10d16-singbox-control.sh
+usage: scripts/knife14h10d16-singbox-control.sh [--profile historical|gate-aligned]
        scripts/knife14h10d16-singbox-control.sh --self-test
 
 Run on the Client VPS as root (normally through sudo -E) after sourcing .env.
-The fixed capability shape is one 20s reverse P1 through a target-only MTU1500
-sing-box TUN. Receiver throughput must exceed 150 Mbit/s and UDP socket drops
-must remain zero before mini_vpn Gate A may run.
+Both profiles run one 20s reverse P1 through a target-only sing-box TUN:
+  historical:   MTU1500 + BBR, retained as a diagnostic comparison only.
+  gate-aligned: MTU1200 + Cubic, matching the approved mini_vpn Gate A shape.
+Only gate-aligned receiver throughput above 150 Mbit/s with zero client and
+server UDP socket drops authorizes mini_vpn Gate A.
 USAGE
 }
 
@@ -51,7 +53,7 @@ cfg = {
         "server_port": int(os.environ["TUIC_SERVER_PORT"]),
         "uuid": os.environ["TUIC_UUID"],
         "password": os.environ["TUIC_PASSWORD"],
-        "congestion_control": "bbr",
+        "congestion_control": os.environ["CONTROL_CC"],
         "udp_relay_mode": "native",
         "zero_rtt_handshake": False,
         "tls": {
@@ -110,14 +112,109 @@ field_value() {
   awk -v key="$name" '{for (i=1; i<=NF; i++) if ($i ~ ("^" key "=")) {sub("^" key "=", "", $i); print $i; exit}}' <<<"$fields"
 }
 
+control_profile_fields() {
+  case "$1" in
+    historical)
+      printf '%s\n' "profile=historical-mtu1500-bbr-reverse-p1 mtu=1500 cc=bbr authorization=diagnostic-only"
+      ;;
+    gate-aligned)
+      printf '%s\n' "profile=gate-aligned-mtu1200-cubic-reverse-p1 mtu=1200 cc=cubic authorization=gate-a"
+      ;;
+    *)
+      echo "ERROR: unsupported control profile: $1" >&2
+      return 1
+      ;;
+  esac
+}
+
+passing_profile_outcome() {
+  case "$1" in
+    historical)
+      printf '%s\n' "result=diagnostic_pass control_result=DIAGNOSTIC_PASS capability_gate=diagnostic_pass gate_a_authorization=diagnostic-only"
+      ;;
+    gate-aligned)
+      printf '%s\n' "result=passed control_result=PASS capability_gate=passed gate_a_authorization=passed"
+      ;;
+    *)
+      echo "ERROR: unsupported control profile: $1" >&2
+      return 1
+      ;;
+  esac
+}
+
+receiver_above_floor() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+raise SystemExit(0 if float(sys.argv[1]) > float(sys.argv[2]) else 1)
+PY
+}
+
 self_test() {
-  local rendered summary socket
+  local gate_aligned gate_outcome historical historical_outcome rendered summary socket
+
+  historical="$(control_profile_fields historical)"
+  [[ "$historical" == "profile=historical-mtu1500-bbr-reverse-p1 mtu=1500 cc=bbr authorization=diagnostic-only" ]] || {
+    echo "control self-test failed: historical profile fields" >&2
+    return 1
+  }
+  gate_aligned="$(control_profile_fields gate-aligned)"
+  [[ "$gate_aligned" == "profile=gate-aligned-mtu1200-cubic-reverse-p1 mtu=1200 cc=cubic authorization=gate-a" ]] || {
+    echo "control self-test failed: gate-aligned profile fields" >&2
+    return 1
+  }
+  historical_outcome="$(passing_profile_outcome historical)"
+  [[ "$historical_outcome" == "result=diagnostic_pass control_result=DIAGNOSTIC_PASS capability_gate=diagnostic_pass gate_a_authorization=diagnostic-only" ]] || {
+    echo "control self-test failed: historical authorization outcome" >&2
+    return 1
+  }
+  gate_outcome="$(passing_profile_outcome gate-aligned)"
+  [[ "$gate_outcome" == "result=passed control_result=PASS capability_gate=passed gate_a_authorization=passed" ]] || {
+    echo "control self-test failed: gate-aligned authorization outcome" >&2
+    return 1
+  }
+  if control_profile_fields invalid >/dev/null 2>&1; then
+    echo "control self-test failed: invalid profile accepted" >&2
+    return 1
+  fi
+  receiver_above_floor 150.001 150 || {
+    echo "control self-test failed: above-floor receiver rejected" >&2
+    return 1
+  }
+  if receiver_above_floor 150 150; then
+    echo "control self-test failed: equal-to-floor receiver accepted" >&2
+    return 1
+  fi
+  if receiver_above_floor 149.999 150; then
+    echo "control self-test failed: below-floor receiver accepted" >&2
+    return 1
+  fi
 
   rendered="$({
     TUIC_SERVER_HOST=192.0.2.10 TUIC_SERVER_PORT=8443 \
       TUIC_UUID=dummy-uuid TUIC_PASSWORD=dummy-password \
       TUIC_SNI=control.invalid TUIC_CA_PATH=/tmp/dummy-ca.pem \
-      CONTROL_MTU=1500 CONTROL_IF=sb-d16-control \
+      CONTROL_MTU=1200 CONTROL_CC=cubic CONTROL_IF=sb-d16-control \
+      TARGET=198.51.100.77 render_config
+  })"
+  RENDERED="$rendered" python3 - <<'PY'
+import json
+import os
+
+cfg = json.loads(os.environ["RENDERED"])
+assert cfg["inbounds"][0]["mtu"] == 1200
+assert cfg["inbounds"][0]["route_address"] == ["198.51.100.77/32"]
+assert cfg["inbounds"][0]["route_exclude_address"] == ["192.0.2.10/32"]
+assert cfg["outbounds"][0]["uuid"] == "dummy-uuid"
+assert cfg["outbounds"][0]["password"] == "dummy-password"
+assert cfg["outbounds"][0]["congestion_control"] == "cubic"
+PY
+  unset rendered RENDERED
+
+  rendered="$({
+    TUIC_SERVER_HOST=192.0.2.10 TUIC_SERVER_PORT=8443 \
+      TUIC_UUID=dummy-uuid TUIC_PASSWORD=dummy-password \
+      TUIC_SNI=control.invalid TUIC_CA_PATH=/tmp/dummy-ca.pem \
+      CONTROL_MTU=1500 CONTROL_CC=bbr CONTROL_IF=sb-d16-control \
       TARGET=198.51.100.77 render_config
   })"
   RENDERED="$rendered" python3 - <<'PY'
@@ -128,8 +225,7 @@ cfg = json.loads(os.environ["RENDERED"])
 assert cfg["inbounds"][0]["mtu"] == 1500
 assert cfg["inbounds"][0]["route_address"] == ["198.51.100.77/32"]
 assert cfg["inbounds"][0]["route_exclude_address"] == ["192.0.2.10/32"]
-assert cfg["outbounds"][0]["uuid"] == "dummy-uuid"
-assert cfg["outbounds"][0]["password"] == "dummy-password"
+assert cfg["outbounds"][0]["congestion_control"] == "bbr"
 PY
   unset rendered RENDERED
 
@@ -155,16 +251,45 @@ SS
   echo "sing-box control self-test passed"
 }
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  usage
-  exit 0
-fi
-if [[ "${1:-}" == "--self-test" ]]; then
-  self_test
-  exit $?
-fi
+CONTROL_PROFILE="historical"
+case "$#" in
+  0)
+    ;;
+  1)
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --self-test)
+        self_test
+        exit $?
+        ;;
+      *)
+        usage >&2
+        exit 64
+        ;;
+    esac
+    ;;
+  2)
+    [[ "$1" == "--profile" ]] || {
+      usage >&2
+      exit 64
+    }
+    CONTROL_PROFILE="$2"
+    ;;
+  *)
+    usage >&2
+    exit 64
+    ;;
+esac
 
-readonly CONTROL_MTU=1500
+PROFILE_FIELDS="$(control_profile_fields "$CONTROL_PROFILE")" || exit 64
+readonly CONTROL_PROFILE
+readonly CONTROL_PROFILE_LABEL="$(field_value "$PROFILE_FIELDS" profile)"
+readonly CONTROL_MTU="$(field_value "$PROFILE_FIELDS" mtu)"
+readonly CONTROL_CC="$(field_value "$PROFILE_FIELDS" cc)"
+readonly PROFILE_AUTHORIZATION="$(field_value "$PROFILE_FIELDS" authorization)"
 readonly CONTROL_IF="${CONTROL_IF:-sb-d16-control}"
 readonly TARGET="${TARGET:-43.130.32.77}"
 readonly DURATION=20
@@ -294,9 +419,11 @@ cleanup() {
     done
   done
   if [[ "$RESULT" == "passed" && $status -eq 0 ]]; then
-    echo "control_result=PASS artifact_dir=$ARTIFACT_DIR"
+    echo "control_result=PASS gate_a_authorization=passed artifact_dir=$ARTIFACT_DIR"
+  elif [[ "$RESULT" == "diagnostic_pass" && $status -eq 0 ]]; then
+    echo "control_result=DIAGNOSTIC_PASS gate_a_authorization=diagnostic-only artifact_dir=$ARTIFACT_DIR"
   elif [[ "$RESULT" == "incapable" && $status -eq 2 ]]; then
-    echo "control_result=INCAPABLE artifact_dir=$ARTIFACT_DIR"
+    echo "control_result=INCAPABLE gate_a_authorization=failed artifact_dir=$ARTIFACT_DIR"
   else
     echo "control_result=FAILED artifact_dir=$ARTIFACT_DIR" >&2
   fi
@@ -313,8 +440,8 @@ else
 fi
 append "runner_sha256=$(sha256_file "$SCRIPT_PATH")"
 append "sing_box_sha256=$(sha256_file "$SING_BOX_BIN")"
-append "profile=historical-mtu1500-reverse-p1 duration_secs=$DURATION parallel=$PARALLEL"
-append "target=$TARGET exit=$TUIC_SERVER_HOST mtu=$CONTROL_MTU floor_mbps=$CONTROL_FLOOR_MBPS"
+append "profile=$CONTROL_PROFILE_LABEL duration_secs=$DURATION parallel=$PARALLEL"
+append "target=$TARGET exit=$TUIC_SERVER_HOST mtu=$CONTROL_MTU cc=$CONTROL_CC floor_mbps=$CONTROL_FLOOR_MBPS gate_a_role=$PROFILE_AUTHORIZATION"
 append "credentials=piped-via-mode-0600-fifo config_persisted=0"
 "$SING_BOX_BIN" version | head -3 | tee -a "$REPORT"
 
@@ -329,7 +456,7 @@ sysctl -q -w net.core.rmem_default="$SOCKET_TARGET_BYTES" >/dev/null
 sysctl -q -w net.core.wmem_default="$SOCKET_TARGET_BYTES" >/dev/null
 append "temporary_socket_defaults=$SOCKET_TARGET_BYTES"
 
-export CONTROL_MTU CONTROL_IF TARGET TUIC_SERVER_HOST TUIC_SERVER_PORT
+export CONTROL_MTU CONTROL_CC CONTROL_IF TARGET TUIC_SERVER_HOST TUIC_SERVER_PORT
 export TUIC_UUID TUIC_PASSWORD TUIC_SNI TUIC_CA_PATH
 render_config > "$CONFIG_FIFO" &
 CONFIG_WRITER_PID=$!
@@ -399,16 +526,15 @@ append "socket_gate=passed"
 SUMMARY="$(parse_iperf_summary < "$IPERF_JSON")"
 append "$SUMMARY"
 RECEIVER_MBPS="$(field_value "${SUMMARY//$'\n'/ }" receiver_mbps)"
-if python3 - "$RECEIVER_MBPS" "$CONTROL_FLOOR_MBPS" <<'PY'
-import sys
-raise SystemExit(0 if float(sys.argv[1]) > float(sys.argv[2]) else 1)
-PY
-then
-  RESULT="passed"
-  append "capability_gate=passed"
+if receiver_above_floor "$RECEIVER_MBPS" "$CONTROL_FLOOR_MBPS"; then
+  PASSING_OUTCOME="$(passing_profile_outcome "$CONTROL_PROFILE")"
+  RESULT="$(field_value "$PASSING_OUTCOME" result)"
+  append "capability_gate=$(field_value "$PASSING_OUTCOME" capability_gate)"
+  append "gate_a_authorization=$(field_value "$PASSING_OUTCOME" gate_a_authorization)"
 else
   RESULT="incapable"
   append "capability_gate=incapable"
+  append "gate_a_authorization=failed"
   exit 2
 fi
 
