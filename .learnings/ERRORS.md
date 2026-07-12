@@ -3970,3 +3970,15 @@ active root unless it repeats.
   mini_vpn without qualification. TDD a fixed gate-aligned mature profile,
   preserve the historical profile as diagnostic evidence, and keep the same
   `>150 Mbit/s` plus zero-drop floor.
+
+## 2026-07-12 - Cargo name filters can succeed after running zero tests
+
+- Symptom: a clean `.27` command used a remembered D16 test name with
+  `--exact`; Cargo exited successfully while every target reported `0 passed`
+  and all tests filtered out.
+- Root cause: Cargo treats a filter with no matches as a successful test run.
+  The requested behavior therefore had no evidence even though the command
+  status was zero.
+- Correct behavior: resolve the current test name from source first and verify
+  that the output reports at least one executed test. For focused acceptance,
+  a zero-match Cargo result is a failed evidence gate, not a pass.

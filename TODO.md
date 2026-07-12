@@ -122,6 +122,20 @@ than the sole authorization predicate. The aligned control must still exceed
 `150 Mbit/s` with both socket drops zero before clean `bdaa19c` scoped. Do not
 run scoped or Gate A until this plan is confirmed and implemented.
 
+That correction is complete at `1b83004`. The historical profile is now
+diagnostic-only and the new Gate-aligned control is fixed at mature-client
+`Cubic + MTU1200`, with exact profile, route, authorization, and strict-floor
+self-tests. Its first clean `.111` run did not authorize scoped mini_vpn:
+direct receiver was `217.220 Mbit/s`, both UDP sockets were `16 MiB` with drop
+`0`, but TUIC receiver was only `3.041 Mbit/s` and fourteen of twenty intervals
+were zero. The same burst/idle shape under historical and Gate-aligned profiles
+rejects BBR/MTU mismatch as the active root. Keep `bdaa19c` scoped, composite
+Gate A, and Gate B frozen. The next discriminator changes the mature-client
+host while holding `.111`, `.77`, sing-box version, Gate-aligned profile, and
+floor constant; do not change D16 or repeat `.27` against unchanged external
+state. Result:
+`docs/tech/2026-07-12-knife14h10d16-gate-aligned-control-results.md`.
+
 The next task is now an external same-window capability precondition, not a
 production code edit. Mature sing-box reverse P1 controls fell to
 `14.207 Mbit/s` and then `1.363 Mbit/s` despite correct routing, `16 MiB` client

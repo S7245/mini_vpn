@@ -5962,3 +5962,21 @@ worth cleaning up separately.
   authorizing closely enough to avoid systematic false negatives. Keep
   historical controls as diagnostics and add a fixed, versioned gate-aligned
   control rather than lowering the floor or bypassing external qualification.
+
+## 2026-07-12 - Gate-aligned control rejects the profile-mismatch root
+
+- `1b83004` made the mature precondition honest: historical BBR/MTU1500 is
+  diagnostic-only, while only the fixed Cubic/MTU1200 profile can authorize
+  Gate A. Exact route, profile, strict floor, and authorization semantics are
+  self-tested.
+- The first clean Gate-aligned `.111` control reached only `3.041 Mbit/s`
+  receiver despite `217.220 Mbit/s` direct, `16 MiB` client/Exit sockets, zero
+  drops, correct target-only routing, and no active client/server error.
+  Fourteen of twenty intervals were zero.
+- Historical and Gate-aligned `.111` controls have the same burst/idle shape,
+  so client BBR and MTU1500 are rejected as the active root. The correction is
+  retained as Gate-process hardening, but it is not a throughput fix.
+- Reusable rule: when a profile-aligned mature control fails before product
+  code executes, do not modify the product hot path. Change one external axis
+  at a time; here the next sufficient discriminator is the client host/path
+  while Exit, target, binary, profile, and floor remain fixed.

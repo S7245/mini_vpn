@@ -216,6 +216,19 @@ This section overrides the older G7/G8/GV next-step text below.
   VPS run, TDD a fixed versioned gate-aligned mature control (`Cubic + MTU1200`)
   while retaining the historical profile as a reported diagnostic. It must
   still exceed `150 Mbit/s` with socket drop zero before `bdaa19c` scoped runs.
+- The correction is implemented and pushed at `1b83004`. The historical
+  profile now reports diagnostic-only results; the new authorization profile
+  is fixed at mature-client `Cubic + MTU1200`, self-tests exact route/profile/
+  floor semantics, and only it can emit Gate A `PASS`. Its first clean `.111`
+  run had a healthy `217.220 Mbit/s` direct receiver, correct route and MTU,
+  `16 MiB` UDP sockets, and drop `0`, but TUIC receiver was only `3.041
+  Mbit/s`; fourteen of twenty intervals were zero. This matches the historical
+  `.111` burst/idle shape and rejects BBR/MTU mismatch as the active root.
+  `bdaa19c` scoped, composite Gate A, and Gate B remain unspent. Next change
+  the client host in one same-window Gate-aligned control while holding `.111`,
+  `.77`, binary, and profile constant; do not edit D16 or repeat `.27` control
+  against unchanged external state. Result:
+  `docs/tech/2026-07-12-knife14h10d16-gate-aligned-control-results.md`.
 - The worktree is intentionally dirty and overlapping D16 files contain older
   experiments. Do not revert user changes and do not commit whole files without
   first showing which pre-D16 diffs would be included.
