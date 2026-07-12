@@ -149,6 +149,20 @@ minimal QUIC without TUIC/TUN next. Keep D16, scoped `bdaa19c`, composite Gate
 A, and Gate B frozen. Result:
 `docs/tech/2026-07-12-knife14h10d16-client-host-discriminator-results.md`.
 
+The raw UDP8443 discriminator is complete. Iperf3 could not run because its
+TCP8443 control was blocked before `.111`, so fixed iperf2 `2.1.9` pure UDP
+reverse was installed temporarily and purged after the test. Both `.27` and
+`.33` received a stable `105 Mbit/s` at the 100 Mbit/s setting with zero loss.
+At the 200 Mbit/s setting both received `198 Mbit/s` overall with no zero-rate
+interval, but both hit the same `.111` edge after five seconds: about `193
+Mbit/s` with `7.9%` interval loss. Client UDP kernel error/buffer-drop deltas
+were zero. This proves continuous raw capacity sufficient for Gate A and 170M
+Gate B while rejecting raw UDP as the TUIC burst/idle root. Next add a
+test-only, versioned minimal Quinn Cubic/safe1200 reverse-stream probe with a
+real loopback RED/GREEN test before one `.27 -> .111` cross-host run. Do not
+modify TUIC, D16, TUN, or product runtime. Result:
+`docs/tech/2026-07-12-knife14h10d16-raw-udp-path-results.md`.
+
 The next task is now an external same-window capability precondition, not a
 production code edit. Mature sing-box reverse P1 controls fell to
 `14.207 Mbit/s` and then `1.363 Mbit/s` despite correct routing, `16 MiB` client

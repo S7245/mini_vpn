@@ -4001,3 +4001,23 @@ active root unless it repeats.
 - Correct behavior: require an actual ingress capture line and exit status
   zero. Bind to the ingress interface/direction, wait for capture readiness,
   and send several bounded probes before classifying an upstream ACL.
+
+## 2026-07-12 - Iperf3 UDP still depends on a TCP control path
+
+- Symptom: an iperf3 server listened on `.111:8443`, but `.27` and `.33`
+  clients timed out before UDP measurement. An ingress capture saw no TCP SYN
+  even though UDP8443 probes reached the host.
+- Root cause: iperf3's UDP data mode still establishes its control session over
+  TCP. The cloud policy exposed only the TUIC UDP port.
+- Correct behavior: preflight both protocols required by a benchmark. For a
+  UDP-only allowed port, use a fixed mature tool whose reverse mode stays on
+  one UDP socket; do not interpret control-channel failure as UDP incapacity.
+
+## 2026-07-12 - Offered 200M crossed a shared raw UDP shaping edge
+
+- Symptom: both clients received five seconds near `210 Mbit/s` with zero
+  loss, then settled near `193 Mbit/s` with `7.9%` interval loss; client
+  `UdpRcvbufErrors` remained zero.
+- Correct behavior: classify this as shared sender/egress/provider headroom,
+  not a client buffer bug or multi-second service stall. Preserve it as a
+  ceiling signal and test QUIC below/through the edge with congestion metrics.

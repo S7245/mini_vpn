@@ -5993,3 +5993,15 @@ worth cleaning up separately.
 - Reusable rule: after a protocol failure survives a client-host A/B, stop
   client and product-code work. Measure the same-port raw transport next; only
   add a protocol-specific benchmark if the raw path passes.
+
+## 2026-07-12 - Raw UDP capacity separates path bandwidth from QUIC stalls
+
+- Fixed iperf2 UDP reverse on `.111:8443` delivered `105 Mbit/s` with zero
+  loss to both `.27` and `.33` at the 100M setting. At 200M, both remained
+  continuous near `198 Mbit/s` overall and had no client UDP buffer errors.
+- Both 200M runs shared an exact edge after five clean seconds, settling near
+  `193 Mbit/s` with loss. That is provider/sender shaping headroom, not the
+  TUIC pattern of many zero-rate seconds at `3-5 Mbit/s`.
+- Reusable rule: sufficient raw bandwidth does not clear a protocol stack.
+  Move one layer upward to a minimal QUIC probe before blaming TUIC or product
+  egress; keep exact CC, MTU, windows, socket buffers, and direction fixed.

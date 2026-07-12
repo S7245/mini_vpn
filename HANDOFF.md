@@ -240,6 +240,17 @@ This section overrides the older G7/G8/GV next-step text below.
   should a minimal QUIC-without-TUIC benchmark follow. D16, scoped `bdaa19c`,
   composite Gate A, and Gate B remain frozen. Result:
   `docs/tech/2026-07-12-knife14h10d16-client-host-discriminator-results.md`.
+- The same-port raw UDP discriminator is complete. Iperf3 was unusable because
+  the cloud ACL passes UDP8443 but blocks its required TCP8443 control; fixed
+  iperf2 `2.1.9` UDP reverse was installed temporarily and purged afterward.
+  At 100 Mbit/s, both `.27` and `.33` received about `105 Mbit/s` for every
+  interval with zero loss. At 200 Mbit/s both received about `198 Mbit/s`
+  overall with no zero interval, but shared a `.111` edge: five seconds at
+  `210 Mbit/s/0%`, then about `193 Mbit/s/7.9%` loss. Client UDP buffer/error
+  deltas were zero. Raw UDP is sufficient for Gate A and 170M Gate B and does
+  not reproduce TUIC burst/idle. Next TDD a test-only minimal Quinn
+  Cubic/safe1200 reverse-stream cross-host probe; do not change product/D16.
+  Result: `docs/tech/2026-07-12-knife14h10d16-raw-udp-path-results.md`.
 - The worktree is intentionally dirty and overlapping D16 files contain older
   experiments. Do not revert user changes and do not commit whole files without
   first showing which pre-D16 diffs would be included.
