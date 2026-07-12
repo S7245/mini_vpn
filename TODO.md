@@ -136,6 +136,19 @@ floor constant; do not change D16 or repeat `.27` against unchanged external
 state. Result:
 `docs/tech/2026-07-12-knife14h10d16-gate-aligned-control-results.md`.
 
+The approved client-host discriminator is complete and also incapable. With
+`.111`, `.77`, sing-box `1.13.14`, Cubic/MTU1200, and the floor unchanged, the
+`.33` mature client reached only `5.347 Mbit/s` receiver despite `218.285
+Mbit/s` direct, zero client/Exit UDP drops, and correct routing. Thirteen of
+twenty intervals were zero, and the existing `.33` sing-box remained active.
+This rejects `.27` as a sufficient root and rejects moving Gate A to `.33`.
+The next proposed discriminator is raw reverse UDP over the same allowed
+`.111:8443` port from both `.27` and `.33`, first at `100 Mbit/s` and then at
+`200 Mbit/s` only after a low-loss first stage. If raw UDP is clean, isolate
+minimal QUIC without TUIC/TUN next. Keep D16, scoped `bdaa19c`, composite Gate
+A, and Gate B frozen. Result:
+`docs/tech/2026-07-12-knife14h10d16-client-host-discriminator-results.md`.
+
 The next task is now an external same-window capability precondition, not a
 production code edit. Mature sing-box reverse P1 controls fell to
 `14.207 Mbit/s` and then `1.363 Mbit/s` despite correct routing, `16 MiB` client

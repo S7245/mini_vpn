@@ -229,6 +229,17 @@ This section overrides the older G7/G8/GV next-step text below.
   `.77`, binary, and profile constant; do not edit D16 or repeat `.27` control
   against unchanged external state. Result:
   `docs/tech/2026-07-12-knife14h10d16-gate-aligned-control-results.md`.
+- The approved client-host discriminator is also complete. Holding `.111`,
+  `.77`, sing-box `1.13.14`, Cubic/MTU1200, and the authorization floor fixed,
+  moving the mature client from `.27` to `.33` still produced only `5.347
+  Mbit/s` receiver. Direct receiver was `218.285 Mbit/s`, both UDP drops were
+  zero, routing was correct, and thirteen of twenty intervals were zero. The
+  `.33` production sing-box remained active. This rejects `.27` as a sufficient
+  root and rejects moving Gate A to `.33`. Next test raw reverse UDP on the
+  same allowed `.111:8443` port from both clients; only if raw UDP is clean
+  should a minimal QUIC-without-TUIC benchmark follow. D16, scoped `bdaa19c`,
+  composite Gate A, and Gate B remain frozen. Result:
+  `docs/tech/2026-07-12-knife14h10d16-client-host-discriminator-results.md`.
 - The worktree is intentionally dirty and overlapping D16 files contain older
   experiments. Do not revert user changes and do not commit whole files without
   first showing which pre-D16 diffs would be included.

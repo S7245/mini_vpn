@@ -3982,3 +3982,22 @@ active root unless it repeats.
 - Correct behavior: resolve the current test name from source first and verify
   that the output reports at least one executed test. For focused acceptance,
   a zero-match Cargo result is a failed evidence gate, not a pass.
+
+## 2026-07-12 - SSH identity use does not imply agent forwarding
+
+- Symptom: the Mac connected to `.33` with `ssh -i`, but an `-A` session could
+  not authenticate `.33 -> .111`; the identity file had never been loaded into
+  the forwarded agent.
+- Correct behavior: for nested ephemeral access, start a temporary local
+  ssh-agent, add the existing identity in memory, forward that agent, and place
+  only its public key selector on the intermediate host. Never copy the private
+  key to a VPS.
+
+## 2026-07-12 - Tcpdump filter counters are not an arrival assertion
+
+- Symptom: the first `.33 -> .111:8443` probe timed out with `0 packets
+  captured` but `1 packet received by filter`; treating the latter as success
+  would have bypassed the host-arrival gate.
+- Correct behavior: require an actual ingress capture line and exit status
+  zero. Bind to the ingress interface/direction, wait for capture readiness,
+  and send several bounded probes before classifying an upstream ACL.

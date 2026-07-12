@@ -5980,3 +5980,16 @@ worth cleaning up separately.
   code executes, do not modify the product hot path. Change one external axis
   at a time; here the next sufficient discriminator is the client host/path
   while Exit, target, binary, profile, and floor remain fixed.
+
+## 2026-07-12 - Client-host change preserves the external burst/idle failure
+
+- Moving the Gate-aligned mature client from `.27` to `.33` while holding
+  `.111`, `.77`, sing-box version, MTU, congestion control, and floor fixed
+  produced only `5.347 Mbit/s` receiver. Direct was `218.285 Mbit/s`, socket
+  drops were zero, routes were correct, and `13/20` intervals were zero.
+- The same burst/idle signature now survives two client hosts and two client
+  profiles. `.27` host state is not a sufficient root, and moving product
+  acceptance to `.33` would only move the symptom.
+- Reusable rule: after a protocol failure survives a client-host A/B, stop
+  client and product-code work. Measure the same-port raw transport next; only
+  add a protocol-specific benchmark if the raw path passes.
