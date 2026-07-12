@@ -251,6 +251,21 @@ This section overrides the older G7/G8/GV next-step text below.
   not reproduce TUIC burst/idle. Next TDD a test-only minimal Quinn
   Cubic/safe1200 reverse-stream cross-host probe; do not change product/D16.
   Result: `docs/tech/2026-07-12-knife14h10d16-raw-udp-path-results.md`.
+- The versioned minimal Quinn discriminator is complete at `8ea8925`; probe
+  shutdown cleanup is `21dd361`. The exact Cubic/safe1200 reverse ordered
+  stream delivered `489095168B` from `.111` to `.27` in `20.315s`, or
+  `192.597 Mbit/s`. All 21 intervals carried data, the minimum non-empty
+  interval was `183.934 Mbit/s`, pattern errors were zero, EOF was clean, and
+  the client reported zero loss, congestion events, and data blocking. Server
+  loss at the shared raw-path edge did not create stalls. Raw UDP and minimal
+  Quinn therefore have sufficient continuous Gate A/Gate B capacity and do
+  not reproduce TUIC burst/idle. Next TDD a test-only direct TUIC Connect
+  relay through `.111` to `.77`: `tcp_pool=1`, generic ordered `open_tcp`, and
+  one loopback iperf3 socket, bypassing auxiliary-pool policy, TUN, smoltcp,
+  native readers, and D16. Use its result to distinguish TUIC/client/server
+  stream service from the product integration. Do not reopen D16 or spend
+  Gate A yet. Result:
+  `docs/tech/2026-07-12-knife14h10d16-minimal-quinn-path-results.md`.
 - The worktree is intentionally dirty and overlapping D16 files contain older
   experiments. Do not revert user changes and do not commit whole files without
   first showing which pre-D16 diffs would be included.

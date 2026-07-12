@@ -163,6 +163,24 @@ real loopback RED/GREEN test before one `.27 -> .111` cross-host run. Do not
 modify TUIC, D16, TUN, or product runtime. Result:
 `docs/tech/2026-07-12-knife14h10d16-raw-udp-path-results.md`.
 
+The minimal Quinn discriminator is complete at `8ea8925` with bounded probe
+cleanup at `21dd361`. A clean, identical test binary ran Cubic/safe1200 from
+`.27` against `.111` and received `489095168B` in `20.315s` at `192.597
+Mbit/s`. All 21 intervals were nonzero, minimum non-empty interval throughput
+was `183.934 Mbit/s`, byte-pattern errors were zero, EOF was clean, and the
+client had zero Quinn loss, congestion events, and data blocking. Server loss
+at the known raw-path shaping edge did not interrupt continuous delivery. This
+rules out raw UDP and minimal Quinn as the TUIC burst/idle root. The next
+approved design seam is a test-only direct TUIC Connect relay from `.27`
+through `.111` to `.77`: force `tcp_pool=1`, use generic ordered `open_tcp`,
+and bridge one loopback iperf3 client socket directly to that relay. This
+bypasses auxiliary-pool policy, TUN, smoltcp, native readers, and D16.
+RED/GREEN the loopback relay, byte accounting, half-close/EOF, and bounded
+shutdown locally, then run one strict `>150 Mbit/s` cross-host discriminator.
+Gate A and Gate B remain frozen.
+Result:
+`docs/tech/2026-07-12-knife14h10d16-minimal-quinn-path-results.md`.
+
 The next task is now an external same-window capability precondition, not a
 production code edit. Mature sing-box reverse P1 controls fell to
 `14.207 Mbit/s` and then `1.363 Mbit/s` despite correct routing, `16 MiB` client

@@ -1,5 +1,23 @@
 # Learnings
 
+## 2026-07-12 - Minimal Quinn crosses the raw-path shaping edge continuously
+
+- A test-only Quinn Cubic/safe1200 reverse ordered stream sustained `192.597
+  Mbit/s` from `.111` to `.27`; all 21 intervals carried data, the minimum
+  non-empty interval was `183.934 Mbit/s`, integrity errors were zero, and EOF
+  was clean.
+- Client Quinn loss, congestion, and data-blocked counters were zero. The
+  server observed loss at the known raw UDP edge but adapted without the
+  multi-second zero-rate intervals seen in TUIC controls.
+- This removes raw UDP and minimal Quinn from the active root set. The first
+  untested boundary is direct TUIC Connect/sing-box stream service; only after
+  that seam passes should diagnosis move into mini_vpn pool/open/relay
+  coupling.
+- Reusable rule: protocol-layer burst/idle must not be assigned to QUIC merely
+  because it rides QUIC. Hold CC, MTU, direction, windows, and host path fixed,
+  then test the smallest real ordered-stream layer before changing product
+  backpressure architecture.
+
 ## 2026-07-10 - D16 local capacity closure moves Gate A upstream
 
 - Code commits: `f7847dd` repairs ACK-driven actor re-entry and the feedback

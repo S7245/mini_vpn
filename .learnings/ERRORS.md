@@ -1,5 +1,16 @@
 # Errors
 
+## 2026-07-12 - Unbounded Quinn probe shutdown obscured completed transfer time
+
+- Symptom: the server transfer and completion ACK finished in about `20.3s`,
+  but the ignored test process remained alive for about another 45 seconds in
+  `Endpoint::wait_idle` and emitted Cargo's over-60-second warning.
+- Impact: throughput, integrity, EOF, and ACK evidence were already complete;
+  the delay affected test orchestration only.
+- Correct behavior: after the explicit completion barrier, close the
+  connection and endpoint and bound `wait_idle` to two seconds. Report
+  sub-millisecond RTT in microseconds rather than truncating it to `0ms`.
+
 ## 2026-07-10 - ACK-capacity Gate A still failed on ordered stream service
 
 - Stage: H10d16 ACK-capacity replacement Gate A.
