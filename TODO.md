@@ -95,6 +95,17 @@ is a user-confirmed maintenance window: temporarily replace the original
 the original service on every exit path. Scoped mini_vpn and Gate A remain
 unspent.
 
+The confirmed maintenance swap on the allowed `8443` port also failed the
+capability floor. A minimal same-version service replaced the original process
+under a restore watchdog. Direct receivers were `218.688 Mbit/s` from `.27`
+and `214.285 Mbit/s` from `.33`; both UDP socket drops were zero. Mature TUIC
+receiver was only `11.953 Mbit/s`, with thirteen zero-rate seconds and isolated
+bursts. The original service was restored successfully. Do not repeat process
+restart/full-config/minimal-config A/B or run `bdaa19c` scoped from this host
+window. Reaching Gate A now requires a genuinely independent capable Exit; a
+host-local network-namespace mature control is useful only if more attribution
+is required before provisioning that Exit.
+
 The next task is now an external same-window capability precondition, not a
 production code edit. Mature sing-box reverse P1 controls fell to
 `14.207 Mbit/s` and then `1.363 Mbit/s` despite correct routing, `16 MiB` client

@@ -3946,3 +3946,14 @@ active root unless it repeats.
 - Correct behavior: add a host-arrival probe before an alternate-port control.
   Do not diagnose authentication, TLS, QUIC, or client throughput until the
   server host has observed the packet.
+
+## 2026-07-12 - Minimal same-port Exit remained burst/idle
+
+- Symptom: replacing the original `.33:8443` process with a minimal
+  same-version service preserved the low mature-client result (`11.953
+  Mbit/s`) and thirteen zero-rate seconds despite healthy direct paths and zero
+  socket drops.
+- Correct behavior: do not repeat service restarts, full/minimal config swaps,
+  or mini_vpn scoped runs on this host window. Treat the `.33` host or external
+  QUIC path as the blocker until a host-local discriminator or a genuinely
+  independent Exit changes the evidence.

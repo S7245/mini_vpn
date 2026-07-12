@@ -118,6 +118,38 @@ The next discriminator requires a maintenance swap on the already-open
 one mature control, then restore the original unit on every exit path. This is
 an external service-state change and must be confirmed before execution.
 
+## Allowed-Port Maintenance Swap
+
+The confirmed maintenance swap installed a `45m` automatic restore watchdog,
+stopped the original `.33:8443` unit, and let a minimal same-version sing-box
+service own the already-open UDP port. Before the swap, clean `7f69fd0` passed
+the focused armed-read regression, both runner self-tests, release build, and
+source-clean check. The isolated service was active with the expected socket
+buffers before traffic.
+
+The mature control still failed capability:
+
+- `.27 -> .77` direct receiver: `218.688 Mbit/s`;
+- `.33 -> .77` direct receiver: `214.285 Mbit/s`;
+- mature TUIC sender/receiver: `13.525/11.953 Mbit/s`;
+- client and server UDP socket drops: `0`;
+- thirteen of twenty one-second intervals: exactly zero.
+
+The client emitted no error. The service stayed active and only logged the
+expected remote cancellation after the timed run. Nonzero intervals were
+isolated bursts (`94.337`, `22.020`, `15.729`, `6.291`, `4.194`, `45.089`,
+and `51.380 Mbit/s`). The original sing-box service was then restored, the
+watchdog and isolated unit were removed, and all three VPS cleanup checks
+passed. Artifact:
+`/tmp/mini_vpn_h10d16_isolated8443_control.tar.gz`.
+
+This falsifies the old-process and full-config hypotheses. Current evidence
+places the blocker at the `.33` host or Client-to-Exit QUIC path, before any
+mini_vpn reader/egress comparison. `bdaa19c` scoped and composite Gate A remain
+unspent. A new independent capable Exit is the shortest path to acceptance; a
+host-local network-namespace mature control can further distinguish server/
+kernel behavior from the external UDP path but cannot itself authorize Gate A.
+
 External artifacts:
 
 - `/tmp/mini_vpn_h10d16_service_batch_scoped_99ff0f4/`

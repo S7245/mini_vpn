@@ -189,6 +189,17 @@ This section overrides the older G7/G8/GV next-step text below.
   stayed healthy. Continuing this discriminator requires a confirmed
   maintenance swap where the minimal service temporarily owns the already-open
   `8443`; do not interpret the `9443` timeout as mini_vpn evidence.
+- The confirmed `8443` maintenance swap is complete and falsifies the original
+  sing-box process/full-config hypothesis. A watchdog-protected minimal
+  same-version service temporarily owned the already-open port. Clean mature
+  control had `218.688 Mbit/s` direct, `214.285 Mbit/s` `.33 -> .77` direct,
+  and zero UDP socket drops, but only `11.953 Mbit/s` TUIC receiver. Thirteen
+  of twenty one-second intervals were zero and the nonzero intervals were
+  isolated bursts. Client errors were zero; the server only logged the expected
+  timed remote cancel. Original sing-box was restored and verified active.
+  This leaves the `.33` host/Client-to-Exit QUIC path, not mini_vpn or the old
+  service process, as the external blocker. Scoped `bdaa19c`, Gate A, and Gate
+  B remain unspent.
 - The worktree is intentionally dirty and overlapping D16 files contain older
   experiments. Do not revert user changes and do not commit whole files without
   first showing which pre-D16 diffs would be included.

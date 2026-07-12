@@ -5934,3 +5934,17 @@ worth cleaning up separately.
 - Reusable rule: before treating a new UDP port as an independent service
   discriminator, prove packet arrival at the host. A listen socket and zero
   socket drops cannot distinguish an upstream firewall from no client traffic.
+
+## 2026-07-12 - Same-port minimal service falsifies process configuration
+
+- A watchdog-protected minimal sing-box service temporarily replaced the
+  original `.33:8443` process on the already-allowed port. It still reached
+  only `11.953 Mbit/s` receiver while both direct paths exceeded `214 Mbit/s`
+  and both UDP socket drops were zero.
+- Thirteen of twenty intervals were zero. Neither endpoint logged an active
+  failure before the expected timed cancellation, so removing full config and
+  process history did not remove the burst/idle behavior.
+- Reusable rule: once original and minimal fresh processes fail on the same
+  allowed port with healthy direct/socket gates, stop process-restart and
+  config-reduction work. Require a new Exit or a host-local path discriminator
+  before spending client acceptance runs.
