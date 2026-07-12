@@ -369,6 +369,10 @@ fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
 }
 
 #[cfg(test)]
+#[path = "quic_path_probe.rs"]
+mod path_probe;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
