@@ -1,5 +1,20 @@
 # Learnings
 
+## 2026-07-12 - Host-local TUIC isolates the external sender/path interaction
+
+- The exact pool-1 direct-TUIC probe and sing-box binary reached `199.639
+  Mbit/s` receiver on `.111` loopback, with `20/20` nonzero intervals and a
+  `169.868 Mbit/s` minimum interval. Both Connect relays completed and
+  Quinn/socket error counters were zero.
+- The same target sender that had `15/20` zero intervals and about `5.08
+  Mbit/s` through external TUIC delivered every interval at `201 Mbit/s`
+  host-local. The tested sing-box TUIC ingress/copy has capacity; its external
+  quic-go sender/path interaction is the remaining boundary.
+- Reusable rule: pair a cross-host protocol failure with an exact host-local
+  protocol control before blaming internal copy code. When host-local and
+  minimal cross-host transport both pass, preserve downstream product
+  architecture and change the protocol-server implementation/version next.
+
 ## 2026-07-12 - Direct TUIC removes D16 and server CC from the capacity root
 
 - A pool-1 generic OrderedJoin probe reproduced the low result without TUN,

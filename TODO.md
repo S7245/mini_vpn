@@ -197,6 +197,21 @@ Next run one host-local `.111` TUIC loopback discriminator with the same Cubic
 service and exact probe; Gate A and Gate B remain frozen. Result:
 `docs/tech/2026-07-12-knife14h10d16-direct-tuic-server-cc-results.md`.
 
+The host-local `.111` discriminator passed. The exact `0f07406` direct probe,
+same sing-box `1.13.14` binary, Cubic/safe1200 client, Cubic server, pool 1,
+and `.77` target reached `199.639 Mbit/s` receiver. All `20/20` intervals were
+nonzero, the minimum interval was `169.868 Mbit/s`, both control/data relays
+completed, and Quinn/socket error surfaces were zero. Target sender aggregate
+was `201 Mbit/s`, versus `5.08 Mbit/s` and `15/20` zero intervals in the
+external Cubic run. This proves the tested sing-box TUIC/copy path has capacity
+and moves the active root to its external sender interaction with `.111 ->
+.27`; it does not justify any D16/product edit. Next run one strict cross-host
+server implementation/version A/B on `.111:8443`, preserving the exact probe,
+profile, target, floor, and target journal. Gate A and Gate B remain frozen.
+This paragraph overrides the older historical next-action text below.
+Result:
+`docs/tech/2026-07-12-knife14h10d16-host-local-tuic-results.md`.
+
 The next task is now an external same-window capability precondition, not a
 production code edit. Mature sing-box reverse P1 controls fell to
 `14.207 Mbit/s` and then `1.363 Mbit/s` despite correct routing, `16 MiB` client

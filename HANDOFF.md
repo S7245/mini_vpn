@@ -279,6 +279,18 @@ This section overrides the older G7/G8/GV next-step text below.
   host-local TUIC loopback discriminator with the same Cubic service and exact
   probe. Do not change D16 or run Gate A/B. Result:
   `docs/tech/2026-07-12-knife14h10d16-direct-tuic-server-cc-results.md`.
+- The host-local discriminator passed with the exact `0f07406` probe and same
+  sing-box `1.13.14` binary on `.111`: receiver was `199.639 Mbit/s`, all
+  `20/20` intervals were nonzero, the minimum interval was `169.868 Mbit/s`,
+  both Connect relays completed, and Quinn/socket error surfaces were zero.
+  The same target sender that had `15/20` zero intervals on the external Cubic
+  run was continuous at `201 Mbit/s` host-local. This rejects an intrinsic
+  sing-box TUIC/copy limit and locks the active boundary to the current
+  sing-box/quic-go external sender's interaction with `.111 -> .27`. Preserve
+  D16. Next compare one alternate mature TUIC server implementation/version on
+  the same `.111:8443` cross-host path with the exact probe and floor. Gate A/B
+  remain frozen. Result:
+  `docs/tech/2026-07-12-knife14h10d16-host-local-tuic-results.md`.
 - The worktree is intentionally dirty and overlapping D16 files contain older
   experiments. Do not revert user changes and do not commit whole files without
   first showing which pre-D16 diffs would be included.

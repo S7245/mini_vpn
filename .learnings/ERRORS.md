@@ -1,5 +1,15 @@
 # Errors
 
+## 2026-07-12 - A server leaf certificate is not the client trust anchor
+
+- Symptom: the first host-local TLS preflight failed with `UnknownIssuer`
+  before opening any TUIC Connect stream or starting iperf traffic.
+- Cause: the server leaf certificate was streamed into the client CA FIFO.
+- Correct behavior: keep the service leaf/key FIFOs distinct from the client
+  trust-anchor FIFO, source the configured CA specifically, and require TLS/
+  TUIC preflight success before measured traffic. Preserve the failed
+  preflight as setup evidence, not as a capacity run.
+
 ## 2026-07-12 - Preserve pipeline exit status and exact test-binary build path
 
 - The first remote direct-TUIC command piped the ignored test through `tee`
