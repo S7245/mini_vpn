@@ -126,10 +126,10 @@ Add one test-only direct TUIC Connect probe on `.27`:
 - reuse `TuicUpstream` authentication and generic `open_tcp` against `.111`
   sing-box, with `tcp_pool=1` and the default ordered-join relay so auxiliary
   pool policy and all native/D16 readers are absent;
-- bind one loopback-only TCP listener on `.27`; relay its single accepted
-  socket directly to one TUIC Connect stream targeting `.77:5201` with bounded
-  Tokio copy buffers, then run the ordinary iperf3 reverse client against that
-  listener;
+- bind one loopback-only TCP listener on `.27`; relay the iperf3 control and P1
+  data sockets to separate TUIC Connect streams targeting `.77:5201`, with
+  bounded concurrency and Tokio copy buffers, then run the ordinary iperf3
+  reverse client against that listener;
 - keep TUN, smoltcp, the D16 queue/actor, and the product event loop absent;
 - retain Cubic/safe1200, the 20-second reverse direction, interval reporting,
   exact source/binary hashes, and a strict `>150 Mbit/s` plus no-zero-interval

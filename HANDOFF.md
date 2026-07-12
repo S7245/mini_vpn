@@ -261,11 +261,24 @@ This section overrides the older G7/G8/GV next-step text below.
   Quinn therefore have sufficient continuous Gate A/Gate B capacity and do
   not reproduce TUIC burst/idle. Next TDD a test-only direct TUIC Connect
   relay through `.111` to `.77`: `tcp_pool=1`, generic ordered `open_tcp`, and
-  one loopback iperf3 socket, bypassing auxiliary-pool policy, TUN, smoltcp,
-  native readers, and D16. Use its result to distinguish TUIC/client/server
-  stream service from the product integration. Do not reopen D16 or spend
-  Gate A yet. Result:
+  bounded loopback iperf3 control/data sockets, bypassing auxiliary-pool
+  policy, TUN, smoltcp, native readers, and D16. Use its result to distinguish
+  TUIC/client/server stream service from the product integration. Do not
+  reopen D16 or spend Gate A yet. Result:
   `docs/tech/2026-07-12-knife14h10d16-minimal-quinn-path-results.md`.
+- The direct TUIC discriminator is complete at `0f07406`. With the exact same
+  release test binary, pool 1, generic OrderedJoin, client Cubic/safe1200,
+  `.111` sing-box, and `.77` target, server BBR reached only `3.775 Mbit/s`
+  receiver with `14/20` zero client intervals and `3441ms` maximum data-read
+  gap. Changing only the temporary server CC to Cubic reached only `2.674
+  Mbit/s`; client delivery became continuous with a `225ms` maximum read gap,
+  but `.77` still sent in roughly five-second bursts and had `15/20` zero
+  sender intervals. Client Quinn loss/congestion/blocking remained clean.
+  This excludes TUN/smoltcp/native D16/pool-2 and rejects server BBR as the
+  capacity root; BBR only worsens the burst shape. Next run one `.111`
+  host-local TUIC loopback discriminator with the same Cubic service and exact
+  probe. Do not change D16 or run Gate A/B. Result:
+  `docs/tech/2026-07-12-knife14h10d16-direct-tuic-server-cc-results.md`.
 - The worktree is intentionally dirty and overlapping D16 files contain older
   experiments. Do not revert user changes and do not commit whole files without
   first showing which pre-D16 diffs would be included.

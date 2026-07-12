@@ -173,13 +173,29 @@ at the known raw-path shaping edge did not interrupt continuous delivery. This
 rules out raw UDP and minimal Quinn as the TUIC burst/idle root. The next
 approved design seam is a test-only direct TUIC Connect relay from `.27`
 through `.111` to `.77`: force `tcp_pool=1`, use generic ordered `open_tcp`,
-and bridge one loopback iperf3 client socket directly to that relay. This
-bypasses auxiliary-pool policy, TUN, smoltcp, native readers, and D16.
+and bridge the loopback iperf3 control/data sockets to separate Connect
+streams. This bypasses auxiliary-pool policy, TUN, smoltcp, native readers,
+and D16.
 RED/GREEN the loopback relay, byte accounting, half-close/EOF, and bounded
 shutdown locally, then run one strict `>150 Mbit/s` cross-host discriminator.
 Gate A and Gate B remain frozen.
 Result:
 `docs/tech/2026-07-12-knife14h10d16-minimal-quinn-path-results.md`.
+
+The direct TUIC probe is implemented at `0f07406` and its server-CC A/B is
+complete. The exact same release test binary, pool 1, generic OrderedJoin,
+client Cubic/safe1200, `.111` sing-box, and `.77` target reached only `3.775
+Mbit/s` with server BBR and `2.674 Mbit/s` with server Cubic. BBR caused
+`14/20` zero client intervals and `3441ms` data-read gaps; Cubic made client
+delivery continuous and reduced the maximum data-read gap to `225ms`, but the
+`.77` sender still had `15/20` zero intervals and roughly five-second bursts.
+Quinn loss/congestion/blocking surfaces stayed clean. Because this path has no
+TUN, smoltcp, native reader, D16, product event loop, or auxiliary pool slot,
+the active root is now sing-box TUIC server/copy/flow-control behavior or its
+external QUIC-path interaction. Server BBR is rejected as a capacity root.
+Next run one host-local `.111` TUIC loopback discriminator with the same Cubic
+service and exact probe; Gate A and Gate B remain frozen. Result:
+`docs/tech/2026-07-12-knife14h10d16-direct-tuic-server-cc-results.md`.
 
 The next task is now an external same-window capability precondition, not a
 production code edit. Mature sing-box reverse P1 controls fell to

@@ -1,5 +1,21 @@
 # Learnings
 
+## 2026-07-12 - Direct TUIC removes D16 and server CC from the capacity root
+
+- A pool-1 generic OrderedJoin probe reproduced the low result without TUN,
+  smoltcp, native readers, D16, or the product event loop: server BBR reached
+  `3.775 Mbit/s` and server Cubic reached `2.674 Mbit/s`.
+- Server Cubic removed client-visible zero intervals and reduced data-read gaps
+  from `3441ms` to `225ms`, but the target TCP sender still had `15/20` zero
+  intervals. Congestion control changed buffering/pacing shape, not capacity.
+- Target-side sender intervals are a stronger boundary signal than client read
+  intervals after an intermediary can buffer. Continuous client delivery does
+  not prove continuous upstream service.
+- Reusable rule: once a direct protocol relay reproduces failure and the
+  target sender itself stalls, preserve the downstream product architecture.
+  Move the next discriminator to the protocol server or a host-local path
+  before changing client queues, readers, wakeups, MTU, or windows.
+
 ## 2026-07-12 - Minimal Quinn crosses the raw-path shaping edge continuously
 
 - A test-only Quinn Cubic/safe1200 reverse ordered stream sustained `192.597

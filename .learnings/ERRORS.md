@@ -1,5 +1,19 @@
 # Errors
 
+## 2026-07-12 - Preserve pipeline exit status and exact test-binary build path
+
+- The first remote direct-TUIC command piped the ignored test through `tee`
+  without `pipefail`; the test failed but SSH returned status zero from `tee`.
+  Future remote test pipelines must set `set -o pipefail` or avoid the pipe.
+- Rebuilding the same source in a different clean-clone path changed the test
+  binary SHA because another compiled test module embeds
+  `CARGO_MANIFEST_DIR`. For strict A/B, rebuild at the same absolute path and
+  require the previous SHA before traffic, or preserve the exact binary.
+- A long binary copy can outlive the tool's visible output wait. Never start a
+  second writer; poll the existing process/file to completion or explicitly
+  terminate it and remove the partial file before switching to one compressed
+  stream.
+
 ## 2026-07-12 - Unbounded Quinn probe shutdown obscured completed transfer time
 
 - Symptom: the server transfer and completion ACK finished in about `20.3s`,
