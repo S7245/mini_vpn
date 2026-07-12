@@ -106,6 +106,22 @@ window. Reaching Gate A now requires a genuinely independent capable Exit; a
 host-local network-namespace mature control is useful only if more attribution
 is required before provisioning that Exit.
 
+The new independent `.111` Exit also failed the historical mature precondition:
+`.111 -> .77` direct was `212.013 Mbit/s`, control direct was `214.092 Mbit/s`,
+both UDP socket drops were zero, but TUIC receiver was only `4.928 Mbit/s` with
+thirteen zero-rate seconds. This rules out `.33`-specific process/host state as
+a sufficient root.
+
+Code review now requests a Gate-process correction before more VPS traffic.
+The only authorization control hard-codes sing-box `BBR` and MTU `1500`, while
+the exact product Gate uses mini_vpn `Cubic` and safe MTU `1200`; mini_vpn's own
+TUIC source documents BBR as an experimental override that may underperform
+Cubic. Add one TDD-locked, versioned `gate-aligned` mature profile (`Cubic +
+MTU1200`) and keep the old historical profile as a diagnostic result rather
+than the sole authorization predicate. The aligned control must still exceed
+`150 Mbit/s` with both socket drops zero before clean `bdaa19c` scoped. Do not
+run scoped or Gate A until this plan is confirmed and implemented.
+
 The next task is now an external same-window capability precondition, not a
 production code edit. Mature sing-box reverse P1 controls fell to
 `14.207 Mbit/s` and then `1.363 Mbit/s` despite correct routing, `16 MiB` client

@@ -3957,3 +3957,16 @@ active root unless it repeats.
   or mini_vpn scoped runs on this host window. Treat the `.33` host or external
   QUIC path as the blocker until a host-local discriminator or a genuinely
   independent Exit changes the evidence.
+
+## 2026-07-12 - Independent Exit did not rescue the historical control
+
+- Symptom: a new `.111` Exit with healthy direct capacity, verified UDP
+  arrival, full socket buffers, and zero drops still produced only `4.928
+  Mbit/s` under the fixed historical BBR/MTU1500 mature control.
+- Review finding: the sole precondition profile does not match the authorized
+  product path, which uses Cubic/safe1200; project source already warns that
+  BBR may underperform Cubic on affected paths.
+- Correct behavior: do not repeat the historical control on more Exits or run
+  mini_vpn without qualification. TDD a fixed gate-aligned mature profile,
+  preserve the historical profile as diagnostic evidence, and keep the same
+  `>150 Mbit/s` plus zero-drop floor.

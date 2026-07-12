@@ -200,6 +200,22 @@ This section overrides the older G7/G8/GV next-step text below.
   This leaves the `.33` host/Client-to-Exit QUIC path, not mini_vpn or the old
   service process, as the external blocker. Scoped `bdaa19c`, Gate A, and Gate
   B remain unspent.
+- A fourth independent Exit `.111` (`43.173.101.111`) was authorized, added to
+  `AGENTS.md` at `559f7a8`, and tested with the same sing-box `1.13.14` binary
+  and FIFO-only service. `.111 -> .77` direct reached `212.013 Mbit/s`; the
+  versioned control direct receiver was `214.092 Mbit/s`; both UDP socket drops
+  were zero. Mature TUIC still reached only `4.928 Mbit/s`, with thirteen of
+  twenty intervals at zero. This removes `.33`-specific host/process state as
+  a sufficient explanation.
+- Follow-up code review found a Gate-process P1: the sole authorization control
+  is hard-coded to mature-client `BBR + MTU1500`, while the product Gate profile
+  is mini_vpn `Cubic + safe1200`; `src/tuic.rs` explicitly records BBR as an
+  experimental override that can underperform Cubic. The historical control
+  remains valid historical evidence but is no longer a sound sole necessary
+  predicate after repeated independent-Exit false negatives. Before another
+  VPS run, TDD a fixed versioned gate-aligned mature control (`Cubic + MTU1200`)
+  while retaining the historical profile as a reported diagnostic. It must
+  still exceed `150 Mbit/s` with socket drop zero before `bdaa19c` scoped runs.
 - The worktree is intentionally dirty and overlapping D16 files contain older
   experiments. Do not revert user changes and do not commit whole files without
   first showing which pre-D16 diffs would be included.

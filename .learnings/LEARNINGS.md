@@ -5948,3 +5948,17 @@ worth cleaning up separately.
   allowed port with healthy direct/socket gates, stop process-restart and
   config-reduction work. Require a new Exit or a host-local path discriminator
   before spending client acceptance runs.
+
+## 2026-07-12 - Independent Exit exposes a control-to-product mismatch
+
+- A fresh `.111` Exit had direct capacity above `212 Mbit/s`, verified UDP
+  arrival, `16 MiB` sockets, and zero drops, but the historical mature control
+  still reached only `4.928 Mbit/s` with thirteen zero-rate seconds.
+- The historical control hard-codes BBR/MTU1500 while the actual product Gate
+  is Cubic/safe1200. The control remains useful historical evidence, but after
+  repeated independent-Exit false negatives it cannot remain the sole
+  necessary predicate for the different product profile.
+- Reusable rule: a capability precondition must match the mechanism it is
+  authorizing closely enough to avoid systematic false negatives. Keep
+  historical controls as diagnostics and add a fixed, versioned gate-aligned
+  control rather than lowering the floor or bypassing external qualification.

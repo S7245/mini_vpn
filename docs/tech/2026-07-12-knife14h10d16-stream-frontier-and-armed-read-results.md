@@ -150,6 +150,57 @@ unspent. A new independent capable Exit is the shortest path to acceptance; a
 host-local network-namespace mature control can further distinguish server/
 kernel behavior from the external UDP path but cannot itself authorize Gate A.
 
+## Independent `.111` Exit Result
+
+The newly authorized independent Exit `.111` was prepared with the exact
+sing-box `1.13.14` binary hash, FIFO-only configuration/certificate/key input,
+temporary high socket buffers, a `60m` restore watchdog, and a verified UDP
+`8443` host-arrival probe. Clean `559f7a8` passed the focused armed-read test,
+both runner self-tests, release build, source check, and direct-path preflight.
+
+- `.111 -> .77` direct receiver: `212.013 Mbit/s`;
+- control direct receiver: `214.092 Mbit/s`;
+- mature TUIC sender/receiver: `7.129/4.928 Mbit/s`;
+- client and Exit UDP socket drops: `0`;
+- thirteen of twenty one-second intervals: exactly zero.
+
+The client emitted no error and the Exit only logged the expected timed remote
+cancellation. The temporary service, watchdog, binary, FIFO, and socket sysctl
+changes were removed; `.111` retained only its authorized public key and the
+installed iperf3 client. Artifact:
+`/tmp/mini_vpn_h10d16_exit111_control.tar.gz`.
+
+This falsifies an Exit-host-specific root. The common remaining surfaces are
+the `.27` Client-to-Exit UDP/QUIC window and the capability-control shape.
+
+## Capability-Control Code Review
+
+Verdict: **request a Gate-process correction; keep D16 unchanged.**
+
+The sole authorization script hard-codes sing-box congestion control `bbr`
+and TUN MTU `1500` (`scripts/knife14h10d16-singbox-control.sh`), whereas the
+actual D16 Gate runner requires `MINI_VPN_TUIC_CC=cubic` and TUN MTU `1200`.
+`src/tuic.rs` documents Cubic as the production default and BBR as an
+experimental override that can materially underperform on affected paths.
+
+The historical control was deliberately versioned and has produced capable
+results before, so its observations remain valid. However, after the same
+burst/idle false negative across independent Exits, it is not a sound sole
+necessary predicate for a different product profile.
+
+The recommended TDD correction is:
+
+1. preserve the historical `BBR + MTU1500` profile as a named diagnostic;
+2. add a fixed `gate-aligned` mature profile using `Cubic + MTU1200`;
+3. extend self-tests to assert the exact profile label, MTU, congestion control,
+   route shape, and fail-closed floor;
+4. authorize one clean `bdaa19c` scoped run only when the gate-aligned mature
+   receiver exceeds `150 Mbit/s` and both socket drops are zero.
+
+This does not relax the capacity floor or authorize Gate A from the failed
+historical result. It removes a control-to-product mismatch before the next
+external measurement.
+
 External artifacts:
 
 - `/tmp/mini_vpn_h10d16_service_batch_scoped_99ff0f4/`
