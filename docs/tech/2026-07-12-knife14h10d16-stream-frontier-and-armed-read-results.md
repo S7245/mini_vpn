@@ -95,6 +95,29 @@ reproduces the external burst/idle discriminator and does not measure
 window. Local artifact:
 `/tmp/mini_vpn_h10d16_bdaa19c_control_current.tar.gz`.
 
+## Isolated `.33` Service Port Discriminator
+
+A same-version minimal sing-box service was started independently on
+`.33:9443` while the original `.33:8443` service remained active. The new unit
+was active, listened on UDP `9443`, inherited the same TUIC inbound, and used
+the existing high socket-buffer settings. Clean `8cc0f15` control setup and
+target-only routing passed, with a `217.011 Mbit/s` direct receiver, but the
+TUIC open timed out after five seconds with no recent network activity.
+
+This was a reachability failure rather than a low capacity result. A bounded
+packet-arrival A/B sent one UDP byte from `.27` to each port while `.33`
+captured both ports. The host received the `8443` packet and did not receive
+the `9443` packet. Therefore an upstream firewall/security policy blocks the
+alternate port before `.33`; service configuration and mini_vpn were not
+measured. The temporary unit was removed and original `8443` remained active.
+Artifact:
+`/tmp/mini_vpn_h10d16_alt9443_control_current.tar.gz`.
+
+The next discriminator requires a maintenance swap on the already-open
+`8443`: stop the original unit, let the minimal isolated unit own `8443`, run
+one mature control, then restore the original unit on every exit path. This is
+an external service-state change and must be confirmed before execution.
+
 External artifacts:
 
 - `/tmp/mini_vpn_h10d16_service_batch_scoped_99ff0f4/`

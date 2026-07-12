@@ -3935,3 +3935,14 @@ active root unless it repeats.
   material is intentionally non-persistent, let one fail-closed transient run
   consume all three FIFOs and require an active unit plus the expected UDP
   listener before capability traffic.
+
+## 2026-07-12 - A listening alternate port was blocked before the VPS
+
+- Symptom: the independent `.33:9443` sing-box unit was active with a healthy
+  UDP socket, but the mature control timed out before server accept and did not
+  produce a throughput result.
+- Discriminator: a simultaneous capture saw the probe sent to allowed port
+  `8443` and did not see the probe sent to `9443`.
+- Correct behavior: add a host-arrival probe before an alternate-port control.
+  Do not diagnose authentication, TLS, QUIC, or client throughput until the
+  server host has observed the packet.

@@ -85,6 +85,16 @@ The `bdaa19c` scoped run and composite Gate A remain unspent. The next action
 requires an independent Exit-service change or genuinely capable control
 window, not another unchanged restart/retry or a mini_vpn parameter edit.
 
+The attempted independent `.33:9443` service started and listened correctly,
+but its mature control timed out before opening a TUIC stream. A controlled
+packet-arrival A/B sent one UDP byte to `8443` and one to `9443`; `.33` captured
+the `8443` packet and no `9443` packet. The alternate port is blocked outside
+the host, so this was not a capability measurement. The safe next discriminator
+is a user-confirmed maintenance window: temporarily replace the original
+`8443` process with the minimal isolated service, run one control, and restore
+the original service on every exit path. Scoped mini_vpn and Gate A remain
+unspent.
+
 The next task is now an external same-window capability precondition, not a
 production code edit. Mature sing-box reverse P1 controls fell to
 `14.207 Mbit/s` and then `1.363 Mbit/s` despite correct routing, `16 MiB` client

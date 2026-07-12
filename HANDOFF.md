@@ -180,6 +180,15 @@ This section overrides the older G7/G8/GV next-step text below.
   were `3.143` and `0.695 Mbit/s`. This is another incapable external TUIC
   window, not evidence about `bdaa19c`. Do not run scoped mini_vpn or composite
   Gate A from this window.
+- An isolated same-version second service on `.33` was then started cleanly on
+  UDP `9443` while the original `8443` service remained active. Its mature
+  control was not a capacity result: the client timed out before a TUIC stream
+  opened. A simultaneous `.33` capture received the one-byte probe sent to
+  `8443` but received nothing sent to `9443`, proving that the new port is
+  blocked before the host. The second service was removed and original `8443`
+  stayed healthy. Continuing this discriminator requires a confirmed
+  maintenance swap where the minimal service temporarily owns the already-open
+  `8443`; do not interpret the `9443` timeout as mini_vpn evidence.
 - The worktree is intentionally dirty and overlapping D16 files contain older
   experiments. Do not revert user changes and do not commit whole files without
   first showing which pre-D16 diffs would be included.

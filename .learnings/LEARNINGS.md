@@ -5923,3 +5923,14 @@ worth cleaning up separately.
   capability change. Never spend the scoped mini_vpn run or Gate A merely
   because deployment is clean; the immediately preceding mature control must
   itself pass the floor.
+
+## 2026-07-12 - Alternate service ports need an arrival gate
+
+- A clean second sing-box service on `.33:9443` was active and listening, but
+  the mature client timed out before opening a TUIC stream.
+- A simultaneous one-byte UDP A/B proved that `.33` received the `8443` probe
+  and did not receive the `9443` probe. The cloud/upstream policy, not the
+  process, blocked the alternate port.
+- Reusable rule: before treating a new UDP port as an independent service
+  discriminator, prove packet arrival at the host. A listen socket and zero
+  socket drops cannot distinguish an upstream firewall from no client traffic.
