@@ -288,18 +288,25 @@ Current acceptance hosts:
   `sudo systemctl status sing-box`; log file is `/var/log/sing-box.log`.
 - Target VPS `.77` (`43.130.32.77`): iperf3 host. Check service with
   `systemctl status iperf3`; inspect logs with `journalctl -u iperf3`.
+- Independent Exit VPS `.111` (`43.173.101.111`): authorized for direct agent
+  access and Knife14 TUIC capability/Gate A work. UDP `8443` is externally
+  allowed.
 
 SSH access:
 
 - From the Mac mini, use `ssh -i ~/.ssh/vpn ubuntu@<host>` for `.27`, `.33`,
-  and `.77`.
+  `.77`, and `.111`.
 - From `.27`, use `ssh -i ~/.ssh/vpn ubuntu@43.153.32.33` and
-  `ssh -i ~/.ssh/vpn ubuntu@43.130.32.77`.
+  `ssh -i ~/.ssh/vpn ubuntu@43.130.32.77`. The same key may be used for
+  `.111` after reachability is verified.
 
 Operational rules:
 
 - The agent may run smoke tests, pressure tests, and collect logs directly from
   these VPS hosts when the task calls for it.
+- The agent may access `.111` and operate temporary TUIC services on its
+  allowed UDP `8443` without requesting per-command authorization. Preserve
+  fail-closed cleanup and do not persist credentials or private keys.
 - Do not store TUIC UUIDs, passwords, private keys, or other secrets in the
   repository, specs, learning memory, or final summaries.
 - When a `.27` VPS suite may need `sudo -v`, start it in a true writable TTY
