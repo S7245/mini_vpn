@@ -1,7 +1,7 @@
 use std::io::BufReader;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -122,7 +122,7 @@ struct ProbeServerResult {
 
 #[derive(Debug, Clone, Copy)]
 struct ProbeQuicStats {
-    rtt_ms: u64,
+    rtt_us: u64,
     cwnd: u64,
     sent_packets: u64,
     lost_packets: u64,
@@ -140,7 +140,7 @@ struct ProbeQuicStats {
 fn probe_quic_stats(connection: &quinn::Connection) -> ProbeQuicStats {
     let stats = connection.stats();
     ProbeQuicStats {
-        rtt_ms: stats.path.rtt.as_millis() as u64,
+        rtt_us: stats.path.rtt.as_micros() as u64,
         cwnd: stats.path.cwnd,
         sent_packets: stats.path.sent_packets,
         lost_packets: stats.path.lost_packets,
@@ -158,9 +158,9 @@ fn probe_quic_stats(connection: &quinn::Connection) -> ProbeQuicStats {
 
 fn print_probe_stats(side: &str, stats: ProbeQuicStats) {
     println!(
-        "quinn_probe_stats side={} rtt_ms={} cwnd={} sent_packets={} lost_packets={} lost_bytes={} congestion_events={} tx_data_blocked={} tx_stream_data_blocked={} udp_tx_datagrams={} udp_tx_bytes={} udp_rx_datagrams={} udp_rx_bytes={} max_datagram_size={}",
+        "quinn_probe_stats side={} rtt_us={} cwnd={} sent_packets={} lost_packets={} lost_bytes={} congestion_events={} tx_data_blocked={} tx_stream_data_blocked={} udp_tx_datagrams={} udp_tx_bytes={} udp_rx_datagrams={} udp_rx_bytes={} max_datagram_size={}",
         side,
-        stats.rtt_ms,
+        stats.rtt_us,
         stats.cwnd,
         stats.sent_packets,
         stats.lost_packets,
@@ -174,6 +174,12 @@ fn print_probe_stats(side: &str, stats: ProbeQuicStats) {
         stats.udp_rx_bytes,
         stats.max_datagram_size,
     );
+}
+
+async fn close_probe_endpoint(connection: &quinn::Connection, endpoint: &Endpoint) {
+    connection.close(0u32.into(), b"probe complete");
+    endpoint.close(0u32.into(), b"probe complete");
+    let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
 }
 
 fn probe_server_endpoint(
@@ -262,8 +268,7 @@ async fn run_probe_server_once(endpoint: Endpoint) -> Result<ProbeServerResult, 
     }
     let elapsed = started.elapsed();
     let stats = probe_quic_stats(&connection);
-    connection.close(0u32.into(), b"probe complete");
-    endpoint.wait_idle().await;
+    close_probe_endpoint(&connection, &endpoint).await;
     Ok(ProbeServerResult {
         total_bytes,
         elapsed,
@@ -394,8 +399,7 @@ async fn run_probe_client(
         .map_err(|err| format!("probe interval sampler join: {err}"))?;
     let total_bytes = total_bytes.load(Ordering::Relaxed);
     let stats = probe_quic_stats(&connection);
-    connection.close(0u32.into(), b"probe complete");
-    endpoint.wait_idle().await;
+    close_probe_endpoint(&connection, &endpoint).await;
     Ok(ProbeClientResult {
         total_bytes,
         pattern_errors,
