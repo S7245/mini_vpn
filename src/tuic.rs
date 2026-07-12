@@ -4166,6 +4166,10 @@ impl crate::failover::HealthProbe for TuicUpstream {
 }
 
 #[cfg(test)]
+#[path = "tuic_direct_probe.rs"]
+mod direct_probe;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::shared::TargetAddr;

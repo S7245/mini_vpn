@@ -53,3 +53,6 @@ harness = []
 tokio = { version = "1", features = ["full", "test-util"] }
 # 刀6：独立解析手写的 TLS 1.3 ClientHello（验证结构，与我方编码器解耦——别用自己的解析器验自己的编码器）。
 tls-parser = "0.12"
+# Knife14 H10d16 direct-TUIC ignored probe parses iperf3 JSON without changing
+# the product dependency graph.
+serde_json = "1"
