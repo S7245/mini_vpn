@@ -11,10 +11,46 @@ use super::*;
 struct BridgeResult {
     accepted_connections: usize,
     completed_connections: usize,
+    terminal_reset_connections: usize,
     failed_connections: usize,
     local_to_remote_bytes: u64,
     remote_to_local_bytes: u64,
+    first_terminal_reset: Option<String>,
     first_failure: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BridgeFailureKind {
+    TerminalReset,
+    Unexpected,
+}
+
+#[derive(Debug)]
+struct BridgeFailure {
+    kind: BridgeFailureKind,
+    message: String,
+}
+
+impl BridgeFailure {
+    fn unexpected(message: String) -> Self {
+        Self {
+            kind: BridgeFailureKind::Unexpected,
+            message,
+        }
+    }
+
+    fn relay_io(target: &TargetAddr, err: std::io::Error) -> Self {
+        let kind = match err.kind() {
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
+                BridgeFailureKind::TerminalReset
+            }
+            _ => BridgeFailureKind::Unexpected,
+        };
+        Self {
+            kind,
+            message: format!("direct TUIC probe relay {target:?}: {err}"),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -23,6 +59,30 @@ struct IperfProbeResult {
     intervals: usize,
     zero_intervals: usize,
     min_interval_mbps: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimedCapacityTerminal {
+    Clean,
+    OneReset,
+}
+
+impl TimedCapacityTerminal {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::OneReset => "one_reset",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct TimedCapacityProbeResult {
+    receiver_mbps: f64,
+    intervals: usize,
+    zero_intervals: usize,
+    min_interval_mbps: f64,
+    terminal: TimedCapacityTerminal,
 }
 
 fn validate_reverse_iperf3_json(
@@ -76,6 +136,44 @@ fn validate_reverse_iperf3_json(
         intervals: interval_mbps.len(),
         zero_intervals,
         min_interval_mbps: interval_mbps.into_iter().reduce(f64::min).unwrap_or(0.0),
+    })
+}
+
+fn validate_timed_capacity_probe(
+    raw: &str,
+    expected_intervals: usize,
+    floor_mbps: f64,
+    bridge: &BridgeResult,
+) -> Result<TimedCapacityProbeResult, String> {
+    let iperf = validate_reverse_iperf3_json(raw, expected_intervals, floor_mbps)?;
+    let terminal = match (
+        bridge.accepted_connections,
+        bridge.completed_connections,
+        bridge.terminal_reset_connections,
+        bridge.failed_connections,
+        bridge.first_terminal_reset.as_deref(),
+        bridge.first_failure.as_deref(),
+    ) {
+        (2, 2, 0, 0, None, None) => TimedCapacityTerminal::Clean,
+        (2, 1, 1, 0, Some(_), None) => TimedCapacityTerminal::OneReset,
+        _ => {
+            return Err(format!(
+                "direct TUIC timed-capacity bridge invalid: accepted={} completed={} terminal_resets={} failed={} first_terminal_reset={} first_failure={}",
+                bridge.accepted_connections,
+                bridge.completed_connections,
+                bridge.terminal_reset_connections,
+                bridge.failed_connections,
+                bridge.first_terminal_reset.as_deref().unwrap_or("none"),
+                bridge.first_failure.as_deref().unwrap_or("none")
+            ));
+        }
+    };
+    Ok(TimedCapacityProbeResult {
+        receiver_mbps: iperf.receiver_mbps,
+        intervals: iperf.intervals,
+        zero_intervals: iperf.zero_intervals,
+        min_interval_mbps: iperf.min_interval_mbps,
+        terminal,
     })
 }
 
@@ -200,12 +298,17 @@ async fn run_cross_host_direct_tuic_probe_from_env() -> Result<(), String> {
             .map_err(|err| format!("direct TUIC probe write iperf3 JSON {path:?}: {err}"))?;
     }
     println!(
-        "direct_tuic_probe_bridge accepted_connections={} completed_connections={} failed_connections={} local_to_remote_bytes={} remote_to_local_bytes={} first_failure={}",
+        "direct_tuic_probe_bridge accepted_connections={} completed_connections={} terminal_reset_connections={} failed_connections={} local_to_remote_bytes={} remote_to_local_bytes={} first_terminal_reset={} first_failure={}",
         bridge_result.accepted_connections,
         bridge_result.completed_connections,
+        bridge_result.terminal_reset_connections,
         bridge_result.failed_connections,
         bridge_result.local_to_remote_bytes,
         bridge_result.remote_to_local_bytes,
+        bridge_result
+            .first_terminal_reset
+            .as_deref()
+            .unwrap_or("none"),
         bridge_result.first_failure.as_deref().unwrap_or("none"),
     );
     if !output.status.success() {
@@ -215,23 +318,15 @@ async fn run_cross_host_direct_tuic_probe_from_env() -> Result<(), String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let iperf = validate_reverse_iperf3_json(&stdout, duration_secs as usize, floor_mbps)?;
-    if bridge_result.failed_connections != 0 {
-        return Err(format!(
-            "direct TUIC probe relay failures={} first_failure={}",
-            bridge_result.failed_connections,
-            bridge_result.first_failure.as_deref().unwrap_or("unknown")
-        ));
-    }
-    if bridge_result.completed_connections < 2 {
-        return Err(format!(
-            "direct TUIC probe expected iperf control+data relays, completed={}",
-            bridge_result.completed_connections
-        ));
-    }
+    let result =
+        validate_timed_capacity_probe(&stdout, duration_secs as usize, floor_mbps, &bridge_result)?;
     println!(
-        "direct_tuic_probe_result receiver_mbps={:.3} intervals={} zero_intervals={} min_interval_mbps={:.3} verdict=PASS",
-        iperf.receiver_mbps, iperf.intervals, iperf.zero_intervals, iperf.min_interval_mbps,
+        "direct_tuic_probe_result receiver_mbps={:.3} intervals={} zero_intervals={} min_interval_mbps={:.3} terminal={} verdict=PASS",
+        result.receiver_mbps,
+        result.intervals,
+        result.zero_intervals,
+        result.min_interval_mbps,
+        result.terminal.as_str(),
     );
     Ok(())
 }
@@ -240,14 +335,13 @@ async fn relay_one_connection(
     mut local: TcpStream,
     upstream: Arc<dyn ProxyUpstream>,
     target: TargetAddr,
-) -> Result<(u64, u64), String> {
-    let mut remote = upstream
-        .open_tcp(&target)
-        .await
-        .map_err(|err| format!("direct TUIC probe open target {target:?}: {err:?}"))?;
+) -> Result<(u64, u64), BridgeFailure> {
+    let mut remote = upstream.open_tcp(&target).await.map_err(|err| {
+        BridgeFailure::unexpected(format!("direct TUIC probe open target {target:?}: {err:?}"))
+    })?;
     tokio::io::copy_bidirectional(&mut local, &mut remote)
         .await
-        .map_err(|err| format!("direct TUIC probe relay {target:?}: {err}"))
+        .map_err(|err| BridgeFailure::relay_io(&target, err))
 }
 
 async fn run_bounded_loopback_bridge(
@@ -286,8 +380,7 @@ async fn run_bounded_loopback_bridge(
             joined = relays.join_next(), if !relays.is_empty() => {
                 let relay_result = joined
                     .ok_or_else(|| "direct TUIC probe relay set ended unexpectedly".to_string())?
-                    .map_err(|err| format!("direct TUIC probe relay task join: {err}"))
-                    .and_then(|result| result);
+                    .map_err(|err| format!("direct TUIC probe relay task join: {err}"))?;
                 match relay_result {
                     Ok((local_to_remote, remote_to_local)) => {
                         result.completed_connections += 1;
@@ -298,10 +391,20 @@ async fn run_bounded_loopback_bridge(
                             .remote_to_local_bytes
                             .saturating_add(remote_to_local);
                     }
-                    Err(err) => {
-                        result.failed_connections += 1;
-                        if result.first_failure.is_none() {
-                            result.first_failure = Some(err);
+                    Err(failure) => {
+                        match failure.kind {
+                            BridgeFailureKind::TerminalReset => {
+                                result.terminal_reset_connections += 1;
+                                if result.first_terminal_reset.is_none() {
+                                    result.first_terminal_reset = Some(failure.message);
+                                }
+                            }
+                            BridgeFailureKind::Unexpected => {
+                                result.failed_connections += 1;
+                                if result.first_failure.is_none() {
+                                    result.first_failure = Some(failure.message);
+                                }
+                            }
                         }
                     }
                 }
@@ -481,6 +584,97 @@ fn reverse_iperf_gate_requires_floor_and_every_interval_to_carry_data() {
     let below_floor = passing.replace("180000000.0", "150000000.0");
     assert!(validate_reverse_iperf3_json(&below_floor, 2, 150.0).is_err());
     assert!(validate_reverse_iperf3_json(passing, 3, 150.0).is_err());
+}
+
+#[test]
+fn timed_capacity_gate_accepts_complete_iperf_after_one_terminal_reset() {
+    let shoes_capacity = r#"{
+        "intervals":[
+            {"sum":{"bits_per_second":288060000.0}},
+            {"sum":{"bits_per_second":184551000.0}},
+            {"sum":{"bits_per_second":185599000.0}},
+            {"sum":{"bits_per_second":174063000.0}},
+            {"sum":{"bits_per_second":205634000.0}},
+            {"sum":{"bits_per_second":186544000.0}},
+            {"sum":{"bits_per_second":188744000.0}},
+            {"sum":{"bits_per_second":187696000.0}},
+            {"sum":{"bits_per_second":181403000.0}},
+            {"sum":{"bits_per_second":193987000.0}},
+            {"sum":{"bits_per_second":187706000.0}},
+            {"sum":{"bits_per_second":187695000.0}},
+            {"sum":{"bits_per_second":187683000.0}},
+            {"sum":{"bits_per_second":181404000.0}},
+            {"sum":{"bits_per_second":193987000.0}},
+            {"sum":{"bits_per_second":153099296.0}},
+            {"sum":{"bits_per_second":222287000.0}},
+            {"sum":{"bits_per_second":187707000.0}},
+            {"sum":{"bits_per_second":185587000.0}},
+            {"sum":{"bits_per_second":189791000.0}}
+        ],
+        "end":{"sum_received":{"bits_per_second":192665956.0}}
+    }"#;
+    let bridge = BridgeResult {
+        accepted_connections: 2,
+        completed_connections: 1,
+        terminal_reset_connections: 1,
+        failed_connections: 0,
+        local_to_remote_bytes: 513,
+        remote_to_local_bytes: 344,
+        first_terminal_reset: Some(
+            "direct TUIC probe relay IpPort(43.130.32.77:5201): Connection reset by peer (os error 104)"
+                .to_string(),
+        ),
+        first_failure: None,
+    };
+
+    let result = validate_timed_capacity_probe(shoes_capacity, 20, 150.0, &bridge).unwrap();
+    assert_eq!(result.receiver_mbps, 192.665956);
+    assert_eq!(result.intervals, 20);
+    assert_eq!(result.zero_intervals, 0);
+    assert_eq!(result.min_interval_mbps, 153.099296);
+    assert_eq!(result.terminal, TimedCapacityTerminal::OneReset);
+}
+
+#[test]
+fn timed_capacity_gate_rejects_open_failure_even_when_text_mentions_reset() {
+    let complete_iperf = r#"{
+        "intervals":[{"sum":{"bits_per_second":180000000.0}}],
+        "end":{"sum_received":{"bits_per_second":180000000.0}}
+    }"#;
+    let bridge = BridgeResult {
+        accepted_connections: 2,
+        completed_connections: 1,
+        terminal_reset_connections: 0,
+        failed_connections: 1,
+        local_to_remote_bytes: 0,
+        remote_to_local_bytes: 0,
+        first_terminal_reset: None,
+        first_failure: Some(
+            "direct TUIC probe open target: transport Connection reset by peer".to_string(),
+        ),
+    };
+
+    assert!(validate_timed_capacity_probe(complete_iperf, 1, 150.0, &bridge).is_err());
+}
+
+#[test]
+fn timed_capacity_gate_rejects_terminal_reset_without_preserved_cause() {
+    let complete_iperf = r#"{
+        "intervals":[{"sum":{"bits_per_second":180000000.0}}],
+        "end":{"sum_received":{"bits_per_second":180000000.0}}
+    }"#;
+    let bridge = BridgeResult {
+        accepted_connections: 2,
+        completed_connections: 1,
+        terminal_reset_connections: 1,
+        failed_connections: 0,
+        local_to_remote_bytes: 0,
+        remote_to_local_bytes: 0,
+        first_terminal_reset: None,
+        first_failure: None,
+    };
+
+    assert!(validate_timed_capacity_probe(complete_iperf, 1, 150.0, &bridge).is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
