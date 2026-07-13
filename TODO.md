@@ -4,6 +4,27 @@
 
 ### Approved next stage: H10d16 byte-owned egress
 
+#### Latest decision (2026-07-13)
+
+Composite Gate A **passed** from clean `79b41b3` against Shoes `v0.2.7` /
+Quinn `0.11.9` on `.111:8443`. A-capacity reached `192/188 Mbit/s`
+sender/receiver with zero TUN drop, actor bypass, send/flush error, pressure
+debt, and QUIC loss/congestion/blocking. Its only timed terminal was the
+approved exact `local_to_remote/local_socket_terminal`: one bounded `524288B`
+D16 ownership release and `27840B` terminal smoltcp egress. A-clean then
+completed exactly `64 MiB` at `179/179 Mbit/s` and closed through remote EOF
+plus `clean_queue_lifecycle`, with every queue/pending/inflight/terminal-drop/
+close-egress/TUN-drop counter at zero.
+
+Stage 8 and Gate A are closed. The approved next action is implementation-plan
+Task 12 / Gate B: one same-window Gate-aligned sing-box control, three exact
+mini_vpn `20s` reverse-first P1 repeats, the `>=170 Mbit/s` median decision
+(with the documented relative-control fallback), then one fixed-byte clean
+repeat before product regressions. Do not change D16 ownership, actor cadence,
+DrainOnly, EOF, MTU, pool, QUIC windows, chunk size, or self-wake before Gate B.
+Result:
+`docs/tech/2026-07-13-knife14h10d16-shoes-composite-gate-a-results.md`.
+
 H10d15 reached `186/185 Mbit/s` sender/receiver and proved that mini_vpn has
 sing-box-class single-flow capacity when the native QUIC read side maintains a
 service-sized independent pump. It did not pass clean acceptance: the tail had

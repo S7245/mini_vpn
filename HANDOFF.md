@@ -6,6 +6,28 @@
 
 This section overrides the older G7/G8/GV next-step text below.
 
+### Latest accepted position (2026-07-13)
+
+- Composite Gate A **passed** from clean source `79b41b3` against the capable
+  Shoes `v0.2.7` / Quinn `0.11.9` Exit on `.111:8443`.
+- A-capacity completed the exact `20s` reverse-first P1 at `192/188 Mbit/s`.
+  TUN drops, actor bypass, send/flush errors, pressure debt, and QUIC
+  loss/congestion/blocking were zero; active data-stream gaps were below one
+  second. Its only timed-boundary terminal was the approved exact
+  `local_to_remote/local_socket_terminal`, with one bounded `524288B` D16
+  ownership release and `27840B` terminal smoltcp egress.
+- A-clean then completed exactly `64 MiB` at `179/179 Mbit/s` on the same
+  binary/profile/tunnel and closed through remote EOF plus
+  `clean_queue_lifecycle`; queue, reserved, leased, pending, inflight,
+  terminal-drop, close-egress, TUN-drop, bypass, and error counters were zero.
+- This is the first accepted H10d16 Gate A and closes stage 8. Gate B is now
+  unlocked but has not run. Next execute Task 12: one same-window Gate-aligned
+  sing-box control, three mini_vpn timed repeats, the median decision, and one
+  fixed-byte clean repeat. Do not reopen D16, MTU, pool, QUIC windows, chunk,
+  self-wake, or VPS tuning before that evidence.
+- Result:
+  `docs/tech/2026-07-13-knife14h10d16-shoes-composite-gate-a-results.md`.
+
 - H10d15 produced the first strong parity-capacity proof: reverse-first P1
   reached `186 Mbit/s` sender and `185 Mbit/s` receiver with the native permit
   path and service-sized read progress. Active read gaps fell below one second.

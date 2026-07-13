@@ -1151,6 +1151,15 @@ timeout. D16 ownership, actor, pressure, TUN drop, and QUIC loss/blocking
 surfaces stayed clean. A pool-1 discriminator reached `115 Mbit/s`, selecting
 the TCP pool lifecycle seam rather than D16 egress. See Task 11C.
 
+Final result (2026-07-13): **passed** from clean `79b41b3` against the capable
+Shoes `v0.2.7` / Quinn `0.11.9` Exit. A-capacity reached `192/188 Mbit/s` with
+zero TUN/bypass/send/flush/QUIC error surfaces and one exact bounded
+`local_socket_terminal`. A-clean then completed exactly `64 MiB` at
+`179/179 Mbit/s` and closed through `clean_queue_lifecycle` with every owned,
+pending, inflight, terminal-drop, and close-egress counter at zero. Gate B is
+unlocked; proceed to Task 12 without reopening D16. Result:
+`2026-07-13-knife14h10d16-shoes-composite-gate-a-results.md`.
+
 ### Task 11C: Replace Destructive Idle Reconnect With Evidence-Based Pool Health
 
 This is a transport-pool lifecycle correction, not a D16 egress redesign.

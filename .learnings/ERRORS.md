@@ -4117,3 +4117,23 @@ active root unless it repeats.
 - Correct behavior: classify this as shared sender/egress/provider headroom,
   not a client buffer bug or multi-second service stall. Preserve it as a
   ceiling signal and test QUIC below/through the edge with congestion metrics.
+
+## 2026-07-13 - Gate verdict must apply the latest architecture amendment
+
+- Symptom: the first manual reading called the composite run a tail failure
+  because A-capacity ended with nonzero terminal ownership and smoltcp egress.
+- Root cause: that reading applied the older single-window zero-tail rule
+  before re-grounding in the later architecture amendment. The approved AND
+  gate permits one exact bounded `local_socket_terminal` in timed A-capacity
+  and assigns strict zero-tail proof to fixed-byte A-clean.
+- Correct behavior: before declaring any versioned gate PASS or FAIL, quote the
+  latest source-of-truth decision table and classify each evidence window
+  separately. A later amendment supersedes historical failure wording.
+
+## 2026-07-13 - Remote evidence commands cannot assume ripgrep
+
+- Symptom: the first read-only report parser on `.27` produced no evidence
+  because `rg` was not installed.
+- Correct behavior: use `command -v rg` and fall back to POSIX `grep`/`sed` in
+  VPS evidence commands. A missing convenience tool must not be mistaken for
+  an empty report.

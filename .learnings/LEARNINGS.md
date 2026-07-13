@@ -6097,3 +6097,23 @@ worth cleaning up separately.
 - Reusable rule: sufficient raw bandwidth does not clear a protocol stack.
   Move one layer upward to a minimal QUIC probe before blaming TUIC or product
   egress; keep exact CC, MTU, windows, socket buffers, and direction fixed.
+
+## 2026-07-13 - Traffic-shaped proofs close Gate A without weakening ownership
+
+- Clean `79b41b3` reached `188 Mbit/s` receiver in the timed A-capacity window
+  with zero TUN drop, actor bypass, send/flush error, pressure debt, and QUIC
+  loss/congestion/blocking. The only terminal was the approved exact local
+  socket boundary: one `524288B` D16 ownership release plus `27840B` already in
+  the terminal smoltcp send queue.
+- The same binary/profile/tunnel then transferred exactly `64 MiB` at
+  `179 Mbit/s` and closed by remote EOF through `clean_queue_lifecycle`, with
+  queue, reserved, leased, pending, inflight, terminal-drop, and close-egress
+  bytes all zero.
+- Reusable rule: do not require an abort-capable timed generator to prove
+  graceful EOF. Require typed, exact, bounded, one-shot accounting at its
+  terminal edge, and use a fixed-byte generator to prove natural EOF and zero
+  tail. Keep both subproofs under one AND gate.
+- Review found no reason to change D16 ownership, actor cadence, DrainOnly,
+  EOF, MTU, pool, QUIC windows, chunk size, or self-wake. Once capacity and
+  clean lifecycle pass independently on the same process, advance to repeated
+  statistical parity instead of reopening architecture.
