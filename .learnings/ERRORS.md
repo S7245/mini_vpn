@@ -1,5 +1,20 @@
 # Errors
 
+## 2026-07-12 - Timed capacity probes must not impersonate clean-close gates
+
+- The Shoes run produced complete iperf JSON at `192.666 Mbit/s` with every
+  interval nonzero, but the direct probe exited failed because one data Connect
+  reset at the timed boundary. Its blanket relay-error veto conflicts with the
+  already approved composite Gate A separation.
+- Correct behavior: parse and preserve terminal causes. A timed capacity gate
+  may accept only an expected post-result bounded reset; a fixed-byte EOF gate
+  must still reject every reset and nonzero tail. TDD the decision and replay
+  captured evidence before another VPS gate.
+- Zsh scalar variables do not split into command argv by default, and a glob
+  under a root-only directory expands before `sudo`. Use a shell function or
+  array for reusable SSH argv, and pass explicit FIFO paths (or expand inside a
+  privileged shell) when permissions block caller-side globbing.
+
 ## 2026-07-12 - Capture lifetime must begin at the measured window
 
 - Both 55-second bilateral pcaps were empty because capture started before two

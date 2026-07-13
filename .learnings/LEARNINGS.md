@@ -1,5 +1,20 @@
 # Learnings
 
+## 2026-07-12 - Modern Quinn closes the external TUIC capacity question
+
+- Shoes `v0.2.7` / Quinn `0.11.9` delivered `192.666 Mbit/s` receiver through
+  `.111 -> .27`, with `20/20` nonzero intervals and a `153.099 Mbit/s`
+  minimum. Both pcaps had zero kernel drops and UDP buffer-drop surfaces stayed
+  clean.
+- The same raw path and TUIC client reached `2-5 Mbit/s` through quic-go forks,
+  `112.559 Mbit/s` through old Quinn `0.10.1`, and `192.666 Mbit/s` through
+  maintained Quinn `0.11.9`. Transport lineage and version are causal axes;
+  D16 is not the active capacity root.
+- Reusable rule: a timed throughput flow and a clean EOF flow prove different
+  contracts. Preserve exact terminal-reset classification for the capacity
+  flow, and require a separate finite-byte flow for zero-tail EOF; never make a
+  timed generator's reset silently stand in for clean close.
+
 ## 2026-07-12 - Independent transport separated starvation from capacity
 
 - Moving the TUIC server from quic-go forks to Rust/Quinn `0.10.1` raised the

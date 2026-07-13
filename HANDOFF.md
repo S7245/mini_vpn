@@ -314,6 +314,21 @@ This section overrides the older G7/G8/GV next-step text below.
   Shoes `v0.2.7` (TUIC v5, Quinn `0.11.9`) and run one corrected 120-second
   capture-backed strict A/B. Result:
   `docs/tech/2026-07-12-knife14h10d16-rust-quinn-reference-server-results.md`.
+- The maintained Shoes `v0.2.7` discriminator closed the remaining transport
+  capacity question. Its Quinn `0.11.9` TUIC server carried the exact direct
+  probe at `192.666 Mbit/s` receiver; `20/20` intervals were nonzero and the
+  minimum was `153.099 Mbit/s`. Direct receivers were `231.306/221.523
+  Mbit/s`, both pcaps dropped zero packets, Exit UDP errors were zero, and
+  client UDP buffer-error delta was zero. Modern Quinn/TUIC is sufficient for
+  Gate A and the 170M Gate B target; do not reopen D16 or transport tuning.
+  The direct test process still failed because timed iperf ended its data
+  Connect with one reset. Review found a gate-process mismatch: this probe
+  rejects every relay reset, while approved composite Gate A deliberately
+  separates timed capacity with exact terminal classification from fixed-byte
+  clean EOF. Gate A did not run. Next TDD that classification, replay the
+  captured result without another 20-second discriminator, then obtain user
+  confirmation before one Shoes-backed composite Gate A. Result:
+  `docs/tech/2026-07-12-knife14h10d16-shoes-modern-quinn-results.md`.
 - The worktree is intentionally dirty and overlapping D16 files contain older
   experiments. Do not revert user changes and do not commit whole files without
   first showing which pre-D16 diffs would be included.

@@ -242,6 +242,22 @@ authorizes composite Gate A. D16 and Gate A/B remain frozen. This paragraph
 supersedes older next-action text. Result:
 `docs/tech/2026-07-12-knife14h10d16-rust-quinn-reference-server-results.md`.
 
+The Shoes `v0.2.7` / Quinn `0.11.9` discriminator proved sufficient external
+TUIC capacity: `192.666 Mbit/s` receiver, `20/20` nonzero intervals, and
+`153.099 Mbit/s` minimum interval, with healthy direct baselines, zero pcap
+kernel drops, zero Exit UDP errors, and zero client UDP buffer-error delta.
+The process nevertheless exited failed because timed iperf ended one data
+Connect with `Connection reset by peer`. Code review found that the direct
+probe's blanket relay-error veto conflicts with the already approved composite
+Gate A split between timed capacity terminal classification and fixed-byte
+clean EOF. Do not rerun the 20-second Shoes discriminator or change D16. Next
+RED/GREEN a pure capacity decision that retains and permits only an expected
+post-result timed reset, keeps fixed-byte close strict, and replay the captured
+JSON/terminal evidence. After user confirmation, redeploy the exact Shoes
+release and run one clean-source composite Gate A. Gate B remains frozen.
+Result:
+`docs/tech/2026-07-12-knife14h10d16-shoes-modern-quinn-results.md`.
+
 The next task is now an external same-window capability precondition, not a
 production code edit. Mature sing-box reverse P1 controls fell to
 `14.207 Mbit/s` and then `1.363 Mbit/s` despite correct routing, `16 MiB` client
