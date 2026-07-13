@@ -226,6 +226,22 @@ Gate A/B and D16 remain frozen. This paragraph supersedes older next-action
 text below. Result:
 `docs/tech/2026-07-12-knife14h10d16-mihomo-alternate-server-results.md`.
 
+The independent Rust/Quinn reference server also did not authorize Gate A,
+but it removed the active starvation signature. Official `tuic-server 1.0.0`
+using Quinn `0.10.1` reached `112.559 Mbit/s` receiver with `20/20` nonzero
+intervals, `103.805 Mbit/s` minimum interval, and `27ms` maximum data-read gap.
+Direct receivers were `217.640/216.382 Mbit/s`; `.77` sender was continuous at
+`119 Mbit/s`; client/server drops were zero and server CPU was not saturated.
+This separates quic-go multi-second starvation from the old reference
+implementation's insufficient continuous capacity. The next single server
+candidate is maintained Shoes `v0.2.7`, which supports TUIC v5 and uses Quinn
+`0.11.9`. First review its hot path/windows, then dry-run and SSH-banner
+preflight, then run one exact `0f07406` strict A/B with corrected `-i any`,
+port-only, 120-second bilateral captures. Only a clean `>150 Mbit/s` result
+authorizes composite Gate A. D16 and Gate A/B remain frozen. This paragraph
+supersedes older next-action text. Result:
+`docs/tech/2026-07-12-knife14h10d16-rust-quinn-reference-server-results.md`.
+
 The next task is now an external same-window capability precondition, not a
 production code edit. Mature sing-box reverse P1 controls fell to
 `14.207 Mbit/s` and then `1.363 Mbit/s` despite correct routing, `16 MiB` client

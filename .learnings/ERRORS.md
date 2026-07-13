@@ -1,5 +1,34 @@
 # Errors
 
+## 2026-07-12 - Capture lifetime must begin at the measured window
+
+- Both 55-second bilateral pcaps were empty because capture started before two
+  direct baselines and orchestration delays, then expired before the official
+  flow. They cannot be used as packet evidence.
+- A one-byte probe proved `tcpdump -i any` sees the translated `.111:8443`
+  packet on `eth0` with zero kernel drops. Future performance captures must use
+  `-i any`, a port-first filter, at least 120 seconds, explicit readiness, and a
+  remaining-time check immediately before traffic; baselines run first.
+- Reference-server info logs include the TUIC user UUID. Redact UUID patterns
+  before packaging and require a silent pattern scan to pass; never include raw
+  service journals in artifacts or summaries.
+- Tcpdump-owned pcap files require privileged cleanup even when they live in
+  `/tmp`; archive first, then remove them with `sudo`.
+
+## 2026-07-12 - Compatibility clients need platform-socket preflight
+
+- The reference client failed before TUIC traffic when `dual_stack:false` was
+  applied to an IPv4 SOCKS socket. Omitting the optional dual-stack field let
+  the bounded SSH-banner preflight pass.
+- `.27` no longer had the sing-box binary/service promised by older environment
+  memory. An attempted large streamed copy remained partial and was explicitly
+  terminated and deleted after failing SHA. Prefer the small official reference
+  client for config compatibility, and always require full binary SHA before
+  execution.
+- In zsh, `path` is a special variable tied to `PATH`; using it as a loop
+  variable made later `curl`/`rg` commands disappear. Use a non-special name
+  such as `file_name` in orchestration loops.
+
 ## 2026-07-12 - Ephemeral server setup needs mount and safe-path preflight
 
 - `.111` mounts `/run` with `noexec`, so systemd rejected launcher/watchdog

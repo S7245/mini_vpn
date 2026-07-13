@@ -302,6 +302,18 @@ This section overrides the older G7/G8/GV next-step text below.
   QUIC-stack TUIC v5 server, then run one synchronized bilateral-capture A/B;
   do not change D16. Result:
   `docs/tech/2026-07-12-knife14h10d16-mihomo-alternate-server-results.md`.
+- The independent Rust/Quinn reference-server discriminator removed the
+  burst/idle shape but still missed the floor. Official `tuic-server 1.0.0`
+  with Quinn `0.10.1` reached `112.559 Mbit/s` receiver; all `20/20` intervals
+  were nonzero, minimum interval was `103.805 Mbit/s`, and maximum data-read
+  gap was `27ms`. Direct receivers were `217.640/216.382 Mbit/s`, target sender
+  was continuous at `119 Mbit/s`, client/server drop surfaces were zero, and
+  server lifetime CPU was only about `2.73s`. This isolates quic-go external
+  starvation from the old reference server's insufficient continuous capacity.
+  Gate A/B remain frozen and D16 stays unchanged. Next review/TDD maintained
+  Shoes `v0.2.7` (TUIC v5, Quinn `0.11.9`) and run one corrected 120-second
+  capture-backed strict A/B. Result:
+  `docs/tech/2026-07-12-knife14h10d16-rust-quinn-reference-server-results.md`.
 - The worktree is intentionally dirty and overlapping D16 files contain older
   experiments. Do not revert user changes and do not commit whole files without
   first showing which pre-D16 diffs would be included.

@@ -1,5 +1,19 @@
 # Learnings
 
+## 2026-07-12 - Independent transport separated starvation from capacity
+
+- Moving the TUIC server from quic-go forks to Rust/Quinn `0.10.1` raised the
+  receiver from `2-5` to `112.559 Mbit/s`, removed every zero interval, and
+  reduced the maximum data-read gap to `27ms`.
+- The result still failed `>150 Mbit/s`. The target sender was continuously
+  backpressured near `119 Mbit/s`, UDP drops were zero, and the server consumed
+  only about `2.73s` CPU over its whole lifetime. This is insufficient server
+  transport efficiency/capacity, not the old starvation and not D16.
+- Reusable rule: performance failures need both shape and aggregate capacity.
+  Eliminating stalls is causal progress but does not authorize the next gate;
+  keep the strict floor and move to a maintained implementation on the already
+  proven transport generation.
+
 ## 2026-07-12 - Server implementation A/B must audit transport lineage
 
 - Official Mihomo `v1.19.28` reproduced the external burst/idle failure at
