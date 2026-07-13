@@ -1,5 +1,19 @@
 # Learnings
 
+## 2026-07-12 - Server implementation A/B must audit transport lineage
+
+- Official Mihomo `v1.19.28` reproduced the external burst/idle failure at
+  `3.460 Mbit/s` receiver with `7/20` client zero intervals. The target sender
+  had `14/20` zero intervals even though both direct baselines exceeded `216
+  Mbit/s` and all client/server drop surfaces were zero.
+- This rejects sing-box application code, but review found that Mihomo and
+  sing-box use separate forks of the same quic-go `0.59.x` lineage. Changing a
+  product name is not necessarily changing the transport mechanism.
+- Reusable rule: before calling a server A/B independent, inventory its QUIC,
+  TLS, protocol, and copy-loop dependencies. When the application changes but
+  the transport lineage remains, classify the result at that narrower boundary
+  and choose an actually independent stack or add transport telemetry next.
+
 ## 2026-07-12 - Host-local TUIC isolates the external sender/path interaction
 
 - The exact pool-1 direct-TUIC probe and sing-box binary reached `199.639

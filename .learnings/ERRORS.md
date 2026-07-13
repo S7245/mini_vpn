@@ -1,5 +1,22 @@
 # Errors
 
+## 2026-07-12 - Ephemeral server setup needs mount and safe-path preflight
+
+- `.111` mounts `/run` with `noexec`, so systemd rejected launcher/watchdog
+  scripts stored there even though their modes were executable. Use an
+  executable mount or invoke the script through an executable interpreter;
+  keep only data FIFOs under `/run`.
+- Mihomo `SAFE_PATHS` rejected certificate/key paths under `/proc/self/fd`.
+  Root-only, one-shot FIFOs below the configured Mihomo home passed validation
+  without persisting TLS bytes.
+- A one-second run of the strict capacity harness proved auth/Connect
+  compatibility but failed relay accounting at the forced timed close. Do not
+  repurpose a duration-based capacity harness as an auth-only test; give the
+  next server a separate bounded compatibility seam.
+- `git bundle create <file> <abbreviated-commit>` can be rejected as an empty
+  bundle because the argument is not a ref. Bundle a real branch/ref and
+  explicitly checkout and verify the intended commit in the isolated clone.
+
 ## 2026-07-12 - A server leaf certificate is not the client trust anchor
 
 - Symptom: the first host-local TLS preflight failed with `UnknownIssuer`

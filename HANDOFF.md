@@ -291,6 +291,17 @@ This section overrides the older G7/G8/GV next-step text below.
   the same `.111:8443` cross-host path with the exact probe and floor. Gate A/B
   remain frozen. Result:
   `docs/tech/2026-07-12-knife14h10d16-host-local-tuic-results.md`.
+- The first alternate mature server A/B also failed the external path. Official
+  Mihomo `v1.19.28` with Cubic reached only `3.460 Mbit/s` receiver and had
+  `7/20` client zero intervals; `.77` had `14/20` zero sender intervals and
+  `5.18 Mbit/s`. Direct receivers were `217.010 Mbit/s` from `.27` and
+  `216.591 Mbit/s` from `.111`; client Quinn loss/congestion/blocking and
+  server UDP drops were zero. This rejects a sing-box-application-specific
+  root but not the quic-go lineage: Mihomo and sing-box use separate forks of
+  quic-go `0.59.x`. Gate A/B remain frozen. Next review and TDD an independent
+  QUIC-stack TUIC v5 server, then run one synchronized bilateral-capture A/B;
+  do not change D16. Result:
+  `docs/tech/2026-07-12-knife14h10d16-mihomo-alternate-server-results.md`.
 - The worktree is intentionally dirty and overlapping D16 files contain older
   experiments. Do not revert user changes and do not commit whole files without
   first showing which pre-D16 diffs would be included.

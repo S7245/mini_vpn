@@ -212,6 +212,20 @@ This paragraph overrides the older historical next-action text below.
 Result:
 `docs/tech/2026-07-12-knife14h10d16-host-local-tuic-results.md`.
 
+The first alternate mature server did not authorize Gate A. Replacing
+sing-box with official Mihomo `v1.19.28` on `.111:8443` yielded only `3.460
+Mbit/s` receiver, `7/20` client zero intervals, and a `3431ms` maximum data
+read gap. `.77` showed `14/20` zero sender intervals and `5.18 Mbit/s`, while
+same-window direct receivers were `217.010 Mbit/s` from `.27` and `216.591
+Mbit/s` from `.111`. Quinn loss/congestion/blocking and `.111` UDP drops were
+zero. This removes sing-box application code as a sufficient root but not the
+quic-go transport family: Mihomo and sing-box use different quic-go `0.59.x`
+forks. Next review/TDD a TUIC v5 server with an independent QUIC stack and add
+synchronized bilateral capture/transport evidence before one further A/B.
+Gate A/B and D16 remain frozen. This paragraph supersedes older next-action
+text below. Result:
+`docs/tech/2026-07-12-knife14h10d16-mihomo-alternate-server-results.md`.
+
 The next task is now an external same-window capability precondition, not a
 production code edit. Mature sing-box reverse P1 controls fell to
 `14.207 Mbit/s` and then `1.363 Mbit/s` despite correct routing, `16 MiB` client
