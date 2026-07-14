@@ -6,34 +6,37 @@
 
 #### Latest decision (2026-07-13)
 
-EndpointPacingService local implementation is complete and **PASS**. The
-accepted fixed service (`30,720,000B/s`, `61,440B` burst, `10,240B` control
-reserve, `20,480B` quantum) is wired through pinned quinn-proto pre-build
-reservations and a thin pinned Quinn driver socket-outcome adapter.
-`EndpointWindowV1` remains default-off and `QuinnDefault` remains production
-default.
+EndpointPacingService is committed at `c55737e1ef094c2bbc0e4e7e69ada97f98219fbb`.
+Its frozen VPS forward P1 reached `194 Mbit/s` receiver and kept aggregate
+QUIC loss at `11,922,924B`, with exact endpoint conservation and no socket
+leak, but failed the zero-drop gate with `10` TUN TX drops. Do not tune pacing
+or frozen profile constants.
 
-Local capacity and conservation passed together: the exact GSO-enabled
-`32 MiB` / `64 KiB` upload reached `240.466 Mbit/s`, delivered exactly
-`33,554,432B`, had zero pattern errors and clean EOF, and ended with
-`available=61,440B`, `live=0`, `outstanding=0`, `records=0`. No old bounded
-sender or cap64 path was active.
+The follow-up H10d16 TUN RX batch relay service is implemented, reviewed, and
+locally **PASS**. It preserves per-packet DNS/UDP/TCP/SYN processing and
+smoltcp poll/flush, but services dirty TCP relays once per bounded ready batch.
+The default non-H10 path remains unchanged. A prefetched single RX slot is now
+preserved across `wait_for_rx`, closing the exactly-once boundary.
 
-Full local evidence is green: quinn-proto `309/309 + 3/3` docs; Quinn `29/29`
-nonignored (`3` expected ignored) + `1/1` doc; mini_vpn `622/622` nonignored
-(`3` expected ignored); all-target harness check; explicit `64/256/1024`;
-zero-loss UDP sweep; root/focused-vendor fmt; shell syntax/self-test; and diff
-checks. Code review fixed the fail-open migration-collision edge and has no
-unresolved P0/P1.
+The exact real-Quinn forward `32 MiB` / `64 KiB` gate reached
+`319.455 Mbit/s`: exact bytes, zero pattern errors, clean EOF, zero modeled
+drops, ring high water `29/500`, `28,934` TCP packets, `4,093` batches and
+batch passes, and `24,841` avoided per-packet relay passes. Final D16 ownership
+and terminal tails were zero.
 
-Next: commit the reviewed implementation, then run one VPS forward acceptance
-with `MINI_VPN_TUIC_PACING_POLICY=endpoint-window-v1`, Quinn UDP sender, GSO
-enabled, and every D16/MTU/pool/window/chunk/Cubic/self-wake value frozen. The
-user authorized commit, VPS, and safe in-scope repairs without repeated
-confirmation. macOS TUN remains prohibited. A local/VPS `<=170 Mbit/s`
-discriminator is architecture failure and must not trigger constant tuning.
-See
-`docs/tech/2026-07-13-knife14h10d16-endpoint-pacing-service-local-gate-results.md`.
+Full evidence is green: quinn-proto `309+3 docs`; Quinn `29+1 doc`; root
+`625` and harness `636` nonignored; all-target check; explicit
+`64/256/1024`; four zero-loss UDP sweep sizes; fmt, runner self-test, and diff
+checks. No unresolved P0/P1 remains.
+
+Next: commit the batch stage and run one frozen, target-only EndpointWindowV1
+VPS P1. Require receiver `>170 Mbit/s`, zero TUN RX/TX drops, QUIC loss
+`<=16 MiB`, `tcp_batches == batch_dirty_relay_passes`, nonzero avoided passes,
+endpoint conservation, and clean pool/lifecycle. If any TUN drop remains,
+classify batch architecture failure and do not tune batching/drain constants.
+The user authorized commit, VPS, and safe in-scope repairs without repeated
+confirmation. macOS TUN remains prohibited. See
+`docs/tech/2026-07-13-knife14h10d16-tun-rx-batch-service-local-gate-results.md`.
 
 The older text below is chronological stage history and no longer describes
 the active authorization boundary.

@@ -189,6 +189,31 @@ results documents.
 
 Current Knife14 summary, as of 2026-07-13:
 
+- EndpointPacingService commit `c55737e1ef094c2bbc0e4e7e69ada97f98219fbb`
+  passed its VPS capacity and endpoint-conservation gates at `194 Mbit/s`
+  receiver and `11,922,924B` aggregate QUIC loss, but failed zero-drop safety
+  with `10` TUN TX drops. Do not tune pacing or frozen profile constants.
+- The follow-up H10d16 TUN RX batch relay service is locally complete and
+  reviewed. It preserves packet-by-packet protocol handling but reduces inner
+  dirty-relay work to one pass per bounded TCP batch; non-H10 default behavior
+  is unchanged.
+- Its exact real-Quinn forward `32 MiB` gate reached `319.455 Mbit/s`, exact
+  bytes, clean EOF, zero modeled drops, and a `29/500` ring high water.
+  `28,934` TCP packets became `4,093` equal batch/pass records, avoiding
+  `24,841` per-packet relay traversals; all final D16 ownership/tail counters
+  were zero.
+- Full local gates pass: quinn-proto `309+3 docs`, Quinn `29+1 doc`, root
+  `625` and harness `636` nonignored, explicit `64/256/1024`, zero-loss UDP
+  sweep, all-target check, fmt, shell self-test, and diff checks. No unresolved
+  P0/P1 remains.
+- Next action is commit followed by one frozen target-only EndpointWindowV1
+  VPS P1. Require `>170 Mbit/s`, zero TUN drops, QUIC loss `<=16 MiB`, batch
+  counter equality with nonzero avoided passes, endpoint conservation, and
+  clean lifecycle. Any remaining TUN drop is architecture failure; do not tune
+  batching/drain constants. macOS TUN remains prohibited.
+
+Earlier endpoint-preparation summary from the same date:
+
 - EndpointPacingService implementation and the full local Task 12 gate pass.
   The pinned quinn-proto service owns pre-build planned bytes, actual GSO
   settlement, socket-blocked outstanding bytes, two-connection DRR/control,

@@ -122,9 +122,9 @@ impl TxToken for LinkTxToken {
     }
 }
 
-fn loopback_caps() -> DeviceCapabilities {
+fn loopback_caps_with_mtu(mtu: usize) -> DeviceCapabilities {
     let mut caps = DeviceCapabilities::default();
-    caps.max_transmission_unit = 1500;
+    caps.max_transmission_unit = mtu;
     caps.medium = Medium::Ip;
     // 与 VirtualTunDevice 一致：发送时算校验和、接收时不校验（回环两端都算 → 包合法）。
     let mut cs = smoltcp::phy::ChecksumCapabilities::default();
@@ -165,6 +165,7 @@ pub struct LoopbackTunDevice {
     suppress_wait_after_tcp_payload_flush: bool,
     wait_suppressed: bool,
     max_tcp_payload_packets_per_flush: Arc<AtomicU64>,
+    mtu: usize,
 }
 
 impl LoopbackTunDevice {
@@ -200,6 +201,7 @@ impl LoopbackTunDevice {
             suppress_wait_after_tcp_payload_flush,
             wait_suppressed: false,
             max_tcp_payload_packets_per_flush: Arc::new(AtomicU64::new(0)),
+            mtu: 1500,
         }
     }
 
@@ -207,10 +209,19 @@ impl LoopbackTunDevice {
         self.max_tcp_payload_packets_per_flush = counter;
         self
     }
+
+    #[cfg(test)]
+    fn with_mtu(mut self, mtu: usize) -> Self {
+        self.mtu = mtu;
+        self
+    }
 }
 
 impl TunIo for LoopbackTunDevice {
     async fn wait_for_rx(&mut self) -> std::io::Result<()> {
+        if self.rx_buffer.is_some() {
+            return Ok(());
+        }
         if self.wait_suppressed {
             return std::future::pending::<std::io::Result<()>>().await;
         }
@@ -271,7 +282,7 @@ impl Device for LoopbackTunDevice {
     type RxToken<'a> = RawRxToken;
     type TxToken<'a> = QueueTxToken<'a>;
     fn capabilities(&self) -> DeviceCapabilities {
-        loopback_caps()
+        loopback_caps_with_mtu(self.mtu)
     }
     fn receive(&mut self, _t: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         // 只取 rx_buffer（由 wait_for_rx 单包填充），保持「每次 wakeup 处理一个包」语义，
@@ -300,6 +311,7 @@ struct GeneratorDevice {
     outbound: PacketLink, // 发生器 → SUT
     ingress_packets_per_poll: Option<usize>,
     ingress_packets_remaining: Option<usize>,
+    mtu: usize,
 }
 
 impl GeneratorDevice {
@@ -309,6 +321,7 @@ impl GeneratorDevice {
             outbound,
             ingress_packets_per_poll: None,
             ingress_packets_remaining: None,
+            mtu: 1500,
         }
     }
 
@@ -323,7 +336,14 @@ impl GeneratorDevice {
             outbound,
             ingress_packets_per_poll: Some(packets),
             ingress_packets_remaining: Some(packets),
+            mtu: 1500,
         }
+    }
+
+    #[cfg(test)]
+    fn with_mtu(mut self, mtu: usize) -> Self {
+        self.mtu = mtu;
+        self
     }
 
     fn begin_poll(&mut self) {
@@ -335,7 +355,7 @@ impl Device for GeneratorDevice {
     type RxToken<'a> = RawRxToken;
     type TxToken<'a> = LinkTxToken;
     fn capabilities(&self) -> DeviceCapabilities {
-        loopback_caps()
+        loopback_caps_with_mtu(self.mtu)
     }
     fn receive(&mut self, _t: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         if self.ingress_packets_remaining == Some(0) {
@@ -812,6 +832,11 @@ struct Recorded {
     tun_rx_budget_exhausted: u64,
     backlog_pause_edges: u64,
     backlog_resume_edges: u64,
+    tun_rx_tcp_packets: u64,
+    tun_rx_tcp_batches: u64,
+    tun_rx_batch_dirty_relay_passes: u64,
+    tun_rx_tcp_batch_packets_high_water: u64,
+    tun_rx_avoided_dirty_relay_passes: u64,
     actor_bypass_admitted_bytes: u64,
     backlog_active: bool,
     d16_running_flows: usize,
@@ -902,6 +927,27 @@ impl MetricsSink for RecordingSink {
         r.tun_rx_budget_exhausted = r.tun_rx_budget_exhausted.max(budget_exhausted);
         r.backlog_pause_edges = r.backlog_pause_edges.max(pause_edges);
         r.backlog_resume_edges = r.backlog_resume_edges.max(resume_edges);
+    }
+    fn note_tun_rx_batch_service(
+        &mut self,
+        tcp_packets: u64,
+        tcp_batches: u64,
+        batch_dirty_relay_passes: u64,
+        tcp_batch_packets_high_water: u64,
+        avoided_dirty_relay_passes: u64,
+    ) {
+        let mut r = self.shared.lock().unwrap();
+        r.tun_rx_tcp_packets = r.tun_rx_tcp_packets.max(tcp_packets);
+        r.tun_rx_tcp_batches = r.tun_rx_tcp_batches.max(tcp_batches);
+        r.tun_rx_batch_dirty_relay_passes = r
+            .tun_rx_batch_dirty_relay_passes
+            .max(batch_dirty_relay_passes);
+        r.tun_rx_tcp_batch_packets_high_water = r
+            .tun_rx_tcp_batch_packets_high_water
+            .max(tcp_batch_packets_high_water);
+        r.tun_rx_avoided_dirty_relay_passes = r
+            .tun_rx_avoided_dirty_relay_passes
+            .max(avoided_dirty_relay_passes);
     }
     fn note_d16_actor_observation(
         &mut self,
@@ -2301,6 +2347,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loopback_wait_for_rx_preserves_prefetched_single_rx_slot() {
+        let inbound = PacketLink::new();
+        let outbound = PacketLink::new();
+        inbound.push(BytesMut::from(&b"first"[..]));
+        inbound.push(BytesMut::from(&b"second"[..]));
+        let mut device = LoopbackTunDevice::new(inbound, outbound);
+
+        assert!(device.try_recv_rx().unwrap());
+        device.wait_for_rx().await.unwrap();
+        assert_eq!(
+            device.rx_take().unwrap(),
+            BytesMut::from(&b"first"[..]),
+            "async wait must not overwrite the packet prefetched by the bounded-drain probe",
+        );
+        assert!(device.try_recv_rx().unwrap());
+        assert_eq!(device.rx_take().unwrap(), BytesMut::from(&b"second"[..]));
+    }
+
+    #[tokio::test]
     async fn d16_integrated_heavy_flow_proves_capacity_ownership_and_clean_eof() {
         let report = run_d16_byte_owned_pressure_scenario()
             .await
@@ -2327,7 +2392,214 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn d16_real_quinn_forward_tun_batch_path_exceeds_capacity_without_ring_drops() {
+        let _capacity_guard = crate::test_support::local_capacity_test_guard().await;
+        const PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+        const WRITE_BYTES: usize = 64 * 1024;
+        const TUN_MTU: usize = 1200;
+        const RING_CAPACITY_PACKETS: usize = 500;
+        const ACK: u8 = 0xAC;
+
+        fn pattern_byte(offset: usize) -> u8 {
+            (offset as u8).wrapping_mul(31).wrapping_add(7)
+        }
+
+        let (server_endpoint, client_endpoint, server_addr) =
+            crate::tuic::d16_quinn_test_endpoints();
+        let server_task = tokio::spawn(async move {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let mut scratch = vec![0u8; WRITE_BYTES];
+            let mut received = 0usize;
+            let mut pattern_errors = 0usize;
+            let mut first_byte_at = None;
+            while received < PAYLOAD_BYTES {
+                let read =
+                    recv.read(&mut scratch).await.unwrap().unwrap_or_else(|| {
+                        panic!("forward D16 stream closed after {received} bytes")
+                    });
+                first_byte_at.get_or_insert_with(Instant::now);
+                for (index, byte) in scratch[..read].iter().copied().enumerate() {
+                    if byte != pattern_byte(received + index) {
+                        pattern_errors = pattern_errors.saturating_add(1);
+                    }
+                }
+                received = received.saturating_add(read);
+            }
+            let payload_elapsed = first_byte_at.unwrap().elapsed();
+            send.write_all(&[ACK]).await.unwrap();
+            send.finish().unwrap();
+            let clean_eof = recv.read(&mut scratch).await.unwrap().is_none();
+            (received, pattern_errors, clean_eof, payload_elapsed)
+        });
+
+        let connection = client_endpoint
+            .connect(server_addr, "example.com")
+            .unwrap()
+            .await
+            .unwrap();
+        let (send, recv) = connection.open_bi().await.unwrap();
+        let upstream = Arc::new(OneShotRealQuinnD16Upstream {
+            relay: Mutex::new(Some(NativeTcpRelayStream {
+                reader: crate::tuic::d16_native_ordered_reader_for_test(recv, connection.clone()),
+                writer: Box::new(send),
+            })),
+        });
+
+        let gen_to_sut = PacketLink::bounded(RING_CAPACITY_PACKETS);
+        let sut_to_gen = PacketLink::new();
+        let (_downlink_tx, downlink_rx) = mpsc::channel::<Vec<u8>>(1);
+        let sut_device =
+            LoopbackTunDevice::new(gen_to_sut.clone(), sut_to_gen.clone()).with_mtu(TUN_MTU);
+        let config = TunRuntimeConfig::h10d16_gate_a_for_test();
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let sut = tokio::spawn(run_event_loop(
+            sut_device,
+            upstream,
+            downlink_rx,
+            config,
+            Arc::new(Metrics::new()),
+            RecordingSink::new(recorded.clone()),
+        ));
+
+        let mut gen_device =
+            GeneratorDevice::new(sut_to_gen.clone(), gen_to_sut.clone()).with_mtu(TUN_MTU);
+        let mut gen_iface = {
+            let cfg = SmolConfig::new(smoltcp::wire::HardwareAddress::Ip);
+            let mut iface = Interface::new(cfg, &mut gen_device, SmolInstant::now());
+            iface.update_ip_addrs(|addrs| {
+                addrs
+                    .push(IpCidr::new(IpAddress::Ipv4(GEN_IP), 24))
+                    .unwrap();
+            });
+            iface.routes_mut().add_default_ipv4_route(GEN_IP).unwrap();
+            iface
+        };
+        let mut sockets = SocketSet::new(vec![]);
+        let rx = tcp::SocketBuffer::new(vec![0u8; 1024 * 1024]);
+        let tx = tcp::SocketBuffer::new(vec![0u8; 1024 * 1024]);
+        let mut socket = tcp::Socket::new(rx, tx);
+        socket.set_ack_delay(None);
+        socket
+            .connect(
+                gen_iface.context(),
+                (IpAddress::Ipv4(TARGET_IP), TARGET_PORT_BASE),
+                42_000,
+            )
+            .unwrap();
+        let handle = sockets.add(socket);
+
+        let mut sent = 0usize;
+        let mut ack_received = false;
+        let mut local_close_started = false;
+        let mut send_chunk = vec![0u8; WRITE_BYTES];
+        let mut recv_scratch = [0u8; 16];
+        let completion = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                gen_device.begin_poll();
+                gen_iface.poll(SmolInstant::now(), &mut gen_device, &mut sockets);
+                let socket = sockets.get_mut::<tcp::Socket>(handle);
+                if sent < PAYLOAD_BYTES && socket.can_send() {
+                    let len = (PAYLOAD_BYTES - sent).min(send_chunk.len());
+                    for (index, byte) in send_chunk[..len].iter_mut().enumerate() {
+                        *byte = pattern_byte(sent + index);
+                    }
+                    if let Ok(written) = socket.send_slice(&send_chunk[..len]) {
+                        sent = sent.saturating_add(written);
+                    }
+                }
+                while socket.can_recv() {
+                    match socket.recv_slice(&mut recv_scratch) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            ack_received |= recv_scratch[..read].contains(&ACK);
+                        }
+                    }
+                }
+                if ack_received && !local_close_started {
+                    socket.close();
+                    local_close_started = true;
+                }
+                if ack_received && server_task.is_finished() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if completion.is_err() {
+            let socket = sockets.get::<tcp::Socket>(handle);
+            let snapshot = recorded.lock().unwrap().clone();
+            panic!(
+                "forward D16 batch path timed out: sent={sent} ack={ack_received} state={:?} can_send={} can_recv={} may_recv={} ring_drops={} ring_high={} recorded={snapshot:?}",
+                socket.state(),
+                socket.can_send(),
+                socket.can_recv(),
+                socket.may_recv(),
+                gen_to_sut.dropped_packets(),
+                gen_to_sut.high_water_packets(),
+            );
+        }
+
+        let (received, pattern_errors, clean_eof, payload_elapsed) =
+            tokio::time::timeout(Duration::from_secs(2), server_task)
+                .await
+                .expect("forward D16 server must observe local EOF")
+                .unwrap();
+        sut.abort();
+        let _ = sut.await;
+        let snapshot = recorded.lock().unwrap().clone();
+        let receiver_mbps = received as f64 * 8.0 / payload_elapsed.as_secs_f64() / 1_000_000.0;
+        eprintln!(
+            "d16_forward_tun_batch receiver_mbps={receiver_mbps:.3} elapsed={payload_elapsed:?} ring_high={} tcp_packets={} tcp_batches={} avoided_dirty_relay_passes={}",
+            gen_to_sut.high_water_packets(),
+            snapshot.tun_rx_tcp_packets,
+            snapshot.tun_rx_tcp_batches,
+            snapshot.tun_rx_avoided_dirty_relay_passes,
+        );
+
+        assert_eq!(sent, PAYLOAD_BYTES, "{snapshot:?}");
+        assert_eq!(received, PAYLOAD_BYTES, "{snapshot:?}");
+        assert_eq!(pattern_errors, 0, "{snapshot:?}");
+        assert!(ack_received, "{snapshot:?}");
+        assert!(clean_eof, "{snapshot:?}");
+        assert_eq!(gen_to_sut.dropped_packets(), 0, "{snapshot:?}");
+        assert!(gen_to_sut.high_water_packets() > 1, "{snapshot:?}");
+        assert!(
+            gen_to_sut.high_water_packets() <= RING_CAPACITY_PACKETS as u64,
+            "{snapshot:?}"
+        );
+        assert!(snapshot.tun_rx_tcp_packets > 0, "{snapshot:?}");
+        assert_eq!(
+            snapshot.tun_rx_tcp_batches, snapshot.tun_rx_batch_dirty_relay_passes,
+            "{snapshot:?}"
+        );
+        assert!(
+            snapshot.tun_rx_tcp_batch_packets_high_water > 1,
+            "{snapshot:?}"
+        );
+        assert!(
+            snapshot.tun_rx_avoided_dirty_relay_passes > 0,
+            "{snapshot:?}"
+        );
+        assert!(snapshot.d16_eof_observed, "{snapshot:?}");
+        assert_eq!(snapshot.d16_eof_tail_bytes, 0, "{snapshot:?}");
+        assert_eq!(snapshot.d16_owned_queue_bytes, 0, "{snapshot:?}");
+        assert_eq!(snapshot.d16_pending_bytes, 0, "{snapshot:?}");
+        assert_eq!(snapshot.d16_inflight_bytes, 0, "{snapshot:?}");
+        assert_eq!(snapshot.terminal_drop_bytes, 0, "{snapshot:?}");
+        assert_eq!(snapshot.terminal_late_payload_bytes, 0, "{snapshot:?}");
+        assert!(
+            receiver_mbps > 170.0,
+            "real Quinn forward D16/TUN batch path must exceed the fixed gate: elapsed={payload_elapsed:?} rate={receiver_mbps:.3}M snapshot={snapshot:?}"
+        );
+
+        client_endpoint.close(0u32.into(), b"test complete");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn d16_real_quinn_full_tun_path_sustains_capacity_and_clean_eof() {
+        let _capacity_guard = crate::test_support::local_capacity_test_guard().await;
         const PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
         const WRITE_BYTES: usize = 64 * 1024;
         const RING_CAPACITY_PACKETS: usize = 64;
@@ -2507,6 +2779,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn d16_reverse_flow_does_not_overrun_bounded_tun_rx_ring() {
+        let _capacity_guard = crate::test_support::local_capacity_test_guard().await;
         const RING_CAPACITY_PACKETS: usize = 64;
         let report = run_d16_tun_rx_starvation_scenario(
             64 * 1024 * 1024,

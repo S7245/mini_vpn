@@ -52,6 +52,9 @@ impl VirtualTunDevice {
     // 当这个方法(wait_for_rx())被 .await 唤醒时，说明底层的 tun0 网卡来数据包了，我们需要把它读出来，存进 rx_buffer 这个“收货仓库”里，准备等下喂给 smoltcp。
     /// 异步进货：等待物理网卡吐出数据，存入 rx_buffer
     pub async fn wait_for_rx(&mut self) -> std::io::Result<()> {
+        if self.rx_buffer.is_some() {
+            return Ok(());
+        }
         let mut buf = BytesMut::zeroed(rx_buffer_capacity_for_mtu(self.mtu));
 
         // 2. 异步等待网卡吐出数据，并拿到读取的字节数 (n)

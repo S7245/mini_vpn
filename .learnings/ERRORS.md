@@ -1,5 +1,42 @@
 # Errors
 
+## 2026-07-13 - TUN batch tracer failures exposed reachability and fixture-fidelity gaps
+
+- The first batch RED compiled only after replacing an invalid
+  `BytesMut::from(Vec<u8>)` conversion with `Bytes::from(packet).into()`. A later
+  Quinn tracer failed because its inherent `RecvStream::read` returns
+  `Option<usize>`; the test must handle `Some(n)` and clean `None` EOF explicitly.
+- One command supplied two Cargo test filters, and another omitted
+  `--features harness`; both exited without exercising the intended tracer.
+  Require the test summary to show the expected nonzero executed count, not only
+  a successful exit status.
+- The first full-path GREEN delivered exact bytes but reported zero batches and
+  about 30,000 relay calls. The actor's direct-ready branch still used the
+  one-packet adapter and bypassed `drain_ready_tun_rx`. Fix product-path
+  reachability before accepting a helper-level GREEN.
+- An early 10-second forward fixture sent only `28,297,696B` because it copied
+  the reverse ACK-starvation fixture's two ingress packets per poll. Restore the
+  normal generator behavior for a faithful forward-capacity test; do not change
+  product constants to compensate for an artificial fixture throttle.
+
+## 2026-07-13 - Prefetched TUN packets must not be overwritten by the next wait
+
+- A two-packet RED showed that the bounded drain probe could leave packet one in
+  `rx_buffer`, after which `wait_for_rx` overwrote it with packet two.
+- Correct behavior is to return ready immediately when the caller-provided slot
+  is already populated. Apply the contract to both the real virtual TUN device
+  and deterministic harness device, then retain the exact-delivery tests.
+
+## 2026-07-13 - Parallel localhost rate gates can manufacture throughput regressions
+
+- `cargo test --features harness --lib` initially failed several rate thresholds
+  even though the same tests passed alone and all exact/lifecycle assertions
+  remained clean. The failures came from concurrent rate-heavy tests competing
+  for the same local CPU and socket capacity.
+- Use one test-only shared capacity guard for localhost Mbps gates and rerun the
+  complete suite. Never weaken a product threshold or tune pacing/queue constants
+  in response to host-resource contention created by the test runner.
+
 ## 2026-07-13 - Endpoint integration gates need crate-local commands and exact test selection
 
 - Root `cargo test -p quinn --lib` and `cargo test -p quinn-proto` failed

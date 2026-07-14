@@ -19,3 +19,17 @@ pub mod tcp_stream_service;
 pub mod tuic;
 pub mod udp_relay;
 pub mod upstream;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::OnceLock;
+    use tokio::sync::{Mutex, MutexGuard};
+
+    /// Real localhost capacity discriminators share one host scheduler and UDP
+    /// stack. Serialize only those tests so the full suite cannot turn test
+    /// runner contention into a false throughput regression.
+    pub(crate) async fn local_capacity_test_guard() -> MutexGuard<'static, ()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| Mutex::new(())).lock().await
+    }
+}

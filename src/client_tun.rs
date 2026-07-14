@@ -298,6 +298,17 @@ pub trait MetricsSink {
         _resume_edges: u64,
     ) {
     }
+    /// H10d16 TUN RX batch service: expose cumulative batch accounting to
+    /// deterministic harnesses without adding per-packet observations.
+    fn note_tun_rx_batch_service(
+        &mut self,
+        _tcp_packets: u64,
+        _tcp_batches: u64,
+        _batch_dirty_relay_passes: u64,
+        _tcp_batch_packets_high_water: u64,
+        _avoided_dirty_relay_passes: u64,
+    ) {
+    }
     /// H10d16 Task 11A：harness 记录 D16 actor bypass 聚合值。
     fn note_d16_actor_observation(
         &mut self,
@@ -5618,6 +5629,9 @@ struct TunRxDrainDiag {
     tcp_packets: u64,
     dns_packets: u64,
     udp_packets: u64,
+    tcp_batches: u64,
+    batch_dirty_relay_passes: u64,
+    tcp_batch_packets_high_water: u64,
     budget_exhausted: u64,
     would_block: u64,
     errors: u64,
@@ -5690,6 +5704,21 @@ impl TunRxDrainDiag {
         }
     }
 
+    fn note_tcp_batch_dirty_relay_pass(&mut self, tcp_packets: usize) {
+        if tcp_packets == 0 {
+            return;
+        }
+        self.tcp_batches = self.tcp_batches.saturating_add(1);
+        self.batch_dirty_relay_passes = self.batch_dirty_relay_passes.saturating_add(1);
+        self.tcp_batch_packets_high_water =
+            self.tcp_batch_packets_high_water.max(tcp_packets as u64);
+    }
+
+    fn avoided_dirty_relay_passes(&self) -> u64 {
+        self.tcp_packets
+            .saturating_sub(self.batch_dirty_relay_passes)
+    }
+
     fn note_budget_exhausted(&mut self) {
         self.budget_exhausted = self.budget_exhausted.saturating_add(1);
         self.backlog_guard
@@ -5719,7 +5748,7 @@ impl TunRxDrainDiag {
 
 fn format_tun_rx_drain_diag(diag: &TunRxDrainDiag) -> String {
     format!(
-        "🔎 tcp-tun-rx-drain attempts={} pre_payload_attempts={} remote_payload_attempts={} remote_payload_deferred_attempts={} remote_payload_deferred_delayed_attempts={} remote_payload_deferred_pressure_attempts={} relay_gap_hint_attempts={} relay_gap_hint_followup_attempts={} maintenance_attempts={} timer_active_flow_attempts={} timer_stalled_read_attempts={} local_egress_service_attempts={} other_attempts={} packets={} tcp={} dns={} udp={} budget_exhausted={} would_block={} errors={} backlog_active={} backlog_pause_edges={} backlog_resume_edges={}",
+        "🔎 tcp-tun-rx-drain attempts={} pre_payload_attempts={} remote_payload_attempts={} remote_payload_deferred_attempts={} remote_payload_deferred_delayed_attempts={} remote_payload_deferred_pressure_attempts={} relay_gap_hint_attempts={} relay_gap_hint_followup_attempts={} maintenance_attempts={} timer_active_flow_attempts={} timer_stalled_read_attempts={} local_egress_service_attempts={} other_attempts={} packets={} tcp={} dns={} udp={} tcp_batches={} batch_dirty_relay_passes={} tcp_batch_packets_high_water={} avoided_dirty_relay_passes={} budget_exhausted={} would_block={} errors={} backlog_active={} backlog_pause_edges={} backlog_resume_edges={}",
         diag.attempts,
         diag.pre_payload_attempts,
         diag.remote_payload_attempts,
@@ -5737,6 +5766,10 @@ fn format_tun_rx_drain_diag(diag: &TunRxDrainDiag) -> String {
         diag.tcp_packets,
         diag.dns_packets,
         diag.udp_packets,
+        diag.tcp_batches,
+        diag.batch_dirty_relay_passes,
+        diag.tcp_batch_packets_high_water,
+        diag.avoided_dirty_relay_passes(),
         diag.budget_exhausted,
         diag.would_block,
         diag.errors,
@@ -8608,38 +8641,75 @@ pub async fn run_event_loop<D, U, M>(
             res = device.wait_for_rx() =>{
                 metrics.loop_park_end();
                 if res.is_ok(){
-                    let packet_kind = process_ready_tun_rx_packet(
-                        &mut device,
-                        &mut assoc_table,
-                        &mut fake_pool,
-                        &upstream,
-                        udp_clock.elapsed().as_secs(),
-                        &metrics_handle,
-                        &mut registry,
-                        &mut sockets,
-                        &mut socket_ctxs,
-                        &mut iface,
-                        &mut dirty,
-                        &handshake_done_tx,
-                        &global_tx,
-                        &mut metrics,
-                        downlink_flush_max_bytes,
-                        downlink_backpressure,
-                        runtime_config.tun_mtu,
-                        &mut downlink_egress_drop_debt,
-                        &mut tcp_loop_flush_tx_calls,
-                        &mut tcp_loop_flush_tx_failures,
-                        tun_rx_drain_diag.backlog_guard().is_active()
-                            || if buffered_downlink.enabled {
-                                tun_egress_feedback.is_paused()
-                            } else {
-                                downlink_rx_paused || tun_egress_feedback.is_paused()
-                            },
-                        buffered_downlink,
-                        "inbound_poll",
-                    )
-                    .await;
-                    if packet_kind == TunRxPacketKind::Tcp
+                    let relay_read_hard_pause = tun_rx_drain_diag
+                        .backlog_guard()
+                        .is_active()
+                        || if buffered_downlink.enabled {
+                            tun_egress_feedback.is_paused()
+                        } else {
+                            downlink_rx_paused || tun_egress_feedback.is_paused()
+                        };
+                    let tcp_packet_ready = if runtime_config.h10d16_byte_owned_egress {
+                        let tcp_packets_before = tun_rx_drain_diag.tcp_packets;
+                        let _ = drain_ready_tun_rx(
+                            &mut device,
+                            &mut assoc_table,
+                            &mut fake_pool,
+                            &upstream,
+                            udp_clock.elapsed().as_secs(),
+                            &metrics_handle,
+                            &mut registry,
+                            &mut sockets,
+                            &mut socket_ctxs,
+                            &mut iface,
+                            &mut dirty,
+                            &handshake_done_tx,
+                            &global_tx,
+                            &mut metrics,
+                            downlink_flush_max_bytes,
+                            downlink_backpressure,
+                            runtime_config.tun_mtu,
+                            &mut downlink_egress_drop_debt,
+                            &mut tcp_loop_flush_tx_calls,
+                            &mut tcp_loop_flush_tx_failures,
+                            &mut tun_rx_drain_diag,
+                            local_egress_service_config.tun_rx_packets_per_cycle,
+                            "inbound_ready_batch",
+                            relay_read_hard_pause,
+                            buffered_downlink,
+                        )
+                        .await;
+                        tun_rx_drain_diag.tcp_packets > tcp_packets_before
+                    } else {
+                        process_ready_tun_rx_packet(
+                            &mut device,
+                            &mut assoc_table,
+                            &mut fake_pool,
+                            &upstream,
+                            udp_clock.elapsed().as_secs(),
+                            &metrics_handle,
+                            &mut registry,
+                            &mut sockets,
+                            &mut socket_ctxs,
+                            &mut iface,
+                            &mut dirty,
+                            &handshake_done_tx,
+                            &global_tx,
+                            &mut metrics,
+                            downlink_flush_max_bytes,
+                            downlink_backpressure,
+                            runtime_config.tun_mtu,
+                            &mut downlink_egress_drop_debt,
+                            &mut tcp_loop_flush_tx_calls,
+                            &mut tcp_loop_flush_tx_failures,
+                            relay_read_hard_pause,
+                            buffered_downlink,
+                            "inbound_poll",
+                        )
+                        .await
+                            == TunRxPacketKind::Tcp
+                    };
+                    if tcp_packet_ready
                         && dirty_contains_d16_flow(&dirty, &socket_ctxs)
                     {
                         metrics.note_d16_tun_rx_actor_wake();
@@ -9068,7 +9138,7 @@ pub async fn run_event_loop<D, U, M>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn process_ready_tun_rx_packet<D, U, M>(
+async fn ingest_ready_tun_rx_packet<D, U, M>(
     device: &mut D,
     assoc_table: &mut AssocTable,
     fake_pool: &mut FakeIpPool,
@@ -9080,17 +9150,9 @@ async fn process_ready_tun_rx_packet<D, U, M>(
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
     iface: &mut Interface,
     dirty: &mut HashSet<SocketHandle>,
-    handshake_done_tx: &mpsc::Sender<HandshakeDone>,
-    global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
     metrics: &mut M,
-    downlink_flush_max_bytes: usize,
-    downlink_backpressure: DownlinkBackpressureConfig,
-    tun_mtu: usize,
-    downlink_egress_drop_debt: &mut DownlinkEgressDropDebt,
     tcp_loop_flush_tx_calls: &mut u64,
     tcp_loop_flush_tx_failures: &mut u64,
-    relay_read_hard_pause: bool,
-    buffered_downlink: BufferedDownlinkConfig,
     poll_stage: &str,
 ) -> TunRxPacketKind
 where
@@ -9157,6 +9219,62 @@ where
         );
     }
     metrics.leave_poll();
+
+    TunRxPacketKind::Tcp
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_ready_tun_rx_packet<D, U, M>(
+    device: &mut D,
+    assoc_table: &mut AssocTable,
+    fake_pool: &mut FakeIpPool,
+    upstream: &Arc<U>,
+    now_secs: u64,
+    metrics_handle: &Metrics,
+    registry: &mut ListenerRegistry,
+    sockets: &mut SocketSet<'static>,
+    socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
+    iface: &mut Interface,
+    dirty: &mut HashSet<SocketHandle>,
+    handshake_done_tx: &mpsc::Sender<HandshakeDone>,
+    global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    metrics: &mut M,
+    downlink_flush_max_bytes: usize,
+    downlink_backpressure: DownlinkBackpressureConfig,
+    tun_mtu: usize,
+    downlink_egress_drop_debt: &mut DownlinkEgressDropDebt,
+    tcp_loop_flush_tx_calls: &mut u64,
+    tcp_loop_flush_tx_failures: &mut u64,
+    relay_read_hard_pause: bool,
+    buffered_downlink: BufferedDownlinkConfig,
+    poll_stage: &str,
+) -> TunRxPacketKind
+where
+    D: TunIo,
+    U: ProxyUpstream + DatagramUpstream + 'static,
+    M: MetricsSink,
+{
+    let packet_kind = ingest_ready_tun_rx_packet(
+        device,
+        assoc_table,
+        fake_pool,
+        upstream,
+        now_secs,
+        metrics_handle,
+        registry,
+        sockets,
+        socket_ctxs,
+        iface,
+        dirty,
+        metrics,
+        tcp_loop_flush_tx_calls,
+        tcp_loop_flush_tx_failures,
+        poll_stage,
+    )
+    .await;
+    if packet_kind != TunRxPacketKind::Tcp {
+        return packet_kind;
+    }
 
     let close_egress_guard = downlink_egress_drop_debt.has_active_drop_debt();
     let relay_read_recovery_active = downlink_egress_drop_debt.has_active_drop_debt();
@@ -9226,6 +9344,7 @@ where
     diag.note_attempt(source);
     let guard_before = diag.backlog_guard();
     let mut drained = 0usize;
+    let mut tcp_packets_in_batch = 0usize;
     let emergency_budget = pressure_tun_rx_drain_budget(downlink_backpressure, tun_mtu);
     let mut drain_limit = budget;
     let mut emergency_extended = false;
@@ -9233,8 +9352,7 @@ where
         while drained < drain_limit {
             match device.try_recv_rx() {
                 Ok(true) => {
-                    let guard_active = diag.backlog_guard().is_active();
-                    let kind = process_ready_tun_rx_packet(
+                    let kind = ingest_ready_tun_rx_packet(
                         device,
                         assoc_table,
                         fake_pool,
@@ -9246,20 +9364,15 @@ where
                         socket_ctxs,
                         iface,
                         dirty,
-                        handshake_done_tx,
-                        global_tx,
                         metrics,
-                        downlink_flush_max_bytes,
-                        downlink_backpressure,
-                        tun_mtu,
-                        downlink_egress_drop_debt,
                         tcp_loop_flush_tx_calls,
                         tcp_loop_flush_tx_failures,
-                        relay_read_hard_pause || guard_active,
-                        buffered_downlink,
                         "tun_rx_drain",
                     )
                     .await;
+                    if kind == TunRxPacketKind::Tcp {
+                        tcp_packets_in_batch = tcp_packets_in_batch.saturating_add(1);
+                    }
                     diag.note_packet(kind);
                     drained += 1;
                 }
@@ -9326,11 +9439,45 @@ where
         }
         TunRxBacklogAction::None => {}
     }
+    if tcp_packets_in_batch > 0 {
+        let close_egress_guard = downlink_egress_drop_debt.has_active_drop_debt();
+        let relay_read_recovery_active = downlink_egress_drop_debt.has_active_drop_debt();
+        process_dirty_relay(
+            dirty,
+            sockets,
+            socket_ctxs,
+            upstream,
+            handshake_done_tx,
+            global_tx,
+            fake_pool,
+            now_secs,
+            metrics_handle,
+            metrics,
+            downlink_flush_max_bytes,
+            downlink_backpressure,
+            tun_mtu,
+            downlink_egress_drop_debt,
+            close_egress_guard,
+            relay_read_recovery_active,
+            relay_read_hard_pause || guard_after.is_active(),
+            buffered_downlink,
+            DownlinkAdmissionOrigin::ControlOnly,
+        )
+        .await;
+        diag.note_tcp_batch_dirty_relay_pass(tcp_packets_in_batch);
+    }
     metrics.note_tun_rx_backlog_guard(
         guard_after.is_active(),
         diag.budget_exhausted,
         guard_after.pause_edges(),
         guard_after.resume_edges(),
+    );
+    metrics.note_tun_rx_batch_service(
+        diag.tcp_packets,
+        diag.tcp_batches,
+        diag.batch_dirty_relay_passes,
+        diag.tcp_batch_packets_high_water,
+        diag.avoided_dirty_relay_passes(),
     );
     drained
 }
@@ -18749,6 +18896,7 @@ mod tests {
 
     #[tokio::test]
     async fn d16_real_quinn_reader_sustains_byte_owned_queue_progress() {
+        let _capacity_guard = crate::test_support::local_capacity_test_guard().await;
         const PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
         const WRITE_BYTES: usize = 64 * 1024;
 
@@ -23782,6 +23930,7 @@ mod tests {
         diag.note_packet(TunRxPacketKind::Tcp);
         diag.note_packet(TunRxPacketKind::Dns);
         diag.note_packet(TunRxPacketKind::Udp);
+        diag.note_tcp_batch_dirty_relay_pass(1);
         diag.note_budget_exhausted();
         diag.note_would_block();
         diag.note_error();
@@ -23815,6 +23964,10 @@ mod tests {
         assert!(line.contains("tcp=1"), "{line}");
         assert!(line.contains("dns=1"), "{line}");
         assert!(line.contains("udp=1"), "{line}");
+        assert!(line.contains("tcp_batches=1"), "{line}");
+        assert!(line.contains("batch_dirty_relay_passes=1"), "{line}");
+        assert!(line.contains("tcp_batch_packets_high_water=1"), "{line}");
+        assert!(line.contains("avoided_dirty_relay_passes=0"), "{line}");
         assert!(line.contains("budget_exhausted=1"), "{line}");
         assert!(line.contains("would_block=1"), "{line}");
         assert!(line.contains("errors=1"), "{line}");
@@ -27682,6 +27835,274 @@ mod tests {
     #[async_trait::async_trait]
     impl DatagramUpstream for NoopTestUpstream {
         async fn send_udp(&self, _datagram: Vec<u8>) {}
+    }
+
+    struct BatchTestRxToken {
+        packet: bytes::BytesMut,
+    }
+
+    impl smoltcp::phy::RxToken for BatchTestRxToken {
+        fn consume<R, F: FnOnce(&mut [u8]) -> R>(mut self, f: F) -> R {
+            f(&mut self.packet)
+        }
+    }
+
+    struct BatchTestTxToken<'a> {
+        queue: &'a mut std::collections::VecDeque<bytes::BytesMut>,
+    }
+
+    impl smoltcp::phy::TxToken for BatchTestTxToken<'_> {
+        fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+            let mut packet = bytes::BytesMut::zeroed(len);
+            let result = f(&mut packet);
+            self.queue.push_back(packet);
+            result
+        }
+    }
+
+    struct BatchTestTunDevice {
+        ready: std::collections::VecDeque<bytes::BytesMut>,
+        current: Option<bytes::BytesMut>,
+        tx: std::collections::VecDeque<bytes::BytesMut>,
+    }
+
+    impl BatchTestTunDevice {
+        fn new(packets: impl IntoIterator<Item = Vec<u8>>) -> Self {
+            Self {
+                ready: packets
+                    .into_iter()
+                    .map(|packet| bytes::Bytes::from(packet).into())
+                    .collect(),
+                current: None,
+                tx: std::collections::VecDeque::new(),
+            }
+        }
+    }
+
+    impl smoltcp::phy::Device for BatchTestTunDevice {
+        type RxToken<'a> = BatchTestRxToken;
+        type TxToken<'a> = BatchTestTxToken<'a>;
+
+        fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
+            let mut capabilities = smoltcp::phy::DeviceCapabilities::default();
+            capabilities.medium = smoltcp::phy::Medium::Ip;
+            capabilities.max_transmission_unit = 1200;
+            capabilities
+        }
+
+        fn receive(
+            &mut self,
+            _timestamp: smoltcp::time::Instant,
+        ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+            self.current.take().map(|packet| {
+                (
+                    BatchTestRxToken { packet },
+                    BatchTestTxToken {
+                        queue: &mut self.tx,
+                    },
+                )
+            })
+        }
+
+        fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+            Some(BatchTestTxToken {
+                queue: &mut self.tx,
+            })
+        }
+    }
+
+    impl TunIo for BatchTestTunDevice {
+        async fn wait_for_rx(&mut self) -> std::io::Result<()> {
+            if self.current.is_none() {
+                self.current = self.ready.pop_front();
+            }
+            Ok(())
+        }
+
+        fn try_recv_rx(&mut self) -> std::io::Result<bool> {
+            if self.current.is_none() {
+                self.current = self.ready.pop_front();
+            }
+            Ok(self.current.is_some())
+        }
+
+        fn rx_peek(&self) -> Option<&[u8]> {
+            self.current.as_deref()
+        }
+
+        fn rx_take(&mut self) -> Option<bytes::BytesMut> {
+            self.current.take()
+        }
+
+        async fn flush_tx(&mut self) -> std::io::Result<()> {
+            self.tx.clear();
+            Ok(())
+        }
+
+        fn inject_ip_packet(&mut self, packet: &[u8]) {
+            self.tx.push_back(bytes::BytesMut::from(packet));
+        }
+    }
+
+    struct BatchDrainTestReport {
+        drained: usize,
+        diag: TunRxDrainDiag,
+        relay_enters: usize,
+        remaining_ready: usize,
+        current_ready: bool,
+    }
+
+    async fn run_batch_drain_test(packets: Vec<Vec<u8>>) -> BatchDrainTestReport {
+        let budget = packets.len();
+        let mut device = BatchTestTunDevice::new(packets);
+        let mut iface = Interface::new(
+            SmolConfig::new(smoltcp::wire::HardwareAddress::Ip),
+            &mut device,
+            smoltcp::time::Instant::now(),
+        );
+        let upstream = Arc::new(NoopTestUpstream);
+        let metrics = Metrics::new();
+        let mut assoc_table = AssocTable::new();
+        let mut fake_pool = FakeIpPool::new();
+        let mut registry = ListenerRegistry::new(1);
+        let mut sockets = SocketSet::new(vec![]);
+        let mut socket_ctxs = HashMap::new();
+        registry
+            .ensure_port(443, &mut sockets, &mut socket_ctxs)
+            .unwrap();
+        let mut dirty = HashSet::new();
+        let (handshake_done_tx, _handshake_done_rx) = mpsc::channel(1);
+        let (global_tx, _global_rx) = mpsc::channel(1);
+        let mut sink = CountingSink::default();
+        let cfg = default_downlink_backpressure_for_tun_egress(1200, 500);
+        let mut drop_debt = DownlinkEgressDropDebt::default();
+        let mut tcp_loop_flush_tx_calls = 0;
+        let mut tcp_loop_flush_tx_failures = 0;
+        let mut diag = TunRxDrainDiag::default();
+
+        let drained = drain_ready_tun_rx(
+            &mut device,
+            &mut assoc_table,
+            &mut fake_pool,
+            &upstream,
+            0,
+            &metrics,
+            &mut registry,
+            &mut sockets,
+            &mut socket_ctxs,
+            &mut iface,
+            &mut dirty,
+            &handshake_done_tx,
+            &global_tx,
+            &mut sink,
+            DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
+            cfg,
+            1200,
+            &mut drop_debt,
+            &mut tcp_loop_flush_tx_calls,
+            &mut tcp_loop_flush_tx_failures,
+            &mut diag,
+            budget,
+            TUN_RX_DRAIN_SOURCE_LOCAL_EGRESS_SERVICE,
+            false,
+            BufferedDownlinkConfig::disabled(cfg, 1),
+        )
+        .await;
+
+        BatchDrainTestReport {
+            drained,
+            diag,
+            relay_enters: sink.relay_enters,
+            remaining_ready: device.ready.len(),
+            current_ready: device.current.is_some(),
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_tun_drain_services_dirty_relay_once_per_tcp_batch() {
+        const PACKETS: usize = 8;
+        let packets = (0..PACKETS).map(|index| {
+            build_ipv4_tcp(
+                [10, 0, 0, 1],
+                [93, 184, 216, 34],
+                40_000 + index as u16,
+                443,
+                false,
+                true,
+            )
+        });
+        let report = run_batch_drain_test(packets.collect()).await;
+
+        assert_eq!(report.drained, PACKETS);
+        assert_eq!(report.diag.tcp_packets, PACKETS as u64);
+        assert_eq!(report.diag.tcp_batches, 1);
+        assert_eq!(report.diag.batch_dirty_relay_passes, 1);
+        assert_eq!(report.diag.tcp_batch_packets_high_water, PACKETS as u64);
+        assert_eq!(
+            report.diag.avoided_dirty_relay_passes(),
+            (PACKETS - 1) as u64
+        );
+        assert_eq!(report.remaining_ready, 0);
+        assert!(!report.current_ready);
+        assert_eq!(
+            report.relay_enters, 1,
+            "one bounded TUN batch must not amplify dirty relay service per packet"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_tun_drain_skips_tcp_relay_for_udp_only_batch() {
+        const PACKETS: usize = 4;
+        let packets = (0..PACKETS)
+            .map(|index| {
+                build_udp_ip_packet(
+                    (Ipv4Addr::new(10, 0, 0, 1), 40_000 + index as u16),
+                    (Ipv4Addr::new(93, 184, 216, 34), 443),
+                    &[index as u8],
+                )
+            })
+            .collect();
+        let report = run_batch_drain_test(packets).await;
+
+        assert_eq!(report.drained, PACKETS);
+        assert_eq!(report.diag.tcp_packets, 0);
+        assert_eq!(report.diag.udp_packets, PACKETS as u64);
+        assert_eq!(report.diag.tcp_batches, 0);
+        assert_eq!(report.diag.batch_dirty_relay_passes, 0);
+        assert_eq!(report.diag.avoided_dirty_relay_passes(), 0);
+        assert_eq!(report.relay_enters, 0);
+        assert_eq!(report.remaining_ready, 0);
+        assert!(!report.current_ready);
+    }
+
+    #[tokio::test]
+    async fn bounded_tun_drain_services_mixed_batch_once_when_tcp_is_present() {
+        let packets = vec![
+            build_udp_ip_packet(
+                (Ipv4Addr::new(10, 0, 0, 1), 40_000),
+                (Ipv4Addr::new(93, 184, 216, 34), 443),
+                &[0x11],
+            ),
+            build_ipv4_tcp([10, 0, 0, 1], [93, 184, 216, 34], 40_001, 443, false, true),
+            build_udp_ip_packet(
+                (Ipv4Addr::new(10, 0, 0, 1), 40_002),
+                (Ipv4Addr::new(93, 184, 216, 34), 443),
+                &[0x22],
+            ),
+            build_ipv4_tcp([10, 0, 0, 1], [93, 184, 216, 34], 40_003, 443, false, true),
+        ];
+        let report = run_batch_drain_test(packets).await;
+
+        assert_eq!(report.drained, 4);
+        assert_eq!(report.diag.tcp_packets, 2);
+        assert_eq!(report.diag.udp_packets, 2);
+        assert_eq!(report.diag.tcp_batches, 1);
+        assert_eq!(report.diag.batch_dirty_relay_passes, 1);
+        assert_eq!(report.diag.tcp_batch_packets_high_water, 2);
+        assert_eq!(report.diag.avoided_dirty_relay_passes(), 1);
+        assert_eq!(report.relay_enters, 1);
+        assert_eq!(report.remaining_ready, 0);
+        assert!(!report.current_ready);
     }
 
     #[tokio::test]

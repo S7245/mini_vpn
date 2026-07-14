@@ -5003,6 +5003,7 @@ mod tests {
 
     #[tokio::test]
     async fn d16_real_quinn_reader_sustains_ordered_progress() {
+        let _capacity_guard = crate::test_support::local_capacity_test_guard().await;
         const PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
         const WRITE_BYTES: usize = 64 * 1024;
 

@@ -1,5 +1,52 @@
 # Learnings
 
+## 2026-07-13 - TUN packet ingestion and relay service need separate batch ownership
+
+- The H10d16 TUN RX path previously traversed dirty relays once per ingested TCP
+  packet and then again from the actor loop. A focused RED observed `8` packets
+  causing `8` relay entries; the batch service GREEN ingests the same packets and
+  performs exactly one dirty-relay pass.
+- The real-Quinn `32 MiB` forward tracer delivered exactly `33,554,432B` at
+  `319.455 Mbit/s`, with zero modeled TUN drops, exact pattern, clean EOF, and a
+  bounded ring high-water of `29/500`. It serviced `28,934` TCP packets in
+  `4,093` batches and avoided `24,841` redundant relay traversals.
+- Reachability matters at the first ready packet: the H10d16 direct-ready branch
+  initially bypassed the batch drain, so a function-level GREEN did not make the
+  product path GREEN. The accepted path routes the already-ready packet and its
+  ready followers through the existing fixed 48-packet drain while preserving
+  the default non-H10 adapter.
+- Reusable rule: keep packet classification/ingress ownership separate from
+  downstream relay service. Prove both the batch invariant and full-path
+  reachability before treating a local optimization as VPS-eligible.
+- Result:
+  `docs/tech/2026-07-13-knife14h10d16-tun-rx-batch-service-local-gate-results.md`.
+
+## 2026-07-13 - A bounded TUN drain probe creates a single-slot ownership obligation
+
+- The drain-budget probe may prefetch one packet and leave it in `rx_buffer` for
+  the next actor turn. The old `wait_for_rx` implementations read again even
+  when that slot was populated, so a two-packet RED proved the first packet could
+  be overwritten by the second.
+- `VirtualTunDevice` and the deterministic harness device now return immediately
+  when `rx_buffer` is already populated. This preserves the prefetched packet
+  without changing MTU, queue capacity, drain budget, or self-wake behavior.
+- Reusable rule: when readiness probing stores data in a caller-owned slot, the
+  next wait must treat a populated slot as ready. A bounded drain is not correct
+  unless every prefetched packet has explicit ownership across turns.
+
+## 2026-07-13 - Throughput tests need serialized ownership of local capacity
+
+- The full harness suite initially produced false `94-164 Mbit/s` rate failures
+  while seven CPU- and socket-heavy localhost tests ran concurrently. Every
+  exact-byte, lifecycle, and pattern invariant passed, and each rate test passed
+  in isolation.
+- A test-only crate-local capacity mutex now serializes those rate-sensitive
+  localhost tests. The complete harness gate then passed `636` tests with no
+  product-path scheduling or pacing change.
+- Reusable rule: a localhost Mbps threshold is meaningful only when the fixture
+  owns the relevant host capacity. Serialize rate gates, but keep exact delivery,
+  conservation, boundedness, and lifecycle assertions independently mandatory.
+
 ## 2026-07-13 - Endpoint-owned pre-accounting closes the local burst/capacity gate
 
 - The complete `EndpointWindowV1` path passed an exact GSO-enabled `32 MiB`

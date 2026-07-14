@@ -796,6 +796,7 @@ fn request_round_trip_and_rejects_invalid_frames() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_loopback_reverse_stream_delivers_fixed_bytes_and_clean_eof() {
+    let _capacity_guard = crate::test_support::local_capacity_test_guard().await;
     let cert_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certs/dev");
     let server_endpoint = probe_server_endpoint(
         "127.0.0.1:0".parse().unwrap(),
@@ -841,6 +842,7 @@ async fn real_loopback_reverse_stream_delivers_fixed_bytes_and_clean_eof() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn disabled_gso_real_loopback_upload_delivers_fixed_bytes_and_clean_eof() {
+    let _capacity_guard = crate::test_support::local_capacity_test_guard().await;
     let cert_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certs/dev");
     let server_endpoint = probe_server_endpoint(
         "127.0.0.1:0".parse().unwrap(),
@@ -884,6 +886,7 @@ async fn disabled_gso_real_loopback_upload_delivers_fixed_bytes_and_clean_eof() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pacer_cap64_real_loopback_upload_delivers_fixed_bytes_and_clean_eof() {
+    let _capacity_guard = crate::test_support::local_capacity_test_guard().await;
     let cert_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certs/dev");
     let server_endpoint = probe_server_endpoint(
         "127.0.0.1:0".parse().unwrap(),
@@ -949,6 +952,7 @@ async fn pacer_cap64_real_loopback_upload_delivers_fixed_bytes_and_clean_eof() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn endpoint_window_v1_real_loopback_upload_exceeds_capacity_gate_without_leaks() {
+    let _capacity_guard = crate::test_support::local_capacity_test_guard().await;
     let cert_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certs/dev");
     let server_endpoint = probe_server_endpoint_with_mtu(
         "127.0.0.1:0".parse().unwrap(),
@@ -1049,6 +1053,7 @@ async fn endpoint_window_v1_real_loopback_upload_exceeds_capacity_gate_without_l
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "known-negative fixed 48-datagram/2ms replay; run explicitly for measurement only"]
 async fn known_negative_bounded_send_service_real_loopback_upload_measurement() {
+    let _capacity_guard = crate::test_support::local_capacity_test_guard().await;
     let cert_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certs/dev");
     let server_endpoint = probe_server_endpoint(
         "127.0.0.1:0".parse().unwrap(),
