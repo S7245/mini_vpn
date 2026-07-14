@@ -2366,11 +2366,22 @@ fn next_d16_egress_phase_for_snapshot(
     drop_debt: bool,
     drain_progress: bool,
 ) -> EgressPhase {
-    if ctx.d16_tun_rx_ack_barrier && snapshot.send_queue == 0 {
-        ctx.d16_tun_rx_ack_barrier = false;
-    }
     let terminal_no_send =
         snapshot.tcp_state == TcpState::Closed && !snapshot.active && !snapshot.can_send;
+    // The barrier was armed only after observing a nonzero send queue. Keep
+    // that historical drain obligation while a stronger stop condition still
+    // dominates; otherwise a hard-pressure zero snapshot can consume the
+    // evidence while leaving the phase in DrainOnly forever. The first clean
+    // zero snapshot proves positive ACK completion even if cycle-local
+    // before/after accounting did not observe the final decrease.
+    let ack_completion_progress = ctx.d16_tun_rx_ack_barrier
+        && snapshot.send_queue == 0
+        && !external_hard_pressure
+        && !drop_debt
+        && !terminal_no_send;
+    if ack_completion_progress {
+        ctx.d16_tun_rx_ack_barrier = false;
+    }
     transition_egress_phase(
         ctx.d16_egress_phase,
         external_hard_pressure
@@ -2379,7 +2390,7 @@ fn next_d16_egress_phase_for_snapshot(
             || terminal_no_send,
         drop_debt,
         snapshot.send_queue <= downlink_backpressure.low_bytes,
-        drain_progress,
+        drain_progress || ack_completion_progress,
     )
 }
 
@@ -23813,6 +23824,136 @@ mod tests {
         assert!(slow.d16_tun_rx_ack_barrier);
         assert_eq!(ready_next, EgressPhase::Recovery { clean_cycles: 0 });
         assert!(!ready.d16_tun_rx_ack_barrier);
+    }
+
+    #[test]
+    fn d16_ack_completion_evidence_survives_hard_pressure_until_clean_snapshot() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let snapshot = |send_queue| SocketCloseSnapshot {
+            tcp_state: TcpState::Established,
+            active: true,
+            can_send: true,
+            can_recv: true,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 1024,
+            send_queue,
+            recv_queue: 0,
+        };
+        let mut ctx = SocketCtx::new(443);
+        ctx.d16_egress_phase = EgressPhase::DrainOnly;
+        arm_d16_tun_rx_ack_barrier(&mut ctx, snapshot(1));
+
+        let still_hard =
+            next_d16_egress_phase_for_snapshot(&mut ctx, snapshot(0), cfg, true, false, false);
+        assert_eq!(still_hard, EgressPhase::DrainOnly);
+        assert!(
+            ctx.d16_tun_rx_ack_barrier,
+            "a hard-pressure-dominated zero snapshot must not consume ACK-completion evidence"
+        );
+
+        ctx.d16_egress_phase = still_hard;
+        let clean =
+            next_d16_egress_phase_for_snapshot(&mut ctx, snapshot(0), cfg, false, false, false);
+        assert_eq!(clean, EgressPhase::Recovery { clean_cycles: 0 });
+        assert!(!ctx.d16_tun_rx_ack_barrier);
+    }
+
+    #[test]
+    fn d16_ack_completion_recovers_eight_flows_without_weakening_stop_conditions() {
+        let cfg = DownlinkBackpressureConfig {
+            high_bytes: 100,
+            low_bytes: 40,
+        };
+        let established = |send_queue| SocketCloseSnapshot {
+            tcp_state: TcpState::Established,
+            active: true,
+            can_send: true,
+            can_recv: true,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 1024,
+            send_queue,
+            recv_queue: 0,
+        };
+        let mut flows: Vec<_> = (0..8)
+            .map(|port| {
+                let mut ctx = SocketCtx::new(10_000 + port);
+                ctx.d16_egress_phase = EgressPhase::DrainOnly;
+                arm_d16_tun_rx_ack_barrier(&mut ctx, established(1));
+                ctx
+            })
+            .collect();
+
+        for ctx in &mut flows {
+            ctx.d16_egress_phase =
+                next_d16_egress_phase_for_snapshot(ctx, established(0), cfg, true, false, false);
+            assert_eq!(ctx.d16_egress_phase, EgressPhase::DrainOnly);
+            assert!(ctx.d16_tun_rx_ack_barrier);
+        }
+        for ctx in &mut flows {
+            ctx.d16_egress_phase =
+                next_d16_egress_phase_for_snapshot(ctx, established(0), cfg, false, false, false);
+            assert_eq!(
+                ctx.d16_egress_phase,
+                EgressPhase::Recovery { clean_cycles: 0 }
+            );
+            assert!(!ctx.d16_tun_rx_ack_barrier);
+        }
+
+        let mut no_barrier = SocketCtx::new(443);
+        no_barrier.d16_egress_phase = EgressPhase::DrainOnly;
+        assert_eq!(
+            next_d16_egress_phase_for_snapshot(
+                &mut no_barrier,
+                established(0),
+                cfg,
+                false,
+                false,
+                false,
+            ),
+            EgressPhase::DrainOnly,
+            "a zero snapshot without prior nonzero ownership must not invent progress"
+        );
+
+        let mut debt = SocketCtx::new(8443);
+        debt.d16_egress_phase = EgressPhase::DrainOnly;
+        arm_d16_tun_rx_ack_barrier(&mut debt, established(1));
+        assert_eq!(
+            next_d16_egress_phase_for_snapshot(&mut debt, established(0), cfg, false, true, false),
+            EgressPhase::DrainOnly
+        );
+        assert!(debt.d16_tun_rx_ack_barrier);
+
+        let mut terminal = SocketCtx::new(9443);
+        terminal.d16_egress_phase = EgressPhase::DrainOnly;
+        arm_d16_tun_rx_ack_barrier(&mut terminal, established(1));
+        let terminal_snapshot = SocketCloseSnapshot {
+            tcp_state: TcpState::Closed,
+            active: false,
+            can_send: false,
+            can_recv: false,
+            may_send: false,
+            may_recv: false,
+            send_capacity: 0,
+            send_queue: 0,
+            recv_queue: 0,
+        };
+        assert_eq!(
+            next_d16_egress_phase_for_snapshot(
+                &mut terminal,
+                terminal_snapshot,
+                cfg,
+                false,
+                false,
+                false,
+            ),
+            EgressPhase::DrainOnly
+        );
+        assert!(terminal.d16_tun_rx_ack_barrier);
     }
 
     #[test]
