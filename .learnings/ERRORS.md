@@ -1,5 +1,21 @@
 # Errors
 
+## 2026-07-13 - Secret-free VPS source exports need explicit provenance and portable inspection
+
+- The isolated source export intentionally omitted `.git`, so the runner
+  reported `source_commit: unknown` even though the archive came from the exact
+  `e2014034` Git object. Record the source object in the deployment manifest and
+  prove it with local/remote archive, binary, runner, and critical-file hashes;
+  do not depend on runtime Git metadata in a secret-free export.
+- One remote checksum command failed because an `awk` field reference crossed
+  nested shell quoting, and a later report query assumed `rg` was installed on
+  `.27`. Use `sha256sum -c` for remote verification, probe tool availability,
+  and retrieve sanitized evidence for local `rg` inspection when the host has
+  only baseline POSIX tools.
+- Neither operational miss changed the build, formal profile, or test window.
+  The corrected source hashes matched before rehearsal/P1, and the final
+  five-member evidence archive passed local path and secret scans.
+
 ## 2026-07-13 - Formal-profile and TCP-window mistakes can create false local safety
 
 - The previous exact 32 MiB tracer configured H10d16 pacing and queues but

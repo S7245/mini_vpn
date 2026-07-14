@@ -1,5 +1,28 @@
 # Learnings
 
+## 2026-07-13 - Bound sender admission before asking bounded ingress to absorb it
+
+- The prior VPS path admitted the full `1 MiB` smoltcp receive window, filled
+  the `500`-packet pump, waited `347` times, and dropped `419` TUN packets.
+  Preserving that physical storage while independently limiting H10d16 TCP
+  receive credit to `368,640B` changed the real envelope without changing any
+  kernel, FIFO, batch, timer, or pacing capacity.
+- The frozen P1 passed at `191 Mbit/s` receiver with `20/20` intervals, TUN
+  drops `0/0`, formal QUIC loss delta `11,459,701B`, and no flow-control block.
+  TCP `recv_queue_max` was exactly `368,640B`; the MTU conversion predicted
+  `318` packets and the real pump reached exactly `318/500`, with zero full
+  waits/read errors.
+- Service attribution stayed exact: `623,222` packets became `4,022` equal
+  batch/relay/poll/flush services. Endpoint final state had zero live and
+  outstanding bytes, and `500,763,062 - 59,480 = 500,703,582` proved exact
+  grant/refund/socket accounting.
+- Reusable rule: when a bounded consumer fails under a startup burst despite
+  average CPU headroom, constrain protocol-level admission at the source of the
+  burst before enlarging queues or accelerating timers. Capacity math is most
+  valuable when it predicts a real high-water mark exactly.
+- Result:
+  `docs/tech/2026-07-13-knife14h10d16-local-uplink-window-service-vps-results.md`.
+
 ## 2026-07-13 - TCP storage and advertised receive credit need independent ownership
 
 - The failed VPS ingress stage used `1 MiB` smoltcp RX storage and repeatedly

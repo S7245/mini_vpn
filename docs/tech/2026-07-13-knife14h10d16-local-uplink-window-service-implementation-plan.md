@@ -1,7 +1,7 @@
 # Knife14h10d16 Local Uplink Window Service Implementation Plan
 
 Date: 2026-07-13
-Status: **LOCAL PASS; VPS P1 PENDING**
+Status: **COMPLETE; VPS P1 PASS**
 
 Architecture:
 `docs/tech/2026-07-13-knife14h10d16-local-uplink-window-service-architecture-spec.md`.
@@ -70,17 +70,20 @@ unexpected repair/regression test fails.
 
 ## Task 8 — One Frozen VPS P1
 
-- [ ] Deploy an exact, secret-free source snapshot and verify hashes.
-- [ ] Rehearse profile/preflight without iperf.
-- [ ] Run one target-only forward P1 with all frozen inputs.
-- [ ] Require receiver `>170 Mbit/s`, zero TUN drops, pump below `500/500`,
+- [x] Deploy an exact, secret-free source snapshot and verify hashes.
+- [x] Rehearse profile/preflight without iperf.
+- [x] Run one target-only forward P1 with all frozen inputs.
+- [x] Require receiver `>170 Mbit/s`, zero TUN drops, pump below `500/500`,
   zero full waits, QUIC loss `<=16 MiB`, exact endpoint conservation, and
   clean lifecycle/cleanup.
-- [ ] Stop the branch on failure; do not tune the window or any frozen value.
+- [x] Stop the branch on failure; do not tune the window or any frozen value.
 
 ## Task 9 — Archive The Result
 
-- [ ] Store a sanitized evidence bundle and checksum.
-- [ ] Update result doc, `HANDOFF.md`, `TODO.md`, `AGENTS.md`, and project
+- [x] Store a sanitized evidence bundle and checksum.
+- [x] Update result doc, `HANDOFF.md`, `TODO.md`, `AGENTS.md`, and project
   learning memory with the exact accepted or failed position.
-- [ ] Commit the evidence stage.
+- [x] Commit the evidence stage.
+
+Accepted result:
+`docs/tech/2026-07-13-knife14h10d16-local-uplink-window-service-vps-results.md`.

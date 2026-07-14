@@ -2,7 +2,8 @@
 
 Date: 2026-07-13
 
-Status: **IMPLEMENTED; full local gate and code review PASS, VPS acceptance pending.**
+Status: **IMPLEMENTED; local gate/code review PASS, accepted in the combined
+H10d16 zero-drop VPS successor.**
 
 Source of truth:
 `docs/tech/2026-07-13-knife14h10d16-endpoint-pacing-service-architecture-spec.md`.
@@ -201,3 +202,18 @@ or new authority still requires an explicit stop.
   generation collision now retains the old paced adapter instead of
   detaching and sending unpaced. The focused lifecycle test and all affected
   suites pass. No unresolved P0/P1 remains.
+
+## VPS Completion Evidence
+
+The endpoint service's first isolated frozen P1 proved capacity, QUIC loss,
+and conservation but still saw `10` TUN TX drops. Subsequent frozen repairs
+added continuous bounded TUN ingress service and, finally, independent H10d16
+TCP receive credit without changing endpoint constants.
+
+The accepted combined P1 from `e2014034` reached `191 Mbit/s` receiver with
+`20/20` intervals, TUN drops `0/0`, and formal QUIC loss delta `11,459,701B`.
+Endpoint final state was `available=61,403B`, `live=0`, `outstanding=0`, with
+`500,763,062 - 59,480 = 500,703,582` exact grant/refund/send bytes. The result
+is recorded in:
+
+`docs/tech/2026-07-13-knife14h10d16-local-uplink-window-service-vps-results.md`.

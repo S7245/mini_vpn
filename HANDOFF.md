@@ -8,52 +8,45 @@ This section overrides the older G7/G8/GV next-step text below.
 
 ### Latest accepted position (2026-07-13)
 
-- EndpointPacingService is committed at `c55737e1ef094c2bbc0e4e7e69ada97f98219fbb`.
-  Its frozen VPS P1 passed capacity (`194 Mbit/s` receiver), QUIC-loss
-  (`11,922,924B <= 16 MiB`), and endpoint conservation, but failed safety with
-  `10` TUN TX drops. Pacing constants are closed as the next repair branch.
-- The H10d16 TUN RX batch relay service is committed at
-  `d934f124a54caf1a60963c7ff84bf619a73b2262`. Its local exact gate passed at
-  `319.455 Mbit/s`, but its frozen VPS P1 failed safety: receiver remained
-  `194 Mbit/s`, QUIC loss passed at `11,717,996B`, and exact batch attribution
-  was `847,092` TCP packets -> `3,712/3,712` batch/relay passes with `843,380`
-  avoided traversals, yet TUN drops were `0/38`. The batch-only branch is
-  closed; do not tune drain or queue constants.
-- The H10d16-only bounded TUN ingress service is committed at
-  `20a0f8cca6ae0661497173671ea4f426333d6114`. It splits the TUN reader into a
-  continuous 500-packet FIFO pump, preserves raw DNS/UDP/SYN classification,
-  and performs one smoltcp poll, TUN flush, and dirty-relay pass per existing
-  bounded TCP batch. The focused tracer moved from `8` poll/flush calls for
-  `8` packets to `1/1` without changing the 48/240 service bounds.
-- The exact real-Quinn 32 MiB gate passed at `293.488 Mbit/s`, exact bytes and
-  clean EOF, zero modeled drops, ring high `38/500`, pump high `56/500`, zero
-  full waits/read errors, and `28,933` TCP packets -> `11,817/11,817`
-  batch/poll/flush passes with `17,116` avoided per-packet calls. D16 terminal
-  ownership and tail were zero.
-- Final regressions pass: quinn-proto `309/309 + 3/3` docs; Quinn `29/29`
-  nonignored (`3` expected ignored) + `1/1` doc; root `629/629` nonignored;
-  harness `640/640` nonignored; integration `10/10`; all-target check;
-  explicit `64/256/1024`; zero-loss UDP sweep; fmt, runner syntax/self-test,
-  and diff checks.
-- Code review fixed terminal TUN error handling so a closed pump cannot become
-  a busy select loop. No unresolved P0/P1 remains. The profiler calibration
-  also now requires completed flows; exact `d934f12` comparison proved the old
-  32-flow fixture could time out without failing its completion contract.
-- Its exact frozen VPS P1 retained `194 Mbit/s` receiver, `20/20` intervals,
-  QUIC loss `11,770,368B`, endpoint conservation, and exact service equality:
-  `856,043` packets -> `4,529` batch/relay/poll/flush passes with `851,514`
-  avoided calls. It nevertheless failed safety with `419` TUN TX drops, pump
-  high-water `500/500`, and `347` full waits. Loop active was only
-  `4.8-17.8%`, so this is a real service/scheduling envelope failure rather
-  than CPU saturation. The ingress-pump/batch branch is closed without tuning.
-- Cleanup is complete, the target route is back on `eth0`, the sanitized
-  bundle is archived locally with SHA-256 `2234c880...e07ab7`, and no macOS
-  TUN ran. The user authorized safe in-scope repairs without repeated
-  confirmation. Next: deterministic startup-burst replay plus a new
-  code-level reachability/architecture gate; do not enlarge capacities or
-  reopen frozen parameter branches. Sources:
-  `docs/tech/2026-07-13-knife14h10d16-tun-rx-batch-service-vps-results.md` and
-  `docs/tech/2026-07-13-knife14h10d16-tun-ingress-service-{architecture-spec,implementation-plan,local-gate-results,vps-results}.md`.
+- The accepted H10d16 chain is now complete through the frozen VPS P1:
+  EndpointPacingService `c55737e`, batch relay `d934f12`, bounded TUN ingress
+  `20a0f8c`, and the independent local TCP receive-credit service
+  `e20140340f7f949fa8bad9e960ce94451d2c0229`.
+- The selected repair preserves the physical `1 MiB` smoltcp RX/TX storage but
+  limits H10d16 advertised and accepted receive credit to `368,640B`. The TCP
+  right edge is `application_consumed_seq + min(storage, limit)`; queued bytes
+  reduce advertised free credit and cannot move that edge forward.
+- Local TDD and regressions pass. The exact real-Quinn 32 MiB gate reached
+  `302.246 Mbit/s`, exact bytes, zero modeled drops, ring/pump `15/500`, zero
+  full waits/read errors, and `recv_queue_max=39,440B`. Vendored smoltcp passed
+  `290+3 docs`; quinn-proto `309+3 docs`; Quinn `29+1 doc`; root/harness
+  `630/641` nonignored; integration `10/10`; explicit `64/256/1024` and the
+  four-size zero-loss UDP sweep passed. No unresolved P0/P1 remains.
+- The one frozen target-only forward VPS P1 is **PASS**: receiver `191 Mbit/s`,
+  `20/20` intervals, tail average/minimum `201.333/192 Mbit/s`, TUN drops
+  `0/0`, and formal aggregate QUIC-loss delta `11,459,701B <= 16 MiB`.
+- Reachability was exact. The socket `recv_queue_max` reached but did not
+  exceed `368,640B`; the packet conversion predicted `318`, and the real pump
+  high-water was exactly `318/500`, with zero full waits/read errors. `623,222`
+  TCP packets became `4,022/4,022/4,022/4,022` batch/relay/poll/flush services,
+  avoiding `619,200` repeated calls.
+- Endpoint final state was `available=61,403B`, `live=0`, `outstanding=0`;
+  `500,763,062B granted - 59,480B refunded = 500,703,582B sent`. There was no
+  abandoned byte, reconnect, migration, pacing leak, flow-control block,
+  terminal pending/reap, TUN flush failure, or unbounded close owner.
+- Cleanup is complete: no VPS client remains and the target route is back on
+  `eth0`. The sanitized five-member bundle is archived at
+  `/private/tmp/mini_vpn_local_uplink_window_e201403/` with SHA-256
+  `769dadd36d1b6db8ba0ff4aad3bd7efc16699b5cc01530932e81cdfb018f18d4`.
+  No macOS TUN ran.
+- Task 12 step 4's local-uplink-window successor is accepted. Keep H10d16,
+  EndpointWindowV1 constants, MTU, queue/FIFO/batch bounds, pool, QUIC windows,
+  chunk, Cubic, GSO default, Quinn sender/driver bound, and self-wake frozen.
+  Do not reopen bounded sender, cap64, GSO-only, or parameter-tuning branches.
+  The forward P1 blocker is closed; resume Task 12 step 4 at a fresh reverse
+  P8 gate, then UDP/live-streaming, Linux fake-IP DNS, and TUN stop/rearm.
+  Source:
+  `docs/tech/2026-07-13-knife14h10d16-local-uplink-window-service-{architecture-spec,implementation-plan,local-gate-results,vps-results}.md`.
 
 The older entries below are chronological stage history and do not override
 this position.
