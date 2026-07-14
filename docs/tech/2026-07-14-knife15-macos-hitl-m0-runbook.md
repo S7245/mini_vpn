@@ -1,14 +1,16 @@
 # Knife15 macOS HITL M0 Runbook
 
 Date: 2026-07-14
-Status: **Runner locally verified; real TUN not yet executed**
+Status: **Short HK qualification PASS; formal 2-hour M0 controller locally
+verified and awaiting user execution**
 
 ## Purpose And Authority Boundary
 
-This runbook qualifies the Knife15 target-only macOS evidence loop before any
-2-hour soak. It may run on the HK development Mac or the dedicated Shenzhen
-Mac. A low-bandwidth cross-region result is not an H10d16 capacity failure; the
-capable Linux/VPS lane remains the absolute throughput reference.
+This runbook runs the formal Knife15 target-only macOS M0 after the short
+evidence-loop qualification. It may run on the HK development Mac or the
+dedicated Shenzhen Mac. A low-bandwidth cross-region result is not an H10d16
+capacity failure; the capable Linux/VPS lane remains the absolute throughput
+reference.
 
 The macOS user runs every command, including every `sudo` command. The agent
 does not create the TUN or mutate macOS routes. The reviewed runner adds only
@@ -18,14 +20,15 @@ install a default route or change system DNS.
 ## Preconditions
 
 - Use a clean checkout containing `scripts/knife15-macos-soak.sh`.
-- Install `cargo`, `iperf3`, and the normal mini_vpn build dependencies.
+- Install `cargo`, `iperf3`, `jq`, and the normal mini_vpn build dependencies.
+  macOS must also provide `dig` for the periodic fake-IP DNS checks.
 - Keep the five TUIC credential/configuration values local. Never paste UUID,
   password, private keys, or credential-bearing environment output into chat.
 - Use a certificate-only CA file. The runner rejects private-key material.
 - Exit any existing VPN/proxy that routes the TUIC Exit or target through a
   `utun` interface. The runner refuses a recursive setup.
-- Keep the Mac awake and connected to power for a later soak. The first run
-  below is only a short M0 qualification.
+- Keep the Mac awake, connected to power, and on a stable network for the
+  formal two-hour workload below.
 
 ## 1. Build And Export Local Configuration
 
@@ -74,23 +77,49 @@ Stop here if self-test, preflight, direct forward, or direct reverse fails.
 Preserve the printed baseline directory. A failed direct/control path makes
 throughput attribution invalid and does not authorize constant tuning.
 
-## 4. Run The User-Controlled Target-Only TUN Qualification
+Export the exact fresh directory printed by `baseline`; do not reuse the
+earlier short-qualification baseline after rebuilding:
+
+```sh
+export M0_BASELINE_DIR='/tmp/mini_vpn_knife15_macos_baseline_REPLACE_WITH_TIMESTAMP'
+```
+
+The formal controller validates the target, TCP protocol, forward/reverse
+direction, positive receiver rate, and every nonzero interval before it starts.
+It derives sustained TCP/UDP rates at `50%` of the same-direction direct
+receiver baseline and short TCP bursts at `80%`.
+
+## 4. Run The Formal 2-Hour M0 Workload
 
 ```sh
 sudo -v
 sudo -E bash scripts/knife15-macos-soak.sh start
 sudo -E bash scripts/knife15-macos-soak.sh smoke
+caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m0
 sudo -E bash scripts/knife15-macos-soak.sh status
 sudo -E bash scripts/knife15-macos-soak.sh stop
 ```
 
 `start` must report the new `utun`, target route, non-recursive Exit route,
-and evidence directory. `smoke` exercises forward TCP, reverse TCP, and the
-optional DNS route. `stop` terminates only identity-verified runner processes,
-removes only routes still owned by this run, scans for secret-shaped material,
-and produces a `.tar.gz` bundle plus SHA-256.
+and evidence directory. `smoke` rechecks forward TCP, reverse TCP, and fake-IP
+DNS before the expensive run. `m0` takes approximately two hours plus command
+setup overhead and keeps the Mac awake through `caffeinate`.
 
-If `start` or `smoke` fails, do not tune any frozen setting. Run:
+The frozen M0 timeline contains `6,780s` of active work, one `300s` idle-drain
+window, and one `120s` final drain. Each full cycle contains capped forward and
+reverse TCP, reverse UDP at a `1160B` application payload, six alternating
+short TCP connections, and fake-IP DNS. The controller validates every iperf
+JSON interval, byte evidence, UDP loss field, and DNS answer. It identity-
+tracks traffic, idle, and final-drain children, checks process/target/Exit and
+lossless-log health at least every two seconds, and records an independently
+verified idle/resume/final-drain timeline.
+
+`stop` first terminates any identity-verified M0 controller, then terminates
+mini_vpn, removes only routes still owned by this run, scans for secret-shaped
+material, and produces a `.tar.gz` bundle plus SHA-256.
+
+If `start`, `smoke`, or `m0` fails, do not tune any frozen setting. The M0
+failure leaves the TUN running for evidence. Run:
 
 ```sh
 sudo -E bash scripts/knife15-macos-soak.sh status || true
@@ -100,15 +129,30 @@ sudo -E bash scripts/knife15-macos-soak.sh stop
 
 The last `stop` is the emergency cleanup and evidence-finalization command.
 
-## 5. Return Only Safe Evidence
+## 5. Prove Stop/Re-create/Rearm
+
+After the first `stop` prints its bundle and checksum, create a fresh TUN and
+prove the client rearms. No second two-hour workload is required:
+
+```sh
+sudo -E bash scripts/knife15-macos-soak.sh start
+sudo -E bash scripts/knife15-macos-soak.sh smoke
+sudo -E bash scripts/knife15-macos-soak.sh stop
+```
+
+The second `start` must create one new utun, keep the Exit outside it, and pass
+TCP/DNS again. The second `stop` must again restore the target and DNS host
+routes and produce a separate sanitized bundle.
+
+## 6. Return Only Safe Evidence
 
 Return these items for review:
 
 - the self-test PASS line;
 - the preflight output;
 - the direct baseline directory and forward/reverse summary;
-- the `start`, `smoke`, and `status` outputs;
-- the bundle path and SHA-256 printed by `stop`.
+- the first `start`, `smoke`, `m0`, and `status` outputs;
+- both bundle paths and SHA-256 values printed by the two `stop` commands.
 
 Do not return exported environment variables, UUID, password, CA/private-key
 contents, shell history, or credential-bearing process/environment dumps. The
@@ -116,7 +160,11 @@ agent can inspect a bundle that remains on the shared HK Mac by its local path.
 
 ## Qualification Decision
 
-This short run proves runner/profile/routing/cleanup behavior only. A valid
-bundle with exact H10d16 startup fingerprint, endpoint conservation, working
-TCP/DNS paths, and clean restoration authorizes preparation of M0's 2-hour
-workload. It does not by itself complete M0, M1, M2, or M3.
+The first HK short run has already qualified the target-only runner. Formal M0
+passes only after the two-hour bundle shows `m0_status: complete`, zero phase
+and health failures, one completed idle/resume/final-drain sequence, every
+endpoint conservation sample at or below `61,440B`, zero final live and
+outstanding ownership, bounded resource envelopes, no unexplained TUN errors,
+no lossy log compaction, and clean stop. The fresh re-create/smoke/stop bundle
+must independently prove rearm and cleanup. M0 does not complete M1, M2, or
+M3.

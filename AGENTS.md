@@ -227,6 +227,21 @@ Current Knife14 summary, as of 2026-07-14:
 
 Current Knife15 plan, as of 2026-07-14:
 
+- The formal macOS M0 controller is locally complete. It derives `50%`
+  sustained and `80%` burst rates from a fresh same-target direct baseline,
+  preserves UDP `1160B`, and fixes the formal timeline at `6,780s` active +
+  `300s` idle + `120s` final drain.
+- The controller validates every iperf interval, byte/loss evidence, and fake-
+  IP DNS answer; identity-tracks traffic/idle/drain children; checks process/
+  target/Exit/lossless-log health throughout the timeline; and stops workload
+  generation before cleanup on failure. Summary exposes M0 event/result/
+  timeline status, resource envelopes, utun deltas, conservation max, and
+  final live/outstanding ownership.
+- Local shell TDD passes; no new real TUN or two-hour run occurred. The next
+  action is user-executed formal M0 followed by fresh create/smoke/stop rearm.
+  Result:
+  `docs/tech/2026-07-14-knife15-macos-m0-controller-local-gate-results.md`.
+
 - The first HK user-executed target-only qualification passed on source
   `2a85fd4`: direct receiver `9.045/26.790 Mbit/s`, TUN receiver
   `31.444/48.490 Mbit/s`, all `20/20` nonzero. Endpoint conservation stayed

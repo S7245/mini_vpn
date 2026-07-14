@@ -1,5 +1,23 @@
 # Errors
 
+## 2026-07-14 - M0 review found false-complete and cleanup gaps before real TUN
+
+- The first local controller draft could retain `m0_status: complete` after an
+  expected iperf JSON or DNS artifact disappeared, because the summary counted
+  events and files independently. It now requires exact phase/file and
+  DNS/file correspondence plus zero invalid files.
+- Idle and final drain initially called `sleep` outside the tracked-child seam.
+  A signal or `stop` could therefore terminate the controller without proving
+  the pause child ended. All scheduled children now use the same monitored,
+  TERM-then-KILL lifecycle.
+- Log compaction initially preserved disk safety while silently deleting early
+  conservation evidence. It now fails the running workload and forces summary
+  review. A live workload PID identity mismatch also blocks user-requested
+  process/route cleanup instead of signaling an unrelated PID or claiming a
+  clean stop.
+- These failures were caught by shell RED tests and code review before a real
+  two-hour TUN run; they do not authorize any H10d16 constant change.
+
 ## 2026-07-14 - The first macOS HITL summary hid evidence and overproduced logs
 
 - BSD `awk` rejected `NR>0?NR-1:0`, leaving process and event counts blank even

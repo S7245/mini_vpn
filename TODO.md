@@ -6,6 +6,24 @@
 
 #### Latest decision (2026-07-14)
 
+The formal M0 mixed-workload controller and evidence parser are locally PASS.
+It requires a fresh same-target direct baseline, derives sustained TCP/UDP at
+`50%` and short TCP bursts at `80%`, fixes UDP at `1160B`, and runs
+`6,780s` active + `300s` idle + `120s` final drain. Eight complete cycles
+provide bidirectional TCP, reverse video-like UDP, 48 short connections, and
+eight fake-IP DNS checks.
+
+The public `m0` action accepts only the full `7,200s` profile. It rejects
+wrong-target/direction/zero-interval baselines, zero-traffic or missing-evidence
+iperf JSON, non-fake DNS answers, process death, target-route escape, and Exit
+recursion. It identity-tracks the controller plus traffic/idle/drain child,
+fails closed if log compaction loses history, leaves TUN running on workload
+failure for evidence, and adds M0 result/DNS/timeline, resource, utun, and
+endpoint-ownership fields to the summary. Local
+shell TDD passes; no new real TUN or two-hour run occurred. Next is the user-
+executed M0 and fresh stop/re-create/rearm pair. Result:
+`docs/tech/2026-07-14-knife15-macos-m0-controller-local-gate-results.md`.
+
 The first HK user-controlled target-only qualification is PASS on exact source
 `2a85fd4`. Direct receiver rates were `9.045/26.790 Mbit/s` forward/reverse;
 TUN receiver rates were `31.444/48.490 Mbit/s`, all four with `20/20` nonzero

@@ -13,7 +13,7 @@ fail() {
 [[ -x "$RUNNER" ]] || fail "runner is missing or not executable: $RUNNER"
 
 help_text="$("$RUNNER" --help)" || fail "--help returned nonzero"
-for mode in preflight baseline start status event snapshot smoke stop bundle; do
+for mode in preflight baseline start status event snapshot smoke m0 stop bundle; do
   grep -Fq "$mode" <<<"$help_text" || fail "--help omits mode: $mode"
 done
 grep -Fq "user runs every sudo command" <<<"$help_text" || \

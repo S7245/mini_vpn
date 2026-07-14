@@ -4,6 +4,23 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-14)
 
+- The formal M0 controller is locally PASS. A fresh same-target baseline
+  derives `50%` sustained TCP/UDP and `80%` short TCP burst rates; UDP remains
+  `1160B`. The frozen timeline is `6,780s` active + `300s` idle + `120s`
+  final drain, with eight complete mixed cycles, 48 short flows, and eight DNS
+  checks.
+- Public `m0` refuses shortened profiles, wrong baseline provenance, zero
+  intervals, missing byte/loss evidence, non-fake DNS, process/route health
+  failure, and concurrent/stale run evidence. It tracks traffic/idle/drain
+  children, fails closed if log history is compacted, stops work before
+  cleanup, and leaves a failed TUN alive for evidence.
+- Summary output includes M0 result/DNS/timeline integrity, RSS/FD/thread
+  envelopes, utun deltas, endpoint conservation maximum, and final live/
+  outstanding ownership. Local shell TDD passed; no new real TUN or two-hour
+  run occurred. Next action is a user-executed M0 followed by a fresh create/
+  smoke/stop rearm bundle. Result:
+  `docs/tech/2026-07-14-knife15-macos-m0-controller-local-gate-results.md`.
+
 - The first HK user-executed target-only qualification passed on exact source
   `2a85fd4`. Direct receiver rates were `9.045/26.790 Mbit/s` and TUN receiver
   rates `31.444/48.490 Mbit/s` forward/reverse, all `20/20` nonzero.

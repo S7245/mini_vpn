@@ -1,5 +1,26 @@
 # Learnings
 
+## 2026-07-14 - A formal soak must pre-account evidence as strictly as bytes
+
+- The macOS M0 controller now derives all offered load from a fresh same-target
+  direct baseline, but rate caps alone do not make a formal run attributable.
+  Every phase must also prove positive intervals, sender/receiver bytes,
+  protocol-specific fields, exact result-file correspondence, fake-IP DNS,
+  and one complete idle/resume/final-drain timeline.
+- Long pauses are workload phases too. Running idle and final drain through the
+  same identity-tracked child seam as iperf/dig makes signals, `stop`, process
+  death, and route failure uniformly fail closed instead of leaving orphaned
+  sleeps or unmonitored gaps.
+- Bounded log compaction protects disk but destroys historical proof. The
+  formal workload now stops at the next health check and the summary becomes
+  `REVIEW` if compaction occurs; a bounded observer is not automatically a
+  lossless observer.
+- Reusable rule: a long-run PASS requires conservation of evidence as well as
+  resources. Predeclare required artifacts, validate them while the system is
+  live, and refuse cleanup if a recorded workload PID changes identity.
+- Result:
+  `docs/tech/2026-07-14-knife15-macos-m0-controller-local-gate-results.md`.
+
 ## 2026-07-14 - Real macOS bundles must qualify the evidence pipeline too
 
 - The first HK HITL bundle proved useful TUN behavior, but it also exposed two

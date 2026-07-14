@@ -1,7 +1,8 @@
 # Knife15 Long-Duration Release-Readiness Plan
 
 Date: 2026-07-14
-Status: **Short HK HITL qualification PASS; 2-hour M0 not yet executed**
+Status: **Short HK HITL qualification PASS; formal M0 controller locally PASS;
+2-hour M0 not yet executed**
 
 ## Stage Goal
 
@@ -269,7 +270,17 @@ was `317/500` with zero waits/errors, and process/utun/routes cleaned up. This
 qualifies the runner, not the 2-hour M0. Results:
 `docs/tech/2026-07-14-knife15-macos-hitl-short-qualification-results.md`.
 
-HK is now permitted to run target-only M0 through the same user-executed HITL
-boundary; Shenzhen remains preferred for M1/M2 and recovery. Before M0,
-complete the repaired summary/log-density gates and the mixed-workload plus
-idle-drain controller. No frozen data-plane constant changed.
+The formal M0 controller is now locally complete. It derives sustained rates
+at `50%` and short bursts at `80%` of a fresh same-target direct baseline,
+validates every iperf interval and fake-IP DNS answer, runs `6,780s` active +
+`300s` idle + `120s` final drain, and fails closed on workload/process/route
+health. The summary records workload completion, resource envelopes, utun
+deltas, and endpoint final ownership. Shell fixtures prove success, zero-
+traffic rejection, failure stop, idle/resume, and summary parsing without a
+real TUN.
+
+HK is now permitted to execute the formal target-only M0 through the same
+user-controlled HITL boundary; Shenzhen remains preferred for M1/M2 and
+recovery. M0 still requires a fresh direct baseline, user-executed TUN, two-
+hour workload, stop bundle, and fresh create/smoke/stop rearm bundle. No frozen
+data-plane constant changed.
