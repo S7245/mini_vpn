@@ -19,12 +19,12 @@ This section overrides the older G7/G8/GV next-step text below.
   was `847,092` TCP packets -> `3,712/3,712` batch/relay passes with `843,380`
   avoided traversals, yet TUN drops were `0/38`. The batch-only branch is
   closed; do not tune drain or queue constants.
-- The H10d16-only bounded TUN ingress service is locally complete. It splits
-  the TUN reader into a continuous 500-packet FIFO pump, preserves raw
-  DNS/UDP/SYN classification, and performs one smoltcp poll, TUN flush, and
-  dirty-relay pass per existing bounded TCP batch. The focused tracer moved
-  from `8` poll/flush calls for `8` packets to `1/1` without changing the
-  48/240 service bounds.
+- The H10d16-only bounded TUN ingress service is committed at
+  `20a0f8cca6ae0661497173671ea4f426333d6114`. It splits the TUN reader into a
+  continuous 500-packet FIFO pump, preserves raw DNS/UDP/SYN classification,
+  and performs one smoltcp poll, TUN flush, and dirty-relay pass per existing
+  bounded TCP batch. The focused tracer moved from `8` poll/flush calls for
+  `8` packets to `1/1` without changing the 48/240 service bounds.
 - The exact real-Quinn 32 MiB gate passed at `293.488 Mbit/s`, exact bytes and
   clean EOF, zero modeled drops, ring high `38/500`, pump high `56/500`, zero
   full waits/read errors, and `28,933` TCP packets -> `11,817/11,817`
@@ -39,14 +39,21 @@ This section overrides the older G7/G8/GV next-step text below.
   a busy select loop. No unresolved P0/P1 remains. The profiler calibration
   also now requires completed flows; exact `d934f12` comparison proved the old
   32-flow fixture could time out without failing its completion contract.
-- The user authorized safe in-scope repairs without repeated confirmation,
-  plus commit and VPS. Next: commit this reviewed local candidate, deploy that
-  exact commit, rehearse the frozen profile, and run one target-only
-  forward-only P1. Receiver `<=170 Mbit/s`, any TUN drop, pump high-water
-  `500`, or any pump full wait is architecture failure without tuning. macOS
-  TUN remains prohibited. Sources:
+- Its exact frozen VPS P1 retained `194 Mbit/s` receiver, `20/20` intervals,
+  QUIC loss `11,770,368B`, endpoint conservation, and exact service equality:
+  `856,043` packets -> `4,529` batch/relay/poll/flush passes with `851,514`
+  avoided calls. It nevertheless failed safety with `419` TUN TX drops, pump
+  high-water `500/500`, and `347` full waits. Loop active was only
+  `4.8-17.8%`, so this is a real service/scheduling envelope failure rather
+  than CPU saturation. The ingress-pump/batch branch is closed without tuning.
+- Cleanup is complete, the target route is back on `eth0`, the sanitized
+  bundle is archived locally with SHA-256 `2234c880...e07ab7`, and no macOS
+  TUN ran. The user authorized safe in-scope repairs without repeated
+  confirmation. Next: deterministic startup-burst replay plus a new
+  code-level reachability/architecture gate; do not enlarge capacities or
+  reopen frozen parameter branches. Sources:
   `docs/tech/2026-07-13-knife14h10d16-tun-rx-batch-service-vps-results.md` and
-  `docs/tech/2026-07-13-knife14h10d16-tun-ingress-service-{architecture-spec,implementation-plan,local-gate-results}.md`.
+  `docs/tech/2026-07-13-knife14h10d16-tun-ingress-service-{architecture-spec,implementation-plan,local-gate-results,vps-results}.md`.
 
 The older entries below are chronological stage history and do not override
 this position.

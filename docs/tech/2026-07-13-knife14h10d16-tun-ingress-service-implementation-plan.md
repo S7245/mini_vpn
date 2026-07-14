@@ -1,7 +1,7 @@
 # Knife14h10d16 TUN Ingress Service Implementation Plan
 
 Date: 2026-07-13
-Status: **LOCAL GATE PASS; Task 10 frozen VPS acceptance pending**
+Status: **IMPLEMENTED; VPS ARCHITECTURE FAIL; branch closed**
 
 Source of truth:
 `docs/tech/2026-07-13-knife14h10d16-tun-ingress-service-architecture-spec.md`.
@@ -75,15 +75,20 @@ Source of truth:
   D16/endpoint conservation, and observability.
 - [x] Resolve every P0/P1, including terminal TUN error fail-closed behavior.
 - [x] Update learning/error memory, HANDOFF/TODO/AGENTS, and result docs.
-- [ ] Commit one coherent reviewed change after a secret/staging audit.
+- [x] Commit one coherent reviewed change after a secret/staging audit:
+  `20a0f8cca6ae0661497173671ea4f426333d6114`.
 
 ## Task 10: Frozen VPS Acceptance
 
-- [ ] Deploy an isolated exact commit and verify source/binary/runner hashes.
-- [ ] Run profile rehearsal and one target-only forward-only P1.
-- [ ] Require `>170 Mbit/s`, zero TUN drops, QUIC loss `<=16 MiB`, pump FIFO
+- [x] Deploy an isolated exact commit and verify source/binary/runner hashes.
+- [x] Run profile rehearsal and one target-only forward-only P1.
+- [x] Require `>170 Mbit/s`, zero TUN drops, QUIC loss `<=16 MiB`, pump FIFO
   below capacity with zero full waits, exact batch attribution, conservation,
-  lifecycle, and cleanup.
-- [ ] If any TUN drop or pump-capacity edge remains, stop this architecture
-  without parameter tuning.
-- [ ] No macOS TUN.
+  lifecycle, and cleanup. Throughput, loss, attribution, conservation, and
+  cleanup passed; safety failed with `419` TUN TX drops, pump `500/500`, and
+  `347` full waits.
+- [x] Stop this architecture without parameter tuning.
+- [x] No macOS TUN.
+
+Result:
+`docs/tech/2026-07-13-knife14h10d16-tun-ingress-service-vps-results.md`.

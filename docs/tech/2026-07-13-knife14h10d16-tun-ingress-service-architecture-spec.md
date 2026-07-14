@@ -1,7 +1,7 @@
 # Knife14h10d16 TUN Ingress Service Architecture Spec
 
 Date: 2026-07-13
-Status: **LOCAL GATE PASS; eligible for one frozen VPS P1**
+Status: **VPS ARCHITECTURE FAIL; branch closed without tuning**
 
 ## Stage Goal
 
@@ -12,6 +12,11 @@ parameter.
 
 This stage is intended to be sufficient for one new zero-TUN-drop,
 `>170 Mbit/s` forward P1. The Mbps result still requires VPS acceptance.
+
+VPS acceptance disproved sufficiency: commit `20a0f8c` retained
+`194 Mbit/s` receiver and exact batch/poll/flush/relay service, but produced
+`419` TUN TX drops, filled the pump to `500/500`, and recorded `347` full
+waits. The architecture is closed; see the sibling VPS results document.
 
 ## Accepted Evidence
 

@@ -201,10 +201,11 @@ Current Knife14 summary, as of 2026-07-13:
 - The batch-only mechanism was reachable but insufficient. Live attribution
   was poll-dominated (`14.1-44.0%`) while relay fell to `0.8-2.8%`; this selected
   independent TUN read ownership plus batch poll/flush as the successor seam.
-- That H10d16-only TUN ingress service is now locally complete. A continuous
-  reader pump owns a 500-packet FIFO, the actor preserves raw DNS/UDP/SYN
-  classification, and every bounded TCP batch performs one smoltcp poll,
-  flush, and dirty-relay pass. The default non-H10 adapter remains direct.
+- That H10d16-only TUN ingress service is committed at
+  `20a0f8cca6ae0661497173671ea4f426333d6114`. A continuous reader pump owns a
+  500-packet FIFO, the actor preserves raw DNS/UDP/SYN classification, and
+  every bounded TCP batch performs one smoltcp poll, flush, and dirty-relay
+  pass. The default non-H10 adapter remains direct.
 - The focused eight-packet test moved from eight poll/flush calls to one. The
   exact real-Quinn 32 MiB gate reached `293.488 Mbit/s`, zero modeled drops,
   ring high `38/500`, pump high `56/500`, zero full waits/read errors, and
@@ -215,11 +216,17 @@ Current Knife14 summary, as of 2026-07-13:
   `64/256/1024`, zero-loss UDP sweep, all-target check, fmt, shell self-test,
   and diff checks. Review made terminal TUN errors exit fail-closed, preventing
   a closed pump from busy-waking. No unresolved P0/P1 remains.
-- Commit and one exact frozen VPS P1 are authorized. Receiver `<=170 Mbit/s`,
-  any TUN drop, pump FIFO high-water `500`, or any full wait is architecture
-  failure without tuning. macOS TUN remains prohibited. See the 2026-07-13 TUN
-  batch VPS result and TUN ingress service architecture/implementation/local
-  result documents.
+- Its exact frozen VPS P1 retained `194 Mbit/s` receiver, `20/20` intervals,
+  QUIC loss `11,770,368B`, endpoint conservation, and exact service equality:
+  `856,043` packets -> `4,529` batch/relay/poll/flush passes. It failed safety
+  with `419` TUN TX drops, pump `500/500`, and `347` full waits. Loop active
+  was only `4.8-17.8%`; the bounded ingress-pump/batch architecture is closed
+  without tuning.
+- Next work must start with a deterministic frozen-capacity startup-burst
+  replay and a new code-level reachability/architecture gate. Do not enlarge
+  FIFO/kernel/batch capacities or reopen pacing, MTU, pool, QUIC-window,
+  chunk, Cubic, GSO, driver, or self-wake tuning. macOS TUN remains prohibited.
+  See the 2026-07-13 TUN ingress VPS results document.
 
 Earlier endpoint-preparation summary from the same date:
 

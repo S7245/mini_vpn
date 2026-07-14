@@ -20,7 +20,8 @@ mechanism exact (`847,092` TCP packets, `3,712/3,712` batches/relay passes,
 tune batching, drain bounds, or the kernel queue; the batch-only branch is
 closed.
 
-The authorized H10d16 TUN ingress service is locally complete. The focused
+The H10d16 TUN ingress service is committed at
+`20a0f8cca6ae0661497173671ea4f426333d6114`. The focused
 eight-packet tracer moved from `8` poll/flush calls to `1/1`, while retaining
 one dirty-relay pass and the frozen 48/240 bounds. H10 now has a continuous
 bounded reader pump, separate raw/classified ownership, and one smoltcp
@@ -39,13 +40,23 @@ explicit `64/256/1024`; four zero-loss UDP sweep sizes; fmt, runner self-test,
 and diff checks. Review fixed terminal TUN errors to stop the event loop
 instead of busy-waking; no unresolved P0/P1 remains.
 
-Next: commit the reviewed candidate, deploy the exact commit, run profile
-rehearsal, then one frozen target-only forward-only VPS P1. The user authorized
-commit, VPS, and safe in-scope repairs without repeated confirmation. Receiver
-`<=170 Mbit/s`, any TUN drop, FIFO high-water `500`, or any full wait is
-architecture failure without tuning. macOS TUN remains prohibited. See
+The frozen VPS P1 reached `194 Mbit/s` receiver with `20/20` intervals and
+`11,770,368B` QUIC loss. Mechanism attribution was exact: `856,043` packets,
+`4,529/4,529/4,529/4,529` batch/relay/poll/flush services, and `851,514`
+avoided calls. Safety failed decisively: TUN drops `0/419`, pump high-water
+`500/500`, and `347` full waits. Endpoint conservation and cleanup were exact;
+loop active stayed only `4.8-17.8%`. The declared architecture-failure rule
+fired, so this branch is closed without parameter tuning.
+
+Next: first reproduce the real startup-burst/service envelope with a
+deterministic frozen-capacity replay, then complete a new code-level
+reachability/architecture spec before implementation. The user authorized
+safe in-scope repairs without repeated confirmation. Do not enlarge FIFO,
+kernel queue, or 48/240 batch bounds and do not reopen pacing, MTU, pool,
+window, chunk, Cubic, GSO, driver, or self-wake tuning. macOS TUN remains
+prohibited. See
 `docs/tech/2026-07-13-knife14h10d16-tun-rx-batch-service-vps-results.md` and
-`docs/tech/2026-07-13-knife14h10d16-tun-ingress-service-{architecture-spec,implementation-plan,local-gate-results}.md`.
+`docs/tech/2026-07-13-knife14h10d16-tun-ingress-service-{architecture-spec,implementation-plan,local-gate-results,vps-results}.md`.
 
 The older text below is chronological stage history and no longer describes
 the active authorization boundary.

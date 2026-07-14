@@ -2,7 +2,7 @@
 
 Date: 2026-07-13
 Base: `d934f124a54caf1a60963c7ff84bf619a73b2262`
-Verdict: **PASS; eligible for one frozen target-only VPS P1**
+Verdict: **LOCAL PASS; later frozen VPS P1 disproved architecture sufficiency**
 
 ## Implemented Seam
 
@@ -106,13 +106,9 @@ one terminal cause and exits fail-closed. No unresolved P0/P1 remains.
 
 No macOS TUN test ran.
 
-## Next Gate And Stop Rule
+## VPS Outcome And Stop Rule
 
-The candidate is eligible for one isolated, target-only, forward-only VPS P1
-with the exact prior frozen profile. PASS requires receiver `>170 Mbit/s`,
-`20/20` nonzero intervals, zero TUN RX/TX drops, aggregate QUIC loss no greater
-than `16 MiB`, pump high water below `500`, zero pump full waits/read errors,
-batch poll/flush/relay equality, endpoint conservation, and clean cleanup.
-
-Any TUN drop, pump capacity edge, or throughput `<=170 Mbit/s` is architecture
-failure. Do not tune constants to rescue it.
+The exact commit later retained `194 Mbit/s` receiver and exact service
+equalities on VPS, but reported `419` TUN TX drops, pump high water `500/500`,
+and `347` full waits. The declared architecture-failure rule fired. Do not
+tune constants to rescue it; see the sibling VPS results document.

@@ -1,5 +1,26 @@
 # Learnings
 
+## 2026-07-13 - Continuous read ownership still needs burst-safe consumer service
+
+- Commit `20a0f8c` reached its exact VPS path: `856,043` TCP packets became
+  `4,529` equal batch/relay/poll/flush services, avoiding `851,514` repeated
+  calls. Receiver throughput stayed `194 Mbit/s`, QUIC loss passed at
+  `11,770,368B`, and endpoint conservation was exact.
+- The bounded reader architecture nevertheless failed its central invariant:
+  pump high-water reached `500/500`, `347` producer waits occurred, and the
+  kernel TUN reported `419` TX drops. The mechanism was reachable but not
+  sufficient.
+- Average CPU is not the discriminator. Load-window loop active was only
+  `4.8-17.8%`, poll `1.6-5.9%`, and relay `0.6-3.1%`; the failure was a
+  startup microburst/service-scheduling envelope that the local steady tracer
+  did not reproduce.
+- Reusable rule: a local throughput tracer must reproduce burst arrival shape,
+  not only average Mbps and bounded ownership. A producer/consumer seam is VPS
+  eligible only when the frozen aggregate buffers survive the worst admitted
+  burst without a producer wait or kernel drop.
+- Result:
+  `docs/tech/2026-07-13-knife14h10d16-tun-ingress-service-vps-results.md`.
+
 ## 2026-07-13 - Kernel-facing read ownership and actor batch service are separate requirements
 
 - Coalescing dirty-relay traversal alone left the real TUN fd actor-owned and

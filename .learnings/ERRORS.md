@@ -1,5 +1,21 @@
 # Errors
 
+## 2026-07-13 - The local ingress gate modeled average capacity but missed the VPS startup burst
+
+- The exact local 32 MiB gate passed above `293 Mbit/s` with ring `38/500`,
+  pump `56/500`, and zero waits/drops, but the frozen VPS P1 filled the pump,
+  produced `347` full waits, and dropped `419` TUN packets while still reaching
+  `194 Mbit/s` receiver.
+- The old capacity proof used average packet service and a generator whose
+  burst shape did not match the sub-millisecond VPS TCP startup. It therefore
+  proved sustained service but not the required jitter envelope.
+- Do not respond by enlarging FIFO, kernel queue, or 48/240 drain bounds. Add a
+  deterministic startup-burst replay at the real actor seam, map each service
+  gap to the frozen 500+500 packet capacity, and reject the next architecture
+  locally if either bounded layer fills.
+- The runner correctly stopped after the single P1. Cleanup restored the target
+  route and removed the client; the five-member bundle passed secret scans.
+
 ## 2026-07-13 - Ingress implementation gates exposed lifecycle and test-provenance traps
 
 - The existing multi-thread profiler test could run both 32-flow phases to
