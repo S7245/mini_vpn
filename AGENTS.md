@@ -230,22 +230,28 @@ Current Knife15 plan, as of 2026-07-14:
 - The next stage is long-duration release readiness, not another pacing or
   peak-throughput tuning stage. The capable Linux/VPS topology remains the
   H10d16 architecture and peak-capacity reference.
-- A dedicated long-running macOS machine in Shenzhen is accepted as the
-  real-client utun, resource-stability, mixed TCP/UDP/DNS, idle/resume, and
-  recovery lane. Its Shenzhen-to-US path is expected to be below `200 Mbit/s`
-  and must not be used as an absolute `170/200 Mbit/s` discriminator.
-- Before real macOS TUN, implement a new H10d16-aware target-only runner with
-  exact provenance, Exit-route recursion protection, fail-closed route/DNS
-  restore, watchdog, bounded logs, process/utun/network/event collection,
-  secret scans, and BSD-compatible self-tests. Historical macOS full-route
-  scripts are not accepted unchanged.
+- macOS is the real-client utun, resource-stability, mixed TCP/UDP/DNS,
+  idle/resume, and recovery lane. HK may run the first user-controlled
+  target-only qualification; the dedicated Shenzhen machine remains the
+  preferred long-duration host. Neither cross-region path is an absolute
+  `170/200 Mbit/s` discriminator.
+- The H10d16-aware target-only HITL runner and shell fixture are implemented at
+  `scripts/knife15-macos-soak.sh` and
+  `scripts/knife15-macos-soak-self-test.sh`. They provide provenance,
+  Exit-route recursion protection, owned-route cleanup, watchdog, bounded
+  logs, process/utun/network/event collection, secret scans, and BSD-compatible
+  self-tests. Historical macOS full-route scripts are not accepted unchanged.
 - Stage gates are `2h -> 8h -> 24h`, then one-variable Wi-Fi, sleep/wake,
   path-change, client-restart, and authorized Exit-restart recovery windows.
-  The current HK development Mac remains prohibited for test TUN; use the
-  dedicated Shenzhen machine.
+  HK TUN is authorized only through the reviewed HITL runner and only when the
+  user explicitly executes every `sudo` command. Agent-started TUN remains
+  prohibited. Current read-only preflight sees `utun1024`; exit that existing
+  VPN/proxy before a qualification run.
 - Keep every accepted H10d16/EndpointWindowV1/MTU/pool/window/chunk/Cubic/GSO/
   queue/driver/self-wake decision frozen. Plan:
   `docs/tech/2026-07-14-knife15-long-duration-release-readiness-plan.md`.
+  User runbook:
+  `docs/tech/2026-07-14-knife15-macos-hitl-m0-runbook.md`.
 
 Previous Knife14 summary, as of 2026-07-13:
 

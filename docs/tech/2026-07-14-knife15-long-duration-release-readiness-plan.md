@@ -1,7 +1,8 @@
 # Knife15 Long-Duration Release-Readiness Plan
 
 Date: 2026-07-14
-Status: **Accepted plan — implementation and execution not started**
+Status: **Accepted plan — HITL target-only runner implemented locally; real
+TUN not yet executed**
 
 ## Stage Goal
 
@@ -14,13 +15,15 @@ Knife15 has two complementary evidence lanes:
 
 1. the existing capable Linux/VPS topology remains the architecture and peak-
    throughput reference;
-2. a dedicated long-running macOS machine in Shenzhen becomes the real-client,
-   cross-region, resource-stability, utun, and recovery lane.
+2. macOS provides the real-client, cross-region, resource-stability, utun, and
+   recovery lane: the HK development Mac may run the first user-controlled
+   target-only qualification, while the dedicated Shenzhen machine remains the
+   preferred long-duration host.
 
-The Shenzhen-to-US path is expected to be below `200 Mbit/s`. It must not be
-used to reject the accepted H10d16 capacity architecture on an absolute Mbps
-threshold. Its value is duration, client realism, network variability, and
-macOS-specific evidence.
+The HK/Shenzhen-to-US paths are expected to be below `200 Mbit/s`. They must
+not be used to reject the accepted H10d16 capacity architecture on an absolute
+Mbps threshold. Their value is duration, client realism, network variability,
+and macOS-specific evidence.
 
 ## Accepted Knife14 Baseline
 
@@ -52,15 +55,16 @@ Knife15 owns:
 
 ## Non-Goals And Frozen Decisions
 
-- Do not use the Shenzhen macOS lane as a `170/200 Mbit/s` gate.
+- Do not use either macOS lane as a `170/200 Mbit/s` gate.
 - Do not reopen bounded sender, PacerCap64, GSO-only, D3 self-wake, or parameter
   tuning.
 - Keep the accepted H10d16, EndpointWindowV1, MTU1200, `1160B` UDP payload,
   pool, QUIC windows, chunk, Cubic, GSO default, and queue/FIFO/batch bounds.
 - Do not treat CLI-created utun as final Network Extension, App sandbox,
   background-execution, battery, iOS, Android, or Windows acceptance.
-- Do not run test TUN on the current HK development Mac. The new lane is the
-  dedicated Shenzhen macOS machine.
+- The HK development Mac may run macOS TUN only through the reviewed HITL
+  target-only shell runner, with the user explicitly executing every `sudo`
+  command. Agent-started TUN and ad-hoc route mutation remain prohibited.
 - Do not reuse the historical full-route macOS Knife3.5/8/9 scripts unchanged.
   They predate H10d16 and do not provide the required target-only, provenance,
   resource, conservation, and fail-closed evidence.
@@ -74,12 +78,13 @@ the source of truth for peak capacity and architecture regressions. A future
 Linux Knife15 soak must preserve the same provenance and capable-peer checks
 before interpreting an Mbps result.
 
-### Shenzhen macOS lane
+### HK/Shenzhen macOS lane
 
 Start with target-only routing. The TUIC Exit address must remain outside the
-utun route to prevent recursion. Only after target-only lifecycle and cleanup
-pass may the dedicated machine run a controlled full-tunnel real-application
-soak.
+utun route to prevent recursion. The HK Mac is limited to user-executed HITL
+qualification unless a later plan expands it. Only after target-only lifecycle
+and cleanup pass may the dedicated Shenzhen machine run a controlled
+full-tunnel real-application soak.
 
 For each macOS run, first measure direct/control bandwidth `B` in both
 directions. Use approximately:
@@ -94,7 +99,10 @@ contradict that conclusion.
 
 ## macOS Runner Safety Contract
 
-Before any long run, implement a new H10d16-aware macOS runner with tests for:
+The H10d16-aware HITL runner and shell fixtures are now implemented at
+`scripts/knife15-macos-soak.sh` and
+`scripts/knife15-macos-soak-self-test.sh`. Before any long run, they must keep
+passing tests for:
 
 - exact source commit, binary SHA-256, runner SHA-256, and sanitized profile;
 - discovery of the newly created utun and proof that the target enters it;
@@ -222,8 +230,9 @@ steady-state recovery is understood.
    QUIC, endpoint, relay, and cleanup evidence.
 5. Run local syntax, parser self-tests, Rust regressions, fmt, diff, and review;
    no real TUN is required for these gates.
-6. Run M0 on the dedicated Shenzhen Mac and define measured warm envelopes and
-   recovery SLOs from valid evidence.
+6. Run the short user-controlled target-only qualification on the HK or
+   Shenzhen Mac, then run M0 on the dedicated Shenzhen Mac and define measured
+   warm envelopes and recovery SLOs from valid evidence.
 7. Run M1 only after M0 and cleanup pass.
 8. Run M2 only after M1 shows bounded resources and exact ownership.
 9. Run M3 one event at a time, with rollback and cleanup checks after each.

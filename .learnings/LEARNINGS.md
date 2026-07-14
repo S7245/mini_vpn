@@ -1,5 +1,30 @@
 # Learnings
 
+## 2026-07-14 - Root TUN work can remain human-controlled without losing evidence quality
+
+- The HK Mac can contribute real utun evidence even when the agent must not
+  invoke `sudo`: a reviewed shell runner lets the user explicitly authorize
+  each root action while keeping the profile, routing, sampling, cleanup, and
+  bundle schema deterministic.
+- The safe boundary is stronger than “the user runs a script.” The runner must
+  use a fixed root-only state directory, restrict evidence paths, verify PID
+  command identity before signaling, own only explicit target routes, refuse
+  Exit-route recursion, handle startup signals, verify its watchdog, bound
+  logs/disk use, and fail closed if secret-shaped material enters the bundle.
+- A read-only preflight on the HK Mac found both the Exit and target covered by
+  an existing `utun1024` route. Refusing to start is the correct result: exit
+  the other VPN/proxy and re-prove physical/non-utun routes instead of deleting
+  or bypassing another product's route.
+- Low HK/Shenzhen bandwidth remains a path constraint, not a reason to tune
+  H10d16. Use direct/control bandwidth for relative load and keep absolute
+  capacity acceptance on the capable Linux/VPS topology.
+- Reusable rule: human-in-the-loop privilege is compatible with repeatable
+  acceptance when every mutation is narrowly owned, identity checked,
+  automatically reversible, and paired with sanitized evidence.
+- Runner/runbook:
+  `scripts/knife15-macos-soak.sh` and
+  `docs/tech/2026-07-14-knife15-macos-hitl-m0-runbook.md`.
+
 ## 2026-07-14 - Separate a long-running client lane from a peak-capacity lane
 
 - A dedicated Shenzhen macOS machine can add evidence that the short Linux/VPS
