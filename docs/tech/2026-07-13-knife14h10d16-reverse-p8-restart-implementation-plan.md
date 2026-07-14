@@ -1,7 +1,7 @@
 # Knife14h10d16 Reverse P8 Restart Implementation Plan
 
 Date: 2026-07-13
-Status: **LOCAL PASS; FROZEN VPS P8 PENDING**
+Status: **FROZEN VPS P8 FAILED; ACK-BARRIER REPAIR SELECTED**
 
 Architecture:
 `docs/tech/2026-07-13-knife14h10d16-reverse-p8-restart-architecture-spec.md`.
@@ -31,16 +31,23 @@ Architecture:
 
 ## Task 4 — Frozen VPS P8
 
-- [ ] Export/deploy the exact secret-free source and verify hashes.
-- [ ] Rehearse the unchanged H10d16 profile without iperf.
-- [ ] Run exactly one `REVERSE_FIRST_PARALLEL=8`, reverse-only, 60-second
+- [x] Export/deploy the exact secret-free source and verify hashes.
+- [x] Rehearse the unchanged H10d16 profile without iperf.
+- [x] Run exactly one `REVERSE_FIRST_PARALLEL=8`, reverse-only, 60-second
   probe and stop before standard P1/full sweep.
-- [ ] Apply every architecture acceptance discriminator without tuning.
+- [x] Apply every architecture acceptance discriminator without tuning.
 
 ## Task 5 — Evidence And Decision
 
-- [ ] Retrieve and secret-scan the bounded evidence bundle.
-- [ ] Record the accepted or failed P8 result in a dedicated results document.
-- [ ] Update HANDOFF/TODO/AGENTS and learning memory.
+- [x] Retrieve and secret-scan the bounded evidence bundle.
+- [x] Record the failed P8 result in a dedicated results document.
+- [ ] Update HANDOFF/TODO/AGENTS and learning memory with the repair result.
 - [ ] Commit the evidence stage, then either proceed to UDP/live-streaming or
   enter an architecture repair branch according to the stop rule.
+
+Decision: the P8 timed out at `0.103 Mbit/s` after each data flow admitted
+roughly one `128 KiB` quantum. TUN drops, pump saturation, smoltcp pressure,
+QUIC loss, pool reconnect, and endpoint leakage were absent. The selected
+root is lost per-flow ACK-completion evidence across a hard-pressure-dominated
+zero snapshot. Continue with the ACK-barrier recovery spec and plan; do not
+rerun or tune this baseline.
