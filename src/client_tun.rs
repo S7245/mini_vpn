@@ -142,9 +142,9 @@ const _: () = assert!(THIN_TCP_RELAY_STAGING_CAPACITY >= 1);
 /// flow so remote reads pause at an explicit queue-full edge.
 const CONTINUOUS_TCP_RELAY_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 const _: () = assert!(CONTINUOUS_TCP_RELAY_QUEUE_BYTES >= RELAY_REMOTE_READ_MIN_BATCH_BYTES);
-/// L2（刀9 F4）：一条 relay 双向静默多久判 idle → 退出 + shutdown。防慢/卡死上游（尤其 REALITY
-/// TCP-only 手写 TLS 遇 server 不返回）长期挂住 relay task 泄漏。90s 偏宽松保稳（长轮询/SSE 不误杀）。
-const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+/// A concrete upstream write may remain pending this long without progress before bounded cleanup.
+/// Full-duplex Established relays have no application-payload idle lifetime.
+const RELAY_STALLED_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 /// Knife14n：本地 Finish 已关闭上游写半边后，只剩远端读半边。若远端没有继续发数据或 EOF，
 /// 用短窗口关闭，避免 read-only relay 卡住 active gauge 并污染下一轮 suite。
 const RELAY_HALF_CLOSED_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1636,10 +1636,12 @@ enum RelayCommand {
 
 #[derive(Debug)]
 enum RelayWriterSignal {
+    WritePending,
     Progress {
         bytes: usize,
         write_wait: std::time::Duration,
     },
+    WriteCompleted,
     WriteHalfClosed {
         reason: &'static str,
     },
@@ -1647,6 +1649,91 @@ enum RelayWriterSignal {
         direction: &'static str,
         reason: &'static str,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayCloseTimerMode {
+    Disarmed,
+    StalledWrite,
+    HalfClosed,
+}
+
+struct RelayCloseTimer {
+    mode: RelayCloseTimerMode,
+    sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+impl RelayCloseTimer {
+    fn new() -> Self {
+        Self {
+            mode: RelayCloseTimerMode::Disarmed,
+            sleep: Box::pin(tokio::time::sleep(RELAY_STALLED_WRITE_TIMEOUT)),
+        }
+    }
+
+    fn is_armed(&self) -> bool {
+        self.mode != RelayCloseTimerMode::Disarmed
+    }
+
+    fn arm_stalled_write(&mut self) {
+        self.mode = RelayCloseTimerMode::StalledWrite;
+        self.reset(RELAY_STALLED_WRITE_TIMEOUT);
+    }
+
+    fn note_write_progress(&mut self) {
+        if self.mode == RelayCloseTimerMode::StalledWrite {
+            self.reset(RELAY_STALLED_WRITE_TIMEOUT);
+        }
+    }
+
+    fn complete_write(&mut self) {
+        if self.mode == RelayCloseTimerMode::StalledWrite {
+            self.mode = RelayCloseTimerMode::Disarmed;
+        }
+    }
+
+    fn arm_half_closed(&mut self) {
+        self.mode = RelayCloseTimerMode::HalfClosed;
+        self.reset(RELAY_HALF_CLOSED_IDLE_TIMEOUT);
+    }
+
+    fn note_read_progress(&mut self) {
+        match self.mode {
+            RelayCloseTimerMode::Disarmed => {}
+            RelayCloseTimerMode::StalledWrite => self.reset(RELAY_STALLED_WRITE_TIMEOUT),
+            RelayCloseTimerMode::HalfClosed => self.reset(RELAY_HALF_CLOSED_IDLE_TIMEOUT),
+        }
+    }
+
+    fn reset(&mut self, timeout: std::time::Duration) {
+        self.sleep
+            .as_mut()
+            .reset(tokio::time::Instant::now() + timeout);
+    }
+
+    fn terminal_reason(&self) -> &'static str {
+        match self.mode {
+            RelayCloseTimerMode::StalledWrite => "stalled_write_timeout",
+            RelayCloseTimerMode::HalfClosed => "half_closed_idle_timeout",
+            RelayCloseTimerMode::Disarmed => "relay_close_timer_disarmed",
+        }
+    }
+
+    fn timeout(&self) -> Option<std::time::Duration> {
+        match self.mode {
+            RelayCloseTimerMode::Disarmed => None,
+            RelayCloseTimerMode::StalledWrite => Some(RELAY_STALLED_WRITE_TIMEOUT),
+            RelayCloseTimerMode::HalfClosed => Some(RELAY_HALF_CLOSED_IDLE_TIMEOUT),
+        }
+    }
+
+    fn is_half_closed(&self) -> bool {
+        self.mode == RelayCloseTimerMode::HalfClosed
+    }
+
+    fn wait(&mut self) -> std::pin::Pin<&mut tokio::time::Sleep> {
+        self.sleep.as_mut()
+    }
 }
 
 struct CoalescedRelayWrite {
@@ -13202,8 +13289,7 @@ async fn run_relay_d16(
         writer_signal_tx,
         writer_stop_rx,
     ));
-    let idle = tokio::time::sleep(RELAY_IDLE_TIMEOUT);
-    tokio::pin!(idle);
+    let mut close_timer = RelayCloseTimer::new();
     let mut reader_done = false;
     let mut writer_done = false;
     let mut activity_open = true;
@@ -13217,30 +13303,29 @@ async fn run_relay_d16(
             activity = activity_rx.recv(), if !reader_done && activity_open => {
                 match activity {
                     Some(()) => {
-                        let timeout = if writer_done {
-                            RELAY_HALF_CLOSED_IDLE_TIMEOUT
-                        } else {
-                            RELAY_IDLE_TIMEOUT
-                        };
-                        idle.as_mut().reset(tokio::time::Instant::now() + timeout);
+                        close_timer.note_read_progress();
                     }
                     None => activity_open = false,
                 }
             }
             signal = writer_signal_rx.recv(), if !writer_done => {
                 match signal {
+                    Some(RelayWriterSignal::WritePending) => {
+                        close_timer.arm_stalled_write();
+                    }
                     Some(RelayWriterSignal::Progress { bytes, write_wait }) => {
                         writer_progress_events = writer_progress_events.saturating_add(1);
                         writer_progress_bytes =
                             writer_progress_bytes.saturating_add(bytes as u64);
                         writer_wait_max_us = writer_wait_max_us.max(write_wait.as_micros());
-                        idle.as_mut().reset(tokio::time::Instant::now() + RELAY_IDLE_TIMEOUT);
+                        close_timer.note_write_progress();
+                    }
+                    Some(RelayWriterSignal::WriteCompleted) => {
+                        close_timer.complete_write();
                     }
                     Some(RelayWriterSignal::WriteHalfClosed { .. }) => {
                         writer_done = true;
-                        idle.as_mut().reset(
-                            tokio::time::Instant::now() + RELAY_HALF_CLOSED_IDLE_TIMEOUT
-                        );
+                        close_timer.arm_half_closed();
                         if reader_done {
                             break None;
                         }
@@ -13264,21 +13349,21 @@ async fn run_relay_d16(
                         }
                     }
                     None => {
-                        writer_done = true;
-                        if reader_done {
-                            break None;
-                        }
+                        break Some(("local_to_remote", "writer_task_closed"));
                     }
                 }
             }
-            _ = &mut reader_task, if !reader_done => {
+            result = &mut reader_task, if !reader_done => {
                 reader_done = true;
+                if result.is_err() {
+                    break Some(("remote_to_local", "reader_task_failed"));
+                }
                 if writer_done {
                     break None;
                 }
             }
-            _ = &mut idle => {
-                if writer_done {
+            _ = close_timer.wait(), if close_timer.is_armed() => {
+                if close_timer.is_half_closed() {
                     let queue_snapshot = queue.snapshot_now();
                     let payload_owned_bytes = queue_snapshot
                         .queued_bytes
@@ -13301,20 +13386,11 @@ async fn run_relay_d16(
                             queue_snapshot.reserved_bytes,
                             queue_snapshot.closure.is_closed(),
                         );
-                        idle.as_mut().reset(
-                            tokio::time::Instant::now() + RELAY_HALF_CLOSED_IDLE_TIMEOUT
-                        );
+                        close_timer.arm_half_closed();
                         continue;
                     }
                 }
-                break Some((
-                    "timer",
-                    if writer_done {
-                        "half_closed_idle_timeout"
-                    } else {
-                        "idle_timeout"
-                    },
-                ));
+                break Some(("timer", close_timer.terminal_reason()));
             }
         }
     };
@@ -13903,10 +13979,8 @@ async fn run_permit_relay_dispatcher(
     }
 }
 
-/// 一条 TCP relay 的双向泵（独立 task body；抽出便于 idle 超时单测）。
-/// 中文要点：L2（刀9 F4）select 加 idle 超时分支——双向 `RELAY_IDLE_TIMEOUT` 无活动 → 退出 + shutdown。
-/// 任一方向有活动（本地→上游 write 成功 / 上游→本地 read）即重置（每轮 select 重建 sleep，计「距上次活动」）。
-/// 适用 TUIC/REALITY 两种 RelayStream，与连接级 failover 探测无关（那是连接级，这是单 relay 级）。
+/// 一条 TCP relay 的双向泵。Established 空闲由 socket/transport 生命周期拥有；只有待完成写入和
+/// 半关闭收尾启用有界 close timer。适用 TUIC/REALITY 两种 RelayStream。
 async fn run_relay(
     handle: SocketHandle,
     epoch: u64,
@@ -14078,8 +14152,7 @@ async fn run_relay_native_chunk(
     ));
     let mut diag = RelayTaskDiag::default();
     let local_write_pressure_threshold = std::time::Duration::from_millis(5);
-    let idle = tokio::time::sleep(RELAY_IDLE_TIMEOUT);
-    tokio::pin!(idle);
+    let mut close_timer = RelayCloseTimer::new();
     let mut diag_tick = tokio::time::interval(std::time::Duration::from_secs(RELAY_LIVE_DIAG_SECS));
     diag_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     diag_tick.tick().await;
@@ -14149,6 +14222,9 @@ async fn run_relay_native_chunk(
             }
             signal = writer_signal_rx.recv(), if !writer_done => {
                 match signal {
+                    Some(RelayWriterSignal::WritePending) => {
+                        close_timer.arm_stalled_write();
+                    }
                     Some(RelayWriterSignal::Progress { bytes, write_wait }) => {
                         diag.note_uplink_write(bytes);
                         diag.note_local_write_wait(write_wait, local_write_pressure_threshold);
@@ -14161,7 +14237,10 @@ async fn run_relay_native_chunk(
                                 diag.local_write_pressure_events
                             );
                         }
-                        idle.as_mut().reset(tokio::time::Instant::now() + RELAY_IDLE_TIMEOUT);
+                        close_timer.note_write_progress();
+                    }
+                    Some(RelayWriterSignal::WriteCompleted) => {
+                        close_timer.complete_write();
                     }
                     Some(RelayWriterSignal::WriteHalfClosed { reason }) => {
                         diag.note_local_finish();
@@ -14173,15 +14252,13 @@ async fn run_relay_native_chunk(
                         );
                         writer_done = true;
                         read_only_after_local_finish = true;
-                        idle.as_mut().reset(
-                            tokio::time::Instant::now() + RELAY_HALF_CLOSED_IDLE_TIMEOUT
-                        );
+                        close_timer.arm_half_closed();
                     }
                     Some(RelayWriterSignal::Closed { direction, reason }) => {
                         break (direction, reason);
                     }
                     None => {
-                        writer_done = true;
+                        break ("local_to_remote", "writer_task_closed");
                     }
                 }
             }
@@ -14189,12 +14266,7 @@ async fn run_relay_native_chunk(
                 match reader_signal {
                     Some(RelayReaderSignal::Progress { diag: reader_diag }) => {
                         diag.copy_reader_fields_from(&reader_diag);
-                        let timeout = if read_only_after_local_finish {
-                            RELAY_HALF_CLOSED_IDLE_TIMEOUT
-                        } else {
-                            RELAY_IDLE_TIMEOUT
-                        };
-                        idle.as_mut().reset(tokio::time::Instant::now() + timeout);
+                        close_timer.note_read_progress();
                     }
                     Some(RelayReaderSignal::Closed { direction, reason, diag: reader_diag }) => {
                         diag.copy_reader_fields_from(&reader_diag);
@@ -14205,13 +14277,10 @@ async fn run_relay_native_chunk(
                     }
                 }
             }
-            _ = &mut idle => {
-                let (timeout, reason) = if read_only_after_local_finish {
-                    (RELAY_HALF_CLOSED_IDLE_TIMEOUT, "half_closed_idle_timeout")
-                } else {
-                    (RELAY_IDLE_TIMEOUT, "idle_timeout")
-                };
-                println!("⏱️ relay {:?} 双向静默 {}s，idle 超时关闭（L2）", handle, timeout.as_secs());
+            _ = close_timer.wait(), if close_timer.is_armed() => {
+                let timeout = close_timer.timeout().unwrap_or_default();
+                let reason = close_timer.terminal_reason();
+                println!("⏱️ relay {:?} lifecycle guard {}s expired reason={}", handle, timeout.as_secs(), reason);
                 break ("timer", reason);
             }
         }
@@ -14330,8 +14399,7 @@ async fn run_relay_native_permit(
     ));
     let mut diag = RelayTaskDiag::default();
     let local_write_pressure_threshold = std::time::Duration::from_millis(5);
-    let idle = tokio::time::sleep(RELAY_IDLE_TIMEOUT);
-    tokio::pin!(idle);
+    let mut close_timer = RelayCloseTimer::new();
     let mut diag_tick = tokio::time::interval(std::time::Duration::from_secs(RELAY_LIVE_DIAG_SECS));
     diag_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     diag_tick.tick().await;
@@ -14401,6 +14469,9 @@ async fn run_relay_native_permit(
             }
             signal = writer_signal_rx.recv(), if !writer_done => {
                 match signal {
+                    Some(RelayWriterSignal::WritePending) => {
+                        close_timer.arm_stalled_write();
+                    }
                     Some(RelayWriterSignal::Progress { bytes, write_wait }) => {
                         diag.note_uplink_write(bytes);
                         diag.note_local_write_wait(write_wait, local_write_pressure_threshold);
@@ -14413,7 +14484,10 @@ async fn run_relay_native_permit(
                                 diag.local_write_pressure_events
                             );
                         }
-                        idle.as_mut().reset(tokio::time::Instant::now() + RELAY_IDLE_TIMEOUT);
+                        close_timer.note_write_progress();
+                    }
+                    Some(RelayWriterSignal::WriteCompleted) => {
+                        close_timer.complete_write();
                     }
                     Some(RelayWriterSignal::WriteHalfClosed { reason }) => {
                         diag.note_local_finish();
@@ -14425,15 +14499,13 @@ async fn run_relay_native_permit(
                         );
                         writer_done = true;
                         read_only_after_local_finish = true;
-                        idle.as_mut().reset(
-                            tokio::time::Instant::now() + RELAY_HALF_CLOSED_IDLE_TIMEOUT
-                        );
+                        close_timer.arm_half_closed();
                     }
                     Some(RelayWriterSignal::Closed { direction, reason }) => {
                         break (direction, reason);
                     }
                     None => {
-                        writer_done = true;
+                        break ("local_to_remote", "writer_task_closed");
                     }
                 }
             }
@@ -14441,12 +14513,7 @@ async fn run_relay_native_permit(
                 match reader_signal {
                     Some(RelayReaderSignal::Progress { diag: reader_diag }) => {
                         diag.copy_reader_fields_from(&reader_diag);
-                        let timeout = if read_only_after_local_finish {
-                            RELAY_HALF_CLOSED_IDLE_TIMEOUT
-                        } else {
-                            RELAY_IDLE_TIMEOUT
-                        };
-                        idle.as_mut().reset(tokio::time::Instant::now() + timeout);
+                        close_timer.note_read_progress();
                     }
                     Some(RelayReaderSignal::Closed { direction, reason, diag: reader_diag }) => {
                         diag.copy_reader_fields_from(&reader_diag);
@@ -14457,13 +14524,10 @@ async fn run_relay_native_permit(
                     }
                 }
             }
-            _ = &mut idle => {
-                let (timeout, reason) = if read_only_after_local_finish {
-                    (RELAY_HALF_CLOSED_IDLE_TIMEOUT, "half_closed_idle_timeout")
-                } else {
-                    (RELAY_IDLE_TIMEOUT, "idle_timeout")
-                };
-                println!("⏱️ relay {:?} 双向静默 {}s，idle 超时关闭（L2）", handle, timeout.as_secs());
+            _ = close_timer.wait(), if close_timer.is_armed() => {
+                let timeout = close_timer.timeout().unwrap_or_default();
+                let reason = close_timer.terminal_reason();
+                println!("⏱️ relay {:?} lifecycle guard {}s expired reason={}", handle, timeout.as_secs(), reason);
                 break ("timer", reason);
             }
         }
@@ -14710,8 +14774,7 @@ async fn run_relay_with_engine(
     ));
     let mut diag = RelayTaskDiag::default();
     let local_write_pressure_threshold = std::time::Duration::from_millis(5);
-    let idle = tokio::time::sleep(RELAY_IDLE_TIMEOUT);
-    tokio::pin!(idle);
+    let mut close_timer = RelayCloseTimer::new();
     let mut diag_tick = tokio::time::interval(std::time::Duration::from_secs(RELAY_LIVE_DIAG_SECS));
     diag_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     diag_tick.tick().await;
@@ -14781,6 +14844,9 @@ async fn run_relay_with_engine(
             }
             signal = writer_signal_rx.recv(), if !writer_done => {
                 match signal {
+                    Some(RelayWriterSignal::WritePending) => {
+                        close_timer.arm_stalled_write();
+                    }
                     Some(RelayWriterSignal::Progress { bytes, write_wait }) => {
                         diag.note_uplink_write(bytes);
                         diag.note_local_write_wait(write_wait, local_write_pressure_threshold);
@@ -14793,7 +14859,10 @@ async fn run_relay_with_engine(
                                 diag.local_write_pressure_events
                             );
                         }
-                        idle.as_mut().reset(tokio::time::Instant::now() + RELAY_IDLE_TIMEOUT);
+                        close_timer.note_write_progress();
+                    }
+                    Some(RelayWriterSignal::WriteCompleted) => {
+                        close_timer.complete_write();
                     }
                     Some(RelayWriterSignal::WriteHalfClosed { reason }) => {
                         diag.note_local_finish();
@@ -14805,15 +14874,13 @@ async fn run_relay_with_engine(
                         );
                         writer_done = true;
                         read_only_after_local_finish = true;
-                        idle.as_mut().reset(
-                            tokio::time::Instant::now() + RELAY_HALF_CLOSED_IDLE_TIMEOUT
-                        );
+                        close_timer.arm_half_closed();
                     }
                     Some(RelayWriterSignal::Closed { direction, reason }) => {
                         break (direction, reason);
                     }
                     None => {
-                        writer_done = true;
+                        break ("local_to_remote", "writer_task_closed");
                     }
                 }
             }
@@ -14821,12 +14888,7 @@ async fn run_relay_with_engine(
                 match reader_signal {
                     Some(RelayReaderSignal::Progress { diag: reader_diag }) => {
                         diag.copy_reader_fields_from(&reader_diag);
-                        let timeout = if read_only_after_local_finish {
-                            RELAY_HALF_CLOSED_IDLE_TIMEOUT
-                        } else {
-                            RELAY_IDLE_TIMEOUT
-                        };
-                        idle.as_mut().reset(tokio::time::Instant::now() + timeout);
+                        close_timer.note_read_progress();
                     }
                     Some(RelayReaderSignal::Closed { direction, reason, diag: reader_diag }) => {
                         diag.copy_reader_fields_from(&reader_diag);
@@ -14838,13 +14900,10 @@ async fn run_relay_with_engine(
                 }
             }
             // L2：双向静默超时 → 主动清理（防泄漏）。有活动的 select 分支会重启 loop → 重建 sleep。
-            _ = &mut idle => {
-                let (timeout, reason) = if read_only_after_local_finish {
-                    (RELAY_HALF_CLOSED_IDLE_TIMEOUT, "half_closed_idle_timeout")
-                } else {
-                    (RELAY_IDLE_TIMEOUT, "idle_timeout")
-                };
-                println!("⏱️ relay {:?} 双向静默 {}s，idle 超时关闭（L2）", handle, timeout.as_secs());
+            _ = close_timer.wait(), if close_timer.is_armed() => {
+                let timeout = close_timer.timeout().unwrap_or_default();
+                let reason = close_timer.terminal_reason();
+                println!("⏱️ relay {:?} lifecycle guard {}s expired reason={}", handle, timeout.as_secs(), reason);
                 break ("timer", reason);
             }
         }
@@ -14949,6 +15008,17 @@ async fn shutdown_relay_writer_after_finish<W>(
     }
 }
 
+async fn send_relay_writer_signal(
+    signal_tx: &mpsc::Sender<RelayWriterSignal>,
+    stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
+    signal: RelayWriterSignal,
+) -> bool {
+    tokio::select! {
+        _ = stop_rx => false,
+        result = signal_tx.send(signal) => result.is_ok(),
+    }
+}
+
 async fn run_relay_writer<W>(
     handle: SocketHandle,
     mut writer: W,
@@ -14977,24 +15047,76 @@ async fn run_relay_writer<W>(
                 deferred_cmd = coalesced.deferred;
                 let payload = coalesced.payload;
                 let payload_len = payload.len();
-                let write_started = std::time::Instant::now();
-                let write_result = tokio::select! {
-                    _ = &mut stop_rx => {
-                        let _ = writer.shutdown().await;
-                        return;
+                if !send_relay_writer_signal(
+                    &signal_tx,
+                    &mut stop_rx,
+                    RelayWriterSignal::WritePending,
+                )
+                .await
+                {
+                    let _ = writer.shutdown().await;
+                    return;
+                }
+                let mut written = 0usize;
+                let mut write_result = Ok(());
+                while written < payload_len {
+                    let write_started = std::time::Instant::now();
+                    let result = tokio::select! {
+                        _ = &mut stop_rx => {
+                            let _ = writer.shutdown().await;
+                            return;
+                        }
+                        result = writer.write(&payload[written..]) => result,
+                    };
+                    let write_wait = write_started.elapsed();
+                    match result {
+                        Ok(0) => {
+                            write_result = Err(std::io::Error::new(
+                                std::io::ErrorKind::WriteZero,
+                                "upstream relay write returned zero bytes",
+                            ));
+                            break;
+                        }
+                        Ok(bytes) => {
+                            written = written.saturating_add(bytes);
+                            if !send_relay_writer_signal(
+                                &signal_tx,
+                                &mut stop_rx,
+                                RelayWriterSignal::Progress { bytes, write_wait },
+                            )
+                            .await
+                            {
+                                let _ = writer.shutdown().await;
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            write_result = Err(error);
+                            break;
+                        }
                     }
-                    result = async {
-                        writer.write_all(&payload).await?;
-                        writer.flush().await
-                    } => result,
-                };
-                let write_wait = write_started.elapsed();
+                }
+                if write_result.is_ok() {
+                    write_result = tokio::select! {
+                        _ = &mut stop_rx => {
+                            let _ = writer.shutdown().await;
+                            return;
+                        }
+                        result = writer.flush() => result,
+                    };
+                }
                 match write_result {
                     Ok(_) => {
-                        let _ = signal_tx.try_send(RelayWriterSignal::Progress {
-                            bytes: payload_len,
-                            write_wait,
-                        });
+                        if !send_relay_writer_signal(
+                            &signal_tx,
+                            &mut stop_rx,
+                            RelayWriterSignal::WriteCompleted,
+                        )
+                        .await
+                        {
+                            let _ = writer.shutdown().await;
+                            return;
+                        }
                         if coalesced.finish_after {
                             shutdown_relay_writer_after_finish(
                                 handle,
@@ -15157,7 +15279,7 @@ mod tests {
     use super::*;
     use crate::upstream::NativeTcpReader;
     use smoltcp::iface::SocketSet;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
 
     /// 刀8/刀9：上游选择器——reality→Reality、failover→Failover（大小写/空白不敏感）；
     /// 其余（含 tuic/缺省/未知）→ Tuic（零回归，failover opt-in）。
@@ -15189,13 +15311,12 @@ mod tests {
         );
     }
 
-    // ---- 刀9 F4：relay idle 超时（L2）----
+    // ---- relay lifecycle timers ----
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Poll, Waker};
 
-    /// 一条永不产数据的 mock 上游流：read 恒 Pending、write/flush 即成、shutdown 记账。
-    /// 用于驱动 run_relay 的 idle 超时分支（唯一能 fire 的分支）。
+    /// A fully-open idle stream whose termination belongs to its lifecycle owner.
     struct IdleStream {
         shutdown_called: Arc<AtomicBool>,
     }
@@ -15205,7 +15326,7 @@ mod tests {
             _cx: &mut Context<'_>,
             _buf: &mut tokio::io::ReadBuf<'_>,
         ) -> Poll<std::io::Result<()>> {
-            Poll::Pending // 永不产数据/永不 EOF：只有 idle sleep 分支能完成
+            Poll::Pending
         }
     }
     impl tokio::io::AsyncWrite for IdleStream {
@@ -15419,6 +15540,18 @@ mod tests {
         }
     }
 
+    struct PanickingD16NativeReader;
+
+    impl NativeTcpReader for PanickingD16NativeReader {
+        fn poll_read_chunk(
+            &mut self,
+            _cx: &mut Context<'_>,
+            _max_len: usize,
+        ) -> Poll<std::io::Result<Option<NativeTcpChunk>>> {
+            panic!("injected D16 reader task failure")
+        }
+    }
+
     struct WakeableD16NativeReader {
         ready: Arc<AtomicBool>,
         read_waker: Arc<Mutex<Option<Waker>>>,
@@ -15537,11 +15670,28 @@ mod tests {
         }
     }
 
-    /// 一条上行写永远不完成的 mock 上游流，用来锁住 pending write 只由 relay 级 idle 兜底清理。
+    /// A remote write that never completes, used to lock the stalled-write guard.
     struct PendingWriteStream {
         shutdown_called: Arc<AtomicBool>,
     }
     impl tokio::io::AsyncRead for PendingWriteStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    struct StepwisePendingWriteStream {
+        allowed_steps: Arc<AtomicUsize>,
+        completed_steps: usize,
+        write_waker: Arc<Mutex<Option<Waker>>>,
+        shutdown_called: Arc<AtomicBool>,
+    }
+
+    impl tokio::io::AsyncRead for StepwisePendingWriteStream {
         fn poll_read(
             self: std::pin::Pin<&mut Self>,
             _cx: &mut Context<'_>,
@@ -15659,6 +15809,35 @@ mod tests {
         ) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.shutdown_called.store(true, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl tokio::io::AsyncWrite for StepwisePendingWriteStream {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.completed_steps < self.allowed_steps.load(Ordering::SeqCst) && !buf.is_empty() {
+                self.completed_steps = self.completed_steps.saturating_add(1);
+                return Poll::Ready(Ok(1));
+            }
+            *self.write_waker.lock().unwrap() = Some(cx.waker().clone());
+            Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
         fn poll_shutdown(
             self: std::pin::Pin<&mut Self>,
             _cx: &mut Context<'_>,
@@ -17014,37 +17193,48 @@ mod tests {
         );
     }
 
-    /// idle：双向 90s 无活动 → relay task 退出 + stream.shutdown 被调（L2）。
+    /// Established relay lifetime belongs to socket/transport lifecycle, not payload silence.
     #[tokio::test(start_paused = true)]
-    async fn relay_idle_timeout_shuts_down_stream() {
+    async fn relay_full_duplex_idle_survives_legacy_timeout() {
         let mut sockets = SocketSet::new(vec![]);
         let handle = mk_test_handle(&mut sockets);
         let flag = Arc::new(AtomicBool::new(false));
         let stream: RelayStream = Box::new(IdleStream {
             shutdown_called: flag.clone(),
         });
-        let (_tx, rx) = mpsc::channel::<RelayCommand>(8); // 持 _tx → rx 不关、永不收（无活动）
+        let (tx, rx) = mpsc::channel::<RelayCommand>(8);
         let (back_tx, mut back_rx) = mpsc::channel(8);
         let (_credit_tx, credit_rx) = relay_read_credit_channel();
         let task = tokio::spawn(run_relay(handle, 7, stream, rx, back_tx, credit_rx));
 
-        tokio::time::advance(std::time::Duration::from_secs(89)).await;
-        assert!(!task.is_finished(), "89s < 90s idle 阈值，relay 不应退出");
-        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(RELAY_STALLED_WRITE_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "a healthy full-duplex relay must survive the former payload-idle deadline"
+        );
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "payload silence must not shutdown an Established stream"
+        );
+        assert!(back_rx.try_recv().is_err());
+
+        drop(tx);
         task.await.unwrap();
         assert!(
             flag.load(Ordering::SeqCst),
-            "idle 超时应退出并调用 stream.shutdown（L2）"
+            "real command-channel lifecycle closure must still shutdown the stream"
         );
         match back_rx
             .try_recv()
-            .expect("relay close should notify main loop")
+            .expect("channel closure should notify main loop")
         {
             (h, RelayEvent::Closed(close)) => {
                 assert_eq!(h, handle);
                 assert_eq!(close.epoch, 7);
-                assert_eq!(close.direction, "timer");
-                assert_eq!(close.reason, "idle_timeout");
+                assert_eq!(close.direction, "local_to_remote");
+                assert_eq!(close.reason, "local_channel_closed");
             }
             other => panic!("expected relay close event, got {other:?}"),
         }
@@ -19266,6 +19456,115 @@ mod tests {
         assert!(back_rx.try_recv().is_err());
     }
 
+    #[tokio::test]
+    async fn d16_reader_task_failure_is_terminal_without_payload_idle_timer() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let reader: NativeTcpReadHalf = Box::new(PanickingD16NativeReader);
+        let writer_shutdown = Arc::new(AtomicBool::new(false));
+        let writer: NativeTcpWriteHalf = Box::new(NoopNativeWriter {
+            shutdown_called: writer_shutdown.clone(),
+        });
+        let queue = AsyncLeasedByteFlowQueue::new_with_release_mode(
+            D16_PER_FLOW_BYTE_CAPACITY,
+            DownstreamPermitReleaseMode::OnEgressDrain,
+        )
+        .unwrap();
+        let (_uplink_tx, uplink_rx) = mpsc::channel::<RelayCommand>(1);
+        let (back_tx, mut back_rx) = mpsc::channel(1);
+        let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit {
+            paused: false,
+            max_batch_bytes: 64 * 1024,
+        });
+
+        run_relay_d16(
+            handle,
+            26,
+            reader,
+            writer,
+            uplink_rx,
+            back_tx,
+            credit_rx,
+            queue.clone(),
+        )
+        .await;
+
+        assert!(writer_shutdown.load(Ordering::SeqCst));
+        assert_eq!(
+            queue.snapshot_now().closure.terminal_cause(),
+            Some(crate::tcp_downlink_pump::LeasedByteQueueTerminalCause {
+                direction: "remote_to_local",
+                reason: "reader_task_failed",
+            })
+        );
+        assert!(matches!(
+            back_rx.recv().await,
+            Some((h, RelayEvent::Closed(RelayClose {
+                epoch: 26,
+                direction: "remote_to_local",
+                reason: "reader_task_failed",
+            }))) if h == handle
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn d16_full_duplex_idle_survives_legacy_timeout() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let reader: NativeTcpReadHalf = Box::new(PendingD16NativeReader {
+            entered: Arc::new(AtomicBool::new(false)),
+        });
+        let writer_shutdown = Arc::new(AtomicBool::new(false));
+        let writer: NativeTcpWriteHalf = Box::new(NoopNativeWriter {
+            shutdown_called: writer_shutdown.clone(),
+        });
+        let queue = AsyncLeasedByteFlowQueue::new_with_release_mode(
+            D16_PER_FLOW_BYTE_CAPACITY,
+            DownstreamPermitReleaseMode::OnEgressDrain,
+        )
+        .unwrap();
+        let (uplink_tx, uplink_rx) = mpsc::channel::<RelayCommand>(1);
+        let (back_tx, mut back_rx) = mpsc::channel(1);
+        let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit {
+            paused: true,
+            max_batch_bytes: 0,
+        });
+        let task = tokio::spawn(run_relay_d16(
+            handle,
+            24,
+            reader,
+            writer,
+            uplink_rx,
+            back_tx,
+            credit_rx,
+            queue.clone(),
+        ));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(RELAY_STALLED_WRITE_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "D16 must not reap a healthy full-duplex relay because payload is quiet"
+        );
+        assert!(!writer_shutdown.load(Ordering::SeqCst));
+        assert!(!queue.snapshot_now().closure.is_closed());
+        assert!(back_rx.try_recv().is_err());
+
+        drop(uplink_tx);
+        task.await.unwrap();
+        assert!(writer_shutdown.load(Ordering::SeqCst));
+        assert!(matches!(
+            back_rx.recv().await,
+            Some((h, RelayEvent::Closed(RelayClose {
+                epoch: 24,
+                direction: "local_to_remote",
+                reason: "local_channel_closed",
+            }))) if h == handle
+        ));
+        assert!(back_rx.try_recv().is_err());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn d16_half_closed_idle_waits_for_owned_payload_to_drain() {
         let mut sockets = SocketSet::new(vec![]);
@@ -20012,7 +20311,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn relay_pending_remote_write_waits_for_relay_idle_timeout() {
+    async fn relay_pending_remote_write_uses_stalled_write_timeout() {
         let mut sockets = SocketSet::new(vec![]);
         let handle = mk_test_handle(&mut sockets);
         let flag = Arc::new(AtomicBool::new(false));
@@ -20041,25 +20340,78 @@ mod tests {
             "pending write should not emit remote_write_timeout"
         );
 
-        tokio::time::advance(RELAY_IDLE_TIMEOUT).await;
+        tokio::time::advance(RELAY_STALLED_WRITE_TIMEOUT).await;
         task.await.unwrap();
 
         assert!(
             flag.load(Ordering::SeqCst),
-            "relay idle cleanup should still call stream.shutdown"
+            "stalled-write cleanup should still call stream.shutdown"
         );
         match back_rx
             .try_recv()
-            .expect("idle timeout should notify main loop")
+            .expect("stalled-write timeout should notify main loop")
         {
             (h, RelayEvent::Closed(close)) => {
                 assert_eq!(h, handle);
                 assert_eq!(close.epoch, 17);
                 assert_eq!(close.direction, "timer");
-                assert_eq!(close.reason, "idle_timeout");
+                assert_eq!(close.reason, "stalled_write_timeout");
             }
             other => panic!("expected relay close event, got {other:?}"),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_partial_write_progress_resets_stalled_write_timeout() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let allowed_steps = Arc::new(AtomicUsize::new(0));
+        let write_waker = Arc::new(Mutex::new(None));
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let stream: RelayStream = Box::new(StepwisePendingWriteStream {
+            allowed_steps: allowed_steps.clone(),
+            completed_steps: 0,
+            write_waker: write_waker.clone(),
+            shutdown_called: shutdown_called.clone(),
+        });
+        let (tx, rx) = mpsc::channel::<RelayCommand>(8);
+        let (back_tx, mut back_rx) = mpsc::channel(8);
+        let (_credit_tx, credit_rx) = relay_read_credit_channel();
+        let task = tokio::spawn(run_relay(handle, 18, stream, rx, back_tx, credit_rx));
+
+        tx.send(RelayCommand::Data(vec![1, 2, 3])).await.unwrap();
+        while write_waker.lock().unwrap().is_none() {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(RELAY_STALLED_WRITE_TIMEOUT - std::time::Duration::from_secs(1)).await;
+        allowed_steps.store(1, Ordering::SeqCst);
+        write_waker
+            .lock()
+            .unwrap()
+            .take()
+            .expect("pending partial write must retain its waker")
+            .wake();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(RELAY_STALLED_WRITE_TIMEOUT - std::time::Duration::from_secs(1)).await;
+        assert!(
+            !task.is_finished(),
+            "one real partial write must reset the stalled-write no-progress window"
+        );
+        assert!(back_rx.try_recv().is_err());
+
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        task.await.unwrap();
+        assert!(shutdown_called.load(Ordering::SeqCst));
+        assert!(matches!(
+            back_rx.try_recv(),
+            Ok((h, RelayEvent::Closed(RelayClose {
+                epoch: 18,
+                direction: "timer",
+                reason: "stalled_write_timeout",
+            }))) if h == handle
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -20110,7 +20462,7 @@ mod tests {
             "relay should still be alive while the pending write is not blocking remote reads"
         );
 
-        tokio::time::advance(RELAY_IDLE_TIMEOUT).await;
+        tokio::time::advance(RELAY_STALLED_WRITE_TIMEOUT).await;
         task.await.unwrap();
     }
 
@@ -20204,9 +20556,9 @@ mod tests {
         }
     }
 
-    /// 活动重置：临近阈值前来一次上行活动 → idle 计时重置，不退出；再静默满 90s 才退出。
+    /// A completed write returns the full-duplex relay to a disarmed lifecycle state.
     #[tokio::test(start_paused = true)]
-    async fn relay_activity_resets_idle_timer() {
+    async fn relay_completed_write_disarms_stalled_write_timer() {
         let mut sockets = SocketSet::new(vec![]);
         let handle = mk_test_handle(&mut sockets);
         let flag = Arc::new(AtomicBool::new(false));
@@ -20214,21 +20566,23 @@ mod tests {
             shutdown_called: flag.clone(),
         });
         let (tx, rx) = mpsc::channel::<RelayCommand>(8);
-        let (back_tx, _back_rx) = mpsc::channel(8);
+        let (back_tx, mut back_rx) = mpsc::channel(8);
         let (_credit_tx, credit_rx) = relay_read_credit_channel();
         let task = tokio::spawn(run_relay(handle, 13, stream, rx, back_tx, credit_rx));
 
-        tokio::time::advance(std::time::Duration::from_secs(89)).await;
-        tx.send(RelayCommand::Data(vec![1, 2, 3])).await.unwrap(); // 活动（上行 write）→ 重置 idle 计时
-        tokio::task::yield_now().await; // 让 relay 消费该活动并重建 sleep
-        tokio::time::advance(std::time::Duration::from_secs(89)).await;
+        tx.send(RelayCommand::Data(vec![1, 2, 3])).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(RELAY_STALLED_WRITE_TIMEOUT + std::time::Duration::from_secs(1)).await;
         assert!(
             !task.is_finished(),
-            "活动重置了 idle 计时，第二个 89s 窗口内不应退出"
+            "a completed write must disarm the stalled-write timer"
         );
-        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert!(back_rx.try_recv().is_err());
+
+        drop(tx);
         task.await.unwrap();
-        assert!(flag.load(Ordering::SeqCst), "重置后再满 90s 静默才退出");
+        assert!(flag.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -21464,7 +21818,7 @@ mod tests {
             RelayClose {
                 epoch: 21,
                 direction: "timer",
-                reason: "idle_timeout",
+                reason: "stalled_write_timeout",
             },
             &mut sockets,
             &mut socket_ctxs,
