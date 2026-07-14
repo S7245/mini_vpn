@@ -225,6 +225,28 @@ Current Knife14 summary, as of 2026-07-14:
   explicitly scoped stage. Result:
   `docs/tech/2026-07-14-knife14h10d16-endpoint-pacing-service-vps-completion-results.md`.
 
+Current Knife15 plan, as of 2026-07-14:
+
+- The next stage is long-duration release readiness, not another pacing or
+  peak-throughput tuning stage. The capable Linux/VPS topology remains the
+  H10d16 architecture and peak-capacity reference.
+- A dedicated long-running macOS machine in Shenzhen is accepted as the
+  real-client utun, resource-stability, mixed TCP/UDP/DNS, idle/resume, and
+  recovery lane. Its Shenzhen-to-US path is expected to be below `200 Mbit/s`
+  and must not be used as an absolute `170/200 Mbit/s` discriminator.
+- Before real macOS TUN, implement a new H10d16-aware target-only runner with
+  exact provenance, Exit-route recursion protection, fail-closed route/DNS
+  restore, watchdog, bounded logs, process/utun/network/event collection,
+  secret scans, and BSD-compatible self-tests. Historical macOS full-route
+  scripts are not accepted unchanged.
+- Stage gates are `2h -> 8h -> 24h`, then one-variable Wi-Fi, sleep/wake,
+  path-change, client-restart, and authorized Exit-restart recovery windows.
+  The current HK development Mac remains prohibited for test TUN; use the
+  dedicated Shenzhen machine.
+- Keep every accepted H10d16/EndpointWindowV1/MTU/pool/window/chunk/Cubic/GSO/
+  queue/driver/self-wake decision frozen. Plan:
+  `docs/tech/2026-07-14-knife15-long-duration-release-readiness-plan.md`.
+
 Previous Knife14 summary, as of 2026-07-13:
 
 - The first fresh frozen reverse P8 from `55792b3` failed at
@@ -407,17 +429,16 @@ Historical Knife14 summary, as of 2026-07-04:
 
 Next stage bias:
 
-- Do not keep tuning the downlink egress pacer, TUN queue length, connection
-  pool, iperf3, or sing-box before resolving the lifecycle branch.
-- Knife14as should first write a design tree, spec, and TDD plan that
-  distinguishes "expected terminal pending after local close" from "premature
-  local close or receive-window behavior that caused low reverse throughput."
-- Add deterministic tests and explicit metrics/accounting for terminal pending
-  bytes, such as pending bytes reaped when `tcp_state=Closed` and
-  `can_send=false`, before asking for another expensive VPS throughput run.
-- If this branch does not produce a coherent causal explanation after focused
-  tests and one scoped acceptance run, re-evaluate the architecture instead of
-  continuing suffix-by-suffix tuning.
+- Build the Knife15 macOS evidence loop before asking the Shenzhen machine for
+  a long run: safe runner, provenance, collectors, event markers, parser, shell
+  self-tests, and fail-closed cleanup.
+- Use `2h` to establish warm resource envelopes and recovery SLOs, then admit
+  `8h` and `24h` only when the previous gate and cleanup pass.
+- Diagnose conservation, ownership, TUN, lifecycle, or resource-slope failures
+  at a deterministic seam before repair. Do not convert cross-region path
+  bandwidth into a frozen-constant tuning request.
+- Keep the Linux/VPS capable-peer lane as the independent capacity reference
+  and compare invariant classes rather than identical Mbps across platforms.
 
 ## Stage Learning Memory
 

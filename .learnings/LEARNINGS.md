@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-07-14 - Separate a long-running client lane from a peak-capacity lane
+
+- A dedicated Shenzhen macOS machine can add evidence that the short Linux/VPS
+  gates cannot: hours-long RSS/FD/thread/relay trends, real utun behavior,
+  mixed application traffic, idle/resume, sleep/wake, path change, and clean
+  route/DNS lifecycle.
+- Its cross-region Shenzhen-to-US bandwidth is expected to remain below the
+  accepted H10d16 peak-capacity result. Absolute `170/200 Mbit/s` therefore
+  belongs to the capable Linux/VPS lane; the macOS lane must use a same-window
+  direct/control baseline and judge relative path behavior plus internal
+  ownership, queue, TUN, recovery, and resource invariants.
+- Historical macOS soak scripts predate H10d16 and lack the new provenance,
+  target-only recursion guard, endpoint-conservation, resource-trend, and
+  fail-closed evidence. A long run is useful only after a new runner makes the
+  feedback loop safe and attributable.
+- Reusable rule: separate platform/duration acceptance from peak-capacity
+  acceptance when geography constrains one test node. A slower real client can
+  still be the strongest leak, lifecycle, and recovery discriminator if it has
+  a capable control, explicit event timeline, and exact internal counters.
+- Plan:
+  `docs/tech/2026-07-14-knife15-long-duration-release-readiness-plan.md`.
+
 ## 2026-07-14 - Acceptance needs a capable peer and a valid packet shape
 
 - Exact `5f9da90` passed the formal reverse P8 at `188 Mbit/s` receiver with

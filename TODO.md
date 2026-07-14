@@ -1,5 +1,45 @@
 # TODO
 
+## Current Knife15 Plan (2026-07-14)
+
+### Long-duration release readiness with a Shenzhen macOS lane
+
+#### Latest decision (2026-07-14)
+
+Knife14 is complete. The next planned stage is Knife15 long-duration
+release-readiness, with two separate evidence lanes: the capable Linux/VPS
+topology remains the architecture and peak-throughput reference, while a
+dedicated long-running macOS machine in Shenzhen becomes the real-client,
+utun, resource-stability, mixed-traffic, and recovery lane.
+
+The Shenzhen-to-US path is expected to remain below `200 Mbit/s`. It is not a
+`170/200 Mbit/s` architecture discriminator. Each run must first measure its
+direct/control bandwidth `B`; sustained soak should use approximately
+`40-60% of B` and short bursts `75-85% of B`, while preserving MTU1200 and a
+valid `1160B` UDP payload. Absolute peak capacity remains owned by the capable
+Linux/VPS gate.
+
+Before a real macOS TUN run, implement a new H10d16-aware target-only runner
+with exact source/binary provenance, Exit-route recursion protection,
+route/DNS save-and-restore, signal/watchdog cleanup, bounded logs, process and
+utun resource samples, event markers, secret scans, and macOS/BSD-compatible
+self-tests. Do not reuse the historical full-route Knife3.5/8/9 scripts
+unchanged, and do not depend on Linux `ip` or sysfs `tx_dropped`.
+
+The staged gates are M0 `2h` target-only qualification, M1 `8h` mixed soak, M2
+`24h` controlled real-client soak, and M3 one-variable-at-a-time Wi-Fi,
+sleep/wake, path change, client restart, and authorized Exit-restart recovery.
+Every bundle must correlate mini_vpn data-plane/loop/QUIC/endpoint/TUN/relay
+logs with RSS, CPU, FD, thread, utun, network-control, and event timelines.
+
+Keep H10d16 and all accepted Knife14 parameters frozen. The current HK
+development Mac remains excluded from test TUN; this lane uses the dedicated
+Shenzhen machine. Planning is accepted, but no runner implementation, real
+macOS TUN, soak, fault injection, or VPS run occurred in this planning update.
+
+Source:
+`docs/tech/2026-07-14-knife15-long-duration-release-readiness-plan.md`.
+
 ## Current Knife14 Status (2026-07-14)
 
 ### H10d16 byte-owned egress completion

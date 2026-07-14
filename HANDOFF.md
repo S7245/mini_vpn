@@ -2,6 +2,36 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
+## Next Planned Stage — Knife15 Release Readiness (2026-07-14)
+
+- Knife14 is complete. Knife15 will prove hours-long bounded operation,
+  recovery, and operational evidence rather than reopen peak-throughput
+  tuning.
+- Preserve two distinct lanes: the capable Linux/VPS topology owns H10d16
+  architecture and peak-throughput regression; a dedicated long-running
+  macOS machine in Shenzhen owns real-client utun, resource stability,
+  mixed TCP/UDP/DNS traffic, idle/resume, and network-lifecycle evidence.
+- Shenzhen-to-US bandwidth below `200 Mbit/s` is expected and is not an
+  architecture failure. Establish direct/control bandwidth `B`, use roughly
+  `40-60% of B` sustained and `75-85% of B` bursts, and judge internal
+  invariants, resource trends, recovery, and relative path behavior.
+- First implementation task is a new H10d16-aware, target-only, fail-closed
+  macOS runner. It must prove exact source/binary provenance, keep the Exit
+  route outside utun, restore route/DNS on every exit, bound logs, collect
+  process/utun/network/event evidence, avoid secrets, and have BSD-compatible
+  self-tests. Do not reuse the historical full-route macOS scripts unchanged.
+- Planned gates are `2h -> 8h -> 24h`, followed by independent Wi-Fi,
+  sleep/wake, path-change, client-restart, and authorized Exit-restart recovery
+  windows. A shorter failure blocks the longer run until diagnosed.
+- The current HK development Mac remains prohibited for test TUN. The accepted
+  lane is the dedicated Shenzhen machine. This update planned the stage only;
+  it did not implement a runner or execute macOS TUN/VPS traffic.
+- Keep H10d16, EndpointWindowV1, MTU1200, `1160B` UDP shape, pool, QUIC
+  windows, chunk, Cubic, GSO default, queue/FIFO/batch bounds, driver bound,
+  and self-wake frozen. Do not reopen bounded sender, cap64, or GSO-only.
+- Plan:
+  `docs/tech/2026-07-14-knife15-long-duration-release-readiness-plan.md`.
+
 ## Current Override — Knife14h10d16 Byte-Owned Egress (2026-07-14)
 
 This section overrides the older G7/G8/GV next-step text below.
