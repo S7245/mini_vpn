@@ -8,6 +8,40 @@ This section overrides the older G7/G8/GV next-step text below.
 
 ### Latest accepted position (2026-07-13)
 
+- The first fresh frozen reverse P8 from `55792b3` is an architecture failure,
+  not an accepted throughput result. All eight data relays opened across the
+  two healthy pool connections, but each admitted only about one `128 KiB`
+  D16 quantum. iperf timed out at `0.103 Mbit/s` after the first aggregate
+  interval; almost every later interval was zero.
+- The failure was cleanly localised. TUN drops were `0/0`, pump high was
+  `177/500` with zero full waits/read errors, smoltcp capacity stayed
+  `1 MiB`, pending ended at zero, QUIC loss/congestion was zero, and endpoint
+  conservation was exact. The guard completed `6/6` pause/resume edges, but
+  the final phases were `Running=0`, `DrainOnly=8`, `Recovery=1` after data
+  sockets later reached `send_queue=0`.
+- Root cause: `next_d16_egress_phase_for_snapshot` cleared a per-flow ACK
+  barrier on a zero snapshot even while hard pressure/debt still forced
+  DrainOnly. The positive nonzero-to-zero proof was discarded; once pressure
+  cleared, an already-zero queue could not generate new cycle-local drain
+  evidence.
+- Repair commit `5f9da90f734b1754fd8c41bcb70fa4c8b6ae9f74` retains the
+  barrier while hard pressure, drop debt, or terminal no-send dominates and
+  consumes it only on the first eligible clean zero snapshot. It changes no
+  queue, quantum, timer, capacity, pacing, or wake constant.
+- Local gates pass: focused `2/2`, D16 `60/60`, root `632 passed / 3 ignored`,
+  harness `10 passed / 4 ignored`, concurrency `64/256/1024`, UDP four-size
+  `500/500`, check/fmt/diff/shell tests, and controlled all-target Clippy. Code
+  review has no unresolved P0/P1. Strict Rust 1.95 Clippy still exposes 19
+  pre-existing baseline lints outside this repair.
+- Next action is one fresh target-only, reverse-only P8 from exact `5f9da90`
+  after secret-free export/hash verification and profile rehearsal. VPS and
+  commit are authorized; macOS TUN remains prohibited. Require `>170 Mbit/s`,
+  `60/60`, zero TUN drops, pump below `500`, all eight flows beyond one
+  quantum, no eligible DrainOnly strand, exact ownership, and cleanup. A new
+  failure is architecture failure; do not tune constants.
+- Failure/local results:
+  `docs/tech/2026-07-13-knife14h10d16-{reverse-p8-failure-results,ack-barrier-recovery-local-gate-results}.md`.
+
 - The accepted H10d16 chain is now complete through the frozen VPS P1:
   EndpointPacingService `c55737e`, batch relay `d934f12`, bounded TUN ingress
   `20a0f8c`, and the independent local TCP receive-credit service
@@ -43,8 +77,9 @@ This section overrides the older G7/G8/GV next-step text below.
   EndpointWindowV1 constants, MTU, queue/FIFO/batch bounds, pool, QUIC windows,
   chunk, Cubic, GSO default, Quinn sender/driver bound, and self-wake frozen.
   Do not reopen bounded sender, cap64, GSO-only, or parameter-tuning branches.
-  The forward P1 blocker is closed; resume Task 12 step 4 at a fresh reverse
-  P8 gate, then UDP/live-streaming, Linux fake-IP DNS, and TUN stop/rearm.
+  The forward P1 blocker remains closed; resume Task 12 step 4 at the repaired
+  fresh reverse P8, then UDP/live-streaming, Linux fake-IP DNS, and TUN
+  stop/rearm.
   Source:
   `docs/tech/2026-07-13-knife14h10d16-local-uplink-window-service-{architecture-spec,implementation-plan,local-gate-results,vps-results}.md`.
 

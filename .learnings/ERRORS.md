@@ -1,5 +1,27 @@
 # Errors
 
+## 2026-07-13 - Reverse P8 exposed lost recovery evidence, not missing capacity
+
+- Source `55792b3` opened eight data flows across both healthy pool
+  connections but timed out at `0.103 Mbit/s`; each flow delivered only
+  `117,412-134,760B`. The client nevertheless received about `114 MiB` of QUIC
+  wire data, and peer flow-control blocking appeared only after application
+  stream consumption stopped.
+- The final `DrainOnly=8`, `Recovery=1`, zero current pending, later
+  `send_queue=0`, clean `6/6` backlog pause/resume, zero TUN drops, pump
+  `177/500`, and zero QUIC loss reject capacity tuning, reader wakers, pool,
+  and path loss as the next repair.
+- The exact bug was clearing `d16_tun_rx_ack_barrier` on a zero snapshot before
+  checking whether hard pressure/debt would suppress Recovery. Preserve the
+  barrier through the suppressor and consume it on the first eligible clean
+  zero snapshot; do not weaken DrainOnly or count arbitrary zero-byte cycles as
+  progress.
+- Strict Rust `1.95.0` all-target Clippy also failed on `19` pre-existing lint
+  sites outside this repair. The all-target rerun allowing only the five known
+  baseline classes passed. Do not turn a throughput repair into an unrelated
+  whole-codebase lint migration; keep the baseline failure explicit until a
+  separate cleanup stage owns it.
+
 ## 2026-07-13 - Secret-free VPS source exports need explicit provenance and portable inspection
 
 - The isolated source export intentionally omitted `.git`, so the runner

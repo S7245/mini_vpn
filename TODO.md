@@ -6,6 +6,40 @@
 
 #### Latest decision (2026-07-13)
 
+The first fresh reverse P8 from `55792b3` failed at `0.103 Mbit/s`. All eight
+data relays opened, but each accepted only `117,412-134,760B`, approximately
+one D16 actor quantum, before stream consumption stopped. This is not a TUN,
+queue-capacity, path-loss, pool, or endpoint-pacing failure: TUN drops were
+`0/0`, pump high was `177/500` with zero waits/errors, pending ended at zero,
+smoltcp capacity remained `1 MiB`, QUIC loss/congestion was zero, and endpoint
+conservation was exact.
+
+The final D16 state was `Running=0`, `DrainOnly=8`, `Recovery=1` despite a
+clean `6/6` backlog pause/resume history and later `send_queue=0` snapshots.
+The root was lost ACK-completion evidence: a hard-pressure zero snapshot
+cleared the per-flow barrier before Recovery could consume it, leaving no later
+positive drain event.
+
+Commit `5f9da90f734b1754fd8c41bcb70fa4c8b6ae9f74` preserves that
+barrier through hard pressure, drop debt, and terminal no-send, then consumes
+the proven nonzero-to-zero transition on the first eligible clean snapshot.
+Local gates pass: focused `2/2`, D16 `60/60`, root `632/632`, harness
+`10/10`, concurrency `64/256/1024`, UDP `500/500` at four sizes, check/fmt/
+diff/shell tests, and controlled all-target Clippy. No unresolved P0/P1
+remains; no frozen constant changed.
+
+Next action: export/deploy exact `5f9da90`, rehearse the unchanged profile,
+and run one fresh target-only reverse P8 for 60 seconds. Require strictly
+`>170 Mbit/s`, `60/60` nonzero intervals, zero TUN drops, pump high below
+`500`, all eight flows progressing beyond one quantum, no eligible DrainOnly
+strand, exact endpoint/D16 ownership, bounded lifecycle, and cleanup. VPS and
+commits are authorized; macOS TUN is prohibited. If this P8 fails, do not tune
+constants. Sources:
+`docs/tech/2026-07-13-knife14h10d16-{reverse-p8-failure-results,ack-barrier-recovery-architecture-spec,ack-barrier-recovery-implementation-plan,ack-barrier-recovery-local-gate-results}.md`.
+
+The accepted forward position below remains a prerequisite and does not
+override the failed/repaired reverse-P8 position above.
+
 Task 12 step 4's zero-drop H10d16 successor is accepted. The complete chain is
 EndpointPacingService `c55737e`, batch relay `d934f12`, bounded TUN ingress
 `20a0f8c`, and the independent local TCP receive-credit service
@@ -39,9 +73,9 @@ process, or residual TUN route. The five-member sanitized bundle is archived
 under `/private/tmp/mini_vpn_local_uplink_window_e201403/` with SHA-256
 `769dadd36d1b6db8ba0ff4aad3bd7efc16699b5cc01530932e81cdfb018f18d4`.
 
-No further repair is pending for this discriminator. Resume Task 12 step 4 at
-a fresh reverse P8 gate, then UDP/live-streaming, Linux fake-IP DNS, and TUN
-stop/rearm. Preserve H10d16,
+No further forward repair is pending for this discriminator. Resume Task 12
+step 4 at the repaired fresh reverse P8 gate, then UDP/live-streaming, Linux
+fake-IP DNS, and TUN stop/rearm. Preserve H10d16,
 EndpointWindowV1 constants, MTU, kernel/FIFO/batch capacities, pool, QUIC
 windows, chunk, Cubic, GSO default, Quinn sender/driver bound, and self-wake.
 Do not reopen bounded sender, cap64, GSO-only, or frozen-parameter tuning.

@@ -41,8 +41,8 @@ Architecture:
 
 - [x] Retrieve and secret-scan the bounded evidence bundle.
 - [x] Record the failed P8 result in a dedicated results document.
-- [ ] Update HANDOFF/TODO/AGENTS and learning memory with the repair result.
-- [ ] Commit the evidence stage, then either proceed to UDP/live-streaming or
+- [x] Update HANDOFF/TODO/AGENTS and learning memory with the repair result.
+- [x] Commit the evidence stage, then either proceed to UDP/live-streaming or
   enter an architecture repair branch according to the stop rule.
 
 Decision: the P8 timed out at `0.103 Mbit/s` after each data flow admitted

@@ -1,5 +1,30 @@
 # Learnings
 
+## 2026-07-13 - Recovery evidence must outlive the pressure that suppresses it
+
+- The fresh reverse P8 opened all eight data relays but each accepted only
+  about one `128 KiB` D16 quantum before the aggregate timed out at
+  `0.103 Mbit/s`. TUN drops, pump saturation, smoltcp pressure, QUIC loss,
+  reconnect, and endpoint leakage were all absent; the final state was
+  `DrainOnly=8` after a clean `6/6` backlog pause/resume history.
+- A per-flow ACK barrier proved that `send_queue` had once been nonzero, but
+  the old transition cleared that evidence when it later saw zero even if hard
+  pressure still forced DrainOnly. After pressure cleared, the already-zero
+  queue could not produce another cycle-local drain, so the read permission
+  remained closed forever.
+- Commit `5f9da90` retains the barrier while hard pressure, drop debt, or
+  terminal no-send dominates. The first clean zero snapshot consumes the
+  nonzero-to-zero history as strict positive progress and enters the existing
+  Recovery path. Two focused tests include an eight-flow replay and negative
+  controls; D16 `60/60`, root `632/632`, harness/concurrency, and UDP gates
+  pass.
+- Reusable rule: if a safety state suppresses the transition that would consume
+  progress, retain the progress proof until the suppressor is gone. A
+  before/after delta scoped to one service cycle is insufficient for state
+  whose obligation spans several control epochs.
+- Results:
+  `docs/tech/2026-07-13-knife14h10d16-{reverse-p8-failure-results,ack-barrier-recovery-local-gate-results}.md`.
+
 ## 2026-07-13 - A concurrency gate needs concurrency at the first measured seam
 
 - The existing suite's reverse-first mode always passed parallelism `1` to the

@@ -189,6 +189,29 @@ results documents.
 
 Current Knife14 summary, as of 2026-07-13:
 
+- The first fresh frozen reverse P8 from `55792b3` failed at
+  `0.103 Mbit/s`. All eight data relays opened, but each accepted only about
+  one `128 KiB` D16 quantum. TUN drops were `0/0`, pump high was `177/500`
+  with zero waits/errors, smoltcp/pending stayed bounded, QUIC loss was zero,
+  endpoint accounting was exact, and the guard completed `6/6` pause/resume
+  edges. Final phases were `Running=0`, `DrainOnly=8`, `Recovery=1`.
+- The selected root is lost per-flow ACK-completion evidence. A zero send-queue
+  snapshot cleared the ACK barrier while hard pressure/debt still suppressed
+  Recovery; after pressure cleared, the already-zero queue could not produce a
+  new cycle-local drain event.
+- Repair commit `5f9da90f734b1754fd8c41bcb70fa4c8b6ae9f74` retains the
+  barrier through hard pressure, drop debt, and terminal no-send, then consumes
+  the proven nonzero-to-zero history on the first clean eligible snapshot.
+  Focused `2/2`, D16 `60/60`, root `632+3 ignored`, harness `10+4 ignored`,
+  concurrency `64/256/1024`, UDP four-size `500/500`, fmt/diff/shell checks,
+  and controlled all-target Clippy pass. No P0/P1 remains.
+- Next run one exact-source, target-only, reverse-only fresh P8 after
+  secret-free hash verification and rehearsal. VPS and commits are authorized;
+  macOS TUN is prohibited. Keep every frozen input unchanged and require
+  `>170 Mbit/s`, `60/60`, zero drops, pump below `500`, all eight flows beyond
+  one quantum, no eligible DrainOnly strand, exact ownership, and cleanup. A
+  failure is architecture failure, not permission to tune. Results:
+  `docs/tech/2026-07-13-knife14h10d16-{reverse-p8-failure-results,ack-barrier-recovery-local-gate-results}.md`.
 - Task 12 step 4's accepted H10d16 chain is EndpointPacingService `c55737e`,
   batch relay `d934f12`, bounded TUN ingress `20a0f8c`, and local TCP
   receive-credit service `e20140340f7f949fa8bad9e960ce94451d2c0229`.
@@ -223,10 +246,10 @@ Current Knife14 summary, as of 2026-07-13:
   Keep H10d16, EndpointWindowV1 constants, MTU, kernel/FIFO/batch capacities,
   pool, QUIC windows, chunk, Cubic, GSO default, Quinn sender/driver bound, and
   self-wake frozen. Do not reopen bounded sender, cap64, GSO-only, or parameter
-  tuning. The forward P1 blocker is closed; resume at a fresh reverse P8 gate,
-  then UDP/live-streaming, Linux fake-IP DNS, and TUN stop/rearm. No macOS TUN
-  ran. Source: the 2026-07-13 local-uplink-window service architecture,
-  implementation, local-gate, and VPS-results documents.
+  tuning. The forward P1 blocker is closed; resume at the repaired fresh
+  reverse P8 gate, then UDP/live-streaming, Linux fake-IP DNS, and TUN
+  stop/rearm. No macOS TUN ran. Source: the 2026-07-13 local-uplink-window
+  service architecture, implementation, local-gate, and VPS-results documents.
 
 Earlier endpoint-preparation summary from the same date:
 

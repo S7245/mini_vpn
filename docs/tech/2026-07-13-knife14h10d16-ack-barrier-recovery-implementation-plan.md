@@ -1,7 +1,7 @@
 # Knife14h10d16 ACK-Barrier Recovery Implementation Plan
 
 Date: 2026-07-13
-Status: **READY FOR TDD**
+Status: **LOCAL PASS; FRESH FROZEN REVERSE P8 PENDING**
 
 Architecture:
 `docs/tech/2026-07-13-knife14h10d16-ack-barrier-recovery-architecture-spec.md`.
@@ -9,27 +9,28 @@ Architecture:
 ## Task 1 — Evidence And RED
 
 - [x] Archive and classify the frozen reverse P8 architecture failure.
-- [ ] Add the hard-pressure zero-snapshot lost-evidence RED.
-- [ ] Add an eight-flow clean recovery RED.
-- [ ] Keep drop-debt, terminal, and no-barrier negative controls.
+- [x] Add the hard-pressure zero-snapshot lost-evidence RED.
+- [x] Add an eight-flow clean recovery RED.
+- [x] Keep drop-debt, terminal, and no-barrier negative controls.
 
 ## Task 2 — Minimal State Repair
 
-- [ ] Retain the ACK barrier while hard pressure, drop debt, or terminal
+- [x] Retain the ACK barrier while hard pressure, drop debt, or terminal
   no-send dominates.
-- [ ] Consume it only on the first eligible clean zero snapshot.
-- [ ] Feed that transition as strict positive drain evidence without changing
+- [x] Consume it only on the first eligible clean zero snapshot.
+- [x] Feed that transition as strict positive drain evidence without changing
   queue, quantum, timer, or capacity constants.
-- [ ] Preserve all existing Running/DrainOnly/Recovery behavior outside this
+- [x] Preserve all existing Running/DrainOnly/Recovery behavior outside this
   interleaving.
 
 ## Task 3 — Local Gates And Review
 
-- [ ] Run focused phase, backlog-guard, D16 reader, and byte-ownership tests.
-- [ ] Run the exact D16/real-Quinn harness and full root regressions.
-- [ ] Run explicit `64/256/1024` concurrency and UDP sweep gates.
-- [ ] Run fmt, clippy, shell self-tests, diff checks, and staged code review.
-- [ ] Update learning/error memory and commit one coherent repair.
+- [x] Run focused phase, backlog-guard, D16 reader, and byte-ownership tests.
+- [x] Run the exact D16/real-Quinn harness and full root regressions.
+- [x] Run explicit `64/256/1024` concurrency and UDP sweep gates.
+- [x] Run fmt, controlled clippy, shell self-tests, diff checks, and staged
+  code review.
+- [x] Update learning/error memory and commit one coherent repair.
 
 ## Task 4 — Fresh Frozen Reverse P8
 
