@@ -1,5 +1,19 @@
 # Learnings
 
+## 2026-07-13 - A concurrency gate needs concurrency at the first measured seam
+
+- The existing suite's reverse-first mode always passed parallelism `1` to the
+  low-RTT probe, so setting later full-sweep values could not produce the
+  required fresh reverse P8. An earlier attempt had therefore measured another
+  P1 while labeling the intended stage as P8 preparation.
+- `REVERSE_FIRST_PARALLEL` now defaults to `1`, validates before any tunnel or
+  route mutation, and passes unchanged through one tested reverse-only helper.
+  The self-test proves `8`, 60 seconds, reverse-only order, and the `p8`
+  artifact label; legacy default behavior remains unchanged.
+- Reusable rule: concurrency belongs in the exact first measurement call, not
+  in a later sweep or a report label. Test orchestration argument propagation
+  with a stub before spending a VPS sample.
+
 ## 2026-07-13 - Bound sender admission before asking bounded ingress to absorb it
 
 - The prior VPS path admitted the full `1 MiB` smoltcp receive window, filled

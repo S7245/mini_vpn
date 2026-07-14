@@ -86,6 +86,11 @@ validate_tuic_pacing_policy() {
   esac
 }
 
+validate_positive_integer() {
+  local value="${1:-}"
+  [[ "$value" =~ ^[0-9]+$ ]] && ((10#$value > 0))
+}
+
 validate_tuic_send_policy_pair() {
   local pacing_policy="${1:-}"
   local send_service="${2:-}"
@@ -124,6 +129,15 @@ run_standard_p1_probe() {
     return "$status"
   fi
   return 0
+}
+
+run_reverse_first_probe() {
+  local parallel="${REVERSE_FIRST_PARALLEL:-1}"
+  run_lowrtt_probe \
+    "mtu${MTU}_reverse_first_p${parallel}" \
+    "$parallel" \
+    "$DURATION" \
+    "reverse-only"
 }
 
 sha256_file() {
@@ -810,6 +824,34 @@ suite_self_test() {
     return 1
   fi
 
+  if ! declare -F run_reverse_first_probe >/dev/null; then
+    echo "suite self-test failed: reverse-first parallel probe helper missing" >&2
+    return 1
+  fi
+  expected="mtu1200_reverse_first_p8|8|60|reverse-only"
+  actual="$({
+    run_lowrtt_probe() {
+      printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4"
+    }
+    MTU=1200
+    DURATION=60
+    REVERSE_FIRST_PARALLEL=8
+    run_reverse_first_probe
+  })"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "suite self-test failed: reverse-first parallel probe propagation" >&2
+    echo "expected: $expected" >&2
+    echo "actual: $actual" >&2
+    return 1
+  fi
+  if ! declare -F validate_positive_integer >/dev/null ||
+    ! validate_positive_integer 1 || ! validate_positive_integer 8 ||
+    validate_positive_integer 0 || validate_positive_integer -1 ||
+    validate_positive_integer '' || validate_positive_integer eight; then
+    echo "suite self-test failed: positive integer validator drifted" >&2
+    return 1
+  fi
+
   if ! declare -F validate_tuic_gso_policy >/dev/null; then
     echo "suite self-test failed: TUIC GSO policy validator missing" >&2
     return 1
@@ -1021,6 +1063,10 @@ EOF
   fi
   if ! grep -q "STOP_AFTER_REVERSE_FIRST_P1=0" <<<"$help_text"; then
     echo "suite self-test failed: reverse-only stop help missing" >&2
+    return 1
+  fi
+  if ! grep -q "REVERSE_FIRST_PARALLEL=1" <<<"$help_text"; then
+    echo "suite self-test failed: reverse-first parallel help/default missing" >&2
     return 1
   fi
   if ! grep -q "STANDARD_P1_ORDER=forward-first" <<<"$help_text" ||
@@ -1333,12 +1379,13 @@ Optional env:
   TARGET_SSH_KNOWN_HOSTS_FILE="$OUT_DIR/target_ssh_known_hosts"
   SERVER_EVIDENCE_SSH_TIMEOUT=20s  hard outer bound for each Exit/Target evidence SSH command
   SOCKET_EVIDENCE_SAMPLES=12       one-second active-window client/Exit UDP socket snapshots per probe
-  RUN_REVERSE_FIRST_P1=0   run a fresh reverse-only P1 probe before the normal forward-first probe
+  RUN_REVERSE_FIRST_P1=0   run a fresh reverse-only probe before the normal forward-first probe
+  REVERSE_FIRST_PARALLEL=1 parallel flows for the fresh reverse-only probe; use 8 for the P8 gate
   STOP_AFTER_REVERSE_FIRST_P1=0  stop after the fresh reverse-only P1 and final snapshots
   STANDARD_P1_ORDER=forward-first  use forward-only for a bounded forward discriminator
   STOP_AFTER_STANDARD_P1=0  stop after the standard P1 and final snapshots; skip the full sweep
   PROFILE_REHEARSAL_ONLY=0  verify binary/runner hashes and exact startup profile, then stop before iperf
-  RUN_D16_EOF_CLOSE_PROBE=0  after reverse-first P1 quiets, run one fixed-byte reverse flow to prove graceful EOF
+  RUN_D16_EOF_CLOSE_PROBE=0  after the reverse-first probe quiets, run one fixed-byte reverse flow to prove graceful EOF
   D16_EOF_CLOSE_BYTES=64M   fixed reverse payload for the D16 EOF-close proof; passed to iperf3 -n
   WAIT_QUIET_BEFORE_FULL=1  after standalone P1, wait for active relays to drop before full sweep
   QUIET_TIMEOUT_SECS=20
@@ -1434,6 +1481,7 @@ TARGET_SSH_KNOWN_HOSTS_FILE="${TARGET_SSH_KNOWN_HOSTS_FILE:-$OUT_DIR/target_ssh_
 SERVER_EVIDENCE_SSH_TIMEOUT="${SERVER_EVIDENCE_SSH_TIMEOUT:-20s}"
 SOCKET_EVIDENCE_SAMPLES="${SOCKET_EVIDENCE_SAMPLES:-12}"
 RUN_REVERSE_FIRST_P1="${RUN_REVERSE_FIRST_P1:-0}"
+REVERSE_FIRST_PARALLEL="${REVERSE_FIRST_PARALLEL-1}"
 STOP_AFTER_REVERSE_FIRST_P1="${STOP_AFTER_REVERSE_FIRST_P1:-0}"
 STANDARD_P1_ORDER="${STANDARD_P1_ORDER:-forward-first}"
 STOP_AFTER_STANDARD_P1="${STOP_AFTER_STANDARD_P1:-0}"
@@ -1448,6 +1496,11 @@ IPERF_BUSY_WAIT_SECS="${IPERF_BUSY_WAIT_SECS:-5}"
 
 if ! [[ "$SOCKET_EVIDENCE_SAMPLES" =~ ^[0-9]+$ ]] || ((10#$SOCKET_EVIDENCE_SAMPLES <= 0)); then
   echo "ERROR: SOCKET_EVIDENCE_SAMPLES must be a positive integer; got $SOCKET_EVIDENCE_SAMPLES" >&2
+  exit 64
+fi
+
+if ! validate_positive_integer "$REVERSE_FIRST_PARALLEL"; then
+  echo "ERROR: REVERSE_FIRST_PARALLEL must be a positive integer; got $REVERSE_FIRST_PARALLEL" >&2
   exit 64
 fi
 
@@ -2601,6 +2654,7 @@ append "- MINI_VPN_TUIC_CC=$MINI_VPN_TUIC_CC"
 append "- CC_SWEEP=${CC_SWEEP:-<single>}"
 append "- CC_VARIANT_LABEL=${CC_VARIANT_LABEL:-<none>}"
 append "- RUN_REVERSE_FIRST_P1=$RUN_REVERSE_FIRST_P1"
+append "- REVERSE_FIRST_PARALLEL=$REVERSE_FIRST_PARALLEL"
 append "- STOP_AFTER_REVERSE_FIRST_P1=$STOP_AFTER_REVERSE_FIRST_P1"
 append "- STANDARD_P1_ORDER=$STANDARD_P1_ORDER"
 append "- STOP_AFTER_STANDARD_P1=$STOP_AFTER_STANDARD_P1"
@@ -2906,7 +2960,7 @@ fi
 
 proceed_to_standard_p1=1
 if [[ "$RUN_REVERSE_FIRST_P1" == "1" ]]; then
-  run_lowrtt_probe "mtu${MTU}_reverse_first_p1" "1" "$DURATION" "reverse-only" || true
+  run_reverse_first_probe || true
   REVERSE_FIRST_END_LINE="$(client_log_line_count)"
   if [[ "$RUN_D16_EOF_CLOSE_PROBE" == "1" ]]; then
     if wait_for_quiet_tunnel "D16 EOF-close probe" "$REVERSE_FIRST_END_LINE"; then
@@ -2927,13 +2981,13 @@ if [[ "$RUN_REVERSE_FIRST_P1" == "1" ]]; then
     proceed_to_standard_p1=0
     append ""
     append "## Standard P1 / Full Sweep Skipped"
-    append "STOP_AFTER_REVERSE_FIRST_P1=1；只保留 clean reverse-first P1 窗口，随后采集 final snapshots 和 bundle。"
+    append "STOP_AFTER_REVERSE_FIRST_P1=1；只保留 clean reverse-first P${REVERSE_FIRST_PARALLEL} 窗口，随后采集 final snapshots 和 bundle。"
   elif [[ "$WAIT_QUIET_BEFORE_FULL" == "1" ]]; then
     if ! wait_for_quiet_tunnel "standard P1 probe" "$REVERSE_FIRST_END_LINE"; then
       proceed_to_standard_p1=0
       append ""
       append "## Standard P1 / Full Sweep Skipped"
-      append "reverse-first P1 后 tunnel 没有在 ${QUIET_TIMEOUT_SECS}s 内确认归零；跳过后续 sweep，避免把旧连接残留误判成吞吐问题。"
+      append "reverse-first P${REVERSE_FIRST_PARALLEL} 后 tunnel 没有在 ${QUIET_TIMEOUT_SECS}s 内确认归零；跳过后续 sweep，避免把旧连接残留误判成吞吐问题。"
     fi
   fi
 fi
