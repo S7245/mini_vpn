@@ -111,6 +111,10 @@ passing tests for:
   timeout, and machine restart where feasible;
 - a watchdog and explicit emergency-stop command;
 - bounded logs, rotation, disk-space guard, and evidence finalization;
+- one-shot immutable bundle publication: a valid archive/checksum pair cannot
+  be overwritten by repeated stop, snapshot, bundle, or event actions;
+- a positive direct Target transaction immediately before any TUN rearm, so a
+  server still occupied by a failed test cannot contaminate the next run;
 - no credentials, UUID, password, private key, or sensitive environment values
   in commands, logs, manifests, or repository files;
 - macOS/BSD-compatible parsing and shell self-tests;

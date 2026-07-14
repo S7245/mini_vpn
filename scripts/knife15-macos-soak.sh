@@ -43,6 +43,8 @@ M0_SLEEP_BIN=sleep
 STATE_DIR="/var/run/mini_vpn_knife15_macos_state"
 SERVER_HOST=""
 SERVER_PORT=""
+TARGET_READY_UTC=""
+TARGET_READY_RECEIVER_BPS=""
 
 ACTION="${1:---help}"
 
@@ -99,8 +101,9 @@ Workflow:
  12. sudo -E bash scripts/knife15-macos-soak.sh stop
 
 The background watchdog samples process/utun state and removes only the host
-routes owned by this run if mini_vpn exits. stop is idempotent and creates a
-sanitized evidence bundle.
+routes owned by this run if mini_vpn exits. start proves Target readiness
+before mutation. The first stop publishes one sanitized immutable evidence
+bundle; repeated stop only reports the same path and checksum.
 USAGE
 }
 
@@ -295,6 +298,8 @@ append_event_to() {
 append_event() {
   local run_dir
   run_dir="$(run_dir_from_state)" || die "no Knife15 run state"
+  bundle_is_finalized "$run_dir" && \
+    die "evidence is finalized; refuse to append an event"
   append_event_to "$run_dir" "$1"
 }
 
@@ -630,6 +635,52 @@ validate_m0_iperf_result() {
   ' "$json_file" >/dev/null 2>&1
 }
 
+validate_target_ready_result() {
+  local json_file="$1"
+  local target="$2"
+  jq -e --arg target "$target" '
+    ((.error? // "") == "")
+    and (.start.connecting_to.host == $target)
+    and (.start.test_start.protocol == "TCP")
+    and (.start.test_start.reverse == 0)
+    and ((.intervals | type) == "array" and (.intervals | length) > 0)
+    and all(.intervals[];
+      .sum.bits_per_second as $bps
+      | (($bps | type) == "number" and $bps > 0))
+    and (.end.sum_sent.bytes as $bytes
+      | (($bytes | type) == "number" and $bytes > 0))
+    and (.end.sum_received.bytes as $bytes
+      | (($bytes | type) == "number" and $bytes > 0))
+    and (.end.sum_received.bits_per_second as $bps
+      | (($bps | type) == "number" and $bps > 0))
+  ' "$json_file" >/dev/null 2>&1
+}
+
+target_ready_probe() {
+  local result_file
+  require_command iperf3
+  require_command jq
+  result_file="$(mktemp "${TMPDIR:-/tmp}/mini_vpn_knife15_target_ready.XXXXXX.json")" || \
+    die "cannot create Target readiness result file"
+  echo "Checking that Target can complete a fresh direct iperf3 transaction..."
+  if ! run_logged "$result_file" \
+    iperf3 -c "$TARGET" -p "$IPERF_PORT" -t 1 -P 1 --connect-timeout 5000 --json; then
+    rm -f "$result_file"
+    die "Target readiness command failed; wait for $TARGET:$IPERF_PORT to recover before start"
+  fi
+  if ! validate_target_ready_result "$result_file" "$TARGET"; then
+    rm -f "$result_file"
+    die "Target is busy or could not complete a positive direct transaction; do not rearm yet"
+  fi
+  TARGET_READY_UTC="$(timestamp)"
+  TARGET_READY_RECEIVER_BPS="$(jq -er '.end.sum_received.bits_per_second | floor' "$result_file")" || {
+    rm -f "$result_file"
+    die "cannot record Target readiness receiver rate"
+  }
+  rm -f "$result_file"
+  echo "PASS: Target readiness transaction completed receiver_bps=$TARGET_READY_RECEIVER_BPS"
+}
+
 validate_m0_dns_result() {
   local output_file="$1"
   grep -Eq '(^|[[:space:]])198\.(18|19)\.[0-9]{1,3}\.[0-9]{1,3}([[:space:]]|$)' \
@@ -675,7 +726,7 @@ EOF_M0_PROFILE
 }
 
 runner_self_test() {
-  local tmp good_log bad_log route_fixture interface_fixture clean_scan secret_scan_dir secret_value summary_dir baseline_dir m0_profile m0_run m0_fail_run fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid
+  local tmp good_log bad_log route_fixture interface_fixture clean_scan secret_scan_dir secret_value summary_dir baseline_dir m0_profile m0_run m0_fail_run fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/knife15-macos-self-test.XXXXXX")" || return 1
   good_log="$tmp/good.log"
   bad_log="$tmp/bad.log"
@@ -734,6 +785,15 @@ runner_self_test() {
     die "self-test: valid M0 baseline pair rejected"
   ! validate_m0_baseline_pair "$baseline_dir" 43.130.32.78 || \
     die "self-test: M0 baseline for another target accepted"
+  target_ready_json="$tmp/target-ready.json"
+  printf '%s\n' '{"start":{"connecting_to":{"host":"43.130.32.77"},"test_start":{"protocol":"TCP","reverse":0}},"intervals":[{"sum":{"bits_per_second":1}}],"end":{"sum_sent":{"bytes":100},"sum_received":{"bytes":100,"bits_per_second":1}}}' \
+    >"$target_ready_json"
+  validate_target_ready_result "$target_ready_json" 43.130.32.77 || \
+    die "self-test: healthy Target readiness transaction rejected"
+  printf '%s\n' '{"error":"the server is busy running a test. try again later"}' \
+    >"$target_ready_json"
+  ! validate_target_ready_result "$target_ready_json" 43.130.32.77 || \
+    die "self-test: busy Target readiness transaction accepted"
   dns_result="$tmp/dns-result.txt"
   printf '%s\n' 'example.com. 60 IN A 198.18.0.2' >"$dns_result"
   validate_m0_dns_result "$dns_result" || die "self-test: fake-IP DNS result rejected"
@@ -993,6 +1053,31 @@ EOF_GOOD
   ! run_logged "$tmp/missing/command.log" bash -c 'printf pass; exit 0' 2>/dev/null || \
     die "self-test: failed evidence write accepted"
 
+  finalized_run="$tmp/finalized-run"
+  finalized_bundle="${finalized_run}.tar.gz"
+  mkdir "$finalized_run"
+  printf '%s\n' immutable >"$finalized_run/evidence.txt"
+  create_bundle_once "$finalized_run" "$finalized_bundle" || \
+    die "self-test: initial immutable bundle publication failed"
+  bundle_is_finalized "$finalized_run" || \
+    die "self-test: valid finalized bundle was not recognized"
+  finalized_hash="$(sha256_file "$finalized_bundle")"
+  printf '%s\n' later-mutation >"$finalized_run/evidence.txt"
+  create_bundle_once "$finalized_run" "$finalized_bundle" || \
+    die "self-test: idempotent finalized bundle check failed"
+  [[ "$(sha256_file "$finalized_bundle")" == "$finalized_hash" ]] || \
+    die "self-test: finalized evidence bundle was overwritten"
+  rm "${finalized_bundle}.sha256"
+  create_bundle_once "$finalized_run" "$finalized_bundle" || \
+    die "self-test: interrupted checksum publication did not recover"
+  [[ "$(sha256_file "$finalized_bundle")" == "$finalized_hash" ]] || \
+    die "self-test: checksum recovery rewrote the evidence archive"
+  printf '%s\n' 'not-a-checksum' >"${finalized_bundle}.sha256"
+  ! bundle_is_finalized "$finalized_run" || \
+    die "self-test: invalid bundle checksum was accepted as finalized"
+  ! create_bundle_once "$finalized_run" "$finalized_bundle" || \
+    die "self-test: existing partial/invalid bundle was overwritten"
+
   clean_scan="$tmp/clean-scan"
   mkdir "$clean_scan"
   printf '%s\n' 'redacted diagnostic' >"$clean_scan/log.txt"
@@ -1075,6 +1160,8 @@ host_os=$(sw_vers -productVersion 2>/dev/null || uname -r)
 hardware=$(uname -m)
 target=$TARGET
 target_route_before=$(route_interface "$TARGET")
+target_ready_utc=$TARGET_READY_UTC
+target_ready_receiver_bps=$TARGET_READY_RECEIVER_BPS
 exit_host=$SERVER_HOST
 exit_port=$SERVER_PORT
 exit_route_before=$(route_interface "$SERVER_HOST")
@@ -1381,6 +1468,7 @@ start_runner() {
   local ts run_dir before_file after_file log_file vpn_pid ready=0 utun owner_uid owner_gid i
   require_root
   common_preflight
+  target_ready_probe
 
   [[ "$STATE_DIR" == "/var/run/mini_vpn_knife15_macos_state" ]] || \
     die "internal state-directory guard failed"
@@ -2022,6 +2110,9 @@ snapshot_action() {
   local run_dir
   require_root
   run_dir="$(run_dir_from_state)" || die "no Knife15 run state"
+  bundle_is_finalized "$run_dir" && \
+    die "evidence is finalized; snapshot cannot mutate it"
+  active_pid || die "snapshot requires the run to be active"
   sample_once_for "$run_dir"
   append_event_to "$run_dir" "manual snapshot"
   echo "PASS: snapshot appended to $run_dir"
@@ -2069,7 +2160,7 @@ write_summary() {
   else
     conservation=FAIL_OR_MISSING
   fi
-  remote_write_failures="$(grep -Ec '写入上游流失败|reason=remote_write_failed' "$log_file" 2>/dev/null || true)"
+  remote_write_failures="$(grep -Ec '写入上游流失败|reason=remote_write_failed|reason=stalled_write_timeout' "$log_file" 2>/dev/null || true)"
   interface_error_samples="$(awk -F, '
     NR > 1 && (($5 ~ /^[0-9]+$/ && $5 + 0 > 0) || ($8 ~ /^[0-9]+$/ && $8 + 0 > 0)) { count++ }
     END { print count + 0 }
@@ -2137,7 +2228,7 @@ write_summary() {
     { [[ "$m0_invalid_results" =~ ^[0-9]+$ ]] && ((10#$m0_invalid_results > 0)); } || \
     { [[ "$interface_error_samples" =~ ^[0-9]+$ ]] && \
     ((10#$interface_error_samples > 0)); } || \
-    grep -Eq 'pump_full_waits=[1-9][0-9]*|pump_read_errors=[1-9][0-9]*|tun_flush_tx_failures=[1-9][0-9]*|terminal_pending_reap_bytes=[1-9][0-9]*|写入上游流失败|reason=remote_write_failed' "$log_file"; then
+    grep -Eq 'pump_full_waits=[1-9][0-9]*|pump_read_errors=[1-9][0-9]*|tun_flush_tx_failures=[1-9][0-9]*|terminal_pending_reap_bytes=[1-9][0-9]*|写入上游流失败|reason=remote_write_failed|reason=stalled_write_timeout|reason=idle_timeout' "$log_file"; then
     verdict=REVIEW
   else
     verdict=NO_KNOWN_INTERNAL_FAILURE_SIGNAL
@@ -2192,19 +2283,110 @@ counters, close-tail ownership, and cleanup together.
 EOF_SUMMARY
 }
 
+bundle_is_finalized() {
+  local run_dir="$1"
+  local bundle="${run_dir}.tar.gz"
+  local checksum_file="${bundle}.sha256"
+  local expected actual lines
+  [[ -f "$bundle" && ! -L "$bundle" && -f "$checksum_file" && ! -L "$checksum_file" ]] || \
+    return 1
+  lines="$(awk 'END {print NR + 0}' "$checksum_file" 2>/dev/null)"
+  [[ "$lines" == "1" ]] || return 1
+  expected="$(awk 'NR == 1 {print $1}' "$checksum_file" 2>/dev/null)"
+  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+  actual="$(sha256_file "$bundle" 2>/dev/null)" || return 1
+  [[ "$actual" == "$expected" ]]
+}
+
+owned_routes_are_restored() {
+  local utun target exit_host dns_target
+  utun="$(read_state utun 2>/dev/null || true)"
+  target="$(read_state target 2>/dev/null || true)"
+  exit_host="$(read_state exit_host 2>/dev/null || true)"
+  dns_target="$(read_state dns_target 2>/dev/null || true)"
+  [[ -n "$utun" && -n "$target" && -n "$exit_host" ]] || return 1
+  [[ "$(route_interface "$target")" != "$utun" ]] || return 1
+  [[ "$(route_interface "$exit_host")" != "$utun" ]] || return 1
+  [[ -z "$dns_target" || "$(route_interface "$dns_target")" != "$utun" ]]
+}
+
+create_bundle_once() {
+  local run_dir="$1"
+  local bundle="$2"
+  local checksum_file="${bundle}.sha256"
+  local tmp_bundle="${bundle}.tmp.$$"
+  local tmp_checksum="${checksum_file}.tmp.$$"
+  local checksum
+  [[ "$bundle" == "${run_dir}.tar.gz" ]] || return 1
+  if bundle_is_finalized "$run_dir"; then
+    return 0
+  fi
+  if [[ -f "$bundle" && ! -L "$bundle" && ! -e "$checksum_file" ]]; then
+    [[ ! -e "$tmp_checksum" ]] || return 1
+    checksum="$(sha256_file "$bundle")" || return 1
+    if ! printf '%s  %s\n' "$checksum" "$bundle" >"$tmp_checksum"; then
+      rm -f "$tmp_checksum"
+      return 1
+    fi
+    if ! mv "$tmp_checksum" "$checksum_file"; then
+      rm -f "$tmp_checksum"
+      return 1
+    fi
+    bundle_is_finalized "$run_dir"
+    return
+  fi
+  [[ ! -e "$bundle" && ! -e "$checksum_file" && \
+    ! -e "$tmp_bundle" && ! -e "$tmp_checksum" ]] || return 1
+  if ! tar -C "$(dirname "$run_dir")" -czf "$tmp_bundle" "$(basename "$run_dir")"; then
+    rm -f "$tmp_bundle" "$tmp_checksum"
+    return 1
+  fi
+  checksum="$(sha256_file "$tmp_bundle")" || {
+    rm -f "$tmp_bundle" "$tmp_checksum"
+    return 1
+  }
+  if ! printf '%s  %s\n' "$checksum" "$bundle" >"$tmp_checksum"; then
+    rm -f "$tmp_bundle" "$tmp_checksum"
+    return 1
+  fi
+  if ! mv "$tmp_bundle" "$bundle"; then
+    rm -f "$tmp_bundle" "$tmp_checksum"
+    return 1
+  fi
+  if ! mv "$tmp_checksum" "$checksum_file"; then
+    rm -f "$tmp_checksum"
+    return 1
+  fi
+  bundle_is_finalized "$run_dir"
+}
+
 bundle_action() {
-  local run_dir owner_uid owner_gid bundle
+  local run_dir owner_uid owner_gid bundle recovering=0
   require_root
   run_dir="$(run_dir_from_state)" || die "no Knife15 run state"
+  bundle="${run_dir}.tar.gz"
+  if bundle_is_finalized "$run_dir"; then
+    echo "PASS: evidence bundle was already finalized; no files changed"
+    echo "bundle=$bundle"
+    cat "${bundle}.sha256" || die "cannot read finalized bundle checksum"
+    return 0
+  fi
+  if [[ -f "$bundle" && ! -L "$bundle" && ! -e "${bundle}.sha256" ]]; then
+    recovering=1
+  else
+    [[ ! -e "$bundle" && ! -e "${bundle}.sha256" ]] || \
+      die "refuse to overwrite an existing invalid or partial evidence bundle"
+  fi
   active_pid && die "refuse a mutable bundle while mini_vpn is running; use snapshot or stop"
   watchdog_matches_run && die "refuse a mutable bundle while the watchdog is running; use stop"
   workload_matches_run && die "refuse a mutable bundle while the M0 workload is running; use stop"
-  write_summary "$run_dir"
-  secret_scan "$run_dir" || die "secret scan failed; inspect $run_dir/secret-scan.txt locally"
-  bundle="${run_dir}.tar.gz"
-  tar -C "$(dirname "$run_dir")" -czf "$bundle" "$(basename "$run_dir")" || \
-    die "evidence archive creation failed"
-  shasum -a 256 "$bundle" >"${bundle}.sha256" || die "bundle checksum failed"
+  owned_routes_are_restored || \
+    die "refuse to finalize evidence while an owned target/Exit/DNS route still points to the run utun"
+  if ((recovering == 0)); then
+    write_summary "$run_dir"
+    secret_scan "$run_dir" || die "secret scan failed; inspect $run_dir/secret-scan.txt locally"
+  fi
+  create_bundle_once "$run_dir" "$bundle" || die "one-shot evidence archive publication failed"
   owner_uid="$(read_state owner_uid 2>/dev/null || echo "${SUDO_UID:-0}")"
   owner_gid="$(read_state owner_gid 2>/dev/null || echo "${SUDO_GID:-0}")"
   if [[ "$owner_uid" =~ ^[0-9]+$ && "$owner_gid" =~ ^[0-9]+$ ]]; then
@@ -2213,15 +2395,32 @@ bundle_action() {
   else
     warn "invalid evidence owner state; leaving root ownership unchanged"
   fi
-  echo "PASS: evidence bundle created"
+  if ((recovering == 1)); then
+    echo "PASS: finalized checksum for the existing immutable evidence archive"
+  else
+    echo "PASS: evidence bundle created"
+  fi
   echo "bundle=$bundle"
   cat "${bundle}.sha256" || die "cannot read bundle checksum"
 }
 
 stop_runner() {
-  local run_dir
+  local run_dir bundle
   require_root
   run_dir="$(run_dir_from_state)" || die "no Knife15 run state"
+  bundle="${run_dir}.tar.gz"
+  if bundle_is_finalized "$run_dir"; then
+    echo "PASS: Knife15 run was already stopped and evidence is immutable"
+    echo "bundle=$bundle"
+    cat "${bundle}.sha256" || die "cannot read finalized bundle checksum"
+    return 0
+  fi
+  if [[ -f "$bundle" && ! -L "$bundle" && ! -e "${bundle}.sha256" ]]; then
+    bundle_action
+    return 0
+  fi
+  [[ ! -e "$bundle" && ! -e "${bundle}.sha256" ]] || \
+    die "existing evidence bundle is invalid or partial; refuse repeated stop mutation"
   append_event_to "$run_dir" "stop requested"
   terminate_recorded_workload "$run_dir" || \
     die "M0 workload identity/termination check failed; refusing process and route cleanup"
@@ -2230,12 +2429,8 @@ stop_runner() {
   terminate_recorded_watchdog "$run_dir"
   sample_once_for "$run_dir"
   append_event_to "$run_dir" "stop cleanup complete"
-  if [[ "$(route_interface "$(read_state target)")" == "$(read_state utun)" ]]; then
-    die "target route still points to the run utun after cleanup"
-  fi
-  if [[ "$(route_interface "$(read_state exit_host)")" == "$(read_state utun)" ]]; then
-    die "Exit route points to the run utun after cleanup"
-  fi
+  owned_routes_are_restored || \
+    die "an owned target/Exit/DNS route still points to the run utun after cleanup"
   write_state inactive "$(timestamp)"
   bundle_action
 }

@@ -101,9 +101,12 @@ sudo -E bash scripts/knife15-macos-soak.sh stop
 ```
 
 `start` must report the new `utun`, target route, non-recursive Exit route,
-and evidence directory. `smoke` rechecks forward TCP, reverse TCP, and fake-IP
-DNS before the expensive run. `m0` takes approximately two hours plus command
-setup overhead and keeps the Mac awake through `caffeinate`.
+and evidence directory. Before it changes any route or starts mini_vpn, it now
+requires a fresh one-second direct Target transaction to complete. A Target
+that is still busy cleaning up an earlier failed iperf session blocks rearm
+without changing local state. `smoke` rechecks forward TCP, reverse TCP, and
+fake-IP DNS before the expensive run. `m0` takes approximately two hours plus
+command setup overhead and keeps the Mac awake through `caffeinate`.
 
 The frozen M0 timeline contains `6,780s` of active work, one `300s` idle-drain
 window, and one `120s` final drain. Each full cycle contains capped forward and
@@ -114,7 +117,8 @@ tracks traffic, idle, and final-drain children, checks process/target/Exit and
 lossless-log health at least every two seconds, and records an independently
 verified idle/resume/final-drain timeline.
 
-`stop` first terminates any identity-verified M0 controller, then terminates
+On a successful M0, run `status` and then `stop`; no manual `snapshot` is
+needed. `stop` first terminates any identity-verified M0 controller, then terminates
 mini_vpn, removes only routes still owned by this run, scans for secret-shaped
 material, and produces a `.tar.gz` bundle plus SHA-256.
 
@@ -128,6 +132,10 @@ sudo -E bash scripts/knife15-macos-soak.sh stop
 ```
 
 The last `stop` is the emergency cleanup and evidence-finalization command.
+Run `status` and `snapshot` only before that `stop`. Once `stop` has published
+a valid archive/checksum pair, the evidence is immutable: later `snapshot`,
+`event`, or overwrite attempts are refused, and a repeated `stop` only prints
+the already-finalized path and checksum without changing either file.
 
 ## 5. Prove Stop/Re-create/Rearm
 
@@ -140,9 +148,11 @@ sudo -E bash scripts/knife15-macos-soak.sh smoke
 sudo -E bash scripts/knife15-macos-soak.sh stop
 ```
 
-The second `start` must create one new utun, keep the Exit outside it, and pass
-TCP/DNS again. The second `stop` must again restore the target and DNS host
-routes and produce a separate sanitized bundle.
+The second `start` first waits for the direct Target readiness gate to pass,
+then must create one new utun, keep the Exit outside it, and pass TCP/DNS
+again. Do not repeatedly race `start` while the Target reports busy. The
+second `stop` must again restore the target and DNS host routes and produce a
+separate sanitized bundle.
 
 ## 6. Return Only Safe Evidence
 
