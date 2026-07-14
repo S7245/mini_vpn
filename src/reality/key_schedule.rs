@@ -70,7 +70,10 @@ pub fn derive_handshake_keys(
 /// derived2 = Derive-Secret(handshake_secret,"derived","")；Master = Extract(derived2, 0)；
 /// {c,s}_ap_traffic = Derive-Secret(Master, "c/s ap traffic", transcript_hash(CH..serverFinished))；key/iv 同 hs。
 /// 中文要点（刀8 用）：server Finished 验证通过后调本函数；`transcript_hash` = hash(CH..serverFinished)。
-pub fn derive_application_keys(handshake_secret: &[u8; 32], transcript_ch_sfin: &[u8; 32]) -> AppKeys {
+pub fn derive_application_keys(
+    handshake_secret: &[u8; 32],
+    transcript_ch_sfin: &[u8; 32],
+) -> AppKeys {
     let derived2 = derive_secret(handshake_secret, "derived", &transcript_hash(&[]));
     let master = extract(&derived2, &[0u8; 32]);
     let c_ap = derive_secret(&master, "c ap traffic", transcript_ch_sfin);
@@ -104,7 +107,10 @@ pub fn hkdf_label(length: u16, label: &str, context: &[u8]) -> Vec<u8> {
     let full_label = [b"tls13 ".as_slice(), label.as_bytes()].concat();
     // TLS 不变量（RFC 8446 §7.1）：label / context 各 ≤255（u8 长前缀）。所有调用点都是短常量；
     // debug_assert 文档化此前提，防 `as u8` 静默截断（若将来传入超长 label）。
-    debug_assert!(full_label.len() <= 255 && context.len() <= 255, "HkdfLabel 字段超 255");
+    debug_assert!(
+        full_label.len() <= 255 && context.len() <= 255,
+        "HkdfLabel 字段超 255"
+    );
     let mut out = Vec::with_capacity(2 + 1 + full_label.len() + 1 + context.len());
     out.extend_from_slice(&length.to_be_bytes());
     out.push(full_label.len() as u8);
@@ -119,7 +125,8 @@ pub fn expand_label(secret: &[u8; 32], label: &str, context: &[u8], length: usiz
     let info = hkdf_label(length as u16, label, context);
     let hk = Hkdf::<Sha256>::from_prk(secret).expect("32B PRK ≥ HashLen");
     let mut okm = vec![0u8; length];
-    hk.expand(&info, &mut okm).expect("length within HKDF-SHA256 limit");
+    hk.expand(&info, &mut okm)
+        .expect("length within HKDF-SHA256 limit");
     okm
 }
 
@@ -142,7 +149,10 @@ pub fn extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
 /// 其中 finished_key = Expand-Label(base_secret, "finished", "", 32)。base_secret = 对应方向的 hs_traffic_secret。
 /// 中文要点（刀8 用）：server 用 s_hs + transcript(CH..CertificateVerify) 算出的应等于其 Finished 内容；
 /// client 用 c_hs + transcript(CH..serverFinished) 算出自己的 Finished。本刀提供纯函数 + RFC 8448 KAT。
-pub fn compute_finished_verify_data(base_secret: &[u8; 32], transcript_hash: &[u8; 32]) -> [u8; 32] {
+pub fn compute_finished_verify_data(
+    base_secret: &[u8; 32],
+    transcript_hash: &[u8; 32],
+) -> [u8; 32] {
     use hmac::{Hmac, Mac};
     let finished_key = expand_label(base_secret, "finished", b"", 32);
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&finished_key).expect("HMAC key any len");
@@ -171,8 +181,14 @@ mod tests {
     /// HkdfLabel 字节编码（RFC 8446 §7.1）——`tls13 ` 含尾空格 + u8 前缀。
     #[test]
     fn hkdf_label_encoding() {
-        assert_eq!(hkdf_label(16, "key", b""), hex("00 10 09 74 6c 73 31 33 20 6b 65 79 00"));
-        assert_eq!(hkdf_label(12, "iv", b""), hex("00 0c 08 74 6c 73 31 33 20 69 76 00"));
+        assert_eq!(
+            hkdf_label(16, "key", b""),
+            hex("00 10 09 74 6c 73 31 33 20 6b 65 79 00")
+        );
+        assert_eq!(
+            hkdf_label(12, "iv", b""),
+            hex("00 0c 08 74 6c 73 31 33 20 69 76 00")
+        );
         assert_eq!(
             hkdf_label(32, "finished", b""),
             hex("00 20 0e 74 6c 73 31 33 20 66 69 6e 69 73 68 65 64 00")
@@ -210,8 +226,7 @@ mod tests {
     // RFC 8448 §3 "Simple 1-RTT Handshake" 的 ClientHello / ServerHello handshake message 字节。
     const RFC8448_CH: &str = "010000c00303cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef6283024dece7000006130113031302010000910000000b0009000006736572766572ff01000100000a00140012001d0017001800190100010101020103010400230000003300260024001d002099381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002d00020101001c00024001";
     const RFC8448_SH: &str = "020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e2692800130100002e00330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304";
-    const RFC8448_ECDHE: &str =
-        "8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d";
+    const RFC8448_ECDHE: &str = "8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d";
 
     /// RFC 8448 §3 transcript hash(CH || SH) —— {c,s}_hs_traffic 的 context。
     #[test]
@@ -239,10 +254,26 @@ mod tests {
             arr32("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"),
             "server_handshake_traffic_secret"
         );
-        assert_eq!(&ks.server_key[..], &hex("3fce516009c21727d0f2e4e86ee403bc")[..], "server key");
-        assert_eq!(&ks.server_iv[..], &hex("5d313eb2671276ee13000b30")[..], "server iv");
-        assert_eq!(&ks.client_key[..], &hex("dbfaa693d1762c5b666af5d950258d01")[..], "client key");
-        assert_eq!(&ks.client_iv[..], &hex("5bd3c71b836e0b76bb73265f")[..], "client iv");
+        assert_eq!(
+            &ks.server_key[..],
+            &hex("3fce516009c21727d0f2e4e86ee403bc")[..],
+            "server key"
+        );
+        assert_eq!(
+            &ks.server_iv[..],
+            &hex("5d313eb2671276ee13000b30")[..],
+            "server iv"
+        );
+        assert_eq!(
+            &ks.client_key[..],
+            &hex("dbfaa693d1762c5b666af5d950258d01")[..],
+            "client key"
+        );
+        assert_eq!(
+            &ks.client_iv[..],
+            &hex("5bd3c71b836e0b76bb73265f")[..],
+            "client iv"
+        );
     }
 
     /// network keyshare 不可信：全零 ECDHE（低阶点/非贡献点）→ Err（在 Extract 前）。
@@ -253,7 +284,8 @@ mod tests {
     }
 
     // RFC 8448 §3 server flight 后续 handshake messages（脚本从 RFC 文本抽取、字节数核对 40/445/136）。
-    const RFC8448_EE: &str = "080000240022000a00140012001d00170018001901000101010201030104001c0002400100000000";
+    const RFC8448_EE: &str =
+        "080000240022000a00140012001d00170018001901000101010201030104001c0002400100000000";
     const RFC8448_CERT: &str = "0b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e310c300a06035504031303727361301e170d3136303733303031323335395a170d3236303733303031323335395a300e310c300a0603550403130372736130819f300d06092a864886f70d010101050003818d0030818902818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b0603551d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b42b4de10000";
     const RFC8448_CV: &str = "0f000084080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd484145ab3ff52f1fda8477b0b7abc90db78e2d33a5c141a078653fa6bef780c5ea248eeaaa785c4f394cab6d30bbe8d4859ee511f602957b15411ac027671459e46445c9ea58c181e818e95b8c3fb0bf3278409d3be152a3da5043e063dda65cdf5aea20d53dfacd42f74f3";
 
@@ -322,7 +354,11 @@ mod tests {
         // ② 函数 == 直接 expand_label（防将来误改 label/ctx/len）。
         let s0 = arr32("a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643"); // RFC 8448 s_ap_0
         let s1 = next_application_traffic_secret(&s0);
-        assert_eq!(s1.to_vec(), expand_label(&s0, "traffic upd", b"", 32), "next ≡ ExpandLabel(.,traffic upd,'',32)");
+        assert_eq!(
+            s1.to_vec(),
+            expand_label(&s0, "traffic upd", b"", 32),
+            "next ≡ ExpandLabel(.,traffic upd,'',32)"
+        );
         // frozen 回归值 + 链可继续推进。
         assert_eq!(
             s1,
@@ -338,7 +374,11 @@ mod tests {
         let rec = send.seal(0x17, b"post-keyupdate"); // send seq0
         let hdr: [u8; 5] = rec[..5].try_into().unwrap();
         let (ct, body) = recv.open(&hdr, &rec[5..]).unwrap(); // recv seq0
-        assert_eq!((ct, body.as_slice()), (0x17, &b"post-keyupdate"[..]), "N+1 key/iv @seq0 round-trip");
+        assert_eq!(
+            (ct, body.as_slice()),
+            (0x17, &b"post-keyupdate"[..]),
+            "N+1 key/iv @seq0 round-trip"
+        );
     }
 
     /// T7：application 阶段密钥（RFC 8448 §3 KAT）。transcript = hash(CH..serverFinished)。

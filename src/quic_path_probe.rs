@@ -120,6 +120,35 @@ struct ProbeServerResult {
     stats: ProbeQuicStats,
 }
 
+#[derive(Debug)]
+struct UploadProbeClientResult {
+    total_bytes: u64,
+    elapsed: Duration,
+    send_service_stats: Option<QuicUdpSendServiceSnapshot>,
+    pacing_stats: ProbePacingStats,
+    endpoint_pacing_stats: Option<quinn::EndpointPacingSnapshot>,
+    connection_pacing_stats: Option<quinn::EndpointPacingConnectionSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProbePacingStats {
+    cwnd: u64,
+    current_mtu: u16,
+    pacing_uncapped_capacity_bytes: u64,
+    pacing_capacity_bytes: u64,
+    pacing_tokens_bytes: u64,
+    pacing_mtu: u16,
+    pacing_cap_active: bool,
+    pacing_delay_events: u64,
+}
+
+#[derive(Debug)]
+struct UploadProbeServerResult {
+    total_bytes: u64,
+    pattern_errors: u64,
+    clean_eof: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ProbeQuicStats {
     rtt_us: u64,
@@ -176,16 +205,31 @@ fn print_probe_stats(side: &str, stats: ProbeQuicStats) {
     );
 }
 
-async fn close_probe_endpoint(connection: &quinn::Connection, endpoint: &Endpoint) {
+async fn close_probe_endpoint(
+    connection: &quinn::Connection,
+    endpoint: &Endpoint,
+) -> Result<(), String> {
     connection.close(0u32.into(), b"probe complete");
     endpoint.close(0u32.into(), b"probe complete");
-    let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
+    tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle())
+        .await
+        .map_err(|_| "probe endpoint did not become idle after close".to_string())?;
+    Ok(())
 }
 
 fn probe_server_endpoint(
     bind: SocketAddr,
     cert_path: &str,
     key_path: &str,
+) -> Result<Endpoint, String> {
+    probe_server_endpoint_with_mtu(bind, cert_path, key_path, MtuPolicy::Safe1200)
+}
+
+fn probe_server_endpoint_with_mtu(
+    bind: SocketAddr,
+    cert_path: &str,
+    key_path: &str,
+    mtu_policy: MtuPolicy,
 ) -> Result<Endpoint, String> {
     let certs = load_certs(cert_path)?;
     let key_file =
@@ -201,7 +245,12 @@ fn probe_server_endpoint(
     let quic_crypto = QuicServerConfig::try_from(crypto)
         .map_err(|err| format!("build probe QUIC server crypto: {err}"))?;
     let mut server_config = ServerConfig::with_crypto(Arc::new(quic_crypto));
-    server_config.transport_config(quic_transport_config(CcChoice::Cubic, MtuPolicy::Safe1200));
+    server_config.transport_config(quic_transport_config(
+        CcChoice::Cubic,
+        mtu_policy,
+        QuicGsoPolicy::Enabled,
+        super::QuicPacingPolicy::QuinnDefault,
+    ));
 
     let socket = std::net::UdpSocket::bind(bind)
         .map_err(|err| format!("bind probe server {bind}: {err}"))?;
@@ -268,11 +317,186 @@ async fn run_probe_server_once(endpoint: Endpoint) -> Result<ProbeServerResult, 
     }
     let elapsed = started.elapsed();
     let stats = probe_quic_stats(&connection);
-    close_probe_endpoint(&connection, &endpoint).await;
+    close_probe_endpoint(&connection, &endpoint).await?;
     Ok(ProbeServerResult {
         total_bytes,
         elapsed,
         stats,
+    })
+}
+
+async fn run_upload_probe_server_once(
+    endpoint: Endpoint,
+    expected_bytes: u64,
+) -> Result<UploadProbeServerResult, String> {
+    let incoming = endpoint
+        .accept()
+        .await
+        .ok_or_else(|| "upload probe server endpoint closed before accept".to_string())?;
+    let connection = incoming
+        .await
+        .map_err(|err| format!("upload probe server handshake: {err}"))?;
+    let (mut send, mut recv) = connection
+        .accept_bi()
+        .await
+        .map_err(|err| format!("upload probe server accept stream: {err}"))?;
+
+    let mut total_bytes = 0u64;
+    let mut pattern_errors = 0u64;
+    let clean_eof = loop {
+        match recv
+            .read_chunk(PROBE_READ_MAX_BYTES, true)
+            .await
+            .map_err(|err| format!("upload probe server read payload: {err}"))?
+        {
+            Some(chunk) => {
+                total_bytes = total_bytes.saturating_add(chunk.bytes.len() as u64);
+                pattern_errors = pattern_errors.saturating_add(
+                    chunk
+                        .bytes
+                        .iter()
+                        .filter(|byte| **byte != PROBE_PATTERN)
+                        .count() as u64,
+                );
+                if total_bytes > expected_bytes {
+                    return Err(format!(
+                        "upload probe server received {total_bytes} > expected {expected_bytes}"
+                    ));
+                }
+            }
+            None => break true,
+        }
+    };
+    if total_bytes != expected_bytes {
+        return Err(format!(
+            "upload probe server received {total_bytes} != expected {expected_bytes}"
+        ));
+    }
+
+    send.write_all(&[PROBE_ACK])
+        .await
+        .map_err(|err| format!("upload probe server write ACK: {err}"))?;
+    send.finish()
+        .map_err(|err| format!("upload probe server finish ACK: {err}"))?;
+    send.stopped()
+        .await
+        .map_err(|err| format!("upload probe server wait ACK delivery: {err}"))?;
+    close_probe_endpoint(&connection, &endpoint).await?;
+    Ok(UploadProbeServerResult {
+        total_bytes,
+        pattern_errors,
+        clean_eof,
+    })
+}
+
+async fn run_upload_probe_client(
+    server_addr: SocketAddr,
+    server_name: &str,
+    ca_path: &str,
+    amount: u64,
+    chunk_bytes: usize,
+    gso_policy: QuicGsoPolicy,
+    send_service_policy: QuicUdpSendServicePolicy,
+    pacing_policy: super::QuicPacingPolicy,
+) -> Result<UploadProbeClientResult, String> {
+    run_upload_probe_client_with_mtu(
+        server_addr,
+        server_name,
+        ca_path,
+        amount,
+        chunk_bytes,
+        MtuPolicy::Safe1200,
+        gso_policy,
+        send_service_policy,
+        pacing_policy,
+    )
+    .await
+}
+
+async fn run_upload_probe_client_with_mtu(
+    server_addr: SocketAddr,
+    server_name: &str,
+    ca_path: &str,
+    amount: u64,
+    chunk_bytes: usize,
+    mtu_policy: MtuPolicy,
+    gso_policy: QuicGsoPolicy,
+    send_service_policy: QuicUdpSendServicePolicy,
+    pacing_policy: super::QuicPacingPolicy,
+) -> Result<UploadProbeClientResult, String> {
+    super::validate_quic_send_policies(pacing_policy, send_service_policy)?;
+    let client_config = client_quic_config_alpn(
+        ca_path,
+        vec![PROBE_ALPN.to_vec()],
+        CcChoice::Cubic,
+        mtu_policy,
+        gso_policy,
+        pacing_policy,
+    )?;
+    let (endpoint, send_service_stats) =
+        client_endpoint_with_udp_send_service(client_config, send_service_policy, pacing_policy)?;
+    let connection = endpoint
+        .connect(server_addr, server_name)
+        .map_err(|err| format!("start upload probe client connect: {err}"))?
+        .await
+        .map_err(|err| format!("upload probe client handshake: {err}"))?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|err| format!("upload probe client open stream: {err}"))?;
+
+    let payload = vec![PROBE_PATTERN; chunk_bytes];
+    let started = Instant::now();
+    let mut total_bytes = 0u64;
+    while total_bytes < amount {
+        let write_bytes = (amount - total_bytes).min(payload.len() as u64) as usize;
+        send.write_all(&payload[..write_bytes])
+            .await
+            .map_err(|err| format!("upload probe client write payload: {err}"))?;
+        total_bytes = total_bytes.saturating_add(write_bytes as u64);
+    }
+    send.finish()
+        .map_err(|err| format!("upload probe client finish payload: {err}"))?;
+
+    let mut ack = [0u8; 1];
+    recv.read_exact(&mut ack)
+        .await
+        .map_err(|err| format!("upload probe client read ACK: {err}"))?;
+    if ack != [PROBE_ACK] {
+        return Err(format!("upload probe client ACK mismatch: {ack:?}"));
+    }
+    let trailing = recv
+        .read_to_end(1)
+        .await
+        .map_err(|err| format!("upload probe client read ACK EOF: {err}"))?;
+    if !trailing.is_empty() {
+        return Err(format!(
+            "upload probe client received trailing ACK bytes: {}",
+            trailing.len()
+        ));
+    }
+    let elapsed = started.elapsed();
+    let path = connection.stats().path;
+    let pacing_stats = ProbePacingStats {
+        cwnd: path.cwnd,
+        current_mtu: path.current_mtu,
+        pacing_uncapped_capacity_bytes: path.pacing_uncapped_capacity_bytes,
+        pacing_capacity_bytes: path.pacing_capacity_bytes,
+        pacing_tokens_bytes: path.pacing_tokens_bytes,
+        pacing_mtu: path.pacing_mtu,
+        pacing_cap_active: path.pacing_cap_active,
+        pacing_delay_events: path.pacing_delay_events,
+    };
+    let connection_pacing_stats = connection.endpoint_pacing_snapshot();
+    close_probe_endpoint(&connection, &endpoint).await?;
+    let endpoint_pacing_stats = endpoint.endpoint_pacing_snapshot();
+    Ok(UploadProbeClientResult {
+        total_bytes,
+        elapsed,
+        send_service_stats: send_service_stats.map(|stats| stats.snapshot()),
+        pacing_stats,
+        endpoint_pacing_stats,
+        connection_pacing_stats,
     })
 }
 
@@ -343,6 +567,8 @@ async fn run_probe_client(
         vec![PROBE_ALPN.to_vec()],
         CcChoice::Cubic,
         MtuPolicy::Safe1200,
+        QuicGsoPolicy::Enabled,
+        super::QuicPacingPolicy::QuinnDefault,
     )?;
     let endpoint = client_endpoint(client_config)?;
     let connection = endpoint
@@ -399,7 +625,7 @@ async fn run_probe_client(
         .map_err(|err| format!("probe interval sampler join: {err}"))?;
     let total_bytes = total_bytes.load(Ordering::Relaxed);
     let stats = probe_quic_stats(&connection);
-    close_probe_endpoint(&connection, &endpoint).await;
+    close_probe_endpoint(&connection, &endpoint).await?;
     Ok(ProbeClientResult {
         total_bytes,
         pattern_errors,
@@ -598,7 +824,11 @@ async fn real_loopback_reverse_stream_delivers_fixed_bytes_and_clean_eof() {
     .await
     .expect("loopback probe must not time out")
     .unwrap();
-    let server = server_task.await.unwrap().unwrap();
+    let server = tokio::time::timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("loopback reverse server must not hang after completion ACK")
+        .unwrap()
+        .unwrap();
 
     assert_eq!(client.total_bytes, request.amount);
     assert_eq!(server.total_bytes, request.amount);
@@ -607,6 +837,271 @@ async fn real_loopback_reverse_stream_delivers_fixed_bytes_and_clean_eof() {
     assert!(!client.intervals.is_empty());
     let receiver_mbps = client.total_bytes as f64 * 8.0 / client.elapsed.as_secs_f64() / 1e6;
     assert!(receiver_mbps > 170.0, "receiver_mbps={receiver_mbps:.3}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disabled_gso_real_loopback_upload_delivers_fixed_bytes_and_clean_eof() {
+    let cert_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certs/dev");
+    let server_endpoint = probe_server_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
+        cert_dir.join("server-cert.pem").to_str().unwrap(),
+        cert_dir.join("server-key.pem").to_str().unwrap(),
+    )
+    .unwrap();
+    let server_addr = server_endpoint.local_addr().unwrap();
+    let amount = 32 * 1024 * 1024;
+    let server_task = tokio::spawn(run_upload_probe_server_once(server_endpoint, amount));
+
+    let client = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_upload_probe_client(
+            server_addr,
+            "example.com",
+            cert_dir.join("ca-cert.pem").to_str().unwrap(),
+            amount,
+            64 * 1024,
+            QuicGsoPolicy::Disabled,
+            QuicUdpSendServicePolicy::QuinnDefault,
+            super::QuicPacingPolicy::QuinnDefault,
+        ),
+    )
+    .await
+    .expect("disabled-GSO loopback upload must not time out")
+    .unwrap();
+    let server = tokio::time::timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("disabled-GSO upload server must not hang after ACK EOF")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(client.total_bytes, amount);
+    assert_eq!(server.total_bytes, amount);
+    assert_eq!(server.pattern_errors, 0);
+    assert!(server.clean_eof);
+    let sender_mbps = client.total_bytes as f64 * 8.0 / client.elapsed.as_secs_f64() / 1e6;
+    assert!(sender_mbps > 170.0, "sender_mbps={sender_mbps:.3}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pacer_cap64_real_loopback_upload_delivers_fixed_bytes_and_clean_eof() {
+    let cert_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certs/dev");
+    let server_endpoint = probe_server_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
+        cert_dir.join("server-cert.pem").to_str().unwrap(),
+        cert_dir.join("server-key.pem").to_str().unwrap(),
+    )
+    .unwrap();
+    let server_addr = server_endpoint.local_addr().unwrap();
+    let amount = 32 * 1024 * 1024;
+    let server_task = tokio::spawn(run_upload_probe_server_once(server_endpoint, amount));
+
+    let client = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_upload_probe_client(
+            server_addr,
+            "example.com",
+            cert_dir.join("ca-cert.pem").to_str().unwrap(),
+            amount,
+            64 * 1024,
+            QuicGsoPolicy::Enabled,
+            QuicUdpSendServicePolicy::QuinnDefault,
+            super::QuicPacingPolicy::PacerCap64,
+        ),
+    )
+    .await
+    .expect("pacer-cap64 loopback upload must not time out")
+    .unwrap();
+    let server = tokio::time::timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("pacer-cap64 upload server must not hang after ACK EOF")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(client.total_bytes, amount);
+    assert_eq!(server.total_bytes, amount);
+    assert_eq!(server.pattern_errors, 0);
+    assert!(server.clean_eof);
+    assert!(client.send_service_stats.is_none());
+
+    let pacing = client.pacing_stats;
+    let expected_capacity = 64 * u64::from(pacing.pacing_mtu);
+    assert!(pacing.cwnd <= u64::from(u32::MAX), "{pacing:?}");
+    assert!(pacing.pacing_cap_active, "{pacing:?}");
+    assert_eq!(
+        pacing.pacing_capacity_bytes, expected_capacity,
+        "{pacing:?}"
+    );
+    assert!(
+        pacing.pacing_tokens_bytes <= pacing.pacing_capacity_bytes,
+        "{pacing:?}"
+    );
+    assert!(
+        pacing.pacing_uncapped_capacity_bytes > expected_capacity,
+        "{pacing:?}"
+    );
+    assert!(pacing.pacing_delay_events > 0, "{pacing:?}");
+    assert_eq!(pacing.pacing_mtu, pacing.current_mtu, "{pacing:?}");
+
+    let sender_mbps = client.total_bytes as f64 * 8.0 / client.elapsed.as_secs_f64() / 1e6;
+    eprintln!("pacer_cap64_probe sender_mbps={sender_mbps:.3} pacing={pacing:?}");
+    assert!(sender_mbps > 170.0, "sender_mbps={sender_mbps:.3}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn endpoint_window_v1_real_loopback_upload_exceeds_capacity_gate_without_leaks() {
+    let cert_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certs/dev");
+    let server_endpoint = probe_server_endpoint_with_mtu(
+        "127.0.0.1:0".parse().unwrap(),
+        cert_dir.join("server-cert.pem").to_str().unwrap(),
+        cert_dir.join("server-key.pem").to_str().unwrap(),
+        MtuPolicy::Default,
+    )
+    .unwrap();
+    let server_addr = server_endpoint.local_addr().unwrap();
+    let amount = 32 * 1024 * 1024;
+    let server_task = tokio::spawn(run_upload_probe_server_once(server_endpoint, amount));
+
+    let client = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_upload_probe_client_with_mtu(
+            server_addr,
+            "example.com",
+            cert_dir.join("ca-cert.pem").to_str().unwrap(),
+            amount,
+            64 * 1024,
+            MtuPolicy::Default,
+            QuicGsoPolicy::Enabled,
+            QuicUdpSendServicePolicy::QuinnDefault,
+            super::QuicPacingPolicy::EndpointWindowV1,
+        ),
+    )
+    .await
+    .expect("endpoint-window-v1 loopback upload must not time out")
+    .unwrap();
+    let server = tokio::time::timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("endpoint-window-v1 upload server must not hang after ACK EOF")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(client.total_bytes, amount);
+    assert_eq!(server.total_bytes, amount);
+    assert_eq!(server.pattern_errors, 0);
+    assert!(server.clean_eof);
+    assert!(client.send_service_stats.is_none());
+    assert!(
+        !client.pacing_stats.pacing_cap_active,
+        "{:?}",
+        client.pacing_stats
+    );
+    assert_eq!(
+        client.pacing_stats.pacing_capacity_bytes,
+        client.pacing_stats.pacing_uncapped_capacity_bytes,
+        "the rejected per-connection cap must remain inactive"
+    );
+
+    let connection = client
+        .connection_pacing_stats
+        .expect("configured connection must expose endpoint service attribution");
+    assert!(connection.attached);
+    assert!(connection.granted_bulk_bytes >= amount);
+    assert!(connection.granted_control_bytes > 0);
+    assert_eq!(connection.live_reservation_bytes, 0);
+    assert_eq!(connection.outstanding_bytes, 0);
+
+    let endpoint = client
+        .endpoint_pacing_stats
+        .expect("configured endpoint must retain its service snapshot after idle");
+    assert_eq!(endpoint.rate_bytes_per_second, 30_720_000);
+    assert_eq!(endpoint.burst_bytes, 61_440);
+    assert_eq!(endpoint.control_reserve_bytes, 10_240);
+    assert_eq!(endpoint.connection_quantum_bytes, 20_480);
+    assert!(endpoint.endpoint_delay_events > 0, "{endpoint:?}");
+    assert!(endpoint.max_endpoint_delay_nanos > 0, "{endpoint:?}");
+    assert!(endpoint.outstanding_bytes_high_water > 0, "{endpoint:?}");
+    assert_eq!(endpoint.live_reservation_bytes, 0, "{endpoint:?}");
+    assert_eq!(endpoint.outstanding_bytes, 0, "{endpoint:?}");
+    assert_eq!(endpoint.connection_records, 0, "{endpoint:?}");
+    assert!(endpoint.detaches > 0, "{endpoint:?}");
+    assert_eq!(endpoint.stateless_responses_sent, 0, "{endpoint:?}");
+    assert_eq!(endpoint.stateless_responses_dropped, 0, "{endpoint:?}");
+    assert_eq!(
+        endpoint.granted_bytes,
+        endpoint
+            .refunded_bytes
+            .saturating_add(endpoint.sent_bytes)
+            .saturating_add(endpoint.abandoned_bytes),
+        "every reservation must have exactly one terminal accounting path: {endpoint:?}"
+    );
+    assert!(
+        endpoint.available_tokens + endpoint.live_reservation_bytes + endpoint.outstanding_bytes
+            <= endpoint.burst_bytes,
+        "endpoint conservation failed: {endpoint:?}"
+    );
+
+    let sender_mbps = client.total_bytes as f64 * 8.0 / client.elapsed.as_secs_f64() / 1e6;
+    eprintln!(
+        "endpoint_window_v1_probe sender_mbps={sender_mbps:.3} endpoint={endpoint:?} connection={connection:?}"
+    );
+    assert!(sender_mbps > 170.0, "sender_mbps={sender_mbps:.3}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "known-negative fixed 48-datagram/2ms replay; run explicitly for measurement only"]
+async fn known_negative_bounded_send_service_real_loopback_upload_measurement() {
+    let cert_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certs/dev");
+    let server_endpoint = probe_server_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
+        cert_dir.join("server-cert.pem").to_str().unwrap(),
+        cert_dir.join("server-key.pem").to_str().unwrap(),
+    )
+    .unwrap();
+    let server_addr = server_endpoint.local_addr().unwrap();
+    let amount = 32 * 1024 * 1024;
+    let server_task = tokio::spawn(run_upload_probe_server_once(server_endpoint, amount));
+
+    let client = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_upload_probe_client(
+            server_addr,
+            "example.com",
+            cert_dir.join("ca-cert.pem").to_str().unwrap(),
+            amount,
+            64 * 1024,
+            QuicGsoPolicy::Enabled,
+            QuicUdpSendServicePolicy::Bounded,
+            super::QuicPacingPolicy::QuinnDefault,
+        ),
+    )
+    .await
+    .expect("bounded-send-service loopback upload must not time out")
+    .unwrap();
+    let server = tokio::time::timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("bounded-send-service upload server must not hang after ACK EOF")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(client.total_bytes, amount);
+    assert_eq!(server.total_bytes, amount);
+    assert_eq!(server.pattern_errors, 0);
+    assert!(server.clean_eof);
+    let service = client
+        .send_service_stats
+        .expect("bounded endpoint exposes send-service stats");
+    assert!(service.accepted_bytes >= amount);
+    assert!(service.accepted_datagrams > 0);
+    assert!(service.cooldown_rearms > 0);
+    let sender_mbps = client.total_bytes as f64 * 8.0 / client.elapsed.as_secs_f64() / 1e6;
+    let mean_payload_bytes = service.accepted_bytes as f64 / service.accepted_datagrams as f64;
+    let mean_rearm_period_us =
+        service.service_elapsed_ns as f64 / service.cooldown_rearms as f64 / 1_000.0;
+    let mean_rearm_lateness_us =
+        service.total_rearm_lateness_ns as f64 / service.cooldown_rearms as f64 / 1_000.0;
+    eprintln!(
+        "bounded_send_service_probe sender_mbps={sender_mbps:.3} mean_payload_bytes={mean_payload_bytes:.3} mean_rearm_period_us={mean_rearm_period_us:.3} mean_rearm_lateness_us={mean_rearm_lateness_us:.3} service={service:?}"
+    );
+    assert!(sender_mbps > 170.0, "sender_mbps={sender_mbps:.3}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

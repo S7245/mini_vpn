@@ -76,7 +76,8 @@ impl Metrics {
     }
     /// datagram 背压「集次」——false→true 上升沿计一次（非每 tick，见 [`note_pressure_edge`]）。
     pub fn inc_datagram_pressure_events(&self) {
-        self.datagram_pressure_events.fetch_add(1, Ordering::Relaxed);
+        self.datagram_pressure_events
+            .fetch_add(1, Ordering::Relaxed);
     }
     /// 累计 relay 启动次数（每条新 TCP flow 一次，`spawn_remote_relay`）。
     pub fn inc_relays_spawned(&self) {
@@ -309,7 +310,10 @@ mod tests {
         let mut prev = false;
         // 序列 [F,T,T,F,T] → 两个上升沿。
         let seq = [false, true, true, false, true];
-        let count = seq.iter().filter(|&&p| note_pressure_edge(p, &mut prev)).count();
+        let count = seq
+            .iter()
+            .filter(|&&p| note_pressure_edge(p, &mut prev))
+            .count();
         assert_eq!(count, 2);
         // 全 false → 0 沿。
         let mut prev2 = false;

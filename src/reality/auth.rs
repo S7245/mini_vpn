@@ -7,9 +7,9 @@
 //!   (key=完整 32B AuthKey, nonce=random[20..32], AAD=session_id 清零的 ClientHello) → ct(16)+tag(16)=**32B** 填满字段。
 //! - 服务端临时证书校验 = HMAC-SHA512(AuthKey, cert.ed25519_pubkey) == cert.signature（不走 CA 链）。
 
+use crate::shared::ClientError;
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
-use crate::shared::ClientError;
 use hkdf::Hkdf;
 use rand::RngCore;
 use sha2::Sha256;
@@ -68,7 +68,9 @@ impl SessionIdPlaintext {
 /// 解析 short_id（hex 字符串）→ 8B 零填充（左对齐）。空串→全零；>8 字节 / 非 hex / 奇数位 → Err。
 pub fn parse_short_id(hex: &str) -> Result<[u8; 8], ClientError> {
     if !hex.len().is_multiple_of(2) {
-        return Err(ClientError::Reality(format!("short_id hex 位数为奇数: {hex:?}")));
+        return Err(ClientError::Reality(format!(
+            "short_id hex 位数为奇数: {hex:?}"
+        )));
     }
     if hex.len() > 16 {
         return Err(ClientError::Reality(format!(
@@ -89,18 +91,34 @@ pub fn parse_short_id(hex: &str) -> Result<[u8; 8], ClientError> {
 /// nonce=ClientHello.random[20..32]，AAD=session_id 清零的 ClientHello handshake message，明文 16B
 /// → ct(16)+tag(16)=**32B**。中文要点(已查证 Xray-core,见 ADR-0008/findings)：用 AES-128 或截断 key
 /// 会让 sing-box 静默拒绝并回落 decoy。
-pub fn seal_session_id(auth_key: &[u8; 32], plaintext: &[u8; 16], nonce: &[u8; 12], aad: &[u8]) -> [u8; 32] {
+pub fn seal_session_id(
+    auth_key: &[u8; 32],
+    plaintext: &[u8; 16],
+    nonce: &[u8; 12],
+    aad: &[u8],
+) -> [u8; 32] {
     use aes_gcm::KeyInit;
     let cipher = Aes256Gcm::new_from_slice(auth_key).expect("32-byte AuthKey");
     let out = cipher
-        .encrypt(Nonce::from_slice(nonce), Payload { msg: plaintext, aad })
+        .encrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .expect("AES-256-GCM encrypt is infallible for valid key/nonce");
     out.try_into()
         .expect("16B plaintext + 16B tag = 32B sealed session_id")
 }
 
 /// 「服务端视角」解封 session_id（也用于离线 round-trip 自检）：解密失败(认证不过)→ None。
-pub fn open_session_id(auth_key: &[u8; 32], sealed: &[u8; 32], nonce: &[u8; 12], aad: &[u8]) -> Option<[u8; 16]> {
+pub fn open_session_id(
+    auth_key: &[u8; 32],
+    sealed: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+) -> Option<[u8; 16]> {
     use aes_gcm::KeyInit;
     let cipher = Aes256Gcm::new_from_slice(auth_key).ok()?;
     let pt = cipher
@@ -156,10 +174,18 @@ mod tests {
         r2[0] = 2;
         let k1 = derive_auth_key(&ss, &r1);
         assert_eq!(k1, derive_auth_key(&ss, &r1), "确定性");
-        assert_ne!(k1, derive_auth_key(&ss, &r2), "salt(random[0..20]) 变 → key 变");
+        assert_ne!(
+            k1,
+            derive_auth_key(&ss, &r2),
+            "salt(random[0..20]) 变 → key 变"
+        );
         let mut r3 = r1;
         r3[25] = 9; // 仅改 random[20..]，不在 salt 范围
-        assert_eq!(k1, derive_auth_key(&ss, &r3), "random[20..] 不进 salt → key 不变");
+        assert_eq!(
+            k1,
+            derive_auth_key(&ss, &r3),
+            "random[20..] 不进 salt → key 不变"
+        );
     }
 
     /// session_id 明文 16B 布局 round-trip。
@@ -186,7 +212,10 @@ mod tests {
             parse_short_id("0123456789abcdef").unwrap(),
             [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]
         );
-        assert!(parse_short_id("0123456789abcdef00").is_err(), ">8 字节应拒绝");
+        assert!(
+            parse_short_id("0123456789abcdef00").is_err(),
+            ">8 字节应拒绝"
+        );
         assert!(parse_short_id("xy").is_err(), "非 hex 应拒绝");
         assert!(parse_short_id("abc").is_err(), "奇数位应拒绝");
     }
@@ -206,7 +235,11 @@ mod tests {
             None,
             "篡改 AAD → 认证失败"
         );
-        assert_eq!(open_session_id(&[1u8; 32], &sealed, &nonce, aad), None, "错 key → 失败");
+        assert_eq!(
+            open_session_id(&[1u8; 32], &sealed, &nonce, aad),
+            None,
+            "错 key → 失败"
+        );
     }
 
     /// verify_server_cert：HMAC-SHA512 命中/失配/长度异常不 panic。
@@ -222,6 +255,9 @@ mod tests {
         assert!(verify_server_cert(&key, &pubkey, &sig), "正确 HMAC 命中");
         assert!(!verify_server_cert(&key, &pubkey, &[0u8; 64]), "错签名失配");
         assert!(!verify_server_cert(&key, &pubkey, &[]), "空签名不 panic");
-        assert!(!verify_server_cert(&[1u8; 32], &pubkey, &sig), "错 key 失配");
+        assert!(
+            !verify_server_cert(&[1u8; 32], &pubkey, &sig),
+            "错 key 失配"
+        );
     }
 }

@@ -1,4 +1,7 @@
 /target
+/third_party/*/target
+/third_party/*/Cargo.lock
+/third_party/*/.cargo-ok
 
 .DS_Store
 

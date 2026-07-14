@@ -37,6 +37,9 @@ const DEFAULT_TUIC_CA_PATH: &str = "cert.pem";
 const DEFAULT_TUIC_CC: &str = "cubic";
 const DEFAULT_TUIC_UDP_MODE: &str = "native";
 const DEFAULT_TUIC_MTU_POLICY: &str = "default";
+const DEFAULT_TUIC_GSO_POLICY: &str = "enabled";
+const DEFAULT_TUIC_UDP_SEND_SERVICE: &str = "quinn";
+const DEFAULT_TUIC_PACING_POLICY: &str = "quinn";
 const MIN_TUIC_TCP_POOL: usize = 1;
 // Knife14cd/dq: keep TCP control/data streams separated by default. Pool=1
 // remains an explicit A/B knob, but one high pool=1 run was not stable evidence.
@@ -99,6 +102,16 @@ pub struct TuicClientConfig {
     /// QUIC MTU policy. `default` keeps the production 1280 + PLPMTUD behavior; `safe1200`
     /// is a bounded diagnostic/product profile for problematic paths.
     pub mtu_policy: String,
+    /// Quinn UDP segmentation-offload policy. Enabled preserves the production default;
+    /// disabled is an explicit packet-burst tracer-bullet profile.
+    pub gso_policy: String,
+    /// Aggregate client-endpoint UDP send service. `quinn` preserves the production path;
+    /// `bounded` installs the fixed 48 wire-datagram / 2ms tracer profile.
+    pub udp_send_service: String,
+    /// Quinn pacing profile. `quinn` preserves the exact upstream default; `pacer-cap64`
+    /// bounds each connection's stored pacer tokens; `endpoint-window-v1` installs the
+    /// endpoint-owned aggregate byte service.
+    pub pacing_policy: String,
     pub tcp_pool: usize,
     /// QUIC connection stats logging interval. `None` keeps normal runtime quiet; acceptance
     /// enables it through `MINI_VPN_TCP_DIAG=1`, or explicitly via
@@ -121,6 +134,9 @@ impl std::fmt::Debug for TuicClientConfig {
             .field("congestion_control", &self.congestion_control)
             .field("udp_relay_mode", &self.udp_relay_mode)
             .field("mtu_policy", &self.mtu_policy)
+            .field("gso_policy", &self.gso_policy)
+            .field("udp_send_service", &self.udp_send_service)
+            .field("pacing_policy", &self.pacing_policy)
             .field("tcp_pool", &self.tcp_pool)
             .field("quic_stats_secs", &self.quic_stats_secs)
             .field("zero_rtt", &self.zero_rtt)
@@ -173,6 +189,9 @@ impl TuicClientConfig {
             congestion_control: DEFAULT_TUIC_CC.to_string(),
             udp_relay_mode: DEFAULT_TUIC_UDP_MODE.to_string(),
             mtu_policy: DEFAULT_TUIC_MTU_POLICY.to_string(),
+            gso_policy: DEFAULT_TUIC_GSO_POLICY.to_string(),
+            udp_send_service: DEFAULT_TUIC_UDP_SEND_SERVICE.to_string(),
+            pacing_policy: DEFAULT_TUIC_PACING_POLICY.to_string(),
             tcp_pool: DEFAULT_TUIC_TCP_POOL,
             quic_stats_secs: None,
             // 默认关：quinn 0.10 在 0-RTT 阶段不支持 export_keying_material（TUIC auth 必失败回落）。
@@ -201,6 +220,13 @@ impl TuicClientConfig {
             cfg.mtu_policy,
             g("MINI_VPN_TUIC_MTU_MODE").or_else(|| g("MINI_VPN_TUIC_MTU_POLICY")),
         );
+        cfg.gso_policy = override_field(
+            cfg.gso_policy,
+            g("MINI_VPN_TUIC_GSO_POLICY").or_else(|| g("MINI_VPN_TUIC_GSO")),
+        );
+        cfg.udp_send_service =
+            override_field(cfg.udp_send_service, g("MINI_VPN_TUIC_UDP_SEND_SERVICE"));
+        cfg.pacing_policy = override_field(cfg.pacing_policy, g("MINI_VPN_TUIC_PACING_POLICY"));
         cfg.tcp_pool = parse_tcp_pool(g("MINI_VPN_TUIC_TCP_POOL").as_deref());
         cfg.quic_stats_secs = parse_quic_stats_secs(
             g("MINI_VPN_TUIC_QUIC_STATS_SECS").as_deref(),
@@ -2501,6 +2527,13 @@ struct QuicStatsSnapshot {
     udp_rx_bytes: u64,
     datagram_max: Option<usize>,
     datagram_send_buffer_space: usize,
+    pacing_uncapped_capacity_bytes: u64,
+    pacing_capacity_bytes: u64,
+    pacing_tokens_bytes: u64,
+    current_mtu: u16,
+    pacing_mtu: u16,
+    pacing_cap_active: bool,
+    pacing_delay_events: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -2582,7 +2615,8 @@ fn format_quic_stats_line(conn_index: usize, stable_id: usize, stats: QuicStatsS
          tx_blocked(data={},stream={},streams_bidi={},streams_uni={}) \
          rx_blocked(data={},stream={}) tx_window(max_data={},max_stream_data={}) \
          rx_window(max_data={},max_stream_data={}) udp_tx={}/{}B udp_rx={}/{}B \
-         dg_max={:?} dg_space={}B",
+         dg_max={:?} dg_space={}B \
+         pacing(uncapped={},capacity={},tokens={},current_mtu={},pacing_mtu={},cap_active={},delay_events={})",
         stats.rtt_ms,
         stats.cwnd,
         stats.lost_packets,
@@ -2610,7 +2644,14 @@ fn format_quic_stats_line(conn_index: usize, stable_id: usize, stats: QuicStatsS
         stats.udp_rx_datagrams,
         stats.udp_rx_bytes,
         stats.datagram_max,
-        stats.datagram_send_buffer_space
+        stats.datagram_send_buffer_space,
+        stats.pacing_uncapped_capacity_bytes,
+        stats.pacing_capacity_bytes,
+        stats.pacing_tokens_bytes,
+        stats.current_mtu,
+        stats.pacing_mtu,
+        stats.pacing_cap_active,
+        stats.pacing_delay_events,
     )
 }
 
@@ -3080,6 +3121,13 @@ fn quic_stats_snapshot(conn: &Connection) -> QuicStatsSnapshot {
         udp_rx_bytes: stats.udp_rx.bytes,
         datagram_max: conn.max_datagram_size(),
         datagram_send_buffer_space: conn.datagram_send_buffer_space(),
+        pacing_uncapped_capacity_bytes: stats.path.pacing_uncapped_capacity_bytes,
+        pacing_capacity_bytes: stats.path.pacing_capacity_bytes,
+        pacing_tokens_bytes: stats.path.pacing_tokens_bytes,
+        current_mtu: stats.path.current_mtu,
+        pacing_mtu: stats.path.pacing_mtu,
+        pacing_cap_active: stats.path.pacing_cap_active,
+        pacing_delay_events: stats.path.pacing_delay_events,
     }
 }
 
@@ -3118,6 +3166,174 @@ fn spawn_quic_stats_logger(
                         "{}",
                         format_quic_stats_line(conn_index, stable_id, quic_stats_snapshot(&conn))
                     );
+                    if let Some(stats) = conn.endpoint_pacing_snapshot() {
+                        println!(
+                            "{}",
+                            format_endpoint_pacing_connection_stats_line(
+                                conn_index,
+                                stable_id,
+                                stats,
+                            )
+                        );
+                    }
+                }
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn format_endpoint_pacing_connection_stats_line(
+    conn_index: usize,
+    stable_id: usize,
+    stats: quinn::EndpointPacingConnectionSnapshot,
+) -> String {
+    format!(
+        "📊 TUIC endpoint pacing conn={conn_index} id={stable_id} handle={} generation={} \
+         attached={} live={}B outstanding={}B grants(bulk={}B,control={}B) \
+         turns={} waits={} max_service_gap={}us",
+        stats.connection_handle,
+        stats.path_generation,
+        stats.attached,
+        stats.live_reservation_bytes,
+        stats.outstanding_bytes,
+        stats.granted_bulk_bytes,
+        stats.granted_control_bytes,
+        stats.turn_count,
+        stats.wait_count,
+        stats.max_service_gap_nanos / 1_000,
+    )
+}
+
+fn format_endpoint_pacing_stats_line(stats: quinn::EndpointPacingSnapshot) -> String {
+    format!(
+        "📊 TUIC endpoint pacing global config(rate={}B/s,burst={}B,control_reserve={}B,quantum={}B) \
+         conservation(available={}B,live={}B,outstanding={}B,records={}) \
+         grants={}/{}B refunds={}/{}B sent={}/{}B abandoned={}/{}B \
+         outstanding_high_water={}B would_block(events={},high_water={}B) \
+         delay(events={},max={}us) fairness_lead_high_water={}B \
+         waiters(control={},bulk={},high_water={}) lifecycle(cancel={},migrate={},detach={}) \
+         stale_wakers={} stateless(sent={},dropped={})",
+        stats.rate_bytes_per_second,
+        stats.burst_bytes,
+        stats.control_reserve_bytes,
+        stats.connection_quantum_bytes,
+        stats.available_tokens,
+        stats.live_reservation_bytes,
+        stats.outstanding_bytes,
+        stats.connection_records,
+        stats.granted_datagrams,
+        stats.granted_bytes,
+        stats.refund_events,
+        stats.refunded_bytes,
+        stats.sent_datagrams,
+        stats.sent_bytes,
+        stats.abandoned_datagrams,
+        stats.abandoned_bytes,
+        stats.outstanding_bytes_high_water,
+        stats.socket_would_block_events,
+        stats.socket_would_block_outstanding_high_water,
+        stats.endpoint_delay_events,
+        stats.max_endpoint_delay_nanos / 1_000,
+        stats.fairness_lead_high_water_bytes,
+        stats.control_waiters,
+        stats.bulk_waiters,
+        stats.waiter_high_water,
+        stats.cancellations,
+        stats.migrations,
+        stats.detaches,
+        stats.stale_waker_events,
+        stats.stateless_responses_sent,
+        stats.stateless_responses_dropped,
+    )
+}
+
+fn spawn_endpoint_pacing_stats_logger(
+    endpoint: Endpoint,
+    interval_secs: u64,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let Some(stats) = endpoint.endpoint_pacing_snapshot() else {
+                        break;
+                    };
+                    println!("{}", format_endpoint_pacing_stats_line(stats));
+                }
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn format_udp_send_service_stats_line(stats: quic::QuicUdpSendServiceSnapshot) -> String {
+    let mean_payload_bytes = stats
+        .accepted_bytes
+        .checked_div(stats.accepted_datagrams)
+        .unwrap_or(0);
+    let mean_rearm_period_us = if stats.cooldown_rearms == 0 {
+        0.0
+    } else {
+        stats.service_elapsed_ns as f64 / stats.cooldown_rearms as f64 / 1_000.0
+    };
+    let total_rearm_lateness_us = stats.total_rearm_lateness_ns as f64 / 1_000.0;
+    let mean_rearm_lateness_us = if stats.cooldown_rearms == 0 {
+        0.0
+    } else {
+        total_rearm_lateness_us / stats.cooldown_rearms as f64
+    };
+    let max_rearm_lateness_us = stats.max_rearm_lateness_ns as f64 / 1_000.0;
+    format!(
+        "📊 QUIC UDP send service accepted={}/{}B service_elapsed_ms={:.3} \
+         service_rate={}dg/s/{}B/s mean_payload={}B batch_closes={} timer_blocked_polls={} \
+         gate_would_block={} cooldown_rearms={} mean_rearm_period_us={:.3} \
+         rearm_lateness_us(total={:.3},mean={:.3},max={:.3}) wasted_datagrams={} \
+         inner_would_block={} inner_errors={} invalid_transmits={}",
+        stats.accepted_datagrams,
+        stats.accepted_bytes,
+        stats.service_elapsed_ns as f64 / 1_000_000.0,
+        stats.accepted_datagrams_per_sec,
+        stats.accepted_bytes_per_sec,
+        mean_payload_bytes,
+        stats.batch_closes,
+        stats.timer_blocked_polls,
+        stats.gate_would_block,
+        stats.cooldown_rearms,
+        mean_rearm_period_us,
+        total_rearm_lateness_us,
+        mean_rearm_lateness_us,
+        max_rearm_lateness_us,
+        stats.wasted_datagrams,
+        stats.inner_would_block,
+        stats.inner_errors,
+        stats.invalid_transmits,
+    )
+}
+
+fn spawn_udp_send_service_stats_logger(
+    stats: quic::QuicUdpSendServiceStats,
+    interval_secs: u64,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    println!("{}", format_udp_send_service_stats_line(stats.snapshot()));
                 }
                 changed = stop_rx.changed() => {
                     if changed.is_err() || *stop_rx.borrow() {
@@ -3232,14 +3448,43 @@ impl TuicUpstream {
                 cfg.mtu_policy
             );
         }
+        let (gso_policy, gso_fell_back) = quic::parse_gso_policy(Some(&cfg.gso_policy));
+        if gso_fell_back {
+            println!(
+                "⚠️ TUIC 未知 gso_policy={:?}，回落 enabled（Quinn 生产默认）",
+                cfg.gso_policy
+            );
+        }
+        let (udp_send_service, udp_send_service_fell_back) =
+            quic::parse_udp_send_service_policy(Some(&cfg.udp_send_service));
+        if udp_send_service_fell_back {
+            println!(
+                "⚠️ TUIC 未知 udp_send_service={:?}，回落 quinn（生产默认）",
+                cfg.udp_send_service
+            );
+        }
+        let (pacing_policy, pacing_policy_fell_back) =
+            quic::parse_pacing_policy(Some(&cfg.pacing_policy));
+        if pacing_policy_fell_back {
+            println!(
+                "⚠️ TUIC 未知 pacing_policy={:?}，回落 quinn（生产默认）",
+                cfg.pacing_policy
+            );
+        }
+        quic::validate_quic_send_policies(pacing_policy, udp_send_service)
+            .map_err(ClientError::InvalidTarget)?;
         let qcfg = quic::client_quic_config_alpn(
             &cfg.ca_path,
             vec![cfg.alpn.as_bytes().to_vec()],
             cc,
             mtu_policy,
+            gso_policy,
+            pacing_policy,
         )
         .map_err(ClientError::InvalidTarget)?;
-        let endpoint = quic::client_endpoint(qcfg).map_err(ClientError::InvalidTarget)?;
+        let (endpoint, udp_send_service_stats) =
+            quic::client_endpoint_with_udp_send_service(qcfg, udp_send_service, pacing_policy)
+                .map_err(ClientError::InvalidTarget)?;
         let conn = Self::handshake(
             &endpoint,
             cfg.server,
@@ -3257,8 +3502,11 @@ impl TuicUpstream {
         );
         // 刀3.5：打实际生效的 CC + relay mode，供 acceptance 确认 BBR/quic 真装上（A/B 归因）。
         println!(
-            "🧭 TUIC 拥塞控制器={cc:?} | UDP relay mode={udp_relay_mode:?} | QUIC MTU policy={}",
-            mtu_policy.label()
+            "🧭 TUIC 拥塞控制器={cc:?} | UDP relay mode={udp_relay_mode:?} | QUIC MTU policy={} | QUIC GSO policy={} | QUIC UDP send service={} | QUIC pacing policy={}",
+            mtu_policy.label(),
+            gso_policy.label(),
+            udp_send_service.label(),
+            pacing_policy.label(),
         );
         println!(
             "🪟 QUIC flow windows: bidi={} uni={} stream_rx={}B conn_rx={}B send={}B",
@@ -3268,6 +3516,9 @@ impl TuicUpstream {
             quic::quic_receive_window_bytes(mtu_policy),
             quic::QUIC_SEND_WINDOW_BYTES
         );
+        if let Some(stats) = endpoint.endpoint_pacing_snapshot() {
+            println!("{}", format_endpoint_pacing_stats_line(stats));
+        }
         let tcp_pool = cfg.tcp_pool.clamp(MIN_TUIC_TCP_POOL, MAX_TUIC_TCP_POOL);
         let mut conns = Vec::with_capacity(tcp_pool);
         let quic_stats_stop = cfg.quic_stats_secs.map(|_| watch::channel(false).0);
@@ -3275,6 +3526,12 @@ impl TuicUpstream {
             println!("🔬 TUIC QUIC stats 已启用：每 {secs}s 打印连接级 flow/congestion 指标");
             if let Some(stop) = &quic_stats_stop {
                 spawn_quic_stats_logger(conn.clone(), 0, secs, stop.subscribe());
+                if endpoint.endpoint_pacing_snapshot().is_some() {
+                    spawn_endpoint_pacing_stats_logger(endpoint.clone(), secs, stop.subscribe());
+                }
+                if let Some(stats) = udp_send_service_stats.clone() {
+                    spawn_udp_send_service_stats_logger(stats, secs, stop.subscribe());
+                }
             }
         }
         conns.push(Mutex::new(conn));
@@ -4246,6 +4503,9 @@ mod tests {
         assert_eq!(c.alpn, "h3"); // default
         assert_eq!(c.congestion_control, "cubic"); // 刀3.5 实测裁决：datagram 路径 Cubic 优于 BBR
         assert_eq!(c.udp_relay_mode, "native");
+        assert_eq!(c.gso_policy, "enabled");
+        assert_eq!(c.udp_send_service, "quinn");
+        assert_eq!(c.pacing_policy, "quinn");
         assert_eq!(c.tcp_pool, 2);
         assert_eq!(c.quic_stats_secs, None);
         assert!(
@@ -4908,6 +5168,13 @@ mod tests {
                 udp_rx_bytes: 17,
                 datagram_max: Some(1375),
                 datagram_send_buffer_space: 18,
+                pacing_uncapped_capacity_bytes: 307_200,
+                pacing_capacity_bytes: 76_800,
+                pacing_tokens_bytes: 65_536,
+                current_mtu: 1_375,
+                pacing_mtu: 1_200,
+                pacing_cap_active: true,
+                pacing_delay_events: 25,
             },
         );
         assert!(line.contains("conn=2"), "{line}");
@@ -4932,6 +5199,48 @@ mod tests {
         );
         assert!(line.contains("dg_max=Some(1375)"), "{line}");
         assert!(line.contains("dg_space=18B"), "{line}");
+        assert!(line.contains("current_mtu=1375"), "{line}");
+        assert!(line.contains("pacing_mtu=1200"), "{line}");
+        assert!(
+            line.contains(
+                "pacing(uncapped=307200,capacity=76800,tokens=65536,current_mtu=1375,pacing_mtu=1200,cap_active=true,delay_events=25)"
+            ),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn format_udp_send_service_stats_line_includes_actual_service_timing() {
+        let line = format_udp_send_service_stats_line(quic::QuicUdpSendServiceSnapshot {
+            accepted_bytes: 512_000,
+            accepted_datagrams: 400,
+            accepted_bytes_per_sec: 25_600_000,
+            accepted_datagrams_per_sec: 20_000,
+            service_elapsed_ns: 20_000_000,
+            gate_would_block: 3,
+            batch_closes: 9,
+            timer_blocked_polls: 10,
+            cooldown_rearms: 8,
+            total_rearm_lateness_ns: 4_000_000,
+            max_rearm_lateness_ns: 1_500_000,
+            wasted_datagrams: 7,
+            inner_would_block: 2,
+            inner_errors: 1,
+            invalid_transmits: 0,
+        });
+
+        assert!(
+            line.contains("service_rate=20000dg/s/25600000B/s"),
+            "{line}"
+        );
+        assert!(line.contains("mean_payload=1280B"), "{line}");
+        assert!(line.contains("batch_closes=9"), "{line}");
+        assert!(line.contains("timer_blocked_polls=10"), "{line}");
+        assert!(line.contains("mean_rearm_period_us=2500.000"), "{line}");
+        assert!(
+            line.contains("rearm_lateness_us(total=4000.000,mean=500.000,max=1500.000)"),
+            "{line}"
+        );
     }
 
     #[test]
@@ -6249,6 +6558,8 @@ mod tests {
                 vec![b"h3".to_vec()],
                 crate::quic::CcChoice::Bbr,
                 crate::quic::MtuPolicy::Default,
+                crate::quic::QuicGsoPolicy::Enabled,
+                crate::quic::QuicPacingPolicy::QuinnDefault,
             )
             .is_ok()
         );

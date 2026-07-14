@@ -59,11 +59,7 @@ impl LoopProfileSnapshot {
 /// `num/den` 比例，`den<=0` → 0（挡除零 + 空周期）。结果不 clamp（调用方按语义处理）。
 fn ratio(num: Duration, den: Duration) -> f64 {
     let d = den.as_secs_f64();
-    if d <= 0.0 {
-        0.0
-    } else {
-        num.as_secs_f64() / d
-    }
+    if d <= 0.0 { 0.0 } else { num.as_secs_f64() / d }
 }
 
 use crate::client_tun::MetricsSink;
@@ -290,7 +286,10 @@ mod tests {
         assert_eq!(snap.iters, 1);
         assert!(snap.poll_fraction() > 0.5, "poll 应主导: {snap:?}");
         assert!(snap.poll_fraction() > snap.relay_fraction(), "{snap:?}");
-        assert!(snap.loop_active_fraction() > 0.5, "park 小→active 高: {snap:?}");
+        assert!(
+            snap.loop_active_fraction() > 0.5,
+            "park 小→active 高: {snap:?}"
+        );
         assert!(snap.park_fraction() < 0.3, "park 小: {snap:?}");
     }
 

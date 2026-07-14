@@ -11,7 +11,8 @@ usage: scripts/knife14h10d16-singbox-control.sh [--profile historical|gate-align
        scripts/knife14h10d16-singbox-control.sh --self-test
 
 Run on the Client VPS as root (normally through sudo -E) after sourcing .env.
-Both profiles run one 20s reverse P1 through a target-only sing-box TUN:
+Both profiles run one 20s P1 through a target-only sing-box TUN. Set
+CONTROL_DIRECTION=forward for a forward discriminator; the default is reverse:
   historical:   MTU1500 + BBR, retained as a diagnostic comparison only.
   gate-aligned: MTU1200 + Cubic, matching the approved mini_vpn Gate A shape.
 Only gate-aligned receiver throughput above 150 Mbit/s with zero client and
@@ -142,6 +143,21 @@ passing_profile_outcome() {
   esac
 }
 
+control_iperf_direction_args() {
+  case "$1" in
+    reverse)
+      printf '%s\n' "-R"
+      ;;
+    forward)
+      printf '\n'
+      ;;
+    *)
+      echo "ERROR: unsupported control direction: $1" >&2
+      return 1
+      ;;
+  esac
+}
+
 receiver_above_floor() {
   python3 - "$1" "$2" <<'PY'
 import sys
@@ -150,7 +166,7 @@ PY
 }
 
 self_test() {
-  local gate_aligned gate_outcome historical historical_outcome rendered summary socket
+  local forward_args gate_aligned gate_outcome historical historical_outcome rendered reverse_args summary socket
 
   historical="$(control_profile_fields historical)"
   [[ "$historical" == "profile=historical-mtu1500-bbr-reverse-p1 mtu=1500 cc=bbr authorization=diagnostic-only" ]] || {
@@ -172,6 +188,20 @@ self_test() {
     echo "control self-test failed: gate-aligned authorization outcome" >&2
     return 1
   }
+  reverse_args="$(control_iperf_direction_args reverse)"
+  [[ "$reverse_args" == "-R" ]] || {
+    echo "control self-test failed: reverse iperf direction" >&2
+    return 1
+  }
+  forward_args="$(control_iperf_direction_args forward)"
+  [[ -z "$forward_args" ]] || {
+    echo "control self-test failed: forward iperf direction" >&2
+    return 1
+  }
+  if control_iperf_direction_args invalid >/dev/null 2>&1; then
+    echo "control self-test failed: invalid iperf direction accepted" >&2
+    return 1
+  fi
   if control_profile_fields invalid >/dev/null 2>&1; then
     echo "control self-test failed: invalid profile accepted" >&2
     return 1
@@ -290,6 +320,10 @@ readonly CONTROL_PROFILE_LABEL="$(field_value "$PROFILE_FIELDS" profile)"
 readonly CONTROL_MTU="$(field_value "$PROFILE_FIELDS" mtu)"
 readonly CONTROL_CC="$(field_value "$PROFILE_FIELDS" cc)"
 readonly PROFILE_AUTHORIZATION="$(field_value "$PROFILE_FIELDS" authorization)"
+readonly CONTROL_DIRECTION="${CONTROL_DIRECTION:-reverse}"
+CONTROL_IPERF_DIRECTION_ARG="$(control_iperf_direction_args "$CONTROL_DIRECTION")" || exit 64
+readonly CONTROL_IPERF_DIRECTION_ARG
+readonly CONTROL_RUN_LABEL="${CONTROL_PROFILE_LABEL%-reverse-p1}-${CONTROL_DIRECTION}-p1"
 readonly CONTROL_IF="${CONTROL_IF:-sb-d16-control}"
 readonly TARGET="${TARGET:-43.130.32.77}"
 readonly DURATION=20
@@ -366,8 +400,8 @@ RUNTIME_DIR="$(mktemp -d /tmp/mini_vpn-h10d16-control-runtime.XXXXXX)"
 CONFIG_FIFO="$RUNTIME_DIR/config.fifo"
 REPORT="$ARTIFACT_DIR/report.txt"
 CLIENT_LOG="$ARTIFACT_DIR/sing-box-client.log"
-IPERF_JSON="$ARTIFACT_DIR/iperf3-reverse-20s.json"
-DIRECT_JSON="$ARTIFACT_DIR/direct-reverse.json"
+IPERF_JSON="$ARTIFACT_DIR/iperf3-${CONTROL_DIRECTION}-20s.json"
+DIRECT_JSON="$ARTIFACT_DIR/direct-${CONTROL_DIRECTION}.json"
 CLIENT_SS="$ARTIFACT_DIR/client-udp-ss.txt"
 SERVER_SS="$ARTIFACT_DIR/server-udp-ss.txt"
 mkdir -p "$ARTIFACT_DIR"
@@ -440,15 +474,20 @@ else
 fi
 append "runner_sha256=$(sha256_file "$SCRIPT_PATH")"
 append "sing_box_sha256=$(sha256_file "$SING_BOX_BIN")"
-append "profile=$CONTROL_PROFILE_LABEL duration_secs=$DURATION parallel=$PARALLEL"
+append "profile=$CONTROL_RUN_LABEL duration_secs=$DURATION parallel=$PARALLEL direction=$CONTROL_DIRECTION"
 append "target=$TARGET exit=$TUIC_SERVER_HOST mtu=$CONTROL_MTU cc=$CONTROL_CC floor_mbps=$CONTROL_FLOOR_MBPS gate_a_role=$PROFILE_AUTHORIZATION"
 append "credentials=piped-via-mode-0600-fifo config_persisted=0"
 "$SING_BOX_BIN" version | head -3 | tee -a "$REPORT"
 
-append "direct_reverse_preflight=running"
-iperf3 -c "$TARGET" -p "$IPERF_PORT" -t "$DIRECT_DURATION" -P 1 -R --json > "$DIRECT_JSON"
+IPERF_DIRECTION_ARGS=()
+if [[ -n "$CONTROL_IPERF_DIRECTION_ARG" ]]; then
+  IPERF_DIRECTION_ARGS+=("$CONTROL_IPERF_DIRECTION_ARG")
+fi
+
+append "direct_${CONTROL_DIRECTION}_preflight=running"
+iperf3 -c "$TARGET" -p "$IPERF_PORT" -t "$DIRECT_DURATION" -P 1 "${IPERF_DIRECTION_ARGS[@]}" --json > "$DIRECT_JSON"
 DIRECT_SUMMARY="$(parse_iperf_summary < "$DIRECT_JSON")"
-append "direct_${DIRECT_SUMMARY//$'\n'/ }"
+append "direct_${CONTROL_DIRECTION}_${DIRECT_SUMMARY//$'\n'/ }"
 
 sysctl -q -w net.core.rmem_max="$SOCKET_TARGET_BYTES" >/dev/null
 sysctl -q -w net.core.wmem_max="$SOCKET_TARGET_BYTES" >/dev/null
@@ -494,7 +533,7 @@ if grep -qw "$CONTROL_IF" <<<"$EXIT_ROUTE"; then
 fi
 append "route_assertion=passed-target-only"
 
-iperf3 -c "$TARGET" -p "$IPERF_PORT" -t "$DURATION" -P "$PARALLEL" -R --json > "$IPERF_JSON" &
+iperf3 -c "$TARGET" -p "$IPERF_PORT" -t "$DURATION" -P "$PARALLEL" "${IPERF_DIRECTION_ARGS[@]}" --json > "$IPERF_JSON" &
 IPERF_PID=$!
 for _ in $(seq 1 10); do
   ss -u -a -m -n -p 2>/dev/null | grep -A2 ":$TUIC_SERVER_PORT" > "$CLIENT_SS" || true

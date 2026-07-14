@@ -63,9 +63,9 @@ const DOH_IPS: &[Ipv4Addr] = &[
 /// 不命中(防裸后缀匹配误中,如 `notdns.google` 不应中 `dns.google`)。
 pub fn is_doh_domain(domain: &str) -> bool {
     let d = domain.trim_end_matches('.').to_ascii_lowercase();
-    DOH_DOMAINS.iter().any(|&doh| {
-        d == doh || d.strip_suffix(doh).is_some_and(|p| p.ends_with('.'))
-    })
+    DOH_DOMAINS
+        .iter()
+        .any(|&doh| d == doh || d.strip_suffix(doh).is_some_and(|p| p.ends_with('.')))
 }
 
 /// IP 是否命中 DoH bootstrap 名单。

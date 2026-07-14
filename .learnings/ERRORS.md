@@ -1,5 +1,216 @@
 # Errors
 
+## 2026-07-13 - Endpoint integration gates need crate-local commands and exact test selection
+
+- Root `cargo test -p quinn --lib` and `cargo test -p quinn-proto` failed
+  because mini_vpn is not a Cargo workspace containing those packages. Test
+  quinn-proto from its vendored manifest and test Quinn from an isolated exact
+  source copy with the local proto patch explicitly configured.
+- The first isolated Quinn attempt silently selected registry
+  `quinn-proto 0.11.15` from its lockfile, so the new API was missing. Require
+  `cargo tree`/build output to show the intended local `0.11.16` path and pass
+  `patch.crates-io.quinn-proto.path` explicitly.
+- A focused command using `--exact` without the full module path ran zero
+  tests. Use the listed fully qualified name or an unambiguous substring and
+  require the summary to report at least one executed test.
+- Reusable rule: package selection, dependency provenance, and executed test
+  count are separate gates; exit code zero alone proves none of them.
+
+## 2026-07-13 - Endpoint repair attempts exposed three avoidable local hazards
+
+- Removing the test-only-looking `ReservationCharge::None` variant broke
+  generic RAII matches in non-test code, and converting off-path path challenge
+  handling to `Result<Option<_>, _>` initially left two stale `return None`
+  branches. Make warning cleanups only after tracing every cfg and return type;
+  rerun the entire vendored suite, not just the new module.
+- A proposed control-vs-bulk liveness RED was invalid because a real socket
+  outcome is allowed to wake the parked peer before the control waiter
+  re-registers. Do not change scheduling to satisfy a false ordering
+  assumption; state the permitted wake partial order, then test continued
+  service and conservation.
+- A relative `rsync` source was resolved from `/tmp` and did not refresh the
+  isolated Quinn copy. Use an absolute repository source and verify a changed
+  file or build path before trusting the isolated result.
+
+## 2026-07-13 - Vendored test artifacts must be ignored before staging
+
+- Crate-local tests created about `1.9 GiB` of nested `target/`, plus local
+  `Cargo.lock` and `.cargo-ok` files. Root `/target` ignore rules did not cover
+  them, so an unqualified `git add third_party` could have staged generated
+  artifacts.
+- Add exact `/third_party/*/{target,Cargo.lock,.cargo-ok}` ignore rules, use an
+  external `CARGO_TARGET_DIR` for repeated vendor gates, and inspect
+  `git status --ignored` before staging a vendored dependency.
+
+## 2026-07-13 - `FxHashMap` does not re-export the standard `Entry` API
+
+- Symptom: the first keyed endpoint-outstanding implementation failed to
+  compile because it imported `rustc_hash::hash_map::Entry`.
+- Cause: `rustc_hash` exposes the `FxHashMap` alias, while the entry enum still
+  comes from `std::collections::hash_map::Entry`.
+- Correct behavior: import `FxHashMap` from `rustc_hash` and `Entry` from the
+  standard library. Keep dependency-alias APIs distinct from their underlying
+  standard collection APIs.
+
+## 2026-07-13 - `status` is a read-only zsh parameter
+
+- Symptom: an untracked-file whitespace-check loop stopped at assignment to
+  `status` even though root fmt and the preceding tracked diff-check passed.
+- Cause: zsh reserves `status` as a read-only special parameter for the last
+  command exit code.
+- Correct behavior: use an ordinary name such as `diff_exit` when preserving
+  `git diff --no-index --check`'s expected `1` result for a nonempty new file.
+  The corrected loop passed all new spec, plan, Pacer, and patch-manifest
+  files.
+
+## 2026-07-13 - Stored-token cap was mistaken for a temporal burst contract
+
+- Symptom: cap64 bound the real data connection at `64*1280` in one formal
+  snapshot, yet the P1 still peaked at `267 packets/ms`, dropped `29` TUN TX
+  packets, and added `50,621,275B` formal QUIC loss.
+- Cause: the patch intentionally preserved Quinn's refill slope. On a sub-ms
+  path, `1.25*cwnd/rtt` can replenish multiple buckets inside one millisecond;
+  limiting stored tokens alone cannot bound a wall-clock window.
+- Correct behavior: reject cap-value retries. RED the sub-ms refill case and
+  require any successor design to prove an explicit time-window/service
+  contract before implementation or VPS use.
+
+## 2026-07-13 - Unconnected Quinn sockets defeat peer-address ss sampling
+
+- Symptom: the 12-sample active socket artifact captured both Shoes endpoint
+  sockets at `drop=0` on every Exit sample but produced no client socket row.
+- Cause: the sampler searches `ss` output for the Exit peer, while Quinn owns
+  an unconnected UDP socket whose row does not contain that peer address.
+- Correct behavior: attribute the client UDP socket from the mini_vpn PID/FD
+  and local port, then snapshot that row. Do not report an empty peer-match as
+  zero client socket drops.
+
+## 2026-07-13 - Large transfer staging must be polled and secret-denied
+
+- The first source archive included tracked development private keys. It was
+  detected and deleted before upload; the replacement archive excluded PEM,
+  key, environment, service-account, target, and git material and passed an
+  explicit path scan.
+- Two initially launched SCP sessions were not polled to completion and left
+  partial `510 KiB` remote files; hash verification caught them before use.
+- Correct behavior: apply a denylist/path scan before transfer, then run and
+  poll one large transfer to completion and require a full SHA-256 match before
+  extraction or execution. Parallel fire-and-forget copy completion is not an
+  integrity proof.
+
+## 2026-07-13 - Whole-vendor rustfmt is not a valid patch gate
+
+- Symptom: `cargo fmt --manifest-path third_party/quinn-proto-0.11.16/Cargo.toml
+  -- --check` proposed broad import/order rewrites across the byte-pinned
+  crates.io source, far beyond mini_vpn's six-file Quinn patch manifest.
+- A later sequential gate repeated this invalid whole-vendor check without
+  fail-fast; the following successful test command made the compound shell
+  return zero even though formatting had failed.
+- Correct behavior: keep root `cargo fmt --all -- --check`, run the vendored
+  Quinn tests/doc tests, compare the vendored tree against the exact crates.io
+  source, format/check new standalone patch files directly, and review only
+  the manifest-listed differences. Use `set -e` or `&&` for sequential gates
+  so a later PASS cannot mask an earlier failure. Do not reformat the entire
+  pinned dependency with a different local rustfmt version.
+
+## 2026-07-13 - A rejected throughput tracer remained a mandatory library test
+
+- Symptom: after cap64 passed exact delivery, clean EOF, active attribution,
+  and `>170 Mbit/s`, the full library gate failed only because the previously
+  rejected bounded `48 then 2ms` replay still asserted `>170 Mbit/s` by
+  default.
+- Correct behavior: preserve known-negative real replays as named, ignored
+  measurement tests and run them only explicitly. Keep deterministic tests for
+  their conservation and scheduling contracts active; do not let a rejected
+  architecture's host-timing threshold veto a different accepted candidate.
+
+## 2026-07-13 - Forward-first product regression poisoned connection state and unsafe close-tail
+
+- Symptom: a fresh P1 forward window completed at `195/183 Mbit/s` but added
+  `54` TUN TX drops, about `61.3 MB` of QUIC lost bytes, and `20,983`
+  congestion events. The following reverse inherited that state, averaged
+  `136 Mbit/s`, and later reached `half_closed_idle_timeout` with `524288B`
+  still in the D16 queue plus `27736B` of active send-capable egress.
+- This is not the repaired O(active²) scheduler: local `1024/1024` and fresh
+  `60s` reverse both pass. It is not yet proven whether the forward QUIC loss
+  is mini_vpn-specific or shared by the external path/server.
+- Correct behavior: stop before spending P8/UDP/DNS/rearm, preserve per-window
+  start deltas, TDD-inhibit timeout reaping while useful ownership/drain
+  remains, and run one same-window sing-box versus mini_vpn forward
+  discriminator before selecting a QUIC change. Do not tune frozen parameters.
+
+## 2026-07-13 - reverse-first suite mode is always P1
+
+- Symptom: setting `PARALLEL_SET=8` together with
+  `RUN_REVERSE_FIRST_P1=1` still launched `-P 1`; that branch passes a literal
+  `1` to the low-RTT probe. The clean `193/191 Mbit/s` result was an extra P1,
+  not a concurrency sample.
+- Correct behavior: inspect the suite branch as well as environment output.
+  Use the `full` branch for `PARALLEL_SET`, or an explicitly bounded direct
+  probe behind a lifecycle-safe launcher. Require the report's
+  `parallel_set` and actual iperf argv to agree before counting a sample.
+
+## 2026-07-13 - Task 12 product gate exposed O(n squared) relay scheduling
+
+- Symptom: the clean `a54fb17` ignored concurrency sweep passed `64/64` and
+  `256/256` but failed `N=1024` at `733/1024` after `120s`; the relay segment
+  consumed `101.271s`, all `1024` upstream opens occurred, and remaining flows
+  fell into the `90s` idle timeout.
+- Root cause: `process_dirty_relay` calls `downlink_pressure_stats` once per
+  handle. That helper scans the dirty set and all sockets, restoring
+  O(active²) work. For frozen D16/non-buffered operation, the resulting global
+  pending value is unused by the downstream credit decision.
+- Correct behavior: put a scan-count/cost invariant under TDD, skip aggregate
+  work when buffered credit is disabled, and compute retained buffered-path
+  aggregates once per pass or incrementally. Re-run the explicit 1024 gate
+  before any VPS product regression. Do not mask the failure with a longer
+  timeout, smaller concurrency, larger pool, or a product knob change.
+- Resolution: the confirmed repair passes `1024/1024` and the local UDP/full
+  gates; the current stop is the separate forward-first failure above.
+
+## 2026-07-13 - Gate runner preflight must lock paths, auth env, and noninteractive sudo
+
+- Several repeat-3 attempts exited before mini_vpn or iperf started: the suite
+  filename is `knife14b-usclient-tunnel-suite.sh`, the executable is
+  `target/release/mini_vpn` with `client-tun` as its subcommand, a fresh SSH
+  shell must load the remote `.env`, and Exit evidence uses `EXIT_SSH_KEY`
+  rather than a generic `SSH_KEY`.
+- `.27` has NOPASSWD command authorization, but mixed sudoers entries make
+  `sudo -v` prompt for a credential. A temporary runner changed only that
+  preflight to `sudo -n true`; its binary, probe, measurement logic, and frozen
+  profile remained identical.
+- Correct behavior: before a limited gate, assert the exact suite/binary/probe
+  hashes, source the auth environment without printing it, validate both
+  dedicated SSH-key variables, use a noninteractive sudo capability check, and
+  prove there is no process/TUN/artifact before starting the sample. A
+  preflight-only exit is an orchestration failure, not a throughput sample.
+
+## 2026-07-13 - Reconstructed Shoes config omitted the Gate ALPN
+
+- Symptom: the one Task 12 Gate-aligned control had a healthy `214.494
+  Mbit/s` direct receiver, correct MTU/routes, and zero-drop full UDP sockets,
+  but iperf produced zero intervals. Both endpoints reported
+  `peer doesn't support any known protocol` during the cryptographic handshake.
+- Root cause: the ephemeral Shoes config omitted
+  `quic_settings.alpn_protocols: ["h3"]`. The client and accepted product
+  profiles require `h3`; the service was alive but its QUIC/TLS contract was
+  incomplete.
+- Correct behavior: validate explicit ALPN in the rendered in-memory config
+  before feeding FIFO-backed config/cert/key, and treat a pre-throughput
+  handshake failure as invalid setup rather than a low control. Preserve the
+  failure and do not proceed to mini_vpn repeats until the config is valid.
+  Under the user's current standing override, an evidenced configuration-only
+  fault may be corrected and rerun without another confirmation.
+
+## 2026-07-13 - Multi-file TLS FIFOs must be written concurrently
+
+- Symptom: a sequential Shoes config/cert/key feed blocked on the certificate
+  writer while the service was free to open the key FIFO first.
+- Correct behavior: start all one-shot FIFO writers concurrently, wait for all
+  of them, and require `Loaded 2 certs/keys`, `Starting 1 server`, and the UDP
+  listener before any traffic. Sequential writers are not safe when the
+  consumer controls file-open order.
+
 ## 2026-07-12 - Timed capacity probes must not impersonate clean-close gates
 
 - The Shoes run produced complete iperf JSON at `192.666 Mbit/s` with every
@@ -4137,3 +4348,150 @@ active root unless it repeats.
 - Correct behavior: use `command -v rg` and fall back to POSIX `grep`/`sed` in
   VPS evidence commands. A missing convenience tool must not be mistaken for
   an empty report.
+
+## 2026-07-13 - Temporary Shoes/TLS preflight must match both clients
+
+- Symptom: the first Shoes config omitted the required `h3` ALPN and both QUIC
+  clients failed negotiation. A later self-signed CA certificate was also used
+  directly as the server leaf; sing-box accepted it, but rustls rejected it as
+  `CaUsedAsEndEntity`.
+- Correct behavior: assert the server ALPN before launch and use a temporary CA
+  only to sign a distinct `CA:false`, server-auth leaf with the required SAN.
+  Run both client handshakes before counting a control. These were preflight
+  configuration failures and did not consume measurement samples.
+
+## 2026-07-13 - Noninteractive sudo must be explicit in remote runners
+
+- Symptom: `sudo -v` prompted even though the required commands had NOPASSWD
+  authorization, preventing an otherwise unattended suite from starting.
+- Correct behavior: when the host policy supports it, validate with `sudo -n
+  true` and fail before mini_vpn/iperf if it is unavailable. Never place a sudo
+  password in a command, log, report, or repository file.
+
+## 2026-07-13 - Active socket evidence cannot be sampled after cleanup
+
+- Symptom: the manual mini_vpn client `ss` snapshot ran after the suite had
+  already stopped the process, leaving an empty evidence file.
+- Correct behavior: have the versioned runner take client and Exit UDP socket
+  snapshots inside the active iperf interval. A post-run snapshot is useful
+  only for proving cleanup, not socket error deltas. In this run, bilateral
+  pcap bytes plus Quinn TX counters and zero tcpdump drops still located the
+  loss boundary, but the missing active client `ss` evidence must not recur.
+
+## 2026-07-13 - Cleanup process checks must not match their own shell
+
+- Symptom: a cleanup guard using `pgrep -f` matched the remote shell command
+  text containing the mini_vpn path and aborted before removing temporary
+  directories, even though no mini_vpn process remained.
+- Correct behavior: use an executable-name query such as `ps -C mini_vpn` or a
+  PID file, then separately assert TUN, route, and directory absence. Rerun the
+  idempotent cleanup and verify every final condition.
+
+## 2026-07-13 - A successful suite exit can still contain a failed gate
+
+- Symptom: the disabled-GSO forward sample completed iperf and produced a
+  bundle with exit status zero despite `30` TUN TX drops and tens of megabytes
+  of QUIC loss.
+- Root cause: the outer suite invokes standard P1 with `|| true`, and the
+  low-RTT probe reports counters but does not apply the product discriminator.
+- Correct behavior: explicit discriminator modes must propagate probe failure
+  and evaluate their own TUN/loss contract before a successful exit. Manual
+  adjudication remains authoritative until that red/green runner repair lands.
+
+## 2026-07-13 - Full-tunnel gold checks are invalid under target-only routing
+
+- Symptom: a target-only acceptance report said curl must show the Exit IP and
+  DNS must return fake-IP, then recorded the client IP and public DNS answers.
+- Root cause: only the target `/32` was routed into TUN; curl and DNS were
+  deliberately outside the measured tunnel.
+- Correct behavior: parameterize the probe's routing mode. Under target-only
+  routing, assert only target-through-TUN and Exit-bypass; label curl/fake-DNS
+  checks not applicable rather than presenting expected direct results as a
+  failed gold check.
+
+## 2026-07-13 - Large pcaps should be summarized where they were captured
+
+- Symptom: sequentially copying four 50-80 MiB pcaps over a slow control link
+  left a partial local file and delayed cleanup.
+- Correct behavior: first verify source hashes and tcpdump drop counters, then
+  run allowlisted byte/timing aggregation on the capture host. Retain the
+  sanitized report bundle and exact summaries locally; copy full pcaps only
+  when packet-level offline inspection is still required, and never accept a
+  partial destination without matching the source hash.
+
+## 2026-07-13 - Nominal 48/2ms math overstated achieved send-service capacity
+
+- Symptom: deterministic bounded-service tests passed and the real GSO-enabled
+  upload delivered exact `32 MiB` with clean EOF, but throughput was only
+  `94.172 Mbit/s` instead of the required `>170 Mbit/s`.
+- Root cause class: the implementation starts a full 2ms cooldown after each
+  exhausted batch; the capacity proof assumed a 2ms achieved batch period but
+  did not measure timer wake lateness or driver scheduling overhead.
+- Correct behavior: fail the local sufficiency gate, do not run VPS, and add
+  actual deadline/rearm/service-rate discriminators before selecting a new
+  mechanism. Do not adjust D16, MTU, pool, windows, chunk, CC, self-wake, or
+  the nominal service constants from this result alone.
+
+## 2026-07-13 - A full post-batch cooldown double-paced Quinn
+
+- Symptom: after adding actual timing counters, the same exact/clean `32 MiB`
+  upload reached only `98.311 Mbit/s`; service rate was `10,506` datagrams/s
+  versus about `17,709` required.
+- Root cause: the public socket wrapper starts a fresh `now + 2ms` cooldown
+  after batch work, on top of Quinn-proto's existing token-bucket pacing.
+  Actual batches took `4.573ms`; even removing the measured `1.340ms` timer
+  lateness leaves only about `142.5 Mbit/s` of capacity.
+- Correct behavior: stop before VPS, do not retry constants, and move the next
+  design gate to the pacing-rate/debt owner. Any dependency-level Quinn cap
+  must preserve upstream defaults and prove whether the bound is per
+  connection or aggregate across the pool.
+
+## 2026-07-13 - Do not promote a per-connection cap to an endpoint guarantee
+
+- Failure risk: describing `64 * mtu` per connection as a strict 64-wire-packet
+  or pool-wide 128-packet sliding-window bound hides ACK-only pacing semantics,
+  independent refills, auxiliary connection traffic, and migration reset.
+- Correct behavior: use paced MTU-equivalent units; require cap-active metrics,
+  `cwnd <= u32::MAX`, at least 95% data-connection attribution, and no
+  formal-window migration for the single-flow tracer. Treat P8/product
+  concurrency as necessary-only. If aggregate burst/fairness still fails,
+  stop and design a shared coordinator inside Quinn-proto before send
+  accounting; never stack another socket gate.
+
+## 2026-07-13 - A retired negative tracer broke the default library gate
+
+- Symptom: after the new pacer-cap64 gate passed at `537.106 Mbit/s`, full
+  `cargo test --lib` ended at `620 passed / 1 failed / 2 ignored`. The failure
+  was `bounded_send_service_real_loopback_upload_delivers_fixed_bytes_and_clean_eof`
+  at `101.084 Mbit/s` because it still unconditionally required `>170`.
+- Root cause: the old fixed `48 then 2ms` socket wrapper had already been
+  measured and rejected as mathematically insufficient, but its known-negative
+  real replay remained in the default regression suite as a product gate.
+- Correct behavior: stop before broader gates/VPS, review first, then make the
+  rejected replay explicit/ignored while keeping byte conservation, GSO
+  accounting, timer, no-busy-wake, and exact lifecycle tests green.
+- Review also found three pre-VPS blockers: the patched default pacer path
+  currently repeats capacity math, the runner does not export or verify
+  `MINI_VPN_TUIC_PACING_POLICY`, and periodic stats omit `current_mtu` needed
+  to compare against `pacing_mtu`.
+
+## 2026-07-13 - Pacer observations have deferred debt and MTU epochs
+
+- Symptom: an early rate test expected an already-sendable pacer to eagerly
+  refill to full; a stats test expected `current_mtu == pacing_mtu` immediately
+  after PLPMTUD advanced the path.
+- Root cause: Quinn preserves elapsed refill as deferred debt when current
+  tokens already cover the send, and the pacer updates its MTU only on its next
+  `delay()` accounting call.
+- Correct behavior: test refill from an empty bucket, expose both MTU values,
+  and require equality only in a formal active snapshot where the cap theorem
+  is claimed.
+
+## 2026-07-13 - Vendored crate targets are not covered by root /target ignore
+
+- Symptom: running the vendored Quinn suite created hundreds of MiB under
+  `third_party/quinn-proto-0.11.16/target`, which the root `/target` ignore does
+  not match.
+- Correct behavior: run `cargo clean --manifest-path` for the vendored crate
+  before handoff and verify no nested build output is left in the untracked
+  vendor tree.

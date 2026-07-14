@@ -8,6 +8,219 @@ This section overrides the older G7/G8/GV next-step text below.
 
 ### Latest accepted position (2026-07-13)
 
+- EndpointPacingService implementation and the full local Task 12 gate are
+  **PASS**. `EndpointWindowV1` installs one endpoint-owned service in pinned
+  quinn-proto and uses a thin pinned Quinn current-waker/socket-outcome
+  adapter. The fixed `30,720,000B/s`, `61,440B`, `10,240B`, and `20,480B`
+  values are unchanged; `QuinnDefault` remains the product default.
+- The real GSO-enabled exact `32 MiB` / `64 KiB` local gate delivered all
+  `33,554,432B` at `240.466 Mbit/s`, with zero pattern error, clean EOF,
+  endpoint delay activity, no bounded sender/cap64 path, and final
+  `available=61,440B`, `live=0`, `outstanding=0`, `records=0`.
+- Final local regressions pass: quinn-proto `309/309 + 3/3` docs; Quinn
+  `29/29` nonignored (`3` expected ignored) + `1/1` doc; mini_vpn `622/622`
+  nonignored (`3` expected ignored); all-target harness check; explicit
+  `64/256/1024`; zero-loss UDP sweep; root/focused-vendor fmt; runner shell
+  syntax/self-test; and diff checks.
+- Code review repaired one fail-open migration edge: an unexpected generation
+  collision now retains the old paced adapter instead of detaching pacing.
+  The focused test and affected full suites pass; no P0/P1 remains.
+- The user authorized safe in-scope repairs without repeated confirmation,
+  plus commit and VPS execution. The next actions are: commit the reviewed
+  local implementation, then run one endpoint-window-v1 VPS forward
+  acceptance under the frozen Gate profile. macOS TUN remains prohibited.
+  If the VPS `>170 Mbit/s` discriminator fails, classify architecture failure;
+  do not tune constants. Source:
+  `docs/tech/2026-07-13-knife14h10d16-endpoint-pacing-service-local-gate-results.md`.
+
+The older entries below are chronological stage history and do not override
+this position.
+
+- The user-confirmed post-cap64 design-preparation stage is complete. The
+  deterministic fake-time replay uses `RTT=200us`, `cwnd=40000B`, `MTU=1280`,
+  one driver poll per `50us`, and the real 20-datagram poll bound. Its initial
+  acceptance assertion failed exactly at `259 > 64` datagrams inside `1ms`;
+  the default vendored test now characterizes that refill mechanism.
+- A new endpoint pre-accounting architecture/capacity spec and implementation
+  plan are prepared. The fixed candidate is `30,720,000 wire B/s`, `61,440B`
+  burst, `10,240B` control reserve, and `20,480B` two-connection DRR quantum.
+  It proves `<=92,160B/1ms` and `<=368,640B/10ms` for finalized and
+  socket-accepted connection datagrams, including live reservations and
+  socket-blocked outstanding bytes, while measured wire overhead leaves
+  `239.167 Mbit/s` application capacity. Source of truth:
+  `docs/tech/2026-07-13-knife14h10d16-endpoint-pacing-service-architecture-spec.md`
+  and the sibling implementation plan.
+- Code-level decision is **GO for local TDD only after explicit confirmation
+  of that spec/plan**. The correct seam spans endpoint-shared Quinn-proto
+  policy plus a thin pinned Quinn driver waker/socket-outcome Adapter; neither
+  the per-connection Pacer nor public socket wrapper alone can prove the
+  contract. No coordinator implementation, VPS, P8, macOS TUN, commit, or
+  external notification ran. Vendored Quinn-proto `276/276` plus doc `3/3`,
+  root fmt, and tracked/untracked diff-checks passed. Frozen values and Gate
+  A/B remain unchanged.
+
+- The architecture spec's one authorized same-window forward discriminator is
+  complete and **FAIL**. The Gate-aligned sing-box control passed at
+  `192.567/191.928 Mbit/s`, target-only, with client/Exit UDP socket drops
+  `0/0`. The same Shoes PID and frozen profile then carried one fresh cap64
+  mini_vpn P1 at `196/185 Mbit/s`, `20/20` nonzero intervals, but it added
+  `29` TUN TX drops, `50,621,275B` formal QUIC loss, and `15,417` congestion
+  events. The `16 MiB` loss ceiling and zero-drop gate both failed.
+- Pool attribution was exact: conn `1` carried `99.9998%` of QUIC TX bytes and
+  `99.9961%` of datagrams, conn `0` remained auxiliary, IDs did not change,
+  flow-control blocking stayed zero, and every formal `cwnd` was far below
+  `u32::MAX`. The data Pacer did bind once at `81920B = 64*1280`, but only one
+  of five formal snapshots was cap-active.
+- Bilateral captures had zero kernel drops. mini_vpn client egress peaked at
+  `267 packets/1ms` and `1337/10ms`, versus same-window sing-box `100/605` and
+  prior Quinn-default mini_vpn `261/1259`. Code review therefore rejects the
+  stored-token cap as a sufficient temporal bound: at sub-ms RTT, Quinn's
+  retained `1.25*cwnd/rtt` refill slope can replenish multiple buckets inside
+  1ms. This is not a policy, pool, GSO, migration, extreme-cwnd, D16, or
+  stacked-sender reachability failure.
+- Task 12 step 4 remains **STOPPED before P8**. Do not retry cap constants,
+  reopen bounded `AsyncUdpSocket` cooldown/GSO-only branches, or tune D16,
+  MTU, pool, QUIC windows, chunk, Cubic, or self-wake. The proposed next work
+  is a red sub-ms refill replay plus a new architecture/capacity spec for a
+  true endpoint pre-accounting time-window/service contract; implementation
+  requires explicit confirmation. Gate A/B remain PASS. VPS cleanup is
+  complete, `.77` iperf3 remains active, and no macOS TUN, commit, or Slack
+  notification ran. Result:
+  `docs/tech/2026-07-13-knife14h10d16-pacer-cap64-forward-discriminator-results.md`.
+
+- Task 12 step 4's four confirmed P1 repairs and the full local regression gate
+  are now **PASS**. The known-negative fixed `48 then 2ms` replay is explicit
+  and ignored by default; the optional Quinn cap derives from one upstream
+  capacity computation; formal QUIC stats expose both `current_mtu` and
+  `pacing_mtu`; and the runner validates, rejects incompatible combinations,
+  propagates, reports, and independently verifies
+  `MINI_VPN_TUIC_PACING_POLICY=quinn|pacer-cap64` at startup.
+- The final local evidence is vendored Quinn `275/275` plus doc tests `3/3`;
+  GSO-enabled fixed `32 MiB` cap64 delivery at `621.573 Mbit/s` with exact
+  bytes, clean EOF, active cap/runtime attribution, and no socket sender;
+  library `620 passed / 0 failed / 3 ignored`; normal harness `10 passed / 4
+  ignored`; explicit concurrency `64/64`, `256/256`, and `1024/1024`; and the
+  UDP sweep with `500/500` at every payload size and zero loss. Default and
+  harness checks, root fmt, all three shell syntax/self-tests, and diff-check
+  passed.
+- Final code review found no open P0/P1. The existing unused
+  `SendBatch::try_reserve` warning remains in the frozen default-off bounded
+  diagnostic path and is not a product/gate failure. Gate A and Gate B remain
+  PASS. No VPS or macOS TUN ran, no commit was created, and D16, MTU, pool,
+  QUIC windows, chunk, Cubic, and self-wake remain unchanged. The next possible
+  action is the architecture spec's single same-window forward control plus
+  cap64 mini_vpn P1, but it requires a new explicit authorization. The required
+  stage-stop Slack notification was sent after local review completed.
+
+- Task 12 step 4 local implementation reached its narrow capacity gate but is
+  **STOPPED before the remaining full local regressions and before VPS** under
+  the user's repeat-failure rule. The vendored exact `quinn-proto 0.11.16`
+  suite passed `274/274`; the GSO-enabled fixed `32 MiB` / `64 KiB` local
+  upload passed exact bytes, clean EOF, and `537.106 Mbit/s`. Its active
+  snapshot proved `307200B` uncapped, `76800B = 64*1200` effective,
+  `cap_active=true`, `delay_events=12`, and `cwnd <= u32::MAX` with the old
+  bounded socket sender absent.
+- Full `cargo test --lib` stopped at `620 passed / 1 failed / 2 ignored`. The
+  sole failure is the already rejected fixed `48 then 2ms` bounded-sender
+  real replay, which still unconditionally requires `>170 Mbit/s`; it reached
+  `101.084 Mbit/s`. This is a regression-suite classification defect, not
+  evidence that pacer-cap64 missed its local gate.
+- Post-stop review found four P1 repairs required before resuming: make the
+  known-negative bounded replay explicit/ignored; derive the optional cap from
+  one upstream capacity computation so the default Quinn hot path does not
+  repeat RTT/window division; log both `current_mtu` and `pacing_mtu`; and add
+  `MINI_VPN_TUIC_PACING_POLICY` validation/export/fingerprint checks to the
+  acceptance runner. Await user confirmation before those code/script edits.
+  No VPS or macOS TUN ran; no commit was created; all frozen knobs remain
+  unchanged.
+
+- Task 12 step 4 remains after the accepted Gate B; it has not rolled back to
+  Gate B. The post-failure architecture/capacity gate is now **CONDITIONAL GO
+  for local TDD implementation only**. The selected tracer is a pinned
+  `quinn-proto 0.11.16` per-connection pacer cap of `64` paced
+  MTU-equivalents. Upstream `256 * mtu` behavior remains exact by default; the
+  frozen pool=2 has a static stored-token ceiling of `128` MTU-equivalents but
+  no endpoint-wide sliding-window or fairness theorem.
+- The public `AsyncUdpSocket` deadline/debt variants are rejected because they
+  act after Quinn records packets sent and therefore double-pace. The Quinn
+  driver has no pre-accounting endpoint scheduler seam, and Linux
+  `SO_MAX_PACING_RATE`/`sch_fq` is not the cross-platform product design. A
+  full shared pre-accounting coordinator is deferred until the narrow
+  single-flow tracer proves it is necessary. This was the prior local-only
+  design authorization; the implementation checkpoint and stop now recorded
+  above supersede its no-implementation wording. Source of truth:
+  `docs/tech/2026-07-13-knife14h10d16-quinn-pacer-burst-cap-architecture-spec.md`.
+
+- Task 12 step 4 remains **stopped before VPS after the confirmed bounded
+  send-service measurement gate failed**. The measurement-only tracer and
+  runner pool-aggregate loss repair passed deterministic tests. The real
+  GSO-enabled `32 MiB` upload again delivered exact bytes/pattern and clean
+  EOF, but reached only `98.311 Mbit/s` versus the required `>170 Mbit/s`.
+- Mean wire payload was healthy at `1199.953B`; the selected root is the
+  serialized send/cooldown/timer period. A 48-datagram batch averaged
+  `4.573ms`, including `1.340ms` mean rearm lateness. Even with lateness set to
+  zero, the fixed full cooldown plus observed batch work allows only about
+  `142.5 Mbit/s`, so another constant retry is rejected.
+- Post-failure review finds the wrapper double-paces Quinn's existing private
+  token bucket. The new architecture/capacity spec and conditional local-only
+  decision are now recorded above. The historical measurement result is:
+  `docs/tech/2026-07-13-knife14h10d16-bounded-udp-send-service-measurement-results.md`.
+  No VPS or macOS TUN ran. D16, MTU, pool, QUIC windows, chunk, CC, and
+  self-wake remain frozen; P8 and later regressions remain unspent.
+
+- Task 12 step 4 remains **stopped after the GSO-disabled forward
+  discriminator failed**. The public Quinn policy seam and real 32 MiB upload
+  passed locally with GSO disabled, exact delivery, clean EOF, and
+  `>170 Mbit/s`; the production default remains enabled. No D16, MTU, pool,
+  QUIC-window, chunk, congestion-control, or self-wake value changed.
+- The corrected same-window sing-box control was `177.303/175.102 Mbit/s`
+  with target-only routing and zero client/Exit socket or capture drops. The
+  fresh disabled-GSO mini_vpn P1 reached `206/193 Mbit/s`, but again added `30`
+  TUN TX drops, `67,826,613B` of formal QUIC loss and `40,887` congestion
+  events. Its final counters were `73,572,300B` lost and `44,198` events.
+- Bilateral capture measured control client-out/Exit-in at
+  `453,361,295B/442,185,588B` (2.47% gap) and disabled-GSO mini_vpn at
+  `565,156,612B/492,300,734B` (12.89% gap), with tcpdump kernel drops zero.
+  Disabling GSO reduced the prior mini_vpn peak from `261` to `163 packets/ms`
+  but did not remove or improve the product loss edge.
+- Post-failure code review explains why: disabled GSO limits one Quinn-proto
+  `poll_transmit` to one datagram, but Quinn still loops to 20 datagrams per
+  driver poll, immediately self-wakes, and retains a 256-packet pacer capacity.
+  The switch changes UDP syscall aggregation, not inter-poll pacing. Review
+  also found that the suite discards standard-P1 status with `|| true` and the
+  low-RTT report prints full-tunnel curl/DNS expectations under target-only
+  routing.
+- Await confirmation of a red-first runner repair plus one shared bounded QUIC
+  UDP egress service at Quinn's public `AsyncUdpSocket` seam. The proposed
+  fixed capacity is 48 wire-datagram equivalents per 2 ms: `30.72 MB/s` raw at
+  1280B, above the `21.25 MB/s` required for 170 Mbit/s while bounding the
+  observed burst. Do not spend another GSO run or resume P8 before this local
+  seam, full regression gate, and code review pass. Result:
+  `docs/tech/2026-07-13-knife14h10d16-gso-disabled-forward-discriminator-results.md`.
+
+- Task 12 steps 1-3 / Gate B **passed** from clean `a54fb17`. The corrected
+  same-window sing-box control was `144.519/143.228 Mbit/s` with target-only
+  routing and zero client/server UDP socket drops. The three exact `20s`
+  reverse-first P1 receiver results were `192`, `188`, and `191 Mbit/s`;
+  median `191 Mbit/s` exceeds the absolute `170 Mbit/s` gate and every run
+  exceeds `150 Mbit/s`. All runs had zero TUN drop, actor bypass, send/flush
+  errors, pressure/drop debt, QUIC loss/blocking, reconnect, and terminal
+  pending reap.
+- The single post-median fixed `64 MiB` A-clean completed at `179/179 Mbit/s`,
+  delivered exactly `67108864B`, and closed through `clean_queue_lifecycle`
+  with queue/reserved/leased, pending/inflight, close pending/egress, terminal
+  reap/drop, TUN drop, and bypass all zero. No macOS TUN test ran.
+- Gate B is closed, but the final stable-170 claim is not yet authorized.
+  Continue with Task 12 step 4 only: sustained `60s` reverse TCP, TCP
+  multi-flow/concurrency, UDP/live-streaming, fake-IP DNS, and TUN lifecycle
+  regressions. Keep D16, MTU, pool, QUIC windows, chunk, self-wake, and old-path
+  cleanup frozen until that gate passes. Result:
+  `docs/tech/2026-07-13-knife14h10d16-gate-b-results.md`.
+- Operational override: when a future run fails only in preflight/configuration
+  and the cause is evidenced, correct it and continue without asking again;
+  preflight-only exits do not consume a measurement sample. A real product or
+  gate failure still follows the stop/analyze/plan rule.
+
 - Composite Gate A **passed** from clean source `79b41b3` against the capable
   Shoes `v0.2.7` / Quinn `0.11.9` Exit on `.111:8443`.
 - A-capacity completed the exact `20s` reverse-first P1 at `192/188 Mbit/s`.
@@ -20,11 +233,9 @@ This section overrides the older G7/G8/GV next-step text below.
   binary/profile/tunnel and closed through remote EOF plus
   `clean_queue_lifecycle`; queue, reserved, leased, pending, inflight,
   terminal-drop, close-egress, TUN-drop, bypass, and error counters were zero.
-- This is the first accepted H10d16 Gate A and closes stage 8. Gate B is now
-  unlocked but has not run. Next execute Task 12: one same-window Gate-aligned
-  sing-box control, three mini_vpn timed repeats, the median decision, and one
-  fixed-byte clean repeat. Do not reopen D16, MTU, pool, QUIC windows, chunk,
-  self-wake, or VPS tuning before that evidence.
+- This was the first accepted H10d16 Gate A and closed stage 8. It unlocked the
+  Gate B execution now recorded above; preserve it as the Gate A source rather
+  than treating its former next-step text as current.
 - Result:
   `docs/tech/2026-07-13-knife14h10d16-shoes-composite-gate-a-results.md`.
 

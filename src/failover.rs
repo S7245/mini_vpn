@@ -59,7 +59,11 @@ pub struct BlackholeDetector {
 
 impl BlackholeDetector {
     pub fn new() -> Self {
-        Self { last_rx: 0, last_change_secs: 0, primed: false }
+        Self {
+            last_rx: 0,
+            last_change_secs: 0,
+            primed: false,
+        }
     }
 
     /// 观察一次 rx 计数。返回 true=判定黑洞（rx 停滞 ≥ 窗口）。
@@ -102,7 +106,11 @@ impl TcpLeg {
         }
     }
     fn from_u8(v: u8) -> TcpLeg {
-        if v == 1 { TcpLeg::Reality } else { TcpLeg::Tuic }
+        if v == 1 {
+            TcpLeg::Reality
+        } else {
+            TcpLeg::Tuic
+        }
     }
 }
 
@@ -154,7 +162,12 @@ impl FailoverState {
     fn switch_to_reality(&self, now_secs: u64) -> bool {
         if self
             .active_tcp_leg
-            .compare_exchange(TcpLeg::Tuic.as_u8(), TcpLeg::Reality.as_u8(), Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(
+                TcpLeg::Tuic.as_u8(),
+                TcpLeg::Reality.as_u8(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
             .is_err()
         {
             return false; // 别人已切（或已不在 TUIC）
@@ -169,7 +182,12 @@ impl FailoverState {
     fn switch_to_tuic(&self) -> bool {
         if self
             .active_tcp_leg
-            .compare_exchange(TcpLeg::Reality.as_u8(), TcpLeg::Tuic.as_u8(), Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(
+                TcpLeg::Reality.as_u8(),
+                TcpLeg::Tuic.as_u8(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
             .is_err()
         {
             return false;
@@ -212,7 +230,8 @@ impl FailoverState {
             return false;
         }
         let n = self.probe_consec_ok.fetch_add(1, Ordering::Relaxed) + 1;
-        let cooled = now_secs.saturating_sub(self.reality_switch_at.load(Ordering::Relaxed)) >= UP_COOLDOWN_SECS;
+        let cooled = now_secs.saturating_sub(self.reality_switch_at.load(Ordering::Relaxed))
+            >= UP_COOLDOWN_SECS;
         if n >= UP_PROBE_CONSEC && cooled {
             self.switch_to_tuic()
         } else {
@@ -249,7 +268,11 @@ pub struct FailoverUpstream<T, R> {
 
 impl<T, R> FailoverUpstream<T, R> {
     pub fn new(tuic: Arc<T>, reality: Arc<R>) -> Self {
-        Self { tuic, reality, state: Arc::new(FailoverState::new()) }
+        Self {
+            tuic,
+            reality,
+            state: Arc::new(FailoverState::new()),
+        }
     }
 
     /// 共享状态句柄（acceptance 观测 / 测试用）。
@@ -298,7 +321,9 @@ where
                             secs_since_up_probe = 0;
                             let ok = tuic.probe().await;
                             if state.record_probe(ok, state.now_secs()) {
-                                println!("🔀 failover：TUIC 探针连续成功 + 冷却已过 → 切回 TUIC 主腿");
+                                println!(
+                                    "🔀 failover：TUIC 探针连续成功 + 冷却已过 → 切回 TUIC 主腿"
+                                );
                             }
                         }
                     }
@@ -325,8 +350,15 @@ where
                     // 区分 down 快路（连接死=黑洞）/慢路（连接活但流失败）。
                     let dead = self.tuic.is_dead().await;
                     if self.state.record_tuic_failure(dead, self.state.now_secs()) {
-                        let why = if dead { "连接死(黑洞快路)" } else { "连续失败(边缘慢路)" };
-                        println!("🔀 failover：TUIC {why} → 切到 REALITY 备路并重试本连接 {}", target.to_wire_string());
+                        let why = if dead {
+                            "连接死(黑洞快路)"
+                        } else {
+                            "连续失败(边缘慢路)"
+                        };
+                        println!(
+                            "🔀 failover：TUIC {why} → 切到 REALITY 备路并重试本连接 {}",
+                            target.to_wire_string()
+                        );
                         // seamless failover：本连接立即在 REALITY 重试，避免触发切换的这条连接白白失败。
                         self.reality.open_tcp(target).await
                     } else {
@@ -428,7 +460,11 @@ mod tests {
         }
     }
 
-    fn mk() -> (Arc<MockLeg>, Arc<MockLeg>, FailoverUpstream<MockLeg, MockLeg>) {
+    fn mk() -> (
+        Arc<MockLeg>,
+        Arc<MockLeg>,
+        FailoverUpstream<MockLeg, MockLeg>,
+    ) {
         let tuic = Arc::new(MockLeg::default());
         let reality = Arc::new(MockLeg::default());
         let fo = FailoverUpstream::new(tuic.clone(), reality.clone());
@@ -457,7 +493,11 @@ mod tests {
         tuic.drops_up.store(42, Ordering::Relaxed);
         reality.drops_up.store(999, Ordering::Relaxed); // 不应被读到
         assert_eq!(fo.udp_drops_up(), 42);
-        assert_eq!(fo.udp_stream_fallbacks(), 0, "MockLeg 未 override fallbacks → 默认 0");
+        assert_eq!(
+            fo.udp_stream_fallbacks(),
+            0,
+            "MockLeg 未 override fallbacks → 默认 0"
+        );
     }
 
     /// 刀11：非 failover 单腿上游继承默认（leg=NO_FAILOVER、fallbacks=0）。
@@ -473,7 +513,11 @@ mod tests {
     async fn open_tcp_routes_by_leg_and_udp_pinned_to_tuic() {
         let (tuic, reality, fo) = mk();
         fo.open_tcp(&target()).await.unwrap();
-        assert_eq!(tuic.tcp.lock().unwrap().len(), 1, "默认 leg=TUIC → TCP 走 tuic");
+        assert_eq!(
+            tuic.tcp.lock().unwrap().len(),
+            1,
+            "默认 leg=TUIC → TCP 走 tuic"
+        );
         assert!(reality.tcp.lock().unwrap().is_empty());
 
         fo.send_udp(vec![1, 2, 3]).await;
@@ -481,12 +525,23 @@ mod tests {
 
         fo.state().set_leg(TcpLeg::Reality);
         fo.open_tcp(&target()).await.unwrap();
-        assert_eq!(reality.tcp.lock().unwrap().len(), 1, "leg=REALITY → TCP 走 reality");
+        assert_eq!(
+            reality.tcp.lock().unwrap().len(),
+            1,
+            "leg=REALITY → TCP 走 reality"
+        );
 
         // F2 硬约束 / 铁律：leg=REALITY 时 UDP 仍恒走 tuic，reality 永不收 UDP。
         fo.send_udp(vec![4, 5]).await;
-        assert_eq!(tuic.udp.lock().unwrap().len(), 2, "leg=REALITY 时 UDP 仍恒走 tuic（F2 硬约束/铁律）");
-        assert!(reality.udp.lock().unwrap().is_empty(), "reality 腿永不承载 UDP");
+        assert_eq!(
+            tuic.udp.lock().unwrap().len(),
+            2,
+            "leg=REALITY 时 UDP 仍恒走 tuic（F2 硬约束/铁律）"
+        );
+        assert!(
+            reality.udp.lock().unwrap().is_empty(),
+            "reality 腿永不承载 UDP"
+        );
     }
 
     /// F1 down 快路：TUIC 失败 + 连接死（黑洞）→ 1 次即切 REALITY，本连接在 REALITY 重试成功。
@@ -498,8 +553,16 @@ mod tests {
 
         let r = fo.open_tcp(&target()).await;
         assert!(r.is_ok(), "切 REALITY 后重试应成功（reality 默认不失败）");
-        assert_eq!(fo.state().active_leg(), TcpLeg::Reality, "dead → 1 次即切 REALITY");
-        assert_eq!(reality.tcp.lock().unwrap().len(), 1, "触发切换的本连接在 REALITY 重试");
+        assert_eq!(
+            fo.state().active_leg(),
+            TcpLeg::Reality,
+            "dead → 1 次即切 REALITY"
+        );
+        assert_eq!(
+            reality.tcp.lock().unwrap().len(),
+            1,
+            "触发切换的本连接在 REALITY 重试"
+        );
     }
 
     /// F1 down 慢路：TUIC 失败但连接活 → 前 2 次不切（返回 Err），第 3 次才切 + 重试 REALITY。
@@ -516,7 +579,11 @@ mod tests {
 
         let r = fo.open_tcp(&target()).await; // 第3次 → 切 + 重试 reality（默认成功）
         assert!(r.is_ok(), "第3次切 REALITY 后重试成功");
-        assert_eq!(fo.state().active_leg(), TcpLeg::Reality, "连续 3 次 → 切 REALITY");
+        assert_eq!(
+            fo.state().active_leg(),
+            TcpLeg::Reality,
+            "连续 3 次 → 切 REALITY"
+        );
         assert_eq!(reality.tcp.lock().unwrap().len(), 1);
     }
 
@@ -532,21 +599,31 @@ mod tests {
         tuic.fail_open.store(true, Ordering::Relaxed);
         let _ = fo.open_tcp(&target()).await; // fail 1（清零后）
         let _ = fo.open_tcp(&target()).await; // fail 2
-        assert_eq!(fo.state().active_leg(), TcpLeg::Tuic, "成功清零后仅 2 次失败 → 不切");
+        assert_eq!(
+            fo.state().active_leg(),
+            TcpLeg::Tuic,
+            "成功清零后仅 2 次失败 → 不切"
+        );
     }
 
     /// F1 up 迟滞（state 级，注入时钟）：连续 3 成功 **且** 距切换 ≥60s 才切回 TUIC；失败清零连续性。
     #[test]
     fn up_switch_back_requires_three_ok_and_cooldown() {
         let s = FailoverState::new();
-        assert!(s.record_tuic_failure(true, 100), "dead → 切 REALITY，switch_at=100");
+        assert!(
+            s.record_tuic_failure(true, 100),
+            "dead → 切 REALITY，switch_at=100"
+        );
         assert_eq!(s.active_leg(), TcpLeg::Reality);
 
         assert!(!s.record_probe(true, 130), "ok#1，冷却 30s<60 → 不切");
         assert!(!s.record_probe(true, 140), "ok#2");
         assert!(!s.record_probe(true, 150), "ok#3 但冷却 50s<60 → 不切");
         assert_eq!(s.active_leg(), TcpLeg::Reality);
-        assert!(s.record_probe(true, 165), "ok#4 且冷却 65s≥60 + 连续≥3 → 切回 TUIC");
+        assert!(
+            s.record_probe(true, 165),
+            "ok#4 且冷却 65s≥60 + 连续≥3 → 切回 TUIC"
+        );
         assert_eq!(s.active_leg(), TcpLeg::Tuic);
 
         // 失败打断连续性。
@@ -556,7 +633,11 @@ mod tests {
         assert!(!s2.record_probe(false, 210), "失败 → 连续清零");
         assert!(!s2.record_probe(true, 220), "ok 连续1");
         assert!(!s2.record_probe(true, 230), "ok 连续2");
-        assert_eq!(s2.active_leg(), TcpLeg::Reality, "中途失败清零 → 仅 2 连续，不切");
+        assert_eq!(
+            s2.active_leg(),
+            TcpLeg::Reality,
+            "中途失败清零 → 仅 2 连续，不切"
+        );
         assert!(s2.record_probe(true, 240), "ok 连续3 + 冷却 → 切回");
         assert_eq!(s2.active_leg(), TcpLeg::Tuic);
     }
@@ -566,10 +647,19 @@ mod tests {
     #[test]
     fn down_switch_is_idempotent() {
         let s = FailoverState::new();
-        assert!(s.record_tuic_failure(true, 10), "首次 dead → 切 REALITY，返回 true");
+        assert!(
+            s.record_tuic_failure(true, 10),
+            "首次 dead → 切 REALITY，返回 true"
+        );
         assert_eq!(s.active_leg(), TcpLeg::Reality);
-        assert!(!s.record_tuic_failure(true, 11), "已在 REALITY → 不重复切，返回 false");
-        assert!(!s.record_tuic_failure(false, 12), "已在 REALITY → 慢路也不动，返回 false");
+        assert!(
+            !s.record_tuic_failure(true, 11),
+            "已在 REALITY → 不重复切，返回 false"
+        );
+        assert!(
+            !s.record_tuic_failure(false, 12),
+            "已在 REALITY → 慢路也不动，返回 false"
+        );
     }
 
     /// down 黑洞探测（主检测）：rx 停滞 ≥ 窗口 → BlackholeDetector 判黑洞；rx 一增长就复位计时。
@@ -608,7 +698,11 @@ mod tests {
         fo.state().record_tuic_failure(true, fo.state().now_secs()); // → REALITY + 冷却中
         assert_eq!(fo.state().active_leg(), TcpLeg::Reality);
         fo.send_udp(vec![9, 9, 9]).await;
-        assert_eq!(tuic.udp.lock().unwrap().len(), 1, "REALITY 当班 + 冷却中，UDP 仍恒走 tuic（铁律）");
+        assert_eq!(
+            tuic.udp.lock().unwrap().len(),
+            1,
+            "REALITY 当班 + 冷却中，UDP 仍恒走 tuic（铁律）"
+        );
         assert!(reality.udp.lock().unwrap().is_empty());
     }
 }

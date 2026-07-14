@@ -89,7 +89,10 @@ fn build_extensions(p: &ClientHelloParams) -> Vec<u8> {
     // renegotiation_info：1B 长=0
     e.extend_from_slice(&ext(0xff01, &[0]));
     // supported_groups：u16 列表（GREASE + X25519 + secp256r1 + secp384r1）
-    e.extend_from_slice(&ext(0x000a, &u16_vec(&u16s(&[GREASE, 0x001d, 0x0017, 0x0018]))));
+    e.extend_from_slice(&ext(
+        0x000a,
+        &u16_vec(&u16s(&[GREASE, 0x001d, 0x0017, 0x0018])),
+    ));
     // ec_point_formats：1B 长=1 + uncompressed(0)
     e.extend_from_slice(&ext(0x000b, &[1, 0]));
     // ALPN：u16 列表 of (1B 长 + proto)
@@ -228,7 +231,11 @@ mod tests {
         let msg = sample();
         assert_eq!(msg[0], 0x01, "handshake type ClientHello");
         assert_eq!(msg[38], 32, "session_id 长度字节");
-        assert_eq!(&msg[39..71], &[0u8; 32], "session_id（占位全零，T3 seal 回写）");
+        assert_eq!(
+            &msg[39..71],
+            &[0u8; 32],
+            "session_id（占位全零，T3 seal 回写）"
+        );
     }
 
     /// tls-parser 独立解析成功，且 cipher 含 AES_128_GCM + GREASE。
@@ -246,7 +253,10 @@ mod tests {
         assert!(ciphers.contains(&GREASE), "GREASE cipher");
         // 刀8 裁决 f / ADR-0009 修订：收紧 TLS1.3 offer 仅 0x1301——绝不 offer 我方完成不了的 0x1302/0x1303
         // （否则借用站选中即 loud-fail；详见 server_hello::parse_server_hello 的 cipher guard）。
-        assert!(!ciphers.contains(&0x1302), "不 offer 0x1302（schedule/record 不支持，避 decoy loud-fail）");
+        assert!(
+            !ciphers.contains(&0x1302),
+            "不 offer 0x1302（schedule/record 不支持，避 decoy loud-fail）"
+        );
         assert!(!ciphers.contains(&0x1303), "不 offer 0x1303（同上）");
         assert_eq!(ch.session_id, Some(&[0u8; 32][..]));
     }
@@ -272,7 +282,11 @@ mod tests {
         // key_share 含 X25519(0x001d) + 32B pubkey。
         let ks = find_ext(exts, 0x0033).expect("key_share 扩展");
         // 跳过 u16 列表长 → group(2) + u16 长(2) + pubkey。
-        assert_eq!(&ks[2..4], &0x001du16.to_be_bytes(), "key_share group=X25519");
+        assert_eq!(
+            &ks[2..4],
+            &0x001du16.to_be_bytes(),
+            "key_share group=X25519"
+        );
         assert_eq!(u16::from_be_bytes([ks[4], ks[5]]), 32, "X25519 pubkey 32B");
         assert_eq!(&ks[6..38], &[0x42u8; 32], "key_share=我方 pubkey");
 
@@ -314,12 +328,18 @@ mod tests {
         while i + 4 <= exts.len() {
             let t = u16::from_be_bytes([exts[i], exts[i + 1]]);
             let l = u16::from_be_bytes([exts[i + 2], exts[i + 3]]) as usize;
-            assert!(seen.insert(t), "重复扩展类型 0x{t:04x}（违反 RFC 8446 §4.2，被 Go-tls 拒 → 回落 decoy）");
+            assert!(
+                seen.insert(t),
+                "重复扩展类型 0x{t:04x}（违反 RFC 8446 §4.2，被 Go-tls 拒 → 回落 decoy）"
+            );
             i += 4 + l;
         }
         // 两个 GREASE 扩展都在，但 type 不同。
         assert!(seen.contains(&GREASE), "含第一个 GREASE 扩展");
-        assert!(seen.contains(&GREASE_EXT2), "含第二个 GREASE 扩展（不同 type）");
+        assert!(
+            seen.contains(&GREASE_EXT2),
+            "含第二个 GREASE 扩展（不同 type）"
+        );
     }
 
     /// 刀6 T3 核心：build_authed → 「服务端视角」解封 round-trip。

@@ -101,7 +101,11 @@ mod tests {
     /// 钉死 PortThenAddress（port 在 atyp 前）+ ATYP IPv4=0x01。
     #[test]
     fn ipv4_request_golden() {
-        let req = encode_vless_request(&[0x11; 16], VLESS_CMD_TCP, &TargetAddr::parse("1.2.3.4:443").unwrap());
+        let req = encode_vless_request(
+            &[0x11; 16],
+            VLESS_CMD_TCP,
+            &TargetAddr::parse("1.2.3.4:443").unwrap(),
+        );
         assert_eq!(
             req,
             hex("00 11111111111111111111111111111111 00 01 01bb 01 01020304")
@@ -109,7 +113,10 @@ mod tests {
         assert_eq!(req.len(), 26);
         // 精确字段定位：port(0x01bb) 在 atyp(0x01) 之前。
         assert_eq!(&req[19..21], &[0x01, 0xbb], "port 443 BE 在 atyp 之前");
-        assert_eq!(req[21], 0x01, "ATYP IPv4=0x01（非 tuic 的 0x01... 注意 domain/v6 错位）");
+        assert_eq!(
+            req[21], 0x01,
+            "ATYP IPv4=0x01（非 tuic 的 0x01... 注意 domain/v6 错位）"
+        );
     }
 
     /// 域名变体：example.com:443 → ATYP domain=0x02 + 1B 长度 + host。
@@ -118,7 +125,10 @@ mod tests {
         let req = encode_vless_request(
             &[0x11; 16],
             VLESS_CMD_TCP,
-            &TargetAddr::DomainPort { host: "example.com".into(), port: 443 },
+            &TargetAddr::DomainPort {
+                host: "example.com".into(),
+                port: 443,
+            },
         );
         assert_eq!(
             req,
@@ -140,7 +150,10 @@ mod tests {
         assert_eq!(&req[19..21], &0x20fbu16.to_be_bytes(), "port 8443 BE");
         assert_eq!(req[21], VLESS_ATYP_IPV6);
         assert_eq!(req.len(), 19 + 2 + 1 + 16);
-        assert_eq!(&req[22..38], &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(
+            &req[22..38],
+            &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+        );
     }
 
     /// 超 255 字节域名按 255 截断，不 panic（与 tuic::encode_address 同纪律）。

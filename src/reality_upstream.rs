@@ -10,7 +10,9 @@ use crate::reality::auth::{
     x25519_shared_secret,
 };
 use crate::reality::cert::extract_ed25519_pubkey_and_sig;
-use crate::reality::client_hello::{AuthedClientHelloParams, authed_session_id, build_authed_client_hello};
+use crate::reality::client_hello::{
+    AuthedClientHelloParams, authed_session_id, build_authed_client_hello,
+};
 use crate::reality::handshake::{self, HandshakeInput};
 use crate::reality::key_schedule::{expand_label, next_application_traffic_secret};
 use crate::reality::record::RecordKeys;
@@ -59,8 +61,12 @@ pub struct RealityStream<R, W> {
 /// 从（已轮换的）application_traffic_secret 派一个新 `RecordKeys`（RFC 8446 §7.3）：
 /// key=ExpandLabel(secret,"key","",16)、iv=ExpandLabel(secret,"iv","",12)，新实例 seq 天然归 0。
 fn record_keys_from_secret(secret: &[u8; 32]) -> RecordKeys {
-    let key: [u8; 16] = expand_label(secret, "key", b"", 16).try_into().expect("key 16B");
-    let iv: [u8; 12] = expand_label(secret, "iv", b"", 12).try_into().expect("iv 12B");
+    let key: [u8; 16] = expand_label(secret, "key", b"", 16)
+        .try_into()
+        .expect("key 16B");
+    let iv: [u8; 12] = expand_label(secret, "iv", b"", 12)
+        .try_into()
+        .expect("iv 12B");
     RecordKeys::new(&key, &iv)
 }
 
@@ -107,7 +113,10 @@ impl<R, W> RealityStream<R, W> {
         let header: [u8; 5] = self.read_raw[..5].try_into().expect("≥5B");
         let len = u16::from_be_bytes([header[3], header[4]]) as usize;
         if len > MAX_TLS_RECORD {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "REALITY record 超长"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "REALITY record 超长",
+            ));
         }
         if self.read_raw.len() < 5 + len {
             return Ok(None);
@@ -128,7 +137,9 @@ impl<R, W> RealityStream<R, W> {
                     (level, desc) => {
                         return Err(io::Error::new(
                             io::ErrorKind::ConnectionAborted,
-                            format!("REALITY 收到 TLS alert level={level:?} desc={desc:?}（server 拒绝/错误）"),
+                            format!(
+                                "REALITY 收到 TLS alert level={level:?} desc={desc:?}（server 拒绝/错误）"
+                            ),
                         ));
                     }
                 }
@@ -147,7 +158,8 @@ impl<R, W> RealityStream<R, W> {
                 // KeyUpdate 恒 5B 本就不分片，NST 本客户端也不消费（无连接复用，刀8）。若未来接会分片的服务端再议。
                 let mut rest: &[u8] = &content;
                 while rest.len() >= 4 {
-                    let msg_len = ((rest[1] as usize) << 16) | ((rest[2] as usize) << 8) | rest[3] as usize;
+                    let msg_len =
+                        ((rest[1] as usize) << 16) | ((rest[2] as usize) << 8) | rest[3] as usize;
                     let total = 4 + msg_len;
                     if rest.len() < total {
                         break; // 半条（跨 record 分片）：本条不处理（见上「已知限制」）。
@@ -226,7 +238,10 @@ impl<R, W> RealityStream<R, W> {
         while !self.write_pending.is_empty() {
             match Pin::new(&mut self.write_half).poll_write(cx, &self.write_pending) {
                 Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "REALITY 写 0 字节")));
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "REALITY 写 0 字节",
+                    )));
                 }
                 Poll::Ready(Ok(k)) => {
                     let _ = self.write_pending.split_to(k);
@@ -242,7 +257,11 @@ impl<R, W> RealityStream<R, W> {
 // 中文要点（刀10/F5）：`W: AsyncWrite` bound——KeyUpdate(update_requested) 须在读路径上**回发** reply
 // （入 write_pending），故 poll_read 顶部机会性 flush write_pending。prod=OwnedWriteHalf、test=WriteHalf 均可写。
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> AsyncRead for RealityStream<R, W> {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         loop {
             // 0. 机会性排空待写密文（含 KeyUpdate 回发 reply）：best-effort，Pending 不阻塞读，错误传播。
@@ -294,7 +313,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> AsyncRead for RealityStream<R,
 }
 
 impl<R: Unpin, W: AsyncWrite + Unpin> AsyncWrite for RealityStream<R, W> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         ready!(this.poll_flush_pending(cx))?; // 背压：旧密文未排空不接受新明文
         if buf.is_empty() {
@@ -396,15 +419,27 @@ impl RealityClientConfig {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| ClientError::Reality("MINI_VPN_REALITY_SERVER 必填".into()))?
             .to_string();
-        let uuid = parse_uuid(uuid.ok_or_else(|| ClientError::Reality("MINI_VPN_REALITY_UUID 必填".into()))?)
-            .ok_or_else(|| ClientError::Reality("MINI_VPN_REALITY_UUID 非法（须 RFC4122 UUID）".into()))?;
-        let pbk = parse_pbk(pbk.ok_or_else(|| ClientError::Reality("MINI_VPN_REALITY_PBK 必填".into()))?)?;
+        let uuid = parse_uuid(
+            uuid.ok_or_else(|| ClientError::Reality("MINI_VPN_REALITY_UUID 必填".into()))?,
+        )
+        .ok_or_else(|| {
+            ClientError::Reality("MINI_VPN_REALITY_UUID 非法（须 RFC4122 UUID）".into())
+        })?;
+        let pbk = parse_pbk(
+            pbk.ok_or_else(|| ClientError::Reality("MINI_VPN_REALITY_PBK 必填".into()))?,
+        )?;
         let short_id = parse_short_id(short_id.unwrap_or(""))?;
         let sni = sni
             .filter(|s| !s.is_empty())
             .ok_or_else(|| ClientError::Reality("MINI_VPN_REALITY_SNI 必填（借用站域名）".into()))?
             .to_string();
-        Ok(Self { server, uuid, pbk, short_id, sni })
+        Ok(Self {
+            server,
+            uuid,
+            pbk,
+            short_id,
+            sni,
+        })
     }
 
     /// 从进程环境读取（`MINI_VPN_REALITY_*`）。
@@ -464,7 +499,11 @@ impl RealityUpstream {
         });
         let expected_session_id = authed_session_id(&ch).to_vec();
         // 4. 跑握手，注入 verify_server_cert 做 REALITY auth 决策。
-        let input = HandshakeInput { client_hello: ch, client_eph_secret: sk_c, expected_session_id };
+        let input = HandshakeInput {
+            client_hello: ch,
+            client_eph_secret: sk_c,
+            expected_session_id,
+        };
         let mut out = handshake::drive(stream, input, move |cert_msg| {
             let (pk, sig) = extract_ed25519_pubkey_and_sig(cert_msg)?;
             if verify_server_cert(&auth_key, &pk, &sig) {
@@ -478,11 +517,23 @@ impl RealityUpstream {
         .await?;
         // REALITY auth 决策已通过（drive 成功 ⟺ verify_server_cert==true；否则上面 `?` 已返回）。
         // 这行是真出口 acceptance 的核心证据（**非** session_id echo 充数，见 ADR-0009/0010）。
-        println!("🔐 REALITY 握手成功（证书 HMAC 校验通过）→ {}", target.to_wire_string());
+        println!(
+            "🔐 REALITY 握手成功（证书 HMAC 校验通过）→ {}",
+            target.to_wire_string()
+        );
         // 5. 发 VLESS 请求（握手后第一条 app record，send_keys seq 0）。
-        let vless = out.send_keys.seal(0x17, &encode_vless_request(&self.cfg.uuid, VLESS_CMD_TCP, target));
-        stream.write_all(&vless).await.map_err(|e| ClientError::Reality(format!("写 VLESS 请求: {e}")))?;
-        stream.flush().await.map_err(|e| ClientError::Reality(format!("flush VLESS 请求: {e}")))?;
+        let vless = out.send_keys.seal(
+            0x17,
+            &encode_vless_request(&self.cfg.uuid, VLESS_CMD_TCP, target),
+        );
+        stream
+            .write_all(&vless)
+            .await
+            .map_err(|e| ClientError::Reality(format!("写 VLESS 请求: {e}")))?;
+        stream
+            .flush()
+            .await
+            .map_err(|e| ClientError::Reality(format!("flush VLESS 请求: {e}")))?;
         Ok(out)
     }
 }
@@ -498,8 +549,12 @@ impl ProxyUpstream for RealityUpstream {
         let timeout = std::time::Duration::from_secs(REALITY_HANDSHAKE_TIMEOUT_SECS);
         let mut stream = tokio::time::timeout(timeout, TcpStream::connect(&self.cfg.server))
             .await
-            .map_err(|_| ClientError::Reality(format!("TCP 连 REALITY 出口 {} 超时", self.cfg.server)))?
-            .map_err(|e| ClientError::Reality(format!("TCP 连 REALITY 出口 {} 失败: {e}", self.cfg.server)))?;
+            .map_err(|_| {
+                ClientError::Reality(format!("TCP 连 REALITY 出口 {} 超时", self.cfg.server))
+            })?
+            .map_err(|e| {
+                ClientError::Reality(format!("TCP 连 REALITY 出口 {} 失败: {e}", self.cfg.server))
+            })?;
         let out = tokio::time::timeout(timeout, self.establish(&mut stream, target))
             .await
             .map_err(|_| ClientError::Reality("REALITY 握手超时（慢/半开 server）".into()))??;
@@ -542,7 +597,10 @@ pub async fn reality_probe(target: &str) {
             return;
         }
     };
-    eprintln!("[probe] REALITY 出口 server={} sni={} → target={target}", cfg.server, cfg.sni);
+    eprintln!(
+        "[probe] REALITY 出口 server={} sni={} → target={target}",
+        cfg.server, cfg.sni
+    );
     let t = match TargetAddr::parse(target) {
         Ok(t) => t,
         Err(e) => {
@@ -659,8 +717,14 @@ mod tests {
         let mut r1 = vec![0x00, 0x00]; // VLESS 响应头（空 addons）
         r1.extend_from_slice(b"hello");
         server_end.write_all(&srv.seal(0x17, &r1)).await.unwrap(); // seq0
-        server_end.write_all(&srv.seal(0x16, &[0x04, 0, 0, 1, 0])).await.unwrap(); // seq1 NST → 丢
-        server_end.write_all(&srv.seal(0x17, b" world")).await.unwrap(); // seq2
+        server_end
+            .write_all(&srv.seal(0x16, &[0x04, 0, 0, 1, 0]))
+            .await
+            .unwrap(); // seq1 NST → 丢
+        server_end
+            .write_all(&srv.seal(0x17, b" world"))
+            .await
+            .unwrap(); // seq2
         server_end.flush().await.unwrap();
 
         let mut got = vec![0u8; 11];
@@ -702,7 +766,10 @@ mod tests {
             records += 1;
         }
         assert_eq!(got, payload, "分块往返字节级一致");
-        assert!(records >= 2, "20000B 应分 ≥2 条 record（每条 ≤16384 明文），实得 {records}");
+        assert!(
+            records >= 2,
+            "20000B 应分 ≥2 条 record（每条 ≤16384 明文），实得 {records}"
+        );
     }
 
     // ---- T9 RealityClientConfig + open_tcp loopback ----
@@ -733,10 +800,38 @@ mod tests {
     fn config_missing_or_invalid_fields_err() {
         let uuid = "12345678-1234-1234-1234-123456789abc";
         let pbk = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
-        assert!(RealityClientConfig::from_sources(None, Some(uuid), Some(pbk), None, Some("s")).is_err(), "缺 server");
-        assert!(RealityClientConfig::from_sources(Some("h:1"), Some("bad-uuid"), Some(pbk), None, Some("s")).is_err(), "非法 uuid");
-        assert!(RealityClientConfig::from_sources(Some("h:1"), Some(uuid), Some("short"), None, Some("s")).is_err(), "非法 pbk");
-        assert!(RealityClientConfig::from_sources(Some("h:1"), Some(uuid), Some(pbk), None, None).is_err(), "缺 sni");
+        assert!(
+            RealityClientConfig::from_sources(None, Some(uuid), Some(pbk), None, Some("s"))
+                .is_err(),
+            "缺 server"
+        );
+        assert!(
+            RealityClientConfig::from_sources(
+                Some("h:1"),
+                Some("bad-uuid"),
+                Some(pbk),
+                None,
+                Some("s")
+            )
+            .is_err(),
+            "非法 uuid"
+        );
+        assert!(
+            RealityClientConfig::from_sources(
+                Some("h:1"),
+                Some(uuid),
+                Some("short"),
+                None,
+                Some("s")
+            )
+            .is_err(),
+            "非法 pbk"
+        );
+        assert!(
+            RealityClientConfig::from_sources(Some("h:1"), Some(uuid), Some(pbk), None, None)
+                .is_err(),
+            "缺 sni"
+        );
     }
 
     // 真 ed25519 自签证书 fixture（同 cert.rs；用于 loopback server 模拟器构 Certificate）。
@@ -816,9 +911,12 @@ mod tests {
         io: &mut S,
         server_static_sk: [u8; 32],
     ) -> (RecordReader, crate::reality::key_schedule::AppKeys) {
-        use crate::reality::auth::{derive_auth_key, generate_ephemeral_keypair, x25519_shared_secret};
+        use crate::reality::auth::{
+            derive_auth_key, generate_ephemeral_keypair, x25519_shared_secret,
+        };
         use crate::reality::key_schedule::{
-            compute_finished_verify_data, derive_application_keys, derive_handshake_keys, transcript_hash,
+            compute_finished_verify_data, derive_application_keys, derive_handshake_keys,
+            transcript_hash,
         };
         let mut rr = RecordReader::new();
         let (_ct, _h, ch) = rr.next(io).await.unwrap(); // client CH
@@ -829,7 +927,10 @@ mod tests {
         let client_sid = ch[39..71].to_vec();
         let client_ks = find_ch_keyshare(&ch);
         // REALITY AuthKey（服务端视角）：x25519(server 静态私钥, client 临时 pub)。
-        let auth_key = derive_auth_key(&x25519_shared_secret(server_static_sk, client_ks), &client_random);
+        let auth_key = derive_auth_key(
+            &x25519_shared_secret(server_static_sk, client_ks),
+            &client_random,
+        );
 
         let (sk_se, pk_se) = generate_ephemeral_keypair();
         let sh = build_sh([0x55u8; 32], &client_sid, pk_se);
@@ -837,7 +938,8 @@ mod tests {
         let hs = derive_handshake_keys(&ecdhe, &ch, &sh).unwrap();
 
         let ee = hex("08 00 00 02 00 00"); // EncryptedExtensions（空）
-        let cert_msg = build_reality_cert_msg(&hex(ED25519_CERT_DER), &hex(ED25519_PUBKEY), &auth_key);
+        let cert_msg =
+            build_reality_cert_msg(&hex(ED25519_CERT_DER), &hex(ED25519_PUBKEY), &auth_key);
         let mut cv = vec![0x0f, 0x00, 0x00, 0x44, 0x08, 0x07, 0x00, 0x40]; // CertVerify（ed25519 scheme + dummy sig）
         cv.extend_from_slice(&[0u8; 64]);
         let th_cv = transcript_hash(&[&ch, &sh, &ee, &cert_msg, &cv]);
@@ -852,7 +954,9 @@ mod tests {
         shrec.extend_from_slice(&(sh.len() as u16).to_be_bytes());
         shrec.extend_from_slice(&sh);
         io.write_all(&shrec).await.unwrap();
-        io.write_all(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]).await.unwrap(); // server CCS
+        io.write_all(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01])
+            .await
+            .unwrap(); // server CCS
         let mut s_hs = RecordKeys::new(&hs.server_key, &hs.server_iv);
         io.write_all(&s_hs.seal(0x16, &flight)).await.unwrap();
         io.flush().await.unwrap();
@@ -910,7 +1014,9 @@ mod tests {
         assert_eq!(&vless[1..17], &expected_uuid, "VLESS UUID 命中");
 
         // 2. server 主动发 KeyUpdate(update_requested=1)（用当前/旧 s_ap seq0 封），随后轮自己发送 secret。
-        io.write_all(&s_ap.seal(0x16, &[0x18, 0x00, 0x00, 0x01, 0x01])).await.unwrap();
+        io.write_all(&s_ap.seal(0x16, &[0x18, 0x00, 0x00, 0x01, 0x01]))
+            .await
+            .unwrap();
         let s_ap1 = next_application_traffic_secret(&app.s_ap_secret);
         let mut s_ap_new = keys_from(&s_ap1);
 
@@ -923,14 +1029,22 @@ mod tests {
         // 4. 读 client 回发的 KeyUpdate(update_not_requested=0)（client 用旧 c_ap seq1 封），随后轮 server 接收 secret。
         let (_k, kh, kp) = rr.next(&mut io).await.unwrap();
         let (kt, kbody) = c_ap.open(&kh, &kp).unwrap();
-        assert_eq!((kt, kbody.as_slice()), (0x16, &[0x18u8, 0x00, 0x00, 0x01, 0x00][..]), "client 回发 update_not_requested(0)");
+        assert_eq!(
+            (kt, kbody.as_slice()),
+            (0x16, &[0x18u8, 0x00, 0x00, 0x01, 0x00][..]),
+            "client 回发 update_not_requested(0)"
+        );
         let c_ap1 = next_application_traffic_secret(&app.c_ap_secret);
         let mut c_ap_new = keys_from(&c_ap1);
 
         // 5. 读 client 用新发送密钥发的 app data（c_ap1 seq0）。
         let (_u, uh, up) = rr.next(&mut io).await.unwrap();
         let (ut, ubody) = c_ap_new.open(&uh, &up).unwrap();
-        assert_eq!((ut, ubody.as_slice()), (0x17, &b"up-after-update"[..]), "client 轮 send 后 app data 用 c_ap1 解");
+        assert_eq!(
+            (ut, ubody.as_slice()),
+            (0x17, &b"up-after-update"[..]),
+            "client 轮 send 后 app data 用 c_ap1 解"
+        );
     }
 
     /// **T9 capstone**：完整 REALITY 握手 over duplex（测试内服务端模拟器）→ verify_server_cert 真路径通过
@@ -954,10 +1068,20 @@ mod tests {
 
         let mut client = client_end;
         let target = TargetAddr::parse("1.2.3.4:443").unwrap();
-        let out = upstream.establish(&mut client, &target).await.expect("REALITY 握手应成功（cert HMAC 通过）");
+        let out = upstream
+            .establish(&mut client, &target)
+            .await
+            .expect("REALITY 握手应成功（cert HMAC 通过）");
         let (rh, wh) = tokio::io::split(client);
-        let mut stream =
-            RealityStream::new(rh, wh, out.recv_keys, out.send_keys, out.leftover, out.s_ap_secret, out.c_ap_secret);
+        let mut stream = RealityStream::new(
+            rh,
+            wh,
+            out.recv_keys,
+            out.send_keys,
+            out.leftover,
+            out.s_ap_secret,
+            out.c_ap_secret,
+        );
         stream.write_all(b"ping").await.unwrap();
         stream.flush().await.unwrap();
         let mut got = vec![0u8; 4];
@@ -989,15 +1113,28 @@ mod tests {
 
         let mut client = client_end;
         let target = TargetAddr::parse("1.2.3.4:443").unwrap();
-        let out = upstream.establish(&mut client, &target).await.expect("REALITY 握手应成功");
+        let out = upstream
+            .establish(&mut client, &target)
+            .await
+            .expect("REALITY 握手应成功");
         let (rh, wh) = tokio::io::split(client);
-        let mut stream =
-            RealityStream::new(rh, wh, out.recv_keys, out.send_keys, out.leftover, out.s_ap_secret, out.c_ap_secret);
+        let mut stream = RealityStream::new(
+            rh,
+            wh,
+            out.recv_keys,
+            out.send_keys,
+            out.leftover,
+            out.s_ap_secret,
+            out.c_ap_secret,
+        );
 
         // 读：触发 KeyUpdate 处理（轮 recv + 回发 reply + 轮 send），返回 server 用新密钥发的 app data。
         let mut got = vec![0u8; b"down-after-update".len()];
         stream.read_exact(&mut got).await.unwrap();
-        assert_eq!(&got, b"down-after-update", "KeyUpdate 后用轮换 recv 解 server 数据（剥 VLESS 头）");
+        assert_eq!(
+            &got, b"down-after-update",
+            "KeyUpdate 后用轮换 recv 解 server 数据（剥 VLESS 头）"
+        );
 
         // 写：用轮换后的 send_keys 发，server 用新 c_ap1 解。
         stream.write_all(b"up-after-update").await.unwrap();
@@ -1041,8 +1178,14 @@ mod tests {
     }
 
     /// 构一个最小 RealityStream over duplex（test helper）。
-    fn mk_stream(rk: [u8; 16], iv: [u8; 12]) -> (
-        RealityStream<tokio::io::ReadHalf<tokio::io::DuplexStream>, tokio::io::WriteHalf<tokio::io::DuplexStream>>,
+    fn mk_stream(
+        rk: [u8; 16],
+        iv: [u8; 12],
+    ) -> (
+        RealityStream<
+            tokio::io::ReadHalf<tokio::io::DuplexStream>,
+            tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        >,
         tokio::io::DuplexStream,
     ) {
         let (client_end, server_end) = tokio::io::duplex(4096);
@@ -1073,12 +1216,23 @@ mod tests {
         s_ap: [u8; 32],
         c_ap: [u8; 32],
     ) -> (
-        RealityStream<tokio::io::ReadHalf<tokio::io::DuplexStream>, tokio::io::WriteHalf<tokio::io::DuplexStream>>,
+        RealityStream<
+            tokio::io::ReadHalf<tokio::io::DuplexStream>,
+            tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        >,
         tokio::io::DuplexStream,
     ) {
         let (client_end, server_end) = tokio::io::duplex(65536);
         let (cr, cw) = tokio::io::split(client_end);
-        let s = RealityStream::new(cr, cw, keys_from(&s_ap), keys_from(&c_ap), BytesMut::new(), s_ap, c_ap);
+        let s = RealityStream::new(
+            cr,
+            cw,
+            keys_from(&s_ap),
+            keys_from(&c_ap),
+            BytesMut::new(),
+            s_ap,
+            c_ap,
+        );
         (s, server_end)
     }
 
@@ -1097,22 +1251,35 @@ mod tests {
         peer_old.open(&ph, &pre[5..]).unwrap(); // peer_old → seq1
 
         // 收 update_requested(1)。
-        stream.on_key_update(&[0x18, 0x00, 0x00, 0x01, 0x01]).unwrap();
+        stream
+            .on_key_update(&[0x18, 0x00, 0x00, 0x01, 0x01])
+            .unwrap();
 
         // B1：reply 必须用「旧」send key c0 @ seq1 封装 → peer_old(seq1) 解出 KeyUpdate(update_not_requested=0)。
-        assert!(!stream.write_pending.is_empty(), "update_requested(1) 必回发 reply");
+        assert!(
+            !stream.write_pending.is_empty(),
+            "update_requested(1) 必回发 reply"
+        );
         let reply = stream.write_pending.split().to_vec();
         let rh: [u8; 5] = reply[..5].try_into().unwrap();
-        let (rit, rbody) = peer_old.open(&rh, &reply[5..]).expect("reply 须用旧 send key/seq 封装（B1 先于 B2）");
+        let (rit, rbody) = peer_old
+            .open(&rh, &reply[5..])
+            .expect("reply 须用旧 send key/seq 封装（B1 先于 B2）");
         assert_eq!(rit, 0x16, "reply 内层 handshake");
-        assert_eq!(rbody, vec![0x18, 0x00, 0x00, 0x01, 0x00], "回发 KeyUpdate(update_not_requested=0)，防环");
+        assert_eq!(
+            rbody,
+            vec![0x18, 0x00, 0x00, 0x01, 0x00],
+            "回发 KeyUpdate(update_not_requested=0)，防环"
+        );
 
         // B2：send_keys 已轮到 c1 @ seq0 → 再发一条用 c1 新 key seq0 解。
         let c1 = next_application_traffic_secret(&c0);
         let mut peer_new = keys_from(&c1);
         let after = stream.send_keys.seal(0x17, b"after-update");
         let ah: [u8; 5] = after[..5].try_into().unwrap();
-        let (ait, abody) = peer_new.open(&ah, &after[5..]).expect("轮换后 send_keys 须用 c1 新 key seq0");
+        let (ait, abody) = peer_new
+            .open(&ah, &after[5..])
+            .expect("轮换后 send_keys 须用 c1 新 key seq0");
         assert_eq!((ait, abody.as_slice()), (0x17, &b"after-update"[..]));
         assert_eq!(stream.client_ap_secret, c1, "发送 secret 轮到 N+1");
 
@@ -1121,7 +1288,10 @@ mod tests {
         let mut srv_new = keys_from(&s1);
         let down = srv_new.seal(0x17, b"down-after");
         let dh: [u8; 5] = down[..5].try_into().unwrap();
-        let (dit, dbody) = stream.recv_keys.open(&dh, &down[5..]).expect("recv_keys 须轮到 s1");
+        let (dit, dbody) = stream
+            .recv_keys
+            .open(&dh, &down[5..])
+            .expect("recv_keys 须轮到 s1");
         assert_eq!((dit, dbody.as_slice()), (0x17, &b"down-after"[..]));
         assert_eq!(stream.server_ap_secret, s1, "接收 secret 轮到 N+1");
     }
@@ -1134,14 +1304,21 @@ mod tests {
 
         // ---- update_not_requested(0)：只轮 recv，不回发、不动 send。----
         let (mut stream, _srv) = mk_stream_secrets(s0, c0);
-        stream.on_key_update(&[0x18, 0x00, 0x00, 0x01, 0x00]).unwrap();
-        assert!(stream.write_pending.is_empty(), "update_not_requested(0) 不回发");
+        stream
+            .on_key_update(&[0x18, 0x00, 0x00, 0x01, 0x00])
+            .unwrap();
+        assert!(
+            stream.write_pending.is_empty(),
+            "update_not_requested(0) 不回发"
+        );
         assert_eq!(stream.client_ap_secret, c0, "不动发送 secret");
         // send_keys 仍 c0 @ seq0。
         let mut peer_send = keys_from(&c0);
         let snd = stream.send_keys.seal(0x17, b"still-c0");
         let sh: [u8; 5] = snd[..5].try_into().unwrap();
-        let (_st, sbody) = peer_send.open(&sh, &snd[5..]).expect("发送方向未轮换：仍 c0 seq0");
+        let (_st, sbody) = peer_send
+            .open(&sh, &snd[5..])
+            .expect("发送方向未轮换：仍 c0 seq0");
         assert_eq!(sbody, b"still-c0");
         // recv 已轮到 s1。
         let s1 = next_application_traffic_secret(&s0);
@@ -1149,30 +1326,49 @@ mod tests {
         let mut srv_new = keys_from(&s1);
         let down = srv_new.seal(0x17, b"down-s1");
         let dh: [u8; 5] = down[..5].try_into().unwrap();
-        let (_dt, dbody) = stream.recv_keys.open(&dh, &down[5..]).expect("recv 轮到 s1");
+        let (_dt, dbody) = stream
+            .recv_keys
+            .open(&dh, &down[5..])
+            .expect("recv 轮到 s1");
         assert_eq!(dbody, b"down-s1");
 
         // ---- 非法 request_update（2）→ Err 且零 mutation。----
         let (mut s2, _e2) = mk_stream_secrets(s0, c0);
-        assert!(s2.on_key_update(&[0x18, 0x00, 0x00, 0x01, 0x02]).is_err(), "request_update=2 → Err");
+        assert!(
+            s2.on_key_update(&[0x18, 0x00, 0x00, 0x01, 0x02]).is_err(),
+            "request_update=2 → Err"
+        );
         assert_eq!(s2.server_ap_secret, s0, "非法值不改接收 secret");
         assert!(s2.write_pending.is_empty(), "非法值不回发");
         let mut srv_s0 = keys_from(&s0);
         let d0 = srv_s0.seal(0x17, b"still-s0");
         let dh0: [u8; 5] = d0[..5].try_into().unwrap();
-        let (_t3, b3) = s2.recv_keys.open(&dh0, &d0[5..]).expect("非法值：recv_keys 未轮、仍 s0 seq0");
+        let (_t3, b3) = s2
+            .recv_keys
+            .open(&dh0, &d0[5..])
+            .expect("非法值：recv_keys 未轮、仍 s0 seq0");
         assert_eq!(b3, b"still-s0");
 
         // ---- 非法帧长（body_len != 1）→ Err 且零 mutation。----
         let (mut s3, _e3) = mk_stream_secrets(s0, c0);
-        assert!(s3.on_key_update(&[0x18, 0x00, 0x00, 0x02, 0x00, 0x00]).is_err(), "body_len=2 → Err");
-        assert!(s3.on_key_update(&[0x18, 0x00, 0x00]).is_err(), "截断帧 → Err");
+        assert!(
+            s3.on_key_update(&[0x18, 0x00, 0x00, 0x02, 0x00, 0x00])
+                .is_err(),
+            "body_len=2 → Err"
+        );
+        assert!(
+            s3.on_key_update(&[0x18, 0x00, 0x00]).is_err(),
+            "截断帧 → Err"
+        );
         // 非法帧前置校验先于任何 mutation：recv_keys 未轮、仍 s0 seq0；接收 secret 不变。
         assert_eq!(s3.server_ap_secret, s0, "非法帧不改接收 secret");
         let mut srv_s0b = keys_from(&s0);
         let d3 = srv_s0b.seal(0x17, b"frame-illegal");
         let dh3: [u8; 5] = d3[..5].try_into().unwrap();
-        let (_t4, b4) = s3.recv_keys.open(&dh3, &d3[5..]).expect("非法帧：recv_keys 未轮、仍 s0 seq0");
+        let (_t4, b4) = s3
+            .recv_keys
+            .open(&dh3, &d3[5..])
+            .expect("非法帧：recv_keys 未轮、仍 s0 seq0");
         assert_eq!(b4, b"frame-illegal");
     }
 
@@ -1198,7 +1394,10 @@ mod tests {
 
         let mut got = vec![0u8; b"after-coalesced".len()];
         stream.read_exact(&mut got).await.unwrap();
-        assert_eq!(&got, b"after-coalesced", "合并 record 中的 KeyUpdate 被处理 → recv 轮到 s1，新-key 数据可解");
+        assert_eq!(
+            &got, b"after-coalesced",
+            "合并 record 中的 KeyUpdate 被处理 → recv 轮到 s1，新-key 数据可解"
+        );
     }
 
     /// L1：fatal alert → Err；close_notify → 干净 EOF（read 返回 0）。
@@ -1220,7 +1419,11 @@ mod tests {
         e2.flush().await.unwrap();
         drop(e2);
         let mut b2 = [0u8; 4];
-        assert_eq!(s2.read(&mut b2).await.unwrap(), 0, "close_notify → 干净 EOF");
+        assert_eq!(
+            s2.read(&mut b2).await.unwrap(),
+            0,
+            "close_notify → 干净 EOF"
+        );
     }
 
     /// M4：半条 record + 裸 FIN → 截断 Err（不静默丢字节/不伪装干净 EOF）。
@@ -1232,6 +1435,9 @@ mod tests {
         srv_end.flush().await.unwrap();
         drop(srv_end); // FIN
         let mut b = [0u8; 4];
-        assert!(stream.read(&mut b).await.is_err(), "半条 record + FIN → 截断 Err（M4）");
+        assert!(
+            stream.read(&mut b).await.is_err(),
+            "半条 record + FIN → 截断 Err（M4）"
+        );
     }
 }

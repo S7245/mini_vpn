@@ -56,3 +56,7 @@ tls-parser = "0.12"
 # Knife14 H10d16 direct-TUIC ignored probe parses iperf3 JSON without changing
 # the product dependency graph.
 serde_json = "1"
+
+[patch.crates-io]
+quinn = { path = "third_party/quinn-0.11.11" }
+quinn-proto = { path = "third_party/quinn-proto-0.11.16" }

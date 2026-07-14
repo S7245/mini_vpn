@@ -40,7 +40,9 @@ pub fn extract_ed25519_pubkey_and_sig(
         return Err(err("非 Certificate（handshake type != 0x0b）"));
     }
     let hs_len = u24(cert_msg.get(1..4).ok_or_else(|| err("handshake 头截断"))?);
-    let body = cert_msg.get(4..).ok_or_else(|| err("handshake body 截断"))?;
+    let body = cert_msg
+        .get(4..)
+        .ok_or_else(|| err("handshake body 截断"))?;
     if hs_len != body.len() {
         return Err(err("handshake 长度字段与 body 不符"));
     }
@@ -49,13 +51,20 @@ pub fn extract_ed25519_pubkey_and_sig(
     let mut p = 1 + ctx_len;
     let list_len = u24(body.get(p..p + 3).ok_or_else(|| err("list_len 截断"))?);
     p += 3;
-    let list = body.get(p..p + list_len).ok_or_else(|| err("certificate_list 截断"))?;
+    let list = body
+        .get(p..p + list_len)
+        .ok_or_else(|| err("certificate_list 截断"))?;
     // 第一条 CertificateEntry：3B cert_data_len + DER + 2B ext_len。
     let cert_len = u24(list.get(0..3).ok_or_else(|| err("cert_data_len 截断"))?);
-    let der = list.get(3..3 + cert_len).ok_or_else(|| err("leaf cert DER 截断"))?;
+    let der = list
+        .get(3..3 + cert_len)
+        .ok_or_else(|| err("leaf cert DER 截断"))?;
 
     // 定点扫 ed25519 SPKI marker → 其后裸 32B 公钥。无 marker = 非 ed25519 证书（多半 decoy 回落）。
-    let Some(pos) = der.windows(ED25519_SPKI_MARKER.len()).position(|w| w == ED25519_SPKI_MARKER) else {
+    let Some(pos) = der
+        .windows(ED25519_SPKI_MARKER.len())
+        .position(|w| w == ED25519_SPKI_MARKER)
+    else {
         return Err(err(
             "未找到 ed25519 SPKI（OID 1.3.101.112）→ 非 ed25519 证书，多半服务端 REALITY auth 失败、回落 decoy。\
              查：①pbk=服务端 public_key(非 private_key) ②SNI∈serverNames ③short_id 匹配",
@@ -90,7 +99,8 @@ mod tests {
     // 严格的 x509-cert(RFC 5280) 报「malformed GeneralizedTime」拒之。本 cert = notBefore UTCTime + notAfter
     // GeneralizedTime 的 ed25519 自签证书；手解 DER **不碰 Validity** → 不受影响。
     const ED25519_CERT_GT_DER: &str = "308201403081f3a003020102021478b8af12a2ccbe7d59c3a66cdd513c159d617056300506032b657030153113301106035504030c0a7265616c6974792d67743020170d3236303632343130343931395a180f32303539303530323130343931395a30153113301106035504030c0a7265616c6974792d6774302a300506032b65700321001fdaec697021e21bc98c0a49223c6439c1b10738017fe027e8bb6da054cbf2d1a3533051301d0603551d0e041604143c59fba583f1b973dc17d84f6dfbf4a66340c384301f0603551d230418301680143c59fba583f1b973dc17d84f6dfbf4a66340c384300f0603551d130101ff040530030101ff300506032b65700341006834e4f0b5158656a2c7d15bcff59baf4a5bceae9417c519d43f6386201cf46e95c25ab465650634ec055db1d5e045e6f67039e3b1986196bd34e3f936fa8200";
-    const ED25519_GT_PUBKEY: &str = "1fdaec697021e21bc98c0a49223c6439c1b10738017fe027e8bb6da054cbf2d1";
+    const ED25519_GT_PUBKEY: &str =
+        "1fdaec697021e21bc98c0a49223c6439c1b10738017fe027e8bb6da054cbf2d1";
 
     // RFC 8448 §3 Certificate(0x0b) message（RSA leaf）——负样本：SPKI OID 非 ed25519 → 拒。
     const RFC8448_CERT_MSG: &str = "0b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e310c300a06035504031303727361301e170d3136303733303031323335395a170d3236303733303031323335395a300e310c300a0603550403130372736130819f300d06092a864886f70d010101050003818d0030818902818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b0603551d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b42b4de10000";
@@ -147,11 +157,17 @@ mod tests {
     /// 各拒绝路径（不 panic）：错 handshake type / 截断 / 长度字段不符。
     #[test]
     fn reject_malformed() {
-        assert!(extract_ed25519_pubkey_and_sig(&[0x02, 0, 0, 0]).is_err(), "非 0x0b");
+        assert!(
+            extract_ed25519_pubkey_and_sig(&[0x02, 0, 0, 0]).is_err(),
+            "非 0x0b"
+        );
         assert!(extract_ed25519_pubkey_and_sig(&[0x0b]).is_err(), "极短截断");
         let mut msg = wrap_cert_message(&hex(ED25519_CERT_DER));
         msg[1] ^= 0xff; // 破坏 handshake 长度字段
-        assert!(extract_ed25519_pubkey_and_sig(&msg).is_err(), "长度字段不符");
+        assert!(
+            extract_ed25519_pubkey_and_sig(&msg).is_err(),
+            "长度字段不符"
+        );
     }
 
     /// 把一张 ed25519 cert DER 的末 64B 签名换成 `HMAC-SHA512(auth_key, 裸 32B 公钥)`，
@@ -179,16 +195,28 @@ mod tests {
         let msg = wrap_cert_message(&der);
         let (pubkey, sig) = extract_ed25519_pubkey_and_sig(&msg).expect("提取成功");
         assert_eq!(&pubkey[..], &hex(ED25519_PUBKEY)[..]);
-        assert!(verify_server_cert(&auth_key, &pubkey, &sig), "正确 AuthKey → REALITY auth 通过");
+        assert!(
+            verify_server_cert(&auth_key, &pubkey, &sig),
+            "正确 AuthKey → REALITY auth 通过"
+        );
         // 错 AuthKey（decoy / 攻击者无静态私钥）→ 拒。
-        assert!(!verify_server_cert(&[0u8; 32], &pubkey, &sig), "错 AuthKey → 拒");
+        assert!(
+            !verify_server_cert(&[0u8; 32], &pubkey, &sig),
+            "错 AuthKey → 拒"
+        );
         // 篡改公钥任一字节 → HMAC 失配 → 拒。
         let mut bad_pk = pubkey;
         bad_pk[0] ^= 0x01;
-        assert!(!verify_server_cert(&auth_key, &bad_pk, &sig), "篡改公钥 → 拒");
+        assert!(
+            !verify_server_cert(&auth_key, &bad_pk, &sig),
+            "篡改公钥 → 拒"
+        );
         // 篡改签名任一字节 → 拒。
         let mut bad_sig = sig.clone();
         bad_sig[0] ^= 0x01;
-        assert!(!verify_server_cert(&auth_key, &pubkey, &bad_sig), "篡改签名 → 拒");
+        assert!(
+            !verify_server_cert(&auth_key, &pubkey, &bad_sig),
+            "篡改签名 → 拒"
+        );
     }
 }

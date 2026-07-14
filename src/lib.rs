@@ -9,6 +9,7 @@ pub mod harness;
 pub mod loop_profiler;
 pub mod metrics;
 pub mod quic;
+pub(crate) mod quic_udp_send_service;
 pub mod reality;
 pub mod reality_upstream;
 pub mod shared;

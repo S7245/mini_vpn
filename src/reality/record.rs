@@ -5,9 +5,9 @@
 //! open 剥尾零→最后非零字节=真 content type、全零明文→Err、读/写**两个独立 seq**（密钥切换时各归零）。
 //! KAT：seq=0 时 nonce==iv；round-trip；RFC 8448 §3 server-flight record open golden KAT（见本刀 plan T5）。
 
+use crate::shared::ClientError;
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes128Gcm, Nonce};
-use crate::shared::ClientError;
 
 /// TLS 1.3 record 上限（RFC 8446 §5.2，单一事实源；handshake/reality_upstream 共用，避免常量漂移，L5）：
 /// 明文 2^14；密文 = 明文 + 256（AEAD tag + 内层 type + padding 余量）。读路径据此防恶意巨 length 无界分配，
@@ -62,7 +62,13 @@ impl RecordKeys {
         let nonce = per_record_nonce(&self.iv, self.seq);
         let ct = self
             .cipher
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: &inner, aad: &header })
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &inner,
+                    aad: &header,
+                },
+            )
             .expect("AES-128-GCM encrypt infallible for valid key/nonce");
         self.seq = self.seq.checked_add(1).expect("record seq 溢出");
         let mut out = Vec::with_capacity(5 + ct.len());
@@ -73,11 +79,21 @@ impl RecordKeys {
 
     /// 开一条 record：解密 → 剥尾零 → 最后非零字节 = 真 content_type，其余 = content。
     /// 认证失败 / 全零明文 → Err。AAD = 传入的 `header`（收到的 5B）。
-    pub fn open(&mut self, header: &[u8; 5], encrypted_record: &[u8]) -> Result<(u8, Vec<u8>), ClientError> {
+    pub fn open(
+        &mut self,
+        header: &[u8; 5],
+        encrypted_record: &[u8],
+    ) -> Result<(u8, Vec<u8>), ClientError> {
         let nonce = per_record_nonce(&self.iv, self.seq);
         let mut inner = self
             .cipher
-            .decrypt(Nonce::from_slice(&nonce), Payload { msg: encrypted_record, aad: header })
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: encrypted_record,
+                    aad: header,
+                },
+            )
             .map_err(|_| ClientError::Reality("record 解密/认证失败".into()))?;
         self.seq = self.seq.checked_add(1).expect("record seq 溢出");
         while inner.last() == Some(&0) {
@@ -98,7 +114,9 @@ mod tests {
     /// seq=0 → nonce==iv；seq 跨字节 XOR 进低 8B。
     #[test]
     fn nonce_construction() {
-        let iv = [0x5d, 0x31, 0x3e, 0xb2, 0x67, 0x12, 0x76, 0xee, 0x13, 0x00, 0x0b, 0x30];
+        let iv = [
+            0x5d, 0x31, 0x3e, 0xb2, 0x67, 0x12, 0x76, 0xee, 0x13, 0x00, 0x0b, 0x30,
+        ];
         assert_eq!(per_record_nonce(&iv, 0), iv, "seq=0 → nonce==iv");
         let zero = [0u8; 12];
         let mut e1 = [0u8; 12];
@@ -107,7 +125,11 @@ mod tests {
         let mut e2 = [0u8; 12];
         e2[10] = 1;
         e2[11] = 2;
-        assert_eq!(per_record_nonce(&zero, 0x0102), e2, "seq 右对齐进 nonce[4..12]");
+        assert_eq!(
+            per_record_nonce(&zero, 0x0102),
+            e2,
+            "seq 右对齐进 nonce[4..12]"
+        );
     }
 
     /// record 头：版本 0x17 0x0303 + 密文长(含 tag)。
@@ -172,10 +194,23 @@ mod tests {
 
         let record = hex(SFLIGHT_RECORD);
         let header: [u8; 5] = record[..5].try_into().unwrap();
-        let (content_type, plaintext) = recv.open(&header, &record[5..]).expect("server flight 应解开");
+        let (content_type, plaintext) = recv
+            .open(&header, &record[5..])
+            .expect("server flight 应解开");
 
-        assert_eq!(content_type, 0x16, "外层解密后内层 content type = handshake");
-        assert_eq!(plaintext, hex(SFLIGHT_PAYLOAD), "明文 == RFC 8448 657B payload");
-        assert_eq!(&plaintext[..4], &[0x08, 0x00, 0x00, 0x24], "起始 EncryptedExtensions");
+        assert_eq!(
+            content_type, 0x16,
+            "外层解密后内层 content type = handshake"
+        );
+        assert_eq!(
+            plaintext,
+            hex(SFLIGHT_PAYLOAD),
+            "明文 == RFC 8448 657B payload"
+        );
+        assert_eq!(
+            &plaintext[..4],
+            &[0x08, 0x00, 0x00, 0x24],
+            "起始 EncryptedExtensions"
+        );
     }
 }

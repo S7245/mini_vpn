@@ -8,6 +8,8 @@
 
 set -euo pipefail
 
+readonly FORWARD_DISCRIMINATOR_MAX_QUIC_LOST_BYTES=16777216
+
 usage() {
   cat <<'USAGE'
 usage: scripts/knife14b-lowrtt-probe.sh <iperf-target> [port]
@@ -32,7 +34,50 @@ env:
   MINI_VPN_PROBE_INCLUDE_STREAM_SERVICE_WINDOW=0
                             set 1 to include per-chunk tcp-stream-service-window lines
   TUN_IF=tun0              TUN interface to sample for RX/TX dropped deltas
+  ROUTING_MODE=full-tunnel full-tunnel | target-only; target-only skips public-exit/fake-IP gold checks
+  FORWARD_DISCRIMINATOR=0  set 1 only for the bounded forward-only Gate; makes receiver/drop/loss failures fatal
 USAGE
+}
+
+routing_expectation_note() {
+  case "${1:-full-tunnel}" in
+    target-only)
+      echo "target-only routing: only the iperf Target is routed through TUN; public exit-IP and fake-IP DNS gold checks are not applicable."
+      ;;
+    full-tunnel)
+      echo "full-tunnel routing: curl ipinfo.io must be the exit IP; dig example.com +short must be a 198.18.x.x fake-IP."
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+forward_discriminator_report_passes() {
+  local report="$1"
+  [[ -f "$report" ]] || return 1
+  grep -Eq '[[:space:]]receiver$' "$report" || return 1
+  awk -v loss_limit="$FORWARD_DISCRIMINATOR_MAX_QUIC_LOST_BYTES" '
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^tun_tx_dropped_delta=/) {
+          split($i, value, "=")
+          tun_samples++
+          if (value[2] !~ /^[0-9]+$/ || (value[2] + 0) != 0) {
+            tun_bad = 1
+          }
+        }
+        if ($i ~ /^aggregate_lost_bytes_delta=/) {
+          split($i, value, "=")
+          quic_samples++
+          if (value[2] !~ /^[0-9]+$/ || (value[2] + 0) > loss_limit) {
+            quic_bad = 1
+          }
+        }
+      }
+    }
+    END {
+      exit !(tun_samples > 0 && tun_bad == 0 && quic_samples > 0 && quic_bad == 0)
+    }
+  ' "$report"
 }
 
 iperf_role_mbps() {
@@ -2048,6 +2093,9 @@ summarize_metrics_window() {
           max_lost_bytes_delta = lost_delta
           worst_conn = key
         }
+        if (lost_delta > 0) {
+          aggregate_lost_bytes_delta += lost_delta
+        }
         if (cong_delta > max_congestion_delta) {
           max_congestion_delta = cong_delta
           if (worst_conn == "") {
@@ -2388,7 +2436,7 @@ summarize_metrics_window() {
       printf "- runtime_tun_egress: samples=%d drop_events=%d drop_delta_total=%d max_delta=%d unavailable=%d resets=%d\n", runtime_tun_samples, runtime_tun_drop_events, runtime_tun_drop_delta_total, max_runtime_tun_delta, runtime_tun_unavailable, runtime_tun_resets
       printf "- tun_egress_feedback: pause_edges=%d resume_edges=%d drop_events=%d drop_delta_total=%d max_delta=%d max_pressure_bytes=%d\n", tun_feedback_pause_count, tun_feedback_resume_count, tun_feedback_drop_events, tun_feedback_drop_delta_total, max_tun_feedback_delta, max_tun_feedback_pressure
       printf "- tun_rx_drain: attempts=%d packets=%d timer_active_flow=%d timer_stalled_read=%d tcp=%d dns=%d udp=%d budget_exhausted=%d would_block=%d errors=%d\n", max_tun_rx_drain_attempts, max_tun_rx_drain_packets, max_tun_rx_drain_timer_active_flow, max_tun_rx_drain_timer_stalled_read, max_tun_rx_drain_tcp, max_tun_rx_drain_dns, max_tun_rx_drain_udp, max_tun_rx_drain_budget_exhausted, max_tun_rx_drain_would_block, max_tun_rx_drain_errors
-      printf "- quic: samples=%d worst_conn=%s max_lost_bytes_delta=%d max_congestion_events_delta=%d max_start_lost_bytes=%d max_start_congestion_events=%d min_start_cwnd=%s min_cwnd=%s inherited_conns=%s inherited_low_cwnd_threshold=%d max_tx_blocked_data_delta=%d max_tx_blocked_stream_delta=%d max_rx_blocked_data_delta=%d max_rx_blocked_stream_delta=%d\n", quic_samples, worst_conn, max_lost_bytes_delta, max_congestion_delta, max_start_lost_bytes, max_start_congestion_events, min_start_cwnd_all, min_cwnd_all, inherited_quic_conns, inherited_low_cwnd_limit, max_tx_data_delta, max_tx_stream_delta, max_rx_data_delta, max_rx_stream_delta
+      printf "- quic: samples=%d worst_conn=%s max_lost_bytes_delta=%d aggregate_lost_bytes_delta=%d max_congestion_events_delta=%d max_start_lost_bytes=%d max_start_congestion_events=%d min_start_cwnd=%s min_cwnd=%s inherited_conns=%s inherited_low_cwnd_threshold=%d max_tx_blocked_data_delta=%d max_tx_blocked_stream_delta=%d max_rx_blocked_data_delta=%d max_rx_blocked_stream_delta=%d\n", quic_samples, worst_conn, max_lost_bytes_delta, aggregate_lost_bytes_delta, max_congestion_delta, max_start_lost_bytes, max_start_congestion_events, min_start_cwnd_all, min_cwnd_all, inherited_quic_conns, inherited_low_cwnd_limit, max_tx_data_delta, max_tx_stream_delta, max_rx_data_delta, max_rx_stream_delta
       print "- attribution: " labels
     }
   '
@@ -2470,6 +2518,53 @@ EOF_LOG
     fi
   }
 
+  if ! declare -F forward_discriminator_report_passes >/dev/null; then
+    echo "lowrtt probe self-test failed: forward discriminator report gate missing" >&2
+    exit 1
+  fi
+  if ! declare -F routing_expectation_note >/dev/null; then
+    echo "lowrtt probe self-test failed: routing expectation helper missing" >&2
+    exit 1
+  fi
+
+  local discriminator_report
+  discriminator_report="$tmpdir/forward-discriminator.md"
+  cat > "$discriminator_report" <<'EOF_DISCRIMINATOR'
+[  5]   0.00-20.00  sec   420 MBytes   176 Mbits/sec                  receiver
+- tun_drops: if=tun0 tun_rx_dropped_delta=0 tun_tx_dropped_delta=0
+- quic: samples=3 worst_conn=1 max_lost_bytes_delta=12582912 aggregate_lost_bytes_delta=12582912 max_congestion_events_delta=200
+EOF_DISCRIMINATOR
+  forward_discriminator_report_passes "$discriminator_report"
+  local aggregate_excess_report
+  aggregate_excess_report="$tmpdir/forward-discriminator-aggregate-excess.md"
+  cat > "$aggregate_excess_report" <<'EOF_AGGREGATE_EXCESS'
+[  5]   0.00-20.00  sec   420 MBytes   176 Mbits/sec                  receiver
+- tun_drops: if=tun0 tun_rx_dropped_delta=0 tun_tx_dropped_delta=0
+- quic: samples=4 worst_conn=0:11 max_lost_bytes_delta=9437184 aggregate_lost_bytes_delta=18874368 max_congestion_events_delta=2
+EOF_AGGREGATE_EXCESS
+  if forward_discriminator_report_passes "$aggregate_excess_report"; then
+    echo "lowrtt probe self-test failed: forward discriminator accepted aggregate pool QUIC loss above the budget" >&2
+    exit 1
+  fi
+  sed -i.bak 's/tun_tx_dropped_delta=0/tun_tx_dropped_delta=1/' "$discriminator_report"
+  if forward_discriminator_report_passes "$discriminator_report"; then
+    echo "lowrtt probe self-test failed: forward discriminator accepted a TUN TX drop" >&2
+    exit 1
+  fi
+  sed -i.bak 's/tun_tx_dropped_delta=1/tun_tx_dropped_delta=0/; s/max_lost_bytes_delta=12582912/max_lost_bytes_delta=16777217/; s/aggregate_lost_bytes_delta=12582912/aggregate_lost_bytes_delta=16777217/' "$discriminator_report"
+  if forward_discriminator_report_passes "$discriminator_report"; then
+    echo "lowrtt probe self-test failed: forward discriminator accepted excess QUIC loss" >&2
+    exit 1
+  fi
+  sed -i.bak '/receiver$/d; s/max_lost_bytes_delta=16777217/max_lost_bytes_delta=0/; s/aggregate_lost_bytes_delta=16777217/aggregate_lost_bytes_delta=0/' "$discriminator_report"
+  if forward_discriminator_report_passes "$discriminator_report"; then
+    echo "lowrtt probe self-test failed: forward discriminator accepted a missing receiver result" >&2
+    exit 1
+  fi
+  assert_contains "$(routing_expectation_note target-only)" "not applicable"
+  assert_not_contains "$(routing_expectation_note target-only)" "must be the exit IP"
+  assert_contains "$(routing_expectation_note full-tunnel)" "must be the exit IP"
+
   local transfer_spec
   transfer_spec="$(IPERF_BYTES=64M DURATION=20 tcp_transfer_spec)"
   assert_contains "$transfer_spec" "-n 64M"
@@ -2501,6 +2596,7 @@ EOF_LOG
   assert_contains "$summary" "runtime_tun_egress: samples=1 drop_events=1 drop_delta_total=1423 max_delta=1423 unavailable=0 resets=0"
   assert_contains "$summary" "tun_rx_drain: attempts=4 packets=11 timer_active_flow=0 timer_stalled_read=2 tcp=9 dns=1 udp=1 budget_exhausted=1 would_block=3 errors=0"
   assert_contains "$summary" "max_lost_bytes_delta=439956"
+  assert_contains "$summary" "aggregate_lost_bytes_delta=439956"
   assert_contains "$summary" "attribution: quic_loss_congestion+local_write_pressure+local_tun_egress_drop+local_drop_credit+local_pressure_credit+local_downlink_backpressure+local_global_rx_receive_window+terminal_late_remote_payload+terminal_pending_reap"
   assert_contains "$summary" "pending_at_close+pending_close_active_no_send"
   assert_contains "$summary" "egress_at_close+egress_close_send_capable+egress_close_drain_candidate"
@@ -2512,7 +2608,18 @@ EOF_LOG
 EOF_LOG
   summary="$(summarize_metrics_window 0 "existing-conn-self-test" "$iperf_sample" "$log_sample")"
   assert_contains "$summary" "max_lost_bytes_delta=500"
+  assert_contains "$summary" "aggregate_lost_bytes_delta=500"
   assert_contains "$summary" "max_congestion_events_delta=3"
+
+  cat > "$log_sample" <<'EOF_LOG'
+📊 TUIC QUIC stats conn=0 id=100 rtt=1ms cwnd=90000 lost=0/100 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=10/1000B udp_rx=2/200B dg_max=Some(1418) dg_space=1048576B
+📊 TUIC QUIC stats conn=1 id=101 rtt=1ms cwnd=90000 lost=0/100 lost_bytes=0 congestion_events=0 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=10/1000B udp_rx=2/200B dg_max=Some(1418) dg_space=1048576B
+📊 TUIC QUIC stats conn=0 id=100 rtt=1ms cwnd=80000 lost=10/200 lost_bytes=9437184 congestion_events=1 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=20/2000B udp_rx=4/400B dg_max=Some(1418) dg_space=1048576B
+📊 TUIC QUIC stats conn=1 id=101 rtt=1ms cwnd=80000 lost=10/200 lost_bytes=9437184 congestion_events=1 tx_blocked(data=0,stream=0,streams_bidi=0,streams_uni=0) rx_blocked(data=0,stream=0) tx_window(max_data=0,max_stream_data=0) rx_window(max_data=0,max_stream_data=0) udp_tx=20/2000B udp_rx=4/400B dg_max=Some(1418) dg_space=1048576B
+EOF_LOG
+  summary="$(summarize_metrics_window 0 "aggregate-pool-loss-self-test" "$iperf_sample" "$log_sample")"
+  assert_contains "$summary" "max_lost_bytes_delta=9437184"
+  assert_contains "$summary" "aggregate_lost_bytes_delta=18874368"
 
   cat > "$iperf_sample" <<'EOF_IPERF'
 Reverse mode, remote host 43.130.32.77 is sending
@@ -2862,6 +2969,9 @@ IPERF_BUSY_RETRIES="${IPERF_BUSY_RETRIES:-3}"
 IPERF_BUSY_WAIT_SECS="${IPERF_BUSY_WAIT_SECS:-5}"
 POST_IPERF_METRICS_SETTLE_SECS="${POST_IPERF_METRICS_SETTLE_SECS:-2}"
 PROBE_ORDER="${PROBE_ORDER:-forward-first}"
+ROUTING_MODE="${ROUTING_MODE:-full-tunnel}"
+FORWARD_DISCRIMINATOR="${FORWARD_DISCRIMINATOR:-0}"
+IPERF_COMMAND_FAILURES=0
 OUT="${OUT:-/tmp/mvpn_knife14b_lowrtt_$(date +%Y%m%d_%H%M%S).md}"
 METRIC_RE='📊 数据面|🔬 主循环|TUIC datagram|UDP relay mode|TCP socket buffers|TUIC QUIC stats|tuic-open-tcp|tuic-tcp-stream-first-rx|tuic-tcp-stream-read-gap|tuic-tcp-stream-pending|tuic-tcp-stream-close|tuic-tcp-pool-(probe|selection|reconnect)|tuic-tcp-unordered-staging|tcp-relay-live|tcp-relay-ack-drain-hint|tcp-relay-write-half-closed|tcp-relay-close|tcp-d16-relay-close|tcp-handle-close|tcp-deferred-close-egress|tcp-lifecycle-transition|tcp-reverse-window|tcp-local-egress-service|tcp-local-write-pressure|tcp-global-rx-pressure|tcp-global-rx-backpressure|tcp-downlink-backpressure|tcp-downlink-flush|tcp-tun-rx-drain|tcp-tun-egress'
 if [[ "${MINI_VPN_PROBE_INCLUDE_STREAM_SERVICE_WINDOW:-0}" == "1" ]]; then
@@ -2875,6 +2985,24 @@ case "$PROBE_ORDER" in
     exit 2
     ;;
 esac
+case "$ROUTING_MODE" in
+  full-tunnel|target-only) ;;
+  *)
+    echo "invalid ROUTING_MODE=$ROUTING_MODE (expected full-tunnel|target-only)" >&2
+    exit 2
+    ;;
+esac
+case "$FORWARD_DISCRIMINATOR" in
+  0|1) ;;
+  *)
+    echo "invalid FORWARD_DISCRIMINATOR=$FORWARD_DISCRIMINATOR (expected 0|1)" >&2
+    exit 2
+    ;;
+esac
+if [[ "$FORWARD_DISCRIMINATOR" == "1" && "$PROBE_ORDER" != "forward-only" ]]; then
+  echo "FORWARD_DISCRIMINATOR=1 requires PROBE_ORDER=forward-only" >&2
+  exit 2
+fi
 if ! is_uint "$POST_IPERF_METRICS_SETTLE_SECS"; then
   echo "invalid POST_IPERF_METRICS_SETTLE_SECS=$POST_IPERF_METRICS_SETTLE_SECS (expected non-negative integer seconds)" >&2
   exit 2
@@ -3053,6 +3181,9 @@ append_iperf_cmd() {
 
     break
   done
+  if ((status != 0)); then
+    IPERF_COMMAND_FAILURES=$((IPERF_COMMAND_FAILURES + 1))
+  fi
   wait_for_post_iperf_metrics_settle "$metrics_title"
   tun_after="$(sample_tun_drops "$tun_if_before")"
   read -r tun_if_after tun_rx_after tun_tx_after <<< "$tun_after"
@@ -3085,19 +3216,28 @@ append_iperf_cmd() {
   echo "- iperf_busy_wait_secs: ${IPERF_BUSY_WAIT_SECS}"
   echo "- post_iperf_metrics_settle_secs: ${POST_IPERF_METRICS_SETTLE_SECS}"
   echo "- probe_order: ${PROBE_ORDER}"
+  echo "- routing_mode: ${ROUTING_MODE}"
+  echo "- forward_discriminator: ${FORWARD_DISCRIMINATOR}"
+  echo "- forward_discriminator_max_quic_lost_bytes: ${FORWARD_DISCRIMINATOR_MAX_QUIC_LOST_BYTES}"
   echo "- log: ${LOG}"
   echo
-  echo "> 判读前先确认：curl ipinfo.io 必须是 exit IP；dig example.com +short 应是 198.18.x.x；📊 TCP relay 累计应增长。"
+  echo "> $(routing_expectation_note "$ROUTING_MODE")"
 } > "$OUT"
 
 append_cleanliness_check
 
-append_section "Tunnel Gold Checks"
-append_cmd curl -fsS ipinfo.io
-if command -v dig >/dev/null 2>&1; then
-  append_cmd dig example.com +short
+if [[ "$ROUTING_MODE" == "target-only" ]]; then
+  append_section "Target-Only Routing Checks"
+  echo "$(routing_expectation_note "$ROUTING_MODE")" | tee -a "$OUT"
+  append_cmd ip route get "$TARGET"
 else
-  echo "dig not found; skipping fake-IP DNS check" | tee -a "$OUT"
+  append_section "Tunnel Gold Checks"
+  append_cmd curl -fsS ipinfo.io
+  if command -v dig >/dev/null 2>&1; then
+    append_cmd dig example.com +short
+  else
+    echo "dig not found; skipping fake-IP DNS check" | tee -a "$OUT"
+  fi
 fi
 
 append_section "Recent mini_vpn Metrics"
@@ -3167,5 +3307,20 @@ if [[ -f "$LOG" ]]; then
   } | tee -a "$OUT"
 fi
 
+PROBE_STATUS=0
+if [[ "$FORWARD_DISCRIMINATOR" == "1" ]]; then
+  append_section "Forward Discriminator Decision"
+  if ((IPERF_COMMAND_FAILURES > 0)); then
+    echo "FAIL: iperf command failures=$IPERF_COMMAND_FAILURES" | tee -a "$OUT"
+    PROBE_STATUS=1
+  elif forward_discriminator_report_passes "$OUT"; then
+    echo "PASS: receiver present, all TUN TX drop deltas are zero, and aggregate pool QUIC lost-byte delta is within ${FORWARD_DISCRIMINATOR_MAX_QUIC_LOST_BYTES}B." | tee -a "$OUT"
+  else
+    echo "FAIL: missing receiver result, non-zero/unknown TUN TX drop delta, missing aggregate QUIC sample, or aggregate pool QUIC lost-byte delta above ${FORWARD_DISCRIMINATOR_MAX_QUIC_LOST_BYTES}B." | tee -a "$OUT"
+    PROBE_STATUS=1
+  fi
+fi
+
 echo
 echo "report written: $OUT"
+exit "$PROBE_STATUS"

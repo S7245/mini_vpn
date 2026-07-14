@@ -35,7 +35,9 @@ impl HandshakeReassembler {
             if self.buf.len() < 4 {
                 break; // 连 type+len 头都不够
             }
-            let len = ((self.buf[1] as usize) << 16) | ((self.buf[2] as usize) << 8) | self.buf[3] as usize;
+            let len = ((self.buf[1] as usize) << 16)
+                | ((self.buf[2] as usize) << 8)
+                | self.buf[3] as usize;
             let total = 4 + len;
             if self.buf.len() < total {
                 break; // message body 未集齐 → 等后续
@@ -81,7 +83,9 @@ pub(crate) struct RecordReader {
 
 impl RecordReader {
     pub(crate) fn new() -> Self {
-        Self { buf: BytesMut::with_capacity(4096) }
+        Self {
+            buf: BytesMut::with_capacity(4096),
+        }
     }
 
     /// 用残留字节初始化 RecordReader（仅测试用：生产路径 RealityStream::new 直接把 leftover 塞 read_raw、
@@ -97,7 +101,11 @@ impl RecordReader {
         r: &mut R,
     ) -> Result<(u8, [u8; 5], Vec<u8>), ClientError> {
         while self.buf.len() < 5 {
-            if r.read_buf(&mut self.buf).await.map_err(|e| io_err("读 record 头", e))? == 0 {
+            if r.read_buf(&mut self.buf)
+                .await
+                .map_err(|e| io_err("读 record 头", e))?
+                == 0
+            {
                 return Err(err("连接关闭（读 record 头 EOF）"));
             }
         }
@@ -107,7 +115,11 @@ impl RecordReader {
             return Err(err(format!("record 长度 {len} 超 TLS 上限")));
         }
         while self.buf.len() < 5 + len {
-            if r.read_buf(&mut self.buf).await.map_err(|e| io_err("读 record body", e))? == 0 {
+            if r.read_buf(&mut self.buf)
+                .await
+                .map_err(|e| io_err("读 record body", e))?
+                == 0
+            {
                 return Err(err("连接关闭（读 record body EOF）"));
             }
         }
@@ -179,7 +191,8 @@ where
 {
     use crate::reality::auth::x25519_shared_secret;
     use crate::reality::key_schedule::{
-        compute_finished_verify_data, derive_application_keys, derive_handshake_keys, transcript_hash,
+        compute_finished_verify_data, derive_application_keys, derive_handshake_keys,
+        transcript_hash,
     };
     use crate::reality::server_hello::parse_server_hello;
 
@@ -190,16 +203,24 @@ where
         .await
         .map_err(|e| io_err("写 client CCS", e))?;
     stream.flush().await.map_err(|e| io_err("flush CH", e))?;
-    rdbg!("→ 已发 ClientHello {} 字节 + dummy CCS，等 ServerHello…", input.client_hello.len());
+    rdbg!(
+        "→ 已发 ClientHello {} 字节 + dummy CCS，等 ServerHello…",
+        input.client_hello.len()
+    );
 
     let mut transcript: Vec<u8> = input.client_hello.clone();
 
     let mut reader = RecordReader::new();
     // 2. 读 ServerHello（首条 record 须 0x16）。
     let (ct, _hdr, sh_msg) = reader.next(stream).await?;
-    rdbg!("← 收到首条 record type=0x{ct:02x} body={} 字节", sh_msg.len());
+    rdbg!(
+        "← 收到首条 record type=0x{ct:02x} body={} 字节",
+        sh_msg.len()
+    );
     if ct != 0x16 {
-        return Err(err(format!("首条 record 非 handshake（type 0x{ct:02x}，期望 ServerHello）")));
+        return Err(err(format!(
+            "首条 record 非 handshake（type 0x{ct:02x}，期望 ServerHello）"
+        )));
     }
     let sh = parse_server_hello(&sh_msg, &input.expected_session_id)?;
     rdbg!("✓ ServerHello 解析 OK cipher=0x{:04x}", sh.cipher_suite);
@@ -221,14 +242,19 @@ where
     let mut cert_verified = false;
     'outer: loop {
         let (ct, hdr, payload) = reader.next(stream).await?;
-        rdbg!("← flight record type=0x{ct:02x} body={} 字节", payload.len());
+        rdbg!(
+            "← flight record type=0x{ct:02x} body={} 字节",
+            payload.len()
+        );
         match ct {
             // server dummy CCS：整条丢弃，**不 open、不递增 server read seq**（不变量 3）。
             0x14 => continue,
             0x17 => {
                 let (inner_type, content) = recv.open(&hdr, &payload)?;
                 if inner_type != 0x16 {
-                    return Err(err(format!("flight 阶段内层非 handshake（0x{inner_type:02x}）")));
+                    return Err(err(format!(
+                        "flight 阶段内层非 handshake（0x{inner_type:02x}）"
+                    )));
                 }
                 for msg in reasm.push(&content) {
                     rdbg!("  flight message type=0x{:02x} len={}", msg[0], msg.len());
@@ -260,7 +286,9 @@ where
                             transcript.extend_from_slice(&msg);
                             break 'outer;
                         }
-                        other => return Err(err(format!("flight 意外 handshake type 0x{other:02x}"))),
+                        other => {
+                            return Err(err(format!("flight 意外 handshake type 0x{other:02x}")));
+                        }
                     }
                 }
             }
@@ -275,8 +303,14 @@ where
     fin_msg.extend_from_slice(&[0x14, 0x00, 0x00, 0x20]);
     fin_msg.extend_from_slice(&cfin);
     let fin_record = send_hs.seal(0x16, &fin_msg);
-    stream.write_all(&fin_record).await.map_err(|e| io_err("写 client Finished", e))?;
-    stream.flush().await.map_err(|e| io_err("flush client Finished", e))?;
+    stream
+        .write_all(&fin_record)
+        .await
+        .map_err(|e| io_err("写 client Finished", e))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| io_err("flush client Finished", e))?;
 
     // 6. app keys（read/write seq 各归零，新 RecordKeys）。
     let app = derive_application_keys(&hs.handshake_secret, &th_sfin);
@@ -356,7 +390,8 @@ mod tests {
     // RFC 8448 §3 server 加密握手 flight 的完整 on-wire record（679B，17 03 03 ... 含 5B 头）。
     const SFLIGHT_RECORD: &str = "17030302a2d1ff334a56f5bff6594a07cc87b580233f500f45e489e7f33af35edf7869fcf40aa40aa2b8ea73f848a7ca07612ef9f945cb960b4068905123ea78b111b429ba9191cd05d2a389280f526134aadc7fc78c4b729df828b5ecf7b13bd9aefb0e57f271585b8ea9bb355c7c79020716cfb9b1183ef3ab20e37d57a6b9d7477609aee6e122a4cf51427325250c7d0e509289444c9b3a648f1d71035d2ed65b0e3cdd0cbae8bf2d0b227812cbb360987255cc744110c453baa4fcd610928d809810e4b7ed1a8fd991f06aa6248204797e36a6a73b70a2559c09ead686945ba246ab66e5edd8044b4c6de3fcf2a89441ac66272fd8fb330ef8190579b3684596c960bd596eea520a56a8d650f563aad27409960dca63d3e688611ea5e22f4415cf9538d51a200c27034272968a264ed6540c84838d89f72c24461aad6d26f59ecaba9acbbb317b66d902f4f292a36ac1b639c637ce343117b659622245317b49eeda0c6258f100d7d961ffb138647e92ea330faeea6dfa31c7a84dc3bd7e1b7a6c7178af36879018e3f252107f243d243dc7339d5684c8b0378bf30244da8c87c843f5e56eb4c5e8280a2b48052cf93b16499a66db7cca71e4599426f7d461e66f99882bd89fc50800becca62d6c74116dbd2972fda1fa80f85df881edbe5a37668936b335583b599186dc5c6918a396fa48a181d6b6fa4f9d62d513afbb992f2b992f67f8afe67f76913fa388cb5630c8ca01e0c65d11c66a1e2ac4c85977b7c7a6999bbf10dc35ae69f5515614636c0b9b68c19ed2e31c0b3b66763038ebba42f3b38edc0399f3a9f23faa63978c317fc9fa66a73f60f0504de93b5b845e275592c12335ee340bbc4fddd502784016e4b3be7ef04dda49f4b440a30cb5d2af939828fd4ae3794e44f94df5a631ede42c1719bfdabf0253fe5175be898e750edc53370d2b";
     // RFC 8448 §3 客户端临时 X25519 私钥（产出 ECDHE 8bd4054f…）。
-    const RFC8448_CLIENT_EPH: &str = "49af42ba7f7994852d713ef2784bcbcaa7911de26adc5642cb634540e7ea5005";
+    const RFC8448_CLIENT_EPH: &str =
+        "49af42ba7f7994852d713ef2784bcbcaa7911de26adc5642cb634540e7ea5005";
 
     fn arr16(s: &str) -> [u8; 16] {
         hex(s).try_into().unwrap()
@@ -389,7 +424,10 @@ mod tests {
             shrec.extend_from_slice(&(sh.len() as u16).to_be_bytes());
             shrec.extend_from_slice(&sh);
             server_io.write_all(&shrec).await.unwrap();
-            server_io.write_all(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]).await.unwrap();
+            server_io
+                .write_all(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01])
+                .await
+                .unwrap();
             server_io.write_all(&flight_record).await.unwrap();
             server_io.flush().await.unwrap();
 
@@ -399,12 +437,19 @@ mod tests {
             assert_eq!(ct_ch, 0x16);
             assert_eq!(got_ch, ch_for_sim, "client 发的 CH 字节 == 输入");
             let (ct_ccs, _h2, ccs_body) = rr.next(&mut server_io).await.unwrap();
-            assert_eq!((ct_ccs, ccs_body.as_slice()), (0x14, &[0x01][..]), "client dummy CCS");
+            assert_eq!(
+                (ct_ccs, ccs_body.as_slice()),
+                (0x14, &[0x01][..]),
+                "client dummy CCS"
+            );
             let (ct_fin, fhdr, fpayload) = rr.next(&mut server_io).await.unwrap();
             assert_eq!(ct_fin, 0x17, "client Finished 是加密 record");
 
             // 用 c_hs key/iv（RFC 8448）解 client Finished，验 verify_data 字节正确。
-            let mut crecv = RecordKeys::new(&arr16("dbfaa693d1762c5b666af5d950258d01"), &arr12("5bd3c71b836e0b76bb73265f"));
+            let mut crecv = RecordKeys::new(
+                &arr16("dbfaa693d1762c5b666af5d950258d01"),
+                &arr12("5bd3c71b836e0b76bb73265f"),
+            );
             let (inner, fin_msg) = crecv.open(&fhdr, &fpayload).unwrap();
             assert_eq!(inner, 0x16, "client Finished 内层 handshake");
             let th_sfin = arr32("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13");
@@ -414,16 +459,24 @@ mod tests {
             assert_eq!(fin_msg, want, "client Finished verify_data 字节正确");
 
             // 3. app round-trip：用 RFC 8448 published handshake_secret + th_sfin 独立派生 app keys。
-            let handshake_secret = arr32("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac");
+            let handshake_secret =
+                arr32("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac");
             let app = derive_application_keys(&handshake_secret, &th_sfin);
             let mut s_ap = RecordKeys::new(&app.server_key, &app.server_iv);
-            server_io.write_all(&s_ap.seal(0x17, b"server-app-hello")).await.unwrap();
+            server_io
+                .write_all(&s_ap.seal(0x17, b"server-app-hello"))
+                .await
+                .unwrap();
             server_io.flush().await.unwrap();
             let (ct_a, ahdr, apayload) = rr.next(&mut server_io).await.unwrap();
             assert_eq!(ct_a, 0x17);
             let mut c_ap = RecordKeys::new(&app.client_key, &app.client_iv);
             let (it, content) = c_ap.open(&ahdr, &apayload).unwrap();
-            assert_eq!((it, content.as_slice()), (0x17, &b"client-app-hi"[..]), "client app data 经 send_keys 正确");
+            assert_eq!(
+                (it, content.as_slice()),
+                (0x17, &b"client-app-hi"[..]),
+                "client app data 经 send_keys 正确"
+            );
         });
 
         // client：跑 drive（KAT 用 always-ok verify_cert——RFC 8448 cert 是 RSA 不走 ed25519 HMAC）。
@@ -432,22 +485,32 @@ mod tests {
             client_eph_secret: client_eph,
             expected_session_id: vec![], // RFC 8448 CH 空 session_id
         };
-        let mut out = drive(&mut client_io, input, |_cert| Ok(())).await.expect("握手应成功");
+        let mut out = drive(&mut client_io, input, |_cert| Ok(()))
+            .await
+            .expect("握手应成功");
 
         // recv_keys(app) 解 server 的 app record；send_keys(app) 封 client app record。
         let mut rr_app = RecordReader::with_leftover(out.leftover);
         let (ct, hdr, payload) = rr_app.next(&mut client_io).await.unwrap();
         assert_eq!(ct, 0x17);
         let (it, content) = out.recv_keys.open(&hdr, &payload).unwrap();
-        assert_eq!((it, content.as_slice()), (0x17, &b"server-app-hello"[..]), "recv_keys 字节级正确（app server key/iv + seq0）");
-        client_io.write_all(&out.send_keys.seal(0x17, b"client-app-hi")).await.unwrap();
+        assert_eq!(
+            (it, content.as_slice()),
+            (0x17, &b"server-app-hello"[..]),
+            "recv_keys 字节级正确（app server key/iv + seq0）"
+        );
+        client_io
+            .write_all(&out.send_keys.seal(0x17, b"client-app-hi"))
+            .await
+            .unwrap();
         client_io.flush().await.unwrap();
 
         sim.await.unwrap();
     }
 
     // RFC 8448 §3 EncryptedExtensions message（供 H1 负向测试构造「无 Certificate」的 flight）。
-    const RFC8448_EE: &str = "080000240022000a00140012001d00170018001901000101010201030104001c0002400100000000";
+    const RFC8448_EE: &str =
+        "080000240022000a00140012001d00170018001901000101010201030104001c0002400100000000";
 
     /// **H1 安全守卫负向 KAT**：server flight 只发 EE + Finished（无 Certificate），transcript 自洽、
     /// server Finished MAC 正确（ECDHE 派生，与 REALITY 静态 pbk 无关）——模拟被回落的 decoy。
@@ -474,11 +537,17 @@ mod tests {
             shrec.extend_from_slice(&(sh.len() as u16).to_be_bytes());
             shrec.extend_from_slice(&sh);
             server_io.write_all(&shrec).await.unwrap();
-            server_io.write_all(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]).await.unwrap();
+            server_io
+                .write_all(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01])
+                .await
+                .unwrap();
             let server_key: [u8; 16] = hex("3fce516009c21727d0f2e4e86ee403bc").try_into().unwrap();
             let server_iv: [u8; 12] = hex("5d313eb2671276ee13000b30").try_into().unwrap();
             let mut s_hs_rk = RecordKeys::new(&server_key, &server_iv);
-            server_io.write_all(&s_hs_rk.seal(0x16, &flight)).await.unwrap();
+            server_io
+                .write_all(&s_hs_rk.seal(0x16, &flight))
+                .await
+                .unwrap();
             server_io.flush().await.unwrap();
         });
 
@@ -489,7 +558,10 @@ mod tests {
         };
         // verify_cert=always-ok：证明拒绝不是因为 verify_cert 失败，而是 Certificate 根本没出现。
         let r = drive(&mut client_io, input, |_cert| Ok(())).await;
-        assert!(r.is_err(), "无 Certificate 的 flight 必须拒绝（REALITY auth 未执行）");
+        assert!(
+            r.is_err(),
+            "无 Certificate 的 flight 必须拒绝（REALITY auth 未执行）"
+        );
         let _ = sim.await;
     }
 
@@ -500,12 +572,19 @@ mod tests {
         let (mut client_io, mut server_io) = tokio::io::duplex(4096);
         let sim = tokio::spawn(async move {
             // 写一条 app-data record 当首条（非 0x16）。
-            server_io.write_all(&[0x17, 0x03, 0x03, 0x00, 0x01, 0x00]).await.unwrap();
+            server_io
+                .write_all(&[0x17, 0x03, 0x03, 0x00, 0x01, 0x00])
+                .await
+                .unwrap();
             // 读掉 client 的 CH/CCS 防止其 write 阻塞（buffer 够大其实不阻塞）。
             let mut buf = [0u8; 512];
             let _ = tokio::io::AsyncReadExt::read(&mut server_io, &mut buf).await;
         });
-        let input = HandshakeInput { client_hello: hex(RFC8448_CH), client_eph_secret: [1u8; 32], expected_session_id: vec![] };
+        let input = HandshakeInput {
+            client_hello: hex(RFC8448_CH),
+            client_eph_secret: [1u8; 32],
+            expected_session_id: vec![],
+        };
         let r = drive(&mut client_io, input, |_| Ok(())).await;
         assert!(r.is_err(), "首条非 SH → Err");
         let _ = sim.await;
@@ -516,7 +595,11 @@ mod tests {
     async fn early_eof_errs() {
         let (mut client_io, server_io) = tokio::io::duplex(4096);
         drop(server_io); // 立即 EOF
-        let input = HandshakeInput { client_hello: hex(RFC8448_CH), client_eph_secret: [1u8; 32], expected_session_id: vec![] };
+        let input = HandshakeInput {
+            client_hello: hex(RFC8448_CH),
+            client_eph_secret: [1u8; 32],
+            expected_session_id: vec![],
+        };
         let r = drive(&mut client_io, input, |_| Ok(())).await;
         assert!(r.is_err(), "EOF → Err");
     }

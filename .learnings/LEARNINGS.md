@@ -1,5 +1,249 @@
 # Learnings
 
+## 2026-07-13 - Endpoint-owned pre-accounting closes the local burst/capacity gate
+
+- The complete `EndpointWindowV1` path passed an exact GSO-enabled `32 MiB`
+  upload at `240.466 Mbit/s`, with `33,554,432B` delivered, zero pattern
+  errors, clean EOF, endpoint delay activity, and no cap64 or bounded sender.
+  Final endpoint state was `available=61,440B`, `live=0`, `outstanding=0`, and
+  `records=0`.
+- Real accounting matched the designed seam: `34,324,276B` was granted,
+  `1,867B` refunded, and `34,322,409B` accepted by the UDP socket across
+  `23,641` datagrams. The service therefore owns planned bytes before packet
+  construction and retains actual bytes through the real socket outcome; it
+  is not another post-accounting cooldown.
+- The regression surface stayed intact: quinn-proto `309/309 + 3/3` docs,
+  Quinn `29/29` nonignored + `1/1` doc, mini_vpn `622/622` nonignored, explicit
+  `64/256/1024` concurrency, and the UDP sweep all passed. Default Quinn
+  remains byte-equivalent when the endpoint policy is absent.
+- Reusable rule: a throughput architecture is locally eligible for VPS only
+  when one test joins the theorem to the real driver/socket lifecycle and
+  proves both capacity and zero accounting leak. Pure token tests or a fast
+  loopback alone are insufficient.
+- Result:
+  `docs/tech/2026-07-13-knife14h10d16-endpoint-pacing-service-local-gate-results.md`.
+
+## 2026-07-13 - Lifecycle anomalies must preserve pacing fail-closed
+
+- Quinn removes a `ConnectionHandle` only after connection `State::drop`
+  abandons/detaches endpoint pacing and sends the `Drained` event, so normal
+  slab reuse cannot collide with an attached service key. Migration
+  tombstones retain only already charged old-path batches and are removed by
+  their exact socket outcome.
+- Code review still found a defensive failure-mode defect: if a target path
+  generation were unexpectedly occupied, the connection detached pacing and
+  continued unpaced. The repair keeps the old attached adapter on migration
+  rejection. Aggregate safety and service continue even though diagnostic
+  generation attribution stays on the last valid key.
+- Reusable rule: internal uniqueness assertions may remain diagnostic, but an
+  impossible lifecycle branch must not disable a safety service in release
+  mode. Prefer stale-but-conservative attribution over fail-open throughput.
+
+## 2026-07-13 - Pre-accounted bytes make the endpoint window testable before Quinn integration
+
+- The Task 3 pure module now charges planned wire bytes before construction,
+  moves only actual bytes to socket outstanding on settlement, refunds short
+  builds or dropped reservations exactly once, and releases outstanding bytes
+  only after a real socket-success transition.
+- Integer refill retains sub-byte-time remainder while service is unsaturated,
+  discards stale credit at saturation, ignores time rollback, and saturates
+  extreme arithmetic. Deterministic arbitrary-window traces cover datagram
+  sizes from `1B` through the full `61,440B` burst.
+- The frozen `30,720,000B/s`, `61,440B` candidate emits exactly
+  `92,160B/1ms` and `368,640B/10ms` under 50us fake-time polling. Every tested
+  transition preserves
+  `available_tokens + live_reservation_bytes + outstanding_bytes <= burst_bytes`.
+- Reusable rule: prove the byte theorem in a pure fake-time module before
+  connection construction, packet classification, fairness, wakers, or socket
+  Adapter integration. Current dead-code warnings are expected only until that
+  Parallel Change reaches its real endpoint/driver consumers.
+
+## 2026-07-13 - A temporal egress proof must include reservations and socket backlog
+
+- A deterministic Quinn fake-time replay made the cap64 limitation exact:
+  with `RTT=200us`, `cwnd=40000B`, `MTU=1280`, 20 datagrams per driver poll,
+  and 50us poll cadence, the Pacer issued `259` datagrams inside `1ms` even
+  though stored capacity stayed exactly `64*MTU`.
+- A shared token bucket at packet-build time is still incomplete if bytes
+  accepted by Quinn accounting can wait behind socket `WouldBlock` while the
+  bucket refills. The temporal invariant must keep both live reservations and
+  finalized-but-unsent bytes charged:
+  `tokens + live_reserved + outstanding <= burst`.
+- The resulting proposed endpoint contract uses `30.72 MB/s` wire rate and a
+  `61,440B` burst: `<=92,160B/1ms`, `<=368,640B/10ms`, and about
+  `239.167 Mbit/s` application capacity after measured QUIC overhead. The
+  policy belongs in Quinn-proto before packet accounting; pinned Quinn only
+  supplies waker and socket-outcome callbacks.
+- Reusable rule: a cross-connection time-window claim needs a theorem over
+  actual finalized/socket-accepted bytes, not gross planned grants, one
+  connection's stored tokens, or a post-accounting socket delay. Include
+  short-build refunds, `WouldBlock`, fairness, control liveness, migration,
+  cancellation, and detach before implementation.
+- Source:
+  `docs/tech/2026-07-13-knife14h10d16-endpoint-pacing-service-architecture-spec.md`.
+
+## 2026-07-13 - A Pacer token ceiling is not a time-window burst ceiling
+
+- The cap64 VPS data connection was exact and attributable: it carried
+  `99.9998%` of TX bytes, had stable identity and bounded cwnd, and one formal
+  snapshot reduced `327680B` upstream capacity to `81920B = 64*1280`.
+  Nevertheless client egress peaked at `267 packets/1ms` and `1337/10ms`,
+  slightly above the prior Quinn-default edge, while TUN drops and formal QUIC
+  loss remained `29` and `50,621,275B`.
+- Quinn deliberately preserves `1.25*cwnd/rtt` refill. At sub-ms RTT, elapsed
+  time inside one observed millisecond can refill and spend multiple stored
+  buckets. The cap was active in only one of five formal data snapshots, and
+  delay events stopped increasing while bulk transmission continued.
+- Reusable rule: distinguish stored capacity from a temporal service
+  invariant. Before claiming a burst bound, test sub-ms RTT with fake time and
+  state the exact 1ms/10ms or sliding-window contract; capacity math and one
+  cap-active snapshot are not sufficient.
+- Result:
+  `docs/tech/2026-07-13-knife14h10d16-pacer-cap64-forward-discriminator-results.md`.
+
+## 2026-07-13 - Same-window pcap separates mechanism failure from path loss
+
+- Both current control and mini_vpn captures had about a `50 MB` bilateral UDP
+  byte gap, so this window cannot assign all raw packet loss uniquely to
+  mini_vpn. The mature control still sustained `191.928 Mbit/s` with zero
+  socket drops, while mini_vpn added local TUN drops and exceeded its formal
+  loss gate.
+- The cadence comparison stayed decisive despite shared path loss: control
+  client egress was `100 packets/1ms` and `605/10ms`, versus cap64
+  `267/1337`. Reusable rule: keep same-window capacity, endpoint drops,
+  bilateral bytes, and client-side cadence as separate discriminators; do not
+  infer a product root from one of them alone.
+
+## 2026-07-13 - Acceptance knobs need one canonical end-to-end fingerprint
+
+- The cap64 path already passed its real capacity gate, but review found that
+  the acceptance runner did not own the new policy as an end-to-end contract.
+  Validation alone was insufficient: the policy now has a canonical value
+  set, an incompatible-pacer veto, an explicit env assignment used by both the
+  report and launch argv, and an independent startup-log verifier that runs
+  even when the H10d16 profile gate is disabled.
+- Formal runtime stats now keep path `current_mtu` separate from the Pacer's
+  `pacing_mtu`. This prevents an active-cap assertion from silently attributing
+  a capacity computed for one MTU to the path's current MTU.
+- Reusable rule: every performance policy must be validated, composition-safe,
+  propagated through the real launcher, reported, and verified from the
+  process's own startup fingerprint. Profile-specific verification cannot be
+  the only proof of a transport policy that exists outside that profile.
+
+## 2026-07-13 - Known-negative measurements must not remain default gates
+
+- The rejected fixed `48 then 2ms` replay was still a normal library test with
+  a `>170 Mbit/s` assertion, so it stopped the cap64 regression even though its
+  own architecture had already been measured and rejected. Making the real
+  replay explicit/ignored preserves it as a measurement without confusing it
+  with a production invariant; its deterministic conservation, timer, GSO,
+  and wake tests remain active.
+- The Quinn cap now computes `optimal_capacity` once and applies the optional
+  ceiling to that result. This keeps default behavior equivalent while making
+  the derivation itself testable and avoiding duplicate RTT/window division.
+- Reusable rule: classify tracer tests when their architecture is accepted or
+  rejected. Keep deterministic mechanism invariants in the default suite, but
+  make environment-sensitive known-negative throughput replays opt-in.
+
+## 2026-07-13 - Reverse-only parity does not prove forward-then-reverse health
+
+- The repaired exact build sustained `60s` reverse at `186 Mbit/s` receiver,
+  all `60/60` intervals nonzero, zero TUN drops, and no stall. A fresh
+  forward-first process then added `54` TUN TX drops and about `61.3 MB` of
+  QUIC lost bytes during P1 forward; its following reverse inherited `63.7
+  MB` lost bytes / `22033` congestion events and averaged only `136 Mbit/s`.
+- The inherited reverse eventually recovered to a `190.167 Mbit/s` tail, so a
+  healthy tail alone does not erase poisoned per-connection history. Product
+  acceptance must exercise direction transitions and classify each subwindow
+  against its own start counters.
+- The same flow later hit `half_closed_idle_timeout` with `524288B` still
+  D16-owned and `27736B` in an active send-capable egress candidate. Timeout
+  policy must treat useful owned/drainable bytes as a hard inhibit, independent
+  of whether the preceding transport loss is client-specific or path-wide.
+- Reusable rule: after reverse parity passes, run forward-first before broad
+  concurrency. Use a same-window mature forward control before changing QUIC
+  code or parameters, and do not reuse a contaminated connection as the sole
+  reverse discriminator.
+- Result:
+  `docs/tech/2026-07-13-knife14h10d16-product-regression-repair-and-forward-failure.md`.
+
+## 2026-07-13 - Conditional once-per-pass aggregation restores the 1024-flow gate
+
+- The focused scan seam proved D16/non-buffered credit needs zero global
+  pending scans, while buffered credit needs one aggregate per dirty pass and
+  can update it from per-handle pending deltas.
+- Clean `1024/1024` now completes in `12.294s` with `4.272s` in relay, replacing
+  the `733/1024` timeout with `101.271s` in relay. Normal tests, UDP sweep,
+  ownership checks, and the sustained reverse VPS run all stayed green.
+- Reusable rule: a performance fix should remove the disproved cost only at
+  its consumer boundary. Preserve retained-mode semantics and validate the
+  exact patch from a clean detached build instead of formatting or staging
+  unrelated dirty files.
+
+## 2026-07-13 - A global pressure scan inside a per-flow loop silently restores O(n squared)
+
+- Clean `a54fb17` passed `609` lib tests and `10` normal concurrency harness
+  tests, including `64/64`, but the explicit sweep completed only `733/1024`
+  at its `120s` limit. All `1024` mock upstream opens occurred, while the
+  relay segment consumed `101.271s` and late relays reached the `90s` idle
+  timeout.
+- Historical Knife2 evidence completed the same `1024/1024` shape in about
+  `2.3s` with roughly `70.8ms` in relay. The regression is the aggregate
+  `downlink_pressure_stats` scan added inside every handle iteration of
+  `process_dirty_relay`: it scans dirty handles and all sockets, producing
+  O(active²) work.
+- The accepted D16/default path has buffered-downlink disabled, so its credit
+  branch never consumes this aggregate pending value. Reusable rule: aggregate
+  observability/backpressure calculations must be once-per-pass, incremental,
+  or conditional on their consumer; normal small-N tests cannot substitute
+  for the explicit 1024-flow gate.
+- Result:
+  `docs/tech/2026-07-13-knife14h10d16-product-regression-concurrency-failure.md`.
+- Resolution: the confirmed conditional/once-per-pass repair now passes
+  `1024/1024`; the later VPS stop is a separate forward-first transport and
+  lifecycle failure.
+
+## 2026-07-13 - Gate B needs both a median capacity proof and one natural EOF proof
+
+- Clean `a54fb17` produced three exact reverse-first P1 receiver results of
+  `192`, `188`, and `191 Mbit/s`; median `191 Mbit/s` passed the absolute
+  `170 Mbit/s` gate. All 60 one-second intervals carried data, while TUN drop,
+  actor bypass, send/flush error, pressure/drop debt, reconnect, QUIC
+  loss/blocking, and terminal pending reap stayed zero.
+- The same-window mature control was only `143.228 Mbit/s`, but its target-only
+  route and both UDP socket drop counters were clean. The documented relative
+  threshold was `128.9052 Mbit/s`; mini_vpn passed both it and the stricter
+  absolute median target. A control runner's Gate-A-oriented `INCAPABLE` label
+  must not replace the distinct Task 12 Gate B formula.
+- The one post-median fixed `64 MiB` flow delivered exactly `67108864B` at
+  `179 Mbit/s` and closed with `clean_queue_lifecycle`, empty queued/leased/
+  reserved ownership, pending/inflight `0/0`, and zero close/TUN tail. Timed
+  capacity and natural EOF remain separate proofs even when timed shutdown
+  reports no terminal cause.
+- Reusable rule: count measurement samples only after mini_vpn and iperf enter
+  the declared window. Evidence-backed preflight/configuration errors may be
+  corrected under the user's standing override without changing frozen
+  product parameters; a real gate failure still stops for analysis and a plan.
+- Result: `docs/tech/2026-07-13-knife14h10d16-gate-b-results.md`.
+
+## 2026-07-13 - Gate controls require an explicit server ALPN fingerprint
+
+- Clean `a54fb17`, the accepted mini_vpn binary, exact Shoes `v0.2.7`, exact
+  sing-box `1.13.14`, healthy `214.494 Mbit/s` direct reverse, MTU1200,
+  target-only routing, and full zero-drop UDP sockets were not sufficient to
+  make the control valid. The reconstructed Shoes config omitted its explicit
+  `h3` ALPN list, so TLS failed before TUIC or iperf data.
+- A running listener plus correct cert/key/auth is not the complete transport
+  fingerprint. For QUIC acceptance, the ephemeral server config must lock and
+  validate ALPN alongside implementation version, endpoint count, worker
+  count, port, socket buffers, and credentials.
+- Reusable rule: assert non-secret protocol fields in the in-memory rendered
+  config before feeding one-shot secret FIFOs. If a control fails before a
+  receiver result, preserve it as invalid setup, do not spend product repeats,
+  and do not classify the window as incapable. Under the current user override,
+  correct the evidenced configuration fault and rerun without another
+  confirmation; do not change frozen product parameters.
+
 ## 2026-07-12 - Modern Quinn closes the external TUIC capacity question
 
 - Shoes `v0.2.7` / Quinn `0.11.9` delivered `192.666 Mbit/s` receiver through
@@ -6117,3 +6361,138 @@ worth cleaning up separately.
   EOF, MTU, pool, QUIC windows, chunk size, or self-wake. Once capacity and
   clean lifecycle pass independently on the same process, advance to repeated
   statistical parity instead of reopening architecture.
+
+## 2026-07-13 - Bilateral capture selects Quinn transmit burst shape
+
+- A half-closed relay timer must consult payload ownership, not elapsed time
+  alone. Queued and leased/inflight D16 payload now defer timeout; reserved-only
+  capacity does not. The focused test must also release ownership and prove the
+  timeout becomes eligible again, or it only proves a leak.
+- Same-instance forward control is essential. Sing-box completed at
+  `182.856 Mbit/s` with zero socket drops, while mini_vpn completed at
+  `193 Mbit/s` but added `30` TUN TX drops and `57,632,755B` of in-window QUIC
+  loss. Throughput alone would have falsely called the mini_vpn sample healthy.
+- Compare client egress bytes to Exit ingress bytes, not raw packet counts,
+  because GRO coalesced mini_vpn packets at the Exit. Mini_vpn's bilateral UDP
+  gap (`62,205,385B`) matched Quinn's loss counter (`62,280,889B`); both
+  tcpdump processes had zero kernel drops.
+- Timing buckets exposed a concrete mechanism: mini_vpn peaked at `261`
+  packets/`334,080B` per millisecond versus control `93`/`132,738B`. This
+  closely matches Quinn-proto's `256 * MTU` pacer burst clamp and makes the
+  GSO/send-service seam the next reversible tracer bullet.
+- Keep TUN MTU and QUIC MTU policy distinct in reports. This accepted profile
+  used TUN MTU `1200` but QUIC `mtu_policy=default`; silently substituting QUIC
+  `safe1200` would be a new MTU experiment, not a configuration correction.
+- `black_holes_detected` is Quinn's derived suspicious-loss-burst count. It can
+  rise even when MTU discovery is disabled. Here all four actual PLPMTUD probes
+  succeeded, so the count describes loss shape and does not prove an MTU root.
+- Sanitized discriminator evidence, including four bilateral pcaps, is under
+  `/tmp/mini_vpn_h10d16_forward_discriminator_a54fb17/`. The Exit was restored
+  fail-closed and all four temporary socket sysctls returned to `212992`.
+
+## 2026-07-13 - Disabling GSO does not bound Quinn send service
+
+- The default-enabled GSO policy seam and a real 32 MiB disabled-GSO upload
+  proved reachability, exact delivery, clean EOF, and local capacity. That was
+  a necessary tracer gate, not proof of burst pacing.
+- In the same valid Shoes window, control reached `175.102 Mbit/s` receiver
+  with a 2.47% bilateral byte gap, while disabled-GSO mini_vpn reached
+  `193 Mbit/s` but retained `30` TUN drops and a 12.89% byte gap. High
+  throughput must never override the loss/drop discriminator.
+- Disabling GSO reduced the prior mini_vpn 1 ms peak from 261 to 163 packets,
+  yet formal QUIC loss increased to `67,826,613B`. GSO aggregation affects
+  syscall/packet shape but is not the sufficient root.
+- Code reachability explains the result: Quinn-proto emits one datagram per
+  disabled-GSO `poll_transmit`, but Quinn loops to 20 datagrams per driver
+  poll, self-wakes when work remains, and its pacer can retain 256 packets of
+  capacity. Bound service across driver polls, not only each UDP syscall.
+- The public `AsyncUdpSocket` abstraction is the preferred reversible seam for
+  a shared endpoint-level send service; it avoids vendoring Quinn and can be
+  tested with a mock socket, paused time, multiple pollers, byte/datagram
+  conservation, and explicit no-busy-wake invariants.
+- Reusable capacity rule: `170 Mbit/s` is `21.25 MB/s`, or about `16,602`
+  1280-byte datagrams/s. A proposed fixed 48-datagram/2ms service ceiling has
+  `30.72 MB/s` raw capacity, so it can bound the measured microburst without
+  making the target mathematically unreachable.
+
+## 2026-07-13 - Static send-service capacity needs achieved-period evidence
+
+- The endpoint-level `AsyncUdpSocket` seam is real: one shared adapter covered
+  two pollers, counted GSO wire equivalents, preserved inner `WouldBlock`, and
+  conserved accepted bytes/metadata without a queue or background task.
+- Exact `32 MiB` delivery and clean EOF still reached only `94.172 Mbit/s`
+  under the fixed `48 then 2ms cooldown` profile. Dividing capacity by the
+  requested timer period was not sufficient because runtime wake and driver
+  service sit in the actual batch period.
+- Reusable rule: a timer-gated throughput design must measure scheduled versus
+  actual rearm time and achieved bytes/datagrams per second before claiming
+  sufficiency. When the real local capacity gate fails, stop before VPS and
+  distinguish timer lateness from packetization instead of tuning the nominal
+  interval.
+
+## 2026-07-13 - Additive pacing can fail even with a perfect timer
+
+- The instrumented fixed service delivered exact `32 MiB` and clean EOF at
+  `98.311 Mbit/s`. Mean payload was `1199.953B`, so packetization was healthy.
+- A 48-datagram batch averaged `4.573ms`: `2ms` intentional cooldown,
+  `1.340ms` measured rearm lateness, and roughly `1.233ms` of send/service
+  work. The `170 Mbit/s` limit requires at most `2.710ms` per batch.
+- Reusable rule: when a transport already has an elapsed-time token-bucket
+  pacer, a socket wrapper that sleeps for a full interval after each batch
+  double-paces it. Subtracting timer lateness is not enough; if work plus the
+  intentional delay already misses the capacity bound, reject the mechanism
+  rather than tuning the timer.
+- Burst-cap work must preserve the existing rate/debt model and separately
+  define whether its limit is per connection or aggregate across the endpoint
+  pool. Those contracts are not interchangeable.
+
+## 2026-07-13 - Pacer caps are byte ownership, not all-packet theorems
+
+- Quinn checks pacing before packet construction and records send/loss/pacing
+  state before the runtime `AsyncUdpSocket` call. A public socket adapter that
+  intentionally returns `WouldBlock` therefore delays an already-accounted
+  packet and is a second pacer, even if it shares a correct endpoint token
+  bucket.
+- Quinn's pacer capacity is bytes. A configured `64 * mtu` maximum is best
+  described as 64 paced MTU-equivalents, not 64 wire datagrams. Padded/bulk
+  packets are charged before GSO coalescing, while pure ACK-only packets may
+  retain zero-sized pacing accounting.
+- At the measured `1.027567595` wire/application ratio, `170 Mbit/s` requires
+  about `21.836 MB/s` wire and `18,197` measured datagrams/s. Reusing the failed
+  cap 48 lacks mean-lateness headroom; cap 64 has about `203.4 Mbit/s`
+  conservative mean-lateness application capacity while preserving Quinn's
+  refill slope and elapsed-time debt.
+- Reusable scope rule: two independent cap-64 connections prove at most a
+  static `128 * mtu` stored paced-token ceiling. They do not prove an
+  endpoint-wide sliding-window rate or fairness bound. A single-flow result is
+  attributable only when one connection carries at least 95% of QUIC TX,
+  current uncapped/effective capacity proves the cap active, every snapshot
+  has `cwnd <= u32::MAX`, and no migration occurs.
+
+## 2026-07-13 - Quinn pacer-cap64 passes the real local capacity gate
+
+- The pinned `quinn-proto 0.11.16` patch passed all `274/274` upstream library
+  tests. Default configuration omits the new option and retains the upstream
+  `256 * mtu` capacity; the candidate changes only the stored token ceiling.
+- The GSO-enabled real loopback upload delivered exactly `32 MiB` with a fixed
+  `64 KiB` application chunk, zero pattern errors, clean EOF, and
+  `537.106 Mbit/s` application sender throughput. The old bounded socket
+  service was absent.
+- The active snapshot proved the selected mechanism rather than only the env
+  label: `uncapped=307200B`, `capacity=76800B=64*1200`, `tokens=42913B`,
+  `cap_active=true`, `delay_events=12`, and `cwnd=34116309 <= u32::MAX`.
+- Quinn does not eagerly apply elapsed refill time when existing tokens already
+  cover the requested send. Characterization tests must use an empty bucket
+  when proving half/full refill, otherwise they accidentally assert a behavior
+  Quinn does not provide.
+- `PathStats.current_mtu` may advance before the pacer receives another
+  `delay()` call and refreshes its accounting MTU. Formal acceptance must log
+  both `current_mtu` and `pacing_mtu`, require equality in the selected window,
+  and calculate the effective cap from that matched snapshot.
+- Review rule: preserve the default hot path as well as its result. Compute the
+  upstream capacity once and derive the optional maximum from that value; do
+  not repeat the RTT/window division on every congestion-window change merely
+  to expose an uncapped diagnostic.
+- Expected-failing measurement tracers must not remain as unconditional tests
+  in the default product regression. Retain their deterministic mechanism
+  tests and make the expensive known-negative replay explicit/ignored.

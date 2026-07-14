@@ -27,6 +27,9 @@ readonly DEFAULT_TUIC_TCP_ORDERED_CHUNK=0
 readonly DEFAULT_TUIC_TCP_UNORDERED_REASSEMBLY=0
 readonly DEFAULT_TUIC_TCP_NATIVE_CHUNK_PUMP=0
 readonly DEFAULT_TUIC_TCP_NATIVE_ORDERED_PUMP=0
+readonly DEFAULT_TUIC_GSO_POLICY=enabled
+readonly DEFAULT_TUIC_UDP_SEND_SERVICE=quinn
+readonly DEFAULT_TUIC_PACING_POLICY=quinn
 readonly LEGACY_DOWNLINK_BACKPRESSURE_HIGH_BYTES=524288
 readonly LEGACY_DOWNLINK_BACKPRESSURE_LOW_BYTES=131072
 readonly DEFAULT_SERVER_EVIDENCE_SING_BOX_TAIL=220
@@ -40,12 +43,86 @@ h10d16_expected_startup_line() {
   printf '%s\n' 'H10d16 byte-owned egress: enabled per_flow_cap=524288 global_cap=67108864 quantum=131072'
 }
 
+verify_tuic_pacing_startup_policy() {
+  local log_file="$1"
+  local expected_pacing_policy="${2:-$DEFAULT_TUIC_PACING_POLICY}"
+
+  grep -Fq "QUIC pacing policy=${expected_pacing_policy}" "$log_file"
+}
+
 verify_h10d16_startup_profile() {
   local log_file="$1"
   local expected_mtu="$2"
+  local expected_gso_policy="$3"
+  local expected_send_service="${4:-$DEFAULT_TUIC_UDP_SEND_SERVICE}"
+  local expected_pacing_policy="${5:-$DEFAULT_TUIC_PACING_POLICY}"
 
   grep -Fq "TUN runtime started with pool_size=2, tun_mtu=${expected_mtu}," "$log_file" &&
-    grep -Fqx "$(h10d16_expected_startup_line)" "$log_file"
+    grep -Fqx "$(h10d16_expected_startup_line)" "$log_file" &&
+    grep -Fq "QUIC GSO policy=${expected_gso_policy}" "$log_file" &&
+    grep -Fq "QUIC UDP send service=${expected_send_service}" "$log_file" &&
+    verify_tuic_pacing_startup_policy "$log_file" "$expected_pacing_policy"
+}
+
+validate_tuic_gso_policy() {
+  case "${1:-}" in
+    enabled|disabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_tuic_udp_send_service() {
+  case "${1:-}" in
+    quinn|bounded) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_tuic_pacing_policy() {
+  case "${1:-}" in
+    quinn|pacer-cap64|endpoint-window-v1) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_tuic_send_policy_pair() {
+  local pacing_policy="${1:-}"
+  local send_service="${2:-}"
+
+  validate_tuic_pacing_policy "$pacing_policy" || return 1
+  validate_tuic_udp_send_service "$send_service" || return 1
+  [[ "$pacing_policy" == "quinn" || "$send_service" != "bounded" ]]
+}
+
+tuic_pacing_policy_env_assignment() {
+  local pacing_policy="${1:-}"
+  validate_tuic_pacing_policy "$pacing_policy" || return 1
+  printf 'MINI_VPN_TUIC_PACING_POLICY=%s\n' "$pacing_policy"
+}
+
+forward_discriminator_mode() {
+  [[ "${STOP_AFTER_STANDARD_P1:-0}" == "1" && "${STANDARD_P1_ORDER:-forward-first}" == "forward-only" ]]
+}
+
+run_standard_p1_probe() {
+  local label="${1:-standard_p1}"
+  local parallel="${2:-1}"
+  local duration="${3:-20}"
+  local discriminator=0
+  local status
+
+  if forward_discriminator_mode; then
+    discriminator=1
+  fi
+  if run_lowrtt_probe "$label" "$parallel" "$duration" "${STANDARD_P1_ORDER:-forward-first}" "" "$discriminator"; then
+    return 0
+  else
+    status=$?
+  fi
+  if ((discriminator == 1)); then
+    return "$status"
+  fi
+  return 0
 }
 
 sha256_file() {
@@ -707,6 +784,76 @@ summarize_final_lifecycle_window() {
 suite_self_test() {
   local sample expected actual help_text profile_log
 
+  if ! declare -F run_standard_p1_probe >/dev/null; then
+    echo "suite self-test failed: standard P1 status policy helper missing" >&2
+    return 1
+  fi
+  if ! (
+    run_lowrtt_probe() { return 42; }
+    STOP_AFTER_STANDARD_P1=1
+    STANDARD_P1_ORDER=forward-only
+    run_standard_p1_probe
+  ); then
+    :
+  else
+    echo "suite self-test failed: forward discriminator swallowed standard P1 failure" >&2
+    return 1
+  fi
+  if ! (
+    run_lowrtt_probe() { return 42; }
+    STOP_AFTER_STANDARD_P1=0
+    STANDARD_P1_ORDER=forward-first
+    run_standard_p1_probe
+  ); then
+    echo "suite self-test failed: broader sweep no longer preserves best-effort probe behavior" >&2
+    return 1
+  fi
+
+  if ! declare -F validate_tuic_gso_policy >/dev/null; then
+    echo "suite self-test failed: TUIC GSO policy validator missing" >&2
+    return 1
+  fi
+  if ! validate_tuic_gso_policy enabled || ! validate_tuic_gso_policy disabled ||
+    validate_tuic_gso_policy false || validate_tuic_gso_policy unknown; then
+    echo "suite self-test failed: TUIC GSO policy validator accepted a non-canonical value" >&2
+    return 1
+  fi
+  if [[ "$DEFAULT_TUIC_GSO_POLICY" != "enabled" ]]; then
+    echo "suite self-test failed: TUIC GSO production default drifted" >&2
+    return 1
+  fi
+  if ! validate_tuic_udp_send_service quinn || ! validate_tuic_udp_send_service bounded ||
+    validate_tuic_udp_send_service paced ||
+    [[ "$DEFAULT_TUIC_UDP_SEND_SERVICE" != "quinn" ]]; then
+    echo "suite self-test failed: TUIC UDP send-service policy drifted" >&2
+    return 1
+  fi
+  if ! declare -F validate_tuic_pacing_policy >/dev/null ||
+    ! validate_tuic_pacing_policy quinn || ! validate_tuic_pacing_policy pacer-cap64 ||
+    ! validate_tuic_pacing_policy endpoint-window-v1 ||
+    validate_tuic_pacing_policy cap64 || validate_tuic_pacing_policy unknown ||
+    [[ "$DEFAULT_TUIC_PACING_POLICY" != "quinn" ]]; then
+    echo "suite self-test failed: TUIC pacing policy drifted" >&2
+    return 1
+  fi
+  if ! declare -F validate_tuic_send_policy_pair >/dev/null ||
+    ! validate_tuic_send_policy_pair quinn bounded ||
+    ! validate_tuic_send_policy_pair pacer-cap64 quinn ||
+    ! validate_tuic_send_policy_pair endpoint-window-v1 quinn ||
+    validate_tuic_send_policy_pair pacer-cap64 bounded ||
+    validate_tuic_send_policy_pair endpoint-window-v1 bounded; then
+    echo "suite self-test failed: TUIC pacing/send-service mutual exclusion drifted" >&2
+    return 1
+  fi
+  if ! declare -F tuic_pacing_policy_env_assignment >/dev/null ||
+    [[ "$(tuic_pacing_policy_env_assignment pacer-cap64 2>/dev/null)" != \
+      "MINI_VPN_TUIC_PACING_POLICY=pacer-cap64" ]] ||
+    [[ "$(tuic_pacing_policy_env_assignment endpoint-window-v1 2>/dev/null)" != \
+      "MINI_VPN_TUIC_PACING_POLICY=endpoint-window-v1" ]]; then
+    echo "suite self-test failed: TUIC pacing policy env propagation helper drifted" >&2
+    return 1
+  fi
+
   sample="$(cat <<'EOF'
 111 bash ssh ubuntu@43.172.75.27 cd /home/ubuntu/mini_vpn && bash scripts/knife14b-usclient-tunnel-suite.sh
 222 mini_vpn /home/ubuntu/mini_vpn/target/release/mini_vpn client-tun
@@ -733,16 +880,33 @@ EOF
   cat > "$profile_log" <<'EOF'
 🚀 TUN runtime started with pool_size=2, tun_mtu=1200, tun_tx_queue_len_estimate=1000
 H10d16 byte-owned egress: enabled per_flow_cap=524288 global_cap=67108864 quantum=131072
+🧭 TUIC 拥塞控制器=Cubic | UDP relay mode=Native | QUIC MTU policy=default | QUIC GSO policy=enabled | QUIC UDP send service=quinn | QUIC pacing policy=pacer-cap64
 EOF
-  if ! verify_h10d16_startup_profile "$profile_log" 1200; then
+  if ! verify_h10d16_startup_profile "$profile_log" 1200 enabled quinn pacer-cap64; then
     echo "suite self-test failed: exact H10d16 Gate A profile was rejected" >&2
+    return 1
+  fi
+  if ! declare -F verify_tuic_pacing_startup_policy >/dev/null ||
+    ! verify_tuic_pacing_startup_policy "$profile_log" pacer-cap64 ||
+    verify_tuic_pacing_startup_policy "$profile_log" quinn; then
+    echo "suite self-test failed: standalone TUIC pacing startup fingerprint drifted" >&2
+    return 1
+  fi
+  cat > "$profile_log" <<'EOF'
+🚀 TUN runtime started with pool_size=2, tun_mtu=1200, tun_tx_queue_len_estimate=1000
+H10d16 byte-owned egress: enabled per_flow_cap=524288 global_cap=67108864 quantum=131072
+🧭 TUIC 拥塞控制器=Cubic | UDP relay mode=Native | QUIC MTU policy=default | QUIC GSO policy=enabled | QUIC UDP send service=quinn | QUIC pacing policy=quinn
+EOF
+  if verify_h10d16_startup_profile "$profile_log" 1200 enabled quinn pacer-cap64; then
+    echo "suite self-test failed: mismatched TUIC pacing startup fingerprint was accepted" >&2
     return 1
   fi
   cat > "$profile_log" <<'EOF'
 🚀 TUN runtime started with pool_size=2, tun_mtu=1500, tun_tx_queue_len_estimate=1000
 H10d16 byte-owned egress: enabled per_flow_cap=524288 global_cap=67108864 quantum=131072
+🧭 TUIC 拥塞控制器=Cubic | UDP relay mode=Native | QUIC MTU policy=default | QUIC GSO policy=enabled | QUIC UDP send service=quinn | QUIC pacing policy=pacer-cap64
 EOF
-  if verify_h10d16_startup_profile "$profile_log" 1200; then
+  if verify_h10d16_startup_profile "$profile_log" 1200 enabled quinn pacer-cap64; then
     echo "suite self-test failed: mismatched H10d16 Gate A MTU was accepted" >&2
     return 1
   fi
@@ -819,6 +983,18 @@ EOF
     echo "suite self-test failed: H10d16 byte-owned egress help default drifted" >&2
     return 1
   fi
+  if ! grep -q "MINI_VPN_TUIC_GSO_POLICY=$DEFAULT_TUIC_GSO_POLICY" <<<"$help_text"; then
+    echo "suite self-test failed: TUIC GSO policy help default drifted" >&2
+    return 1
+  fi
+  if ! grep -q "MINI_VPN_TUIC_UDP_SEND_SERVICE=$DEFAULT_TUIC_UDP_SEND_SERVICE" <<<"$help_text"; then
+    echo "suite self-test failed: TUIC UDP send-service help default drifted" >&2
+    return 1
+  fi
+  if ! grep -q "MINI_VPN_TUIC_PACING_POLICY=$DEFAULT_TUIC_PACING_POLICY" <<<"$help_text"; then
+    echo "suite self-test failed: TUIC pacing policy help default drifted" >&2
+    return 1
+  fi
   if ! grep -q "MINI_VPN_TUIC_TCP_ORDERED_CHUNK=$DEFAULT_TUIC_TCP_ORDERED_CHUNK" <<<"$help_text"; then
     echo "suite self-test failed: ordered chunk diagnostic help default drifted" >&2
     return 1
@@ -841,6 +1017,15 @@ EOF
   fi
   if ! grep -q "STOP_AFTER_REVERSE_FIRST_P1=0" <<<"$help_text"; then
     echo "suite self-test failed: reverse-only stop help missing" >&2
+    return 1
+  fi
+  if ! grep -q "STANDARD_P1_ORDER=forward-first" <<<"$help_text" ||
+    ! grep -q "STOP_AFTER_STANDARD_P1=0" <<<"$help_text"; then
+    echo "suite self-test failed: standard P1 direction/stop help missing" >&2
+    return 1
+  fi
+  if ! grep -q "SUDO_NONINTERACTIVE=0" <<<"$help_text"; then
+    echo "suite self-test failed: noninteractive sudo help missing" >&2
     return 1
   fi
   if ! grep -q "PROFILE_REHEARSAL_ONLY=0" <<<"$help_text"; then
@@ -1115,6 +1300,7 @@ Optional env:
   CARGO=<path>              cargo binary override, useful when running as root with rustup under /home/ubuntu
   KILL_OLD=1                stop old mini_vpn client-tun before starting
   KEEP_TUNNEL=0             keep mini_vpn running after the suite
+  SUDO_NONINTERACTIVE=0     set 1 to validate with sudo -n true instead of refreshing an interactive ticket
   STARTUP_TIMEOUT=25
   METRICS_SECS=5
   CHECK_VPS_SERVICES=1      preflight-check Exit host reachability and Target iperf3 before tunnel starts
@@ -1142,8 +1328,11 @@ Optional env:
   TARGET_SSH_STRICT_HOST_KEY_CHECKING=accept-new
   TARGET_SSH_KNOWN_HOSTS_FILE="$OUT_DIR/target_ssh_known_hosts"
   SERVER_EVIDENCE_SSH_TIMEOUT=20s  hard outer bound for each Exit/Target evidence SSH command
+  SOCKET_EVIDENCE_SAMPLES=12       one-second active-window client/Exit UDP socket snapshots per probe
   RUN_REVERSE_FIRST_P1=0   run a fresh reverse-only P1 probe before the normal forward-first probe
   STOP_AFTER_REVERSE_FIRST_P1=0  stop after the fresh reverse-only P1 and final snapshots
+  STANDARD_P1_ORDER=forward-first  use forward-only for a bounded forward discriminator
+  STOP_AFTER_STANDARD_P1=0  stop after the standard P1 and final snapshots; skip the full sweep
   PROFILE_REHEARSAL_ONLY=0  verify binary/runner hashes and exact startup profile, then stop before iperf
   RUN_D16_EOF_CLOSE_PROBE=0  after reverse-first P1 quiets, run one fixed-byte reverse flow to prove graceful EOF
   D16_EOF_CLOSE_BYTES=64M   fixed reverse payload for the D16 EOF-close proof; passed to iperf3 -n
@@ -1153,6 +1342,9 @@ Optional env:
   IPERF_BUSY_RETRIES=3      retry each iperf sub-run when Target reports "server is busy"
   IPERF_BUSY_WAIT_SECS=5    seconds to wait between iperf busy retries
   MINI_VPN_TUIC_TCP_POOL=2  TUIC TCP connection pool; set 1 only for explicit single-connection A/B diagnostics
+  MINI_VPN_TUIC_GSO_POLICY=enabled  Quinn UDP segmentation offload; set disabled only for the bounded Knife14 tracer bullet
+  MINI_VPN_TUIC_UDP_SEND_SERVICE=quinn  set bounded for the fixed aggregate 48-datagram/2ms Knife14 tracer
+  MINI_VPN_TUIC_PACING_POLICY=quinn  set endpoint-window-v1 for the endpoint-owned aggregate byte service
   MINI_VPN_TUIC_TCP_ORDERED_CHUNK=0  set 1 to enable H4 ordered chunk diagnostic path
   MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY=0  set 1 to enable TUIC unordered reassembly diagnostic path
   MINI_VPN_TUIC_TCP_NATIVE_CHUNK_PUMP=0  set 1 to enable TUIC native unordered read-pump diagnostic path
@@ -1208,6 +1400,7 @@ RUN_BASE_MTU_P1="${RUN_BASE_MTU_P1:-0}"
 BUILD_RELEASE="${BUILD_RELEASE:-1}"
 KILL_OLD="${KILL_OLD:-1}"
 KEEP_TUNNEL="${KEEP_TUNNEL:-0}"
+SUDO_NONINTERACTIVE="${SUDO_NONINTERACTIVE:-0}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-25}"
 METRICS_SECS="${METRICS_SECS:-5}"
 CHECK_VPS_SERVICES="${CHECK_VPS_SERVICES:-1}"
@@ -1235,8 +1428,11 @@ TARGET_SSH_PROXY_JUMP="${TARGET_SSH_PROXY_JUMP:-}"
 TARGET_SSH_STRICT_HOST_KEY_CHECKING="${TARGET_SSH_STRICT_HOST_KEY_CHECKING:-accept-new}"
 TARGET_SSH_KNOWN_HOSTS_FILE="${TARGET_SSH_KNOWN_HOSTS_FILE:-$OUT_DIR/target_ssh_known_hosts}"
 SERVER_EVIDENCE_SSH_TIMEOUT="${SERVER_EVIDENCE_SSH_TIMEOUT:-20s}"
+SOCKET_EVIDENCE_SAMPLES="${SOCKET_EVIDENCE_SAMPLES:-12}"
 RUN_REVERSE_FIRST_P1="${RUN_REVERSE_FIRST_P1:-0}"
 STOP_AFTER_REVERSE_FIRST_P1="${STOP_AFTER_REVERSE_FIRST_P1:-0}"
+STANDARD_P1_ORDER="${STANDARD_P1_ORDER:-forward-first}"
+STOP_AFTER_STANDARD_P1="${STOP_AFTER_STANDARD_P1:-0}"
 PROFILE_REHEARSAL_ONLY="${PROFILE_REHEARSAL_ONLY:-0}"
 RUN_D16_EOF_CLOSE_PROBE="${RUN_D16_EOF_CLOSE_PROBE:-0}"
 D16_EOF_CLOSE_BYTES="${D16_EOF_CLOSE_BYTES:-64M}"
@@ -1245,6 +1441,20 @@ QUIET_TIMEOUT_SECS="${QUIET_TIMEOUT_SECS:-20}"
 QUIET_POLL_SECS="${QUIET_POLL_SECS:-1}"
 IPERF_BUSY_RETRIES="${IPERF_BUSY_RETRIES:-3}"
 IPERF_BUSY_WAIT_SECS="${IPERF_BUSY_WAIT_SECS:-5}"
+
+if ! [[ "$SOCKET_EVIDENCE_SAMPLES" =~ ^[0-9]+$ ]] || ((10#$SOCKET_EVIDENCE_SAMPLES <= 0)); then
+  echo "ERROR: SOCKET_EVIDENCE_SAMPLES must be a positive integer; got $SOCKET_EVIDENCE_SAMPLES" >&2
+  exit 64
+fi
+
+case "$STANDARD_P1_ORDER" in
+  forward-first|forward-only)
+    ;;
+  *)
+    echo "ERROR: STANDARD_P1_ORDER must be forward-first or forward-only; got $STANDARD_P1_ORDER" >&2
+    exit 64
+    ;;
+esac
 
 if ! mkdir -p "$OUT_DIR"; then
   echo "ERROR: cannot create OUT_DIR=$OUT_DIR" >&2
@@ -2052,14 +2262,57 @@ probe_has_receiver_result() {
   grep -Eq 'receiver$' "$file"
 }
 
+collect_active_quic_socket_evidence() {
+  local label="$1"
+  local evidence_out="$2"
+  local client_out="${evidence_out}.client.$$"
+  local exit_out="${evidence_out}.exit.$$"
+  local client_sampler_pid exit_sampler_pid sample
+
+  (
+    echo "side=client peer=${EXIT_HOST}:${EXIT_PORT}"
+    for ((sample = 1; sample <= SOCKET_EVIDENCE_SAMPLES; sample++)); do
+      echo "sample=$sample utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      sudo ss -u -n -i -m -p 2>&1 |
+        awk -v peer="${EXIT_HOST}:${EXIT_PORT}" 'index($0, peer) { print; if (getline > 0) print }' || true
+      if ((sample < SOCKET_EVIDENCE_SAMPLES)); then
+        sleep 1
+      fi
+    done
+  ) > "$client_out" 2>&1 &
+  client_sampler_pid=$!
+
+  exit_sampler_pid=""
+  if [[ -n "$EXIT_SSH_HOST" ]]; then
+    exit_ssh_raw "samples=$SOCKET_EVIDENCE_SAMPLES; port=':${EXIT_PORT}'; echo side=exit port=\$port; for sample in \$(seq 1 \$samples); do echo sample=\$sample utc=\$(date -u +%Y-%m-%dT%H:%M:%SZ); sudo ss -u -a -n -i -m -p 2>&1 | awk -v port=\"\$port\" 'index(\$0, port) { print; if (getline > 0) print }'; if [ \$sample -lt \$samples ]; then sleep 1; fi; done" > "$exit_out" 2>&1 &
+    exit_sampler_pid=$!
+  else
+    echo "side=exit skipped=EXIT_SSH_HOST_unset" > "$exit_out"
+  fi
+
+  wait "$client_sampler_pid" || true
+  if [[ -n "$exit_sampler_pid" ]]; then
+    wait "$exit_sampler_pid" || true
+  fi
+  {
+    echo "active_quic_socket_evidence label=$label samples=$SOCKET_EVIDENCE_SAMPLES interval_secs=1"
+    sed 's/^/client: /' "$client_out"
+    sed 's/^/exit: /' "$exit_out"
+  } > "$evidence_out"
+  rm -f "$client_out" "$exit_out"
+}
+
 run_lowrtt_probe() {
   local label="$1"
   local parallel="$2"
   local duration="$3"
   local probe_order="${4:-forward-first}"
   local iperf_bytes="${5:-}"
+  local forward_discriminator="${6:-0}"
   local probe_out="$OUT_DIR/mvpn_${SUITE_TAG}_usclient_tunnel_${label}_${TS}.md"
-  ARTIFACTS+=("$probe_out")
+  local socket_out="$OUT_DIR/mvpn_${SUITE_TAG}_active_quic_sockets_${label}_${TS}.log"
+  local socket_sampler_pid
+  ARTIFACTS+=("$probe_out" "$socket_out")
 
   append ""
   append "## Probe: $label"
@@ -2068,10 +2321,15 @@ run_lowrtt_probe() {
   append "- duration: ${duration}s"
   append "- iperf_bytes: ${iperf_bytes:-<timed>}"
   append "- probe_order: $probe_order"
+  append "- routing_mode: target-only"
+  append "- forward_discriminator: $forward_discriminator"
   append "- client_log: $CLIENT_LOG"
+  append "- active_quic_socket_evidence: $socket_out"
 
   local probe_start_epoch probe_end_epoch
   probe_start_epoch="$(date +%s 2>/dev/null || printf '0')"
+  collect_active_quic_socket_evidence "$label" "$socket_out" &
+  socket_sampler_pid=$!
   run_cmd env \
     LOG="$CLIENT_LOG" \
     OUT="$probe_out" \
@@ -2079,12 +2337,15 @@ run_lowrtt_probe() {
     DURATION="$duration" \
     IPERF_BYTES="$iperf_bytes" \
     PROBE_ORDER="$probe_order" \
+    ROUTING_MODE=target-only \
+    FORWARD_DISCRIMINATOR="$forward_discriminator" \
     TUN_IF="$TUN_IF" \
     IPERF_BUSY_RETRIES="$IPERF_BUSY_RETRIES" \
     IPERF_BUSY_WAIT_SECS="$IPERF_BUSY_WAIT_SECS" \
     bash "$LOWRTT_SCRIPT" "$TARGET" "$IPERF_PORT"
   local status=$?
   probe_end_epoch="$(date +%s 2>/dev/null || printf '%s' "$probe_start_epoch")"
+  wait "$socket_sampler_pid" || true
 
   append ""
   append "### Probe $label Summary"
@@ -2274,6 +2535,22 @@ export MINI_VPN_TCP_DIAG="${MINI_VPN_TCP_DIAG:-1}"
 export MINI_VPN_TUIC_CC="${MINI_VPN_TUIC_CC:-cubic}"
 export MINI_VPN_TUIC_UDP_MODE="${MINI_VPN_TUIC_UDP_MODE:-native}"
 export MINI_VPN_TUIC_ZERO_RTT="${MINI_VPN_TUIC_ZERO_RTT:-false}"
+export MINI_VPN_TUIC_GSO_POLICY="${MINI_VPN_TUIC_GSO_POLICY:-$DEFAULT_TUIC_GSO_POLICY}"
+if ! validate_tuic_gso_policy "$MINI_VPN_TUIC_GSO_POLICY"; then
+  fail "MINI_VPN_TUIC_GSO_POLICY 必须是 enabled 或 disabled，当前值: $MINI_VPN_TUIC_GSO_POLICY"
+fi
+export MINI_VPN_TUIC_UDP_SEND_SERVICE="${MINI_VPN_TUIC_UDP_SEND_SERVICE:-$DEFAULT_TUIC_UDP_SEND_SERVICE}"
+if ! validate_tuic_udp_send_service "$MINI_VPN_TUIC_UDP_SEND_SERVICE"; then
+  fail "MINI_VPN_TUIC_UDP_SEND_SERVICE 必须是 quinn 或 bounded，当前值: $MINI_VPN_TUIC_UDP_SEND_SERVICE"
+fi
+export MINI_VPN_TUIC_PACING_POLICY="${MINI_VPN_TUIC_PACING_POLICY:-$DEFAULT_TUIC_PACING_POLICY}"
+if ! validate_tuic_pacing_policy "$MINI_VPN_TUIC_PACING_POLICY"; then
+  fail "MINI_VPN_TUIC_PACING_POLICY 必须是 quinn、pacer-cap64 或 endpoint-window-v1，当前值: $MINI_VPN_TUIC_PACING_POLICY"
+fi
+if ! validate_tuic_send_policy_pair "$MINI_VPN_TUIC_PACING_POLICY" "$MINI_VPN_TUIC_UDP_SEND_SERVICE"; then
+  fail "非默认 MINI_VPN_TUIC_PACING_POLICY 不能与 MINI_VPN_TUIC_UDP_SEND_SERVICE=bounded 同时启用"
+fi
+TUIC_PACING_POLICY_ENV_ASSIGNMENT="$(tuic_pacing_policy_env_assignment "$MINI_VPN_TUIC_PACING_POLICY")"
 export MINI_VPN_TUIC_TCP_POOL="${MINI_VPN_TUIC_TCP_POOL:-2}"
 export MINI_VPN_TUIC_TCP_ORDERED_CHUNK="${MINI_VPN_TUIC_TCP_ORDERED_CHUNK:-$DEFAULT_TUIC_TCP_ORDERED_CHUNK}"
 export MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY="${MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY:-$DEFAULT_TUIC_TCP_UNORDERED_REASSEMBLY}"
@@ -2321,12 +2598,17 @@ append "- CC_SWEEP=${CC_SWEEP:-<single>}"
 append "- CC_VARIANT_LABEL=${CC_VARIANT_LABEL:-<none>}"
 append "- RUN_REVERSE_FIRST_P1=$RUN_REVERSE_FIRST_P1"
 append "- STOP_AFTER_REVERSE_FIRST_P1=$STOP_AFTER_REVERSE_FIRST_P1"
+append "- STANDARD_P1_ORDER=$STANDARD_P1_ORDER"
+append "- STOP_AFTER_STANDARD_P1=$STOP_AFTER_STANDARD_P1"
 append "- PROFILE_REHEARSAL_ONLY=$PROFILE_REHEARSAL_ONLY"
 append "- RUN_D16_EOF_CLOSE_PROBE=$RUN_D16_EOF_CLOSE_PROBE"
 append "- D16_EOF_CLOSE_BYTES=$D16_EOF_CLOSE_BYTES"
 append "- TUN_TX_QUEUE_LEN=${TUN_TX_QUEUE_LEN:-<default>}"
 append "- MINI_VPN_TUIC_UDP_MODE=$MINI_VPN_TUIC_UDP_MODE"
 append "- MINI_VPN_TUIC_ZERO_RTT=$MINI_VPN_TUIC_ZERO_RTT"
+append "- MINI_VPN_TUIC_GSO_POLICY=$MINI_VPN_TUIC_GSO_POLICY"
+append "- MINI_VPN_TUIC_UDP_SEND_SERVICE=$MINI_VPN_TUIC_UDP_SEND_SERVICE"
+append "- $TUIC_PACING_POLICY_ENV_ASSIGNMENT"
 append "- MINI_VPN_TUIC_TCP_POOL=$MINI_VPN_TUIC_TCP_POOL"
 append "- MINI_VPN_TUIC_TCP_ORDERED_CHUNK=$MINI_VPN_TUIC_TCP_ORDERED_CHUNK"
 append "- MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY=$MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY"
@@ -2396,7 +2678,11 @@ fi
 
 append ""
 append "## Sudo / Build Checks"
-run_cmd sudo -v || fail "sudo 校验失败。请确认当前用户有 sudo 权限。"
+if [[ "$SUDO_NONINTERACTIVE" == "1" ]]; then
+  run_cmd sudo -n true || fail "sudo -n 校验失败。请确认非交互 sudo 已授权。"
+else
+  run_cmd sudo -v || fail "sudo 校验失败。请确认当前用户有 sudo 权限。"
+fi
 if ! sudo -E env sh -c 'test -n "${MINI_VPN_TUIC_PASSWORD:-}"' >/dev/null 2>&1; then
   fail "sudo -E 没有保留 MINI_VPN_TUIC_* 环境变量。请在 root shell 中 export 这些变量后运行脚本，或调整 sudoers env_keep。"
 fi
@@ -2478,10 +2764,13 @@ append ""
 append "## Start mini_vpn client-tun"
 : > "$CLIENT_LOG"
 append "- client_log: $CLIENT_LOG"
-append "- command: sudo -E env MINI_VPN_TUN_MTU=$MTU MINI_VPN_TUN_TX_QUEUE_LEN=${MINI_VPN_TUN_TX_QUEUE_LEN:-} MINI_VPN_TCP_DIAG=$MINI_VPN_TCP_DIAG MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS=$METRICS_SECS MINI_VPN_TUIC_CC=$MINI_VPN_TUIC_CC MINI_VPN_TUIC_TCP_POOL=$MINI_VPN_TUIC_TCP_POOL MINI_VPN_TUIC_TCP_ORDERED_CHUNK=$MINI_VPN_TUIC_TCP_ORDERED_CHUNK MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY=$MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY MINI_VPN_TUIC_TCP_NATIVE_CHUNK_PUMP=$MINI_VPN_TUIC_TCP_NATIVE_CHUNK_PUMP MINI_VPN_TUIC_TCP_NATIVE_ORDERED_PUMP=$MINI_VPN_TUIC_TCP_NATIVE_ORDERED_PUMP MINI_VPN_D6_NATIVE_EGRESS_PERMIT=$MINI_VPN_D6_NATIVE_EGRESS_PERMIT MINI_VPN_D11_ORDERED_EGRESS_PERMIT=$MINI_VPN_D11_ORDERED_EGRESS_PERMIT MINI_VPN_H10D16_BYTE_OWNED_EGRESS=$MINI_VPN_H10D16_BYTE_OWNED_EGRESS MINI_VPN_TCP_RX_BUFFER_BYTES=$MINI_VPN_TCP_RX_BUFFER_BYTES MINI_VPN_TCP_TX_BUFFER_BYTES=$MINI_VPN_TCP_TX_BUFFER_BYTES MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=$MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=$MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES MINI_VPN_TUN_RX_DRAIN_BUDGET=$MINI_VPN_TUN_RX_DRAIN_BUDGET MINI_VPN_THIN_TCP_RELAY=$MINI_VPN_THIN_TCP_RELAY MINI_VPN_CONTINUOUS_TCP_RELAY=$MINI_VPN_CONTINUOUS_TCP_RELAY MINI_VPN_D2_PERMIT_TCP_RELAY=$MINI_VPN_D2_PERMIT_TCP_RELAY MINI_VPN_D3_EGRESS_ACTOR=$MINI_VPN_D3_EGRESS_ACTOR MINI_VPN_D3_EGRESS_ACTOR_ADAPTIVE_CREDIT=$MINI_VPN_D3_EGRESS_ACTOR_ADAPTIVE_CREDIT MINI_VPN_D3_EGRESS_ACTOR_LEGACY_CREDIT=$MINI_VPN_D3_EGRESS_ACTOR_LEGACY_CREDIT MINI_VPN_D3_EGRESS_ACTOR_SELF_WAKE=$MINI_VPN_D3_EGRESS_ACTOR_SELF_WAKE MINI_VPN_D4_STALLED_READ_SERVICE=$MINI_VPN_D4_STALLED_READ_SERVICE MINI_VPN_D5_CAPACITY_BACKPRESSURE=$MINI_VPN_D5_CAPACITY_BACKPRESSURE $BIN client-tun"
+append "- command: sudo -E env MINI_VPN_TUN_MTU=$MTU MINI_VPN_TUN_TX_QUEUE_LEN=${MINI_VPN_TUN_TX_QUEUE_LEN:-} MINI_VPN_TCP_DIAG=$MINI_VPN_TCP_DIAG MINI_VPN_PROFILE_LOOP=1 MINI_VPN_METRICS_SECS=$METRICS_SECS MINI_VPN_TUIC_CC=$MINI_VPN_TUIC_CC MINI_VPN_TUIC_GSO_POLICY=$MINI_VPN_TUIC_GSO_POLICY MINI_VPN_TUIC_UDP_SEND_SERVICE=$MINI_VPN_TUIC_UDP_SEND_SERVICE $TUIC_PACING_POLICY_ENV_ASSIGNMENT MINI_VPN_TUIC_TCP_POOL=$MINI_VPN_TUIC_TCP_POOL MINI_VPN_TUIC_TCP_ORDERED_CHUNK=$MINI_VPN_TUIC_TCP_ORDERED_CHUNK MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY=$MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY MINI_VPN_TUIC_TCP_NATIVE_CHUNK_PUMP=$MINI_VPN_TUIC_TCP_NATIVE_CHUNK_PUMP MINI_VPN_TUIC_TCP_NATIVE_ORDERED_PUMP=$MINI_VPN_TUIC_TCP_NATIVE_ORDERED_PUMP MINI_VPN_D6_NATIVE_EGRESS_PERMIT=$MINI_VPN_D6_NATIVE_EGRESS_PERMIT MINI_VPN_D11_ORDERED_EGRESS_PERMIT=$MINI_VPN_D11_ORDERED_EGRESS_PERMIT MINI_VPN_H10D16_BYTE_OWNED_EGRESS=$MINI_VPN_H10D16_BYTE_OWNED_EGRESS MINI_VPN_TCP_RX_BUFFER_BYTES=$MINI_VPN_TCP_RX_BUFFER_BYTES MINI_VPN_TCP_TX_BUFFER_BYTES=$MINI_VPN_TCP_TX_BUFFER_BYTES MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_HIGH_BYTES MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES=$MINI_VPN_DOWNLINK_BACKPRESSURE_LOW_BYTES MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES=$MINI_VPN_DOWNLINK_FLUSH_MAX_BYTES MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES=$MINI_VPN_DOWNLINK_EGRESS_IMMEDIATE_BYTES MINI_VPN_TUN_RX_DRAIN_BUDGET=$MINI_VPN_TUN_RX_DRAIN_BUDGET MINI_VPN_THIN_TCP_RELAY=$MINI_VPN_THIN_TCP_RELAY MINI_VPN_CONTINUOUS_TCP_RELAY=$MINI_VPN_CONTINUOUS_TCP_RELAY MINI_VPN_D2_PERMIT_TCP_RELAY=$MINI_VPN_D2_PERMIT_TCP_RELAY MINI_VPN_D3_EGRESS_ACTOR=$MINI_VPN_D3_EGRESS_ACTOR MINI_VPN_D3_EGRESS_ACTOR_ADAPTIVE_CREDIT=$MINI_VPN_D3_EGRESS_ACTOR_ADAPTIVE_CREDIT MINI_VPN_D3_EGRESS_ACTOR_LEGACY_CREDIT=$MINI_VPN_D3_EGRESS_ACTOR_LEGACY_CREDIT MINI_VPN_D3_EGRESS_ACTOR_SELF_WAKE=$MINI_VPN_D3_EGRESS_ACTOR_SELF_WAKE MINI_VPN_D4_STALLED_READ_SERVICE=$MINI_VPN_D4_STALLED_READ_SERVICE MINI_VPN_D5_CAPACITY_BACKPRESSURE=$MINI_VPN_D5_CAPACITY_BACKPRESSURE $BIN client-tun"
 sudo -E env MINI_VPN_TUN_MTU="$MTU" MINI_VPN_TUN_TX_QUEUE_LEN="$MINI_VPN_TUN_TX_QUEUE_LEN" \
   MINI_VPN_TCP_DIAG="$MINI_VPN_TCP_DIAG" MINI_VPN_PROFILE_LOOP=1 \
   MINI_VPN_METRICS_SECS="$METRICS_SECS" MINI_VPN_TUIC_CC="$MINI_VPN_TUIC_CC" \
+  MINI_VPN_TUIC_GSO_POLICY="$MINI_VPN_TUIC_GSO_POLICY" \
+  MINI_VPN_TUIC_UDP_SEND_SERVICE="$MINI_VPN_TUIC_UDP_SEND_SERVICE" \
+  "$TUIC_PACING_POLICY_ENV_ASSIGNMENT" \
   MINI_VPN_TUIC_TCP_POOL="$MINI_VPN_TUIC_TCP_POOL" \
   MINI_VPN_TUIC_TCP_ORDERED_CHUNK="$MINI_VPN_TUIC_TCP_ORDERED_CHUNK" \
   MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY="$MINI_VPN_TUIC_TCP_UNORDERED_REASSEMBLY" \
@@ -2543,11 +2832,16 @@ if [[ "$ready" != "1" ]]; then
   fail "等待 ${STARTUP_TIMEOUT}s 后仍未看到 TUIC ready 日志。"
 fi
 
+if ! verify_tuic_pacing_startup_policy "$CLIENT_LOG" "$MINI_VPN_TUIC_PACING_POLICY"; then
+  fail "TUIC pacing startup fingerprint mismatch; expected policy=$MINI_VPN_TUIC_PACING_POLICY."
+fi
+append "- tuic_pacing_startup_profile: verified-$MINI_VPN_TUIC_PACING_POLICY"
+
 if [[ "$MINI_VPN_H10D16_BYTE_OWNED_EGRESS" == "1" ]]; then
   if [[ "$MTU" != "1200" ]]; then
     fail "H10d16 Gate A profile requires MTU=1200; got MTU=$MTU."
   fi
-  if ! verify_h10d16_startup_profile "$CLIENT_LOG" "$MTU"; then
+  if ! verify_h10d16_startup_profile "$CLIENT_LOG" "$MTU" "$MINI_VPN_TUIC_GSO_POLICY" "$MINI_VPN_TUIC_UDP_SEND_SERVICE" "$MINI_VPN_TUIC_PACING_POLICY"; then
     fail "H10d16 startup fingerprint mismatch; refusing to run acceptance with an unverified profile."
   fi
   append "- h10d16_startup_profile: verified-safe1200"
@@ -2641,7 +2935,9 @@ if [[ "$RUN_REVERSE_FIRST_P1" == "1" ]]; then
 fi
 
 if [[ "$proceed_to_standard_p1" == "1" ]]; then
-  run_lowrtt_probe "mtu${MTU}_p1" "1" "$DURATION" "forward-first" || true
+  if ! run_standard_p1_probe "mtu${MTU}_p1" "1" "$DURATION"; then
+    fail "standard P1 forward discriminator failed; receiver/TUN-drop/QUIC-loss details are in the probe report. Stopping before any further sweep."
+  fi
 else
   append ""
   append "## Standard P1 Probe Skipped"
@@ -2653,8 +2949,15 @@ else
 fi
 MTU_P1_OUT="$OUT_DIR/mvpn_${SUITE_TAG}_usclient_tunnel_mtu${MTU}_p1_${TS}.md"
 P1_END_LINE="$(client_log_line_count)"
+proceed_to_full="$proceed_to_standard_p1"
+if [[ "$proceed_to_standard_p1" == "1" && "$STOP_AFTER_STANDARD_P1" == "1" ]]; then
+  proceed_to_full=0
+  append ""
+  append "## Full Sweep Skipped"
+  append "STOP_AFTER_STANDARD_P1=1；只保留 standard P1 窗口，随后采集 final snapshots 和 bundle。"
+fi
 
-if [[ "$proceed_to_standard_p1" == "1" && -f "$MTU_P1_OUT" ]] && probe_has_receiver_result "$MTU_P1_OUT"; then
+if [[ "$proceed_to_full" == "1" && -f "$MTU_P1_OUT" ]] && probe_has_receiver_result "$MTU_P1_OUT"; then
   if [[ "$WAIT_QUIET_BEFORE_FULL" == "1" ]]; then
     if wait_for_quiet_tunnel "full sweep" "$P1_END_LINE"; then
       run_lowrtt_probe "mtu${MTU}_full" "$PARALLEL_SET" "$DURATION" "forward-first" || true
@@ -2667,9 +2970,13 @@ if [[ "$proceed_to_standard_p1" == "1" && -f "$MTU_P1_OUT" ]] && probe_has_recei
     run_lowrtt_probe "mtu${MTU}_full" "$PARALLEL_SET" "$DURATION" "forward-first" || true
   fi
 else
-  append ""
-  append "## Full Sweep Skipped"
-  if [[ "$proceed_to_standard_p1" == "1" ]]; then
+  if [[ "$STOP_AFTER_STANDARD_P1" != "1" ]]; then
+    append ""
+    append "## Full Sweep Skipped"
+  fi
+  if [[ "$STOP_AFTER_STANDARD_P1" == "1" ]]; then
+    append "STOP_AFTER_STANDARD_P1=1."
+  elif [[ "$proceed_to_standard_p1" == "1" ]]; then
     append "MTU=$MTU P1 没有 receiver 结果，说明 tunnel 基础连通/iperf 控制连接已经失败；跳过 full sweep，避免浪费时间。"
   else
     if [[ "$STOP_AFTER_REVERSE_FIRST_P1" == "1" ]]; then

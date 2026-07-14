@@ -76,7 +76,8 @@ pub fn parse_server_hello(
     let len_field = bytes.get(1..4).ok_or_else(|| err("handshake 头截断"))?;
     let body = bytes.get(4..).ok_or_else(|| err("handshake 头截断"))?;
     // 校验 handshake 长度字段（uint24）== 实际 body 长度（防截断/拼接的网络输入静默误解析）。
-    let claimed = ((len_field[0] as usize) << 16) | ((len_field[1] as usize) << 8) | len_field[2] as usize;
+    let claimed =
+        ((len_field[0] as usize) << 16) | ((len_field[1] as usize) << 8) | len_field[2] as usize;
     if claimed != body.len() {
         return Err(err("handshake 长度字段与实际 body 不符"));
     }
@@ -87,7 +88,11 @@ pub fn parse_server_hello(
     }
     p += 2;
 
-    let random: [u8; 32] = body.get(p..p + 32).ok_or_else(|| err("random 截断"))?.try_into().unwrap();
+    let random: [u8; 32] = body
+        .get(p..p + 32)
+        .ok_or_else(|| err("random 截断"))?
+        .try_into()
+        .unwrap();
     p += 32;
     if random == HRR_RANDOM {
         return Err(err("HelloRetryRequest（暂不支持，刀8 处理）"));
@@ -98,7 +103,9 @@ pub fn parse_server_hello(
 
     let sid_len = *body.get(p).ok_or_else(|| err("session_id 长度截断"))? as usize;
     p += 1;
-    let sid = body.get(p..p + sid_len).ok_or_else(|| err("session_id 截断"))?;
+    let sid = body
+        .get(p..p + sid_len)
+        .ok_or_else(|| err("session_id 截断"))?;
     p += sid_len;
     if sid != expected_session_id {
         // echo≠auth：RFC 一致性检查；REALITY auth 成败由刀8 证书 HMAC 定。
@@ -121,10 +128,14 @@ pub fn parse_server_hello(
     }
     p += 1;
 
-    let el = body.get(p..p + 2).ok_or_else(|| err("extensions 长度截断"))?;
+    let el = body
+        .get(p..p + 2)
+        .ok_or_else(|| err("extensions 长度截断"))?;
     let ext_len = u16::from_be_bytes([el[0], el[1]]) as usize;
     p += 2;
-    let exts = body.get(p..p + ext_len).ok_or_else(|| err("extensions 截断"))?;
+    let exts = body
+        .get(p..p + ext_len)
+        .ok_or_else(|| err("extensions 截断"))?;
 
     if extract_selected_version(exts)? != 0x0304 {
         return Err(err("selected_version != TLS 1.3"));
@@ -200,10 +211,16 @@ mod tests {
         // 不支持的 cipher_suite（RFC SH cipher 在 [39..41] = 1301 → 改 1302）→ Err。
         let mut cs = base.clone();
         cs[39..41].copy_from_slice(&[0x13, 0x02]);
-        assert!(parse_server_hello(&cs, b"").is_err(), "cipher_suite != 0x1301");
+        assert!(
+            parse_server_hello(&cs, b"").is_err(),
+            "cipher_suite != 0x1301"
+        );
 
         // session_id_echo 不一致（RFC SH 空 echo，传 32B expected）→ Err。
-        assert!(parse_server_hello(&base, &[0u8; 32]).is_err(), "echo mismatch");
+        assert!(
+            parse_server_hello(&base, &[0u8; 32]).is_err(),
+            "echo mismatch"
+        );
 
         // 截断 → Err（不 panic）。
         assert!(parse_server_hello(&base[..10], b"").is_err(), "截断");

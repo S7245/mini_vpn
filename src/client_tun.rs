@@ -4532,6 +4532,29 @@ fn downlink_pressure_stats(
     stats
 }
 
+fn global_pending_for_buffered_credit(
+    buffered_credit_enabled: bool,
+    scan_pending: impl FnOnce() -> usize,
+) -> usize {
+    if buffered_credit_enabled {
+        scan_pending()
+    } else {
+        0
+    }
+}
+
+fn dirty_downlink_pending_total(
+    dirty: &HashSet<SocketHandle>,
+    socket_ctxs: &HashMap<SocketHandle, SocketCtx>,
+) -> usize {
+    dirty
+        .iter()
+        .filter_map(|handle| socket_ctxs.get(handle))
+        .fold(0usize, |total, ctx| {
+            total.saturating_add(ctx.downlink_pending.len())
+        })
+}
+
 fn d16_relay_read_credit(ctx: &SocketCtx, tun_rx_backlog_active: bool) -> Option<RelayReadCredit> {
     let queue = ctx.d16_downlink_queue.as_ref()?;
     let permissions = EgressPermissions::for_phase(ctx.d16_egress_phase);
@@ -8041,8 +8064,10 @@ pub async fn run_event_loop<D, U, M>(
                         ) {
                             dirty.insert(handle);
                         }
-                        let current_global_pending =
-                            downlink_pressure_stats(&dirty, &socket_ctxs, &sockets).total_pending;
+                        let current_global_pending = global_pending_for_buffered_credit(
+                            buffered_downlink.enabled,
+                            || dirty_downlink_pending_total(&dirty, &socket_ctxs),
+                        );
                         publish_relay_read_credit_for_handle(
                             handle,
                             &sockets,
@@ -8297,8 +8322,9 @@ pub async fn run_event_loop<D, U, M>(
                                 D4_STALLED_READ_SERVICE_HOLD_MS
                             );
                         }
-                        let current_global_pending =
-                            downlink_pressure_stats(&dirty, &socket_ctxs, &sockets).total_pending;
+                        let current_downlink_stats =
+                            downlink_pressure_stats(&dirty, &socket_ctxs, &sockets);
+                        let current_global_pending = current_downlink_stats.total_pending;
                         publish_relay_read_credit_for_handle(
                             handle,
                             &sockets,
@@ -8311,8 +8337,6 @@ pub async fn run_event_loop<D, U, M>(
                             buffered_downlink,
                             current_global_pending,
                         );
-                        let current_downlink_stats =
-                            downlink_pressure_stats(&dirty, &socket_ctxs, &sockets);
                         let tun_rx_budget = tun_rx_drain_budget_for_relay_gap_hint(
                             socket_ctxs.get(&handle),
                             epoch,
@@ -9627,8 +9651,20 @@ async fn process_dirty_relay<U, M>(
     metrics.enter_relay();
     // 快照后处理：边遍历边 `dirty.remove` 会与迭代借用冲突。dirty 规模 = O(活跃)，分配可忽略。
     let snapshot: Vec<SocketHandle> = dirty.iter().copied().collect();
+    let mut current_global_pending =
+        global_pending_for_buffered_credit(buffered_downlink.enabled, || {
+            dirty_downlink_pending_total(dirty, socket_ctxs)
+        });
     metrics.note_listeners(snapshot.len());
     for handle in snapshot {
+        let pending_before = if buffered_downlink.enabled {
+            socket_ctxs
+                .get(&handle)
+                .map(|ctx| ctx.downlink_pending.len())
+                .unwrap_or(0)
+        } else {
+            0
+        };
         if let Err(e) = process_listener_activity(
             handle,
             sockets,
@@ -9686,8 +9722,15 @@ async fn process_dirty_relay<U, M>(
                 || needs_local_finish
                 || snapshot.send_queue > downlink_backpressure.low_bytes
         };
-        let current_global_pending =
-            downlink_pressure_stats(dirty, socket_ctxs, sockets).total_pending;
+        if buffered_downlink.enabled {
+            let pending_after = socket_ctxs
+                .get(&handle)
+                .map(|ctx| ctx.downlink_pending.len())
+                .unwrap_or(0);
+            current_global_pending = current_global_pending
+                .saturating_sub(pending_before)
+                .saturating_add(pending_after);
+        }
         publish_relay_read_credit_for_handle(
             handle,
             sockets,
@@ -12884,6 +12927,8 @@ async fn run_relay_d16(
     let mut writer_progress_events = 0u64;
     let mut writer_progress_bytes = 0u64;
     let mut writer_wait_max_us = 0u128;
+    let mut half_closed_idle_blocked_events = 0u64;
+    let mut half_closed_idle_blocked_max_payload_bytes = 0usize;
     let terminal_error = loop {
         tokio::select! {
             activity = activity_rx.recv(), if !reader_done && activity_open => {
@@ -12950,6 +12995,35 @@ async fn run_relay_d16(
                 }
             }
             _ = &mut idle => {
+                if writer_done {
+                    let queue_snapshot = queue.snapshot_now();
+                    let payload_owned_bytes = queue_snapshot
+                        .queued_bytes
+                        .saturating_add(queue_snapshot.leased_bytes);
+                    if queue_snapshot.closure.terminal_cause().is_none()
+                        && payload_owned_bytes > 0
+                    {
+                        half_closed_idle_blocked_events =
+                            half_closed_idle_blocked_events.saturating_add(1);
+                        half_closed_idle_blocked_max_payload_bytes =
+                            half_closed_idle_blocked_max_payload_bytes.max(payload_owned_bytes);
+                        tcp_diag_log!(
+                            "🔎 tcp-d16-half-closed-idle-blocked handle={:?} epoch={} blocked_events={} payload_owned_bytes={} queue_queued={} queue_leased={} queue_reserved={} queue_closed={}",
+                            handle,
+                            epoch,
+                            half_closed_idle_blocked_events,
+                            payload_owned_bytes,
+                            queue_snapshot.queued_bytes,
+                            queue_snapshot.leased_bytes,
+                            queue_snapshot.reserved_bytes,
+                            queue_snapshot.closure.is_closed(),
+                        );
+                        idle.as_mut().reset(
+                            tokio::time::Instant::now() + RELAY_HALF_CLOSED_IDLE_TIMEOUT
+                        );
+                        continue;
+                    }
+                }
                 break Some((
                     "timer",
                     if writer_done {
@@ -13011,7 +13085,7 @@ async fn run_relay_d16(
     let (terminal_direction, terminal_reason) =
         terminal_error.unwrap_or(("none", "clean_queue_lifecycle"));
     tcp_diag_log!(
-        "🔎 tcp-d16-relay-close handle={:?} epoch={} terminal_direction={} terminal_reason={} writer_progress_events={} writer_progress_bytes={} writer_wait_max_us={} queue_queued={} queue_leased={} queue_reserved={} queue_closed={}",
+        "🔎 tcp-d16-relay-close handle={:?} epoch={} terminal_direction={} terminal_reason={} writer_progress_events={} writer_progress_bytes={} writer_wait_max_us={} half_closed_idle_blocked_events={} half_closed_idle_blocked_max_payload_bytes={} queue_queued={} queue_leased={} queue_reserved={} queue_closed={}",
         handle,
         epoch,
         terminal_direction,
@@ -13019,6 +13093,8 @@ async fn run_relay_d16(
         writer_progress_events,
         writer_progress_bytes,
         writer_wait_max_us,
+        half_closed_idle_blocked_events,
+        half_closed_idle_blocked_max_payload_bytes,
         queue_snapshot.queued_bytes,
         queue_snapshot.leased_bytes,
         queue_snapshot.reserved_bytes,
@@ -18906,6 +18982,107 @@ mod tests {
         assert!(back_rx.try_recv().is_err());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn d16_half_closed_idle_waits_for_owned_payload_to_drain() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let reader: NativeTcpReadHalf = Box::new(BurstNativeReader {
+            chunks: std::collections::VecDeque::from([NativeTcpChunk {
+                offset: 0,
+                bytes: Bytes::from(vec![7; 64 * 1024]),
+            }]),
+            eof_after_chunks: false,
+        });
+        let writer_shutdown = Arc::new(AtomicBool::new(false));
+        let writer: NativeTcpWriteHalf = Box::new(NoopNativeWriter {
+            shutdown_called: writer_shutdown.clone(),
+        });
+        let queue = AsyncLeasedByteFlowQueue::new_with_release_mode(
+            64 * 1024,
+            DownstreamPermitReleaseMode::OnEgressDrain,
+        )
+        .unwrap();
+        let (uplink_tx, uplink_rx) = mpsc::channel::<RelayCommand>(1);
+        let (back_tx, mut back_rx) = mpsc::channel(8);
+        let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit {
+            paused: false,
+            max_batch_bytes: 64 * 1024,
+        });
+        let task = tokio::spawn(run_relay_d16(
+            handle,
+            25,
+            reader,
+            writer,
+            uplink_rx,
+            back_tx,
+            credit_rx,
+            queue.clone(),
+        ));
+
+        assert!(matches!(
+            back_rx.recv().await,
+            Some((h, RelayEvent::DataReady { epoch: 25 })) if h == handle
+        ));
+        assert_eq!(queue.snapshot_now().queued_bytes, 64 * 1024);
+
+        uplink_tx.send(RelayCommand::Finish).await.unwrap();
+        while !writer_shutdown.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(RELAY_HALF_CLOSED_IDLE_TIMEOUT).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            !task.is_finished(),
+            "half-close timeout must not terminate while useful D16 payload ownership remains"
+        );
+        let snapshot = queue.snapshot_now();
+        assert_eq!(snapshot.queued_bytes, 64 * 1024);
+        assert_eq!(snapshot.leased_bytes, 0);
+        assert_eq!(
+            snapshot.closure,
+            crate::tcp_downlink_pump::LeasedByteQueueClosure::Open
+        );
+        assert!(back_rx.try_recv().is_err());
+
+        let leased = match queue.try_recv_up_to(64 * 1024) {
+            LeasedQueuePoll::Data(leased) => leased,
+            other => panic!("expected owned D16 payload, got {other:?}"),
+        };
+        tokio::time::advance(RELAY_HALF_CLOSED_IDLE_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "half-close timeout must also preserve payload leased into pending/inflight ownership"
+        );
+        let snapshot = queue.snapshot_now();
+        assert_eq!(snapshot.queued_bytes, 0);
+        assert_eq!(snapshot.leased_bytes, 64 * 1024);
+        assert_eq!(
+            snapshot.closure,
+            crate::tcp_downlink_pump::LeasedByteQueueClosure::Open
+        );
+        assert!(back_rx.try_recv().is_err());
+
+        let (bytes, mut permit) = leased.into_parts();
+        assert_eq!(bytes.len(), 64 * 1024);
+        assert_eq!(permit.release(bytes.len()), bytes.len());
+        drop(permit);
+
+        tokio::time::advance(RELAY_HALF_CLOSED_IDLE_TIMEOUT).await;
+        task.await.unwrap();
+        assert_eq!(queue.snapshot_now().owned_bytes(), 0);
+        assert!(matches!(
+            back_rx.recv().await,
+            Some((h, RelayEvent::Closed(RelayClose {
+                epoch: 25,
+                direction: "timer",
+                reason: "half_closed_idle_timeout",
+            }))) if h == handle
+        ));
+        assert!(back_rx.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn d16_local_terminal_cause_survives_writer_shutdown() {
         let mut sockets = SocketSet::new(vec![]);
@@ -22525,6 +22702,32 @@ mod tests {
         assert_eq!(stats.total_tx_queue, 0);
         assert_eq!(stats.max_pressure(), 25);
         assert_eq!(stats.total_pressure(), 35);
+    }
+
+    #[test]
+    fn global_pending_scan_runs_only_for_buffered_credit() {
+        let scans = std::cell::Cell::new(0usize);
+        let disabled_pending = global_pending_for_buffered_credit(false, || {
+            scans.set(scans.get() + 1);
+            4096
+        });
+        assert_eq!(disabled_pending, 0);
+        assert_eq!(
+            scans.get(),
+            0,
+            "D16/non-buffered relay passes must not scan every dirty flow and socket"
+        );
+
+        let enabled_pending = global_pending_for_buffered_credit(true, || {
+            scans.set(scans.get() + 1);
+            4096
+        });
+        assert_eq!(enabled_pending, 4096);
+        assert_eq!(
+            scans.get(),
+            1,
+            "buffered credit may evaluate the aggregate only once per dirty pass"
+        );
     }
 
     #[test]

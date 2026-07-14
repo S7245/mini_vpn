@@ -243,7 +243,11 @@ mod tests {
         let mut p = FakeIpPool::new();
         assert_eq!(p.usage(), (0, 0), "空池");
         let ip = p.alloc("a.com", 0);
-        assert_eq!(p.usage(), (1, 0), "alloc 计 total、不改 refcount → active=0");
+        assert_eq!(
+            p.usage(),
+            (1, 0),
+            "alloc 计 total、不改 refcount → active=0"
+        );
         p.acquire(ip, 0);
         assert_eq!(p.usage(), (1, 1), "acquire → active=1");
         let _ = p.alloc("b.com", 0);

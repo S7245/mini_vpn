@@ -6,6 +6,7 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
+use std::num::NonZeroU16;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -16,6 +17,10 @@ use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Endpoint, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
+
+pub(crate) use crate::quic_udp_send_service::{
+    QuicUdpSendServiceSnapshot, QuicUdpSendServiceStats,
+};
 
 /// QUIC ALPN：握手必须协商；client/server 一致。
 pub const QUIC_ALPN: &[u8] = b"mvpn";
@@ -63,6 +68,61 @@ pub enum MtuPolicy {
     Safe1200,
 }
 
+/// QUIC UDP segmentation-offload policy. Production defaults to Quinn's enabled behavior;
+/// Disabled is an explicit tracer-bullet profile for measuring packet-burst amplification.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum QuicGsoPolicy {
+    Enabled,
+    Disabled,
+}
+
+/// Client-endpoint UDP send service. `QuinnDefault` preserves Quinn's direct socket service;
+/// `Bounded` installs the fixed aggregate 48-datagram/2ms tracer profile across all connections.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum QuicUdpSendServicePolicy {
+    QuinnDefault,
+    Bounded,
+}
+
+/// Per-connection Quinn pacing policy. The production default preserves Quinn's upstream
+/// adaptive burst capacity; `PacerCap64` bounds only the pacer's token ceiling to 64 paced
+/// datagram equivalents without adding another sender or timer. `EndpointWindowV1` keeps that
+/// per-path pacer unchanged and adds one byte-owned service shared by the client endpoint.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum QuicPacingPolicy {
+    QuinnDefault,
+    PacerCap64,
+    EndpointWindowV1,
+}
+
+impl QuicPacingPolicy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::QuinnDefault => "quinn",
+            Self::PacerCap64 => "pacer-cap64",
+            Self::EndpointWindowV1 => "endpoint-window-v1",
+        }
+    }
+}
+
+impl QuicUdpSendServicePolicy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::QuinnDefault => "quinn",
+            Self::Bounded => "bounded",
+        }
+    }
+}
+
+impl QuicGsoPolicy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
 impl MtuPolicy {
     pub fn label(self) -> &'static str {
         match self {
@@ -100,6 +160,66 @@ pub fn parse_mtu_policy(name: Option<&str>) -> (MtuPolicy, bool) {
             _ => (MtuPolicy::Default, true),
         },
     }
+}
+
+/// Parse the QUIC GSO policy. Missing/empty values retain Quinn's enabled default; unknown
+/// values fail safe to that production default and return `true` so callers can warn.
+pub fn parse_gso_policy(name: Option<&str>) -> (QuicGsoPolicy, bool) {
+    match name.map(str::trim).filter(|v| !v.is_empty()) {
+        None => (QuicGsoPolicy::Enabled, false),
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "enabled" | "enable" | "true" | "1" | "on" => (QuicGsoPolicy::Enabled, false),
+            "disabled" | "disable" | "false" | "0" | "off" => (QuicGsoPolicy::Disabled, false),
+            _ => (QuicGsoPolicy::Enabled, true),
+        },
+    }
+}
+
+/// Parse the client UDP send-service policy. Unknown values preserve the production Quinn path
+/// and return `true` so the caller can emit an observable fallback warning.
+pub fn parse_udp_send_service_policy(name: Option<&str>) -> (QuicUdpSendServicePolicy, bool) {
+    match name.map(str::trim).filter(|value| !value.is_empty()) {
+        None => (QuicUdpSendServicePolicy::QuinnDefault, false),
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "quinn" | "default" => (QuicUdpSendServicePolicy::QuinnDefault, false),
+            "bounded" => (QuicUdpSendServicePolicy::Bounded, false),
+            _ => (QuicUdpSendServicePolicy::QuinnDefault, true),
+        },
+    }
+}
+
+/// Parse the Quinn pacer policy. Missing/empty values retain the exact upstream default;
+/// unknown values fail safe to that default and return `true` so callers can warn.
+pub fn parse_pacing_policy(name: Option<&str>) -> (QuicPacingPolicy, bool) {
+    match name.map(str::trim).filter(|value| !value.is_empty()) {
+        None => (QuicPacingPolicy::QuinnDefault, false),
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "quinn" | "default" => (QuicPacingPolicy::QuinnDefault, false),
+            "pacer-cap64" | "pacer_cap64" | "cap64" => (QuicPacingPolicy::PacerCap64, false),
+            "endpoint-window-v1" | "endpoint_window_v1" | "endpointwindowv1" => {
+                (QuicPacingPolicy::EndpointWindowV1, false)
+            }
+            _ => (QuicPacingPolicy::QuinnDefault, true),
+        },
+    }
+}
+
+/// Reject two independent pacing layers on the same client endpoint. The bounded UDP sender is
+/// retained only as a default-off diagnostic profile; the Quinn pacer cap must remain the sole
+/// active production pacing mechanism.
+pub fn validate_quic_send_policies(
+    pacing_policy: QuicPacingPolicy,
+    udp_send_service_policy: QuicUdpSendServicePolicy,
+) -> Result<(), String> {
+    if !matches!(pacing_policy, QuicPacingPolicy::QuinnDefault)
+        && matches!(udp_send_service_policy, QuicUdpSendServicePolicy::Bounded)
+    {
+        return Err(format!(
+            "QUIC pacing policy {} cannot be combined with bounded UDP send service",
+            pacing_policy.label()
+        ));
+    }
+    Ok(())
 }
 
 /// 下行 uni-stream 并发配额（刀3.5）：quinn 默认仅 **100**，而 quic-relay-mode 每包一条 uni-stream，
@@ -202,13 +322,22 @@ fn force_linux_socket_buffer(socket: &std::net::UdpSocket, opt: libc::c_int, byt
 /// 共享的 QUIC 传输参数：keep-alive + 拉长 idle + 起步 MTU + CC + uni-stream 配额（datagram 等其余默认）。
 /// 中文要点（刀3.5）：装 `congestion_controller_factory`（quinn 默认 Cubic；高 RTT/丢包跨境 BBR 通常更优）
 /// + 抬 `max_concurrent_uni_streams`（避 #221）。
-fn quic_transport_config(cc: CcChoice, mtu_policy: MtuPolicy) -> Arc<TransportConfig> {
+fn quic_transport_config(
+    cc: CcChoice,
+    mtu_policy: MtuPolicy,
+    gso_policy: QuicGsoPolicy,
+    pacing_policy: QuicPacingPolicy,
+) -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
     let idle = IdleTimeout::try_from(Duration::from_secs(QUIC_MAX_IDLE_SECS))
         .expect("idle timeout fits VarInt");
     t.max_idle_timeout(Some(idle));
     t.keep_alive_interval(Some(Duration::from_secs(QUIC_KEEPALIVE_SECS)));
     apply_mtu_policy(&mut t, mtu_policy);
+    t.enable_segmentation_offload(matches!(gso_policy, QuicGsoPolicy::Enabled));
+    if matches!(pacing_policy, QuicPacingPolicy::PacerCap64) {
+        t.max_pacing_burst_datagram_equivalents(NonZeroU16::new(64));
+    }
     t.max_concurrent_bidi_streams(QUIC_MAX_CONCURRENT_BIDI_STREAMS.into());
     t.max_concurrent_uni_streams(QUIC_MAX_CONCURRENT_UNI_STREAMS.into());
     t.stream_receive_window(quic_stream_receive_window_bytes(mtu_policy).into());
@@ -269,6 +398,8 @@ pub fn client_quic_config(ca_path: &str) -> Result<ClientConfig, String> {
         crypto,
         CcChoice::Cubic,
         MtuPolicy::Default,
+        QuicGsoPolicy::Enabled,
+        QuicPacingPolicy::QuinnDefault,
     ))
 }
 
@@ -280,9 +411,17 @@ pub fn client_quic_config_alpn(
     alpn_protocols: Vec<Vec<u8>>,
     cc: CcChoice,
     mtu_policy: MtuPolicy,
+    gso_policy: QuicGsoPolicy,
+    pacing_policy: QuicPacingPolicy,
 ) -> Result<ClientConfig, String> {
     let crypto = client_crypto(ca_path, alpn_protocols, true)?;
-    Ok(finish_client_config(crypto, cc, mtu_policy))
+    Ok(finish_client_config(
+        crypto,
+        cc,
+        mtu_policy,
+        gso_policy,
+        pacing_policy,
+    ))
 }
 
 /// 把 rustls 客户端配置包成 quinn `ClientConfig` 并装上共享传输参数（含选定 CC）。
@@ -290,11 +429,18 @@ fn finish_client_config(
     crypto: rustls::ClientConfig,
     cc: CcChoice,
     mtu_policy: MtuPolicy,
+    gso_policy: QuicGsoPolicy,
+    pacing_policy: QuicPacingPolicy,
 ) -> ClientConfig {
     let quic_crypto = QuicClientConfig::try_from(crypto)
         .expect("rustls client config must support QUIC initial cipher suite");
     let mut cfg = ClientConfig::new(Arc::new(quic_crypto));
-    cfg.transport_config(quic_transport_config(cc, mtu_policy));
+    cfg.transport_config(quic_transport_config(
+        cc,
+        mtu_policy,
+        gso_policy,
+        pacing_policy,
+    ));
     cfg
 }
 
@@ -324,6 +470,22 @@ fn client_crypto(
 /// 中文要点（刀3）：经 `Endpoint::new` 注入自定义 `EndpointConfig`，显式设 `max_udp_payload_size`
 /// （接收侧 headroom，见常量注释）；replaces `Endpoint::client`（其用默认 EndpointConfig，旋钮不可调）。
 pub fn client_endpoint(cfg: ClientConfig) -> Result<Endpoint, String> {
+    client_endpoint_with_udp_send_service(
+        cfg,
+        QuicUdpSendServicePolicy::QuinnDefault,
+        QuicPacingPolicy::QuinnDefault,
+    )
+    .map(|(endpoint, _)| endpoint)
+}
+
+/// Bind a QUIC client endpoint and optionally install the fixed aggregate UDP send-service
+/// adapter. One endpoint owns one UDP socket, so the returned bounded stats cover every QUIC
+/// connection (including the full TUIC TCP pool) created from this endpoint.
+pub(crate) fn client_endpoint_with_udp_send_service(
+    cfg: ClientConfig,
+    send_service_policy: QuicUdpSendServicePolicy,
+    pacing_policy: QuicPacingPolicy,
+) -> Result<(Endpoint, Option<QuicUdpSendServiceStats>), String> {
     let bind: SocketAddr = "0.0.0.0:0".parse().expect("valid bind addr");
     let socket = std::net::UdpSocket::bind(bind).map_err(|e| format!("quic client bind: {e}"))?;
     let (udp_buffer_bytes, udp_buffer_fell_back) = parse_quic_udp_socket_buffer_bytes(
@@ -350,10 +512,26 @@ pub fn client_endpoint(cfg: ClientConfig) -> Result<Endpoint, String> {
     ep_cfg
         .max_udp_payload_size(QUIC_MAX_UDP_PAYLOAD_SIZE)
         .map_err(|e| format!("quic max_udp_payload_size: {e:?}"))?;
-    let mut ep = Endpoint::new(ep_cfg, None, socket, runtime)
+    if matches!(pacing_policy, QuicPacingPolicy::EndpointWindowV1) {
+        ep_cfg.endpoint_pacing_service(Some(
+            quinn::EndpointPacingServiceConfig::endpoint_window_v1(),
+        ));
+    }
+    let abstract_socket = runtime
+        .wrap_udp_socket(socket)
+        .map_err(|e| format!("quic client abstract socket: {e}"))?;
+    let (abstract_socket, send_service_stats) = match send_service_policy {
+        QuicUdpSendServicePolicy::QuinnDefault => (abstract_socket, None),
+        QuicUdpSendServicePolicy::Bounded => {
+            let (socket, stats) =
+                crate::quic_udp_send_service::bounded_udp_socket(abstract_socket, runtime.clone());
+            (socket, Some(stats))
+        }
+    };
+    let mut ep = Endpoint::new_with_abstract_socket(ep_cfg, None, abstract_socket, runtime)
         .map_err(|e| format!("quic client endpoint: {e}"))?;
     ep.set_default_client_config(cfg);
-    Ok(ep)
+    Ok((ep, send_service_stats))
 }
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
@@ -411,8 +589,175 @@ mod tests {
     }
 
     #[test]
+    fn gso_policy_defaults_enabled_and_parses_disabled() {
+        assert_eq!(parse_gso_policy(None), (QuicGsoPolicy::Enabled, false));
+        assert_eq!(parse_gso_policy(Some("")), (QuicGsoPolicy::Enabled, false));
+        assert_eq!(
+            parse_gso_policy(Some("enabled")),
+            (QuicGsoPolicy::Enabled, false)
+        );
+        assert_eq!(
+            parse_gso_policy(Some("disabled")),
+            (QuicGsoPolicy::Disabled, false)
+        );
+        assert_eq!(
+            parse_gso_policy(Some("false")),
+            (QuicGsoPolicy::Disabled, false)
+        );
+        assert_eq!(
+            parse_gso_policy(Some("unknown")),
+            (QuicGsoPolicy::Enabled, true)
+        );
+    }
+
+    #[test]
+    fn udp_send_service_policy_defaults_to_quinn_and_parses_bounded() {
+        assert_eq!(
+            parse_udp_send_service_policy(None),
+            (QuicUdpSendServicePolicy::QuinnDefault, false)
+        );
+        assert_eq!(
+            parse_udp_send_service_policy(Some("bounded")),
+            (QuicUdpSendServicePolicy::Bounded, false)
+        );
+        assert_eq!(
+            parse_udp_send_service_policy(Some("unknown")),
+            (QuicUdpSendServicePolicy::QuinnDefault, true)
+        );
+    }
+
+    #[test]
+    fn pacing_policy_defaults_to_quinn_and_parses_supported_candidates() {
+        assert_eq!(
+            parse_pacing_policy(None),
+            (QuicPacingPolicy::QuinnDefault, false)
+        );
+        assert_eq!(
+            parse_pacing_policy(Some("pacer-cap64")),
+            (QuicPacingPolicy::PacerCap64, false)
+        );
+        assert_eq!(
+            parse_pacing_policy(Some("endpoint-window-v1")),
+            (QuicPacingPolicy::EndpointWindowV1, false)
+        );
+        assert_eq!(
+            parse_pacing_policy(Some("unknown")),
+            (QuicPacingPolicy::QuinnDefault, true)
+        );
+    }
+
+    #[test]
+    fn pacer_cap64_cannot_stack_with_bounded_udp_send_service() {
+        assert!(
+            validate_quic_send_policies(
+                QuicPacingPolicy::QuinnDefault,
+                QuicUdpSendServicePolicy::Bounded,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_quic_send_policies(
+                QuicPacingPolicy::PacerCap64,
+                QuicUdpSendServicePolicy::QuinnDefault,
+            )
+            .is_ok()
+        );
+
+        let err = validate_quic_send_policies(
+            QuicPacingPolicy::PacerCap64,
+            QuicUdpSendServicePolicy::Bounded,
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot be combined"), "{err}");
+
+        let err = validate_quic_send_policies(
+            QuicPacingPolicy::EndpointWindowV1,
+            QuicUdpSendServicePolicy::Bounded,
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot be combined"), "{err}");
+    }
+
+    #[test]
+    fn transport_config_applies_gso_policy() {
+        let enabled = quic_transport_config(
+            CcChoice::Cubic,
+            MtuPolicy::Default,
+            QuicGsoPolicy::Enabled,
+            QuicPacingPolicy::QuinnDefault,
+        );
+        let disabled = quic_transport_config(
+            CcChoice::Cubic,
+            MtuPolicy::Default,
+            QuicGsoPolicy::Disabled,
+            QuicPacingPolicy::QuinnDefault,
+        );
+
+        assert!(
+            format!("{enabled:?}").contains("enable_segmentation_offload: true"),
+            "{enabled:?}"
+        );
+        assert!(
+            format!("{disabled:?}").contains("enable_segmentation_offload: false"),
+            "{disabled:?}"
+        );
+    }
+
+    #[test]
+    fn transport_config_keeps_endpoint_window_off_the_per_connection_pacer() {
+        let default = quic_transport_config(
+            CcChoice::Cubic,
+            MtuPolicy::Default,
+            QuicGsoPolicy::Enabled,
+            QuicPacingPolicy::QuinnDefault,
+        );
+        let capped = quic_transport_config(
+            CcChoice::Cubic,
+            MtuPolicy::Default,
+            QuicGsoPolicy::Enabled,
+            QuicPacingPolicy::PacerCap64,
+        );
+        let endpoint_window = quic_transport_config(
+            CcChoice::Cubic,
+            MtuPolicy::Default,
+            QuicGsoPolicy::Enabled,
+            QuicPacingPolicy::EndpointWindowV1,
+        );
+
+        let default_debug = format!("{default:?}");
+        let capped_debug = format!("{capped:?}");
+        let endpoint_window_debug = format!("{endpoint_window:?}");
+        assert!(
+            !default_debug.contains("max_pacing_burst_datagram_equivalents"),
+            "{default_debug}"
+        );
+        assert!(
+            capped_debug.contains("max_pacing_burst_datagram_equivalents: 64"),
+            "{capped_debug}"
+        );
+        assert!(
+            !endpoint_window_debug.contains("max_pacing_burst_datagram_equivalents"),
+            "{endpoint_window_debug}"
+        );
+        assert_eq!(endpoint_window_debug, default_debug);
+    }
+
+    #[test]
     fn client_config_builds_with_dev_ca() {
         let cfg = client_quic_config("certs/dev/ca-cert.pem");
+        assert!(cfg.is_ok(), "{:?}", cfg.err());
+    }
+
+    #[test]
+    fn client_config_accepts_cap64_pacing_policy() {
+        let cfg = client_quic_config_alpn(
+            "certs/dev/ca-cert.pem",
+            vec![b"h3".to_vec()],
+            CcChoice::Cubic,
+            MtuPolicy::Default,
+            QuicGsoPolicy::Enabled,
+            QuicPacingPolicy::PacerCap64,
+        );
         assert!(cfg.is_ok(), "{:?}", cfg.err());
     }
 
@@ -433,6 +778,58 @@ mod tests {
         assert!(client_endpoint(cfg).is_ok());
     }
 
+    #[tokio::test]
+    async fn bounded_client_endpoint_exposes_shared_send_service_stats() {
+        let default_cfg = client_quic_config("certs/dev/ca-cert.pem").unwrap();
+        let (_, default_stats) = client_endpoint_with_udp_send_service(
+            default_cfg,
+            QuicUdpSendServicePolicy::QuinnDefault,
+            QuicPacingPolicy::QuinnDefault,
+        )
+        .unwrap();
+        assert!(default_stats.is_none());
+
+        let bounded_cfg = client_quic_config("certs/dev/ca-cert.pem").unwrap();
+        let (_, bounded_stats) = client_endpoint_with_udp_send_service(
+            bounded_cfg,
+            QuicUdpSendServicePolicy::Bounded,
+            QuicPacingPolicy::QuinnDefault,
+        )
+        .unwrap();
+        assert!(bounded_stats.is_some());
+    }
+
+    #[tokio::test]
+    async fn endpoint_window_is_default_off_and_installed_once_per_client_endpoint() {
+        let default_cfg = client_quic_config("certs/dev/ca-cert.pem").unwrap();
+        let (default_endpoint, _) = client_endpoint_with_udp_send_service(
+            default_cfg,
+            QuicUdpSendServicePolicy::QuinnDefault,
+            QuicPacingPolicy::QuinnDefault,
+        )
+        .unwrap();
+        assert!(default_endpoint.endpoint_pacing_snapshot().is_none());
+
+        let window_cfg = client_quic_config("certs/dev/ca-cert.pem").unwrap();
+        let (window_endpoint, _) = client_endpoint_with_udp_send_service(
+            window_cfg,
+            QuicUdpSendServicePolicy::QuinnDefault,
+            QuicPacingPolicy::EndpointWindowV1,
+        )
+        .unwrap();
+        let snapshot = window_endpoint
+            .endpoint_pacing_snapshot()
+            .expect("EndpointWindowV1 must install one endpoint-owned service");
+        assert_eq!(snapshot.rate_bytes_per_second, 30_720_000);
+        assert_eq!(snapshot.burst_bytes, 61_440);
+        assert_eq!(snapshot.control_reserve_bytes, 10_240);
+        assert_eq!(snapshot.connection_quantum_bytes, 20_480);
+        assert_eq!(snapshot.available_tokens, 61_440);
+        assert_eq!(snapshot.live_reservation_bytes, 0);
+        assert_eq!(snapshot.outstanding_bytes, 0);
+        assert_eq!(snapshot.connection_records, 0);
+    }
+
     // 刀3.5：BBR/Cubic 两种 CC 都能装进 transport config 并 bind（真 CC 生效靠 acceptance 验，
     // 此处只锁"装得上、bind 绿"，factory 本身 opaque 不可断言类型）。
     #[tokio::test]
@@ -443,6 +840,8 @@ mod tests {
                 vec![b"h3".to_vec()],
                 cc,
                 MtuPolicy::Default,
+                QuicGsoPolicy::Enabled,
+                QuicPacingPolicy::QuinnDefault,
             )
             .unwrap();
             assert!(client_endpoint(cfg).is_ok(), "bind failed for {cc:?}");
@@ -451,7 +850,12 @@ mod tests {
 
     #[test]
     fn transport_config_sets_vpn_flow_control_windows() {
-        let cfg = quic_transport_config(CcChoice::Cubic, MtuPolicy::Default);
+        let cfg = quic_transport_config(
+            CcChoice::Cubic,
+            MtuPolicy::Default,
+            QuicGsoPolicy::Enabled,
+            QuicPacingPolicy::QuinnDefault,
+        );
         let dbg = format!("{cfg:?}");
         assert_eq!(
             quic_stream_receive_window_bytes(MtuPolicy::Default),
@@ -511,7 +915,12 @@ mod tests {
             }
         );
 
-        let cfg = quic_transport_config(CcChoice::Cubic, MtuPolicy::Safe1200);
+        let cfg = quic_transport_config(
+            CcChoice::Cubic,
+            MtuPolicy::Safe1200,
+            QuicGsoPolicy::Enabled,
+            QuicPacingPolicy::QuinnDefault,
+        );
         let dbg = format!("{cfg:?}");
         assert_eq!(
             quic_stream_receive_window_bytes(MtuPolicy::Safe1200),

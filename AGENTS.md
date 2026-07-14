@@ -187,7 +187,73 @@ throughput branch, prioritize the 2026 Knife14 documents, especially the
 US-client results, downlink/backpressure/lifecycle specs, and the latest
 results documents.
 
-Current Knife14 summary, as of 2026-07-08:
+Current Knife14 summary, as of 2026-07-13:
+
+- EndpointPacingService implementation and the full local Task 12 gate pass.
+  The pinned quinn-proto service owns pre-build planned bytes, actual GSO
+  settlement, socket-blocked outstanding bytes, two-connection DRR/control,
+  deadline/waker composition, and lifecycle cleanup; pinned Quinn supplies
+  only the current-waker and real socket-outcome adapter.
+- The fixed candidate remains `30,720,000B/s`, `61,440B` burst, `10,240B`
+  control reserve, and `20,480B` quantum. The exact GSO-enabled `32 MiB` local
+  gate reached `240.466 Mbit/s`, exact delivery, clean EOF, and final zero
+  live/outstanding/record leaks. `EndpointWindowV1` is default-off and
+  `QuinnDefault` remains production default.
+- Final gates: quinn-proto `309/309 + 3/3` docs; Quinn `29/29` nonignored plus
+  `1/1` doc; mini_vpn `622/622` nonignored; explicit `64/256/1024`; UDP sweep;
+  harness check; root/focused-vendor format; runner shell/self-test; diff
+  checks. Code review fixed fail-open behavior on an impossible migration-key
+  collision by retaining the old paced adapter; no P0/P1 remains.
+- Commit and one VPS endpoint-window-v1 forward acceptance are authorized.
+  macOS TUN is prohibited. Keep D16, MTU/PLPMTUD, pool=2, QUIC windows,
+  `64 KiB` chunk, Cubic, GSO enabled, the 20-datagram driver bound, and
+  self-wake frozen. A `<=170 Mbit/s` discriminator is architecture failure;
+  do not tune constants. Local result:
+  `docs/tech/2026-07-13-knife14h10d16-endpoint-pacing-service-local-gate-results.md`.
+
+The bullets below preserve earlier stage history and are superseded where
+they describe implementation or authorization as pending.
+
+- The confirmed post-cap64 design-preparation stage is complete. A fake-time
+  `RTT=200us`, `cwnd=40000B`, `MTU=1280` replay proved that the stored cap64
+  Pacer can issue exactly `259` datagrams inside `1ms`; the default vendored
+  test now preserves this as a mechanism characterization rather than a
+  known-negative gate.
+- The proposed successor is an endpoint-owned pre-accounting byte service at
+  `30.72 MB/s` with a `61,440B` burst, giving formal connection-datagram
+  bounds of `92,160B/1ms` and `368,640B/10ms` while retaining about
+  `239.167 Mbit/s` measured application capacity. Its proof includes live
+  reservations and socket-blocked outstanding bytes, two-connection DRR,
+  control reserve, idle borrowing, combined deadlines/wakers, and
+  cancel/migration cleanup. Spec and plan:
+  `docs/tech/2026-07-13-knife14h10d16-endpoint-pacing-service-{architecture-spec,implementation-plan}.md`.
+- No coordinator implementation, VPS, macOS TUN, commit, or notification ran
+  in that preparation stage. Vendored Quinn-proto passed `276/276` plus
+  `3/3` doc tests; root fmt and tracked/untracked diff-checks passed. Task 12
+  step 4 remains stopped before P8. The
+  next possible action is local TDD implementation only after explicit review
+  and confirmation of the new spec/plan; a later VPS would still require a
+  separate explicit authorization.
+- Gate A and Gate B remain accepted, but Task 12 step 4 is stopped before P8.
+  The one allowed same-window pacer-cap64 forward discriminator ran: sing-box
+  control passed at `191.928 Mbit/s` receiver with zero socket drops; mini_vpn
+  reached `185 Mbit/s` with `20/20` intervals but added `29` TUN TX drops and
+  `50,621,275B` formal QUIC loss.
+- cap64 was reachable and attributable: the data connection carried
+  `99.9998%` of TX bytes and one snapshot reduced `327680B` to
+  `81920B = 64*1280`; there was no migration, reconnect, blocking, or extreme
+  cwnd. It nevertheless peaked at `267 packets/1ms` and `1337/10ms`, no better
+  than the prior Quinn-default failure class.
+- Code review rejects stored-token capacity as a temporal burst bound. Quinn's
+  preserved `1.25*cwnd/rtt` refill can replenish multiple buckets inside 1ms
+  on a sub-ms path. Do not retry cap values, bounded socket cooldown, GSO-only,
+  or frozen-parameter tuning. The next possible stage is a deterministic
+  sub-ms refill replay plus a new pre-accounting endpoint time-window/service
+  architecture spec, and it requires explicit confirmation before code or
+  VPS work. Result:
+  `docs/tech/2026-07-13-knife14h10d16-pacer-cap64-forward-discriminator-results.md`.
+
+Earlier Knife14 summary, as of 2026-07-08:
 
 - Knife14fp changed the server-side preflight: exit-side Linux socket buffers
   are mandatory for `100+ Mbit/s` TUIC acceptance. With the old `.33` defaults
@@ -342,6 +408,7 @@ show the system survives realistic pressure:
 # Session & Context Management
 - **Frequent Refreshes:** If the task takes too long to run or multiple repair failures occur, please automatically re-evaluate the current architecture.
 - **Source of Truth:** Always refer to the project root's `AGENTS.md` and architecture design files. Do not rely on short-term memory. If the context is too large, ask me if a new session tree is needed to maintain code quality.
+- **50% Context Handoff:** When the current session context has exceeded roughly 50%, do not interrupt an in-progress task solely for that reason. At the end of the current task, explicitly recommend opening a new session and provide a ready-to-copy opening handoff for it. The handoff must name the current Knife/stage/task, the exact stop or accepted position, the required source-of-truth files to read, the next authorized actions, frozen parameters/non-goals, test/stop rules, and whether VPS, macOS TUN, commits, or Slack notification are authorized.
 
 # Execution Plans
 - **Self-Correction:** If the repair test fails, do not immediately begin random modifications. You must first analyze the reasons for the failure and output a proposed modification plan, then wait for my confirmation before proceeding to the next step.
