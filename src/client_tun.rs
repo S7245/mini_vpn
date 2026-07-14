@@ -324,6 +324,7 @@ pub trait MetricsSink {
         _running_flows: usize,
         _drain_only_flows: usize,
         _recovery_flows: usize,
+        _uplink_recv_queue_max: usize,
     ) {
     }
     /// H10d16 Task 11A follow-up: a ready local TCP packet directly scheduled
@@ -510,6 +511,10 @@ impl TcpSendWindowSnapshot {
 }
 
 impl TcpDownlinkDiag {
+    fn note_uplink_recv_queue(&mut self, recv_queue: usize) {
+        self.recv_queue_max = self.recv_queue_max.max(recv_queue);
+    }
+
     fn note_pending(&mut self, pending_current: usize) {
         self.downlink_pending_high_water = self.downlink_pending_high_water.max(pending_current);
     }
@@ -4340,6 +4345,7 @@ fn default_downlink_backpressure_for_tun_egress(
 struct TcpSocketBufferConfig {
     rx_bytes: usize,
     tx_bytes: usize,
+    receive_window_limit: Option<usize>,
 }
 
 impl Default for TcpSocketBufferConfig {
@@ -4347,6 +4353,7 @@ impl Default for TcpSocketBufferConfig {
         Self {
             rx_bytes: TCP_SOCKET_BUFFER_SIZE,
             tx_bytes: TCP_SOCKET_BUFFER_SIZE,
+            receive_window_limit: None,
         }
     }
 }
@@ -6304,6 +6311,7 @@ fn record_d16_harness_observation<M: MetricsSink>(
         aggregate.d16_running_flows,
         aggregate.d16_drain_only_flows,
         aggregate.d16_recovery_flows,
+        aggregate.recv_queue_max,
     );
     let mut owned_queue_bytes = 0usize;
     let mut pending_bytes = 0usize;
@@ -7143,7 +7151,16 @@ fn parse_tcp_socket_buffer_config(rx: Option<&str>, tx: Option<&str>) -> TcpSock
     TcpSocketBufferConfig {
         rx_bytes: parse_tcp_socket_buffer_bytes(rx, default.rx_bytes),
         tx_bytes: parse_tcp_socket_buffer_bytes(tx, default.tx_bytes),
+        receive_window_limit: None,
     }
+}
+
+fn endpoint_window_v1_local_uplink_window_bytes() -> usize {
+    let endpoint = quinn::EndpointPacingServiceConfig::endpoint_window_v1();
+    let ten_millisecond_bound = endpoint
+        .burst_bytes()
+        .saturating_add(endpoint.rate_bytes_per_second() / 100);
+    usize::try_from(ten_millisecond_bound).unwrap_or(usize::MAX)
 }
 
 /// Startup configuration for the TUN runtime.
@@ -7232,6 +7249,8 @@ impl TunRuntimeConfig {
     pub(crate) fn h10d16_gate_a_for_test() -> Self {
         let mut config = Self::from_sources(Some("2")).expect("Gate A profile must be valid");
         config.tun_mtu = 1_200;
+        config.tcp_socket_buffers.rx_bytes = 1024 * 1024;
+        config.tcp_socket_buffers.tx_bytes = 1024 * 1024;
         config.downlink_backpressure =
             default_downlink_backpressure_for_tun_egress(config.tun_mtu, config.tun_tx_queue_len);
         config.buffered_downlink = BufferedDownlinkConfig::disabled(
@@ -7239,6 +7258,8 @@ impl TunRuntimeConfig {
             config.listener.pool_size,
         );
         config.h10d16_byte_owned_egress = true;
+        config.tcp_socket_buffers.receive_window_limit =
+            Some(endpoint_window_v1_local_uplink_window_bytes());
         config
     }
 
@@ -7356,6 +7377,10 @@ impl TunRuntimeConfig {
                 .ok()
                 .as_deref(),
         );
+        if cfg.h10d16_byte_owned_egress {
+            cfg.tcp_socket_buffers.receive_window_limit =
+                Some(endpoint_window_v1_local_uplink_window_bytes());
+        }
         Ok(cfg)
     }
 }
@@ -7489,8 +7514,13 @@ pub async fn start_tun_proxy() {
         tx_queue_pause_threshold(runtime_config.downlink_backpressure)
     );
     println!(
-        "🧱 TCP socket buffers: rx={}B tx={}B（MINI_VPN_TCP_*_BUFFER_BYTES 可调）",
-        runtime_config.tcp_socket_buffers.rx_bytes, runtime_config.tcp_socket_buffers.tx_bytes
+        "🧱 TCP socket buffers: rx={}B tx={}B receive_window_limit={}（MINI_VPN_TCP_*_BUFFER_BYTES 可调；H10d16 limit 固定由 EndpointWindowV1 10ms bound 派生）",
+        runtime_config.tcp_socket_buffers.rx_bytes,
+        runtime_config.tcp_socket_buffers.tx_bytes,
+        runtime_config
+            .tcp_socket_buffers
+            .receive_window_limit
+            .map_or_else(|| "none".to_string(), |bytes| format!("{bytes}B"))
     );
     let adaptive_tun_rx_pressure_budget =
         pressure_tun_rx_drain_budget(runtime_config.downlink_backpressure, runtime_config.tun_mtu);
@@ -10326,6 +10356,7 @@ fn build_listener_socket_with_buffers(
     let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; buffers.rx_bytes]);
     let tcp_tx_buffer = TcpSocketBuffer::new(vec![0; buffers.tx_bytes]);
     let mut tcp_socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
+    tcp_socket.set_receive_window_limit(buffers.receive_window_limit);
     configure_local_tcp_socket(&mut tcp_socket);
     tcp_socket.listen(spec.local_port).unwrap();
     tcp_socket
@@ -10840,6 +10871,8 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
             return Ok(());
         };
         let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
+        ctx.downlink_diag
+            .note_uplink_recv_queue(tcp_socket.recv_queue());
         let tcp_state = tcp_socket.state();
         pump_established_uplink(ctx, tcp_state, now_secs, || {
             extract_socket_payload(tcp_socket)
@@ -26989,6 +27022,7 @@ mod tests {
         let buffers = TcpSocketBufferConfig {
             rx_bytes: 8192,
             tx_bytes: 16384,
+            receive_window_limit: None,
         };
         let mut registry = ListenerRegistry::with_socket_buffers(1, buffers);
         let mut sockets = SocketSet::new(vec![]);
@@ -27002,6 +27036,25 @@ mod tests {
 
         assert_eq!(socket.recv_capacity(), buffers.rx_bytes);
         assert_eq!(socket.send_capacity(), buffers.tx_bytes);
+        assert_eq!(socket.receive_window_limit(), None);
+    }
+
+    #[test]
+    fn h10d16_listener_keeps_storage_and_limits_local_uplink_window() {
+        let config = TunRuntimeConfig::h10d16_gate_a_for_test();
+        assert_eq!(endpoint_window_v1_local_uplink_window_bytes(), 368_640);
+        assert_eq!(config.tcp_socket_buffers.rx_bytes, 1024 * 1024);
+        assert_eq!(
+            config.tcp_socket_buffers.receive_window_limit,
+            Some(368_640)
+        );
+
+        let socket = build_listener_socket_with_buffers(
+            &ListenerSpec { local_port: 443 },
+            config.tcp_socket_buffers,
+        );
+        assert_eq!(socket.recv_capacity(), 1024 * 1024);
+        assert_eq!(socket.receive_window_limit(), Some(368_640));
     }
 
     #[test]

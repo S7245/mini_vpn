@@ -1,5 +1,26 @@
 # Errors
 
+## 2026-07-13 - Formal-profile and TCP-window mistakes can create false local safety
+
+- The previous exact 32 MiB tracer configured H10d16 pacing and queues but
+  left the SUT's smoltcp RX/TX storage at the `65,535B` test default. VPS used
+  the frozen `1 MiB` buffers, so the local gate silently pre-limited the sender
+  and missed the real admitted burst. Every architecture discriminator must
+  assert all formal profile inputs inside the SUT before measuring capacity.
+- The first receive-window implementation used an additive
+  `min(physical_free, limit)` formula. With `100,000B` unconsumed, it still
+  advertised `368,640B`; the right edge moved forward by `100,000B`. The
+  correct formula is `min(capacity, limit) - queued`, with saturation at zero.
+  Test advertisement and segment acceptability together after queueing data.
+- `--all-features --offline` on the standalone vendored Quinn manifests tried
+  to select uncached fuzz/extra runtime dependencies and failed before tests.
+  Use the accepted default upstream suites, pass Quinn an explicit absolute
+  local quinn-proto patch, and verify the executed counts and provenance.
+- Rust 1.95 strict all-target Clippy also reports established repository-wide
+  lints unrelated to this stage. Compare against the baseline and rerun with
+  explicit allowances for only those known lint classes; do not expand a
+  throughput repair into an unrelated whole-codebase rewrite.
+
 ## 2026-07-13 - The local ingress gate modeled average capacity but missed the VPS startup burst
 
 - The exact local 32 MiB gate passed above `293 Mbit/s` with ring `38/500`,

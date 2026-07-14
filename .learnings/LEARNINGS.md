@@ -1,5 +1,28 @@
 # Learnings
 
+## 2026-07-13 - TCP storage and advertised receive credit need independent ownership
+
+- The failed VPS ingress stage used `1 MiB` smoltcp RX storage and repeatedly
+  moved its receive queue from hundreds of KiB or `1,048,576B` to zero. The
+  prior local tracer accidentally retained the default `65,535B` test socket,
+  so it could not reproduce the formal profile's admitted startup burst.
+- The successor preserves `1 MiB` physical storage but independently limits
+  H10d16 TCP flow-control credit to `368,640B`. Correct TCP semantics require
+  `advertised_free = limit - unconsumed_queue`; the acceptance right edge stays
+  `application_consumed_seq + limit` until the application actually consumes
+  bytes.
+- The exact formal-profile 32 MiB tracer passed at `302.246 Mbit/s`, with ring
+  and pump high-water both `15/500`, zero full waits, receive-queue high-water
+  `39,440B`, exact bytes, and clean EOF. Full smoltcp, mini_vpn, Quinn,
+  concurrency, and UDP gates passed.
+- Reusable rule: deterministic capacity tests must clone the deployed socket
+  storage and protocol-credit profile, not merely the application payload and
+  queue sizes. Separate storage capacity from advertised credit when storage
+  is retained for lifecycle resilience but must not be exposed as one sender
+  burst.
+- Result:
+  `docs/tech/2026-07-13-knife14h10d16-local-uplink-window-service-local-gate-results.md`.
+
 ## 2026-07-13 - Continuous read ownership still needs burst-safe consumer service
 
 - Commit `20a0f8c` reached its exact VPS path: `856,043` TCP packets became

@@ -965,6 +965,7 @@ struct Recorded {
     tun_rx_pump_full_waits: u64,
     tun_rx_pump_read_errors: u64,
     actor_bypass_admitted_bytes: u64,
+    uplink_recv_queue_max: usize,
     backlog_active: bool,
     d16_running_flows: usize,
     d16_drain_only_flows: usize,
@@ -1098,6 +1099,7 @@ impl MetricsSink for RecordingSink {
         running_flows: usize,
         drain_only_flows: usize,
         recovery_flows: usize,
+        uplink_recv_queue_max: usize,
     ) {
         let mut r = self.shared.lock().unwrap();
         r.actor_bypass_admitted_bytes = r
@@ -1106,6 +1108,7 @@ impl MetricsSink for RecordingSink {
         r.d16_running_flows = running_flows;
         r.d16_drain_only_flows = drain_only_flows;
         r.d16_recovery_flows = recovery_flows;
+        r.uplink_recv_queue_max = r.uplink_recv_queue_max.max(uplink_recv_queue_max);
     }
     fn note_d16_tun_rx_actor_wake(&mut self) {
         let mut r = self.shared.lock().unwrap();
@@ -2696,11 +2699,12 @@ mod tests {
         let snapshot = recorded.lock().unwrap().clone();
         let receiver_mbps = received as f64 * 8.0 / payload_elapsed.as_secs_f64() / 1_000_000.0;
         eprintln!(
-            "d16_forward_tun_batch receiver_mbps={receiver_mbps:.3} elapsed={payload_elapsed:?} ring_high={} pump_high={}/{} pump_full_waits={} tcp_packets={} tcp_batches={} batch_iface_polls={} batch_flushes={} avoided_dirty_relay_passes={} avoided_iface_polls={}",
+            "d16_forward_tun_batch receiver_mbps={receiver_mbps:.3} elapsed={payload_elapsed:?} ring_high={} pump_high={}/{} pump_full_waits={} uplink_recv_queue_max={} tcp_packets={} tcp_batches={} batch_iface_polls={} batch_flushes={} avoided_dirty_relay_passes={} avoided_iface_polls={}",
             gen_to_sut.high_water_packets(),
             snapshot.tun_rx_pump_queue_high_water,
             snapshot.tun_rx_pump_capacity_packets,
             snapshot.tun_rx_pump_full_waits,
+            snapshot.uplink_recv_queue_max,
             snapshot.tun_rx_tcp_packets,
             snapshot.tun_rx_tcp_batches,
             snapshot.tun_rx_batch_iface_polls,
@@ -2757,6 +2761,10 @@ mod tests {
         );
         assert_eq!(snapshot.tun_rx_pump_full_waits, 0, "{snapshot:?}");
         assert_eq!(snapshot.tun_rx_pump_read_errors, 0, "{snapshot:?}");
+        assert!(
+            snapshot.uplink_recv_queue_max <= 368_640,
+            "local TCP admission must stay within EndpointWindowV1's 10ms bound: {snapshot:?}"
+        );
         assert!(snapshot.d16_eof_observed, "{snapshot:?}");
         assert_eq!(snapshot.d16_eof_tail_bytes, 0, "{snapshot:?}");
         assert_eq!(snapshot.d16_owned_queue_bytes, 0, "{snapshot:?}");
