@@ -1,5 +1,21 @@
 # Errors
 
+## 2026-07-14 - The first macOS HITL summary hid evidence and overproduced logs
+
+- BSD `awk` rejected `NR>0?NR-1:0`, leaving process and event counts blank even
+  though their CSV/TSV files were intact. Use the portable spaced/parenthesized
+  form and lock it with the runner's macOS self-test.
+- The summary emitted `NO_KNOWN_INTERNAL_FAILURE_SIGNAL` despite a real
+  `remote_write_failed` close-tail event. Count both error/lifecycle forms,
+  promote any match or nonzero TUN interface error to `REVIEW`, and keep the
+  summary explicitly non-authoritative.
+- Per-flush permit-release diagnostics produced `8,909` lines in a short run
+  and would force repeated compaction during M0. Preserve their aggregate byte
+  accounting while gating individual batches behind full TRACE; keep bounded
+  log and free-disk fail-closed checks for the remaining evidence.
+- These were observer failures, not permission to alter H10d16, pacing, MTU,
+  pool, window, chunk, Cubic, GSO, queue, or self-wake parameters.
+
 ## 2026-07-14 - Final VPS regression exposed topology, packet-shape, and runner traps
 
 - A reverse P8 against `.33` was initially treated as a client architecture

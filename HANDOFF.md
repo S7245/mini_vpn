@@ -4,6 +4,25 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-14)
 
+- The first HK user-executed target-only qualification passed on exact source
+  `2a85fd4`. Direct receiver rates were `9.045/26.790 Mbit/s` and TUN receiver
+  rates `31.444/48.490 Mbit/s` forward/reverse, all `20/20` nonzero.
+- Endpoint conservation was exact at or below `61,440B`; pump high was
+  `317/500` with zero waits/errors; macOS interface errors were `0/0`; DNS,
+  PID/utun/route cleanup, secret scan, and bundle checksum passed.
+- One forward iperf-tail `Stopped(0)` is `REVIEW`, not a leak: D16
+  queue/lease/reservation closed at zero and the slot rearmed for reverse. M0
+  must preserve an idle-drain epoch and sender/receiver byte-gap evidence.
+- Real-bundle TDD repaired blank macOS-awk summary counts and remote-write
+  classification. High-rate per-flush permit logs moved behind full TRACE;
+  aggregate/exception/lifecycle evidence remains. No data-plane constant
+  changed.
+- Short qualification passes, but 2-hour M0 has not run. HK may run target-
+  only M0 through the user-controlled HITL script; Shenzhen remains preferred
+  for M1/M2/recovery. Add the mixed-workload and idle-drain controller before
+  M0. Result:
+  `docs/tech/2026-07-14-knife15-macos-hitl-short-qualification-results.md`.
+
 - Knife14 is complete. Knife15 will prove hours-long bounded operation,
   recovery, and operational evidence rather than reopen peak-throughput
   tuning.

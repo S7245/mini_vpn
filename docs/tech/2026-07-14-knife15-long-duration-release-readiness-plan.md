@@ -1,8 +1,7 @@
 # Knife15 Long-Duration Release-Readiness Plan
 
 Date: 2026-07-14
-Status: **Accepted plan — HITL target-only runner implemented locally; real
-TUN not yet executed**
+Status: **Short HK HITL qualification PASS; 2-hour M0 not yet executed**
 
 ## Stage Goal
 
@@ -260,3 +259,17 @@ capacity, core invariants, and short formal regressions are strong, but the new
 macOS runner, resource trend evidence, recovery SLOs, and staged 2/8/24-hour
 results do not yet exist. Reaching `10/10` requires Tasks 1-11 to pass with no
 unresolved P0/P1 and with complete fail-closed cleanup evidence.
+
+## 2026-07-14 Execution Update
+
+The first HK user-controlled target-only qualification passed on exact source
+`2a85fd4`: TCP forward/reverse and fake-IP DNS completed, endpoint conservation
+held at or below `61,440B`, macOS interface errors were zero, pump high-water
+was `317/500` with zero waits/errors, and process/utun/routes cleaned up. This
+qualifies the runner, not the 2-hour M0. Results:
+`docs/tech/2026-07-14-knife15-macos-hitl-short-qualification-results.md`.
+
+HK is now permitted to run target-only M0 through the same user-executed HITL
+boundary; Shenzhen remains preferred for M1/M2 and recovery. Before M0,
+complete the repaired summary/log-density gates and the mixed-workload plus
+idle-drain controller. No frozen data-plane constant changed.

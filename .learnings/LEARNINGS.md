@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-07-14 - Real macOS bundles must qualify the evidence pipeline too
+
+- The first HK HITL bundle proved useful TUN behavior, but it also exposed two
+  evidence defects that synthetic Linux checks had missed: BSD `awk` rejected
+  a tightly written ternary, and the summary did not classify a real remote
+  write failure for review. Test report generation with the target platform's
+  tools and fixtures, not only the data-plane process.
+- Raw artifacts remain the source of truth when a generated summary is
+  incomplete. Exact iperf JSON, endpoint conservation, interface counters,
+  lifecycle lines, process samples, routes, and cleanup were sufficient to
+  recover the short-run decision without rerunning TUN.
+- One per-flush diagnostic accounted for `8,909/9,185` log lines and about 89%
+  of bytes while duplicating a 30-second aggregate. Long-duration evidence
+  needs both a hard disk bound and a signal-density budget: retain aggregate,
+  exception, and lifecycle events by default, and put high-rate detail behind
+  an explicit trace gate.
+- Reusable rule: qualify the observer with the same rigor as the SUT. A long
+  soak is not ready until target-platform parsing, failure classification,
+  log compaction, and post-stop raw-evidence recovery are all tested.
+- Result:
+  `docs/tech/2026-07-14-knife15-macos-hitl-short-qualification-results.md`.
+
 ## 2026-07-14 - Root TUN work can remain human-controlled without losing evidence quality
 
 - The HK Mac can contribute real utun evidence even when the agent must not

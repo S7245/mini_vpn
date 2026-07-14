@@ -6,6 +6,26 @@
 
 #### Latest decision (2026-07-14)
 
+The first HK user-controlled target-only qualification is PASS on exact source
+`2a85fd4`. Direct receiver rates were `9.045/26.790 Mbit/s` forward/reverse;
+TUN receiver rates were `31.444/48.490 Mbit/s`, all four with `20/20` nonzero
+intervals. This is client-function evidence on a variable path, not an absolute
+capacity gate.
+
+Endpoint conservation stayed at or below `61,440B`; the TUN pump reached
+`317/500` with zero waits/errors; macOS `utun4` reported zero input/output
+errors; DNS forged `198.18.0.2`; PID, utun, and routes cleaned up; bundle secret
+scan and SHA-256 passed. One forward iperf-tail `Stopped(0)` is classified
+`REVIEW`: D16 owned queues/reservations closed at zero and the slot rearmed for
+reverse, so it is not a leak, but M0 must retain idle-drain and byte-gap checks.
+
+The real bundle exposed and drove TDD repairs for macOS-awk summary counts,
+remote-write failure classification, and high-rate permit-release log noise.
+These are report/log-density changes only. The short qualification authorizes
+a user-run target-only 2-hour M0 on HK or Shenzhen after the repaired runner is
+rebuilt; it does not complete M0. Result:
+`docs/tech/2026-07-14-knife15-macos-hitl-short-qualification-results.md`.
+
 Knife14 is complete. The next planned stage is Knife15 long-duration
 release-readiness, with two separate evidence lanes: the capable Linux/VPS
 topology remains the architecture and peak-throughput reference, while macOS

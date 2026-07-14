@@ -6141,7 +6141,10 @@ async fn flush_tx_and_release_downlink_permits<D: TunIo>(
         socket_ctxs,
     );
     if release.released_inflight_permit_bytes > 0 {
-        tcp_diag_log!(
+        // This fires once per flushed batch and dominated long-run logs. The
+        // 30s TCP aggregate retains the same byte accounting; keep individual
+        // batches behind the explicit full-trace gate.
+        trace_log!(
             "🔎 tcp-d6-egress-permit-release stage={} flushed_tcp_payload={} released_inflight_permits={}",
             stage,
             release.flushed_tcp_payload_bytes,

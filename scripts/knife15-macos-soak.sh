@@ -26,8 +26,8 @@ PARALLEL="${PARALLEL:-1}"
 METRICS_SECS="${METRICS_SECS:-30}"
 SAMPLE_SECS="${SAMPLE_SECS:-30}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-40}"
-MAX_LOG_BYTES="${MAX_LOG_BYTES:-134217728}"
-LOG_KEEP_BYTES="${LOG_KEEP_BYTES:-67108864}"
+MAX_LOG_BYTES="${MAX_LOG_BYTES:-268435456}"
+LOG_KEEP_BYTES="${LOG_KEEP_BYTES:-134217728}"
 MIN_FREE_KB="${MIN_FREE_KB:-1048576}"
 STATE_DIR="/var/run/mini_vpn_knife15_macos_state"
 SERVER_HOST=""
@@ -353,7 +353,7 @@ interface_csv_from_text() {
 }
 
 runner_self_test() {
-  local tmp good_log bad_log route_fixture interface_fixture clean_scan secret_scan_dir secret_value
+  local tmp good_log bad_log route_fixture interface_fixture clean_scan secret_scan_dir secret_value summary_dir
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/knife15-macos-self-test.XXXXXX")" || return 1
   good_log="$tmp/good.log"
   bad_log="$tmp/bad.log"
@@ -434,6 +434,38 @@ EOF_GOOD
   ! grep -Fq "$secret_value" "$secret_scan_dir/secret-scan.txt" || \
     die "self-test: secret scan copied the matched value"
 
+  summary_dir="$tmp/summary"
+  mkdir "$summary_dir"
+  cp "$good_log" "$summary_dir/mini_vpn.log"
+  printf '%s\n%s\n%s\n' header sample-1 sample-2 >"$summary_dir/process.csv"
+  printf '%s\n%s\n' header event-1 >"$summary_dir/events.tsv"
+  printf '%s\n' 'timestamp,interface,mtu,ipkts,ierrs,ibytes,opkts,oerrs,obytes,collisions' \
+    >"$summary_dir/interface.csv"
+  printf '%s\n' '2026-07-14T00:00:00Z,utun42,1200,1,0,64,1,0,64,0' \
+    >>"$summary_dir/interface.csv"
+  write_summary "$summary_dir"
+  grep -Fq -- '- process_samples: 2' "$summary_dir/summary.md" || \
+    die "self-test: summary process count is not macOS-awk compatible"
+  grep -Fq -- '- events: 1' "$summary_dir/summary.md" || \
+    die "self-test: summary event count is not macOS-awk compatible"
+  grep -Fq -- '- interface_error_samples: 0' "$summary_dir/summary.md" || \
+    die "self-test: zero-error interface sample was misclassified"
+  printf '%s\n' '2026-07-14T00:00:30Z,utun42,1200,2,1,128,2,0,128,0' \
+    >>"$summary_dir/interface.csv"
+  write_summary "$summary_dir"
+  grep -Fq -- '- internal_failure_scan: REVIEW' "$summary_dir/summary.md" || \
+    die "self-test: interface error was not marked for review"
+  grep -Fq -- '- interface_error_samples: 1' "$summary_dir/summary.md" || \
+    die "self-test: interface error count mismatch"
+  sed -i '' '$d' "$summary_dir/interface.csv"
+  printf '%s\n' '写入上游流失败 direction=local_to_remote err=Stopped(0)' \
+    >>"$summary_dir/mini_vpn.log"
+  write_summary "$summary_dir"
+  grep -Fq -- '- internal_failure_scan: REVIEW' "$summary_dir/summary.md" || \
+    die "self-test: remote write failure was not marked for review"
+  grep -Fq -- '- remote_write_failures: 1' "$summary_dir/summary.md" || \
+    die "self-test: remote write failure count mismatch"
+
   rm -rf "$tmp"
   echo "knife15 macOS runner self-test passed"
 }
@@ -477,6 +509,9 @@ pacing_policy=endpoint-window-v1
 h10d16=enabled
 metrics_secs=$METRICS_SECS
 sample_secs=$SAMPLE_SECS
+max_log_bytes=$MAX_LOG_BYTES
+log_keep_bytes=$LOG_KEEP_BYTES
+min_free_kb=$MIN_FREE_KB
 owner_uid=$owner_uid
 owner_gid=$owner_gid
 EOF_MANIFEST
@@ -971,13 +1006,21 @@ secret_scan() {
 write_summary() {
   local run_dir="$1"
   local log_file="$run_dir/mini_vpn.log"
-  local conservation verdict
+  local conservation verdict remote_write_failures interface_error_samples log_bytes
   if conservation_check_file "$log_file"; then
     conservation=PASS
   else
     conservation=FAIL_OR_MISSING
   fi
-  if grep -Eq 'pump_full_waits=[1-9][0-9]*|pump_read_errors=[1-9][0-9]*|tun_flush_tx_failures=[1-9][0-9]*|terminal_pending_reap_bytes=[1-9][0-9]*' "$log_file"; then
+  remote_write_failures="$(grep -Ec '写入上游流失败|reason=remote_write_failed' "$log_file" 2>/dev/null || true)"
+  interface_error_samples="$(awk -F, '
+    NR > 1 && (($5 ~ /^[0-9]+$/ && $5 + 0 > 0) || ($8 ~ /^[0-9]+$/ && $8 + 0 > 0)) { count++ }
+    END { print count + 0 }
+  ' "$run_dir/interface.csv" 2>/dev/null)"
+  log_bytes="$(wc -c <"$log_file" 2>/dev/null | tr -d ' ')"
+  if { [[ "$interface_error_samples" =~ ^[0-9]+$ ]] && \
+    ((10#$interface_error_samples > 0)); } || \
+    grep -Eq 'pump_full_waits=[1-9][0-9]*|pump_read_errors=[1-9][0-9]*|tun_flush_tx_failures=[1-9][0-9]*|terminal_pending_reap_bytes=[1-9][0-9]*|写入上游流失败|reason=remote_write_failed' "$log_file"; then
     verdict=REVIEW
   else
     verdict=NO_KNOWN_INTERNAL_FAILURE_SIGNAL
@@ -988,10 +1031,13 @@ write_summary() {
 - generated_utc: $(timestamp)
 - endpoint_conservation: $conservation
 - internal_failure_scan: $verdict
-- process_samples: $(awk 'END {print NR>0?NR-1:0}' "$run_dir/process.csv" 2>/dev/null)
+- remote_write_failures: ${remote_write_failures:-unknown}
+- interface_error_samples: ${interface_error_samples:-unknown}
+- mini_vpn_log_bytes: ${log_bytes:-unknown}
+- process_samples: $(awk 'END {print (NR > 0 ? NR - 1 : 0)}' "$run_dir/process.csv" 2>/dev/null)
 - endpoint_samples: $(grep -c '📊 TUIC endpoint pacing global' "$log_file" 2>/dev/null || true)
 - data_plane_samples: $(grep -c '📊 数据面' "$log_file" 2>/dev/null || true)
-- events: $(awk 'END {print NR>0?NR-1:0}' "$run_dir/events.tsv" 2>/dev/null)
+- events: $(awk 'END {print (NR > 0 ? NR - 1 : 0)}' "$run_dir/events.tsv" 2>/dev/null)
 
 This summary is a discriminator, not a release verdict. Review direct/control
 baselines, resource slopes, fault-window event markers, QUIC deltas, TUN

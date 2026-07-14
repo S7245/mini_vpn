@@ -227,6 +227,21 @@ Current Knife14 summary, as of 2026-07-14:
 
 Current Knife15 plan, as of 2026-07-14:
 
+- The first HK user-executed target-only qualification passed on source
+  `2a85fd4`: direct receiver `9.045/26.790 Mbit/s`, TUN receiver
+  `31.444/48.490 Mbit/s`, all `20/20` nonzero. Endpoint conservation stayed
+  `<=61,440B`, pump high was `317/500` with zero waits/errors, macOS interface
+  errors were zero, DNS passed, and PID/utun/routes cleaned up.
+- One forward iperf-tail `Stopped(0)` remains `REVIEW`, but D16
+  queue/lease/reservation closed at zero and the slot rearmed for reverse; it
+  is not a leak. M0 must keep idle-drain and byte-gap checks.
+- Real evidence drove TDD fixes for macOS-awk summary counts, remote-write
+  classification, and high-rate permit-release logging. Reporting/log density
+  changed; no frozen data-plane constant changed. The short qualification
+  authorizes user-run target-only M0 on HK or Shenzhen, but 2-hour M0 has not
+  run. Result:
+  `docs/tech/2026-07-14-knife15-macos-hitl-short-qualification-results.md`.
+
 - The next stage is long-duration release readiness, not another pacing or
   peak-throughput tuning stage. The capable Linux/VPS topology remains the
   H10d16 architecture and peak-capacity reference.
