@@ -58,6 +58,7 @@ verify_h10d16_startup_profile() {
   local expected_pacing_policy="${5:-$DEFAULT_TUIC_PACING_POLICY}"
 
   grep -Fq "TUN runtime started with pool_size=2, tun_mtu=${expected_mtu}," "$log_file" &&
+    grep -Fq "TUN ingress service: enabled capacity=" "$log_file" &&
     grep -Fqx "$(h10d16_expected_startup_line)" "$log_file" &&
     grep -Fq "QUIC GSO policy=${expected_gso_policy}" "$log_file" &&
     grep -Fq "QUIC UDP send service=${expected_send_service}" "$log_file" &&
@@ -879,6 +880,7 @@ EOF
   trap 'rm -f "${profile_log:-}"' RETURN
   cat > "$profile_log" <<'EOF'
 🚀 TUN runtime started with pool_size=2, tun_mtu=1200, tun_tx_queue_len_estimate=1000
+🧺 TUN ingress service: enabled capacity=1000 packets source=tun_tx_queue_len
 H10d16 byte-owned egress: enabled per_flow_cap=524288 global_cap=67108864 quantum=131072
 🧭 TUIC 拥塞控制器=Cubic | UDP relay mode=Native | QUIC MTU policy=default | QUIC GSO policy=enabled | QUIC UDP send service=quinn | QUIC pacing policy=pacer-cap64
 EOF
@@ -894,6 +896,7 @@ EOF
   fi
   cat > "$profile_log" <<'EOF'
 🚀 TUN runtime started with pool_size=2, tun_mtu=1200, tun_tx_queue_len_estimate=1000
+🧺 TUN ingress service: enabled capacity=1000 packets source=tun_tx_queue_len
 H10d16 byte-owned egress: enabled per_flow_cap=524288 global_cap=67108864 quantum=131072
 🧭 TUIC 拥塞控制器=Cubic | UDP relay mode=Native | QUIC MTU policy=default | QUIC GSO policy=enabled | QUIC UDP send service=quinn | QUIC pacing policy=quinn
 EOF
@@ -903,6 +906,7 @@ EOF
   fi
   cat > "$profile_log" <<'EOF'
 🚀 TUN runtime started with pool_size=2, tun_mtu=1500, tun_tx_queue_len_estimate=1000
+🧺 TUN ingress service: enabled capacity=1000 packets source=tun_tx_queue_len
 H10d16 byte-owned egress: enabled per_flow_cap=524288 global_cap=67108864 quantum=131072
 🧭 TUIC 拥塞控制器=Cubic | UDP relay mode=Native | QUIC MTU policy=default | QUIC GSO policy=enabled | QUIC UDP send service=quinn | QUIC pacing policy=pacer-cap64
 EOF

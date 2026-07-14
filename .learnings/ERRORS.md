@@ -1,5 +1,31 @@
 # Errors
 
+## 2026-07-13 - Ingress implementation gates exposed lifecycle and test-provenance traps
+
+- The existing multi-thread profiler test could run both 32-flow phases to
+  their 10-second timeout and still compare fractions without checking
+  completion. Exact `d934f12` reproduced the same 20-second behavior. Isolate
+  profiler calibration to one completed flow, require completion before metric
+  assertions, and keep concurrency in the dedicated 64/256/1024 sweeps.
+- A terminal pump channel initially returned `BrokenPipe` forever while
+  `run_event_loop` ignored TUN wait errors, creating a potential busy select
+  loop. Terminal TUN failure must log once and end the event loop; test the
+  consumer lifecycle, not only producer closure.
+- A standalone vendored Quinn command selected registry `quinn-proto 0.11.16`
+  and failed on missing endpoint APIs. Pass an explicit absolute
+  `patch.crates-io.quinn-proto.path` and verify build provenance before treating
+  compiler errors as regressions.
+- One focused command again used `--exact` without the full module path and ran
+  zero tests. A successful exit is invalid unless the summary reports the
+  expected nonzero test count.
+- The first VPS source copy was partial until `rsync --partial` completed and
+  the SHA-256 matched. The first macOS tar also carried Apple xattr/`._`
+  metadata; clear xattrs and use `COPYFILE_DISABLE=1` plus `--no-xattrs`, then
+  inspect members before deployment.
+- An initial UDP `8443` preflight read the wrong `ss` column, and a broad process
+  match could include the checker itself. Filter the exact source port and
+  require `comm == mini_vpn` for client process cleanup.
+
 ## 2026-07-13 - TUN batch tracer failures exposed reachability and fixture-fidelity gaps
 
 - The first batch RED compiled only after replacing an invalid

@@ -12,7 +12,9 @@
 //! 封在本模块内，使 `tests/` 整合测试极薄。隔离不了的瓶颈 #3（单条 QUIC 连接）见 spec，deferred。
 
 use crate::client_tun::{D16HarnessFlow, MetricsSink, TunRuntimeConfig, run_event_loop};
-use crate::device::{TunFlushedTcpPacket, TunIo, summarize_flushed_ip_tcp_packet};
+use crate::device::{
+    TunFlushedTcpPacket, TunIngressPumpSnapshot, TunIo, summarize_flushed_ip_tcp_packet,
+};
 use crate::metrics::Metrics;
 use crate::shared::{ClientError, TargetAddr};
 use crate::tcp_downlink_pump::{ByteQueuePushError, D16GlobalByteBudget};
@@ -154,10 +156,12 @@ fn busy_spin(d: Duration) {
 /// （单槽 rx_buffer + tx_queue），只是数据来自 [`PacketLink`] 而非真 utun。
 pub struct LoopbackTunDevice {
     rx_buffer: Option<BytesMut>,
+    iface_rx_queue: VecDeque<BytesMut>,
     tx_queue: VecDeque<BytesMut>,
     flushed_tcp_packets: Vec<TunFlushedTcpPacket>,
     inbound: PacketLink,  // 发生器 → SUT
     outbound: PacketLink, // SUT → 发生器
+    ingress_pump: Option<LoopbackIngressPump>,
     /// 刀12：每次 `flush_tx` 注入的合成 on-loop CPU 成本（busy-spin）。默认 ZERO。
     /// `flush_tx` 在主循环 poll 段内（enter_poll/leave_poll 括起）→ 该 burn 计入 poll_time / loop-active，
     /// 用于验证 profiler 能侦测「主循环被 on-loop CPU 拖满」的饱和信号（T4 spike）。
@@ -166,6 +170,37 @@ pub struct LoopbackTunDevice {
     wait_suppressed: bool,
     max_tcp_payload_packets_per_flush: Arc<AtomicU64>,
     mtu: usize,
+}
+
+struct LoopbackIngressPump {
+    receiver: mpsc::Receiver<BytesMut>,
+    task: tokio::task::JoinHandle<()>,
+    stats: Arc<LoopbackIngressPumpStats>,
+    capacity_packets: usize,
+}
+
+#[derive(Default)]
+struct LoopbackIngressPumpStats {
+    packets: AtomicU64,
+    bytes: AtomicU64,
+    queue_high_water: AtomicU64,
+    full_waits: AtomicU64,
+    closed: AtomicU64,
+}
+
+impl LoopbackIngressPumpStats {
+    fn snapshot(&self, capacity_packets: usize) -> TunIngressPumpSnapshot {
+        TunIngressPumpSnapshot {
+            enabled: true,
+            packets: self.packets.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+            queue_high_water: self.queue_high_water.load(Ordering::Relaxed),
+            capacity_packets,
+            full_waits: self.full_waits.load(Ordering::Relaxed),
+            read_errors: 0,
+            closed: self.closed.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl LoopbackTunDevice {
@@ -193,10 +228,12 @@ impl LoopbackTunDevice {
     ) -> Self {
         Self {
             rx_buffer: None,
+            iface_rx_queue: VecDeque::new(),
             tx_queue: VecDeque::new(),
             flushed_tcp_packets: Vec::new(),
             inbound,
             outbound,
+            ingress_pump: None,
             cpu_burn_per_flush,
             suppress_wait_after_tcp_payload_flush,
             wait_suppressed: false,
@@ -215,6 +252,55 @@ impl LoopbackTunDevice {
         self.mtu = mtu;
         self
     }
+
+    #[cfg(test)]
+    fn with_ingress_pump(mut self, capacity_packets: usize) -> Self {
+        let capacity_packets = capacity_packets.max(1);
+        let inbound = self.inbound.clone();
+        let (sender, receiver) = mpsc::channel(capacity_packets);
+        let stats = Arc::new(LoopbackIngressPumpStats::default());
+        let task_stats = Arc::clone(&stats);
+        let task = tokio::spawn(async move {
+            loop {
+                let packet = loop {
+                    if let Some(packet) = inbound.pop() {
+                        break packet;
+                    }
+                    inbound.notify.notified().await;
+                };
+                let occupied = capacity_packets.saturating_sub(sender.capacity());
+                task_stats.queue_high_water.fetch_max(
+                    occupied.saturating_add(1).min(capacity_packets) as u64,
+                    Ordering::Relaxed,
+                );
+                if sender.capacity() == 0 {
+                    task_stats.full_waits.fetch_add(1, Ordering::Relaxed);
+                }
+                let bytes = packet.len();
+                if sender.send(packet).await.is_err() {
+                    break;
+                }
+                task_stats.packets.fetch_add(1, Ordering::Relaxed);
+                task_stats.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+            }
+            task_stats.closed.fetch_add(1, Ordering::Relaxed);
+        });
+        self.ingress_pump = Some(LoopbackIngressPump {
+            receiver,
+            task,
+            stats,
+            capacity_packets,
+        });
+        self
+    }
+}
+
+impl Drop for LoopbackTunDevice {
+    fn drop(&mut self) {
+        if let Some(pump) = &self.ingress_pump {
+            pump.task.abort();
+        }
+    }
 }
 
 impl TunIo for LoopbackTunDevice {
@@ -224,6 +310,15 @@ impl TunIo for LoopbackTunDevice {
         }
         if self.wait_suppressed {
             return std::future::pending::<std::io::Result<()>>().await;
+        }
+        if let Some(pump) = &mut self.ingress_pump {
+            self.rx_buffer = Some(pump.receiver.recv().await.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "loopback ingress pump closed",
+                )
+            })?);
+            return Ok(());
         }
         loop {
             if let Some(pkt) = self.inbound.pop() {
@@ -238,6 +333,19 @@ impl TunIo for LoopbackTunDevice {
         if self.rx_buffer.is_some() {
             return Ok(true);
         }
+        if let Some(pump) = &mut self.ingress_pump {
+            return match pump.receiver.try_recv() {
+                Ok(packet) => {
+                    self.rx_buffer = Some(packet);
+                    Ok(true)
+                }
+                Err(mpsc::error::TryRecvError::Empty) => Ok(false),
+                Err(mpsc::error::TryRecvError::Disconnected) => Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "loopback ingress pump closed",
+                )),
+            };
+        }
         if let Some(pkt) = self.inbound.pop() {
             self.rx_buffer = Some(pkt);
             return Ok(true);
@@ -249,6 +357,13 @@ impl TunIo for LoopbackTunDevice {
     }
     fn rx_take(&mut self) -> Option<BytesMut> {
         self.rx_buffer.take()
+    }
+    fn stage_rx_for_iface(&mut self) -> bool {
+        let Some(packet) = self.rx_buffer.take() else {
+            return false;
+        };
+        self.iface_rx_queue.push_back(packet);
+        true
     }
     async fn flush_tx(&mut self) -> std::io::Result<()> {
         busy_spin(self.cpu_burn_per_flush); // 刀12：合成 on-loop CPU（默认 ZERO 即 no-op）。
@@ -273,6 +388,12 @@ impl TunIo for LoopbackTunDevice {
     fn take_flushed_tcp_packets(&mut self) -> Vec<TunFlushedTcpPacket> {
         std::mem::take(&mut self.flushed_tcp_packets)
     }
+    fn tun_ingress_pump_snapshot(&self) -> TunIngressPumpSnapshot {
+        self.ingress_pump
+            .as_ref()
+            .map(|pump| pump.stats.snapshot(pump.capacity_packets))
+            .unwrap_or_default()
+    }
     fn inject_ip_packet(&mut self, pkt: &[u8]) {
         self.tx_queue.push_back(BytesMut::from(pkt));
     }
@@ -285,9 +406,7 @@ impl Device for LoopbackTunDevice {
         loopback_caps_with_mtu(self.mtu)
     }
     fn receive(&mut self, _t: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // 只取 rx_buffer（由 wait_for_rx 单包填充），保持「每次 wakeup 处理一个包」语义，
-        // 让 SYN inspector / classify 的逐包窥视与真 utun 一致。
-        self.rx_buffer.take().map(|buffer| {
+        self.iface_rx_queue.pop_front().map(|buffer| {
             (
                 RawRxToken { buffer },
                 QueueTxToken {
@@ -835,8 +954,16 @@ struct Recorded {
     tun_rx_tcp_packets: u64,
     tun_rx_tcp_batches: u64,
     tun_rx_batch_dirty_relay_passes: u64,
+    tun_rx_batch_iface_polls: u64,
+    tun_rx_batch_flushes: u64,
     tun_rx_tcp_batch_packets_high_water: u64,
     tun_rx_avoided_dirty_relay_passes: u64,
+    tun_rx_avoided_iface_polls: u64,
+    tun_rx_pump_packets: u64,
+    tun_rx_pump_queue_high_water: u64,
+    tun_rx_pump_capacity_packets: usize,
+    tun_rx_pump_full_waits: u64,
+    tun_rx_pump_read_errors: u64,
     actor_bypass_admitted_bytes: u64,
     backlog_active: bool,
     d16_running_flows: usize,
@@ -933,8 +1060,16 @@ impl MetricsSink for RecordingSink {
         tcp_packets: u64,
         tcp_batches: u64,
         batch_dirty_relay_passes: u64,
+        batch_iface_polls: u64,
+        batch_flushes: u64,
         tcp_batch_packets_high_water: u64,
         avoided_dirty_relay_passes: u64,
+        avoided_iface_polls: u64,
+        pump_packets: u64,
+        pump_queue_high_water: u64,
+        pump_capacity_packets: usize,
+        pump_full_waits: u64,
+        pump_read_errors: u64,
     ) {
         let mut r = self.shared.lock().unwrap();
         r.tun_rx_tcp_packets = r.tun_rx_tcp_packets.max(tcp_packets);
@@ -942,12 +1077,20 @@ impl MetricsSink for RecordingSink {
         r.tun_rx_batch_dirty_relay_passes = r
             .tun_rx_batch_dirty_relay_passes
             .max(batch_dirty_relay_passes);
+        r.tun_rx_batch_iface_polls = r.tun_rx_batch_iface_polls.max(batch_iface_polls);
+        r.tun_rx_batch_flushes = r.tun_rx_batch_flushes.max(batch_flushes);
         r.tun_rx_tcp_batch_packets_high_water = r
             .tun_rx_tcp_batch_packets_high_water
             .max(tcp_batch_packets_high_water);
         r.tun_rx_avoided_dirty_relay_passes = r
             .tun_rx_avoided_dirty_relay_passes
             .max(avoided_dirty_relay_passes);
+        r.tun_rx_avoided_iface_polls = r.tun_rx_avoided_iface_polls.max(avoided_iface_polls);
+        r.tun_rx_pump_packets = r.tun_rx_pump_packets.max(pump_packets);
+        r.tun_rx_pump_queue_high_water = r.tun_rx_pump_queue_high_water.max(pump_queue_high_water);
+        r.tun_rx_pump_capacity_packets = r.tun_rx_pump_capacity_packets.max(pump_capacity_packets);
+        r.tun_rx_pump_full_waits = r.tun_rx_pump_full_waits.max(pump_full_waits);
+        r.tun_rx_pump_read_errors = r.tun_rx_pump_read_errors.max(pump_read_errors);
     }
     fn note_d16_actor_observation(
         &mut self,
@@ -1259,6 +1402,7 @@ pub async fn run_tcp_scenario(params: ScenarioParams) -> Report {
 
     // ---- 5. 收尾：停 SUT，汇总报告 ----
     sut.abort();
+    let _ = sut.await;
     let rec = shared.lock().unwrap();
     let bytes_echoed: usize = conns.iter().map(|c| c.recvd).sum();
     let latencies_us: Vec<u64> = conns.iter().filter_map(|c| c.done_us).collect();
@@ -2449,8 +2593,9 @@ mod tests {
         let gen_to_sut = PacketLink::bounded(RING_CAPACITY_PACKETS);
         let sut_to_gen = PacketLink::new();
         let (_downlink_tx, downlink_rx) = mpsc::channel::<Vec<u8>>(1);
-        let sut_device =
-            LoopbackTunDevice::new(gen_to_sut.clone(), sut_to_gen.clone()).with_mtu(TUN_MTU);
+        let sut_device = LoopbackTunDevice::new(gen_to_sut.clone(), sut_to_gen.clone())
+            .with_mtu(TUN_MTU)
+            .with_ingress_pump(RING_CAPACITY_PACKETS);
         let config = TunRuntimeConfig::h10d16_gate_a_for_test();
         let recorded = Arc::new(Mutex::new(Recorded::default()));
         let sut = tokio::spawn(run_event_loop(
@@ -2551,11 +2696,17 @@ mod tests {
         let snapshot = recorded.lock().unwrap().clone();
         let receiver_mbps = received as f64 * 8.0 / payload_elapsed.as_secs_f64() / 1_000_000.0;
         eprintln!(
-            "d16_forward_tun_batch receiver_mbps={receiver_mbps:.3} elapsed={payload_elapsed:?} ring_high={} tcp_packets={} tcp_batches={} avoided_dirty_relay_passes={}",
+            "d16_forward_tun_batch receiver_mbps={receiver_mbps:.3} elapsed={payload_elapsed:?} ring_high={} pump_high={}/{} pump_full_waits={} tcp_packets={} tcp_batches={} batch_iface_polls={} batch_flushes={} avoided_dirty_relay_passes={} avoided_iface_polls={}",
             gen_to_sut.high_water_packets(),
+            snapshot.tun_rx_pump_queue_high_water,
+            snapshot.tun_rx_pump_capacity_packets,
+            snapshot.tun_rx_pump_full_waits,
             snapshot.tun_rx_tcp_packets,
             snapshot.tun_rx_tcp_batches,
+            snapshot.tun_rx_batch_iface_polls,
+            snapshot.tun_rx_batch_flushes,
             snapshot.tun_rx_avoided_dirty_relay_passes,
+            snapshot.tun_rx_avoided_iface_polls,
         );
 
         assert_eq!(sent, PAYLOAD_BYTES, "{snapshot:?}");
@@ -2574,6 +2725,14 @@ mod tests {
             snapshot.tun_rx_tcp_batches, snapshot.tun_rx_batch_dirty_relay_passes,
             "{snapshot:?}"
         );
+        assert_eq!(
+            snapshot.tun_rx_tcp_batches, snapshot.tun_rx_batch_iface_polls,
+            "{snapshot:?}"
+        );
+        assert_eq!(
+            snapshot.tun_rx_tcp_batches, snapshot.tun_rx_batch_flushes,
+            "{snapshot:?}"
+        );
         assert!(
             snapshot.tun_rx_tcp_batch_packets_high_water > 1,
             "{snapshot:?}"
@@ -2582,6 +2741,22 @@ mod tests {
             snapshot.tun_rx_avoided_dirty_relay_passes > 0,
             "{snapshot:?}"
         );
+        assert!(snapshot.tun_rx_avoided_iface_polls > 0, "{snapshot:?}");
+        assert!(snapshot.tun_rx_pump_packets > 0, "{snapshot:?}");
+        assert_eq!(
+            snapshot.tun_rx_pump_packets, snapshot.tun_rx_tcp_packets,
+            "all pumped packets must leave the FIFO through the classified TCP path: {snapshot:?}"
+        );
+        assert_eq!(
+            snapshot.tun_rx_pump_capacity_packets, RING_CAPACITY_PACKETS,
+            "{snapshot:?}"
+        );
+        assert!(
+            snapshot.tun_rx_pump_queue_high_water < RING_CAPACITY_PACKETS as u64,
+            "{snapshot:?}"
+        );
+        assert_eq!(snapshot.tun_rx_pump_full_waits, 0, "{snapshot:?}");
+        assert_eq!(snapshot.tun_rx_pump_read_errors, 0, "{snapshot:?}");
         assert!(snapshot.d16_eof_observed, "{snapshot:?}");
         assert_eq!(snapshot.d16_eof_tail_bytes, 0, "{snapshot:?}");
         assert_eq!(snapshot.d16_owned_queue_bytes, 0, "{snapshot:?}");

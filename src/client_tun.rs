@@ -1,4 +1,4 @@
-use crate::device::{TunFlushedTcpPacket, TunIo, VirtualTunDevice};
+use crate::device::{TunFlushedTcpPacket, TunIngressPumpSnapshot, TunIo, VirtualTunDevice};
 use crate::dns::{self, Answer};
 use crate::failover::FailoverUpstream;
 use crate::fake_ip::FakeIpPool;
@@ -305,8 +305,16 @@ pub trait MetricsSink {
         _tcp_packets: u64,
         _tcp_batches: u64,
         _batch_dirty_relay_passes: u64,
+        _batch_iface_polls: u64,
+        _batch_flushes: u64,
         _tcp_batch_packets_high_water: u64,
         _avoided_dirty_relay_passes: u64,
+        _avoided_iface_polls: u64,
+        _pump_packets: u64,
+        _pump_queue_high_water: u64,
+        _pump_capacity_packets: usize,
+        _pump_full_waits: u64,
+        _pump_read_errors: u64,
     ) {
     }
     /// H10d16 Task 11A：harness 记录 D16 actor bypass 聚合值。
@@ -5631,7 +5639,10 @@ struct TunRxDrainDiag {
     udp_packets: u64,
     tcp_batches: u64,
     batch_dirty_relay_passes: u64,
+    batch_iface_polls: u64,
+    batch_flushes: u64,
     tcp_batch_packets_high_water: u64,
+    pump: TunIngressPumpSnapshot,
     budget_exhausted: u64,
     would_block: u64,
     errors: u64,
@@ -5719,6 +5730,20 @@ impl TunRxDrainDiag {
             .saturating_sub(self.batch_dirty_relay_passes)
     }
 
+    fn note_tcp_batch_poll_flush(&mut self, tcp_packets: usize) {
+        if tcp_packets == 0 {
+            return;
+        }
+        self.batch_iface_polls = self.batch_iface_polls.saturating_add(1);
+        self.batch_flushes = self.batch_flushes.saturating_add(1);
+        self.tcp_batch_packets_high_water =
+            self.tcp_batch_packets_high_water.max(tcp_packets as u64);
+    }
+
+    fn avoided_iface_polls(&self) -> u64 {
+        self.tcp_packets.saturating_sub(self.batch_iface_polls)
+    }
+
     fn note_budget_exhausted(&mut self) {
         self.budget_exhausted = self.budget_exhausted.saturating_add(1);
         self.backlog_guard
@@ -5748,7 +5773,7 @@ impl TunRxDrainDiag {
 
 fn format_tun_rx_drain_diag(diag: &TunRxDrainDiag) -> String {
     format!(
-        "🔎 tcp-tun-rx-drain attempts={} pre_payload_attempts={} remote_payload_attempts={} remote_payload_deferred_attempts={} remote_payload_deferred_delayed_attempts={} remote_payload_deferred_pressure_attempts={} relay_gap_hint_attempts={} relay_gap_hint_followup_attempts={} maintenance_attempts={} timer_active_flow_attempts={} timer_stalled_read_attempts={} local_egress_service_attempts={} other_attempts={} packets={} tcp={} dns={} udp={} tcp_batches={} batch_dirty_relay_passes={} tcp_batch_packets_high_water={} avoided_dirty_relay_passes={} budget_exhausted={} would_block={} errors={} backlog_active={} backlog_pause_edges={} backlog_resume_edges={}",
+        "🔎 tcp-tun-rx-drain attempts={} pre_payload_attempts={} remote_payload_attempts={} remote_payload_deferred_attempts={} remote_payload_deferred_delayed_attempts={} remote_payload_deferred_pressure_attempts={} relay_gap_hint_attempts={} relay_gap_hint_followup_attempts={} maintenance_attempts={} timer_active_flow_attempts={} timer_stalled_read_attempts={} local_egress_service_attempts={} other_attempts={} packets={} tcp={} dns={} udp={} tcp_batches={} batch_dirty_relay_passes={} batch_iface_polls={} batch_flushes={} tcp_batch_packets_high_water={} avoided_dirty_relay_passes={} avoided_iface_polls={} pump_enabled={} pump_packets={} pump_bytes={} pump_queue_high_water={} pump_capacity={} pump_full_waits={} pump_read_errors={} pump_closed={} budget_exhausted={} would_block={} errors={} backlog_active={} backlog_pause_edges={} backlog_resume_edges={}",
         diag.attempts,
         diag.pre_payload_attempts,
         diag.remote_payload_attempts,
@@ -5768,8 +5793,19 @@ fn format_tun_rx_drain_diag(diag: &TunRxDrainDiag) -> String {
         diag.udp_packets,
         diag.tcp_batches,
         diag.batch_dirty_relay_passes,
+        diag.batch_iface_polls,
+        diag.batch_flushes,
         diag.tcp_batch_packets_high_water,
         diag.avoided_dirty_relay_passes(),
+        diag.avoided_iface_polls(),
+        diag.pump.enabled,
+        diag.pump.packets,
+        diag.pump.bytes,
+        diag.pump.queue_high_water,
+        diag.pump.capacity_packets,
+        diag.pump.full_waits,
+        diag.pump.read_errors,
+        diag.pump.closed,
         diag.budget_exhausted,
         diag.would_block,
         diag.errors,
@@ -7564,7 +7600,20 @@ pub async fn start_tun_proxy() {
             return;
         }
     };
-    let device = VirtualTunDevice::new(raw_tun, runtime_config.tun_mtu);
+    let device = if runtime_config.h10d16_byte_owned_egress {
+        println!(
+            "🧺 TUN ingress service: enabled capacity={} packets source=tun_tx_queue_len",
+            runtime_config.tun_tx_queue_len
+        );
+        VirtualTunDevice::new_pumped(
+            raw_tun,
+            runtime_config.tun_mtu,
+            runtime_config.tun_tx_queue_len,
+        )
+    } else {
+        println!("🧺 TUN ingress service: disabled");
+        VirtualTunDevice::new(raw_tun, runtime_config.tun_mtu)
+    };
 
     // 刀11：进程级数据面可观测性句柄。**在选上游之前**构造一次 → 同一 `Arc<Metrics>` 既喂
     // run_event_loop（DNS/relay/gauge），又（T6 起）clone 进 TuicUpstream（UDP 下行 drop/背压）。
@@ -8758,6 +8807,9 @@ pub async fn run_event_loop<D, U, M>(
                         )
                         .await;
                     }
+                } else if let Err(error) = res {
+                    println!("TUN ingress terminated: {error}");
+                    break;
                 }
             }
             // 刀9 M3 / 刀14d：spawn 出主循环的 remote-open 完成 → 安装 relay（成功）/ rearm（失败），
@@ -9138,7 +9190,7 @@ pub async fn run_event_loop<D, U, M>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn ingest_ready_tun_rx_packet<D, U, M>(
+async fn prepare_ready_tun_rx_packet<D, U>(
     device: &mut D,
     assoc_table: &mut AssocTable,
     fake_pool: &mut FakeIpPool,
@@ -9148,17 +9200,11 @@ async fn ingest_ready_tun_rx_packet<D, U, M>(
     registry: &mut ListenerRegistry,
     sockets: &mut SocketSet<'static>,
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
-    iface: &mut Interface,
     dirty: &mut HashSet<SocketHandle>,
-    metrics: &mut M,
-    tcp_loop_flush_tx_calls: &mut u64,
-    tcp_loop_flush_tx_failures: &mut u64,
-    poll_stage: &str,
 ) -> TunRxPacketKind
 where
     D: TunIo,
     U: ProxyUpstream + DatagramUpstream + 'static,
-    M: MetricsSink,
 {
     // rx 分流（stage-12 D1 + 刀5）：任意 :53 → 裸包 DNS 劫持；其它 UDP → 裸 relay；
     // 非 UDP → 既有 smoltcp 路径。前两类 take 走、不进 iface.poll。
@@ -9203,9 +9249,29 @@ where
         }
     }
 
+    if !device.stage_rx_for_iface() {
+        tcp_diag_log!("🔎 tcp-tun-rx-stage-missing");
+    }
+
+    TunRxPacketKind::Tcp
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn poll_staged_tun_rx<D, M>(
+    device: &mut D,
+    sockets: &mut SocketSet<'static>,
+    socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
+    iface: &mut Interface,
+    metrics: &mut M,
+    tcp_loop_flush_tx_calls: &mut u64,
+    tcp_loop_flush_tx_failures: &mut u64,
+    poll_stage: &str,
+) where
+    D: TunIo,
+    M: MetricsSink,
+{
     metrics.enter_poll();
-    let timestamp = smoltcp::time::Instant::now();
-    iface.poll(timestamp, device, sockets);
+    iface.poll(smoltcp::time::Instant::now(), device, sockets);
     *tcp_loop_flush_tx_calls = tcp_loop_flush_tx_calls.saturating_add(1);
     let (flush_result, _) =
         flush_tx_and_release_downlink_permits(device, sockets, socket_ctxs, poll_stage).await;
@@ -9219,8 +9285,6 @@ where
         );
     }
     metrics.leave_poll();
-
-    TunRxPacketKind::Tcp
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9254,7 +9318,7 @@ where
     U: ProxyUpstream + DatagramUpstream + 'static,
     M: MetricsSink,
 {
-    let packet_kind = ingest_ready_tun_rx_packet(
+    let packet_kind = prepare_ready_tun_rx_packet(
         device,
         assoc_table,
         fake_pool,
@@ -9264,17 +9328,24 @@ where
         registry,
         sockets,
         socket_ctxs,
-        iface,
         dirty,
+    )
+    .await;
+    if packet_kind != TunRxPacketKind::Tcp {
+        return packet_kind;
+    }
+
+    poll_staged_tun_rx(
+        device,
+        sockets,
+        socket_ctxs,
+        iface,
         metrics,
         tcp_loop_flush_tx_calls,
         tcp_loop_flush_tx_failures,
         poll_stage,
     )
     .await;
-    if packet_kind != TunRxPacketKind::Tcp {
-        return packet_kind;
-    }
 
     let close_egress_guard = downlink_egress_drop_debt.has_active_drop_debt();
     let relay_read_recovery_active = downlink_egress_drop_debt.has_active_drop_debt();
@@ -9352,7 +9423,7 @@ where
         while drained < drain_limit {
             match device.try_recv_rx() {
                 Ok(true) => {
-                    let kind = ingest_ready_tun_rx_packet(
+                    let kind = prepare_ready_tun_rx_packet(
                         device,
                         assoc_table,
                         fake_pool,
@@ -9362,12 +9433,7 @@ where
                         registry,
                         sockets,
                         socket_ctxs,
-                        iface,
                         dirty,
-                        metrics,
-                        tcp_loop_flush_tx_calls,
-                        tcp_loop_flush_tx_failures,
-                        "tun_rx_drain",
                     )
                     .await;
                     if kind == TunRxPacketKind::Tcp {
@@ -9416,6 +9482,20 @@ where
                 break;
             }
         }
+    }
+    if tcp_packets_in_batch > 0 {
+        poll_staged_tun_rx(
+            device,
+            sockets,
+            socket_ctxs,
+            iface,
+            metrics,
+            tcp_loop_flush_tx_calls,
+            tcp_loop_flush_tx_failures,
+            "tun_rx_drain",
+        )
+        .await;
+        diag.note_tcp_batch_poll_flush(tcp_packets_in_batch);
     }
     let guard_after = diag.backlog_guard();
     match tun_rx_backlog_action(guard_before, guard_after) {
@@ -9466,6 +9546,7 @@ where
         .await;
         diag.note_tcp_batch_dirty_relay_pass(tcp_packets_in_batch);
     }
+    diag.pump = device.tun_ingress_pump_snapshot();
     metrics.note_tun_rx_backlog_guard(
         guard_after.is_active(),
         diag.budget_exhausted,
@@ -9476,8 +9557,16 @@ where
         diag.tcp_packets,
         diag.tcp_batches,
         diag.batch_dirty_relay_passes,
+        diag.batch_iface_polls,
+        diag.batch_flushes,
         diag.tcp_batch_packets_high_water,
         diag.avoided_dirty_relay_passes(),
+        diag.avoided_iface_polls(),
+        diag.pump.packets,
+        diag.pump.queue_high_water,
+        diag.pump.capacity_packets,
+        diag.pump.full_waits,
+        diag.pump.read_errors,
     );
     drained
 }
@@ -23930,6 +24019,7 @@ mod tests {
         diag.note_packet(TunRxPacketKind::Tcp);
         diag.note_packet(TunRxPacketKind::Dns);
         diag.note_packet(TunRxPacketKind::Udp);
+        diag.note_tcp_batch_poll_flush(1);
         diag.note_tcp_batch_dirty_relay_pass(1);
         diag.note_budget_exhausted();
         diag.note_would_block();
@@ -23966,6 +24056,8 @@ mod tests {
         assert!(line.contains("udp=1"), "{line}");
         assert!(line.contains("tcp_batches=1"), "{line}");
         assert!(line.contains("batch_dirty_relay_passes=1"), "{line}");
+        assert!(line.contains("batch_iface_polls=1"), "{line}");
+        assert!(line.contains("batch_flushes=1"), "{line}");
         assert!(line.contains("tcp_batch_packets_high_water=1"), "{line}");
         assert!(line.contains("avoided_dirty_relay_passes=0"), "{line}");
         assert!(line.contains("budget_exhausted=1"), "{line}");
@@ -27815,6 +27907,9 @@ mod tests {
         fn rx_take(&mut self) -> Option<bytes::BytesMut> {
             None
         }
+        fn stage_rx_for_iface(&mut self) -> bool {
+            false
+        }
         async fn flush_tx(&mut self) -> std::io::Result<()> {
             Ok(())
         }
@@ -27835,6 +27930,80 @@ mod tests {
     #[async_trait::async_trait]
     impl DatagramUpstream for NoopTestUpstream {
         async fn send_udp(&self, _datagram: Vec<u8>) {}
+    }
+
+    struct BrokenTunDevice;
+
+    impl smoltcp::phy::Device for BrokenTunDevice {
+        type RxToken<'a> = DeadToken;
+        type TxToken<'a> = DeadToken;
+
+        fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
+            let mut capabilities = smoltcp::phy::DeviceCapabilities::default();
+            capabilities.medium = smoltcp::phy::Medium::Ip;
+            capabilities.max_transmission_unit = 1200;
+            capabilities
+        }
+
+        fn receive(
+            &mut self,
+            _timestamp: smoltcp::time::Instant,
+        ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+            None
+        }
+
+        fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+            None
+        }
+    }
+
+    impl TunIo for BrokenTunDevice {
+        async fn wait_for_rx(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "synthetic terminal TUN failure",
+            ))
+        }
+
+        fn try_recv_rx(&mut self) -> std::io::Result<bool> {
+            Ok(false)
+        }
+
+        fn rx_peek(&self) -> Option<&[u8]> {
+            None
+        }
+
+        fn rx_take(&mut self) -> Option<bytes::BytesMut> {
+            None
+        }
+
+        fn stage_rx_for_iface(&mut self) -> bool {
+            false
+        }
+
+        async fn flush_tx(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn inject_ip_packet(&mut self, _packet: &[u8]) {}
+    }
+
+    #[tokio::test]
+    async fn event_loop_stops_after_terminal_tun_failure() {
+        let (_downlink_tx, downlink_rx) = tokio::sync::mpsc::channel(1);
+        let config = TunRuntimeConfig::from_sources(Some("2")).expect("valid test profile");
+        let run = run_event_loop(
+            BrokenTunDevice,
+            Arc::new(NoopTestUpstream),
+            downlink_rx,
+            config,
+            Arc::new(Metrics::new()),
+            NoopSink,
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), run)
+            .await
+            .expect("terminal TUN failure must stop the event loop instead of busy-waking");
     }
 
     struct BatchTestRxToken {
@@ -27863,6 +28032,7 @@ mod tests {
     struct BatchTestTunDevice {
         ready: std::collections::VecDeque<bytes::BytesMut>,
         current: Option<bytes::BytesMut>,
+        iface_ready: std::collections::VecDeque<bytes::BytesMut>,
         tx: std::collections::VecDeque<bytes::BytesMut>,
     }
 
@@ -27874,6 +28044,7 @@ mod tests {
                     .map(|packet| bytes::Bytes::from(packet).into())
                     .collect(),
                 current: None,
+                iface_ready: std::collections::VecDeque::new(),
                 tx: std::collections::VecDeque::new(),
             }
         }
@@ -27894,7 +28065,7 @@ mod tests {
             &mut self,
             _timestamp: smoltcp::time::Instant,
         ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-            self.current.take().map(|packet| {
+            self.iface_ready.pop_front().map(|packet| {
                 (
                     BatchTestRxToken { packet },
                     BatchTestTxToken {
@@ -27934,6 +28105,14 @@ mod tests {
             self.current.take()
         }
 
+        fn stage_rx_for_iface(&mut self) -> bool {
+            let Some(packet) = self.current.take() else {
+                return false;
+            };
+            self.iface_ready.push_back(packet);
+            true
+        }
+
         async fn flush_tx(&mut self) -> std::io::Result<()> {
             self.tx.clear();
             Ok(())
@@ -27947,9 +28126,12 @@ mod tests {
     struct BatchDrainTestReport {
         drained: usize,
         diag: TunRxDrainDiag,
+        poll_enters: usize,
+        flush_calls: u64,
         relay_enters: usize,
         remaining_ready: usize,
         current_ready: bool,
+        iface_ready: usize,
     }
 
     async fn run_batch_drain_test(packets: Vec<Vec<u8>>) -> BatchDrainTestReport {
@@ -28012,9 +28194,12 @@ mod tests {
         BatchDrainTestReport {
             drained,
             diag,
+            poll_enters: sink.poll_enters,
+            flush_calls: tcp_loop_flush_tx_calls,
             relay_enters: sink.relay_enters,
             remaining_ready: device.ready.len(),
             current_ready: device.current.is_some(),
+            iface_ready: device.iface_ready.len(),
         }
     }
 
@@ -28037,13 +28222,25 @@ mod tests {
         assert_eq!(report.diag.tcp_packets, PACKETS as u64);
         assert_eq!(report.diag.tcp_batches, 1);
         assert_eq!(report.diag.batch_dirty_relay_passes, 1);
+        assert_eq!(report.diag.batch_iface_polls, 1);
+        assert_eq!(report.diag.batch_flushes, 1);
         assert_eq!(report.diag.tcp_batch_packets_high_water, PACKETS as u64);
         assert_eq!(
             report.diag.avoided_dirty_relay_passes(),
             (PACKETS - 1) as u64
         );
+        assert_eq!(report.diag.avoided_iface_polls(), (PACKETS - 1) as u64);
         assert_eq!(report.remaining_ready, 0);
         assert!(!report.current_ready);
+        assert_eq!(report.iface_ready, 0);
+        assert_eq!(
+            report.poll_enters, 1,
+            "one bounded TCP batch must enter smoltcp poll once"
+        );
+        assert_eq!(
+            report.flush_calls, 1,
+            "one bounded TCP batch must flush TUN once"
+        );
         assert_eq!(
             report.relay_enters, 1,
             "one bounded TUN batch must not amplify dirty relay service per packet"
@@ -28069,10 +28266,13 @@ mod tests {
         assert_eq!(report.diag.udp_packets, PACKETS as u64);
         assert_eq!(report.diag.tcp_batches, 0);
         assert_eq!(report.diag.batch_dirty_relay_passes, 0);
+        assert_eq!(report.diag.batch_iface_polls, 0);
+        assert_eq!(report.diag.batch_flushes, 0);
         assert_eq!(report.diag.avoided_dirty_relay_passes(), 0);
         assert_eq!(report.relay_enters, 0);
         assert_eq!(report.remaining_ready, 0);
         assert!(!report.current_ready);
+        assert_eq!(report.iface_ready, 0);
     }
 
     #[tokio::test]
@@ -28098,11 +28298,15 @@ mod tests {
         assert_eq!(report.diag.udp_packets, 2);
         assert_eq!(report.diag.tcp_batches, 1);
         assert_eq!(report.diag.batch_dirty_relay_passes, 1);
+        assert_eq!(report.diag.batch_iface_polls, 1);
+        assert_eq!(report.diag.batch_flushes, 1);
         assert_eq!(report.diag.tcp_batch_packets_high_water, 2);
         assert_eq!(report.diag.avoided_dirty_relay_passes(), 1);
+        assert_eq!(report.diag.avoided_iface_polls(), 1);
         assert_eq!(report.relay_enters, 1);
         assert_eq!(report.remaining_ready, 0);
         assert!(!report.current_ready);
+        assert_eq!(report.iface_ready, 0);
     }
 
     #[tokio::test]

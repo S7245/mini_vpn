@@ -12,31 +12,40 @@ QUIC loss at `11,922,924B`, with exact endpoint conservation and no socket
 leak, but failed the zero-drop gate with `10` TUN TX drops. Do not tune pacing
 or frozen profile constants.
 
-The follow-up H10d16 TUN RX batch relay service is implemented, reviewed, and
-locally **PASS**. It preserves per-packet DNS/UDP/TCP/SYN processing and
-smoltcp poll/flush, but services dirty TCP relays once per bounded ready batch.
-The default non-H10 path remains unchanged. A prefetched single RX slot is now
-preserved across `wait_for_rx`, closing the exactly-once boundary.
+The H10d16 TUN RX batch relay service is committed at
+`d934f124a54caf1a60963c7ff84bf619a73b2262`. Its frozen VPS P1 retained
+`194 Mbit/s` receiver, passed QUIC loss at `11,717,996B`, and proved the
+mechanism exact (`847,092` TCP packets, `3,712/3,712` batches/relay passes,
+`843,380` avoided traversals), but failed zero-drop safety at `0/38`. Do not
+tune batching, drain bounds, or the kernel queue; the batch-only branch is
+closed.
 
-The exact real-Quinn forward `32 MiB` / `64 KiB` gate reached
-`319.455 Mbit/s`: exact bytes, zero pattern errors, clean EOF, zero modeled
-drops, ring high water `29/500`, `28,934` TCP packets, `4,093` batches and
-batch passes, and `24,841` avoided per-packet relay passes. Final D16 ownership
-and terminal tails were zero.
+The authorized H10d16 TUN ingress service is locally complete. The focused
+eight-packet tracer moved from `8` poll/flush calls to `1/1`, while retaining
+one dirty-relay pass and the frozen 48/240 bounds. H10 now has a continuous
+bounded reader pump, separate raw/classified ownership, and one smoltcp
+poll/flush/relay service per TCP batch; the default non-H10 adapter remains
+direct.
+
+The final exact real-Quinn forward `32 MiB` / `64 KiB` gate reached
+`293.488 Mbit/s`: exact bytes, zero pattern errors, clean EOF, zero modeled
+drops, ring high `38/500`, pump high `56/500`, zero full waits/read errors,
+`28,933` TCP packets, `11,817` batches/polls/flushes, and `17,116` avoided
+per-packet calls. Final D16 ownership and terminal tails were zero.
 
 Full evidence is green: quinn-proto `309+3 docs`; Quinn `29+1 doc`; root
-`625` and harness `636` nonignored; all-target check; explicit
-`64/256/1024`; four zero-loss UDP sweep sizes; fmt, runner self-test, and diff
-checks. No unresolved P0/P1 remains.
+`629` and harness `640` nonignored; integration `10/10`; all-target check;
+explicit `64/256/1024`; four zero-loss UDP sweep sizes; fmt, runner self-test,
+and diff checks. Review fixed terminal TUN errors to stop the event loop
+instead of busy-waking; no unresolved P0/P1 remains.
 
-Next: commit the batch stage and run one frozen, target-only EndpointWindowV1
-VPS P1. Require receiver `>170 Mbit/s`, zero TUN RX/TX drops, QUIC loss
-`<=16 MiB`, `tcp_batches == batch_dirty_relay_passes`, nonzero avoided passes,
-endpoint conservation, and clean pool/lifecycle. If any TUN drop remains,
-classify batch architecture failure and do not tune batching/drain constants.
-The user authorized commit, VPS, and safe in-scope repairs without repeated
-confirmation. macOS TUN remains prohibited. See
-`docs/tech/2026-07-13-knife14h10d16-tun-rx-batch-service-local-gate-results.md`.
+Next: commit the reviewed candidate, deploy the exact commit, run profile
+rehearsal, then one frozen target-only forward-only VPS P1. The user authorized
+commit, VPS, and safe in-scope repairs without repeated confirmation. Receiver
+`<=170 Mbit/s`, any TUN drop, FIFO high-water `500`, or any full wait is
+architecture failure without tuning. macOS TUN remains prohibited. See
+`docs/tech/2026-07-13-knife14h10d16-tun-rx-batch-service-vps-results.md` and
+`docs/tech/2026-07-13-knife14h10d16-tun-ingress-service-{architecture-spec,implementation-plan,local-gate-results}.md`.
 
 The older text below is chronological stage history and no longer describes
 the active authorization boundary.

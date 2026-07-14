@@ -1,7 +1,7 @@
 # Knife14h10d16 TUN RX Batch Relay Service Implementation Plan
 
 Date: 2026-07-13
-Status: **LOCAL IMPLEMENTATION AND REVIEW PASS; VPS acceptance pending**
+Status: **IMPLEMENTED; VPS SAFETY FAIL; BRANCH CLOSED**
 
 Source of truth:
 `docs/tech/2026-07-13-knife14h10d16-tun-rx-batch-service-architecture-spec.md`.
@@ -95,14 +95,18 @@ behavior.
 
 ## Task 10: Commit And VPS Acceptance
 
-- [ ] Commit one coherent reviewed batch-service change; do not stage secrets
+- [x] Commit one coherent reviewed batch-service change; do not stage secrets
   or temporary VPS artifacts.
-- [ ] Deploy an isolated source snapshot and verify hashes.
-- [ ] Run one target-only, forward-only P1 with the entire Gate profile frozen
+- [x] Deploy an isolated source snapshot and verify hashes.
+- [x] Run one target-only, forward-only P1 with the entire Gate profile frozen
   and EndpointWindowV1 enabled.
-- [ ] Require receiver `>170 Mbit/s`, zero TUN RX/TX drops, QUIC loss no greater
+- [x] Require receiver `>170 Mbit/s`, zero TUN RX/TX drops, QUIC loss no greater
   than `16 MiB`, exact batch counters, endpoint conservation, clean pool and
-  lifecycle, and healthy client/Exit sockets.
-- [ ] If any TUN drop remains, classify architecture failure and stop this
+  lifecycle, and healthy client/Exit sockets. Throughput, QUIC loss, batch,
+  conservation, and lifecycle passed; zero-drop safety failed at `0/38`.
+- [x] Classify the remaining TUN drops as architecture failure and close this
   branch without tuning.
-- [ ] No macOS TUN.
+- [x] No macOS TUN.
+
+Result:
+`docs/tech/2026-07-13-knife14h10d16-tun-rx-batch-service-vps-results.md`.

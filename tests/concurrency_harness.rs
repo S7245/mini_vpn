@@ -311,8 +311,10 @@ async fn elastic_pool_drains_hot_port() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn loop_profiler_detects_on_loop_cpu_saturation() {
     let base_params = ScenarioParams {
-        connections: 32,
-        distinct_ports: 8,
+        // 这条测试只验证 profiler 信号；单 flow 避免把 multi-thread listener/close-tail
+        // 调度混入合成 CPU 自检。并发与共享端口压力由专门的 sweep 覆盖。
+        connections: 1,
+        distinct_ports: 1,
         payload_len: 2048,
         pool_size: 8,
         timeout: Duration::from_secs(10),
@@ -329,6 +331,8 @@ async fn loop_profiler_detects_on_loop_cpu_saturation() {
 
     let base = baseline.loop_profile();
     let load = loaded.loop_profile();
+    baseline.print_row();
+    loaded.print_row();
     eprintln!(
         "T4 baseline: loop-active={:.3} poll={:.3} iters={} | loaded: loop-active={:.3} poll={:.3} iters={}",
         base.loop_active_fraction(),
@@ -350,6 +354,8 @@ async fn loop_profiler_detects_on_loop_cpu_saturation() {
     );
     // 主循环确有迭代（仪器在真 run_event_loop 里被调用过）。
     assert!(base.iters > 0 && load.iters > 0, "两轮都应有 select! 迭代");
+    assert_eq!(baseline.completed, 1, "baseline 必须先完成全部 TCP echo");
+    assert_eq!(loaded.completed, 1, "loaded 必须先完成全部 TCP echo");
 
     // 新的本地 egress service lane 会让无 burn 基线也更 active；当基线已经接近饱和时，
     // 不能再要求 loop-active 继续显著上升。burn 落在 poll 段（flush_tx），poll fraction

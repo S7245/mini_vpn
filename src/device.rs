@@ -3,7 +3,11 @@ use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read};
 use std::net::Ipv4Addr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt}; // ⚠️ 极其重要：引入异步读写魔法
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf}; // ⚠️ 极其重要：引入异步读写魔法
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tun::Device as TunDevice;
 
 // 条件编译宏。这意味着如果在 Linux 系统上编译这段代码，编译器会自动忽略 PI 头逻辑，直接按标准处理。
@@ -12,16 +16,137 @@ const UTUN_IPV4_HEADER: [u8; 4] = [0, 0, 0, 2];
 
 /// 虚拟 TUN 设备包装器：连接异步物理网卡与同步 smoltcp 协议栈的桥梁
 pub struct VirtualTunDevice {
-    pub device: tun::AsyncDevice,
+    backend: VirtualTunBackend,
     /// OS interface name when the platform exposes it (diagnostics only).
     interface_name: Option<String>,
     /// 刀14c：真实 TUN IP MTU。必须和 OS TUN MTU / smoltcp capability 保持一致。
     mtu: usize,
     /// 收货仓库：存放刚从网卡读出来、还没被 smoltcp 吃掉的一个完整 IP 包
     pub rx_buffer: Option<BytesMut>,
+    /// 已完成旁路分类/SYN 检查、等待 smoltcp 在一次 poll 中按序消费的 TCP 包。
+    iface_rx_queue: VecDeque<BytesMut>,
     /// 发货仓库：存放 smoltcp 已经打包好、排队等待发给物理网卡的 IP 包队列
     pub tx_queue: VecDeque<BytesMut>,
     flushed_tcp_packets: Vec<TunFlushedTcpPacket>,
+}
+
+enum VirtualTunBackend {
+    Direct(tun::AsyncDevice),
+    Pumped {
+        writer: WriteHalf<tun::AsyncDevice>,
+        receiver: mpsc::Receiver<std::io::Result<BytesMut>>,
+        task: JoinHandle<()>,
+        stats: Arc<TunIngressPumpStats>,
+        capacity_packets: usize,
+    },
+}
+
+#[derive(Debug, Default)]
+struct TunIngressPumpStats {
+    packets: AtomicU64,
+    bytes: AtomicU64,
+    queue_high_water: AtomicU64,
+    full_waits: AtomicU64,
+    read_errors: AtomicU64,
+    closed: AtomicU64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TunIngressPumpSnapshot {
+    pub enabled: bool,
+    pub packets: u64,
+    pub bytes: u64,
+    pub queue_high_water: u64,
+    pub capacity_packets: usize,
+    pub full_waits: u64,
+    pub read_errors: u64,
+    pub closed: u64,
+}
+
+impl TunIngressPumpStats {
+    fn snapshot(&self, capacity_packets: usize) -> TunIngressPumpSnapshot {
+        TunIngressPumpSnapshot {
+            enabled: true,
+            packets: self.packets.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+            queue_high_water: self.queue_high_water.load(Ordering::Relaxed),
+            capacity_packets,
+            full_waits: self.full_waits.load(Ordering::Relaxed),
+            read_errors: self.read_errors.load(Ordering::Relaxed),
+            closed: self.closed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn spawn_tun_ingress_pump<R>(
+    reader: R,
+    mtu: usize,
+    capacity_packets: usize,
+) -> (
+    mpsc::Receiver<std::io::Result<BytesMut>>,
+    JoinHandle<()>,
+    Arc<TunIngressPumpStats>,
+)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let capacity_packets = capacity_packets.max(1);
+    let (sender, receiver) = mpsc::channel(capacity_packets);
+    let stats = Arc::new(TunIngressPumpStats::default());
+    let task_stats = Arc::clone(&stats);
+    let task = tokio::spawn(run_tun_ingress_pump(
+        reader,
+        sender,
+        task_stats,
+        mtu,
+        capacity_packets,
+    ));
+    (receiver, task, stats)
+}
+
+async fn run_tun_ingress_pump<R>(
+    mut reader: R,
+    sender: mpsc::Sender<std::io::Result<BytesMut>>,
+    stats: Arc<TunIngressPumpStats>,
+    mtu: usize,
+    capacity_packets: usize,
+) where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        let mut packet = BytesMut::zeroed(rx_buffer_capacity_for_mtu(mtu));
+        let bytes = match reader.read(&mut packet).await {
+            Ok(0) => break,
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => {
+                stats.read_errors.fetch_add(1, Ordering::Relaxed);
+                let _ = sender.send(Err(error)).await;
+                break;
+            }
+        };
+        packet.truncate(bytes);
+        let occupied = capacity_packets.saturating_sub(sender.capacity());
+        stats.queue_high_water.fetch_max(
+            occupied.saturating_add(1).min(capacity_packets) as u64,
+            Ordering::Relaxed,
+        );
+        let permit = match sender.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                stats.full_waits.fetch_add(1, Ordering::Relaxed);
+                match sender.reserve().await {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => break,
+        };
+        permit.send(Ok(packet));
+        stats.packets.fetch_add(1, Ordering::Relaxed);
+        stats.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+    stats.closed.fetch_add(1, Ordering::Relaxed);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -39,10 +164,33 @@ impl VirtualTunDevice {
     pub fn new(device: tun::AsyncDevice, mtu: usize) -> Self {
         let interface_name = TunDevice::name(device.get_ref()).ok();
         Self {
-            device,
+            backend: VirtualTunBackend::Direct(device),
             interface_name,
             mtu,
             rx_buffer: None,
+            iface_rx_queue: VecDeque::new(),
+            tx_queue: VecDeque::new(),
+            flushed_tcp_packets: Vec::new(),
+        }
+    }
+
+    pub fn new_pumped(device: tun::AsyncDevice, mtu: usize, capacity_packets: usize) -> Self {
+        let interface_name = TunDevice::name(device.get_ref()).ok();
+        let (reader, writer): (ReadHalf<_>, WriteHalf<_>) = tokio::io::split(device);
+        let capacity_packets = capacity_packets.max(1);
+        let (receiver, task, stats) = spawn_tun_ingress_pump(reader, mtu, capacity_packets);
+        Self {
+            backend: VirtualTunBackend::Pumped {
+                writer,
+                receiver,
+                task,
+                stats,
+                capacity_packets,
+            },
+            interface_name,
+            mtu,
+            rx_buffer: None,
+            iface_rx_queue: VecDeque::new(),
             tx_queue: VecDeque::new(),
             flushed_tcp_packets: Vec::new(),
         }
@@ -55,11 +203,26 @@ impl VirtualTunDevice {
         if self.rx_buffer.is_some() {
             return Ok(());
         }
-        let mut buf = BytesMut::zeroed(rx_buffer_capacity_for_mtu(self.mtu));
-
-        // 2. 异步等待网卡吐出数据，并拿到读取的字节数 (n)
-        let n = self.device.read(&mut buf).await?;
-        self.store_rx_packet(buf, n)
+        let mut buf = match &mut self.backend {
+            VirtualTunBackend::Direct(device) => {
+                let mut buf = BytesMut::zeroed(rx_buffer_capacity_for_mtu(self.mtu));
+                let n = device.read(&mut buf).await?;
+                buf.truncate(n);
+                buf
+            }
+            VirtualTunBackend::Pumped { receiver, .. } => match receiver.recv().await {
+                Some(Ok(packet)) => packet,
+                Some(Err(error)) => return Err(error),
+                None => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "TUN ingress pump closed",
+                    ));
+                }
+            },
+        };
+        let n = buf.len();
+        self.store_rx_packet(std::mem::take(&mut buf), n)
     }
 
     fn store_rx_packet(&mut self, mut buf: BytesMut, n: usize) -> std::io::Result<()> {
@@ -93,21 +256,37 @@ impl VirtualTunDevice {
             return Ok(true);
         }
 
-        let mut buf = BytesMut::zeroed(rx_buffer_capacity_for_mtu(self.mtu));
-        loop {
-            match self.device.get_mut().read(&mut buf) {
-                Ok(n) => {
-                    if n == 0 {
-                        return Ok(false);
+        let packet = match &mut self.backend {
+            VirtualTunBackend::Direct(device) => {
+                let mut buf = BytesMut::zeroed(rx_buffer_capacity_for_mtu(self.mtu));
+                loop {
+                    match device.get_mut().read(&mut buf) {
+                        Ok(0) => return Ok(false),
+                        Ok(n) => {
+                            buf.truncate(n);
+                            break buf;
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(false),
+                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e),
                     }
-                    self.store_rx_packet(buf, n)?;
-                    return Ok(true);
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(false),
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
             }
-        }
+            VirtualTunBackend::Pumped { receiver, .. } => match receiver.try_recv() {
+                Ok(Ok(packet)) => packet,
+                Ok(Err(error)) => return Err(error),
+                Err(mpsc::error::TryRecvError::Empty) => return Ok(false),
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "TUN ingress pump closed",
+                    ));
+                }
+            },
+        };
+        let n = packet.len();
+        self.store_rx_packet(packet, n)?;
+        Ok(true)
     }
 
     pub async fn flush_tx(&mut self) -> std::io::Result<()> {
@@ -120,7 +299,10 @@ impl VirtualTunDevice {
         while let Some(packet) = self.tx_queue.pop_front() {
             let flushed_tcp_packet = summarize_flushed_tcp_packet(&packet);
             // 无论是 macOS 还是 Linux，发货仓库里的包已经是完美形态了，直接发！
-            self.device.write_all(&packet).await?;
+            match &mut self.backend {
+                VirtualTunBackend::Direct(device) => device.write_all(&packet).await?,
+                VirtualTunBackend::Pumped { writer, .. } => writer.write_all(&packet).await?,
+            }
             if let Some(packet) = flushed_tcp_packet {
                 self.flushed_tcp_packets.push(packet);
             }
@@ -144,8 +326,35 @@ impl VirtualTunDevice {
         self.rx_buffer.take()
     }
 
+    pub fn stage_rx_for_iface(&mut self) -> bool {
+        let Some(packet) = self.rx_buffer.take() else {
+            return false;
+        };
+        self.iface_rx_queue.push_back(packet);
+        true
+    }
+
     pub fn take_flushed_tcp_packets(&mut self) -> Vec<TunFlushedTcpPacket> {
         std::mem::take(&mut self.flushed_tcp_packets)
+    }
+
+    pub fn tun_ingress_pump_snapshot(&self) -> TunIngressPumpSnapshot {
+        match &self.backend {
+            VirtualTunBackend::Direct(_) => TunIngressPumpSnapshot::default(),
+            VirtualTunBackend::Pumped {
+                stats,
+                capacity_packets,
+                ..
+            } => stats.snapshot(*capacity_packets),
+        }
+    }
+}
+
+impl Drop for VirtualTunDevice {
+    fn drop(&mut self) {
+        if let VirtualTunBackend::Pumped { task, .. } = &self.backend {
+            task.abort();
+        }
     }
 }
 
@@ -165,6 +374,8 @@ pub trait TunIo: Device {
     fn rx_peek(&self) -> Option<&[u8]>;
     /// 取走当前 rx 槽。
     fn rx_take(&mut self) -> Option<BytesMut>;
+    /// 将已分类的 TCP rx 包从原始单槽移交给 smoltcp FIFO。
+    fn stage_rx_for_iface(&mut self) -> bool;
     /// 异步发货：把发货队列里排队的包全部写出。
     async fn flush_tx(&mut self) -> std::io::Result<()>;
     /// 当前等待写入 OS TUN 的 IP 包字节数。默认 0，真实/回环设备可覆盖用于诊断本地 egress 进展。
@@ -174,6 +385,9 @@ pub trait TunIo: Device {
     /// TCP payload packets successfully written by the latest `flush_tx` calls and not yet consumed.
     fn take_flushed_tcp_packets(&mut self) -> Vec<TunFlushedTcpPacket> {
         Vec::new()
+    }
+    fn tun_ingress_pump_snapshot(&self) -> TunIngressPumpSnapshot {
+        TunIngressPumpSnapshot::default()
     }
     /// 下行注入：裸 IP 包入发货队列，等 `flush_tx` 发出。
     fn inject_ip_packet(&mut self, pkt: &[u8]);
@@ -197,6 +411,9 @@ impl TunIo for VirtualTunDevice {
     fn rx_take(&mut self) -> Option<BytesMut> {
         VirtualTunDevice::rx_take(self)
     }
+    fn stage_rx_for_iface(&mut self) -> bool {
+        VirtualTunDevice::stage_rx_for_iface(self)
+    }
     async fn flush_tx(&mut self) -> std::io::Result<()> {
         VirtualTunDevice::flush_tx(self).await
     }
@@ -205,6 +422,9 @@ impl TunIo for VirtualTunDevice {
     }
     fn take_flushed_tcp_packets(&mut self) -> Vec<TunFlushedTcpPacket> {
         VirtualTunDevice::take_flushed_tcp_packets(self)
+    }
+    fn tun_ingress_pump_snapshot(&self) -> TunIngressPumpSnapshot {
+        VirtualTunDevice::tun_ingress_pump_snapshot(self)
     }
     fn inject_ip_packet(&mut self, pkt: &[u8]) {
         VirtualTunDevice::inject_ip_packet(self, pkt)
@@ -349,7 +569,7 @@ impl Device for VirtualTunDevice {
         // 如果仓库里有货，就 take() 拿走，打包成收货单和发货单交给 smoltcp
         // 如果仓库里没有货，就返回 None
         // println!("接收包：{:?}", self.rx_buffer);
-        self.rx_buffer.take().map(|buffer| {
+        self.iface_rx_queue.pop_front().map(|buffer| {
             (
                 TunRxToken { buffer },
                 TunTxToken {
@@ -411,6 +631,10 @@ fn device_capabilities_for_mtu(mtu: usize) -> DeviceCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+    use tokio::io::{AsyncWriteExt, ReadBuf};
 
     fn frame_tx_test_packet(packet: Vec<u8>) -> Vec<u8> {
         #[cfg(target_os = "macos")]
@@ -487,5 +711,102 @@ mod tests {
         let packet = frame_tx_test_packet(packet);
 
         assert!(summarize_flushed_tcp_packet(&packet).is_none());
+    }
+
+    #[tokio::test]
+    async fn tun_ingress_pump_preserves_fifo_and_accounts_full_wait() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (mut receiver, task, stats) = spawn_tun_ingress_pump(reader, 1200, 1);
+        let first = vec![0x11; 16];
+        let second = vec![0x22; 16];
+
+        writer.write_all(&first).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while stats.packets.load(Ordering::Relaxed) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first packet should enter the bounded FIFO");
+
+        writer.write_all(&second).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while stats.full_waits.load(Ordering::Relaxed) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second packet should wait behind the full one-packet FIFO");
+
+        assert_eq!(receiver.recv().await.unwrap().unwrap().as_ref(), first);
+        assert_eq!(receiver.recv().await.unwrap().unwrap().as_ref(), second);
+        drop(writer);
+        task.await.unwrap();
+
+        assert_eq!(
+            stats.snapshot(1),
+            TunIngressPumpSnapshot {
+                enabled: true,
+                packets: 2,
+                bytes: 32,
+                queue_high_water: 1,
+                capacity_packets: 1,
+                full_waits: 1,
+                read_errors: 0,
+                closed: 1,
+            }
+        );
+    }
+
+    struct FailingPacketReader;
+
+    impl AsyncRead for FailingPacketReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "synthetic TUN read failure",
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn tun_ingress_pump_surfaces_read_error_once_then_closes() {
+        let (mut receiver, task, stats) = spawn_tun_ingress_pump(FailingPacketReader, 1200, 4);
+
+        let error = receiver
+            .recv()
+            .await
+            .expect("one terminal error event")
+            .expect_err("event should retain the read error");
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        task.await.unwrap();
+        assert!(receiver.recv().await.is_none());
+
+        let snapshot = stats.snapshot(4);
+        assert_eq!(snapshot.read_errors, 1);
+        assert_eq!(snapshot.closed, 1);
+        assert_eq!(snapshot.packets, 0);
+    }
+
+    #[tokio::test]
+    async fn tun_ingress_pump_stops_when_consumer_closes() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (receiver, task, stats) = spawn_tun_ingress_pump(reader, 1200, 4);
+        drop(receiver);
+
+        writer.write_all(&[0x33; 16]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("pump should stop after its bounded FIFO consumer closes")
+            .expect("pump task should not panic");
+
+        let snapshot = stats.snapshot(4);
+        assert_eq!(snapshot.closed, 1);
+        assert_eq!(snapshot.packets, 0);
+        assert_eq!(snapshot.read_errors, 0);
     }
 }

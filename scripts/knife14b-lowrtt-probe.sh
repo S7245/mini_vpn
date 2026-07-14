@@ -1309,6 +1309,16 @@ summarize_metrics_window() {
           if (value > max_tun_rx_drain_batch_dirty_relay_passes) {
             max_tun_rx_drain_batch_dirty_relay_passes = value
           }
+        } else if ($i ~ /^batch_iface_polls=/) {
+          value = numeric_token($i, "batch_iface_polls")
+          if (value > max_tun_rx_drain_batch_iface_polls) {
+            max_tun_rx_drain_batch_iface_polls = value
+          }
+        } else if ($i ~ /^batch_flushes=/) {
+          value = numeric_token($i, "batch_flushes")
+          if (value > max_tun_rx_drain_batch_flushes) {
+            max_tun_rx_drain_batch_flushes = value
+          }
         } else if ($i ~ /^tcp_batch_packets_high_water=/) {
           value = numeric_token($i, "tcp_batch_packets_high_water")
           if (value > max_tun_rx_drain_tcp_batch_packets_high_water) {
@@ -1318,6 +1328,36 @@ summarize_metrics_window() {
           value = numeric_token($i, "avoided_dirty_relay_passes")
           if (value > max_tun_rx_drain_avoided_dirty_relay_passes) {
             max_tun_rx_drain_avoided_dirty_relay_passes = value
+          }
+        } else if ($i ~ /^avoided_iface_polls=/) {
+          value = numeric_token($i, "avoided_iface_polls")
+          if (value > max_tun_rx_drain_avoided_iface_polls) {
+            max_tun_rx_drain_avoided_iface_polls = value
+          }
+        } else if ($i ~ /^pump_packets=/) {
+          value = numeric_token($i, "pump_packets")
+          if (value > max_tun_rx_pump_packets) {
+            max_tun_rx_pump_packets = value
+          }
+        } else if ($i ~ /^pump_queue_high_water=/) {
+          value = numeric_token($i, "pump_queue_high_water")
+          if (value > max_tun_rx_pump_queue_high_water) {
+            max_tun_rx_pump_queue_high_water = value
+          }
+        } else if ($i ~ /^pump_capacity=/) {
+          value = numeric_token($i, "pump_capacity")
+          if (value > max_tun_rx_pump_capacity) {
+            max_tun_rx_pump_capacity = value
+          }
+        } else if ($i ~ /^pump_full_waits=/) {
+          value = numeric_token($i, "pump_full_waits")
+          if (value > max_tun_rx_pump_full_waits) {
+            max_tun_rx_pump_full_waits = value
+          }
+        } else if ($i ~ /^pump_read_errors=/) {
+          value = numeric_token($i, "pump_read_errors")
+          if (value > max_tun_rx_pump_read_errors) {
+            max_tun_rx_pump_read_errors = value
           }
         } else if ($i ~ /^budget_exhausted=/) {
           value = numeric_token($i, "budget_exhausted")
@@ -2455,7 +2495,7 @@ summarize_metrics_window() {
       printf "- tun_drops: if=%s tun_rx_dropped_delta=%s tun_tx_dropped_delta=%s\n", tun_if, tun_rx_delta, tun_tx_delta
       printf "- runtime_tun_egress: samples=%d drop_events=%d drop_delta_total=%d max_delta=%d unavailable=%d resets=%d\n", runtime_tun_samples, runtime_tun_drop_events, runtime_tun_drop_delta_total, max_runtime_tun_delta, runtime_tun_unavailable, runtime_tun_resets
       printf "- tun_egress_feedback: pause_edges=%d resume_edges=%d drop_events=%d drop_delta_total=%d max_delta=%d max_pressure_bytes=%d\n", tun_feedback_pause_count, tun_feedback_resume_count, tun_feedback_drop_events, tun_feedback_drop_delta_total, max_tun_feedback_delta, max_tun_feedback_pressure
-      printf "- tun_rx_drain: attempts=%d packets=%d timer_active_flow=%d timer_stalled_read=%d tcp=%d dns=%d udp=%d tcp_batches=%d batch_dirty_relay_passes=%d tcp_batch_packets_high_water=%d avoided_dirty_relay_passes=%d budget_exhausted=%d would_block=%d errors=%d\n", max_tun_rx_drain_attempts, max_tun_rx_drain_packets, max_tun_rx_drain_timer_active_flow, max_tun_rx_drain_timer_stalled_read, max_tun_rx_drain_tcp, max_tun_rx_drain_dns, max_tun_rx_drain_udp, max_tun_rx_drain_tcp_batches, max_tun_rx_drain_batch_dirty_relay_passes, max_tun_rx_drain_tcp_batch_packets_high_water, max_tun_rx_drain_avoided_dirty_relay_passes, max_tun_rx_drain_budget_exhausted, max_tun_rx_drain_would_block, max_tun_rx_drain_errors
+      printf "- tun_rx_drain: attempts=%d packets=%d timer_active_flow=%d timer_stalled_read=%d tcp=%d dns=%d udp=%d tcp_batches=%d batch_dirty_relay_passes=%d batch_iface_polls=%d batch_flushes=%d tcp_batch_packets_high_water=%d avoided_dirty_relay_passes=%d avoided_iface_polls=%d pump_packets=%d pump_queue_high_water=%d pump_capacity=%d pump_full_waits=%d pump_read_errors=%d budget_exhausted=%d would_block=%d errors=%d\n", max_tun_rx_drain_attempts, max_tun_rx_drain_packets, max_tun_rx_drain_timer_active_flow, max_tun_rx_drain_timer_stalled_read, max_tun_rx_drain_tcp, max_tun_rx_drain_dns, max_tun_rx_drain_udp, max_tun_rx_drain_tcp_batches, max_tun_rx_drain_batch_dirty_relay_passes, max_tun_rx_drain_batch_iface_polls, max_tun_rx_drain_batch_flushes, max_tun_rx_drain_tcp_batch_packets_high_water, max_tun_rx_drain_avoided_dirty_relay_passes, max_tun_rx_drain_avoided_iface_polls, max_tun_rx_pump_packets, max_tun_rx_pump_queue_high_water, max_tun_rx_pump_capacity, max_tun_rx_pump_full_waits, max_tun_rx_pump_read_errors, max_tun_rx_drain_budget_exhausted, max_tun_rx_drain_would_block, max_tun_rx_drain_errors
       printf "- quic: samples=%d worst_conn=%s max_lost_bytes_delta=%d aggregate_lost_bytes_delta=%d max_congestion_events_delta=%d max_start_lost_bytes=%d max_start_congestion_events=%d min_start_cwnd=%s min_cwnd=%s inherited_conns=%s inherited_low_cwnd_threshold=%d max_tx_blocked_data_delta=%d max_tx_blocked_stream_delta=%d max_rx_blocked_data_delta=%d max_rx_blocked_stream_delta=%d\n", quic_samples, worst_conn, max_lost_bytes_delta, aggregate_lost_bytes_delta, max_congestion_delta, max_start_lost_bytes, max_start_congestion_events, min_start_cwnd_all, min_cwnd_all, inherited_quic_conns, inherited_low_cwnd_limit, max_tx_data_delta, max_tx_stream_delta, max_rx_data_delta, max_rx_stream_delta
       print "- attribution: " labels
     }
@@ -2507,7 +2547,7 @@ EOF_IPERF
 🔎 tcp-global-rx-backpressure paused=false max_pending=2097120 total_pending=2097120 max_tx_queue=524280 total_tx_queue=524280 max_pressure=2097120 total_pressure=2611400 receive_high=8388480 receive_low=2097120 receive_total_high=16776960 receive_total_low=4194240 local_egress_paused=false tun_feedback_paused=false
 🔎 tcp-downlink-flush pending_total=524233 pending_max=524233 pending_high=2151649 remote_to_global_rx_bytes=3145728 downstream_permit_bytes=3145728 downstream_permit_released_bytes=2621440 downstream_permit_pending_high=524233 terminal_late_remote_payload_bytes=128 terminal_late_remote_payload_events=1 flush_attempts=23 no_send_capacity=7 send_window_samples=23 send_capacity_min=0 send_capacity_max=1048576 send_queue_max=1048576 recv_queue_max=4096 may_send_false=1 may_recv_false=1 no_send_capacity_streak_max=7 no_send_capacity_pending_max=524233 send_slice_calls=16 send_slice_accepted=2621440 send_slice_zero=2 send_slice_errors=0 budget_limited_calls=9 headroom_limited_calls=4 headroom_deferred_bytes=4096 drain_credit_granted_bytes=8192 drain_credit_planned_bytes=4096 drain_credit_used_bytes=2048 egress_payload_credit_bytes=12345 drop_credit_debt_bytes=1024 drop_credit_debt_paid_bytes=512 drop_credit_blocked_bytes=1536 pressure_credit_debt_bytes=2048 pressure_credit_debt_paid_bytes=256 pressure_credit_blocked_bytes=768 hard_edge_guard_bytes=24576 hard_edge_guard_limited_calls=2 hard_edge_guard_deferred_bytes=8192 send_slice_max_accepted=262144 tun_flush_tx_calls=14 tun_flush_tx_failures=1 tun_flush_deferred=3 dirty_handles=1
 🔎 tcp-relay-ack-drain-hint handle=SocketHandle(1) epoch=7 gap_ms=7002 remote_to_global_rx_bytes=3145728 budget=240 cadence_floor=15340
-🔎 tcp-tun-rx-drain attempts=4 pre_payload_attempts=0 remote_payload_attempts=1 remote_payload_deferred_attempts=1 remote_payload_deferred_delayed_attempts=1 remote_payload_deferred_pressure_attempts=0 relay_gap_hint_attempts=1 relay_gap_hint_followup_attempts=0 maintenance_attempts=0 timer_active_flow_attempts=0 timer_stalled_read_attempts=2 other_attempts=0 packets=11 tcp=9 dns=1 udp=1 tcp_batches=3 batch_dirty_relay_passes=3 tcp_batch_packets_high_water=4 avoided_dirty_relay_passes=6 budget_exhausted=1 would_block=3 errors=0
+🔎 tcp-tun-rx-drain attempts=4 pre_payload_attempts=0 remote_payload_attempts=1 remote_payload_deferred_attempts=1 remote_payload_deferred_delayed_attempts=1 remote_payload_deferred_pressure_attempts=0 relay_gap_hint_attempts=1 relay_gap_hint_followup_attempts=0 maintenance_attempts=0 timer_active_flow_attempts=0 timer_stalled_read_attempts=2 other_attempts=0 packets=11 tcp=9 dns=1 udp=1 tcp_batches=3 batch_dirty_relay_passes=3 batch_iface_polls=3 batch_flushes=3 tcp_batch_packets_high_water=4 avoided_dirty_relay_passes=6 avoided_iface_polls=6 pump_enabled=true pump_packets=11 pump_bytes=13200 pump_queue_high_water=7 pump_capacity=500 pump_full_waits=0 pump_read_errors=0 pump_closed=0 budget_exhausted=1 would_block=3 errors=0
 🔎 tcp-tun-egress if=tun0 status=delta tx_dropped_total=1523 tx_dropped_delta=1423 global_rx_paused=true pending_total=524233 pending_max=524233 pending_high=2151649 remote_to_global_rx_bytes=3145728 tun_flush_tx_calls=14 dirty_handles=1
 🔎 tcp-lifecycle-transition handle=SocketHandle(1) source=dead_slot_reap prev_source=remote_payload prev_observed_secs=10 observed_secs=15 prev_state=Established state=Closed prev_active=true active=false prev_can_send=true can_send=false prev_can_recv=true can_recv=false prev_may_send=true may_send=false prev_may_recv=true may_recv=false prev_send_queue=65536 send_queue=0 prev_recv_queue=0 recv_queue=0 ctx_state=Relaying uplink_tx=true local_fin_sent=false local_fin_pending_since=none local_fin_last_remote_progress=none pending=4096 pending_high=2151649 remote_to_global_rx_bytes=3145728 send_slice_accepted=2621440 flush_attempts=23 terminal_candidate=true
 🔎 tcp-terminal-remote-payload handle=SocketHandle(1) bytes=128 total_bytes=128 events=1 pending=4096 tcp_state=Closed active=false can_send=false can_recv=false may_send=false may_recv=false send_capacity=1048576 send_queue=0 recv_queue=0
@@ -2614,7 +2654,7 @@ EOF_AGGREGATE_EXCESS
   assert_contains "$summary" "tuic_stream_pending_causes: connection_stream_frames_pending=0 connection_fresh_stream_frames_pending=0 connection_stale_stream_frames_pending=0 connection_rx_no_stream_frames=0 no_connection_rx=0 no_transport_sample=0"
   assert_contains "$summary" "tuic_stream_polling: polls_max=0 max_poll_gap_ms=0 data_streams=0 data_polls_max=0 data_poll_gap_max_ms=0 data_rx_bytes_max=0"
   assert_contains "$summary" "runtime_tun_egress: samples=1 drop_events=1 drop_delta_total=1423 max_delta=1423 unavailable=0 resets=0"
-  assert_contains "$summary" "tun_rx_drain: attempts=4 packets=11 timer_active_flow=0 timer_stalled_read=2 tcp=9 dns=1 udp=1 tcp_batches=3 batch_dirty_relay_passes=3 tcp_batch_packets_high_water=4 avoided_dirty_relay_passes=6 budget_exhausted=1 would_block=3 errors=0"
+  assert_contains "$summary" "tun_rx_drain: attempts=4 packets=11 timer_active_flow=0 timer_stalled_read=2 tcp=9 dns=1 udp=1 tcp_batches=3 batch_dirty_relay_passes=3 batch_iface_polls=3 batch_flushes=3 tcp_batch_packets_high_water=4 avoided_dirty_relay_passes=6 avoided_iface_polls=6 pump_packets=11 pump_queue_high_water=7 pump_capacity=500 pump_full_waits=0 pump_read_errors=0 budget_exhausted=1 would_block=3 errors=0"
   assert_contains "$summary" "max_lost_bytes_delta=439956"
   assert_contains "$summary" "aggregate_lost_bytes_delta=439956"
   assert_contains "$summary" "attribution: quic_loss_congestion+local_write_pressure+local_tun_egress_drop+local_drop_credit+local_pressure_credit+local_downlink_backpressure+local_global_rx_receive_window+terminal_late_remote_payload+terminal_pending_reap"

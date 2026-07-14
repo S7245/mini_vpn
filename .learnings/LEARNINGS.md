@@ -1,5 +1,29 @@
 # Learnings
 
+## 2026-07-13 - Kernel-facing read ownership and actor batch service are separate requirements
+
+- Coalescing dirty-relay traversal alone left the real TUN fd actor-owned and
+  the VPS poll-dominated; the frozen P1 stayed at `194 Mbit/s` but TUN drops
+  increased from `10` to `38`. A useful batch does not by itself guarantee that
+  the upstream kernel queue is drained while the actor is busy.
+- The successor gives H10d16 a continuous, bounded TUN reader pump and keeps all
+  classification, smoltcp, relay, and write state actor-owned. A distinct raw
+  slot and smoltcp-staged FIFO prevent prefetch from bypassing DNS/UDP/SYN
+  inspection while allowing one poll/flush per bounded TCP batch.
+- The final exact 32 MiB repeat reached `293.488 Mbit/s`, with ring high
+  `38/500`, pump high `56/500`, zero full waits/drops, and `28,933` packets
+  serviced by `11,817` poll/flush/relay batches. Terminal D16 ownership and EOF
+  tail were zero.
+- Review found that a bounded producer is still unsafe if its closed receiver
+  becomes an always-ready select branch. Terminal TUN errors now stop the event
+  loop fail-closed; a dedicated test proves no busy wake.
+- Reusable rule: for a kernel-to-actor boundary, prove both continuous ingress
+  ownership and bounded actor service. Keep raw classification ownership
+  separate from protocol-stack staging, and make terminal channel state end the
+  consumer loop rather than become a retry source.
+- Result:
+  `docs/tech/2026-07-13-knife14h10d16-tun-ingress-service-local-gate-results.md`.
+
 ## 2026-07-13 - TUN packet ingestion and relay service need separate batch ownership
 
 - The H10d16 TUN RX path previously traversed dirty relays once per ingested TCP

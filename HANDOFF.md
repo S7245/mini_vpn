@@ -12,30 +12,41 @@ This section overrides the older G7/G8/GV next-step text below.
   Its frozen VPS P1 passed capacity (`194 Mbit/s` receiver), QUIC-loss
   (`11,922,924B <= 16 MiB`), and endpoint conservation, but failed safety with
   `10` TUN TX drops. Pacing constants are closed as the next repair branch.
-- The follow-up H10d16 TUN RX batch relay service is implemented and locally
-  **PASS**. It keeps packet-by-packet classification/polling but performs one
-  inner dirty-relay pass per bounded TCP batch. The default non-H10 one-packet
-  Adapter and all frozen product parameters remain unchanged.
-- The exact real-Quinn forward `32 MiB` gate reached `319.455 Mbit/s`, with
-  exact bytes, zero pattern errors, clean EOF, zero modeled ring drops, and a
-  `29/500` ring high water. It reduced `28,934` TCP packets to `4,093` batch
-  relay passes and avoided `24,841` per-packet passes; final D16 owned,
-  pending, inflight, terminal-drop, and late-payload bytes were zero.
+- The H10d16 TUN RX batch relay service is committed at
+  `d934f124a54caf1a60963c7ff84bf619a73b2262`. Its local exact gate passed at
+  `319.455 Mbit/s`, but its frozen VPS P1 failed safety: receiver remained
+  `194 Mbit/s`, QUIC loss passed at `11,717,996B`, and exact batch attribution
+  was `847,092` TCP packets -> `3,712/3,712` batch/relay passes with `843,380`
+  avoided traversals, yet TUN drops were `0/38`. The batch-only branch is
+  closed; do not tune drain or queue constants.
+- The H10d16-only bounded TUN ingress service is locally complete. It splits
+  the TUN reader into a continuous 500-packet FIFO pump, preserves raw
+  DNS/UDP/SYN classification, and performs one smoltcp poll, TUN flush, and
+  dirty-relay pass per existing bounded TCP batch. The focused tracer moved
+  from `8` poll/flush calls for `8` packets to `1/1` without changing the
+  48/240 service bounds.
+- The exact real-Quinn 32 MiB gate passed at `293.488 Mbit/s`, exact bytes and
+  clean EOF, zero modeled drops, ring high `38/500`, pump high `56/500`, zero
+  full waits/read errors, and `28,933` TCP packets -> `11,817/11,817`
+  batch/poll/flush passes with `17,116` avoided per-packet calls. D16 terminal
+  ownership and tail were zero.
 - Final regressions pass: quinn-proto `309/309 + 3/3` docs; Quinn `29/29`
-  nonignored (`3` expected ignored) + `1/1` doc; root `625/625` nonignored;
-  harness `636/636` nonignored; all-target check; explicit `64/256/1024`;
-  zero-loss UDP sweep; fmt, runner syntax/self-test, and diff checks.
-- Code review closed the prefetched single-RX-slot overwrite and serialized
-  test-only localhost capacity gates to prevent parallel resource contention
-  from producing false rate failures. No unresolved P0/P1 remains.
+  nonignored (`3` expected ignored) + `1/1` doc; root `629/629` nonignored;
+  harness `640/640` nonignored; integration `10/10`; all-target check;
+  explicit `64/256/1024`; zero-loss UDP sweep; fmt, runner syntax/self-test,
+  and diff checks.
+- Code review fixed terminal TUN error handling so a closed pump cannot become
+  a busy select loop. No unresolved P0/P1 remains. The profiler calibration
+  also now requires completed flows; exact `d934f12` comparison proved the old
+  32-flow fixture could time out without failing its completion contract.
 - The user authorized safe in-scope repairs without repeated confirmation,
-  plus commit and VPS. Next: commit this reviewed batch stage, then run one
-  frozen target-only EndpointWindowV1 P1. Require `>170 Mbit/s`, zero TUN
-  drops, QUIC loss `<=16 MiB`, exact batch counter equality/nonzero avoided
-  passes, endpoint conservation, and clean lifecycle. Any remaining TUN drop
-  is architecture failure; do not tune batch/drain constants. macOS TUN
-  remains prohibited. Source:
-  `docs/tech/2026-07-13-knife14h10d16-tun-rx-batch-service-local-gate-results.md`.
+  plus commit and VPS. Next: commit this reviewed local candidate, deploy that
+  exact commit, rehearse the frozen profile, and run one target-only
+  forward-only P1. Receiver `<=170 Mbit/s`, any TUN drop, pump high-water
+  `500`, or any pump full wait is architecture failure without tuning. macOS
+  TUN remains prohibited. Sources:
+  `docs/tech/2026-07-13-knife14h10d16-tun-rx-batch-service-vps-results.md` and
+  `docs/tech/2026-07-13-knife14h10d16-tun-ingress-service-{architecture-spec,implementation-plan,local-gate-results}.md`.
 
 The older entries below are chronological stage history and do not override
 this position.
