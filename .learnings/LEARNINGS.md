@@ -1,5 +1,31 @@
 # Learnings
 
+## 2026-07-14 - Acceptance needs a capable peer and a valid packet shape
+
+- Exact `5f9da90` passed the formal reverse P8 at `188 Mbit/s` receiver with
+  `60/60` nonzero intervals only after the external sender moved from the
+  historically low sing-box/quic-go `.33` path to the control-certified
+  Shoes/Quinn `.111:8443` path. Client architecture cannot be inferred from a
+  run whose external sender is independently below the gate.
+- The accepted P8 retained every frozen parameter and had TUN drops `0/0`,
+  pump `129/500`, zero QUIC loss/congestion/blocking, all eight flows beyond
+  one D16 quantum, and exact endpoint conservation. This closes the ACK
+  barrier repair without another pacing or queue modification.
+- UDP payload length is application payload, not IP-packet length. A `1200B`
+  iperf UDP payload becomes `1228B` after IPv4/UDP headers and invalidates an
+  MTU1200 no-fragment discriminator. Correcting only the test shape to `1160B`
+  yielded `90 Mbit/s` reverse/live-streaming with zero loss and zero internal
+  drops; no product constant changed.
+- Two independent Linux TUN processes forged arbitrary-resolver DNS replies,
+  stopped cleanly, and recreated. Repeating create/query/stop is stronger
+  lifecycle evidence than a single successful query on a long-lived TUN.
+- Reusable rule: before assigning a performance result to the SUT, prove the
+  peer can produce the required direction and prove the offered packet fits
+  the frozen MTU. Treat topology capability and packet geometry as acceptance
+  preconditions, not post-failure excuses.
+- Result:
+  `docs/tech/2026-07-14-knife14h10d16-endpoint-pacing-service-vps-completion-results.md`.
+
 ## 2026-07-13 - Recovery evidence must outlive the pressure that suppresses it
 
 - The fresh reverse P8 opened all eight data relays but each accepted only

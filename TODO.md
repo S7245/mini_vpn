@@ -1,10 +1,46 @@
 # TODO
 
-## Current Knife14 Status (2026-07-09)
+## Current Knife14 Status (2026-07-14)
 
-### Approved next stage: H10d16 byte-owned egress
+### H10d16 byte-owned egress completion
 
-#### Latest decision (2026-07-13)
+#### Latest decision (2026-07-14)
+
+Knife14 H10d16 Task 12 step 4 is **complete**. Exact repair source `5f9da90`
+passed the formal target-only reverse P8 on the capable Shoes/Quinn
+`.111:8443` Exit at `188 Mbit/s` receiver with `60/60` nonzero intervals.
+All eight flows exceeded one D16 quantum; TUN drops were `0/0`, pump high was
+`129/500` with zero waits/errors, formal QUIC loss/congestion/blocking was
+zero, and endpoint conservation/close cleanup was exact.
+
+The earlier `.33` low reverse result is not an architecture discriminator:
+that external sing-box/quic-go sender is independently limited to the low
+single-digit Mbit/s class on this topology. Do not use an externally incapable
+sender to reject the client architecture.
+
+The valid `1160B` UDP regression passed the required downlink/live-streaming
+direction at `90 Mbit/s` with `0/290,950` loss and zero mini_vpn, TUN, or
+within-window client QUIC loss. Forward delivered `83.7 Mbit/s` from a
+`90 Mbit/s` offer with `7%` application loss but no mini_vpn/TUN/within-window
+client QUIC drop signal. The prior `1200B` payload result is excluded because
+`1200 + 28 = 1228B` exceeded the frozen TUN MTU and forced fragmentation.
+
+Linux fake-IP DNS and TUN lifecycle passed twice: arbitrary resolver queries
+returned `198.18.0.2`, metrics reported `DNS forge=1/drop=0`, both processes
+stopped without residual TUN/routes, and a fresh TUN recreated successfully.
+Post-VPS root, harness, integration, vendored Quinn/proto/smoltcp, check, fmt,
+shell, and diff gates passed; final review has no unresolved P0/P1. `.27` and
+`.111` cleanup is complete, `.111` buffers are restored to `212992`, and no
+macOS TUN ran.
+
+Accepted chain: `c55737e -> d934f12 -> 20a0f8c -> e201403 -> 5f9da90`.
+Gate A and Gate B remain accepted. Do not reopen bounded sender, cap64,
+GSO-only, D3 self-wake, or frozen-parameter tuning. The next work should be a
+new explicitly scoped stage rather than another Knife14 H10d16 pacing repair.
+Source:
+`docs/tech/2026-07-14-knife14h10d16-endpoint-pacing-service-vps-completion-results.md`.
+
+#### Previous decision (2026-07-13)
 
 The first fresh reverse P8 from `55792b3` failed at `0.103 Mbit/s`. All eight
 data relays opened, but each accepted only `117,412-134,760B`, approximately

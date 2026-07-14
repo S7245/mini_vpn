@@ -1,5 +1,39 @@
 # Errors
 
+## 2026-07-14 - Final VPS regression exposed topology, packet-shape, and runner traps
+
+- A reverse P8 against `.33` was initially treated as a client architecture
+  failure even though that external sing-box/quic-go sender is independently
+  known to remain in the low single-digit Mbit/s class on this topology. The
+  capable Shoes/Quinn `.111:8443` rerun reached `188 Mbit/s` receiver with all
+  formal client invariants clean. Require a direction-capable peer before
+  interpreting a throughput failure.
+- The first UDP run used `-l 1200` with TUN MTU1200. IPv4/UDP headers made the
+  actual IP packet `1228B`, caused fragmentation, and produced a misleading
+  `55%` forward loss result. Test payload must satisfy
+  `payload + IP/transport headers <= TUN MTU`; the corrected `1160B` run is
+  the only accepted UDP result.
+- A standalone vendored Quinn test again omitted the explicit local
+  quinn-proto patch and failed on missing EndpointPacing APIs. The root build
+  and quinn-proto tests were already green; the same Quinn manifest passed
+  `29+1` once given the absolute patch path. A compiler failure against the
+  wrong dependency graph is provenance failure, not product regression.
+- `.27` reports NOPASSWD command rules, but the suite's bare `sudo -v`
+  preflight can still select a password-requiring rule. `sudo -n true` proved
+  noninteractive command authority; running the unchanged suite through
+  `sudo -n -E` avoided putting a password in commands, logs, or artifacts.
+- A long multiline paste into the remote PTY lost commands after the first
+  line. Send stateful credential/profile exports one line at a time and verify
+  only redacted lengths before starting a suite.
+- The first transient Shoes copy was partial and failed its SHA/status check;
+  an exact re-copy fixed it. A root-owned FIFO glob also required the glob to
+  expand inside `sudo sh -c`, and its feeder writers had to be terminated after
+  the service loaded. Hash the final archive and binary before traffic, and
+  keep a fail-closed restoration timer until manual cleanup is verified.
+- Cleanup succeeded: the temporary service/timer/binary/runtime were removed,
+  UDP8443 closed, and all four `.111` socket-buffer values returned to
+  `212992`.
+
 ## 2026-07-13 - Reverse P8 exposed lost recovery evidence, not missing capacity
 
 - Source `55792b3` opened eight data flows across both healthy pool

@@ -217,3 +217,23 @@ Endpoint final state was `available=61,403B`, `live=0`, `outstanding=0`, with
 is recorded in:
 
 `docs/tech/2026-07-13-knife14h10d16-local-uplink-window-service-vps-results.md`.
+
+The repaired fresh reverse P8 from exact `5f9da90` then passed on the capable
+Shoes/Quinn `.111:8443` Exit: `188 Mbit/s` receiver, `60/60` nonzero
+intervals, all eight flows beyond one D16 quantum, TUN drops `0/0`, pump
+`129/500` with zero waits/errors, and zero formal QUIC loss/congestion/
+blocking. Endpoint conservation and close cleanup were exact.
+
+The corrected `1160B` UDP regression delivered reverse/live-streaming at
+`90 Mbit/s` with `0/290,950` loss and zero mini_vpn/TUN/QUIC-window drops.
+Forward delivered `83.7 Mbit/s` from a `90 Mbit/s` offer with `7%` application
+loss but zero mini_vpn/TUN/within-window client QUIC loss. Two independent
+Linux TUN lifecycles forged arbitrary-resolver DNS answers to `198.18.0.2`,
+reported `DNS forge=1/drop=0`, stopped cleanly, and recreated successfully.
+
+Final local suites and review passed again with no unresolved P0/P1. VPS
+processes, routes, TUNs, the transient Shoes service, timer, binary, and
+runtime directory were removed, and `.111` socket buffers were restored.
+Task 12 step 4 is complete. Full evidence:
+
+`docs/tech/2026-07-14-knife14h10d16-endpoint-pacing-service-vps-completion-results.md`.

@@ -187,7 +187,45 @@ throughput branch, prioritize the 2026 Knife14 documents, especially the
 US-client results, downlink/backpressure/lifecycle specs, and the latest
 results documents.
 
-Current Knife14 summary, as of 2026-07-13:
+Current Knife14 summary, as of 2026-07-14:
+
+- Knife14 H10d16 Task 12 step 4 is complete. Exact repair source `5f9da90`
+  passed the capable Shoes/Quinn `.111:8443` target-only reverse P8 at
+  `188 Mbit/s` receiver, `60/60` nonzero intervals, and `149 Mbit/s` minimum.
+  All eight flows exceeded one D16 quantum.
+- The P8 had TUN drops `0/0`, pump `129/500` with zero full waits/read errors,
+  zero formal QUIC loss/congestion/blocking, zero terminal pending/reap, and
+  exact endpoint conservation. The largest observed conservation sample was
+  `61,406 <= 61,440B`.
+- Do not use `.33` reverse throughput as an H10d16 architecture discriminator.
+  Its external sing-box/quic-go reverse sender is independently limited to
+  low single-digit throughput on this topology; the capable Shoes/Quinn Exit
+  is the accepted reverse gate.
+- Corrected UDP payload `1160B` stayed within TUN MTU1200. The required
+  reverse/live-streaming direction delivered `90 Mbit/s` with `0/290,950`
+  loss and zero mini_vpn/TUN/client-QUIC window loss. Forward delivered
+  `83.7 Mbit/s` from a `90 Mbit/s` offer with `7%` application loss but no
+  mini_vpn/TUN/within-window client QUIC drop. Exclude the prior `1200B`
+  payload because its `1228B` IP packet forced fragmentation.
+- Linux fake-IP DNS and TUN rearm passed in two independent process cycles:
+  arbitrary resolver queries returned `198.18.0.2`, metrics reported
+  `DNS forge=1/drop=0`, both stops removed TUN/routes, and a fresh create
+  succeeded.
+- Post-VPS gates passed: root `632+3 ignored`, harness `643+3 ignored`,
+  integration `10+4 ignored`, quinn-proto `309+3`, Quinn `29+1`, smoltcp
+  `290+3`, all-target check, fmt, shell self-tests, and diff checks. No
+  unresolved P0/P1 remains.
+- Cleanup is complete. `.27` has no client/TUN/test route. `.111` has no
+  Shoes service, restore timer/service, UDP8443 listener, transient binary,
+  or runtime directory; all four socket buffers are restored to `212992`.
+  No macOS TUN ran.
+- Accepted chain: `c55737e -> d934f12 -> 20a0f8c -> e201403 -> 5f9da90`.
+  Gate A/B remain accepted. Do not reopen bounded sender, cap64, GSO-only,
+  D3 self-wake, or frozen-parameter tuning. Any later work needs a new
+  explicitly scoped stage. Result:
+  `docs/tech/2026-07-14-knife14h10d16-endpoint-pacing-service-vps-completion-results.md`.
+
+Previous Knife14 summary, as of 2026-07-13:
 
 - The first fresh frozen reverse P8 from `55792b3` failed at
   `0.103 Mbit/s`. All eight data relays opened, but each accepted only about
