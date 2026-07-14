@@ -4,6 +4,33 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-14)
 
+- **Latest accepted position:** the first formal HK M0 did not fail because of
+  user credentials/routes or endpoint pacing. The iperf control relay was a
+  healthy full-duplex Established flow with only `4B` downlink and `186B`
+  uplink; the old D16 payload-idle timer killed it at `90,001ms`, which made
+  the target close the data flow and the client report Broken pipe. The target
+  journal matched this causal time. Conservation stayed `<=61,440B`, with no
+  TUN/pump error discriminator.
+- ADR-0014 now makes full-open Established lifetime socket/transport-owned.
+  A shared `RelayCloseTimer` arms `90s` only for a concrete incomplete remote
+  write, resets on actual partial-write or remote-read progress, disarms after
+  completed flush, and retains the `10s` half-close drain plus D16 queued/
+  leased-byte protection. D16 child-task failure is explicitly terminal.
+- Runner evidence is now immutable after the first valid archive/checksum.
+  Repeated stop prints the existing pair; snapshot/event/overwrite are
+  refused. An interrupted archive-first publication may add its missing
+  checksum without rewriting the archive. `start` runs a positive direct
+  one-second Target transaction before any local state/TUN/route mutation and
+  records it in the manifest, preventing the prior too-early rearm.
+- Local focused tests, shell syntax/internal/external self-tests, formatting,
+  diff checks, release build, and the all-target root suite pass (`635`
+  library tests passed, `3` ignored; main binary `2/2`). No frozen data-plane
+  or M0 load constant changed. Code review has no unresolved P0/P1. Relay
+  lifecycle commit `a4e4549` and runner/rearm commit `89cf1e9` are complete;
+  only the fresh user-run M0 and its clean rearm remain for acceptance.
+- Result:
+  `docs/tech/2026-07-14-knife15-macos-m0-first-run-failure-and-repair-results.md`.
+
 - The formal M0 controller is locally PASS. A fresh same-target baseline
   derives `50%` sustained TCP/UDP and `80%` short TCP burst rates; UDP remains
   `1160B`. The frozen timeline is `6,780s` active + `300s` idle + `120s`

@@ -1,5 +1,49 @@
 # Learnings
 
+## 2026-07-14 - Transparent TCP silence is not a lifecycle signal
+
+- The first formal M0 proved that a control connection can remain healthy and
+  Established for more than 90 seconds with almost no payload while a sibling
+  data connection does useful work. Killing the quiet control flow caused the
+  application server to terminate the data flow, even though pacing, TUN, and
+  queue ownership were clean.
+- Bounded cleanup should attach to concrete unfinished work or an actual
+  lifecycle transition. The repaired relay has no full-open payload-idle
+  timer; it guards a started incomplete write and a locally half-closed drain.
+  Manual partial writes make “no progress” observable instead of treating one
+  long `write_all` completion as the only signal.
+- Removing a broad timer can expose child-task failures it previously masked.
+  D16 now treats reader panic and writer signal-channel loss as explicit
+  terminal causes instead of waiting for an unrelated idle deadline.
+- Reusable rule: transparent transport code must not infer application death
+  from silence. Name and test the exact owned obligation being bounded, and
+  preserve independent terminal owners for task failure and cancellation.
+- Implementation: relay lifecycle commit `a4e4549`; root library tests passed
+  `635` with `3` ignored, the main binary passed `2/2`, and the release build
+  completed.
+
+## 2026-07-14 - Finalized evidence must be content-addressed and immutable
+
+- The old idempotent `stop` reran summary, sampling, tar, and checksum steps,
+  so the same bundle path changed after the user had already reported its
+  SHA-256. A post-stop snapshot and repeated cleanup made provenance ambiguous
+  even though the underlying first failure remained diagnosable.
+- A valid archive/checksum pair is now a terminal evidence state. Read-only
+  status remains safe; stop returns the same pair; snapshot/event/bundle
+  overwrite are refused. If interruption occurs after the archive rename but
+  before checksum rename, recovery computes only the missing checksum and
+  never rebuilds the archive.
+- A rearm gate must prove the target can complete a transaction, not merely
+  that its TCP port accepts. The one-second direct iperf transaction prevents
+  a server still occupied by the failed session from contaminating the next
+  TUN run.
+- Reusable rule: make evidence publication one-way and content-addressed, and
+  make rearm readiness an end-to-end capability check before local mutation.
+- Implementation: macOS runner/rearm commit `89cf1e9`; internal and external
+  shell self-tests, syntax, formatting, and diff gates passed.
+- Result:
+  `docs/tech/2026-07-14-knife15-macos-m0-first-run-failure-and-repair-results.md`.
+
 ## 2026-07-14 - A formal soak must pre-account evidence as strictly as bytes
 
 - The macOS M0 controller now derives all offered load from a fresh same-target

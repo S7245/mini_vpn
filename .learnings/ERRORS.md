@@ -1,5 +1,36 @@
 # Errors
 
+## 2026-07-14 - A non-fail-fast commit command crossed a failed diff check
+
+- `git diff --cached --check` correctly found two trailing spaces in a newly
+  staged ADR, but the following `git commit` still ran because the multi-line
+  shell command did not enable fail-fast behavior.
+- The defect was documentation-only and did not change the tested Rust code,
+  but the commit must not be amended or hidden. Remove the whitespace in a
+  follow-up and use `set -e` for any command group where a failed pre-commit
+  gate must prevent the commit.
+- Untracked files are absent from an ordinary `git diff --check`; stage the
+  exact intended files first and make `git diff --cached --check` a hard gate.
+
+## 2026-07-14 - A payload-idle timer killed M0 control and polluted rearm
+
+- At `90,001ms`, D16 closed an active Established iperf control relay with
+  `reason=idle_timeout`; the target then logged an unexpected client close,
+  ended the data flow, and the client reported Broken pipe. The control relay
+  was legitimately quiet, so raising the timeout or adding keepalive traffic
+  would only hide the invalid lifecycle inference.
+- The first archive's reported SHA later changed because repeated `stop` and
+  `snapshot` commands were allowed to mutate and rebuild an already-published
+  evidence path. Treat the valid archive/checksum pair as immutable; never
+  ask users to snapshot after stop.
+- The immediate rearm smoke failed while the target iperf server still owned
+  the broken prior session. Port/routing preflight was insufficient. Require a
+  complete positive direct transaction before new route/TUN mutation.
+- The user's intended baseline/start/smoke/m0 operation was not the root
+  error. Script wording and missing guards permitted the evidence/rearm
+  mistakes, so the repair belongs in code and runbook rather than operator
+  blame.
+
 ## 2026-07-14 - M0 review found false-complete and cleanup gaps before real TUN
 
 - The first local controller draft could retain `m0_status: complete` after an

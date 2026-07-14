@@ -6,6 +6,29 @@
 
 #### Latest decision (2026-07-14)
 
+The first user-run formal M0 selected a relay-lifecycle defect, not user
+operation or H10d16 pacing. A legitimately quiet iperf control relay was still
+full-duplex Established when the old 90-second payload-idle timer aborted it;
+the target then closed the data session and remained busy during the immediate
+rearm. Endpoint conservation, pump, and interface evidence reject pacing/TUN
+capacity as the cause.
+
+The local repair is implemented. Full-open relays are deadline-free; only a
+concrete unfinished write has the 90-second no-progress guard, actual partial
+and remote progress reset it, completed flush disarms it, and local FIN keeps
+the 10-second drain bound. All relay engines use the same policy. The runner
+now finalizes one immutable archive/checksum and requires a positive direct
+Target transaction before every `start` mutation. Local Rust/shell/fmt/diff
+gates and review pass without changing frozen constants.
+
+Relay lifecycle commit `a4e4549` and runner/rearm commit `89cf1e9` are complete.
+The release build and local suite pass (`635` library tests passed, `3`
+ignored; main binary `2/2`). Next, the user takes a fresh baseline and runs one
+new formal M0. If it passes, perform one fresh start/smoke/stop rearm. Do not
+reuse either failed-run bundle as acceptance and do not tune endpoint pacing
+or M0 rates. Result:
+`docs/tech/2026-07-14-knife15-macos-m0-first-run-failure-and-repair-results.md`.
+
 The formal M0 mixed-workload controller and evidence parser are locally PASS.
 It requires a fresh same-target direct baseline, derives sustained TCP/UDP at
 `50%` and short TCP bursts at `80%`, fixes UDP at `1160B`, and runs

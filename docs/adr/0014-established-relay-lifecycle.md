@@ -1,7 +1,7 @@
 # ADR-0014: Established TCP Relays Are Lifecycle-Owned
 
-**Date:** 2026-07-14  
-**Status:** Accepted  
+**Date:** 2026-07-14
+**Status:** Accepted
 **Supersedes:** ADR-0011's L2 full-duplex payload-idle consequence only
 
 ## Context
