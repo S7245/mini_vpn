@@ -6,35 +6,39 @@
 
 #### Latest decision (2026-07-15)
 
-Exact source `239acba` completed two full mixed M0 cycles, then cycle 3
-forward produced three complete Target receiver zero-throughput seconds while
-still delivering exact `313,786,368B / 8.363 Mbit/s` over its full 300-second
-command. Baseline/provenance and the user's start/smoke/M0/status/snapshot/stop
-sequence were correct; cleanup happened after the failure and was not causal.
+Source `5c127eb` bundle
+`/tmp/mini_vpn_knife15_macos_20260715_104417.tar.gz` (SHA-256 `5743b352...`)
+is exact and correctly operated. Its 300-second direct prerequisite passed all
+Target receiver seconds at `6.626752 Mbit/s` and was fresh. Sustained forward,
+sustained reverse, and reverse UDP then passed; the first short-forward phase
+failed with two initial receiver-zero seconds and only `3,670,016B` received
+from `10,616,832B` sent.
 
-Endpoint conservation, final ownership, TUN/pump service, relay lifecycle,
-resources, and physical-interface errors remained clean. The bulk relay had an
-`8.900252s` writer wait and its QUIC connection accumulated loss/congestion,
-while the sibling connection remained stable. All 81 Exit/gateway controls
-showed zero loss but are too coarse and protocol-independent to reject a
-one-second flow-specific path event.
+The deterministic discriminator is pool history. Global round-robin placed
+the first two TCP phase pairs on control/data conn0/conn1. Reverse UDP opened
+one TCP control on conn0 and shifted the cursor; the next short pair inverted
+to conn1/conn0. The conn0 data writer waited `3.864382s` while endpoint
+ownership, TUN/pump, resources, same-window Exit/gateway controls, and exit-side
+Connect timing remained clean. Operator error, direct-path continuity,
+server-dial delay, endpoint pacing, and connection liveness are rejected.
 
-The old 20-second baseline did not prove direct 300-second Target receiver
-continuity. Commit `885c321` repairs baseline receiver ownership and adds a
-non-root `direct-discriminator` at the exact frozen M0 forward shape: 300
-seconds, one stream, 50% of the fresh forward receiver baseline, physical
-Target/Exit routes, and 300 complete positive Target receiver seconds. Formal
-M0 requires matching provenance completed within 15 minutes and preserves it
-in the bundle. Shell TDD, Knife15/Knife14 gates, syntax/diff, and code review
-pass with no unresolved P0/P1; no frozen data-plane or workload constant
-changed.
+Commit `c945a41` replaces global history with least-active atomic reservation,
+stable primary-first ties, and a per-slot RAII preparation gate held until the
+selected connection is cloned. The gate closes a P1 overtaking risk found in
+review of the initial counter-only implementation. Focused pool tests `15/15`,
+all-target library `640 + 3 ignored`, main `2/2`, release, Clippy, Knife15 and
+Knife14 shell gates, fmt, and diff checks pass; review has no unresolved P0/P1.
+Pool=2 and every frozen data-plane/workload setting remain unchanged.
 
-Next run only a fresh build, structured baseline, and direct discriminator on
-the Shenzhen Mac. Direct failure blocks TUN and tuning. Direct PASS permits an
-immediate start/smoke/M0; a repeated clean-internal receiver interruption then
-selects an architecture failure and blocks another identical M0. M1 remains
-blocked. Result:
-`docs/tech/2026-07-15-knife15-macos-m0-direct-continuity-discriminator-results.md`.
+Next: user rebuilds release, takes a fresh baseline, and passes a new
+300-second direct discriminator before start/smoke/M0. Corrected M0 must place
+short control/data on conn0/conn1 and keep all complete Target receiver
+intervals positive. If placement is corrected but the SLI still fails, stop
+repeats and tuning and reopen the flow-specific QUIC/path architecture branch.
+If M0 passes, run an independent rearm. M1 stays blocked until both pass.
+Results:
+`docs/tech/2026-07-15-knife15-macos-m0-directpass-pool-parity-results.md` and
+`docs/tech/2026-07-15-knife15-macos-m0-lease-aware-pool-selection-architecture-spec.md`.
 
 Exact source `5e8846f` repaired-observer bundle
 `/tmp/mini_vpn_knife15_macos_20260715_084113.tar.gz` (SHA-256 `85dd7a66...`)

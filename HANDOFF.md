@@ -4,38 +4,38 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-15)
 
-- **Latest accepted position:** exact source `239acba` M0 bundle
-  `/tmp/mini_vpn_knife15_macos_20260715_091501.tar.gz` (SHA-256
-  `9cf99fa2...`) completed two full mixed cycles, then cycle 3 forward produced
-  three complete Target receiver zero-throughput seconds. The phase ran its
-  full 300 seconds and delivered exact `313,786,368B / 8.363 Mbit/s`; the
-  direction-aware receiver SLI correctly failed. The later status/snapshot/
-  stop sequence was correct and occurred more than four minutes after the
-  failure, so this was not an operator or sudo-delay error.
-- Internal ownership, TUN/pump service, lifecycle, and resources remained
-  clean: endpoint conservation was `<=61,440B`, final ownership was
-  `61,388/0/0B`, pump high-water was `291/500` with zero waits/errors, utun
-  errors were zero, FD/thread stayed `15/11`, and the bulk relay closed
-  `clean_queue_lifecycle` with an `8.900252s` maximum writer wait. The active
-  bulk QUIC connection accumulated loss/congestion while its sibling stayed
-  stable. All 81 coarse Exit/gateway controls had zero loss; they reject a
-  broad outage but not a one-second or flow-specific path event.
-- The 20-second baseline cannot classify that event because it did not prove
-  direct 300-second Target receiver continuity. Commit `885c321` adds a
-  non-root `direct-discriminator`: fresh baseline now uses structured,
-  direction-aware receiver evidence; the direct gate runs the exact 300s/one-
-  stream/50% forward shape on physical routes and requires 300 complete
-  positive Target receiver seconds. Formal M0 binds matching source/runner/
-  binary/baseline/result evidence completed within 15 minutes. Knife15 and
-  Knife14 shell/syntax/diff gates pass; code review has no unresolved P0/P1.
-- Next action is user-run, non-TUN `cargo build --release`, fresh baseline, and
-  `direct-discriminator` on the Shenzhen Mac. If direct fails, do not start
-  TUN or tune constants. If it passes, export `M0_DIRECT_DIR` and immediately
-  run start/smoke/M0. If that M0 repeats a receiver interruption with clean
-  internals, stop identical repeats and open connection-health isolation/
-  failover architecture work with a mature-client control. M0 and M1 remain
-  blocked. Result:
-  `docs/tech/2026-07-15-knife15-macos-m0-direct-continuity-discriminator-results.md`.
+- **Latest accepted position:** the user-operated source `5c127eb` M0 bundle
+  `/tmp/mini_vpn_knife15_macos_20260715_104417.tar.gz` (SHA-256
+  `5743b352...`) is exact and correctly operated. Its prerequisite direct run
+  `/tmp/mini_vpn_knife15_macos_direct_20260715_102948` passed all 300 Target
+  receiver seconds at `6.626752 Mbit/s` and was 615 seconds old at M0 start.
+  Password timing, stale evidence, route/provenance mismatch, premature
+  cleanup, and operator error are rejected.
+- Sustained forward, sustained reverse, and reverse UDP passed. The first
+  short-forward flow failed after global round-robin history inverted the pair:
+  the UDP phase opened its TCP control on conn0, then short control/data opened
+  on conn1/conn0. The short sender wrote `10,616,832B`, but Target received only
+  `3,670,016B`; the first two receiver seconds were zero and the conn0 writer
+  waited `3.864382s`. Endpoint ownership, TUN/pump, resources, Exit/gateway,
+  and exit-side Connect timing remained clean. This is a deterministic pool-
+  placement architecture defect, not a frozen-constant issue.
+- Commit `c945a41` replaces the global cursor with stable, least-active atomic
+  reservation plus a per-slot RAII preparation gate held through slot-mutex
+  wait, optional probe/reconnect, and connection clone. Review caught and
+  repaired the pre-clone overtaking risk in the initial counter-only design.
+  Focused pool tests passed `15/15`; all-target library tests passed `640 + 3
+  ignored`, main `2/2`; release, Clippy, Knife15/Knife14 shell gates, fmt, and
+  diff checks pass. No unresolved P0/P1 or frozen-setting change remains.
+- Next action is user-run `cargo build --release`, then a fresh baseline and
+  300-second direct discriminator because the binary source changed. A direct
+  PASS permits immediate start/smoke/M0. M0 must show short control/data on
+  conn0/conn1 and no receiver-zero interval. If placement is corrected but the
+  short SLI still fails, do not repeat or tune constants; reopen the flow-
+  specific QUIC/path branch with a usable same-path mature-client control. A
+  passing M0 is followed by an independent rearm; M1 remains blocked until
+  both pass. Results:
+  `docs/tech/2026-07-15-knife15-macos-m0-directpass-pool-parity-results.md` and
+  `docs/tech/2026-07-15-knife15-macos-m0-lease-aware-pool-selection-architecture-spec.md`.
 
 - **Previous accepted position:** exact source `5e8846f` repaired-observer short
   bundle `/tmp/mini_vpn_knife15_macos_20260715_084113.tar.gz` (SHA-256

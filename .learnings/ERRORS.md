@@ -1,5 +1,31 @@
 # Errors
 
+## 2026-07-15 - Global pool parity inverted a healthy control/data pairing
+
+- The user correctly ran an M0 with a passing fresh direct gate. Sustained TCP
+  and reverse UDP passed, but reverse UDP opened only one TCP control flow and
+  shifted the global cursor. The next short flow placed control on conn1 and
+  data on conn0; Target then saw two initial receiver-zero seconds.
+- The connection was alive and the exit opened the Target immediately. Timeout,
+  stale-probe, pool-size, pacing, workload-rate, and operator changes would not
+  repair a placement decision based on irrelevant history.
+- The first local repair draft reserved active count before awaiting the slot
+  mutex, but review found a same-slot overtaking path around idle-exclusive
+  reconnect/clone. Per-slot preparation ownership and wakeup were required
+  before the repair could pass review.
+- A post-stop direct-short control was invalid because another local VPN/proxy
+  auto-restored the Target route through `utun1024`. Recheck the actual route
+  after every cleanup before classifying a command as physical direct evidence.
+
+## 2026-07-15 - A zsh pattern error did not stop a guarded commit command
+
+- The code commit's staged diff check passed, but a complex secret-scan regex
+  inside an `if` triggered zsh `bad pattern`; despite `set -e`, the following
+  commit still ran. A separate unambiguous post-commit scan found no secret.
+- Do not combine shell-sensitive quote classes in a single inline regex gate.
+  Use multiple `rg -e` expressions, verify their command status explicitly,
+  and keep the exact staged file set small enough to audit independently.
+
 ## 2026-07-15 - The baseline claimed continuity from the wrong duration and endpoint
 
 - Formal M0 failed on three complete Target receiver zero seconds during a

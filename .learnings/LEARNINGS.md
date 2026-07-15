@@ -1,5 +1,23 @@
 # Learnings
 
+## 2026-07-15 - Pool placement must follow live ownership, not history
+
+- A one-control-flow UDP phase shifted a global round-robin cursor and inverted
+  the next short TCP control/data pair, even though every prior relay had
+  closed. Historical call parity is not a valid load or quality signal.
+- Stable least-active selection restores the intended idle-pair mapping:
+  control reserves conn0 and makes data observe conn1, independent of earlier
+  one-flow phases. RAII lease accounting is the source of truth.
+- Atomic active-count reservation alone was not sufficient. A later opener
+  could select the same slot and overtake an idle-exclusive opener waiting to
+  reconnect/clone under the slot mutex. A per-slot RAII preparation gate must
+  stay held through the clone and wake waiters on every exit path.
+- Reusable rule: concurrency review must model side-effect ordering and lock
+  acquisition reordering, not only counter conservation. Separate persistent
+  ownership from short-lived preparation authority and test both.
+- Implementation: `c945a41`. Result:
+  `docs/tech/2026-07-15-knife15-macos-m0-directpass-pool-parity-results.md`.
+
 ## 2026-07-15 - Match the control duration and receiver boundary to the failed SLI
 
 - A 20-second direct baseline correctly sized M0 at 50%, but could not
