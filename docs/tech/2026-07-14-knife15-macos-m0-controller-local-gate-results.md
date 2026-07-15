@@ -1,8 +1,7 @@
 # Knife15 macOS M0 Controller Local Gate Results
 
 Date: 2026-07-14
-Status: **LOCAL PASS — formal controller ready for user-executed M0; no new
-real TUN or two-hour run executed**
+Status: **RECEIVER-EVIDENCE SEMANTICS REPAIRED; FRESH M0 PENDING**
 
 ## Goal And Boundary
 
@@ -45,9 +44,12 @@ DNS checks, one explicit idle/resume proof, and one final drain proof.
 - Formal `m0` rejects duration overrides; compressed schedules exist only in
   self-tests.
 - Every iperf JSON must have the expected protocol, positive sender/receiver
-  byte evidence, a positive receiver rate, and no zero interval. UDP also
-  requires a numeric loss field. A command exit code of zero alone is
-  insufficient.
+  byte evidence, and structured evidence from both endpoints. Forward phases
+  validate Target receiver intervals; reverse phases validate local receiver
+  intervals. Receiver intervals must all be positive. Sender intervals remain
+  numeric diagnostics: a zero is counted and requires final review but does
+  not erase continuous receiver delivery. UDP also requires a numeric loss
+  field. A command exit code of zero alone is insufficient.
 - Every DNS epoch must return an address in fake-IP `198.18.0.0/15`.
 - The identity-verified controller tracks its current traffic, idle, or final-
   drain child. It checks mini_vpn liveness, target-to-utun routing, and Exit

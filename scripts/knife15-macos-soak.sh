@@ -520,24 +520,49 @@ m0_result_envelope() {
   local m0_dir="$1"
   local result_file
   if [[ ! -d "$m0_dir" ]]; then
-    echo "0 0 unknown unknown 0"
+    echo "0 0 unknown unknown 0 0 0"
     return 0
   fi
   {
     for result_file in "$m0_dir"/*.json; do
       [[ -f "$result_file" ]] || continue
       if ! jq -er '
-        .end.sum_sent.bytes as $sent
-        | .end.sum_received.bytes as $received
+        . as $root
+        | $root.end.sum_sent.bytes as $sent
+        | $root.end.sum_received.bytes as $received
         | ($sent - $received | if . < 0 then -. else . end) as $gap
+        | $root.start.test_start.reverse as $reverse
+        | (if $reverse == 0 then $root else $root.server_output_json end) as $sender
+        | (if $reverse == 0 then $root.server_output_json else $root end) as $receiver
+        | if (($sender | type) != "object"
+            or ($receiver | type) != "object"
+            or ($sender.intervals | type) != "array"
+            or ($receiver.intervals | type) != "array"
+            or (all($sender.intervals[];
+              (.sum.bits_per_second | type) == "number"
+              and .sum.bits_per_second >= 0) | not)
+            or (all($receiver.intervals[];
+              (.sum.bits_per_second | type) == "number"
+              and .sum.bits_per_second >= 0) | not))
+          then error("missing directional interval evidence") else . end
+        | [$sender.intervals[]
+            | select((.sum.bits_per_second | type) == "number"
+              and .sum.bits_per_second <= 0)]
+          | length as $sender_zero
+        | [$receiver.intervals[]
+            | select((.sum.bits_per_second | type) == "number"
+              and .sum.bits_per_second <= 0)]
+          | length as $receiver_zero
         | [
-            .start.test_start.protocol,
+            $root.start.test_start.protocol,
             $gap,
-            (.end.sum.lost_percent // .end.sum_received.lost_percent // -1)
+            ($root.end.sum.lost_percent // $root.end.sum_received.lost_percent // -1),
+            $sender_zero,
+            $receiver_zero
           ]
         | @tsv
       ' "$result_file" 2>/dev/null; then
-        echo $'INVALID\t0\t-1'
+        echo $'INVALID\t0\t-1\t0\t0'
       fi
     done
   } | awk -F '\t' '
@@ -554,11 +579,16 @@ m0_result_envelope() {
         have_udp_loss = 1
       }
     }
+    $1 == "TCP" || $1 == "UDP" {
+      sender_zero += $4 + 0
+      receiver_zero += $5 + 0
+    }
     $1 == "INVALID" { invalid++ }
     END {
       tcp_gap = tcp > 0 ? max_tcp_gap : "unknown"
       udp_loss = have_udp_loss ? sprintf("%.6f", max_udp_loss) : "unknown"
-      printf "%d %d %s %s %d\n", tcp + 0, udp + 0, tcp_gap, udp_loss, invalid + 0
+      printf "%d %d %s %s %d %d %d\n", tcp + 0, udp + 0, tcp_gap,
+        udp_loss, invalid + 0, sender_zero + 0, receiver_zero + 0
     }
   '
 }
@@ -615,13 +645,23 @@ validate_m0_baseline_pair() {
 validate_m0_iperf_result() {
   local json_file="$1"
   local protocol="$2"
-  jq -e --arg protocol "$protocol" '
+  local reverse="$3"
+  jq -e --arg protocol "$protocol" --argjson reverse "$reverse" '
     ((.error? // "") == "")
     and (.start.test_start.protocol == $protocol)
+    and (.start.test_start.reverse == $reverse)
     and ((.intervals | type) == "array" and (.intervals | length) > 0)
     and all(.intervals[];
       .sum.bits_per_second as $bps
-      | (($bps | type) == "number" and $bps > 0))
+      | (($bps | type) == "number" and $bps >= 0))
+    and ((.server_output_json | type) == "object")
+    and (.server_output_json.start.test_start.protocol == $protocol)
+    and (.server_output_json.start.test_start.reverse == $reverse)
+    and ((.server_output_json.intervals | type) == "array"
+      and (.server_output_json.intervals | length) > 0)
+    and all(.server_output_json.intervals[];
+      .sum.bits_per_second as $bps
+      | (($bps | type) == "number" and $bps >= 0))
     and (.end.sum_received.bits_per_second as $bps
       | (($bps | type) == "number" and $bps > 0))
     and (.end.sum_sent.bytes as $bytes
@@ -632,7 +672,50 @@ validate_m0_iperf_result() {
       ((.end.sum.lost_percent // .end.sum_received.lost_percent) as $loss
         | (($loss | type) == "number" and $loss >= 0 and $loss <= 100))
     else true end)
+    and ((if $reverse == 0 then .server_output_json else . end) as $receiver
+      | (($receiver | type) == "object")
+      and ($receiver.start.test_start.protocol == $protocol)
+      and ($receiver.start.test_start.reverse == $reverse)
+      and (($receiver.intervals | type) == "array"
+        and ($receiver.intervals | length) > 0)
+      and all($receiver.intervals[];
+        .sum.bits_per_second as $bps
+        | (($bps | type) == "number" and $bps > 0))
+      and ($receiver.end.sum_received.bits_per_second as $bps
+        | (($bps | type) == "number" and $bps > 0))
+      and ($receiver.end.sum_received.bytes as $bytes
+        | (($bytes | type) == "number" and $bytes > 0)))
   ' "$json_file" >/dev/null 2>&1
+}
+
+m0_iperf_result_failure_reason() {
+  local json_file="$1"
+  local protocol="$2"
+  local reverse="$3"
+  if validate_m0_iperf_result "$json_file" "$protocol" "$reverse"; then
+    echo ok
+    return 0
+  fi
+  if ! jq -e '(.server_output_json | type) == "object"' \
+    "$json_file" >/dev/null 2>&1; then
+    if [[ "$reverse" == "0" ]]; then
+      echo missing_receiver_evidence
+    else
+      echo missing_sender_evidence
+    fi
+    return 0
+  fi
+  if jq -e --argjson reverse "$reverse" '
+    (if $reverse == 0 then .server_output_json else . end) as $receiver
+    | (($receiver.intervals | type) == "array")
+      and any($receiver.intervals[];
+        (.sum.bits_per_second | type) == "number"
+        and .sum.bits_per_second <= 0)
+  ' "$json_file" >/dev/null 2>&1; then
+    echo receiver_zero_interval
+    return 0
+  fi
+  echo invalid_iperf_result
 }
 
 validate_target_ready_result() {
@@ -653,6 +736,19 @@ validate_target_ready_result() {
       | (($bytes | type) == "number" and $bytes > 0))
     and (.end.sum_received.bits_per_second as $bps
       | (($bps | type) == "number" and $bps > 0))
+    and ((.server_output_json // null) as $receiver
+      | (($receiver | type) == "object")
+      and ($receiver.start.test_start.protocol == "TCP")
+      and ($receiver.start.test_start.reverse == 0)
+      and (($receiver.intervals | type) == "array"
+        and ($receiver.intervals | length) > 0)
+      and all($receiver.intervals[];
+        .sum.bits_per_second as $bps
+        | (($bps | type) == "number" and $bps > 0))
+      and ($receiver.end.sum_received.bytes as $bytes
+        | (($bytes | type) == "number" and $bytes > 0))
+      and ($receiver.end.sum_received.bits_per_second as $bps
+        | (($bps | type) == "number" and $bps > 0)))
   ' "$json_file" >/dev/null 2>&1
 }
 
@@ -660,11 +756,12 @@ target_ready_probe() {
   local result_file
   require_command iperf3
   require_command jq
-  result_file="$(mktemp "${TMPDIR:-/tmp}/mini_vpn_knife15_target_ready.XXXXXX.json")" || \
+  result_file="$(mktemp "${TMPDIR:-/tmp}/mini_vpn_knife15_target_ready.XXXXXX")" || \
     die "cannot create Target readiness result file"
   echo "Checking that Target can complete a fresh direct iperf3 transaction..."
   if ! run_logged "$result_file" \
-    iperf3 -c "$TARGET" -p "$IPERF_PORT" -t 1 -P 1 --connect-timeout 5000 --json; then
+    iperf3 -c "$TARGET" -p "$IPERF_PORT" -t 1 -P 1 --connect-timeout 5000 \
+      --json --get-server-output; then
     rm -f "$result_file"
     die "Target readiness command failed; wait for $TARGET:$IPERF_PORT to recover before start"
   fi
@@ -673,7 +770,8 @@ target_ready_probe() {
     die "Target is busy or could not complete a positive direct transaction; do not rearm yet"
   fi
   TARGET_READY_UTC="$(timestamp)"
-  TARGET_READY_RECEIVER_BPS="$(jq -er '.end.sum_received.bits_per_second | floor' "$result_file")" || {
+  TARGET_READY_RECEIVER_BPS="$(jq -er \
+    '.server_output_json.end.sum_received.bits_per_second | floor' "$result_file")" || {
     rm -f "$result_file"
     die "cannot record Target readiness receiver rate"
   }
@@ -786,10 +884,13 @@ runner_self_test() {
   ! validate_m0_baseline_pair "$baseline_dir" 43.130.32.78 || \
     die "self-test: M0 baseline for another target accepted"
   target_ready_json="$tmp/target-ready.json"
-  printf '%s\n' '{"start":{"connecting_to":{"host":"43.130.32.77"},"test_start":{"protocol":"TCP","reverse":0}},"intervals":[{"sum":{"bits_per_second":1}}],"end":{"sum_sent":{"bytes":100},"sum_received":{"bytes":100,"bits_per_second":1}}}' \
+  printf '%s\n' '{"start":{"connecting_to":{"host":"43.130.32.77"},"test_start":{"protocol":"TCP","reverse":0}},"intervals":[{"sum":{"bits_per_second":1}}],"end":{"sum_sent":{"bytes":100},"sum_received":{"bytes":100,"bits_per_second":1}},"server_output_json":{"start":{"test_start":{"protocol":"TCP","reverse":0}},"intervals":[{"sum":{"bits_per_second":1}}],"end":{"sum_received":{"bytes":100,"bits_per_second":1}}}}' \
     >"$target_ready_json"
   validate_target_ready_result "$target_ready_json" 43.130.32.77 || \
     die "self-test: healthy Target readiness transaction rejected"
+  jq 'del(.server_output_json)' "$target_ready_json" >"$target_ready_json.without-server"
+  ! validate_target_ready_result "$target_ready_json.without-server" 43.130.32.77 || \
+    die "self-test: Target without JSON receiver evidence was accepted"
   printf '%s\n' '{"error":"the server is busy running a test. try again later"}' \
     >"$target_ready_json"
   ! validate_target_ready_result "$target_ready_json" 43.130.32.77 || \
@@ -837,10 +938,12 @@ printf 'iperf3' >>"$M0_TEST_COMMAND_LOG"
 printf ' %s' "$@" >>"$M0_TEST_COMMAND_LOG"
 printf '\n' >>"$M0_TEST_COMMAND_LOG"
 protocol=TCP
+reverse=0
 for arg in "$@"; do
   [[ "$arg" == "-u" ]] && protocol=UDP
+  [[ "$arg" == "-R" ]] && reverse=1
 done
-printf '%s\n' "{\"start\":{\"test_start\":{\"protocol\":\"$protocol\"}},\"intervals\":[{\"sum\":{\"bits_per_second\":1}}],\"end\":{\"sum_sent\":{\"bytes\":100},\"sum_received\":{\"bytes\":90,\"bits_per_second\":1},\"sum\":{\"lost_percent\":1.25}}}"
+printf '%s\n' "{\"start\":{\"test_start\":{\"protocol\":\"$protocol\",\"reverse\":$reverse}},\"intervals\":[{\"sum\":{\"bits_per_second\":1}}],\"end\":{\"sum_sent\":{\"bytes\":100},\"sum_received\":{\"bytes\":90,\"bits_per_second\":1},\"sum\":{\"lost_percent\":1.25}},\"server_output_json\":{\"start\":{\"test_start\":{\"protocol\":\"$protocol\",\"reverse\":$reverse}},\"intervals\":[{\"sum\":{\"bits_per_second\":1}}],\"end\":{\"sum_received\":{\"bytes\":90,\"bits_per_second\":1}}}}"
 EOF_FAKE_IPERF
   cat >"$fake_dig" <<'EOF_FAKE_DIG'
 #!/usr/bin/env bash
@@ -864,15 +967,15 @@ EOF_FAKE_SLEEP
     die "self-test: M0 idle child was not tracked through the logged runner"
   [[ -f "$m0_run/m0/final-drain.sleep.log" ]] || \
     die "self-test: M0 final-drain child was not tracked through the logged runner"
-  grep -Fq 'iperf3 -c 43.130.32.77 -p 5201 -t 2 -P 1 -b 4522378 --json' \
+  grep -Fq 'iperf3 -c 43.130.32.77 -p 5201 -t 2 -P 1 -b 4522378 --json --get-server-output' \
     "$M0_TEST_COMMAND_LOG" || \
-    die "self-test: M0 sustained forward TCP command mismatch"
-  grep -Fq 'iperf3 -c 43.130.32.77 -p 5201 -t 2 -P 1 -b 13395070 -R --json' \
+    die "self-test: M0 forward TCP did not request receiver evidence"
+  grep -Fq 'iperf3 -c 43.130.32.77 -p 5201 -t 2 -P 1 -b 13395070 -R --json --get-server-output' \
     "$M0_TEST_COMMAND_LOG" || \
     die "self-test: M0 sustained reverse TCP command mismatch"
-  grep -Fq 'iperf3 -c 43.130.32.77 -p 5201 -t 1 -P 1 -b 13395070 -u -l 1160 -R --json' \
+  grep -Fq 'iperf3 -c 43.130.32.77 -p 5201 -t 1 -P 1 -b 13395070 -u -l 1160 -R --json --get-server-output' \
     "$M0_TEST_COMMAND_LOG" || die "self-test: M0 reverse UDP command mismatch"
-  grep -Fq 'iperf3 -c 43.130.32.77 -p 5201 -t 1 -P 1 -b 7235805 --json' \
+  grep -Fq 'iperf3 -c 43.130.32.77 -p 5201 -t 1 -P 1 -b 7235805 --json --get-server-output' \
     "$M0_TEST_COMMAND_LOG" || \
     die "self-test: M0 short forward burst command mismatch"
   grep -Fq 'dig @8.8.8.8 example.com A +time=5 +tries=1' "$M0_TEST_COMMAND_LOG" || \
@@ -933,6 +1036,38 @@ EOF_FAKE_SLEEP
     die "self-test: M0 completed phase count mismatch"
   grep -Fq -- '- m0_result_evidence: PASS' "$m0_run/summary.md" || \
     die "self-test: complete M0 result evidence was not accepted"
+  jq '.intervals[0].sum.bits_per_second = 0' \
+    "$m0_run/m0/cycle_001_tcp-forward.json" \
+    >"$m0_run/m0/cycle_001_tcp-forward.json.tmp"
+  mv "$m0_run/m0/cycle_001_tcp-forward.json.tmp" \
+    "$m0_run/m0/cycle_001_tcp-forward.json"
+  write_summary "$m0_run"
+  grep -Fq -- '- m0_sender_zero_intervals: 1' "$m0_run/summary.md" || \
+    die "self-test: bounded sender stall was not preserved as diagnostic evidence"
+  grep -Fq -- '- m0_receiver_zero_intervals: 0' "$m0_run/summary.md" || \
+    die "self-test: continuous receiver was misclassified as stalled"
+  grep -Fq -- '- m0_result_evidence: PASS' "$m0_run/summary.md" || \
+    die "self-test: sender-only stall invalidated continuous receiver evidence"
+  jq '.server_output_json.intervals[0].sum.bits_per_second = 0' \
+    "$m0_run/m0/cycle_001_tcp-forward.json" \
+    >"$m0_run/m0/cycle_001_tcp-forward.json.tmp"
+  mv "$m0_run/m0/cycle_001_tcp-forward.json.tmp" \
+    "$m0_run/m0/cycle_001_tcp-forward.json"
+  write_summary "$m0_run"
+  grep -Fq -- '- m0_receiver_zero_intervals: 1' "$m0_run/summary.md" || \
+    die "self-test: receiver stall was not preserved as acceptance evidence"
+  grep -Fq -- '- m0_result_evidence: MISMATCH' "$m0_run/summary.md" || \
+    die "self-test: receiver stall did not fail closed in final summary"
+  grep -Fq -- '- internal_failure_scan: REVIEW' "$m0_run/summary.md" || \
+    die "self-test: receiver stall did not require final review"
+  jq '.server_output_json.intervals[0].sum.bits_per_second = 1' \
+    "$m0_run/m0/cycle_001_tcp-forward.json" \
+    >"$m0_run/m0/cycle_001_tcp-forward.json.tmp"
+  mv "$m0_run/m0/cycle_001_tcp-forward.json.tmp" \
+    "$m0_run/m0/cycle_001_tcp-forward.json"
+  write_summary "$m0_run"
+  grep -Fq -- '- m0_result_evidence: PASS' "$m0_run/summary.md" || \
+    die "self-test: restored receiver evidence did not return summary to PASS"
   grep -Fq -- '- m0_dns_result_files: 2' "$m0_run/summary.md" || \
     die "self-test: M0 DNS result count mismatch"
   grep -Fq -- '- m0_dns_evidence: PASS' "$m0_run/summary.md" || \
@@ -979,8 +1114,25 @@ EOF_FAKE_SLEEP
   printf '%s\n' \
     '{"start":{"test_start":{"protocol":"TCP"}},"intervals":[{"sum":{"bits_per_second":1}}],"end":{"sum_received":{"bits_per_second":1}}}' \
     >"$tmp/m0-positive-rate-missing-bytes.json"
-  ! validate_m0_iperf_result "$tmp/m0-positive-rate-missing-bytes.json" TCP || \
+  ! validate_m0_iperf_result "$tmp/m0-positive-rate-missing-bytes.json" TCP 0 || \
     die "self-test: M0 result missing sender/receiver byte evidence was accepted"
+
+  printf '%s\n' \
+    '{"start":{"test_start":{"protocol":"TCP","reverse":0}},"intervals":[{"sum":{"bits_per_second":0}}],"end":{"sum_sent":{"bytes":100},"sum_received":{"bytes":100,"bits_per_second":1}},"server_output_json":{"start":{"test_start":{"protocol":"TCP","reverse":0}},"intervals":[{"sum":{"bits_per_second":1}}],"end":{"sum_received":{"bytes":100,"bits_per_second":1}}}}' \
+    >"$tmp/m0-forward-receiver-continuous.json"
+  validate_m0_iperf_result "$tmp/m0-forward-receiver-continuous.json" TCP 0 || \
+    die "self-test: continuous forward receiver was rejected because sender stalled"
+  jq '.server_output_json.intervals[0].sum.bits_per_second = 0' \
+    "$tmp/m0-forward-receiver-continuous.json" \
+    >"$tmp/m0-forward-receiver-stalled.json"
+  [[ "$(m0_iperf_result_failure_reason \
+    "$tmp/m0-forward-receiver-stalled.json" TCP 0)" == "receiver_zero_interval" ]] || \
+    die "self-test: zero forward receiver interval was not classified"
+  jq 'del(.server_output_json)' "$tmp/m0-forward-receiver-continuous.json" \
+    >"$tmp/m0-forward-missing-receiver.json"
+  [[ "$(m0_iperf_result_failure_reason \
+    "$tmp/m0-forward-missing-receiver.json" TCP 0)" == "missing_receiver_evidence" ]] || \
+    die "self-test: missing forward receiver evidence was not classified"
 
   m0_fail_run="$tmp/m0-fail-run"
   mkdir -p "$m0_fail_run/m0"
@@ -1763,7 +1915,7 @@ run_m0_iperf_phase() {
   local rate_bps="$7"
   local reverse="$8"
   local udp="$9"
-  local output_file
+  local output_file validation_reason
   output_file="$run_dir/m0/cycle_$(printf '%03d' "$cycle")_${phase}.json"
   m0_assert_run_healthy "$run_dir" || return 1
   append_event_to "$run_dir" \
@@ -1771,24 +1923,26 @@ run_m0_iperf_phase() {
   m0_progress "M0 cycle=$cycle phase=$phase duration=${duration}s rate_bps=$rate_bps start"
   if [[ "$udp" == "1" && "$reverse" == "1" ]]; then
     run_m0_logged "$output_file" "$M0_IPERF3_BIN" -c "$target" -p "$iperf_port" \
-      -t "$duration" -P 1 -b "$rate_bps" -u -l 1160 -R --json
+      -t "$duration" -P 1 -b "$rate_bps" -u -l 1160 -R --json --get-server-output
   elif [[ "$udp" == "1" ]]; then
     run_m0_logged "$output_file" "$M0_IPERF3_BIN" -c "$target" -p "$iperf_port" \
-      -t "$duration" -P 1 -b "$rate_bps" -u -l 1160 --json
+      -t "$duration" -P 1 -b "$rate_bps" -u -l 1160 --json --get-server-output
   elif [[ "$reverse" == "1" ]]; then
     run_m0_logged "$output_file" "$M0_IPERF3_BIN" -c "$target" -p "$iperf_port" \
-      -t "$duration" -P 1 -b "$rate_bps" -R --json
+      -t "$duration" -P 1 -b "$rate_bps" -R --json --get-server-output
   else
     run_m0_logged "$output_file" "$M0_IPERF3_BIN" -c "$target" -p "$iperf_port" \
-      -t "$duration" -P 1 -b "$rate_bps" --json
+      -t "$duration" -P 1 -b "$rate_bps" --json --get-server-output
   fi || {
     append_event_to "$run_dir" "m0 phase failed cycle=$cycle phase=$phase"
     return 1
   }
   m0_assert_run_healthy "$run_dir" || return 1
-  if ! validate_m0_iperf_result "$output_file" "$([[ "$udp" == "1" ]] && echo UDP || echo TCP)"; then
+  validation_reason="$(m0_iperf_result_failure_reason \
+    "$output_file" "$([[ "$udp" == "1" ]] && echo UDP || echo TCP)" "$reverse")"
+  if [[ "$validation_reason" != "ok" ]]; then
     append_event_to "$run_dir" \
-      "m0 phase failed cycle=$cycle phase=$phase reason=invalid_iperf_result"
+      "m0 phase failed cycle=$cycle phase=$phase reason=$validation_reason"
     return 1
   fi
   append_event_to "$run_dir" "m0 phase complete cycle=$cycle phase=$phase"
@@ -2153,6 +2307,7 @@ write_summary() {
   local endpoint_samples_count endpoint_conservation_max endpoint_last_available endpoint_last_live
   local endpoint_last_outstanding endpoint_max_live endpoint_max_outstanding
   local m0_tcp_results m0_udp_results m0_tcp_max_gap m0_udp_max_loss m0_invalid_results
+  local m0_sender_zero_intervals m0_receiver_zero_intervals
   local m0_phase_results m0_result_evidence
   local m0_dns_result_files m0_invalid_dns_results m0_dns_evidence m0_timeline_evidence
   if conservation_check_file "$log_file"; then
@@ -2189,6 +2344,7 @@ write_summary() {
     endpoint_last_live endpoint_last_outstanding endpoint_max_live endpoint_max_outstanding \
     <<<"$(endpoint_resource_envelope "$log_file")"
   read -r m0_tcp_results m0_udp_results m0_tcp_max_gap m0_udp_max_loss m0_invalid_results \
+    m0_sender_zero_intervals m0_receiver_zero_intervals \
     <<<"$(m0_result_envelope "$run_dir/m0")"
   read -r m0_dns_result_files m0_invalid_dns_results \
     <<<"$(m0_dns_result_envelope "$run_dir/m0")"
@@ -2198,7 +2354,8 @@ write_summary() {
   if [[ "$m0_status" == "complete" ]]; then
     if ((10#$m0_phase_results > 0 && \
       10#$m0_phase_results == 10#$m0_tcp_results + 10#$m0_udp_results && \
-      10#$m0_invalid_results == 0)); then
+      10#$m0_invalid_results == 0 && \
+      10#$m0_receiver_zero_intervals == 0)); then
       m0_result_evidence=PASS
     else
       m0_result_evidence=MISMATCH
@@ -2226,6 +2383,10 @@ write_summary() {
     [[ "$m0_timeline_evidence" == "MISMATCH" ]] || \
     { [[ "$log_compactions" =~ ^[0-9]+$ ]] && ((10#$log_compactions > 0)); } || \
     { [[ "$m0_invalid_results" =~ ^[0-9]+$ ]] && ((10#$m0_invalid_results > 0)); } || \
+    { [[ "$m0_sender_zero_intervals" =~ ^[0-9]+$ ]] && \
+    ((10#$m0_sender_zero_intervals > 0)); } || \
+    { [[ "$m0_receiver_zero_intervals" =~ ^[0-9]+$ ]] && \
+    ((10#$m0_receiver_zero_intervals > 0)); } || \
     { [[ "$interface_error_samples" =~ ^[0-9]+$ ]] && \
     ((10#$interface_error_samples > 0)); } || \
     grep -Eq 'pump_full_waits=[1-9][0-9]*|pump_read_errors=[1-9][0-9]*|tun_flush_tx_failures=[1-9][0-9]*|terminal_pending_reap_bytes=[1-9][0-9]*|写入上游流失败|reason=remote_write_failed|reason=stalled_write_timeout|reason=idle_timeout' "$log_file"; then
@@ -2260,6 +2421,8 @@ write_summary() {
 - m0_tcp_max_sender_receiver_gap_bytes: ${m0_tcp_max_gap:-unknown}
 - m0_udp_max_loss_percent: ${m0_udp_max_loss:-unknown}
 - m0_invalid_result_files: ${m0_invalid_results:-0}
+- m0_sender_zero_intervals: ${m0_sender_zero_intervals:-0}
+- m0_receiver_zero_intervals: ${m0_receiver_zero_intervals:-0}
 - process_numeric_samples: ${process_numeric_samples:-0}
 - rss_kib_first_last_max_delta: ${rss_first:-unknown}/${rss_last:-unknown}/${rss_max:-unknown}/${rss_delta:-unknown}
 - fd_first_last_max_delta: ${fd_first:-unknown}/${fd_last:-unknown}/${fd_max:-unknown}/${fd_delta:-unknown}

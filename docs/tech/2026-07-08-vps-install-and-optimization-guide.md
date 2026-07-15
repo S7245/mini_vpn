@@ -197,6 +197,33 @@ systemctl is-active iperf3
 ss -ltnp | grep ':5201'
 ```
 
+Knife15 macOS receiver-quality evidence also requires structured server
+output. Use a systemd drop-in on the dedicated acceptance Target:
+
+```bash
+sudo mkdir -p /etc/systemd/system/iperf3.service.d
+sudo tee /etc/systemd/system/iperf3.service.d/20-mini-vpn-json-output.conf >/dev/null <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/iperf3 -s --json --forceflush
+EOF
+sudo systemctl daemon-reload
+sudo systemctl restart iperf3
+systemctl is-active iperf3
+ss -ltnp | grep ':5201'
+```
+
+Qualify the capability from a client with
+`iperf3 ... --json --get-server-output` and require
+`.server_output_json` to be an object with positive receiver intervals. To
+roll this Target-only evidence change back:
+
+```bash
+sudo rm -f /etc/systemd/system/iperf3.service.d/20-mini-vpn-json-output.conf
+sudo systemctl daemon-reload
+sudo systemctl restart iperf3
+```
+
 Direct path baseline from the exit to the target must be higher than the tunnel
 goal before mini_vpn is blamed:
 

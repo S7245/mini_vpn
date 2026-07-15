@@ -29,6 +29,9 @@ install a default route or change system DNS.
   `utun` interface. The runner refuses a recursive setup.
 - Keep the Mac awake, connected to power, and on a stable network for the
   formal two-hour workload below.
+- The Target iperf3 service must run with JSON output enabled. The current
+  `.77` service is qualified with `iperf3 -s --json --forceflush`; `start`
+  verifies the structured receiver result before changing routes.
 
 ## 1. Build And Export Local Configuration
 
@@ -102,11 +105,11 @@ sudo -E bash scripts/knife15-macos-soak.sh stop
 
 `start` must report the new `utun`, target route, non-recursive Exit route,
 and evidence directory. Before it changes any route or starts mini_vpn, it now
-requires a fresh one-second direct Target transaction to complete. A Target
-that is still busy cleaning up an earlier failed iperf session blocks rearm
-without changing local state. `smoke` rechecks forward TCP, reverse TCP, and
-fake-IP DNS before the expensive run. `m0` takes approximately two hours plus
-command setup overhead and keeps the Mac awake through `caffeinate`.
+requires a fresh one-second direct Target transaction with structured JSON
+receiver evidence to complete. A busy or incorrectly configured Target blocks
+rearm without changing local state. `smoke` rechecks forward TCP, reverse TCP,
+and fake-IP DNS before the expensive run. `m0` takes approximately two hours
+plus command setup overhead and keeps the Mac awake through `caffeinate`.
 
 The frozen M0 timeline contains `6,780s` of active work, one `300s` idle-drain
 window, and one `120s` final drain. Each full cycle contains capped forward and
@@ -115,7 +118,10 @@ short TCP connections, and fake-IP DNS. The controller validates every iperf
 JSON interval, byte evidence, UDP loss field, and DNS answer. It identity-
 tracks traffic, idle, and final-drain children, checks process/target/Exit and
 lossless-log health at least every two seconds, and records an independently
-verified idle/resume/final-drain timeline.
+verified idle/resume/final-drain timeline. Forward quality is judged from the
+Target receiver intervals returned in `server_output_json`; reverse quality is
+judged from the local receiver intervals. Sender-only zero intervals remain
+visible in the summary and trigger review without prematurely ending M0.
 
 On a successful M0, run `status` and then `stop`; no manual `snapshot` is
 needed. `stop` first terminates any identity-verified M0 controller, then terminates
