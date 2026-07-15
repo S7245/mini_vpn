@@ -30,6 +30,8 @@ MAX_LOG_BYTES="${MAX_LOG_BYTES:-268435456}"
 LOG_KEEP_BYTES="${LOG_KEEP_BYTES:-134217728}"
 MIN_FREE_KB="${MIN_FREE_KB:-1048576}"
 M0_BASELINE_DIR="${M0_BASELINE_DIR:-}"
+M0_DIRECT_DIR="${M0_DIRECT_DIR:-}"
+M0_DIRECT_MAX_AGE_SECS=900
 M0_TOTAL_SECS="${M0_TOTAL_SECS:-7200}"
 M0_TCP_SECS="${M0_TCP_SECS:-300}"
 M0_UDP_SECS="${M0_UDP_SECS:-180}"
@@ -45,6 +47,7 @@ SERVER_HOST=""
 SERVER_PORT=""
 TARGET_READY_UTC=""
 TARGET_READY_RECEIVER_BPS=""
+DIRECT_CONTINUITY_REASON=not_run
 
 ACTION="${1:---help}"
 
@@ -60,6 +63,7 @@ Usage:
   bash scripts/knife15-macos-soak.sh --self-test
   bash scripts/knife15-macos-soak.sh preflight
   bash scripts/knife15-macos-soak.sh baseline
+  bash scripts/knife15-macos-soak.sh direct-discriminator
   sudo -E bash scripts/knife15-macos-soak.sh start
   sudo -E bash scripts/knife15-macos-soak.sh status
   sudo -E bash scripts/knife15-macos-soak.sh event "label"
@@ -85,6 +89,7 @@ Important optional environment:
   DURATION=20 PARALLEL=1 IPERF_PORT=5201
   METRICS_SECS=30 SAMPLE_SECS=30
   M0_BASELINE_DIR=/tmp/mini_vpn_knife15_macos_baseline_REPLACE_WITH_TIMESTAMP
+  M0_DIRECT_DIR=/tmp/mini_vpn_knife15_macos_direct_REPLACE_WITH_TIMESTAMP
 
 Workflow:
   1. cargo build --release
@@ -92,13 +97,15 @@ Workflow:
   3. bash scripts/knife15-macos-soak.sh --self-test
   4. bash scripts/knife15-macos-soak.sh preflight
   5. bash scripts/knife15-macos-soak.sh baseline
-  6. sudo -v
-  7. sudo -E bash scripts/knife15-macos-soak.sh start
-  8. sudo -E bash scripts/knife15-macos-soak.sh smoke
-  9. export M0_BASELINE_DIR='REPLACE_WITH_BASELINE_DIRECTORY_FROM_STEP_5'
- 10. sudo -E bash scripts/knife15-macos-soak.sh m0
- 11. sudo -E bash scripts/knife15-macos-soak.sh status
- 12. sudo -E bash scripts/knife15-macos-soak.sh stop
+  6. export M0_BASELINE_DIR='REPLACE_WITH_BASELINE_DIRECTORY_FROM_STEP_5'
+  7. bash scripts/knife15-macos-soak.sh direct-discriminator
+  8. export M0_DIRECT_DIR='REPLACE_WITH_DIRECT_DIRECTORY_FROM_STEP_7'
+  9. sudo -v
+ 10. sudo -E bash scripts/knife15-macos-soak.sh start
+ 11. sudo -E bash scripts/knife15-macos-soak.sh smoke
+ 12. sudo -E bash scripts/knife15-macos-soak.sh m0
+ 13. sudo -E bash scripts/knife15-macos-soak.sh status
+ 14. sudo -E bash scripts/knife15-macos-soak.sh stop
 
 The background watchdog samples process/utun state and removes only the host
 routes owned by this run if mini_vpn exits. start proves Target readiness
@@ -175,6 +182,11 @@ validate_run_dir_path() {
 validate_baseline_dir_path() {
   local value="${1:-}"
   [[ "$value" =~ ^/tmp/mini_vpn_knife15_macos_baseline_[A-Za-z0-9._-]+$ ]]
+}
+
+validate_direct_dir_path() {
+  local value="${1:-}"
+  [[ "$value" =~ ^/tmp/mini_vpn_knife15_macos_direct_[A-Za-z0-9._-]+$ ]]
 }
 
 parse_server() {
@@ -781,7 +793,8 @@ m0_dns_result_envelope() {
 baseline_receiver_bps() {
   local json_file="$1"
   jq -er '
-    .end.sum_received.bits_per_second
+    (if .start.test_start.reverse == 0 then .server_output_json else . end)
+    | .end.sum_received.bits_per_second
     | if type == "number" and . > 0 then floor else error("invalid receiver rate") end
   ' "$json_file" 2>/dev/null
 }
@@ -797,11 +810,17 @@ validate_m0_baseline_file() {
     and (.start.test_start.protocol == "TCP")
     and (.start.test_start.reverse == $reverse)
     and ((.intervals | type) == "array" and (.intervals | length) > 0)
-    and all(.intervals[];
-      .sum.bits_per_second as $bps
-      | (($bps | type) == "number" and $bps > 0))
-    and (.end.sum_received.bits_per_second as $bps
-      | (($bps | type) == "number" and $bps > 0))
+    and ((.server_output_json | type) == "object")
+    and (.server_output_json.start.test_start.protocol == "TCP")
+    and (.server_output_json.start.test_start.reverse == $reverse)
+    and ((if $reverse == 0 then .server_output_json else . end) as $receiver
+      | (($receiver.intervals | type) == "array"
+        and ($receiver.intervals | length) > 0)
+      and all($receiver.intervals[];
+        .sum.bits_per_second as $bps
+        | (($bps | type) == "number" and $bps > 0))
+      and ($receiver.end.sum_received.bits_per_second as $bps
+        | (($bps | type) == "number" and $bps > 0)))
   ' "$json_file" >/dev/null 2>&1
 }
 
@@ -810,6 +829,65 @@ validate_m0_baseline_pair() {
   local target="$2"
   validate_m0_baseline_file "$baseline_dir/direct-forward.json" "$target" 0 &&
     validate_m0_baseline_file "$baseline_dir/direct-reverse.json" "$target" 1
+}
+
+validate_direct_continuity_result() {
+  local result="$1"
+  local target="$2"
+  jq -e --arg target "$target" '
+    (.start.connecting_to.host == $target)
+    and (.start.test_start.duration == 300)
+    and (.server_output_json.end.sum_received.seconds as $seconds
+      | (($seconds | type) == "number" and $seconds >= 299 and $seconds <= 310))
+    and ([.server_output_json.intervals[]
+      | select((.sum.end - .sum.start) >= 0.5)] | length) >= 300
+  ' "$result" >/dev/null 2>&1 && validate_m0_iperf_result "$result" TCP 0
+}
+
+validate_direct_continuity_dir() {
+  local direct_dir="$1"
+  local baseline_dir="$2"
+  local target="$3"
+  local now_epoch="${4:-$(date +%s)}"
+  local manifest="$direct_dir/manifest.txt"
+  local result="$direct_dir/direct-forward-300s.json"
+  local completed_epoch target_route exit_route forward_bps expected_rate current_source
+
+  [[ -d "$direct_dir" && ! -L "$direct_dir" ]] || return 1
+  [[ -f "$manifest" && ! -L "$manifest" && -f "$result" && ! -L "$result" ]] || \
+    return 1
+  [[ "$(m0_profile_value "$manifest" schema)" == \
+    "knife15-macos-direct-continuity-v1" ]] || return 1
+  [[ "$(m0_profile_value "$manifest" status)" == "pass" ]] || return 1
+  [[ "$(m0_profile_value "$manifest" target)" == "$target" ]] || return 1
+  [[ "$(m0_profile_value "$manifest" baseline_dir)" == "$baseline_dir" ]] || return 1
+  [[ "$(m0_profile_value "$manifest" baseline_forward_sha256)" == \
+    "$(sha256_file "$baseline_dir/direct-forward.json")" ]] || return 1
+  [[ "$(m0_profile_value "$manifest" baseline_reverse_sha256)" == \
+    "$(sha256_file "$baseline_dir/direct-reverse.json")" ]] || return 1
+  [[ "$(m0_profile_value "$manifest" result_sha256)" == \
+    "$(sha256_file "$result")" ]] || return 1
+  [[ "$(m0_profile_value "$manifest" duration_secs)" == "300" ]] || return 1
+  forward_bps="$(baseline_receiver_bps \
+    "$baseline_dir/direct-forward.json")" || return 1
+  [[ "$forward_bps" =~ ^[0-9]+$ ]] || return 1
+  expected_rate=$((10#$forward_bps / 2))
+  [[ "$(m0_profile_value "$manifest" rate_bps)" == "$expected_rate" ]] || return 1
+  current_source="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
+  [[ "$(m0_profile_value "$manifest" source_commit)" == "$current_source" ]] || return 1
+  [[ "$(m0_profile_value "$manifest" runner_sha256)" == \
+    "$(sha256_file "$SCRIPT_PATH")" ]] || return 1
+  [[ "$(m0_profile_value "$manifest" binary_sha256)" == \
+    "$(sha256_file "$BIN")" ]] || return 1
+  completed_epoch="$(m0_profile_value "$manifest" completed_epoch)"
+  [[ "$completed_epoch" =~ ^[0-9]+$ && "$now_epoch" =~ ^[0-9]+$ ]] || return 1
+  ((10#$completed_epoch <= 10#$now_epoch && \
+    10#$now_epoch - 10#$completed_epoch <= M0_DIRECT_MAX_AGE_SECS)) || return 1
+  target_route="$(m0_profile_value "$manifest" target_route)"
+  exit_route="$(m0_profile_value "$manifest" exit_route)"
+  [[ -n "$target_route" && "$target_route" != utun* ]] || return 1
+  [[ -n "$exit_route" && "$exit_route" != utun* ]] || return 1
+  validate_direct_continuity_result "$result" "$target"
 }
 
 validate_m0_iperf_result() {
@@ -994,7 +1072,7 @@ EOF_M0_PROFILE
 }
 
 runner_self_test() {
-  local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir m0_profile m0_run m0_fail_run fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash
+  local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir m0_profile m0_run m0_fail_run direct_dir fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/knife15-macos-self-test.XXXXXX")" || return 1
   good_log="$tmp/good.log"
   bad_log="$tmp/bad.log"
@@ -1039,7 +1117,7 @@ runner_self_test() {
 
   baseline_dir="$tmp/baseline"
   mkdir "$baseline_dir"
-  printf '%s\n' '{"start":{"connecting_to":{"host":"43.130.32.77"},"test_start":{"protocol":"TCP","reverse":0}},"intervals":[{"sum":{"bits_per_second":1}}],"end":{"sum_received":{"bits_per_second":9044757.9}}}' \
+  printf '%s\n' '{"start":{"connecting_to":{"host":"43.130.32.77"},"test_start":{"protocol":"TCP","reverse":0}},"intervals":[{"sum":{"bits_per_second":1}}],"end":{"sum_received":{"bits_per_second":9044757.9}},"server_output_json":{"start":{"test_start":{"protocol":"TCP","reverse":0}},"intervals":[{"sum":{"bits_per_second":1}}],"end":{"sum_received":{"bytes":100,"bits_per_second":9044757.9}}}}' \
     >"$baseline_dir/direct-forward.json"
   [[ "$(baseline_receiver_bps "$baseline_dir/direct-forward.json")" == "9044757" ]] || \
     die "self-test: baseline receiver rate parser mismatch"
@@ -1047,10 +1125,17 @@ runner_self_test() {
     >"$baseline_dir/invalid.json"
   ! baseline_receiver_bps "$baseline_dir/invalid.json" >/dev/null 2>&1 || \
     die "self-test: zero baseline receiver rate accepted"
-  printf '%s\n' '{"start":{"connecting_to":{"host":"43.130.32.77"},"test_start":{"protocol":"TCP","reverse":1}},"intervals":[{"sum":{"bits_per_second":1}}],"end":{"sum_received":{"bits_per_second":26790141.6}}}' \
+  printf '%s\n' '{"start":{"connecting_to":{"host":"43.130.32.77"},"test_start":{"protocol":"TCP","reverse":1}},"intervals":[{"sum":{"bits_per_second":1}}],"end":{"sum_received":{"bytes":100,"bits_per_second":26790141.6}},"server_output_json":{"start":{"test_start":{"protocol":"TCP","reverse":1}},"intervals":[{"sum":{"bits_per_second":1}}],"end":{"sum_received":{"bytes":100,"bits_per_second":26790141.6}}}}' \
     >"$baseline_dir/direct-reverse.json"
   validate_m0_baseline_pair "$baseline_dir" 43.130.32.77 || \
     die "self-test: valid M0 baseline pair rejected"
+  jq '.server_output_json.intervals[0].sum.bits_per_second = 0' \
+    "$baseline_dir/direct-forward.json" >"$baseline_dir/direct-forward.stalled.json"
+  mv "$baseline_dir/direct-forward.json" "$baseline_dir/direct-forward.valid.json"
+  mv "$baseline_dir/direct-forward.stalled.json" "$baseline_dir/direct-forward.json"
+  ! validate_m0_baseline_pair "$baseline_dir" 43.130.32.77 || \
+    die "self-test: forward baseline with a Target receiver zero interval was accepted"
+  mv "$baseline_dir/direct-forward.valid.json" "$baseline_dir/direct-forward.json"
   ! validate_m0_baseline_pair "$baseline_dir" 43.130.32.78 || \
     die "self-test: M0 baseline for another target accepted"
   target_ready_json="$tmp/target-ready.json"
@@ -1109,11 +1194,48 @@ printf ' %s' "$@" >>"$M0_TEST_COMMAND_LOG"
 printf '\n' >>"$M0_TEST_COMMAND_LOG"
 protocol=TCP
 reverse=0
-for arg in "$@"; do
-  [[ "$arg" == "-u" ]] && protocol=UDP
-  [[ "$arg" == "-R" ]] && reverse=1
+duration=1
+target=43.130.32.77
+while (($# > 0)); do
+  case "$1" in
+    -c)
+      target="$2"
+      shift 2
+      ;;
+    -t)
+      duration="$2"
+      shift 2
+      ;;
+    -u)
+      protocol=UDP
+      shift
+      ;;
+    -R)
+      reverse=1
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
 done
-printf '%s\n' "{\"start\":{\"test_start\":{\"protocol\":\"$protocol\",\"reverse\":$reverse}},\"intervals\":[{\"sum\":{\"bits_per_second\":1}}],\"end\":{\"sum_sent\":{\"bytes\":100},\"sum_received\":{\"bytes\":90,\"bits_per_second\":1},\"sum\":{\"lost_percent\":1.25}},\"server_output_json\":{\"start\":{\"test_start\":{\"protocol\":\"$protocol\",\"reverse\":$reverse}},\"intervals\":[{\"sum\":{\"bits_per_second\":1}}],\"end\":{\"sum_received\":{\"bytes\":90,\"bits_per_second\":1}}}}"
+jq -nc --arg target "$target" --arg protocol "$protocol" \
+  --argjson reverse "$reverse" --argjson duration "$duration" '
+  def samples: [range(0; $duration) as $second
+    | {sum: {start: $second, end: ($second + 1), bits_per_second: 1}}];
+  {start: {connecting_to: {host: $target},
+      test_start: {protocol: $protocol, reverse: $reverse, duration: $duration}},
+    intervals: samples,
+    end: {sum_sent: {bytes: 100},
+      sum_received: {bytes: 90, bits_per_second: 1},
+      sum: {lost_percent: 1.25}},
+    server_output_json: {
+      start: {test_start: {protocol: $protocol, reverse: $reverse,
+        duration: $duration}},
+      intervals: samples,
+      end: {sum_received: {bytes: 90, bits_per_second: 1,
+        seconds: $duration}}}}
+  '
 EOF_FAKE_IPERF
   cat >"$fake_dig" <<'EOF_FAKE_DIG'
 #!/usr/bin/env bash
@@ -1131,6 +1253,17 @@ EOF_FAKE_SLEEP
   M0_IPERF3_BIN="$fake_iperf"
   M0_DIG_BIN="$fake_dig"
   M0_SLEEP_BIN="$fake_sleep"
+  : >"$M0_TEST_COMMAND_LOG"
+  run_direct_continuity_probe "$tmp/direct-probe.json" 43.130.32.77 5201 \
+    300 4522378 "$fake_iperf" || \
+    die "self-test: valid direct continuity probe rejected"
+  grep -Fxq \
+    'iperf3 -c 43.130.32.77 -p 5201 -t 300 -P 1 -b 4522378 --json --get-server-output' \
+    "$M0_TEST_COMMAND_LOG" || \
+    die "self-test: direct continuity probe command drifted from M0 forward shape"
+  [[ "$DIRECT_CONTINUITY_REASON" == "ok" ]] || \
+    die "self-test: direct continuity probe did not report ok"
+  : >"$M0_TEST_COMMAND_LOG"
   M0_QUIET=1
   run_m0_schedule "$m0_run" "$m0_profile"
   [[ -f "$m0_run/m0/idle.sleep.log" ]] || \
@@ -1157,6 +1290,70 @@ EOF_FAKE_SLEEP
   done
   grep -Fxq complete "$m0_run/m0.status" || \
     die "self-test: successful M0 schedule status mismatch"
+  direct_dir="$tmp/direct"
+  mkdir "$direct_dir"
+  jq '.start.test_start.duration = 300
+    | .server_output_json.end.sum_received.seconds = 300
+    | .server_output_json.intervals = [range(0; 300) as $second
+      | {"sum": {"start": $second, "end": ($second + 1),
+          "bits_per_second": 1}}]' \
+    "$m0_run/m0/cycle_001_tcp-forward.json" \
+    >"$tmp/direct-forward-valid.json"
+  cp "$tmp/direct-forward-valid.json" "$direct_dir/direct-forward-300s.json"
+  cat >"$direct_dir/manifest.txt" <<EOF_DIRECT_FIXTURE
+schema=knife15-macos-direct-continuity-v1
+status=pass
+completed_epoch=1050
+source_commit=$(git -C "$REPO" rev-parse HEAD)
+runner_sha256=$(sha256_file "$SCRIPT_PATH")
+binary_sha256=$(sha256_file "$BIN")
+target=43.130.32.77
+target_route=en0
+exit_route=en0
+baseline_dir=$baseline_dir
+baseline_forward_sha256=$(sha256_file "$baseline_dir/direct-forward.json")
+baseline_reverse_sha256=$(sha256_file "$baseline_dir/direct-reverse.json")
+duration_secs=300
+rate_bps=4522378
+result_sha256=$(sha256_file "$direct_dir/direct-forward-300s.json")
+EOF_DIRECT_FIXTURE
+  validate_direct_continuity_dir "$direct_dir" "$baseline_dir" \
+    43.130.32.77 1100 || die "self-test: valid direct continuity evidence rejected"
+  jq '.start.test_start.duration = 30
+    | .server_output_json.end.sum_received.seconds = 30' \
+    "$direct_dir/direct-forward-300s.json" \
+    >"$direct_dir/direct-forward-300s.json.tmp"
+  mv "$direct_dir/direct-forward-300s.json.tmp" \
+    "$direct_dir/direct-forward-300s.json"
+  sed -i '' "s/^result_sha256=.*/result_sha256=$(sha256_file "$direct_dir/direct-forward-300s.json")/" \
+    "$direct_dir/manifest.txt"
+  ! validate_direct_continuity_dir "$direct_dir" "$baseline_dir" \
+    43.130.32.77 1100 || \
+    die "self-test: short direct continuity result was accepted as 300s evidence"
+  cp "$tmp/direct-forward-valid.json" "$direct_dir/direct-forward-300s.json"
+  sed -i '' "s/^result_sha256=.*/result_sha256=$(sha256_file "$direct_dir/direct-forward-300s.json")/" \
+    "$direct_dir/manifest.txt"
+  jq '.server_output_json.intervals[0].sum.bits_per_second = 0' \
+    "$direct_dir/direct-forward-300s.json" \
+    >"$direct_dir/direct-forward-300s.json.tmp"
+  mv "$direct_dir/direct-forward-300s.json.tmp" \
+    "$direct_dir/direct-forward-300s.json"
+  sed -i '' "s/^result_sha256=.*/result_sha256=$(sha256_file "$direct_dir/direct-forward-300s.json")/" \
+    "$direct_dir/manifest.txt"
+  ! validate_direct_continuity_dir "$direct_dir" "$baseline_dir" \
+    43.130.32.77 1100 || \
+    die "self-test: direct Target receiver zero interval was accepted"
+  cp "$tmp/direct-forward-valid.json" "$direct_dir/direct-forward-300s.json"
+  sed -i '' "s/^result_sha256=.*/result_sha256=$(sha256_file "$direct_dir/direct-forward-300s.json")/" \
+    "$direct_dir/manifest.txt"
+  ! validate_direct_continuity_dir "$direct_dir" "$baseline_dir" \
+    43.130.32.77 2000 || \
+    die "self-test: stale direct continuity evidence was accepted"
+  sed -i '' 's/^baseline_forward_sha256=.*/baseline_forward_sha256=wrong/' \
+    "$direct_dir/manifest.txt"
+  ! validate_direct_continuity_dir "$direct_dir" "$baseline_dir" \
+    43.130.32.77 1100 || \
+    die "self-test: direct continuity evidence for another baseline was accepted"
   printf '%s\n' \
     '📊 TUIC endpoint pacing global conservation(available=61406B,live=0B,outstanding=0B,records=2)' \
     >"$m0_run/mini_vpn.log"
@@ -1359,10 +1556,14 @@ EOF_FAIL_IPERF
   ! validate_m0_formal_config || die "self-test: shortened formal M0 schedule accepted"
   M0_TOTAL_SECS=7200
   usage_text="$(usage)"
+  grep -Fq 'scripts/knife15-macos-soak.sh direct-discriminator' <<<"$usage_text" || \
+    die "self-test: public direct continuity action missing from help"
   grep -Fq 'scripts/knife15-macos-soak.sh m0' <<<"$usage_text" || \
     die "self-test: public M0 action missing from help"
   grep -Fq 'M0_BASELINE_DIR=' <<<"$usage_text" || \
     die "self-test: M0 baseline requirement missing from help"
+  grep -Fq 'M0_DIRECT_DIR=' <<<"$usage_text" || \
+    die "self-test: M0 direct continuity requirement missing from help"
 
   printf '%s\n' '   gateway: 192.168.50.1' ' interface: en0' >"$route_fixture"
   [[ "$(route_interface_from_text <"$route_fixture")" == "en0" ]] || \
@@ -2233,15 +2434,141 @@ run_baseline() {
   mkdir -p "$out_dir" || die "cannot create baseline output directory"
   echo "Running direct forward baseline..."
   if ! run_logged "$out_dir/direct-forward.json" \
-    iperf3 -c "$TARGET" -p "$IPERF_PORT" -t "$DURATION" -P "$PARALLEL" --json; then
+    iperf3 -c "$TARGET" -p "$IPERF_PORT" -t "$DURATION" -P "$PARALLEL" \
+      --json --get-server-output; then
     die "direct forward baseline failed; evidence: $out_dir/direct-forward.json"
   fi
   echo "Running direct reverse baseline..."
   if ! run_logged "$out_dir/direct-reverse.json" \
-    iperf3 -c "$TARGET" -p "$IPERF_PORT" -t "$DURATION" -P "$PARALLEL" -R --json; then
+    iperf3 -c "$TARGET" -p "$IPERF_PORT" -t "$DURATION" -P "$PARALLEL" -R \
+      --json --get-server-output; then
     die "direct reverse baseline failed; evidence: $out_dir/direct-reverse.json"
   fi
+  validate_m0_baseline_pair "$out_dir" "$TARGET" || \
+    die "direct baseline receiver continuity/evidence failed; evidence: $out_dir"
   echo "PASS: direct baseline complete: $out_dir"
+}
+
+run_direct_continuity_probe() {
+  local output_file="$1"
+  local target="$2"
+  local iperf_port="$3"
+  local duration="$4"
+  local rate_bps="$5"
+  local iperf_bin="$6"
+
+  DIRECT_CONTINUITY_REASON=command_failed
+  if ! "$iperf_bin" -c "$target" -p "$iperf_port" -t "$duration" -P 1 \
+    -b "$rate_bps" --json --get-server-output >"$output_file" 2>&1; then
+    return 1
+  fi
+  DIRECT_CONTINUITY_REASON="$(m0_iperf_result_failure_reason \
+    "$output_file" TCP 0)"
+  [[ "$DIRECT_CONTINUITY_REASON" == "ok" ]] || return 1
+  if ! validate_direct_continuity_result "$output_file" "$target"; then
+    DIRECT_CONTINUITY_REASON=incomplete_300s_receiver_evidence
+    return 1
+  fi
+  return 0
+}
+
+run_direct_discriminator() {
+  local out_dir result_file status reason completed_utc completed_epoch
+  local forward_bps rate_bps target_route exit_route receiver_bytes receiver_bps
+  local receiver_zero_intervals sender_zero_intervals current_target_route current_exit_route
+
+  common_preflight
+  require_command jq
+  require_command iperf3
+  [[ "$M0_TCP_SECS" == "300" ]] || \
+    die "direct discriminator requires the frozen 300s M0 TCP epoch; unset M0_TCP_SECS"
+  validate_baseline_dir_path "$M0_BASELINE_DIR" || \
+    die "M0_BASELINE_DIR must be the fresh directory printed by baseline"
+  [[ -d "$M0_BASELINE_DIR" && ! -L "$M0_BASELINE_DIR" ]] || \
+    die "M0_BASELINE_DIR must be an existing non-symlink directory"
+  validate_m0_baseline_pair "$M0_BASELINE_DIR" "$TARGET" || \
+    die "direct discriminator requires fresh direction-aware baseline evidence for $TARGET"
+
+  out_dir="${DIRECT_OUT_DIR:-/tmp/mini_vpn_knife15_macos_direct_$(date -u '+%Y%m%d_%H%M%S')}"
+  validate_direct_dir_path "$out_dir" || \
+    die "DIRECT_OUT_DIR must be a simple /tmp/mini_vpn_knife15_macos_direct_<label> path"
+  [[ ! -e "$out_dir" && ! -L "$out_dir" ]] || \
+    die "direct discriminator output already exists: $out_dir"
+  mkdir "$out_dir" || die "cannot create direct discriminator output: $out_dir"
+  chmod 700 "$out_dir" || die "cannot protect direct discriminator output: $out_dir"
+
+  forward_bps="$(baseline_receiver_bps \
+    "$M0_BASELINE_DIR/direct-forward.json")" || \
+    die "cannot derive direct discriminator rate from baseline"
+  rate_bps=$((10#$forward_bps / 2))
+  target_route="$(route_interface "$TARGET")"
+  exit_route="$(route_interface "$SERVER_HOST")"
+  result_file="$out_dir/direct-forward-300s.json"
+  echo "Running 300s direct forward continuity discriminator at ${rate_bps} bit/s..."
+  status=fail
+  reason=command_failed
+  if run_direct_continuity_probe "$result_file" "$TARGET" "$IPERF_PORT" \
+    300 "$rate_bps" "$(command -v iperf3)"; then
+    status=pass
+    reason=ok
+  else
+    reason="$DIRECT_CONTINUITY_REASON"
+  fi
+
+  current_target_route="$(route_interface "$TARGET")"
+  current_exit_route="$(route_interface "$SERVER_HOST")"
+  if [[ "$current_target_route" != "$target_route" || \
+    "$current_exit_route" != "$exit_route" || "$target_route" == utun* || \
+    "$exit_route" == utun* ]]; then
+    status=fail
+    reason=physical_route_changed
+  fi
+  completed_utc="$(timestamp)"
+  completed_epoch="$(date +%s)"
+  receiver_bytes="$(jq -er \
+    '.server_output_json.end.sum_received.bytes | floor' "$result_file" 2>/dev/null || \
+    echo unknown)"
+  receiver_bps="$(jq -er \
+    '.server_output_json.end.sum_received.bits_per_second | floor' \
+    "$result_file" 2>/dev/null || echo unknown)"
+  receiver_zero_intervals="$(jq -er \
+    '[.server_output_json.intervals[] | select(.sum.bits_per_second <= 0)] | length' \
+    "$result_file" 2>/dev/null || echo unknown)"
+  sender_zero_intervals="$(jq -er \
+    '[.intervals[] | select(.sum.bits_per_second <= 0)] | length' \
+    "$result_file" 2>/dev/null || echo unknown)"
+  cat >"$out_dir/manifest.txt" <<EOF_DIRECT_MANIFEST
+schema=knife15-macos-direct-continuity-v1
+status=$status
+reason=$reason
+completed_utc=$completed_utc
+completed_epoch=$completed_epoch
+source_commit=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
+runner_sha256=$(sha256_file "$SCRIPT_PATH")
+binary_sha256=$(sha256_file "$BIN")
+target=$TARGET
+target_route=$target_route
+exit_host=$SERVER_HOST
+exit_route=$exit_route
+baseline_dir=$M0_BASELINE_DIR
+baseline_forward_sha256=$(sha256_file "$M0_BASELINE_DIR/direct-forward.json")
+baseline_reverse_sha256=$(sha256_file "$M0_BASELINE_DIR/direct-reverse.json")
+duration_secs=300
+rate_bps=$rate_bps
+receiver_bytes=$receiver_bytes
+receiver_bps=$receiver_bps
+receiver_zero_intervals=$receiver_zero_intervals
+sender_zero_intervals=$sender_zero_intervals
+result_sha256=$(sha256_file "$result_file")
+EOF_DIRECT_MANIFEST
+  echo "direct_dir=$out_dir"
+  echo "result_sha256=$(sha256_file "$result_file")"
+  if [[ "$status" != "pass" ]] || \
+    ! validate_direct_continuity_dir "$out_dir" "$M0_BASELINE_DIR" \
+      "$TARGET" "$completed_epoch"; then
+    die "direct continuity discriminator failed reason=$reason; no TUN was started"
+  fi
+  echo "PASS: 300s direct Target receiver continuity discriminator completed"
 }
 
 run_logged() {
@@ -2592,6 +2919,10 @@ run_m0_action() {
     die "M0_BASELINE_DIR must be the simple /tmp baseline directory printed by baseline"
   [[ -d "$M0_BASELINE_DIR" && ! -L "$M0_BASELINE_DIR" ]] || \
     die "M0_BASELINE_DIR must be an existing non-symlink directory"
+  validate_direct_dir_path "$M0_DIRECT_DIR" || \
+    die "M0_DIRECT_DIR must be the fresh directory printed by direct-discriminator"
+  [[ -d "$M0_DIRECT_DIR" && ! -L "$M0_DIRECT_DIR" ]] || \
+    die "M0_DIRECT_DIR must be an existing non-symlink directory"
 
   utun="$(read_state utun)"
   target="$(read_state target)"
@@ -2611,8 +2942,16 @@ run_m0_action() {
   require_command dig
   validate_m0_baseline_pair "$M0_BASELINE_DIR" "$target" || \
     die "M0 baseline must contain valid nonzero TCP forward/reverse results for $target"
+  validate_direct_continuity_dir "$M0_DIRECT_DIR" "$M0_BASELINE_DIR" "$target" || \
+    die "formal M0 requires a matching 300s direct continuity PASS completed within 15 minutes"
 
   mkdir "$run_dir/m0" || die "cannot create M0 evidence directory"
+  mkdir "$run_dir/m0-direct" || die "cannot create M0 direct evidence directory"
+  cp "$M0_DIRECT_DIR/manifest.txt" "$run_dir/m0-direct/manifest.txt" || \
+    die "cannot preserve direct continuity manifest"
+  cp "$M0_DIRECT_DIR/direct-forward-300s.json" \
+    "$run_dir/m0-direct/direct-forward-300s.json" || \
+    die "cannot preserve direct continuity result"
   profile_file="$run_dir/m0-workload.txt"
   printf '%s\n' preparing >"$run_dir/m0.status"
   if ! write_m0_profile "$M0_BASELINE_DIR" "$profile_file" "$target" "$iperf_port" \
@@ -2621,6 +2960,11 @@ run_m0_action() {
     append_event_to "$run_dir" "m0 failed: workload profile derivation"
     die "cannot derive the M0 workload profile from baseline"
   fi
+  printf '%s\n' \
+    "direct_dir=$M0_DIRECT_DIR" \
+    "direct_manifest_sha256=$(sha256_file "$M0_DIRECT_DIR/manifest.txt")" \
+    "direct_result_sha256=$(sha256_file "$M0_DIRECT_DIR/direct-forward-300s.json")" \
+    >>"$profile_file" || die "cannot bind direct continuity evidence to M0 profile"
   printf '%s\n' prepared >"$run_dir/m0.status"
   append_event_to "$run_dir" \
     "m0 prepared baseline=$(basename "$M0_BASELINE_DIR") profile=$(sha256_file "$profile_file")"
@@ -3089,6 +3433,9 @@ case "$ACTION" in
     ;;
   baseline)
     run_baseline
+    ;;
+  direct-discriminator)
+    run_direct_discriminator
     ;;
   start)
     start_runner
