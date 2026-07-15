@@ -1564,13 +1564,18 @@ EOF_GOOD
   grep -Fq -- '- interface_error_samples: 1' "$summary_dir/summary.md" || \
     die "self-test: interface error count mismatch"
   sed -i '' '$d' "$summary_dir/interface.csv"
-  printf '%s\n' '写入上游流失败 direction=local_to_remote err=Stopped(0)' \
+  printf '%s\n' \
+    '写入上游流失败 direction=local_to_remote err=Stopped(0)' \
+    'tcp-handle-close conn=1 epoch=1 reason=remote_write_failed' \
+    'tcp-d16-relay-close conn=1 epoch=1 terminal_reason=remote_write_failed queue_queued_bytes=0 queue_leased_bytes=0 queue_reserved_bytes=0' \
     >>"$summary_dir/mini_vpn.log"
   write_summary "$summary_dir"
   grep -Fq -- '- internal_failure_scan: REVIEW' "$summary_dir/summary.md" || \
     die "self-test: remote write failure was not marked for review"
   grep -Fq -- '- remote_write_failures: 1' "$summary_dir/summary.md" || \
-    die "self-test: remote write failure count mismatch"
+    die "self-test: one remote write terminal relay was counted more than once"
+  grep -Fq -- '- remote_write_failure_log_matches: 3' "$summary_dir/summary.md" || \
+    die "self-test: remote write diagnostic log-match count mismatch"
 
   STATE_DIR="$tmp/workload-state"
   mkdir "$STATE_DIR"
@@ -2726,7 +2731,8 @@ secret_scan() {
 write_summary() {
   local run_dir="$1"
   local log_file="$run_dir/mini_vpn.log"
-  local conservation verdict remote_write_failures interface_error_samples log_bytes log_compactions
+  local conservation verdict remote_write_failures remote_write_failure_log_matches
+  local interface_error_samples log_bytes log_compactions
   local m0_status m0_cycles m0_dns m0_idle m0_resume m0_final_drain m0_phase_failures m0_health_failures
   local process_numeric_samples rss_first rss_last rss_max rss_delta
   local fd_first fd_last fd_max fd_delta threads_first threads_last threads_max threads_delta
@@ -2750,7 +2756,11 @@ write_summary() {
   else
     conservation=FAIL_OR_MISSING
   fi
-  remote_write_failures="$(grep -Ec '写入上游流失败|reason=remote_write_failed|reason=stalled_write_timeout' "$log_file" 2>/dev/null || true)"
+  remote_write_failure_log_matches="$(grep -Ec '写入上游流失败|reason=remote_write_failed|reason=stalled_write_timeout' "$log_file" 2>/dev/null || true)"
+  # One D16 terminal event is also emitted as a raw error and handle-close
+  # diagnostic. Count the canonical relay-close record once while preserving
+  # the broader log-match count for forensic review.
+  remote_write_failures="$(grep -Ec 'tcp-d16-relay-close .*terminal_reason=(remote_write_failed|stalled_write_timeout)( |$)' "$log_file" 2>/dev/null || true)"
   interface_error_samples="$(awk -F, '
     NR > 1 && (($5 ~ /^[0-9]+$/ && $5 + 0 > 0) || ($8 ~ /^[0-9]+$/ && $8 + 0 > 0)) { count++ }
     END { print count + 0 }
@@ -2856,6 +2866,7 @@ write_summary() {
 - endpoint_conservation: $conservation
 - internal_failure_scan: $verdict
 - remote_write_failures: ${remote_write_failures:-unknown}
+- remote_write_failure_log_matches: ${remote_write_failure_log_matches:-unknown}
 - interface_error_samples: ${interface_error_samples:-unknown}
 - network_control_evidence: $network_control_evidence
 - network_control_samples: ${network_control_samples:-0}
