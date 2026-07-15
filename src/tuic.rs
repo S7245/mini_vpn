@@ -24,7 +24,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 
 /// 默认 ALPN：TUIC over QUIC 常用 `h3`，必须与 sing-box `tls.alpn` 一致。
 const DEFAULT_TUIC_ALPN: &str = "h3";
@@ -359,15 +359,6 @@ fn select_tuic_native_relay_mode(
     }
 }
 
-/// TCP pool 轮询选择。`pool_len` 在生产中恒非 0；纯函数保底处理 0，避免测试/未来误用 panic。
-fn tcp_pool_index(pool_len: usize, cursor: u64) -> usize {
-    if pool_len == 0 {
-        0
-    } else {
-        (cursor % pool_len as u64) as usize
-    }
-}
-
 fn tcp_pool_slot_stale(now_secs: u64, last_used_secs: u64) -> bool {
     now_secs.saturating_sub(last_used_secs) >= TUIC_TCP_POOL_STALE_RECONNECT_SECS
 }
@@ -517,12 +508,140 @@ struct TcpPoolSlotLease {
 }
 
 impl TcpPoolSlotLease {
+    fn from_reserved(active: Arc<AtomicU64>) -> Self {
+        Self { active }
+    }
+
+    #[cfg(test)]
     fn reserve(active: Arc<AtomicU64>) -> (Self, bool) {
         match active.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => (Self { active }, true),
+            Ok(_) => (Self::from_reserved(active), true),
             Err(_) => {
                 active.fetch_add(1, Ordering::AcqRel);
-                (Self { active }, false)
+                (Self::from_reserved(active), false)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpPoolReservationError {
+    Empty,
+    Busy,
+    Saturated,
+}
+
+struct TcpPoolSlotPreparation {
+    preparing: Arc<AtomicBool>,
+    available: Arc<Notify>,
+}
+
+impl Drop for TcpPoolSlotPreparation {
+    fn drop(&mut self) {
+        self.preparing.store(false, Ordering::Release);
+        self.available.notify_one();
+    }
+}
+
+struct TcpPoolSlotReservation {
+    index: usize,
+    lease: TcpPoolSlotLease,
+    active_before: u64,
+    preparation: TcpPoolSlotPreparation,
+}
+
+struct TcpPoolLeaseSelector {
+    active_slots: Vec<Arc<AtomicU64>>,
+    preparing_slots: Vec<Arc<AtomicBool>>,
+    available: Arc<Notify>,
+}
+
+impl TcpPoolLeaseSelector {
+    fn new(pool_len: usize) -> Self {
+        Self {
+            active_slots: (0..pool_len).map(|_| Arc::new(AtomicU64::new(0))).collect(),
+            preparing_slots: (0..pool_len)
+                .map(|_| Arc::new(AtomicBool::new(false)))
+                .collect(),
+            available: Arc::new(Notify::new()),
+        }
+    }
+
+    fn try_reserve_least_active(&self) -> Result<TcpPoolSlotReservation, TcpPoolReservationError> {
+        if self.active_slots.is_empty() {
+            return Err(TcpPoolReservationError::Empty);
+        }
+        debug_assert_eq!(self.active_slots.len(), self.preparing_slots.len());
+
+        loop {
+            let mut choice = None;
+            let mut preparing = false;
+            for (index, (active, slot_preparing)) in self
+                .active_slots
+                .iter()
+                .zip(&self.preparing_slots)
+                .enumerate()
+            {
+                if slot_preparing.load(Ordering::Acquire) {
+                    preparing = true;
+                    continue;
+                }
+                let active_before = active.load(Ordering::Acquire);
+                if active_before == u64::MAX {
+                    continue;
+                }
+                if choice.is_none_or(|(_, current)| active_before < current) {
+                    choice = Some((index, active_before));
+                }
+            }
+
+            let Some((index, active_before)) = choice else {
+                return Err(if preparing {
+                    TcpPoolReservationError::Busy
+                } else {
+                    TcpPoolReservationError::Saturated
+                });
+            };
+            let slot_preparing = self.preparing_slots[index].clone();
+            if slot_preparing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            let preparation = TcpPoolSlotPreparation {
+                preparing: slot_preparing,
+                available: self.available.clone(),
+            };
+            let active = self.active_slots[index].clone();
+            if active
+                .compare_exchange(
+                    active_before,
+                    active_before + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Ok(TcpPoolSlotReservation {
+                    index,
+                    lease: TcpPoolSlotLease::from_reserved(active),
+                    active_before,
+                    preparation,
+                });
+            }
+            drop(preparation);
+        }
+    }
+
+    async fn reserve_least_active(
+        &self,
+    ) -> Result<TcpPoolSlotReservation, TcpPoolReservationError> {
+        loop {
+            let available = self.available.notified();
+            match self.try_reserve_least_active() {
+                Err(TcpPoolReservationError::Busy) => available.await,
+                result => return result,
             }
         }
     }
@@ -2675,6 +2794,24 @@ fn format_tuic_tcp_open_line(
     )
 }
 
+fn format_tuic_tcp_pool_selection_line(
+    conn_index: usize,
+    stable_id: usize,
+    active_before: u64,
+    generation: u64,
+    last_success_age_secs: Option<u64>,
+    probe_result: &str,
+    reconnect_reason: Option<&str>,
+) -> String {
+    let last_success_age_secs = last_success_age_secs
+        .map(|age| age.to_string())
+        .unwrap_or_else(|| "never".into());
+    format!(
+        "🔎 tuic-tcp-pool-selection conn={conn_index} id={stable_id} policy=least_active active_before={active_before} generation={generation} last_success_age_secs={last_success_age_secs} probe_result={probe_result} reconnect_reason={}",
+        reconnect_reason.unwrap_or("none")
+    )
+}
+
 fn format_tuic_tcp_open_line_with_diag(
     target: &TargetAddr,
     conn_index: usize,
@@ -3369,6 +3506,7 @@ struct TcpPoolConnectionSelection {
     conn_index: usize,
     conn: Connection,
     lease: TcpPoolSlotLease,
+    active_before: u64,
     generation: u64,
     last_success_age_secs: Option<u64>,
     probe_result: &'static str,
@@ -3385,8 +3523,6 @@ pub struct TuicUpstream {
     password: String,
     /// 主连接是 index 0：UDP relay、heartbeat、health probe 都固定走它，避免 TCP pool 改变 UDP 语义。
     conns: Vec<Mutex<Connection>>,
-    /// TCP `open_tcp` 的轮询游标。Relaxed 足够：只需要分散流，不承载同步语义。
-    tcp_next: AtomicU64,
     /// Per-slot generation, successful-open time, and failure invalidation. Failed opens never
     /// refresh the idle clock; only auxiliary slots can be invalidated by TCP-open evidence.
     tcp_open_states: Vec<TcpPoolOpenState>,
@@ -3395,7 +3531,7 @@ pub struct TuicUpstream {
     tcp_startup_auth_attempts: Vec<AtomicU64>,
     /// Active or opening TCP relay count per pool slot. Stale reconnect is only safe when a slot is
     /// idle; closing an active QUIC connection would cut every stream multiplexed on that slot.
-    tcp_active_streams: Vec<Arc<AtomicU64>>,
+    tcp_pool_selector: TcpPoolLeaseSelector,
     /// 上行 UDP datagram 丢弃计数（连接不可用 / stream 兜底也失败）。可观测性，不影响 UDP 语义。
     udp_drops: AtomicU64,
     /// 上行走 uni-stream 兜底（超 datagram 上限）的次数。可观测性：判断 MTU 调优是否够、兜底是否热。
@@ -3577,7 +3713,7 @@ impl TuicUpstream {
             );
         }
         let tcp_open_states = (0..tcp_pool).map(|_| TcpPoolOpenState::new()).collect();
-        let tcp_active_streams = (0..tcp_pool).map(|_| Arc::new(AtomicU64::new(0))).collect();
+        let tcp_pool_selector = TcpPoolLeaseSelector::new(tcp_pool);
         Ok(Self {
             endpoint,
             server: cfg.server,
@@ -3585,10 +3721,9 @@ impl TuicUpstream {
             uuid: cfg.uuid,
             password: cfg.password.clone(),
             conns,
-            tcp_next: AtomicU64::new(0),
             tcp_open_states,
             tcp_startup_auth_attempts,
-            tcp_active_streams,
+            tcp_pool_selector,
             udp_drops: AtomicU64::new(0),
             udp_stream_fallbacks: AtomicU64::new(0),
             last_udp_activity: AtomicU64::new(0),
@@ -3795,29 +3930,38 @@ impl TuicUpstream {
         Ok(())
     }
 
-    /// TCP 专用连接选择。Idle age only requests a bounded liveness probe; it is not itself
-    /// permission to destroy an auxiliary connection. Holding the per-slot mutex while reserving
-    /// the lease closes the old race where a second opener could join after an "exclusive" check
-    /// but before the first opener recycled the shared QUIC connection.
+    /// TCP 专用连接选择。Selection atomically reserves the least-active observed slot before any
+    /// mutex wait, so a following opener sees that load instead of depending on global open parity.
+    /// Idle age only requests a bounded liveness probe; it is not itself permission to destroy an
+    /// auxiliary connection. The per-slot mutex still serializes probe/reconnect and connection
+    /// cloning while the already-visible reservation steers unrelated opens toward other slots.
     async fn live_tcp_conn(&self) -> Result<TcpPoolConnectionSelection, ClientError> {
-        let cursor = self.tcp_next.fetch_add(1, Ordering::Relaxed);
-        let index = tcp_pool_index(self.conns.len(), cursor);
+        let reservation = self
+            .tcp_pool_selector
+            .reserve_least_active()
+            .await
+            .map_err(|error| {
+                ClientError::InvalidTarget(format!(
+                    "tuic tcp pool lease-aware reservation failed: {error:?}"
+                ))
+            })?;
+        let TcpPoolSlotReservation {
+            index,
+            lease,
+            active_before,
+            preparation,
+        } = reservation;
+        let idle_exclusive = active_before == 0;
         let now_secs = self.clock.elapsed().as_secs();
         let open_state = self
             .tcp_open_states
             .get(index)
             .ok_or_else(|| ClientError::InvalidTarget("tuic tcp pool index out of range".into()))?;
-        let active = self
-            .tcp_active_streams
-            .get(index)
-            .ok_or_else(|| ClientError::InvalidTarget("tuic tcp pool index out of range".into()))?
-            .clone();
         let slot = self
             .conns
             .get(index)
             .ok_or_else(|| ClientError::InvalidTarget("tuic tcp pool index out of range".into()))?;
         let mut guard = slot.lock().await;
-        let (lease, idle_exclusive) = TcpPoolSlotLease::reserve(active);
         let last_success_age_secs = open_state.last_success_age_secs(now_secs);
         let last_success_secs = open_state.last_success_secs().unwrap_or(0);
         let mut probe_result = "not_due";
@@ -3870,10 +4014,14 @@ impl TuicUpstream {
             }
         }
 
+        let conn = guard.clone();
+        drop(guard);
+        drop(preparation);
         Ok(TcpPoolConnectionSelection {
             conn_index: index,
-            conn: guard.clone(),
+            conn,
             lease,
+            active_before,
             generation: open_state.generation(),
             last_success_age_secs,
             probe_result,
@@ -4136,6 +4284,7 @@ impl ProxyUpstream for TuicUpstream {
             conn_index,
             conn,
             lease,
+            active_before,
             generation,
             last_success_age_secs,
             probe_result,
@@ -4167,11 +4316,16 @@ impl ProxyUpstream for TuicUpstream {
             let relay_mode = tuic_tcp_relay_mode();
             let diag_meta = if tcp_diag_enabled() {
                 println!(
-                    "🔎 tuic-tcp-pool-selection conn={conn_index} id={stable_id} generation={generation} last_success_age_secs={} probe_result={probe_result} reconnect_reason={}",
-                    last_success_age_secs
-                        .map(|age| age.to_string())
-                        .unwrap_or_else(|| "never".into()),
-                    reconnect_reason.unwrap_or("none")
+                    "{}",
+                    format_tuic_tcp_pool_selection_line(
+                        conn_index,
+                        stable_id,
+                        active_before,
+                        generation,
+                        last_success_age_secs,
+                        probe_result,
+                        reconnect_reason,
+                    )
                 );
                 println!(
                     "{}",
@@ -4258,6 +4412,7 @@ impl ProxyUpstream for TuicUpstream {
             conn_index,
             conn,
             lease,
+            active_before,
             generation,
             last_success_age_secs,
             probe_result,
@@ -4283,11 +4438,16 @@ impl ProxyUpstream for TuicUpstream {
                 .unwrap_or(0);
             let diag_meta = if tcp_diag_enabled() {
                 println!(
-                    "🔎 tuic-tcp-pool-selection conn={conn_index} id={stable_id} generation={generation} last_success_age_secs={} probe_result={probe_result} reconnect_reason={}",
-                    last_success_age_secs
-                        .map(|age| age.to_string())
-                        .unwrap_or_else(|| "never".into()),
-                    reconnect_reason.unwrap_or("none")
+                    "{}",
+                    format_tuic_tcp_pool_selection_line(
+                        conn_index,
+                        stable_id,
+                        active_before,
+                        generation,
+                        last_success_age_secs,
+                        probe_result,
+                        reconnect_reason,
+                    )
                 );
                 println!(
                     "{}",
@@ -5245,6 +5405,31 @@ mod tests {
     }
 
     #[test]
+    fn format_tuic_tcp_pool_selection_line_identifies_lease_aware_policy() {
+        let line = format_tuic_tcp_pool_selection_line(
+            1,
+            42,
+            0,
+            7,
+            Some(15),
+            "alive",
+            Some("previous_open_failure"),
+        );
+
+        assert!(line.contains("tuic-tcp-pool-selection"), "{line}");
+        assert!(line.contains("conn=1 id=42"), "{line}");
+        assert!(line.contains("policy=least_active"), "{line}");
+        assert!(line.contains("active_before=0"), "{line}");
+        assert!(line.contains("generation=7"), "{line}");
+        assert!(line.contains("last_success_age_secs=15"), "{line}");
+        assert!(line.contains("probe_result=alive"), "{line}");
+        assert!(
+            line.contains("reconnect_reason=previous_open_failure"),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn format_tuic_tcp_open_line_includes_target_pool_and_id() {
         let target = TargetAddr::parse("1.2.3.4:5201").unwrap();
         let line = format_tuic_tcp_open_line(&target, 3, 42, 8, 2, TuicTcpRelayMode::OrderedJoin);
@@ -6004,12 +6189,132 @@ mod tests {
     }
 
     #[test]
-    fn tcp_pool_round_robin_selection() {
-        assert_eq!(tcp_pool_index(1, 42), 0);
-        assert_eq!(tcp_pool_index(3, 0), 0);
-        assert_eq!(tcp_pool_index(3, 1), 1);
-        assert_eq!(tcp_pool_index(3, 2), 2);
-        assert_eq!(tcp_pool_index(3, 3), 0);
+    fn tcp_pool_phase_history_cannot_shift_the_next_idle_pair() {
+        let selector = TcpPoolLeaseSelector::new(2);
+
+        {
+            let prior = selector
+                .try_reserve_least_active()
+                .expect("an idle pool must accept a historical one-flow phase");
+            assert_eq!(prior.index, 0);
+            assert_eq!(prior.active_before, 0);
+        }
+
+        let control = selector
+            .try_reserve_least_active()
+            .expect("the next control flow must reserve the primary slot");
+        let data = selector
+            .try_reserve_least_active()
+            .expect("the live control reservation must steer data to auxiliary");
+
+        assert_eq!((control.index, control.active_before), (0, 0));
+        assert_eq!((data.index, data.active_before), (1, 0));
+        drop((control, data));
+        assert_eq!(selector.active_slots[0].load(Ordering::Relaxed), 0);
+        assert_eq!(selector.active_slots[1].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn tcp_pool_preparing_slot_cannot_be_overtaken_before_connection_clone() {
+        let selector = TcpPoolLeaseSelector::new(2);
+        selector.active_slots[1].store(4, Ordering::Release);
+
+        let first = selector
+            .try_reserve_least_active()
+            .expect("the idle primary slot must be selected first");
+        let second = selector
+            .try_reserve_least_active()
+            .expect("the preparing primary must steer the next opener to auxiliary");
+
+        assert_eq!((first.index, first.active_before), (0, 0));
+        assert_eq!((second.index, second.active_before), (1, 4));
+        selector.active_slots[1].store(1, Ordering::Release);
+        drop((first, second));
+        assert_eq!(selector.active_slots[0].load(Ordering::Acquire), 0);
+        assert_eq!(selector.active_slots[1].load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_busy_waiter_wakes_after_preparation_releases() {
+        let selector = Arc::new(TcpPoolLeaseSelector::new(1));
+        let first = selector
+            .try_reserve_least_active()
+            .expect("the only idle slot must be reservable");
+        let waiter = tokio::spawn({
+            let selector = selector.clone();
+            async move { selector.reserve_least_active().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "the preparing slot must not be overtaken"
+        );
+
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("preparation release must wake one blocked selector")
+            .unwrap()
+            .unwrap();
+        assert_eq!((second.index, second.active_before), (0, 0));
+        drop(second);
+        assert_eq!(selector.active_slots[0].load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn tcp_pool_simultaneous_first_reservations_use_distinct_slots() {
+        let selector = Arc::new(TcpPoolLeaseSelector::new(2));
+        let held = Arc::new(std::sync::Barrier::new(3));
+        let (selected_tx, selected_rx) = std::sync::mpsc::channel();
+
+        let workers = (0..2)
+            .map(|_| {
+                let selector = selector.clone();
+                let held = held.clone();
+                let selected_tx = selected_tx.clone();
+                std::thread::spawn(move || {
+                    let reservation = selector
+                        .try_reserve_least_active()
+                        .expect("an idle two-slot pool must accept both reservations");
+                    selected_tx.send(reservation.index).unwrap();
+                    held.wait();
+                    drop(reservation);
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(selected_tx);
+
+        let mut selected = vec![selected_rx.recv().unwrap(), selected_rx.recv().unwrap()];
+        selected.sort_unstable();
+        assert_eq!(selected, vec![0, 1]);
+        assert_eq!(selector.active_slots[0].load(Ordering::Acquire), 1);
+        assert_eq!(selector.active_slots[1].load(Ordering::Acquire), 1);
+
+        held.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(selector.active_slots[0].load(Ordering::Acquire), 0);
+        assert_eq!(selector.active_slots[1].load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn tcp_pool_reservation_fails_closed_for_empty_or_saturated_slots() {
+        let empty = TcpPoolLeaseSelector::new(0);
+        assert!(matches!(
+            empty.try_reserve_least_active(),
+            Err(TcpPoolReservationError::Empty)
+        ));
+
+        let saturated = TcpPoolLeaseSelector::new(2);
+        saturated.active_slots[0].store(u64::MAX, Ordering::Release);
+        saturated.active_slots[1].store(u64::MAX, Ordering::Release);
+        assert!(matches!(
+            saturated.try_reserve_least_active(),
+            Err(TcpPoolReservationError::Saturated)
+        ));
+        assert_eq!(saturated.active_slots[0].load(Ordering::Acquire), u64::MAX);
+        assert_eq!(saturated.active_slots[1].load(Ordering::Acquire), u64::MAX);
     }
 
     #[test]
