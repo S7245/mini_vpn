@@ -189,22 +189,22 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-07-15:
 
-- Source `adbc78b` Shenzhen physical-`en0` baseline failed only on reverse
-  evidence. Forward was continuous at `21.732742 Mbit/s`; reverse averaged
-  `0.524183 Mbit/s` with 13/20 zero receiver intervals. Every positive reverse
-  interval was a `131,072B` multiple, while the path delivered only about
-  `65,523B/s`: default iperf block granularity made a per-second no-zero SLI
-  unobservable. Do not combine this copied artifact with current-HK live route
-  or process state.
-- Commit `cc32df0` uses iperf `-l 16384` only for reverse TCP baseline/M0 and
-  records it in the profile. Forward, direct discriminator, short-forward,
-  UDP1160, all M0 rates/durations, and every mini_vpn frozen constant remain
-  unchanged. Knife15/Knife14 shell, syntax, fmt/diff, and review gates pass;
-  no unresolved P0/P1 remains.
-- Next run a fresh build and Shenzhen physical-`en0` baseline. Positive 16KiB
-  reverse intervals permit direct/start/smoke/M0. Any remaining zero interval
-  rejects observer quantization and blocks TUN as a physical reverse-path
-  failure; do not relax SLI or tune constants. Result:
+- Exact copied Shenzhen archive `...154130.tar.gz` (SHA-256 `49c4b71a...`)
+  proves the 16KiB observer reached reverse iperf. Physical forward was
+  `31.798980 Mbit/s` with all Target intervals positive and `9,420` sender
+  retransmits. Physical reverse was `0.131071 Mbit/s`, five receiver zeros, 45
+  retransmits, `169-184ms` RTT, and max cwnd `8,328B`. mini_vpn/TUN was absent:
+  slow/loss are environment profile, not product bugs.
+- Positive reverse intervals remained 16KiB multiples while useful delivery
+  was about 16KiB/s. Commit `e49d83c` uses 1KiB only for reverse TCP baseline/
+  M0 and prints direction-aware baseline rates/zero counts before verdict.
+  Forward/direct/short-forward, UDP1160, rates/durations, strict SLI, and all
+  frozen mini_vpn constants remain unchanged. Shell/fmt/diff/review gates pass;
+  no P0/P1 remains.
+- Next run fresh build and Shenzhen physical-`en0` baseline. Slow values have
+  no failure threshold. Positive 1KiB intervals permit direct/M0; remaining
+  zeros block formal M0 as physical continuity evidence, not a mini_vpn bug.
+  Do not tune data-plane constants. Result:
   `docs/tech/2026-07-15-knife15-macos-low-rate-reverse-observer-results.md`.
 
 - Source `5c127eb` bundle

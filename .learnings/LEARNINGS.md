@@ -10,13 +10,20 @@
   continuity. The formal half-rate was about `32,761B/s`; a 16KiB observer
   gives roughly two visible blocks per second while 128KiB gives one every
   four seconds.
+- The 16KiB replay then found an even slower `16,384B/s` reverse path with only
+  an `8,328B` cwnd. Observation quanta must stay well below both expected
+  interval bytes and current transport service capacity; equality remains
+  ambiguous. A 1KiB reverse observer yields about eight blocks/s at half-rate.
 - Preserve the SLI by improving observation resolution, not by accepting zero
   intervals. Direction-specific application evidence can change without
   changing mini_vpn D16/QUIC chunking or the forward failure discriminator.
+- Print physical rates before continuity verdicts. A slow direct link is an
+  environment capability measurement; it is not a mini_vpn regression when
+  mini_vpn and TUN are absent.
 - Reusable rule: capacity math applies to test instruments too. A consumer
   cannot prove a time-window invariant when its own delivery quantum exceeds
   the expected bytes in that window.
-- Implementation: `cc32df0`. Result:
+- Implementations: `cc32df0`, `e49d83c`. Result:
   `docs/tech/2026-07-15-knife15-macos-low-rate-reverse-observer-results.md`.
 
 ## 2026-07-15 - Pool placement must follow live ownership, not history

@@ -6,28 +6,29 @@
 
 #### Latest decision (2026-07-15)
 
-Source `adbc78b` baseline ran on the separate Shenzhen Mac over physical
-`en0`; its directory was then copied to the current Mac. Current-host
-`utun1024`/Clash state is not run-host evidence and is excluded.
+Exact copied Shenzhen archive
+`/tmp/mini_vpn_knife15_macos_baseline_20260715_154130.tar.gz` (SHA-256
+`49c4b71a...`) used the repaired 16KiB reverse command. Physical forward was
+`31.798980 Mbit/s`, with all Target intervals positive but `9,420` sender
+retransmits. Physical reverse was `0.131071 Mbit/s`, with five local receiver
+zeros, 45 retransmits, `169-184ms` RTT, and max cwnd `8,328B`. mini_vpn/TUN was
+not running: slow speed and loss are environment capability, not product bugs.
 
-Forward delivered `21.732742 Mbit/s` with every Target receiver interval
-positive. Reverse delivered only `0.524183 Mbit/s`; 13/20 local receiver
-intervals were zero, and every positive interval was exactly one or more
-`131,072B` iperf blocks. At about `65,523B/s`, the default 128KiB observer
-cannot represent continuous sub-buffer progress each second. At the formal
-50% M0 rate it would need about four seconds per reportable block.
+Every positive reverse interval remained a 16KiB multiple, while useful
+delivery was about 16KiB/s and the block exceeded cwnd. Commit `e49d83c`
+changes only reverse baseline/M0 iperf observation to 1KiB, giving about eight
+blocks/s at the current formal half-rate. Baseline also prints direction-aware
+physical receiver Mbit/s and zero counts before any acceptance verdict. No
+minimum Mbps is enforced.
 
-Commit `cc32df0` preserves the strict no-zero receiver SLI and all forward
-discriminator shapes, but uses iperf `-l 16384` for reverse TCP baseline/M0
-only. M0 profile records the observer length. This is not a mini_vpn chunk,
-rate, duration, or frozen data-plane change. TDD, Knife15/Knife14 shell gates,
+Forward/direct/short-forward, rates, durations, UDP1160, strict no-zero SLI,
+and all frozen mini_vpn settings remain unchanged. TDD, Knife15/Knife14 shell,
 syntax, fmt/diff, and review pass with no P0/P1.
 
 Next rebuild final source and run one fresh Shenzhen physical-`en0` baseline.
-If reverse is positive in every 16KiB interval, proceed to direct and M0. If
-zeros remain, stop before TUN: the quantization hypothesis is rejected and the
-physical reverse path does not meet formal M0 continuity. Do not reuse the old
-baseline, relax the SLI, or tune constants. Result:
+Do not reuse `...131049` or `...154130`. Positive 1KiB reverse intervals permit
+direct/M0. Remaining zeros block formal M0 as physical continuity evidence,
+not a mini_vpn bug; do not tune data-plane constants. Result:
 `docs/tech/2026-07-15-knife15-macos-low-rate-reverse-observer-results.md`.
 
 Source `5c127eb` bundle

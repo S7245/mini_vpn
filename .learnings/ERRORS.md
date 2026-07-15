@@ -14,7 +14,7 @@
   direction, Target, and iperf block size. The accepted Shenzhen route evidence
   is the user's physical-`en0` statement; current-HK state is excluded.
 
-## 2026-07-15 - The 128KiB iperf observer fabricated low-rate zero seconds
+## 2026-07-15 - Oversized iperf observers fabricated low-rate zero seconds
 
 - Reverse averaged `0.524183 Mbit/s`, but 13/20 receiver intervals were zero
   and every positive interval was exactly `131,072B` or a multiple. The old
@@ -24,6 +24,14 @@
   relax receiver continuity or blame the network from that evidence. Reduce
   the reverse-only iperf observation length, preserve forward shape, and use a
   fresh run as the discriminator.
+- A first reduction to 16KiB was still equal to the next run's entire useful
+  bytes per second and exceeded its `8,328B` cwnd. Five zeros remained, with
+  every positive receiver interval still a 16KiB multiple. Do not declare a
+  fixed observer sufficient from one prior rate sample; replay its capacity
+  math against the next evidence.
+- The accepted follow-up is 1KiB, about eight observer blocks/s at the latest
+  half-rate. If zeros remain at that resolution, preserve them as physical
+  continuity evidence while still refusing to call low speed a mini_vpn bug.
 
 ## 2026-07-15 - Global pool parity inverted a healthy control/data pairing
 

@@ -2,8 +2,8 @@
 
 Date: 2026-07-15
 
-Status: **SHENZHEN OPERATOR/ROUTE CORRECT; 128K OBSERVER QUANTIZATION
-CONFIRMED; LOCAL REPAIR PASS; FRESH BASELINE PENDING**
+Status: **SHENZHEN SPEED PROFILE ACCEPTED; 16K OBSERVER STILL QUANTIZED;
+1K LOCAL REPAIR PASS; FRESH BASELINE PENDING**
 
 ## Evidence And Host Attribution
 
@@ -20,6 +20,21 @@ current Mac for inspection:
 The current Mac's live `utun1024`/Clash routes are unrelated to the Shenzhen
 run and must not be used to attribute this artifact. The user's `en0` route
 statement is the accepted run-host evidence.
+
+The 16KiB-repaired runner was then replayed in Shenzhen. Its copied archive is:
+
+- `/tmp/mini_vpn_knife15_macos_baseline_20260715_154130.tar.gz`;
+- archive SHA-256:
+  `49c4b71aed357273aa600e6040d9ed594d62609e4ed653f36b6eb0d4a31b86b8`;
+- forward JSON SHA-256:
+  `638254835f3c4844ecaeefca37c93cefe4df2b50d25c8feef9e690a6557d1a95`;
+- reverse JSON SHA-256:
+  `80e300e21f136613f3246aaad89b85e7facc665f279574ea03eca10815e10da0`.
+
+The archive checksum is exact and contains only the expected directory and two
+regular JSON files. Its `blksize=16384` proves that the repaired reverse command
+was reached. Baseline itself does not bind a source commit, so no stronger
+source-provenance claim is made from this archive alone.
 
 ## Exact Failure
 
@@ -46,6 +61,26 @@ The formal M0 reverse rate would be 50% of baseline, about `0.262 Mbit/s` or
 four seconds. A strict per-second no-zero SLI was unreachable even for smooth
 delivery.
 
+## 16KiB Replay And Physical Speed Profile
+
+The second forward receiver delivered `80,216,064B` at `31.798980 Mbit/s` with
+all 21 Target intervals positive. The client sender had two zero intervals and
+`9,420` retransmits; those are physical-path quality evidence, not the forward
+receiver SLI.
+
+The second reverse receiver delivered `327,680B` at only
+`0.131071 Mbit/s`, approximately `16,384B/s`. It had five zero intervals, and
+every positive interval was again exactly one or more 16KiB blocks. The sender
+reported `376,832B` at `0.149423 Mbit/s`, 45 retransmits, RTT about
+`169-184ms`, and maximum cwnd only `8,328B`.
+
+This is a valid Shenzhen physical speed/path profile and not a mini_vpn bug:
+TUN and mini_vpn were not running. The absolute speed has no failure threshold.
+However, 16KiB was still not a valid one-second observer because it equaled a
+full second of useful delivery and exceeded the observed sender cwnd. The five
+zeros therefore remain quantization-ambiguous rather than proof of a physical
+one-second outage.
+
 ## Goal, Non-Goals, And Capacity
 
 Preserve the strict receiver no-zero SLI by increasing observation resolution,
@@ -56,11 +91,13 @@ This stage does not change mini_vpn H10d16/D16 chunking, endpoint pacing, MTU,
 pool, QUIC windows, Cubic, GSO, self-wake, M0 rates/durations, UDP payload, or
 Target receiver semantics.
 
-Reverse TCP baseline and M0 now use iperf `-l 16384`. At the formal half-rate
-this gives about two completed observer buffers per second. At `100 Mbit/s` it
-requires about 763 application buffers per second, which is bounded and small
-relative to the data-plane capacity. Forward retains iperf's default 128KiB
-buffer and the 300-second direct discriminator is unchanged.
+Reverse TCP baseline and M0 now use iperf `-l 1024`. At the latest formal
+half-rate this gives about eight completed observer buffers per second and each
+buffer is far below the observed `8,328B` cwnd. At `100 Mbit/s` it requires
+about 12,207 application buffers per second, which remains bounded; macOS M0 is
+a relative-rate longevity lane, while high-throughput acceptance remains on
+the Knife14 VPS lane. Forward retains iperf's default 128KiB buffer and the
+300-second direct discriminator is unchanged.
 
 ## TDD And Implementation
 
@@ -72,7 +109,16 @@ Two tracer bullets were run:
    baseline and self-test now share `run_direct_baseline_probe`; forward is
    exact-old-shape and reverse alone uses `-l 16384`.
 
-Implementation commit: `cc32df0`.
+The 16KiB replay then drove two more tracer bullets:
+
+3. RED: reverse baseline/M0/profile command contracts required `-l 1024` and
+   rejected 16KiB. GREEN: the single reverse observer constant changed to
+   1KiB; no forward command changed.
+4. RED: a valid baseline could not produce a direction-aware human speed
+   summary. GREEN: baseline now prints receiver Mbit/s and zero counts before
+   applying continuity acceptance, including on a later failure.
+
+Implementation commits: `cc32df0` and `e49d83c`.
 
 Local gates passed:
 
@@ -83,14 +129,17 @@ Local gates passed:
 
 ## Next Gate And Stop Rule
 
-The old baseline remains invalid and must not be reused. Rebuild the final
+Both old baselines remain invalid and must not be reused. Rebuild the final
 source, run a fresh physical-`en0` baseline, and inspect its reverse JSON.
 
-- If 16KiB reverse intervals are all positive, continue to the unchanged
+- Treat the printed forward/reverse rates as environment capacity, never as a
+  minimum product threshold.
+- If 1KiB reverse intervals are all positive, continue to the unchanged
   300-second forward direct discriminator, then user-run start/smoke/M0.
 - If reverse still contains zero intervals, the smaller observer has rejected
-  the quantization hypothesis. Stop before TUN and classify the Shenzhen-to-
-  Target reverse physical path as insufficient for this formal M0 window; do
-  not relax the SLI or tune mini_vpn constants.
+  simple block-quantization hypothesis. Stop before formal M0 and preserve it
+  as physical-path continuity evidence, not a mini_vpn bug. A separate degraded-
+  path soak may use relative/direct-control acceptance, but must not silently
+  weaken formal M0 or tune mini_vpn constants.
 
 M1 remains blocked until M0 and an independent rearm pass.
