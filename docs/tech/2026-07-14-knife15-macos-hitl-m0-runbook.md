@@ -1,8 +1,8 @@
 # Knife15 macOS HITL M0 Runbook
 
 Date: 2026-07-14
-Status: **M0 repeated a real receiver interruption; physical-counter observer
-repaired; fresh short validation required before Shenzhen M0**
+Status: **M0 repeated a real receiver interruption; repaired physical-counter
+observer short-validation PASS; fresh Shenzhen baseline/M0 required**
 
 ## Purpose And Authority Boundary
 
@@ -76,9 +76,17 @@ bash scripts/knife15-macos-soak.sh --self-test
 bash scripts/knife15-macos-soak.sh preflight
 ```
 
-Stop here if self-test or preflight fails. After updating to physical-counter
-repair commit `524139b`, do not take the formal baseline or spend the next
-two-hour M0 yet. First run one short observer validation:
+Stop here if self-test or preflight fails. The one required repaired-observer
+short validation completed on exact source `5e8846f` in bundle
+`/tmp/mini_vpn_knife15_macos_20260715_084113.tar.gz` (SHA-256
+`85dd7a66...`). It proved semantic numeric physical counters, meaningful byte/
+rate deltas, zero physical errors, complete network controls, and clean
+teardown. Do not repeat that gate unless the observer changes again.
+Summary-only follow-up commit `2c8030a` separates canonical terminal-relay
+counts from raw/derived diagnostic log matches; it does not change the
+observer and therefore does not require another short TUN validation.
+
+For reference, the accepted short-gate sequence was:
 
 ```sh
 sudo -v
@@ -87,12 +95,7 @@ sudo -E bash scripts/knife15-macos-soak.sh smoke
 sudo -E bash scripts/knife15-macos-soak.sh stop
 ```
 
-Return that bundle/checksum for review. Its `network.csv` must contain numeric
-physical packet/error/byte fields rather than a link Address, and traffic must
-produce meaningful physical byte/rate deltas. This fresh stop also re-proves
-process, utun, route, and ownership cleanup.
-
-Only after the short validation passes, take the fresh formal baseline:
+Now take the fresh formal baseline on the dedicated Shenzhen Mac:
 
 ```sh
 bash scripts/knife15-macos-soak.sh baseline
@@ -207,12 +210,11 @@ agent can inspect a bundle that remains on the shared HK Mac by its local path.
 
 ## Qualification Decision
 
-The macOS lane has qualified target-only lifecycle and clean rearm, but exact
-source `b0fcb76` repeated five complete receiver-zero seconds in cycle 1 and
-therefore remains failed. Its physical counters also exposed the observer bug
-repaired by `524139b`. First pass the fresh short observer validation above;
-then, per the accepted task order, run the next formal M0 on the dedicated
-Shenzhen Mac.
+The macOS lane has qualified target-only lifecycle, clean rearm, and the
+repaired physical observer. Exact source `b0fcb76` nevertheless repeated five
+complete receiver-zero seconds in cycle 1 and therefore remains failed. Per
+the accepted task order, take a fresh direct baseline and run the next formal
+M0 on the dedicated Shenzhen Mac.
 Formal M0 passes only after the two-hour bundle shows `m0_status: complete`, zero phase
 and health failures, one completed idle/resume/final-drain sequence, every
 endpoint conservation sample at or below `61,440B`, zero final live and

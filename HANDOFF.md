@@ -4,7 +4,25 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-15)
 
-- **Latest accepted position:** exact source `b0fcb76` M0 bundle
+- **Latest accepted position:** exact source `5e8846f` repaired-observer short
+  bundle `/tmp/mini_vpn_knife15_macos_20260715_084113.tar.gz` (SHA-256
+  `85dd7a66...`) passes its scoped gate. All `5/5` physical-interface rows are
+  semantically numeric, errors remain zero, RX/TX counters increase by
+  `185,341,406/106,914,245B`, derived rates are meaningful, and all five Exit/
+  gateway controls are complete with zero loss. TCP smoke completed both
+  directions with `20/20` nonzero intervals, DNS returned `198.18.0.2`,
+  endpoint conservation stayed `<=61,365B`, and process/utun/routes/ownership
+  cleaned up.
+- `internal_failure_scan: REVIEW` is one forward `Stopped(0)` close tail
+  repeated under three log labels, not three independent failures. D16 and
+  endpoint ownership ended clean and reverse rearm succeeded. This short run
+  validates the observer only; it is not formal M0. Follow-up commit `2c8030a`
+  now reports one canonical terminal relay plus three diagnostic log matches;
+  it changes summary semantics only and keeps REVIEW visible. Next take a
+  fresh direct baseline on the dedicated Shenzhen Mac, run formal M0, then
+  independent rearm. M0 acceptance and M1 remain blocked.
+
+- **Previous accepted position:** exact source `b0fcb76` M0 bundle
   `/tmp/mini_vpn_knife15_macos_20260715_072254.tar.gz` (SHA-256
   `0127e3af...`) correctly failed cycle 1 forward after five complete Target
   receiver zero-byte seconds plus one short tail. The command ran the full
@@ -31,10 +49,8 @@
 - Rearm bundle `/tmp/mini_vpn_knife15_macos_20260715_074823.tar.gz` (SHA-256
   `6d271b0c...`) passed fresh create, TCP/DNS smoke, zero ownership, route/utun
   cleanup, and process exit. Its physical rows share the old observer defect.
-  M0 remains failed and blocks M1. Next run one repaired-source
-  start/smoke/stop short validation, verify numeric physical counters and
-  meaningful rates, then take a fresh baseline and run formal Shenzhen M0 plus
-  independent rearm. Result:
+  M0 remains failed and blocks M1. The later exact-source short validation
+  above closes the physical-observer prerequisite. Result:
   `docs/tech/2026-07-15-knife15-macos-m0-physical-counter-observer-repair-results.md`.
 
 - **Previous accepted position:** exact source `b5c3963` M0 bundle

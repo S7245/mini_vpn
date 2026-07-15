@@ -6,6 +6,27 @@
 
 #### Latest decision (2026-07-15)
 
+Exact source `5e8846f` repaired-observer bundle
+`/tmp/mini_vpn_knife15_macos_20260715_084113.tar.gz` (SHA-256 `85dd7a66...`)
+passes the scoped short gate. All `5/5` physical rows have semantically valid
+numeric counters, zero errors, nonzero byte deltas and meaningful rates; all
+Exit/gateway controls are complete with zero loss. TCP/DNS smoke, endpoint
+conservation, D16 ownership, process/utun/route cleanup, and artifact
+provenance pass. The generic REVIEW is one forward close-tail logged three
+ways, not three independent failures.
+
+Summary-only follow-up commit `2c8030a` now counts one canonical D16 terminal
+relay in `remote_write_failures` and preserves all three diagnostic matches in
+`remote_write_failure_log_matches`. Knife15 internal/external and Knife14 shell
+self-tests pass. Observer collection and all frozen settings are unchanged.
+
+The observer prerequisite is closed, but M0 itself remains failed/incomplete
+and M1 remains blocked. Next take a fresh direct baseline on the dedicated
+Shenzhen Mac, run formal M0, then run an independent start/smoke/stop rearm.
+Do not reuse a prior baseline, relax the receiver SLI, or tune frozen settings.
+Result:
+`docs/tech/2026-07-15-knife15-macos-m0-physical-counter-observer-repair-results.md`.
+
 Exact source `b0fcb76` repeated a genuine receiver continuity failure in the
 first M0 forward phase. Five complete Target receiver seconds were zero, plus
 one short tail; the full command delivered `208,142,336B / 5.547 Mbit/s` from
@@ -28,10 +49,10 @@ freshness on semantic numeric validity. Focused shell TDD, Rust/release,
 Knife14 shell, syntax, fmt/diff, and review gates pass with no P0/P1. The
 separate rearm lifecycle passed but shares the old observer defect.
 
-M0 and M1 remain blocked. Next run one fresh repaired-source
-start/smoke/stop validation and inspect numeric physical counters/rates. Only
-then take a new direct baseline and spend another formal Shenzhen M0, followed
-by independent rearm. Do not tune frozen settings or relax the receiver SLI.
+M0 and M1 remain blocked. The later exact-source short validation above closes
+the observer prerequisite; a new direct baseline and formal Shenzhen M0,
+followed by independent rearm, remain required. Do not tune frozen settings or
+relax the receiver SLI.
 Result:
 `docs/tech/2026-07-15-knife15-macos-m0-physical-counter-observer-repair-results.md`.
 

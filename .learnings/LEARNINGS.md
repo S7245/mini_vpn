@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-07-15 - Prove an observer repair with semantic movement
+
+- The repaired physical parser passed a real start/smoke/stop run only after
+  every physical field was numeric, byte counters moved monotonically, elapsed
+  samples produced nonzero rates, and process/network timestamps corresponded.
+  A syntactically valid row alone would not have closed the earlier false PASS.
+- Initial rate fields may legitimately be unknown before a positive elapsed
+  interval exists. Acceptance should require meaningful rates where derivable,
+  not fabricate zero or reject the initial sample.
+- Log-pattern counts are not necessarily event counts. One forward
+  `Stopped(0)` close tail appeared as raw, handle-close, and relay-close lines;
+  ownership and subsequent rearm determine whether it is one clean close-tail
+  or multiple failures.
+- Keep both views when they serve different purposes: commit `2c8030a` reports
+  one canonical terminal relay for event multiplicity and three broader log
+  matches for forensic coverage, without suppressing the REVIEW verdict.
+- Reusable rule: validate observer repairs with real semantic counter movement,
+  independent time correspondence, and lifecycle cleanup, while keeping the
+  scoped observer verdict separate from the formal workload verdict.
+- Result:
+  `docs/tech/2026-07-15-knife15-macos-m0-physical-counter-observer-repair-results.md`.
+
 ## 2026-07-15 - Validate semantic fields, not only CSV width
 
 - The network-v2 collector emitted exactly 27 columns and one row per process

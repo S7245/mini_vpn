@@ -189,6 +189,21 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-07-15:
 
+- Exact source `5e8846f` passed the repaired physical-observer short gate in
+  bundle `/tmp/mini_vpn_knife15_macos_20260715_084113.tar.gz` (SHA-256
+  `85dd7a66...`). All `5/5` physical rows were semantically numeric with zero
+  interface errors, `185,341,406/106,914,245B` RX/TX deltas, meaningful rates,
+  complete zero-loss Exit/gateway controls, and clean process/utun/route/
+  ownership teardown. The generic REVIEW is one forward `Stopped(0)` close
+  tail repeated under three log labels, not three failures.
+- Follow-up commit `2c8030a` counts the canonical D16 terminal relay once in
+  `remote_write_failures` and preserves the three raw/derived diagnostic lines
+  separately. Knife15 and Knife14 shell gates pass. It changes summary
+  semantics only, so the accepted observer gate remains valid.
+- This closes only the repaired-observer prerequisite; it is not formal M0.
+  Take a fresh physical-route baseline on the dedicated Shenzhen Mac, run the
+  formal M0, then run an independent start/smoke/stop rearm. M0 acceptance and
+  M1 remain blocked until those gates pass.
 - Exact source `b0fcb76` repeated a genuine receiver continuity failure in
   cycle 1 forward: five complete Target receiver zero-byte seconds plus one
   short tail row, `208,142,336B` over `300.175s`, and only `5.547 Mbit/s`
@@ -209,8 +224,7 @@ Current Knife15 summary, as of 2026-07-15:
   gates pass with no unresolved P0/P1.
 - The independent rearm lifecycle passed and cleaned process, utun, routes,
   and ownership, but its physical controls share the old observer defect.
-  Before another two-hour M0, run one fresh repaired-source
-  start/smoke/stop validation and verify numeric physical counters/rates.
+  The later exact-source short validation above closes that observer defect.
   Result:
   `docs/tech/2026-07-15-knife15-macos-m0-physical-counter-observer-repair-results.md`.
 

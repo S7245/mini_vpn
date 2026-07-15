@@ -3,7 +3,8 @@
 Date: 2026-07-15
 
 Status: **REAL RECEIVER INTERRUPTION REPEATED; INTERNAL REGRESSION REJECTED;
-PHYSICAL-COUNTER FALSE PASS REPAIRED LOCALLY; FRESH MACOS VALIDATION PENDING**
+PHYSICAL-COUNTER FALSE PASS REPAIRED AND SHORT-VALIDATED; FRESH SHENZHEN M0
+PENDING**
 
 ## Goal And Evidence
 
@@ -186,10 +187,50 @@ chunk, Cubic, GSO, queue, driver, pacing, or wake setting changed.
 - focused code review: PASS, no unresolved P0/P1; a P2 freshness-marker
   negative test was added and passes.
 
-M0 remains failed and blocks M1. Before spending another two-hour run, rebuild
-the repaired exact source on the dedicated Mac and run one fresh
-start/smoke/stop validation. Its `network.csv` must contain numeric physical
-packet/error/byte fields, nonzero traffic deltas/rates where traffic occurred,
-and no false physical errors. Then take a fresh direct baseline and run formal
-M0 plus independent rearm. Do not reuse either reviewed bundle as acceptance,
-relax the receiver SLI, or tune frozen constants.
+## Repaired-Observer Short Validation
+
+The user-executed start/smoke/stop bundle
+`/tmp/mini_vpn_knife15_macos_20260715_084113.tar.gz`, SHA-256
+`85dd7a6650b82441040e1a9bfaa4425a8021ed98b26795e1b9a3ea6680449a6b`,
+passes the repaired-observer gate on exact source `5e8846f`. Its runner and
+binary hashes match the reviewed local artifacts.
+
+All five `network.csv` rows have 27 columns and semantically numeric physical
+MTU, packet, error, byte, and collision fields. Physical input/output errors
+and collisions remained zero. Physical receive bytes increased by
+`185,341,406B`, transmit bytes by `106,914,245B`, and the three elapsed samples
+reported nonzero rates up to `68.744/26.766 Mbit/s` receive/transmit. The first
+two unknown rates are the expected initial/no-positive-elapsed state, not a
+shifted row. Exit and gateway controls were complete for all five process
+timestamps and had zero loss.
+
+Forward and reverse TCP smoke completed with `20/20` nonzero client intervals
+at `37.381/50.907 Mbit/s` receiver rate, and fake-IP DNS returned
+`198.18.0.2`. Endpoint conservation stayed at or below `61,365B` and ended
+`61,277/0/0B` available/live/outstanding. Pump waits/read errors, physical and
+utun errors, stranded D16 ownership, and endpoint abandonment were zero.
+Final evidence proves the process dead, `utun4` absent, and Target/Exit routes
+on physical `en1`.
+
+The generic `internal_failure_scan: REVIEW` does not represent three failures.
+One forward `Stopped(0)` close-tail is repeated as the raw write error,
+`tcp-handle-close`, and `tcp-d16-relay-close`; all corresponding D16 ownership
+closed at zero and the reverse flow rearmed successfully. The reverse
+client-close tail also retained terminal-drop diagnostics but no pending or
+endpoint ownership. These remain quality-review evidence, not an observer-gate
+failure.
+
+A post-validation shell TDD follow-up in commit `2c8030a` prevents that
+multiplicity from obstructing future review. `remote_write_failures` now counts
+the canonical D16 relay terminal record once, while the new
+`remote_write_failure_log_matches` preserves all three diagnostic lines. The
+generic REVIEW remains fail-visible. Internal/external Knife15 self-tests,
+Bash syntax, and the three Knife14 shell self-tests pass. This summary-only
+change does not alter physical observer collection, the data plane, or any
+frozen setting, so it does not invalidate the accepted observer gate.
+
+The physical-counter short validation is therefore PASS. M0 itself remains
+failed/incomplete and continues to block M1. The next action is a fresh direct
+baseline on the dedicated Shenzhen Mac, followed by formal M0 and an
+independent rearm. Do not reuse a prior baseline, relax the receiver SLI, or
+tune frozen constants.
