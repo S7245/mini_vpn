@@ -1,5 +1,23 @@
 # Errors
 
+## 2026-07-15 - The M0 network collector recorded routes but not controls
+
+- The accepted readiness plan required same-window direct/control RTT, loss,
+  and throughput, but the implemented `network.csv` contained only
+  `target_if` and `exit_if`. The omission was not caught by the earlier shell
+  self-test because it asserted route parsing rather than the evidence schema.
+- The next M0 then produced real receiver interruptions alongside QUIC
+  congestion. Clean TUN, endpoint, lifecycle, and resource evidence rejected
+  an internal regression, but the missing control prevented exact
+  external-path versus tunnel-only attribution.
+- The repair locks BSD ping parsing, total-loss semantics, gateway and physical
+  interface parsing, composed 27-column rows, raw logs, counter-derived rates,
+  freshness, watchdog identity, per-process correspondence, and fail-closed
+  partial-summary behavior.
+- Future formal evidence plans must have a schema-level self-test for every
+  promised evidence family. Do not equate route stability with path health,
+  and do not spend a long soak when its independent control is already missing.
+
 ## 2026-07-15 - M0 validated forward sender cadence as receiver quality
 
 - A full 300-second forward phase delivered `541,065,216B` to the Target with

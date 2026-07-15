@@ -1,9 +1,28 @@
 # Knife15 Long-Duration Release-Readiness Plan
 
 Date: 2026-07-14
-Status: **RECEIVER-EVIDENCE SEMANTICS REPAIRED; FRESH 2-HOUR M0 PENDING**
+Status: **REAL RECEIVER INTERRUPTION CONFIRMED; SAME-WINDOW NETWORK CONTROL
+REPAIRED LOCALLY; FRESH SHENZHEN M0 PENDING**
 
 ## Latest M0 Discriminator
+
+The 2026-07-15 M0 bundle from exact source `b5c3963` completed two mixed
+cycles, then cycle 3 forward contained four real Target receiver zero-byte
+seconds. Endpoint ownership, TUN/pump service, relay lifecycle, and resources
+remained clean, while QUIC loss/congestion rose and cwnd contracted to
+`25,174B` before recovery. This is a genuine continuity failure, not user
+operation or the earlier sender-evidence defect. The old runner lacked the
+required same-window physical-path controls, so external-path versus
+tunnel-only attribution remains unproven.
+
+The runner now samples direct Exit and physical-gateway RTT/loss plus physical
+interface counters/rates every 30 seconds, checks control freshness during M0,
+and fails closed on missing per-process network evidence. The independent
+stop/re-create/smoke/stop rearm passed. No data-plane or workload constant
+changed. Fresh M0 must use the dedicated Shenzhen Mac before M1. Result:
+`docs/tech/2026-07-15-knife15-macos-m0-network-control-discriminator-results.md`.
+
+Previous discriminator:
 
 The 2026-07-15 fresh M0 crossed 90 seconds and completed its first 300-second
 forward transfer at `14.420 Mbit/s` receiver, but the old runner aborted after
@@ -267,11 +286,13 @@ steady-state recovery is understood.
 
 ## Readiness Score
 
-At plan acceptance, long-duration release readiness is `6.5/10`: peak Linux
-capacity, core invariants, and short formal regressions are strong, but the new
-macOS runner, resource trend evidence, recovery SLOs, and staged 2/8/24-hour
-results do not yet exist. Reaching `10/10` requires Tasks 1-11 to pass with no
-unresolved P0/P1 and with complete fail-closed cleanup evidence.
+Current long-duration release readiness is `7.5/10`: peak Linux capacity, core
+invariants, the macOS runner, mixed M0 controller, exact receiver semantics,
+clean rearm, and same-window control collection are locally or operationally
+proven. A valid two-hour Shenzhen M0 still does not exist, so M1/M2/M3,
+measured recovery SLOs, and the complementary long Linux soak remain blocked.
+Reaching `10/10` requires Tasks 1-11 to pass with no unresolved P0/P1 and with
+complete fail-closed cleanup evidence.
 
 ## 2026-07-14 Execution Update
 

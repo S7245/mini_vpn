@@ -4,6 +4,36 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-15)
 
+- **Latest accepted position:** exact source `b5c3963` M0 bundle
+  `/tmp/mini_vpn_knife15_macos_20260715_032723.tar.gz` (SHA-256
+  `865aa440...`) completed two mixed cycles, then cycle 3 forward produced four
+  genuine Target receiver zero-byte seconds while still transferring exact
+  `230,031,360B` over 300 seconds. The direction-aware receiver SLI correctly
+  failed; this was not user operation or the earlier sender-evidence defect.
+- Internal regression discriminators are negative: endpoint conservation
+  stayed `<=61,440B` and ended `61,414/0/0B`; TUN/pump errors, lifecycle
+  timeouts, terminal reap, stranded D16 ownership, FD/thread growth, and log
+  compaction were zero. The failure window instead had QUIC cwnd contraction
+  down to `25,174B`, about `+550` lost packets, `+772,134B` lost bytes, and
+  `+237` congestion events before recovery.
+- Exact external-path versus tunnel-only attribution is not proven because the
+  old `network.csv` recorded only route names, despite the plan requiring
+  same-window direct/control RTT, loss, and throughput. The independent rearm
+  bundle `/tmp/mini_vpn_knife15_macos_20260715_051746.tar.gz` (SHA-256
+  `823926e6...`) passed fresh utun, TCP/DNS smoke, zero ownership, and cleanup.
+- The local runner now records Exit/gateway RTT/loss and physical-interface
+  counters/rates in a 27-column `network.csv`, preserves raw `network.log`,
+  verifies control completeness before M0, watches freshness and watchdog
+  identity during M0, and requires one valid network row per process sample at
+  final PASS. Root `635+2`, release build, Knife15/Knife14 shell gates, syntax,
+  diff, and review pass with no unresolved P0/P1. No frozen constant changed.
+- M0 remains failed and blocks M1. Next action is a fresh physical-route
+  baseline and formal M0 on the dedicated Shenzhen Mac, followed by its own
+  rearm bundle. Correlate any receiver-zero seconds with Exit/gateway controls,
+  physical counters, and QUIC deltas; do not tune constants or relax the SLI.
+  Result:
+  `docs/tech/2026-07-15-knife15-macos-m0-network-control-discriminator-results.md`.
+
 - **Latest accepted position:** fresh M0 bundle
   `/tmp/mini_vpn_knife15_macos_20260715_013158.tar.gz` (SHA-256 `5c04031e...`)
   completed its full first `300s` forward phase at `14.420 Mbit/s` Target

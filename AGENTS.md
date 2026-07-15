@@ -168,7 +168,7 @@ observed counters before modifying code again. Do not continue with the same
 class of tweak if the run proves that class of fix was only necessary, not
 sufficient.
 
-## Current Agent Role And Knife14 Position
+## Current Agent Role And Knife15 Position
 
 The agent's role in this repository is data-plane engineering for the
 mini_vpn core: read evidence, design small testable stages, implement Rust and
@@ -182,10 +182,34 @@ duration, and stable quality.
 For cold-start grounding, read this file, `Rules.md`, `HANDOFF.md`, `TODO.md`,
 latest `.learnings/LEARNINGS.md` / `.learnings/ERRORS.md`, and the relevant
 `docs/tech/2026-*.md` files. The older numbered `docs/tech/*.md` files are
-historical background; do not load all of them by default. For the current TCP
-throughput branch, prioritize the 2026 Knife14 documents, especially the
-US-client results, downlink/backpressure/lifecycle specs, and the latest
-results documents.
+historical background; do not load all of them by default. For current
+release-readiness work, prioritize the latest Knife15 result, long-duration
+plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
+documents as the frozen architecture/capacity baseline.
+
+Current Knife15 summary, as of 2026-07-15:
+
+- Exact source `b5c3963` completed two full macOS M0 mixed cycles, then cycle
+  3 forward contained four genuine Target receiver zero-byte seconds. The
+  direction-aware SLI correctly failed; this was not user operation or the
+  earlier sender-versus-receiver evidence defect.
+- Endpoint ownership, TUN/pump service, D16 lifecycle, and resources remained
+  clean. The failure window instead had QUIC loss/congestion growth and cwnd
+  contraction to `25,174B` before recovery. Do not tune frozen data-plane or
+  workload constants from this result.
+- Exact external-path versus tunnel-only attribution was not possible because
+  the old `network.csv` recorded routes but omitted the plan's same-window
+  controls. The runner now collects direct Exit and physical-gateway RTT/loss,
+  physical-interface counters/rates, raw network logs, and fail-closed
+  completeness/freshness correspondence.
+- The independent stop/re-create/smoke/stop rearm passed with zero final
+  ownership and clean route/TUN cleanup. Local Rust, release, shell, fmt/diff,
+  and review gates pass with no unresolved P0/P1.
+- M0 remains failed and blocks M1. The next formal M0 belongs on the dedicated
+  Shenzhen Mac after a fresh physical-route baseline. If continuity fails,
+  correlate the same seconds across Exit/gateway controls, physical counters,
+  and QUIC deltas. Result:
+  `docs/tech/2026-07-15-knife15-macos-m0-network-control-discriminator-results.md`.
 
 Current Knife14 summary, as of 2026-07-14:
 
@@ -225,7 +249,7 @@ Current Knife14 summary, as of 2026-07-14:
   explicitly scoped stage. Result:
   `docs/tech/2026-07-14-knife14h10d16-endpoint-pacing-service-vps-completion-results.md`.
 
-Current Knife15 plan, as of 2026-07-14:
+Earlier Knife15 plan and qualification context, as of 2026-07-14:
 
 - The formal macOS M0 controller is locally complete. It derives `50%`
   sustained and `80%` burst rates from a fresh same-target direct baseline,

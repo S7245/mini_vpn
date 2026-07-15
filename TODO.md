@@ -6,6 +6,28 @@
 
 #### Latest decision (2026-07-15)
 
+Exact source `b5c3963` completed two full mixed M0 cycles. Cycle 3 forward then
+contained four genuine Target receiver zero-byte seconds while transferring
+exactly `230,031,360B` over the full `300s`, so the receiver SLI correctly
+failed. This was not user operation and not the earlier sender-evidence defect.
+Endpoint ownership, TUN/pump service, relay lifecycle, and resource envelopes
+remained clean. QUIC loss/congestion rose and cwnd contracted to `25,174B`
+before recovery, selecting a path/QUIC congestion branch rather than a
+data-plane constant or lifecycle repair.
+
+The old runner did not collect the plan's same-window direct controls, so the
+artifact cannot distinguish external physical-path degradation from a
+tunnel-only UDP/QUIC event. The local evidence repair adds Exit/gateway
+RTT/loss, physical-interface counters/rates, raw network logs, pre-M0
+completeness, in-run freshness/watchdog checks, and fail-closed per-process
+network correspondence. All local Rust/release/shell/fmt/diff/review gates
+pass; no frozen setting changed. The separate rearm bundle passed.
+
+M0 is still incomplete. Next: rebuild on the dedicated Shenzhen Mac, exit any
+other VPN so Target/Exit use physical routes, take a fresh baseline, run the
+formal M0, then stop/re-create/smoke/stop. M1 remains blocked. Result:
+`docs/tech/2026-07-15-knife15-macos-m0-network-control-discriminator-results.md`.
+
 The fresh M0 bundle
 `/tmp/mini_vpn_knife15_macos_20260715_013158.tar.gz` (SHA-256 `5c04031e...`)
 completed its full first `300s` forward transfer at `14.420 Mbit/s` Target

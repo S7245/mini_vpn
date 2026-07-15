@@ -199,6 +199,10 @@ route_interface_from_text() {
   awk '/interface:/ {print $2; exit}'
 }
 
+route_gateway_from_text() {
+  awk '/gateway:/ {print $2; exit}'
+}
+
 route_interface() {
   route -n get "$1" 2>/dev/null | route_interface_from_text
 }
@@ -307,7 +311,7 @@ common_preflight() {
   local server target_if exit_if
 
   [[ "$(uname -s)" == "Darwin" ]] || die "Knife15 macOS runner requires Darwin"
-  for command_name in bash route ifconfig netstat ps lsof shasum tar awk sed grep sort comm; do
+  for command_name in bash route ifconfig netstat ping ps lsof shasum tar awk sed grep sort comm; do
     require_command "$command_name"
   done
   [[ -x "$BIN" ]] || die "release binary not found: $BIN (run cargo build --release first)"
@@ -397,14 +401,162 @@ conservation_check_file() {
 interface_csv_from_text() {
   local now="$1"
   local interface="$2"
-  awk -v now="$now" -v interface="$interface" '
+  local fields
+  fields="$(interface_control_fields_from_text "$interface")" || return 1
+  printf '%s,%s,%s\n' "$now" "$interface" "$fields"
+}
+
+interface_control_fields_from_text() {
+  local interface="$1"
+  awk -v interface="$interface" '
     $1 == interface && $3 ~ /^<Link#/ {
-      printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", now, $1, $2, $4, $5, $6, $7, $8, $9, $10
+      printf "%s,%s,%s,%s,%s,%s,%s,%s\n", $2, $4, $5, $6, $7, $8, $9, $10
       found = 1
       exit
     }
     END { if (!found) exit 1 }
   '
+}
+
+ping_control_fields_from_text() {
+  awk '
+    BEGIN {
+      transmitted = "unknown"
+      received = "unknown"
+      loss = "unknown"
+      rtt_min = "unknown"
+      rtt_avg = "unknown"
+      rtt_max = "unknown"
+    }
+    / packets transmitted, [0-9]+ packets received, [0-9.]+% packet loss/ {
+      if ($1 ~ /^[0-9]+$/) transmitted = $1
+      if ($4 ~ /^[0-9]+$/) received = $4
+      value = $7
+      sub(/%$/, "", value)
+      if (value ~ /^[0-9]+([.][0-9]+)?$/) loss = sprintf("%.6f", value + 0)
+    }
+    /min\/avg\/max\/(stddev|mdev) =/ {
+      value = $0
+      sub(/^.* = /, "", value)
+      sub(/ ms.*$/, "", value)
+      if (split(value, rtt, "/") >= 3 &&
+          rtt[1] ~ /^[0-9]+([.][0-9]+)?$/ &&
+          rtt[2] ~ /^[0-9]+([.][0-9]+)?$/ &&
+          rtt[3] ~ /^[0-9]+([.][0-9]+)?$/) {
+        rtt_min = rtt[1]
+        rtt_avg = rtt[2]
+        rtt_max = rtt[3]
+      }
+    }
+    END {
+      printf "%s,%s,%s,%s,%s,%s\n", transmitted, received, loss,
+        rtt_min, rtt_avg, rtt_max
+    }
+  '
+}
+
+network_control_envelope() {
+  local network_file="$1"
+  awk -F, '
+    function numeric(value) {
+      return value ~ /^[0-9]+([.][0-9]+)?$/
+    }
+    NR > 1 {
+      rows++
+      schema_valid = (NF == 27)
+      if (schema_valid && $6 ~ /^[0-9]+$/ && $7 ~ /^[0-9]+$/ && numeric($8)) {
+        exit_samples++
+        if (!have_exit_loss || $8 + 0 > exit_loss_max) exit_loss_max = $8 + 0
+        have_exit_loss = 1
+      }
+      if (schema_valid && numeric($10)) {
+        exit_rtt_samples++
+        if (!have_exit_rtt || $10 + 0 > exit_rtt_max) exit_rtt_max = $10 + 0
+        have_exit_rtt = 1
+      }
+      if (schema_valid && numeric($14)) {
+        gateway_samples++
+        if (!have_gateway_loss || $14 + 0 > gateway_loss_max) gateway_loss_max = $14 + 0
+        have_gateway_loss = 1
+      }
+      if (schema_valid && (($20 ~ /^[0-9]+$/ && $20 + 0 > 0) ||
+          ($23 ~ /^[0-9]+$/ && $23 + 0 > 0))) physical_error_samples++
+      if (schema_valid && $21 ~ /^[0-9]+$/ && $24 ~ /^[0-9]+$/) {
+        if (!physical_samples) {
+          ibytes_first = $21 + 0
+          obytes_first = $24 + 0
+        }
+        ibytes_last = $21 + 0
+        obytes_last = $24 + 0
+        physical_samples++
+      }
+      if (schema_valid && $26 ~ /^[0-9]+$/ && (!have_rx_bps || $26 + 0 > rx_bps_max)) {
+        rx_bps_max = $26 + 0
+        have_rx_bps = 1
+      }
+      if (schema_valid && $27 ~ /^[0-9]+$/ && (!have_tx_bps || $27 + 0 > tx_bps_max)) {
+        tx_bps_max = $27 + 0
+        have_tx_bps = 1
+      }
+    }
+    END {
+      printf "%d %d %d %d %d %d %d ", rows + 0, exit_samples + 0,
+        rows - exit_samples, exit_rtt_samples + 0, gateway_samples + 0,
+        rows - gateway_samples, physical_samples + 0
+      printf "%s %s %s %d ",
+        have_exit_loss ? sprintf("%.6f", exit_loss_max) : "unknown",
+        have_exit_rtt ? sprintf("%.3f", exit_rtt_max) : "unknown",
+        have_gateway_loss ? sprintf("%.6f", gateway_loss_max) : "unknown",
+        physical_error_samples + 0
+      if (physical_samples) {
+        printf "%.0f %.0f %.0f %.0f %.0f %.0f ", ibytes_first, ibytes_last,
+          ibytes_last - ibytes_first, obytes_first, obytes_last,
+          obytes_last - obytes_first
+      } else {
+        printf "unknown unknown unknown unknown unknown unknown "
+      }
+      printf "%s %s\n",
+        have_rx_bps ? sprintf("%.0f", rx_bps_max) : "unknown",
+        have_tx_bps ? sprintf("%.0f", tx_bps_max) : "unknown"
+    }
+  ' "$network_file" 2>/dev/null
+}
+
+network_control_is_sufficient() {
+  local run_dir="$1"
+  local attempts="${2:-1}"
+  local attempt
+  local process_samples network_samples exit_samples exit_missing exit_rtt_samples
+  local gateway_samples gateway_missing physical_samples rest
+  [[ "$attempts" =~ ^[0-9]+$ ]] && ((10#$attempts > 0)) || return 1
+  for ((attempt = 0; attempt < 10#$attempts; attempt++)); do
+    process_samples="$(awk 'END {print (NR > 0 ? NR - 1 : 0)}' \
+      "$run_dir/process.csv" 2>/dev/null)"
+    read -r network_samples exit_samples exit_missing exit_rtt_samples \
+      gateway_samples gateway_missing physical_samples rest \
+      <<<"$(network_control_envelope "$run_dir/network.csv")"
+    if [[ "$process_samples" =~ ^[0-9]+$ && "$network_samples" =~ ^[0-9]+$ && \
+      "$exit_samples" =~ ^[0-9]+$ && "$physical_samples" =~ ^[0-9]+$ ]] && \
+      ((10#$network_samples >= 2 && \
+        10#$network_samples == 10#$process_samples && \
+        10#$exit_samples == 10#$network_samples && \
+        10#$physical_samples == 10#$network_samples)); then
+      return 0
+    fi
+    ((attempt + 1 < 10#$attempts)) && sleep 1
+  done
+  return 1
+}
+
+network_control_is_recent() {
+  local valid_epoch now sample_secs max_age
+  valid_epoch="$(read_state network.valid.epoch 2>/dev/null || true)"
+  now="$(date +%s)"
+  sample_secs="$(read_state sample_secs 2>/dev/null || echo "$SAMPLE_SECS")"
+  [[ "$valid_epoch" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ && \
+    "$sample_secs" =~ ^[0-9]+$ ]] || return 1
+  max_age=$((2 * 10#$sample_secs + 10))
+  ((10#$now >= 10#$valid_epoch && 10#$now - 10#$valid_epoch <= max_age))
 }
 
 process_resource_envelope() {
@@ -824,7 +976,7 @@ EOF_M0_PROFILE
 }
 
 runner_self_test() {
-  local tmp good_log bad_log route_fixture interface_fixture clean_scan secret_scan_dir secret_value summary_dir baseline_dir m0_profile m0_run m0_fail_run fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash
+  local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir m0_profile m0_run m0_fail_run fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/knife15-macos-self-test.XXXXXX")" || return 1
   good_log="$tmp/good.log"
   bad_log="$tmp/bad.log"
@@ -1001,6 +1153,12 @@ EOF_FAKE_SLEEP
     '2026-07-14T00:00:30Z,utun42,1200,20,0,2000,35,0,3500,0' \
     '2026-07-14T00:01:00Z,utun42,1200,30,0,3000,50,0,5000,0' \
     >>"$m0_run/interface.csv"
+  printf '%s\n' \
+    'timestamp,target_route,exit_route,physical_interface,physical_gateway,exit_ping_transmitted,exit_ping_received,exit_ping_loss_percent,exit_ping_rtt_min_ms,exit_ping_rtt_avg_ms,exit_ping_rtt_max_ms,gateway_ping_transmitted,gateway_ping_received,gateway_ping_loss_percent,gateway_ping_rtt_min_ms,gateway_ping_rtt_avg_ms,gateway_ping_rtt_max_ms,physical_mtu,physical_ipkts,physical_ierrs,physical_ibytes,physical_opkts,physical_oerrs,physical_obytes,physical_collisions,physical_rx_bps,physical_tx_bps' \
+    '2026-07-14T00:00:00Z,utun42,en0,en0,192.168.50.1,3,3,0.000000,170.000,171.000,172.000,3,3,0.000000,1.000,1.500,2.000,1500,100,0,64000,90,0,60000,0,unknown,unknown' \
+    '2026-07-14T00:00:30Z,utun42,en0,en0,192.168.50.1,3,3,0.000000,170.100,171.100,172.100,3,3,0.000000,1.000,1.500,2.000,1500,200,0,128000,180,0,120000,0,17066,16000' \
+    '2026-07-14T00:01:00Z,utun42,en0,en0,192.168.50.1,3,2,33.300000,170.123,180.456,190.789,3,3,0.000000,1.000,1.500,2.000,1500,300,0,192000,270,0,180000,0,17066,16000' \
+    >"$m0_run/network.csv"
   write_summary "$m0_run"
   grep -Fq -- '- m0_status: complete' "$m0_run/summary.md" || \
     die "self-test: completed M0 summary status mismatch"
@@ -1036,6 +1194,23 @@ EOF_FAKE_SLEEP
     die "self-test: M0 completed phase count mismatch"
   grep -Fq -- '- m0_result_evidence: PASS' "$m0_run/summary.md" || \
     die "self-test: complete M0 result evidence was not accepted"
+  grep -Fq -- '- network_control_evidence: PASS' "$m0_run/summary.md" || \
+    die "self-test: complete M0 network controls were not accepted"
+  grep -Fq -- '- network_control_samples: 3' "$m0_run/summary.md" || \
+    die "self-test: network control sample count mismatch"
+  grep -Fq -- '- exit_ping_max_loss_percent: 33.300000' "$m0_run/summary.md" || \
+    die "self-test: Exit control loss envelope mismatch"
+  grep -Fq -- '- physical_ibytes_first_last_delta: 64000/192000/128000' \
+    "$m0_run/summary.md" || die "self-test: physical input byte envelope mismatch"
+  cp "$m0_run/network.csv" "$m0_run/network.complete.csv"
+  sed -i '' '$d' "$m0_run/network.csv"
+  write_summary "$m0_run"
+  grep -Fq -- '- network_control_evidence: PARTIAL' "$m0_run/summary.md" || \
+    die "self-test: missing same-window network control was not detected"
+  grep -Fq -- '- internal_failure_scan: REVIEW' "$m0_run/summary.md" || \
+    die "self-test: incomplete M0 network control did not require review"
+  mv "$m0_run/network.complete.csv" "$m0_run/network.csv"
+  write_summary "$m0_run"
   jq '.intervals[0].sum.bits_per_second = 0' \
     "$m0_run/m0/cycle_001_tcp-forward.json" \
     >"$m0_run/m0/cycle_001_tcp-forward.json.tmp"
@@ -1171,9 +1346,11 @@ EOF_FAIL_IPERF
   grep -Fq 'M0_BASELINE_DIR=' <<<"$usage_text" || \
     die "self-test: M0 baseline requirement missing from help"
 
-  printf '   interface: en0\n' >"$route_fixture"
+  printf '%s\n' '   gateway: 192.168.50.1' ' interface: en0' >"$route_fixture"
   [[ "$(route_interface_from_text <"$route_fixture")" == "en0" ]] || \
     die "self-test: route interface parser mismatch"
+  [[ "$(route_gateway_from_text <"$route_fixture")" == "192.168.50.1" ]] || \
+    die "self-test: route gateway parser mismatch"
   cat >"$interface_fixture" <<'EOF_INTERFACE'
 Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll
 utun42     1200  <Link#23>                         100     0      64000       90     0      60000     0
@@ -1181,6 +1358,83 @@ EOF_INTERFACE
   [[ "$(interface_csv_from_text 2026-07-14T00:00:00Z utun42 <"$interface_fixture")" == \
     "2026-07-14T00:00:00Z,utun42,1200,100,0,64000,90,0,60000,0" ]] || \
     die "self-test: interface counter parser mismatch"
+  [[ "$(interface_control_fields_from_text utun42 <"$interface_fixture")" == \
+    "1200,100,0,64000,90,0,60000,0" ]] || \
+    die "self-test: physical interface control parser mismatch"
+
+  ping_fixture="$tmp/ping.txt"
+  printf '%s\n' \
+    '3 packets transmitted, 2 packets received, 33.3% packet loss' \
+    'round-trip min/avg/max/stddev = 170.123/180.456/190.789/8.123 ms' \
+    >"$ping_fixture"
+  [[ "$(ping_control_fields_from_text <"$ping_fixture")" == \
+    "3,2,33.300000,170.123,180.456,190.789" ]] || \
+    die "self-test: ping control parser mismatch"
+  printf '%s\n' '3 packets transmitted, 0 packets received, 100.0% packet loss' \
+    >"$ping_fixture"
+  [[ "$(ping_control_fields_from_text <"$ping_fixture")" == \
+    "3,0,100.000000,unknown,unknown,unknown" ]] || \
+    die "self-test: total-loss ping control parser mismatch"
+
+  network_fixture="$tmp/network.csv"
+  printf '%s\n' \
+    'timestamp,target_route,exit_route,physical_interface,physical_gateway,exit_ping_transmitted,exit_ping_received,exit_ping_loss_percent,exit_ping_rtt_min_ms,exit_ping_rtt_avg_ms,exit_ping_rtt_max_ms,gateway_ping_transmitted,gateway_ping_received,gateway_ping_loss_percent,gateway_ping_rtt_min_ms,gateway_ping_rtt_avg_ms,gateway_ping_rtt_max_ms,physical_mtu,physical_ipkts,physical_ierrs,physical_ibytes,physical_opkts,physical_oerrs,physical_obytes,physical_collisions,physical_rx_bps,physical_tx_bps' \
+    '2026-07-14T00:00:00Z,utun42,en0,en0,192.168.50.1,3,3,0.000000,170.000,171.000,172.000,3,3,0.000000,1.000,1.500,2.000,1500,100,0,64000,90,0,60000,0,unknown,unknown' \
+    '2026-07-14T00:00:30Z,utun42,en0,en0,192.168.50.1,3,2,33.300000,170.123,180.456,190.789,3,3,0.000000,1.000,1.500,2.000,1500,200,1,128000,180,0,120000,0,17066,16000' \
+    >"$network_fixture"
+  [[ "$(network_control_envelope "$network_fixture")" == \
+    "2 2 0 2 2 0 2 33.300000 180.456 0.000000 1 64000 128000 64000 60000 120000 60000 17066 16000" ]] || \
+    die "self-test: network control envelope mismatch"
+
+  collector_dir="$tmp/network-collector"
+  collector_bin="$tmp/network-collector-bin"
+  mkdir -p "$collector_dir" "$collector_bin" "$tmp/network-collector-state"
+  cat >"$collector_bin/route" <<'EOF_FAKE_ROUTE'
+#!/usr/bin/env bash
+if [[ "${3:-}" == "43.153.32.33" ]]; then
+  printf '%s\n' 'gateway: 192.168.50.1' 'interface: en0'
+else
+  printf '%s\n' 'interface: utun42'
+fi
+EOF_FAKE_ROUTE
+  cat >"$collector_bin/ping" <<'EOF_FAKE_PING'
+#!/usr/bin/env bash
+host=""
+for host in "$@"; do :; done
+printf '%s\n' \
+  "3 packets transmitted, 3 packets received, 0.0% packet loss" \
+  "$([[ "$host" == "43.153.32.33" ]] && echo 'round-trip min/avg/max/stddev = 170.000/171.000/172.000/1.000 ms' || echo 'round-trip min/avg/max/stddev = 1.000/1.500/2.000/0.500 ms')"
+EOF_FAKE_PING
+  cat >"$collector_bin/netstat" <<'EOF_FAKE_NETSTAT'
+#!/usr/bin/env bash
+printf '%s\n' \
+  'Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll' \
+  'en0        1500  <Link#15>                         100     0      64000       90     0      60000     0'
+EOF_FAKE_NETSTAT
+  chmod +x "$collector_bin/route" "$collector_bin/ping" "$collector_bin/netstat"
+  printf '%s\n' \
+    'timestamp,target_route,exit_route,physical_interface,physical_gateway,exit_ping_transmitted,exit_ping_received,exit_ping_loss_percent,exit_ping_rtt_min_ms,exit_ping_rtt_avg_ms,exit_ping_rtt_max_ms,gateway_ping_transmitted,gateway_ping_received,gateway_ping_loss_percent,gateway_ping_rtt_min_ms,gateway_ping_rtt_avg_ms,gateway_ping_rtt_max_ms,physical_mtu,physical_ipkts,physical_ierrs,physical_ibytes,physical_opkts,physical_oerrs,physical_obytes,physical_collisions,physical_rx_bps,physical_tx_bps' \
+    >"$collector_dir/network.csv"
+  : >"$collector_dir/network.log"
+  printf 'timestamp\tevent\n' >"$collector_dir/events.tsv"
+  original_path="$PATH"
+  original_state_dir="$STATE_DIR"
+  PATH="$collector_bin:$PATH"
+  STATE_DIR="$tmp/network-collector-state"
+  write_state target 43.130.32.77
+  write_state exit_host 43.153.32.33
+  sample_network_control_for "$collector_dir" 2026-07-14T00:00:00Z
+  network_control_is_recent || die "self-test: fresh network control was rejected"
+  write_state network.valid.epoch 1
+  ! network_control_is_recent || die "self-test: stale network control was accepted"
+  PATH="$original_path"
+  STATE_DIR="$original_state_dir"
+  [[ "$(awk -F, 'NR == 2 {print NF ":" $2 ":" $3 ":" $4 ":" $5 ":" $8 ":" $10 ":" $14 ":" $20 ":" $23}' \
+    "$collector_dir/network.csv")" == \
+    "27:utun42:en0:en0:192.168.50.1:0.000000:171.000:0.000000:0:0" ]] || \
+    die "self-test: composed network control sample mismatch"
+  grep -Fq 'control=exit host=43.153.32.33 route=en0' \
+    "$collector_dir/network.log" || die "self-test: raw Exit control evidence missing"
 
   cat >"$good_log" <<'EOF_GOOD'
 🚀 TUN runtime started with pool_size=2, tun_mtu=1200, tun_tx_queue_len_estimate=500
@@ -1335,6 +1589,9 @@ gso_policy=enabled
 udp_send_service=quinn
 pacing_policy=endpoint-window-v1
 h10d16=enabled
+network_control_schema=knife15-macos-network-v2
+network_control_host=$SERVER_HOST
+network_control_ping=3x-icmp-200ms-spacing-1000ms-wait
 metrics_secs=$METRICS_SECS
 sample_secs=$SAMPLE_SECS
 max_log_bytes=$MAX_LOG_BYTES
@@ -1536,6 +1793,121 @@ interrupt_m0() {
   exit 130
 }
 
+sample_network_control_for() {
+  local run_dir="$1"
+  local now="$2"
+  local lock_dir exit_host target target_route exit_route_text exit_route physical_interface
+  local physical_gateway exit_ping_file gateway_ping_file exit_ping_pid gateway_ping_pid
+  local exit_ping_fields gateway_ping_fields physical_fields
+  local exit_ping_transmitted exit_ping_received exit_ping_loss ignored_ping_fields
+  local physical_mtu physical_ipkts physical_ierrs physical_ibytes
+  local physical_opkts physical_oerrs physical_obytes physical_collisions
+  local epoch previous_file previous_epoch previous_interface previous_ibytes previous_obytes elapsed
+  local lock_attempt lock_acquired=0 physical_rx_bps=unknown physical_tx_bps=unknown
+
+  lock_dir="$(state_file network-sample.lock)"
+  for ((lock_attempt = 0; lock_attempt < 5; lock_attempt++)); do
+    if mkdir "$lock_dir" 2>/dev/null; then
+      lock_acquired=1
+      break
+    fi
+    sleep 1
+  done
+  if ((lock_acquired != 1)); then
+    append_event_to "$run_dir" "network control sample skipped: collector busy"
+    return 0
+  fi
+
+  exit_host="$(read_state exit_host 2>/dev/null || echo "$SERVER_HOST")"
+  target="$(read_state target 2>/dev/null || echo "$TARGET")"
+  target_route="$(route_interface "$target")"
+  exit_route_text="$(route -n get "$exit_host" 2>/dev/null || true)"
+  exit_route="$(route_interface_from_text <<<"$exit_route_text")"
+  physical_interface="$exit_route"
+  physical_gateway="$(route_gateway_from_text <<<"$exit_route_text")"
+  exit_ping_file="$run_dir/.network-exit-ping.$$"
+  gateway_ping_file="$run_dir/.network-gateway-ping.$$"
+
+  ping -n -q -c 3 -i 0.2 -W 1000 "$exit_host" >"$exit_ping_file" 2>&1 &
+  exit_ping_pid=$!
+  gateway_ping_pid=""
+  if [[ -n "$physical_gateway" ]]; then
+    ping -n -q -c 3 -i 0.2 -W 1000 "$physical_gateway" >"$gateway_ping_file" 2>&1 &
+    gateway_ping_pid=$!
+  fi
+  wait "$exit_ping_pid" 2>/dev/null || true
+  if [[ -n "$gateway_ping_pid" ]]; then
+    wait "$gateway_ping_pid" 2>/dev/null || true
+  fi
+
+  exit_ping_fields="$(ping_control_fields_from_text <"$exit_ping_file")"
+  gateway_ping_fields="unknown,unknown,unknown,unknown,unknown,unknown"
+  if [[ -f "$gateway_ping_file" ]]; then
+    gateway_ping_fields="$(ping_control_fields_from_text <"$gateway_ping_file")"
+  fi
+  {
+    printf 'timestamp=%s control=exit host=%s route=%s\n' \
+      "$now" "$exit_host" "${exit_route:-unknown}"
+    sed 's/^/  /' "$exit_ping_file"
+    printf 'timestamp=%s control=gateway host=%s route=%s\n' \
+      "$now" "${physical_gateway:-unknown}" "${physical_interface:-unknown}"
+    if [[ -f "$gateway_ping_file" ]]; then
+      sed 's/^/  /' "$gateway_ping_file"
+    else
+      printf '  unavailable\n'
+    fi
+  } >>"$run_dir/network.log"
+  rm -f "$exit_ping_file" "$gateway_ping_file"
+
+  physical_fields="unknown,unknown,unknown,unknown,unknown,unknown,unknown,unknown"
+  if [[ -n "$physical_interface" ]]; then
+    physical_fields="$(netstat -ibn -I "$physical_interface" 2>/dev/null | \
+      interface_control_fields_from_text "$physical_interface" || \
+      echo unknown,unknown,unknown,unknown,unknown,unknown,unknown,unknown)"
+  fi
+  IFS=, read -r physical_mtu physical_ipkts physical_ierrs physical_ibytes \
+    physical_opkts physical_oerrs physical_obytes physical_collisions <<<"$physical_fields"
+
+  epoch="$(date +%s)"
+  previous_file="$(state_file network.previous)"
+  if [[ -f "$previous_file" ]]; then
+    read -r previous_epoch previous_interface previous_ibytes previous_obytes \
+      <"$previous_file" || true
+    if [[ "$epoch" =~ ^[0-9]+$ && "$previous_epoch" =~ ^[0-9]+$ && \
+      "$physical_interface" == "$previous_interface" && \
+      "$physical_ibytes" =~ ^[0-9]+$ && "$previous_ibytes" =~ ^[0-9]+$ && \
+      "$physical_obytes" =~ ^[0-9]+$ && "$previous_obytes" =~ ^[0-9]+$ ]] && \
+      ((10#$physical_ibytes >= 10#$previous_ibytes && \
+        10#$physical_obytes >= 10#$previous_obytes)); then
+      elapsed=$((10#$epoch - 10#$previous_epoch))
+      if ((elapsed > 0)); then
+        physical_rx_bps=$(((10#$physical_ibytes - 10#$previous_ibytes) * 8 / elapsed))
+        physical_tx_bps=$(((10#$physical_obytes - 10#$previous_obytes) * 8 / elapsed))
+      fi
+    fi
+  fi
+  if [[ "$epoch" =~ ^[0-9]+$ && "$physical_ibytes" =~ ^[0-9]+$ && \
+    "$physical_obytes" =~ ^[0-9]+$ ]]; then
+    printf '%s %s %s %s\n' "$epoch" "$physical_interface" \
+      "$physical_ibytes" "$physical_obytes" >"$previous_file"
+  fi
+
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$now" "${target_route:-unknown}" "${exit_route:-unknown}" \
+    "${physical_interface:-unknown}" "${physical_gateway:-unknown}" \
+    "$exit_ping_fields" "$gateway_ping_fields" "$physical_fields" \
+    "$physical_rx_bps" "$physical_tx_bps" >>"$run_dir/network.csv"
+  IFS=, read -r exit_ping_transmitted exit_ping_received exit_ping_loss \
+    ignored_ping_fields <<<"$exit_ping_fields"
+  if [[ "$epoch" =~ ^[0-9]+$ && "$exit_ping_transmitted" =~ ^[0-9]+$ && \
+    "$exit_ping_received" =~ ^[0-9]+$ && \
+    "$exit_ping_loss" =~ ^[0-9]+([.][0-9]+)?$ && \
+    "$physical_ibytes" =~ ^[0-9]+$ && "$physical_obytes" =~ ^[0-9]+$ ]]; then
+    write_state network.valid.epoch "$epoch"
+  fi
+  rmdir "$lock_dir" 2>/dev/null || true
+}
+
 sample_once_for() {
   local run_dir="$1"
   local pid utun now process_line rss cpu state etime fd_count thread_count log_file log_bytes avail_kb
@@ -1568,10 +1940,7 @@ sample_once_for() {
     printf '%s,%s,unknown,unknown,unknown,unknown,unknown,unknown,unknown,unknown\n' \
       "$now" "$utun" >>"$run_dir/interface.csv"
   fi
-  printf '%s,target_if=%s,exit_if=%s\n' "$now" \
-    "$(route_interface "$(read_state target 2>/dev/null || echo "$TARGET")")" \
-    "$(route_interface "$(read_state exit_host 2>/dev/null || echo "$SERVER_HOST")")" \
-    >>"$run_dir/network.csv"
+  sample_network_control_for "$run_dir" "$now"
 
   log_file="$run_dir/mini_vpn.log"
   if [[ -f "$log_file" ]]; then
@@ -1649,7 +2018,10 @@ start_runner() {
   printf 'timestamp,pid,rss_kib,cpu_percent,state,elapsed,fd_count,thread_rows\n' >"$run_dir/process.csv"
   printf 'timestamp,interface,mtu,ipkts,ierrs,ibytes,opkts,oerrs,obytes,collisions\n' \
     >"$run_dir/interface.csv"
-  printf 'timestamp,target_route,exit_route\n' >"$run_dir/network.csv"
+  printf '%s\n' \
+    'timestamp,target_route,exit_route,physical_interface,physical_gateway,exit_ping_transmitted,exit_ping_received,exit_ping_loss_percent,exit_ping_rtt_min_ms,exit_ping_rtt_avg_ms,exit_ping_rtt_max_ms,gateway_ping_transmitted,gateway_ping_received,gateway_ping_loss_percent,gateway_ping_rtt_min_ms,gateway_ping_rtt_avg_ms,gateway_ping_rtt_max_ms,physical_mtu,physical_ipkts,physical_ierrs,physical_ibytes,physical_opkts,physical_oerrs,physical_obytes,physical_collisions,physical_rx_bps,physical_tx_bps' \
+    >"$run_dir/network.csv"
+  : >"$run_dir/network.log"
   printf 'timestamp\tevent\n' >"$run_dir/events.tsv"
 
   write_state run_dir "$run_dir"
@@ -1660,6 +2032,7 @@ start_runner() {
   write_state iperf_port "$IPERF_PORT"
   write_state duration "$DURATION"
   write_state parallel "$PARALLEL"
+  write_state sample_secs "$SAMPLE_SECS"
   write_state dns_name "$DNS_NAME"
   owner_uid="${SUDO_UID:-0}"
   owner_gid="${SUDO_GID:-0}"
@@ -1886,6 +2259,14 @@ m0_assert_run_healthy() {
   fi
   if ! active_pid; then
     append_event_to "$run_dir" "m0 health failed: mini_vpn not running"
+    return 1
+  fi
+  if ! watchdog_matches_run; then
+    append_event_to "$run_dir" "m0 health failed: watchdog not running"
+    return 1
+  fi
+  if ! network_control_is_recent; then
+    append_event_to "$run_dir" "m0 health failed: network control sample stale or invalid"
     return 1
   fi
   utun="$(read_state utun 2>/dev/null || true)"
@@ -2174,6 +2555,8 @@ run_m0_action() {
     die "TARGET no longer routes through $utun"
   [[ "$(route_interface "$exit_host")" != "$utun" ]] || \
     die "Exit route recursed into $utun"
+  network_control_is_sufficient "$run_dir" 5 && network_control_is_recent || \
+    die "formal M0 requires complete, recent Exit and physical-interface controls from start/smoke"
   require_command jq
   require_command iperf3
   require_command dig
@@ -2216,10 +2599,11 @@ run_m0_action() {
     trap - INT TERM HUP
     clear_workload_state
     if ! sample_once_for "$run_dir" || ! m0_assert_run_healthy "$run_dir" || \
-      ! m0_final_ownership_is_clean "$run_dir/mini_vpn.log"; then
+      ! m0_final_ownership_is_clean "$run_dir/mini_vpn.log" || \
+      ! network_control_is_sufficient "$run_dir" 5; then
       printf '%s\n' failed >"$run_dir/m0.status"
-      append_event_to "$run_dir" "m0 failed: final evidence sample or health check"
-      die "M0 traffic completed but final evidence/health/ownership failed; TUN remains for stop"
+      append_event_to "$run_dir" "m0 failed: final evidence, health, ownership, or network controls"
+      die "M0 traffic completed but final evidence/health/ownership/network controls failed; TUN remains for stop"
     fi
     echo "PASS: formal 2-hour M0 workload completed; TUN remains running"
     echo "run_dir=$run_dir"
@@ -2310,6 +2694,13 @@ write_summary() {
   local m0_sender_zero_intervals m0_receiver_zero_intervals
   local m0_phase_results m0_result_evidence
   local m0_dns_result_files m0_invalid_dns_results m0_dns_evidence m0_timeline_evidence
+  local process_samples_total network_control_evidence network_control_samples
+  local exit_ping_samples exit_ping_missing_samples exit_ping_rtt_samples
+  local gateway_ping_samples gateway_ping_missing_samples physical_interface_samples
+  local exit_ping_max_loss exit_ping_max_avg_rtt gateway_ping_max_loss physical_interface_error_samples
+  local physical_ibytes_first physical_ibytes_last physical_ibytes_delta
+  local physical_obytes_first physical_obytes_last physical_obytes_delta
+  local physical_rx_bps_max physical_tx_bps_max
   if conservation_check_file "$log_file"; then
     conservation=PASS
   else
@@ -2348,6 +2739,22 @@ write_summary() {
     <<<"$(m0_result_envelope "$run_dir/m0")"
   read -r m0_dns_result_files m0_invalid_dns_results \
     <<<"$(m0_dns_result_envelope "$run_dir/m0")"
+  process_samples_total="$(awk 'END {print (NR > 0 ? NR - 1 : 0)}' \
+    "$run_dir/process.csv" 2>/dev/null)"
+  read -r network_control_samples exit_ping_samples exit_ping_missing_samples \
+    exit_ping_rtt_samples gateway_ping_samples gateway_ping_missing_samples \
+    physical_interface_samples exit_ping_max_loss exit_ping_max_avg_rtt \
+    gateway_ping_max_loss physical_interface_error_samples physical_ibytes_first \
+    physical_ibytes_last physical_ibytes_delta physical_obytes_first \
+    physical_obytes_last physical_obytes_delta physical_rx_bps_max physical_tx_bps_max \
+    <<<"$(network_control_envelope "$run_dir/network.csv")"
+  network_control_evidence=MISSING
+  if network_control_is_sufficient "$run_dir"; then
+    network_control_evidence=PASS
+  elif [[ "$network_control_samples" =~ ^[0-9]+$ ]] && \
+    ((10#$network_control_samples > 0)); then
+    network_control_evidence=PARTIAL
+  fi
   m0_result_evidence=NOT_APPLICABLE
   m0_dns_evidence=NOT_APPLICABLE
   m0_timeline_evidence=NOT_APPLICABLE
@@ -2381,6 +2788,8 @@ write_summary() {
     [[ "$m0_result_evidence" == "MISMATCH" ]] || \
     [[ "$m0_dns_evidence" == "MISMATCH" ]] || \
     [[ "$m0_timeline_evidence" == "MISMATCH" ]] || \
+    { [[ "$m0_status" == "complete" ]] && \
+      [[ "$network_control_evidence" != "PASS" ]]; } || \
     { [[ "$log_compactions" =~ ^[0-9]+$ ]] && ((10#$log_compactions > 0)); } || \
     { [[ "$m0_invalid_results" =~ ^[0-9]+$ ]] && ((10#$m0_invalid_results > 0)); } || \
     { [[ "$m0_sender_zero_intervals" =~ ^[0-9]+$ ]] && \
@@ -2389,6 +2798,8 @@ write_summary() {
     ((10#$m0_receiver_zero_intervals > 0)); } || \
     { [[ "$interface_error_samples" =~ ^[0-9]+$ ]] && \
     ((10#$interface_error_samples > 0)); } || \
+    { [[ "$physical_interface_error_samples" =~ ^[0-9]+$ ]] && \
+    ((10#$physical_interface_error_samples > 0)); } || \
     grep -Eq 'pump_full_waits=[1-9][0-9]*|pump_read_errors=[1-9][0-9]*|tun_flush_tx_failures=[1-9][0-9]*|terminal_pending_reap_bytes=[1-9][0-9]*|写入上游流失败|reason=remote_write_failed|reason=stalled_write_timeout|reason=idle_timeout' "$log_file"; then
     verdict=REVIEW
   else
@@ -2402,6 +2813,18 @@ write_summary() {
 - internal_failure_scan: $verdict
 - remote_write_failures: ${remote_write_failures:-unknown}
 - interface_error_samples: ${interface_error_samples:-unknown}
+- network_control_evidence: $network_control_evidence
+- network_control_samples: ${network_control_samples:-0}
+- exit_ping_samples_missing_rtt_samples: ${exit_ping_samples:-0}/${exit_ping_missing_samples:-0}/${exit_ping_rtt_samples:-0}
+- exit_ping_max_loss_percent: ${exit_ping_max_loss:-unknown}
+- exit_ping_max_avg_rtt_ms: ${exit_ping_max_avg_rtt:-unknown}
+- gateway_ping_samples_missing: ${gateway_ping_samples:-0}/${gateway_ping_missing_samples:-0}
+- gateway_ping_max_loss_percent: ${gateway_ping_max_loss:-unknown}
+- physical_interface_samples: ${physical_interface_samples:-0}
+- physical_interface_error_samples: ${physical_interface_error_samples:-0}
+- physical_ibytes_first_last_delta: ${physical_ibytes_first:-unknown}/${physical_ibytes_last:-unknown}/${physical_ibytes_delta:-unknown}
+- physical_obytes_first_last_delta: ${physical_obytes_first:-unknown}/${physical_obytes_last:-unknown}/${physical_obytes_delta:-unknown}
+- physical_rx_tx_bps_max: ${physical_rx_bps_max:-unknown}/${physical_tx_bps_max:-unknown}
 - mini_vpn_log_bytes: ${log_bytes:-unknown}
 - log_compactions: ${log_compactions:-unknown}
 - m0_status: $m0_status
@@ -2435,7 +2858,7 @@ write_summary() {
 - endpoint_conservation_max_bytes: ${endpoint_conservation_max:-unknown}
 - endpoint_last_available_live_outstanding: ${endpoint_last_available:-unknown}/${endpoint_last_live:-unknown}/${endpoint_last_outstanding:-unknown}
 - endpoint_max_live_outstanding: ${endpoint_max_live:-unknown}/${endpoint_max_outstanding:-unknown}
-- process_samples: $(awk 'END {print (NR > 0 ? NR - 1 : 0)}' "$run_dir/process.csv" 2>/dev/null)
+- process_samples: ${process_samples_total:-0}
 - endpoint_samples: ${endpoint_samples_count:-0}
 - data_plane_samples: $(grep -c '📊 数据面' "$log_file" 2>/dev/null || true)
 - events: $(awk 'END {print (NR > 0 ? NR - 1 : 0)}' "$run_dir/events.tsv" 2>/dev/null)

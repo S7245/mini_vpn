@@ -1,5 +1,26 @@
 # Learnings
 
+## 2026-07-15 - A path diagnosis needs a live control, not a pre-run baseline
+
+- A fresh direct baseline sized the workload correctly, but it could not
+  classify four receiver-zero seconds that happened about 30 minutes later.
+  QUIC loss/cwnd collapse plus clean internal invariants strongly selected a
+  path event, yet route-name-only `network.csv` evidence could not prove
+  whether the physical path degraded in the same seconds.
+- A useful long-run network control must stay outside the tunnel and share the
+  observation window. Direct Exit and local-gateway RTT/loss, combined with
+  physical-interface byte/rate/error counters, now provide that comparison
+  without changing the VPN workload.
+- Evidence liveness is an owned invariant. Formal M0 now proves controls before
+  starting, verifies the watchdog and recent valid controls while running, and
+  requires network/process sample correspondence before PASS.
+- Reusable rule: a baseline establishes capacity and provenance; only a
+  continuously sampled independent control establishes time-local causality.
+  When that control is missing, preserve the likely diagnosis but state the
+  attribution limit instead of tuning the product.
+- Result:
+  `docs/tech/2026-07-15-knife15-macos-m0-network-control-discriminator-results.md`.
+
 ## 2026-07-15 - Measure continuity at the receiving user boundary
 
 - A forward iperf client reports sender application-write intervals at the

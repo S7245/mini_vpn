@@ -1,8 +1,8 @@
 # Knife15 macOS HITL M0 Runbook
 
 Date: 2026-07-14
-Status: **Short HK qualification PASS; formal 2-hour M0 controller locally
-verified and awaiting user execution**
+Status: **HK M0 selected a real receiver interruption; same-window controls
+locally repaired; fresh Shenzhen M0 awaiting user execution**
 
 ## Purpose And Authority Boundary
 
@@ -21,7 +21,8 @@ install a default route or change system DNS.
 
 - Use a clean checkout containing `scripts/knife15-macos-soak.sh`.
 - Install `cargo`, `iperf3`, `jq`, and the normal mini_vpn build dependencies.
-  macOS must also provide `dig` for the periodic fake-IP DNS checks.
+  macOS must also provide `dig` for periodic fake-IP DNS checks and its normal
+  BSD `ping` for same-window Exit/gateway controls.
 - Keep the five TUIC credential/configuration values local. Never paste UUID,
   password, private keys, or credential-bearing environment output into chat.
 - Use a certificate-only CA file. The runner rejects private-key material.
@@ -123,6 +124,15 @@ Target receiver intervals returned in `server_output_json`; reverse quality is
 judged from the local receiver intervals. Sender-only zero intervals remain
 visible in the summary and trigger review without prematurely ending M0.
 
+Every periodic snapshot also pings the TUIC Exit directly outside the utun,
+pings the current physical gateway, and records physical-interface packet,
+byte, error, and derived bit-rate fields. `m0` refuses to start unless the
+start/smoke samples are complete and recent. During the workload it verifies
+the watchdog and a recent valid control at least every two seconds; final PASS
+requires a valid Exit and physical-interface control for every process sample.
+ICMP total loss is preserved as valid path evidence with unknown RTT. Missing
+or unparseable controls are not silently converted to PASS.
+
 On a successful M0, run `status` and then `stop`; no manual `snapshot` is
 needed. `stop` first terminates any identity-verified M0 controller, then terminates
 mini_vpn, removes only routes still owned by this run, scans for secret-shaped
@@ -176,11 +186,13 @@ agent can inspect a bundle that remains on the shared HK Mac by its local path.
 
 ## Qualification Decision
 
-The first HK short run has already qualified the target-only runner. Formal M0
-passes only after the two-hour bundle shows `m0_status: complete`, zero phase
+The HK lane has qualified target-only lifecycle and clean rearm, but its latest
+M0 contained four real receiver-zero seconds and therefore remains failed. Per
+the accepted task order, run the next formal M0 on the dedicated Shenzhen Mac.
+Formal M0 passes only after the two-hour bundle shows `m0_status: complete`, zero phase
 and health failures, one completed idle/resume/final-drain sequence, every
 endpoint conservation sample at or below `61,440B`, zero final live and
 outstanding ownership, bounded resource envelopes, no unexplained TUN errors,
-no lossy log compaction, and clean stop. The fresh re-create/smoke/stop bundle
-must independently prove rearm and cleanup. M0 does not complete M1, M2, or
-M3.
+complete same-window network controls, no lossy log compaction, and clean stop.
+The fresh re-create/smoke/stop bundle must independently prove rearm and
+cleanup. M0 does not complete M1, M2, or M3.
