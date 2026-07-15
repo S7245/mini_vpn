@@ -39,6 +39,10 @@ M0_SHORT_SECS="${M0_SHORT_SECS:-10}"
 M0_SHORT_COUNT="${M0_SHORT_COUNT:-6}"
 M0_IDLE_SECS="${M0_IDLE_SECS:-300}"
 M0_FINAL_DRAIN_SECS="${M0_FINAL_DRAIN_SECS:-120}"
+# iperf only reports completed application buffers. Its 128KiB TCP default can
+# fabricate one-second receiver zeros below 1 Mbit/s, so reverse evidence uses
+# a smaller observer buffer while the forward discriminator stays unchanged.
+TCP_REVERSE_IPERF_LENGTH_BYTES=16384
 M0_IPERF3_BIN=iperf3
 M0_DIG_BIN=dig
 M0_SLEEP_BIN=sleep
@@ -1060,6 +1064,7 @@ tcp_reverse_bps=$((10#$reverse_bps / 2))
 udp_reverse_bps=$((10#$reverse_bps / 2))
 short_forward_bps=$((10#$forward_bps * 4 / 5))
 short_reverse_bps=$((10#$reverse_bps * 4 / 5))
+tcp_reverse_iperf_length_bytes=$TCP_REVERSE_IPERF_LENGTH_BYTES
 udp_payload_bytes=1160
 total_secs=$M0_TOTAL_SECS
 tcp_epoch_secs=$M0_TCP_SECS
@@ -1178,6 +1183,8 @@ runner_self_test() {
     die "self-test: M0 sustained reverse rate must be 50% of baseline"
   grep -Fq 'short_forward_bps=7235805' "$m0_profile" || \
     die "self-test: M0 burst forward rate must be 80% of baseline"
+  grep -Fq 'tcp_reverse_iperf_length_bytes=16384' "$m0_profile" || \
+    die "self-test: M0 reverse TCP observer granularity missing from profile"
   grep -Fq 'udp_payload_bytes=1160' "$m0_profile" || \
     die "self-test: M0 UDP payload drifted from the MTU1200-safe shape"
 
@@ -1254,6 +1261,21 @@ EOF_FAKE_SLEEP
   M0_DIG_BIN="$fake_dig"
   M0_SLEEP_BIN="$fake_sleep"
   : >"$M0_TEST_COMMAND_LOG"
+  run_direct_baseline_probe "$tmp/baseline-forward.json" 43.130.32.77 5201 \
+    20 1 0 "$fake_iperf" >/dev/null || \
+    die "self-test: direct forward baseline probe failed"
+  run_direct_baseline_probe "$tmp/baseline-reverse.json" 43.130.32.77 5201 \
+    20 1 1 "$fake_iperf" >/dev/null || \
+    die "self-test: direct reverse baseline probe failed"
+  grep -Fxq \
+    'iperf3 -c 43.130.32.77 -p 5201 -t 20 -P 1 --json --get-server-output' \
+    "$M0_TEST_COMMAND_LOG" || \
+    die "self-test: direct forward baseline shape changed"
+  grep -Fxq \
+    'iperf3 -c 43.130.32.77 -p 5201 -t 20 -P 1 -l 16384 -R --json --get-server-output' \
+    "$M0_TEST_COMMAND_LOG" || \
+    die "self-test: direct reverse baseline lacks low-rate receiver granularity"
+  : >"$M0_TEST_COMMAND_LOG"
   run_direct_continuity_probe "$tmp/direct-probe.json" 43.130.32.77 5201 \
     300 4522378 "$fake_iperf" || \
     die "self-test: valid direct continuity probe rejected"
@@ -1273,9 +1295,9 @@ EOF_FAKE_SLEEP
   grep -Fq 'iperf3 -c 43.130.32.77 -p 5201 -t 2 -P 1 -b 4522378 --json --get-server-output' \
     "$M0_TEST_COMMAND_LOG" || \
     die "self-test: M0 forward TCP did not request receiver evidence"
-  grep -Fq 'iperf3 -c 43.130.32.77 -p 5201 -t 2 -P 1 -b 13395070 -R --json --get-server-output' \
+  grep -Fq 'iperf3 -c 43.130.32.77 -p 5201 -t 2 -P 1 -b 13395070 -l 16384 -R --json --get-server-output' \
     "$M0_TEST_COMMAND_LOG" || \
-    die "self-test: M0 sustained reverse TCP command mismatch"
+    die "self-test: M0 sustained reverse TCP lacks low-rate receiver granularity"
   grep -Fq 'iperf3 -c 43.130.32.77 -p 5201 -t 1 -P 1 -b 13395070 -u -l 1160 -R --json --get-server-output' \
     "$M0_TEST_COMMAND_LOG" || die "self-test: M0 reverse UDP command mismatch"
   grep -Fq 'iperf3 -c 43.130.32.77 -p 5201 -t 1 -P 1 -b 7235805 --json --get-server-output' \
@@ -2425,6 +2447,26 @@ start_runner() {
   echo "Next: sudo -E bash scripts/knife15-macos-soak.sh smoke"
 }
 
+run_direct_baseline_probe() {
+  local output_file="$1"
+  local target="$2"
+  local iperf_port="$3"
+  local duration="$4"
+  local parallel="$5"
+  local reverse="$6"
+  local iperf_bin="$7"
+  if [[ "$reverse" == "1" ]]; then
+    run_logged "$output_file" "$iperf_bin" -c "$target" -p "$iperf_port" \
+      -t "$duration" -P "$parallel" -l "$TCP_REVERSE_IPERF_LENGTH_BYTES" -R \
+      --json --get-server-output
+  elif [[ "$reverse" == "0" ]]; then
+    run_logged "$output_file" "$iperf_bin" -c "$target" -p "$iperf_port" \
+      -t "$duration" -P "$parallel" --json --get-server-output
+  else
+    return 2
+  fi
+}
+
 run_baseline() {
   local out_dir
   common_preflight
@@ -2433,15 +2475,13 @@ run_baseline() {
   out_dir="${BASELINE_OUT_DIR:-/tmp/mini_vpn_knife15_macos_baseline_$(date -u '+%Y%m%d_%H%M%S')}"
   mkdir -p "$out_dir" || die "cannot create baseline output directory"
   echo "Running direct forward baseline..."
-  if ! run_logged "$out_dir/direct-forward.json" \
-    iperf3 -c "$TARGET" -p "$IPERF_PORT" -t "$DURATION" -P "$PARALLEL" \
-      --json --get-server-output; then
+  if ! run_direct_baseline_probe "$out_dir/direct-forward.json" "$TARGET" \
+    "$IPERF_PORT" "$DURATION" "$PARALLEL" 0 iperf3; then
     die "direct forward baseline failed; evidence: $out_dir/direct-forward.json"
   fi
   echo "Running direct reverse baseline..."
-  if ! run_logged "$out_dir/direct-reverse.json" \
-    iperf3 -c "$TARGET" -p "$IPERF_PORT" -t "$DURATION" -P "$PARALLEL" -R \
-      --json --get-server-output; then
+  if ! run_direct_baseline_probe "$out_dir/direct-reverse.json" "$TARGET" \
+    "$IPERF_PORT" "$DURATION" "$PARALLEL" 1 iperf3; then
     die "direct reverse baseline failed; evidence: $out_dir/direct-reverse.json"
   fi
   validate_m0_baseline_pair "$out_dir" "$TARGET" || \
@@ -2686,7 +2726,8 @@ run_m0_iperf_phase() {
       -t "$duration" -P 1 -b "$rate_bps" -u -l 1160 --json --get-server-output
   elif [[ "$reverse" == "1" ]]; then
     run_m0_logged "$output_file" "$M0_IPERF3_BIN" -c "$target" -p "$iperf_port" \
-      -t "$duration" -P 1 -b "$rate_bps" -R --json --get-server-output
+      -t "$duration" -P 1 -b "$rate_bps" -l "$TCP_REVERSE_IPERF_LENGTH_BYTES" -R \
+      --json --get-server-output
   else
     run_m0_logged "$output_file" "$M0_IPERF3_BIN" -c "$target" -p "$iperf_port" \
       -t "$duration" -P 1 -b "$rate_bps" --json --get-server-output
