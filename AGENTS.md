@@ -189,6 +189,31 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-07-15:
 
+- Exact source `b0fcb76` repeated a genuine receiver continuity failure in
+  cycle 1 forward: five complete Target receiver zero-byte seconds plus one
+  short tail row, `208,142,336B` over `300.175s`, and only `5.547 Mbit/s`
+  from a `14.425 Mbit/s` offer. The user sequence and baseline provenance were
+  correct; delayed final sudo input cannot cause an earlier completed phase to
+  fail.
+- Internal ownership, TUN/pump, lifecycle, and resources remained clean. The
+  failure aligned with bulk QUIC loss/congestion, cwnd contraction, and a
+  `10.05s` writer wait. Exit/gateway ICMP controls were complete and broadly
+  stable around the zero seconds, but cannot isolate one-second or flow-
+  specific path events.
+- The new network-v2 observer had a separate false PASS: a physical BSD
+  `netstat` Link row included an Address field absent from the utun fixture,
+  shifting every counter while preserving 27 CSV columns. Commit `524139b`
+  parses both row shapes and requires semantic numeric validity before
+  physical samples, errors, rates, or freshness can pass. Focused shell TDD,
+  root `635+3 ignored`, main `2`, release, Knife14 shell, fmt/diff, and review
+  gates pass with no unresolved P0/P1.
+- The independent rearm lifecycle passed and cleaned process, utun, routes,
+  and ownership, but its physical controls share the old observer defect.
+  Before another two-hour M0, run one fresh repaired-source
+  start/smoke/stop validation and verify numeric physical counters/rates.
+  Result:
+  `docs/tech/2026-07-15-knife15-macos-m0-physical-counter-observer-repair-results.md`.
+
 - Exact source `b5c3963` completed two full macOS M0 mixed cycles, then cycle
   3 forward contained four genuine Target receiver zero-byte seconds. The
   direction-aware SLI correctly failed; this was not user operation or the

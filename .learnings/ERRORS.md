@@ -1,5 +1,32 @@
 # Errors
 
+## 2026-07-15 - A physical link Address shifted every network counter
+
+- The network-v2 parser was tested only with a utun-shaped `<Link#>` row whose
+  Address column was empty. A physical `en*` row included a link Address, so
+  the fixed `$4..$10` extraction shifted all counters and omitted collisions.
+- The 27-column output still passed schema width, sample correspondence, and
+  freshness. It falsely reported every packet sample as an interface error,
+  byte/rate deltas as zero, and `network_control_evidence: PASS`.
+- The repair detects the optional Address field, requires numeric MTU and all
+  seven counters, and refuses errors, bytes, rates, freshness, and final PASS
+  when physical semantics are invalid. A real physical-row fixture and a
+  deliberately shifted 27-column fixture lock both failure modes.
+- Future platform observers must include real physical and virtual interface
+  row shapes in their fixtures before a long run. A syntactically complete
+  evidence row is not necessarily a semantically valid control.
+
+## 2026-07-15 - A regression gate used stale invented script names
+
+- After Rust and release gates passed, a fail-fast command stopped with exit
+  `127` because it invoked nonexistent `knife14-*-self-test.sh` names instead
+  of the repository's actual `knife14b-*.sh --self-test` interfaces.
+- The failure was command selection, not a product regression. `rg --files`
+  and each script's self-test dispatch identified the correct commands; the
+  low-RTT, US-client-suite, and sing-box-control gates then passed.
+- Future handoff text that names a gate family is not a shell command source.
+  Discover the checked-in executable path first, then use fail-fast execution.
+
 ## 2026-07-15 - The M0 network collector recorded routes but not controls
 
 - The accepted readiness plan required same-window direct/control RTT, loss,

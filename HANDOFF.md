@@ -4,7 +4,40 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-15)
 
-- **Latest accepted position:** exact source `b5c3963` M0 bundle
+- **Latest accepted position:** exact source `b0fcb76` M0 bundle
+  `/tmp/mini_vpn_knife15_macos_20260715_072254.tar.gz` (SHA-256
+  `0127e3af...`) correctly failed cycle 1 forward after five complete Target
+  receiver zero-byte seconds plus one short tail. The command ran the full
+  `300s`; receiver delivery was `208,142,336B / 5.547 Mbit/s` from a
+  `14.425 Mbit/s` offer. Baseline/provenance and user operation were correct.
+  Delayed sudo input before the later stop can only delay cleanup, not cause an
+  earlier completed receiver interval to become zero.
+- Internal regression discriminators remained negative: endpoint conservation
+  stayed `<=61,440B` and ended `61,414/0/0B`; utun errors, pump waits/errors,
+  endpoint blocking/delay, D16 ownership, terminal reap, reconnect, resource
+  growth, and log compaction were absent. The bulk QUIC connection instead
+  showed loss/congestion growth, cwnd contraction, and a `10.05s` writer wait.
+- Exit/gateway ping controls were complete and broadly stable in the failure
+  window, but the physical-counter portion was invalid. BSD physical
+  `netstat` included a Link Address absent from the utun test fixture, shifting
+  all counters while retaining 27 columns. The old summary's
+  `network_control_evidence: PASS`, physical errors, and zero rates were false.
+- Commit `524139b` parses Link rows with or without Address and requires all
+  physical MTU/counter fields to be numeric before sample/error/byte/rate or
+  freshness acceptance. Three RED/GREEN cycles plus a review P2 freshness
+  negative test pass. Root `635+3 ignored`, main `2`, release, Knife15 and
+  Knife14 shell gates, syntax, fmt/diff, and review pass; no P0/P1 or frozen
+  constant change remains.
+- Rearm bundle `/tmp/mini_vpn_knife15_macos_20260715_074823.tar.gz` (SHA-256
+  `6d271b0c...`) passed fresh create, TCP/DNS smoke, zero ownership, route/utun
+  cleanup, and process exit. Its physical rows share the old observer defect.
+  M0 remains failed and blocks M1. Next run one repaired-source
+  start/smoke/stop short validation, verify numeric physical counters and
+  meaningful rates, then take a fresh baseline and run formal Shenzhen M0 plus
+  independent rearm. Result:
+  `docs/tech/2026-07-15-knife15-macos-m0-physical-counter-observer-repair-results.md`.
+
+- **Previous accepted position:** exact source `b5c3963` M0 bundle
   `/tmp/mini_vpn_knife15_macos_20260715_032723.tar.gz` (SHA-256
   `865aa440...`) completed two mixed cycles, then cycle 3 forward produced four
   genuine Target receiver zero-byte seconds while still transferring exact
@@ -34,7 +67,7 @@
   Result:
   `docs/tech/2026-07-15-knife15-macos-m0-network-control-discriminator-results.md`.
 
-- **Latest accepted position:** fresh M0 bundle
+- **Previous accepted position:** fresh M0 bundle
   `/tmp/mini_vpn_knife15_macos_20260715_013158.tar.gz` (SHA-256 `5c04031e...`)
   completed its full first `300s` forward phase at `14.420 Mbit/s` Target
   receiver, crossed the rejected 90-second boundary, and closed both M0 D16
@@ -61,7 +94,7 @@
   changed. Result:
   `docs/tech/2026-07-15-knife15-macos-m0-receiver-evidence-results.md`.
 
-- **Latest accepted position:** the first formal HK M0 did not fail because of
+- **Previous accepted position:** the first formal HK M0 did not fail because of
   user credentials/routes or endpoint pacing. The iperf control relay was a
   healthy full-duplex Established flow with only `4B` downlink and `186B`
   uplink; the old D16 payload-idle timer killed it at `90,001ms`, which made

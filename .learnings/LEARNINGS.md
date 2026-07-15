@@ -1,5 +1,25 @@
 # Learnings
 
+## 2026-07-15 - Validate semantic fields, not only CSV width
+
+- The network-v2 collector emitted exactly 27 columns and one row per process
+  sample, yet every physical-interface row was semantically shifted. BSD
+  `netstat` printed a link Address for the physical interface while the utun
+  fixture left that column blank, so a fixed positional parser treated the
+  address and packet counts as packet/error fields.
+- Completeness is deeper than row count and column count. The old validator
+  happened to find numeric zeroes in the shifted real error fields, accepted
+  them as byte counters, and reported a false PASS with zero rates and a false
+  nonzero error count.
+- The repair tests both target shapes, requires numeric MTU plus all seven
+  counters before counting a physical sample, and gates byte/error/rate
+  envelopes on that same semantic validity predicate.
+- Reusable rule: fixtures for platform text must preserve optional-but-real
+  fields from every production row class. Fail closed on field type and
+  meaning, not merely delimiter count, freshness, or sample correspondence.
+- Result:
+  `docs/tech/2026-07-15-knife15-macos-m0-physical-counter-observer-repair-results.md`.
+
 ## 2026-07-15 - A path diagnosis needs a live control, not a pre-run baseline
 
 - A fresh direct baseline sized the workload correctly, but it could not

@@ -1,10 +1,31 @@
 # Knife15 Long-Duration Release-Readiness Plan
 
 Date: 2026-07-14
-Status: **REAL RECEIVER INTERRUPTION CONFIRMED; SAME-WINDOW NETWORK CONTROL
-REPAIRED LOCALLY; FRESH SHENZHEN M0 PENDING**
+Status: **REAL RECEIVER INTERRUPTION REPEATED; PHYSICAL-COUNTER OBSERVER
+REPAIRED LOCALLY; FRESH SHORT VALIDATION THEN SHENZHEN M0 PENDING**
 
 ## Latest M0 Discriminator
+
+Exact source `b0fcb76` repeated a real Target receiver interruption in cycle 1
+forward: five complete zero-byte seconds plus one short tail, with
+`208,142,336B / 5.547 Mbit/s` delivered over the full `300s` command from a
+`14.425 Mbit/s` offer. Baseline/provenance and user operation were correct.
+Internal ownership, TUN/pump, lifecycle, and resource signals remained clean;
+bulk QUIC loss/congestion, cwnd contraction, and a `10.05s` writer wait were
+the positive discriminator.
+
+Exit/gateway controls were complete and broadly stable around the failure, but
+the physical-interface portion had a false PASS. A BSD physical Link row
+included an Address field absent from the utun fixture, shifting every counter
+while preserving 27 CSV columns. Commit `524139b` parses both shapes and fails
+closed unless all physical MTU/counter semantics are numeric. Local shell,
+Rust/release, Knife14, fmt/diff, and review gates pass. The independent rearm
+lifecycle passed but has the same old physical-row defect. Run one fresh
+repaired-source start/smoke/stop validation before another formal Shenzhen M0.
+Result:
+`docs/tech/2026-07-15-knife15-macos-m0-physical-counter-observer-repair-results.md`.
+
+Previous discriminator:
 
 The 2026-07-15 M0 bundle from exact source `b5c3963` completed two mixed
 cycles, then cycle 3 forward contained four real Target receiver zero-byte
@@ -22,7 +43,7 @@ stop/re-create/smoke/stop rearm passed. No data-plane or workload constant
 changed. Fresh M0 must use the dedicated Shenzhen Mac before M1. Result:
 `docs/tech/2026-07-15-knife15-macos-m0-network-control-discriminator-results.md`.
 
-Previous discriminator:
+Earlier discriminator:
 
 The 2026-07-15 fresh M0 crossed 90 seconds and completed its first 300-second
 forward transfer at `14.420 Mbit/s` receiver, but the old runner aborted after

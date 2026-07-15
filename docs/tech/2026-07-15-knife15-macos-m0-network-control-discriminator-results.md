@@ -5,6 +5,14 @@ Date: 2026-07-15
 Status: **REAL RECEIVER INTERRUPTION CONFIRMED; INTERNAL REGRESSION REJECTED;
 SAME-WINDOW PATH CONTROL REPAIRED LOCALLY; FRESH SHENZHEN M0 PENDING**
 
+> Follow-up (2026-07-15): the next real bundle proved that the physical
+> `netstat` parser in source `b0fcb76` shifted counters when a Link Address was
+> present, while still emitting 27 columns and a false network-control PASS.
+> Exit/gateway ping collection and the diagnosis below remain valid, but the
+> physical-counter acceptance claim is superseded by repair commit `524139b`
+> and
+> `docs/tech/2026-07-15-knife15-macos-m0-physical-counter-observer-repair-results.md`.
+
 ## Goal And Evidence
 
 Review the next user-executed macOS M0 without blaming operator procedure or

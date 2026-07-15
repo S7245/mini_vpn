@@ -6,6 +6,35 @@
 
 #### Latest decision (2026-07-15)
 
+Exact source `b0fcb76` repeated a genuine receiver continuity failure in the
+first M0 forward phase. Five complete Target receiver seconds were zero, plus
+one short tail; the full command delivered `208,142,336B / 5.547 Mbit/s` from
+a `14.425 Mbit/s` offer before the direction-aware SLI stopped the schedule.
+The baseline, manifest, route, and user sequence were correct. A delayed sudo
+password before the much later stop can only delay evidence cleanup and was
+not the failure cause.
+
+Internal conservation, endpoint service, utun/pump, D16 lifecycle, and
+resource evidence remained clean. QUIC loss/congestion, cwnd contraction, and
+a `10.05s` writer wait select bulk-QUIC transport pressure, while same-window
+Exit/gateway ICMP rejects only a broad simultaneous outage. The exact external
+segment remains unisolated.
+
+The physical portion of network-v2 was independently invalid: BSD physical
+`netstat` included a link Address absent from the utun fixture, shifting every
+counter while preserving the expected 27 columns. Commit `524139b` repairs
+both row shapes and gates physical samples, errors, byte/rate envelopes, and
+freshness on semantic numeric validity. Focused shell TDD, Rust/release,
+Knife14 shell, syntax, fmt/diff, and review gates pass with no P0/P1. The
+separate rearm lifecycle passed but shares the old observer defect.
+
+M0 and M1 remain blocked. Next run one fresh repaired-source
+start/smoke/stop validation and inspect numeric physical counters/rates. Only
+then take a new direct baseline and spend another formal Shenzhen M0, followed
+by independent rearm. Do not tune frozen settings or relax the receiver SLI.
+Result:
+`docs/tech/2026-07-15-knife15-macos-m0-physical-counter-observer-repair-results.md`.
+
 Exact source `b5c3963` completed two full mixed M0 cycles. Cycle 3 forward then
 contained four genuine Target receiver zero-byte seconds while transferring
 exactly `230,031,360B` over the full `300s`, so the receiver SLI correctly
