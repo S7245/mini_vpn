@@ -1,8 +1,16 @@
 # Knife15 Long-Duration Release-Readiness Plan
 
 Date: 2026-07-14
-Status: **Short HK HITL qualification PASS; formal M0 controller locally PASS;
-2-hour M0 not yet executed**
+Status: **RECEIVER-EVIDENCE SEMANTICS REPAIRED; FRESH 2-HOUR M0 PENDING**
+
+## Latest M0 Discriminator
+
+The 2026-07-15 fresh M0 crossed 90 seconds and completed its first 300-second
+forward transfer at `14.420 Mbit/s` receiver, but the old runner aborted after
+one client sender zero interval even though the Target receiver remained
+positive in all `301` interval/tail rows. Direction-aware structured receiver
+evidence is now the SLI; sender zeros remain review diagnostics. Result:
+`docs/tech/2026-07-15-knife15-macos-m0-receiver-evidence-results.md`.
 
 ## Stage Goal
 

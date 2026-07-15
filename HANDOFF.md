@@ -2,7 +2,34 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 Release Readiness (2026-07-14)
+## Next Planned Stage — Knife15 Release Readiness (2026-07-15)
+
+- **Latest accepted position:** fresh M0 bundle
+  `/tmp/mini_vpn_knife15_macos_20260715_013158.tar.gz` (SHA-256 `5c04031e...`)
+  completed its full first `300s` forward phase at `14.420 Mbit/s` Target
+  receiver, crossed the rejected 90-second boundary, and closed both M0 D16
+  relays via `clean_queue_lifecycle`. Endpoint conservation stayed
+  `<=61,440B`; utun/pump/TUN failures were zero. This validates the relay
+  lifecycle repair.
+- The runner stopped because one client **sender** interval at `213-214s` was
+  zero. The Target **receiver** still carried `640 KiB / 5.24 Mbit/s` in that
+  second and had zero zero-rate rows across `301` interval/tail rows. WAN QUIC
+  loss/cwnd contraction caused about `1.548s` sender backpressure; treating
+  sender cadence as receiver quality was the evidence-contract defect. It was
+  not user operation, endpoint pacing, or a new relay failure.
+- The repaired runner requests `--get-server-output`, requires structured
+  evidence from both endpoints, validates forward server receivers and reverse
+  local receivers, aborts on receiver zero, and records sender zeros as final
+  `REVIEW` diagnostics without ending the two-hour collection. Readiness now
+  proves this JSON capability before route/TUN mutation. `.77` uses the tested
+  reversible `iperf3 -s --json --forceflush` drop-in; `.27 -> .77` capability
+  probe PASS. Repair commit: `4f836b9`; root tests `635/635` plus main `2/2`,
+  both script self-tests, fmt/diff/syntax, release build, and review PASS.
+- Current HK Target route was `utun1024` during post-run review. Before the
+  next fresh baseline/M0, exit that other VPN/proxy and require physical/non-
+  `utun` Target and Exit routes. No frozen data-plane or workload constant
+  changed. Result:
+  `docs/tech/2026-07-15-knife15-macos-m0-receiver-evidence-results.md`.
 
 - **Latest accepted position:** the first formal HK M0 did not fail because of
   user credentials/routes or endpoint pacing. The iperf control relay was a

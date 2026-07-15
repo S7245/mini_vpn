@@ -1,5 +1,22 @@
 # Errors
 
+## 2026-07-15 - M0 validated forward sender cadence as receiver quality
+
+- A full 300-second forward phase delivered `541,065,216B` to the Target with
+  no receiver-zero interval, but one client sender interval was zero during a
+  WAN congestion/backpressure episode. The generic no-zero validator inspected
+  the client root and incorrectly emitted `invalid_iperf_result`.
+- Correct behavior is direction-aware: request structured server output,
+  validate forward at the server receiver and reverse at the local receiver,
+  and keep sender zeros as separate review evidence. Missing either endpoint
+  is a capability/schema failure.
+- BSD `mktemp` requires the replacement `XXXXXX` at the end of the template.
+  The readiness path's `.XXXXXX.json` form created one literal fixed path;
+  ending the template at `XXXXXX` restores unique, concurrency-safe files.
+- The first summary's three remote-write matches described one earlier smoke
+  close-tail event in three log forms. Always correlate epoch and phase before
+  treating an aggregate grep count as the active failure cause.
+
 ## 2026-07-14 - A non-fail-fast commit command crossed a failed diff check
 
 - `git diff --cached --check` correctly found two trailing spaces in a newly

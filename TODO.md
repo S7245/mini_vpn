@@ -4,7 +4,26 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-07-14)
+#### Latest decision (2026-07-15)
+
+The fresh M0 bundle
+`/tmp/mini_vpn_knife15_macos_20260715_013158.tar.gz` (SHA-256 `5c04031e...`)
+completed its full first `300s` forward transfer at `14.420 Mbit/s` Target
+receiver. It crossed 90 seconds, both M0 relays closed cleanly, conservation
+stayed `<=61,440B`, and TUN/pump/interface failures were zero. The runner
+stopped only because one client sender interval was zero while the Target
+receiver still delivered `640 KiB / 5.24 Mbit/s`; this is an evidence-semantics
+failure, not user operation or a relay/pacing regression.
+
+The local runner repair uses `--get-server-output` and direction-aware receiver
+SLIs. Receiver zero remains fail-closed; sender zero is counted and makes the
+final summary `REVIEW` without prematurely ending M0. Target readiness now
+requires structured receiver evidence. `.77` is qualified with a reversible
+JSON-output systemd drop-in and the `.27 -> .77` capability probe passes.
+Repair commit `4f836b9`; local gates and review pass. Next: exit the HK
+`utun1024` VPN/proxy, take a fresh direct baseline, then run fresh M0 and
+rearm. No constants changed. Result:
+`docs/tech/2026-07-15-knife15-macos-m0-receiver-evidence-results.md`.
 
 The first user-run formal M0 selected a relay-lifecycle defect, not user
 operation or H10d16 pacing. A legitimately quiet iperf control relay was still

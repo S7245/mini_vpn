@@ -1,5 +1,25 @@
 # Learnings
 
+## 2026-07-15 - Measure continuity at the receiving user boundary
+
+- A forward iperf client reports sender application-write intervals at the
+  JSON root. One such interval was zero during WAN loss recovery, while the
+  Target receiver continued at `5.24 Mbit/s` and completed the full 300-second
+  transfer. Treating the root interval as receiver quality stopped a healthy
+  end-to-end phase.
+- Direction determines evidence ownership: forward receiver intervals belong
+  to structured server output; reverse receiver intervals belong to the local
+  client. Both sides must remain present, but sender stalls and receiver stalls
+  are different signals.
+- Reusable rule: acceptance SLIs must be measured at the consumer boundary.
+  Preserve producer/backpressure gaps as diagnostics and review triggers, but
+  do not substitute them for consumer availability.
+- Deep readiness should prove the exact evidence capability, not merely port
+  liveness. A one-second transaction now requires `server_output_json` before
+  any route or TUN mutation.
+- Result:
+  `docs/tech/2026-07-15-knife15-macos-m0-receiver-evidence-results.md`.
+
 ## 2026-07-14 - Transparent TCP silence is not a lifecycle signal
 
 - The first formal M0 proved that a control connection can remain healthy and
