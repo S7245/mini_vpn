@@ -4,7 +4,40 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-15)
 
-- **Latest accepted position:** exact source `5e8846f` repaired-observer short
+- **Latest accepted position:** exact source `239acba` M0 bundle
+  `/tmp/mini_vpn_knife15_macos_20260715_091501.tar.gz` (SHA-256
+  `9cf99fa2...`) completed two full mixed cycles, then cycle 3 forward produced
+  three complete Target receiver zero-throughput seconds. The phase ran its
+  full 300 seconds and delivered exact `313,786,368B / 8.363 Mbit/s`; the
+  direction-aware receiver SLI correctly failed. The later status/snapshot/
+  stop sequence was correct and occurred more than four minutes after the
+  failure, so this was not an operator or sudo-delay error.
+- Internal ownership, TUN/pump service, lifecycle, and resources remained
+  clean: endpoint conservation was `<=61,440B`, final ownership was
+  `61,388/0/0B`, pump high-water was `291/500` with zero waits/errors, utun
+  errors were zero, FD/thread stayed `15/11`, and the bulk relay closed
+  `clean_queue_lifecycle` with an `8.900252s` maximum writer wait. The active
+  bulk QUIC connection accumulated loss/congestion while its sibling stayed
+  stable. All 81 coarse Exit/gateway controls had zero loss; they reject a
+  broad outage but not a one-second or flow-specific path event.
+- The 20-second baseline cannot classify that event because it did not prove
+  direct 300-second Target receiver continuity. Commit `885c321` adds a
+  non-root `direct-discriminator`: fresh baseline now uses structured,
+  direction-aware receiver evidence; the direct gate runs the exact 300s/one-
+  stream/50% forward shape on physical routes and requires 300 complete
+  positive Target receiver seconds. Formal M0 binds matching source/runner/
+  binary/baseline/result evidence completed within 15 minutes. Knife15 and
+  Knife14 shell/syntax/diff gates pass; code review has no unresolved P0/P1.
+- Next action is user-run, non-TUN `cargo build --release`, fresh baseline, and
+  `direct-discriminator` on the Shenzhen Mac. If direct fails, do not start
+  TUN or tune constants. If it passes, export `M0_DIRECT_DIR` and immediately
+  run start/smoke/M0. If that M0 repeats a receiver interruption with clean
+  internals, stop identical repeats and open connection-health isolation/
+  failover architecture work with a mature-client control. M0 and M1 remain
+  blocked. Result:
+  `docs/tech/2026-07-15-knife15-macos-m0-direct-continuity-discriminator-results.md`.
+
+- **Previous accepted position:** exact source `5e8846f` repaired-observer short
   bundle `/tmp/mini_vpn_knife15_macos_20260715_084113.tar.gz` (SHA-256
   `85dd7a66...`) passes its scoped gate. All `5/5` physical-interface rows are
   semantically numeric, errors remain zero, RX/TX counters increase by

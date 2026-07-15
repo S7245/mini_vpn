@@ -1,10 +1,29 @@
 # Knife15 Long-Duration Release-Readiness Plan
 
 Date: 2026-07-14
-Status: **REAL RECEIVER INTERRUPTION REPEATED; PHYSICAL-COUNTER OBSERVER
-REPAIRED LOCALLY; FRESH SHORT VALIDATION THEN SHENZHEN M0 PENDING**
+Status: **REAL RECEIVER INTERRUPTION REPEATED; 300S PHYSICAL DIRECT
+CONTINUITY GATE IMPLEMENTED; M0 AND M1 BLOCKED**
 
 ## Latest M0 Discriminator
+
+Exact source `239acba` completed two mixed M0 cycles, then cycle 3 forward
+contained three complete Target receiver zero-throughput seconds while still
+delivering exact `313,786,368B / 8.363 Mbit/s` over the full 300 seconds.
+User operation was correct. Endpoint conservation, TUN/pump service, relay
+lifecycle, resource bounds, physical-interface errors, and coarse Exit/gateway
+controls remained clean. The active bulk QUIC connection accumulated loss and
+congestion with an 8.9-second writer wait while its sibling remained stable.
+
+The old 20-second baseline sized the load but did not validate forward Target
+receiver intervals or prove direct 300-second continuity. The local runner now
+requires a direction-aware baseline plus a non-root 300-second direct forward
+gate at the exact 50% M0 rate. Formal M0 accepts only matching source/runner/
+binary/baseline/result evidence completed within 15 minutes. Direct failure
+blocks TUN; direct PASS followed by another clean-internal M0 interruption
+selects an architecture failure and blocks another identical run. Result:
+`docs/tech/2026-07-15-knife15-macos-m0-direct-continuity-discriminator-results.md`.
+
+Previous discriminator:
 
 Exact source `b0fcb76` repeated a real Target receiver interruption in cycle 1
 forward: five complete zero-byte seconds plus one short tail, with
@@ -25,7 +44,7 @@ repaired-source start/smoke/stop validation before another formal Shenzhen M0.
 Result:
 `docs/tech/2026-07-15-knife15-macos-m0-physical-counter-observer-repair-results.md`.
 
-Previous discriminator:
+Earlier discriminator:
 
 The 2026-07-15 M0 bundle from exact source `b5c3963` completed two mixed
 cycles, then cycle 3 forward contained four real Target receiver zero-byte
@@ -338,3 +357,11 @@ user-controlled HITL boundary; Shenzhen remains preferred for M1/M2 and
 recovery. M0 still requires a fresh direct baseline, user-executed TUN, two-
 hour workload, stop bundle, and fresh create/smoke/stop rearm bundle. No frozen
 data-plane constant changed.
+
+The latest `239acba` M0 remains failed after two complete cycles because cycle
+3 forward contained three Target receiver zero seconds. Before any new TUN,
+the user must rebuild the reviewed runner, take a new structured baseline, and
+pass `direct-discriminator`. Export its directory and begin `start`/`smoke`/
+`m0` within 15 minutes of direct completion. A direct failure blocks TUN; a
+direct PASS plus another clean-internal M0 receiver interruption stops this
+test branch and opens connection-health isolation/failover architecture work.

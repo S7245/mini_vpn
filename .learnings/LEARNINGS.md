@@ -1,5 +1,24 @@
 # Learnings
 
+## 2026-07-15 - Match the control duration and receiver boundary to the failed SLI
+
+- A 20-second direct baseline correctly sized M0 at 50%, but could not
+  classify three receiver interruptions in a later 300-second tunnel phase.
+  Capacity, continuity, and same-window causality are separate claims and need
+  separate controls.
+- The smallest useful discriminator mirrors the failed phase: same Target,
+  direction, one-stream shape, relative rate, 300-second duration, and Target
+  receiver intervals, while remaining outside the TUN.
+- Provenance is part of the discriminator. Bind source, runner, release binary,
+  baseline files, result, routes, and completion age, then preserve the control
+  inside the formal bundle.
+- Reusable rule: before repeating an expensive integration failure, make the
+  independent control equal in duration and consumer-side SLI semantics. If
+  control passes and product fails under clean internals, advance the
+  architecture branch instead of repeating the same test or tuning constants.
+- Implementation commit: `885c321`. Result:
+  `docs/tech/2026-07-15-knife15-macos-m0-direct-continuity-discriminator-results.md`.
+
 ## 2026-07-15 - Prove an observer repair with semantic movement
 
 - The repaired physical parser passed a real start/smoke/stop run only after

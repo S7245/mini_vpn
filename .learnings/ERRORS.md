@@ -1,5 +1,23 @@
 # Errors
 
+## 2026-07-15 - The baseline claimed continuity from the wrong duration and endpoint
+
+- Formal M0 failed on three complete Target receiver zero seconds during a
+  300-second forward phase, but the prerequisite baseline covered only 20
+  seconds and validated client-root forward intervals. It could set the offer
+  rate but could not prove the physical path met the same receiver SLI.
+- A manifest field saying `duration_secs=300` is not proof that a result ran
+  for 300 seconds. Code review found that an early positive result could pass
+  unless requested duration, receiver elapsed time, and 300 complete interval
+  records were checked in the JSON itself.
+- The repair requires structured direction-aware baseline evidence and a
+  separate non-TUN direct gate whose result proves 300 requested seconds,
+  299-310 receiver seconds, and at least 300 complete positive Target receiver
+  intervals. Short, stale, changed, or mismatched evidence fails closed.
+- Future long-run prerequisites must distinguish capacity sampling from
+  continuity qualification and validate every acceptance claim from the
+  artifact, not only from intended command arguments or manifest metadata.
+
 ## 2026-07-15 - A physical link Address shifted every network counter
 
 - The network-v2 parser was tested only with a utun-shaped `<Link#>` row whose

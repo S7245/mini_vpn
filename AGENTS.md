@@ -189,6 +189,35 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-07-15:
 
+- Exact source `239acba` M0 bundle
+  `/tmp/mini_vpn_knife15_macos_20260715_091501.tar.gz` (SHA-256
+  `9cf99fa2...`) completed two full mixed cycles, then cycle 3 forward produced
+  three complete Target receiver zero-throughput seconds despite exact final
+  delivery of `313,786,368B / 8.363 Mbit/s` over 300 seconds. The user's
+  operation and later status/snapshot/stop were correct; cleanup occurred more
+  than four minutes after the failure.
+- Endpoint conservation stayed `<=61,440B` and ended `61,388/0/0B`; pump
+  high-water was `291/500` with zero waits/errors; interface, lifecycle,
+  resource, reconnect, terminal-reap, and log-compaction discriminators were
+  clean. The bulk relay closed `clean_queue_lifecycle` but had an `8.900252s`
+  writer wait, and its QUIC connection accumulated loss/congestion while the
+  sibling connection remained stable. All 81 coarse Exit/gateway samples had
+  zero loss but cannot reject a one-second or flow-specific path event.
+- Commit `885c321` adds the missing pre-TUN discriminator. Baseline now proves
+  direction-aware receiver intervals with structured server output. The
+  non-root 300-second direct forward gate uses one stream at exactly 50% of the
+  fresh forward receiver baseline and requires 300 complete positive Target
+  receiver seconds on unchanged physical routes. Formal M0 requires matching
+  source/runner/binary/baseline/result evidence no older than 15 minutes and
+  copies it into the bundle. Shell TDD, Knife15/Knife14 gates, syntax/diff, and
+  code review pass; no P0/P1 or frozen-constant change remains.
+- M0 and M1 remain blocked. Next run fresh build/baseline/direct-discriminator
+  on the Shenzhen Mac without TUN. Direct failure blocks TUN and tuning.
+  Direct PASS permits immediate user-run start/smoke/M0; another receiver
+  interruption with clean internals selects a connection-health isolation/
+  failover architecture stage and forbids another identical M0. Result:
+  `docs/tech/2026-07-15-knife15-macos-m0-direct-continuity-discriminator-results.md`.
+
 - Exact source `5e8846f` passed the repaired physical-observer short gate in
   bundle `/tmp/mini_vpn_knife15_macos_20260715_084113.tar.gz` (SHA-256
   `85dd7a66...`). All `5/5` physical rows were semantically numeric with zero

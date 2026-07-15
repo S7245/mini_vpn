@@ -1,8 +1,8 @@
 # Knife15 macOS HITL M0 Runbook
 
 Date: 2026-07-14
-Status: **M0 repeated a real receiver interruption; repaired physical-counter
-observer short-validation PASS; fresh Shenzhen baseline/M0 required**
+Status: **M0 repeated a real receiver interruption; 300s physical direct
+continuity gate required before another TUN M0**
 
 ## Purpose And Authority Boundary
 
@@ -69,7 +69,7 @@ Both interfaces must be a physical/non-TUN path such as `en0`; neither may be
 `utun*`. If either is `utun*`, exit the current VPN/proxy and repeat this step.
 Do not delete another VPN's routes manually.
 
-## 3. Validate The Repaired Observer, Then Take The Baseline
+## 3. Validate The Runner, Baseline, And Direct Continuity
 
 ```sh
 bash scripts/knife15-macos-soak.sh --self-test
@@ -95,15 +95,16 @@ sudo -E bash scripts/knife15-macos-soak.sh smoke
 sudo -E bash scripts/knife15-macos-soak.sh stop
 ```
 
-Now take the fresh formal baseline on the dedicated Shenzhen Mac:
+Now take a fresh direction-aware baseline on the dedicated Shenzhen Mac:
 
 ```sh
 bash scripts/knife15-macos-soak.sh baseline
 ```
 
 Stop here if direct forward or direct reverse fails. Preserve the printed
-baseline directory. A failed direct/control path makes throughput attribution
-invalid and does not authorize constant tuning.
+baseline directory. The repaired baseline requests structured output from both
+ends and validates the Target receiver for forward and the local receiver for
+reverse. An older baseline without this evidence is intentionally rejected.
 
 Export the exact fresh directory printed by `baseline`; do not reuse the
 earlier short-qualification or pre-repair baseline:
@@ -112,10 +113,33 @@ earlier short-qualification or pre-repair baseline:
 export M0_BASELINE_DIR='/tmp/mini_vpn_knife15_macos_baseline_REPLACE_WITH_TIMESTAMP'
 ```
 
-The formal controller validates the target, TCP protocol, forward/reverse
-direction, positive receiver rate, and every nonzero interval before it starts.
-It derives sustained TCP/UDP rates at `50%` of the same-direction direct
-receiver baseline and short TCP bursts at `80%`.
+Before starting any TUN, run the exact 300-second physical-path discriminator:
+
+```sh
+bash scripts/knife15-macos-soak.sh direct-discriminator
+```
+
+This is a non-root direct iperf3 test; it does not create a TUN or change
+routes. It uses one forward stream at exactly 50% of the fresh forward Target
+receiver baseline. PASS requires 300 complete positive Target receiver
+seconds, a complete 300-second result, unchanged physical Target/Exit routes,
+and matching source, runner, release-binary, baseline, and result hashes.
+
+If it fails, do not run `start`: the physical path did not meet M0's receiver
+continuity SLI. Do not tune mini_vpn or relax the SLI. Preserve the printed
+direct directory and retry only with a new baseline/direct pair in a more
+suitable network window.
+
+If it passes, export its exact printed directory:
+
+```sh
+export M0_DIRECT_DIR='/tmp/mini_vpn_knife15_macos_direct_REPLACE_WITH_TIMESTAMP'
+```
+
+Proceed immediately to section 4. Formal M0 accepts only a matching direct
+PASS completed within the previous 15 minutes and copies that evidence into
+the final bundle. The controller then derives sustained TCP/UDP rates at `50%`
+of the same-direction receiver baseline and short TCP bursts at `80%`.
 
 ## 4. Run The Formal 2-Hour M0 Workload
 
@@ -156,6 +180,11 @@ the watchdog and a recent valid control at least every two seconds; final PASS
 requires a valid Exit and physical-interface control for every process sample.
 ICMP total loss is preserved as valid path evidence with unknown RTT. Missing
 or unparseable controls are not silently converted to PASS.
+
+`m0` also revalidates `M0_DIRECT_DIR`. Missing, stale, shortened, modified, or
+provenance-mismatched direct evidence fails closed. Because this validation
+occurs after the user-created TUN exists, use the failure cleanup sequence
+below if the 15-minute window was missed.
 
 On a successful M0, run `status` and then `stop`; no manual `snapshot` is
 needed. `stop` first terminates any identity-verified M0 controller, then terminates
@@ -201,6 +230,7 @@ Return these items for review:
 - the self-test PASS line;
 - the preflight output;
 - the direct baseline directory and forward/reverse summary;
+- the direct-discriminator directory and result hash;
 - the first `start`, `smoke`, `m0`, and `status` outputs;
 - both bundle paths and SHA-256 values printed by the two `stop` commands.
 
@@ -211,10 +241,13 @@ agent can inspect a bundle that remains on the shared HK Mac by its local path.
 ## Qualification Decision
 
 The macOS lane has qualified target-only lifecycle, clean rearm, and the
-repaired physical observer. Exact source `b0fcb76` nevertheless repeated five
-complete receiver-zero seconds in cycle 1 and therefore remains failed. Per
-the accepted task order, take a fresh direct baseline and run the next formal
-M0 on the dedicated Shenzhen Mac.
+repaired physical observer. Exact source `239acba` completed two mixed cycles,
+then cycle 3 forward produced three complete Target receiver zero-throughput
+seconds despite exact final byte delivery. User operation, ownership, TUN,
+relay lifecycle, and resource regressions are rejected; bulk-connection QUIC
+loss/congestion remains selected. The old 20-second baseline could not prove
+300-second direct receiver continuity, so the new physical direct gate must
+pass before another TUN M0.
 Formal M0 passes only after the two-hour bundle shows `m0_status: complete`, zero phase
 and health failures, one completed idle/resume/final-drain sequence, every
 endpoint conservation sample at or below `61,440B`, zero final live and
@@ -222,3 +255,10 @@ outstanding ownership, bounded resource envelopes, no unexplained TUN errors,
 complete same-window network controls, no lossy log compaction, and clean stop.
 The fresh re-create/smoke/stop bundle must independently prove rearm and
 cleanup. M0 does not complete M1, M2, or M3.
+
+If the direct gate passes and the immediately following M0 repeats a receiver
+interruption with the internal invariants clean, stop repeating this M0 shape
+and classify the single-bulk-QUIC transport path as an architecture failure.
+Begin a connection-health isolation/failover design stage with a mature-client
+control. Result:
+`docs/tech/2026-07-15-knife15-macos-m0-direct-continuity-discriminator-results.md`.
