@@ -1,5 +1,24 @@
 # Learnings
 
+## 2026-07-15 - Observation capacity must exceed the interval SLI
+
+- Shenzhen reverse baseline averaged `65,523B/s`, below iperf's default
+  `131,072B` TCP application block. Every positive interval was a full-block
+  multiple, so per-second zeros could represent sub-buffer progress rather
+  than a network interruption.
+- Translate the acceptance interval into observer capacity before classifying
+  continuity. The formal half-rate was about `32,761B/s`; a 16KiB observer
+  gives roughly two visible blocks per second while 128KiB gives one every
+  four seconds.
+- Preserve the SLI by improving observation resolution, not by accepting zero
+  intervals. Direction-specific application evidence can change without
+  changing mini_vpn D16/QUIC chunking or the forward failure discriminator.
+- Reusable rule: capacity math applies to test instruments too. A consumer
+  cannot prove a time-window invariant when its own delivery quantum exceeds
+  the expected bytes in that window.
+- Implementation: `cc32df0`. Result:
+  `docs/tech/2026-07-15-knife15-macos-low-rate-reverse-observer-results.md`.
+
 ## 2026-07-15 - Pool placement must follow live ownership, not history
 
 - A one-control-flow UDP phase shifted a global round-robin cursor and inverted

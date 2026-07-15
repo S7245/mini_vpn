@@ -6,6 +6,30 @@
 
 #### Latest decision (2026-07-15)
 
+Source `adbc78b` baseline ran on the separate Shenzhen Mac over physical
+`en0`; its directory was then copied to the current Mac. Current-host
+`utun1024`/Clash state is not run-host evidence and is excluded.
+
+Forward delivered `21.732742 Mbit/s` with every Target receiver interval
+positive. Reverse delivered only `0.524183 Mbit/s`; 13/20 local receiver
+intervals were zero, and every positive interval was exactly one or more
+`131,072B` iperf blocks. At about `65,523B/s`, the default 128KiB observer
+cannot represent continuous sub-buffer progress each second. At the formal
+50% M0 rate it would need about four seconds per reportable block.
+
+Commit `cc32df0` preserves the strict no-zero receiver SLI and all forward
+discriminator shapes, but uses iperf `-l 16384` for reverse TCP baseline/M0
+only. M0 profile records the observer length. This is not a mini_vpn chunk,
+rate, duration, or frozen data-plane change. TDD, Knife15/Knife14 shell gates,
+syntax, fmt/diff, and review pass with no P0/P1.
+
+Next rebuild final source and run one fresh Shenzhen physical-`en0` baseline.
+If reverse is positive in every 16KiB interval, proceed to direct and M0. If
+zeros remain, stop before TUN: the quantization hypothesis is rejected and the
+physical reverse path does not meet formal M0 continuity. Do not reuse the old
+baseline, relax the SLI, or tune constants. Result:
+`docs/tech/2026-07-15-knife15-macos-low-rate-reverse-observer-results.md`.
+
 Source `5c127eb` bundle
 `/tmp/mini_vpn_knife15_macos_20260715_104417.tar.gz` (SHA-256 `5743b352...`)
 is exact and correctly operated. Its 300-second direct prerequisite passed all

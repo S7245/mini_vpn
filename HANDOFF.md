@@ -4,7 +4,30 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-15)
 
-- **Latest accepted position:** the user-operated source `5c127eb` M0 bundle
+- **Latest accepted position:** source `adbc78b` ran baseline on the separate
+  Shenzhen Mac with physical `en0`. The copied evidence directory
+  `/tmp/mini_vpn_knife15_macos_baseline_20260715_131049` is valid for offline
+  inspection; current-HK `utun1024`/Clash state is unrelated and must not be
+  joined to it. Forward was continuous at `21.732742 Mbit/s`. Reverse averaged
+  `0.524183 Mbit/s`, and 13/20 receiver seconds were zero because every nonzero
+  interval was an exact multiple of iperf's default `131,072B` block. At only
+  `65,523B/s`, this evidence cannot distinguish sub-buffer progress from a
+  path stall.
+- Commit `cc32df0` keeps forward/direct/short-forward commands unchanged and
+  uses iperf `-l 16384` only for reverse TCP baseline and M0. The formal
+  half-rate reverse is about `32,761B/s`, giving roughly two observer blocks
+  per second instead of one block per four seconds. The strict no-zero SLI is
+  unchanged; H10d16 chunking and every frozen data-plane/workload constant are
+  unchanged. Knife15/Knife14 shell gates, syntax, fmt/diff, and review pass
+  with no unresolved P0/P1.
+- Next rebuild final HEAD on Shenzhen and run a new physical-`en0` baseline.
+  Do not reuse `...131049`. A PASS continues to direct/start/smoke/M0. Any
+  receiver-zero interval with 16KiB evidence rejects the quantization
+  hypothesis and blocks TUN; classify the Shenzhen reverse physical path as
+  insufficient without relaxing the SLI or tuning mini_vpn. Result:
+  `docs/tech/2026-07-15-knife15-macos-low-rate-reverse-observer-results.md`.
+
+- **Previous accepted position:** the user-operated source `5c127eb` M0 bundle
   `/tmp/mini_vpn_knife15_macos_20260715_104417.tar.gz` (SHA-256
   `5743b352...`) is exact and correctly operated. Its prerequisite direct run
   `/tmp/mini_vpn_knife15_macos_direct_20260715_102948` passed all 300 Target

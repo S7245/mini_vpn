@@ -189,6 +189,24 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-07-15:
 
+- Source `adbc78b` Shenzhen physical-`en0` baseline failed only on reverse
+  evidence. Forward was continuous at `21.732742 Mbit/s`; reverse averaged
+  `0.524183 Mbit/s` with 13/20 zero receiver intervals. Every positive reverse
+  interval was a `131,072B` multiple, while the path delivered only about
+  `65,523B/s`: default iperf block granularity made a per-second no-zero SLI
+  unobservable. Do not combine this copied artifact with current-HK live route
+  or process state.
+- Commit `cc32df0` uses iperf `-l 16384` only for reverse TCP baseline/M0 and
+  records it in the profile. Forward, direct discriminator, short-forward,
+  UDP1160, all M0 rates/durations, and every mini_vpn frozen constant remain
+  unchanged. Knife15/Knife14 shell, syntax, fmt/diff, and review gates pass;
+  no unresolved P0/P1 remains.
+- Next run a fresh build and Shenzhen physical-`en0` baseline. Positive 16KiB
+  reverse intervals permit direct/start/smoke/M0. Any remaining zero interval
+  rejects observer quantization and blocks TUN as a physical reverse-path
+  failure; do not relax SLI or tune constants. Result:
+  `docs/tech/2026-07-15-knife15-macos-low-rate-reverse-observer-results.md`.
+
 - Source `5c127eb` bundle
   `/tmp/mini_vpn_knife15_macos_20260715_104417.tar.gz` (SHA-256
   `5743b352...`) is exact and correctly operated. Its fresh 300-second direct

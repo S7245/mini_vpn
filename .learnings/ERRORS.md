@@ -1,5 +1,30 @@
 # Errors
 
+## 2026-07-15 - A copied remote artifact was joined to the local host state
+
+- The Shenzhen baseline directory was copied into the current Mac's `/tmp`.
+  Inspection correctly read its iperf JSON, but a live route/process probe ran
+  on the current Mac and was initially attributed to Shenzhen. The resulting
+  Clash/`utun1024` conclusion was invalid and was withdrawn after user
+  correction.
+- Filesystem location is not host provenance. Never join a copied artifact
+  with live route, process, clock, or interface state unless an artifact field
+  binds that observation to the originating host and time.
+- The portable evidence was the JSON itself: reverse rate, interval bytes,
+  direction, Target, and iperf block size. The accepted Shenzhen route evidence
+  is the user's physical-`en0` statement; current-HK state is excluded.
+
+## 2026-07-15 - The 128KiB iperf observer fabricated low-rate zero seconds
+
+- Reverse averaged `0.524183 Mbit/s`, but 13/20 receiver intervals were zero
+  and every positive interval was exactly `131,072B` or a multiple. The old
+  strict validator correctly rejected the artifact but could not distinguish
+  observer quantization from a real stall.
+- At M0's 50% rate, a default iperf block would take about four seconds. Do not
+  relax receiver continuity or blame the network from that evidence. Reduce
+  the reverse-only iperf observation length, preserve forward shape, and use a
+  fresh run as the discriminator.
+
 ## 2026-07-15 - Global pool parity inverted a healthy control/data pairing
 
 - The user correctly ran an M0 with a passing fresh direct gate. Sustained TCP
