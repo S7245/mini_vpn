@@ -39,10 +39,10 @@ M0_SHORT_SECS="${M0_SHORT_SECS:-10}"
 M0_SHORT_COUNT="${M0_SHORT_COUNT:-6}"
 M0_IDLE_SECS="${M0_IDLE_SECS:-300}"
 M0_FINAL_DRAIN_SECS="${M0_FINAL_DRAIN_SECS:-120}"
-# iperf only reports completed application buffers. Its 128KiB TCP default can
-# fabricate one-second receiver zeros below 1 Mbit/s, so reverse evidence uses
-# a smaller observer buffer while the forward discriminator stays unchanged.
-TCP_REVERSE_IPERF_LENGTH_BYTES=16384
+# iperf only reports completed application buffers. Shenzhen's 0.131 Mbit/s
+# reverse path delivered about 16KiB/s with an 8.3KiB cwnd, so a 1KiB observer
+# preserves multiple visible blocks per second while forward stays unchanged.
+TCP_REVERSE_IPERF_LENGTH_BYTES=1024
 M0_IPERF3_BIN=iperf3
 M0_DIG_BIN=dig
 M0_SLEEP_BIN=sleep
@@ -803,6 +803,28 @@ baseline_receiver_bps() {
   ' "$json_file" 2>/dev/null
 }
 
+baseline_receiver_summary() {
+  local baseline_dir="$1"
+  local forward_file="$baseline_dir/direct-forward.json"
+  local reverse_file="$baseline_dir/direct-reverse.json"
+  local forward_bps reverse_bps forward_mbit reverse_mbit
+  local forward_zero reverse_zero
+  forward_bps="$(baseline_receiver_bps "$forward_file")" || return 1
+  reverse_bps="$(baseline_receiver_bps "$reverse_file")" || return 1
+  forward_zero="$(jq -er \
+    '[.server_output_json.intervals[] | select(
+      (.sum.bits_per_second | type) != "number" or
+      .sum.bits_per_second <= 0)] | length' "$forward_file" 2>/dev/null)" || return 1
+  reverse_zero="$(jq -er \
+    '[.intervals[] | select(
+      (.sum.bits_per_second | type) != "number" or
+      .sum.bits_per_second <= 0)] | length' "$reverse_file" 2>/dev/null)" || return 1
+  forward_mbit="$(awk -v bps="$forward_bps" 'BEGIN {printf "%.3f", bps / 1000000}')"
+  reverse_mbit="$(awk -v bps="$reverse_bps" 'BEGIN {printf "%.3f", bps / 1000000}')"
+  printf 'BASELINE receiver: forward_mbit=%s reverse_mbit=%s forward_zero_intervals=%s reverse_zero_intervals=%s\n' \
+    "$forward_mbit" "$reverse_mbit" "$forward_zero" "$reverse_zero"
+}
+
 validate_m0_baseline_file() {
   local json_file="$1"
   local target="$2"
@@ -1077,7 +1099,7 @@ EOF_M0_PROFILE
 }
 
 runner_self_test() {
-  local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir m0_profile m0_run m0_fail_run direct_dir fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash
+  local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir baseline_summary_text m0_profile m0_run m0_fail_run direct_dir fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/knife15-macos-self-test.XXXXXX")" || return 1
   good_log="$tmp/good.log"
   bad_log="$tmp/bad.log"
@@ -1134,6 +1156,11 @@ runner_self_test() {
     >"$baseline_dir/direct-reverse.json"
   validate_m0_baseline_pair "$baseline_dir" 43.130.32.77 || \
     die "self-test: valid M0 baseline pair rejected"
+  baseline_summary_text="$(baseline_receiver_summary "$baseline_dir")" || \
+    die "self-test: valid M0 baseline pair could not be summarized"
+  [[ "$baseline_summary_text" == \
+    'BASELINE receiver: forward_mbit=9.045 reverse_mbit=26.790 forward_zero_intervals=0 reverse_zero_intervals=0' ]] || \
+    die "self-test: baseline receiver speed/continuity summary mismatch"
   jq '.server_output_json.intervals[0].sum.bits_per_second = 0' \
     "$baseline_dir/direct-forward.json" >"$baseline_dir/direct-forward.stalled.json"
   mv "$baseline_dir/direct-forward.json" "$baseline_dir/direct-forward.valid.json"
@@ -1183,7 +1210,7 @@ runner_self_test() {
     die "self-test: M0 sustained reverse rate must be 50% of baseline"
   grep -Fq 'short_forward_bps=7235805' "$m0_profile" || \
     die "self-test: M0 burst forward rate must be 80% of baseline"
-  grep -Fq 'tcp_reverse_iperf_length_bytes=16384' "$m0_profile" || \
+  grep -Fq 'tcp_reverse_iperf_length_bytes=1024' "$m0_profile" || \
     die "self-test: M0 reverse TCP observer granularity missing from profile"
   grep -Fq 'udp_payload_bytes=1160' "$m0_profile" || \
     die "self-test: M0 UDP payload drifted from the MTU1200-safe shape"
@@ -1272,7 +1299,7 @@ EOF_FAKE_SLEEP
     "$M0_TEST_COMMAND_LOG" || \
     die "self-test: direct forward baseline shape changed"
   grep -Fxq \
-    'iperf3 -c 43.130.32.77 -p 5201 -t 20 -P 1 -l 16384 -R --json --get-server-output' \
+    'iperf3 -c 43.130.32.77 -p 5201 -t 20 -P 1 -l 1024 -R --json --get-server-output' \
     "$M0_TEST_COMMAND_LOG" || \
     die "self-test: direct reverse baseline lacks low-rate receiver granularity"
   : >"$M0_TEST_COMMAND_LOG"
@@ -1295,7 +1322,7 @@ EOF_FAKE_SLEEP
   grep -Fq 'iperf3 -c 43.130.32.77 -p 5201 -t 2 -P 1 -b 4522378 --json --get-server-output' \
     "$M0_TEST_COMMAND_LOG" || \
     die "self-test: M0 forward TCP did not request receiver evidence"
-  grep -Fq 'iperf3 -c 43.130.32.77 -p 5201 -t 2 -P 1 -b 13395070 -l 16384 -R --json --get-server-output' \
+  grep -Fq 'iperf3 -c 43.130.32.77 -p 5201 -t 2 -P 1 -b 13395070 -l 1024 -R --json --get-server-output' \
     "$M0_TEST_COMMAND_LOG" || \
     die "self-test: M0 sustained reverse TCP lacks low-rate receiver granularity"
   grep -Fq 'iperf3 -c 43.130.32.77 -p 5201 -t 1 -P 1 -b 13395070 -u -l 1160 -R --json --get-server-output' \
@@ -2484,6 +2511,8 @@ run_baseline() {
     "$IPERF_PORT" "$DURATION" "$PARALLEL" 1 iperf3; then
     die "direct reverse baseline failed; evidence: $out_dir/direct-reverse.json"
   fi
+  baseline_receiver_summary "$out_dir" || \
+    warn "direct baseline completed but its receiver speed summary is unavailable"
   validate_m0_baseline_pair "$out_dir" "$TARGET" || \
     die "direct baseline receiver continuity/evidence failed; evidence: $out_dir"
   echo "PASS: direct baseline complete: $out_dir"
