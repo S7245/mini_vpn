@@ -410,7 +410,17 @@ interface_control_fields_from_text() {
   local interface="$1"
   awk -v interface="$interface" '
     $1 == interface && $3 ~ /^<Link#/ {
-      printf "%s,%s,%s,%s,%s,%s,%s,%s\n", $2, $4, $5, $6, $7, $8, $9, $10
+      first_counter = 4
+      if ($4 !~ /^[0-9]+$/) first_counter = 5
+      valid = ($2 ~ /^[0-9]+$/)
+      for (field = first_counter; field <= first_counter + 6; field++) {
+        if ($(field) !~ /^[0-9]+$/) valid = 0
+      }
+      if (!valid) next
+      printf "%s,%s,%s,%s,%s,%s,%s,%s\n", $2,
+        $(first_counter), $(first_counter + 1), $(first_counter + 2),
+        $(first_counter + 3), $(first_counter + 4), $(first_counter + 5),
+        $(first_counter + 6)
       found = 1
       exit
     }
@@ -464,6 +474,11 @@ network_control_envelope() {
     NR > 1 {
       rows++
       schema_valid = (NF == 27)
+      physical_valid = (schema_valid &&
+        $18 ~ /^[0-9]+$/ && $19 ~ /^[0-9]+$/ &&
+        $20 ~ /^[0-9]+$/ && $21 ~ /^[0-9]+$/ &&
+        $22 ~ /^[0-9]+$/ && $23 ~ /^[0-9]+$/ &&
+        $24 ~ /^[0-9]+$/ && $25 ~ /^[0-9]+$/)
       if (schema_valid && $6 ~ /^[0-9]+$/ && $7 ~ /^[0-9]+$/ && numeric($8)) {
         exit_samples++
         if (!have_exit_loss || $8 + 0 > exit_loss_max) exit_loss_max = $8 + 0
@@ -479,9 +494,10 @@ network_control_envelope() {
         if (!have_gateway_loss || $14 + 0 > gateway_loss_max) gateway_loss_max = $14 + 0
         have_gateway_loss = 1
       }
-      if (schema_valid && (($20 ~ /^[0-9]+$/ && $20 + 0 > 0) ||
-          ($23 ~ /^[0-9]+$/ && $23 + 0 > 0))) physical_error_samples++
-      if (schema_valid && $21 ~ /^[0-9]+$/ && $24 ~ /^[0-9]+$/) {
+      if (physical_valid && ($20 + 0 > 0 || $23 + 0 > 0)) {
+        physical_error_samples++
+      }
+      if (physical_valid) {
         if (!physical_samples) {
           ibytes_first = $21 + 0
           obytes_first = $24 + 0
@@ -490,11 +506,13 @@ network_control_envelope() {
         obytes_last = $24 + 0
         physical_samples++
       }
-      if (schema_valid && $26 ~ /^[0-9]+$/ && (!have_rx_bps || $26 + 0 > rx_bps_max)) {
+      if (physical_valid && $26 ~ /^[0-9]+$/ &&
+          (!have_rx_bps || $26 + 0 > rx_bps_max)) {
         rx_bps_max = $26 + 0
         have_rx_bps = 1
       }
-      if (schema_valid && $27 ~ /^[0-9]+$/ && (!have_tx_bps || $27 + 0 > tx_bps_max)) {
+      if (physical_valid && $27 ~ /^[0-9]+$/ &&
+          (!have_tx_bps || $27 + 0 > tx_bps_max)) {
         tx_bps_max = $27 + 0
         have_tx_bps = 1
       }
@@ -1361,6 +1379,13 @@ EOF_INTERFACE
   [[ "$(interface_control_fields_from_text utun42 <"$interface_fixture")" == \
     "1200,100,0,64000,90,0,60000,0" ]] || \
     die "self-test: physical interface control parser mismatch"
+  cat >"$interface_fixture" <<'EOF_PHYSICAL_INTERFACE'
+Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll
+en1        1500  <Link#15>     0a:0b:f8:b0:f8:93  89891762     0  89665814003 41674842     0 16466942968     0
+EOF_PHYSICAL_INTERFACE
+  [[ "$(interface_control_fields_from_text en1 <"$interface_fixture")" == \
+    "1500,89891762,0,89665814003,41674842,0,16466942968,0" ]] || \
+    die "self-test: physical interface MAC address shifted counters"
 
   ping_fixture="$tmp/ping.txt"
   printf '%s\n' \
@@ -1385,6 +1410,14 @@ EOF_INTERFACE
   [[ "$(network_control_envelope "$network_fixture")" == \
     "2 2 0 2 2 0 2 33.300000 180.456 0.000000 1 64000 128000 64000 60000 120000 60000 17066 16000" ]] || \
     die "self-test: network control envelope mismatch"
+  printf '%s\n' \
+    'timestamp,target_route,exit_route,physical_interface,physical_gateway,exit_ping_transmitted,exit_ping_received,exit_ping_loss_percent,exit_ping_rtt_min_ms,exit_ping_rtt_avg_ms,exit_ping_rtt_max_ms,gateway_ping_transmitted,gateway_ping_received,gateway_ping_loss_percent,gateway_ping_rtt_min_ms,gateway_ping_rtt_avg_ms,gateway_ping_rtt_max_ms,physical_mtu,physical_ipkts,physical_ierrs,physical_ibytes,physical_opkts,physical_oerrs,physical_obytes,physical_collisions,physical_rx_bps,physical_tx_bps' \
+    '2026-07-14T00:00:00Z,utun42,en0,en0,192.168.50.1,3,3,0.000000,170.000,171.000,172.000,3,3,0.000000,1.000,1.500,2.000,1500,0a:0b:f8:b0:f8:93,100,0,64000,90,0,60000,0,0' \
+    '2026-07-14T00:00:30Z,utun42,en0,en0,192.168.50.1,3,3,0.000000,170.000,171.000,172.000,3,3,0.000000,1.000,1.500,2.000,1500,0a:0b:f8:b0:f8:93,200,0,128000,180,0,120000,0,0' \
+    >"$network_fixture.malformed"
+  [[ "$(network_control_envelope "$network_fixture.malformed")" == \
+    "2 2 0 2 2 0 0 0.000000 171.000 0.000000 0 unknown unknown unknown unknown unknown unknown unknown unknown" ]] || \
+    die "self-test: shifted physical counters were accepted as network control"
 
   collector_dir="$tmp/network-collector"
   collector_bin="$tmp/network-collector-bin"
@@ -1409,7 +1442,7 @@ EOF_FAKE_PING
 #!/usr/bin/env bash
 printf '%s\n' \
   'Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll' \
-  'en0        1500  <Link#15>                         100     0      64000       90     0      60000     0'
+  'en0        1500  <Link#15>     0a:0b:f8:b0:f8:93  100     0      64000       90     0      60000     0'
 EOF_FAKE_NETSTAT
   chmod +x "$collector_bin/route" "$collector_bin/ping" "$collector_bin/netstat"
   printf '%s\n' \
@@ -1427,6 +1460,17 @@ EOF_FAKE_NETSTAT
   network_control_is_recent || die "self-test: fresh network control was rejected"
   write_state network.valid.epoch 1
   ! network_control_is_recent || die "self-test: stale network control was accepted"
+  cat >"$collector_bin/netstat" <<'EOF_MALFORMED_NETSTAT'
+#!/usr/bin/env bash
+printf '%s\n' \
+  'Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll' \
+  'en0        1500  <Link#15>     0a:0b:f8:b0:f8:93  200     0     128000      180     0     120000  unknown'
+EOF_MALFORMED_NETSTAT
+  chmod +x "$collector_bin/netstat"
+  rm -f "$(state_file network.valid.epoch)"
+  sample_network_control_for "$collector_dir" 2026-07-14T00:00:30Z
+  [[ ! -e "$(state_file network.valid.epoch)" ]] || \
+    die "self-test: malformed physical control refreshed freshness"
   PATH="$original_path"
   STATE_DIR="$original_state_dir"
   [[ "$(awk -F, 'NR == 2 {print NF ":" $2 ":" $3 ":" $4 ":" $5 ":" $8 ":" $10 ":" $14 ":" $20 ":" $23}' \
