@@ -172,11 +172,22 @@ struct BoundedUdpSocket {
     shared: Arc<Mutex<SharedState>>,
 }
 
+#[cfg(test)]
 pub(crate) fn bounded_udp_socket(
     inner: Arc<dyn AsyncUdpSocket>,
     runtime: Arc<dyn Runtime>,
 ) -> (Arc<dyn AsyncUdpSocket>, QuicUdpSendServiceStats) {
-    let shared = Arc::new(Mutex::new(SharedState::new()));
+    bounded_udp_socket_with_stats(inner, runtime, None)
+}
+
+pub(crate) fn bounded_udp_socket_with_stats(
+    inner: Arc<dyn AsyncUdpSocket>,
+    runtime: Arc<dyn Runtime>,
+    existing: Option<&QuicUdpSendServiceStats>,
+) -> (Arc<dyn AsyncUdpSocket>, QuicUdpSendServiceStats) {
+    let shared = existing
+        .map(|stats| stats.shared.clone())
+        .unwrap_or_else(|| Arc::new(Mutex::new(SharedState::new())));
     let stats = QuicUdpSendServiceStats {
         shared: shared.clone(),
     };
@@ -606,6 +617,34 @@ mod tests {
         assert!(first.as_mut().poll_writable(&mut first_cx).is_ready());
         assert!(second.as_mut().poll_writable(&mut second_cx).is_ready());
         assert_eq!(stats.snapshot().accepted_datagrams, 48);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_udp_send_service_preserves_one_budget_across_socket_rebind() {
+        let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+        let first_inner = Arc::new(ReadyMockSocket::default());
+        let (first_socket, stats) = bounded_udp_socket(first_inner, runtime.clone());
+        let payload = [0x5a; 1200];
+        let packet = transmit(&payload, None);
+
+        for _ in 0..24 {
+            first_socket.try_send(&packet).expect("old socket share");
+        }
+        let second_inner = Arc::new(ReadyMockSocket::default());
+        let (second_socket, rebound_stats) =
+            bounded_udp_socket_with_stats(second_inner, runtime, Some(&stats));
+        for _ in 0..24 {
+            second_socket.try_send(&packet).expect("new socket share");
+        }
+        assert_eq!(
+            second_socket
+                .try_send(&packet)
+                .expect_err("rebind must not reset the aggregate batch")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(stats.snapshot().accepted_datagrams, 48);
+        assert_eq!(rebound_stats.snapshot().accepted_datagrams, 48);
     }
 
     #[tokio::test(start_paused = true)]

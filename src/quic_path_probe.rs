@@ -841,6 +841,114 @@ async fn real_loopback_reverse_stream_delivers_fixed_bytes_and_clean_eof() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn endpoint_window_rebind_preserves_two_live_connections_and_conservation() {
+    async fn echo_twice(connection: quinn::Connection) {
+        for _ in 0..2 {
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let payload = recv.read_to_end(64).await.unwrap();
+            send.write_all(&payload).await.unwrap();
+            send.finish().unwrap();
+            send.stopped().await.unwrap();
+        }
+    }
+
+    async fn round_trip(connection: &quinn::Connection, payload: &[u8]) {
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send.write_all(payload).await.unwrap();
+        send.finish().unwrap();
+        assert_eq!(recv.read_to_end(64).await.unwrap(), payload);
+    }
+
+    let cert_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certs/dev");
+    let server_endpoint = probe_server_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
+        cert_dir.join("server-cert.pem").to_str().unwrap(),
+        cert_dir.join("server-key.pem").to_str().unwrap(),
+    )
+    .unwrap();
+    let server_addr = server_endpoint.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            tasks.push(tokio::spawn(echo_twice(connection)));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+    });
+
+    let client_config = client_quic_config_alpn(
+        cert_dir.join("ca-cert.pem").to_str().unwrap(),
+        vec![PROBE_ALPN.to_vec()],
+        CcChoice::Cubic,
+        MtuPolicy::Safe1200,
+        QuicGsoPolicy::Enabled,
+        super::QuicPacingPolicy::EndpointWindowV1,
+    )
+    .unwrap();
+    let (endpoint, send_stats) = client_endpoint_with_udp_send_service(
+        client_config,
+        QuicUdpSendServicePolicy::QuinnDefault,
+        super::QuicPacingPolicy::EndpointWindowV1,
+    )
+    .unwrap();
+    let first = endpoint
+        .connect(server_addr, "example.com")
+        .unwrap()
+        .await
+        .unwrap();
+    let second = endpoint
+        .connect(server_addr, "example.com")
+        .unwrap()
+        .await
+        .unwrap();
+
+    tokio::join!(
+        round_trip(&first, b"before-1"),
+        round_trip(&second, b"before-2")
+    );
+    let before_addr = endpoint.local_addr().unwrap();
+    let before_pacing = endpoint.endpoint_pacing_snapshot().unwrap();
+
+    let rebound = rebind_client_endpoint_udp_socket(
+        &endpoint,
+        QuicUdpSendServicePolicy::QuinnDefault,
+        send_stats.as_ref(),
+    )
+    .unwrap();
+    assert_eq!(rebound.old_local_addr, before_addr);
+    assert_ne!(rebound.new_local_addr.port(), before_addr.port());
+    assert_eq!(rebound.rebind_generation, 1);
+    assert_eq!(endpoint.stats().current_socket_rx_rebind_generation, 0);
+    assert_eq!(endpoint.local_addr().unwrap(), rebound.new_local_addr);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            round_trip(&first, b"after-1"),
+            round_trip(&second, b"after-2")
+        );
+    })
+    .await
+    .expect("both established connections must survive endpoint socket rebind");
+    assert_eq!(endpoint.stats().current_socket_rx_rebind_generation, 1);
+
+    let after_pacing = endpoint.endpoint_pacing_snapshot().unwrap();
+    assert_eq!(
+        after_pacing.rate_bytes_per_second,
+        before_pacing.rate_bytes_per_second
+    );
+    assert_eq!(after_pacing.burst_bytes, before_pacing.burst_bytes);
+    assert!(
+        after_pacing.available_tokens
+            + after_pacing.live_reservation_bytes
+            + after_pacing.outstanding_bytes
+            <= after_pacing.burst_bytes
+    );
+    server_task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn disabled_gso_real_loopback_upload_delivers_fixed_bytes_and_clean_eof() {
     let _capacity_guard = crate::test_support::local_capacity_test_guard().await;
     let cert_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certs/dev");

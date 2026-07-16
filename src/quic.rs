@@ -487,6 +487,40 @@ pub(crate) fn client_endpoint_with_udp_send_service(
     pacing_policy: QuicPacingPolicy,
 ) -> Result<(Endpoint, Option<QuicUdpSendServiceStats>), String> {
     let bind: SocketAddr = "0.0.0.0:0".parse().expect("valid bind addr");
+    let runtime =
+        quinn::default_runtime().ok_or_else(|| "no async runtime for quic endpoint".to_string())?;
+    let BoundClientUdpSocket {
+        socket: abstract_socket,
+        send_service_stats,
+        ..
+    } = bind_client_udp_socket(bind, runtime.clone(), send_service_policy, None)?;
+    let mut ep_cfg = quinn::EndpointConfig::default();
+    ep_cfg
+        .max_udp_payload_size(QUIC_MAX_UDP_PAYLOAD_SIZE)
+        .map_err(|e| format!("quic max_udp_payload_size: {e:?}"))?;
+    if matches!(pacing_policy, QuicPacingPolicy::EndpointWindowV1) {
+        ep_cfg.endpoint_pacing_service(Some(
+            quinn::EndpointPacingServiceConfig::endpoint_window_v1(),
+        ));
+    }
+    let mut ep = Endpoint::new_with_abstract_socket(ep_cfg, None, abstract_socket, runtime)
+        .map_err(|e| format!("quic client endpoint: {e}"))?;
+    ep.set_default_client_config(cfg);
+    Ok((ep, send_service_stats))
+}
+
+struct BoundClientUdpSocket {
+    socket: Arc<dyn quinn::AsyncUdpSocket>,
+    send_service_stats: Option<QuicUdpSendServiceStats>,
+    local_addr: SocketAddr,
+}
+
+fn bind_client_udp_socket(
+    bind: SocketAddr,
+    runtime: Arc<dyn quinn::Runtime>,
+    send_service_policy: QuicUdpSendServicePolicy,
+    existing_send_service_stats: Option<&QuicUdpSendServiceStats>,
+) -> Result<BoundClientUdpSocket, String> {
     let socket = std::net::UdpSocket::bind(bind).map_err(|e| format!("quic client bind: {e}"))?;
     let (udp_buffer_bytes, udp_buffer_fell_back) = parse_quic_udp_socket_buffer_bytes(
         std::env::var("MINI_VPN_QUIC_UDP_SOCKET_BUFFER_BYTES")
@@ -506,32 +540,77 @@ pub(crate) fn client_endpoint_with_udp_send_service(
         ),
         Err(e) => println!("⚠️ QUIC UDP socket buffer 配置失败，继续使用系统默认: {e}"),
     }
-    let runtime =
-        quinn::default_runtime().ok_or_else(|| "no async runtime for quic endpoint".to_string())?;
-    let mut ep_cfg = quinn::EndpointConfig::default();
-    ep_cfg
-        .max_udp_payload_size(QUIC_MAX_UDP_PAYLOAD_SIZE)
-        .map_err(|e| format!("quic max_udp_payload_size: {e:?}"))?;
-    if matches!(pacing_policy, QuicPacingPolicy::EndpointWindowV1) {
-        ep_cfg.endpoint_pacing_service(Some(
-            quinn::EndpointPacingServiceConfig::endpoint_window_v1(),
-        ));
-    }
     let abstract_socket = runtime
         .wrap_udp_socket(socket)
         .map_err(|e| format!("quic client abstract socket: {e}"))?;
     let (abstract_socket, send_service_stats) = match send_service_policy {
         QuicUdpSendServicePolicy::QuinnDefault => (abstract_socket, None),
         QuicUdpSendServicePolicy::Bounded => {
-            let (socket, stats) =
-                crate::quic_udp_send_service::bounded_udp_socket(abstract_socket, runtime.clone());
+            let (socket, stats) = crate::quic_udp_send_service::bounded_udp_socket_with_stats(
+                abstract_socket,
+                runtime,
+                existing_send_service_stats,
+            );
             (socket, Some(stats))
         }
     };
-    let mut ep = Endpoint::new_with_abstract_socket(ep_cfg, None, abstract_socket, runtime)
-        .map_err(|e| format!("quic client endpoint: {e}"))?;
-    ep.set_default_client_config(cfg);
-    Ok((ep, send_service_stats))
+    let local_addr = abstract_socket
+        .local_addr()
+        .map_err(|e| format!("quic client local addr: {e}"))?;
+    Ok(BoundClientUdpSocket {
+        socket: abstract_socket,
+        send_service_stats,
+        local_addr,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuicEndpointRebindResult {
+    pub old_local_addr: SocketAddr,
+    pub new_local_addr: SocketAddr,
+    pub rebind_generation: u64,
+}
+
+pub(crate) fn rebind_client_endpoint_udp_socket(
+    endpoint: &Endpoint,
+    send_service_policy: QuicUdpSendServicePolicy,
+    send_service_stats: Option<&QuicUdpSendServiceStats>,
+) -> Result<QuicEndpointRebindResult, String> {
+    if matches!(send_service_policy, QuicUdpSendServicePolicy::Bounded)
+        && send_service_stats.is_none()
+    {
+        return Err("bounded QUIC UDP rebind requires existing aggregate stats state".to_string());
+    }
+    let old_local_addr = endpoint
+        .local_addr()
+        .map_err(|e| format!("quic endpoint old local addr: {e}"))?;
+    let old_rebind_generation = endpoint.stats().socket_rebinds;
+    let bind = if old_local_addr.is_ipv4() {
+        "0.0.0.0:0".parse().expect("valid IPv4 wildcard")
+    } else {
+        "[::]:0".parse().expect("valid IPv6 wildcard")
+    };
+    let runtime =
+        quinn::default_runtime().ok_or_else(|| "no async runtime for quic rebind".to_string())?;
+    let BoundClientUdpSocket {
+        socket,
+        local_addr: new_local_addr,
+        ..
+    } = bind_client_udp_socket(bind, runtime, send_service_policy, send_service_stats)?;
+    endpoint
+        .rebind_abstract(socket)
+        .map_err(|e| format!("quic endpoint rebind: {e}"))?;
+    let rebind_generation = endpoint.stats().socket_rebinds;
+    if rebind_generation != old_rebind_generation.saturating_add(1) {
+        return Err(format!(
+            "quic endpoint rebind generation mismatch: old={old_rebind_generation} new={rebind_generation}"
+        ));
+    }
+    Ok(QuicEndpointRebindResult {
+        old_local_addr,
+        new_local_addr,
+        rebind_generation,
+    })
 }
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {

@@ -265,6 +265,7 @@ impl Endpoint {
         let mut inner = self.inner.state.lock().unwrap();
         inner.prev_socket = Some(mem::replace(&mut inner.socket, socket));
         inner.ipv6 = addr.is_ipv6();
+        inner.stats.socket_rebinds = inner.stats.socket_rebinds.saturating_add(1);
 
         // Update connection socket references
         for sender in inner.recv_state.connections.senders.values() {
@@ -357,6 +358,12 @@ pub struct EndpointStats {
     pub refused_handshakes: u64,
     /// Cummulative number of Quic handshakes ignored on this [Endpoint]
     pub ignored_handshakes: u64,
+    /// Cumulative number of successful live UDP socket rebinds.
+    pub socket_rebinds: u64,
+    /// Latest rebind generation for which a connection packet arrived on the current socket.
+    ///
+    /// Packets received on the temporarily retained previous socket do not advance this value.
+    pub current_socket_rx_rebind_generation: u64,
 }
 
 /// A future that drives IO on an endpoint
@@ -530,6 +537,7 @@ impl State {
             // Traffic has arrived on self.socket, therefore there is no need for the abandoned
             // one anymore. TODO: Account for multiple outgoing connections.
             self.prev_socket = None;
+            self.stats.current_socket_rx_rebind_generation = self.stats.socket_rebinds;
         }
         Ok(poll_res.keep_going)
     }

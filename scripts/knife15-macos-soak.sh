@@ -1473,6 +1473,30 @@ EOF_DIRECT_FIXTURE
     die "self-test: Exit control loss envelope mismatch"
   grep -Fq -- '- physical_ibytes_first_last_delta: 64000/192000/128000' \
     "$m0_run/summary.md" || die "self-test: physical input byte envelope mismatch"
+  cp "$m0_run/mini_vpn.log" "$m0_run/mini_vpn.no-rebind.log"
+  printf '%s\n' \
+    '🔄 tuic-endpoint-rebind generation=1 old_local=0.0.0.0:60000 new_local=0.0.0.0:60001 active_tcp=2 udp_active=false live_connections=2 stalled_ms=2000 bound_ms=2000 tx_since_rx=65536B max_rtt_ms=164' \
+    '✅ tuic-endpoint-rebind-recovered generation=1 first_rx_ms=250 socket_generation=1' \
+    >>"$m0_run/mini_vpn.log"
+  write_summary "$m0_run"
+  grep -Fq -- '- endpoint_rebind_attempts_recoveries_failures: 1/1/0' \
+    "$m0_run/summary.md" || die "self-test: recovered endpoint rebind was not counted"
+  grep -Fq -- '- endpoint_rebind_evidence: PASS' "$m0_run/summary.md" || \
+    die "self-test: recovered endpoint rebind evidence was not accepted"
+  grep -Fq -- '- endpoint_rebind_max_first_rx_ms: 250' "$m0_run/summary.md" || \
+    die "self-test: endpoint rebind recovery latency mismatch"
+  printf '%s\n' \
+    '⚠️ tuic-endpoint-rebind-failed generation=2 active_tcp=1 udp_active=false live_connections=1 stalled_ms=2000 bound_ms=2000 tx_since_rx=1024B max_rtt_ms=100 error=bind-failed' \
+    >>"$m0_run/mini_vpn.log"
+  write_summary "$m0_run"
+  grep -Fq -- '- endpoint_rebind_attempts_recoveries_failures: 2/1/1' \
+    "$m0_run/summary.md" || die "self-test: failed endpoint rebind was not counted"
+  grep -Fq -- '- endpoint_rebind_evidence: MISMATCH' "$m0_run/summary.md" || \
+    die "self-test: incomplete endpoint rebind was accepted"
+  grep -Fq -- '- internal_failure_scan: REVIEW' "$m0_run/summary.md" || \
+    die "self-test: incomplete endpoint rebind did not require review"
+  mv "$m0_run/mini_vpn.no-rebind.log" "$m0_run/mini_vpn.log"
+  write_summary "$m0_run"
   cp "$m0_run/network.csv" "$m0_run/network.complete.csv"
   sed -i '' '$d' "$m0_run/network.csv"
   write_summary "$m0_run"
@@ -3153,7 +3177,7 @@ show_status() {
   echo "target_if=$(route_interface "$target") expected=$utun"
   echo "exit_if=$(route_interface "$exit_host") must_not_equal=$utun"
   tail -n 3 "$run_dir/process.csv" 2>/dev/null || true
-  grep -E '📊 数据面|🔬 主循环|📊 TUIC QUIC stats|📊 TUIC endpoint pacing global|tcp-tun-rx-drain|tcp-handle-close|tcp-d16-relay-close' \
+  grep -E '📊 数据面|🔬 主循环|📊 TUIC QUIC stats|📊 TUIC endpoint pacing global|tuic-endpoint-rebind|tcp-tun-rx-drain|tcp-handle-close|tcp-d16-relay-close' \
     "$run_dir/mini_vpn.log" 2>/dev/null | tail -n 20 || true
 }
 
@@ -3204,6 +3228,8 @@ write_summary() {
   local opkts_first opkts_last opkts_delta obytes_first obytes_last obytes_delta
   local endpoint_samples_count endpoint_conservation_max endpoint_last_available endpoint_last_live
   local endpoint_last_outstanding endpoint_max_live endpoint_max_outstanding
+  local endpoint_rebind_successes endpoint_rebind_recoveries endpoint_rebind_failures
+  local endpoint_rebind_attempts endpoint_rebind_evidence endpoint_rebind_max_first_rx_ms
   local m0_tcp_results m0_udp_results m0_tcp_max_gap m0_udp_max_loss m0_invalid_results
   local m0_sender_zero_intervals m0_receiver_zero_intervals
   local m0_phase_results m0_result_evidence
@@ -3225,6 +3251,30 @@ write_summary() {
   # diagnostic. Count the canonical relay-close record once while preserving
   # the broader log-match count for forensic review.
   remote_write_failures="$(grep -Ec 'tcp-d16-relay-close .*terminal_reason=(remote_write_failed|stalled_write_timeout)( |$)' "$log_file" 2>/dev/null || true)"
+  endpoint_rebind_successes="$(grep -Ec 'tuic-endpoint-rebind generation=[0-9]+' \
+    "$log_file" 2>/dev/null || true)"
+  endpoint_rebind_recoveries="$(grep -Ec 'tuic-endpoint-rebind-recovered generation=[0-9]+ first_rx_ms=[0-9]+ socket_generation=[0-9]+' \
+    "$log_file" 2>/dev/null || true)"
+  endpoint_rebind_failures="$(grep -Ec 'tuic-endpoint-rebind-failed generation=[0-9]+' \
+    "$log_file" 2>/dev/null || true)"
+  endpoint_rebind_attempts=$((10#${endpoint_rebind_successes:-0} + 10#${endpoint_rebind_failures:-0}))
+  endpoint_rebind_max_first_rx_ms="$(awk '
+    match($0, /tuic-endpoint-rebind-recovered generation=[0-9]+ first_rx_ms=[0-9]+/) {
+      value = substr($0, RSTART, RLENGTH)
+      sub(/^.*first_rx_ms=/, "", value)
+      if (value + 0 > maximum) maximum = value + 0
+    }
+    END { print maximum + 0 }
+  ' "$log_file" 2>/dev/null)"
+  endpoint_rebind_evidence=NOT_OBSERVED
+  if ((10#$endpoint_rebind_attempts > 0)); then
+    if ((10#${endpoint_rebind_failures:-0} == 0 && \
+      10#${endpoint_rebind_successes:-0} == 10#${endpoint_rebind_recoveries:-0})); then
+      endpoint_rebind_evidence=PASS
+    else
+      endpoint_rebind_evidence=MISMATCH
+    fi
+  fi
   interface_error_samples="$(awk -F, '
     NR > 1 && (($5 ~ /^[0-9]+$/ && $5 + 0 > 0) || ($8 ~ /^[0-9]+$/ && $8 + 0 > 0)) { count++ }
     END { print count + 0 }
@@ -3314,6 +3364,7 @@ write_summary() {
     ((10#$m0_sender_zero_intervals > 0)); } || \
     { [[ "$m0_receiver_zero_intervals" =~ ^[0-9]+$ ]] && \
     ((10#$m0_receiver_zero_intervals > 0)); } || \
+    ((10#${endpoint_rebind_attempts:-0} > 0)) || \
     { [[ "$interface_error_samples" =~ ^[0-9]+$ ]] && \
     ((10#$interface_error_samples > 0)); } || \
     { [[ "$physical_interface_error_samples" =~ ^[0-9]+$ ]] && \
@@ -3331,6 +3382,9 @@ write_summary() {
 - internal_failure_scan: $verdict
 - remote_write_failures: ${remote_write_failures:-unknown}
 - remote_write_failure_log_matches: ${remote_write_failure_log_matches:-unknown}
+- endpoint_rebind_attempts_recoveries_failures: ${endpoint_rebind_attempts:-0}/${endpoint_rebind_recoveries:-0}/${endpoint_rebind_failures:-0}
+- endpoint_rebind_evidence: $endpoint_rebind_evidence
+- endpoint_rebind_max_first_rx_ms: ${endpoint_rebind_max_first_rx_ms:-0}
 - interface_error_samples: ${interface_error_samples:-unknown}
 - network_control_evidence: $network_control_evidence
 - network_control_samples: ${network_control_samples:-0}
