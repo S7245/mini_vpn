@@ -1,5 +1,21 @@
 # Learnings
 
+## 2026-07-16 - No minimum speed does not mean no continuity gate
+
+- A complete Shenzhen baseline averaged only `2.598 Mbit/s` forward and
+  `0.098 Mbit/s` reverse. Those rates alone are accepted environment capacity,
+  but the receivers also recorded two and four zero intervals.
+- Reverse already used a `1KiB` block at about `12KiB/s` average delivery.
+  Three consecutive receiver-zero seconds, 50 retransmits, and a
+  `1,388-2,776B` sender cwnd reject observer quantization. This was transport
+  discontinuity, not merely low bandwidth.
+- Reusable rule: keep capacity and continuity orthogonal. A path may be slow
+  enough to size a low workload but still too discontinuous to attribute a
+  later tunneled zero interval. Preserve a fine observer and require positive
+  receiver evidence before introducing the product under test.
+- Result:
+  `docs/tech/2026-07-16-knife15-shenzhen-post-rebind-physical-baseline-results.md`.
+
 ## 2026-07-16 - Recovery authority must match the shared failure domain
 
 - Two independent QUIC connections timed out together only after their shared

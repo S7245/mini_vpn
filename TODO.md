@@ -6,7 +6,28 @@
 
 #### Latest decision (2026-07-16)
 
-Exact source `8e9daf9` Shenzhen bundle
+The first two Shenzhen physical baseline attempts after candidate `fe3ec83`
+failed before any TUN or mini_vpn execution. Attempt `...134708` established
+the iperf control and data connections but produced no interval; the client
+reported a closed control socket while Target reported an idle data receive.
+The Target service stayed active with zero restarts.
+
+Attempt `...135653` completed both directions. Forward Target receiver was
+`2.598 Mbit/s` with two zero intervals and 24 retransmits. Reverse local
+receiver was `0.098 Mbit/s` with four zero intervals and 50 retransmits. The
+accepted `1KiB` reverse observer normally exposed multiple blocks per positive
+second, but three consecutive receiver seconds were zero while sender cwnd
+fell to `1,388-2,776B`. This is physical path discontinuity, not a minimum-
+speed failure or observer quantization.
+
+Do not export either directory, run direct/start/M0, tune mini_vpn, or relax
+receiver continuity. Retry the unchanged baseline in a different network
+window or on another Mac with a more continuous Target path. No minimum Mbps
+is required. A degraded-path lane, if planned later, remains non-promotable and
+separate from formal socket-rebind acceptance. Result:
+`docs/tech/2026-07-16-knife15-shenzhen-post-rebind-physical-baseline-results.md`.
+
+Previous exact source `8e9daf9` Shenzhen bundle
 `/tmp/mini_vpn_knife15_macos_20260716_110535.tar.gz` (SHA-256 `f9799711...`)
 was operated correctly. It did not stop because the user interrupted it or
 because a sudo password was delayed. Smoke passed, M0 cycle 1 completed, and

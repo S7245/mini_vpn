@@ -4,7 +4,24 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-16)
 
-- **Latest accepted position:** exact source `8e9daf9` Shenzhen M0 bundle
+- **Latest accepted position:** the first two post-`fe3ec83` Shenzhen physical
+  baseline attempts failed before any TUN or mini_vpn execution. Attempt
+  `...134708` connected both iperf control/data sockets but produced zero
+  intervals; client reported `control socket has closed unexpectedly` and
+  Target reported `idle timeout for receiving data`. The Target service stayed
+  active with zero restarts.
+- Attempt `...135653` completed both directions but measured forward
+  `2.598 Mbit/s` with two Target receiver zeros and 24 retransmits, and reverse
+  `0.098 Mbit/s` with four local receiver zeros and 50 retransmits. Reverse
+  already used the accepted `1KiB` observer; three consecutive zeros plus
+  `1,388-2,776B` cwnd prove real physical stalls, not low-rate quantization.
+- Formal M0 remains blocked before direct/start. Neither failed directory may
+  be exported as `M0_BASELINE_DIR`. Do not tune mini_vpn or relax the SLI.
+  Retry in a different network window or use another Mac whose direct physical
+  path passes the unchanged baseline; there is still no minimum Mbps. Result:
+  `docs/tech/2026-07-16-knife15-shenzhen-post-rebind-physical-baseline-results.md`.
+
+- **Previous accepted position:** exact source `8e9daf9` Shenzhen M0 bundle
   `/tmp/mini_vpn_knife15_macos_20260716_110535.tar.gz` (SHA-256
   `f9799711...`) was operated correctly. Smoke and the entire first M0 cycle
   passed. Cycle 2 forward failed itself after about `65s`; the user did not

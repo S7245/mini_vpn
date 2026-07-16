@@ -1,5 +1,17 @@
 # Errors
 
+## 2026-07-16 - Post-rebind acceptance was blocked by the physical lane
+
+- The first Shenzhen baseline established iperf control/data sockets but sent
+  no data interval. The second completed both directions but recorded two
+  forward and four reverse receiver-zero intervals before mini_vpn or TUN ran.
+- Target iperf remained active with zero restarts. The accepted `1KiB` reverse
+  observer, repeated retransmission, and one-to-two-segment cwnd reject service
+  restart, operation, minimum speed, and coarse observation as causes.
+- Do not loop direct/start/M0 after a failed baseline and do not export the
+  failed directory. Move to another network window or physical Mac. Any
+  degraded-path soak must be an explicitly separate non-acceptance lane.
+
 ## 2026-07-16 - M0 outlived one healthy UDP endpoint identity
 
 - The user correctly ran smoke and one full M0 cycle. Cycle 2 forward then
