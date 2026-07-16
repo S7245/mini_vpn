@@ -6,6 +6,32 @@
 
 #### Latest decision (2026-07-16)
 
+Exact source `c50613c` Shenzhen bundle
+`/tmp/mini_vpn_knife15_macos_20260716_072536.tar.gz` (SHA-256 `dd8a28f0...`)
+correctly failed M0 cycle 1 forward. Start/smoke and all baseline/direct
+freshness/provenance checks passed. The user correctly preserved the failure,
+took a snapshot, and stopped with complete cleanup.
+
+The 300-second client sent only `10,485,760B`, reported `292/300` zero
+intervals and final `Broken pipe`, and had no server output. Target recorded an
+unexpectedly closed client. Both TUIC pool connections on the shared Quinn
+endpoint ended `TimedOut`; all reconnect attempts on that endpoint then timed
+out. The data relay had accepted `5,242,917B` before transport loss.
+
+Endpoint conservation stayed `<=61,440B` and ended `61,440/0/0B`; pacing
+blocking, TUN pump/flush errors, FD/thread growth, interface errors, log
+compaction, and watchdog failures were absent. `.33` sing-box and `.77` iperf
+remained active; `.33` had zero service restarts and logged both M0 Target
+opens. This rejects operator, observer, freshness, local pressure, and service-
+restart branches.
+
+The unresolved branch is Shenzhen/upstream UDP five-tuple blackhole versus a
+mini_vpn shared-endpoint receive/service failure. A bounded `.33` UDP `8443`
+capture is active. Next run only a fresh-process start/smoke/status/stop rearm
+and compare fresh source-port recovery plus server ingress/egress. Do not
+repeat M0 or change frozen constants before classification. Result:
+`docs/tech/2026-07-16-knife15-macos-m0-shared-quic-timeout-results.md`.
+
 Synchronized Shenzhen directory
 `/tmp/mini_vpn_knife15_macos_direct_20260716_071534` passes the unchanged
 300-second physical forward discriminator. Result SHA-256 is `810e777b...`.

@@ -1,5 +1,19 @@
 # Errors
 
+## 2026-07-16 - M0 lost every QUIC connection on one shared endpoint
+
+- The accepted baseline and 300-second physical TCP direct control passed,
+  but M0 cycle 1 forward lost both pool connections within its opening window.
+  The client then spent most of 300 seconds at zero and failed its final
+  control message with `Broken pipe`.
+- Reconnects on the same endpoint repeatedly timed out even though sing-box,
+  iperf, local resources, endpoint conservation, and ICMP controls remained
+  available. ICMP and direct TCP do not prove UDP five-tuple continuity.
+- Do not retry M0 or tune pacing, MTU, pool, windows, chunking, Cubic, or GSO
+  from this evidence. Capture UDP ingress/egress at the Exit and test a fresh
+  endpoint/source port to distinguish a path mapping blackhole from client
+  receive/service failure.
+
 ## 2026-07-16 - A zsh field-splitting probe printed false PASS labels
 
 - A one-off artifact validator used `set -- $spec` under zsh. Default zsh did

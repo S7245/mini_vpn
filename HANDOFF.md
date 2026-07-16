@@ -4,7 +4,27 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-16)
 
-- **Latest accepted position:** the synchronized Shenzhen direct directory
+- **Latest accepted position:** exact source `c50613c` bundle
+  `/tmp/mini_vpn_knife15_macos_20260716_072536.tar.gz` (SHA-256
+  `dd8a28f0...`) correctly failed M0 cycle 1 forward. Start, smoke, baseline,
+  direct freshness/provenance, snapshot, and stop were correct. The client ran
+  300 seconds but sent only `10,485,760B`; `292/300` intervals were zero, final
+  control failed `Broken pipe`, and Target reported the client unexpectedly
+  closed.
+- Both TUIC pool connections on the shared Quinn endpoint ended `TimedOut`;
+  the conn1 data relay accepted only `5,242,917B`, and all reconnects on the
+  old endpoint then timed out. Endpoint conservation ended `61,440/0/0B`, with
+  zero pacing blocking, pump/flush errors, FD/thread growth, interface errors,
+  or service restart. `.33` sing-box stayed active with zero restarts and
+  logged both M0 Target opens; `.77` iperf stayed active.
+- The remaining discriminator is old UDP five-tuple/network blackhole versus
+  client shared-endpoint receive/service failure. A bounded `.33` UDP `8443`
+  capture is active; next run only a fresh-process start/smoke/status/stop
+  rearm. Do not repeat formal M0 or tune frozen constants until packet
+  direction and fresh-port recovery classify the branch. Result:
+  `docs/tech/2026-07-16-knife15-macos-m0-shared-quic-timeout-results.md`.
+
+- **Previous accepted position:** the synchronized Shenzhen direct directory
   `/tmp/mini_vpn_knife15_macos_direct_20260716_071534` is a formal 300-second
   direct continuity PASS. Its result SHA-256 is `810e777b...`; the Target
   receiver delivered `420,741,120B` at `11.213247 Mbit/s` for `300.174s`, with
@@ -23,7 +43,7 @@
   M1 remains blocked until M0 and a separate rearm pass. Result:
   `docs/tech/2026-07-15-knife15-macos-low-rate-reverse-observer-results.md`.
 
-- **Previous accepted position:** the exact copied Shenzhen archive
+- **Earlier accepted position:** the exact copied Shenzhen archive
   `/tmp/mini_vpn_knife15_macos_baseline_20260716_064427.tar.gz` (SHA-256
   `5ea583c5...`) reaches the 1KiB reverse observer and passes the formal
   direction-aware baseline validator. Physical forward Target receiver was

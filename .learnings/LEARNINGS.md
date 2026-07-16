@@ -1,5 +1,23 @@
 # Learnings
 
+## 2026-07-16 - Shared timeout needs packet-direction evidence
+
+- A passing TCP direct discriminator and healthy ICMP controls did not prove
+  UDP `8443` continuity. Both QUIC pool connections on one endpoint timed out
+  together while Exit and Target services remained active.
+- Reconnect on the same endpoint/five-tuple repeatedly failed, so connection-
+  local retry could not distinguish an upstream mapping blackhole from a dead
+  client endpoint receive/service loop.
+- Endpoint conservation, local TUN queues, resources, and service liveness are
+  necessary negative controls but cannot prove which side last exchanged UDP.
+  A bounded server capture plus a fresh endpoint/source port provides the
+  smallest directional discriminator.
+- Reusable rule: when all sessions sharing a socket fail together, instrument
+  both directions at the peer and test a fresh socket identity before changing
+  transport constants or per-connection retry policy.
+- Evidence: `dd8a28f0...`. Result:
+  `docs/tech/2026-07-16-knife15-macos-m0-shared-quic-timeout-results.md`.
+
 ## 2026-07-16 - Match long-run controls to the product receiver SLI
 
 - The 20-second low-rate baseline established capacity, while the separate
