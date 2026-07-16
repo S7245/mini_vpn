@@ -2430,6 +2430,112 @@ mod tests {
     };
     use crate::tcp_egress::EgressPhase;
 
+    #[derive(Default)]
+    struct FailAfterWriteTrigger {
+        written: AtomicBool,
+        reader_waker: Mutex<Option<std::task::Waker>>,
+    }
+
+    impl FailAfterWriteTrigger {
+        fn fire(&self) {
+            self.written.store(true, Ordering::Release);
+            if let Some(waker) = self.reader_waker.lock().unwrap().take() {
+                waker.wake();
+            }
+        }
+    }
+
+    struct FailAfterWriteReader {
+        trigger: Arc<FailAfterWriteTrigger>,
+        failed: bool,
+    }
+
+    impl NativeTcpReader for FailAfterWriteReader {
+        fn poll_read_chunk(
+            &mut self,
+            cx: &mut Context<'_>,
+            _max_len: usize,
+        ) -> Poll<std::io::Result<Option<NativeTcpChunk>>> {
+            if self.failed {
+                return Poll::Pending;
+            }
+            if self.trigger.written.load(Ordering::Acquire) {
+                self.failed = true;
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "injected remote read failure",
+                )));
+            }
+            *self.trigger.reader_waker.lock().unwrap() = Some(cx.waker().clone());
+            if self.trigger.written.load(Ordering::Acquire) {
+                cx.waker().wake_by_ref();
+            }
+            Poll::Pending
+        }
+    }
+
+    struct FailAfterWriteWriter {
+        trigger: Arc<FailAfterWriteTrigger>,
+        written_bytes: Arc<AtomicU64>,
+    }
+
+    impl tokio::io::AsyncWrite for FailAfterWriteWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.written_bytes
+                .fetch_add(buf.len() as u64, Ordering::Relaxed);
+            self.trigger.fire();
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct OneShotFailingD16Upstream {
+        relay: Mutex<Option<NativeTcpRelayStream>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyUpstream for OneShotFailingD16Upstream {
+        async fn open_tcp(&self, _target: &TargetAddr) -> Result<RelayStream, ClientError> {
+            Err(ClientError::InvalidTarget(
+                "failing D16 harness requires native relay open".into(),
+            ))
+        }
+
+        async fn open_tcp_relay(
+            &self,
+            _target: &TargetAddr,
+        ) -> Result<OpenedTcpRelay, ClientError> {
+            self.relay
+                .lock()
+                .unwrap()
+                .take()
+                .map(OpenedTcpRelay::NativeByteOwned)
+                .ok_or_else(|| ClientError::InvalidTarget("failing relay already opened".into()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DatagramUpstream for OneShotFailingD16Upstream {
+        async fn send_udp(&self, _datagram: Vec<u8>) {}
+    }
+
     struct OneShotRealQuinnD16Upstream {
         relay: Mutex<Option<NativeTcpRelayStream>>,
     }
@@ -2536,6 +2642,100 @@ mod tests {
         assert!(report.second_control_echoed, "{report:?}");
         assert!(report.round_trip_intact, "{report:?}");
         assert_eq!(report.tcp_opens, 1, "{report:?}");
+    }
+
+    #[tokio::test]
+    async fn d16_remote_read_failure_reaches_local_tcp_client() {
+        let gen_to_sut = PacketLink::new();
+        let sut_to_gen = PacketLink::new();
+        let (_downlink_tx, downlink_rx) = mpsc::channel::<Vec<u8>>(1);
+        let trigger = Arc::new(FailAfterWriteTrigger::default());
+        let written_bytes = Arc::new(AtomicU64::new(0));
+        let upstream = Arc::new(OneShotFailingD16Upstream {
+            relay: Mutex::new(Some(NativeTcpRelayStream {
+                reader: Box::new(FailAfterWriteReader {
+                    trigger: Arc::clone(&trigger),
+                    failed: false,
+                }),
+                writer: Box::new(FailAfterWriteWriter {
+                    trigger,
+                    written_bytes: Arc::clone(&written_bytes),
+                }),
+            })),
+        });
+        let sut_device = LoopbackTunDevice::new(gen_to_sut.clone(), sut_to_gen.clone());
+        let config = TunRuntimeConfig::h10d16_gate_a_for_test();
+        let sut = tokio::spawn(run_event_loop(
+            sut_device,
+            upstream,
+            downlink_rx,
+            config,
+            Arc::new(Metrics::new()),
+            RecordingSink::new(Arc::new(Mutex::new(Recorded::default()))),
+        ));
+
+        let mut gen_device = GeneratorDevice::new(sut_to_gen, gen_to_sut);
+        let mut gen_iface = {
+            let cfg = SmolConfig::new(smoltcp::wire::HardwareAddress::Ip);
+            let mut iface = Interface::new(cfg, &mut gen_device, SmolInstant::now());
+            iface.update_ip_addrs(|addrs| {
+                addrs
+                    .push(IpCidr::new(IpAddress::Ipv4(GEN_IP), 24))
+                    .unwrap();
+            });
+            iface.routes_mut().add_default_ipv4_route(GEN_IP).unwrap();
+            iface
+        };
+        let mut sockets = SocketSet::new(vec![]);
+        let rx = tcp::SocketBuffer::new(vec![0u8; 16 * 1024]);
+        let tx = tcp::SocketBuffer::new(vec![0u8; 16 * 1024]);
+        let mut socket = tcp::Socket::new(rx, tx);
+        socket.set_ack_delay(None);
+        socket
+            .connect(
+                gen_iface.context(),
+                (IpAddress::Ipv4(TARGET_IP), TARGET_PORT_BASE),
+                42_000,
+            )
+            .unwrap();
+        let handle = sockets.add(socket);
+
+        let control = [0xA5u8; 37];
+        let mut sent = 0usize;
+        let mut local_failure_observed = false;
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(2) {
+            gen_iface.poll(SmolInstant::now(), &mut gen_device, &mut sockets);
+            let socket = sockets.get_mut::<tcp::Socket>(handle);
+            if sent < control.len()
+                && socket.can_send()
+                && let Ok(written) = socket.send_slice(&control[sent..])
+            {
+                sent = sent.saturating_add(written);
+            }
+            if sent == control.len() && (!socket.may_recv() || !socket.is_active()) {
+                local_failure_observed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_micros(200)).await;
+        }
+        let socket = sockets.get::<tcp::Socket>(handle);
+        let final_state = socket.state();
+        let final_active = socket.is_active();
+        let final_may_recv = socket.may_recv();
+        sut.abort();
+        let _ = sut.await;
+
+        assert_eq!(
+            sent,
+            control.len(),
+            "local client did not finish its control write"
+        );
+        assert_eq!(written_bytes.load(Ordering::Relaxed), control.len() as u64);
+        assert!(
+            local_failure_observed,
+            "remote read failure did not reach local TCP client: state={final_state:?} active={final_active} may_recv={final_may_recv}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

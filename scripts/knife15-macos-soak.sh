@@ -1099,7 +1099,7 @@ EOF_M0_PROFILE
 }
 
 runner_self_test() {
-  local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir baseline_summary_text m0_profile m0_run m0_fail_run direct_dir fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash
+  local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir baseline_summary_text m0_profile m0_run m0_fail_run direct_dir fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash bounded_status
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/knife15-macos-self-test.XXXXXX")" || return 1
   good_log="$tmp/good.log"
   bad_log="$tmp/bad.log"
@@ -1133,6 +1133,13 @@ runner_self_test() {
     die "self-test: unrelated PID command accepted"
   ! pid_command_matches /tmp/mini_vpn '/tmp/mini_vpn client-tun --other' || \
     die "self-test: non-exact mini_vpn command accepted"
+  if run_logged_with_timeout "$tmp/bounded-timeout.log" 1 /bin/sleep 30; then
+    die "self-test: bounded runner accepted a command that exceeded its deadline"
+  else
+    bounded_status=$?
+  fi
+  [[ "$bounded_status" == "124" ]] || \
+    die "self-test: bounded runner returned $bounded_status instead of timeout status 124"
   watchdog_command_matches "bash $SCRIPT_PATH __watchdog" || \
     die "self-test: watchdog command rejected"
   ! watchdog_command_matches '/usr/bin/sleep 30' || \
@@ -1876,6 +1883,7 @@ dns_target=${DNS_TARGET:-disabled}
 dns_name=$DNS_NAME
 iperf_port=$IPERF_PORT
 smoke_duration_secs=$DURATION
+smoke_command_timeout_secs=$((10#$DURATION + 30))
 smoke_parallel=$PARALLEL
 tun_mtu=1200
 tun_ingress_capacity=500
@@ -2649,6 +2657,45 @@ run_logged() {
   ((statuses[0] == 0 && statuses[1] == 0))
 }
 
+run_logged_with_timeout() {
+  local output_file="$1"
+  local timeout_secs="$2"
+  local command_pid watchdog_pid parent_pid status timeout_marker
+  shift 2
+  [[ "$timeout_secs" =~ ^[1-9][0-9]*$ ]] || return 2
+  timeout_marker="${output_file}.timeout.$$"
+  rm -f "$timeout_marker"
+  parent_pid="$$"
+  (
+    exec "$@" >"$output_file" 2>&1
+  ) &
+  command_pid=$!
+  (
+    sleep "$timeout_secs"
+    kill -0 "$parent_pid" 2>/dev/null || exit 0
+    kill -0 "$command_pid" 2>/dev/null || exit 0
+    printf '%s\n' timeout >"$timeout_marker"
+    kill -TERM "$command_pid" 2>/dev/null || exit 0
+    sleep 2
+    kill -KILL "$command_pid" 2>/dev/null || true
+  ) &
+  watchdog_pid=$!
+  trap 'kill -TERM "$command_pid" "$watchdog_pid" 2>/dev/null || true' INT TERM HUP
+  wait "$command_pid"
+  status=$?
+  kill -TERM "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  trap - INT TERM HUP
+  if [[ -f "$timeout_marker" ]]; then
+    printf 'ERROR: command exceeded hard timeout of %ss\n' "$timeout_secs" \
+      >>"$output_file"
+    status=124
+  fi
+  rm -f "$timeout_marker"
+  sed -n '1,$p' "$output_file"
+  return "$status"
+}
+
 m0_profile_value() {
   local profile_file="$1"
   local key="$2"
@@ -2933,7 +2980,7 @@ run_m0_schedule() {
 }
 
 run_smoke() {
-  local run_dir utun target exit_host smoke_dir iperf_port duration parallel dns_name dns_target
+  local run_dir utun target exit_host smoke_dir iperf_port duration parallel dns_name dns_target smoke_timeout_secs
   require_root
   run_dir="$(run_dir_from_state)" || die "no Knife15 run state"
   active_pid || die "mini_vpn is not running"
@@ -2945,18 +2992,21 @@ run_smoke() {
   parallel="$(read_state parallel)"
   dns_name="$(read_state dns_name)"
   dns_target="$(read_state dns_target 2>/dev/null || true)"
+  smoke_timeout_secs=$((10#$duration + 30))
   [[ "$(route_interface "$target")" == "$utun" ]] || die "TARGET no longer routes through $utun"
   [[ "$(route_interface "$exit_host")" != "$utun" ]] || die "Exit route recursed into $utun"
   require_command iperf3
   smoke_dir="$run_dir/smoke_$(date -u '+%Y%m%d_%H%M%S')"
   mkdir -p "$smoke_dir"
   append_event_to "$run_dir" "smoke start"
-  if ! run_logged "$smoke_dir/tunnel-forward.json" \
+  echo "Running tunnel forward smoke: duration=${duration}s hard_timeout=${smoke_timeout_secs}s"
+  if ! run_logged_with_timeout "$smoke_dir/tunnel-forward.json" "$smoke_timeout_secs" \
     iperf3 -c "$target" -p "$iperf_port" -t "$duration" -P "$parallel" --json; then
     append_event_to "$run_dir" "smoke forward failed"
     die "tunnel forward smoke failed; leave TUN running for status/stop"
   fi
-  if ! run_logged "$smoke_dir/tunnel-reverse.json" \
+  echo "Running tunnel reverse smoke: duration=${duration}s hard_timeout=${smoke_timeout_secs}s"
+  if ! run_logged_with_timeout "$smoke_dir/tunnel-reverse.json" "$smoke_timeout_secs" \
     iperf3 -c "$target" -p "$iperf_port" -t "$duration" -P "$parallel" -R --json; then
     append_event_to "$run_dir" "smoke reverse failed"
     die "tunnel reverse smoke failed; leave TUN running for status/stop"

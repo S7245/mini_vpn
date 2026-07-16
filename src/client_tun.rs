@@ -11629,6 +11629,22 @@ fn handle_relay_closed(
         );
         return false;
     }
+    if let Some(pending) = ctx.pending_relay_close {
+        ctx.state = SocketState::Closing;
+        ctx.uplink_tx = None;
+        if pending.reason == "remote_eof" && close.reason != "remote_eof" {
+            ctx.pending_relay_close = Some(close);
+        }
+        trace_log!(
+            "⏳ handle {:?} relay close({}/{}) coalesced with pending close({}/{})",
+            handle,
+            close.direction,
+            close.reason,
+            pending.direction,
+            pending.reason
+        );
+        return true;
+    }
     let snapshot = {
         let tcp_socket = sockets.get::<TcpSocket>(handle);
         SocketCloseSnapshot::from_socket(tcp_socket)
