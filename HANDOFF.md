@@ -4,24 +4,51 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-16)
 
-- **Latest accepted position:** exact source `c50613c` bundle
+- **Latest accepted position:** exact source `c50613c` clean rearm bundle
+  `/tmp/mini_vpn_knife15_macos_20260716_100056.tar.gz` (SHA-256
+  `baee8f2f...`) was operated correctly and exposed a deterministic local TCP
+  close-lifecycle defect. Start was ready on `utun5`; the target route stayed
+  on `utun5`, the Exit stayed on `en0`, and the user correctly interrupted the
+  hung smoke before snapshot/stop/clean cleanup. `curl ipinfo.io` remaining in
+  Shenzhen is expected because this is a target-only TUN, not a default route.
+- The first smoke relay wrote exactly `37B` of iperf control, then received no
+  remote stream frame for `11.045s`. D16 queue closure first installed
+  `remote_eof` and called `socket.close()`, but the later
+  `remote_read_failed` event immediately rearmed/aborted the same smoltcp
+  socket before its FIN could pass `iface.poll + flush_tx`. Local iperf3 saw
+  neither FIN nor RST and waited indefinitely. This is not Shenzhen speed,
+  sudo timing, operator procedure, endpoint pacing, TUN pressure, or an old
+  five-tuple permanent blackhole.
+- `.33` capture contained bidirectional UDP `8443` on the fresh source port,
+  including handshake/recovery bursts; later fresh connections exchanged
+  heartbeats. `.33` also logged authentication timeouts, so the network path
+  remains lossy and transport stability is not yet accepted, but packet
+  direction no longer blocks the local lifecycle repair.
+- Commit `9f68435` coalesces a same-epoch terminal relay event into an existing
+  deferred close, upgrades `remote_eof` to the first non-clean cause, and lets
+  the bounded drain state machine deliver local FIN/reset semantics before
+  rearm. A full in-memory TUN + dual-smoltcp RED test previously ended
+  `Established`; it now observes local failure within the two-second bound.
+  The macOS smoke runner also hard-bounds each iperf command at
+  `duration+30s`, preserves evidence, and returns `124` on timeout.
+- Full local gates pass: library `640 passed + 3 ignored`, main `2 passed`,
+  focused D16 close tests, release build, all-target harness check/Clippy,
+  Knife15 and Knife14 shell suites, fmt, and diff checks. Review has no
+  unresolved P0/P1. Frozen H10d16 constants and SLI are unchanged.
+- The next action is to get commit `9f68435` onto the Shenzhen Mac and build a
+  fresh release binary. Because source, runner, and binary changed, the old
+  `...064427` baseline and `...071534` direct result are historical evidence,
+  not formal provenance for the next M0. Run fresh baseline and direct, then
+  one bounded start/smoke. A smoke PASS permits formal M0; a smoke failure now
+  terminates within the hard bound and must be preserved with status/snapshot/
+  stop. Do not tune frozen constants. Result:
+  `docs/tech/2026-07-16-knife15-macos-smoke-close-lifecycle-results.md`.
+
+- **Previous accepted position:** exact source `c50613c` bundle
   `/tmp/mini_vpn_knife15_macos_20260716_072536.tar.gz` (SHA-256
-  `dd8a28f0...`) correctly failed M0 cycle 1 forward. Start, smoke, baseline,
-  direct freshness/provenance, snapshot, and stop were correct. The client ran
-  300 seconds but sent only `10,485,760B`; `292/300` intervals were zero, final
-  control failed `Broken pipe`, and Target reported the client unexpectedly
-  closed.
-- Both TUIC pool connections on the shared Quinn endpoint ended `TimedOut`;
-  the conn1 data relay accepted only `5,242,917B`, and all reconnects on the
-  old endpoint then timed out. Endpoint conservation ended `61,440/0/0B`, with
-  zero pacing blocking, pump/flush errors, FD/thread growth, interface errors,
-  or service restart. `.33` sing-box stayed active with zero restarts and
-  logged both M0 Target opens; `.77` iperf stayed active.
-- The remaining discriminator is old UDP five-tuple/network blackhole versus
-  client shared-endpoint receive/service failure. A bounded `.33` UDP `8443`
-  capture is active; next run only a fresh-process start/smoke/status/stop
-  rearm. Do not repeat formal M0 or tune frozen constants until packet
-  direction and fresh-port recovery classify the branch. Result:
+  `dd8a28f0...`) correctly failed M0 cycle 1 forward. Both pool connections on
+  one shared endpoint timed out after the accepted baseline/direct pair; this
+  motivated the clean rearm plus `.33` capture above. Result:
   `docs/tech/2026-07-16-knife15-macos-m0-shared-quic-timeout-results.md`.
 
 - **Previous accepted position:** the synchronized Shenzhen direct directory
@@ -35,12 +62,10 @@
   physical `en0` routes for both Target and Exit. The requested rate was the
   exact half-forward baseline rate, `11,218,349 bit/s`. Current-HK live state
   is excluded from this copied Shenzhen evidence.
-- The formal prerequisite pair is now accepted. Keep the Shenzhen checkout,
-  binary, runner, baseline, and direct directory unchanged; start/smoke/M0 may
-  run immediately, with `m0` starting inside the direct manifest's 15-minute
-  freshness window. On any start/smoke failure, do not enter M0. On an M0
-  workload failure, preserve the running TUN for status/snapshot/stop evidence.
-  M1 remains blocked until M0 and a separate rearm pass. Result:
+- This pair was the accepted prerequisite for source `c50613c` and permitted
+  its old start/smoke/M0 attempt. It is now historical evidence and cannot
+  provide formal provenance for the `9f68435` repair at the top of this file.
+  Result:
   `docs/tech/2026-07-15-knife15-macos-low-rate-reverse-observer-results.md`.
 
 - **Earlier accepted position:** the exact copied Shenzhen archive

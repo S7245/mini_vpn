@@ -1,5 +1,40 @@
 # Learnings
 
+## 2026-07-16 - Terminal events must join an existing close obligation
+
+- A D16 queue can become closed before its diagnostic `Closed` event reaches
+  the loop. The first observation queued local FIN as `remote_eof`; the later
+  `remote_read_failed` event aborted/rearmed the smoltcp socket before that FIN
+  reached the local client.
+- Event duplication was not the problem. Both observations represented one
+  same-epoch terminal obligation, and the second carried the more accurate
+  non-clean cause. Immediate cleanup destroyed the protocol signal that the
+  local application needed to stop waiting.
+- The repair coalesces same-epoch closes, keeps the socket dirty in the bounded
+  close-drain state, and upgrades a provisional clean cause to the first
+  non-clean cause. A full in-memory TUN plus peer smoltcp test proves behavior
+  at the local TCP client boundary instead of only inspecting internal state.
+- Reusable rule: when teardown has already begun, later terminal evidence must
+  refine that obligation rather than bypass its drain state machine. Rearm only
+  after the transport-level close becomes observable or its existing bounded
+  grace expires.
+- Implementation: `9f68435`. Result:
+  `docs/tech/2026-07-16-knife15-macos-smoke-close-lifecycle-results.md`.
+
+## 2026-07-16 - Every interactive smoke command needs its own hard deadline
+
+- Process liveness, route correctness, and external watchdog sampling did not
+  bound a foreground iperf command. When the local TCP socket received neither
+  FIN nor RST, `smoke` waited for about 18 minutes until the user interrupted
+  it.
+- Each iperf now has a `duration+30s` command deadline, a TERM-then-KILL
+  sequence, captured output, and a distinct `124` result. TUN remains running
+  after failure so status/snapshot/stop evidence is still available.
+- Reusable rule: bound the exact child whose completion is an acceptance
+  precondition. A global process watchdog is not a substitute for a foreground
+  command deadline, and timeout must preserve enough evidence to diagnose the
+  missing lifecycle signal.
+
 ## 2026-07-16 - Shared timeout needs packet-direction evidence
 
 - A passing TCP direct discriminator and healthy ICMP controls did not prove

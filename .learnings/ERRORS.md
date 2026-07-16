@@ -1,5 +1,30 @@
 # Errors
 
+## 2026-07-16 - A later relay error erased the queued local TCP close
+
+- The clean Shenzhen rearm wrote `37B` of iperf control, then D16 reported
+  queue closure followed by `remote_read_failed`. The first event called
+  `socket.close()`, but the second immediately called rearm/abort while the
+  socket was still `FinWait1`.
+- The local client received neither FIN nor RST and the old smoke command had
+  no hard deadline, so it appeared frozen until manual interruption. Route,
+  sudo timing, public IP, Shenzhen speed, and user operation were not causes.
+- Future close handlers must first check for an existing same-epoch deferred
+  close. Coalesce and refine its cause; do not independently abort the socket
+  before the local protocol signal drains. Every external smoke command must
+  also have its own evidence-preserving timeout.
+
+## 2026-07-16 - macOS Bash 3.2 does not provide BASHPID
+
+- The first portable timeout-helper self-test failed under the system Bash
+  with `BASHPID: unbound variable`. `BASHPID` is not available in macOS Bash
+  3.2 and `set -u` turned the portability mistake into a hard failure.
+- The helper only needs to prove that the owning shell still exists, so `$$`
+  is sufficient and is stable in Bash subshells. The repaired self-test kills
+  a 30-second sleep at one second and requires status `124`.
+- Reusable rule: new macOS runbook helpers must be exercised with the actual
+  `/bin/bash` version and must not rely on post-3.2 variables or syntax.
+
 ## 2026-07-16 - M0 lost every QUIC connection on one shared endpoint
 
 - The accepted baseline and 300-second physical TCP direct control passed,

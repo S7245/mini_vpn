@@ -187,7 +187,33 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-07-15:
+Current Knife15 summary, as of 2026-07-16:
+
+- Exact source `c50613c` clean rearm bundle
+  `/tmp/mini_vpn_knife15_macos_20260716_100056.tar.gz` (SHA-256
+  `baee8f2f...`) was operated correctly. The target-only route remained on
+  `utun5`, Exit remained `en0`, and Shenzhen remained the default public
+  egress as designed.
+- The smoke hang is a deterministic local close-lifecycle defect. D16 queue
+  closure queued a local FIN under `remote_eof`, then a later same-epoch
+  `remote_read_failed` event immediately aborted/rearmed the smoltcp socket
+  before `iface.poll + flush_tx`. The local iperf client therefore saw neither
+  FIN nor RST and waited forever. `.33` captured bidirectional UDP on the fresh
+  source port, rejecting an old-five-tuple permanent blackhole; the path can
+  still be lossy and is not yet accepted as stable.
+- Commit `9f68435` coalesces the second terminal event into the existing
+  bounded close and preserves the first non-clean cause. A full in-memory TUN
+  + dual-smoltcp RED/GREEN test locks local failure propagation. The macOS
+  smoke runner hard-bounds each iperf at `duration+30s`, preserves output, and
+  returns `124` on timeout. Full Rust, release, Clippy, shell, fmt/diff, and
+  review gates pass with no unresolved P0/P1; frozen H10d16 settings and SLI
+  are unchanged.
+- Next get `9f68435` onto Shenzhen, rebuild release, then take a fresh baseline
+  and 300-second direct discriminator because source/runner/binary changed.
+  A direct PASS permits one bounded start/smoke; smoke PASS permits M0. A
+  failure must preserve status/snapshot/stop evidence and cannot authorize
+  tuning. Result:
+  `docs/tech/2026-07-16-knife15-macos-smoke-close-lifecycle-results.md`.
 
 - Exact copied Shenzhen archive `...154130.tar.gz` (SHA-256 `49c4b71a...`)
   proves the 16KiB observer reached reverse iperf. Physical forward was
