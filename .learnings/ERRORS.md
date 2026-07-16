@@ -1,5 +1,18 @@
 # Errors
 
+## 2026-07-16 - A zsh field-splitting probe printed false PASS labels
+
+- A one-off artifact validator used `set -- $spec` under zsh. Default zsh did
+  not split the scalar as expected, so `jq --argjson` received an empty value.
+  The command group also lacked fail-fast handling and printed PASS labels
+  after jq had failed.
+- The labels were rejected immediately and the exact validation was rerun with
+  explicit file/reverse arguments under `set -euo pipefail`; both files then
+  passed legitimately.
+- Reusable rule: never derive an acceptance label from an unchecked prior
+  command. Use explicit function arguments for zsh probes and fail fast before
+  printing PASS.
+
 ## 2026-07-15 - A copied remote artifact was joined to the local host state
 
 - The Shenzhen baseline directory was copied into the current Mac's `/tmp`.

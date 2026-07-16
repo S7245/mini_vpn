@@ -1,5 +1,23 @@
 # Learnings
 
+## 2026-07-16 - A finer observer can preserve a strict low-rate SLI
+
+- The fresh Shenzhen reverse baseline used a 1KiB iperf application block and
+  delivered only `454,656B / 0.181787 Mbit/s`, yet all `20/20` local receiver
+  intervals were positive. The previous 16KiB observer produced five zeros on
+  a comparable slow physical path.
+- Sender cadence remained poor: nine sender intervals were zero, with 50
+  retransmits, about `164-170ms` RTT, and max cwnd `8,328B`. Direction-aware
+  receiver evidence correctly accepts continuity without erasing these path
+  diagnostics.
+- Reusable rule: when a strict time-window SLI fails only because the
+  application emits coarse evidence, reduce the observer quantum below both
+  expected per-window bytes and transport service capacity. Keep the SLI and
+  diagnostic sender evidence unchanged, then require fresh real-path proof.
+- Evidence: `/tmp/mini_vpn_knife15_macos_baseline_20260716_064427.tar.gz`,
+  SHA-256 `5ea583c5...`. The next gate is the unchanged 300-second physical
+  direct discriminator; this baseline alone does not qualify M0.
+
 ## 2026-07-15 - Observation capacity must exceed the interval SLI
 
 - Shenzhen reverse baseline averaged `65,523B/s`, below iperf's default

@@ -2,9 +2,27 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 Release Readiness (2026-07-15)
+## Next Planned Stage — Knife15 Release Readiness (2026-07-16)
 
 - **Latest accepted position:** the exact copied Shenzhen archive
+  `/tmp/mini_vpn_knife15_macos_baseline_20260716_064427.tar.gz` (SHA-256
+  `5ea583c5...`) reaches the 1KiB reverse observer and passes the formal
+  direction-aware baseline validator. Physical forward Target receiver was
+  `22.436698 Mbit/s`, `57,147,392B`, with `21/21` positive intervals. Physical
+  reverse local receiver was `0.181787 Mbit/s`, `454,656B`, with `20/20`
+  positive intervals. The reverse sender still showed nine zero intervals,
+  50 retransmits, about `164-170ms` RTT, and max cwnd `8,328B`; those are
+  physical-path diagnostics and do not invalidate the receiver SLI.
+- The archive contains only the expected two regular JSON files and its
+  checksum is exact. `blksize=1024` proves the repaired observer was reached;
+  baseline artifacts do not bind an exact source commit. Slow speed remains
+  Shenzhen environment capacity, not a mini_vpn bug. The next action, still
+  without mini_vpn/TUN, is the unchanged 300-second direct discriminator using
+  `/tmp/mini_vpn_knife15_macos_baseline_20260716_064427`. Only a direct PASS
+  permits user-run start/smoke/M0. Result:
+  `docs/tech/2026-07-15-knife15-macos-low-rate-reverse-observer-results.md`.
+
+- **Previous accepted position:** the exact copied Shenzhen archive
   `/tmp/mini_vpn_knife15_macos_baseline_20260715_154130.tar.gz` (SHA-256
   `49c4b71a...`) proves the 16KiB reverse observer reached iperf. Physical
   forward was `31.798980 Mbit/s`, all Target intervals positive, with `9,420`

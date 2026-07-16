@@ -1,9 +1,10 @@
 # Knife15 macOS Low-Rate Reverse Observer Results
 
 Date: 2026-07-15
+Updated: 2026-07-16
 
-Status: **SHENZHEN SPEED PROFILE ACCEPTED; 16K OBSERVER STILL QUANTIZED;
-1K LOCAL REPAIR PASS; FRESH BASELINE PENDING**
+Status: **SHENZHEN SPEED PROFILE ACCEPTED; 1K PHYSICAL BASELINE PASS;
+300S DIRECT DISCRIMINATOR PENDING**
 
 ## Evidence And Host Attribution
 
@@ -81,6 +82,39 @@ full second of useful delivery and exceeded the observed sender cwnd. The five
 zeros therefore remain quantization-ambiguous rather than proof of a physical
 one-second outage.
 
+## 1KiB Physical Baseline Acceptance
+
+The fresh copied Shenzhen archive is:
+
+- `/tmp/mini_vpn_knife15_macos_baseline_20260716_064427.tar.gz`;
+- archive SHA-256:
+  `5ea583c580d59111b8fce8caca013dc140b5e083c6e64c5e26a2402c1dda3f57`;
+- forward JSON SHA-256:
+  `5ad7483c337d7bb70a2638f7488e11846fc3f0bb336a8c983084333e1282d230`;
+- reverse JSON SHA-256:
+  `0047bc043e8cb3aaaf378a671e8a6ef8188aeba8d59ca111a52e2c51ee6da2b3`.
+
+The archive checksum is exact and it contains only one directory and the two
+expected regular JSON files. Reverse declares `blksize=1024`, proving the 1KiB
+observer command was reached. Baseline JSON does not bind an exact source
+commit, so the artifact does not make a stronger source-provenance claim.
+
+Forward Target receiver delivered `57,147,392B` at `22.436698 Mbit/s`; all 21
+server receiver intervals were positive. The client sender delivered
+`58,327,040B` at `23.321742 Mbit/s`, all client intervals were positive, and
+reported 4,068 retransmits.
+
+Reverse local receiver delivered `454,656B` at `0.181787 Mbit/s`; all 20
+receiver intervals were positive. Each interval delivered at least `12,288B`,
+well above one 1KiB observation block. The server sender delivered `518,144B`
+at `0.205455 Mbit/s`, with nine sender-zero intervals, 50 retransmits, RTT
+about `164-170ms`, and maximum cwnd `8,328B`.
+
+The formal validator passes both files. This accepts receiver continuity at
+the observed low physical capacity while preserving sender loss/cadence as
+diagnostic evidence. The low speed remains Shenzhen environment capability,
+not a mini_vpn defect: baseline is deliberately run before mini_vpn/TUN.
+
 ## Goal, Non-Goals, And Capacity
 
 Preserve the strict receiver no-zero SLI by increasing observation resolution,
@@ -129,17 +163,18 @@ Local gates passed:
 
 ## Next Gate And Stop Rule
 
-Both old baselines remain invalid and must not be reused. Rebuild the final
-source, run a fresh physical-`en0` baseline, and inspect its reverse JSON.
+The two old baselines remain invalid and must not be reused. The fresh 1KiB
+baseline is accepted only as the capacity/short-continuity prerequisite.
 
-- Treat the printed forward/reverse rates as environment capacity, never as a
-  minimum product threshold.
-- If 1KiB reverse intervals are all positive, continue to the unchanged
-  300-second forward direct discriminator, then user-run start/smoke/M0.
-- If reverse still contains zero intervals, the smaller observer has rejected
-  simple block-quantization hypothesis. Stop before formal M0 and preserve it
-  as physical-path continuity evidence, not a mini_vpn bug. A separate degraded-
-  path soak may use relative/direct-control acceptance, but must not silently
-  weaken formal M0 or tune mini_vpn constants.
+- Keep mini_vpn/TUN off and run the unchanged 300-second forward direct
+  discriminator with the original Shenzhen baseline directory.
+- Treat its rate as environment capacity, never as a minimum product threshold.
+- If every Target receiver interval is positive, continue to user-run
+  start/smoke/M0 using the exact baseline/direct pair.
+- If the direct discriminator reports a Target receiver zero, stop before
+  formal M0 and preserve it as physical-path continuity evidence, not a
+  mini_vpn bug. A separate degraded-path soak may use relative/direct-control
+  acceptance, but must not silently weaken formal M0 or tune mini_vpn
+  constants.
 
 M1 remains blocked until M0 and an independent rearm pass.

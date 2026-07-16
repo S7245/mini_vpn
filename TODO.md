@@ -4,7 +4,29 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-07-15)
+#### Latest decision (2026-07-16)
+
+Exact copied Shenzhen archive
+`/tmp/mini_vpn_knife15_macos_baseline_20260716_064427.tar.gz` (SHA-256
+`5ea583c5...`) passes the formal physical baseline with the 1KiB reverse
+observer. Forward Target receiver delivered `57,147,392B` at
+`22.436698 Mbit/s` with `21/21` positive intervals. Reverse local receiver
+delivered `454,656B` at `0.181787 Mbit/s` with `20/20` positive intervals.
+The reverse sender's nine zero intervals, 50 retransmits, roughly `164-170ms`
+RTT, and `8,328B` maximum cwnd remain physical-path diagnostics; acceptance is
+direction-aware at the receiver.
+
+The archive checksum and two-file regular-file shape are exact, and
+`blksize=1024` proves the new observer command was reached. It does not prove
+an exact source commit. Slow speed has no minimum threshold and is not a
+mini_vpn defect because this is the required pre-TUN physical lane.
+
+Next, keep mini_vpn/TUN off, export the original Shenzhen directory
+`/tmp/mini_vpn_knife15_macos_baseline_20260716_064427`, and run the unchanged
+300-second direct discriminator. A PASS permits start/smoke/M0; a direct
+receiver zero blocks formal M0 as physical continuity evidence without tuning
+data-plane constants. Result:
+`docs/tech/2026-07-15-knife15-macos-low-rate-reverse-observer-results.md`.
 
 Exact copied Shenzhen archive
 `/tmp/mini_vpn_knife15_macos_baseline_20260715_154130.tar.gz` (SHA-256
