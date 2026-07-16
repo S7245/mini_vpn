@@ -6,6 +6,8 @@ Status: **LOCAL IMPLEMENTATION AND REVIEW PASS; SHENZHEN M0 PENDING**
 
 Source baseline: `8e9daf98ac41a6c17dacaeee7255fcaec114d1ac`.
 
+Implementation commit: `0460886`.
+
 Architecture:
 `2026-07-16-knife15-endpoint-socket-rebind-recovery-architecture-spec.md`.
 

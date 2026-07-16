@@ -4,7 +4,48 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-16)
 
-- **Latest accepted position:** exact source `c50613c` clean rearm bundle
+- **Latest accepted position:** exact source `8e9daf9` Shenzhen M0 bundle
+  `/tmp/mini_vpn_knife15_macos_20260716_110535.tar.gz` (SHA-256
+  `f9799711...`) was operated correctly. Smoke and the entire first M0 cycle
+  passed. Cycle 2 forward failed itself after about `65s`; the user did not
+  interrupt it or wait too long at sudo. Status/snapshot/stop later preserved
+  and cleaned the evidence.
+- The fresh physical baseline measured `31.447419 Mbit/s` forward and
+  `0.487728 Mbit/s` reverse. The fresh 300-second direct gate passed at
+  `15.716047 Mbit/s` receiver with no zero interval. Slow Shenzhen capacity
+  remains environment evidence, not a mini_vpn bug.
+- Conn0 and conn1 shared Endpoint/source port `64195`, served traffic for
+  about 18 minutes, then timed out together. Connection-local reconnect reused
+  the same endpoint/socket identity and timed out. TUN, endpoint pacing,
+  resources, physical controls, sing-box, and iperf remained healthy. This
+  selects an endpoint-wide UDP receive/service outage and rejects operation,
+  pacing, D16, local pressure, or service restart as the immediate cause.
+- Commit `0460886` adds one endpoint-owned, one-shot live UDP socket rebind.
+  Active TX without any Endpoint RX is sampled at `250ms` and triggers before
+  the frozen 15-second QUIC idle timeout using
+  `clamp(8 * max_rtt, 2s, 7s)`. The same Quinn Endpoint, both QUIC
+  connections, active TUIC streams, and EndpointWindowV1 conservation state
+  survive the source-port change. Existing reconnect remains the fallback.
+- Review found and fixed a P1: Quinn temporarily receives on the retained old
+  socket, so aggregate connection RX alone could falsely prove recovery. A
+  recovery now requires a known connection packet on the current socket's
+  rebind generation. The runner requires that generation in positive evidence.
+- Final local gates pass: focused policy `4/4`, root library `646 passed + 3
+  ignored`, main `2/2`, Quinn-proto `309/309 + 3/3` doc, Quinn `29 passed + 3
+  ignored + 1/1` doc, release, all-target check/Clippy, Knife15/Knife14 shell,
+  fmt, and diff. Review has no unresolved P0/P1; no frozen parameter or SLI
+  changed. Results:
+  `docs/tech/2026-07-16-knife15-macos-m0-cycle2-endpoint-timeout-results.md`
+  and
+  `docs/tech/2026-07-16-knife15-endpoint-socket-rebind-recovery-local-results.md`.
+- Next synchronize the pushed commit to Shenzhen and build release. Take a
+  fresh physical baseline and fresh 300-second direct discriminator because
+  source/runner/binary changed. Direct PASS permits start/smoke/M0. If rebind
+  occurs, require one trigger and current-socket RX recovery; any receiver-zero
+  interval, missing trigger, missing recovery, or repeated same-episode rebind
+  rejects the architecture and does not authorize constant tuning.
+
+- **Previous accepted position:** exact source `c50613c` clean rearm bundle
   `/tmp/mini_vpn_knife15_macos_20260716_100056.tar.gz` (SHA-256
   `baee8f2f...`) was operated correctly and exposed a deterministic local TCP
   close-lifecycle defect. Start was ready on `utun5`; the target route stayed

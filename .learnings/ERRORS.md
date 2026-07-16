@@ -1,5 +1,42 @@
 # Errors
 
+## 2026-07-16 - M0 outlived one healthy UDP endpoint identity
+
+- The user correctly ran smoke and one full M0 cycle. Cycle 2 forward then
+  failed by itself after about `65s`; it was not an early interruption, late
+  sudo password, missing client, or low Shenzhen speed.
+- Both QUIC pool connections shared source port `64195`, timed out together,
+  and failed reconnect on the unchanged Endpoint. Physical/direct continuity,
+  TUN, pacing conservation, resources, sing-box, and iperf were healthy.
+- Do not repeat the unchanged M0 or tune frozen constants. A shared socket
+  identity that stops serving every child requires bounded endpoint socket
+  replacement and explicit current-socket recovery evidence.
+
+## 2026-07-16 - A loopback server lifetime looked like rebind failure
+
+- The first live two-connection rebind test let the server task drop its Quinn
+  Endpoint immediately after calling `SendStream::finish`. The client could
+  lose the response before observing it, even though live rebind was correct.
+- Waiting for `SendStream::stopped` keeps the server Endpoint alive until the
+  peer acknowledges the response. The repaired integration then proves both
+  established connections survive the source-port change.
+- Reusable rule: a transport integration fixture must own its Endpoint until
+  the exact peer-visible completion boundary under test, not merely until the
+  local send API accepts `finish`.
+
+## 2026-07-16 - An invented strict Clippy gate obscured the accepted gate
+
+- A final command added `-D warnings` to the repository's current Clippy gate.
+  It promoted 17 established lints to errors and made the stage look broken,
+  although tests, check, and release were green.
+- The command also exposed one new tuple-complexity warning in the rebind
+  helper. That new warning was repaired with a named socket result structure;
+  the unchanged project Clippy command then passed with only established
+  warnings.
+- Reusable rule: do not silently strengthen a stage gate while reporting its
+  result as the accepted gate. Repair new warnings in changed code, but track
+  repository-wide lint ratcheting as a separate authorized cleanup.
+
 ## 2026-07-16 - A later relay error erased the queued local TCP close
 
 - The clean Shenzhen rearm wrote `37B` of iperf control, then D16 reported

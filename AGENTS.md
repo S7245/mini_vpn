@@ -189,7 +189,35 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-07-16:
 
-- Exact source `c50613c` clean rearm bundle
+- Exact source `8e9daf9` bundle
+  `/tmp/mini_vpn_knife15_macos_20260716_110535.tar.gz` (SHA-256
+  `f9799711...`) was operated correctly. Smoke and M0 cycle 1 passed; cycle 2
+  forward failed itself after about `65s`. The user did not interrupt M0.
+- Fresh direct physical continuity passed `300s` at `15.716047 Mbit/s` with no
+  receiver zero. Conn0 and conn1 then timed out together after their shared
+  Endpoint/source-port identity had served about 18 minutes. Reconnect reused
+  that identity and timed out, while TUN, pacing, resources, physical controls,
+  sing-box, and iperf remained healthy. The selected boundary is endpoint-wide
+  UDP receive/service, not operator procedure or a frozen data-plane setting.
+- Commit `0460886` adds a bounded endpoint-owned socket rebind before the
+  15-second QUIC idle timeout. The `250ms` monitor uses active workload plus TX-
+  without-RX and `clamp(8 * max_rtt, 2s, 7s)`, with at most one rebind per
+  continuous episode. It preserves the Endpoint, live connections/streams,
+  optional adapter accounting, and EndpointWindowV1 conservation.
+- After rebind, only a known connection packet received on the current socket
+  generation proves recovery. Traffic on Quinn's retained previous socket is
+  not sufficient. This P1 review repair is locked in vendored Quinn, policy,
+  integration, and runner tests.
+- Final root `646 + 3 ignored`, main `2`, Quinn-proto `309 + 3` doc, Quinn
+  `29 + 3 ignored + 1` doc, release, check/Clippy, shell, fmt/diff, and review
+  gates pass with no unresolved P0/P1. All frozen values and strict SLI remain.
+  Next use a fresh Shenzhen build/baseline/direct/start/smoke/M0. A failed
+  recovery rejects the architecture; it does not authorize tuning. Results:
+  `docs/tech/2026-07-16-knife15-macos-m0-cycle2-endpoint-timeout-results.md`
+  and
+  `docs/tech/2026-07-16-knife15-endpoint-socket-rebind-recovery-local-results.md`.
+
+- Previous exact source `c50613c` clean rearm bundle
   `/tmp/mini_vpn_knife15_macos_20260716_100056.tar.gz` (SHA-256
   `baee8f2f...`) was operated correctly. The target-only route remained on
   `utun5`, Exit remained `en0`, and Shenzhen remained the default public

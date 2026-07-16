@@ -6,7 +6,55 @@
 
 #### Latest decision (2026-07-16)
 
-Exact source `c50613c` clean Shenzhen rearm bundle
+Exact source `8e9daf9` Shenzhen bundle
+`/tmp/mini_vpn_knife15_macos_20260716_110535.tar.gz` (SHA-256 `f9799711...`)
+was operated correctly. It did not stop because the user interrupted it or
+because a sudo password was delayed. Smoke passed, M0 cycle 1 completed, and
+cycle 2 forward failed by itself after about `65s`. The later status/snapshot/
+stop sequence preserved evidence and cleaned the TUN.
+
+Fresh physical baseline was `31.447419 Mbit/s` forward and `0.487728 Mbit/s`
+reverse. The fresh 300-second direct receiver passed at `15.716047 Mbit/s`
+with no zero interval. Shenzhen speed remains an environment measurement with
+no minimum threshold.
+
+Conn0/control and conn1/data shared one Quinn Endpoint and source port `64195`.
+After that identity had served smoke and all of cycle 1 for about 18 minutes,
+both connections timed out together. Reconnect on the same Endpoint/socket
+identity timed out. Endpoint pacing stayed within `61,440B` and ended
+`61,440/0/0B`; TUN, resources, physical controls, sing-box, and iperf remained
+healthy. The selected failure boundary is endpoint-wide UDP receive/service,
+not operator procedure, D16, pacing, TUN pressure, or a service restart.
+
+Commit `0460886` implements proactive endpoint socket recovery. One weak-owned
+monitor samples at `250ms`; active aggregate TX with no RX crosses
+`clamp(8 * max_rtt, 2s, 7s)` and causes at most one live socket rebind in that
+episode. It preserves the same Endpoint, both established connections, TUIC
+streams, optional bounded-adapter accounting, and EndpointWindowV1 state.
+Connection-local reconnect remains unchanged as the fallback.
+
+Review found and repaired one P1: Quinn retains the previous socket during
+active migration, so old-socket packets could increase connection RX and
+falsely declare the new socket healthy. Vendored Quinn now exposes the current-
+socket RX rebind generation. Product policy and runner evidence require that
+generation before recovery. No unresolved P0/P1 remains.
+
+Final local gates pass: policy `4/4`, root library `646 + 3 ignored`, main
+`2/2`, Quinn-proto `309/309 + 3/3` doc, Quinn `29 + 3 ignored + 1/1` doc,
+release, all-target check/Clippy, Knife15/Knife14 shell suites, fmt, and diff.
+No frozen D16, MTU, pool, QUIC window, chunk, Cubic, GSO, self-wake, pacing,
+workload, or receiver-SLI value changed.
+
+Next synchronize the pushed source to Shenzhen, build release, and take a
+fresh physical baseline plus fresh 300-second direct discriminator. Only a
+direct PASS permits start/smoke/M0. If a rebind occurs, M0 must show one
+trigger and current-socket RX recovery; any receiver-zero interval, missing
+trigger, missing recovery, or repeated same-episode rebind rejects the
+architecture without tuning. Results:
+`docs/tech/2026-07-16-knife15-macos-m0-cycle2-endpoint-timeout-results.md` and
+`docs/tech/2026-07-16-knife15-endpoint-socket-rebind-recovery-local-results.md`.
+
+Previous exact source `c50613c` clean Shenzhen rearm bundle
 `/tmp/mini_vpn_knife15_macos_20260716_100056.tar.gz` (SHA-256 `baee8f2f...`)
 was operated correctly and classifies the hanging smoke as a local TCP close-
 lifecycle defect. The target route remained `utun5`, Exit remained `en0`, and

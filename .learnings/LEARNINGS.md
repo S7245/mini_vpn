@@ -1,5 +1,40 @@
 # Learnings
 
+## 2026-07-16 - Recovery authority must match the shared failure domain
+
+- Two independent QUIC connections timed out together only after their shared
+  Endpoint/source port had served about 18 minutes. Recreating connections on
+  that same socket identity could not recover, while TUN, pacing, services,
+  and physical controls remained healthy.
+- The smallest recovery boundary is the Endpoint socket, not a TCP relay or
+  QUIC connection. Quinn can rebind its live Endpoint and notify every
+  connection, preserving TUIC streams and endpoint pacing state while changing
+  only the local UDP identity.
+- Recovery must be evidence-driven and bounded: active workload, aggregate TX
+  progress, endpoint-wide no RX, an RTT-derived pre-idle deadline, and at most
+  one attempt per continuous episode. Existing connection reconnect remains a
+  later fallback rather than a competing authority.
+- Reusable rule: place recovery at the narrowest owner shared by every failed
+  child. Preserve healthy child state across that owner's replaceable resource
+  boundary instead of rebuilding the whole subsystem.
+- Implementation: `0460886`. Results:
+  `docs/tech/2026-07-16-knife15-macos-m0-cycle2-endpoint-timeout-results.md`
+  and
+  `docs/tech/2026-07-16-knife15-endpoint-socket-rebind-recovery-local-results.md`.
+
+## 2026-07-16 - Post-migration recovery must prove the new receive path
+
+- Quinn intentionally retains the previous UDP socket until traffic arrives
+  on the new socket. During that overlap, per-connection RX counters can grow
+  from old-socket packets and cannot prove that the new identity works.
+- The accepted signal is a generation advanced only when a packet for an
+  existing connection is routed from the current socket. The policy and
+  runner require that generation before reporting recovery.
+- Reusable rule: after replacing a shared I/O resource, distinguish logical
+  child progress from progress attributable to the replacement. Migration
+  success requires provenance from the new resource, not merely continued
+  aggregate counters.
+
 ## 2026-07-16 - Terminal events must join an existing close obligation
 
 - A D16 queue can become closed before its diagnostic `Closed` event reaches
