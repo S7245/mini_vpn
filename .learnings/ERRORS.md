@@ -5,10 +5,13 @@
 - The first Shenzhen baseline established iperf control/data sockets but sent
   no data interval. The second completed both directions but recorded two
   forward and four reverse receiver-zero intervals before mini_vpn or TUN ran.
+  A third completed with continuous reverse delivery but repeated a complete
+  forward zero second, 31 retransmits, and cwnd down to `1,388B`.
 - Target iperf remained active with zero restarts. The accepted `1KiB` reverse
   observer, repeated retransmission, and one-to-two-segment cwnd reject service
   restart, operation, minimum speed, and coarse observation as causes.
-- Do not loop direct/start/M0 after a failed baseline and do not export the
+- Three immediate attempts exhaust the same-window discriminator. Do not loop
+  direct/start/M0 after a failed baseline and do not export the
   failed directory. Move to another network window or physical Mac. Any
   degraded-path soak must be an explicitly separate non-acceptance lane.
 

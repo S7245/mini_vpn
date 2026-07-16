@@ -9,6 +9,10 @@
   Three consecutive receiver-zero seconds, 50 retransmits, and a
   `1,388-2,776B` sender cwnd reject observer quantization. This was transport
   discontinuity, not merely low bandwidth.
+- A third attempt improved reverse receiver continuity to `0.566 Mbit/s` but
+  repeated one complete forward receiver-zero second at `2.444 Mbit/s` with
+  31 retransmits. Independent direction changes can vary while the pair still
+  fails the attribution gate; a good reverse result cannot waive forward SLI.
 - Reusable rule: keep capacity and continuity orthogonal. A path may be slow
   enough to size a low workload but still too discontinuous to attribute a
   later tunneled zero interval. Preserve a fine observer and require positive

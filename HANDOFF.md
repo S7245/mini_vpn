@@ -4,7 +4,7 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-16)
 
-- **Latest accepted position:** the first two post-`fe3ec83` Shenzhen physical
+- **Latest accepted position:** the first three post-`fe3ec83` Shenzhen physical
   baseline attempts failed before any TUN or mini_vpn execution. Attempt
   `...134708` connected both iperf control/data sockets but produced zero
   intervals; client reported `control socket has closed unexpectedly` and
@@ -15,7 +15,12 @@
   `0.098 Mbit/s` with four local receiver zeros and 50 retransmits. Reverse
   already used the accepted `1KiB` observer; three consecutive zeros plus
   `1,388-2,776B` cwnd prove real physical stalls, not low-rate quantization.
-- Formal M0 remains blocked before direct/start. Neither failed directory may
+- Attempt `...140906` again completed both directions. Reverse receiver had
+  no zero interval at `0.566 Mbit/s`, but forward Target receiver repeated one
+  complete zero second plus a zero short tail at `2.444 Mbit/s`; the client
+  recorded 31 retransmits and cwnd down to `1,388B`. This rejects a tail-only
+  validator bug and confirms the current Shenzhen window is discontinuous.
+- Formal M0 remains blocked before direct/start. No failed directory may
   be exported as `M0_BASELINE_DIR`. Do not tune mini_vpn or relax the SLI.
   Retry in a different network window or use another Mac whose direct physical
   path passes the unchanged baseline; there is still no minimum Mbps. Result:

@@ -189,15 +189,17 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-07-16:
 
-- The first two post-`fe3ec83` Shenzhen physical baseline attempts failed
+- The first three post-`fe3ec83` Shenzhen physical baseline attempts failed
   before TUN/mini_vpn execution. `...134708` established iperf control/data
   sockets but produced zero intervals. `...135653` completed at forward
   `2.598 Mbit/s` / reverse `0.098 Mbit/s`, but had two/four receiver-zero
   intervals and 24/50 retransmits. Reverse used the accepted `1KiB` observer;
   three consecutive zeros and one-to-two-segment cwnd prove real physical
-  discontinuity, not low speed or quantization. Formal direct/start/M0 is
-  blocked until a different window or Mac passes the unchanged baseline. Do
-  not tune mini_vpn or relax the SLI. Result:
+  discontinuity, not low speed or quantization. `...140906` then repeated a
+  complete forward receiver-zero second at `2.444 Mbit/s` with 31 retransmits
+  and cwnd down to `1,388B`, rejecting a tail-only validator bug. Formal
+  direct/start/M0 is blocked until a different window or Mac passes the
+  unchanged baseline. Do not tune mini_vpn or relax the SLI. Result:
   `docs/tech/2026-07-16-knife15-shenzhen-post-rebind-physical-baseline-results.md`.
 
 - Previous exact source `8e9daf9` bundle

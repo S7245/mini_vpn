@@ -6,7 +6,7 @@
 
 #### Latest decision (2026-07-16)
 
-The first two Shenzhen physical baseline attempts after candidate `fe3ec83`
+The first three Shenzhen physical baseline attempts after candidate `fe3ec83`
 failed before any TUN or mini_vpn execution. Attempt `...134708` established
 the iperf control and data connections but produced no interval; the client
 reported a closed control socket while Target reported an idle data receive.
@@ -20,7 +20,14 @@ second, but three consecutive receiver seconds were zero while sender cwnd
 fell to `1,388-2,776B`. This is physical path discontinuity, not a minimum-
 speed failure or observer quantization.
 
-Do not export either directory, run direct/start/M0, tune mini_vpn, or relax
+Attempt `...140906` repeated the decisive forward symptom: both JSON results
+completed, reverse receiver was continuous at `0.566 Mbit/s`, but forward
+Target receiver still had one complete `0B` second plus a zero short tail at
+`2.444 Mbit/s`. The client recorded 31 retransmits and cwnd down to `1,388B`.
+The failure is therefore not caused only by validator treatment of a short
+tail, and immediate same-window repeats are exhausted.
+
+Do not export any failed directory, run direct/start/M0, tune mini_vpn, or relax
 receiver continuity. Retry the unchanged baseline in a different network
 window or on another Mac with a more continuous Target path. No minimum Mbps
 is required. A degraded-path lane, if planned later, remains non-promotable and

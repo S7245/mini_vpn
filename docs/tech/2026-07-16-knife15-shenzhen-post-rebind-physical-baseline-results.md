@@ -71,11 +71,34 @@ The Target service remained active with zero restarts throughout. Low average
 speed is not a failure condition, but complete receiver-zero seconds are a
 physical continuity failure under the unchanged SLI.
 
+## Attempt 3 — Forward Discontinuity Repeated
+
+Evidence:
+
+- directory:
+  `/tmp/mini_vpn_knife15_macos_baseline_20260716_140906`;
+- forward SHA-256:
+  `1664d7d24d217b7f034a46c21bc50e4da2d5e0b4e32f5d26cb1a041268e26134`;
+- reverse SHA-256:
+  `8415d46e13ab046495c10765b734355d80930e7b227913b9b78da0e65b4c6dcb`.
+
+Both directions again completed without an iperf JSON error. Forward Target
+receiver delivered `6,160,384B` at `2.444 Mbit/s`, but the complete
+`18-19s` interval delivered `0B`; the final short tail was also zero. The
+client recorded 31 retransmits and its cwnd fell as low as `1,388B`.
+
+Reverse improved to `1,416,192B` at `0.566 Mbit/s` and every local receiver
+interval was positive. That does not repair the pair: the Target sender still
+recorded 123 retransmits, many zero-send intervals, and cwnd down to `2,776B`.
+The repeated complete forward zero independently rejects a tail-only validator
+bug, while the complete JSON rejects a Target service failure.
+
 ## Decision
 
-Neither directory is valid `M0_BASELINE_DIR`. Do not run the 300-second direct
-discriminator, start the TUN, or run M0 from this pair. Do not tune mini_vpn,
-lower workload rates, increase observer blocks, or relax receiver continuity.
+None of the three directories is valid `M0_BASELINE_DIR`. Do not run the
+300-second direct discriminator, start the TUN, or run M0 from this evidence.
+Do not tune mini_vpn, lower workload rates, increase observer blocks, or relax
+receiver continuity.
 
 The next formal attempt must use a different physical-network window or a Mac
 whose direct Target path can first pass the unchanged direction-aware baseline.
