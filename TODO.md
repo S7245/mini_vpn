@@ -6,6 +6,27 @@
 
 #### Latest decision (2026-07-16)
 
+Synchronized Shenzhen directory
+`/tmp/mini_vpn_knife15_macos_direct_20260716_071534` passes the unchanged
+300-second physical forward discriminator. Result SHA-256 is `810e777b...`.
+The Target receiver delivered `420,741,120B` at `11.213247 Mbit/s` over
+`300.174s`; all `300` complete receiver intervals were positive. Sender and
+receiver zero counts were both zero, and the sender reported one retransmit.
+
+The manifest is `status=pass/reason=ok` and binds source `c50613c`, the runner
+and release binary hashes, the accepted baseline's exact forward/reverse JSON
+hashes, requested `300s` at the exact half-baseline `11,218,349 bit/s`, and
+physical `en0` Target/Exit routes. This rejects the physical-continuity branch
+for the immediate M0 window without claiming a minimum Shenzhen speed.
+
+Next, do not pull, rebuild, edit the runner, or replace either evidence
+directory. Export the exact baseline and direct directories, then user-run
+`start`, `smoke`, and `m0`; M0 must begin within the direct result's 15-minute
+freshness window. A start/smoke failure blocks M0. An M0 workload failure keeps
+TUN alive for status/snapshot/stop evidence. M1 remains blocked until M0 and an
+independent rearm pass. Result:
+`docs/tech/2026-07-15-knife15-macos-low-rate-reverse-observer-results.md`.
+
 Exact copied Shenzhen archive
 `/tmp/mini_vpn_knife15_macos_baseline_20260716_064427.tar.gz` (SHA-256
 `5ea583c5...`) passes the formal physical baseline with the 1KiB reverse

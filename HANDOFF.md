@@ -4,7 +4,26 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-16)
 
-- **Latest accepted position:** the exact copied Shenzhen archive
+- **Latest accepted position:** the synchronized Shenzhen direct directory
+  `/tmp/mini_vpn_knife15_macos_direct_20260716_071534` is a formal 300-second
+  direct continuity PASS. Its result SHA-256 is `810e777b...`; the Target
+  receiver delivered `420,741,120B` at `11.213247 Mbit/s` for `300.174s`, with
+  `300` complete positive intervals and no receiver or sender zero interval.
+  The sender reported one retransmit.
+- The manifest is `status=pass/reason=ok`, binds the accepted baseline's exact
+  two JSON hashes, source `c50613c`, the accepted runner/binary hashes, and
+  physical `en0` routes for both Target and Exit. The requested rate was the
+  exact half-forward baseline rate, `11,218,349 bit/s`. Current-HK live state
+  is excluded from this copied Shenzhen evidence.
+- The formal prerequisite pair is now accepted. Keep the Shenzhen checkout,
+  binary, runner, baseline, and direct directory unchanged; start/smoke/M0 may
+  run immediately, with `m0` starting inside the direct manifest's 15-minute
+  freshness window. On any start/smoke failure, do not enter M0. On an M0
+  workload failure, preserve the running TUN for status/snapshot/stop evidence.
+  M1 remains blocked until M0 and a separate rearm pass. Result:
+  `docs/tech/2026-07-15-knife15-macos-low-rate-reverse-observer-results.md`.
+
+- **Previous accepted position:** the exact copied Shenzhen archive
   `/tmp/mini_vpn_knife15_macos_baseline_20260716_064427.tar.gz` (SHA-256
   `5ea583c5...`) reaches the 1KiB reverse observer and passes the formal
   direction-aware baseline validator. Physical forward Target receiver was
@@ -22,7 +41,7 @@
   permits user-run start/smoke/M0. Result:
   `docs/tech/2026-07-15-knife15-macos-low-rate-reverse-observer-results.md`.
 
-- **Previous accepted position:** the exact copied Shenzhen archive
+- **Earlier accepted position:** the exact copied Shenzhen archive
   `/tmp/mini_vpn_knife15_macos_baseline_20260715_154130.tar.gz` (SHA-256
   `49c4b71a...`) proves the 16KiB reverse observer reached iperf. Physical
   forward was `31.798980 Mbit/s`, all Target intervals positive, with `9,420`

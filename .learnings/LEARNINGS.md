@@ -1,5 +1,23 @@
 # Learnings
 
+## 2026-07-16 - Match long-run controls to the product receiver SLI
+
+- The 20-second low-rate baseline established capacity, while the separate
+  300-second physical forward discriminator tested the same complete-second
+  Target receiver continuity contract needed by M0.
+- At the exact half-baseline offer (`11,218,349 bit/s`), the Target delivered
+  `420,741,120B` over `300.174s`; all 300 complete receiver intervals were
+  positive. The direct lane therefore rejects a same-window physical
+  continuity failure before TUN is introduced.
+- The direct manifest binds source, runner, binary, baseline hashes, result
+  hash, requested duration/rate, completion time, and physical routes. Its
+  15-minute freshness bound prevents a later path state from silently standing
+  in for the immediate product run.
+- Reusable rule: a capacity sample and a continuity discriminator answer
+  different questions. Bind both artifacts and match the long control's
+  duration, direction, receiver boundary, rate derivation, and freshness to
+  the product SLI before attribution.
+
 ## 2026-07-16 - A finer observer can preserve a strict low-rate SLI
 
 - The fresh Shenzhen reverse baseline used a 1KiB iperf application block and

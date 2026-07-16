@@ -3,8 +3,8 @@
 Date: 2026-07-15
 Updated: 2026-07-16
 
-Status: **SHENZHEN SPEED PROFILE ACCEPTED; 1K PHYSICAL BASELINE PASS;
-300S DIRECT DISCRIMINATOR PENDING**
+Status: **SHENZHEN 1K PHYSICAL BASELINE PASS; 300S DIRECT PASS;
+FORMAL M0 AUTHORIZED AND PENDING**
 
 ## Evidence And Host Attribution
 
@@ -115,6 +115,36 @@ the observed low physical capacity while preserving sender loss/cadence as
 diagnostic evidence. The low speed remains Shenzhen environment capability,
 not a mini_vpn defect: baseline is deliberately run before mini_vpn/TUN.
 
+## 300-Second Direct Continuity Acceptance
+
+The synchronized Shenzhen evidence directory is:
+
+- `/tmp/mini_vpn_knife15_macos_direct_20260716_071534`;
+- result SHA-256:
+  `810e777bd75c735912123cd3be86bc4a6fd05ffdc3f23bd9783d7577a62a984e`;
+- manifest SHA-256:
+  `0b995f20fc570389c6b5842910571fbe74c47ff1b0c5d77a180c7060cddf2cf6`.
+
+The directory contains only its expected regular manifest and result JSON.
+The JSON parses and the manifest records `status=pass`, `reason=ok`, source
+`c50613c`, the exact runner and release binary hashes, Target/Exit physical
+routes `en0`, and the accepted baseline's exact forward/reverse JSON hashes.
+The current Mac's later documentation-only HEAD and live network state are not
+joined to the copied Shenzhen evidence.
+
+The discriminator requested TCP forward for 300 seconds at the exact integer
+half of baseline forward capacity, `11,218,349 bit/s`. The Target receiver
+delivered `420,741,120B` over `300.174s` at `11.213247 Mbit/s`. Its JSON has
+301 receiver rows, of which 300 are complete intervals; all receiver rows are
+positive. The 300 client sender intervals are also positive, and the sender
+reported only one retransmit.
+
+This closes the immediate physical-continuity prerequisite for M0. It does not
+raise a minimum-throughput claim or test mini_vpn itself. The accepted pair is
+time-bounded: the formal M0 command must begin within 15 minutes of direct
+completion and must see the same source, runner, binary, baseline, and direct
+artifacts.
+
 ## Goal, Non-Goals, And Capacity
 
 Preserve the strict receiver no-zero SLI by increasing observation resolution,
@@ -163,18 +193,15 @@ Local gates passed:
 
 ## Next Gate And Stop Rule
 
-The two old baselines remain invalid and must not be reused. The fresh 1KiB
-baseline is accepted only as the capacity/short-continuity prerequisite.
+The fresh 1KiB baseline and 300-second direct discriminator are now the exact
+accepted prerequisite pair. The two old baselines remain invalid.
 
-- Keep mini_vpn/TUN off and run the unchanged 300-second forward direct
-  discriminator with the original Shenzhen baseline directory.
-- Treat its rate as environment capacity, never as a minimum product threshold.
-- If every Target receiver interval is positive, continue to user-run
-  start/smoke/M0 using the exact baseline/direct pair.
-- If the direct discriminator reports a Target receiver zero, stop before
-  formal M0 and preserve it as physical-path continuity evidence, not a
-  mini_vpn bug. A separate degraded-path soak may use relative/direct-control
-  acceptance, but must not silently weaken formal M0 or tune mini_vpn
-  constants.
+- Keep the Shenzhen checkout, runner, release binary, baseline directory, and
+  direct directory unchanged; do not pull or rebuild between direct and M0.
+- Export the exact baseline/direct directories, then user-run start and smoke.
+  Either failure blocks M0 and preserves its evidence.
+- Begin M0 inside the direct result's 15-minute freshness window. If the M0
+  workload fails, leave TUN running for status/snapshot/stop evidence; do not
+  tune frozen data-plane constants or weaken receiver continuity.
 
 M1 remains blocked until M0 and an independent rearm pass.
