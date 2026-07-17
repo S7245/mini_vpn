@@ -1,5 +1,19 @@
 # Learnings
 
+## 2026-07-17 - Review signals need phase and ownership context
+
+- Bundle `a189b848...` repeated one forward iperf `Stopped(0)` close tail at
+  the 20-second boundary. It produced three text matches but only one canonical
+  `tcp-d16-relay-close`; queue ownership ended at zero, Endpoint conservation
+  passed, and reverse TCP plus fake-IP DNS subsequently succeeded.
+- Reusable rule: `REVIEW` preserves ambiguity for human correlation. It is not
+  a synonym for repair failure. Automatic stop rules must use canonical event
+  multiplicity, error semantics, ownership, connection/rearm state, and the
+  direction-aware receiver SLI together.
+- `DNS_TARGET` is captured and routed by `start`, then read from runner state.
+  Exporting it only before `m0` cannot repair a run started with
+  `dns_target=disabled`; verify the `start` output before smoke.
+
 ## 2026-07-16 - No minimum speed does not mean no continuity gate
 
 - A complete Shenzhen baseline averaged only `2.598 Mbit/s` forward and

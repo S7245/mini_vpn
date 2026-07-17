@@ -2,10 +2,33 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 Release Readiness (2026-07-16)
+## Next Planned Stage — Knife15 Release Readiness (2026-07-17)
 
-- **Latest accepted position:** the first three post-`fe3ec83` Shenzhen physical
-  baseline attempts failed before any TUN or mini_vpn execution. Attempt
+- **Latest accepted position:** exact-source `13faccc` HK bundle
+  `/tmp/mini_vpn_knife15_macos_20260717_033923.tar.gz` (SHA-256
+  `a189b848...`) started with Target, Exit, and DNS on physical `en1`, routed
+  Target/DNS into `utun4`, and passed forward/reverse TCP plus fake-IP DNS
+  smoke. `DNS_TARGET=8.8.8.8` was correctly captured this time.
+- The forward iperf tail produced one canonical `remote_write_failed` with
+  Quinn `Stopped(0)`. D16 queued/leased/reserved ownership was zero, Endpoint
+  conservation passed, no rebind occurred, and reverse/DNS succeeded next.
+  Existing Knife15 rules classify this as expected `REVIEW` close-tail
+  evidence, not a stop gate. A manual generic grep instruction was wrong and
+  caused the user to stop before M0; `m0_status=not_run`.
+- The first direct attempt `...033055` was user-interrupted by SIGINT; the
+  complete `...033233` repeat passed but is now stale. Rerun one fresh
+  300-second direct discriminator, then start/smoke/M0 immediately. Do not
+  stop for a lone boundary `Stopped(0)` with zero ownership and successful
+  subsequent smoke. Do stop for a smoke command failure, nonzero receiver
+  interval failure in formal evidence, nonzero stranded ownership, connection
+  failure/rebind, or a non-equivalent terminal error.
+- Another VPN created `utun1024` after smoke but before snapshot/stop. It did
+  not cause the close tail, but it contaminated final route/counter evidence.
+  Keep other VPNs off until Knife15 `stop` has completed. Result:
+  `docs/tech/2026-07-17-knife15-hk-smoke-stopped0-classification-results.md`.
+
+- **Previous accepted position:** the first three post-`fe3ec83` Shenzhen
+  physical baseline attempts failed before any TUN or mini_vpn execution. Attempt
   `...134708` connected both iperf control/data sockets but produced zero
   intervals; client reported `control socket has closed unexpectedly` and
   Target reported `idle timeout for receiving data`. The Target service stayed

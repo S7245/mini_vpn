@@ -1,10 +1,28 @@
 # TODO
 
-## Current Knife15 Plan (2026-07-16)
+## Current Knife15 Plan (2026-07-17)
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-07-16)
+#### Latest decision (2026-07-17)
+
+The exact-source `13faccc` HK bundle
+`/tmp/mini_vpn_knife15_macos_20260717_033923.tar.gz` (SHA-256 `a189b848...`)
+passes its scoped start/smoke/DNS qualification. The one canonical forward
+`Stopped(0)` is the accepted iperf close-tail class: D16 ownership was zero,
+Endpoint conservation passed, and reverse TCP plus DNS succeeded. The generic
+manual `remote_write_failed` grep was not a valid stop gate; it incorrectly
+prevented M0 from starting. No data-plane or runner change is required.
+
+The latest complete direct `...033233` has expired. Keep all other VPNs off,
+rerun the unchanged 300-second direct discriminator, then perform
+start/smoke/M0 immediately. A lone equivalent `Stopped(0)` remains visible as
+`REVIEW` but does not stop M0. Do not re-enable another VPN until Knife15
+`stop` completes; the last bundle's post-smoke `utun1024` route contaminated
+the final route sample. Result:
+`docs/tech/2026-07-17-knife15-hk-smoke-stopped0-classification-results.md`.
+
+#### Previous decision (2026-07-16)
 
 The first three Shenzhen physical baseline attempts after candidate `fe3ec83`
 failed before any TUN or mini_vpn execution. Attempt `...134708` established

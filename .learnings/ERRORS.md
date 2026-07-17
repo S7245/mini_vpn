@@ -1,5 +1,21 @@
 # Errors
 
+## 2026-07-17 - Do not promote generic remote-write grep to an M0 stop gate
+
+- A manual pre-M0 instruction incorrectly treated any
+  `remote_write_failed` line as an internal smoke failure. Two HK bundles
+  instead reproduced the already accepted iperf forward close tail: one
+  canonical failure, Quinn `Stopped(0)`, zero D16 queued/leased/reserved
+  ownership, a live Endpoint, and successful subsequent reverse/DNS smoke.
+- `internal_failure_scan: REVIEW` is intentionally fail-visible and requires
+  phase-aware review; it is not equivalent to an automatic stop. Count
+  canonical relay-close events, inspect the peer stop code and ownership, and
+  apply the receiver SLI to formal M0 artifacts. Do not block M0 solely with a
+  broad grep over raw/derived log labels.
+- Another VPN may be enabled only after Knife15 `stop` finishes. Enabling it
+  before snapshot/stop changes the final physical-route sample to `utun*` and
+  contaminates cleanup/network evidence even when smoke preceded that change.
+
 ## 2026-07-16 - Post-rebind acceptance was blocked by the physical lane
 
 - The first Shenzhen baseline established iperf control/data sockets but sent

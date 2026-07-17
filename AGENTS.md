@@ -187,7 +187,20 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-07-16:
+Current Knife15 summary, as of 2026-07-17:
+
+- The HK bundle `/tmp/mini_vpn_knife15_macos_20260717_033923.tar.gz`
+  (SHA-256 `a189b848...`) fixed the preceding missing-DNS operation and passed
+  forward/reverse TCP plus fake-IP DNS smoke. Its one canonical forward
+  `Stopped(0)` at the iperf boundary had zero D16 queued/leased/reserved
+  ownership, Endpoint conservation passed, and the reverse flow rearmed.
+  This is the already accepted `REVIEW` close-tail class, not an automatic M0
+  stop. Do not use a generic `remote_write_failed` grep as a gate. The run was
+  stopped before M0 because of that incorrect manual instruction, so a fresh
+  300-second direct PASS is required. Keep every other VPN off until Knife15
+  `stop` completes; `utun1024` appeared after smoke and contaminated the final
+  route sample. Result:
+  `docs/tech/2026-07-17-knife15-hk-smoke-stopped0-classification-results.md`.
 
 - The first three post-`fe3ec83` Shenzhen physical baseline attempts failed
   before TUN/mini_vpn execution. `...134708` established iperf control/data
