@@ -1,8 +1,8 @@
 # Knife15 macOS HITL M0 Runbook
 
 Date: 2026-07-14
-Status: **M0 repeated a real receiver interruption; 300s physical direct
-continuity gate required before another TUN M0**
+Status: **two-hour M0 main run PASS; independent fresh rearm pending before
+M1**
 
 ## Purpose And Authority Boundary
 
@@ -239,6 +239,19 @@ contents, shell history, or credential-bearing process/environment dumps. The
 agent can inspect a bundle that remains on the shared HK Mac by its local path.
 
 ## Qualification Decision
+
+Exact source `8bc7b7c` completed the first accepted two-hour main M0 on HK.
+The fresh direct gate, all direction-aware receiver results, mixed workload,
+DNS, idle/resume, final drain, conservation, resource envelope, network
+controls, and first cleanup passed. Its phase-aware close-tail review found no
+unresolved P0/P1. Result:
+`docs/tech/2026-07-17-knife15-hk-m0-main-run-results.md`.
+
+The remaining M0 gate is only the independent fresh create/smoke/stop bundle
+defined in section 5. M1 remains blocked until it passes. Do not repeat the
+baseline, direct discriminator, or two-hour workload for this rearm gate.
+
+Historical context follows.
 
 The macOS lane has qualified target-only lifecycle, clean rearm, and the
 repaired physical observer. Exact source `239acba` completed two mixed cycles,

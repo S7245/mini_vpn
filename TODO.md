@@ -6,6 +6,29 @@
 
 #### Latest decision (2026-07-17)
 
+Exact source `8bc7b7c` has produced the first accepted two-hour Knife15 M0
+main bundle: `/tmp/mini_vpn_knife15_macos_20260717_035908.tar.gz` (SHA-256
+`1ecee823...`). Its fresh direct prerequisite completed 300 positive Target
+receiver seconds at `18.101918 Mbit/s`. The M0 controller completed eight full
+mixed cycles, both 30-second forward bookends, idle/resume, final drain, all
+`74` result files, and `8/8` DNS checks with zero phase/health failures and
+zero direction-aware receiver-zero intervals.
+
+Conservation remained at or below `61,440B` and ended `61,403/0/0B` available/
+live/outstanding. Resource envelopes were bounded; TUN/physical interface
+errors and log compactions were zero; stop restored routes and removed the
+process/TUN. The close-tail `REVIEW` contains only boundary `Stopped(0)` events
+with zero D16 ownership and one pre-M0 smoke local-close release matching the
+already accepted bounded `524288B + 27840B` case. No unresolved P0/P1 remains.
+
+Next run only an independent fresh `start -> smoke -> stop` rearm and return its
+bundle/checksum. Do not repeat baseline, direct, or two-hour M0; do not change
+frozen settings. M1 stays blocked until this rearm passes, after which define
+explicit M1 resource/recovery SLOs from the accepted M0 envelope. Result:
+`docs/tech/2026-07-17-knife15-hk-m0-main-run-results.md`.
+
+#### Previous decision (2026-07-17)
+
 The exact-source `13faccc` HK bundle
 `/tmp/mini_vpn_knife15_macos_20260717_033923.tar.gz` (SHA-256 `a189b848...`)
 passes its scoped start/smoke/DNS qualification. The one canonical forward

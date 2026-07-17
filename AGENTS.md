@@ -189,6 +189,25 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-07-17:
 
+- Exact source `8bc7b7c` produced the first accepted two-hour M0 main bundle:
+  `/tmp/mini_vpn_knife15_macos_20260717_035908.tar.gz` (SHA-256
+  `1ecee823...`). Its fresh direct gate passed at `18.101918 Mbit/s` with zero
+  sender/receiver zero intervals. M0 completed eight full mixed cycles, both
+  planned 30-second forward bookends, idle/resume, final drain, `74` result
+  files, and `8/8` DNS checks with zero phase/health failures and zero
+  direction-aware receiver-zero intervals.
+- Endpoint conservation held at or below `61,440B` and ended
+  `61,403/0/0B`; resource envelopes were bounded, interface errors and log
+  compactions were zero, secret scan passed, and stop cleaned process, TUN,
+  and routes. The close-tail `REVIEW` contains boundary `Stopped(0)` events
+  with zero D16 queue ownership and one pre-M0 smoke local-close release equal
+  to the accepted bounded `524288B + 27840B` case. No unresolved P0/P1 remains.
+- The M0 gate still requires one independent fresh `start -> smoke -> stop`
+  rearm bundle. Do not repeat baseline/direct/two-hour M0 for that gate, and do
+  not enable another VPN before stop. M1 remains blocked until rearm passes;
+  then define its explicit eight-hour SLOs from this M0 envelope. Result:
+  `docs/tech/2026-07-17-knife15-hk-m0-main-run-results.md`.
+
 - The HK bundle `/tmp/mini_vpn_knife15_macos_20260717_033923.tar.gz`
   (SHA-256 `a189b848...`) fixed the preceding missing-DNS operation and passed
   forward/reverse TCP plus fake-IP DNS smoke. Its one canonical forward

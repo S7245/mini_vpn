@@ -1,5 +1,25 @@
 # Learnings
 
+## 2026-07-17 - Long-run acceptance must separate receiver continuity from close-tail review
+
+- The first successful two-hour M0 completed `74` TCP/UDP results with zero
+  direction-aware receiver-zero intervals even though sender evidence retained
+  `58` zero intervals and the log retained command-boundary `Stopped(0)` events.
+  Receiver results, exact completion, and ownership are the formal data-quality
+  signals; sender/review events remain useful diagnostics but are not automatic
+  failures.
+- One smoke flow released the exact bounded D16 reservoir and a terminal local
+  send queue before M0 began. It matched an already proven application-first
+  close boundary and ended with zero queue ownership. Phase boundaries matter:
+  a classified smoke teardown cannot be projected onto a later clean two-hour
+  workload without evidence.
+- Reusable rule: accept a long run only by correlating phase, direction-aware
+  receiver evidence, conservation, final ownership, resource envelopes, path
+  controls, and cleanup. Preserve `REVIEW`, but do not collapse it into FAIL
+  when every acceptance invariant closes exactly.
+- Result:
+  `docs/tech/2026-07-17-knife15-hk-m0-main-run-results.md`.
+
 ## 2026-07-17 - Review signals need phase and ownership context
 
 - Bundle `a189b848...` repeated one forward iperf `Stopped(0)` close tail at

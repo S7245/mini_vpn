@@ -326,13 +326,29 @@ steady-state recovery is understood.
 
 ## Readiness Score
 
-Current long-duration release readiness is `7.5/10`: peak Linux capacity, core
-invariants, the macOS runner, mixed M0 controller, exact receiver semantics,
-clean rearm, and same-window control collection are locally or operationally
-proven. A valid two-hour Shenzhen M0 still does not exist, so M1/M2/M3,
-measured recovery SLOs, and the complementary long Linux soak remain blocked.
+Current long-duration release readiness is `8/10`: peak Linux capacity, core
+invariants, the macOS runner, exact receiver semantics, same-window controls,
+and the first valid two-hour HK M0 main run are proven. The independent fresh
+M0 rearm is still pending, so M1/M2/M3 and the complementary long Linux soak
+remain blocked. After rearm, define explicit M1 resource/recovery SLOs from the
+accepted M0 envelope before starting the eight-hour run.
 Reaching `10/10` requires Tasks 1-11 to pass with no unresolved P0/P1 and with
 complete fail-closed cleanup evidence.
+
+## 2026-07-17 Execution Update
+
+Exact source `8bc7b7c` completed the first accepted two-hour M0 main run on HK:
+eight full mixed cycles plus both forward bookends, `74` exact result files,
+`8/8` DNS checks, one idle/resume sequence, final drain, zero phase/health
+failures, and zero direction-aware receiver-zero intervals. Endpoint
+conservation held at or below `61,440B` and final live/outstanding ownership
+was zero. Resource, interface, log, secret-scan, stop, and route cleanup
+evidence passed; phase-aware close-tail review found no unresolved P0/P1.
+
+The independent fresh `start -> smoke -> stop` rearm remains mandatory before
+M1. It does not require another baseline, direct discriminator, or two-hour
+workload. Result:
+`docs/tech/2026-07-17-knife15-hk-m0-main-run-results.md`.
 
 ## 2026-07-14 Execution Update
 

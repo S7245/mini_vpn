@@ -4,7 +4,29 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-17)
 
-- **Latest accepted position:** exact-source `13faccc` HK bundle
+- **Latest accepted position:** exact-source `8bc7b7c` HK M0 bundle
+  `/tmp/mini_vpn_knife15_macos_20260717_035908.tar.gz` (SHA-256
+  `1ecee823...`) passes the two-hour main run and first cleanup. The fresh
+  300-second direct prerequisite passed at `18.101918 Mbit/s` with zero
+  sender/Target-receiver zero intervals. M0 completed eight full mixed cycles,
+  both planned forward bookends, idle/resume, final drain, `74` result files,
+  and `8/8` DNS checks with zero phase/health failures and zero direction-aware
+  receiver-zero intervals.
+- Endpoint conservation held at or below `61,440B` and ended
+  `61,403/0/0B`; RSS/FD/thread envelopes were bounded, interface errors and log
+  compactions were zero, secret scan passed, and stop removed the process/TUN
+  and restored physical routes. No endpoint rebind was needed.
+- The bundle's `REVIEW` consists of command-boundary Quinn `Stopped(0)` events
+  with zero D16 queue ownership, plus one pre-M0 smoke local-close release of
+  exactly the accepted `524288B + 27840B` bounded tail. All formal receiver
+  evidence stayed positive and final ownership is zero; review found no
+  unresolved P0/P1.
+- M0 is not fully closed and M1 remains blocked until one independent fresh
+  `start -> smoke -> stop` rearm bundle passes. Do not repeat baseline, direct,
+  or the two-hour M0 for this gate. Keep other VPNs off through stop. Result:
+  `docs/tech/2026-07-17-knife15-hk-m0-main-run-results.md`.
+
+- **Previous accepted position:** exact-source `13faccc` HK bundle
   `/tmp/mini_vpn_knife15_macos_20260717_033923.tar.gz` (SHA-256
   `a189b848...`) started with Target, Exit, and DNS on physical `en1`, routed
   Target/DNS into `utun4`, and passed forward/reverse TCP plus fake-IP DNS
