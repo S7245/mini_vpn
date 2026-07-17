@@ -243,7 +243,7 @@ bash -n scripts/knife15-macos-soak.sh
 ```bash
 bash scripts/knife15-macos-soak.sh --self-test
 bash scripts/knife15-macos-soak-self-test.sh
-bash scripts/knife14-h10d16-gate.sh --self-test
+bash scripts/knife14h10d16-singbox-control.sh --self-test
 bash -n scripts/knife15-macos-soak.sh
 ```
 
