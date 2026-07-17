@@ -2,8 +2,7 @@
 
 Date: 2026-07-17
 
-Status: **Implementation candidate — local runner TDD authorized; no real M1
-TUN run until local gates and code review pass**
+Status: **Local implementation accepted — real user-run macOS TUN M1 pending**
 
 ## Stage Goal
 

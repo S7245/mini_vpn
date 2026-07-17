@@ -6,6 +6,23 @@
 
 #### Latest decision (2026-07-17)
 
+Knife15 M1 local implementation is complete and pushed at `2cca535`. The exact
+eight-hour schedule, stage-owned evidence, four fresh resource/ownership
+checkpoints, `302` TCP + `30` UDP + `30` DNS result contract, child deadlines,
+rebind SLO, summary validation, and fail-closed cleanup are implemented. All
+local shell/Rust/release/Clippy/fmt/diff/secret gates pass and code review has
+no unresolved P0/P1. Result:
+`docs/tech/2026-07-17-knife15-m1-eight-hour-soak-local-results.md`.
+
+Next run one user-operated HK macOS M1 from the exact reviewed source. Before
+baseline, completely disable Clash-TUN and every other VPN/TUN, and keep them
+off through `stop`. Use fresh M1 baseline/direct directories; do not reuse the
+M0 artifacts or run M0 in the same TUN lifecycle. A real failure requires
+`status/snapshot/stop` evidence and analysis, not frozen-constant tuning or an
+unchanged immediate repeat. M2 and M3 remain blocked pending M1 bundle review.
+
+#### Previous decision (2026-07-17)
+
 Knife15 M0 is complete. The independent rearm bundle
 `/tmp/mini_vpn_knife15_macos_20260717_063948.tar.gz` (SHA-256 `f4e0f649...`)
 used source `d3f7b13` and exact main-run binary/runner hashes. It created a

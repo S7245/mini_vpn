@@ -189,6 +189,20 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-07-17:
 
+- Knife15 M1 local implementation is complete and pushed at `2cca535`. The
+  target-only runner now implements the exact `28,800s` mixed schedule, five
+  active windows, three idle/resume boundaries, four fresh post-drain
+  checkpoints, `302` TCP + `30` UDP + `30` DNS results, hard child deadlines,
+  resource/rebind SLOs, and fail-closed cleanup. All local shell, Rust,
+  release, Clippy, fmt, diff, and secret gates pass; review has no unresolved
+  P0/P1. Result:
+  `docs/tech/2026-07-17-knife15-m1-eight-hour-soak-local-results.md`.
+- No real M1 TUN run occurred during implementation. The next action is one
+  user-run HK macOS M1 using the exact reviewed source and fresh M1 baseline
+  and direct artifacts. Clash-TUN and every other VPN/TUN must be completely
+  disabled before baseline and remain disabled through Knife15 `stop`. On a
+  failure preserve `status/snapshot/stop`; do not tune frozen constants or
+  immediately repeat unchanged. M2/M3 remain blocked pending bundle review.
 - Knife15 M0 is complete. Independent rearm bundle
   `/tmp/mini_vpn_knife15_macos_20260717_063948.tar.gz` (SHA-256
   `f4e0f649...`) used source `d3f7b13` with the exact accepted main-run binary

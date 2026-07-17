@@ -1,5 +1,8 @@
 # Knife15 M1 Eight-Hour Soak Implementation Plan
 
+Status: **Completed locally at `2cca535`; final gates and review PASS; real M1
+pending user execution**
+
 > **For agentic workers:** Implement inline in this repository with the `tdd`,
 > `code-review`, `self-improving-agent`, and `git-commit` skills. Subagents are
 > not authorized for this plan. Every behavior is one RED -> GREEN slice.

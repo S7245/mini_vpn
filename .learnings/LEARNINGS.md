@@ -1,5 +1,32 @@
 # Learnings
 
+## 2026-07-17 - Long-run evidence needs freshness and deadlines at each owner
+
+- An eight-hour parent controller does not bound a foreground iperf, DNS,
+  idle, or drain child. Each child now owns its expected duration plus a
+  bounded grace and returns `124` while leaving status/snapshot/stop evidence.
+- A numerically valid latest Endpoint row does not prove an idle checkpoint.
+  Checkpoint capture must observe the Endpoint sample count advance during the
+  named drain and then immediately verify ownership and conservation.
+- Reusable rule: long-run acceptance needs both temporal ownership and evidence
+  provenance. Put the deadline on the exact blocking child and bind every
+  checkpoint to a sample generated inside its own observation window.
+
+## 2026-07-17 - Review classes must preserve strict evidence multiplicity
+
+- A sender-only zero can remain REVIEW while receiver continuity, exact result
+  count, and M1 SLO stay PASS. A receiver zero or nonzero D16 ownership remains
+  a hard failure.
+- Mutation backups placed inside the formal evidence directory changed result
+  multiplicity and obscured the intended discriminator. Backups now live
+  outside `m1/`, and direction-aware mutations select the authoritative
+  receiver for each result.
+- Reusable rule: a negative fixture must vary exactly one acceptance invariant.
+  Do not let its backup path, file count, or direction selection create a
+  second independent failure.
+- Result:
+  `docs/tech/2026-07-17-knife15-m1-eight-hour-soak-local-results.md`.
+
 ## 2026-07-17 - Rearm provenance should identify the executable system
 
 - The independent rearm source advanced from `8bc7b7c` to `d3f7b13` only to

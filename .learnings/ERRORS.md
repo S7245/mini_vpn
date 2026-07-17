@@ -1,5 +1,27 @@
 # Errors
 
+## 2026-07-17 - Resolve documented gate names before final execution
+
+- The initial M1 implementation plan named
+  `scripts/knife14-h10d16-gate.sh`, which does not exist. The actual preserved
+  control gate is `scripts/knife14h10d16-singbox-control.sh --self-test`.
+- The nonexistent command failed once during closeout; the plan was corrected
+  and the real gate passed. This was a documentation/command-resolution error,
+  not a product or regression failure.
+- Reusable rule: resolve every plan command against `rg --files` before the
+  final gate batch. Do not infer historical script names from stage prose.
+
+## 2026-07-17 - A negative fixture accidentally changed two invariants
+
+- The first sender-zero mutation was direction-agnostic and stored a backup in
+  the formal M1 result directory. Depending on the selected result, it could
+  modify the receiver side and always changed evidence multiplicity.
+- The fixture was repaired to choose the direction-aware sender and keep its
+  backup outside the counted directory. The intended sender-only REVIEW then
+  passed without weakening receiver or result-count gates.
+- Reusable rule: preserve file multiplicity and traffic direction when testing
+  result classification; one mutation should select one discriminator.
+
 ## 2026-07-17 - Do not promote generic remote-write grep to an M0 stop gate
 
 - A manual pre-M0 instruction incorrectly treated any

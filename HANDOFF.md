@@ -4,7 +4,21 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-17)
 
-- **Latest accepted position:** Knife15 M0 is complete. The independent rearm
+- **Latest accepted position:** Knife15 M1 local implementation is complete at
+  pushed commit `2cca535`. The runner now owns the exact `28,800s` schedule,
+  five active windows, three idle/resume boundaries, four fresh drain
+  checkpoints, `302` TCP + `30` UDP + `30` DNS results, resource/recovery
+  SLOs, child hard deadlines, and fail-closed cleanup. All shell, Rust,
+  release, Clippy, fmt, diff, and secret gates pass; review has no unresolved
+  P0/P1. Result:
+  `docs/tech/2026-07-17-knife15-m1-eight-hour-soak-local-results.md`.
+- No real M1 TUN run occurred in the implementation stage. The next action is
+  one user-run HK macOS M1 from the exact reviewed source. Clash-TUN and every
+  other VPN/TUN must be completely disabled before baseline and remain off
+  through `stop`. Use fresh `M1_BASELINE_DIR` and `M1_DIRECT_DIR`, then run
+  `start -> smoke -> m1 -> status -> stop`. On failure use
+  `status -> snapshot -> stop`. M2/M3 remain blocked until bundle review.
+- **Previous accepted position:** Knife15 M0 is complete. The independent rearm
   bundle `/tmp/mini_vpn_knife15_macos_20260717_063948.tar.gz` (SHA-256
   `f4e0f649...`) used source `d3f7b13` with the exact same release-binary and
   runner hashes as the accepted main run. It created fresh `utun4`, kept Exit
