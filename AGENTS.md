@@ -189,6 +189,20 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-07-17:
 
+- Knife15 M0 is complete. Independent rearm bundle
+  `/tmp/mini_vpn_knife15_macos_20260717_063948.tar.gz` (SHA-256
+  `f4e0f649...`) used source `d3f7b13` with the exact accepted main-run binary
+  and runner hashes. It created fresh `utun4`, kept Exit on `en1`, passed both
+  TCP directions and fake-IP DNS, then cleaned process, TUN, and routes.
+- Rearm conservation ended `61,277/0/0B`; interface errors, abandoned bytes,
+  stranded ownership, and log compactions were zero. Its one `Stopped(0)` and
+  bounded application-first close are the accepted REVIEW classes. No
+  unresolved P0/P1 remains. Together with main bundle `...035908.tar.gz`
+  (SHA-256 `1ecee823...`), this closes M0. Do not repeat baseline, direct, or
+  M0. Next define M1 eight-hour SLOs and a deterministic runner/TDD plan before
+  M1 execution. Result:
+  `docs/tech/2026-07-17-knife15-hk-m0-rearm-acceptance-results.md`.
+
 - Exact source `8bc7b7c` produced the first accepted two-hour M0 main bundle:
   `/tmp/mini_vpn_knife15_macos_20260717_035908.tar.gz` (SHA-256
   `1ecee823...`). Its fresh direct gate passed at `18.101918 Mbit/s` with zero
@@ -202,7 +216,7 @@ Current Knife15 summary, as of 2026-07-17:
   and routes. The close-tail `REVIEW` contains boundary `Stopped(0)` events
   with zero D16 queue ownership and one pre-M0 smoke local-close release equal
   to the accepted bounded `524288B + 27840B` case. No unresolved P0/P1 remains.
-- The M0 gate still requires one independent fresh `start -> smoke -> stop`
+- At that point the M0 gate still required one independent fresh `start -> smoke -> stop`
   rearm bundle. Do not repeat baseline/direct/two-hour M0 for that gate, and do
   not enable another VPN before stop. M1 remains blocked until rearm passes;
   then define its explicit eight-hour SLOs from this M0 envelope. Result:

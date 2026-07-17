@@ -1,8 +1,8 @@
 # Knife15 macOS HITL M0 Runbook
 
 Date: 2026-07-14
-Status: **two-hour M0 main run PASS; independent fresh rearm pending before
-M1**
+Status: **M0 PASS — two-hour main run and independent fresh rearm complete; M1
+design/TDD is next**
 
 ## Purpose And Authority Boundary
 
@@ -247,9 +247,11 @@ controls, and first cleanup passed. Its phase-aware close-tail review found no
 unresolved P0/P1. Result:
 `docs/tech/2026-07-17-knife15-hk-m0-main-run-results.md`.
 
-The remaining M0 gate is only the independent fresh create/smoke/stop bundle
-defined in section 5. M1 remains blocked until it passes. Do not repeat the
-baseline, direct discriminator, or two-hour workload for this rearm gate.
+The independent fresh create/smoke/stop bundle defined in section 5 then
+passed on exact main-run binary/runner hashes. M0 is complete; do not repeat
+the baseline, direct discriminator, or two-hour workload. M1 must first define
+its explicit eight-hour SLOs and deterministic runner/TDD plan. Rearm result:
+`docs/tech/2026-07-17-knife15-hk-m0-rearm-acceptance-results.md`.
 
 Historical context follows.
 

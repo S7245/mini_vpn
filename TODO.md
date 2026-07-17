@@ -6,6 +6,26 @@
 
 #### Latest decision (2026-07-17)
 
+Knife15 M0 is complete. The independent rearm bundle
+`/tmp/mini_vpn_knife15_macos_20260717_063948.tar.gz` (SHA-256 `f4e0f649...`)
+used source `d3f7b13` and exact main-run binary/runner hashes. It created a
+fresh target-only `utun4`, kept Exit on physical `en1`, passed forward/reverse
+TCP and fake-IP DNS, then cleaned the process, TUN, and routes.
+
+Endpoint conservation passed and ended `61,277/0/0B`; interface errors,
+abandoned bytes, stranded queue ownership, log compactions, and secret scan
+failures were zero. Its `Stopped(0)` and bounded application-first close are
+the accepted REVIEW classes. No unresolved P0/P1 remains. Together with main
+bundle `...035908.tar.gz` (SHA-256 `1ecee823...`), this closes M0.
+
+Do not repeat M0, baseline, or direct. Next define the M1 eight-hour SLO/spec
+from the M0 resource/path envelope, then extend the runner with deterministic
+shell TDD before any M1 macOS execution. Keep all frozen data-plane constants
+and strict direction-aware receiver semantics. Result:
+`docs/tech/2026-07-17-knife15-hk-m0-rearm-acceptance-results.md`.
+
+#### Previous decision (2026-07-17)
+
 Exact source `8bc7b7c` has produced the first accepted two-hour Knife15 M0
 main bundle: `/tmp/mini_vpn_knife15_macos_20260717_035908.tar.gz` (SHA-256
 `1ecee823...`). Its fresh direct prerequisite completed 300 positive Target
@@ -27,7 +47,7 @@ frozen settings. M1 stays blocked until this rearm passes, after which define
 explicit M1 resource/recovery SLOs from the accepted M0 envelope. Result:
 `docs/tech/2026-07-17-knife15-hk-m0-main-run-results.md`.
 
-#### Previous decision (2026-07-17)
+#### Earlier decision (2026-07-17)
 
 The exact-source `13faccc` HK bundle
 `/tmp/mini_vpn_knife15_macos_20260717_033923.tar.gz` (SHA-256 `a189b848...`)

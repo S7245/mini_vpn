@@ -4,7 +4,24 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-17)
 
-- **Latest accepted position:** exact-source `8bc7b7c` HK M0 bundle
+- **Latest accepted position:** Knife15 M0 is complete. The independent rearm
+  bundle `/tmp/mini_vpn_knife15_macos_20260717_063948.tar.gz` (SHA-256
+  `f4e0f649...`) used source `d3f7b13` with the exact same release-binary and
+  runner hashes as the accepted main run. It created fresh `utun4`, kept Exit
+  on `en1`, passed forward/reverse TCP and fake-IP DNS, then stopped with the
+  process dead, TUN unavailable, and Target/Exit/physical routes all on `en1`.
+- Endpoint conservation passed and ended `61,277/0/0B`; interface errors, log
+  compactions, abandoned bytes, and stranded ownership were zero. The one
+  forward `Stopped(0)` and exact bounded reverse local-close release are the
+  already accepted command-boundary REVIEW classes. No unresolved P0/P1.
+- The accepted two-hour main bundle remains `...035908.tar.gz` (SHA-256
+  `1ecee823...`). Together the pair closes M0. Do not repeat M0, baseline, or
+  direct. Next write the explicit M1 eight-hour SLO/spec and deterministic
+  runner/TDD plan from the M0 envelope before changing or executing the runner.
+  Result:
+  `docs/tech/2026-07-17-knife15-hk-m0-rearm-acceptance-results.md`.
+
+- **Previous accepted position:** exact-source `8bc7b7c` HK M0 bundle
   `/tmp/mini_vpn_knife15_macos_20260717_035908.tar.gz` (SHA-256
   `1ecee823...`) passes the two-hour main run and first cleanup. The fresh
   300-second direct prerequisite passed at `18.101918 Mbit/s` with zero
@@ -21,9 +38,9 @@
   exactly the accepted `524288B + 27840B` bounded tail. All formal receiver
   evidence stayed positive and final ownership is zero; review found no
   unresolved P0/P1.
-- M0 is not fully closed and M1 remains blocked until one independent fresh
-  `start -> smoke -> stop` rearm bundle passes. Do not repeat baseline, direct,
-  or the two-hour M0 for this gate. Keep other VPNs off through stop. Result:
+- At that point M0 was not fully closed and M1 remained blocked until one
+  independent fresh `start -> smoke -> stop` rearm bundle passed. It did not
+  require another baseline, direct, or two-hour M0. Result:
   `docs/tech/2026-07-17-knife15-hk-m0-main-run-results.md`.
 
 - **Previous accepted position:** exact-source `13faccc` HK bundle

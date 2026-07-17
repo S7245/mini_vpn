@@ -2,8 +2,8 @@
 
 Date: 2026-07-17
 
-Status: **PASS — two-hour M0 main run and first cleanup accepted; independent
-fresh rearm still required before M1**
+Status: **PASS — two-hour M0 main run accepted; independent fresh rearm later
+passed and the full M0 gate is complete**
 
 ## Provenance And Prerequisites
 
@@ -94,7 +94,9 @@ the first valid Knife15 M0 workload evidence, but the M0 gate is not fully
 closed until a separate fresh `start -> smoke -> stop` bundle proves re-create,
 rearm, and cleanup. That second run does not repeat the two-hour workload.
 
-M1 remains blocked until the independent rearm bundle passes. No baseline,
-direct discriminator, parameter change, or M0 repeat is required for that
-rearm. After it passes, use this M0's observed resource/path envelopes to set
-the explicit M1 eight-hour SLOs before executing M1.
+The independent rearm subsequently passed in bundle
+`/tmp/mini_vpn_knife15_macos_20260717_063948.tar.gz` (SHA-256 `f4e0f649...`).
+The full M0 gate is therefore complete. Use this M0's observed resource/path
+envelopes to set the explicit M1 eight-hour SLOs before executing M1. Rearm
+result:
+`docs/tech/2026-07-17-knife15-hk-m0-rearm-acceptance-results.md`.

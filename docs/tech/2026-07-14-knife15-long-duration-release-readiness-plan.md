@@ -326,16 +326,25 @@ steady-state recovery is understood.
 
 ## Readiness Score
 
-Current long-duration release readiness is `8/10`: peak Linux capacity, core
+Current long-duration release readiness is `8.5/10`: peak Linux capacity, core
 invariants, the macOS runner, exact receiver semantics, same-window controls,
-and the first valid two-hour HK M0 main run are proven. The independent fresh
-M0 rearm is still pending, so M1/M2/M3 and the complementary long Linux soak
-remain blocked. After rearm, define explicit M1 resource/recovery SLOs from the
-accepted M0 envelope before starting the eight-hour run.
+the valid two-hour HK M0 main run, and its independent fresh rearm are proven.
+M0 is complete. M1/M2/M3 and the complementary long Linux soak remain pending;
+define explicit M1 resource/recovery SLOs from the accepted M0 envelope before
+starting the eight-hour run.
 Reaching `10/10` requires Tasks 1-11 to pass with no unresolved P0/P1 and with
 complete fail-closed cleanup evidence.
 
 ## 2026-07-17 Execution Update
+
+Independent rearm bundle `...063948.tar.gz` (SHA-256 `f4e0f649...`) created a
+fresh target-only utun, kept Exit physical, passed both TCP directions and
+fake-IP DNS, and then proved process/TUN/route cleanup. It used the exact
+main-run binary and runner hashes; its newer source commit contained only the
+main-run evidence documents. Endpoint ownership ended with zero live and
+outstanding bytes, and review found no unresolved P0/P1. M0 is complete. Next
+define M1 SLOs and runner TDD before an eight-hour execution. Result:
+`docs/tech/2026-07-17-knife15-hk-m0-rearm-acceptance-results.md`.
 
 Exact source `8bc7b7c` completed the first accepted two-hour M0 main run on HK:
 eight full mixed cycles plus both forward bookends, `74` exact result files,
@@ -345,9 +354,9 @@ conservation held at or below `61,440B` and final live/outstanding ownership
 was zero. Resource, interface, log, secret-scan, stop, and route cleanup
 evidence passed; phase-aware close-tail review found no unresolved P0/P1.
 
-The independent fresh `start -> smoke -> stop` rearm remains mandatory before
-M1. It does not require another baseline, direct discriminator, or two-hour
-workload. Result:
+At that point the independent fresh `start -> smoke -> stop` rearm remained
+mandatory before M1. It did not require another baseline, direct discriminator,
+or two-hour workload. Main-run result:
 `docs/tech/2026-07-17-knife15-hk-m0-main-run-results.md`.
 
 ## 2026-07-14 Execution Update

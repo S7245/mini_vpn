@@ -1,5 +1,21 @@
 # Learnings
 
+## 2026-07-17 - Rearm provenance should identify the executable system
+
+- The independent rearm source advanced from `8bc7b7c` to `d3f7b13` only to
+  record the accepted main-run documents. Release-binary and runner hashes
+  remained exact, so rebuilding or repeating the main workload would add no
+  executable-system evidence.
+- The fresh run still proved the required lifecycle boundary: a new utun,
+  correct non-recursive Exit route, bidirectional TCP, fake-IP DNS, exact
+  ownership closure, process termination, and route/TUN cleanup.
+- Reusable rule: use source commit, executable hash, runner hash, and the
+  intervening file diff together. A docs-only source change does not invalidate
+  a paired rearm when executable and harness identities are exact; a code,
+  build, config, or runner change does.
+- Result:
+  `docs/tech/2026-07-17-knife15-hk-m0-rearm-acceptance-results.md`.
+
 ## 2026-07-17 - Long-run acceptance must separate receiver continuity from close-tail review
 
 - The first successful two-hour M0 completed `74` TCP/UDP results with zero
