@@ -2,9 +2,31 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 Release Readiness (2026-07-17)
+## Next Planned Stage — Knife15 Release Readiness (2026-07-20)
 
-- **Latest accepted position:** Knife15 M1 local implementation is complete at
+- **Latest accepted position:** the first real HK M1 bundle
+  `/tmp/mini_vpn_knife15_macos_20260720_090636.tar.gz` (SHA-256
+  `5fd183b1...`) used exact source `dc8cfb1` and was operated correctly. It
+  completed five full mixed cycles before cycle 6 forward was falsely rejected
+  as `receiver_zero_interval`.
+- Cycle 6 transferred `292,945,920B` over the full 300-second command. Its
+  Target receiver had `300` complete positive intervals followed by one final
+  `0.163918s` zero command tail. Target remained on `utun4`, Exit on `en0`,
+  Endpoint conservation stayed within `61,440B` and ended `61,403/0/0B`, and
+  process/TUN/routes cleaned completely. This was not user, sudo, Clash, route,
+  or mini_vpn data-plane failure.
+- The local runner repair excludes only a numeric, final, sub-`0.5s` zero row
+  proven at the command boundary. Complete, nonterminal, missing-timing, and
+  malformed zeros still fail closed. Real artifact replay plus shell, Rust,
+  release, Clippy, fmt, diff, and secret gates pass; review has no unresolved
+  P0/P1. Result:
+  `docs/tech/2026-07-20-knife15-m1-partial-tail-observer-repair-results.md`.
+- The bundle is partial and does not pass M1. Next use the pushed repair,
+  rebuild release, and take fresh M1 baseline/direct artifacts before one new
+  user-run HK `start -> smoke -> m1 -> status -> stop`. Keep all other VPN/TUN
+  disabled through stop. On failure use `status -> snapshot -> stop`. M2/M3
+  remain blocked.
+- **Previous accepted position:** Knife15 M1 local implementation is complete at
   pushed commit `2cca535`. The runner now owns the exact `28,800s` schedule,
   five active windows, three idle/resume boundaries, four fresh drain
   checkpoints, `302` TCP + `30` UDP + `30` DNS results, resource/recovery

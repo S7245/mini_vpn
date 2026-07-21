@@ -1,5 +1,21 @@
 # Learnings
 
+## 2026-07-20 - Continuity evidence needs a proven command-tail boundary
+
+- The first real M1 stopped after five complete cycles because iperf emitted a
+  final `0.163918s` zero-byte receiver row after `300` complete positive
+  receiver seconds. Treating every emitted row as a full continuity window
+  created a false product failure.
+- Duration alone is insufficient to waive a zero row. A safe exclusion also
+  requires numeric timing, command-end proximity, and proof that the row is
+  the final interval entry. Complete, nonterminal, and timing-unproven zeros
+  must remain failures.
+- Reusable rule: define acceptance over the measurement window promised by the
+  SLI, while retaining partial command-tail evidence for diagnostics. Replay
+  the exact real artifact before changing product behavior or constants.
+- Result:
+  `docs/tech/2026-07-20-knife15-m1-partial-tail-observer-repair-results.md`.
+
 ## 2026-07-17 - Long-run evidence needs freshness and deadlines at each owner
 
 - An eight-hour parent controller does not bound a foreground iperf, DNS,

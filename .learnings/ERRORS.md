@@ -1,5 +1,18 @@
 # Errors
 
+## 2026-07-20 - A direct fixture changed only one endpoint's duration
+
+- The new direct-discriminator tail regression initially changed the iperf
+  client duration to `300s` but left the embedded server duration at the
+  compressed `2s` M1 fixture value. The correct classifier rejected the row
+  because it was not near the server command boundary.
+- This was a test-fixture construction error, not a repair or product failure.
+  Work stopped at the unexpected RED; the confirmed repair aligned client and
+  server durations, after which the intended artifact passed.
+- Reusable rule: when direction-aware evidence embeds both iperf endpoints,
+  fixture time scaling must update the authoritative sender and receiver
+  command contracts together.
+
 ## 2026-07-17 - Resolve documented gate names before final execution
 
 - The initial M1 implementation plan named

@@ -1,10 +1,34 @@
 # TODO
 
-## Current Knife15 Plan (2026-07-17)
+## Current Knife15 Plan (2026-07-20)
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-07-17)
+#### Latest decision (2026-07-20)
+
+The first real HK M1 bundle
+`/tmp/mini_vpn_knife15_macos_20260720_090636.tar.gz` (SHA-256 `5fd183b1...`)
+was operated correctly and completed five full mixed cycles. Cycle 6 forward
+then transferred `292,945,920B` over its complete 300-second command but was
+rejected as `receiver_zero_interval`. All `300` complete Target receiver
+intervals were positive; the only zero was a final `0.163918s` iperf command
+tail. Routes, conservation, resources, health, and cleanup reject operator,
+Clash, route, and data-plane failure.
+
+The local repair excludes only a numeric final sub-`0.5s` zero row proven at
+the command boundary. Complete, nonterminal, timing-unproven, malformed, and
+negative evidence still fails closed. Real artifact replay and all shell,
+Rust, release, Clippy, fmt, diff, and secret gates pass; review has no
+unresolved P0/P1. Result:
+`docs/tech/2026-07-20-knife15-m1-partial-tail-observer-repair-results.md`.
+
+The partial bundle does not satisfy the eight-hour M1 contract. After the
+repair is pushed, rebuild release and create fresh M1 baseline/direct artifacts
+for one new user-operated HK run. Disable every other VPN/TUN before baseline
+and keep them off through stop. Use `status/snapshot/stop` on failure. M2/M3
+remain blocked; do not tune frozen constants.
+
+#### Previous decision (2026-07-17)
 
 Knife15 M1 local implementation is complete and pushed at `2cca535`. The exact
 eight-hour schedule, stage-owned evidence, four fresh resource/ownership

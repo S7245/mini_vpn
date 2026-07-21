@@ -187,7 +187,29 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-07-17:
+Current Knife15 summary, as of 2026-07-20:
+
+- The first real HK M1 bundle
+  `/tmp/mini_vpn_knife15_macos_20260720_090636.tar.gz` (SHA-256
+  `5fd183b1...`) used exact source `dc8cfb1` and was operated correctly. It
+  completed five full mixed cycles; cycle 6 forward then transferred
+  `292,945,920B` over the full `300s` command but the runner reported
+  `receiver_zero_interval`.
+- All `300` complete Target receiver intervals were positive. The only zero
+  was the final `0.163918s` iperf command-tail row. Target/Exit routes, TUN,
+  Endpoint conservation (`61,440B` max, `61,403/0/0B` final), resources, and
+  cleanup were healthy. This selects an observer false negative, not operator,
+  Clash, route, or mini_vpn data-plane failure.
+- The runner now excludes a zero interval only when numeric timing proves it
+  is the final sub-`0.5s` row at the command boundary. Complete, nonterminal,
+  missing-timing, malformed, or negative rows still fail closed. Real artifact
+  replay and all shell/Rust/release/Clippy/fmt/diff/secret gates pass; review
+  has no unresolved P0/P1. Result:
+  `docs/tech/2026-07-20-knife15-m1-partial-tail-observer-repair-results.md`.
+- The partial M1 is not an eight-hour acceptance. After the repair is pushed,
+  the next action is one fresh user-run HK M1 with a rebuilt release and fresh
+  baseline/direct artifacts. Keep every other VPN/TUN disabled through stop;
+  on failure preserve `status/snapshot/stop`. M2/M3 remain blocked.
 
 - Knife15 M1 local implementation is complete and pushed at `2cca535`. The
   target-only runner now implements the exact `28,800s` mixed schedule, five

@@ -915,6 +915,15 @@ m0_result_envelope() {
     for result_file in "$m0_dir"/*.json; do
       [[ -f "$result_file" ]] || continue
       if ! jq -er '
+        def interval_entry_is_proven_partial($duration; $count):
+          .key as $index
+          | .value.sum.start as $start | .value.sum.end as $end
+          | (($duration | type) == "number"
+            and $index == ($count - 1)
+            and ($start | type) == "number" and ($end | type) == "number"
+            and $start >= ($duration - 0.5) and $end >= $duration
+            and $end <= ($duration + 0.5) and $end >= $start
+            and ($end - $start) < 0.5);
         . as $root
         | $root.end.sum_sent.bytes as $sent
         | $root.end.sum_received.bytes as $received
@@ -933,13 +942,21 @@ m0_result_envelope() {
               (.sum.bits_per_second | type) == "number"
               and .sum.bits_per_second >= 0) | not))
           then error("missing directional interval evidence") else . end
-        | [$sender.intervals[]
-            | select((.sum.bits_per_second | type) == "number"
-              and .sum.bits_per_second <= 0)]
+        | $sender.intervals as $sender_intervals
+        | [$sender_intervals | to_entries[]
+            | select((.value.sum.bits_per_second | type) == "number"
+              and .value.sum.bits_per_second <= 0
+              and (interval_entry_is_proven_partial(
+                $sender.start.test_start.duration;
+                ($sender_intervals | length)) | not))]
           | length as $sender_zero
-        | [$receiver.intervals[]
-            | select((.sum.bits_per_second | type) == "number"
-              and .sum.bits_per_second <= 0)]
+        | $receiver.intervals as $receiver_intervals
+        | [$receiver_intervals | to_entries[]
+            | select((.value.sum.bits_per_second | type) == "number"
+              and .value.sum.bits_per_second <= 0
+              and (interval_entry_is_proven_partial(
+                $receiver.start.test_start.duration;
+                ($receiver_intervals | length)) | not))]
           | length as $receiver_zero
         | [
             $root.start.test_start.protocol,
@@ -1014,13 +1031,41 @@ baseline_receiver_summary() {
   forward_bps="$(baseline_receiver_bps "$forward_file")" || return 1
   reverse_bps="$(baseline_receiver_bps "$reverse_file")" || return 1
   forward_zero="$(jq -er \
-    '[.server_output_json.intervals[] | select(
-      (.sum.bits_per_second | type) != "number" or
-      .sum.bits_per_second <= 0)] | length' "$forward_file" 2>/dev/null)" || return 1
+    'def interval_entry_is_proven_partial($duration; $count):
+      .key as $index
+      | .value.sum.start as $start | .value.sum.end as $end
+      | (($duration | type) == "number"
+        and $index == ($count - 1)
+        and ($start | type) == "number" and ($end | type) == "number"
+        and $start >= ($duration - 0.5) and $end >= $duration
+        and $end <= ($duration + 0.5) and $end >= $start
+        and ($end - $start) < 0.5);
+    .server_output_json.start.test_start.duration as $duration
+    | .server_output_json.intervals as $intervals
+    | [$intervals | to_entries[] | select(
+      (.value.sum.bits_per_second | type) != "number" or
+      (.value.sum.bits_per_second <= 0 and
+        (interval_entry_is_proven_partial(
+          $duration; ($intervals | length)) | not)))] | length' \
+    "$forward_file" 2>/dev/null)" || return 1
   reverse_zero="$(jq -er \
-    '[.intervals[] | select(
-      (.sum.bits_per_second | type) != "number" or
-      .sum.bits_per_second <= 0)] | length' "$reverse_file" 2>/dev/null)" || return 1
+    'def interval_entry_is_proven_partial($duration; $count):
+      .key as $index
+      | .value.sum.start as $start | .value.sum.end as $end
+      | (($duration | type) == "number"
+        and $index == ($count - 1)
+        and ($start | type) == "number" and ($end | type) == "number"
+        and $start >= ($duration - 0.5) and $end >= $duration
+        and $end <= ($duration + 0.5) and $end >= $start
+        and ($end - $start) < 0.5);
+    .start.test_start.duration as $duration
+    | .intervals as $intervals
+    | [$intervals | to_entries[] | select(
+      (.value.sum.bits_per_second | type) != "number" or
+      (.value.sum.bits_per_second <= 0 and
+        (interval_entry_is_proven_partial(
+          $duration; ($intervals | length)) | not)))] | length' \
+    "$reverse_file" 2>/dev/null)" || return 1
   forward_mbit="$(awk -v bps="$forward_bps" 'BEGIN {printf "%.3f", bps / 1000000}')"
   reverse_mbit="$(awk -v bps="$reverse_bps" 'BEGIN {printf "%.3f", bps / 1000000}')"
   printf 'BASELINE receiver: forward_mbit=%s reverse_mbit=%s forward_zero_intervals=%s reverse_zero_intervals=%s\n' \
@@ -1033,6 +1078,15 @@ validate_m0_baseline_file() {
   local reverse="$3"
   [[ -f "$json_file" && ! -L "$json_file" ]] || return 1
   jq -e --arg target "$target" --argjson reverse "$reverse" '
+    def interval_entry_is_proven_partial($duration; $count):
+      .key as $index
+      | .value.sum.start as $start | .value.sum.end as $end
+      | (($duration | type) == "number"
+        and $index == ($count - 1)
+        and ($start | type) == "number" and ($end | type) == "number"
+        and $start >= ($duration - 0.5) and $end >= $duration
+        and $end <= ($duration + 0.5) and $end >= $start
+        and ($end - $start) < 0.5);
     ((.error? // "") == "")
     and (.start.connecting_to.host == $target)
     and (.start.test_start.protocol == "TCP")
@@ -1044,9 +1098,14 @@ validate_m0_baseline_file() {
     and ((if $reverse == 0 then .server_output_json else . end) as $receiver
       | (($receiver.intervals | type) == "array"
         and ($receiver.intervals | length) > 0)
-      and all($receiver.intervals[];
-        .sum.bits_per_second as $bps
-        | (($bps | type) == "number" and $bps > 0))
+      and ($receiver.intervals as $intervals
+        | all($intervals | to_entries[];
+          .value.sum.bits_per_second as $bps
+          | (($bps | type) == "number"
+            and ($bps > 0 or ($bps == 0 and
+              interval_entry_is_proven_partial(
+                $receiver.start.test_start.duration;
+                ($intervals | length)))))))
       and ($receiver.end.sum_received.bits_per_second as $bps
         | (($bps | type) == "number" and $bps > 0)))
   ' "$json_file" >/dev/null 2>&1
@@ -1123,6 +1182,15 @@ validate_m0_iperf_result() {
   local protocol="$2"
   local reverse="$3"
   jq -e --arg protocol "$protocol" --argjson reverse "$reverse" '
+    def interval_entry_is_proven_partial($duration; $count):
+      .key as $index
+      | .value.sum.start as $start | .value.sum.end as $end
+      | (($duration | type) == "number"
+        and $index == ($count - 1)
+        and ($start | type) == "number" and ($end | type) == "number"
+        and $start >= ($duration - 0.5) and $end >= $duration
+        and $end <= ($duration + 0.5) and $end >= $start
+        and ($end - $start) < 0.5);
     ((.error? // "") == "")
     and (.start.test_start.protocol == $protocol)
     and (.start.test_start.reverse == $reverse)
@@ -1154,9 +1222,14 @@ validate_m0_iperf_result() {
       and ($receiver.start.test_start.reverse == $reverse)
       and (($receiver.intervals | type) == "array"
         and ($receiver.intervals | length) > 0)
-      and all($receiver.intervals[];
-        .sum.bits_per_second as $bps
-        | (($bps | type) == "number" and $bps > 0))
+      and ($receiver.intervals as $intervals
+        | all($intervals | to_entries[];
+          .value.sum.bits_per_second as $bps
+          | (($bps | type) == "number"
+            and ($bps > 0 or ($bps == 0 and
+              interval_entry_is_proven_partial(
+                $receiver.start.test_start.duration;
+                ($intervals | length)))))))
       and ($receiver.end.sum_received.bits_per_second as $bps
         | (($bps | type) == "number" and $bps > 0))
       and ($receiver.end.sum_received.bytes as $bytes
@@ -1182,11 +1255,24 @@ m0_iperf_result_failure_reason() {
     return 0
   fi
   if jq -e --argjson reverse "$reverse" '
+    def interval_entry_is_proven_partial($duration; $count):
+      .key as $index
+      | .value.sum.start as $start | .value.sum.end as $end
+      | (($duration | type) == "number"
+        and $index == ($count - 1)
+        and ($start | type) == "number" and ($end | type) == "number"
+        and $start >= ($duration - 0.5) and $end >= $duration
+        and $end <= ($duration + 0.5) and $end >= $start
+        and ($end - $start) < 0.5);
     (if $reverse == 0 then .server_output_json else . end) as $receiver
     | (($receiver.intervals | type) == "array")
-      and any($receiver.intervals[];
-        (.sum.bits_per_second | type) == "number"
-        and .sum.bits_per_second <= 0)
+      and ($receiver.intervals as $intervals
+        | any($intervals | to_entries[];
+          (.value.sum.bits_per_second | type) == "number"
+          and .value.sum.bits_per_second <= 0
+          and (interval_entry_is_proven_partial(
+            $receiver.start.test_start.duration;
+            ($intervals | length)) | not)))
   ' "$json_file" >/dev/null 2>&1; then
     echo receiver_zero_interval
     return 0
@@ -1198,6 +1284,15 @@ validate_target_ready_result() {
   local json_file="$1"
   local target="$2"
   jq -e --arg target "$target" '
+    def interval_entry_is_proven_partial($duration; $count):
+      .key as $index
+      | .value.sum.start as $start | .value.sum.end as $end
+      | (($duration | type) == "number"
+        and $index == ($count - 1)
+        and ($start | type) == "number" and ($end | type) == "number"
+        and $start >= ($duration - 0.5) and $end >= $duration
+        and $end <= ($duration + 0.5) and $end >= $start
+        and ($end - $start) < 0.5);
     ((.error? // "") == "")
     and (.start.connecting_to.host == $target)
     and (.start.test_start.protocol == "TCP")
@@ -1218,9 +1313,14 @@ validate_target_ready_result() {
       and ($receiver.start.test_start.reverse == 0)
       and (($receiver.intervals | type) == "array"
         and ($receiver.intervals | length) > 0)
-      and all($receiver.intervals[];
-        .sum.bits_per_second as $bps
-        | (($bps | type) == "number" and $bps > 0))
+      and ($receiver.intervals as $intervals
+        | all($intervals | to_entries[];
+          .value.sum.bits_per_second as $bps
+          | (($bps | type) == "number"
+            and ($bps > 0 or ($bps == 0 and
+              interval_entry_is_proven_partial(
+                $receiver.start.test_start.duration;
+                ($intervals | length)))))))
       and ($receiver.end.sum_received.bytes as $bytes
         | (($bytes | type) == "number" and $bytes > 0))
       and ($receiver.end.sum_received.bits_per_second as $bps
@@ -1470,6 +1570,29 @@ runner_self_test() {
   [[ "$baseline_summary_text" == \
     'BASELINE receiver: forward_mbit=9.045 reverse_mbit=26.790 forward_zero_intervals=0 reverse_zero_intervals=0' ]] || \
     die "self-test: baseline receiver speed/continuity summary mismatch"
+  jq '.start.test_start.duration = 20
+    | .server_output_json.start.test_start.duration = 20
+    | .server_output_json.intervals[0].sum.start = 0
+    | .server_output_json.intervals[0].sum.end = 20
+    | .server_output_json.intervals += [
+        {"sum":{"start":20.001,"end":20.165,"bits_per_second":0}}]' \
+    "$baseline_dir/direct-forward.json" \
+    >"$baseline_dir/direct-forward.partial-tail.json"
+  mv "$baseline_dir/direct-forward.json" \
+    "$baseline_dir/direct-forward.without-tail.json"
+  mv "$baseline_dir/direct-forward.partial-tail.json" \
+    "$baseline_dir/direct-forward.json"
+  validate_m0_baseline_pair "$baseline_dir" 43.130.32.77 || \
+    die "self-test: baseline with a zero short receiver command tail was rejected"
+  baseline_summary_text="$(baseline_receiver_summary "$baseline_dir")" || \
+    die "self-test: partial-tail baseline summary failed"
+  [[ "$baseline_summary_text" == \
+    'BASELINE receiver: forward_mbit=9.045 reverse_mbit=26.790 forward_zero_intervals=0 reverse_zero_intervals=0' ]] || \
+    die "self-test: partial-tail baseline summary counted a complete receiver stall"
+  mv "$baseline_dir/direct-forward.json" \
+    "$baseline_dir/direct-forward.partial-tail.json"
+  mv "$baseline_dir/direct-forward.without-tail.json" \
+    "$baseline_dir/direct-forward.json"
   jq '.server_output_json.intervals[0].sum.bits_per_second = 0' \
     "$baseline_dir/direct-forward.json" >"$baseline_dir/direct-forward.stalled.json"
   mv "$baseline_dir/direct-forward.json" "$baseline_dir/direct-forward.valid.json"
@@ -1819,12 +1942,20 @@ EOF_FAKE_SLEEP
   direct_dir="$tmp/direct"
   mkdir "$direct_dir"
   jq '.start.test_start.duration = 300
+    | .server_output_json.start.test_start.duration = 300
     | .server_output_json.end.sum_received.seconds = 300
     | .server_output_json.intervals = [range(0; 300) as $second
       | {"sum": {"start": $second, "end": ($second + 1),
           "bits_per_second": 1}}]' \
     "$m0_run/m0/cycle_001_tcp-forward.json" \
     >"$tmp/direct-forward-valid.json"
+  jq '.server_output_json.intervals += [
+      {"sum":{"start":300.001,"end":300.165,"bits_per_second":0}}]' \
+    "$tmp/direct-forward-valid.json" \
+    >"$tmp/direct-forward-zero-partial-tail.json"
+  validate_direct_continuity_result \
+    "$tmp/direct-forward-zero-partial-tail.json" 43.130.32.77 || \
+    die "self-test: direct continuity rejected a zero short receiver command tail"
   cp "$tmp/direct-forward-valid.json" "$direct_dir/direct-forward-300s.json"
   cat >"$direct_dir/manifest.txt" <<EOF_DIRECT_FIXTURE
 schema=knife15-macos-direct-continuity-v1
@@ -2259,6 +2390,43 @@ EOF_DIRECT_FIXTURE
   [[ "$(m0_iperf_result_failure_reason \
     "$tmp/m0-forward-receiver-stalled.json" TCP 0)" == "receiver_zero_interval" ]] || \
     die "self-test: zero forward receiver interval was not classified"
+  printf '%s\n' \
+    '{"start":{"test_start":{"protocol":"TCP","reverse":0,"duration":1}},"intervals":[{"sum":{"start":0,"end":1,"bits_per_second":1}}],"end":{"sum_sent":{"bytes":100},"sum_received":{"bytes":100,"bits_per_second":1}},"server_output_json":{"start":{"test_start":{"protocol":"TCP","reverse":0,"duration":1}},"intervals":[{"sum":{"start":0,"end":1,"bits_per_second":1}},{"sum":{"start":1.001,"end":1.165,"bits_per_second":0}}],"end":{"sum_received":{"bytes":100,"bits_per_second":1,"seconds":1.165}}}}' \
+    >"$tmp/m0-forward-zero-partial-tail.json"
+  [[ "$(m0_iperf_result_failure_reason \
+    "$tmp/m0-forward-zero-partial-tail.json" TCP 0)" == "ok" ]] || \
+    die "self-test: zero short receiver command tail was treated as a complete interval"
+  mkdir "$tmp/m0-partial-tail-envelope"
+  cp "$tmp/m0-forward-zero-partial-tail.json" \
+    "$tmp/m0-partial-tail-envelope/tcp-forward.json"
+  read -r _ _ _ _ partial_tail_invalid _ partial_tail_receiver_zero \
+    <<<"$(m0_result_envelope "$tmp/m0-partial-tail-envelope")"
+  [[ "$partial_tail_invalid" == "0" && \
+    "$partial_tail_receiver_zero" == "0" ]] || \
+    die "self-test: zero short receiver command tail polluted the result envelope"
+  jq '.server_output_json.intervals[1].sum.end = 2.001' \
+    "$tmp/m0-forward-zero-partial-tail.json" \
+    >"$tmp/m0-forward-zero-complete-window.json"
+  [[ "$(m0_iperf_result_failure_reason \
+    "$tmp/m0-forward-zero-complete-window.json" TCP 0)" == \
+    "receiver_zero_interval" ]] || \
+    die "self-test: zero complete receiver interval was hidden as a command tail"
+  jq 'del(.server_output_json.intervals[1].sum.start,
+      .server_output_json.intervals[1].sum.end)' \
+    "$tmp/m0-forward-zero-partial-tail.json" \
+    >"$tmp/m0-forward-zero-missing-timing.json"
+  [[ "$(m0_iperf_result_failure_reason \
+    "$tmp/m0-forward-zero-missing-timing.json" TCP 0)" == \
+    "receiver_zero_interval" ]] || \
+    die "self-test: zero receiver interval without timing proof did not fail closed"
+  jq '.server_output_json.intervals += [
+      {"sum":{"start":1.165,"end":2.165,"bits_per_second":1}}]' \
+    "$tmp/m0-forward-zero-partial-tail.json" \
+    >"$tmp/m0-forward-zero-nonterminal-partial.json"
+  [[ "$(m0_iperf_result_failure_reason \
+    "$tmp/m0-forward-zero-nonterminal-partial.json" TCP 0)" == \
+    "receiver_zero_interval" ]] || \
+    die "self-test: nonterminal zero receiver interval was hidden as a command tail"
   jq 'del(.server_output_json)' "$tmp/m0-forward-receiver-continuous.json" \
     >"$tmp/m0-forward-missing-receiver.json"
   [[ "$(m0_iperf_result_failure_reason \
@@ -3344,10 +3512,38 @@ run_direct_discriminator() {
     '.server_output_json.end.sum_received.bits_per_second | floor' \
     "$result_file" 2>/dev/null || echo unknown)"
   receiver_zero_intervals="$(jq -er \
-    '[.server_output_json.intervals[] | select(.sum.bits_per_second <= 0)] | length' \
+    'def interval_entry_is_proven_partial($duration; $count):
+      .key as $index
+      | .value.sum.start as $start | .value.sum.end as $end
+      | (($duration | type) == "number"
+        and $index == ($count - 1)
+        and ($start | type) == "number" and ($end | type) == "number"
+        and $start >= ($duration - 0.5) and $end >= $duration
+        and $end <= ($duration + 0.5) and $end >= $start
+        and ($end - $start) < 0.5);
+    .server_output_json.start.test_start.duration as $duration
+    | .server_output_json.intervals as $intervals
+    | [$intervals | to_entries[]
+      | select(.value.sum.bits_per_second <= 0 and
+        (interval_entry_is_proven_partial(
+          $duration; ($intervals | length)) | not))] | length' \
     "$result_file" 2>/dev/null || echo unknown)"
   sender_zero_intervals="$(jq -er \
-    '[.intervals[] | select(.sum.bits_per_second <= 0)] | length' \
+    'def interval_entry_is_proven_partial($duration; $count):
+      .key as $index
+      | .value.sum.start as $start | .value.sum.end as $end
+      | (($duration | type) == "number"
+        and $index == ($count - 1)
+        and ($start | type) == "number" and ($end | type) == "number"
+        and $start >= ($duration - 0.5) and $end >= $duration
+        and $end <= ($duration + 0.5) and $end >= $start
+        and ($end - $start) < 0.5);
+    .start.test_start.duration as $duration
+    | .intervals as $intervals
+    | [$intervals | to_entries[]
+      | select(.value.sum.bits_per_second <= 0 and
+        (interval_entry_is_proven_partial(
+          $duration; ($intervals | length)) | not))] | length' \
     "$result_file" 2>/dev/null || echo unknown)"
   cat >"$out_dir/manifest.txt" <<EOF_DIRECT_MANIFEST
 schema=knife15-macos-direct-continuity-v1
