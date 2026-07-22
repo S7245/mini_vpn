@@ -1897,14 +1897,18 @@ impl Drop for TuicNativeTcpReader {
 }
 
 struct TuicNativeTcpWriter {
-    send: quinn::SendStream,
+    send: TcpWritePressureAdapter<quinn::SendStream>,
     _lease: TcpPoolSlotLease,
 }
 
 impl TuicNativeTcpWriter {
-    fn new(send: quinn::SendStream, lease: TcpPoolSlotLease) -> Self {
+    fn new(
+        send: quinn::SendStream,
+        lease: TcpPoolSlotLease,
+        pressure: TcpWritePressureWriter,
+    ) -> Self {
         Self {
-            send,
+            send: TcpWritePressureAdapter::new(send, pressure),
             _lease: lease,
         }
     }
@@ -1916,15 +1920,15 @@ impl AsyncWrite for TuicNativeTcpWriter {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        <quinn::SendStream as AsyncWrite>::poll_write(Pin::new(&mut self.send), cx, buf)
+        Pin::new(&mut self.send).poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        <quinn::SendStream as AsyncWrite>::poll_flush(Pin::new(&mut self.send), cx)
+        Pin::new(&mut self.send).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        <quinn::SendStream as AsyncWrite>::poll_shutdown(Pin::new(&mut self.send), cx)
+        Pin::new(&mut self.send).poll_shutdown(cx)
     }
 }
 
@@ -3509,12 +3513,214 @@ fn endpoint_recovery_stall_bound(max_rtt: Duration) -> Duration {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpWritePressureSnapshot {
+    episode: u64,
+    pending_for: Duration,
+}
+
+const TCP_WRITE_PRESSURE_COUNT_MASK: u64 = u32::MAX as u64;
+const TCP_WRITE_PRESSURE_EPISODE_SHIFT: u32 = u32::BITS;
+
+/// Per-QUIC-connection ownership for TCP writers currently blocked in `poll_write`.
+/// The packed state makes the zero-to-one episode edge and writer count one atomic transition;
+/// timestamp metadata is tagged with that episode so a late release cannot clear a new episode.
+struct TcpWritePressure {
+    origin: Instant,
+    state: AtomicU64,
+    pending_since_micros: AtomicU64,
+    pending_since_episode: AtomicU64,
+}
+
+impl TcpWritePressure {
+    fn new(origin: Instant) -> Self {
+        Self {
+            origin,
+            state: AtomicU64::new(0),
+            pending_since_micros: AtomicU64::new(0),
+            pending_since_episode: AtomicU64::new(0),
+        }
+    }
+
+    fn writer(self: &Arc<Self>) -> TcpWritePressureWriter {
+        TcpWritePressureWriter {
+            pressure: self.clone(),
+            pending_episode: None,
+        }
+    }
+
+    fn elapsed_micros_at(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.origin)
+            .as_micros()
+            .min(u64::MAX as u128) as u64
+    }
+
+    fn begin_pending(&self, now: Instant) -> u32 {
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            let count = current as u32;
+            let current_episode = (current >> TCP_WRITE_PRESSURE_EPISODE_SHIFT) as u32;
+            let starts_episode = count == 0;
+            let episode = if starts_episode {
+                current_episode.wrapping_add(1).max(1)
+            } else {
+                current_episode
+            };
+            let next_count = count.saturating_add(1);
+            let next = ((episode as u64) << TCP_WRITE_PRESSURE_EPISODE_SHIFT) | (next_count as u64);
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if starts_episode {
+                        self.pending_since_micros
+                            .store(self.elapsed_micros_at(now), Ordering::Relaxed);
+                        self.pending_since_episode
+                            .store(episode as u64, Ordering::Release);
+                    }
+                    return episode;
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn end_pending(&self, episode: u32) {
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            let count = current as u32;
+            let current_episode = (current >> TCP_WRITE_PRESSURE_EPISODE_SHIFT) as u32;
+            if count == 0 || current_episode != episode {
+                return;
+            }
+            let next =
+                ((episode as u64) << TCP_WRITE_PRESSURE_EPISODE_SHIFT) | ((count - 1) as u64);
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if count == 1 {
+                        let _ = self.pending_since_episode.compare_exchange(
+                            episode as u64,
+                            0,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                    }
+                    return;
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn snapshot_at(&self, now: Instant) -> Option<TcpWritePressureSnapshot> {
+        let state = self.state.load(Ordering::Acquire);
+        let count = state & TCP_WRITE_PRESSURE_COUNT_MASK;
+        if count == 0 {
+            return None;
+        }
+        let episode = state >> TCP_WRITE_PRESSURE_EPISODE_SHIFT;
+        if self.pending_since_episode.load(Ordering::Acquire) != episode {
+            return None;
+        }
+        let pending_since = self.pending_since_micros.load(Ordering::Relaxed);
+        if self.state.load(Ordering::Acquire) != state {
+            return None;
+        }
+        Some(TcpWritePressureSnapshot {
+            episode,
+            pending_for: Duration::from_micros(
+                self.elapsed_micros_at(now).saturating_sub(pending_since),
+            ),
+        })
+    }
+}
+
+struct TcpWritePressureWriter {
+    pressure: Arc<TcpWritePressure>,
+    pending_episode: Option<u32>,
+}
+
+impl TcpWritePressureWriter {
+    fn note_pending_at(&mut self, now: Instant) {
+        if self.pending_episode.is_none() {
+            self.pending_episode = Some(self.pressure.begin_pending(now));
+        }
+    }
+
+    fn note_ready(&mut self) {
+        if let Some(episode) = self.pending_episode.take() {
+            self.pressure.end_pending(episode);
+        }
+    }
+}
+
+impl Drop for TcpWritePressureWriter {
+    fn drop(&mut self) {
+        self.note_ready();
+    }
+}
+
+struct TcpWritePressureAdapter<W> {
+    inner: W,
+    pressure: TcpWritePressureWriter,
+}
+
+impl<W> TcpWritePressureAdapter<W> {
+    fn new(inner: W, pressure: TcpWritePressureWriter) -> Self {
+        Self { inner, pressure }
+    }
+}
+
+impl<W: AsyncRead + Unpin> AsyncRead for TcpWritePressureAdapter<W> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for TcpWritePressureAdapter<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if result.is_pending() {
+            self.pressure.note_pending_at(Instant::now());
+        } else {
+            self.pressure.note_ready();
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.pressure.note_ready();
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EndpointRecoveryConnectionSample {
     stable_id: usize,
     tx_bytes: u64,
     rx_bytes: u64,
     rtt: Duration,
     current_socket_rx_rebind_generation: u64,
+    tcp_write_pressure: Option<TcpWritePressureSnapshot>,
 }
 
 #[derive(Debug)]
@@ -3526,10 +3732,33 @@ struct EndpointRecoveryInput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointRecoveryTrigger {
+    NoRx,
+    TcpWriteStall { stable_id: usize, episode: u64 },
+}
+
+impl EndpointRecoveryTrigger {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NoRx => "no_rx",
+            Self::TcpWriteStall { .. } => "tcp_write_stall",
+        }
+    }
+
+    fn tcp_write_fields(self) -> (usize, u64) {
+        match self {
+            Self::NoRx => (0, 0),
+            Self::TcpWriteStall { stable_id, episode } => (stable_id, episode),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EndpointRecoveryAction {
     None,
     Rebind {
         generation: u64,
+        trigger: EndpointRecoveryTrigger,
         stalled_for: Duration,
         stall_bound: Duration,
         tx_bytes_since_rx: u64,
@@ -3554,15 +3783,60 @@ struct EndpointRecoveryState {
     connections: HashMap<usize, EndpointRecoveryCounters>,
     armed_at: Option<Instant>,
     tx_bytes_since_rx: u64,
-    rebound_without_rx: bool,
+    rebind_issued: bool,
     rebind_generation: u64,
     rebound_at: Option<Instant>,
     expected_socket_generation: Option<u64>,
     pending_recovery_connections: HashSet<usize>,
     expected_recovery_connection_count: usize,
+    covered_tcp_write_episodes: HashMap<usize, u64>,
 }
 
 impl EndpointRecoveryState {
+    fn cover_tcp_write_episodes(&mut self, input: &EndpointRecoveryInput) {
+        for sample in &input.connections {
+            if let Some(pressure) = sample.tcp_write_pressure {
+                self.covered_tcp_write_episodes
+                    .insert(sample.stable_id, pressure.episode);
+            }
+        }
+    }
+
+    fn eligible_tcp_write_stall(
+        &self,
+        input: &EndpointRecoveryInput,
+        stall_bound: Duration,
+    ) -> Option<(usize, TcpWritePressureSnapshot)> {
+        input.connections.iter().find_map(|sample| {
+            let pressure = sample.tcp_write_pressure?;
+            (pressure.pending_for >= stall_bound
+                && self.covered_tcp_write_episodes.get(&sample.stable_id)
+                    != Some(&pressure.episode))
+            .then_some((sample.stable_id, pressure))
+        })
+    }
+
+    fn begin_rebind(
+        &mut self,
+        input: &EndpointRecoveryInput,
+        trigger: EndpointRecoveryTrigger,
+        stalled_for: Duration,
+        stall_bound: Duration,
+        max_rtt: Duration,
+    ) -> EndpointRecoveryAction {
+        self.cover_tcp_write_episodes(input);
+        self.rebind_generation = self.rebind_generation.saturating_add(1);
+        self.rebind_issued = true;
+        EndpointRecoveryAction::Rebind {
+            generation: self.rebind_generation,
+            trigger,
+            stalled_for,
+            stall_bound,
+            tx_bytes_since_rx: self.tx_bytes_since_rx,
+            max_rtt,
+        }
+    }
+
     fn observe(&mut self, now: Instant, input: &EndpointRecoveryInput) -> EndpointRecoveryAction {
         let mut next = HashMap::with_capacity(input.connections.len());
         let mut tx_progress = 0u64;
@@ -3589,6 +3863,15 @@ impl EndpointRecoveryState {
             );
         }
         self.connections = next;
+        self.covered_tcp_write_episodes
+            .retain(|stable_id, episode| {
+                input.connections.iter().any(|sample| {
+                    sample.stable_id == *stable_id
+                        && sample
+                            .tcp_write_pressure
+                            .is_some_and(|pressure| pressure.episode == *episode)
+                })
+            });
 
         if let Some(expected_generation) = self.expected_socket_generation {
             for sample in &input.connections {
@@ -3623,6 +3906,28 @@ impl EndpointRecoveryState {
             return EndpointRecoveryAction::None;
         }
 
+        let active_workload = input.active_tcp > 0 || input.udp_active;
+        if !active_workload || input.connections.is_empty() {
+            self.clear_episode();
+            return EndpointRecoveryAction::None;
+        }
+
+        let stall_bound = endpoint_recovery_stall_bound(max_rtt);
+        if let Some((stable_id, pressure)) = self.eligible_tcp_write_stall(input, stall_bound)
+            && !self.rebind_issued
+        {
+            return self.begin_rebind(
+                input,
+                EndpointRecoveryTrigger::TcpWriteStall {
+                    stable_id,
+                    episode: pressure.episode,
+                },
+                pressure.pending_for,
+                stall_bound,
+                max_rtt,
+            );
+        }
+
         if rx_progress {
             if self.expected_socket_generation.is_some() {
                 return EndpointRecoveryAction::None;
@@ -3640,12 +3945,6 @@ impl EndpointRecoveryState {
             return recovered.unwrap_or(EndpointRecoveryAction::None);
         }
 
-        let active_workload = input.active_tcp > 0 || input.udp_active;
-        if !active_workload || input.connections.is_empty() {
-            self.clear_episode();
-            return EndpointRecoveryAction::None;
-        }
-
         if tx_progress > 0 {
             self.armed_at.get_or_insert(now);
             self.tx_bytes_since_rx = self.tx_bytes_since_rx.saturating_add(tx_progress);
@@ -3654,29 +3953,26 @@ impl EndpointRecoveryState {
         let Some(armed_at) = self.armed_at else {
             return EndpointRecoveryAction::None;
         };
-        if self.rebound_without_rx {
+        if self.rebind_issued {
             return EndpointRecoveryAction::None;
         }
 
-        let stall_bound = endpoint_recovery_stall_bound(max_rtt);
         let stalled_for = now.saturating_duration_since(armed_at);
         if stalled_for < stall_bound {
             return EndpointRecoveryAction::None;
         }
 
-        self.rebind_generation = self.rebind_generation.saturating_add(1);
-        self.rebound_without_rx = true;
-        EndpointRecoveryAction::Rebind {
-            generation: self.rebind_generation,
+        self.begin_rebind(
+            input,
+            EndpointRecoveryTrigger::NoRx,
             stalled_for,
             stall_bound,
-            tx_bytes_since_rx: self.tx_bytes_since_rx,
             max_rtt,
-        }
+        )
     }
 
     fn note_rebind_succeeded(&mut self, now: Instant, socket_generation: u64) {
-        if self.rebound_without_rx {
+        if self.rebind_issued {
             self.rebound_at = Some(now);
             self.expected_socket_generation = Some(socket_generation);
             self.pending_recovery_connections = self.connections.keys().copied().collect();
@@ -3687,7 +3983,7 @@ impl EndpointRecoveryState {
     fn clear_episode(&mut self) {
         self.armed_at = None;
         self.tx_bytes_since_rx = 0;
-        self.rebound_without_rx = false;
+        self.rebind_issued = false;
         self.rebound_at = None;
         self.expected_socket_generation = None;
         self.pending_recovery_connections.clear();
@@ -3739,6 +4035,9 @@ pub struct TuicUpstream {
     /// Active or opening TCP relay count per pool slot. Stale reconnect is only safe when a slot is
     /// idle; closing an active QUIC connection would cut every stream multiplexed on that slot.
     tcp_pool_selector: TcpPoolLeaseSelector,
+    /// Per-slot continuous TCP `poll_write -> Pending` ownership. Endpoint recovery samples this
+    /// independently from UDP RX so ACK/control traffic cannot hide a blocked business stream.
+    tcp_write_pressures: Vec<Arc<TcpWritePressure>>,
     /// 上行 UDP datagram 丢弃计数（连接不可用 / stream 兜底也失败）。可观测性，不影响 UDP 语义。
     udp_drops: AtomicU64,
     /// 上行走 uni-stream 兜底（超 datagram 上限）的次数。可观测性：判断 MTU 调优是否够、兜底是否热。
@@ -3921,6 +4220,10 @@ impl TuicUpstream {
         }
         let tcp_open_states = (0..tcp_pool).map(|_| TcpPoolOpenState::new()).collect();
         let tcp_pool_selector = TcpPoolLeaseSelector::new(tcp_pool);
+        let clock = std::time::Instant::now();
+        let tcp_write_pressures = (0..tcp_pool)
+            .map(|_| Arc::new(TcpWritePressure::new(clock)))
+            .collect();
         Ok(Self {
             endpoint,
             udp_send_service_policy: udp_send_service,
@@ -3934,10 +4237,11 @@ impl TuicUpstream {
             tcp_open_states,
             tcp_startup_auth_attempts,
             tcp_pool_selector,
+            tcp_write_pressures,
             udp_drops: AtomicU64::new(0),
             udp_stream_fallbacks: AtomicU64::new(0),
             last_udp_activity: AtomicU64::new(0),
-            clock: std::time::Instant::now(),
+            clock,
             zero_rtt: cfg.zero_rtt,
             quic_stats_secs: cfg.quic_stats_secs,
             quic_stats_stop,
@@ -4500,11 +4804,13 @@ impl TuicUpstream {
                     }
                     EndpointRecoveryAction::Rebind {
                         generation,
+                        trigger,
                         stalled_for,
                         stall_bound,
                         tx_bytes_since_rx,
                         max_rtt,
                     } => {
+                        let (write_conn, write_episode) = trigger.tcp_write_fields();
                         match quic::rebind_client_endpoint_udp_socket(
                             &upstream.endpoint,
                             upstream.udp_send_service_policy,
@@ -4513,7 +4819,10 @@ impl TuicUpstream {
                             Ok(rebound) => {
                                 state.note_rebind_succeeded(now, rebound.rebind_generation);
                                 println!(
-                                    "🔄 tuic-endpoint-rebind generation={generation} old_local={} new_local={} socket_generation={} active_tcp={} udp_active={} live_connections={} stalled_ms={} bound_ms={} tx_since_rx={}B max_rtt_ms={}",
+                                    "🔄 tuic-endpoint-rebind generation={generation} trigger={} write_conn={} write_episode={} old_local={} new_local={} socket_generation={} active_tcp={} udp_active={} live_connections={} stalled_ms={} bound_ms={} tx_since_rx={}B max_rtt_ms={}",
+                                    trigger.label(),
+                                    write_conn,
+                                    write_episode,
                                     rebound.old_local_addr,
                                     rebound.new_local_addr,
                                     rebound.rebind_generation,
@@ -4528,7 +4837,10 @@ impl TuicUpstream {
                             }
                             Err(error) => {
                                 println!(
-                                    "⚠️ tuic-endpoint-rebind-failed generation={generation} active_tcp={} udp_active={} live_connections={} stalled_ms={} bound_ms={} tx_since_rx={}B max_rtt_ms={} error={error}",
+                                    "⚠️ tuic-endpoint-rebind-failed generation={generation} trigger={} write_conn={} write_episode={} active_tcp={} udp_active={} live_connections={} stalled_ms={} bound_ms={} tx_since_rx={}B max_rtt_ms={} error={error}",
+                                    trigger.label(),
+                                    write_conn,
+                                    write_episode,
                                     input.active_tcp,
                                     input.udp_active,
                                     input.connections.len(),
@@ -4547,7 +4859,8 @@ impl TuicUpstream {
 
     fn endpoint_recovery_input(&self) -> Option<EndpointRecoveryInput> {
         let mut connections = Vec::with_capacity(self.conns.len());
-        for slot in &self.conns {
+        let sampled_at = Instant::now();
+        for (index, slot) in self.conns.iter().enumerate() {
             let conn = slot.try_lock().ok()?;
             if conn.close_reason().is_some() {
                 continue;
@@ -4559,6 +4872,10 @@ impl TuicUpstream {
                 rx_bytes: stats.udp_rx.bytes,
                 rtt: stats.path.rtt,
                 current_socket_rx_rebind_generation: conn.current_socket_rx_rebind_generation(),
+                tcp_write_pressure: self
+                    .tcp_write_pressures
+                    .get(index)
+                    .and_then(|pressure| pressure.snapshot_at(sampled_at)),
             });
         }
         let active_tcp = self.tcp_pool_selector.active_total();
@@ -4672,22 +4989,35 @@ impl ProxyUpstream for TuicUpstream {
             let tcp_stream_diag = diag_meta
                 .clone()
                 .map(|meta| TuicTcpStreamDiag::new(meta, Instant::now()));
+            let write_pressure = self
+                .tcp_write_pressures
+                .get(conn_index)
+                .ok_or_else(|| io_err("tuic TCP write pressure", "pool slot tracker missing"))?;
             let relay: RelayStream = match relay_mode {
                 TuicTcpRelayMode::OrderedJoin => Box::new(TrackedRelayStream::new_with_transport(
-                    tokio::io::join(recv, send),
+                    TcpWritePressureAdapter::new(
+                        tokio::io::join(recv, send),
+                        write_pressure.writer(),
+                    ),
                     lease,
                     tcp_stream_diag,
                     conn.clone(),
                 )),
                 TuicTcpRelayMode::OrderedChunk => Box::new(TrackedRelayStream::new_with_transport(
-                    TuicOrderedRelayStream::from_quinn(recv, send),
+                    TcpWritePressureAdapter::new(
+                        TuicOrderedRelayStream::from_quinn(recv, send),
+                        write_pressure.writer(),
+                    ),
                     lease,
                     tcp_stream_diag,
                     conn.clone(),
                 )),
                 TuicTcpRelayMode::UnorderedReassembly => {
                     Box::new(TrackedRelayStream::new_with_transport(
-                        TuicChunkRelayStream::new(recv, send, diag_meta),
+                        TcpWritePressureAdapter::new(
+                            TuicChunkRelayStream::new(recv, send, diag_meta),
+                            write_pressure.writer(),
+                        ),
                         lease,
                         tcp_stream_diag,
                         conn.clone(),
@@ -4794,6 +5124,10 @@ impl ProxyUpstream for TuicUpstream {
             let tcp_stream_diag = diag_meta
                 .clone()
                 .map(|meta| TuicTcpStreamDiag::new(meta, Instant::now()));
+            let write_pressure = self
+                .tcp_write_pressures
+                .get(conn_index)
+                .ok_or_else(|| io_err("tuic TCP write pressure", "pool slot tracker missing"))?;
             let reader: NativeTcpReadHalf = if d16_byte_owned {
                 Box::new(TuicNativeOrderedReader::new(
                     recv,
@@ -4816,7 +5150,11 @@ impl ProxyUpstream for TuicUpstream {
                     conn.clone(),
                 ))
             };
-            let writer = Box::new(TuicNativeTcpWriter::new(send, lease));
+            let writer = Box::new(TuicNativeTcpWriter::new(
+                send,
+                lease,
+                write_pressure.writer(),
+            ));
             let relay = NativeTcpRelayStream { reader, writer };
             Ok::<OpenedTcpRelay, ClientError>(if d16_byte_owned {
                 OpenedTcpRelay::NativeByteOwned(relay)
@@ -4916,6 +5254,223 @@ mod tests {
     use super::*;
     use crate::shared::TargetAddr;
     use crate::tcp_downlink_pump::{AsyncLeasedByteFlowQueue, DownstreamPermitReleaseMode};
+    use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn endpoint_recovery_rebinds_on_continuous_tcp_write_stall_despite_rx_progress() {
+        let started = Instant::now();
+        let rtt = Duration::from_millis(159);
+        let mut state = EndpointRecoveryState::default();
+        let sample = |rx_bytes, pending_for| EndpointRecoveryInput {
+            active_tcp: 2,
+            udp_active: false,
+            current_socket_rx_rebind_generation: 0,
+            connections: vec![EndpointRecoveryConnectionSample {
+                stable_id: 11,
+                tx_bytes: 100_000,
+                rx_bytes,
+                rtt,
+                current_socket_rx_rebind_generation: 0,
+                tcp_write_pressure: Some(TcpWritePressureSnapshot {
+                    episode: 7,
+                    pending_for,
+                }),
+            }],
+        };
+
+        assert_eq!(
+            state.observe(started, &sample(1_000, Duration::ZERO)),
+            EndpointRecoveryAction::None
+        );
+        let bound = endpoint_recovery_stall_bound(rtt);
+        let action = state.observe(started + bound, &sample(2_000, bound));
+        assert!(
+            matches!(
+                action,
+                EndpointRecoveryAction::Rebind {
+                    trigger: EndpointRecoveryTrigger::TcpWriteStall {
+                        stable_id: 11,
+                        episode: 7,
+                    },
+                    ..
+                }
+            ),
+            "continuous business-stream write pressure must survive unrelated/ACK RX: {action:?}"
+        );
+    }
+
+    #[test]
+    fn endpoint_recovery_one_rebind_covers_every_current_tcp_write_episode() {
+        let started = Instant::now();
+        let bound = Duration::from_secs(2);
+        let mut state = EndpointRecoveryState::default();
+        let sample = |socket_generation| EndpointRecoveryInput {
+            active_tcp: 2,
+            udp_active: false,
+            current_socket_rx_rebind_generation: socket_generation,
+            connections: vec![
+                EndpointRecoveryConnectionSample {
+                    stable_id: 11,
+                    tx_bytes: 100_000,
+                    rx_bytes: 1_000 + socket_generation,
+                    rtt: Duration::from_millis(100),
+                    current_socket_rx_rebind_generation: socket_generation,
+                    tcp_write_pressure: Some(TcpWritePressureSnapshot {
+                        episode: 7,
+                        pending_for: bound,
+                    }),
+                },
+                EndpointRecoveryConnectionSample {
+                    stable_id: 12,
+                    tx_bytes: 200_000,
+                    rx_bytes: 2_000 + socket_generation,
+                    rtt: Duration::from_millis(150),
+                    current_socket_rx_rebind_generation: socket_generation,
+                    tcp_write_pressure: Some(TcpWritePressureSnapshot {
+                        episode: 9,
+                        pending_for: bound,
+                    }),
+                },
+            ],
+        };
+
+        let action = state.observe(started, &sample(0));
+        assert!(matches!(action, EndpointRecoveryAction::Rebind { .. }));
+        state.note_rebind_succeeded(started, 1);
+        assert!(matches!(
+            state.observe(started + Duration::from_millis(250), &sample(1)),
+            EndpointRecoveryAction::Recovered { .. }
+        ));
+        assert_eq!(
+            state.observe(started + Duration::from_millis(500), &sample(1)),
+            EndpointRecoveryAction::None,
+            "one Endpoint migration must cover every write episode already pending at rebind time"
+        );
+
+        let cleared = EndpointRecoveryInput {
+            active_tcp: 2,
+            udp_active: false,
+            current_socket_rx_rebind_generation: 1,
+            connections: sample(1)
+                .connections
+                .into_iter()
+                .map(|mut connection| {
+                    connection.tcp_write_pressure = None;
+                    connection
+                })
+                .collect(),
+        };
+        assert_eq!(
+            state.observe(started + Duration::from_millis(750), &cleared),
+            EndpointRecoveryAction::None
+        );
+        let mut next_episode = sample(1);
+        next_episode.connections[0].tcp_write_pressure = None;
+        next_episode.connections[1].tcp_write_pressure = Some(TcpWritePressureSnapshot {
+            episode: 10,
+            pending_for: bound,
+        });
+        assert!(matches!(
+            state.observe(started + Duration::from_secs(3), &next_episode),
+            EndpointRecoveryAction::Rebind {
+                generation: 2,
+                trigger: EndpointRecoveryTrigger::TcpWriteStall {
+                    stable_id: 12,
+                    episode: 10,
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tcp_write_pressure_owns_one_episode_until_every_pending_writer_clears() {
+        let started = Instant::now();
+        let pressure = Arc::new(TcpWritePressure::new(started));
+        let mut first = pressure.writer();
+        let mut second = pressure.writer();
+
+        first.note_pending_at(started);
+        let first_snapshot = pressure
+            .snapshot_at(started + Duration::from_secs(1))
+            .expect("first pending writer starts an episode");
+        assert_eq!(first_snapshot.episode, 1);
+        assert_eq!(first_snapshot.pending_for, Duration::from_secs(1));
+
+        second.note_pending_at(started + Duration::from_millis(500));
+        first.note_ready();
+        assert_eq!(
+            pressure
+                .snapshot_at(started + Duration::from_secs(2))
+                .expect("second writer still owns the shared episode"),
+            TcpWritePressureSnapshot {
+                episode: 1,
+                pending_for: Duration::from_secs(2),
+            }
+        );
+
+        drop(second);
+        assert_eq!(pressure.snapshot_at(started + Duration::from_secs(2)), None);
+
+        let mut third = pressure.writer();
+        third.note_pending_at(started + Duration::from_secs(3));
+        assert_eq!(
+            pressure.snapshot_at(started + Duration::from_secs(4)),
+            Some(TcpWritePressureSnapshot {
+                episode: 2,
+                pending_for: Duration::from_secs(1),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_write_pressure_adapter_tracks_async_write_pending_edges() {
+        struct GateWriter {
+            ready: Arc<AtomicBool>,
+        }
+
+        impl AsyncWrite for GateWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                if self.ready.load(Ordering::Acquire) {
+                    Poll::Ready(Ok(buf.len()))
+                } else {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let pressure = Arc::new(TcpWritePressure::new(Instant::now()));
+        let ready = Arc::new(AtomicBool::new(false));
+        let mut writer = TcpWritePressureAdapter::new(
+            GateWriter {
+                ready: ready.clone(),
+            },
+            pressure.writer(),
+        );
+        let write = tokio::spawn(async move { writer.write_all(b"pending").await });
+        tokio::task::yield_now().await;
+        assert!(
+            pressure.snapshot_at(Instant::now()).is_some(),
+            "a real AsyncWrite Pending edge must arm connection pressure"
+        );
+
+        ready.store(true, Ordering::Release);
+        write.await.expect("writer task").expect("write completes");
+        assert_eq!(pressure.snapshot_at(Instant::now()), None);
+    }
 
     #[test]
     fn endpoint_recovery_rebinds_once_after_active_tx_without_rx() {
@@ -4933,6 +5488,7 @@ mod tests {
                 rx_bytes: 1_000,
                 rtt,
                 current_socket_rx_rebind_generation: 0,
+                tcp_write_pressure: None,
             }],
         };
 
@@ -4974,6 +5530,7 @@ mod tests {
                 rx_bytes,
                 rtt: Duration::from_millis(100),
                 current_socket_rx_rebind_generation: 0,
+                tcp_write_pressure: None,
             }],
         };
 
@@ -5024,6 +5581,7 @@ mod tests {
                         rx_bytes: first_rx,
                         rtt: Duration::from_millis(100),
                         current_socket_rx_rebind_generation: first_socket_rx_generation,
+                        tcp_write_pressure: None,
                     },
                     EndpointRecoveryConnectionSample {
                         stable_id: 12,
@@ -5031,6 +5589,7 @@ mod tests {
                         rx_bytes: second_rx,
                         rtt: Duration::from_millis(150),
                         current_socket_rx_rebind_generation: second_socket_rx_generation,
+                        tcp_write_pressure: None,
                     },
                 ],
             }
@@ -5127,6 +5686,7 @@ mod tests {
                 rx_bytes: 100,
                 rtt: Duration::from_millis(100),
                 current_socket_rx_rebind_generation: 0,
+                tcp_write_pressure: None,
             }],
         };
 

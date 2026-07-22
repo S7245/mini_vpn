@@ -1,5 +1,19 @@
 # Errors
 
+## 2026-07-22 - ACK traffic hid a saturated business-stream send window
+
+- The exact HK M1 reached cycle 2 forward before a complete Target receiver
+  second went empty. Its sender paused for most of 18 seconds and the matching
+  D16 writer waited `11.280s`, while QUIC loss/congestion rose sharply.
+- Endpoint-wide receive counters still advanced through ACK/control traffic,
+  so the accepted TX-without-RX detector remained disarmed and never requested
+  socket recovery. Shared transport liveness was incorrectly treated as proof
+  of business-stream write progress.
+- The repair observes continuous per-connection writer `Pending` ownership as
+  a separate bounded episode and reuses the existing socket rebind/recovery
+  path. Reusable rule: aggregate liveness cannot discharge a narrower blocked
+  ownership invariant.
+
 ## 2026-07-21 - Endpoint routing was initially mistaken for authenticated recovery
 
 - The first multi-connection repair removed a pending handle as soon as the

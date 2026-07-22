@@ -1,10 +1,36 @@
 # TODO
 
-## Current Knife15 Plan (2026-07-21)
+## Current Knife15 Plan (2026-07-22)
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-07-21)
+#### Latest decision (2026-07-22)
+
+Exact-source `b33a3f6` HK bundle
+`/tmp/mini_vpn_knife15_macos_20260722_075828.tar.gz` (SHA-256 `f8b5b2ea...`)
+was operated correctly and passed fresh baseline/direct, start/smoke, and M1
+cycle 1. Cycle 2 forward failed one complete Target receiver second while its
+sender stopped for most of an 18-second span. Conn1 accumulated `356` QUIC
+lost packets, `480,190B` loss, `112` congestion events, and an
+`11,279,769us` D16 writer wait. ACK/control RX continued, so the old no-RX
+Endpoint monitor did not trigger.
+
+The local repair adds per-pool continuous TCP `poll_write -> Pending`
+ownership and feeds it into the existing recovery state machine. An episode
+at the unchanged RTT bound can request one Endpoint rebind despite RX progress;
+the rebind covers all then-current pool episodes and retains the accepted
+authenticated set-wise current-generation recovery. Full local gates pass:
+root `650+3 ignored`, main `2`, TUIC `100`, Quinn/proto docs and tests,
+release/Clippy/shell/fmt/diff/secret, and 32 MiB at `240.585 Mbit/s` with exact
+conservation. Review has no unresolved P0/P1; no frozen value changed. Result:
+`docs/tech/2026-07-22-knife15-m1-tcp-write-stall-rebind-local-results.md`.
+
+Next run one fresh user-operated HK M1 from the pushed repair with rebuilt
+release and fresh baseline/direct. Keep every other VPN/TUN disabled through
+`stop` and preserve `status/snapshot/stop` on failure. Do not repeat unchanged,
+tune frozen constants, or waive strict SLIs. M2/M3 remain blocked.
+
+#### Previous decision (2026-07-21)
 
 Exact-source `1c587ba` HK bundle
 `/tmp/mini_vpn_knife15_macos_20260721_110225.tar.gz` (SHA-256 `62280ba0...`)

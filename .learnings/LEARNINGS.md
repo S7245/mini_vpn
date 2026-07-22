@@ -1,5 +1,21 @@
 # Learnings
 
+## 2026-07-22 - Business write pressure is independent recovery evidence
+
+- Endpoint RX liveness is insufficient when ACK/control packets keep arriving
+  but a business QUIC stream cannot accept another byte. Observe the exact
+  ownership boundary that blocks application progress, not only shared socket
+  activity.
+- A useful recovery signal needs episode semantics: zero-to-one starts it,
+  every pending writer shares it, the last release ends it, and one Endpoint
+  action covers all pool episodes present at that instant. This prevents both
+  missed recovery and cross-connection rebind loops.
+- Capacity math tied the `32 MiB` send window (`~12.177s` at the offered rate)
+  to the observed `11.280s` writer wait. That falsifiable match justified a
+  discriminator repair without changing windows, pacing, or workload values.
+- Result:
+  `docs/tech/2026-07-22-knife15-m1-tcp-write-stall-rebind-local-results.md`.
+
 ## 2026-07-21 - Shared Endpoint recovery proof must be set-wise and authenticated
 
 - One current-socket packet proves only the connection that authenticated it.

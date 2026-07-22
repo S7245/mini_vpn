@@ -2,9 +2,36 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 Release Readiness (2026-07-21)
+## Next Planned Stage — Knife15 Release Readiness (2026-07-22)
 
-- **Latest accepted position:** exact-source `1c587ba` HK M1 bundle
+- **Latest accepted position:** exact-source `b33a3f6` HK M1 bundle
+  `/tmp/mini_vpn_knife15_macos_20260722_075828.tar.gz` (SHA-256
+  `f8b5b2ea...`) was operated correctly. Fresh baseline/direct, start/smoke,
+  and cycle 1 passed; cycle 2 forward then contained one complete Target
+  receiver-zero interval at `151.001053s -> 152.001047s`.
+- The sender paused for most of `149s -> 167s`. Conn1 added `356` QUIC lost
+  packets, `480,190B` lost bytes, and `112` congestion events; cwnd fell to
+  `208,427B`. Its D16 writer blocked for `11,279,769us`. The frozen `32 MiB`
+  send window represents about `12.177s` at the `22.042647 Mbit/s` offer, so
+  the evidence is capacity-consistent with unacknowledged-data saturation.
+  ACK/control RX continued and hid the failure from the old no-RX monitor.
+- TUIC now tracks lock-free continuous `poll_write -> Pending` ownership per
+  pool connection. The existing recovery monitor rebinds once when an episode
+  reaches the unchanged RTT-derived bound even if RX progresses, and one
+  rebind covers every then-pending episode. Ready/error/drop clears ownership;
+  a cleared/new episode may rearm. Existing no-RX and authenticated set-wise
+  current-generation recovery remain unchanged.
+- Root `650+3 ignored`, main `2`, TUIC `100`, Quinn `36+3 ignored + doc 1`,
+  quinn-proto `309 + doc 3`, release, Clippy, shell, fmt/diff, and secret gates
+  pass. The 32 MiB gate reached `240.585 Mbit/s` with exact conservation. Code
+  review has no unresolved P0/P1 and no frozen value changed. Result:
+  `docs/tech/2026-07-22-knife15-m1-tcp-write-stall-rebind-local-results.md`.
+- This partial run is not M1 acceptance. Next take one fresh user-run HK M1
+  from the pushed repair with a rebuilt release and fresh baseline/direct.
+  Keep every other VPN/TUN off through `stop`; on failure preserve
+  `status/snapshot/stop`. M2/M3 remain blocked.
+
+- **Previous accepted position:** exact-source `1c587ba` HK M1 bundle
   `/tmp/mini_vpn_knife15_macos_20260721_110225.tar.gz` (SHA-256
   `62280ba0...`) was operated correctly, passed fresh baseline/direct, then
   failed after about 6h43m in cycle 28 `steady-c/short-reverse-6`. The local

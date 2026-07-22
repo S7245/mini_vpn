@@ -187,7 +187,31 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-07-21:
+Current Knife15 summary, as of 2026-07-22:
+
+- Exact-source `b33a3f6` HK M1 bundle
+  `/tmp/mini_vpn_knife15_macos_20260722_075828.tar.gz` (SHA-256
+  `f8b5b2ea...`) was operated correctly. Fresh baseline/direct, start/smoke,
+  and cycle 1 passed; cycle 2 forward failed one complete Target receiver
+  interval at `151.001053s -> 152.001047s`.
+- The sender paused for most of `149s -> 167s`. Conn1 added `356` lost packets,
+  `480,190B` lost bytes, and `112` congestion events; its D16 writer blocked
+  for `11,279,769us`. ACK/control RX continued, so the old Endpoint-wide no-RX
+  recovery discriminator did not arm.
+- TUIC now tracks continuous `poll_write -> Pending` ownership per TCP pool
+  connection. At the unchanged RTT-derived bound, it triggers the existing
+  socket rebind despite unrelated RX; one rebind covers every pending pool
+  episode. Ready/error/drop clears ownership, and existing no-RX plus
+  authenticated set-wise current-generation recovery remain intact.
+- Root `650+3 ignored`, main `2`, TUIC `100`, Quinn `36+3 ignored + doc 1`,
+  quinn-proto `309 + doc 3`, release, Clippy, shell, fmt/diff, secret, and
+  code-review gates pass. The 32 MiB gate reached `240.585 Mbit/s` with exact
+  conservation. No frozen value changed and no P0/P1 remains. Result:
+  `docs/tech/2026-07-22-knife15-m1-tcp-write-stall-rebind-local-results.md`.
+- The failed partial run is not M1 acceptance. Next use the pushed repair for
+  one fresh user-run HK M1 with rebuilt release and fresh baseline/direct.
+  Keep every other VPN/TUN off through stop; preserve `status/snapshot/stop`
+  on failure. M2/M3 remain blocked.
 
 - Exact-source `1c587ba` HK M1 bundle
   `/tmp/mini_vpn_knife15_macos_20260721_110225.tar.gz` (SHA-256
