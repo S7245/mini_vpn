@@ -18,8 +18,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -1907,8 +1907,9 @@ impl TuicNativeTcpWriter {
         lease: TcpPoolSlotLease,
         pressure: TcpWritePressureWriter,
     ) -> Self {
+        let progress = send.progress_handle();
         Self {
-            send: TcpWritePressureAdapter::new(send, pressure),
+            send: TcpWritePressureAdapter::new_with_progress(send, pressure, progress),
             _lease: lease,
         }
     }
@@ -3514,37 +3515,66 @@ fn endpoint_recovery_stall_bound(max_rtt: Duration) -> Duration {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TcpWritePressureSnapshot {
+    writer: u64,
+    stream: u64,
     episode: u64,
     pending_for: Duration,
+    ack_stalled_for: Duration,
+    acknowledged_bytes: u64,
 }
 
-const TCP_WRITE_PRESSURE_COUNT_MASK: u64 = u32::MAX as u64;
-const TCP_WRITE_PRESSURE_EPISODE_SHIFT: u32 = u32::BITS;
-
-/// Per-QUIC-connection ownership for TCP writers currently blocked in `poll_write`.
-/// The packed state makes the zero-to-one episode edge and writer count one atomic transition;
-/// timestamp metadata is tagged with that episode so a late release cannot clear a new episode.
+/// Per-QUIC-connection registry for TCP writers currently blocked in `poll_write`.
+/// Each writer owns its own atomic progress clock so ACKs on unrelated streams cannot mask a
+/// business-stream black hole. The registry lock is used only at relay create/drop and by the
+/// 250ms recovery sampler; the write hot path touches only its writer-local atomics.
 struct TcpWritePressure {
     origin: Instant,
-    state: AtomicU64,
+    next_writer: AtomicU64,
+    next_episode: AtomicU64,
+    writers: StdMutex<HashMap<u64, Weak<TcpWritePressureWriterState>>>,
+}
+
+struct TcpWritePressureWriterState {
+    writer: u64,
+    stream: u64,
+    episode: AtomicU64,
     pending_since_micros: AtomicU64,
-    pending_since_episode: AtomicU64,
+    ack_stalled_since_micros: AtomicU64,
+    acknowledged_bytes: AtomicU64,
+    progress: OnceLock<quinn::SendStreamProgress>,
 }
 
 impl TcpWritePressure {
     fn new(origin: Instant) -> Self {
         Self {
             origin,
-            state: AtomicU64::new(0),
-            pending_since_micros: AtomicU64::new(0),
-            pending_since_episode: AtomicU64::new(0),
+            next_writer: AtomicU64::new(0),
+            next_episode: AtomicU64::new(0),
+            writers: StdMutex::new(HashMap::new()),
         }
     }
 
-    fn writer(self: &Arc<Self>) -> TcpWritePressureWriter {
+    fn writer(self: &Arc<Self>, stream: u64) -> TcpWritePressureWriter {
+        let writer = self
+            .next_writer
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let state = Arc::new(TcpWritePressureWriterState {
+            writer,
+            stream,
+            episode: AtomicU64::new(0),
+            pending_since_micros: AtomicU64::new(0),
+            ack_stalled_since_micros: AtomicU64::new(0),
+            acknowledged_bytes: AtomicU64::new(0),
+            progress: OnceLock::new(),
+        });
+        self.writers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(writer, Arc::downgrade(&state));
         TcpWritePressureWriter {
             pressure: self.clone(),
-            pending_episode: None,
+            state,
         }
     }
 
@@ -3554,127 +3584,176 @@ impl TcpWritePressure {
             .min(u64::MAX as u128) as u64
     }
 
-    fn begin_pending(&self, now: Instant) -> u32 {
-        let mut current = self.state.load(Ordering::Acquire);
-        loop {
-            let count = current as u32;
-            let current_episode = (current >> TCP_WRITE_PRESSURE_EPISODE_SHIFT) as u32;
-            let starts_episode = count == 0;
-            let episode = if starts_episode {
-                current_episode.wrapping_add(1).max(1)
-            } else {
-                current_episode
+    fn next_episode(&self) -> u64 {
+        self.next_episode
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    fn snapshots_at(&self, now: Instant) -> Vec<TcpWritePressureSnapshot> {
+        let now_micros = self.elapsed_micros_at(now);
+        let mut writers = self
+            .writers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut snapshots = Vec::new();
+        writers.retain(|_, weak| {
+            let Some(state) = weak.upgrade() else {
+                return false;
             };
-            let next_count = count.saturating_add(1);
-            let next = ((episode as u64) << TCP_WRITE_PRESSURE_EPISODE_SHIFT) | (next_count as u64);
-            match self.state.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    if starts_episode {
-                        self.pending_since_micros
-                            .store(self.elapsed_micros_at(now), Ordering::Relaxed);
-                        self.pending_since_episode
-                            .store(episode as u64, Ordering::Release);
-                    }
-                    return episode;
-                }
-                Err(observed) => current = observed,
+            state.refresh_acknowledged_at(now_micros);
+            if let Some(snapshot) = state.snapshot_at(now_micros) {
+                snapshots.push(snapshot);
             }
-        }
+            true
+        });
+        snapshots
     }
 
-    fn end_pending(&self, episode: u32) {
-        let mut current = self.state.load(Ordering::Acquire);
-        loop {
-            let count = current as u32;
-            let current_episode = (current >> TCP_WRITE_PRESSURE_EPISODE_SHIFT) as u32;
-            if count == 0 || current_episode != episode {
-                return;
-            }
-            let next =
-                ((episode as u64) << TCP_WRITE_PRESSURE_EPISODE_SHIFT) | ((count - 1) as u64);
-            match self.state.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    if count == 1 {
-                        let _ = self.pending_since_episode.compare_exchange(
-                            episode as u64,
-                            0,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        );
-                    }
-                    return;
-                }
-                Err(observed) => current = observed,
-            }
-        }
-    }
-
+    #[cfg(test)]
     fn snapshot_at(&self, now: Instant) -> Option<TcpWritePressureSnapshot> {
-        let state = self.state.load(Ordering::Acquire);
-        let count = state & TCP_WRITE_PRESSURE_COUNT_MASK;
-        if count == 0 {
-            return None;
-        }
-        let episode = state >> TCP_WRITE_PRESSURE_EPISODE_SHIFT;
-        if self.pending_since_episode.load(Ordering::Acquire) != episode {
-            return None;
-        }
-        let pending_since = self.pending_since_micros.load(Ordering::Relaxed);
-        if self.state.load(Ordering::Acquire) != state {
-            return None;
-        }
-        Some(TcpWritePressureSnapshot {
-            episode,
-            pending_for: Duration::from_micros(
-                self.elapsed_micros_at(now).saturating_sub(pending_since),
-            ),
-        })
+        self.snapshots_at(now)
+            .into_iter()
+            .max_by_key(|snapshot| (snapshot.ack_stalled_for, snapshot.pending_for))
+    }
+
+    fn remove_writer(&self, writer: u64) {
+        self.writers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&writer);
     }
 }
 
 struct TcpWritePressureWriter {
     pressure: Arc<TcpWritePressure>,
-    pending_episode: Option<u32>,
+    state: Arc<TcpWritePressureWriterState>,
+}
+
+impl TcpWritePressureWriterState {
+    fn install_progress(&self, progress: quinn::SendStreamProgress) {
+        let _ = self.progress.set(progress);
+    }
+
+    fn refresh_acknowledged_at(&self, now_micros: u64) {
+        if self.episode.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let acknowledged_bytes = self
+            .progress
+            .get()
+            .and_then(|progress| progress.sample().ok())
+            .map(|progress| progress.acknowledged_bytes);
+        if let Some(acknowledged_bytes) = acknowledged_bytes {
+            self.note_acknowledged_micros(now_micros, acknowledged_bytes);
+        }
+    }
+
+    fn note_acknowledged_micros(&self, now_micros: u64, acknowledged_bytes: u64) {
+        if self.episode.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let previous = self
+            .acknowledged_bytes
+            .fetch_max(acknowledged_bytes, Ordering::AcqRel);
+        if acknowledged_bytes <= previous {
+            return;
+        }
+        self.ack_stalled_since_micros
+            .store(now_micros, Ordering::Release);
+    }
+
+    fn snapshot_at(&self, now_micros: u64) -> Option<TcpWritePressureSnapshot> {
+        let episode = self.episode.load(Ordering::Acquire);
+        if episode == 0 {
+            return None;
+        }
+        let pending_since = self.pending_since_micros.load(Ordering::Relaxed);
+        let ack_stalled_since = self.ack_stalled_since_micros.load(Ordering::Relaxed);
+        let acknowledged_bytes = self.acknowledged_bytes.load(Ordering::Relaxed);
+        if self.episode.load(Ordering::Acquire) != episode {
+            return None;
+        }
+        Some(TcpWritePressureSnapshot {
+            writer: self.writer,
+            stream: self.stream,
+            episode,
+            pending_for: Duration::from_micros(now_micros.saturating_sub(pending_since)),
+            ack_stalled_for: Duration::from_micros(now_micros.saturating_sub(ack_stalled_since)),
+            acknowledged_bytes,
+        })
+    }
 }
 
 impl TcpWritePressureWriter {
-    fn note_pending_at(&mut self, now: Instant) {
-        if self.pending_episode.is_none() {
-            self.pending_episode = Some(self.pressure.begin_pending(now));
+    fn install_progress(&mut self, progress: quinn::SendStreamProgress) {
+        self.state.install_progress(progress);
+    }
+
+    fn note_pending_at(&mut self, now: Instant, acknowledged_bytes: u64) {
+        if self.state.episode.load(Ordering::Acquire) == 0 {
+            let now_micros = self.pressure.elapsed_micros_at(now);
+            self.state
+                .pending_since_micros
+                .store(now_micros, Ordering::Relaxed);
+            self.state
+                .ack_stalled_since_micros
+                .store(now_micros, Ordering::Relaxed);
+            self.state
+                .acknowledged_bytes
+                .store(acknowledged_bytes, Ordering::Relaxed);
+            self.state
+                .episode
+                .store(self.pressure.next_episode(), Ordering::Release);
+        } else {
+            self.note_acknowledged_at(now, acknowledged_bytes);
         }
     }
 
     fn note_ready(&mut self) {
-        if let Some(episode) = self.pending_episode.take() {
-            self.pressure.end_pending(episode);
-        }
+        self.state.episode.store(0, Ordering::Release);
+    }
+
+    fn note_acknowledged_at(&mut self, now: Instant, acknowledged_bytes: u64) {
+        self.state
+            .note_acknowledged_micros(self.pressure.elapsed_micros_at(now), acknowledged_bytes);
     }
 }
 
 impl Drop for TcpWritePressureWriter {
     fn drop(&mut self) {
         self.note_ready();
+        self.pressure.remove_writer(self.state.writer);
     }
 }
 
 struct TcpWritePressureAdapter<W> {
     inner: W,
     pressure: TcpWritePressureWriter,
+    progress: Option<quinn::SendStreamProgress>,
 }
 
 impl<W> TcpWritePressureAdapter<W> {
+    #[cfg(test)]
     fn new(inner: W, pressure: TcpWritePressureWriter) -> Self {
-        Self { inner, pressure }
+        Self {
+            inner,
+            pressure,
+            progress: None,
+        }
+    }
+
+    fn new_with_progress(
+        inner: W,
+        mut pressure: TcpWritePressureWriter,
+        progress: quinn::SendStreamProgress,
+    ) -> Self {
+        pressure.install_progress(progress.clone());
+        Self {
+            inner,
+            pressure,
+            progress: Some(progress),
+        }
     }
 }
 
@@ -3696,7 +3775,14 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for TcpWritePressureAdapter<W> {
     ) -> Poll<io::Result<usize>> {
         let result = Pin::new(&mut self.inner).poll_write(cx, buf);
         if result.is_pending() {
-            self.pressure.note_pending_at(Instant::now());
+            let acknowledged_bytes = self
+                .progress
+                .as_ref()
+                .and_then(|progress| progress.sample().ok())
+                .map(|progress| progress.acknowledged_bytes)
+                .unwrap_or(0);
+            self.pressure
+                .note_pending_at(Instant::now(), acknowledged_bytes);
         } else {
             self.pressure.note_ready();
         }
@@ -3713,14 +3799,14 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for TcpWritePressureAdapter<W> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct EndpointRecoveryConnectionSample {
     stable_id: usize,
     tx_bytes: u64,
     rx_bytes: u64,
     rtt: Duration,
     current_socket_rx_rebind_generation: u64,
-    tcp_write_pressure: Option<TcpWritePressureSnapshot>,
+    tcp_write_pressures: Vec<TcpWritePressureSnapshot>,
 }
 
 #[derive(Debug)]
@@ -3734,7 +3820,14 @@ struct EndpointRecoveryInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EndpointRecoveryTrigger {
     NoRx,
-    TcpWriteStall { stable_id: usize, episode: u64 },
+    TcpWriteStall {
+        stable_id: usize,
+        writer: u64,
+        stream: u64,
+        episode: u64,
+        acknowledged_bytes: u64,
+        pending_for: Duration,
+    },
 }
 
 impl EndpointRecoveryTrigger {
@@ -3745,10 +3838,24 @@ impl EndpointRecoveryTrigger {
         }
     }
 
-    fn tcp_write_fields(self) -> (usize, u64) {
+    fn tcp_write_fields(self) -> (usize, u64, u64, u64, u64, u128) {
         match self {
-            Self::NoRx => (0, 0),
-            Self::TcpWriteStall { stable_id, episode } => (stable_id, episode),
+            Self::NoRx => (0, 0, 0, 0, 0, 0),
+            Self::TcpWriteStall {
+                stable_id,
+                writer,
+                stream,
+                episode,
+                acknowledged_bytes,
+                pending_for,
+            } => (
+                stable_id,
+                writer,
+                stream,
+                episode,
+                acknowledged_bytes,
+                pending_for.as_millis(),
+            ),
         }
     }
 }
@@ -3789,15 +3896,15 @@ struct EndpointRecoveryState {
     expected_socket_generation: Option<u64>,
     pending_recovery_connections: HashSet<usize>,
     expected_recovery_connection_count: usize,
-    covered_tcp_write_episodes: HashMap<usize, u64>,
+    covered_tcp_write_episodes: HashMap<(usize, u64), u64>,
 }
 
 impl EndpointRecoveryState {
     fn cover_tcp_write_episodes(&mut self, input: &EndpointRecoveryInput) {
         for sample in &input.connections {
-            if let Some(pressure) = sample.tcp_write_pressure {
+            for pressure in &sample.tcp_write_pressures {
                 self.covered_tcp_write_episodes
-                    .insert(sample.stable_id, pressure.episode);
+                    .insert((sample.stable_id, pressure.writer), pressure.episode);
             }
         }
     }
@@ -3807,13 +3914,25 @@ impl EndpointRecoveryState {
         input: &EndpointRecoveryInput,
         stall_bound: Duration,
     ) -> Option<(usize, TcpWritePressureSnapshot)> {
-        input.connections.iter().find_map(|sample| {
-            let pressure = sample.tcp_write_pressure?;
-            (pressure.pending_for >= stall_bound
-                && self.covered_tcp_write_episodes.get(&sample.stable_id)
-                    != Some(&pressure.episode))
-            .then_some((sample.stable_id, pressure))
-        })
+        input
+            .connections
+            .iter()
+            .flat_map(|sample| {
+                sample
+                    .tcp_write_pressures
+                    .iter()
+                    .copied()
+                    .map(move |pressure| (sample.stable_id, pressure))
+            })
+            .filter(|(stable_id, pressure)| {
+                pressure.pending_for >= stall_bound
+                    && pressure.ack_stalled_for >= stall_bound
+                    && self
+                        .covered_tcp_write_episodes
+                        .get(&(*stable_id, pressure.writer))
+                        != Some(&pressure.episode)
+            })
+            .max_by_key(|(_, pressure)| (pressure.ack_stalled_for, pressure.pending_for))
     }
 
     fn begin_rebind(
@@ -3864,12 +3983,12 @@ impl EndpointRecoveryState {
         }
         self.connections = next;
         self.covered_tcp_write_episodes
-            .retain(|stable_id, episode| {
+            .retain(|(stable_id, writer), episode| {
                 input.connections.iter().any(|sample| {
                     sample.stable_id == *stable_id
-                        && sample
-                            .tcp_write_pressure
-                            .is_some_and(|pressure| pressure.episode == *episode)
+                        && sample.tcp_write_pressures.iter().any(|pressure| {
+                            pressure.writer == *writer && pressure.episode == *episode
+                        })
                 })
             });
 
@@ -3920,9 +4039,13 @@ impl EndpointRecoveryState {
                 input,
                 EndpointRecoveryTrigger::TcpWriteStall {
                     stable_id,
+                    writer: pressure.writer,
+                    stream: pressure.stream,
                     episode: pressure.episode,
+                    acknowledged_bytes: pressure.acknowledged_bytes,
+                    pending_for: pressure.pending_for,
                 },
-                pressure.pending_for,
+                pressure.ack_stalled_for,
                 stall_bound,
                 max_rtt,
             );
@@ -4810,7 +4933,14 @@ impl TuicUpstream {
                         tx_bytes_since_rx,
                         max_rtt,
                     } => {
-                        let (write_conn, write_episode) = trigger.tcp_write_fields();
+                        let (
+                            write_conn,
+                            write_writer,
+                            write_stream,
+                            write_episode,
+                            write_acknowledged_bytes,
+                            write_pending_ms,
+                        ) = trigger.tcp_write_fields();
                         match quic::rebind_client_endpoint_udp_socket(
                             &upstream.endpoint,
                             upstream.udp_send_service_policy,
@@ -4819,10 +4949,14 @@ impl TuicUpstream {
                             Ok(rebound) => {
                                 state.note_rebind_succeeded(now, rebound.rebind_generation);
                                 println!(
-                                    "🔄 tuic-endpoint-rebind generation={generation} trigger={} write_conn={} write_episode={} old_local={} new_local={} socket_generation={} active_tcp={} udp_active={} live_connections={} stalled_ms={} bound_ms={} tx_since_rx={}B max_rtt_ms={}",
+                                    "🔄 tuic-endpoint-rebind generation={generation} trigger={} write_conn={} write_writer={} write_stream={} write_episode={} write_acknowledged={}B write_pending_ms={} old_local={} new_local={} socket_generation={} active_tcp={} udp_active={} live_connections={} stalled_ms={} bound_ms={} tx_since_rx={}B max_rtt_ms={}",
                                     trigger.label(),
                                     write_conn,
+                                    write_writer,
+                                    write_stream,
                                     write_episode,
+                                    write_acknowledged_bytes,
+                                    write_pending_ms,
                                     rebound.old_local_addr,
                                     rebound.new_local_addr,
                                     rebound.rebind_generation,
@@ -4837,10 +4971,14 @@ impl TuicUpstream {
                             }
                             Err(error) => {
                                 println!(
-                                    "⚠️ tuic-endpoint-rebind-failed generation={generation} trigger={} write_conn={} write_episode={} active_tcp={} udp_active={} live_connections={} stalled_ms={} bound_ms={} tx_since_rx={}B max_rtt_ms={} error={error}",
+                                    "⚠️ tuic-endpoint-rebind-failed generation={generation} trigger={} write_conn={} write_writer={} write_stream={} write_episode={} write_acknowledged={}B write_pending_ms={} active_tcp={} udp_active={} live_connections={} stalled_ms={} bound_ms={} tx_since_rx={}B max_rtt_ms={} error={error}",
                                     trigger.label(),
                                     write_conn,
+                                    write_writer,
+                                    write_stream,
                                     write_episode,
+                                    write_acknowledged_bytes,
+                                    write_pending_ms,
                                     input.active_tcp,
                                     input.udp_active,
                                     input.connections.len(),
@@ -4872,10 +5010,11 @@ impl TuicUpstream {
                 rx_bytes: stats.udp_rx.bytes,
                 rtt: stats.path.rtt,
                 current_socket_rx_rebind_generation: conn.current_socket_rx_rebind_generation(),
-                tcp_write_pressure: self
+                tcp_write_pressures: self
                     .tcp_write_pressures
                     .get(index)
-                    .and_then(|pressure| pressure.snapshot_at(sampled_at)),
+                    .map(|pressure| pressure.snapshots_at(sampled_at))
+                    .unwrap_or_default(),
             });
         }
         let active_tcp = self.tcp_pool_selector.active_total();
@@ -4993,20 +5132,24 @@ impl ProxyUpstream for TuicUpstream {
                 .tcp_write_pressures
                 .get(conn_index)
                 .ok_or_else(|| io_err("tuic TCP write pressure", "pool slot tracker missing"))?;
+            let send_progress = send.progress_handle();
+            let pressure_writer = write_pressure.writer(stream_id);
             let relay: RelayStream = match relay_mode {
                 TuicTcpRelayMode::OrderedJoin => Box::new(TrackedRelayStream::new_with_transport(
-                    TcpWritePressureAdapter::new(
+                    TcpWritePressureAdapter::new_with_progress(
                         tokio::io::join(recv, send),
-                        write_pressure.writer(),
+                        pressure_writer,
+                        send_progress,
                     ),
                     lease,
                     tcp_stream_diag,
                     conn.clone(),
                 )),
                 TuicTcpRelayMode::OrderedChunk => Box::new(TrackedRelayStream::new_with_transport(
-                    TcpWritePressureAdapter::new(
+                    TcpWritePressureAdapter::new_with_progress(
                         TuicOrderedRelayStream::from_quinn(recv, send),
-                        write_pressure.writer(),
+                        pressure_writer,
+                        send_progress,
                     ),
                     lease,
                     tcp_stream_diag,
@@ -5014,9 +5157,10 @@ impl ProxyUpstream for TuicUpstream {
                 )),
                 TuicTcpRelayMode::UnorderedReassembly => {
                     Box::new(TrackedRelayStream::new_with_transport(
-                        TcpWritePressureAdapter::new(
+                        TcpWritePressureAdapter::new_with_progress(
                             TuicChunkRelayStream::new(recv, send, diag_meta),
-                            write_pressure.writer(),
+                            pressure_writer,
+                            send_progress,
                         ),
                         lease,
                         tcp_stream_diag,
@@ -5153,7 +5297,7 @@ impl ProxyUpstream for TuicUpstream {
             let writer = Box::new(TuicNativeTcpWriter::new(
                 send,
                 lease,
-                write_pressure.writer(),
+                write_pressure.writer(stream_id),
             ));
             let relay = NativeTcpRelayStream { reader, writer };
             Ok::<OpenedTcpRelay, ClientError>(if d16_byte_owned {
@@ -5271,10 +5415,14 @@ mod tests {
                 rx_bytes,
                 rtt,
                 current_socket_rx_rebind_generation: 0,
-                tcp_write_pressure: Some(TcpWritePressureSnapshot {
+                tcp_write_pressures: vec![TcpWritePressureSnapshot {
+                    writer: 1,
+                    stream: 3,
                     episode: 7,
                     pending_for,
-                }),
+                    ack_stalled_for: pending_for,
+                    acknowledged_bytes: 0,
+                }],
             }],
         };
 
@@ -5291,11 +5439,44 @@ mod tests {
                     trigger: EndpointRecoveryTrigger::TcpWriteStall {
                         stable_id: 11,
                         episode: 7,
+                        ..
                     },
                     ..
                 }
             ),
             "continuous business-stream write pressure must survive unrelated/ACK RX: {action:?}"
+        );
+    }
+
+    #[test]
+    fn endpoint_recovery_does_not_rebind_while_pending_stream_acknowledges_progress() {
+        let started = Instant::now();
+        let mut state = EndpointRecoveryState::default();
+        let input = EndpointRecoveryInput {
+            active_tcp: 2,
+            udp_active: false,
+            current_socket_rx_rebind_generation: 0,
+            connections: vec![EndpointRecoveryConnectionSample {
+                stable_id: 11,
+                tx_bytes: 100_000,
+                rx_bytes: 2_000,
+                rtt: Duration::from_millis(159),
+                current_socket_rx_rebind_generation: 0,
+                tcp_write_pressures: vec![TcpWritePressureSnapshot {
+                    writer: 1,
+                    stream: 3,
+                    episode: 7,
+                    pending_for: Duration::from_secs(5),
+                    ack_stalled_for: Duration::from_millis(250),
+                    acknowledged_bytes: 64 * 1024,
+                }],
+            }],
+        };
+
+        assert_eq!(
+            state.observe(started, &input),
+            EndpointRecoveryAction::None,
+            "application backpressure with business-stream ACK progress is not a path black hole"
         );
     }
 
@@ -5315,10 +5496,14 @@ mod tests {
                     rx_bytes: 1_000 + socket_generation,
                     rtt: Duration::from_millis(100),
                     current_socket_rx_rebind_generation: socket_generation,
-                    tcp_write_pressure: Some(TcpWritePressureSnapshot {
+                    tcp_write_pressures: vec![TcpWritePressureSnapshot {
+                        writer: 1,
+                        stream: 3,
                         episode: 7,
                         pending_for: bound,
-                    }),
+                        ack_stalled_for: bound,
+                        acknowledged_bytes: 0,
+                    }],
                 },
                 EndpointRecoveryConnectionSample {
                     stable_id: 12,
@@ -5326,10 +5511,14 @@ mod tests {
                     rx_bytes: 2_000 + socket_generation,
                     rtt: Duration::from_millis(150),
                     current_socket_rx_rebind_generation: socket_generation,
-                    tcp_write_pressure: Some(TcpWritePressureSnapshot {
+                    tcp_write_pressures: vec![TcpWritePressureSnapshot {
+                        writer: 2,
+                        stream: 5,
                         episode: 9,
                         pending_for: bound,
-                    }),
+                        ack_stalled_for: bound,
+                        acknowledged_bytes: 0,
+                    }],
                 },
             ],
         };
@@ -5355,7 +5544,7 @@ mod tests {
                 .connections
                 .into_iter()
                 .map(|mut connection| {
-                    connection.tcp_write_pressure = None;
+                    connection.tcp_write_pressures.clear();
                     connection
                 })
                 .collect(),
@@ -5365,11 +5554,15 @@ mod tests {
             EndpointRecoveryAction::None
         );
         let mut next_episode = sample(1);
-        next_episode.connections[0].tcp_write_pressure = None;
-        next_episode.connections[1].tcp_write_pressure = Some(TcpWritePressureSnapshot {
+        next_episode.connections[0].tcp_write_pressures.clear();
+        next_episode.connections[1].tcp_write_pressures = vec![TcpWritePressureSnapshot {
+            writer: 3,
+            stream: 7,
             episode: 10,
             pending_for: bound,
-        });
+            ack_stalled_for: bound,
+            acknowledged_bytes: 0,
+        }];
         assert!(matches!(
             state.observe(started + Duration::from_secs(3), &next_episode),
             EndpointRecoveryAction::Rebind {
@@ -5377,6 +5570,7 @@ mod tests {
                 trigger: EndpointRecoveryTrigger::TcpWriteStall {
                     stable_id: 12,
                     episode: 10,
+                    ..
                 },
                 ..
             }
@@ -5384,42 +5578,121 @@ mod tests {
     }
 
     #[test]
-    fn tcp_write_pressure_owns_one_episode_until_every_pending_writer_clears() {
+    fn endpoint_recovery_one_rebind_covers_all_pending_writers_on_one_connection() {
+        let started = Instant::now();
+        let bound = Duration::from_secs(2);
+        let mut state = EndpointRecoveryState::default();
+        let sample = |socket_generation| EndpointRecoveryInput {
+            active_tcp: 2,
+            udp_active: false,
+            current_socket_rx_rebind_generation: socket_generation,
+            connections: vec![EndpointRecoveryConnectionSample {
+                stable_id: 11,
+                tx_bytes: 100_000,
+                rx_bytes: 1_000 + socket_generation,
+                rtt: Duration::from_millis(100),
+                current_socket_rx_rebind_generation: socket_generation,
+                tcp_write_pressures: vec![
+                    TcpWritePressureSnapshot {
+                        writer: 1,
+                        stream: 3,
+                        episode: 7,
+                        pending_for: bound,
+                        ack_stalled_for: bound,
+                        acknowledged_bytes: 0,
+                    },
+                    TcpWritePressureSnapshot {
+                        writer: 2,
+                        stream: 5,
+                        episode: 8,
+                        pending_for: bound,
+                        ack_stalled_for: bound,
+                        acknowledged_bytes: 0,
+                    },
+                ],
+            }],
+        };
+
+        assert!(matches!(
+            state.observe(started, &sample(0)),
+            EndpointRecoveryAction::Rebind { .. }
+        ));
+        state.note_rebind_succeeded(started, 1);
+        assert!(matches!(
+            state.observe(started + Duration::from_millis(250), &sample(1)),
+            EndpointRecoveryAction::Recovered { .. }
+        ));
+        assert_eq!(
+            state.observe(started + Duration::from_millis(500), &sample(1)),
+            EndpointRecoveryAction::None,
+            "one socket migration covers every writer sampled on that connection"
+        );
+    }
+
+    #[test]
+    fn tcp_write_pressure_selects_the_oldest_per_stream_ack_stall() {
         let started = Instant::now();
         let pressure = Arc::new(TcpWritePressure::new(started));
-        let mut first = pressure.writer();
-        let mut second = pressure.writer();
+        let mut first = pressure.writer(3);
+        let mut second = pressure.writer(5);
 
-        first.note_pending_at(started);
+        first.note_pending_at(started, 0);
         let first_snapshot = pressure
             .snapshot_at(started + Duration::from_secs(1))
             .expect("first pending writer starts an episode");
         assert_eq!(first_snapshot.episode, 1);
         assert_eq!(first_snapshot.pending_for, Duration::from_secs(1));
 
-        second.note_pending_at(started + Duration::from_millis(500));
+        second.note_pending_at(started + Duration::from_millis(500), 0);
         first.note_ready();
         assert_eq!(
             pressure
                 .snapshot_at(started + Duration::from_secs(2))
                 .expect("second writer still owns the shared episode"),
             TcpWritePressureSnapshot {
-                episode: 1,
-                pending_for: Duration::from_secs(2),
+                writer: 2,
+                stream: 5,
+                episode: 2,
+                pending_for: Duration::from_millis(1500),
+                ack_stalled_for: Duration::from_millis(1500),
+                acknowledged_bytes: 0,
             }
         );
 
         drop(second);
         assert_eq!(pressure.snapshot_at(started + Duration::from_secs(2)), None);
 
-        let mut third = pressure.writer();
-        third.note_pending_at(started + Duration::from_secs(3));
+        let mut third = pressure.writer(7);
+        third.note_pending_at(started + Duration::from_secs(3), 0);
         assert_eq!(
             pressure.snapshot_at(started + Duration::from_secs(4)),
             Some(TcpWritePressureSnapshot {
-                episode: 2,
+                writer: 3,
+                stream: 7,
+                episode: 3,
                 pending_for: Duration::from_secs(1),
+                ack_stalled_for: Duration::from_secs(1),
+                acknowledged_bytes: 0,
             })
+        );
+    }
+
+    #[test]
+    fn tcp_write_pressure_ack_progress_resets_stall_without_clearing_pending() {
+        let started = Instant::now();
+        let pressure = Arc::new(TcpWritePressure::new(started));
+        let mut writer = pressure.writer(3);
+
+        writer.note_pending_at(started, 0);
+        writer.note_acknowledged_at(started + Duration::from_secs(2), 64 * 1024);
+
+        assert_eq!(
+            pressure
+                .snapshot_at(started + Duration::from_millis(2250))
+                .expect("the writer remains application-blocked")
+                .ack_stalled_for,
+            Duration::from_millis(250),
+            "acknowledged business-stream bytes reset only the recovery-stall clock"
         );
     }
 
@@ -5458,7 +5731,7 @@ mod tests {
             GateWriter {
                 ready: ready.clone(),
             },
-            pressure.writer(),
+            pressure.writer(3),
         );
         let write = tokio::spawn(async move { writer.write_all(b"pending").await });
         tokio::task::yield_now().await;
@@ -5488,7 +5761,7 @@ mod tests {
                 rx_bytes: 1_000,
                 rtt,
                 current_socket_rx_rebind_generation: 0,
-                tcp_write_pressure: None,
+                tcp_write_pressures: Vec::new(),
             }],
         };
 
@@ -5530,7 +5803,7 @@ mod tests {
                 rx_bytes,
                 rtt: Duration::from_millis(100),
                 current_socket_rx_rebind_generation: 0,
-                tcp_write_pressure: None,
+                tcp_write_pressures: Vec::new(),
             }],
         };
 
@@ -5581,7 +5854,7 @@ mod tests {
                         rx_bytes: first_rx,
                         rtt: Duration::from_millis(100),
                         current_socket_rx_rebind_generation: first_socket_rx_generation,
-                        tcp_write_pressure: None,
+                        tcp_write_pressures: Vec::new(),
                     },
                     EndpointRecoveryConnectionSample {
                         stable_id: 12,
@@ -5589,7 +5862,7 @@ mod tests {
                         rx_bytes: second_rx,
                         rtt: Duration::from_millis(150),
                         current_socket_rx_rebind_generation: second_socket_rx_generation,
-                        tcp_write_pressure: None,
+                        tcp_write_pressures: Vec::new(),
                     },
                 ],
             }
@@ -5686,7 +5959,7 @@ mod tests {
                 rx_bytes: 100,
                 rtt: Duration::from_millis(100),
                 current_socket_rx_rebind_generation: 0,
-                tcp_write_pressure: None,
+                tcp_write_pressures: Vec::new(),
             }],
         };
 

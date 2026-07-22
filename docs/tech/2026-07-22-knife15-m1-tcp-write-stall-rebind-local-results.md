@@ -1,5 +1,9 @@
 # Knife15 M1 TCP write-stall Endpoint rebind local results
 
+> Historical note: the local result below was later falsified by exact-source
+> bundle `...094608.tar.gz`; Pending alone caused false rebind churn. See
+> `2026-07-22-knife15-m1-stream-ack-qualified-rebind-local-results.md`.
+
 Date: 2026-07-22
 
 ## Result

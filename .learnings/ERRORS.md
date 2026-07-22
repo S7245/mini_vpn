@@ -1,5 +1,31 @@
 # Errors
 
+## 2026-07-22 - Pending-only recovery caused a false-rebind feedback loop
+
+- Exact source `e479013` passed fresh baseline/direct, then M1 cycle 1 forward
+  had three complete receiver-zero seconds while the Endpoint performed seven
+  successful `tcp_write_stall` rebinds. Generations 3--7 repeatedly changed
+  source port during the blocked business flow.
+- The trigger treated any two-second Pending episode as path failure. Normal
+  per-stream ACK progress was not observed, and connection-level recovery
+  repeatedly declared success while the owning business writer remained
+  Pending. Rebind churn amplified congestion instead of recovering it.
+- Correct behavior: require both continuous Pending and no ACK advancement on
+  the exact send stream for the unchanged bound. Do not repair this class by
+  increasing thresholds or tuning frozen windows/pacing values.
+
+## 2026-07-22 - Gate invocations must preserve dependency and test provenance
+
+- Cargo accepts one positional test filter; attempts to pass multiple test
+  names were command errors, not test failures. Use one common substring or
+  separate invocations.
+- Standalone vendored Quinn again selected registry quinn-proto until the
+  absolute local `patch.crates-io.quinn-proto.path` was supplied. An `--exact`
+  filter without the module-qualified test name also executed zero tests.
+- Correct behavior: use the documented absolute patch and verify a nonzero
+  executed-test count before accepting a standalone result. Remove the
+  generated ignored vendored `Cargo.lock` after the gate.
+
 ## 2026-07-22 - ACK traffic hid a saturated business-stream send window
 
 - The exact HK M1 reached cycle 2 forward before a complete Target receiver

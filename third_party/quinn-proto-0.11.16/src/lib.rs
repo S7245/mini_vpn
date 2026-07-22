@@ -48,8 +48,8 @@ pub use crate::connection::{
     EndpointPacingConnectionSnapshot, EndpointPacingSnapshot, EndpointPacingSocketOutcomeError,
     EndpointPacingStatelessResponseDenied, EndpointPacingStatelessResponseReservation, Event,
     FinishError, FrameStats, PathStats, ReadError, ReadableError, RecvStream, RttEstimator,
-    SendDatagramError, SendStream, ShouldTransmit, StreamEvent, Streams, UdpStats, WriteError,
-    Written,
+    SendDatagramError, SendStream, SendStreamProgress, ShouldTransmit, StreamEvent, Streams,
+    UdpStats, WriteError, Written,
 };
 #[cfg(feature = "qlog")]
 pub use connection::qlog::QlogStream;

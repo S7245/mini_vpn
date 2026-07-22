@@ -1,5 +1,9 @@
 # Knife15 M1 TCP write-stall Endpoint rebind implementation plan
 
+> Historical note: bundle `...094608.tar.gz` falsified the Pending-only trigger.
+> The replacement plan is
+> `2026-07-22-knife15-m1-stream-ack-qualified-rebind-implementation-plan.md`.
+
 Date: 2026-07-22
 
 1. Record exact bundle provenance, prerequisite passes, the complete

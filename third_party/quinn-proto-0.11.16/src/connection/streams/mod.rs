@@ -200,6 +200,15 @@ pub struct SendStream<'a> {
     pub(super) conn_state: &'a super::State,
 }
 
+/// Monotonic application-write and peer-acknowledgement progress for one send stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendStreamProgress {
+    /// Bytes accepted from the application on this stream.
+    pub written_bytes: u64,
+    /// Bytes acknowledged by the peer on this stream, including out-of-order ranges.
+    pub acknowledged_bytes: u64,
+}
+
 #[allow(clippy::needless_lifetimes)] // Needed for cfg(fuzzing)
 impl<'a> SendStream<'a> {
     #[cfg(fuzzing)]
@@ -232,6 +241,21 @@ impl<'a> SendStream<'a> {
     /// the chunk will be advanced and contain only non-written data after the call.
     pub fn write_chunks(&mut self, data: &mut [Bytes]) -> Result<Written, WriteError> {
         self.write_source(&mut BytesArray::from_chunks(data))
+    }
+
+    /// Returns monotonic write and acknowledgement progress for this stream.
+    pub fn progress(&self) -> Result<SendStreamProgress, ClosedStream> {
+        let stream = self
+            .state
+            .send
+            .get(&self.id)
+            .and_then(|stream| stream.as_ref())
+            .ok_or(ClosedStream { _private: () })?;
+        let written_bytes = stream.pending.offset();
+        Ok(SendStreamProgress {
+            written_bytes,
+            acknowledged_bytes: written_bytes.saturating_sub(stream.pending.unacked()),
+        })
     }
 
     fn write_source<B: BytesSource>(&mut self, source: &mut B) -> Result<Written, WriteError> {

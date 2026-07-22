@@ -6,6 +6,35 @@
 
 #### Latest decision (2026-07-22)
 
+Exact-source `e479013` HK bundle
+`/tmp/mini_vpn_knife15_macos_20260722_094608.tar.gz` (SHA-256 `7443769e...`)
+was operated correctly. Fresh baseline/direct passed; M1 cycle 1 forward then
+had three complete Target receiver-zero seconds and seven successful
+`tcp_write_stall` rebind/recovery cycles. Repeated source-port migration while
+the same business writer stayed blocked proves the Pending-only trigger
+created false recovery churn. Physical controls, TUN, Endpoint conservation,
+resources, and cleanup reject operator, route, or local ownership failure.
+
+The replacement architecture samples monotonic ACK progress from the exact
+Quinn send stream owned by each Pending writer. The existing recovery may
+rebind only when both Pending age and exact-stream ACK-stall age reach the
+unchanged RTT-derived bound. Same-stream ACK progress suppresses false rebind;
+unrelated ACKs cannot hide a real stream black hole. One rebind covers all
+sampled writers. No frozen value changed.
+
+Full local gates pass: root `653+3 ignored`, main `2`, Quinn `37+3 ignored`,
+quinn-proto `309`, docs, release, Clippy, shell, fmt/diff/secret, and 32 MiB at
+`240.472 Mbit/s` with final `61,440/0/0B` conservation. Review has no
+unresolved P0/P1. Result:
+`docs/tech/2026-07-22-knife15-m1-stream-ack-qualified-rebind-local-results.md`.
+
+Next run one fresh user-operated HK M1 from the pushed repair with rebuilt
+release and fresh baseline/direct. Keep every other VPN/TUN disabled through
+`stop`; preserve `status/snapshot/stop` on failure. Do not tune constants or
+waive strict TCP/UDP SLIs. M2/M3 remain blocked.
+
+#### Previous decision (2026-07-22)
+
 Exact-source `b33a3f6` HK bundle
 `/tmp/mini_vpn_knife15_macos_20260722_075828.tar.gz` (SHA-256 `f8b5b2ea...`)
 was operated correctly and passed fresh baseline/direct, start/smoke, and M1

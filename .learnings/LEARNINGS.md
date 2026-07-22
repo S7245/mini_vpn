@@ -1,5 +1,21 @@
 # Learnings
 
+## 2026-07-22 - Pending is demand; stalled ACK ownership is failure evidence
+
+- `poll_write(Pending)` proves only that application demand exceeds current
+  QUIC admission. Under congestion or flow control it can persist while that
+  exact stream is still being acknowledged, so Pending age alone is unsafe as
+  a destructive path-recovery trigger.
+- Match evidence to ownership: a blocked business writer is discharged only
+  by ACK progress from its own send stream. Connection-level RX and another
+  stream's ACKs are useful liveness signals but do not prove this flow moved.
+- Keep demand lifetime and failure lifetime separate. Ready/error/drop ends
+  Pending ownership; same-stream ACK advancement resets only the ACK-stall
+  clock. This preserves true black-hole recovery without turning normal
+  backpressure into source-port churn.
+- Result:
+  `docs/tech/2026-07-22-knife15-m1-stream-ack-qualified-rebind-local-results.md`.
+
 ## 2026-07-22 - Business write pressure is independent recovery evidence
 
 - Endpoint RX liveness is insufficient when ACK/control packets keep arriving

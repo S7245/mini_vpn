@@ -37,6 +37,30 @@ pub struct SendStream {
     is_0rtt: bool,
 }
 
+/// Cloneable read-only handle for one send stream's write and acknowledgement progress.
+#[derive(Debug, Clone)]
+pub struct SendStreamProgress {
+    conn: ConnectionRef,
+    stream: StreamId,
+    is_0rtt: bool,
+}
+
+impl SendStreamProgress {
+    /// Sample monotonic application-write and peer-acknowledgement progress.
+    pub fn sample(&self) -> Result<proto::SendStreamProgress, ClosedStream> {
+        let mut conn = self.conn.state.lock("SendStreamProgress::sample");
+        if self.is_0rtt && conn.check_0rtt().is_err() {
+            return Err(ClosedStream::default());
+        }
+        conn.inner.send_stream(self.stream).progress()
+    }
+
+    /// Get the identity of the sampled stream.
+    pub fn id(&self) -> StreamId {
+        self.stream
+    }
+}
+
 impl SendStream {
     pub(crate) fn new(conn: ConnectionRef, stream: StreamId, is_0rtt: bool) -> Self {
         Self {
@@ -271,6 +295,16 @@ impl SendStream {
     /// Get the identity of this stream
     pub fn id(&self) -> StreamId {
         self.stream
+    }
+
+    /// Create a cloneable read-only handle for this stream's write and acknowledgement progress.
+    #[doc(hidden)]
+    pub fn progress_handle(&self) -> SendStreamProgress {
+        SendStreamProgress {
+            conn: self.conn.clone(),
+            stream: self.stream,
+            is_0rtt: self.is_0rtt,
+        }
     }
 
     /// Attempt to write bytes from buf into the stream.

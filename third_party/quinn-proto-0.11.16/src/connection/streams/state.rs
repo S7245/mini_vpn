@@ -985,7 +985,7 @@ pub(super) fn get_or_insert_recv(
 mod tests {
     use super::*;
     use crate::{
-        ReadableError, RecvStream, SendStream, TransportErrorCode, WriteError,
+        ReadableError, RecvStream, SendStream, SendStreamProgress, TransportErrorCode, WriteError,
         connection::State as ConnState, connection::Streams,
     };
     use bytes::Bytes;
@@ -1981,6 +1981,13 @@ mod tests {
         let data = vec![0xFFu8; initial_send_len];
 
         assert_eq!(stream.write(&data), Ok(initial_send_len));
+        assert_eq!(
+            stream.progress(),
+            Ok(SendStreamProgress {
+                written_bytes: initial_send_window,
+                acknowledged_bytes: 0,
+            })
+        );
 
         // Try to write the same data again, observe that it's blocked
         assert_eq!(stream.write(&data), Err(WriteError::Blocked));
@@ -2004,6 +2011,13 @@ mod tests {
             offsets: 0..larger_send_window,
             fin: false,
         });
+        assert_eq!(
+            stream.progress(),
+            Ok(SendStreamProgress {
+                written_bytes: larger_send_window,
+                acknowledged_bytes: larger_send_window,
+            })
+        );
 
         assert_eq!(
             stream.state.poll(),
@@ -2076,6 +2090,13 @@ mod tests {
             offsets: 0..smaller_send_window,
             fin: false,
         });
+        assert_eq!(
+            stream.progress(),
+            Ok(SendStreamProgress {
+                written_bytes: initial_send_window,
+                acknowledged_bytes: smaller_send_window,
+            })
+        );
 
         assert_eq!(stream.write(&data), Err(WriteError::Blocked));
 

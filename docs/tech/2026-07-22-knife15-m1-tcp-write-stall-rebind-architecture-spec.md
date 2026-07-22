@@ -1,5 +1,9 @@
 # Knife15 M1 TCP write-stall Endpoint rebind architecture spec
 
+> Historical note: the `poll_write(Pending)`-alone trigger specified here was
+> falsified by bundle `...094608.tar.gz`. Its trigger semantics are superseded
+> by `2026-07-22-knife15-m1-stream-ack-qualified-rebind-architecture-spec.md`.
+
 Date: 2026-07-22
 
 ## Accepted evidence

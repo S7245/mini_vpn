@@ -122,6 +122,52 @@ async fn close_endpoint() {
     }
 }
 
+#[tokio::test]
+async fn send_stream_progress_handle_tracks_acknowledgements() {
+    let _guard = subscribe();
+    let endpoint = endpoint();
+    let server_endpoint = endpoint.clone();
+    const MSG: &[u8] = b"stream progress";
+
+    let server = tokio::spawn(async move {
+        let connection = server_endpoint
+            .accept()
+            .await
+            .expect("incoming connection")
+            .await
+            .expect("server handshake");
+        let mut recv = connection.accept_uni().await.expect("incoming stream");
+        let mut data = vec![0; MSG.len()];
+        recv.read_exact(&mut data).await.expect("read stream payload");
+        assert_eq!(data, MSG);
+    });
+
+    let connection = endpoint
+        .connect(endpoint.local_addr().expect("endpoint address"), "localhost")
+        .expect("start connection")
+        .await
+        .expect("client handshake");
+    let mut send = connection.open_uni().await.expect("open stream");
+    let progress = send.progress_handle();
+    send.write_all(MSG).await.expect("write stream payload");
+    assert_eq!(progress.sample().expect("written progress").written_bytes, MSG.len() as u64);
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if progress
+                .sample()
+                .is_ok_and(|sample| sample.acknowledged_bytes == MSG.len() as u64)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("peer acknowledgement progress");
+    server.await.expect("server task");
+}
+
 #[test]
 fn local_addr() {
     let socket = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
