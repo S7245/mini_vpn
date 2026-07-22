@@ -21,7 +21,8 @@ mini_vpn changes are intentionally limited to:
 - `src/connection/stats.rs`: read-only pacing diagnostics;
 - `src/connection/mod.rs`: pre-build reservation, traffic classification,
   per-datagram settlement, migration/cancel/detach, socket-batch attribution,
-  and pacing diagnostics;
+  pacing diagnostics, and a read-only authenticated-packet count used by the
+  Quinn live-rebind lifecycle;
 - `src/endpoint.rs`: create one fresh service per endpoint, attach stable
   connection/path keys, and pre-account stateless responses;
 - `src/tests/mod.rs` and `src/tests/util.rs`: endpoint isolation, default-off,

@@ -1,10 +1,37 @@
 # TODO
 
-## Current Knife15 Plan (2026-07-20)
+## Current Knife15 Plan (2026-07-21)
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-07-20)
+#### Latest decision (2026-07-21)
+
+Exact-source `1c587ba` HK bundle
+`/tmp/mini_vpn_knife15_macos_20260721_110225.tar.gz` (SHA-256 `62280ba0...`)
+was operated correctly and passed fresh baseline/direct. M1 ran about 6h43m,
+completed four active windows and all idle/resume boundaries, then failed
+cycle 28 `steady-c/short-reverse-6` with eight complete local receiver-zero
+seconds. Conn1 business RX paused `8,301ms` while conn0 control RX paused
+`10,733ms`; the shared Endpoint rebound, but Quinn released its retained old
+socket after only the first pooled connection proved the current socket.
+
+The local repair makes rebind recovery set-wise: Quinn retains one previous
+socket until every rebind-time live connection authenticates a current-socket
+packet or drains, and mini_vpn requires every sampled connection generation.
+Old-socket, routed-but-unauthenticated, stale-generation, and post-snapshot
+traffic cannot prove recovery. Review found and repaired the authentication
+P1. Full Rust/Quinn/proto/release/Clippy/shell/fmt/diff/secret gates pass; the
+32 MiB gate is `232.164 Mbit/s` with exact conservation. No frozen value or SLO
+changed. Result:
+`docs/tech/2026-07-21-knife15-m1-multi-connection-rebind-retention-local-results.md`.
+
+The failed bundle also had two independent reverse-UDP windows above `3%`.
+This remains a real discriminator, not a reason to tune or waive the SLO. Next
+run one fresh user-operated HK M1 from the pushed repair using a rebuilt
+release and fresh baseline/direct. Keep every other VPN/TUN disabled through
+`stop`; preserve `status/snapshot/stop` on failure. M2/M3 remain blocked.
+
+#### Previous decision (2026-07-20)
 
 The first real HK M1 bundle
 `/tmp/mini_vpn_knife15_macos_20260720_090636.tar.gz` (SHA-256 `5fd183b1...`)

@@ -1,5 +1,21 @@
 # Learnings
 
+## 2026-07-21 - Shared Endpoint recovery proof must be set-wise and authenticated
+
+- One current-socket packet proves only the connection that authenticated it.
+  On a pooled Endpoint, releasing the previous socket at that first proof can
+  strand another live connection even though an Endpoint-wide generation
+  counter advanced.
+- Snapshot the live set at rebind and discharge each member only with
+  authenticated current-generation evidence or drain. Old-socket packets,
+  post-snapshot connections, stale generations, and pre-auth routing are not
+  equivalent evidence.
+- Keep independent acceptance dimensions independent. Repairing the selected
+  TCP/rebind lifecycle does not explain away two reverse-UDP windows above the
+  frozen loss SLO; a fresh M1 must pass both.
+- Result:
+  `docs/tech/2026-07-21-knife15-m1-multi-connection-rebind-retention-local-results.md`.
+
 ## 2026-07-20 - Continuity evidence needs a proven command-tail boundary
 
 - The first real M1 stopped after five complete cycles because iperf emitted a

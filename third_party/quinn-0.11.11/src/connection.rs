@@ -24,12 +24,23 @@ use crate::{
     recv_stream::RecvStream,
     runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPoller},
     send_stream::SendStream,
-    udp_transmit, ConnectionEvent, Duration, Instant, VarInt,
+    udp_transmit, ConnectionEvent, ConnectionToEndpointEvent, Duration, Instant, VarInt,
 };
 use proto::{
-    congestion::Controller, ConnectionError, ConnectionHandle, ConnectionStats, Dir, EndpointEvent,
+    congestion::Controller, ConnectionError, ConnectionHandle, ConnectionStats, Dir,
     Side, StreamEvent, StreamId,
 };
+
+fn authenticated_current_socket_generation(
+    authenticated_before: u64,
+    authenticated_after: u64,
+    candidate_generation: Option<u64>,
+    current_generation: u64,
+) -> Option<u64> {
+    candidate_generation.filter(|generation| {
+        *generation > current_generation && authenticated_after > authenticated_before
+    })
+}
 
 /// In-progress connection attempt future
 #[derive(Debug)]
@@ -43,7 +54,7 @@ impl Connecting {
     pub(crate) fn new(
         handle: ConnectionHandle,
         conn: proto::Connection,
-        endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
+        endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, ConnectionToEndpointEvent)>,
         conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
@@ -539,6 +550,18 @@ impl Connection {
         self.0.state.lock("stats").inner.stats()
     }
 
+    /// Latest endpoint socket-rebind generation on which this connection authenticated a packet.
+    ///
+    /// Packets received on an Endpoint's temporarily retained previous socket do not advance this
+    /// value.
+    #[doc(hidden)]
+    pub fn current_socket_rx_rebind_generation(&self) -> u64 {
+        self.0
+            .state
+            .lock("current_socket_rx_rebind_generation")
+            .current_socket_rx_rebind_generation
+    }
+
     /// Current state of the congestion control algorithm, for debugging purposes
     pub fn congestion_state(&self) -> Box<dyn Controller> {
         self.0
@@ -892,7 +915,7 @@ impl ConnectionRef {
     fn new(
         handle: ConnectionHandle,
         conn: proto::Connection,
-        endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
+        endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, ConnectionToEndpointEvent)>,
         conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
         on_handshake_data: oneshot::Sender<()>,
         on_connected: oneshot::Sender<bool>,
@@ -911,6 +934,7 @@ impl ConnectionRef {
                 timer_deadline: None,
                 conn_events,
                 endpoint_events,
+                current_socket_rx_rebind_generation: 0,
                 blocked_writers: FxHashMap::default(),
                 blocked_readers: FxHashMap::default(),
                 stopped: FxHashMap::default(),
@@ -992,7 +1016,8 @@ pub(crate) struct State {
     timer: Option<Pin<Box<dyn AsyncTimer>>>,
     timer_deadline: Option<Instant>,
     conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
-    endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
+    endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, ConnectionToEndpointEvent)>,
+    current_socket_rx_rebind_generation: u64,
     pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
     pub(crate) blocked_readers: FxHashMap<StreamId, Waker>,
     pub(crate) stopped: FxHashMap<StreamId, Arc<Notify>>,
@@ -1121,7 +1146,9 @@ impl State {
     fn forward_endpoint_events(&mut self) {
         while let Some(event) = self.inner.poll_endpoint_events() {
             // If the endpoint driver is gone, noop.
-            let _ = self.endpoint_events.send((self.handle, event));
+            let _ = self
+                .endpoint_events
+                .send((self.handle, ConnectionToEndpointEvent::Proto(event)));
         }
     }
 
@@ -1138,8 +1165,32 @@ impl State {
                     self.io_poller = self.socket.clone().create_io_poller();
                     self.inner.local_address_changed();
                 }
-                Poll::Ready(Some(ConnectionEvent::Proto(event))) => {
+                Poll::Ready(Some(ConnectionEvent::Proto {
+                    event,
+                    current_socket_rx_rebind_generation,
+                })) => {
+                    let candidate_generation = current_socket_rx_rebind_generation.filter(
+                        |generation| *generation > self.current_socket_rx_rebind_generation,
+                    );
+                    let authenticated_before = candidate_generation
+                        .map(|_| self.inner.authenticated_packets());
                     self.inner.handle_event(event);
+                    let generation = authenticated_before.and_then(|authenticated_before| {
+                        authenticated_current_socket_generation(
+                            authenticated_before,
+                            self.inner.authenticated_packets(),
+                            candidate_generation,
+                            self.current_socket_rx_rebind_generation,
+                        )
+                    });
+                    if let Some(generation) = generation {
+                        self.current_socket_rx_rebind_generation =
+                            self.current_socket_rx_rebind_generation.max(generation);
+                        let _ = self.endpoint_events.send((
+                            self.handle,
+                            ConnectionToEndpointEvent::AuthenticatedCurrentSocketRx(generation),
+                        ));
+                    }
                 }
                 Poll::Ready(Some(ConnectionEvent::Close { reason, error_code })) => {
                     self.close(error_code, reason, shared);
@@ -1305,6 +1356,28 @@ impl State {
     }
 }
 
+#[cfg(test)]
+mod rebind_authentication_tests {
+    use super::authenticated_current_socket_generation;
+
+    #[test]
+    fn unauthenticated_routed_packet_cannot_advance_rebind_recovery() {
+        assert_eq!(
+            authenticated_current_socket_generation(41, 41, Some(3), 2),
+            None
+        );
+        assert_eq!(
+            authenticated_current_socket_generation(41, 42, Some(3), 2),
+            Some(3)
+        );
+        assert_eq!(
+            authenticated_current_socket_generation(41, 42, Some(3), 3),
+            None,
+            "each connection reports at most once per socket generation"
+        );
+    }
+}
+
 impl Drop for State {
     fn drop(&mut self) {
         self.abandon_and_detach_endpoint_pacing();
@@ -1312,7 +1385,10 @@ impl Drop for State {
             // Ensure the endpoint can tidy up
             let _ = self
                 .endpoint_events
-                .send((self.handle, proto::EndpointEvent::drained()));
+                .send((
+                    self.handle,
+                    ConnectionToEndpointEvent::Proto(proto::EndpointEvent::drained()),
+                ));
         }
     }
 }
@@ -1623,6 +1699,7 @@ mod endpoint_pacing_driver_tests {
             timer_deadline: None,
             conn_events,
             endpoint_events,
+            current_socket_rx_rebind_generation: 0,
             blocked_writers: Default::default(),
             blocked_readers: Default::default(),
             stopped: Default::default(),

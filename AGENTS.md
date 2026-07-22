@@ -187,7 +187,36 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-07-20:
+Current Knife15 summary, as of 2026-07-21:
+
+- Exact-source `1c587ba` HK M1 bundle
+  `/tmp/mini_vpn_knife15_macos_20260721_110225.tar.gz` (SHA-256
+  `62280ba0...`) was operated correctly, passed fresh baseline/direct, and ran
+  about 6h43m before cycle 28 `steady-c/short-reverse-6` failed with eight
+  complete local receiver-zero seconds. This is a real failure, not the
+  repaired partial-tail observer class.
+- Conn1 business RX paused `8,301ms` while conn0 control RX paused `10,733ms`.
+  Endpoint rebind triggered, but vendored Quinn released the previous socket
+  after the first pooled connection authenticated on the current socket. TUN,
+  pump, Endpoint conservation, routes, network controls, resources, and
+  cleanup remained healthy.
+- Quinn now snapshots every rebind-time live handle and retains one previous
+  socket until each member authenticates on the current generation or drains.
+  Old-socket, routed-but-unauthenticated, stale-generation, and post-snapshot
+  traffic cannot complete the set. mini_vpn requires every sampled pool
+  connection generation before logging recovery. The first implementation's
+  unauthenticated-routing P1 was repaired; no unresolved P0/P1 remains.
+- Root `646+3 ignored`, main `2`, Quinn `36+3 ignored + doc 1`, quinn-proto
+  `309 + doc 3`, release, Clippy, shell, fmt/diff, and secret gates pass. The
+  32 MiB capacity gate reached `232.164 Mbit/s` with exact conservation. No
+  frozen H10d16 or M1 value changed. Result:
+  `docs/tech/2026-07-21-knife15-m1-multi-connection-rebind-retention-local-results.md`.
+- The same partial run independently exceeded the reverse-UDP `3%` SLO in two
+  windows (`4.421980%`, `4.127822%`). The lifecycle repair does not waive or
+  claim to fix that result. Next use the pushed repair for one fresh user-run
+  HK M1 with rebuilt release and fresh baseline/direct. Keep other VPN/TUN off
+  through stop and preserve `status/snapshot/stop` on failure. M2/M3 remain
+  blocked.
 
 - The first real HK M1 bundle
   `/tmp/mini_vpn_knife15_macos_20260720_090636.tar.gz` (SHA-256

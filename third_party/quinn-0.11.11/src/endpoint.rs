@@ -25,9 +25,9 @@ use bytes::{Bytes, BytesMut};
 use pin_project_lite::pin_project;
 use proto::{
     self as proto, ClientConfig, ConnectError, ConnectionError, ConnectionHandle, DatagramEvent,
-    EndpointEvent, ServerConfig,
+    ServerConfig,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 #[cfg(all(not(wasm_browser), any(feature = "aws-lc-rs", feature = "ring"),))]
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::{futures::Notified, mpsc, Notify};
@@ -36,7 +36,7 @@ use udp::{RecvMeta, BATCH_SIZE};
 
 use crate::{
     connection::Connecting, incoming::Incoming, work_limiter::WorkLimiter, ConnectionEvent,
-    EndpointConfig, VarInt, IO_LOOP_BOUND, RECV_TIME_BOUND,
+    ConnectionToEndpointEvent, EndpointConfig, VarInt, IO_LOOP_BOUND, RECV_TIME_BOUND,
 };
 
 /// A QUIC endpoint.
@@ -263,9 +263,18 @@ impl Endpoint {
     pub fn rebind_abstract(&self, socket: Arc<dyn AsyncUdpSocket>) -> io::Result<()> {
         let addr = socket.local_addr()?;
         let mut inner = self.inner.state.lock().unwrap();
-        inner.prev_socket = Some(mem::replace(&mut inner.socket, socket));
+        let previous_socket = mem::replace(&mut inner.socket, socket);
+        let rebind_generation = inner.stats.socket_rebinds.saturating_add(1);
+        inner.prev_socket_connections = PreviousSocketConnections::at_rebind(
+            rebind_generation,
+            inner.recv_state.connections.senders.keys().copied(),
+        );
+        inner.prev_socket = inner
+            .prev_socket_connections
+            .must_retain_previous_socket()
+            .then_some(previous_socket);
         inner.ipv6 = addr.is_ipv6();
-        inner.stats.socket_rebinds = inner.stats.socket_rebinds.saturating_add(1);
+        inner.stats.socket_rebinds = rebind_generation;
 
         // Update connection socket references
         for sender in inner.recv_state.connections.senders.values() {
@@ -360,7 +369,8 @@ pub struct EndpointStats {
     pub ignored_handshakes: u64,
     /// Cumulative number of successful live UDP socket rebinds.
     pub socket_rebinds: u64,
-    /// Latest rebind generation for which a connection packet arrived on the current socket.
+    /// Latest rebind generation for which a connection authenticated a packet from the current
+    /// socket.
     ///
     /// Packets received on the temporarily retained previous socket do not advance this value.
     pub current_socket_rx_rebind_generation: u64,
@@ -494,17 +504,59 @@ impl EndpointInner {
 #[derive(Debug)]
 pub(crate) struct State {
     socket: Arc<dyn AsyncUdpSocket>,
-    /// During an active migration, abandoned_socket receives traffic
-    /// until the first packet arrives on the new socket.
+    /// During active migration, the previous socket receives traffic until every connection that
+    /// was live at rebind has authenticated a packet from the current socket or drained.
     prev_socket: Option<Arc<dyn AsyncUdpSocket>>,
+    prev_socket_connections: PreviousSocketConnections,
     inner: proto::Endpoint,
     recv_state: RecvState,
     driver: Option<Waker>,
     ipv6: bool,
-    events: mpsc::UnboundedReceiver<(ConnectionHandle, EndpointEvent)>,
+    events: mpsc::UnboundedReceiver<(ConnectionHandle, ConnectionToEndpointEvent)>,
     driver_lost: bool,
     runtime: Arc<dyn Runtime>,
     stats: EndpointStats,
+}
+
+#[derive(Debug, Default)]
+struct PreviousSocketConnections {
+    generation: u64,
+    pending: FxHashSet<ConnectionHandle>,
+}
+
+impl PreviousSocketConnections {
+    fn at_rebind(
+        generation: u64,
+        connections: impl IntoIterator<Item = ConnectionHandle>,
+    ) -> Self {
+        Self {
+            generation,
+            pending: connections.into_iter().collect(),
+        }
+    }
+
+    fn note_authenticated_current_socket_packet(
+        &mut self,
+        connection: ConnectionHandle,
+        generation: u64,
+    ) {
+        if generation == self.generation {
+            self.pending.remove(&connection);
+        }
+    }
+
+    fn note_connection_drained(&mut self, connection: ConnectionHandle) {
+        self.pending.remove(&connection);
+    }
+
+    fn must_retain_previous_socket(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, connection: ConnectionHandle) -> bool {
+        self.pending.contains(&connection)
+    }
 }
 
 #[derive(Debug)]
@@ -521,24 +573,29 @@ impl State {
         self.recv_state.recv_limiter.start_cycle(get_time);
         if let Some(socket) = &self.prev_socket {
             // We don't care about the `PollProgress` from old sockets.
-            let poll_res =
-                self.recv_state
-                    .poll_socket(cx, &mut self.inner, &**socket, &*self.runtime, now);
+            let poll_res = self.recv_state.poll_socket(
+                cx,
+                &mut self.inner,
+                &**socket,
+                &*self.runtime,
+                now,
+                None,
+            );
             if poll_res.is_err() {
                 self.prev_socket = None;
+                self.prev_socket_connections = PreviousSocketConnections::default();
             }
         };
-        let poll_res =
-            self.recv_state
-                .poll_socket(cx, &mut self.inner, &*self.socket, &*self.runtime, now);
+        let poll_res = self.recv_state.poll_socket(
+            cx,
+            &mut self.inner,
+            &*self.socket,
+            &*self.runtime,
+            now,
+            Some(self.stats.socket_rebinds),
+        );
         self.recv_state.recv_limiter.finish_cycle(get_time);
         let poll_res = poll_res?;
-        if poll_res.received_connection_packet {
-            // Traffic has arrived on self.socket, therefore there is no need for the abandoned
-            // one anymore. TODO: Account for multiple outgoing connections.
-            self.prev_socket = None;
-            self.stats.current_socket_rx_rebind_generation = self.stats.socket_rebinds;
-        }
         Ok(poll_res.keep_going)
     }
 
@@ -552,8 +609,28 @@ impl State {
                 }
             };
 
+            let event = match event {
+                ConnectionToEndpointEvent::AuthenticatedCurrentSocketRx(generation) => {
+                    self.stats.current_socket_rx_rebind_generation = self
+                        .stats
+                        .current_socket_rx_rebind_generation
+                        .max(generation);
+                    self.prev_socket_connections
+                        .note_authenticated_current_socket_packet(ch, generation);
+                    if !self.prev_socket_connections.must_retain_previous_socket() {
+                        self.prev_socket = None;
+                    }
+                    continue;
+                }
+                ConnectionToEndpointEvent::Proto(event) => event,
+            };
+
             if event.is_drained() {
                 self.recv_state.connections.senders.remove(&ch);
+                self.prev_socket_connections.note_connection_drained(ch);
+                if !self.prev_socket_connections.must_retain_previous_socket() {
+                    self.prev_socket = None;
+                }
                 if self.recv_state.connections.is_empty() {
                     shared.idle.notify_waiters();
                 }
@@ -568,7 +645,10 @@ impl State {
                 .senders
                 .get_mut(&ch)
                 .unwrap()
-                .send(ConnectionEvent::Proto(event));
+                .send(ConnectionEvent::Proto {
+                    event,
+                    current_socket_rx_rebind_generation: None,
+                });
         }
 
         true
@@ -639,7 +719,7 @@ struct ConnectionSet {
     /// Senders for communicating with the endpoint's connections
     senders: FxHashMap<ConnectionHandle, mpsc::UnboundedSender<ConnectionEvent>>,
     /// Stored to give out clones to new ConnectionInners
-    sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
+    sender: mpsc::UnboundedSender<(ConnectionHandle, ConnectionToEndpointEvent)>,
     /// Set if the endpoint has been manually closed
     close: Option<(VarInt, Bytes)>,
 }
@@ -736,6 +816,7 @@ impl EndpointRef {
             state: Mutex::new(State {
                 socket,
                 prev_socket: None,
+                prev_socket_connections: PreviousSocketConnections::default(),
                 inner,
                 ipv6,
                 events,
@@ -788,7 +869,7 @@ struct RecvState {
 
 impl RecvState {
     fn new(
-        sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
+        sender: mpsc::UnboundedSender<(ConnectionHandle, ConnectionToEndpointEvent)>,
         max_receive_segments: usize,
         endpoint: &proto::Endpoint,
     ) -> Self {
@@ -817,8 +898,8 @@ impl RecvState {
         socket: &dyn AsyncUdpSocket,
         runtime: &dyn Runtime,
         now: Instant,
+        current_socket_rx_rebind_generation: Option<u64>,
     ) -> Result<PollProgress, io::Error> {
-        let mut received_connection_packet = false;
         let mut metas = [RecvMeta::default(); BATCH_SIZE];
         let mut iovs: [IoSliceMut; BATCH_SIZE] = {
             let mut bufs = self
@@ -859,13 +940,13 @@ impl RecvState {
                                 }
                                 Some(DatagramEvent::ConnectionEvent(handle, event)) => {
                                     // Ignoring errors from dropped connections that haven't yet been cleaned up
-                                    received_connection_packet = true;
-                                    let _ = self
-                                        .connections
-                                        .senders
-                                        .get_mut(&handle)
-                                        .unwrap()
-                                        .send(ConnectionEvent::Proto(event));
+                                    let _ =
+                                        self.connections.senders.get_mut(&handle).unwrap().send(
+                                            ConnectionEvent::Proto {
+                                                event,
+                                                current_socket_rx_rebind_generation,
+                                            },
+                                        );
                                 }
                                 Some(DatagramEvent::Response(transmit)) => {
                                     respond(transmit, &response_buffer, socket, endpoint, now);
@@ -877,7 +958,6 @@ impl RecvState {
                 }
                 Poll::Pending => {
                     return Ok(PollProgress {
-                        received_connection_packet,
                         keep_going: false,
                     });
                 }
@@ -892,7 +972,6 @@ impl RecvState {
             }
             if !self.recv_limiter.allow_work(|| runtime.now()) {
                 return Ok(PollProgress {
-                    received_connection_packet,
                     keep_going: true,
                 });
             }
@@ -913,8 +992,6 @@ impl fmt::Debug for RecvState {
 
 #[derive(Default)]
 struct PollProgress {
-    /// Whether a datagram was routed to an existing connection
-    received_connection_packet: bool,
     /// Whether datagram handling was interrupted early by the work limiter for fairness
     keep_going: bool,
 }
@@ -1079,5 +1156,81 @@ mod endpoint_pacing_stateless_tests {
 
         assert_eq!(socket.attempts(), 1);
         assert!(endpoint.endpoint_pacing_snapshot().is_none());
+    }
+}
+
+#[cfg(test)]
+mod multi_connection_rebind_state_tests {
+    use super::{ConnectionHandle, PreviousSocketConnections};
+
+    #[test]
+    fn first_current_socket_recovery_retains_previous_socket_for_other_connections() {
+        let first = ConnectionHandle(11);
+        let second = ConnectionHandle(12);
+        let mut pending = PreviousSocketConnections::at_rebind(1, [first, second]);
+
+        pending.note_authenticated_current_socket_packet(first, 1);
+
+        assert!(pending.must_retain_previous_socket());
+        assert!(!pending.contains(first));
+        assert!(pending.contains(second));
+    }
+
+    #[test]
+    fn all_current_socket_recoveries_release_previous_socket() {
+        let first = ConnectionHandle(11);
+        let second = ConnectionHandle(12);
+        let mut pending = PreviousSocketConnections::at_rebind(1, [first, second]);
+
+        pending.note_authenticated_current_socket_packet(first, 1);
+        pending.note_authenticated_current_socket_packet(second, 1);
+
+        assert!(!pending.must_retain_previous_socket());
+    }
+
+    #[test]
+    fn drained_pending_connection_releases_previous_socket() {
+        let connection = ConnectionHandle(11);
+        let mut pending = PreviousSocketConnections::at_rebind(1, [connection]);
+
+        pending.note_connection_drained(connection);
+
+        assert!(!pending.must_retain_previous_socket());
+    }
+
+    #[test]
+    fn post_rebind_connection_does_not_extend_previous_socket_lifetime() {
+        let existing = ConnectionHandle(11);
+        let post_rebind = ConnectionHandle(12);
+        let mut pending = PreviousSocketConnections::at_rebind(1, [existing]);
+
+        pending.note_authenticated_current_socket_packet(post_rebind, 1);
+
+        assert!(pending.contains(existing));
+        assert!(!pending.contains(post_rebind));
+    }
+
+    #[test]
+    fn next_rebind_replaces_the_previous_pending_snapshot() {
+        let first_generation = ConnectionHandle(11);
+        let second_generation = ConnectionHandle(12);
+        let pending = PreviousSocketConnections::at_rebind(1, [first_generation]);
+        assert!(pending.contains(first_generation));
+
+        let pending = PreviousSocketConnections::at_rebind(2, [second_generation]);
+
+        assert!(!pending.contains(first_generation));
+        assert!(pending.contains(second_generation));
+    }
+
+    #[test]
+    fn stale_authenticated_generation_cannot_complete_a_later_rebind() {
+        let connection = ConnectionHandle(11);
+        let mut pending = PreviousSocketConnections::at_rebind(2, [connection]);
+
+        pending.note_authenticated_current_socket_packet(connection, 1);
+
+        assert!(pending.contains(connection));
+        assert!(pending.must_retain_previous_socket());
     }
 }

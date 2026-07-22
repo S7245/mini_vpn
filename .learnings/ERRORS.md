@@ -1,5 +1,39 @@
 # Errors
 
+## 2026-07-21 - Endpoint routing was initially mistaken for authenticated recovery
+
+- The first multi-connection repair removed a pending handle as soon as the
+  Endpoint routed a datagram to that connection. Quinn routing precedes packet-
+  protection authentication, so corrupt or spoofed traffic could falsely
+  release the previous socket.
+- Code review moved recovery proof behind connection event handling and a real
+  authenticated-packet-count advance. Each connection reports at most once per
+  generation; stale and old-socket events cannot advance it.
+- A focused negative test and the full Quinn/root/capacity gates pass after the
+  repair. Reusable rule: identity routing selects the consumer, but only
+  protocol authentication proves path recovery.
+
+## 2026-07-21 - Standalone Quinn tests require the explicit local proto patch
+
+- Directly invoking the vendored Quinn manifest selected registry
+  `quinn-proto` and failed on missing Endpoint pacing and authenticated-packet
+  APIs. This was dependency-provenance failure, not a product regression.
+- The correct gate passes an absolute
+  `patch.crates-io.quinn-proto.path`, verifies `cargo tree`, and requires a
+  nonzero executed test count. This rule already existed in project memory and
+  must be applied before interpreting standalone compiler output.
+
+## 2026-07-21 - One pooled connection cannot complete Endpoint-wide rebind
+
+- The six-hour HK M1 had simultaneous conn0/conn1 receive gaps. The Endpoint
+  rebound, then the old lifecycle released its previous socket on the first
+  current-socket connection packet while the other connection remained
+  stalled for eight complete receiver seconds.
+- Treating Endpoint-level first RX as full recovery produced a false-positive
+  recovery event and selected the wrong socket lifetime. The repair snapshots
+  every live handle and waits for per-connection authenticated recovery or
+  drain without changing any threshold or workload value.
+
 ## 2026-07-20 - A direct fixture changed only one endpoint's duration
 
 - The new direct-discriminator tail regression initially changed the iperf

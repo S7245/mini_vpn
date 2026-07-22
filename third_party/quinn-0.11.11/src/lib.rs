@@ -100,8 +100,17 @@ enum ConnectionEvent {
         error_code: VarInt,
         reason: bytes::Bytes,
     },
-    Proto(proto::ConnectionEvent),
+    Proto {
+        event: proto::ConnectionEvent,
+        current_socket_rx_rebind_generation: Option<u64>,
+    },
     Rebind(Arc<dyn AsyncUdpSocket>),
+}
+
+#[derive(Debug)]
+enum ConnectionToEndpointEvent {
+    Proto(proto::EndpointEvent),
+    AuthenticatedCurrentSocketRx(u64),
 }
 
 fn udp_transmit<'a>(t: &proto::Transmit, buffer: &'a [u8]) -> udp::Transmit<'a> {

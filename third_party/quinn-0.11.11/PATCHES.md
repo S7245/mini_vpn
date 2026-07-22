@@ -13,9 +13,14 @@ ignored stress tests, one ignored `many_connections` integration test, and
 The endpoint-pacing stage may change only:
 
 - `Cargo.toml`: pin direct `socket2` to the accepted lockfile version `0.6.3`;
-- `src/connection.rs`: thin current-waker and real socket-outcome Adapter;
-- `src/endpoint.rs`: immediate stateless-response reservation/socket outcome;
-- `src/lib.rs`: re-export read-only endpoint-pacing config and snapshots;
+- `src/connection.rs`: thin current-waker and real socket-outcome Adapter,
+  plus authenticated per-connection current-socket rebind generation;
+- `src/endpoint.rs`: immediate stateless-response reservation/socket outcome,
+  plus rebind-time live-connection snapshot and previous-socket retention;
+- `src/lib.rs`: re-export read-only endpoint-pacing config and snapshots and
+  carry internal socket-generation/authentication events;
+- `src/tests.rs`: prove authenticated current-socket generation on live
+  rebind;
 - `examples/README.md`: remove upstream trailing whitespace so the repository
   diff-check remains clean;
 - focused tests that prove default equivalence, Adapter lifecycle, socket
@@ -31,5 +36,6 @@ does not change socket behavior or pacing policy.
 Rate, burst, fairness, reservation, and token policy remain in the pinned
 `quinn-proto 0.11.16` Module. No UDP socket implementation, runtime, stream,
 endpoint, crypto, congestion, loss, MTU, GSO, or protocol policy is replaced.
-The modified suite passes `29/29` nonignored unit tests (`3` expected ignored)
-and `1/1` doc test.
+The modified suite passes `36/36` nonignored unit tests (`3` expected ignored)
+and `1/1` doc test. The one `many_connections` integration test remains
+expected ignored.

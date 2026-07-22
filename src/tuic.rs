@@ -14,7 +14,7 @@ use crate::upstream::{
     OpenedTcpRelay, ProxyUpstream, RelayStream, TcpRelayOpenDiag, current_tcp_relay_open_diag,
 };
 use quinn::{Connection, Endpoint, VarInt};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
@@ -3514,6 +3514,7 @@ struct EndpointRecoveryConnectionSample {
     tx_bytes: u64,
     rx_bytes: u64,
     rtt: Duration,
+    current_socket_rx_rebind_generation: u64,
 }
 
 #[derive(Debug)]
@@ -3538,6 +3539,7 @@ enum EndpointRecoveryAction {
         generation: u64,
         socket_generation: u64,
         recovery_time: Duration,
+        connection_count: usize,
     },
 }
 
@@ -3556,6 +3558,8 @@ struct EndpointRecoveryState {
     rebind_generation: u64,
     rebound_at: Option<Instant>,
     expected_socket_generation: Option<u64>,
+    pending_recovery_connections: HashSet<usize>,
+    expected_recovery_connection_count: usize,
 }
 
 impl EndpointRecoveryState {
@@ -3586,10 +3590,18 @@ impl EndpointRecoveryState {
         }
         self.connections = next;
 
-        if self
-            .expected_socket_generation
-            .is_some_and(|generation| input.current_socket_rx_rebind_generation >= generation)
-        {
+        if let Some(expected_generation) = self.expected_socket_generation {
+            for sample in &input.connections {
+                if sample.current_socket_rx_rebind_generation >= expected_generation {
+                    self.pending_recovery_connections.remove(&sample.stable_id);
+                }
+            }
+        }
+
+        if self.expected_socket_generation.is_some_and(|generation| {
+            input.current_socket_rx_rebind_generation >= generation
+                && self.pending_recovery_connections.is_empty()
+        }) {
             let socket_generation = self.expected_socket_generation.unwrap_or(0);
             let recovered = self
                 .rebound_at
@@ -3597,6 +3609,7 @@ impl EndpointRecoveryState {
                     generation: self.rebind_generation,
                     socket_generation,
                     recovery_time: now.saturating_duration_since(rebound_at),
+                    connection_count: self.expected_recovery_connection_count,
                 });
             self.clear_episode();
             return recovered.unwrap_or(EndpointRecoveryAction::None);
@@ -3621,6 +3634,7 @@ impl EndpointRecoveryState {
                         generation: self.rebind_generation,
                         socket_generation: 0,
                         recovery_time: now.saturating_duration_since(rebound_at),
+                        connection_count: self.expected_recovery_connection_count,
                     });
             self.clear_episode();
             return recovered.unwrap_or(EndpointRecoveryAction::None);
@@ -3665,6 +3679,8 @@ impl EndpointRecoveryState {
         if self.rebound_without_rx {
             self.rebound_at = Some(now);
             self.expected_socket_generation = Some(socket_generation);
+            self.pending_recovery_connections = self.connections.keys().copied().collect();
+            self.expected_recovery_connection_count = self.pending_recovery_connections.len();
         }
     }
 
@@ -3674,6 +3690,8 @@ impl EndpointRecoveryState {
         self.rebound_without_rx = false;
         self.rebound_at = None;
         self.expected_socket_generation = None;
+        self.pending_recovery_connections.clear();
+        self.expected_recovery_connection_count = 0;
     }
 }
 
@@ -4473,9 +4491,10 @@ impl TuicUpstream {
                         generation,
                         socket_generation,
                         recovery_time,
+                        connection_count,
                     } => {
                         println!(
-                            "✅ tuic-endpoint-rebind-recovered generation={generation} first_rx_ms={} socket_generation={socket_generation}",
+                            "✅ tuic-endpoint-rebind-recovered generation={generation} first_rx_ms={} socket_generation={socket_generation} connections={connection_count}",
                             recovery_time.as_millis(),
                         );
                     }
@@ -4539,6 +4558,7 @@ impl TuicUpstream {
                 tx_bytes: stats.udp_tx.bytes,
                 rx_bytes: stats.udp_rx.bytes,
                 rtt: stats.path.rtt,
+                current_socket_rx_rebind_generation: conn.current_socket_rx_rebind_generation(),
             });
         }
         let active_tcp = self.tcp_pool_selector.active_total();
@@ -4912,6 +4932,7 @@ mod tests {
                 tx_bytes,
                 rx_bytes: 1_000,
                 rtt,
+                current_socket_rx_rebind_generation: 0,
             }],
         };
 
@@ -4952,6 +4973,7 @@ mod tests {
                 tx_bytes,
                 rx_bytes,
                 rtt: Duration::from_millis(100),
+                current_socket_rx_rebind_generation: 0,
             }],
         };
 
@@ -4983,44 +5005,52 @@ mod tests {
     fn endpoint_recovery_requires_endpoint_wide_stall_and_rearms_on_rx() {
         let started = Instant::now();
         let mut state = EndpointRecoveryState::default();
-        let sample =
-            |active_tcp, first_tx, first_rx, second_tx, second_rx, socket_rx_generation| {
-                EndpointRecoveryInput {
-                    active_tcp,
-                    udp_active: false,
-                    current_socket_rx_rebind_generation: socket_rx_generation,
-                    connections: vec![
-                        EndpointRecoveryConnectionSample {
-                            stable_id: 11,
-                            tx_bytes: first_tx,
-                            rx_bytes: first_rx,
-                            rtt: Duration::from_millis(100),
-                        },
-                        EndpointRecoveryConnectionSample {
-                            stable_id: 12,
-                            tx_bytes: second_tx,
-                            rx_bytes: second_rx,
-                            rtt: Duration::from_millis(150),
-                        },
-                    ],
-                }
-            };
+        let sample = |active_tcp,
+                      first_tx,
+                      first_rx,
+                      second_tx,
+                      second_rx,
+                      socket_rx_generation,
+                      first_socket_rx_generation,
+                      second_socket_rx_generation| {
+            EndpointRecoveryInput {
+                active_tcp,
+                udp_active: false,
+                current_socket_rx_rebind_generation: socket_rx_generation,
+                connections: vec![
+                    EndpointRecoveryConnectionSample {
+                        stable_id: 11,
+                        tx_bytes: first_tx,
+                        rx_bytes: first_rx,
+                        rtt: Duration::from_millis(100),
+                        current_socket_rx_rebind_generation: first_socket_rx_generation,
+                    },
+                    EndpointRecoveryConnectionSample {
+                        stable_id: 12,
+                        tx_bytes: second_tx,
+                        rx_bytes: second_rx,
+                        rtt: Duration::from_millis(150),
+                        current_socket_rx_rebind_generation: second_socket_rx_generation,
+                    },
+                ],
+            }
+        };
 
         assert_eq!(
-            state.observe(started, &sample(2, 100, 100, 100, 100, 0)),
+            state.observe(started, &sample(2, 100, 100, 100, 100, 0, 0, 0)),
             EndpointRecoveryAction::None
         );
         assert_eq!(
             state.observe(
                 started + Duration::from_millis(250),
-                &sample(2, 200, 100, 100, 100, 0),
+                &sample(2, 200, 100, 100, 100, 0, 0, 0),
             ),
             EndpointRecoveryAction::None
         );
         assert_eq!(
             state.observe(
                 started + Duration::from_secs(3),
-                &sample(2, 300, 100, 100, 101, 0),
+                &sample(2, 300, 100, 100, 101, 0, 0, 0),
             ),
             EndpointRecoveryAction::None,
             "RX on either connection proves that the shared endpoint is alive"
@@ -5028,12 +5058,12 @@ mod tests {
 
         let second_episode = started + Duration::from_secs(4);
         assert_eq!(
-            state.observe(second_episode, &sample(2, 400, 100, 100, 101, 0)),
+            state.observe(second_episode, &sample(2, 400, 100, 100, 101, 0, 0, 0),),
             EndpointRecoveryAction::None
         );
         let action = state.observe(
             second_episode + Duration::from_secs(2),
-            &sample(2, 500, 100, 100, 101, 0),
+            &sample(2, 500, 100, 100, 101, 0, 0, 0),
         );
         assert!(matches!(
             action,
@@ -5043,7 +5073,7 @@ mod tests {
         assert_eq!(
             state.observe(
                 second_episode + Duration::from_millis(2_050),
-                &sample(2, 500, 101, 100, 101, 0),
+                &sample(2, 500, 101, 100, 101, 0, 0, 0),
             ),
             EndpointRecoveryAction::None,
             "a packet on Quinn's retained old socket must not complete rebind recovery"
@@ -5051,12 +5081,21 @@ mod tests {
         assert_eq!(
             state.observe(
                 second_episode + Duration::from_millis(2_100),
-                &sample(2, 500, 101, 100, 101, 1),
+                &sample(2, 500, 101, 100, 101, 1, 1, 0),
+            ),
+            EndpointRecoveryAction::None,
+            "one current-socket connection cannot prove that the other pooled connection migrated"
+        );
+        assert_eq!(
+            state.observe(
+                second_episode + Duration::from_millis(2_150),
+                &sample(2, 500, 101, 100, 101, 1, 1, 1),
             ),
             EndpointRecoveryAction::Recovered {
                 generation: 1,
                 socket_generation: 1,
-                recovery_time: Duration::from_millis(100),
+                recovery_time: Duration::from_millis(150),
+                connection_count: 2,
             }
         );
 
@@ -5087,6 +5126,7 @@ mod tests {
                 tx_bytes,
                 rx_bytes: 100,
                 rtt: Duration::from_millis(100),
+                current_socket_rx_rebind_generation: 0,
             }],
         };
 

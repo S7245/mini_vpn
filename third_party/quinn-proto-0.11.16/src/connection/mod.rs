@@ -1562,6 +1562,12 @@ impl Connection {
         stats
     }
 
+    /// Number of packets that passed packet protection authentication.
+    #[doc(hidden)]
+    pub fn authenticated_packets(&self) -> u64 {
+        self.total_authed_packets
+    }
+
     /// Ping the remote endpoint
     ///
     /// Causes an ACK-eliciting packet to be transmitted.

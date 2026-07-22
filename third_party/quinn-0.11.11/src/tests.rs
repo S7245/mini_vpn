@@ -745,11 +745,13 @@ async fn rebind_recv() {
     connected_recv.notified().await;
     assert_eq!(client.stats().socket_rebinds, 0);
     assert_eq!(client.stats().current_socket_rx_rebind_generation, 0);
+    assert_eq!(connection.current_socket_rx_rebind_generation(), 0);
     client
         .rebind(UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap())
         .unwrap();
     assert_eq!(client.stats().socket_rebinds, 1);
     assert_eq!(client.stats().current_socket_rx_rebind_generation, 0);
+    assert_eq!(connection.current_socket_rx_rebind_generation(), 0);
     info!("rebound");
     let mut path_probe = connection.open_uni().await.unwrap();
     path_probe.write_all(b"p").await.unwrap();
@@ -758,6 +760,7 @@ async fn rebind_recv() {
     let mut stream = connection.accept_uni().await.unwrap();
     assert_eq!(stream.read_to_end(MSG.len()).await.unwrap(), MSG);
     assert_eq!(client.stats().current_socket_rx_rebind_generation, 1);
+    assert_eq!(connection.current_socket_rx_rebind_generation(), 1);
     server.await.unwrap();
 }
 

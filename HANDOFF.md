@@ -2,9 +2,38 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 Release Readiness (2026-07-20)
+## Next Planned Stage — Knife15 Release Readiness (2026-07-21)
 
-- **Latest accepted position:** the first real HK M1 bundle
+- **Latest accepted position:** exact-source `1c587ba` HK M1 bundle
+  `/tmp/mini_vpn_knife15_macos_20260721_110225.tar.gz` (SHA-256
+  `62280ba0...`) was operated correctly, passed fresh baseline/direct, then
+  failed after about 6h43m in cycle 28 `steady-c/short-reverse-6`. The local
+  receiver had eight complete zero-byte seconds; this is not a partial-tail
+  observer failure.
+- Conn1 business RX paused `8,301ms` while conn0 control RX paused `10,733ms`.
+  Endpoint rebind triggered correctly, but old Quinn released its previous
+  socket after the first pooled connection reached the current socket; the
+  other connection had not yet proved migration. TUN/pump/Endpoint ownership,
+  routes, controls, resources, and cleanup stayed healthy.
+- Quinn now snapshots all live handles at rebind and retains one previous
+  socket until every snapshot connection authenticates on the current
+  generation or drains. Routed-but-unauthenticated, old-socket, stale-
+  generation, and post-snapshot connection traffic cannot complete recovery.
+  mini_vpn also requires every sampled pool connection generation before
+  logging recovery.
+- Code review found and repaired the unauthenticated-routing P1. Root
+  `646+3 ignored`, main `2`, Quinn `36+3 ignored + doc 1`, quinn-proto
+  `309 + doc 3`, release, Clippy, shell, fmt/diff, and secret gates pass. The
+  32 MiB capacity gate reached `232.164 Mbit/s` with exact conservation. No
+  frozen value changed and no P0/P1 remains. Result:
+  `docs/tech/2026-07-21-knife15-m1-multi-connection-rebind-retention-local-results.md`.
+- This real bundle also had two independent reverse-UDP windows above the
+  `3%` SLO (`4.421980%`, `4.127822%`). The rebind repair does not waive or
+  claim to fix them. Next take one fresh user-run HK M1 from the pushed repair
+  with a rebuilt release and fresh baseline/direct. Keep every other VPN/TUN
+  off through `stop`; on failure preserve `status/snapshot/stop`. M2/M3 remain
+  blocked.
+- **Previous accepted position:** the first real HK M1 bundle
   `/tmp/mini_vpn_knife15_macos_20260720_090636.tar.gz` (SHA-256
   `5fd183b1...`) used exact source `dc8cfb1` and was operated correctly. It
   completed five full mixed cycles before cycle 6 forward was falsely rejected

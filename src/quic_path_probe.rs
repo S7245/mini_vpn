@@ -921,6 +921,8 @@ async fn endpoint_window_rebind_preserves_two_live_connections_and_conservation(
     assert_ne!(rebound.new_local_addr.port(), before_addr.port());
     assert_eq!(rebound.rebind_generation, 1);
     assert_eq!(endpoint.stats().current_socket_rx_rebind_generation, 0);
+    assert_eq!(first.current_socket_rx_rebind_generation(), 0);
+    assert_eq!(second.current_socket_rx_rebind_generation(), 0);
     assert_eq!(endpoint.local_addr().unwrap(), rebound.new_local_addr);
 
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -932,6 +934,8 @@ async fn endpoint_window_rebind_preserves_two_live_connections_and_conservation(
     .await
     .expect("both established connections must survive endpoint socket rebind");
     assert_eq!(endpoint.stats().current_socket_rx_rebind_generation, 1);
+    assert_eq!(first.current_socket_rx_rebind_generation(), 1);
+    assert_eq!(second.current_socket_rx_rebind_generation(), 1);
 
     let after_pacing = endpoint.endpoint_pacing_snapshot().unwrap();
     assert_eq!(
