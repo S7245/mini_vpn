@@ -4,7 +4,32 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-22)
 
-- **Latest accepted position:** exact-source `e479013` HK bundle
+- **Latest accepted position:** exact-source `f60926e` HK bundle
+  `/tmp/mini_vpn_knife15_macos_20260722_110059.tar.gz` (SHA-256
+  `9071ec0f...`) was operated correctly. Baseline was `24.371/30.882 Mbit/s`;
+  direct passed 300 seconds at `12.181 Mbit/s`. M1's first forward phase then
+  had one complete initial Target receiver-zero second.
+- Smoke completed at `11:01:45Z` and M1 began at `11:01:46Z`. The old conn1
+  reverse-data relay still held two native half leases. M1 control occupied
+  conn0; the `2:2` tie placed M1 data on conn0 too; conn1 reaped only after the
+  open. Earlier comparable starts drained first, split the pair across the
+  pool, and had positive first intervals. User operation, delayed stop,
+  physical continuity, TUN, pacing, conservation, and rebind are rejected.
+- TUIC now publishes transition-only TCP-pool `active_leases`. Smoke waits for
+  exact zero within its existing hard timeout, and formal M0/M1 independently
+  require zero. Missing/malformed/nonzero evidence fails closed with TUN
+  evidence preserved. There is no fixed sleep, selector change, SLI waiver, or
+  frozen-value tuning.
+- Root `666+3 ignored`, main `2`, Quinn `37+3 ignored + doc 1`, quinn-proto
+  `309 + doc 3`, release, Clippy, shell, fmt/diff/secret, and review gates
+  pass. Capacity is `240.322 Mbit/s`, final `61,440/0/0B`; no P0/P1 remains.
+  Result:
+  `docs/tech/2026-07-22-knife15-m1-post-smoke-pool-idle-local-results.md`.
+- Next use the pushed repair for one fresh user-run HK M1 with rebuilt release
+  and fresh baseline/direct. Keep every other VPN/TUN off through `stop` and
+  preserve status/snapshot/stop on failure. M2/M3 remain blocked.
+
+- **Previous accepted position:** exact-source `e479013` HK bundle
   `/tmp/mini_vpn_knife15_macos_20260722_094608.tar.gz` (SHA-256
   `7443769e...`) was operated correctly. Fresh baseline was
   `31.258/26.417 Mbit/s`; direct passed 300 seconds at `15.621 Mbit/s` with

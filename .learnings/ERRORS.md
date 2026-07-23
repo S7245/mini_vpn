@@ -1,5 +1,20 @@
 # Errors
 
+## 2026-07-22 - Smoke completion was mistaken for TCP-pool quiescence
+
+- Exact source `f60926e` passed baseline/direct, then M1's first Target
+  receiver interval was zero. Smoke had completed at the command layer, but
+  its conn1 reverse-data relay still owned both native half leases when M1
+  control/data opened.
+- The resulting `2:2` least-active tie placed both M1 flows on conn0. Three
+  comparable starts with a drained smoke tail placed them on conn0/conn1 and
+  had positive first intervals. Delayed `stop`, low bandwidth, pacing, TUN,
+  and false rebind were not the cause.
+- Correct behavior: publish the exact pool lease total, wait for zero with a
+  bounded fail-closed barrier, and independently require zero before formal
+  M0/M1. Do not repair this class with a fixed sleep, selector tuning, or an
+  initial-interval SLI waiver.
+
 ## 2026-07-22 - Pending-only recovery caused a false-rebind feedback loop
 
 - Exact source `e479013` passed fresh baseline/direct, then M1 cycle 1 forward

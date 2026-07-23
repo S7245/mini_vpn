@@ -339,6 +339,43 @@ workload_command_matches() {
     "$command_text" == *"knife15-macos-soak.sh m1" ]]
 }
 
+tcp_pool_latest_active_leases() {
+  local log_file="$1"
+  [[ -f "$log_file" ]] || return 1
+  awk '
+    /tuic-tcp-pool-activity active_leases=/ {
+      value = $0
+      sub(/^.*tuic-tcp-pool-activity active_leases=/, "", value)
+      latest = value
+      found = 1
+    }
+    END {
+      if (!found) exit 1
+      print latest
+    }
+  ' "$log_file"
+}
+
+tcp_pool_activity_is_idle() {
+  local active_leases
+  active_leases="$(tcp_pool_latest_active_leases "$1")" || return 1
+  [[ "$active_leases" =~ ^[0-9]+$ ]] || return 1
+  ((10#$active_leases == 0))
+}
+
+wait_for_tcp_pool_idle() {
+  local log_file="$1"
+  local timeout_secs="$2"
+  local deadline
+  validate_positive_integer "$timeout_secs" || return 1
+  deadline=$((SECONDS + 10#$timeout_secs))
+  while ((SECONDS < deadline)); do
+    tcp_pool_activity_is_idle "$log_file" && return 0
+    /bin/sleep 1
+  done
+  tcp_pool_activity_is_idle "$log_file"
+}
+
 watchdog_matches_run() {
   local watchdog_pid watchdog_expected watchdog_current
   watchdog_pid="$(read_state watchdog.pid 2>/dev/null || true)"
@@ -1550,6 +1587,24 @@ runner_self_test() {
     die "self-test: M1 workload command rejected"
   ! workload_command_matches 'bash scripts/knife15-macos-soak.sh smoke' || \
     die "self-test: non-M0 workload command accepted"
+
+  printf '%s\n' 'ordinary log line' >"$tmp/tcp-pool-activity.log"
+  ! tcp_pool_activity_is_idle "$tmp/tcp-pool-activity.log" || \
+    die "self-test: missing TCP-pool activity evidence was accepted as idle"
+  printf '%s\n' \
+    '🔎 tuic-tcp-pool-activity active_leases=4' \
+    '🔎 tuic-tcp-pool-activity active_leases=2' \
+    >>"$tmp/tcp-pool-activity.log"
+  ! tcp_pool_activity_is_idle "$tmp/tcp-pool-activity.log" || \
+    die "self-test: live TCP-pool ownership was accepted as idle"
+  printf '%s\n' '🔎 tuic-tcp-pool-activity active_leases=0' \
+    >>"$tmp/tcp-pool-activity.log"
+  tcp_pool_activity_is_idle "$tmp/tcp-pool-activity.log" || \
+    die "self-test: exact zero TCP-pool ownership was rejected"
+  printf '%s\n' '🔎 tuic-tcp-pool-activity active_leases=unknown' \
+    >"$tmp/tcp-pool-activity.log"
+  ! tcp_pool_activity_is_idle "$tmp/tcp-pool-activity.log" || \
+    die "self-test: malformed TCP-pool activity evidence was accepted as idle"
 
   baseline_dir="$tmp/baseline"
   mkdir "$baseline_dir"
@@ -4099,6 +4154,12 @@ run_smoke() {
       die "DNS smoke failed; leave TUN running for status/stop"
     fi
   fi
+  echo "Waiting for smoke TCP-pool ownership to drain: hard_timeout=${smoke_timeout_secs}s"
+  if ! wait_for_tcp_pool_idle "$run_dir/mini_vpn.log" "$smoke_timeout_secs"; then
+    append_event_to "$run_dir" "smoke TCP pool drain failed"
+    die "smoke TCP-pool ownership did not drain; leave TUN running for status/snapshot/stop"
+  fi
+  append_event_to "$run_dir" "smoke TCP pool idle"
   sample_once_for "$run_dir"
   append_event_to "$run_dir" "smoke complete"
   echo "PASS: target-only smoke completed: $smoke_dir"
@@ -4138,6 +4199,8 @@ run_m0_action() {
     die "Exit route recursed into $utun"
   network_control_is_sufficient "$run_dir" 5 && network_control_is_recent || \
     die "formal M0 requires complete, recent Exit and physical-interface controls from start/smoke"
+  tcp_pool_activity_is_idle "$run_dir/mini_vpn.log" || \
+    die "formal M0 requires fully drained TCP-pool ownership after smoke"
   require_command jq
   require_command iperf3
   require_command dig
@@ -4247,6 +4310,8 @@ run_m1_action() {
     die "Exit route recursed into $utun"
   network_control_is_sufficient "$run_dir" 5 && network_control_is_recent || \
     die "formal M1 requires complete, recent Exit and physical-interface controls from start/smoke"
+  tcp_pool_activity_is_idle "$run_dir/mini_vpn.log" || \
+    die "formal M1 requires fully drained TCP-pool ownership after smoke"
   require_command jq
   require_command iperf3
   require_command dig

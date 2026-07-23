@@ -189,6 +189,31 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-07-22:
 
+- Exact-source `f60926e` HK bundle
+  `/tmp/mini_vpn_knife15_macos_20260722_110059.tar.gz` (SHA-256
+  `9071ec0f...`) was operated correctly. Fresh baseline/direct passed; M1's
+  first forward phase then had one complete initial Target receiver-zero
+  second despite sustained sender throughput.
+- Smoke completed and M1 began in adjacent seconds. Its old conn1 reverse-data
+  relay still owned two native half leases; M1 control occupied conn0, the
+  resulting `2:2` tie placed M1 data on conn0 too, and the old relay reaped
+  only after that open. Three comparable earlier starts drained first, split
+  control/data across conn0/conn1, and had positive first intervals.
+- The Endpoint monitor now publishes transition-only TCP-pool `active_leases`.
+  Smoke waits within its existing hard timeout for exact zero; missing,
+  malformed, or nonzero evidence fails closed. Formal M0/M1 independently
+  require zero. No fixed sleep, SLI waiver, selector change, or frozen-value
+  tuning was added.
+- Root `666+3 ignored`, main `2`, Quinn `37+3 ignored + doc 1`, quinn-proto
+  `309 + doc 3`, release, Clippy, shell, fmt/diff/secret, and code-review gates
+  pass. The 32 MiB gate reached `240.322 Mbit/s` with final Endpoint
+  conservation `61,440/0/0B`. No unresolved P0/P1 remains. Result:
+  `docs/tech/2026-07-22-knife15-m1-post-smoke-pool-idle-local-results.md`.
+- This partial run is not M1 acceptance. Next take one fresh user-run HK M1
+  from the pushed repair with rebuilt release and fresh baseline/direct. Keep
+  every other VPN/TUN off through `stop`; preserve status/snapshot/stop on
+  failure. M2/M3 remain blocked.
+
 - Exact-source `e479013` HK bundle
   `/tmp/mini_vpn_knife15_macos_20260722_094608.tar.gz` (SHA-256
   `7443769e...`) was operated correctly. Fresh baseline/direct passed; M1

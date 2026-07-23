@@ -653,6 +653,14 @@ impl TcpPoolLeaseSelector {
     }
 }
 
+fn note_tcp_pool_activity_transition(previous: &mut Option<u64>, active: u64) -> Option<u64> {
+    if *previous == Some(active) {
+        return None;
+    }
+    *previous = Some(active);
+    Some(active)
+}
+
 impl Drop for TcpPoolSlotLease {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::AcqRel);
@@ -4901,6 +4909,7 @@ impl TuicUpstream {
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             let mut state = EndpointRecoveryState::default();
+            let mut last_tcp_pool_activity = None;
             let mut tick = tokio::time::interval(ENDPOINT_RECOVERY_SAMPLE_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -4911,6 +4920,11 @@ impl TuicUpstream {
                 let Some(input) = upstream.endpoint_recovery_input() else {
                     continue;
                 };
+                if let Some(active_leases) =
+                    note_tcp_pool_activity_transition(&mut last_tcp_pool_activity, input.active_tcp)
+                {
+                    println!("🔎 tuic-tcp-pool-activity active_leases={active_leases}");
+                }
                 let now = Instant::now();
                 match state.observe(now, &input) {
                     EndpointRecoveryAction::None => {}
@@ -7865,6 +7879,18 @@ mod tests {
             assert_eq!(active.load(Ordering::Relaxed), 1);
         }
         assert_eq!(active.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn tcp_pool_activity_is_published_only_on_transitions() {
+        let mut previous = None;
+
+        assert_eq!(note_tcp_pool_activity_transition(&mut previous, 0), Some(0));
+        assert_eq!(note_tcp_pool_activity_transition(&mut previous, 0), None);
+        assert_eq!(note_tcp_pool_activity_transition(&mut previous, 4), Some(4));
+        assert_eq!(note_tcp_pool_activity_transition(&mut previous, 2), Some(2));
+        assert_eq!(note_tcp_pool_activity_transition(&mut previous, 2), None);
+        assert_eq!(note_tcp_pool_activity_transition(&mut previous, 0), Some(0));
     }
 
     #[test]

@@ -6,6 +6,36 @@
 
 #### Latest decision (2026-07-22)
 
+Exact-source `f60926e` HK bundle
+`/tmp/mini_vpn_knife15_macos_20260722_110059.tar.gz` (SHA-256 `9071ec0f...`)
+was operated correctly and passed fresh baseline/direct. M1's first forward
+phase then had one complete initial Target receiver-zero second. Smoke had
+completed only one second before the phase: its old conn1 reverse-data relay
+still owned two native half leases, so a `2:2` pool tie placed both new M1
+flows on conn0. The old flow reaped only after this open. Three comparable
+earlier starts drained first, split control/data across conn0/conn1, and had a
+positive first interval.
+
+The Endpoint monitor now publishes the exact TCP-pool lease total only on
+transitions. Smoke waits for zero within its existing hard timeout; formal
+M0/M1 independently require the latest exact zero. Missing, malformed, and
+nonzero evidence fails closed and preserves the TUN for evidence. No fixed
+sleep, initial-interval waiver, selector/pool change, or frozen-value tuning
+was added.
+
+Full local gates pass: root `666+3 ignored`, main `2`, Quinn `37+3 ignored`,
+quinn-proto `309`, docs, release, Clippy, shell, fmt/diff/secret, and 32 MiB at
+`240.322 Mbit/s` with final `61,440/0/0B`. Review has no unresolved P0/P1.
+Result:
+`docs/tech/2026-07-22-knife15-m1-post-smoke-pool-idle-local-results.md`.
+
+Next run one fresh user-operated HK M1 from the pushed repair with rebuilt
+release and fresh baseline/direct. Keep every other VPN/TUN disabled through
+`stop`; preserve status/snapshot/stop on failure. Do not tune constants or
+waive strict TCP/UDP SLIs. M2/M3 remain blocked.
+
+#### Previous decision (2026-07-22)
+
 Exact-source `e479013` HK bundle
 `/tmp/mini_vpn_knife15_macos_20260722_094608.tar.gz` (SHA-256 `7443769e...`)
 was operated correctly. Fresh baseline/direct passed; M1 cycle 1 forward then

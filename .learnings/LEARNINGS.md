@@ -1,5 +1,20 @@
 # Learnings
 
+## 2026-07-22 - Preflight traffic must discharge lifecycle ownership before acceptance starts
+
+- A successful smoke command proves application completion, not that both
+  native relay halves have dropped their pool leases. Starting a formal soak
+  in the same second can make its first flows compete with a closing preflight
+  flow and change deterministic pool placement.
+- Prefer owned-state evidence over a fixed grace sleep. The Endpoint monitor
+  already sees the exact lease total; transition-only publication plus a
+  bounded zero barrier proves quiescence without changing the workload or SLI.
+- Keep ACK evidence scoped correctly: stream ACK progress proves Exit ingress,
+  not Exit-to-Target TCP delivery. It correctly suppresses destructive rebind
+  while the runner separately enforces a clean acceptance boundary.
+- Result:
+  `docs/tech/2026-07-22-knife15-m1-post-smoke-pool-idle-local-results.md`.
+
 ## 2026-07-22 - Pending is demand; stalled ACK ownership is failure evidence
 
 - `poll_write(Pending)` proves only that application demand exceeds current
