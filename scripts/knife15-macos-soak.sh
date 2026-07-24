@@ -73,6 +73,9 @@ SOAK_STAGE=m0
 SOAK_LABEL=M0
 SOAK_EVIDENCE_DIR=m0
 SOAK_STATUS_FILE=m0.status
+SOAK_CONTINUE_DATA_QUALITY=0
+SOAK_VIOLATIONS_FILE=
+SOAK_SUCCESS_STATUS=complete
 
 ACTION="${1:---help}"
 
@@ -96,6 +99,7 @@ Usage:
   sudo -E bash scripts/knife15-macos-soak.sh smoke
   sudo -E bash scripts/knife15-macos-soak.sh m0
   sudo -E bash scripts/knife15-macos-soak.sh m1
+  sudo -E bash scripts/knife15-macos-soak.sh m1-diagnostic
   sudo -E bash scripts/knife15-macos-soak.sh stop
   sudo -E bash scripts/knife15-macos-soak.sh bundle
 
@@ -152,8 +156,16 @@ M1 workflow (use a fresh terminal and keep every other VPN/TUN disabled):
  14. sudo -E bash scripts/knife15-macos-soak.sh status
  15. sudo -E bash scripts/knife15-macos-soak.sh stop
 
-Never run m0 and m1 in one TUN run. The M1 action has a 28,800-second
-traffic/drain budget and normally takes slightly more than eight wall hours.
+For a longitudinal diagnostic instead of formal acceptance, replace step 13
+with:
+  sudo -E bash scripts/knife15-macos-soak.sh m1-diagnostic
+
+Never run m0, m1, and m1-diagnostic in one TUN run. Both M1 actions have a
+28,800-second traffic/drain budget and normally take slightly more than eight
+wall hours.
+Use m1-diagnostic only when a complete longitudinal artifact is required:
+data-quality violations are recorded and continued, safety failures still
+stop immediately, and the result can never satisfy formal M1 acceptance.
 
 The background watchdog samples process/utun state and removes only the host
 routes owned by this run if mini_vpn exits. start proves Target readiness
@@ -336,7 +348,8 @@ watchdog_command_matches() {
 workload_command_matches() {
   local command_text="$1"
   [[ "$command_text" == *"knife15-macos-soak.sh m0" || \
-    "$command_text" == *"knife15-macos-soak.sh m1" ]]
+    "$command_text" == *"knife15-macos-soak.sh m1" || \
+    "$command_text" == *"knife15-macos-soak.sh m1-diagnostic" ]]
 }
 
 tcp_pool_latest_active_leases() {
@@ -1035,6 +1048,33 @@ m0_result_envelope() {
   '
 }
 
+m1_diagnostic_violation_envelope() {
+  local violation_file="$1"
+  if [[ ! -f "$violation_file" ]]; then
+    echo "0 1"
+    return 0
+  fi
+  awk -F '\t' '
+    NR == 1 {
+      if ($0 != "timestamp\tcycle\tphase\tkind\tvalue\tdetail\tevidence") invalid++
+      next
+    }
+    {
+      count++
+      key = $4 SUBSEP $7
+      seen[key]++
+      if (NF != 7 ||
+          $1 !~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/ ||
+          $2 !~ /^[0-9]+$/ ||
+          $3 !~ /^[A-Za-z0-9._-]+$/ ||
+          $4 !~ /^(receiver_zero_interval|udp_loss_percent|tcp_sender_receiver_gap_bytes)$/ ||
+          $5 !~ /^[0-9]+([.][0-9]+)?$/ ||
+          $6 == "" || $7 == "" || seen[key] > 1) invalid++
+    }
+    END { print count + 0, invalid + 0 }
+  ' "$violation_file"
+}
+
 m0_dns_result_envelope() {
   local m0_dir="$1"
   local result_file count=0 invalid=0
@@ -1218,7 +1258,9 @@ validate_m0_iperf_result() {
   local json_file="$1"
   local protocol="$2"
   local reverse="$3"
-  jq -e --arg protocol "$protocol" --argjson reverse "$reverse" '
+  local allow_receiver_zero="${4:-0}"
+  jq -e --arg protocol "$protocol" --argjson reverse "$reverse" \
+    --argjson allow_receiver_zero "$allow_receiver_zero" '
     def interval_entry_is_proven_partial($duration; $count):
       .key as $index
       | .value.sum.start as $start | .value.sum.end as $end
@@ -1264,9 +1306,10 @@ validate_m0_iperf_result() {
           .value.sum.bits_per_second as $bps
           | (($bps | type) == "number"
             and ($bps > 0 or ($bps == 0 and
-              interval_entry_is_proven_partial(
-                $receiver.start.test_start.duration;
-                ($intervals | length)))))))
+              ($allow_receiver_zero == 1 or
+                interval_entry_is_proven_partial(
+                  $receiver.start.test_start.duration;
+                  ($intervals | length))))))))
       and ($receiver.end.sum_received.bits_per_second as $bps
         | (($bps | type) == "number" and $bps > 0))
       and ($receiver.end.sum_received.bytes as $bytes
@@ -1315,6 +1358,62 @@ m0_iperf_result_failure_reason() {
     return 0
   fi
   echo invalid_iperf_result
+}
+
+receiver_zero_interval_evidence() {
+  local json_file="$1"
+  local reverse="$2"
+  jq -er --argjson reverse "$reverse" '
+    def interval_entry_is_proven_partial($duration; $count):
+      .key as $index
+      | .value.sum.start as $start | .value.sum.end as $end
+      | (($duration | type) == "number"
+        and $index == ($count - 1)
+        and ($start | type) == "number" and ($end | type) == "number"
+        and $start >= ($duration - 0.5) and $end >= $duration
+        and $end <= ($duration + 0.5) and $end >= $start
+        and ($end - $start) < 0.5);
+    (if $reverse == 0 then .server_output_json else . end) as $receiver
+    | $receiver.intervals as $intervals
+    | [$intervals | to_entries[]
+        | select((.value.sum.bits_per_second | type) == "number"
+          and .value.sum.bits_per_second <= 0
+          and (interval_entry_is_proven_partial(
+            $receiver.start.test_start.duration;
+            ($intervals | length)) | not))
+        | "\(.value.sum.start)-\(.value.sum.end)"] as $ranges
+    | select(($ranges | length) > 0)
+    | "\($ranges | length)\t\($ranges | join(","))"
+  ' "$json_file" 2>/dev/null
+}
+
+udp_loss_percent() {
+  local json_file="$1"
+  jq -er '
+    (.end.sum.lost_percent // .end.sum_received.lost_percent) as $loss
+    | select(($loss | type) == "number" and $loss >= 0 and $loss <= 100)
+    | $loss
+  ' "$json_file" 2>/dev/null
+}
+
+record_soak_data_quality_violation() {
+  local run_dir="$1"
+  local cycle="$2"
+  local phase="$3"
+  local kind="$4"
+  local value="$5"
+  local detail="$6"
+  local evidence_file="$7"
+  local relative_evidence
+  [[ "${SOAK_CONTINUE_DATA_QUALITY:-0}" == "1" ]] || return 1
+  [[ -n "${SOAK_VIOLATIONS_FILE:-}" && -f "$SOAK_VIOLATIONS_FILE" ]] || return 1
+  [[ "$detail" != *$'\t'* && "$detail" != *$'\n'* ]] || return 1
+  relative_evidence="${evidence_file#"$run_dir"/}"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(timestamp)" "$cycle" "$phase" "$kind" "$value" "$detail" \
+    "$relative_evidence" >>"$SOAK_VIOLATIONS_FILE" || return 1
+  append_event_to "$run_dir" \
+    "$SOAK_STAGE phase violation cycle=$cycle phase=$phase kind=$kind value=$value detail=$detail"
 }
 
 validate_target_ready_result() {
@@ -1504,7 +1603,7 @@ EOF_M1_PROFILE
 }
 
 runner_self_test() {
-  local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir baseline_summary_text m0_profile m1_profile m1_test_profile m0_run m1_stage_run m1_run m1_checkpoint_file m1_capture_run m1_formal_run m1_tcp_fixture m1_udp_fixture m0_fail_run direct_dir fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash bounded_status result_index result_label sample_index
+  local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir baseline_summary_text m0_profile m1_profile m1_test_profile m0_run m1_stage_run m1_run m1_diagnostic_run m1_diagnostic_fail_run m1_diagnostic_formal_run m1_checkpoint_file m1_capture_run m1_formal_run m1_tcp_fixture m1_udp_fixture m0_fail_run direct_dir fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash bounded_status result_index result_label sample_index violations_before violation_count invalid_violations
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/knife15-macos-self-test.XXXXXX")" || return 1
   good_log="$tmp/good.log"
   bad_log="$tmp/bad.log"
@@ -1585,6 +1684,8 @@ runner_self_test() {
     die "self-test: M0 workload command rejected"
   workload_command_matches 'bash scripts/knife15-macos-soak.sh m1' || \
     die "self-test: M1 workload command rejected"
+  workload_command_matches 'bash scripts/knife15-macos-soak.sh m1-diagnostic' || \
+    die "self-test: M1 diagnostic workload command rejected"
   ! workload_command_matches 'bash scripts/knife15-macos-soak.sh smoke' || \
     die "self-test: non-M0 workload command accepted"
 
@@ -1738,6 +1839,9 @@ runner_self_test() {
 printf 'iperf3' >>"$M0_TEST_COMMAND_LOG"
 printf ' %s' "$@" >>"$M0_TEST_COMMAND_LOG"
 printf '\n' >>"$M0_TEST_COMMAND_LOG"
+if [[ "${M0_TEST_IPERF_FAIL:-0}" == "1" ]]; then
+  exit 86
+fi
 protocol=TCP
 reverse=0
 duration=1
@@ -1765,22 +1869,32 @@ while (($# > 0)); do
       ;;
   esac
 done
-jq -nc --arg target "$target" --arg protocol "$protocol" \
-  --argjson reverse "$reverse" --argjson duration "$duration" '
+  jq -nc --arg target "$target" --arg protocol "$protocol" \
+  --argjson reverse "$reverse" --argjson duration "$duration" \
+  --argjson receiver_zero "${M0_TEST_IPERF_RECEIVER_ZERO:-0}" \
+  --argjson missing_receiver "${M0_TEST_IPERF_MISSING_RECEIVER:-0}" \
+  --argjson invalid_sent "${M0_TEST_IPERF_INVALID_SENT:-0}" \
+  --argjson udp_loss "${M0_TEST_IPERF_UDP_LOSS:-1.25}" '
   def samples: [range(0; $duration) as $second
     | {sum: {start: $second, end: ($second + 1), bits_per_second: 1}}];
+  def receiver_samples: [range(0; $duration) as $second
+    | {sum: {start: $second, end: ($second + 1),
+        bits_per_second:
+          (if $receiver_zero == 1 and $second == 0 then 0 else 1 end)}}];
   {start: {connecting_to: {host: $target},
       test_start: {protocol: $protocol, reverse: $reverse, duration: $duration}},
     intervals: samples,
     end: {sum_sent: {bytes: 100},
       sum_received: {bytes: 90, bits_per_second: 1},
-      sum: {lost_percent: 1.25}},
+      sum: {lost_percent: $udp_loss}},
     server_output_json: {
       start: {test_start: {protocol: $protocol, reverse: $reverse,
         duration: $duration}},
-      intervals: samples,
+      intervals: receiver_samples,
       end: {sum_received: {bytes: 90, bits_per_second: 1,
         seconds: $duration}}}}
+  | if $missing_receiver == 1 then del(.server_output_json) else . end
+  | if $invalid_sent == 1 then del(.end.sum_sent.bytes) else . end
   '
 EOF_FAKE_IPERF
   cat >"$fake_dig" <<'EOF_FAKE_DIG'
@@ -1866,6 +1980,69 @@ EOF_FAKE_SLEEP
   grep -Fq $'\tm1 phase complete cycle=1 phase=tcp-forward' \
     "$m1_stage_run/events.tsv" || \
     die "self-test: M1 phase event used the wrong stage"
+  SOAK_STAGE=m1-diagnostic
+  SOAK_LABEL=M1-DIAGNOSTIC
+  SOAK_CONTINUE_DATA_QUALITY=1
+  SOAK_VIOLATIONS_FILE="$m1_stage_run/m1-diagnostic-violations.tsv"
+  printf '%s\n' $'timestamp\tcycle\tphase\tkind\tvalue\tdetail\tevidence' \
+    >"$SOAK_VIOLATIONS_FILE"
+  M0_TEST_IPERF_RECEIVER_ZERO=1
+  export M0_TEST_IPERF_RECEIVER_ZERO
+  run_m0_iperf_phase "$m1_stage_run" 43.130.32.77 5201 2 \
+    tcp-forward 1 4522378 0 0 || \
+    die "self-test: diagnostic receiver-zero phase did not continue"
+  grep -Fq $'\tm1-diagnostic phase violation cycle=2 phase=tcp-forward kind=receiver_zero_interval' \
+    "$m1_stage_run/events.tsv" || \
+    die "self-test: diagnostic receiver-zero violation event missing"
+  grep -Fq $'\t2\ttcp-forward\treceiver_zero_interval\t1\t' \
+    "$SOAK_VIOLATIONS_FILE" || \
+    die "self-test: diagnostic receiver-zero violation row missing"
+  grep -Fq $'\tm1-diagnostic phase complete cycle=2 phase=tcp-forward' \
+    "$m1_stage_run/events.tsv" || \
+    die "self-test: diagnostic receiver-zero phase did not complete"
+  unset M0_TEST_IPERF_RECEIVER_ZERO
+  M0_TEST_IPERF_MISSING_RECEIVER=1
+  export M0_TEST_IPERF_MISSING_RECEIVER
+  if run_m0_iperf_phase "$m1_stage_run" 43.130.32.77 5201 3 \
+    tcp-forward 1 4522378 0 0; then
+    die "self-test: diagnostic policy continued missing receiver evidence"
+  fi
+  grep -Fq $'\tm1-diagnostic phase failed cycle=3 phase=tcp-forward reason=missing_receiver_evidence' \
+    "$m1_stage_run/events.tsv" || \
+    die "self-test: diagnostic missing-receiver failure reason missing"
+  unset M0_TEST_IPERF_MISSING_RECEIVER
+  M0_TEST_IPERF_RECEIVER_ZERO=1
+  M0_TEST_IPERF_INVALID_SENT=1
+  export M0_TEST_IPERF_RECEIVER_ZERO M0_TEST_IPERF_INVALID_SENT
+  if run_m0_iperf_phase "$m1_stage_run" 43.130.32.77 5201 4 \
+    tcp-forward 1 4522378 0 0; then
+    die "self-test: diagnostic receiver-zero policy hid malformed sender evidence"
+  fi
+  unset M0_TEST_IPERF_RECEIVER_ZERO M0_TEST_IPERF_INVALID_SENT
+  violations_before="$(awk 'END { print NR - 1 }' "$SOAK_VIOLATIONS_FILE")"
+  M0_TEST_IPERF_UDP_LOSS=3.000001
+  export M0_TEST_IPERF_UDP_LOSS
+  run_m0_iperf_phase "$m1_stage_run" 43.130.32.77 5201 5 \
+    udp-reverse 1 4522378 1 1 || \
+    die "self-test: diagnostic high-loss UDP phase did not continue"
+  grep -Fq $'\tm1-diagnostic phase violation cycle=5 phase=udp-reverse kind=udp_loss_percent value=3.000001' \
+    "$m1_stage_run/events.tsv" || \
+    die "self-test: diagnostic UDP loss violation event missing"
+  grep -Fq $'\t5\tudp-reverse\tudp_loss_percent\t3.000001\t' \
+    "$SOAK_VIOLATIONS_FILE" || \
+    die "self-test: diagnostic UDP loss violation row missing"
+  M0_TEST_IPERF_UDP_LOSS=3.0
+  run_m0_iperf_phase "$m1_stage_run" 43.130.32.77 5201 6 \
+    udp-reverse 1 4522378 1 1 || \
+    die "self-test: diagnostic boundary-loss UDP phase failed"
+  [[ "$(awk 'END { print NR - 1 }' "$SOAK_VIOLATIONS_FILE")" == \
+    "$((10#$violations_before + 1))" ]] || \
+    die "self-test: UDP loss at the exact 3.0 percent SLO recorded a violation"
+  unset M0_TEST_IPERF_UDP_LOSS
+  SOAK_CONTINUE_DATA_QUALITY=0
+  SOAK_VIOLATIONS_FILE=
+  SOAK_STAGE=m1
+  SOAK_LABEL=M1
   m1_run="$tmp/m1-run"
   m1_test_profile="$tmp/m1-test-workload.txt"
   mkdir -p "$m1_run/m1"
@@ -1905,6 +2082,63 @@ EOF_FAKE_SLEEP
     die "self-test: compressed M1 DNS cycle count mismatch"
   grep -Fxq complete "$m1_run/m1.status" || \
     die "self-test: successful M1 schedule status mismatch"
+  m1_diagnostic_run="$tmp/m1-diagnostic-run"
+  mkdir -p "$m1_diagnostic_run/m1"
+  printf 'timestamp\tevent\n' >"$m1_diagnostic_run/events.tsv"
+  printf '%s\n' diagnostic >"$m1_diagnostic_run/m1-mode"
+  printf '%s\n' $'timestamp\tcycle\tphase\tkind\tvalue\tdetail\tevidence' \
+    >"$m1_diagnostic_run/m1-diagnostic-violations.tsv"
+  SOAK_STAGE=m1-diagnostic
+  SOAK_LABEL=M1-DIAGNOSTIC
+  SOAK_STATUS_FILE=m1.status
+  SOAK_SUCCESS_STATUS=diagnostic_timeline_complete
+  SOAK_CONTINUE_DATA_QUALITY=1
+  SOAK_VIOLATIONS_FILE="$m1_diagnostic_run/m1-diagnostic-violations.tsv"
+  M0_TEST_IPERF_RECEIVER_ZERO=1
+  M0_TEST_IPERF_UDP_LOSS=3.000001
+  export M0_TEST_IPERF_RECEIVER_ZERO M0_TEST_IPERF_UDP_LOSS
+  run_m1_schedule "$m1_diagnostic_run" "$m1_test_profile" || \
+    die "self-test: compressed diagnostic M1 schedule did not continue"
+  grep -Fxq diagnostic_timeline_complete "$m1_diagnostic_run/m1.status" || \
+    die "self-test: diagnostic M1 timeline status mismatch"
+  grep -Fq $'\tm1-diagnostic final drain complete ' \
+    "$m1_diagnostic_run/events.tsv" || \
+    die "self-test: diagnostic M1 did not reach final drain"
+  [[ "$(grep -Fc $'\tm1-diagnostic phase failed ' \
+    "$m1_diagnostic_run/events.tsv")" == "0" ]] || \
+    die "self-test: continuable diagnostic observations emitted phase failure"
+  read -r violation_count invalid_violations \
+    <<<"$(m1_diagnostic_violation_envelope \
+      "$m1_diagnostic_run/m1-diagnostic-violations.tsv")"
+  ((10#$violation_count > 1 && 10#$invalid_violations == 0)) || \
+    die "self-test: diagnostic M1 did not preserve typed violations"
+  unset M0_TEST_IPERF_RECEIVER_ZERO M0_TEST_IPERF_UDP_LOSS
+
+  m1_diagnostic_fail_run="$tmp/m1-diagnostic-fail-run"
+  mkdir -p "$m1_diagnostic_fail_run/m1"
+  printf 'timestamp\tevent\n' >"$m1_diagnostic_fail_run/events.tsv"
+  printf '%s\n' $'timestamp\tcycle\tphase\tkind\tvalue\tdetail\tevidence' \
+    >"$m1_diagnostic_fail_run/m1-diagnostic-violations.tsv"
+  SOAK_VIOLATIONS_FILE="$m1_diagnostic_fail_run/m1-diagnostic-violations.tsv"
+  M0_TEST_IPERF_FAIL=1
+  export M0_TEST_IPERF_FAIL
+  if run_m1_schedule "$m1_diagnostic_fail_run" "$m1_test_profile"; then
+    die "self-test: diagnostic M1 continued an iperf command failure"
+  fi
+  grep -Fxq failed "$m1_diagnostic_fail_run/m1.status" || \
+    die "self-test: diagnostic command failure status mismatch"
+  grep -Fq $'\tm1-diagnostic phase failed cycle=1 phase=tcp-forward' \
+    "$m1_diagnostic_fail_run/events.tsv" || \
+    die "self-test: diagnostic command failure event missing"
+  ! grep -Fq $'\tm1-diagnostic final drain complete ' \
+    "$m1_diagnostic_fail_run/events.tsv" || \
+    die "self-test: diagnostic command failure reached final drain"
+  unset M0_TEST_IPERF_FAIL
+  SOAK_STAGE=m1
+  SOAK_LABEL=M1
+  SOAK_SUCCESS_STATUS=complete
+  SOAK_CONTINUE_DATA_QUALITY=0
+  SOAK_VIOLATIONS_FILE=
   m1_checkpoint_file="$m1_run/m1-checkpoints.csv"
   printf '%s\n' \
     'timestamp,label,rss_kib,fd_count,thread_rows,endpoint_available_bytes,endpoint_live_bytes,endpoint_outstanding_bytes' \
@@ -2318,9 +2552,83 @@ EOF_DIRECT_FIXTURE
   write_summary "$m1_formal_run"
   grep -Fq -- '- m1_slo_evidence: PASS' "$m1_formal_run/summary.md" || \
     die "self-test: complete formal M1 evidence did not meet its SLO"
+  grep -Fq -- '- formal_m1_acceptance: PASS' "$m1_formal_run/summary.md" || \
+    die "self-test: complete formal M1 evidence lost its acceptance verdict"
   grep -Fq -- '- internal_failure_scan: NO_KNOWN_INTERNAL_FAILURE_SIGNAL' \
     "$m1_formal_run/summary.md" || \
     die "self-test: complete formal M1 evidence unexpectedly required review"
+
+  m1_diagnostic_formal_run="$tmp/m1-diagnostic-formal-run"
+  cp -R "$m1_formal_run" "$m1_diagnostic_formal_run"
+  printf '%s\n' diagnostic >"$m1_diagnostic_formal_run/m1-mode"
+  printf '%s\n' diagnostic_complete_with_violations \
+    >"$m1_diagnostic_formal_run/m1.status"
+  sed -i '' 's/	m1 /	m1-diagnostic /' \
+    "$m1_diagnostic_formal_run/events.tsv"
+  printf '%s\n' \
+    $'timestamp\tcycle\tphase\tkind\tvalue\tdetail\tevidence' \
+    $'2026-07-17T00:00:00Z\t1\tudp-reverse\tudp_loss_percent\t3.000001\tlimit=3.0\tm1/formal_udp_01.json' \
+    >"$m1_diagnostic_formal_run/m1-diagnostic-violations.tsv"
+  jq '.end.sum.lost_percent = 3.000001' \
+    "$m1_diagnostic_formal_run/m1/formal_udp_01.json" \
+    >"$m1_diagnostic_formal_run/m1/formal_udp_01.json.updated"
+  mv "$m1_diagnostic_formal_run/m1/formal_udp_01.json.updated" \
+    "$m1_diagnostic_formal_run/m1/formal_udp_01.json"
+  jq '.end.sum_sent.bytes = 20000000 | .end.sum_received.bytes = 1' \
+    "$m1_diagnostic_formal_run/m1/formal_tcp_001.json" \
+    >"$m1_diagnostic_formal_run/m1/formal_tcp_001.json.updated"
+  mv "$m1_diagnostic_formal_run/m1/formal_tcp_001.json.updated" \
+    "$m1_diagnostic_formal_run/m1/formal_tcp_001.json"
+  SOAK_STAGE=m1-diagnostic
+  SOAK_CONTINUE_DATA_QUALITY=1
+  SOAK_VIOLATIONS_FILE="$m1_diagnostic_formal_run/m1-diagnostic-violations.tsv"
+  record_m1_diagnostic_aggregate_violations "$m1_diagnostic_formal_run" || \
+    die "self-test: diagnostic aggregate TCP gap was not recorded"
+  SOAK_STAGE=m0
+  SOAK_LABEL=M0
+  SOAK_SUCCESS_STATUS=complete
+  SOAK_CONTINUE_DATA_QUALITY=0
+  SOAK_VIOLATIONS_FILE=
+  write_summary "$m1_diagnostic_formal_run"
+  grep -Fq -- '- m1_mode: diagnostic' \
+    "$m1_diagnostic_formal_run/summary.md" || \
+    die "self-test: complete diagnostic M1 mode missing from summary"
+  grep -Fq -- '- formal_m1_acceptance: NOT_APPLICABLE' \
+    "$m1_diagnostic_formal_run/summary.md" || \
+    die "self-test: diagnostic M1 was treated as formal acceptance"
+  grep -Fq -- '- m1_result_integrity_evidence: PASS' \
+    "$m1_diagnostic_formal_run/summary.md" || \
+    die "self-test: valid diagnostic result evidence lost integrity"
+  grep -Fq -- '- m1_result_evidence: NOT_APPLICABLE' \
+    "$m1_diagnostic_formal_run/summary.md" || \
+    die "self-test: diagnostic result was evaluated as formal M1"
+  grep -Fq -- '- m1_slo_evidence: NOT_APPLICABLE' \
+    "$m1_diagnostic_formal_run/summary.md" || \
+    die "self-test: diagnostic M1 produced a formal SLO verdict"
+  grep -Fq -- '- m1_diagnostic_violation_count: 2' \
+    "$m1_diagnostic_formal_run/summary.md" || \
+    die "self-test: diagnostic violation count mismatch"
+  grep -Fq -- '- m1_diagnostic_safety_evidence: PASS' \
+    "$m1_diagnostic_formal_run/summary.md" || \
+    die "self-test: safe complete diagnostic M1 evidence rejected"
+  cp "$m1_diagnostic_formal_run/m1-diagnostic-violations.tsv" \
+    "$m1_diagnostic_formal_run/m1-diagnostic-violations.valid.tsv"
+  awk '$4 != "udp_loss_percent"' FS=$'\t' OFS=$'\t' \
+    "$m1_diagnostic_formal_run/m1-diagnostic-violations.valid.tsv" \
+    >"$m1_diagnostic_formal_run/m1-diagnostic-violations.tsv"
+  write_summary "$m1_diagnostic_formal_run"
+  grep -Fq -- '- m1_diagnostic_safety_evidence: MISMATCH' \
+    "$m1_diagnostic_formal_run/summary.md" || \
+    die "self-test: diagnostic violation missing its source coverage was accepted"
+  mv "$m1_diagnostic_formal_run/m1-diagnostic-violations.valid.tsv" \
+    "$m1_diagnostic_formal_run/m1-diagnostic-violations.tsv"
+  printf '%s\n' \
+    '📊 数据面 pump_full_waits=1 pump_read_errors=0 tun_flush_tx_failures=0' \
+    >>"$m1_diagnostic_formal_run/mini_vpn.log"
+  write_summary "$m1_diagnostic_formal_run"
+  grep -Fq -- '- m1_diagnostic_safety_evidence: MISMATCH' \
+    "$m1_diagnostic_formal_run/summary.md" || \
+    die "self-test: diagnostic safety failure was continued"
 
   cp "$m1_formal_run/mini_vpn.log" "$m1_formal_run/mini_vpn.clean.log"
   printf '%s\n' \
@@ -3794,7 +4102,7 @@ run_m0_iperf_phase() {
   local rate_bps="$7"
   local reverse="$8"
   local udp="$9"
-  local output_file validation_reason
+  local output_file validation_reason violation_value violation_detail udp_loss
   output_file="$run_dir/$SOAK_EVIDENCE_DIR/cycle_$(printf '%03d' "$cycle")_${phase}.json"
   m0_assert_run_healthy "$run_dir" || return 1
   append_event_to "$run_dir" \
@@ -3826,9 +4134,28 @@ run_m0_iperf_phase() {
   validation_reason="$(m0_iperf_result_failure_reason \
     "$output_file" "$([[ "$udp" == "1" ]] && echo UDP || echo TCP)" "$reverse")"
   if [[ "$validation_reason" != "ok" ]]; then
-    append_event_to "$run_dir" \
-      "$SOAK_STAGE phase failed cycle=$cycle phase=$phase reason=$validation_reason"
-    return 1
+    if [[ "$validation_reason" == "receiver_zero_interval" && \
+      "${SOAK_CONTINUE_DATA_QUALITY:-0}" == "1" ]] && \
+      validate_m0_iperf_result "$output_file" \
+        "$([[ "$udp" == "1" ]] && echo UDP || echo TCP)" "$reverse" 1; then
+      read -r violation_value violation_detail \
+        <<<"$(receiver_zero_interval_evidence "$output_file" "$reverse")"
+      [[ "$violation_value" =~ ^[1-9][0-9]*$ && -n "$violation_detail" ]] || return 1
+      record_soak_data_quality_violation "$run_dir" "$cycle" "$phase" \
+        receiver_zero_interval "$violation_value" "$violation_detail" \
+        "$output_file" || return 1
+    else
+      append_event_to "$run_dir" \
+        "$SOAK_STAGE phase failed cycle=$cycle phase=$phase reason=$validation_reason"
+      return 1
+    fi
+  fi
+  if [[ "$udp" == "1" && "${SOAK_CONTINUE_DATA_QUALITY:-0}" == "1" ]]; then
+    udp_loss="$(udp_loss_percent "$output_file")" || return 1
+    if ! decimal_le "$udp_loss" 3.0; then
+      record_soak_data_quality_violation "$run_dir" "$cycle" "$phase" \
+        udp_loss_percent "$udp_loss" limit=3.0 "$output_file" || return 1
+    fi
   fi
   append_event_to "$run_dir" \
     "$SOAK_STAGE phase complete cycle=$cycle phase=$phase"
@@ -4104,7 +4431,7 @@ run_m1_schedule() {
   local result
   printf '%s\n' running >"$status_file" || return 1
   if run_m1_schedule_body "$@"; then
-    printf '%s\n' complete >"$status_file" || return 1
+    printf '%s\n' "${SOAK_SUCCESS_STATUS:-complete}" >"$status_file" || return 1
     return 0
   else
     result=$?
@@ -4274,11 +4601,124 @@ run_m0_action() {
   die "M0 workload failed; TUN remains running for status/snapshot/stop evidence"
 }
 
+record_m1_diagnostic_aggregate_violations() {
+  local run_dir="$1"
+  local tcp_results udp_results tcp_max_gap rest
+  read -r tcp_results udp_results tcp_max_gap rest \
+    <<<"$(m0_result_envelope "$run_dir/m1")"
+  [[ "$tcp_results" =~ ^[0-9]+$ && "$udp_results" =~ ^[0-9]+$ && \
+    "$tcp_max_gap" =~ ^[0-9]+$ ]] || return 1
+  if ((10#$tcp_max_gap > 16777216)); then
+    record_soak_data_quality_violation "$run_dir" 0 aggregate \
+      tcp_sender_receiver_gap_bytes "$tcp_max_gap" limit=16777216 \
+      "$run_dir/m1" || return 1
+  fi
+}
+
+m1_diagnostic_violation_coverage_is_complete() {
+  local run_dir="$1"
+  local violation_file="$run_dir/m1-diagnostic-violations.tsv"
+  local violation_count invalid_violations
+  local tcp_results udp_results tcp_max_gap udp_max_loss invalid_results
+  local sender_zero receiver_zero
+  local row_timestamp cycle phase kind value detail evidence evidence_file
+  local actual_value actual_detail reverse expected_udp=0
+  local recorded_receiver=0 recorded_receiver_rows=0 recorded_udp=0 recorded_gap=0
+  local result_file
+  read -r violation_count invalid_violations \
+    <<<"$(m1_diagnostic_violation_envelope "$violation_file")"
+  [[ "$invalid_violations" == "0" ]] || return 1
+  read -r tcp_results udp_results tcp_max_gap udp_max_loss invalid_results \
+    sender_zero receiver_zero \
+    <<<"$(m0_result_envelope "$run_dir/m1")"
+  [[ "$tcp_results" =~ ^[0-9]+$ && "$udp_results" =~ ^[0-9]+$ && \
+    "$tcp_max_gap" =~ ^[0-9]+$ && "$invalid_results" == "0" && \
+    "$receiver_zero" =~ ^[0-9]+$ ]] || return 1
+
+  while IFS=$'\t' read -r row_timestamp cycle phase kind value detail evidence; do
+    [[ -n "$row_timestamp" ]] || continue
+    case "$kind" in
+      receiver_zero_interval)
+        [[ "$evidence" =~ ^m1/[^/]+[.]json$ ]] || return 1
+        evidence_file="$run_dir/$evidence"
+        [[ -f "$evidence_file" && ! -L "$evidence_file" ]] || return 1
+        reverse="$(jq -er '.start.test_start.reverse' "$evidence_file" 2>/dev/null)" || \
+          return 1
+        read -r actual_value actual_detail \
+          <<<"$(receiver_zero_interval_evidence "$evidence_file" "$reverse")"
+        [[ "$value" == "$actual_value" && "$detail" == "$actual_detail" ]] || \
+          return 1
+        recorded_receiver=$((recorded_receiver + 10#$value))
+        recorded_receiver_rows=$((recorded_receiver_rows + 1))
+        ;;
+      udp_loss_percent)
+        [[ "$evidence" =~ ^m1/[^/]+[.]json$ ]] || return 1
+        evidence_file="$run_dir/$evidence"
+        [[ -f "$evidence_file" && ! -L "$evidence_file" ]] || return 1
+        [[ "$(jq -er '.start.test_start.protocol' "$evidence_file" 2>/dev/null)" == \
+          "UDP" ]] || return 1
+        actual_value="$(udp_loss_percent "$evidence_file")" || return 1
+        awk -v left="$value" -v right="$actual_value" \
+          'BEGIN { exit !((left + 0) == (right + 0)) }' || return 1
+        ! decimal_le "$value" 3.0 || return 1
+        [[ "$detail" == "limit=3.0" ]] || return 1
+        recorded_udp=$((recorded_udp + 1))
+        ;;
+      tcp_sender_receiver_gap_bytes)
+        [[ "$cycle" == "0" && "$phase" == "aggregate" && \
+          "$evidence" == "m1" && "$value" == "$tcp_max_gap" && \
+          "$detail" == "limit=16777216" ]] || return 1
+        ((10#$value > 16777216)) || return 1
+        recorded_gap=$((recorded_gap + 1))
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  done < <(tail -n +2 "$violation_file")
+
+  for result_file in "$run_dir/m1"/*.json; do
+    [[ -f "$result_file" ]] || continue
+    if jq -e '
+      .start.test_start.protocol == "UDP"
+      and ((.end.sum.lost_percent // .end.sum_received.lost_percent) > 3.0)
+    ' "$result_file" >/dev/null 2>&1; then
+      expected_udp=$((expected_udp + 1))
+    fi
+  done
+  ((recorded_receiver == 10#$receiver_zero && recorded_udp == expected_udp)) || \
+    return 1
+  if ((10#$tcp_max_gap > 16777216)); then
+    ((recorded_gap == 1)) || return 1
+  else
+    ((recorded_gap == 0)) || return 1
+  fi
+  ((10#$violation_count == recorded_receiver_rows + recorded_udp + recorded_gap))
+}
+
 run_m1_action() {
+  local execution_mode="${1:-formal}"
   local run_dir utun target exit_host iperf_port dns_target dns_name profile_file
+  local action_description=m1 stage=m1 label=M1 success_status=complete
+  local diagnostic=0 violation_count invalid_violations
+  case "$execution_mode" in
+    formal)
+      action_description="formal M1"
+      ;;
+    diagnostic)
+      action_description="M1 diagnostic"
+      stage=m1-diagnostic
+      label=M1-DIAGNOSTIC
+      success_status=diagnostic_timeline_complete
+      diagnostic=1
+      ;;
+    *)
+      die "unknown M1 execution mode: $execution_mode"
+      ;;
+  esac
   require_root
   validate_m1_formal_config || \
-    die "formal M1 requires the frozen 28800s schedule and 30s metrics/sampling; unset M1_* duration overrides"
+    die "$action_description requires the frozen 28800s schedule and 30s metrics/sampling; unset M1_* duration overrides"
   run_dir="$(run_dir_from_state)" || die "no Knife15 run state"
   active_pid || die "mini_vpn is not running"
   workload_matches_run && die "a soak workload is already running"
@@ -4287,7 +4727,7 @@ run_m1_action() {
     ! -e "$run_dir/m1-workload.txt" && ! -e "$run_dir/m1" ]] || \
     die "this TUN run already has M0 or M1 evidence; stop and start a fresh run"
   [[ -z "$M0_BASELINE_DIR" && -z "$M0_DIRECT_DIR" ]] || \
-    die "formal M1 requires M0_BASELINE_DIR and M0_DIRECT_DIR to be unset"
+    die "$action_description requires M0_BASELINE_DIR and M0_DIRECT_DIR to be unset"
   validate_baseline_dir_path "$M1_BASELINE_DIR" || \
     die "M1_BASELINE_DIR must be the simple /tmp baseline directory printed by baseline"
   [[ -d "$M1_BASELINE_DIR" && ! -L "$M1_BASELINE_DIR" ]] || \
@@ -4303,22 +4743,23 @@ run_m1_action() {
   iperf_port="$(read_state iperf_port)"
   dns_target="$(read_state dns_target 2>/dev/null || true)"
   dns_name="$(read_state dns_name)"
-  [[ -n "$dns_target" ]] || die "formal M1 requires DNS_TARGET for periodic DNS evidence"
+  [[ -n "$dns_target" ]] || \
+    die "$action_description requires DNS_TARGET for periodic DNS evidence"
   [[ "$(route_interface "$target")" == "$utun" ]] || \
     die "TARGET no longer routes through $utun"
   [[ "$(route_interface "$exit_host")" != "$utun" ]] || \
     die "Exit route recursed into $utun"
   network_control_is_sufficient "$run_dir" 5 && network_control_is_recent || \
-    die "formal M1 requires complete, recent Exit and physical-interface controls from start/smoke"
+    die "$action_description requires complete, recent Exit and physical-interface controls from start/smoke"
   tcp_pool_activity_is_idle "$run_dir/mini_vpn.log" || \
-    die "formal M1 requires fully drained TCP-pool ownership after smoke"
+    die "$action_description requires fully drained TCP-pool ownership after smoke"
   require_command jq
   require_command iperf3
   require_command dig
   validate_m0_baseline_pair "$M1_BASELINE_DIR" "$target" || \
     die "M1 baseline must contain valid nonzero TCP forward/reverse results for $target"
   validate_direct_continuity_dir "$M1_DIRECT_DIR" "$M1_BASELINE_DIR" "$target" || \
-    die "formal M1 requires a matching 300s direct continuity PASS completed within 15 minutes"
+    die "$action_description requires a matching 300s direct continuity PASS completed within 15 minutes"
 
   mkdir "$run_dir/m1" || die "cannot create M1 evidence directory"
   mkdir "$run_dir/m1-baseline" || die "cannot create M1 baseline evidence directory"
@@ -4337,30 +4778,49 @@ run_m1_action() {
   printf '%s\n' \
     'timestamp,label,rss_kib,fd_count,thread_rows,endpoint_available_bytes,endpoint_live_bytes,endpoint_outstanding_bytes' \
     >"$run_dir/m1-checkpoints.csv" || die "cannot create M1 checkpoint evidence"
+  printf '%s\n' "$execution_mode" >"$run_dir/m1-mode" || \
+    die "cannot create M1 execution-mode evidence"
+  if ((diagnostic == 1)); then
+    printf '%s\n' $'timestamp\tcycle\tphase\tkind\tvalue\tdetail\tevidence' \
+      >"$run_dir/m1-diagnostic-violations.tsv" || \
+      die "cannot create M1 diagnostic violation evidence"
+  fi
   profile_file="$run_dir/m1-workload.txt"
   printf '%s\n' preparing >"$run_dir/m1.status"
   if ! write_m1_profile "$M1_BASELINE_DIR" "$profile_file" "$target" \
     "$iperf_port" "$dns_target" "$dns_name"; then
     printf '%s\n' failed >"$run_dir/m1.status"
-    append_event_to "$run_dir" "m1 failed: workload profile derivation"
+    append_event_to "$run_dir" "$stage failed: workload profile derivation"
     die "cannot derive the M1 workload profile from baseline"
   fi
   printf '%s\n' \
+    "execution_mode=$execution_mode" \
     "direct_dir=$M1_DIRECT_DIR" \
     "direct_manifest_sha256=$(sha256_file "$M1_DIRECT_DIR/manifest.txt")" \
     "direct_result_sha256=$(sha256_file "$M1_DIRECT_DIR/direct-forward-300s.json")" \
     >>"$profile_file" || die "cannot bind direct continuity evidence to M1 profile"
   printf '%s\n' prepared >"$run_dir/m1.status"
   append_event_to "$run_dir" \
-    "m1 prepared baseline=$(basename "$M1_BASELINE_DIR") profile=$(sha256_file "$profile_file")"
-  echo "Starting formal Knife15 M1 workload; planned traffic/drain time is 28800 seconds."
+    "$stage prepared baseline=$(basename "$M1_BASELINE_DIR") profile=$(sha256_file "$profile_file")"
+  if ((diagnostic == 1)); then
+    echo "Starting Knife15 M1 diagnostic workload; planned traffic/drain time is 28800 seconds."
+    echo "Data-quality violations will be recorded and continued; safety failures still stop immediately."
+    echo "This run can never satisfy formal M1 acceptance."
+  else
+    echo "Starting formal Knife15 M1 workload; planned traffic/drain time is 28800 seconds."
+  fi
   grep -E '^(baseline_(forward|reverse)_bps|rate_cap_bps|steady_(tcp|udp|short)|quiet_(tcp|udp|short)|churn_(tcp|udp|short)|total_secs|steady_a_secs|idle_secs|quiet_secs|steady_b_secs|churn_secs|steady_c_secs|final_drain_secs)=' \
     "$profile_file"
 
-  SOAK_STAGE=m1
-  SOAK_LABEL=M1
+  SOAK_STAGE="$stage"
+  SOAK_LABEL="$label"
   SOAK_EVIDENCE_DIR=m1
   SOAK_STATUS_FILE=m1.status
+  SOAK_SUCCESS_STATUS="$success_status"
+  SOAK_CONTINUE_DATA_QUALITY="$diagnostic"
+  SOAK_VIOLATIONS_FILE=
+  ((diagnostic == 1)) && \
+    SOAK_VIOLATIONS_FILE="$run_dir/m1-diagnostic-violations.tsv"
   M0_IPERF3_BIN="$(command -v iperf3)"
   M0_DIG_BIN="$(command -v dig)"
   M0_SLEEP_BIN=/bin/sleep
@@ -4370,7 +4830,7 @@ run_m1_action() {
   if ! register_m0_workload; then
     clear_workload_state
     printf '%s\n' failed >"$run_dir/m1.status"
-    append_event_to "$run_dir" "m1 failed: workload identity registration"
+    append_event_to "$run_dir" "$stage failed: workload identity registration"
     die "cannot establish identity-verified M1 workload state"
   fi
   trap "interrupt_m0 '$run_dir' INT" INT
@@ -4386,13 +4846,49 @@ run_m1_action() {
       ! m1_checkpoint_slo "$run_dir/m1-checkpoints.csv"; then
       printf '%s\n' failed >"$run_dir/m1.status"
       append_event_to "$run_dir" \
-        "m1 failed: final evidence, health, ownership, network controls, or checkpoints"
+        "$stage failed: final evidence, health, ownership, network controls, or checkpoints"
       die "M1 traffic completed but final evidence/health/ownership/network/checkpoints failed; TUN remains for stop"
+    fi
+    if ((diagnostic == 1)); then
+      if ! record_m1_diagnostic_aggregate_violations "$run_dir"; then
+        printf '%s\n' failed >"$run_dir/m1.status"
+        append_event_to "$run_dir" \
+          "$stage failed: aggregate result evidence"
+        die "M1 diagnostic timeline completed but aggregate result evidence failed; TUN remains for stop"
+      fi
+      read -r violation_count invalid_violations \
+        <<<"$(m1_diagnostic_violation_envelope \
+          "$run_dir/m1-diagnostic-violations.tsv")"
+      if [[ "$invalid_violations" != "0" ]]; then
+        printf '%s\n' failed >"$run_dir/m1.status"
+        append_event_to "$run_dir" \
+          "$stage failed: invalid violation evidence"
+        die "M1 diagnostic violation evidence is invalid; TUN remains for stop"
+      fi
+      if ((10#$violation_count > 0)); then
+        printf '%s\n' diagnostic_complete_with_violations >"$run_dir/m1.status"
+      else
+        printf '%s\n' diagnostic_complete_clean >"$run_dir/m1.status"
+      fi
+      write_summary "$run_dir"
+      if ! grep -Fq -- '- m1_diagnostic_safety_evidence: PASS' \
+        "$run_dir/summary.md"; then
+        printf '%s\n' failed >"$run_dir/m1.status"
+        append_event_to "$run_dir" "$stage failed: final safety mismatch"
+        write_summary "$run_dir"
+        die "M1 diagnostic timeline completed but final safety evidence failed; TUN remains for status/snapshot/stop"
+      fi
+      echo "COMPLETE: 8-hour M1 diagnostic timeline collected with $violation_count data-quality violation(s)."
+      echo "This is diagnostic evidence, not formal M1 acceptance."
+      echo "run_dir=$run_dir"
+      echo "Next: sudo -E bash scripts/knife15-macos-soak.sh status"
+      echo "Then: sudo -E bash scripts/knife15-macos-soak.sh stop"
+      return 0
     fi
     write_summary "$run_dir"
     if ! grep -Fq -- '- m1_slo_evidence: PASS' "$run_dir/summary.md"; then
       printf '%s\n' failed >"$run_dir/m1.status"
-      append_event_to "$run_dir" "m1 failed: acceptance SLO mismatch"
+      append_event_to "$run_dir" "$stage failed: acceptance SLO mismatch"
       die "M1 traffic completed but its acceptance SLO failed; TUN remains for status/snapshot/stop"
     fi
     echo "PASS: formal 8-hour M1 workload completed; TUN remains running"
@@ -4404,7 +4900,7 @@ run_m1_action() {
   trap - INT TERM HUP
   clear_workload_state
   sample_once_for "$run_dir" || true
-  die "M1 workload failed; TUN remains running for status/snapshot/stop evidence"
+  die "$action_description workload failed; TUN remains running for status/snapshot/stop evidence"
 }
 
 show_status() {
@@ -4423,6 +4919,11 @@ show_status() {
   echo "run_dir=$run_dir"
   echo "m0_status=$(sed -n '1p' "$run_dir/m0.status" 2>/dev/null || echo not_run)"
   echo "m1_status=$(sed -n '1p' "$run_dir/m1.status" 2>/dev/null || echo not_run)"
+  echo "m1_mode=$(sed -n '1p' "$run_dir/m1-mode" 2>/dev/null || echo not_run)"
+  if [[ -f "$run_dir/m1-diagnostic-violations.tsv" ]]; then
+    echo "m1_diagnostic_violations=$(awk 'END { print (NR > 0 ? NR - 1 : 0) }' \
+      "$run_dir/m1-diagnostic-violations.tsv")"
+  fi
   if workload_matches_run; then
     echo "soak_workload=running pid=$(read_state workload.pid) command=$(read_state workload.command)"
   else
@@ -4488,12 +4989,16 @@ write_summary() {
   local m0_sender_zero_intervals m0_receiver_zero_intervals
   local m0_phase_results m0_result_evidence
   local m0_dns_result_files m0_invalid_dns_results m0_dns_evidence m0_timeline_evidence
-  local m1_status m1_active_windows m1_cycles m1_dns m1_idle m1_resume
+  local m1_status m1_mode m1_event_stage m1_completed
+  local m1_active_windows m1_cycles m1_dns m1_idle m1_resume
   local m1_final_drain m1_phase_failures m1_health_failures m1_phase_results
   local m1_tcp_results m1_udp_results m1_tcp_max_gap m1_udp_max_loss
   local m1_invalid_results m1_sender_zero_intervals m1_receiver_zero_intervals
   local m1_dns_result_files m1_invalid_dns_results m1_result_evidence
   local m1_dns_evidence m1_timeline_evidence m1_checkpoint_evidence
+  local m1_result_integrity_evidence m1_diagnostic_safety_evidence
+  local m1_diagnostic_violation_count m1_diagnostic_invalid_violations
+  local formal_m1_acceptance
   local m1_checkpoint_count m1_checkpoint_labels m1_checkpoint_first_rss
   local m1_checkpoint_final_rss m1_checkpoint_max_rss m1_checkpoint_rss_delta
   local m1_checkpoint_first_fd m1_checkpoint_final_fd m1_checkpoint_max_fd
@@ -4562,16 +5067,28 @@ write_summary() {
   m0_phase_results="$(grep -Fc $'\tm0 phase complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
   m1_status="$(sed -n '1p' "$run_dir/m1.status" 2>/dev/null || true)"
   m1_status="${m1_status:-not_run}"
-  m1_active_windows="$(grep -Ec $'\tm1 active .* complete ' \
+  m1_mode="$(sed -n '1p' "$run_dir/m1-mode" 2>/dev/null || true)"
+  if [[ -z "$m1_mode" ]]; then
+    [[ "$m1_status" == "not_run" ]] && m1_mode=not_run || m1_mode=formal
+  fi
+  m1_event_stage=m1
+  [[ "$m1_mode" == "diagnostic" ]] && m1_event_stage=m1-diagnostic
+  m1_completed=0
+  if [[ "$m1_status" == "complete" || \
+    "$m1_status" == "diagnostic_complete_clean" || \
+    "$m1_status" == "diagnostic_complete_with_violations" ]]; then
+    m1_completed=1
+  fi
+  m1_active_windows="$(grep -Ec $'\t'"$m1_event_stage"' active .* complete ' \
     "$run_dir/events.tsv" 2>/dev/null || true)"
-  m1_cycles="$(grep -Fc $'\tm1 cycle complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
-  m1_dns="$(grep -Fc $'\tm1 DNS complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
-  m1_idle="$(grep -Fc $'\tm1 idle complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
-  m1_resume="$(grep -Fc $'\tm1 resume complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
-  m1_final_drain="$(grep -Fc $'\tm1 final drain complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
-  m1_phase_failures="$(grep -Fc $'\tm1 phase failed ' "$run_dir/events.tsv" 2>/dev/null || true)"
-  m1_health_failures="$(grep -Fc $'\tm1 health failed:' "$run_dir/events.tsv" 2>/dev/null || true)"
-  m1_phase_results="$(grep -Fc $'\tm1 phase complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  m1_cycles="$(grep -Fc $'\t'"$m1_event_stage"' cycle complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  m1_dns="$(grep -Fc $'\t'"$m1_event_stage"' DNS complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  m1_idle="$(grep -Fc $'\t'"$m1_event_stage"' idle complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  m1_resume="$(grep -Fc $'\t'"$m1_event_stage"' resume complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  m1_final_drain="$(grep -Fc $'\t'"$m1_event_stage"' final drain complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  m1_phase_failures="$(grep -Fc $'\t'"$m1_event_stage"' phase failed ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  m1_health_failures="$(grep -Fc $'\t'"$m1_event_stage"' health failed:' "$run_dir/events.tsv" 2>/dev/null || true)"
+  m1_phase_results="$(grep -Fc $'\t'"$m1_event_stage"' phase complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
   read -r process_numeric_samples rss_first rss_last rss_max rss_delta \
     fd_first fd_last fd_max fd_delta threads_first threads_last threads_max threads_delta \
     <<<"$(process_resource_envelope "$run_dir/process.csv")"
@@ -4592,6 +5109,13 @@ write_summary() {
     <<<"$(m0_result_envelope "$run_dir/m1")"
   read -r m1_dns_result_files m1_invalid_dns_results \
     <<<"$(m0_dns_result_envelope "$run_dir/m1")"
+  m1_diagnostic_violation_count=0
+  m1_diagnostic_invalid_violations=0
+  if [[ "$m1_mode" == "diagnostic" ]]; then
+    read -r m1_diagnostic_violation_count m1_diagnostic_invalid_violations \
+      <<<"$(m1_diagnostic_violation_envelope \
+        "$run_dir/m1-diagnostic-violations.tsv")"
+  fi
   read -r m1_checkpoint_count m1_checkpoint_labels m1_checkpoint_first_rss \
     m1_checkpoint_final_rss m1_checkpoint_max_rss m1_checkpoint_rss_delta \
     m1_checkpoint_first_fd m1_checkpoint_final_fd m1_checkpoint_max_fd \
@@ -4663,14 +5187,24 @@ write_summary() {
   m1_sample_coverage_evidence=NOT_APPLICABLE
   m1_remote_write_evidence=NOT_APPLICABLE
   m1_slo_evidence=NOT_APPLICABLE
-  if [[ "$m1_status" == "complete" ]]; then
+  m1_result_integrity_evidence=NOT_APPLICABLE
+  m1_diagnostic_safety_evidence=NOT_APPLICABLE
+  formal_m1_acceptance=NOT_RUN
+  if ((m1_completed == 1)); then
     if ((10#$m1_phase_results > 0 && \
       10#$m1_phase_results == 10#$m1_tcp_results + 10#$m1_udp_results && \
-      10#$m1_invalid_results == 0 && \
-      10#$m1_receiver_zero_intervals == 0)); then
-      m1_result_evidence=PASS
+      10#$m1_invalid_results == 0)); then
+      m1_result_integrity_evidence=PASS
     else
-      m1_result_evidence=MISMATCH
+      m1_result_integrity_evidence=MISMATCH
+    fi
+    if [[ "$m1_mode" == "formal" ]]; then
+      if [[ "$m1_result_integrity_evidence" == "PASS" ]] && \
+        ((10#$m1_receiver_zero_intervals == 0)); then
+        m1_result_evidence=PASS
+      else
+        m1_result_evidence=MISMATCH
+      fi
     fi
     if ((10#$m1_dns > 0 && 10#$m1_dns == 10#$m1_dns_result_files && \
       10#$m1_invalid_dns_results == 0)); then
@@ -4709,11 +5243,13 @@ write_summary() {
       m1_remote_write_evidence=PASS
     elif [[ "$remote_write_failures" =~ ^[1-9][0-9]*$ ]] && \
       remote_write_close_ownership_is_clean "$log_file" && \
-      [[ "$m1_result_evidence" == "PASS" ]]; then
+      [[ "$m1_result_integrity_evidence" == "PASS" ]]; then
       m1_remote_write_evidence=CLASSIFIED_REVIEW
     else
       m1_remote_write_evidence=MISMATCH
     fi
+  fi
+  if [[ "$m1_mode" == "formal" && "$m1_status" == "complete" ]]; then
     m1_slo_evidence=PASS
     [[ "$m1_timeline_evidence" == "PASS" && \
       "$m1_result_evidence" == "PASS" && "$m1_dns_evidence" == "PASS" && \
@@ -4748,6 +5284,58 @@ write_summary() {
       grep -Eq 'pump_full_waits=[1-9][0-9]*|pump_read_errors=[1-9][0-9]*|send_slice_errors=[1-9][0-9]*|tun_flush_tx_failures=[1-9][0-9]*|terminal_pending_reap_bytes=[1-9][0-9]*|queue_(queued|leased|reserved)=[1-9][0-9]*|reason=stalled_write_timeout|reason=idle_timeout' "$log_file"; then
       m1_slo_evidence=MISMATCH
     fi
+    [[ "$m1_slo_evidence" == "PASS" ]] && \
+      formal_m1_acceptance=PASS || formal_m1_acceptance=FAIL
+  elif [[ "$m1_mode" == "diagnostic" && "$m1_completed" == "1" ]]; then
+    m1_diagnostic_safety_evidence=PASS
+    [[ "$m1_timeline_evidence" == "PASS" && \
+      "$m1_result_integrity_evidence" == "PASS" && \
+      "$m1_dns_evidence" == "PASS" && \
+      "$m1_checkpoint_evidence" == "PASS" && \
+      "$m1_sample_coverage_evidence" == "PASS" && \
+      "$m1_remote_write_evidence" != "MISMATCH" && \
+      "$conservation" == "PASS" && "$endpoint_last_live" == "0" && \
+      "$endpoint_last_outstanding" == "0" && \
+      "$endpoint_conservation_max" =~ ^[0-9]+$ && \
+      "$log_compactions" =~ ^[0-9]+$ && \
+      "$interface_error_samples" =~ ^[0-9]+$ && \
+      "$physical_interface_error_samples" =~ ^[0-9]+$ && \
+      "$m1_diagnostic_invalid_violations" == "0" ]] || \
+      m1_diagnostic_safety_evidence=MISMATCH
+    if [[ "$m1_diagnostic_safety_evidence" == "PASS" ]]; then
+      ((10#$m1_cycles == 30 && 10#$m1_dns == 30 && \
+        10#$m1_phase_results == 332 && 10#$m1_tcp_results == 302 && \
+        10#$m1_udp_results == 30 && 10#$endpoint_conservation_max <= 61440 && \
+        10#$log_compactions == 0 && 10#$interface_error_samples == 0 && \
+        10#$physical_interface_error_samples == 0)) || \
+        m1_diagnostic_safety_evidence=MISMATCH
+    fi
+    if [[ "$m1_diagnostic_safety_evidence" == "PASS" && \
+      "$endpoint_rebind_evidence" != "NOT_OBSERVED" ]]; then
+      [[ "$endpoint_rebind_evidence" == "PASS" ]] && \
+        ((10#$endpoint_rebind_max_first_rx_ms <= 7000)) || \
+        m1_diagnostic_safety_evidence=MISMATCH
+    fi
+    if [[ "$m1_diagnostic_safety_evidence" == "PASS" ]] && \
+      grep -Eq 'pump_full_waits=[1-9][0-9]*|pump_read_errors=[1-9][0-9]*|send_slice_errors=[1-9][0-9]*|tun_flush_tx_failures=[1-9][0-9]*|terminal_pending_reap_bytes=[1-9][0-9]*|queue_(queued|leased|reserved)=[1-9][0-9]*|reason=stalled_write_timeout|reason=idle_timeout' "$log_file"; then
+      m1_diagnostic_safety_evidence=MISMATCH
+    fi
+    if [[ "$m1_diagnostic_safety_evidence" == "PASS" ]]; then
+      m1_diagnostic_violation_coverage_is_complete "$run_dir" || \
+        m1_diagnostic_safety_evidence=MISMATCH
+    fi
+    if [[ "$m1_diagnostic_safety_evidence" == "PASS" ]]; then
+      if [[ "$m1_status" == "diagnostic_complete_clean" ]]; then
+        ((10#$m1_diagnostic_violation_count == 0)) || \
+          m1_diagnostic_safety_evidence=MISMATCH
+      elif [[ "$m1_status" == "diagnostic_complete_with_violations" ]]; then
+        ((10#$m1_diagnostic_violation_count > 0)) || \
+          m1_diagnostic_safety_evidence=MISMATCH
+      else
+        m1_diagnostic_safety_evidence=MISMATCH
+      fi
+    fi
+    formal_m1_acceptance=NOT_APPLICABLE
   fi
   if [[ "$conservation" != "PASS" ]] || \
     [[ "$m0_status" != "complete" && "$m0_status" != "not_run" ]] || \
@@ -4833,6 +5421,8 @@ write_summary() {
 - m0_sender_zero_intervals: ${m0_sender_zero_intervals:-0}
 - m0_receiver_zero_intervals: ${m0_receiver_zero_intervals:-0}
 - m1_status: $m1_status
+- m1_mode: $m1_mode
+- formal_m1_acceptance: $formal_m1_acceptance
 - m1_active_windows_completed: ${m1_active_windows:-0}
 - m1_cycles_completed: ${m1_cycles:-0}
 - m1_dns_completed: ${m1_dns:-0}
@@ -4843,6 +5433,7 @@ write_summary() {
 - m1_health_failures: ${m1_health_failures:-0}
 - m1_timeline_evidence: $m1_timeline_evidence
 - m1_phase_results_completed: ${m1_phase_results:-0}
+- m1_result_integrity_evidence: $m1_result_integrity_evidence
 - m1_result_evidence: $m1_result_evidence
 - m1_dns_result_files: ${m1_dns_result_files:-0}
 - m1_dns_evidence: $m1_dns_evidence
@@ -4861,6 +5452,9 @@ write_summary() {
 - m1_sample_coverage_evidence: $m1_sample_coverage_evidence
 - m1_remote_write_evidence: $m1_remote_write_evidence
 - m1_slo_evidence: $m1_slo_evidence
+- m1_diagnostic_violation_count: ${m1_diagnostic_violation_count:-0}
+- m1_diagnostic_invalid_violations: ${m1_diagnostic_invalid_violations:-0}
+- m1_diagnostic_safety_evidence: $m1_diagnostic_safety_evidence
 - process_numeric_samples: ${process_numeric_samples:-0}
 - rss_kib_first_last_max_delta: ${rss_first:-unknown}/${rss_last:-unknown}/${rss_max:-unknown}/${rss_delta:-unknown}
 - fd_first_last_max_delta: ${fd_first:-unknown}/${fd_last:-unknown}/${fd_max:-unknown}/${fd_delta:-unknown}
@@ -5095,7 +5689,10 @@ case "$ACTION" in
     run_m0_action
     ;;
   m1)
-    run_m1_action
+    run_m1_action formal
+    ;;
+  m1-diagnostic)
+    run_m1_action diagnostic
     ;;
   stop)
     stop_runner
