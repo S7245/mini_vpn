@@ -1,10 +1,39 @@
 # TODO
 
-## Current Knife15 Plan (2026-07-22)
+## Current Knife15 Plan (2026-07-24)
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-07-22)
+#### Latest decision (2026-07-24)
+
+Exact-source `297dee9` HK bundle
+`/tmp/mini_vpn_knife15_macos_20260724_034941.tar.gz` (SHA-256 `182cc896...`)
+was operated correctly. Fresh baseline/direct and the smoke pool-idle barrier
+passed. M1 completed `steady-a`, `idle-1`, `quiet`, and `idle-2`, then failed
+about 3h20m into the run in cycle 15 forward with three complete Target
+receiver-zero seconds.
+
+The `297dee9` repair is not the failed boundary. Both checkpoints ended at
+`61,403/0/0B`, and the failing control/data pair split conn0/conn1 from an
+idle pool. Conn1 added `783` lost packets, `898,964B` loss, `366` congestion
+events, and `18` PLPMTUD black holes while its writer waited `9,256,932us`.
+A direct Exit control lost one of three probes inside the interruption; the
+gateway, TUN, Endpoint conservation, D16 ownership, resources, and cleanup
+remained healthy.
+
+Reverse UDP also exceeded the frozen `3%` loss SLO twice (`3.356208%`,
+`3.408435%`), with each window aligned to direct Exit degradation and zero
+internal UDP drops/backpressure. Result:
+`docs/tech/2026-07-24-knife15-m1-hk-path-quality-failure-results.md`.
+
+Classify this as an external single-path M1 failure. Do not tune product or
+workload values and do not immediately repeat in the same network window.
+M2/M3 remain blocked. One fresh later-window HK M1 remains the next acceptance
+action. A future TCP repeat under healthy direct controls opens connection
+isolation/failover; a future UDP repeat under healthy direct controls opens
+UDP/TUIC quality architecture.
+
+#### Previous decision (2026-07-22)
 
 Exact-source `f60926e` HK bundle
 `/tmp/mini_vpn_knife15_macos_20260722_110059.tar.gz` (SHA-256 `9071ec0f...`)

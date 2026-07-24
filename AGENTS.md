@@ -187,7 +187,31 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-07-22:
+Current Knife15 summary, as of 2026-07-24:
+
+- Exact-source `297dee9` HK bundle
+  `/tmp/mini_vpn_knife15_macos_20260724_034941.tar.gz` (SHA-256
+  `182cc896...`) was operated correctly. Fresh baseline/direct and the new
+  smoke pool-idle barrier passed. M1 completed `steady-a`, `idle-1`, `quiet`,
+  and `idle-2`, then failed about 3h20m into the run on the first `steady-b`
+  forward phase with three complete Target receiver-zero seconds.
+- Pool ownership and placement were correct: both checkpoints ended at
+  `61,403/0/0B`, and cycle 15 control/data split conn0/conn1 from an idle pool.
+  The data writer waited `9,256,932us`; conn1 added `783` lost packets,
+  `898,964B` loss, `366` congestion events, and `18` PLPMTUD black holes.
+  A direct Exit control lost one of three probes inside the interruption while
+  the gateway and local interface remained clean.
+- Two reverse-UDP windows also exceeded the frozen `3%` SLO (`3.356208%`,
+  `3.408435%`). Each aligned with direct Exit degradation; mini_vpn internal
+  UDP drops/backpressure were zero. Endpoint conservation, D16 close
+  ownership, resources, and cleanup passed.
+- This is a path-attributed M1 failure, not a regression in `297dee9` and not
+  permission to tune a threshold, pool, MTU, pacing value, workload, or SLI.
+  M2/M3 remain blocked. Do not repeat in the same network window. One fresh
+  later-window HK M1 remains allowed; a future healthy-control TCP repeat
+  opens connection isolation/failover, and a healthy-control UDP repeat opens
+  UDP/TUIC quality architecture. Result:
+  `docs/tech/2026-07-24-knife15-m1-hk-path-quality-failure-results.md`.
 
 - Exact-source `f60926e` HK bundle
   `/tmp/mini_vpn_knife15_macos_20260722_110059.tar.gz` (SHA-256

@@ -2,9 +2,31 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 Release Readiness (2026-07-22)
+## Next Planned Stage — Knife15 Release Readiness (2026-07-24)
 
-- **Latest accepted position:** exact-source `f60926e` HK bundle
+- **Latest accepted position:** exact-source `297dee9` HK bundle
+  `/tmp/mini_vpn_knife15_macos_20260724_034941.tar.gz` (SHA-256
+  `182cc896...`) was operated correctly. Fresh baseline/direct and the
+  repaired smoke pool-idle barrier passed. M1 completed two active windows and
+  two idle checkpoints before the first `steady-b` forward phase failed about
+  3h20m into the run with three complete Target receiver-zero seconds.
+- The previous repair worked: both checkpoints ended at `61,403/0/0B`, and
+  cycle 15 control/data split conn0/conn1 from an idle pool. The data writer
+  waited `9,256,932us`; conn1 added `783` lost packets, `898,964B` loss,
+  `366` congestion events, and `18` PLPMTUD black holes. Direct Exit ICMP lost
+  one of three probes in the same interruption while the gateway, TUN,
+  Endpoint conservation, D16 ownership, resources, and cleanup stayed healthy.
+- Reverse UDP independently exceeded the frozen `3%` SLO in cycle 8
+  (`3.356208%`) and cycle 12 (`3.408435%`); each aligned with direct Exit RTT
+  or loss degradation, with zero mini_vpn internal UDP drops/backpressure.
+- This is an external single-path M1 failure, not a local repair or tuning
+  target. M2/M3 remain blocked. Do not repeat in the same window. A fresh
+  later-window HK M1 remains allowed. A healthy-control TCP repeat opens
+  connection isolation/failover; a healthy-control UDP repeat opens UDP/TUIC
+  quality architecture. Result:
+  `docs/tech/2026-07-24-knife15-m1-hk-path-quality-failure-results.md`.
+
+- **Previous accepted position:** exact-source `f60926e` HK bundle
   `/tmp/mini_vpn_knife15_macos_20260722_110059.tar.gz` (SHA-256
   `9071ec0f...`) was operated correctly. Baseline was `24.371/30.882 Mbit/s`;
   direct passed 300 seconds at `12.181 Mbit/s`. M1's first forward phase then

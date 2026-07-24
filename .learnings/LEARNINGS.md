@@ -1,5 +1,28 @@
 # Learnings
 
+## 2026-07-24 - A clean local invariant can coexist with a real external-path SLI failure
+
+- Exact source, fresh direct continuity, pool quiescence, correct two-slot
+  placement, Endpoint conservation, D16 closure, resource bounds, and cleanup
+  all passed for more than three hours before a real receiver interruption.
+  These invariants reject the prior lifecycle bug but cannot guarantee an
+  uncontrolled cross-region path.
+- Time alignment matters more than aggregate health. Three Target zero seconds,
+  a `9.257s` business-writer wait, bulk-connection QUIC loss/cwnd contraction,
+  and a direct Exit ICMP loss sample overlapped while the local gateway stayed
+  lossless. That evidence selects the external path without changing a frozen
+  value.
+- Independent acceptance dimensions remain independent: two reverse-UDP
+  windows above `3%` still fail M1, even though their alignment with Exit
+  degradation rejects a local tuning response. A path-attributed failure is
+  neither product acceptance nor permission to weaken the SLO.
+- Reusable rule: after a lifecycle repair passes its exact invariant, do not
+  keep modifying it to mask a separate path-quality failure. Retry only in a
+  new qualified window; open isolation/failover or UDP-quality architecture
+  only when healthy same-window controls select that boundary.
+- Result:
+  `docs/tech/2026-07-24-knife15-m1-hk-path-quality-failure-results.md`.
+
 ## 2026-07-22 - Preflight traffic must discharge lifecycle ownership before acceptance starts
 
 - A successful smoke command proves application completion, not that both

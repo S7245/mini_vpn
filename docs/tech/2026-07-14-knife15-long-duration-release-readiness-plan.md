@@ -1,8 +1,28 @@
 # Knife15 Long-Duration Release-Readiness Plan
 
 Date: 2026-07-14
-Status: **REAL RECEIVER INTERRUPTION REPEATED; 300S PHYSICAL DIRECT
-CONTINUITY GATE IMPLEMENTED; M0 AND M1 BLOCKED**
+Status: **2026-07-24 M1 PATH-ATTRIBUTED FAILURE; M2 AND M3 BLOCKED**
+
+## Latest M1 Discriminator
+
+Exact source `297dee9` passed fresh baseline/direct, the repaired smoke
+pool-idle barrier, `steady-a`, `idle-1`, `quiet`, and `idle-2`. The first
+`steady-b` forward phase then had three complete Target receiver-zero seconds
+about 3h20m into M1.
+
+Pool placement, Endpoint conservation, D16 ownership, TUN, resources, and
+cleanup were healthy. The data connection instead added `783` QUIC lost
+packets, `898,964B` loss, `366` congestion events, and `18` PLPMTUD black
+holes. A direct Exit control lost one of three probes in the same interruption
+while the physical gateway remained lossless. Two reverse-UDP windows above
+the frozen `3%` SLO independently aligned with direct Exit degradation and
+zero internal UDP drops/backpressure.
+
+This is a path-attributed M1 non-acceptance, not a local tuning target. Do not
+repeat in the same network window. One fresh later-window HK M1 remains
+allowed; healthy-control recurrence selects connection isolation/failover or
+UDP/TUIC quality architecture. Result:
+`docs/tech/2026-07-24-knife15-m1-hk-path-quality-failure-results.md`.
 
 ## Latest M0 Discriminator
 

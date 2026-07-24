@@ -1,5 +1,23 @@
 # Errors
 
+## 2026-07-24 - Do not turn an external path interruption into another local recovery tweak
+
+- Exact source `297dee9` passed baseline/direct, smoke quiescence, correct
+  pool placement, and two zero-ownership checkpoints before cycle 15 forward
+  had three complete Target receiver-zero seconds.
+- The bulk QUIC connection accumulated `783` lost packets, `898,964B` loss,
+  `366` congestion events, and `18` PLPMTUD black holes; direct Exit ICMP lost
+  one of three probes inside the same interruption, while the local gateway,
+  TUN, Endpoint conservation, D16 ownership, and resources stayed healthy.
+- Exact-stream ACK progress correctly suppressed a socket rebind. Re-enabling
+  Pending-only rebind, changing its bound, tuning MTU/pacing/pool/workload, or
+  waiving receiver gaps would repeat rejected branches rather than repair the
+  selected failure.
+- Correct behavior: preserve the M1 failure, block M2/M3, and wait for a new
+  qualified network window. Escalate to isolation/failover or UDP-quality
+  architecture only when healthy same-window controls select those product
+  boundaries.
+
 ## 2026-07-22 - Smoke completion was mistaken for TCP-pool quiescence
 
 - Exact source `f60926e` passed baseline/direct, then M1's first Target
