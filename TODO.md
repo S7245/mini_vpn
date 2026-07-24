@@ -6,6 +6,28 @@
 
 #### Latest decision (2026-07-24)
 
+Exact-source `f2c1484` HK pre-run bundle
+`/tmp/mini_vpn_knife15_macos_20260724_103153.tar.gz` (SHA-256
+`07f7e620...`) completed `start -> smoke -> stop`; no M1 diagnostic action
+ran. Binary/runner identity, routes, both TCP directions, fake-IP DNS, pool
+idle, Endpoint/D16 ownership, resources, and cleanup pass.
+
+Forward smoke retained four top-level zero intervals, but these are local
+sender intervals because smoke has no embedded server JSON. Replay over the
+six preceding real HK M1 bundles found `4/4/10/8/0/4` forward smoke
+cold-start sender zeros. They are not a new regression and do not predict the
+later Target receiver failure. One `1/3` Exit ICMP loss sample recovered in
+the next sample while the gateway remained lossless. Do not tune or add a
+strict smoke sender-zero gate. Result:
+`docs/tech/2026-07-24-knife15-hk-diagnostic-prerun-smoke-results.md`.
+
+Because the run was stopped, take one fresh complete
+`baseline -> direct-discriminator -> start -> smoke -> m1-diagnostic ->
+status -> stop` sequence. The diagnostic is still non-acceptance evidence and
+does not unblock M2/M3.
+
+#### Previous decision (2026-07-24)
+
 M1 diagnostic continuation is implemented locally at `b675540`. The new
 `m1-diagnostic` action reuses the exact frozen `28,800s` schedule and all
 formal preconditions/rates, but records valid receiver-zero, reverse-UDP loss

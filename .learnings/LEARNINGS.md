@@ -1,5 +1,23 @@
 # Learnings
 
+## 2026-07-24 - A warm-up signal is not automatically an acceptance signal
+
+- The exact-source pre-run smoke completed both TCP directions, fake-IP DNS,
+  pool drain, Endpoint conservation, and cleanup, but its forward top-level
+  iperf intervals included four local sender zeros. Smoke does not embed the
+  server JSON, so those rows cannot be relabeled as Target receiver zeros.
+- Replay over six preceding real HK M1 bundles found `4/4/10/8/0/4` forward
+  smoke sender zeros. Several later ran for hours. The pattern reflects the
+  cold preflight boundary and does not discriminate the later cross-region
+  interruption.
+- Reusable rule: before promoting a short preflight observation to a hard
+  gate, prove both its traffic direction and predictive power against prior
+  artifacts. Keep smoke responsible for connectivity and owned-state drain;
+  keep fresh direct continuity and the typed long diagnostic responsible for
+  path attribution.
+- Result:
+  `docs/tech/2026-07-24-knife15-hk-diagnostic-prerun-smoke-results.md`.
+
 ## 2026-07-24 - Long diagnostics need a typed exception, not a broad keep-going switch
 
 - A fail-fast acceptance runner and a longitudinal diagnostic runner serve
