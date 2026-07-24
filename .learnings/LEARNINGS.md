@@ -1,5 +1,24 @@
 # Learnings
 
+## 2026-07-24 - Long diagnostics need a typed exception, not a broad keep-going switch
+
+- A fail-fast acceptance runner and a longitudinal diagnostic runner serve
+  different questions. Reusing the exact schedule while separating mode,
+  status, event namespace, and final verdict preserves both without weakening
+  formal M1.
+- A classifier such as `receiver_zero_interval` is not sufficient authority
+  to continue: the same result may contain an unrelated malformed field. The
+  safe seam is a complete second validator that relaxes exactly one predicate
+  and keeps every other evidence requirement.
+- A violation ledger is useful only when it is source-complete. Replaying each
+  row against its JSON and independently scanning all results prevents a
+  missing row from turning bad data into a false clean diagnostic.
+- Reusable rule: exceptions must be typed, default-off, evidence-bound, and
+  explicitly excluded from acceptance. Safety and provenance failures stay on
+  the original stop path.
+- Result:
+  `docs/tech/2026-07-24-knife15-m1-diagnostic-continuation-local-results.md`.
+
 ## 2026-07-24 - A clean local invariant can coexist with a real external-path SLI failure
 
 - Exact source, fresh direct continuity, pool quiescence, correct two-slot

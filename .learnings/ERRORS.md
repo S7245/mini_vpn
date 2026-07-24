@@ -1,5 +1,32 @@
 # Errors
 
+## 2026-07-24 - Gate names and feature coverage must come from the current repository
+
+- The first shell-gate command referenced historical
+  `knife14h10d16-vps-test.sh` / `local-test.sh` names that do not exist. The
+  authoritative current Knife14 shell gate is
+  `knife14h10d16-singbox-control.sh`; Knife15 runner and wrapper make the three
+  shell self-tests.
+- The first `cargo test --all-targets` invocation passed but omitted the
+  `harness` feature, yielding `654+3 ignored` and zero integration tests
+  instead of the accepted `666+3` plus `10+4 ignored`.
+- Correct behavior: enumerate current scripts with `rg --files`, read feature
+  gates from the test source/Cargo metadata, and require the expected nonzero
+  counts. The corrected `cargo test --all-targets --features harness` and all
+  current shell gates passed; neither command mistake was a product
+  regression.
+
+## 2026-07-24 - A failure label must not authorize an incomplete evidence waiver
+
+- The initial diagnostic branch continued whenever the existing classifier
+  returned `receiver_zero_interval`. That classifier intentionally prioritizes
+  the zero cause and can coexist with an unrelated malformed sender field.
+- A focused zero-plus-missing-sender fixture exposed the fail-open edge before
+  any real TUN run.
+- Correct behavior: continue only after a second full-schema validation that
+  permits receiver zero and changes no other predicate. Replay the typed
+  violation ledger against source JSON and reject missing source coverage.
+
 ## 2026-07-24 - Do not turn an external path interruption into another local recovery tweak
 
 - Exact source `297dee9` passed baseline/direct, smoke quiescence, correct

@@ -2,7 +2,7 @@
 
 Date: 2026-07-24
 
-Status: **Approved for implementation**
+Status: **Completed at `b675540`**
 
 ## Task 1 — Lock the continuation seam
 

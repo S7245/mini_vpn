@@ -4,7 +4,29 @@
 
 ## Next Planned Stage — Knife15 Release Readiness (2026-07-24)
 
-- **Latest accepted position:** exact-source `297dee9` HK bundle
+- **Latest accepted position:** M1 diagnostic continuation is implemented
+  locally at `b675540`. `m1-diagnostic` runs the exact frozen `28,800s` M1
+  schedule, records valid receiver-zero intervals, reverse-UDP loss above
+  `3%`, and aggregate TCP gap above `16MiB`, and continues to final drain.
+  Formal `m1` is unchanged and remains the only acceptance path.
+- The violation TSV is typed and source-bound. Final summary replays each row
+  against its JSON and proves there are no missing observations. A second
+  validator relaxes only receiver positivity, so a zero plus any malformed
+  field still fails. Commands/timeouts, DNS, TUN/routes/watchdog, checkpoints,
+  samples, Endpoint/D16/pump/TUN signals, resource/rebind/ownership mismatches,
+  and ledger corruption remain fail-closed.
+- Root `666+3 ignored`, main `2`, integration `10+4 ignored`, release, Clippy,
+  shell, syntax, fmt/diff/secret, and review gates pass; no P0/P1 remains.
+  Result:
+  `docs/tech/2026-07-24-knife15-m1-diagnostic-continuation-local-results.md`.
+- Next use a fresh user-operated HK Mac from the pushed source:
+  `baseline -> direct-discriminator -> start -> smoke -> m1-diagnostic ->
+  status -> stop`. Rebuild release, use fresh `M1_BASELINE_DIR` /
+  `M1_DIRECT_DIR`, and keep every other VPN/TUN disabled through stop. The
+  artifact is diagnostic and cannot accept M1 or unblock M2/M3; formal M1
+  still needs a separate passing run.
+
+- **Previous accepted position:** exact-source `297dee9` HK bundle
   `/tmp/mini_vpn_knife15_macos_20260724_034941.tar.gz` (SHA-256
   `182cc896...`) was operated correctly. Fresh baseline/direct and the
   repaired smoke pool-idle barrier passed. M1 completed two active windows and

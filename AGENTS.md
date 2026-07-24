@@ -189,6 +189,28 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-07-24:
 
+- M1 diagnostic continuation is locally complete at `b675540`. The new public
+  `m1-diagnostic` action runs the unchanged `28,800s` schedule but records and
+  continues valid Target receiver-zero, reverse-UDP loss above `3%`, and final
+  TCP gap above `16MiB`. Formal `m1` remains fail-fast and is still the only
+  M1 acceptance action.
+- The typed violation ledger records cycle/phase/value/ranges and source JSON.
+  Final summary replays every row and scans all `332` results for missing
+  observations. Receiver-zero continuation uses a complete second validator
+  that relaxes only the receiver-positive predicate; malformed/missing
+  evidence, command/DNS/health/checkpoint/resource/ownership/recovery failures
+  remain fail-closed.
+- Root `666+3 ignored`, main `2`, integration `10+4 ignored`, release, Clippy,
+  Knife15/Knife14 shell, syntax, fmt/diff/secret, and code-review gates pass
+  with no unresolved P0/P1. No Rust data-plane or frozen value changed.
+  Result:
+  `docs/tech/2026-07-24-knife15-m1-diagnostic-continuation-local-results.md`.
+- Next take one fresh user-run HK `m1-diagnostic` from the pushed source with
+  rebuilt release and fresh baseline/direct. Keep every other VPN/TUN off
+  through `stop`; preserve status/snapshot/stop on safety failure. This run is
+  longitudinal evidence only and cannot unblock M2/M3. A separate formal `m1`
+  must still pass.
+
 - Exact-source `297dee9` HK bundle
   `/tmp/mini_vpn_knife15_macos_20260724_034941.tar.gz` (SHA-256
   `182cc896...`) was operated correctly. Fresh baseline/direct and the new

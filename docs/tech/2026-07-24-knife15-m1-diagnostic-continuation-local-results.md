@@ -10,7 +10,7 @@ Status: **Local implementation accepted — one fresh user-run HK macOS
 The macOS HITL runner now has a separate public `m1-diagnostic` action. It
 executes the unchanged formal M1 `28,800s` schedule and continues after valid
 data-quality observations so one eight-hour window can produce a complete
-longitudinal artifact.
+longitudinal artifact. The implementation commit is `b675540`.
 
 Formal `m1` remains fail-fast and is the only action that can produce formal
 M1 acceptance. No Rust data-plane code or frozen Knife14/Knife15 value

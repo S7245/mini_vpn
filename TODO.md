@@ -6,6 +6,29 @@
 
 #### Latest decision (2026-07-24)
 
+M1 diagnostic continuation is implemented locally at `b675540`. The new
+`m1-diagnostic` action reuses the exact frozen `28,800s` schedule and all
+formal preconditions/rates, but records valid receiver-zero, reverse-UDP loss
+above `3%`, and aggregate TCP gap above `16MiB` and continues the timeline.
+Formal `m1` remains fail-fast and is the only M1 acceptance action.
+
+The typed ledger is replayed against its original JSON and checked for missing
+observations. Receiver-zero continuation relaxes only receiver positivity;
+malformed or missing evidence and every command/DNS/health/checkpoint/sample/
+Endpoint/D16/pump/TUN/resource/rebind/ownership failure remain fail-closed.
+Root `666+3 ignored`, main `2`, integration `10+4 ignored`, release, Clippy,
+shell, syntax, fmt/diff/secret, and review gates pass with no P0/P1. Result:
+`docs/tech/2026-07-24-knife15-m1-diagnostic-continuation-local-results.md`.
+
+Next run one fresh user-operated HK diagnostic sequence from the pushed
+source: `baseline -> direct-discriminator -> start -> smoke -> m1-diagnostic
+-> status -> stop`. Rebuild release, use fresh `M1_BASELINE_DIR` and
+`M1_DIRECT_DIR`, and keep every other VPN/TUN disabled through stop. This
+artifact is for complete longitudinal attribution; it cannot accept M1 or
+unblock M2/M3. Formal M1 still requires a separate passing run.
+
+#### Previous decision (2026-07-24)
+
 Exact-source `297dee9` HK bundle
 `/tmp/mini_vpn_knife15_macos_20260724_034941.tar.gz` (SHA-256 `182cc896...`)
 was operated correctly. Fresh baseline/direct and the smoke pool-idle barrier
