@@ -1,5 +1,19 @@
 # Errors
 
+## 2026-07-27 - Smoke PASS was mistaken for a runnable M1 transaction
+
+- Exact source `5c3cd95` passed post-repair smoke and pool-idle cleanup, but
+  the resulting bundle contained no M1 evidence. `DNS_TARGET` had been
+  disabled when start state was written, and direct evidence was 1,875 seconds
+  old at start versus the frozen 900-second limit.
+- Exporting DNS after start cannot change state; restarting without a fresh
+  direct cannot restore freshness. Stopping after smoke also finalizes a run
+  that can no longer host M1.
+- Correct behavior: export DNS before start, take a fresh baseline/direct pair,
+  and run `start -> smoke -> m1-diagnostic` immediately as one sequence. Run
+  status/stop only after the diagnostic returns, except for the documented
+  safety-failure evidence path.
+
 ## 2026-07-26 - A data-preservation guard became an unbounded lifecycle veto
 
 - Exact source `a3ebe42` completed both smoke workloads, but its reverse-data

@@ -187,7 +187,29 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-07-26:
+Current Knife15 summary, as of 2026-07-27:
+
+- Exact-source `5c3cd95` HK bundle
+  `/tmp/mini_vpn_knife15_macos_20260727_074752.tar.gz` (SHA-256
+  `27f105d8...`) completed only `start -> smoke -> stop` in about 49 seconds.
+  The repaired pool-idle barrier reached `active_leases=0`; both TCP
+  directions, Endpoint/D16 conservation, controls, resources, routes, secret
+  scan, and cleanup passed. No half-closed-idle block occurred.
+- M1 diagnostic did not run: status/mode remained `not_run`, with no
+  controller, result directory, checkpoint, event, or violation ledger.
+  `DNS_TARGET` was disabled in the immutable start-owned state. The paired
+  baseline/direct passed at `30.885/52.530 Mbit/s` and `15.412 Mbit/s` with
+  zero receiver gaps, but direct was 1,875 seconds old at start versus the
+  frozen 900-second bound. A later DNS export cannot repair the current run.
+- Accept this as post-`44ff086` real-Mac smoke non-regression only. It does not
+  exercise the exact static-ownership timeout branch, complete M1 diagnostic,
+  accept M1, or unblock M2/M3. No code or frozen value changed. Result:
+  `docs/tech/2026-07-27-knife15-hk-post-repair-smoke-only-results.md`.
+- Next take a fresh uninterrupted HK
+  `baseline -> direct-discriminator -> start -> smoke -> m1-diagnostic ->
+  status -> stop`. Export `DNS_TARGET=8.8.8.8` before start and enter
+  `m1-diagnostic` within 900 seconds of direct completion. Do not stop after
+  smoke.
 
 - Exact-source `a3ebe42` HK bundle
   `/tmp/mini_vpn_knife15_macos_20260724_105822.tar.gz` (SHA-256

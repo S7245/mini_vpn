@@ -2,9 +2,32 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 Release Readiness (2026-07-26)
+## Next Planned Stage — Knife15 Release Readiness (2026-07-27)
 
-- **Latest reviewed position:** exact-source `a3ebe42` HK bundle
+- **Latest reviewed position:** exact-source `5c3cd95` HK bundle
+  `/tmp/mini_vpn_knife15_macos_20260727_074752.tar.gz` (SHA-256
+  `27f105d8...`) safely completed `start -> smoke -> stop` in about 49
+  seconds. The repaired pool-idle barrier reached `active_leases=0`; both TCP
+  directions, Endpoint/D16 conservation, controls, resources, routes, and
+  cleanup passed. No half-closed-idle block occurred.
+- This is post-`44ff086` smoke non-regression evidence, not an M1 diagnostic.
+  M1 status/mode remained `not_run`, with no controller, results, checkpoints,
+  or violation ledger. `DNS_TARGET` was disabled in start-owned state, and the
+  otherwise passing direct result was already 1,875 seconds old at start,
+  beyond the frozen 900-second limit. A later DNS export cannot change the
+  existing run state.
+- Baseline receivers were `30.885/52.530 Mbit/s` with zero gaps; direct was
+  `15.412 Mbit/s` with zero receiver gaps. Smoke was `26.763/48.275 Mbit/s`;
+  its four forward sender-zero rows remain the accepted cold-start REVIEW
+  class. No code or frozen value changed. Result:
+  `docs/tech/2026-07-27-knife15-hk-post-repair-smoke-only-results.md`.
+- Next take a fresh uninterrupted HK
+  `baseline -> direct-discriminator -> start -> smoke -> m1-diagnostic ->
+  status -> stop` sequence. Export `DNS_TARGET=8.8.8.8` before `start` and
+  enter M1 diagnostic within 900 seconds of direct completion. Do not stop
+  after smoke. The diagnostic cannot accept M1 or unblock M2/M3.
+
+- **Previous reviewed position:** exact-source `a3ebe42` HK bundle
   `/tmp/mini_vpn_knife15_macos_20260724_105822.tar.gz` (SHA-256
   `b5ce3af4...`) was operated correctly. Both smoke TCP commands and fake-IP
   DNS completed, but smoke's pool-idle barrier failed: reverse-data handle 1

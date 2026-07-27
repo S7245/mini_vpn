@@ -1,5 +1,23 @@
 # Learnings
 
+## 2026-07-27 - Long-run prerequisites must be bound before start and consumed promptly
+
+- A clean start/smoke does not prove M1 can start. DNS configuration is copied
+  into run-owned state at `start`; exporting it later cannot change what
+  `run_m1_action` reads.
+- Direct continuity is not merely a prior PASS artifact. Its 900-second
+  freshness is consumed by elapsed wall time, so waiting 1,875 seconds before
+  start turned a healthy `15.412 Mbit/s` result into an invalid prerequisite.
+- The safest operator sequence treats direct PASS through M1 registration as
+  one uninterrupted transaction: export every state-bound value first, run
+  direct, start, smoke, and enter M1 immediately. Status/stop belong after the
+  long action returns, not after smoke.
+- Reusable rule: distinguish component readiness from transaction readiness.
+  Validate immutable inputs and expiring evidence at the boundary that begins
+  the expensive transaction.
+- Result:
+  `docs/tech/2026-07-27-knife15-hk-post-repair-smoke-only-results.md`.
+
 ## 2026-07-26 - Owned-byte presence protects conservation; progress governs lifetime
 
 - The failed smoke preserved exactly `524,288B` of D16 payload, but four
