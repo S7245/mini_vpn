@@ -1,5 +1,18 @@
 # Errors
 
+## 2026-07-26 - A data-preservation guard became an unbounded lifecycle veto
+
+- Exact source `a3ebe42` completed both smoke workloads, but its reverse-data
+  relay retained one pool lease because each 10-second half-close timeout saw
+  `524,288B` queued and unconditionally re-armed.
+- Endpoint rebind recovery, path samples, conservation, and repeated actor
+  scheduling did not move the bytes. Increasing the pool-idle wait, changing a
+  timeout, or treating rebind as business-stream progress would hide the
+  ownership leak rather than repair it.
+- Correct behavior: grant the first owned window, then require monotonic
+  queued-to-leased or permit-release progress before another renewal. Test
+  static ownership separately from progressing queued and leased ownership.
+
 ## 2026-07-24 - Gate names and feature coverage must come from the current repository
 
 - The first shell-gate command referenced historical

@@ -2,9 +2,34 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 Release Readiness (2026-07-24)
+## Next Planned Stage — Knife15 Release Readiness (2026-07-26)
 
-- **Latest reviewed position:** exact-source `f2c1484` HK pre-run bundle
+- **Latest reviewed position:** exact-source `a3ebe42` HK bundle
+  `/tmp/mini_vpn_knife15_macos_20260724_105822.tar.gz` (SHA-256
+  `b5ce3af4...`) was operated correctly. Both smoke TCP commands and fake-IP
+  DNS completed, but smoke's pool-idle barrier failed: reverse-data handle 1
+  epoch 3 retained one native lease and exactly `524,288B` queued through four
+  identical 10-second half-close windows. M1 diagnostic did not run.
+- Endpoint conservation ended `61,414/0/0B`; three rebinds recovered,
+  TUN/pump/interfaces/resources stayed healthy, and stop cleaned everything.
+  The old relay timer nevertheless re-armed on ownership presence alone,
+  despite roughly 19,000 subsequent egress windows with no ownership progress.
+  This is a local bounded-lifecycle defect, not user operation, path loss,
+  pacing, or a frozen-value tuning branch.
+- Commit `44ff086` publishes monotonic queued-to-leased/permit-release progress
+  from the D16 queue. The first owned half-close window is preserved; later
+  windows re-arm only after real local progress. Static ownership reaches the
+  existing timeout. Root `667+3 ignored`, main `2`, integration `10+4
+  ignored`, release, Clippy, shell, vendored Quinn/proto, capacity,
+  fmt/diff/secret, and review gates pass with no unresolved P0/P1. Result:
+  `docs/tech/2026-07-26-knife15-hk-smoke-half-close-progress-results.md`.
+- Next pull the pushed repair, rebuild release, and take a fresh user-run HK
+  `baseline -> direct-discriminator -> start -> smoke -> m1-diagnostic ->
+  status -> stop` sequence. Keep every other VPN/TUN off through stop and
+  preserve status/snapshot/stop on failure. The diagnostic cannot accept M1
+  or unblock M2/M3.
+
+- **Previous reviewed position:** exact-source `f2c1484` HK pre-run bundle
   `/tmp/mini_vpn_knife15_macos_20260724_103153.tar.gz` (SHA-256
   `07f7e620...`) completed `start -> smoke -> stop`; M1 diagnostic was not
   run. Binary/runner provenance, routes, bidirectional TCP, fake-IP DNS,

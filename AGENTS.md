@@ -187,7 +187,32 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-07-24:
+Current Knife15 summary, as of 2026-07-26:
+
+- Exact-source `a3ebe42` HK bundle
+  `/tmp/mini_vpn_knife15_macos_20260724_105822.tar.gz` (SHA-256
+  `b5ce3af4...`) was operated correctly. Both smoke TCP directions and fake-IP
+  DNS completed, but the TCP-pool idle barrier failed before M1 diagnostic:
+  reverse-data handle 1 epoch 3 retained one native lease and exactly
+  `524,288B` queued through four identical 10-second half-close windows.
+- Endpoint conservation ended `61,414/0/0B`; three Endpoint rebinds recovered,
+  while TUN/pump/interfaces/resources and cleanup passed. The relay still ran
+  roughly 19,000 no-progress egress windows because ownership presence alone
+  unconditionally re-armed its timer. This is a local bounded-lifecycle defect,
+  not operator, path, pacing, or frozen-value tuning evidence.
+- Commit `44ff086` publishes monotonic queued-to-leased/permit-release progress
+  from the D16 queue. The first owned half-close window is preserved; later
+  windows re-arm only after real local progress. Static ownership reaches the
+  existing timeout. Root `667+3 ignored`, main `2`, integration `10+4
+  ignored`, release, Clippy, shell, vendored Quinn/proto, 32 MiB capacity,
+  fmt/diff/secret, and review gates pass with no unresolved P0/P1. No frozen
+  value changed. Result:
+  `docs/tech/2026-07-26-knife15-hk-smoke-half-close-progress-results.md`.
+- Next pull the pushed repair, rebuild release, and take a fresh user-run HK
+  `baseline -> direct-discriminator -> start -> smoke -> m1-diagnostic ->
+  status -> stop`. Keep every other VPN/TUN off through stop; preserve
+  status/snapshot/stop on safety failure. M1 diagnostic remains longitudinal
+  evidence only and cannot unblock M2/M3; formal `m1` must still pass.
 
 - M1 diagnostic continuation is locally complete at `b675540`. The new public
   `m1-diagnostic` action runs the unchanged `28,800s` schedule but records and

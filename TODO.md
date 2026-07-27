@@ -1,10 +1,42 @@
 # TODO
 
-## Current Knife15 Plan (2026-07-24)
+## Current Knife15 Plan (2026-07-26)
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-07-24)
+#### Latest decision (2026-07-26)
+
+Exact-source `a3ebe42` HK bundle
+`/tmp/mini_vpn_knife15_macos_20260724_105822.tar.gz` (SHA-256
+`b5ce3af4...`) was operated correctly. Both smoke TCP directions and fake-IP
+DNS completed, but the pool-idle safety barrier failed before M1 diagnostic:
+reverse-data handle 1 epoch 3 retained one native pool lease and exactly
+`524,288B` queued across four identical 10-second half-close windows.
+
+Endpoint conservation ended `61,414/0/0B`; three Endpoint rebinds recovered,
+and TUN, pump, interfaces, resources, routes, and cleanup remained healthy.
+The relay nevertheless ran roughly 19,000 more egress windows without local
+ownership progress because each timeout renewed on owned-byte presence alone.
+This selects a local bounded-lifecycle defect rather than operator procedure,
+network quality, pacing, or a frozen-value tuning branch.
+
+Commit `44ff086` makes the D16 queue publish monotonic local progress for
+queued-to-leased transfer and permit release. The first owned half-close
+window remains protected; later windows defer only when that evidence
+advances. Static ownership now reaches the existing half-close timeout.
+Focused RED/GREEN, root `667+3 ignored`, main `2`, integration `10+4
+ignored`, release, Clippy, shell, vendored Quinn/proto, 32 MiB capacity,
+fmt/diff/secret, and code-review gates pass with no P0/P1. No frozen value
+changed. Result:
+`docs/tech/2026-07-26-knife15-hk-smoke-half-close-progress-results.md`.
+
+Next pull the pushed repair, rebuild release, and take one fresh user-operated
+HK `baseline -> direct-discriminator -> start -> smoke -> m1-diagnostic ->
+status -> stop` sequence. Keep every other VPN/TUN disabled through stop and
+preserve status/snapshot/stop on failure. M1 diagnostic remains
+non-acceptance evidence and cannot unblock M2/M3.
+
+#### Previous decision (2026-07-24)
 
 Exact-source `f2c1484` HK pre-run bundle
 `/tmp/mini_vpn_knife15_macos_20260724_103153.tar.gz` (SHA-256

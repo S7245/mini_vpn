@@ -1,5 +1,22 @@
 # Learnings
 
+## 2026-07-26 - Owned-byte presence protects conservation; progress governs lifetime
+
+- The failed smoke preserved exactly `524,288B` of D16 payload, but four
+  identical half-close windows and roughly 19,000 no-progress actor windows
+  showed that conservation alone cannot justify an unbounded relay lifetime.
+- Put the discriminator at the module that owns the state transitions. A
+  monotonic counter over queued-to-leased transfer and permit release is
+  stronger and cheaper than reconstructing progress from relay logs, socket
+  state, or Endpoint traffic.
+- One initial owned-payload grace preserves data safety. Later renewal requires
+  counter advancement, so slow useful drains survive while static ownership
+  reaches the existing bounded close path without tuning a timeout.
+- Reusable rule: distinguish state ownership from state progress. Presence is
+  an invariant; progress is the evidence that may renew a deadline.
+- Result:
+  `docs/tech/2026-07-26-knife15-hk-smoke-half-close-progress-results.md`.
+
 ## 2026-07-24 - A warm-up signal is not automatically an acceptance signal
 
 - The exact-source pre-run smoke completed both TCP directions, fake-IP DNS,
