@@ -339,6 +339,8 @@ pub struct LeasedByteQueueSnapshot {
     pub queued_bytes: usize,
     pub leased_bytes: usize,
     pub reserved_bytes: usize,
+    /// Monotonic evidence that owned payload advanced toward local egress.
+    pub local_progress_bytes: u64,
     pub capacity_bytes: usize,
     pub high_water_bytes: usize,
     pub chunks: usize,
@@ -613,6 +615,7 @@ struct LeasedByteFlowQueueState {
     queued_bytes: usize,
     leased_bytes: usize,
     reserved_bytes: usize,
+    local_progress_bytes: u64,
     wake_pending: bool,
     capacity_bytes: usize,
     high_water_bytes: usize,
@@ -627,6 +630,7 @@ impl LeasedByteFlowQueueState {
             queued_bytes: 0,
             leased_bytes: 0,
             reserved_bytes: 0,
+            local_progress_bytes: 0,
             wake_pending: false,
             capacity_bytes,
             high_water_bytes: 0,
@@ -640,6 +644,7 @@ impl LeasedByteFlowQueueState {
             queued_bytes: self.queued_bytes,
             leased_bytes: self.leased_bytes,
             reserved_bytes: self.reserved_bytes,
+            local_progress_bytes: self.local_progress_bytes,
             capacity_bytes: self.capacity_bytes,
             high_water_bytes: self.high_water_bytes,
             chunks: self.chunks.len(),
@@ -685,6 +690,7 @@ impl LeasedByteFlowQueueState {
         if out.is_empty() {
             None
         } else {
+            self.local_progress_bytes = self.local_progress_bytes.saturating_add(out.len() as u64);
             self.note_high_water();
             Some(out.freeze())
         }
@@ -1140,6 +1146,7 @@ impl DownstreamBytePermit {
         self.remaining_bytes = self.remaining_bytes.saturating_sub(released);
         let mut state = self.inner.lock_state();
         state.leased_bytes = state.leased_bytes.saturating_sub(released);
+        state.local_progress_bytes = state.local_progress_bytes.saturating_add(released as u64);
         drop(state);
         if let Some(global_budget) = &self.inner.global_budget {
             global_budget.inner.release_owned(released);
@@ -1484,11 +1491,13 @@ mod tests {
     async fn leased_byte_queue_holds_capacity_until_permit_release() {
         let queue = AsyncLeasedByteFlowQueue::new(128 * 1024).unwrap();
         queue.push(Bytes::from(vec![1; 128 * 1024])).await.unwrap();
+        assert_eq!(queue.snapshot().await.local_progress_bytes, 0);
 
         let mut leased = queue.recv_up_to(64 * 1024).await.unwrap();
         assert_eq!(leased.bytes().len(), 64 * 1024);
         assert_eq!(queue.snapshot().await.queued_bytes, 64 * 1024);
         assert_eq!(queue.snapshot().await.leased_bytes, 64 * 1024);
+        assert_eq!(queue.snapshot().await.local_progress_bytes, 64 * 1024);
         assert_eq!(queue.snapshot().await.available_bytes(), 0);
 
         let producer_queue = queue.clone();
@@ -1501,6 +1510,10 @@ mod tests {
         );
 
         assert_eq!(leased.permit_mut().release(32 * 1024), 32 * 1024);
+        assert_eq!(
+            queue.snapshot().await.local_progress_bytes,
+            64 * 1024 + 32 * 1024
+        );
         tokio::task::yield_now().await;
         assert!(
             producer.is_finished(),
@@ -1512,6 +1525,7 @@ mod tests {
         let snapshot = queue.snapshot().await;
         assert_eq!(snapshot.leased_bytes, 0);
         assert_eq!(snapshot.queued_bytes, 64 * 1024 + 1);
+        assert_eq!(snapshot.local_progress_bytes, 128 * 1024);
     }
 
     #[tokio::test]

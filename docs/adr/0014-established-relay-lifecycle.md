@@ -24,14 +24,18 @@ needs bounded remote drain.
   deadline.
 - Successful completion of the whole write plus flush disarms it.
 - Local write-half completion arms the existing 10-second remote-drain
-  deadline; useful D16-owned payload continues to defer terminal close.
+  deadline. The first deadline with D16-owned payload preserves one drain
+  window; later deadlines defer terminal close only when monotonic local
+  ownership progress advanced through queued-to-leased transfer or permit
+  release. Ownership presence alone cannot renew the deadline forever.
 - One shared state machine supplies these semantics to every relay engine.
 
 ## Consequences
 
 - Quiet control, long-poll, SSE, and other transparent TCP sessions remain
   open until a real lifecycle owner closes them.
-- Wedged writes and half-closed drains remain bounded and observable.
+- Wedged writes and half-closed drains remain bounded and observable, while
+  useful D16 payload that continues advancing retains time to drain.
 - `idle_timeout` is no longer a valid full-open relay terminal cause;
   `stalled_write_timeout` identifies the concrete guarded condition.
 - Channel closure, socket terminal state, remote EOF/error, and transport

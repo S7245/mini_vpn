@@ -13314,6 +13314,7 @@ async fn run_relay_d16(
     let mut writer_wait_max_us = 0u128;
     let mut half_closed_idle_blocked_events = 0u64;
     let mut half_closed_idle_blocked_max_payload_bytes = 0usize;
+    let mut half_closed_local_progress_bytes = None;
     let terminal_error = loop {
         tokio::select! {
             activity = activity_rx.recv(), if !reader_done && activity_open => {
@@ -13341,6 +13342,7 @@ async fn run_relay_d16(
                     }
                     Some(RelayWriterSignal::WriteHalfClosed { .. }) => {
                         writer_done = true;
+                        half_closed_local_progress_bytes = None;
                         close_timer.arm_half_closed();
                         if reader_done {
                             break None;
@@ -13387,23 +13389,34 @@ async fn run_relay_d16(
                     if queue_snapshot.closure.terminal_cause().is_none()
                         && payload_owned_bytes > 0
                     {
-                        half_closed_idle_blocked_events =
-                            half_closed_idle_blocked_events.saturating_add(1);
-                        half_closed_idle_blocked_max_payload_bytes =
-                            half_closed_idle_blocked_max_payload_bytes.max(payload_owned_bytes);
-                        tcp_diag_log!(
-                            "🔎 tcp-d16-half-closed-idle-blocked handle={:?} epoch={} blocked_events={} payload_owned_bytes={} queue_queued={} queue_leased={} queue_reserved={} queue_closed={}",
-                            handle,
-                            epoch,
-                            half_closed_idle_blocked_events,
-                            payload_owned_bytes,
-                            queue_snapshot.queued_bytes,
-                            queue_snapshot.leased_bytes,
-                            queue_snapshot.reserved_bytes,
-                            queue_snapshot.closure.is_closed(),
-                        );
-                        close_timer.arm_half_closed();
-                        continue;
+                        let previous_local_progress_bytes =
+                            half_closed_local_progress_bytes.unwrap_or(0);
+                        let first_owned_window = half_closed_local_progress_bytes.is_none();
+                        let made_local_progress = queue_snapshot.local_progress_bytes
+                            > previous_local_progress_bytes;
+                        if first_owned_window || made_local_progress {
+                            half_closed_local_progress_bytes =
+                                Some(queue_snapshot.local_progress_bytes);
+                            half_closed_idle_blocked_events =
+                                half_closed_idle_blocked_events.saturating_add(1);
+                            half_closed_idle_blocked_max_payload_bytes =
+                                half_closed_idle_blocked_max_payload_bytes.max(payload_owned_bytes);
+                            tcp_diag_log!(
+                                "🔎 tcp-d16-half-closed-idle-blocked handle={:?} epoch={} blocked_events={} payload_owned_bytes={} local_progress_bytes={} previous_local_progress_bytes={} queue_queued={} queue_leased={} queue_reserved={} queue_closed={}",
+                                handle,
+                                epoch,
+                                half_closed_idle_blocked_events,
+                                payload_owned_bytes,
+                                queue_snapshot.local_progress_bytes,
+                                previous_local_progress_bytes,
+                                queue_snapshot.queued_bytes,
+                                queue_snapshot.leased_bytes,
+                                queue_snapshot.reserved_bytes,
+                                queue_snapshot.closure.is_closed(),
+                            );
+                            close_timer.arm_half_closed();
+                            continue;
+                        }
                     }
                 }
                 break Some(("timer", close_timer.terminal_reason()));
@@ -19680,6 +19693,78 @@ mod tests {
             }))) if h == handle
         ));
         assert!(back_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn d16_half_closed_idle_owned_payload_without_local_progress_is_bounded() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = mk_test_handle(&mut sockets);
+        let reader: NativeTcpReadHalf = Box::new(BurstNativeReader {
+            chunks: std::collections::VecDeque::from([NativeTcpChunk {
+                offset: 0,
+                bytes: Bytes::from(vec![7; 64 * 1024]),
+            }]),
+            eof_after_chunks: false,
+        });
+        let writer_shutdown = Arc::new(AtomicBool::new(false));
+        let writer: NativeTcpWriteHalf = Box::new(NoopNativeWriter {
+            shutdown_called: writer_shutdown.clone(),
+        });
+        let queue = AsyncLeasedByteFlowQueue::new_with_release_mode(
+            64 * 1024,
+            DownstreamPermitReleaseMode::OnEgressDrain,
+        )
+        .unwrap();
+        let (uplink_tx, uplink_rx) = mpsc::channel::<RelayCommand>(1);
+        let (back_tx, mut back_rx) = mpsc::channel(8);
+        let (_credit_tx, credit_rx) = watch::channel(RelayReadCredit {
+            paused: false,
+            max_batch_bytes: 64 * 1024,
+        });
+        let task = tokio::spawn(run_relay_d16(
+            handle,
+            26,
+            reader,
+            writer,
+            uplink_rx,
+            back_tx,
+            credit_rx,
+            queue.clone(),
+        ));
+
+        assert!(matches!(
+            back_rx.recv().await,
+            Some((h, RelayEvent::DataReady { epoch: 26 })) if h == handle
+        ));
+        assert_eq!(queue.snapshot_now().queued_bytes, 64 * 1024);
+
+        uplink_tx.send(RelayCommand::Finish).await.unwrap();
+        while !writer_shutdown.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(RELAY_HALF_CLOSED_IDLE_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "the first half-close deadline must preserve useful D16 ownership"
+        );
+
+        tokio::time::advance(RELAY_HALF_CLOSED_IDLE_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert!(
+            task.is_finished(),
+            "unchanged D16 ownership must not re-arm the half-close timer forever"
+        );
+        task.await.unwrap();
+        assert!(matches!(
+            back_rx.recv().await,
+            Some((h, RelayEvent::Closed(RelayClose {
+                epoch: 26,
+                direction: "timer",
+                reason: "half_closed_idle_timeout",
+            }))) if h == handle
+        ));
     }
 
     #[tokio::test]
