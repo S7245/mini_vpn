@@ -1,5 +1,20 @@
 # Errors
 
+## 2026-07-28 - An Exit outage ended a nearly complete diagnostic
+
+- Exact source `0b43141` ran M1 diagnostic for 7h34m43s before the Exit became
+  unreachable and cycle 32 reverse TCP ended with an incomplete iperf JSON.
+  The gateway stayed lossless, while Exit ICMP stayed at 100% loss for 861
+  consecutive samples and TUIC reconnect attempts timed out.
+- Reclassifying the malformed result as a continuable data-quality violation
+  would make the diagnostic fail open. Tuning pacing, D16, MTU, pool, QUIC
+  windows, workload rates, or SLI thresholds cannot repair an unavailable
+  single Exit.
+- Correct behavior: retain the completed longitudinal evidence, keep the
+  command/evidence-integrity stop, confirm infrastructure uptime, and advance
+  to a fresh formal M1 rather than spending another eight hours repeating the
+  non-acceptance diagnostic.
+
 ## 2026-07-27 - Smoke PASS was mistaken for a runnable M1 transaction
 
 - Exact source `5c3cd95` passed post-repair smoke and pool-idle cleanup, but

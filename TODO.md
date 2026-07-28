@@ -1,10 +1,38 @@
 # TODO
 
-## Current Knife15 Plan (2026-07-27)
+## Current Knife15 Plan (2026-07-28)
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-07-27)
+#### Latest decision (2026-07-28)
+
+Exact-source `0b43141` HK bundle
+`/tmp/mini_vpn_knife15_macos_20260727_085340.tar.gz` (SHA-256
+`0fdfbfd4...`) contains a correctly operated M1 diagnostic that ran 7h34m43s
+before cycle 32 reverse TCP produced an incomplete iperf result with
+`control socket has closed unexpectedly`.
+
+This is an external Exit outage. Exit `43.153.32.33` was `3/3`, 0% loss at
+`16:28:33Z`, then `0/3`, 100% loss at `16:29:04Z`; the local gateway remained
+`3/3`, 0% loss. Exit loss persisted for 861 consecutive samples through
+`00:04:07Z`, and TUIC rebind/reconnect could not recover. No other VPN/TUN
+route existed during the workload; `utun1024` appeared only about nine hours
+after the failure and just before stop.
+
+Before the outage, 305 completed phase results and 27 DNS results were valid,
+all three idle/resume checkpoints passed at `61,403/0/0B`, and the diagnostic
+violation ledger was empty. Maximum UDP loss was `2.127049%`, maximum TCP gap
+was `12,451,840B`, and Endpoint/D16/pool/TUN/resource invariants passed. About
+39 minutes of the frozen schedule remained. Result:
+`docs/tech/2026-07-28-knife15-hk-m1-diagnostic-exit-outage-results.md`.
+
+Do not tune or repair mini_vpn for this failure, and do not repeat the
+diagnostic. After confirming the Exit VPS will remain powered and the TUIC
+service is stable, take fresh baseline/direct evidence and run one formal
+`start -> smoke -> m1 -> status -> stop`. Formal M1 remains the only gate that
+can unblock M2/M3.
+
+#### Previous decision (2026-07-27)
 
 Exact-source `5c3cd95` HK bundle
 `/tmp/mini_vpn_knife15_macos_20260727_074752.tar.gz` (SHA-256

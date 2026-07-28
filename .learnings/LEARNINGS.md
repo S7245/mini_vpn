@@ -1,5 +1,23 @@
 # Learnings
 
+## 2026-07-28 - Partial long-run evidence remains useful when controls prove an infrastructure outage
+
+- The M1 diagnostic produced 7h34m of wall-time evidence, 305 valid phase
+  results, 27 DNS results, and three clean idle checkpoints before its only
+  incomplete command. Treating the whole run as unusable would discard the
+  longest clean post-repair observation.
+- Failure attribution came from time alignment, not the generic workload
+  label: Exit probes changed from 0% to 100% loss while the gateway remained
+  lossless, then stayed down for 861 samples as TUIC reconnect timed out.
+- A late unrelated TUN route cannot explain an earlier failure. `utun1024`
+  appeared about nine hours after M1 diagnostic stopped, so it affects only
+  post-failure summary deltas.
+- Reusable rule: preserve completed typed observations, distinguish incomplete
+  acceptance from useless evidence, and advance to the next necessary gate
+  when repeating a non-acceptance diagnostic would not answer a new question.
+- Result:
+  `docs/tech/2026-07-28-knife15-hk-m1-diagnostic-exit-outage-results.md`.
+
 ## 2026-07-27 - Long-run prerequisites must be bound before start and consumed promptly
 
 - A clean start/smoke does not prove M1 can start. DNS configuration is copied

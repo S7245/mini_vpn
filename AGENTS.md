@@ -187,7 +187,31 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-07-27:
+Current Knife15 summary, as of 2026-07-28:
+
+- Exact-source `0b43141` HK M1 diagnostic bundle
+  `/tmp/mini_vpn_knife15_macos_20260727_085340.tar.gz` (SHA-256
+  `0fdfbfd4...`) was operated correctly and ran 7h34m43s before cycle 32
+  reverse TCP ended with an incomplete iperf result:
+  `control socket has closed unexpectedly`.
+- The Exit changed from `3/3`, 0% ICMP loss at `16:28:33Z` to `0/3`, 100%
+  loss at `16:29:04Z`, while the gateway stayed `3/3`, 0% loss. The Exit
+  remained at 100% loss for 861 consecutive samples through `00:04:07Z`;
+  TUIC rebind/reconnect could not recover an unreachable endpoint.
+  `utun1024` appeared only about nine hours after the failure, immediately
+  before stop, and was not causal.
+- Before the outage, 305 completed phase results, 27 DNS results, and all
+  three idle/resume checkpoints were valid. The diagnostic ledger was empty;
+  maximum UDP loss was `2.127049%`, maximum TCP gap `12,451,840B`, and
+  Endpoint checkpoints were `61,403/0/0B`. Conservation, D16, pool idle,
+  TUN, resources, and interfaces passed. About 39 minutes remained.
+- This is an external Exit VPS/upstream outage and a valid fail-closed
+  diagnostic stop, not a product, operator, pacing, or frozen-value tuning
+  branch. It is not diagnostic completion or formal M1 acceptance. Do not
+  repeat the diagnostic. Once Exit uptime/TUIC stability is confirmed, take
+  fresh baseline/direct evidence and run one formal M1. M2/M3 remain blocked.
+  Result:
+  `docs/tech/2026-07-28-knife15-hk-m1-diagnostic-exit-outage-results.md`.
 
 - Exact-source `5c3cd95` HK bundle
   `/tmp/mini_vpn_knife15_macos_20260727_074752.tar.gz` (SHA-256

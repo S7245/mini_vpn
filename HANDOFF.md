@@ -2,9 +2,34 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 Release Readiness (2026-07-27)
+## Next Planned Stage — Knife15 Release Readiness (2026-07-28)
 
-- **Latest reviewed position:** exact-source `5c3cd95` HK bundle
+- **Latest reviewed position:** exact-source `0b43141` HK M1 diagnostic bundle
+  `/tmp/mini_vpn_knife15_macos_20260727_085340.tar.gz` (SHA-256
+  `0fdfbfd4...`) was operated correctly and ran 7h34m43s before cycle 32
+  reverse TCP ended with `control socket has closed unexpectedly`.
+- The failure is externally attributed. Exit `43.153.32.33` changed from
+  `3/3`, 0% loss at `16:28:33Z` to `0/3`, 100% loss at `16:29:04Z`, while
+  the local gateway stayed `3/3`, 0% loss. Exit loss then persisted for 861
+  consecutive samples through `00:04:07Z`; TUIC rebind/reconnect could not
+  recover an unreachable host. `utun1024` appeared only about nine hours after
+  the diagnostic failed, immediately before stop, and did not cause it.
+- Before the outage, 305 completed TCP/UDP results, 27 DNS results, and all
+  three idle/resume checkpoints were valid. The diagnostic ledger was empty;
+  UDP loss maxed at `2.127049%`, TCP gap at `12,451,840B`, and Endpoint
+  checkpoints were `61,403/0/0B`. Conservation, D16, pool idle, TUN,
+  resources, and interfaces remained healthy. About 39 minutes of the frozen
+  schedule remained.
+- This is useful post-`44ff086` long real-Mac non-regression evidence, but it
+  is neither a complete diagnostic nor formal M1 acceptance. No product,
+  runner, SLI, or frozen-value change is selected. Result:
+  `docs/tech/2026-07-28-knife15-hk-m1-diagnostic-exit-outage-results.md`.
+- Do not repeat the diagnostic. Once the Exit VPS is confirmed continuously
+  powered and its TUIC service stable, take fresh baseline/direct evidence and
+  run one formal `start -> smoke -> m1 -> status -> stop`. Keep every other
+  VPN/TUN off through stop. M2/M3 remain blocked pending formal M1.
+
+- **Previous reviewed position:** exact-source `5c3cd95` HK bundle
   `/tmp/mini_vpn_knife15_macos_20260727_074752.tar.gz` (SHA-256
   `27f105d8...`) safely completed `start -> smoke -> stop` in about 49
   seconds. The repaired pool-idle barrier reached `active_leases=0`; both TCP
