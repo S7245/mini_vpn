@@ -4,6 +4,39 @@
 
 ## Next Planned Stage — Knife15 M2 Release Readiness (2026-07-30)
 
+- **Latest accepted position:** Knife15 M2 local implementation, gates, and
+  review are complete at `4dac87c`. The public `m2` action owns a controlled
+  IPv4 full tunnel and system DNS for an exact `86,400s` schedule, then
+  requires two-phase cleanup before formal acceptance. No Rust data-plane or
+  frozen Knife14/M1 value changed.
+- The immutable schedule has six active windows, five 600-second idle/resume
+  boundaries, a 600-second final drain, 93 complete DNS/real-client cycles,
+  `934` TCP plus `95` UDP results, `1,029` phase results, and six
+  lifecycle/resource checkpoints. Partial cycles retain phase evidence but use
+  a separate contiguous complete-cycle identity for the 93 HTTPS records.
+- M2 records the physical Exit path and DNS snapshot, pins Exit physical,
+  routes both IPv4 halves and `198.18.0.0/15` through the owned utun, blocks a
+  physical IPv6 route, and probes public egress plus real HTTPS through the
+  system resolver/fake-IP path. Cleanup removes only matching owned state and
+  restores the exact DNS snapshot.
+- Endpoint/D16/M1 receiver, TCP-gap, UDP-loss, rebind, resource, disk, log, and
+  cleanup gates remain fail-closed. Fake-IP checkpoints require zero active
+  ownership and a stable one/two-entry cache because the frozen `1,800s` TTL
+  intentionally exceeds the `600s` drain.
+- Final root `667+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  Clippy, Knife15/Knife14 shell, syntax, fmt/diff/secret, vendored Quinn
+  `37+3 ignored` plus doc `1`, quinn-proto `309` plus doc `3`, and code review
+  pass with no unresolved P0/P1. Results:
+  `docs/tech/2026-07-30-knife15-m2-24h-real-client-soak-local-results.md`.
+- Next pull the pushed source, disable Clash-TUN/every other VPN from baseline
+  through stop, and run exactly one fresh HK
+  `baseline -> direct-discriminator -> start -> smoke -> m2 -> status -> stop`
+  using
+  `docs/tech/2026-07-30-knife15-m2-macos-hitl-runbook.md`. Reserve about 25
+  hours. On any start/smoke/M2 failure preserve
+  `status -> snapshot -> stop`; do not tune or repeat unchanged. M3 remains
+  blocked pending real M2 bundle acceptance.
+
 - **Latest accepted position:** exact-source `ee1a423` HK formal M1 bundle
   `/tmp/mini_vpn_knife15_macos_20260729_105127.tar.gz` (SHA-256
   `c263507c...`) was operated correctly and completed the entire frozen

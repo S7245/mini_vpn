@@ -189,6 +189,35 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-07-30:
 
+- Knife15 M2 local implementation is complete at `4dac87c`. The reviewed
+  public `m2` action owns a controlled IPv4 full tunnel/system DNS for an exact
+  `86,400s` schedule, with six active windows, five idle/resume boundaries,
+  final drain, 93 DNS/real-client cycles, `934` TCP plus `95` UDP results,
+  `1,029` phase results, and six lifecycle/resource checkpoints.
+- M2 pins the TUIC Exit to the recorded physical gateway, routes both IPv4
+  halves and `198.18.0.0/15` through the owned utun, changes only the matching
+  physical service DNS, blocks a physical IPv6 route, and proves public egress
+  plus real HTTPS through the system resolver/fake-IP path. Cleanup is
+  compare-before-remove/restore and formal acceptance remains
+  `PENDING_CLEANUP` until `stop`.
+- The accepted M1 receiver/TCP-gap/UDP-loss, Endpoint/D16, rebind, pool,
+  resource, disk, log, route/DNS, and cleanup gates remain fail-closed.
+  Fake-IP checkpoints require zero active ownership and a stable one/two-entry
+  registered cache because the frozen `1,800s` TTL exceeds the `600s` drain.
+  No Rust data-plane or frozen value changed.
+- Root `667+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  Clippy, Knife15/Knife14 shell, syntax, fmt/diff/secret, vendored Quinn
+  `37+3 ignored` plus doc `1`, quinn-proto `309` plus doc `3`, and review
+  gates pass with no unresolved P0/P1. Result:
+  `docs/tech/2026-07-30-knife15-m2-24h-real-client-soak-local-results.md`.
+- Next take exactly one fresh user-run HK
+  `baseline -> direct-discriminator -> start -> smoke -> m2 -> status -> stop`
+  from `4dac87c` or a descendant using
+  `docs/tech/2026-07-30-knife15-m2-macos-hitl-runbook.md`. Disable Clash-TUN
+  and every other VPN before baseline and through stop. On failure preserve
+  `status/snapshot/stop`; do not tune or repeat unchanged. M3 remains blocked
+  until the real M2 bundle is accepted.
+
 - Exact-source `ee1a423` HK formal M1 bundle
   `/tmp/mini_vpn_knife15_macos_20260729_105127.tar.gz` (SHA-256
   `c263507c...`) completed the exact frozen `28,800s` schedule: five active

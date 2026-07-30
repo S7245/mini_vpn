@@ -11,6 +11,7 @@ The Knife15 macOS runner now has one formal `m2` action for a controlled
 plane and M1 SLOs while adding runner-owned split-default routes, system DNS,
 real HTTPS/fake-IP/public-egress evidence, six lifecycle checkpoints, bounded
 storage/resource gates, and two-phase cleanup acceptance.
+The implementation commit is `4dac87c`.
 
 No Rust data-plane code, Endpoint pacing value, MTU, pool, QUIC window, chunk,
 Cubic, GSO, self-wake, M1 SLI, or workload-rate cap changed.

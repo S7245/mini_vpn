@@ -2,7 +2,7 @@
 
 Date: 2026-07-30
 
-Status: **READY AFTER THE M2 IMPLEMENTATION COMMIT IS PUSHED**
+Status: **READY — implementation commit `4dac87c` or a descendant required**
 
 This is the only reviewed M2 sequence. It runs a controlled IPv4 full tunnel
 for 24 hours and temporarily changes the active physical network service DNS.
@@ -32,6 +32,7 @@ git switch codex/knife14d-downlink-reap-open
 git pull --ff-only origin codex/knife14d-downlink-reap-open
 git status --short
 git rev-parse HEAD
+git merge-base --is-ancestor 4dac87c HEAD && echo 'PASS: M2 source accepted'
 
 unset M0_BASELINE_DIR M0_DIRECT_DIR
 unset M1_BASELINE_DIR M1_DIRECT_DIR
@@ -54,8 +55,9 @@ export MINI_VPN_TUIC_SNI='example.com'
 export MINI_VPN_TUIC_CA_PATH='certs/dev/ca-cert.pem'
 ```
 
-`git status --short` must print nothing. Replace only the UUID/password
-placeholders; do not send those values or paste them into a bundle.
+`git status --short` must print nothing, and the source check must print PASS.
+Replace only the UUID/password placeholders; do not send those values or paste
+them into a bundle.
 
 ## 2. Build And Offline Gates
 

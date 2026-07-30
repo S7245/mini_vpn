@@ -4,7 +4,47 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-07-30)
+#### Latest decision (2026-07-30 — M2 local)
+
+Knife15 M2 local implementation is accepted at `4dac87c`. One public `m2`
+action now owns a controlled IPv4 full tunnel, the active physical service
+DNS, an exact 24-hour mixed workload, real HTTPS/public-egress evidence, six
+drain checkpoints, and two-phase cleanup acceptance.
+
+The formal contract requires:
+
+```text
+86400s traffic/drain budget
+6 active windows + 5 idle/resume pairs + final drain
+93 complete cycles/DNS/real-client probes
+934 TCP + 95 UDP = 1029 phase results
+6 lifecycle/resource checkpoints
+```
+
+The Exit stays pinned to its physical gateway while `0/1`, `128/1`, and
+`198.18/15` use the owned utun. System-resolver HTTPS must observe fake remote
+addresses and the Exit public IPv4. A physical IPv6 route blocks M2. Cleanup
+restores the protected DNS snapshot and removes only matching owned routes;
+formal acceptance remains pending until `stop`.
+
+Root/harness, release, Clippy, all Knife15/Knife14 shell gates, vendored
+Quinn/proto, fmt/diff/secret, and code review pass with no unresolved P0/P1.
+No Rust data-plane or frozen value changed. Results:
+`docs/tech/2026-07-30-knife15-m2-24h-real-client-soak-local-results.md`.
+
+Next:
+
+1. pull the pushed branch and rebuild release on the HK Mac;
+2. disable Clash-TUN and every other VPN/TUN before baseline and through stop;
+3. run one fresh
+   `baseline -> direct-discriminator -> start -> smoke -> m2 -> status -> stop`
+   using `docs/tech/2026-07-30-knife15-m2-macos-hitl-runbook.md`;
+4. preserve `status -> snapshot -> stop` on any failure;
+5. review and accept the real bundle before planning M3.
+
+Do not repeat M0/M1, tune constants, or open M3 before M2 evidence review.
+
+#### Previous decision (2026-07-30 — formal M1)
 
 Exact-source `ee1a423` HK formal M1 bundle
 `/tmp/mini_vpn_knife15_macos_20260729_105127.tar.gz` (SHA-256
