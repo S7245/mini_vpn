@@ -2,9 +2,43 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 Release Readiness (2026-07-28)
+## Next Planned Stage — Knife15 M2 Release Readiness (2026-07-30)
 
-- **Latest reviewed position:** exact-source `0b43141` HK M1 diagnostic bundle
+- **Latest accepted position:** exact-source `ee1a423` HK formal M1 bundle
+  `/tmp/mini_vpn_knife15_macos_20260729_105127.tar.gz` (SHA-256
+  `c263507c...`) was operated correctly and completed the entire frozen
+  `28,800s` schedule: five active windows, 30 cycles/DNS checks, three
+  idle/resume pairs, final drain, `302` TCP plus `30` UDP results, and four
+  clean checkpoints.
+- The old runner reported `acceptance SLO mismatch` only after logging
+  `m1 complete`. It counted an unchanged lifetime `en0` input-error counter
+  (`16 -> 16`) as 1,539 error samples and rejected two normal
+  relay-task snapshots with `19,456B`/`18,944B` already leased to smoltcp.
+  The same handles proved equal local-EOF queues, terminal send queues of
+  zero, zero reap, and no reuse before drain.
+- Focused TDD makes physical errors movement/reset-aware and replaces the
+  global queue grep with a same-handle fail-closed lifecycle validator.
+  Counter movement/reset, open terminal queues, queued/reserved bytes,
+  unequal/missing drain, terminal ownership, and cross-epoch reuse still
+  fail. No Rust data-plane or frozen value changed.
+- Immutable-bundle replay reports formal M1 PASS. Target receiver zero
+  intervals were `0`; maximum TCP gap was `10,485,760B`, maximum UDP loss
+  `2.446087%`, Endpoint conservation max/final was
+  `61,440B / 61,403/0/0B`, checkpoints were stable, and cleanup passed.
+  Eighty-eight `Stopped(0)` boundaries and 22 sender-zero intervals remain
+  visible `CLASSIFIED_REVIEW` evidence; neither violates receiver or ownership
+  acceptance.
+- Root `667+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  Clippy, Knife15/Knife14 shell, syntax, fmt/diff/secret, real-bundle replay,
+  and review gates pass with no unresolved P0/P1. Result:
+  `docs/tech/2026-07-30-knife15-hk-m1-formal-acceptance-results.md`.
+- Knife15 M1 is complete; do not repeat it. M2 planning is unblocked. Next
+  write the M2 24-hour real-client soak architecture spec and implementation
+  plan for product-like TCP/UDP/video/DNS/idle activity, bounded logs/resources,
+  route/DNS leak checks, and Shenzhen/HK path attribution. Keep M3
+  single-variable recovery work sequenced after that contract.
+
+- **Previous reviewed position:** exact-source `0b43141` HK M1 diagnostic bundle
   `/tmp/mini_vpn_knife15_macos_20260727_085340.tar.gz` (SHA-256
   `0fdfbfd4...`) was operated correctly and ran 7h34m43s before cycle 32
   reverse TCP ended with `control socket has closed unexpectedly`.

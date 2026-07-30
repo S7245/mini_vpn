@@ -1,5 +1,21 @@
 # Errors
 
+## 2026-07-30 - Snapshot and lifetime-counter greps rejected a complete M1
+
+- Exact source `ee1a423` logged all five active windows, 30 cycles, 332
+  results, three idle/resume pairs, and final drain, then the summary changed
+  M1 from `complete` to `failed`.
+- The first observer error counted every row whose lifetime `en0` input-error
+  counter was 16. The counter never moved, so 1,539 reported error samples
+  represented one pre-run value rather than a run-time failure.
+- The second observer error rejected any nonzero D16 queue field anywhere in
+  the log. Two clean reader-task snapshots retained bytes already leased to
+  smoltcp; later same-handle records proved exact and complete egress drain.
+- Correct behavior: baseline cumulative counters and reject movement/reset;
+  validate transient transferred ownership through equal bytes, terminal
+  zero/reap, and a handle-reuse barrier. Never repair this class by hiding the
+  log line or broadly allowing `clean_queue_lifecycle`.
+
 ## 2026-07-28 - An Exit outage ended a nearly complete diagnostic
 
 - Exact source `0b43141` ran M1 diagnostic for 7h34m43s before the Exit became

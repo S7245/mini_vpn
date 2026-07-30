@@ -1,5 +1,25 @@
 # Learnings
 
+## 2026-07-30 - Follow owned state to its terminal boundary before judging a snapshot
+
+- The formal M1 schedule and every receiver SLI completed, but a summary grep
+  rejected two D16 relay-task snapshots with `19,456B`/`18,944B` leased. Those
+  bytes had already moved into smoltcp ownership; the same handles then showed
+  equal local-EOF queues, drained to zero, and closed before reuse.
+- A reason label alone is not sufficient to waive ownership. The repaired
+  validator accepts the transient only through a full same-handle sequence and
+  rejects unequal bytes, missing final drain, an open queue, terminal
+  ownership, or a new epoch before completion.
+- Lifetime kernel counters also need an observation boundary. A constant
+  nonzero `en0` error counter is pre-run history, not 1,539 new failures.
+  Establish the first valid row as baseline, then fail on movement or reset.
+- Reusable rule: cumulative counters are judged by run-time change, while
+  transferred ownership is judged at the last module that still owns it.
+  Preserve fail-closed sequence and identity checks instead of using a global
+  nonzero grep.
+- Result:
+  `docs/tech/2026-07-30-knife15-hk-m1-formal-acceptance-results.md`.
+
 ## 2026-07-28 - Partial long-run evidence remains useful when controls prove an infrastructure outage
 
 - The M1 diagnostic produced 7h34m of wall-time evidence, 305 valid phase

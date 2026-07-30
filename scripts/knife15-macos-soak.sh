@@ -639,16 +639,20 @@ network_control_envelope() {
         if (!have_gateway_loss || $14 + 0 > gateway_loss_max) gateway_loss_max = $14 + 0
         have_gateway_loss = 1
       }
-      if (physical_valid && ($20 + 0 > 0 || $23 + 0 > 0)) {
-        physical_error_samples++
-      }
       if (physical_valid) {
         if (!physical_samples) {
+          # Interface counters are lifetime-cumulative. The first valid row is
+          # the run baseline; only movement or a reset is a run-time signal.
           ibytes_first = $21 + 0
           obytes_first = $24 + 0
+        } else if ($20 + 0 != physical_ierrs_last ||
+            $23 + 0 != physical_oerrs_last) {
+          physical_error_samples++
         }
         ibytes_last = $21 + 0
         obytes_last = $24 + 0
+        physical_ierrs_last = $20 + 0
+        physical_oerrs_last = $23 + 0
         physical_samples++
       }
       if (physical_valid && $26 ~ /^[0-9]+$/ &&
@@ -951,6 +955,92 @@ remote_write_close_ownership_is_clean() {
           $0 !~ /queue_closed=true( |$)/) invalid++
     }
     END { exit !(count > 0 && invalid == 0) }
+  ' "$log_file" 2>/dev/null
+}
+
+d16_terminal_ownership_is_clean() {
+  local log_file="$1"
+  # A clean relay task may finish after handing its final lease to smoltcp.
+  # Accept that transient state only when the same handle proves an equal
+  # local EOF queue and reaches a zero-queue handle close before reuse.
+  awk '
+    function field(prefix, position) {
+      for (position = 1; position <= NF; position++) {
+        if (substr($position, 1, length(prefix)) == prefix) {
+          return substr($position, length(prefix) + 1)
+        }
+      }
+      return ""
+    }
+    /tcp-d16-relay-close/ {
+      handle = field("handle=")
+      reason = field("terminal_reason=")
+      queued = field("queue_queued=")
+      leased = field("queue_leased=")
+      reserved = field("queue_reserved=")
+      closed = field("queue_closed=")
+      if (queued !~ /^[0-9]+$/ || leased !~ /^[0-9]+$/ ||
+          reserved !~ /^[0-9]+$/ || closed !~ /^(true|false)$/) {
+        invalid++
+        next
+      }
+      if (queued + 0 > 0 || reserved + 0 > 0 || closed != "true") {
+        invalid++
+      }
+      if (leased + 0 > 0) {
+        if (reason != "clean_queue_lifecycle" ||
+            handle == "" || drain_phase[handle] != 0) {
+          invalid++
+        } else {
+          drain_phase[handle] = 1
+          drain_bytes[handle] = leased + 0
+        }
+      }
+      next
+    }
+    /tcp-relay-engine/ {
+      handle = field("handle=")
+      if (handle != "" && drain_phase[handle] != 0) invalid++
+      next
+    }
+    /tcp-local-eof-close/ {
+      handle = field("handle=")
+      if (handle == "" || drain_phase[handle] == 0) next
+      direction = field("direction=")
+      reason = field("reason=")
+      send_queue = field("send_queue=")
+      if (drain_phase[handle] != 1 ||
+          direction != "remote_to_local" || reason != "remote_eof" ||
+          send_queue !~ /^[0-9]+$/ ||
+          send_queue + 0 != drain_bytes[handle]) {
+        invalid++
+      } else {
+        drain_phase[handle] = 2
+      }
+      next
+    }
+    /tcp-handle-close/ {
+      handle = field("handle=")
+      if (handle == "" || drain_phase[handle] == 0) next
+      direction = field("direction=")
+      reason = field("reason=")
+      terminal_reap = field("terminal_pending_reap_bytes=")
+      send_queue = field("send_queue=")
+      if (drain_phase[handle] != 2 ||
+          direction != "remote_to_local" || reason != "remote_eof" ||
+          terminal_reap != "0" || send_queue != "0") {
+        invalid++
+      }
+      delete drain_phase[handle]
+      delete drain_bytes[handle]
+      next
+    }
+    END {
+      for (handle in drain_phase) {
+        if (drain_phase[handle] != 0) invalid++
+      }
+      exit !(invalid == 0)
+    }
   ' "$log_file" 2>/dev/null
 }
 
@@ -2558,6 +2648,55 @@ EOF_DIRECT_FIXTURE
     "$m1_formal_run/summary.md" || \
     die "self-test: complete formal M1 evidence unexpectedly required review"
 
+  cp "$m1_formal_run/mini_vpn.log" "$m1_formal_run/mini_vpn.clean.log"
+  printf '%s\n' \
+    '🔎 tcp-d16-relay-close handle=SocketHandle(16) epoch=109 terminal_direction=none terminal_reason=clean_queue_lifecycle writer_progress_events=1 writer_progress_bytes=37 writer_wait_max_us=178 half_closed_idle_blocked_events=0 half_closed_idle_blocked_max_payload_bytes=0 queue_queued=0 queue_leased=19456 queue_reserved=0 queue_closed=true' \
+    '🔎 tcp-local-eof-close handle=SocketHandle(16) direction=remote_to_local reason=remote_eof send_queue=19456 tcp_state=Established active=true can_send=true can_recv=false may_send=true may_recv=true' \
+    '🔎 tcp-handle-close handle=SocketHandle(16) direction=remote_to_local reason=remote_eof state=Closing pending=0 terminal_pending_reap_bytes=0 tcp_state=Closed active=false send_queue=0 recv_queue=0' \
+    >>"$m1_formal_run/mini_vpn.log"
+  write_summary "$m1_formal_run"
+  grep -Fq -- '- m1_slo_evidence: PASS' "$m1_formal_run/summary.md" || \
+    die "self-test: proven post-relay egress drain invalidated the M1 SLO"
+  cp "$m1_formal_run/mini_vpn.log" "$m1_formal_run/mini_vpn.drained.log"
+  sed -i '' '$d' "$m1_formal_run/mini_vpn.log"
+  write_summary "$m1_formal_run"
+  grep -Fq -- '- m1_slo_evidence: MISMATCH' \
+    "$m1_formal_run/summary.md" || \
+    die "self-test: incomplete post-relay egress drain met the M1 SLO"
+  mv "$m1_formal_run/mini_vpn.drained.log" "$m1_formal_run/mini_vpn.log"
+  cp "$m1_formal_run/mini_vpn.log" "$m1_formal_run/mini_vpn.drained.log"
+  sed -i '' \
+    's/reason=remote_eof send_queue=19456/reason=remote_eof send_queue=19455/' \
+    "$m1_formal_run/mini_vpn.log"
+  write_summary "$m1_formal_run"
+  grep -Fq -- '- m1_slo_evidence: MISMATCH' \
+    "$m1_formal_run/summary.md" || \
+    die "self-test: mismatched post-relay egress ownership met the M1 SLO"
+  mv "$m1_formal_run/mini_vpn.drained.log" "$m1_formal_run/mini_vpn.log"
+  cp "$m1_formal_run/mini_vpn.log" "$m1_formal_run/mini_vpn.drained.log"
+  awk '
+    /tcp-handle-close handle=SocketHandle[(]16[)]/ {
+      print "🔎 tcp-relay-engine handle=SocketHandle(16) epoch=111 engine=d16_byte_owned"
+    }
+    { print }
+  ' "$m1_formal_run/mini_vpn.log" >"$m1_formal_run/mini_vpn.log.reused"
+  mv "$m1_formal_run/mini_vpn.log.reused" "$m1_formal_run/mini_vpn.log"
+  write_summary "$m1_formal_run"
+  grep -Fq -- '- m1_slo_evidence: MISMATCH' \
+    "$m1_formal_run/summary.md" || \
+    die "self-test: cross-epoch post-relay drain evidence met the M1 SLO"
+  mv "$m1_formal_run/mini_vpn.drained.log" "$m1_formal_run/mini_vpn.log"
+  mv "$m1_formal_run/mini_vpn.clean.log" "$m1_formal_run/mini_vpn.log"
+  cp "$m1_formal_run/mini_vpn.log" "$m1_formal_run/mini_vpn.clean.log"
+  printf '%s\n' \
+    '🔎 tcp-d16-relay-close handle=SocketHandle(16) epoch=109 terminal_direction=none terminal_reason=clean_queue_lifecycle queue_queued=0 queue_leased=0 queue_reserved=0 queue_closed=false' \
+    >>"$m1_formal_run/mini_vpn.log"
+  write_summary "$m1_formal_run"
+  grep -Fq -- '- m1_slo_evidence: MISMATCH' \
+    "$m1_formal_run/summary.md" || \
+    die "self-test: open terminal D16 queue met the M1 SLO"
+  mv "$m1_formal_run/mini_vpn.clean.log" "$m1_formal_run/mini_vpn.log"
+
   m1_diagnostic_formal_run="$tmp/m1-diagnostic-formal-run"
   cp -R "$m1_formal_run" "$m1_diagnostic_formal_run"
   printf '%s\n' diagnostic >"$m1_diagnostic_formal_run/m1-mode"
@@ -2909,6 +3048,20 @@ EOF_PHYSICAL_INTERFACE
   [[ "$(network_control_envelope "$network_fixture")" == \
     "2 2 0 2 2 0 2 33.300000 180.456 0.000000 1 64000 128000 64000 60000 120000 60000 17066 16000" ]] || \
     die "self-test: network control envelope mismatch"
+  printf '%s\n' \
+    'timestamp,target_route,exit_route,physical_interface,physical_gateway,exit_ping_transmitted,exit_ping_received,exit_ping_loss_percent,exit_ping_rtt_min_ms,exit_ping_rtt_avg_ms,exit_ping_rtt_max_ms,gateway_ping_transmitted,gateway_ping_received,gateway_ping_loss_percent,gateway_ping_rtt_min_ms,gateway_ping_rtt_avg_ms,gateway_ping_rtt_max_ms,physical_mtu,physical_ipkts,physical_ierrs,physical_ibytes,physical_opkts,physical_oerrs,physical_obytes,physical_collisions,physical_rx_bps,physical_tx_bps' \
+    '2026-07-14T00:00:00Z,utun42,en0,en0,192.168.50.1,3,3,0.000000,170.000,171.000,172.000,3,3,0.000000,1.000,1.500,2.000,1500,100,16,64000,90,0,60000,0,unknown,unknown' \
+    '2026-07-14T00:00:30Z,utun42,en0,en0,192.168.50.1,3,3,0.000000,170.000,171.000,172.000,3,3,0.000000,1.000,1.500,2.000,1500,200,16,128000,180,0,120000,0,17066,16000' \
+    >"$network_fixture.cumulative-errors"
+  [[ "$(network_control_envelope "$network_fixture.cumulative-errors" | \
+    awk '{print $11}')" == "0" ]] || \
+    die "self-test: unchanged preexisting physical errors failed the run"
+  sed 's/,200,16,128000,180,0,120000,0,17066,16000$/,200,15,128000,180,0,120000,0,17066,16000/' \
+    "$network_fixture.cumulative-errors" \
+    >"$network_fixture.error-counter-reset"
+  [[ "$(network_control_envelope "$network_fixture.error-counter-reset" | \
+    awk '{print $11}')" == "1" ]] || \
+    die "self-test: physical error counter reset was accepted as continuity"
   printf '%s\n' \
     'timestamp,target_route,exit_route,physical_interface,physical_gateway,exit_ping_transmitted,exit_ping_received,exit_ping_loss_percent,exit_ping_rtt_min_ms,exit_ping_rtt_avg_ms,exit_ping_rtt_max_ms,gateway_ping_transmitted,gateway_ping_received,gateway_ping_loss_percent,gateway_ping_rtt_min_ms,gateway_ping_rtt_avg_ms,gateway_ping_rtt_max_ms,physical_mtu,physical_ipkts,physical_ierrs,physical_ibytes,physical_opkts,physical_oerrs,physical_obytes,physical_collisions,physical_rx_bps,physical_tx_bps' \
     '2026-07-14T00:00:00Z,utun42,en0,en0,192.168.50.1,3,3,0.000000,170.000,171.000,172.000,3,3,0.000000,1.000,1.500,2.000,1500,0a:0b:f8:b0:f8:93,100,0,64000,90,0,60000,0,0' \
@@ -5281,7 +5434,11 @@ write_summary() {
         m1_slo_evidence=MISMATCH
     fi
     if [[ "$m1_slo_evidence" == "PASS" ]] && \
-      grep -Eq 'pump_full_waits=[1-9][0-9]*|pump_read_errors=[1-9][0-9]*|send_slice_errors=[1-9][0-9]*|tun_flush_tx_failures=[1-9][0-9]*|terminal_pending_reap_bytes=[1-9][0-9]*|queue_(queued|leased|reserved)=[1-9][0-9]*|reason=stalled_write_timeout|reason=idle_timeout' "$log_file"; then
+      ! d16_terminal_ownership_is_clean "$log_file"; then
+      m1_slo_evidence=MISMATCH
+    fi
+    if [[ "$m1_slo_evidence" == "PASS" ]] && \
+      grep -Eq 'pump_full_waits=[1-9][0-9]*|pump_read_errors=[1-9][0-9]*|send_slice_errors=[1-9][0-9]*|tun_flush_tx_failures=[1-9][0-9]*|terminal_pending_reap_bytes=[1-9][0-9]*|reason=stalled_write_timeout|reason=idle_timeout' "$log_file"; then
       m1_slo_evidence=MISMATCH
     fi
     [[ "$m1_slo_evidence" == "PASS" ]] && \
@@ -5317,7 +5474,11 @@ write_summary() {
         m1_diagnostic_safety_evidence=MISMATCH
     fi
     if [[ "$m1_diagnostic_safety_evidence" == "PASS" ]] && \
-      grep -Eq 'pump_full_waits=[1-9][0-9]*|pump_read_errors=[1-9][0-9]*|send_slice_errors=[1-9][0-9]*|tun_flush_tx_failures=[1-9][0-9]*|terminal_pending_reap_bytes=[1-9][0-9]*|queue_(queued|leased|reserved)=[1-9][0-9]*|reason=stalled_write_timeout|reason=idle_timeout' "$log_file"; then
+      ! d16_terminal_ownership_is_clean "$log_file"; then
+      m1_diagnostic_safety_evidence=MISMATCH
+    fi
+    if [[ "$m1_diagnostic_safety_evidence" == "PASS" ]] && \
+      grep -Eq 'pump_full_waits=[1-9][0-9]*|pump_read_errors=[1-9][0-9]*|send_slice_errors=[1-9][0-9]*|tun_flush_tx_failures=[1-9][0-9]*|terminal_pending_reap_bytes=[1-9][0-9]*|reason=stalled_write_timeout|reason=idle_timeout' "$log_file"; then
       m1_diagnostic_safety_evidence=MISMATCH
     fi
     if [[ "$m1_diagnostic_safety_evidence" == "PASS" ]]; then
@@ -5370,6 +5531,7 @@ write_summary() {
     ((10#$interface_error_samples > 0)); } || \
     { [[ "$physical_interface_error_samples" =~ ^[0-9]+$ ]] && \
     ((10#$physical_interface_error_samples > 0)); } || \
+    ! d16_terminal_ownership_is_clean "$log_file" || \
     grep -Eq 'pump_full_waits=[1-9][0-9]*|pump_read_errors=[1-9][0-9]*|tun_flush_tx_failures=[1-9][0-9]*|terminal_pending_reap_bytes=[1-9][0-9]*|写入上游流失败|reason=remote_write_failed|reason=stalled_write_timeout|reason=idle_timeout' "$log_file"; then
     verdict=REVIEW
   else

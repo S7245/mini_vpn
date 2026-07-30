@@ -187,7 +187,36 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-07-28:
+Current Knife15 summary, as of 2026-07-30:
+
+- Exact-source `ee1a423` HK formal M1 bundle
+  `/tmp/mini_vpn_knife15_macos_20260729_105127.tar.gz` (SHA-256
+  `c263507c...`) completed the exact frozen `28,800s` schedule: five active
+  windows, 30 cycles/DNS checks, three idle/resume pairs, final drain, `302`
+  TCP plus `30` UDP results, and four clean checkpoints.
+- The old `acceptance SLO mismatch` occurred after `m1 complete` and is an
+  observer false negative. It treated unchanged lifetime `en0` errors
+  (`16 -> 16`) as 1,539 failed samples and rejected two clean relay snapshots
+  with `19,456B`/`18,944B` already leased to smoltcp, although each same
+  handle proved an equal local-EOF queue, terminal send queue/reap of zero,
+  and no reuse before drain.
+- The runner now treats the first physical-error row as the run baseline and
+  fails on later movement or reset. Its D16 validator follows nonzero clean
+  leases across the exact same-handle drain sequence. Open terminal queues,
+  queued/reserved ownership, unequal/missing drain, terminal ownership, and
+  cross-epoch reuse remain fail-closed. No Rust data plane or frozen value
+  changed.
+- Immutable-bundle replay reports `formal_m1_acceptance=PASS`: Target receiver
+  zero intervals `0`, TCP gap max `10,485,760B`, UDP loss max `2.446087%`,
+  Endpoint conservation max/final `61,440B / 61,403/0/0B`, stable resources,
+  and clean cleanup. Eighty-eight `Stopped(0)` boundaries and 22 sender-zero
+  intervals remain visible `CLASSIFIED_REVIEW` evidence.
+- Root `667+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  Clippy, Knife15/Knife14 shell, syntax, fmt/diff/secret, real-bundle replay,
+  and review gates pass with no unresolved P0/P1. M1 is complete and must not
+  be repeated. M2 spec/plan work is unblocked; keep M3 recovery events
+  sequenced and single-variable. Result:
+  `docs/tech/2026-07-30-knife15-hk-m1-formal-acceptance-results.md`.
 
 - Exact-source `0b43141` HK M1 diagnostic bundle
   `/tmp/mini_vpn_knife15_macos_20260727_085340.tar.gz` (SHA-256

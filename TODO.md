@@ -1,10 +1,59 @@
 # TODO
 
-## Current Knife15 Plan (2026-07-28)
+## Current Knife15 Plan (2026-07-30)
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-07-28)
+#### Latest decision (2026-07-30)
+
+Exact-source `ee1a423` HK formal M1 bundle
+`/tmp/mini_vpn_knife15_macos_20260729_105127.tar.gz` (SHA-256
+`c263507c...`) completed the full frozen `28,800s` schedule and is accepted
+after a deterministic observer repair and immutable-artifact replay.
+
+The old `acceptance SLO mismatch` was not a workload failure. `en0` began with
+16 lifetime input errors and ended with 16, but the old summary counted all
+1,539 nonzero cumulative rows as new failures. Two clean relay tasks also
+ended with `19,456B`/`18,944B` leased to smoltcp; their same handles then
+proved equal local-EOF send queues, terminal zero queues/reap, and no reuse.
+The old global grep stopped at the transient snapshots.
+
+Physical error evidence now uses the first valid sample as the run baseline
+and fails on any later movement or reset. D16 terminal evidence accepts a
+nonzero clean lease only across the exact same-handle drain sequence. Open
+terminal queues, queued/reserved ownership, unequal or incomplete drain, and
+cross-epoch reuse remain fail-closed. One review P1 added mandatory
+`queue_closed=true`. No Rust data-plane, frozen constant, workload, or SLI
+changed.
+
+Repaired raw-evidence replay reports:
+
+```text
+formal_m1_acceptance=PASS
+Target receiver zero intervals=0
+TCP max gap=10485760B
+UDP max loss=2.446087%
+Endpoint max/final=61440B / 61403/0/0B
+```
+
+All 332 result files, 30 DNS checks, four checkpoints, controls, resources,
+and cleanup pass. Eighty-eight `Stopped(0)` terminal boundaries and 22 forward
+sender-zero intervals remain classified REVIEW evidence with zero receiver
+stall and zero terminal ownership. Root/harness, release, Clippy, shell,
+fmt/diff/secret, real-bundle replay, and code review pass. Result:
+`docs/tech/2026-07-30-knife15-hk-m1-formal-acceptance-results.md`.
+
+M1 is complete and must not be repeated. Next:
+
+1. write the M2 24-hour real-client soak architecture spec;
+2. write its TDD/implementation and macOS HITL plan;
+3. cover product-like TCP, UDP/video, DNS, idle, resource/log bounds, route/DNS
+   leak detection, and HK/Shenzhen path attribution;
+4. run M2 only after local gates and review;
+5. keep M3 recovery events single-variable and sequenced after the M2
+   acceptance contract.
+
+#### Previous decision (2026-07-28)
 
 Exact-source `0b43141` HK bundle
 `/tmp/mini_vpn_knife15_macos_20260727_085340.tar.gz` (SHA-256
