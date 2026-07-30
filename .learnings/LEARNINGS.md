@@ -1,5 +1,37 @@
 # Learnings
 
+## 2026-07-30 - Long-run evidence needs identities for completed work, not attempted work
+
+- M2 active windows intentionally end with partial cycles. Reusing the phase
+  attempt number for complete-cycle HTTPS evidence produced deterministic
+  filename gaps even though every traffic result was valid.
+- Keep attempt identity for phase attribution, but advance a separate complete
+  identity only after all traffic and DNS work for a cycle finishes. Exact
+  multiplicity and contiguous artifact replay then describe the same event.
+- Safety absence also needs positive provenance. “No parsed IPv6 interface”
+  is safe only when the route command returned the known `not in table`
+  outcome; an unknown command failure must not collapse into the same empty
+  value.
+- Reusable rule: model partial work, completed work, and missing observation as
+  different states. Do not let one counter or an empty parser result stand for
+  all three.
+- Result:
+  `docs/tech/2026-07-30-knife15-m2-24h-real-client-soak-local-results.md`.
+
+## 2026-07-30 - Cache lifetime and active ownership are different leak signals
+
+- The frozen fake-IP registration TTL is `1,800s`, while each M2 drain is
+  `600s`. Requiring zero registered entries would reject every healthy run or
+  pressure the design toward an unrelated TTL/schedule change.
+- The two fixed HTTPS hosts give a stronger discriminator: active fake-IP
+  ownership must be zero, while the inactive registered cache must remain
+  stable at one or two entries across all six checkpoints.
+- Reusable rule: leak gates should measure growth and live ownership according
+  to the component's actual lifetime contract. A nonzero bounded cache is not
+  a leak, and tuning its TTL to manufacture zero weakens the experiment.
+- Result:
+  `docs/tech/2026-07-30-knife15-m2-24h-real-client-soak-local-results.md`.
+
 ## 2026-07-30 - Follow owned state to its terminal boundary before judging a snapshot
 
 - The formal M1 schedule and every receiver SLI completed, but a summary grep

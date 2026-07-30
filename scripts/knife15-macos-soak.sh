@@ -33,6 +33,8 @@ M0_BASELINE_DIR="${M0_BASELINE_DIR:-}"
 M0_DIRECT_DIR="${M0_DIRECT_DIR:-}"
 M1_BASELINE_DIR="${M1_BASELINE_DIR:-}"
 M1_DIRECT_DIR="${M1_DIRECT_DIR:-}"
+M2_BASELINE_DIR="${M2_BASELINE_DIR:-}"
+M2_DIRECT_DIR="${M2_DIRECT_DIR:-}"
 M0_DIRECT_MAX_AGE_SECS=900
 M0_TOTAL_SECS="${M0_TOTAL_SECS:-7200}"
 M0_TCP_SECS="${M0_TCP_SECS:-300}"
@@ -56,6 +58,29 @@ M1_STEADY_SHORT_COUNT="${M1_STEADY_SHORT_COUNT:-6}"
 M1_QUIET_SHORT_COUNT="${M1_QUIET_SHORT_COUNT:-6}"
 M1_CHURN_SHORT_COUNT="${M1_CHURN_SHORT_COUNT:-24}"
 M1_RATE_CAP_BPS=200000000
+M2_TOTAL_SECS="${M2_TOTAL_SECS:-86400}"
+M2_STEADY_A_SECS="${M2_STEADY_A_SECS:-14400}"
+M2_IDLE_SECS="${M2_IDLE_SECS:-600}"
+M2_QUIET_A_SECS="${M2_QUIET_A_SECS:-10800}"
+M2_STEADY_B_SECS="${M2_STEADY_B_SECS:-14400}"
+M2_CHURN_SECS="${M2_CHURN_SECS:-10800}"
+M2_QUIET_B_SECS="${M2_QUIET_B_SECS:-10800}"
+M2_STEADY_C_SECS="${M2_STEADY_C_SECS:-21600}"
+M2_FINAL_DRAIN_SECS="${M2_FINAL_DRAIN_SECS:-600}"
+M2_TCP_SECS="${M2_TCP_SECS:-300}"
+M2_UDP_SECS="${M2_UDP_SECS:-180}"
+M2_SHORT_SECS="${M2_SHORT_SECS:-10}"
+M2_STEADY_SHORT_COUNT="${M2_STEADY_SHORT_COUNT:-6}"
+M2_QUIET_SHORT_COUNT="${M2_QUIET_SHORT_COUNT:-6}"
+M2_CHURN_SHORT_COUNT="${M2_CHURN_SHORT_COUNT:-24}"
+M2_MIN_FREE_KB=4194304
+M2_EXPECTED_CYCLES=93
+M2_EXPECTED_TCP_RESULTS=934
+M2_EXPECTED_UDP_RESULTS=95
+M2_EXPECTED_PHASE_RESULTS=1029
+M2_EXPECTED_CHECKPOINTS=6
+M2_EGRESS_URL=https://api.ipify.org
+M2_BROWSER_URL=https://example.com/
 # iperf only reports completed application buffers. Shenzhen's 0.131 Mbit/s
 # reverse path delivered about 16KiB/s with an 8.3KiB cwnd, so a 1KiB observer
 # preserves multiple visible blocks per second while forward stays unchanged.
@@ -63,6 +88,14 @@ TCP_REVERSE_IPERF_LENGTH_BYTES=1024
 M0_IPERF3_BIN=iperf3
 M0_DIG_BIN=dig
 M0_SLEEP_BIN=sleep
+M2_ROUTE_BIN=route
+M2_NETWORKSETUP_BIN=networksetup
+M2_DSCACHEUTIL_BIN=dscacheutil
+M2_CURL_BIN=curl
+M2_PUBLIC_LOW_PROBE=1.1.1.1
+M2_PUBLIC_HIGH_PROBE=129.1.1.1
+M2_FAKE_PROBE=198.18.0.1
+M2_IPV6_PROBE=2001:4860:4860::8888
 STATE_DIR="/var/run/mini_vpn_knife15_macos_state"
 SERVER_HOST=""
 SERVER_PORT=""
@@ -76,6 +109,8 @@ SOAK_STATUS_FILE=m0.status
 SOAK_CONTINUE_DATA_QUALITY=0
 SOAK_VIOLATIONS_FILE=
 SOAK_SUCCESS_STATUS=complete
+SOAK_REAL_CLIENT_PROBE=0
+M2_COMPLETE_CYCLE_INDEX=0
 
 ACTION="${1:---help}"
 
@@ -100,6 +135,7 @@ Usage:
   sudo -E bash scripts/knife15-macos-soak.sh m0
   sudo -E bash scripts/knife15-macos-soak.sh m1
   sudo -E bash scripts/knife15-macos-soak.sh m1-diagnostic
+  sudo -E bash scripts/knife15-macos-soak.sh m2
   sudo -E bash scripts/knife15-macos-soak.sh stop
   sudo -E bash scripts/knife15-macos-soak.sh bundle
 
@@ -122,6 +158,8 @@ Important optional environment:
   M0_DIRECT_DIR=/tmp/mini_vpn_knife15_macos_direct_REPLACE_WITH_TIMESTAMP
   M1_BASELINE_DIR=/tmp/mini_vpn_knife15_macos_baseline_REPLACE_WITH_TIMESTAMP
   M1_DIRECT_DIR=/tmp/mini_vpn_knife15_macos_direct_REPLACE_WITH_TIMESTAMP
+  M2_BASELINE_DIR=/tmp/mini_vpn_knife15_macos_baseline_REPLACE_WITH_TIMESTAMP
+  M2_DIRECT_DIR=/tmp/mini_vpn_knife15_macos_direct_REPLACE_WITH_TIMESTAMP
 
 Workflow:
   1. cargo build --release
@@ -140,7 +178,7 @@ Workflow:
  14. sudo -E bash scripts/knife15-macos-soak.sh stop
 
 M1 workflow (use a fresh terminal and keep every other VPN/TUN disabled):
-  1. unset M0_BASELINE_DIR M0_DIRECT_DIR M1_BASELINE_DIR M1_DIRECT_DIR
+  1. unset M0_BASELINE_DIR M0_DIRECT_DIR M1_BASELINE_DIR M1_DIRECT_DIR M2_BASELINE_DIR M2_DIRECT_DIR
   2. cargo build --release
   3. export the five MINI_VPN_TUIC_* values and TARGET/DNS/IPERF settings
   4. bash scripts/knife15-macos-soak.sh --self-test
@@ -160,12 +198,31 @@ For a longitudinal diagnostic instead of formal acceptance, replace step 13
 with:
   sudo -E bash scripts/knife15-macos-soak.sh m1-diagnostic
 
-Never run m0, m1, and m1-diagnostic in one TUN run. Both M1 actions have a
+Never run m0, m1, m1-diagnostic, and m2 in one TUN run. Both M1 actions have a
 28,800-second traffic/drain budget and normally take slightly more than eight
 wall hours.
 Use m1-diagnostic only when a complete longitudinal artifact is required:
 data-quality violations are recorded and continued, safety failures still
 stop immediately, and the result can never satisfy formal M1 acceptance.
+
+M2 workflow (use a fresh terminal; M2 temporarily owns IPv4 split-default
+routes and the active physical service DNS until stop):
+  1. unset M0_BASELINE_DIR M0_DIRECT_DIR M1_BASELINE_DIR M1_DIRECT_DIR
+  2. unset M2_BASELINE_DIR M2_DIRECT_DIR
+  3. cargo build --release
+  4. export the five MINI_VPN_TUIC_* values and TARGET/DNS/IPERF settings
+  5. bash scripts/knife15-macos-soak.sh --self-test
+  6. bash scripts/knife15-macos-soak.sh preflight
+  7. bash scripts/knife15-macos-soak.sh baseline
+  8. export M2_BASELINE_DIR='REPLACE_WITH_BASELINE_DIRECTORY_FROM_STEP_7'
+  9. bash scripts/knife15-macos-soak.sh direct-discriminator
+ 10. export M2_DIRECT_DIR='REPLACE_WITH_DIRECT_DIRECTORY_FROM_STEP_9'
+ 11. sudo -v
+ 12. sudo -E bash scripts/knife15-macos-soak.sh start
+ 13. sudo -E bash scripts/knife15-macos-soak.sh smoke
+ 14. caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2
+ 15. sudo -E bash scripts/knife15-macos-soak.sh status
+ 16. sudo -E bash scripts/knife15-macos-soak.sh stop
 
 The background watchdog samples process/utun state and removes only the host
 routes owned by this run if mini_vpn exits. start proves Target readiness
@@ -234,6 +291,76 @@ validate_m1_formal_config() {
     "$METRICS_SECS" == "30" && "$SAMPLE_SECS" == "30" ]]
 }
 
+validate_m2_formal_config() {
+  [[ "$M2_TOTAL_SECS" == "86400" && \
+    "$M2_STEADY_A_SECS" == "14400" && "$M2_IDLE_SECS" == "600" && \
+    "$M2_QUIET_A_SECS" == "10800" && "$M2_STEADY_B_SECS" == "14400" && \
+    "$M2_CHURN_SECS" == "10800" && "$M2_QUIET_B_SECS" == "10800" && \
+    "$M2_STEADY_C_SECS" == "21600" && "$M2_FINAL_DRAIN_SECS" == "600" && \
+    "$M2_TCP_SECS" == "300" && "$M2_UDP_SECS" == "180" && \
+    "$M2_SHORT_SECS" == "10" && "$M2_STEADY_SHORT_COUNT" == "6" && \
+    "$M2_QUIET_SHORT_COUNT" == "6" && "$M2_CHURN_SHORT_COUNT" == "24" && \
+    "$METRICS_SECS" == "30" && "$SAMPLE_SECS" == "30" ]]
+}
+
+m2_window_count_model() {
+  local remaining="$1"
+  local short_count="$2"
+  local tcp=0 udp=0 phases=0 cycles=0 duration short_index
+  while ((10#$remaining > 0)); do
+    duration="$M2_TCP_SECS"
+    ((10#$duration > 10#$remaining)) && duration="$remaining"
+    tcp=$((tcp + 1))
+    phases=$((phases + 1))
+    remaining=$((10#$remaining - 10#$duration))
+    ((remaining > 0)) || break
+    duration="$M2_TCP_SECS"
+    ((10#$duration > 10#$remaining)) && duration="$remaining"
+    tcp=$((tcp + 1))
+    phases=$((phases + 1))
+    remaining=$((10#$remaining - 10#$duration))
+    ((remaining > 0)) || break
+    duration="$M2_UDP_SECS"
+    ((10#$duration > 10#$remaining)) && duration="$remaining"
+    udp=$((udp + 1))
+    phases=$((phases + 1))
+    remaining=$((10#$remaining - 10#$duration))
+    ((remaining > 0)) || break
+    for ((short_index = 1; short_index <= 10#$short_count && remaining > 0; short_index++)); do
+      duration="$M2_SHORT_SECS"
+      ((10#$duration > 10#$remaining)) && duration="$remaining"
+      tcp=$((tcp + 1))
+      phases=$((phases + 1))
+      remaining=$((10#$remaining - 10#$duration))
+    done
+    ((remaining > 0)) || break
+    cycles=$((cycles + 1))
+  done
+  printf '%s %s %s %s\n' "$cycles" "$tcp" "$udp" "$phases"
+}
+
+m2_formal_count_model() {
+  local window mode_short counts
+  local cycles=0 tcp=0 udp=0 phases=0 one_cycles one_tcp one_udp one_phases
+  for window in \
+    "$M2_STEADY_A_SECS:$M2_STEADY_SHORT_COUNT" \
+    "$M2_QUIET_A_SECS:$M2_QUIET_SHORT_COUNT" \
+    "$M2_STEADY_B_SECS:$M2_STEADY_SHORT_COUNT" \
+    "$M2_CHURN_SECS:$M2_CHURN_SHORT_COUNT" \
+    "$M2_QUIET_B_SECS:$M2_QUIET_SHORT_COUNT" \
+    "$M2_STEADY_C_SECS:$M2_STEADY_SHORT_COUNT"; do
+    mode_short="${window#*:}"
+    window="${window%%:*}"
+    counts="$(m2_window_count_model "$window" "$mode_short")" || return 1
+    read -r one_cycles one_tcp one_udp one_phases <<<"$counts"
+    cycles=$((cycles + one_cycles))
+    tcp=$((tcp + one_tcp))
+    udp=$((udp + one_udp))
+    phases=$((phases + one_phases))
+  done
+  printf '%s %s %s %s\n' "$cycles" "$tcp" "$udp" "$phases"
+}
+
 validate_ipv4() {
   local value="${1:-}"
   local a b c d extra octet
@@ -271,13 +398,32 @@ validate_direct_dir_path() {
 }
 
 selected_direct_baseline_dir() {
-  if [[ -n "$M0_BASELINE_DIR" && -n "$M1_BASELINE_DIR" ]]; then
+  local selected=0
+  [[ -n "$M0_BASELINE_DIR" ]] && selected=$((selected + 1))
+  [[ -n "$M1_BASELINE_DIR" ]] && selected=$((selected + 1))
+  [[ -n "$M2_BASELINE_DIR" ]] && selected=$((selected + 1))
+  if ((selected != 1)); then
     return 1
   fi
-  if [[ -n "$M1_BASELINE_DIR" ]]; then
+  if [[ -n "$M2_BASELINE_DIR" ]]; then
+    printf '%s\n' "$M2_BASELINE_DIR"
+  elif [[ -n "$M1_BASELINE_DIR" ]]; then
     printf '%s\n' "$M1_BASELINE_DIR"
   elif [[ -n "$M0_BASELINE_DIR" ]]; then
     printf '%s\n' "$M0_BASELINE_DIR"
+  else
+    return 1
+  fi
+}
+
+selected_direct_epoch_is_frozen() {
+  local baseline_dir="$1"
+  if [[ -n "$M2_BASELINE_DIR" && "$baseline_dir" == "$M2_BASELINE_DIR" ]]; then
+    [[ "$M2_TCP_SECS" == "300" ]]
+  elif [[ -n "$M1_BASELINE_DIR" && "$baseline_dir" == "$M1_BASELINE_DIR" ]]; then
+    [[ "$M1_TCP_SECS" == "300" ]]
+  elif [[ -n "$M0_BASELINE_DIR" && "$baseline_dir" == "$M0_BASELINE_DIR" ]]; then
+    [[ "$M0_TCP_SECS" == "300" ]]
   else
     return 1
   fi
@@ -307,6 +453,514 @@ route_interface_from_text() {
 
 route_gateway_from_text() {
   awk '/gateway:/ {print $2; exit}'
+}
+
+network_service_for_interface_from_text() {
+  local interface="$1"
+  awk -v interface="$interface" '
+    /^\([0-9]+\) / {
+      service = $0
+      sub(/^\([0-9]+\) /, "", service)
+      disabled = 0
+      next
+    }
+    /^\(\*\) / {
+      service = ""
+      disabled = 1
+      next
+    }
+    $0 ~ /Device: [^)]+\)$/ {
+      device = $0
+      sub(/^.*Device: /, "", device)
+      sub(/\)$/, "", device)
+      if (!disabled && service != "" && device == interface) {
+        matches++
+        selected = service
+      }
+    }
+    END {
+      if (matches != 1) exit 1
+      print selected
+    }
+  '
+}
+
+normalized_dns_snapshot_from_text() {
+  awk '
+    /^There aren.t any DNS Servers set on .+[.]$/ {
+      if (NR != 1) invalid++
+      empty = 1
+      next
+    }
+    {
+      if (empty || $0 == "" ||
+          ($0 !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ &&
+           $0 !~ /^[0-9A-Fa-f:%]+$/)) {
+        invalid++
+      } else {
+        values[++count] = $0
+      }
+    }
+    END {
+      if (invalid || (empty && count != 0) || (!empty && count == 0)) exit 1
+      if (empty) {
+        print "EMPTY"
+      } else {
+        for (i = 1; i <= count; i++) print values[i]
+      }
+    }
+  '
+}
+
+ipv4_is_fake() {
+  local value="${1:-}"
+  local first second third fourth extra
+  validate_ipv4 "$value" || return 1
+  IFS=. read -r first second third fourth extra <<<"$value"
+  [[ "$first" == "198" && \
+    ( "$second" == "18" || "$second" == "19" ) ]]
+}
+
+m2_ipv6_route_is_safe_from_text() {
+  local interface
+  interface="$(route_interface_from_text)"
+  [[ -z "$interface" || "$interface" == "lo0" || "$interface" == utun* ]]
+}
+
+m2_ipv6_route_interface() {
+  local route_text route_status interface
+  route_text="$("$M2_ROUTE_BIN" -n get -inet6 "$M2_IPV6_PROBE" 2>&1)"
+  route_status=$?
+  if ((route_status != 0)); then
+    [[ "$route_text" == *"not in table"* ]] || return 1
+    printf '%s\n' none
+    return 0
+  fi
+  interface="$(route_interface_from_text <<<"$route_text")"
+  [[ -n "$interface" && \
+    ( "$interface" == "lo0" || "$interface" == utun* ) ]] || return 1
+  printf '%s\n' "$interface"
+}
+
+m2_route_text() {
+  "$M2_ROUTE_BIN" -n get "$1" 2>/dev/null
+}
+
+m2_route_interface() {
+  m2_route_text "$1" | route_interface_from_text
+}
+
+m2_route_gateway() {
+  m2_route_text "$1" | route_gateway_from_text
+}
+
+m2_ipv6_route_is_safe() {
+  m2_ipv6_route_interface >/dev/null
+}
+
+m2_dns_snapshot_for_service() {
+  local service="$1"
+  "$M2_NETWORKSETUP_BIN" -getdnsservers "$service" 2>/dev/null | \
+    normalized_dns_snapshot_from_text
+}
+
+m2_saved_dns_snapshot() {
+  local snapshot_file="$1"
+  local first lines
+  [[ -f "$snapshot_file" && ! -L "$snapshot_file" ]] || return 1
+  first="$(sed -n '1p' "$snapshot_file")"
+  lines="$(awk 'END {print NR + 0}' "$snapshot_file")"
+  if [[ "$first" == "EMPTY" ]]; then
+    [[ "$lines" == "1" ]] || return 1
+    printf '%s\n' EMPTY
+  else
+    normalized_dns_snapshot_from_text <"$snapshot_file"
+  fi
+}
+
+m2_dns_snapshot_matches_target() {
+  local service="$1"
+  local target="$2"
+  [[ "$(m2_dns_snapshot_for_service "$service")" == "$target" ]]
+}
+
+m2_restore_dns_snapshot() {
+  local service="$1"
+  local snapshot_file="$2"
+  local snapshot value
+  local -a dns_servers=()
+  snapshot="$(m2_saved_dns_snapshot "$snapshot_file")" || return 1
+  if [[ "$snapshot" == "EMPTY" ]]; then
+    "$M2_NETWORKSETUP_BIN" -setdnsservers "$service" Empty
+  else
+    while IFS= read -r value; do
+      [[ -n "$value" ]] || return 1
+      dns_servers+=("$value")
+    done <<<"$snapshot"
+    ((${#dns_servers[@]} > 0)) || return 1
+    "$M2_NETWORKSETUP_BIN" -setdnsservers "$service" "${dns_servers[@]}"
+  fi
+}
+
+m2_curl_metadata_values() {
+  local metadata_file="$1"
+  [[ -f "$metadata_file" && ! -L "$metadata_file" ]] || return 1
+  awk -F= '
+    $1 == "remote_ip" && NF == 2 { remote = $2; remote_count++ }
+    $1 == "http_code" && NF == 2 { code = $2; code_count++ }
+    $1 == "size_download" && NF == 2 { bytes = $2; bytes_count++ }
+    END {
+      if (NR != 3 || remote_count != 1 || code_count != 1 ||
+          bytes_count != 1 || remote !~ /^[0-9.]+$/ ||
+          code !~ /^[0-9][0-9][0-9]$/ ||
+          bytes !~ /^[0-9]+([.][0-9]+)?$/) exit 1
+      printf "%s %s %.0f\n", remote, code, bytes
+    }
+  ' "$metadata_file"
+}
+
+m2_real_client_result_is_valid() {
+  local result_file="$1"
+  local expected_label expected observed egress_remote egress_code egress_bytes
+  local browser_remote browser_code browser_bytes
+  local utun physical_interface physical_gateway dns_target ipv6_route_interface
+  [[ -f "$result_file" && ! -L "$result_file" ]] || return 1
+  [[ "$(m0_profile_value "$result_file" schema)" == \
+    "knife15-macos-m2-real-client-v1" ]] || return 1
+  expected_label="$(basename "$result_file" .txt)"
+  [[ "$(m0_profile_value "$result_file" label)" == "$expected_label" ]] || return 1
+  expected="$(m0_profile_value "$result_file" expected_egress)"
+  observed="$(m0_profile_value "$result_file" observed_egress)"
+  egress_remote="$(m0_profile_value "$result_file" egress_remote_ip)"
+  egress_code="$(m0_profile_value "$result_file" egress_http_code)"
+  egress_bytes="$(m0_profile_value "$result_file" egress_bytes)"
+  browser_remote="$(m0_profile_value "$result_file" browser_remote_ip)"
+  browser_code="$(m0_profile_value "$result_file" browser_http_code)"
+  browser_bytes="$(m0_profile_value "$result_file" browser_bytes)"
+  utun="$(m0_profile_value "$result_file" expected_utun)"
+  physical_interface="$(m0_profile_value "$result_file" expected_physical_interface)"
+  physical_gateway="$(m0_profile_value "$result_file" expected_physical_gateway)"
+  dns_target="$(m0_profile_value "$result_file" expected_dns_target)"
+  validate_ipv4 "$expected" && [[ "$observed" == "$expected" ]] || return 1
+  ipv4_is_fake "$egress_remote" && ipv4_is_fake "$browser_remote" || return 1
+  [[ "$egress_code" =~ ^[0-9]{3}$ && "$browser_code" =~ ^[0-9]{3}$ && \
+    "$egress_bytes" =~ ^[1-9][0-9]*$ && \
+    "$browser_bytes" =~ ^[1-9][0-9]*$ ]] || return 1
+  ((10#$egress_code >= 200 && 10#$egress_code < 300 && \
+    10#$browser_code >= 200 && 10#$browser_code < 400)) || return 1
+  [[ "$utun" == utun[0-9]* && "$physical_interface" != utun* && \
+    -n "$physical_interface" && -n "$physical_gateway" && \
+    "$(m0_profile_value "$result_file" target_route)" == "$utun" && \
+    "$(m0_profile_value "$result_file" dns_target_route)" == "$utun" && \
+    "$(m0_profile_value "$result_file" public_low_route)" == "$utun" && \
+    "$(m0_profile_value "$result_file" public_high_route)" == "$utun" && \
+    "$(m0_profile_value "$result_file" fake_ip_route)" == "$utun" && \
+    "$(m0_profile_value "$result_file" exit_route)" == "$physical_interface" && \
+    "$(m0_profile_value "$result_file" exit_gateway)" == "$physical_gateway" && \
+    "$(m0_profile_value "$result_file" system_dns)" == "$dns_target" ]] || return 1
+  ipv6_route_interface="$(m0_profile_value "$result_file" ipv6_route_interface)"
+  [[ "$ipv6_route_interface" == "none" || "$ipv6_route_interface" == "lo0" || \
+    "$ipv6_route_interface" == utun* ]] && \
+    [[ "$(m0_profile_value "$result_file" network_control_evidence)" == "PASS" ]]
+}
+
+run_m2_real_client_probe() {
+  local run_dir="$1"
+  local label="$2"
+  local result_file="$run_dir/m2-real-client/${label}.txt"
+  local egress_body="$run_dir/m2-real-client/.${label}.egress-body.$$"
+  local egress_meta="$run_dir/m2-real-client/.${label}.egress-meta.$$"
+  local browser_body="$run_dir/m2-real-client/.${label}.browser-body.$$"
+  local browser_meta="$run_dir/m2-real-client/.${label}.browser-meta.$$"
+  local expected observed egress_remote egress_code egress_bytes
+  local browser_remote browser_code browser_bytes
+  local utun target dns_target physical_interface physical_gateway ipv6_interface
+  m0_assert_run_healthy "$run_dir" || return 1
+  m2_full_tunnel_is_active || return 1
+  network_control_is_recent || return 1
+  expected="$(read_state exit_host 2>/dev/null || true)"
+  validate_ipv4 "$expected" || return 1
+  rm -f "$egress_body" "$egress_meta" "$browser_body" "$browser_meta"
+  if ! run_m0_logged "$egress_meta" 40 \
+    /usr/bin/env -u http_proxy -u https_proxy -u all_proxy -u no_proxy \
+      -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY \
+      "$M2_CURL_BIN" --silent --show-error --location --max-redirs 3 \
+        --proto '=https' --connect-timeout 10 --max-time 30 \
+        --output "$egress_body" \
+        --write-out $'remote_ip=%{remote_ip}\nhttp_code=%{http_code}\nsize_download=%{size_download}\n' \
+        "$M2_EGRESS_URL"; then
+    rm -f "$egress_body" "$browser_body"
+    return 1
+  fi
+  read -r egress_remote egress_code egress_bytes \
+    <<<"$(m2_curl_metadata_values "$egress_meta")" || {
+    rm -f "$egress_body" "$browser_body"
+    return 1
+  }
+  observed="$(tr -d '[:space:]' <"$egress_body" 2>/dev/null)"
+  if ! run_m0_logged "$browser_meta" 40 \
+    /usr/bin/env -u http_proxy -u https_proxy -u all_proxy -u no_proxy \
+      -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY \
+      "$M2_CURL_BIN" --silent --show-error --location --max-redirs 3 \
+        --proto '=https' --connect-timeout 10 --max-time 30 \
+        --output "$browser_body" \
+        --write-out $'remote_ip=%{remote_ip}\nhttp_code=%{http_code}\nsize_download=%{size_download}\n' \
+        "$M2_BROWSER_URL"; then
+    rm -f "$egress_body" "$browser_body"
+    return 1
+  fi
+  read -r browser_remote browser_code browser_bytes \
+    <<<"$(m2_curl_metadata_values "$browser_meta")" || {
+    rm -f "$egress_body" "$browser_body"
+    return 1
+  }
+  rm -f "$egress_body" "$browser_body" "$egress_meta" "$browser_meta" \
+    "$egress_meta.command" "$browser_meta.command"
+  m2_full_tunnel_is_active && network_control_is_recent || return 1
+  utun="$(read_state utun 2>/dev/null || true)"
+  target="$(read_state target 2>/dev/null || true)"
+  dns_target="$(read_state dns_target 2>/dev/null || true)"
+  physical_interface="$(read_state m2.physical_interface 2>/dev/null || true)"
+  physical_gateway="$(read_state m2.physical_gateway 2>/dev/null || true)"
+  ipv6_interface="$(m2_ipv6_route_interface)" || return 1
+  cat >"$result_file" <<EOF_M2_REAL_CLIENT
+schema=knife15-macos-m2-real-client-v1
+timestamp=$(timestamp)
+label=$label
+expected_egress=$expected
+observed_egress=$observed
+egress_remote_ip=$egress_remote
+egress_http_code=$egress_code
+egress_bytes=$egress_bytes
+browser_remote_ip=$browser_remote
+browser_http_code=$browser_code
+browser_bytes=$browser_bytes
+expected_utun=$utun
+expected_physical_interface=$physical_interface
+expected_physical_gateway=$physical_gateway
+expected_dns_target=$dns_target
+target_route=$(m2_route_interface "$target")
+dns_target_route=$(m2_route_interface "$dns_target")
+public_low_route=$(m2_route_interface "$M2_PUBLIC_LOW_PROBE")
+public_high_route=$(m2_route_interface "$M2_PUBLIC_HIGH_PROBE")
+fake_ip_route=$(m2_route_interface "$M2_FAKE_PROBE")
+exit_route=$(m2_route_interface "$expected")
+exit_gateway=$(m2_route_gateway "$expected")
+system_dns=$(m2_dns_snapshot_for_service "$(read_state m2.dns_service)")
+ipv6_route_interface=$ipv6_interface
+network_control_evidence=PASS
+EOF_M2_REAL_CLIENT
+  if ! m2_real_client_result_is_valid "$result_file"; then
+    return 1
+  fi
+  append_event_to "$run_dir" \
+    "$SOAK_STAGE real client complete label=$label remote=$browser_remote"
+}
+
+m2_full_tunnel_is_active() {
+  local utun target dns_target exit_host physical_interface physical_gateway
+  local dns_service
+  [[ "$(read_state m2.full_tunnel 2>/dev/null || true)" == "active" ]] || return 1
+  utun="$(read_state utun 2>/dev/null || true)"
+  target="$(read_state target 2>/dev/null || true)"
+  dns_target="$(read_state dns_target 2>/dev/null || true)"
+  exit_host="$(read_state exit_host 2>/dev/null || true)"
+  physical_interface="$(read_state m2.physical_interface 2>/dev/null || true)"
+  physical_gateway="$(read_state m2.physical_gateway 2>/dev/null || true)"
+  dns_service="$(read_state m2.dns_service 2>/dev/null || true)"
+  [[ -n "$utun" && -n "$target" && -n "$dns_target" && -n "$exit_host" && \
+    -n "$physical_interface" && -n "$physical_gateway" && -n "$dns_service" ]] || \
+    return 1
+  [[ "$(m2_route_interface "$target")" == "$utun" && \
+    "$(m2_route_interface "$dns_target")" == "$utun" && \
+    "$(m2_route_interface "$M2_PUBLIC_LOW_PROBE")" == "$utun" && \
+    "$(m2_route_interface "$M2_PUBLIC_HIGH_PROBE")" == "$utun" && \
+    "$(m2_route_interface "$M2_FAKE_PROBE")" == "$utun" && \
+    "$(m2_route_interface "$exit_host")" == "$physical_interface" && \
+    "$(m2_route_gateway "$exit_host")" == "$physical_gateway" ]] || return 1
+  m2_dns_snapshot_matches_target "$dns_service" "$dns_target" || return 1
+  m2_ipv6_route_is_safe
+}
+
+m2_full_tunnel_is_restored() {
+  local utun exit_host dns_service snapshot_file expected_dns
+  utun="$(read_state utun 2>/dev/null || true)"
+  exit_host="$(read_state exit_host 2>/dev/null || true)"
+  dns_service="$(read_state m2.dns_service 2>/dev/null || true)"
+  snapshot_file="$(read_state m2.dns_before_file 2>/dev/null || true)"
+  [[ -n "$utun" && -n "$exit_host" && -n "$dns_service" && \
+    -n "$snapshot_file" ]] || return 1
+  [[ "$(m2_route_interface "$M2_PUBLIC_LOW_PROBE")" != "$utun" && \
+    "$(m2_route_interface "$M2_PUBLIC_HIGH_PROBE")" != "$utun" && \
+    "$(m2_route_interface "$M2_FAKE_PROBE")" != "$utun" && \
+    "$(m2_route_interface "$exit_host")" != "$utun" ]] || return 1
+  expected_dns="$(m2_saved_dns_snapshot "$snapshot_file")" || return 1
+  [[ "$(m2_dns_snapshot_for_service "$dns_service")" == "$expected_dns" ]] || \
+    return 1
+}
+
+deactivate_m2_full_tunnel() {
+  local run_dir="$1"
+  local status utun exit_host dns_target physical_interface physical_gateway
+  local dns_service snapshot_file current_interface current_gateway failed=0
+  status="$(read_state m2.full_tunnel 2>/dev/null || true)"
+  [[ -n "$status" ]] || return 0
+  if [[ "$status" == "inactive" ]]; then
+    m2_full_tunnel_is_restored
+    return
+  fi
+  utun="$(read_state utun 2>/dev/null || true)"
+  exit_host="$(read_state exit_host 2>/dev/null || true)"
+  dns_target="$(read_state dns_target 2>/dev/null || true)"
+  physical_interface="$(read_state m2.physical_interface 2>/dev/null || true)"
+  physical_gateway="$(read_state m2.physical_gateway 2>/dev/null || true)"
+  dns_service="$(read_state m2.dns_service 2>/dev/null || true)"
+  snapshot_file="$(read_state m2.dns_before_file 2>/dev/null || true)"
+  [[ -n "$utun" && -n "$exit_host" && -n "$dns_target" && \
+    -n "$physical_interface" && -n "$physical_gateway" && \
+    -n "$dns_service" && -n "$snapshot_file" ]] || return 1
+
+  if [[ "$(read_state m2.fake_route_owned 2>/dev/null || true)" == "1" ]]; then
+    current_interface="$(m2_route_interface "$M2_FAKE_PROBE")"
+    if [[ "$current_interface" == "$utun" ]] && \
+      "$M2_ROUTE_BIN" -n delete -net 198.18.0.0/15 \
+        >>"$run_dir/cleanup.log" 2>&1; then
+      write_state m2.fake_route_owned 0
+    else
+      failed=1
+    fi
+  fi
+  if [[ "$(read_state m2.low_route_owned 2>/dev/null || true)" == "1" ]]; then
+    current_interface="$(m2_route_interface "$M2_PUBLIC_LOW_PROBE")"
+    if [[ "$current_interface" == "$utun" ]] && \
+      "$M2_ROUTE_BIN" -n delete -net 0.0.0.0/1 \
+        >>"$run_dir/cleanup.log" 2>&1; then
+      write_state m2.low_route_owned 0
+    else
+      failed=1
+    fi
+  fi
+  if [[ "$(read_state m2.high_route_owned 2>/dev/null || true)" == "1" ]]; then
+    current_interface="$(m2_route_interface "$M2_PUBLIC_HIGH_PROBE")"
+    if [[ "$current_interface" == "$utun" ]] && \
+      "$M2_ROUTE_BIN" -n delete -net 128.0.0.0/1 \
+        >>"$run_dir/cleanup.log" 2>&1; then
+      write_state m2.high_route_owned 0
+    else
+      failed=1
+    fi
+  fi
+  if [[ "$(read_state m2.dns_owned 2>/dev/null || true)" == "1" ]]; then
+    if m2_dns_snapshot_matches_target "$dns_service" "$dns_target" && \
+      m2_restore_dns_snapshot "$dns_service" "$snapshot_file" \
+        >>"$run_dir/cleanup.log" 2>&1 && \
+      "$M2_DSCACHEUTIL_BIN" -flushcache >>"$run_dir/cleanup.log" 2>&1 && \
+      [[ "$(m2_dns_snapshot_for_service "$dns_service")" == \
+        "$(m2_saved_dns_snapshot "$snapshot_file")" ]]; then
+      write_state m2.dns_owned 0
+    else
+      failed=1
+    fi
+  fi
+  if [[ "$(read_state m2.exit_route_owned 2>/dev/null || true)" == "1" ]]; then
+    current_interface="$(m2_route_interface "$exit_host")"
+    current_gateway="$(m2_route_gateway "$exit_host")"
+    if [[ "$current_interface" == "$physical_interface" && \
+      "$current_gateway" == "$physical_gateway" ]] && \
+      "$M2_ROUTE_BIN" -n delete -host "$exit_host" "$physical_gateway" \
+        >>"$run_dir/cleanup.log" 2>&1; then
+      write_state m2.exit_route_owned 0
+    else
+      failed=1
+    fi
+  fi
+  ((failed == 0)) || return 1
+  write_state m2.full_tunnel inactive
+  m2_full_tunnel_is_restored || return 1
+  append_event_to "$run_dir" "m2 full tunnel cleanup complete"
+}
+
+activate_m2_full_tunnel() {
+  local run_dir="$1"
+  local utun target dns_target exit_host exit_route_text physical_interface
+  local physical_gateway dns_service dns_snapshot snapshot_file
+  local exit_route_owned=0
+  [[ -z "$(read_state m2.full_tunnel 2>/dev/null || true)" || \
+    "$(read_state m2.full_tunnel 2>/dev/null || true)" == "inactive" ]] || return 1
+  utun="$(read_state utun 2>/dev/null || true)"
+  target="$(read_state target 2>/dev/null || true)"
+  dns_target="$(read_state dns_target 2>/dev/null || true)"
+  exit_host="$(read_state exit_host 2>/dev/null || true)"
+  [[ -n "$utun" && -n "$target" && -n "$dns_target" && -n "$exit_host" ]] || \
+    return 1
+  [[ "$(m2_route_interface "$target")" == "$utun" && \
+    "$(m2_route_interface "$dns_target")" == "$utun" && \
+    "$(m2_route_interface "$M2_PUBLIC_LOW_PROBE")" != "$utun" && \
+    "$(m2_route_interface "$M2_PUBLIC_HIGH_PROBE")" != "$utun" ]] || return 1
+  m2_ipv6_route_is_safe || return 1
+  exit_route_text="$(m2_route_text "$exit_host")" || return 1
+  physical_interface="$(route_interface_from_text <<<"$exit_route_text")"
+  physical_gateway="$(route_gateway_from_text <<<"$exit_route_text")"
+  [[ -n "$physical_interface" && "$physical_interface" != utun* && \
+    -n "$physical_gateway" ]] || return 1
+  dns_service="$("$M2_NETWORKSETUP_BIN" -listnetworkserviceorder 2>/dev/null | \
+    network_service_for_interface_from_text "$physical_interface")" || return 1
+  dns_snapshot="$(m2_dns_snapshot_for_service "$dns_service")" || return 1
+  snapshot_file="$run_dir/m2-dns.before"
+  printf '%s\n' "$dns_snapshot" >"$snapshot_file" || return 1
+
+  write_state m2.full_tunnel preparing
+  write_state m2.physical_interface "$physical_interface"
+  write_state m2.physical_gateway "$physical_gateway"
+  write_state m2.dns_service "$dns_service"
+  write_state m2.dns_before_file "$snapshot_file"
+  write_state m2.exit_route_owned 0
+  write_state m2.low_route_owned 0
+  write_state m2.high_route_owned 0
+  write_state m2.fake_route_owned 0
+  write_state m2.dns_owned 0
+
+  if "$M2_ROUTE_BIN" -n add -host "$exit_host" "$physical_gateway" \
+    >>"$run_dir/route.log" 2>&1; then
+    exit_route_owned=1
+    write_state m2.exit_route_owned 1
+  fi
+  if ! "$M2_ROUTE_BIN" -n add -net 0.0.0.0/1 -interface "$utun" \
+    >>"$run_dir/route.log" 2>&1; then
+    deactivate_m2_full_tunnel "$run_dir" || true
+    return 1
+  fi
+  write_state m2.low_route_owned 1
+  if ! "$M2_ROUTE_BIN" -n add -net 128.0.0.0/1 -interface "$utun" \
+    >>"$run_dir/route.log" 2>&1; then
+    deactivate_m2_full_tunnel "$run_dir" || true
+    return 1
+  fi
+  write_state m2.high_route_owned 1
+  if ! "$M2_ROUTE_BIN" -n add -net 198.18.0.0/15 -interface "$utun" \
+    >>"$run_dir/route.log" 2>&1; then
+    deactivate_m2_full_tunnel "$run_dir" || true
+    return 1
+  fi
+  write_state m2.fake_route_owned 1
+  if ! "$M2_NETWORKSETUP_BIN" -setdnsservers "$dns_service" "$dns_target" \
+    >>"$run_dir/route.log" 2>&1; then
+    deactivate_m2_full_tunnel "$run_dir" || true
+    return 1
+  fi
+  write_state m2.dns_owned 1
+  if ! "$M2_DSCACHEUTIL_BIN" -flushcache >>"$run_dir/route.log" 2>&1; then
+    deactivate_m2_full_tunnel "$run_dir" || true
+    return 1
+  fi
+  write_state m2.full_tunnel active
+  if ! m2_full_tunnel_is_active; then
+    write_state m2.full_tunnel preparing
+    deactivate_m2_full_tunnel "$run_dir" || true
+    return 1
+  fi
+  append_event_to "$run_dir" \
+    "m2 full tunnel active interface=$utun physical=$physical_interface dns_service=$dns_service exit_route_owned=$exit_route_owned"
 }
 
 route_interface() {
@@ -349,7 +1003,8 @@ workload_command_matches() {
   local command_text="$1"
   [[ "$command_text" == *"knife15-macos-soak.sh m0" || \
     "$command_text" == *"knife15-macos-soak.sh m1" || \
-    "$command_text" == *"knife15-macos-soak.sh m1-diagnostic" ]]
+    "$command_text" == *"knife15-macos-soak.sh m1-diagnostic" || \
+    "$command_text" == *"knife15-macos-soak.sh m2" ]]
 }
 
 tcp_pool_latest_active_leases() {
@@ -924,6 +1579,165 @@ capture_m1_checkpoint() {
     >>"$run_dir/m1-checkpoints.csv" || return 1
   ((10#$live == 0 && 10#$outstanding == 0 && \
     10#$available + 10#$live + 10#$outstanding <= 61440))
+}
+
+m2_data_plane_envelope() {
+  local log_file="$1"
+  sed -nE \
+    's/.*DNS forge=([0-9]+)\/drop=([0-9]+) \| TCP relay 活跃=([0-9]+)\/累计=([0-9]+) \| fake-IP 活跃=([0-9]+)\/在册=([0-9]+).*/\1 \2 \3 \4 \5 \6/p' \
+    "$log_file" 2>/dev/null | awk '
+      {
+        forged = $1
+        dropped = $2
+        active_relays = $3
+        total_relays = $4
+        fake_active = $5
+        fake_total = $6
+        samples++
+      }
+      END {
+        if (samples == 0) {
+          print "0 unknown unknown unknown unknown unknown unknown"
+        } else {
+          printf "%d %d %d %d %d %d %d\n", samples, forged, dropped,
+            active_relays, total_relays, fake_active, fake_total
+        }
+      }
+    '
+}
+
+m2_checkpoint_envelope() {
+  local checkpoint_file="$1"
+  awk -F, '
+    BEGIN {
+      expected[1] = "idle-1"
+      expected[2] = "idle-2"
+      expected[3] = "idle-3"
+      expected[4] = "idle-4"
+      expected[5] = "idle-5"
+      expected[6] = "final"
+    }
+    NR > 1 {
+      numeric = 1
+      for (field = 3; field <= 14; field++) {
+        if ($field !~ /^[0-9]+$/) numeric = 0
+      }
+      if (!numeric) {
+        invalid++
+        next
+      }
+      count++
+      if ($2 != expected[count]) labels_invalid++
+      rss = $3 + 0
+      fd = $4 + 0
+      threads = $5 + 0
+      available = $6 + 0
+      live = $7 + 0
+      outstanding = $8 + 0
+      active_relays = $9 + 0
+      fake_active = $11 + 0
+      fake_total = $12 + 0
+      dns_dropped = $14 + 0
+      if (count == 1) {
+        first_rss = rss
+        first_fd = fd
+        first_threads = threads
+        max_rss = rss
+        max_fd = fd
+        max_threads = threads
+        first_fake_total = fake_total
+      }
+      final_rss = rss
+      final_fd = fd
+      final_threads = threads
+      if (rss > max_rss) max_rss = rss
+      if (fd > max_fd) max_fd = fd
+      if (threads > max_threads) max_threads = threads
+      if (live != 0 || outstanding != 0 ||
+          available + live + outstanding > 61440 ||
+          active_relays != 0 || fake_active != 0 ||
+          fake_total < 1 || fake_total > 2 ||
+          fake_total != first_fake_total ||
+          dns_dropped != 0) ownership_failures++
+    }
+    END {
+      labels_valid = (count == 6 && labels_invalid == 0 && invalid == 0) ? 1 : 0
+      if (count == 0) {
+        print "0 0 unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown unknown 0"
+      } else {
+        printf "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
+          count, labels_valid, first_rss, final_rss, max_rss,
+          final_rss - first_rss, first_fd, final_fd, max_fd,
+          final_fd - first_fd, first_threads, final_threads, max_threads,
+          final_threads - first_threads, ownership_failures + 0
+      }
+    }
+  ' "$checkpoint_file" 2>/dev/null
+}
+
+m2_checkpoint_slo() {
+  local checkpoint_file="$1"
+  local count labels_valid first_rss final_rss max_rss rss_delta
+  local first_fd final_fd max_fd fd_delta first_threads final_threads
+  local max_threads threads_delta ownership_failures value
+  read -r count labels_valid first_rss final_rss max_rss rss_delta \
+    first_fd final_fd max_fd fd_delta first_threads final_threads \
+    max_threads threads_delta ownership_failures \
+    <<<"$(m2_checkpoint_envelope "$checkpoint_file")"
+  [[ "$count" == "6" && "$labels_valid" == "1" && \
+    "$ownership_failures" == "0" ]] || return 1
+  for value in "$first_rss" "$final_rss" "$max_rss" "$first_fd" \
+    "$final_fd" "$max_fd" "$first_threads" "$final_threads" "$max_threads"; do
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  done
+  ((max_rss <= 131072 && rss_delta <= 32768 && \
+    max_fd - first_fd <= 2 && final_fd - first_fd <= 1 && \
+    max_threads - first_threads <= 2 && final_threads - first_threads <= 1))
+}
+
+capture_m2_checkpoint() {
+  local run_dir="$1"
+  local label="$2"
+  local previous_endpoint_samples="$3"
+  local previous_data_plane_samples="$4"
+  local process_values endpoint_values data_plane_values
+  local rss fd threads endpoint_samples max_total available live outstanding rest
+  local data_samples dns_forged dns_dropped active_relays total_relays
+  local fake_active fake_total
+  process_values="$(awk -F, '
+    NR > 1 && $3 ~ /^[0-9]+$/ && $7 ~ /^[0-9]+$/ && $8 ~ /^[0-9]+$/ {
+      value = $3 " " $7 " " $8
+    }
+    END { print value }
+  ' "$run_dir/process.csv" 2>/dev/null)"
+  read -r rss fd threads <<<"$process_values"
+  [[ "$rss" =~ ^[0-9]+$ && "$fd" =~ ^[0-9]+$ && "$threads" =~ ^[0-9]+$ ]] || \
+    return 1
+  endpoint_values="$(endpoint_resource_envelope "$run_dir/mini_vpn.log")"
+  read -r endpoint_samples max_total available live outstanding rest \
+    <<<"$endpoint_values"
+  data_plane_values="$(m2_data_plane_envelope "$run_dir/mini_vpn.log")"
+  read -r data_samples dns_forged dns_dropped active_relays total_relays \
+    fake_active fake_total <<<"$data_plane_values"
+  [[ "$previous_endpoint_samples" =~ ^[0-9]+$ && \
+    "$previous_data_plane_samples" =~ ^[0-9]+$ && \
+    "$endpoint_samples" =~ ^[0-9]+$ && "$data_samples" =~ ^[0-9]+$ && \
+    10#$endpoint_samples -gt 10#$previous_endpoint_samples && \
+    10#$data_samples -gt 10#$previous_data_plane_samples ]] || return 1
+  for value in "$available" "$live" "$outstanding" "$dns_forged" \
+    "$dns_dropped" "$active_relays" "$total_relays" "$fake_active" "$fake_total"; do
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  done
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$(timestamp)" "$label" "$rss" "$fd" "$threads" "$available" "$live" \
+    "$outstanding" "$active_relays" "$total_relays" "$fake_active" \
+    "$fake_total" "$dns_forged" "$dns_dropped" \
+    >>"$run_dir/m2-checkpoints.csv" || return 1
+  ((10#$live == 0 && 10#$outstanding == 0 && \
+    10#$available + 10#$live + 10#$outstanding <= 61440 && \
+    10#$active_relays == 0 && 10#$fake_active == 0 && \
+    10#$fake_total >= 1 && 10#$fake_total <= 2 && \
+    10#$dns_dropped == 0))
 }
 
 m0_final_ownership_is_clean() {
@@ -1692,13 +2506,80 @@ short_epoch_secs=$M1_SHORT_SECS
 EOF_M1_PROFILE
 }
 
+write_m2_profile() {
+  local baseline_dir="$1"
+  local output_file="$2"
+  local target="${3:-$TARGET}"
+  local iperf_port="${4:-$IPERF_PORT}"
+  local dns_target="${5:-$DNS_TARGET}"
+  local dns_name="${6:-$DNS_NAME}"
+  local forward_bps reverse_bps
+  forward_bps="$(baseline_receiver_bps "$baseline_dir/direct-forward.json")" || return 1
+  reverse_bps="$(baseline_receiver_bps "$baseline_dir/direct-reverse.json")" || return 1
+  cat >"$output_file" <<EOF_M2_PROFILE
+schema=knife15-macos-m2-v1
+created_utc=$(timestamp)
+baseline_dir=$baseline_dir
+baseline_forward_sha256=$(sha256_file "$baseline_dir/direct-forward.json")
+baseline_reverse_sha256=$(sha256_file "$baseline_dir/direct-reverse.json")
+target=$target
+iperf_port=$iperf_port
+dns_target=${dns_target:-disabled}
+dns_name=$dns_name
+baseline_forward_bps=$forward_bps
+baseline_reverse_bps=$reverse_bps
+rate_cap_bps=$M1_RATE_CAP_BPS
+steady_tcp_forward_bps=$(min_rate_bps $((10#$forward_bps / 2)))
+steady_tcp_reverse_bps=$(min_rate_bps $((10#$reverse_bps / 2)))
+steady_udp_reverse_bps=$(min_rate_bps $((10#$reverse_bps / 2)))
+steady_short_forward_bps=$(min_rate_bps $((10#$forward_bps * 4 / 5)))
+steady_short_reverse_bps=$(min_rate_bps $((10#$reverse_bps * 4 / 5)))
+steady_short_connections_per_cycle=$M2_STEADY_SHORT_COUNT
+quiet_tcp_forward_bps=$(min_rate_bps $((10#$forward_bps / 4)))
+quiet_tcp_reverse_bps=$(min_rate_bps $((10#$reverse_bps / 4)))
+quiet_udp_reverse_bps=$(min_rate_bps $((10#$reverse_bps / 4)))
+quiet_short_forward_bps=$(min_rate_bps $((10#$forward_bps / 2)))
+quiet_short_reverse_bps=$(min_rate_bps $((10#$reverse_bps / 2)))
+quiet_short_connections_per_cycle=$M2_QUIET_SHORT_COUNT
+churn_tcp_forward_bps=$(min_rate_bps $((10#$forward_bps / 4)))
+churn_tcp_reverse_bps=$(min_rate_bps $((10#$reverse_bps / 4)))
+churn_udp_reverse_bps=$(min_rate_bps $((10#$reverse_bps / 4)))
+churn_short_forward_bps=$(min_rate_bps $((10#$forward_bps / 2)))
+churn_short_reverse_bps=$(min_rate_bps $((10#$reverse_bps / 2)))
+churn_short_connections_per_cycle=$M2_CHURN_SHORT_COUNT
+tcp_reverse_iperf_length_bytes=$TCP_REVERSE_IPERF_LENGTH_BYTES
+udp_payload_bytes=1160
+total_secs=$M2_TOTAL_SECS
+steady_a_secs=$M2_STEADY_A_SECS
+idle_secs=$M2_IDLE_SECS
+quiet_a_secs=$M2_QUIET_A_SECS
+steady_b_secs=$M2_STEADY_B_SECS
+churn_secs=$M2_CHURN_SECS
+quiet_b_secs=$M2_QUIET_B_SECS
+steady_c_secs=$M2_STEADY_C_SECS
+final_drain_secs=$M2_FINAL_DRAIN_SECS
+tcp_epoch_secs=$M2_TCP_SECS
+udp_epoch_secs=$M2_UDP_SECS
+short_epoch_secs=$M2_SHORT_SECS
+expected_cycles=$M2_EXPECTED_CYCLES
+expected_tcp_results=$M2_EXPECTED_TCP_RESULTS
+expected_udp_results=$M2_EXPECTED_UDP_RESULTS
+expected_phase_results=$M2_EXPECTED_PHASE_RESULTS
+expected_checkpoints=$M2_EXPECTED_CHECKPOINTS
+egress_url=$M2_EGRESS_URL
+browser_url=$M2_BROWSER_URL
+EOF_M2_PROFILE
+}
+
 runner_self_test() {
-  local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir baseline_summary_text m0_profile m1_profile m1_test_profile m0_run m1_stage_run m1_run m1_diagnostic_run m1_diagnostic_fail_run m1_diagnostic_formal_run m1_checkpoint_file m1_capture_run m1_formal_run m1_tcp_fixture m1_udp_fixture m0_fail_run direct_dir fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash bounded_status result_index result_label sample_index violations_before violation_count invalid_violations
+  local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture service_fixture dns_fixture m2_route_bin m2_networksetup_bin m2_dscacheutil_bin m2_curl_bin m2_route_state m2_run m2_result m2_schedule_run m2_test_profile m2_checkpoint_file m2_capture_run original_m2_route_bin original_m2_networksetup_bin original_m2_dscacheutil_bin original_m2_curl_bin collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir baseline_summary_text m0_profile m1_profile m2_profile m1_test_profile m0_run m1_stage_run m1_run m1_diagnostic_run m1_diagnostic_fail_run m1_diagnostic_formal_run m1_checkpoint_file m1_capture_run m1_formal_run m1_tcp_fixture m1_udp_fixture m0_fail_run direct_dir fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash bounded_status result_index result_label sample_index violations_before violation_count invalid_violations
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/knife15-macos-self-test.XXXXXX")" || return 1
   good_log="$tmp/good.log"
   bad_log="$tmp/bad.log"
   route_fixture="$tmp/route.txt"
   interface_fixture="$tmp/interface.txt"
+  service_fixture="$tmp/network-service-order.txt"
+  dns_fixture="$tmp/dns-servers.txt"
 
   validate_ipv4 43.130.32.77 || die "self-test: valid IPv4 rejected"
   ! validate_ipv4 300.1.1.1 || die "self-test: invalid IPv4 accepted"
@@ -1711,6 +2592,299 @@ runner_self_test() {
   ! validate_run_dir_path /tmp/other || die "self-test: unrelated run directory accepted"
   ! validate_run_dir_path /tmp/mini_vpn_knife15_macos_../victim || \
     die "self-test: traversal run directory accepted"
+  cat >"$service_fixture" <<'EOF_NETWORK_SERVICES'
+An asterisk (*) denotes that a network service is disabled.
+(1) USB 10/100/1000 LAN
+(Hardware Port: USB 10/100/1000 LAN, Device: en5)
+(2) Wi-Fi
+(Hardware Port: Wi-Fi, Device: en0)
+EOF_NETWORK_SERVICES
+  [[ "$(network_service_for_interface_from_text en0 <"$service_fixture")" == \
+    "Wi-Fi" ]] || die "self-test: physical network service parser mismatch"
+  ! network_service_for_interface_from_text en9 <"$service_fixture" >/dev/null || \
+    die "self-test: missing physical network service was accepted"
+  printf '%s\n' '8.8.8.8' '1.1.1.1' >"$dns_fixture"
+  [[ "$(normalized_dns_snapshot_from_text <"$dns_fixture")" == \
+    $'8.8.8.8\n1.1.1.1' ]] || die "self-test: DNS snapshot parser mismatch"
+  printf '%s\n' "There aren't any DNS Servers set on Wi-Fi." >"$dns_fixture"
+  [[ "$(normalized_dns_snapshot_from_text <"$dns_fixture")" == "EMPTY" ]] || \
+    die "self-test: empty DNS snapshot parser mismatch"
+  printf '%s\n' '8.8.8.8; injected' >"$dns_fixture"
+  ! normalized_dns_snapshot_from_text <"$dns_fixture" >/dev/null || \
+    die "self-test: unsafe DNS snapshot was accepted"
+  ipv4_is_fake 198.18.0.2 || die "self-test: valid fake IPv4 rejected"
+  ipv4_is_fake 198.19.255.254 || die "self-test: upper fake IPv4 rejected"
+  ! ipv4_is_fake 198.20.0.1 || die "self-test: non-fake IPv4 accepted"
+  printf '%s\n' 'interface: lo0' >"$route_fixture"
+  m2_ipv6_route_is_safe_from_text <"$route_fixture" || \
+    die "self-test: loopback IPv6 route rejected"
+  printf '%s\n' 'interface: en0' >"$route_fixture"
+  ! m2_ipv6_route_is_safe_from_text <"$route_fixture" || \
+    die "self-test: physical IPv6 route accepted"
+
+  m2_route_state="$tmp/m2-route-state"
+  m2_run="$tmp/m2-route-run"
+  mkdir "$m2_route_state" "$m2_run" "$tmp/m2-state" \
+    "$m2_run/m2-real-client"
+  printf 'timestamp\tevent\n' >"$m2_run/events.tsv"
+  : >"$m2_run/route.log"
+  : >"$m2_run/cleanup.log"
+  printf '%s\n' 9.9.9.9 >"$m2_route_state/dns-current"
+  : >"$m2_route_state/commands.log"
+  m2_route_bin="$tmp/m2-route"
+  m2_networksetup_bin="$tmp/m2-networksetup"
+  m2_dscacheutil_bin="$tmp/m2-dscacheutil"
+  m2_curl_bin="$tmp/m2-curl"
+  cat >"$m2_route_bin" <<'EOF_M2_FAKE_ROUTE'
+#!/usr/bin/env bash
+set -u
+printf 'route' >>"$M2_TEST_DIR/commands.log"
+printf ' %s' "$@" >>"$M2_TEST_DIR/commands.log"
+printf '\n' >>"$M2_TEST_DIR/commands.log"
+action="${2:-}"
+if [[ "$action" == "get" ]]; then
+  if [[ "${3:-}" == "-inet6" ]]; then
+    if [[ -n "${M2_TEST_IPV6_ERROR:-}" ]]; then
+      printf '%s\n' "$M2_TEST_IPV6_ERROR" >&2
+      exit 2
+    elif [[ -n "${M2_TEST_IPV6_IF:-}" ]]; then
+      printf 'interface: %s\n' "$M2_TEST_IPV6_IF"
+      exit 0
+    fi
+    printf '%s\n' 'route: writing to routing socket: not in table' >&2
+    exit 1
+  fi
+  target="${3:-}"
+  case "$target" in
+    43.153.32.33)
+      printf '%s\n' 'gateway: 192.168.50.1' 'interface: en0'
+      ;;
+    43.130.32.77|8.8.8.8)
+      printf 'interface: utun42\n'
+      ;;
+    1.1.1.1)
+      [[ -f "$M2_TEST_DIR/route_low" ]] && printf 'interface: utun42\n' || \
+        printf '%s\n' 'gateway: 192.168.50.1' 'interface: en0'
+      ;;
+    129.1.1.1)
+      [[ -f "$M2_TEST_DIR/route_high" ]] && printf 'interface: utun42\n' || \
+        printf '%s\n' 'gateway: 192.168.50.1' 'interface: en0'
+      ;;
+    198.18.0.1)
+      [[ -f "$M2_TEST_DIR/route_fake" ]] && printf 'interface: utun42\n' || \
+        printf '%s\n' 'gateway: 192.168.50.1' 'interface: en0'
+      ;;
+    *)
+      printf '%s\n' 'gateway: 192.168.50.1' 'interface: en0'
+      ;;
+  esac
+  exit 0
+fi
+kind="${3:-}"
+destination="${4:-}"
+if [[ "$action" == "add" && "$destination" == "${M2_TEST_FAIL_ROUTE:-}" ]]; then
+  exit 1
+fi
+case "$kind:$destination" in
+  -host:43.153.32.33) marker=route_exit ;;
+  -net:0.0.0.0/1) marker=route_low ;;
+  -net:128.0.0.0/1) marker=route_high ;;
+  -net:198.18.0.0/15) marker=route_fake ;;
+  *) exit 2 ;;
+esac
+if [[ "$action" == "add" ]]; then
+  : >"$M2_TEST_DIR/$marker"
+elif [[ "$action" == "delete" ]]; then
+  rm -f "$M2_TEST_DIR/$marker"
+else
+  exit 2
+fi
+EOF_M2_FAKE_ROUTE
+  cat >"$m2_networksetup_bin" <<'EOF_M2_FAKE_NETWORKSETUP'
+#!/usr/bin/env bash
+set -u
+printf 'networksetup' >>"$M2_TEST_DIR/commands.log"
+printf ' %s' "$@" >>"$M2_TEST_DIR/commands.log"
+printf '\n' >>"$M2_TEST_DIR/commands.log"
+case "${1:-}" in
+  -listnetworkserviceorder)
+    printf '%s\n' \
+      'An asterisk (*) denotes that a network service is disabled.' \
+      '(1) Wi-Fi' \
+      '(Hardware Port: Wi-Fi, Device: en0)'
+    ;;
+  -getdnsservers)
+    if [[ "$(sed -n '1p' "$M2_TEST_DIR/dns-current")" == "EMPTY" ]]; then
+      printf "There aren't any DNS Servers set on %s.\n" "${2:-}"
+    else
+      sed -n '1,$p' "$M2_TEST_DIR/dns-current"
+    fi
+    ;;
+  -setdnsservers)
+    shift 2
+    if [[ "${1:-}" == "Empty" ]]; then
+      printf '%s\n' EMPTY >"$M2_TEST_DIR/dns-current"
+    else
+      : >"$M2_TEST_DIR/dns-current"
+      printf '%s\n' "$@" >>"$M2_TEST_DIR/dns-current"
+    fi
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+EOF_M2_FAKE_NETWORKSETUP
+  cat >"$m2_dscacheutil_bin" <<'EOF_M2_FAKE_DSCACHEUTIL'
+#!/usr/bin/env bash
+printf 'dscacheutil' >>"$M2_TEST_DIR/commands.log"
+printf ' %s' "$@" >>"$M2_TEST_DIR/commands.log"
+printf '\n' >>"$M2_TEST_DIR/commands.log"
+EOF_M2_FAKE_DSCACHEUTIL
+  cat >"$m2_curl_bin" <<'EOF_M2_FAKE_CURL'
+#!/usr/bin/env bash
+set -u
+[[ -z "${http_proxy:-}${https_proxy:-}${all_proxy:-}${no_proxy:-}" ]] || exit 80
+[[ -z "${HTTP_PROXY:-}${HTTPS_PROXY:-}${ALL_PROXY:-}${NO_PROXY:-}" ]] || exit 81
+printf 'curl' >>"$M2_TEST_DIR/commands.log"
+printf ' %s' "$@" >>"$M2_TEST_DIR/commands.log"
+printf '\n' >>"$M2_TEST_DIR/commands.log"
+output=
+url=
+while (($# > 0)); do
+  case "$1" in
+    --resolve|--proxy|-x)
+      exit 82
+      ;;
+    --output)
+      output="$2"
+      shift 2
+      ;;
+    --write-out|--proto|--connect-timeout|--max-time|--max-redirs)
+      shift 2
+      ;;
+    --*)
+      shift
+      ;;
+    *)
+      url="$1"
+      shift
+      ;;
+  esac
+done
+[[ -n "$output" && -n "$url" ]] || exit 83
+case "$url" in
+  https://api.ipify.org)
+    printf '%s\n' "${M2_TEST_EGRESS_VALUE:-43.153.32.33}" >"$output"
+    ;;
+  https://example.com/)
+    printf '%s\n' '<html>ok</html>' >"$output"
+    ;;
+  *)
+    exit 84
+    ;;
+esac
+printf '%s\n' \
+  "remote_ip=${M2_TEST_REMOTE_IP:-198.18.0.2}" \
+  'http_code=200' \
+  'size_download=16'
+EOF_M2_FAKE_CURL
+  chmod +x "$m2_route_bin" "$m2_networksetup_bin" "$m2_dscacheutil_bin" \
+    "$m2_curl_bin"
+  original_state_dir="$STATE_DIR"
+  original_m2_route_bin="$M2_ROUTE_BIN"
+  original_m2_networksetup_bin="$M2_NETWORKSETUP_BIN"
+  original_m2_dscacheutil_bin="$M2_DSCACHEUTIL_BIN"
+  original_m2_curl_bin="$M2_CURL_BIN"
+  STATE_DIR="$tmp/m2-state"
+  M2_ROUTE_BIN="$m2_route_bin"
+  M2_NETWORKSETUP_BIN="$m2_networksetup_bin"
+  M2_DSCACHEUTIL_BIN="$m2_dscacheutil_bin"
+  M2_CURL_BIN="$m2_curl_bin"
+  export M2_TEST_DIR="$m2_route_state"
+  write_state utun utun42
+  write_state target 43.130.32.77
+  write_state dns_target 8.8.8.8
+  write_state exit_host 43.153.32.33
+  M2_TEST_IPV6_ERROR='route: invalid option'
+  export M2_TEST_IPV6_ERROR
+  ! m2_ipv6_route_is_safe || \
+    die "self-test: unknown IPv6 route failure was accepted as no route"
+  unset M2_TEST_IPV6_ERROR
+  activate_m2_full_tunnel "$m2_run" || \
+    die "self-test: valid M2 full-tunnel activation failed"
+  m2_full_tunnel_is_active || \
+    die "self-test: active M2 full-tunnel ownership was rejected"
+  [[ "$(sed -n '1p' "$m2_route_state/dns-current")" == "8.8.8.8" ]] || \
+    die "self-test: M2 did not own the active DNS service"
+  for marker in route_exit route_low route_high route_fake; do
+    [[ -f "$m2_route_state/$marker" ]] || \
+      die "self-test: M2 route activation missed $marker"
+  done
+  write_state sample_secs 30
+  write_state network.valid.epoch "$(date +%s)"
+  HTTP_PROXY=http://poison.invalid
+  HTTPS_PROXY=http://poison.invalid
+  ALL_PROXY=http://poison.invalid
+  export HTTP_PROXY HTTPS_PROXY ALL_PROXY
+  SOAK_STAGE=m2
+  run_m2_real_client_probe "$m2_run" preflight || \
+    die "self-test: valid M2 real-client probe failed"
+  m2_result="$m2_run/m2-real-client/preflight.txt"
+  m2_real_client_result_is_valid "$m2_result" || \
+    die "self-test: valid M2 real-client evidence rejected"
+  cp "$m2_result" "$m2_result.valid"
+  sed -i '' 's/^public_low_route=utun42$/public_low_route=en0/' "$m2_result"
+  ! m2_real_client_result_is_valid "$m2_result" || \
+    die "self-test: M2 real-client result with a physical public route was accepted"
+  mv "$m2_result.valid" "$m2_result"
+  cp "$m2_result" "$m2_result.valid"
+  sed -i '' 's/^label=preflight$/label=cycle_001/' "$m2_result"
+  ! m2_real_client_result_is_valid "$m2_result" || \
+    die "self-test: mislabeled M2 real-client evidence was accepted"
+  mv "$m2_result.valid" "$m2_result"
+  grep -Fq 'curl --silent --show-error' "$m2_route_state/commands.log" || \
+    die "self-test: M2 real-client curl seam was not exercised"
+  ! grep -Fq -- '--resolve' "$m2_route_state/commands.log" || \
+    die "self-test: M2 real-client probe bypassed the system resolver"
+  M2_TEST_EGRESS_VALUE=43.153.32.34
+  export M2_TEST_EGRESS_VALUE
+  if run_m2_real_client_probe "$m2_run" wrong-egress; then
+    die "self-test: wrong M2 public egress identity was accepted"
+  fi
+  unset M2_TEST_EGRESS_VALUE HTTP_PROXY HTTPS_PROXY ALL_PROXY
+  deactivate_m2_full_tunnel "$m2_run" || \
+    die "self-test: valid M2 full-tunnel cleanup failed"
+  [[ "$(sed -n '1p' "$m2_route_state/dns-current")" == "9.9.9.9" ]] || \
+    die "self-test: M2 did not restore the prior DNS service"
+  for marker in route_exit route_low route_high route_fake; do
+    [[ ! -e "$m2_route_state/$marker" ]] || \
+      die "self-test: M2 route cleanup retained $marker"
+  done
+  deactivate_m2_full_tunnel "$m2_run" || \
+    die "self-test: repeated M2 full-tunnel cleanup was not idempotent"
+
+  rm -f "$m2_route_state"/route_*
+  printf '%s\n' 9.9.9.9 >"$m2_route_state/dns-current"
+  : >"$m2_route_state/commands.log"
+  export M2_TEST_FAIL_ROUTE=128.0.0.0/1
+  if activate_m2_full_tunnel "$m2_run"; then
+    die "self-test: partial M2 route activation unexpectedly passed"
+  fi
+  unset M2_TEST_FAIL_ROUTE
+  for marker in route_exit route_low route_high route_fake; do
+    [[ ! -e "$m2_route_state/$marker" ]] || \
+      die "self-test: partial M2 activation stranded $marker"
+  done
+  [[ "$(sed -n '1p' "$m2_route_state/dns-current")" == "9.9.9.9" ]] || \
+    die "self-test: partial M2 activation changed DNS"
+  STATE_DIR="$original_state_dir"
+  M2_ROUTE_BIN="$original_m2_route_bin"
+  M2_NETWORKSETUP_BIN="$original_m2_networksetup_bin"
+  M2_DSCACHEUTIL_BIN="$original_m2_dscacheutil_bin"
+  M2_CURL_BIN="$original_m2_curl_bin"
+  SOAK_STAGE=m0
+  SOAK_LABEL=M0
+  unset M2_TEST_DIR
   validate_baseline_dir_path /tmp/mini_vpn_knife15_macos_baseline_20260714_010203 || \
     die "self-test: valid baseline directory rejected"
   ! validate_baseline_dir_path /tmp/mini_vpn_knife15_macos_baseline_../victim || \
@@ -1723,11 +2897,28 @@ runner_self_test() {
   M1_BASELINE_DIR=/tmp/mini_vpn_knife15_macos_baseline_m1
   [[ "$(selected_direct_baseline_dir)" == "$M1_BASELINE_DIR" ]] || \
     die "self-test: direct discriminator did not select M1 baseline"
+  M1_BASELINE_DIR=
+  M2_BASELINE_DIR=/tmp/mini_vpn_knife15_macos_baseline_m2
+  [[ "$(selected_direct_baseline_dir)" == "$M2_BASELINE_DIR" ]] || \
+    die "self-test: direct discriminator did not select M2 baseline"
+  selected_direct_epoch_is_frozen "$M2_BASELINE_DIR" || \
+    die "self-test: frozen M2 direct epoch was rejected"
+  M2_TCP_SECS=299
+  ! selected_direct_epoch_is_frozen "$M2_BASELINE_DIR" || \
+    die "self-test: shortened M2 direct epoch was accepted"
+  M2_TCP_SECS=300
+  M1_BASELINE_DIR=/tmp/mini_vpn_knife15_macos_baseline_m1
+  ! selected_direct_baseline_dir >/dev/null || \
+    die "self-test: ambiguous M1/M2 direct baseline selection was accepted"
+  M1_BASELINE_DIR=
+  M2_BASELINE_DIR=
   M0_BASELINE_DIR=/tmp/mini_vpn_knife15_macos_baseline_m0
+  M1_BASELINE_DIR=/tmp/mini_vpn_knife15_macos_baseline_m1
   ! selected_direct_baseline_dir >/dev/null || \
     die "self-test: ambiguous M0/M1 direct baseline selection was accepted"
   M0_BASELINE_DIR=
   M1_BASELINE_DIR=
+  M2_BASELINE_DIR=
   ! selected_direct_baseline_dir >/dev/null || \
     die "self-test: missing direct baseline selection was accepted"
   parse_server 43.173.101.111:8443 || die "self-test: valid server rejected"
@@ -1776,6 +2967,8 @@ runner_self_test() {
     die "self-test: M1 workload command rejected"
   workload_command_matches 'bash scripts/knife15-macos-soak.sh m1-diagnostic' || \
     die "self-test: M1 diagnostic workload command rejected"
+  workload_command_matches 'bash scripts/knife15-macos-soak.sh m2' || \
+    die "self-test: M2 workload command rejected"
   ! workload_command_matches 'bash scripts/knife15-macos-soak.sh smoke' || \
     die "self-test: non-M0 workload command accepted"
 
@@ -1917,6 +3110,30 @@ runner_self_test() {
     die "self-test: M1 churn count mismatch"
   [[ "$(min_rate_bps 240000000)" == "200000000" ]] || \
     die "self-test: M1 workload capacity cap mismatch"
+  m2_profile="$tmp/m2-workload.txt"
+  write_m2_profile "$baseline_dir" "$m2_profile" \
+    43.130.32.77 5201 8.8.8.8 example.com || \
+    die "self-test: cannot derive M2 workload profile"
+  grep -Fq 'schema=knife15-macos-m2-v1' "$m2_profile" || \
+    die "self-test: M2 profile schema mismatch"
+  grep -Fq 'total_secs=86400' "$m2_profile" || \
+    die "self-test: M2 total duration mismatch"
+  grep -Fq 'expected_cycles=93' "$m2_profile" || \
+    die "self-test: M2 complete-cycle arithmetic mismatch"
+  grep -Fq 'expected_tcp_results=934' "$m2_profile" || \
+    die "self-test: M2 TCP result arithmetic mismatch"
+  grep -Fq 'expected_udp_results=95' "$m2_profile" || \
+    die "self-test: M2 UDP result arithmetic mismatch"
+  grep -Fq 'expected_phase_results=1029' "$m2_profile" || \
+    die "self-test: M2 phase result arithmetic mismatch"
+  grep -Fq 'expected_checkpoints=6' "$m2_profile" || \
+    die "self-test: M2 checkpoint arithmetic mismatch"
+  grep -Fq 'quiet_a_secs=10800' "$m2_profile" || \
+    die "self-test: M2 first quiet window mismatch"
+  grep -Fq 'quiet_b_secs=10800' "$m2_profile" || \
+    die "self-test: M2 second quiet window mismatch"
+  grep -Fq 'steady_c_secs=21600' "$m2_profile" || \
+    die "self-test: M2 final steady window mismatch"
 
   m0_run="$tmp/m0-run"
   fake_iperf="$tmp/fake-iperf3"
@@ -2229,6 +3446,57 @@ EOF_FAKE_SLEEP
   SOAK_SUCCESS_STATUS=complete
   SOAK_CONTINUE_DATA_QUALITY=0
   SOAK_VIOLATIONS_FILE=
+  SOAK_STAGE=m2
+  SOAK_LABEL=M2
+  SOAK_EVIDENCE_DIR=m2
+  SOAK_STATUS_FILE=m2.status
+  SOAK_SUCCESS_STATUS=complete
+  SOAK_REAL_CLIENT_PROBE=0
+  m2_schedule_run="$tmp/m2-schedule-run"
+  m2_test_profile="$tmp/m2-test-workload.txt"
+  mkdir -p "$m2_schedule_run/m2"
+  printf 'timestamp\tevent\n' >"$m2_schedule_run/events.tsv"
+  cp "$m2_profile" "$m2_test_profile"
+  sed -i '' \
+    -e 's/^total_secs=.*/total_secs=84/' \
+    -e 's/^steady_a_secs=.*/steady_a_secs=10/' \
+    -e 's/^idle_secs=.*/idle_secs=1/' \
+    -e 's/^quiet_a_secs=.*/quiet_a_secs=10/' \
+    -e 's/^steady_b_secs=.*/steady_b_secs=10/' \
+    -e 's/^churn_secs=.*/churn_secs=28/' \
+    -e 's/^quiet_b_secs=.*/quiet_b_secs=10/' \
+    -e 's/^steady_c_secs=.*/steady_c_secs=10/' \
+    -e 's/^final_drain_secs=.*/final_drain_secs=1/' \
+    -e 's/^tcp_epoch_secs=.*/tcp_epoch_secs=1/' \
+    -e 's/^udp_epoch_secs=.*/udp_epoch_secs=1/' \
+    -e 's/^short_epoch_secs=.*/short_epoch_secs=1/' \
+    "$m2_test_profile"
+  : >"$M0_TEST_COMMAND_LOG"
+  run_m2_schedule "$m2_schedule_run" "$m2_test_profile" || \
+    die "self-test: compressed M2 schedule failed"
+  [[ "$(grep -Fc $'\tm2 active ' "$m2_schedule_run/events.tsv")" == "12" ]] || \
+    die "self-test: M2 active-window start/complete count mismatch"
+  [[ "$(grep -Fc $'\tm2 idle complete ' "$m2_schedule_run/events.tsv")" == "5" ]] || \
+    die "self-test: M2 idle count mismatch"
+  [[ "$(grep -Fc $'\tm2 resume complete ' "$m2_schedule_run/events.tsv")" == "5" ]] || \
+    die "self-test: M2 resume count mismatch"
+  [[ "$(grep -Fc $'\tm2 cycle complete ' "$m2_schedule_run/events.tsv")" == "6" ]] || \
+    die "self-test: compressed M2 complete-cycle count mismatch"
+  [[ "$M2_COMPLETE_CYCLE_INDEX" == "6" && "$M0_CYCLE_INDEX" == "12" ]] || \
+    die "self-test: M2 complete-cycle identity followed partial attempt numbering"
+  [[ "$(grep -Fc $'\tm2 DNS complete ' "$m2_schedule_run/events.tsv")" == "6" ]] || \
+    die "self-test: compressed M2 DNS count mismatch"
+  [[ "$(grep -Fc $'\tm2 phase complete ' "$m2_schedule_run/events.tsv")" == "78" ]] || \
+    die "self-test: compressed M2 phase count mismatch"
+  [[ "$(grep -Ec $'\tm2 phase complete cycle=[0-9]+ phase=udp-reverse' \
+    "$m2_schedule_run/events.tsv")" == "6" ]] || \
+    die "self-test: compressed M2 UDP count mismatch"
+  grep -Fxq complete "$m2_schedule_run/m2.status" || \
+    die "self-test: successful M2 schedule status mismatch"
+  SOAK_STAGE=m1
+  SOAK_LABEL=M1
+  SOAK_EVIDENCE_DIR=m1
+  SOAK_STATUS_FILE=m1.status
   m1_checkpoint_file="$m1_run/m1-checkpoints.csv"
   printf '%s\n' \
     'timestamp,label,rss_kib,fd_count,thread_rows,endpoint_available_bytes,endpoint_live_bytes,endpoint_outstanding_bytes' \
@@ -2288,6 +3556,60 @@ EOF_FAKE_SLEEP
     die "self-test: fresh endpoint sample was rejected for an M1 checkpoint"
   [[ "$(awk 'END {print NR}' "$m1_capture_run/m1-checkpoints.csv")" == "2" ]] || \
     die "self-test: fresh M1 checkpoint row was not recorded exactly once"
+
+  m2_checkpoint_file="$m2_schedule_run/m2-checkpoints.csv"
+  printf '%s\n' \
+    'timestamp,label,rss_kib,fd_count,thread_rows,endpoint_available_bytes,endpoint_live_bytes,endpoint_outstanding_bytes,active_relays,total_relays,fake_ip_active,fake_ip_registered,dns_forged,dns_dropped' \
+    '2026-07-30T00:00:00Z,idle-1,100,15,11,61440,0,0,0,10,0,2,10,0' \
+    '2026-07-30T01:00:00Z,idle-2,110,16,12,61440,0,0,0,20,0,2,20,0' \
+    '2026-07-30T02:00:00Z,idle-3,120,17,13,61440,0,0,0,30,0,2,30,0' \
+    '2026-07-30T03:00:00Z,idle-4,125,17,13,61440,0,0,0,40,0,2,40,0' \
+    '2026-07-30T04:00:00Z,idle-5,130,16,12,61440,0,0,0,50,0,2,50,0' \
+    '2026-07-30T05:00:00Z,final,125,16,12,61440,0,0,0,60,0,2,60,0' \
+    >"$m2_checkpoint_file"
+  [[ "$(m2_checkpoint_envelope "$m2_checkpoint_file")" == \
+    '6 1 100 125 130 25 15 16 17 1 11 12 13 1 0' ]] || \
+    die "self-test: M2 checkpoint envelope mismatch"
+  m2_checkpoint_slo "$m2_checkpoint_file" || \
+    die "self-test: valid M2 checkpoint plateau rejected"
+  cp "$m2_checkpoint_file" "$m2_checkpoint_file.valid"
+  sed -i '' 's/,final,125,16,12,61440,0,0,0,60,0,2,60,0$/,final,125,16,12,61440,0,0,1,60,0,2,60,0/' \
+    "$m2_checkpoint_file"
+  ! m2_checkpoint_slo "$m2_checkpoint_file" || \
+    die "self-test: M2 active relay at final checkpoint accepted"
+  cp "$m2_checkpoint_file.valid" "$m2_checkpoint_file"
+  sed -i '' 's/,idle-4,125,17,13,61440,0,0,0,40,0,2,40,0$/,idle-4,125,17,13,61440,0,0,0,40,0,3,40,0/' \
+    "$m2_checkpoint_file"
+  ! m2_checkpoint_slo "$m2_checkpoint_file" || \
+    die "self-test: M2 growing fake-IP cache at checkpoint accepted"
+  cp "$m2_checkpoint_file.valid" "$m2_checkpoint_file"
+  sed -i '' 's/,idle-5,130,16,12,61440,0,0,0,50,0,2,50,0$/,idle-5,130,16,12,61440,0,0,0,50,0,2,50,1/' \
+    "$m2_checkpoint_file"
+  ! m2_checkpoint_slo "$m2_checkpoint_file" || \
+    die "self-test: M2 DNS drop at checkpoint accepted"
+  mv "$m2_checkpoint_file.valid" "$m2_checkpoint_file"
+
+  m2_capture_run="$tmp/m2-capture-run"
+  mkdir "$m2_capture_run"
+  printf '%s\n' \
+    'timestamp,pid,rss_kib,cpu_percent,state,elapsed,fd_count,thread_rows' \
+    '2026-07-30T00:00:00Z,1,100,1.0,S,00:01,15,11' \
+    >"$m2_capture_run/process.csv"
+  printf '%s\n' \
+    'timestamp,label,rss_kib,fd_count,thread_rows,endpoint_available_bytes,endpoint_live_bytes,endpoint_outstanding_bytes,active_relays,total_relays,fake_ip_active,fake_ip_registered,dns_forged,dns_dropped' \
+    >"$m2_capture_run/m2-checkpoints.csv"
+  printf '%s\n' \
+    '📊 TUIC endpoint pacing global conservation(available=61440B,live=0B,outstanding=0B,records=2)' \
+    '📊 数据面: DNS forge=10/drop=0 | TCP relay 活跃=0/累计=10 | fake-IP 活跃=0/在册=2 | UDP↓丢=0 背压=0 | UDP↑丢=0 stream兜底=0 | leg=tuic' \
+    >"$m2_capture_run/mini_vpn.log"
+  ! capture_m2_checkpoint "$m2_capture_run" idle-1 1 1 || \
+    die "self-test: stale M2 endpoint/data-plane samples were accepted"
+  printf '%s\n' \
+    '📊 TUIC endpoint pacing global conservation(available=61440B,live=0B,outstanding=0B,records=2)' \
+    '📊 数据面: DNS forge=11/drop=0 | TCP relay 活跃=0/累计=11 | fake-IP 活跃=0/在册=2 | UDP↓丢=0 背压=0 | UDP↑丢=0 stream兜底=0 | leg=tuic' \
+    >>"$m2_capture_run/mini_vpn.log"
+  capture_m2_checkpoint "$m2_capture_run" idle-1 1 1 || \
+    die "self-test: fresh clean M2 checkpoint samples were rejected"
   : >"$m1_run/mini_vpn.log"
   write_summary "$m1_run"
   grep -Fq -- '- m1_status: complete' "$m1_run/summary.md" || \
@@ -2967,6 +4289,36 @@ EOF_FAIL_IPERF
   ! validate_m0_formal_config || die "self-test: shortened formal M0 schedule accepted"
   M0_TOTAL_SECS=7200
   M1_TOTAL_SECS=28800
+  M2_TOTAL_SECS=86400
+  M2_STEADY_A_SECS=14400
+  M2_IDLE_SECS=600
+  M2_QUIET_A_SECS=10800
+  M2_STEADY_B_SECS=14400
+  M2_CHURN_SECS=10800
+  M2_QUIET_B_SECS=10800
+  M2_STEADY_C_SECS=21600
+  M2_FINAL_DRAIN_SECS=600
+  M2_TCP_SECS=300
+  M2_UDP_SECS=180
+  M2_SHORT_SECS=10
+  M2_STEADY_SHORT_COUNT=6
+  M2_QUIET_SHORT_COUNT=6
+  M2_CHURN_SHORT_COUNT=24
+  validate_m2_formal_config || die "self-test: formal M2 schedule rejected"
+  [[ "$(m2_formal_count_model)" == "93 934 95 1029" ]] || \
+    die "self-test: M2 formal schedule count model mismatch"
+  M2_TOTAL_SECS=86399
+  ! validate_m2_formal_config || die "self-test: shortened formal M2 schedule accepted"
+  M2_TOTAL_SECS=86400
+  [[ "$(m2_formal_acceptance_from_values \
+    complete PASS active 0 NOT_APPLICABLE)" == "PENDING_CLEANUP" ]] || \
+    die "self-test: live M2 was not held pending cleanup"
+  [[ "$(m2_formal_acceptance_from_values \
+    complete PASS inactive 1 PASS)" == "PASS" ]] || \
+    die "self-test: cleaned M2 acceptance was rejected"
+  [[ "$(m2_formal_acceptance_from_values \
+    complete PASS inactive 1 MISMATCH)" == "FAIL" ]] || \
+    die "self-test: M2 cleanup mismatch was accepted"
   M1_STEADY_A_SECS=7200
   M1_IDLE_SECS=300
   M1_QUIET_SECS=3600
@@ -2993,6 +4345,8 @@ EOF_FAIL_IPERF
     die "self-test: public M0 action missing from help"
   grep -Fq 'scripts/knife15-macos-soak.sh m1' <<<"$usage_text" || \
     die "self-test: public M1 action missing from help"
+  grep -Fq 'scripts/knife15-macos-soak.sh m2' <<<"$usage_text" || \
+    die "self-test: public M2 action missing from help"
   grep -Fq 'M0_BASELINE_DIR=' <<<"$usage_text" || \
     die "self-test: M0 baseline requirement missing from help"
   grep -Fq 'M0_DIRECT_DIR=' <<<"$usage_text" || \
@@ -3001,6 +4355,10 @@ EOF_FAIL_IPERF
     die "self-test: M1 baseline requirement missing from help"
   grep -Fq 'M1_DIRECT_DIR=' <<<"$usage_text" || \
     die "self-test: M1 direct continuity requirement missing from help"
+  grep -Fq 'M2_BASELINE_DIR=' <<<"$usage_text" || \
+    die "self-test: M2 baseline requirement missing from help"
+  grep -Fq 'M2_DIRECT_DIR=' <<<"$usage_text" || \
+    die "self-test: M2 direct continuity requirement missing from help"
 
   printf '%s\n' '   gateway: 192.168.50.1' ' interface: en0' >"$route_fixture"
   [[ "$(route_interface_from_text <"$route_fixture")" == "en0" ]] || \
@@ -3321,6 +4679,23 @@ m1_steady_short_connections_per_cycle=$M1_STEADY_SHORT_COUNT
 m1_quiet_short_connections_per_cycle=$M1_QUIET_SHORT_COUNT
 m1_churn_short_connections_per_cycle=$M1_CHURN_SHORT_COUNT
 m1_rate_cap_bps=$M1_RATE_CAP_BPS
+m2_total_secs=$M2_TOTAL_SECS
+m2_steady_a_secs=$M2_STEADY_A_SECS
+m2_idle_secs=$M2_IDLE_SECS
+m2_quiet_a_secs=$M2_QUIET_A_SECS
+m2_steady_b_secs=$M2_STEADY_B_SECS
+m2_churn_secs=$M2_CHURN_SECS
+m2_quiet_b_secs=$M2_QUIET_B_SECS
+m2_steady_c_secs=$M2_STEADY_C_SECS
+m2_final_drain_secs=$M2_FINAL_DRAIN_SECS
+m2_tcp_epoch_secs=$M2_TCP_SECS
+m2_udp_epoch_secs=$M2_UDP_SECS
+m2_short_epoch_secs=$M2_SHORT_SECS
+m2_expected_cycles=$M2_EXPECTED_CYCLES
+m2_expected_tcp_results=$M2_EXPECTED_TCP_RESULTS
+m2_expected_udp_results=$M2_EXPECTED_UDP_RESULTS
+m2_expected_phase_results=$M2_EXPECTED_PHASE_RESULTS
+m2_expected_checkpoints=$M2_EXPECTED_CHECKPOINTS
 owner_uid=$owner_uid
 owner_gid=$owner_gid
 EOF_MANIFEST
@@ -3329,6 +4704,13 @@ EOF_MANIFEST
 cleanup_owned_routes() {
   local run_dir="$1"
   local utun target dns_target current
+  if [[ -n "$(read_state m2.full_tunnel 2>/dev/null || true)" ]]; then
+    deactivate_m2_full_tunnel "$run_dir" || {
+      append_event_to "$run_dir" \
+        "m2 full tunnel cleanup failed: owned route or DNS state changed"
+      return 1
+    }
+  fi
   utun="$(read_state utun 2>/dev/null || true)"
   target="$(read_state target 2>/dev/null || true)"
   dns_target="$(read_state dns_target 2>/dev/null || true)"
@@ -3698,7 +5080,12 @@ watchdog_loop() {
   done
   append_event_to "$run_dir" "mini_vpn exited; watchdog cleanup"
   terminate_recorded_workload "$run_dir"
-  cleanup_owned_routes "$run_dir"
+  if ! cleanup_owned_routes "$run_dir"; then
+    append_event_to "$run_dir" \
+      "watchdog cleanup failed: owned route or DNS state requires review"
+    sample_once_for "$run_dir"
+    return 1
+  fi
   sample_once_for "$run_dir"
   write_state inactive "$(timestamp)"
 }
@@ -3970,14 +5357,9 @@ run_direct_discriminator() {
   require_command jq
   require_command iperf3
   baseline_dir="$(selected_direct_baseline_dir)" || \
-    die "set exactly one of M0_BASELINE_DIR or M1_BASELINE_DIR to the fresh baseline directory"
-  if [[ "$baseline_dir" == "$M1_BASELINE_DIR" ]]; then
-    [[ "$M1_TCP_SECS" == "300" ]] || \
-      die "direct discriminator requires the frozen 300s M1 TCP epoch; unset M1_TCP_SECS"
-  else
-    [[ "$M0_TCP_SECS" == "300" ]] || \
-      die "direct discriminator requires the frozen 300s M0 TCP epoch; unset M0_TCP_SECS"
-  fi
+    die "set exactly one of M0_BASELINE_DIR, M1_BASELINE_DIR, or M2_BASELINE_DIR to the fresh baseline directory"
+  selected_direct_epoch_is_frozen "$baseline_dir" || \
+    die "direct discriminator requires the selected stage's frozen 300s TCP epoch; unset its stage override"
   validate_baseline_dir_path "$baseline_dir" || \
     die "the selected soak baseline must be the fresh directory printed by baseline"
   [[ -d "$baseline_dir" && ! -L "$baseline_dir" ]] || \
@@ -4243,6 +5625,11 @@ m0_assert_run_healthy() {
       "$SOAK_STAGE health failed: Exit route actual=${exit_if:-missing} forbidden=$utun"
     return 1
   fi
+  if [[ "$SOAK_STAGE" == "m2" ]] && ! m2_full_tunnel_is_active; then
+    append_event_to "$run_dir" \
+      "$SOAK_STAGE health failed: full-tunnel route, DNS, or IPv6 invariant"
+    return 1
+  fi
 }
 
 run_m0_iperf_phase() {
@@ -4417,6 +5804,18 @@ run_m0_active_window() {
     done
     ((remaining > 0)) || break
     run_m0_dns_phase "$run_dir" "$dns_target" "$dns_name" "$M0_CYCLE_INDEX" || return 1
+    if [[ "$SOAK_STAGE" == "m2" ]]; then
+      M2_COMPLETE_CYCLE_INDEX=$((M2_COMPLETE_CYCLE_INDEX + 1))
+    fi
+    if [[ "${SOAK_REAL_CLIENT_PROBE:-0}" == "1" ]]; then
+      ((M2_COMPLETE_CYCLE_INDEX > 0)) || return 1
+      run_m2_real_client_probe "$run_dir" \
+        "cycle_$(printf '%03d' "$M2_COMPLETE_CYCLE_INDEX")" || {
+        append_event_to "$run_dir" \
+          "$SOAK_STAGE real client failed cycle=$M0_CYCLE_INDEX"
+        return 1
+      }
+    fi
     append_event_to "$run_dir" \
       "$SOAK_STAGE cycle complete cycle=$M0_CYCLE_INDEX"
   done
@@ -4594,6 +5993,128 @@ run_m1_schedule() {
   fi
 }
 
+run_m2_idle_window() {
+  local run_dir="$1"
+  local label="$2"
+  local idle_secs="$3"
+  local endpoint_values data_plane_values endpoint_samples_before
+  local data_plane_samples_before
+  endpoint_values="$(endpoint_resource_envelope "$run_dir/mini_vpn.log")"
+  read -r endpoint_samples_before _ <<<"$endpoint_values"
+  data_plane_values="$(m2_data_plane_envelope "$run_dir/mini_vpn.log")"
+  read -r data_plane_samples_before _ <<<"$data_plane_values"
+  [[ "$endpoint_samples_before" =~ ^[0-9]+$ && \
+    "$data_plane_samples_before" =~ ^[0-9]+$ ]] || return 1
+  m0_assert_run_healthy "$run_dir" || return 1
+  [[ "${M0_ENFORCE_RUN_HEALTH:-0}" != "1" ]] || \
+    sample_once_for "$run_dir" || return 1
+  append_event_to "$run_dir" \
+    "$SOAK_STAGE idle start label=$label planned_secs=$idle_secs"
+  m0_progress "$SOAK_LABEL idle drain $label start duration=${idle_secs}s"
+  run_m0_logged "$run_dir/$SOAK_EVIDENCE_DIR/${label}.sleep.log" \
+    "$((10#$idle_secs + 30))" "$M0_SLEEP_BIN" "$idle_secs" || return 1
+  m0_assert_run_healthy "$run_dir" || return 1
+  if [[ "${M0_ENFORCE_RUN_HEALTH:-0}" == "1" ]]; then
+    sample_once_for "$run_dir" || return 1
+    capture_m2_checkpoint "$run_dir" "$label" "$endpoint_samples_before" \
+      "$data_plane_samples_before" || return 1
+  fi
+  append_event_to "$run_dir" \
+    "$SOAK_STAGE idle complete label=$label planned_secs=$idle_secs"
+  append_event_to "$run_dir" "$SOAK_STAGE resume start label=$label"
+  M0_RESUME_PENDING=1
+}
+
+run_m2_schedule_body() {
+  local run_dir="$1"
+  local profile_file="$2"
+  local total_secs steady_a_secs idle_secs quiet_a_secs steady_b_secs
+  local churn_secs quiet_b_secs steady_c_secs final_drain_secs planned_sum
+  local endpoint_values data_plane_values endpoint_samples_before
+  local data_plane_samples_before
+  total_secs="$(m0_profile_value "$profile_file" total_secs)"
+  steady_a_secs="$(m0_profile_value "$profile_file" steady_a_secs)"
+  idle_secs="$(m0_profile_value "$profile_file" idle_secs)"
+  quiet_a_secs="$(m0_profile_value "$profile_file" quiet_a_secs)"
+  steady_b_secs="$(m0_profile_value "$profile_file" steady_b_secs)"
+  churn_secs="$(m0_profile_value "$profile_file" churn_secs)"
+  quiet_b_secs="$(m0_profile_value "$profile_file" quiet_b_secs)"
+  steady_c_secs="$(m0_profile_value "$profile_file" steady_c_secs)"
+  final_drain_secs="$(m0_profile_value "$profile_file" final_drain_secs)"
+  planned_sum=$((10#$steady_a_secs + 5 * 10#$idle_secs + \
+    10#$quiet_a_secs + 10#$steady_b_secs + 10#$churn_secs + \
+    10#$quiet_b_secs + 10#$steady_c_secs + 10#$final_drain_secs))
+  ((planned_sum == 10#$total_secs)) || return 1
+  M0_CYCLE_INDEX=0
+  M0_RESUME_PENDING=0
+  M2_COMPLETE_CYCLE_INDEX=0
+
+  append_event_to "$run_dir" "$SOAK_STAGE start planned_secs=$total_secs"
+  run_m0_active_window "$run_dir" steady-a "$steady_a_secs" \
+    "$profile_file" steady || return 1
+  run_m2_idle_window "$run_dir" idle-1 "$idle_secs" || return 1
+  run_m0_active_window "$run_dir" quiet-a "$quiet_a_secs" \
+    "$profile_file" quiet || return 1
+  [[ "$M0_RESUME_PENDING" == "0" ]] || return 1
+  run_m2_idle_window "$run_dir" idle-2 "$idle_secs" || return 1
+  run_m0_active_window "$run_dir" steady-b "$steady_b_secs" \
+    "$profile_file" steady || return 1
+  [[ "$M0_RESUME_PENDING" == "0" ]] || return 1
+  run_m2_idle_window "$run_dir" idle-3 "$idle_secs" || return 1
+  run_m0_active_window "$run_dir" churn "$churn_secs" \
+    "$profile_file" churn || return 1
+  [[ "$M0_RESUME_PENDING" == "0" ]] || return 1
+  run_m2_idle_window "$run_dir" idle-4 "$idle_secs" || return 1
+  run_m0_active_window "$run_dir" quiet-b "$quiet_b_secs" \
+    "$profile_file" quiet || return 1
+  [[ "$M0_RESUME_PENDING" == "0" ]] || return 1
+  run_m2_idle_window "$run_dir" idle-5 "$idle_secs" || return 1
+  run_m0_active_window "$run_dir" steady-c "$steady_c_secs" \
+    "$profile_file" steady || return 1
+  [[ "$M0_RESUME_PENDING" == "0" ]] || return 1
+
+  m0_assert_run_healthy "$run_dir" || return 1
+  endpoint_values="$(endpoint_resource_envelope "$run_dir/mini_vpn.log")"
+  read -r endpoint_samples_before _ <<<"$endpoint_values"
+  data_plane_values="$(m2_data_plane_envelope "$run_dir/mini_vpn.log")"
+  read -r data_plane_samples_before _ <<<"$data_plane_values"
+  [[ "$endpoint_samples_before" =~ ^[0-9]+$ && \
+    "$data_plane_samples_before" =~ ^[0-9]+$ ]] || return 1
+  append_event_to "$run_dir" \
+    "$SOAK_STAGE final drain start planned_secs=$final_drain_secs"
+  m0_progress "$SOAK_LABEL final drain start duration=${final_drain_secs}s"
+  run_m0_logged "$run_dir/$SOAK_EVIDENCE_DIR/final-drain.sleep.log" \
+    "$((10#$final_drain_secs + 30))" \
+    "$M0_SLEEP_BIN" "$final_drain_secs" || return 1
+  m0_assert_run_healthy "$run_dir" || return 1
+  if [[ "${M0_ENFORCE_RUN_HEALTH:-0}" == "1" ]]; then
+    sample_once_for "$run_dir" || return 1
+    capture_m2_checkpoint "$run_dir" final "$endpoint_samples_before" \
+      "$data_plane_samples_before" || return 1
+  fi
+  append_event_to "$run_dir" \
+    "$SOAK_STAGE final drain complete planned_secs=$final_drain_secs"
+  append_event_to "$run_dir" \
+    "$SOAK_STAGE complete cycles=$M0_CYCLE_INDEX planned_secs=$total_secs"
+  m0_progress "$SOAK_LABEL workload timeline complete"
+}
+
+run_m2_schedule() {
+  local run_dir="$1"
+  local status_file="$run_dir/m2.status"
+  local result
+  printf '%s\n' running >"$status_file" || return 1
+  if run_m2_schedule_body "$@"; then
+    printf '%s\n' complete >"$status_file" || return 1
+    return 0
+  else
+    result=$?
+    printf '%s\n' failed >"$status_file" || return 1
+    append_event_to "$run_dir" "m2 failed"
+    return "$result"
+  fi
+}
+
 run_smoke() {
   local run_dir utun target exit_host smoke_dir iperf_port duration parallel dns_name dns_target smoke_timeout_secs
   require_root
@@ -4655,7 +6176,9 @@ run_m0_action() {
   workload_matches_run && die "an M0 workload is already running"
   [[ ! -e "$run_dir/m0.status" && ! -e "$run_dir/m0-workload.txt" && \
     ! -e "$run_dir/m0" && ! -e "$run_dir/m1.status" && \
-    ! -e "$run_dir/m1-workload.txt" && ! -e "$run_dir/m1" ]] || \
+    ! -e "$run_dir/m1-workload.txt" && ! -e "$run_dir/m1" && \
+    ! -e "$run_dir/m2.status" && ! -e "$run_dir/m2-workload.txt" && \
+    ! -e "$run_dir/m2" ]] || \
     die "this TUN run already has soak evidence; stop and start a fresh run"
   validate_baseline_dir_path "$M0_BASELINE_DIR" || \
     die "M0_BASELINE_DIR must be the simple /tmp baseline directory printed by baseline"
@@ -4877,8 +6400,10 @@ run_m1_action() {
   workload_matches_run && die "a soak workload is already running"
   [[ ! -e "$run_dir/m0.status" && ! -e "$run_dir/m0-workload.txt" && \
     ! -e "$run_dir/m0" && ! -e "$run_dir/m1.status" && \
-    ! -e "$run_dir/m1-workload.txt" && ! -e "$run_dir/m1" ]] || \
-    die "this TUN run already has M0 or M1 evidence; stop and start a fresh run"
+    ! -e "$run_dir/m1-workload.txt" && ! -e "$run_dir/m1" && \
+    ! -e "$run_dir/m2.status" && ! -e "$run_dir/m2-workload.txt" && \
+    ! -e "$run_dir/m2" ]] || \
+    die "this TUN run already has soak evidence; stop and start a fresh run"
   [[ -z "$M0_BASELINE_DIR" && -z "$M0_DIRECT_DIR" ]] || \
     die "$action_description requires M0_BASELINE_DIR and M0_DIRECT_DIR to be unset"
   validate_baseline_dir_path "$M1_BASELINE_DIR" || \
@@ -5056,6 +6581,306 @@ run_m1_action() {
   die "$action_description workload failed; TUN remains running for status/snapshot/stop evidence"
 }
 
+m2_real_client_envelope() {
+  local results_dir="$1"
+  local expected_index=1 count=0 invalid=0 result_file expected_label
+  [[ -d "$results_dir" && ! -L "$results_dir" ]] || {
+    printf '0 1\n'
+    return
+  }
+  for result_file in "$results_dir"/cycle_*.txt; do
+    [[ -f "$result_file" && ! -L "$result_file" ]] || continue
+    expected_label="cycle_$(printf '%03d' "$expected_index")"
+    if [[ "$(basename "$result_file" .txt)" != "$expected_label" ]] || \
+      ! m2_real_client_result_is_valid "$result_file"; then
+      invalid=$((invalid + 1))
+    fi
+    count=$((count + 1))
+    expected_index=$((expected_index + 1))
+  done
+  printf '%s %s\n' "$count" "$invalid"
+}
+
+m2_source_is_accepted() {
+  git -C "$REPO" merge-base --is-ancestor 5e7a97c HEAD >/dev/null 2>&1
+}
+
+free_kb_for_path() {
+  df -Pk "$1" 2>/dev/null | awk 'NR == 2 && $4 ~ /^[0-9]+$/ {print $4; exit}'
+}
+
+m2_workload_slo() {
+  local run_dir="$1"
+  local log_file="$run_dir/mini_vpn.log"
+  local status active_windows cycles dns idle resume final_drain
+  local phase_failures health_failures real_failures phase_results
+  local tcp_results udp_results tcp_gap udp_loss invalid_results sender_zero receiver_zero
+  local dns_files invalid_dns real_results invalid_real
+  local process_samples rss_first rss_last rss_max rss_delta
+  local fd_first fd_last fd_max fd_delta thread_first thread_last thread_max thread_delta
+  local interface_samples rest endpoint_samples endpoint_max endpoint_available
+  local endpoint_live endpoint_outstanding endpoint_max_live endpoint_max_outstanding
+  local network_samples exit_samples exit_missing exit_rtt gateway_samples gateway_missing
+  local physical_samples exit_loss exit_rtt gateway_loss physical_errors
+  local remote_failures remote_log_matches rebind_successes rebind_recoveries
+  local rebind_failures rebind_max_first_rx log_compactions interface_errors
+  local value
+  status="$(sed -n '1p' "$run_dir/m2.status" 2>/dev/null || true)"
+  active_windows="$(grep -Ec $'\tm2 active .* complete planned_secs=' \
+    "$run_dir/events.tsv" 2>/dev/null || true)"
+  cycles="$(grep -Fc $'\tm2 cycle complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  dns="$(grep -Fc $'\tm2 DNS complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  idle="$(grep -Fc $'\tm2 idle complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  resume="$(grep -Fc $'\tm2 resume complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  final_drain="$(grep -Fc $'\tm2 final drain complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  phase_failures="$(grep -Fc $'\tm2 phase failed ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  health_failures="$(grep -Fc $'\tm2 health failed:' "$run_dir/events.tsv" 2>/dev/null || true)"
+  real_failures="$(grep -Fc $'\tm2 real client failed ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  phase_results="$(grep -Fc $'\tm2 phase complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  read -r tcp_results udp_results tcp_gap udp_loss invalid_results \
+    sender_zero receiver_zero <<<"$(m0_result_envelope "$run_dir/m2")"
+  read -r dns_files invalid_dns <<<"$(m0_dns_result_envelope "$run_dir/m2")"
+  read -r real_results invalid_real \
+    <<<"$(m2_real_client_envelope "$run_dir/m2-real-client")"
+  read -r process_samples rss_first rss_last rss_max rss_delta fd_first \
+    fd_last fd_max fd_delta thread_first thread_last thread_max thread_delta \
+    <<<"$(process_resource_envelope "$run_dir/process.csv")"
+  read -r interface_samples rest \
+    <<<"$(interface_resource_envelope "$run_dir/interface.csv")"
+  read -r endpoint_samples endpoint_max endpoint_available endpoint_live \
+    endpoint_outstanding endpoint_max_live endpoint_max_outstanding \
+    <<<"$(endpoint_resource_envelope "$log_file")"
+  read -r network_samples exit_samples exit_missing exit_rtt gateway_samples \
+    gateway_missing physical_samples exit_loss exit_rtt gateway_loss physical_errors rest \
+    <<<"$(network_control_envelope "$run_dir/network.csv")"
+  interface_errors="$(awk -F, '
+    NR > 1 && (($5 ~ /^[0-9]+$/ && $5 + 0 > 0) ||
+      ($8 ~ /^[0-9]+$/ && $8 + 0 > 0)) { count++ }
+    END { print count + 0 }
+  ' "$run_dir/interface.csv" 2>/dev/null)"
+  log_compactions="$(grep -Fc $'\twatchdog compacted mini_vpn.log' \
+    "$run_dir/events.tsv" 2>/dev/null || true)"
+  remote_log_matches="$(grep -Ec \
+    '写入上游流失败|reason=remote_write_failed|reason=stalled_write_timeout' \
+    "$log_file" 2>/dev/null || true)"
+  remote_failures="$(grep -Ec \
+    'tcp-d16-relay-close .*terminal_reason=(remote_write_failed|stalled_write_timeout)( |$)' \
+    "$log_file" 2>/dev/null || true)"
+  rebind_successes="$(grep -Ec 'tuic-endpoint-rebind generation=[0-9]+' \
+    "$log_file" 2>/dev/null || true)"
+  rebind_recoveries="$(grep -Ec \
+    'tuic-endpoint-rebind-recovered generation=[0-9]+ first_rx_ms=[0-9]+ socket_generation=[0-9]+' \
+    "$log_file" 2>/dev/null || true)"
+  rebind_failures="$(grep -Ec 'tuic-endpoint-rebind-failed generation=[0-9]+' \
+    "$log_file" 2>/dev/null || true)"
+  rebind_max_first_rx="$(awk '
+    match($0, /tuic-endpoint-rebind-recovered generation=[0-9]+ first_rx_ms=[0-9]+/) {
+      value = substr($0, RSTART, RLENGTH)
+      sub(/^.*first_rx_ms=/, "", value)
+      if (value + 0 > maximum) maximum = value + 0
+    }
+    END { print maximum + 0 }
+  ' "$log_file" 2>/dev/null)"
+
+  [[ "$status" == "complete" && \
+    "$active_windows" == "6" && "$cycles" == "$M2_EXPECTED_CYCLES" && \
+    "$dns" == "$M2_EXPECTED_CYCLES" && "$idle" == "5" && \
+    "$resume" == "5" && "$final_drain" == "1" && \
+    "$phase_failures" == "0" && "$health_failures" == "0" && \
+    "$real_failures" == "0" && "$phase_results" == "$M2_EXPECTED_PHASE_RESULTS" && \
+    "$tcp_results" == "$M2_EXPECTED_TCP_RESULTS" && \
+    "$udp_results" == "$M2_EXPECTED_UDP_RESULTS" && \
+    "$invalid_results" == "0" && "$sender_zero" =~ ^[0-9]+$ && \
+    "$receiver_zero" == "0" && "$dns_files" == "$M2_EXPECTED_CYCLES" && \
+    "$invalid_dns" == "0" && "$real_results" == "$M2_EXPECTED_CYCLES" && \
+    "$invalid_real" == "0" ]] || return 1
+  for value in "$tcp_gap" "$process_samples" "$interface_samples" \
+    "$endpoint_samples" "$endpoint_max" "$endpoint_live" "$endpoint_outstanding" \
+    "$network_samples" "$exit_samples" "$physical_samples" "$physical_errors" \
+    "$interface_errors" "$log_compactions" "$rebind_successes" \
+    "$rebind_recoveries" "$rebind_failures" "$rebind_max_first_rx"; do
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  done
+  ((10#$tcp_gap <= 16777216 && 10#$process_samples >= 2700 && \
+    10#$interface_samples >= 2700 && 10#$endpoint_samples >= 2700 && \
+    10#$network_samples >= 2700 && 10#$exit_samples == 10#$network_samples && \
+    10#$physical_samples == 10#$network_samples && 10#$endpoint_max <= 61440 && \
+    10#$endpoint_live == 0 && 10#$endpoint_outstanding == 0 && \
+    10#$physical_errors == 0 && 10#$interface_errors == 0 && \
+    10#$log_compactions == 0 && 10#$rebind_failures == 0 && \
+    10#$rebind_successes == 10#$rebind_recoveries && \
+    10#$rebind_max_first_rx <= 7000)) || return 1
+  decimal_le "$udp_loss" 3.0 || return 1
+  if [[ "$remote_failures" != "0" || "$remote_log_matches" != "0" ]]; then
+    [[ "$remote_failures" =~ ^[1-9][0-9]*$ ]] && \
+      remote_write_close_ownership_is_clean "$log_file" || return 1
+  fi
+  conservation_check_file "$log_file" && \
+    m0_final_ownership_is_clean "$log_file" && \
+    d16_terminal_ownership_is_clean "$log_file" && \
+    m2_checkpoint_slo "$run_dir/m2-checkpoints.csv" && \
+    m2_real_client_result_is_valid "$run_dir/m2-real-client/preflight.txt" && \
+    m2_full_tunnel_is_active && network_control_is_sufficient "$run_dir" && \
+    ! grep -Eq \
+      'pump_full_waits=[1-9][0-9]*|pump_read_errors=[1-9][0-9]*|send_slice_errors=[1-9][0-9]*|tun_flush_tx_failures=[1-9][0-9]*|terminal_pending_reap_bytes=[1-9][0-9]*|reason=stalled_write_timeout|reason=idle_timeout' \
+      "$log_file"
+}
+
+run_m2_action() {
+  local run_dir utun target exit_host iperf_port dns_target dns_name
+  local profile_file free_kb command_name
+  require_root
+  validate_m2_formal_config || \
+    die "formal M2 requires the frozen 86400s schedule and 30s sampling; unset M2_* duration overrides"
+  [[ "$(m2_formal_count_model)" == \
+    "$M2_EXPECTED_CYCLES $M2_EXPECTED_TCP_RESULTS $M2_EXPECTED_UDP_RESULTS $M2_EXPECTED_PHASE_RESULTS" ]] || \
+    die "formal M2 count model does not match its immutable evidence contract"
+  m2_source_is_accepted || \
+    die "formal M2 requires source at 5e7a97c or a descendant"
+  run_dir="$(run_dir_from_state)" || die "no Knife15 run state"
+  active_pid || die "mini_vpn is not running"
+  workload_matches_run && die "a soak workload is already running"
+  [[ ! -e "$run_dir/m0.status" && ! -e "$run_dir/m0" && \
+    ! -e "$run_dir/m1.status" && ! -e "$run_dir/m1" && \
+    ! -e "$run_dir/m2.status" && ! -e "$run_dir/m2" ]] || \
+    die "this TUN run already has soak evidence; stop and start a fresh run"
+  [[ -z "$M0_BASELINE_DIR" && -z "$M0_DIRECT_DIR" && \
+    -z "$M1_BASELINE_DIR" && -z "$M1_DIRECT_DIR" ]] || \
+    die "formal M2 requires every M0/M1 baseline and direct variable to be unset"
+  validate_baseline_dir_path "$M2_BASELINE_DIR" || \
+    die "M2_BASELINE_DIR must be the simple /tmp baseline directory printed by baseline"
+  [[ -d "$M2_BASELINE_DIR" && ! -L "$M2_BASELINE_DIR" ]] || \
+    die "M2_BASELINE_DIR must be an existing non-symlink directory"
+  validate_direct_dir_path "$M2_DIRECT_DIR" || \
+    die "M2_DIRECT_DIR must be the fresh directory printed by direct-discriminator"
+  [[ -d "$M2_DIRECT_DIR" && ! -L "$M2_DIRECT_DIR" ]] || \
+    die "M2_DIRECT_DIR must be an existing non-symlink directory"
+  free_kb="$(free_kb_for_path "$run_dir")"
+  [[ "$free_kb" =~ ^[0-9]+$ ]] && ((10#$free_kb >= M2_MIN_FREE_KB)) || \
+    die "formal M2 requires at least 4GiB free before evidence creation"
+
+  utun="$(read_state utun)"
+  target="$(read_state target)"
+  exit_host="$(read_state exit_host)"
+  iperf_port="$(read_state iperf_port)"
+  dns_target="$(read_state dns_target 2>/dev/null || true)"
+  dns_name="$(read_state dns_name)"
+  [[ -n "$dns_target" ]] || die "formal M2 requires DNS_TARGET"
+  [[ "$(route_interface "$target")" == "$utun" ]] || \
+    die "TARGET no longer routes through $utun"
+  [[ "$(route_interface "$dns_target")" == "$utun" ]] || \
+    die "DNS_TARGET no longer routes through $utun"
+  [[ "$(route_interface "$exit_host")" != "$utun" ]] || \
+    die "Exit route recursed into $utun"
+  m2_ipv6_route_is_safe || \
+    die "formal M2 blocks a routable physical IPv6 path; disable IPv6 for this dedicated test service"
+  network_control_is_sufficient "$run_dir" 5 && network_control_is_recent || \
+    die "formal M2 requires complete, recent Exit and physical-interface controls"
+  tcp_pool_activity_is_idle "$run_dir/mini_vpn.log" || \
+    die "formal M2 requires fully drained TCP-pool ownership after smoke"
+  for command_name in jq iperf3 dig curl route networksetup dscacheutil git; do
+    require_command "$command_name"
+  done
+  validate_m0_baseline_pair "$M2_BASELINE_DIR" "$target" || \
+    die "M2 baseline must contain valid nonzero TCP forward/reverse results"
+  validate_direct_continuity_dir "$M2_DIRECT_DIR" "$M2_BASELINE_DIR" "$target" || \
+    die "formal M2 requires a matching 300s direct continuity PASS completed within 15 minutes"
+
+  mkdir "$run_dir/m2" "$run_dir/m2-baseline" "$run_dir/m2-direct" \
+    "$run_dir/m2-real-client" || die "cannot create M2 evidence directories"
+  cp "$M2_BASELINE_DIR/direct-forward.json" \
+    "$run_dir/m2-baseline/direct-forward.json" || die "cannot preserve M2 forward baseline"
+  cp "$M2_BASELINE_DIR/direct-reverse.json" \
+    "$run_dir/m2-baseline/direct-reverse.json" || die "cannot preserve M2 reverse baseline"
+  cp "$M2_DIRECT_DIR/manifest.txt" "$run_dir/m2-direct/manifest.txt" || \
+    die "cannot preserve M2 direct manifest"
+  cp "$M2_DIRECT_DIR/direct-forward-300s.json" \
+    "$run_dir/m2-direct/direct-forward-300s.json" || \
+    die "cannot preserve M2 direct result"
+  printf '%s\n' \
+    'timestamp,label,rss_kib,fd_count,thread_rows,endpoint_available_bytes,endpoint_live_bytes,endpoint_outstanding_bytes,active_relays,total_relays,fake_ip_active,fake_ip_registered,dns_forged,dns_dropped' \
+    >"$run_dir/m2-checkpoints.csv" || die "cannot create M2 checkpoint evidence"
+  profile_file="$run_dir/m2-workload.txt"
+  printf '%s\n' preparing >"$run_dir/m2.status"
+  if ! write_m2_profile "$M2_BASELINE_DIR" "$profile_file" "$target" \
+    "$iperf_port" "$dns_target" "$dns_name"; then
+    printf '%s\n' failed >"$run_dir/m2.status"
+    append_event_to "$run_dir" "m2 failed: workload profile derivation"
+    die "cannot derive M2 workload profile"
+  fi
+  printf '%s\n' \
+    "start_free_kb=$free_kb" \
+    "direct_dir=$M2_DIRECT_DIR" \
+    "direct_manifest_sha256=$(sha256_file "$M2_DIRECT_DIR/manifest.txt")" \
+    "direct_result_sha256=$(sha256_file "$M2_DIRECT_DIR/direct-forward-300s.json")" \
+    >>"$profile_file" || die "cannot bind direct evidence to M2 profile"
+  append_event_to "$run_dir" \
+    "m2 prepared baseline=$(basename "$M2_BASELINE_DIR") profile=$(sha256_file "$profile_file")"
+  activate_m2_full_tunnel "$run_dir" || {
+    printf '%s\n' failed >"$run_dir/m2.status"
+    die "M2 full-tunnel activation failed or rolled back; use status/snapshot/stop"
+  }
+  M2_CURL_BIN="$(command -v curl)"
+  M0_TRACK_CHILD=1
+  M0_ENFORCE_RUN_HEALTH=1
+  M0_ACTIVE_RUN_DIR="$run_dir"
+  SOAK_STAGE=m2
+  SOAK_LABEL=M2
+  SOAK_EVIDENCE_DIR=m2
+  SOAK_STATUS_FILE=m2.status
+  SOAK_SUCCESS_STATUS=complete
+  SOAK_CONTINUE_DATA_QUALITY=0
+  SOAK_VIOLATIONS_FILE=
+  SOAK_REAL_CLIENT_PROBE=1
+  sample_once_for "$run_dir" || true
+  if ! run_m2_real_client_probe "$run_dir" preflight; then
+    printf '%s\n' failed >"$run_dir/m2.status"
+    append_event_to "$run_dir" "m2 failed: real-client preflight"
+    die "M2 real-client preflight failed; no 24-hour workload ran; use status/snapshot/stop"
+  fi
+
+  M0_IPERF3_BIN="$(command -v iperf3)"
+  M0_DIG_BIN="$(command -v dig)"
+  M0_SLEEP_BIN=/bin/sleep
+  if ! register_m0_workload; then
+    clear_workload_state
+    printf '%s\n' failed >"$run_dir/m2.status"
+    append_event_to "$run_dir" "m2 failed: workload identity registration"
+    die "cannot establish identity-verified M2 workload state"
+  fi
+  trap "interrupt_m0 '$run_dir' INT" INT
+  trap "interrupt_m0 '$run_dir' TERM" TERM
+  trap "interrupt_m0 '$run_dir' HUP" HUP
+  echo "Starting formal Knife15 M2 workload; planned traffic/drain time is 86400 seconds."
+  echo "Reserve about 25 wall-clock hours; full-tunnel DNS/routes remain owned until stop."
+  if run_m2_schedule "$run_dir" "$profile_file"; then
+    trap - INT TERM HUP
+    clear_workload_state
+    sample_once_for "$run_dir" || true
+    if ! m2_workload_slo "$run_dir"; then
+      printf '%s\n' failed >"$run_dir/m2.status"
+      append_event_to "$run_dir" "m2 failed: acceptance SLO mismatch"
+      write_summary "$run_dir"
+      die "M2 timeline completed but acceptance SLO failed; use status/snapshot/stop"
+    fi
+    printf '%s\n' \
+      'm2_slo_evidence=PASS' \
+      'formal_m2_acceptance=PENDING_CLEANUP' \
+      >"$run_dir/m2-pre-stop-verdict.txt" || \
+      die "cannot record M2 pre-stop verdict"
+    write_summary "$run_dir"
+    echo "PASS: formal 24-hour M2 workload completed; cleanup acceptance is pending."
+    echo "run_dir=$run_dir"
+    echo "Next: sudo -E bash scripts/knife15-macos-soak.sh status"
+    echo "Then: sudo -E bash scripts/knife15-macos-soak.sh stop"
+    return 0
+  fi
+  trap - INT TERM HUP
+  clear_workload_state
+  sample_once_for "$run_dir" || true
+  die "M2 workload failed; full tunnel and TUN remain for status/snapshot/stop evidence"
+}
+
 show_status() {
   local run_dir pid utun target exit_host
   require_root
@@ -5073,6 +6898,8 @@ show_status() {
   echo "m0_status=$(sed -n '1p' "$run_dir/m0.status" 2>/dev/null || echo not_run)"
   echo "m1_status=$(sed -n '1p' "$run_dir/m1.status" 2>/dev/null || echo not_run)"
   echo "m1_mode=$(sed -n '1p' "$run_dir/m1-mode" 2>/dev/null || echo not_run)"
+  echo "m2_status=$(sed -n '1p' "$run_dir/m2.status" 2>/dev/null || echo not_run)"
+  echo "m2_full_tunnel=$(read_state m2.full_tunnel 2>/dev/null || echo not_run)"
   if [[ -f "$run_dir/m1-diagnostic-violations.tsv" ]]; then
     echo "m1_diagnostic_violations=$(awk 'END { print (NR > 0 ? NR - 1 : 0) }' \
       "$run_dir/m1-diagnostic-violations.tsv")"
@@ -5122,6 +6949,127 @@ secret_scan() {
       return 1
       ;;
   esac
+}
+
+m2_pre_stop_verdict_is_valid() {
+  local verdict_file="$1"
+  [[ -f "$verdict_file" && ! -L "$verdict_file" && \
+    "$(awk 'END {print NR + 0}' "$verdict_file" 2>/dev/null)" == "2" && \
+    "$(sed -n '1p' "$verdict_file")" == "m2_slo_evidence=PASS" && \
+    "$(sed -n '2p' "$verdict_file")" == \
+      "formal_m2_acceptance=PENDING_CLEANUP" ]]
+}
+
+m2_formal_acceptance_from_values() {
+  local status="$1"
+  local pre_stop="$2"
+  local full_tunnel_state="$3"
+  local cleanup_complete="$4"
+  local cleanup_restored="$5"
+  if [[ "$status" != "complete" || "$pre_stop" != "PASS" ]]; then
+    [[ "$status" == "not_run" ]] && printf '%s\n' NOT_RUN || printf '%s\n' FAIL
+  elif [[ "$full_tunnel_state" == "active" && "$cleanup_complete" == "0" ]]; then
+    printf '%s\n' PENDING_CLEANUP
+  elif [[ "$full_tunnel_state" == "inactive" && "$cleanup_complete" =~ ^[1-9][0-9]*$ && \
+    "$cleanup_restored" == "PASS" ]]; then
+    printf '%s\n' PASS
+  else
+    printf '%s\n' FAIL
+  fi
+}
+
+append_m2_summary() {
+  local run_dir="$1"
+  local status active_windows cycles dns idle resume final_drain
+  local phase_failures health_failures real_failures phase_results
+  local tcp_results udp_results tcp_gap udp_loss invalid_results
+  local sender_zero receiver_zero dns_files invalid_dns real_results invalid_real
+  local checkpoint_count checkpoint_labels checkpoint_first_rss
+  local checkpoint_final_rss checkpoint_max_rss checkpoint_rss_delta
+  local checkpoint_first_fd checkpoint_final_fd checkpoint_max_fd checkpoint_fd_delta
+  local checkpoint_first_threads checkpoint_final_threads checkpoint_max_threads
+  local checkpoint_threads_delta checkpoint_ownership_failures
+  local pre_stop=NOT_APPLICABLE full_tunnel_state cleanup_complete=0
+  local cleanup_restored=NOT_APPLICABLE formal_m2_acceptance m2_slo_evidence
+  status="$(sed -n '1p' "$run_dir/m2.status" 2>/dev/null || true)"
+  status="${status:-not_run}"
+  active_windows="$(grep -Ec $'\tm2 active .* complete planned_secs=' \
+    "$run_dir/events.tsv" 2>/dev/null || true)"
+  cycles="$(grep -Fc $'\tm2 cycle complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  dns="$(grep -Fc $'\tm2 DNS complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  idle="$(grep -Fc $'\tm2 idle complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  resume="$(grep -Fc $'\tm2 resume complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  final_drain="$(grep -Fc $'\tm2 final drain complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  phase_failures="$(grep -Fc $'\tm2 phase failed ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  health_failures="$(grep -Fc $'\tm2 health failed:' "$run_dir/events.tsv" 2>/dev/null || true)"
+  real_failures="$(grep -Fc $'\tm2 real client failed ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  phase_results="$(grep -Fc $'\tm2 phase complete ' "$run_dir/events.tsv" 2>/dev/null || true)"
+  read -r tcp_results udp_results tcp_gap udp_loss invalid_results \
+    sender_zero receiver_zero <<<"$(m0_result_envelope "$run_dir/m2")"
+  read -r dns_files invalid_dns <<<"$(m0_dns_result_envelope "$run_dir/m2")"
+  read -r real_results invalid_real \
+    <<<"$(m2_real_client_envelope "$run_dir/m2-real-client")"
+  read -r checkpoint_count checkpoint_labels checkpoint_first_rss \
+    checkpoint_final_rss checkpoint_max_rss checkpoint_rss_delta \
+    checkpoint_first_fd checkpoint_final_fd checkpoint_max_fd checkpoint_fd_delta \
+    checkpoint_first_threads checkpoint_final_threads checkpoint_max_threads \
+    checkpoint_threads_delta checkpoint_ownership_failures \
+    <<<"$(m2_checkpoint_envelope "$run_dir/m2-checkpoints.csv")"
+  if m2_pre_stop_verdict_is_valid "$run_dir/m2-pre-stop-verdict.txt"; then
+    pre_stop=PASS
+  elif [[ "$status" != "not_run" ]]; then
+    pre_stop=MISMATCH
+  fi
+  m2_slo_evidence="$pre_stop"
+  full_tunnel_state="$(read_state m2.full_tunnel 2>/dev/null || true)"
+  full_tunnel_state="${full_tunnel_state:-not_run}"
+  cleanup_complete="$(grep -Fc $'\tstop cleanup complete' \
+    "$run_dir/events.tsv" 2>/dev/null || true)"
+  if [[ "$full_tunnel_state" == "inactive" ]]; then
+    if m2_full_tunnel_is_restored; then
+      cleanup_restored=PASS
+    else
+      cleanup_restored=MISMATCH
+    fi
+  fi
+  formal_m2_acceptance="$(m2_formal_acceptance_from_values "$status" \
+    "$pre_stop" "$full_tunnel_state" "$cleanup_complete" "$cleanup_restored")"
+  cat >>"$run_dir/summary.md" <<EOF_M2_SUMMARY
+
+## Knife15 M2
+
+- m2_status: $status
+- m2_active_windows_completed: ${active_windows:-0}
+- m2_cycles_completed: ${cycles:-0}
+- m2_dns_completed: ${dns:-0}
+- m2_real_client_results: ${real_results:-0}
+- m2_invalid_real_client_results: ${invalid_real:-0}
+- m2_idle_complete: ${idle:-0}
+- m2_resume_complete: ${resume:-0}
+- m2_final_drain_complete: ${final_drain:-0}
+- m2_phase_failures: ${phase_failures:-0}
+- m2_health_failures: ${health_failures:-0}
+- m2_real_client_failures: ${real_failures:-0}
+- m2_phase_results_completed: ${phase_results:-0}
+- m2_tcp_results: ${tcp_results:-0}
+- m2_udp_results: ${udp_results:-0}
+- m2_tcp_max_sender_receiver_gap_bytes: ${tcp_gap:-unknown}
+- m2_udp_max_loss_percent: ${udp_loss:-unknown}
+- m2_invalid_result_files: ${invalid_results:-0}
+- m2_sender_zero_intervals: ${sender_zero:-0}
+- m2_receiver_zero_intervals: ${receiver_zero:-0}
+- m2_dns_result_files: ${dns_files:-0}
+- m2_invalid_dns_results: ${invalid_dns:-0}
+- m2_checkpoint_count_labels_valid: ${checkpoint_count:-0}/${checkpoint_labels:-0}
+- m2_checkpoint_rss_first_final_max_delta: ${checkpoint_first_rss:-unknown}/${checkpoint_final_rss:-unknown}/${checkpoint_max_rss:-unknown}/${checkpoint_rss_delta:-unknown}
+- m2_checkpoint_fd_first_final_max_delta: ${checkpoint_first_fd:-unknown}/${checkpoint_final_fd:-unknown}/${checkpoint_max_fd:-unknown}/${checkpoint_fd_delta:-unknown}
+- m2_checkpoint_threads_first_final_max_delta: ${checkpoint_first_threads:-unknown}/${checkpoint_final_threads:-unknown}/${checkpoint_max_threads:-unknown}/${checkpoint_threads_delta:-unknown}
+- m2_checkpoint_ownership_failures: ${checkpoint_ownership_failures:-0}
+- m2_slo_evidence: $m2_slo_evidence
+- m2_full_tunnel_state: $full_tunnel_state
+- m2_cleanup_restored: $cleanup_restored
+- formal_m2_acceptance: $formal_m2_acceptance
+EOF_M2_SUMMARY
 }
 
 write_summary() {
@@ -5642,6 +7590,7 @@ This summary is a discriminator, not a release verdict. Review direct/control
 baselines, resource slopes, fault-window event markers, QUIC deltas, TUN
 counters, close-tail ownership, and cleanup together.
 EOF_SUMMARY
+  append_m2_summary "$run_dir"
 }
 
 bundle_is_finalized() {
@@ -5668,7 +7617,12 @@ owned_routes_are_restored() {
   [[ -n "$utun" && -n "$target" && -n "$exit_host" ]] || return 1
   [[ "$(route_interface "$target")" != "$utun" ]] || return 1
   [[ "$(route_interface "$exit_host")" != "$utun" ]] || return 1
-  [[ -z "$dns_target" || "$(route_interface "$dns_target")" != "$utun" ]]
+  [[ -z "$dns_target" || "$(route_interface "$dns_target")" != "$utun" ]] || \
+    return 1
+  if [[ -n "$(read_state m2.full_tunnel 2>/dev/null || true)" ]]; then
+    [[ "$(read_state m2.full_tunnel 2>/dev/null || true)" == "inactive" ]] && \
+      m2_full_tunnel_is_restored
+  fi
 }
 
 owned_tun_is_unavailable() {
@@ -5799,8 +7753,9 @@ stop_runner() {
   terminate_recorded_workload "$run_dir" || \
     die "soak workload identity/termination check failed; refusing process and route cleanup"
   terminate_recorded_pid "$run_dir"
-  cleanup_owned_routes "$run_dir"
   terminate_recorded_watchdog "$run_dir"
+  cleanup_owned_routes "$run_dir" || \
+    die "owned route or DNS cleanup failed; inspect status/snapshot before retrying stop"
   active_pid && die "mini_vpn still matches the recorded process after cleanup"
   owned_tun_is_unavailable || \
     die "the owned utun is still available after the mini_vpn process stopped"
@@ -5855,6 +7810,9 @@ case "$ACTION" in
     ;;
   m1-diagnostic)
     run_m1_action diagnostic
+    ;;
+  m2)
+    run_m2_action
     ;;
   stop)
     stop_runner

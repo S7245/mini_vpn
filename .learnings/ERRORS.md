@@ -1,5 +1,35 @@
 # Errors
 
+## 2026-07-30 - M2 review found three default-value-hidden evidence failures
+
+- The first real-client naming path used `M0_CYCLE_INDEX`. Because every
+  formal active window can end with a partial cycle, attempt numbers skip
+  between windows and the otherwise healthy 93-file replay would fail.
+- The live IPv6 check treated every nonzero `route` exit as empty/no-route.
+  An invalid invocation or unexpected command failure could therefore pass the
+  leak boundary.
+- `direct-discriminator` selected `M2_BASELINE_DIR` but its fallback branch
+  validated `M0_TCP_SECS`. Both default to 300, so only a negative M2 override
+  exposed the provenance error.
+- Correct behavior: use a separate completed-cycle identity, accept only the
+  known macOS `not in table` absence outcome, and bind each selected stage to
+  its own frozen epoch. Defaults matching are not proof that branches are
+  correctly wired.
+
+## 2026-07-30 - M2 shell TDD exposed portability and state-fixture traps
+
+- Bash conditional brace grouping and BSD awk's built-in `index` name broke
+  early local fixtures. A later activation fixture verified active state while
+  the transaction was still marked `preparing`, and an M2 stage global leaked
+  into an M0 fixture.
+- The initial checkpoint contract also required
+  `fake_ip_registered=0`, which contradicted the frozen `1,800s` cache TTL and
+  `600s` drains.
+- Correct behavior: use Bash-3.2-compatible parentheses, avoid awk built-in
+  names, verify only after committing transactional state, restore every
+  shared fixture global, and derive leak predicates from actual ownership
+  lifetimes before writing the test.
+
 ## 2026-07-30 - Snapshot and lifetime-counter greps rejected a complete M1
 
 - Exact source `ee1a423` logged all five active windows, 30 cycles, 332

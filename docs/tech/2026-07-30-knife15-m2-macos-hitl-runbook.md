@@ -1,0 +1,184 @@
+# Knife15 M2 macOS HITL Runbook
+
+Date: 2026-07-30
+
+Status: **READY AFTER THE M2 IMPLEMENTATION COMMIT IS PUSHED**
+
+This is the only reviewed M2 sequence. It runs a controlled IPv4 full tunnel
+for 24 hours and temporarily changes the active physical network service DNS.
+`stop` is mandatory even after a successful `m2`.
+
+## Before Opening The Test Terminal
+
+1. Use the HK Mac and its normal physical network.
+2. Quit Clash completely and disable Clash-TUN.
+3. Disable every other VPN, proxy app, and manually created TUN.
+4. Prevent sleep and power loss; keep the Exit and Target VPSs powered.
+5. Do not browse, change Wi-Fi/Ethernet, alter DNS, or start another VPN until
+   Knife15 `stop` finishes.
+
+Slow HK bandwidth is not itself a bug. The baseline derives offered rates, and
+M2 judges continuity, UDP loss, lifecycle, resources, routes, and cleanup.
+
+## 1. Fresh Terminal, Source, And Environment
+
+Run:
+
+```bash
+cd /Users/liushan/Documents/Personal/Languages/Rust/mini_vpn
+
+git fetch origin
+git switch codex/knife14d-downlink-reap-open
+git pull --ff-only origin codex/knife14d-downlink-reap-open
+git status --short
+git rev-parse HEAD
+
+unset M0_BASELINE_DIR M0_DIRECT_DIR
+unset M1_BASELINE_DIR M1_DIRECT_DIR
+unset M2_BASELINE_DIR M2_DIRECT_DIR
+unset BASELINE_OUT_DIR DIRECT_OUT_DIR OUT_DIR
+
+export TARGET=43.130.32.77
+export DNS_TARGET=8.8.8.8
+export DNS_NAME=example.com
+export IPERF_PORT=5201
+export DURATION=20
+export PARALLEL=1
+export METRICS_SECS=30
+export SAMPLE_SECS=30
+
+export MINI_VPN_TUIC_SERVER='43.153.32.33:8443'
+export MINI_VPN_TUIC_UUID='REPLACE_WITH_UUID'
+export MINI_VPN_TUIC_PASSWORD='REPLACE_WITH_PASSWORD'
+export MINI_VPN_TUIC_SNI='example.com'
+export MINI_VPN_TUIC_CA_PATH='certs/dev/ca-cert.pem'
+```
+
+`git status --short` must print nothing. Replace only the UUID/password
+placeholders; do not send those values or paste them into a bundle.
+
+## 2. Build And Offline Gates
+
+```bash
+cargo build --release
+bash scripts/knife15-macos-soak.sh --self-test
+bash scripts/knife15-macos-soak.sh preflight
+```
+
+The self-test intentionally prints one
+`ERROR: command exceeded hard timeout of 1s` line. It passes only if it later
+prints:
+
+```text
+knife15 macOS runner self-test passed
+```
+
+`preflight` must end in PASS and changes no route or DNS state.
+
+## 3. Fresh Baseline
+
+```bash
+bash scripts/knife15-macos-soak.sh baseline
+```
+
+This normally takes about 40–90 seconds. Copy the directory from:
+
+```text
+PASS: direct baseline complete: /tmp/mini_vpn_knife15_macos_baseline_...
+```
+
+Then export it, for example:
+
+```bash
+export M2_BASELINE_DIR='/tmp/mini_vpn_knife15_macos_baseline_REPLACE_WITH_ACTUAL_TIMESTAMP'
+```
+
+If baseline fails, stop here. No TUN was started; send the baseline directory.
+Low throughput alone is acceptable, but receiver discontinuity is not.
+
+## 4. Fresh 300-Second Direct Discriminator
+
+```bash
+bash scripts/knife15-macos-soak.sh direct-discriminator
+```
+
+It takes a little over five minutes. It must print:
+
+```text
+PASS: 300s direct Target receiver continuity discriminator completed
+```
+
+Export its `direct_dir`, for example:
+
+```bash
+export M2_DIRECT_DIR='/tmp/mini_vpn_knife15_macos_direct_REPLACE_WITH_ACTUAL_TIMESTAMP'
+```
+
+Continue immediately. M2 must consume this evidence within 15 minutes.
+
+## 5. Start, Smoke, And M2
+
+```bash
+sudo -v
+sudo -E bash scripts/knife15-macos-soak.sh start
+sudo -E bash scripts/knife15-macos-soak.sh smoke
+caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2
+```
+
+Do not press `Ctrl+C`, close the terminal, start Clash, or change the network.
+The `m2` command has exactly 24 hours of planned traffic/drain time plus DNS,
+HTTPS, health, and transition overhead. Reserve about 25 hours.
+
+During M2, the Mac's public IPv4 should be the Exit VPS. That is expected.
+The runner blocks a routable physical IPv6 path instead of claiming a
+dual-stack leak-free result.
+
+If `m2` returns PASS, it will say cleanup acceptance is pending. That is not
+the final acceptance; continue to the next section.
+
+## 6. Mandatory Status And Stop
+
+After `m2` returns, successful or failed:
+
+```bash
+sudo -E bash scripts/knife15-macos-soak.sh status
+sudo -E bash scripts/knife15-macos-soak.sh stop
+```
+
+`stop` restores DNS/routes, stops the owned TUN, writes final acceptance, scans
+secrets, creates one immutable bundle, and prints its SHA-256.
+
+Send both lines:
+
+```text
+<sha256>  /tmp/mini_vpn_knife15_macos_....tar.gz
+bundle=/tmp/mini_vpn_knife15_macos_....tar.gz
+```
+
+Also synchronize the bundle to the analysis Mac as before.
+
+## Failure Procedure
+
+If `start`, `smoke`, or `m2` fails, do not retry and do not tune any value.
+Run:
+
+```bash
+sudo -E bash scripts/knife15-macos-soak.sh status || true
+sudo -E bash scripts/knife15-macos-soak.sh snapshot || true
+sudo -E bash scripts/knife15-macos-soak.sh stop
+```
+
+If `stop` itself reports an owned route/DNS cleanup mismatch, do not start
+Clash or another VPN. Preserve the terminal output and run `status` again so
+the ownership conflict can be reviewed safely.
+
+## Expected Total Time
+
+```text
+build/self-test/preflight   about 1–3 minutes
+baseline                    about 40–90 seconds
+direct discriminator        a little over 5 minutes
+start + smoke               about 1–2 minutes
+M2                          about 25 wall-clock hours
+status + stop + bundle      about 1–3 minutes
+```
