@@ -1,5 +1,24 @@
 # Errors
 
+## 2026-08-01 - The M2 runbook warned about IPv6 but did not operationalize it
+
+- Exact source `753691a` passed target-only start/smoke, then M2 rejected the
+  physical IPv6 path before creating any M2 evidence. The rejection was
+  correct, but the runbook placed no inspect/disable/restore procedure before
+  baseline and direct evidence.
+- The first bundle lacked terminal stderr and could prove only `m2=not_run`.
+  A fresh immediate reproduction preserved the decisive IPv6 error and avoided
+  misclassifying the clean smoke `Stopped(0)` close as causal.
+- Correct behavior: derive the service from the Exit interface, accept only a
+  known `Automatic` starting mode for the documented temporary change, verify
+  no physical global IPv6 route before baseline, restore immediately on a
+  pre-start failure, or restore only after `stop` once start was invoked.
+  Never bypass the leak gate to make M2 start.
+- A local review loop used `path` as its zsh iteration variable. `path` is tied
+  to `PATH`, so the next `git` lookup failed even though the preceding checks
+  passed. Use a neutral name such as `file_path` in zsh harness loops and rerun
+  the interrupted gate from the beginning.
+
 ## 2026-07-30 - M2 review found three default-value-hidden evidence failures
 
 - The first real-client naming path used `M0_CYCLE_INDEX`. Because every

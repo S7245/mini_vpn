@@ -187,7 +187,31 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-07-30:
+Current Knife15 summary, as of 2026-08-01:
+
+- Exact-source `753691a` HK bundle
+  `/tmp/mini_vpn_knife15_macos_20260801_041142.tar.gz` (SHA-256
+  `93d384a...`) passed target-only start/smoke, then formal M2 correctly
+  rejected a routable physical IPv6 path before any M2-owned route or DNS
+  mutation. M2 status/full-tunnel/acceptance remained
+  `not_run/not_run/NOT_RUN`; this is not a smoke or data-plane failure.
+- Smoke forward/reverse receivers were `63.428/49.695 Mbit/s`, pool ownership
+  drained, Endpoint conservation ended `61,414/0/0B`, and controls/cleanup
+  passed. The one `Stopped(0)` close had zero D16 queued, leased, and reserved
+  ownership.
+- Current M2 is deliberately IPv4-only. Keep the physical IPv6 gate
+  fail-closed. The updated HITL runbook derives the exact physical network
+  service, records an original `Automatic` mode, temporarily disables IPv6
+  before fresh baseline/direct evidence, and gives identity-bound pre-start
+  and post-stop restoration branches. Do not reuse rejected evidence or
+  expand this stage into IPv6 tunnelling.
+  Result:
+  `docs/tech/2026-08-01-knife15-hk-m2-ipv6-precondition-results.md`.
+- Next take one fresh uninterrupted HK
+  `baseline -> direct-discriminator -> start -> smoke -> m2 -> status -> stop`
+  only after the runbook's IPv6 route proof passes. Restore immediately on a
+  pre-start failure; after `start`, restore only after stop. M3 remains
+  blocked pending real M2 acceptance.
 
 - Knife15 M2 local implementation is complete at `4dac87c`. The reviewed
   public `m2` action owns a controlled IPv4 full tunnel/system DNS for an exact

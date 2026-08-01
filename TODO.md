@@ -1,10 +1,40 @@
 # TODO
 
-## Current Knife15 Plan (2026-07-30)
+## Current Knife15 Plan (2026-08-01)
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-07-30 — M2 local)
+#### Latest decision (2026-08-01 — M2 IPv6 precondition)
+
+Exact-source `753691a` HK bundle
+`/tmp/mini_vpn_knife15_macos_20260801_041142.tar.gz` (SHA-256
+`93d384a...`) passed target-only start and smoke, then formal M2 correctly
+blocked a routable physical IPv6 path before any M2 route/DNS mutation.
+`m2_status=not_run`, `m2_full_tunnel_state=not_run`, and
+`formal_m2_acceptance=NOT_RUN` are the expected fail-closed result.
+
+Smoke forward/reverse receivers were `63.428/49.695 Mbit/s`; TCP-pool
+ownership drained, Endpoint conservation ended `61,414/0/0B`, and cleanup
+passed. This is not operator, smoke, pacing, D16, QUIC, pool, MTU, or
+throughput failure. It selects the frozen IPv6 leak boundary of the controlled
+IPv4-only M2 architecture.
+
+The runbook now requires, before baseline:
+
+1. derive the physical Exit interface and its exact enabled network service;
+2. verify and record original `IPv6: Automatic` state;
+3. temporarily change only that service to `IPv6: Off`;
+4. prove the global IPv6 discriminator has no physical route;
+5. take a fresh uninterrupted baseline/direct/start/smoke/M2 transaction;
+6. restore immediately on a pre-start failure; once `start` is invoked, run
+   `status/snapshot/stop` first and restore IPv6 only after `stop`.
+
+Result:
+`docs/tech/2026-08-01-knife15-hk-m2-ipv6-precondition-results.md`.
+Do not reuse the rejected evidence, relax IPv6 safety, tune frozen values, or
+open M3. The next action remains one real formal HK M2 bundle.
+
+#### Previous decision (2026-07-30 — M2 local)
 
 Knife15 M2 local implementation is accepted at `4dac87c`. One public `m2`
 action now owns a controlled IPv4 full tunnel, the active physical service

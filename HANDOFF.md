@@ -2,7 +2,33 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 M2 Release Readiness (2026-07-30)
+## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-01)
+
+- **Latest accepted position:** exact-source `753691a` HK bundle
+  `/tmp/mini_vpn_knife15_macos_20260801_041142.tar.gz` (SHA-256
+  `93d384a...`) passed target-only start/smoke, then formal M2 correctly
+  failed closed before any M2 route/DNS mutation because a routable physical
+  IPv6 path existed. M2 status/full-tunnel/acceptance remained
+  `not_run/not_run/NOT_RUN`; this is not a smoke or data-plane failure.
+- Smoke forward/reverse receivers were `63.428/49.695 Mbit/s`; pool ownership
+  drained, Endpoint conservation ended `61,414/0/0B`, controls and cleanup
+  passed, and the one `Stopped(0)` boundary had zero D16 ownership. The
+  operator's `status/snapshot/stop` response was correct.
+- This selects the frozen IPv6 leak boundary: current mini_vpn M2 is IPv4-only
+  and must not claim full-tunnel acceptance while physical IPv6 can bypass it.
+  Do not relax the gate or open an IPv6-tunnelling implementation branch in
+  this stage.
+- The HITL runbook now derives the exact service owning the physical Exit
+  interface, permits only a recorded `Automatic -> Off` temporary change,
+  verifies the global IPv6 route is absent before baseline, and restores the
+  same service immediately after a pre-start failure or only after `stop` once
+  start was invoked. Result:
+  `docs/tech/2026-08-01-knife15-hk-m2-ipv6-precondition-results.md`.
+- Next take one fresh uninterrupted HK baseline/direct/start/smoke/M2 run
+  after the runbook's IPv6 precondition passes. Never reuse the rejected
+  baseline/direct evidence. Restore IPv6 immediately on a pre-start failure;
+  once `start` is invoked, restore only after `stop`. M3 remains blocked
+  pending formal M2 acceptance.
 
 - **Latest accepted position:** Knife15 M2 local implementation, gates, and
   review are complete at `4dac87c`. The public `m2` action owns a controlled

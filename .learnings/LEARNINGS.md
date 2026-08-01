@@ -1,5 +1,25 @@
 # Learnings
 
+## 2026-08-01 - Leak prerequisites belong before expiring evidence
+
+- Formal M2 correctly blocked a routable physical IPv6 path after start/smoke,
+  but the operator had already paid for baseline, a 300-second direct probe,
+  and TUN setup. The runbook described the gate without an actionable way to
+  satisfy and later undo it.
+- A physical-network mutation can invalidate earlier path evidence. Identify
+  the service from the actual Exit route, record its original IPv6 mode,
+  disable it, prove the route boundary, and only then create baseline/direct
+  artifacts.
+- Restoration is part of the test transaction. A pre-start failure restores
+  immediately because no owned TUN exists; after `start`, restoration must
+  wait for route/DNS cleanup on both success and failure and never occur while
+  M2 is active.
+- Reusable rule: document safety prerequisites at the earliest cheap boundary,
+  before freshness-limited or expensive work, and pair every manual mutation
+  with an identity-bound restoration step.
+- Result:
+  `docs/tech/2026-08-01-knife15-hk-m2-ipv6-precondition-results.md`.
+
 ## 2026-07-30 - Long-run evidence needs identities for completed work, not attempted work
 
 - M2 active windows intentionally end with partial cycles. Reusing the phase

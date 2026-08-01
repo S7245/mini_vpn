@@ -16,6 +16,10 @@ for 24 hours and temporarily changes the active physical network service DNS.
 4. Prevent sleep and power loss; keep the Exit and Target VPSs powered.
 5. Do not browse, change Wi-Fi/Ethernet, alter DNS, or start another VPN until
    Knife15 `stop` finishes.
+6. M2 is an IPv4-only gate. The dedicated physical network service must have
+   IPv6 temporarily disabled before baseline. Restore immediately after a
+   pre-start failure; once `start` is invoked, restore only after `stop`, using
+   the exact procedure below.
 
 Slow HK bandwidth is not itself a bug. The baseline derives offered rates, and
 M2 judges continuity, UDP loss, lifecycle, resources, routes, and cleanup.
@@ -59,7 +63,89 @@ export MINI_VPN_TUIC_CA_PATH='certs/dev/ca-cert.pem'
 Replace only the UUID/password placeholders; do not send those values or paste
 them into a bundle.
 
-## 2. Build And Offline Gates
+## 2. Identify And Temporarily Disable Physical IPv6
+
+M2 must not run while global IPv6 can bypass the IPv4 TUN. First derive the
+physical interface used by the TUIC Exit and the one enabled macOS network
+service that owns it:
+
+```bash
+export M2_IPV6_PROBE='2606:4700:4700::1111'
+export M2_PHYSICAL_IF="$(route -n get 43.153.32.33 | awk '/interface:/ {print $2; exit}')"
+export M2_NETWORK_SERVICE="$({ networksetup -listnetworkserviceorder || true; } | awk -v interface="$M2_PHYSICAL_IF" '
+  /^\([0-9]+\) / {
+    service = $0
+    sub(/^\([0-9]+\) /, "", service)
+    disabled = 0
+    next
+  }
+  /^\(\*\) / {
+    service = ""
+    disabled = 1
+    next
+  }
+  $0 ~ /Device: [^)]+\)$/ {
+    device = $0
+    sub(/^.*Device: /, "", device)
+    sub(/\)$/, "", device)
+    if (!disabled && service != "" && device == interface) {
+      matches++
+      selected = service
+    }
+  }
+  END {
+    if (matches != 1) exit 1
+    print selected
+  }
+')"
+
+printf 'M2 physical interface: %s\nM2 network service: %s\n' \
+  "$M2_PHYSICAL_IF" "$M2_NETWORK_SERVICE"
+route -n get -inet6 "$M2_IPV6_PROBE" 2>&1 || true
+networksetup -getinfo "$M2_NETWORK_SERVICE" | grep '^IPv6'
+export M2_IPV6_MODE_BEFORE="$(networksetup -getinfo "$M2_NETWORK_SERVICE" | \
+  awk -F': ' '$1 == "IPv6" {print $2; exit}')"
+```
+
+Both derived values must be nonempty. On the current HK lane the physical
+interface is expected to be `en0`, but do not hard-code a service name such as
+`Wi-Fi`: use the printed service that owns the actual Exit route.
+
+The `networksetup` output must report `IPv6: Automatic`. If it reports Manual,
+Link-local, Off, is missing, or the service derivation is empty/ambiguous, stop
+and preserve the output; do not guess how to restore it.
+
+Record the original mode and disable IPv6 for only that service:
+
+```bash
+if [ -z "$M2_PHYSICAL_IF" ] || [ -z "$M2_NETWORK_SERVICE" ] || \
+  [ "$M2_IPV6_MODE_BEFORE" != 'Automatic' ]; then
+  echo 'ERROR: exact physical service and original IPv6 Automatic mode are required' >&2
+else
+  export M2_IPV6_RECORD="/tmp/mini_vpn_knife15_m2_ipv6_before_$(date -u '+%Y%m%d_%H%M%S').txt"
+  printf 'service=%s\ninterface=%s\nmode=%s\n' \
+    "$M2_NETWORK_SERVICE" "$M2_PHYSICAL_IF" "$M2_IPV6_MODE_BEFORE" | \
+    tee "$M2_IPV6_RECORD"
+  chmod 600 "$M2_IPV6_RECORD"
+
+  sudo networksetup -setv6off "$M2_NETWORK_SERVICE"
+  sleep 5
+  networksetup -getinfo "$M2_NETWORK_SERVICE" | grep '^IPv6'
+  route -n get -inet6 "$M2_IPV6_PROBE" 2>&1 || true
+fi
+```
+
+The service must now report `IPv6: Off`. The route lookup must either report
+the known `not in table` absence or use only `lo0`/an existing `utun`; it must
+not name `en0`, `en1`, or another physical interface. If this proof fails,
+restore IPv6 immediately with the pre-start branch in section 8 and do not
+take a baseline.
+
+Keep `M2_NETWORK_SERVICE`, `M2_IPV6_MODE_BEFORE`, and `M2_IPV6_RECORD` exported
+in this terminal. Disabling IPv6 may briefly reset the physical link, so all
+baseline/direct evidence must be collected after this step.
+
+## 3. Build And Offline Gates
 
 ```bash
 cargo build --release
@@ -76,8 +162,10 @@ knife15 macOS runner self-test passed
 ```
 
 `preflight` must end in PASS and changes no route or DNS state.
+If build, self-test, or preflight fails, no Knife15 TUN exists; preserve the
+output and immediately use the pre-start restoration branch in section 8.
 
-## 3. Fresh Baseline
+## 4. Fresh Baseline
 
 ```bash
 bash scripts/knife15-macos-soak.sh baseline
@@ -96,9 +184,10 @@ export M2_BASELINE_DIR='/tmp/mini_vpn_knife15_macos_baseline_REPLACE_WITH_ACTUAL
 ```
 
 If baseline fails, stop here. No TUN was started; send the baseline directory.
-Low throughput alone is acceptable, but receiver discontinuity is not.
+Restore IPv6 using the pre-start branch in section 8. Low throughput alone is
+acceptable, but receiver discontinuity is not.
 
-## 4. Fresh 300-Second Direct Discriminator
+## 5. Fresh 300-Second Direct Discriminator
 
 ```bash
 bash scripts/knife15-macos-soak.sh direct-discriminator
@@ -117,8 +206,10 @@ export M2_DIRECT_DIR='/tmp/mini_vpn_knife15_macos_direct_REPLACE_WITH_ACTUAL_TIM
 ```
 
 Continue immediately. M2 must consume this evidence within 15 minutes.
+If the direct discriminator fails, no TUN was started; preserve its directory
+and restore IPv6 using the pre-start branch in section 8.
 
-## 5. Start, Smoke, And M2
+## 6. Start, Smoke, And M2
 
 ```bash
 sudo -v
@@ -138,7 +229,7 @@ dual-stack leak-free result.
 If `m2` returns PASS, it will say cleanup acceptance is pending. That is not
 the final acceptance; continue to the next section.
 
-## 6. Mandatory Status And Stop
+## 7. Mandatory Status And Stop
 
 After `m2` returns, successful or failed:
 
@@ -159,6 +250,35 @@ bundle=/tmp/mini_vpn_knife15_macos_....tar.gz
 
 Also synchronize the bundle to the analysis Mac as before.
 
+## 8. Restore The Physical Service IPv6
+
+Restore the exact service whose original mode was recorded as `Automatic`.
+
+If failure occurs before invoking `start`, there is no Knife15 TUN or owned
+route/DNS state. Restore immediately after preserving the failure output. If
+`start` was invoked, first complete the documented
+`status -> snapshot -> stop` path; restore only after `stop` has cleaned the
+run and printed its immutable bundle path and checksum.
+
+For either branch, run:
+
+```bash
+if [ -z "$M2_NETWORK_SERVICE" ] || \
+  [ "$M2_IPV6_MODE_BEFORE" != 'Automatic' ]; then
+  echo 'ERROR: refusing ambiguous IPv6 restoration; inspect M2_IPV6_RECORD' >&2
+else
+  sudo networksetup -setv6automatic "$M2_NETWORK_SERVICE"
+  sleep 5
+  networksetup -getinfo "$M2_NETWORK_SERVICE" | grep '^IPv6'
+fi
+```
+
+The service must report `IPv6: Automatic`. This restoration is required after
+success and every failure. Once `start` has been invoked, it must never occur
+while the Knife15 TUN or M2 full-tunnel ownership is active. If the original
+terminal was lost, use the protected `M2_IPV6_RECORD` file to identify the
+service and mode; do not source or `eval` that file.
+
 ## Failure Procedure
 
 If `start`, `smoke`, or `m2` fails, do not retry and do not tune any value.
@@ -170,6 +290,10 @@ sudo -E bash scripts/knife15-macos-soak.sh snapshot || true
 sudo -E bash scripts/knife15-macos-soak.sh stop
 ```
 
+After `stop` completes, restore IPv6 using section 8. Do not restore it before
+`stop`, because a physical IPv6 route appearing during M2 is itself a safety
+failure.
+
 If `stop` itself reports an owned route/DNS cleanup mismatch, do not start
 Clash or another VPN. Preserve the terminal output and run `status` again so
 the ownership conflict can be reviewed safely.
@@ -177,10 +301,12 @@ the ownership conflict can be reviewed safely.
 ## Expected Total Time
 
 ```text
+IPv6 inspect/disable        about 1 minute
 build/self-test/preflight   about 1–3 minutes
 baseline                    about 40–90 seconds
 direct discriminator        a little over 5 minutes
 start + smoke               about 1–2 minutes
 M2                          about 25 wall-clock hours
 status + stop + bundle      about 1–3 minutes
+IPv6 restoration           about 1 minute
 ```
