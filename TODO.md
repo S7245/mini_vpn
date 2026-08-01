@@ -4,20 +4,63 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-01 — M2 IPv6 precondition)
+#### Latest decision (2026-08-01 — M2 IPv6 route observer repair)
+
+Exact-source `19b5ceb` HK bundle
+`/tmp/mini_vpn_knife15_macos_20260801_044032.tar.gz` (SHA-256
+`651f977b...`) followed the documented physical-service IPv6 disable flow and
+passed start/smoke, but M2 again stopped before evidence creation. The bundle
+could not distinguish a physical route from an unknown route-command outcome.
+
+The exact formal probe reproduced locally as:
+
+```text
+route_status=0
+route: writing to routing socket: not in table
+old classification=unknown
+```
+
+The old observer recognized `not in table` only when status was nonzero. The
+repair uses one four-state classifier for a new public `m2-ipv6-check`, formal
+M2, health, and real-client paths. The exact absence line with no interface is
+`safe_absent` regardless of status; only `lo0`/`utun*` is `safe_tunnel`;
+physical interfaces and unknown combinations remain rejected. Formal M2 saves
+raw status/text/class/interface before continuing or rejecting and publishes
+the decisive fields in status/summary. The runbook uses the exact formal probe.
+
+Result:
+`docs/tech/2026-08-01-knife15-m2-ipv6-route-status-observability-local-results.md`.
+
+Next:
+
+1. pull the pushed repair on the HK Mac;
+2. disable IPv6 for the exact physical service using the runbook;
+3. run only `bash scripts/knife15-macos-soak.sh m2-ipv6-check`;
+4. restore immediately and send its structured output if it fails;
+5. only after PASS, take one fresh uninterrupted
+   `baseline -> direct -> start -> smoke -> m2 -> status -> stop`.
+
+Do not spend another baseline/direct/TUN cycle before the cheap check passes.
+No data-plane constant, SLO, route scope, or IPv6 non-goal changed. M3 remains
+blocked.
+
+#### Previous decision (2026-08-01 — M2 IPv6 precondition)
 
 Exact-source `753691a` HK bundle
 `/tmp/mini_vpn_knife15_macos_20260801_041142.tar.gz` (SHA-256
-`93d384a...`) passed target-only start and smoke, then formal M2 correctly
-blocked a routable physical IPv6 path before any M2 route/DNS mutation.
-`m2_status=not_run`, `m2_full_tunnel_state=not_run`, and
-`formal_m2_acceptance=NOT_RUN` are the expected fail-closed result.
+`93d384a...`) passed target-only start and smoke, then formal M2 reported its
+physical-IPv6 error before any M2 route/DNS mutation. The bundle saved neither
+the raw route output nor its status, so it did not prove that a routable
+physical path existed. `m2_status=not_run`, `m2_full_tunnel_state=not_run`,
+and `formal_m2_acceptance=NOT_RUN` describe the fail-closed stop.
 
 Smoke forward/reverse receivers were `63.428/49.695 Mbit/s`; TCP-pool
 ownership drained, Endpoint conservation ended `61,414/0/0B`, and cleanup
 passed. This is not operator, smoke, pacing, D16, QUIC, pool, MTU, or
-throughput failure. It selects the frozen IPv6 leak boundary of the controlled
-IPv4-only M2 architecture.
+throughput failure. The later exact-probe reproduction selected an observer
+false negative and supersedes this bundle's earlier physical-route inference;
+the frozen IPv6 leak boundary of the controlled IPv4-only M2 architecture is
+unchanged.
 
 The runbook now requires, before baseline:
 
@@ -32,7 +75,8 @@ The runbook now requires, before baseline:
 Result:
 `docs/tech/2026-08-01-knife15-hk-m2-ipv6-precondition-results.md`.
 Do not reuse the rejected evidence, relax IPv6 safety, tune frozen values, or
-open M3. The next action remains one real formal HK M2 bundle.
+open M3. This next action was superseded by the repaired public
+`m2-ipv6-check`, which must pass before a real formal HK M2 bundle.
 
 #### Previous decision (2026-07-30 — M2 local)
 

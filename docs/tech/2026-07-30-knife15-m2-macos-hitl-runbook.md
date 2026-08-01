@@ -70,7 +70,6 @@ physical interface used by the TUIC Exit and the one enabled macOS network
 service that owns it:
 
 ```bash
-export M2_IPV6_PROBE='2606:4700:4700::1111'
 export M2_PHYSICAL_IF="$(route -n get 43.153.32.33 | awk '/interface:/ {print $2; exit}')"
 export M2_NETWORK_SERVICE="$({ networksetup -listnetworkserviceorder || true; } | awk -v interface="$M2_PHYSICAL_IF" '
   /^\([0-9]+\) / {
@@ -101,7 +100,7 @@ export M2_NETWORK_SERVICE="$({ networksetup -listnetworkserviceorder || true; } 
 
 printf 'M2 physical interface: %s\nM2 network service: %s\n' \
   "$M2_PHYSICAL_IF" "$M2_NETWORK_SERVICE"
-route -n get -inet6 "$M2_IPV6_PROBE" 2>&1 || true
+bash scripts/knife15-macos-soak.sh m2-ipv6-check || true
 networksetup -getinfo "$M2_NETWORK_SERVICE" | grep '^IPv6'
 export M2_IPV6_MODE_BEFORE="$(networksetup -getinfo "$M2_NETWORK_SERVICE" | \
   awk -F': ' '$1 == "IPv6" {print $2; exit}')"
@@ -131,15 +130,18 @@ else
   sudo networksetup -setv6off "$M2_NETWORK_SERVICE"
   sleep 5
   networksetup -getinfo "$M2_NETWORK_SERVICE" | grep '^IPv6'
-  route -n get -inet6 "$M2_IPV6_PROBE" 2>&1 || true
+  bash scripts/knife15-macos-soak.sh m2-ipv6-check
 fi
 ```
 
-The service must now report `IPv6: Off`. The route lookup must either report
-the known `not in table` absence or use only `lo0`/an existing `utun`; it must
-not name `en0`, `en1`, or another physical interface. If this proof fails,
-restore IPv6 immediately with the pre-start branch in section 8 and do not
-take a baseline.
+The service must now report `IPv6: Off`, and the exact runner check must end
+with `PASS: M2 IPv6 route check`. It uses the same
+`2001:4860:4860::8888` probe and four-state classifier as formal M2. A known
+`not in table` line with no interface is `safe_absent` even on macOS versions
+that return status zero; `lo0`/`utun*` is `safe_tunnel`; a physical interface
+or unknown outcome fails closed. If the check fails, preserve its complete structured
+output, restore IPv6 immediately with the pre-start branch in section 8, and
+do not take a baseline.
 
 Keep `M2_NETWORK_SERVICE`, `M2_IPV6_MODE_BEFORE`, and `M2_IPV6_RECORD` exported
 in this terminal. Disabling IPv6 may briefly reset the physical link, so all

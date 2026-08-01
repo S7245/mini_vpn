@@ -142,6 +142,19 @@ No Rust data-plane or frozen value changes are in scope.
 - [x] Secret scan staged content.
 - [x] Commit one coherent conventional commit and push the current branch.
 
+### Task 13: Repair real-macOS IPv6 route-status observation
+
+- [x] RED the observed status-zero `not in table` output; retain unknown and
+  physical fail-closed fixtures.
+- [x] GREEN one shared four-state classifier for the public pre-baseline check,
+  formal M2, health checks, and real-client evidence.
+- [x] Add read-only `m2-ipv6-check` using the exact formal probe.
+- [x] Persist formal route status/text/class/interface before rejection and
+  publish the decisive fields in status/summary.
+- [x] Update the runbook so no baseline begins without an exact check PASS.
+- [x] Re-run internal/external shell gates, Bash 3.2 syntax, the original local
+  macOS reproduction, review, diff, link, and secret gates.
+
 ## User Execution Stop Position
 
 Only after Task 12 passes may the user run:

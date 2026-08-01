@@ -2,7 +2,7 @@
 
 Date: 2026-08-01
 
-Status: **EXPECTED FAIL-CLOSED — smoke passed; formal M2 did not start**
+Status: **RUNNER FALSE NEGATIVE SELECTED — smoke passed; local repair complete**
 
 ## Evidence
 
@@ -27,9 +27,25 @@ The earlier exact-source bundle
 `2c5ce9f6ce2cde34034cc95d13e93896e5e049f6c40a8047ba51dd79ad14090b`)
 also contained no M2 evidence, but its terminal error was not
 preserved. It kept only a target-only TUN alive for about 16h25m. The fresh
-deterministic reproduction selects the same IPv6 prerequisite branch for the
-current physical-network configuration; the earlier artifact alone remains
-insufficient to reconstruct its stderr.
+attempt selected the same reported IPv6 prerequisite branch for the current
+physical-network configuration; neither artifact preserved enough raw route
+evidence to distinguish a physical route from an observer error.
+
+A second attempt after the documented IPv6 service change produced:
+
+```text
+bundle=/tmp/mini_vpn_knife15_macos_20260801_044032.tar.gz
+sha256=651f977bd4756f0c4d25a086d583f6f58d5d1ba240e1f87ff59be6ae43ebf417
+source_commit=19b5ceb1c04f4b8cb5b268f98df3fb5794998947
+```
+
+It again passed smoke and cleanup but kept M2 `not_run`. A local replay of the
+exact formal probe selected a runner false negative: macOS printed the known
+`not in table` absence while returning status zero, and the old classifier
+recognized that text only for a nonzero status. The first runbook revision
+also used a different IPv6 probe from formal M2. The focused repair and gates
+are recorded in
+`docs/tech/2026-08-01-knife15-m2-ipv6-route-status-observability-local-results.md`.
 
 ## Timeline And Boundary
 
@@ -72,20 +88,24 @@ m2 cycles/results/checkpoints=0
 
 The M2 architecture is intentionally IPv4-only. A routable physical IPv6
 path would bypass the owned IPv4 split-default routes, so the runner must not
-claim a leak-free full tunnel while that path exists. The observed rejection
-therefore matches the frozen architecture and is not evidence of an operator,
-smoke, pacing, D16, QUIC, pool, MTU, or throughput defect.
+claim a leak-free full tunnel while that path exists. The repeated rejection
+after the documented service change was an observer false negative and is not
+evidence of an operator, smoke, pacing, D16, QUIC, pool, MTU, or throughput
+defect.
 
-The operational defect was in the HITL runbook: it warned that M2 blocks
-physical IPv6 but did not place an explicit inspect/disable/restore procedure
-before the expiring baseline/direct transaction. The repaired runbook now:
+The initial operational defect was in the HITL runbook: it warned that M2
+blocks physical IPv6 but did not place an explicit inspect/disable/restore
+procedure before the expiring baseline/direct transaction. The second attempt
+then selected the status/text classifier defect. The repaired runbook and
+runner now:
 
 1. derives the active physical interface and its exact macOS network service;
 2. records the original IPv6 mode;
 3. permits the documented temporary change only from `Automatic` to `Off`;
 4. proves the global IPv6 discriminator no longer has a physical route before
    baseline;
-5. restores immediately if a pre-start gate fails, or only after Knife15
+5. runs the exact shared `m2-ipv6-check` before baseline;
+6. restores immediately if a pre-start gate fails, or only after Knife15
    `stop` once `start` has been invoked.
 
 The runner continues to check the IPv6 invariant before mutation and
@@ -97,8 +117,8 @@ IPv6 non-goal changed.
 On the dedicated HK test Mac, use the updated M2 HITL runbook. With every
 other VPN/TUN disabled, identify the service owning the Exit route, verify its
 current IPv6 mode is `Automatic`, temporarily set that service to IPv6 `Off`,
-and prove the global IPv6 discriminator has no physical route. Then take one
-fresh uninterrupted:
+and run only the exact public `m2-ipv6-check`. Take one fresh uninterrupted
+transaction only after that action reports PASS:
 
 ```text
 baseline -> direct-discriminator -> start -> smoke -> m2 -> status -> stop

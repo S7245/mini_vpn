@@ -1,11 +1,27 @@
 # Errors
 
+## 2026-08-01 - Status-first IPv6 parsing rejected a known no-route result
+
+- The second HK attempt followed the documented `Automatic -> Off` flow but
+  repeated the same M2 precondition error. Its bundle still lacked the raw
+  route observation, so another baseline/direct/start/smoke cycle did not add
+  the discriminator needed to choose network state versus observer behavior.
+- Exact local replay showed status zero with the known `not in table` text.
+  The old parser inspected that text only under nonzero status and otherwise
+  required an interface, producing a false physical-leak error. The runbook
+  also checked a different IPv6 address from formal M2.
+- Correct behavior: classify the exact known absence line with no interface
+  before status branching, use one exact public/formal probe, preserve raw
+  status/text/class/interface, and block expensive evidence creation until the
+  public check passes. Unknown text and physical interfaces remain fail-closed.
+
 ## 2026-08-01 - The M2 runbook warned about IPv6 but did not operationalize it
 
-- Exact source `753691a` passed target-only start/smoke, then M2 rejected the
-  physical IPv6 path before creating any M2 evidence. The rejection was
-  correct, but the runbook placed no inspect/disable/restore procedure before
-  baseline and direct evidence.
+- Exact source `753691a` passed target-only start/smoke, then M2 reported its
+  physical-IPv6 error before creating any M2 evidence. The bundle lacked raw
+  route evidence and a later exact replay selected an observer false negative,
+  but the runbook independently placed no inspect/disable/restore procedure
+  before baseline and direct evidence.
 - The first bundle lacked terminal stderr and could prove only `m2=not_run`.
   A fresh immediate reproduction preserved the decisive IPv6 error and avoided
   misclassifying the clean smoke `Stopped(0)` close as causal.
@@ -18,6 +34,13 @@
   to `PATH`, so the next `git` lookup failed even though the preceding checks
   passed. Use a neutral name such as `file_path` in zsh harness loops and rerun
   the interrupted gate from the beginning.
+- A later wrapper captured its child exit code in zsh variable `status`, which
+  is read-only. The child self-test had passed, but the wrapper failed while
+  recording the result. Use `rc` for portable harness exit-code capture.
+- An attempted one-line PCRE secret scan nested both shell quote forms and
+  failed in zsh parsing before scanning. Split private-key and assignment
+  checks and use a small awk predicate for added assignments; do not embed a
+  quote-heavy PCRE in the command string.
 
 ## 2026-07-30 - M2 review found three default-value-hidden evidence failures
 

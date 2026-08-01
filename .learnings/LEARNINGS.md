@@ -1,11 +1,28 @@
 # Learnings
 
+## 2026-08-01 - Positive absence text can outrank a misleading exit status
+
+- After the physical service was set to IPv6 Off, macOS `route` printed the
+  exact known `not in table` absence but returned status zero. Branching on
+  status first turned positive absence into a missing-interface failure.
+- Classify the full `(status, text, interface)` observation. An exact known
+  absence line with no interface is safe regardless of status; a successful
+  physical interface is unsafe; every unknown combination remains fail-closed.
+- Operator and formal prerequisites must use the same probe and implementation.
+  A different global address plus prose inspection did not reproduce the
+  actual gate.
+- Reusable rule: place a cheap, exact, read-only version of an expensive
+  transaction's predicate before freshness-limited work, then persist the same
+  raw discriminator when the formal transaction runs.
+- Result:
+  `docs/tech/2026-08-01-knife15-m2-ipv6-route-status-observability-local-results.md`.
+
 ## 2026-08-01 - Leak prerequisites belong before expiring evidence
 
-- Formal M2 correctly blocked a routable physical IPv6 path after start/smoke,
-  but the operator had already paid for baseline, a 300-second direct probe,
-  and TUN setup. The runbook described the gate without an actionable way to
-  satisfy and later undo it.
+- Formal M2 reported its physical-IPv6 block only after start/smoke, but the
+  operator had already paid for baseline, a 300-second direct probe, and TUN
+  setup. Later exact replay selected an observer false negative; independently,
+  the runbook still lacked an actionable way to satisfy and undo the gate.
 - A physical-network mutation can invalidate earlier path evidence. Identify
   the service from the actual Exit route, record its original IPv6 mode,
   disable it, prove the route boundary, and only then create baseline/direct

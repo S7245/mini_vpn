@@ -4,31 +4,55 @@
 
 ## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-01)
 
+- **Latest accepted position:** exact-source `19b5ceb` HK bundle
+  `/tmp/mini_vpn_knife15_macos_20260801_044032.tar.gz` (SHA-256
+  `651f977b...`) followed the new `Automatic -> Off` service procedure and
+  passed start/smoke, but formal M2 repeated the IPv6 error before M2 evidence
+  creation. M2 remained `not_run`; Endpoint and cleanup passed.
+- A local exact-probe replay returned status zero while printing the known
+  `route: writing to routing socket: not in table` absence. The old runner
+  checked that text only for nonzero status, so it tried and failed to parse
+  an interface. This is a runner observer false negative, not proof that IPv6
+  remained enabled. The first runbook repair also checked a different address
+  from formal M2.
+- The repaired shared classifier accepts the exact `not in table` line only
+  when no interface is present, independent of status; it accepts only
+  `lo0`/`utun*` successful routes, rejects physical interfaces, and keeps every
+  other outcome unknown/fail-closed. The public
+  read-only `m2-ipv6-check` uses the exact formal probe before baseline.
+  Formal M2 preserves raw status/text/class/interface in the bundle and
+  publishes decisive summary/status fields. Result:
+  `docs/tech/2026-08-01-knife15-m2-ipv6-route-status-observability-local-results.md`.
+- Next pull the pushed repair and run only `m2-ipv6-check` after disabling the
+  exact physical-service IPv6. Take no baseline until it reports
+  `safe_absent` or `safe_tunnel` plus PASS. Restore IPv6 immediately on check
+  failure. M3 remains blocked pending formal M2 acceptance.
+
 - **Latest accepted position:** exact-source `753691a` HK bundle
   `/tmp/mini_vpn_knife15_macos_20260801_041142.tar.gz` (SHA-256
-  `93d384a...`) passed target-only start/smoke, then formal M2 correctly
-  failed closed before any M2 route/DNS mutation because a routable physical
-  IPv6 path existed. M2 status/full-tunnel/acceptance remained
-  `not_run/not_run/NOT_RUN`; this is not a smoke or data-plane failure.
+  `93d384a...`) passed target-only start/smoke, then formal M2 reported its
+  physical-IPv6 error before any M2 route/DNS mutation. The bundle preserved
+  neither the raw route output nor its status, so the original physical-route
+  inference was not proven. M2 status/full-tunnel/acceptance remained
+  `not_run/not_run/NOT_RUN`; this was not a smoke or data-plane failure.
 - Smoke forward/reverse receivers were `63.428/49.695 Mbit/s`; pool ownership
   drained, Endpoint conservation ended `61,414/0/0B`, controls and cleanup
   passed, and the one `Stopped(0)` boundary had zero D16 ownership. The
   operator's `status/snapshot/stop` response was correct.
-- This selects the frozen IPv6 leak boundary: current mini_vpn M2 is IPv4-only
-  and must not claim full-tunnel acceptance while physical IPv6 can bypass it.
-  Do not relax the gate or open an IPv6-tunnelling implementation branch in
-  this stage.
+- Current mini_vpn M2 is IPv4-only and must not claim full-tunnel acceptance
+  while physical IPv6 can bypass it. The later exact-probe reproduction
+  selected an observer false negative and supersedes this bundle's earlier
+  physical-route inference; the safety boundary itself remains unchanged.
 - The HITL runbook now derives the exact service owning the physical Exit
   interface, permits only a recorded `Automatic -> Off` temporary change,
   verifies the global IPv6 route is absent before baseline, and restores the
   same service immediately after a pre-start failure or only after `stop` once
   start was invoked. Result:
   `docs/tech/2026-08-01-knife15-hk-m2-ipv6-precondition-results.md`.
-- Next take one fresh uninterrupted HK baseline/direct/start/smoke/M2 run
-  after the runbook's IPv6 precondition passes. Never reuse the rejected
-  baseline/direct evidence. Restore IPv6 immediately on a pre-start failure;
-  once `start` is invoked, restore only after `stop`. M3 remains blocked
-  pending formal M2 acceptance.
+- Superseded next action: first run the repaired public `m2-ipv6-check`; only a
+  PASS can authorize fresh baseline/direct evidence. Restore IPv6 immediately
+  on a pre-start failure; once `start` is invoked, restore only after `stop`.
+  M3 remains blocked pending formal M2 acceptance.
 
 - **Latest accepted position:** Knife15 M2 local implementation, gates, and
   review are complete at `4dac87c`. The public `m2` action owns a controlled

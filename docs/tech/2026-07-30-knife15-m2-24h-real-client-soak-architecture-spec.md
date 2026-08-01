@@ -120,6 +120,14 @@ physical IPv6 default blocks M2 before the 24-hour workload. The user may
 disable IPv6 for the dedicated test service and take a fresh run; the runner
 must never silently allow an IPv6 side channel.
 
+The pre-baseline operator check and formal M2 must use the same global IPv6
+discriminator and classifier. The exact known macOS `not in table` line is
+positive absence evidence whether `route` returns zero or nonzero, but only
+when no interface is present. A successful lookup with `lo0`/`utun*` is safe;
+any physical interface is unsafe; any other status, text, or missing-interface
+combination is unknown and fails closed. Formal M2 persists the raw
+status/text/class/interface before it accepts or rejects the precondition.
+
 IPv6 tunnelling itself remains a separate future architecture stage.
 
 ## Provenance And Preconditions
@@ -347,6 +355,8 @@ then becomes `PASS`.
 |---|---|---|
 | preflight egress IP differs, public route physical, or fake-IP absent | full-tunnel/DNS runner | stop before 24h; repair fixture/route contract |
 | physical IPv6 route exists | IPv6 leak boundary | block M2; do not claim full tunnel |
+| exact `not in table` line, no interface, and status zero | IPv6 route observer | classify safe absence; do not require an interface |
+| unknown IPv6 route status/text combination | IPv6 route observer | fail closed and preserve raw evidence before another baseline |
 | Target/Exit/gateway degrade together | external path/VPS | preserve evidence; no constant tuning |
 | receiver fails while controls and ownership stay clean | connection/QUIC service | architecture review; no unchanged repeat |
 | UDP loss exceeds 3% with healthy controls | UDP/TUIC quality | inspect datagram service, not TCP constants |

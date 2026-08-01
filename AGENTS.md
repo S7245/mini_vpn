@@ -189,27 +189,53 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-01:
 
+- Exact-source `19b5ceb` HK bundle
+  `/tmp/mini_vpn_knife15_macos_20260801_044032.tar.gz` (SHA-256
+  `651f977b...`) followed the documented physical-service
+  `IPv6: Automatic -> Off` sequence, passed target-only start/smoke, and then
+  hit the same pre-M2 IPv6 error. M2 remained `not_run`; cleanup passed.
+- The exact formal probe reproduced locally with
+  `route_status=0` plus `route: writing to routing socket: not in table`.
+  The old runner recognized that positive absence text only for nonzero
+  status, then rejected the status-zero output because it had no `interface:`.
+  This selects an observer false negative, not a physical leak or operator
+  failure. The first runbook repair also used a different probe from formal
+  M2.
+- One shared four-state classifier now treats the exact `not in table` line
+  with no interface as `safe_absent` regardless of status, accepts only
+  `lo0`/`utun*` as `safe_tunnel`, rejects other interfaces as
+  `unsafe_physical`, and keeps all other outcomes `unknown`/fail-closed. A
+  public read-only `m2-ipv6-check` uses the exact formal probe before baseline.
+  Formal M2 persists raw status/text/class/interface and exposes them in
+  status/summary.
+  No Rust data plane, frozen value, SLO, route scope, or IPv6 non-goal changed.
+  Result:
+  `docs/tech/2026-08-01-knife15-m2-ipv6-route-status-observability-local-results.md`.
+- Next pull the pushed repair on the HK Mac, disable the exact physical
+  service IPv6, and run only `m2-ipv6-check`. Do not take a baseline unless it
+  reports `safe_absent`/`safe_tunnel` and PASS. Restore IPv6 immediately if
+  the cheap check fails. M3 remains blocked pending real M2 acceptance.
+
 - Exact-source `753691a` HK bundle
   `/tmp/mini_vpn_knife15_macos_20260801_041142.tar.gz` (SHA-256
-  `93d384a...`) passed target-only start/smoke, then formal M2 correctly
-  rejected a routable physical IPv6 path before any M2-owned route or DNS
-  mutation. M2 status/full-tunnel/acceptance remained
-  `not_run/not_run/NOT_RUN`; this is not a smoke or data-plane failure.
+  `93d384a...`) passed target-only start/smoke, then formal M2 reported its
+  physical-IPv6 error before any M2-owned route or DNS mutation. The bundle
+  did not preserve raw route status/text, so it could not prove that a
+  routable physical path existed. M2 status/full-tunnel/acceptance remained
+  `not_run/not_run/NOT_RUN`; this was not a smoke or data-plane failure.
 - Smoke forward/reverse receivers were `63.428/49.695 Mbit/s`, pool ownership
   drained, Endpoint conservation ended `61,414/0/0B`, and controls/cleanup
   passed. The one `Stopped(0)` close had zero D16 queued, leased, and reserved
   ownership.
-- Current M2 is deliberately IPv4-only. Keep the physical IPv6 gate
-  fail-closed. The updated HITL runbook derives the exact physical network
-  service, records an original `Automatic` mode, temporarily disables IPv6
-  before fresh baseline/direct evidence, and gives identity-bound pre-start
-  and post-stop restoration branches. Do not reuse rejected evidence or
-  expand this stage into IPv6 tunnelling.
+- Current M2 is deliberately IPv4-only, so the physical IPv6 gate must remain
+  fail-closed. The later exact-probe reproduction selected the runner false
+  negative described above; it supersedes the earlier physical-route
+  inference without weakening the invariant. Do not reuse rejected evidence
+  or expand this stage into IPv6 tunnelling.
   Result:
   `docs/tech/2026-08-01-knife15-hk-m2-ipv6-precondition-results.md`.
-- Next take one fresh uninterrupted HK
-  `baseline -> direct-discriminator -> start -> smoke -> m2 -> status -> stop`
-  only after the runbook's IPv6 route proof passes. Restore immediately on a
+- Superseded next action: the repaired public `m2-ipv6-check` must pass before
+  taking one fresh uninterrupted HK transaction. Restore immediately on a
   pre-start failure; after `start`, restore only after stop. M3 remains
   blocked pending real M2 acceptance.
 

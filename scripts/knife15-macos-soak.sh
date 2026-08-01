@@ -96,6 +96,10 @@ M2_PUBLIC_LOW_PROBE=1.1.1.1
 M2_PUBLIC_HIGH_PROBE=129.1.1.1
 M2_FAKE_PROBE=198.18.0.1
 M2_IPV6_PROBE=2001:4860:4860::8888
+M2_IPV6_ROUTE_STATUS=unknown
+M2_IPV6_ROUTE_CLASSIFICATION=unknown
+M2_IPV6_ROUTE_INTERFACE=none
+M2_IPV6_ROUTE_TEXT=
 STATE_DIR="/var/run/mini_vpn_knife15_macos_state"
 SERVER_HOST=""
 SERVER_PORT=""
@@ -125,6 +129,7 @@ default route.
 Usage:
   bash scripts/knife15-macos-soak.sh --self-test
   bash scripts/knife15-macos-soak.sh preflight
+  bash scripts/knife15-macos-soak.sh m2-ipv6-check
   bash scripts/knife15-macos-soak.sh baseline
   bash scripts/knife15-macos-soak.sh direct-discriminator
   sudo -E bash scripts/knife15-macos-soak.sh start
@@ -213,16 +218,18 @@ routes and the active physical service DNS until stop):
   4. export the five MINI_VPN_TUIC_* values and TARGET/DNS/IPERF settings
   5. bash scripts/knife15-macos-soak.sh --self-test
   6. bash scripts/knife15-macos-soak.sh preflight
-  7. bash scripts/knife15-macos-soak.sh baseline
-  8. export M2_BASELINE_DIR='REPLACE_WITH_BASELINE_DIRECTORY_FROM_STEP_7'
-  9. bash scripts/knife15-macos-soak.sh direct-discriminator
- 10. export M2_DIRECT_DIR='REPLACE_WITH_DIRECT_DIRECTORY_FROM_STEP_9'
- 11. sudo -v
- 12. sudo -E bash scripts/knife15-macos-soak.sh start
- 13. sudo -E bash scripts/knife15-macos-soak.sh smoke
- 14. caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2
- 15. sudo -E bash scripts/knife15-macos-soak.sh status
- 16. sudo -E bash scripts/knife15-macos-soak.sh stop
+  7. disable physical-service IPv6 as documented, then run:
+     bash scripts/knife15-macos-soak.sh m2-ipv6-check
+  8. bash scripts/knife15-macos-soak.sh baseline
+  9. export M2_BASELINE_DIR='REPLACE_WITH_BASELINE_DIRECTORY_FROM_STEP_8'
+ 10. bash scripts/knife15-macos-soak.sh direct-discriminator
+ 11. export M2_DIRECT_DIR='REPLACE_WITH_DIRECT_DIRECTORY_FROM_STEP_10'
+ 12. sudo -v
+ 13. sudo -E bash scripts/knife15-macos-soak.sh start
+ 14. sudo -E bash scripts/knife15-macos-soak.sh smoke
+ 15. caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2
+ 16. sudo -E bash scripts/knife15-macos-soak.sh status
+ 17. sudo -E bash scripts/knife15-macos-soak.sh stop
 
 The background watchdog samples process/utun state and removes only the host
 routes owned by this run if mini_vpn exits. start proves Target readiness
@@ -521,25 +528,83 @@ ipv4_is_fake() {
     ( "$second" == "18" || "$second" == "19" ) ]]
 }
 
-m2_ipv6_route_is_safe_from_text() {
-  local interface
-  interface="$(route_interface_from_text)"
-  [[ -z "$interface" || "$interface" == "lo0" || "$interface" == utun* ]]
+m2_ipv6_route_classification_from_text() {
+  local route_status="${1:-}" route_text interface
+  [[ "$route_status" =~ ^[0-9]+$ ]] || return 1
+  route_text="$(sed -n '1,$p')"
+  interface="$(route_interface_from_text <<<"$route_text")"
+  if [[ -z "$interface" ]] && \
+    grep -Fqx 'route: writing to routing socket: not in table' \
+      <<<"$route_text"; then
+    printf '%s\n' 'safe_absent none'
+    return 0
+  fi
+  if ((10#$route_status != 0)); then
+    printf '%s\n' 'unknown none'
+    return 0
+  fi
+  if [[ -z "$interface" ]]; then
+    printf '%s\n' 'unknown none'
+  elif [[ "$interface" == "lo0" || "$interface" == utun* ]]; then
+    printf 'safe_tunnel %s\n' "$interface"
+  else
+    printf 'unsafe_physical %s\n' "$interface"
+  fi
+}
+
+observe_m2_ipv6_route() {
+  local classification
+  M2_IPV6_ROUTE_TEXT="$(
+    "$M2_ROUTE_BIN" -n get -inet6 "$M2_IPV6_PROBE" 2>&1
+  )"
+  M2_IPV6_ROUTE_STATUS=$?
+  classification="$(
+    printf '%s\n' "$M2_IPV6_ROUTE_TEXT" | \
+      m2_ipv6_route_classification_from_text "$M2_IPV6_ROUTE_STATUS"
+  )" || {
+    M2_IPV6_ROUTE_CLASSIFICATION=unknown
+    M2_IPV6_ROUTE_INTERFACE=none
+    return 1
+  }
+  read -r M2_IPV6_ROUTE_CLASSIFICATION M2_IPV6_ROUTE_INTERFACE \
+    <<<"$classification"
+  [[ -n "$M2_IPV6_ROUTE_CLASSIFICATION" && \
+    -n "$M2_IPV6_ROUTE_INTERFACE" ]]
+}
+
+write_m2_ipv6_route_evidence() {
+  local evidence_file="$1"
+  [[ -n "$evidence_file" && ! -L "$evidence_file" ]] || return 1
+  observe_m2_ipv6_route || return 1
+  {
+    printf '%s\n' \
+      'schema=knife15-macos-m2-ipv6-route-v1' \
+      "timestamp=$(timestamp)" \
+      "probe=$M2_IPV6_PROBE" \
+      "route_status=$M2_IPV6_ROUTE_STATUS" \
+      "classification=$M2_IPV6_ROUTE_CLASSIFICATION" \
+      "interface=$M2_IPV6_ROUTE_INTERFACE" \
+      'route_text_begin'
+    printf '%s\n' "$M2_IPV6_ROUTE_TEXT"
+    printf '%s\n' 'route_text_end'
+  } >"$evidence_file" || return 1
+  [[ "$M2_IPV6_ROUTE_CLASSIFICATION" == "safe_absent" || \
+    "$M2_IPV6_ROUTE_CLASSIFICATION" == "safe_tunnel" ]]
 }
 
 m2_ipv6_route_interface() {
-  local route_text route_status interface
-  route_text="$("$M2_ROUTE_BIN" -n get -inet6 "$M2_IPV6_PROBE" 2>&1)"
-  route_status=$?
-  if ((route_status != 0)); then
-    [[ "$route_text" == *"not in table"* ]] || return 1
-    printf '%s\n' none
-    return 0
-  fi
-  interface="$(route_interface_from_text <<<"$route_text")"
-  [[ -n "$interface" && \
-    ( "$interface" == "lo0" || "$interface" == utun* ) ]] || return 1
-  printf '%s\n' "$interface"
+  observe_m2_ipv6_route || return 1
+  case "$M2_IPV6_ROUTE_CLASSIFICATION" in
+    safe_absent)
+      printf '%s\n' none
+      ;;
+    safe_tunnel)
+      printf '%s\n' "$M2_IPV6_ROUTE_INTERFACE"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 m2_route_text() {
@@ -556,6 +621,33 @@ m2_route_gateway() {
 
 m2_ipv6_route_is_safe() {
   m2_ipv6_route_interface >/dev/null
+}
+
+run_m2_ipv6_check() {
+  [[ "$(uname -s)" == "Darwin" ]] || \
+    die "Knife15 M2 IPv6 check requires Darwin"
+  require_command route
+  observe_m2_ipv6_route || die "cannot classify the M2 IPv6 route lookup"
+  printf '%s\n' \
+    'schema=knife15-macos-m2-ipv6-route-v1' \
+    "probe=$M2_IPV6_PROBE" \
+    "route_status=$M2_IPV6_ROUTE_STATUS" \
+    "classification=$M2_IPV6_ROUTE_CLASSIFICATION" \
+    "interface=$M2_IPV6_ROUTE_INTERFACE" \
+    'route_text_begin'
+  printf '%s\n' "$M2_IPV6_ROUTE_TEXT"
+  printf '%s\n' 'route_text_end'
+  case "$M2_IPV6_ROUTE_CLASSIFICATION" in
+    safe_absent|safe_tunnel)
+      echo "PASS: M2 IPv6 route check"
+      ;;
+    unsafe_physical)
+      die "M2 IPv6 check found physical interface $M2_IPV6_ROUTE_INTERFACE; do not run baseline"
+      ;;
+    *)
+      die "M2 IPv6 route outcome is unknown; do not run baseline"
+      ;;
+  esac
 }
 
 m2_dns_snapshot_for_service() {
@@ -2572,7 +2664,7 @@ EOF_M2_PROFILE
 }
 
 runner_self_test() {
-  local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture service_fixture dns_fixture m2_route_bin m2_networksetup_bin m2_dscacheutil_bin m2_curl_bin m2_route_state m2_run m2_result m2_schedule_run m2_test_profile m2_checkpoint_file m2_capture_run original_m2_route_bin original_m2_networksetup_bin original_m2_dscacheutil_bin original_m2_curl_bin collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir baseline_summary_text m0_profile m1_profile m2_profile m1_test_profile m0_run m1_stage_run m1_run m1_diagnostic_run m1_diagnostic_fail_run m1_diagnostic_formal_run m1_checkpoint_file m1_capture_run m1_formal_run m1_tcp_fixture m1_udp_fixture m0_fail_run direct_dir fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash bounded_status result_index result_label sample_index violations_before violation_count invalid_violations
+  local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture service_fixture dns_fixture m2_route_bin m2_networksetup_bin m2_dscacheutil_bin m2_curl_bin m2_route_state m2_run m2_result m2_schedule_run m2_test_profile m2_checkpoint_file m2_capture_run m2_ipv6_evidence original_m2_route_bin original_m2_networksetup_bin original_m2_dscacheutil_bin original_m2_curl_bin collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir baseline_summary_text m0_profile m1_profile m2_profile m1_test_profile m0_run m1_stage_run m1_run m1_diagnostic_run m1_diagnostic_fail_run m1_diagnostic_formal_run m1_checkpoint_file m1_capture_run m1_formal_run m1_tcp_fixture m1_udp_fixture m0_fail_run direct_dir fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash bounded_status result_index result_label sample_index violations_before violation_count invalid_violations ipv6_class ipv6_interface
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/knife15-macos-self-test.XXXXXX")" || return 1
   good_log="$tmp/good.log"
   bad_log="$tmp/bad.log"
@@ -2615,12 +2707,56 @@ EOF_NETWORK_SERVICES
   ipv4_is_fake 198.18.0.2 || die "self-test: valid fake IPv4 rejected"
   ipv4_is_fake 198.19.255.254 || die "self-test: upper fake IPv4 rejected"
   ! ipv4_is_fake 198.20.0.1 || die "self-test: non-fake IPv4 accepted"
-  printf '%s\n' 'interface: lo0' >"$route_fixture"
-  m2_ipv6_route_is_safe_from_text <"$route_fixture" || \
-    die "self-test: loopback IPv6 route rejected"
-  printf '%s\n' 'interface: en0' >"$route_fixture"
-  ! m2_ipv6_route_is_safe_from_text <"$route_fixture" || \
-    die "self-test: physical IPv6 route accepted"
+  read -r ipv6_class ipv6_interface <<<"$(
+    printf '%s\n' 'interface: lo0' | \
+      m2_ipv6_route_classification_from_text 0
+  )"
+  [[ "$ipv6_class" == "safe_tunnel" && "$ipv6_interface" == "lo0" ]] || \
+    die "self-test: loopback IPv6 route classification mismatch"
+  read -r ipv6_class ipv6_interface <<<"$(
+    printf '%s\n' 'interface: utun42' | \
+      m2_ipv6_route_classification_from_text 0
+  )"
+  [[ "$ipv6_class" == "safe_tunnel" && "$ipv6_interface" == "utun42" ]] || \
+    die "self-test: tunnel IPv6 route classification mismatch"
+  read -r ipv6_class ipv6_interface <<<"$(
+    printf '%s\n' 'interface: en0' | \
+      m2_ipv6_route_classification_from_text 0
+  )"
+  [[ "$ipv6_class" == "unsafe_physical" && "$ipv6_interface" == "en0" ]] || \
+    die "self-test: physical IPv6 route classification mismatch"
+  read -r ipv6_class ipv6_interface <<<"$(
+    printf '%s\n' 'route: writing to routing socket: not in table' | \
+      m2_ipv6_route_classification_from_text 1
+  )"
+  [[ "$ipv6_class" == "safe_absent" && "$ipv6_interface" == "none" ]] || \
+    die "self-test: absent IPv6 route classification mismatch"
+  read -r ipv6_class ipv6_interface <<<"$(
+    printf '%s\n' 'route: writing to routing socket: not in table' | \
+      m2_ipv6_route_classification_from_text 0
+  )"
+  [[ "$ipv6_class" == "safe_absent" && "$ipv6_interface" == "none" ]] || \
+    die "self-test: status-zero absent IPv6 route classification mismatch"
+  read -r ipv6_class ipv6_interface <<<"$(
+    printf '%s\n' \
+      'route: writing to routing socket: not in table' \
+      'interface: en0' | \
+      m2_ipv6_route_classification_from_text 0
+  )"
+  [[ "$ipv6_class" == "unsafe_physical" && "$ipv6_interface" == "en0" ]] || \
+    die "self-test: ambiguous absent/physical IPv6 output was accepted"
+  read -r ipv6_class ipv6_interface <<<"$(
+    printf '%s\n' 'route: Network is unreachable' | \
+      m2_ipv6_route_classification_from_text 1
+  )"
+  [[ "$ipv6_class" == "unknown" && "$ipv6_interface" == "none" ]] || \
+    die "self-test: unknown IPv6 error was accepted"
+  read -r ipv6_class ipv6_interface <<<"$(
+    printf '%s\n' 'gateway: fe80::1' | \
+      m2_ipv6_route_classification_from_text 0
+  )"
+  [[ "$ipv6_class" == "unknown" && "$ipv6_interface" == "none" ]] || \
+    die "self-test: successful IPv6 lookup without interface was accepted"
 
   m2_route_state="$tmp/m2-route-state"
   m2_run="$tmp/m2-route-run"
@@ -2810,6 +2946,24 @@ EOF_M2_FAKE_CURL
   ! m2_ipv6_route_is_safe || \
     die "self-test: unknown IPv6 route failure was accepted as no route"
   unset M2_TEST_IPV6_ERROR
+  m2_ipv6_evidence="$m2_run/m2-ipv6-preflight.txt"
+  M2_TEST_IPV6_IF=en0
+  export M2_TEST_IPV6_IF
+  ! write_m2_ipv6_route_evidence "$m2_ipv6_evidence" || \
+    die "self-test: physical IPv6 evidence was accepted"
+  grep -Fqx 'classification=unsafe_physical' "$m2_ipv6_evidence" || \
+    die "self-test: physical IPv6 evidence missed its classification"
+  grep -Fqx 'interface=en0' "$m2_ipv6_evidence" || \
+    die "self-test: physical IPv6 evidence missed its interface"
+  grep -Fqx 'route_status=0' "$m2_ipv6_evidence" || \
+    die "self-test: physical IPv6 evidence missed route status"
+  grep -Fq 'interface: en0' "$m2_ipv6_evidence" || \
+    die "self-test: physical IPv6 evidence missed raw route text"
+  unset M2_TEST_IPV6_IF
+  write_m2_ipv6_route_evidence "$m2_ipv6_evidence" || \
+    die "self-test: absent IPv6 evidence was rejected"
+  grep -Fqx 'classification=safe_absent' "$m2_ipv6_evidence" || \
+    die "self-test: absent IPv6 evidence missed its classification"
   activate_m2_full_tunnel "$m2_run" || \
     die "self-test: valid M2 full-tunnel activation failed"
   m2_full_tunnel_is_active || \
@@ -4347,6 +4501,8 @@ EOF_FAIL_IPERF
     die "self-test: public M1 action missing from help"
   grep -Fq 'scripts/knife15-macos-soak.sh m2' <<<"$usage_text" || \
     die "self-test: public M2 action missing from help"
+  grep -Fq 'scripts/knife15-macos-soak.sh m2-ipv6-check' <<<"$usage_text" || \
+    die "self-test: public M2 IPv6 check missing from help"
   grep -Fq 'M0_BASELINE_DIR=' <<<"$usage_text" || \
     die "self-test: M0 baseline requirement missing from help"
   grep -Fq 'M0_DIRECT_DIR=' <<<"$usage_text" || \
@@ -6728,7 +6884,7 @@ m2_workload_slo() {
 
 run_m2_action() {
   local run_dir utun target exit_host iperf_port dns_target dns_name
-  local profile_file free_kb command_name
+  local profile_file free_kb command_name ipv6_evidence_file
   require_root
   validate_m2_formal_config || \
     die "formal M2 requires the frozen 86400s schedule and 30s sampling; unset M2_* duration overrides"
@@ -6772,8 +6928,12 @@ run_m2_action() {
     die "DNS_TARGET no longer routes through $utun"
   [[ "$(route_interface "$exit_host")" != "$utun" ]] || \
     die "Exit route recursed into $utun"
-  m2_ipv6_route_is_safe || \
-    die "formal M2 blocks a routable physical IPv6 path; disable IPv6 for this dedicated test service"
+  ipv6_evidence_file="$run_dir/m2-ipv6-preflight.txt"
+  if ! write_m2_ipv6_route_evidence "$ipv6_evidence_file"; then
+    append_event_to "$run_dir" \
+      "m2 preflight failed: IPv6 classification=$M2_IPV6_ROUTE_CLASSIFICATION interface=$M2_IPV6_ROUTE_INTERFACE status=$M2_IPV6_ROUTE_STATUS"
+    die "formal M2 IPv6 preflight failed classification=$M2_IPV6_ROUTE_CLASSIFICATION interface=$M2_IPV6_ROUTE_INTERFACE; evidence: $ipv6_evidence_file"
+  fi
   network_control_is_sufficient "$run_dir" 5 && network_control_is_recent || \
     die "formal M2 requires complete, recent Exit and physical-interface controls"
   tcp_pool_activity_is_idle "$run_dir/mini_vpn.log" || \
@@ -6900,6 +7060,14 @@ show_status() {
   echo "m1_mode=$(sed -n '1p' "$run_dir/m1-mode" 2>/dev/null || echo not_run)"
   echo "m2_status=$(sed -n '1p' "$run_dir/m2.status" 2>/dev/null || echo not_run)"
   echo "m2_full_tunnel=$(read_state m2.full_tunnel 2>/dev/null || echo not_run)"
+  if [[ -f "$run_dir/m2-ipv6-preflight.txt" ]]; then
+    echo "m2_ipv6_preflight_classification=$(m0_profile_value \
+      "$run_dir/m2-ipv6-preflight.txt" classification)"
+    echo "m2_ipv6_preflight_interface=$(m0_profile_value \
+      "$run_dir/m2-ipv6-preflight.txt" interface)"
+    echo "m2_ipv6_preflight_route_status=$(m0_profile_value \
+      "$run_dir/m2-ipv6-preflight.txt" route_status)"
+  fi
   if [[ -f "$run_dir/m1-diagnostic-violations.tsv" ]]; then
     echo "m1_diagnostic_violations=$(awk 'END { print (NR > 0 ? NR - 1 : 0) }' \
       "$run_dir/m1-diagnostic-violations.tsv")"
@@ -6991,6 +7159,8 @@ append_m2_summary() {
   local checkpoint_threads_delta checkpoint_ownership_failures
   local pre_stop=NOT_APPLICABLE full_tunnel_state cleanup_complete=0
   local cleanup_restored=NOT_APPLICABLE formal_m2_acceptance m2_slo_evidence
+  local ipv6_preflight_classification=not_run ipv6_preflight_interface=unknown
+  local ipv6_preflight_route_status=unknown
   status="$(sed -n '1p' "$run_dir/m2.status" 2>/dev/null || true)"
   status="${status:-not_run}"
   active_windows="$(grep -Ec $'\tm2 active .* complete planned_secs=' \
@@ -7034,6 +7204,17 @@ append_m2_summary() {
   fi
   formal_m2_acceptance="$(m2_formal_acceptance_from_values "$status" \
     "$pre_stop" "$full_tunnel_state" "$cleanup_complete" "$cleanup_restored")"
+  if [[ -f "$run_dir/m2-ipv6-preflight.txt" ]]; then
+    ipv6_preflight_classification="$(m0_profile_value \
+      "$run_dir/m2-ipv6-preflight.txt" classification 2>/dev/null || true)"
+    ipv6_preflight_interface="$(m0_profile_value \
+      "$run_dir/m2-ipv6-preflight.txt" interface 2>/dev/null || true)"
+    ipv6_preflight_route_status="$(m0_profile_value \
+      "$run_dir/m2-ipv6-preflight.txt" route_status 2>/dev/null || true)"
+    ipv6_preflight_classification="${ipv6_preflight_classification:-unknown}"
+    ipv6_preflight_interface="${ipv6_preflight_interface:-unknown}"
+    ipv6_preflight_route_status="${ipv6_preflight_route_status:-unknown}"
+  fi
   cat >>"$run_dir/summary.md" <<EOF_M2_SUMMARY
 
 ## Knife15 M2
@@ -7065,6 +7246,9 @@ append_m2_summary() {
 - m2_checkpoint_fd_first_final_max_delta: ${checkpoint_first_fd:-unknown}/${checkpoint_final_fd:-unknown}/${checkpoint_max_fd:-unknown}/${checkpoint_fd_delta:-unknown}
 - m2_checkpoint_threads_first_final_max_delta: ${checkpoint_first_threads:-unknown}/${checkpoint_final_threads:-unknown}/${checkpoint_max_threads:-unknown}/${checkpoint_threads_delta:-unknown}
 - m2_checkpoint_ownership_failures: ${checkpoint_ownership_failures:-0}
+- m2_ipv6_preflight_classification: $ipv6_preflight_classification
+- m2_ipv6_preflight_interface: $ipv6_preflight_interface
+- m2_ipv6_preflight_route_status: $ipv6_preflight_route_status
 - m2_slo_evidence: $m2_slo_evidence
 - m2_full_tunnel_state: $full_tunnel_state
 - m2_cleanup_restored: $cleanup_restored
@@ -7783,6 +7967,9 @@ case "$ACTION" in
     ;;
   direct-discriminator)
     run_direct_discriminator
+    ;;
+  m2-ipv6-check)
+    run_m2_ipv6_check
     ;;
   start)
     start_runner
