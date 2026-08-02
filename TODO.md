@@ -4,7 +4,40 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-02 — recover M2 kernel-reaped route ownership)
+#### Latest decision (2026-08-02 — path-service-aware equal-busy pool selection)
+
+The recovered immutable bundle is
+`/tmp/mini_vpn_knife15_macos_20260801_053127.tar.gz` (SHA-256
+`d4fc3bc6...`, start source `6f1df4a`). The cleanup repair passed on the exact
+kernel-reap discriminator, so route/DNS/process ownership is closed.
+
+Formal M2 remains failed. Cycle 2 `short-forward-1` had a first complete
+receiver-zero second while exact Exit/gateway, route, TUN, Endpoint, D16, and
+QUIC liveness controls stayed healthy. An equal busy `62:62` lease tie put data
+on conn0 at `10,124B/163ms`, although conn1 had `23,842B/163ms`; the selected
+writer then waited `3.355s`.
+
+The accepted local repair preserves least-active as the first key and idle
+stable ordering, then breaks only equal nonzero ties by exact current
+`cwnd/RTT`. It adds no constant, SLI waiver, pool/window/MTU/pacing change,
+rebind, retry, or payload-hot-path work. Review and all local gates pass with
+no unresolved P0/P1. Result:
+`docs/tech/2026-08-02-knife15-m2-path-service-aware-pool-selection-local-results.md`.
+
+Next:
+
+1. pull the pushed reviewed source and rebuild release on the HK test Mac;
+2. keep Clash-TUN/every other VPN off and temporarily disable the recorded
+   physical service IPv6;
+3. require `m2-ipv6-check` PASS before fresh evidence;
+4. run exactly one fresh `baseline -> direct -> start -> smoke -> m2 -> status
+   -> stop` transaction;
+5. restore IPv6 only at the runbook-defined boundary and synchronize the
+   bundle;
+6. do not tune or repeat unchanged; keep M3 blocked until M2 plus cleanup is
+   accepted.
+
+#### Previous decision (2026-08-02 — recover M2 kernel-reaped route ownership)
 
 Exact-source `6f1df4a` real HK M2 run
 `/tmp/mini_vpn_knife15_macos_20260801_053127` passed baseline/direct,

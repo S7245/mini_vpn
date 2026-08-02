@@ -12,6 +12,10 @@ _Avoid_: relay-server, gateway (when meaning the proxy box)
 How the client carries its tunnel to the **Upstream**. Today: **TUIC over QUIC** (the data plane — TCP relay streams plus a UDP datagram plane). A second transport, **VLESS over REALITY over TCP**, is the anti-censorship fallback for when QUIC is degraded or blocked.
 _Avoid_: protocol (overloaded), connection (a transport can span reconnects)
 
+**TUIC TCP pool path service**:
+The current send-side service estimate of one TUIC TCP pool slot, represented by that QUIC path's congestion window divided by its RTT. It is a point-in-time placement hint for breaking equal, nonzero lease-load ties; it is not a bandwidth promise, a health verdict, or permission to change congestion-control constants. Unknown or idle evidence falls back to the pool's stable lease-aware ordering.
+_Avoid_: connection speed, bandwidth score, priority (the estimate is transient transport state, not a configured class of service)
+
 **Target**:
 The final `IP:port` an intercepted connection wants to reach (e.g. a website). On the TUN path it is extracted from smoltcp's `local_endpoint()`. The Upstream connects out to the Target.
 _Avoid_: upstream, destination, remote (these collide with other concepts)

@@ -1,5 +1,24 @@
 # Errors
 
+## 2026-08-02 - Equal busy TCP-pool loads hid a lower-service placement
+
+- The recovered first formal M2 bundle passed cycle 1, then cycle 2
+  `short-forward-1` opened data on conn0 after an equal `62:62` lease tie. The
+  Target's first complete receiver second was zero and the D16 writer waited
+  `3.355s`.
+- Same-window controls rejected an outage or local ownership failure. Conn0
+  remained authenticated at `10,124B/163ms`, while conn1 offered
+  `23,842B/163ms`; stable index ignored this current service difference.
+- Correct behavior: keep lease load primary and idle ordering stable, but use
+  exact known `cwnd/RTT` only for equal nonzero ties. If the next M2 selects
+  the greater-service slot and still fails, reject this hypothesis instead of
+  tuning constants or repeating unchanged.
+- The first standalone Quinn gate invocation omitted its required local
+  quinn-proto patch and pulled the registry dependency, which lacks the fork
+  APIs. Always prove the patched path with `cargo tree` and run Quinn with the
+  explicit `patch.crates-io.quinn-proto.path` config; this command failure was
+  not a product regression.
+
 ## 2026-08-02 - Dead-utun route reap stranded M2 ownership markers
 
 - The first formal M2 run failed a workload phase, then repeated stop attempts

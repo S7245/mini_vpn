@@ -4,7 +4,36 @@
 
 ## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-02)
 
-- **Latest accepted position:** exact-source `6f1df4a` real HK M2 run
+- **Latest accepted position:** recovered exact-source `6f1df4a` HK bundle
+  `/tmp/mini_vpn_knife15_macos_20260801_053127.tar.gz` (SHA-256
+  `d4fc3bc6...`) proves the `cebf30d` kernel-reap cleanup repair worked:
+  low/high/fake markers released without foreign route mutation, DNS/process
+  cleanup passed, and the immutable artifact finalized.
+- Formal M2 itself failed cycle 2 `short-forward-1` on a first complete
+  `1.001225s` Target receiver interval of `0B`. Exit/gateway controls, routes,
+  TUN, Endpoint conservation (`61,404/0/0B`), D16 closure, and authenticated
+  QUIC progress were healthy. This is not an observer tail, operator error,
+  outage, or frozen-value tuning branch.
+- Control chose conn1 at `active_before=60`; after the two relay half-leases,
+  data saw an equal busy `62:62` tie and stable index chose conn0. Current path
+  state was conn0 `10,124B/163ms` versus conn1 `23,842B/163ms`; the conn0 D16
+  writer waited `3,355,211us`, 4.4x the comparable passing conn1 flow. This
+  selects equal-busy placement without current QUIC send-service evidence.
+- The reviewed selector keeps lease count first and idle `conn0 -> conn1`, but
+  breaks equal nonzero ties by exact known `cwnd/RTT`; unknown/equal stays
+  stable. Sampling is nonblocking, refreshed after preparation waits, and
+  affects no reconnect, pool, pacing, or payload hot path. Focused `22/22`,
+  root `673+3 ignored`, main `2`, integration `10+4 ignored`, release, Clippy,
+  shell, vendored Quinn/proto, >170 Mbit/s 32 MiB capacity, fmt/diff/secret,
+  and review gates pass with no unresolved P0/P1. Result:
+  `docs/tech/2026-08-02-knife15-m2-path-service-aware-pool-selection-local-results.md`.
+- Next take exactly one fresh HK
+  `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke -> m2
+  -> status -> stop` from the pushed reviewed source with a rebuilt release
+  binary. Do not tune or repeat unchanged. M3 remains blocked pending full M2
+  plus cleanup acceptance.
+
+- **Previous reviewed position:** exact-source `6f1df4a` real HK M2 run
   `/tmp/mini_vpn_knife15_macos_20260801_053127` passed baseline/direct,
   start/smoke, IPv6/full-tunnel/real-client preflight, and cycle 1. Cycle 2
   failed `short-forward-1` on `receiver_zero_interval`; that remains an

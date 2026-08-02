@@ -547,7 +547,49 @@ struct TcpPoolSlotReservation {
     index: usize,
     lease: TcpPoolSlotLease,
     active_before: u64,
+    path_service: TcpPoolPathService,
+    path_service_tiebreak: bool,
     preparation: TcpPoolSlotPreparation,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum TcpPoolPathService {
+    #[default]
+    Unknown,
+    Known {
+        cwnd: u64,
+        rtt_micros: u64,
+    },
+}
+
+impl TcpPoolPathService {
+    fn known(cwnd: u64, rtt: Duration) -> Self {
+        let rtt_micros = u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX);
+        if cwnd == 0 || rtt_micros == 0 {
+            return Self::Unknown;
+        }
+        Self::Known { cwnd, rtt_micros }
+    }
+
+    fn has_greater_service_than(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Unknown, _) => false,
+            (Self::Known { .. }, Self::Unknown) => true,
+            (
+                Self::Known {
+                    cwnd: left_cwnd,
+                    rtt_micros: left_rtt,
+                },
+                Self::Known {
+                    cwnd: right_cwnd,
+                    rtt_micros: right_rtt,
+                },
+            ) => {
+                u128::from(left_cwnd) * u128::from(right_rtt)
+                    > u128::from(right_cwnd) * u128::from(left_rtt)
+            }
+        }
+    }
 }
 
 struct TcpPoolLeaseSelector {
@@ -567,7 +609,10 @@ impl TcpPoolLeaseSelector {
         }
     }
 
-    fn try_reserve_least_active(&self) -> Result<TcpPoolSlotReservation, TcpPoolReservationError> {
+    fn try_reserve_least_active(
+        &self,
+        path_service: &[TcpPoolPathService],
+    ) -> Result<TcpPoolSlotReservation, TcpPoolReservationError> {
         if self.active_slots.is_empty() {
             return Err(TcpPoolReservationError::Empty);
         }
@@ -575,6 +620,7 @@ impl TcpPoolLeaseSelector {
 
         loop {
             let mut choice = None;
+            let mut path_service_tiebreak = false;
             let mut preparing = false;
             for (index, (active, slot_preparing)) in self
                 .active_slots
@@ -590,12 +636,28 @@ impl TcpPoolLeaseSelector {
                 if active_before == u64::MAX {
                     continue;
                 }
-                if choice.is_none_or(|(_, current)| active_before < current) {
-                    choice = Some((index, active_before));
+                let candidate_service = path_service.get(index).copied().unwrap_or_default();
+                match choice {
+                    None => choice = Some((index, active_before, candidate_service)),
+                    Some((_, current_active, _)) if active_before < current_active => {
+                        choice = Some((index, active_before, candidate_service));
+                        path_service_tiebreak = false;
+                    }
+                    Some((_, current_active, current_service))
+                        if active_before == current_active && active_before != 0 =>
+                    {
+                        if candidate_service.has_greater_service_than(current_service) {
+                            choice = Some((index, active_before, candidate_service));
+                            path_service_tiebreak = true;
+                        } else if current_service.has_greater_service_than(candidate_service) {
+                            path_service_tiebreak = true;
+                        }
+                    }
+                    Some(_) => {}
                 }
             }
 
-            let Some((index, active_before)) = choice else {
+            let Some((index, active_before, selected_path_service)) = choice else {
                 return Err(if preparing {
                     TcpPoolReservationError::Busy
                 } else {
@@ -627,6 +689,8 @@ impl TcpPoolLeaseSelector {
                     index,
                     lease: TcpPoolSlotLease::from_reserved(active),
                     active_before,
+                    path_service: selected_path_service,
+                    path_service_tiebreak,
                     preparation,
                 });
             }
@@ -636,10 +700,12 @@ impl TcpPoolLeaseSelector {
 
     async fn reserve_least_active(
         &self,
+        mut sample_path_service: impl FnMut() -> Vec<TcpPoolPathService>,
     ) -> Result<TcpPoolSlotReservation, TcpPoolReservationError> {
         loop {
             let available = self.available.notified();
-            match self.try_reserve_least_active() {
+            let path_service = sample_path_service();
+            match self.try_reserve_least_active(&path_service) {
                 Err(TcpPoolReservationError::Busy) => available.await,
                 result => return result,
             }
@@ -2813,20 +2879,42 @@ fn format_tuic_tcp_open_line(
     )
 }
 
-fn format_tuic_tcp_pool_selection_line(
+#[derive(Debug, Clone, Copy)]
+struct TuicTcpPoolSelectionDiag<'a> {
     conn_index: usize,
     stable_id: usize,
     active_before: u64,
+    path_service: TcpPoolPathService,
+    path_service_tiebreak: bool,
     generation: u64,
     last_success_age_secs: Option<u64>,
-    probe_result: &str,
-    reconnect_reason: Option<&str>,
-) -> String {
+    probe_result: &'a str,
+    reconnect_reason: Option<&'a str>,
+}
+
+fn format_tuic_tcp_pool_selection_line(diag: TuicTcpPoolSelectionDiag<'_>) -> String {
+    let TuicTcpPoolSelectionDiag {
+        conn_index,
+        stable_id,
+        active_before,
+        path_service,
+        path_service_tiebreak,
+        generation,
+        last_success_age_secs,
+        probe_result,
+        reconnect_reason,
+    } = diag;
     let last_success_age_secs = last_success_age_secs
         .map(|age| age.to_string())
         .unwrap_or_else(|| "never".into());
+    let (path_cwnd, path_rtt_us) = match path_service {
+        TcpPoolPathService::Unknown => ("unknown".into(), "unknown".into()),
+        TcpPoolPathService::Known { cwnd, rtt_micros } => {
+            (cwnd.to_string(), rtt_micros.to_string())
+        }
+    };
     format!(
-        "🔎 tuic-tcp-pool-selection conn={conn_index} id={stable_id} policy=least_active active_before={active_before} generation={generation} last_success_age_secs={last_success_age_secs} probe_result={probe_result} reconnect_reason={}",
+        "🔎 tuic-tcp-pool-selection conn={conn_index} id={stable_id} policy=least_active_then_path_service active_before={active_before} path_cwnd={path_cwnd} path_rtt_us={path_rtt_us} path_service_tiebreak={path_service_tiebreak} generation={generation} last_success_age_secs={last_success_age_secs} probe_result={probe_result} reconnect_reason={}",
         reconnect_reason.unwrap_or("none")
     )
 }
@@ -4138,6 +4226,8 @@ struct TcpPoolConnectionSelection {
     conn: Connection,
     lease: TcpPoolSlotLease,
     active_before: u64,
+    path_service: TcpPoolPathService,
+    path_service_tiebreak: bool,
     generation: u64,
     last_success_age_secs: Option<u64>,
     probe_result: &'static str,
@@ -4575,15 +4665,30 @@ impl TuicUpstream {
         Ok(())
     }
 
-    /// TCP 专用连接选择。Selection atomically reserves the least-active observed slot before any
-    /// mutex wait, so a following opener sees that load instead of depending on global open parity.
+    /// TCP 专用连接选择。Selection samples current Quinn path service without waiting, then atomically
+    /// reserves the least-active observed slot. Equal nonzero loads prefer greater `cwnd / RTT`;
+    /// an idle pool keeps stable-index ordering so a following opener observes the first reservation.
     /// Idle age only requests a bounded liveness probe; it is not itself permission to destroy an
     /// auxiliary connection. The per-slot mutex still serializes probe/reconnect and connection
     /// cloning while the already-visible reservation steers unrelated opens toward other slots.
     async fn live_tcp_conn(&self) -> Result<TcpPoolConnectionSelection, ClientError> {
         let reservation = self
             .tcp_pool_selector
-            .reserve_least_active()
+            .reserve_least_active(|| {
+                self.conns
+                    .iter()
+                    .map(|slot| {
+                        let Ok(conn) = slot.try_lock() else {
+                            return TcpPoolPathService::Unknown;
+                        };
+                        if conn.close_reason().is_some() {
+                            return TcpPoolPathService::Unknown;
+                        }
+                        let path = conn.stats().path;
+                        TcpPoolPathService::known(path.cwnd, path.rtt)
+                    })
+                    .collect()
+            })
             .await
             .map_err(|error| {
                 ClientError::InvalidTarget(format!(
@@ -4594,6 +4699,8 @@ impl TuicUpstream {
             index,
             lease,
             active_before,
+            path_service,
+            path_service_tiebreak,
             preparation,
         } = reservation;
         let idle_exclusive = active_before == 0;
@@ -4667,6 +4774,8 @@ impl TuicUpstream {
             conn,
             lease,
             active_before,
+            path_service,
+            path_service_tiebreak,
             generation: open_state.generation(),
             last_success_age_secs,
             probe_result,
@@ -5080,6 +5189,8 @@ impl ProxyUpstream for TuicUpstream {
             conn,
             lease,
             active_before,
+            path_service,
+            path_service_tiebreak,
             generation,
             last_success_age_secs,
             probe_result,
@@ -5112,15 +5223,17 @@ impl ProxyUpstream for TuicUpstream {
             let diag_meta = if tcp_diag_enabled() {
                 println!(
                     "{}",
-                    format_tuic_tcp_pool_selection_line(
+                    format_tuic_tcp_pool_selection_line(TuicTcpPoolSelectionDiag {
                         conn_index,
                         stable_id,
                         active_before,
+                        path_service,
+                        path_service_tiebreak,
                         generation,
                         last_success_age_secs,
                         probe_result,
                         reconnect_reason,
-                    )
+                    })
                 );
                 println!(
                     "{}",
@@ -5226,6 +5339,8 @@ impl ProxyUpstream for TuicUpstream {
             conn,
             lease,
             active_before,
+            path_service,
+            path_service_tiebreak,
             generation,
             last_success_age_secs,
             probe_result,
@@ -5252,15 +5367,17 @@ impl ProxyUpstream for TuicUpstream {
             let diag_meta = if tcp_diag_enabled() {
                 println!(
                     "{}",
-                    format_tuic_tcp_pool_selection_line(
+                    format_tuic_tcp_pool_selection_line(TuicTcpPoolSelectionDiag {
                         conn_index,
                         stable_id,
                         active_before,
+                        path_service,
+                        path_service_tiebreak,
                         generation,
                         last_success_age_secs,
                         probe_result,
                         reconnect_reason,
-                    )
+                    })
                 );
                 println!(
                     "{}",
@@ -6810,21 +6927,29 @@ mod tests {
     }
 
     #[test]
-    fn format_tuic_tcp_pool_selection_line_identifies_lease_aware_policy() {
-        let line = format_tuic_tcp_pool_selection_line(
-            1,
-            42,
-            0,
-            7,
-            Some(15),
-            "alive",
-            Some("previous_open_failure"),
-        );
+    fn format_tuic_tcp_pool_selection_line_identifies_path_service_policy() {
+        let line = format_tuic_tcp_pool_selection_line(TuicTcpPoolSelectionDiag {
+            conn_index: 1,
+            stable_id: 42,
+            active_before: 62,
+            path_service: TcpPoolPathService::known(23_842, Duration::from_millis(163)),
+            path_service_tiebreak: true,
+            generation: 7,
+            last_success_age_secs: Some(15),
+            probe_result: "alive",
+            reconnect_reason: Some("previous_open_failure"),
+        });
 
         assert!(line.contains("tuic-tcp-pool-selection"), "{line}");
         assert!(line.contains("conn=1 id=42"), "{line}");
-        assert!(line.contains("policy=least_active"), "{line}");
-        assert!(line.contains("active_before=0"), "{line}");
+        assert!(
+            line.contains("policy=least_active_then_path_service"),
+            "{line}"
+        );
+        assert!(line.contains("active_before=62"), "{line}");
+        assert!(line.contains("path_cwnd=23842"), "{line}");
+        assert!(line.contains("path_rtt_us=163000"), "{line}");
+        assert!(line.contains("path_service_tiebreak=true"), "{line}");
         assert!(line.contains("generation=7"), "{line}");
         assert!(line.contains("last_success_age_secs=15"), "{line}");
         assert!(line.contains("probe_result=alive"), "{line}");
@@ -7599,17 +7724,17 @@ mod tests {
 
         {
             let prior = selector
-                .try_reserve_least_active()
+                .try_reserve_least_active(&[])
                 .expect("an idle pool must accept a historical one-flow phase");
             assert_eq!(prior.index, 0);
             assert_eq!(prior.active_before, 0);
         }
 
         let control = selector
-            .try_reserve_least_active()
+            .try_reserve_least_active(&[])
             .expect("the next control flow must reserve the primary slot");
         let data = selector
-            .try_reserve_least_active()
+            .try_reserve_least_active(&[])
             .expect("the live control reservation must steer data to auxiliary");
 
         assert_eq!((control.index, control.active_before), (0, 0));
@@ -7620,15 +7745,136 @@ mod tests {
     }
 
     #[test]
+    fn tcp_pool_equal_busy_load_prefers_greater_path_service() {
+        let selector = TcpPoolLeaseSelector::new(2);
+        selector.active_slots[0].store(62, Ordering::Release);
+        selector.active_slots[1].store(62, Ordering::Release);
+        let path_service = [
+            TcpPoolPathService::known(10_124, Duration::from_millis(163)),
+            TcpPoolPathService::known(23_842, Duration::from_millis(163)),
+        ];
+
+        let selected = selector
+            .try_reserve_least_active(&path_service)
+            .expect("an equal-load busy pool must use current path service");
+
+        assert_eq!((selected.index, selected.active_before), (1, 62));
+        assert!(selected.path_service_tiebreak);
+    }
+
+    #[test]
+    fn tcp_pool_path_service_compares_exact_ratio_and_rejects_invalid_samples() {
+        let lower_window_better_service =
+            TcpPoolPathService::known(10_000, Duration::from_millis(100));
+        let higher_window_lower_service =
+            TcpPoolPathService::known(15_000, Duration::from_millis(200));
+        assert!(lower_window_better_service.has_greater_service_than(higher_window_lower_service));
+        assert!(!higher_window_lower_service.has_greater_service_than(lower_window_better_service));
+
+        let max_fast = TcpPoolPathService::known(u64::MAX, Duration::from_micros(1));
+        let max_slow = TcpPoolPathService::known(u64::MAX, Duration::from_micros(2));
+        assert!(max_fast.has_greater_service_than(max_slow));
+        assert_eq!(
+            TcpPoolPathService::known(0, Duration::from_millis(1)),
+            TcpPoolPathService::Unknown
+        );
+        assert_eq!(
+            TcpPoolPathService::known(1, Duration::ZERO),
+            TcpPoolPathService::Unknown
+        );
+    }
+
+    #[test]
+    fn tcp_pool_idle_pair_ignores_stale_path_service_history() {
+        let selector = TcpPoolLeaseSelector::new(2);
+        let path_service = [
+            TcpPoolPathService::known(10_124, Duration::from_millis(163)),
+            TcpPoolPathService::known(23_842, Duration::from_millis(163)),
+        ];
+
+        let control = selector
+            .try_reserve_least_active(&path_service)
+            .expect("idle control must reserve the stable primary slot");
+        let data = selector
+            .try_reserve_least_active(&path_service)
+            .expect("the live control reservation must steer data to auxiliary");
+
+        assert_eq!((control.index, control.active_before), (0, 0));
+        assert_eq!((data.index, data.active_before), (1, 0));
+        assert!(!control.path_service_tiebreak);
+        assert!(!data.path_service_tiebreak);
+    }
+
+    #[test]
+    fn tcp_pool_unequal_load_precedes_path_service() {
+        let selector = TcpPoolLeaseSelector::new(2);
+        selector.active_slots[0].store(3, Ordering::Release);
+        selector.active_slots[1].store(4, Ordering::Release);
+        let path_service = [
+            TcpPoolPathService::known(1, Duration::from_secs(1)),
+            TcpPoolPathService::known(1_000_000, Duration::from_millis(1)),
+        ];
+
+        let selected = selector
+            .try_reserve_least_active(&path_service)
+            .expect("lease load remains the first ordering key");
+
+        assert_eq!((selected.index, selected.active_before), (0, 3));
+        assert!(!selected.path_service_tiebreak);
+    }
+
+    #[test]
+    fn tcp_pool_known_path_service_precedes_unknown_for_equal_busy_load() {
+        let selector = TcpPoolLeaseSelector::new(2);
+        selector.active_slots[0].store(4, Ordering::Release);
+        selector.active_slots[1].store(4, Ordering::Release);
+        let path_service = [
+            TcpPoolPathService::Unknown,
+            TcpPoolPathService::known(10_000, Duration::from_millis(100)),
+        ];
+
+        let selected = selector
+            .try_reserve_least_active(&path_service)
+            .expect("known current service must win an equal busy-load tie");
+
+        assert_eq!((selected.index, selected.active_before), (1, 4));
+        assert!(selected.path_service_tiebreak);
+    }
+
+    #[test]
+    fn tcp_pool_equal_or_unknown_path_service_keeps_stable_index() {
+        let selector = TcpPoolLeaseSelector::new(2);
+        selector.active_slots[0].store(8, Ordering::Release);
+        selector.active_slots[1].store(8, Ordering::Release);
+        let equal_service = [
+            TcpPoolPathService::known(10_000, Duration::from_millis(100)),
+            TcpPoolPathService::known(20_000, Duration::from_millis(200)),
+        ];
+
+        let equal = selector
+            .try_reserve_least_active(&equal_service)
+            .expect("equal path service must keep stable index ordering");
+        assert_eq!((equal.index, equal.active_before), (0, 8));
+        assert!(!equal.path_service_tiebreak);
+        drop(equal);
+
+        let unknown = selector
+            .try_reserve_least_active(&[])
+            .expect("missing samples must keep stable index ordering");
+        assert_eq!((unknown.index, unknown.active_before), (0, 8));
+        assert!(!unknown.path_service_tiebreak);
+    }
+
+    #[test]
     fn tcp_pool_preparing_slot_cannot_be_overtaken_before_connection_clone() {
         let selector = TcpPoolLeaseSelector::new(2);
         selector.active_slots[1].store(4, Ordering::Release);
 
         let first = selector
-            .try_reserve_least_active()
+            .try_reserve_least_active(&[])
             .expect("the idle primary slot must be selected first");
         let second = selector
-            .try_reserve_least_active()
+            .try_reserve_least_active(&[])
             .expect("the preparing primary must steer the next opener to auxiliary");
 
         assert_eq!((first.index, first.active_before), (0, 0));
@@ -7643,11 +7889,20 @@ mod tests {
     async fn tcp_pool_busy_waiter_wakes_after_preparation_releases() {
         let selector = Arc::new(TcpPoolLeaseSelector::new(1));
         let first = selector
-            .try_reserve_least_active()
+            .try_reserve_least_active(&[])
             .expect("the only idle slot must be reservable");
+        let sample_calls = Arc::new(AtomicU64::new(0));
         let waiter = tokio::spawn({
             let selector = selector.clone();
-            async move { selector.reserve_least_active().await }
+            let sample_calls = sample_calls.clone();
+            async move {
+                selector
+                    .reserve_least_active(|| {
+                        sample_calls.fetch_add(1, Ordering::Relaxed);
+                        Vec::new()
+                    })
+                    .await
+            }
         });
         tokio::task::yield_now().await;
         assert!(
@@ -7662,6 +7917,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!((second.index, second.active_before), (0, 0));
+        assert!(
+            sample_calls.load(Ordering::Relaxed) >= 2,
+            "a waiter must refresh path service after preparation releases"
+        );
         drop(second);
         assert_eq!(selector.active_slots[0].load(Ordering::Acquire), 0);
     }
@@ -7679,7 +7938,7 @@ mod tests {
                 let selected_tx = selected_tx.clone();
                 std::thread::spawn(move || {
                     let reservation = selector
-                        .try_reserve_least_active()
+                        .try_reserve_least_active(&[])
                         .expect("an idle two-slot pool must accept both reservations");
                     selected_tx.send(reservation.index).unwrap();
                     held.wait();
@@ -7707,7 +7966,7 @@ mod tests {
     fn tcp_pool_reservation_fails_closed_for_empty_or_saturated_slots() {
         let empty = TcpPoolLeaseSelector::new(0);
         assert!(matches!(
-            empty.try_reserve_least_active(),
+            empty.try_reserve_least_active(&[]),
             Err(TcpPoolReservationError::Empty)
         ));
 
@@ -7715,7 +7974,7 @@ mod tests {
         saturated.active_slots[0].store(u64::MAX, Ordering::Release);
         saturated.active_slots[1].store(u64::MAX, Ordering::Release);
         assert!(matches!(
-            saturated.try_reserve_least_active(),
+            saturated.try_reserve_least_active(&[]),
             Err(TcpPoolReservationError::Saturated)
         ));
         assert_eq!(saturated.active_slots[0].load(Ordering::Acquire), u64::MAX);

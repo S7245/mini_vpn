@@ -1,5 +1,24 @@
 # Learnings
 
+## 2026-08-02 - Equal ownership is not equal current transport service
+
+- Lease-aware selection correctly prevents history/parity drift, but two
+  long-lived QUIC slots with equal relay counts can have very different
+  congestion-window service at the next open. Stable index then creates a
+  deterministic hot spot even though every ownership invariant passes.
+- Preserve the stronger invariant hierarchy: least active first; stable idle
+  pairing; only an equal nonzero tie may use a volatile plain-value
+  `cwnd/RTT` hint. This keeps lifecycle safety independent of transport
+  heuristics and introduces no tuning constant.
+- Volatile evidence belongs outside the selector's deep module. Convert Quinn
+  stats at a nonblocking adapter, compare exact ratios in `u128`, and make
+  locked/closed/zero/missing observations unknown rather than a health action.
+- A wait boundary invalidates a point-in-time sample. Resample after
+  preparation wake-up; focused waiter coverage should prove it before the
+  long-run acceptance test.
+- Result:
+  `docs/tech/2026-08-02-knife15-m2-path-service-aware-pool-selection-local-results.md`.
+
 ## 2026-08-02 - Kernel teardown can finish ownership before the ledger observes it
 
 - macOS removed three interface routes with the dead owned utun. The runner
