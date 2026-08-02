@@ -89,6 +89,7 @@ M0_IPERF3_BIN=iperf3
 M0_DIG_BIN=dig
 M0_SLEEP_BIN=sleep
 M2_ROUTE_BIN=route
+M2_IFCONFIG_BIN=ifconfig
 M2_NETWORKSETUP_BIN=networksetup
 M2_DSCACHEUTIL_BIN=dscacheutil
 M2_CURL_BIN=curl
@@ -891,10 +892,64 @@ m2_full_tunnel_is_restored() {
     return 1
 }
 
+m2_owned_route_cleanup_classification() {
+  local current_interface="${1:-}" current_gateway="${2:-}"
+  local utun="${3:-}" physical_interface="${4:-}"
+  local physical_gateway="${5:-}" tun_available="${6:-}"
+  [[ -n "$current_interface" && -n "$utun" && \
+    -n "$physical_interface" && -n "$physical_gateway" && \
+    ( "$tun_available" == "0" || "$tun_available" == "1" ) ]] || return 1
+  if [[ "$current_interface" == "$utun" ]]; then
+    printf '%s\n' delete_owned
+  elif [[ "$tun_available" == "0" && \
+    "$current_interface" == "$physical_interface" && \
+    "$current_gateway" == "$physical_gateway" ]]; then
+    printf '%s\n' release_kernel_reaped
+  else
+    printf '%s\n' mismatch
+  fi
+}
+
+m2_cleanup_owned_interface_route() {
+  local run_dir="$1" state_name="$2" label="$3" probe="$4"
+  local destination="$5" utun="$6" physical_interface="$7"
+  local physical_gateway="$8" tun_available="$9"
+  local current_interface current_gateway classification
+  [[ "$(read_state "$state_name" 2>/dev/null || true)" == "1" ]] || return 0
+  current_interface="$(m2_route_interface "$probe")"
+  current_gateway="$(m2_route_gateway "$probe")"
+  classification="$(m2_owned_route_cleanup_classification \
+    "$current_interface" "$current_gateway" "$utun" "$physical_interface" \
+    "$physical_gateway" "$tun_available")" || return 1
+  case "$classification" in
+    delete_owned)
+      "$M2_ROUTE_BIN" -n delete -net "$destination" \
+        >>"$run_dir/cleanup.log" 2>&1 || return 1
+      ;;
+    release_kernel_reaped)
+      printf 'release kernel-reaped %s route: interface=%s gateway=%s utun=%s\n' \
+        "$label" "$current_interface" "$current_gateway" "$utun" \
+        >>"$run_dir/cleanup.log" || return 1
+      append_event_to "$run_dir" \
+        "m2 kernel-reaped route released: label=$label interface=$current_interface gateway=$current_gateway" || \
+        return 1
+      ;;
+    *)
+      printf 'refuse mismatched %s route: interface=%s gateway=%s utun=%s physical=%s/%s tun_available=%s\n' \
+        "$label" "${current_interface:-missing}" "${current_gateway:-missing}" \
+        "$utun" "$physical_interface" "$physical_gateway" "$tun_available" \
+        >>"$run_dir/cleanup.log" || true
+      return 1
+      ;;
+  esac
+  write_state "$state_name" 0
+}
+
 deactivate_m2_full_tunnel() {
   local run_dir="$1"
   local status utun exit_host dns_target physical_interface physical_gateway
   local dns_service snapshot_file current_interface current_gateway failed=0
+  local tun_available=1
   status="$(read_state m2.full_tunnel 2>/dev/null || true)"
   [[ -n "$status" ]] || return 0
   if [[ "$status" == "inactive" ]]; then
@@ -912,36 +967,17 @@ deactivate_m2_full_tunnel() {
     -n "$physical_interface" && -n "$physical_gateway" && \
     -n "$dns_service" && -n "$snapshot_file" ]] || return 1
 
-  if [[ "$(read_state m2.fake_route_owned 2>/dev/null || true)" == "1" ]]; then
-    current_interface="$(m2_route_interface "$M2_FAKE_PROBE")"
-    if [[ "$current_interface" == "$utun" ]] && \
-      "$M2_ROUTE_BIN" -n delete -net 198.18.0.0/15 \
-        >>"$run_dir/cleanup.log" 2>&1; then
-      write_state m2.fake_route_owned 0
-    else
-      failed=1
-    fi
-  fi
-  if [[ "$(read_state m2.low_route_owned 2>/dev/null || true)" == "1" ]]; then
-    current_interface="$(m2_route_interface "$M2_PUBLIC_LOW_PROBE")"
-    if [[ "$current_interface" == "$utun" ]] && \
-      "$M2_ROUTE_BIN" -n delete -net 0.0.0.0/1 \
-        >>"$run_dir/cleanup.log" 2>&1; then
-      write_state m2.low_route_owned 0
-    else
-      failed=1
-    fi
-  fi
-  if [[ "$(read_state m2.high_route_owned 2>/dev/null || true)" == "1" ]]; then
-    current_interface="$(m2_route_interface "$M2_PUBLIC_HIGH_PROBE")"
-    if [[ "$current_interface" == "$utun" ]] && \
-      "$M2_ROUTE_BIN" -n delete -net 128.0.0.0/1 \
-        >>"$run_dir/cleanup.log" 2>&1; then
-      write_state m2.high_route_owned 0
-    else
-      failed=1
-    fi
-  fi
+  "$M2_IFCONFIG_BIN" "$utun" >/dev/null 2>&1 || tun_available=0
+
+  m2_cleanup_owned_interface_route "$run_dir" m2.fake_route_owned fake \
+    "$M2_FAKE_PROBE" 198.18.0.0/15 "$utun" "$physical_interface" \
+    "$physical_gateway" "$tun_available" || failed=1
+  m2_cleanup_owned_interface_route "$run_dir" m2.low_route_owned low \
+    "$M2_PUBLIC_LOW_PROBE" 0.0.0.0/1 "$utun" "$physical_interface" \
+    "$physical_gateway" "$tun_available" || failed=1
+  m2_cleanup_owned_interface_route "$run_dir" m2.high_route_owned high \
+    "$M2_PUBLIC_HIGH_PROBE" 128.0.0.0/1 "$utun" "$physical_interface" \
+    "$physical_gateway" "$tun_available" || failed=1
   if [[ "$(read_state m2.dns_owned 2>/dev/null || true)" == "1" ]]; then
     if m2_dns_snapshot_matches_target "$dns_service" "$dns_target" && \
       m2_restore_dns_snapshot "$dns_service" "$snapshot_file" \
@@ -2664,7 +2700,7 @@ EOF_M2_PROFILE
 }
 
 runner_self_test() {
-  local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture service_fixture dns_fixture m2_route_bin m2_networksetup_bin m2_dscacheutil_bin m2_curl_bin m2_route_state m2_run m2_result m2_schedule_run m2_test_profile m2_checkpoint_file m2_capture_run m2_ipv6_evidence original_m2_route_bin original_m2_networksetup_bin original_m2_dscacheutil_bin original_m2_curl_bin collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir baseline_summary_text m0_profile m1_profile m2_profile m1_test_profile m0_run m1_stage_run m1_run m1_diagnostic_run m1_diagnostic_fail_run m1_diagnostic_formal_run m1_checkpoint_file m1_capture_run m1_formal_run m1_tcp_fixture m1_udp_fixture m0_fail_run direct_dir fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash bounded_status result_index result_label sample_index violations_before violation_count invalid_violations ipv6_class ipv6_interface
+  local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture service_fixture dns_fixture m2_route_bin m2_ifconfig_bin m2_networksetup_bin m2_dscacheutil_bin m2_curl_bin m2_route_state m2_run m2_result m2_schedule_run m2_test_profile m2_checkpoint_file m2_capture_run m2_ipv6_evidence original_m2_route_bin original_m2_ifconfig_bin original_m2_networksetup_bin original_m2_dscacheutil_bin original_m2_curl_bin collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir baseline_summary_text m0_profile m1_profile m2_profile m1_test_profile m0_run m1_stage_run m1_run m1_diagnostic_run m1_diagnostic_fail_run m1_diagnostic_formal_run m1_checkpoint_file m1_capture_run m1_formal_run m1_tcp_fixture m1_udp_fixture m0_fail_run direct_dir fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash bounded_status result_index result_label sample_index violations_before violation_count invalid_violations ipv6_class ipv6_interface cleanup_class
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/knife15-macos-self-test.XXXXXX")" || return 1
   good_log="$tmp/good.log"
   bad_log="$tmp/bad.log"
@@ -2757,6 +2793,26 @@ EOF_NETWORK_SERVICES
   )"
   [[ "$ipv6_class" == "unknown" && "$ipv6_interface" == "none" ]] || \
     die "self-test: successful IPv6 lookup without interface was accepted"
+  cleanup_class="$(m2_owned_route_cleanup_classification \
+    utun42 '' utun42 en0 192.168.50.1 1)"
+  [[ "$cleanup_class" == "delete_owned" ]] || \
+    die "self-test: live owned M2 route was not selected for deletion"
+  cleanup_class="$(m2_owned_route_cleanup_classification \
+    en0 192.168.50.1 utun42 en0 192.168.50.1 0)"
+  [[ "$cleanup_class" == "release_kernel_reaped" ]] || \
+    die "self-test: exact kernel-reaped M2 route was not releasable"
+  cleanup_class="$(m2_owned_route_cleanup_classification \
+    en0 192.168.50.1 utun42 en0 192.168.50.1 1)"
+  [[ "$cleanup_class" == "mismatch" ]] || \
+    die "self-test: live-utun external M2 route mutation was accepted"
+  cleanup_class="$(m2_owned_route_cleanup_classification \
+    utun99 '' utun42 en0 192.168.50.1 0)"
+  [[ "$cleanup_class" == "mismatch" ]] || \
+    die "self-test: foreign tunnel M2 route mutation was accepted"
+  cleanup_class="$(m2_owned_route_cleanup_classification \
+    en0 192.168.60.1 utun42 en0 192.168.50.1 0)"
+  [[ "$cleanup_class" == "mismatch" ]] || \
+    die "self-test: wrong-gateway M2 route mutation was accepted"
 
   m2_route_state="$tmp/m2-route-state"
   m2_run="$tmp/m2-route-run"
@@ -2768,6 +2824,7 @@ EOF_NETWORK_SERVICES
   printf '%s\n' 9.9.9.9 >"$m2_route_state/dns-current"
   : >"$m2_route_state/commands.log"
   m2_route_bin="$tmp/m2-route"
+  m2_ifconfig_bin="$tmp/m2-ifconfig"
   m2_networksetup_bin="$tmp/m2-networksetup"
   m2_dscacheutil_bin="$tmp/m2-dscacheutil"
   m2_curl_bin="$tmp/m2-curl"
@@ -2836,6 +2893,11 @@ else
   exit 2
 fi
 EOF_M2_FAKE_ROUTE
+  cat >"$m2_ifconfig_bin" <<'EOF_M2_FAKE_IFCONFIG'
+#!/usr/bin/env bash
+set -u
+[[ "${1:-}" == "utun42" && -f "$M2_TEST_DIR/utun_available" ]]
+EOF_M2_FAKE_IFCONFIG
   cat >"$m2_networksetup_bin" <<'EOF_M2_FAKE_NETWORKSETUP'
 #!/usr/bin/env bash
 set -u
@@ -2924,15 +2986,17 @@ printf '%s\n' \
   'http_code=200' \
   'size_download=16'
 EOF_M2_FAKE_CURL
-  chmod +x "$m2_route_bin" "$m2_networksetup_bin" "$m2_dscacheutil_bin" \
-    "$m2_curl_bin"
+  chmod +x "$m2_route_bin" "$m2_ifconfig_bin" "$m2_networksetup_bin" \
+    "$m2_dscacheutil_bin" "$m2_curl_bin"
   original_state_dir="$STATE_DIR"
   original_m2_route_bin="$M2_ROUTE_BIN"
+  original_m2_ifconfig_bin="$M2_IFCONFIG_BIN"
   original_m2_networksetup_bin="$M2_NETWORKSETUP_BIN"
   original_m2_dscacheutil_bin="$M2_DSCACHEUTIL_BIN"
   original_m2_curl_bin="$M2_CURL_BIN"
   STATE_DIR="$tmp/m2-state"
   M2_ROUTE_BIN="$m2_route_bin"
+  M2_IFCONFIG_BIN="$m2_ifconfig_bin"
   M2_NETWORKSETUP_BIN="$m2_networksetup_bin"
   M2_DSCACHEUTIL_BIN="$m2_dscacheutil_bin"
   M2_CURL_BIN="$m2_curl_bin"
@@ -3017,6 +3081,24 @@ EOF_M2_FAKE_CURL
   deactivate_m2_full_tunnel "$m2_run" || \
     die "self-test: repeated M2 full-tunnel cleanup was not idempotent"
 
+  : >"$m2_route_state/commands.log"
+  activate_m2_full_tunnel "$m2_run" || \
+    die "self-test: M2 kernel-reap cleanup fixture activation failed"
+  rm -f "$m2_route_state/route_low" "$m2_route_state/route_high" \
+    "$m2_route_state/route_fake"
+  deactivate_m2_full_tunnel "$m2_run" || \
+    die "self-test: kernel-reaped M2 interface routes were not released"
+  [[ "$(read_state m2.full_tunnel)" == "inactive" ]] || \
+    die "self-test: kernel-reaped M2 cleanup did not become inactive"
+  for marker in low high fake; do
+    [[ "$(read_state "m2.${marker}_route_owned")" == "0" ]] || \
+      die "self-test: kernel-reaped M2 cleanup retained $marker ownership"
+    grep -Fq "release kernel-reaped $marker route:" "$m2_run/cleanup.log" || \
+      die "self-test: kernel-reaped M2 cleanup missed $marker evidence"
+  done
+  ! grep -Fq 'route -n delete -net' "$m2_route_state/commands.log" || \
+    die "self-test: kernel-reaped M2 cleanup deleted a non-owned route"
+
   rm -f "$m2_route_state"/route_*
   printf '%s\n' 9.9.9.9 >"$m2_route_state/dns-current"
   : >"$m2_route_state/commands.log"
@@ -3033,6 +3115,7 @@ EOF_M2_FAKE_CURL
     die "self-test: partial M2 activation changed DNS"
   STATE_DIR="$original_state_dir"
   M2_ROUTE_BIN="$original_m2_route_bin"
+  M2_IFCONFIG_BIN="$original_m2_ifconfig_bin"
   M2_NETWORKSETUP_BIN="$original_m2_networksetup_bin"
   M2_DSCACHEUTIL_BIN="$original_m2_dscacheutil_bin"
   M2_CURL_BIN="$original_m2_curl_bin"

@@ -1,10 +1,47 @@
 # TODO
 
-## Current Knife15 Plan (2026-08-01)
+## Current Knife15 Plan (2026-08-02)
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-01 — M2 IPv6 route observer repair)
+#### Latest decision (2026-08-02 — recover M2 kernel-reaped route ownership)
+
+Exact-source `6f1df4a` real HK M2 run
+`/tmp/mini_vpn_knife15_macos_20260801_053127` passed baseline/direct,
+start/smoke, exact IPv6 preflight, full-tunnel/real-client preflight, and one
+complete mixed cycle. Cycle 2 failed `short-forward-1` with
+`receiver_zero_interval`; this remains an independent bundle-review failure.
+
+Stop could not finalize the artifact. Diagnostic
+`/tmp/mini_vpn_knife15_cleanup_diag_20260801_053127.txt` (SHA-256
+`146eb0e1...`) selected one exact lifecycle defect:
+
+```text
+utun4 absent
+low/high/fake ownership markers = 1
+DNS/Exit ownership markers = 0
+all six IPv4 probes = en0 / 192.168.133.1
+current Ethernet DNS = saved pre-M2 DNS = EMPTY
+```
+
+macOS removed the interface routes with the dead utun, but the runner retained
+their markers and rejected the already-restored physical path. The repair
+performs no deletion and releases a marker only when the utun is absent and
+the route exactly matches the recorded physical interface/gateway. Every
+foreign, live, changed, missing, DNS, and IPv6 observation remains fail-closed.
+
+Result:
+`docs/tech/2026-08-02-knife15-m2-kernel-route-reap-cleanup-local-results.md`.
+
+Next:
+
+1. pull the pushed repair on the test Mac;
+2. run repeated `stop`, then `bundle`, against the existing state;
+3. synchronize the immutable bundle;
+4. replay the independent cycle-2 receiver-zero failure;
+5. do not rerun baseline/M2 or open M3 before that review.
+
+#### Previous decision (2026-08-01 — M2 IPv6 route observer repair)
 
 Exact-source `19b5ceb` HK bundle
 `/tmp/mini_vpn_knife15_macos_20260801_044032.tar.gz` (SHA-256

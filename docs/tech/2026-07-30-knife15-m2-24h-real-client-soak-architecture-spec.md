@@ -104,6 +104,14 @@ and removes the explicit Exit route only when its interface and gateway still
 match. Unexpected external route or DNS changes fail closed instead of being
 silently overwritten.
 
+An interface route may disappear with the owned utun before cleanup observes
+it. That is not an external owner if and only if the utun is absent and the
+probe resolves through the exact recorded physical interface and gateway. In
+that case cleanup records kernel-reap evidence and releases only its stale
+ownership marker; it issues no route mutation. A live/reused utun, foreign
+interface, changed gateway, missing observation, or DNS mismatch remains
+fail-closed.
+
 The watchdog and `stop` share the same idempotent cleanup. A process death,
 signal, partial route setup, workload failure, normal stop, or repeated stop
 must converge to the exact pre-M2 DNS list and a non-utun Target/DNS/Exit/
@@ -357,6 +365,8 @@ then becomes `PASS`.
 | physical IPv6 route exists | IPv6 leak boundary | block M2; do not claim full tunnel |
 | exact `not in table` line, no interface, and status zero | IPv6 route observer | classify safe absence; do not require an interface |
 | unknown IPv6 route status/text combination | IPv6 route observer | fail closed and preserve raw evidence before another baseline |
+| utun absent, route marker live, exact physical interface/gateway restored | M2 cleanup observer | record kernel reap, issue no delete, release stale ownership |
+| route marker live with a live utun, foreign interface, or changed gateway | M2 cleanup ownership | retain ownership and fail closed |
 | Target/Exit/gateway degrade together | external path/VPS | preserve evidence; no constant tuning |
 | receiver fails while controls and ownership stay clean | connection/QUIC service | architecture review; no unchanged repeat |
 | UDP loss exceeds 3% with healthy controls | UDP/TUIC quality | inspect datagram service, not TCP constants |

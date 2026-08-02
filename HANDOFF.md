@@ -2,7 +2,30 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-01)
+## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-02)
+
+- **Latest accepted position:** exact-source `6f1df4a` real HK M2 run
+  `/tmp/mini_vpn_knife15_macos_20260801_053127` passed baseline/direct,
+  start/smoke, IPv6/full-tunnel/real-client preflight, and cycle 1. Cycle 2
+  failed `short-forward-1` on `receiver_zero_interval`; that remains an
+  independent, unclassified bundle-review failure.
+- Stop could not bundle. The 151-line diagnostic
+  `/tmp/mini_vpn_knife15_cleanup_diag_20260801_053127.txt` (SHA-256
+  `146eb0e1...`) proves `utun4` absent, six IPv4 probes restored to exact
+  `en0/192.168.133.1`, and current/saved Ethernet DNS both `EMPTY`. Only
+  low/high/fake ownership markers remained one; DNS and Exit ownership were
+  already zero. macOS reaped the three interface routes with the utun and the
+  runner rejected its stale markers.
+- The repair releases a stale marker without route mutation only when the
+  owned utun is absent and the current route exactly matches the recorded
+  physical interface/gateway. Live/reused utun, foreign tunnel/interface,
+  changed gateway, missing observation, DNS/IPv6 mismatch remain fail-closed.
+  Result:
+  `docs/tech/2026-08-02-knife15-m2-kernel-route-reap-cleanup-local-results.md`.
+- Next pull the pushed repair on the test Mac and run only `stop`, then
+  `bundle`, to recover the existing artifact. Do not rerun baseline/M2 or
+  mutate routes/DNS manually. Replay the bundle before classifying the
+  receiver-zero failure. M3 remains blocked.
 
 - **Latest accepted position:** exact-source `19b5ceb` HK bundle
   `/tmp/mini_vpn_knife15_macos_20260801_044032.tar.gz` (SHA-256

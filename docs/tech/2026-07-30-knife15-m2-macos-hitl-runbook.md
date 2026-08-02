@@ -298,7 +298,11 @@ failure.
 
 If `stop` itself reports an owned route/DNS cleanup mismatch, do not start
 Clash or another VPN. Preserve the terminal output and run `status` again so
-the ownership conflict can be reviewed safely.
+the ownership conflict can be reviewed safely. Do not manually delete routes,
+change DNS, or create an ad-hoc archive. A dead owned utun may have caused
+macOS to reap its interface routes; current descendants recognize only an
+exact return to the recorded physical interface/gateway and release the stale
+markers without issuing a delete. Every other mismatch remains fail-closed.
 
 ## Expected Total Time
 

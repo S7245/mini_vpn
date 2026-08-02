@@ -187,7 +187,32 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-08-01:
+Current Knife15 summary, as of 2026-08-02:
+
+- Exact-source `6f1df4a` real HK M2 run
+  `/tmp/mini_vpn_knife15_macos_20260801_053127` passed baseline/direct,
+  start/smoke, exact IPv6 preflight, full-tunnel/real-client preflight, and one
+  complete mixed cycle. Cycle 2 failed `short-forward-1` with
+  `receiver_zero_interval`; preserve this as an independent bundle-review
+  failure and do not tune or repeat yet.
+- Stop then failed before bundling. Diagnostic
+  `/tmp/mini_vpn_knife15_cleanup_diag_20260801_053127.txt` (SHA-256
+  `146eb0e1...`) proves `utun4` absent, every route back on exact
+  `en0/192.168.133.1`, and current/saved Ethernet DNS both `EMPTY`, while only
+  the low/high/fake ownership markers remained one. DNS and Exit-route
+  ownership were already zero. This selects kernel route reap plus stale
+  runner markers, not Clash, operator, DNS, or data-plane failure.
+- Cleanup now deletes only a route still using the owned utun. If that utun is
+  absent and the probe exactly matches the recorded physical interface and
+  gateway, it records kernel-reap evidence, performs no route mutation, and
+  clears the stale marker. Live/reused utun, foreign interface/tunnel, changed
+  gateway, missing observation, DNS mismatch, and IPv6 mismatch remain
+  fail-closed. Result:
+  `docs/tech/2026-08-02-knife15-m2-kernel-route-reap-cleanup-local-results.md`.
+- Next pull the pushed cleanup repair on the test Mac and run only repeated
+  `stop`, then `bundle`, to recover the existing immutable artifact. Do not
+  rerun baseline/M2. Replay the bundle before classifying the independent
+  receiver-zero failure. M3 remains blocked.
 
 - Exact-source `19b5ceb` HK bundle
   `/tmp/mini_vpn_knife15_macos_20260801_044032.tar.gz` (SHA-256

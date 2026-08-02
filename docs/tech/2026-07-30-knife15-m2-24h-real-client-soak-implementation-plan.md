@@ -155,6 +155,19 @@ No Rust data-plane or frozen value changes are in scope.
 - [x] Re-run internal/external shell gates, Bash 3.2 syntax, the original local
   macOS reproduction, review, diff, link, and secret gates.
 
+### Task 14: Recover kernel-reaped M2 interface-route ownership
+
+- [x] Replay the protected cleanup diagnostic and separate route/DNS state,
+  ownership markers, utun availability, and current physical path.
+- [x] RED the real state: marker one, utun absent, and all three probes already
+  restored to the exact recorded physical interface/gateway.
+- [x] GREEN a no-mutation ownership release for only that exact state.
+- [x] Keep live/reused utun, foreign interface/tunnel, changed gateway,
+  missing route evidence, DNS mismatch, and IPv6 mismatch fail-closed.
+- [x] Assert the recovery emits evidence and executes no `route delete -net`.
+- [x] Re-run internal/external shell gates, Bash 3.2 syntax, review, diff,
+  link, and secret gates; commit and push before recovering the real run.
+
 ## User Execution Stop Position
 
 Only after Task 12 passes may the user run:

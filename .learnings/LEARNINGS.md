@@ -1,5 +1,22 @@
 # Learnings
 
+## 2026-08-02 - Kernel teardown can finish ownership before the ledger observes it
+
+- macOS removed three interface routes with the dead owned utun. The runner
+  still had ownership markers at one and misread the exact restored physical
+  route as an external mutation.
+- Cleanup needs three states, not two: still-owned state is deleted; exact
+  pre-run state after owner disappearance releases only the stale marker; any
+  live/reused owner, foreign interface, changed gateway, or missing evidence
+  fails closed.
+- Non-mutation is part of the proof. The regression fixture must assert that
+  the kernel-reap branch writes evidence but never invokes `route delete`.
+- A cleanup failure and the workload failure that preceded it are independent.
+  Recover the immutable bundle first, then classify the receiver-zero result;
+  neither failure authorizes threshold or data-plane tuning.
+- Result:
+  `docs/tech/2026-08-02-knife15-m2-kernel-route-reap-cleanup-local-results.md`.
+
 ## 2026-08-01 - Positive absence text can outrank a misleading exit status
 
 - After the physical service was set to IPv6 Off, macOS `route` printed the

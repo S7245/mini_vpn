@@ -1,5 +1,21 @@
 # Errors
 
+## 2026-08-02 - Dead-utun route reap stranded M2 ownership markers
+
+- The first formal M2 run failed a workload phase, then repeated stop attempts
+  could not finalize evidence. DNS and the Exit host-route ownership reached
+  zero, but low/high/fake markers stayed one after `utun4` disappeared.
+- All affected probes had already returned to the exact recorded
+  `en0/192.168.133.1` path and current/saved DNS were both `EMPTY`. The cleanup
+  observer accepted only a route still pointing to the owned utun, so normal
+  kernel teardown became a permanent fail-closed loop.
+- Correct behavior: when the utun is absent, release only a stale marker and
+  only for the exact recorded physical interface/gateway; perform no route
+  mutation. A live/reused utun, foreign interface, changed gateway, missing
+  observation, DNS mismatch, or IPv6 mismatch must still fail closed.
+- Keep the independent `receiver_zero_interval` failure unclassified until the
+  recovered bundle is replayed.
+
 ## 2026-08-01 - Status-first IPv6 parsing rejected a known no-route result
 
 - The second HK attempt followed the documented `Automatic -> Off` flow but
