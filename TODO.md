@@ -1,10 +1,36 @@
 # TODO
 
-## Current Knife15 Plan (2026-08-02)
+## Current Knife15 Plan (2026-08-03)
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-02 — path-service-aware equal-busy pool selection)
+#### Latest decision (2026-08-03 — direct continuity preflight failed before TUN)
+
+Exact-source `6231048` baseline/direct directories
+`/tmp/mini_vpn_knife15_macos_baseline_20260803_035615` and
+`/tmp/mini_vpn_knife15_macos_direct_20260803_035733` are valid and correctly
+bound. Baseline receiver continuity passed at `12.930/49.357 Mbit/s`, but the
+300-second direct Target test failed even at `6.462 Mbit/s`: seven complete
+receiver-zero seconds occurred in two nonterminal episodes (`62–65s` and
+`152–156s`). Sender continuity failed at the same times, with 533 retransmits
+and cwnd as low as `1,344B`.
+
+This is an external physical Target-path continuity preflight failure. It is
+not “bandwidth below 200M,” and it occurs before any Knife15 TUN/product path.
+Do not run `start`; restore IPv6 immediately through the pre-start branch. No
+status/snapshot/stop is required. Result:
+`docs/tech/2026-08-03-knife15-hk-m2-direct-continuity-preflight-failure-results.md`.
+
+Next, after a materially later or repaired network window:
+
+1. use source `6231048` or a descendant and rebuild release;
+2. keep every other VPN off, disable only the recorded physical-service IPv6,
+   and require `m2-ipv6-check` PASS;
+3. take fresh baseline and direct evidence;
+4. proceed to `start -> smoke -> m2 -> status -> stop` only if direct PASSes;
+5. do not tune/repeat unchanged; keep M3 blocked.
+
+#### Previous decision (2026-08-02 — path-service-aware equal-busy pool selection)
 
 The recovered immutable bundle is
 `/tmp/mini_vpn_knife15_macos_20260801_053127.tar.gz` (SHA-256

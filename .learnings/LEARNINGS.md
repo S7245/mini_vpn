@@ -1,5 +1,20 @@
 # Learnings
 
+## 2026-08-03 - Low bandwidth and complete continuity loss are different gates
+
+- A direct path can sustain only `6.462 Mbit/s` and still be acceptable if
+  every complete receiver interval is positive. This run failed because it
+  stopped completely for three seconds and then four seconds, not because its
+  average was below a target rate.
+- Deriving the offered load from a short baseline protects slow links, but it
+  cannot make a noisy baseline predictive. Thousands of baseline retransmits
+  preceded the later cwnd collapse even at half the baseline receiver rate.
+- A pre-TUN direct failure is a valuable attribution stop: continuing into M2
+  would spend 24 hours while making any later receiver gap ambiguous. Restore
+  manual prerequisites and wait for a materially different network window.
+- Result:
+  `docs/tech/2026-08-03-knife15-hk-m2-direct-continuity-preflight-failure-results.md`.
+
 ## 2026-08-02 - Equal ownership is not equal current transport service
 
 - Lease-aware selection correctly prevents history/parity drift, but two

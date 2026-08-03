@@ -2,9 +2,29 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-02)
+## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-03)
 
-- **Latest accepted position:** recovered exact-source `6f1df4a` HK bundle
+- **Latest accepted position:** exact-source `6231048` HK preflight directories
+  `/tmp/mini_vpn_knife15_macos_baseline_20260803_035615` and
+  `/tmp/mini_vpn_knife15_macos_direct_20260803_035733` bind the reviewed
+  runner/binary and each other. Baseline receiver continuity passed at
+  `12.930/49.357 Mbit/s` forward/reverse.
+- The 300-second direct Target discriminator correctly reduced offered load to
+  `6.462 Mbit/s` but failed with seven complete receiver-zero seconds in two
+  nonterminal episodes (`62–65s`, `152–156s`). Sender zeroed at the same
+  boundaries, recorded 533 retransmits, and collapsed cwnd to `1,344B`.
+- This is a physical Target-path continuity preflight failure before TUN
+  startup, not mini_vpn, path-service selection, D16, Endpoint, M2, or a slow
+  bandwidth rejection. Do not execute `start`; use the runbook pre-start
+  branch to restore IPv6 immediately. No `status/snapshot/stop` is required.
+  Result:
+  `docs/tech/2026-08-03-knife15-hk-m2-direct-continuity-preflight-failure-results.md`.
+- Do not repeat unchanged in the same network window. After a materially later
+  or repaired path, take a fresh `m2-ipv6-check -> baseline -> direct`; only a
+  fresh PASS may continue immediately to `start -> smoke -> m2 -> status ->
+  stop`. No code or frozen value changed. M3 remains blocked.
+
+- **Previous reviewed position:** recovered exact-source `6f1df4a` HK bundle
   `/tmp/mini_vpn_knife15_macos_20260801_053127.tar.gz` (SHA-256
   `d4fc3bc6...`) proves the `cebf30d` kernel-reap cleanup repair worked:
   low/high/fake markers released without foreign route mutation, DNS/process

@@ -187,7 +187,26 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-08-02:
+Current Knife15 summary, as of 2026-08-03:
+
+- Exact-source `6231048` HK directories
+  `/tmp/mini_vpn_knife15_macos_baseline_20260803_035615` and
+  `/tmp/mini_vpn_knife15_macos_direct_20260803_035733` bind the reviewed
+  source/runner/binary and exact baseline hashes. Baseline receivers passed at
+  `12.930/49.357 Mbit/s` forward/reverse with no zero intervals.
+- The 300-second direct Target discriminator ran at the derived
+  `6.462 Mbit/s` but failed seven complete receiver intervals in two
+  nonterminal episodes (`62–65s`, `152–156s`). Sender continuity failed at the
+  same boundaries; 533 retransmits and cwnd collapse to `1,344B` prove a real
+  pre-TUN physical Target-path stall, not a command-tail observer or slow-rate
+  failure.
+- Do not execute `start`. Restore the physical-service IPv6 immediately using
+  the runbook pre-start branch; no status/snapshot/stop is required because no
+  TUN/route/DNS/process ownership began. Do not repeat unchanged in the same
+  network window. After a materially later or repaired path, take fresh
+  `m2-ipv6-check -> baseline -> direct` evidence and continue only on direct
+  PASS. No code or frozen value changed; M3 remains blocked. Result:
+  `docs/tech/2026-08-03-knife15-hk-m2-direct-continuity-preflight-failure-results.md`.
 
 - Recovered exact-source `6f1df4a` HK bundle
   `/tmp/mini_vpn_knife15_macos_20260801_053127.tar.gz` (SHA-256

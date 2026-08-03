@@ -1,5 +1,19 @@
 # Errors
 
+## 2026-08-03 - The fresh M2 direct discriminator lost complete seconds
+
+- Source `6231048` passed the 20-second baseline but the 300-second pre-TUN
+  direct discriminator recorded seven complete Target receiver-zero seconds
+  in two middle-of-command episodes. Sender zeros, retransmissions, and cwnd
+  collapse independently confirm real direct-path stalls.
+- Average throughput was only `6.462 Mbit/s`, but slow throughput is not the
+  rejection. Treating the result as “the HK link is slow” would erase the
+  exact continuity discriminator and make later M2 failure attribution
+  impossible.
+- Correct behavior: do not start TUN, restore IPv6 through the pre-start
+  branch, preserve the artifacts, and retry only after a materially later or
+  repaired external path. No code, constant, or SLI change is selected.
+
 ## 2026-08-02 - Equal busy TCP-pool loads hid a lower-service placement
 
 - The recovered first formal M2 bundle passed cycle 1, then cycle 2
