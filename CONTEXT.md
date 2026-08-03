@@ -16,6 +16,10 @@ _Avoid_: protocol (overloaded), connection (a transport can span reconnects)
 The current send-side service estimate of one TUIC TCP pool slot, represented by that QUIC path's congestion window divided by its RTT. It is a point-in-time placement hint for breaking equal, nonzero lease-load ties; it is not a bandwidth promise, a health verdict, or permission to change congestion-control constants. Unknown or idle evidence falls back to the pool's stable lease-aware ordering.
 _Avoid_: connection speed, bandwidth score, priority (the estimate is transient transport state, not a configured class of service)
 
+**TUIC TCP pool forward qualification**:
+Whether a TCP pool slot has added a Quinn PLPMTUD black-hole detection since the start of its current nonzero TCP-lease ownership epoch. A slot is qualified while the monotonic count stays at its epoch anchor and degraded after it advances; exact per-slot lease zero begins a new epoch. Qualification controls only new Target relay admission while the pool is busy. It never closes, reconnects, migrates, retries, or promises bandwidth, and an all-degraded pool retains a bounded least-active fallback.
+_Avoid_: connection health (qualification is one exact placement discriminator, not a complete health verdict), blacklist (zero ownership starts a new epoch), MTU tuning (the observed counter is used without changing MTU policy)
+
 **Direct baseline evidence**:
 The pre-TUN pair of forward and reverse iperf JSON results against the Target. It proves receiver-positive physical-path continuity for the short observation window and supplies the forward receiver rate from which the longer direct discriminator derives its offered load. Low average bandwidth is valid; a complete receiver-zero interval, malformed evidence, command failure, or validator execution failure is not. It is distinct from the 300-second direct discriminator and never exercises mini_vpn.
 _Avoid_: speed test (continuity and provenance, not maximum bandwidth, are the contract), VPN baseline (no TUN or VPN data plane is active)

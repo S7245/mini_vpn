@@ -549,6 +549,12 @@ struct TcpPoolSlotReservation {
     active_before: u64,
     path_service: TcpPoolPathService,
     path_service_tiebreak: bool,
+    qualification: TcpPoolForwardQualification,
+    qualification_anchor: Option<u64>,
+    black_holes_current: Option<u64>,
+    qualification_override: bool,
+    all_degraded_fallback: bool,
+    candidates: Vec<TcpPoolAdmissionCandidate>,
     preparation: TcpPoolSlotPreparation,
 }
 
@@ -592,36 +598,207 @@ impl TcpPoolPathService {
     }
 }
 
-struct TcpPoolLeaseSelector {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpPoolTransportIdentity {
+    stable_id: usize,
+    generation: u64,
+}
+
+impl TcpPoolTransportIdentity {
+    fn new(stable_id: usize, generation: u64) -> Self {
+        Self {
+            stable_id,
+            generation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum TcpPoolPathObservation {
+    #[default]
+    Unknown,
+    Known {
+        identity: TcpPoolTransportIdentity,
+        path_service: TcpPoolPathService,
+        black_holes_detected: u64,
+    },
+}
+
+impl TcpPoolPathObservation {
+    fn known(
+        identity: TcpPoolTransportIdentity,
+        cwnd: u64,
+        rtt: Duration,
+        black_holes_detected: u64,
+    ) -> Self {
+        Self::Known {
+            identity,
+            path_service: TcpPoolPathService::known(cwnd, rtt),
+            black_holes_detected,
+        }
+    }
+
+    fn path_service(self) -> TcpPoolPathService {
+        match self {
+            Self::Unknown => TcpPoolPathService::Unknown,
+            Self::Known { path_service, .. } => path_service,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum TcpPoolForwardQualification {
+    #[default]
+    Unknown,
+    Qualified,
+    Degraded,
+}
+
+impl TcpPoolForwardQualification {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Qualified => "qualified",
+            Self::Degraded => "degraded",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpPoolQualificationDecision {
+    qualification: TcpPoolForwardQualification,
+    anchor: Option<u64>,
+    current: Option<u64>,
+}
+
+impl TcpPoolQualificationDecision {
+    fn unknown(anchor: Option<u64>, current: Option<u64>) -> Self {
+        Self {
+            qualification: TcpPoolForwardQualification::Unknown,
+            anchor,
+            current,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TcpPoolQualificationEpoch {
+    identity: Option<TcpPoolTransportIdentity>,
+    black_hole_anchor: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpPoolAdmissionCandidate {
+    index: usize,
+    identity: Option<TcpPoolTransportIdentity>,
+    active_before: u64,
+    path_service: TcpPoolPathService,
+    qualification: TcpPoolForwardQualification,
+    qualification_anchor: Option<u64>,
+    black_holes_current: Option<u64>,
+    admitted: bool,
+}
+
+struct TcpPoolAdmission {
     active_slots: Vec<Arc<AtomicU64>>,
     preparing_slots: Vec<Arc<AtomicBool>>,
+    qualification_epochs: Vec<StdMutex<TcpPoolQualificationEpoch>>,
     available: Arc<Notify>,
 }
 
-impl TcpPoolLeaseSelector {
+impl TcpPoolAdmission {
     fn new(pool_len: usize) -> Self {
         Self {
             active_slots: (0..pool_len).map(|_| Arc::new(AtomicU64::new(0))).collect(),
             preparing_slots: (0..pool_len)
                 .map(|_| Arc::new(AtomicBool::new(false)))
                 .collect(),
+            qualification_epochs: (0..pool_len)
+                .map(|_| StdMutex::new(TcpPoolQualificationEpoch::default()))
+                .collect(),
             available: Arc::new(Notify::new()),
         }
     }
 
-    fn try_reserve_least_active(
+    fn qualification_for(
         &self,
-        path_service: &[TcpPoolPathService],
+        index: usize,
+        active_before: u64,
+        observation: TcpPoolPathObservation,
+    ) -> TcpPoolQualificationDecision {
+        let TcpPoolPathObservation::Known {
+            identity,
+            black_holes_detected,
+            ..
+        } = observation
+        else {
+            return TcpPoolQualificationDecision::unknown(None, None);
+        };
+        let Some(epoch) = self.qualification_epochs.get(index) else {
+            return TcpPoolQualificationDecision::unknown(None, Some(black_holes_detected));
+        };
+        let Ok(epoch) = epoch.lock() else {
+            return TcpPoolQualificationDecision::unknown(None, Some(black_holes_detected));
+        };
+
+        if active_before == 0 {
+            return TcpPoolQualificationDecision {
+                qualification: TcpPoolForwardQualification::Qualified,
+                anchor: Some(black_holes_detected),
+                current: Some(black_holes_detected),
+            };
+        }
+        if epoch.identity != Some(identity) {
+            return TcpPoolQualificationDecision::unknown(None, Some(black_holes_detected));
+        }
+
+        match black_holes_detected.cmp(&epoch.black_hole_anchor) {
+            std::cmp::Ordering::Less => TcpPoolQualificationDecision::unknown(
+                Some(epoch.black_hole_anchor),
+                Some(black_holes_detected),
+            ),
+            std::cmp::Ordering::Equal => TcpPoolQualificationDecision {
+                qualification: TcpPoolForwardQualification::Qualified,
+                anchor: Some(epoch.black_hole_anchor),
+                current: Some(black_holes_detected),
+            },
+            std::cmp::Ordering::Greater => TcpPoolQualificationDecision {
+                qualification: TcpPoolForwardQualification::Degraded,
+                anchor: Some(epoch.black_hole_anchor),
+                current: Some(black_holes_detected),
+            },
+        }
+    }
+
+    fn commit_idle_epoch(
+        &self,
+        index: usize,
+        identity: TcpPoolTransportIdentity,
+        black_hole_anchor: u64,
+    ) {
+        let Some(epoch) = self.qualification_epochs.get(index) else {
+            return;
+        };
+        let Ok(mut epoch) = epoch.lock() else {
+            return;
+        };
+        epoch.identity = Some(identity);
+        epoch.black_hole_anchor = black_hole_anchor;
+    }
+
+    fn try_reserve(
+        &self,
+        observations: &[TcpPoolPathObservation],
     ) -> Result<TcpPoolSlotReservation, TcpPoolReservationError> {
         if self.active_slots.is_empty() {
             return Err(TcpPoolReservationError::Empty);
         }
         debug_assert_eq!(self.active_slots.len(), self.preparing_slots.len());
+        debug_assert_eq!(self.active_slots.len(), self.qualification_epochs.len());
 
         loop {
-            let mut choice = None;
-            let mut path_service_tiebreak = false;
             let mut preparing = false;
+            let mut candidates = Vec::with_capacity(self.active_slots.len());
             for (index, (active, slot_preparing)) in self
                 .active_slots
                 .iter()
@@ -636,20 +813,79 @@ impl TcpPoolLeaseSelector {
                 if active_before == u64::MAX {
                     continue;
                 }
-                let candidate_service = path_service.get(index).copied().unwrap_or_default();
+                let observation = observations.get(index).copied().unwrap_or_default();
+                let path_service = observation.path_service();
+                let qualification = self.qualification_for(index, active_before, observation);
+                let identity = match observation {
+                    TcpPoolPathObservation::Unknown => None,
+                    TcpPoolPathObservation::Known { identity, .. } => Some(identity),
+                };
+                candidates.push(TcpPoolAdmissionCandidate {
+                    index,
+                    identity,
+                    active_before,
+                    path_service,
+                    qualification: qualification.qualification,
+                    qualification_anchor: qualification.anchor,
+                    black_holes_current: qualification.current,
+                    admitted: true,
+                });
+            }
+
+            if candidates.is_empty() {
+                return Err(if preparing {
+                    TcpPoolReservationError::Busy
+                } else {
+                    TcpPoolReservationError::Saturated
+                });
+            }
+
+            let all_busy = candidates
+                .iter()
+                .all(|candidate| candidate.active_before != 0);
+            let all_degraded_fallback = all_busy
+                && candidates.iter().all(|candidate| {
+                    candidate.qualification == TcpPoolForwardQualification::Degraded
+                });
+            let qualification_override = all_busy
+                && !all_degraded_fallback
+                && candidates.iter().any(|candidate| {
+                    candidate.qualification == TcpPoolForwardQualification::Degraded
+                });
+            if qualification_override {
+                for candidate in &mut candidates {
+                    candidate.admitted =
+                        candidate.qualification != TcpPoolForwardQualification::Degraded;
+                }
+            }
+
+            let mut choice: Option<TcpPoolAdmissionCandidate> = None;
+            let mut path_service_tiebreak = false;
+            for candidate in candidates
+                .iter()
+                .copied()
+                .filter(|candidate| candidate.admitted)
+            {
                 match choice {
-                    None => choice = Some((index, active_before, candidate_service)),
-                    Some((_, current_active, _)) if active_before < current_active => {
-                        choice = Some((index, active_before, candidate_service));
+                    None => choice = Some(candidate),
+                    Some(current) if candidate.active_before < current.active_before => {
+                        choice = Some(candidate);
                         path_service_tiebreak = false;
                     }
-                    Some((_, current_active, current_service))
-                        if active_before == current_active && active_before != 0 =>
+                    Some(current)
+                        if candidate.active_before == current.active_before
+                            && candidate.active_before != 0 =>
                     {
-                        if candidate_service.has_greater_service_than(current_service) {
-                            choice = Some((index, active_before, candidate_service));
+                        if candidate
+                            .path_service
+                            .has_greater_service_than(current.path_service)
+                        {
+                            choice = Some(candidate);
                             path_service_tiebreak = true;
-                        } else if current_service.has_greater_service_than(candidate_service) {
+                        } else if current
+                            .path_service
+                            .has_greater_service_than(candidate.path_service)
+                        {
                             path_service_tiebreak = true;
                         }
                     }
@@ -657,13 +893,11 @@ impl TcpPoolLeaseSelector {
                 }
             }
 
-            let Some((index, active_before, selected_path_service)) = choice else {
-                return Err(if preparing {
-                    TcpPoolReservationError::Busy
-                } else {
-                    TcpPoolReservationError::Saturated
-                });
+            let Some(selected) = choice else {
+                return Err(TcpPoolReservationError::Saturated);
             };
+            let index = selected.index;
+            let active_before = selected.active_before;
             let slot_preparing = self.preparing_slots[index].clone();
             if slot_preparing
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -685,12 +919,24 @@ impl TcpPoolLeaseSelector {
                 )
                 .is_ok()
             {
+                if active_before == 0
+                    && let (Some(identity), Some(black_hole_anchor)) =
+                        (selected.identity, selected.black_holes_current)
+                {
+                    self.commit_idle_epoch(index, identity, black_hole_anchor);
+                }
                 return Ok(TcpPoolSlotReservation {
                     index,
                     lease: TcpPoolSlotLease::from_reserved(active),
                     active_before,
-                    path_service: selected_path_service,
+                    path_service: selected.path_service,
                     path_service_tiebreak,
+                    qualification: selected.qualification,
+                    qualification_anchor: selected.qualification_anchor,
+                    black_holes_current: selected.black_holes_current,
+                    qualification_override,
+                    all_degraded_fallback,
+                    candidates,
                     preparation,
                 });
             }
@@ -698,14 +944,14 @@ impl TcpPoolLeaseSelector {
         }
     }
 
-    async fn reserve_least_active(
+    async fn reserve(
         &self,
-        mut sample_path_service: impl FnMut() -> Vec<TcpPoolPathService>,
+        mut sample_observations: impl FnMut() -> Vec<TcpPoolPathObservation>,
     ) -> Result<TcpPoolSlotReservation, TcpPoolReservationError> {
         loop {
             let available = self.available.notified();
-            let path_service = sample_path_service();
-            match self.try_reserve_least_active(&path_service) {
+            let observations = sample_observations();
+            match self.try_reserve(&observations) {
                 Err(TcpPoolReservationError::Busy) => available.await,
                 result => return result,
             }
@@ -2886,6 +3132,12 @@ struct TuicTcpPoolSelectionDiag<'a> {
     active_before: u64,
     path_service: TcpPoolPathService,
     path_service_tiebreak: bool,
+    qualification: TcpPoolForwardQualification,
+    qualification_anchor: Option<u64>,
+    black_holes_current: Option<u64>,
+    qualification_override: bool,
+    all_degraded_fallback: bool,
+    candidates: &'a [TcpPoolAdmissionCandidate],
     generation: u64,
     last_success_age_secs: Option<u64>,
     probe_result: &'a str,
@@ -2899,6 +3151,12 @@ fn format_tuic_tcp_pool_selection_line(diag: TuicTcpPoolSelectionDiag<'_>) -> St
         active_before,
         path_service,
         path_service_tiebreak,
+        qualification,
+        qualification_anchor,
+        black_holes_current,
+        qualification_override,
+        all_degraded_fallback,
+        candidates,
         generation,
         last_success_age_secs,
         probe_result,
@@ -2913,8 +3171,41 @@ fn format_tuic_tcp_pool_selection_line(diag: TuicTcpPoolSelectionDiag<'_>) -> St
             (cwnd.to_string(), rtt_micros.to_string())
         }
     };
+    let optional_counter = |value: Option<u64>| {
+        value
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".into())
+    };
+    let candidates = candidates
+        .iter()
+        .map(|candidate| {
+            let identity = candidate
+                .identity
+                .map(|identity| format!("{}@{}", identity.stable_id, identity.generation))
+                .unwrap_or_else(|| "unknown".into());
+            let (cwnd, rtt_us) = match candidate.path_service {
+                TcpPoolPathService::Unknown => ("unknown".into(), "unknown".into()),
+                TcpPoolPathService::Known { cwnd, rtt_micros } => {
+                    (cwnd.to_string(), rtt_micros.to_string())
+                }
+            };
+            format!(
+                "conn{}:id={identity},active={},qualification={},anchor={},current={},admitted={},cwnd={cwnd},rtt_us={rtt_us}",
+                candidate.index,
+                candidate.active_before,
+                candidate.qualification.as_str(),
+                optional_counter(candidate.qualification_anchor),
+                optional_counter(candidate.black_holes_current),
+                candidate.admitted,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
     format!(
-        "🔎 tuic-tcp-pool-selection conn={conn_index} id={stable_id} policy=least_active_then_path_service active_before={active_before} path_cwnd={path_cwnd} path_rtt_us={path_rtt_us} path_service_tiebreak={path_service_tiebreak} generation={generation} last_success_age_secs={last_success_age_secs} probe_result={probe_result} reconnect_reason={}",
+        "🔎 tuic-tcp-pool-selection conn={conn_index} id={stable_id} policy=busy_epoch_forward_qualification_then_least_active_then_path_service active_before={active_before} path_cwnd={path_cwnd} path_rtt_us={path_rtt_us} path_service_tiebreak={path_service_tiebreak} qualification={} black_hole_anchor={} black_holes_current={} qualification_override={qualification_override} all_degraded_fallback={all_degraded_fallback} candidates=[{candidates}] generation={generation} last_success_age_secs={last_success_age_secs} probe_result={probe_result} reconnect_reason={}",
+        qualification.as_str(),
+        optional_counter(qualification_anchor),
+        optional_counter(black_holes_current),
         reconnect_reason.unwrap_or("none")
     )
 }
@@ -4228,6 +4519,12 @@ struct TcpPoolConnectionSelection {
     active_before: u64,
     path_service: TcpPoolPathService,
     path_service_tiebreak: bool,
+    qualification: TcpPoolForwardQualification,
+    qualification_anchor: Option<u64>,
+    black_holes_current: Option<u64>,
+    qualification_override: bool,
+    all_degraded_fallback: bool,
+    candidates: Vec<TcpPoolAdmissionCandidate>,
     generation: u64,
     last_success_age_secs: Option<u64>,
     probe_result: &'static str,
@@ -4253,9 +4550,10 @@ pub struct TuicUpstream {
     /// Per-slot startup authentication attempts. A recovered auxiliary slot is still usable, but
     /// reverse-throughput diagnostics must distinguish it from a first-attempt-clean slot.
     tcp_startup_auth_attempts: Vec<AtomicU64>,
-    /// Active or opening TCP relay count per pool slot. Stale reconnect is only safe when a slot is
-    /// idle; closing an active QUIC connection would cut every stream multiplexed on that slot.
-    tcp_pool_selector: TcpPoolLeaseSelector,
+    /// TCP-open admission owns active/opening counts plus busy-epoch forward qualification. Stale
+    /// reconnect is only safe when a slot is idle; closing an active QUIC connection would cut
+    /// every stream multiplexed on that slot.
+    tcp_pool_admission: TcpPoolAdmission,
     /// Per-slot continuous TCP `poll_write -> Pending` ownership. Endpoint recovery samples this
     /// independently from UDP RX so ACK/control traffic cannot hide a blocked business stream.
     tcp_write_pressures: Vec<Arc<TcpWritePressure>>,
@@ -4440,7 +4738,7 @@ impl TuicUpstream {
             );
         }
         let tcp_open_states = (0..tcp_pool).map(|_| TcpPoolOpenState::new()).collect();
-        let tcp_pool_selector = TcpPoolLeaseSelector::new(tcp_pool);
+        let tcp_pool_admission = TcpPoolAdmission::new(tcp_pool);
         let clock = std::time::Instant::now();
         let tcp_write_pressures = (0..tcp_pool)
             .map(|_| Arc::new(TcpWritePressure::new(clock)))
@@ -4457,7 +4755,7 @@ impl TuicUpstream {
             conns,
             tcp_open_states,
             tcp_startup_auth_attempts,
-            tcp_pool_selector,
+            tcp_pool_admission,
             tcp_write_pressures,
             udp_drops: AtomicU64::new(0),
             udp_stream_fallbacks: AtomicU64::new(0),
@@ -4665,34 +4963,48 @@ impl TuicUpstream {
         Ok(())
     }
 
-    /// TCP 专用连接选择。Selection samples current Quinn path service without waiting, then atomically
-    /// reserves the least-active observed slot. Equal nonzero loads prefer greater `cwnd / RTT`;
-    /// an idle pool keeps stable-index ordering so a following opener observes the first reservation.
+    /// TCP 专用连接选择。Admission samples current Quinn path and PLPMTUD evidence without waiting,
+    /// then atomically reserves an eligible slot. A busy slot that added a black-hole detection in
+    /// its current ownership epoch is isolated while a non-degraded alternative exists. Remaining
+    /// candidates retain least-active ordering and equal nonzero `cwnd / RTT` tie-breaking; an idle
+    /// pool keeps stable-index ordering so a following opener observes the first reservation.
     /// Idle age only requests a bounded liveness probe; it is not itself permission to destroy an
     /// auxiliary connection. The per-slot mutex still serializes probe/reconnect and connection
     /// cloning while the already-visible reservation steers unrelated opens toward other slots.
     async fn live_tcp_conn(&self) -> Result<TcpPoolConnectionSelection, ClientError> {
         let reservation = self
-            .tcp_pool_selector
-            .reserve_least_active(|| {
+            .tcp_pool_admission
+            .reserve(|| {
                 self.conns
                     .iter()
-                    .map(|slot| {
+                    .enumerate()
+                    .map(|(index, slot)| {
                         let Ok(conn) = slot.try_lock() else {
-                            return TcpPoolPathService::Unknown;
+                            return TcpPoolPathObservation::Unknown;
                         };
                         if conn.close_reason().is_some() {
-                            return TcpPoolPathService::Unknown;
+                            return TcpPoolPathObservation::Unknown;
                         }
+                        let Some(open_state) = self.tcp_open_states.get(index) else {
+                            return TcpPoolPathObservation::Unknown;
+                        };
                         let path = conn.stats().path;
-                        TcpPoolPathService::known(path.cwnd, path.rtt)
+                        TcpPoolPathObservation::known(
+                            TcpPoolTransportIdentity::new(
+                                conn.stable_id(),
+                                open_state.generation(),
+                            ),
+                            path.cwnd,
+                            path.rtt,
+                            path.black_holes_detected,
+                        )
                     })
                     .collect()
             })
             .await
             .map_err(|error| {
                 ClientError::InvalidTarget(format!(
-                    "tuic tcp pool lease-aware reservation failed: {error:?}"
+                    "tuic tcp pool forward admission failed: {error:?}"
                 ))
             })?;
         let TcpPoolSlotReservation {
@@ -4701,6 +5013,12 @@ impl TuicUpstream {
             active_before,
             path_service,
             path_service_tiebreak,
+            qualification,
+            qualification_anchor,
+            black_holes_current,
+            qualification_override,
+            all_degraded_fallback,
+            candidates,
             preparation,
         } = reservation;
         let idle_exclusive = active_before == 0;
@@ -4776,6 +5094,12 @@ impl TuicUpstream {
             active_before,
             path_service,
             path_service_tiebreak,
+            qualification,
+            qualification_anchor,
+            black_holes_current,
+            qualification_override,
+            all_degraded_fallback,
+            candidates,
             generation: open_state.generation(),
             last_success_age_secs,
             probe_result,
@@ -5140,7 +5464,7 @@ impl TuicUpstream {
                     .unwrap_or_default(),
             });
         }
-        let active_tcp = self.tcp_pool_selector.active_total();
+        let active_tcp = self.tcp_pool_admission.active_total();
         let now = self.clock.elapsed().as_secs();
         let last_udp_activity = self.last_udp_activity.load(Ordering::Relaxed);
         let udp_active = should_send_heartbeat(last_udp_activity, now, TUIC_HB_IDLE_WINDOW_SECS);
@@ -5191,6 +5515,12 @@ impl ProxyUpstream for TuicUpstream {
             active_before,
             path_service,
             path_service_tiebreak,
+            qualification,
+            qualification_anchor,
+            black_holes_current,
+            qualification_override,
+            all_degraded_fallback,
+            candidates,
             generation,
             last_success_age_secs,
             probe_result,
@@ -5229,6 +5559,12 @@ impl ProxyUpstream for TuicUpstream {
                         active_before,
                         path_service,
                         path_service_tiebreak,
+                        qualification,
+                        qualification_anchor,
+                        black_holes_current,
+                        qualification_override,
+                        all_degraded_fallback,
+                        candidates: &candidates,
                         generation,
                         last_success_age_secs,
                         probe_result,
@@ -5341,6 +5677,12 @@ impl ProxyUpstream for TuicUpstream {
             active_before,
             path_service,
             path_service_tiebreak,
+            qualification,
+            qualification_anchor,
+            black_holes_current,
+            qualification_override,
+            all_degraded_fallback,
+            candidates,
             generation,
             last_success_age_secs,
             probe_result,
@@ -5373,6 +5715,12 @@ impl ProxyUpstream for TuicUpstream {
                         active_before,
                         path_service,
                         path_service_tiebreak,
+                        qualification,
+                        qualification_anchor,
+                        black_holes_current,
+                        qualification_override,
+                        all_degraded_fallback,
+                        candidates: &candidates,
                         generation,
                         last_success_age_secs,
                         probe_result,
@@ -5530,6 +5878,22 @@ mod tests {
     use crate::shared::TargetAddr;
     use crate::tcp_downlink_pump::{AsyncLeasedByteFlowQueue, DownstreamPermitReleaseMode};
     use tokio::io::AsyncWriteExt;
+
+    fn tcp_pool_observations(path_service: &[TcpPoolPathService]) -> Vec<TcpPoolPathObservation> {
+        path_service
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, path_service)| match path_service {
+                TcpPoolPathService::Unknown => TcpPoolPathObservation::Unknown,
+                TcpPoolPathService::Known { .. } => TcpPoolPathObservation::Known {
+                    identity: TcpPoolTransportIdentity::new(index, 1),
+                    path_service,
+                    black_holes_detected: 0,
+                },
+            })
+            .collect()
+    }
 
     #[test]
     fn endpoint_recovery_rebinds_on_continuous_tcp_write_stall_despite_rx_progress() {
@@ -6927,13 +7291,28 @@ mod tests {
     }
 
     #[test]
-    fn format_tuic_tcp_pool_selection_line_identifies_path_service_policy() {
+    fn format_tuic_tcp_pool_selection_line_identifies_forward_qualification_policy() {
         let line = format_tuic_tcp_pool_selection_line(TuicTcpPoolSelectionDiag {
             conn_index: 1,
             stable_id: 42,
             active_before: 62,
             path_service: TcpPoolPathService::known(23_842, Duration::from_millis(163)),
             path_service_tiebreak: true,
+            qualification: TcpPoolForwardQualification::Qualified,
+            qualification_anchor: Some(0),
+            black_holes_current: Some(0),
+            qualification_override: true,
+            all_degraded_fallback: false,
+            candidates: &[TcpPoolAdmissionCandidate {
+                index: 1,
+                identity: Some(TcpPoolTransportIdentity::new(42, 7)),
+                active_before: 62,
+                path_service: TcpPoolPathService::known(23_842, Duration::from_millis(163)),
+                qualification: TcpPoolForwardQualification::Qualified,
+                qualification_anchor: Some(0),
+                black_holes_current: Some(0),
+                admitted: true,
+            }],
             generation: 7,
             last_success_age_secs: Some(15),
             probe_result: "alive",
@@ -6943,13 +7322,24 @@ mod tests {
         assert!(line.contains("tuic-tcp-pool-selection"), "{line}");
         assert!(line.contains("conn=1 id=42"), "{line}");
         assert!(
-            line.contains("policy=least_active_then_path_service"),
+            line.contains(
+                "policy=busy_epoch_forward_qualification_then_least_active_then_path_service"
+            ),
             "{line}"
         );
         assert!(line.contains("active_before=62"), "{line}");
         assert!(line.contains("path_cwnd=23842"), "{line}");
         assert!(line.contains("path_rtt_us=163000"), "{line}");
         assert!(line.contains("path_service_tiebreak=true"), "{line}");
+        assert!(line.contains("qualification=qualified"), "{line}");
+        assert!(line.contains("black_hole_anchor=0"), "{line}");
+        assert!(line.contains("black_holes_current=0"), "{line}");
+        assert!(line.contains("qualification_override=true"), "{line}");
+        assert!(line.contains("all_degraded_fallback=false"), "{line}");
+        assert!(
+            line.contains("candidates=[conn1:id=42@7,active=62,qualification=qualified,anchor=0,current=0,admitted=true,cwnd=23842,rtt_us=163000]"),
+            "{line}"
+        );
         assert!(line.contains("generation=7"), "{line}");
         assert!(line.contains("last_success_age_secs=15"), "{line}");
         assert!(line.contains("probe_result=alive"), "{line}");
@@ -7720,21 +8110,21 @@ mod tests {
 
     #[test]
     fn tcp_pool_phase_history_cannot_shift_the_next_idle_pair() {
-        let selector = TcpPoolLeaseSelector::new(2);
+        let selector = TcpPoolAdmission::new(2);
 
         {
             let prior = selector
-                .try_reserve_least_active(&[])
+                .try_reserve(&[])
                 .expect("an idle pool must accept a historical one-flow phase");
             assert_eq!(prior.index, 0);
             assert_eq!(prior.active_before, 0);
         }
 
         let control = selector
-            .try_reserve_least_active(&[])
+            .try_reserve(&[])
             .expect("the next control flow must reserve the primary slot");
         let data = selector
-            .try_reserve_least_active(&[])
+            .try_reserve(&[])
             .expect("the live control reservation must steer data to auxiliary");
 
         assert_eq!((control.index, control.active_before), (0, 0));
@@ -7745,8 +8135,236 @@ mod tests {
     }
 
     #[test]
+    fn tcp_pool_busy_epoch_black_hole_advancement_isolates_new_forward_opens() {
+        let admission = TcpPoolAdmission::new(2);
+        let anchored = [
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(0, 1),
+                6_665,
+                Duration::from_millis(176),
+                0,
+            ),
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(1, 1),
+                12_887,
+                Duration::from_millis(176),
+                0,
+            ),
+        ];
+
+        let first = admission
+            .try_reserve(&anchored)
+            .expect("the first idle slot must open its qualification epoch");
+        let second = admission
+            .try_reserve(&anchored)
+            .expect("the second idle slot must open its qualification epoch");
+        assert_eq!((first.index, second.index), (0, 1));
+        drop((first, second));
+
+        admission.active_slots[0].store(8, Ordering::Release);
+        admission.active_slots[1].store(6, Ordering::Release);
+        let advanced = [
+            anchored[0],
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(1, 1),
+                12_887,
+                Duration::from_millis(176),
+                10,
+            ),
+        ];
+
+        let selected = admission
+            .try_reserve(&advanced)
+            .expect("a qualified busy alternative must isolate the degraded slot");
+
+        assert_eq!((selected.index, selected.active_before), (0, 8));
+        assert_eq!(
+            selected.qualification,
+            TcpPoolForwardQualification::Qualified
+        );
+        assert!(selected.qualification_override);
+        assert!(!selected.all_degraded_fallback);
+    }
+
+    #[test]
+    fn tcp_pool_active_zero_starts_a_fresh_forward_qualification_epoch() {
+        let admission = TcpPoolAdmission::new(1);
+        let identity = TcpPoolTransportIdentity::new(7, 3);
+        let initial = [TcpPoolPathObservation::known(
+            identity,
+            10_000,
+            Duration::from_millis(100),
+            2,
+        )];
+        let first = admission.try_reserve(&initial).unwrap();
+        assert_eq!(first.qualification, TcpPoolForwardQualification::Qualified);
+        assert_eq!(first.qualification_anchor, Some(2));
+        drop(first);
+
+        admission.active_slots[0].store(1, Ordering::Release);
+        let advanced = [TcpPoolPathObservation::known(
+            identity,
+            10_000,
+            Duration::from_millis(100),
+            5,
+        )];
+        let degraded = admission.try_reserve(&advanced).unwrap();
+        assert_eq!(
+            degraded.qualification,
+            TcpPoolForwardQualification::Degraded
+        );
+        assert!(degraded.all_degraded_fallback);
+        drop(degraded);
+
+        admission.active_slots[0].store(0, Ordering::Release);
+        let recovered = admission.try_reserve(&advanced).unwrap();
+        assert_eq!(
+            recovered.qualification,
+            TcpPoolForwardQualification::Qualified
+        );
+        assert_eq!(recovered.qualification_anchor, Some(5));
+        assert_eq!(recovered.black_holes_current, Some(5));
+        assert!(!recovered.all_degraded_fallback);
+    }
+
+    #[test]
+    fn tcp_pool_idle_observation_does_not_commit_an_epoch_before_reservation() {
+        let admission = TcpPoolAdmission::new(1);
+        let identity = TcpPoolTransportIdentity::new(7, 3);
+        let anchored =
+            TcpPoolPathObservation::known(identity, 10_000, Duration::from_millis(100), 0);
+        let first = admission.try_reserve(&[anchored]).unwrap();
+        assert_eq!(first.qualification_anchor, Some(0));
+
+        let losing_idle_sample =
+            TcpPoolPathObservation::known(identity, 10_000, Duration::from_millis(100), 7);
+        let sampled = admission.qualification_for(0, 0, losing_idle_sample);
+        assert_eq!(
+            sampled.qualification,
+            TcpPoolForwardQualification::Qualified
+        );
+
+        let advanced =
+            TcpPoolPathObservation::known(identity, 10_000, Duration::from_millis(100), 1);
+        let still_busy = admission.qualification_for(0, 1, advanced);
+        assert_eq!(
+            still_busy.qualification,
+            TcpPoolForwardQualification::Degraded,
+            "an idle observation that lost reservation ownership must not reset the busy epoch"
+        );
+    }
+
+    #[test]
+    fn tcp_pool_all_degraded_fallback_preserves_bounded_least_active_ordering() {
+        let admission = TcpPoolAdmission::new(2);
+        let identities = [
+            TcpPoolTransportIdentity::new(0, 1),
+            TcpPoolTransportIdentity::new(1, 1),
+        ];
+        let anchored = identities.map(|identity| {
+            TcpPoolPathObservation::known(identity, 10_000, Duration::from_millis(100), 0)
+        });
+        let first = admission.try_reserve(&anchored).unwrap();
+        let second = admission.try_reserve(&anchored).unwrap();
+        drop((first, second));
+
+        admission.active_slots[0].store(7, Ordering::Release);
+        admission.active_slots[1].store(3, Ordering::Release);
+        let degraded = [
+            TcpPoolPathObservation::known(identities[0], 1_000_000, Duration::from_millis(1), 1),
+            TcpPoolPathObservation::known(identities[1], 1, Duration::from_secs(1), 2),
+        ];
+
+        let selected = admission.try_reserve(&degraded).unwrap();
+
+        assert_eq!((selected.index, selected.active_before), (1, 3));
+        assert_eq!(
+            selected.qualification,
+            TcpPoolForwardQualification::Degraded
+        );
+        assert!(selected.all_degraded_fallback);
+        assert!(!selected.qualification_override);
+        drop(selected);
+
+        admission.active_slots[0].store(6, Ordering::Release);
+        admission.active_slots[1].store(6, Ordering::Release);
+        let service_selected = admission.try_reserve(&degraded).unwrap();
+        assert_eq!(
+            (service_selected.index, service_selected.active_before),
+            (0, 6)
+        );
+        assert!(service_selected.path_service_tiebreak);
+        assert!(service_selected.all_degraded_fallback);
+        drop(service_selected);
+
+        let equal_service = identities.map(|identity| {
+            TcpPoolPathObservation::known(identity, 10_000, Duration::from_millis(100), 3)
+        });
+        let stable = admission.try_reserve(&equal_service).unwrap();
+        assert_eq!((stable.index, stable.active_before), (0, 6));
+        assert!(!stable.path_service_tiebreak);
+        assert!(stable.all_degraded_fallback);
+    }
+
+    #[test]
+    fn tcp_pool_unknown_evidence_never_reuses_or_resets_a_busy_epoch() {
+        let admission = TcpPoolAdmission::new(2);
+        let identities = [
+            TcpPoolTransportIdentity::new(10, 1),
+            TcpPoolTransportIdentity::new(11, 1),
+        ];
+        let anchored = identities.map(|identity| {
+            TcpPoolPathObservation::known(identity, 10_000, Duration::from_millis(100), 4)
+        });
+        let first = admission.try_reserve(&anchored).unwrap();
+        let second = admission.try_reserve(&anchored).unwrap();
+        drop((first, second));
+        admission.active_slots[0].store(5, Ordering::Release);
+        admission.active_slots[1].store(4, Ordering::Release);
+
+        let missing_and_degraded = [
+            TcpPoolPathObservation::Unknown,
+            TcpPoolPathObservation::known(identities[1], 10_000, Duration::from_millis(100), 5),
+        ];
+        let missing = admission.try_reserve(&missing_and_degraded).unwrap();
+        assert_eq!(missing.index, 0);
+        assert_eq!(missing.qualification, TcpPoolForwardQualification::Unknown);
+        assert!(missing.qualification_override);
+        drop(missing);
+
+        let regression_and_degraded = [
+            TcpPoolPathObservation::known(identities[0], 10_000, Duration::from_millis(100), 3),
+            missing_and_degraded[1],
+        ];
+        let regression = admission.try_reserve(&regression_and_degraded).unwrap();
+        assert_eq!(regression.index, 0);
+        assert_eq!(
+            regression.qualification,
+            TcpPoolForwardQualification::Unknown
+        );
+        assert_eq!(regression.qualification_anchor, Some(4));
+        assert_eq!(regression.black_holes_current, Some(3));
+        drop(regression);
+
+        let new_identity_and_degraded = [
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(10, 2),
+                10_000,
+                Duration::from_millis(100),
+                0,
+            ),
+            missing_and_degraded[1],
+        ];
+        let replaced = admission.try_reserve(&new_identity_and_degraded).unwrap();
+        assert_eq!(replaced.index, 0);
+        assert_eq!(replaced.qualification, TcpPoolForwardQualification::Unknown);
+        assert_eq!(replaced.qualification_anchor, None);
+        assert_eq!(replaced.black_holes_current, Some(0));
+    }
+
+    #[test]
     fn tcp_pool_equal_busy_load_prefers_greater_path_service() {
-        let selector = TcpPoolLeaseSelector::new(2);
+        let selector = TcpPoolAdmission::new(2);
         selector.active_slots[0].store(62, Ordering::Release);
         selector.active_slots[1].store(62, Ordering::Release);
         let path_service = [
@@ -7755,7 +8373,7 @@ mod tests {
         ];
 
         let selected = selector
-            .try_reserve_least_active(&path_service)
+            .try_reserve(&tcp_pool_observations(&path_service))
             .expect("an equal-load busy pool must use current path service");
 
         assert_eq!((selected.index, selected.active_before), (1, 62));
@@ -7786,17 +8404,18 @@ mod tests {
 
     #[test]
     fn tcp_pool_idle_pair_ignores_stale_path_service_history() {
-        let selector = TcpPoolLeaseSelector::new(2);
+        let selector = TcpPoolAdmission::new(2);
         let path_service = [
             TcpPoolPathService::known(10_124, Duration::from_millis(163)),
             TcpPoolPathService::known(23_842, Duration::from_millis(163)),
         ];
 
+        let observations = tcp_pool_observations(&path_service);
         let control = selector
-            .try_reserve_least_active(&path_service)
+            .try_reserve(&observations)
             .expect("idle control must reserve the stable primary slot");
         let data = selector
-            .try_reserve_least_active(&path_service)
+            .try_reserve(&observations)
             .expect("the live control reservation must steer data to auxiliary");
 
         assert_eq!((control.index, control.active_before), (0, 0));
@@ -7807,7 +8426,7 @@ mod tests {
 
     #[test]
     fn tcp_pool_unequal_load_precedes_path_service() {
-        let selector = TcpPoolLeaseSelector::new(2);
+        let selector = TcpPoolAdmission::new(2);
         selector.active_slots[0].store(3, Ordering::Release);
         selector.active_slots[1].store(4, Ordering::Release);
         let path_service = [
@@ -7816,7 +8435,7 @@ mod tests {
         ];
 
         let selected = selector
-            .try_reserve_least_active(&path_service)
+            .try_reserve(&tcp_pool_observations(&path_service))
             .expect("lease load remains the first ordering key");
 
         assert_eq!((selected.index, selected.active_before), (0, 3));
@@ -7825,7 +8444,7 @@ mod tests {
 
     #[test]
     fn tcp_pool_known_path_service_precedes_unknown_for_equal_busy_load() {
-        let selector = TcpPoolLeaseSelector::new(2);
+        let selector = TcpPoolAdmission::new(2);
         selector.active_slots[0].store(4, Ordering::Release);
         selector.active_slots[1].store(4, Ordering::Release);
         let path_service = [
@@ -7834,7 +8453,7 @@ mod tests {
         ];
 
         let selected = selector
-            .try_reserve_least_active(&path_service)
+            .try_reserve(&tcp_pool_observations(&path_service))
             .expect("known current service must win an equal busy-load tie");
 
         assert_eq!((selected.index, selected.active_before), (1, 4));
@@ -7843,7 +8462,7 @@ mod tests {
 
     #[test]
     fn tcp_pool_equal_or_unknown_path_service_keeps_stable_index() {
-        let selector = TcpPoolLeaseSelector::new(2);
+        let selector = TcpPoolAdmission::new(2);
         selector.active_slots[0].store(8, Ordering::Release);
         selector.active_slots[1].store(8, Ordering::Release);
         let equal_service = [
@@ -7852,14 +8471,14 @@ mod tests {
         ];
 
         let equal = selector
-            .try_reserve_least_active(&equal_service)
+            .try_reserve(&tcp_pool_observations(&equal_service))
             .expect("equal path service must keep stable index ordering");
         assert_eq!((equal.index, equal.active_before), (0, 8));
         assert!(!equal.path_service_tiebreak);
         drop(equal);
 
         let unknown = selector
-            .try_reserve_least_active(&[])
+            .try_reserve(&[])
             .expect("missing samples must keep stable index ordering");
         assert_eq!((unknown.index, unknown.active_before), (0, 8));
         assert!(!unknown.path_service_tiebreak);
@@ -7867,14 +8486,14 @@ mod tests {
 
     #[test]
     fn tcp_pool_preparing_slot_cannot_be_overtaken_before_connection_clone() {
-        let selector = TcpPoolLeaseSelector::new(2);
+        let selector = TcpPoolAdmission::new(2);
         selector.active_slots[1].store(4, Ordering::Release);
 
         let first = selector
-            .try_reserve_least_active(&[])
+            .try_reserve(&[])
             .expect("the idle primary slot must be selected first");
         let second = selector
-            .try_reserve_least_active(&[])
+            .try_reserve(&[])
             .expect("the preparing primary must steer the next opener to auxiliary");
 
         assert_eq!((first.index, first.active_before), (0, 0));
@@ -7887,9 +8506,9 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_pool_busy_waiter_wakes_after_preparation_releases() {
-        let selector = Arc::new(TcpPoolLeaseSelector::new(1));
+        let selector = Arc::new(TcpPoolAdmission::new(1));
         let first = selector
-            .try_reserve_least_active(&[])
+            .try_reserve(&[])
             .expect("the only idle slot must be reservable");
         let sample_calls = Arc::new(AtomicU64::new(0));
         let waiter = tokio::spawn({
@@ -7897,9 +8516,14 @@ mod tests {
             let sample_calls = sample_calls.clone();
             async move {
                 selector
-                    .reserve_least_active(|| {
-                        sample_calls.fetch_add(1, Ordering::Relaxed);
-                        Vec::new()
+                    .reserve(|| {
+                        let sample = sample_calls.fetch_add(1, Ordering::Relaxed) + 1;
+                        vec![TcpPoolPathObservation::known(
+                            TcpPoolTransportIdentity::new(0, 1),
+                            10_000,
+                            Duration::from_millis(100),
+                            sample,
+                        )]
                     })
                     .await
             }
@@ -7917,9 +8541,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!((second.index, second.active_before), (0, 0));
+        assert_eq!(second.qualification, TcpPoolForwardQualification::Qualified);
+        assert_eq!(
+            second.black_holes_current,
+            Some(sample_calls.load(Ordering::Relaxed))
+        );
         assert!(
             sample_calls.load(Ordering::Relaxed) >= 2,
-            "a waiter must refresh path service after preparation releases"
+            "a waiter must refresh path and qualification after preparation releases"
         );
         drop(second);
         assert_eq!(selector.active_slots[0].load(Ordering::Acquire), 0);
@@ -7927,7 +8556,7 @@ mod tests {
 
     #[test]
     fn tcp_pool_simultaneous_first_reservations_use_distinct_slots() {
-        let selector = Arc::new(TcpPoolLeaseSelector::new(2));
+        let selector = Arc::new(TcpPoolAdmission::new(2));
         let held = Arc::new(std::sync::Barrier::new(3));
         let (selected_tx, selected_rx) = std::sync::mpsc::channel();
 
@@ -7938,7 +8567,7 @@ mod tests {
                 let selected_tx = selected_tx.clone();
                 std::thread::spawn(move || {
                     let reservation = selector
-                        .try_reserve_least_active(&[])
+                        .try_reserve(&[])
                         .expect("an idle two-slot pool must accept both reservations");
                     selected_tx.send(reservation.index).unwrap();
                     held.wait();
@@ -7964,17 +8593,17 @@ mod tests {
 
     #[test]
     fn tcp_pool_reservation_fails_closed_for_empty_or_saturated_slots() {
-        let empty = TcpPoolLeaseSelector::new(0);
+        let empty = TcpPoolAdmission::new(0);
         assert!(matches!(
-            empty.try_reserve_least_active(&[]),
+            empty.try_reserve(&[]),
             Err(TcpPoolReservationError::Empty)
         ));
 
-        let saturated = TcpPoolLeaseSelector::new(2);
+        let saturated = TcpPoolAdmission::new(2);
         saturated.active_slots[0].store(u64::MAX, Ordering::Release);
         saturated.active_slots[1].store(u64::MAX, Ordering::Release);
         assert!(matches!(
-            saturated.try_reserve_least_active(&[]),
+            saturated.try_reserve(&[]),
             Err(TcpPoolReservationError::Saturated)
         ));
         assert_eq!(saturated.active_slots[0].load(Ordering::Acquire), u64::MAX);

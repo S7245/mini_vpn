@@ -1,5 +1,30 @@
 # Learnings
 
+## 2026-08-03 - Busy transport epochs need categorical admission evidence
+
+- Least ownership and greater instantaneous `cwnd/RTT` are useful ordering
+  facts, but neither is a forward-progress qualification. The xiaoou Ethernet
+  run selected the strictly less-loaded, higher-service slot and still lost
+  complete receiver seconds while controls and local ownership stayed clean.
+- Prefer an exact monotonic transport event over another score. A PLPMTUD
+  black-hole advance inside the same nonzero ownership epoch is categorical;
+  exact active zero supplies a lifecycle-bound recovery point without a time,
+  loss, byte, or Target-specific threshold.
+- Unknown evidence is not negative evidence. Locked/missing observations,
+  counter regression, or a busy replacement identity must not rewrite the
+  epoch. Isolate only proven degraded candidates and retain an explicit
+  all-degraded bounded fallback so safety does not become an availability
+  deadlock.
+- Keep the deep module caller-oriented: one plain admission interface owns
+  qualification, least-active/path-service/stable ordering, CAS reservation,
+  fallback, and decision diagnostics. Quinn sampling remains a nonblocking
+  adapter and the payload hot path stays untouched.
+- Observation is not ownership authority. An idle-looking sample may lose a
+  concurrent reservation race, so it can describe a candidate as qualified
+  but must not commit the epoch anchor until the active-count CAS succeeds.
+- Result:
+  `docs/tech/2026-08-03-knife15-m2-busy-epoch-forward-qualification-local-results.md`.
+
 ## 2026-08-03 - Evidence validity and validator execution are separate facts
 
 - The synchronized baseline JSON replayed the complete production predicate

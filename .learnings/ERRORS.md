@@ -1,5 +1,35 @@
 # Errors
 
+## 2026-08-03 - Idle qualification sampling initially preceded reservation authority
+
+- The first busy-epoch implementation updated an idle slot's black-hole anchor
+  while constructing candidates, before that slot won preparation and active
+  reservation CAS.
+- A concurrent opener could therefore observe stale `active=0`, lose the CAS,
+  but still rewrite the anchor of an already-live busy epoch and hide a real
+  black-hole advance.
+- A focused RED called the observation seam without reservation and proved the
+  later busy decision became `unknown` instead of `degraded`. Correct behavior
+  is to keep sampling read-only and commit identity/anchor only after the
+  selected slot's active-count CAS succeeds.
+
+## 2026-08-03 - Higher path service still admitted an active-epoch black-hole slot
+
+- Exact-source xiaoou Ethernet evidence passed baseline/direct and every M2
+  prerequisite, then the first short forward lost two complete receiver
+  intervals while gateway/Exit controls, TUN, D16, Endpoint, routes,
+  resources, and cleanup stayed healthy.
+- Both opens selected conn1 because it was strictly less loaded, and conn1 had
+  the greater current `cwnd/RTT`. This is the required stop-rule result for the
+  prior equal-busy path-service hypothesis; repeating or adding another score
+  would ignore the falsifier.
+- Conn1 had advanced from zero to ten Quinn PLPMTUD black-hole detections
+  during the same nonzero TCP-ownership epoch while conn0 stayed at zero.
+  Correct behavior is categorical new-open isolation until exact ownership
+  zero starts a fresh epoch, with Unknown kept available and an explicit
+  all-degraded fallback. Do not tune MTU, pacing, windows, pool size, workload,
+  or SLIs.
+
 ## 2026-08-03 - Loop-profiler self-test retained a contradicted monotonic assertion
 
 - The post-implementation all-target gate passed all 677 library tests and
