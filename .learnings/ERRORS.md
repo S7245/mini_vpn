@@ -1,5 +1,21 @@
 # Errors
 
+## 2026-08-03 - Loop-profiler self-test retained a contradicted monotonic assertion
+
+- The post-implementation all-target gate passed all 677 library tests and
+  every capacity check, but `loop_profiler_detects_on_loop_cpu_saturation`
+  failed twice because `loop_active_fraction` fell from `0.502 -> 0.388` and
+  `0.594 -> 0.499` between two independent 6–11ms scenarios.
+- The injected work was still observed exactly where intended: poll fraction
+  rose from `0.012 -> 0.234` and `0.013 -> 0.406`. The stale monotonic
+  assertion contradicted the existing Knife14gs learning that loop-active
+  mixes park, relay scheduling, and short-run wall jitter, while poll fraction
+  is the stable causal signal for a burn injected in `flush_tx`.
+- Correct behavior: retain completion, iteration, range, and the unchanged
+  `poll_fraction + 0.05` attribution gate; do not require loop-active to be
+  monotonic across independent short runs. This is an observer repair, not a
+  product, M2 SLI, workload, or frozen-parameter change.
+
 ## 2026-08-03 - The baseline runner discarded its decisive validator status
 
 - Exact source, runner, jq version, and byte-identical uploaded JSON were

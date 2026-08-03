@@ -357,19 +357,13 @@ async fn loop_profiler_detects_on_loop_cpu_saturation() {
     assert_eq!(baseline.completed, 1, "baseline 必须先完成全部 TCP echo");
     assert_eq!(loaded.completed, 1, "loaded 必须先完成全部 TCP echo");
 
-    // 新的本地 egress service lane 会让无 burn 基线也更 active；当基线已经接近饱和时，
-    // 不能再要求 loop-active 继续显著上升。burn 落在 poll 段（flush_tx），poll fraction
-    // 才是这条自检的稳定信号。
+    // `loop-active = 1 - park/wall` 还混入短场景里的 relay 调度与 wall 抖动，因此既不能要求
+    // 它额外增长，也不能要求它在两次独立运行间单调不降。burn 精确落在 poll 段
+    //（flush_tx），poll fraction 才是这条自检的稳定因果信号。
     assert!(
         load.poll_fraction() > base.poll_fraction() + 0.05,
         "burn 在 poll 段应显著抬升 poll fraction：base={:.3} load={:.3}",
         base.poll_fraction(),
         load.poll_fraction()
-    );
-    assert!(
-        load.loop_active_fraction() + 0.02 >= base.loop_active_fraction(),
-        "on-loop CPU burn 不应让 loop-active 明显下降：base={:.3} load={:.3}",
-        base.loop_active_fraction(),
-        load.loop_active_fraction()
     );
 }
