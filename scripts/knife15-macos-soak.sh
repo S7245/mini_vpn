@@ -132,6 +132,7 @@ Usage:
   bash scripts/knife15-macos-soak.sh preflight
   bash scripts/knife15-macos-soak.sh m2-ipv6-check
   bash scripts/knife15-macos-soak.sh baseline
+  bash scripts/knife15-macos-soak.sh baseline-check
   bash scripts/knife15-macos-soak.sh direct-discriminator
   sudo -E bash scripts/knife15-macos-soak.sh start
   sudo -E bash scripts/knife15-macos-soak.sh status
@@ -1097,6 +1098,15 @@ route_interface() {
 
 sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
+}
+
+sha256_file_or_unknown() {
+  local file_path="$1"
+  if [[ -f "$file_path" && ! -L "$file_path" ]]; then
+    sha256_file "$file_path" 2>/dev/null || echo unknown
+  else
+    echo unknown
+  fi
 }
 
 state_file() {
@@ -2181,7 +2191,7 @@ baseline_receiver_summary() {
     "$forward_mbit" "$reverse_mbit" "$forward_zero" "$reverse_zero"
 }
 
-validate_m0_baseline_file() {
+run_m0_baseline_file_validator() {
   local json_file="$1"
   local target="$2"
   local reverse="$3"
@@ -2217,14 +2227,130 @@ validate_m0_baseline_file() {
                 ($intervals | length)))))))
       and ($receiver.end.sum_received.bits_per_second as $bps
         | (($bps | type) == "number" and $bps > 0)))
-  ' "$json_file" >/dev/null 2>&1
+  ' "$json_file"
+}
+
+baseline_file_validation_reason() {
+  local json_file="$1"
+  local target="$2"
+  local reverse="$3"
+  local rc
+  if [[ ! -f "$json_file" || -L "$json_file" ]]; then
+    echo missing_or_symlink
+    return 0
+  fi
+  if run_m0_baseline_file_validator "$json_file" "$target" "$reverse" \
+    >/dev/null; then
+    echo ok
+    return 0
+  else
+    rc=$?
+  fi
+  if ((rc == 1)); then
+    echo invalid_evidence
+  else
+    echo "validator_error_rc_$rc"
+  fi
+}
+
+baseline_pair_validation_reasons() {
+  local baseline_dir="$1"
+  local target="$2"
+  local forward_reason reverse_reason
+  forward_reason="$(baseline_file_validation_reason \
+    "$baseline_dir/direct-forward.json" "$target" 0)"
+  reverse_reason="$(baseline_file_validation_reason \
+    "$baseline_dir/direct-reverse.json" "$target" 1)"
+  printf '%s %s\n' "$forward_reason" "$reverse_reason"
+}
+
+baseline_check_report() {
+  local baseline_dir="$1"
+  local target="$2"
+  local forward_reason reverse_reason summary status reason
+  read -r forward_reason reverse_reason \
+    <<<"$(baseline_pair_validation_reasons "$baseline_dir" "$target")"
+  summary="$(baseline_receiver_summary "$baseline_dir" 2>/dev/null || \
+    echo unavailable)"
+  status=fail
+  reason="forward_${forward_reason}__reverse_${reverse_reason}"
+  if [[ "$forward_reason" == "ok" && "$reverse_reason" == "ok" ]]; then
+    status=pass
+    reason=ok
+  fi
+  printf '%s\n' \
+    'schema=knife15-macos-baseline-check-v1' \
+    "status=$status" \
+    "reason=$reason" \
+    "source_commit=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)" \
+    "runner_sha256=$(sha256_file_or_unknown "$SCRIPT_PATH")" \
+    "target=$target" \
+    "baseline_dir=$baseline_dir" \
+    "forward_sha256=$(sha256_file_or_unknown "$baseline_dir/direct-forward.json")" \
+    "reverse_sha256=$(sha256_file_or_unknown "$baseline_dir/direct-reverse.json")" \
+    "forward_validation=$forward_reason" \
+    "reverse_validation=$reverse_reason" \
+    "receiver_summary=$summary"
+  [[ "$status" == "pass" ]]
+}
+
+write_baseline_manifest() {
+  local baseline_dir="$1"
+  local status="$2"
+  local reason="$3"
+  local forward_reason="$4"
+  local reverse_reason="$5"
+  local summary
+  summary="$(baseline_receiver_summary "$baseline_dir" 2>/dev/null || \
+    echo unavailable)"
+  cat >"$baseline_dir/manifest.txt" <<EOF_BASELINE_MANIFEST
+schema=knife15-macos-baseline-v1
+status=$status
+reason=$reason
+completed_utc=$(timestamp)
+completed_epoch=$(date +%s)
+source_commit=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
+runner_sha256=$(sha256_file_or_unknown "$SCRIPT_PATH")
+target=$TARGET
+target_route=$(route_interface "$TARGET")
+duration_secs=$DURATION
+parallel=$PARALLEL
+forward_sha256=$(sha256_file_or_unknown "$baseline_dir/direct-forward.json")
+reverse_sha256=$(sha256_file_or_unknown "$baseline_dir/direct-reverse.json")
+forward_validation=$forward_reason
+reverse_validation=$reverse_reason
+receiver_summary=$summary
+EOF_BASELINE_MANIFEST
+}
+
+run_baseline_check() {
+  local baseline_dir report
+  require_command jq
+  require_command shasum
+  validate_ipv4 "$TARGET" || die "baseline-check requires an IPv4 TARGET"
+  baseline_dir="$(selected_direct_baseline_dir)" || \
+    die "set exactly one of M0_BASELINE_DIR, M1_BASELINE_DIR, or M2_BASELINE_DIR for baseline-check"
+  validate_baseline_dir_path "$baseline_dir" || \
+    die "baseline-check requires a simple /tmp baseline directory"
+  [[ -d "$baseline_dir" && ! -L "$baseline_dir" ]] || \
+    die "baseline-check requires an existing non-symlink baseline directory"
+  report="$(baseline_check_report "$baseline_dir" "$TARGET")"
+  local rc=$?
+  printf '%s\n' "$report"
+  ((rc == 0)) || die "baseline-check rejected the selected evidence"
+  echo "PASS: direct baseline evidence replay completed"
+}
+
+validate_m0_baseline_file() {
+  [[ "$(baseline_file_validation_reason "$1" "$2" "$3" 2>/dev/null)" == \
+    "ok" ]]
 }
 
 validate_m0_baseline_pair() {
   local baseline_dir="$1"
   local target="$2"
-  validate_m0_baseline_file "$baseline_dir/direct-forward.json" "$target" 0 &&
-    validate_m0_baseline_file "$baseline_dir/direct-reverse.json" "$target" 1
+  [[ "$(baseline_pair_validation_reasons \
+    "$baseline_dir" "$target" 2>/dev/null)" == "ok ok" ]]
 }
 
 validate_direct_continuity_result() {
@@ -3241,6 +3367,46 @@ EOF_M2_FAKE_CURL
     >"$baseline_dir/direct-reverse.json"
   validate_m0_baseline_pair "$baseline_dir" 43.130.32.77 || \
     die "self-test: valid M0 baseline pair rejected"
+  [[ "$(baseline_pair_validation_reasons \
+    "$baseline_dir" 43.130.32.77)" == "ok ok" ]] || \
+    die "self-test: valid baseline pair reasons were not ok/ok"
+  printf '%s\n' '{' >"$baseline_dir/malformed.json"
+  [[ "$(baseline_file_validation_reason \
+    "$baseline_dir/malformed.json" 43.130.32.77 0 2>/dev/null)" == \
+    "validator_error_rc_5" ]] || \
+    die "self-test: malformed baseline JSON was not a validator error"
+  [[ "$(baseline_file_validation_reason \
+    "$baseline_dir/missing.json" 43.130.32.77 0)" == \
+    "missing_or_symlink" ]] || \
+    die "self-test: missing baseline evidence was not classified separately"
+  ln -s "$baseline_dir/direct-forward.json" "$baseline_dir/symlink.json"
+  [[ "$(baseline_file_validation_reason \
+    "$baseline_dir/symlink.json" 43.130.32.77 0)" == \
+    "missing_or_symlink" ]] || \
+    die "self-test: symlink baseline evidence was not rejected separately"
+  baseline_check_text="$(baseline_check_report \
+    "$baseline_dir" 43.130.32.77)" || \
+    die "self-test: valid baseline replay report failed"
+  grep -Fq 'schema=knife15-macos-baseline-check-v1' \
+    <<<"$baseline_check_text" || \
+    die "self-test: baseline replay schema missing"
+  grep -Fq 'status=pass' <<<"$baseline_check_text" || \
+    die "self-test: valid baseline replay did not pass"
+  grep -Fq 'forward_validation=ok' <<<"$baseline_check_text" || \
+    die "self-test: forward baseline replay reason missing"
+  grep -Fq 'reverse_validation=ok' <<<"$baseline_check_text" || \
+    die "self-test: reverse baseline replay reason missing"
+  write_baseline_manifest "$baseline_dir" pass ok ok ok
+  [[ "$(m0_profile_value "$baseline_dir/manifest.txt" schema)" == \
+    "knife15-macos-baseline-v1" ]] || \
+    die "self-test: baseline manifest schema mismatch"
+  [[ "$(m0_profile_value "$baseline_dir/manifest.txt" status)" == "pass" && \
+    "$(m0_profile_value "$baseline_dir/manifest.txt" reason)" == "ok" ]] || \
+    die "self-test: baseline manifest terminal result mismatch"
+  [[ "$(m0_profile_value "$baseline_dir/manifest.txt" forward_validation)" == \
+    "ok" && \
+    "$(m0_profile_value "$baseline_dir/manifest.txt" reverse_validation)" == \
+    "ok" ]] || die "self-test: baseline manifest validation reasons missing"
   baseline_summary_text="$(baseline_receiver_summary "$baseline_dir")" || \
     die "self-test: valid M0 baseline pair could not be summarized"
   [[ "$baseline_summary_text" == \
@@ -3260,6 +3426,9 @@ EOF_M2_FAKE_CURL
     "$baseline_dir/direct-forward.json"
   validate_m0_baseline_pair "$baseline_dir" 43.130.32.77 || \
     die "self-test: baseline with a zero short receiver command tail was rejected"
+  [[ "$(baseline_file_validation_reason \
+    "$baseline_dir/direct-forward.json" 43.130.32.77 0)" == "ok" ]] || \
+    die "self-test: proven partial tail did not classify ok"
   baseline_summary_text="$(baseline_receiver_summary "$baseline_dir")" || \
     die "self-test: partial-tail baseline summary failed"
   [[ "$baseline_summary_text" == \
@@ -3275,6 +3444,10 @@ EOF_M2_FAKE_CURL
   mv "$baseline_dir/direct-forward.stalled.json" "$baseline_dir/direct-forward.json"
   ! validate_m0_baseline_pair "$baseline_dir" 43.130.32.77 || \
     die "self-test: forward baseline with a Target receiver zero interval was accepted"
+  [[ "$(baseline_file_validation_reason \
+    "$baseline_dir/direct-forward.json" 43.130.32.77 0)" == \
+    "invalid_evidence" ]] || \
+    die "self-test: complete receiver zero was not invalid evidence"
   mv "$baseline_dir/direct-forward.valid.json" "$baseline_dir/direct-forward.json"
   ! validate_m0_baseline_pair "$baseline_dir" 43.130.32.78 || \
     die "self-test: M0 baseline for another target accepted"
@@ -4578,6 +4751,8 @@ EOF_FAIL_IPERF
   usage_text="$(usage)"
   grep -Fq 'scripts/knife15-macos-soak.sh direct-discriminator' <<<"$usage_text" || \
     die "self-test: public direct continuity action missing from help"
+  grep -Fq 'scripts/knife15-macos-soak.sh baseline-check' <<<"$usage_text" || \
+    die "self-test: public baseline evidence replay action missing from help"
   grep -Fq 'scripts/knife15-macos-soak.sh m0' <<<"$usage_text" || \
     die "self-test: public M0 action missing from help"
   grep -Fq 'scripts/knife15-macos-soak.sh m1' <<<"$usage_text" || \
@@ -5540,7 +5715,7 @@ run_direct_baseline_probe() {
 }
 
 run_baseline() {
-  local out_dir
+  local out_dir forward_reason reverse_reason
   common_preflight
   require_command iperf3
   [[ "$(route_interface "$TARGET")" != utun* ]] || die "baseline requires TARGET outside utun"
@@ -5549,17 +5724,30 @@ run_baseline() {
   echo "Running direct forward baseline..."
   if ! run_direct_baseline_probe "$out_dir/direct-forward.json" "$TARGET" \
     "$IPERF_PORT" "$DURATION" "$PARALLEL" 0 iperf3; then
+    write_baseline_manifest "$out_dir" fail forward_command_failed \
+      command_failed not_run
     die "direct forward baseline failed; evidence: $out_dir/direct-forward.json"
   fi
   echo "Running direct reverse baseline..."
   if ! run_direct_baseline_probe "$out_dir/direct-reverse.json" "$TARGET" \
     "$IPERF_PORT" "$DURATION" "$PARALLEL" 1 iperf3; then
+    forward_reason="$(baseline_file_validation_reason \
+      "$out_dir/direct-forward.json" "$TARGET" 0)"
+    write_baseline_manifest "$out_dir" fail reverse_command_failed \
+      "$forward_reason" command_failed
     die "direct reverse baseline failed; evidence: $out_dir/direct-reverse.json"
   fi
   baseline_receiver_summary "$out_dir" || \
     warn "direct baseline completed but its receiver speed summary is unavailable"
-  validate_m0_baseline_pair "$out_dir" "$TARGET" || \
-    die "direct baseline receiver continuity/evidence failed; evidence: $out_dir"
+  read -r forward_reason reverse_reason \
+    <<<"$(baseline_pair_validation_reasons "$out_dir" "$TARGET")"
+  if [[ "$forward_reason" != "ok" || "$reverse_reason" != "ok" ]]; then
+    write_baseline_manifest "$out_dir" fail \
+      "forward_${forward_reason}__reverse_${reverse_reason}" \
+      "$forward_reason" "$reverse_reason"
+    die "direct baseline validation failed forward=$forward_reason reverse=$reverse_reason; evidence: $out_dir"
+  fi
+  write_baseline_manifest "$out_dir" pass ok "$forward_reason" "$reverse_reason"
   echo "PASS: direct baseline complete: $out_dir"
 }
 
@@ -8047,6 +8235,9 @@ case "$ACTION" in
     ;;
   baseline)
     run_baseline
+    ;;
+  baseline-check)
+    run_baseline_check
     ;;
   direct-discriminator)
     run_direct_discriminator

@@ -1,5 +1,19 @@
 # Errors
 
+## 2026-08-03 - The baseline runner discarded its decisive validator status
+
+- Exact source, runner, jq version, and byte-identical uploaded JSON were
+  verified; the complete current predicate accepted both directions, including
+  the valid final `0.305442s` partial tail.
+- The old runner redirected jq status detail and wrote no terminal manifest,
+  so the generic baseline error could not distinguish invalid evidence from a
+  validator invocation failure after the fact.
+- Correct behavior: classify each direction as `ok`, `invalid_evidence`,
+  `missing_or_symlink`, or `validator_error_rc_<n>` through the single
+  production predicate; persist hashes/provenance/reasons in a manifest; and
+  provide a read-only replay action. Do not retroactively relabel or reuse the
+  historical baseline across a physical-network transition.
+
 ## 2026-08-03 - The fresh M2 direct discriminator lost complete seconds
 
 - Source `6231048` passed the 20-second baseline but the 300-second pre-TUN

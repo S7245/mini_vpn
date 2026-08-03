@@ -16,6 +16,10 @@ _Avoid_: protocol (overloaded), connection (a transport can span reconnects)
 The current send-side service estimate of one TUIC TCP pool slot, represented by that QUIC path's congestion window divided by its RTT. It is a point-in-time placement hint for breaking equal, nonzero lease-load ties; it is not a bandwidth promise, a health verdict, or permission to change congestion-control constants. Unknown or idle evidence falls back to the pool's stable lease-aware ordering.
 _Avoid_: connection speed, bandwidth score, priority (the estimate is transient transport state, not a configured class of service)
 
+**Direct baseline evidence**:
+The pre-TUN pair of forward and reverse iperf JSON results against the Target. It proves receiver-positive physical-path continuity for the short observation window and supplies the forward receiver rate from which the longer direct discriminator derives its offered load. Low average bandwidth is valid; a complete receiver-zero interval, malformed evidence, command failure, or validator execution failure is not. It is distinct from the 300-second direct discriminator and never exercises mini_vpn.
+_Avoid_: speed test (continuity and provenance, not maximum bandwidth, are the contract), VPN baseline (no TUN or VPN data plane is active)
+
 **Target**:
 The final `IP:port` an intercepted connection wants to reach (e.g. a website). On the TUN path it is extracted from smoltcp's `local_endpoint()`. The Upstream connects out to the Target.
 _Avoid_: upstream, destination, remote (these collide with other concepts)

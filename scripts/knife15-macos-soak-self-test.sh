@@ -13,7 +13,7 @@ fail() {
 [[ -x "$RUNNER" ]] || fail "runner is missing or not executable: $RUNNER"
 
 help_text="$("$RUNNER" --help)" || fail "--help returned nonzero"
-for mode in preflight m2-ipv6-check baseline direct-discriminator start status event snapshot smoke m0 m1 m1-diagnostic m2 stop bundle; do
+for mode in preflight m2-ipv6-check baseline baseline-check direct-discriminator start status event snapshot smoke m0 m1 m1-diagnostic m2 stop bundle; do
   grep -Fq "$mode" <<<"$help_text" || fail "--help omits mode: $mode"
 done
 grep -Fq "user runs every sudo command" <<<"$help_text" || \

@@ -1,5 +1,22 @@
 # Learnings
 
+## 2026-08-03 - Evidence validity and validator execution are separate facts
+
+- The synchronized baseline JSON replayed the complete production predicate
+  as `ok/ok`, while the historical command had emitted only a generic failure.
+  Valid raw evidence cannot reconstruct a jq exit status that the runner never
+  saved.
+- One predicate should own boolean admission, structured failure reasons,
+  formal manifests, fixtures, and operator replay. A second replay predicate
+  would make future PASS results easier to obtain but harder to trust.
+- A read-only replay action is useful only when it prints source, runner,
+  hashes, direction-specific reasons, and receiver summary even on rejection.
+- Reusable rule: preserve command execution provenance separately from
+  evidence semantics. `invalid_evidence` and `validator_error` must never
+  collapse into the same generic error.
+- Result:
+  `docs/tech/2026-08-03-knife15-baseline-evidence-observability-local-results.md`.
+
 ## 2026-08-03 - Low bandwidth and complete continuity loss are different gates
 
 - A direct path can sustain only `6.462 Mbit/s` and still be acceptable if
