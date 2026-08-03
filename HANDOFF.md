@@ -4,7 +4,38 @@
 
 ## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-03)
 
-- **Latest accepted position:** exact-source `6231048` HK preflight directories
+- **Latest accepted position:** exact-source `99e56b0` xiaoou Ethernet bundle
+  `/tmp/mini_vpn_knife15_macos_20260803_093012.tar.gz` (SHA-256
+  `804b96c5...`) passed baseline at `34.527/60.550 Mbit/s`, the 300-second
+  direct discriminator at `17.264 Mbit/s` without sender/receiver gaps,
+  start/smoke, IPv6/full-tunnel/real-client gates, long cycle-1 TCP, and
+  reverse UDP. The first short forward then lost two complete receiver
+  intervals while exact physical/Exit controls, TUN, D16, Endpoint
+  (`61,412/0/0B`), resources, routes, and cleanup remained healthy.
+- Both opens chose strictly less-loaded conn1 (`active_before=6`, then `8`),
+  rejecting the prior equal-load tie hypothesis. Conn1 also had greater
+  current `cwnd/RTT` (`12,887B/176ms`) than conn0 (`6,665B/176ms`), yet its
+  writer waited `4,214,880us`. Conn1 advanced from zero to ten PLPMTUD
+  black-hole detections during one nonzero ownership epoch while conn0 stayed
+  at zero. The earlier Wi-Fi run is only a clean-short comparator.
+- Implementation `b40aa75` adds categorical busy-epoch qualification inside
+  the deep TCP admission module. It commits an idle anchor only after winning
+  reservation CAS, isolates a proven degraded busy slot only when a
+  qualified/unknown alternative exists, and keeps an explicit bounded
+  all-degraded fallback. Existing flows, UDP, reconnect, pool, MTU, pacing,
+  windows, D16, Endpoint, and all frozen values are unchanged.
+- Focused `27/27`, root `678+3 ignored`, main `2`, integration `10+4 ignored`,
+  release, Clippy, shell, vendored Quinn/proto, 32 MiB `240.154 Mbit/s`,
+  fmt/diff/secret, and code-review gates pass with no unresolved P0/P1.
+  Observer-only repair `3ad7128` is separate. Result:
+  `docs/tech/2026-08-03-knife15-m2-busy-epoch-forward-qualification-local-results.md`.
+- Next take exactly one fresh HK `m2-ipv6-check -> baseline ->
+  direct-discriminator -> start -> smoke -> m2 -> status -> stop` from the
+  pushed reviewed descendant with a rebuilt release. Keep every other VPN off,
+  restore IPv6 only at the runbook boundary, and do not tune or repeat
+  unchanged. M3 remains blocked pending full M2 plus cleanup acceptance.
+
+- **Previous accepted position:** exact-source `6231048` HK preflight directories
   `/tmp/mini_vpn_knife15_macos_baseline_20260803_035615` and
   `/tmp/mini_vpn_knife15_macos_direct_20260803_035733` bind the reviewed
   runner/binary and each other. Baseline receiver continuity passed at

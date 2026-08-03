@@ -10,6 +10,8 @@ Architecture:
 Plan:
 `docs/tech/2026-08-03-knife15-m2-busy-epoch-forward-qualification-implementation-plan.md`
 
+Implementation commit: `b40aa75`
+
 ## 1. Evidence And Rejected Prior Hypothesis
 
 The exact-source xiaoou Ethernet artifact is:

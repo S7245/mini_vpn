@@ -4,7 +4,41 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-03 — direct continuity preflight failed before TUN)
+#### Latest decision (2026-08-03 — busy-epoch forward qualification ready for M2)
+
+Exact-source `99e56b0` xiaoou Ethernet bundle
+`/tmp/mini_vpn_knife15_macos_20260803_093012.tar.gz` (SHA-256
+`804b96c5...`) passed baseline/direct and every M2 prerequisite, then the first
+short forward lost two complete receiver intervals. Same-window gateway/Exit,
+TUN, D16, Endpoint, routes, resources, and cleanup stayed healthy.
+
+The prior equal-load path-service hypothesis is rejected: both opens selected
+strictly less-loaded conn1, and conn1 had greater instantaneous `cwnd/RTT`.
+The decisive categorical difference is that conn1 advanced from zero to ten
+PLPMTUD black-hole detections inside one nonzero ownership epoch while conn0
+stayed at zero.
+
+Reviewed implementation `b40aa75` makes busy-epoch qualification part of the
+existing TCP admission authority. It anchors only after an idle slot wins
+reservation CAS, isolates only proven degraded candidates when a
+qualified/unknown alternative exists, and preserves bounded all-degraded
+fallback. No frozen constant, SLO, current flow, UDP path, reconnect policy, or
+payload hot path changed. Focused `27/27`, root `678+3 ignored`, main `2`,
+integration `10+4 ignored`, release, Clippy, shell, vendored Quinn/proto,
+32 MiB `240.154 Mbit/s`, fmt/diff/secret, and review gates pass with no
+unresolved P0/P1. Result:
+`docs/tech/2026-08-03-knife15-m2-busy-epoch-forward-qualification-local-results.md`.
+
+Next:
+
+1. pull the pushed reviewed descendant and rebuild release on the HK test Mac;
+2. keep Clash-TUN/every other VPN off and use the runbook IPv6 boundary;
+3. run exactly one fresh `m2-ipv6-check -> baseline -> direct-discriminator ->
+   start -> smoke -> m2 -> status -> stop`;
+4. preserve failure evidence and do not tune or repeat unchanged;
+5. keep M3 blocked until complete M2 plus cleanup acceptance.
+
+#### Previous decision (2026-08-03 — direct continuity preflight failed before TUN)
 
 Exact-source `6231048` baseline/direct directories
 `/tmp/mini_vpn_knife15_macos_baseline_20260803_035615` and

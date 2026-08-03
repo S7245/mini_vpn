@@ -189,6 +189,41 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-03:
 
+- Exact-source `99e56b0` xiaoou Ethernet bundle
+  `/tmp/mini_vpn_knife15_macos_20260803_093012.tar.gz` (SHA-256
+  `804b96c5...`) passed baseline at `34.527/60.550 Mbit/s`, the 300-second
+  direct discriminator at `17.264 Mbit/s` with zero sender/receiver gaps,
+  start/smoke, IPv6/full-tunnel/real-client gates, cycle-1 long TCP, reverse
+  TCP, and reverse UDP. Its first short forward then lost two complete Target
+  receiver intervals while Ethernet gateway/Exit controls, TUN, D16, Endpoint
+  conservation (`61,412/0/0B`), routes, resources, and cleanup stayed healthy.
+- Both failed-phase opens selected strictly less-loaded conn1, so the prior
+  equal-busy path-service hypothesis is rejected. Conn1 nevertheless had the
+  greater current service (`12,887B/176ms` versus `6,665B/176ms`), waited
+  `4,214,880us`, and advanced from zero to ten Quinn PLPMTUD black-hole
+  detections during the same nonzero TCP-ownership epoch; conn0 remained at
+  zero. The paired Wi-Fi artifact's passing first short used its zero-debt
+  conn0 and is comparator evidence only.
+- Reviewed implementation `b40aa75` deepens TCP-open admission with exact
+  busy-epoch forward qualification. Active zero commits the current
+  identity/black-hole anchor only after reservation CAS; same-identity counter
+  advance makes a busy slot degraded for new opens. Proven degraded candidates
+  are isolated while a qualified/unknown alternative exists; all-degraded
+  fallback preserves bounded least-active/path-service/stable ordering.
+  Current flows, UDP, reconnect, pool size, MTU, pacing, windows, D16, and all
+  frozen values remain unchanged.
+- Focused `27/27`, root `678+3 ignored`, main `2`, integration `10+4 ignored`,
+  release, Clippy, Knife15/Knife14 shell, vendored Quinn/proto, fmt/diff/secret,
+  and review gates pass with no unresolved P0/P1. The 32 MiB Endpoint gate
+  reached `240.154 Mbit/s` with final conservation `61,440/0/0B`. The isolated
+  observer repair is `3ad7128`. Result:
+  `docs/tech/2026-08-03-knife15-m2-busy-epoch-forward-qualification-local-results.md`.
+- Next take exactly one fresh HK `m2-ipv6-check -> baseline ->
+  direct-discriminator -> start -> smoke -> m2 -> status -> stop` from the
+  pushed reviewed descendant with a rebuilt release binary. Keep every other
+  VPN off, restore IPv6 only at the runbook boundary, and do not tune or repeat
+  unchanged. M3 remains blocked pending complete M2 plus cleanup acceptance.
+
 - Exact-source `6231048` HK directories
   `/tmp/mini_vpn_knife15_macos_baseline_20260803_035615` and
   `/tmp/mini_vpn_knife15_macos_direct_20260803_035733` bind the reviewed
