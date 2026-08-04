@@ -3760,6 +3760,26 @@ EOF_FAKE_SLEEP
   SOAK_VIOLATIONS_FILE=
   SOAK_STAGE=m1
   SOAK_LABEL=M1
+  M0_TEST_IPERF_UDP_LOSS=3.000001
+  export M0_TEST_IPERF_UDP_LOSS
+  if run_m0_iperf_phase "$m1_stage_run" 43.130.32.77 5201 7 \
+    udp-reverse 1 4522378 1 1; then
+    die "self-test: formal high-loss UDP phase continued"
+  fi
+  grep -Fq $'\tm1 phase failed cycle=7 phase=udp-reverse reason=udp_loss_percent value=3.000001 limit=3.0' \
+    "$m1_stage_run/events.tsv" || \
+    die "self-test: formal UDP loss failure evidence missing"
+  ! grep -Fq $'\tm1 phase complete cycle=7 phase=udp-reverse' \
+    "$m1_stage_run/events.tsv" || \
+    die "self-test: formal high-loss UDP phase was marked complete"
+  M0_TEST_IPERF_UDP_LOSS=3.0
+  run_m0_iperf_phase "$m1_stage_run" 43.130.32.77 5201 8 \
+    udp-reverse 1 4522378 1 1 || \
+    die "self-test: formal boundary-loss UDP phase failed"
+  grep -Fq $'\tm1 phase complete cycle=8 phase=udp-reverse' \
+    "$m1_stage_run/events.tsv" || \
+    die "self-test: formal boundary-loss UDP phase did not complete"
+  unset M0_TEST_IPERF_UDP_LOSS
   m1_run="$tmp/m1-run"
   m1_test_profile="$tmp/m1-test-workload.txt"
   mkdir -p "$m1_run/m1"
@@ -6117,11 +6137,17 @@ run_m0_iperf_phase() {
       return 1
     fi
   fi
-  if [[ "$udp" == "1" && "${SOAK_CONTINUE_DATA_QUALITY:-0}" == "1" ]]; then
+  if [[ "$udp" == "1" ]]; then
     udp_loss="$(udp_loss_percent "$output_file")" || return 1
     if ! decimal_le "$udp_loss" 3.0; then
-      record_soak_data_quality_violation "$run_dir" "$cycle" "$phase" \
-        udp_loss_percent "$udp_loss" limit=3.0 "$output_file" || return 1
+      if [[ "${SOAK_CONTINUE_DATA_QUALITY:-0}" == "1" ]]; then
+        record_soak_data_quality_violation "$run_dir" "$cycle" "$phase" \
+          udp_loss_percent "$udp_loss" limit=3.0 "$output_file" || return 1
+      else
+        append_event_to "$run_dir" \
+          "$SOAK_STAGE phase failed cycle=$cycle phase=$phase reason=udp_loss_percent value=$udp_loss limit=3.0"
+        return 1
+      fi
     fi
   fi
   append_event_to "$run_dir" \
