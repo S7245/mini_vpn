@@ -390,6 +390,18 @@ fn tcp_pool_idle_action(
     }
 }
 
+fn should_probe_tcp_pool_generation(
+    index: usize,
+    now_secs: u64,
+    last_used_secs: u64,
+    idle_exclusive: bool,
+    replacement_installed: bool,
+) -> bool {
+    !replacement_installed
+        && tcp_pool_idle_action(index, now_secs, last_used_secs, idle_exclusive)
+            == TcpPoolIdleAction::Probe
+}
+
 async fn probe_tcp_pool_connection(conn: &Connection, timeout: Duration) -> TcpPoolProbeOutcome {
     if conn.close_reason().is_some() {
         return TcpPoolProbeOutcome::Closed;
@@ -436,9 +448,14 @@ struct TcpPoolOpenState {
 }
 
 impl TcpPoolOpenState {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::new_at_generation(1)
+    }
+
+    fn new_at_generation(generation: u64) -> Self {
         Self {
-            generation: AtomicU64::new(1),
+            generation: AtomicU64::new(generation),
             last_success_secs_plus_one: AtomicU64::new(0),
             reconnect_required: AtomicBool::new(false),
         }
@@ -503,13 +520,188 @@ fn tcp_pool_aux_retry_delay(attempt: usize) -> Option<Duration> {
     ))
 }
 
+struct TcpPoolGenerationActivity {
+    active: AtomicU64,
+    zero: Notify,
+}
+
+impl TcpPoolGenerationActivity {
+    fn new() -> Self {
+        Self {
+            active: AtomicU64::new(0),
+            zero: Notify::new(),
+        }
+    }
+
+    fn active(&self) -> u64 {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn try_increment(&self) -> Result<(), TcpPoolReservationError> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_add(1)
+            })
+            .map(|_| ())
+            .map_err(|_| TcpPoolReservationError::Saturated)
+    }
+
+    fn try_increment_from(&self, active_before: u64) -> Result<(), TcpPoolReservationError> {
+        let Some(active_after) = active_before.checked_add(1) else {
+            return Err(TcpPoolReservationError::Saturated);
+        };
+        self.active
+            .compare_exchange(
+                active_before,
+                active_after,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| TcpPoolReservationError::Busy)
+    }
+
+    fn decrement(&self) {
+        let Ok(active_before) =
+            self.active
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                    active.checked_sub(1)
+                })
+        else {
+            return;
+        };
+        if active_before == 1 {
+            // One drain task owns one predecessor. `notify_one` retains a permit when the exact
+            // zero transition races between the waiter's load and its first poll.
+            self.zero.notify_one();
+        }
+    }
+
+    async fn wait_for_zero(&self) {
+        loop {
+            let zero = self.zero.notified();
+            if self.active() == 0 {
+                return;
+            }
+            zero.await;
+        }
+    }
+}
+
 struct TcpPoolSlotLease {
-    active: Arc<AtomicU64>,
+    slot_active: Arc<AtomicU64>,
+    pool_active_total: Option<Arc<AtomicU64>>,
+    generation_active: Option<Arc<TcpPoolGenerationActivity>>,
 }
 
 impl TcpPoolSlotLease {
+    #[cfg(test)]
     fn from_reserved(active: Arc<AtomicU64>) -> Self {
-        Self { active }
+        Self {
+            slot_active: active,
+            pool_active_total: None,
+            generation_active: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn reserve_generation(
+        generation_active: Arc<TcpPoolGenerationActivity>,
+        slot_active: Arc<AtomicU64>,
+        pool_active_total: Arc<AtomicU64>,
+    ) -> Result<Self, TcpPoolReservationError> {
+        generation_active.try_increment()?;
+        if slot_active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_add(1)
+            })
+            .is_err()
+        {
+            generation_active.decrement();
+            return Err(TcpPoolReservationError::Saturated);
+        }
+        if pool_active_total
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_add(1)
+            })
+            .is_err()
+        {
+            slot_active.fetch_sub(1, Ordering::AcqRel);
+            generation_active.decrement();
+            return Err(TcpPoolReservationError::Saturated);
+        }
+        Ok(Self {
+            slot_active,
+            pool_active_total: Some(pool_active_total),
+            generation_active: Some(generation_active),
+        })
+    }
+
+    fn from_generation_reserved(
+        generation_active: Arc<TcpPoolGenerationActivity>,
+        slot_active: Arc<AtomicU64>,
+        pool_active_total: Arc<AtomicU64>,
+    ) -> Result<Self, TcpPoolReservationError> {
+        if slot_active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_add(1)
+            })
+            .is_err()
+        {
+            generation_active.decrement();
+            return Err(TcpPoolReservationError::Saturated);
+        }
+        if pool_active_total
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_add(1)
+            })
+            .is_err()
+        {
+            slot_active.fetch_sub(1, Ordering::AcqRel);
+            generation_active.decrement();
+            return Err(TcpPoolReservationError::Saturated);
+        }
+        Ok(Self {
+            slot_active,
+            pool_active_total: Some(pool_active_total),
+            generation_active: Some(generation_active),
+        })
+    }
+
+    fn try_clone(&self) -> Result<Self, TcpPoolReservationError> {
+        if let Some(active) = &self.generation_active {
+            active.try_increment()?;
+        }
+        if self
+            .slot_active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_add(1)
+            })
+            .is_err()
+        {
+            if let Some(active) = &self.generation_active {
+                active.decrement();
+            }
+            return Err(TcpPoolReservationError::Saturated);
+        }
+        if let Some(active) = &self.pool_active_total
+            && active
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                    active.checked_add(1)
+                })
+                .is_err()
+        {
+            self.slot_active.fetch_sub(1, Ordering::AcqRel);
+            if let Some(active) = &self.generation_active {
+                active.decrement();
+            }
+            return Err(TcpPoolReservationError::Saturated);
+        }
+        Ok(Self {
+            slot_active: self.slot_active.clone(),
+            pool_active_total: self.pool_active_total.clone(),
+            generation_active: self.generation_active.clone(),
+        })
     }
 
     #[cfg(test)]
@@ -699,17 +891,53 @@ struct TcpPoolAdmissionCandidate {
     admitted: bool,
 }
 
+struct TcpPoolAuxiliaryReplacementPreparation {
+    index: usize,
+    identity: TcpPoolTransportIdentity,
+    active_before: u64,
+    qualification_anchor: u64,
+    black_holes_current: u64,
+    candidates: Vec<TcpPoolAdmissionCandidate>,
+    preparation: TcpPoolSlotPreparation,
+}
+
+enum TcpPoolAdmissionDecision {
+    ReserveCurrent(TcpPoolSlotReservation),
+    ReplaceAuxiliary(TcpPoolAuxiliaryReplacementPreparation),
+}
+
 struct TcpPoolAdmission {
+    /// Logical-slot ownership includes the current generation plus any draining predecessor.
     active_slots: Vec<Arc<AtomicU64>>,
+    /// Admission load is current-generation-only so a predecessor cannot penalize its successor.
+    current_generation_activity: Vec<StdMutex<Arc<TcpPoolGenerationActivity>>>,
+    pool_active_total: Arc<AtomicU64>,
     preparing_slots: Vec<Arc<AtomicBool>>,
     qualification_epochs: Vec<StdMutex<TcpPoolQualificationEpoch>>,
     available: Arc<Notify>,
 }
 
 impl TcpPoolAdmission {
+    #[cfg(test)]
     fn new(pool_len: usize) -> Self {
+        Self::with_current_generation_activity(
+            (0..pool_len)
+                .map(|_| Arc::new(TcpPoolGenerationActivity::new()))
+                .collect(),
+        )
+    }
+
+    fn with_current_generation_activity(
+        current_generation_activity: Vec<Arc<TcpPoolGenerationActivity>>,
+    ) -> Self {
+        let pool_len = current_generation_activity.len();
         Self {
             active_slots: (0..pool_len).map(|_| Arc::new(AtomicU64::new(0))).collect(),
+            current_generation_activity: current_generation_activity
+                .into_iter()
+                .map(StdMutex::new)
+                .collect(),
+            pool_active_total: Arc::new(AtomicU64::new(0)),
             preparing_slots: (0..pool_len)
                 .map(|_| Arc::new(AtomicBool::new(false)))
                 .collect(),
@@ -786,30 +1014,33 @@ impl TcpPoolAdmission {
         epoch.black_hole_anchor = black_hole_anchor;
     }
 
-    fn try_reserve(
+    fn try_decide(
         &self,
         observations: &[TcpPoolPathObservation],
-    ) -> Result<TcpPoolSlotReservation, TcpPoolReservationError> {
+        replacement_allowed: &[bool],
+    ) -> Result<TcpPoolAdmissionDecision, TcpPoolReservationError> {
         if self.active_slots.is_empty() {
             return Err(TcpPoolReservationError::Empty);
         }
         debug_assert_eq!(self.active_slots.len(), self.preparing_slots.len());
+        debug_assert_eq!(
+            self.active_slots.len(),
+            self.current_generation_activity.len()
+        );
         debug_assert_eq!(self.active_slots.len(), self.qualification_epochs.len());
 
         loop {
             let mut preparing = false;
             let mut candidates = Vec::with_capacity(self.active_slots.len());
-            for (index, (active, slot_preparing)) in self
-                .active_slots
-                .iter()
-                .zip(&self.preparing_slots)
-                .enumerate()
-            {
+            for (index, slot_preparing) in self.preparing_slots.iter().enumerate() {
                 if slot_preparing.load(Ordering::Acquire) {
                     preparing = true;
                     continue;
                 }
-                let active_before = active.load(Ordering::Acquire);
+                let Some(generation_active) = self.current_generation_activity(index) else {
+                    continue;
+                };
+                let active_before = generation_active.active();
                 if active_before == u64::MAX {
                     continue;
                 }
@@ -857,6 +1088,55 @@ impl TcpPoolAdmission {
                     candidate.admitted =
                         candidate.qualification != TcpPoolForwardQualification::Degraded;
                 }
+            }
+
+            let replacement = qualification_override.then(|| {
+                candidates
+                    .iter()
+                    .copied()
+                    .filter(|candidate| {
+                        candidate.index != 0
+                            && replacement_allowed
+                                .get(candidate.index)
+                                .copied()
+                                .unwrap_or(false)
+                            && candidate.active_before != 0
+                            && candidate.qualification == TcpPoolForwardQualification::Degraded
+                            && !candidate.admitted
+                    })
+                    .min_by_key(|candidate| (candidate.active_before, candidate.index))
+            });
+            if let Some(Some(replacement)) = replacement {
+                let Some(identity) = replacement.identity else {
+                    continue;
+                };
+                let Some(qualification_anchor) = replacement.qualification_anchor else {
+                    continue;
+                };
+                let Some(black_holes_current) = replacement.black_holes_current else {
+                    continue;
+                };
+                let slot_preparing = self.preparing_slots[replacement.index].clone();
+                if slot_preparing
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                return Ok(TcpPoolAdmissionDecision::ReplaceAuxiliary(
+                    TcpPoolAuxiliaryReplacementPreparation {
+                        index: replacement.index,
+                        identity,
+                        active_before: replacement.active_before,
+                        qualification_anchor,
+                        black_holes_current,
+                        candidates,
+                        preparation: TcpPoolSlotPreparation {
+                            preparing: slot_preparing,
+                            available: self.available.clone(),
+                        },
+                    },
+                ));
             }
 
             let mut choice: Option<TcpPoolAdmissionCandidate> = None;
@@ -909,41 +1189,64 @@ impl TcpPoolAdmission {
                 preparing: slot_preparing,
                 available: self.available.clone(),
             };
-            let active = self.active_slots[index].clone();
-            if active
-                .compare_exchange(
-                    active_before,
-                    active_before + 1,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
+            let Some(generation_active) = self.current_generation_activity(index) else {
+                drop(preparation);
+                continue;
+            };
+            if generation_active.try_increment_from(active_before).is_ok() {
+                let slot_active = self.active_slots[index].clone();
+                let lease = match TcpPoolSlotLease::from_generation_reserved(
+                    generation_active,
+                    slot_active,
+                    self.pool_active_total.clone(),
+                ) {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        drop(preparation);
+                        return Err(error);
+                    }
+                };
                 if active_before == 0
                     && let (Some(identity), Some(black_hole_anchor)) =
                         (selected.identity, selected.black_holes_current)
                 {
                     self.commit_idle_epoch(index, identity, black_hole_anchor);
                 }
-                return Ok(TcpPoolSlotReservation {
-                    index,
-                    lease: TcpPoolSlotLease::from_reserved(active),
-                    active_before,
-                    path_service: selected.path_service,
-                    path_service_tiebreak,
-                    qualification: selected.qualification,
-                    qualification_anchor: selected.qualification_anchor,
-                    black_holes_current: selected.black_holes_current,
-                    qualification_override,
-                    all_degraded_fallback,
-                    candidates,
-                    preparation,
-                });
+                return Ok(TcpPoolAdmissionDecision::ReserveCurrent(
+                    TcpPoolSlotReservation {
+                        index,
+                        lease,
+                        active_before,
+                        path_service: selected.path_service,
+                        path_service_tiebreak,
+                        qualification: selected.qualification,
+                        qualification_anchor: selected.qualification_anchor,
+                        black_holes_current: selected.black_holes_current,
+                        qualification_override,
+                        all_degraded_fallback,
+                        candidates,
+                        preparation,
+                    },
+                ));
             }
             drop(preparation);
         }
     }
 
+    #[cfg(test)]
+    fn try_reserve(
+        &self,
+        observations: &[TcpPoolPathObservation],
+    ) -> Result<TcpPoolSlotReservation, TcpPoolReservationError> {
+        match self.try_decide(observations, &[])? {
+            TcpPoolAdmissionDecision::ReserveCurrent(reservation) => Ok(reservation),
+            TcpPoolAdmissionDecision::ReplaceAuxiliary(_) => {
+                unreachable!("replacement is disabled for reserve-only admission")
+            }
+        }
+    }
+
+    #[cfg(test)]
     async fn reserve(
         &self,
         mut sample_observations: impl FnMut() -> Vec<TcpPoolPathObservation>,
@@ -959,9 +1262,106 @@ impl TcpPoolAdmission {
     }
 
     fn active_total(&self) -> u64 {
-        self.active_slots.iter().fold(0u64, |total, active| {
-            total.saturating_add(active.load(Ordering::Acquire))
+        self.pool_active_total.load(Ordering::Acquire)
+    }
+
+    fn current_generation_activity(&self, index: usize) -> Option<Arc<TcpPoolGenerationActivity>> {
+        self.current_generation_activity
+            .get(index)?
+            .lock()
+            .ok()
+            .map(|activity| activity.clone())
+    }
+
+    fn replace_current_generation_activity(
+        &self,
+        index: usize,
+        expected: &Arc<TcpPoolGenerationActivity>,
+        successor: Arc<TcpPoolGenerationActivity>,
+    ) -> bool {
+        let Some(activity) = self.current_generation_activity.get(index) else {
+            return false;
+        };
+        let Ok(mut activity) = activity.lock() else {
+            return false;
+        };
+        if !Arc::ptr_eq(&activity, expected) {
+            return false;
+        }
+        *activity = successor;
+        true
+    }
+
+    fn reserve_replacement_successor(
+        &self,
+        mut replacement: TcpPoolAuxiliaryReplacementPreparation,
+        successor_activity: Arc<TcpPoolGenerationActivity>,
+        successor_observation: TcpPoolPathObservation,
+    ) -> Result<TcpPoolSlotReservation, TcpPoolReservationError> {
+        let TcpPoolPathObservation::Known {
+            identity,
+            path_service,
+            black_holes_detected,
+        } = successor_observation
+        else {
+            return Err(TcpPoolReservationError::Busy);
+        };
+        let current_activity = self
+            .current_generation_activity(replacement.index)
+            .ok_or(TcpPoolReservationError::Busy)?;
+        if !Arc::ptr_eq(&current_activity, &successor_activity) {
+            return Err(TcpPoolReservationError::Busy);
+        }
+        successor_activity.try_increment_from(0)?;
+        let lease = TcpPoolSlotLease::from_generation_reserved(
+            successor_activity,
+            self.active_slots[replacement.index].clone(),
+            self.pool_active_total.clone(),
+        )?;
+        self.commit_idle_epoch(replacement.index, identity, black_holes_detected);
+        if let Some(candidate) = replacement
+            .candidates
+            .iter_mut()
+            .find(|candidate| candidate.index == replacement.index)
+        {
+            *candidate = TcpPoolAdmissionCandidate {
+                index: replacement.index,
+                identity: Some(identity),
+                active_before: 0,
+                path_service,
+                qualification: TcpPoolForwardQualification::Qualified,
+                qualification_anchor: Some(black_holes_detected),
+                black_holes_current: Some(black_holes_detected),
+                admitted: true,
+            };
+        }
+        Ok(TcpPoolSlotReservation {
+            index: replacement.index,
+            lease,
+            active_before: 0,
+            path_service,
+            path_service_tiebreak: false,
+            qualification: TcpPoolForwardQualification::Qualified,
+            qualification_anchor: Some(black_holes_detected),
+            black_holes_current: Some(black_holes_detected),
+            qualification_override: true,
+            all_degraded_fallback: false,
+            candidates: replacement.candidates,
+            preparation: replacement.preparation,
         })
+    }
+
+    #[cfg(test)]
+    fn set_active_for_test(&self, index: usize, active: u64) {
+        let generation = self
+            .current_generation_activity(index)
+            .expect("test slot generation must exist");
+        generation.active.store(active, Ordering::Release);
+        self.active_slots[index].store(active, Ordering::Release);
+        let total = self.active_slots.iter().fold(0u64, |total, slot| {
+            total.saturating_add(slot.load(Ordering::Acquire))
+        });
+        self.pool_active_total.store(total, Ordering::Release);
     }
 }
 
@@ -975,15 +1375,18 @@ fn note_tcp_pool_activity_transition(previous: &mut Option<u64>, active: u64) ->
 
 impl Drop for TcpPoolSlotLease {
     fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-impl Clone for TcpPoolSlotLease {
-    fn clone(&self) -> Self {
-        self.active.fetch_add(1, Ordering::AcqRel);
-        Self {
-            active: self.active.clone(),
+        if let Some(active) = &self.generation_active {
+            active.decrement();
+        }
+        let _ = self
+            .slot_active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_sub(1)
+            });
+        if let Some(active) = &self.pool_active_total {
+            let _ = active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_sub(1)
+            });
         }
     }
 }
@@ -3142,6 +3545,7 @@ struct TuicTcpPoolSelectionDiag<'a> {
     last_success_age_secs: Option<u64>,
     probe_result: &'a str,
     reconnect_reason: Option<&'a str>,
+    replacement_installed: bool,
 }
 
 fn format_tuic_tcp_pool_selection_line(diag: TuicTcpPoolSelectionDiag<'_>) -> String {
@@ -3161,6 +3565,7 @@ fn format_tuic_tcp_pool_selection_line(diag: TuicTcpPoolSelectionDiag<'_>) -> St
         last_success_age_secs,
         probe_result,
         reconnect_reason,
+        replacement_installed,
     } = diag;
     let last_success_age_secs = last_success_age_secs
         .map(|age| age.to_string())
@@ -3202,7 +3607,7 @@ fn format_tuic_tcp_pool_selection_line(diag: TuicTcpPoolSelectionDiag<'_>) -> St
         .collect::<Vec<_>>()
         .join(";");
     format!(
-        "🔎 tuic-tcp-pool-selection conn={conn_index} id={stable_id} policy=busy_epoch_forward_qualification_then_least_active_then_path_service active_before={active_before} path_cwnd={path_cwnd} path_rtt_us={path_rtt_us} path_service_tiebreak={path_service_tiebreak} qualification={} black_hole_anchor={} black_holes_current={} qualification_override={qualification_override} all_degraded_fallback={all_degraded_fallback} candidates=[{candidates}] generation={generation} last_success_age_secs={last_success_age_secs} probe_result={probe_result} reconnect_reason={}",
+        "🔎 tuic-tcp-pool-selection conn={conn_index} id={stable_id} policy=busy_epoch_forward_qualification_then_least_active_then_path_service active_before={active_before} path_cwnd={path_cwnd} path_rtt_us={path_rtt_us} path_service_tiebreak={path_service_tiebreak} qualification={} black_hole_anchor={} black_holes_current={} qualification_override={qualification_override} all_degraded_fallback={all_degraded_fallback} candidates=[{candidates}] generation={generation} replacement_installed={replacement_installed} last_success_age_secs={last_success_age_secs} probe_result={probe_result} reconnect_reason={}",
         qualification.as_str(),
         optional_counter(qualification_anchor),
         optional_counter(black_holes_current),
@@ -4512,6 +4917,234 @@ const TUIC_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
 const TUIC_TCP_POOL_STALE_RECONNECT_SECS: u64 = 10;
 const TUIC_TCP_POOL_LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
+trait TcpPoolTransport: Clone {
+    fn tcp_pool_stable_id(&self) -> usize;
+}
+
+impl TcpPoolTransport for Connection {
+    fn tcp_pool_stable_id(&self) -> usize {
+        self.stable_id()
+    }
+}
+
+#[cfg(test)]
+impl TcpPoolTransport for u64 {
+    fn tcp_pool_stable_id(&self) -> usize {
+        usize::try_from(*self).unwrap_or(usize::MAX)
+    }
+}
+
+struct TcpPoolGeneration<T> {
+    transport: T,
+    activity: Arc<TcpPoolGenerationActivity>,
+    write_pressure: Arc<TcpWritePressure>,
+    open_state: Arc<TcpPoolOpenState>,
+    auth_attempts: u64,
+}
+
+impl<T: TcpPoolTransport> TcpPoolGeneration<T> {
+    fn new(transport: T, generation: u64, auth_attempts: u64, clock: Instant) -> Self {
+        Self {
+            transport,
+            activity: Arc::new(TcpPoolGenerationActivity::new()),
+            write_pressure: Arc::new(TcpWritePressure::new(clock)),
+            open_state: Arc::new(TcpPoolOpenState::new_at_generation(generation)),
+            auth_attempts,
+        }
+    }
+
+    fn identity(&self) -> TcpPoolTransportIdentity {
+        TcpPoolTransportIdentity::new(
+            self.transport.tcp_pool_stable_id(),
+            self.open_state.generation(),
+        )
+    }
+}
+
+struct TcpPoolDrainingGeneration<T> {
+    generation: TcpPoolGeneration<T>,
+    started_at: Instant,
+}
+
+struct TcpPoolGenerationSlotState<T> {
+    current: TcpPoolGeneration<T>,
+    draining: Option<TcpPoolDrainingGeneration<T>>,
+}
+
+struct TcpPoolGenerationSlot<T> {
+    index: usize,
+    state: Mutex<TcpPoolGenerationSlotState<T>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpPoolGenerationInstallError {
+    Primary,
+    PredecessorDraining,
+    StalePredecessor,
+    InvalidSuccessor,
+}
+
+struct TcpPoolGenerationInstall {
+    predecessor_identity: TcpPoolTransportIdentity,
+    successor_identity: TcpPoolTransportIdentity,
+    predecessor_activity: Arc<TcpPoolGenerationActivity>,
+}
+
+struct TcpPoolDrainingPermit {
+    owned: Arc<AtomicBool>,
+    transferred: bool,
+}
+
+impl TcpPoolDrainingPermit {
+    fn try_acquire(owned: Arc<AtomicBool>) -> Option<Self> {
+        owned
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(Self {
+            owned,
+            transferred: false,
+        })
+    }
+
+    fn transfer(mut self) -> Arc<AtomicBool> {
+        self.transferred = true;
+        self.owned.clone()
+    }
+}
+
+impl Drop for TcpPoolDrainingPermit {
+    fn drop(&mut self) {
+        if !self.transferred {
+            self.owned.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl<T: TcpPoolTransport> TcpPoolGenerationSlot<T> {
+    fn new(
+        index: usize,
+        transport: T,
+        generation: u64,
+        auth_attempts: u64,
+        clock: Instant,
+    ) -> Self {
+        Self {
+            index,
+            state: Mutex::new(TcpPoolGenerationSlotState {
+                current: TcpPoolGeneration::new(transport, generation, auth_attempts, clock),
+                draining: None,
+            }),
+        }
+    }
+
+    fn replacement_available(&self) -> bool {
+        if self.index == 0 {
+            return false;
+        }
+        self.state
+            .try_lock()
+            .map(|state| state.draining.is_none())
+            .unwrap_or(false)
+    }
+
+    async fn current_activity(&self) -> Arc<TcpPoolGenerationActivity> {
+        self.state.lock().await.current.activity.clone()
+    }
+
+    #[cfg(test)]
+    async fn current_transport(&self) -> T {
+        self.state.lock().await.current.transport.clone()
+    }
+
+    #[cfg(test)]
+    async fn draining_transport(&self) -> Option<T> {
+        self.state
+            .lock()
+            .await
+            .draining
+            .as_ref()
+            .map(|draining| draining.generation.transport.clone())
+    }
+
+    #[cfg(test)]
+    async fn install_successor(
+        &self,
+        expected_identity: TcpPoolTransportIdentity,
+        expected_activity: &Arc<TcpPoolGenerationActivity>,
+        successor: TcpPoolGeneration<T>,
+        started_at: Instant,
+    ) -> Result<TcpPoolGenerationInstall, TcpPoolGenerationInstallError> {
+        self.install_successor_with(
+            expected_identity,
+            expected_activity,
+            successor,
+            started_at,
+            |_, _| true,
+        )
+        .await
+    }
+
+    async fn install_successor_with(
+        &self,
+        expected_identity: TcpPoolTransportIdentity,
+        expected_activity: &Arc<TcpPoolGenerationActivity>,
+        successor: TcpPoolGeneration<T>,
+        started_at: Instant,
+        install_activity: impl FnOnce(
+            &Arc<TcpPoolGenerationActivity>,
+            &Arc<TcpPoolGenerationActivity>,
+        ) -> bool,
+    ) -> Result<TcpPoolGenerationInstall, TcpPoolGenerationInstallError> {
+        if self.index == 0 {
+            return Err(TcpPoolGenerationInstallError::Primary);
+        }
+        let mut state = self.state.lock().await;
+        if state.draining.is_some() {
+            return Err(TcpPoolGenerationInstallError::PredecessorDraining);
+        }
+        if state.current.identity() != expected_identity
+            || !Arc::ptr_eq(&state.current.activity, expected_activity)
+        {
+            return Err(TcpPoolGenerationInstallError::StalePredecessor);
+        }
+        let successor_identity = successor.identity();
+        if successor_identity.stable_id == expected_identity.stable_id
+            || expected_identity.generation.checked_add(1) != Some(successor_identity.generation)
+        {
+            return Err(TcpPoolGenerationInstallError::InvalidSuccessor);
+        }
+        if !install_activity(&state.current.activity, &successor.activity) {
+            return Err(TcpPoolGenerationInstallError::StalePredecessor);
+        }
+        let predecessor = std::mem::replace(&mut state.current, successor);
+        let predecessor_identity = predecessor.identity();
+        let predecessor_activity = predecessor.activity.clone();
+        state.draining = Some(TcpPoolDrainingGeneration {
+            generation: predecessor,
+            started_at,
+        });
+        Ok(TcpPoolGenerationInstall {
+            predecessor_identity,
+            successor_identity,
+            predecessor_activity,
+        })
+    }
+
+    async fn take_drained(
+        &self,
+        expected_identity: TcpPoolTransportIdentity,
+    ) -> Option<TcpPoolDrainingGeneration<T>> {
+        let mut state = self.state.lock().await;
+        let draining = state.draining.as_ref()?;
+        if draining.generation.identity() != expected_identity
+            || draining.generation.activity.active() != 0
+        {
+            return None;
+        }
+        state.draining.take()
+    }
+}
+
 struct TcpPoolConnectionSelection {
     conn_index: usize,
     conn: Connection,
@@ -4529,6 +5162,10 @@ struct TcpPoolConnectionSelection {
     last_success_age_secs: Option<u64>,
     probe_result: &'static str,
     reconnect_reason: Option<&'static str>,
+    open_state: Arc<TcpPoolOpenState>,
+    write_pressure: Arc<TcpWritePressure>,
+    startup_auth_attempts: u64,
+    replacement_installed: bool,
 }
 
 /// TUIC 客户端上游：持有到 sing-box 的 QUIC 连接，每条 TCP 开一条 `Connect` 双向流。
@@ -4542,21 +5179,15 @@ pub struct TuicUpstream {
     sni: String,
     uuid: [u8; 16],
     password: String,
-    /// 主连接是 index 0：UDP relay、heartbeat、health probe 都固定走它，避免 TCP pool 改变 UDP 语义。
-    conns: Vec<Mutex<Connection>>,
-    /// Per-slot generation, successful-open time, and failure invalidation. Failed opens never
-    /// refresh the idle clock; only auxiliary slots can be invalidated by TCP-open evidence.
-    tcp_open_states: Vec<TcpPoolOpenState>,
-    /// Per-slot startup authentication attempts. A recovered auxiliary slot is still usable, but
-    /// reverse-throughput diagnostics must distinguish it from a first-attempt-clean slot.
-    tcp_startup_auth_attempts: Vec<AtomicU64>,
+    /// Fixed logical slots own current and optional draining generations as one lifecycle unit.
+    /// Slot 0 remains the single primary source for UDP relay, heartbeat, and health probes.
+    tcp_pool_slots: Vec<Arc<TcpPoolGenerationSlot<Connection>>>,
+    /// The frozen two-slot pool permits at most one drain-only predecessor globally.
+    tcp_pool_draining_predecessor: Arc<AtomicBool>,
     /// TCP-open admission owns active/opening counts plus busy-epoch forward qualification. Stale
     /// reconnect is only safe when a slot is idle; closing an active QUIC connection would cut
     /// every stream multiplexed on that slot.
     tcp_pool_admission: TcpPoolAdmission,
-    /// Per-slot continuous TCP `poll_write -> Pending` ownership. Endpoint recovery samples this
-    /// independently from UDP RX so ACK/control traffic cannot hide a blocked business stream.
-    tcp_write_pressures: Vec<Arc<TcpWritePressure>>,
     /// 上行 UDP datagram 丢弃计数（连接不可用 / stream 兜底也失败）。可观测性，不影响 UDP 语义。
     udp_drops: AtomicU64,
     /// 上行走 uni-stream 兜底（超 datagram 上限）的次数。可观测性：判断 MTU 调优是否够、兜底是否热。
@@ -4695,9 +5326,9 @@ impl TuicUpstream {
                 }
             }
         }
-        conns.push(Mutex::new(conn));
+        conns.push(conn);
         let mut tcp_startup_auth_attempts = Vec::with_capacity(tcp_pool);
-        tcp_startup_auth_attempts.push(AtomicU64::new(1));
+        tcp_startup_auth_attempts.push(1_u64);
         for index in 1..tcp_pool {
             let (extra, auth_attempts) = match Self::handshake_aux_with_retries(
                 &endpoint,
@@ -4722,13 +5353,13 @@ impl TuicUpstream {
                     }
                 },
             };
-            tcp_startup_auth_attempts.push(AtomicU64::new(auth_attempts as u64));
+            tcp_startup_auth_attempts.push(auth_attempts as u64);
             if let Some(secs) = cfg.quic_stats_secs
                 && let Some(stop) = &quic_stats_stop
             {
                 spawn_quic_stats_logger(extra.clone(), index, secs, stop.subscribe());
             }
-            conns.push(Mutex::new(extra));
+            conns.push(extra);
         }
         let tcp_pool = conns.len();
         debug_assert_eq!(tcp_startup_auth_attempts.len(), tcp_pool);
@@ -4737,12 +5368,27 @@ impl TuicUpstream {
                 "🧵 TUIC TCP connection pool={tcp_pool}（UDP/health 仍走 primary connection）"
             );
         }
-        let tcp_open_states = (0..tcp_pool).map(|_| TcpPoolOpenState::new()).collect();
-        let tcp_pool_admission = TcpPoolAdmission::new(tcp_pool);
         let clock = std::time::Instant::now();
-        let tcp_write_pressures = (0..tcp_pool)
-            .map(|_| Arc::new(TcpWritePressure::new(clock)))
-            .collect();
+        let tcp_pool_slots = conns
+            .into_iter()
+            .zip(tcp_startup_auth_attempts)
+            .enumerate()
+            .map(|(index, (conn, auth_attempts))| {
+                Arc::new(TcpPoolGenerationSlot::new(
+                    index,
+                    conn,
+                    1,
+                    auth_attempts,
+                    clock,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut current_generation_activity = Vec::with_capacity(tcp_pool_slots.len());
+        for slot in &tcp_pool_slots {
+            current_generation_activity.push(slot.current_activity().await);
+        }
+        let tcp_pool_admission =
+            TcpPoolAdmission::with_current_generation_activity(current_generation_activity);
         Ok(Self {
             endpoint,
             udp_send_service_policy: udp_send_service,
@@ -4752,11 +5398,9 @@ impl TuicUpstream {
             sni: cfg.sni.clone(),
             uuid: cfg.uuid,
             password: cfg.password.clone(),
-            conns,
-            tcp_open_states,
-            tcp_startup_auth_attempts,
+            tcp_pool_slots,
+            tcp_pool_draining_predecessor: Arc::new(AtomicBool::new(false)),
             tcp_pool_admission,
-            tcp_write_pressures,
             udp_drops: AtomicU64::new(0),
             udp_stream_fallbacks: AtomicU64::new(0),
             last_udp_activity: AtomicU64::new(0),
@@ -4913,19 +5557,19 @@ impl TuicUpstream {
         reconnect_reason: Option<&'static str>,
     ) -> Result<Connection, ClientError> {
         let slot = self
-            .conns
+            .tcp_pool_slots
             .get(index)
             .ok_or_else(|| ClientError::InvalidTarget("tuic tcp pool index out of range".into()))?;
-        let mut guard = slot.lock().await;
-        let closed = guard.close_reason().is_some();
+        let mut state = slot.state.lock().await;
+        let current = &mut state.current;
+        let closed = current.transport.close_reason().is_some();
         if closed || reconnect_reason.is_some() {
             let reason = reconnect_reason.unwrap_or("transport_closed");
-            self.reconnect_locked(index, &mut guard, reason).await?;
-            if let Some(state) = self.tcp_open_states.get(index) {
-                state.note_reconnect_success();
-            }
+            self.reconnect_locked(index, &mut current.transport, reason)
+                .await?;
+            current.open_state.note_reconnect_success();
         }
-        Ok(guard.clone())
+        Ok(current.transport.clone())
     }
 
     async fn reconnect_locked(
@@ -4963,6 +5607,229 @@ impl TuicUpstream {
         Ok(())
     }
 
+    fn sample_tcp_pool_observations(&self) -> Vec<TcpPoolPathObservation> {
+        self.tcp_pool_slots
+            .iter()
+            .map(|slot| {
+                let Ok(state) = slot.state.try_lock() else {
+                    return TcpPoolPathObservation::Unknown;
+                };
+                let current = &state.current;
+                let conn = &current.transport;
+                if conn.close_reason().is_some() {
+                    return TcpPoolPathObservation::Unknown;
+                }
+                let path = conn.stats().path;
+                TcpPoolPathObservation::known(
+                    current.identity(),
+                    path.cwnd,
+                    path.rtt,
+                    path.black_holes_detected,
+                )
+            })
+            .collect()
+    }
+
+    fn tcp_pool_replacement_allowed(&self) -> Vec<bool> {
+        if self.tcp_pool_draining_predecessor.load(Ordering::Acquire) {
+            return vec![false; self.tcp_pool_slots.len()];
+        }
+        self.tcp_pool_slots
+            .iter()
+            .map(|slot| slot.replacement_available())
+            .collect()
+    }
+
+    async fn acquire_tcp_pool_reservation(
+        &self,
+    ) -> Result<(TcpPoolSlotReservation, bool), ClientError> {
+        loop {
+            let available = self.tcp_pool_admission.available.notified();
+            let observations = self.sample_tcp_pool_observations();
+            let replacement_allowed = self.tcp_pool_replacement_allowed();
+            match self
+                .tcp_pool_admission
+                .try_decide(&observations, &replacement_allowed)
+            {
+                Ok(TcpPoolAdmissionDecision::ReserveCurrent(reservation)) => {
+                    if self.tcp_pool_draining_predecessor.load(Ordering::Acquire)
+                        && reservation.qualification_override
+                        && reservation.candidates.iter().any(|candidate| {
+                            candidate.index != 0
+                                && candidate.qualification == TcpPoolForwardQualification::Degraded
+                                && !candidate.admitted
+                        })
+                    {
+                        println!(
+                            "⚠️ tuic-tcp-pool-generation-replacement-blocked slot={} reason=predecessor_draining",
+                            reservation.index
+                        );
+                    }
+                    return Ok((reservation, false));
+                }
+                Ok(TcpPoolAdmissionDecision::ReplaceAuxiliary(replacement)) => {
+                    let Some(permit) = TcpPoolDrainingPermit::try_acquire(
+                        self.tcp_pool_draining_predecessor.clone(),
+                    ) else {
+                        drop(replacement);
+                        continue;
+                    };
+                    return self
+                        .replace_auxiliary_generation(replacement, permit)
+                        .await
+                        .map(|reservation| (reservation, true));
+                }
+                Err(TcpPoolReservationError::Busy) => available.await,
+                Err(error) => {
+                    return Err(ClientError::InvalidTarget(format!(
+                        "tuic tcp pool forward admission failed: {error:?}"
+                    )));
+                }
+            }
+        }
+    }
+
+    async fn replace_auxiliary_generation(
+        &self,
+        replacement: TcpPoolAuxiliaryReplacementPreparation,
+        permit: TcpPoolDrainingPermit,
+    ) -> Result<TcpPoolSlotReservation, ClientError> {
+        let slot = self
+            .tcp_pool_slots
+            .get(replacement.index)
+            .ok_or_else(|| ClientError::InvalidTarget("tuic tcp pool index out of range".into()))?
+            .clone();
+        let expected_activity = self
+            .tcp_pool_admission
+            .current_generation_activity(replacement.index)
+            .ok_or_else(|| {
+                io_err(
+                    "tuic tcp pool generation replacement",
+                    "current generation activity unavailable",
+                )
+            })?;
+        println!(
+            "🔄 tuic-tcp-pool-generation-replacement-start slot={} predecessor_id={} generation={} active={} black_hole_anchor={} black_holes_current={}",
+            replacement.index,
+            replacement.identity.stable_id,
+            replacement.identity.generation,
+            replacement.active_before,
+            replacement.qualification_anchor,
+            replacement.black_holes_current,
+        );
+        let started_at = Instant::now();
+        let handshake = Self::handshake_aux_with_retries(
+            &self.endpoint,
+            self.server,
+            &self.sni,
+            &self.uuid,
+            &self.password,
+            self.zero_rtt,
+            replacement.index,
+        );
+        let (successor_conn, auth_attempts) =
+            tokio::time::timeout(TUIC_RECONNECT_TIMEOUT, handshake)
+                .await
+                .map_err(|_| {
+                    io_err(
+                        "tuic tcp pool generation replacement",
+                        "successor handshake exceeded 5s",
+                    )
+                })??;
+        let successor_generation =
+            replacement
+                .identity
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| {
+                    io_err(
+                        "tuic tcp pool generation replacement",
+                        "generation counter saturated",
+                    )
+                })?;
+        let successor = TcpPoolGeneration::new(
+            successor_conn.clone(),
+            successor_generation,
+            auth_attempts as u64,
+            self.clock,
+        );
+        let successor_activity = successor.activity.clone();
+        let successor_path = successor_conn.stats().path;
+        let successor_observation = TcpPoolPathObservation::known(
+            successor.identity(),
+            successor_path.cwnd,
+            successor_path.rtt,
+            successor_path.black_holes_detected,
+        );
+        let install = slot
+            .install_successor_with(
+                replacement.identity,
+                &expected_activity,
+                successor,
+                started_at,
+                |predecessor, successor| {
+                    self.tcp_pool_admission.replace_current_generation_activity(
+                        replacement.index,
+                        predecessor,
+                        successor.clone(),
+                    )
+                },
+            )
+            .await
+            .map_err(|error| {
+                io_err(
+                    "tuic tcp pool generation replacement",
+                    format!("successor install failed: {error:?}"),
+                )
+            })?;
+        if let Some(secs) = self.quic_stats_secs
+            && let Some(stop) = &self.quic_stats_stop
+        {
+            spawn_quic_stats_logger(successor_conn, replacement.index, secs, stop.subscribe());
+        }
+        println!(
+            "✅ tuic-tcp-pool-generation-replacement-installed slot={} predecessor_id={} successor_id={} generation={} handshake_ms={} active={}",
+            replacement.index,
+            install.predecessor_identity.stable_id,
+            install.successor_identity.stable_id,
+            install.successor_identity.generation,
+            started_at.elapsed().as_millis(),
+            install.predecessor_activity.active(),
+        );
+        let predecessor_identity = install.predecessor_identity;
+        let predecessor_activity = install.predecessor_activity.clone();
+        let draining_owned = permit.transfer();
+        tokio::spawn(async move {
+            predecessor_activity.wait_for_zero().await;
+            if let Some(draining) = slot.take_drained(predecessor_identity).await {
+                draining
+                    .generation
+                    .transport
+                    .close(VarInt::from_u32(0), b"tcp_pool_predecessor_drained");
+                println!(
+                    "✅ tuic-tcp-pool-generation-drained slot={} predecessor_id={} generation={} drain_ms={}",
+                    slot.index,
+                    predecessor_identity.stable_id,
+                    predecessor_identity.generation,
+                    draining.started_at.elapsed().as_millis(),
+                );
+                draining_owned.store(false, Ordering::Release);
+            } else {
+                println!(
+                    "⚠️ tuic-tcp-pool-generation-replacement-blocked slot={} reason=predecessor_reap_identity_mismatch predecessor_id={} generation={}",
+                    slot.index, predecessor_identity.stable_id, predecessor_identity.generation,
+                );
+            }
+        });
+        self.tcp_pool_admission
+            .reserve_replacement_successor(replacement, successor_activity, successor_observation)
+            .map_err(|error| {
+                ClientError::InvalidTarget(format!(
+                    "tuic tcp pool successor reservation failed: {error:?}"
+                ))
+            })
+    }
+
     /// TCP 专用连接选择。Admission samples current Quinn path and PLPMTUD evidence without waiting,
     /// then atomically reserves an eligible slot. A busy slot that added a black-hole detection in
     /// its current ownership epoch is isolated while a non-degraded alternative exists. Remaining
@@ -4972,41 +5839,7 @@ impl TuicUpstream {
     /// auxiliary connection. The per-slot mutex still serializes probe/reconnect and connection
     /// cloning while the already-visible reservation steers unrelated opens toward other slots.
     async fn live_tcp_conn(&self) -> Result<TcpPoolConnectionSelection, ClientError> {
-        let reservation = self
-            .tcp_pool_admission
-            .reserve(|| {
-                self.conns
-                    .iter()
-                    .enumerate()
-                    .map(|(index, slot)| {
-                        let Ok(conn) = slot.try_lock() else {
-                            return TcpPoolPathObservation::Unknown;
-                        };
-                        if conn.close_reason().is_some() {
-                            return TcpPoolPathObservation::Unknown;
-                        }
-                        let Some(open_state) = self.tcp_open_states.get(index) else {
-                            return TcpPoolPathObservation::Unknown;
-                        };
-                        let path = conn.stats().path;
-                        TcpPoolPathObservation::known(
-                            TcpPoolTransportIdentity::new(
-                                conn.stable_id(),
-                                open_state.generation(),
-                            ),
-                            path.cwnd,
-                            path.rtt,
-                            path.black_holes_detected,
-                        )
-                    })
-                    .collect()
-            })
-            .await
-            .map_err(|error| {
-                ClientError::InvalidTarget(format!(
-                    "tuic tcp pool forward admission failed: {error:?}"
-                ))
-            })?;
+        let (reservation, replacement_installed) = self.acquire_tcp_pool_reservation().await?;
         let TcpPoolSlotReservation {
             index,
             lease,
@@ -5023,29 +5856,37 @@ impl TuicUpstream {
         } = reservation;
         let idle_exclusive = active_before == 0;
         let now_secs = self.clock.elapsed().as_secs();
-        let open_state = self
-            .tcp_open_states
-            .get(index)
-            .ok_or_else(|| ClientError::InvalidTarget("tuic tcp pool index out of range".into()))?;
         let slot = self
-            .conns
+            .tcp_pool_slots
             .get(index)
             .ok_or_else(|| ClientError::InvalidTarget("tuic tcp pool index out of range".into()))?;
-        let mut guard = slot.lock().await;
+        let mut state = slot.state.lock().await;
+        let current = &mut state.current;
+        let open_state = current.open_state.clone();
         let last_success_age_secs = open_state.last_success_age_secs(now_secs);
         let last_success_secs = open_state.last_success_secs().unwrap_or(0);
         let mut probe_result = "not_due";
-        let mut reconnect_reason = guard.close_reason().is_some().then_some("transport_closed");
+        let mut reconnect_reason = current
+            .transport
+            .close_reason()
+            .is_some()
+            .then_some("transport_closed");
 
         if reconnect_reason.is_none() && open_state.needs_reconnect(index) && idle_exclusive {
             reconnect_reason = Some("previous_open_failure");
         }
         if reconnect_reason.is_none()
-            && tcp_pool_idle_action(index, now_secs, last_success_secs, idle_exclusive)
-                == TcpPoolIdleAction::Probe
+            && should_probe_tcp_pool_generation(
+                index,
+                now_secs,
+                last_success_secs,
+                idle_exclusive,
+                replacement_installed,
+            )
         {
             let outcome =
-                probe_tcp_pool_connection(&guard, TUIC_TCP_POOL_LIVENESS_PROBE_TIMEOUT).await;
+                probe_tcp_pool_connection(&current.transport, TUIC_TCP_POOL_LIVENESS_PROBE_TIMEOUT)
+                    .await;
             probe_result = match outcome {
                 TcpPoolProbeOutcome::Alive { .. } => "alive",
                 TcpPoolProbeOutcome::Closed => "closed",
@@ -5055,18 +5896,22 @@ impl TuicUpstream {
             reconnect_reason = tcp_pool_probe_reconnect_reason(outcome);
             println!(
                 "🔎 tuic-tcp-pool-probe conn={index} id={} generation={} idle_age_secs={} result={probe_result}",
-                guard.stable_id(),
+                current.transport.stable_id(),
                 open_state.generation(),
                 now_secs.saturating_sub(last_success_secs),
             );
         }
 
         if let Some(reason) = reconnect_reason {
-            self.reconnect_locked(index, &mut guard, reason).await?;
+            self.reconnect_locked(index, &mut current.transport, reason)
+                .await?;
             open_state.note_reconnect_success();
             if index != 0 {
-                let ready =
-                    probe_tcp_pool_connection(&guard, TUIC_TCP_POOL_LIVENESS_PROBE_TIMEOUT).await;
+                let ready = probe_tcp_pool_connection(
+                    &current.transport,
+                    TUIC_TCP_POOL_LIVENESS_PROBE_TIMEOUT,
+                )
+                .await;
                 probe_result = match ready {
                     TcpPoolProbeOutcome::Alive { .. } => "reconnected_alive",
                     TcpPoolProbeOutcome::Closed => "reconnected_closed",
@@ -5075,7 +5920,9 @@ impl TuicUpstream {
                 };
                 if !matches!(ready, TcpPoolProbeOutcome::Alive { .. }) {
                     open_state.note_open_failure(index);
-                    guard.close(VarInt::from_u32(0), b"tcp_pool_ready_probe_failed");
+                    current
+                        .transport
+                        .close(VarInt::from_u32(0), b"tcp_pool_ready_probe_failed");
                     return Err(io_err(
                         "tuic tcp pool ready probe",
                         format!("conn={index} result={probe_result}"),
@@ -5084,8 +5931,11 @@ impl TuicUpstream {
             }
         }
 
-        let conn = guard.clone();
-        drop(guard);
+        let conn = current.transport.clone();
+        let generation = open_state.generation();
+        let write_pressure = current.write_pressure.clone();
+        let startup_auth_attempts = current.auth_attempts;
+        drop(state);
         drop(preparation);
         Ok(TcpPoolConnectionSelection {
             conn_index: index,
@@ -5100,10 +5950,14 @@ impl TuicUpstream {
             qualification_override,
             all_degraded_fallback,
             candidates,
-            generation: open_state.generation(),
+            generation,
             last_success_age_secs,
             probe_result,
             reconnect_reason,
+            open_state,
+            write_pressure,
+            startup_auth_attempts,
+            replacement_installed,
         })
     }
 
@@ -5111,11 +5965,11 @@ impl TuicUpstream {
     /// 数秒）→ `None`，**绝不 await 锁**（否则在主循环 inline 的 send_udp 会被 stall）。连接已死 → `None`。
     /// 重连交给后台 `start_udp` 自愈循环（背景退避重连），与主循环解耦。
     fn current_conn(&self) -> Option<Connection> {
-        let guard = self.conns.first()?.try_lock().ok()?;
-        if guard.close_reason().is_some() {
+        let guard = self.tcp_pool_slots.first()?.state.try_lock().ok()?;
+        if guard.current.transport.close_reason().is_some() {
             None
         } else {
-            Some(guard.clone())
+            Some(guard.current.transport.clone())
         }
     }
 
@@ -5443,26 +6297,27 @@ impl TuicUpstream {
     }
 
     fn endpoint_recovery_input(&self) -> Option<EndpointRecoveryInput> {
-        let mut connections = Vec::with_capacity(self.conns.len());
+        let mut connections = Vec::with_capacity(self.tcp_pool_slots.len() + 1);
         let sampled_at = Instant::now();
-        for (index, slot) in self.conns.iter().enumerate() {
-            let conn = slot.try_lock().ok()?;
-            if conn.close_reason().is_some() {
-                continue;
+        for slot in &self.tcp_pool_slots {
+            let state = slot.state.try_lock().ok()?;
+            for generation in std::iter::once(&state.current)
+                .chain(state.draining.as_ref().map(|draining| &draining.generation))
+            {
+                let conn = &generation.transport;
+                if conn.close_reason().is_some() {
+                    continue;
+                }
+                let stats = conn.stats();
+                connections.push(EndpointRecoveryConnectionSample {
+                    stable_id: conn.stable_id(),
+                    tx_bytes: stats.udp_tx.bytes,
+                    rx_bytes: stats.udp_rx.bytes,
+                    rtt: stats.path.rtt,
+                    current_socket_rx_rebind_generation: conn.current_socket_rx_rebind_generation(),
+                    tcp_write_pressures: generation.write_pressure.snapshots_at(sampled_at),
+                });
             }
-            let stats = conn.stats();
-            connections.push(EndpointRecoveryConnectionSample {
-                stable_id: conn.stable_id(),
-                tx_bytes: stats.udp_tx.bytes,
-                rx_bytes: stats.udp_rx.bytes,
-                rtt: stats.path.rtt,
-                current_socket_rx_rebind_generation: conn.current_socket_rx_rebind_generation(),
-                tcp_write_pressures: self
-                    .tcp_write_pressures
-                    .get(index)
-                    .map(|pressure| pressure.snapshots_at(sampled_at))
-                    .unwrap_or_default(),
-            });
         }
         let active_tcp = self.tcp_pool_admission.active_total();
         let now = self.clock.elapsed().as_secs();
@@ -5525,6 +6380,10 @@ impl ProxyUpstream for TuicUpstream {
             last_success_age_secs,
             probe_result,
             reconnect_reason,
+            open_state,
+            write_pressure,
+            startup_auth_attempts,
+            replacement_installed,
         } = selection;
         // 刀9（真出口 acceptance 修）：open_bi + write Connect 在**黑洞连接**上会 hang——连接尚未被
         // 判死（close_reason 仍 None，因 keepalive/非对称封锁架空 idle 检测），但 QUIC send 窗口满、
@@ -5541,14 +6400,7 @@ impl ProxyUpstream for TuicUpstream {
             send.write_all(&encode_connect(target))
                 .await
                 .map_err(|e| io_err("tuic connect write", e))?;
-            if let Some(state) = self.tcp_open_states.get(conn_index) {
-                state.note_open_success(self.clock.elapsed().as_secs());
-            }
-            let startup_auth_attempts = self
-                .tcp_startup_auth_attempts
-                .get(conn_index)
-                .map(|attempts| attempts.load(Ordering::Relaxed))
-                .unwrap_or(0);
+            open_state.note_open_success(self.clock.elapsed().as_secs());
             let relay_mode = tuic_tcp_relay_mode();
             let diag_meta = if tcp_diag_enabled() {
                 println!(
@@ -5569,6 +6421,7 @@ impl ProxyUpstream for TuicUpstream {
                         last_success_age_secs,
                         probe_result,
                         reconnect_reason,
+                        replacement_installed,
                     })
                 );
                 println!(
@@ -5591,10 +6444,6 @@ impl ProxyUpstream for TuicUpstream {
             let tcp_stream_diag = diag_meta
                 .clone()
                 .map(|meta| TuicTcpStreamDiag::new(meta, Instant::now()));
-            let write_pressure = self
-                .tcp_write_pressures
-                .get(conn_index)
-                .ok_or_else(|| io_err("tuic TCP write pressure", "pool slot tracker missing"))?;
             let send_progress = send.progress_handle();
             let pressure_writer = write_pressure.writer(stream_id);
             let relay: RelayStream = match relay_mode {
@@ -5651,10 +6500,8 @@ impl ProxyUpstream for TuicUpstream {
                 )
             })
             .and_then(|result| result);
-        if result.is_err()
-            && let Some(state) = self.tcp_open_states.get(conn_index)
-        {
-            state.note_open_failure(conn_index);
+        if result.is_err() {
+            open_state.note_open_failure(conn_index);
         }
         result
     }
@@ -5687,6 +6534,10 @@ impl ProxyUpstream for TuicUpstream {
             last_success_age_secs,
             probe_result,
             reconnect_reason,
+            open_state,
+            write_pressure,
+            startup_auth_attempts,
+            replacement_installed,
         } = selection;
         let open = async {
             let (mut send, recv) = conn
@@ -5698,14 +6549,7 @@ impl ProxyUpstream for TuicUpstream {
             send.write_all(&encode_connect(target))
                 .await
                 .map_err(|e| io_err("tuic connect write", e))?;
-            if let Some(state) = self.tcp_open_states.get(conn_index) {
-                state.note_open_success(self.clock.elapsed().as_secs());
-            }
-            let startup_auth_attempts = self
-                .tcp_startup_auth_attempts
-                .get(conn_index)
-                .map(|attempts| attempts.load(Ordering::Relaxed))
-                .unwrap_or(0);
+            open_state.note_open_success(self.clock.elapsed().as_secs());
             let diag_meta = if tcp_diag_enabled() {
                 println!(
                     "{}",
@@ -5725,6 +6569,7 @@ impl ProxyUpstream for TuicUpstream {
                         last_success_age_secs,
                         probe_result,
                         reconnect_reason,
+                        replacement_installed,
                     })
                 );
                 println!(
@@ -5747,28 +6592,30 @@ impl ProxyUpstream for TuicUpstream {
             let tcp_stream_diag = diag_meta
                 .clone()
                 .map(|meta| TuicTcpStreamDiag::new(meta, Instant::now()));
-            let write_pressure = self
-                .tcp_write_pressures
-                .get(conn_index)
-                .ok_or_else(|| io_err("tuic TCP write pressure", "pool slot tracker missing"))?;
+            let reader_lease = lease.try_clone().map_err(|error| {
+                io_err(
+                    "tuic TCP generation lease split",
+                    format!("failed to reserve reader ownership: {error:?}"),
+                )
+            })?;
             let reader: NativeTcpReadHalf = if d16_byte_owned {
                 Box::new(TuicNativeOrderedReader::new(
                     recv,
-                    lease.clone(),
+                    reader_lease,
                     tcp_stream_diag,
                     conn.clone(),
                 ))
             } else if relay_mode == TuicTcpRelayMode::NativeOrderedPump {
                 Box::new(TuicNativeOrderedPumpReader::spawn(
                     recv,
-                    lease.clone(),
+                    reader_lease,
                     tcp_stream_diag,
                     conn.clone(),
                 ))
             } else {
                 Box::new(TuicNativeTcpReader::new(
                     recv,
-                    lease.clone(),
+                    reader_lease,
                     tcp_stream_diag,
                     conn.clone(),
                 ))
@@ -5794,10 +6641,8 @@ impl ProxyUpstream for TuicUpstream {
                 )
             })
             .and_then(|result| result);
-        if result.is_err()
-            && let Some(state) = self.tcp_open_states.get(conn_index)
-        {
-            state.note_open_failure(conn_index);
+        if result.is_err() {
+            open_state.note_open_failure(conn_index);
         }
         result
     }
@@ -5842,11 +6687,14 @@ impl crate::failover::HealthProbe for TuicUpstream {
         self.live_conn().await.is_ok()
     }
     async fn is_dead(&self) -> bool {
-        self.conns
+        self.tcp_pool_slots
             .first()
             .expect("TuicUpstream always has a primary connection")
+            .state
             .lock()
             .await
+            .current
+            .transport
             .close_reason()
             .is_some()
     }
@@ -5857,10 +6705,13 @@ impl crate::failover::HealthProbe for TuicUpstream {
     /// 跳过本次观察：连接正在重连本就不健康，停滞计时靠 `now` 累积、不重置，下次能读到（仍停滞）即判黑洞。
     async fn rx_datagrams(&self) -> Option<u64> {
         Some(
-            self.conns
+            self.tcp_pool_slots
                 .first()?
+                .state
                 .try_lock()
                 .ok()?
+                .current
+                .transport
                 .stats()
                 .udp_rx
                 .datagrams,
@@ -7317,6 +8168,7 @@ mod tests {
             last_success_age_secs: Some(15),
             probe_result: "alive",
             reconnect_reason: Some("previous_open_failure"),
+            replacement_installed: true,
         });
 
         assert!(line.contains("tuic-tcp-pool-selection"), "{line}");
@@ -7341,6 +8193,7 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("generation=7"), "{line}");
+        assert!(line.contains("replacement_installed=true"), "{line}");
         assert!(line.contains("last_success_age_secs=15"), "{line}");
         assert!(line.contains("probe_result=alive"), "{line}");
         assert!(
@@ -8134,6 +8987,243 @@ mod tests {
         assert_eq!(selector.active_slots[1].load(Ordering::Relaxed), 0);
     }
 
+    #[tokio::test]
+    async fn tcp_pool_generation_lease_zero_is_isolated_from_successor() {
+        let pool_active = Arc::new(AtomicU64::new(0));
+        let predecessor_slot_active = Arc::new(AtomicU64::new(0));
+        let successor_slot_active = Arc::new(AtomicU64::new(0));
+        let predecessor = Arc::new(TcpPoolGenerationActivity::new());
+        let successor = Arc::new(TcpPoolGenerationActivity::new());
+
+        let predecessor_lease = TcpPoolSlotLease::reserve_generation(
+            predecessor.clone(),
+            predecessor_slot_active,
+            pool_active.clone(),
+        )
+        .expect("the predecessor generation must accept its first lease");
+        let successor_lease = TcpPoolSlotLease::reserve_generation(
+            successor.clone(),
+            successor_slot_active,
+            pool_active.clone(),
+        )
+        .expect("the successor generation must have an independent lease counter");
+
+        assert_eq!(predecessor.active(), 1);
+        assert_eq!(successor.active(), 1);
+        assert_eq!(pool_active.load(Ordering::Acquire), 2);
+
+        let predecessor_zero = tokio::spawn({
+            let predecessor = predecessor.clone();
+            async move { predecessor.wait_for_zero().await }
+        });
+        tokio::task::yield_now().await;
+        drop(predecessor_lease);
+        tokio::time::timeout(Duration::from_secs(1), predecessor_zero)
+            .await
+            .expect("the exact predecessor zero transition must notify its drain waiter")
+            .expect("the predecessor zero waiter must not panic");
+
+        assert_eq!(predecessor.active(), 0);
+        assert_eq!(successor.active(), 1);
+        assert_eq!(pool_active.load(Ordering::Acquire), 1);
+
+        drop(successor_lease);
+        assert_eq!(successor.active(), 0);
+        assert_eq!(pool_active.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_generation_slot_installs_successor_without_resetting_predecessor() {
+        let clock = Instant::now();
+        let slot = TcpPoolGenerationSlot::new(1, 11_u64, 1, 1, clock);
+        let predecessor_activity = slot.current_activity().await;
+        let slot_active = Arc::new(AtomicU64::new(0));
+        let pool_active = Arc::new(AtomicU64::new(0));
+        let predecessor_lease = TcpPoolSlotLease::reserve_generation(
+            predecessor_activity.clone(),
+            slot_active,
+            pool_active,
+        )
+        .unwrap();
+        let expected = TcpPoolTransportIdentity::new(11, 1);
+        let successor = TcpPoolGeneration::new(22_u64, 2, 1, clock);
+
+        let installed = slot
+            .install_successor(expected, &predecessor_activity, successor, Instant::now())
+            .await
+            .expect("the exact predecessor identity must install one successor");
+
+        assert_eq!(installed.predecessor_identity, expected);
+        assert_eq!(
+            installed.successor_identity,
+            TcpPoolTransportIdentity::new(22, 2)
+        );
+        assert_eq!(slot.current_transport().await, 22);
+        assert_eq!(slot.draining_transport().await, Some(11));
+        assert_eq!(predecessor_activity.active(), 1);
+        assert!(
+            slot.take_drained(expected).await.is_none(),
+            "a predecessor with a live lease must remain untouched"
+        );
+
+        drop(predecessor_lease);
+        predecessor_activity.wait_for_zero().await;
+        assert_eq!(predecessor_activity.active(), 0);
+        let drained = slot
+            .take_drained(expected)
+            .await
+            .expect("only the exact zero predecessor may be reaped");
+        assert_eq!(drained.generation.transport, 11);
+        assert_eq!(slot.draining_transport().await, None);
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_generation_install_rejects_primary_stale_and_second_predecessor() {
+        let clock = Instant::now();
+        let primary = TcpPoolGenerationSlot::new(0, 10_u64, 1, 1, clock);
+        let primary_activity = primary.current_activity().await;
+        let primary_result = primary
+            .install_successor(
+                TcpPoolTransportIdentity::new(10, 1),
+                &primary_activity,
+                TcpPoolGeneration::new(20_u64, 2, 1, clock),
+                Instant::now(),
+            )
+            .await;
+        assert!(matches!(
+            primary_result,
+            Err(TcpPoolGenerationInstallError::Primary)
+        ));
+        assert_eq!(primary.current_transport().await, 10);
+
+        let auxiliary = TcpPoolGenerationSlot::new(1, 11_u64, 1, 1, clock);
+        let predecessor_activity = auxiliary.current_activity().await;
+        let stale_result = auxiliary
+            .install_successor(
+                TcpPoolTransportIdentity::new(99, 1),
+                &predecessor_activity,
+                TcpPoolGeneration::new(21_u64, 2, 1, clock),
+                Instant::now(),
+            )
+            .await;
+        assert!(matches!(
+            stale_result,
+            Err(TcpPoolGenerationInstallError::StalePredecessor)
+        ));
+        assert_eq!(auxiliary.current_transport().await, 11);
+        assert_eq!(auxiliary.draining_transport().await, None);
+
+        auxiliary
+            .install_successor(
+                TcpPoolTransportIdentity::new(11, 1),
+                &predecessor_activity,
+                TcpPoolGeneration::new(22_u64, 2, 1, clock),
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        let successor_activity = auxiliary.current_activity().await;
+        let second_result = auxiliary
+            .install_successor(
+                TcpPoolTransportIdentity::new(22, 2),
+                &successor_activity,
+                TcpPoolGeneration::new(23_u64, 3, 1, clock),
+                Instant::now(),
+            )
+            .await;
+        assert!(matches!(
+            second_result,
+            Err(TcpPoolGenerationInstallError::PredecessorDraining)
+        ));
+        assert_eq!(auxiliary.current_transport().await, 22);
+        assert_eq!(auxiliary.draining_transport().await, Some(11));
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_replacement_trigger_reserves_only_the_installed_successor() {
+        let clock = Instant::now();
+        let slots = [
+            TcpPoolGenerationSlot::new(0, 10_u64, 1, 1, clock),
+            TcpPoolGenerationSlot::new(1, 11_u64, 1, 1, clock),
+        ];
+        let activities = vec![
+            slots[0].current_activity().await,
+            slots[1].current_activity().await,
+        ];
+        let admission = TcpPoolAdmission::with_current_generation_activity(activities.clone());
+        let anchored = [
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(10, 1),
+                5_140,
+                Duration::from_millis(175),
+                0,
+            ),
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(11, 1),
+                77_246,
+                Duration::from_millis(179),
+                0,
+            ),
+        ];
+        let primary = admission.try_reserve(&anchored).unwrap();
+        let auxiliary = admission.try_reserve(&anchored).unwrap();
+        drop((primary, auxiliary));
+        admission.set_active_for_test(0, 14);
+        admission.set_active_for_test(1, 6);
+        let observed = [
+            anchored[0],
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(11, 1),
+                77_246,
+                Duration::from_millis(179),
+                16,
+            ),
+        ];
+        let TcpPoolAdmissionDecision::ReplaceAuxiliary(replacement) =
+            admission.try_decide(&observed, &[false, true]).unwrap()
+        else {
+            panic!("the replay must prepare an auxiliary successor");
+        };
+        let predecessor_activity = activities[1].clone();
+        let successor = TcpPoolGeneration::new(22_u64, 2, 1, clock);
+        let successor_activity = successor.activity.clone();
+        let successor_observation = TcpPoolPathObservation::known(
+            successor.identity(),
+            12_000,
+            Duration::from_millis(175),
+            0,
+        );
+        slots[1]
+            .install_successor_with(
+                TcpPoolTransportIdentity::new(11, 1),
+                &predecessor_activity,
+                successor,
+                Instant::now(),
+                |predecessor, successor| {
+                    admission.replace_current_generation_activity(1, predecessor, successor.clone())
+                },
+            )
+            .await
+            .unwrap();
+
+        let selected = admission
+            .reserve_replacement_successor(
+                replacement,
+                successor_activity.clone(),
+                successor_observation,
+            )
+            .unwrap();
+
+        assert_eq!((selected.index, selected.active_before), (1, 0));
+        assert_eq!(predecessor_activity.active(), 6);
+        assert_eq!(successor_activity.active(), 1);
+        assert_eq!(admission.active_total(), 21);
+        drop(selected);
+        assert_eq!(predecessor_activity.active(), 6);
+        assert_eq!(successor_activity.active(), 0);
+        assert_eq!(admission.active_total(), 20);
+    }
+
     #[test]
     fn tcp_pool_busy_epoch_black_hole_advancement_isolates_new_forward_opens() {
         let admission = TcpPoolAdmission::new(2);
@@ -8161,8 +9251,8 @@ mod tests {
         assert_eq!((first.index, second.index), (0, 1));
         drop((first, second));
 
-        admission.active_slots[0].store(8, Ordering::Release);
-        admission.active_slots[1].store(6, Ordering::Release);
+        admission.set_active_for_test(0, 8);
+        admission.set_active_for_test(1, 6);
         let advanced = [
             anchored[0],
             TcpPoolPathObservation::known(
@@ -8187,6 +9277,49 @@ mod tests {
     }
 
     #[test]
+    fn tcp_pool_qualified_lane_collapse_requests_auxiliary_generation_replacement() {
+        let admission = TcpPoolAdmission::new(2);
+        let anchored = [
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(0, 1),
+                5_140,
+                Duration::from_millis(175),
+                0,
+            ),
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(1, 1),
+                77_246,
+                Duration::from_millis(179),
+                0,
+            ),
+        ];
+        let first = admission.try_reserve(&anchored).unwrap();
+        let second = admission.try_reserve(&anchored).unwrap();
+        drop((first, second));
+
+        admission.set_active_for_test(0, 14);
+        admission.set_active_for_test(1, 6);
+        let observed = [
+            anchored[0],
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(1, 1),
+                77_246,
+                Duration::from_millis(179),
+                16,
+            ),
+        ];
+
+        let decision = admission
+            .try_decide(&observed, &[false, true])
+            .expect("the degraded auxiliary generation must remain replaceable");
+
+        let TcpPoolAdmissionDecision::ReplaceAuxiliary(replacement) = decision else {
+            panic!("qualified-lane collapse must request replacement, not reserve conn0");
+        };
+        assert_eq!(replacement.index, 1);
+    }
+
+    #[test]
     fn tcp_pool_active_zero_starts_a_fresh_forward_qualification_epoch() {
         let admission = TcpPoolAdmission::new(1);
         let identity = TcpPoolTransportIdentity::new(7, 3);
@@ -8201,7 +9334,7 @@ mod tests {
         assert_eq!(first.qualification_anchor, Some(2));
         drop(first);
 
-        admission.active_slots[0].store(1, Ordering::Release);
+        admission.set_active_for_test(0, 1);
         let advanced = [TcpPoolPathObservation::known(
             identity,
             10_000,
@@ -8216,7 +9349,7 @@ mod tests {
         assert!(degraded.all_degraded_fallback);
         drop(degraded);
 
-        admission.active_slots[0].store(0, Ordering::Release);
+        admission.set_active_for_test(0, 0);
         let recovered = admission.try_reserve(&advanced).unwrap();
         assert_eq!(
             recovered.qualification,
@@ -8268,8 +9401,8 @@ mod tests {
         let second = admission.try_reserve(&anchored).unwrap();
         drop((first, second));
 
-        admission.active_slots[0].store(7, Ordering::Release);
-        admission.active_slots[1].store(3, Ordering::Release);
+        admission.set_active_for_test(0, 7);
+        admission.set_active_for_test(1, 3);
         let degraded = [
             TcpPoolPathObservation::known(identities[0], 1_000_000, Duration::from_millis(1), 1),
             TcpPoolPathObservation::known(identities[1], 1, Duration::from_secs(1), 2),
@@ -8286,8 +9419,8 @@ mod tests {
         assert!(!selected.qualification_override);
         drop(selected);
 
-        admission.active_slots[0].store(6, Ordering::Release);
-        admission.active_slots[1].store(6, Ordering::Release);
+        admission.set_active_for_test(0, 6);
+        admission.set_active_for_test(1, 6);
         let service_selected = admission.try_reserve(&degraded).unwrap();
         assert_eq!(
             (service_selected.index, service_selected.active_before),
@@ -8319,8 +9452,8 @@ mod tests {
         let first = admission.try_reserve(&anchored).unwrap();
         let second = admission.try_reserve(&anchored).unwrap();
         drop((first, second));
-        admission.active_slots[0].store(5, Ordering::Release);
-        admission.active_slots[1].store(4, Ordering::Release);
+        admission.set_active_for_test(0, 5);
+        admission.set_active_for_test(1, 4);
 
         let missing_and_degraded = [
             TcpPoolPathObservation::Unknown,
@@ -8365,8 +9498,8 @@ mod tests {
     #[test]
     fn tcp_pool_equal_busy_load_prefers_greater_path_service() {
         let selector = TcpPoolAdmission::new(2);
-        selector.active_slots[0].store(62, Ordering::Release);
-        selector.active_slots[1].store(62, Ordering::Release);
+        selector.set_active_for_test(0, 62);
+        selector.set_active_for_test(1, 62);
         let path_service = [
             TcpPoolPathService::known(10_124, Duration::from_millis(163)),
             TcpPoolPathService::known(23_842, Duration::from_millis(163)),
@@ -8427,8 +9560,8 @@ mod tests {
     #[test]
     fn tcp_pool_unequal_load_precedes_path_service() {
         let selector = TcpPoolAdmission::new(2);
-        selector.active_slots[0].store(3, Ordering::Release);
-        selector.active_slots[1].store(4, Ordering::Release);
+        selector.set_active_for_test(0, 3);
+        selector.set_active_for_test(1, 4);
         let path_service = [
             TcpPoolPathService::known(1, Duration::from_secs(1)),
             TcpPoolPathService::known(1_000_000, Duration::from_millis(1)),
@@ -8445,8 +9578,8 @@ mod tests {
     #[test]
     fn tcp_pool_known_path_service_precedes_unknown_for_equal_busy_load() {
         let selector = TcpPoolAdmission::new(2);
-        selector.active_slots[0].store(4, Ordering::Release);
-        selector.active_slots[1].store(4, Ordering::Release);
+        selector.set_active_for_test(0, 4);
+        selector.set_active_for_test(1, 4);
         let path_service = [
             TcpPoolPathService::Unknown,
             TcpPoolPathService::known(10_000, Duration::from_millis(100)),
@@ -8463,8 +9596,8 @@ mod tests {
     #[test]
     fn tcp_pool_equal_or_unknown_path_service_keeps_stable_index() {
         let selector = TcpPoolAdmission::new(2);
-        selector.active_slots[0].store(8, Ordering::Release);
-        selector.active_slots[1].store(8, Ordering::Release);
+        selector.set_active_for_test(0, 8);
+        selector.set_active_for_test(1, 8);
         let equal_service = [
             TcpPoolPathService::known(10_000, Duration::from_millis(100)),
             TcpPoolPathService::known(20_000, Duration::from_millis(200)),
@@ -8487,7 +9620,7 @@ mod tests {
     #[test]
     fn tcp_pool_preparing_slot_cannot_be_overtaken_before_connection_clone() {
         let selector = TcpPoolAdmission::new(2);
-        selector.active_slots[1].store(4, Ordering::Release);
+        selector.set_active_for_test(1, 4);
 
         let first = selector
             .try_reserve(&[])
@@ -8498,7 +9631,7 @@ mod tests {
 
         assert_eq!((first.index, first.active_before), (0, 0));
         assert_eq!((second.index, second.active_before), (1, 4));
-        selector.active_slots[1].store(1, Ordering::Release);
+        selector.set_active_for_test(1, 1);
         drop((first, second));
         assert_eq!(selector.active_slots[0].load(Ordering::Acquire), 0);
         assert_eq!(selector.active_slots[1].load(Ordering::Acquire), 0);
@@ -8600,8 +9733,8 @@ mod tests {
         ));
 
         let saturated = TcpPoolAdmission::new(2);
-        saturated.active_slots[0].store(u64::MAX, Ordering::Release);
-        saturated.active_slots[1].store(u64::MAX, Ordering::Release);
+        saturated.set_active_for_test(0, u64::MAX);
+        saturated.set_active_for_test(1, u64::MAX);
         assert!(matches!(
             saturated.try_reserve(&[]),
             Err(TcpPoolReservationError::Saturated)
@@ -8644,6 +9777,11 @@ mod tests {
             TcpPoolIdleAction::Probe,
             "elapsed idle time requests evidence; it is not failure evidence"
         );
+        assert!(
+            !should_probe_tcp_pool_generation(1, 10_000, 0, true, true),
+            "an authenticated successor must not be recycled as stale before its triggering open"
+        );
+        assert!(should_probe_tcp_pool_generation(1, 100, 90, true, false));
     }
 
     #[tokio::test]
