@@ -2,7 +2,7 @@
 
 Date: 2026-08-04
 
-Status: **APPROVED DIRECTION — implementation pending**
+Status: **IMPLEMENTED LOCALLY — real M2 acceptance pending**
 
 Evidence:
 `docs/tech/2026-08-04-knife15-m2-qualified-collapse-failure-results.md`

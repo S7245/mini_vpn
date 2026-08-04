@@ -1,10 +1,44 @@
 # TODO
 
-## Current Knife15 Plan (2026-08-03)
+## Current Knife15 Plan (2026-08-04)
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-03 — busy-epoch forward qualification ready for M2)
+#### Latest decision (2026-08-04 — auxiliary generation replacement ready for M2)
+
+Exact-source `fd6c34f` bundle
+`/tmp/mini_vpn_knife15_macos_20260804_095117.tar.gz` (SHA-256
+`889cdd276c...`) passed every prerequisite and cycle 1, then the first short
+forward had one complete receiver-zero interval. The reviewed busy-epoch rule
+correctly isolated degraded conn1 (`black_holes 0 -> 16`); both opens used
+qualified conn0. Conn0 stayed transport-live but already had fourteen lease
+halves and its data writer waited `1,169,717us`. Selector-only isolation is
+therefore falsified. Reverse UDP independently lost `3.391937% > 3%`.
+
+Runner `addc54d` now fails formal UDP phases immediately above the unchanged
+`3%` limit. Implementation `5533d15` installs one authenticated auxiliary
+successor while the predecessor drains its exact existing generation leases.
+No existing flow is replayed/reset, conn0 remains primary for UDP/health, the
+eligible pool remains two, and every frozen data-plane value/SLO remains
+unchanged. Focused `31/31`, root `671+3 ignored`, main `2`, integration `10+4
+ignored`, release, Clippy, shell, vendored Quinn/proto, 32 MiB
+`239.967 Mbit/s`, fmt/diff/secret, and review pass with no unresolved P0/P1.
+Result:
+`docs/tech/2026-08-04-knife15-m2-auxiliary-generation-replacement-local-results.md`.
+
+Next:
+
+1. pull the pushed reviewed descendant and rebuild release on the test Mac;
+2. keep Clash-TUN/every other VPN off and use the runbook IPv6 boundary;
+3. run exactly one fresh `m2-ipv6-check -> baseline -> direct-discriminator ->
+   start -> smoke -> m2 -> status -> stop`;
+4. preserve `status/snapshot/stop` after a post-start failure; do not tune or
+   repeat unchanged;
+5. reject this architecture if an installed successor still has a
+   healthy-control complete receiver-zero interval; keep M3 blocked until
+   complete M2 plus cleanup acceptance.
+
+#### Previous decision (2026-08-03 — busy-epoch forward qualification ready for M2)
 
 Exact-source `99e56b0` xiaoou Ethernet bundle
 `/tmp/mini_vpn_knife15_macos_20260803_093012.tar.gz` (SHA-256

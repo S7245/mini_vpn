@@ -1,5 +1,24 @@
 # Errors
 
+## 2026-08-04 - Qualified-lane isolation collapsed onto one incumbent generation
+
+- Exact-source `fd6c34f` correctly excluded degraded conn1, but both new opens
+  then used qualified conn0 with fourteen existing lease halves. The Target
+  lost one complete initial receiver interval while controls, Endpoint, D16,
+  TUN, and conn0 transport identity stayed healthy.
+- This is the selector-only stop-rule result, not permission for another
+  score, threshold, pool increase, or frozen-value tune. Correct behavior is
+  one bounded authenticated auxiliary successor with the old generation
+  drain-only until its exact leases reach zero.
+- The same bundle's reverse UDP loss was `3.391937%`, but the formal runner
+  delayed the unchanged `3%` predicate until final aggregate acceptance.
+  Correct behavior is immediate formal phase rejection; diagnostic
+  continuation remains separate.
+- Review also caught four lifecycle hazards before commit: a zero-transition
+  lost wake, global replacement permit races, predecessor identity mismatch
+  releasing ownership too early, and infallible hot-path lease cloning. Each
+  now fails closed or has focused coverage.
+
 ## 2026-08-03 - Idle qualification sampling initially preceded reservation authority
 
 - The first busy-epoch implementation updated an idle slot's black-hole anchor

@@ -2,9 +2,41 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-03)
+## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-04)
 
-- **Latest accepted position:** exact-source `99e56b0` xiaoou Ethernet bundle
+- **Latest accepted position:** exact-source `fd6c34f` xiaoou bundle
+  `/tmp/mini_vpn_knife15_macos_20260804_095117.tar.gz` (SHA-256
+  `889cdd276c...`) passed baseline at `29.369/44.838 Mbit/s`, direct at
+  `14.675 Mbit/s` with no gaps, start/smoke, IPv6/full-tunnel/real-client
+  gates, the first mixed cycle, and cleanup. The first short forward then had
+  one complete initial receiver-zero interval.
+- The reviewed busy-epoch discriminator correctly excluded conn1 after its
+  PLPMTUD black holes advanced `0 -> 16`. Both opens used qualified conn0,
+  which stayed at zero black holes but had fourteen existing lease halves,
+  `5,140B/175ms` service, and a `1,169,717us` writer wait. Selector-only
+  isolation is therefore rejected. The preceding reverse UDP independently
+  lost `3.391937%`, above the frozen `3%` SLI.
+- Runner `addc54d` makes formal UDP loss fail at the phase boundary.
+  Implementation `5533d15` adds bounded auxiliary generation replacement:
+  the degraded predecessor becomes drain-only, an authenticated successor is
+  atomically installed and receives the triggering reservation, and exact
+  generation-zero closes only the predecessor. Primary conn0/UDP/health,
+  eligible pool two, existing flows, D16, Endpoint, MTU, windows, chunk,
+  Cubic, GSO, self-wake, workload, and SLOs remain unchanged.
+- Focused `31/31`, root `671+3 ignored`, main `2`, integration `10+4 ignored`,
+  release, Clippy, Knife15/Knife14 shell, vendored Quinn/proto, 32 MiB
+  `239.967 Mbit/s` with `61,440/0/0B`, fmt/diff/secret, and code review pass
+  with no unresolved P0/P1. Result:
+  `docs/tech/2026-08-04-knife15-m2-auxiliary-generation-replacement-local-results.md`.
+- Next take exactly one fresh real-Mac `m2-ipv6-check -> baseline ->
+  direct-discriminator -> start -> smoke -> m2 -> status -> stop` from the
+  pushed reviewed descendant with a rebuilt release and every other VPN off.
+  Preserve `status/snapshot/stop` after any post-start failure. Do not tune or
+  repeat unchanged. An installed-successor healthy-control receiver-zero
+  rejects this architecture and opens Quinn scheduling/failover research. M3
+  remains blocked pending full M2 plus cleanup acceptance.
+
+- **Previous accepted position:** exact-source `99e56b0` xiaoou Ethernet bundle
   `/tmp/mini_vpn_knife15_macos_20260803_093012.tar.gz` (SHA-256
   `804b96c5...`) passed baseline at `34.527/60.550 Mbit/s`, the 300-second
   direct discriminator at `17.264 Mbit/s` without sender/receiver gaps,

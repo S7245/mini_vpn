@@ -2,12 +2,12 @@
 
 Date: 2026-08-04
 
-Status: **READY FOR LOCAL TDD**
+Status: **COMPLETE LOCALLY — real M2 acceptance pending**
 
 Architecture:
 `docs/tech/2026-08-04-knife15-m2-auxiliary-generation-replacement-architecture-spec.md`
 
-## Task 1 - Freeze the failure replay and formal UDP fail-fast
+## Task 1 - Freeze the failure replay and formal UDP fail-fast — COMPLETE
 
 - Add a shell fixture where formal UDP loss `3.000001%` is rejected at the
   phase and exact `3.0%` passes.
@@ -15,14 +15,14 @@ Architecture:
 - Persist failure reason, value, limit, and evidence path.
 - Run Knife15 internal/external self-tests and syntax.
 
-## Task 2 - Introduce generation-bound lease ownership
+## Task 2 - Introduce generation-bound lease ownership — COMPLETE
 
 - Add a per-generation active counter plus zero notification.
 - Make each lease update generation active and pool-wide active total.
 - Preserve clone/drop and saturation semantics.
 - RED/GREEN zero notification and cross-generation isolation.
 
-## Task 3 - Separate admission decision from generation preparation
+## Task 3 - Separate admission decision from generation preparation — COMPLETE
 
 - Extend the plain admission outcome with `ReserveCurrent` versus
   `ReplaceAuxiliary`.
@@ -30,7 +30,7 @@ Architecture:
 - Require replacement rather than another conn0 reservation.
 - Preserve primary-only degradation and ordinary qualified ordering.
 
-## Task 4 - Extract the TCP pool generation module
+## Task 4 - Extract the TCP pool generation module — COMPLETE
 
 - Introduce one parameter object for connection, identity/generation,
   generation lease counter, write pressure, and auth/open evidence.
@@ -38,7 +38,7 @@ Architecture:
 - Keep the production Quinn adapter and add a deterministic in-memory adapter.
 - Use Parallel Change; production behavior stays unchanged in this task.
 
-## Task 5 - Implement single-owner successor preparation
+## Task 5 - Implement single-owner successor preparation — COMPLETE
 
 - Reuse the existing bounded handshake/auth path.
 - Hold replacement preparation authority without holding a Quinn or endpoint
@@ -46,7 +46,7 @@ Architecture:
 - Verify predecessor identity/generation before install.
 - RED/GREEN concurrent opens and stale handshake completion.
 
-## Task 6 - Atomically install and reserve the successor
+## Task 6 - Atomically install and reserve the successor — COMPLETE
 
 - Swap current generation, write pressure, and active counter under one slot
   authority.
@@ -54,7 +54,7 @@ Architecture:
 - Bind the triggering open to the successor.
 - Prove no opener can reserve the predecessor after install.
 
-## Task 7 - Drain and reap the predecessor
+## Task 7 - Drain and reap the predecessor — COMPLETE
 
 - Retain predecessor connection and pressure evidence while generation active
   is nonzero.
@@ -63,14 +63,14 @@ Architecture:
   draining predecessor globally.
 - RED/GREEN long-lived predecessor and replacement-blocked cases.
 
-## Task 8 - Preserve endpoint recovery and diagnostics by identity
+## Task 8 - Preserve endpoint recovery and diagnostics by identity — COMPLETE
 
 - Sample current and draining generations independently.
 - Attribute writer pressure to its exact stable id/generation.
 - Keep endpoint-wide socket rebind semantics unchanged.
 - Label QUIC stats and selection/replacement/drain transitions.
 
-## Task 9 - Migrate both TCP open interfaces
+## Task 9 - Migrate both TCP open interfaces — COMPLETE
 
 - Make generic and D16 native opens consume the same acquired generation.
 - Return connection, generation-bound lease, write pressure, and diagnostics
@@ -78,7 +78,7 @@ Architecture:
 - Remove parallel-vector lookups from both callers.
 - Preserve TUIC Connect bytes and all relay modes.
 
-## Task 10 - Failure and lifecycle regressions
+## Task 10 - Failure and lifecycle regressions — COMPLETE
 
 - Handshake timeout/failure leaves current state intact.
 - Primary conn0 is never generation-replaced.
@@ -86,7 +86,7 @@ Architecture:
 - Existing predecessor streams receive no reset during successor install.
 - Drop/cancel after reservation releases every count and preparation token.
 
-## Task 11 - Local gates and code review
+## Task 11 - Local gates and code review — COMPLETE
 
 - Focused pool/replacement and shell RED/GREEN tests.
 - Root library/binary/integration, release, and all-target Clippy.
@@ -95,7 +95,7 @@ Architecture:
 - Endpoint 32MiB capacity `>170 Mbit/s` and final conservation.
 - fmt, diff check, secret scan, and P0/P1 code review.
 
-## Task 12 - Memory, commit, push, and real-Mac handoff
+## Task 12 - Memory, commit, push, and real-Mac handoff — COMPLETE
 
 - Record results in a local-results document.
 - Update `AGENTS.md`, `HANDOFF.md`, `TODO.md`, and learnings/errors.

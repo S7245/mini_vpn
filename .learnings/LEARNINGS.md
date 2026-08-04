@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-08-04 - Isolation needs a bounded clean-generation escape path
+
+- Categorical negative evidence can correctly stop new opens from using a
+  degraded transport without restoring service. Once the only alternative is
+  already busy, selector-only logic has exhausted its authority.
+- Preserve established streams by separating logical slot identity from
+  transport generation identity. A predecessor can remain drain-only while a
+  successor is the slot's sole admission target; this restores capacity
+  without replay, migration, reset, or configured pool growth.
+- Lease ownership must be exact per generation and global. The zero waiter
+  needs a retained notification permit, install needs expected-identity and
+  expected-counter checks, and reap must close only the exact predecessor.
+- Keep bounded overlap explicit: two eligible generations, one draining
+  predecessor, three live transports maximum. If the successor degrades before
+  predecessor drain, fail closed into the existing fallback instead of
+  producing a fourth connection.
+- A fresh generation must not inherit process-age stale-idle semantics. Its
+  first triggering reservation already follows a successful authenticated
+  handshake and should not immediately reconnect itself.
+- Result:
+  `docs/tech/2026-08-04-knife15-m2-auxiliary-generation-replacement-local-results.md`.
+
 ## 2026-08-03 - Busy transport epochs need categorical admission evidence
 
 - Least ownership and greater instantaneous `cwnd/RTT` are useful ordering

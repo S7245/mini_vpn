@@ -187,7 +187,42 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-08-03:
+Current Knife15 summary, as of 2026-08-04:
+
+- Exact-source `fd6c34f` xiaoou bundle
+  `/tmp/mini_vpn_knife15_macos_20260804_095117.tar.gz` (SHA-256
+  `889cdd276c...`) passed baseline `29.369/44.838 Mbit/s`, the 300-second
+  direct discriminator at `14.675 Mbit/s` without gaps, start/smoke,
+  IPv6/full-tunnel/real-client gates, cycle-1 long TCP/reverse TCP/reverse
+  UDP, and cleanup. Its first short forward then had one complete initial
+  Target receiver-zero interval.
+- Busy-epoch qualification ran correctly: degraded conn1 advanced from zero
+  to sixteen PLPMTUD black holes and was excluded; both new opens used
+  qualified conn0. Conn0 stayed at zero black holes but already owned fourteen
+  lease halves, had `5,140B/175ms` service, and its data writer waited
+  `1,169,717us`. This falsifies selector-only isolation and selects bounded
+  auxiliary generation replacement. The independent reverse-UDP result was
+  `3.391937%`, above the frozen `3%` SLI.
+- Runner commit `addc54d` now rejects formal UDP loss above `3%` immediately.
+  Implementation `5533d15` owns connection, exact generation activity,
+  write-pressure, open/auth state, and drain lifecycle in each logical slot.
+  A degraded busy auxiliary predecessor becomes drain-only; one authenticated
+  successor becomes the only new-open generation and receives the triggering
+  reservation. Existing streams are never replayed, migrated, or reset.
+  Primary/UDP/health remain conn0, eligible pool remains two, and bounded
+  overlap is at most one predecessor/three live generations.
+- Focused `31/31`, root `671+3 ignored`, main `2`, integration `10+4 ignored`,
+  release, Clippy, Knife15/Knife14 shell, vendored Quinn/proto, fmt/diff/secret,
+  and review gates pass with no unresolved P0/P1. The exact 32 MiB Endpoint
+  gate reached `239.967 Mbit/s` with final conservation `61,440/0/0B`. Result:
+  `docs/tech/2026-08-04-knife15-m2-auxiliary-generation-replacement-local-results.md`.
+- Next take exactly one fresh real-Mac `m2-ipv6-check -> baseline ->
+  direct-discriminator -> start -> smoke -> m2 -> status -> stop` from the
+  pushed reviewed descendant and rebuilt release. Do not tune or repeat
+  unchanged. If an installed successor still has a healthy-control complete
+  receiver-zero interval, reject this architecture and open Quinn
+  initial-stream scheduling/failover research. M3 remains blocked pending
+  complete M2 plus cleanup acceptance.
 
 - Exact-source `99e56b0` xiaoou Ethernet bundle
   `/tmp/mini_vpn_knife15_macos_20260803_093012.tar.gz` (SHA-256
