@@ -187,7 +187,42 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-08-04:
+Current Knife15 summary, as of 2026-08-05:
+
+- Exact-source `798c1a5` artifact
+  `/tmp/mini_vpn_knife15_macos_20260805_015011.tar.gz` (SHA-256
+  `386ecafc...`) passed baseline `45.914/26.363 Mbit/s`, direct
+  `22.908 Mbit/s` with no gaps, start/smoke, IPv6/full-tunnel/real-client
+  gates, the complete four-hour steady-a window, 17 mixed cycles plus cycle
+  18 forward, and cleanup. Across 154 results it had zero Target receiver
+  gaps, `10,354,688B` max TCP gap, `0.604884%` max UDP loss, and Endpoint
+  max/final `61,440B / 61,403/0/0B`.
+- The auxiliary replacement occurred exactly once: degraded conn1 generation
+  1 advanced PLPMTUD black holes `192 -> 193`; authenticated generation 2 was
+  installed in `689ms` and served new opens. The predecessor retained one
+  existing Google push flow and correctly remained bounded drain-only. No
+  installed-successor receiver-zero discriminator occurred, so the data-plane
+  architecture is retained.
+- M2 failed only at the first 600-second idle checkpoint with four active
+  relays and fake-IP `7/19`. Exact targets were Apple/Google push, WeChat, and
+  Cursor. The runbook did not require quitting all network Apps, and the old
+  runner discovered this global-quiescence prerequisite only after four
+  hours. This is not operator command misuse, a path outage, or a data-plane
+  regression; do not weaken the idle checkpoint.
+- Commit `4ceb2ed` makes formal M2 reuse the existing smoke timeout (normally
+  `50s`) before the 86,400s schedule and requires fresh data-plane plus
+  Endpoint samples with
+  zero leases/relays/fake active/live/outstanding ownership, fake registered
+  `1..2`, zero DNS drops, and conservation at or below `61,440B`. Structured
+  evidence distinguishes dirty traffic, unhealthy process, and evidence I/O.
+  Runner/runbook only; no Rust or frozen value changed. Result:
+  `docs/tech/2026-08-05-knife15-m2-full-tunnel-quiescence-fail-fast-local-results.md`.
+- Next pull the pushed reviewed descendant, rebuild release, quit Cursor,
+  WeChat, browsers, mail/sync/chat/media clients and every VPN, then take one
+  fresh `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke
+  -> m2 -> status -> stop`. If quiescence fails it must fail before the long
+  schedule; preserve `status/snapshot/stop`. M3 remains blocked pending full
+  M2 plus cleanup acceptance.
 
 - Exact-source `fd6c34f` xiaoou bundle
   `/tmp/mini_vpn_knife15_macos_20260804_095117.tar.gz` (SHA-256

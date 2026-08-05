@@ -1,5 +1,24 @@
 # Errors
 
+## 2026-08-05 - M2 discovered non-test full-tunnel ownership after four hours
+
+- Exact-source `798c1a5` passed 154 controlled phase results with zero Target
+  receiver gaps, but the first idle checkpoint found four active relays and
+  fake-IP `7/19`. Exact targets identified Apple/Google push, WeChat, and
+  Cursor traffic.
+- The checkpoint was correct and must not be relaxed. The error was that the
+  runbook did not require quitting all network Apps and the runner had no
+  equivalent pre-schedule quiescence gate, so a predictable environment
+  failure consumed the complete four-hour steady-a window.
+- Correct behavior is to apply the same ownership contract within the
+  existing bounded smoke timeout after full-tunnel activation and real-client
+  preflight, persist the snapshot, and refuse the 24-hour schedule while the
+  host is dirty.
+- Review caught a second false-PASS risk in the first repair: relay/fake-IP
+  state was fresh but Endpoint ownership was not part of the predicate. The
+  RED fixture with Endpoint `live=1409B` now requires fresh zero live and
+  outstanding samples plus conservation at or below `61,440B`.
+
 ## 2026-08-04 - Qualified-lane isolation collapsed onto one incumbent generation
 
 - Exact-source `fd6c34f` correctly excluded degraded conn1, but both new opens

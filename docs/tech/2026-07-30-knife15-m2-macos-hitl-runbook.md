@@ -13,13 +13,22 @@ for 24 hours and temporarily changes the active physical network service DNS.
 1. Use the HK Mac and its normal physical network.
 2. Quit Clash completely and disable Clash-TUN.
 3. Disable every other VPN, proxy app, and manually created TUN.
-4. Prevent sleep and power loss; keep the Exit and Target VPSs powered.
-5. Do not browse, change Wi-Fi/Ethernet, alter DNS, or start another VPN until
+4. Quit every non-test App that can use the network, including Cursor, Codex
+   or VS Code clients, WeChat, browsers, Mail, cloud/sync clients, and chat or
+   media Apps. Do not leave them merely hidden in the Dock.
+5. Prevent sleep and power loss; keep the Exit and Target VPSs powered.
+6. Do not browse, change Wi-Fi/Ethernet, alter DNS, or start another VPN until
    Knife15 `stop` finishes.
-6. M2 is an IPv4-only gate. The dedicated physical network service must have
+7. M2 is an IPv4-only gate. The dedicated physical network service must have
    IPv6 temporarily disabled before baseline. Restore immediately after a
    pre-start failure; once `start` is invoked, restore only after `stop`, using
    the exact procedure below.
+
+Do not terminate macOS system daemons manually. Formal `m2` has an exact
+full-tunnel quiescence preflight; it is the authority for whether remaining
+system traffic is clean enough. If it fails, preserve evidence, run
+`status/snapshot/stop`, quit the named non-test Apps, and start a fresh
+transaction.
 
 Slow HK bandwidth is not itself a bug. The baseline derives offered rates, and
 M2 judges continuity, UDP loss, lifecycle, resources, routes, and cleanup.
@@ -221,6 +230,12 @@ caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2
 ```
 
 Do not press `Ctrl+C`, close the terminal, start Clash, or change the network.
+Before starting the 24-hour schedule, `m2` waits up to the existing smoke hard
+timeout (normally about 50 seconds) for fresh zero-ownership Endpoint,
+TCP-relay, and fake-IP evidence. A failure here means background App/system
+traffic is still using the full tunnel; it saves the 24-hour run and leaves
+the TUN/full tunnel available for `status/snapshot/stop`.
+
 The `m2` command has exactly 24 hours of planned traffic/drain time plus DNS,
 HTTPS, health, and transition overhead. Reserve about 25 hours.
 

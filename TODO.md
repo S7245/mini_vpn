@@ -1,10 +1,48 @@
 # TODO
 
-## Current Knife15 Plan (2026-08-04)
+## Current Knife15 Plan (2026-08-05)
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-04 — auxiliary generation replacement ready for M2)
+#### Latest decision (2026-08-05 — full-tunnel quiescence fail-fast ready for M2)
+
+Exact-source `798c1a5` artifact
+`/tmp/mini_vpn_knife15_macos_20260805_015011.tar.gz` (SHA-256
+`386ecafc...`) passed baseline/direct, start/smoke, formal preflights, the
+four-hour steady-a window, 17 mixed cycles plus cycle 18 forward, and cleanup.
+All 154 phase results were structurally valid: zero Target receiver intervals,
+max TCP gap `10,354,688B`, max UDP loss `0.604884%`, and Endpoint max/final
+`61,440B / 61,403/0/0B`.
+
+The bounded auxiliary generation replacement ran successfully and the
+architecture rejection discriminator did not occur. M2 instead failed the
+first idle checkpoint because four non-test relays remained active and
+fake-IP ownership was `7/19`. Exact traffic included Apple/Google push,
+WeChat, and Cursor. Keep the unchanged checkpoint; this was a missing early
+dedicated-host prerequisite, not operator command misuse or a data-plane
+failure.
+
+Runner commit `4ceb2ed` checks the same global ownership contract within the
+existing smoke timeout (normally `50s`) after full-tunnel/real-client
+preflight and before the exact 86,400s timeline. It requires fresh data-plane
+and Endpoint samples and preserves structured evidence. No Rust, SLO,
+schedule, or frozen value changed. Result:
+`docs/tech/2026-08-05-knife15-m2-full-tunnel-quiescence-fail-fast-local-results.md`.
+
+Next:
+
+1. pull the pushed reviewed descendant and rebuild release on the test Mac;
+2. quit Cursor/Codex/VS Code, WeChat, browsers, Mail, sync/chat/media Apps,
+   and every VPN before opening the test terminal;
+3. run exactly one fresh `m2-ipv6-check -> baseline -> direct-discriminator ->
+   start -> smoke -> m2 -> status -> stop`;
+4. if the new quiescence preflight fails, preserve `status/snapshot/stop`,
+   remove the named background traffic, and start a fresh transaction; it
+   must not consume the 24-hour schedule;
+5. do not tune or repeat unchanged; keep M3 blocked until complete M2 plus
+   cleanup acceptance.
+
+#### Previous decision (2026-08-04 — auxiliary generation replacement ready for M2)
 
 Exact-source `fd6c34f` bundle
 `/tmp/mini_vpn_knife15_macos_20260804_095117.tar.gz` (SHA-256

@@ -2,9 +2,40 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-04)
+## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-05)
 
-- **Latest accepted position:** exact-source `fd6c34f` xiaoou bundle
+- **Latest accepted position:** exact-source `798c1a5` artifact
+  `/tmp/mini_vpn_knife15_macos_20260805_015011.tar.gz` (SHA-256
+  `386ecafc...`) passed baseline/direct, start/smoke, every formal preflight,
+  the four-hour steady-a window, 17 mixed cycles plus cycle 18 forward, and
+  cleanup. Its 154 valid results had zero Target receiver gaps, max TCP gap
+  `10,354,688B`, max UDP loss `0.604884%`, and Endpoint max/final
+  `61,440B / 61,403/0/0B`.
+- Auxiliary generation replacement ran correctly: degraded conn1 generation
+  1 advanced PLPMTUD black holes `192 -> 193`; generation 2 authenticated and
+  installed in `689ms`, then served new opens. The predecessor remained
+  bounded drain-only for its existing Google push flow. No healthy-control
+  installed-successor receiver-zero interval occurred, so the architecture
+  stop rule did not fire.
+- M2 failed at the first idle checkpoint only because the full tunnel still
+  owned four non-test relays and fake-IP `7/19`: Apple/Google push, WeChat,
+  and Cursor. The existing checkpoint correctly failed and is unchanged. The
+  missing control was an early dedicated-machine quiescence prerequisite, not
+  operator command misuse or a data-plane failure.
+- Reviewed runner commit `4ceb2ed` requires fresh zero-ownership data-plane and
+  Endpoint observations within the existing smoke timeout (normally `50s`)
+  after full-tunnel/real-client preflight and before the 86,400s schedule. It
+  records structured evidence and distinguishes dirty traffic, process
+  health, and evidence-write failure. No Rust, workload, SLO, or frozen value
+  changed. Result:
+  `docs/tech/2026-08-05-knife15-m2-full-tunnel-quiescence-fail-fast-local-results.md`.
+- Next pull the pushed descendant, rebuild release, quit every non-test
+  network App and every VPN, and take exactly one fresh `m2-ipv6-check ->
+  baseline -> direct-discriminator -> start -> smoke -> m2 -> status ->
+  stop`. A dirty host must now fail before the long schedule. Preserve
+  `status/snapshot/stop`; do not tune or repeat unchanged. M3 remains blocked.
+
+- **Previous accepted position:** exact-source `fd6c34f` xiaoou bundle
   `/tmp/mini_vpn_knife15_macos_20260804_095117.tar.gz` (SHA-256
   `889cdd276c...`) passed baseline at `29.369/44.838 Mbit/s`, direct at
   `14.675 Mbit/s` with no gaps, start/smoke, IPv6/full-tunnel/real-client

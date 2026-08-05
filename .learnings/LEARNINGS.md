@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-08-05 - Global quiescence belongs before the long schedule
+
+- A full-tunnel soak can pass every controlled traffic phase while unrelated
+  desktop Apps keep relay and fake-IP ownership alive. The first idle
+  checkpoint then fails correctly, but discovering that only after a
+  four-hour active window wastes the scarce real-Mac lane.
+- Reuse the exact acceptance predicate at a cheap boundary. Capture sample
+  counts before the controlled real-client probe, require fresh data-plane and
+  Endpoint observations afterward, and apply the unchanged ownership and
+  conservation contract before registering the long workload.
+- Quiescence needs both planes. Relay/fake-IP zeros alone can coincide with
+  Endpoint live reservation bytes; a focused RED with `live=1409B` prevented
+  that false PASS.
+- Distinguish dirty traffic, process health, and evidence-write failure. A
+  fail-fast gate is useful only when its artifact explains whether to close
+  Apps, diagnose the data plane, or repair the observer.
+- Runbooks must name common background clients explicitly. “Do not browse”
+  did not communicate that Cursor, WeChat, mail/sync/chat clients, and push
+  traffic violate a global zero-ownership checkpoint.
+- Result:
+  `docs/tech/2026-08-05-knife15-m2-full-tunnel-quiescence-fail-fast-local-results.md`.
+
 ## 2026-08-04 - Isolation needs a bounded clean-generation escape path
 
 - Categorical negative evidence can correctly stop new opens from using a
