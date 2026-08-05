@@ -189,7 +189,40 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-05:
 
-- Exact-source `798c1a5` artifact
+- Exact-source `a1e22ca` artifact
+  `/tmp/mini_vpn_knife15_macos_20260805_080607.tar.gz` (SHA-256
+  `f5f6d933...`) passed baseline `19.183/50.639 Mbit/s`, direct
+  `9.584823 Mbit/s` without gaps, start/smoke, IPv6/full-tunnel/real-client
+  gates, the bounded pre-schedule stop, and cleanup. The sole remaining relay
+  was `28-courier.push.apple.com:5223`; the operator had closed user Apps.
+- That silent Apple Push relay caused fifteen endpoint migrations in about
+  fifty seconds. Every action was generic `no_rx`, `udp_active=false`, no
+  exact writer pressure, and only `37B` aggregate QUIC TX. This is a recovery
+  authority defect plus an observer ownership defect, not operator error,
+  path outage, or a frozen-parameter branch. It supersedes the earlier global
+  zero/quitting-all-Apps premise.
+- Reviewed implementation `1debaff` demand-qualifies generic no-RX with the
+  existing UDP application-activity timestamp; exact TCP writer/stream ACK
+  stall remains unchanged. The M2 runner replays exact open/install/Closing/
+  close lifecycle for its iperf/api.ipify/example.com workload and requires
+  only controlled ownership to drain. Ambient leases/relays/fake-IP remain
+  numeric observations; Endpoint zero debt/conservation, DNS drops, replay
+  validity, all quality/resource/route/cleanup gates, and every frozen value
+  remain fail-closed/unchanged.
+- Focused recovery `9/9`, root `672+3 ignored`, main `2`, integration `10+4
+  ignored`, release, established Clippy lane, Knife15/Knife14 shell, vendored
+  Quinn `37+3 ignored` plus doc `1`, quinn-proto `309` plus doc `3`, fmt/diff/
+  secret, and review gates pass with no unresolved P0/P1. The exact 32 MiB
+  Endpoint gate reached `235.232 Mbit/s` with final `61,440/0/0B`. Result:
+  `docs/tech/2026-08-05-knife15-m2-ambient-traffic-recovery-local-results.md`.
+- Next pull the pushed descendant, rebuild release, keep Clash-TUN/every other
+  VPN off, avoid deliberate heavy non-test traffic, and take exactly one fresh
+  `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke -> m2
+  -> status -> stop`. Normal Apple Push/iCloud traffic may remain. Preserve
+  `status/snapshot/stop` after failure. M3 remains blocked pending full M2 plus
+  cleanup acceptance.
+
+- Previous accepted position: exact-source `798c1a5` artifact
   `/tmp/mini_vpn_knife15_macos_20260805_015011.tar.gz` (SHA-256
   `386ecafc...`) passed baseline `45.914/26.363 Mbit/s`, direct
   `22.908 Mbit/s` with no gaps, start/smoke, IPv6/full-tunnel/real-client

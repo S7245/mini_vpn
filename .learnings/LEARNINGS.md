@@ -1,6 +1,33 @@
 # Learnings
 
-## 2026-08-05 - Global quiescence belongs before the long schedule
+## 2026-08-05 - Recovery and acceptance need exact demand ownership
+
+- Ownership presence is not application demand. A silent established TCP
+  relay can emit QUIC ACK/control TX while no stream writer is blocked;
+  aggregate TX/no-RX must not migrate a shared endpoint on that evidence.
+- Reuse exact deep signals already present. TCP recovery belongs to its
+  pending writer plus exact stream ACK episode; generic endpoint recovery can
+  use the existing UDP application-activity timestamp without adding packet
+  cost, a timer, or a threshold.
+- A full-tunnel product cannot require an ordinary logged-in OS to have zero
+  system traffic. Acceptance should drain only identities created by the
+  harness while keeping ambient leases/relays/fake-IP visible and bounded by
+  existing resource, debt, DNS, and cleanup gates.
+- Async success is not local ownership. Stage target identity at the open
+  result, install it only at the matching local engine epoch, count pending
+  controlled opens conservatively, and retire transport ownership at Closing
+  even when the final smoltcp handle close is later.
+- Two observers with different lifecycle boundaries need not be equal. Use
+  the periodic global gauge as observation and immutable lifecycle replay as
+  controlled-workload authority; make malformed replay fail closed.
+- Result:
+  `docs/tech/2026-08-05-knife15-m2-ambient-traffic-recovery-local-results.md`.
+
+## 2026-08-05 - Superseded: global quiescence before the long schedule
+
+This was the correct fail-fast placement but the wrong ownership model. The
+later exact Apple Push artifact supersedes global-zero and quitting-all-Apps;
+the current invariant is zero runner-controlled ownership.
 
 - A full-tunnel soak can pass every controlled traffic phase while unrelated
   desktop Apps keep relay and fake-IP ownership alive. The first idle

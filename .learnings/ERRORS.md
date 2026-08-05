@@ -1,6 +1,35 @@
 # Errors
 
-## 2026-08-05 - M2 discovered non-test full-tunnel ownership after four hours
+## 2026-08-05 - Aggregate transport TX authorized false TCP endpoint recovery
+
+- Exact-source `a1e22ca` retained only Apple Push after the operator closed
+  Apps. One silent relay produced fifteen generic `no_rx` rebinds in about
+  fifty seconds with `udp_active=false`, no exact writer pressure, and `37B`
+  QUIC transport TX each time.
+- The error was semantic: active TCP ownership plus transport TX was treated
+  as business demand. Increasing recovery bounds or forcing system daemons
+  off would hide the predicate defect.
+- Correct behavior is exact TCP writer/stream ACK-stall recovery and
+  UDP-demand-qualified generic no-RX. Controlled M2 lifecycle, not global OS
+  ownership, defines the drain gate.
+
+## 2026-08-05 - Independent package commands bypassed project validation context
+
+- Direct vendored Quinn testing selected registry quinn-proto because an
+  independent manifest does not inherit the root `[patch.crates-io]`; the
+  resulting missing fork API errors were not a product regression. Bind the
+  absolute local quinn-proto patch and verify resolved metadata before the
+  gate.
+- An exploratory Rust 1.95 Clippy `-D warnings` run surfaced nineteen existing
+  style/API lints outside the changed code. The established no-dependency lane
+  passes. Treat strict-lint migration as separate repository debt rather than
+  broadening a lifecycle repair or claiming the command passed.
+
+## 2026-08-05 - Superseded: global ownership was classified as a dirty host
+
+The early gate placement remains useful, but the later exact system-traffic
+artifact rejects the global-zero premise below. Normal Apple Push/iCloud is
+ambient product traffic; only runner-controlled lifecycle must drain.
 
 - Exact-source `798c1a5` passed 154 controlled phase results with zero Target
   receiver gaps, but the first idle checkpoint found four active relays and

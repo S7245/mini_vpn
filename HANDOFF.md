@@ -4,7 +4,33 @@
 
 ## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-05)
 
-- **Latest accepted position:** exact-source `798c1a5` artifact
+- **Latest accepted position:** exact-source `a1e22ca` artifact
+  `/tmp/mini_vpn_knife15_macos_20260805_080607.tar.gz` (SHA-256
+  `f5f6d933...`) passed baseline `19.183/50.639 Mbit/s`, direct
+  `9.584823 Mbit/s` without gaps, start/smoke, IPv6/full-tunnel/real-client,
+  the bounded early stop, and cleanup. The only decisive relay was Apple Push
+  `28-courier.push.apple.com:5223`; closing all user Apps was correct but
+  cannot eliminate normal system traffic.
+- The Apple relay triggered fifteen false endpoint rebinds in about fifty
+  seconds: generic `no_rx`, `udp_active=false`, no exact writer pressure, and
+  `37B` QUIC transport TX. The prior global-zero host model is rejected.
+- Implementation `1debaff` keeps exact TCP writer/stream ACK-stall recovery,
+  but generic no-RX now requires existing UDP application demand. M2 replays
+  exact lifecycle for its three controlled Targets and drains only that
+  ownership; ambient global counts remain observations. Endpoint debt,
+  conservation, DNS drops, replay ambiguity, quality, resources, routes,
+  cleanup, and all frozen values remain fail-closed/unchanged.
+- Focused `9/9`, root `672+3 ignored`, main `2`, integration `10+4 ignored`,
+  release, established Clippy, shell, vendored Quinn/proto/doc, exact 32 MiB
+  `235.232 Mbit/s` with `61,440/0/0B`, fmt/diff/secret, and review pass with no
+  unresolved P0/P1. Result:
+  `docs/tech/2026-08-05-knife15-m2-ambient-traffic-recovery-local-results.md`.
+- Next pull/rebuild, keep all other VPNs off, avoid intentional heavy traffic,
+  and take one fresh `m2-ipv6-check -> baseline -> direct-discriminator ->
+  start -> smoke -> m2 -> status -> stop`. Normal Apple Push/iCloud may
+  remain. M3 stays blocked until full M2 plus cleanup acceptance.
+
+- **Previous accepted position:** exact-source `798c1a5` artifact
   `/tmp/mini_vpn_knife15_macos_20260805_015011.tar.gz` (SHA-256
   `386ecafc...`) passed baseline/direct, start/smoke, every formal preflight,
   the four-hour steady-a window, 17 mixed cycles plus cycle 18 forward, and

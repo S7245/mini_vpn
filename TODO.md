@@ -4,7 +4,48 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-05 — full-tunnel quiescence fail-fast ready for M2)
+#### Latest decision (2026-08-05 — ambient-traffic recovery ready for M2)
+
+Exact-source `a1e22ca` artifact
+`/tmp/mini_vpn_knife15_macos_20260805_080607.tar.gz` (SHA-256
+`f5f6d933...`) passed baseline `19.183/50.639 Mbit/s`, direct
+`9.584823 Mbit/s` without gaps, start/smoke, every preflight, the bounded
+early stop, and cleanup. The user had closed all Apps; the remaining relay was
+Apple Push `28-courier.push.apple.com:5223`.
+
+That silent system relay caused fifteen false generic `no_rx` rebinds in about
+fifty seconds although `udp_active=false`, exact writer pressure was absent,
+and aggregate transport TX was only `37B`. Therefore the earlier global-zero
+machine model is rejected rather than enforced through daemon termination or
+an Apple-domain exception.
+
+Implementation `1debaff` requires existing UDP application activity before
+generic no-RX can arm; exact TCP writer/stream ACK-stall recovery is unchanged.
+The runner reconstructs exact lifecycle for its controlled iperf,
+api.ipify.org, and example.com Targets. Only controlled ownership must drain;
+ambient leases/relays/fake-IP remain numeric observations. Endpoint zero debt
+and conservation, DNS drops, replay validity, quality, resources, routes,
+cleanup, workload, SLOs, and frozen data-plane values remain unchanged.
+
+Focused `9/9`, root `672+3 ignored`, main `2`, integration `10+4 ignored`,
+release, established Clippy, shell, vendored Quinn/proto/doc, exact 32 MiB
+`235.232 Mbit/s` with `61,440/0/0B`, fmt/diff/secret, and review pass with no
+unresolved P0/P1. Result:
+`docs/tech/2026-08-05-knife15-m2-ambient-traffic-recovery-local-results.md`.
+
+Next:
+
+1. pull the pushed reviewed descendant and rebuild release on the test Mac;
+2. keep Clash-TUN and every other VPN/proxy off; avoid deliberate downloads,
+   streaming, sync, or other heavy non-test traffic, but do not terminate
+   Apple Push/iCloud system services;
+3. run exactly one fresh `m2-ipv6-check -> baseline -> direct-discriminator ->
+   start -> smoke -> m2 -> status -> stop`;
+4. preserve `status/snapshot/stop` after any post-start failure;
+5. do not tune or repeat unchanged; keep M3 blocked until complete M2 plus
+   cleanup acceptance.
+
+#### Previous decision (2026-08-05 — global-quiescence fail-fast)
 
 Exact-source `798c1a5` artifact
 `/tmp/mini_vpn_knife15_macos_20260805_015011.tar.gz` (SHA-256

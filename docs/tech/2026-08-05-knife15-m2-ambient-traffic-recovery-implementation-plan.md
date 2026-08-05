@@ -88,7 +88,7 @@ Endpoint recovery and runner lifecycle-replay seams.
 - [x] Repair every P0/P1 with a focused test; review found none unresolved.
 - [x] Write local results and update runbook, `AGENTS.md`, `HANDOFF.md`,
   `TODO.md`, and `.learnings/`.
-- [ ] Commit coherent changes, scan for secrets, and push the current branch.
+- [x] Commit coherent changes, scan for secrets, and push the current branch.
 
 ### Task 9 — Fresh real-macOS discriminator
 
