@@ -4605,6 +4605,7 @@ struct EndpointRecoveryConnectionSample {
 struct EndpointRecoveryInput {
     active_tcp: u64,
     udp_active: bool,
+    last_udp_activity_secs: u64,
     current_socket_rx_rebind_generation: u64,
     connections: Vec<EndpointRecoveryConnectionSample>,
 }
@@ -4689,6 +4690,8 @@ struct EndpointRecoveryState {
     pending_recovery_connections: HashSet<usize>,
     expected_recovery_connection_count: usize,
     covered_tcp_write_episodes: HashMap<(usize, u64), u64>,
+    observed_udp_activity_secs: u64,
+    udp_demand_since_rx: bool,
 }
 
 impl EndpointRecoveryState {
@@ -4749,6 +4752,13 @@ impl EndpointRecoveryState {
     }
 
     fn observe(&mut self, now: Instant, input: &EndpointRecoveryInput) -> EndpointRecoveryAction {
+        if input.last_udp_activity_secs < self.observed_udp_activity_secs {
+            self.observed_udp_activity_secs = input.last_udp_activity_secs;
+            self.clear_episode();
+        } else if input.last_udp_activity_secs > self.observed_udp_activity_secs {
+            self.observed_udp_activity_secs = input.last_udp_activity_secs;
+            self.udp_demand_since_rx = true;
+        }
         let mut next = HashMap::with_capacity(input.connections.len());
         let mut tx_progress = 0u64;
         let mut rx_progress = false;
@@ -4843,6 +4853,13 @@ impl EndpointRecoveryState {
             );
         }
 
+        if !input.udp_active || !self.udp_demand_since_rx {
+            if self.expected_socket_generation.is_none() {
+                self.clear_episode();
+            }
+            return EndpointRecoveryAction::None;
+        }
+
         if rx_progress {
             if self.expected_socket_generation.is_some() {
                 return EndpointRecoveryAction::None;
@@ -4903,6 +4920,7 @@ impl EndpointRecoveryState {
         self.expected_socket_generation = None;
         self.pending_recovery_connections.clear();
         self.expected_recovery_connection_count = 0;
+        self.udp_demand_since_rx = false;
     }
 }
 
@@ -6326,6 +6344,7 @@ impl TuicUpstream {
         Some(EndpointRecoveryInput {
             active_tcp,
             udp_active,
+            last_udp_activity_secs: last_udp_activity,
             current_socket_rx_rebind_generation: self
                 .endpoint
                 .stats()
@@ -6754,6 +6773,7 @@ mod tests {
         let sample = |rx_bytes, pending_for| EndpointRecoveryInput {
             active_tcp: 2,
             udp_active: false,
+            last_udp_activity_secs: 0,
             current_socket_rx_rebind_generation: 0,
             connections: vec![EndpointRecoveryConnectionSample {
                 stable_id: 11,
@@ -6801,6 +6821,7 @@ mod tests {
         let input = EndpointRecoveryInput {
             active_tcp: 2,
             udp_active: false,
+            last_udp_activity_secs: 0,
             current_socket_rx_rebind_generation: 0,
             connections: vec![EndpointRecoveryConnectionSample {
                 stable_id: 11,
@@ -6834,6 +6855,7 @@ mod tests {
         let sample = |socket_generation| EndpointRecoveryInput {
             active_tcp: 2,
             udp_active: false,
+            last_udp_activity_secs: 0,
             current_socket_rx_rebind_generation: socket_generation,
             connections: vec![
                 EndpointRecoveryConnectionSample {
@@ -6885,6 +6907,7 @@ mod tests {
         let cleared = EndpointRecoveryInput {
             active_tcp: 2,
             udp_active: false,
+            last_udp_activity_secs: 0,
             current_socket_rx_rebind_generation: 1,
             connections: sample(1)
                 .connections
@@ -6931,6 +6954,7 @@ mod tests {
         let sample = |socket_generation| EndpointRecoveryInput {
             active_tcp: 2,
             udp_active: false,
+            last_udp_activity_secs: 0,
             current_socket_rx_rebind_generation: socket_generation,
             connections: vec![EndpointRecoveryConnectionSample {
                 stable_id: 11,
@@ -7092,14 +7116,59 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_recovery_silent_tcp_transport_tx_does_not_arm_generic_no_rx() {
+        let started = Instant::now();
+        let rtt = Duration::from_millis(171);
+        let mut state = EndpointRecoveryState::default();
+        let sample = |tx_bytes| EndpointRecoveryInput {
+            active_tcp: 2,
+            udp_active: false,
+            last_udp_activity_secs: 0,
+            current_socket_rx_rebind_generation: 0,
+            connections: vec![EndpointRecoveryConnectionSample {
+                stable_id: 11,
+                tx_bytes,
+                rx_bytes: 1_000,
+                rtt,
+                current_socket_rx_rebind_generation: 0,
+                tcp_write_pressures: Vec::new(),
+            }],
+        };
+
+        assert_eq!(
+            state.observe(started, &sample(10_000)),
+            EndpointRecoveryAction::None
+        );
+        assert_eq!(
+            state.observe(started + Duration::from_millis(250), &sample(10_037)),
+            EndpointRecoveryAction::None
+        );
+        assert_eq!(
+            state.armed_at, None,
+            "silent TCP ownership plus transport ACK/control TX is not application demand"
+        );
+
+        let bound = endpoint_recovery_stall_bound(rtt);
+        assert_eq!(
+            state.observe(
+                started + bound + Duration::from_millis(250),
+                &sample(10_074)
+            ),
+            EndpointRecoveryAction::None,
+            "TCP-only transport TX without an exact writer stall must never rebind"
+        );
+    }
+
+    #[test]
     fn endpoint_recovery_rebinds_once_after_active_tx_without_rx() {
         let started = Instant::now();
         let rtt = Duration::from_millis(164);
         let mut state = EndpointRecoveryState::default();
 
         let sample = |tx_bytes| EndpointRecoveryInput {
-            active_tcp: 2,
-            udp_active: false,
+            active_tcp: 0,
+            udp_active: true,
+            last_udp_activity_secs: 1,
             current_socket_rx_rebind_generation: 0,
             connections: vec![EndpointRecoveryConnectionSample {
                 stable_id: 11,
@@ -7140,8 +7209,9 @@ mod tests {
         let started = Instant::now();
         let mut state = EndpointRecoveryState::default();
         let sample = |stable_id, tx_bytes, rx_bytes| EndpointRecoveryInput {
-            active_tcp: 1,
-            udp_active: false,
+            active_tcp: 0,
+            udp_active: true,
+            last_udp_activity_secs: 1,
             current_socket_rx_rebind_generation: 0,
             connections: vec![EndpointRecoveryConnectionSample {
                 stable_id,
@@ -7188,10 +7258,12 @@ mod tests {
                       second_rx,
                       socket_rx_generation,
                       first_socket_rx_generation,
-                      second_socket_rx_generation| {
+                      second_socket_rx_generation,
+                      last_udp_activity_secs| {
             EndpointRecoveryInput {
                 active_tcp,
-                udp_active: false,
+                udp_active: true,
+                last_udp_activity_secs,
                 current_socket_rx_rebind_generation: socket_rx_generation,
                 connections: vec![
                     EndpointRecoveryConnectionSample {
@@ -7215,20 +7287,20 @@ mod tests {
         };
 
         assert_eq!(
-            state.observe(started, &sample(2, 100, 100, 100, 100, 0, 0, 0)),
+            state.observe(started, &sample(2, 100, 100, 100, 100, 0, 0, 0, 1)),
             EndpointRecoveryAction::None
         );
         assert_eq!(
             state.observe(
                 started + Duration::from_millis(250),
-                &sample(2, 200, 100, 100, 100, 0, 0, 0),
+                &sample(2, 200, 100, 100, 100, 0, 0, 0, 1),
             ),
             EndpointRecoveryAction::None
         );
         assert_eq!(
             state.observe(
                 started + Duration::from_secs(3),
-                &sample(2, 300, 100, 100, 101, 0, 0, 0),
+                &sample(2, 300, 100, 100, 101, 0, 0, 0, 1),
             ),
             EndpointRecoveryAction::None,
             "RX on either connection proves that the shared endpoint is alive"
@@ -7236,12 +7308,12 @@ mod tests {
 
         let second_episode = started + Duration::from_secs(4);
         assert_eq!(
-            state.observe(second_episode, &sample(2, 400, 100, 100, 101, 0, 0, 0),),
+            state.observe(second_episode, &sample(2, 400, 100, 100, 101, 0, 0, 0, 2),),
             EndpointRecoveryAction::None
         );
         let action = state.observe(
             second_episode + Duration::from_secs(2),
-            &sample(2, 500, 100, 100, 101, 0, 0, 0),
+            &sample(2, 500, 100, 100, 101, 0, 0, 0, 2),
         );
         assert!(matches!(
             action,
@@ -7251,7 +7323,7 @@ mod tests {
         assert_eq!(
             state.observe(
                 second_episode + Duration::from_millis(2_050),
-                &sample(2, 500, 101, 100, 101, 0, 0, 0),
+                &sample(2, 500, 101, 100, 101, 0, 0, 0, 2),
             ),
             EndpointRecoveryAction::None,
             "a packet on Quinn's retained old socket must not complete rebind recovery"
@@ -7259,7 +7331,7 @@ mod tests {
         assert_eq!(
             state.observe(
                 second_episode + Duration::from_millis(2_100),
-                &sample(2, 500, 101, 100, 101, 1, 1, 0),
+                &sample(2, 500, 101, 100, 101, 1, 1, 0, 2),
             ),
             EndpointRecoveryAction::None,
             "one current-socket connection cannot prove that the other pooled connection migrated"
@@ -7267,7 +7339,7 @@ mod tests {
         assert_eq!(
             state.observe(
                 second_episode + Duration::from_millis(2_150),
-                &sample(2, 500, 101, 100, 101, 1, 1, 1),
+                &sample(2, 500, 101, 100, 101, 1, 1, 1, 2),
             ),
             EndpointRecoveryAction::Recovered {
                 generation: 1,
@@ -7295,9 +7367,10 @@ mod tests {
     fn endpoint_recovery_does_not_arm_without_workload_or_tx_progress() {
         let started = Instant::now();
         let mut state = EndpointRecoveryState::default();
-        let sample = |active_tcp, tx_bytes| EndpointRecoveryInput {
-            active_tcp,
-            udp_active: false,
+        let sample = |udp_active, tx_bytes| EndpointRecoveryInput {
+            active_tcp: 0,
+            udp_active,
+            last_udp_activity_secs: u64::from(udp_active),
             current_socket_rx_rebind_generation: 0,
             connections: vec![EndpointRecoveryConnectionSample {
                 stable_id: 11,
@@ -7310,20 +7383,20 @@ mod tests {
         };
 
         assert_eq!(
-            state.observe(started, &sample(0, 100)),
+            state.observe(started, &sample(false, 100)),
             EndpointRecoveryAction::None
         );
         assert_eq!(
-            state.observe(started + Duration::from_secs(3), &sample(0, 200)),
+            state.observe(started + Duration::from_secs(3), &sample(false, 200)),
             EndpointRecoveryAction::None
         );
         assert_eq!(
-            state.observe(started + Duration::from_secs(6), &sample(1, 200)),
+            state.observe(started + Duration::from_secs(6), &sample(true, 200)),
             EndpointRecoveryAction::None,
             "old background TX must not arm a later workload"
         );
         assert_eq!(
-            state.observe(started + Duration::from_secs(9), &sample(1, 200)),
+            state.observe(started + Duration::from_secs(9), &sample(true, 200)),
             EndpointRecoveryAction::None,
             "an active but transport-idle workload must not churn the socket"
         );

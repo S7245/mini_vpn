@@ -81,6 +81,8 @@ M2_EXPECTED_PHASE_RESULTS=1029
 M2_EXPECTED_CHECKPOINTS=6
 M2_EGRESS_URL=https://api.ipify.org
 M2_BROWSER_URL=https://example.com/
+M2_EGRESS_TARGET=api.ipify.org:443
+M2_BROWSER_TARGET=example.com:443
 # iperf only reports completed application buffers. Shenzhen's 0.131 Mbit/s
 # reverse path delivered about 16KiB/s with an 8.3KiB cwnd, so a 1KiB observer
 # preserves multiple visible blocks per second while forward stays unchanged.
@@ -309,6 +311,10 @@ validate_m2_formal_config() {
     "$M2_TCP_SECS" == "300" && "$M2_UDP_SECS" == "180" && \
     "$M2_SHORT_SECS" == "10" && "$M2_STEADY_SHORT_COUNT" == "6" && \
     "$M2_QUIET_SHORT_COUNT" == "6" && "$M2_CHURN_SHORT_COUNT" == "24" && \
+    "$M2_EGRESS_URL" == "https://api.ipify.org" && \
+    "$M2_BROWSER_URL" == "https://example.com/" && \
+    "$M2_EGRESS_TARGET" == "api.ipify.org:443" && \
+    "$M2_BROWSER_TARGET" == "example.com:443" && \
     "$METRICS_SECS" == "30" && "$SAMPLE_SECS" == "30" ]]
 }
 
@@ -1744,11 +1750,163 @@ m2_data_plane_envelope() {
     '
 }
 
+m2_controlled_tcp_replay_envelope() {
+  local log_file="$1"
+  local controlled_one="$2"
+  local controlled_two="$3"
+  local controlled_three="$4"
+  awk -v controlled_one="$controlled_one" \
+    -v controlled_two="$controlled_two" \
+    -v controlled_three="$controlled_three" '
+    /tuic-open-tcp target=/ {
+      target = $0
+      sub(/^.*tuic-open-tcp target=/, "", target)
+      sub(/ .*/, "", target)
+      handle = $0
+      sub(/^.* handle=SocketHandle\(/, "", handle)
+      sub(/\).*/, "", handle)
+      epoch = $0
+      sub(/^.* epoch=/, "", epoch)
+      sub(/ .*/, "", epoch)
+      if (target == "" || handle !~ /^[0-9]+$/ || epoch !~ /^[0-9]+$/) {
+        invalid++
+        next
+      }
+      key = handle SUBSEP epoch
+      if (key in pending_target ||
+          ((handle in active_target) && active_epoch[handle] == epoch)) {
+        invalid++
+        next
+      }
+      pending_target[key] = target
+      next
+    }
+    /tcp-relay-engine handle=SocketHandle\(/ {
+      handle = $0
+      sub(/^.*tcp-relay-engine handle=SocketHandle\(/, "", handle)
+      sub(/\).*/, "", handle)
+      epoch = $0
+      sub(/^.* epoch=/, "", epoch)
+      sub(/ .*/, "", epoch)
+      key = handle SUBSEP epoch
+      if (handle !~ /^[0-9]+$/ || epoch !~ /^[0-9]+$/ ||
+          !(key in pending_target) || handle in active_target) {
+        invalid++
+        next
+      }
+      active_target[handle] = pending_target[key]
+      active_epoch[handle] = epoch
+      if (active_target[handle] == controlled_one ||
+          active_target[handle] == controlled_two ||
+          active_target[handle] == controlled_three) controlled[handle] = 1
+      delete pending_target[key]
+      next
+    }
+    /迟到 open 结果\(epoch [0-9]+≠[0-9]+\) 丢弃/ {
+      handle = $0
+      sub(/^.*handle SocketHandle\(/, "", handle)
+      sub(/\).*/, "", handle)
+      epoch = $0
+      sub(/^.*迟到 open 结果\(epoch /, "", epoch)
+      sub(/≠.*/, "", epoch)
+      key = handle SUBSEP epoch
+      if (handle !~ /^[0-9]+$/ || epoch !~ /^[0-9]+$/ ||
+          !(key in pending_target)) {
+        invalid++
+        next
+      }
+      delete pending_target[key]
+      next
+    }
+    /tcp-lifecycle-transition handle=SocketHandle\(/ && /ctx_state=Closing( |$)/ {
+      handle = $0
+      sub(/^.*tcp-lifecycle-transition handle=SocketHandle\(/, "", handle)
+      sub(/\).*/, "", handle)
+      if (handle !~ /^[0-9]+$/) {
+        invalid++
+        next
+      }
+      if (handle in active_target) {
+        delete active_target[handle]
+        delete active_epoch[handle]
+        delete controlled[handle]
+        retired[handle] = 1
+      }
+      next
+    }
+    /tcp-handle-close handle=SocketHandle\(/ {
+      handle = $0
+      sub(/^.*tcp-handle-close handle=SocketHandle\(/, "", handle)
+      sub(/\).*/, "", handle)
+      if (handle !~ /^[0-9]+$/) {
+        invalid++
+        next
+      }
+      if (handle in active_target) {
+        delete active_target[handle]
+        delete active_epoch[handle]
+        delete controlled[handle]
+      } else if (handle in retired) {
+        delete retired[handle]
+      } else {
+        pending = 0
+        for (key in pending_target) {
+          split(key, parts, SUBSEP)
+          if (parts[1] == handle) {
+            delete pending_target[key]
+            pending = 1
+          }
+        }
+        if (!pending &&
+            $0 !~ /direction=remote_open reason=handshake_failed state=HandshakePending( |$)/ &&
+            $0 !~ /direction=policy reason=encrypted_dns_block state=Listening( |$)/) {
+          invalid++
+        }
+      }
+      next
+    }
+    /📊 数据面:/ {
+      samples++
+      replayed = 0
+      controlled_active = 0
+      for (handle in active_target) replayed++
+      for (handle in controlled) controlled_active++
+      for (key in pending_target) {
+        if (pending_target[key] == controlled_one ||
+            pending_target[key] == controlled_two ||
+            pending_target[key] == controlled_three) controlled_active++
+      }
+      latest_replayed = replayed
+      latest_controlled = controlled_active
+    }
+    END {
+      printf "%d %d %d %d\n", samples + 0, latest_replayed + 0,
+        latest_controlled + 0, invalid + 0
+    }
+  ' "$log_file" 2>/dev/null
+}
+
+m2_controlled_tcp_replay_for_profile() {
+  local log_file="$1"
+  local profile_file="$2"
+  local target iperf_port
+  [[ -f "$profile_file" && ! -L "$profile_file" ]] || return 1
+  target="$(m0_profile_value "$profile_file" target 2>/dev/null || true)"
+  iperf_port="$(m0_profile_value "$profile_file" iperf_port 2>/dev/null || true)"
+  validate_ipv4 "$target" && validate_positive_integer "$iperf_port" && \
+    ((10#$iperf_port <= 65535)) || return 1
+  m2_controlled_tcp_replay_envelope "$log_file" "$target:$iperf_port" \
+    "$M2_EGRESS_TARGET" "$M2_BROWSER_TARGET"
+}
+
 m2_full_tunnel_quiescence_snapshot() {
   local log_file="$1"
+  local profile_file="$2"
   local active_leases data_plane_values endpoint_values data_samples dns_forged
   local dns_dropped active_relays total_relays fake_active fake_total
   local endpoint_samples max_total available live outstanding rest
+  local replay_values replay_samples replayed_active controlled_active
+  local replay_invalid
   active_leases="$(tcp_pool_latest_active_leases "$log_file" 2>/dev/null || true)"
   data_plane_values="$(m2_data_plane_envelope "$log_file")"
   read -r data_samples dns_forged dns_dropped active_relays total_relays \
@@ -1756,23 +1914,33 @@ m2_full_tunnel_quiescence_snapshot() {
   endpoint_values="$(endpoint_resource_envelope "$log_file")"
   read -r endpoint_samples max_total available live outstanding rest \
     <<<"$endpoint_values"
-  printf '%s %s %s %s %s %s %s %s %s %s\n' \
+  replay_values="$(m2_controlled_tcp_replay_for_profile \
+    "$log_file" "$profile_file" 2>/dev/null || true)"
+  read -r replay_samples replayed_active controlled_active replay_invalid \
+    <<<"$replay_values"
+  printf '%s %s %s %s %s %s %s %s %s %s %s %s %s %s\n' \
     "${data_samples:-unknown}" "${endpoint_samples:-unknown}" \
     "${active_leases:-unknown}" "${active_relays:-unknown}" \
     "${fake_active:-unknown}" "${fake_total:-unknown}" \
     "${dns_dropped:-unknown}" "${available:-unknown}" \
-    "${live:-unknown}" "${outstanding:-unknown}"
+    "${live:-unknown}" "${outstanding:-unknown}" \
+    "${replay_samples:-unknown}" "${replayed_active:-unknown}" \
+    "${controlled_active:-unknown}" "${replay_invalid:-unknown}"
 }
 
 m2_full_tunnel_quiescence_is_clean() {
   local log_file="$1"
-  local previous_data_plane_samples="$2"
-  local previous_endpoint_samples="$3"
+  local profile_file="$2"
+  local previous_data_plane_samples="$3"
+  local previous_endpoint_samples="$4"
   local snapshot data_samples endpoint_samples active_leases active_relays
   local fake_active fake_total dns_dropped available live outstanding value
-  snapshot="$(m2_full_tunnel_quiescence_snapshot "$log_file")"
+  local replay_samples replayed_active controlled_active replay_invalid
+  snapshot="$(m2_full_tunnel_quiescence_snapshot "$log_file" "$profile_file")"
   read -r data_samples endpoint_samples active_leases active_relays fake_active \
-    fake_total dns_dropped available live outstanding <<<"$snapshot"
+    fake_total dns_dropped available live outstanding replay_samples \
+    replayed_active controlled_active replay_invalid \
+    <<<"$snapshot"
   [[ "$previous_data_plane_samples" =~ ^[0-9]+$ && \
     "$previous_endpoint_samples" =~ ^[0-9]+$ && \
     "$active_leases" =~ ^[0-9]+$ && "$data_samples" =~ ^[0-9]+$ && \
@@ -1780,49 +1948,58 @@ m2_full_tunnel_quiescence_is_clean() {
     10#$data_samples -gt 10#$previous_data_plane_samples && \
     10#$endpoint_samples -gt 10#$previous_endpoint_samples ]] || return 1
   for value in "$dns_dropped" "$active_relays" "$fake_active" "$fake_total" \
-    "$available" "$live" "$outstanding"; do
+    "$available" "$live" "$outstanding" "$replay_samples" \
+    "$replayed_active" "$controlled_active" "$replay_invalid"; do
     [[ "$value" =~ ^[0-9]+$ ]] || return 1
   done
-  ((10#$active_leases == 0 && 10#$active_relays == 0 && \
-    10#$fake_active == 0 && 10#$fake_total >= 1 && 10#$fake_total <= 2 && \
-    10#$dns_dropped == 0 && 10#$live == 0 && 10#$outstanding == 0 && \
+  ((10#$replay_samples == 10#$data_samples && \
+    10#$controlled_active == 0 && 10#$replay_invalid == 0 && \
+    10#$dns_dropped == 0 && \
+    10#$live == 0 && 10#$outstanding == 0 && \
     10#$available + 10#$live + 10#$outstanding <= 61440))
 }
 
 wait_for_m2_full_tunnel_quiescence() {
   local log_file="$1"
-  local previous_data_plane_samples="$2"
-  local previous_endpoint_samples="$3"
-  local timeout_secs="$4"
+  local profile_file="$2"
+  local previous_data_plane_samples="$3"
+  local previous_endpoint_samples="$4"
+  local timeout_secs="$5"
   local deadline
   validate_positive_integer "$timeout_secs" || return 1
   deadline=$((SECONDS + 10#$timeout_secs))
   while ((SECONDS < deadline)); do
     m2_full_tunnel_quiescence_is_clean \
-      "$log_file" "$previous_data_plane_samples" \
+      "$log_file" "$profile_file" "$previous_data_plane_samples" \
       "$previous_endpoint_samples" && return 0
     /bin/sleep 1
   done
   m2_full_tunnel_quiescence_is_clean \
-    "$log_file" "$previous_data_plane_samples" "$previous_endpoint_samples"
+    "$log_file" "$profile_file" "$previous_data_plane_samples" \
+    "$previous_endpoint_samples"
 }
 
 record_m2_full_tunnel_quiescence() {
   local run_dir="$1"
-  local previous_data_plane_samples="$2"
-  local previous_endpoint_samples="$3"
-  local timeout_secs="$4"
+  local profile_file="$2"
+  local previous_data_plane_samples="$3"
+  local previous_endpoint_samples="$4"
+  local timeout_secs="$5"
   local result snapshot data_samples endpoint_samples active_leases active_relays
   local fake_active fake_total dns_dropped available live outstanding
+  local replay_samples replayed_active controlled_active replay_invalid
   result=FAIL
   wait_for_m2_full_tunnel_quiescence "$run_dir/mini_vpn.log" \
-    "$previous_data_plane_samples" "$previous_endpoint_samples" \
-    "$timeout_secs" && result=PASS
-  snapshot="$(m2_full_tunnel_quiescence_snapshot "$run_dir/mini_vpn.log")"
+    "$profile_file" "$previous_data_plane_samples" \
+    "$previous_endpoint_samples" "$timeout_secs" && result=PASS
+  snapshot="$(m2_full_tunnel_quiescence_snapshot \
+    "$run_dir/mini_vpn.log" "$profile_file")"
   read -r data_samples endpoint_samples active_leases active_relays fake_active \
-    fake_total dns_dropped available live outstanding <<<"$snapshot"
+    fake_total dns_dropped available live outstanding replay_samples \
+    replayed_active controlled_active replay_invalid \
+    <<<"$snapshot"
   printf '%s\n' \
-    'schema=knife15-macos-m2-full-tunnel-quiescence-v2' \
+    'schema=knife15-macos-m2-controlled-drain-v4' \
     "recorded_utc=$(timestamp)" \
     "timeout_secs=$timeout_secs" \
     "previous_data_plane_samples=$previous_data_plane_samples" \
@@ -1831,6 +2008,7 @@ record_m2_full_tunnel_quiescence() {
     "endpoint_samples=$endpoint_samples" \
     "endpoint_available=$available endpoint_live=$live endpoint_outstanding=$outstanding" \
     "active_leases=$active_leases active_relays=$active_relays fake_ip_active=$fake_active fake_ip_registered=$fake_total dns_dropped=$dns_dropped" \
+    "replay_samples=$replay_samples replayed_relaying_handles=$replayed_active controlled_active_relays=$controlled_active replay_invalid=$replay_invalid" \
     "result=$result" \
     >"$run_dir/m2-full-tunnel-quiescence.txt" || return 2
   [[ "$result" == PASS ]]
@@ -1849,7 +2027,7 @@ m2_checkpoint_envelope() {
     }
     NR > 1 {
       numeric = 1
-      for (field = 3; field <= 14; field++) {
+      for (field = 3; field <= 18; field++) {
         if ($field !~ /^[0-9]+$/) numeric = 0
       }
       if (!numeric) {
@@ -1865,9 +2043,10 @@ m2_checkpoint_envelope() {
       live = $7 + 0
       outstanding = $8 + 0
       active_relays = $9 + 0
-      fake_active = $11 + 0
-      fake_total = $12 + 0
       dns_dropped = $14 + 0
+      active_leases = $15 + 0
+      controlled_active = $17 + 0
+      replay_invalid = $18 + 0
       if (count == 1) {
         first_rss = rss
         first_fd = fd
@@ -1875,7 +2054,6 @@ m2_checkpoint_envelope() {
         max_rss = rss
         max_fd = fd
         max_threads = threads
-        first_fake_total = fake_total
       }
       final_rss = rss
       final_fd = fd
@@ -1885,9 +2063,7 @@ m2_checkpoint_envelope() {
       if (threads > max_threads) max_threads = threads
       if (live != 0 || outstanding != 0 ||
           available + live + outstanding > 61440 ||
-          active_relays != 0 || fake_active != 0 ||
-          fake_total < 1 || fake_total > 2 ||
-          fake_total != first_fake_total ||
+          controlled_active != 0 || replay_invalid != 0 ||
           dns_dropped != 0) ownership_failures++
     }
     END {
@@ -1933,7 +2109,8 @@ capture_m2_checkpoint() {
   local process_values endpoint_values data_plane_values
   local rss fd threads endpoint_samples max_total available live outstanding rest
   local data_samples dns_forged dns_dropped active_relays total_relays
-  local fake_active fake_total
+  local fake_active fake_total active_leases profile_file replay_values
+  local replay_samples replayed_active controlled_active replay_invalid
   process_values="$(awk -F, '
     NR > 1 && $3 ~ /^[0-9]+$/ && $7 ~ /^[0-9]+$/ && $8 ~ /^[0-9]+$/ {
       value = $3 " " $7 " " $8
@@ -1949,25 +2126,58 @@ capture_m2_checkpoint() {
   data_plane_values="$(m2_data_plane_envelope "$run_dir/mini_vpn.log")"
   read -r data_samples dns_forged dns_dropped active_relays total_relays \
     fake_active fake_total <<<"$data_plane_values"
+  active_leases="$(tcp_pool_latest_active_leases \
+    "$run_dir/mini_vpn.log" 2>/dev/null || true)"
+  profile_file="$run_dir/m2-workload.txt"
+  replay_values="$(m2_controlled_tcp_replay_for_profile \
+    "$run_dir/mini_vpn.log" "$profile_file" 2>/dev/null || true)"
+  read -r replay_samples replayed_active controlled_active replay_invalid \
+    <<<"$replay_values"
   [[ "$previous_endpoint_samples" =~ ^[0-9]+$ && \
     "$previous_data_plane_samples" =~ ^[0-9]+$ && \
     "$endpoint_samples" =~ ^[0-9]+$ && "$data_samples" =~ ^[0-9]+$ && \
     10#$endpoint_samples -gt 10#$previous_endpoint_samples && \
     10#$data_samples -gt 10#$previous_data_plane_samples ]] || return 1
   for value in "$available" "$live" "$outstanding" "$dns_forged" \
-    "$dns_dropped" "$active_relays" "$total_relays" "$fake_active" "$fake_total"; do
+    "$dns_dropped" "$active_relays" "$total_relays" "$fake_active" \
+    "$fake_total" "$active_leases" "$replay_samples" "$replayed_active" \
+    "$controlled_active" "$replay_invalid"; do
     [[ "$value" =~ ^[0-9]+$ ]] || return 1
   done
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+  ((10#$replay_samples == 10#$data_samples)) || return 1
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
     "$(timestamp)" "$label" "$rss" "$fd" "$threads" "$available" "$live" \
     "$outstanding" "$active_relays" "$total_relays" "$fake_active" \
-    "$fake_total" "$dns_forged" "$dns_dropped" \
+    "$fake_total" "$dns_forged" "$dns_dropped" "$active_leases" \
+    "$replayed_active" "$controlled_active" "$replay_invalid" \
     >>"$run_dir/m2-checkpoints.csv" || return 1
   ((10#$live == 0 && 10#$outstanding == 0 && \
     10#$available + 10#$live + 10#$outstanding <= 61440 && \
-    10#$active_relays == 0 && 10#$fake_active == 0 && \
-    10#$fake_total >= 1 && 10#$fake_total <= 2 && \
+    10#$controlled_active == 0 && 10#$replay_invalid == 0 && \
     10#$dns_dropped == 0))
+}
+
+capture_m2_checkpoint_after_drain() {
+  local run_dir="$1"
+  local label="$2"
+  local previous_endpoint_samples="$3"
+  local previous_data_plane_samples="$4"
+  local duration timeout_secs profile_file snapshot
+  duration="$(read_state duration 2>/dev/null || true)"
+  validate_positive_integer "$duration" || return 1
+  timeout_secs=$((10#$duration + 30))
+  profile_file="$run_dir/m2-workload.txt"
+  if ! wait_for_m2_full_tunnel_quiescence "$run_dir/mini_vpn.log" \
+    "$profile_file" "$previous_data_plane_samples" \
+    "$previous_endpoint_samples" "$timeout_secs"; then
+    snapshot="$(m2_full_tunnel_quiescence_snapshot \
+      "$run_dir/mini_vpn.log" "$profile_file")"
+    append_event_to "$run_dir" \
+      "m2 controlled drain failed label=$label snapshot=$snapshot"
+    return 1
+  fi
+  capture_m2_checkpoint "$run_dir" "$label" "$previous_endpoint_samples" \
+    "$previous_data_plane_samples"
 }
 
 m0_final_ownership_is_clean() {
@@ -2919,7 +3129,7 @@ EOF_M2_PROFILE
 
 runner_self_test() {
   local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture service_fixture dns_fixture m2_route_bin m2_ifconfig_bin m2_networksetup_bin m2_dscacheutil_bin m2_curl_bin m2_route_state m2_run m2_result m2_schedule_run m2_test_profile m2_checkpoint_file m2_capture_run m2_ipv6_evidence original_m2_route_bin original_m2_ifconfig_bin original_m2_networksetup_bin original_m2_dscacheutil_bin original_m2_curl_bin collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir baseline_summary_text m0_profile m1_profile m2_profile m1_test_profile m0_run m1_stage_run m1_run m1_diagnostic_run m1_diagnostic_fail_run m1_diagnostic_formal_run m1_checkpoint_file m1_capture_run m1_formal_run m1_tcp_fixture m1_udp_fixture m0_fail_run direct_dir fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash bounded_status result_index result_label sample_index violations_before violation_count invalid_violations ipv6_class ipv6_interface cleanup_class
-  local m2_record_fail_run quiescence_record_status
+  local m2_record_fail_run quiescence_record_status m2_replay_log
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/knife15-macos-self-test.XXXXXX")" || return 1
   good_log="$tmp/good.log"
   bad_log="$tmp/bad.log"
@@ -4080,15 +4290,72 @@ EOF_FAKE_SLEEP
   [[ "$(awk 'END {print NR}' "$m1_capture_run/m1-checkpoints.csv")" == "2" ]] || \
     die "self-test: fresh M1 checkpoint row was not recorded exactly once"
 
+  m2_replay_log="$tmp/m2-controlled-replay.log"
+  printf '%s\n' \
+    '🔎 tuic-open-tcp target=28-courier.push.apple.com:5223 conn=0 id=1 stream=1 relay_mode=d16_direct_ordered startup_auth_attempts=1 handle=SocketHandle(3) epoch=1' \
+    '🔎 tcp-relay-engine handle=SocketHandle(3) epoch=1 engine=d16_byte_owned per_flow_cap=524288 global_cap=16777216 quantum=32768' \
+    '🔎 tuic-open-tcp target=api.ipify.org:443 conn=1 id=2 stream=1 relay_mode=d16_direct_ordered startup_auth_attempts=1 handle=SocketHandle(5) epoch=1' \
+    '🔎 tcp-relay-engine handle=SocketHandle(5) epoch=1 engine=d16_byte_owned per_flow_cap=524288 global_cap=16777216 quantum=32768' \
+    '🔎 tcp-handle-close handle=SocketHandle(5) direction=remote_to_local reason=remote_eof state=Closing' \
+    '🔎 tuic-open-tcp target=example.com:443 conn=1 id=2 stream=2 relay_mode=d16_direct_ordered startup_auth_attempts=1 handle=SocketHandle(5) epoch=3' \
+    '🔎 tcp-relay-engine handle=SocketHandle(5) epoch=3 engine=d16_byte_owned per_flow_cap=524288 global_cap=16777216 quantum=32768' \
+    '🔎 tcp-lifecycle-transition handle=SocketHandle(5) source=dirty_relay prev_source=dirty_relay ctx_state=Closing uplink_tx=false' \
+    '🔎 tcp-handle-close handle=SocketHandle(5) direction=remote_to_local reason=remote_eof state=Closing' \
+    '🔎 tcp-handle-close handle=SocketHandle(7) direction=remote_open reason=handshake_failed state=HandshakePending' \
+    '🔎 tcp-handle-close handle=SocketHandle(9) direction=policy reason=encrypted_dns_block state=Listening' \
+    '🔎 tuic-open-tcp target=api.ipify.org:443 conn=1 id=2 stream=7 relay_mode=d16_direct_ordered startup_auth_attempts=1 handle=SocketHandle(13) epoch=1' \
+    '🗑️ handle SocketHandle(13) 迟到 open 结果(epoch 1≠3) 丢弃，不装到新代 socket' \
+    '📊 数据面: DNS forge=18/drop=0 | TCP relay 活跃=1/累计=3 | fake-IP 活跃=1/在册=9 | UDP↓丢=0 背压=0 | UDP↑丢=0 stream兜底=0 | leg=tuic' \
+    >"$m2_replay_log"
+  [[ "$(m2_controlled_tcp_replay_envelope "$m2_replay_log" \
+    43.130.32.77:5201 api.ipify.org:443 example.com:443)" == \
+    '1 1 0 0' ]] || \
+    die "self-test: ambient relay with drained controlled handles was rejected"
+  cp "$m2_replay_log" "$tmp/m2-controlled-replay-pending.log"
+  printf '%s\n' \
+    '🔎 tuic-open-tcp target=api.ipify.org:443 conn=1 id=2 stream=8 relay_mode=d16_direct_ordered startup_auth_attempts=1 handle=SocketHandle(15) epoch=1' \
+    '📊 数据面: DNS forge=18/drop=0 | TCP relay 活跃=1/累计=3 | fake-IP 活跃=1/在册=9 | UDP↓丢=0 背压=0 | UDP↑丢=0 stream兜底=0 | leg=tuic' \
+    >>"$tmp/m2-controlled-replay-pending.log"
+  [[ "$(m2_controlled_tcp_replay_envelope \
+    "$tmp/m2-controlled-replay-pending.log" 43.130.32.77:5201 \
+    api.ipify.org:443 example.com:443)" == '2 1 1 0' ]] || \
+    die "self-test: pending controlled install was accepted as drained"
+  printf '%s\n' \
+    '🔎 tuic-open-tcp target=43.130.32.77:5201 conn=1 id=2 stream=3 relay_mode=d16_direct_ordered startup_auth_attempts=1 handle=SocketHandle(5) epoch=5' \
+    '🔎 tcp-relay-engine handle=SocketHandle(5) epoch=5 engine=d16_byte_owned per_flow_cap=524288 global_cap=16777216 quantum=32768' \
+    '📊 数据面: DNS forge=18/drop=0 | TCP relay 活跃=2/累计=4 | fake-IP 活跃=1/在册=9 | UDP↓丢=0 背压=0 | UDP↑丢=0 stream兜底=0 | leg=tuic' \
+    >>"$m2_replay_log"
+  [[ "$(m2_controlled_tcp_replay_envelope "$m2_replay_log" \
+    43.130.32.77:5201 api.ipify.org:443 example.com:443)" == \
+    '2 2 1 0' ]] || \
+    die "self-test: undrained controlled relay was not reconstructed"
+  cp "$m2_replay_log" "$tmp/m2-controlled-replay-mismatch.log"
+  sed -i '' '$s/TCP relay 活跃=2/TCP relay 活跃=1/' \
+    "$tmp/m2-controlled-replay-mismatch.log"
+  [[ "$(m2_controlled_tcp_replay_envelope \
+    "$tmp/m2-controlled-replay-mismatch.log" 43.130.32.77:5201 \
+    api.ipify.org:443 example.com:443)" == '2 2 1 0' ]] || \
+    die "self-test: different replay/gauge lifecycle boundaries were coupled"
+  cp "$m2_replay_log" "$tmp/m2-controlled-replay-duplicate.log"
+  printf '%s\n' \
+    '🔎 tuic-open-tcp target=other.example:443 conn=0 id=1 stream=4 relay_mode=d16_direct_ordered startup_auth_attempts=1 handle=SocketHandle(3) epoch=3' \
+    '🔎 tcp-relay-engine handle=SocketHandle(3) epoch=3 engine=d16_byte_owned per_flow_cap=524288 global_cap=16777216 quantum=32768' \
+    '📊 数据面: DNS forge=18/drop=0 | TCP relay 活跃=2/累计=5 | fake-IP 活跃=2/在册=10 | UDP↓丢=0 背压=0 | UDP↑丢=0 stream兜底=0 | leg=tuic' \
+    >>"$tmp/m2-controlled-replay-duplicate.log"
+  [[ "$(m2_controlled_tcp_replay_envelope \
+    "$tmp/m2-controlled-replay-duplicate.log" 43.130.32.77:5201 \
+    api.ipify.org:443 example.com:443)" == '3 2 1 1' ]] || \
+    die "self-test: duplicate live handle did not fail closed"
+
   m2_checkpoint_file="$m2_schedule_run/m2-checkpoints.csv"
   printf '%s\n' \
-    'timestamp,label,rss_kib,fd_count,thread_rows,endpoint_available_bytes,endpoint_live_bytes,endpoint_outstanding_bytes,active_relays,total_relays,fake_ip_active,fake_ip_registered,dns_forged,dns_dropped' \
-    '2026-07-30T00:00:00Z,idle-1,100,15,11,61440,0,0,0,10,0,2,10,0' \
-    '2026-07-30T01:00:00Z,idle-2,110,16,12,61440,0,0,0,20,0,2,20,0' \
-    '2026-07-30T02:00:00Z,idle-3,120,17,13,61440,0,0,0,30,0,2,30,0' \
-    '2026-07-30T03:00:00Z,idle-4,125,17,13,61440,0,0,0,40,0,2,40,0' \
-    '2026-07-30T04:00:00Z,idle-5,130,16,12,61440,0,0,0,50,0,2,50,0' \
-    '2026-07-30T05:00:00Z,final,125,16,12,61440,0,0,0,60,0,2,60,0' \
+    'timestamp,label,rss_kib,fd_count,thread_rows,endpoint_available_bytes,endpoint_live_bytes,endpoint_outstanding_bytes,active_relays,total_relays,fake_ip_active,fake_ip_registered,dns_forged,dns_dropped,active_leases,replayed_relaying_handles,controlled_active_relays,replay_invalid' \
+    '2026-07-30T00:00:00Z,idle-1,100,15,11,61440,0,0,1,10,1,9,10,0,2,1,0,0' \
+    '2026-07-30T01:00:00Z,idle-2,110,16,12,61440,0,0,2,20,2,10,20,0,4,1,0,0' \
+    '2026-07-30T02:00:00Z,idle-3,120,17,13,61440,0,0,1,30,1,11,30,0,2,4,0,0' \
+    '2026-07-30T03:00:00Z,idle-4,125,17,13,61440,0,0,3,40,3,12,40,0,6,2,0,0' \
+    '2026-07-30T04:00:00Z,idle-5,130,16,12,61440,0,0,1,50,1,13,50,0,2,3,0,0' \
+    '2026-07-30T05:00:00Z,final,125,16,12,61440,0,0,2,60,2,14,60,0,4,1,0,0' \
     >"$m2_checkpoint_file"
   [[ "$(m2_checkpoint_envelope "$m2_checkpoint_file")" == \
     '6 1 100 125 130 25 15 16 17 1 11 12 13 1 0' ]] || \
@@ -4096,20 +4363,25 @@ EOF_FAKE_SLEEP
   m2_checkpoint_slo "$m2_checkpoint_file" || \
     die "self-test: valid M2 checkpoint plateau rejected"
   cp "$m2_checkpoint_file" "$m2_checkpoint_file.valid"
-  sed -i '' 's/,final,125,16,12,61440,0,0,0,60,0,2,60,0$/,final,125,16,12,61440,0,0,1,60,0,2,60,0/' \
+  sed -i '' 's/,final,125,16,12,61440,0,0,2,60,2,14,60,0,4,1,0,0$/,final,125,16,12,61440,0,0,2,60,2,14,60,0,4,1,1,0/' \
     "$m2_checkpoint_file"
   ! m2_checkpoint_slo "$m2_checkpoint_file" || \
-    die "self-test: M2 active relay at final checkpoint accepted"
+    die "self-test: M2 controlled relay at final checkpoint accepted"
   cp "$m2_checkpoint_file.valid" "$m2_checkpoint_file"
-  sed -i '' 's/,idle-4,125,17,13,61440,0,0,0,40,0,2,40,0$/,idle-4,125,17,13,61440,0,0,0,40,0,3,40,0/' \
+  sed -i '' 's/,idle-4,125,17,13,61440,0,0,3,40,3,12,40,0,6,2,0,0$/,idle-4,125,17,13,61440,0,0,3,40,3,19,40,0,6,2,0,0/' \
     "$m2_checkpoint_file"
-  ! m2_checkpoint_slo "$m2_checkpoint_file" || \
-    die "self-test: M2 growing fake-IP cache at checkpoint accepted"
+  m2_checkpoint_slo "$m2_checkpoint_file" || \
+    die "self-test: numeric ambient fake-IP growth was rejected"
   cp "$m2_checkpoint_file.valid" "$m2_checkpoint_file"
-  sed -i '' 's/,idle-5,130,16,12,61440,0,0,0,50,0,2,50,0$/,idle-5,130,16,12,61440,0,0,0,50,0,2,50,1/' \
+  sed -i '' 's/,idle-5,130,16,12,61440,0,0,1,50,1,13,50,0,2,3,0,0$/,idle-5,130,16,12,61440,0,0,1,50,1,13,50,1,2,3,0,0/' \
     "$m2_checkpoint_file"
   ! m2_checkpoint_slo "$m2_checkpoint_file" || \
     die "self-test: M2 DNS drop at checkpoint accepted"
+  cp "$m2_checkpoint_file.valid" "$m2_checkpoint_file"
+  sed -i '' 's/,idle-2,110,16,12,61440,0,0,2,20,2,10,20,0,4,1,0,0$/,idle-2,110,16,12,61440,0,0,2,20,2,10,20,0,4,1,0,1/' \
+    "$m2_checkpoint_file"
+  ! m2_checkpoint_slo "$m2_checkpoint_file" || \
+    die "self-test: M2 invalid lifecycle replay at checkpoint accepted"
   mv "$m2_checkpoint_file.valid" "$m2_checkpoint_file"
 
   m2_capture_run="$tmp/m2-capture-run"
@@ -4119,8 +4391,12 @@ EOF_FAKE_SLEEP
     '2026-07-30T00:00:00Z,1,100,1.0,S,00:01,15,11' \
     >"$m2_capture_run/process.csv"
   printf '%s\n' \
-    'timestamp,label,rss_kib,fd_count,thread_rows,endpoint_available_bytes,endpoint_live_bytes,endpoint_outstanding_bytes,active_relays,total_relays,fake_ip_active,fake_ip_registered,dns_forged,dns_dropped' \
+    'timestamp,label,rss_kib,fd_count,thread_rows,endpoint_available_bytes,endpoint_live_bytes,endpoint_outstanding_bytes,active_relays,total_relays,fake_ip_active,fake_ip_registered,dns_forged,dns_dropped,active_leases,replayed_relaying_handles,controlled_active_relays,replay_invalid' \
     >"$m2_capture_run/m2-checkpoints.csv"
+  printf '%s\n' \
+    'target=43.130.32.77' \
+    'iperf_port=5201' \
+    >"$m2_capture_run/m2-workload.txt"
   printf '%s\n' \
     '📊 TUIC endpoint pacing global conservation(available=61440B,live=0B,outstanding=0B,records=2)' \
     '🔎 tuic-tcp-pool-activity active_leases=0' \
@@ -4135,10 +4411,10 @@ EOF_FAKE_SLEEP
   capture_m2_checkpoint "$m2_capture_run" idle-1 1 1 || \
     die "self-test: fresh clean M2 checkpoint samples were rejected"
   m2_full_tunnel_quiescence_is_clean \
-    "$m2_capture_run/mini_vpn.log" 1 1 || \
+    "$m2_capture_run/mini_vpn.log" "$m2_capture_run/m2-workload.txt" 1 1 || \
     die "self-test: clean full-tunnel quiescence evidence was rejected"
   wait_for_m2_full_tunnel_quiescence \
-    "$m2_capture_run/mini_vpn.log" 1 1 1 || \
+    "$m2_capture_run/mini_vpn.log" "$m2_capture_run/m2-workload.txt" 1 1 1 || \
     die "self-test: clean full-tunnel quiescence did not pass immediately"
   cp "$m2_capture_run/mini_vpn.log" "$tmp/m2-quiescence-endpoint.log"
   printf '%s\n' \
@@ -4146,29 +4422,52 @@ EOF_FAKE_SLEEP
     '📊 数据面: DNS forge=12/drop=0 | TCP relay 活跃=0/累计=12 | fake-IP 活跃=0/在册=2 | UDP↓丢=0 背压=0 | UDP↑丢=0 stream兜底=0 | leg=tuic' \
     >>"$tmp/m2-quiescence-endpoint.log"
   ! m2_full_tunnel_quiescence_is_clean \
-    "$tmp/m2-quiescence-endpoint.log" 2 2 || \
+    "$tmp/m2-quiescence-endpoint.log" "$m2_capture_run/m2-workload.txt" 2 2 || \
     die "self-test: live Endpoint ownership passed full-tunnel quiescence"
   printf '%s\n' \
+    '🔎 tuic-open-tcp target=push-a.example:5223 conn=0 id=1 stream=1 relay_mode=d16_direct_ordered startup_auth_attempts=1 handle=SocketHandle(3) epoch=1' \
+    '🔎 tcp-relay-engine handle=SocketHandle(3) epoch=1 engine=d16_byte_owned per_flow_cap=524288 global_cap=16777216 quantum=32768' \
+    '🔎 tuic-open-tcp target=push-b.example:5223 conn=1 id=2 stream=1 relay_mode=d16_direct_ordered startup_auth_attempts=1 handle=SocketHandle(5) epoch=1' \
+    '🔎 tcp-relay-engine handle=SocketHandle(5) epoch=1 engine=d16_byte_owned per_flow_cap=524288 global_cap=16777216 quantum=32768' \
+    '🔎 tuic-open-tcp target=sync-a.example:443 conn=0 id=1 stream=2 relay_mode=d16_direct_ordered startup_auth_attempts=1 handle=SocketHandle(7) epoch=1' \
+    '🔎 tcp-relay-engine handle=SocketHandle(7) epoch=1 engine=d16_byte_owned per_flow_cap=524288 global_cap=16777216 quantum=32768' \
+    '🔎 tuic-open-tcp target=sync-b.example:443 conn=1 id=2 stream=2 relay_mode=d16_direct_ordered startup_auth_attempts=1 handle=SocketHandle(9) epoch=1' \
+    '🔎 tcp-relay-engine handle=SocketHandle(9) epoch=1 engine=d16_byte_owned per_flow_cap=524288 global_cap=16777216 quantum=32768' \
     '🔎 tuic-tcp-pool-activity active_leases=8' \
     '📊 数据面: DNS forge=12/drop=0 | TCP relay 活跃=4/累计=15 | fake-IP 活跃=7/在册=19 | UDP↓丢=0 背压=0 | UDP↑丢=0 stream兜底=0 | leg=tuic' \
     >>"$m2_capture_run/mini_vpn.log"
+  m2_full_tunnel_quiescence_is_clean \
+    "$m2_capture_run/mini_vpn.log" "$m2_capture_run/m2-workload.txt" 2 1 || \
+    die "self-test: replay-consistent ambient traffic was rejected"
+  printf '%s\n' \
+    '🔎 tuic-open-tcp target=43.130.32.77:5201 conn=0 id=1 stream=3 relay_mode=d16_direct_ordered startup_auth_attempts=1 handle=SocketHandle(11) epoch=1' \
+    '🔎 tcp-relay-engine handle=SocketHandle(11) epoch=1 engine=d16_byte_owned per_flow_cap=524288 global_cap=16777216 quantum=32768' \
+    '🔎 tuic-tcp-pool-activity active_leases=10' \
+    '📊 TUIC endpoint pacing global conservation(available=61440B,live=0B,outstanding=0B,records=2)' \
+    '📊 数据面: DNS forge=13/drop=0 | TCP relay 活跃=5/累计=16 | fake-IP 活跃=8/在册=20 | UDP↓丢=0 背压=0 | UDP↑丢=0 stream兜底=0 | leg=tuic' \
+    >>"$m2_capture_run/mini_vpn.log"
   ! m2_full_tunnel_quiescence_is_clean \
-    "$m2_capture_run/mini_vpn.log" 2 1 || \
-    die "self-test: live App traffic passed full-tunnel quiescence preflight"
+    "$m2_capture_run/mini_vpn.log" "$m2_capture_run/m2-workload.txt" 3 2 || \
+    die "self-test: undrained controlled traffic passed full-tunnel quiescence"
   [[ "$(m2_full_tunnel_quiescence_snapshot \
-    "$m2_capture_run/mini_vpn.log")" == '3 2 8 4 7 19 0 61440 0 0' ]] || \
+    "$m2_capture_run/mini_vpn.log" "$m2_capture_run/m2-workload.txt")" == \
+    '4 3 10 5 8 20 0 61440 0 0 4 5 1 0' ]] || \
     die "self-test: full-tunnel quiescence snapshot mismatch"
   ! wait_for_m2_full_tunnel_quiescence \
-    "$m2_capture_run/mini_vpn.log" 2 1 1 || \
-    die "self-test: live App traffic passed the bounded quiescence wait"
-  ! record_m2_full_tunnel_quiescence "$m2_capture_run" 2 1 1 || \
-    die "self-test: dirty full-tunnel quiescence evidence was recorded as PASS"
+    "$m2_capture_run/mini_vpn.log" "$m2_capture_run/m2-workload.txt" 3 2 1 || \
+    die "self-test: controlled traffic passed the bounded quiescence wait"
+  ! record_m2_full_tunnel_quiescence \
+    "$m2_capture_run" "$m2_capture_run/m2-workload.txt" 3 2 1 || \
+    die "self-test: controlled traffic evidence was recorded as PASS"
   grep -Fq 'result=FAIL' \
     "$m2_capture_run/m2-full-tunnel-quiescence.txt" || \
     die "self-test: dirty full-tunnel quiescence verdict missing"
-  grep -Fq 'active_leases=8 active_relays=4 fake_ip_active=7 fake_ip_registered=19 dns_dropped=0' \
+  grep -Fq 'active_leases=10 active_relays=5 fake_ip_active=8 fake_ip_registered=20 dns_dropped=0' \
     "$m2_capture_run/m2-full-tunnel-quiescence.txt" || \
-    die "self-test: dirty full-tunnel quiescence values missing"
+    die "self-test: ambient full-tunnel observations missing"
+  grep -Fq 'replay_samples=4 replayed_relaying_handles=5 controlled_active_relays=1 replay_invalid=0' \
+    "$m2_capture_run/m2-full-tunnel-quiescence.txt" || \
+    die "self-test: controlled full-tunnel replay evidence missing"
   grep -Fq 'endpoint_available=61440 endpoint_live=0 endpoint_outstanding=0' \
     "$m2_capture_run/m2-full-tunnel-quiescence.txt" || \
     die "self-test: full-tunnel quiescence Endpoint values missing"
@@ -4177,7 +4476,7 @@ EOF_FAKE_SLEEP
     "$m2_record_fail_run/m2-full-tunnel-quiescence.txt"
   cp "$m2_capture_run/mini_vpn.log" "$m2_record_fail_run/mini_vpn.log"
   record_m2_full_tunnel_quiescence \
-    "$m2_record_fail_run" 2 1 1 2>/dev/null
+    "$m2_record_fail_run" "$m2_capture_run/m2-workload.txt" 3 2 1 2>/dev/null
   quiescence_record_status=$?
   [[ "$quiescence_record_status" == "2" ]] || \
     die "self-test: full-tunnel quiescence evidence write failure was not distinct"
@@ -4876,6 +5175,10 @@ EOF_FAIL_IPERF
   M2_QUIET_SHORT_COUNT=6
   M2_CHURN_SHORT_COUNT=24
   validate_m2_formal_config || die "self-test: formal M2 schedule rejected"
+  M2_EGRESS_TARGET=api.ipify.org:444
+  ! validate_m2_formal_config || \
+    die "self-test: M2 controlled target drift was accepted"
+  M2_EGRESS_TARGET=api.ipify.org:443
   [[ "$(m2_formal_count_model)" == "93 934 95 1029" ]] || \
     die "self-test: M2 formal schedule count model mismatch"
   M2_TOTAL_SECS=86399
@@ -6610,7 +6913,8 @@ run_m2_idle_window() {
   m0_assert_run_healthy "$run_dir" || return 1
   if [[ "${M0_ENFORCE_RUN_HEALTH:-0}" == "1" ]]; then
     sample_once_for "$run_dir" || return 1
-    capture_m2_checkpoint "$run_dir" "$label" "$endpoint_samples_before" \
+    capture_m2_checkpoint_after_drain \
+      "$run_dir" "$label" "$endpoint_samples_before" \
       "$data_plane_samples_before" || return 1
   fi
   append_event_to "$run_dir" \
@@ -6683,7 +6987,8 @@ run_m2_schedule_body() {
   m0_assert_run_healthy "$run_dir" || return 1
   if [[ "${M0_ENFORCE_RUN_HEALTH:-0}" == "1" ]]; then
     sample_once_for "$run_dir" || return 1
-    capture_m2_checkpoint "$run_dir" final "$endpoint_samples_before" \
+    capture_m2_checkpoint_after_drain \
+      "$run_dir" final "$endpoint_samples_before" \
       "$data_plane_samples_before" || return 1
   fi
   append_event_to "$run_dir" \
@@ -7402,7 +7707,7 @@ run_m2_action() {
     "$run_dir/m2-direct/direct-forward-300s.json" || \
     die "cannot preserve M2 direct result"
   printf '%s\n' \
-    'timestamp,label,rss_kib,fd_count,thread_rows,endpoint_available_bytes,endpoint_live_bytes,endpoint_outstanding_bytes,active_relays,total_relays,fake_ip_active,fake_ip_registered,dns_forged,dns_dropped' \
+    'timestamp,label,rss_kib,fd_count,thread_rows,endpoint_available_bytes,endpoint_live_bytes,endpoint_outstanding_bytes,active_relays,total_relays,fake_ip_active,fake_ip_registered,dns_forged,dns_dropped,active_leases,replayed_relaying_handles,controlled_active_relays,replay_invalid' \
     >"$run_dir/m2-checkpoints.csv" || die "cannot create M2 checkpoint evidence"
   profile_file="$run_dir/m2-workload.txt"
   printf '%s\n' preparing >"$run_dir/m2.status"
@@ -7444,41 +7749,41 @@ run_m2_action() {
   [[ "$data_plane_samples_before" =~ ^[0-9]+$ && \
     "$endpoint_samples_before" =~ ^[0-9]+$ ]] || {
     printf '%s\n' failed >"$run_dir/m2.status"
-    append_event_to "$run_dir" "m2 failed: full-tunnel quiescence baseline"
-    die "M2 cannot establish the full-tunnel quiescence baseline; use status/snapshot/stop"
+    append_event_to "$run_dir" "m2 failed: controlled-drain baseline"
+    die "M2 cannot establish the controlled-drain baseline; use status/snapshot/stop"
   }
   if ! run_m2_real_client_probe "$run_dir" preflight; then
     printf '%s\n' failed >"$run_dir/m2.status"
     append_event_to "$run_dir" "m2 failed: real-client preflight"
     die "M2 real-client preflight failed; no 24-hour workload ran; use status/snapshot/stop"
   fi
-  echo "Waiting for formal M2 full-tunnel quiescence: hard_timeout=${quiescence_timeout_secs}s"
+  echo "Waiting for formal M2 controlled-workload drain: hard_timeout=${quiescence_timeout_secs}s"
   record_m2_full_tunnel_quiescence "$run_dir" \
-    "$data_plane_samples_before" "$endpoint_samples_before" \
+    "$profile_file" "$data_plane_samples_before" "$endpoint_samples_before" \
     "$quiescence_timeout_secs"
   quiescence_status=$?
   if [[ "$quiescence_status" != "0" ]]; then
     quiescence_snapshot="$(m2_full_tunnel_quiescence_snapshot \
-      "$run_dir/mini_vpn.log")"
+      "$run_dir/mini_vpn.log" "$profile_file")"
     printf '%s\n' failed >"$run_dir/m2.status"
     if [[ "$quiescence_status" == "2" ]]; then
       append_event_to "$run_dir" \
-        "m2 failed: cannot record full-tunnel quiescence snapshot=$quiescence_snapshot"
-      die "M2 cannot record full-tunnel quiescence evidence; use status/snapshot/stop"
+        "m2 failed: cannot record controlled-drain snapshot=$quiescence_snapshot"
+      die "M2 cannot record controlled-drain evidence; use status/snapshot/stop"
     fi
     if ! m0_assert_run_healthy "$run_dir"; then
       append_event_to "$run_dir" \
-        "m2 failed: full-tunnel quiescence run health snapshot=$quiescence_snapshot"
-      die "M2 became unhealthy during full-tunnel quiescence; use status/snapshot/stop"
+        "m2 failed: controlled-drain run health snapshot=$quiescence_snapshot"
+      die "M2 became unhealthy during controlled drain; use status/snapshot/stop"
     fi
     append_event_to "$run_dir" \
-      "m2 failed: full-tunnel quiescence active App/system traffic snapshot=$quiescence_snapshot"
-    die "M2 full-tunnel quiescence failed before the 24-hour schedule; quit every non-test network App and use status/snapshot/stop"
+      "m2 failed: controlled-drain ownership/evidence snapshot=$quiescence_snapshot"
+    die "M2 controlled workload did not drain or replay evidence was inconsistent before the 24-hour schedule; use status/snapshot/stop"
   fi
   quiescence_snapshot="$(m2_full_tunnel_quiescence_snapshot \
-    "$run_dir/mini_vpn.log")"
+    "$run_dir/mini_vpn.log" "$profile_file")"
   append_event_to "$run_dir" \
-    "m2 full-tunnel quiescence complete snapshot=$quiescence_snapshot"
+    "m2 controlled drain complete snapshot=$quiescence_snapshot"
 
   M0_IPERF3_BIN="$(command -v iperf3)"
   M0_DIG_BIN="$(command -v dig)"

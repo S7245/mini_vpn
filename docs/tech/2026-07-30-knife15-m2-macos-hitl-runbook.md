@@ -13,9 +13,10 @@ for 24 hours and temporarily changes the active physical network service DNS.
 1. Use the HK Mac and its normal physical network.
 2. Quit Clash completely and disable Clash-TUN.
 3. Disable every other VPN, proxy app, and manually created TUN.
-4. Quit every non-test App that can use the network, including Cursor, Codex
-   or VS Code clients, WeChat, browsers, Mail, cloud/sync clients, and chat or
-   media Apps. Do not leave them merely hidden in the Dock.
+4. Do not deliberately run downloads, streaming, sync, or other heavy
+   non-test traffic. Quitting user Apps improves reproducibility but is not a
+   correctness prerequisite; normal macOS services such as Apple Push/iCloud
+   may remain connected.
 5. Prevent sleep and power loss; keep the Exit and Target VPSs powered.
 6. Do not browse, change Wi-Fi/Ethernet, alter DNS, or start another VPN until
    Knife15 `stop` finishes.
@@ -25,10 +26,11 @@ for 24 hours and temporarily changes the active physical network service DNS.
    the exact procedure below.
 
 Do not terminate macOS system daemons manually. Formal `m2` has an exact
-full-tunnel quiescence preflight; it is the authority for whether remaining
-system traffic is clean enough. If it fails, preserve evidence, run
-`status/snapshot/stop`, quit the named non-test Apps, and start a fresh
-transaction.
+controlled-lifecycle preflight: only runner-owned iperf and HTTP relays must
+drain, while ambient system/App relay and fake-IP counts remain recorded
+observations. If it fails, preserve evidence and run `status/snapshot/stop`;
+the evidence distinguishes controlled ownership, malformed replay, Endpoint
+debt, and DNS drops.
 
 Slow HK bandwidth is not itself a bug. The baseline derives offered rates, and
 M2 judges continuity, UDP loss, lifecycle, resources, routes, and cleanup.
@@ -231,10 +233,11 @@ caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2
 
 Do not press `Ctrl+C`, close the terminal, start Clash, or change the network.
 Before starting the 24-hour schedule, `m2` waits up to the existing smoke hard
-timeout (normally about 50 seconds) for fresh zero-ownership Endpoint,
-TCP-relay, and fake-IP evidence. A failure here means background App/system
-traffic is still using the full tunnel; it saves the 24-hour run and leaves
-the TUN/full tunnel available for `status/snapshot/stop`.
+timeout (normally about 50 seconds) for fresh Endpoint conservation, zero
+runner-controlled TCP relays, valid lifecycle replay, and zero DNS drops.
+Ambient Apple/system relays and fake-IP entries are allowed and recorded. A
+failure here saves the 24-hour run and leaves the TUN/full tunnel available
+for `status/snapshot/stop`.
 
 The `m2` command has exactly 24 hours of planned traffic/drain time plus DNS,
 HTTPS, health, and transition overhead. Reserve about 25 hours.
