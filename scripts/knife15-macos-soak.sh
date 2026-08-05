@@ -1744,6 +1744,98 @@ m2_data_plane_envelope() {
     '
 }
 
+m2_full_tunnel_quiescence_snapshot() {
+  local log_file="$1"
+  local active_leases data_plane_values endpoint_values data_samples dns_forged
+  local dns_dropped active_relays total_relays fake_active fake_total
+  local endpoint_samples max_total available live outstanding rest
+  active_leases="$(tcp_pool_latest_active_leases "$log_file" 2>/dev/null || true)"
+  data_plane_values="$(m2_data_plane_envelope "$log_file")"
+  read -r data_samples dns_forged dns_dropped active_relays total_relays \
+    fake_active fake_total <<<"$data_plane_values"
+  endpoint_values="$(endpoint_resource_envelope "$log_file")"
+  read -r endpoint_samples max_total available live outstanding rest \
+    <<<"$endpoint_values"
+  printf '%s %s %s %s %s %s %s %s %s %s\n' \
+    "${data_samples:-unknown}" "${endpoint_samples:-unknown}" \
+    "${active_leases:-unknown}" "${active_relays:-unknown}" \
+    "${fake_active:-unknown}" "${fake_total:-unknown}" \
+    "${dns_dropped:-unknown}" "${available:-unknown}" \
+    "${live:-unknown}" "${outstanding:-unknown}"
+}
+
+m2_full_tunnel_quiescence_is_clean() {
+  local log_file="$1"
+  local previous_data_plane_samples="$2"
+  local previous_endpoint_samples="$3"
+  local snapshot data_samples endpoint_samples active_leases active_relays
+  local fake_active fake_total dns_dropped available live outstanding value
+  snapshot="$(m2_full_tunnel_quiescence_snapshot "$log_file")"
+  read -r data_samples endpoint_samples active_leases active_relays fake_active \
+    fake_total dns_dropped available live outstanding <<<"$snapshot"
+  [[ "$previous_data_plane_samples" =~ ^[0-9]+$ && \
+    "$previous_endpoint_samples" =~ ^[0-9]+$ && \
+    "$active_leases" =~ ^[0-9]+$ && "$data_samples" =~ ^[0-9]+$ && \
+    "$endpoint_samples" =~ ^[0-9]+$ && \
+    10#$data_samples -gt 10#$previous_data_plane_samples && \
+    10#$endpoint_samples -gt 10#$previous_endpoint_samples ]] || return 1
+  for value in "$dns_dropped" "$active_relays" "$fake_active" "$fake_total" \
+    "$available" "$live" "$outstanding"; do
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  done
+  ((10#$active_leases == 0 && 10#$active_relays == 0 && \
+    10#$fake_active == 0 && 10#$fake_total >= 1 && 10#$fake_total <= 2 && \
+    10#$dns_dropped == 0 && 10#$live == 0 && 10#$outstanding == 0 && \
+    10#$available + 10#$live + 10#$outstanding <= 61440))
+}
+
+wait_for_m2_full_tunnel_quiescence() {
+  local log_file="$1"
+  local previous_data_plane_samples="$2"
+  local previous_endpoint_samples="$3"
+  local timeout_secs="$4"
+  local deadline
+  validate_positive_integer "$timeout_secs" || return 1
+  deadline=$((SECONDS + 10#$timeout_secs))
+  while ((SECONDS < deadline)); do
+    m2_full_tunnel_quiescence_is_clean \
+      "$log_file" "$previous_data_plane_samples" \
+      "$previous_endpoint_samples" && return 0
+    /bin/sleep 1
+  done
+  m2_full_tunnel_quiescence_is_clean \
+    "$log_file" "$previous_data_plane_samples" "$previous_endpoint_samples"
+}
+
+record_m2_full_tunnel_quiescence() {
+  local run_dir="$1"
+  local previous_data_plane_samples="$2"
+  local previous_endpoint_samples="$3"
+  local timeout_secs="$4"
+  local result snapshot data_samples endpoint_samples active_leases active_relays
+  local fake_active fake_total dns_dropped available live outstanding
+  result=FAIL
+  wait_for_m2_full_tunnel_quiescence "$run_dir/mini_vpn.log" \
+    "$previous_data_plane_samples" "$previous_endpoint_samples" \
+    "$timeout_secs" && result=PASS
+  snapshot="$(m2_full_tunnel_quiescence_snapshot "$run_dir/mini_vpn.log")"
+  read -r data_samples endpoint_samples active_leases active_relays fake_active \
+    fake_total dns_dropped available live outstanding <<<"$snapshot"
+  printf '%s\n' \
+    'schema=knife15-macos-m2-full-tunnel-quiescence-v2' \
+    "recorded_utc=$(timestamp)" \
+    "timeout_secs=$timeout_secs" \
+    "previous_data_plane_samples=$previous_data_plane_samples" \
+    "data_plane_samples=$data_samples" \
+    "previous_endpoint_samples=$previous_endpoint_samples" \
+    "endpoint_samples=$endpoint_samples" \
+    "endpoint_available=$available endpoint_live=$live endpoint_outstanding=$outstanding" \
+    "active_leases=$active_leases active_relays=$active_relays fake_ip_active=$fake_active fake_ip_registered=$fake_total dns_dropped=$dns_dropped" \
+    "result=$result" \
+    >"$run_dir/m2-full-tunnel-quiescence.txt" || return 2
+  [[ "$result" == PASS ]]
+}
+
 m2_checkpoint_envelope() {
   local checkpoint_file="$1"
   awk -F, '
@@ -2827,6 +2919,7 @@ EOF_M2_PROFILE
 
 runner_self_test() {
   local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture service_fixture dns_fixture m2_route_bin m2_ifconfig_bin m2_networksetup_bin m2_dscacheutil_bin m2_curl_bin m2_route_state m2_run m2_result m2_schedule_run m2_test_profile m2_checkpoint_file m2_capture_run m2_ipv6_evidence original_m2_route_bin original_m2_ifconfig_bin original_m2_networksetup_bin original_m2_dscacheutil_bin original_m2_curl_bin collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir baseline_summary_text m0_profile m1_profile m2_profile m1_test_profile m0_run m1_stage_run m1_run m1_diagnostic_run m1_diagnostic_fail_run m1_diagnostic_formal_run m1_checkpoint_file m1_capture_run m1_formal_run m1_tcp_fixture m1_udp_fixture m0_fail_run direct_dir fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash bounded_status result_index result_label sample_index violations_before violation_count invalid_violations ipv6_class ipv6_interface cleanup_class
+  local m2_record_fail_run quiescence_record_status
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/knife15-macos-self-test.XXXXXX")" || return 1
   good_log="$tmp/good.log"
   bad_log="$tmp/bad.log"
@@ -4030,6 +4123,7 @@ EOF_FAKE_SLEEP
     >"$m2_capture_run/m2-checkpoints.csv"
   printf '%s\n' \
     '📊 TUIC endpoint pacing global conservation(available=61440B,live=0B,outstanding=0B,records=2)' \
+    '🔎 tuic-tcp-pool-activity active_leases=0' \
     '📊 数据面: DNS forge=10/drop=0 | TCP relay 活跃=0/累计=10 | fake-IP 活跃=0/在册=2 | UDP↓丢=0 背压=0 | UDP↑丢=0 stream兜底=0 | leg=tuic' \
     >"$m2_capture_run/mini_vpn.log"
   ! capture_m2_checkpoint "$m2_capture_run" idle-1 1 1 || \
@@ -4040,6 +4134,53 @@ EOF_FAKE_SLEEP
     >>"$m2_capture_run/mini_vpn.log"
   capture_m2_checkpoint "$m2_capture_run" idle-1 1 1 || \
     die "self-test: fresh clean M2 checkpoint samples were rejected"
+  m2_full_tunnel_quiescence_is_clean \
+    "$m2_capture_run/mini_vpn.log" 1 1 || \
+    die "self-test: clean full-tunnel quiescence evidence was rejected"
+  wait_for_m2_full_tunnel_quiescence \
+    "$m2_capture_run/mini_vpn.log" 1 1 1 || \
+    die "self-test: clean full-tunnel quiescence did not pass immediately"
+  cp "$m2_capture_run/mini_vpn.log" "$tmp/m2-quiescence-endpoint.log"
+  printf '%s\n' \
+    '📊 TUIC endpoint pacing global conservation(available=60031B,live=1409B,outstanding=0B,records=2)' \
+    '📊 数据面: DNS forge=12/drop=0 | TCP relay 活跃=0/累计=12 | fake-IP 活跃=0/在册=2 | UDP↓丢=0 背压=0 | UDP↑丢=0 stream兜底=0 | leg=tuic' \
+    >>"$tmp/m2-quiescence-endpoint.log"
+  ! m2_full_tunnel_quiescence_is_clean \
+    "$tmp/m2-quiescence-endpoint.log" 2 2 || \
+    die "self-test: live Endpoint ownership passed full-tunnel quiescence"
+  printf '%s\n' \
+    '🔎 tuic-tcp-pool-activity active_leases=8' \
+    '📊 数据面: DNS forge=12/drop=0 | TCP relay 活跃=4/累计=15 | fake-IP 活跃=7/在册=19 | UDP↓丢=0 背压=0 | UDP↑丢=0 stream兜底=0 | leg=tuic' \
+    >>"$m2_capture_run/mini_vpn.log"
+  ! m2_full_tunnel_quiescence_is_clean \
+    "$m2_capture_run/mini_vpn.log" 2 1 || \
+    die "self-test: live App traffic passed full-tunnel quiescence preflight"
+  [[ "$(m2_full_tunnel_quiescence_snapshot \
+    "$m2_capture_run/mini_vpn.log")" == '3 2 8 4 7 19 0 61440 0 0' ]] || \
+    die "self-test: full-tunnel quiescence snapshot mismatch"
+  ! wait_for_m2_full_tunnel_quiescence \
+    "$m2_capture_run/mini_vpn.log" 2 1 1 || \
+    die "self-test: live App traffic passed the bounded quiescence wait"
+  ! record_m2_full_tunnel_quiescence "$m2_capture_run" 2 1 1 || \
+    die "self-test: dirty full-tunnel quiescence evidence was recorded as PASS"
+  grep -Fq 'result=FAIL' \
+    "$m2_capture_run/m2-full-tunnel-quiescence.txt" || \
+    die "self-test: dirty full-tunnel quiescence verdict missing"
+  grep -Fq 'active_leases=8 active_relays=4 fake_ip_active=7 fake_ip_registered=19 dns_dropped=0' \
+    "$m2_capture_run/m2-full-tunnel-quiescence.txt" || \
+    die "self-test: dirty full-tunnel quiescence values missing"
+  grep -Fq 'endpoint_available=61440 endpoint_live=0 endpoint_outstanding=0' \
+    "$m2_capture_run/m2-full-tunnel-quiescence.txt" || \
+    die "self-test: full-tunnel quiescence Endpoint values missing"
+  m2_record_fail_run="$tmp/m2-record-fail"
+  mkdir "$m2_record_fail_run" \
+    "$m2_record_fail_run/m2-full-tunnel-quiescence.txt"
+  cp "$m2_capture_run/mini_vpn.log" "$m2_record_fail_run/mini_vpn.log"
+  record_m2_full_tunnel_quiescence \
+    "$m2_record_fail_run" 2 1 1 2>/dev/null
+  quiescence_record_status=$?
+  [[ "$quiescence_record_status" == "2" ]] || \
+    die "self-test: full-tunnel quiescence evidence write failure was not distinct"
   : >"$m1_run/mini_vpn.log"
   write_summary "$m1_run"
   grep -Fq -- '- m1_status: complete' "$m1_run/summary.md" || \
@@ -7181,7 +7322,10 @@ m2_workload_slo() {
 
 run_m2_action() {
   local run_dir utun target exit_host iperf_port dns_target dns_name
-  local profile_file free_kb command_name ipv6_evidence_file
+  local profile_file free_kb command_name ipv6_evidence_file duration
+  local data_plane_values endpoint_values data_plane_samples_before
+  local endpoint_samples_before quiescence_timeout_secs quiescence_snapshot
+  local quiescence_status
   require_root
   validate_m2_formal_config || \
     die "formal M2 requires the frozen 86400s schedule and 30s sampling; unset M2_* duration overrides"
@@ -7218,6 +7362,9 @@ run_m2_action() {
   iperf_port="$(read_state iperf_port)"
   dns_target="$(read_state dns_target 2>/dev/null || true)"
   dns_name="$(read_state dns_name)"
+  duration="$(read_state duration)"
+  validate_positive_integer "$duration" || die "recorded smoke duration is invalid"
+  quiescence_timeout_secs=$((10#$duration + 30))
   [[ -n "$dns_target" ]] || die "formal M2 requires DNS_TARGET"
   [[ "$(route_interface "$target")" == "$utun" ]] || \
     die "TARGET no longer routes through $utun"
@@ -7290,11 +7437,48 @@ run_m2_action() {
   SOAK_VIOLATIONS_FILE=
   SOAK_REAL_CLIENT_PROBE=1
   sample_once_for "$run_dir" || true
+  data_plane_values="$(m2_data_plane_envelope "$run_dir/mini_vpn.log")"
+  read -r data_plane_samples_before _ <<<"$data_plane_values"
+  endpoint_values="$(endpoint_resource_envelope "$run_dir/mini_vpn.log")"
+  read -r endpoint_samples_before _ <<<"$endpoint_values"
+  [[ "$data_plane_samples_before" =~ ^[0-9]+$ && \
+    "$endpoint_samples_before" =~ ^[0-9]+$ ]] || {
+    printf '%s\n' failed >"$run_dir/m2.status"
+    append_event_to "$run_dir" "m2 failed: full-tunnel quiescence baseline"
+    die "M2 cannot establish the full-tunnel quiescence baseline; use status/snapshot/stop"
+  }
   if ! run_m2_real_client_probe "$run_dir" preflight; then
     printf '%s\n' failed >"$run_dir/m2.status"
     append_event_to "$run_dir" "m2 failed: real-client preflight"
     die "M2 real-client preflight failed; no 24-hour workload ran; use status/snapshot/stop"
   fi
+  echo "Waiting for formal M2 full-tunnel quiescence: hard_timeout=${quiescence_timeout_secs}s"
+  record_m2_full_tunnel_quiescence "$run_dir" \
+    "$data_plane_samples_before" "$endpoint_samples_before" \
+    "$quiescence_timeout_secs"
+  quiescence_status=$?
+  if [[ "$quiescence_status" != "0" ]]; then
+    quiescence_snapshot="$(m2_full_tunnel_quiescence_snapshot \
+      "$run_dir/mini_vpn.log")"
+    printf '%s\n' failed >"$run_dir/m2.status"
+    if [[ "$quiescence_status" == "2" ]]; then
+      append_event_to "$run_dir" \
+        "m2 failed: cannot record full-tunnel quiescence snapshot=$quiescence_snapshot"
+      die "M2 cannot record full-tunnel quiescence evidence; use status/snapshot/stop"
+    fi
+    if ! m0_assert_run_healthy "$run_dir"; then
+      append_event_to "$run_dir" \
+        "m2 failed: full-tunnel quiescence run health snapshot=$quiescence_snapshot"
+      die "M2 became unhealthy during full-tunnel quiescence; use status/snapshot/stop"
+    fi
+    append_event_to "$run_dir" \
+      "m2 failed: full-tunnel quiescence active App/system traffic snapshot=$quiescence_snapshot"
+    die "M2 full-tunnel quiescence failed before the 24-hour schedule; quit every non-test network App and use status/snapshot/stop"
+  fi
+  quiescence_snapshot="$(m2_full_tunnel_quiescence_snapshot \
+    "$run_dir/mini_vpn.log")"
+  append_event_to "$run_dir" \
+    "m2 full-tunnel quiescence complete snapshot=$quiescence_snapshot"
 
   M0_IPERF3_BIN="$(command -v iperf3)"
   M0_DIG_BIN="$(command -v dig)"
