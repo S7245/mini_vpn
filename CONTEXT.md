@@ -28,6 +28,10 @@ _Avoid_: reconnect active flows (the predecessor remains alive), failover retry 
 A bounded per-stream send-scheduling contract. A newly opened TUIC TCP stream queues its Connect header and first non-empty business payload above incumbent normal-priority stream data, then atomically returns to its original Quinn priority after exactly one business scheduling turn. Blocked or empty writes do not consume the contract. It changes neither connection admission nor congestion/flow control and has no timer, byte threshold, Target rule, or configuration knob.
 _Avoid_: stream boost (sounds tunable or permanent), fast lane (suggests separate capacity), failover (the selected QUIC connection does not change)
 
+**TUIC TCP connection-local path-state recovery**:
+A one-shot recovery contract for an established TUIC TCP relay whose exact business writer remains Pending for the existing RTT-derived bound while its owning QUIC connection adds PLPMTUD black-hole detections. It resets only that connection's Quinn congestion, RTT, and MTU-discovery state from the existing transport configuration, preserving the QUIC identity, TUIC stream, Target TCP connection, UDP socket, and payload bytes. One stable QUIC identity can consume the authority only once; it is neither a retry loop nor parameter tuning.
+_Avoid_: stream failover (no stream moves), Endpoint rebind (the shared UDP socket does not change), MTU reset (congestion and RTT state reset too, using existing configuration)
+
 **Direct baseline evidence**:
 The pre-TUN pair of forward and reverse iperf JSON results against the Target. It proves receiver-positive physical-path continuity for the short observation window and supplies the forward receiver rate from which the longer direct discriminator derives its offered load. Low average bandwidth is valid; a complete receiver-zero interval, malformed evidence, command failure, or validator execution failure is not. It is distinct from the 300-second direct discriminator and never exercises mini_vpn.
 _Avoid_: speed test (continuity and provenance, not maximum bandwidth, are the contract), VPN baseline (no TUN or VPN data plane is active)

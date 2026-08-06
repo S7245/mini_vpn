@@ -620,6 +620,23 @@ impl Connection {
             .endpoint_pacing_connection_snapshot()
     }
 
+    /// Reset path-specific transport state while retaining this connection and its streams.
+    ///
+    /// This hidden adapter exposes quinn-proto's existing path-change mechanism to applications
+    /// that have independent, connection-local evidence that the learned path state is no longer
+    /// usable. Detection policy remains outside Quinn.
+    #[doc(hidden)]
+    pub fn path_changed(&self) -> Result<(), ConnectionError> {
+        let mut conn = self.0.state.lock("path_changed");
+        if let Some(error) = conn.error.clone() {
+            return Err(error);
+        }
+        let now = conn.runtime.now();
+        conn.inner.path_changed(now);
+        conn.wake();
+        Ok(())
+    }
+
     /// Update traffic keys spontaneously
     ///
     /// This primarily exists for testing purposes.

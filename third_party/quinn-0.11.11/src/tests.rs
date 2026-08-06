@@ -169,6 +169,83 @@ async fn send_stream_progress_handle_tracks_acknowledgements() {
 }
 
 #[tokio::test]
+async fn connection_path_changed_resets_transport_state_and_preserves_stream() {
+    let _guard = subscribe();
+    const INITIAL_RTT: Duration = Duration::from_millis(250);
+    const INITIAL_MTU: u16 = 1280;
+    const FIRST_LEN: usize = 512 * 1024;
+    const SECOND: &[u8] = b"same stream after connection-local path reset";
+
+    let mut transport = TransportConfig::default();
+    transport.initial_rtt(INITIAL_RTT).initial_mtu(INITIAL_MTU);
+    let endpoint = endpoint_with_config(transport);
+    let server_endpoint = endpoint.clone();
+    let server = tokio::spawn(async move {
+        let connection = server_endpoint
+            .accept()
+            .await
+            .expect("incoming connection")
+            .await
+            .expect("server handshake");
+        let mut recv = connection.accept_uni().await.expect("incoming stream");
+        let mut first = vec![0; FIRST_LEN];
+        recv.read_exact(&mut first).await.expect("first payload");
+        assert!(first.iter().all(|byte| *byte == 0xA5));
+        let mut second = vec![0; SECOND.len()];
+        recv.read_exact(&mut second).await.expect("post-reset payload");
+        assert_eq!(second, SECOND);
+    });
+
+    let connection = endpoint
+        .connect(endpoint.local_addr().expect("endpoint address"), "localhost")
+        .expect("start connection")
+        .await
+        .expect("client handshake");
+    let stable_id = connection.stable_id();
+    let mut send = connection.open_uni().await.expect("open stream");
+    let progress = send.progress_handle();
+    send.write_all(&vec![0xA5; FIRST_LEN])
+        .await
+        .expect("write first payload");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if progress
+                .sample()
+                .is_ok_and(|sample| sample.acknowledged_bytes >= FIRST_LEN as u64)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first payload acknowledgements");
+
+    let before = connection.stats().path;
+    connection.path_changed().expect("reset live path state");
+    let reset = connection.stats().path;
+    assert_eq!(connection.stable_id(), stable_id);
+    assert_eq!(reset.rtt, INITIAL_RTT);
+    assert_eq!(reset.current_mtu, INITIAL_MTU);
+    assert!(
+        reset.cwnd <= before.cwnd,
+        "configured initial congestion state must replace learned state: before={} reset={}",
+        before.cwnd,
+        reset.cwnd
+    );
+
+    send.write_all(SECOND).await.expect("write after path reset");
+    send.finish().expect("finish same stream");
+    server.await.expect("server task");
+
+    connection.close(0u32.into(), b"test complete");
+    assert!(matches!(
+        connection.path_changed(),
+        Err(crate::ConnectionError::LocallyClosed)
+    ));
+}
+
+#[tokio::test]
 async fn send_stream_atomic_priority_restore_delivers_bytes() {
     let _guard = subscribe();
     let endpoint = endpoint();

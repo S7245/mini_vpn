@@ -4745,6 +4745,7 @@ struct EndpointRecoveryConnectionSample {
     tx_bytes: u64,
     rx_bytes: u64,
     rtt: Duration,
+    black_holes_detected: u64,
     current_socket_rx_rebind_generation: u64,
     tcp_write_pressures: Vec<TcpWritePressureSnapshot>,
 }
@@ -4758,6 +4759,13 @@ struct EndpointRecoveryInput {
     connections: Vec<EndpointRecoveryConnectionSample>,
 }
 
+struct EndpointRecoveryConnectionHandle {
+    stable_id: usize,
+    pool_index: usize,
+    pool_generation: u64,
+    connection: Connection,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EndpointRecoveryTrigger {
     NoRx,
@@ -4769,6 +4777,16 @@ enum EndpointRecoveryTrigger {
         acknowledged_bytes: u64,
         pending_for: Duration,
     },
+    TcpPathDegraded {
+        stable_id: usize,
+        writer: u64,
+        stream: u64,
+        episode: u64,
+        acknowledged_bytes: u64,
+        pending_for: Duration,
+        black_hole_anchor: u64,
+        black_holes_current: u64,
+    },
 }
 
 impl EndpointRecoveryTrigger {
@@ -4776,6 +4794,7 @@ impl EndpointRecoveryTrigger {
         match self {
             Self::NoRx => "no_rx",
             Self::TcpWriteStall { .. } => "tcp_write_stall",
+            Self::TcpPathDegraded { .. } => "tcp_path_degraded",
         }
     }
 
@@ -4797,6 +4816,22 @@ impl EndpointRecoveryTrigger {
                 acknowledged_bytes,
                 pending_for.as_millis(),
             ),
+            Self::TcpPathDegraded {
+                stable_id,
+                writer,
+                stream,
+                episode,
+                acknowledged_bytes,
+                pending_for,
+                ..
+            } => (
+                stable_id,
+                writer,
+                stream,
+                episode,
+                acknowledged_bytes,
+                pending_for.as_millis(),
+            ),
         }
     }
 }
@@ -4804,6 +4839,12 @@ impl EndpointRecoveryTrigger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EndpointRecoveryAction {
     None,
+    ResetConnectionPath {
+        generation: u64,
+        trigger: EndpointRecoveryTrigger,
+        stall_bound: Duration,
+        max_rtt: Duration,
+    },
     Rebind {
         generation: u64,
         trigger: EndpointRecoveryTrigger,
@@ -4838,6 +4879,9 @@ struct EndpointRecoveryState {
     pending_recovery_connections: HashSet<usize>,
     expected_recovery_connection_count: usize,
     covered_tcp_write_episodes: HashMap<(usize, u64), u64>,
+    path_black_hole_anchors: HashMap<usize, u64>,
+    path_reset_consumed: HashSet<usize>,
+    path_reset_generation: u64,
     observed_udp_activity_secs: u64,
     udp_demand_since_rx: bool,
 }
@@ -4876,6 +4920,100 @@ impl EndpointRecoveryState {
                         != Some(&pressure.episode)
             })
             .max_by_key(|(_, pressure)| (pressure.ack_stalled_for, pressure.pending_for))
+    }
+
+    fn refresh_path_recovery_ownership(&mut self, input: &EndpointRecoveryInput) {
+        self.path_black_hole_anchors.retain(|stable_id, _| {
+            input
+                .connections
+                .iter()
+                .any(|sample| sample.stable_id == *stable_id)
+        });
+        self.path_reset_consumed.retain(|stable_id| {
+            input
+                .connections
+                .iter()
+                .any(|sample| sample.stable_id == *stable_id)
+        });
+
+        for sample in &input.connections {
+            let has_pending_writer = !sample.tcp_write_pressures.is_empty();
+            self.path_black_hole_anchors
+                .entry(sample.stable_id)
+                .and_modify(|anchor| {
+                    if sample.black_holes_detected < *anchor || !has_pending_writer {
+                        *anchor = sample.black_holes_detected;
+                    }
+                })
+                .or_insert(sample.black_holes_detected);
+        }
+    }
+
+    fn eligible_tcp_path_degradation(
+        &self,
+        input: &EndpointRecoveryInput,
+        stall_bound: Duration,
+    ) -> Option<(usize, TcpWritePressureSnapshot, u64, u64)> {
+        input
+            .connections
+            .iter()
+            .filter_map(|sample| {
+                let anchor = *self.path_black_hole_anchors.get(&sample.stable_id)?;
+                if self.path_reset_consumed.contains(&sample.stable_id)
+                    || sample.black_holes_detected <= anchor
+                {
+                    return None;
+                }
+                sample
+                    .tcp_write_pressures
+                    .iter()
+                    .copied()
+                    .filter(|pressure| pressure.pending_for >= stall_bound)
+                    .max_by_key(|pressure| pressure.pending_for)
+                    .map(|pressure| {
+                        (
+                            sample.stable_id,
+                            pressure,
+                            anchor,
+                            sample.black_holes_detected,
+                        )
+                    })
+            })
+            .max_by_key(|(stable_id, pressure, anchor, current)| {
+                (
+                    pressure.pending_for,
+                    current.saturating_sub(*anchor),
+                    *stable_id,
+                )
+            })
+    }
+
+    fn begin_path_reset(
+        &mut self,
+        stable_id: usize,
+        pressure: TcpWritePressureSnapshot,
+        black_hole_anchor: u64,
+        black_holes_current: u64,
+        stall_bound: Duration,
+        max_rtt: Duration,
+    ) -> EndpointRecoveryAction {
+        self.path_reset_consumed.insert(stable_id);
+        self.path_reset_generation = self.path_reset_generation.saturating_add(1);
+        EndpointRecoveryAction::ResetConnectionPath {
+            generation: self.path_reset_generation,
+            trigger: EndpointRecoveryTrigger::TcpPathDegraded {
+                stable_id,
+                writer: pressure.writer,
+                stream: pressure.stream,
+                episode: pressure.episode,
+                acknowledged_bytes: pressure.acknowledged_bytes,
+                pending_for: pressure.pending_for,
+                black_hole_anchor,
+                black_holes_current,
+            },
+            stall_bound,
+            max_rtt,
+        }
     }
 
     fn begin_rebind(
@@ -4932,6 +5070,7 @@ impl EndpointRecoveryState {
             );
         }
         self.connections = next;
+        self.refresh_path_recovery_ownership(input);
         self.covered_tcp_write_episodes
             .retain(|(stable_id, writer), episode| {
                 input.connections.iter().any(|sample| {
@@ -4996,6 +5135,21 @@ impl EndpointRecoveryState {
                     pending_for: pressure.pending_for,
                 },
                 pressure.ack_stalled_for,
+                stall_bound,
+                max_rtt,
+            );
+        }
+
+        if let Some((stable_id, pressure, anchor, current)) =
+            self.eligible_tcp_path_degradation(input, stall_bound)
+            && !self.rebind_issued
+            && self.expected_socket_generation.is_none()
+        {
+            return self.begin_path_reset(
+                stable_id,
+                pressure,
+                anchor,
+                current,
                 stall_bound,
                 max_rtt,
             );
@@ -6370,7 +6524,7 @@ impl TuicUpstream {
                 let Some(upstream) = weak.upgrade() else {
                     return;
                 };
-                let Some(input) = upstream.endpoint_recovery_input() else {
+                let Some((input, connection_handles)) = upstream.endpoint_recovery_input() else {
                     continue;
                 };
                 if let Some(active_leases) =
@@ -6391,6 +6545,74 @@ impl TuicUpstream {
                             "✅ tuic-endpoint-rebind-recovered generation={generation} first_rx_ms={} socket_generation={socket_generation} connections={connection_count}",
                             recovery_time.as_millis(),
                         );
+                    }
+                    EndpointRecoveryAction::ResetConnectionPath {
+                        generation,
+                        trigger,
+                        stall_bound,
+                        max_rtt,
+                    } => {
+                        let (
+                            write_conn,
+                            write_writer,
+                            write_stream,
+                            write_episode,
+                            write_acknowledged_bytes,
+                            write_pending_ms,
+                        ) = trigger.tcp_write_fields();
+                        let (black_hole_anchor, black_holes_current) = match trigger {
+                            EndpointRecoveryTrigger::TcpPathDegraded {
+                                black_hole_anchor,
+                                black_holes_current,
+                                ..
+                            } => (black_hole_anchor, black_holes_current),
+                            _ => (0, 0),
+                        };
+                        match connection_handles
+                            .iter()
+                            .find(|handle| handle.stable_id == write_conn)
+                        {
+                            Some(handle) => {
+                                let before = handle.connection.stats().path;
+                                match handle.connection.path_changed() {
+                                    Ok(()) => {
+                                        let after = handle.connection.stats().path;
+                                        println!(
+                                            "🔄 tuic-connection-path-reset generation={generation} result=applied trigger={} write_conn={write_conn} pool_index={} pool_generation={} write_writer={write_writer} write_stream={write_stream} write_episode={write_episode} write_acknowledged={write_acknowledged_bytes}B write_pending_ms={write_pending_ms} black_hole_anchor={black_hole_anchor} black_holes_current={black_holes_current} bound_ms={} max_rtt_ms={} rtt_before_ms={} rtt_after_ms={} cwnd_before={} cwnd_after={} mtu_before={} mtu_after={}",
+                                            trigger.label(),
+                                            handle.pool_index,
+                                            handle.pool_generation,
+                                            stall_bound.as_millis(),
+                                            max_rtt.as_millis(),
+                                            before.rtt.as_millis(),
+                                            after.rtt.as_millis(),
+                                            before.cwnd,
+                                            after.cwnd,
+                                            before.current_mtu,
+                                            after.current_mtu,
+                                        );
+                                    }
+                                    Err(error) => {
+                                        println!(
+                                            "⚠️ tuic-connection-path-reset generation={generation} result=closed trigger={} write_conn={write_conn} pool_index={} pool_generation={} write_writer={write_writer} write_stream={write_stream} write_episode={write_episode} write_acknowledged={write_acknowledged_bytes}B write_pending_ms={write_pending_ms} black_hole_anchor={black_hole_anchor} black_holes_current={black_holes_current} bound_ms={} max_rtt_ms={} error={error}",
+                                            trigger.label(),
+                                            handle.pool_index,
+                                            handle.pool_generation,
+                                            stall_bound.as_millis(),
+                                            max_rtt.as_millis(),
+                                        );
+                                    }
+                                }
+                            }
+                            None => {
+                                println!(
+                                    "⚠️ tuic-connection-path-reset generation={generation} result=not_found trigger={} write_conn={write_conn} write_writer={write_writer} write_stream={write_stream} write_episode={write_episode} write_acknowledged={write_acknowledged_bytes}B write_pending_ms={write_pending_ms} black_hole_anchor={black_hole_anchor} black_holes_current={black_holes_current} bound_ms={} max_rtt_ms={}",
+                                    trigger.label(),
+                                    stall_bound.as_millis(),
+                                    max_rtt.as_millis(),
+                                );
+                            }
+                        }
                     }
                     EndpointRecoveryAction::Rebind {
                         generation,
@@ -6462,8 +6684,11 @@ impl TuicUpstream {
         });
     }
 
-    fn endpoint_recovery_input(&self) -> Option<EndpointRecoveryInput> {
+    fn endpoint_recovery_input(
+        &self,
+    ) -> Option<(EndpointRecoveryInput, Vec<EndpointRecoveryConnectionHandle>)> {
         let mut connections = Vec::with_capacity(self.tcp_pool_slots.len() + 1);
+        let mut connection_handles = Vec::with_capacity(self.tcp_pool_slots.len() + 1);
         let sampled_at = Instant::now();
         for slot in &self.tcp_pool_slots {
             let state = slot.state.try_lock().ok()?;
@@ -6475,13 +6700,21 @@ impl TuicUpstream {
                     continue;
                 }
                 let stats = conn.stats();
+                let stable_id = conn.stable_id();
                 connections.push(EndpointRecoveryConnectionSample {
-                    stable_id: conn.stable_id(),
+                    stable_id,
                     tx_bytes: stats.udp_tx.bytes,
                     rx_bytes: stats.udp_rx.bytes,
                     rtt: stats.path.rtt,
+                    black_holes_detected: stats.path.black_holes_detected,
                     current_socket_rx_rebind_generation: conn.current_socket_rx_rebind_generation(),
                     tcp_write_pressures: generation.write_pressure.snapshots_at(sampled_at),
+                });
+                connection_handles.push(EndpointRecoveryConnectionHandle {
+                    stable_id,
+                    pool_index: slot.index,
+                    pool_generation: generation.open_state.generation(),
+                    connection: conn.clone(),
                 });
             }
         }
@@ -6489,16 +6722,19 @@ impl TuicUpstream {
         let now = self.clock.elapsed().as_secs();
         let last_udp_activity = self.last_udp_activity.load(Ordering::Relaxed);
         let udp_active = should_send_heartbeat(last_udp_activity, now, TUIC_HB_IDLE_WINDOW_SECS);
-        Some(EndpointRecoveryInput {
-            active_tcp,
-            udp_active,
-            last_udp_activity_secs: last_udp_activity,
-            current_socket_rx_rebind_generation: self
-                .endpoint
-                .stats()
-                .current_socket_rx_rebind_generation,
-            connections,
-        })
+        Some((
+            EndpointRecoveryInput {
+                active_tcp,
+                udp_active,
+                last_udp_activity_secs: last_udp_activity,
+                current_socket_rx_rebind_generation: self
+                    .endpoint
+                    .stats()
+                    .current_socket_rx_rebind_generation,
+                connections,
+            },
+            connection_handles,
+        ))
     }
 }
 
@@ -7015,6 +7251,338 @@ mod tests {
             .collect()
     }
 
+    fn endpoint_recovery_connection(
+        stable_id: usize,
+        black_holes_detected: u64,
+        pressure: Option<TcpWritePressureSnapshot>,
+    ) -> EndpointRecoveryConnectionSample {
+        EndpointRecoveryConnectionSample {
+            stable_id,
+            tx_bytes: 100_000,
+            rx_bytes: 10_000,
+            rtt: Duration::from_millis(159),
+            black_holes_detected,
+            current_socket_rx_rebind_generation: 0,
+            tcp_write_pressures: pressure.into_iter().collect(),
+        }
+    }
+
+    fn endpoint_recovery_path_sample(
+        connections: Vec<EndpointRecoveryConnectionSample>,
+    ) -> EndpointRecoveryInput {
+        EndpointRecoveryInput {
+            active_tcp: 1,
+            udp_active: false,
+            last_udp_activity_secs: 0,
+            current_socket_rx_rebind_generation: 0,
+            connections,
+        }
+    }
+
+    fn endpoint_recovery_pending(
+        writer: u64,
+        episode: u64,
+        pending_for: Duration,
+        ack_stalled_for: Duration,
+        acknowledged_bytes: u64,
+    ) -> TcpWritePressureSnapshot {
+        TcpWritePressureSnapshot {
+            writer,
+            stream: writer.saturating_mul(2).saturating_add(1),
+            episode,
+            pending_for,
+            ack_stalled_for,
+            acknowledged_bytes,
+        }
+    }
+
+    #[test]
+    fn endpoint_recovery_resets_only_the_pending_connection_on_black_hole_advance() {
+        let started = Instant::now();
+        let rtt = Duration::from_millis(159);
+        let bound = endpoint_recovery_stall_bound(rtt);
+        let mut state = EndpointRecoveryState::default();
+
+        let baseline = endpoint_recovery_path_sample(vec![
+            endpoint_recovery_connection(11, 0, None),
+            endpoint_recovery_connection(12, 0, None),
+        ]);
+        assert_eq!(
+            state.observe(started, &baseline),
+            EndpointRecoveryAction::None
+        );
+
+        let degraded = endpoint_recovery_path_sample(vec![
+            endpoint_recovery_connection(
+                11,
+                1,
+                Some(endpoint_recovery_pending(
+                    7,
+                    9,
+                    bound,
+                    Duration::from_millis(250),
+                    64 * 1024,
+                )),
+            ),
+            endpoint_recovery_connection(
+                12,
+                0,
+                Some(endpoint_recovery_pending(
+                    8,
+                    10,
+                    bound + Duration::from_secs(1),
+                    Duration::from_millis(250),
+                    128 * 1024,
+                )),
+            ),
+        ]);
+        let action = state.observe(started + bound, &degraded);
+        assert!(
+            matches!(
+                action,
+                EndpointRecoveryAction::ResetConnectionPath {
+                    generation: 1,
+                    trigger: EndpointRecoveryTrigger::TcpPathDegraded {
+                        stable_id: 11,
+                        writer: 7,
+                        stream: 15,
+                        episode: 9,
+                        acknowledged_bytes: 65_536,
+                        black_hole_anchor: 0,
+                        black_holes_current: 1,
+                        ..
+                    },
+                    stall_bound,
+                    max_rtt,
+                } if stall_bound == bound && max_rtt == rtt
+            ),
+            "only the connection with current writer ownership plus black-hole advance may reset: {action:?}"
+        );
+    }
+
+    #[test]
+    fn endpoint_recovery_path_reset_requires_same_pending_window_black_hole_advance() {
+        let started = Instant::now();
+        let bound = endpoint_recovery_stall_bound(Duration::from_millis(159));
+        let mut state = EndpointRecoveryState::default();
+
+        assert_eq!(
+            state.observe(
+                started,
+                &endpoint_recovery_path_sample(vec![endpoint_recovery_connection(11, 0, None)])
+            ),
+            EndpointRecoveryAction::None
+        );
+        assert_eq!(
+            state.observe(
+                started + Duration::from_millis(250),
+                &endpoint_recovery_path_sample(vec![endpoint_recovery_connection(11, 1, None)])
+            ),
+            EndpointRecoveryAction::None,
+            "an idle black-hole increment must only refresh the anchor"
+        );
+        assert_eq!(
+            state.observe(
+                started + bound,
+                &endpoint_recovery_path_sample(vec![endpoint_recovery_connection(
+                    11,
+                    1,
+                    Some(endpoint_recovery_pending(
+                        7,
+                        9,
+                        bound,
+                        Duration::from_millis(250),
+                        65_536,
+                    )),
+                )])
+            ),
+            EndpointRecoveryAction::None,
+            "Pending and ACK progress without a same-window black-hole increment is ordinary backpressure"
+        );
+        assert!(matches!(
+            state.observe(
+                started + bound + Duration::from_millis(250),
+                &endpoint_recovery_path_sample(vec![endpoint_recovery_connection(
+                    11,
+                    2,
+                    Some(endpoint_recovery_pending(
+                        7,
+                        9,
+                        bound + Duration::from_millis(250),
+                        Duration::from_millis(250),
+                        131_072,
+                    )),
+                )])
+            ),
+            EndpointRecoveryAction::ResetConnectionPath { .. }
+        ));
+    }
+
+    #[test]
+    fn endpoint_recovery_path_reset_is_once_per_stable_identity() {
+        let started = Instant::now();
+        let bound = endpoint_recovery_stall_bound(Duration::from_millis(159));
+        let mut state = EndpointRecoveryState::default();
+        let idle = |stable_id, black_holes_detected| {
+            endpoint_recovery_path_sample(vec![endpoint_recovery_connection(
+                stable_id,
+                black_holes_detected,
+                None,
+            )])
+        };
+        let pending = |stable_id, black_holes_detected, writer, episode| {
+            endpoint_recovery_path_sample(vec![endpoint_recovery_connection(
+                stable_id,
+                black_holes_detected,
+                Some(endpoint_recovery_pending(
+                    writer,
+                    episode,
+                    bound,
+                    Duration::from_millis(250),
+                    64 * 1024,
+                )),
+            )])
+        };
+
+        assert_eq!(
+            state.observe(started, &idle(11, 0)),
+            EndpointRecoveryAction::None
+        );
+        assert!(matches!(
+            state.observe(started + bound, &pending(11, 1, 7, 9)),
+            EndpointRecoveryAction::ResetConnectionPath { generation: 1, .. }
+        ));
+        assert_eq!(
+            state.observe(started + bound + Duration::from_millis(250), &idle(11, 1)),
+            EndpointRecoveryAction::None
+        );
+        assert_eq!(
+            state.observe(started + bound * 2, &pending(11, 2, 8, 10)),
+            EndpointRecoveryAction::None,
+            "a stable identity cannot enter a path-reset loop across writer episodes"
+        );
+
+        assert_eq!(
+            state.observe(
+                started + bound * 2 + Duration::from_millis(250),
+                &idle(12, 0)
+            ),
+            EndpointRecoveryAction::None,
+            "identity replacement starts with observation, not an inherited action"
+        );
+        assert!(matches!(
+            state.observe(started + bound * 3, &pending(12, 1, 9, 11)),
+            EndpointRecoveryAction::ResetConnectionPath { generation: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn endpoint_recovery_counter_regression_is_not_path_reset_authority() {
+        let started = Instant::now();
+        let bound = endpoint_recovery_stall_bound(Duration::from_millis(159));
+        let mut state = EndpointRecoveryState::default();
+        assert_eq!(
+            state.observe(
+                started,
+                &endpoint_recovery_path_sample(vec![endpoint_recovery_connection(11, 5, None)])
+            ),
+            EndpointRecoveryAction::None
+        );
+        assert_eq!(
+            state.observe(
+                started + bound,
+                &endpoint_recovery_path_sample(vec![endpoint_recovery_connection(
+                    11,
+                    4,
+                    Some(endpoint_recovery_pending(
+                        7,
+                        9,
+                        bound,
+                        Duration::from_millis(250),
+                        65_536,
+                    )),
+                )])
+            ),
+            EndpointRecoveryAction::None,
+            "a regressed cumulative counter is unknown evidence and must fail closed"
+        );
+    }
+
+    #[test]
+    fn endpoint_recovery_exact_ack_stall_precedes_path_reset() {
+        let started = Instant::now();
+        let bound = endpoint_recovery_stall_bound(Duration::from_millis(159));
+        let mut state = EndpointRecoveryState::default();
+        assert_eq!(
+            state.observe(
+                started,
+                &endpoint_recovery_path_sample(vec![endpoint_recovery_connection(11, 0, None)])
+            ),
+            EndpointRecoveryAction::None
+        );
+        let action = state.observe(
+            started + bound,
+            &endpoint_recovery_path_sample(vec![endpoint_recovery_connection(
+                11,
+                1,
+                Some(endpoint_recovery_pending(7, 9, bound, bound, 0)),
+            )]),
+        );
+        assert!(matches!(
+            action,
+            EndpointRecoveryAction::Rebind {
+                trigger: EndpointRecoveryTrigger::TcpWriteStall { stable_id: 11, .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn endpoint_recovery_does_not_overlap_path_reset_with_rebind_recovery() {
+        let started = Instant::now();
+        let bound = endpoint_recovery_stall_bound(Duration::from_millis(159));
+        let mut state = EndpointRecoveryState::default();
+        assert_eq!(
+            state.observe(
+                started,
+                &endpoint_recovery_path_sample(vec![endpoint_recovery_connection(11, 0, None)])
+            ),
+            EndpointRecoveryAction::None
+        );
+        let hard_stall = endpoint_recovery_path_sample(vec![endpoint_recovery_connection(
+            11,
+            1,
+            Some(endpoint_recovery_pending(7, 9, bound, bound, 0)),
+        )]);
+        assert!(matches!(
+            state.observe(started + bound, &hard_stall),
+            EndpointRecoveryAction::Rebind { .. }
+        ));
+        state.note_rebind_succeeded(started + bound, 1);
+
+        let mut waiting_for_current_socket =
+            endpoint_recovery_path_sample(vec![endpoint_recovery_connection(
+                11,
+                2,
+                Some(endpoint_recovery_pending(
+                    7,
+                    9,
+                    bound + Duration::from_millis(250),
+                    bound + Duration::from_millis(250),
+                    0,
+                )),
+            )]);
+        waiting_for_current_socket.current_socket_rx_rebind_generation = 1;
+        assert_eq!(
+            state.observe(
+                started + bound + Duration::from_millis(250),
+                &waiting_for_current_socket,
+            ),
+            EndpointRecoveryAction::None,
+            "an in-flight Endpoint rebind owns recovery until every sampled connection authenticates the current socket"
+        );
+    }
+
     #[test]
     fn endpoint_recovery_rebinds_on_continuous_tcp_write_stall_despite_rx_progress() {
         let started = Instant::now();
@@ -7030,6 +7598,7 @@ mod tests {
                 tx_bytes: 100_000,
                 rx_bytes,
                 rtt,
+                black_holes_detected: 0,
                 current_socket_rx_rebind_generation: 0,
                 tcp_write_pressures: vec![TcpWritePressureSnapshot {
                     writer: 1,
@@ -7078,6 +7647,7 @@ mod tests {
                 tx_bytes: 100_000,
                 rx_bytes: 2_000,
                 rtt: Duration::from_millis(159),
+                black_holes_detected: 0,
                 current_socket_rx_rebind_generation: 0,
                 tcp_write_pressures: vec![TcpWritePressureSnapshot {
                     writer: 1,
@@ -7113,6 +7683,7 @@ mod tests {
                     tx_bytes: 100_000,
                     rx_bytes: 1_000 + socket_generation,
                     rtt: Duration::from_millis(100),
+                    black_holes_detected: 0,
                     current_socket_rx_rebind_generation: socket_generation,
                     tcp_write_pressures: vec![TcpWritePressureSnapshot {
                         writer: 1,
@@ -7128,6 +7699,7 @@ mod tests {
                     tx_bytes: 200_000,
                     rx_bytes: 2_000 + socket_generation,
                     rtt: Duration::from_millis(150),
+                    black_holes_detected: 0,
                     current_socket_rx_rebind_generation: socket_generation,
                     tcp_write_pressures: vec![TcpWritePressureSnapshot {
                         writer: 2,
@@ -7211,6 +7783,7 @@ mod tests {
                 tx_bytes: 100_000,
                 rx_bytes: 1_000 + socket_generation,
                 rtt: Duration::from_millis(100),
+                black_holes_detected: 0,
                 current_socket_rx_rebind_generation: socket_generation,
                 tcp_write_pressures: vec![
                     TcpWritePressureSnapshot {
@@ -7380,6 +7953,7 @@ mod tests {
                 tx_bytes,
                 rx_bytes: 1_000,
                 rtt,
+                black_holes_detected: 0,
                 current_socket_rx_rebind_generation: 0,
                 tcp_write_pressures: Vec::new(),
             }],
@@ -7425,6 +7999,7 @@ mod tests {
                 tx_bytes,
                 rx_bytes: 1_000,
                 rtt,
+                black_holes_detected: 0,
                 current_socket_rx_rebind_generation: 0,
                 tcp_write_pressures: Vec::new(),
             }],
@@ -7468,6 +8043,7 @@ mod tests {
                 tx_bytes,
                 rx_bytes,
                 rtt: Duration::from_millis(100),
+                black_holes_detected: 0,
                 current_socket_rx_rebind_generation: 0,
                 tcp_write_pressures: Vec::new(),
             }],
@@ -7521,6 +8097,7 @@ mod tests {
                         tx_bytes: first_tx,
                         rx_bytes: first_rx,
                         rtt: Duration::from_millis(100),
+                        black_holes_detected: 0,
                         current_socket_rx_rebind_generation: first_socket_rx_generation,
                         tcp_write_pressures: Vec::new(),
                     },
@@ -7529,6 +8106,7 @@ mod tests {
                         tx_bytes: second_tx,
                         rx_bytes: second_rx,
                         rtt: Duration::from_millis(150),
+                        black_holes_detected: 0,
                         current_socket_rx_rebind_generation: second_socket_rx_generation,
                         tcp_write_pressures: Vec::new(),
                     },
@@ -7627,6 +8205,7 @@ mod tests {
                 tx_bytes,
                 rx_bytes: 100,
                 rtt: Duration::from_millis(100),
+                black_holes_detected: 0,
                 current_socket_rx_rebind_generation: 0,
                 tcp_write_pressures: Vec::new(),
             }],
