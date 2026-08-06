@@ -56,7 +56,7 @@ Architecture:
 - [x] Repair each P0/P1 with a focused test.
 - [x] Write local results and update `CONTEXT.md`, `AGENTS.md`, `HANDOFF.md`,
   `TODO.md`, and `.learnings/`.
-- [ ] Commit coherent stages and push the current branch under standing
+- [x] Commit coherent stages and push the current branch under standing
   authorization.
 
 ## Task 7 — One fresh real-Mac discriminator

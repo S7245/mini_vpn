@@ -4,7 +4,41 @@
 
 ## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-05)
 
-- **Latest accepted position:** exact-source `a1e22ca` artifact
+- **Latest accepted position:** exact-source `f570353` artifact
+  `/tmp/mini_vpn_knife15_macos_20260805_111712.tar.gz` (SHA-256
+  `b0d3815e...`) passed baseline `34.319/52.001 Mbit/s`, direct
+  `17.151374 Mbit/s` without gaps, start/smoke, every preflight, seven mixed
+  cycles, and cleanup. Cycle 8 `tcp-forward` then had one complete initial
+  Target receiver-zero interval although the local sender had already
+  admitted `2,228,224B`; the exact transfer later completed.
+- The data/control streams used installed conn1 generation 2. Same-window
+  gateway/Exit, routes, interfaces, process, TUN, D16, Endpoint conservation,
+  and recovery remained healthy. This fires the auxiliary-replacement stop
+  rule: retain its bounded lifecycle protection but reject it as sufficient
+  first-stream service. Do not tune selectors, pool, MTU, windows, chunk,
+  Cubic, GSO, Endpoint, recovery, workload, or SLIs.
+- Reviewed implementation `f7260ee` gives every TUIC TCP stream relative
+  Quinn priority `original + 1` through Connect and its first accepted
+  nonempty business write, then restores the exact original priority under
+  the same Quinn connection lock. Blocked/empty writes remain armed. All
+  generic/native/D16 modes share one writer; UDP, queues, capacity, timers,
+  connection admission, and frozen values are unchanged.
+- Root `685+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  established Clippy, Knife15/Knife14 shell, vendored Quinn `38+3 ignored`,
+  quinn-proto `310`, docs, fmt/diff/secret, and review pass with no unresolved
+  P0/P1. Exact 32 MiB Endpoint capacity reached `240.076 Mbit/s` with final
+  `61,440/0/0B` and zero socket would-block. Result:
+  `docs/tech/2026-08-05-knife15-m2-quinn-new-stream-startup-service-local-results.md`.
+- Next pull/rebuild, keep Clash-TUN/every other VPN off, avoid deliberate
+  heavy non-test traffic, and take exactly one fresh `m2-ipv6-check ->
+  baseline -> direct-discriminator -> start -> smoke -> m2 -> status ->
+  stop`. Normal Apple Push/iCloud may remain. Preserve
+  `status/snapshot/stop` after failure. A consumed startup service plus the
+  same healthy-control installed-successor receiver zero rejects this
+  architecture and opens transport first-payload ACK/failover research. M3
+  remains blocked pending complete M2 plus cleanup acceptance.
+
+- **Previous accepted position:** exact-source `a1e22ca` artifact
   `/tmp/mini_vpn_knife15_macos_20260805_080607.tar.gz` (SHA-256
   `f5f6d933...`) passed baseline `19.183/50.639 Mbit/s`, direct
   `9.584823 Mbit/s` without gaps, start/smoke, IPv6/full-tunnel/real-client,

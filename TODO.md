@@ -4,7 +4,48 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-05 — ambient-traffic recovery ready for M2)
+#### Latest decision (2026-08-05 — Quinn new-stream startup service ready for M2)
+
+Exact-source `f570353` artifact
+`/tmp/mini_vpn_knife15_macos_20260805_111712.tar.gz` (SHA-256
+`b0d3815e...`) passed baseline/direct, every preflight, seven complete mixed
+cycles, and cleanup. Cycle 8 `tcp-forward` then lost the first complete Target
+receiver interval while the sender had already admitted `2,228,224B`. It
+ultimately transferred the exact `643,563,520B` with zero sender retransmits.
+
+Both new streams used installed conn1 generation 2. Gateway/Exit, routes,
+interfaces, process, TUN, D16, Endpoint conservation, and repaired recovery
+remained healthy. The auxiliary-replacement stop rule therefore fired. Do not
+repeat or tune another selector, replacement, pool, MTU, window, chunk, Cubic,
+GSO, Endpoint, recovery, workload, or SLI branch.
+
+Implementation `f7260ee` adds one deep TUIC startup writer plus the minimum
+vendored Quinn atomic scheduling seam. Each new TUIC TCP stream uses relative
+priority `original + 1` through Connect and its first accepted business write;
+the successful admission restores the original priority under the same Quinn
+connection lock. Empty/Pending writes do not consume it, later writes are
+ordinary, every generic/native/D16 mode shares it, and UDP is unchanged.
+
+Root `685+3 ignored`, main `2`, integration `10+4 ignored`, release, Clippy,
+shell, vendored Quinn/proto/docs, exact 32 MiB `240.076 Mbit/s` with
+`61,440/0/0B`, fmt/diff/secret, and review pass with no unresolved P0/P1.
+Result:
+`docs/tech/2026-08-05-knife15-m2-quinn-new-stream-startup-service-local-results.md`.
+
+Next:
+
+1. pull the pushed reviewed descendant and rebuild release on the test Mac;
+2. keep Clash-TUN/every other VPN off and avoid deliberate heavy non-test
+   traffic; normal Apple Push/iCloud may remain;
+3. run exactly one fresh `m2-ipv6-check -> baseline -> direct-discriminator ->
+   start -> smoke -> m2 -> status -> stop`;
+4. preserve `status/snapshot/stop` after any post-start failure;
+5. if startup consumption is present but the same healthy-control
+   installed-successor receiver zero recurs, reject this architecture and
+   open transport first-payload ACK/failover research; do not tune;
+6. keep M3 blocked until complete M2 plus cleanup acceptance.
+
+#### Previous decision (2026-08-05 — ambient-traffic recovery ready for M2)
 
 Exact-source `a1e22ca` artifact
 `/tmp/mini_vpn_knife15_macos_20260805_080607.tar.gz` (SHA-256

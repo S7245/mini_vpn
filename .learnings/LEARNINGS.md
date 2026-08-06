@@ -1,5 +1,30 @@
 # Learnings
 
+## 2026-08-05 - New multiplexed streams need bounded startup service
+
+- A transport generation can be authenticated, installed, epoch-qualified,
+  selected correctly, ACK-active, and still delay a new stream behind old
+  pending streams long enough to lose a complete receiver interval. Lifecycle
+  replacement and initial stream scheduling are separate responsibilities.
+- Put caller policy above the transport and atomic mechanics inside it. TUIC
+  owns “Connect plus first business payload needs startup service”; Quinn owns
+  queue insertion plus priority restoration under one connection lock.
+- Relative categorical authority avoids a parameter branch: preserve the
+  original priority, use exactly one higher class until the first positive
+  business admission, then restore the exact original. Empty and blocked
+  writes cannot consume the contract.
+- Preserve server-first protocols by sending Connect immediately. Do not hold
+  the header waiting for client payload merely to simplify the scheduling
+  boundary.
+- A one-shot per stream does not add bytes, queues, timers, or capacity. It
+  remains bounded by QUIC flow/congestion control and Endpoint pre-accounting;
+  real M2 is still the decisive sufficient-path test.
+- Code review must preserve established I/O error kinds across a new adapter.
+  Collapsing Quinn `ConnectionReset`/`NotConnected` into `Other` would silently
+  change existing lifecycle classification even though byte scheduling passed.
+- Result:
+  `docs/tech/2026-08-05-knife15-m2-quinn-new-stream-startup-service-local-results.md`.
+
 ## 2026-08-05 - Recovery and acceptance need exact demand ownership
 
 - Ownership presence is not application demand. A silent established TCP

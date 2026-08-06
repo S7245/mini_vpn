@@ -4,6 +4,8 @@ Date: 2026-08-05
 
 Status: **LOCAL IMPLEMENTATION AND REVIEW PASS — ONE FRESH M2 REQUIRED**
 
+Implementation: `f7260ee`
+
 Architecture:
 `docs/tech/2026-08-05-knife15-m2-quinn-new-stream-startup-service-architecture-spec.md`
 

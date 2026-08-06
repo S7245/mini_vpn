@@ -1,5 +1,33 @@
 # Errors
 
+## 2026-08-05 - Installed auxiliary successor still delayed a new stream
+
+- Exact-source `f570353` passed baseline/direct, every preflight, seven mixed
+  cycles, and cleanup, then cycle 8 forward produced a complete first Target
+  receiver-zero interval on installed conn1 generation 2. Same-window network
+  controls and local ownership were healthy.
+- This is the explicit auxiliary-replacement stop-rule outcome. Another pool
+  score, replacement, parameter change, or unchanged repeat would remain in a
+  falsified class.
+- Correct behavior is a bounded per-stream startup scheduling contract with
+  atomic Quinn priority restoration. A fresh recurrence after visible startup
+  consumption rejects that contract and opens first-payload ACK/failover
+  research instead of tuning it.
+
+## 2026-08-05 - Local gates exposed edition and zero-test command traps
+
+- A repair used Rust-2024 let-chain syntax in vendored quinn-proto, whose
+  crate edition does not accept it. The failure was compile compatibility, not
+  product behavior; use the equivalent nested condition and rerun the same
+  focused gate.
+- The first 32 MiB command used an incomplete module filter and reported
+  `running 0 tests`. A zero-test exit code is not a gate PASS. Resolve the
+  unique test name, require `running 1 test`, and retain its measured
+  throughput/conservation output.
+- Independent vendored Quinn commands must continue to bind the absolute
+  local quinn-proto patch; otherwise they validate the registry crate instead
+  of the fork under review.
+
 ## 2026-08-05 - Aggregate transport TX authorized false TCP endpoint recovery
 
 - Exact-source `a1e22ca` retained only Apple Push after the operator closed
