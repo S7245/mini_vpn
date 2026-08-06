@@ -117,6 +117,7 @@ SOAK_CONTINUE_DATA_QUALITY=0
 SOAK_VIOLATIONS_FILE=
 SOAK_SUCCESS_STATUS=complete
 SOAK_REAL_CLIENT_PROBE=0
+M2_REAL_CLIENT_EVIDENCE_DIR=m2-real-client
 M2_COMPLETE_CYCLE_INDEX=0
 
 ACTION="${1:---help}"
@@ -144,6 +145,7 @@ Usage:
   sudo -E bash scripts/knife15-macos-soak.sh m0
   sudo -E bash scripts/knife15-macos-soak.sh m1
   sudo -E bash scripts/knife15-macos-soak.sh m1-diagnostic
+  sudo -E bash scripts/knife15-macos-soak.sh m2-qualification
   sudo -E bash scripts/knife15-macos-soak.sh m2
   sudo -E bash scripts/knife15-macos-soak.sh stop
   sudo -E bash scripts/knife15-macos-soak.sh bundle
@@ -207,7 +209,7 @@ For a longitudinal diagnostic instead of formal acceptance, replace step 13
 with:
   sudo -E bash scripts/knife15-macos-soak.sh m1-diagnostic
 
-Never run m0, m1, m1-diagnostic, and m2 in one TUN run. Both M1 actions have a
+Never run m0, m1, m1-diagnostic, m2-qualification, and m2 in one TUN run. Both M1 actions have a
 28,800-second traffic/drain budget and normally take slightly more than eight
 wall hours.
 Use m1-diagnostic only when a complete longitudinal artifact is required:
@@ -231,9 +233,18 @@ routes and the active physical service DNS until stop):
  12. sudo -v
  13. sudo -E bash scripts/knife15-macos-soak.sh start
  14. sudo -E bash scripts/knife15-macos-soak.sh smoke
- 15. caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2
+15. caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2
  16. sudo -E bash scripts/knife15-macos-soak.sh status
- 17. sudo -E bash scripts/knife15-macos-soak.sh stop
+17. sudo -E bash scripts/knife15-macos-soak.sh stop
+
+Before another formal M2 after an initial-stream architecture or observer
+change, replace step 15 with:
+  caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2-qualification
+
+M2 qualification runs only one exact 300s forward + 300s reverse + 180s
+reverse-UDP + 10s short-forward cycle. It normally takes about 15 minutes,
+stops on the same data-quality/safety failures, and can never satisfy formal
+M2 acceptance. Always continue with status and stop.
 
 The background watchdog samples process/utun state and removes only the host
 routes owned by this run if mini_vpn exits. start proves Target readiness
@@ -767,11 +778,12 @@ m2_real_client_result_is_valid() {
 run_m2_real_client_probe() {
   local run_dir="$1"
   local label="$2"
-  local result_file="$run_dir/m2-real-client/${label}.txt"
-  local egress_body="$run_dir/m2-real-client/.${label}.egress-body.$$"
-  local egress_meta="$run_dir/m2-real-client/.${label}.egress-meta.$$"
-  local browser_body="$run_dir/m2-real-client/.${label}.browser-body.$$"
-  local browser_meta="$run_dir/m2-real-client/.${label}.browser-meta.$$"
+  local evidence_dir="${M2_REAL_CLIENT_EVIDENCE_DIR:-m2-real-client}"
+  local result_file="$run_dir/$evidence_dir/${label}.txt"
+  local egress_body="$run_dir/$evidence_dir/.${label}.egress-body.$$"
+  local egress_meta="$run_dir/$evidence_dir/.${label}.egress-meta.$$"
+  local browser_body="$run_dir/$evidence_dir/.${label}.browser-body.$$"
+  local browser_meta="$run_dir/$evidence_dir/.${label}.browser-meta.$$"
   local expected observed egress_remote egress_code egress_bytes
   local browser_remote browser_code browser_bytes
   local utun target dns_target physical_interface physical_gateway ipv6_interface
@@ -1148,6 +1160,7 @@ workload_command_matches() {
   [[ "$command_text" == *"knife15-macos-soak.sh m0" || \
     "$command_text" == *"knife15-macos-soak.sh m1" || \
     "$command_text" == *"knife15-macos-soak.sh m1-diagnostic" || \
+    "$command_text" == *"knife15-macos-soak.sh m2-qualification" || \
     "$command_text" == *"knife15-macos-soak.sh m2" ]]
 }
 
@@ -3130,6 +3143,7 @@ EOF_M2_PROFILE
 runner_self_test() {
   local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture service_fixture dns_fixture m2_route_bin m2_ifconfig_bin m2_networksetup_bin m2_dscacheutil_bin m2_curl_bin m2_route_state m2_run m2_result m2_schedule_run m2_test_profile m2_checkpoint_file m2_capture_run m2_ipv6_evidence original_m2_route_bin original_m2_ifconfig_bin original_m2_networksetup_bin original_m2_dscacheutil_bin original_m2_curl_bin collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir baseline_summary_text m0_profile m1_profile m2_profile m1_test_profile m0_run m1_stage_run m1_run m1_diagnostic_run m1_diagnostic_fail_run m1_diagnostic_formal_run m1_checkpoint_file m1_capture_run m1_formal_run m1_tcp_fixture m1_udp_fixture m0_fail_run direct_dir fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash bounded_status result_index result_label sample_index violations_before violation_count invalid_violations ipv6_class ipv6_interface cleanup_class
   local m2_record_fail_run quiescence_record_status m2_replay_log
+  local m2_qualification_run m2_qualification_fail_run
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/knife15-macos-self-test.XXXXXX")" || return 1
   good_log="$tmp/good.log"
   bad_log="$tmp/bad.log"
@@ -3633,6 +3647,8 @@ EOF_M2_FAKE_CURL
     die "self-test: M1 workload command rejected"
   workload_command_matches 'bash scripts/knife15-macos-soak.sh m1-diagnostic' || \
     die "self-test: M1 diagnostic workload command rejected"
+  workload_command_matches 'bash scripts/knife15-macos-soak.sh m2-qualification' || \
+    die "self-test: M2 qualification workload command rejected"
   workload_command_matches 'bash scripts/knife15-macos-soak.sh m2' || \
     die "self-test: M2 workload command rejected"
   ! workload_command_matches 'bash scripts/knife15-macos-soak.sh smoke' || \
@@ -4226,6 +4242,79 @@ EOF_FAKE_SLEEP
     die "self-test: compressed M2 UDP count mismatch"
   grep -Fxq complete "$m2_schedule_run/m2.status" || \
     die "self-test: successful M2 schedule status mismatch"
+  SOAK_STAGE=m2-qualification
+  SOAK_LABEL=M2-QUALIFICATION
+  SOAK_EVIDENCE_DIR=m2-qualification
+  SOAK_STATUS_FILE=m2-qualification.status
+  SOAK_REAL_CLIENT_PROBE=0
+  SOAK_CONTINUE_DATA_QUALITY=0
+  M0_ENFORCE_RUN_HEALTH=0
+  m2_qualification_run="$tmp/m2-qualification-run"
+  mkdir -p "$m2_qualification_run/m2-qualification"
+  printf 'timestamp\tevent\n' >"$m2_qualification_run/events.tsv"
+  : >"$M0_TEST_COMMAND_LOG"
+  run_m2_qualification_schedule \
+    "$m2_qualification_run" "$m2_test_profile" || \
+    die "self-test: compressed M2 qualification failed"
+  [[ "$(grep -Fc $'\tm2-qualification phase complete ' \
+    "$m2_qualification_run/events.tsv")" == "4" ]] || \
+    die "self-test: M2 qualification phase count mismatch"
+  for result_label in tcp-forward tcp-reverse udp-reverse short-forward-1; do
+    [[ "$(grep -Fc $'\tm2-qualification phase complete cycle=1 phase='"$result_label" \
+      "$m2_qualification_run/events.tsv")" == "1" ]] || \
+      die "self-test: M2 qualification exact phase missing: $result_label"
+  done
+  ! grep -Eq $'\tm2-qualification (active|idle|resume|final drain) ' \
+    "$m2_qualification_run/events.tsv" || \
+    die "self-test: M2 qualification entered a formal timeline window"
+  [[ "$(grep -Fc $'\tm2-qualification DNS complete cycle=1' \
+    "$m2_qualification_run/events.tsv")" == "1" ]] || \
+    die "self-test: M2 qualification DNS count mismatch"
+  [[ "$(grep -Fc $'\tm2-qualification cycle complete cycle=1' \
+    "$m2_qualification_run/events.tsv")" == "1" ]] || \
+    die "self-test: M2 qualification cycle identity mismatch"
+  grep -Fxq PASS_NON_ACCEPTANCE \
+    "$m2_qualification_run/m2-qualification.status" || \
+    die "self-test: M2 qualification success status mismatch"
+  [[ ! -e "$m2_qualification_run/m2.status" && \
+    ! -e "$m2_qualification_run/m2-pre-stop-verdict.txt" ]] || \
+    die "self-test: M2 qualification created formal acceptance evidence"
+  mkdir -p "$m2_qualification_run/m2-qualification-real-client"
+  printf '%s\n' \
+    'qualification_slo_evidence=PASS' \
+    'formal_m2_acceptance=NOT_RUN' \
+    >"$m2_qualification_run/m2-qualification-verdict.txt"
+  : >"$m2_qualification_run/mini_vpn.log"
+  write_summary "$m2_qualification_run"
+  grep -Fq -- '- m2_qualification_status: PASS_NON_ACCEPTANCE' \
+    "$m2_qualification_run/summary.md" || \
+    die "self-test: M2 qualification summary status mismatch"
+  grep -Fq -- '- m2_qualification_verdict: PASS_NON_ACCEPTANCE' \
+    "$m2_qualification_run/summary.md" || \
+    die "self-test: M2 qualification summary verdict mismatch"
+  grep -Fq -- '- m2_qualification_formal_m2_acceptance: NOT_RUN' \
+    "$m2_qualification_run/summary.md" || \
+    die "self-test: M2 qualification was promoted to formal acceptance"
+
+  m2_qualification_fail_run="$tmp/m2-qualification-fail-run"
+  mkdir -p "$m2_qualification_fail_run/m2-qualification"
+  printf 'timestamp\tevent\n' >"$m2_qualification_fail_run/events.tsv"
+  M0_TEST_IPERF_RECEIVER_ZERO=1
+  export M0_TEST_IPERF_RECEIVER_ZERO
+  if run_m2_qualification_schedule \
+    "$m2_qualification_fail_run" "$m2_test_profile"; then
+    die "self-test: M2 qualification continued a receiver-zero failure"
+  fi
+  grep -Fxq failed \
+    "$m2_qualification_fail_run/m2-qualification.status" || \
+    die "self-test: M2 qualification failure status mismatch"
+  grep -Fq $'\tm2-qualification phase failed cycle=1 phase=tcp-forward reason=receiver_zero_interval' \
+    "$m2_qualification_fail_run/events.tsv" || \
+    die "self-test: M2 qualification failure reason missing"
+  ! grep -Fq $'\tm2-qualification phase complete cycle=1 phase=tcp-reverse' \
+    "$m2_qualification_fail_run/events.tsv" || \
+    die "self-test: M2 qualification continued after failure"
+  unset M0_TEST_IPERF_RECEIVER_ZERO
   SOAK_STAGE=m1
   SOAK_LABEL=M1
   SOAK_EVIDENCE_DIR=m1
@@ -5215,6 +5304,8 @@ EOF_FAIL_IPERF
   usage_text="$(usage)"
   grep -Fq 'scripts/knife15-macos-soak.sh direct-discriminator' <<<"$usage_text" || \
     die "self-test: public direct continuity action missing from help"
+  grep -Fq 'scripts/knife15-macos-soak.sh m2-qualification' <<<"$usage_text" || \
+    die "self-test: public M2 qualification action missing from help"
   grep -Fq 'scripts/knife15-macos-soak.sh baseline-check' <<<"$usage_text" || \
     die "self-test: public baseline evidence replay action missing from help"
   grep -Fq 'scripts/knife15-macos-soak.sh m0' <<<"$usage_text" || \
@@ -6516,7 +6607,9 @@ m0_assert_run_healthy() {
       "$SOAK_STAGE health failed: Exit route actual=${exit_if:-missing} forbidden=$utun"
     return 1
   fi
-  if [[ "$SOAK_STAGE" == "m2" ]] && ! m2_full_tunnel_is_active; then
+  if [[ ( "$SOAK_STAGE" == "m2" || \
+    "$SOAK_STAGE" == "m2-qualification" ) ]] && \
+    ! m2_full_tunnel_is_active; then
     append_event_to "$run_dir" \
       "$SOAK_STAGE health failed: full-tunnel route, DNS, or IPv6 invariant"
     return 1
@@ -7014,6 +7107,68 @@ run_m2_schedule() {
   fi
 }
 
+run_m2_qualification_body() {
+  local run_dir="$1"
+  local profile_file="$2"
+  local target iperf_port dns_target dns_name tcp_secs udp_secs short_secs
+  local tcp_forward_bps tcp_reverse_bps udp_reverse_bps short_forward_bps
+  target="$(m0_profile_value "$profile_file" target)"
+  iperf_port="$(m0_profile_value "$profile_file" iperf_port)"
+  dns_target="$(m0_profile_value "$profile_file" dns_target)"
+  [[ "$dns_target" == "disabled" ]] && dns_target=""
+  dns_name="$(m0_profile_value "$profile_file" dns_name)"
+  tcp_secs="$(m0_profile_value "$profile_file" tcp_epoch_secs)"
+  udp_secs="$(m0_profile_value "$profile_file" udp_epoch_secs)"
+  short_secs="$(m0_profile_value "$profile_file" short_epoch_secs)"
+  tcp_forward_bps="$(m0_profile_value "$profile_file" steady_tcp_forward_bps)"
+  tcp_reverse_bps="$(m0_profile_value "$profile_file" steady_tcp_reverse_bps)"
+  udp_reverse_bps="$(m0_profile_value "$profile_file" steady_udp_reverse_bps)"
+  short_forward_bps="$(m0_profile_value "$profile_file" steady_short_forward_bps)"
+
+  M0_CYCLE_INDEX=1
+  M0_RESUME_PENDING=0
+  M2_COMPLETE_CYCLE_INDEX=0
+  append_event_to "$run_dir" \
+    "$SOAK_STAGE start exact_cycle=1 planned_secs=$((10#$tcp_secs * 2 + 10#$udp_secs + 10#$short_secs))"
+  run_m0_iperf_phase "$run_dir" "$target" "$iperf_port" 1 \
+    tcp-forward "$tcp_secs" "$tcp_forward_bps" 0 0 || return 1
+  run_m0_iperf_phase "$run_dir" "$target" "$iperf_port" 1 \
+    tcp-reverse "$tcp_secs" "$tcp_reverse_bps" 1 0 || return 1
+  run_m0_iperf_phase "$run_dir" "$target" "$iperf_port" 1 \
+    udp-reverse "$udp_secs" "$udp_reverse_bps" 1 1 || return 1
+  run_m0_iperf_phase "$run_dir" "$target" "$iperf_port" 1 \
+    short-forward-1 "$short_secs" "$short_forward_bps" 0 0 || return 1
+  run_m0_dns_phase "$run_dir" "$dns_target" "$dns_name" 1 || return 1
+  M2_COMPLETE_CYCLE_INDEX=1
+  if [[ "${SOAK_REAL_CLIENT_PROBE:-0}" == "1" ]]; then
+    run_m2_real_client_probe "$run_dir" qualification_cycle_001 || {
+      append_event_to "$run_dir" \
+        "$SOAK_STAGE real client failed cycle=1"
+      return 1
+    }
+  fi
+  append_event_to "$run_dir" "$SOAK_STAGE cycle complete cycle=1"
+  append_event_to "$run_dir" "$SOAK_STAGE complete exact_cycle=1"
+  m0_progress "$SOAK_LABEL exact mixed cycle complete"
+}
+
+run_m2_qualification_schedule() {
+  local run_dir="$1"
+  local profile_file="$2"
+  local status_file="$run_dir/m2-qualification.status"
+  local result
+  printf '%s\n' running >"$status_file" || return 1
+  if run_m2_qualification_body "$run_dir" "$profile_file"; then
+    printf '%s\n' PASS_NON_ACCEPTANCE >"$status_file" || return 1
+    return 0
+  else
+    result=$?
+    printf '%s\n' failed >"$status_file" || return 1
+    append_event_to "$run_dir" "$SOAK_STAGE failed"
+    return "$result"
+  fi
+}
+
 run_smoke() {
   local run_dir utun target exit_host smoke_dir iperf_port duration parallel dns_name dns_target smoke_timeout_secs
   require_root
@@ -7077,7 +7232,8 @@ run_m0_action() {
     ! -e "$run_dir/m0" && ! -e "$run_dir/m1.status" && \
     ! -e "$run_dir/m1-workload.txt" && ! -e "$run_dir/m1" && \
     ! -e "$run_dir/m2.status" && ! -e "$run_dir/m2-workload.txt" && \
-    ! -e "$run_dir/m2" ]] || \
+    ! -e "$run_dir/m2" && ! -e "$run_dir/m2-qualification.status" && \
+    ! -e "$run_dir/m2-qualification" ]] || \
     die "this TUN run already has soak evidence; stop and start a fresh run"
   validate_baseline_dir_path "$M0_BASELINE_DIR" || \
     die "M0_BASELINE_DIR must be the simple /tmp baseline directory printed by baseline"
@@ -7301,7 +7457,8 @@ run_m1_action() {
     ! -e "$run_dir/m0" && ! -e "$run_dir/m1.status" && \
     ! -e "$run_dir/m1-workload.txt" && ! -e "$run_dir/m1" && \
     ! -e "$run_dir/m2.status" && ! -e "$run_dir/m2-workload.txt" && \
-    ! -e "$run_dir/m2" ]] || \
+    ! -e "$run_dir/m2" && ! -e "$run_dir/m2-qualification.status" && \
+    ! -e "$run_dir/m2-qualification" ]] || \
     die "this TUN run already has soak evidence; stop and start a fresh run"
   [[ -z "$M0_BASELINE_DIR" && -z "$M0_DIRECT_DIR" ]] || \
     die "$action_description requires M0_BASELINE_DIR and M0_DIRECT_DIR to be unset"
@@ -7626,29 +7783,57 @@ m2_workload_slo() {
 }
 
 run_m2_action() {
+  local execution_mode="${1:-formal}"
   local run_dir utun target exit_host iperf_port dns_target dns_name
   local profile_file free_kb command_name ipv6_evidence_file duration
   local data_plane_values endpoint_values data_plane_samples_before
   local endpoint_samples_before quiescence_timeout_secs quiescence_snapshot
   local quiescence_status
+  local action_description stage label evidence_dir status_file
+  local baseline_evidence_dir direct_evidence_dir
+  case "$execution_mode" in
+    formal)
+      action_description="formal M2"
+      stage=m2
+      label=M2
+      evidence_dir=m2
+      status_file=m2.status
+      M2_REAL_CLIENT_EVIDENCE_DIR=m2-real-client
+      ;;
+    qualification)
+      action_description="M2 qualification"
+      stage=m2-qualification
+      label=M2-QUALIFICATION
+      evidence_dir=m2-qualification
+      status_file=m2-qualification.status
+      M2_REAL_CLIENT_EVIDENCE_DIR=m2-qualification-real-client
+      ;;
+    *)
+      die "unknown M2 execution mode: $execution_mode"
+      ;;
+  esac
   require_root
   validate_m2_formal_config || \
-    die "formal M2 requires the frozen 86400s schedule and 30s sampling; unset M2_* duration overrides"
+    die "$action_description requires frozen M2 rates/durations and 30s sampling; unset M2_* overrides"
   [[ "$(m2_formal_count_model)" == \
     "$M2_EXPECTED_CYCLES $M2_EXPECTED_TCP_RESULTS $M2_EXPECTED_UDP_RESULTS $M2_EXPECTED_PHASE_RESULTS" ]] || \
-    die "formal M2 count model does not match its immutable evidence contract"
+    die "$action_description requires the immutable formal M2 count model"
   m2_source_is_accepted || \
-    die "formal M2 requires source at 5e7a97c or a descendant"
+    die "$action_description requires source at 5e7a97c or a descendant"
   run_dir="$(run_dir_from_state)" || die "no Knife15 run state"
+  baseline_evidence_dir="$run_dir/${evidence_dir}-baseline"
+  direct_evidence_dir="$run_dir/${evidence_dir}-direct"
   active_pid || die "mini_vpn is not running"
   workload_matches_run && die "a soak workload is already running"
   [[ ! -e "$run_dir/m0.status" && ! -e "$run_dir/m0" && \
     ! -e "$run_dir/m1.status" && ! -e "$run_dir/m1" && \
-    ! -e "$run_dir/m2.status" && ! -e "$run_dir/m2" ]] || \
+    ! -e "$run_dir/m2.status" && ! -e "$run_dir/m2" && \
+    ! -e "$run_dir/m2-qualification.status" && \
+    ! -e "$run_dir/m2-qualification" ]] || \
     die "this TUN run already has soak evidence; stop and start a fresh run"
   [[ -z "$M0_BASELINE_DIR" && -z "$M0_DIRECT_DIR" && \
     -z "$M1_BASELINE_DIR" && -z "$M1_DIRECT_DIR" ]] || \
-    die "formal M2 requires every M0/M1 baseline and direct variable to be unset"
+    die "$action_description requires every M0/M1 baseline and direct variable to be unset"
   validate_baseline_dir_path "$M2_BASELINE_DIR" || \
     die "M2_BASELINE_DIR must be the simple /tmp baseline directory printed by baseline"
   [[ -d "$M2_BASELINE_DIR" && ! -L "$M2_BASELINE_DIR" ]] || \
@@ -7659,7 +7844,7 @@ run_m2_action() {
     die "M2_DIRECT_DIR must be an existing non-symlink directory"
   free_kb="$(free_kb_for_path "$run_dir")"
   [[ "$free_kb" =~ ^[0-9]+$ ]] && ((10#$free_kb >= M2_MIN_FREE_KB)) || \
-    die "formal M2 requires at least 4GiB free before evidence creation"
+    die "$action_description requires at least 4GiB free before evidence creation"
 
   utun="$(read_state utun)"
   target="$(read_state target)"
@@ -7670,7 +7855,7 @@ run_m2_action() {
   duration="$(read_state duration)"
   validate_positive_integer "$duration" || die "recorded smoke duration is invalid"
   quiescence_timeout_secs=$((10#$duration + 30))
-  [[ -n "$dns_target" ]] || die "formal M2 requires DNS_TARGET"
+  [[ -n "$dns_target" ]] || die "$action_description requires DNS_TARGET"
   [[ "$(route_interface "$target")" == "$utun" ]] || \
     die "TARGET no longer routes through $utun"
   [[ "$(route_interface "$dns_target")" == "$utun" ]] || \
@@ -7681,40 +7866,41 @@ run_m2_action() {
   if ! write_m2_ipv6_route_evidence "$ipv6_evidence_file"; then
     append_event_to "$run_dir" \
       "m2 preflight failed: IPv6 classification=$M2_IPV6_ROUTE_CLASSIFICATION interface=$M2_IPV6_ROUTE_INTERFACE status=$M2_IPV6_ROUTE_STATUS"
-    die "formal M2 IPv6 preflight failed classification=$M2_IPV6_ROUTE_CLASSIFICATION interface=$M2_IPV6_ROUTE_INTERFACE; evidence: $ipv6_evidence_file"
+    die "$action_description IPv6 preflight failed classification=$M2_IPV6_ROUTE_CLASSIFICATION interface=$M2_IPV6_ROUTE_INTERFACE; evidence: $ipv6_evidence_file"
   fi
   network_control_is_sufficient "$run_dir" 5 && network_control_is_recent || \
-    die "formal M2 requires complete, recent Exit and physical-interface controls"
+    die "$action_description requires complete, recent Exit and physical-interface controls"
   tcp_pool_activity_is_idle "$run_dir/mini_vpn.log" || \
-    die "formal M2 requires fully drained TCP-pool ownership after smoke"
+    die "$action_description requires fully drained TCP-pool ownership after smoke"
   for command_name in jq iperf3 dig curl route networksetup dscacheutil git; do
     require_command "$command_name"
   done
   validate_m0_baseline_pair "$M2_BASELINE_DIR" "$target" || \
     die "M2 baseline must contain valid nonzero TCP forward/reverse results"
   validate_direct_continuity_dir "$M2_DIRECT_DIR" "$M2_BASELINE_DIR" "$target" || \
-    die "formal M2 requires a matching 300s direct continuity PASS completed within 15 minutes"
+    die "$action_description requires a matching 300s direct continuity PASS completed within 15 minutes"
 
-  mkdir "$run_dir/m2" "$run_dir/m2-baseline" "$run_dir/m2-direct" \
-    "$run_dir/m2-real-client" || die "cannot create M2 evidence directories"
+  mkdir "$run_dir/$evidence_dir" "$baseline_evidence_dir" "$direct_evidence_dir" \
+    "$run_dir/$M2_REAL_CLIENT_EVIDENCE_DIR" || \
+    die "cannot create M2 evidence directories"
   cp "$M2_BASELINE_DIR/direct-forward.json" \
-    "$run_dir/m2-baseline/direct-forward.json" || die "cannot preserve M2 forward baseline"
+    "$baseline_evidence_dir/direct-forward.json" || die "cannot preserve M2 forward baseline"
   cp "$M2_BASELINE_DIR/direct-reverse.json" \
-    "$run_dir/m2-baseline/direct-reverse.json" || die "cannot preserve M2 reverse baseline"
-  cp "$M2_DIRECT_DIR/manifest.txt" "$run_dir/m2-direct/manifest.txt" || \
+    "$baseline_evidence_dir/direct-reverse.json" || die "cannot preserve M2 reverse baseline"
+  cp "$M2_DIRECT_DIR/manifest.txt" "$direct_evidence_dir/manifest.txt" || \
     die "cannot preserve M2 direct manifest"
   cp "$M2_DIRECT_DIR/direct-forward-300s.json" \
-    "$run_dir/m2-direct/direct-forward-300s.json" || \
+    "$direct_evidence_dir/direct-forward-300s.json" || \
     die "cannot preserve M2 direct result"
   printf '%s\n' \
     'timestamp,label,rss_kib,fd_count,thread_rows,endpoint_available_bytes,endpoint_live_bytes,endpoint_outstanding_bytes,active_relays,total_relays,fake_ip_active,fake_ip_registered,dns_forged,dns_dropped,active_leases,replayed_relaying_handles,controlled_active_relays,replay_invalid' \
     >"$run_dir/m2-checkpoints.csv" || die "cannot create M2 checkpoint evidence"
-  profile_file="$run_dir/m2-workload.txt"
-  printf '%s\n' preparing >"$run_dir/m2.status"
+  profile_file="$run_dir/${evidence_dir}-workload.txt"
+  printf '%s\n' preparing >"$run_dir/$status_file"
   if ! write_m2_profile "$M2_BASELINE_DIR" "$profile_file" "$target" \
     "$iperf_port" "$dns_target" "$dns_name"; then
-    printf '%s\n' failed >"$run_dir/m2.status"
-    append_event_to "$run_dir" "m2 failed: workload profile derivation"
+    printf '%s\n' failed >"$run_dir/$status_file"
+    append_event_to "$run_dir" "$stage failed: workload profile derivation"
     die "cannot derive M2 workload profile"
   fi
   printf '%s\n' \
@@ -7724,19 +7910,19 @@ run_m2_action() {
     "direct_result_sha256=$(sha256_file "$M2_DIRECT_DIR/direct-forward-300s.json")" \
     >>"$profile_file" || die "cannot bind direct evidence to M2 profile"
   append_event_to "$run_dir" \
-    "m2 prepared baseline=$(basename "$M2_BASELINE_DIR") profile=$(sha256_file "$profile_file")"
+    "$stage prepared baseline=$(basename "$M2_BASELINE_DIR") profile=$(sha256_file "$profile_file")"
   activate_m2_full_tunnel "$run_dir" || {
-    printf '%s\n' failed >"$run_dir/m2.status"
+    printf '%s\n' failed >"$run_dir/$status_file"
     die "M2 full-tunnel activation failed or rolled back; use status/snapshot/stop"
   }
   M2_CURL_BIN="$(command -v curl)"
   M0_TRACK_CHILD=1
   M0_ENFORCE_RUN_HEALTH=1
   M0_ACTIVE_RUN_DIR="$run_dir"
-  SOAK_STAGE=m2
-  SOAK_LABEL=M2
-  SOAK_EVIDENCE_DIR=m2
-  SOAK_STATUS_FILE=m2.status
+  SOAK_STAGE="$stage"
+  SOAK_LABEL="$label"
+  SOAK_EVIDENCE_DIR="$evidence_dir"
+  SOAK_STATUS_FILE="$status_file"
   SOAK_SUCCESS_STATUS=complete
   SOAK_CONTINUE_DATA_QUALITY=0
   SOAK_VIOLATIONS_FILE=
@@ -7748,16 +7934,16 @@ run_m2_action() {
   read -r endpoint_samples_before _ <<<"$endpoint_values"
   [[ "$data_plane_samples_before" =~ ^[0-9]+$ && \
     "$endpoint_samples_before" =~ ^[0-9]+$ ]] || {
-    printf '%s\n' failed >"$run_dir/m2.status"
-    append_event_to "$run_dir" "m2 failed: controlled-drain baseline"
+    printf '%s\n' failed >"$run_dir/$status_file"
+    append_event_to "$run_dir" "$stage failed: controlled-drain baseline"
     die "M2 cannot establish the controlled-drain baseline; use status/snapshot/stop"
   }
   if ! run_m2_real_client_probe "$run_dir" preflight; then
-    printf '%s\n' failed >"$run_dir/m2.status"
-    append_event_to "$run_dir" "m2 failed: real-client preflight"
-    die "M2 real-client preflight failed; no 24-hour workload ran; use status/snapshot/stop"
+    printf '%s\n' failed >"$run_dir/$status_file"
+    append_event_to "$run_dir" "$stage failed: real-client preflight"
+    die "$action_description real-client preflight failed; no workload ran; use status/snapshot/stop"
   fi
-  echo "Waiting for formal M2 controlled-workload drain: hard_timeout=${quiescence_timeout_secs}s"
+  echo "Waiting for $action_description controlled-workload drain: hard_timeout=${quiescence_timeout_secs}s"
   record_m2_full_tunnel_quiescence "$run_dir" \
     "$profile_file" "$data_plane_samples_before" "$endpoint_samples_before" \
     "$quiescence_timeout_secs"
@@ -7765,38 +7951,71 @@ run_m2_action() {
   if [[ "$quiescence_status" != "0" ]]; then
     quiescence_snapshot="$(m2_full_tunnel_quiescence_snapshot \
       "$run_dir/mini_vpn.log" "$profile_file")"
-    printf '%s\n' failed >"$run_dir/m2.status"
+    printf '%s\n' failed >"$run_dir/$status_file"
     if [[ "$quiescence_status" == "2" ]]; then
       append_event_to "$run_dir" \
-        "m2 failed: cannot record controlled-drain snapshot=$quiescence_snapshot"
+        "$stage failed: cannot record controlled-drain snapshot=$quiescence_snapshot"
       die "M2 cannot record controlled-drain evidence; use status/snapshot/stop"
     fi
     if ! m0_assert_run_healthy "$run_dir"; then
       append_event_to "$run_dir" \
-        "m2 failed: controlled-drain run health snapshot=$quiescence_snapshot"
+        "$stage failed: controlled-drain run health snapshot=$quiescence_snapshot"
       die "M2 became unhealthy during controlled drain; use status/snapshot/stop"
     fi
     append_event_to "$run_dir" \
-      "m2 failed: controlled-drain ownership/evidence snapshot=$quiescence_snapshot"
-    die "M2 controlled workload did not drain or replay evidence was inconsistent before the 24-hour schedule; use status/snapshot/stop"
+      "$stage failed: controlled-drain ownership/evidence snapshot=$quiescence_snapshot"
+    die "$action_description controlled workload did not drain or replay evidence was inconsistent before its schedule; use status/snapshot/stop"
   fi
   quiescence_snapshot="$(m2_full_tunnel_quiescence_snapshot \
     "$run_dir/mini_vpn.log" "$profile_file")"
   append_event_to "$run_dir" \
-    "m2 controlled drain complete snapshot=$quiescence_snapshot"
+    "$stage controlled drain complete snapshot=$quiescence_snapshot"
 
   M0_IPERF3_BIN="$(command -v iperf3)"
   M0_DIG_BIN="$(command -v dig)"
   M0_SLEEP_BIN=/bin/sleep
   if ! register_m0_workload; then
     clear_workload_state
-    printf '%s\n' failed >"$run_dir/m2.status"
-    append_event_to "$run_dir" "m2 failed: workload identity registration"
+    printf '%s\n' failed >"$run_dir/$status_file"
+    append_event_to "$run_dir" "$stage failed: workload identity registration"
     die "cannot establish identity-verified M2 workload state"
   fi
   trap "interrupt_m0 '$run_dir' INT" INT
   trap "interrupt_m0 '$run_dir' TERM" TERM
   trap "interrupt_m0 '$run_dir' HUP" HUP
+  if [[ "$execution_mode" == "qualification" ]]; then
+    echo "Starting Knife15 M2 qualification; one exact mixed cycle takes about 15 minutes."
+    echo "This action can never satisfy formal M2 acceptance."
+    if run_m2_qualification_schedule "$run_dir" "$profile_file"; then
+      trap - INT TERM HUP
+      clear_workload_state
+      sample_once_for "$run_dir" || true
+      if ! m0_assert_run_healthy "$run_dir" || \
+        ! network_control_is_sufficient "$run_dir" 5 || \
+        ! conservation_check_file "$run_dir/mini_vpn.log"; then
+        printf '%s\n' failed >"$run_dir/$status_file"
+        append_event_to "$run_dir" \
+          "$stage failed: final health, network, or Endpoint evidence"
+        write_summary "$run_dir"
+        die "M2 qualification traffic passed but final safety evidence failed; use status/snapshot/stop"
+      fi
+      printf '%s\n' \
+        'qualification_slo_evidence=PASS' \
+        'formal_m2_acceptance=NOT_RUN' \
+        >"$run_dir/m2-qualification-verdict.txt" || \
+        die "cannot record M2 qualification verdict"
+      write_summary "$run_dir"
+      echo "PASS: M2 one-cycle qualification completed; this is not formal M2 acceptance."
+      echo "run_dir=$run_dir"
+      echo "Next: sudo -E bash scripts/knife15-macos-soak.sh status"
+      echo "Then: sudo -E bash scripts/knife15-macos-soak.sh stop"
+      return 0
+    fi
+    trap - INT TERM HUP
+    clear_workload_state
+    sample_once_for "$run_dir" || true
+    die "M2 qualification workload failed; full tunnel and TUN remain for status/snapshot/stop evidence"
+  fi
   echo "Starting formal Knife15 M2 workload; planned traffic/drain time is 86400 seconds."
   echo "Reserve about 25 wall-clock hours; full-tunnel DNS/routes remain owned until stop."
   if run_m2_schedule "$run_dir" "$profile_file"; then
@@ -7845,6 +8064,8 @@ show_status() {
   echo "m1_status=$(sed -n '1p' "$run_dir/m1.status" 2>/dev/null || echo not_run)"
   echo "m1_mode=$(sed -n '1p' "$run_dir/m1-mode" 2>/dev/null || echo not_run)"
   echo "m2_status=$(sed -n '1p' "$run_dir/m2.status" 2>/dev/null || echo not_run)"
+  echo "m2_qualification_status=$(sed -n '1p' \
+    "$run_dir/m2-qualification.status" 2>/dev/null || echo not_run)"
   echo "m2_full_tunnel=$(read_state m2.full_tunnel 2>/dev/null || echo not_run)"
   if [[ -f "$run_dir/m2-ipv6-preflight.txt" ]]; then
     echo "m2_ipv6_preflight_classification=$(m0_profile_value \
@@ -8040,6 +8261,63 @@ append_m2_summary() {
 - m2_cleanup_restored: $cleanup_restored
 - formal_m2_acceptance: $formal_m2_acceptance
 EOF_M2_SUMMARY
+}
+
+append_m2_qualification_summary() {
+  local run_dir="$1"
+  local status phase_results phase_failures cycles dns
+  local tcp_results udp_results tcp_gap udp_loss invalid_results
+  local sender_zero receiver_zero real_results invalid_real verdict=NOT_RUN
+  status="$(sed -n '1p' \
+    "$run_dir/m2-qualification.status" 2>/dev/null || true)"
+  status="${status:-not_run}"
+  phase_results="$(grep -Fc $'\tm2-qualification phase complete ' \
+    "$run_dir/events.tsv" 2>/dev/null || true)"
+  phase_failures="$(grep -Fc $'\tm2-qualification phase failed ' \
+    "$run_dir/events.tsv" 2>/dev/null || true)"
+  cycles="$(grep -Fc $'\tm2-qualification cycle complete cycle=1' \
+    "$run_dir/events.tsv" 2>/dev/null || true)"
+  dns="$(grep -Fc $'\tm2-qualification DNS complete cycle=1' \
+    "$run_dir/events.tsv" 2>/dev/null || true)"
+  read -r tcp_results udp_results tcp_gap udp_loss invalid_results \
+    sender_zero receiver_zero \
+    <<<"$(m0_result_envelope "$run_dir/m2-qualification")"
+  read -r real_results invalid_real \
+    <<<"$(m2_real_client_envelope \
+      "$run_dir/m2-qualification-real-client")"
+  if [[ -f "$run_dir/m2-qualification-verdict.txt" && \
+    ! -L "$run_dir/m2-qualification-verdict.txt" && \
+    "$(sed -n '1p' "$run_dir/m2-qualification-verdict.txt")" == \
+      "qualification_slo_evidence=PASS" && \
+    "$(sed -n '2p' "$run_dir/m2-qualification-verdict.txt")" == \
+      "formal_m2_acceptance=NOT_RUN" && \
+    "$(awk 'END { print NR + 0 }' \
+      "$run_dir/m2-qualification-verdict.txt")" == "2" ]]; then
+    verdict=PASS_NON_ACCEPTANCE
+  elif [[ "$status" != "not_run" ]]; then
+    verdict=MISMATCH
+  fi
+  cat >>"$run_dir/summary.md" <<EOF_M2_QUALIFICATION_SUMMARY
+
+## Knife15 M2 Qualification
+
+- m2_qualification_status: $status
+- m2_qualification_phase_results: ${phase_results:-0}
+- m2_qualification_phase_failures: ${phase_failures:-0}
+- m2_qualification_cycles: ${cycles:-0}
+- m2_qualification_dns_results: ${dns:-0}
+- m2_qualification_real_client_results: ${real_results:-0}
+- m2_qualification_invalid_real_client_results: ${invalid_real:-0}
+- m2_qualification_tcp_results: ${tcp_results:-0}
+- m2_qualification_udp_results: ${udp_results:-0}
+- m2_qualification_tcp_max_sender_receiver_gap_bytes: ${tcp_gap:-unknown}
+- m2_qualification_udp_max_loss_percent: ${udp_loss:-unknown}
+- m2_qualification_invalid_result_files: ${invalid_results:-0}
+- m2_qualification_sender_zero_intervals: ${sender_zero:-0}
+- m2_qualification_receiver_zero_intervals: ${receiver_zero:-0}
+- m2_qualification_verdict: $verdict
+- m2_qualification_formal_m2_acceptance: NOT_RUN
+EOF_M2_QUALIFICATION_SUMMARY
 }
 
 write_summary() {
@@ -8561,6 +8839,7 @@ baselines, resource slopes, fault-window event markers, QUIC deltas, TUN
 counters, close-tail ownership, and cleanup together.
 EOF_SUMMARY
   append_m2_summary "$run_dir"
+  append_m2_qualification_summary "$run_dir"
 }
 
 bundle_is_finalized() {
@@ -8787,8 +9066,11 @@ case "$ACTION" in
   m1-diagnostic)
     run_m1_action diagnostic
     ;;
+  m2-qualification)
+    run_m2_action qualification
+    ;;
   m2)
-    run_m2_action
+    run_m2_action formal
     ;;
   stop)
     stop_runner

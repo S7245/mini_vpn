@@ -2,11 +2,14 @@
 
 Date: 2026-07-30
 
-Status: **READY — implementation commit `4dac87c` or a descendant required**
+Status: **QUALIFICATION FIRST — use a reviewed descendant containing the
+`m2-qualification` action; formal M2 remains blocked**
 
-This is the only reviewed M2 sequence. It runs a controlled IPv4 full tunnel
-for 24 hours and temporarily changes the active physical network service DNS.
-`stop` is mandatory even after a successful `m2`.
+This is the only reviewed M2 sequence. The current next run is the one-cycle
+qualification, not the 24-hour formal M2. It runs the same controlled IPv4
+full tunnel and temporarily changes the active physical network service DNS,
+but stops after one exact mixed cycle in about 15 minutes. `stop` is mandatory
+even after a successful `m2-qualification`.
 
 ## Before Opening The Test Terminal
 
@@ -222,44 +225,54 @@ Continue immediately. M2 must consume this evidence within 15 minutes.
 If the direct discriminator fails, no TUN was started; preserve its directory
 and restore IPv6 using the pre-start branch in section 8.
 
-## 6. Start, Smoke, And M2
+## 6. Start, Smoke, And One-Cycle Qualification
+
+Before invoking `m2-qualification`, wait until the analysis agent reports that
+the bounded Exit observer is active on `.33`. Do not run the Exit observer on
+the Mac. It is a 96-byte header-oriented, target/port-filtered server-side
+diagnostic with a two-hour watchdog and fixed-size ring.
 
 ```bash
 sudo -v
 sudo -E bash scripts/knife15-macos-soak.sh start
 sudo -E bash scripts/knife15-macos-soak.sh smoke
-caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2
+caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2-qualification
 ```
 
 Do not press `Ctrl+C`, close the terminal, start Clash, or change the network.
-Before starting the 24-hour schedule, `m2` waits up to the existing smoke hard
-timeout (normally about 50 seconds) for fresh Endpoint conservation, zero
+Before starting its exact mixed cycle, `m2-qualification` waits up to the
+existing smoke hard timeout (normally about 50 seconds) for fresh Endpoint
+conservation, zero
 runner-controlled TCP relays, valid lifecycle replay, and zero DNS drops.
 Ambient Apple/system relays and fake-IP entries are allowed and recorded. A
-failure here saves the 24-hour run and leaves the TUN/full tunnel available
+failure here saves a long run and leaves the TUN/full tunnel available
 for `status/snapshot/stop`.
 
-The `m2` command has exactly 24 hours of planned traffic/drain time plus DNS,
-HTTPS, health, and transition overhead. Reserve about 25 hours.
+The qualification runs one 300-second forward TCP, one 300-second reverse TCP,
+one 180-second reverse UDP, and one 10-second short forward, plus preflight,
+DNS, HTTPS, health, and transition overhead. Reserve about 15–20 minutes. A
+success prints `PASS_NON_ACCEPTANCE`; it deliberately cannot create a formal
+M2 verdict.
 
 During M2, the Mac's public IPv4 should be the Exit VPS. That is expected.
 The runner blocks a routable physical IPv6 path instead of claiming a
 dual-stack leak-free result.
 
-If `m2` returns PASS, it will say cleanup acceptance is pending. That is not
-the final acceptance; continue to the next section.
+Do not replace this action with `m2` until the matching Mac and Exit evidence
+has been reviewed and a later accepted position explicitly reopens formal M2.
 
 ## 7. Mandatory Status And Stop
 
-After `m2` returns, successful or failed:
+After `m2-qualification` returns, successful or failed:
 
 ```bash
 sudo -E bash scripts/knife15-macos-soak.sh status
 sudo -E bash scripts/knife15-macos-soak.sh stop
 ```
 
-`stop` restores DNS/routes, stops the owned TUN, writes final acceptance, scans
-secrets, creates one immutable bundle, and prints its SHA-256.
+`stop` restores DNS/routes, stops the owned TUN, records qualification cleanup,
+keeps formal M2 acceptance at `NOT_RUN`, scans secrets, creates one immutable
+bundle, and prints its SHA-256.
 
 Send both lines:
 
