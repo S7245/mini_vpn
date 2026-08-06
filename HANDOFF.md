@@ -4,7 +4,34 @@
 
 ## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-06)
 
-- **Latest accepted position:** exact-source `bfaba9e` artifact
+- **Latest accepted position:** exact-source `0c521fa` artifact
+  `/tmp/mini_vpn_knife15_macos_20260806_101142.tar.gz` (SHA-256
+  `2a45314d...`) passed baseline `34.964/8.262 Mbit/s`, direct
+  `13.539 Mbit/s` without gaps, start/smoke, every qualification preflight,
+  the exact `300 + 300 + 180 + 10` second cycle, DNS/real-client checks, and
+  cleanup. Verdict is `PASS_NON_ACCEPTANCE`; formal M2 is `NOT_RUN`.
+- Qualification TCP forward/reverse/short had zero sender/receiver intervals;
+  max sender/receiver gap was `7,208,960B`. Reverse UDP loss was `0.223184%`.
+  Endpoint max/final was `61,440B / 61,403/0/0B`, with zero TUN/interface
+  errors and complete route/DNS/process cleanup.
+- No path reset fired. Conn0 had black holes `0 -> 12` but exact writer wait
+  only `274,915us`, below the unchanged minimum `2s` bound; conn1 stayed at
+  zero. This is a correct healthy comparator and real-WAN false-positive
+  check, not a predicate mismatch. The selected failure remains distinct at
+  `7,001,335us` plus `144` black holes on the same connection.
+- Two `Stopped(0)` write lines were timed-transfer close tails: the peer had
+  ended, every D16 queue/lease/reservation was zero, data SLIs passed, and no
+  ownership debt remained. They explain `internal_failure_scan=REVIEW` but
+  are not active-transfer failures. Result:
+  `docs/tech/2026-08-06-knife15-m2-connection-local-path-state-recovery-macos-qualification-results.md`.
+- Next pull/rebuild the pushed descendant and run exactly one fresh formal
+  `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke -> m2
+  -> status -> stop` with every other VPN off. Preserve
+  `status/snapshot/stop` after failure. Do not run another qualification or
+  tune. An applied reset followed by a complete healthy-control receiver-zero
+  rejects the architecture. M3 remains blocked until full M2 plus cleanup.
+
+- **Previous accepted position:** exact-source `bfaba9e` artifact
   `/tmp/mini_vpn_knife15_macos_20260806_083422.tar.gz` (SHA-256
   `74300b2e...`) passed baseline `32.551/58.899 Mbit/s`, direct
   `16.268 Mbit/s` without gaps, start/smoke, preflights, exact `610,402,304B`

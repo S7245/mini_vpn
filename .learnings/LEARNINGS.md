@@ -1,5 +1,25 @@
 # Learnings
 
+## 2026-08-06 - A healthy WAN comparator should prove recovery specificity
+
+- A recovery qualification need not force the recovery mechanism to fire.
+  Exact black-hole counter growth with sub-bound writer pressure is valuable
+  evidence: the detector sees real path events but correctly avoids resetting
+  a connection whose application service remains continuous.
+- Compare complete predicates, not individual counters. The accepted healthy
+  run had `12` black holes plus `274,915us` maximum writer wait; the selected
+  failure had `144` plus `7,001,335us` on the same identity. Only the latter
+  owns reset authority.
+- `PASS_NON_ACCEPTANCE` is a useful structural state. It can authorize the
+  expensive formal run while remaining incapable of claiming the 24-hour
+  schedule and cleanup requirements were satisfied.
+- A summary-level internal `REVIEW` is not automatically a failure. Inspect
+  lifecycle ordering and ownership: peer `Stopped(0)` after the timed result,
+  with zero D16 queue/lease/reservation and passing byte-gap SLI, is a close
+  tail rather than active data loss.
+- Result:
+  `docs/tech/2026-08-06-knife15-m2-connection-local-path-state-recovery-macos-qualification-results.md`.
+
 ## 2026-08-06 - Local pressure plus monotonic path evidence authorizes bounded repair
 
 - QUIC ACK progress is not proof of usable sustained service. When one pooled

@@ -189,6 +189,30 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-06:
 
+- Exact-source `0c521fa` artifact
+  `/tmp/mini_vpn_knife15_macos_20260806_101142.tar.gz` (SHA-256
+  `2a45314d...`) passed baseline `34.964/8.262 Mbit/s`, direct
+  `13.539 Mbit/s` without gaps, start/smoke, every qualification preflight,
+  all four phases, DNS/real-client, and cleanup. TCP had zero sender/receiver
+  intervals and max gap `7,208,960B`; UDP loss was `0.223184%`. Verdict is
+  `PASS_NON_ACCEPTANCE`; formal M2 remains `NOT_RUN`.
+- No path reset fired. Conn0 advanced black holes `0 -> 12` but its exact
+  writer wait was only `274,915us`, below the unchanged `2s` minimum bound;
+  conn1 remained at zero. This is the correct healthy comparator and
+  false-positive result. The selected failure remains distinct at
+  `7,001,335us` writer Pending plus `144` same-connection black holes.
+- Endpoint max/final was `61,440B / 61,403/0/0B`, with zero interface errors
+  and complete route/DNS/TUN/process cleanup. Two peer `Stopped(0)` writes
+  occurred only at timed-transfer close tails with D16
+  queued/leased/reserved `0/0/0B`; they explain the summary `REVIEW` and are
+  not active-transfer failures. Result:
+  `docs/tech/2026-08-06-knife15-m2-connection-local-path-state-recovery-macos-qualification-results.md`.
+- Next pull/rebuild the pushed descendant and take exactly one fresh formal
+  `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke -> m2
+  -> status -> stop`. Keep every other VPN off, preserve
+  `status/snapshot/stop` after failure, and do not rerun qualification or tune.
+  Knife15 M2 requires the full schedule plus cleanup; M3 remains blocked.
+
 - Exact-source `bfaba9e` artifact
   `/tmp/mini_vpn_knife15_macos_20260806_083422.tar.gz` (SHA-256
   `74300b2e...`) passed baseline `32.551/58.899 Mbit/s`, direct

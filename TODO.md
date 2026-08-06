@@ -4,7 +4,40 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-06 — connection-local QUIC path recovery ready for qualification)
+#### Latest decision (2026-08-06 — qualification passed; formal M2 authorized)
+
+Exact-source `0c521fa` artifact
+`/tmp/mini_vpn_knife15_macos_20260806_101142.tar.gz` (SHA-256
+`2a45314d...`) passed baseline `34.964/8.262 Mbit/s`, direct
+`13.539 Mbit/s` without gaps, all preflights, four qualification phases,
+DNS/real-client checks, and cleanup. Qualification TCP had zero sender or
+receiver intervals, max sender/receiver gap `7,208,960B`; reverse UDP loss
+was `0.223184%`. Verdict is `PASS_NON_ACCEPTANCE`, not formal acceptance.
+
+No connection path reset occurred. Conn0's black-hole count advanced
+`0 -> 12`, but its exact writer wait was only `274,915us`, below the
+unchanged minimum `2s` predicate; conn1 remained at zero. This proves the
+healthy real-WAN false-positive boundary. It does not claim recovery fired,
+but it is not a predicate/observer mismatch: the earlier failure combined
+`7,001,335us` Pending and `144` same-connection black holes.
+
+Endpoint max/final was `61,440B / 61,403/0/0B`; routes, DNS, TUN, process,
+and secrets cleanup passed. Two peer `Stopped(0)` lines were reviewed as
+zero-debt timed-transfer close tails. Result:
+`docs/tech/2026-08-06-knife15-m2-connection-local-path-state-recovery-macos-qualification-results.md`.
+
+Next:
+
+1. pull the pushed descendant and rebuild release on the Mac;
+2. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
+3. take exactly one fresh `m2-ipv6-check -> baseline ->
+   direct-discriminator -> start -> smoke -> m2 -> status -> stop`;
+4. preserve `status/snapshot/stop` after any post-start failure;
+5. do not rerun qualification or tune unchanged values;
+6. accept Knife15 M2 only after the full schedule plus cleanup; keep M3
+   blocked until then.
+
+#### Previous decision (2026-08-06 — connection-local QUIC path recovery ready for qualification)
 
 Exact-source `bfaba9e` artifact
 `/tmp/mini_vpn_knife15_macos_20260806_083422.tar.gz` (SHA-256
