@@ -2,9 +2,48 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-05)
+## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-06)
 
-- **Latest accepted position:** exact-source `f570353` artifact
+- **Latest accepted position:** exact-source `727f00b` artifact
+  `/tmp/mini_vpn_knife15_macos_20260806_035626.tar.gz` (SHA-256
+  `4013a05b...`) passed baseline `38.747/47.278 Mbit/s`, direct
+  `19.361574 Mbit/s` without gaps, start/smoke, every preflight, cycle-1 long
+  TCP/reverse TCP/reverse UDP, and cleanup. Its first 10-second short forward
+  then had two complete Target receiver-zero intervals; Mac/Target bytes were
+  `10,092,544/4,325,376B`.
+- The data stream visibly consumed the one-turn startup service and the Exit
+  ACKed QUIC data. D16, smoltcp, Endpoint conservation (`61,414/0/0B` final),
+  gateway/Exit controls, routes, interfaces, process, and cleanup stayed
+  healthy. The unresolved seam is after Exit QUIC receipt and before Target
+  TCP delivery. Retain the bounded startup code but reject it as sufficient;
+  do not tune priority, pool, MTU, windows, chunk, Cubic, GSO, pacing,
+  recovery, workload, or SLIs.
+- Exact-order bare Exit-to-Target control passed all four phases. Sixty fresh
+  short connections then passed 600/600 receiver intervals with one total
+  retransmit. This rejects a persistent/readily recurring bare path limit but
+  cannot classify the historical TUIC-to-direct-TCP copy boundary.
+- Reviewed `4d02355` adds a non-acceptance `m2-qualification` action for one
+  exact `300 + 300 + 180 + 10` second mixed cycle and a bounded Exit observer:
+  exact `.77:5201` filter, 96-byte snapshots, 340,000,000-byte ring, 250ms
+  TCP_INFO samples, two-hour timeout, identity-safe stop, drop/version/secret/
+  checksum evidence. Formal M2 remains blocked; qualification success is only
+  `PASS_NON_ACCEPTANCE` and formal acceptance stays `NOT_RUN`.
+- Root `673+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  established Clippy, Knife15/Knife14 shell, vendored Quinn `38+3 ignored`
+  plus doc `1`, quinn-proto `310` plus docs `3`, root docs, fmt/diff/secret,
+  and review pass with no unresolved P0/P1. Exact 32 MiB Endpoint capacity was
+  `237.737 Mbit/s`, final `61,440/0/0B`, zero socket would-block. Final real
+  observer smoke bundle SHA-256 is `b119ec7e...`. Result:
+  `docs/tech/2026-08-06-knife15-exit-target-forwarding-observability-local-results.md`.
+- Next pull/rebuild `4d02355` or its pushed descendant. After the agent starts
+  the observer on `.33`, take exactly one fresh `m2-ipv6-check -> baseline ->
+  direct-discriminator -> start -> smoke -> m2-qualification -> status ->
+  stop`; then stop/bundle the observer. Do not run formal `m2`. Matching Mac
+  and Exit evidence must select kernel/path, mature-server copy service,
+  client-to-Exit QUIC, or observer mismatch before another architecture.
+  M3 remains blocked.
+
+- **Previous accepted position:** exact-source `f570353` artifact
   `/tmp/mini_vpn_knife15_macos_20260805_111712.tar.gz` (SHA-256
   `b0d3815e...`) passed baseline `34.319/52.001 Mbit/s`, direct
   `17.151374 Mbit/s` without gaps, start/smoke, every preflight, seven mixed

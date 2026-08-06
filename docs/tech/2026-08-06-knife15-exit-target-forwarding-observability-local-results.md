@@ -5,6 +5,8 @@ Date: 2026-08-06
 Status: **LOCAL IMPLEMENTATION AND REVIEW PASS — ONE SHORT QUALIFICATION
 REQUIRED; FORMAL M2 BLOCKED**
 
+Implementation: `4d02355`
+
 Architecture:
 `docs/tech/2026-08-06-knife15-exit-target-forwarding-observability-architecture-spec.md`
 

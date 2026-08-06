@@ -1,5 +1,26 @@
 # Errors
 
+## 2026-08-06 - Post-QUIC Target delivery failed and gate commands repeated traps
+
+- Exact-source `727f00b` consumed the new-stream startup turn and continued
+  QUIC ACK progress, but its first short forward still lost two complete
+  Target receiver intervals. The one-turn mechanism is bounded but
+  insufficient; another priority/selector/pool/parameter iteration would
+  ignore the stop rule.
+- The first real Exit observer could not rotate its root-owned capture file
+  after tcpdump dropped privileges. It was stopped and bundled. Explicit
+  `-Z root`, argument coverage, and a second real start/status/stop/bundle
+  smoke now lock correct rotation ownership.
+- A new runner summary fixture referenced `good.log` before the older self-test
+  created it. The self-test printed missing-file diagnostics despite its final
+  PASS. Use a local empty log fixture at that point and rerun the complete
+  wrapper; do not accept noisy PASS output.
+- An independent vendored Quinn command again omitted the explicit local
+  quinn-proto path patch and selected the registry crate. A later 32 MiB
+  command again combined `--exact` with an unqualified function name and ran
+  zero tests. Both outcomes were rejected and rerun correctly. Future gates
+  must use the explicit patch and require `running 1 test` plus measurement.
+
 ## 2026-08-05 - Installed auxiliary successor still delayed a new stream
 
 - Exact-source `f570353` passed baseline/direct, every preflight, seven mixed

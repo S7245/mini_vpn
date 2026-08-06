@@ -1,10 +1,47 @@
 # TODO
 
-## Current Knife15 Plan (2026-08-05)
+## Current Knife15 Plan (2026-08-06)
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-05 — Quinn new-stream startup service ready for M2)
+#### Latest decision (2026-08-06 — Exit forwarding qualification required)
+
+Exact-source `727f00b` artifact
+`/tmp/mini_vpn_knife15_macos_20260806_035626.tar.gz` (SHA-256
+`4013a05b...`) passed baseline/direct, every preflight, cycle-1 long
+TCP/reverse TCP/reverse UDP, and cleanup. Its first 10-second short forward
+lost two complete Target receiver intervals. Startup priority was consumed and
+QUIC ACKs progressed while D16, Endpoint, TUN, controls, routes, process, and
+cleanup remained healthy. The remaining seam is Exit QUIC receipt to Target
+TCP delivery; another client constant or pool/recovery branch is rejected.
+
+Bare Exit-to-Target exact-order and sixty-fresh-connection controls passed.
+Reviewed `4d02355` therefore adds one falsifiable observation stage: public
+`m2-qualification` runs exactly `300 + 300 + 180 + 10` seconds with every
+formal preflight/quality/cleanup invariant, but can write only
+`PASS_NON_ACCEPTANCE`. A separate Exit observer owns an exact target filter,
+96-byte snapshots, 340,000,000-byte ring, 250ms TCP_INFO samples, two-hour
+timeout, exact PID cleanup, version/drop/secret/checksum evidence.
+
+All local/review gates pass with no unresolved P0/P1. Root is `673+3 ignored`,
+vendored Quinn/proto are `38+3 ignored`/`310`, and the exact 32 MiB Endpoint
+gate reached `237.737 Mbit/s` with `61,440/0/0B`. Result:
+`docs/tech/2026-08-06-knife15-exit-target-forwarding-observability-local-results.md`.
+
+Next:
+
+1. pull the pushed descendant of `4d02355` and rebuild release on the Mac;
+2. keep Clash-TUN/every other VPN off and use fresh IPv6/baseline/direct
+   evidence;
+3. wait for the agent to report the reviewed Exit observer active on `.33`;
+4. run exactly `start -> smoke -> m2-qualification -> status -> stop`;
+5. stop/bundle the Exit observer and correlate both UTC timelines;
+6. select kernel/path, mature-server copy service, client QUIC, or observer
+   mismatch from evidence; do not tune or repeat unchanged;
+7. keep formal M2 and M3 blocked until the selected architecture passes local
+   gates, review, one short qualification, and cleanup.
+
+#### Previous decision (2026-08-05 — Quinn new-stream startup service ready for M2)
 
 Exact-source `f570353` artifact
 `/tmp/mini_vpn_knife15_macos_20260805_111712.tar.gz` (SHA-256

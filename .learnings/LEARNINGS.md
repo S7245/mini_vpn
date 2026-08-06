@@ -1,5 +1,28 @@
 # Learnings
 
+## 2026-08-06 - Transport receipt and Target delivery need separate evidence
+
+- QUIC ACK progress proves peer transport receipt, not successful service by
+  the peer's next TCP hop. TUIC v5 has no Connect response, so client-only
+  counters cannot safely authorize replay or classify Exit application-copy
+  service.
+- A hypothesis-specific short qualification should precede a 25-hour
+  acceptance run. Reuse every production preflight and SLO, run only the first
+  exact mixed cycle, and make its success structurally incapable of becoming
+  formal acceptance.
+- Put mature-server observation outside the product data path. Exact target/
+  port filtering, bounded snapshots, TCP_INFO, hard timeout, rotating storage,
+  identity-safe cleanup, and immutable hashes add causal evidence without
+  changing interoperability or queue/service behavior.
+- Capacity units are part of correctness. tcpdump `-C` is decimal millions of
+  bytes; testing only the flags would have accepted a ring below the specified
+  320 MiB. State and test the byte total, not a colloquial “20 MiB” label.
+- Direct controls reject persistent bare-path limitations but do not prove an
+  instantaneous historical transient impossible. Preserve that uncertainty
+  and require paired Mac/Exit timelines rather than overclaiming causality.
+- Result:
+  `docs/tech/2026-08-06-knife15-exit-target-forwarding-observability-local-results.md`.
+
 ## 2026-08-05 - New multiplexed streams need bounded startup service
 
 - A transport generation can be authenticated, installed, epoch-qualified,
