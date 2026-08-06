@@ -79,11 +79,11 @@ without changing any frozen value or replaying application payload.
 
 ## Task 8: Results, Memory, Commit, Push
 
-- [ ] Write local result and exact gate counts/rates.
-- [ ] Update `TODO.md`, `HANDOFF.md`, `AGENTS.md`, learnings, and errors.
-- [ ] Commit coherent spec/implementation/result stages and push the current
+- [x] Write local result and exact gate counts/rates.
+- [x] Update `TODO.md`, `HANDOFF.md`, `AGENTS.md`, learnings, and errors.
+- [x] Commit coherent spec/implementation/result stages and push the current
   branch.
-- [ ] Provide one exact Mac `m2-qualification` transaction; do not run formal
+- [x] Provide one exact Mac `m2-qualification` transaction; do not run formal
   M2.
 
 ## Stop Rule

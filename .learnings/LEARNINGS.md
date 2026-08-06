@@ -1,5 +1,28 @@
 # Learnings
 
+## 2026-08-06 - Local pressure plus monotonic path evidence authorizes bounded repair
+
+- QUIC ACK progress is not proof of usable sustained service. When one pooled
+  connection alone accumulates PLPMTUD black holes, loss, congestion events,
+  and multi-second exact writer Pending while its peer and the Exit-to-Target
+  socket stay healthy, recovery belongs to that connection's learned path
+  state rather than the shared UDP socket or pool selector.
+- Attribute cumulative counters to an ownership window. Refresh a black-hole
+  anchor while no business writer is Pending, preserve it during Pending, and
+  require monotonic growth before acting. Historical idle events and counter
+  regressions must fail closed.
+- Recovery authority must be bounded by stable identity. Consume it before
+  mechanism application and retain it through closure so failure cannot form
+  a reset loop; a replacement connection is the only fresh authority.
+- Capture evidence and the exact mechanism handle in one snapshot. A later
+  pool lookup can target a replacement generation and silently sever the
+  proof-to-action relationship.
+- Keep policy and mechanism separate: TUIC decides whether exact evidence is
+  sufficient; Quinn only resets existing congestion/RTT/MTUD state and wakes
+  the driver. Preserve connection, stream, Target TCP, socket, and bytes.
+- Result:
+  `docs/tech/2026-08-06-knife15-m2-connection-local-path-state-recovery-local-results.md`.
+
 ## 2026-08-06 - Transport receipt and Target delivery need separate evidence
 
 - QUIC ACK progress proves peer transport receipt, not successful service by

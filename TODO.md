@@ -4,7 +4,49 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-06 — Exit forwarding qualification required)
+#### Latest decision (2026-08-06 — connection-local QUIC path recovery ready for qualification)
+
+Exact-source `bfaba9e` artifact
+`/tmp/mini_vpn_knife15_macos_20260806_083422.tar.gz` (SHA-256
+`74300b2e...`) passed baseline `32.551/58.899 Mbit/s`, the 300-second direct
+discriminator at `16.268 Mbit/s` without gaps, start/smoke, preflights, exact
+forward completion, and cleanup. The qualification forward nevertheless had
+three complete Target receiver-zero intervals. Its writer waited up to
+`7,001,335us`; the owning conn1 grew PLPMTUD black holes `0 -> 144`, QUIC loss
+to `2,147,556B`, and congestion events to `537`, while conn0 stayed healthy.
+
+The paired Exit observer (`e95880ae...`) had zero capture/kernel drops,
+`1..9ms` Target TCP RTT, no retransmit growth, and complete ACKs for every byte
+the mature Exit supplied. Application supply from QUIC alone decayed. This
+selects connection-local client-to-Exit QUIC service degradation, not an
+operator, baseline, Exit-to-Target, TUN, D16, Endpoint, or parameter issue.
+
+Reviewed implementation `0e94e56` consumes one reset authority per stable
+QUIC identity when the exact business writer reaches the existing RTT-derived
+Pending bound and the same connection adds black-hole detections. It invokes
+the existing Quinn path-state reset on the exact sampled handle and retains
+the connection, stream, Target TCP, socket, and bytes. ACK-stall Endpoint
+rebind retains precedence; no frozen values, payload replay, migration, or
+retry loop were added.
+
+All local/review gates pass with no unresolved P0/P1. Root is `679+3 ignored`,
+vendored Quinn/proto are `39+3 ignored`/`310`, and exact 32 MiB Endpoint
+capacity reached `240.348 Mbit/s` with final `61,440/0/0B`. Result:
+`docs/tech/2026-08-06-knife15-m2-connection-local-path-state-recovery-local-results.md`.
+
+Next:
+
+1. pull the pushed descendant of `0e94e56` and rebuild release on the Mac;
+2. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
+3. wait for the agent to report the bounded Exit observer active on `.33`;
+4. run one fresh `m2-ipv6-check -> baseline -> direct-discriminator -> start
+   -> smoke -> m2-qualification -> status -> stop`;
+5. do not run formal M2; this qualification schedules about `13m10s`;
+6. an applied reset plus another receiver-zero interval rejects this
+   architecture; do not tune or repeat unchanged;
+7. keep formal M2 and M3 blocked pending the short discriminator.
+
+#### Previous decision (2026-08-06 — Exit forwarding qualification required)
 
 Exact-source `727f00b` artifact
 `/tmp/mini_vpn_knife15_macos_20260806_035626.tar.gz` (SHA-256

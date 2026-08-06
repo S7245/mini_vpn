@@ -1,5 +1,28 @@
 # Errors
 
+## 2026-08-06 - Connection-local degradation and gate provenance traps
+
+- Exact-source `bfaba9e` passed baseline/direct and completed the exact
+  transfer, but the Target lost three whole receiver intervals while the
+  owning QUIC connection added `144` black-hole detections and the healthy
+  peer did not. The paired Exit observer rejected Exit-to-Target service as
+  the cause. Treating completion or aggregate pool health as PASS would have
+  hidden a connection-local transport liveness defect.
+- A standalone vendored Quinn command omitted the absolute local quinn-proto
+  patch and produced many missing-fork-API compile errors. It was not a code
+  regression. Independent vendor gates must bind the local proto path
+  explicitly and verify that resolved implementation.
+- A concurrency command omitted `--features harness` and exited successfully
+  after running zero tests. Zero-test success is never a gate; require the
+  expected test count and rerun the exact feature lane.
+- Current rustfmt reformatted many unrelated files in the pinned Quinn tree.
+  That noise was reverted. Do not wholesale-format vendored Quinn with a
+  newer formatter; preserve upstream style and review a narrow focused diff.
+- Review found two real P1 defects before commit: path reset could overlap an
+  in-flight Endpoint rebind, and connection closure could be logged as a
+  successful reset. Recovery mechanisms now serialize by authority, and the
+  Quinn adapter checks closure under the same connection lock.
+
 ## 2026-08-06 - Post-QUIC Target delivery failed and gate commands repeated traps
 
 - Exact-source `727f00b` consumed the new-stream startup turn and continued

@@ -189,6 +189,40 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-06:
 
+- Exact-source `bfaba9e` artifact
+  `/tmp/mini_vpn_knife15_macos_20260806_083422.tar.gz` (SHA-256
+  `74300b2e...`) passed baseline `32.551/58.899 Mbit/s`, direct
+  `16.268 Mbit/s` without gaps, start/smoke, every preflight, exact
+  `610,402,304B` forward completion, and cleanup. The qualification forward
+  had three complete Target receiver-zero intervals around seconds
+  101/103/105; the exact writer waited up to `7,001,335us`.
+- Owning conn1 advanced PLPMTUD black holes `0 -> 144`, QUIC loss
+  `2,147,556B`, and congestion events `537`, while healthy conn0 had no
+  comparable growth. Paired Exit observer artifact
+  `/tmp/mini_vpn_knife15_exit_target_observer_20260806_065748.tar.gz`
+  (SHA-256 `e95880ae...`) had zero capture/kernel drops, Target TCP RTT
+  `1..9ms`, no retransmit growth, and full ACKs for Exit-supplied bytes while
+  QUIC application supply decayed. This selects client-to-Exit
+  per-connection QUIC path-state degradation; do not tune a frozen value.
+- Reviewed implementation `0e94e56` owns one path-state reset per live stable
+  identity. Exact writer Pending for the existing RTT-derived bound plus
+  same-window black-hole growth resets only that connection's configured
+  congestion/RTT/MTUD state through the existing proto mechanism. It retains
+  the QUIC identity, stream, Target TCP, shared socket, and payload. Exact
+  ACK-stall Endpoint rebind retains precedence and cannot overlap the reset.
+- Root `679+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  established Clippy, Knife15/Knife14 shell, vendored Quinn `39+3 ignored`
+  plus doc `1`, quinn-proto `310` plus docs `3`, root docs, fmt/diff/secret,
+  and review pass with no unresolved P0/P1. Exact 32 MiB Endpoint capacity was
+  `240.348 Mbit/s`, final `61,440/0/0B`, zero socket would-block. Result:
+  `docs/tech/2026-08-06-knife15-m2-connection-local-path-state-recovery-local-results.md`.
+- Next pull/rebuild the pushed descendant. After the `.33` observer is active,
+  take exactly one fresh `m2-ipv6-check -> baseline -> direct-discriminator
+  -> start -> smoke -> m2-qualification -> status -> stop`. Do not run formal
+  M2. Qualification can produce only `PASS_NON_ACCEPTANCE`; an applied reset
+  plus another receiver-zero interval rejects the architecture without
+  tuning/repeat. Formal M2 and M3 remain blocked.
+
 - Exact-source `727f00b` artifact
   `/tmp/mini_vpn_knife15_macos_20260806_035626.tar.gz` (SHA-256
   `4013a05b...`) passed baseline `38.747/47.278 Mbit/s`, direct
