@@ -1396,6 +1396,56 @@ mod tests {
     }
 
     #[test]
+    fn startup_priority_turn_rejoins_default_fairness() {
+        let mut server = make(Side::Server);
+        server.set_params(&TransportParameters {
+            initial_max_streams_bidi: 2u32.into(),
+            initial_max_data: 300u32.into(),
+            initial_max_stream_data_bidi_remote: 300u32.into(),
+            ..TransportParameters::default()
+        });
+
+        let (mut pending, state) = (Retransmits::default(), ConnState::Established);
+        let mut streams = Streams {
+            state: &mut server,
+            conn_state: &state,
+        };
+
+        let incumbent_id = streams.open(Dir::Bi).unwrap();
+        let startup_id = streams.open(Dir::Bi).unwrap();
+
+        let mut incumbent = SendStream {
+            id: incumbent_id,
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &state,
+        };
+        incumbent.write(&[b'i'; 100]).unwrap();
+
+        let mut startup = SendStream {
+            id: startup_id,
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &state,
+        };
+        startup.set_priority(1).unwrap();
+        startup
+            .write_then_set_priority(&[b's'; 100], 0)
+            .unwrap();
+        assert_eq!(startup.priority().unwrap(), 0);
+
+        let mut buf = Vec::with_capacity(1024);
+        let meta = server.write_stream_frames(&mut buf, 40, true);
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0].id, startup_id);
+
+        let buf_len = buf.len();
+        let meta = server.write_stream_frames(&mut buf, buf_len + 40, true);
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0].id, incumbent_id);
+    }
+
+    #[test]
     fn requeue_stream_priority() {
         let mut server = make(Side::Server);
         server.set_params(&TransportParameters {

@@ -57,6 +57,9 @@ const TUIC_TCP_RELAY_MODE_UNORDERED_REASSEMBLY: &str = "unordered_reassembly_dia
 const TUIC_TCP_RELAY_MODE_NATIVE_CHUNK_PUMP: &str = "native_chunk_pump_diag";
 const TUIC_TCP_RELAY_MODE_NATIVE_ORDERED_PUMP: &str = "native_ordered_pump_diag";
 const TUIC_TCP_RELAY_MODE_D16_DIRECT_ORDERED: &str = "d16_direct_ordered";
+// Categorical one-step service class for a newly opened TCP stream. This is not a throughput
+// knob: the stream returns to its prior Quinn priority on the first accepted business write.
+const TUIC_TCP_STARTUP_PRIORITY_DELTA: i32 = 1;
 const TUIC_TCP_UNORDERED_CHUNK_READ_MAX_BYTES: usize = 64 * 1024;
 const TUIC_TCP_DIRECT_ORDERED_READ_MAX_BYTES: usize = TUIC_TCP_UNORDERED_CHUNK_READ_MAX_BYTES * 2;
 const TUIC_TCP_UNORDERED_REASSEMBLY_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -1428,15 +1431,142 @@ impl OrderedChunkRecv for QuinnOrderedChunkRecv {
     }
 }
 
-struct TuicOrderedRelayStream<R = QuinnOrderedChunkRecv, S = quinn::SendStream> {
+trait TuicTcpStartupPriorityWrite: AsyncWrite + Unpin {
+    fn current_priority(&mut self) -> io::Result<i32>;
+    fn set_stream_priority(&mut self, priority: i32) -> io::Result<()>;
+    fn poll_write_then_set_priority(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        priority_after: i32,
+    ) -> Poll<io::Result<usize>>;
+}
+
+impl TuicTcpStartupPriorityWrite for quinn::SendStream {
+    fn current_priority(&mut self) -> io::Result<i32> {
+        self.priority()
+            .map_err(|error| io::Error::other(format!("tuic TCP priority read: {error}")))
+    }
+
+    fn set_stream_priority(&mut self, priority: i32) -> io::Result<()> {
+        self.set_priority(priority)
+            .map_err(|error| io::Error::other(format!("tuic TCP priority set: {error}")))
+    }
+
+    fn poll_write_then_set_priority(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        priority_after: i32,
+    ) -> Poll<io::Result<usize>> {
+        match quinn::SendStream::poll_write_then_set_priority(self, cx, buf, priority_after) {
+            Poll::Ready(Ok(written)) => Poll::Ready(Ok(written)),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error.into())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Keeps a new TUIC TCP stream in one higher Quinn service class through Connect and the first
+/// accepted nonempty business write, then atomically rejoins its original class. No payload is
+/// copied or queued here; Quinn remains the only owner of transport backpressure.
+struct TuicTcpStartupWriter<W> {
+    inner: W,
+    original_priority: i32,
+    startup_priority: i32,
+    first_payload_pending: bool,
+    diag_meta: Option<TuicTcpStreamDiagMeta>,
+}
+
+impl<W: TuicTcpStartupPriorityWrite> TuicTcpStartupWriter<W> {
+    fn arm(mut inner: W) -> io::Result<Self> {
+        let original_priority = inner.current_priority()?;
+        let startup_priority = original_priority
+            .checked_add(TUIC_TCP_STARTUP_PRIORITY_DELTA)
+            .ok_or_else(|| io::Error::other("tuic TCP startup priority overflow"))?;
+        inner.set_stream_priority(startup_priority)?;
+        Ok(Self {
+            inner,
+            original_priority,
+            startup_priority,
+            first_payload_pending: true,
+            diag_meta: None,
+        })
+    }
+
+    async fn write_connect(&mut self, connect: &[u8]) -> io::Result<()> {
+        tokio::io::AsyncWriteExt::write_all(&mut self.inner, connect).await
+    }
+
+    fn set_diag_meta(&mut self, diag_meta: Option<TuicTcpStreamDiagMeta>) {
+        self.diag_meta = diag_meta;
+    }
+}
+
+impl TuicTcpStartupWriter<quinn::SendStream> {
+    async fn prepare(
+        send: quinn::SendStream,
+        connect: &[u8],
+    ) -> io::Result<(Self, quinn::SendStreamProgress)> {
+        let progress = send.progress_handle();
+        let mut writer = Self::arm(send)?;
+        writer.write_connect(connect).await?;
+        Ok((writer, progress))
+    }
+}
+
+impl<W: TuicTcpStartupPriorityWrite> AsyncWrite for TuicTcpStartupWriter<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if buf.is_empty() || !self.first_payload_pending {
+            return Pin::new(&mut self.inner).poll_write(cx, buf);
+        }
+
+        let original_priority = self.original_priority;
+        match Pin::new(&mut self.inner).poll_write_then_set_priority(cx, buf, original_priority) {
+            Poll::Ready(Ok(written)) if written > 0 => {
+                self.first_payload_pending = false;
+                if let Some(meta) = &self.diag_meta {
+                    println!(
+                        "{}",
+                        format_tuic_tcp_startup_service_line(
+                            meta,
+                            written,
+                            self.startup_priority,
+                            self.original_priority,
+                        )
+                    );
+                }
+                Poll::Ready(Ok(written))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+struct TuicOrderedRelayStream<
+    R = QuinnOrderedChunkRecv,
+    S = TuicTcpStartupWriter<quinn::SendStream>,
+> {
     recv: R,
     send: S,
     pending: bytes::Bytes,
     recv_eof: bool,
 }
 
-impl TuicOrderedRelayStream<QuinnOrderedChunkRecv, quinn::SendStream> {
-    fn from_quinn(recv: quinn::RecvStream, send: quinn::SendStream) -> Self {
+impl TuicOrderedRelayStream<QuinnOrderedChunkRecv, TuicTcpStartupWriter<quinn::SendStream>> {
+    fn from_quinn(recv: quinn::RecvStream, send: TuicTcpStartupWriter<quinn::SendStream>) -> Self {
         Self::new(QuinnOrderedChunkRecv::new(recv), send)
     }
 }
@@ -1609,7 +1739,7 @@ impl OrderedQuicChunkAssembler {
 
 struct TuicChunkRelayStream {
     recv: quinn::RecvStream,
-    send: quinn::SendStream,
+    send: TuicTcpStartupWriter<quinn::SendStream>,
     rx: OrderedQuicChunkAssembler,
     recv_eof: bool,
     diag_meta: Option<TuicTcpStreamDiagMeta>,
@@ -1624,7 +1754,7 @@ struct TuicChunkRelayStream {
 impl TuicChunkRelayStream {
     fn new(
         recv: quinn::RecvStream,
-        send: quinn::SendStream,
+        send: TuicTcpStartupWriter<quinn::SendStream>,
         diag_meta: Option<TuicTcpStreamDiagMeta>,
     ) -> Self {
         Self {
@@ -1775,15 +1905,15 @@ impl AsyncWrite for TuicChunkRelayStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        <quinn::SendStream as AsyncWrite>::poll_write(Pin::new(&mut self.send), cx, buf)
+        Pin::new(&mut self.send).poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        <quinn::SendStream as AsyncWrite>::poll_flush(Pin::new(&mut self.send), cx)
+        Pin::new(&mut self.send).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        <quinn::SendStream as AsyncWrite>::poll_shutdown(Pin::new(&mut self.send), cx)
+        Pin::new(&mut self.send).poll_shutdown(cx)
     }
 }
 
@@ -2620,17 +2750,17 @@ impl Drop for TuicNativeTcpReader {
 }
 
 struct TuicNativeTcpWriter {
-    send: TcpWritePressureAdapter<quinn::SendStream>,
+    send: TcpWritePressureAdapter<TuicTcpStartupWriter<quinn::SendStream>>,
     _lease: TcpPoolSlotLease,
 }
 
 impl TuicNativeTcpWriter {
     fn new(
-        send: quinn::SendStream,
+        send: TuicTcpStartupWriter<quinn::SendStream>,
         lease: TcpPoolSlotLease,
         pressure: TcpWritePressureWriter,
+        progress: quinn::SendStreamProgress,
     ) -> Self {
-        let progress = send.progress_handle();
         Self {
             send: TcpWritePressureAdapter::new_with_progress(send, pressure, progress),
             _lease: lease,
@@ -3656,6 +3786,24 @@ impl TuicTcpStreamDiagMeta {
             stream_id,
         }
     }
+}
+
+fn format_tuic_tcp_startup_service_line(
+    meta: &TuicTcpStreamDiagMeta,
+    first_payload_bytes: usize,
+    priority_before: i32,
+    priority_after: i32,
+) -> String {
+    format!(
+        "🔎 tuic-tcp-startup-service target={} conn={} id={} stream={} first_payload_bytes={} priority_before={} priority_after={} state=consumed",
+        meta.target,
+        meta.conn_index,
+        meta.stable_id,
+        meta.stream_id,
+        first_payload_bytes,
+        priority_before,
+        priority_after,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6410,15 +6558,16 @@ impl ProxyUpstream for TuicUpstream {
         // → FailoverUpstream 据「连接活但 open 超时」走 **慢路计数**（并发 open 下 ~5s 累计 3 次即切 REALITY，
         // 不再死等 close_reason）。正常 open（open_bi + 写小 Connect 头）是本地操作、远小于 5s，不误伤。
         let open = async {
-            let (mut send, recv) = conn
+            let (send, recv) = conn
                 .open_bi()
                 .await
                 .map_err(|e| io_err("tuic open_bi", e))?;
             let stable_id = conn.stable_id();
             let stream_id = recv.id().index();
-            send.write_all(&encode_connect(target))
-                .await
-                .map_err(|e| io_err("tuic connect write", e))?;
+            let (mut send, send_progress) =
+                TuicTcpStartupWriter::prepare(send, &encode_connect(target))
+                    .await
+                    .map_err(|e| io_err("tuic connect write", e))?;
             open_state.note_open_success(self.clock.elapsed().as_secs());
             let relay_mode = tuic_tcp_relay_mode();
             let diag_meta = if tcp_diag_enabled() {
@@ -6463,7 +6612,7 @@ impl ProxyUpstream for TuicUpstream {
             let tcp_stream_diag = diag_meta
                 .clone()
                 .map(|meta| TuicTcpStreamDiag::new(meta, Instant::now()));
-            let send_progress = send.progress_handle();
+            send.set_diag_meta(diag_meta.clone());
             let pressure_writer = write_pressure.writer(stream_id);
             let relay: RelayStream = match relay_mode {
                 TuicTcpRelayMode::OrderedJoin => Box::new(TrackedRelayStream::new_with_transport(
@@ -6559,15 +6708,16 @@ impl ProxyUpstream for TuicUpstream {
             replacement_installed,
         } = selection;
         let open = async {
-            let (mut send, recv) = conn
+            let (send, recv) = conn
                 .open_bi()
                 .await
                 .map_err(|e| io_err("tuic open_bi", e))?;
             let stable_id = conn.stable_id();
             let stream_id = recv.id().index();
-            send.write_all(&encode_connect(target))
-                .await
-                .map_err(|e| io_err("tuic connect write", e))?;
+            let (mut send, send_progress) =
+                TuicTcpStartupWriter::prepare(send, &encode_connect(target))
+                    .await
+                    .map_err(|e| io_err("tuic connect write", e))?;
             open_state.note_open_success(self.clock.elapsed().as_secs());
             let diag_meta = if tcp_diag_enabled() {
                 println!(
@@ -6611,6 +6761,7 @@ impl ProxyUpstream for TuicUpstream {
             let tcp_stream_diag = diag_meta
                 .clone()
                 .map(|meta| TuicTcpStreamDiag::new(meta, Instant::now()));
+            send.set_diag_meta(diag_meta);
             let reader_lease = lease.try_clone().map_err(|error| {
                 io_err(
                     "tuic TCP generation lease split",
@@ -6643,6 +6794,7 @@ impl ProxyUpstream for TuicUpstream {
                 send,
                 lease,
                 write_pressure.writer(stream_id),
+                send_progress,
             ));
             let relay = NativeTcpRelayStream { reader, writer };
             Ok::<OpenedTcpRelay, ClientError>(if d16_byte_owned {
@@ -6747,7 +6899,105 @@ mod tests {
     use super::*;
     use crate::shared::TargetAddr;
     use crate::tcp_downlink_pump::{AsyncLeasedByteFlowQueue, DownstreamPermitReleaseMode};
+    use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
+
+    #[derive(Debug, Default)]
+    struct StartupPriorityProbeState {
+        priority: i32,
+        atomic_pending_once: bool,
+        atomic_calls: usize,
+        queued_priorities: Vec<i32>,
+        writes: Vec<Vec<u8>>,
+    }
+
+    struct StartupPriorityProbeWriter {
+        state: Arc<StdMutex<StartupPriorityProbeState>>,
+    }
+
+    impl AsyncWrite for StartupPriorityProbeWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.state.lock().unwrap().writes.push(buf.to_vec());
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl TuicTcpStartupPriorityWrite for StartupPriorityProbeWriter {
+        fn current_priority(&mut self) -> io::Result<i32> {
+            Ok(self.state.lock().unwrap().priority)
+        }
+
+        fn set_stream_priority(&mut self, priority: i32) -> io::Result<()> {
+            self.state.lock().unwrap().priority = priority;
+            Ok(())
+        }
+
+        fn poll_write_then_set_priority(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+            priority_after: i32,
+        ) -> Poll<io::Result<usize>> {
+            let mut state = self.state.lock().unwrap();
+            state.atomic_calls += 1;
+            if state.atomic_pending_once {
+                state.atomic_pending_once = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            let priority = state.priority;
+            state.queued_priorities.push(priority);
+            state.priority = priority_after;
+            state.writes.push(buf.to_vec());
+            Poll::Ready(Ok(buf.len()))
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_startup_service_is_one_atomic_business_write_after_connect() {
+        let state = Arc::new(StdMutex::new(StartupPriorityProbeState {
+            priority: 7,
+            atomic_pending_once: true,
+            ..StartupPriorityProbeState::default()
+        }));
+        let probe = StartupPriorityProbeWriter {
+            state: Arc::clone(&state),
+        };
+        let mut writer = TuicTcpStartupWriter::arm(probe).unwrap();
+
+        writer.write_connect(b"connect").await.unwrap();
+        std::future::poll_fn(|cx| Pin::new(&mut writer).poll_write(cx, &[]))
+            .await
+            .unwrap();
+        writer.write_all(b"first-payload").await.unwrap();
+        writer.write_all(b"later-payload").await.unwrap();
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.priority, 7);
+        assert_eq!(state.atomic_calls, 2, "Pending and successful admission");
+        assert_eq!(state.queued_priorities, vec![8]);
+        assert_eq!(
+            state.writes,
+            vec![
+                b"connect".to_vec(),
+                Vec::new(),
+                b"first-payload".to_vec(),
+                b"later-payload".to_vec()
+            ]
+        );
+    }
 
     fn tcp_pool_observations(path_service: &[TcpPoolPathService]) -> Vec<TcpPoolPathObservation> {
         path_service

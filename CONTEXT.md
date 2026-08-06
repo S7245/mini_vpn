@@ -24,6 +24,10 @@ _Avoid_: connection health (qualification is one exact placement discriminator, 
 A bounded lifecycle handoff for an auxiliary TCP pool slot whose current busy generation has proven degraded. The old generation becomes drain-only and keeps every existing relay; one authenticated successor becomes the slot's only generation eligible for new Target opens. The configured pool and eligible-slot count remain unchanged, the primary TUIC connection and UDP/health ownership never move, and at most one predecessor may drain behind an auxiliary successor. Replacement is neither stream migration nor pool expansion.
 _Avoid_: reconnect active flows (the predecessor remains alive), failover retry (the triggering open waits for a successor instead of replaying payload), pool growth (only two logical slots admit new work)
 
+**TUIC TCP new-stream startup service**:
+A bounded per-stream send-scheduling contract. A newly opened TUIC TCP stream queues its Connect header and first non-empty business payload above incumbent normal-priority stream data, then atomically returns to its original Quinn priority after exactly one business scheduling turn. Blocked or empty writes do not consume the contract. It changes neither connection admission nor congestion/flow control and has no timer, byte threshold, Target rule, or configuration knob.
+_Avoid_: stream boost (sounds tunable or permanent), fast lane (suggests separate capacity), failover (the selected QUIC connection does not change)
+
 **Direct baseline evidence**:
 The pre-TUN pair of forward and reverse iperf JSON results against the Target. It proves receiver-positive physical-path continuity for the short observation window and supplies the forward receiver rate from which the longer direct discriminator derives its offered load. Low average bandwidth is valid; a complete receiver-zero interval, malformed evidence, command failure, or validator execution failure is not. It is distinct from the 300-second direct discriminator and never exercises mini_vpn.
 _Avoid_: speed test (continuity and provenance, not maximum bandwidth, are the contract), VPN baseline (no TUN or VPN data plane is active)

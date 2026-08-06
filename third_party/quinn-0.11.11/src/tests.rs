@@ -10,7 +10,7 @@ use std::{
     future::Future,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
-    pin::pin,
+    pin::{Pin, pin},
     str,
     sync::{
         Arc,
@@ -165,6 +165,44 @@ async fn send_stream_progress_handle_tracks_acknowledgements() {
     })
     .await
     .expect("peer acknowledgement progress");
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn send_stream_atomic_priority_restore_delivers_bytes() {
+    let _guard = subscribe();
+    let endpoint = endpoint();
+    let server_endpoint = endpoint.clone();
+    const MSG: &[u8] = b"startup payload";
+
+    let server = tokio::spawn(async move {
+        let connection = server_endpoint
+            .accept()
+            .await
+            .expect("incoming connection")
+            .await
+            .expect("server handshake");
+        let mut recv = connection.accept_uni().await.expect("incoming stream");
+        let mut data = vec![0; MSG.len()];
+        recv.read_exact(&mut data).await.expect("read stream payload");
+        assert_eq!(data, MSG);
+    });
+
+    let connection = endpoint
+        .connect(endpoint.local_addr().expect("endpoint address"), "localhost")
+        .expect("start connection")
+        .await
+        .expect("client handshake");
+    let mut send = connection.open_uni().await.expect("open stream");
+    send.set_priority(1).expect("arm startup priority");
+    std::future::poll_fn(|cx| {
+        Pin::new(&mut send).poll_write_then_set_priority(cx, MSG, 0)
+    })
+    .await
+    .expect("write startup payload");
+    assert_eq!(send.priority().expect("restored priority"), 0);
+    send.finish().expect("finish stream");
+
     server.await.expect("server task");
 }
 

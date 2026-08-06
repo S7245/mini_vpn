@@ -321,6 +321,23 @@ impl SendStream {
     ) -> Poll<Result<usize, WriteError>> {
         pin!(self.get_mut().write(buf)).as_mut().poll(cx)
     }
+
+    /// Attempt to write bytes using the currently queued priority and atomically restore
+    /// `priority_after` before releasing the connection lock.
+    ///
+    /// If the write is blocked, no bytes are accepted and the priority remains unchanged.
+    /// This is a fork-only adapter for bounded new-stream startup service.
+    #[doc(hidden)]
+    pub fn poll_write_then_set_priority(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &[u8],
+        priority_after: i32,
+    ) -> Poll<Result<usize, WriteError>> {
+        self.get_mut().execute_poll(cx, |stream| {
+            stream.write_then_set_priority(buf, priority_after)
+        })
+    }
 }
 
 /// Check if a send stream is stopped.
