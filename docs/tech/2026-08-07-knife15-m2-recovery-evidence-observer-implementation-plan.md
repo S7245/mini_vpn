@@ -58,8 +58,8 @@ Source of truth:
 - [x] Write exact local results and gate counts.
 - [x] Update `CONTEXT.md`, `TODO.md`, `HANDOFF.md`, `AGENTS.md`, learnings,
   and errors.
-- [ ] Commit coherent stages and push the current branch.
-- [ ] Provide exactly one bounded Mac qualification transaction with the Exit
+- [x] Commit coherent stages and push the current branch.
+- [x] Provide exactly one bounded Mac qualification transaction with the Exit
   observer; do not run formal M2.
 
 ## Stop Rule
