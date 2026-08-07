@@ -169,6 +169,68 @@ async fn send_stream_progress_handle_tracks_acknowledgements() {
 }
 
 #[tokio::test]
+async fn recv_stream_progress_handle_tracks_ordered_delivery() {
+    let _guard = subscribe();
+    let endpoint = endpoint();
+    let server_endpoint = endpoint.clone();
+    const MSG: &[u8] = b"ordered receive progress";
+
+    let server = tokio::spawn(async move {
+        let connection = server_endpoint
+            .accept()
+            .await
+            .expect("incoming connection")
+            .await
+            .expect("server handshake");
+        let mut recv = connection.accept_uni().await.expect("incoming stream");
+        let progress = recv.progress_handle();
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if progress.sample().is_ok_and(|sample| {
+                    sample.highest_received_offset == MSG.len() as u64
+                }) {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("receive progress before application read");
+        let buffered = progress.sample().expect("buffered progress");
+        assert_eq!(buffered.read_offset, 0);
+        assert_eq!(buffered.next_received_offset, Some(0));
+        assert_eq!(buffered.buffered_bytes, MSG.len());
+        assert_eq!(buffered.ordered_gap_bytes, 0);
+
+        let mut data = vec![0; MSG.len()];
+        recv.read_exact(&mut data).await.expect("read stream payload");
+        assert_eq!(data, MSG);
+        let delivered = progress.sample().expect("delivered progress");
+        assert_eq!(delivered.read_offset, MSG.len() as u64);
+        assert_eq!(delivered.highest_received_offset, MSG.len() as u64);
+        assert_eq!(delivered.next_received_offset, None);
+        assert_eq!(delivered.buffered_bytes, 0);
+        assert_eq!(delivered.ordered_gap_bytes, 0);
+        drop(recv);
+        assert!(
+            progress.sample().is_err(),
+            "a released receive stream must not retain recoverable progress"
+        );
+    });
+
+    let connection = endpoint
+        .connect(endpoint.local_addr().expect("endpoint address"), "localhost")
+        .expect("start connection")
+        .await
+        .expect("client handshake");
+    let mut send = connection.open_uni().await.expect("open stream");
+    send.write_all(MSG).await.expect("write stream payload");
+    send.finish().expect("finish stream");
+    server.await.expect("server task");
+}
+
+#[tokio::test]
 async fn connection_path_changed_resets_transport_state_and_preserves_stream() {
     let _guard = subscribe();
     const INITIAL_RTT: Duration = Duration::from_millis(250);
@@ -874,7 +936,8 @@ async fn rebind_recv() {
     };
     let server_addr = server.local_addr().unwrap();
 
-    const MSG: &[u8; 5] = b"hello";
+    const BEFORE_REBIND: &[u8; 6] = b"before";
+    const AFTER_REBIND: &[u8; 5] = b"after";
 
     let write_send = Arc::new(tokio::sync::Notify::new());
     let write_recv = write_send.clone();
@@ -884,11 +947,12 @@ async fn rebind_recv() {
         let connection = server.accept().await.unwrap().await.unwrap();
         info!("got conn");
         connected_send.notify_one();
+        let mut stream = connection.open_uni().await.unwrap();
+        stream.write_all(BEFORE_REBIND).await.unwrap();
         write_recv.notified().await;
         let mut path_probe = connection.accept_uni().await.unwrap();
         assert_eq!(path_probe.read_to_end(1).await.unwrap(), b"p");
-        let mut stream = connection.open_uni().await.unwrap();
-        stream.write_all(MSG).await.unwrap();
+        stream.write_all(AFTER_REBIND).await.unwrap();
         stream.finish().unwrap();
         // Wait for the stream to be closed, one way or another.
         _ = stream.stopped().await;
@@ -904,6 +968,12 @@ async fn rebind_recv() {
     };
     info!("connected");
     connected_recv.notified().await;
+    let mut stream = connection.accept_uni().await.unwrap();
+    let stream_id = stream.id();
+    let progress = stream.progress_handle();
+    let mut before = [0; BEFORE_REBIND.len()];
+    stream.read_exact(&mut before).await.unwrap();
+    assert_eq!(&before, BEFORE_REBIND);
     assert_eq!(client.stats().socket_rebinds, 0);
     assert_eq!(client.stats().current_socket_rx_rebind_generation, 0);
     assert_eq!(connection.current_socket_rx_rebind_generation(), 0);
@@ -918,8 +988,9 @@ async fn rebind_recv() {
     path_probe.write_all(b"p").await.unwrap();
     path_probe.finish().unwrap();
     write_send.notify_one();
-    let mut stream = connection.accept_uni().await.unwrap();
-    assert_eq!(stream.read_to_end(MSG.len()).await.unwrap(), MSG);
+    assert_eq!(stream.id(), stream_id);
+    assert_eq!(progress.id(), stream_id);
+    assert_eq!(stream.read_to_end(AFTER_REBIND.len()).await.unwrap(), AFTER_REBIND);
     assert_eq!(client.stats().current_socket_rx_rebind_generation, 1);
     assert_eq!(connection.current_socket_rx_rebind_generation(), 1);
     server.await.unwrap();

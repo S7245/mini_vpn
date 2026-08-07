@@ -24,6 +24,7 @@ use send::{BytesSource, Send, SendState};
 pub use send::{FinishError, WriteError, Written};
 
 mod state;
+use state::StreamRecv;
 #[allow(unreachable_pub)] // fuzzing only
 pub use state::StreamsState;
 
@@ -108,7 +109,41 @@ pub struct RecvStream<'a> {
     pub(super) pending: &'a mut Retransmits,
 }
 
+/// Read-only ordered-delivery progress for one receive stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecvStreamProgress {
+    /// Length of the contiguous prefix already consumed by the application.
+    pub read_offset: u64,
+    /// Lowest offset of any currently buffered chunk.
+    pub next_received_offset: Option<u64>,
+    /// Greatest stream offset observed from the peer.
+    pub highest_received_offset: u64,
+    /// Bytes currently held by the receive assembler, including duplicates.
+    pub buffered_bytes: usize,
+    /// Missing bytes between `read_offset` and `next_received_offset`.
+    pub ordered_gap_bytes: u64,
+}
+
 impl RecvStream<'_> {
+    /// Return a read-only snapshot of ordered receive progress.
+    pub fn progress(&self) -> Result<RecvStreamProgress, ClosedStream> {
+        let stream = self
+            .state
+            .recv
+            .get(&self.id)
+            .and_then(|stream| stream.as_ref())
+            .and_then(StreamRecv::as_open_recv)
+            .ok_or(ClosedStream { _private: () })?;
+        let progress = stream.assembler.progress();
+        Ok(RecvStreamProgress {
+            read_offset: progress.read_offset,
+            next_received_offset: progress.next_received_offset,
+            highest_received_offset: progress.highest_received_offset,
+            buffered_bytes: progress.buffered_bytes,
+            ordered_gap_bytes: progress.ordered_gap_bytes,
+        })
+    }
+
     /// Read from the given recv stream
     ///
     /// `max_length` limits the maximum size of the returned `Bytes` value; passing `usize::MAX`

@@ -241,8 +241,8 @@ Before another formal M2 after an initial-stream architecture or observer
 change, replace step 15 with:
   caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2-qualification
 
-M2 qualification runs only one exact 300s forward + 300s reverse + 180s
-reverse-UDP + 10s short-forward cycle. It normally takes about 15 minutes,
+M2 qualification runs exactly two 300s forward + 300s reverse + 180s
+reverse-UDP + 10s short-forward cycles. It normally takes about 30 minutes,
 stops on the same data-quality/safety failures, and can never satisfy formal
 M2 acceptance. Always continue with status and stop.
 
@@ -3141,7 +3141,7 @@ EOF_M2_PROFILE
 }
 
 runner_self_test() {
-  local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture service_fixture dns_fixture m2_route_bin m2_ifconfig_bin m2_networksetup_bin m2_dscacheutil_bin m2_curl_bin m2_route_state m2_run m2_result m2_schedule_run m2_test_profile m2_checkpoint_file m2_capture_run m2_ipv6_evidence original_m2_route_bin original_m2_ifconfig_bin original_m2_networksetup_bin original_m2_dscacheutil_bin original_m2_curl_bin collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir baseline_summary_text m0_profile m1_profile m2_profile m1_test_profile m0_run m1_stage_run m1_run m1_diagnostic_run m1_diagnostic_fail_run m1_diagnostic_formal_run m1_checkpoint_file m1_capture_run m1_formal_run m1_tcp_fixture m1_udp_fixture m0_fail_run direct_dir fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash bounded_status result_index result_label sample_index violations_before violation_count invalid_violations ipv6_class ipv6_interface cleanup_class
+  local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture service_fixture dns_fixture m2_route_bin m2_ifconfig_bin m2_networksetup_bin m2_dscacheutil_bin m2_curl_bin m2_route_state m2_run m2_result m2_schedule_run m2_test_profile m2_checkpoint_file m2_capture_run m2_ipv6_evidence original_m2_route_bin original_m2_ifconfig_bin original_m2_networksetup_bin original_m2_dscacheutil_bin original_m2_curl_bin collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir baseline_summary_text m0_profile m1_profile m2_profile m1_test_profile m0_run m1_stage_run m1_run m1_diagnostic_run m1_diagnostic_fail_run m1_diagnostic_formal_run m1_checkpoint_file m1_capture_run m1_formal_run m1_tcp_fixture m1_udp_fixture m0_fail_run direct_dir fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash bounded_status cycle_index result_index result_label sample_index violations_before violation_count invalid_violations ipv6_class ipv6_interface cleanup_class
   local m2_record_fail_run quiescence_record_status m2_replay_log
   local m2_qualification_run m2_qualification_fail_run
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/knife15-macos-self-test.XXXXXX")" || return 1
@@ -4257,22 +4257,26 @@ EOF_FAKE_SLEEP
     "$m2_qualification_run" "$m2_test_profile" || \
     die "self-test: compressed M2 qualification failed"
   [[ "$(grep -Fc $'\tm2-qualification phase complete ' \
-    "$m2_qualification_run/events.tsv")" == "4" ]] || \
+    "$m2_qualification_run/events.tsv")" == "8" ]] || \
     die "self-test: M2 qualification phase count mismatch"
-  for result_label in tcp-forward tcp-reverse udp-reverse short-forward-1; do
-    [[ "$(grep -Fc $'\tm2-qualification phase complete cycle=1 phase='"$result_label" \
-      "$m2_qualification_run/events.tsv")" == "1" ]] || \
-      die "self-test: M2 qualification exact phase missing: $result_label"
+  for cycle_index in 1 2; do
+    for result_label in tcp-forward tcp-reverse udp-reverse short-forward-1; do
+      [[ "$(grep -Fc $'\tm2-qualification phase complete cycle='"$cycle_index"' phase='"$result_label" \
+        "$m2_qualification_run/events.tsv")" == "1" ]] || \
+        die "self-test: M2 qualification exact phase missing: cycle=$cycle_index $result_label"
+    done
   done
   ! grep -Eq $'\tm2-qualification (active|idle|resume|final drain) ' \
     "$m2_qualification_run/events.tsv" || \
     die "self-test: M2 qualification entered a formal timeline window"
-  [[ "$(grep -Fc $'\tm2-qualification DNS complete cycle=1' \
-    "$m2_qualification_run/events.tsv")" == "1" ]] || \
+  [[ "$(grep -Fc $'\tm2-qualification DNS complete cycle=' \
+    "$m2_qualification_run/events.tsv")" == "2" ]] || \
     die "self-test: M2 qualification DNS count mismatch"
-  [[ "$(grep -Fc $'\tm2-qualification cycle complete cycle=1' \
-    "$m2_qualification_run/events.tsv")" == "1" ]] || \
+  [[ "$(grep -Fc $'\tm2-qualification cycle complete cycle=' \
+    "$m2_qualification_run/events.tsv")" == "2" ]] || \
     die "self-test: M2 qualification cycle identity mismatch"
+  [[ "$M2_COMPLETE_CYCLE_INDEX" == "2" && "$M0_CYCLE_INDEX" == "2" ]] || \
+    die "self-test: M2 qualification complete-cycle state mismatch"
   grep -Fxq PASS_NON_ACCEPTANCE \
     "$m2_qualification_run/m2-qualification.status" || \
     die "self-test: M2 qualification success status mismatch"
@@ -4280,6 +4284,21 @@ EOF_FAKE_SLEEP
     ! -e "$m2_qualification_run/m2-pre-stop-verdict.txt" ]] || \
     die "self-test: M2 qualification created formal acceptance evidence"
   mkdir -p "$m2_qualification_run/m2-qualification-real-client"
+  m2_qualification_result_slo "$m2_qualification_run" 0 || \
+    die "self-test: M2 qualification exact result envelope failed"
+  : >"$m2_qualification_run/mini_vpn.log"
+  endpoint_rebind_lifecycle_is_clean "$m2_qualification_run/mini_vpn.log" || \
+    die "self-test: empty M2 qualification rebind lifecycle rejected"
+  printf '%s\n' \
+    'tuic-endpoint-rebind generation=1 trigger=tcp_ordered_read_gap' \
+    >>"$m2_qualification_run/mini_vpn.log"
+  ! endpoint_rebind_lifecycle_is_clean "$m2_qualification_run/mini_vpn.log" || \
+    die "self-test: unrecovered M2 qualification rebind accepted"
+  printf '%s\n' \
+    'tuic-endpoint-rebind-recovered generation=1 first_rx_ms=250 socket_generation=1' \
+    >>"$m2_qualification_run/mini_vpn.log"
+  endpoint_rebind_lifecycle_is_clean "$m2_qualification_run/mini_vpn.log" || \
+    die "self-test: recovered M2 qualification rebind rejected"
   printf '%s\n' \
     'qualification_slo_evidence=PASS' \
     'formal_m2_acceptance=NOT_RUN' \
@@ -7112,6 +7131,7 @@ run_m2_qualification_body() {
   local profile_file="$2"
   local target iperf_port dns_target dns_name tcp_secs udp_secs short_secs
   local tcp_forward_bps tcp_reverse_bps udp_reverse_bps short_forward_bps
+  local cycle_index real_client_label
   target="$(m0_profile_value "$profile_file" target)"
   iperf_port="$(m0_profile_value "$profile_file" iperf_port)"
   dns_target="$(m0_profile_value "$profile_file" dns_target)"
@@ -7125,31 +7145,37 @@ run_m2_qualification_body() {
   udp_reverse_bps="$(m0_profile_value "$profile_file" steady_udp_reverse_bps)"
   short_forward_bps="$(m0_profile_value "$profile_file" steady_short_forward_bps)"
 
-  M0_CYCLE_INDEX=1
+  M0_CYCLE_INDEX=0
   M0_RESUME_PENDING=0
   M2_COMPLETE_CYCLE_INDEX=0
   append_event_to "$run_dir" \
-    "$SOAK_STAGE start exact_cycle=1 planned_secs=$((10#$tcp_secs * 2 + 10#$udp_secs + 10#$short_secs))"
-  run_m0_iperf_phase "$run_dir" "$target" "$iperf_port" 1 \
-    tcp-forward "$tcp_secs" "$tcp_forward_bps" 0 0 || return 1
-  run_m0_iperf_phase "$run_dir" "$target" "$iperf_port" 1 \
-    tcp-reverse "$tcp_secs" "$tcp_reverse_bps" 1 0 || return 1
-  run_m0_iperf_phase "$run_dir" "$target" "$iperf_port" 1 \
-    udp-reverse "$udp_secs" "$udp_reverse_bps" 1 1 || return 1
-  run_m0_iperf_phase "$run_dir" "$target" "$iperf_port" 1 \
-    short-forward-1 "$short_secs" "$short_forward_bps" 0 0 || return 1
-  run_m0_dns_phase "$run_dir" "$dns_target" "$dns_name" 1 || return 1
-  M2_COMPLETE_CYCLE_INDEX=1
-  if [[ "${SOAK_REAL_CLIENT_PROBE:-0}" == "1" ]]; then
-    run_m2_real_client_probe "$run_dir" qualification_cycle_001 || {
-      append_event_to "$run_dir" \
-        "$SOAK_STAGE real client failed cycle=1"
-      return 1
-    }
-  fi
-  append_event_to "$run_dir" "$SOAK_STAGE cycle complete cycle=1"
-  append_event_to "$run_dir" "$SOAK_STAGE complete exact_cycle=1"
-  m0_progress "$SOAK_LABEL exact mixed cycle complete"
+    "$SOAK_STAGE start exact_cycles=2 planned_secs=$((2 * (10#$tcp_secs * 2 + 10#$udp_secs + 10#$short_secs)))"
+  for cycle_index in 1 2; do
+    M0_CYCLE_INDEX="$cycle_index"
+    run_m0_iperf_phase "$run_dir" "$target" "$iperf_port" "$cycle_index" \
+      tcp-forward "$tcp_secs" "$tcp_forward_bps" 0 0 || return 1
+    run_m0_iperf_phase "$run_dir" "$target" "$iperf_port" "$cycle_index" \
+      tcp-reverse "$tcp_secs" "$tcp_reverse_bps" 1 0 || return 1
+    run_m0_iperf_phase "$run_dir" "$target" "$iperf_port" "$cycle_index" \
+      udp-reverse "$udp_secs" "$udp_reverse_bps" 1 1 || return 1
+    run_m0_iperf_phase "$run_dir" "$target" "$iperf_port" "$cycle_index" \
+      short-forward-1 "$short_secs" "$short_forward_bps" 0 0 || return 1
+    run_m0_dns_phase "$run_dir" "$dns_target" "$dns_name" "$cycle_index" || return 1
+    M2_COMPLETE_CYCLE_INDEX="$cycle_index"
+    if [[ "${SOAK_REAL_CLIENT_PROBE:-0}" == "1" ]]; then
+      printf -v real_client_label 'cycle_%03d' "$cycle_index"
+      run_m2_real_client_probe "$run_dir" "$real_client_label" || {
+        append_event_to "$run_dir" \
+          "$SOAK_STAGE real client failed cycle=$cycle_index"
+        return 1
+      }
+    fi
+    append_event_to "$run_dir" \
+      "$SOAK_STAGE cycle complete cycle=$cycle_index"
+    m0_progress \
+      "$SOAK_LABEL exact mixed cycle complete cycle=$cycle_index/2"
+  done
+  append_event_to "$run_dir" "$SOAK_STAGE complete exact_cycles=2"
 }
 
 run_m2_qualification_schedule() {
@@ -7661,6 +7687,103 @@ m2_source_is_accepted() {
   git -C "$REPO" merge-base --is-ancestor 5e7a97c HEAD >/dev/null 2>&1
 }
 
+endpoint_rebind_lifecycle_is_clean() {
+  local log_file="$1"
+  local successes recoveries failures max_first_rx
+  [[ -f "$log_file" && ! -L "$log_file" ]] || return 1
+  successes="$(grep -Ec 'tuic-endpoint-rebind generation=[0-9]+' \
+    "$log_file" 2>/dev/null || true)"
+  recoveries="$(grep -Ec \
+    'tuic-endpoint-rebind-recovered generation=[0-9]+ first_rx_ms=[0-9]+ socket_generation=[0-9]+' \
+    "$log_file" 2>/dev/null || true)"
+  failures="$(grep -Ec 'tuic-endpoint-rebind-failed generation=[0-9]+' \
+    "$log_file" 2>/dev/null || true)"
+  max_first_rx="$(awk '
+    match($0, /tuic-endpoint-rebind-recovered generation=[0-9]+ first_rx_ms=[0-9]+/) {
+      value = substr($0, RSTART, RLENGTH)
+      sub(/^.*first_rx_ms=/, "", value)
+      if (value + 0 > maximum) maximum = value + 0
+    }
+    END { print maximum + 0 }
+  ' "$log_file" 2>/dev/null)"
+  [[ "$successes" =~ ^[0-9]+$ && "$recoveries" =~ ^[0-9]+$ && \
+    "$failures" == "0" && "$max_first_rx" =~ ^[0-9]+$ ]] || return 1
+  ((10#$successes == 10#$recoveries && 10#$max_first_rx <= 7000))
+}
+
+m2_qualification_result_slo() {
+  local run_dir="$1"
+  local expected_real_results="$2"
+  local status cycles dns phase_results phase_failures health_failures real_failures
+  local tcp_results udp_results tcp_gap udp_loss invalid_results sender_zero receiver_zero
+  local dns_files invalid_dns real_results invalid_real
+  [[ "$expected_real_results" =~ ^[0-9]+$ ]] || return 1
+  status="$(sed -n '1p' "$run_dir/m2-qualification.status" 2>/dev/null || true)"
+  cycles="$(grep -Fc $'\tm2-qualification cycle complete cycle=' \
+    "$run_dir/events.tsv" 2>/dev/null || true)"
+  dns="$(grep -Fc $'\tm2-qualification DNS complete cycle=' \
+    "$run_dir/events.tsv" 2>/dev/null || true)"
+  phase_results="$(grep -Fc $'\tm2-qualification phase complete ' \
+    "$run_dir/events.tsv" 2>/dev/null || true)"
+  phase_failures="$(grep -Fc $'\tm2-qualification phase failed ' \
+    "$run_dir/events.tsv" 2>/dev/null || true)"
+  health_failures="$(grep -Fc $'\tm2-qualification health failed:' \
+    "$run_dir/events.tsv" 2>/dev/null || true)"
+  real_failures="$(grep -Fc $'\tm2-qualification real client failed ' \
+    "$run_dir/events.tsv" 2>/dev/null || true)"
+  read -r tcp_results udp_results tcp_gap udp_loss invalid_results \
+    sender_zero receiver_zero \
+    <<<"$(m0_result_envelope "$run_dir/m2-qualification")"
+  read -r dns_files invalid_dns \
+    <<<"$(m0_dns_result_envelope "$run_dir/m2-qualification")"
+  read -r real_results invalid_real \
+    <<<"$(m2_real_client_envelope "$run_dir/m2-qualification-real-client")"
+  [[ "$status" == "PASS_NON_ACCEPTANCE" && "$cycles" == "2" && \
+    "$dns" == "2" && "$phase_results" == "8" && \
+    "$phase_failures" == "0" && "$health_failures" == "0" && \
+    "$real_failures" == "0" && "$tcp_results" == "6" && \
+    "$udp_results" == "2" && "$invalid_results" == "0" && \
+    "$sender_zero" =~ ^[0-9]+$ && "$receiver_zero" == "0" && \
+    "$dns_files" == "2" && "$invalid_dns" == "0" && \
+    "$real_results" == "$expected_real_results" && "$invalid_real" == "0" && \
+    "$tcp_gap" =~ ^[0-9]+$ ]] || return 1
+  ((10#$tcp_gap <= 16777216)) && decimal_le "$udp_loss" 3.0
+}
+
+m2_qualification_terminal_safety() {
+  local run_dir="$1"
+  local log_file="$run_dir/mini_vpn.log"
+  local endpoint_samples endpoint_max endpoint_available endpoint_live
+  local endpoint_outstanding endpoint_max_live endpoint_max_outstanding
+  local remote_failures remote_log_matches
+  local value
+  read -r endpoint_samples endpoint_max endpoint_available endpoint_live \
+    endpoint_outstanding endpoint_max_live endpoint_max_outstanding \
+    <<<"$(endpoint_resource_envelope "$log_file")"
+  for value in "$endpoint_samples" "$endpoint_max" "$endpoint_live" \
+    "$endpoint_outstanding"; do
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  done
+  ((10#$endpoint_samples > 0 && 10#$endpoint_max <= 61440 && \
+    10#$endpoint_live == 0 && 10#$endpoint_outstanding == 0)) || return 1
+  remote_log_matches="$(grep -Ec \
+    '写入上游流失败|reason=remote_write_failed|reason=stalled_write_timeout' \
+    "$log_file" 2>/dev/null || true)"
+  remote_failures="$(grep -Ec \
+    'tcp-d16-relay-close .*terminal_reason=(remote_write_failed|stalled_write_timeout)( |$)' \
+    "$log_file" 2>/dev/null || true)"
+  if [[ "$remote_failures" != "0" || "$remote_log_matches" != "0" ]]; then
+    [[ "$remote_failures" =~ ^[1-9][0-9]*$ ]] && \
+      remote_write_close_ownership_is_clean "$log_file" || return 1
+  fi
+  endpoint_rebind_lifecycle_is_clean "$log_file" && \
+    conservation_check_file "$log_file" && \
+    d16_terminal_ownership_is_clean "$log_file" && \
+    ! grep -Eq \
+      'pump_full_waits=[1-9][0-9]*|pump_read_errors=[1-9][0-9]*|send_slice_errors=[1-9][0-9]*|tun_flush_tx_failures=[1-9][0-9]*|terminal_pending_reap_bytes=[1-9][0-9]*|reason=stalled_write_timeout|reason=idle_timeout' \
+      "$log_file"
+}
+
 free_kb_for_path() {
   df -Pk "$1" 2>/dev/null | awk 'NR == 2 && $4 ~ /^[0-9]+$/ {print $4; exit}'
 }
@@ -7984,7 +8107,7 @@ run_m2_action() {
   trap "interrupt_m0 '$run_dir' TERM" TERM
   trap "interrupt_m0 '$run_dir' HUP" HUP
   if [[ "$execution_mode" == "qualification" ]]; then
-    echo "Starting Knife15 M2 qualification; one exact mixed cycle takes about 15 minutes."
+    echo "Starting Knife15 M2 qualification; two exact mixed cycles take about 30 minutes."
     echo "This action can never satisfy formal M2 acceptance."
     if run_m2_qualification_schedule "$run_dir" "$profile_file"; then
       trap - INT TERM HUP
@@ -7992,7 +8115,8 @@ run_m2_action() {
       sample_once_for "$run_dir" || true
       if ! m0_assert_run_healthy "$run_dir" || \
         ! network_control_is_sufficient "$run_dir" 5 || \
-        ! conservation_check_file "$run_dir/mini_vpn.log"; then
+        ! m2_qualification_result_slo "$run_dir" 2 || \
+        ! m2_qualification_terminal_safety "$run_dir"; then
         printf '%s\n' failed >"$run_dir/$status_file"
         append_event_to "$run_dir" \
           "$stage failed: final health, network, or Endpoint evidence"
@@ -8005,7 +8129,7 @@ run_m2_action() {
         >"$run_dir/m2-qualification-verdict.txt" || \
         die "cannot record M2 qualification verdict"
       write_summary "$run_dir"
-      echo "PASS: M2 one-cycle qualification completed; this is not formal M2 acceptance."
+      echo "PASS: M2 two-cycle qualification completed; this is not formal M2 acceptance."
       echo "run_dir=$run_dir"
       echo "Next: sudo -E bash scripts/knife15-macos-soak.sh status"
       echo "Then: sudo -E bash scripts/knife15-macos-soak.sh stop"
@@ -8275,9 +8399,9 @@ append_m2_qualification_summary() {
     "$run_dir/events.tsv" 2>/dev/null || true)"
   phase_failures="$(grep -Fc $'\tm2-qualification phase failed ' \
     "$run_dir/events.tsv" 2>/dev/null || true)"
-  cycles="$(grep -Fc $'\tm2-qualification cycle complete cycle=1' \
+  cycles="$(grep -Fc $'\tm2-qualification cycle complete cycle=' \
     "$run_dir/events.tsv" 2>/dev/null || true)"
-  dns="$(grep -Fc $'\tm2-qualification DNS complete cycle=1' \
+  dns="$(grep -Fc $'\tm2-qualification DNS complete cycle=' \
     "$run_dir/events.tsv" 2>/dev/null || true)"
   read -r tcp_results udp_results tcp_gap udp_loss invalid_results \
     sender_zero receiver_zero \

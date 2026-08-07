@@ -19,6 +19,9 @@ mini_vpn changes are intentionally limited to:
   and characterize sub-millisecond multi-bucket refill;
 - `src/connection/paths.rs`: new-path wiring and migration inheritance;
 - `src/connection/stats.rs`: read-only pacing diagnostics;
+- `src/connection/assembler.rs` and `src/connection/streams/mod.rs`: a
+  read-only ordered receive-progress snapshot exposing the consumed prefix
+  and buffered bytes beyond a missing prefix, without recovery policy;
 - `src/connection/mod.rs`: pre-build reservation, traffic classification,
   per-datagram settlement, migration/cancel/detach, socket-batch attribution,
   pacing diagnostics, and a read-only authenticated-packet count used by the
@@ -29,5 +32,5 @@ mini_vpn changes are intentionally limited to:
   real GSO accounting, and socket-outcome behavior tests.
 
 No quinn-udp, congestion-control, MTU-discovery, crypto, loss timer, or stream
-flow-control implementation is replaced. The modified suite passes `309/309`
+flow-control implementation is replaced. The modified suite passes `311/311`
 unit tests and `3/3` doc tests.

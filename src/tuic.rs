@@ -1969,6 +1969,7 @@ struct TuicNativeOrderedReader<R = QuinnDirectOrderedNativeChunkRecv> {
     transport_conn: Option<Connection>,
     next_offset: u64,
     pending_self_wake_deadline: Option<Instant>,
+    _read_pressure: Option<TcpOrderedReadPressureReader>,
     _lease: TcpPoolSlotLease,
 }
 
@@ -1978,12 +1979,14 @@ impl TuicNativeOrderedReader<QuinnDirectOrderedNativeChunkRecv> {
         lease: TcpPoolSlotLease,
         tcp_diag: Option<TuicTcpStreamDiag>,
         transport_conn: Connection,
+        read_pressure: Option<TcpOrderedReadPressureReader>,
     ) -> Self {
         Self::from_recv(
             QuinnDirectOrderedNativeChunkRecv::new(recv),
             lease,
             tcp_diag,
             Some(transport_conn),
+            read_pressure,
         )
     }
 }
@@ -2001,6 +2004,7 @@ pub(crate) fn d16_native_ordered_reader_for_test(
         lease,
         None,
         transport_conn,
+        None,
     ))
 }
 
@@ -2045,6 +2049,7 @@ impl<R> TuicNativeOrderedReader<R> {
         lease: TcpPoolSlotLease,
         tcp_diag: Option<TuicTcpStreamDiag>,
         transport_conn: Option<Connection>,
+        read_pressure: Option<TcpOrderedReadPressureReader>,
     ) -> Self {
         Self {
             recv,
@@ -2052,6 +2057,7 @@ impl<R> TuicNativeOrderedReader<R> {
             transport_conn,
             next_offset: 0,
             pending_self_wake_deadline: None,
+            _read_pressure: read_pressure,
             _lease: lease,
         }
     }
@@ -4463,6 +4469,95 @@ struct TcpWritePressureSnapshot {
     acknowledged_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpOrderedReadProgressSnapshot {
+    reader: u64,
+    stream: u64,
+    read_offset: u64,
+    next_received_offset: Option<u64>,
+    highest_received_offset: u64,
+    buffered_bytes: usize,
+    ordered_gap_bytes: u64,
+}
+
+/// Per-generation registry of live ordered TCP readers. Sampling happens only on the existing
+/// 250ms recovery task; the receive hot path does not acquire this registry or a recovery lock.
+struct TcpOrderedReadPressure {
+    next_reader: AtomicU64,
+    readers: StdMutex<HashMap<u64, TcpOrderedReadPressureEntry>>,
+}
+
+struct TcpOrderedReadPressureEntry {
+    stream: u64,
+    progress: quinn::RecvStreamProgress,
+}
+
+struct TcpOrderedReadPressureReader {
+    pressure: Arc<TcpOrderedReadPressure>,
+    reader: u64,
+}
+
+impl TcpOrderedReadPressure {
+    fn new() -> Self {
+        Self {
+            next_reader: AtomicU64::new(0),
+            readers: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    fn reader(
+        self: &Arc<Self>,
+        stream: u64,
+        progress: quinn::RecvStreamProgress,
+    ) -> TcpOrderedReadPressureReader {
+        let reader = self
+            .next_reader
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.readers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(reader, TcpOrderedReadPressureEntry { stream, progress });
+        TcpOrderedReadPressureReader {
+            pressure: self.clone(),
+            reader,
+        }
+    }
+
+    fn snapshots(&self) -> Vec<TcpOrderedReadProgressSnapshot> {
+        self.readers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter_map(|(reader, entry)| {
+                let progress = entry.progress.sample().ok()?;
+                Some(TcpOrderedReadProgressSnapshot {
+                    reader: *reader,
+                    stream: entry.stream,
+                    read_offset: progress.read_offset,
+                    next_received_offset: progress.next_received_offset,
+                    highest_received_offset: progress.highest_received_offset,
+                    buffered_bytes: progress.buffered_bytes,
+                    ordered_gap_bytes: progress.ordered_gap_bytes,
+                })
+            })
+            .collect()
+    }
+
+    fn remove_reader(&self, reader: u64) {
+        self.readers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&reader);
+    }
+}
+
+impl Drop for TcpOrderedReadPressureReader {
+    fn drop(&mut self) {
+        self.pressure.remove_reader(self.reader);
+    }
+}
+
 /// Per-QUIC-connection registry for TCP writers currently blocked in `poll_write`.
 /// Each writer owns its own atomic progress clock so ACKs on unrelated streams cannot mask a
 /// business-stream black hole. The registry lock is used only at relay create/drop and by the
@@ -4748,6 +4843,7 @@ struct EndpointRecoveryConnectionSample {
     black_holes_detected: u64,
     current_socket_rx_rebind_generation: u64,
     tcp_write_pressures: Vec<TcpWritePressureSnapshot>,
+    tcp_ordered_read_progress: Vec<TcpOrderedReadProgressSnapshot>,
 }
 
 #[derive(Debug)]
@@ -4787,6 +4883,18 @@ enum EndpointRecoveryTrigger {
         black_hole_anchor: u64,
         black_holes_current: u64,
     },
+    TcpOrderedReadGap {
+        stable_id: usize,
+        reader: u64,
+        stream: u64,
+        episode: u64,
+        read_offset: u64,
+        next_received_offset: u64,
+        highest_received_offset: u64,
+        buffered_bytes: usize,
+        ordered_gap_bytes: u64,
+        observations: u64,
+    },
 }
 
 impl EndpointRecoveryTrigger {
@@ -4795,6 +4903,7 @@ impl EndpointRecoveryTrigger {
             Self::NoRx => "no_rx",
             Self::TcpWriteStall { .. } => "tcp_write_stall",
             Self::TcpPathDegraded { .. } => "tcp_path_degraded",
+            Self::TcpOrderedReadGap { .. } => "tcp_ordered_read_gap",
         }
     }
 
@@ -4832,6 +4941,36 @@ impl EndpointRecoveryTrigger {
                 acknowledged_bytes,
                 pending_for.as_millis(),
             ),
+            Self::TcpOrderedReadGap { .. } => (0, 0, 0, 0, 0, 0),
+        }
+    }
+
+    fn tcp_read_fields(self) -> (usize, u64, u64, u64, u64, u64, u64, usize, u64, u64) {
+        match self {
+            Self::TcpOrderedReadGap {
+                stable_id,
+                reader,
+                stream,
+                episode,
+                read_offset,
+                next_received_offset,
+                highest_received_offset,
+                buffered_bytes,
+                ordered_gap_bytes,
+                observations,
+            } => (
+                stable_id,
+                reader,
+                stream,
+                episode,
+                read_offset,
+                next_received_offset,
+                highest_received_offset,
+                buffered_bytes,
+                ordered_gap_bytes,
+                observations,
+            ),
+            _ => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
         }
     }
 }
@@ -4867,6 +5006,14 @@ struct EndpointRecoveryCounters {
     rx_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TcpOrderedReadGapAnchor {
+    progress: TcpOrderedReadProgressSnapshot,
+    episode: u64,
+    observed_at: Instant,
+    observations: u64,
+}
+
 #[derive(Debug, Default)]
 struct EndpointRecoveryState {
     connections: HashMap<usize, EndpointRecoveryCounters>,
@@ -4882,11 +5029,108 @@ struct EndpointRecoveryState {
     path_black_hole_anchors: HashMap<usize, u64>,
     path_reset_consumed: HashSet<usize>,
     path_reset_generation: u64,
+    tcp_ordered_read_gap_anchors: HashMap<(usize, u64), TcpOrderedReadGapAnchor>,
+    covered_tcp_ordered_read_gap_episodes: HashMap<(usize, u64), u64>,
+    next_tcp_ordered_read_gap_episode: u64,
     observed_udp_activity_secs: u64,
     udp_demand_since_rx: bool,
 }
 
 impl EndpointRecoveryState {
+    fn clear_tcp_ordered_read_gap_episodes(&mut self) {
+        self.tcp_ordered_read_gap_anchors.clear();
+        self.covered_tcp_ordered_read_gap_episodes.clear();
+    }
+
+    fn refresh_tcp_ordered_read_gap_ownership(
+        &mut self,
+        now: Instant,
+        input: &EndpointRecoveryInput,
+    ) {
+        let current = input
+            .connections
+            .iter()
+            .flat_map(|connection| {
+                connection
+                    .tcp_ordered_read_progress
+                    .iter()
+                    .copied()
+                    .map(move |progress| ((connection.stable_id, progress.reader), progress))
+            })
+            .collect::<HashMap<_, _>>();
+
+        self.tcp_ordered_read_gap_anchors.retain(|key, _| {
+            current
+                .get(key)
+                .is_some_and(|progress| progress.ordered_gap_bytes > 0)
+        });
+        self.covered_tcp_ordered_read_gap_episodes
+            .retain(|key, episode| {
+                self.tcp_ordered_read_gap_anchors
+                    .get(key)
+                    .is_some_and(|anchor| anchor.episode == *episode)
+            });
+
+        for (key, progress) in current {
+            if progress.ordered_gap_bytes == 0 {
+                self.tcp_ordered_read_gap_anchors.remove(&key);
+                self.covered_tcp_ordered_read_gap_episodes.remove(&key);
+                continue;
+            }
+            let unchanged = self
+                .tcp_ordered_read_gap_anchors
+                .get(&key)
+                .is_some_and(|anchor| {
+                    anchor.progress.stream == progress.stream
+                        && anchor.progress.read_offset == progress.read_offset
+                        && anchor.progress.next_received_offset == progress.next_received_offset
+                });
+            if unchanged {
+                if let Some(anchor) = self.tcp_ordered_read_gap_anchors.get_mut(&key) {
+                    anchor.progress = progress;
+                    anchor.observations = anchor.observations.saturating_add(1);
+                }
+                continue;
+            }
+
+            self.next_tcp_ordered_read_gap_episode =
+                self.next_tcp_ordered_read_gap_episode.saturating_add(1);
+            self.tcp_ordered_read_gap_anchors.insert(
+                key,
+                TcpOrderedReadGapAnchor {
+                    progress,
+                    episode: self.next_tcp_ordered_read_gap_episode,
+                    observed_at: now,
+                    observations: 1,
+                },
+            );
+            self.covered_tcp_ordered_read_gap_episodes.remove(&key);
+        }
+    }
+
+    fn eligible_tcp_ordered_read_gap(
+        &self,
+        now: Instant,
+    ) -> Option<(usize, TcpOrderedReadGapAnchor)> {
+        self.tcp_ordered_read_gap_anchors
+            .iter()
+            .filter(|(key, anchor)| {
+                anchor.observations >= 2
+                    && now.saturating_duration_since(anchor.observed_at)
+                        >= ENDPOINT_RECOVERY_SAMPLE_INTERVAL
+                    && self.covered_tcp_ordered_read_gap_episodes.get(key) != Some(&anchor.episode)
+            })
+            .map(|((stable_id, _), anchor)| (*stable_id, *anchor))
+            .max_by_key(|(stable_id, anchor)| {
+                (
+                    now.saturating_duration_since(anchor.observed_at),
+                    anchor.progress.buffered_bytes,
+                    *stable_id,
+                    anchor.progress.reader,
+                )
+            })
+    }
+
     fn cover_tcp_write_episodes(&mut self, input: &EndpointRecoveryInput) {
         for sample in &input.connections {
             for pressure in &sample.tcp_write_pressures {
@@ -5037,6 +5281,39 @@ impl EndpointRecoveryState {
         }
     }
 
+    fn begin_tcp_ordered_read_gap_rebind(
+        &mut self,
+        now: Instant,
+        input: &EndpointRecoveryInput,
+        stable_id: usize,
+        anchor: TcpOrderedReadGapAnchor,
+        max_rtt: Duration,
+    ) -> EndpointRecoveryAction {
+        let progress = anchor.progress;
+        self.covered_tcp_ordered_read_gap_episodes
+            .insert((stable_id, progress.reader), anchor.episode);
+        self.begin_rebind(
+            input,
+            EndpointRecoveryTrigger::TcpOrderedReadGap {
+                stable_id,
+                reader: progress.reader,
+                stream: progress.stream,
+                episode: anchor.episode,
+                read_offset: progress.read_offset,
+                next_received_offset: progress
+                    .next_received_offset
+                    .unwrap_or(progress.read_offset),
+                highest_received_offset: progress.highest_received_offset,
+                buffered_bytes: progress.buffered_bytes,
+                ordered_gap_bytes: progress.ordered_gap_bytes,
+                observations: anchor.observations,
+            },
+            now.saturating_duration_since(anchor.observed_at),
+            ENDPOINT_RECOVERY_SAMPLE_INTERVAL,
+            max_rtt,
+        )
+    }
+
     fn observe(&mut self, now: Instant, input: &EndpointRecoveryInput) -> EndpointRecoveryAction {
         if input.last_udp_activity_secs < self.observed_udp_activity_secs {
             self.observed_udp_activity_secs = input.last_udp_activity_secs;
@@ -5071,6 +5348,7 @@ impl EndpointRecoveryState {
         }
         self.connections = next;
         self.refresh_path_recovery_ownership(input);
+        self.refresh_tcp_ordered_read_gap_ownership(now, input);
         self.covered_tcp_write_episodes
             .retain(|(stable_id, writer), episode| {
                 input.connections.iter().any(|sample| {
@@ -5110,12 +5388,14 @@ impl EndpointRecoveryState {
             if self.expected_socket_generation.is_some() {
                 return EndpointRecoveryAction::None;
             }
+            self.clear_tcp_ordered_read_gap_episodes();
             self.clear_episode();
             return EndpointRecoveryAction::None;
         }
 
         let active_workload = input.active_tcp > 0 || input.udp_active;
         if !active_workload || input.connections.is_empty() {
+            self.clear_tcp_ordered_read_gap_episodes();
             self.clear_episode();
             return EndpointRecoveryAction::None;
         }
@@ -5138,6 +5418,13 @@ impl EndpointRecoveryState {
                 stall_bound,
                 max_rtt,
             );
+        }
+
+        if let Some((stable_id, anchor)) = self.eligible_tcp_ordered_read_gap(now)
+            && !self.rebind_issued
+            && self.expected_socket_generation.is_none()
+        {
+            return self.begin_tcp_ordered_read_gap_rebind(now, input, stable_id, anchor, max_rtt);
         }
 
         if let Some((stable_id, pressure, anchor, current)) =
@@ -5258,6 +5545,7 @@ struct TcpPoolGeneration<T> {
     transport: T,
     activity: Arc<TcpPoolGenerationActivity>,
     write_pressure: Arc<TcpWritePressure>,
+    read_pressure: Arc<TcpOrderedReadPressure>,
     open_state: Arc<TcpPoolOpenState>,
     auth_attempts: u64,
 }
@@ -5268,6 +5556,7 @@ impl<T: TcpPoolTransport> TcpPoolGeneration<T> {
             transport,
             activity: Arc::new(TcpPoolGenerationActivity::new()),
             write_pressure: Arc::new(TcpWritePressure::new(clock)),
+            read_pressure: Arc::new(TcpOrderedReadPressure::new()),
             open_state: Arc::new(TcpPoolOpenState::new_at_generation(generation)),
             auth_attempts,
         }
@@ -5484,6 +5773,7 @@ struct TcpPoolConnectionSelection {
     reconnect_reason: Option<&'static str>,
     open_state: Arc<TcpPoolOpenState>,
     write_pressure: Arc<TcpWritePressure>,
+    read_pressure: Arc<TcpOrderedReadPressure>,
     startup_auth_attempts: u64,
     replacement_installed: bool,
 }
@@ -6254,6 +6544,7 @@ impl TuicUpstream {
         let conn = current.transport.clone();
         let generation = open_state.generation();
         let write_pressure = current.write_pressure.clone();
+        let read_pressure = current.read_pressure.clone();
         let startup_auth_attempts = current.auth_attempts;
         drop(state);
         drop(preparation);
@@ -6276,6 +6567,7 @@ impl TuicUpstream {
             reconnect_reason,
             open_state,
             write_pressure,
+            read_pressure,
             startup_auth_attempts,
             replacement_installed,
         })
@@ -6630,6 +6922,18 @@ impl TuicUpstream {
                             write_acknowledged_bytes,
                             write_pending_ms,
                         ) = trigger.tcp_write_fields();
+                        let (
+                            read_conn,
+                            read_reader,
+                            read_stream,
+                            read_episode,
+                            read_offset,
+                            read_next_offset,
+                            read_highest_offset,
+                            read_buffered_bytes,
+                            read_gap_bytes,
+                            read_observations,
+                        ) = trigger.tcp_read_fields();
                         match quic::rebind_client_endpoint_udp_socket(
                             &upstream.endpoint,
                             upstream.udp_send_service_policy,
@@ -6638,7 +6942,7 @@ impl TuicUpstream {
                             Ok(rebound) => {
                                 state.note_rebind_succeeded(now, rebound.rebind_generation);
                                 println!(
-                                    "🔄 tuic-endpoint-rebind generation={generation} trigger={} write_conn={} write_writer={} write_stream={} write_episode={} write_acknowledged={}B write_pending_ms={} old_local={} new_local={} socket_generation={} active_tcp={} udp_active={} live_connections={} stalled_ms={} bound_ms={} tx_since_rx={}B max_rtt_ms={}",
+                                    "🔄 tuic-endpoint-rebind generation={generation} trigger={} write_conn={} write_writer={} write_stream={} write_episode={} write_acknowledged={}B write_pending_ms={} read_conn={read_conn} read_reader={read_reader} read_stream={read_stream} read_episode={read_episode} read_offset={read_offset} read_next_offset={read_next_offset} read_highest_offset={read_highest_offset} read_buffered={read_buffered_bytes}B read_gap={read_gap_bytes}B read_observations={read_observations} old_local={} new_local={} socket_generation={} active_tcp={} udp_active={} live_connections={} stalled_ms={} bound_ms={} tx_since_rx={}B max_rtt_ms={}",
                                     trigger.label(),
                                     write_conn,
                                     write_writer,
@@ -6660,7 +6964,7 @@ impl TuicUpstream {
                             }
                             Err(error) => {
                                 println!(
-                                    "⚠️ tuic-endpoint-rebind-failed generation={generation} trigger={} write_conn={} write_writer={} write_stream={} write_episode={} write_acknowledged={}B write_pending_ms={} active_tcp={} udp_active={} live_connections={} stalled_ms={} bound_ms={} tx_since_rx={}B max_rtt_ms={} error={error}",
+                                    "⚠️ tuic-endpoint-rebind-failed generation={generation} trigger={} write_conn={} write_writer={} write_stream={} write_episode={} write_acknowledged={}B write_pending_ms={} read_conn={read_conn} read_reader={read_reader} read_stream={read_stream} read_episode={read_episode} read_offset={read_offset} read_next_offset={read_next_offset} read_highest_offset={read_highest_offset} read_buffered={read_buffered_bytes}B read_gap={read_gap_bytes}B read_observations={read_observations} active_tcp={} udp_active={} live_connections={} stalled_ms={} bound_ms={} tx_since_rx={}B max_rtt_ms={} error={error}",
                                     trigger.label(),
                                     write_conn,
                                     write_writer,
@@ -6709,6 +7013,7 @@ impl TuicUpstream {
                     black_holes_detected: stats.path.black_holes_detected,
                     current_socket_rx_rebind_generation: conn.current_socket_rx_rebind_generation(),
                     tcp_write_pressures: generation.write_pressure.snapshots_at(sampled_at),
+                    tcp_ordered_read_progress: generation.read_pressure.snapshots(),
                 });
                 connection_handles.push(EndpointRecoveryConnectionHandle {
                     stable_id,
@@ -6785,6 +7090,7 @@ impl ProxyUpstream for TuicUpstream {
             reconnect_reason,
             open_state,
             write_pressure,
+            read_pressure: _,
             startup_auth_attempts,
             replacement_installed,
         } = selection;
@@ -6940,6 +7246,7 @@ impl ProxyUpstream for TuicUpstream {
             reconnect_reason,
             open_state,
             write_pressure,
+            read_pressure,
             startup_auth_attempts,
             replacement_installed,
         } = selection;
@@ -7005,11 +7312,13 @@ impl ProxyUpstream for TuicUpstream {
                 )
             })?;
             let reader: NativeTcpReadHalf = if d16_byte_owned {
+                let read_pressure = read_pressure.reader(stream_id, recv.progress_handle());
                 Box::new(TuicNativeOrderedReader::new(
                     recv,
                     reader_lease,
                     tcp_stream_diag,
                     conn.clone(),
+                    Some(read_pressure),
                 ))
             } else if relay_mode == TuicTcpRelayMode::NativeOrderedPump {
                 Box::new(TuicNativeOrderedPumpReader::spawn(
@@ -7264,6 +7573,7 @@ mod tests {
             black_holes_detected,
             current_socket_rx_rebind_generation: 0,
             tcp_write_pressures: pressure.into_iter().collect(),
+            tcp_ordered_read_progress: Vec::new(),
         }
     }
 
@@ -7294,6 +7604,257 @@ mod tests {
             ack_stalled_for,
             acknowledged_bytes,
         }
+    }
+
+    fn endpoint_recovery_ordered_progress(
+        reader: u64,
+        stream: u64,
+        read_offset: u64,
+        next_received_offset: Option<u64>,
+        highest_received_offset: u64,
+        buffered_bytes: usize,
+    ) -> TcpOrderedReadProgressSnapshot {
+        TcpOrderedReadProgressSnapshot {
+            reader,
+            stream,
+            read_offset,
+            next_received_offset,
+            highest_received_offset,
+            buffered_bytes,
+            ordered_gap_bytes: next_received_offset
+                .unwrap_or(read_offset)
+                .saturating_sub(read_offset),
+        }
+    }
+
+    #[test]
+    fn endpoint_recovery_rebinds_once_for_two_observations_of_the_same_ordered_gap() {
+        let started = Instant::now();
+        let mut state = EndpointRecoveryState::default();
+        let sample = |read_offset, next_received_offset, highest_received_offset| {
+            let mut connection = endpoint_recovery_connection(11, 0, None);
+            connection.tcp_ordered_read_progress = vec![endpoint_recovery_ordered_progress(
+                7,
+                21,
+                read_offset,
+                next_received_offset,
+                highest_received_offset,
+                96_732,
+            )];
+            endpoint_recovery_path_sample(vec![connection])
+        };
+
+        let first_gap = sample(569_624_937, Some(569_626_217), 569_721_669);
+        assert_eq!(
+            state.observe(started, &first_gap),
+            EndpointRecoveryAction::None,
+            "one sampler observation only establishes exact gap ownership"
+        );
+        let action = state.observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL, &first_gap);
+        assert!(matches!(
+            action,
+            EndpointRecoveryAction::Rebind {
+                generation: 1,
+                trigger: EndpointRecoveryTrigger::TcpOrderedReadGap {
+                    stable_id: 11,
+                    reader: 7,
+                    stream: 21,
+                    episode: 1,
+                    read_offset: 569_624_937,
+                    next_received_offset: 569_626_217,
+                    highest_received_offset: 569_721_669,
+                    buffered_bytes: 96_732,
+                    ordered_gap_bytes: 1_280,
+                    observations: 2,
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            state.observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 2, &first_gap),
+            EndpointRecoveryAction::None,
+            "covered exact gap authority cannot rebind twice"
+        );
+
+        let progressed = sample(569_721_669, None, 569_721_669);
+        assert_eq!(
+            state.observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 3, &progressed),
+            EndpointRecoveryAction::None
+        );
+        let later_gap = sample(700_000_000, Some(700_001_280), 700_080_000);
+        assert_eq!(
+            state.observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 4, &later_gap),
+            EndpointRecoveryAction::None
+        );
+        assert!(matches!(
+            state.observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 5, &later_gap),
+            EndpointRecoveryAction::Rebind {
+                generation: 2,
+                trigger: EndpointRecoveryTrigger::TcpOrderedReadGap { episode: 2, .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn endpoint_recovery_writer_ack_stall_precedes_an_eligible_ordered_gap() {
+        let started = Instant::now();
+        let rtt = Duration::from_millis(159);
+        let bound = endpoint_recovery_stall_bound(rtt);
+        let mut state = EndpointRecoveryState::default();
+        let sample = |with_writer: bool| {
+            let mut connection = endpoint_recovery_connection(
+                11,
+                0,
+                with_writer.then(|| endpoint_recovery_pending(3, 7, bound, bound, 0)),
+            );
+            connection.tcp_ordered_read_progress = vec![endpoint_recovery_ordered_progress(
+                9,
+                21,
+                569_624_937,
+                Some(569_626_217),
+                569_721_669,
+                96_732,
+            )];
+            endpoint_recovery_path_sample(vec![connection])
+        };
+
+        assert_eq!(
+            state.observe(started, &sample(false)),
+            EndpointRecoveryAction::None
+        );
+        assert!(matches!(
+            state.observe(started + bound, &sample(true)),
+            EndpointRecoveryAction::Rebind {
+                trigger: EndpointRecoveryTrigger::TcpWriteStall {
+                    stable_id: 11,
+                    writer: 3,
+                    episode: 7,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn endpoint_recovery_changed_gap_and_connection_replacement_restart_observation() {
+        let started = Instant::now();
+        let mut state = EndpointRecoveryState::default();
+        let sample = |next_received_offset, include_replacement| {
+            let mut connection = endpoint_recovery_connection(11, 0, None);
+            connection.tcp_ordered_read_progress = vec![endpoint_recovery_ordered_progress(
+                7,
+                21,
+                1_000,
+                Some(next_received_offset),
+                2_000,
+                900,
+            )];
+            let mut connections = vec![connection];
+            if include_replacement {
+                connections.push(endpoint_recovery_connection(12, 0, None));
+            }
+            endpoint_recovery_path_sample(connections)
+        };
+
+        assert_eq!(
+            state.observe(started, &sample(1_100, false)),
+            EndpointRecoveryAction::None
+        );
+        assert_eq!(
+            state.observe(
+                started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL,
+                &sample(1_200, false)
+            ),
+            EndpointRecoveryAction::None,
+            "a changed first buffered offset begins a fresh gap episode"
+        );
+        assert_eq!(
+            state.observe(
+                started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 2,
+                &sample(1_200, true)
+            ),
+            EndpointRecoveryAction::None,
+            "connection replacement clears already accumulated observations"
+        );
+        assert_eq!(
+            state.observe(
+                started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 3,
+                &sample(1_200, true)
+            ),
+            EndpointRecoveryAction::None,
+            "the first stable post-replacement sample only owns the gap"
+        );
+        assert!(matches!(
+            state.observe(
+                started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 4,
+                &sample(1_200, true)
+            ),
+            EndpointRecoveryAction::Rebind {
+                trigger: EndpointRecoveryTrigger::TcpOrderedReadGap {
+                    stable_id: 11,
+                    reader: 7,
+                    stream: 21,
+                    observations: 2,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn endpoint_recovery_ordered_gap_requires_elapsed_sampler_interval_and_active_workload() {
+        let started = Instant::now();
+        let mut state = EndpointRecoveryState::default();
+        let sample = |active_tcp| {
+            let mut input =
+                endpoint_recovery_path_sample(vec![endpoint_recovery_connection(11, 0, None)]);
+            input.active_tcp = active_tcp;
+            input.connections[0].tcp_ordered_read_progress =
+                vec![endpoint_recovery_ordered_progress(
+                    7,
+                    21,
+                    1_000,
+                    Some(1_100),
+                    2_000,
+                    900,
+                )];
+            input
+        };
+
+        assert_eq!(
+            state.observe(started, &sample(1)),
+            EndpointRecoveryAction::None
+        );
+        assert_eq!(
+            state.observe(started + Duration::from_millis(1), &sample(1)),
+            EndpointRecoveryAction::None,
+            "back-to-back recovery turns cannot impersonate one sampler interval"
+        );
+        assert!(matches!(
+            state.observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL, &sample(1)),
+            EndpointRecoveryAction::Rebind {
+                trigger: EndpointRecoveryTrigger::TcpOrderedReadGap { .. },
+                ..
+            }
+        ));
+
+        let mut inactive_state = EndpointRecoveryState::default();
+        assert_eq!(
+            inactive_state.observe(started, &sample(0)),
+            EndpointRecoveryAction::None
+        );
+        assert_eq!(
+            inactive_state.observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL, &sample(0)),
+            EndpointRecoveryAction::None
+        );
+        assert_eq!(
+            inactive_state.observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 2, &sample(1)),
+            EndpointRecoveryAction::None,
+            "inactive samples cannot accumulate recovery authority"
+        );
     }
 
     #[test]
@@ -7608,6 +8169,7 @@ mod tests {
                     ack_stalled_for: pending_for,
                     acknowledged_bytes: 0,
                 }],
+                tcp_ordered_read_progress: Vec::new(),
             }],
         };
 
@@ -7657,6 +8219,7 @@ mod tests {
                     ack_stalled_for: Duration::from_millis(250),
                     acknowledged_bytes: 64 * 1024,
                 }],
+                tcp_ordered_read_progress: Vec::new(),
             }],
         };
 
@@ -7693,6 +8256,7 @@ mod tests {
                         ack_stalled_for: bound,
                         acknowledged_bytes: 0,
                     }],
+                    tcp_ordered_read_progress: Vec::new(),
                 },
                 EndpointRecoveryConnectionSample {
                     stable_id: 12,
@@ -7709,6 +8273,7 @@ mod tests {
                         ack_stalled_for: bound,
                         acknowledged_bytes: 0,
                     }],
+                    tcp_ordered_read_progress: Vec::new(),
                 },
             ],
         };
@@ -7803,6 +8368,7 @@ mod tests {
                         acknowledged_bytes: 0,
                     },
                 ],
+                tcp_ordered_read_progress: Vec::new(),
             }],
         };
 
@@ -7938,6 +8504,56 @@ mod tests {
         assert_eq!(pressure.snapshot_at(Instant::now()), None);
     }
 
+    #[tokio::test]
+    async fn tcp_ordered_read_pressure_samples_live_reader_and_releases_on_drop() {
+        let (server_endpoint, client_endpoint, server_addr) = d16_quinn_test_endpoints();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let mut marker = [0u8; 1];
+            recv.read_exact(&mut marker).await.unwrap();
+            send.write_all(b"buffered ordered bytes").await.unwrap();
+            send.finish().unwrap();
+            let _ = release_rx.await;
+        });
+
+        let connection = client_endpoint
+            .connect(server_addr, "example.com")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, recv) = connection.open_bi().await.unwrap();
+        let stream = recv.id().index();
+        let pressure = Arc::new(TcpOrderedReadPressure::new());
+        let reader = pressure.reader(stream, recv.progress_handle());
+        send.write_all(&[0x5a]).await.unwrap();
+
+        let snapshots = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshots = pressure.snapshots();
+                if !snapshots.is_empty() {
+                    break snapshots;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("live ordered reader progress");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].reader, 1);
+        assert_eq!(snapshots[0].stream, stream);
+        assert_eq!(snapshots[0].read_offset, 0);
+        assert_eq!(snapshots[0].next_received_offset, Some(0));
+        assert_eq!(snapshots[0].ordered_gap_bytes, 0);
+
+        drop(reader);
+        assert!(pressure.snapshots().is_empty());
+        let _ = release_tx.send(());
+        server_task.await.unwrap();
+        client_endpoint.close(0u32.into(), b"test complete");
+    }
+
     #[test]
     fn endpoint_recovery_silent_tcp_transport_tx_does_not_arm_generic_no_rx() {
         let started = Instant::now();
@@ -7956,6 +8572,7 @@ mod tests {
                 black_holes_detected: 0,
                 current_socket_rx_rebind_generation: 0,
                 tcp_write_pressures: Vec::new(),
+                tcp_ordered_read_progress: Vec::new(),
             }],
         };
 
@@ -8002,6 +8619,7 @@ mod tests {
                 black_holes_detected: 0,
                 current_socket_rx_rebind_generation: 0,
                 tcp_write_pressures: Vec::new(),
+                tcp_ordered_read_progress: Vec::new(),
             }],
         };
 
@@ -8046,6 +8664,7 @@ mod tests {
                 black_holes_detected: 0,
                 current_socket_rx_rebind_generation: 0,
                 tcp_write_pressures: Vec::new(),
+                tcp_ordered_read_progress: Vec::new(),
             }],
         };
 
@@ -8100,6 +8719,7 @@ mod tests {
                         black_holes_detected: 0,
                         current_socket_rx_rebind_generation: first_socket_rx_generation,
                         tcp_write_pressures: Vec::new(),
+                        tcp_ordered_read_progress: Vec::new(),
                     },
                     EndpointRecoveryConnectionSample {
                         stable_id: 12,
@@ -8109,6 +8729,7 @@ mod tests {
                         black_holes_detected: 0,
                         current_socket_rx_rebind_generation: second_socket_rx_generation,
                         tcp_write_pressures: Vec::new(),
+                        tcp_ordered_read_progress: Vec::new(),
                     },
                 ],
             }
@@ -8208,6 +8829,7 @@ mod tests {
                 black_holes_detected: 0,
                 current_socket_rx_rebind_generation: 0,
                 tcp_write_pressures: Vec::new(),
+                tcp_ordered_read_progress: Vec::new(),
             }],
         };
 
@@ -8628,7 +9250,7 @@ mod tests {
         let active = Arc::new(AtomicU64::new(0));
         let (lease, reserved) = TcpPoolSlotLease::reserve(active.clone());
         assert!(reserved);
-        let mut reader = TuicNativeOrderedReader::from_recv(recv, lease, None, None);
+        let mut reader = TuicNativeOrderedReader::from_recv(recv, lease, None, None, None);
         let waker = std::task::Waker::noop();
         let mut cx = Context::from_waker(waker);
 
@@ -8669,7 +9291,7 @@ mod tests {
         let active = Arc::new(AtomicU64::new(0));
         let (lease, reserved) = TcpPoolSlotLease::reserve(active);
         assert!(reserved);
-        let mut reader = TuicNativeOrderedReader::from_recv(recv, lease, None, None);
+        let mut reader = TuicNativeOrderedReader::from_recv(recv, lease, None, None, None);
         let waker = std::task::Waker::noop();
         let mut cx = Context::from_waker(waker);
 
@@ -8693,7 +9315,7 @@ mod tests {
         let active = Arc::new(AtomicU64::new(0));
         let (lease, reserved) = TcpPoolSlotLease::reserve(active);
         assert!(reserved);
-        let mut reader = TuicNativeOrderedReader::from_recv(recv, lease, None, None);
+        let mut reader = TuicNativeOrderedReader::from_recv(recv, lease, None, None, None);
         let waker = std::task::Waker::noop();
         let mut cx = Context::from_waker(waker);
 
@@ -8775,7 +9397,7 @@ mod tests {
         let active = Arc::new(AtomicU64::new(0));
         let (lease, reserved) = TcpPoolSlotLease::reserve(active);
         assert!(reserved);
-        let mut reader = TuicNativeOrderedReader::new(recv, lease, None, connection);
+        let mut reader = TuicNativeOrderedReader::new(recv, lease, None, connection, None);
         let mut first_poll = true;
         let read = tokio::time::timeout(
             Duration::from_secs(1),
@@ -8834,7 +9456,7 @@ mod tests {
         let active = Arc::new(AtomicU64::new(0));
         let (lease, reserved) = TcpPoolSlotLease::reserve(active);
         assert!(reserved);
-        let mut reader = TuicNativeOrderedReader::new(recv, lease, None, connection);
+        let mut reader = TuicNativeOrderedReader::new(recv, lease, None, connection, None);
         let started = Instant::now();
         let mut last_progress = started;
         let mut max_progress_gap = Duration::ZERO;
@@ -8896,7 +9518,7 @@ mod tests {
         let active = Arc::new(AtomicU64::new(0));
         let (lease, reserved) = TcpPoolSlotLease::reserve(active);
         assert!(reserved);
-        let mut reader = TuicNativeOrderedReader::from_recv(recv, lease, None, None);
+        let mut reader = TuicNativeOrderedReader::from_recv(recv, lease, None, None, None);
         let waker = std::task::Waker::noop();
         let mut cx = Context::from_waker(waker);
 

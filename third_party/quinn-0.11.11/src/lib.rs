@@ -81,7 +81,9 @@ pub use crate::connection::{
 };
 pub use crate::endpoint::{Accept, Endpoint, EndpointStats};
 pub use crate::incoming::{Incoming, IncomingFuture, RetryError};
-pub use crate::recv_stream::{ReadError, ReadExactError, ReadToEndError, RecvStream, ResetError};
+pub use crate::recv_stream::{
+    ReadError, ReadExactError, ReadToEndError, RecvStream, RecvStreamProgress, ResetError,
+};
 #[cfg(feature = "runtime-async-std")]
 pub use crate::runtime::AsyncStdRuntime;
 #[cfg(feature = "runtime-smol")]

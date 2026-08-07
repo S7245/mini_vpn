@@ -96,8 +96,8 @@ pub use streams::StreamsState;
 #[cfg(not(fuzzing))]
 use streams::StreamsState;
 pub use streams::{
-    Chunks, ClosedStream, FinishError, ReadError, ReadableError, RecvStream, SendStream,
-    SendStreamProgress, ShouldTransmit, StreamEvent, Streams, WriteError, Written,
+    Chunks, ClosedStream, FinishError, ReadError, ReadableError, RecvStream, RecvStreamProgress,
+    SendStream, SendStreamProgress, ShouldTransmit, StreamEvent, Streams, WriteError, Written,
 };
 
 mod timer;

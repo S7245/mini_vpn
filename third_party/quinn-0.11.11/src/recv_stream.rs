@@ -57,6 +57,30 @@ pub struct RecvStream {
     reset: Option<VarInt>,
 }
 
+/// Cloneable read-only handle for one receive stream's ordered-delivery progress.
+#[derive(Debug, Clone)]
+pub struct RecvStreamProgress {
+    conn: ConnectionRef,
+    stream: StreamId,
+    is_0rtt: bool,
+}
+
+impl RecvStreamProgress {
+    /// Sample the consumed prefix and any buffered data beyond an ordered gap.
+    pub fn sample(&self) -> Result<proto::RecvStreamProgress, ClosedStream> {
+        let mut conn = self.conn.state.lock("RecvStreamProgress::sample");
+        if self.is_0rtt && conn.check_0rtt().is_err() {
+            return Err(ClosedStream::default());
+        }
+        conn.inner.recv_stream(self.stream).progress()
+    }
+
+    /// Get the identity of the sampled stream.
+    pub fn id(&self) -> StreamId {
+        self.stream
+    }
+}
+
 impl RecvStream {
     pub(crate) fn new(conn: ConnectionRef, stream: StreamId, is_0rtt: bool) -> Self {
         Self {
@@ -297,6 +321,16 @@ impl RecvStream {
     /// Get the identity of this stream
     pub fn id(&self) -> StreamId {
         self.stream
+    }
+
+    /// Create a cloneable read-only handle for ordered receive progress.
+    #[doc(hidden)]
+    pub fn progress_handle(&self) -> RecvStreamProgress {
+        RecvStreamProgress {
+            conn: self.conn.clone(),
+            stream: self.stream,
+            is_0rtt: self.is_0rtt,
+        }
     }
 
     /// Completes when the stream has been reset by the peer or otherwise closed

@@ -24,6 +24,15 @@ pub(super) struct Assembler {
     end: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AssemblerProgress {
+    pub(super) read_offset: u64,
+    pub(super) next_received_offset: Option<u64>,
+    pub(super) highest_received_offset: u64,
+    pub(super) buffered_bytes: usize,
+    pub(super) ordered_gap_bytes: u64,
+}
+
 impl Assembler {
     pub(super) fn new() -> Self {
         Self::default()
@@ -224,6 +233,19 @@ impl Assembler {
         self.bytes_read
     }
 
+    pub(super) fn progress(&self) -> AssemblerProgress {
+        let next_received_offset = self.data.peek().map(|chunk| chunk.offset);
+        AssemblerProgress {
+            read_offset: self.bytes_read,
+            next_received_offset,
+            highest_received_offset: self.end,
+            buffered_bytes: self.buffered,
+            ordered_gap_bytes: next_received_offset
+                .unwrap_or(self.bytes_read)
+                .saturating_sub(self.bytes_read),
+        }
+    }
+
     /// Discard all buffered data
     pub(super) fn clear(&mut self) {
         self.data.clear();
@@ -369,6 +391,54 @@ mod test {
         assert_matches!(next(&mut x, 32), Some(ref y) if &y[..] == b"789");
         assert_matches!(next(&mut x, 32), Some(ref y) if &y[..] == b"10");
         assert_matches!(next(&mut x, 32), None);
+    }
+
+    #[test]
+    fn ordered_progress_distinguishes_buffered_gap_from_contiguous_data() {
+        let mut assembler = Assembler::new();
+        assert_eq!(
+            assembler.progress(),
+            AssemblerProgress {
+                read_offset: 0,
+                next_received_offset: None,
+                highest_received_offset: 0,
+                buffered_bytes: 0,
+                ordered_gap_bytes: 0,
+            },
+            "an empty assembler is not an ordered gap"
+        );
+
+        assembler
+            .insert(3, Bytes::from_static(b"def"), 3)
+            .unwrap();
+        let gap = assembler.progress();
+        assert_eq!(gap.read_offset, 0);
+        assert_eq!(gap.next_received_offset, Some(3));
+        assert_eq!(gap.highest_received_offset, 6);
+        assert_eq!(gap.buffered_bytes, 3);
+        assert_eq!(gap.ordered_gap_bytes, 3);
+
+        assembler
+            .insert(0, Bytes::from_static(b"abc"), 3)
+            .unwrap();
+        let contiguous = assembler.progress();
+        assert_eq!(contiguous.next_received_offset, Some(0));
+        assert_eq!(contiguous.ordered_gap_bytes, 0);
+
+        assert_eq!(
+            assembler.read(usize::MAX, true).unwrap().bytes.as_ref(),
+            b"abc"
+        );
+        assert_eq!(
+            assembler.read(usize::MAX, true).unwrap().bytes.as_ref(),
+            b"def"
+        );
+        let drained = assembler.progress();
+        assert_eq!(drained.read_offset, 6);
+        assert_eq!(drained.next_received_offset, None);
+        assert_eq!(drained.highest_received_offset, 6);
+        assert_eq!(drained.buffered_bytes, 0);
+        assert_eq!(drained.ordered_gap_bytes, 0);
     }
 
     #[test]
