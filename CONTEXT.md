@@ -13,8 +13,12 @@ How the client carries its tunnel to the **Upstream**. Today: **TUIC over QUIC**
 _Avoid_: protocol (overloaded), connection (a transport can span reconnects)
 
 **TUIC TCP pool path service**:
-The current send-side service estimate of one TUIC TCP pool slot, represented by that QUIC path's congestion window divided by its RTT. It is a point-in-time placement hint for breaking equal, nonzero lease-load ties; it is not a bandwidth promise, a health verdict, or permission to change congestion-control constants. Unknown or idle evidence falls back to the pool's stable lease-aware ordering.
+The current send-side service estimate of one TUIC TCP pool slot, represented by that QUIC path's congestion window divided by its RTT. It is a point-in-time placement input for service-normalized admission when every admitted candidate is busy and known, and remains the equal-load tie-break inside the bounded fallback. It is not a bandwidth promise, a health verdict, or permission to change congestion-control constants. Unknown or idle evidence falls back to the pool's stable lease-aware ordering.
 _Avoid_: connection speed, bandwidth score, priority (the estimate is transient transport state, not a configured class of service)
+
+**TUIC TCP pool service-normalized admission**:
+The new-open placement rule applied after forward qualification when every admitted candidate is busy and has known current path service. It compares exact `active lease ownership * RTT / cwnd`, so ownership demand is evaluated against the current service available to it; lower normalized load wins. Equal normalized load falls back to lower raw ownership, then greater path service, then stable index. Idle, Unknown, and all-degraded cases retain the existing bounded fallback. The comparison is exact rational ordering with no float, threshold, multiplier, timer, Target rule, or config knob, and it cannot mutate an existing connection, stream, or payload.
+_Avoid_: bandwidth score (path service remains a transient placement hint), weighted tuning (there is no configured weight), connection health (forward qualification owns negative evidence), affinity (no Target cohort is inferred)
 
 **TUIC TCP pool forward qualification**:
 Whether a TCP pool slot has added a Quinn PLPMTUD black-hole detection since the start of its current nonzero TCP-lease ownership epoch. A slot is qualified while the monotonic count stays at its epoch anchor and degraded after it advances; exact per-slot lease zero begins a new epoch. Qualification controls only new Target relay admission while the pool is busy. It never closes, reconnects, migrates, retries, or promises bandwidth, and an all-degraded pool retains a bounded least-active fallback.
