@@ -2,7 +2,7 @@
 
 Date: 2026-08-07
 
-Status: **LOCAL IMPLEMENTATION AND REVIEW COMPLETE; RESULTS/MEMORY/DELIVERY IN PROGRESS; FORMAL M2 AND M3 REMAIN BLOCKED**
+Status: **LOCAL DELIVERY COMPLETE; MAC QUALIFICATION PENDING; FORMAL M2 AND M3 REMAIN BLOCKED**
 
 Source of truth:
 `docs/tech/2026-08-07-knife15-m2-quinn-successor-service-turn-architecture-spec.md`.
@@ -64,8 +64,8 @@ Source of truth:
 - [x] Write local results with exact tests and capacity.
 - [x] Update `CONTEXT.md`, `TODO.md`, `HANDOFF.md`, `AGENTS.md`, learnings, and
   errors.
-- [ ] Commit coherent stages and push the current branch.
-- [ ] Start a fresh paired Exit observer and provide exactly one bounded Mac
+- [x] Commit coherent stages and push the current branch.
+- [x] Start a fresh paired Exit observer and provide exactly one bounded Mac
   qualification transaction. Formal M2 remains blocked.
 
 ## Stop Rule

@@ -28,7 +28,8 @@ reached `240.291 Mbit/s` with final `61,440/0/0B`. Result:
 
 Next:
 
-1. start a fresh paired `.33` Exit observer; the previous observer expired;
+1. use the fresh paired `.33` Exit observer active at
+   `/tmp/mini_vpn_knife15_exit_target_observer_20260807_102734`;
 2. pull the pushed descendant and rebuild release on the Mac;
 3. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
 4. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->

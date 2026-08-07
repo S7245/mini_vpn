@@ -29,8 +29,10 @@
   review pass with no unresolved P0/P1. Exact 32 MiB Endpoint capacity was
   `240.291 Mbit/s`, final `61,440/0/0B`, zero socket would-block. Result:
   `docs/tech/2026-08-07-knife15-m2-quinn-successor-service-turn-local-results.md`.
-- The intended `.33` observer expired before this Mac run. Start a fresh
-  observer, pull/rebuild the pushed descendant, then take exactly one
+- The intended prior `.33` observer expired before this Mac run. A fresh
+  observer is active at
+  `/tmp/mini_vpn_knife15_exit_target_observer_20260807_102734`. Pull/rebuild
+  the pushed descendant, then take exactly one
   `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke ->
   m2-qualification -> status -> stop`. Preserve evidence after failure; do
   not run formal M2 or repeat/tune unchanged. Formal M2 and M3 remain blocked.

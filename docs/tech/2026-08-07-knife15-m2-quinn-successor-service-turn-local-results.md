@@ -140,8 +140,15 @@ This mechanism is intended to be sufficient only for the exact cold-successor
 first-receiver-interval discriminator. It is not formal-M2 acceptance or a
 general bandwidth promise.
 
-After a fresh `.33` observer is active, pull and rebuild the pushed descendant
-and take exactly one Mac transaction:
+A fresh `.33` observer is active at:
+
+```text
+/tmp/mini_vpn_knife15_exit_target_observer_20260807_102734
+```
+
+It started with both tcpdump and TCP_INFO sampler live under the bounded
+two-hour hard timeout. Pull and rebuild the pushed descendant and take exactly
+one Mac transaction while this observer remains active:
 
 ```text
 m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke
