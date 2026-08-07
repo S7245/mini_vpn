@@ -227,9 +227,19 @@ and restore IPv6 using the pre-start branch in section 8.
 
 ## 6. Start, Smoke, And Two-Cycle Qualification
 
-The exact ordered-gap discriminator is observed in the client QUIC stream, so
-this qualification does not require the former bounded Exit observer. Do not
-start a separate observer on the Mac or wait for one on `.33`.
+The current cold-successor discriminator requires the agent-owned bounded
+Exit observer to overlap the Mac qualification. Do not start a separate
+observer on the Mac. Before `start`, confirm that the current accepted
+position names a fresh `.33` observer and that its two-hour hard-timeout
+window is still active. The observer for this transaction is:
+
+```text
+/tmp/mini_vpn_knife15_exit_target_observer_20260807_102734
+```
+
+If that observer has expired, do not run the transaction; ask the agent to
+start a new one so another 30-minute qualification is not spent without
+paired evidence.
 
 ```bash
 sudo -v
