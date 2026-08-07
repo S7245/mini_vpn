@@ -4,7 +4,52 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-06 — qualification passed; formal M2 authorized)
+#### Latest decision (2026-08-06 — exact ordered-gap migration ready for qualification)
+
+Exact-source `0a71ebe` artifact
+`/tmp/mini_vpn_knife15_macos_20260806_104632.tar.gz` (SHA-256
+`da12448c...`) passed baseline `46.328/59.947 Mbit/s`, direct
+`23.077 Mbit/s` without gaps, every preflight, cycle 1, cycle 2 forward, and
+cleanup. Cycle 2 reverse failed with eleven complete Target receiver-zero
+intervals about 25 minutes after the schedule began; the later fourteen hours
+were retained evidence time, not successful M2 time.
+
+The exact conn1/stream21 ordered reader stopped at `569,624,937B` for
+`12,630ms`. Its connection continued receiving packets and STREAM frames, but
+the historical log cannot prove those frames belonged to stream 21. D16, TUN,
+Endpoint conservation, routes, process, and cleanup remained healthy. Existing
+writer-Pending/path-reset recovery was unreachable for this downlink-only gap;
+generic TCP silence remains unsafe because of valid quiet traffic.
+
+Reviewed implementation `4d168a1` exposes exact read-only stream assembler
+progress and registers only live D16 ordered readers. Two observations over
+one full existing `250ms` interval of the same consumed offset plus exact
+same-stream bytes beyond a missing prefix consume one episode authority and
+reuse the existing Endpoint socket rebind. Progress, changed gap, close,
+inactivity, or generation replacement clears authority. The QUIC identity,
+stream, Target TCP, payload, pool, D16, and old-socket lifecycle are retained;
+no frozen value, replay, new threshold, or tuning branch was added.
+
+The public `m2-qualification` now runs exactly two mixed cycles, validates all
+8 phase results, 2 DNS/real-client results, unchanged TCP/UDP SLIs, Endpoint/
+D16 terminal state, and complete rebind lifecycle, and can emit only
+`PASS_NON_ACCEPTANCE`. All local gates pass with no unresolved P0/P1; the
+exact 32 MiB Endpoint gate reached `240.403 Mbit/s` with final
+`61,440/0/0B`. Result:
+`docs/tech/2026-08-06-knife15-m2-ordered-gap-path-migration-local-results.md`.
+
+Next:
+
+1. pull the pushed descendant of `4d168a1` and rebuild release on the Mac;
+2. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
+3. take exactly one fresh `m2-ipv6-check -> baseline -> direct-discriminator
+   -> start -> smoke -> m2-qualification -> status -> stop`;
+4. allow about 30 minutes for the two-cycle qualification and preserve
+   `status/snapshot/stop` after any post-start failure;
+5. do not run formal M2, tune, or repeat unchanged;
+6. keep formal M2 and M3 blocked pending qualification plus cleanup.
+
+#### Previous decision (2026-08-06 — qualification passed; formal M2 authorized)
 
 Exact-source `0c521fa` artifact
 `/tmp/mini_vpn_knife15_macos_20260806_101142.tar.gz` (SHA-256

@@ -1,5 +1,30 @@
 # Errors
 
+## 2026-08-06 - Ordered-gap evidence and final-gate provenance traps
+
+- Exact-source `0a71ebe` formal M2 failed about 25 minutes into its workload;
+  the Mac then held the TUN and evidence for roughly fourteen hours. Treating
+  hold duration as soak duration would overstate coverage and obscure the
+  actual cycle-2 reverse failure.
+- Connection-wide fresh STREAM frames did not prove bytes on the blocked
+  stream. The implementation therefore added exact read-only same-stream
+  assembler progress rather than authorizing recovery from an inferred
+  correlation.
+- Two capacity invocations used `--ignored` and ran zero tests; a later final
+  gate used a stale shell-test path and test target, then omitted the harness
+  feature. All zero-test or nonexistent-target results were rejected and the
+  exact commands rerun with expected counts.
+- A zsh wrapper used reserved variable `status`; one new shell validator
+  called a nonexistent helper; and a final Clippy attempt incorrectly added
+  `-D warnings` to the established warning-tolerant lane. These were command
+  or harness defects, not product regressions, and were corrected without
+  broad unrelated cleanup.
+- Review found that two delayed recovery ticks could run less than `250ms`
+  apart and inactive samples could preserve authority. It also found that the
+  old qualification real-client label did not match the result envelope and
+  the final verdict lacked an exact SLO count. Full elapsed-time/inactivity
+  guards and exact two-cycle validation now fail closed.
+
 ## 2026-08-06 - Connection-local degradation and gate provenance traps
 
 - Exact-source `bfaba9e` passed baseline/direct and completed the exact

@@ -1,5 +1,26 @@
 # Learnings
 
+## 2026-08-06 - Exact structural demand should own peer-visible recovery
+
+- Connection-wide packet and STREAM-frame growth is a hypothesis, not proof
+  that a particular blocked stream has useful data. A read-only assembler
+  snapshot converts it into exact evidence: the application prefix is fixed
+  while the same stream buffers bytes strictly beyond its missing prefix.
+- Recovery predicates and mechanisms must match direction. A client-local
+  congestion/path-state reset cannot repair a peer's stalled downlink sender;
+  Endpoint source-port migration is peer-visible while retaining QUIC and
+  application identity.
+- Consecutive observation count is not elapsed time. Delayed sampler turns can
+  run back-to-back, so bounded recovery needs both two matching observations
+  and one real full sampler interval. Inactive ownership must clear rather
+  than accumulate authority.
+- Qualification verdicts must validate their own evidence namespace, counts,
+  labels, SLIs, terminal ownership, and recovery lifecycle. A script exit code
+  cannot substitute for exact envelope checks, and cycle labels must match the
+  validator glob.
+- Result:
+  `docs/tech/2026-08-06-knife15-m2-ordered-gap-path-migration-local-results.md`.
+
 ## 2026-08-06 - A healthy WAN comparator should prove recovery specificity
 
 - A recovery qualification need not force the recovery mechanism to fire.

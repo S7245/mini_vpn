@@ -189,7 +189,44 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-06:
 
-- Exact-source `0c521fa` artifact
+- Exact-source `0a71ebe` formal-M2 artifact
+  `/tmp/mini_vpn_knife15_macos_20260806_104632.tar.gz` (SHA-256
+  `da12448c...`) passed baseline `46.328/59.947 Mbit/s`, direct
+  `23.077 Mbit/s` without gaps, start/smoke, every preflight, cycle 1, cycle
+  2 forward, and cleanup. Cycle 2 reverse then lost eleven complete receiver
+  intervals about 25 minutes into the schedule; the later fourteen hours were
+  evidence hold time, not a completed soak.
+- The exact conn1/stream21 ordered reader stopped at `569,624,937B` for
+  `12,630ms` while the connection received `111` datagrams, `96,732B`, and
+  `62` STREAM frames by its first Pending report. Historical evidence is
+  connection-wide, so it selects an exact same-stream observer rather than
+  proving same-stream buffered bytes retrospectively. D16, TUN, Endpoint
+  conservation, routes, process, and cleanup stayed healthy; no frozen value
+  is implicated.
+- Reviewed implementation `4d168a1` exposes a read-only Quinn assembler
+  progress handle. A live D16 ordered reader whose unchanged consumed prefix
+  has exact same-stream bytes buffered beyond a missing prefix for two
+  observations and one full existing `250ms` sample interval consumes one
+  episode authority and reuses the existing Endpoint rebind. It retains the
+  QUIC identity, stream, Target TCP, payload, pool, and old-socket lifecycle;
+  writer ACK-stall recovery keeps precedence and generic TCP silence remains
+  ineligible.
+- Public `m2-qualification` now runs exactly two mixed cycles, validates 8
+  phases, 2 DNS/real-client results, unchanged TCP/UDP SLIs, Endpoint/D16
+  terminal ownership, and complete rebind lifecycle, and can emit only
+  `PASS_NON_ACCEPTANCE`. Root `684+3 ignored`, main `2`, integration `10+4
+  ignored`, release, established Clippy, shell, vendored Quinn `40+3 ignored`
+  plus doc `1`, quinn-proto `311` plus docs `3`, root docs, fmt/diff/secret,
+  and review pass with no unresolved P0/P1. Exact 32 MiB Endpoint capacity was
+  `240.403 Mbit/s`, final `61,440/0/0B`, zero socket would-block. Result:
+  `docs/tech/2026-08-06-knife15-m2-ordered-gap-path-migration-local-results.md`.
+- Next pull/rebuild the pushed descendant and take exactly one fresh
+  `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke ->
+  m2-qualification -> status -> stop`. It normally takes about 30 minutes.
+  Do not run formal `m2` or repeat/tune unchanged. Formal M2 and M3 remain
+  blocked pending qualification plus cleanup.
+
+- Previous accepted position: exact-source `0c521fa` artifact
   `/tmp/mini_vpn_knife15_macos_20260806_101142.tar.gz` (SHA-256
   `2a45314d...`) passed baseline `34.964/8.262 Mbit/s`, direct
   `13.539 Mbit/s` without gaps, start/smoke, every qualification preflight,

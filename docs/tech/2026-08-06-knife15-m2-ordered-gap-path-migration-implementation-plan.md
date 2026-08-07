@@ -2,7 +2,7 @@
 
 Date: 2026-08-06
 
-Status: **AUTHORIZED AND IN PROGRESS; FORMAL M2 REMAINS BLOCKED**
+Status: **LOCAL IMPLEMENTATION COMPLETE; FORMAL M2 REMAINS BLOCKED**
 
 Source of truth:
 `docs/tech/2026-08-06-knife15-m2-ordered-gap-path-migration-architecture-spec.md`.
@@ -91,10 +91,10 @@ action without changing frozen values or replaying application payload.
   D16/TUN/UDP/TCP/Endpoint regressions, and missing tests.
 - [x] Repair all P0/P1 findings and rerun affected gates.
 - [x] Write failure/local results and exact counts/rates.
-- [ ] Update `TODO.md`, `HANDOFF.md`, `AGENTS.md`, `CONTEXT.md`, learnings,
+- [x] Update `TODO.md`, `HANDOFF.md`, `AGENTS.md`, `CONTEXT.md`, learnings,
   and errors.
-- [ ] Commit coherent stages and push the current branch.
-- [ ] Provide exactly one bounded two-cycle Mac qualification transaction.
+- [x] Commit coherent stages and push the current branch.
+- [x] Provide exactly one bounded two-cycle Mac qualification transaction.
 
 ## Stop Rule
 
