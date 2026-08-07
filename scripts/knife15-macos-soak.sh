@@ -4289,8 +4289,10 @@ EOF_FAKE_SLEEP
   : >"$m2_qualification_run/mini_vpn.log"
   endpoint_rebind_lifecycle_is_clean "$m2_qualification_run/mini_vpn.log" || \
     die "self-test: empty M2 qualification rebind lifecycle rejected"
+  recovery_evidence_is_safe "$m2_qualification_run/mini_vpn.log" || \
+    die "self-test: empty M2 qualification recovery evidence rejected"
   printf '%s\n' \
-    'tuic-endpoint-rebind generation=1 trigger=tcp_ordered_read_gap' \
+    'tuic-endpoint-rebind generation=1 trigger=tcp_write_stall' \
     >>"$m2_qualification_run/mini_vpn.log"
   ! endpoint_rebind_lifecycle_is_clean "$m2_qualification_run/mini_vpn.log" || \
     die "self-test: unrecovered M2 qualification rebind accepted"
@@ -4299,6 +4301,27 @@ EOF_FAKE_SLEEP
     >>"$m2_qualification_run/mini_vpn.log"
   endpoint_rebind_lifecycle_is_clean "$m2_qualification_run/mini_vpn.log" || \
     die "self-test: recovered M2 qualification rebind rejected"
+  printf '%s\n' \
+    'tuic-recovery-evidence kind=tcp_write_pressure_start action=none conn=11 writer=3 stream=7 episode=9 acknowledged=1000B pending_ms=250 ack_stalled_ms=250' \
+    'tuic-recovery-evidence kind=tcp_write_pressure_end action=none conn=11 writer=3 stream=7 episode=9 observations=2 observed_ms=500 initial_acknowledged=1000B final_acknowledged=65000B acknowledged_delta=64000B ack_progress_observations=1 max_pending_ms=500 max_ack_stalled_ms=250' \
+    'tuic-recovery-evidence kind=tcp_ordered_gap_observed action=none conn=12 reader=4 stream=21 episode=2 read_offset=1000 next_received_offset=1100 initial_highest_received_offset=2000 current_highest_received_offset=3000 initial_buffered=900B current_buffered=1900B gap=100B observations=2 observed_ms=250 tail_advanced=true' \
+    >>"$m2_qualification_run/mini_vpn.log"
+  recovery_evidence_is_safe "$m2_qualification_run/mini_vpn.log" || \
+    die "self-test: valid recovery evidence rejected"
+  printf '%s\n' \
+    'tuic-recovery-evidence kind=tcp_write_pressure_start action=none conn=11' \
+    >>"$m2_qualification_run/mini_vpn.log"
+  ! recovery_evidence_is_safe "$m2_qualification_run/mini_vpn.log" || \
+    die "self-test: malformed recovery evidence accepted"
+  : >"$m2_qualification_run/mini_vpn.log"
+  printf '%s\n' \
+    'tuic-endpoint-rebind generation=2 trigger=tcp_ordered_read_gap' \
+    'tuic-endpoint-rebind-recovered generation=2 first_rx_ms=250 socket_generation=2' \
+    >>"$m2_qualification_run/mini_vpn.log"
+  endpoint_rebind_lifecycle_is_clean "$m2_qualification_run/mini_vpn.log" || \
+    die "self-test: active ordered-gap lifecycle fixture invalid"
+  ! recovery_evidence_is_safe "$m2_qualification_run/mini_vpn.log" || \
+    die "self-test: active ordered-gap rebind was accepted"
   printf '%s\n' \
     'qualification_slo_evidence=PASS' \
     'formal_m2_acceptance=NOT_RUN' \
@@ -7711,6 +7734,33 @@ endpoint_rebind_lifecycle_is_clean() {
   ((10#$successes == 10#$recoveries && 10#$max_first_rx <= 7000))
 }
 
+recovery_evidence_is_safe() {
+  local log_file="$1"
+  local total ordered_valid writer_start_valid writer_end_valid valid
+  [[ -f "$log_file" && ! -L "$log_file" ]] || return 1
+  ! grep -Eq \
+    'tuic-endpoint-rebind(-failed)? .*trigger=tcp_ordered_read_gap' \
+    "$log_file" || return 1
+  total="$(grep -Ec 'tuic-recovery-evidence kind=' \
+    "$log_file" 2>/dev/null || true)"
+  ordered_valid="$(grep -Ec \
+    'tuic-recovery-evidence kind=tcp_ordered_gap_observed action=none conn=[0-9]+ reader=[0-9]+ stream=[0-9]+ episode=[0-9]+ read_offset=[0-9]+ next_received_offset=[0-9]+ initial_highest_received_offset=[0-9]+ current_highest_received_offset=[0-9]+ initial_buffered=[0-9]+B current_buffered=[0-9]+B gap=[0-9]+B observations=[0-9]+ observed_ms=[0-9]+ tail_advanced=(true|false)$' \
+    "$log_file" 2>/dev/null || true)"
+  writer_start_valid="$(grep -Ec \
+    'tuic-recovery-evidence kind=tcp_write_pressure_start action=none conn=[0-9]+ writer=[0-9]+ stream=[0-9]+ episode=[0-9]+ acknowledged=[0-9]+B pending_ms=[0-9]+ ack_stalled_ms=[0-9]+$' \
+    "$log_file" 2>/dev/null || true)"
+  writer_end_valid="$(grep -Ec \
+    'tuic-recovery-evidence kind=tcp_write_pressure_end action=none conn=[0-9]+ writer=[0-9]+ stream=[0-9]+ episode=[0-9]+ observations=[0-9]+ observed_ms=[0-9]+ initial_acknowledged=[0-9]+B final_acknowledged=[0-9]+B acknowledged_delta=[0-9]+B ack_progress_observations=[0-9]+ max_pending_ms=[0-9]+ max_ack_stalled_ms=[0-9]+$' \
+    "$log_file" 2>/dev/null || true)"
+  for valid in "$total" "$ordered_valid" "$writer_start_valid" \
+    "$writer_end_valid"; do
+    [[ "$valid" =~ ^[0-9]+$ ]] || return 1
+  done
+  valid=$((10#$ordered_valid + 10#$writer_start_valid + 10#$writer_end_valid))
+  [[ "$total" =~ ^[0-9]+$ && "$valid" =~ ^[0-9]+$ && \
+    "$total" == "$valid" ]]
+}
+
 m2_qualification_result_slo() {
   local run_dir="$1"
   local expected_real_results="$2"
@@ -7777,6 +7827,7 @@ m2_qualification_terminal_safety() {
       remote_write_close_ownership_is_clean "$log_file" || return 1
   fi
   endpoint_rebind_lifecycle_is_clean "$log_file" && \
+    recovery_evidence_is_safe "$log_file" && \
     conservation_check_file "$log_file" && \
     d16_terminal_ownership_is_clean "$log_file" && \
     ! grep -Eq \
@@ -8458,6 +8509,8 @@ write_summary() {
   local endpoint_last_outstanding endpoint_max_live endpoint_max_outstanding
   local endpoint_rebind_successes endpoint_rebind_recoveries endpoint_rebind_failures
   local endpoint_rebind_attempts endpoint_rebind_evidence endpoint_rebind_max_first_rx_ms
+  local recovery_evidence_ordered_gaps recovery_evidence_writer_starts
+  local recovery_evidence_writer_ends recovery_evidence_safety
   local m0_tcp_results m0_udp_results m0_tcp_max_gap m0_udp_max_loss m0_invalid_results
   local m0_sender_zero_intervals m0_receiver_zero_intervals
   local m0_phase_results m0_result_evidence
@@ -8520,6 +8573,20 @@ write_summary() {
     else
       endpoint_rebind_evidence=MISMATCH
     fi
+  fi
+  recovery_evidence_ordered_gaps="$(grep -Ec \
+    'tuic-recovery-evidence kind=tcp_ordered_gap_observed action=none ' \
+    "$log_file" 2>/dev/null || true)"
+  recovery_evidence_writer_starts="$(grep -Ec \
+    'tuic-recovery-evidence kind=tcp_write_pressure_start action=none ' \
+    "$log_file" 2>/dev/null || true)"
+  recovery_evidence_writer_ends="$(grep -Ec \
+    'tuic-recovery-evidence kind=tcp_write_pressure_end action=none ' \
+    "$log_file" 2>/dev/null || true)"
+  if recovery_evidence_is_safe "$log_file"; then
+    recovery_evidence_safety=PASS
+  else
+    recovery_evidence_safety=MISMATCH
   fi
   interface_error_samples="$(awk -F, '
     NR > 1 && (($5 ~ /^[0-9]+$/ && $5 + 0 > 0) || ($8 ~ /^[0-9]+$/ && $8 + 0 > 0)) { count++ }
@@ -8847,6 +8914,7 @@ write_summary() {
     { [[ "$m1_receiver_zero_intervals" =~ ^[0-9]+$ ]] && \
     ((10#$m1_receiver_zero_intervals > 0)); } || \
     ((10#${endpoint_rebind_attempts:-0} > 0)) || \
+    [[ "$recovery_evidence_safety" != "PASS" ]] || \
     { [[ "$interface_error_samples" =~ ^[0-9]+$ ]] && \
     ((10#$interface_error_samples > 0)); } || \
     { [[ "$physical_interface_error_samples" =~ ^[0-9]+$ ]] && \
@@ -8868,6 +8936,9 @@ write_summary() {
 - endpoint_rebind_attempts_recoveries_failures: ${endpoint_rebind_attempts:-0}/${endpoint_rebind_recoveries:-0}/${endpoint_rebind_failures:-0}
 - endpoint_rebind_evidence: $endpoint_rebind_evidence
 - endpoint_rebind_max_first_rx_ms: ${endpoint_rebind_max_first_rx_ms:-0}
+- recovery_evidence_ordered_gaps: ${recovery_evidence_ordered_gaps:-0}
+- recovery_evidence_writer_starts_ends: ${recovery_evidence_writer_starts:-0}/${recovery_evidence_writer_ends:-0}
+- recovery_evidence_safety: $recovery_evidence_safety
 - interface_error_samples: ${interface_error_samples:-unknown}
 - network_control_evidence: $network_control_evidence
 - network_control_samples: ${network_control_samples:-0}

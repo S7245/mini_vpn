@@ -920,9 +920,16 @@ async fn endpoint_window_rebind_preserves_two_live_connections_and_conservation(
     assert_eq!(rebound.old_local_addr, before_addr);
     assert_ne!(rebound.new_local_addr.port(), before_addr.port());
     assert_eq!(rebound.rebind_generation, 1);
-    assert_eq!(endpoint.stats().current_socket_rx_rebind_generation, 0);
-    assert_eq!(first.current_socket_rx_rebind_generation(), 0);
-    assert_eq!(second.current_socket_rx_rebind_generation(), 0);
+    // Rebind sends a PING on each live connection. A loopback response can
+    // therefore authenticate the new socket before this task is scheduled
+    // again; both the old and the new generation are valid at this boundary.
+    for observed_generation in [
+        endpoint.stats().current_socket_rx_rebind_generation,
+        first.current_socket_rx_rebind_generation(),
+        second.current_socket_rx_rebind_generation(),
+    ] {
+        assert!(observed_generation <= rebound.rebind_generation);
+    }
     assert_eq!(endpoint.local_addr().unwrap(), rebound.new_local_addr);
 
     tokio::time::timeout(Duration::from_secs(2), async {

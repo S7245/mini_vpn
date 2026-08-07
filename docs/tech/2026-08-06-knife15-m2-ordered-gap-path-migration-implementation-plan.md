@@ -2,7 +2,10 @@
 
 Date: 2026-08-06
 
-Status: **LOCAL IMPLEMENTATION COMPLETE; FORMAL M2 REMAINS BLOCKED**
+Status: **IMPLEMENTED LOCALLY, THEN REJECTED BY MAC QUALIFICATION**
+
+Qualification result:
+`docs/tech/2026-08-07-knife15-m2-ordered-gap-qualification-failure-results.md`.
 
 Source of truth:
 `docs/tech/2026-08-06-knife15-m2-ordered-gap-path-migration-architecture-spec.md`.

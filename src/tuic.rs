@@ -4480,6 +4480,326 @@ struct TcpOrderedReadProgressSnapshot {
     ordered_gap_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryEvidence {
+    OrderedGapObserved {
+        stable_id: usize,
+        reader: u64,
+        stream: u64,
+        episode: u64,
+        read_offset: u64,
+        next_received_offset: u64,
+        initial_highest_received_offset: u64,
+        current_highest_received_offset: u64,
+        initial_buffered_bytes: usize,
+        current_buffered_bytes: usize,
+        ordered_gap_bytes: u64,
+        observations: u64,
+        observed_for: Duration,
+        tail_advanced: bool,
+    },
+    TcpWritePressureStarted {
+        stable_id: usize,
+        writer: u64,
+        stream: u64,
+        episode: u64,
+        acknowledged_bytes: u64,
+        pending_for: Duration,
+        ack_stalled_for: Duration,
+    },
+    TcpWritePressureEnded {
+        stable_id: usize,
+        writer: u64,
+        stream: u64,
+        episode: u64,
+        observations: u64,
+        observed_for: Duration,
+        initial_acknowledged_bytes: u64,
+        final_acknowledged_bytes: u64,
+        ack_progress_observations: u64,
+        max_pending_for: Duration,
+        max_ack_stalled_for: Duration,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OrderedGapEvidenceAnchor {
+    initial: TcpOrderedReadProgressSnapshot,
+    current: TcpOrderedReadProgressSnapshot,
+    episode: u64,
+    observed_at: Instant,
+    observations: u64,
+    reported: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TcpWriteEvidenceAnchor {
+    stable_id: usize,
+    initial: TcpWritePressureSnapshot,
+    current: TcpWritePressureSnapshot,
+    observed_at: Instant,
+    observations: u64,
+    ack_progress_observations: u64,
+    max_pending_for: Duration,
+    max_ack_stalled_for: Duration,
+}
+
+/// Pure, bounded evidence policy. It consumes scalar snapshots from the existing recovery
+/// sampler and can only return diagnostic events; Endpoint and connection mutation remain in
+/// `EndpointRecoveryState`.
+#[derive(Debug, Default)]
+struct RecoveryEvidenceObserver {
+    ordered_gap_anchors: HashMap<(usize, u64), OrderedGapEvidenceAnchor>,
+    next_ordered_gap_episode: u64,
+    tcp_write_anchors: HashMap<(usize, u64), TcpWriteEvidenceAnchor>,
+}
+
+impl RecoveryEvidenceObserver {
+    fn observe(&mut self, now: Instant, input: &EndpointRecoveryInput) -> Vec<RecoveryEvidence> {
+        let mut events = self.observe_tcp_write_pressure(now, input);
+        events.extend(self.observe_ordered_gaps(now, input));
+        events
+    }
+
+    fn observe_tcp_write_pressure(
+        &mut self,
+        now: Instant,
+        input: &EndpointRecoveryInput,
+    ) -> Vec<RecoveryEvidence> {
+        let current = input
+            .connections
+            .iter()
+            .flat_map(|connection| {
+                connection
+                    .tcp_write_pressures
+                    .iter()
+                    .copied()
+                    .map(move |pressure| ((connection.stable_id, pressure.writer), pressure))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut events = Vec::new();
+
+        let mut ended = self
+            .tcp_write_anchors
+            .iter()
+            .filter_map(|(key, anchor)| {
+                current
+                    .get(key)
+                    .is_none_or(|pressure| pressure.episode != anchor.current.episode)
+                    .then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        ended.sort_unstable();
+        for key in ended {
+            if let Some(anchor) = self.tcp_write_anchors.remove(&key) {
+                events.push(RecoveryEvidence::TcpWritePressureEnded {
+                    stable_id: anchor.stable_id,
+                    writer: anchor.current.writer,
+                    stream: anchor.current.stream,
+                    episode: anchor.current.episode,
+                    observations: anchor.observations,
+                    observed_for: now.saturating_duration_since(anchor.observed_at),
+                    initial_acknowledged_bytes: anchor.initial.acknowledged_bytes,
+                    final_acknowledged_bytes: anchor.current.acknowledged_bytes,
+                    ack_progress_observations: anchor.ack_progress_observations,
+                    max_pending_for: anchor.max_pending_for,
+                    max_ack_stalled_for: anchor.max_ack_stalled_for,
+                });
+            }
+        }
+
+        let mut live = current.into_iter().collect::<Vec<_>>();
+        live.sort_unstable_by_key(|(key, _)| *key);
+        for ((stable_id, writer), pressure) in live {
+            if let Some(anchor) = self.tcp_write_anchors.get_mut(&(stable_id, writer)) {
+                if pressure.acknowledged_bytes > anchor.current.acknowledged_bytes {
+                    anchor.ack_progress_observations =
+                        anchor.ack_progress_observations.saturating_add(1);
+                }
+                anchor.current = pressure;
+                anchor.observations = anchor.observations.saturating_add(1);
+                anchor.max_pending_for = anchor.max_pending_for.max(pressure.pending_for);
+                anchor.max_ack_stalled_for =
+                    anchor.max_ack_stalled_for.max(pressure.ack_stalled_for);
+                continue;
+            }
+
+            self.tcp_write_anchors.insert(
+                (stable_id, writer),
+                TcpWriteEvidenceAnchor {
+                    stable_id,
+                    initial: pressure,
+                    current: pressure,
+                    observed_at: now,
+                    observations: 1,
+                    ack_progress_observations: 0,
+                    max_pending_for: pressure.pending_for,
+                    max_ack_stalled_for: pressure.ack_stalled_for,
+                },
+            );
+            events.push(RecoveryEvidence::TcpWritePressureStarted {
+                stable_id,
+                writer,
+                stream: pressure.stream,
+                episode: pressure.episode,
+                acknowledged_bytes: pressure.acknowledged_bytes,
+                pending_for: pressure.pending_for,
+                ack_stalled_for: pressure.ack_stalled_for,
+            });
+        }
+        events
+    }
+
+    fn observe_ordered_gaps(
+        &mut self,
+        now: Instant,
+        input: &EndpointRecoveryInput,
+    ) -> Vec<RecoveryEvidence> {
+        if input.active_tcp == 0 {
+            self.ordered_gap_anchors.clear();
+            return Vec::new();
+        }
+
+        let current = input
+            .connections
+            .iter()
+            .flat_map(|connection| {
+                connection
+                    .tcp_ordered_read_progress
+                    .iter()
+                    .copied()
+                    .map(move |progress| ((connection.stable_id, progress.reader), progress))
+            })
+            .collect::<HashMap<_, _>>();
+        self.ordered_gap_anchors.retain(|key, _| {
+            current
+                .get(key)
+                .is_some_and(|progress| progress.ordered_gap_bytes > 0)
+        });
+
+        let mut live = current.into_iter().collect::<Vec<_>>();
+        live.sort_unstable_by_key(|(key, _)| *key);
+        let mut events = Vec::new();
+        for (key, progress) in live {
+            if progress.ordered_gap_bytes == 0 {
+                self.ordered_gap_anchors.remove(&key);
+                continue;
+            }
+            let unchanged = self.ordered_gap_anchors.get(&key).is_some_and(|anchor| {
+                anchor.current.stream == progress.stream
+                    && anchor.current.read_offset == progress.read_offset
+                    && anchor.current.next_received_offset == progress.next_received_offset
+            });
+            if unchanged {
+                let Some(anchor) = self.ordered_gap_anchors.get_mut(&key) else {
+                    continue;
+                };
+                anchor.current = progress;
+                anchor.observations = anchor.observations.saturating_add(1);
+                let observed_for = now.saturating_duration_since(anchor.observed_at);
+                if !anchor.reported
+                    && anchor.observations >= 2
+                    && observed_for >= ENDPOINT_RECOVERY_SAMPLE_INTERVAL
+                {
+                    anchor.reported = true;
+                    let next_received_offset = progress
+                        .next_received_offset
+                        .unwrap_or(progress.read_offset);
+                    events.push(RecoveryEvidence::OrderedGapObserved {
+                        stable_id: key.0,
+                        reader: progress.reader,
+                        stream: progress.stream,
+                        episode: anchor.episode,
+                        read_offset: progress.read_offset,
+                        next_received_offset,
+                        initial_highest_received_offset: anchor.initial.highest_received_offset,
+                        current_highest_received_offset: progress.highest_received_offset,
+                        initial_buffered_bytes: anchor.initial.buffered_bytes,
+                        current_buffered_bytes: progress.buffered_bytes,
+                        ordered_gap_bytes: progress.ordered_gap_bytes,
+                        observations: anchor.observations,
+                        observed_for,
+                        tail_advanced: progress.highest_received_offset
+                            > anchor.initial.highest_received_offset
+                            || progress.buffered_bytes > anchor.initial.buffered_bytes,
+                    });
+                }
+                continue;
+            }
+
+            self.next_ordered_gap_episode = self.next_ordered_gap_episode.saturating_add(1);
+            self.ordered_gap_anchors.insert(
+                key,
+                OrderedGapEvidenceAnchor {
+                    initial: progress,
+                    current: progress,
+                    episode: self.next_ordered_gap_episode,
+                    observed_at: now,
+                    observations: 1,
+                    reported: false,
+                },
+            );
+        }
+        events
+    }
+}
+
+fn log_recovery_evidence(event: RecoveryEvidence) {
+    match event {
+        RecoveryEvidence::OrderedGapObserved {
+            stable_id,
+            reader,
+            stream,
+            episode,
+            read_offset,
+            next_received_offset,
+            initial_highest_received_offset,
+            current_highest_received_offset,
+            initial_buffered_bytes,
+            current_buffered_bytes,
+            ordered_gap_bytes,
+            observations,
+            observed_for,
+            tail_advanced,
+        } => println!(
+            "🔎 tuic-recovery-evidence kind=tcp_ordered_gap_observed action=none conn={stable_id} reader={reader} stream={stream} episode={episode} read_offset={read_offset} next_received_offset={next_received_offset} initial_highest_received_offset={initial_highest_received_offset} current_highest_received_offset={current_highest_received_offset} initial_buffered={initial_buffered_bytes}B current_buffered={current_buffered_bytes}B gap={ordered_gap_bytes}B observations={observations} observed_ms={} tail_advanced={tail_advanced}",
+            observed_for.as_millis(),
+        ),
+        RecoveryEvidence::TcpWritePressureStarted {
+            stable_id,
+            writer,
+            stream,
+            episode,
+            acknowledged_bytes,
+            pending_for,
+            ack_stalled_for,
+        } => println!(
+            "🔎 tuic-recovery-evidence kind=tcp_write_pressure_start action=none conn={stable_id} writer={writer} stream={stream} episode={episode} acknowledged={acknowledged_bytes}B pending_ms={} ack_stalled_ms={}",
+            pending_for.as_millis(),
+            ack_stalled_for.as_millis(),
+        ),
+        RecoveryEvidence::TcpWritePressureEnded {
+            stable_id,
+            writer,
+            stream,
+            episode,
+            observations,
+            observed_for,
+            initial_acknowledged_bytes,
+            final_acknowledged_bytes,
+            ack_progress_observations,
+            max_pending_for,
+            max_ack_stalled_for,
+        } => println!(
+            "🔎 tuic-recovery-evidence kind=tcp_write_pressure_end action=none conn={stable_id} writer={writer} stream={stream} episode={episode} observations={observations} observed_ms={} initial_acknowledged={initial_acknowledged_bytes}B final_acknowledged={final_acknowledged_bytes}B acknowledged_delta={}B ack_progress_observations={ack_progress_observations} max_pending_ms={} max_ack_stalled_ms={}",
+            observed_for.as_millis(),
+            final_acknowledged_bytes.saturating_sub(initial_acknowledged_bytes),
+            max_pending_for.as_millis(),
+            max_ack_stalled_for.as_millis(),
+        ),
+    }
+}
+
 /// Per-generation registry of live ordered TCP readers. Sampling happens only on the existing
 /// 250ms recovery task; the receive hot path does not acquire this registry or a recovery lock.
 struct TcpOrderedReadPressure {
@@ -4883,18 +5203,6 @@ enum EndpointRecoveryTrigger {
         black_hole_anchor: u64,
         black_holes_current: u64,
     },
-    TcpOrderedReadGap {
-        stable_id: usize,
-        reader: u64,
-        stream: u64,
-        episode: u64,
-        read_offset: u64,
-        next_received_offset: u64,
-        highest_received_offset: u64,
-        buffered_bytes: usize,
-        ordered_gap_bytes: u64,
-        observations: u64,
-    },
 }
 
 impl EndpointRecoveryTrigger {
@@ -4903,7 +5211,6 @@ impl EndpointRecoveryTrigger {
             Self::NoRx => "no_rx",
             Self::TcpWriteStall { .. } => "tcp_write_stall",
             Self::TcpPathDegraded { .. } => "tcp_path_degraded",
-            Self::TcpOrderedReadGap { .. } => "tcp_ordered_read_gap",
         }
     }
 
@@ -4941,37 +5248,11 @@ impl EndpointRecoveryTrigger {
                 acknowledged_bytes,
                 pending_for.as_millis(),
             ),
-            Self::TcpOrderedReadGap { .. } => (0, 0, 0, 0, 0, 0),
         }
     }
 
     fn tcp_read_fields(self) -> (usize, u64, u64, u64, u64, u64, u64, usize, u64, u64) {
-        match self {
-            Self::TcpOrderedReadGap {
-                stable_id,
-                reader,
-                stream,
-                episode,
-                read_offset,
-                next_received_offset,
-                highest_received_offset,
-                buffered_bytes,
-                ordered_gap_bytes,
-                observations,
-            } => (
-                stable_id,
-                reader,
-                stream,
-                episode,
-                read_offset,
-                next_received_offset,
-                highest_received_offset,
-                buffered_bytes,
-                ordered_gap_bytes,
-                observations,
-            ),
-            _ => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
-        }
+        (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     }
 }
 
@@ -5006,14 +5287,6 @@ struct EndpointRecoveryCounters {
     rx_bytes: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct TcpOrderedReadGapAnchor {
-    progress: TcpOrderedReadProgressSnapshot,
-    episode: u64,
-    observed_at: Instant,
-    observations: u64,
-}
-
 #[derive(Debug, Default)]
 struct EndpointRecoveryState {
     connections: HashMap<usize, EndpointRecoveryCounters>,
@@ -5029,108 +5302,11 @@ struct EndpointRecoveryState {
     path_black_hole_anchors: HashMap<usize, u64>,
     path_reset_consumed: HashSet<usize>,
     path_reset_generation: u64,
-    tcp_ordered_read_gap_anchors: HashMap<(usize, u64), TcpOrderedReadGapAnchor>,
-    covered_tcp_ordered_read_gap_episodes: HashMap<(usize, u64), u64>,
-    next_tcp_ordered_read_gap_episode: u64,
     observed_udp_activity_secs: u64,
     udp_demand_since_rx: bool,
 }
 
 impl EndpointRecoveryState {
-    fn clear_tcp_ordered_read_gap_episodes(&mut self) {
-        self.tcp_ordered_read_gap_anchors.clear();
-        self.covered_tcp_ordered_read_gap_episodes.clear();
-    }
-
-    fn refresh_tcp_ordered_read_gap_ownership(
-        &mut self,
-        now: Instant,
-        input: &EndpointRecoveryInput,
-    ) {
-        let current = input
-            .connections
-            .iter()
-            .flat_map(|connection| {
-                connection
-                    .tcp_ordered_read_progress
-                    .iter()
-                    .copied()
-                    .map(move |progress| ((connection.stable_id, progress.reader), progress))
-            })
-            .collect::<HashMap<_, _>>();
-
-        self.tcp_ordered_read_gap_anchors.retain(|key, _| {
-            current
-                .get(key)
-                .is_some_and(|progress| progress.ordered_gap_bytes > 0)
-        });
-        self.covered_tcp_ordered_read_gap_episodes
-            .retain(|key, episode| {
-                self.tcp_ordered_read_gap_anchors
-                    .get(key)
-                    .is_some_and(|anchor| anchor.episode == *episode)
-            });
-
-        for (key, progress) in current {
-            if progress.ordered_gap_bytes == 0 {
-                self.tcp_ordered_read_gap_anchors.remove(&key);
-                self.covered_tcp_ordered_read_gap_episodes.remove(&key);
-                continue;
-            }
-            let unchanged = self
-                .tcp_ordered_read_gap_anchors
-                .get(&key)
-                .is_some_and(|anchor| {
-                    anchor.progress.stream == progress.stream
-                        && anchor.progress.read_offset == progress.read_offset
-                        && anchor.progress.next_received_offset == progress.next_received_offset
-                });
-            if unchanged {
-                if let Some(anchor) = self.tcp_ordered_read_gap_anchors.get_mut(&key) {
-                    anchor.progress = progress;
-                    anchor.observations = anchor.observations.saturating_add(1);
-                }
-                continue;
-            }
-
-            self.next_tcp_ordered_read_gap_episode =
-                self.next_tcp_ordered_read_gap_episode.saturating_add(1);
-            self.tcp_ordered_read_gap_anchors.insert(
-                key,
-                TcpOrderedReadGapAnchor {
-                    progress,
-                    episode: self.next_tcp_ordered_read_gap_episode,
-                    observed_at: now,
-                    observations: 1,
-                },
-            );
-            self.covered_tcp_ordered_read_gap_episodes.remove(&key);
-        }
-    }
-
-    fn eligible_tcp_ordered_read_gap(
-        &self,
-        now: Instant,
-    ) -> Option<(usize, TcpOrderedReadGapAnchor)> {
-        self.tcp_ordered_read_gap_anchors
-            .iter()
-            .filter(|(key, anchor)| {
-                anchor.observations >= 2
-                    && now.saturating_duration_since(anchor.observed_at)
-                        >= ENDPOINT_RECOVERY_SAMPLE_INTERVAL
-                    && self.covered_tcp_ordered_read_gap_episodes.get(key) != Some(&anchor.episode)
-            })
-            .map(|((stable_id, _), anchor)| (*stable_id, *anchor))
-            .max_by_key(|(stable_id, anchor)| {
-                (
-                    now.saturating_duration_since(anchor.observed_at),
-                    anchor.progress.buffered_bytes,
-                    *stable_id,
-                    anchor.progress.reader,
-                )
-            })
-    }
-
     fn cover_tcp_write_episodes(&mut self, input: &EndpointRecoveryInput) {
         for sample in &input.connections {
             for pressure in &sample.tcp_write_pressures {
@@ -5281,39 +5457,6 @@ impl EndpointRecoveryState {
         }
     }
 
-    fn begin_tcp_ordered_read_gap_rebind(
-        &mut self,
-        now: Instant,
-        input: &EndpointRecoveryInput,
-        stable_id: usize,
-        anchor: TcpOrderedReadGapAnchor,
-        max_rtt: Duration,
-    ) -> EndpointRecoveryAction {
-        let progress = anchor.progress;
-        self.covered_tcp_ordered_read_gap_episodes
-            .insert((stable_id, progress.reader), anchor.episode);
-        self.begin_rebind(
-            input,
-            EndpointRecoveryTrigger::TcpOrderedReadGap {
-                stable_id,
-                reader: progress.reader,
-                stream: progress.stream,
-                episode: anchor.episode,
-                read_offset: progress.read_offset,
-                next_received_offset: progress
-                    .next_received_offset
-                    .unwrap_or(progress.read_offset),
-                highest_received_offset: progress.highest_received_offset,
-                buffered_bytes: progress.buffered_bytes,
-                ordered_gap_bytes: progress.ordered_gap_bytes,
-                observations: anchor.observations,
-            },
-            now.saturating_duration_since(anchor.observed_at),
-            ENDPOINT_RECOVERY_SAMPLE_INTERVAL,
-            max_rtt,
-        )
-    }
-
     fn observe(&mut self, now: Instant, input: &EndpointRecoveryInput) -> EndpointRecoveryAction {
         if input.last_udp_activity_secs < self.observed_udp_activity_secs {
             self.observed_udp_activity_secs = input.last_udp_activity_secs;
@@ -5348,7 +5491,6 @@ impl EndpointRecoveryState {
         }
         self.connections = next;
         self.refresh_path_recovery_ownership(input);
-        self.refresh_tcp_ordered_read_gap_ownership(now, input);
         self.covered_tcp_write_episodes
             .retain(|(stable_id, writer), episode| {
                 input.connections.iter().any(|sample| {
@@ -5388,14 +5530,12 @@ impl EndpointRecoveryState {
             if self.expected_socket_generation.is_some() {
                 return EndpointRecoveryAction::None;
             }
-            self.clear_tcp_ordered_read_gap_episodes();
             self.clear_episode();
             return EndpointRecoveryAction::None;
         }
 
         let active_workload = input.active_tcp > 0 || input.udp_active;
         if !active_workload || input.connections.is_empty() {
-            self.clear_tcp_ordered_read_gap_episodes();
             self.clear_episode();
             return EndpointRecoveryAction::None;
         }
@@ -5418,13 +5558,6 @@ impl EndpointRecoveryState {
                 stall_bound,
                 max_rtt,
             );
-        }
-
-        if let Some((stable_id, anchor)) = self.eligible_tcp_ordered_read_gap(now)
-            && !self.rebind_issued
-            && self.expected_socket_generation.is_none()
-        {
-            return self.begin_tcp_ordered_read_gap_rebind(now, input, stable_id, anchor, max_rtt);
         }
 
         if let Some((stable_id, pressure, anchor, current)) =
@@ -6808,6 +6941,7 @@ impl TuicUpstream {
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             let mut state = EndpointRecoveryState::default();
+            let mut evidence_observer = tcp_diag_enabled().then(RecoveryEvidenceObserver::default);
             let mut last_tcp_pool_activity = None;
             let mut tick = tokio::time::interval(ENDPOINT_RECOVERY_SAMPLE_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -6825,6 +6959,11 @@ impl TuicUpstream {
                     println!("🔎 tuic-tcp-pool-activity active_leases={active_leases}");
                 }
                 let now = Instant::now();
+                if let Some(observer) = evidence_observer.as_mut() {
+                    for event in observer.observe(now, &input) {
+                        log_recovery_evidence(event);
+                    }
+                }
                 match state.observe(now, &input) {
                     EndpointRecoveryAction::None => {}
                     EndpointRecoveryAction::Recovered {
@@ -7312,13 +7451,14 @@ impl ProxyUpstream for TuicUpstream {
                 )
             })?;
             let reader: NativeTcpReadHalf = if d16_byte_owned {
-                let read_pressure = read_pressure.reader(stream_id, recv.progress_handle());
+                let read_pressure = tcp_diag_enabled()
+                    .then(|| read_pressure.reader(stream_id, recv.progress_handle()));
                 Box::new(TuicNativeOrderedReader::new(
                     recv,
                     reader_lease,
                     tcp_stream_diag,
                     conn.clone(),
-                    Some(read_pressure),
+                    read_pressure,
                 ))
             } else if relay_mode == TuicTcpRelayMode::NativeOrderedPump {
                 Box::new(TuicNativeOrderedPumpReader::spawn(
@@ -7628,103 +7768,242 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_recovery_rebinds_once_for_two_observations_of_the_same_ordered_gap() {
+    fn recovery_evidence_observes_persistent_ordered_gap_without_endpoint_action() {
         let started = Instant::now();
-        let mut state = EndpointRecoveryState::default();
-        let sample = |read_offset, next_received_offset, highest_received_offset| {
-            let mut connection = endpoint_recovery_connection(11, 0, None);
-            connection.tcp_ordered_read_progress = vec![endpoint_recovery_ordered_progress(
-                7,
-                21,
-                read_offset,
-                next_received_offset,
-                highest_received_offset,
-                96_732,
-            )];
-            endpoint_recovery_path_sample(vec![connection])
-        };
+        let mut recovery = EndpointRecoveryState::default();
+        let mut evidence = RecoveryEvidenceObserver::default();
+        let sample =
+            |read_offset, next_received_offset, highest_received_offset, buffered_bytes| {
+                let mut connection = endpoint_recovery_connection(11, 0, None);
+                connection.tcp_ordered_read_progress = vec![endpoint_recovery_ordered_progress(
+                    7,
+                    21,
+                    read_offset,
+                    next_received_offset,
+                    highest_received_offset,
+                    buffered_bytes,
+                )];
+                endpoint_recovery_path_sample(vec![connection])
+            };
 
-        let first_gap = sample(569_624_937, Some(569_626_217), 569_721_669);
+        let first_gap = sample(569_624_937, Some(569_626_217), 569_721_669, 96_732);
+        assert!(evidence.observe(started, &first_gap).is_empty());
         assert_eq!(
-            state.observe(started, &first_gap),
+            recovery.observe(started, &first_gap),
             EndpointRecoveryAction::None,
-            "one sampler observation only establishes exact gap ownership"
+            "read-only evidence cannot authorize Endpoint mutation"
         );
-        let action = state.observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL, &first_gap);
+        let growing_tail = sample(569_624_937, Some(569_626_217), 570_721_669, 1_096_732);
+        let events = evidence.observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL, &growing_tail);
+        assert_eq!(events.len(), 1);
         assert!(matches!(
-            action,
-            EndpointRecoveryAction::Rebind {
-                generation: 1,
-                trigger: EndpointRecoveryTrigger::TcpOrderedReadGap {
-                    stable_id: 11,
-                    reader: 7,
-                    stream: 21,
-                    episode: 1,
-                    read_offset: 569_624_937,
-                    next_received_offset: 569_626_217,
-                    highest_received_offset: 569_721_669,
-                    buffered_bytes: 96_732,
-                    ordered_gap_bytes: 1_280,
-                    observations: 2,
-                },
+            events[0],
+            RecoveryEvidence::OrderedGapObserved {
+                stable_id: 11,
+                reader: 7,
+                stream: 21,
+                episode: 1,
+                read_offset: 569_624_937,
+                next_received_offset: 569_626_217,
+                initial_highest_received_offset: 569_721_669,
+                current_highest_received_offset: 570_721_669,
+                initial_buffered_bytes: 96_732,
+                current_buffered_bytes: 1_096_732,
+                ordered_gap_bytes: 1_280,
+                observations: 2,
+                tail_advanced: true,
                 ..
             }
         ));
         assert_eq!(
-            state.observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 2, &first_gap),
+            recovery.observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL, &growing_tail,),
             EndpointRecoveryAction::None,
-            "covered exact gap authority cannot rebind twice"
+            "even a persistent gap with a growing tail remains observation-only"
+        );
+        assert!(
+            evidence
+                .observe(
+                    started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 2,
+                    &growing_tail,
+                )
+                .is_empty()
         );
 
-        let progressed = sample(569_721_669, None, 569_721_669);
-        assert_eq!(
-            state.observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 3, &progressed),
-            EndpointRecoveryAction::None
+        let progressed = sample(570_721_669, None, 570_721_669, 0);
+        assert!(
+            evidence
+                .observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 3, &progressed,)
+                .is_empty()
         );
-        let later_gap = sample(700_000_000, Some(700_001_280), 700_080_000);
-        assert_eq!(
-            state.observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 4, &later_gap),
-            EndpointRecoveryAction::None
+
+        let later_gap = sample(700_000_000, Some(700_001_280), 700_080_000, 80_000);
+        assert!(
+            evidence
+                .observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 4, &later_gap,)
+                .is_empty(),
+            "a later gap must establish fresh observation ownership"
         );
         assert!(matches!(
-            state.observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 5, &later_gap),
-            EndpointRecoveryAction::Rebind {
-                generation: 2,
-                trigger: EndpointRecoveryTrigger::TcpOrderedReadGap { episode: 2, .. },
+            evidence
+                .observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 5, &later_gap,)
+                .as_slice(),
+            [RecoveryEvidence::OrderedGapObserved { episode: 2, .. }]
+        ));
+    }
+
+    #[test]
+    fn recovery_evidence_aggregates_writer_ack_progress_until_episode_end() {
+        let started = Instant::now();
+        let mut evidence = RecoveryEvidenceObserver::default();
+        let sample = |pressure| {
+            endpoint_recovery_path_sample(vec![endpoint_recovery_connection(11, 0, pressure)])
+        };
+
+        let first = sample(Some(endpoint_recovery_pending(
+            3,
+            7,
+            Duration::from_millis(250),
+            Duration::from_millis(250),
+            1_000,
+        )));
+        assert!(matches!(
+            evidence.observe(started, &first).as_slice(),
+            [RecoveryEvidence::TcpWritePressureStarted {
+                stable_id: 11,
+                writer: 3,
+                stream: 7,
+                episode: 7,
+                acknowledged_bytes: 1_000,
+                ..
+            }]
+        ));
+
+        let progressed = sample(Some(endpoint_recovery_pending(
+            3,
+            7,
+            Duration::from_millis(500),
+            Duration::from_millis(50),
+            65_000,
+        )));
+        assert!(
+            evidence
+                .observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL, &progressed)
+                .is_empty()
+        );
+
+        let ended = sample(None);
+        assert!(matches!(
+            evidence
+                .observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 2, &ended)
+                .as_slice(),
+            [RecoveryEvidence::TcpWritePressureEnded {
+                stable_id: 11,
+                writer: 3,
+                stream: 7,
+                episode: 7,
+                observations: 2,
+                initial_acknowledged_bytes: 1_000,
+                final_acknowledged_bytes: 65_000,
+                ack_progress_observations: 1,
+                max_pending_for,
+                max_ack_stalled_for,
+                ..
+            }] if *max_pending_for == Duration::from_millis(500)
+                && *max_ack_stalled_for == Duration::from_millis(250)
+        ));
+    }
+
+    #[test]
+    fn recovery_evidence_does_not_merge_writer_identity_or_episode_replacement() {
+        let started = Instant::now();
+        let mut evidence = RecoveryEvidenceObserver::default();
+        let input = |stable_id, episode, acknowledged_bytes| {
+            endpoint_recovery_path_sample(vec![endpoint_recovery_connection(
+                stable_id,
+                0,
+                Some(endpoint_recovery_pending(
+                    3,
+                    episode,
+                    Duration::from_millis(250),
+                    Duration::from_millis(250),
+                    acknowledged_bytes,
+                )),
+            )])
+        };
+
+        assert_eq!(evidence.observe(started, &input(11, 7, 1_000)).len(), 1);
+        let episode_events = evidence.observe(
+            started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL,
+            &input(11, 8, 2_000),
+        );
+        assert_eq!(episode_events.len(), 2);
+        assert!(matches!(
+            episode_events[0],
+            RecoveryEvidence::TcpWritePressureEnded {
+                stable_id: 11,
+                episode: 7,
+                observations: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            episode_events[1],
+            RecoveryEvidence::TcpWritePressureStarted {
+                stable_id: 11,
+                episode: 8,
+                acknowledged_bytes: 2_000,
+                ..
+            }
+        ));
+
+        let identity_events = evidence.observe(
+            started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 2,
+            &input(12, 9, 3_000),
+        );
+        assert_eq!(identity_events.len(), 2);
+        assert!(matches!(
+            identity_events[0],
+            RecoveryEvidence::TcpWritePressureEnded {
+                stable_id: 11,
+                episode: 8,
+                observations: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            identity_events[1],
+            RecoveryEvidence::TcpWritePressureStarted {
+                stable_id: 12,
+                episode: 9,
+                acknowledged_bytes: 3_000,
                 ..
             }
         ));
     }
 
     #[test]
-    fn endpoint_recovery_writer_ack_stall_precedes_an_eligible_ordered_gap() {
+    fn endpoint_recovery_writer_ack_stall_is_unchanged_by_ordered_gap_evidence() {
         let started = Instant::now();
         let rtt = Duration::from_millis(159);
         let bound = endpoint_recovery_stall_bound(rtt);
         let mut state = EndpointRecoveryState::default();
-        let sample = |with_writer: bool| {
-            let mut connection = endpoint_recovery_connection(
-                11,
-                0,
-                with_writer.then(|| endpoint_recovery_pending(3, 7, bound, bound, 0)),
-            );
-            connection.tcp_ordered_read_progress = vec![endpoint_recovery_ordered_progress(
-                9,
-                21,
-                569_624_937,
-                Some(569_626_217),
-                569_721_669,
-                96_732,
-            )];
-            endpoint_recovery_path_sample(vec![connection])
-        };
-
-        assert_eq!(
-            state.observe(started, &sample(false)),
-            EndpointRecoveryAction::None
+        let mut connection = endpoint_recovery_connection(
+            11,
+            0,
+            Some(endpoint_recovery_pending(3, 7, bound, bound, 0)),
         );
+        connection.tcp_ordered_read_progress = vec![endpoint_recovery_ordered_progress(
+            9,
+            21,
+            569_624_937,
+            Some(569_626_217),
+            569_721_669,
+            96_732,
+        )];
+        let sample = endpoint_recovery_path_sample(vec![connection]);
+
         assert!(matches!(
-            state.observe(started + bound, &sample(true)),
+            state.observe(started, &sample),
             EndpointRecoveryAction::Rebind {
                 trigger: EndpointRecoveryTrigger::TcpWriteStall {
                     stable_id: 11,
@@ -7735,126 +8014,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn endpoint_recovery_changed_gap_and_connection_replacement_restart_observation() {
-        let started = Instant::now();
-        let mut state = EndpointRecoveryState::default();
-        let sample = |next_received_offset, include_replacement| {
-            let mut connection = endpoint_recovery_connection(11, 0, None);
-            connection.tcp_ordered_read_progress = vec![endpoint_recovery_ordered_progress(
-                7,
-                21,
-                1_000,
-                Some(next_received_offset),
-                2_000,
-                900,
-            )];
-            let mut connections = vec![connection];
-            if include_replacement {
-                connections.push(endpoint_recovery_connection(12, 0, None));
-            }
-            endpoint_recovery_path_sample(connections)
-        };
-
-        assert_eq!(
-            state.observe(started, &sample(1_100, false)),
-            EndpointRecoveryAction::None
-        );
-        assert_eq!(
-            state.observe(
-                started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL,
-                &sample(1_200, false)
-            ),
-            EndpointRecoveryAction::None,
-            "a changed first buffered offset begins a fresh gap episode"
-        );
-        assert_eq!(
-            state.observe(
-                started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 2,
-                &sample(1_200, true)
-            ),
-            EndpointRecoveryAction::None,
-            "connection replacement clears already accumulated observations"
-        );
-        assert_eq!(
-            state.observe(
-                started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 3,
-                &sample(1_200, true)
-            ),
-            EndpointRecoveryAction::None,
-            "the first stable post-replacement sample only owns the gap"
-        );
-        assert!(matches!(
-            state.observe(
-                started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 4,
-                &sample(1_200, true)
-            ),
-            EndpointRecoveryAction::Rebind {
-                trigger: EndpointRecoveryTrigger::TcpOrderedReadGap {
-                    stable_id: 11,
-                    reader: 7,
-                    stream: 21,
-                    observations: 2,
-                    ..
-                },
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn endpoint_recovery_ordered_gap_requires_elapsed_sampler_interval_and_active_workload() {
-        let started = Instant::now();
-        let mut state = EndpointRecoveryState::default();
-        let sample = |active_tcp| {
-            let mut input =
-                endpoint_recovery_path_sample(vec![endpoint_recovery_connection(11, 0, None)]);
-            input.active_tcp = active_tcp;
-            input.connections[0].tcp_ordered_read_progress =
-                vec![endpoint_recovery_ordered_progress(
-                    7,
-                    21,
-                    1_000,
-                    Some(1_100),
-                    2_000,
-                    900,
-                )];
-            input
-        };
-
-        assert_eq!(
-            state.observe(started, &sample(1)),
-            EndpointRecoveryAction::None
-        );
-        assert_eq!(
-            state.observe(started + Duration::from_millis(1), &sample(1)),
-            EndpointRecoveryAction::None,
-            "back-to-back recovery turns cannot impersonate one sampler interval"
-        );
-        assert!(matches!(
-            state.observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL, &sample(1)),
-            EndpointRecoveryAction::Rebind {
-                trigger: EndpointRecoveryTrigger::TcpOrderedReadGap { .. },
-                ..
-            }
-        ));
-
-        let mut inactive_state = EndpointRecoveryState::default();
-        assert_eq!(
-            inactive_state.observe(started, &sample(0)),
-            EndpointRecoveryAction::None
-        );
-        assert_eq!(
-            inactive_state.observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL, &sample(0)),
-            EndpointRecoveryAction::None
-        );
-        assert_eq!(
-            inactive_state.observe(started + ENDPOINT_RECOVERY_SAMPLE_INTERVAL * 2, &sample(1)),
-            EndpointRecoveryAction::None,
-            "inactive samples cannot accumulate recovery authority"
-        );
     }
 
     #[test]

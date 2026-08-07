@@ -2,7 +2,10 @@
 
 Date: 2026-08-06
 
-Status: **SELECTED FOR LOCAL TDD. FORMAL M2 FAILED AND REMAINS BLOCKED.**
+Status: **REJECTED BY MAC QUALIFICATION; FORMAL M2 REMAINS BLOCKED.**
+
+Superseded by:
+`docs/tech/2026-08-07-knife15-m2-recovery-evidence-observer-architecture-spec.md`.
 
 Source baseline: `0a71ebe4b1c147f9db5982ec3125cd54a495a067`.
 
