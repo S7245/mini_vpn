@@ -55,8 +55,8 @@ Source of truth:
 
 ## Task 6: Results, Memory, Commit, Push
 
-- [ ] Write exact local results and gate counts.
-- [ ] Update `CONTEXT.md`, `TODO.md`, `HANDOFF.md`, `AGENTS.md`, learnings,
+- [x] Write exact local results and gate counts.
+- [x] Update `CONTEXT.md`, `TODO.md`, `HANDOFF.md`, `AGENTS.md`, learnings,
   and errors.
 - [ ] Commit coherent stages and push the current branch.
 - [ ] Provide exactly one bounded Mac qualification transaction with the Exit

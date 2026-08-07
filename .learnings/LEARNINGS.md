@@ -1,5 +1,25 @@
 # Learnings
 
+## 2026-08-07 - Observation and recovery authority must remain separate
+
+- A precise signal can still be unsafe authority. Six exact same-stream gaps
+  survived two samples while healthy WAN reordering continued to grow the
+  buffered tail and the transfer completed. Exact attribution rejected a weak
+  guess, but it did not by itself prove transport failure.
+- Check direction reachability before repairing a failed phase. The selected
+  short-forward failure was an uplink writer event with no business reads, so
+  a receive-gap mechanism could never be sufficient even if its predicate were
+  made more conservative.
+- Preserve a useful mechanism seam after rejecting its policy. Quinn read
+  progress remains read-only evidence; a separate bounded observer owns
+  episode aggregation; `EndpointRecoveryState` alone owns mutation. Default
+  production mode does not register or aggregate the diagnostic read state.
+- Sampled ACK progress proves client-to-Exit transport service, not Target
+  delivery. Pair writer episode evidence with the independent Exit observer
+  before choosing another architecture.
+- Result:
+  `docs/tech/2026-08-07-knife15-m2-recovery-evidence-observer-local-results.md`.
+
 ## 2026-08-06 - Exact structural demand should own peer-visible recovery
 
 - Connection-wide packet and STREAM-frame growth is a hypothesis, not proof

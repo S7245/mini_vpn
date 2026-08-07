@@ -2,9 +2,43 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-06)
+## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-07)
 
-- **Latest accepted position:** exact-source `0a71ebe` formal-M2 artifact
+- **Latest accepted position:** exact-source `f8c0639` qualification artifact
+  `/tmp/mini_vpn_knife15_macos_20260807_031530.tar.gz` (SHA-256
+  `60c60b7f...`) passed baseline `24.026/58.984 Mbit/s`, direct, start/smoke,
+  every preflight, long forward/reverse TCP/reverse UDP, and cleanup. Cycle 1
+  short forward then had two complete initial Target receiver-zero intervals;
+  formal M2 was not run.
+- The ordered-gap action fired six Endpoint rebinds on the preceding passing
+  long forward. The same missing prefixes coexisted with multi-megabyte tail
+  growth and the phase completed `119,087,605B`. The failed short stream was
+  uplink-only, accepted `6,296,649B`, waited `4,493,917us`, and had no business
+  read/gap signal. This rejects active ordered-gap migration as both unsafe
+  and insufficient; do not tune its old `250ms` observation interval.
+- Reviewed implementation `847a5d7` removes ordered gaps from recovery
+  authority and adds a pure, bounded `RecoveryEvidenceObserver`. Under the
+  existing TCP diagnostic switch it emits one ordered-gap observation and
+  exact writer-Pending start/end ACK aggregates; it cannot mutate transport.
+  Existing exact ACK-stall rebind, writer plus PLPMTUD connection reset, and
+  UDP-demand recovery remain unchanged. The runner rejects any legacy
+  ordered-gap action or malformed evidence.
+- Focused evidence `3`, Endpoint recovery `16`, root `684+3 ignored`, main
+  `2`, integration `10+4 ignored`, release, established Clippy, shell,
+  vendored Quinn `40+3 ignored` plus doc `1`, quinn-proto `311` plus docs `3`,
+  fmt/diff/vendor/secret, and review pass with no unresolved P0/P1. Exact
+  32 MiB Endpoint capacity was `240.370 Mbit/s`, final `61,440/0/0B`, zero
+  socket would-block. Result:
+  `docs/tech/2026-08-07-knife15-m2-recovery-evidence-observer-local-results.md`.
+- Next pull/rebuild the pushed descendant and, with the `.33` Exit observer
+  active, run exactly one fresh `m2-ipv6-check -> baseline ->
+  direct-discriminator -> start -> smoke -> m2-qualification -> status ->
+  stop`. It normally takes about 30 minutes and can only produce
+  `PASS_NON_ACCEPTANCE`. Preserve `status/snapshot/stop` after failure. Do not
+  run formal M2 or repeat/tune unchanged; paired ACK/Exit evidence must select
+  the next architecture first. Formal M2 and M3 remain blocked.
+
+- **Previous accepted position:** exact-source `0a71ebe` formal-M2 artifact
   `/tmp/mini_vpn_knife15_macos_20260806_104632.tar.gz` (SHA-256
   `da12448c...`) passed baseline `46.328/59.947 Mbit/s`, direct
   `23.077 Mbit/s` without gaps, start/smoke, every preflight, cycle 1, cycle

@@ -1,5 +1,25 @@
 # Errors
 
+## 2026-08-07 - Ordered-gap migration false positives and gate provenance
+
+- Exact-source `f8c0639` emitted six ordered-gap Endpoint rebinds during a
+  passing 300-second forward transfer. The buffered tail kept growing by
+  megabytes beyond small missing prefixes. A stable prefix over `250ms` is
+  ordinary WAN reordering evidence, not safe migration authority.
+- The later failed short flow was uplink-only and therefore could not produce
+  the receive-side signal. Retuning the observation interval would leave the
+  selected failure unreachable while retaining active false positives.
+- A two-connection rebind test assumed the new generation must remain zero
+  immediately after rebind. Quinn sends a PING as part of rebind, so an
+  authenticated loopback response may legally advance one connection before
+  the task resumes. Accept old/current generation at that asynchronous point,
+  then require exact current generation after explicit round trips.
+- A strict Clippy command again promoted established repository warnings to
+  errors, and a standalone Quinn command again selected registry proto because
+  it omitted the absolute local patch. Neither was a regression. The new lint
+  was fixed; the established lane and a `cargo tree`-verified local-proto
+  vendor suite passed.
+
 ## 2026-08-06 - Ordered-gap evidence and final-gate provenance traps
 
 - Exact-source `0a71ebe` formal M2 failed about 25 minutes into its workload;

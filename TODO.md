@@ -1,10 +1,51 @@
 # TODO
 
-## Current Knife15 Plan (2026-08-06)
+## Current Knife15 Plan (2026-08-07)
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-06 — exact ordered-gap migration ready for qualification)
+#### Latest decision (2026-08-07 — recovery evidence observer ready for qualification)
+
+Exact-source `f8c0639` artifact
+`/tmp/mini_vpn_knife15_macos_20260807_031530.tar.gz` (SHA-256
+`60c60b7f...`) passed baseline `24.026/58.984 Mbit/s`, direct, every
+preflight, the long forward/reverse TCP/reverse UDP phases, and cleanup. Its
+cycle-1 short forward then had two complete initial Target receiver-zero
+intervals. Formal M2 was not run.
+
+The ordered-gap predicate had already caused six Endpoint rebinds on the
+passing long forward while each exact missing prefix accumulated a growing
+multi-megabyte tail. The failed short flow was uplink-only, accepted
+`6,296,649B`, waited `4,493,917us`, and owned no exact business read gap. The
+active ordered-gap migration is therefore rejected as unsafe and insufficient;
+do not tune its former observation interval.
+
+Reviewed implementation `847a5d7` removes ordered-gap recovery authority but
+keeps read-only Quinn evidence. A pure diagnostic observer records one
+persistent-gap event and exact writer-Pending start/end ACK aggregates; it is
+instantiated only under `MINI_VPN_TCP_DIAG=1` and cannot mutate transport. The
+runner rejects old ordered-gap actions and malformed evidence. Existing exact
+ACK-stall rebind, writer plus PLPMTUD connection reset, and UDP-demand recovery
+remain unchanged.
+
+All local gates pass with no unresolved P0/P1. Root is `684+3 ignored`,
+vendored Quinn/proto are `40+3 ignored`/`311`, and exact 32 MiB Endpoint
+capacity reached `240.370 Mbit/s` with final `61,440/0/0B`. Result:
+`docs/tech/2026-08-07-knife15-m2-recovery-evidence-observer-local-results.md`.
+
+Next:
+
+1. pull the pushed descendant of `847a5d7` and rebuild release on the Mac;
+2. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
+3. wait for the agent to report the bounded Exit observer active on `.33`;
+4. take exactly one fresh `m2-ipv6-check -> baseline -> direct-discriminator
+   -> start -> smoke -> m2-qualification -> status -> stop`;
+5. allow about 30 minutes and preserve `status/snapshot/stop` after failure;
+6. do not run formal M2 or repeat/tune unchanged; classify paired writer/ACK
+   and Exit evidence before selecting another recovery mechanism;
+7. keep formal M2 and M3 blocked.
+
+#### Previous decision (2026-08-06 — exact ordered-gap migration ready for qualification)
 
 Exact-source `0a71ebe` artifact
 `/tmp/mini_vpn_knife15_macos_20260806_104632.tar.gz` (SHA-256
