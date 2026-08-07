@@ -28,6 +28,18 @@ _Avoid_: connection health (qualification is one exact placement discriminator, 
 A bounded lifecycle handoff for an auxiliary TCP pool slot whose current busy generation has proven degraded. The old generation becomes drain-only and keeps every existing relay; one authenticated successor becomes the slot's only generation eligible for new Target opens. The configured pool and eligible-slot count remain unchanged, the primary TUIC connection and UDP/health ownership never move, and at most one predecessor may drain behind an auxiliary successor. Replacement is neither stream migration nor pool expansion.
 _Avoid_: reconnect active flows (the predecessor remains alive), failover retry (the triggering open waits for a successor instead of replaying payload), pool growth (only two logical slots admit new work)
 
+**TUIC TCP successor service turn**:
+A bounded pre-install readiness contract for a freshly authenticated auxiliary
+replacement. Quinn snapshots that connection's current congestion window and
+emits one Endpoint-bulk, ACK-eliciting transport flight; every tagged encrypted
+packet byte must be acknowledged on the same path generation before the
+existing identity/activity/generation CAS may install the successor. Loss,
+path change, close, or the existing whole-replacement deadline fails without
+retry and leaves the predecessor current. It sends no Target/business probe,
+adds no timer or configured byte threshold, and is not a general bandwidth
+promise.
+_Avoid_: warm-up traffic (the proof is transport-native and carries no business payload), health check (it proves one exact delivered flight only), retry (loss is terminal), pool expansion (no additional eligible generation is retained)
+
 **TUIC TCP new-stream startup service**:
 A bounded per-stream send-scheduling contract. A newly opened TUIC TCP stream queues its Connect header and first non-empty business payload above incumbent normal-priority stream data, then atomically returns to its original Quinn priority after exactly one business scheduling turn. Blocked or empty writes do not consume the contract. It changes neither connection admission nor congestion/flow control and has no timer, byte threshold, Target rule, or configuration knob.
 _Avoid_: stream boost (sounds tunable or permanent), fast lane (suggests separate capacity), failover (the selected QUIC connection does not change)

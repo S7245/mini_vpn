@@ -4,7 +4,39 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-07 — service-normalized admission ready for qualification)
+#### Latest decision (2026-08-07 — successor service turn ready for qualification)
+
+Exact-source `7131de4` artifact
+`/tmp/mini_vpn_knife15_macos_20260807_091815.tar.gz` (SHA-256
+`7c749fb9...`) passed baseline `35.336/61.978 Mbit/s`, direct at
+`17.659 Mbit/s` without gaps, start/smoke, every preflight, the long
+forward/reverse TCP/reverse UDP phases, and cleanup. Its first short forward
+then lost one complete Target receiver interval. Formal M2 was not run.
+
+Service-normalized admission selected the correct known busy candidate, but
+that candidate was authenticated conn1 generation 2 with no prior forward bulk
+service and only its initial `12,000B` congestion window. Reviewed `541fbfb`
+now requires one current-cwnd, Endpoint-bulk Quinn service turn before the
+existing successor generation CAS. Every tagged packet byte must be ACKed on
+the same path generation; loss/path/close/deadline fails without retry and
+leaves the predecessor current. No frozen value or new timer changed.
+
+All local gates pass with no unresolved P0/P1; root is `688+3 ignored`,
+vendored Quinn/proto are `40+3 ignored`/`315`, and the exact Endpoint gate
+reached `240.291 Mbit/s` with final `61,440/0/0B`. Result:
+`docs/tech/2026-08-07-knife15-m2-quinn-successor-service-turn-local-results.md`.
+
+Next:
+
+1. start a fresh paired `.33` Exit observer; the previous observer expired;
+2. pull the pushed descendant and rebuild release on the Mac;
+3. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
+4. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
+   start -> smoke -> m2-qualification -> status -> stop`;
+5. preserve `status/snapshot/stop` after failure and upload the bundle;
+6. do not run formal M2 or repeat/tune unchanged; keep M2/M3 blocked.
+
+#### Previous decision (2026-08-07 — service-normalized admission ready for qualification)
 
 Exact-source `12e845f` artifact
 `/tmp/mini_vpn_knife15_macos_20260807_054320.tar.gz` (SHA-256

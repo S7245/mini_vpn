@@ -61,8 +61,8 @@ Source of truth:
 
 ## Task 6: Results, Memory, Commit, Push
 
-- [ ] Write local results with exact tests and capacity.
-- [ ] Update `CONTEXT.md`, `TODO.md`, `HANDOFF.md`, `AGENTS.md`, learnings, and
+- [x] Write local results with exact tests and capacity.
+- [x] Update `CONTEXT.md`, `TODO.md`, `HANDOFF.md`, `AGENTS.md`, learnings, and
   errors.
 - [ ] Commit coherent stages and push the current branch.
 - [ ] Start a fresh paired Exit observer and provide exactly one bounded Mac

@@ -4,7 +4,38 @@
 
 ## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-07)
 
-- **Latest accepted position:** exact-source `12e845f` qualification artifact
+- **Latest accepted position:** exact-source `7131de4` qualification artifact
+  `/tmp/mini_vpn_knife15_macos_20260807_091815.tar.gz` (SHA-256
+  `7c749fb9...`) passed baseline `35.336/61.978 Mbit/s`, direct at
+  `17.659 Mbit/s` without gaps, start/smoke, every preflight, the long
+  forward/reverse TCP/reverse UDP phases, and cleanup. The first short
+  forward then lost one complete Target receiver interval; formal M2 was not
+  run.
+- Normalized admission correctly chose conn1 generation 2 at
+  `12,000B/163.342ms`; exact D16 writer and Endpoint conservation stayed
+  live, but that authenticated replacement had never served forward bulk and
+  remained cold while its predecessor had reached `780,994B/164.107ms`.
+  Normalized placement is retained; authentication-only successor install is
+  the selected seam.
+- Reviewed `541fbfb` inserts one exact current-cwnd Quinn service turn between
+  TUIC authentication and the existing generation CAS. It uses Endpoint bulk
+  service, succeeds only when every tagged encrypted packet byte is ACKed on
+  the same path generation, and fails without retry on loss/path/close or the
+  existing shared five-second replacement deadline. Failure creates no new
+  owner or draining generation.
+- Root `688+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  established Clippy, shell, vendored Quinn `40+3 ignored` plus doc `1`,
+  quinn-proto `315` plus docs `3`, root docs, fmt/diff/vendor/secret, and
+  review pass with no unresolved P0/P1. Exact 32 MiB Endpoint capacity was
+  `240.291 Mbit/s`, final `61,440/0/0B`, zero socket would-block. Result:
+  `docs/tech/2026-08-07-knife15-m2-quinn-successor-service-turn-local-results.md`.
+- The intended `.33` observer expired before this Mac run. Start a fresh
+  observer, pull/rebuild the pushed descendant, then take exactly one
+  `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke ->
+  m2-qualification -> status -> stop`. Preserve evidence after failure; do
+  not run formal M2 or repeat/tune unchanged. Formal M2 and M3 remain blocked.
+
+- **Previous accepted position:** exact-source `12e845f` qualification artifact
   `/tmp/mini_vpn_knife15_macos_20260807_054320.tar.gz` (SHA-256
   `916db92b...`) passed baseline `26.054/60.199 Mbit/s`, 300-second direct at
   `13.020 Mbit/s` without gaps, start/smoke, every preflight, exact transfer,

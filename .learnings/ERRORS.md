@@ -1,5 +1,25 @@
 # Errors
 
+## 2026-08-07 - Successor readiness evidence and repeated local gate traps
+
+- Exact-source `7131de4` selected the better normalized busy candidate, but
+  that candidate was an authentication-only replacement with no prior forward
+  bulk service. Treating the receiver zero as another selector/rate/MTU tweak
+  would ignore the newly isolated installation-contract seam.
+- The intended `.33` observer had reached its two-hour timeout before the Mac
+  run and captured no matching packet. Historical paired evidence is a
+  comparator only; it cannot be presented as exact evidence for this artifact.
+- A standalone Quinn command again omitted the absolute local quinn-proto
+  patch and produced missing-fork-API errors. A whole-vendor rustfmt command
+  then created unrelated formatting noise. The noise was reverted; the exact
+  patched vendor suite and narrow diff passed. Never wholesale-format the
+  pinned Quinn tree with the current formatter.
+- The first integration command named a nonexistent target; the next omitted
+  `--features harness` and ran zero tests. The first explicit capacity rerun
+  used `--ignored` on a non-ignored test and also ran zero. All were rejected
+  and rerun with exact targets and expected counts (`10+4 ignored` and one
+  measured 32 MiB test).
+
 ## 2026-08-07 - Cold placement and local replay provenance traps
 
 - Exact-source `12e845f` lost two complete startup receiver intervals after

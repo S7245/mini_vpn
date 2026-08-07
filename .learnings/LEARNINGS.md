@@ -1,5 +1,28 @@
 # Learnings
 
+## 2026-08-07 - Authentication must not transfer service ownership by itself
+
+- QUIC/TUIC authentication proves peer identity and protocol reachability, not
+  that a fresh auxiliary generation has delivered one useful congestion-
+  controlled flight. A correct selector can still choose a cold but formally
+  qualified successor if installation grants ownership too early.
+- Put readiness inside the replacement commit boundary. Keep the predecessor
+  current while the successor proves service, then reuse the existing exact
+  identity/activity/generation CAS; failure must create neither a new-open
+  owner nor a draining predecessor.
+- A current-cwnd transport flight avoids a workload threshold or tuning knob.
+  Tag the real encrypted packets, charge them through Endpoint bulk service,
+  and accept only exact same-path ACK settlement. Authentication control bytes
+  already queued on the first carrier benefit from the same proof.
+- Reuse one existing whole-operation deadline. Preserve separate handshake,
+  service-turn, and replacement timing plus partial byte counters so deadline
+  failure remains causal without introducing a retry/timer subsystem.
+- Observer lifetime is part of evidence provenance. An observer that expired
+  before the client run supplies no paired facts; keep its absence explicit
+  and start a fresh bounded observer for the next unique qualification.
+- Result:
+  `docs/tech/2026-08-07-knife15-m2-quinn-successor-service-turn-local-results.md`.
+
 ## 2026-08-07 - Eligible ownership must be normalized by current service
 
 - Paired opens form one placement transaction. A control reservation can make
