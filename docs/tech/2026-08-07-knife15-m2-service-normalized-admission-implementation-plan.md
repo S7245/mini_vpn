@@ -2,7 +2,7 @@
 
 Date: 2026-08-07
 
-Status: **LOCAL TDD IMPLEMENTATION IN PROGRESS; FORMAL M2 AND M3 REMAIN BLOCKED**
+Status: **LOCAL COMPLETE; ONE MAC QUALIFICATION REQUIRED; FORMAL M2 AND M3 REMAIN BLOCKED**
 
 Source of truth:
 `docs/tech/2026-08-07-knife15-m2-service-normalized-admission-architecture-spec.md`.
@@ -28,38 +28,38 @@ Source of truth:
 
 ## Task 3: Focused RED
 
-- [ ] Replace the old unequal-load-first assertion with the exact warm-control/
+- [x] Replace the old unequal-load-first assertion with the exact warm-control/
   cold-data replay and prove current admission selects the cold data path.
-- [ ] Add exact ratio, max-value, idle, unknown, all-degraded, and preparation
+- [x] Add exact ratio, max-value, idle, unknown, all-degraded, and preparation
   fallback tests.
-- [ ] Add diagnostic formatting coverage for normalized selection.
+- [x] Add diagnostic formatting coverage for normalized selection.
 
 ## Task 4: Minimal GREEN
 
-- [ ] Add one private overflow-safe rational comparator to path-service policy.
-- [ ] Apply normalized ordering only to all-busy, all-known, admitted
+- [x] Add one private overflow-safe rational comparator to path-service policy.
+- [x] Apply normalized ordering only to all-busy, all-known, admitted
   candidates after qualification.
-- [ ] Preserve existing deterministic inner ordering for ties and fallbacks.
-- [ ] Thread normalized-selection diagnostics through generic and D16 opens.
+- [x] Preserve existing deterministic inner ordering for ties and fallbacks.
+- [x] Thread normalized-selection diagnostics through generic and D16 opens.
 
 ## Task 5: Gates And Review
 
-- [ ] Run focused admission, generation replacement, recovery, and diagnostic
+- [x] Run focused admission, generation replacement, recovery, and diagnostic
   tests.
-- [ ] Run exact 32 MiB Endpoint capacity/conservation gate.
-- [ ] Run root library/main/integration/release/Clippy, Knife15/Knife14 shell,
+- [x] Run exact 32 MiB Endpoint capacity/conservation gate.
+- [x] Run root library/main/integration/release/Clippy, Knife15/Knife14 shell,
   vendored Quinn/proto/docs, root docs, fmt/diff/vendor-patch/secret gates.
-- [ ] Review exact ordering, overflow, unknown/fallback availability, CAS
+- [x] Review exact ordering, overflow, unknown/fallback availability, CAS
   races, lock placement, log compatibility, and TCP/UDP/TUN/D16 regressions.
-- [ ] Repair all P0/P1 findings and rerun affected gates.
+- [x] Repair all P0/P1 findings and rerun affected gates.
 
 ## Task 6: Results, Memory, Commit, Push
 
-- [ ] Write local results with exact counts and capacity.
-- [ ] Update `CONTEXT.md`, `TODO.md`, `HANDOFF.md`, `AGENTS.md`, learnings, and
+- [x] Write local results with exact counts and capacity.
+- [x] Update `CONTEXT.md`, `TODO.md`, `HANDOFF.md`, `AGENTS.md`, learnings, and
   errors.
-- [ ] Commit coherent stages and push the current branch.
-- [ ] Start the paired Exit observer and provide exactly one bounded Mac
+- [x] Commit coherent stages and push the current branch.
+- [x] Start the paired Exit observer and provide exactly one bounded Mac
   qualification transaction; formal M2 remains blocked.
 
 ## Stop Rule

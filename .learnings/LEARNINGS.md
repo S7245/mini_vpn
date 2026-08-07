@@ -1,5 +1,25 @@
 # Learnings
 
+## 2026-08-07 - Eligible ownership must be normalized by current service
+
+- Paired opens form one placement transaction. A control reservation can make
+  the adjacent data open prefer a cold path under raw least-connections even
+  though both paths were equal before the pair. Replay the sequence, not only
+  one isolated selector snapshot.
+- Keep negative evidence categorical. Forward qualification and bounded
+  generation replacement must exclude a degraded generation before any load
+  comparison; service normalization cannot manufacture health or re-admit it.
+- For admitted busy paths, `active * RTT / cwnd` expresses ownership demand
+  against current service without a threshold or configured weight. Exact
+  continued-fraction comparison avoids float drift and a three-factor `u128`
+  overflow while keeping the hot path allocation-free.
+- Historical falsifiers still bind. This rule would not change the qualified
+  lane-collapse or installed-successor choices; it addresses the newly proven
+  state where multiple qualified candidates remain but raw ownership points
+  at a roughly 73-times colder path.
+- Result:
+  `docs/tech/2026-08-07-knife15-m2-service-normalized-admission-local-results.md`.
+
 ## 2026-08-07 - Observation and recovery authority must remain separate
 
 - A precise signal can still be unsafe authority. Six exact same-stream gaps

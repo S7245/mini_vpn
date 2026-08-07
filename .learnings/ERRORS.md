@@ -1,5 +1,24 @@
 # Errors
 
+## 2026-08-07 - Cold placement and local replay provenance traps
+
+- Exact-source `12e845f` lost two complete startup receiver intervals after
+  control chose warm conn1 and data chose cold conn0. Direct, smoke, paired
+  Exit supply, Target ACKs, and local conservation all passed. Treating this
+  as slow WAN or tuning a rate would discard the exact placement evidence.
+- The first focused replay kept `TcpPoolSlotPreparation` alive while opening
+  data, so conn1 was temporarily excluded and the apparent RED had the wrong
+  cause. Match `live_tcp_conn`: release preparation after cloning the selected
+  connection while retaining the active lease, then assert the second open.
+- An isolated unmodified-HEAD build used a second target directory and hit
+  `ENOSPC` while the repository held 66 GiB of renewable build cache. The
+  failure was not source code. Clean the owned cache or reuse the verified
+  target directory before compiling a detached replay, and never count a
+  partial build as a gate.
+- Cargo accepts only one positional test filter. A command with two filters
+  failed at argument parsing; use one common filter or run the exact tests
+  separately and require the expected count.
+
 ## 2026-08-07 - Ordered-gap migration false positives and gate provenance
 
 - Exact-source `f8c0639` emitted six ordered-gap Endpoint rebinds during a

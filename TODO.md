@@ -4,7 +4,44 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-07 — recovery evidence observer ready for qualification)
+#### Latest decision (2026-08-07 — service-normalized admission ready for qualification)
+
+Exact-source `12e845f` artifact
+`/tmp/mini_vpn_knife15_macos_20260807_054320.tar.gz` (SHA-256
+`916db92b...`) passed baseline `26.054/60.199 Mbit/s`, direct at
+`13.020 Mbit/s` without gaps, start/smoke, every preflight, exact transfer,
+and cleanup. Its first qualification forward had two complete sender and
+receiver zero intervals during startup. Formal M2 was not run.
+
+Paired Exit evidence had zero capture/kernel drops, at most `223.987ms`
+between positive data packets, and about `1ms` Target ACK RTT. The exact writer
+continued ACK progress and local ownership/conservation stayed healthy.
+Control had selected warm conn1 at equal ownership; its reservation then made
+data select roughly 73-times colder conn0 because raw leases preceded service
+when loads differed.
+
+Reviewed `6e78d23` preserves categorical forward qualification and generation
+replacement, then compares exact `active * RTT / cwnd` only across admitted
+busy candidates with known positive service. No score threshold, weight,
+timer, state, config, payload action, or frozen value was added. Idle,
+unknown, and all-degraded fallbacks are unchanged. All local gates pass with
+no unresolved P0/P1; root is `686+3 ignored`, vendored Quinn/proto are
+`40+3 ignored`/`311`, and the exact Endpoint gate reached `240.313 Mbit/s`
+with final `61,440/0/0B`. Result:
+`docs/tech/2026-08-07-knife15-m2-service-normalized-admission-local-results.md`.
+
+Next:
+
+1. the `.33` observer is active at
+   `/tmp/mini_vpn_knife15_exit_target_observer_20260807_064333`;
+2. pull the pushed descendant and rebuild release on the Mac;
+3. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
+4. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
+   start -> smoke -> m2-qualification -> status -> stop`;
+5. preserve `status/snapshot/stop` after failure and upload the bundle;
+6. do not run formal M2 or repeat/tune unchanged; keep M2/M3 blocked.
+
+#### Previous decision (2026-08-07 — recovery evidence observer ready for qualification)
 
 Exact-source `f8c0639` artifact
 `/tmp/mini_vpn_knife15_macos_20260807_031530.tar.gz` (SHA-256
