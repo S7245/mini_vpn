@@ -69,6 +69,8 @@ pub use proto::{
     TokenReuseError, TokenStore, Transmit, TransportConfig, TransportErrorCode, UdpStats,
     ValidationTokenConfig, VarInt, VarIntBoundsExceeded, Written,
 };
+#[doc(hidden)]
+pub use proto::{SuccessorServiceTurnFailure, SuccessorServiceTurnStats};
 #[cfg(feature = "qlog")]
 pub use proto::{QlogConfig, QlogStream};
 #[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
@@ -79,6 +81,8 @@ pub use crate::connection::{
     AcceptBi, AcceptUni, Connecting, Connection, OpenBi, OpenUni, ReadDatagram, SendDatagram,
     SendDatagramError, ZeroRttAccepted,
 };
+#[doc(hidden)]
+pub use crate::connection::SuccessorServiceTurnError;
 pub use crate::endpoint::{Accept, Endpoint, EndpointStats};
 pub use crate::incoming::{Incoming, IncomingFuture, RetryError};
 pub use crate::recv_stream::{

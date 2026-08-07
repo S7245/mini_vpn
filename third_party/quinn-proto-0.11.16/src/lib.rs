@@ -51,6 +51,11 @@ pub use crate::connection::{
     RttEstimator, SendDatagramError, SendStream, SendStreamProgress, ShouldTransmit, StreamEvent,
     Streams, UdpStats, WriteError, Written,
 };
+#[doc(hidden)]
+pub use crate::connection::{
+    SuccessorServiceTurnFailure, SuccessorServiceTurnOutcome, SuccessorServiceTurnStartError,
+    SuccessorServiceTurnStats,
+};
 #[cfg(feature = "qlog")]
 pub use connection::qlog::QlogStream;
 

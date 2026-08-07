@@ -90,6 +90,138 @@ use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket, ThinRe
 mod stats;
 pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
 
+/// Exact congestion-controlled byte accounting for one successor service turn.
+///
+/// This fork-only transport primitive is used to prove that a freshly authenticated auxiliary
+/// connection can deliver one bounded flight before it becomes an application traffic owner.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SuccessorServiceTurnStats {
+    pub target_bytes: u64,
+    pub sent_bytes: u64,
+    pub acked_bytes: u64,
+    pub lost_bytes: u64,
+    pub path_generation: u64,
+}
+
+/// Terminal reason for an unsuccessful successor service turn.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SuccessorServiceTurnFailure {
+    PacketLost,
+    PathChanged,
+    ConnectionClosed,
+}
+
+/// Terminal result for one successor service turn.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SuccessorServiceTurnOutcome {
+    Succeeded(SuccessorServiceTurnStats),
+    Failed {
+        reason: SuccessorServiceTurnFailure,
+        stats: SuccessorServiceTurnStats,
+    },
+}
+
+/// Starting a successor service turn is deliberately fail-closed and single-owner.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SuccessorServiceTurnStartError {
+    Busy,
+    NotEstablished,
+    ZeroWindow,
+}
+
+#[derive(Debug)]
+struct SuccessorServiceTurn {
+    stats: SuccessorServiceTurnStats,
+    outcome: Option<SuccessorServiceTurnOutcome>,
+}
+
+impl SuccessorServiceTurn {
+    fn new(
+        target_bytes: u64,
+        path_generation: u64,
+    ) -> Result<Self, SuccessorServiceTurnStartError> {
+        if target_bytes == 0 {
+            return Err(SuccessorServiceTurnStartError::ZeroWindow);
+        }
+        Ok(Self {
+            stats: SuccessorServiceTurnStats {
+                target_bytes,
+                sent_bytes: 0,
+                acked_bytes: 0,
+                lost_bytes: 0,
+                path_generation,
+            },
+            outcome: None,
+        })
+    }
+
+    fn wants_packet(&self) -> bool {
+        self.outcome.is_none() && self.stats.sent_bytes < self.stats.target_bytes
+    }
+
+    fn on_packet_sent(&mut self, path_generation: u64, bytes: u64) -> Result<(), ()> {
+        if self.outcome.is_some() || path_generation != self.stats.path_generation || bytes == 0 {
+            if path_generation != self.stats.path_generation {
+                self.fail(SuccessorServiceTurnFailure::PathChanged);
+            }
+            return Err(());
+        }
+        self.stats.sent_bytes = self.stats.sent_bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    fn on_packet_acked(&mut self, path_generation: u64, bytes: u64) {
+        if self.outcome.is_some() {
+            return;
+        }
+        if path_generation != self.stats.path_generation {
+            self.fail(SuccessorServiceTurnFailure::PathChanged);
+            return;
+        }
+        self.stats.acked_bytes = self.stats.acked_bytes.saturating_add(bytes);
+        if self.stats.sent_bytes >= self.stats.target_bytes
+            && self.stats.acked_bytes == self.stats.sent_bytes
+            && self.stats.lost_bytes == 0
+        {
+            self.outcome = Some(SuccessorServiceTurnOutcome::Succeeded(self.stats));
+        }
+    }
+
+    fn on_packet_lost(&mut self, path_generation: u64, bytes: u64) {
+        if self.outcome.is_some() {
+            return;
+        }
+        if path_generation != self.stats.path_generation {
+            self.fail(SuccessorServiceTurnFailure::PathChanged);
+            return;
+        }
+        self.stats.lost_bytes = self.stats.lost_bytes.saturating_add(bytes);
+        self.fail(SuccessorServiceTurnFailure::PacketLost);
+    }
+
+    fn fail(&mut self, reason: SuccessorServiceTurnFailure) {
+        if self.outcome.is_none() {
+            self.outcome = Some(SuccessorServiceTurnOutcome::Failed {
+                reason,
+                stats: self.stats,
+            });
+        }
+    }
+
+    #[cfg(test)]
+    fn outcome(&self) -> Option<SuccessorServiceTurnOutcome> {
+        self.outcome
+    }
+
+    fn take_outcome(&mut self) -> Option<SuccessorServiceTurnOutcome> {
+        self.outcome.take()
+    }
+}
+
 mod streams;
 #[cfg(fuzzing)]
 pub use streams::StreamsState;
@@ -241,6 +373,9 @@ pub struct Connection {
     /// no outgoing application data.
     app_limited: bool,
 
+    /// One bounded, ACK-correlated service flight for a not-yet-installed auxiliary successor.
+    successor_service_turn: Option<SuccessorServiceTurn>,
+
     streams: StreamsState,
     /// Surplus remote CIDs for future use on new paths
     rem_cids: CidQueue,
@@ -354,6 +489,7 @@ impl Connection {
             pto_count: 0,
 
             app_limited: false,
+            successor_service_turn: None,
             receiving_ecn: false,
             total_authed_packets: 0,
 
@@ -1089,6 +1225,9 @@ impl Connection {
 
             let sent =
                 self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number);
+            if sent.successor_service_turn {
+                builder.pad_to(self.path.current_mtu());
+            }
 
             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
             // any other reason, there is a bug which leads to one component announcing write
@@ -1350,7 +1489,9 @@ impl Connection {
             space_id,
             close,
             self.spaces[space_id].loss_probes != 0,
-            self.streams.can_send_stream_data() || application_datagram_ready,
+            self.streams.can_send_stream_data()
+                || application_datagram_ready
+                || self.successor_service_turn_wants_packet(),
         )
     }
 
@@ -1575,6 +1716,31 @@ impl Connection {
         self.spaces[self.highest_space].ping_pending = true;
     }
 
+    /// Start one bounded congestion-controlled service flight on the current path.
+    #[doc(hidden)]
+    pub fn start_successor_service_turn(
+        &mut self,
+    ) -> Result<SuccessorServiceTurnStats, SuccessorServiceTurnStartError> {
+        if !self.state.is_established() {
+            return Err(SuccessorServiceTurnStartError::NotEstablished);
+        }
+        if self.successor_service_turn.is_some() {
+            return Err(SuccessorServiceTurnStartError::Busy);
+        }
+        let target_bytes = self.path.congestion.window();
+        let path_generation = self.path.generation();
+        let turn = SuccessorServiceTurn::new(target_bytes, path_generation)?;
+        let stats = turn.stats;
+        self.successor_service_turn = Some(turn);
+        Ok(stats)
+    }
+
+    /// Return the exact partial counters for the currently active service turn.
+    #[doc(hidden)]
+    pub fn successor_service_turn_stats(&self) -> Option<SuccessorServiceTurnStats> {
+        self.successor_service_turn.as_ref().map(|turn| turn.stats)
+    }
+
     /// Update traffic keys spontaneously
     ///
     /// This can be useful for testing key updates, as they otherwise only happen infrequently.
@@ -1692,6 +1858,7 @@ impl Connection {
     /// faster or reduce loss to settle on optimal values by restarting from the initial
     /// configuration in the [`TransportConfig`].
     pub fn path_changed(&mut self, now: Instant) {
+        self.fail_successor_service_turn(SuccessorServiceTurnFailure::PathChanged);
         self.path.reset(now, &self.config);
     }
 
@@ -1877,6 +2044,9 @@ impl Connection {
     // Not timing-aware, so it's safe to call this for inferred acks, such as arise from
     // high-latency handshakes
     fn on_packet_acked(&mut self, now: Instant, info: SentPacket) {
+        let successor_service_turn = info.successor_service_turn;
+        let path_generation = info.path_generation;
+        let packet_size = u64::from(info.size);
         self.remove_in_flight(&info);
         if info.ack_eliciting && self.path.challenge.is_none() {
             // Only pass ACKs to the congestion controller if we are not validating the current
@@ -1899,6 +2069,59 @@ impl Connection {
 
         for frame in info.stream_frames {
             self.streams.received_ack_of(frame);
+        }
+        if successor_service_turn {
+            self.note_successor_service_turn_packet_acked(path_generation, packet_size);
+        }
+    }
+
+    fn successor_service_turn_wants_packet(&self) -> bool {
+        self.successor_service_turn
+            .as_ref()
+            .is_some_and(SuccessorServiceTurn::wants_packet)
+    }
+
+    pub(super) fn note_successor_service_turn_packet_sent(
+        &mut self,
+        path_generation: u64,
+        bytes: u64,
+    ) {
+        if let Some(turn) = self.successor_service_turn.as_mut() {
+            let _ = turn.on_packet_sent(path_generation, bytes);
+        }
+        self.publish_successor_service_turn_outcome();
+    }
+
+    fn note_successor_service_turn_packet_acked(&mut self, path_generation: u64, bytes: u64) {
+        if let Some(turn) = self.successor_service_turn.as_mut() {
+            turn.on_packet_acked(path_generation, bytes);
+        }
+        self.publish_successor_service_turn_outcome();
+    }
+
+    fn note_successor_service_turn_packet_lost(&mut self, path_generation: u64, bytes: u64) {
+        if let Some(turn) = self.successor_service_turn.as_mut() {
+            turn.on_packet_lost(path_generation, bytes);
+        }
+        self.publish_successor_service_turn_outcome();
+    }
+
+    fn fail_successor_service_turn(&mut self, reason: SuccessorServiceTurnFailure) {
+        if let Some(turn) = self.successor_service_turn.as_mut() {
+            turn.fail(reason);
+        }
+        self.publish_successor_service_turn_outcome();
+    }
+
+    fn publish_successor_service_turn_outcome(&mut self) {
+        let outcome = self
+            .successor_service_turn
+            .as_mut()
+            .and_then(SuccessorServiceTurn::take_outcome);
+        if let Some(outcome) = outcome {
+            self.successor_service_turn = None;
+            self.events
+                .push_back(Event::SuccessorServiceTurn { outcome });
         }
     }
 
@@ -2050,6 +2273,12 @@ impl Connection {
                     now,
                     self.orig_rem_cid,
                 );
+                if info.successor_service_turn {
+                    self.note_successor_service_turn_packet_lost(
+                        info.path_generation,
+                        u64::from(info.size),
+                    );
+                }
                 self.remove_in_flight(&info);
                 for frame in info.stream_frames {
                     self.streams.retransmit(frame);
@@ -3345,6 +3574,7 @@ impl Connection {
     }
 
     fn migrate(&mut self, now: Instant, remote: SocketAddr) {
+        self.fail_successor_service_turn(SuccessorServiceTurnFailure::PathChanged);
         trace!(%remote, "migration initiated");
         self.path_counter = self.path_counter.wrapping_add(1);
         // Reset rtt/congestion state for new path unless it looks like a NAT rebinding.
@@ -3449,6 +3679,8 @@ impl Connection {
         pn: u64,
     ) -> SentFrames {
         let mut sent = SentFrames::default();
+        let successor_service_turn =
+            space_id == SpaceId::Data && self.successor_service_turn_wants_packet();
         let space = &mut self.spaces[space_id];
         let is_0rtt = space_id == SpaceId::Data && space.crypto.is_none();
         space.pending_acks.maybe_ack_non_eliciting();
@@ -3463,7 +3695,14 @@ impl Connection {
         }
 
         // PING
-        if mem::replace(&mut space.ping_pending, false) {
+        if successor_service_turn {
+            space.ping_pending = false;
+            trace!("PING (successor service turn)");
+            buf.write(frame::FrameType::PING);
+            sent.non_retransmits = true;
+            sent.successor_service_turn = true;
+            self.stats.frame_tx.ping += 1;
+        } else if mem::replace(&mut space.ping_pending, false) {
             trace!("PING");
             buf.write(frame::FrameType::PING);
             sent.non_retransmits = true;
@@ -3742,6 +3981,7 @@ impl Connection {
 
     fn close_common(&mut self) {
         trace!("connection closed");
+        self.fail_successor_service_turn(SuccessorServiceTurnFailure::ConnectionClosed);
         for &timer in &Timer::VALUES {
             self.timers.stop(timer);
         }
@@ -3973,6 +4213,7 @@ impl Connection {
     /// See also `self.space(SpaceId::Data).can_send()`
     fn can_send_1rtt(&self, max_size: usize) -> bool {
         self.streams.can_send_stream_data()
+            || self.successor_service_turn_wants_packet()
             || self.path.challenge_pending
             || self
                 .prev_path
@@ -4318,6 +4559,11 @@ pub enum Event {
     DatagramReceived,
     /// One or more application datagrams have been sent after blocking
     DatagramsUnblocked,
+    /// A bounded successor service turn reached an exact terminal outcome.
+    #[doc(hidden)]
+    SuccessorServiceTurn {
+        outcome: SuccessorServiceTurnOutcome,
+    },
 }
 
 fn get_max_ack_delay(params: &TransportParameters) -> Duration {
@@ -4357,6 +4603,7 @@ struct SentFrames {
     /// Whether the packet contains non-retransmittable frames (like datagrams)
     non_retransmits: bool,
     requires_padding: bool,
+    successor_service_turn: bool,
 }
 
 impl SentFrames {
@@ -4450,5 +4697,100 @@ mod tests {
             PacingTrafficClass::Bulk,
             "STREAM/DATAGRAM and mixed application packets are bulk"
         );
+
+        let service_turn = SuccessorServiceTurn::new(12_000, 1).unwrap();
+        assert_eq!(
+            classify_endpoint_pacing_datagram(
+                SpaceId::Data,
+                false,
+                false,
+                service_turn.wants_packet(),
+            ),
+            PacingTrafficClass::Bulk,
+            "a successor service-turn carrier must consume Endpoint bulk service"
+        );
+    }
+
+    #[test]
+    fn successor_service_turn_state_requires_every_tagged_byte_acknowledged() {
+        let mut turn = SuccessorServiceTurn::new(12_000, 7).unwrap();
+        assert!(turn.wants_packet());
+
+        turn.on_packet_sent(7, 6_000).unwrap();
+        turn.on_packet_sent(7, 6_240).unwrap();
+        assert!(!turn.wants_packet());
+        assert_eq!(turn.outcome(), None);
+
+        turn.on_packet_acked(7, 6_000);
+        assert_eq!(turn.outcome(), None);
+        turn.on_packet_acked(7, 6_240);
+
+        assert_eq!(
+            turn.outcome(),
+            Some(SuccessorServiceTurnOutcome::Succeeded(
+                SuccessorServiceTurnStats {
+                    target_bytes: 12_000,
+                    sent_bytes: 12_240,
+                    acked_bytes: 12_240,
+                    lost_bytes: 0,
+                    path_generation: 7,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn successor_service_turn_state_fails_closed_on_loss_or_path_change() {
+        let mut lost = SuccessorServiceTurn::new(12_000, 3).unwrap();
+        lost.on_packet_sent(3, 1_200).unwrap();
+        lost.on_packet_lost(3, 1_200);
+        assert!(matches!(
+            lost.outcome(),
+            Some(SuccessorServiceTurnOutcome::Failed {
+                reason: SuccessorServiceTurnFailure::PacketLost,
+                stats: SuccessorServiceTurnStats {
+                    sent_bytes: 1_200,
+                    acked_bytes: 0,
+                    lost_bytes: 1_200,
+                    ..
+                }
+            })
+        ));
+        assert!(!lost.wants_packet());
+
+        let mut migrated = SuccessorServiceTurn::new(12_000, 3).unwrap();
+        migrated.on_packet_sent(3, 1_200).unwrap();
+        migrated.fail(SuccessorServiceTurnFailure::PathChanged);
+        assert!(matches!(
+            migrated.outcome(),
+            Some(SuccessorServiceTurnOutcome::Failed {
+                reason: SuccessorServiceTurnFailure::PathChanged,
+                ..
+            })
+        ));
+        migrated.on_packet_acked(3, 1_200);
+        assert!(matches!(
+            migrated.outcome(),
+            Some(SuccessorServiceTurnOutcome::Failed {
+                reason: SuccessorServiceTurnFailure::PathChanged,
+                ..
+            })
+        ));
+
+        let mut closed = SuccessorServiceTurn::new(12_000, 3).unwrap();
+        closed.on_packet_sent(3, 1_200).unwrap();
+        closed.fail(SuccessorServiceTurnFailure::ConnectionClosed);
+        assert!(matches!(
+            closed.outcome(),
+            Some(SuccessorServiceTurnOutcome::Failed {
+                reason: SuccessorServiceTurnFailure::ConnectionClosed,
+                stats: SuccessorServiceTurnStats {
+                    sent_bytes: 1_200,
+                    acked_bytes: 0,
+                    lost_bytes: 0,
+                    ..
+                }
+            })
+        ));
     }
 }

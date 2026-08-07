@@ -305,7 +305,78 @@ impl Future for ConnectionDriver {
 #[derive(Debug, Clone)]
 pub struct Connection(ConnectionRef);
 
+/// Failure to establish one bounded ACK-correlated service turn on a fresh connection.
+#[doc(hidden)]
+#[derive(Debug, Error)]
+pub enum SuccessorServiceTurnError {
+    #[error("a successor service turn is already active")]
+    Busy,
+    #[error("the connection is not established")]
+    NotEstablished,
+    #[error("the congestion window is zero")]
+    ZeroWindow,
+    #[error("connection lost during successor service turn: {0}")]
+    ConnectionLost(ConnectionError),
+    #[error("successor service turn failed: {reason:?}")]
+    Failed {
+        reason: proto::SuccessorServiceTurnFailure,
+        stats: proto::SuccessorServiceTurnStats,
+    },
+    #[error("successor service turn completion channel closed")]
+    CompletionChannelClosed,
+}
+
 impl Connection {
+    /// Deliver one congestion-window-sized, ACK-correlated transport service turn.
+    #[doc(hidden)]
+    pub async fn successor_service_turn(
+        &self,
+    ) -> Result<proto::SuccessorServiceTurnStats, SuccessorServiceTurnError> {
+        let receiver = {
+            let mut conn = self.0.state.lock("successor_service_turn");
+            if let Some(error) = conn.error.clone() {
+                return Err(SuccessorServiceTurnError::ConnectionLost(error));
+            }
+            if conn.successor_service_turn.is_some() {
+                return Err(SuccessorServiceTurnError::Busy);
+            }
+            conn.inner
+                .start_successor_service_turn()
+                .map_err(|error| match error {
+                    proto::SuccessorServiceTurnStartError::Busy => SuccessorServiceTurnError::Busy,
+                    proto::SuccessorServiceTurnStartError::NotEstablished => {
+                        SuccessorServiceTurnError::NotEstablished
+                    }
+                    proto::SuccessorServiceTurnStartError::ZeroWindow => {
+                        SuccessorServiceTurnError::ZeroWindow
+                    }
+                })?;
+            let (sender, receiver) = oneshot::channel();
+            conn.successor_service_turn = Some(sender);
+            conn.wake();
+            receiver
+        };
+
+        match receiver.await {
+            Ok(Ok(proto::SuccessorServiceTurnOutcome::Succeeded(stats))) => Ok(stats),
+            Ok(Ok(proto::SuccessorServiceTurnOutcome::Failed { reason, stats })) => {
+                Err(SuccessorServiceTurnError::Failed { reason, stats })
+            }
+            Ok(Err(error)) => Err(SuccessorServiceTurnError::ConnectionLost(error)),
+            Err(_) => Err(SuccessorServiceTurnError::CompletionChannelClosed),
+        }
+    }
+
+    /// Return exact partial byte counters while a successor service turn is active.
+    #[doc(hidden)]
+    pub fn successor_service_turn_stats(&self) -> Option<proto::SuccessorServiceTurnStats> {
+        self.0
+            .state
+            .lock("successor_service_turn_stats")
+            .inner
+            .successor_service_turn_stats()
+    }
+
     /// Initiate a new outgoing unidirectional stream.
     ///
     /// Streams are cheap and instantaneous to open unless blocked by flow control. As a
@@ -946,6 +1017,7 @@ impl ConnectionRef {
                 handle,
                 on_handshake_data: Some(on_handshake_data),
                 on_connected: Some(on_connected),
+                successor_service_turn: None,
                 connected: false,
                 timer: None,
                 timer_deadline: None,
@@ -1029,6 +1101,8 @@ pub(crate) struct State {
     handle: ConnectionHandle,
     on_handshake_data: Option<oneshot::Sender<()>>,
     on_connected: Option<oneshot::Sender<bool>>,
+    successor_service_turn:
+        Option<oneshot::Sender<Result<proto::SuccessorServiceTurnOutcome, ConnectionError>>>,
     connected: bool,
     timer: Option<Pin<Box<dyn AsyncTimer>>>,
     timer_deadline: Option<Instant>,
@@ -1265,6 +1339,11 @@ impl State {
                 DatagramsUnblocked => {
                     shared.datagrams_unblocked.notify_waiters();
                 }
+                SuccessorServiceTurn { outcome } => {
+                    if let Some(sender) = self.successor_service_turn.take() {
+                        let _ = sender.send(Ok(outcome));
+                    }
+                }
                 Stream(StreamEvent::Readable { id }) => wake_stream(id, &mut self.blocked_readers),
                 Stream(StreamEvent::Available { dir }) => {
                     // Might mean any number of streams are ready, so we wake up everyone
@@ -1332,6 +1411,9 @@ impl State {
     /// Used to wake up all blocked futures when the connection becomes closed for any reason
     fn terminate(&mut self, reason: ConnectionError, shared: &Shared) {
         self.error = Some(reason.clone());
+        if let Some(sender) = self.successor_service_turn.take() {
+            let _ = sender.send(Err(reason.clone()));
+        }
         if let Some(x) = self.on_handshake_data.take() {
             let _ = x.send(());
         }
@@ -1726,6 +1808,7 @@ mod endpoint_pacing_driver_tests {
             runtime: runtime.clone(),
             send_buffer: Vec::new(),
             buffered_transmit: None,
+            successor_service_turn: None,
         };
         (state, socket, runtime)
     }

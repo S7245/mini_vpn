@@ -278,6 +278,79 @@ fn server_stateless_reset() {
 }
 
 #[test]
+fn successor_service_turn_delivers_one_exact_acked_flight() {
+    let mut pair = Pair::default_with_deterministic_pns();
+    let (client_ch, _) = pair.connect();
+    pair.drive();
+    let initial_cwnd = pair.client_conn_mut(client_ch).stats().path.cwnd;
+
+    let started = pair
+        .client_conn_mut(client_ch)
+        .start_successor_service_turn()
+        .unwrap();
+    assert_eq!(started.target_bytes, initial_cwnd);
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .successor_service_turn_stats(),
+        Some(started),
+        "the deadline owner must be able to capture exact partial counters"
+    );
+    assert_matches!(
+        pair.client_conn_mut(client_ch)
+            .start_successor_service_turn(),
+        Err(SuccessorServiceTurnStartError::Busy)
+    );
+
+    pair.drive();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::SuccessorServiceTurn {
+            outcome: SuccessorServiceTurnOutcome::Succeeded(stats),
+        }) if stats.target_bytes == initial_cwnd
+            && stats.sent_bytes >= stats.target_bytes
+            && stats.acked_bytes == stats.sent_bytes
+            && stats.lost_bytes == 0
+    );
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .successor_service_turn_stats(),
+        None,
+        "terminal publication must release the bounded turn state"
+    );
+    assert!(pair.client_conn_mut(client_ch).stats().path.cwnd > initial_cwnd);
+}
+
+#[test]
+fn successor_service_turn_is_terminal_when_one_tagged_packet_is_lost() {
+    let mut pair = Pair::default_with_deterministic_pns();
+    let (client_ch, _) = pair.connect();
+    pair.drive();
+    pair.client_conn_mut(client_ch)
+        .start_successor_service_turn()
+        .unwrap();
+
+    pair.client.drive_outgoing(pair.time);
+    assert!(
+        pair.client.outbound.len() >= 4,
+        "one current-cwnd service turn must expose enough packets for threshold loss"
+    );
+    pair.client.outbound.pop_front();
+    pair.drive();
+
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::SuccessorServiceTurn {
+            outcome: SuccessorServiceTurnOutcome::Failed {
+                reason: SuccessorServiceTurnFailure::PacketLost,
+                stats,
+            },
+        }) if stats.sent_bytes > 0
+            && stats.lost_bytes > 0
+            && stats.acked_bytes + stats.lost_bytes == stats.sent_bytes
+    );
+}
+
+#[test]
 fn client_stateless_reset() {
     let _guard = subscribe();
     let mut key_material = vec![0; 64];

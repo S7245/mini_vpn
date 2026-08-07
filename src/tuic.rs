@@ -6576,6 +6576,7 @@ impl TuicUpstream {
             replacement.black_holes_current,
         );
         let started_at = Instant::now();
+        let replacement_deadline = tokio::time::Instant::now() + TUIC_RECONNECT_TIMEOUT;
         let handshake = Self::handshake_aux_with_retries(
             &self.endpoint,
             self.server,
@@ -6586,7 +6587,7 @@ impl TuicUpstream {
             replacement.index,
         );
         let (successor_conn, auth_attempts) =
-            tokio::time::timeout(TUIC_RECONNECT_TIMEOUT, handshake)
+            tokio::time::timeout_at(replacement_deadline, handshake)
                 .await
                 .map_err(|_| {
                     io_err(
@@ -6594,6 +6595,43 @@ impl TuicUpstream {
                         "successor handshake exceeded 5s",
                     )
                 })??;
+        let handshake_ms = started_at.elapsed().as_millis();
+        let successor_stable_id = successor_conn.stable_id();
+        let service_turn_started_at = Instant::now();
+        let service_turn = match tokio::time::timeout_at(
+            replacement_deadline,
+            successor_conn.successor_service_turn(),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|error| {
+                io_err(
+                    "tuic tcp pool generation replacement",
+                    format!("successor service turn failed: {error:?}"),
+                )
+            })?,
+            Err(_) => {
+                let partial = successor_conn.successor_service_turn_stats();
+                return Err(io_err(
+                    "tuic tcp pool generation replacement",
+                    format!(
+                        "successor service turn exceeded the existing 5s replacement deadline: partial={partial:?}"
+                    ),
+                ));
+            }
+        };
+        let service_turn_ms = service_turn_started_at.elapsed().as_millis();
+        println!(
+            "✅ tuic-tcp-pool-successor-service-turn slot={} successor_id={} target_bytes={} sent_bytes={} acked_bytes={} lost_bytes={} path_generation={} service_turn_ms={}",
+            replacement.index,
+            successor_stable_id,
+            service_turn.target_bytes,
+            service_turn.sent_bytes,
+            service_turn.acked_bytes,
+            service_turn.lost_bytes,
+            service_turn.path_generation,
+            service_turn_ms,
+        );
         let successor_generation =
             replacement
                 .identity
@@ -6646,11 +6684,13 @@ impl TuicUpstream {
             spawn_quic_stats_logger(successor_conn, replacement.index, secs, stop.subscribe());
         }
         println!(
-            "✅ tuic-tcp-pool-generation-replacement-installed slot={} predecessor_id={} successor_id={} generation={} handshake_ms={} active={}",
+            "✅ tuic-tcp-pool-generation-replacement-installed slot={} predecessor_id={} successor_id={} generation={} handshake_ms={} service_turn_ms={} replacement_ms={} active={}",
             replacement.index,
             install.predecessor_identity.stable_id,
             install.successor_identity.stable_id,
             install.successor_identity.generation,
+            handshake_ms,
+            service_turn_ms,
             started_at.elapsed().as_millis(),
             install.predecessor_activity.active(),
         );
@@ -11719,6 +11759,66 @@ mod tests {
         assert_eq!(connection.stable_id(), stable_id);
         server_task.await.unwrap();
         client_endpoint.close(0u32.into(), b"test complete");
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_successor_service_turn_requires_an_exact_acked_quinn_flight() {
+        let (server_endpoint, client_endpoint, server_addr) = d16_quinn_test_endpoints();
+        let server_task = tokio::spawn(async move {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            connection.closed().await;
+        });
+
+        let connection = client_endpoint
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let initial_cwnd = connection.stats().path.cwnd;
+        let stats = connection.successor_service_turn().await.unwrap();
+
+        assert_eq!(stats.target_bytes, initial_cwnd);
+        assert!(stats.sent_bytes >= stats.target_bytes);
+        assert_eq!(stats.acked_bytes, stats.sent_bytes);
+        assert_eq!(stats.lost_bytes, 0);
+        assert!(
+            connection.stats().path.cwnd > initial_cwnd,
+            "the deliberately full service turn must not be marked application-limited before ACKs"
+        );
+
+        client_endpoint.close(0u32.into(), b"test complete");
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_successor_service_turn_has_exactly_one_owner() {
+        let (server_endpoint, client_endpoint, server_addr) = d16_quinn_test_endpoints();
+        let server_task = tokio::spawn(async move {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            connection.closed().await;
+        });
+
+        let connection = client_endpoint
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let (left, right) = tokio::join!(
+            connection.successor_service_turn(),
+            connection.successor_service_turn()
+        );
+
+        assert!(
+            matches!(
+                (&left, &right),
+                (Ok(_), Err(quinn::SuccessorServiceTurnError::Busy))
+                    | (Err(quinn::SuccessorServiceTurnError::Busy), Ok(_))
+            ),
+            "exactly one concurrent caller must own the bounded service turn: left={left:?} right={right:?}"
+        );
+
+        client_endpoint.close(0u32.into(), b"test complete");
+        server_task.await.unwrap();
     }
 
     #[test]

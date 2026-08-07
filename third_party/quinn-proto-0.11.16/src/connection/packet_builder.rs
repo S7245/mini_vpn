@@ -208,9 +208,14 @@ impl PacketBuilder {
             time_sent: now,
             size,
             ack_eliciting,
+            successor_service_turn: sent.successor_service_turn,
             retransmits: sent.retransmits,
             stream_frames: sent.stream_frames,
         };
+
+        if packet.successor_service_turn {
+            conn.note_successor_service_turn_packet_sent(packet.path_generation, u64::from(size));
+        }
 
         conn.path
             .sent(exact_number, packet, &mut conn.spaces[space_id]);
