@@ -5,10 +5,10 @@ Date: 2026-07-30
 Status: **QUALIFICATION FIRST — use a reviewed descendant containing the
 `m2-qualification` action; formal M2 remains blocked**
 
-This is the only reviewed M2 sequence. The current next run is the one-cycle
+This is the only reviewed M2 sequence. The current next run is the two-cycle
 qualification, not the 24-hour formal M2. It runs the same controlled IPv4
 full tunnel and temporarily changes the active physical network service DNS,
-but stops after one exact mixed cycle in about 15 minutes. `stop` is mandatory
+but stops after two exact mixed cycles in about 30 minutes. `stop` is mandatory
 even after a successful `m2-qualification`.
 
 ## Before Opening The Test Terminal
@@ -225,12 +225,11 @@ Continue immediately. M2 must consume this evidence within 15 minutes.
 If the direct discriminator fails, no TUN was started; preserve its directory
 and restore IPv6 using the pre-start branch in section 8.
 
-## 6. Start, Smoke, And One-Cycle Qualification
+## 6. Start, Smoke, And Two-Cycle Qualification
 
-Before invoking `m2-qualification`, wait until the analysis agent reports that
-the bounded Exit observer is active on `.33`. Do not run the Exit observer on
-the Mac. It is a 96-byte header-oriented, target/port-filtered server-side
-diagnostic with a two-hour watchdog and fixed-size ring.
+The exact ordered-gap discriminator is observed in the client QUIC stream, so
+this qualification does not require the former bounded Exit observer. Do not
+start a separate observer on the Mac or wait for one on `.33`.
 
 ```bash
 sudo -v
@@ -248,11 +247,11 @@ Ambient Apple/system relays and fake-IP entries are allowed and recorded. A
 failure here saves a long run and leaves the TUN/full tunnel available
 for `status/snapshot/stop`.
 
-The qualification runs one 300-second forward TCP, one 300-second reverse TCP,
-one 180-second reverse UDP, and one 10-second short forward, plus preflight,
-DNS, HTTPS, health, and transition overhead. Reserve about 15–20 minutes. A
-success prints `PASS_NON_ACCEPTANCE`; it deliberately cannot create a formal
-M2 verdict.
+The qualification runs exactly two cycles, each containing one 300-second
+forward TCP, one 300-second reverse TCP, one 180-second reverse UDP, and one
+10-second short forward, plus per-cycle DNS/HTTPS checks, health, and
+transition overhead. Reserve about 30 minutes. A success prints
+`PASS_NON_ACCEPTANCE`; it deliberately cannot create a formal M2 verdict.
 
 During M2, the Mac's public IPv4 should be the Exit VPS. That is expected.
 The runner blocks a routable physical IPv6 path instead of claiming a
