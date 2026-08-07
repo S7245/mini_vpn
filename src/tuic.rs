@@ -744,6 +744,7 @@ struct TcpPoolSlotReservation {
     active_before: u64,
     path_service: TcpPoolPathService,
     path_service_tiebreak: bool,
+    service_normalized_ordering: bool,
     qualification: TcpPoolForwardQualification,
     qualification_anchor: Option<u64>,
     black_holes_current: Option<u64>,
@@ -790,6 +791,91 @@ impl TcpPoolPathService {
                     > u128::from(right_cwnd) * u128::from(left_rtt)
             }
         }
+    }
+
+    fn is_known(self) -> bool {
+        matches!(
+            self,
+            Self::Known { cwnd, rtt_micros } if cwnd != 0 && rtt_micros != 0
+        )
+    }
+
+    fn normalized_load_cmp(
+        self,
+        active: u64,
+        other: Self,
+        other_active: u64,
+    ) -> Option<std::cmp::Ordering> {
+        if active == 0 || other_active == 0 {
+            return None;
+        }
+        let (
+            Self::Known {
+                cwnd: left_cwnd,
+                rtt_micros: left_rtt,
+            },
+            Self::Known {
+                cwnd: right_cwnd,
+                rtt_micros: right_rtt,
+            },
+        ) = (self, other)
+        else {
+            return None;
+        };
+        if left_cwnd == 0 || left_rtt == 0 || right_cwnd == 0 || right_rtt == 0 {
+            return None;
+        }
+        let left_numerator = u128::from(active) * u128::from(left_rtt);
+        let right_numerator = u128::from(other_active) * u128::from(right_rtt);
+        Some(compare_positive_rationals(
+            left_numerator,
+            u128::from(left_cwnd),
+            right_numerator,
+            u128::from(right_cwnd),
+        ))
+    }
+}
+
+fn compare_positive_rationals(
+    mut left_numerator: u128,
+    mut left_denominator: u128,
+    mut right_numerator: u128,
+    mut right_denominator: u128,
+) -> std::cmp::Ordering {
+    debug_assert!(left_denominator != 0 && right_denominator != 0);
+    let mut reverse = false;
+    loop {
+        let left_quotient = left_numerator / left_denominator;
+        let right_quotient = right_numerator / right_denominator;
+        if left_quotient != right_quotient {
+            let ordering = left_quotient.cmp(&right_quotient);
+            return if reverse {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+        }
+
+        let left_remainder = left_numerator % left_denominator;
+        let right_remainder = right_numerator % right_denominator;
+        let ordering = match (left_remainder == 0, right_remainder == 0) {
+            (true, true) => return std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => {
+                left_numerator = left_denominator;
+                left_denominator = left_remainder;
+                right_numerator = right_denominator;
+                right_denominator = right_remainder;
+                reverse = !reverse;
+                continue;
+            }
+        };
+        return if reverse {
+            ordering.reverse()
+        } else {
+            ordering
+        };
     }
 }
 
@@ -1092,6 +1178,13 @@ impl TcpPoolAdmission {
                         candidate.qualification != TcpPoolForwardQualification::Degraded;
                 }
             }
+            let service_normalized_ordering = !all_degraded_fallback
+                && candidates
+                    .iter()
+                    .filter(|candidate| candidate.admitted)
+                    .all(|candidate| {
+                        candidate.active_before != 0 && candidate.path_service.is_known()
+                    });
 
             let replacement = qualification_override.then(|| {
                 candidates
@@ -1149,16 +1242,33 @@ impl TcpPoolAdmission {
                 .copied()
                 .filter(|candidate| candidate.admitted)
             {
-                match choice {
-                    None => choice = Some(candidate),
-                    Some(current) if candidate.active_before < current.active_before => {
+                let Some(current) = choice else {
+                    choice = Some(candidate);
+                    continue;
+                };
+                if service_normalized_ordering
+                    && let Some(ordering) = candidate.path_service.normalized_load_cmp(
+                        candidate.active_before,
+                        current.path_service,
+                        current.active_before,
+                    )
+                {
+                    match ordering {
+                        std::cmp::Ordering::Less => {
+                            choice = Some(candidate);
+                            path_service_tiebreak = false;
+                            continue;
+                        }
+                        std::cmp::Ordering::Greater => continue,
+                        std::cmp::Ordering::Equal => {}
+                    }
+                }
+                match candidate.active_before.cmp(&current.active_before) {
+                    std::cmp::Ordering::Less => {
                         choice = Some(candidate);
                         path_service_tiebreak = false;
                     }
-                    Some(current)
-                        if candidate.active_before == current.active_before
-                            && candidate.active_before != 0 =>
-                    {
+                    std::cmp::Ordering::Equal if candidate.active_before != 0 => {
                         if candidate
                             .path_service
                             .has_greater_service_than(current.path_service)
@@ -1172,7 +1282,7 @@ impl TcpPoolAdmission {
                             path_service_tiebreak = true;
                         }
                     }
-                    Some(_) => {}
+                    std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {}
                 }
             }
 
@@ -1222,6 +1332,7 @@ impl TcpPoolAdmission {
                         active_before,
                         path_service: selected.path_service,
                         path_service_tiebreak,
+                        service_normalized_ordering,
                         qualification: selected.qualification,
                         qualification_anchor: selected.qualification_anchor,
                         black_holes_current: selected.black_holes_current,
@@ -1344,6 +1455,7 @@ impl TcpPoolAdmission {
             active_before: 0,
             path_service,
             path_service_tiebreak: false,
+            service_normalized_ordering: false,
             qualification: TcpPoolForwardQualification::Qualified,
             qualification_anchor: Some(black_holes_detected),
             black_holes_current: Some(black_holes_detected),
@@ -3671,6 +3783,7 @@ struct TuicTcpPoolSelectionDiag<'a> {
     active_before: u64,
     path_service: TcpPoolPathService,
     path_service_tiebreak: bool,
+    service_normalized_ordering: bool,
     qualification: TcpPoolForwardQualification,
     qualification_anchor: Option<u64>,
     black_holes_current: Option<u64>,
@@ -3691,6 +3804,7 @@ fn format_tuic_tcp_pool_selection_line(diag: TuicTcpPoolSelectionDiag<'_>) -> St
         active_before,
         path_service,
         path_service_tiebreak,
+        service_normalized_ordering,
         qualification,
         qualification_anchor,
         black_holes_current,
@@ -3743,7 +3857,7 @@ fn format_tuic_tcp_pool_selection_line(diag: TuicTcpPoolSelectionDiag<'_>) -> St
         .collect::<Vec<_>>()
         .join(";");
     format!(
-        "🔎 tuic-tcp-pool-selection conn={conn_index} id={stable_id} policy=busy_epoch_forward_qualification_then_least_active_then_path_service active_before={active_before} path_cwnd={path_cwnd} path_rtt_us={path_rtt_us} path_service_tiebreak={path_service_tiebreak} qualification={} black_hole_anchor={} black_holes_current={} qualification_override={qualification_override} all_degraded_fallback={all_degraded_fallback} candidates=[{candidates}] generation={generation} replacement_installed={replacement_installed} last_success_age_secs={last_success_age_secs} probe_result={probe_result} reconnect_reason={}",
+        "🔎 tuic-tcp-pool-selection conn={conn_index} id={stable_id} policy=busy_epoch_forward_qualification_then_service_normalized_load_then_least_active_then_path_service active_before={active_before} path_cwnd={path_cwnd} path_rtt_us={path_rtt_us} service_normalized_ordering={service_normalized_ordering} path_service_tiebreak={path_service_tiebreak} qualification={} black_hole_anchor={} black_holes_current={} qualification_override={qualification_override} all_degraded_fallback={all_degraded_fallback} candidates=[{candidates}] generation={generation} replacement_installed={replacement_installed} last_success_age_secs={last_success_age_secs} probe_result={probe_result} reconnect_reason={}",
         qualification.as_str(),
         optional_counter(qualification_anchor),
         optional_counter(black_holes_current),
@@ -5894,6 +6008,7 @@ struct TcpPoolConnectionSelection {
     active_before: u64,
     path_service: TcpPoolPathService,
     path_service_tiebreak: bool,
+    service_normalized_ordering: bool,
     qualification: TcpPoolForwardQualification,
     qualification_anchor: Option<u64>,
     black_holes_current: Option<u64>,
@@ -6575,9 +6690,11 @@ impl TuicUpstream {
 
     /// TCP 专用连接选择。Admission samples current Quinn path and PLPMTUD evidence without waiting,
     /// then atomically reserves an eligible slot. A busy slot that added a black-hole detection in
-    /// its current ownership epoch is isolated while a non-degraded alternative exists. Remaining
-    /// candidates retain least-active ordering and equal nonzero `cwnd / RTT` tie-breaking; an idle
-    /// pool keeps stable-index ordering so a following opener observes the first reservation.
+    /// its current ownership epoch is isolated while a non-degraded alternative exists. When all
+    /// admitted candidates are busy with known service, ownership is ordered by exact
+    /// `active * RTT / cwnd`; idle, unknown, and all-degraded fallback retain least-active ordering
+    /// and equal nonzero `cwnd / RTT` tie-breaking. An idle pool keeps stable-index ordering so a
+    /// following opener observes the first reservation.
     /// Idle age only requests a bounded liveness probe; it is not itself permission to destroy an
     /// auxiliary connection. The per-slot mutex still serializes probe/reconnect and connection
     /// cloning while the already-visible reservation steers unrelated opens toward other slots.
@@ -6589,6 +6706,7 @@ impl TuicUpstream {
             active_before,
             path_service,
             path_service_tiebreak,
+            service_normalized_ordering,
             qualification,
             qualification_anchor,
             black_holes_current,
@@ -6688,6 +6806,7 @@ impl TuicUpstream {
             active_before,
             path_service,
             path_service_tiebreak,
+            service_normalized_ordering,
             qualification,
             qualification_anchor,
             black_holes_current,
@@ -7217,6 +7336,7 @@ impl ProxyUpstream for TuicUpstream {
             active_before,
             path_service,
             path_service_tiebreak,
+            service_normalized_ordering,
             qualification,
             qualification_anchor,
             black_holes_current,
@@ -7260,6 +7380,7 @@ impl ProxyUpstream for TuicUpstream {
                         active_before,
                         path_service,
                         path_service_tiebreak,
+                        service_normalized_ordering,
                         qualification,
                         qualification_anchor,
                         black_holes_current,
@@ -7373,6 +7494,7 @@ impl ProxyUpstream for TuicUpstream {
             active_before,
             path_service,
             path_service_tiebreak,
+            service_normalized_ordering,
             qualification,
             qualification_anchor,
             black_holes_current,
@@ -7410,6 +7532,7 @@ impl ProxyUpstream for TuicUpstream {
                         active_before,
                         path_service,
                         path_service_tiebreak,
+                        service_normalized_ordering,
                         qualification,
                         qualification_anchor,
                         black_holes_current,
@@ -9831,7 +9954,8 @@ mod tests {
             stable_id: 42,
             active_before: 62,
             path_service: TcpPoolPathService::known(23_842, Duration::from_millis(163)),
-            path_service_tiebreak: true,
+            path_service_tiebreak: false,
+            service_normalized_ordering: true,
             qualification: TcpPoolForwardQualification::Qualified,
             qualification_anchor: Some(0),
             black_holes_current: Some(0),
@@ -9858,14 +9982,15 @@ mod tests {
         assert!(line.contains("conn=1 id=42"), "{line}");
         assert!(
             line.contains(
-                "policy=busy_epoch_forward_qualification_then_least_active_then_path_service"
+                "policy=busy_epoch_forward_qualification_then_service_normalized_load_then_least_active_then_path_service"
             ),
             "{line}"
         );
         assert!(line.contains("active_before=62"), "{line}");
         assert!(line.contains("path_cwnd=23842"), "{line}");
         assert!(line.contains("path_rtt_us=163000"), "{line}");
-        assert!(line.contains("path_service_tiebreak=true"), "{line}");
+        assert!(line.contains("service_normalized_ordering=true"), "{line}");
+        assert!(line.contains("path_service_tiebreak=false"), "{line}");
         assert!(line.contains("qualification=qualified"), "{line}");
         assert!(line.contains("black_hole_anchor=0"), "{line}");
         assert!(line.contains("black_holes_current=0"), "{line}");
@@ -11110,6 +11235,7 @@ mod tests {
             (0, 6)
         );
         assert!(service_selected.path_service_tiebreak);
+        assert!(!service_selected.service_normalized_ordering);
         assert!(service_selected.all_degraded_fallback);
         drop(service_selected);
 
@@ -11119,6 +11245,7 @@ mod tests {
         let stable = admission.try_reserve(&equal_service).unwrap();
         assert_eq!((stable.index, stable.active_before), (0, 6));
         assert!(!stable.path_service_tiebreak);
+        assert!(!stable.service_normalized_ordering);
         assert!(stable.all_degraded_fallback);
     }
 
@@ -11193,7 +11320,8 @@ mod tests {
             .expect("an equal-load busy pool must use current path service");
 
         assert_eq!((selected.index, selected.active_before), (1, 62));
-        assert!(selected.path_service_tiebreak);
+        assert!(selected.service_normalized_ordering);
+        assert!(!selected.path_service_tiebreak);
     }
 
     #[test]
@@ -11208,6 +11336,50 @@ mod tests {
         let max_fast = TcpPoolPathService::known(u64::MAX, Duration::from_micros(1));
         let max_slow = TcpPoolPathService::known(u64::MAX, Duration::from_micros(2));
         assert!(max_fast.has_greater_service_than(max_slow));
+        let maximum_normalized_load = TcpPoolPathService::Known {
+            cwnd: 1,
+            rtt_micros: u64::MAX,
+        };
+        let smaller_normalized_load = TcpPoolPathService::Known {
+            cwnd: u64::MAX,
+            rtt_micros: u64::MAX,
+        };
+        assert_eq!(
+            maximum_normalized_load.normalized_load_cmp(
+                u64::MAX,
+                smaller_normalized_load,
+                u64::MAX,
+            ),
+            Some(std::cmp::Ordering::Greater),
+            "three-factor comparison must remain exact above u128 cross-product capacity"
+        );
+        assert_eq!(
+            TcpPoolPathService::Known {
+                cwnd: 10,
+                rtt_micros: 100,
+            }
+            .normalized_load_cmp(
+                1,
+                TcpPoolPathService::Known {
+                    cwnd: 20,
+                    rtt_micros: 100,
+                },
+                2,
+            ),
+            Some(std::cmp::Ordering::Equal)
+        );
+        assert_eq!(
+            TcpPoolPathService::Unknown.normalized_load_cmp(1, max_fast, 1),
+            None
+        );
+        assert_eq!(
+            TcpPoolPathService::Known {
+                cwnd: 0,
+                rtt_micros: 1,
+            }
+            .normalized_load_cmp(1, max_fast, 1),
+            None
+        );
         assert_eq!(
             TcpPoolPathService::known(0, Duration::from_millis(1)),
             TcpPoolPathService::Unknown
@@ -11216,6 +11388,28 @@ mod tests {
             TcpPoolPathService::known(1, Duration::ZERO),
             TcpPoolPathService::Unknown
         );
+    }
+
+    #[test]
+    fn tcp_pool_positive_rational_comparison_matches_small_cross_products() {
+        for left_numerator in 1..=16 {
+            for left_denominator in 1..=16 {
+                for right_numerator in 1..=16 {
+                    for right_denominator in 1..=16 {
+                        assert_eq!(
+                            compare_positive_rationals(
+                                left_numerator,
+                                left_denominator,
+                                right_numerator,
+                                right_denominator,
+                            ),
+                            (left_numerator * right_denominator)
+                                .cmp(&(right_numerator * left_denominator)),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -11238,23 +11432,56 @@ mod tests {
         assert_eq!((data.index, data.active_before), (1, 0));
         assert!(!control.path_service_tiebreak);
         assert!(!data.path_service_tiebreak);
+        assert!(!control.service_normalized_ordering);
+        assert!(!data.service_normalized_ordering);
     }
 
     #[test]
-    fn tcp_pool_unequal_load_precedes_path_service() {
+    fn tcp_pool_service_normalized_admission_keeps_data_on_served_path_after_control() {
         let selector = TcpPoolAdmission::new(2);
-        selector.set_active_for_test(0, 3);
-        selector.set_active_for_test(1, 4);
-        let path_service = [
-            TcpPoolPathService::known(1, Duration::from_secs(1)),
-            TcpPoolPathService::known(1_000_000, Duration::from_millis(1)),
+        selector.set_active_for_test(0, 2);
+        selector.set_active_for_test(1, 2);
+        let control_observations = [
+            TcpPoolPathService::known(12_000, Duration::from_micros(164_215)),
+            TcpPoolPathService::known(871_763, Duration::from_micros(163_889)),
+        ];
+
+        let control = selector
+            .try_reserve(&tcp_pool_observations(&control_observations))
+            .expect("equal-load control must select the currently served path");
+        assert_eq!((control.index, control.active_before), (1, 2));
+        assert!(control.service_normalized_ordering);
+        assert!(!control.path_service_tiebreak);
+        drop(control.preparation);
+
+        let data_observations = [
+            TcpPoolPathService::known(12_000, Duration::from_micros(164_215)),
+            TcpPoolPathService::known(871_763, Duration::from_micros(163_853)),
+        ];
+        let data = selector
+            .try_reserve(&tcp_pool_observations(&data_observations))
+            .expect("data must compare ownership against current path service");
+
+        assert_eq!((data.index, data.active_before), (1, 3));
+        assert!(data.service_normalized_ordering);
+    }
+
+    #[test]
+    fn tcp_pool_equal_normalized_load_falls_back_to_lower_raw_ownership() {
+        let selector = TcpPoolAdmission::new(2);
+        selector.set_active_for_test(0, 2);
+        selector.set_active_for_test(1, 1);
+        let equal_normalized_load = [
+            TcpPoolPathService::known(20, Duration::from_micros(100)),
+            TcpPoolPathService::known(10, Duration::from_micros(100)),
         ];
 
         let selected = selector
-            .try_reserve(&tcp_pool_observations(&path_service))
-            .expect("lease load remains the first ordering key");
+            .try_reserve(&tcp_pool_observations(&equal_normalized_load))
+            .expect("an exact normalized tie must preserve deterministic fallback");
 
-        assert_eq!((selected.index, selected.active_before), (0, 3));
+        assert_eq!((selected.index, selected.active_before), (1, 1));
+        assert!(selected.service_normalized_ordering);
         assert!(!selected.path_service_tiebreak);
     }
 
@@ -11274,6 +11501,7 @@ mod tests {
 
         assert_eq!((selected.index, selected.active_before), (1, 4));
         assert!(selected.path_service_tiebreak);
+        assert!(!selected.service_normalized_ordering);
     }
 
     #[test]
@@ -11291,6 +11519,7 @@ mod tests {
             .expect("equal path service must keep stable index ordering");
         assert_eq!((equal.index, equal.active_before), (0, 8));
         assert!(!equal.path_service_tiebreak);
+        assert!(equal.service_normalized_ordering);
         drop(equal);
 
         let unknown = selector
@@ -11298,6 +11527,7 @@ mod tests {
             .expect("missing samples must keep stable index ordering");
         assert_eq!((unknown.index, unknown.active_before), (0, 8));
         assert!(!unknown.path_service_tiebreak);
+        assert!(!unknown.service_normalized_ordering);
     }
 
     #[test]
