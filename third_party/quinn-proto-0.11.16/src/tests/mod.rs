@@ -321,6 +321,33 @@ fn successor_service_turn_delivers_one_exact_acked_flight() {
 }
 
 #[test]
+fn successor_service_turn_grows_cwnd_across_a_realistic_rtt() {
+    let mut pair = Pair::default_with_deterministic_pns();
+    pair.latency = Duration::from_millis(82);
+    let (client_ch, _) = pair.connect();
+    pair.drive();
+    let initial_cwnd = pair.client_conn_mut(client_ch).stats().path.cwnd;
+
+    pair.client_conn_mut(client_ch)
+        .start_successor_service_turn()
+        .unwrap();
+    pair.drive();
+
+    let stats = match pair.client_conn_mut(client_ch).poll() {
+        Some(Event::SuccessorServiceTurn {
+            outcome: SuccessorServiceTurnOutcome::Succeeded(stats),
+        }) => stats,
+        outcome => panic!("unexpected service-turn outcome: {outcome:?}"),
+    };
+    let final_cwnd = pair.client_conn_mut(client_ch).stats().path.cwnd;
+    assert!(
+        final_cwnd >= initial_cwnd + stats.acked_bytes,
+        "every acknowledged full-window service byte must retain its send-time non-application-limited slow-start authority: initial={initial_cwnd} acked={} final={final_cwnd}",
+        stats.acked_bytes
+    );
+}
+
+#[test]
 fn successor_service_turn_is_terminal_when_one_tagged_packet_is_lost() {
     let mut pair = Pair::default_with_deterministic_pns();
     let (client_ch, _) = pair.connect();

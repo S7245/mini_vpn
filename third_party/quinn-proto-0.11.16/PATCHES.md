@@ -24,13 +24,16 @@ mini_vpn changes are intentionally limited to:
   and buffered bytes beyond a missing prefix, without recovery policy;
 - `src/connection/mod.rs`: pre-build reservation, traffic classification,
   per-datagram settlement, migration/cancel/detach, socket-batch attribution,
-  pacing diagnostics, and a read-only authenticated-packet count used by the
-  Quinn live-rebind lifecycle;
+  pacing diagnostics, a read-only authenticated-packet count used by the
+  Quinn live-rebind lifecycle, connection-local path-state reset, and one
+  tagged successor service turn whose ACKs retain their exact send-time
+  non-application-limited ownership;
 - `src/endpoint.rs`: create one fresh service per endpoint, attach stable
   connection/path keys, and pre-account stateless responses;
 - `src/tests/mod.rs` and `src/tests/util.rs`: endpoint isolation, default-off,
-  real GSO accounting, and socket-outcome behavior tests.
+  real GSO accounting, socket-outcome behavior, successor-turn ACK/loss, and
+  realistic-RTT congestion-window ownership tests.
 
-No quinn-udp, congestion-control, MTU-discovery, crypto, loss timer, or stream
-flow-control implementation is replaced. The modified suite passes `311/311`
-unit tests and `3/3` doc tests.
+No quinn-udp, congestion-controller algorithm, MTU-discovery, crypto, loss
+timer, or stream flow-control implementation is replaced. The modified suite
+passes `316/316` unit tests and `3/3` doc tests.
