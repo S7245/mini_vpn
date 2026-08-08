@@ -4,7 +4,31 @@
 
 ## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-08)
 
-- **Latest accepted position:** exact-source `a7cd603` qualification artifact
+- **Latest accepted position:** code review of the `1d08565` descendant found
+  that a TUIC Authenticate packet could already be in Quinn's Data-space sent
+  map before the successor service turn started. It was then outside the
+  turn's exact ACK/loss ownership. The same review found that an adopted
+  PLPMTUD probe used a special loss branch that left the turn nonterminal.
+- Reviewed `6aefd19` adopts every existing ACK-eliciting,
+  congestion-accounted Data packet at turn start. Delivered authentication
+  succeeds only after exact ACK ownership; withheld authentication and owned
+  PLPMTUD loss both fail `PacketLost`. MTUD/congestion policy, turn target,
+  deadline, payload, retry, Endpoint, admission, and every frozen value remain
+  unchanged.
+- Root `689+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  established Clippy, shell, vendored Quinn `40+3 ignored` plus doc `1`,
+  quinn-proto `320` plus docs `3`, root docs, fmt/diff/vendor/secret, and
+  review pass with no unresolved P0/P1. Exact 32 MiB Endpoint capacity was
+  `240.300 Mbit/s`, final `61,440/0/0B`, zero socket would-block. Result:
+  `docs/tech/2026-08-08-knife15-m2-successor-authentication-flight-ownership-local-results.md`.
+- The accepted Mac evidence remains exact-source `a7cd603`; no new Mac result
+  is claimed. Pull/rebuild the pushed reviewed descendant. When the Mac is
+  ready, start a fresh bounded `.33` observer and take exactly one
+  `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke ->
+  m2-qualification -> status -> stop`. Preserve failure evidence; do not run
+  formal M2 or repeat/tune unchanged. Formal M2 and M3 remain blocked.
+
+- **Previous accepted position:** exact-source `a7cd603` qualification artifact
   `/tmp/mini_vpn_knife15_macos_20260808_065723.tar.gz` (SHA-256
   `6fae3611...`) passed baseline `28.490/52.003 Mbit/s`, direct at
   `13.970 Mbit/s` without gaps, smoke, every preflight, cycle-1 long

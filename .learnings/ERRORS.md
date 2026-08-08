@@ -1,5 +1,27 @@
 # Errors
 
+## 2026-08-08 - Successor readiness omitted pre-start authentication and special MTU loss
+
+- Review after the Endpoint ownership repair traced the actual call order:
+  TUIC Authenticate can already be a Quinn Data-space sent packet before
+  `start_successor_service_turn`. The deterministic RED observed a nonempty
+  withheld authentication flight but `start.sent_bytes == 0`.
+- Later tagged carriers could therefore satisfy their own ACK accounting while
+  the protocol prerequisite remained outside the turn. Correct behavior is to
+  adopt existing ACK-eliciting, congestion-accounted Data packets before any
+  later ACK/loss is handled.
+- A second RED reactivated test-only PLPMTUD, adopted its exact in-flight
+  probe, withheld it, and observed no terminal event. Quinn's special probe
+  loss cleanup intentionally bypassed congestion loss but accidentally also
+  bypassed the service-turn owner.
+- The repair does not change authentication payload, MTU discovery,
+  congestion control, the five-second deadline, or any frozen value. Real
+  Pair success/loss/probe-loss tests and all local gates pass; exact Endpoint
+  capacity is `240.300 Mbit/s` with final `61,440/0/0B` and zero socket
+  would-block.
+- Result:
+  `docs/tech/2026-08-08-knife15-m2-successor-authentication-flight-ownership-local-results.md`.
+
 ## 2026-08-08 - Endpoint waits hid ordinary congestion ownership and local gates had three provenance traps
 
 - Exact-source `a7cd603` passed baseline/direct, smoke, long forward/reverse

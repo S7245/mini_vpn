@@ -189,7 +189,30 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-08:
 
-- Exact-source `a7cd603` qualification artifact
+- Review before the next Mac run found that TUIC Authenticate could already
+  be an in-flight Quinn Data packet when the successor service turn started,
+  leaving a protocol prerequisite outside its exact ACK/loss ownership. An
+  adopted PLPMTUD probe also used a special loss branch that left the turn
+  nonterminal.
+- Reviewed `6aefd19` adopts every existing ACK-eliciting,
+  congestion-accounted Data packet at turn start. Delivered authentication
+  succeeds only after exact ACK ownership; withheld authentication and owned
+  PLPMTUD loss both fail `PacketLost`. Turn size/deadline, MTUD/congestion
+  policy, payload, retry, Endpoint, admission, and frozen values are unchanged.
+- Root `689+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  established Clippy, shell, vendored Quinn `40+3 ignored` plus doc `1`,
+  quinn-proto `320` plus docs `3`, root docs, fmt/diff/vendor/secret, and
+  review pass with no unresolved P0/P1. Exact 32 MiB Endpoint capacity was
+  `240.300 Mbit/s`, final `61,440/0/0B`, zero socket would-block. Result:
+  `docs/tech/2026-08-08-knife15-m2-successor-authentication-flight-ownership-local-results.md`.
+- The accepted Mac artifact remains exact-source `a7cd603`; no new Mac result
+  is claimed. Pull/rebuild the pushed reviewed descendant. When the Mac is
+  ready start one fresh bounded `.33` observer and take exactly one
+  `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke ->
+  m2-qualification -> status -> stop`. Do not run formal M2 or repeat/tune
+  unchanged. Formal M2 and M3 remain blocked.
+
+- Previous accepted position: exact-source `a7cd603` qualification artifact
   `/tmp/mini_vpn_knife15_macos_20260808_065723.tar.gz` (SHA-256
   `6fae3611...`) passed baseline `28.490/52.003 Mbit/s`, direct at
   `13.970 Mbit/s` without gaps, smoke, every preflight, cycle-1 long

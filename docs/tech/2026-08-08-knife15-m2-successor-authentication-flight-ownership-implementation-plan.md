@@ -40,8 +40,8 @@ Architecture:
 - [x] Review authentication ordering, path generation, ordinary/PLPMTUD loss,
   cancellation, boundedness, Endpoint conservation, and TCP/UDP/TUN/D16 risk.
 - [x] Resolve every P0/P1.
-- [ ] Update Quinn patch manifest, result docs, and project learning memory.
-- [ ] Commit coherent implementation/evidence changes and push the branch.
+- [x] Update Quinn patch manifest, result docs, and project learning memory.
+- [x] Commit coherent implementation/evidence changes and push the branch.
 
 ## Task 6: One Paired Mac Qualification
 

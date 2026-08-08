@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-08-08 - Readiness must own prerequisites already in flight
+
+- A readiness operation that starts after protocol setup cannot count only
+  packets created after its start. If setup bytes are still in the transport's
+  sent map, readiness must adopt their exact ACK/loss ownership or it can
+  certify service past a missing prerequisite.
+- Queued, in-flight, and ACKed are distinct boundaries. Queued authentication
+  naturally shares a later tagged carrier; in-flight authentication must be
+  adopted; already ACKed authentication needs no additional ownership.
+- Special transport loss paths still owe terminal notification to the
+  operation that owns the packet. PLPMTUD probes correctly avoid congestion
+  loss, but that exemption must not strand an exact service-turn counter until
+  an unrelated outer timeout.
+- Test both directions of the ownership contract: withhold the preexisting
+  packet and require fail-closed, then deliver it and require exact peer bytes
+  plus `sent == acked`. A counter-only unit test would miss stream reachability.
+- QUIC ACK proves peer transport delivery, not server application acceptance.
+  Keep that boundary explicit rather than inventing an application response
+  or overstating the repair.
+- Result:
+  `docs/tech/2026-08-08-knife15-m2-successor-authentication-flight-ownership-local-results.md`.
+
 ## 2026-08-08 - A sub-application scheduler cannot publish application idle
 
 - A continuously Pending application can still produce an empty transport

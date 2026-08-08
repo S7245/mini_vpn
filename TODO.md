@@ -4,7 +4,38 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-08 — Endpoint-blocked application ownership ready for qualification)
+#### Latest decision (2026-08-08 — successor authentication-flight ownership ready for qualification)
+
+Code review before the next Mac run found a prerequisite-ownership gap in the
+successor readiness gate. TUIC Authenticate can already be an in-flight Quinn
+Data packet when the service turn starts; the old turn began at
+`sent_bytes=0` and counted only later carriers. An adopted PLPMTUD probe also
+used a special loss path that did not terminate the turn.
+
+Reviewed `6aefd19` adopts every existing ACK-eliciting,
+congestion-accounted Data packet into the same current-cwnd turn. Exact Pair
+replay now proves delivered authentication succeeds only after all owned ACKs,
+withheld authentication fails `PacketLost`, and owned PLPMTUD loss terminates
+without waiting for the outer deadline. No MTU/congestion policy, turn size,
+deadline, payload, retry, Endpoint, admission, or frozen value changed.
+
+All gates pass with no unresolved P0/P1; root is `689+3 ignored`, vendored
+Quinn/proto are `40+3 ignored`/`320`, and the exact Endpoint gate reached
+`240.300 Mbit/s` with final `61,440/0/0B`. Result:
+`docs/tech/2026-08-08-knife15-m2-successor-authentication-flight-ownership-local-results.md`.
+
+Next:
+
+1. pull/rebuild the pushed reviewed descendant on the Mac;
+2. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
+3. tell the agent when the Mac is ready so a fresh bounded `.33` observer can
+   be started;
+4. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
+   start -> smoke -> m2-qualification -> status -> stop`;
+5. preserve `status/snapshot/stop` after failure and upload the bundle;
+6. do not run formal M2 or repeat/tune unchanged; keep M2/M3 blocked.
+
+#### Previous decision (2026-08-08 — Endpoint-blocked application ownership ready for qualification)
 
 Exact-source `a7cd603` artifact
 `/tmp/mini_vpn_knife15_macos_20260808_065723.tar.gz` (SHA-256
