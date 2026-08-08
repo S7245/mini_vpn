@@ -4,7 +4,45 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-08 — service-turn ACK ownership ready for qualification)
+#### Latest decision (2026-08-08 — Endpoint-blocked application ownership ready for qualification)
+
+Exact-source `a7cd603` artifact
+`/tmp/mini_vpn_knife15_macos_20260808_065723.tar.gz` (SHA-256
+`6fae3611...`) passed baseline `28.490/52.003 Mbit/s`, direct at
+`13.970 Mbit/s` without gaps, smoke, every preflight, the cycle-1 long
+forward/reverse TCP and reverse UDP phases, and cleanup. Its short forward
+then lost one complete Target receiver interval. Formal M2 was not run.
+
+The prior tagged-turn fix was present: conn1 generation 2 passed
+`12,000/12,800/12,800/0B` and installed at `24,800B` cwnd. Its business
+writer stayed Pending and ACK-progressing, but the first 128KiB took about
+`1.21s` to reach the Exit. Paired capture SHA-256 `ffb39a48...` had
+`2,075,057` packets, zero kernel drops, and about `1ms` Target ACK RTT. This
+selects client-to-Exit ordinary cwnd growth, not operator, Target,
+Exit-to-Target, D16, TUN, Endpoint capacity, cleanup, or a frozen value.
+
+Reviewed `1d08565` prevents only an Endpoint `Bulk` reservation wait from
+publishing `app_limited=true` on an empty Quinn poll. Control waits, real idle,
+Quinn pacing/congestion, partial batches, Cubic, tagged turns, loss/path/close,
+and all frozen behavior remain unchanged. The real-pair RED was
+`12,000 -> 12,000B` across 120 waits and is GREEN at one full growth round.
+All gates pass with no unresolved P0/P1; root is `689+3 ignored`, vendored
+Quinn/proto are `40+3 ignored`/`317`, and the exact Endpoint gate reached
+`239.487 Mbit/s` with final `61,440/0/0B`. Result:
+`docs/tech/2026-08-08-knife15-m2-endpoint-blocked-app-limited-local-results.md`.
+
+Next:
+
+1. pull/rebuild the pushed descendant on the Mac;
+2. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
+3. tell the agent when the Mac is ready so a fresh bounded `.33` observer can
+   be started;
+4. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
+   start -> smoke -> m2-qualification -> status -> stop`;
+5. preserve `status/snapshot/stop` after failure and upload the bundle;
+6. do not run formal M2 or repeat/tune unchanged; keep M2/M3 blocked.
+
+#### Previous decision (2026-08-08 — service-turn ACK ownership ready for qualification)
 
 Exact-source `f693d0d` artifact
 `/tmp/mini_vpn_knife15_macos_20260808_054225.tar.gz` (SHA-256

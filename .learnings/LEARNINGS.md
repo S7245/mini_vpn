@@ -1,5 +1,29 @@
 # Learnings
 
+## 2026-08-08 - A sub-application scheduler cannot publish application idle
+
+- A continuously Pending application can still produce an empty transport
+  poll when a lower Endpoint byte scheduler denies the next reservation. That
+  lower-layer wait is transport backpressure, not evidence that the
+  application stopped supplying bytes.
+- Readiness probes and business traffic need separate ownership proofs. The
+  tagged successor flight correctly installed `24,800B` cwnd, yet ordinary
+  packets still consulted the global app-limited snapshot and lost later
+  growth. Passing a maintenance probe was necessary but not sufficient.
+- Pair writer Pending/ACK progress with exact Exit supply timing. Here Target
+  ACKed Exit supply at about `1ms`, while the first 128KiB reached the Exit
+  socket only after about `1.21s`; that selects client-side window growth
+  without reopening operator, TUN, D16, Endpoint capacity, or Target branches.
+- Preserve classification boundaries explicitly. Endpoint Bulk waits retain
+  non-idle ownership; Control-only waits, genuine idle, default-off, Quinn
+  pacing/congestion, and partial batches keep their existing meanings.
+- A realistic-RTT real-pair RED is stronger than byte accounting alone:
+  pre-fix `12,000 -> 12,000B` with 120 waits, post-fix at least one full cwnd
+  growth round, while the exact 32MiB service still reached
+  `239.487 Mbit/s` and conserved `61,440/0/0B`.
+- Result:
+  `docs/tech/2026-08-08-knife15-m2-endpoint-blocked-app-limited-local-results.md`.
+
 ## 2026-08-08 - Send-time packet ownership must survive later global snapshots
 
 - A transport operation can deliberately fill the congestion window and still

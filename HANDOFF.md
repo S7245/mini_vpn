@@ -4,7 +4,40 @@
 
 ## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-08)
 
-- **Latest accepted position:** exact-source `f693d0d` qualification artifact
+- **Latest accepted position:** exact-source `a7cd603` qualification artifact
+  `/tmp/mini_vpn_knife15_macos_20260808_065723.tar.gz` (SHA-256
+  `6fae3611...`) passed baseline `28.490/52.003 Mbit/s`, direct at
+  `13.970 Mbit/s` without gaps, smoke, every preflight, cycle-1 long
+  forward/reverse TCP, reverse UDP, and cleanup. The short forward then lost
+  one complete Target receiver interval; formal M2 was not run.
+- The prior service-turn ACK repair was present. Conn1 generation 2 passed at
+  target/sent/acked/lost `12,000/12,800/12,800/0B` and installed with
+  `24,800B` cwnd. Its ordinary business writer remained Pending and
+  ACK-progressing, yet the first 128KiB took about `1.21s` to reach the Exit.
+- Paired Exit artifact
+  `/tmp/mini_vpn_knife15_exit_target_observer_20260808_063213.tar.gz`
+  (SHA-256 `ffb39a48...`) captured `2,075,057` packets with zero kernel drops.
+  Target ACKed supplied bytes at about `1ms`; client-to-Exit ordinary cwnd
+  growth was the limiting seam. The observer is stopped and bundled.
+- Reviewed `1d08565` treats only an Endpoint Bulk reservation wait as
+  transport backpressure rather than application idle. Control waits, true
+  idle, partial batches, Quinn pacing/congestion, Cubic, successor tags,
+  loss/path/close, Endpoint accounting, and every frozen value remain
+  unchanged. The realistic pair was RED at `12,000 -> 12,000B` across 120
+  waits and is GREEN at one full cwnd growth round.
+- Root `689+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  established Clippy, shell, vendored Quinn `40+3 ignored` plus doc `1`,
+  quinn-proto `317` plus docs `3`, root docs, fmt/diff/vendor/secret, and
+  review pass with no unresolved P0/P1. Exact 32 MiB Endpoint capacity was
+  `239.487 Mbit/s`, final `61,440/0/0B`, zero socket would-block. Result:
+  `docs/tech/2026-08-08-knife15-m2-endpoint-blocked-app-limited-local-results.md`.
+- Pull and rebuild the pushed reviewed descendant. When the Mac operator is
+  ready, start a fresh bounded `.33` observer and take exactly one
+  `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke ->
+  m2-qualification -> status -> stop`. Preserve evidence after failure; do
+  not run formal M2 or repeat/tune unchanged. Formal M2 and M3 remain blocked.
+
+- **Previous accepted position:** exact-source `f693d0d` qualification artifact
   `/tmp/mini_vpn_knife15_macos_20260808_054225.tar.gz` (SHA-256
   `0e6d8ee6...`) passed baseline `21.003/42.391 Mbit/s`, direct at
   `10.497 Mbit/s` without gaps, smoke, every preflight, the long forward,

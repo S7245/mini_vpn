@@ -38,8 +38,8 @@ Architecture:
 - [x] Review correctness, ordinary idle behavior, congestion/Endpoint
   ownership, lifecycle, boundedness, and TCP/UDP/TUN/D16 regression risk.
 - [x] Resolve every P0/P1.
-- [ ] Record results in docs and project learning memory.
-- [ ] Commit coherent implementation and evidence tasks and push the branch.
+- [x] Record results in docs and project learning memory.
+- [x] Commit coherent implementation and evidence tasks and push the branch.
 
 ## Task 6: One Paired Mac Qualification
 

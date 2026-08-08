@@ -1,5 +1,28 @@
 # Errors
 
+## 2026-08-08 - Endpoint waits hid ordinary congestion ownership and local gates had three provenance traps
+
+- Exact-source `a7cd603` passed baseline/direct, smoke, long forward/reverse
+  TCP, reverse UDP, and cleanup, then its short forward lost one complete
+  Target receiver interval. The predecessor repair was visible and correct:
+  service-turn `12,800/12,800/0B` installed at `24,800B` cwnd.
+- The ordinary business writer remained Pending and ACK-progressing, but an
+  Endpoint Bulk reservation denial produced an empty poll that set the global
+  `app_limited=true`. The real-pair RED stayed at `12,000B` cwnd across 120
+  Endpoint waits. Correct behavior is to preserve non-idle ownership for only
+  that Bulk wait, not enlarge/repeat the service turn or tune a frozen value.
+- The first root full-suite gate failed an unrelated short sleep assertion
+  after the 1ms park segment was descheduled to `7.0875ms`. Twenty serial
+  reruns and the complete suite passed. Do not modify VPN code or acceptance
+  parameters for this known short-window observer jitter.
+- Three commands were rejected as non-gates: standalone Quinn selected
+  registry proto without the absolute local patch; concurrency omitted
+  `--features harness` and ran zero tests; one capacity invocation added
+  `--ignored` and ran zero tests. All were rerun with exact dependency and
+  test provenance, and the generated ignored Quinn lockfile was removed.
+- Result:
+  `docs/tech/2026-08-08-knife15-m2-endpoint-blocked-app-limited-local-results.md`.
+
 ## 2026-08-08 - Exact service-turn settlement hid lost congestion ownership
 
 - Exact-source `f693d0d` passed direct, smoke, every preflight, long forward,
