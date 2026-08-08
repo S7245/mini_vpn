@@ -54,7 +54,7 @@ Architecture:
 ## Task 7 — Commit, push, and paired qualification
 
 - [x] Commit coherent implementation and evidence changes (`f9c3c23`).
-- [ ] Push the reviewed descendant.
+- [x] Push the reviewed descendant (`2dec9ec`).
 - [ ] Start a fresh bounded `.33` observer only when the Mac is ready.
 - [ ] Take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
   start -> smoke -> m2-qualification -> status -> stop`.
