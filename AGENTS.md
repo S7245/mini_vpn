@@ -189,6 +189,36 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-07:
 
+- Exact-source `b04cb65` qualification artifact
+  `/tmp/mini_vpn_knife15_macos_20260808_030357.tar.gz` (SHA-256
+  `e5c866f6...`) passed baseline `27.973/63.814 Mbit/s`, direct at
+  `13.970 Mbit/s` without gaps, smoke, every preflight, exact forward, and
+  cleanup. Cycle 1 reverse never connected and hit the unchanged 330-second
+  child timeout; formal M2 was not run.
+- Conn1 predecessor black holes advanced `0 -> 5`. Its successor service turn
+  correctly failed closed at target/sent/acked/lost
+  `12,000/13,058/10,326/1,366B`, but the maintenance error propagated to the
+  triggering business open as `handshake_failed -> rearm`. A later independent
+  open passed at `12,800/12,800/0B` and installed generation 2. Paired Exit
+  capture SHA-256 `21b08483...` had `547,358` packets, zero kernel drops, and
+  no new Target socket after forward completion. The observer is stopped.
+- Reviewed `68c7271` preserves the failed successor/predecessor contract,
+  excludes the failed slot for that open, and admits only another qualified
+  current generation. No same-open second replacement is possible; no safe
+  fallback preserves both exact errors; later independent opens retain fresh
+  authority. All frozen behavior remains unchanged.
+- Root `689+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  established Clippy, shell, vendored Quinn `40+3 ignored` plus doc `1`,
+  quinn-proto `315` plus docs `3`, root docs, fmt/diff/vendor/secret, and
+  review pass with no unresolved P0/P1. Exact 32 MiB Endpoint capacity was
+  `240.470 Mbit/s`, final `61,440/0/0B`, zero socket would-block. Result:
+  `docs/tech/2026-08-07-knife15-m2-replacement-failure-business-fallback-local-results.md`.
+- The prior observer is stopped and bundled. Pull/rebuild the pushed reviewed
+  descendant; when the Mac is ready start a fresh bounded `.33` observer and
+  take exactly one `m2-ipv6-check -> baseline -> direct-discriminator -> start
+  -> smoke -> m2-qualification -> status -> stop`. Do not run formal M2 or
+  repeat/tune unchanged. Formal M2 and M3 remain blocked.
+
 - Exact-source `7131de4` qualification artifact
   `/tmp/mini_vpn_knife15_macos_20260807_091815.tar.gz` (SHA-256
   `7c749fb9...`) passed baseline `35.336/61.978 Mbit/s`, direct at

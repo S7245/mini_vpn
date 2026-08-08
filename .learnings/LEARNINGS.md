@@ -1,5 +1,23 @@
 # Learnings
 
+## 2026-08-07 - Maintenance failure must not automatically own business failure
+
+- A terminal successor service-turn loss correctly rejects installation, but
+  propagating that maintenance error directly to the triggering Target open
+  couples availability to maintenance. Preserve the predecessor and let the
+  business open use another already-qualified current generation.
+- The fallback must be attempt-local and qualified-only. A failed-slot mask by
+  itself is insufficient when pool length exceeds two because the same open
+  could replace a second degraded auxiliary. Three-slot replay is the smallest
+  proof of the no-same-open-replacement invariant.
+- Later independent work needs fresh authority. Do not turn one real loss into
+  a persistent blacklist; discard the attempt-local mask when the open returns.
+- Paired evidence separated the layers: no new Exit-to-Target socket after
+  forward completion plus a later successful service turn proves the failed
+  reverse never crossed business admission and does not select WAN tuning.
+- Result:
+  `docs/tech/2026-08-07-knife15-m2-replacement-failure-business-fallback-local-results.md`.
+
 ## 2026-08-07 - Authentication must not transfer service ownership by itself
 
 - QUIC/TUIC authentication proves peer identity and protocol reachability, not

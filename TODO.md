@@ -4,7 +4,44 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-07 — successor service turn ready for qualification)
+#### Latest decision (2026-08-07 — replacement failure business fallback ready for qualification)
+
+Exact-source `b04cb65` artifact
+`/tmp/mini_vpn_knife15_macos_20260808_030357.tar.gz` (SHA-256
+`e5c866f6...`) passed baseline `27.973/63.814 Mbit/s`, direct at
+`13.970 Mbit/s` without gaps, smoke, all preflights, exact forward, and
+cleanup. Its cycle-1 reverse never connected and hit the unchanged 330-second
+child timeout. Formal M2 was not run.
+
+The conn1 successor turn correctly failed closed at
+`12,000/13,058/10,326/1,366B`, but the replacement maintenance error was
+returned to the triggering business open as `handshake_failed -> rearm`. A
+later independent open passed a fresh turn and installed the successor. Paired
+Exit capture had `547,358` packets, zero kernel drops, and no new Target socket
+after forward completion. This selects maintenance/admission isolation, not a
+service-turn, network, Target, D16, Endpoint, or frozen-parameter change.
+
+Reviewed `68c7271` makes the failed slot attempt-local ineligible and permits
+the same business open to reserve only another already-qualified current
+generation. It cannot attempt replacement on a second degraded auxiliary; no
+safe fallback fails with both exact causes. Later independent opens retain
+fresh authority. All local gates pass with no unresolved P0/P1; root is
+`689+3 ignored`, vendored Quinn/proto are `40+3 ignored`/`315`, and the exact
+Endpoint gate reached `240.470 Mbit/s` with final `61,440/0/0B`. Result:
+`docs/tech/2026-08-07-knife15-m2-replacement-failure-business-fallback-local-results.md`.
+
+Next:
+
+1. pull/rebuild the pushed reviewed descendant on the Mac;
+2. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
+3. tell the agent when the Mac is ready so a fresh bounded `.33` observer can
+   be started;
+4. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
+   start -> smoke -> m2-qualification -> status -> stop`;
+5. preserve `status/snapshot/stop` after failure and upload the bundle;
+6. do not run formal M2 or repeat/tune unchanged; keep M2/M3 blocked.
+
+#### Previous decision (2026-08-07 — successor service turn ready for qualification)
 
 Exact-source `7131de4` artifact
 `/tmp/mini_vpn_knife15_macos_20260807_091815.tar.gz` (SHA-256

@@ -40,6 +40,21 @@ adds no timer or configured byte threshold, and is not a general bandwidth
 promise.
 _Avoid_: warm-up traffic (the proof is transport-native and carries no business payload), health check (it proves one exact delivered flight only), retry (loss is terminal), pool expansion (no additional eligible generation is retained)
 
+**TUIC TCP replacement-failure business fallback**:
+A bounded new-open admission rule used only after one auxiliary generation
+replacement fails before successor installation. The failed slot becomes
+ineligible for that business open, the predecessor remains current, and only
+another already-qualified current generation may receive the open through the
+existing preparation/activity/lease path. The same open cannot attempt a
+second replacement; no safe generation fails with both exact causes. A later
+independent open has fresh replacement authority. No TUIC Connect, Target
+socket, or business payload exists yet, so this is admission fallback rather
+than traffic retry.
+_Avoid_: retry (neither replacement nor payload is retried within the open),
+failover replay (no Target request has been sent), degraded fallback
+(post-failure admission is qualified-only), pool expansion (eligible ownership
+does not grow)
+
 **TUIC TCP new-stream startup service**:
 A bounded per-stream send-scheduling contract. A newly opened TUIC TCP stream queues its Connect header and first non-empty business payload above incumbent normal-priority stream data, then atomically returns to its original Quinn priority after exactly one business scheduling turn. Blocked or empty writes do not consume the contract. It changes neither connection admission nor congestion/flow control and has no timer, byte threshold, Target rule, or configuration knob.
 _Avoid_: stream boost (sounds tunable or permanent), fast lane (suggests separate capacity), failover (the selected QUIC connection does not change)

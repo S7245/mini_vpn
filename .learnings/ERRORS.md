@@ -1,5 +1,24 @@
 # Errors
 
+## 2026-08-07 - Replacement fallback and exact-filter gate traps
+
+- Exact-source `b04cb65` correctly failed a lossy successor service turn, but
+  the caller returned the maintenance error to the business open. The resulting
+  `handshake_failed -> rearm` left reverse iperf unconnected until its hard
+  timeout. Later successful replacement and paired no-Target-socket evidence
+  reject a sustained path outage.
+- The first explicit rerun twice combined `--exact` with an unqualified test
+  name and therefore ran zero tests. Full library coverage had passed, but the
+  zero-test commands were not accepted as focused gates. Use the complete
+  `module::test` name and require `running 1 test` plus the measurement.
+- A `cargo fmt -- --check` invocation correctly reported the newly extended
+  test needed formatting. Run `cargo fmt`, then rerun diff and the exact test;
+  formatting failure is not a product regression.
+- Review found that failed-slot exclusion alone allowed a same-open
+  replacement on a different degraded auxiliary in pools larger than two.
+  A deterministic three-slot RED selected qualified-only post-failure
+  admission before commit.
+
 ## 2026-08-07 - Successor readiness evidence and repeated local gate traps
 
 - Exact-source `7131de4` selected the better normalized busy candidate, but
