@@ -292,6 +292,8 @@ pub(super) struct SentPacket {
     pub(super) ack_eliciting: bool,
     /// Whether this packet carries bytes owned by the bounded successor service turn.
     pub(super) successor_service_turn: bool,
+    /// Whether this packet carries STREAM bytes for a transport-blocked application writer.
+    pub(super) transport_write_demand: bool,
     /// The largest packet number acknowledged by this packet
     pub(super) largest_acked: Option<u64>,
     /// Data which needs to be retransmitted in case the packet is lost.

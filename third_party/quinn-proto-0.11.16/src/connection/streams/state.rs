@@ -108,6 +108,9 @@ pub struct StreamsState {
     ///
     /// Streams are only added to this list when a write fails.
     pub(super) connection_blocked: Vec<StreamId>,
+    /// Number of live send streams whose application write reached transport backpressure and has
+    /// not yet made progress on its writable retry.
+    pub(super) transport_write_blocked: usize,
     /// Connection-level flow control budget dictated by the peer
     pub(super) max_data: u64,
     /// The initial receive window
@@ -168,6 +171,7 @@ impl StreamsState {
             pending: PendingStreamsQueue::new(),
             events: VecDeque::new(),
             connection_blocked: Vec::new(),
+            transport_write_blocked: 0,
             max_data: 0,
             receive_window: receive_window.into(),
             local_max_data: receive_window.into(),
@@ -245,6 +249,7 @@ impl StreamsState {
         self.send_streams = 0;
         self.data_sent = 0;
         self.connection_blocked.clear();
+        self.transport_write_blocked = 0;
     }
 
     /// Process incoming stream frame
@@ -371,6 +376,10 @@ impl StreamsState {
         };
 
         if stream.try_stop(error_code) {
+            if stream.transport_write_blocked {
+                stream.transport_write_blocked = false;
+                self.transport_write_blocked -= 1;
+            }
             self.events
                 .push_back(StreamEvent::Stopped { id, error_code });
             self.on_stream_frame(false, id);
@@ -398,6 +407,18 @@ impl StreamsState {
                 .and_then(|s| s.as_ref())
                 .is_some_and(|s| !s.is_reset())
         })
+    }
+
+    /// Whether a packet's STREAM frames belong to an application writer that is still waiting to
+    /// retry after proven transport backpressure.
+    pub(crate) fn owns_transport_write_demand(&self, frames: &StreamMetaVec) -> bool {
+        self.transport_write_blocked != 0
+            && frames.iter().any(|frame| {
+                self.send
+                    .get(&frame.id)
+                    .and_then(|stream| stream.as_ref())
+                    .is_some_and(|stream| stream.transport_write_blocked)
+            })
     }
 
     /// Whether MAX_STREAM_DATA frames could be sent for stream `id`

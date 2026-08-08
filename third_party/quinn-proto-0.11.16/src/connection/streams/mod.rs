@@ -344,11 +344,31 @@ impl<'a> SendStream<'a> {
                 stream.connection_blocked = true;
                 self.state.connection_blocked.push(self.id);
             }
+            if !stream.transport_write_blocked {
+                stream.transport_write_blocked = true;
+                self.state.transport_write_blocked += 1;
+            }
             return Err(WriteError::Blocked);
         }
 
         let was_pending = stream.is_pending();
-        let written = stream.write(source, limit)?;
+        let written = match stream.write(source, limit) {
+            Ok(written) => written,
+            Err(WriteError::Blocked) => {
+                if !stream.transport_write_blocked {
+                    stream.transport_write_blocked = true;
+                    self.state.transport_write_blocked += 1;
+                }
+                return Err(WriteError::Blocked);
+            }
+            Err(error) => {
+                if stream.transport_write_blocked {
+                    stream.transport_write_blocked = false;
+                    self.state.transport_write_blocked -= 1;
+                }
+                return Err(error);
+            }
+        };
         self.state.data_sent += written.bytes as u64;
         self.state.unacked_data += written.bytes as u64;
         trace!(stream = %self.id, "wrote {} bytes", written.bytes);
@@ -356,6 +376,10 @@ impl<'a> SendStream<'a> {
             self.state.pending.push_pending(self.id, stream.priority);
         }
         if written.bytes > 0 {
+            if stream.transport_write_blocked {
+                stream.transport_write_blocked = false;
+                self.state.transport_write_blocked -= 1;
+            }
             if let Some(priority_after) = priority_after {
                 stream.priority = priority_after;
             }
@@ -388,6 +412,10 @@ impl<'a> SendStream<'a> {
 
         let was_pending = stream.is_pending();
         stream.finish()?;
+        if stream.transport_write_blocked {
+            stream.transport_write_blocked = false;
+            self.state.transport_write_blocked -= 1;
+        }
         if !was_pending {
             self.state.pending.push_pending(self.id, stream.priority);
         }
@@ -418,6 +446,10 @@ impl<'a> SendStream<'a> {
         // credit based on the final offset communicated in the RESET_STREAM frame we send.
         self.state.unacked_data -= stream.pending.unacked();
         stream.reset();
+        if stream.transport_write_blocked {
+            stream.transport_write_blocked = false;
+            self.state.transport_write_blocked -= 1;
+        }
         self.pending.reset_stream.push((self.id, error_code));
 
         // Don't reopen an already-closed stream we haven't forgotten yet

@@ -1734,12 +1734,17 @@ impl Connection {
         let target_bytes = self.path.congestion.window();
         let path_generation = self.path.generation();
         let mut turn = SuccessorServiceTurn::new(target_bytes, path_generation)?;
-        // Authentication is queued before this turn starts. Adopt every Data-space packet that is
-        // already consuming congestion authority so the turn cannot succeed past unacknowledged
-        // authentication bytes. Loss and path-generation mismatches retain the same fail-closed
-        // outcome as packets emitted after the turn starts.
-        for packet in self.spaces[SpaceId::Data].sent_packets.values_mut() {
+        // Authentication is queued before this turn starts. Adopt every ordinary Data-space
+        // packet already consuming congestion authority so the turn cannot succeed past
+        // unacknowledged authentication bytes. A PLPMTUD probe is not a protocol prerequisite and
+        // remains owned exclusively by the MTUD state machine; losing it must not reject an
+        // otherwise qualified successor.
+        let in_flight_mtu_probe = self.path.mtud.in_flight_mtu_probe();
+        for (&packet_number, packet) in &mut self.spaces[SpaceId::Data].sent_packets {
             if !packet.ack_eliciting || packet.size == 0 {
+                continue;
+            }
+            if in_flight_mtu_probe == Some(packet_number) {
                 continue;
             }
             packet.successor_service_turn = true;
@@ -2061,20 +2066,23 @@ impl Connection {
     // high-latency handshakes
     fn on_packet_acked(&mut self, now: Instant, info: SentPacket) {
         let successor_service_turn = info.successor_service_turn;
+        let transport_write_demand = info.transport_write_demand;
         let path_generation = info.path_generation;
         let packet_size = u64::from(info.size);
         self.remove_in_flight(&info);
         if info.ack_eliciting && self.path.challenge.is_none() {
             // Only pass ACKs to the congestion controller if we are not validating the current
             // path, so as to ignore any ACKs from older paths still coming in.
-            // A successor service turn intentionally fills the snapshotted congestion window.
-            // Preserve that per-packet send-time ownership even if a later empty transmit poll
-            // marks the connection application-limited before the ACK arrives.
+            // A successor service turn intentionally fills the snapshotted congestion window. A
+            // STREAM packet emitted for a transport-blocked writer likewise owns its congestion
+            // feedback, without lending that authority to another stream. Preserve both
+            // per-packet send-time decisions even if a later empty transmit poll marks the
+            // connection application-limited before the ACK arrives.
             self.path.congestion.on_ack(
                 now,
                 info.time_sent,
                 info.size.into(),
-                self.app_limited && !successor_service_turn,
+                self.app_limited && !successor_service_turn && !transport_write_demand,
                 &self.path.rtt,
             );
         }
@@ -3959,6 +3967,9 @@ impl Connection {
             sent.stream_frames =
                 self.streams
                     .write_stream_frames(buf, max_size, self.config.send_fairness);
+            sent.transport_write_demand = self
+                .streams
+                .owns_transport_write_demand(&sent.stream_frames);
             self.stats.frame_tx.stream += sent.stream_frames.len() as u64;
         }
 
@@ -4629,6 +4640,7 @@ struct SentFrames {
     non_retransmits: bool,
     requires_padding: bool,
     successor_service_turn: bool,
+    transport_write_demand: bool,
 }
 
 impl SentFrames {

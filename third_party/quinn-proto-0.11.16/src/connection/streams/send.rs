@@ -13,6 +13,12 @@ pub(super) struct Send {
     pub(super) fin_pending: bool,
     /// Whether this stream is in the `connection_blocked` list of `Streams`
     pub(super) connection_blocked: bool,
+    /// Whether the application has proven continuous demand by reaching transport backpressure.
+    ///
+    /// This remains set across `Writable` delivery until the application actually retries. The
+    /// connection worker can otherwise publish a transient application-limited state between
+    /// waking the writer task and that task acquiring the connection lock again.
+    pub(super) transport_write_blocked: bool,
     /// The reason the peer wants us to stop, if `STOP_SENDING` was received
     pub(super) stop_reason: Option<VarInt>,
 }
@@ -26,6 +32,7 @@ impl Send {
             priority: 0,
             fin_pending: false,
             connection_blocked: false,
+            transport_write_blocked: false,
             stop_reason: None,
         })
     }

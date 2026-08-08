@@ -209,6 +209,7 @@ impl PacketBuilder {
             size,
             ack_eliciting,
             successor_service_turn: sent.successor_service_turn,
+            transport_write_demand: sent.transport_write_demand,
             retransmits: sent.retransmits,
             stream_frames: sent.stream_frames,
         };

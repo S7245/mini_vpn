@@ -464,7 +464,7 @@ fn successor_service_turn_completes_after_preexisting_stream_is_acked() {
 }
 
 #[test]
-fn successor_service_turn_fails_when_an_adopted_mtu_probe_is_lost() {
+fn successor_service_turn_ignores_preexisting_mtu_probe_loss() {
     let mut pair = Pair::default_with_deterministic_pns();
     let mut config = client_config_with_deterministic_pns();
     let mut mtud = MtuDiscoveryConfig::default();
@@ -481,6 +481,11 @@ fn successor_service_turn_fails_when_an_adopted_mtu_probe_is_lost() {
         .stats()
         .path
         .sent_plpmtud_probes;
+    let lost_probes_before = pair
+        .client_conn_mut(client_ch)
+        .stats()
+        .path
+        .lost_plpmtud_probes;
 
     pair.time += Duration::from_millis(2);
     pair.client.drive(pair.time, pair.server.addr);
@@ -498,18 +503,28 @@ fn successor_service_turn_fails_when_an_adopted_mtu_probe_is_lost() {
         .client_conn_mut(client_ch)
         .start_successor_service_turn()
         .unwrap();
-    assert!(started.sent_bytes > 0);
+    assert_eq!(
+        started.sent_bytes, 0,
+        "an unrelated PLPMTUD probe must remain outside protocol-readiness ownership"
+    );
     pair.drive();
 
     assert_matches!(
         pair.client_conn_mut(client_ch).poll(),
         Some(Event::SuccessorServiceTurn {
-            outcome: SuccessorServiceTurnOutcome::Failed {
-                reason: SuccessorServiceTurnFailure::PacketLost,
-                stats,
-            },
-        }) if stats.lost_bytes > 0,
-        "PLPMTUD loss must terminate the turn without waiting for its outer deadline"
+            outcome: SuccessorServiceTurnOutcome::Succeeded(stats),
+        }) if stats.sent_bytes >= stats.target_bytes
+            && stats.acked_bytes == stats.sent_bytes
+            && stats.lost_bytes == 0,
+        "readiness must settle its own fresh flight independently of an older MTU probe"
+    );
+    assert!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .path
+            .lost_plpmtud_probes
+            > lost_probes_before,
+        "the unchanged MTUD state machine must still own and record its probe loss"
     );
 }
 
@@ -3576,6 +3591,199 @@ fn endpoint_pacing_backpressure_preserves_business_cwnd_growth() {
         "continuously queued business data must complete at least one slow-start growth round across Endpoint-blocked empty polls: initial={initial_cwnd} final={final_cwnd} waits={}",
         pacing.wait_count
     );
+}
+
+#[test]
+fn write_blocked_business_demand_survives_writable_delivery_until_retry() {
+    let _guard = subscribe();
+    const SEND_WINDOW: u64 = 128 * 1024;
+    const TOTAL_BYTES: usize = 2 * 1024 * 1024;
+
+    let mut endpoint_config = EndpointConfig::default();
+    endpoint_config.endpoint_pacing_service(Some(
+        EndpointPacingServiceConfig::new(30_720_000, 61_440, 10_240, 20_480).unwrap(),
+    ));
+
+    let mut server_transport = TransportConfig::default();
+    server_transport
+        .receive_window(VarInt::from_u32(4 * 1024 * 1024))
+        .stream_receive_window(VarInt::from_u32(4 * 1024 * 1024))
+        .mtu_discovery_config(None);
+    let mut server = server_config();
+    server.transport = Arc::new(server_transport);
+
+    let mut client = client_config();
+    Arc::get_mut(&mut client.transport)
+        .unwrap()
+        .send_window(SEND_WINDOW)
+        .mtu_discovery_config(None);
+
+    let mut pair = Pair::new(Arc::new(endpoint_config), server);
+    pair.latency = Duration::from_millis(82);
+    let (client_ch, _) = pair.connect_with(client);
+    pair.client_conn_mut(client_ch)
+        .start_successor_service_turn()
+        .unwrap();
+    pair.drive();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::SuccessorServiceTurn {
+            outcome: SuccessorServiceTurnOutcome::Succeeded(_),
+        })
+    );
+    let business_initial_cwnd = pair.client_conn_mut(client_ch).stats().path.cwnd;
+
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let payload = vec![0x5a; TOTAL_BYTES];
+    let mut written = 0;
+    while written < payload.len() {
+        let accepted = pair
+            .client_send(client_ch, stream)
+            .write(&payload[written..])
+            .unwrap();
+        assert!(accepted > 0, "a writable notification must admit progress");
+        written += accepted;
+        if written == payload.len() {
+            break;
+        }
+        assert_eq!(
+            pair.client_send(client_ch, stream)
+                .write(&payload[written..]),
+            Err(WriteError::Blocked),
+            "the tracer must prove continuous application demand at the transport boundary"
+        );
+
+        pair.drive();
+        assert_matches!(
+            pair.client_conn_mut(client_ch).poll(),
+            Some(Event::Stream(StreamEvent::Writable { id })) if id == stream
+        );
+    }
+    pair.client_send(client_ch, stream).finish().unwrap();
+    pair.drive();
+
+    let final_cwnd = pair.client_conn_mut(client_ch).stats().path.cwnd;
+    assert!(
+        final_cwnd >= business_initial_cwnd + TOTAL_BYTES as u64 - SEND_WINDOW,
+        "a writer that reached transport Blocked remains non-application-limited until its writable retry; only the final application-complete window may be app-limited: initial={business_initial_cwnd} final={final_cwnd} bytes={TOTAL_BYTES} send_window={SEND_WINDOW}"
+    );
+}
+
+#[test]
+fn transport_write_demand_is_owned_per_blocked_stream() {
+    let _guard = subscribe();
+    const STREAM_WINDOW: u64 = 128 * 1024;
+    const SEND_WINDOW: u64 = 2 * STREAM_WINDOW;
+
+    let mut server_transport = TransportConfig::default();
+    server_transport
+        .receive_window(VarInt::from_u32(1024 * 1024))
+        .stream_receive_window(VarInt::from_u32(STREAM_WINDOW as u32))
+        .mtu_discovery_config(None);
+    let mut server = server_config();
+    server.transport = Arc::new(server_transport);
+
+    let mut client = client_config();
+    Arc::get_mut(&mut client.transport)
+        .unwrap()
+        .send_window(SEND_WINDOW)
+        .mtu_discovery_config(None);
+
+    let mut pair = Pair::new(Default::default(), server);
+    pair.latency = Duration::from_millis(82);
+    let (client_ch, _) = pair.connect_with(client);
+    let initial_cwnd = pair.client_conn_mut(client_ch).stats().path.cwnd;
+    let first = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let second = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let payload = vec![0x5a; STREAM_WINDOW as usize];
+
+    assert_eq!(
+        pair.client_send(client_ch, first).write(&payload),
+        Ok(STREAM_WINDOW as usize)
+    );
+    assert_eq!(
+        pair.client_send(client_ch, first).write(&[1]),
+        Err(WriteError::Blocked)
+    );
+    assert_eq!(
+        pair.client_send(client_ch, second).write(&payload),
+        Ok(STREAM_WINDOW as usize)
+    );
+    assert_eq!(
+        pair.client_send(client_ch, second).write(&[2]),
+        Err(WriteError::Blocked)
+    );
+
+    // Both streams have queued frames and independent demand. Removing the first before any
+    // packet is emitted must leave the aggregate nonzero so the second stream's packets retain
+    // their own congestion-growth authority.
+    pair.client_send(client_ch, first).reset(VarInt(0)).unwrap();
+    pair.drive();
+
+    let final_cwnd = pair.client_conn_mut(client_ch).stats().path.cwnd;
+    assert!(
+        final_cwnd > initial_cwnd,
+        "resetting one blocked writer must not erase another writer's congestion demand: initial={initial_cwnd} final={final_cwnd}"
+    );
+    pair.client_send(client_ch, second)
+        .reset(VarInt(0))
+        .unwrap();
+}
+
+#[test]
+fn cancelled_blocked_writer_does_not_own_another_streams_packets() {
+    let _guard = subscribe();
+    const SEND_WINDOW: u64 = 128 * 1024;
+
+    let mut server_transport = TransportConfig::default();
+    server_transport
+        .receive_window(VarInt::from_u32(1024 * 1024))
+        .stream_receive_window(VarInt::from_u32(1024 * 1024))
+        .mtu_discovery_config(None);
+    let mut server = server_config();
+    server.transport = Arc::new(server_transport);
+
+    let mut client = client_config();
+    Arc::get_mut(&mut client.transport)
+        .unwrap()
+        .send_window(SEND_WINDOW)
+        .mtu_discovery_config(None);
+
+    let mut pair = Pair::new(Default::default(), server);
+    pair.latency = Duration::from_millis(82);
+    let (client_ch, _) = pair.connect_with(client);
+    let blocked = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let independent = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let full_window = vec![0x5a; SEND_WINDOW as usize];
+
+    assert_eq!(
+        pair.client_send(client_ch, blocked).write(&full_window),
+        Ok(SEND_WINDOW as usize)
+    );
+    assert_eq!(
+        pair.client_send(client_ch, blocked).write(&[1]),
+        Err(WriteError::Blocked)
+    );
+    pair.drive();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::Stream(StreamEvent::Writable { id })) if id == blocked
+    );
+
+    let before_independent = pair.client_conn_mut(client_ch).stats().path.cwnd;
+    assert_eq!(
+        pair.client_send(client_ch, independent).write(&full_window[..64 * 1024]),
+        Ok(64 * 1024)
+    );
+    pair.client_send(client_ch, independent).finish().unwrap();
+    pair.drive();
+    let after_independent = pair.client_conn_mut(client_ch).stats().path.cwnd;
+
+    assert_eq!(
+        after_independent, before_independent,
+        "a cancelled or deferred blocked writer cannot lend non-application-limited ownership to an independent stream"
+    );
+    pair.client_send(client_ch, blocked).reset(VarInt(0)).unwrap();
 }
 
 #[test]
