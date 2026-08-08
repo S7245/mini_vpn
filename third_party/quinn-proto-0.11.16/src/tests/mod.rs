@@ -378,6 +378,142 @@ fn successor_service_turn_is_terminal_when_one_tagged_packet_is_lost() {
 }
 
 #[test]
+fn successor_service_turn_cannot_succeed_past_preexisting_stream_loss() {
+    let mut pair = Pair::default_with_deterministic_pns();
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+
+    let authentication = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, authentication)
+        .write(b"authenticate")
+        .unwrap();
+    pair.client_send(client_ch, authentication).finish().unwrap();
+    pair.client.drive(pair.time, pair.server.addr);
+    assert!(
+        !pair.client.outbound.is_empty(),
+        "authentication must be in flight before the service turn starts"
+    );
+    pair.client.delay_outbound();
+
+    let started = pair
+        .client_conn_mut(client_ch)
+        .start_successor_service_turn()
+        .unwrap();
+    assert!(
+        started.sent_bytes > 0,
+        "a turn must immediately own the authentication STREAM packet already in flight"
+    );
+    assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
+
+    pair.drive();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::SuccessorServiceTurn {
+            outcome: SuccessorServiceTurnOutcome::Failed {
+                reason: SuccessorServiceTurnFailure::PacketLost,
+                ..
+            },
+        }),
+        "declared loss of the preexisting authentication packet must fail the turn"
+    );
+}
+
+#[test]
+fn successor_service_turn_completes_after_preexisting_stream_is_acked() {
+    let mut pair = Pair::default_with_deterministic_pns();
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+
+    let authentication = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, authentication)
+        .write(b"authenticate")
+        .unwrap();
+    pair.client_send(client_ch, authentication).finish().unwrap();
+    pair.client.drive(pair.time, pair.server.addr);
+
+    let started = pair
+        .client_conn_mut(client_ch)
+        .start_successor_service_turn()
+        .unwrap();
+    assert!(started.sent_bytes > 0);
+    pair.drive();
+
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::SuccessorServiceTurn {
+            outcome: SuccessorServiceTurnOutcome::Succeeded(stats),
+        }) if stats.sent_bytes >= stats.target_bytes
+            && stats.acked_bytes == stats.sent_bytes
+            && stats.lost_bytes == 0
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Stream(StreamEvent::Opened { dir: Dir::Uni }))
+    );
+    assert_eq!(
+        pair.server_streams(server_ch).accept(Dir::Uni),
+        Some(authentication)
+    );
+    let mut recv = pair.server_recv(server_ch, authentication);
+    let mut chunks = recv.read(true).unwrap();
+    assert_matches!(
+        chunks.next(usize::MAX),
+        Ok(Some(chunk)) if chunk.offset == 0 && chunk.bytes == b"authenticate"[..]
+    );
+    let _ = chunks.finalize();
+}
+
+#[test]
+fn successor_service_turn_fails_when_an_adopted_mtu_probe_is_lost() {
+    let mut pair = Pair::default_with_deterministic_pns();
+    let mut config = client_config_with_deterministic_pns();
+    let mut mtud = MtuDiscoveryConfig::default();
+    mtud
+        .interval(Duration::from_millis(1))
+        .upper_bound(2_000);
+    Arc::get_mut(&mut config.transport)
+        .unwrap()
+        .mtu_discovery_config(Some(mtud));
+    let (client_ch, _) = pair.connect_with(config);
+    pair.drive();
+    let probes_before = pair
+        .client_conn_mut(client_ch)
+        .stats()
+        .path
+        .sent_plpmtud_probes;
+
+    pair.time += Duration::from_millis(2);
+    pair.client.drive(pair.time, pair.server.addr);
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .path
+            .sent_plpmtud_probes,
+        probes_before + 1,
+        "the reactivated PLPMTUD search must expose one in-flight probe"
+    );
+    pair.client.delay_outbound();
+
+    let started = pair
+        .client_conn_mut(client_ch)
+        .start_successor_service_turn()
+        .unwrap();
+    assert!(started.sent_bytes > 0);
+    pair.drive();
+
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::SuccessorServiceTurn {
+            outcome: SuccessorServiceTurnOutcome::Failed {
+                reason: SuccessorServiceTurnFailure::PacketLost,
+                stats,
+            },
+        }) if stats.lost_bytes > 0,
+        "PLPMTUD loss must terminate the turn without waiting for its outer deadline"
+    );
+}
+
+#[test]
 fn client_stateless_reset() {
     let _guard = subscribe();
     let mut key_material = vec![0; 64];

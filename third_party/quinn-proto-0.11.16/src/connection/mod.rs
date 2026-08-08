@@ -1733,9 +1733,21 @@ impl Connection {
         }
         let target_bytes = self.path.congestion.window();
         let path_generation = self.path.generation();
-        let turn = SuccessorServiceTurn::new(target_bytes, path_generation)?;
+        let mut turn = SuccessorServiceTurn::new(target_bytes, path_generation)?;
+        // Authentication is queued before this turn starts. Adopt every Data-space packet that is
+        // already consuming congestion authority so the turn cannot succeed past unacknowledged
+        // authentication bytes. Loss and path-generation mismatches retain the same fail-closed
+        // outcome as packets emitted after the turn starts.
+        for packet in self.spaces[SpaceId::Data].sent_packets.values_mut() {
+            if !packet.ack_eliciting || packet.size == 0 {
+                continue;
+            }
+            packet.successor_service_turn = true;
+            let _ = turn.on_packet_sent(packet.path_generation, u64::from(packet.size));
+        }
         let stats = turn.stats;
         self.successor_service_turn = Some(turn);
+        self.publish_successor_service_turn_outcome();
         Ok(stats)
     }
 
@@ -2321,6 +2333,12 @@ impl Connection {
         // Handle a lost MTU probe
         if let Some(packet) = lost_mtu_probe {
             let info = self.spaces[SpaceId::Data].take(packet).unwrap(); // safe: lost_mtu_probe is omitted from lost_packets, and therefore must not have been removed yet
+            if info.successor_service_turn {
+                self.note_successor_service_turn_packet_lost(
+                    info.path_generation,
+                    u64::from(info.size),
+                );
+            }
             self.remove_in_flight(&info);
             self.path.mtud.on_probe_lost();
             self.stats.path.lost_plpmtud_probes += 1;
