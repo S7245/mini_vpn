@@ -3397,6 +3397,52 @@ fn endpoint_pacing_preaccounts_every_stream_gso_datagram_and_batch() {
 }
 
 #[test]
+fn endpoint_pacing_backpressure_preserves_business_cwnd_growth() {
+    let _guard = subscribe();
+    let datagram_bytes = DEFAULT_MTU as u64;
+    let mut endpoint_config = EndpointConfig::default();
+    endpoint_config.endpoint_pacing_service(Some(
+        EndpointPacingServiceConfig::new(
+            10_000,
+            2 * datagram_bytes,
+            datagram_bytes,
+            datagram_bytes,
+        )
+        .unwrap(),
+    ));
+    let mut config = client_config();
+    Arc::get_mut(&mut config.transport)
+        .unwrap()
+        .mtu_discovery_config(None);
+    let mut pair = Pair::new(Arc::new(endpoint_config), server_config());
+    pair.latency = Duration::from_millis(82);
+    let (client_ch, _) = pair.connect_with(config);
+    let initial_cwnd = pair.client_conn_mut(client_ch).stats().path.cwnd;
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+
+    pair.client_send(client_ch, stream)
+        .write(&vec![0; 64 * 1024])
+        .unwrap();
+    pair.client_send(client_ch, stream).finish().unwrap();
+    pair.drive();
+
+    let final_cwnd = pair.client_conn_mut(client_ch).stats().path.cwnd;
+    let pacing = pair
+        .client_conn_mut(client_ch)
+        .endpoint_pacing_connection_snapshot()
+        .expect("configured connection pacing snapshot");
+    assert!(
+        pacing.wait_count > 0,
+        "the tracer must force Endpoint reservation backpressure"
+    );
+    assert!(
+        final_cwnd >= 2 * initial_cwnd,
+        "continuously queued business data must complete at least one slow-start growth round across Endpoint-blocked empty polls: initial={initial_cwnd} final={final_cwnd} waits={}",
+        pacing.wait_count
+    );
+}
+
+#[test]
 fn configured_pacing_cap_accounts_bulk_datagrams_before_gso_io() {
     let _guard = subscribe();
     let mut config = client_config();

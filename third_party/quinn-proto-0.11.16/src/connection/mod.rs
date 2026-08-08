@@ -817,6 +817,7 @@ impl Connection {
         let mut pad_datagram_to_mtu = false;
         let mut congestion_blocked = false;
         let mut endpoint_blocked = false;
+        let mut endpoint_bulk_blocked = false;
         let mut endpoint_reservation: Option<DatagramReservation> = None;
 
         // Iterate over all spaces and find data to send
@@ -1040,6 +1041,7 @@ impl Connection {
                     Ok(reservation) => reservation,
                     Err(()) => {
                         endpoint_blocked = true;
+                        endpoint_bulk_blocked = class == PacingTrafficClass::Bulk;
                         break;
                     }
                 };
@@ -1290,7 +1292,9 @@ impl Connection {
             );
         }
 
-        self.app_limited = buf.is_empty() && !congestion_blocked;
+        // Endpoint bulk backpressure sits below the application, just like path pacing. It cannot
+        // prove that no application bytes are queued; control-only waits retain upstream behavior.
+        self.app_limited = buf.is_empty() && !congestion_blocked && !endpoint_bulk_blocked;
 
         // Send MTU probe if necessary
         if buf.is_empty() && self.state.is_established() {
