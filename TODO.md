@@ -4,7 +4,46 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-08 — successor authentication-flight ownership ready for qualification)
+#### Latest decision (2026-08-08 — transport-write packet ownership ready for qualification)
+
+Exact-source `eb2185f` artifact
+`/tmp/mini_vpn_knife15_macos_20260808_092053.tar.gz` (SHA-256
+`100d3163...`) passed baseline `17.521/65.771 Mbit/s`, bounded direct at
+`8.758 Mbit/s` without a complete zero interval, smoke, every preflight, long
+forward/reverse TCP, reverse UDP, and cleanup. Its cycle-1 short forward then
+lost one complete Target receiver interval; formal M2 was not run.
+
+The stream used replacement generation 2 at `24,886B` cwnd and about `165ms`
+RTT. Quinn accepted `6,300,119B`, writer Pending reached `2,367,062us`, and
+sampled QUIC ACKs reached `3,849,795B` while Target received `4,194,304B`.
+D16, TUN, Endpoint conservation, process, routes, and cleanup stayed healthy.
+No fresh paired Exit observer existed, so none is claimed.
+
+Reviewed `f9c3c23` keeps a stream's write-Blocked demand across Writable
+delivery and gives ACK growth authority only to packets carrying that stream's
+frames. Review RED/GREEN proves a cancelled/deferred writer cannot lend this
+authority to an unrelated stream. Successor pre-start adoption also excludes
+only the exact active PLPMTUD probe; authentication packet loss remains
+fail-closed. No rate, MTU policy, pool, window, chunk, Cubic, GSO, Endpoint,
+D16, retry, or timer changed.
+
+All gates pass with no unresolved P0/P1; root is `689+3 ignored`, vendored
+Quinn/proto are `40+3 ignored`/`323`, and the exact Endpoint gate reached
+`240.079 Mbit/s` with final `61,440/0/0B`. Result:
+`docs/tech/2026-08-08-knife15-m2-transport-write-demand-local-results.md`.
+
+Next:
+
+1. pull/rebuild the pushed reviewed descendant on the Mac;
+2. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
+3. tell the agent when the Mac is ready so a fresh bounded `.33` observer can
+   be started;
+4. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
+   start -> smoke -> m2-qualification -> status -> stop`;
+5. preserve `status/snapshot/stop` after failure and upload the bundle;
+6. do not run formal M2 or repeat/tune unchanged; keep M2/M3 blocked.
+
+#### Previous decision (2026-08-08 — successor authentication-flight ownership ready for qualification)
 
 Code review before the next Mac run found a prerequisite-ownership gap in the
 successor readiness gate. TUIC Authenticate can already be an in-flight Quinn

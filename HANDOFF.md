@@ -4,7 +4,38 @@
 
 ## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-08)
 
-- **Latest accepted position:** code review of the `1d08565` descendant found
+- **Latest accepted position:** exact-source `eb2185f` qualification artifact
+  `/tmp/mini_vpn_knife15_macos_20260808_092053.tar.gz` (SHA-256
+  `100d3163...`) passed baseline `17.521/65.771 Mbit/s`, direct at
+  `8.758 Mbit/s` without a complete zero interval, smoke, every preflight,
+  long forward/reverse TCP, reverse UDP, and cleanup. The cycle-1 short
+  forward then admitted `10,092,544B`, delivered `4,194,304B`, and had one
+  complete Target receiver-zero interval; formal M2 was not run.
+- Generation 2 installed at `24,886B` cwnd and about `165ms` RTT. Its exact
+  writer accepted `6,300,119B`, remained Pending up to `2,367,062us`, and
+  sampled QUIC ACKs reached only `3,849,795B`. Target bytes exceeded that
+  snapshot, selecting pre-Exit transport supply. D16, TUN, Endpoint
+  conservation, routes, process, and cleanup stayed healthy. No fresh paired
+  Exit observer existed for this run.
+- Reviewed `f9c3c23` retains per-stream write-Blocked demand across Writable
+  delivery and assigns ACK growth authority only to packets that actually
+  carry that stream. The code-review RED proves a cancelled/deferred writer
+  cannot pollute an unrelated stream. The exact active PLPMTUD probe is also
+  excluded from successor pre-start adoption while authentication loss stays
+  fail-closed.
+- Root `689+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  established Clippy, shell, vendored Quinn `40+3 ignored` plus doc `1`,
+  quinn-proto `323` plus docs `3`, root docs, fmt/diff/vendor/secret, and
+  review pass with no unresolved P0/P1. Exact 32 MiB Endpoint capacity was
+  `240.079 Mbit/s`, final `61,440/0/0B`, zero socket would-block. Result:
+  `docs/tech/2026-08-08-knife15-m2-transport-write-demand-local-results.md`.
+- Pull/rebuild the pushed reviewed descendant. When the Mac is ready, start a
+  fresh bounded `.33` observer and take exactly one `m2-ipv6-check -> baseline
+  -> direct-discriminator -> start -> smoke -> m2-qualification -> status ->
+  stop`. Preserve failure evidence; do not run formal M2 or repeat/tune
+  unchanged. Formal M2 and M3 remain blocked.
+
+- **Previous accepted position:** code review of the `1d08565` descendant found
   that a TUIC Authenticate packet could already be in Quinn's Data-space sent
   map before the successor service turn started. It was then outside the
   turn's exact ACK/loss ownership. The same review found that an adopted

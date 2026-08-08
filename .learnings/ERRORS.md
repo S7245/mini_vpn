@@ -1,5 +1,30 @@
 # Errors
 
+## 2026-08-08 - Writable delivery lost business demand and the first repair polluted other streams
+
+- Exact-source `eb2185f` passed baseline/direct, smoke, every preflight, long
+  forward/reverse TCP, reverse UDP, and cleanup, then the cycle-1 short forward
+  lost one complete Target receiver interval. Quinn accepted `6,300,119B`, but
+  sampled ACK progress was only `3,849,795B` at about `165ms` RTT while the
+  installed successor began at `24,886B` cwnd.
+- Polling Quinn's Writable event removed the stream from its notification list
+  before the application retried. An intervening empty transmit poll could
+  publish application idle despite previously proven transport backpressure.
+- The first GREEN made the live blocked-stream count override the entire
+  connection. Code review produced a new RED: after the blocked writer was
+  cancelled/deferred, an unrelated app-limited stream incorrectly grew cwnd
+  `146,658 -> 213,998B`.
+- Correct behavior is two-level ownership: a per-stream bit survives Writable
+  until progress/terminal state, while only packets actually carrying that
+  stream's frames inherit non-idle ACK authority. The unrelated stream then
+  remains exactly `146,658B`.
+- Nine replacement attempts also treated a preexisting `1366B` PLPMTUD probe
+  loss as protocol-readiness failure. Exclude only that exact probe from
+  pre-start adoption; keep authentication packet loss fail-closed and MTUD
+  loss accounting unchanged.
+- Result:
+  `docs/tech/2026-08-08-knife15-m2-transport-write-demand-local-results.md`.
+
 ## 2026-08-08 - Successor readiness omitted pre-start authentication and special MTU loss
 
 - Review after the Endpoint ownership repair traced the actual call order:

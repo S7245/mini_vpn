@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-08-08 - Backpressure ownership belongs to emitted business packets
+
+- Writable notification means transport capacity may have returned; it does
+  not prove the woken writer has retried or stopped demanding service. Preserve
+  the blocked fact until nonempty write progress or terminal lifecycle.
+- Connection-wide ownership is too broad under cancellation. A deferred
+  blocked writer must not make control traffic or another stream appear
+  non-application-limited. Tag only packets that actually carry that stream's
+  frames and preserve the tag through ACK processing.
+- An aggregate live-stream count remains useful only as an O(1) fast reject.
+  The authoritative ownership decision must inspect the already bounded frame
+  metadata of the packet being built, so the hot path adds neither allocation
+  nor an unbounded scan.
+- Positive throughput replay is not enough for lifecycle safety. The decisive
+  review test cancels one writer after Writable, sends an independent
+  application-limited stream, and requires exactly zero borrowed cwnd growth.
+- Maintenance mechanics must stay outside protocol readiness unless they are
+  prerequisites. An existing PLPMTUD probe remains MTUD-owned; authentication
+  STREAM loss remains fail-closed.
+- Result:
+  `docs/tech/2026-08-08-knife15-m2-transport-write-demand-local-results.md`.
+
 ## 2026-08-08 - Readiness must own prerequisites already in flight
 
 - A readiness operation that starts after protocol setup cannot count only

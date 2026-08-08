@@ -189,7 +189,37 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-08:
 
-- Review before the next Mac run found that TUIC Authenticate could already
+- Exact-source `eb2185f` qualification artifact
+  `/tmp/mini_vpn_knife15_macos_20260808_092053.tar.gz` (SHA-256
+  `100d3163...`) passed baseline `17.521/65.771 Mbit/s`, direct at
+  `8.758 Mbit/s` without a complete zero interval, smoke, every preflight,
+  long forward/reverse TCP, reverse UDP, and cleanup. The cycle-1 short
+  forward then had two sender-zero intervals and one complete Target
+  receiver-zero interval; formal M2 was not run.
+- The exact stream used successor generation 2 at `24,886B` cwnd and about
+  `165ms` RTT. Quinn accepted `6,300,119B`, writer Pending reached
+  `2,367,062us`, sampled QUIC ACKs reached `3,849,795B`, and Target received
+  `4,194,304B`. D16, TUN, Endpoint conservation, routes, process, and cleanup
+  were healthy. No fresh paired Exit observer existed; do not claim one.
+- Reviewed `f9c3c23` preserves a stream's proven write-Blocked demand across
+  Writable delivery, then tags only packets actually carrying that stream's
+  frames. A cancelled/deferred writer cannot lend cwnd authority to another
+  stream. Pre-start successor adoption also excludes only the exact active
+  PLPMTUD probe while authentication packet loss remains fail-closed.
+- Root `689+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  established Clippy, shell, vendored Quinn `40+3 ignored` plus doc `1`,
+  quinn-proto `323` plus docs `3`, root docs, fmt/diff/vendor/secret, and
+  review pass with no unresolved P0/P1. Exact 32 MiB Endpoint capacity was
+  `240.079 Mbit/s`, final `61,440/0/0B`, zero socket would-block. Result:
+  `docs/tech/2026-08-08-knife15-m2-transport-write-demand-local-results.md`.
+- Pull/rebuild the pushed reviewed descendant. When the Mac is ready start
+  one fresh bounded `.33` observer and take exactly one
+  `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke ->
+  m2-qualification -> status -> stop`. Do not run formal M2 or repeat/tune
+  unchanged. Formal M2 and M3 remain blocked.
+
+- Previous accepted position: review before the next Mac run found that TUIC
+  Authenticate could already
   be an in-flight Quinn Data packet when the successor service turn started,
   leaving a protocol prerequisite outside its exact ACK/loss ownership. An
   adopted PLPMTUD probe also used a special loss branch that left the turn
