@@ -1103,10 +1103,21 @@ impl TcpPoolAdmission {
         epoch.black_hole_anchor = black_hole_anchor;
     }
 
+    #[cfg(test)]
     fn try_decide(
         &self,
         observations: &[TcpPoolPathObservation],
         replacement_allowed: &[bool],
+    ) -> Result<TcpPoolAdmissionDecision, TcpPoolReservationError> {
+        self.try_decide_excluding(observations, replacement_allowed, &[], false)
+    }
+
+    fn try_decide_excluding(
+        &self,
+        observations: &[TcpPoolPathObservation],
+        replacement_allowed: &[bool],
+        excluded_slots: &[bool],
+        qualified_only: bool,
     ) -> Result<TcpPoolAdmissionDecision, TcpPoolReservationError> {
         if self.active_slots.is_empty() {
             return Err(TcpPoolReservationError::Empty);
@@ -1122,6 +1133,9 @@ impl TcpPoolAdmission {
             let mut preparing = false;
             let mut candidates = Vec::with_capacity(self.active_slots.len());
             for (index, slot_preparing) in self.preparing_slots.iter().enumerate() {
+                if excluded_slots.get(index).copied().unwrap_or(false) {
+                    continue;
+                }
                 if slot_preparing.load(Ordering::Acquire) {
                     preparing = true;
                     continue;
@@ -1136,6 +1150,11 @@ impl TcpPoolAdmission {
                 let observation = observations.get(index).copied().unwrap_or_default();
                 let path_service = observation.path_service();
                 let qualification = self.qualification_for(index, active_before, observation);
+                if qualified_only
+                    && qualification.qualification != TcpPoolForwardQualification::Qualified
+                {
+                    continue;
+                }
                 let identity = match observation {
                     TcpPoolPathObservation::Unknown => None,
                     TcpPoolPathObservation::Known { identity, .. } => Some(identity),
@@ -6501,15 +6520,28 @@ impl TuicUpstream {
     async fn acquire_tcp_pool_reservation(
         &self,
     ) -> Result<(TcpPoolSlotReservation, bool), ClientError> {
+        // A failed maintenance replacement must not fail the business open when another
+        // qualified current generation remains. Keep the exclusion local to this open so a
+        // later independent open retains fresh replacement authority.
+        let mut failed_replacement_slots = vec![false; self.tcp_pool_slots.len()];
+        let mut failed_replacement: Option<(usize, String)> = None;
         loop {
             let available = self.tcp_pool_admission.available.notified();
             let observations = self.sample_tcp_pool_observations();
             let replacement_allowed = self.tcp_pool_replacement_allowed();
-            match self
-                .tcp_pool_admission
-                .try_decide(&observations, &replacement_allowed)
-            {
+            match self.tcp_pool_admission.try_decide_excluding(
+                &observations,
+                &replacement_allowed,
+                &failed_replacement_slots,
+                failed_replacement.is_some(),
+            ) {
                 Ok(TcpPoolAdmissionDecision::ReserveCurrent(reservation)) => {
+                    if let Some((failed_slot, _)) = &failed_replacement {
+                        println!(
+                            "✅ tuic-tcp-pool-generation-replacement-fallback failed_slot={failed_slot} selected_slot={} same_open_retry=false",
+                            reservation.index,
+                        );
+                    }
                     if self.tcp_pool_draining_predecessor.load(Ordering::Acquire)
                         && reservation.qualification_override
                         && reservation.candidates.iter().any(|candidate| {
@@ -6526,19 +6558,45 @@ impl TuicUpstream {
                     return Ok((reservation, false));
                 }
                 Ok(TcpPoolAdmissionDecision::ReplaceAuxiliary(replacement)) => {
+                    let replacement_index = replacement.index;
                     let Some(permit) = TcpPoolDrainingPermit::try_acquire(
                         self.tcp_pool_draining_predecessor.clone(),
                     ) else {
                         drop(replacement);
                         continue;
                     };
-                    return self
-                        .replace_auxiliary_generation(replacement, permit)
-                        .await
-                        .map(|reservation| (reservation, true));
+                    match self.replace_auxiliary_generation(replacement, permit).await {
+                        Ok(reservation) => return Ok((reservation, true)),
+                        Err(error) => {
+                            let error = format!("{error:?}");
+                            let Some(excluded) =
+                                failed_replacement_slots.get_mut(replacement_index)
+                            else {
+                                return Err(io_err(
+                                    "tuic tcp pool generation replacement fallback",
+                                    format!(
+                                        "replacement slot index out of range: slot={replacement_index} error={error}"
+                                    ),
+                                ));
+                            };
+                            *excluded = true;
+                            println!(
+                                "⚠️ tuic-tcp-pool-generation-replacement-fallback failed_slot={replacement_index} same_open_retry=false error={error}"
+                            );
+                            failed_replacement = Some((replacement_index, error));
+                        }
+                    }
                 }
                 Err(TcpPoolReservationError::Busy) => available.await,
                 Err(error) => {
+                    if let Some((failed_slot, replacement_error)) = &failed_replacement {
+                        return Err(io_err(
+                            "tuic tcp pool generation replacement fallback",
+                            format!(
+                                "no current-generation fallback after slot={failed_slot} failure={replacement_error}: admission={error:?}"
+                            ),
+                        ));
+                    }
                     return Err(ClientError::InvalidTarget(format!(
                         "tuic tcp pool forward admission failed: {error:?}"
                     )));
@@ -11163,6 +11221,91 @@ mod tests {
 
         let TcpPoolAdmissionDecision::ReplaceAuxiliary(replacement) = decision else {
             panic!("qualified-lane collapse must request replacement, not reserve conn0");
+        };
+        assert_eq!(replacement.index, 1);
+    }
+
+    #[test]
+    fn tcp_pool_failed_auxiliary_replacement_falls_back_without_same_open_retry() {
+        let admission = TcpPoolAdmission::new(3);
+        let anchored = [
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(10, 1),
+                12_000,
+                Duration::from_millis(165),
+                0,
+            ),
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(11, 1),
+                980_000,
+                Duration::from_millis(163),
+                0,
+            ),
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(12, 1),
+                960_000,
+                Duration::from_millis(164),
+                0,
+            ),
+        ];
+        let first = admission.try_reserve(&anchored).unwrap();
+        let second = admission.try_reserve(&anchored).unwrap();
+        let third = admission.try_reserve(&anchored).unwrap();
+        drop((first, second, third));
+        admission.set_active_for_test(0, 2);
+        admission.set_active_for_test(1, 2);
+        admission.set_active_for_test(2, 2);
+
+        let degraded = [
+            anchored[0],
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(11, 1),
+                980_000,
+                Duration::from_millis(163),
+                5,
+            ),
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(12, 1),
+                960_000,
+                Duration::from_millis(164),
+                3,
+            ),
+        ];
+        let first_decision = admission
+            .try_decide(&degraded, &[false, true, true])
+            .expect("the degraded auxiliary generation must request replacement");
+        let TcpPoolAdmissionDecision::ReplaceAuxiliary(replacement) = first_decision else {
+            panic!("the replay must reach auxiliary replacement");
+        };
+        assert_eq!(replacement.index, 1);
+        drop(replacement);
+
+        let fallback = admission
+            .try_decide_excluding(&degraded, &[false, true, true], &[false, true, false], true)
+            .expect("the same open must retain a qualified current-generation fallback");
+        let TcpPoolAdmissionDecision::ReserveCurrent(fallback) = fallback else {
+            panic!("the same open must not retry replacement");
+        };
+        assert_eq!(fallback.index, 0);
+        assert_eq!(fallback.active_before, 2);
+        assert_eq!(admission.active_total(), 7);
+        assert!(matches!(
+            admission.try_decide_excluding(
+                &degraded,
+                &[false, true, true],
+                &[false, true, false],
+                true,
+            ),
+            Err(TcpPoolReservationError::Busy)
+        ));
+        drop(fallback);
+        assert_eq!(admission.active_total(), 6);
+
+        let next_open = admission
+            .try_decide(&degraded, &[false, true, true])
+            .expect("a later independent open retains fresh replacement authority");
+        let TcpPoolAdmissionDecision::ReplaceAuxiliary(replacement) = next_open else {
+            panic!("replacement suppression must remain attempt-local");
         };
         assert_eq!(replacement.index, 1);
     }
