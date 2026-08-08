@@ -1,10 +1,47 @@
 # TODO
 
-## Current Knife15 Plan (2026-08-07)
+## Current Knife15 Plan (2026-08-08)
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-07 — replacement failure business fallback ready for qualification)
+#### Latest decision (2026-08-08 — service-turn ACK ownership ready for qualification)
+
+Exact-source `f693d0d` artifact
+`/tmp/mini_vpn_knife15_macos_20260808_054225.tar.gz` (SHA-256
+`0e6d8ee6...`) passed baseline `21.003/42.391 Mbit/s`, direct at
+`10.497 Mbit/s` without gaps, smoke, every preflight, the long forward/reverse
+TCP/reverse UDP phases, and cleanup. Its first ten-second short forward then
+lost one complete Target receiver interval. Formal M2 was not run.
+
+Conn1 generation 2 had passed its replacement service turn at
+`12,000/12,800/12,800/0B`, but installed with only `13,280B` cwnd and stayed
+cold through the reverse phases. The paired Exit observer captured `1,569,331`
+packets with zero kernel drops; Target ACKed every Exit-supplied short-flow byte
+at about `1..3ms`. This selects client-to-Exit initial supply, not operator,
+Target, Exit-to-Target, D16, Endpoint, TUN, cleanup, or a frozen value.
+
+Reviewed `c3c264a` preserves send-time non-application-limited ownership for
+the existing tagged service-turn ACKs even if a later empty Quinn poll changes
+the global snapshot. Ordinary packets, Cubic, turn size/deadline/failure,
+pool, MTU, D16, Endpoint, GSO, workload, and SLIs are unchanged. A deterministic
+`164ms` RTT RED at `12,000 + 13,068 > 23,616` is GREEN. All local gates pass
+with no unresolved P0/P1; root is `689+3 ignored`, vendored Quinn/proto are
+`40+3 ignored`/`316`, and the exact Endpoint gate reached `237.701 Mbit/s`
+with final `61,440/0/0B`. Result:
+`docs/tech/2026-08-08-knife15-m2-successor-service-turn-app-limited-local-results.md`.
+
+Next:
+
+1. pull/rebuild the pushed descendant on the Mac;
+2. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
+3. tell the agent when the Mac is ready so a fresh bounded `.33` observer can
+   be started;
+4. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
+   start -> smoke -> m2-qualification -> status -> stop`;
+5. preserve `status/snapshot/stop` after failure and upload the bundle;
+6. do not run formal M2 or repeat/tune unchanged; keep M2/M3 blocked.
+
+#### Previous decision (2026-08-07 — replacement failure business fallback ready for qualification)
 
 Exact-source `b04cb65` artifact
 `/tmp/mini_vpn_knife15_macos_20260808_030357.tar.gz` (SHA-256

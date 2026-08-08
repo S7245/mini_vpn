@@ -1,5 +1,34 @@
 # Errors
 
+## 2026-08-08 - Exact service-turn settlement hid lost congestion ownership
+
+- Exact-source `f693d0d` passed direct, smoke, every preflight, long forward,
+  reverse TCP, reverse UDP, and cleanup, then its first short forward lost one
+  complete Target receiver interval. The successor turn had reported exact
+  success, but installed cwnd was only `13,280B`; paired Exit evidence showed
+  Target immediately ACKed every byte it received.
+- Root cause: tagged packets were deliberately sent to fill a snapshotted
+  congestion window, but their delayed ACKs used a later global
+  `app_limited=true` value set by an empty transmit poll. Exact turn byte
+  accounting therefore did not preserve the state transition the readiness
+  contract assumed.
+- The first local assertion required only `final_cwnd > initial_cwnd` and
+  false-passed. The accepted regression uses `82ms` one-way delay and requires
+  `final_cwnd >= initial_cwnd + tagged_acked_bytes`; pre-fix it failed at
+  `12,000 + 13,068 > 23,616`.
+- A standalone Quinn command again selected registry quinn-proto and failed on
+  missing fork APIs. This was rejected as dependency provenance, not product
+  regression. The final gate supplied the absolute local patch, verified the
+  dependency tree, ran `40+3 ignored` plus doc `1`, and removed its generated
+  ignored lockfile.
+- The first final secret scan inspected whole modified files and matched an
+  older placeholder in the runbook. It was rejected and rerun over only added
+  tracked lines plus complete untracked files; that exact changed-content scan
+  passed without printing candidate content.
+- Correct behavior: use the existing per-packet tag to preserve only tagged
+  ACK ownership; keep ordinary ACKs, Cubic, loss/path/close failure, turn size,
+  deadline, and all frozen product values unchanged.
+
 ## 2026-08-07 - Replacement fallback and exact-filter gate traps
 
 - Exact-source `b04cb65` correctly failed a lossy successor service turn, but

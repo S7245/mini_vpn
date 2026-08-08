@@ -1,5 +1,30 @@
 # Learnings
 
+## 2026-08-08 - Send-time packet ownership must survive later global snapshots
+
+- A transport operation can deliberately fill the congestion window and still
+  lose slow-start authority if ACK handling consults a later connection-wide
+  application-limited snapshot. When the operation already tags the exact
+  encrypted packets, preserve that send-time fact per packet through ACK.
+- A successful byte-accounting outcome is not enough. The service turn had
+  exact `sent == acked` settlement but installed with only one MTU of cwnd
+  growth. Readiness contracts must validate the state they are intended to
+  establish, not only completion of the probe action.
+- Zero-latency transport tests can hide causality that exists across a WAN
+  RTT. A deterministic realistic-delay replay plus a quantitative invariant
+  (`final >= initial + tagged ACK bytes`) exposed a bug that the weaker
+  `final > initial` assertion accepted.
+- Capacity math should bind the fix to the exact acceptance boundary. With
+  half of the first second already spent on Connect and about three `164ms`
+  rounds remaining, `13.28KiB` cannot fill the first 128KiB receiver block,
+  while at least `24.8KiB` can. This supports one qualification, not formal M2
+  or a general throughput claim.
+- Paired endpoint evidence remains decisive: zero Exit capture drops and
+  low-millisecond ACKs for every Exit-supplied byte isolate client-to-Exit
+  supply without turning the result into another parameter branch.
+- Result:
+  `docs/tech/2026-08-08-knife15-m2-successor-service-turn-app-limited-local-results.md`.
+
 ## 2026-08-07 - Maintenance failure must not automatically own business failure
 
 - A terminal successor service-turn loss correctly rejects installation, but

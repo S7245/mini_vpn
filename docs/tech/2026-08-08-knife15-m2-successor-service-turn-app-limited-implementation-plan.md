@@ -2,7 +2,7 @@
 
 Date: 2026-08-08
 
-Status: **LOCAL IMPLEMENTATION AND REVIEW PASS; PUBLICATION IN PROGRESS**
+Status: **LOCAL IMPLEMENTATION AND REVIEW PUBLISHED; ONE MAC QUALIFICATION REQUIRED**
 
 Architecture:
 `docs/tech/2026-08-08-knife15-m2-successor-service-turn-app-limited-architecture-spec.md`.
@@ -58,9 +58,9 @@ Architecture:
 
 ## Task 7 — Memory and publication
 
-- [ ] Record local results and the paired qualification classification.
-- [ ] Update `HANDOFF.md`, `TODO.md`, `AGENTS.md`, and learning/error memory.
-- [ ] Commit the coherent stage and push the reviewed descendant.
+- [x] Record local results and the paired qualification classification.
+- [x] Update `HANDOFF.md`, `TODO.md`, `AGENTS.md`, and learning/error memory.
+- [x] Commit the coherent stage and push the reviewed descendant.
 
 ## Task 8 — One bounded Mac qualification
 

@@ -231,11 +231,9 @@ The current cold-successor discriminator requires the agent-owned bounded
 Exit observer to overlap the Mac qualification. Do not start a separate
 observer on the Mac. Before `start`, confirm that the current accepted
 position names a fresh `.33` observer and that its two-hour hard-timeout
-window is still active. The observer for this transaction is:
-
-```text
-/tmp/mini_vpn_knife15_exit_target_observer_20260807_102734
-```
+window is still active. Use only the exact observer directory reported by the
+agent for this transaction; historical paths in earlier result documents are
+stopped or expired and must not be reused.
 
 If that observer has expired, do not run the transaction; ask the agent to
 start a new one so another 30-minute qualification is not spent without
@@ -323,8 +321,8 @@ service and mode; do not source or `eval` that file.
 
 ## Failure Procedure
 
-If `start`, `smoke`, or `m2` fails, do not retry and do not tune any value.
-Run:
+If `start`, `smoke`, `m2-qualification`, or a later explicitly authorized
+`m2` fails, do not retry and do not tune any value. Run:
 
 ```bash
 sudo -E bash scripts/knife15-macos-soak.sh status || true
@@ -352,7 +350,8 @@ build/self-test/preflight   about 1–3 minutes
 baseline                    about 40–90 seconds
 direct discriminator        a little over 5 minutes
 start + smoke               about 1–2 minutes
-M2                          about 25 wall-clock hours
+m2-qualification            about 30 minutes
+formal m2 (blocked now)     about 25 wall-clock hours
 status + stop + bundle      about 1–3 minutes
 IPv6 restoration           about 1 minute
 ```
