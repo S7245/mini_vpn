@@ -63,8 +63,8 @@ Architecture:
 
 - [x] Review correctness, performance, concurrency, bounded fallback, D16,
   TUN, TCP/UDP, Endpoint, and missing-test risk; resolve every P0/P1.
-- [ ] Update `CONTEXT.md`, `.learnings`, `HANDOFF.md`, and `TODO.md`.
-- [ ] Commit coherent implementation/evidence changes and push.
+- [x] Update `CONTEXT.md`, `.learnings`, `HANDOFF.md`, and `TODO.md`.
+- [x] Commit coherent implementation/evidence changes and push (`3737dee`).
 - [ ] Start one fresh bounded `.33` observer only when the Mac is ready.
 - [ ] Take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
   start -> smoke -> m2-qualification -> status -> stop`.

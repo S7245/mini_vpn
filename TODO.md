@@ -4,7 +4,48 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-10 — exact transport-write flight ownership ready for qualification)
+#### Latest decision (2026-08-10 — successor service certificate ready for qualification)
+
+Exact-source `80df179` artifact
+`/tmp/mini_vpn_knife15_macos_20260810_055556.tar.gz` (SHA-256
+`9d291f6c...`) passed baseline `23.658/61.795 Mbit/s`, bounded direct at
+`11.822 Mbit/s` without zero intervals, smoke, every preflight, seven mixed
+phases, and cleanup. Cycle-2 short forward then lost one complete Target
+receiver interval; formal M2 was not run.
+
+Paired Exit SHA-256 `6d5538c9...` saw `1,506,514B` on the exact socket over
+`10.210s`, maximum supply gap `280.203ms`, Target ACK RTT about `1..6ms`, zero
+retransmit growth, and zero capture/kernel drops. The selected successor had
+proved `24,800B` after its service turn but was admitted later at `17,360B`,
+about `173ms` RTT, and zero black holes. Local ownership/conservation and
+cleanup were healthy; this selects stale successor service readiness.
+
+Reviewed pushed `3737dee` stores an immutable certificate for exact transport
+identity, logical generation, path generation, and post-turn cwnd floor.
+Ready requires matching identity/path and current cwnd at least the proved
+floor; stale auxiliary state uses the existing bounded fresh replacement,
+CAS install, and predecessor drain. Initial/incomplete evidence remains
+`Unknown`, all-stale and failure fallback remain bounded, and no frozen value
+or workload changed. Review also fixed a possible no-progress replacement
+loop when exact qualification epoch evidence was absent.
+
+All local gates pass with no unresolved P0/P1; root is `700+3 ignored`,
+vendored Quinn/proto are `40+3 ignored`/`326`, and exact Endpoint capacity is
+`237.868 Mbit/s` with final `61,440/0/0B`. Result:
+`docs/tech/2026-08-10-knife15-m2-successor-service-certificate-local-results.md`.
+
+Next:
+
+1. pull/rebuild the pushed reviewed descendant on the Mac and keep every
+   other VPN off;
+2. start one fresh bounded `.33` observer only when the Mac is ready;
+3. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
+   start -> smoke -> m2-qualification -> status -> stop`;
+4. preserve `status/snapshot/stop` after failure and upload the bundle;
+5. do not run formal M2 or repeat/tune unchanged; a recurrence rejects this
+   architecture and keeps M2/M3 blocked.
+
+#### Previous decision (2026-08-10 — exact transport-write flight ownership ready for qualification)
 
 Exact-source `b437b93` artifact
 `/tmp/mini_vpn_knife15_macos_20260810_021421.tar.gz` (SHA-256

@@ -1,5 +1,30 @@
 # Errors
 
+## 2026-08-10 - Historical successor proof outlived its current service state
+
+- Exact-source `80df179` passed baseline/direct, smoke, every preflight, seven
+  qualification phases, and cleanup, then cycle-2 short forward lost one
+  complete Target receiver interval. Formal M2 was not run.
+- The selected auxiliary had installed after a successful service turn at
+  `24,800B` cwnd but was admitted later at `17,360B`, about `173ms` RTT, and
+  zero black holes. Its historical qualification therefore remained true
+  while the service state needed for the first `128KiB` interval was stale.
+- Paired Exit evidence saw `1,506,514B` over `10.210s`, maximum positive
+  supply gap `280.203ms`, Target ACK RTT about `1..6ms`, zero sender TCP
+  retransmit growth, and zero capture/kernel drops. D16/TUN/Endpoint and
+  cleanup were healthy; do not reopen parameter or downstream branches.
+- Code review found a separate progress failure before commit: a stale busy
+  auxiliary without an exact qualification epoch could be selected and then
+  skipped forever. Selection now requires the epoch, and the missing-evidence
+  case falls back without maintenance spin.
+- An exploratory `-D warnings` Clippy command failed on established untouched
+  warnings under the current toolchain. It was rejected as a gate; the
+  established repository Clippy lane passed. A first changed-content secret
+  scan also had invalid shell quoting and was rerun with separate safe regex
+  arguments; the corrected scan passed without printing candidates.
+- Result:
+  `docs/tech/2026-08-10-knife15-m2-successor-service-certificate-local-results.md`.
+
 ## 2026-08-10 - Write progress cleared ownership before the worker emitted its flight
 
 - Exact-source `b437b93` passed baseline/direct, smoke, every preflight, seven

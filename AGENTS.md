@@ -189,7 +189,40 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-10:
 
-- Exact-source `b437b93` qualification artifact
+- Exact-source `80df179` qualification artifact
+  `/tmp/mini_vpn_knife15_macos_20260810_055556.tar.gz` (SHA-256
+  `9d291f6c...`) passed baseline `23.658/61.795 Mbit/s`, direct at
+  `11.822 Mbit/s` without zero intervals, smoke, every preflight, seven mixed
+  phases, and cleanup. Cycle-2 short forward then lost one complete Target
+  receiver interval; formal M2 was not run.
+- Paired Exit SHA-256 `6d5538c9...` saw `1,506,514B` over `10.210s`, maximum
+  supply gap `280.203ms`, Target ACK RTT about `1..6ms`, zero sender TCP
+  retransmit growth, and zero capture/kernel drops. D16, TUN, Endpoint,
+  routes, process, and cleanup were healthy.
+- The selected successor proved a `24,800B` post-turn cwnd floor but was later
+  admitted at `17,360B`, about `173ms` RTT, and zero black holes. This selects
+  stale successor service readiness, not operator, Target, Exit-to-Target,
+  local data-plane ownership, or parameter tuning.
+- Reviewed pushed `3737dee` stores an exact immutable
+  identity/logical-generation/path-generation/post-turn-cwnd certificate.
+  Ready requires the same identity/path and current cwnd at least the proved
+  floor. Stale auxiliaries reuse the bounded fresh replacement/CAS/drain;
+  initial/incomplete evidence stays `Unknown`, and fallback remains bounded.
+- Review found and fixed a possible replacement-decision spin when exact epoch
+  evidence was absent. Root `700+3 ignored`, main `2`, integration `10+4
+  ignored`, release, established Clippy, shell, vendored Quinn `40+3 ignored`
+  plus doc `1`, quinn-proto `326` plus docs `3`, root docs,
+  fmt/diff/vendor/secret, and review pass with no unresolved P0/P1. Exact
+  Endpoint capacity was `237.868 Mbit/s`, final `61,440/0/0B`, zero socket
+  would-block. Result:
+  `docs/tech/2026-08-10-knife15-m2-successor-service-certificate-local-results.md`.
+- Pull/rebuild the pushed reviewed descendant. When the Mac is ready, start
+  one fresh bounded `.33` observer and take exactly one `m2-ipv6-check ->
+  baseline -> direct-discriminator -> start -> smoke -> m2-qualification ->
+  status -> stop`. Do not run formal M2 or repeat/tune unchanged. A recurrence
+  rejects this architecture. Formal M2 and M3 remain blocked.
+
+- Previous accepted position: exact-source `b437b93` qualification artifact
   `/tmp/mini_vpn_knife15_macos_20260810_021421.tar.gz` (SHA-256
   `33dddf00...`) passed baseline `25.429/54.539 Mbit/s`, direct at
   `12.715 Mbit/s` without a complete zero interval, smoke, every preflight,

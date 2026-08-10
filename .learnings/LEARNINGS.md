@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-08-10 - Readiness is versioned state, not a historical success bit
+
+- A successful successor service turn is exact evidence for one transport
+  identity, logical pool generation, path generation, and post-turn cwnd
+  floor. It does not remain transferable after the identity/path changes or
+  current service falls below the state the generation proved.
+- Preserve the proof as immutable generation-owned state and classify it at
+  admission from scalar current observations. This keeps Quinn outside the
+  policy module and avoids a configured threshold, ratio, timer, or retry.
+- Unknown evidence is not negative evidence. Initial generations and an
+  unavailable current path generation retain bounded availability; stale is
+  asserted only when exact certificate evidence disagrees with current state.
+- Requalification of an installed live generation would mix maintenance with
+  business ownership. Reuse a fresh replacement, exact CAS install, and
+  predecessor drain so existing streams and payload are never migrated.
+- Maintenance selection itself needs a progress certificate. Code review
+  found that a stale candidate without an exact qualification epoch could be
+  repeatedly selected and skipped; filter it before selection and require a
+  deterministic no-spin fallback test.
+- Result:
+  `docs/tech/2026-08-10-knife15-m2-successor-service-certificate-local-results.md`.
+
 ## 2026-08-10 - Proven demand owns accepted bytes until their cumulative ACK
 
 - A successful partial transport write does not prove application demand has

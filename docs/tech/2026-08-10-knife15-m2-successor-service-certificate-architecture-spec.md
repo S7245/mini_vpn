@@ -2,10 +2,13 @@
 
 Date: 2026-08-10
 
-Status: **APPROVED FOR LOCAL TDD IMPLEMENTATION; FORMAL M2 AND M3 REMAIN BLOCKED**
+Status: **LOCAL IMPLEMENTATION AND REVIEW PASS; ONE PAIRED MAC QUALIFICATION IS REQUIRED; FORMAL M2 AND M3 REMAIN BLOCKED**
 
 Failure evidence:
 `docs/tech/2026-08-10-knife15-m2-successor-service-certificate-qualification-failure-results.md`.
+
+Local result:
+`docs/tech/2026-08-10-knife15-m2-successor-service-certificate-local-results.md`.
 
 ## Decision
 
