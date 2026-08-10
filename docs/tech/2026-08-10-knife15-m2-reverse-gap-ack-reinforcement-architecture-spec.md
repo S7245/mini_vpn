@@ -2,7 +2,10 @@
 
 Date: 2026-08-10
 
-Status: **LOCAL IMPLEMENTATION AND REVIEW PASS; ONE PAIRED MAC QUALIFICATION REQUIRED; FORMAL M2 AND M3 REMAIN BLOCKED**
+Status: **PAIRED MAC QUALIFICATION PASS; FORMAL M2 REOPENED ON REVIEWED TREE; M3 REMAINS BLOCKED**
+
+Qualification result:
+`docs/tech/2026-08-10-knife15-m2-reverse-gap-ack-reinforcement-macos-qualification-results.md`.
 
 ## Decision
 

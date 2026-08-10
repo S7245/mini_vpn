@@ -1,5 +1,25 @@
 # Errors
 
+## 2026-08-10 - A successful SCP process did not prove a complete evidence copy
+
+- The finalized Exit observer bundle was about `63MiB`. The first local SCP
+  left only a `7.7MiB` file, whose SHA-256 did not match the authoritative
+  remote `03d51370...` checksum.
+- The partial archive was rejected before extraction. A fresh transfer to a
+  distinct `.complete` path was allowed to finish, matched the remote SHA, and
+  then passed every internal `SHA256SUMS` entry.
+- Always compare remote and local size/hash after cross-region evidence
+  transfer, even when the transfer command emitted no error. Never overwrite
+  or analyze the only candidate until the replacement is independently
+  complete.
+- The first documentation validation loop used `path` as its zsh loop
+  variable. Because zsh ties lowercase `path` to `PATH`, later `git`, `sed`,
+  and `rg` commands were unavailable and the printed PASS was invalid. The
+  result was rejected and rerun with `doc_file`; avoid zsh special parameter
+  names in gate scripts.
+- Result:
+  `docs/tech/2026-08-10-knife15-m2-reverse-gap-ack-reinforcement-macos-qualification-results.md`.
+
 ## 2026-08-10 - Reverse STREAM credit exhausted behind one lost prefix
 
 - Exact-source `673d13d` passed baseline/direct, smoke, every preflight,

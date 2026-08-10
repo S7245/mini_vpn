@@ -1,5 +1,31 @@
 # Learnings
 
+## 2026-08-10 - A positive WAN qualification needs reachability and boundedness together
+
+- Absence of the old zero interval is not enough for a rare branch. Require a
+  nonzero exact branch counter in the same run; here
+  `gap_ack_reinforcements` advanced `0 -> 8 -> 22` before both mixed cycles
+  completed with zero TCP sender/receiver intervals.
+- A monotonic counter also needs a stable tail. Remaining exactly `22` for the
+  next 28 minutes showed that inbound stream pressure created bounded
+  opportunities rather than a self-sustaining ACK loop.
+- Pair the application verdict with exact physical sockets. Zero capture
+  drops plus reverse supply gaps of only `251ms/343ms` and zero windows of
+  `250ms/342ms` distinguished real continuity from a permissive aggregate
+  SLI; the prior failure had a paired `1,158ms` supply pause.
+- A rotating capture's configured lifetime is not its evidence lifetime under
+  high packet volume. Inspect every file's first/last packet timestamps. This
+  ring overwrote baseline/direct but retained the full qualification window,
+  which was the required transaction.
+- Timed-transfer `Stopped(0)` lines remain review evidence, not automatic
+  failure. Classify them from phase completion plus exact D16 terminal
+  ownership; both close tails had queued/leased/reserved `0/0/0B`.
+- A passed bounded qualification can reopen the already-specified formal
+  gate, but it must remain `PASS_NON_ACCEPTANCE`; never rewrite it as a formal
+  M2 result.
+- Result:
+  `docs/tech/2026-08-10-knife15-m2-reverse-gap-ack-reinforcement-macos-qualification-results.md`.
+
 ## 2026-08-10 - ACK recovery authority needs stream pressure plus exact receive state
 
 - Split QUIC packet-number ranges do not prove a live ordered STREAM gap.

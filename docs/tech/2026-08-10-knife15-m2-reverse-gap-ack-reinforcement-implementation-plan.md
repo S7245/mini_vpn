@@ -5,6 +5,9 @@ Date: 2026-08-10
 Architecture:
 `docs/tech/2026-08-10-knife15-m2-reverse-gap-ack-reinforcement-architecture-spec.md`.
 
+Qualification result:
+`docs/tech/2026-08-10-knife15-m2-reverse-gap-ack-reinforcement-macos-qualification-results.md`.
+
 ## Task 1 — Preserve and classify exact paired evidence
 
 - [x] Verify Mac artifact SHA-256 and exact source.
@@ -75,7 +78,11 @@ Architecture:
   position.
 - [x] Commit the coherent implementation/evidence stage and push as
   `300fb16`.
-- [ ] Start one fresh bounded `.33` observer only when the Mac is ready.
-- [ ] Take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
+- [x] Start one fresh bounded `.33` observer only when the Mac is ready.
+- [x] Take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
   start -> smoke -> m2-qualification -> status -> stop`.
-- [ ] Do not run formal M2 or repeat/tune unchanged.
+- [x] Stop, bundle, transfer, hash, and pair the exact Exit observer.
+- [x] Confirm nonzero reinforcement, zero complete TCP intervals, bounded
+  counter behavior, and complete lifecycle cleanup.
+- [x] Do not repeat/tune qualification; reopen formal M2 only on the exact
+  reviewed source and frozen workload.

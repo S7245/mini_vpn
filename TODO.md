@@ -4,7 +4,43 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-10 — exact reverse-gap ACK reinforcement ready for qualification)
+#### Latest decision (2026-08-10 — paired qualification passed; formal M2 reopened)
+
+Exact-source `c6ffa3a` artifact
+`/tmp/mini_vpn_knife15_macos_20260810_101221.tar.gz` (SHA-256
+`6121b8b8...`) passed baseline `12.791/44.901 Mbit/s`, bounded direct at
+`6.393 Mbit/s` with no zero interval, smoke, every preflight, two exact mixed
+cycles/eight phases, two DNS/real-client checks, and cleanup. All six TCP
+results had zero sender/receiver intervals; maximum TCP gap was `5,767,168B`
+and maximum UDP loss was `1.830894%`. The result correctly remained
+`PASS_NON_ACCEPTANCE`; formal M2 was not run.
+
+Conn1's exact `gap_ack_reinforcements` counter advanced `0 -> 8 -> 22` under
+smoke pressure and then stayed `22` through both cycles. Paired Exit SHA-256
+`03d51370...` captured `2,971,792` packets with zero kernel drops. The two
+qualification reverse sockets had maximum supply gaps of only
+`251.174/342.575ms`, no gap at or above `500ms`, and longest zero receive
+windows of `249.901/341.525ms`. This satisfies reachability, effectiveness,
+and boundedness without tuning.
+
+Endpoint high/final was `61,440B / 61,414/0/0B`; interface, socket, process,
+DNS, route/TUN ownership, secret scan, and cleanup gates passed. Two
+`Stopped(0)` writes were zero-owned timed-transfer close tails, not
+active-transfer failures. Result:
+`docs/tech/2026-08-10-knife15-m2-reverse-gap-ack-reinforcement-macos-qualification-results.md`.
+
+Next:
+
+1. do not repeat or tune `m2-qualification`;
+2. keep the reviewed `c6ffa3a` production-code tree, implementation `300fb16`,
+   its docs-only pushed descendant, and every frozen workload/config value;
+3. when the HK Mac can remain uninterrupted for about 25 hours, take one fresh
+   `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke -> m2
+   -> status -> stop`;
+4. preserve `status/snapshot/stop` after failure and upload the bundle;
+5. M3 remains blocked until formal M2 and cleanup pass.
+
+#### Previous decision (2026-08-10 — exact reverse-gap ACK reinforcement ready for qualification)
 
 Exact-source `673d13d` artifact
 `/tmp/mini_vpn_knife15_macos_20260810_075621.tar.gz` (SHA-256
