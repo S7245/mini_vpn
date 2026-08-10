@@ -348,6 +348,63 @@ fn successor_service_turn_grows_cwnd_across_a_realistic_rtt() {
 }
 
 #[test]
+fn fresh_successor_services_first_receiver_interval_with_bounded_ordinary_loss() {
+    const FIRST_RECEIVER_INTERVAL: usize = 128 * 1024;
+
+    let mut pair = Pair::default_with_deterministic_pns();
+    pair.latency = Duration::from_millis(82);
+    let (client_ch, server_ch) = pair.connect();
+    pair.client_conn_mut(client_ch)
+        .start_successor_service_turn()
+        .unwrap();
+    pair.drive();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::SuccessorServiceTurn {
+            outcome: SuccessorServiceTurnOutcome::Succeeded(_),
+        })
+    );
+
+    let started_at = pair.time;
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.client_send(client_ch, stream)
+            .write(&vec![0x5a; FIRST_RECEIVER_INTERVAL]),
+        Ok(FIRST_RECEIVER_INTERVAL)
+    );
+    pair.client_send(client_ch, stream).finish().unwrap();
+    pair.drive_client();
+    assert!(
+        pair.server.inbound.len() > 1,
+        "fresh qualified service must expose an ordinary multi-packet business flight"
+    );
+    pair.server.inbound.pop_front();
+    pair.drive();
+
+    assert!(
+        pair.time.duration_since(started_at) <= Duration::from_secs(1),
+        "one bounded ordinary packet loss must not erase the fresh successor's first-interval reachability: elapsed={:?}",
+        pair.time.duration_since(started_at)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Stream(StreamEvent::Opened { dir: Dir::Uni }))
+    );
+    assert_matches!(
+        pair.server_streams(server_ch).accept(Dir::Uni),
+        Some(accepted) if accepted == stream
+    );
+    let mut received = 0;
+    let mut recv = pair.server_recv(server_ch, stream);
+    let mut chunks = recv.read(false).unwrap();
+    while let Some(chunk) = chunks.next(usize::MAX).unwrap() {
+        received += chunk.bytes.len();
+    }
+    let _ = chunks.finalize();
+    assert_eq!(received, FIRST_RECEIVER_INTERVAL);
+}
+
+#[test]
 fn successor_service_turn_is_terminal_when_one_tagged_packet_is_lost() {
     let mut pair = Pair::default_with_deterministic_pns();
     let (client_ch, _) = pair.connect();

@@ -40,6 +40,21 @@ adds no timer or configured byte threshold, and is not a general bandwidth
 promise.
 _Avoid_: warm-up traffic (the proof is transport-native and carries no business payload), health check (it proves one exact delivered flight only), retry (loss is terminal), pool expansion (no additional eligible generation is retained)
 
+**TUIC TCP successor service certificate**:
+The immutable transport-native service proof owned by one installed auxiliary
+successor generation. It records the exact stable identity, logical pool
+generation, ACK-owned path generation, and positive post-turn congestion
+window floor established by that successor's pre-install service turn. It is
+Ready for new-open admission only while identity/path still match and current
+cwnd remains at or above its own proved floor; otherwise it is Stale and the
+existing bounded fresh-generation replacement seam owns recovery. Initial
+pool generations are Unknown rather than degraded. The certificate is not a
+configured threshold, congestion-event blacklist, bandwidth promise, or
+permission to mutate existing streams.
+_Avoid_: health score (it is one exact historical proof), cwnd tuning (the
+floor is observed, not configured), in-place warm-up (replacement is the safe
+seam), connection blacklist (a fresh generation can prove new service)
+
 **TUIC TCP replacement-failure business fallback**:
 A bounded new-open admission rule used only after one auxiliary generation
 replacement fails before successor installation. The failed slot becomes

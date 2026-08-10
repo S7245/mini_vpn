@@ -45,9 +45,10 @@ mini_vpn changes are intentionally limited to:
 - `src/tests/mod.rs` and `src/tests/util.rs`: endpoint isolation, default-off,
   real GSO accounting, socket-outcome behavior, successor-turn ACK/loss,
   preexisting authentication/PLPMTUD separation, and realistic-RTT
-  service-turn, Endpoint-blocked, and writer-Blocked business
-  congestion-window ownership tests.
+  service-turn, first-128KiB bounded-ordinary-loss reachability,
+  Endpoint-blocked, and writer-Blocked business congestion-window ownership
+  tests.
 
 No quinn-udp, congestion-controller algorithm, MTU-discovery, crypto, loss
 timer, or stream flow-control implementation is replaced. The modified suite
-passes `325/325` unit tests and `3/3` doc tests.
+passes `326/326` unit tests and `3/3` doc tests.

@@ -894,6 +894,56 @@ impl TcpPoolTransportIdentity {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpPoolSuccessorServiceCertificate {
+    identity: TcpPoolTransportIdentity,
+    path_generation: u64,
+    proved_cwnd_floor: u64,
+}
+
+impl TcpPoolSuccessorServiceCertificate {
+    fn new(
+        identity: TcpPoolTransportIdentity,
+        path_generation: u64,
+        proved_cwnd_floor: u64,
+    ) -> Option<Self> {
+        (proved_cwnd_floor != 0).then_some(Self {
+            identity,
+            path_generation,
+            proved_cwnd_floor,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum TcpPoolSuccessorServiceReadiness {
+    #[default]
+    Unknown,
+    Ready,
+    StaleIdentity,
+    StalePath,
+    StaleCwnd,
+}
+
+impl TcpPoolSuccessorServiceReadiness {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Ready => "ready",
+            Self::StaleIdentity => "stale_identity",
+            Self::StalePath => "stale_path",
+            Self::StaleCwnd => "stale_cwnd",
+        }
+    }
+
+    fn is_stale(self) -> bool {
+        matches!(
+            self,
+            Self::StaleIdentity | Self::StalePath | Self::StaleCwnd
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum TcpPoolPathObservation {
     #[default]
@@ -902,10 +952,13 @@ enum TcpPoolPathObservation {
         identity: TcpPoolTransportIdentity,
         path_service: TcpPoolPathService,
         black_holes_detected: u64,
+        path_generation: Option<u64>,
+        successor_service_certificate: Option<TcpPoolSuccessorServiceCertificate>,
     },
 }
 
 impl TcpPoolPathObservation {
+    #[cfg(test)]
     fn known(
         identity: TcpPoolTransportIdentity,
         cwnd: u64,
@@ -916,6 +969,31 @@ impl TcpPoolPathObservation {
             identity,
             path_service: TcpPoolPathService::known(cwnd, rtt),
             black_holes_detected,
+            path_generation: None,
+            successor_service_certificate: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn known_with_successor_service_certificate(
+        identity: TcpPoolTransportIdentity,
+        cwnd: u64,
+        rtt: Duration,
+        black_holes_detected: u64,
+        path_generation: u64,
+        proved_path_generation: u64,
+        proved_cwnd_floor: u64,
+    ) -> Self {
+        Self::Known {
+            identity,
+            path_service: TcpPoolPathService::known(cwnd, rtt),
+            black_holes_detected,
+            path_generation: Some(path_generation),
+            successor_service_certificate: TcpPoolSuccessorServiceCertificate::new(
+                identity,
+                proved_path_generation,
+                proved_cwnd_floor,
+            ),
         }
     }
 
@@ -924,6 +1002,55 @@ impl TcpPoolPathObservation {
             Self::Unknown => TcpPoolPathService::Unknown,
             Self::Known { path_service, .. } => path_service,
         }
+    }
+
+    fn successor_service_readiness(self) -> TcpPoolSuccessorServiceReadiness {
+        let Self::Known {
+            identity,
+            path_service,
+            path_generation,
+            successor_service_certificate: Some(certificate),
+            ..
+        } = self
+        else {
+            return TcpPoolSuccessorServiceReadiness::Unknown;
+        };
+        if certificate.identity != identity {
+            return TcpPoolSuccessorServiceReadiness::StaleIdentity;
+        }
+        let Some(path_generation) = path_generation else {
+            return TcpPoolSuccessorServiceReadiness::Unknown;
+        };
+        if certificate.path_generation != path_generation {
+            return TcpPoolSuccessorServiceReadiness::StalePath;
+        }
+        match path_service {
+            TcpPoolPathService::Known { cwnd, .. } if cwnd < certificate.proved_cwnd_floor => {
+                TcpPoolSuccessorServiceReadiness::StaleCwnd
+            }
+            TcpPoolPathService::Known { .. } => TcpPoolSuccessorServiceReadiness::Ready,
+            TcpPoolPathService::Unknown => TcpPoolSuccessorServiceReadiness::Unknown,
+        }
+    }
+
+    fn successor_service_evidence(self) -> (Option<u64>, Option<u64>, Option<u64>) {
+        let Self::Known {
+            path_generation,
+            successor_service_certificate,
+            ..
+        } = self
+        else {
+            return (None, None, None);
+        };
+        let (proved_path_generation, proved_cwnd_floor) = successor_service_certificate
+            .map(|certificate| {
+                (
+                    Some(certificate.path_generation),
+                    Some(certificate.proved_cwnd_floor),
+                )
+            })
+            .unwrap_or((None, None));
+        (path_generation, proved_path_generation, proved_cwnd_floor)
     }
 }
 
@@ -977,6 +1104,10 @@ struct TcpPoolAdmissionCandidate {
     qualification: TcpPoolForwardQualification,
     qualification_anchor: Option<u64>,
     black_holes_current: Option<u64>,
+    successor_service_readiness: TcpPoolSuccessorServiceReadiness,
+    successor_service_current_path_generation: Option<u64>,
+    successor_service_proved_path_generation: Option<u64>,
+    successor_service_proved_cwnd_floor: Option<u64>,
     admitted: bool,
 }
 
@@ -1149,6 +1280,12 @@ impl TcpPoolAdmission {
                 }
                 let observation = observations.get(index).copied().unwrap_or_default();
                 let path_service = observation.path_service();
+                let successor_service_readiness = observation.successor_service_readiness();
+                let (
+                    successor_service_current_path_generation,
+                    successor_service_proved_path_generation,
+                    successor_service_proved_cwnd_floor,
+                ) = observation.successor_service_evidence();
                 let qualification = self.qualification_for(index, active_before, observation);
                 if qualified_only
                     && qualification.qualification != TcpPoolForwardQualification::Qualified
@@ -1167,6 +1304,10 @@ impl TcpPoolAdmission {
                     qualification: qualification.qualification,
                     qualification_anchor: qualification.anchor,
                     black_holes_current: qualification.current,
+                    successor_service_readiness,
+                    successor_service_current_path_generation,
+                    successor_service_proved_path_generation,
+                    successor_service_proved_cwnd_floor,
                     admitted: true,
                 });
             }
@@ -1197,6 +1338,18 @@ impl TcpPoolAdmission {
                         candidate.qualification != TcpPoolForwardQualification::Degraded;
                 }
             }
+            let service_readiness_override = candidates.iter().any(|candidate| {
+                candidate.admitted && candidate.successor_service_readiness.is_stale()
+            }) && candidates.iter().any(|candidate| {
+                candidate.admitted && !candidate.successor_service_readiness.is_stale()
+            });
+            if service_readiness_override {
+                for candidate in &mut candidates {
+                    if candidate.successor_service_readiness.is_stale() {
+                        candidate.admitted = false;
+                    }
+                }
+            }
             let service_normalized_ordering = !all_degraded_fallback
                 && candidates
                     .iter()
@@ -1205,22 +1358,29 @@ impl TcpPoolAdmission {
                         candidate.active_before != 0 && candidate.path_service.is_known()
                     });
 
-            let replacement = qualification_override.then(|| {
-                candidates
-                    .iter()
-                    .copied()
-                    .filter(|candidate| {
-                        candidate.index != 0
-                            && replacement_allowed
-                                .get(candidate.index)
-                                .copied()
-                                .unwrap_or(false)
-                            && candidate.active_before != 0
-                            && candidate.qualification == TcpPoolForwardQualification::Degraded
-                            && !candidate.admitted
-                    })
-                    .min_by_key(|candidate| (candidate.active_before, candidate.index))
-            });
+            let replacement = (!qualified_only
+                && (qualification_override || service_readiness_override))
+                .then(|| {
+                    candidates
+                        .iter()
+                        .copied()
+                        .filter(|candidate| {
+                            candidate.index != 0
+                                && replacement_allowed
+                                    .get(candidate.index)
+                                    .copied()
+                                    .unwrap_or(false)
+                                && ((candidate.active_before != 0
+                                    && candidate.qualification
+                                        == TcpPoolForwardQualification::Degraded)
+                                    || candidate.successor_service_readiness.is_stale())
+                                && candidate.identity.is_some()
+                                && candidate.qualification_anchor.is_some()
+                                && candidate.black_holes_current.is_some()
+                                && !candidate.admitted
+                        })
+                        .min_by_key(|candidate| (candidate.active_before, candidate.index))
+                });
             if let Some(Some(replacement)) = replacement {
                 let Some(identity) = replacement.identity else {
                     continue;
@@ -1431,10 +1591,17 @@ impl TcpPoolAdmission {
         successor_activity: Arc<TcpPoolGenerationActivity>,
         successor_observation: TcpPoolPathObservation,
     ) -> Result<TcpPoolSlotReservation, TcpPoolReservationError> {
+        let successor_service_readiness = successor_observation.successor_service_readiness();
+        let (
+            successor_service_current_path_generation,
+            successor_service_proved_path_generation,
+            successor_service_proved_cwnd_floor,
+        ) = successor_observation.successor_service_evidence();
         let TcpPoolPathObservation::Known {
             identity,
             path_service,
             black_holes_detected,
+            ..
         } = successor_observation
         else {
             return Err(TcpPoolReservationError::Busy);
@@ -1465,6 +1632,10 @@ impl TcpPoolAdmission {
                 qualification: TcpPoolForwardQualification::Qualified,
                 qualification_anchor: Some(black_holes_detected),
                 black_holes_current: Some(black_holes_detected),
+                successor_service_readiness,
+                successor_service_current_path_generation,
+                successor_service_proved_path_generation,
+                successor_service_proved_cwnd_floor,
                 admitted: true,
             };
         }
@@ -3864,19 +4035,23 @@ fn format_tuic_tcp_pool_selection_line(diag: TuicTcpPoolSelectionDiag<'_>) -> St
                 }
             };
             format!(
-                "conn{}:id={identity},active={},qualification={},anchor={},current={},admitted={},cwnd={cwnd},rtt_us={rtt_us}",
+                "conn{}:id={identity},active={},qualification={},anchor={},current={},service_certificate={},service_current_path_generation={},service_proved_path_generation={},service_proved_cwnd_floor={},admitted={},cwnd={cwnd},rtt_us={rtt_us}",
                 candidate.index,
                 candidate.active_before,
                 candidate.qualification.as_str(),
                 optional_counter(candidate.qualification_anchor),
                 optional_counter(candidate.black_holes_current),
+                candidate.successor_service_readiness.as_str(),
+                optional_counter(candidate.successor_service_current_path_generation),
+                optional_counter(candidate.successor_service_proved_path_generation),
+                optional_counter(candidate.successor_service_proved_cwnd_floor),
                 candidate.admitted,
             )
         })
         .collect::<Vec<_>>()
         .join(";");
     format!(
-        "🔎 tuic-tcp-pool-selection conn={conn_index} id={stable_id} policy=busy_epoch_forward_qualification_then_service_normalized_load_then_least_active_then_path_service active_before={active_before} path_cwnd={path_cwnd} path_rtt_us={path_rtt_us} service_normalized_ordering={service_normalized_ordering} path_service_tiebreak={path_service_tiebreak} qualification={} black_hole_anchor={} black_holes_current={} qualification_override={qualification_override} all_degraded_fallback={all_degraded_fallback} candidates=[{candidates}] generation={generation} replacement_installed={replacement_installed} last_success_age_secs={last_success_age_secs} probe_result={probe_result} reconnect_reason={}",
+        "🔎 tuic-tcp-pool-selection conn={conn_index} id={stable_id} policy=busy_epoch_forward_qualification_then_successor_service_certificate_then_service_normalized_load_then_least_active_then_path_service active_before={active_before} path_cwnd={path_cwnd} path_rtt_us={path_rtt_us} service_normalized_ordering={service_normalized_ordering} path_service_tiebreak={path_service_tiebreak} qualification={} black_hole_anchor={} black_holes_current={} qualification_override={qualification_override} all_degraded_fallback={all_degraded_fallback} candidates=[{candidates}] generation={generation} replacement_installed={replacement_installed} last_success_age_secs={last_success_age_secs} probe_result={probe_result} reconnect_reason={}",
         qualification.as_str(),
         optional_counter(qualification_anchor),
         optional_counter(black_holes_current),
@@ -5809,6 +5984,7 @@ impl TcpPoolTransport for u64 {
 
 struct TcpPoolGeneration<T> {
     transport: T,
+    successor_service_certificate: Option<TcpPoolSuccessorServiceCertificate>,
     activity: Arc<TcpPoolGenerationActivity>,
     write_pressure: Arc<TcpWritePressure>,
     read_pressure: Arc<TcpOrderedReadPressure>,
@@ -5820,6 +5996,7 @@ impl<T: TcpPoolTransport> TcpPoolGeneration<T> {
     fn new(transport: T, generation: u64, auth_attempts: u64, clock: Instant) -> Self {
         Self {
             transport,
+            successor_service_certificate: None,
             activity: Arc::new(TcpPoolGenerationActivity::new()),
             write_pressure: Arc::new(TcpWritePressure::new(clock)),
             read_pressure: Arc::new(TcpOrderedReadPressure::new()),
@@ -5828,11 +6005,36 @@ impl<T: TcpPoolTransport> TcpPoolGeneration<T> {
         }
     }
 
+    fn new_successor(
+        transport: T,
+        generation: u64,
+        auth_attempts: u64,
+        clock: Instant,
+        path_generation: u64,
+        proved_cwnd_floor: u64,
+    ) -> Option<Self> {
+        let mut successor = Self::new(transport, generation, auth_attempts, clock);
+        successor.successor_service_certificate = TcpPoolSuccessorServiceCertificate::new(
+            successor.identity(),
+            path_generation,
+            proved_cwnd_floor,
+        );
+        successor
+            .successor_service_certificate
+            .is_some()
+            .then_some(successor)
+    }
+
     fn identity(&self) -> TcpPoolTransportIdentity {
         TcpPoolTransportIdentity::new(
             self.transport.tcp_pool_stable_id(),
             self.open_state.generation(),
         )
+    }
+
+    fn note_reconnect_success(&mut self) {
+        self.successor_service_certificate = None;
+        self.open_state.note_reconnect_success();
     }
 }
 
@@ -6444,7 +6646,7 @@ impl TuicUpstream {
             let reason = reconnect_reason.unwrap_or("transport_closed");
             self.reconnect_locked(index, &mut current.transport, reason)
                 .await?;
-            current.open_state.note_reconnect_success();
+            current.note_reconnect_success();
         }
         Ok(current.transport.clone())
     }
@@ -6497,12 +6699,15 @@ impl TuicUpstream {
                     return TcpPoolPathObservation::Unknown;
                 }
                 let path = conn.stats().path;
-                TcpPoolPathObservation::known(
-                    current.identity(),
-                    path.cwnd,
-                    path.rtt,
-                    path.black_holes_detected,
-                )
+                TcpPoolPathObservation::Known {
+                    identity: current.identity(),
+                    path_service: TcpPoolPathService::known(path.cwnd, path.rtt),
+                    black_holes_detected: path.black_holes_detected,
+                    path_generation: conn
+                        .endpoint_pacing_snapshot()
+                        .map(|snapshot| snapshot.path_generation),
+                    successor_service_certificate: current.successor_service_certificate,
+                }
             })
             .collect()
     }
@@ -6543,10 +6748,11 @@ impl TuicUpstream {
                         );
                     }
                     if self.tcp_pool_draining_predecessor.load(Ordering::Acquire)
-                        && reservation.qualification_override
                         && reservation.candidates.iter().any(|candidate| {
                             candidate.index != 0
-                                && candidate.qualification == TcpPoolForwardQualification::Degraded
+                                && (candidate.qualification
+                                    == TcpPoolForwardQualification::Degraded
+                                    || candidate.successor_service_readiness.is_stale())
                                 && !candidate.admitted
                         })
                     {
@@ -6624,12 +6830,43 @@ impl TuicUpstream {
                     "current generation activity unavailable",
                 )
             })?;
+        let replacement_candidate = replacement
+            .candidates
+            .iter()
+            .find(|candidate| candidate.index == replacement.index);
+        let successor_service_readiness = replacement_candidate
+            .map(|candidate| candidate.successor_service_readiness)
+            .unwrap_or_default();
+        let replacement_reason = if successor_service_readiness.is_stale() {
+            "successor_service_stale"
+        } else {
+            "forward_qualification_degraded"
+        };
+        let optional_counter = |value: Option<u64>| {
+            value
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        };
         println!(
-            "🔄 tuic-tcp-pool-generation-replacement-start slot={} predecessor_id={} generation={} active={} black_hole_anchor={} black_holes_current={}",
+            "🔄 tuic-tcp-pool-generation-replacement-start slot={} predecessor_id={} generation={} active={} reason={} successor_service_certificate={} service_current_path_generation={} service_proved_path_generation={} service_proved_cwnd_floor={} black_hole_anchor={} black_holes_current={}",
             replacement.index,
             replacement.identity.stable_id,
             replacement.identity.generation,
             replacement.active_before,
+            replacement_reason,
+            successor_service_readiness.as_str(),
+            optional_counter(
+                replacement_candidate
+                    .and_then(|candidate| candidate.successor_service_current_path_generation)
+            ),
+            optional_counter(
+                replacement_candidate
+                    .and_then(|candidate| candidate.successor_service_proved_path_generation)
+            ),
+            optional_counter(
+                replacement_candidate
+                    .and_then(|candidate| candidate.successor_service_proved_cwnd_floor)
+            ),
             replacement.qualification_anchor,
             replacement.black_holes_current,
         );
@@ -6701,20 +6938,29 @@ impl TuicUpstream {
                         "generation counter saturated",
                     )
                 })?;
-        let successor = TcpPoolGeneration::new(
+        let successor_path = successor_conn.stats().path;
+        let successor = TcpPoolGeneration::new_successor(
             successor_conn.clone(),
             successor_generation,
             auth_attempts as u64,
             self.clock,
-        );
-        let successor_activity = successor.activity.clone();
-        let successor_path = successor_conn.stats().path;
-        let successor_observation = TcpPoolPathObservation::known(
-            successor.identity(),
+            service_turn.path_generation,
             successor_path.cwnd,
-            successor_path.rtt,
-            successor_path.black_holes_detected,
-        );
+        )
+        .ok_or_else(|| {
+            io_err(
+                "tuic tcp pool generation replacement",
+                "successful successor service turn produced a zero cwnd certificate",
+            )
+        })?;
+        let successor_activity = successor.activity.clone();
+        let successor_observation = TcpPoolPathObservation::Known {
+            identity: successor.identity(),
+            path_service: TcpPoolPathService::known(successor_path.cwnd, successor_path.rtt),
+            black_holes_detected: successor_path.black_holes_detected,
+            path_generation: Some(service_turn.path_generation),
+            successor_service_certificate: successor.successor_service_certificate,
+        };
         let install = slot
             .install_successor_with(
                 replacement.identity,
@@ -6788,8 +7034,10 @@ impl TuicUpstream {
 
     /// TCP 专用连接选择。Admission samples current Quinn path and PLPMTUD evidence without waiting,
     /// then atomically reserves an eligible slot. A busy slot that added a black-hole detection in
-    /// its current ownership epoch is isolated while a non-degraded alternative exists. When all
-    /// admitted candidates are busy with known service, ownership is ordered by exact
+    /// its current ownership epoch is isolated while a non-degraded alternative exists. A
+    /// certified auxiliary whose exact identity/path changed or whose current cwnd fell below its
+    /// own post-turn floor uses the same bounded replacement seam while a non-stale lane exists.
+    /// When all admitted candidates are busy with known service, ownership is ordered by exact
     /// `active * RTT / cwnd`; idle, unknown, and all-degraded fallback retain least-active ordering
     /// and equal nonzero `cwnd / RTT` tie-breaking. An idle pool keeps stable-index ordering so a
     /// following opener observes the first reservation.
@@ -6864,7 +7112,7 @@ impl TuicUpstream {
         if let Some(reason) = reconnect_reason {
             self.reconnect_locked(index, &mut current.transport, reason)
                 .await?;
-            open_state.note_reconnect_success();
+            current.note_reconnect_success();
             if index != 0 {
                 let ready = probe_tcp_pool_connection(
                     &current.transport,
@@ -7916,6 +8164,8 @@ mod tests {
                     identity: TcpPoolTransportIdentity::new(index, 1),
                     path_service,
                     black_holes_detected: 0,
+                    path_generation: None,
+                    successor_service_certificate: None,
                 },
             })
             .collect()
@@ -10067,6 +10317,10 @@ mod tests {
                 qualification: TcpPoolForwardQualification::Qualified,
                 qualification_anchor: Some(0),
                 black_holes_current: Some(0),
+                successor_service_readiness: TcpPoolSuccessorServiceReadiness::Ready,
+                successor_service_current_path_generation: Some(5),
+                successor_service_proved_path_generation: Some(5),
+                successor_service_proved_cwnd_floor: Some(23_000),
                 admitted: true,
             }],
             generation: 7,
@@ -10080,7 +10334,7 @@ mod tests {
         assert!(line.contains("conn=1 id=42"), "{line}");
         assert!(
             line.contains(
-                "policy=busy_epoch_forward_qualification_then_service_normalized_load_then_least_active_then_path_service"
+                "policy=busy_epoch_forward_qualification_then_successor_service_certificate_then_service_normalized_load_then_least_active_then_path_service"
             ),
             "{line}"
         );
@@ -10095,7 +10349,7 @@ mod tests {
         assert!(line.contains("qualification_override=true"), "{line}");
         assert!(line.contains("all_degraded_fallback=false"), "{line}");
         assert!(
-            line.contains("candidates=[conn1:id=42@7,active=62,qualification=qualified,anchor=0,current=0,admitted=true,cwnd=23842,rtt_us=163000]"),
+            line.contains("candidates=[conn1:id=42@7,active=62,qualification=qualified,anchor=0,current=0,service_certificate=ready,service_current_path_generation=5,service_proved_path_generation=5,service_proved_cwnd_floor=23000,admitted=true,cwnd=23842,rtt_us=163000]"),
             "{line}"
         );
         assert!(line.contains("generation=7"), "{line}");
@@ -10938,6 +11192,42 @@ mod tests {
         assert_eq!(pool_active.load(Ordering::Acquire), 0);
     }
 
+    #[test]
+    fn tcp_pool_successor_generation_owns_its_exact_service_certificate() {
+        let clock = Instant::now();
+        let successor = TcpPoolGeneration::new_successor(22_u64, 2, 1, clock, 7, 24_800)
+            .expect("a positive post-turn cwnd must create one exact certificate");
+
+        assert_eq!(
+            successor.successor_service_certificate,
+            TcpPoolSuccessorServiceCertificate::new(
+                TcpPoolTransportIdentity::new(22, 2),
+                7,
+                24_800,
+            )
+        );
+        assert!(
+            TcpPoolGeneration::new_successor(23_u64, 3, 1, clock, 8, 0).is_none(),
+            "zero service cannot manufacture a certificate"
+        );
+    }
+
+    #[test]
+    fn tcp_pool_reconnected_generation_cannot_reuse_a_successor_certificate() {
+        let clock = Instant::now();
+        let mut successor = TcpPoolGeneration::new_successor(22_u64, 2, 1, clock, 7, 24_800)
+            .expect("the replay starts with an installed successor proof");
+
+        successor.note_reconnect_success();
+
+        assert_eq!(
+            successor.identity(),
+            TcpPoolTransportIdentity::new(22, 3),
+            "reconnect must advance the logical identity"
+        );
+        assert_eq!(successor.successor_service_certificate, None);
+    }
+
     #[tokio::test]
     async fn tcp_pool_generation_slot_installs_successor_without_resetting_predecessor() {
         let clock = Instant::now();
@@ -11091,14 +11381,19 @@ mod tests {
             panic!("the replay must prepare an auxiliary successor");
         };
         let predecessor_activity = activities[1].clone();
-        let successor = TcpPoolGeneration::new(22_u64, 2, 1, clock);
+        let successor = TcpPoolGeneration::new_successor(22_u64, 2, 1, clock, 5, 24_800)
+            .expect("the installed successor must own its successful service turn");
         let successor_activity = successor.activity.clone();
-        let successor_observation = TcpPoolPathObservation::known(
-            successor.identity(),
-            12_000,
-            Duration::from_millis(175),
-            0,
-        );
+        let successor_observation =
+            TcpPoolPathObservation::known_with_successor_service_certificate(
+                successor.identity(),
+                24_800,
+                Duration::from_millis(175),
+                0,
+                5,
+                5,
+                24_800,
+            );
         slots[1]
             .install_successor_with(
                 TcpPoolTransportIdentity::new(11, 1),
@@ -11121,6 +11416,28 @@ mod tests {
             .unwrap();
 
         assert_eq!((selected.index, selected.active_before), (1, 0));
+        assert_eq!(
+            selected
+                .candidates
+                .iter()
+                .find(|candidate| candidate.index == 1)
+                .expect("the installed successor must replace its predecessor candidate")
+                .successor_service_readiness,
+            TcpPoolSuccessorServiceReadiness::Ready
+        );
+        assert_eq!(
+            slots[1]
+                .state
+                .lock()
+                .await
+                .current
+                .successor_service_certificate,
+            TcpPoolSuccessorServiceCertificate::new(
+                TcpPoolTransportIdentity::new(22, 2),
+                5,
+                24_800,
+            )
+        );
         assert_eq!(predecessor_activity.active(), 6);
         assert_eq!(successor_activity.active(), 1);
         assert_eq!(admission.active_total(), 21);
@@ -11226,6 +11543,298 @@ mod tests {
     }
 
     #[test]
+    fn tcp_pool_stale_successor_service_certificate_requests_auxiliary_replacement() {
+        let admission = TcpPoolAdmission::new(2);
+        admission.set_active_for_test(0, 2);
+        admission.set_active_for_test(1, 0);
+        let observations = [
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(10, 1),
+                12_000,
+                Duration::from_micros(172_618),
+                0,
+            ),
+            TcpPoolPathObservation::known_with_successor_service_certificate(
+                TcpPoolTransportIdentity::new(11, 2),
+                17_360,
+                Duration::from_micros(172_869),
+                0,
+                0,
+                0,
+                24_800,
+            ),
+        ];
+
+        let decision = admission
+            .try_decide(&observations, &[false, true])
+            .expect("the exact stale successor must retain bounded replacement authority");
+
+        let TcpPoolAdmissionDecision::ReplaceAuxiliary(replacement) = decision else {
+            panic!("a 17,360B current window must not borrow a 24,800B successor proof");
+        };
+        assert_eq!(replacement.index, 1);
+    }
+
+    #[test]
+    fn tcp_pool_successor_at_its_proved_floor_does_not_churn_generation() {
+        let admission = TcpPoolAdmission::new(2);
+        admission.set_active_for_test(0, 2);
+        admission.set_active_for_test(1, 0);
+        let observations = [
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(10, 1),
+                12_000,
+                Duration::from_micros(172_618),
+                0,
+            ),
+            TcpPoolPathObservation::known_with_successor_service_certificate(
+                TcpPoolTransportIdentity::new(11, 2),
+                24_800,
+                Duration::from_micros(172_869),
+                0,
+                0,
+                0,
+                24_800,
+            ),
+        ];
+
+        let decision = admission
+            .try_decide(&observations, &[false, true])
+            .expect("a successor at its own proved floor must remain available");
+
+        let TcpPoolAdmissionDecision::ReserveCurrent(reservation) = decision else {
+            panic!("ordinary congestion history must not replace a currently proved successor");
+        };
+        assert_eq!(reservation.index, 1);
+        assert_eq!(
+            reservation.candidates[1].successor_service_readiness,
+            TcpPoolSuccessorServiceReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn tcp_pool_successor_certificate_cannot_cross_a_path_generation() {
+        let admission = TcpPoolAdmission::new(2);
+        admission.set_active_for_test(0, 2);
+        let observations = [
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(10, 1),
+                12_000,
+                Duration::from_millis(173),
+                0,
+            ),
+            TcpPoolPathObservation::known_with_successor_service_certificate(
+                TcpPoolTransportIdentity::new(11, 2),
+                96_000,
+                Duration::from_millis(173),
+                0,
+                4,
+                3,
+                24_800,
+            ),
+        ];
+
+        let decision = admission
+            .try_decide(&observations, &[false, true])
+            .expect("a migrated successor must retain fresh replacement authority");
+
+        let TcpPoolAdmissionDecision::ReplaceAuxiliary(replacement) = decision else {
+            panic!("a large cwnd cannot transfer an ACK proof across path generations");
+        };
+        assert_eq!(replacement.index, 1);
+        assert_eq!(
+            replacement.candidates[1].successor_service_readiness,
+            TcpPoolSuccessorServiceReadiness::StalePath
+        );
+    }
+
+    #[test]
+    fn tcp_pool_successor_certificate_cannot_cross_a_transport_identity() {
+        let admission = TcpPoolAdmission::new(2);
+        admission.set_active_for_test(0, 2);
+        let observed_identity = TcpPoolTransportIdentity::new(11, 3);
+        let observations = [
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(10, 1),
+                12_000,
+                Duration::from_millis(173),
+                0,
+            ),
+            TcpPoolPathObservation::Known {
+                identity: observed_identity,
+                path_service: TcpPoolPathService::known(96_000, Duration::from_millis(173)),
+                black_holes_detected: 0,
+                path_generation: Some(4),
+                successor_service_certificate: TcpPoolSuccessorServiceCertificate::new(
+                    TcpPoolTransportIdentity::new(99, 3),
+                    4,
+                    24_800,
+                ),
+            },
+        ];
+
+        let decision = admission
+            .try_decide(&observations, &[false, true])
+            .expect("a certificate from another transport must retain replacement authority");
+
+        let TcpPoolAdmissionDecision::ReplaceAuxiliary(replacement) = decision else {
+            panic!("transport identity is part of the exact successor proof");
+        };
+        assert_eq!(replacement.index, 1);
+        assert_eq!(
+            replacement.candidates[1].successor_service_readiness,
+            TcpPoolSuccessorServiceReadiness::StaleIdentity
+        );
+    }
+
+    #[test]
+    fn tcp_pool_missing_current_path_generation_preserves_unknown_availability() {
+        let admission = TcpPoolAdmission::new(2);
+        admission.set_active_for_test(0, 2);
+        let identity = TcpPoolTransportIdentity::new(11, 2);
+        let observations = [
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(10, 1),
+                12_000,
+                Duration::from_millis(173),
+                0,
+            ),
+            TcpPoolPathObservation::Known {
+                identity,
+                path_service: TcpPoolPathService::known(17_360, Duration::from_millis(173)),
+                black_holes_detected: 0,
+                path_generation: None,
+                successor_service_certificate: TcpPoolSuccessorServiceCertificate::new(
+                    identity, 0, 24_800,
+                ),
+            },
+        ];
+
+        let decision = admission
+            .try_decide(&observations, &[false, true])
+            .expect("unavailable adapter evidence must not manufacture staleness");
+
+        let TcpPoolAdmissionDecision::ReserveCurrent(reservation) = decision else {
+            panic!("unknown current path generation cannot authorize replacement");
+        };
+        assert_eq!(reservation.index, 1);
+        assert_eq!(
+            reservation.candidates[1].successor_service_readiness,
+            TcpPoolSuccessorServiceReadiness::Unknown
+        );
+    }
+
+    #[test]
+    fn tcp_pool_all_stale_service_candidates_preserve_bounded_fallback() {
+        let admission = TcpPoolAdmission::new(2);
+        admission.set_active_for_test(0, 2);
+        admission.set_active_for_test(1, 1);
+        let observations = [
+            TcpPoolPathObservation::known_with_successor_service_certificate(
+                TcpPoolTransportIdentity::new(10, 2),
+                17_360,
+                Duration::from_millis(173),
+                0,
+                0,
+                0,
+                24_800,
+            ),
+            TcpPoolPathObservation::known_with_successor_service_certificate(
+                TcpPoolTransportIdentity::new(11, 2),
+                18_000,
+                Duration::from_millis(173),
+                0,
+                0,
+                0,
+                24_800,
+            ),
+        ];
+
+        let decision = admission
+            .try_decide(&observations, &[false, true])
+            .expect("all-stale evidence must preserve bounded availability");
+
+        let TcpPoolAdmissionDecision::ReserveCurrent(reservation) = decision else {
+            panic!("all-stale fallback cannot enter replacement churn");
+        };
+        assert_eq!(reservation.index, 1);
+        assert!(reservation.candidates.iter().all(
+            |candidate| candidate.admitted && candidate.successor_service_readiness.is_stale()
+        ));
+    }
+
+    #[test]
+    fn tcp_pool_stale_successor_with_unavailable_replacement_uses_current_fallback() {
+        let admission = TcpPoolAdmission::new(2);
+        admission.set_active_for_test(0, 2);
+        let observations = [
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(10, 1),
+                12_000,
+                Duration::from_millis(173),
+                0,
+            ),
+            TcpPoolPathObservation::known_with_successor_service_certificate(
+                TcpPoolTransportIdentity::new(11, 2),
+                17_360,
+                Duration::from_millis(173),
+                0,
+                0,
+                0,
+                24_800,
+            ),
+        ];
+
+        let decision = admission
+            .try_decide(&observations, &[false, false])
+            .expect("a draining predecessor must not make a current qualified lane unavailable");
+
+        let TcpPoolAdmissionDecision::ReserveCurrent(reservation) = decision else {
+            panic!("unavailable replacement authority must fall back to the admitted primary");
+        };
+        assert_eq!(reservation.index, 0);
+        assert!(!reservation.candidates[1].admitted);
+    }
+
+    #[test]
+    fn tcp_pool_stale_busy_successor_without_exact_epoch_cannot_spin_replacement() {
+        let admission = TcpPoolAdmission::new(2);
+        admission.set_active_for_test(0, 2);
+        admission.set_active_for_test(1, 1);
+        let observations = [
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(10, 1),
+                12_000,
+                Duration::from_millis(173),
+                0,
+            ),
+            TcpPoolPathObservation::known_with_successor_service_certificate(
+                TcpPoolTransportIdentity::new(11, 2),
+                17_360,
+                Duration::from_millis(173),
+                0,
+                0,
+                0,
+                24_800,
+            ),
+        ];
+
+        let decision = admission
+            .try_decide(&observations, &[false, true])
+            .expect("missing exact epoch evidence must retain a bounded current fallback");
+
+        let TcpPoolAdmissionDecision::ReserveCurrent(reservation) = decision else {
+            panic!("replacement cannot start without an exact qualification epoch");
+        };
+        assert_eq!(reservation.index, 0);
+        assert_eq!(
+            reservation.candidates[1].qualification,
+            TcpPoolForwardQualification::Unknown
+        );
+        assert!(!reservation.candidates[1].admitted);
+    }
+
+    #[test]
     fn tcp_pool_failed_auxiliary_replacement_falls_back_without_same_open_retry() {
         let admission = TcpPoolAdmission::new(3);
         let anchored = [
@@ -11308,6 +11917,65 @@ mod tests {
             panic!("replacement suppression must remain attempt-local");
         };
         assert_eq!(replacement.index, 1);
+    }
+
+    #[test]
+    fn tcp_pool_failed_stale_service_replacement_cannot_start_a_second_maintenance_action() {
+        let admission = TcpPoolAdmission::new(3);
+        let observations = [
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(10, 1),
+                12_000,
+                Duration::from_millis(173),
+                0,
+            ),
+            TcpPoolPathObservation::known_with_successor_service_certificate(
+                TcpPoolTransportIdentity::new(11, 2),
+                17_360,
+                Duration::from_millis(173),
+                0,
+                0,
+                0,
+                24_800,
+            ),
+            TcpPoolPathObservation::known_with_successor_service_certificate(
+                TcpPoolTransportIdentity::new(12, 2),
+                18_000,
+                Duration::from_millis(173),
+                0,
+                0,
+                0,
+                24_800,
+            ),
+        ];
+        let primary_epoch = admission
+            .try_reserve(&observations)
+            .expect("the primary must establish its exact qualification epoch");
+        assert_eq!(primary_epoch.index, 0);
+        drop(primary_epoch);
+        admission.set_active_for_test(0, 2);
+
+        let first = admission
+            .try_decide(&observations, &[false, true, true])
+            .expect("one stale auxiliary may request replacement");
+        let TcpPoolAdmissionDecision::ReplaceAuxiliary(first) = first else {
+            panic!("the first stale auxiliary must own the only maintenance attempt");
+        };
+        assert_eq!(first.index, 1);
+        drop(first);
+
+        let fallback = admission
+            .try_decide_excluding(
+                &observations,
+                &[false, true, true],
+                &[false, true, false],
+                true,
+            )
+            .expect("the same open must retain a current-generation fallback");
+        let TcpPoolAdmissionDecision::ReserveCurrent(fallback) = fallback else {
+            panic!("the same open must not replace a second stale auxiliary generation");
+        };
+        assert_eq!(fallback.index, 0);
     }
 
     #[test]
