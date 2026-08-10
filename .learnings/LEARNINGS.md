@@ -1,5 +1,31 @@
 # Learnings
 
+## 2026-08-10 - Proven demand owns accepted bytes until their cumulative ACK
+
+- A successful partial transport write does not prove application demand has
+  ended. When production reports that progress through an awaited supervisory
+  channel, the connection worker can packetize the accepted bytes before the
+  writer's next poll proves Blocked again.
+- Model the proof and its flight separately: a boolean records whether the
+  writer is still waiting for its retry, while an exclusive stream-offset
+  boundary owns the exact prefix accepted from the already-proven demand
+  episode. Clear the boundary only on cumulative ACK or terminal lifecycle.
+- Packet ownership needs both stream identity and offset range. Per-stream
+  identity prevents cross-stream borrowing; an offset boundary also prevents
+  later same-stream bytes from inheriting stale congestion authority.
+- A deterministic test must reproduce production yield points, not just API
+  order. Driving Quinn between successful retry and the next Blocked call was
+  the missing tracer bullet; immediate retry had hidden the defect.
+- Pair a client writer timeline with the exact Exit socket before changing
+  transport policy. Here Exit supply never paused above one WAN RTT and Target
+  ACKed immediately, which selected slow client-to-Exit cwnd growth without
+  reopening D16, TUN, Endpoint, Target, or parameter branches.
+- Validation commands are part of provenance. Require a nonzero exact-test
+  count and use the established feature lane; optional FIPS `--all-features`
+  dependencies are not a product gate when production does not enable them.
+- Result:
+  `docs/tech/2026-08-10-knife15-m2-transport-write-demand-flight-ownership-local-results.md`.
+
 ## 2026-08-08 - Backpressure ownership belongs to emitted business packets
 
 - Writable notification means transport capacity may have returned; it does

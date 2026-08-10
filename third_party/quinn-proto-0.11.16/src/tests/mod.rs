@@ -3670,6 +3670,99 @@ fn write_blocked_business_demand_survives_writable_delivery_until_retry() {
 }
 
 #[test]
+fn write_blocked_business_demand_survives_worker_turn_before_retry() {
+    let _guard = subscribe();
+    const SEND_WINDOW: u64 = 128 * 1024;
+    const TOTAL_BYTES: usize = 2 * 1024 * 1024;
+
+    let mut endpoint_config = EndpointConfig::default();
+    endpoint_config.endpoint_pacing_service(Some(
+        EndpointPacingServiceConfig::new(30_720_000, 61_440, 10_240, 20_480).unwrap(),
+    ));
+
+    let mut server_transport = TransportConfig::default();
+    server_transport
+        .receive_window(VarInt::from_u32(4 * 1024 * 1024))
+        .stream_receive_window(VarInt::from_u32(4 * 1024 * 1024))
+        .mtu_discovery_config(None);
+    let mut server = server_config();
+    server.transport = Arc::new(server_transport);
+
+    let mut client = client_config();
+    Arc::get_mut(&mut client.transport)
+        .unwrap()
+        .send_window(SEND_WINDOW)
+        .mtu_discovery_config(None);
+
+    let mut pair = Pair::new(Arc::new(endpoint_config), server);
+    pair.latency = Duration::from_millis(82);
+    let (client_ch, _) = pair.connect_with(client);
+    pair.client_conn_mut(client_ch)
+        .start_successor_service_turn()
+        .unwrap();
+    pair.drive();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::SuccessorServiceTurn {
+            outcome: SuccessorServiceTurnOutcome::Succeeded(_),
+        })
+    );
+    let business_initial_cwnd = pair.client_conn_mut(client_ch).stats().path.cwnd;
+
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let payload = vec![0x5a; TOTAL_BYTES];
+    let mut written = pair
+        .client_send(client_ch, stream)
+        .write(&payload)
+        .unwrap();
+    assert_eq!(written, SEND_WINDOW as usize);
+    assert_eq!(
+        pair.client_send(client_ch, stream)
+            .write(&payload[written..]),
+        Err(WriteError::Blocked),
+        "the tracer must establish transport-owned application demand"
+    );
+
+    while written < payload.len() {
+        pair.drive();
+        assert_matches!(
+            pair.client_conn_mut(client_ch).poll(),
+            Some(Event::Stream(StreamEvent::Writable { id })) if id == stream
+        );
+
+        let accepted = pair
+            .client_send(client_ch, stream)
+            .write(&payload[written..])
+            .unwrap();
+        assert!(accepted > 0, "a writable retry must admit progress");
+        written += accepted;
+        if written == payload.len() {
+            break;
+        }
+
+        // Production D16 reports each successful write to its owner through an async channel.
+        // During that handoff the Quinn connection worker can packetize the newly accepted bytes
+        // before the writer task retries and reaches Blocked again. Those exact packets still
+        // belong to the already-proven continuous business demand.
+        pair.drive_client();
+        assert_eq!(
+            pair.client_send(client_ch, stream)
+                .write(&payload[written..]),
+            Err(WriteError::Blocked),
+            "the next writer poll re-establishes Blocked only after the worker turn"
+        );
+    }
+    pair.client_send(client_ch, stream).finish().unwrap();
+    pair.drive();
+
+    let final_cwnd = pair.client_conn_mut(client_ch).stats().path.cwnd;
+    assert!(
+        final_cwnd >= business_initial_cwnd + TOTAL_BYTES as u64 - SEND_WINDOW,
+        "packets emitted during the progress-handoff worker turn must retain the blocked writer's congestion ownership: initial={business_initial_cwnd} final={final_cwnd} bytes={TOTAL_BYTES} send_window={SEND_WINDOW}"
+    );
+}
+
+#[test]
 fn transport_write_demand_is_owned_per_blocked_stream() {
     let _guard = subscribe();
     const STREAM_WINDOW: u64 = 128 * 1024;

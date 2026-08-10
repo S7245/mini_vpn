@@ -172,6 +172,11 @@ impl SendBuffer {
         self.offset
     }
 
+    /// First stream offset that has not been cumulatively acknowledged.
+    pub(super) fn first_unacked_offset(&self) -> u64 {
+        self.offset - self.unacked_len as u64
+    }
+
     /// Whether all sent data has been acknowledged
     pub(super) fn is_fully_acked(&self) -> bool {
         self.unacked_len == 0

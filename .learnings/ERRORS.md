@@ -1,5 +1,31 @@
 # Errors
 
+## 2026-08-10 - Write progress cleared ownership before the worker emitted its flight
+
+- Exact-source `b437b93` passed baseline/direct, smoke, every preflight, seven
+  mixed phases, and cleanup, then cycle-2 short forward lost one complete
+  Target receiver interval. The writer accepted `6,296,563B` and waited up to
+  `3,820,792us`; the owning cwnd grew only `12,947 -> 223,724B`.
+- Paired Exit evidence saw about `4.23MB`, no supply gap above `165.430ms`,
+  Target ACK RTT about `1..4ms`, zero sender retransmit growth, and zero
+  capture/kernel drops. Local ownership/conservation was healthy, selecting
+  client-to-Exit congestion ownership instead of a frozen value.
+- The prior repair cleared its per-stream Blocked bit on successful progress.
+  Production then awaited an async Progress signal, allowing Quinn to emit the
+  newly accepted flight before the next write reached Blocked. The old test
+  retried immediately and did not include this worker turn.
+- The production-order RED ended `24,000 -> 1,772,034B`, below the required
+  `1,990,080B`. Retain an exact accepted-offset boundary until cumulative ACK;
+  reset/STOP/terminal/0-RTT paths clear it, while other streams and later
+  same-stream bytes remain ineligible.
+- The first exact 32MiB command used the wrong module path and ran zero tests;
+  it was rejected and rerun as one exact measured test. An exploratory
+  quinn-proto `--all-features` Clippy selected optional AWS-LC FIPS and failed
+  for missing local `cmake`; default-feature Clippy is the established lane
+  and passed. Neither command failure was a product regression.
+- Result:
+  `docs/tech/2026-08-10-knife15-m2-transport-write-demand-flight-ownership-local-results.md`.
+
 ## 2026-08-08 - Writable delivery lost business demand and the first repair polluted other streams
 
 - Exact-source `eb2185f` passed baseline/direct, smoke, every preflight, long

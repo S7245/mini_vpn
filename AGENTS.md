@@ -187,7 +187,45 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-08-08:
+Current Knife15 summary, as of 2026-08-10:
+
+- Exact-source `b437b93` qualification artifact
+  `/tmp/mini_vpn_knife15_macos_20260810_021421.tar.gz` (SHA-256
+  `33dddf00...`) passed baseline `25.429/54.539 Mbit/s`, direct at
+  `12.715 Mbit/s` without a complete zero interval, smoke, every preflight,
+  cycle 1, cycle 2 long forward/reverse TCP and reverse UDP, and cleanup. The
+  cycle-2 short forward then lost one complete Target receiver interval;
+  formal M2 was not run.
+- Paired Exit artifact SHA-256 `2bc46085...` saw the exact business socket
+  receive about `4.23MB` without a supply gap above `165.430ms`; Target ACK
+  RTT was about `1..4ms`, sender TCP retransmit growth and capture/kernel drops
+  were zero. D16 accepted `6,296,563B` into Quinn and waited up to
+  `3,820,792us`; generation-3 cwnd grew only `12,947 -> 223,724B`. D16, TUN,
+  Endpoint, routes, process, and cleanup were healthy. This selects
+  client-to-Exit congestion ownership.
+- Production `run_relay_writer` yields on its async Progress signal after a
+  successful partial write. Quinn can packetize those bytes before the next
+  retry reaches Blocked, after the old demand bit was cleared. The prior test
+  immediately retried and did not reproduce this worker turn.
+- Reviewed implementation retains an exclusive per-stream accepted-offset
+  boundary until cumulative ACK or terminal lifecycle. Packets for another
+  stream, control traffic, and later same-stream bytes cannot borrow it. The
+  production-order RED was `24,000 -> 1,772,034B < 1,990,080B` and is GREEN.
+  No D16, MTU, pool, window, chunk, Cubic, GSO, Endpoint, self-wake, retry,
+  workload, or SLI changed.
+- Root `689+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  established Clippy, shell, vendored Quinn `40+3 ignored` plus doc `1`,
+  quinn-proto `325` plus docs `3`, root docs, fmt/diff/vendor/secret, and
+  review pass with no unresolved P0/P1. Exact 32MiB Endpoint capacity was
+  `239.784 Mbit/s`, final `61,440/0/0B`, zero socket would-block. Result:
+  `docs/tech/2026-08-10-knife15-m2-transport-write-demand-flight-ownership-local-results.md`.
+- Commit/push the reviewed descendant. When the Mac is ready, start one fresh
+  bounded `.33` observer and take exactly one `m2-ipv6-check -> baseline ->
+  direct-discriminator -> start -> smoke -> m2-qualification -> status ->
+  stop`. Do not run formal M2 or repeat/tune unchanged. A recurrence rejects
+  this architecture. Formal M2 and M3 remain blocked.
+
+- Previous accepted position:
 
 - Exact-source `eb2185f` qualification artifact
   `/tmp/mini_vpn_knife15_macos_20260808_092053.tar.gz` (SHA-256

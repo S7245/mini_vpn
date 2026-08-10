@@ -32,11 +32,14 @@ mini_vpn changes are intentionally limited to:
   Endpoint-bulk ownership and per-packet application-writer
   transport-backpressure ownership for ordinary application-limited
   classification;
-- `src/connection/streams/send.rs`, `state.rs`, and `mod.rs`: one bounded
-  per-stream transport-write-demand bit with an O(1) connection aggregate,
-  retained across Writable delivery and cleared by write progress or terminal
-  lifecycle; only packets actually carrying that stream's frames inherit the
-  demand, so cancelled writers cannot lend ownership to unrelated streams;
+- `src/connection/send_buffer.rs` and `src/connection/streams/send.rs`,
+  `state.rs`, and `mod.rs`: one bounded per-stream transport-write-demand bit
+  plus an exclusive accepted-offset boundary with an O(1) connection
+  aggregate, retained across Writable delivery and an intervening connection
+  worker turn until the exact accepted prefix is cumulatively acknowledged or
+  the stream becomes terminal; only packets actually carrying bytes below
+  that stream's boundary inherit the demand, so cancelled writers cannot lend
+  ownership to unrelated streams or later same-stream bytes;
 - `src/endpoint.rs`: create one fresh service per endpoint, attach stable
   connection/path keys, and pre-account stateless responses;
 - `src/tests/mod.rs` and `src/tests/util.rs`: endpoint isolation, default-off,
@@ -47,4 +50,4 @@ mini_vpn changes are intentionally limited to:
 
 No quinn-udp, congestion-controller algorithm, MTU-discovery, crypto, loss
 timer, or stream flow-control implementation is replaced. The modified suite
-passes `323/323` unit tests and `3/3` doc tests.
+passes `325/325` unit tests and `3/3` doc tests.

@@ -344,9 +344,8 @@ impl<'a> SendStream<'a> {
                 stream.connection_blocked = true;
                 self.state.connection_blocked.push(self.id);
             }
-            if !stream.transport_write_blocked {
-                stream.transport_write_blocked = true;
-                self.state.transport_write_blocked += 1;
+            if stream.note_transport_write_blocked() {
+                self.state.transport_write_demand_streams += 1;
             }
             return Err(WriteError::Blocked);
         }
@@ -355,16 +354,14 @@ impl<'a> SendStream<'a> {
         let written = match stream.write(source, limit) {
             Ok(written) => written,
             Err(WriteError::Blocked) => {
-                if !stream.transport_write_blocked {
-                    stream.transport_write_blocked = true;
-                    self.state.transport_write_blocked += 1;
+                if stream.note_transport_write_blocked() {
+                    self.state.transport_write_demand_streams += 1;
                 }
                 return Err(WriteError::Blocked);
             }
             Err(error) => {
-                if stream.transport_write_blocked {
-                    stream.transport_write_blocked = false;
-                    self.state.transport_write_blocked -= 1;
+                if stream.clear_transport_write_demand() {
+                    self.state.transport_write_demand_streams -= 1;
                 }
                 return Err(error);
             }
@@ -376,10 +373,7 @@ impl<'a> SendStream<'a> {
             self.state.pending.push_pending(self.id, stream.priority);
         }
         if written.bytes > 0 {
-            if stream.transport_write_blocked {
-                stream.transport_write_blocked = false;
-                self.state.transport_write_blocked -= 1;
-            }
+            stream.note_transport_write_progress();
             if let Some(priority_after) = priority_after {
                 stream.priority = priority_after;
             }
@@ -412,9 +406,9 @@ impl<'a> SendStream<'a> {
 
         let was_pending = stream.is_pending();
         stream.finish()?;
-        if stream.transport_write_blocked {
-            stream.transport_write_blocked = false;
-            self.state.transport_write_blocked -= 1;
+        stream.transport_write_blocked = false;
+        if stream.clear_satisfied_transport_write_demand() {
+            self.state.transport_write_demand_streams -= 1;
         }
         if !was_pending {
             self.state.pending.push_pending(self.id, stream.priority);
@@ -446,9 +440,8 @@ impl<'a> SendStream<'a> {
         // credit based on the final offset communicated in the RESET_STREAM frame we send.
         self.state.unacked_data -= stream.pending.unacked();
         stream.reset();
-        if stream.transport_write_blocked {
-            stream.transport_write_blocked = false;
-            self.state.transport_write_blocked -= 1;
+        if stream.clear_transport_write_demand() {
+            self.state.transport_write_demand_streams -= 1;
         }
         self.pending.reset_stream.push((self.id, error_code));
 

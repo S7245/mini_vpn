@@ -19,6 +19,12 @@ pub(super) struct Send {
     /// connection worker can otherwise publish a transient application-limited state between
     /// waking the writer task and that task acquiring the connection lock again.
     pub(super) transport_write_blocked: bool,
+    /// Exclusive stream offset through which packets inherit proven transport-write demand.
+    ///
+    /// A writable retry can accept bytes and then yield to application bookkeeping before the
+    /// next write reaches `Blocked`. Retaining the exact accepted prefix lets the connection
+    /// worker packetize that prefix without lending ownership to later bytes on the same stream.
+    pub(super) transport_write_demand_through: Option<u64>,
     /// The reason the peer wants us to stop, if `STOP_SENDING` was received
     pub(super) stop_reason: Option<VarInt>,
 }
@@ -33,8 +39,66 @@ impl Send {
             fin_pending: false,
             connection_blocked: false,
             transport_write_blocked: false,
+            transport_write_demand_through: None,
             stop_reason: None,
         })
+    }
+
+    /// Record that the application reached transport backpressure.
+    ///
+    /// Returns whether this stream newly entered the connection aggregate.
+    pub(super) fn note_transport_write_blocked(&mut self) -> bool {
+        self.transport_write_blocked = true;
+        let newly_owned = self.transport_write_demand_through.is_none();
+        self.transport_write_demand_through = Some(
+            self.transport_write_demand_through
+                .unwrap_or(0)
+                .max(self.offset()),
+        );
+        newly_owned
+    }
+
+    /// Extend ownership through bytes accepted by the first writable retry.
+    pub(super) fn note_transport_write_progress(&mut self) {
+        if !self.transport_write_blocked {
+            return;
+        }
+        self.transport_write_blocked = false;
+        self.transport_write_demand_through = Some(
+            self.transport_write_demand_through
+                .unwrap_or(0)
+                .max(self.offset()),
+        );
+    }
+
+    /// Whether this exact STREAM range belongs to proven application demand.
+    pub(super) fn owns_transport_write_demand(&self, offsets: &std::ops::Range<u64>) -> bool {
+        self.transport_write_demand_through
+            .is_some_and(|through| offsets.start < through)
+    }
+
+    /// Clear ownership once the exact prefix is cumulatively acknowledged.
+    ///
+    /// A writer still blocked awaiting its retry retains the empty edge so newly accepted bytes
+    /// can extend the same continuous-demand episode.
+    pub(super) fn clear_satisfied_transport_write_demand(&mut self) -> bool {
+        if self.transport_write_blocked {
+            return false;
+        }
+        let Some(through) = self.transport_write_demand_through else {
+            return false;
+        };
+        if self.pending.first_unacked_offset() < through {
+            return false;
+        }
+        self.transport_write_demand_through = None;
+        true
+    }
+
+    /// Clear all demand state for an abandoned or peer-stopped stream.
+    pub(super) fn clear_transport_write_demand(&mut self) -> bool {
+        self.transport_write_blocked = false;
+        self.transport_write_demand_through.take().is_some()
     }
 
     /// Whether the stream has been reset
@@ -314,6 +378,29 @@ pub enum FinishError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_write_demand_owns_only_the_exact_accepted_prefix() {
+        let mut send = Send::new(VarInt::from_u32(1024));
+        send.pending.write(Bytes::from_static(&[0; 8]));
+
+        assert!(send.note_transport_write_blocked());
+        assert!(send.owns_transport_write_demand(&(0..8)));
+
+        send.pending.write(Bytes::from_static(&[0; 4]));
+        send.note_transport_write_progress();
+        assert!(send.owns_transport_write_demand(&(8..12)));
+        assert!(!send.owns_transport_write_demand(&(12..13)));
+
+        send.pending.ack(0..12);
+        assert!(send.clear_satisfied_transport_write_demand());
+        send.pending.write(Bytes::from_static(&[0; 4]));
+        assert!(
+            !send.owns_transport_write_demand(&(12..16)),
+            "later same-stream bytes must not inherit completed demand ownership"
+        );
+        assert!(!send.clear_satisfied_transport_write_demand());
+    }
 
     #[test]
     fn bytes_array() {
