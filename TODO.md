@@ -27,7 +27,7 @@ before the writer's next Blocked retry. The old per-stream bit was already
 cleared; the old deterministic test immediately retried and therefore missed
 the worker turn.
 
-Reviewed implementation retains one exclusive accepted-offset boundary until
+Reviewed `c218d8a` retains one exclusive accepted-offset boundary until
 its exact prefix is cumulatively ACKed or terminal. It cannot lend authority
 to another stream, control traffic, or later same-stream bytes. The production
 interleaving was RED at `24,000 -> 1,772,034B < 1,990,080B` and is GREEN. No
@@ -40,13 +40,13 @@ vendored Quinn/proto are `40+3 ignored`/`325`, and exact Endpoint capacity is
 
 Next:
 
-1. commit and push the reviewed descendant;
-2. pull/rebuild it on the Mac and keep every other VPN off;
-3. start one fresh bounded `.33` observer only when the Mac is ready;
-4. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
+1. pull/rebuild the pushed reviewed descendant on the Mac and keep every
+   other VPN off;
+2. start one fresh bounded `.33` observer only when the Mac is ready;
+3. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
    start -> smoke -> m2-qualification -> status -> stop`;
-5. preserve `status/snapshot/stop` after failure and upload the bundle;
-6. do not run formal M2 or repeat/tune unchanged; a recurrence rejects this
+4. preserve `status/snapshot/stop` after failure and upload the bundle;
+5. do not run formal M2 or repeat/tune unchanged; a recurrence rejects this
    architecture and keeps M2/M3 blocked.
 
 #### Previous decision (2026-08-08 — transport-write packet ownership ready for qualification)

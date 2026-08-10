@@ -207,7 +207,7 @@ Current Knife15 summary, as of 2026-08-10:
   successful partial write. Quinn can packetize those bytes before the next
   retry reaches Blocked, after the old demand bit was cleared. The prior test
   immediately retried and did not reproduce this worker turn.
-- Reviewed implementation retains an exclusive per-stream accepted-offset
+- Reviewed `c218d8a` retains an exclusive per-stream accepted-offset
   boundary until cumulative ACK or terminal lifecycle. Packets for another
   stream, control traffic, and later same-stream bytes cannot borrow it. The
   production-order RED was `24,000 -> 1,772,034B < 1,990,080B` and is GREEN.
@@ -219,8 +219,8 @@ Current Knife15 summary, as of 2026-08-10:
   review pass with no unresolved P0/P1. Exact 32MiB Endpoint capacity was
   `239.784 Mbit/s`, final `61,440/0/0B`, zero socket would-block. Result:
   `docs/tech/2026-08-10-knife15-m2-transport-write-demand-flight-ownership-local-results.md`.
-- Commit/push the reviewed descendant. When the Mac is ready, start one fresh
-  bounded `.33` observer and take exactly one `m2-ipv6-check -> baseline ->
+- Pull/rebuild the pushed reviewed descendant. When the Mac is ready, start
+  one fresh bounded `.33` observer and take exactly one `m2-ipv6-check -> baseline ->
   direct-discriminator -> start -> smoke -> m2-qualification -> status ->
   stop`. Do not run formal M2 or repeat/tune unchanged. A recurrence rejects
   this architecture. Formal M2 and M3 remain blocked.

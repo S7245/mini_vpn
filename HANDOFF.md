@@ -25,7 +25,7 @@
   those accepted bytes before the next writer retry reaches Blocked. The prior
   bit was cleared on write progress, so the exact worker-turn flight lost
   ownership; the old test retried immediately and missed this interleaving.
-- Reviewed implementation retains one exclusive per-stream accepted-offset
+- Reviewed `c218d8a` retains one exclusive per-stream accepted-offset
   boundary through that worker turn and clears it only after cumulative ACK or
   terminal lifecycle. Another stream, control traffic, and later same-stream
   bytes cannot borrow authority. The new RED was
@@ -38,8 +38,8 @@
   review pass with no unresolved P0/P1. Exact 32MiB Endpoint capacity was
   `239.784 Mbit/s`, final `61,440/0/0B`, zero socket would-block. Result:
   `docs/tech/2026-08-10-knife15-m2-transport-write-demand-flight-ownership-local-results.md`.
-- Commit/push the reviewed descendant. When the Mac is ready, start one fresh
-  bounded `.33` observer and take exactly one `m2-ipv6-check -> baseline ->
+- Pull/rebuild the pushed reviewed descendant. When the Mac is ready, start
+  one fresh bounded `.33` observer and take exactly one `m2-ipv6-check -> baseline ->
   direct-discriminator -> start -> smoke -> m2-qualification -> status ->
   stop`. Preserve failure evidence; do not run formal M2 or repeat/tune
   unchanged. A recurrence rejects this architecture. Formal M2 and M3 remain

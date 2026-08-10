@@ -4,6 +4,8 @@ Date: 2026-08-10
 
 Status: **LOCAL IMPLEMENTATION AND REVIEW PASS; ONE PAIRED MAC QUALIFICATION REQUIRED; FORMAL M2 AND M3 REMAIN BLOCKED**
 
+Implementation commit: `c218d8a`.
+
 Architecture:
 `docs/tech/2026-08-10-knife15-m2-transport-write-demand-flight-ownership-architecture-spec.md`.
 
@@ -101,8 +103,8 @@ reachability. No unresolved P0/P1 remains.
 
 ## Qualification Boundary
 
-Commit and push the reviewed descendant, then start one fresh bounded `.33`
-observer only when the Mac is ready. Take exactly one:
+Pull/rebuild the pushed reviewed descendant, then start one fresh bounded
+`.33` observer only when the Mac is ready. Take exactly one:
 
 ```text
 m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke
