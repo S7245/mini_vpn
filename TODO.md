@@ -4,7 +4,48 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-10 — successor service certificate ready for qualification)
+#### Latest decision (2026-08-10 — exact reverse-gap ACK reinforcement ready for qualification)
+
+Exact-source `673d13d` artifact
+`/tmp/mini_vpn_knife15_macos_20260810_075621.tar.gz` (SHA-256
+`25847808...`) passed baseline `23.502/64.236 Mbit/s`, bounded direct, smoke,
+every preflight, cycle 1, cycle-2 forward, and cleanup. Cycle-2 reverse then
+lost one complete Target receiver interval; formal M2 was not run.
+
+The exact conn1 generation-2 stream-2 reader stopped at `385,286,941B` behind
+a missing `1,386B` prefix while buffered same-stream tail grew to `7,552,771B`.
+Another `2,982` datagrams and `2,981` STREAM frames arrived before the prefix
+recovered after `1,759ms`. Paired Exit SHA-256 `5c26edfd...` had zero drops;
+the exact TCP socket receive window reached zero, supply paused
+`1,158.373ms`, and the window reopened with resumed supply. Local
+ownership/conservation, service readiness, Target, and cleanup were healthy.
+
+Reviewed pushed `300fb16` uses exact `STREAM_DATA_BLOCKED` plus the same
+receive stream's ordered assembler gap and buffered tail to authorize one
+bounded ACK reinforcement. Packet-number history alone cannot arm it. A newer
+ACK replaces the opportunity, a reinforcement cannot self-rearm, and range
+collapse disarms it. The new counter records only reinforcements actually
+transmitted; no frozen value, workload, or SLI changed.
+
+The 64KiB flow-control RED/GREEN proves the remote writer is Blocked, drops the
+sole gap ACK, and recovers before the sender's loss-detection/PTO deadline.
+All local gates pass with no unresolved P0/P1; root is `700+3 ignored`,
+vendored Quinn/proto are `40+3 ignored`/`330`, and exact Endpoint capacity is
+`239.815 Mbit/s` with final `61,440/0/0B`. Result:
+`docs/tech/2026-08-10-knife15-m2-reverse-gap-ack-reinforcement-local-results.md`.
+
+Next:
+
+1. pull `300fb16`, rebuild on the Mac, and keep every other VPN off;
+2. start one fresh bounded `.33` observer only when the Mac is ready;
+3. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
+   start -> smoke -> m2-qualification -> status -> stop`;
+4. preserve `status/snapshot/stop` after failure and upload the bundle;
+5. do not run formal M2 or repeat/tune unchanged; a recurrence with nonzero
+   reinforcement rejects this mechanism, while zero reinforcement retains
+   only the exact reachability branch. M2/M3 remain blocked.
+
+#### Previous decision (2026-08-10 — successor service certificate ready for qualification)
 
 Exact-source `80df179` artifact
 `/tmp/mini_vpn_knife15_macos_20260810_055556.tar.gz` (SHA-256

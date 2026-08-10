@@ -4,7 +4,48 @@
 
 ## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-10)
 
-- **Latest accepted position:** exact-source `80df179` qualification artifact
+- **Latest accepted position:** exact-source `673d13d` qualification artifact
+  `/tmp/mini_vpn_knife15_macos_20260810_075621.tar.gz` (SHA-256
+  `25847808...`) passed baseline `23.502/64.236 Mbit/s`, bounded direct,
+  smoke, every preflight, cycle 1, cycle-2 forward, and
+  cleanup. Cycle-2 reverse then lost exactly one complete Target receiver
+  interval; formal M2 was not run.
+- Conn1 generation 2 stream 2 retained a Ready service certificate with no
+  replacement or migration. Its ordered reader stopped at `385,286,941B`
+  behind a missing `1,386B` prefix while same-stream buffered tail grew from
+  `5,876,229B` to `7,552,771B`; another `2,982` datagrams and `2,981` STREAM
+  frames arrived, and the prefix recovered after `1,759ms`.
+- Paired Exit artifact SHA-256 `5c26edfd...` identified the exact reverse
+  socket with zero capture/kernel drops. Its TCP receive window fell from 3
+  to 0, Exit supply paused `1,158.373ms`, and the window reopened immediately
+  before supply resumed. D16, TUN, Endpoint, certificate admission, Target,
+  routes, process, and cleanup were healthy. This selects QUIC ordered-loss
+  recovery plus stream-credit exhaustion; transient WAN loss/RTT growth is a
+  contributor, not a frozen-value branch.
+- Reviewed pushed `300fb16` adds one bounded ACK reinforcement only after
+  exact `STREAM_DATA_BLOCKED` pressure for the same open receive stream with
+  an ordered assembler gap and buffered tail. Split packet-number history
+  alone is ineligible. One negotiated `max_ack_delay` opportunity is replaced
+  by newer ACK progress, cannot self-rearm, and disarms after range collapse.
+  `gap_ack_reinforcements` exposes exact branch reachability.
+- The deterministic 64KiB flow-control replay blocks the writer beyond its
+  receive window, drops the sole gap ACK, and recovers the missing prefix via
+  one reinforcement before the sender loss-detection/PTO deadline. Root
+  `700+3 ignored`, main `2`, integration `10+4 ignored`, release, established
+  Clippy, shell, vendored Quinn `40+3 ignored` plus doc `1`, quinn-proto `330`
+  plus docs `3`, root docs, fmt/diff/vendor/secret, exact capacity, and review
+  all pass with no unresolved P0/P1. Exact 32MiB Endpoint capacity was
+  `239.815 Mbit/s`, final `61,440/0/0B`, zero socket would-block. Result:
+  `docs/tech/2026-08-10-knife15-m2-reverse-gap-ack-reinforcement-local-results.md`.
+- Pull/rebuild `300fb16`. When the Mac is ready, start one fresh bounded `.33`
+  observer and take exactly one `m2-ipv6-check -> baseline ->
+  direct-discriminator -> start -> smoke -> m2-qualification -> status ->
+  stop`. Preserve failure evidence; do not run formal M2 or repeat/tune
+  unchanged. A recurrence with nonzero reinforcement rejects this mechanism
+  as sufficient; zero reinforcement preserves only the exact reachability
+  branch for paired analysis. Formal M2 and M3 remain blocked.
+
+- **Previous accepted position:** exact-source `80df179` qualification artifact
   `/tmp/mini_vpn_knife15_macos_20260810_055556.tar.gz` (SHA-256
   `9d291f6c...`) passed baseline `23.658/61.795 Mbit/s`, direct at
   `11.822 Mbit/s` without zero intervals, smoke, every preflight, seven mixed

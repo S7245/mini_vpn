@@ -1,5 +1,35 @@
 # Learnings
 
+## 2026-08-10 - ACK recovery authority needs stream pressure plus exact receive state
+
+- Split QUIC packet-number ranges do not prove a live ordered STREAM gap.
+  Packet-number filtering deliberately skips numbers, and retransmitted STREAM
+  data uses a new packet number while the old historical number stays absent.
+- The safe recovery authority is the conjunction of peer
+  `STREAM_DATA_BLOCKED`, the exact open receive stream's ordered assembler gap
+  and buffered tail, a credible blocked offset, and split Data ACK ranges.
+  Keeping that classification inside Quinn avoids coupling recovery to D16's
+  slower diagnostic observer.
+- A bounded duplicate ACK must be owned by the normal ACK that reports the
+  exact state: one negotiated `max_ack_delay` deadline, replacement by newer
+  progress, no self-rearm, and disarm after confirmed range collapse. Timer
+  calculation must take the minimum so a later below-threshold packet cannot
+  postpone an older reinforcement.
+- A deterministic test for this branch must exhaust scaled stream credit,
+  drop every ACK that reports the missing prefix until the sender is Blocked,
+  and prove recovery before the sender's loss-detection/PTO deadline. Merely
+  observing a second ACK after a small flight is not sufficient.
+- Aligning the client ordered gap with the exact Exit socket was decisive: the
+  Exit TCP receive window reached zero while the client buffered megabytes
+  beyond one missing prefix, then reopened immediately before supply resumed.
+  That selects the ordered QUIC/stream-credit chain without reopening D16,
+  TUN, Endpoint, Target, or frozen-value branches.
+- Vendored validation needs exact provenance. Pass an absolute local
+  quinn-proto patch to standalone Quinn commands, and never run whole-vendor
+  formatting when only the maintained fork files are in scope.
+- Result:
+  `docs/tech/2026-08-10-knife15-m2-reverse-gap-ack-reinforcement-local-results.md`.
+
 ## 2026-08-10 - Readiness is versioned state, not a historical success bit
 
 - A successful successor service turn is exact evidence for one transport

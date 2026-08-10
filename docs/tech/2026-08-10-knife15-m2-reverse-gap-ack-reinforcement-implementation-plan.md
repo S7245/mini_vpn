@@ -71,9 +71,10 @@ Architecture:
 ## Task 7 — Commit, push, and one paired qualification
 
 - [x] Update `PATCHES.md` with the exact maintained fork contract.
-- [ ] Update `HANDOFF.md`, `TODO.md`, and `AGENTS.md` with exact accepted
+- [x] Update `HANDOFF.md`, `TODO.md`, and `AGENTS.md` with exact accepted
   position.
-- [ ] Commit the coherent implementation/evidence stage and push.
+- [x] Commit the coherent implementation/evidence stage and push as
+  `300fb16`.
 - [ ] Start one fresh bounded `.33` observer only when the Mac is ready.
 - [ ] Take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
   start -> smoke -> m2-qualification -> status -> stop`.

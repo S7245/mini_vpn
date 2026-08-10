@@ -1,5 +1,39 @@
 # Errors
 
+## 2026-08-10 - Reverse STREAM credit exhausted behind one lost prefix
+
+- Exact-source `673d13d` passed baseline/direct, smoke, every preflight,
+  cycle 1, cycle-2 forward, and cleanup. Cycle-2 reverse TCP then lost one
+  complete Target receiver interval; formal M2 was not run.
+- Conn1 generation 2 stream 2 stopped at ordered offset `385,286,941B` behind
+  one missing `1,386B` prefix while its same-stream buffered tail grew from
+  `5,876,229B` to `7,552,771B`. Quinn continued receiving `2,982` datagrams
+  and `2,981` STREAM frames, and the prefix arrived after `1,759ms`.
+- Paired Exit evidence had zero capture/kernel drops. The exact TCP socket's
+  receive window fell to zero, Exit supply paused for `1,158.373ms`, and both
+  reopened together. D16, TUN, Endpoint, service certificate, replacement,
+  Target, routes, process, and cleanup were healthy.
+- The first local patch treated any split ACK range as reinforcement
+  authority. Review rejected it before commit: skipped packet numbers and
+  historical retransmission gaps make that trigger broad and potentially
+  persistent. The final branch requires exact `STREAM_DATA_BLOCKED` pressure
+  plus a same-stream ordered assembler gap and buffered tail.
+- The first 12KiB Pair test proved only that a duplicate gap ACK could exist;
+  it did not exhaust stream credit or prove recovery before PTO. The accepted
+  RED/GREEN uses a 64KiB receive window, blocks the writer beyond the window,
+  drops the sole gap ACK, delivers reinforcement, and proves prefix recovery
+  before the recorded sender loss-detection deadline.
+- A later below-threshold packet initially overwrote the earlier reinforcement
+  timer. The deadline now comes from `PendingAcks`' minimum and has a focused
+  regression test.
+- One standalone Quinn command omitted the absolute local proto patch, and an
+  extra standalone Clippy invocation selected registry proto; neither is an
+  established gate. A whole-vendor rustfmt also created unrelated mechanical
+  noise. The commands were corrected, the noise and generated lockfiles were
+  removed, and the established root/proto gates passed.
+- Result:
+  `docs/tech/2026-08-10-knife15-m2-reverse-gap-ack-reinforcement-local-results.md`.
+
 ## 2026-08-10 - Historical successor proof outlived its current service state
 
 - Exact-source `80df179` passed baseline/direct, smoke, every preflight, seven

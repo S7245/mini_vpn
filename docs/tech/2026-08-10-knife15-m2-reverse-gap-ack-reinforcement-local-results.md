@@ -4,6 +4,8 @@ Date: 2026-08-10
 
 Status: **LOCAL IMPLEMENTATION AND REVIEW PASS; ONE PAIRED MAC QUALIFICATION REQUIRED; FORMAL M2 AND M3 REMAIN BLOCKED**
 
+Reviewed implementation: `300fb16`
+
 Architecture:
 `docs/tech/2026-08-10-knife15-m2-reverse-gap-ack-reinforcement-architecture-spec.md`.
 
