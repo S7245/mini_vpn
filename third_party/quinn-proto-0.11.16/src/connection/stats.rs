@@ -32,6 +32,8 @@ impl UdpStats {
 #[allow(missing_docs)]
 pub struct FrameStats {
     pub acks: u64,
+    /// ACK frames repeated once after a receive gap to survive loss of the prior gap ACK
+    pub gap_ack_reinforcements: u64,
     pub ack_frequency: u64,
     pub crypto: u64,
     pub connection_close: u64,
@@ -103,6 +105,7 @@ impl std::fmt::Debug for FrameStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FrameStats")
             .field("ACK", &self.acks)
+            .field("GAP_ACK_REINFORCEMENT", &self.gap_ack_reinforcements)
             .field("ACK_FREQUENCY", &self.ack_frequency)
             .field("CONNECTION_CLOSE", &self.connection_close)
             .field("CRYPTO", &self.crypto)

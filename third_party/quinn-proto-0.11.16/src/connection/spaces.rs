@@ -616,6 +616,14 @@ pub(super) struct PendingAcks {
     largest_ack_eliciting_packet: Option<u64>,
     /// The largest acknowledged packet number sent in an ACK frame
     largest_acked: Option<u64>,
+    /// When to reinforce the most recent ACK that reported a receive gap
+    ///
+    /// This is replaced by newer ACK progress and consumed after one timeout.
+    gap_ack_reinforcement_sent_at: Option<Instant>,
+    /// Whether exact stream-flow-control pressure owns one terminal reinforcement opportunity
+    gap_ack_reinforcement_active: bool,
+    /// Whether the ACK currently pending was requested by the reinforcement timer
+    gap_ack_reinforcement_due: bool,
 }
 
 impl PendingAcks {
@@ -631,6 +639,9 @@ impl PendingAcks {
             largest_packet: None,
             largest_ack_eliciting_packet: None,
             largest_acked: None,
+            gap_ack_reinforcement_sent_at: None,
+            gap_ack_reinforcement_active: false,
+            gap_ack_reinforcement_due: false,
         }
     }
 
@@ -643,13 +654,37 @@ impl PendingAcks {
         self.immediate_ack_required = true;
     }
 
-    pub(super) fn on_max_ack_delay_timeout(&mut self) {
-        self.immediate_ack_required = self.ack_eliciting_since_last_ack_sent > 0;
+    pub(super) fn request_gap_ack_reinforcement(&mut self) {
+        if self.ranges.len() > 1 {
+            self.gap_ack_reinforcement_active = true;
+        }
+    }
+
+    pub(super) fn on_max_ack_delay_timeout(&mut self, now: Instant, max_ack_delay: Duration) {
+        let reinforcement_due = self
+            .gap_ack_reinforcement_sent_at
+            .is_some_and(|sent_at| sent_at + max_ack_delay <= now);
+        if reinforcement_due {
+            self.gap_ack_reinforcement_sent_at = None;
+            self.gap_ack_reinforcement_due = true;
+        }
+        self.immediate_ack_required |=
+            self.ack_eliciting_since_last_ack_sent > 0 || reinforcement_due;
     }
 
     pub(super) fn max_ack_delay_timeout(&self, max_ack_delay: Duration) -> Option<Instant> {
-        self.earliest_ack_eliciting_since_last_ack_sent
-            .map(|earliest_unacked| earliest_unacked + max_ack_delay)
+        let normal = self
+            .earliest_ack_eliciting_since_last_ack_sent
+            .map(|earliest_unacked| earliest_unacked + max_ack_delay);
+        let reinforcement = self
+            .gap_ack_reinforcement_sent_at
+            .map(|sent_at| sent_at + max_ack_delay);
+        match (normal, reinforcement) {
+            (Some(normal), Some(reinforcement)) => Some(normal.min(reinforcement)),
+            (Some(normal), None) => Some(normal),
+            (None, Some(reinforcement)) => Some(reinforcement),
+            (None, None) => None,
+        }
     }
 
     /// Whether any ACK frames can be sent
@@ -744,7 +779,7 @@ impl PendingAcks {
     /// Should be called whenever ACKs have been sent
     ///
     /// This will suppress sending further ACKs until additional ACK eliciting frames arrive
-    pub(super) fn acks_sent(&mut self) {
+    pub(super) fn acks_sent(&mut self, now: Instant, max_ack_delay: Duration) -> AckSentOutcome {
         // It is possible (though unlikely) that the ACKs we just sent do not cover all the
         // ACK-eliciting packets we have received (e.g. if there is not enough room in the packet to
         // fit all the ranges). To keep things simple, however, we assume they do. If there are
@@ -754,11 +789,29 @@ impl PendingAcks {
         // new packet, which is suboptimal, because we already received them. Our assumption here is
         // that simplicity results in code that is more performant, even in the presence of
         // occasional redundant retransmits.
+        let had_new_ack_eliciting = self.ack_eliciting_since_last_ack_sent > 0;
+        let reinforced = self.gap_ack_reinforcement_due && !had_new_ack_eliciting;
+
         self.immediate_ack_required = false;
         self.ack_eliciting_since_last_ack_sent = 0;
         self.non_ack_eliciting_since_last_ack_sent = 0;
         self.earliest_ack_eliciting_since_last_ack_sent = None;
+        self.gap_ack_reinforcement_due = false;
+        if reinforced {
+            self.gap_ack_reinforcement_active = false;
+            self.gap_ack_reinforcement_sent_at = None;
+        } else if had_new_ack_eliciting
+            && self.gap_ack_reinforcement_active
+            && self.ranges.len() > 1
+        {
+            self.gap_ack_reinforcement_sent_at = Some(now);
+        }
         self.largest_acked = self.largest_ack_eliciting_packet;
+
+        AckSentOutcome {
+            reinforced,
+            next_timeout: self.max_ack_delay_timeout(max_ack_delay),
+        }
     }
 
     /// Insert one packet that needs to be acknowledged
@@ -777,6 +830,11 @@ impl PendingAcks {
     /// Remove ACKs of packets numbered at or below `max` from the set of pending ACKs
     pub(super) fn subtract_below(&mut self, max: u64) {
         self.ranges.remove(0..(max + 1));
+        if self.ranges.len() < 2 {
+            self.gap_ack_reinforcement_sent_at = None;
+            self.gap_ack_reinforcement_active = false;
+            self.gap_ack_reinforcement_due = false;
+        }
     }
 
     /// Returns the set of currently pending ACK ranges
@@ -799,6 +857,11 @@ impl PendingAcks {
             self.immediate_ack_required = true;
         }
     }
+}
+
+pub(super) struct AckSentOutcome {
+    pub(super) reinforced: bool,
+    pub(super) next_timeout: Option<Instant>,
 }
 
 /// Helper for mitigating [optimistic ACK attacks]
@@ -1081,6 +1144,70 @@ mod test {
         acks.insert_one(2, t3);
         acks.packet_received(t3, 2, true, &dedup);
         assert_eq!(acks.ack_delay(t3), Duration::from_millis(5));
+    }
+
+    #[test]
+    fn gap_ack_reinforcement_keeps_older_deadline_and_new_ack_replaces_it() {
+        let mut acks = PendingAcks::new();
+        let mut dedup = Dedup::new();
+        let delay = Duration::from_millis(25);
+        let sent_at = Instant::now();
+
+        for packet_number in [0, 2] {
+            dedup.insert(packet_number);
+            acks.insert_one(packet_number, sent_at);
+            acks.packet_received(sent_at, packet_number, true, &dedup);
+        }
+        acks.request_gap_ack_reinforcement();
+        let first = acks.acks_sent(sent_at, delay);
+        assert!(!first.reinforced);
+        assert_eq!(first.next_timeout, Some(sent_at + delay));
+
+        let newer_packet_at = sent_at + delay - Duration::from_millis(1);
+        dedup.insert(3);
+        acks.insert_one(3, newer_packet_at);
+        assert!(acks.packet_received(newer_packet_at, 3, true, &dedup));
+        assert_eq!(
+            acks.max_ack_delay_timeout(delay),
+            Some(sent_at + delay),
+            "a newer ordinary delayed ACK must not overwrite an older reinforcement deadline"
+        );
+
+        acks.on_max_ack_delay_timeout(sent_at + delay, delay);
+        assert!(acks.can_send());
+        let replacement = acks.acks_sent(sent_at + delay, delay);
+        assert!(
+            !replacement.reinforced,
+            "new ACK progress replaces reinforcement"
+        );
+        assert_eq!(replacement.next_timeout, Some(sent_at + 2 * delay));
+
+        acks.on_max_ack_delay_timeout(sent_at + 2 * delay, delay);
+        assert!(acks.can_send());
+        let reinforced = acks.acks_sent(sent_at + 2 * delay, delay);
+        assert!(reinforced.reinforced);
+        assert_eq!(reinforced.next_timeout, None);
+    }
+
+    #[test]
+    fn gap_ack_reinforcement_disarms_when_ack_ranges_collapse() {
+        let mut acks = PendingAcks::new();
+        let mut dedup = Dedup::new();
+        let delay = Duration::from_millis(25);
+        let now = Instant::now();
+
+        for packet_number in [0, 2] {
+            dedup.insert(packet_number);
+            acks.insert_one(packet_number, now);
+            acks.packet_received(now, packet_number, true, &dedup);
+        }
+        acks.request_gap_ack_reinforcement();
+        assert_eq!(acks.acks_sent(now, delay).next_timeout, Some(now + delay));
+
+        acks.subtract_below(0);
+        assert_eq!(acks.max_ack_delay_timeout(delay), None);
+        acks.on_max_ack_delay_timeout(now + delay, delay);
+        assert!(!acks.can_send());
     }
 
     #[test]

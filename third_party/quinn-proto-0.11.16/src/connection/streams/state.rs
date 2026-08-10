@@ -142,6 +142,25 @@ pub struct StreamsState {
 }
 
 impl StreamsState {
+    pub(crate) fn has_ordered_receive_gap_at_blocked_offset(
+        &self,
+        id: StreamId,
+        blocked_offset: u64,
+    ) -> bool {
+        let Some(stream) = self
+            .recv
+            .get(&id)
+            .and_then(|stream| stream.as_ref())
+            .and_then(StreamRecv::as_open_recv)
+        else {
+            return false;
+        };
+        let progress = stream.assembler.progress();
+        progress.ordered_gap_bytes > 0
+            && progress.buffered_bytes > 0
+            && progress.highest_received_offset <= blocked_offset
+    }
+
     #[allow(unreachable_pub)] // fuzzing only
     pub fn new(
         side: Side,

@@ -18,7 +18,8 @@ mini_vpn changes are intentionally limited to:
 - `src/connection/pacing.rs`: apply the maximum without changing refill/debt
   and characterize sub-millisecond multi-bucket refill;
 - `src/connection/paths.rs`: new-path wiring and migration inheritance;
-- `src/connection/stats.rs`: read-only pacing diagnostics;
+- `src/connection/stats.rs`: read-only pacing diagnostics plus an exact count
+  of bounded receive-gap ACK reinforcements;
 - `src/connection/assembler.rs` and `src/connection/streams/mod.rs`: a
   read-only ordered receive-progress snapshot exposing the consumed prefix
   and buffered bytes beyond a missing prefix, without recovery policy;
@@ -31,7 +32,11 @@ mini_vpn changes are intentionally limited to:
   in flight while excluding unrelated preexisting PLPMTUD probes, plus exact
   Endpoint-bulk ownership and per-packet application-writer
   transport-backpressure ownership for ordinary application-limited
-  classification;
+  classification, plus exact `STREAM_DATA_BLOCKED`/same-stream ordered-gap
+  authority for one bounded Data-space ACK reinforcement;
+- `src/connection/spaces.rs`: one normal-ACK-replaceable, non-self-rearming
+  reinforcement deadline using the negotiated `max_ack_delay`, eligible only
+  after the exact receive-stream pressure authority above;
 - `src/connection/send_buffer.rs` and `src/connection/streams/send.rs`,
   `state.rs`, and `mod.rs`: one bounded per-stream transport-write-demand bit
   plus an exclusive accepted-offset boundary with an O(1) connection
@@ -46,9 +51,9 @@ mini_vpn changes are intentionally limited to:
   real GSO accounting, socket-outcome behavior, successor-turn ACK/loss,
   preexisting authentication/PLPMTUD separation, and realistic-RTT
   service-turn, first-128KiB bounded-ordinary-loss reachability,
-  Endpoint-blocked, and writer-Blocked business congestion-window ownership
-  tests.
+  Endpoint-blocked, writer-Blocked business congestion-window ownership, and
+  scaled stream-flow-control exhaustion with final gap-ACK loss tests.
 
 No quinn-udp, congestion-controller algorithm, MTU-discovery, crypto, loss
 timer, or stream flow-control implementation is replaced. The modified suite
-passes `326/326` unit tests and `3/3` doc tests.
+passes `330/330` unit tests and `3/3` doc tests.

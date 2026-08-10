@@ -3800,6 +3800,7 @@ struct QuicStatsSnapshot {
     lost_plpmtud_probes: u64,
     black_holes_detected: u64,
     tx_ack_frames: u64,
+    gap_ack_reinforcements: u64,
     rx_ack_frames: u64,
     rx_stream_frames: u64,
     tx_data_blocked: u64,
@@ -3902,7 +3903,7 @@ fn format_quic_stats_line(conn_index: usize, stable_id: usize, stats: QuicStatsS
     format!(
         "📊 TUIC QUIC stats conn={conn_index} id={stable_id} \
          rtt={}ms cwnd={} lost={}/{} lost_bytes={} congestion_events={} \
-         plpmtud(sent={},lost={},black_holes={}) frames(rx_stream={},rx_ack={},tx_ack={}) \
+         plpmtud(sent={},lost={},black_holes={}) frames(rx_stream={},rx_ack={},tx_ack={},gap_ack_reinforcements={}) \
          tx_blocked(data={},stream={},streams_bidi={},streams_uni={}) \
          rx_blocked(data={},stream={}) tx_window(max_data={},max_stream_data={}) \
          rx_window(max_data={},max_stream_data={}) udp_tx={}/{}B udp_rx={}/{}B \
@@ -3920,6 +3921,7 @@ fn format_quic_stats_line(conn_index: usize, stable_id: usize, stats: QuicStatsS
         stats.rx_stream_frames,
         stats.rx_ack_frames,
         stats.tx_ack_frames,
+        stats.gap_ack_reinforcements,
         stats.tx_data_blocked,
         stats.tx_stream_data_blocked,
         stats.tx_streams_blocked_bidi,
@@ -4505,6 +4507,7 @@ fn quic_stats_snapshot(conn: &Connection) -> QuicStatsSnapshot {
         lost_plpmtud_probes: stats.path.lost_plpmtud_probes,
         black_holes_detected: stats.path.black_holes_detected,
         tx_ack_frames: stats.frame_tx.acks,
+        gap_ack_reinforcements: stats.frame_tx.gap_ack_reinforcements,
         rx_ack_frames: stats.frame_rx.acks,
         rx_stream_frames: stats.frame_rx.stream,
         tx_data_blocked: stats.frame_tx.data_blocked,
@@ -10202,6 +10205,7 @@ mod tests {
                 lost_plpmtud_probes: 20,
                 black_holes_detected: 21,
                 tx_ack_frames: 22,
+                gap_ack_reinforcements: 26,
                 rx_ack_frames: 23,
                 rx_stream_frames: 24,
                 tx_data_blocked: 4,
@@ -10239,8 +10243,9 @@ mod tests {
             line.contains("plpmtud(sent=19,lost=20,black_holes=21)"),
             "{line}"
         );
+        assert!(line.contains("gap_ack_reinforcements=26"), "{line}");
         assert!(
-            line.contains("frames(rx_stream=24,rx_ack=23,tx_ack=22)"),
+            line.contains("frames(rx_stream=24,rx_ack=23,tx_ack=22,gap_ack_reinforcements=26)"),
             "{line}"
         );
         assert!(line.contains("tx_blocked(data=4,stream=5"), "{line}");

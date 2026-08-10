@@ -2964,6 +2964,196 @@ fn single_ack_eliciting_packet_triggers_ack_after_delay() {
 }
 
 #[test]
+fn receiver_repeats_a_lost_gap_ack_before_sender_pto() {
+    const STREAM_WINDOW: u32 = 64 * 1024;
+
+    let mut client = client_config_with_deterministic_pns();
+    Arc::get_mut(&mut client.transport)
+        .unwrap()
+        .receive_window(VarInt::from_u32(STREAM_WINDOW))
+        .stream_receive_window(VarInt::from_u32(STREAM_WINDOW))
+        .mtu_discovery_config(None);
+
+    let mut cubic = congestion::CubicConfig::default();
+    cubic.initial_window(2 * u64::from(STREAM_WINDOW));
+    let mut server_transport = TransportConfig::default();
+    server_transport
+        .send_window(2 * u64::from(STREAM_WINDOW))
+        .congestion_controller_factory(Arc::new(cubic))
+        .mtu_discovery_config(None)
+        .deterministic_packet_numbers(true);
+    let mut server = server_config();
+    server.transport = Arc::new(server_transport);
+
+    let mut pair = Pair::new(Default::default(), server);
+    pair.latency = Duration::from_millis(82);
+    let (client_ch, server_ch) = pair.connect_with(client);
+
+    let flight_started = pair.time;
+    let stream = pair.server_streams(server_ch).open(Dir::Uni).unwrap();
+    let payload = vec![0x5a; STREAM_WINDOW as usize + 1];
+    assert_eq!(
+        pair.server_send(server_ch, stream)
+            .write(&payload[..STREAM_WINDOW as usize]),
+        Ok(STREAM_WINDOW as usize)
+    );
+    pair.server.drive_outgoing(pair.time);
+    assert!(
+        pair.server.outbound.len() > 2,
+        "the receive-gap replay requires a multi-packet full-window flight"
+    );
+
+    for (packet, buffer) in pair.server.outbound.drain(..) {
+        pair.client.inbound.push_back((
+            pair.time + pair.latency,
+            packet.ecn,
+            buffer.as_ref().into(),
+        ));
+    }
+    pair.client.inbound.pop_front();
+
+    pair.time += pair.latency;
+    pair.client.drive_incoming(pair.time, pair.server.addr);
+    pair.client.process_connection_events(client_ch);
+    let progress = pair
+        .client_recv(client_ch, stream)
+        .progress()
+        .expect("tail STREAM frames must open the receive stream");
+    assert!(progress.ordered_gap_bytes > 0, "{progress:?}");
+    assert!(progress.buffered_bytes > 0, "{progress:?}");
+
+    assert_eq!(
+        pair.server_send(server_ch, stream)
+            .write(&payload[STREAM_WINDOW as usize..]),
+        Err(WriteError::Blocked),
+        "the sender must exhaust the scaled stream receive window"
+    );
+    let sender_pto = pair
+        .server_conn_mut(server_ch)
+        .loss_detection_deadline()
+        .expect("the outstanding full-window flight must arm loss detection");
+    pair.client_conn_mut(client_ch)
+        .observe_stream_data_blocked_for_test(stream, u64::from(STREAM_WINDOW))
+        .expect("the exact receive-stream pressure signal must be valid");
+    pair.client.drive_outgoing(pair.time);
+    assert!(
+        !pair.client.outbound.is_empty(),
+        "the out-of-order tail plus exact pressure must produce the final gap ACK"
+    );
+    pair.client.outbound.clear();
+
+    let max_ack_delay =
+        Duration::from_millis(TransportParameters::default().max_ack_delay.into_inner());
+    let one_millisecond = Duration::from_millis(1);
+    pair.time += max_ack_delay - one_millisecond;
+    pair.client.drive(pair.time, pair.server.addr);
+    assert!(
+        pair.client.outbound.is_empty(),
+        "reinforcement must not precede negotiated max_ack_delay"
+    );
+
+    pair.time += one_millisecond;
+    pair.client.drive(pair.time, pair.server.addr);
+    assert!(
+        !pair.client.outbound.is_empty(),
+        "a lost final gap ACK must be reinforced before the sender's PTO"
+    );
+    assert!(
+        pair.time < sender_pto,
+        "the reinforcement must be emitted before sender PTO: now={:?} pto={:?}",
+        pair.time,
+        sender_pto
+    );
+
+    pair.drive_client();
+    pair.time += pair.latency;
+    pair.drive_server();
+    pair.time += pair.latency;
+    pair.drive_client();
+    assert!(
+        pair.time.duration_since(flight_started) < Duration::from_secs(1),
+        "the reinforcement path must reach the receiver before sender PTO-scale recovery"
+    );
+    let progress = pair
+        .client_recv(client_ch, stream)
+        .progress()
+        .expect("the receive stream must remain open");
+    assert_eq!(progress.ordered_gap_bytes, 0, "{progress:?}");
+
+    assert!(
+        pair.client_conn_mut(client_ch).stats().frame_tx.acks >= 2,
+        "the receiver must have emitted the original and reinforced ACK frames"
+    );
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .gap_ack_reinforcements,
+        1
+    );
+
+    pair.client.outbound.clear();
+    pair.time += max_ack_delay;
+    pair.client.drive(pair.time, pair.server.addr);
+    assert!(
+        pair.client.outbound.is_empty(),
+        "a reinforcement ACK must not re-arm itself"
+    );
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .gap_ack_reinforcements,
+        1
+    );
+}
+
+#[test]
+fn packet_number_gap_alone_does_not_repeat_an_ack() {
+    let mut pair = Pair::default_with_deterministic_pns();
+    pair.latency = Duration::from_millis(82);
+    let (client_ch, server_ch) = pair.connect_with(client_config_with_deterministic_pns());
+
+    let stream = pair.server_streams(server_ch).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.server_send(server_ch, stream)
+            .write(&[0x5a; 12 * 1024]),
+        Ok(12 * 1024)
+    );
+    pair.server.drive_outgoing(pair.time);
+    assert!(pair.server.outbound.len() > 2);
+    for (packet, buffer) in pair.server.outbound.drain(..) {
+        pair.client.inbound.push_back((
+            pair.time + pair.latency,
+            packet.ecn,
+            buffer.as_ref().into(),
+        ));
+    }
+    pair.client.inbound.pop_front();
+
+    pair.time += pair.latency;
+    pair.client.drive(pair.time, pair.server.addr);
+    assert!(!pair.client.outbound.is_empty());
+    pair.client.outbound.clear();
+
+    let max_ack_delay =
+        Duration::from_millis(TransportParameters::default().max_ack_delay.into_inner());
+    pair.time += max_ack_delay;
+    pair.client.drive(pair.time, pair.server.addr);
+    assert!(
+        pair.client.outbound.is_empty(),
+        "historical packet-number gaps alone must not create reinforcement traffic"
+    );
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .gap_ack_reinforcements,
+        0
+    );
+}
+
+#[test]
 fn immediate_ack_triggers_ack() {
     let _guard = subscribe();
     let mut pair = Pair::default_with_deterministic_pns();

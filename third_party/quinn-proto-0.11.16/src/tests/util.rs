@@ -404,6 +404,20 @@ impl TestEndpoint {
         }
     }
 
+    /// Apply queued datagrams to one connection without polling new transmits.
+    ///
+    /// This exposes the production receive/transmit boundary for tests that must inspect or
+    /// inject frame semantics after packet processing but before the resulting ACK is emitted.
+    pub(super) fn process_connection_events(&mut self, ch: ConnectionHandle) {
+        let Some(mut events) = self.conn_events.remove(&ch) else {
+            return;
+        };
+        let conn = self.connections.get_mut(&ch).unwrap();
+        for event in events.drain(..) {
+            conn.handle_event(event);
+        }
+    }
+
     pub(super) fn drive_outgoing(&mut self, now: Instant) {
         let buffer_size = self.endpoint.config().get_max_udp_payload_size() as usize;
         let mut buf = Vec::with_capacity(buffer_size);

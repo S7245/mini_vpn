@@ -1248,8 +1248,17 @@ impl Connection {
             pad_datagram |= sent.requires_padding;
 
             if sent.largest_acked.is_some() {
-                self.spaces[space_id].pending_acks.acks_sent();
-                self.timers.stop(Timer::MaxAckDelay);
+                let outcome = self.spaces[space_id]
+                    .pending_acks
+                    .acks_sent(now, self.ack_frequency.max_ack_delay);
+                if outcome.reinforced {
+                    self.stats.frame_tx.gap_ack_reinforcements += 1;
+                }
+                if let Some(timeout) = outcome.next_timeout {
+                    self.timers.set(Timer::MaxAckDelay, timeout);
+                } else {
+                    self.timers.stop(Timer::MaxAckDelay);
+                }
             }
 
             // Keep information about the packet around until it gets finalized
@@ -1652,7 +1661,7 @@ impl Connection {
                     // This timer is only armed in the Data space
                     self.spaces[SpaceId::Data]
                         .pending_acks
-                        .on_max_ack_delay_timeout()
+                        .on_max_ack_delay_timeout(now, self.ack_frequency.max_ack_delay)
                 }
             }
         }
@@ -3392,16 +3401,7 @@ impl Connection {
                     debug!(offset, "peer claims to be blocked at connection level");
                 }
                 Frame::StreamDataBlocked { id, offset } => {
-                    if id.initiator() == self.side.side() && id.dir() == Dir::Uni {
-                        debug!("got STREAM_DATA_BLOCKED on send-only {}", id);
-                        return Err(TransportError::STREAM_STATE_ERROR(
-                            "STREAM_DATA_BLOCKED on send-only stream",
-                        ));
-                    }
-                    debug!(
-                        stream = %id,
-                        offset, "peer claims to be blocked at stream level"
-                    );
+                    self.on_stream_data_blocked(id, offset)?;
                 }
                 Frame::StreamsBlocked { dir, limit } => {
                     if limit > MAX_STREAM_COUNT {
@@ -3569,8 +3569,12 @@ impl Connection {
             .pending_acks
             .packet_received(now, number, ack_eliciting, &space.dedup)
         {
-            self.timers
-                .set(Timer::MaxAckDelay, now + self.ack_frequency.max_ack_delay);
+            if let Some(timeout) = space
+                .pending_acks
+                .max_ack_delay_timeout(self.ack_frequency.max_ack_delay)
+            {
+                self.timers.set(Timer::MaxAckDelay, timeout);
+            }
         }
 
         // Issue stream ID credit due to ACKs of outgoing finish/resets and incoming finish/resets
@@ -3653,6 +3657,37 @@ impl Connection {
             Timer::PathValidation,
             now + 3 * cmp::max(self.pto(SpaceId::Data), prev_pto),
         );
+    }
+
+    fn on_stream_data_blocked(&mut self, id: StreamId, offset: u64) -> Result<(), TransportError> {
+        if id.initiator() == self.side.side() && id.dir() == Dir::Uni {
+            debug!("got STREAM_DATA_BLOCKED on send-only {}", id);
+            return Err(TransportError::STREAM_STATE_ERROR(
+                "STREAM_DATA_BLOCKED on send-only stream",
+            ));
+        }
+        debug!(
+            stream = %id,
+            offset, "peer claims to be blocked at stream level"
+        );
+        if self
+            .streams
+            .has_ordered_receive_gap_at_blocked_offset(id, offset)
+        {
+            self.spaces[SpaceId::Data]
+                .pending_acks
+                .request_gap_ack_reinforcement();
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_stream_data_blocked_for_test(
+        &mut self,
+        id: StreamId,
+        offset: u64,
+    ) -> Result<(), TransportError> {
+        self.on_stream_data_blocked(id, offset)
     }
 
     /// Handle a change in the local address, i.e. an active migration
@@ -4193,6 +4228,11 @@ impl Connection {
             .congestion
             .window()
             .saturating_sub(self.path.in_flight.bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loss_detection_deadline(&self) -> Option<Instant> {
+        self.timers.get(Timer::LossDetection)
     }
 
     /// Whether no timers but keepalive, idle, rtt, pushnewcid, and key discard are running
