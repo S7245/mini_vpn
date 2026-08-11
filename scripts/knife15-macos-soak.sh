@@ -4286,6 +4286,29 @@ EOF_FAKE_SLEEP
   mkdir -p "$m2_qualification_run/m2-qualification-real-client"
   m2_qualification_result_slo "$m2_qualification_run" 0 || \
     die "self-test: M2 qualification exact result envelope failed"
+  m2_qualification_terminal_wait_run="$tmp/m2-qualification-terminal-wait-run"
+  mkdir "$m2_qualification_terminal_wait_run"
+  printf '%s\n' \
+    '📊 TUIC endpoint pacing global conservation(available=60031B,live=1409B,outstanding=0B,records=2)' \
+    >"$m2_qualification_terminal_wait_run/mini_vpn.log"
+  (
+    /bin/sleep 0.1
+    printf '%s\n' \
+      '📊 TUIC endpoint pacing global conservation(available=61440B,live=0B,outstanding=0B,records=2)' \
+      >>"$m2_qualification_terminal_wait_run/mini_vpn.log"
+  ) &
+  m2_qualification_terminal_wait_pid=$!
+  wait_for_m2_qualification_terminal_safety \
+    "$m2_qualification_terminal_wait_run" 2 || \
+    die "self-test: M2 qualification did not wait for bounded terminal drain"
+  wait "$m2_qualification_terminal_wait_pid" || \
+    die "self-test: M2 qualification terminal-drain fixture failed"
+  printf '%s\n' \
+    '📊 TUIC endpoint pacing global conservation(available=60031B,live=1409B,outstanding=0B,records=2)' \
+    >>"$m2_qualification_terminal_wait_run/mini_vpn.log"
+  ! wait_for_m2_qualification_terminal_safety \
+    "$m2_qualification_terminal_wait_run" 1 || \
+    die "self-test: M2 qualification terminal-drain wait was unbounded"
   : >"$m2_qualification_run/mini_vpn.log"
   endpoint_rebind_lifecycle_is_clean "$m2_qualification_run/mini_vpn.log" || \
     die "self-test: empty M2 qualification rebind lifecycle rejected"
@@ -7835,6 +7858,19 @@ m2_qualification_terminal_safety() {
       "$log_file"
 }
 
+wait_for_m2_qualification_terminal_safety() {
+  local run_dir="$1"
+  local timeout_secs="$2"
+  local deadline
+  validate_positive_integer "$timeout_secs" || return 1
+  deadline=$((SECONDS + 10#$timeout_secs))
+  while ((SECONDS < deadline)); do
+    m2_qualification_terminal_safety "$run_dir" && return 0
+    /bin/sleep 1
+  done
+  m2_qualification_terminal_safety "$run_dir"
+}
+
 free_kb_for_path() {
   df -Pk "$1" 2>/dev/null | awk 'NR == 2 && $4 ~ /^[0-9]+$/ {print $4; exit}'
 }
@@ -8164,10 +8200,11 @@ run_m2_action() {
       trap - INT TERM HUP
       clear_workload_state
       sample_once_for "$run_dir" || true
-      if ! m0_assert_run_healthy "$run_dir" || \
-        ! network_control_is_sufficient "$run_dir" 5 || \
-        ! m2_qualification_result_slo "$run_dir" 2 || \
-        ! m2_qualification_terminal_safety "$run_dir"; then
+      if ! m2_qualification_result_slo "$run_dir" 2 || \
+        ! wait_for_m2_qualification_terminal_safety \
+          "$run_dir" "$quiescence_timeout_secs" || \
+        ! m0_assert_run_healthy "$run_dir" || \
+        ! network_control_is_sufficient "$run_dir" 5; then
         printf '%s\n' failed >"$run_dir/$status_file"
         append_event_to "$run_dir" \
           "$stage failed: final health, network, or Endpoint evidence"
