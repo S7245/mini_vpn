@@ -105,8 +105,10 @@ On `.33`, a short isolated observer transaction passed:
   cleanup ownership, secret scan, and immutable bundle checksum.
 - Code review found and repaired stale-lifetime admission, bundle-before-table
   cleanup, four-netlink-reads-per-second overhead, signal/finalization ordering,
-  wrong-Exit admission, and observer-script override. No unresolved P0/P1
-  remains in the changed scripts/docs scope.
+  wrong-Exit admission, observer-script override, and a zombie-reap PID
+  identity race. No unresolved P0/P1 remains in the changed scripts/docs scope.
+- Formal M2 rejects source older than the reviewed v2 observer implementation
+  commit `2707873`.
 
 ## Frozen Scope And Decision
 

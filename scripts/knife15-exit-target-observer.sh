@@ -101,6 +101,18 @@ process_matches() {
   [[ -n "$command_text" && "$command_text" == *"$needle"* ]]
 }
 
+process_state_is_zombie() {
+  [[ "$1" == Z* ]]
+}
+
+process_is_zombie() {
+  local pid="$1" state
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  state="$("$PS_BIN" -p "$pid" -o stat= 2>/dev/null | \
+    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  [[ -n "$state" ]] && process_state_is_zombie "$state"
+}
+
 observer_live() {
   local run_dir tcpdump_pid sampler_pid counter_sampler_pid
   run_dir="$(state_value run_dir 2>/dev/null || true)"
@@ -321,8 +333,13 @@ stop_process_group() {
       wait "$pid" 2>/dev/null || true
       return 0
     }
+    process_is_zombie "$pid" && {
+      wait "$pid" 2>/dev/null || true
+      return 0
+    }
     /bin/sleep 1
   done
+  process_is_zombie "$pid" && return 0
   process_matches "$pid" "$needle" || \
     die "observer PID identity changed while stopping: $pid"
   kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
@@ -550,6 +567,9 @@ EOF_FAKE_SETSID
   ! validate_timeout 899 || die "self-test: short timeout accepted"
   validate_timeout 93600 || die "self-test: formal M2 timeout rejected"
   ! validate_timeout 93601 || die "self-test: oversized timeout accepted"
+  process_state_is_zombie Z || die "self-test: zombie process state rejected"
+  process_state_is_zombie Z+ || die "self-test: foreground zombie state rejected"
+  ! process_state_is_zombie S || die "self-test: live process state accepted as zombie"
   [[ "$(capture_filter 43.130.32.77 5201 8443)" == \
     '((host 43.130.32.77 and port 5201) or (udp and port 8443))' ]] || \
     die "self-test: Target/TUIC capture filter mismatch"

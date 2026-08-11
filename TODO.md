@@ -22,6 +22,7 @@ counters once per second, retains only a bounded recent pcap ring, and owns
 its nftables table with fail-closed cleanup. Formal `m2` requires the matching
 observer to be fully healthy and at most `900s` old, binds its SSH host to the
 recorded Exit, and automatically freezes/bundles it on every terminal path.
+Source older than reviewed observer commit `2707873` is rejected.
 Local self-tests and a real `.33` lifecycle probe pass; no Rust production
 code, frozen value, workload, or SLI changed. Result:
 `docs/tech/2026-08-11-knife15-formal-m2-udp-path-attribution-observer-local-results.md`.

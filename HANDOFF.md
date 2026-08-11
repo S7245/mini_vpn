@@ -23,6 +23,7 @@
   counter cleanup. Formal M2 requires a matching healthy observer no older
   than `900s`, binds its SSH IP to the recorded Exit, and automatically
   `freeze -> bundle`s it on success, failure, signal, or unexpected exit.
+- Formal M2 rejects source older than reviewed observer commit `2707873`.
 - Local observer and Mac runner self-tests pass. A real `.33` lifecycle probe
   counted reverse UDP, froze cleanly, left sing-box active with zero restarts,
   and produced Exit bundle SHA-256 `fff3011e...`. No Rust production code,

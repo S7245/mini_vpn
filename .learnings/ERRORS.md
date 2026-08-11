@@ -19,6 +19,11 @@
   old but still active observer could expire before 24 hours, and a hard-
   timed-out observer could be bundled while leaving its diagnostic nftables
   table installed. Focused RED/GREEN checks now reject both.
+- A later full self-test exposed a stop race: the fake observer had exited and
+  become zombie, so `kill -0` remained true while command identity had already
+  disappeared. The old safety check reported PID replacement. Cleanup now
+  accepts only exact `Z*` as already terminated; live PIDs still require the
+  recorded command marker. Three consecutive observer self-tests pass.
 - The repair changes only bounded observability and test orchestration. The
   formal failure remains failed; workload, SLI, and data-plane constants are
   unchanged.

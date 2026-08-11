@@ -12,6 +12,10 @@
 - An observer that mutates diagnostic state needs the same ownership discipline
   as the product runner. Record the exact nftables table and ownership bit,
   refuse ambiguous deletion, and refuse bundling while owned state remains.
+- `kill -0` is not a liveness proof during cleanup: a zombie still has a PID
+  while its command identity has disappeared. Treat an exact `Z*` process
+  state as terminated, but retain command matching before signaling any live
+  PID so PID reuse remains fail-closed.
 - Bind evidence to the system under test, not only its payload filter. The
   formal runner now matches Exit SSH IP, Target, iperf/TUIC ports, schema,
   health, and lifetime before traffic.

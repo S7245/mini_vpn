@@ -205,6 +205,7 @@ Current Knife15 summary, as of 2026-08-11:
   fully healthy observer no older than `900s`, binds SSH to the recorded Exit,
   and automatically freezes/bundles evidence on success, failure, signal, or
   unexpected exit.
+- Formal M2 rejects source older than reviewed observer commit `2707873`.
 - Local runner/observer self-tests and a real `.33` lifecycle probe pass. The
   probe counted reverse UDP, removed all observer state/table ownership, left
   sing-box active with zero restarts, and produced bundle SHA-256
