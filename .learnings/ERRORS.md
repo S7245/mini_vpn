@@ -1,5 +1,27 @@
 # Errors
 
+## 2026-08-11 - Qualification traffic passed but immediate terminal sampling failed
+
+- Exact-source `25ea39c` completed two cycles/eight phases, two DNS and
+  real-client checks, with zero Target receiver-zero intervals and clean
+  cleanup, but the immutable runner status is `failed/MISMATCH`.
+- The final assertion read the most recent Endpoint statistics immediately
+  after the last real-client close. It still showed one transient `1,409B`
+  live reservation. The next normal line about 14 seconds later showed zero
+  live/outstanding ownership and remained clean.
+- Exact artifact-prefix replay reproduced the failure; adding only the real
+  subsequent drain records passed every terminal predicate. The repair waits
+  under the existing 50-second bound, fails persistent ownership, and repeats
+  runtime/network health checks after drain.
+- Paired Exit evidence prevented misclassifying one sender-zero interval as a
+  product regression: Target received positive bytes every complete interval,
+  with a maximum `263.147ms` supply gap and zero capture drops.
+- The Exit archive was copied to a distinct `.complete` path, matched remote
+  SHA-256 `6f745e9f...`, and passed every internal `SHA256SUMS` entry before
+  analysis.
+- Result:
+  `docs/tech/2026-08-11-knife15-m2-successor-forward-service-inheritance-macos-qualification-results.md`.
+
 ## 2026-08-11 - Formal M2 exposed a successor service inheritance gap
 
 - Exact-source `e531b30` passed baseline/direct, smoke, every preflight, five

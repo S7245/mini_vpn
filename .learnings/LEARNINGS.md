@@ -1,5 +1,30 @@
 # Learnings
 
+## 2026-08-11 - Terminal safety needs a bounded settle boundary
+
+- A workload command can finish before its asynchronous Endpoint accounting
+  sample reflects the final release. Treating the first post-command gauge as
+  terminal truth created a false failure at `60,031/1,409/0B`; the next
+  ordinary sample about 14 seconds later was stably `61,414/0/0B`.
+- Reuse an existing lifecycle bound instead of inventing a tuning parameter.
+  Qualification now waits within the frozen `duration + 30` controlled-drain
+  limit and still rejects ownership that remains dirty at the deadline.
+- A successful settle wait is not sufficient by itself. Recheck process,
+  watchdog, route, DNS, full-tunnel, recent-network, and sample-count health
+  after the wait so asynchronous patience cannot hide a real runtime failure.
+- Preserve immutable evidence even when its runner verdict is wrong. Replay
+  the exact prefix and later records in a separate analysis copy, document the
+  false-negative classification, and never rewrite the archived status.
+- Directional SLIs remain authoritative. One Mac sender-zero interval did not
+  become a Target receiver-zero interval; paired Exit data showed continuous
+  supply with a `263.147ms` maximum gap. Sender pressure is review evidence,
+  while Target receiver continuity is the frozen acceptance boundary.
+- Absence of a recurrence can prove regression cleanliness without proving a
+  rare repair branch was reached. This run had no path reset or inherited
+  floor, so formal M2 remains the exact reachability/effectiveness gate.
+- Result:
+  `docs/tech/2026-08-11-knife15-m2-successor-forward-service-inheritance-macos-qualification-results.md`.
+
 ## 2026-08-11 - A replacement must inherit surrendered service, not only prove fresh liveness
 
 - One exact current-cwnd service turn proves delivery, path ownership, and

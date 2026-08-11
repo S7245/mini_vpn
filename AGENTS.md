@@ -189,7 +189,40 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-11:
 
-- Exact-source `e531b30` formal artifact
+- Exact-source `25ea39c` paired qualification artifact
+  `/tmp/mini_vpn_knife15_macos_20260811_054300.tar.gz` (SHA-256
+  `23a49673...`) passed baseline `11.858/55.917 Mbit/s`, direct at
+  `5.928 Mbit/s` without zero intervals, smoke, every preflight, two exact
+  cycles/eight phases, two DNS/real-client checks, and cleanup. Target
+  receiver-zero intervals were zero; one sender interval was zero, maximum
+  TCP gap was `5,636,096B`, and maximum UDP loss was `1.830049%`.
+- The immutable artifact records `failed/MISMATCH` because the runner asserted
+  terminal safety immediately after the final real-client probe. Its latest
+  Endpoint line was temporarily `60,031/1,409/0B`; the next ordinary sample
+  about 14 seconds later was `61,414/0/0B` and stayed zero-owned. Exact-prefix
+  replay is dirty before that drain record and PASS after it. Do not rewrite
+  the archive status; classify it as a runner false negative.
+- Paired Exit SHA-256 `6f745e9f...` captured `3,270,562` packets with zero
+  kernel drops. The short-forward connection containing the one Mac
+  sender-zero supplied `2,817,041B/10.182s` with a maximum `263.147ms` gap,
+  so Target remained continuous. Three remote-write failures were completed
+  timed-transfer close tails with zero D16 queued/leased/reserved ownership.
+- No path reset, successor replacement, or inherited floor occurred. The run
+  is regression-clean but does not claim inheritance-branch reachability;
+  formal M2 is decisive. Reviewed runner fix `3a8a796` waits under the existing
+  `duration + 30` bound, rejects persistent dirt, then rechecks process,
+  watchdog, routes, DNS, full-tunnel, and network health. Full runner
+  self-test, artifact replay, shell, diff, secret scan, and review pass with
+  no unresolved P0/P1. Result:
+  `docs/tech/2026-08-11-knife15-m2-successor-forward-service-inheritance-macos-qualification-results.md`.
+- Do not repeat or tune qualification. Pull/rebuild the pushed reviewed
+  descendant and take one fresh `m2-ipv6-check -> baseline ->
+  direct-discriminator -> start -> smoke -> m2 -> status -> stop` when the
+  Mac and `.33` services can remain uninterrupted for about 25 hours. A
+  Target receiver-zero after a logged nonzero inherited floor rejects the
+  mechanism. M3 remains blocked until formal M2 and cleanup pass.
+
+- Previous accepted position: exact-source `e531b30` formal artifact
   `/tmp/mini_vpn_knife15_macos_20260811_014220.tar.gz` (SHA-256
   `2d8b4e6e...`) passed baseline/direct, smoke, every preflight, five complete
   M2 cycles, most of cycle 6, and cleanup. Cycle-6 `short-forward-3` lost its

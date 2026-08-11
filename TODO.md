@@ -4,7 +4,44 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-11 — formal M2 rejected one-turn successor service; inheritance ready for qualification)
+#### Latest decision (2026-08-11 — paired qualification evidence passed; runner false negative fixed; formal M2 reopened)
+
+Exact-source `25ea39c` artifact
+`/tmp/mini_vpn_knife15_macos_20260811_054300.tar.gz` (SHA-256
+`23a49673...`) passed baseline `11.858/55.917 Mbit/s`, bounded direct at
+`5.928 Mbit/s`, smoke, every preflight, two cycles/eight phases, two
+DNS/real-client checks, and cleanup. Target receiver-zero intervals were zero;
+one sender interval was zero, maximum TCP gap was `5,636,096B`, and maximum
+UDP loss was `1.830049%`.
+
+The immutable status is `failed/MISMATCH`, but exact replay proves a runner
+false negative. The immediate final Endpoint line was
+`60,031/1,409/0B`; about 14 seconds later ordinary statistics reached
+`61,414/0/0B` and stayed zero-owned. Paired Exit SHA-256 `6f745e9f...`
+captured `3,270,562` packets with zero drops. The short flow containing the
+sender-zero supplied `2,817,041B/10.182s` with maximum `263.147ms` gap, so
+Target continuity did not fail.
+
+Reviewed `3a8a796` waits for terminal safety under the existing 50-second
+controlled-drain bound, rejects persistent dirt, then rechecks runtime and
+network health. Full runner self-test, exact artifact replay, shell, diff,
+secret scan, and review pass with no unresolved P0/P1. No Rust data-plane or
+frozen value changed. No path reset/inherited floor occurred in this run, so
+formal M2 remains the deciding branch-reachability gate. Result:
+`docs/tech/2026-08-11-knife15-m2-successor-forward-service-inheritance-macos-qualification-results.md`.
+
+Next:
+
+1. do not repeat or tune qualification;
+2. pull/rebuild the pushed descendant of `3a8a796`;
+3. when the HK Mac and `.33` services can remain uninterrupted for about 25
+   hours, take exactly one `m2-ipv6-check -> baseline ->
+   direct-discriminator -> start -> smoke -> m2 -> status -> stop`;
+4. preserve `status/snapshot/stop` after failure;
+5. a Target receiver-zero after a logged nonzero inherited floor rejects the
+   mechanism. M3 remains blocked until formal M2 and cleanup pass.
+
+#### Previous decision (2026-08-11 — formal M2 rejected one-turn successor service; inheritance ready for qualification)
 
 Exact-source `e531b30` formal artifact
 `/tmp/mini_vpn_knife15_macos_20260811_014220.tar.gz` (SHA-256
