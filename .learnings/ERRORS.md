@@ -1,5 +1,30 @@
 # Errors
 
+## 2026-08-11 - Formal M2 lost reverse UDP without same-window segment attribution
+
+- Exact-source `0e44a939` completed fourteen cycles, then cycle 15 reverse
+  UDP lost `22,139/562,748` datagrams (`3.934088%`) and correctly exceeded the
+  frozen `3%` limit. TCP Target receiver-zero remained zero and cleanup passed.
+- Target sent the complete flow while the Mac physical receive rate fell.
+  Gateway/interface, local UDP drop/backpressure, TUN pump, D16, Endpoint,
+  process, and service-restart evidence was clean. This rejects a local queue
+  or frozen-capacity explanation but cannot identify the historical loss side
+  of `.33` without an Exit observer.
+- The first same-rate direct diagnostic returned no usable JSON after the SSH
+  session closed; it was rejected. An immediate retry hit an iperf `server
+  busy` condition left by that attempt and was also rejected. Only the later
+  independently completed systemd-bounded run was accepted: all `562,214`
+  datagrams arrived with `0%` loss.
+- Review found two additional observer hazards before the next long run: an
+  old but still active observer could expire before 24 hours, and a hard-
+  timed-out observer could be bundled while leaving its diagnostic nftables
+  table installed. Focused RED/GREEN checks now reject both.
+- The repair changes only bounded observability and test orchestration. The
+  formal failure remains failed; workload, SLI, and data-plane constants are
+  unchanged.
+- Result:
+  `docs/tech/2026-08-11-knife15-formal-m2-udp-path-attribution-observer-local-results.md`.
+
 ## 2026-08-11 - Formal M2 preflight admitted preventable evidence ambiguity
 
 - The formal verdict did not call the exact recovery-evidence safety helper

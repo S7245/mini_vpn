@@ -2,7 +2,7 @@
 
 Date: 2026-07-30
 
-Status: **FORMAL M2 REOPENED — use a clean reviewed descendant of `de4d170`;
+Status: **FORMAL M2 BLOCKED UNTIL THE REVIEWED V2 EXIT OBSERVER IS PULLED —
 the paired two-cycle qualification is complete and must not be repeated**
 
 This is the reviewed formal M2 sequence. The current next run is the frozen
@@ -65,6 +65,9 @@ export DURATION=20
 export PARALLEL=1
 export METRICS_SECS=30
 export SAMPLE_SECS=30
+
+export EXIT_SSH_HOST='ubuntu@43.153.32.33'
+export EXIT_SSH_KEY="$HOME/.ssh/vpn"
 
 export MINI_VPN_TUIC_SERVER='43.153.32.33:8443'
 export MINI_VPN_TUIC_UUID='REPLACE_WITH_UUID'
@@ -228,16 +231,24 @@ and restore IPv6 using the pre-start branch in section 8.
 ## 6. Start, Smoke, And Formal M2
 
 Before `start`, confirm that the `.33` Exit and `.77` Target services can stay
-powered and reachable for about 25 hours. The earlier two-hour paired observer
-was a bounded qualification instrument and is not a prerequisite for formal
-acceptance; do not reuse an expired observer directory.
+powered and reachable for about 25 hours. Formal M2 now requires one fresh v2
+Exit observer. It records bounded recent Target/TUIC packets plus per-second
+four-direction counters and is automatically frozen/bundled when `m2` exits.
+Do not reuse an expired observer directory.
 
 ```bash
 sudo -v
 sudo -E bash scripts/knife15-macos-soak.sh start
 sudo -E bash scripts/knife15-macos-soak.sh smoke
+OBSERVER_TIMEOUT_SECS=93600 bash scripts/knife15-exit-target-observer.sh start
 caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2
 ```
+
+Start the observer only after smoke passes, then invoke `m2` promptly. Formal
+preflight rejects a mismatched Exit/Target/port, any dead observer component,
+and an observer older than 900 seconds. It also requires
+`EXIT_SSH_HOST` to match the recorded Exit IP. If observer start fails, do not
+run `m2`; preserve its output and continue with Mac `status/snapshot/stop`.
 
 Do not press `Ctrl+C`, close the terminal, start Clash, or change the network.
 Before starting the formal schedule, `m2` waits up to the
@@ -271,6 +282,11 @@ sudo -E bash scripts/knife15-macos-soak.sh stop
 secrets, creates one immutable bundle, and prints its SHA-256. Only a complete
 formal workload with a valid pre-stop verdict and successful cleanup becomes
 `formal_m2_acceptance: PASS`.
+
+The `m2` action also prints the remote Exit observer bundle path and SHA-256
+inside `m2-exit-observer-finalization.txt`. Sync that remote bundle together
+with the Mac bundle; do not run a second observer `stop` or `bundle` after
+successful automatic finalization.
 
 Send both lines:
 

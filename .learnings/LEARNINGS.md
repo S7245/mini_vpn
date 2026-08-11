@@ -1,5 +1,26 @@
 # Learnings
 
+## 2026-08-11 - Long-run attribution needs aggregate history plus failure-time detail
+
+- A bounded rolling pcap and a long-duration test solve different evidence
+  problems. Keep only recent exact packets, but retain low-cost cumulative
+  packet/byte counters for the whole run; freeze the ring on the first
+  terminal event so neither storage nor evidence age is unbounded.
+- Observer lifetime is a consumable budget. Checking only its configured
+  timeout is insufficient; formal preflight must verify elapsed time so the
+  remaining lifetime covers the entire frozen schedule.
+- An observer that mutates diagnostic state needs the same ownership discipline
+  as the product runner. Record the exact nftables table and ownership bit,
+  refuse ambiguous deletion, and refuse bundling while owned state remains.
+- Bind evidence to the system under test, not only its payload filter. The
+  formal runner now matches Exit SSH IP, Target, iperf/TUIC ports, schema,
+  health, and lifetime before traffic.
+- Do not turn a real external-path SLI failure into a product PASS merely
+  because local queues are clean. Preserve the formal failure, reject tuning,
+  and improve the next run's discriminator before spending another 25 hours.
+- Result:
+  `docs/tech/2026-08-11-knife15-formal-m2-udp-path-attribution-observer-local-results.md`.
+
 ## 2026-08-11 - Long-run acceptance needs executable provenance and one safety contract
 
 - A source revision in an evidence bundle is insufficient if the runner can

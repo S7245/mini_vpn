@@ -189,7 +189,35 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-11:
 
-- Concentrated formal-M2 self-audit removed three locally preventable
+- Exact-source `0e44a939` formal artifact
+  `/tmp/mini_vpn_knife15_macos_20260811_074703.tar.gz` (SHA-256
+  `a0c268c1...`) completed fourteen cycles before cycle 15 reverse UDP lost
+  `3.934088%`, above the frozen `3%` limit. TCP Target receiver-zero remained
+  zero and cleanup passed. Target sent every datagram; local TUN/D16/Endpoint,
+  backpressure, interface, and gateway evidence was clean. A later exact
+  same-rate `.77 -> .33` reverse-UDP discriminator lost zero of `562,214`
+  datagrams. Classify this as a transient external UDP/QUIC path event, but
+  keep formal M2 failed because no same-window observer can split the path.
+- The v2 Exit observer runs for at most `93,600s`, keeps a bounded recent
+  Target/TUIC pcap ring, and records four-direction nftables packet/byte
+  counters every second. Its table has exact ownership and cannot be bypassed
+  by bundling after process timeout. Formal M2 now requires an exact matching,
+  fully healthy observer no older than `900s`, binds SSH to the recorded Exit,
+  and automatically freezes/bundles evidence on success, failure, signal, or
+  unexpected exit.
+- Local runner/observer self-tests and a real `.33` lifecycle probe pass. The
+  probe counted reverse UDP, removed all observer state/table ownership, left
+  sing-box active with zero restarts, and produced bundle SHA-256
+  `fff3011e...`. No Rust production code, workload, SLI, or frozen value
+  changed. Result:
+  `docs/tech/2026-08-11-knife15-formal-m2-udp-path-attribution-observer-local-results.md`.
+- Do not repeat qualification or tune. Pull/rebuild the reviewed pushed
+  descendant, start one fresh v2 observer after smoke, and take exactly one
+  `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke ->
+  observer start -> m2 -> status -> stop`. Sync both Exit and Mac bundles.
+  Formal M2 and M3 remain blocked until the transaction and cleanup pass.
+
+- Previous accepted position: concentrated formal-M2 self-audit removed three locally preventable
   long-run risks without changing Rust production code or frozen behavior.
   Formal M2 now shares the qualification's exact recovery contract, rejects
   source older than reviewed inheritance `de4d170`, and refuses a

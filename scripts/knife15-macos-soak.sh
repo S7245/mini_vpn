@@ -12,6 +12,7 @@ umask 077
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCRIPT_PATH="$SCRIPT_DIR/$(basename "$0")"
+M2_EXIT_OBSERVER_SCRIPT="${M2_EXIT_OBSERVER_SCRIPT:-$SCRIPT_DIR/knife15-exit-target-observer.sh}"
 SAFE_PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
 PATH="$SAFE_PATH"
 export PATH
@@ -119,6 +120,11 @@ SOAK_SUCCESS_STATUS=complete
 SOAK_REAL_CLIENT_PROBE=0
 M2_REAL_CLIENT_EVIDENCE_DIR=m2-real-client
 M2_COMPLETE_CYCLE_INDEX=0
+M2_EXIT_OBSERVER_ARMED=0
+M2_EXIT_OBSERVER_RUN_DIR=
+M2_EXIT_OBSERVER_TARGET=
+M2_EXIT_OBSERVER_IPERF_PORT=
+M2_EXIT_OBSERVER_TUIC_PORT=
 
 ACTION="${1:---help}"
 
@@ -171,6 +177,8 @@ Important optional environment:
   M1_DIRECT_DIR=/tmp/mini_vpn_knife15_macos_direct_REPLACE_WITH_TIMESTAMP
   M2_BASELINE_DIR=/tmp/mini_vpn_knife15_macos_baseline_REPLACE_WITH_TIMESTAMP
   M2_DIRECT_DIR=/tmp/mini_vpn_knife15_macos_direct_REPLACE_WITH_TIMESTAMP
+  EXIT_SSH_HOST=ubuntu@43.153.32.33
+  EXIT_SSH_KEY=$HOME/.ssh/vpn
 
 Workflow:
   1. cargo build --release
@@ -233,12 +241,15 @@ routes and the active physical service DNS until stop):
  12. sudo -v
  13. sudo -E bash scripts/knife15-macos-soak.sh start
  14. sudo -E bash scripts/knife15-macos-soak.sh smoke
-15. caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2
- 16. sudo -E bash scripts/knife15-macos-soak.sh status
-17. sudo -E bash scripts/knife15-macos-soak.sh stop
+ 15. export EXIT_SSH_HOST=ubuntu@43.153.32.33
+ 16. export EXIT_SSH_KEY="$HOME/.ssh/vpn"
+ 17. OBSERVER_TIMEOUT_SECS=93600 bash scripts/knife15-exit-target-observer.sh start
+ 18. caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2
+ 19. sudo -E bash scripts/knife15-macos-soak.sh status
+ 20. sudo -E bash scripts/knife15-macos-soak.sh stop
 
-Before another formal M2 after an initial-stream architecture or observer
-change, replace step 15 with:
+Before another formal M2 after an initial-stream architecture change, replace
+step 18 with:
   caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2-qualification
 
 M2 qualification runs exactly two 300s forward + 300s reverse + 180s
@@ -3166,6 +3177,8 @@ runner_self_test() {
   local tmp good_log bad_log route_fixture interface_fixture ping_fixture network_fixture service_fixture dns_fixture m2_route_bin m2_ifconfig_bin m2_networksetup_bin m2_dscacheutil_bin m2_curl_bin m2_route_state m2_run m2_result m2_schedule_run m2_test_profile m2_checkpoint_file m2_capture_run m2_ipv6_evidence original_m2_route_bin original_m2_ifconfig_bin original_m2_networksetup_bin original_m2_dscacheutil_bin original_m2_curl_bin collector_dir collector_bin original_path original_state_dir clean_scan secret_scan_dir secret_value summary_dir baseline_dir baseline_summary_text m0_profile m1_profile m2_profile m1_test_profile m0_run m1_stage_run m1_run m1_diagnostic_run m1_diagnostic_fail_run m1_diagnostic_formal_run m1_checkpoint_file m1_capture_run m1_formal_run m1_tcp_fixture m1_udp_fixture m0_fail_run direct_dir fake_iperf fake_dig fake_sleep usage_text dns_result unrelated_pid target_ready_json finalized_run finalized_bundle finalized_hash bounded_status cycle_index result_index result_label sample_index violations_before violation_count invalid_violations ipv6_class ipv6_interface cleanup_class
   local m2_record_fail_run quiescence_record_status m2_replay_log
   local m2_qualification_run m2_qualification_fail_run
+  local observer_status observer_run observer_fake observer_calls
+  local observer_exit_run observer_exit_status original_m2_exit_observer_script
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/knife15-macos-self-test.XXXXXX")" || return 1
   good_log="$tmp/good.log"
   bad_log="$tmp/bad.log"
@@ -5357,6 +5370,100 @@ EOF_FAIL_IPERF
   M2_QUIET_SHORT_COUNT=6
   M2_CHURN_SHORT_COUNT=24
   validate_m2_formal_config || die "self-test: formal M2 schedule rejected"
+  m2_exit_observer_ssh_host_matches_exit \
+    ubuntu@43.153.32.33 43.153.32.33 || \
+    die "self-test: matching formal M2 Exit SSH host rejected"
+  ! m2_exit_observer_ssh_host_matches_exit \
+    ubuntu@43.130.32.77 43.153.32.33 || \
+    die "self-test: wrong formal M2 Exit SSH host accepted"
+  observer_status=$'schema=knife15-exit-target-observer-v2\nstatus=active\nobserver_healthy=1\ntarget=43.130.32.77\niperf_port=5201\ntuic_port=8443\ntimeout_secs=93600\nelapsed_secs=0'
+  m2_exit_observer_status_is_valid \
+    "$observer_status" 43.130.32.77 5201 8443 || \
+    die "self-test: matching formal M2 Exit observer rejected"
+  ! m2_exit_observer_status_is_valid \
+    "${observer_status/observer_healthy=1/observer_healthy=0}" \
+    43.130.32.77 5201 8443 || \
+    die "self-test: unhealthy formal M2 Exit observer accepted"
+  ! m2_exit_observer_status_is_valid \
+    "${observer_status/timeout_secs=93600/timeout_secs=7200}" \
+    43.130.32.77 5201 8443 || \
+    die "self-test: short-lived formal M2 Exit observer accepted"
+  ! m2_exit_observer_status_is_valid \
+    "${observer_status/elapsed_secs=0/elapsed_secs=901}" \
+    43.130.32.77 5201 8443 || \
+    die "self-test: stale formal M2 Exit observer accepted"
+  observer_run="$tmp/m2-exit-observer-run"
+  observer_fake="$tmp/fake-exit-observer"
+  observer_calls="$tmp/exit-observer.calls"
+  mkdir "$observer_run"
+  cat >"$observer_fake" <<'EOF_FAKE_EXIT_OBSERVER'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >>"$M2_EXIT_OBSERVER_TEST_CALLS"
+case "$1" in
+  status)
+    printf '%s\n' \
+      'schema=knife15-exit-target-observer-v2' \
+      'status=active' \
+      'observer_healthy=1' \
+      'target=43.130.32.77' \
+      'iperf_port=5201' \
+      'tuic_port=8443' \
+      'timeout_secs=93600' \
+      'elapsed_secs=0'
+    ;;
+  freeze)
+    printf '%s\n' 'PASS: Exit observer frozen' \
+      'run_dir=/tmp/mini_vpn_knife15_exit_target_observer_20260811_120000'
+    ;;
+  bundle)
+    printf '%s\n' 'PASS: Exit observer bundle finalized' \
+      'bundle=/tmp/mini_vpn_knife15_exit_target_observer_20260811_120000.tar.gz' \
+      'sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    ;;
+  *) exit 1 ;;
+esac
+EOF_FAKE_EXIT_OBSERVER
+  chmod +x "$observer_fake"
+  export M2_EXIT_OBSERVER_TEST_CALLS="$observer_calls"
+  original_m2_exit_observer_script="$M2_EXIT_OBSERVER_SCRIPT"
+  M2_EXIT_OBSERVER_SCRIPT="$observer_fake"
+  m2_exit_observer_require_active \
+    "$observer_run" 43.130.32.77 5201 8443 || \
+    die "self-test: formal M2 active Exit observer preflight failed"
+  [[ "$(tr '\n' ' ' <"$observer_calls")" == "status " ]] || \
+    die "self-test: formal M2 observer preflight did not use status"
+  : >"$observer_calls"
+  m2_exit_observer_freeze_and_bundle \
+    "$observer_run" workload-failed 43.130.32.77 5201 8443 || \
+    die "self-test: formal M2 Exit observer finalization failed"
+  [[ "$(tr '\n' ' ' <"$observer_calls")" == "freeze bundle " ]] || \
+    die "self-test: formal M2 did not freeze before observer bundling"
+  grep -Fxq 'reason=workload-failed' \
+    "$observer_run/m2-exit-observer-finalization.txt" || \
+    die "self-test: formal M2 observer finalization reason missing"
+  grep -Fxq \
+    'sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+    "$observer_run/m2-exit-observer-finalization.txt" || \
+    die "self-test: formal M2 observer bundle checksum missing"
+  observer_exit_run="$tmp/m2-exit-observer-exit-run"
+  mkdir "$observer_exit_run"
+  printf 'timestamp\tevent\n' >"$observer_exit_run/events.tsv"
+  : >"$observer_calls"
+  (
+    m2_exit_observer_arm \
+      "$observer_exit_run" 43.130.32.77 5201 8443
+    trap 'm2_exit_observer_exit_trap "$?"' EXIT
+    exit 7
+  )
+  observer_exit_status=$?
+  [[ "$observer_exit_status" == "7" ]] || \
+    die "self-test: formal M2 observer EXIT trap changed primary status"
+  [[ "$(tr '\n' ' ' <"$observer_calls")" == "freeze bundle " ]] || \
+    die "self-test: formal M2 unexpected exit did not freeze and bundle"
+  grep -Fxq 'reason=unexpected-exit' \
+    "$observer_exit_run/m2-exit-observer-finalization.txt" || \
+    die "self-test: formal M2 unexpected-exit reason missing"
+  M2_EXIT_OBSERVER_SCRIPT="$original_m2_exit_observer_script"
   ! m2_source_is_accepted 5e7a97c || \
     die "self-test: obsolete pre-inheritance source was accepted for formal M2"
   m2_source_is_accepted de4d170 || \
@@ -7786,6 +7893,162 @@ m2_source_is_accepted() {
   git -C "$REPO" merge-base --is-ancestor de4d170 "$revision" >/dev/null 2>&1
 }
 
+m2_exit_observer_value_from_text() {
+  local key="$1"
+  awk -F= -v key="$key" '
+    $1 == key {
+      count++
+      value = substr($0, length(key) + 2)
+    }
+    END {
+      if (count != 1 || value == "") exit 1
+      print value
+    }
+  '
+}
+
+m2_exit_observer_ssh_host_matches_exit() {
+  local ssh_host="$1"
+  local exit_host="$2"
+  [[ "$ssh_host" =~ ^[a-z_][a-zA-Z0-9_-]*@([0-9]+[.]){3}[0-9]+$ ]] && \
+    validate_ipv4 "$exit_host" && [[ "${ssh_host#*@}" == "$exit_host" ]]
+}
+
+m2_exit_observer_status_is_valid() {
+  local status_text="$1"
+  local target="$2"
+  local iperf_port="$3"
+  local tuic_port="$4"
+  local schema status healthy observed_target observed_iperf_port
+  local observed_tuic_port timeout_secs elapsed_secs
+  schema="$(m2_exit_observer_value_from_text schema <<<"$status_text")" || return 1
+  status="$(m2_exit_observer_value_from_text status <<<"$status_text")" || return 1
+  healthy="$(m2_exit_observer_value_from_text observer_healthy \
+    <<<"$status_text")" || return 1
+  observed_target="$(m2_exit_observer_value_from_text target \
+    <<<"$status_text")" || return 1
+  observed_iperf_port="$(m2_exit_observer_value_from_text iperf_port \
+    <<<"$status_text")" || return 1
+  observed_tuic_port="$(m2_exit_observer_value_from_text tuic_port \
+    <<<"$status_text")" || return 1
+  timeout_secs="$(m2_exit_observer_value_from_text timeout_secs \
+    <<<"$status_text")" || return 1
+  elapsed_secs="$(m2_exit_observer_value_from_text elapsed_secs \
+    <<<"$status_text")" || return 1
+  [[ "$schema" == "knife15-exit-target-observer-v2" && \
+    "$status" == "active" && "$healthy" == "1" && \
+    "$observed_target" == "$target" && \
+    "$observed_iperf_port" == "$iperf_port" && \
+    "$observed_tuic_port" == "$tuic_port" && \
+    "$timeout_secs" == "93600" && "$elapsed_secs" =~ ^[0-9]+$ ]] && \
+    ((10#$elapsed_secs <= 900))
+}
+
+m2_exit_observer_call() {
+  local action="$1"
+  local target="$2"
+  local iperf_port="$3"
+  local tuic_port="$4"
+  [[ -f "$M2_EXIT_OBSERVER_SCRIPT" && ! -L "$M2_EXIT_OBSERVER_SCRIPT" ]] || \
+    return 1
+  validate_ipv4 "$target" && \
+    validate_positive_integer "$iperf_port" && ((10#$iperf_port <= 65535)) && \
+    validate_positive_integer "$tuic_port" && ((10#$tuic_port <= 65535)) || \
+    return 1
+  TARGET="$target" IPERF_PORT="$iperf_port" TUIC_PORT="$tuic_port" \
+    OBSERVER_TIMEOUT_SECS=93600 \
+    /bin/bash "$M2_EXIT_OBSERVER_SCRIPT" "$action"
+}
+
+m2_exit_observer_finalization_is_valid() {
+  local evidence_file="$1"
+  [[ -f "$evidence_file" && ! -L "$evidence_file" ]] || return 1
+  [[ "$(grep -Ec '^PASS: Exit observer frozen$' "$evidence_file" \
+    2>/dev/null || true)" == "1" ]] && \
+    [[ "$(grep -Ec '^PASS: Exit observer bundle finalized$' "$evidence_file" \
+      2>/dev/null || true)" == "1" ]] && \
+    [[ "$(grep -Ec '^bundle=/tmp/mini_vpn_knife15_exit_target_observer_[0-9]{8}_[0-9]{6}[.]tar[.]gz$' \
+      "$evidence_file" 2>/dev/null || true)" == "1" ]] && \
+    [[ "$(grep -Ec '^sha256=[0-9a-f]{64}$' "$evidence_file" \
+      2>/dev/null || true)" == "1" ]]
+}
+
+m2_exit_observer_require_active() {
+  local run_dir="$1"
+  local target="$2"
+  local iperf_port="$3"
+  local tuic_port="$4"
+  local evidence_file="$run_dir/m2-exit-observer-status.txt"
+  [[ -d "$run_dir" && ! -L "$run_dir" ]] || return 1
+  m2_exit_observer_call status "$target" "$iperf_port" "$tuic_port" \
+    >"$evidence_file" 2>&1 || return 1
+  m2_exit_observer_status_is_valid \
+    "$(sed -n '1,80p' "$evidence_file")" \
+    "$target" "$iperf_port" "$tuic_port"
+}
+
+m2_exit_observer_freeze_and_bundle() {
+  local run_dir="$1"
+  local reason="$2"
+  local target="$3"
+  local iperf_port="$4"
+  local tuic_port="$5"
+  local evidence_file="$run_dir/m2-exit-observer-finalization.txt"
+  [[ -d "$run_dir" && ! -L "$run_dir" ]] || return 1
+  [[ "$reason" =~ ^[a-z0-9-]+$ ]] || return 1
+  printf '%s\n' \
+    'schema=knife15-m2-exit-observer-finalization-v1' \
+    "started_at=$(timestamp)" \
+    "reason=$reason" \
+    "observer_script_sha256=$(sha256_file "$M2_EXIT_OBSERVER_SCRIPT")" \
+    >"$evidence_file" || return 1
+  if ! m2_exit_observer_call freeze "$target" "$iperf_port" "$tuic_port" \
+    >>"$evidence_file" 2>&1; then
+    printf '%s\n' 'finalization_status=freeze_failed' >>"$evidence_file"
+    return 1
+  fi
+  if ! m2_exit_observer_call bundle "$target" "$iperf_port" "$tuic_port" \
+    >>"$evidence_file" 2>&1; then
+    printf '%s\n' 'finalization_status=bundle_failed' >>"$evidence_file"
+    return 1
+  fi
+  printf '%s\n' 'finalization_status=complete' >>"$evidence_file"
+  m2_exit_observer_finalization_is_valid "$evidence_file"
+}
+
+m2_exit_observer_arm() {
+  M2_EXIT_OBSERVER_RUN_DIR="$1"
+  M2_EXIT_OBSERVER_TARGET="$2"
+  M2_EXIT_OBSERVER_IPERF_PORT="$3"
+  M2_EXIT_OBSERVER_TUIC_PORT="$4"
+  M2_EXIT_OBSERVER_ARMED=1
+}
+
+m2_exit_observer_finalize_armed() {
+  local reason="$1"
+  local result=0
+  [[ "$M2_EXIT_OBSERVER_ARMED" == "1" ]] || return 0
+  if ! m2_exit_observer_freeze_and_bundle \
+    "$M2_EXIT_OBSERVER_RUN_DIR" "$reason" \
+    "$M2_EXIT_OBSERVER_TARGET" "$M2_EXIT_OBSERVER_IPERF_PORT" \
+    "$M2_EXIT_OBSERVER_TUIC_PORT"; then
+    result=1
+  fi
+  M2_EXIT_OBSERVER_ARMED=0
+  append_event_to "$M2_EXIT_OBSERVER_RUN_DIR" \
+    "m2 Exit observer finalization reason=$reason status=$(
+      ((result == 0)) && printf complete || printf failed
+    )"
+  return "$result"
+}
+
+m2_exit_observer_exit_trap() {
+  local exit_status="$1"
+  trap - EXIT
+  m2_exit_observer_finalize_armed unexpected-exit || true
+  exit "$exit_status"
+}
+
 m2_worktree_is_clean() {
   local repo="${1:-$REPO}"
   git -C "$repo" diff --quiet -- && \
@@ -8059,13 +8322,14 @@ m2_workload_slo() {
 
 run_m2_action() {
   local execution_mode="${1:-formal}"
-  local run_dir utun target exit_host iperf_port dns_target dns_name
+  local run_dir utun target exit_host server_port iperf_port dns_target dns_name
   local profile_file free_kb command_name ipv6_evidence_file duration
   local data_plane_values endpoint_values data_plane_samples_before
   local endpoint_samples_before quiescence_timeout_secs quiescence_snapshot
   local quiescence_status
   local action_description stage label evidence_dir status_file
   local baseline_evidence_dir direct_evidence_dir
+  local observer_finalization_status=0
   case "$execution_mode" in
     formal)
       action_description="formal M2"
@@ -8126,6 +8390,7 @@ run_m2_action() {
   utun="$(read_state utun)"
   target="$(read_state target)"
   exit_host="$(read_state exit_host)"
+  server_port="$(read_state server_port)"
   iperf_port="$(read_state iperf_port)"
   dns_target="$(read_state dns_target 2>/dev/null || true)"
   dns_name="$(read_state dns_name)"
@@ -8156,6 +8421,24 @@ run_m2_action() {
     die "M2 baseline must contain valid nonzero TCP forward/reverse results"
   validate_direct_continuity_dir "$M2_DIRECT_DIR" "$M2_BASELINE_DIR" "$target" || \
     die "$action_description requires a matching 300s direct continuity PASS completed within 15 minutes"
+
+  if [[ "$execution_mode" == "formal" ]]; then
+    [[ "$M2_EXIT_OBSERVER_SCRIPT" == \
+      "$SCRIPT_DIR/knife15-exit-target-observer.sh" ]] || \
+      die "formal M2 requires the exact tracked Exit observer script"
+    [[ -n "${EXIT_SSH_HOST:-}" && -n "${EXIT_SSH_KEY:-}" ]] || \
+      die "formal M2 requires explicit EXIT_SSH_HOST and EXIT_SSH_KEY for its owned Exit observer"
+    m2_exit_observer_ssh_host_matches_exit "$EXIT_SSH_HOST" "$exit_host" || \
+      die "formal M2 Exit observer SSH host must match the recorded Exit $exit_host"
+    if ! m2_exit_observer_require_active \
+      "$run_dir" "$target" "$iperf_port" "$server_port"; then
+      die "formal M2 requires a healthy matching 26-hour Exit observer; start it before m2 and inspect $run_dir/m2-exit-observer-status.txt"
+    fi
+    m2_exit_observer_arm "$run_dir" "$target" "$iperf_port" "$server_port"
+    trap 'm2_exit_observer_exit_trap "$?"' EXIT
+    append_event_to "$run_dir" \
+      "m2 Exit observer ownership armed target=$target iperf_port=$iperf_port tuic_port=$server_port"
+  fi
 
   mkdir "$run_dir/$evidence_dir" "$baseline_evidence_dir" "$direct_evidence_dir" \
     "$run_dir/$M2_REAL_CLIENT_EVIDENCE_DIR" || \
@@ -8299,6 +8582,12 @@ run_m2_action() {
   echo "Reserve about 25 wall-clock hours; full-tunnel DNS/routes remain owned until stop."
   if run_m2_schedule "$run_dir" "$profile_file"; then
     trap - INT TERM HUP
+    if ! m2_exit_observer_finalize_armed workload-complete; then
+      printf '%s\n' failed >"$run_dir/m2.status"
+      append_event_to "$run_dir" "m2 failed: Exit observer finalization"
+      write_summary "$run_dir"
+      die "M2 timeline completed but Exit observer freeze/bundle failed; use status/snapshot/stop"
+    fi
     clear_workload_state
     sample_once_for "$run_dir" || true
     if ! m2_workload_slo "$run_dir"; then
@@ -8320,8 +8609,13 @@ run_m2_action() {
     return 0
   fi
   trap - INT TERM HUP
+  m2_exit_observer_finalize_armed workload-failed || \
+    observer_finalization_status=$?
   clear_workload_state
   sample_once_for "$run_dir" || true
+  if [[ "$observer_finalization_status" != "0" ]]; then
+    warn "formal M2 failed and Exit observer finalization also failed; inspect m2-exit-observer-finalization.txt before remote recovery"
+  fi
   die "M2 workload failed; full tunnel and TUN remain for status/snapshot/stop evidence"
 }
 

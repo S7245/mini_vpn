@@ -4,7 +4,39 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-11 — formal M2 preflight self-audit passed)
+#### Latest decision (2026-08-11 — formal M2 hit external UDP loss; exact v2 observer required)
+
+Exact-source `0e44a939` artifact
+`/tmp/mini_vpn_knife15_macos_20260811_074703.tar.gz` (SHA-256
+`a0c268c1...`) completed fourteen formal cycles before cycle 15 reverse UDP
+reported `3.934088%` loss, above the frozen `3%` limit. TCP receiver-zero was
+zero and cleanup passed. Local TUN/D16/Endpoint/backpressure evidence was
+clean; Target sent the full datagram count; a later exact `.77 -> .33`
+same-rate discriminator had `0%` loss. The highest-confidence classification
+is transient external UDP/QUIC path loss, but the missing historical Exit
+observer prevents exact segment attribution. The result remains a real formal
+M2 failure.
+
+The v2 observer now runs up to `93,600s`, samples Target/TUIC packet and byte
+counters once per second, retains only a bounded recent pcap ring, and owns
+its nftables table with fail-closed cleanup. Formal `m2` requires the matching
+observer to be fully healthy and at most `900s` old, binds its SSH host to the
+recorded Exit, and automatically freezes/bundles it on every terminal path.
+Local self-tests and a real `.33` lifecycle probe pass; no Rust production
+code, frozen value, workload, or SLI changed. Result:
+`docs/tech/2026-08-11-knife15-formal-m2-udp-path-attribution-observer-local-results.md`.
+
+Next:
+
+1. finish local gates, code review, commit, and push the v2 observer stage;
+2. pull the reviewed descendant and rebuild release on the Mac;
+3. after smoke, start exactly one fresh `93,600s` observer and invoke formal
+   `m2` within 900 seconds;
+4. preserve/sync both automatic Exit observer and Mac bundles;
+5. do not repeat qualification or tune constants. M3 remains blocked until
+   formal M2 and cleanup pass.
+
+#### Previous decision (2026-08-11 — formal M2 preflight self-audit passed)
 
 A concentrated pre-test audit removed three preventable long-run risks without
 changing Rust production code or frozen behavior. Formal M2 now uses the exact

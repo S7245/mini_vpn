@@ -4,7 +4,37 @@
 
 ## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-11)
 
-- **Latest accepted position:** concentrated formal-M2 self-audit found and
+- **Latest accepted position:** exact-source `0e44a939` formal artifact
+  `/tmp/mini_vpn_knife15_macos_20260811_074703.tar.gz` (SHA-256
+  `a0c268c1...`) completed fourteen cycles and failed cycle 15 reverse UDP at
+  `3.934088%` loss versus the frozen `3%` limit. All prior UDP phases were
+  `1.1968..2.3812%`; TCP Target receiver-zero remained zero and cleanup
+  passed.
+- Target sent all `562,748` datagrams. The Mac physical receive rate fell
+  during burst loss while gateway/interface errors, local UDP drops,
+  backpressure, TUN pump, D16, Endpoint, and socket would-block stayed clean.
+  `.33`/`.77` did not restart. A later exact same-rate `.77 -> .33` reverse
+  UDP discriminator delivered `562,214/562,214` datagrams. This selects a
+  transient external UDP/QUIC path event, but the absent historical observer
+  cannot split before/after `.33`; formal M2 therefore remains failed.
+- The reviewed v2 observer now covers Target TCP/UDP plus encrypted TUIC,
+  keeps a bounded pcap ring, records four-direction nftables packet/byte
+  counters every second for up to `93,600s`, and refuses ambiguous or bypassed
+  counter cleanup. Formal M2 requires a matching healthy observer no older
+  than `900s`, binds its SSH IP to the recorded Exit, and automatically
+  `freeze -> bundle`s it on success, failure, signal, or unexpected exit.
+- Local observer and Mac runner self-tests pass. A real `.33` lifecycle probe
+  counted reverse UDP, froze cleanly, left sing-box active with zero restarts,
+  and produced Exit bundle SHA-256 `fff3011e...`. No Rust production code,
+  workload, SLI, or frozen value changed. Result:
+  `docs/tech/2026-08-11-knife15-formal-m2-udp-path-attribution-observer-local-results.md`.
+- Do not rerun yet. Pull/rebuild the reviewed pushed descendant, start one
+  fresh v2 observer after smoke, then take exactly one
+  `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke ->
+  observer start -> m2 -> status -> stop`. Sync both Mac and Exit bundles.
+  Do not repeat qualification or tune. M3 remains blocked.
+
+- **Previous accepted position:** concentrated formal-M2 self-audit found and
   fixed three locally preventable 25-hour-run risks without changing Rust or
   any frozen value. Formal M2 now shares the qualification's exact recovery
   contract, rejects source older than reviewed inheritance `de4d170`, and
