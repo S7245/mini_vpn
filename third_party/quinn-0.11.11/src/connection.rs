@@ -327,6 +327,16 @@ pub enum SuccessorServiceTurnError {
 }
 
 impl Connection {
+    /// Return the monotonic identity of the currently active network path.
+    #[doc(hidden)]
+    pub fn current_path_generation(&self) -> u64 {
+        self.0
+            .state
+            .lock("current_path_generation")
+            .inner
+            .current_path_generation()
+    }
+
     /// Deliver one congestion-window-sized, ACK-correlated transport service turn.
     #[doc(hidden)]
     pub async fn successor_service_turn(

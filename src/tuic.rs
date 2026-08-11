@@ -901,6 +901,138 @@ struct TcpPoolSuccessorServiceCertificate {
     proved_cwnd_floor: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpPoolSuccessorForwardServiceProof {
+    required_cwnd_floor: Option<u64>,
+    initial_cwnd: u64,
+    final_cwnd: u64,
+    rounds: u64,
+    target_bytes: u64,
+    sent_bytes: u64,
+    acked_bytes: u64,
+    lost_bytes: u64,
+    path_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpPoolSuccessorForwardServiceProgress {
+    Complete,
+    Continue,
+    Stalled,
+}
+
+fn tcp_pool_successor_forward_service_progress(
+    required_cwnd_floor: Option<u64>,
+    previous_cwnd: u64,
+    current_cwnd: u64,
+) -> TcpPoolSuccessorForwardServiceProgress {
+    if required_cwnd_floor.is_none_or(|floor| current_cwnd >= floor) {
+        return TcpPoolSuccessorForwardServiceProgress::Complete;
+    }
+    if current_cwnd > previous_cwnd {
+        TcpPoolSuccessorForwardServiceProgress::Continue
+    } else {
+        TcpPoolSuccessorForwardServiceProgress::Stalled
+    }
+}
+
+async fn prove_tcp_pool_successor_forward_service(
+    connection: &Connection,
+    required_cwnd_floor: Option<u64>,
+    deadline: tokio::time::Instant,
+) -> Result<TcpPoolSuccessorForwardServiceProof, ClientError> {
+    let required_cwnd_floor = required_cwnd_floor.filter(|floor| *floor != 0);
+    let initial_cwnd = connection.stats().path.cwnd;
+    let mut previous_cwnd = initial_cwnd;
+    let mut proof = TcpPoolSuccessorForwardServiceProof {
+        required_cwnd_floor,
+        initial_cwnd,
+        final_cwnd: initial_cwnd,
+        rounds: 0,
+        target_bytes: 0,
+        sent_bytes: 0,
+        acked_bytes: 0,
+        lost_bytes: 0,
+        path_generation: 0,
+    };
+
+    loop {
+        let turn = match tokio::time::timeout_at(deadline, connection.successor_service_turn())
+            .await
+        {
+            Ok(result) => result.map_err(|error| {
+                io_err(
+                    "tuic tcp pool generation replacement",
+                    format!(
+                        "successor forward service proof failed at round {}: {error:?}",
+                        proof.rounds.saturating_add(1)
+                    ),
+                )
+            })?,
+            Err(_) => {
+                let partial = connection.successor_service_turn_stats();
+                return Err(io_err(
+                    "tuic tcp pool generation replacement",
+                    format!(
+                        "successor forward service proof exceeded the existing 5s replacement deadline after {} complete round(s): partial={partial:?}",
+                        proof.rounds
+                    ),
+                ));
+            }
+        };
+
+        if proof.rounds != 0 && proof.path_generation != turn.path_generation {
+            return Err(io_err(
+                "tuic tcp pool generation replacement",
+                format!(
+                    "successor forward service proof changed path between rounds: first={} current={}",
+                    proof.path_generation, turn.path_generation
+                ),
+            ));
+        }
+        let current_path_generation = connection.current_path_generation();
+        if current_path_generation != turn.path_generation {
+            return Err(io_err(
+                "tuic tcp pool generation replacement",
+                format!(
+                    "successor forward service proof no longer owns the current path: turn={} current={current_path_generation}",
+                    turn.path_generation
+                ),
+            ));
+        }
+        proof.rounds = proof.rounds.saturating_add(1);
+        proof.path_generation = turn.path_generation;
+        proof.target_bytes = proof.target_bytes.saturating_add(turn.target_bytes);
+        proof.sent_bytes = proof.sent_bytes.saturating_add(turn.sent_bytes);
+        proof.acked_bytes = proof.acked_bytes.saturating_add(turn.acked_bytes);
+        proof.lost_bytes = proof.lost_bytes.saturating_add(turn.lost_bytes);
+        proof.final_cwnd = connection.stats().path.cwnd;
+
+        match tcp_pool_successor_forward_service_progress(
+            required_cwnd_floor,
+            previous_cwnd,
+            proof.final_cwnd,
+        ) {
+            TcpPoolSuccessorForwardServiceProgress::Complete => return Ok(proof),
+            TcpPoolSuccessorForwardServiceProgress::Continue => {
+                previous_cwnd = proof.final_cwnd;
+            }
+            TcpPoolSuccessorForwardServiceProgress::Stalled => {
+                return Err(io_err(
+                    "tuic tcp pool generation replacement",
+                    format!(
+                        "successor forward service proof made no cwnd progress below inherited floor: previous={} current={} required={} rounds={}",
+                        previous_cwnd,
+                        proof.final_cwnd,
+                        required_cwnd_floor.unwrap_or_default(),
+                        proof.rounds
+                    ),
+                ));
+            }
+        }
+    }
+}
+
 impl TcpPoolSuccessorServiceCertificate {
     fn new(
         identity: TcpPoolTransportIdentity,
@@ -5490,7 +5622,6 @@ struct EndpointRecoveryConnectionHandle {
     stable_id: usize,
     pool_index: usize,
     pool_generation: u64,
-    connection: Connection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5988,6 +6119,9 @@ impl TcpPoolTransport for u64 {
 struct TcpPoolGeneration<T> {
     transport: T,
     successor_service_certificate: Option<TcpPoolSuccessorServiceCertificate>,
+    /// Exact service the current transport had proved before surrendering its path or generation.
+    /// This is observed state, not a configured congestion-window target.
+    replacement_forward_service_floor: Option<u64>,
     activity: Arc<TcpPoolGenerationActivity>,
     write_pressure: Arc<TcpWritePressure>,
     read_pressure: Arc<TcpOrderedReadPressure>,
@@ -6000,6 +6134,7 @@ impl<T: TcpPoolTransport> TcpPoolGeneration<T> {
         Self {
             transport,
             successor_service_certificate: None,
+            replacement_forward_service_floor: None,
             activity: Arc::new(TcpPoolGenerationActivity::new()),
             write_pressure: Arc::new(TcpWritePressure::new(clock)),
             read_pressure: Arc::new(TcpOrderedReadPressure::new()),
@@ -6022,6 +6157,7 @@ impl<T: TcpPoolTransport> TcpPoolGeneration<T> {
             path_generation,
             proved_cwnd_floor,
         );
+        successor.replacement_forward_service_floor = Some(proved_cwnd_floor).filter(|v| *v != 0);
         successor
             .successor_service_certificate
             .is_some()
@@ -6035,8 +6171,21 @@ impl<T: TcpPoolTransport> TcpPoolGeneration<T> {
         )
     }
 
+    fn record_forward_service_floor(&mut self, observed_cwnd: u64) -> Option<u64> {
+        if observed_cwnd == 0 {
+            return None;
+        }
+        let floor = self
+            .replacement_forward_service_floor
+            .unwrap_or(0)
+            .max(observed_cwnd);
+        self.replacement_forward_service_floor = Some(floor);
+        Some(floor)
+    }
+
     fn note_reconnect_success(&mut self) {
         self.successor_service_certificate = None;
+        self.replacement_forward_service_floor = None;
         self.open_state.note_reconnect_success();
     }
 }
@@ -6062,6 +6211,48 @@ enum TcpPoolGenerationInstallError {
     PredecessorDraining,
     StalePredecessor,
     InvalidSuccessor,
+    InsufficientForwardService,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpPoolPathResetPreparation {
+    Current { forward_service_floor: u64 },
+    Draining,
+    Stale,
+    ZeroWindow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpPoolPathResetSnapshot {
+    rtt: Duration,
+    cwnd: u64,
+    current_mtu: u16,
+}
+
+impl TcpPoolPathResetSnapshot {
+    fn from_connection(connection: &Connection) -> Self {
+        let path = connection.stats().path;
+        Self {
+            rtt: path.rtt,
+            cwnd: path.cwnd,
+            current_mtu: path.current_mtu,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TcpPoolPathResetOutcome {
+    Applied {
+        preparation: TcpPoolPathResetPreparation,
+        before: TcpPoolPathResetSnapshot,
+        after: TcpPoolPathResetSnapshot,
+    },
+    Rejected(TcpPoolPathResetPreparation),
+    Closed {
+        preparation: TcpPoolPathResetPreparation,
+        before: TcpPoolPathResetSnapshot,
+        error: String,
+    },
 }
 
 struct TcpPoolGenerationInstall {
@@ -6131,6 +6322,17 @@ impl<T: TcpPoolTransport> TcpPoolGenerationSlot<T> {
         self.state.lock().await.current.activity.clone()
     }
 
+    async fn replacement_forward_service_floor(
+        &self,
+        expected_identity: TcpPoolTransportIdentity,
+    ) -> Result<Option<u64>, TcpPoolGenerationInstallError> {
+        let state = self.state.lock().await;
+        if state.current.identity() != expected_identity {
+            return Err(TcpPoolGenerationInstallError::StalePredecessor);
+        }
+        Ok(state.current.replacement_forward_service_floor)
+    }
+
     #[cfg(test)]
     async fn current_transport(&self) -> T {
         self.state.lock().await.current.transport.clone()
@@ -6193,6 +6395,17 @@ impl<T: TcpPoolTransport> TcpPoolGenerationSlot<T> {
         {
             return Err(TcpPoolGenerationInstallError::InvalidSuccessor);
         }
+        if state
+            .current
+            .replacement_forward_service_floor
+            .is_some_and(|required| {
+                successor
+                    .replacement_forward_service_floor
+                    .is_none_or(|proved| proved < required)
+            })
+        {
+            return Err(TcpPoolGenerationInstallError::InsufficientForwardService);
+        }
         if !install_activity(&state.current.activity, &successor.activity) {
             return Err(TcpPoolGenerationInstallError::StalePredecessor);
         }
@@ -6222,6 +6435,59 @@ impl<T: TcpPoolTransport> TcpPoolGenerationSlot<T> {
             return None;
         }
         state.draining.take()
+    }
+}
+
+impl TcpPoolGenerationSlot<Connection> {
+    async fn reset_path_if_owned(
+        &self,
+        expected_identity: TcpPoolTransportIdentity,
+    ) -> TcpPoolPathResetOutcome {
+        let mut state = self.state.lock().await;
+        if state.current.identity() == expected_identity {
+            let before = TcpPoolPathResetSnapshot::from_connection(&state.current.transport);
+            let Some(forward_service_floor) =
+                state.current.record_forward_service_floor(before.cwnd)
+            else {
+                return TcpPoolPathResetOutcome::Rejected(TcpPoolPathResetPreparation::ZeroWindow);
+            };
+            let preparation = TcpPoolPathResetPreparation::Current {
+                forward_service_floor,
+            };
+            return match state.current.transport.path_changed() {
+                Ok(()) => TcpPoolPathResetOutcome::Applied {
+                    preparation,
+                    before,
+                    after: TcpPoolPathResetSnapshot::from_connection(&state.current.transport),
+                },
+                Err(error) => TcpPoolPathResetOutcome::Closed {
+                    preparation,
+                    before,
+                    error: error.to_string(),
+                },
+            };
+        }
+        let Some(draining) = state
+            .draining
+            .as_mut()
+            .filter(|draining| draining.generation.identity() == expected_identity)
+        else {
+            return TcpPoolPathResetOutcome::Rejected(TcpPoolPathResetPreparation::Stale);
+        };
+        let before = TcpPoolPathResetSnapshot::from_connection(&draining.generation.transport);
+        let preparation = TcpPoolPathResetPreparation::Draining;
+        match draining.generation.transport.path_changed() {
+            Ok(()) => TcpPoolPathResetOutcome::Applied {
+                preparation,
+                before,
+                after: TcpPoolPathResetSnapshot::from_connection(&draining.generation.transport),
+            },
+            Err(error) => TcpPoolPathResetOutcome::Closed {
+                preparation,
+                before,
+                error: error.to_string(),
+            },
+        }
     }
 }
 
@@ -6706,9 +6972,7 @@ impl TuicUpstream {
                     identity: current.identity(),
                     path_service: TcpPoolPathService::known(path.cwnd, path.rtt),
                     black_holes_detected: path.black_holes_detected,
-                    path_generation: conn
-                        .endpoint_pacing_snapshot()
-                        .map(|snapshot| snapshot.path_generation),
+                    path_generation: Some(conn.current_path_generation()),
                     successor_service_certificate: current.successor_service_certificate,
                 }
             })
@@ -6845,13 +7109,22 @@ impl TuicUpstream {
         } else {
             "forward_qualification_degraded"
         };
+        let inherited_forward_service_floor = slot
+            .replacement_forward_service_floor(replacement.identity)
+            .await
+            .map_err(|error| {
+                io_err(
+                    "tuic tcp pool generation replacement",
+                    format!("predecessor service-floor ownership failed: {error:?}"),
+                )
+            })?;
         let optional_counter = |value: Option<u64>| {
             value
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".into())
         };
         println!(
-            "🔄 tuic-tcp-pool-generation-replacement-start slot={} predecessor_id={} generation={} active={} reason={} successor_service_certificate={} service_current_path_generation={} service_proved_path_generation={} service_proved_cwnd_floor={} black_hole_anchor={} black_holes_current={}",
+            "🔄 tuic-tcp-pool-generation-replacement-start slot={} predecessor_id={} generation={} active={} reason={} successor_service_certificate={} service_current_path_generation={} service_proved_path_generation={} service_proved_cwnd_floor={} inherited_forward_service_floor={} black_hole_anchor={} black_holes_current={}",
             replacement.index,
             replacement.identity.stable_id,
             replacement.identity.generation,
@@ -6870,6 +7143,7 @@ impl TuicUpstream {
                 replacement_candidate
                     .and_then(|candidate| candidate.successor_service_proved_cwnd_floor)
             ),
+            optional_counter(inherited_forward_service_floor),
             replacement.qualification_anchor,
             replacement.black_holes_current,
         );
@@ -6896,38 +7170,46 @@ impl TuicUpstream {
         let handshake_ms = started_at.elapsed().as_millis();
         let successor_stable_id = successor_conn.stable_id();
         let service_turn_started_at = Instant::now();
-        let service_turn = match tokio::time::timeout_at(
+        let service_proof = prove_tcp_pool_successor_forward_service(
+            &successor_conn,
+            inherited_forward_service_floor,
             replacement_deadline,
-            successor_conn.successor_service_turn(),
         )
-        .await
-        {
-            Ok(result) => result.map_err(|error| {
-                io_err(
-                    "tuic tcp pool generation replacement",
-                    format!("successor service turn failed: {error:?}"),
-                )
-            })?,
-            Err(_) => {
-                let partial = successor_conn.successor_service_turn_stats();
-                return Err(io_err(
-                    "tuic tcp pool generation replacement",
-                    format!(
-                        "successor service turn exceeded the existing 5s replacement deadline: partial={partial:?}"
-                    ),
-                ));
-            }
-        };
+        .await?;
+        let successor_path = successor_conn.stats().path;
+        let successor_current_path_generation = successor_conn.current_path_generation();
+        if successor_current_path_generation != service_proof.path_generation {
+            return Err(io_err(
+                "tuic tcp pool generation replacement",
+                format!(
+                    "successor path changed before install: proof={} current={successor_current_path_generation}",
+                    service_proof.path_generation
+                ),
+            ));
+        }
+        if successor_path.cwnd < service_proof.final_cwnd {
+            return Err(io_err(
+                "tuic tcp pool generation replacement",
+                format!(
+                    "successor service regressed before install: proved={} current={}",
+                    service_proof.final_cwnd, successor_path.cwnd
+                ),
+            ));
+        }
         let service_turn_ms = service_turn_started_at.elapsed().as_millis();
         println!(
-            "✅ tuic-tcp-pool-successor-service-turn slot={} successor_id={} target_bytes={} sent_bytes={} acked_bytes={} lost_bytes={} path_generation={} service_turn_ms={}",
+            "✅ tuic-tcp-pool-successor-forward-service-proof slot={} successor_id={} inherited_forward_service_floor={} initial_cwnd={} final_cwnd={} rounds={} target_bytes={} sent_bytes={} acked_bytes={} lost_bytes={} path_generation={} service_turn_ms={}",
             replacement.index,
             successor_stable_id,
-            service_turn.target_bytes,
-            service_turn.sent_bytes,
-            service_turn.acked_bytes,
-            service_turn.lost_bytes,
-            service_turn.path_generation,
+            optional_counter(service_proof.required_cwnd_floor),
+            service_proof.initial_cwnd,
+            service_proof.final_cwnd,
+            service_proof.rounds,
+            service_proof.target_bytes,
+            service_proof.sent_bytes,
+            service_proof.acked_bytes,
+            service_proof.lost_bytes,
+            service_proof.path_generation,
             service_turn_ms,
         );
         let successor_generation =
@@ -6941,14 +7223,13 @@ impl TuicUpstream {
                         "generation counter saturated",
                     )
                 })?;
-        let successor_path = successor_conn.stats().path;
         let successor = TcpPoolGeneration::new_successor(
             successor_conn.clone(),
             successor_generation,
             auth_attempts as u64,
             self.clock,
-            service_turn.path_generation,
-            successor_path.cwnd,
+            service_proof.path_generation,
+            service_proof.final_cwnd,
         )
         .ok_or_else(|| {
             io_err(
@@ -6961,7 +7242,7 @@ impl TuicUpstream {
             identity: successor.identity(),
             path_service: TcpPoolPathService::known(successor_path.cwnd, successor_path.rtt),
             black_holes_detected: successor_path.black_holes_detected,
-            path_generation: Some(service_turn.path_generation),
+            path_generation: Some(service_proof.path_generation),
             successor_service_certificate: successor.successor_service_certificate,
         };
         let install = slot
@@ -7472,15 +7753,42 @@ impl TuicUpstream {
                             .find(|handle| handle.stable_id == write_conn)
                         {
                             Some(handle) => {
-                                let before = handle.connection.stats().path;
-                                match handle.connection.path_changed() {
-                                    Ok(()) => {
-                                        let after = handle.connection.stats().path;
+                                let expected_identity = TcpPoolTransportIdentity::new(
+                                    handle.stable_id,
+                                    handle.pool_generation,
+                                );
+                                let outcome = match upstream.tcp_pool_slots.get(handle.pool_index) {
+                                    Some(slot) => slot.reset_path_if_owned(expected_identity).await,
+                                    None => TcpPoolPathResetOutcome::Rejected(
+                                        TcpPoolPathResetPreparation::Stale,
+                                    ),
+                                };
+                                match outcome {
+                                    TcpPoolPathResetOutcome::Applied {
+                                        preparation,
+                                        before,
+                                        after,
+                                    } => {
+                                        let inherited_forward_service_floor = match preparation {
+                                            TcpPoolPathResetPreparation::Current {
+                                                forward_service_floor,
+                                            } => forward_service_floor.to_string(),
+                                            TcpPoolPathResetPreparation::Draining => {
+                                                "draining".into()
+                                            }
+                                            TcpPoolPathResetPreparation::Stale
+                                            | TcpPoolPathResetPreparation::ZeroWindow => {
+                                                unreachable!(
+                                                    "rejected path-reset preparation cannot be applied"
+                                                )
+                                            }
+                                        };
                                         println!(
-                                            "🔄 tuic-connection-path-reset generation={generation} result=applied trigger={} write_conn={write_conn} pool_index={} pool_generation={} write_writer={write_writer} write_stream={write_stream} write_episode={write_episode} write_acknowledged={write_acknowledged_bytes}B write_pending_ms={write_pending_ms} black_hole_anchor={black_hole_anchor} black_holes_current={black_holes_current} bound_ms={} max_rtt_ms={} rtt_before_ms={} rtt_after_ms={} cwnd_before={} cwnd_after={} mtu_before={} mtu_after={}",
+                                            "🔄 tuic-connection-path-reset generation={generation} result=applied trigger={} write_conn={write_conn} pool_index={} pool_generation={} inherited_forward_service_floor={} write_writer={write_writer} write_stream={write_stream} write_episode={write_episode} write_acknowledged={write_acknowledged_bytes}B write_pending_ms={write_pending_ms} black_hole_anchor={black_hole_anchor} black_holes_current={black_holes_current} bound_ms={} max_rtt_ms={} rtt_before_ms={} rtt_after_ms={} cwnd_before={} cwnd_after={} mtu_before={} mtu_after={}",
                                             trigger.label(),
                                             handle.pool_index,
                                             handle.pool_generation,
+                                            inherited_forward_service_floor,
                                             stall_bound.as_millis(),
                                             max_rtt.as_millis(),
                                             before.rtt.as_millis(),
@@ -7491,14 +7799,27 @@ impl TuicUpstream {
                                             after.current_mtu,
                                         );
                                     }
-                                    Err(error) => {
+                                    TcpPoolPathResetOutcome::Rejected(preparation) => {
                                         println!(
-                                            "⚠️ tuic-connection-path-reset generation={generation} result=closed trigger={} write_conn={write_conn} pool_index={} pool_generation={} write_writer={write_writer} write_stream={write_stream} write_episode={write_episode} write_acknowledged={write_acknowledged_bytes}B write_pending_ms={write_pending_ms} black_hole_anchor={black_hole_anchor} black_holes_current={black_holes_current} bound_ms={} max_rtt_ms={} error={error}",
+                                            "⚠️ tuic-connection-path-reset generation={generation} result=ownership_rejected preparation={preparation:?} trigger={} write_conn={write_conn} pool_index={} pool_generation={} write_writer={write_writer} write_stream={write_stream} write_episode={write_episode}",
+                                            trigger.label(),
+                                            handle.pool_index,
+                                            handle.pool_generation,
+                                        );
+                                    }
+                                    TcpPoolPathResetOutcome::Closed {
+                                        preparation,
+                                        before,
+                                        error,
+                                    } => {
+                                        println!(
+                                            "⚠️ tuic-connection-path-reset generation={generation} result=closed preparation={preparation:?} trigger={} write_conn={write_conn} pool_index={} pool_generation={} write_writer={write_writer} write_stream={write_stream} write_episode={write_episode} write_acknowledged={write_acknowledged_bytes}B write_pending_ms={write_pending_ms} black_hole_anchor={black_hole_anchor} black_holes_current={black_holes_current} bound_ms={} max_rtt_ms={} cwnd_before={} error={error}",
                                             trigger.label(),
                                             handle.pool_index,
                                             handle.pool_generation,
                                             stall_bound.as_millis(),
                                             max_rtt.as_millis(),
+                                            before.cwnd,
                                         );
                                     }
                                 }
@@ -7626,7 +7947,6 @@ impl TuicUpstream {
                     stable_id,
                     pool_index: slot.index,
                     pool_generation: generation.open_state.generation(),
-                    connection: conn.clone(),
                 });
             }
         }
@@ -11211,6 +11531,7 @@ mod tests {
                 24_800,
             )
         );
+        assert_eq!(successor.replacement_forward_service_floor, Some(24_800));
         assert!(
             TcpPoolGeneration::new_successor(23_u64, 3, 1, clock, 8, 0).is_none(),
             "zero service cannot manufacture a certificate"
@@ -11231,6 +11552,51 @@ mod tests {
             "reconnect must advance the logical identity"
         );
         assert_eq!(successor.successor_service_certificate, None);
+        assert_eq!(successor.replacement_forward_service_floor, None);
+    }
+
+    #[test]
+    fn tcp_pool_generation_owns_a_monotonic_pre_reset_forward_service_floor() {
+        let clock = Instant::now();
+        let mut generation = TcpPoolGeneration::new(11_u64, 1, 1, clock);
+
+        assert_eq!(
+            generation.record_forward_service_floor(41_301),
+            Some(41_301)
+        );
+        assert_eq!(generation.replacement_forward_service_floor, Some(41_301));
+        assert_eq!(
+            generation.record_forward_service_floor(24_800),
+            Some(41_301)
+        );
+        assert_eq!(
+            generation.replacement_forward_service_floor,
+            Some(41_301),
+            "later lower evidence must not weaken the replacement requirement"
+        );
+        assert_eq!(generation.record_forward_service_floor(0), None);
+    }
+
+    #[test]
+    fn tcp_pool_successor_forward_service_progress_is_dynamic_and_fail_closed() {
+        assert_eq!(
+            tcp_pool_successor_forward_service_progress(None, 12_000, 24_000),
+            TcpPoolSuccessorForwardServiceProgress::Complete,
+            "an uncertified predecessor preserves the existing one-turn contract"
+        );
+        assert_eq!(
+            tcp_pool_successor_forward_service_progress(Some(41_301), 12_000, 26_424),
+            TcpPoolSuccessorForwardServiceProgress::Continue
+        );
+        assert_eq!(
+            tcp_pool_successor_forward_service_progress(Some(41_301), 26_424, 52_848),
+            TcpPoolSuccessorForwardServiceProgress::Complete
+        );
+        assert_eq!(
+            tcp_pool_successor_forward_service_progress(Some(41_301), 26_424, 26_424),
+            TcpPoolSuccessorForwardServiceProgress::Stalled,
+            "a successful turn without cwnd progress cannot become an unbounded retry"
+        );
     }
 
     #[tokio::test]
@@ -12601,6 +12967,177 @@ mod tests {
             connection.stats().path.cwnd > initial_cwnd,
             "the deliberately full service turn must not be marked application-limited before ACKs"
         );
+
+        client_endpoint.close(0u32.into(), b"test complete");
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_path_reset_is_atomic_for_current_and_draining_generations() {
+        let (server_endpoint, client_endpoint, server_addr) = d16_quinn_test_endpoints();
+        let server_task = tokio::spawn(async move {
+            let predecessor = server_endpoint.accept().await.unwrap().await.unwrap();
+            let successor = server_endpoint.accept().await.unwrap().await.unwrap();
+            tokio::join!(predecessor.closed(), successor.closed());
+        });
+        let predecessor = client_endpoint
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let successor = client_endpoint
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let clock = Instant::now();
+        let slot = TcpPoolGenerationSlot::new(1, predecessor.clone(), 1, 1, clock);
+        let predecessor_identity = TcpPoolTransportIdentity::new(predecessor.stable_id(), 1);
+
+        let current_path_generation = predecessor.current_path_generation();
+        let TcpPoolPathResetOutcome::Applied {
+            preparation:
+                TcpPoolPathResetPreparation::Current {
+                    forward_service_floor,
+                },
+            before,
+            after,
+        } = slot.reset_path_if_owned(predecessor_identity).await
+        else {
+            panic!("the exact current generation must own one atomic reset")
+        };
+        assert_eq!(forward_service_floor, before.cwnd);
+        assert!(after.cwnd > 0);
+        assert_eq!(
+            predecessor.current_path_generation(),
+            current_path_generation,
+            "a state reset stays within the same network-path generation"
+        );
+        assert_eq!(
+            slot.replacement_forward_service_floor(predecessor_identity)
+                .await
+                .unwrap(),
+            Some(before.cwnd)
+        );
+
+        let predecessor_activity = slot.current_activity().await;
+        let successor_floor = forward_service_floor.max(successor.stats().path.cwnd);
+        slot.install_successor(
+            predecessor_identity,
+            &predecessor_activity,
+            TcpPoolGeneration::new_successor(
+                successor.clone(),
+                2,
+                1,
+                clock,
+                successor.current_path_generation(),
+                successor_floor,
+            )
+            .expect("the successor must carry at least the current generation's owned floor"),
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        let draining_path_generation = predecessor.current_path_generation();
+        assert!(matches!(
+            slot.reset_path_if_owned(predecessor_identity).await,
+            TcpPoolPathResetOutcome::Applied {
+                preparation: TcpPoolPathResetPreparation::Draining,
+                ..
+            }
+        ));
+        assert_eq!(
+            predecessor.current_path_generation(),
+            draining_path_generation,
+            "a drain-only predecessor must retain recovery for its existing streams"
+        );
+        assert!(matches!(
+            slot.reset_path_if_owned(TcpPoolTransportIdentity::new(usize::MAX, 99))
+                .await,
+            TcpPoolPathResetOutcome::Rejected(TcpPoolPathResetPreparation::Stale)
+        ));
+
+        predecessor.close(0u32.into(), b"test complete");
+        successor.close(0u32.into(), b"test complete");
+        server_task.await.unwrap();
+        client_endpoint.close(0u32.into(), b"test complete");
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_successor_install_rechecks_the_latest_owned_floor() {
+        let clock = Instant::now();
+        let slot = TcpPoolGenerationSlot::new(1, 11_u64, 1, 1, clock);
+        let predecessor_identity = TcpPoolTransportIdentity::new(11, 1);
+        let predecessor_activity = slot.current_activity().await;
+        {
+            let mut state = slot.state.lock().await;
+            assert_eq!(
+                state.current.record_forward_service_floor(41_301),
+                Some(41_301)
+            );
+        }
+        let insufficient = TcpPoolGeneration::new_successor(22_u64, 2, 1, clock, 7, 26_424)
+            .expect("the replay successor has a positive but insufficient proof");
+
+        assert!(matches!(
+            slot.install_successor(
+                predecessor_identity,
+                &predecessor_activity,
+                insufficient,
+                Instant::now(),
+            )
+            .await,
+            Err(TcpPoolGenerationInstallError::InsufficientForwardService)
+        ));
+        assert_eq!(slot.current_transport().await, 11);
+        assert_eq!(slot.draining_transport().await, None);
+
+        let sufficient = TcpPoolGeneration::new_successor(23_u64, 2, 1, clock, 7, 52_848)
+            .expect("a proof above the latest owned floor must remain installable");
+        slot.install_successor(
+            predecessor_identity,
+            &predecessor_activity,
+            sufficient,
+            Instant::now(),
+        )
+        .await
+        .expect("the install CAS must accept the latest sufficient proof");
+        assert_eq!(slot.current_transport().await, 23);
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_successor_inherits_a_dynamic_forward_service_floor() {
+        let (server_endpoint, client_endpoint, server_addr) = d16_quinn_test_endpoints();
+        let server_task = tokio::spawn(async move {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            connection.closed().await;
+        });
+
+        let connection = client_endpoint
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let initial_cwnd = connection.stats().path.cwnd;
+        let required_floor = initial_cwnd.saturating_mul(3);
+        let proof = prove_tcp_pool_successor_forward_service(
+            &connection,
+            Some(required_floor),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            proof.rounds >= 2,
+            "a floor above one slow-start turn must require sequential exact ownership: {proof:?}"
+        );
+        assert_eq!(proof.required_cwnd_floor, Some(required_floor));
+        assert!(proof.final_cwnd >= required_floor);
+        assert!(proof.sent_bytes >= proof.target_bytes);
+        assert_eq!(proof.acked_bytes, proof.sent_bytes);
+        assert_eq!(proof.lost_bytes, 0);
+        assert_eq!(proof.path_generation, connection.current_path_generation());
 
         client_endpoint.close(0u32.into(), b"test complete");
         server_task.await.unwrap();

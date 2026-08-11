@@ -55,6 +55,21 @@ _Avoid_: health score (it is one exact historical proof), cwnd tuning (the
 floor is observed, not configured), in-place warm-up (replacement is the safe
 seam), connection blacklist (a fresh generation can prove new service)
 
+**TUIC TCP successor forward-service inheritance**:
+A generation-replacement contract that preserves the exact positive
+congestion window surrendered by the current auxiliary generation immediately
+before its one-shot path-state reset. The generation slot owns this monotonic
+observed floor. A fresh successor must complete one or more sequential
+**successor service turns** on one path, within the unchanged whole-replacement
+deadline, until its current cwnd reaches that floor; the install CAS rechecks
+the latest slot-owned requirement. Loss, path change, close, timeout, no cwnd
+progress, or an insufficient final proof leaves the predecessor current. It
+adds no configured threshold, retry, timer, Target probe, payload replay, or
+bandwidth promise.
+_Avoid_: cwnd target (the floor is observed predecessor state), warm-up loop
+(the transaction is deadline-bounded and loss-fail-closed), throughput
+guarantee (it preserves surrendered service rather than predicting the WAN)
+
 **TUIC TCP replacement-failure business fallback**:
 A bounded new-open admission rule used only after one auxiliary generation
 replacement fails before successor installation. The failed slot becomes

@@ -1722,6 +1722,12 @@ impl Connection {
         self.total_authed_packets
     }
 
+    /// Monotonic identity of the currently active network path.
+    #[doc(hidden)]
+    pub fn current_path_generation(&self) -> u64 {
+        self.path.generation()
+    }
+
     /// Ping the remote endpoint
     ///
     /// Causes an ACK-eliciting packet to be transmitted.
