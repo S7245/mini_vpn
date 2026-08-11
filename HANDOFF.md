@@ -2,9 +2,43 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-10)
+## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-11)
 
-- **Latest accepted position:** exact-source `c6ffa3a` paired qualification
+- **Latest accepted position:** exact-source `e531b30` formal artifact
+  `/tmp/mini_vpn_knife15_macos_20260811_014220.tar.gz` (SHA-256
+  `2d8b4e6e...`) passed baseline `12.838/54.648 Mbit/s`, direct, smoke, every
+  preflight, five complete M2 cycles, and most of cycle 6 before
+  `short-forward-3` lost its first complete Target receiver interval. Sender
+  admitted `10,878,976B`, Target received `4,194,304B`, TCP retransmits were
+  zero, and cleanup passed. This is a formal M2 failure; M3 remains blocked.
+- D16, TUN, Endpoint, path identity, ACK progress, VPS probes, resources,
+  routes, DNS, and cleanup were healthy. No paired Exit observer existed, so
+  no packet-capture claim is made. The exact predecessor reset at
+  `41,301 -> 12,000B` cwnd, while its successor installed after one exact
+  service turn at only `26,424B` and owned the failed flow. The previous
+  one-turn sufficiency claim is rejected; do not repeat or tune that build.
+- Reviewed implementation `de4d170` records the exact positive pre-reset cwnd
+  as a monotonic generation-owned forward-service floor. A successor performs
+  sequential exact ACK-owned service turns on one path, under the unchanged
+  five-second whole-replacement deadline, until current cwnd reaches that
+  floor. Loss, path change, close, timeout, or no progress fails closed.
+  Reset publication is atomic with `path_changed()`, and install CAS rechecks
+  the latest slot-owned floor.
+- Root `705+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  established Clippy, shell, vendored Quinn `40+3 ignored` plus doc `1`,
+  quinn-proto `330` plus docs `3`, root docs, fmt/diff/local-patch/secret, and
+  review pass with no unresolved P0/P1. Exact 32MiB Endpoint capacity was
+  `240.349 Mbit/s`, final `61,440/0/0B`, zero socket would-block. Result:
+  `docs/tech/2026-08-11-knife15-m2-successor-forward-service-inheritance-local-results.md`.
+- Do not run another 25-hour formal M2 yet. Pull/rebuild the pushed reviewed
+  descendant and take exactly one fresh paired `m2-ipv6-check -> baseline ->
+  direct-discriminator -> start -> smoke -> m2-qualification -> status ->
+  stop`. It is about thirty minutes and remains non-acceptance. A recurrence
+  after a logged nonzero inherited floor rejects the mechanism; do not repeat
+  or tune unchanged. A clean qualification reopens formal M2. M3 remains
+  blocked until formal M2 passes.
+
+- **Previous accepted position:** exact-source `c6ffa3a` paired qualification
   artifact `/tmp/mini_vpn_knife15_macos_20260810_101221.tar.gz` (SHA-256
   `6121b8b8...`) passed baseline `12.791/44.901 Mbit/s`, direct at
   `6.393 Mbit/s` without zero intervals, smoke, every preflight, two exact

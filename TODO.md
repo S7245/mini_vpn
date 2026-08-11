@@ -1,10 +1,51 @@
 # TODO
 
-## Current Knife15 Plan (2026-08-10)
+## Current Knife15 Plan (2026-08-11)
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-10 — paired qualification passed; formal M2 reopened)
+#### Latest decision (2026-08-11 — formal M2 rejected one-turn successor service; inheritance ready for qualification)
+
+Exact-source `e531b30` formal artifact
+`/tmp/mini_vpn_knife15_macos_20260811_014220.tar.gz` (SHA-256
+`2d8b4e6e...`) passed baseline/direct, smoke, every preflight, five whole M2
+cycles, and most of cycle 6. `short-forward-3` then lost its first complete
+Target receiver interval after the sender admitted `10,878,976B`; Target
+received `4,194,304B`, sender retransmits were zero, and cleanup passed.
+
+The exact predecessor path reset surrendered `41,301B` cwnd. Its successor
+installed after one service turn at `26,424B`, stayed on the same exact
+identity/path with continuous ACK progress, and owned the failed short flow.
+D16, TUN, Endpoint conservation, VPS probes, routes, DNS, resources, and
+cleanup were healthy. No paired Exit capture existed. This satisfies the
+previous stop rule and rejects one current-cwnd turn as sufficient.
+
+Reviewed `de4d170` stores the positive pre-reset cwnd as a monotonic exact
+generation-owned floor. A successor must perform sequential exact ACK-owned
+service turns on one path until it reaches that floor, all within the unchanged
+five-second replacement deadline. Reset and floor publication are one slot
+transaction; install CAS rechecks the latest floor. Every frozen data-plane
+and workload value remains unchanged.
+
+All local gates and review pass with no unresolved P0/P1: root
+`705+3 ignored`, vendored Quinn/proto `40+3 ignored`/`330`, and exact Endpoint
+capacity `240.349 Mbit/s` with final `61,440/0/0B` and zero would-block.
+Result:
+`docs/tech/2026-08-11-knife15-m2-successor-forward-service-inheritance-local-results.md`.
+
+Next:
+
+1. do not run another 25-hour formal M2 yet and do not tune constants;
+2. pull/rebuild the pushed reviewed descendant and start one fresh bounded
+   `.33` observer;
+3. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
+   start -> smoke -> m2-qualification -> status -> stop`;
+4. preserve `status/snapshot/stop` after failure and upload both bundles;
+5. a receiver-zero after a logged nonzero inherited floor rejects this
+   mechanism; a clean qualification reopens formal M2. M3 remains blocked
+   until formal M2 passes.
+
+#### Previous decision (2026-08-10 — paired qualification passed; formal M2 reopened)
 
 Exact-source `c6ffa3a` artifact
 `/tmp/mini_vpn_knife15_macos_20260810_101221.tar.gz` (SHA-256

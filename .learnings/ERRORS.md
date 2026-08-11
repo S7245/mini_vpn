@@ -1,5 +1,31 @@
 # Errors
 
+## 2026-08-11 - Formal M2 exposed a successor service inheritance gap
+
+- Exact-source `e531b30` passed baseline/direct, smoke, every preflight, five
+  whole formal cycles, and most of cycle 6. `short-forward-3` then lost its
+  first complete Target receiver interval. Sender admitted `10,878,976B`,
+  Target received `4,194,304B`, retransmits were zero, and cleanup passed.
+- The exact predecessor reset from `41,301B` to `12,000B` cwnd. Its successor
+  passed one exact service turn, installed at `26,424B`, and later owned the
+  failed flow with continuous ACK progress. One-turn readiness was necessary
+  but not sufficient to inherit surrendered forward service.
+- The first local reset implementation published the floor and released the
+  slot before calling `path_changed()`. Review rejected that ownership gap and
+  made publication plus reset atomic. A second review RED required install CAS
+  to reject a proof below the latest slot floor.
+- An initial Pair assertion assumed `path_changed()` increments Quinn's path
+  generation. It resets congestion/RTT/MTUD state on the same path, so the
+  corrected test requires the generation to remain unchanged. Exact path
+  identity still advances only on actual path migration.
+- Two `cargo test --exact` probes omitted the module-qualified name and ran
+  zero tests; an earlier integration probe omitted `--features harness` and
+  also ran zero. All were rejected and rerun with nonzero exact counts. A
+  whole-module rustfmt check recursed into unchanged fork siblings, so it was
+  not treated as a product gate; root fmt, changed hunks, and diff checks pass.
+- Result:
+  `docs/tech/2026-08-11-knife15-m2-successor-forward-service-inheritance-local-results.md`.
+
 ## 2026-08-10 - A successful SCP process did not prove a complete evidence copy
 
 - The finalized Exit observer bundle was about `63MiB`. The first local SCP

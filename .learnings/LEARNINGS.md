@@ -1,5 +1,31 @@
 # Learnings
 
+## 2026-08-11 - A replacement must inherit surrendered service, not only prove fresh liveness
+
+- One exact current-cwnd service turn proves delivery, path ownership, and
+  loss-free readiness for that flight. It does not prove that the fresh
+  generation has recovered the forward service its predecessor surrendered.
+  Formal M2 exposed the distinction at `41,301B` predecessor pre-reset versus
+  `26,424B` successor install.
+- Use observed generation state as the requirement. A monotonic positive
+  pre-reset cwnd floor avoids a configured threshold, rate, round count, or
+  workload-specific target while still preventing known service regression.
+- Compose the existing exact primitive instead of weakening it. Sequential
+  ACK-owned turns stay on one path and share the already-bounded whole-
+  replacement deadline; loss, no progress, or path change remains terminal.
+- Evidence publication and the action it authorizes must be one transaction.
+  Holding the slot across identity check, floor record, and `path_changed()`
+  prevents a stale handle from publishing evidence for one generation and
+  mutating another.
+- Recheck requirements at commit time. Reading a floor before a network
+  handshake is not enough; install CAS must reject a successor whose final
+  proof is below the latest slot-owned requirement.
+- Optional telemetry is not identity authority. Exposing Quinn's exact current
+  path generation through a narrow read-only adapter closed the prior
+  dependency on whether Endpoint pacing diagnostics happened to be enabled.
+- Result:
+  `docs/tech/2026-08-11-knife15-m2-successor-forward-service-inheritance-local-results.md`.
+
 ## 2026-08-10 - A positive WAN qualification needs reachability and boundedness together
 
 - Absence of the old zero interval is not enough for a rare branch. Require a

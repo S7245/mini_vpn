@@ -62,8 +62,9 @@ Architecture:
 
 - [x] Review correctness, concurrency, performance, boundedness, D16,
   Endpoint, TUN, TCP/UDP, lifecycle, and missing tests; resolve all P0/P1.
-- [ ] Update `CONTEXT.md`, `.learnings`, `HANDOFF.md`, and `TODO.md`.
-- [ ] Commit one coherent implementation/evidence stage and push.
+- [x] Update `CONTEXT.md`, `.learnings`, `HANDOFF.md`, and `TODO.md`.
+- [x] Commit one coherent implementation/evidence stage and push its reviewed
+  memory descendant.
 - [ ] Run exactly one fresh paired Mac qualification before formal M2.
 - [ ] Do not repeat or tune unchanged; a recurrence after a nonzero inherited
   floor rejects the mechanism as sufficient.
