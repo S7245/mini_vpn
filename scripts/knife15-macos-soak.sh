@@ -1264,6 +1264,22 @@ append_event() {
   append_event_to "$run_dir" "$1"
 }
 
+release_binary_is_fresh() {
+  local binary="${1:-$BIN}"
+  local input
+  [[ -x "$binary" && ! -L "$binary" ]] || return 1
+  git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
+  while IFS= read -r -d '' input; do
+    case "$input" in
+      Cargo.toml|Cargo.lock|rust-toolchain|rust-toolchain.toml|build.rs|\
+      .cargo/*.toml|src/*.rs|third_party/*/Cargo.toml|\
+      third_party/*/build.rs|third_party/*/src/*.rs)
+        [[ ! "$REPO/$input" -nt "$binary" ]] || return 1
+        ;;
+    esac
+  done < <(git -C "$REPO" ls-files -z)
+}
+
 common_preflight() {
   local server target_if exit_if
 
@@ -1272,6 +1288,12 @@ common_preflight() {
     require_command "$command_name"
   done
   [[ -x "$BIN" ]] || die "release binary not found: $BIN (run cargo build --release first)"
+  release_binary_is_fresh "$BIN" || \
+    die "release binary is older than tracked Rust/Cargo inputs (run cargo build --release)"
+  m2_source_is_accepted || \
+    die "Knife15 runner requires reviewed source at de4d170 or a descendant"
+  m2_worktree_is_clean || \
+    die "Knife15 runner requires a clean tracked worktree for exact-source evidence"
 
   : "${MINI_VPN_TUIC_SERVER:?export MINI_VPN_TUIC_SERVER locally}"
   : "${MINI_VPN_TUIC_UUID:?export MINI_VPN_TUIC_UUID locally}"
@@ -4314,6 +4336,8 @@ EOF_FAKE_SLEEP
     die "self-test: empty M2 qualification rebind lifecycle rejected"
   recovery_evidence_is_safe "$m2_qualification_run/mini_vpn.log" || \
     die "self-test: empty M2 qualification recovery evidence rejected"
+  m2_recovery_contract_is_safe "$m2_qualification_run/mini_vpn.log" || \
+    die "self-test: empty formal M2 recovery contract rejected"
   printf '%s\n' \
     'tuic-endpoint-rebind generation=1 trigger=tcp_write_stall' \
     >>"$m2_qualification_run/mini_vpn.log"
@@ -4336,6 +4360,8 @@ EOF_FAKE_SLEEP
     >>"$m2_qualification_run/mini_vpn.log"
   ! recovery_evidence_is_safe "$m2_qualification_run/mini_vpn.log" || \
     die "self-test: malformed recovery evidence accepted"
+  ! m2_recovery_contract_is_safe "$m2_qualification_run/mini_vpn.log" || \
+    die "self-test: malformed recovery evidence met the formal M2 contract"
   : >"$m2_qualification_run/mini_vpn.log"
   printf '%s\n' \
     'tuic-endpoint-rebind generation=2 trigger=tcp_ordered_read_gap' \
@@ -4345,6 +4371,8 @@ EOF_FAKE_SLEEP
     die "self-test: active ordered-gap lifecycle fixture invalid"
   ! recovery_evidence_is_safe "$m2_qualification_run/mini_vpn.log" || \
     die "self-test: active ordered-gap rebind was accepted"
+  ! m2_recovery_contract_is_safe "$m2_qualification_run/mini_vpn.log" || \
+    die "self-test: active ordered-gap rebind met the formal M2 contract"
   printf '%s\n' \
     'qualification_slo_evidence=PASS' \
     'formal_m2_acceptance=NOT_RUN' \
@@ -5329,6 +5357,30 @@ EOF_FAIL_IPERF
   M2_QUIET_SHORT_COUNT=6
   M2_CHURN_SHORT_COUNT=24
   validate_m2_formal_config || die "self-test: formal M2 schedule rejected"
+  ! m2_source_is_accepted 5e7a97c || \
+    die "self-test: obsolete pre-inheritance source was accepted for formal M2"
+  m2_source_is_accepted de4d170 || \
+    die "self-test: reviewed successor-inheritance source was rejected for formal M2"
+  stale_release_binary="$tmp/stale-release-binary"
+  cp "$BIN" "$stale_release_binary"
+  touch -t 200001010000 "$stale_release_binary"
+  ! release_binary_is_fresh "$stale_release_binary" || \
+    die "self-test: stale release binary was accepted"
+  touch "$stale_release_binary"
+  release_binary_is_fresh "$stale_release_binary" || \
+    die "self-test: fresh release binary was rejected"
+  exact_source_repo="$tmp/exact-source-repo"
+  mkdir "$exact_source_repo"
+  git -C "$exact_source_repo" init -q
+  printf '%s\n' clean >"$exact_source_repo/tracked.txt"
+  git -C "$exact_source_repo" add tracked.txt
+  git -C "$exact_source_repo" -c user.name=knife15 \
+    -c user.email=knife15@example.invalid commit -qm fixture
+  m2_worktree_is_clean "$exact_source_repo" || \
+    die "self-test: clean exact-source worktree was rejected"
+  printf '%s\n' dirty >>"$exact_source_repo/tracked.txt"
+  ! m2_worktree_is_clean "$exact_source_repo" || \
+    die "self-test: dirty exact-source worktree was accepted"
   M2_EGRESS_TARGET=api.ipify.org:444
   ! validate_m2_formal_config || \
     die "self-test: M2 controlled target drift was accepted"
@@ -7730,7 +7782,14 @@ m2_real_client_envelope() {
 }
 
 m2_source_is_accepted() {
-  git -C "$REPO" merge-base --is-ancestor 5e7a97c HEAD >/dev/null 2>&1
+  local revision="${1:-HEAD}"
+  git -C "$REPO" merge-base --is-ancestor de4d170 "$revision" >/dev/null 2>&1
+}
+
+m2_worktree_is_clean() {
+  local repo="${1:-$REPO}"
+  git -C "$repo" diff --quiet -- && \
+    git -C "$repo" diff --cached --quiet --
 }
 
 endpoint_rebind_lifecycle_is_clean() {
@@ -7782,6 +7841,12 @@ recovery_evidence_is_safe() {
   valid=$((10#$ordered_valid + 10#$writer_start_valid + 10#$writer_end_valid))
   [[ "$total" =~ ^[0-9]+$ && "$valid" =~ ^[0-9]+$ && \
     "$total" == "$valid" ]]
+}
+
+m2_recovery_contract_is_safe() {
+  local log_file="$1"
+  endpoint_rebind_lifecycle_is_clean "$log_file" && \
+    recovery_evidence_is_safe "$log_file"
 }
 
 m2_qualification_result_slo() {
@@ -7849,8 +7914,7 @@ m2_qualification_terminal_safety() {
     [[ "$remote_failures" =~ ^[1-9][0-9]*$ ]] && \
       remote_write_close_ownership_is_clean "$log_file" || return 1
   fi
-  endpoint_rebind_lifecycle_is_clean "$log_file" && \
-    recovery_evidence_is_safe "$log_file" && \
+  m2_recovery_contract_is_safe "$log_file" && \
     conservation_check_file "$log_file" && \
     d16_terminal_ownership_is_clean "$log_file" && \
     ! grep -Eq \
@@ -7984,6 +8048,7 @@ m2_workload_slo() {
   conservation_check_file "$log_file" && \
     m0_final_ownership_is_clean "$log_file" && \
     d16_terminal_ownership_is_clean "$log_file" && \
+    m2_recovery_contract_is_safe "$log_file" && \
     m2_checkpoint_slo "$run_dir/m2-checkpoints.csv" && \
     m2_real_client_result_is_valid "$run_dir/m2-real-client/preflight.txt" && \
     m2_full_tunnel_is_active && network_control_is_sufficient "$run_dir" && \
@@ -8029,7 +8094,9 @@ run_m2_action() {
     "$M2_EXPECTED_CYCLES $M2_EXPECTED_TCP_RESULTS $M2_EXPECTED_UDP_RESULTS $M2_EXPECTED_PHASE_RESULTS" ]] || \
     die "$action_description requires the immutable formal M2 count model"
   m2_source_is_accepted || \
-    die "$action_description requires source at 5e7a97c or a descendant"
+    die "$action_description requires reviewed source at de4d170 or a descendant"
+  m2_worktree_is_clean || \
+    die "$action_description requires a clean tracked worktree for exact-source evidence"
   run_dir="$(run_dir_from_state)" || die "no Knife15 run state"
   baseline_evidence_dir="$run_dir/${evidence_dir}-baseline"
   direct_evidence_dir="$run_dir/${evidence_dir}-direct"

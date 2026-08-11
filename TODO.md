@@ -4,7 +4,34 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-11 — paired qualification evidence passed; runner false negative fixed; formal M2 reopened)
+#### Latest decision (2026-08-11 — formal M2 preflight self-audit passed)
+
+A concentrated pre-test audit removed three preventable long-run risks without
+changing Rust production code or frozen behavior. Formal M2 now uses the exact
+qualification recovery contract; source older than reviewed inheritance
+`de4d170` is rejected; stale/symlinked release binaries and dirty tracked
+worktrees are rejected before traffic. The Mac runbook now points to the
+formal `m2` action and mandatory cleanup.
+
+Root `705+3 ignored`, main `2`, integration `10+4 ignored`, focused successor
+`9+1`, release/full-TUN, Clippy, fmt, shell, runner/observer self-tests, and
+diff checks pass. Release batch capacity was `1,406.229 Mbit/s` with zero ring
+drops/full waits. Code review has no unresolved P0/P1; readiness to start
+formal M2 is `10/10`. Result:
+`docs/tech/2026-08-11-knife15-formal-m2-preflight-self-audit-local-results.md`.
+
+Next:
+
+1. pull the reviewed pushed descendant, confirm a clean worktree, and rebuild
+   release;
+2. while `.33` Exit and `.77` Target can remain uninterrupted for about 25
+   hours, run exactly one `m2-ipv6-check -> baseline -> direct-discriminator
+   -> start -> smoke -> m2 -> status -> stop`;
+3. do not rerun qualification or tune constants;
+4. preserve `status/snapshot/stop` after failure. M3 remains blocked until
+   formal M2 and cleanup pass.
+
+#### Previous decision (2026-08-11 — paired qualification evidence passed; runner false negative fixed; formal M2 reopened)
 
 Exact-source `25ea39c` artifact
 `/tmp/mini_vpn_knife15_macos_20260811_054300.tar.gz` (SHA-256

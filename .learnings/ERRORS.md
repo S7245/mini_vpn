@@ -1,5 +1,24 @@
 # Errors
 
+## 2026-08-11 - Formal M2 preflight admitted preventable evidence ambiguity
+
+- The formal verdict did not call the exact recovery-evidence safety helper
+  used by qualification. A malformed recovery record or forbidden active
+  ordered-gap rebind could pass if aggregate workload checks stayed healthy.
+- The accepted source ancestor was still `5e7a97c`, older than the reviewed
+  successor inheritance implementation `de4d170` required by the next test.
+- The binary SHA recorded identity but not freshness, and the runner allowed
+  tracked worktree drift. Both could make the reported source an inaccurate
+  description of the executable under test.
+- One focused `cargo test --exact` command used the unqualified function name
+  and ran zero tests. That result was rejected; the module-qualified command
+  ran exactly one path-reset transaction test and passed.
+- Repairs are deterministic startup/verdict gates; they do not tune workload
+  or data-plane behavior. Full local gates and `1,406.229 Mbit/s` release
+  capacity pass.
+- Result:
+  `docs/tech/2026-08-11-knife15-formal-m2-preflight-self-audit-local-results.md`.
+
 ## 2026-08-11 - Qualification traffic passed but immediate terminal sampling failed
 
 - Exact-source `25ea39c` completed two cycles/eight phases, two DNS and

@@ -65,6 +65,6 @@ Architecture:
 - [x] Update `CONTEXT.md`, `.learnings`, `HANDOFF.md`, and `TODO.md`.
 - [x] Commit one coherent implementation/evidence stage and push its reviewed
   memory descendant.
-- [ ] Run exactly one fresh paired Mac qualification before formal M2.
-- [ ] Do not repeat or tune unchanged; a recurrence after a nonzero inherited
+- [x] Run exactly one fresh paired Mac qualification before formal M2.
+- [x] Do not repeat or tune unchanged; a recurrence after a nonzero inherited
   floor rejects the mechanism as sufficient.

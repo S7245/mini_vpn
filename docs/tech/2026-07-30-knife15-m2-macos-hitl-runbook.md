@@ -2,14 +2,14 @@
 
 Date: 2026-07-30
 
-Status: **QUALIFICATION FIRST — use a reviewed descendant containing the
-`m2-qualification` action; formal M2 remains blocked**
+Status: **FORMAL M2 REOPENED — use a clean reviewed descendant of `de4d170`;
+the paired two-cycle qualification is complete and must not be repeated**
 
-This is the only reviewed M2 sequence. The current next run is the two-cycle
-qualification, not the 24-hour formal M2. It runs the same controlled IPv4
-full tunnel and temporarily changes the active physical network service DNS,
-but stops after two exact mixed cycles in about 30 minutes. `stop` is mandatory
-even after a successful `m2-qualification`.
+This is the reviewed formal M2 sequence. The current next run is the frozen
+24-hour workload, which uses the controlled IPv4 full tunnel and temporarily
+changes the active physical network service DNS. Reserve about 25 wall-clock
+hours. `stop` is mandatory even after a successful `m2` because cleanup is
+part of formal acceptance.
 
 ## Before Opening The Test Terminal
 
@@ -50,7 +50,7 @@ git switch codex/knife14d-downlink-reap-open
 git pull --ff-only origin codex/knife14d-downlink-reap-open
 git status --short
 git rev-parse HEAD
-git merge-base --is-ancestor 4dac87c HEAD && echo 'PASS: M2 source accepted'
+git merge-base --is-ancestor de4d170 HEAD && echo 'PASS: M2 source accepted'
 
 unset M0_BASELINE_DIR M0_DIRECT_DIR
 unset M1_BASELINE_DIR M1_DIRECT_DIR
@@ -225,29 +225,22 @@ Continue immediately. M2 must consume this evidence within 15 minutes.
 If the direct discriminator fails, no TUN was started; preserve its directory
 and restore IPv6 using the pre-start branch in section 8.
 
-## 6. Start, Smoke, And Two-Cycle Qualification
+## 6. Start, Smoke, And Formal M2
 
-The current cold-successor discriminator requires the agent-owned bounded
-Exit observer to overlap the Mac qualification. Do not start a separate
-observer on the Mac. Before `start`, confirm that the current accepted
-position names a fresh `.33` observer and that its two-hour hard-timeout
-window is still active. Use only the exact observer directory reported by the
-agent for this transaction; historical paths in earlier result documents are
-stopped or expired and must not be reused.
-
-If that observer has expired, do not run the transaction; ask the agent to
-start a new one so another 30-minute qualification is not spent without
-paired evidence.
+Before `start`, confirm that the `.33` Exit and `.77` Target services can stay
+powered and reachable for about 25 hours. The earlier two-hour paired observer
+was a bounded qualification instrument and is not a prerequisite for formal
+acceptance; do not reuse an expired observer directory.
 
 ```bash
 sudo -v
 sudo -E bash scripts/knife15-macos-soak.sh start
 sudo -E bash scripts/knife15-macos-soak.sh smoke
-caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2-qualification
+caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2
 ```
 
 Do not press `Ctrl+C`, close the terminal, start Clash, or change the network.
-Before starting its exact mixed cycle, `m2-qualification` waits up to the
+Before starting the formal schedule, `m2` waits up to the
 existing smoke hard timeout (normally about 50 seconds) for fresh Endpoint
 conservation, zero
 runner-controlled TCP relays, valid lifecycle replay, and zero DNS drops.
@@ -255,31 +248,29 @@ Ambient Apple/system relays and fake-IP entries are allowed and recorded. A
 failure here saves a long run and leaves the TUN/full tunnel available
 for `status/snapshot/stop`.
 
-The qualification runs exactly two cycles, each containing one 300-second
-forward TCP, one 300-second reverse TCP, one 180-second reverse UDP, and one
-10-second short forward, plus per-cycle DNS/HTTPS checks, health, and
-transition overhead. Reserve about 30 minutes. A success prints
-`PASS_NON_ACCEPTANCE`; it deliberately cannot create a formal M2 verdict.
+The formal schedule runs for 86,400 planned seconds across steady, quiet,
+churn, idle/resume, DNS/HTTPS, and final-drain windows. The runner samples
+process, utun, Endpoint, Exit, gateway, and physical-interface evidence every
+30 seconds. A traffic success remains `PENDING_CLEANUP` until `stop` restores
+owned DNS/routes, removes the TUN, and finalizes the immutable bundle.
 
 During M2, the Mac's public IPv4 should be the Exit VPS. That is expected.
 The runner blocks a routable physical IPv6 path instead of claiming a
 dual-stack leak-free result.
 
-Do not replace this action with `m2` until the matching Mac and Exit evidence
-has been reviewed and a later accepted position explicitly reopens formal M2.
-
 ## 7. Mandatory Status And Stop
 
-After `m2-qualification` returns, successful or failed:
+After `m2` returns, successful or failed:
 
 ```bash
 sudo -E bash scripts/knife15-macos-soak.sh status
 sudo -E bash scripts/knife15-macos-soak.sh stop
 ```
 
-`stop` restores DNS/routes, stops the owned TUN, records qualification cleanup,
-keeps formal M2 acceptance at `NOT_RUN`, scans secrets, creates one immutable
-bundle, and prints its SHA-256.
+`stop` restores DNS/routes, stops the owned TUN, records cleanup, scans
+secrets, creates one immutable bundle, and prints its SHA-256. Only a complete
+formal workload with a valid pre-stop verdict and successful cleanup becomes
+`formal_m2_acceptance: PASS`.
 
 Send both lines:
 
@@ -321,8 +312,8 @@ service and mode; do not source or `eval` that file.
 
 ## Failure Procedure
 
-If `start`, `smoke`, `m2-qualification`, or a later explicitly authorized
-`m2` fails, do not retry and do not tune any value. Run:
+If `start`, `smoke`, or `m2` fails, do not retry and do not tune any value.
+Run:
 
 ```bash
 sudo -E bash scripts/knife15-macos-soak.sh status || true
@@ -350,8 +341,7 @@ build/self-test/preflight   about 1–3 minutes
 baseline                    about 40–90 seconds
 direct discriminator        a little over 5 minutes
 start + smoke               about 1–2 minutes
-m2-qualification            about 30 minutes
-formal m2 (blocked now)     about 25 wall-clock hours
+formal m2                   about 25 wall-clock hours
 status + stop + bundle      about 1–3 minutes
 IPv6 restoration           about 1 minute
 ```

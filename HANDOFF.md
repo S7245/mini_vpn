@@ -4,7 +4,26 @@
 
 ## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-11)
 
-- **Latest accepted position:** exact-source `25ea39c` paired qualification
+- **Latest accepted position:** concentrated formal-M2 self-audit found and
+  fixed three locally preventable 25-hour-run risks without changing Rust or
+  any frozen value. Formal M2 now shares the qualification's exact recovery
+  contract, rejects source older than reviewed inheritance `de4d170`, and
+  refuses a stale/symlinked release binary or dirty tracked worktree before
+  traffic. The runbook now points only to formal `m2`, not the completed
+  qualification.
+- Root `705+3 ignored`, main `2`, integration `10+4 ignored`, focused
+  successor `9+1`, release full-TUN, release build, established Clippy, fmt,
+  shell, runner/observer self-tests, and diff checks pass. Exact release batch
+  capacity was `1,406.229 Mbit/s`, with zero ring drops/full waits. Review has
+  no unresolved P0/P1; readiness to start formal M2 is `10/10`. Result:
+  `docs/tech/2026-08-11-knife15-formal-m2-preflight-self-audit-local-results.md`.
+- Pull/rebuild the pushed reviewed descendant and take exactly one clean
+  `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke -> m2
+  -> status -> stop` while `.33` Exit and `.77` Target can remain up for about
+  25 hours. Do not repeat qualification. M3 remains blocked until formal M2
+  and cleanup pass.
+
+- **Previous accepted position:** exact-source `25ea39c` paired qualification
   artifact `/tmp/mini_vpn_knife15_macos_20260811_054300.tar.gz` (SHA-256
   `23a49673...`) passed baseline `11.858/55.917 Mbit/s`, direct at
   `5.928 Mbit/s` without zero intervals, smoke, every preflight, two exact

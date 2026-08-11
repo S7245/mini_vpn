@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-08-11 - Long-run acceptance needs executable provenance and one safety contract
+
+- A source revision in an evidence bundle is insufficient if the runner can
+  launch an older release binary or a dirty tracked tree. Reject stale build
+  inputs and local tracked drift before baseline so a 25-hour result has one
+  defensible source/executable relationship.
+- Qualification and formal acceptance must share exact lifecycle predicates.
+  Copying only aggregate count/continuity gates allowed malformed recovery
+  evidence to be stricter in the short discriminator than in the decisive
+  long run.
+- Recheck exact-source cleanliness at both common preflight and the formal
+  action boundary. The first saves operator time; the second prevents drift
+  between setup and the accepting transaction.
+- A current runbook is part of release safety. Leaving a completed
+  qualification as the documented next command risks repeating a
+  non-acceptance run while the actual formal gate remains undone.
+- Release readiness should be scoped precisely. Local evidence reaches
+  `10/10` for starting formal M2, while product release still depends on the
+  irreducible real 24-hour workload and cleanup result.
+- Result:
+  `docs/tech/2026-08-11-knife15-formal-m2-preflight-self-audit-local-results.md`.
+
 ## 2026-08-11 - Terminal safety needs a bounded settle boundary
 
 - A workload command can finish before its asynchronous Endpoint accounting
