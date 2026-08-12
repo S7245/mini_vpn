@@ -4,7 +4,46 @@
 
 ## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-12)
 
-- **Latest accepted position:** exact-source `166c390` artifact
+- **Latest accepted position:** exact-source `85d8772` formal artifact
+  `/tmp/mini_vpn_knife15_macos_20260812_034701.tar.gz` (SHA-256
+  `9d33b1af...`) passed baseline `17.776/64.868 Mbit/s`, direct, smoke,
+  observer admission, every preflight, fifteen complete M2 cycles, and
+  cleanup. Cycle 16 `short-forward-5` lost its first complete Target receiver
+  interval. Formal M2 remains failed; M3 remains blocked.
+- The matching `.33` v2 observer was healthy. Its independently verified
+  bundle SHA-256 is `643a019a...`. The exact Exit flow supplied only
+  `113,261B` during the first `1.001031s`, below one `131,072B` iperf block,
+  despite continuous Target ACKs, about `1..5ms` RTT, and a maximum
+  `180.701ms` supply gap. D16, TUN, Endpoint, routes, DNS, process, observer,
+  and cleanup evidence was clean.
+- The replaced predecessor currently owned `361,778B` cwnd, but its stored
+  service floor was only `26,338B`. Direct degraded-generation replacement
+  therefore installed a fresh successor at `26,338B`, which immediately
+  owned the failed flow. This satisfies the prior stop rule and rejects
+  path-reset-only successor inheritance as sufficient. Do not repeat or tune
+  `85d8772`.
+- Reviewed local implementation adds one atomic slot-owned current-service
+  handoff before successor handshake/proof:
+  `required=max(previous_owned_floor,current_generation_cwnd)`. The existing
+  sequential ACK-owned proof reaches that exact dynamic floor within the
+  unchanged five-second deadline, and install CAS rechecks it. No D16, MTU,
+  pool, window, chunk, Cubic, GSO, Endpoint, self-wake, workload, or SLI
+  changed.
+- Root `707+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  established Clippy, shell, runner/observer self-tests, vendored Quinn
+  `40+3 ignored` plus doc `1`, quinn-proto `330` plus docs `3`, root docs,
+  fmt/diff/provenance/secret, capacity, and review pass with no unresolved
+  P0/P1. Exact Endpoint capacity was `239.536 Mbit/s`, final
+  `61,440/0/0B`, zero socket would-block. Result:
+  `docs/tech/2026-08-12-knife15-m2-replacement-current-service-handoff-local-results.md`.
+- Pull/rebuild the pushed reviewed descendant. Start one fresh matching `.33`
+  observer after smoke and take exactly one paired `m2-ipv6-check -> baseline
+  -> direct-discriminator -> start -> smoke -> observer start ->
+  m2-qualification -> status -> stop`. Do not run formal M2 or repeat/tune
+  unchanged. A receiver-zero after proof reaches the handoff floor rejects
+  this mechanism. A clean qualification only reopens formal M2.
+
+- **Previous accepted position:** exact-source `166c390` artifact
   `/tmp/mini_vpn_knife15_macos_20260812_030150.tar.gz` (SHA-256
   `692c6286...`) passed start/smoke and the gates before observer admission,
   then formal M2 stopped before traffic with an empty

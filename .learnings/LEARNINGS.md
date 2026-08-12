@@ -1,5 +1,30 @@
 # Learnings
 
+## 2026-08-12 - Replacement readiness must inherit current service, not historical service
+
+- A nonzero inherited service floor can still be stale. Exact-source `85d8772`
+  handed a successor only `26,338B` although the current predecessor had grown
+  to `361,778B`; the historical certificate proved old readiness, not current
+  service at replacement.
+- Publish the capacity being surrendered at the replacement-preparation seam,
+  before successor proof. Identity validation, current Quinn sample, positive
+  validation, and monotonic publication must be one generation-slot mutex
+  transaction so the values cannot belong to different logical generations.
+- Reuse transport-native evidence. The successor reaches the dynamic floor
+  through sequential exact ACK/loss/path-owned turns and the existing bounded
+  deadline; adding a cwnd minimum, multiplier, proof-round constant, warm lane,
+  or relaxed SLI would be tuning rather than ownership repair.
+- Paired endpoint evidence distinguishes a stopped Target socket from slow
+  upstream supply. Here the Target ACKed continuously and the Exit had only a
+  `180.701ms` maximum supply gap, but fewer than `128KiB` application bytes
+  arrived in the first complete interval because the fresh QUIC generation
+  started far below the predecessor's service.
+- Code review must include every way a floor is published. Path-reset
+  publication was atomic and correct, but direct degraded-generation
+  replacement bypassed that seam entirely.
+- Result:
+  `docs/tech/2026-08-12-knife15-m2-replacement-current-service-handoff-local-results.md`.
+
 ## 2026-08-12 - Cross-action state is an executable contract
 
 - A value present in process environment and the immutable manifest is not

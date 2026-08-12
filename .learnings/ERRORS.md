@@ -1,5 +1,31 @@
 # Errors
 
+## 2026-08-12 - Formal M2 exposed stale replacement-service ownership
+
+- Exact-source `85d8772` passed fifteen complete formal cycles and failed
+  cycle 16 `short-forward-5` with one Target receiver-zero interval. Cleanup
+  and the paired `.33` observer passed; this is a product architecture
+  discriminator, not operator, network-health, or observer failure.
+- The predecessor's exact current cwnd was `361,778B`, but direct replacement
+  consumed its old `26,338B` installation floor. The successor proved only
+  that stale floor and immediately owned the failed business stream. The
+  prior inheritance design is rejected as sufficient; do not repeat or tune
+  that source.
+- The first focused `cargo test --exact` probe omitted the module-qualified
+  test path and ran zero tests. It was rejected and rerun with
+  `tuic::tests::...`, producing a real expected RED and counted GREEN.
+- A standalone vendored Quinn command initially resolved registry
+  `quinn-proto` and failed on fork-only APIs. The result was rejected. Run
+  vendored Quinn through the root workspace patch (`cargo test` with an exact
+  local patch or `cargo clippy -p quinn`) and verify package provenance before
+  treating it as a gate.
+- Two concurrent evidence copies were partial/corrupt despite transport
+  progress. Both were rejected. A fresh single rsync to a distinct path was
+  accepted only after its SHA-256 matched the authoritative remote
+  `643a019a...` and the gzip tar listed successfully.
+- Result:
+  `docs/tech/2026-08-12-knife15-m2-replacement-current-service-handoff-formal-failure-results.md`.
+
 ## 2026-08-12 - Formal M2 runner omitted its observer TUIC-port state
 
 - Exact-source `166c390` reached formal observer admission with a healthy,

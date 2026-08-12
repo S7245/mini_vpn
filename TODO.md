@@ -4,7 +4,43 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-12 — formal M2 observer state binding repaired locally)
+#### Latest decision (2026-08-12 — formal M2 rejected stale current-service handoff; local repair ready for qualification)
+
+Exact-source `85d8772` formal artifact
+`/tmp/mini_vpn_knife15_macos_20260812_034701.tar.gz` (SHA-256
+`9d33b1af...`) passed baseline `17.776/64.868 Mbit/s`, direct, smoke, exact
+observer admission, every preflight, fifteen whole cycles, and cleanup. Cycle
+16 `short-forward-5` then lost its first complete Target receiver interval.
+Formal M2 remains failed and M3 remains blocked.
+
+Paired Exit SHA-256 `643a019a...` proves that the exact Target socket kept ACK
+progress with about `1..5ms` RTT, but received only `113,261B` in the first
+`1.001031s`, below one `131,072B` iperf block. The direct replacement had
+discarded current forward service: predecessor cwnd was `361,778B`, while its
+stored inherited floor and successor proof were only `26,338B`. This rejects
+the previous path-reset-only inheritance mechanism as sufficient.
+
+The reviewed local repair atomically publishes
+`max(previous_owned_floor,current_generation_cwnd)` from the exact current
+slot before successor handshake/proof. The existing dynamic sequential
+ACK-owned turns and install CAS enforce that floor under the unchanged
+five-second deadline. All local correctness, vendored transport, script,
+capacity (`239.536 Mbit/s`), and review gates pass with no unresolved P0/P1.
+Result:
+`docs/tech/2026-08-12-knife15-m2-replacement-current-service-handoff-local-results.md`.
+
+Next:
+
+1. pull the reviewed pushed descendant on the Mac, confirm a clean worktree,
+   and rebuild release;
+2. run exactly one paired `m2-ipv6-check -> baseline -> direct-discriminator
+   -> start -> smoke -> fresh .33 observer start -> m2-qualification ->
+   status -> stop`;
+3. sync both bundles; do not run formal M2 or repeat/tune unchanged;
+4. a Target receiver-zero after the exact handoff floor is proved rejects the
+   architecture. A clean qualification only reopens formal M2.
+
+#### Previous decision (2026-08-12 — formal M2 observer state binding repaired locally)
 
 Exact-source `166c390` artifact
 `/tmp/mini_vpn_knife15_macos_20260812_030150.tar.gz` (SHA-256

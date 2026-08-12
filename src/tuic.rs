@@ -6215,6 +6215,18 @@ enum TcpPoolGenerationInstallError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpPoolReplacementCurrentServiceHandoffError {
+    StalePredecessor,
+    ZeroWindow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpPoolReplacementCurrentServiceHandoff {
+    observed_cwnd: u64,
+    required_cwnd_floor: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TcpPoolPathResetPreparation {
     Current { forward_service_floor: u64 },
     Draining,
@@ -6322,6 +6334,7 @@ impl<T: TcpPoolTransport> TcpPoolGenerationSlot<T> {
         self.state.lock().await.current.activity.clone()
     }
 
+    #[cfg(test)]
     async fn replacement_forward_service_floor(
         &self,
         expected_identity: TcpPoolTransportIdentity,
@@ -6439,6 +6452,26 @@ impl<T: TcpPoolTransport> TcpPoolGenerationSlot<T> {
 }
 
 impl TcpPoolGenerationSlot<Connection> {
+    async fn prepare_replacement_current_service_handoff(
+        &self,
+        expected_identity: TcpPoolTransportIdentity,
+    ) -> Result<TcpPoolReplacementCurrentServiceHandoff, TcpPoolReplacementCurrentServiceHandoffError>
+    {
+        let mut state = self.state.lock().await;
+        if state.current.identity() != expected_identity {
+            return Err(TcpPoolReplacementCurrentServiceHandoffError::StalePredecessor);
+        }
+        let observed_cwnd = state.current.transport.stats().path.cwnd;
+        let required_cwnd_floor = state
+            .current
+            .record_forward_service_floor(observed_cwnd)
+            .ok_or(TcpPoolReplacementCurrentServiceHandoffError::ZeroWindow)?;
+        Ok(TcpPoolReplacementCurrentServiceHandoff {
+            observed_cwnd,
+            required_cwnd_floor,
+        })
+    }
+
     async fn reset_path_if_owned(
         &self,
         expected_identity: TcpPoolTransportIdentity,
@@ -7109,22 +7142,23 @@ impl TuicUpstream {
         } else {
             "forward_qualification_degraded"
         };
-        let inherited_forward_service_floor = slot
-            .replacement_forward_service_floor(replacement.identity)
+        let current_service_handoff = slot
+            .prepare_replacement_current_service_handoff(replacement.identity)
             .await
             .map_err(|error| {
                 io_err(
                     "tuic tcp pool generation replacement",
-                    format!("predecessor service-floor ownership failed: {error:?}"),
+                    format!("predecessor current-service handoff failed: {error:?}"),
                 )
             })?;
+        let inherited_forward_service_floor = Some(current_service_handoff.required_cwnd_floor);
         let optional_counter = |value: Option<u64>| {
             value
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".into())
         };
         println!(
-            "🔄 tuic-tcp-pool-generation-replacement-start slot={} predecessor_id={} generation={} active={} reason={} successor_service_certificate={} service_current_path_generation={} service_proved_path_generation={} service_proved_cwnd_floor={} inherited_forward_service_floor={} black_hole_anchor={} black_holes_current={}",
+            "🔄 tuic-tcp-pool-generation-replacement-start slot={} predecessor_id={} generation={} active={} reason={} successor_service_certificate={} service_current_path_generation={} service_proved_path_generation={} service_proved_cwnd_floor={} observed_current_cwnd={} inherited_forward_service_floor={} black_hole_anchor={} black_holes_current={}",
             replacement.index,
             replacement.identity.stable_id,
             replacement.identity.generation,
@@ -7143,6 +7177,7 @@ impl TuicUpstream {
                 replacement_candidate
                     .and_then(|candidate| candidate.successor_service_proved_cwnd_floor)
             ),
+            current_service_handoff.observed_cwnd,
             optional_counter(inherited_forward_service_floor),
             replacement.qualification_anchor,
             replacement.black_holes_current,
@@ -13059,6 +13094,89 @@ mod tests {
 
         predecessor.close(0u32.into(), b"test complete");
         successor.close(0u32.into(), b"test complete");
+        server_task.await.unwrap();
+        client_endpoint.close(0u32.into(), b"test complete");
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_replacement_handoff_publishes_the_exact_current_service() {
+        let (server_endpoint, client_endpoint, server_addr) = d16_quinn_test_endpoints();
+        let server_task = tokio::spawn(async move {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            connection.closed().await;
+        });
+        let connection = client_endpoint
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let clock = Instant::now();
+        let slot = TcpPoolGenerationSlot::new(1, connection.clone(), 1, 1, clock);
+        let identity = TcpPoolTransportIdentity::new(connection.stable_id(), 1);
+        let old_floor = connection.stats().path.cwnd;
+        {
+            let mut state = slot.state.lock().await;
+            assert_eq!(
+                state.current.record_forward_service_floor(old_floor),
+                Some(old_floor)
+            );
+        }
+
+        connection.successor_service_turn().await.unwrap();
+        let current_cwnd = connection.stats().path.cwnd;
+        assert!(
+            current_cwnd > old_floor,
+            "the exact predecessor must grow beyond its stale installation floor"
+        );
+
+        let handoff = slot
+            .prepare_replacement_current_service_handoff(identity)
+            .await
+            .unwrap();
+        assert_eq!(handoff.observed_cwnd, current_cwnd);
+        assert_eq!(handoff.required_cwnd_floor, current_cwnd);
+        assert_eq!(
+            slot.replacement_forward_service_floor(identity)
+                .await
+                .unwrap(),
+            Some(current_cwnd)
+        );
+
+        connection.close(0u32.into(), b"test complete");
+        server_task.await.unwrap();
+        client_endpoint.close(0u32.into(), b"test complete");
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_replacement_handoff_rejects_a_stale_generation() {
+        let (server_endpoint, client_endpoint, server_addr) = d16_quinn_test_endpoints();
+        let server_task = tokio::spawn(async move {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            connection.closed().await;
+        });
+        let connection = client_endpoint
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let slot = TcpPoolGenerationSlot::new(1, connection.clone(), 7, 1, Instant::now());
+        let stale_identity = TcpPoolTransportIdentity::new(connection.stable_id(), 6);
+
+        assert_eq!(
+            slot.prepare_replacement_current_service_handoff(stale_identity)
+                .await,
+            Err(TcpPoolReplacementCurrentServiceHandoffError::StalePredecessor)
+        );
+        assert_eq!(
+            slot.state
+                .lock()
+                .await
+                .current
+                .replacement_forward_service_floor,
+            None
+        );
+
+        connection.close(0u32.into(), b"test complete");
         server_task.await.unwrap();
         client_endpoint.close(0u32.into(), b"test complete");
     }
