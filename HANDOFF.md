@@ -2,9 +2,30 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-11)
+## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-12)
 
-- **Latest accepted position:** exact-source `0e44a939` formal artifact
+- **Latest accepted position:** exact-source `166c390` artifact
+  `/tmp/mini_vpn_knife15_macos_20260812_030150.tar.gz` (SHA-256
+  `692c6286...`) passed start/smoke and the gates before observer admission,
+  then formal M2 stopped before traffic with an empty
+  `m2-exit-observer-status.txt`. Cleanup passed; formal M2 is `NOT_RUN`.
+- The matching `.33` observer was active and healthy. Root cause was local:
+  `start_runner()` persisted the Exit host and iperf port but omitted the
+  parsed TUIC `server_port`; formal M2 read an empty state value and the old
+  input guard returned before SSH without writing an error.
+- Reviewed repair commit `1cdb17c` persists the whole start network binding
+  including TUIC port. Invalid observer inputs now leave sanitized readable
+  evidence, and focused RED/GREEN runner checks cover both contracts. The
+  unused observer was frozen/bundled as SHA-256 `78542720...`.
+- Formal M2 now rejects source older than `1cdb17c`. No Rust production code,
+  workload, SLI, or frozen value changed. Result:
+  `docs/tech/2026-08-12-knife15-formal-m2-observer-state-binding-repair-local-results.md`.
+- Pull/rebuild the pushed reviewed descendant and take one fresh
+  `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke ->
+  observer start -> m2 -> status -> stop`. Do not reuse the stopped run or
+  frozen observer. M3 remains blocked.
+
+- **Previous accepted position:** exact-source `0e44a939` formal artifact
   `/tmp/mini_vpn_knife15_macos_20260811_074703.tar.gz` (SHA-256
   `a0c268c1...`) completed fourteen cycles and failed cycle 15 reverse UDP at
   `3.934088%` loss versus the frozen `3%` limit. All prior UDP phases were

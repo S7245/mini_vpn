@@ -1,5 +1,24 @@
 # Learnings
 
+## 2026-08-12 - Cross-action state is an executable contract
+
+- A value present in process environment and the immutable manifest is not
+  automatically available to a later privileged action. Every value consumed
+  from the root-owned run state must be written through the same startup
+  boundary and covered by a read-back test.
+- Validate multi-value endpoint identity as one binding. Persist Target, DNS
+  Target, Exit host, TUIC port, and iperf port together so a future field
+  cannot silently fall out of the formal preflight contract.
+- A redirected preflight helper must explain failures that occur before its
+  external command. A zero-byte evidence file is itself a discriminator for
+  an early local guard, but fixed `<missing>/<invalid>` output makes the next
+  failure immediately actionable without echoing untrusted values.
+- A long-run source floor must advance after repairing a locally preventable
+  preflight defect; otherwise the exact broken descendant remains eligible
+  even though the fixed head is clean.
+- Result:
+  `docs/tech/2026-08-12-knife15-formal-m2-observer-state-binding-repair-local-results.md`.
+
 ## 2026-08-11 - Long-run attribution needs aggregate history plus failure-time detail
 
 - A bounded rolling pcap and a long-duration test solve different evidence

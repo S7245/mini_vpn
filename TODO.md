@@ -1,10 +1,37 @@
 # TODO
 
-## Current Knife15 Plan (2026-08-11)
+## Current Knife15 Plan (2026-08-12)
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-11 — formal M2 hit external UDP loss; exact v2 observer required)
+#### Latest decision (2026-08-12 — formal M2 observer state binding repaired locally)
+
+Exact-source `166c390` artifact
+`/tmp/mini_vpn_knife15_macos_20260812_030150.tar.gz` (SHA-256
+`692c6286...`) passed start/smoke and reached observer admission, but formal M2
+did not start. The referenced observer status file was zero bytes and cleanup
+passed. The matching `.33` observer was active and healthy; this was not a
+VPS, observer-lifetime, network, or operator-order failure.
+
+The runner had not persisted the parsed TUIC `server_port` at start. Formal
+M2 therefore read an empty value and its silent input guard returned before
+SSH. Reviewed `1cdb17c` writes the complete start network binding and leaves
+sanitized readable evidence for invalid observer inputs. Focused RED/GREEN
+self-tests pass. Formal M2 now rejects source older than `1cdb17c`; no Rust
+production code, workload, SLI, or frozen value changed. Result:
+`docs/tech/2026-08-12-knife15-formal-m2-observer-state-binding-repair-local-results.md`.
+
+Next:
+
+1. pull the reviewed pushed descendant on the Mac, confirm a clean worktree,
+   and rebuild release;
+2. run one fresh `m2-ipv6-check -> baseline -> direct-discriminator -> start
+   -> smoke -> observer start -> m2 -> status -> stop`;
+3. start the observer after smoke and invoke `m2` within 900 seconds;
+4. do not reuse the stopped run or frozen observer and do not tune constants.
+   M3 remains blocked until formal M2 and cleanup pass.
+
+#### Previous decision (2026-08-11 — formal M2 hit external UDP loss; exact v2 observer required)
 
 Exact-source `0e44a939` artifact
 `/tmp/mini_vpn_knife15_macos_20260811_074703.tar.gz` (SHA-256

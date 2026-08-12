@@ -1,5 +1,24 @@
 # Errors
 
+## 2026-08-12 - Formal M2 runner omitted its observer TUIC-port state
+
+- Exact-source `166c390` reached formal observer admission with a healthy,
+  matching `.33` observer but stopped before M2 traffic. The Mac evidence file
+  `m2-exit-observer-status.txt` was exactly zero bytes and cleanup passed.
+- `start_runner()` recorded `exit_port=8443` in the manifest but did not write
+  `server_port` into the cross-action state. `run_m2_action()` read the absent
+  file as an empty value; without shell `errexit`, execution reached the
+  observer helper, whose silent validation returned before SSH.
+- The prior self-test supplied literal `8443` directly to the helper and thus
+  proved observer parsing without proving the production start-to-M2 state
+  seam. The repaired test writes and reads the same startup binding used by
+  production, and separately requires readable evidence for missing input.
+- No 25-hour workload ran. The active observer was frozen and bundled as
+  SHA-256 `78542720...`; the stopped Mac run and frozen observer must not be
+  reused.
+- Result:
+  `docs/tech/2026-08-12-knife15-formal-m2-observer-state-binding-repair-local-results.md`.
+
 ## 2026-08-11 - Formal M2 lost reverse UDP without same-window segment attribution
 
 - Exact-source `0e44a939` completed fourteen cycles, then cycle 15 reverse
