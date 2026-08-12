@@ -1155,6 +1155,27 @@ write_state() {
     die "cannot write runner state: $name"
 }
 
+write_start_network_state() {
+  local target="${1:-}"
+  local dns_target="${2:-}"
+  local exit_host="${3:-}"
+  local server_port="${4:-}"
+  local iperf_port="${5:-}"
+  validate_ipv4 "$target" || die "cannot persist invalid TARGET state"
+  [[ -z "$dns_target" ]] || validate_ipv4 "$dns_target" || \
+    die "cannot persist invalid DNS_TARGET state"
+  validate_ipv4 "$exit_host" || die "cannot persist invalid Exit state"
+  validate_positive_integer "$server_port" && ((10#$server_port <= 65535)) || \
+    die "cannot persist invalid TUIC server-port state"
+  validate_positive_integer "$iperf_port" && ((10#$iperf_port <= 65535)) || \
+    die "cannot persist invalid iperf-port state"
+  write_state target "$target"
+  write_state dns_target "$dns_target"
+  write_state exit_host "$exit_host"
+  write_state server_port "$server_port"
+  write_state iperf_port "$iperf_port"
+}
+
 pid_command_matches() {
   local expected_bin="$1"
   local command_text="$2"
@@ -3479,10 +3500,11 @@ EOF_M2_FAKE_CURL
   M2_DSCACHEUTIL_BIN="$m2_dscacheutil_bin"
   M2_CURL_BIN="$m2_curl_bin"
   export M2_TEST_DIR="$m2_route_state"
+  write_start_network_state \
+    43.130.32.77 8.8.8.8 43.153.32.33 8443 5201
+  [[ "$(read_state server_port)" == "8443" ]] || \
+    die "self-test: start state did not preserve the TUIC server port"
   write_state utun utun42
-  write_state target 43.130.32.77
-  write_state dns_target 8.8.8.8
-  write_state exit_host 43.153.32.33
   M2_TEST_IPV6_ERROR='route: invalid option'
   export M2_TEST_IPV6_ERROR
   ! m2_ipv6_route_is_safe || \
@@ -5432,6 +5454,12 @@ EOF_FAKE_EXIT_OBSERVER
     die "self-test: formal M2 active Exit observer preflight failed"
   [[ "$(tr '\n' ' ' <"$observer_calls")" == "status " ]] || \
     die "self-test: formal M2 observer preflight did not use status"
+  ! m2_exit_observer_require_active \
+    "$observer_run" 43.130.32.77 5201 '' || \
+    die "self-test: missing formal M2 TUIC port was accepted"
+  grep -Fxq 'ERROR: invalid formal M2 Exit observer TUIC port: <missing>' \
+    "$observer_run/m2-exit-observer-status.txt" || \
+    die "self-test: invalid observer input did not leave readable evidence"
   : >"$observer_calls"
   m2_exit_observer_freeze_and_bundle \
     "$observer_run" workload-failed 43.130.32.77 5201 8443 || \
@@ -6323,11 +6351,9 @@ start_runner() {
   printf 'timestamp\tevent\n' >"$run_dir/events.tsv"
 
   write_state run_dir "$run_dir"
-  write_state target "$TARGET"
-  write_state dns_target "$DNS_TARGET"
-  write_state exit_host "$SERVER_HOST"
+  write_start_network_state \
+    "$TARGET" "$DNS_TARGET" "$SERVER_HOST" "$SERVER_PORT" "$IPERF_PORT"
   write_state bin "$BIN"
-  write_state iperf_port "$IPERF_PORT"
   write_state duration "$DURATION"
   write_state parallel "$PARALLEL"
   write_state sample_secs "$SAMPLE_SECS"
@@ -7949,12 +7975,35 @@ m2_exit_observer_call() {
   local target="$2"
   local iperf_port="$3"
   local tuic_port="$4"
-  [[ -f "$M2_EXIT_OBSERVER_SCRIPT" && ! -L "$M2_EXIT_OBSERVER_SCRIPT" ]] || \
+  [[ -f "$M2_EXIT_OBSERVER_SCRIPT" && ! -L "$M2_EXIT_OBSERVER_SCRIPT" ]] || {
+    printf '%s\n' \
+      'ERROR: formal M2 Exit observer script is missing or symlinked' >&2
     return 1
-  validate_ipv4 "$target" && \
-    validate_positive_integer "$iperf_port" && ((10#$iperf_port <= 65535)) && \
-    validate_positive_integer "$tuic_port" && ((10#$tuic_port <= 65535)) || \
+  }
+  validate_ipv4 "$target" || {
+    printf '%s\n' 'ERROR: invalid formal M2 Exit observer Target IPv4' >&2
     return 1
+  }
+  validate_positive_integer "$iperf_port" && ((10#$iperf_port <= 65535)) || {
+    if [[ -z "$iperf_port" ]]; then
+      printf '%s\n' \
+        'ERROR: invalid formal M2 Exit observer iperf port: <missing>' >&2
+    else
+      printf '%s\n' \
+        'ERROR: invalid formal M2 Exit observer iperf port: <invalid>' >&2
+    fi
+    return 1
+  }
+  validate_positive_integer "$tuic_port" && ((10#$tuic_port <= 65535)) || {
+    if [[ -z "$tuic_port" ]]; then
+      printf '%s\n' \
+        'ERROR: invalid formal M2 Exit observer TUIC port: <missing>' >&2
+    else
+      printf '%s\n' \
+        'ERROR: invalid formal M2 Exit observer TUIC port: <invalid>' >&2
+    fi
+    return 1
+  }
   TARGET="$target" IPERF_PORT="$iperf_port" TUIC_PORT="$tuic_port" \
     OBSERVER_TIMEOUT_SECS=93600 \
     /bin/bash "$M2_EXIT_OBSERVER_SCRIPT" "$action"
