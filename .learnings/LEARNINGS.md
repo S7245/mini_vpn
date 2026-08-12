@@ -1,5 +1,26 @@
 # Learnings
 
+## 2026-08-12 - A clean short qualification reopens a rare-branch formal gate without proving reachability
+
+- Exact-source `579fff4` passed the whole frozen two-cycle mixed workload with
+  zero Target receiver-zero intervals, but no generation replacement or path
+  reset occurred. State the two claims separately: regression cleanliness is
+  proven; current-service handoff effectiveness is not yet observed.
+- Do not repeat a stochastic short run merely to force a rare branch. The
+  accepted architecture already has deterministic local ownership tests; the
+  long formal workload is the real effectiveness discriminator and retains
+  the exact rejection rule if a proved handoff still loses receiver
+  continuity.
+- Qualification observers are not automatically finalized by the Mac runner.
+  After the qualification terminal bundle, explicitly freeze and bundle the
+  fresh Exit observer, verify its table/state cleanup and sing-box health, and
+  start a different fresh observer for formal M2.
+- Advance the formal source ancestor after a production repair qualifies.
+  Otherwise a clean runner can still admit an exact older build whose missing
+  invariant caused the preceding formal failure.
+- Result:
+  `docs/tech/2026-08-12-knife15-m2-replacement-current-service-handoff-macos-qualification-results.md`.
+
 ## 2026-08-12 - Replacement readiness must inherit current service, not historical service
 
 - A nonzero inherited service floor can still be stale. Exact-source `85d8772`

@@ -4,7 +4,38 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-12 — formal M2 rejected stale current-service handoff; local repair ready for qualification)
+#### Latest decision (2026-08-12 — current-service handoff qualification passed; formal M2 reopened)
+
+Exact-source `579fff4` artifact
+`/tmp/mini_vpn_knife15_macos_20260812_092030.tar.gz` (SHA-256
+`c6d9c339...`) completed the two-cycle paired qualification with
+`PASS_NON_ACCEPTANCE`: baseline `38.274/61.255 Mbit/s`, direct
+`19.125 Mbit/s`, eight phases, two DNS and real-client checks, zero Target
+receiver-zero intervals, maximum TCP gap `7,733,248B`, maximum UDP loss
+`1.954378%`, and clean stop cleanup.
+
+Paired Exit SHA-256 `95afe240...` captured `12,235,760` packets with zero
+kernel drops. It was frozen and bundled; observer state/table ownership is
+clean and sing-box remains active. No replacement or path reset occurred, so
+the run proves regression cleanliness without independently proving the rare
+handoff branch. Per the accepted stop contract, do not repeat qualification;
+formal M2 is reopened as the decisive discriminator.
+
+The formal runner now rejects source `85d8772` and requires `579fff4` or a
+descendant. RED/GREEN and full runner self-test pass. Result:
+`docs/tech/2026-08-12-knife15-m2-replacement-current-service-handoff-macos-qualification-results.md`.
+
+Next:
+
+1. pull/rebuild the reviewed pushed descendant on the HK Mac;
+2. reserve about 25 uninterrupted hours for the Mac, `.33` Exit, and `.77`
+   Target;
+3. run exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
+   start -> smoke -> fresh .33 observer start -> m2 -> status -> stop`;
+4. sync both automatically finalized bundles; do not repeat qualification or
+   tune constants. M3 remains blocked until formal M2 and cleanup pass.
+
+#### Previous decision (2026-08-12 — formal M2 rejected stale current-service handoff; local repair ready for qualification)
 
 Exact-source `85d8772` formal artifact
 `/tmp/mini_vpn_knife15_macos_20260812_034701.tar.gz` (SHA-256

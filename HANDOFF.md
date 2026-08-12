@@ -4,7 +4,37 @@
 
 ## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-12)
 
-- **Latest accepted position:** exact-source `85d8772` formal artifact
+- **Latest accepted position:** exact-source `579fff4` paired qualification
+  artifact `/tmp/mini_vpn_knife15_macos_20260812_092030.tar.gz` (SHA-256
+  `c6d9c339...`) passed baseline `38.274/61.255 Mbit/s`, bounded direct at
+  `19.125 Mbit/s`, smoke, every preflight, two cycles/eight phases, two DNS
+  and real-client checks, and cleanup. Target receiver-zero was zero; maximum
+  TCP gap was `7,733,248B`; maximum UDP loss was `1.954378%`. Verdict is
+  `PASS_NON_ACCEPTANCE`; formal M2 was not run.
+- Four `Stopped(0)` writes were completed timed-transfer close tails with D16
+  queued/leased/reserved `0/0/0B`. Endpoint conservation stayed within
+  `61,440B`, terminal live/outstanding was `0/0B`, socket would-block was
+  zero, recovery evidence was safe, and the final process was dead after
+  cleanup.
+- No generation replacement or path reset occurred. The qualification proves
+  regression cleanliness but does not independently reach the rare
+  `observed_current_cwnd` handoff branch. Do not repeat or tune; formal M2 is
+  the decisive branch/effectiveness gate.
+- Paired Exit observer SHA-256 `95afe240...` captured `12,235,760` packets
+  with zero kernel drops. It was frozen/bundled after qualification; observer
+  nftables/state ownership is gone and sing-box remains active.
+- Formal M2 now rejects `85d8772` and requires reviewed handoff source
+  `579fff4` or a descendant. Focused source-floor RED/GREEN and the full
+  runner self-test pass; no data-plane code, workload, SLI, or frozen value
+  changed. Result:
+  `docs/tech/2026-08-12-knife15-m2-replacement-current-service-handoff-macos-qualification-results.md`.
+- Pull/rebuild the pushed reviewed descendant. Take exactly one fresh formal
+  `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke ->
+  fresh .33 observer start -> m2 -> status -> stop` while the Mac and VPSs
+  can remain uninterrupted for about 25 hours. Sync both final bundles. M3
+  remains blocked until formal M2 and cleanup pass.
+
+- **Previous accepted position:** exact-source `85d8772` formal artifact
   `/tmp/mini_vpn_knife15_macos_20260812_034701.tar.gz` (SHA-256
   `9d33b1af...`) passed baseline `17.776/64.868 Mbit/s`, direct, smoke,
   observer admission, every preflight, fifteen complete M2 cycles, and

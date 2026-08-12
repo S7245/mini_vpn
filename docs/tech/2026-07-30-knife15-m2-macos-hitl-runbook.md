@@ -2,7 +2,7 @@
 
 Date: 2026-07-30
 
-Status: **FORMAL M2 READY ON A CLEAN REVIEWED DESCENDANT OF `2707873` — the
+Status: **FORMAL M2 READY ON A CLEAN REVIEWED DESCENDANT OF `579fff4` — the
 paired two-cycle qualification is complete and must not be repeated**
 
 This is the reviewed formal M2 sequence. The current next run is the frozen
@@ -50,7 +50,7 @@ git switch codex/knife14d-downlink-reap-open
 git pull --ff-only origin codex/knife14d-downlink-reap-open
 git status --short
 git rev-parse HEAD
-git merge-base --is-ancestor 2707873 HEAD && echo 'PASS: M2 source accepted'
+git merge-base --is-ancestor 579fff4 HEAD && echo 'PASS: M2 source accepted'
 
 unset M0_BASELINE_DIR M0_DIRECT_DIR
 unset M1_BASELINE_DIR M1_DIRECT_DIR

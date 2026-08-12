@@ -1,5 +1,17 @@
 # Errors
 
+## 2026-08-12 - A credential-name scan was broader than a credential-value scan
+
+- The first final gate rejected `MINI_VPN_TUIC_PASSWORD` wherever the variable
+  name was followed by any non-space text. It therefore matched the runner's
+  variable forwarding and the runbook's literal `REPLACE_WITH_PASSWORD`
+  placeholder.
+- That result was rejected as a false positive after inspecting only redacted
+  assignment shapes. Final secret checking must scan changed values and exact
+  private-key/access-key/UUID patterns while explicitly permitting shell
+  variable references and documented replacement placeholders.
+- No credential value or private-key marker was present in the changed diff.
+
 ## 2026-08-12 - Formal M2 exposed stale replacement-service ownership
 
 - Exact-source `85d8772` passed fifteen complete formal cycles and failed

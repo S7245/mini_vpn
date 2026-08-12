@@ -189,7 +189,35 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-12:
 
-- Exact-source `85d8772` formal artifact
+- Exact-source `579fff4` paired qualification artifact
+  `/tmp/mini_vpn_knife15_macos_20260812_092030.tar.gz` (SHA-256
+  `c6d9c339...`) passed baseline `38.274/61.255 Mbit/s`, direct
+  `19.125 Mbit/s`, smoke, every preflight, two cycles/eight phases, two DNS
+  and real-client checks, and cleanup. Target receiver-zero was zero, maximum
+  TCP gap was `7,733,248B`, and maximum UDP loss was `1.954378%`. Verdict is
+  `PASS_NON_ACCEPTANCE`; formal M2 was not run.
+- D16 terminal ownership, Endpoint conservation, routes, DNS, process,
+  physical interface, recovery evidence, and cleanup were clean. Four
+  `Stopped(0)` writes were timed-transfer tails. Endpoint terminal
+  live/outstanding was `0/0B` and socket would-block was zero.
+- No generation replacement or path reset occurred. This proves regression
+  cleanliness without independently proving the rare current-service handoff
+  branch. Do not repeat qualification; formal M2 is reopened as the decisive
+  branch/effectiveness gate.
+- Paired Exit SHA-256 `95afe240...` captured `12,235,760` packets with zero
+  kernel drops. It was frozen/bundled after qualification, its observer state
+  and nftables ownership are gone, and sing-box remains active.
+- Formal M2 now rejects `85d8772` and requires reviewed source `579fff4` or a
+  descendant. Focused source-floor RED/GREEN and the complete runner self-test
+  pass. No data-plane code, workload, SLI, or frozen value changed. Result:
+  `docs/tech/2026-08-12-knife15-m2-replacement-current-service-handoff-macos-qualification-results.md`.
+- Pull/rebuild the pushed reviewed descendant and take exactly one fresh
+  formal `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke
+  -> fresh .33 observer start -> m2 -> status -> stop` while the Mac and VPSs
+  can remain uninterrupted for about 25 hours. Sync both bundles. M3 remains
+  blocked until formal M2 and cleanup pass.
+
+- Previous accepted position: exact-source `85d8772` formal artifact
   `/tmp/mini_vpn_knife15_macos_20260812_034701.tar.gz` (SHA-256
   `9d33b1af...`) passed baseline `17.776/64.868 Mbit/s`, direct, smoke,
   matching observer admission, every preflight, fifteen complete cycles, and
