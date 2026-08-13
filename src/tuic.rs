@@ -6004,13 +6004,30 @@ const TUIC_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
 const TUIC_TCP_POOL_STALE_RECONNECT_SECS: u64 = 10;
 const TUIC_TCP_POOL_LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpPoolInstallServiceState {
+    path_generation: u64,
+    cwnd: u64,
+    closed: bool,
+}
+
 trait TcpPoolTransport: Clone {
     fn tcp_pool_stable_id(&self) -> usize;
+    fn tcp_pool_install_service_state(&self) -> Option<TcpPoolInstallServiceState>;
 }
 
 impl TcpPoolTransport for Connection {
     fn tcp_pool_stable_id(&self) -> usize {
         self.stable_id()
+    }
+
+    fn tcp_pool_install_service_state(&self) -> Option<TcpPoolInstallServiceState> {
+        let cwnd = self.stats().path.cwnd;
+        Some(TcpPoolInstallServiceState {
+            path_generation: self.current_path_generation(),
+            cwnd,
+            closed: self.close_reason().is_some(),
+        })
     }
 }
 
@@ -6018,6 +6035,10 @@ impl TcpPoolTransport for Connection {
 impl TcpPoolTransport for u64 {
     fn tcp_pool_stable_id(&self) -> usize {
         usize::try_from(*self).unwrap_or(usize::MAX)
+    }
+
+    fn tcp_pool_install_service_state(&self) -> Option<TcpPoolInstallServiceState> {
+        None
     }
 }
 
@@ -6298,11 +6319,20 @@ impl<T: TcpPoolTransport> TcpPoolGenerationSlot<T> {
             return Err(TcpPoolGenerationInstallError::StalePredecessor);
         }
         let successor_identity = successor.identity();
+        let successor_current_service = successor.transport.tcp_pool_install_service_state();
         if successor_identity.stable_id == expected_identity.stable_id
             || expected_identity.generation.checked_add(1) != Some(successor_identity.generation)
             || !proved_forward_service.matches_successor(&successor)
+            || successor_current_service.is_some_and(|current| {
+                current.closed || current.path_generation != proved_forward_service.path_generation
+            })
         {
             return Err(TcpPoolGenerationInstallError::InvalidSuccessor);
+        }
+        if successor_current_service
+            .is_some_and(|current| current.cwnd < proved_forward_service.final_cwnd)
+        {
+            return Err(TcpPoolGenerationInstallError::InsufficientForwardService);
         }
         if state
             .current
@@ -8145,6 +8175,79 @@ mod tests {
     use crate::tcp_downlink_pump::{AsyncLeasedByteFlowQueue, DownstreamPermitReleaseMode};
     use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
+
+    #[derive(Clone)]
+    struct TcpPoolInstallStateTransport {
+        stable_id: usize,
+        path_generation: u64,
+        cwnd: u64,
+        closed: bool,
+    }
+
+    impl TcpPoolTransport for TcpPoolInstallStateTransport {
+        fn tcp_pool_stable_id(&self) -> usize {
+            self.stable_id
+        }
+
+        fn tcp_pool_install_service_state(&self) -> Option<TcpPoolInstallServiceState> {
+            Some(TcpPoolInstallServiceState {
+                path_generation: self.path_generation,
+                cwnd: self.cwnd,
+                closed: self.closed,
+            })
+        }
+    }
+
+    async fn install_successor_with_current_service(
+        current_path_generation: u64,
+        current_cwnd: u64,
+        closed: bool,
+        proved_path_generation: u64,
+        proved_final_cwnd: u64,
+    ) -> Result<TcpPoolGenerationInstall, TcpPoolGenerationInstallError> {
+        let clock = Instant::now();
+        let slot = TcpPoolGenerationSlot::new(
+            1,
+            TcpPoolInstallStateTransport {
+                stable_id: 11,
+                path_generation: 1,
+                cwnd: 24_800,
+                closed: false,
+            },
+            1,
+            1,
+            clock,
+        );
+        let predecessor_identity = TcpPoolTransportIdentity::new(11, 1);
+        let predecessor_activity = slot.current_activity().await;
+        let successor = TcpPoolGeneration::new_successor(
+            TcpPoolInstallStateTransport {
+                stable_id: 22,
+                path_generation: current_path_generation,
+                cwnd: current_cwnd,
+                closed,
+            },
+            2,
+            1,
+            clock,
+            proved_path_generation,
+            26_424,
+        )
+        .unwrap();
+        let proof =
+            TcpPoolSuccessorInstallServiceProof::for_successor(&successor, proved_final_cwnd)
+                .expect("the replay proof must remain above first-turn readiness");
+
+        slot.install_successor_with(
+            predecessor_identity,
+            &predecessor_activity,
+            successor,
+            proof,
+            Instant::now(),
+            |_, _| true,
+        )
+        .await
+    }
 
     #[derive(Debug, Default)]
     struct StartupPriorityProbeState {
@@ -12916,6 +13019,37 @@ mod tests {
         ));
         assert_eq!(slot.current_transport().await, 11);
         assert_eq!(slot.draining_transport().await, None);
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_successor_install_rejects_current_path_after_proof_changed() {
+        assert!(matches!(
+            install_successor_with_current_service(8, 52_848, false, 7, 52_848).await,
+            Err(TcpPoolGenerationInstallError::InvalidSuccessor)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_successor_install_rejects_current_cwnd_regression_after_proof() {
+        assert!(matches!(
+            install_successor_with_current_service(7, 41_301, false, 7, 52_848).await,
+            Err(TcpPoolGenerationInstallError::InsufficientForwardService)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_successor_install_rejects_connection_closed_after_proof() {
+        assert!(matches!(
+            install_successor_with_current_service(7, 52_848, true, 7, 52_848).await,
+            Err(TcpPoolGenerationInstallError::InvalidSuccessor)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_successor_install_accepts_matching_current_service() {
+        install_successor_with_current_service(7, 61_440, false, 7, 52_848)
+            .await
+            .expect("a live same-path successor above its exact proof remains installable");
     }
 
     #[test]
