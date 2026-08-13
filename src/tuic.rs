@@ -905,6 +905,7 @@ struct TcpPoolSuccessorServiceCertificate {
 struct TcpPoolSuccessorForwardServiceProof {
     required_cwnd_floor: Option<u64>,
     initial_cwnd: u64,
+    readiness_cwnd_floor: u64,
     final_cwnd: u64,
     rounds: u64,
     target_bytes: u64,
@@ -912,6 +913,14 @@ struct TcpPoolSuccessorForwardServiceProof {
     acked_bytes: u64,
     lost_bytes: u64,
     path_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpPoolSuccessorInstallServiceProof {
+    successor_identity: TcpPoolTransportIdentity,
+    path_generation: u64,
+    readiness_cwnd_floor: u64,
+    final_cwnd: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -947,6 +956,7 @@ async fn prove_tcp_pool_successor_forward_service(
     let mut proof = TcpPoolSuccessorForwardServiceProof {
         required_cwnd_floor,
         initial_cwnd,
+        readiness_cwnd_floor: 0,
         final_cwnd: initial_cwnd,
         rounds: 0,
         target_bytes: 0,
@@ -1007,6 +1017,9 @@ async fn prove_tcp_pool_successor_forward_service(
         proof.acked_bytes = proof.acked_bytes.saturating_add(turn.acked_bytes);
         proof.lost_bytes = proof.lost_bytes.saturating_add(turn.lost_bytes);
         proof.final_cwnd = connection.stats().path.cwnd;
+        if proof.readiness_cwnd_floor == 0 {
+            proof.readiness_cwnd_floor = proof.final_cwnd;
+        }
 
         match tcp_pool_successor_forward_service_progress(
             required_cwnd_floor,
@@ -1044,6 +1057,50 @@ impl TcpPoolSuccessorServiceCertificate {
             path_generation,
             proved_cwnd_floor,
         })
+    }
+}
+
+impl TcpPoolSuccessorInstallServiceProof {
+    fn from_forward_service<T: TcpPoolTransport>(
+        successor: &TcpPoolGeneration<T>,
+        proof: &TcpPoolSuccessorForwardServiceProof,
+    ) -> Option<Self> {
+        let certificate = successor.successor_service_certificate?;
+        (proof.path_generation == certificate.path_generation
+            && proof.readiness_cwnd_floor == certificate.proved_cwnd_floor
+            && proof.final_cwnd >= proof.readiness_cwnd_floor)
+            .then_some(Self {
+                successor_identity: successor.identity(),
+                path_generation: proof.path_generation,
+                readiness_cwnd_floor: proof.readiness_cwnd_floor,
+                final_cwnd: proof.final_cwnd,
+            })
+    }
+
+    #[cfg(test)]
+    fn for_successor<T: TcpPoolTransport>(
+        successor: &TcpPoolGeneration<T>,
+        final_cwnd: u64,
+    ) -> Option<Self> {
+        let certificate = successor.successor_service_certificate?;
+        (final_cwnd >= certificate.proved_cwnd_floor).then_some(Self {
+            successor_identity: successor.identity(),
+            path_generation: certificate.path_generation,
+            readiness_cwnd_floor: certificate.proved_cwnd_floor,
+            final_cwnd,
+        })
+    }
+
+    fn matches_successor<T: TcpPoolTransport>(self, successor: &TcpPoolGeneration<T>) -> bool {
+        successor
+            .successor_service_certificate
+            .is_some_and(|certificate| {
+                self.successor_identity == successor.identity()
+                    && certificate.identity == self.successor_identity
+                    && certificate.path_generation == self.path_generation
+                    && certificate.proved_cwnd_floor == self.readiness_cwnd_floor
+                    && self.final_cwnd >= self.readiness_cwnd_floor
+            })
     }
 }
 
@@ -5967,8 +6024,8 @@ impl TcpPoolTransport for u64 {
 struct TcpPoolGeneration<T> {
     transport: T,
     successor_service_certificate: Option<TcpPoolSuccessorServiceCertificate>,
-    /// Exact service the current transport had proved before surrendering its generation.
-    /// This is observed state, not a configured congestion-window target.
+    /// Exact current-service handoff for the active replacement attempt. A new attempt
+    /// recomputes it from the immutable readiness certificate and current Quinn cwnd.
     replacement_forward_service_floor: Option<u64>,
     activity: Arc<TcpPoolGenerationActivity>,
     write_pressure: Arc<TcpWritePressure>,
@@ -6024,7 +6081,8 @@ impl<T: TcpPoolTransport> TcpPoolGeneration<T> {
             return None;
         }
         let floor = self
-            .replacement_forward_service_floor
+            .successor_service_certificate
+            .map(|certificate| certificate.proved_cwnd_floor)
             .unwrap_or(0)
             .max(observed_cwnd);
         self.replacement_forward_service_floor = Some(floor);
@@ -6176,10 +6234,39 @@ impl<T: TcpPoolTransport> TcpPoolGenerationSlot<T> {
         successor: TcpPoolGeneration<T>,
         started_at: Instant,
     ) -> Result<TcpPoolGenerationInstall, TcpPoolGenerationInstallError> {
+        let proved_forward_service = TcpPoolSuccessorInstallServiceProof::for_successor(
+            &successor,
+            successor.replacement_forward_service_floor.unwrap_or(0),
+        )
+        .ok_or(TcpPoolGenerationInstallError::InvalidSuccessor)?;
         self.install_successor_with(
             expected_identity,
             expected_activity,
             successor,
+            proved_forward_service,
+            started_at,
+            |_, _| true,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn install_successor_with_proved_service(
+        &self,
+        expected_identity: TcpPoolTransportIdentity,
+        expected_activity: &Arc<TcpPoolGenerationActivity>,
+        successor: TcpPoolGeneration<T>,
+        final_cwnd: u64,
+        started_at: Instant,
+    ) -> Result<TcpPoolGenerationInstall, TcpPoolGenerationInstallError> {
+        let proved_forward_service =
+            TcpPoolSuccessorInstallServiceProof::for_successor(&successor, final_cwnd)
+                .ok_or(TcpPoolGenerationInstallError::InvalidSuccessor)?;
+        self.install_successor_with(
+            expected_identity,
+            expected_activity,
+            successor,
+            proved_forward_service,
             started_at,
             |_, _| true,
         )
@@ -6191,6 +6278,7 @@ impl<T: TcpPoolTransport> TcpPoolGenerationSlot<T> {
         expected_identity: TcpPoolTransportIdentity,
         expected_activity: &Arc<TcpPoolGenerationActivity>,
         successor: TcpPoolGeneration<T>,
+        proved_forward_service: TcpPoolSuccessorInstallServiceProof,
         started_at: Instant,
         install_activity: impl FnOnce(
             &Arc<TcpPoolGenerationActivity>,
@@ -6212,17 +6300,14 @@ impl<T: TcpPoolTransport> TcpPoolGenerationSlot<T> {
         let successor_identity = successor.identity();
         if successor_identity.stable_id == expected_identity.stable_id
             || expected_identity.generation.checked_add(1) != Some(successor_identity.generation)
+            || !proved_forward_service.matches_successor(&successor)
         {
             return Err(TcpPoolGenerationInstallError::InvalidSuccessor);
         }
         if state
             .current
             .replacement_forward_service_floor
-            .is_some_and(|required| {
-                successor
-                    .replacement_forward_service_floor
-                    .is_none_or(|proved| proved < required)
-            })
+            .is_some_and(|required| proved_forward_service.final_cwnd < required)
         {
             return Err(TcpPoolGenerationInstallError::InsufficientForwardService);
         }
@@ -6989,11 +7074,12 @@ impl TuicUpstream {
         }
         let service_turn_ms = service_turn_started_at.elapsed().as_millis();
         println!(
-            "✅ tuic-tcp-pool-successor-forward-service-proof slot={} successor_id={} inherited_forward_service_floor={} initial_cwnd={} final_cwnd={} rounds={} target_bytes={} sent_bytes={} acked_bytes={} lost_bytes={} path_generation={} service_turn_ms={}",
+            "✅ tuic-tcp-pool-successor-forward-service-proof slot={} successor_id={} inherited_forward_service_floor={} initial_cwnd={} readiness_cwnd_floor={} final_cwnd={} rounds={} target_bytes={} sent_bytes={} acked_bytes={} lost_bytes={} path_generation={} service_turn_ms={}",
             replacement.index,
             successor_stable_id,
             optional_counter(service_proof.required_cwnd_floor),
             service_proof.initial_cwnd,
+            service_proof.readiness_cwnd_floor,
             service_proof.final_cwnd,
             service_proof.rounds,
             service_proof.target_bytes,
@@ -7020,7 +7106,7 @@ impl TuicUpstream {
             auth_attempts as u64,
             self.clock,
             service_proof.path_generation,
-            service_proof.final_cwnd,
+            service_proof.readiness_cwnd_floor,
         )
         .ok_or_else(|| {
             io_err(
@@ -7029,6 +7115,14 @@ impl TuicUpstream {
             )
         })?;
         let successor_activity = successor.activity.clone();
+        let Some(successor_install_service_proof) =
+            TcpPoolSuccessorInstallServiceProof::from_forward_service(&successor, &service_proof)
+        else {
+            return Err(io_err(
+                "tuic tcp pool generation replacement",
+                "successful successor handoff proof does not match its readiness certificate",
+            ));
+        };
         let successor_observation = TcpPoolPathObservation::Known {
             identity: successor.identity(),
             path_service: TcpPoolPathService::known(successor_path.cwnd, successor_path.rtt),
@@ -7041,6 +7135,7 @@ impl TuicUpstream {
                 replacement.identity,
                 &expected_activity,
                 successor,
+                successor_install_service_proof,
                 started_at,
                 |predecessor, successor| {
                     self.tcp_pool_admission.replace_current_generation_activity(
@@ -11155,23 +11250,24 @@ mod tests {
     }
 
     #[test]
-    fn tcp_pool_generation_owns_a_monotonic_replacement_forward_service_floor() {
+    fn tcp_pool_generation_recomputes_each_replacement_handoff_from_readiness() {
         let clock = Instant::now();
-        let mut generation = TcpPoolGeneration::new(11_u64, 1, 1, clock);
+        let mut generation =
+            TcpPoolGeneration::new_successor(11_u64, 2, 1, clock, 7, 26_424).unwrap();
 
         assert_eq!(
-            generation.record_forward_service_floor(41_301),
-            Some(41_301)
-        );
-        assert_eq!(generation.replacement_forward_service_floor, Some(41_301));
-        assert_eq!(
-            generation.record_forward_service_floor(24_800),
-            Some(41_301)
+            generation.record_forward_service_floor(3_605_919),
+            Some(3_605_919)
         );
         assert_eq!(
-            generation.replacement_forward_service_floor,
-            Some(41_301),
-            "later lower evidence must not weaken the replacement requirement"
+            generation.record_forward_service_floor(381_502),
+            Some(381_502),
+            "a failed historical handoff must not ratchet the next replacement attempt"
+        );
+        assert_eq!(generation.replacement_forward_service_floor, Some(381_502));
+        assert_eq!(
+            generation.record_forward_service_floor(17_360),
+            Some(26_424)
         );
         assert_eq!(generation.record_forward_service_floor(0), None);
     }
@@ -11212,7 +11308,8 @@ mod tests {
         )
         .unwrap();
         let expected = TcpPoolTransportIdentity::new(11, 1);
-        let successor = TcpPoolGeneration::new(22_u64, 2, 1, clock);
+        let successor = TcpPoolGeneration::new_successor(22_u64, 2, 1, clock, 7, 24_800)
+            .expect("an installable successor must own exact service evidence");
 
         let installed = slot
             .install_successor(expected, &predecessor_activity, successor, Instant::now())
@@ -11252,7 +11349,7 @@ mod tests {
             .install_successor(
                 TcpPoolTransportIdentity::new(10, 1),
                 &primary_activity,
-                TcpPoolGeneration::new(20_u64, 2, 1, clock),
+                TcpPoolGeneration::new_successor(20_u64, 2, 1, clock, 7, 24_800).unwrap(),
                 Instant::now(),
             )
             .await;
@@ -11268,7 +11365,7 @@ mod tests {
             .install_successor(
                 TcpPoolTransportIdentity::new(99, 1),
                 &predecessor_activity,
-                TcpPoolGeneration::new(21_u64, 2, 1, clock),
+                TcpPoolGeneration::new_successor(21_u64, 2, 1, clock, 7, 24_800).unwrap(),
                 Instant::now(),
             )
             .await;
@@ -11283,7 +11380,7 @@ mod tests {
             .install_successor(
                 TcpPoolTransportIdentity::new(11, 1),
                 &predecessor_activity,
-                TcpPoolGeneration::new(22_u64, 2, 1, clock),
+                TcpPoolGeneration::new_successor(22_u64, 2, 1, clock, 7, 24_800).unwrap(),
                 Instant::now(),
             )
             .await
@@ -11293,7 +11390,7 @@ mod tests {
             .install_successor(
                 TcpPoolTransportIdentity::new(22, 2),
                 &successor_activity,
-                TcpPoolGeneration::new(23_u64, 3, 1, clock),
+                TcpPoolGeneration::new_successor(23_u64, 3, 1, clock, 7, 24_800).unwrap(),
                 Instant::now(),
             )
             .await;
@@ -11354,6 +11451,8 @@ mod tests {
         let successor = TcpPoolGeneration::new_successor(22_u64, 2, 1, clock, 5, 24_800)
             .expect("the installed successor must own its successful service turn");
         let successor_activity = successor.activity.clone();
+        let successor_install_service_proof =
+            TcpPoolSuccessorInstallServiceProof::for_successor(&successor, 24_800).unwrap();
         let successor_observation =
             TcpPoolPathObservation::known_with_successor_service_certificate(
                 successor.identity(),
@@ -11369,6 +11468,7 @@ mod tests {
                 TcpPoolTransportIdentity::new(11, 1),
                 &predecessor_activity,
                 successor,
+                successor_install_service_proof,
                 Instant::now(),
                 |predecessor, successor| {
                     admission.replace_current_generation_activity(1, predecessor, successor.clone())
@@ -11574,6 +11674,52 @@ mod tests {
 
         let TcpPoolAdmissionDecision::ReserveCurrent(reservation) = decision else {
             panic!("ordinary congestion history must not replace a currently proved successor");
+        };
+        assert_eq!(reservation.index, 1);
+        assert_eq!(
+            reservation.candidates[1].successor_service_readiness,
+            TcpPoolSuccessorServiceReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn tcp_pool_historical_handoff_proof_does_not_churn_ready_successor() {
+        let admission = TcpPoolAdmission::new(2);
+        admission.set_active_for_test(0, 2);
+        let readiness_floor = 26_424;
+        let current_cwnd = 381_502;
+        let historical_handoff_proof = 3_605_919;
+        let mut successor =
+            TcpPoolGeneration::new_successor(11_u64, 2, 1, Instant::now(), 0, readiness_floor)
+                .unwrap();
+        assert_eq!(
+            successor.record_forward_service_floor(historical_handoff_proof),
+            Some(historical_handoff_proof)
+        );
+        let observations = [
+            TcpPoolPathObservation::known(
+                TcpPoolTransportIdentity::new(10, 1),
+                12_000,
+                Duration::from_millis(164),
+                2,
+            ),
+            TcpPoolPathObservation::known_with_successor_service_certificate(
+                successor.identity(),
+                current_cwnd,
+                Duration::from_millis(164),
+                0,
+                0,
+                0,
+                readiness_floor,
+            ),
+        ];
+
+        let decision = admission
+            .try_decide(&observations, &[false, true])
+            .expect("native same-path congestion contraction must retain current availability");
+
+        let TcpPoolAdmissionDecision::ReserveCurrent(reservation) = decision else {
+            panic!("a historical multi-round handoff cannot authorize generation churn");
         };
         assert_eq!(reservation.index, 1);
         assert_eq!(
@@ -12697,6 +12843,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_pool_successor_install_separates_readiness_from_handoff_proof() {
+        let clock = Instant::now();
+        let slot = TcpPoolGenerationSlot::new(1, 11_u64, 1, 1, clock);
+        let predecessor_identity = TcpPoolTransportIdentity::new(11, 1);
+        let predecessor_activity = slot.current_activity().await;
+        let inherited_handoff_floor = 3_605_919;
+        let readiness_floor = 26_424;
+        {
+            let mut state = slot.state.lock().await;
+            assert_eq!(
+                state
+                    .current
+                    .record_forward_service_floor(inherited_handoff_floor),
+                Some(inherited_handoff_floor)
+            );
+        }
+        let successor = TcpPoolGeneration::new_successor(22_u64, 2, 1, clock, 7, readiness_floor)
+            .expect("the first exact service turn must create readiness evidence");
+
+        slot.install_successor_with_proved_service(
+            predecessor_identity,
+            &predecessor_activity,
+            successor,
+            inherited_handoff_floor,
+            Instant::now(),
+        )
+        .await
+        .expect("a final transaction proof may satisfy a larger inherited handoff");
+
+        let state = slot.state.lock().await;
+        assert_eq!(
+            state.current.successor_service_certificate,
+            TcpPoolSuccessorServiceCertificate::new(
+                TcpPoolTransportIdentity::new(22, 2),
+                7,
+                readiness_floor,
+            )
+        );
+        assert_eq!(
+            state.current.replacement_forward_service_floor,
+            Some(readiness_floor),
+            "the historical multi-round handoff proof must not become a lifetime replacement floor"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_successor_install_rejects_proof_from_another_path() {
+        let clock = Instant::now();
+        let slot = TcpPoolGenerationSlot::new(1, 11_u64, 1, 1, clock);
+        let predecessor_identity = TcpPoolTransportIdentity::new(11, 1);
+        let predecessor_activity = slot.current_activity().await;
+        let successor = TcpPoolGeneration::new_successor(22_u64, 2, 1, clock, 7, 26_424).unwrap();
+        let mismatched = TcpPoolSuccessorInstallServiceProof {
+            successor_identity: successor.identity(),
+            path_generation: 8,
+            readiness_cwnd_floor: 26_424,
+            final_cwnd: 52_848,
+        };
+
+        assert!(matches!(
+            slot.install_successor_with(
+                predecessor_identity,
+                &predecessor_activity,
+                successor,
+                mismatched,
+                Instant::now(),
+                |_, _| true,
+            )
+            .await,
+            Err(TcpPoolGenerationInstallError::InvalidSuccessor)
+        ));
+        assert_eq!(slot.current_transport().await, 11);
+        assert_eq!(slot.draining_transport().await, None);
+    }
+
+    #[test]
+    fn tcp_pool_successor_install_proof_binds_the_exact_forward_service_turn() {
+        let successor =
+            TcpPoolGeneration::new_successor(22_u64, 2, 1, Instant::now(), 7, 26_424).unwrap();
+        let exact = TcpPoolSuccessorForwardServiceProof {
+            required_cwnd_floor: Some(52_848),
+            initial_cwnd: 12_000,
+            readiness_cwnd_floor: 26_424,
+            final_cwnd: 52_848,
+            rounds: 2,
+            target_bytes: 38_424,
+            sent_bytes: 38_424,
+            acked_bytes: 38_424,
+            lost_bytes: 0,
+            path_generation: 7,
+        };
+
+        assert!(
+            TcpPoolSuccessorInstallServiceProof::from_forward_service(&successor, &exact).is_some()
+        );
+        assert!(
+            TcpPoolSuccessorInstallServiceProof::from_forward_service(
+                &successor,
+                &TcpPoolSuccessorForwardServiceProof {
+                    path_generation: 8,
+                    ..exact
+                },
+            )
+            .is_none()
+        );
+        assert!(
+            TcpPoolSuccessorInstallServiceProof::from_forward_service(
+                &successor,
+                &TcpPoolSuccessorForwardServiceProof {
+                    readiness_cwnd_floor: 24_800,
+                    ..exact
+                },
+            )
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn tcp_pool_successor_inherits_a_dynamic_forward_service_floor() {
         let (server_endpoint, client_endpoint, server_addr) = d16_quinn_test_endpoints();
         let server_task = tokio::spawn(async move {
@@ -12724,6 +12988,14 @@ mod tests {
             "a floor above one slow-start turn must require sequential exact ownership: {proof:?}"
         );
         assert_eq!(proof.required_cwnd_floor, Some(required_floor));
+        assert!(
+            proof.readiness_cwnd_floor > initial_cwnd,
+            "the first exact ACK-owned turn must establish a positive readiness floor: {proof:?}"
+        );
+        assert!(
+            proof.readiness_cwnd_floor < proof.final_cwnd,
+            "a multi-round handoff must not collapse its first-turn readiness floor into the final transaction proof: {proof:?}"
+        );
         assert!(proof.final_cwnd >= required_floor);
         assert!(proof.sent_bytes >= proof.target_bytes);
         assert_eq!(proof.acked_bytes, proof.sent_bytes);
