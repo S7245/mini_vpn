@@ -4,7 +4,37 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-13 — formal M2 rejected historical handoff as lifetime readiness; separation ready for qualification)
+#### Latest decision (2026-08-13 — prequalification code review closed three preventable P1 gaps)
+
+Concentrated review after the service-floor separation repaired three defects
+that could otherwise waste or invalidate the next Mac run:
+
+- `c06a9d0` revalidates successor live close/path/cwnd state under the exact
+  generation-slot install mutex, after the typed proof and immediately before
+  activity/install ownership changes;
+- `cce3bf8` rejects untracked exact-source inputs such as `build.rs`; and
+- paired healthy Exit observer admission is now executable for qualification,
+  not only documented or reserved for formal M2.
+
+Expected RED/GREEN tests and all local gates pass. Root is `713+3 ignored`,
+integration is `10+4 ignored`, exact Endpoint capacity is `225.382 Mbit/s`,
+and code review has no unresolved P0/P1. No frozen data-plane value, workload,
+SLI, retry, or deadline changed. Result:
+`docs/tech/2026-08-13-knife15-m2-prequalification-code-review-local-results.md`.
+
+Next:
+
+1. pull/rebuild the pushed reviewed descendant on the HK Mac and confirm
+   `git status --short` is completely empty;
+2. reserve about 45 uninterrupted minutes and start one fresh `.33` observer
+   only after smoke;
+3. run exactly one paired `m2-ipv6-check -> baseline -> direct-discriminator
+   -> start -> smoke -> fresh .33 observer start -> m2-qualification ->
+   status -> stop -> observer freeze/bundle`;
+4. sync both bundles. A clean qualification reopens one fresh formal M2 of
+   about 25 hours. Do not run formal first or tune/repeat unchanged.
+
+#### Previous decision (2026-08-13 — formal M2 rejected historical handoff as lifetime readiness; separation ready for qualification)
 
 Exact-source `642e3ae` formal artifact
 `/tmp/mini_vpn_knife15_macos_20260813_053346.tar.gz` (SHA-256

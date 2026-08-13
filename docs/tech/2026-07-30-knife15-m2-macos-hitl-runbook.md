@@ -3,7 +3,7 @@
 Date: 2026-07-30
 
 Status: **PAIRED M2 QUALIFICATION REQUIRED ON A CLEAN REVIEWED DESCENDANT OF
-`b7bb9a9` — FORMAL M2 MUST NOT RUN YET**
+`c06a9d0` — FORMAL M2 MUST NOT RUN YET**
 
 This is the reviewed sequence for the current non-acceptance qualification.
 It uses the controlled IPv4 full tunnel and temporarily changes the active
@@ -50,7 +50,7 @@ git switch codex/knife14d-downlink-reap-open
 git pull --ff-only origin codex/knife14d-downlink-reap-open
 git status --short
 git rev-parse HEAD
-git merge-base --is-ancestor b7bb9a9 HEAD && echo 'PASS: M2 source accepted'
+git merge-base --is-ancestor c06a9d0 HEAD && echo 'PASS: M2 source accepted'
 
 unset M0_BASELINE_DIR M0_DIRECT_DIR
 unset M1_BASELINE_DIR M1_DIRECT_DIR
@@ -76,9 +76,11 @@ export MINI_VPN_TUIC_SNI='example.com'
 export MINI_VPN_TUIC_CA_PATH='certs/dev/ca-cert.pem'
 ```
 
-`git status --short` must print nothing, and the source check must print PASS.
-Replace only the UUID/password placeholders; do not send those values or paste
-them into a bundle.
+`git status --short` must print nothing, including no untracked files, and the
+source check must print PASS. The runner enforces the same condition before
+setup and again before M2 traffic so an untracked Cargo/build input cannot
+invalidate exact-source evidence. Replace only the UUID/password placeholders;
+do not send those values or paste them into a bundle.
 
 ## 2. Identify And Temporarily Disable Physical IPv6
 

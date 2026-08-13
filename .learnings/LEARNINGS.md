@@ -1,5 +1,23 @@
 # Learnings
 
+## 2026-08-13 - Proofs and test prerequisites must be revalidated at their mutation boundary
+
+- A transport proof is not sufficient if live state can change before the
+  install CAS. Revalidate close, exact path generation, and current cwnd while
+  owning the same slot mutex that changes generation/activity ownership.
+- Exact-source means every effective non-ignored source input, not merely the
+  absence of tracked diffs. `git status --porcelain --untracked-files=all`
+  closes the untracked `build.rs`/Cargo-input hole while respecting ignored
+  build output.
+- A paired-observer requirement in a runbook is not a test gate. Admission
+  must reject the qualification before traffic if observer start failed,
+  identity/ports mismatch, components are unhealthy, or evidence is stale.
+- Short qualification remains the cost-control boundary: use it to validate
+  regression cleanliness and paired attribution before committing about 25
+  hours to the formal run.
+- Result:
+  `docs/tech/2026-08-13-knife15-m2-prequalification-code-review-local-results.md`.
+
 ## 2026-08-13 - Readiness certificates and handoff proofs have different lifetimes
 
 - The first exact ACK-owned successor service turn proves the fresh

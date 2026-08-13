@@ -189,6 +189,26 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-13:
 
+- Concentrated prequalification code review found and repaired three locally
+  preventable P1 risks. Production/TDD `c06a9d0` revalidates successor live
+  close/path/cwnd state under the slot install mutex so proof-to-install
+  regression cannot become current. Runner `cce3bf8` rejects untracked source
+  inputs and requires a fresh healthy matching Exit observer for qualification
+  as well as formal M2.
+- Expected REDs cover path change, cwnd contraction, close-after-proof,
+  untracked `build.rs`, and missing qualification observer authority. Root
+  `713+3 ignored`, main `2`, integration `10+4 ignored`, release, established
+  Clippy, full-TUN/D16 batch, runner/observer self-tests, shell/fmt/diff/secret,
+  and review pass with no unresolved P0/P1. Exact Endpoint capacity was
+  `225.382 Mbit/s`, terminal `61,440/0/0B`, and zero socket would-block.
+- The runner requires `c06a9d0` or a descendant. Pull/rebuild and take exactly
+  one fresh paired `m2-ipv6-check -> baseline -> direct-discriminator -> start
+  -> smoke -> fresh .33 observer start -> m2-qualification -> status -> stop
+  -> observer freeze/bundle`. Reserve about 45 uninterrupted minutes. A clean
+  qualification reopens one fresh formal M2 of about 25 hours. M3 remains
+  blocked. Result:
+  `docs/tech/2026-08-13-knife15-m2-prequalification-code-review-local-results.md`.
+
 - Exact-source `642e3ae` formal artifact
   `/tmp/mini_vpn_knife15_macos_20260813_053346.tar.gz` (SHA-256
   `6aeddcf1...`) passed baseline `23.289/52.799 Mbit/s`, bounded direct

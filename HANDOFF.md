@@ -4,7 +4,29 @@
 
 ## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-13)
 
-- **Latest accepted position:** exact-source `642e3ae` formal artifact
+- **Latest accepted position:** concentrated prequalification code review found
+  and repaired three locally preventable P1 risks before another Mac run.
+  Production/TDD `c06a9d0` revalidates the successor's live close state, path
+  generation, and cwnd under the generation-slot install mutex; a connection
+  that changes or regresses after proof cannot become current. Runner
+  `cce3bf8` rejects untracked exact-source inputs and requires a fresh healthy
+  matching Exit observer for qualification as well as formal M2.
+- Expected REDs covered path change, cwnd contraction, close-after-proof,
+  untracked `build.rs`, and missing qualification observer authority. Root
+  `713+3 ignored`, main `2`, integration `10+4 ignored`, release, established
+  Clippy, full-TUN/D16 batch, runner/observer self-tests, shell/fmt/diff/secret,
+  and review pass with no unresolved P0/P1. Exact Endpoint capacity was
+  `225.382 Mbit/s`, terminal `61,440/0/0B`, and zero socket would-block.
+  Result:
+  `docs/tech/2026-08-13-knife15-m2-prequalification-code-review-local-results.md`.
+- The runner requires `c06a9d0` or a descendant. Pull/rebuild and take exactly
+  one fresh paired `m2-ipv6-check -> baseline -> direct-discriminator -> start
+  -> smoke -> fresh .33 observer start -> m2-qualification -> status -> stop
+  -> observer freeze/bundle`. Reserve about 45 uninterrupted minutes. A clean
+  qualification reopens one fresh formal M2 of about 25 hours; M3 remains
+  blocked.
+
+- **Formal failure basis:** exact-source `642e3ae` formal artifact
   `/tmp/mini_vpn_knife15_macos_20260813_053346.tar.gz` (SHA-256
   `6aeddcf1...`) passed baseline `23.289/52.799 Mbit/s`, bounded direct
   `11.632 Mbit/s`, smoke, every preflight, nine complete cycles, 87 phases,

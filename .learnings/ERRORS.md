@@ -1,5 +1,24 @@
 # Errors
 
+## 2026-08-13 - Prequalification review found three locally preventable long-run risks
+
+- The slot install CAS trusted a typed proof without rechecking live successor
+  close/path/cwnd state inside its mutex. Deterministic REDs showed a successor
+  could install after path change, cwnd contraction, or close; `c06a9d0` now
+  fails those cases before ownership mutation.
+- The runner's clean-source predicate ignored untracked files, so an untracked
+  build input could invalidate exact-source evidence. A focused untracked
+  `build.rs` RED is now GREEN under the complete worktree check.
+- Qualification observer admission existed only in operator instructions.
+  `cce3bf8` makes the same fresh/matching/healthy observer contract mandatory
+  before qualification traffic.
+- One observer self-test safely refused a PID-identity race; no remote state
+  changed and an isolated replay passed. Two first Endpoint capacity commands
+  used an incorrect module-qualified exact name and ran zero tests; both were
+  rejected, then the counted exact replay passed at `225.382 Mbit/s`.
+- Result:
+  `docs/tech/2026-08-13-knife15-m2-prequalification-code-review-local-results.md`.
+
 ## 2026-08-13 - Formal M2 replacement churn blocked a Target open
 
 - Exact-source `642e3ae` passed nine complete formal cycles and 87 phases,

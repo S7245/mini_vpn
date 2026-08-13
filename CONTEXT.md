@@ -65,10 +65,12 @@ replacement attempt overwrites its transaction requirement with the maximum
 of the immutable first-turn readiness floor and the exact current Quinn cwnd.
 A fresh successor must complete one or more sequential **successor service
 turns** on one path, within the unchanged whole-replacement deadline, until
-its typed install proof reaches that requirement. The install CAS rechecks
-the latest slot-owned requirement and exact successor identity/path/readiness;
-after installation, only first-turn readiness becomes the new generation's
-lifetime certificate. A failed transaction cannot ratchet a later attempt.
+its typed install proof reaches that requirement. Under the predecessor slot
+mutex, the install CAS rechecks the latest slot-owned requirement, exact
+successor identity/path/readiness, and the successor's live close/path/cwnd
+state; a successor that changed or regressed after proof cannot install. After
+installation, only first-turn readiness becomes the new generation's lifetime
+certificate. A failed transaction cannot ratchet a later attempt.
 Loss, path change, close, timeout, no cwnd progress, or an insufficient final
 proof leaves the predecessor current. It adds no configured threshold, retry,
 timer, Target probe, payload replay, or bandwidth promise.
