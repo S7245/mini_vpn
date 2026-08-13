@@ -1323,7 +1323,7 @@ common_preflight() {
   release_binary_is_fresh "$BIN" || \
     die "release binary is older than tracked Rust/Cargo inputs (run cargo build --release)"
   m2_source_is_accepted || \
-    die "Knife15 runner requires reviewed source at c06a9d0 or a descendant"
+    die "Knife15 runner requires reviewed source at cce3bf8 or a descendant"
   m2_worktree_is_clean || \
     die "Knife15 runner requires a clean worktree, including no untracked files, for exact-source evidence"
 
@@ -5559,10 +5559,10 @@ EOF_FAKE_EXIT_OBSERVER
     "$observer_exit_run/m2-exit-observer-finalization.txt" || \
     die "self-test: formal M2 unexpected-exit reason missing"
   M2_EXIT_OBSERVER_SCRIPT="$original_m2_exit_observer_script"
-  ! m2_source_is_accepted b7bb9a9 || \
-    die "self-test: source missing successor install revalidation was accepted for M2"
-  m2_source_is_accepted c06a9d0 || \
-    die "self-test: reviewed successor install revalidation was rejected for M2"
+  ! m2_source_is_accepted c06a9d0 || \
+    die "self-test: source missing complete M2 prequalification gates was accepted"
+  m2_source_is_accepted cce3bf8 || \
+    die "self-test: reviewed M2 prequalification gates were rejected"
   stale_release_binary="$tmp/stale-release-binary"
   cp "$BIN" "$stale_release_binary"
   touch -t 200001010000 "$stale_release_binary"
@@ -7987,7 +7987,7 @@ m2_real_client_envelope() {
 
 m2_source_is_accepted() {
   local revision="${1:-HEAD}"
-  git -C "$REPO" merge-base --is-ancestor c06a9d0 "$revision" >/dev/null 2>&1
+  git -C "$REPO" merge-base --is-ancestor cce3bf8 "$revision" >/dev/null 2>&1
 }
 
 m2_execution_requires_paired_observer() {
@@ -8484,7 +8484,7 @@ run_m2_action() {
     "$M2_EXPECTED_CYCLES $M2_EXPECTED_TCP_RESULTS $M2_EXPECTED_UDP_RESULTS $M2_EXPECTED_PHASE_RESULTS" ]] || \
     die "$action_description requires the immutable formal M2 count model"
   m2_source_is_accepted || \
-    die "$action_description requires successor install revalidation source at c06a9d0 or a descendant"
+    die "$action_description requires complete prequalification gates at cce3bf8 or a descendant"
   m2_worktree_is_clean || \
     die "$action_description requires a clean worktree, including no untracked files, for exact-source evidence"
   run_dir="$(run_dir_from_state)" || die "no Knife15 run state"
