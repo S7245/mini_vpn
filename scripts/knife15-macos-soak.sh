@@ -5553,10 +5553,10 @@ EOF_FAKE_EXIT_OBSERVER
     "$observer_exit_run/m2-exit-observer-finalization.txt" || \
     die "self-test: formal M2 unexpected-exit reason missing"
   M2_EXIT_OBSERVER_SCRIPT="$original_m2_exit_observer_script"
-  ! m2_source_is_accepted 85d8772 || \
-    die "self-test: source missing replacement current-service handoff was accepted for formal M2"
-  m2_source_is_accepted 579fff4 || \
-    die "self-test: reviewed replacement current-service handoff source was rejected for formal M2"
+  ! m2_source_is_accepted bec6dc8 || \
+    die "self-test: source missing terminal local-close replay repair was accepted for formal M2"
+  m2_source_is_accepted 0296688 || \
+    die "self-test: reviewed terminal local-close replay repair was rejected for formal M2"
   stale_release_binary="$tmp/stale-release-binary"
   cp "$BIN" "$stale_release_binary"
   touch -t 200001010000 "$stale_release_binary"
@@ -7977,7 +7977,7 @@ m2_real_client_envelope() {
 
 m2_source_is_accepted() {
   local revision="${1:-HEAD}"
-  git -C "$REPO" merge-base --is-ancestor 579fff4 "$revision" >/dev/null 2>&1
+  git -C "$REPO" merge-base --is-ancestor 0296688 "$revision" >/dev/null 2>&1
 }
 
 m2_exit_observer_value_from_text() {
@@ -8468,7 +8468,7 @@ run_m2_action() {
     "$M2_EXPECTED_CYCLES $M2_EXPECTED_TCP_RESULTS $M2_EXPECTED_UDP_RESULTS $M2_EXPECTED_PHASE_RESULTS" ]] || \
     die "$action_description requires the immutable formal M2 count model"
   m2_source_is_accepted || \
-    die "$action_description requires reviewed replacement current-service handoff source at 579fff4 or a descendant"
+    die "$action_description requires terminal local-close replay repair source at 0296688 or a descendant"
   m2_worktree_is_clean || \
     die "$action_description requires a clean tracked worktree for exact-source evidence"
   run_dir="$(run_dir_from_state)" || die "no Knife15 run state"
