@@ -43,10 +43,12 @@ _Avoid_: warm-up traffic (the proof is transport-native and carries no business 
 **TUIC TCP successor service certificate**:
 The immutable transport-native service proof owned by one installed auxiliary
 successor generation. It records the exact stable identity, logical pool
-generation, ACK-owned path generation, and positive post-turn congestion
-window floor established by that successor's pre-install service turn. It is
-Ready for new-open admission only while identity/path still match and current
-cwnd remains at or above its own proved floor; otherwise it is Stale and the
+generation, ACK-owned path generation, and positive congestion-window floor
+established by the first exact pre-install service turn. Additional turns may
+prove a larger predecessor handoff for that install transaction, but their
+final cwnd is not persisted as lifetime readiness. The generation is Ready
+for new-open admission only while identity/path still match and current cwnd
+remains at or above its first-turn floor; otherwise it is Stale and the
 existing bounded fresh-generation replacement seam owns recovery. Initial
 pool generations are Unknown rather than degraded. The certificate is not a
 configured threshold, congestion-event blacklist, bandwidth promise, or
@@ -58,14 +60,18 @@ seam), connection blacklist (a fresh generation can prove new service)
 **TUIC TCP successor forward-service inheritance**:
 A generation-replacement contract that preserves the exact positive
 congestion window surrendered by the current auxiliary generation immediately
-before its one-shot path-state reset. The generation slot owns this monotonic
-observed floor. A fresh successor must complete one or more sequential
-**successor service turns** on one path, within the unchanged whole-replacement
-deadline, until its current cwnd reaches that floor; the install CAS rechecks
-the latest slot-owned requirement. Loss, path change, close, timeout, no cwnd
-progress, or an insufficient final proof leaves the predecessor current. It
-adds no configured threshold, retry, timer, Target probe, payload replay, or
-bandwidth promise.
+before an already-authorized replacement. Under the slot mutex, each
+replacement attempt overwrites its transaction requirement with the maximum
+of the immutable first-turn readiness floor and the exact current Quinn cwnd.
+A fresh successor must complete one or more sequential **successor service
+turns** on one path, within the unchanged whole-replacement deadline, until
+its typed install proof reaches that requirement. The install CAS rechecks
+the latest slot-owned requirement and exact successor identity/path/readiness;
+after installation, only first-turn readiness becomes the new generation's
+lifetime certificate. A failed transaction cannot ratchet a later attempt.
+Loss, path change, close, timeout, no cwnd progress, or an insufficient final
+proof leaves the predecessor current. It adds no configured threshold, retry,
+timer, Target probe, payload replay, or bandwidth promise.
 _Avoid_: cwnd target (the floor is observed predecessor state), warm-up loop
 (the transaction is deadline-bounded and loss-fail-closed), throughput
 guarantee (it preserves surrendered service rather than predicting the WAN)
@@ -90,8 +96,16 @@ A bounded per-stream send-scheduling contract. A newly opened TUIC TCP stream qu
 _Avoid_: stream boost (sounds tunable or permanent), fast lane (suggests separate capacity), failover (the selected QUIC connection does not change)
 
 **TUIC TCP connection-local path-state recovery**:
-A one-shot recovery contract for an established TUIC TCP relay whose exact business writer remains Pending for the existing RTT-derived bound while its owning QUIC connection adds PLPMTUD black-hole detections. It resets only that connection's Quinn congestion, RTT, and MTU-discovery state from the existing transport configuration, preserving the QUIC identity, TUIC stream, Target TCP connection, UDP socket, and payload bytes. One stable QUIC identity can consume the authority only once; it is neither a retry loop nor parameter tuning.
-_Avoid_: stream failover (no stream moves), Endpoint rebind (the shared UDP socket does not change), MTU reset (congestion and RTT state reset too, using existing configuration)
+The retired client policy that called Quinn `path_changed()` on an unchanged
+path when an established TCP writer remained Pending and PLPMTUD black-hole
+count advanced. Formal evidence showed exact ACK progress while this reset
+collapsed cwnd and interrupted Target service; an established TUIC stream
+cannot migrate to a replacement generation. mini_vpn therefore grants no
+connection-local path reset authority. Native Quinn loss/PLPMTUD recovery,
+exact ACK-stall Endpoint rebind, UDP no-RX rebind, generation replacement for
+future opens, and predecessor drain remain active.
+_Avoid_: active recovery (the policy is retired), stream migration (existing
+TUIC streams stay on their generation), MTU tuning (native Quinn owns it)
 
 **TUIC recovery evidence observer**:
 A diagnostics-only, bounded observer beside the active Endpoint recovery policy. For exact writer-Pending episodes it records start and terminal sampled ACK-service aggregates; for exact ordered receive gaps it records one persistent-gap event with initial/current tail state. It is enabled only by `MINI_VPN_TCP_DIAG=1` and cannot rebind, reset, replay, retry, close, or replace any connection or stream. The earlier ordered-gap active migration was rejected after six false rebinds on a passing WAN transfer and is not an available recovery authority.

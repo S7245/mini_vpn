@@ -1,5 +1,33 @@
 # Errors
 
+## 2026-08-13 - Formal M2 replacement churn blocked a Target open
+
+- Exact-source `642e3ae` passed nine complete formal cycles and 87 phases,
+  then cycle 10 `short-reverse-4` timed out before it created an iperf/TUIC
+  Connect. The paired Exit observer captured `57,705,606` packets with zero
+  kernel drops and no Target counter advance for that phase.
+- Exact identity/path and black-hole state were unchanged, but current native
+  cwnd `381,502B` was judged against a historical multi-round certificate
+  `3,605,919B`. Repeated `stale_cwnd` replacement chased the old proof; the
+  failure-time successor lost one `1,409B` packet and correctly failed closed.
+  Formal M2 remains failed; do not retry or tune that source.
+- A default-parallel local suite once measured Endpoint capacity
+  `168.781 Mbit/s` with a `35.65ms` scheduling gap. The immediate exact
+  isolated replay measured `240.256 Mbit/s`, and the complete single-thread
+  suite passed. This was local contention, not authority to tune production.
+- One standalone Quinn command omitted the absolute local proto patch and
+  failed on fork APIs; the corrected local-patch lane passed. Exploratory
+  `--all-features` Clippy requested an unavailable FIPS CMake build, while the
+  established default Quinn/quinn-proto Clippy lanes passed.
+- Some first focused `--exact` commands used unqualified test names and ran
+  zero tests. They were rejected and rerun with counted module-qualified tests.
+  One observer self-test safely refused a PID-identity race, then passed in an
+  isolated replay; no remote state or script was changed.
+- Results:
+  `docs/tech/2026-08-13-knife15-m2-successor-service-floor-separation-formal-failure-results.md`
+  and
+  `docs/tech/2026-08-13-knife15-m2-successor-service-floor-separation-local-results.md`.
+
 ## 2026-08-13 - Qualification traffic passed but D16 replay rejected terminal local closure
 
 - Exact-source `bec6dc8` completed both qualification cycles with zero Target

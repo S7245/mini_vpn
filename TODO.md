@@ -4,7 +4,47 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-13 — path-reset retirement qualification accepted; formal M2 reopened)
+#### Latest decision (2026-08-13 — formal M2 rejected historical handoff as lifetime readiness; separation ready for qualification)
+
+Exact-source `642e3ae` formal artifact
+`/tmp/mini_vpn_knife15_macos_20260813_053346.tar.gz` (SHA-256
+`6aeddcf1...`) passed baseline `23.289/52.799 Mbit/s`, bounded direct
+`11.632 Mbit/s`, smoke, every preflight, nine complete cycles, 87 phases,
+nine DNS/real-client checks, and cleanup. Cycle 10 `short-reverse-4` timed out
+before creating a connection. Formal M2 remains failed and M3 remains blocked.
+
+Paired Exit SHA-256 `8a0c0c19...` captured `57,705,606` packets with zero
+kernel drops and no Target counter advance for the failed phase. The exact
+auxiliary identity/path and black-hole state were unchanged, but current
+native cwnd `381,502B` was compared against a historical final handoff proof
+of `3,605,919B`. Repeated `stale_cwnd` replacement chased the historical
+value; the last proof lost one `1,409B` packet and failed closed before TUIC
+Connect. This selects certificate lifetime architecture, not external path,
+Mac operation, D16, TUN, or Endpoint.
+
+Reviewed `b7bb9a9` records the first exact successor service turn as immutable
+readiness and carries later multi-round cwnd only as typed install proof. Each
+authorized replacement recomputes `max(readiness floor, exact current cwnd)`
+for that transaction, so failed historical handoffs cannot ratchet future
+admission. All prior stale/current-handoff discriminators and frozen values
+remain intact. Complete local gates pass; exact release Endpoint capacity is
+`240.256 Mbit/s`; code review has no unresolved P0/P1. Results:
+
+- `docs/tech/2026-08-13-knife15-m2-successor-service-floor-separation-formal-failure-results.md`
+- `docs/tech/2026-08-13-knife15-m2-successor-service-floor-separation-local-results.md`
+
+Next:
+
+1. pull/rebuild the pushed reviewed descendant on the HK Mac;
+2. reserve about 45 uninterrupted minutes and start one fresh `.33` observer
+   only after smoke;
+3. run exactly one paired `m2-ipv6-check -> baseline -> direct-discriminator
+   -> start -> smoke -> fresh .33 observer start -> m2-qualification ->
+   status -> stop -> observer freeze/bundle`;
+4. sync both bundles; do not run formal M2 first or tune/repeat unchanged. A
+   clean qualification reopens one fresh formal M2.
+
+#### Previous decision (2026-08-13 — path-reset retirement qualification accepted; formal M2 reopened)
 
 Exact-source `bec6dc8` paired qualification artifact
 `/tmp/mini_vpn_knife15_macos_20260813_030113.tar.gz` (SHA-256

@@ -1,5 +1,28 @@
 # Learnings
 
+## 2026-08-13 - Readiness certificates and handoff proofs have different lifetimes
+
+- The first exact ACK-owned successor service turn proves the fresh
+  generation's immutable minimum readiness. A later multi-round final cwnd
+  proves only that one install can inherit the predecessor's current service;
+  persisting it as lifetime readiness converts ordinary native congestion
+  contraction into destructive replacement churn.
+- Replacement handoff state must be recomputed per authorized transaction as
+  `max(readiness floor, exact current cwnd)`. A failed historical transaction
+  must not ratchet every later successor back to its maximum observed proof.
+- The final install value is an ownership proof, not a scalar hint. Binding
+  successor identity, path generation, readiness floor, and final cwnd in one
+  typed proof lets the slot mutex/CAS reject evidence from a different
+  generation or path.
+- Separating lifetimes preserves both prior safety discriminators: a current
+  cwnd below first-turn readiness is still stale, while a legitimately larger
+  current predecessor still requires a successor to inherit its exact service
+  before installation.
+- Results:
+  `docs/tech/2026-08-13-knife15-m2-successor-service-floor-separation-formal-failure-results.md`
+  and
+  `docs/tech/2026-08-13-knife15-m2-successor-service-floor-separation-local-results.md`.
+
 ## 2026-08-13 - D16 ownership and terminal smoltcp egress are different domains
 
 - A positive D16 lease at relay-task exit is not automatically a leak if the

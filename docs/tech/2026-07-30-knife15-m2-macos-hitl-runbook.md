@@ -3,7 +3,7 @@
 Date: 2026-07-30
 
 Status: **PAIRED M2 QUALIFICATION REQUIRED ON A CLEAN REVIEWED DESCENDANT OF
-`0a3cc9c` — FORMAL M2 MUST NOT RUN YET**
+`b7bb9a9` — FORMAL M2 MUST NOT RUN YET**
 
 This is the reviewed sequence for the current non-acceptance qualification.
 It uses the controlled IPv4 full tunnel and temporarily changes the active
@@ -50,7 +50,7 @@ git switch codex/knife14d-downlink-reap-open
 git pull --ff-only origin codex/knife14d-downlink-reap-open
 git status --short
 git rev-parse HEAD
-git merge-base --is-ancestor 0a3cc9c HEAD && echo 'PASS: M2 source accepted'
+git merge-base --is-ancestor b7bb9a9 HEAD && echo 'PASS: M2 source accepted'
 
 unset M0_BASELINE_DIR M0_DIRECT_DIR
 unset M1_BASELINE_DIR M1_DIRECT_DIR

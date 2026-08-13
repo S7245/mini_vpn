@@ -189,7 +189,43 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-13:
 
-- Exact-source `bec6dc8` paired qualification artifact
+- Exact-source `642e3ae` formal artifact
+  `/tmp/mini_vpn_knife15_macos_20260813_053346.tar.gz` (SHA-256
+  `6aeddcf1...`) passed baseline `23.289/52.799 Mbit/s`, bounded direct
+  `11.632 Mbit/s`, smoke, every preflight, nine complete cycles, 87 phases,
+  nine DNS/real-client checks, and cleanup. Cycle 10 `short-reverse-4` failed
+  before an iperf connection existed. Formal M2 remains failed; M3 remains
+  blocked.
+- Paired Exit SHA-256 `8a0c0c19...` captured `57,705,606` packets with zero
+  kernel drops. Exact auxiliary identity/path and black-hole state remained
+  stable, but admission compared current native cwnd `381,502B` with a
+  historical multi-round certificate `3,605,919B`. Repeated `stale_cwnd`
+  replacement chased that old value; the failure-time proof lost one
+  `1,409B` packet and failed closed with no qualified business lane. Target
+  counters did not advance. Mac/VPS/network, D16, TUN, Endpoint, routes, DNS,
+  and cleanup were not the cause.
+- Reviewed `b7bb9a9` separates immutable first-turn readiness from
+  transaction-only final handoff proof. Each future preparation overwrites
+  its requirement with `max(readiness floor, exact current cwnd)` and the
+  typed install proof binds exact successor identity/path/readiness/final
+  cwnd. Prior `17,360/24,800B` stale and `361,778/26,338B` current-service
+  discriminators remain intact; no frozen constant or workload changed.
+- Root `709+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  established Clippy, vendored Quinn `40+3 ignored` plus doc `1`, quinn-proto
+  `330` plus docs `3`, full-TUN/D16 batch, runner/observer self-tests,
+  fmt/diff/provenance/secret, and review pass with no unresolved P0/P1. Exact
+  Endpoint capacity was `240.256 Mbit/s`, terminal `61,440/0/0B`, and zero
+  socket would-block. Results:
+  `docs/tech/2026-08-13-knife15-m2-successor-service-floor-separation-formal-failure-results.md`
+  and
+  `docs/tech/2026-08-13-knife15-m2-successor-service-floor-separation-local-results.md`.
+- Pull/rebuild the pushed reviewed descendant and take exactly one fresh
+  paired `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke
+  -> fresh .33 observer start -> m2-qualification -> status -> stop ->
+  observer freeze/bundle`. Do not run formal M2 first or tune/repeat
+  unchanged. A clean qualification reopens one formal M2. M3 remains blocked.
+
+- Previous accepted position: exact-source `bec6dc8` paired qualification artifact
   `/tmp/mini_vpn_knife15_macos_20260813_030113.tar.gz` (SHA-256
   `8a65cc5b...`) completed baseline `31.445/60.511 Mbit/s`, bounded direct
   `15.716 Mbit/s`, smoke, all preflights, two cycles/eight phases, two DNS and
