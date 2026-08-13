@@ -1323,9 +1323,9 @@ common_preflight() {
   release_binary_is_fresh "$BIN" || \
     die "release binary is older than tracked Rust/Cargo inputs (run cargo build --release)"
   m2_source_is_accepted || \
-    die "Knife15 runner requires reviewed source at b7bb9a9 or a descendant"
+    die "Knife15 runner requires reviewed source at c06a9d0 or a descendant"
   m2_worktree_is_clean || \
-    die "Knife15 runner requires a clean tracked worktree for exact-source evidence"
+    die "Knife15 runner requires a clean worktree, including no untracked files, for exact-source evidence"
 
   : "${MINI_VPN_TUIC_SERVER:?export MINI_VPN_TUIC_SERVER locally}"
   : "${MINI_VPN_TUIC_UUID:?export MINI_VPN_TUIC_UUID locally}"
@@ -5453,6 +5453,12 @@ EOF_FAIL_IPERF
   M2_QUIET_SHORT_COUNT=6
   M2_CHURN_SHORT_COUNT=24
   validate_m2_formal_config || die "self-test: formal M2 schedule rejected"
+  m2_execution_requires_paired_observer qualification || \
+    die "self-test: M2 qualification did not require paired Exit evidence"
+  m2_execution_requires_paired_observer formal || \
+    die "self-test: formal M2 did not require paired Exit evidence"
+  ! m2_execution_requires_paired_observer unknown || \
+    die "self-test: unknown M2 execution mode acquired observer authority"
   m2_exit_observer_ssh_host_matches_exit \
     ubuntu@43.153.32.33 43.153.32.33 || \
     die "self-test: matching formal M2 Exit SSH host rejected"
@@ -5553,10 +5559,10 @@ EOF_FAKE_EXIT_OBSERVER
     "$observer_exit_run/m2-exit-observer-finalization.txt" || \
     die "self-test: formal M2 unexpected-exit reason missing"
   M2_EXIT_OBSERVER_SCRIPT="$original_m2_exit_observer_script"
-  ! m2_source_is_accepted 642e3ae || \
-    die "self-test: source missing successor service-floor separation was accepted for M2"
-  m2_source_is_accepted b7bb9a9 || \
-    die "self-test: reviewed successor service-floor separation was rejected for M2"
+  ! m2_source_is_accepted b7bb9a9 || \
+    die "self-test: source missing successor install revalidation was accepted for M2"
+  m2_source_is_accepted c06a9d0 || \
+    die "self-test: reviewed successor install revalidation was rejected for M2"
   stale_release_binary="$tmp/stale-release-binary"
   cp "$BIN" "$stale_release_binary"
   touch -t 200001010000 "$stale_release_binary"
@@ -5574,6 +5580,10 @@ EOF_FAKE_EXIT_OBSERVER
     -c user.email=knife15@example.invalid commit -qm fixture
   m2_worktree_is_clean "$exact_source_repo" || \
     die "self-test: clean exact-source worktree was rejected"
+  printf '%s\n' 'fn main() {}' >"$exact_source_repo/build.rs"
+  ! m2_worktree_is_clean "$exact_source_repo" || \
+    die "self-test: untracked build input was accepted as exact source"
+  rm "$exact_source_repo/build.rs"
   printf '%s\n' dirty >>"$exact_source_repo/tracked.txt"
   ! m2_worktree_is_clean "$exact_source_repo" || \
     die "self-test: dirty exact-source worktree was accepted"
@@ -7977,7 +7987,11 @@ m2_real_client_envelope() {
 
 m2_source_is_accepted() {
   local revision="${1:-HEAD}"
-  git -C "$REPO" merge-base --is-ancestor b7bb9a9 "$revision" >/dev/null 2>&1
+  git -C "$REPO" merge-base --is-ancestor c06a9d0 "$revision" >/dev/null 2>&1
+}
+
+m2_execution_requires_paired_observer() {
+  [[ "${1:-}" == "formal" || "${1:-}" == "qualification" ]]
 }
 
 m2_exit_observer_value_from_text() {
@@ -8161,8 +8175,10 @@ m2_exit_observer_exit_trap() {
 
 m2_worktree_is_clean() {
   local repo="${1:-$REPO}"
-  git -C "$repo" diff --quiet -- && \
-    git -C "$repo" diff --cached --quiet --
+  local status
+  status="$(git -C "$repo" status --porcelain=v1 --untracked-files=all 2>/dev/null)" || \
+    return 1
+  [[ -z "$status" ]]
 }
 
 endpoint_rebind_lifecycle_is_clean() {
@@ -8468,9 +8484,9 @@ run_m2_action() {
     "$M2_EXPECTED_CYCLES $M2_EXPECTED_TCP_RESULTS $M2_EXPECTED_UDP_RESULTS $M2_EXPECTED_PHASE_RESULTS" ]] || \
     die "$action_description requires the immutable formal M2 count model"
   m2_source_is_accepted || \
-    die "$action_description requires successor service-floor separation source at b7bb9a9 or a descendant"
+    die "$action_description requires successor install revalidation source at c06a9d0 or a descendant"
   m2_worktree_is_clean || \
-    die "$action_description requires a clean tracked worktree for exact-source evidence"
+    die "$action_description requires a clean worktree, including no untracked files, for exact-source evidence"
   run_dir="$(run_dir_from_state)" || die "no Knife15 run state"
   baseline_evidence_dir="$run_dir/${evidence_dir}-baseline"
   direct_evidence_dir="$run_dir/${evidence_dir}-direct"
@@ -8532,18 +8548,23 @@ run_m2_action() {
   validate_direct_continuity_dir "$M2_DIRECT_DIR" "$M2_BASELINE_DIR" "$target" || \
     die "$action_description requires a matching 300s direct continuity PASS completed within 15 minutes"
 
-  if [[ "$execution_mode" == "formal" ]]; then
+  if m2_execution_requires_paired_observer "$execution_mode"; then
     [[ "$M2_EXIT_OBSERVER_SCRIPT" == \
       "$SCRIPT_DIR/knife15-exit-target-observer.sh" ]] || \
-      die "formal M2 requires the exact tracked Exit observer script"
+      die "$action_description requires the exact tracked Exit observer script"
     [[ -n "${EXIT_SSH_HOST:-}" && -n "${EXIT_SSH_KEY:-}" ]] || \
-      die "formal M2 requires explicit EXIT_SSH_HOST and EXIT_SSH_KEY for its owned Exit observer"
+      die "$action_description requires explicit EXIT_SSH_HOST and EXIT_SSH_KEY for paired Exit evidence"
     m2_exit_observer_ssh_host_matches_exit "$EXIT_SSH_HOST" "$exit_host" || \
-      die "formal M2 Exit observer SSH host must match the recorded Exit $exit_host"
+      die "$action_description Exit observer SSH host must match the recorded Exit $exit_host"
     if ! m2_exit_observer_require_active \
       "$run_dir" "$target" "$iperf_port" "$server_port"; then
-      die "formal M2 requires a healthy matching 26-hour Exit observer; start it before m2 and inspect $run_dir/m2-exit-observer-status.txt"
+      die "$action_description requires a healthy matching 26-hour Exit observer; start it after smoke and inspect $run_dir/m2-exit-observer-status.txt"
     fi
+    append_event_to "$run_dir" \
+      "$stage Exit observer admission complete target=$target iperf_port=$iperf_port tuic_port=$server_port"
+  fi
+
+  if [[ "$execution_mode" == "formal" ]]; then
     m2_exit_observer_arm "$run_dir" "$target" "$iperf_port" "$server_port"
     trap 'm2_exit_observer_exit_trap "$?"' EXIT
     append_event_to "$run_dir" \
