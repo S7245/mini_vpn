@@ -1,5 +1,25 @@
 # Learnings
 
+## 2026-08-13 - A short qualification can validate the real handoff branch without weakening formal duration
+
+- The two-cycle run reached an actual auxiliary replacement: exact current
+  predecessor service became the transaction requirement, first-turn
+  readiness remained smaller, a multi-round proof exceeded the handoff floor,
+  and live proof-to-install revalidation succeeded under the real path.
+- Record branch reachability separately from duration acceptance. This result
+  closes regression and mechanism uncertainty, but only the formal 24-hour
+  schedule can accept M2.
+- Sender-zero intervals do not imply Target discontinuity. Compare server-side
+  receiver intervals and paired Exit counters; here every receiver interval
+  and every relevant TUIC counter window remained live.
+- Timed-transfer `Stopped(0)` writes remain acceptable only through exact D16
+  and terminal-ownership replay, never from the error text alone.
+- A source floor must include the runner commit that enforces all preflight
+  repairs, not only the production commit it protects. Otherwise an exact
+  production commit can execute its older script and bypass the newer gate.
+- Result:
+  `docs/tech/2026-08-13-knife15-m2-successor-install-revalidation-macos-qualification-results.md`.
+
 ## 2026-08-13 - Proofs and test prerequisites must be revalidated at their mutation boundary
 
 - A transport proof is not sufficient if live state can change before the

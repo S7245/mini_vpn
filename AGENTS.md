@@ -189,6 +189,31 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-13:
 
+- Exact-source `d91f205` paired qualification artifact
+  `/tmp/mini_vpn_knife15_macos_20260813_095649.tar.gz` (SHA-256 `db8297c6...`)
+  passed baseline `19.549/52.870 Mbit/s`, bounded direct `9.771 Mbit/s`, smoke,
+  every preflight, two cycles/eight phases, two DNS and real-client checks, and
+  cleanup. Target receiver-zero was zero, maximum TCP gap was `5,767,168B`,
+  and maximum UDP loss was `2.548546%`. Verdict is `PASS_NON_ACCEPTANCE`.
+- Generation 1 surrendered current `235,811B`; generation 2 retained
+  first-turn readiness `26,338B`, completed five turns at final `427,953B`
+  with `414,587/414,587/0B` sent/acked/lost, passed live install revalidation,
+  and installed in `1,946ms`. No failed replacement, `stale_cwnd`, mini_vpn
+  path reset, or Endpoint rebind occurred.
+- Three sender-zero intervals had zero Target receiver-zero intervals. Three
+  timed close tails passed D16 terminal replay. Endpoint final was
+  `61,402/0/0B`, with zero abandon/would-block; process, interface, routes,
+  DNS, TUN, secret scan, and cleanup passed.
+- Paired Exit SHA-256 `9dc4c864...` captured `10,442,111` packets with zero
+  kernel drops. Observer ownership is gone and sing-box is active with zero
+  restarts. Do not repeat qualification. Take exactly one fresh formal
+  `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke -> fresh
+  .33 observer start -> m2 -> status -> stop`, reserve about 25 hours, and sync
+  both final bundles. Formal source admission requires `cce3bf8` or a
+  descendant; exact `c06a9d0` with the older runner is rejected. M3 remains
+  blocked. Result:
+  `docs/tech/2026-08-13-knife15-m2-successor-install-revalidation-macos-qualification-results.md`.
+
 - Concentrated prequalification code review found and repaired three locally
   preventable P1 risks. Production/TDD `c06a9d0` revalidates successor live
   close/path/cwnd state under the slot install mutex so proof-to-install

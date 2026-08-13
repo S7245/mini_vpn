@@ -2,14 +2,14 @@
 
 Date: 2026-07-30
 
-Status: **PAIRED M2 QUALIFICATION REQUIRED ON A CLEAN REVIEWED DESCENDANT OF
-`c06a9d0` — FORMAL M2 MUST NOT RUN YET**
+Status: **ONE FRESH FORMAL M2 REQUIRED ON A CLEAN REVIEWED DESCENDANT OF
+`cce3bf8` — DO NOT REPEAT QUALIFICATION**
 
-This is the reviewed sequence for the current non-acceptance qualification.
+This is the reviewed sequence for the current formal M2 acceptance run.
 It uses the controlled IPv4 full tunnel and temporarily changes the active
-physical network service DNS. Reserve about 45 wall-clock minutes. `stop` is
-mandatory after `m2-qualification`; a clean result only reopens one later
-formal M2 and does not itself accept M2.
+physical network service DNS. Reserve about 25 uninterrupted wall-clock hours.
+`stop` is mandatory after `m2`; only a complete formal schedule plus cleanup
+can accept M2.
 
 ## Before Opening The Test Terminal
 
@@ -28,10 +28,10 @@ formal M2 and does not itself accept M2.
    pre-start failure; once `start` is invoked, restore only after `stop`, using
    the exact procedure below.
 
-Do not terminate macOS system daemons manually. The qualification has the
-same exact controlled-lifecycle preflight as formal `m2`: only runner-owned
-iperf and HTTP relays must drain, while ambient system/App relay and fake-IP
-counts remain recorded observations. If it fails, preserve evidence and run
+Do not terminate macOS system daemons manually. Formal M2 uses the exact
+controlled-lifecycle preflight: only runner-owned iperf and HTTP relays must
+drain, while ambient system/App relay and fake-IP counts remain recorded
+observations. If it fails, preserve evidence and run
 `status/snapshot/stop`; the evidence distinguishes controlled ownership,
 malformed replay, Endpoint debt, and DNS drops.
 
@@ -50,7 +50,7 @@ git switch codex/knife14d-downlink-reap-open
 git pull --ff-only origin codex/knife14d-downlink-reap-open
 git status --short
 git rev-parse HEAD
-git merge-base --is-ancestor c06a9d0 HEAD && echo 'PASS: M2 source accepted'
+git merge-base --is-ancestor cce3bf8 HEAD && echo 'PASS: M2 source accepted'
 
 unset M0_BASELINE_DIR M0_DIRECT_DIR
 unset M1_BASELINE_DIR M1_DIRECT_DIR
@@ -226,59 +226,57 @@ Export its `direct_dir`, for example:
 export M2_DIRECT_DIR='/tmp/mini_vpn_knife15_macos_direct_REPLACE_WITH_ACTUAL_TIMESTAMP'
 ```
 
-Continue immediately. The qualification must consume this evidence within 15
-minutes.
+Continue immediately. Formal M2 must consume this evidence within 15 minutes.
 If the direct discriminator fails, no TUN was started; preserve its directory
 and restore IPv6 using the pre-start branch in section 8.
 
-## 6. Start, Smoke, And Paired M2 Qualification
+## 6. Start, Smoke, And Paired Formal M2
 
-Before `start`, confirm that the `.33` Exit and `.77` Target services can stay
-powered and reachable for about 45 minutes. The qualification requires one
-fresh v2 Exit observer. It records bounded recent Target/TUIC packets plus
-per-second four-direction counters. Do not reuse an expired observer
-directory.
+Before `start`, confirm that the Mac, `.33` Exit, and `.77` Target can stay
+powered and reachable for about 25 hours. Formal M2 requires one fresh v2 Exit
+observer. It records bounded recent Target/TUIC packets plus per-second
+four-direction counters. Do not reuse the completed qualification observer.
 
 ```bash
 sudo -v
 sudo -E bash scripts/knife15-macos-soak.sh start
 sudo -E bash scripts/knife15-macos-soak.sh smoke
 OBSERVER_TIMEOUT_SECS=93600 bash scripts/knife15-exit-target-observer.sh start
-caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2-qualification
+caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2
 ```
 
-Start the observer only after smoke passes, then invoke `m2-qualification`
-promptly. The preflight rejects a mismatched Exit/Target/port, any dead
+Start the observer only after smoke passes, then invoke `m2` promptly. The
+preflight rejects a mismatched Exit/Target/port, any dead
 observer component, and an observer older than 900 seconds. It also requires
 `EXIT_SSH_HOST` to match the recorded Exit IP. If observer start fails, do not
-run the qualification; preserve its output and continue with Mac
+run formal M2; preserve its output and continue with Mac
 `status/snapshot/stop`.
 
 Do not press `Ctrl+C`, close the terminal, start Clash, or change the network.
-Before starting the qualification schedule, `m2-qualification` waits up to the
-existing smoke hard timeout (normally about 50 seconds) for fresh Endpoint
+Before starting the formal schedule, `m2` waits up to the existing smoke hard
+timeout (normally about 50 seconds) for fresh Endpoint
 conservation, zero
 runner-controlled TCP relays, valid lifecycle replay, and zero DNS drops.
 Ambient Apple/system relays and fake-IP entries are allowed and recorded. A
 failure here saves a long run and leaves the TUN/full tunnel available
 for `status/snapshot/stop`.
 
-The qualification runs exactly two mixed cycles with eight traffic phases,
-two DNS checks, and two real-client checks. It normally takes about 30 minutes.
-The runner samples process, utun, Endpoint, Exit, gateway, and physical-
-interface evidence every 30 seconds. A traffic success remains
-`PENDING_CLEANUP` until `stop` restores owned DNS/routes, removes the TUN, and
-finalizes the immutable bundle. Its successful verdict is
-`PASS_NON_ACCEPTANCE`, not formal acceptance.
+Formal M2 runs the frozen 86,400-second mixed schedule and final drain. The
+runner samples process, utun, Endpoint, Exit, gateway, and physical-interface
+evidence every 30 seconds. It automatically freezes and bundles the exact
+observer on workload completion, failure, signal, or unexpected exit after
+observer admission. A traffic success remains `PENDING_CLEANUP` until `stop`
+restores owned DNS/routes, removes the TUN, and finalizes the immutable Mac
+bundle.
 
-During the qualification, the Mac's public IPv4 should be the Exit VPS. That
-is expected.
+During formal M2, the Mac's public IPv4 should be the Exit VPS. That is
+expected.
 The runner blocks a routable physical IPv6 path instead of claiming a
 dual-stack leak-free result.
 
 ## 7. Mandatory Status And Stop
 
-After `m2-qualification` returns, successful or failed:
+After `m2` returns, successful or failed:
 
 ```bash
 sudo -E bash scripts/knife15-macos-soak.sh status
@@ -290,24 +288,30 @@ secrets, creates one immutable bundle, and prints its SHA-256. Only a complete
 formal workload with a valid pre-stop verdict and successful cleanup becomes
 `formal_m2_acceptance: PASS`.
 
-After Mac `stop` succeeds, freeze and bundle the paired observer explicitly:
+The formal runner prints the automatically finalized Exit observer bundle and
+checksum. Sync it together with the Mac bundle. After Mac `stop`, inspect
+observer `status` once. `ERROR: no observer state` is expected after automatic
+finalization; if and only if status still says `status=active`, explicitly run
+`freeze -> bundle`. Do not start another observer until both paths and
+checksums have been preserved.
 
 ```bash
-bash scripts/knife15-exit-target-observer.sh freeze
-bash scripts/knife15-exit-target-observer.sh bundle
+OBSERVER_STATUS="$(bash scripts/knife15-exit-target-observer.sh status 2>&1 || true)"
+printf '%s\n' "$OBSERVER_STATUS"
+if grep -Fxq 'status=active' <<<"$OBSERVER_STATUS"; then
+  bash scripts/knife15-exit-target-observer.sh freeze
+  bash scripts/knife15-exit-target-observer.sh bundle
+fi
 ```
 
-Sync the printed Exit observer bundle together with the Mac bundle. Do not
-start another observer until both paths and checksums have been preserved.
-
-Send both lines:
+Send both checksum/path lines:
 
 ```text
-<sha256>  /tmp/mini_vpn_knife15_macos_....tar.gz
-bundle=/tmp/mini_vpn_knife15_macos_....tar.gz
+<mac-sha256>   /tmp/mini_vpn_knife15_macos_....tar.gz
+<exit-sha256>  /tmp/mini_vpn_knife15_exit_target_observer_....tar.gz
 ```
 
-Also synchronize the bundle to the analysis Mac as before.
+Also synchronize both bundles to the analysis Mac as before.
 
 ## 8. Restore The Physical Service IPv6
 
@@ -340,7 +344,7 @@ service and mode; do not source or `eval` that file.
 
 ## Failure Procedure
 
-If `start`, `smoke`, or `m2-qualification` fails, do not retry and do not tune
+If `start`, `smoke`, or `m2` fails, do not retry and do not tune
 any value. Run:
 
 ```bash
@@ -369,7 +373,7 @@ build/self-test/preflight   about 1–3 minutes
 baseline                    about 40–90 seconds
 direct discriminator        a little over 5 minutes
 start + smoke               about 1–2 minutes
-m2 qualification           about 30 minutes
+formal M2 traffic/drain     about 24 hours
 status + stop + bundle      about 1–3 minutes
 IPv6 restoration           about 1 minute
 ```

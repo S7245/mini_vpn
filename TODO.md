@@ -4,7 +4,37 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-13 — prequalification code review closed three preventable P1 gaps)
+#### Latest decision (2026-08-13 — paired successor install qualification passed; formal M2 reopened)
+
+Exact-source `d91f205` paired Mac artifact
+`/tmp/mini_vpn_knife15_macos_20260813_095649.tar.gz` (SHA-256 `db8297c6...`)
+passed baseline `19.549/52.870 Mbit/s`, bounded direct `9.771 Mbit/s`, smoke,
+all preflights, two cycles/eight phases, two DNS and real-client checks, and
+cleanup. Target receiver-zero was zero, maximum TCP gap was `5,767,168B`, and
+maximum UDP loss was `2.548546%`.
+
+The run reached the decisive branch: predecessor current `235,811B` became the
+handoff requirement, while successor readiness stayed `26,338B`; five exact
+turns proved final `427,953B` with zero loss and the live `c06a9d0` install CAS
+installed generation 2. No `stale_cwnd`, failed replacement, path reset, or
+Endpoint rebind recurred. Three timed close tails passed D16/terminal replay.
+Endpoint final was `61,402/0/0B` with zero abandon/would-block.
+
+Paired Exit SHA-256 `9dc4c864...` captured `10,442,111` packets with zero
+kernel drops and cleaned observer state/table ownership. Result:
+`docs/tech/2026-08-13-knife15-m2-successor-install-revalidation-macos-qualification-results.md`.
+
+Next:
+
+1. do not repeat qualification;
+2. pull/rebuild the pushed reviewed descendant on the HK Mac;
+3. reserve about 25 uninterrupted hours and run one fresh formal
+   `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke ->
+   fresh .33 observer start -> m2 -> status -> stop`;
+4. require `cce3bf8` or a descendant, then sync both automatically finalized
+   bundles. M3 remains blocked until formal M2 and cleanup pass.
+
+#### Previous decision (2026-08-13 — prequalification code review closed three preventable P1 gaps)
 
 Concentrated review after the service-floor separation repaired three defects
 that could otherwise waste or invalidate the next Mac run:

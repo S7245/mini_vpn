@@ -4,7 +4,37 @@
 
 ## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-13)
 
-- **Latest accepted position:** concentrated prequalification code review found
+- **Latest accepted position:** exact-source `d91f205` paired qualification
+  artifact `/tmp/mini_vpn_knife15_macos_20260813_095649.tar.gz` (SHA-256
+  `db8297c6...`) passed baseline `19.549/52.870 Mbit/s`, bounded direct
+  `9.771 Mbit/s`, smoke, every preflight, two cycles/eight phases, two DNS and
+  real-client checks, and cleanup. Target receiver-zero was zero, maximum TCP
+  gap was `5,767,168B`, and maximum UDP loss was `2.548546%`. Verdict is
+  `PASS_NON_ACCEPTANCE`; formal M2 was not run.
+- The repaired real replacement branch was reached. Generation 1 surrendered
+  current `235,811B`; generation 2 retained first-turn readiness `26,338B`,
+  completed five exact turns at final `427,953B` with `414,587/414,587/0B`
+  sent/acked/lost, passed the live install CAS, and installed in `1,946ms`.
+  No replacement failed, no `stale_cwnd` recurred, and no mini_vpn path reset
+  or Endpoint rebind occurred.
+- Three sender-zero intervals had zero Target receiver-zero intervals. Three
+  timed-transfer `Stopped(0)` tails had D16 queued/leased/reserved `0/0/0B`
+  and passed terminal replay. Endpoint final was `61,402/0/0B`, with zero
+  abandon and socket would-block. Process, interface, DNS, routes, TUN, secret
+  scan, and cleanup passed.
+- Paired Exit SHA-256 `9dc4c864...` captured `10,442,111` packets with zero
+  kernel drops. Observer state/nftables ownership is gone and sing-box is
+  active with zero restarts. Result:
+  `docs/tech/2026-08-13-knife15-m2-successor-install-revalidation-macos-qualification-results.md`.
+- Do not repeat qualification. Pull/rebuild the pushed reviewed descendant and
+  take exactly one fresh formal `m2-ipv6-check -> baseline ->
+  direct-discriminator -> start -> smoke -> fresh .33 observer start -> m2 ->
+  status -> stop`. Reserve about 25 uninterrupted hours and sync both final
+  bundles. The runner requires `cce3bf8` or a descendant, so exact `c06a9d0`
+  with its older script is rejected. M3 remains blocked until formal M2 and
+  cleanup pass.
+
+- **Previous accepted position:** concentrated prequalification code review found
   and repaired three locally preventable P1 risks before another Mac run.
   Production/TDD `c06a9d0` revalidates the successor's live close state, path
   generation, and cwnd under the generation-slot install mutex; a connection

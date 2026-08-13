@@ -1,5 +1,24 @@
 # Errors
 
+## 2026-08-13 - Formal source floor initially stopped at production before its runner repair
+
+- After qualification, a focused source-policy RED showed exact `c06a9d0`
+  was still admitted although it predates the `cce3bf8` complete-worktree and
+  qualification-observer runner gates.
+- Formal admission now rejects `c06a9d0` and requires `cce3bf8` or a
+  descendant. No Rust production code, workload, SLI, or frozen value changed.
+
+## 2026-08-13 - Paired observer copy must keep its transfer session drainable
+
+- The first 114MB observer `rsync --progress` was launched behind a tool call
+  whose output was no longer being drained. Its progress pipe filled and the
+  transfer appeared as a slow network copy. It was interrupted safely with
+  `--partial` after `22,052,864B` and resumed with `--append` in an explicitly
+  pollable session.
+- For large evidence, avoid noisy progress output in an orphaned command.
+  Retain a session id, poll it, preserve partial data, and accept the copy only
+  after local SHA-256 matches the authoritative remote checksum.
+
 ## 2026-08-13 - Prequalification review found three locally preventable long-run risks
 
 - The slot install CAS trusted a typed proof without rechecking live successor
