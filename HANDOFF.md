@@ -2,9 +2,41 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-12)
+## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-13)
 
-- **Latest accepted position:** exact-source `fe7b809` formal artifact
+- **Latest accepted position:** exact-source `bec6dc8` paired qualification
+  artifact `/tmp/mini_vpn_knife15_macos_20260813_030113.tar.gz` (SHA-256
+  `8a65cc5b...`) completed baseline `31.445/60.511 Mbit/s`, bounded direct
+  `15.716 Mbit/s`, smoke, every preflight, two cycles/eight phases, two DNS
+  and real-client checks, and cleanup. Target receiver-zero was zero, maximum
+  TCP gap was `7,208,960B`, and maximum UDP loss was `2.230867%`.
+- The immutable archive says `failed/MISMATCH` because final D16 replay
+  required a zero smoltcp send queue. Two Apple control flows had transferred
+  their exact final 24-byte D16 lease through TUN before the local TCP peer
+  became terminally Closed. Pending/reap/permit-drop and Endpoint ownership
+  were all zero. Reviewed replay therefore classifies the run as
+  `PASS_NON_ACCEPTANCE`; the archive itself is not rewritten.
+- Paired Exit SHA-256 `97b7f704...` captured `11,576,962` packets with zero
+  kernel drops. Observer state/nftables ownership is gone and sing-box remains
+  active. A replacement also reached current/inherited floor `242,949B`,
+  failed successor proof on `1,280B` loss, and safely fell back without a
+  Target receiver-zero interval. No mini_vpn path reset remained.
+- Reviewed `0296688` permits only an exact terminal local-close proof after
+  same-handle D16 lease/local-EOF byte equality. Any pending/reap/permit-drop,
+  byte mismatch, send capability, incomplete sequence, or handle reuse still
+  fails. `2ada935` raises the formal source floor to `0296688` so the stale
+  runner is rejected before a 25-hour run. No Rust production or frozen value
+  changed.
+- Complete runner self-test, exact artifact terminal replay, shell, diff,
+  secret, and review gates pass with no unresolved P0/P1. Result:
+  `docs/tech/2026-08-13-knife15-m2-path-reset-retirement-macos-qualification-results.md`.
+- Do not repeat qualification. Pull/rebuild the pushed reviewed descendant and
+  take exactly one fresh formal `m2-ipv6-check -> baseline ->
+  direct-discriminator -> start -> smoke -> fresh .33 observer start -> m2 ->
+  status -> stop`. Reserve about 25 uninterrupted hours and sync both bundles.
+  M3 remains blocked until formal M2 and cleanup pass.
+
+- **Previous accepted position:** exact-source `fe7b809` formal artifact
   `/tmp/mini_vpn_knife15_macos_20260812_102923.tar.gz` (SHA-256
   `eb1888a1...`) passed baseline, direct, smoke, every preflight, twenty
   complete cycles, 181 phases, and cleanup before cycle 22 `tcp-forward`

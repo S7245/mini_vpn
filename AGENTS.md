@@ -187,7 +187,35 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-08-12:
+Current Knife15 summary, as of 2026-08-13:
+
+- Exact-source `bec6dc8` paired qualification artifact
+  `/tmp/mini_vpn_knife15_macos_20260813_030113.tar.gz` (SHA-256
+  `8a65cc5b...`) completed baseline `31.445/60.511 Mbit/s`, bounded direct
+  `15.716 Mbit/s`, smoke, all preflights, two cycles/eight phases, two DNS and
+  real-client checks, and cleanup. Target receiver-zero was zero, maximum TCP
+  gap was `7,208,960B`, and maximum UDP loss was `2.230867%`.
+- Its immutable `failed/MISMATCH` status is a runner false negative. Two exact
+  24-byte Apple control tails had already left D16 ownership before the local
+  peers became terminally Closed; pending/reap/permit-drop and Endpoint
+  ownership were zero. Reviewed replay classifies the qualification as
+  `PASS_NON_ACCEPTANCE` without rewriting the archive.
+- Paired Exit SHA-256 `97b7f704...` captured `11,576,962` packets with zero
+  kernel drops; observer state/nftables ownership is gone and sing-box remains
+  active. A current-floor `242,949B` replacement attempt failed successor proof
+  on `1,280B` loss and safely fell back without receiver loss. No mini_vpn
+  path reset remained.
+- Reviewed `0296688` permits only the exact same-handle terminal local-close
+  ownership transfer; all mismatched, owned, send-capable, incomplete, or
+  reused-handle sequences fail. `2ada935` raises formal source admission to
+  `0296688` or a descendant. No Rust production or frozen value changed.
+- Complete runner self-test, exact artifact terminal replay, shell, diff,
+  secret, and review gates pass with no unresolved P0/P1. Result:
+  `docs/tech/2026-08-13-knife15-m2-path-reset-retirement-macos-qualification-results.md`.
+- Do not repeat qualification. Pull/rebuild the pushed reviewed descendant and
+  take one fresh formal `m2-ipv6-check -> baseline -> direct-discriminator ->
+  start -> smoke -> fresh .33 observer start -> m2 -> status -> stop`. Reserve
+  about 25 uninterrupted hours and sync both bundles. M3 remains blocked.
 
 - Exact-source `fe7b809` formal artifact
   `/tmp/mini_vpn_knife15_macos_20260812_102923.tar.gz` (SHA-256

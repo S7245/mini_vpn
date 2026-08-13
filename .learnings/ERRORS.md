@@ -1,5 +1,25 @@
 # Errors
 
+## 2026-08-13 - Qualification traffic passed but D16 replay rejected terminal local closure
+
+- Exact-source `bec6dc8` completed both qualification cycles with zero Target
+  receiver-zero intervals, then waited the full 50-second final drain and
+  failed terminal safety. This was not a workload, network, Endpoint, D16,
+  TUN, route, DNS, process, observer, or cleanup failure.
+- Two ambient Apple flows each transferred a final 24-byte D16 lease through
+  TUN, then their local TCP peers became `Closed/active=false/can_send=false`
+  before acknowledging the smoltcp queue. The old replay required
+  `send_queue=0` and conflated terminal local egress with retained D16
+  ownership.
+- The initial implementation review found a second preventable risk: formal
+  M2 still accepted the old `579fff4` source floor. A focused runner RED proved
+  it would accept `bec6dc8`; `2ada935` now requires `0296688` or a descendant
+  before traffic.
+- The immutable artifact remains failed. Reviewed replay classifies it as
+  `PASS_NON_ACCEPTANCE`; formal M2 still requires a fresh run.
+- Result:
+  `docs/tech/2026-08-13-knife15-m2-path-reset-retirement-macos-qualification-results.md`.
+
 ## 2026-08-12 - Formal M2 rejected client-forced same-path reset under ACK progress
 
 - Exact-source `fe7b809` passed twenty complete formal cycles and failed cycle

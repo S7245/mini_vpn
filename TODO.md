@@ -1,10 +1,44 @@
 # TODO
 
-## Current Knife15 Plan (2026-08-12)
+## Current Knife15 Plan (2026-08-13)
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-12 — formal M2 rejected ACK-progress path reset; retirement ready for qualification)
+#### Latest decision (2026-08-13 — path-reset retirement qualification accepted; formal M2 reopened)
+
+Exact-source `bec6dc8` paired qualification artifact
+`/tmp/mini_vpn_knife15_macos_20260813_030113.tar.gz` (SHA-256
+`8a65cc5b...`) passed its full traffic, network, ownership, and cleanup
+envelope: baseline `31.445/60.511 Mbit/s`, bounded direct `15.716 Mbit/s`, two
+cycles/eight phases, zero Target receiver-zero intervals, maximum TCP gap
+`7,208,960B`, and maximum UDP loss `2.230867%`.
+
+The immutable status is `failed/MISMATCH` only because two exact 24-byte Apple
+control tails had left D16 ownership before their local TCP peers became
+terminally Closed. Pending/reap/permit-drop and Endpoint ownership were zero.
+Reviewed `0296688` recognizes only this exact same-handle terminal transfer;
+all owned, mismatched, send-capable, incomplete, and reused-handle cases still
+fail. Paired Exit SHA-256 `97b7f704...` captured `11,576,962` packets with zero
+kernel drops and cleaned all observer ownership. A current-floor `242,949B`
+replacement attempt safely failed proof and fell back without receiver loss.
+
+Formal source floor repair `2ada935` rejects `bec6dc8` and requires `0296688`
+or a descendant before traffic. Complete runner self-test, immutable artifact
+replay, shell, diff, secret, and review gates pass with no unresolved P0/P1.
+Result:
+`docs/tech/2026-08-13-knife15-m2-path-reset-retirement-macos-qualification-results.md`.
+
+Next:
+
+1. pull/rebuild the pushed reviewed descendant on the test Mac;
+2. reserve about 25 uninterrupted hours for the Mac, `.33` Exit, and `.77`
+   Target;
+3. run exactly one fresh `m2-ipv6-check -> baseline -> direct-discriminator
+   -> start -> smoke -> fresh .33 observer start -> m2 -> status -> stop`;
+4. sync both final bundles. Do not repeat qualification or tune constants.
+   M3 remains blocked until formal M2 and cleanup pass.
+
+#### Previous decision (2026-08-12 — formal M2 rejected ACK-progress path reset; retirement ready for qualification)
 
 Exact-source `fe7b809` formal artifact
 `/tmp/mini_vpn_knife15_macos_20260812_102923.tar.gz` (SHA-256

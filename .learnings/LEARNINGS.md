@@ -1,5 +1,25 @@
 # Learnings
 
+## 2026-08-13 - D16 ownership and terminal smoltcp egress are different domains
+
+- A positive D16 lease at relay-task exit is not automatically a leak if the
+  same bytes are observed at local EOF and the D16 permit is released on TUN
+  flush. Later bytes in a terminal `Closed` smoltcp send queue are local TCP
+  egress, not Endpoint or D16 ownership.
+- Accept terminal abandonment only from a conjunctive proof: exact same-handle
+  byte equality, pending/reap/permit-drop zero, terminal close-egress class,
+  no drain candidacy, and no current or protocol send authority. A broad
+  allowance for `terminal_closed_no_send` would hide real ownership loss.
+- A short qualification can still reach a valuable failure branch. The
+  successor proof lost `1,280B`, installation failed closed, and the pool
+  safely fell back while Target continuity stayed clean. Record this separately
+  from a successful successor install/handoff claim.
+- Long-run source floors must advance after a runner acceptance repair. Without
+  that gate, a stale exact-source build can consume 25 hours and reproduce a
+  known final false negative even though production behavior is correct.
+- Result:
+  `docs/tech/2026-08-13-knife15-m2-path-reset-retirement-macos-qualification-results.md`.
+
 ## 2026-08-12 - Exact ACK progress forbids destructive same-path recovery
 
 - A PLPMTUD black-hole increment is loss evidence, not proof that an unchanged
