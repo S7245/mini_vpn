@@ -5618,12 +5618,6 @@ struct EndpointRecoveryInput {
     connections: Vec<EndpointRecoveryConnectionSample>,
 }
 
-struct EndpointRecoveryConnectionHandle {
-    stable_id: usize,
-    pool_index: usize,
-    pool_generation: u64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EndpointRecoveryTrigger {
     NoRx,
@@ -5635,16 +5629,6 @@ enum EndpointRecoveryTrigger {
         acknowledged_bytes: u64,
         pending_for: Duration,
     },
-    TcpPathDegraded {
-        stable_id: usize,
-        writer: u64,
-        stream: u64,
-        episode: u64,
-        acknowledged_bytes: u64,
-        pending_for: Duration,
-        black_hole_anchor: u64,
-        black_holes_current: u64,
-    },
 }
 
 impl EndpointRecoveryTrigger {
@@ -5652,7 +5636,6 @@ impl EndpointRecoveryTrigger {
         match self {
             Self::NoRx => "no_rx",
             Self::TcpWriteStall { .. } => "tcp_write_stall",
-            Self::TcpPathDegraded { .. } => "tcp_path_degraded",
         }
     }
 
@@ -5674,22 +5657,6 @@ impl EndpointRecoveryTrigger {
                 acknowledged_bytes,
                 pending_for.as_millis(),
             ),
-            Self::TcpPathDegraded {
-                stable_id,
-                writer,
-                stream,
-                episode,
-                acknowledged_bytes,
-                pending_for,
-                ..
-            } => (
-                stable_id,
-                writer,
-                stream,
-                episode,
-                acknowledged_bytes,
-                pending_for.as_millis(),
-            ),
         }
     }
 
@@ -5701,12 +5668,6 @@ impl EndpointRecoveryTrigger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EndpointRecoveryAction {
     None,
-    ResetConnectionPath {
-        generation: u64,
-        trigger: EndpointRecoveryTrigger,
-        stall_bound: Duration,
-        max_rtt: Duration,
-    },
     Rebind {
         generation: u64,
         trigger: EndpointRecoveryTrigger,
@@ -5741,9 +5702,6 @@ struct EndpointRecoveryState {
     pending_recovery_connections: HashSet<usize>,
     expected_recovery_connection_count: usize,
     covered_tcp_write_episodes: HashMap<(usize, u64), u64>,
-    path_black_hole_anchors: HashMap<usize, u64>,
-    path_reset_consumed: HashSet<usize>,
-    path_reset_generation: u64,
     observed_udp_activity_secs: u64,
     udp_demand_since_rx: bool,
 }
@@ -5782,100 +5740,6 @@ impl EndpointRecoveryState {
                         != Some(&pressure.episode)
             })
             .max_by_key(|(_, pressure)| (pressure.ack_stalled_for, pressure.pending_for))
-    }
-
-    fn refresh_path_recovery_ownership(&mut self, input: &EndpointRecoveryInput) {
-        self.path_black_hole_anchors.retain(|stable_id, _| {
-            input
-                .connections
-                .iter()
-                .any(|sample| sample.stable_id == *stable_id)
-        });
-        self.path_reset_consumed.retain(|stable_id| {
-            input
-                .connections
-                .iter()
-                .any(|sample| sample.stable_id == *stable_id)
-        });
-
-        for sample in &input.connections {
-            let has_pending_writer = !sample.tcp_write_pressures.is_empty();
-            self.path_black_hole_anchors
-                .entry(sample.stable_id)
-                .and_modify(|anchor| {
-                    if sample.black_holes_detected < *anchor || !has_pending_writer {
-                        *anchor = sample.black_holes_detected;
-                    }
-                })
-                .or_insert(sample.black_holes_detected);
-        }
-    }
-
-    fn eligible_tcp_path_degradation(
-        &self,
-        input: &EndpointRecoveryInput,
-        stall_bound: Duration,
-    ) -> Option<(usize, TcpWritePressureSnapshot, u64, u64)> {
-        input
-            .connections
-            .iter()
-            .filter_map(|sample| {
-                let anchor = *self.path_black_hole_anchors.get(&sample.stable_id)?;
-                if self.path_reset_consumed.contains(&sample.stable_id)
-                    || sample.black_holes_detected <= anchor
-                {
-                    return None;
-                }
-                sample
-                    .tcp_write_pressures
-                    .iter()
-                    .copied()
-                    .filter(|pressure| pressure.pending_for >= stall_bound)
-                    .max_by_key(|pressure| pressure.pending_for)
-                    .map(|pressure| {
-                        (
-                            sample.stable_id,
-                            pressure,
-                            anchor,
-                            sample.black_holes_detected,
-                        )
-                    })
-            })
-            .max_by_key(|(stable_id, pressure, anchor, current)| {
-                (
-                    pressure.pending_for,
-                    current.saturating_sub(*anchor),
-                    *stable_id,
-                )
-            })
-    }
-
-    fn begin_path_reset(
-        &mut self,
-        stable_id: usize,
-        pressure: TcpWritePressureSnapshot,
-        black_hole_anchor: u64,
-        black_holes_current: u64,
-        stall_bound: Duration,
-        max_rtt: Duration,
-    ) -> EndpointRecoveryAction {
-        self.path_reset_consumed.insert(stable_id);
-        self.path_reset_generation = self.path_reset_generation.saturating_add(1);
-        EndpointRecoveryAction::ResetConnectionPath {
-            generation: self.path_reset_generation,
-            trigger: EndpointRecoveryTrigger::TcpPathDegraded {
-                stable_id,
-                writer: pressure.writer,
-                stream: pressure.stream,
-                episode: pressure.episode,
-                acknowledged_bytes: pressure.acknowledged_bytes,
-                pending_for: pressure.pending_for,
-                black_hole_anchor,
-                black_holes_current,
-            },
-            stall_bound,
-            max_rtt,
-        }
     }
 
     fn begin_rebind(
@@ -5932,7 +5796,6 @@ impl EndpointRecoveryState {
             );
         }
         self.connections = next;
-        self.refresh_path_recovery_ownership(input);
         self.covered_tcp_write_episodes
             .retain(|(stable_id, writer), episode| {
                 input.connections.iter().any(|sample| {
@@ -5997,21 +5860,6 @@ impl EndpointRecoveryState {
                     pending_for: pressure.pending_for,
                 },
                 pressure.ack_stalled_for,
-                stall_bound,
-                max_rtt,
-            );
-        }
-
-        if let Some((stable_id, pressure, anchor, current)) =
-            self.eligible_tcp_path_degradation(input, stall_bound)
-            && !self.rebind_issued
-            && self.expected_socket_generation.is_none()
-        {
-            return self.begin_path_reset(
-                stable_id,
-                pressure,
-                anchor,
-                current,
                 stall_bound,
                 max_rtt,
             );
@@ -6119,7 +5967,7 @@ impl TcpPoolTransport for u64 {
 struct TcpPoolGeneration<T> {
     transport: T,
     successor_service_certificate: Option<TcpPoolSuccessorServiceCertificate>,
-    /// Exact service the current transport had proved before surrendering its path or generation.
+    /// Exact service the current transport had proved before surrendering its generation.
     /// This is observed state, not a configured congestion-window target.
     replacement_forward_service_floor: Option<u64>,
     activity: Arc<TcpPoolGenerationActivity>,
@@ -6224,47 +6072,6 @@ enum TcpPoolReplacementCurrentServiceHandoffError {
 struct TcpPoolReplacementCurrentServiceHandoff {
     observed_cwnd: u64,
     required_cwnd_floor: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TcpPoolPathResetPreparation {
-    Current { forward_service_floor: u64 },
-    Draining,
-    Stale,
-    ZeroWindow,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TcpPoolPathResetSnapshot {
-    rtt: Duration,
-    cwnd: u64,
-    current_mtu: u16,
-}
-
-impl TcpPoolPathResetSnapshot {
-    fn from_connection(connection: &Connection) -> Self {
-        let path = connection.stats().path;
-        Self {
-            rtt: path.rtt,
-            cwnd: path.cwnd,
-            current_mtu: path.current_mtu,
-        }
-    }
-}
-
-#[derive(Debug)]
-enum TcpPoolPathResetOutcome {
-    Applied {
-        preparation: TcpPoolPathResetPreparation,
-        before: TcpPoolPathResetSnapshot,
-        after: TcpPoolPathResetSnapshot,
-    },
-    Rejected(TcpPoolPathResetPreparation),
-    Closed {
-        preparation: TcpPoolPathResetPreparation,
-        before: TcpPoolPathResetSnapshot,
-        error: String,
-    },
 }
 
 struct TcpPoolGenerationInstall {
@@ -6470,57 +6277,6 @@ impl TcpPoolGenerationSlot<Connection> {
             observed_cwnd,
             required_cwnd_floor,
         })
-    }
-
-    async fn reset_path_if_owned(
-        &self,
-        expected_identity: TcpPoolTransportIdentity,
-    ) -> TcpPoolPathResetOutcome {
-        let mut state = self.state.lock().await;
-        if state.current.identity() == expected_identity {
-            let before = TcpPoolPathResetSnapshot::from_connection(&state.current.transport);
-            let Some(forward_service_floor) =
-                state.current.record_forward_service_floor(before.cwnd)
-            else {
-                return TcpPoolPathResetOutcome::Rejected(TcpPoolPathResetPreparation::ZeroWindow);
-            };
-            let preparation = TcpPoolPathResetPreparation::Current {
-                forward_service_floor,
-            };
-            return match state.current.transport.path_changed() {
-                Ok(()) => TcpPoolPathResetOutcome::Applied {
-                    preparation,
-                    before,
-                    after: TcpPoolPathResetSnapshot::from_connection(&state.current.transport),
-                },
-                Err(error) => TcpPoolPathResetOutcome::Closed {
-                    preparation,
-                    before,
-                    error: error.to_string(),
-                },
-            };
-        }
-        let Some(draining) = state
-            .draining
-            .as_mut()
-            .filter(|draining| draining.generation.identity() == expected_identity)
-        else {
-            return TcpPoolPathResetOutcome::Rejected(TcpPoolPathResetPreparation::Stale);
-        };
-        let before = TcpPoolPathResetSnapshot::from_connection(&draining.generation.transport);
-        let preparation = TcpPoolPathResetPreparation::Draining;
-        match draining.generation.transport.path_changed() {
-            Ok(()) => TcpPoolPathResetOutcome::Applied {
-                preparation,
-                before,
-                after: TcpPoolPathResetSnapshot::from_connection(&draining.generation.transport),
-            },
-            Err(error) => TcpPoolPathResetOutcome::Closed {
-                preparation,
-                before,
-                error: error.to_string(),
-            },
-        }
     }
 }
 
@@ -7734,7 +7490,7 @@ impl TuicUpstream {
                 let Some(upstream) = weak.upgrade() else {
                     return;
                 };
-                let Some((input, connection_handles)) = upstream.endpoint_recovery_input() else {
+                let Some(input) = upstream.endpoint_recovery_input() else {
                     continue;
                 };
                 if let Some(active_leases) =
@@ -7760,114 +7516,6 @@ impl TuicUpstream {
                             "✅ tuic-endpoint-rebind-recovered generation={generation} first_rx_ms={} socket_generation={socket_generation} connections={connection_count}",
                             recovery_time.as_millis(),
                         );
-                    }
-                    EndpointRecoveryAction::ResetConnectionPath {
-                        generation,
-                        trigger,
-                        stall_bound,
-                        max_rtt,
-                    } => {
-                        let (
-                            write_conn,
-                            write_writer,
-                            write_stream,
-                            write_episode,
-                            write_acknowledged_bytes,
-                            write_pending_ms,
-                        ) = trigger.tcp_write_fields();
-                        let (black_hole_anchor, black_holes_current) = match trigger {
-                            EndpointRecoveryTrigger::TcpPathDegraded {
-                                black_hole_anchor,
-                                black_holes_current,
-                                ..
-                            } => (black_hole_anchor, black_holes_current),
-                            _ => (0, 0),
-                        };
-                        match connection_handles
-                            .iter()
-                            .find(|handle| handle.stable_id == write_conn)
-                        {
-                            Some(handle) => {
-                                let expected_identity = TcpPoolTransportIdentity::new(
-                                    handle.stable_id,
-                                    handle.pool_generation,
-                                );
-                                let outcome = match upstream.tcp_pool_slots.get(handle.pool_index) {
-                                    Some(slot) => slot.reset_path_if_owned(expected_identity).await,
-                                    None => TcpPoolPathResetOutcome::Rejected(
-                                        TcpPoolPathResetPreparation::Stale,
-                                    ),
-                                };
-                                match outcome {
-                                    TcpPoolPathResetOutcome::Applied {
-                                        preparation,
-                                        before,
-                                        after,
-                                    } => {
-                                        let inherited_forward_service_floor = match preparation {
-                                            TcpPoolPathResetPreparation::Current {
-                                                forward_service_floor,
-                                            } => forward_service_floor.to_string(),
-                                            TcpPoolPathResetPreparation::Draining => {
-                                                "draining".into()
-                                            }
-                                            TcpPoolPathResetPreparation::Stale
-                                            | TcpPoolPathResetPreparation::ZeroWindow => {
-                                                unreachable!(
-                                                    "rejected path-reset preparation cannot be applied"
-                                                )
-                                            }
-                                        };
-                                        println!(
-                                            "🔄 tuic-connection-path-reset generation={generation} result=applied trigger={} write_conn={write_conn} pool_index={} pool_generation={} inherited_forward_service_floor={} write_writer={write_writer} write_stream={write_stream} write_episode={write_episode} write_acknowledged={write_acknowledged_bytes}B write_pending_ms={write_pending_ms} black_hole_anchor={black_hole_anchor} black_holes_current={black_holes_current} bound_ms={} max_rtt_ms={} rtt_before_ms={} rtt_after_ms={} cwnd_before={} cwnd_after={} mtu_before={} mtu_after={}",
-                                            trigger.label(),
-                                            handle.pool_index,
-                                            handle.pool_generation,
-                                            inherited_forward_service_floor,
-                                            stall_bound.as_millis(),
-                                            max_rtt.as_millis(),
-                                            before.rtt.as_millis(),
-                                            after.rtt.as_millis(),
-                                            before.cwnd,
-                                            after.cwnd,
-                                            before.current_mtu,
-                                            after.current_mtu,
-                                        );
-                                    }
-                                    TcpPoolPathResetOutcome::Rejected(preparation) => {
-                                        println!(
-                                            "⚠️ tuic-connection-path-reset generation={generation} result=ownership_rejected preparation={preparation:?} trigger={} write_conn={write_conn} pool_index={} pool_generation={} write_writer={write_writer} write_stream={write_stream} write_episode={write_episode}",
-                                            trigger.label(),
-                                            handle.pool_index,
-                                            handle.pool_generation,
-                                        );
-                                    }
-                                    TcpPoolPathResetOutcome::Closed {
-                                        preparation,
-                                        before,
-                                        error,
-                                    } => {
-                                        println!(
-                                            "⚠️ tuic-connection-path-reset generation={generation} result=closed preparation={preparation:?} trigger={} write_conn={write_conn} pool_index={} pool_generation={} write_writer={write_writer} write_stream={write_stream} write_episode={write_episode} write_acknowledged={write_acknowledged_bytes}B write_pending_ms={write_pending_ms} black_hole_anchor={black_hole_anchor} black_holes_current={black_holes_current} bound_ms={} max_rtt_ms={} cwnd_before={} error={error}",
-                                            trigger.label(),
-                                            handle.pool_index,
-                                            handle.pool_generation,
-                                            stall_bound.as_millis(),
-                                            max_rtt.as_millis(),
-                                            before.cwnd,
-                                        );
-                                    }
-                                }
-                            }
-                            None => {
-                                println!(
-                                    "⚠️ tuic-connection-path-reset generation={generation} result=not_found trigger={} write_conn={write_conn} write_writer={write_writer} write_stream={write_stream} write_episode={write_episode} write_acknowledged={write_acknowledged_bytes}B write_pending_ms={write_pending_ms} black_hole_anchor={black_hole_anchor} black_holes_current={black_holes_current} bound_ms={} max_rtt_ms={}",
-                                    trigger.label(),
-                                    stall_bound.as_millis(),
-                                    max_rtt.as_millis(),
-                                );
-                            }
-                        }
                     }
                     EndpointRecoveryAction::Rebind {
                         generation,
@@ -7951,11 +7599,8 @@ impl TuicUpstream {
         });
     }
 
-    fn endpoint_recovery_input(
-        &self,
-    ) -> Option<(EndpointRecoveryInput, Vec<EndpointRecoveryConnectionHandle>)> {
+    fn endpoint_recovery_input(&self) -> Option<EndpointRecoveryInput> {
         let mut connections = Vec::with_capacity(self.tcp_pool_slots.len() + 1);
-        let mut connection_handles = Vec::with_capacity(self.tcp_pool_slots.len() + 1);
         let sampled_at = Instant::now();
         for slot in &self.tcp_pool_slots {
             let state = slot.state.try_lock().ok()?;
@@ -7978,30 +7623,22 @@ impl TuicUpstream {
                     tcp_write_pressures: generation.write_pressure.snapshots_at(sampled_at),
                     tcp_ordered_read_progress: generation.read_pressure.snapshots(),
                 });
-                connection_handles.push(EndpointRecoveryConnectionHandle {
-                    stable_id,
-                    pool_index: slot.index,
-                    pool_generation: generation.open_state.generation(),
-                });
             }
         }
         let active_tcp = self.tcp_pool_admission.active_total();
         let now = self.clock.elapsed().as_secs();
         let last_udp_activity = self.last_udp_activity.load(Ordering::Relaxed);
         let udp_active = should_send_heartbeat(last_udp_activity, now, TUIC_HB_IDLE_WINDOW_SECS);
-        Some((
-            EndpointRecoveryInput {
-                active_tcp,
-                udp_active,
-                last_udp_activity_secs: last_udp_activity,
-                current_socket_rx_rebind_generation: self
-                    .endpoint
-                    .stats()
-                    .current_socket_rx_rebind_generation,
-                connections,
-            },
-            connection_handles,
-        ))
+        Some(EndpointRecoveryInput {
+            active_tcp,
+            udp_active,
+            last_udp_activity_secs: last_udp_activity,
+            current_socket_rx_rebind_generation: self
+                .endpoint
+                .stats()
+                .current_socket_rx_rebind_generation,
+            connections,
+        })
     }
 }
 
@@ -8846,7 +8483,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_recovery_resets_only_the_pending_connection_on_black_hole_advance() {
+    fn endpoint_recovery_does_not_reset_an_ack_progressing_path_on_black_hole_advance() {
         let started = Instant::now();
         let rtt = Duration::from_millis(159);
         let bound = endpoint_recovery_stall_bound(rtt);
@@ -8886,31 +8523,15 @@ mod tests {
             ),
         ]);
         let action = state.observe(started + bound, &degraded);
-        assert!(
-            matches!(
-                action,
-                EndpointRecoveryAction::ResetConnectionPath {
-                    generation: 1,
-                    trigger: EndpointRecoveryTrigger::TcpPathDegraded {
-                        stable_id: 11,
-                        writer: 7,
-                        stream: 15,
-                        episode: 9,
-                        acknowledged_bytes: 65_536,
-                        black_hole_anchor: 0,
-                        black_holes_current: 1,
-                        ..
-                    },
-                    stall_bound,
-                    max_rtt,
-                } if stall_bound == bound && max_rtt == rtt
-            ),
-            "only the connection with current writer ownership plus black-hole advance may reset: {action:?}"
+        assert_eq!(
+            action,
+            EndpointRecoveryAction::None,
+            "continuing exact ACK progress must leave native QUIC recovery in control despite writer Pending and black-hole advance"
         );
     }
 
     #[test]
-    fn endpoint_recovery_path_reset_requires_same_pending_window_black_hole_advance() {
+    fn endpoint_recovery_repeated_black_hole_advance_does_not_override_ack_progress() {
         let started = Instant::now();
         let bound = endpoint_recovery_stall_bound(Duration::from_millis(159));
         let mut state = EndpointRecoveryState::default();
@@ -8948,7 +8569,7 @@ mod tests {
             EndpointRecoveryAction::None,
             "Pending and ACK progress without a same-window black-hole increment is ordinary backpressure"
         );
-        assert!(matches!(
+        assert_eq!(
             state.observe(
                 started + bound + Duration::from_millis(250),
                 &endpoint_recovery_path_sample(vec![endpoint_recovery_connection(
@@ -8963,70 +8584,13 @@ mod tests {
                     )),
                 )])
             ),
-            EndpointRecoveryAction::ResetConnectionPath { .. }
-        ));
+            EndpointRecoveryAction::None,
+            "later black-hole movement still cannot override continuing exact ACK progress"
+        );
     }
 
     #[test]
-    fn endpoint_recovery_path_reset_is_once_per_stable_identity() {
-        let started = Instant::now();
-        let bound = endpoint_recovery_stall_bound(Duration::from_millis(159));
-        let mut state = EndpointRecoveryState::default();
-        let idle = |stable_id, black_holes_detected| {
-            endpoint_recovery_path_sample(vec![endpoint_recovery_connection(
-                stable_id,
-                black_holes_detected,
-                None,
-            )])
-        };
-        let pending = |stable_id, black_holes_detected, writer, episode| {
-            endpoint_recovery_path_sample(vec![endpoint_recovery_connection(
-                stable_id,
-                black_holes_detected,
-                Some(endpoint_recovery_pending(
-                    writer,
-                    episode,
-                    bound,
-                    Duration::from_millis(250),
-                    64 * 1024,
-                )),
-            )])
-        };
-
-        assert_eq!(
-            state.observe(started, &idle(11, 0)),
-            EndpointRecoveryAction::None
-        );
-        assert!(matches!(
-            state.observe(started + bound, &pending(11, 1, 7, 9)),
-            EndpointRecoveryAction::ResetConnectionPath { generation: 1, .. }
-        ));
-        assert_eq!(
-            state.observe(started + bound + Duration::from_millis(250), &idle(11, 1)),
-            EndpointRecoveryAction::None
-        );
-        assert_eq!(
-            state.observe(started + bound * 2, &pending(11, 2, 8, 10)),
-            EndpointRecoveryAction::None,
-            "a stable identity cannot enter a path-reset loop across writer episodes"
-        );
-
-        assert_eq!(
-            state.observe(
-                started + bound * 2 + Duration::from_millis(250),
-                &idle(12, 0)
-            ),
-            EndpointRecoveryAction::None,
-            "identity replacement starts with observation, not an inherited action"
-        );
-        assert!(matches!(
-            state.observe(started + bound * 3, &pending(12, 1, 9, 11)),
-            EndpointRecoveryAction::ResetConnectionPath { generation: 2, .. }
-        ));
-    }
-
-    #[test]
-    fn endpoint_recovery_counter_regression_is_not_path_reset_authority() {
+    fn endpoint_recovery_counter_regression_is_not_recovery_authority() {
         let started = Instant::now();
         let bound = endpoint_recovery_stall_bound(Duration::from_millis(159));
         let mut state = EndpointRecoveryState::default();
@@ -9058,7 +8622,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_recovery_exact_ack_stall_precedes_path_reset() {
+    fn endpoint_recovery_exact_ack_stall_rebinds() {
         let started = Instant::now();
         let bound = endpoint_recovery_stall_bound(Duration::from_millis(159));
         let mut state = EndpointRecoveryState::default();
@@ -9087,7 +8651,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_recovery_does_not_overlap_path_reset_with_rebind_recovery() {
+    fn endpoint_recovery_does_not_overlap_rebind_recovery() {
         let started = Instant::now();
         let bound = endpoint_recovery_stall_bound(Duration::from_millis(159));
         let mut state = EndpointRecoveryState::default();
@@ -11591,7 +11155,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_pool_generation_owns_a_monotonic_pre_reset_forward_service_floor() {
+    fn tcp_pool_generation_owns_a_monotonic_replacement_forward_service_floor() {
         let clock = Instant::now();
         let mut generation = TcpPoolGeneration::new(11_u64, 1, 1, clock);
 
@@ -13005,97 +12569,6 @@ mod tests {
 
         client_endpoint.close(0u32.into(), b"test complete");
         server_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn tcp_pool_path_reset_is_atomic_for_current_and_draining_generations() {
-        let (server_endpoint, client_endpoint, server_addr) = d16_quinn_test_endpoints();
-        let server_task = tokio::spawn(async move {
-            let predecessor = server_endpoint.accept().await.unwrap().await.unwrap();
-            let successor = server_endpoint.accept().await.unwrap().await.unwrap();
-            tokio::join!(predecessor.closed(), successor.closed());
-        });
-        let predecessor = client_endpoint
-            .connect(server_addr, "localhost")
-            .unwrap()
-            .await
-            .unwrap();
-        let successor = client_endpoint
-            .connect(server_addr, "localhost")
-            .unwrap()
-            .await
-            .unwrap();
-        let clock = Instant::now();
-        let slot = TcpPoolGenerationSlot::new(1, predecessor.clone(), 1, 1, clock);
-        let predecessor_identity = TcpPoolTransportIdentity::new(predecessor.stable_id(), 1);
-
-        let current_path_generation = predecessor.current_path_generation();
-        let TcpPoolPathResetOutcome::Applied {
-            preparation:
-                TcpPoolPathResetPreparation::Current {
-                    forward_service_floor,
-                },
-            before,
-            after,
-        } = slot.reset_path_if_owned(predecessor_identity).await
-        else {
-            panic!("the exact current generation must own one atomic reset")
-        };
-        assert_eq!(forward_service_floor, before.cwnd);
-        assert!(after.cwnd > 0);
-        assert_eq!(
-            predecessor.current_path_generation(),
-            current_path_generation,
-            "a state reset stays within the same network-path generation"
-        );
-        assert_eq!(
-            slot.replacement_forward_service_floor(predecessor_identity)
-                .await
-                .unwrap(),
-            Some(before.cwnd)
-        );
-
-        let predecessor_activity = slot.current_activity().await;
-        let successor_floor = forward_service_floor.max(successor.stats().path.cwnd);
-        slot.install_successor(
-            predecessor_identity,
-            &predecessor_activity,
-            TcpPoolGeneration::new_successor(
-                successor.clone(),
-                2,
-                1,
-                clock,
-                successor.current_path_generation(),
-                successor_floor,
-            )
-            .expect("the successor must carry at least the current generation's owned floor"),
-            Instant::now(),
-        )
-        .await
-        .unwrap();
-        let draining_path_generation = predecessor.current_path_generation();
-        assert!(matches!(
-            slot.reset_path_if_owned(predecessor_identity).await,
-            TcpPoolPathResetOutcome::Applied {
-                preparation: TcpPoolPathResetPreparation::Draining,
-                ..
-            }
-        ));
-        assert_eq!(
-            predecessor.current_path_generation(),
-            draining_path_generation,
-            "a drain-only predecessor must retain recovery for its existing streams"
-        );
-        assert!(matches!(
-            slot.reset_path_if_owned(TcpPoolTransportIdentity::new(usize::MAX, 99))
-                .await,
-            TcpPoolPathResetOutcome::Rejected(TcpPoolPathResetPreparation::Stale)
-        ));
-
-        predecessor.close(0u32.into(), b"test complete");
-        successor.close(0u32.into(), b"test complete");
-        server_task.await.unwrap();
-        client_endpoint.close(0u32.into(), b"test complete");
     }
 
     #[tokio::test]

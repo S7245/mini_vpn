@@ -1,5 +1,27 @@
 # Errors
 
+## 2026-08-12 - Formal M2 rejected client-forced same-path reset under ACK progress
+
+- Exact-source `fe7b809` passed twenty complete formal cycles and failed cycle
+  22 `tcp-forward` with three Target receiver-zero intervals. Endpoint, D16,
+  TUN, process, routes, DNS, UDP SLI, cleanup, and the paired observer were
+  healthy; this is an architecture discriminator, not an operator or external
+  Exit-to-Target outage.
+- The exact current flow retained ACK progress when black-hole movement
+  authorized `path_changed()`. It reset cwnd `24,285 -> 12,000B`; the later
+  successor correctly proved the inherited `24,285B` floor but could not
+  migrate the already established predecessor stream. The connection-local
+  reset architecture met its explicit rejection rule and was retired.
+- The first focused command combined an unqualified test name with `--exact`
+  and ran zero tests. It was rejected and rerun as a counted test, producing
+  the expected policy RED followed by GREEN.
+- A strict `cargo clippy --all-targets --features harness -- -D warnings`
+  command promoted 17 established lints in untouched code to errors. It was
+  rejected as the known non-gate and replaced by the established warning-
+  tolerant all-target lane, which passed without a new warning from this diff.
+- Result:
+  `docs/tech/2026-08-12-knife15-m2-ack-progress-path-reset-retirement-local-results.md`.
+
 ## 2026-08-12 - A credential-name scan was broader than a credential-value scan
 
 - The first final gate rejected `MINI_VPN_TUIC_PASSWORD` wherever the variable

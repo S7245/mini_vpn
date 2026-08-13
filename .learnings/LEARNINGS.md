@@ -1,5 +1,30 @@
 # Learnings
 
+## 2026-08-12 - Exact ACK progress forbids destructive same-path recovery
+
+- A PLPMTUD black-hole increment is loss evidence, not proof that an unchanged
+  QUIC path is dead. Exact-source `fe7b809` continued acknowledging the
+  business writer when mini_vpn called `path_changed()` and collapsed current
+  cwnd `24,285 -> 12,000B`; three Target receiver-zero intervals followed.
+- Recovery authority must match what can be preserved. An arbitrary
+  established TUIC TCP stream cannot be migrated or replayed onto a successor,
+  so generation replacement protects future flows but cannot rescue a current
+  predecessor flow after its transport state is destroyed.
+- There was no distinct safe policy region for the client-forced reset. Exact
+  ACK stall already selects the stronger Endpoint socket rebind; while ACKs
+  progress, native Quinn loss, Cubic, and PLPMTUD recovery must retain
+  ownership.
+- Paired endpoint evidence remained essential: the Exit-to-Target socket had
+  continuous ACKs, about `1..8ms` RTT, and only a `320.240ms` maximum supply
+  gap. Low one-second application supply came from Mac-to-Exit QUIC, not the
+  Target, Exit, or operator environment.
+- Prefer deletion after an architecture stop rule is hit. Removing the policy,
+  action, executor, slot adapter, and positive tests prevents a later call
+  site from quietly re-authorizing the rejected mechanism without adding a
+  new threshold or replacement mechanism.
+- Result:
+  `docs/tech/2026-08-12-knife15-m2-ack-progress-path-reset-retirement-local-results.md`.
+
 ## 2026-08-12 - A clean short qualification reopens a rare-branch formal gate without proving reachability
 
 - Exact-source `579fff4` passed the whole frozen two-cycle mixed workload with
