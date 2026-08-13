@@ -2283,7 +2283,9 @@ d16_terminal_ownership_is_clean() {
   local log_file="$1"
   # A clean relay task may finish after handing its final lease to smoltcp.
   # Accept that transient state only when the same handle proves an equal
-  # local EOF queue and reaches a zero-queue handle close before reuse.
+  # local EOF queue and then either drains it or proves that the local TCP peer
+  # is terminally closed after D16/pending ownership reached zero. Bytes left
+  # in the latter smoltcp send queue cannot be delivered and are not D16-owned.
   awk '
     function field(prefix, position) {
       for (position = 1; position <= NF; position++) {
@@ -2345,12 +2347,36 @@ d16_terminal_ownership_is_clean() {
       if (handle == "" || drain_phase[handle] == 0) next
       direction = field("direction=")
       reason = field("reason=")
+      pending = field("pending=")
       terminal_reap = field("terminal_pending_reap_bytes=")
+      permit_drop_bytes = field("permit_terminal_drop_bytes=")
+      permit_drop_events = field("permit_terminal_drop_events=")
       send_queue = field("send_queue=")
       if (drain_phase[handle] != 2 ||
           direction != "remote_to_local" || reason != "remote_eof" ||
-          terminal_reap != "0" || send_queue != "0") {
+          pending != "0" || terminal_reap != "0" ||
+          permit_drop_bytes != "0" || permit_drop_events != "0" ||
+          send_queue !~ /^[0-9]+$/) {
         invalid++
+      } else if (send_queue != "0") {
+        close_pending_class = field("close_pending_class=")
+        close_pending_bytes = field("close_pending_bytes=")
+        close_egress_class = field("close_egress_class=")
+        close_egress_bytes = field("close_egress_bytes=")
+        drain_candidate = field("close_egress_drain_candidate=")
+        tcp_state = field("tcp_state=")
+        active = field("active=")
+        can_send = field("can_send=")
+        may_send = field("may_send=")
+        if (send_queue + 0 != drain_bytes[handle] ||
+            close_pending_class != "none" || close_pending_bytes != "0" ||
+            close_egress_class != "terminal_closed_no_send" ||
+            close_egress_bytes !~ /^[0-9]+$/ ||
+            close_egress_bytes + 0 != drain_bytes[handle] ||
+            drain_candidate != "false" || tcp_state != "Closed" ||
+            active != "false" || can_send != "false" || may_send != "false") {
+          invalid++
+        }
       }
       delete drain_phase[handle]
       delete drain_bytes[handle]
@@ -5061,11 +5087,46 @@ EOF_DIRECT_FIXTURE
   printf '%s\n' \
     '🔎 tcp-d16-relay-close handle=SocketHandle(16) epoch=109 terminal_direction=none terminal_reason=clean_queue_lifecycle writer_progress_events=1 writer_progress_bytes=37 writer_wait_max_us=178 half_closed_idle_blocked_events=0 half_closed_idle_blocked_max_payload_bytes=0 queue_queued=0 queue_leased=19456 queue_reserved=0 queue_closed=true' \
     '🔎 tcp-local-eof-close handle=SocketHandle(16) direction=remote_to_local reason=remote_eof send_queue=19456 tcp_state=Established active=true can_send=true can_recv=false may_send=true may_recv=true' \
-    '🔎 tcp-handle-close handle=SocketHandle(16) direction=remote_to_local reason=remote_eof state=Closing pending=0 terminal_pending_reap_bytes=0 tcp_state=Closed active=false send_queue=0 recv_queue=0' \
+    '🔎 tcp-handle-close handle=SocketHandle(16) direction=remote_to_local reason=remote_eof state=Closing pending=0 permit_terminal_drop_bytes=0 permit_terminal_drop_events=0 terminal_pending_reap_bytes=0 tcp_state=Closed active=false send_queue=0 recv_queue=0' \
     >>"$m1_formal_run/mini_vpn.log"
   write_summary "$m1_formal_run"
   grep -Fq -- '- m1_slo_evidence: PASS' "$m1_formal_run/summary.md" || \
     die "self-test: proven post-relay egress drain invalidated the M1 SLO"
+  printf '%s\n' \
+    '🔎 tcp-d16-relay-close handle=SocketHandle(17) epoch=113 terminal_direction=none terminal_reason=clean_queue_lifecycle writer_progress_events=4 writer_progress_bytes=2036 writer_wait_max_us=391 half_closed_idle_blocked_events=0 half_closed_idle_blocked_max_payload_bytes=0 queue_queued=0 queue_leased=24 queue_reserved=0 queue_closed=true' \
+    '🔎 tcp-local-eof-close handle=SocketHandle(17) direction=remote_to_local reason=remote_eof send_queue=24 tcp_state=CloseWait active=true can_send=true can_recv=false may_send=true may_recv=false' \
+    '🔎 tcp-handle-close handle=SocketHandle(17) direction=remote_to_local reason=remote_eof state=Closing pending=0 pending_high=3735 remote_to_global_rx_bytes=0 terminal_late_remote_payload_bytes=0 terminal_late_remote_payload_events=0 flush_attempts=4 no_send_capacity=0 send_window_samples=4 send_capacity_min=1048576 send_capacity_max=1048576 send_queue_max=1374 recv_queue_max=1160 may_send_false=0 may_recv_false=1 no_send_capacity_streak_max=0 no_send_capacity_pending_max=0 send_slice_calls=4 send_slice_accepted=7660 actor_admitted_bytes=7660 actor_bypass_admitted_bytes=0 permit_terminal_drop_bytes=0 permit_terminal_drop_events=0 send_slice_zero=0 send_slice_errors=0 budget_limited_calls=0 headroom_limited_calls=0 headroom_deferred_bytes=0 drain_credit_granted_bytes=7636 drain_credit_planned_bytes=0 drain_credit_used_bytes=0 drop_credit_debt_bytes=0 drop_credit_debt_paid_bytes=0 drop_credit_blocked_bytes=0 pressure_credit_debt_bytes=0 pressure_credit_debt_paid_bytes=0 pressure_credit_blocked_bytes=0 hard_edge_guard_bytes=15340 hard_edge_guard_limited_calls=0 hard_edge_guard_deferred_bytes=0 send_slice_max_accepted=3735 tun_flush_tx_calls=0 tun_flush_tx_failures=0 tun_flush_deferred=0 close_pending_class=none close_pending_bytes=0 terminal_pending_reap_bytes=0 close_egress_class=terminal_closed_no_send close_egress_bytes=24 close_egress_drain_candidate=false tcp_state=Closed active=false can_send=false can_recv=false may_send=false may_recv=false send_capacity=1048576 send_queue=24 recv_queue=0' \
+    >>"$m1_formal_run/mini_vpn.log"
+  write_summary "$m1_formal_run"
+  grep -Fq -- '- m1_slo_evidence: PASS' "$m1_formal_run/summary.md" || \
+    die "self-test: proven terminal local-close ownership transfer invalidated the M1 SLO"
+  cp "$m1_formal_run/mini_vpn.log" "$m1_formal_run/mini_vpn.terminal.log"
+  sed -i '' \
+    '/tcp-handle-close handle=SocketHandle[(]17[)]/ s/permit_terminal_drop_bytes=0/permit_terminal_drop_bytes=1/' \
+    "$m1_formal_run/mini_vpn.log"
+  write_summary "$m1_formal_run"
+  grep -Fq -- '- m1_slo_evidence: MISMATCH' \
+    "$m1_formal_run/summary.md" || \
+    die "self-test: terminal local-close permit drop met the M1 SLO"
+  mv "$m1_formal_run/mini_vpn.terminal.log" "$m1_formal_run/mini_vpn.log"
+  cp "$m1_formal_run/mini_vpn.log" "$m1_formal_run/mini_vpn.terminal.log"
+  sed -i '' \
+    '/tcp-handle-close handle=SocketHandle[(]17[)]/ s/close_egress_bytes=24/close_egress_bytes=23/' \
+    "$m1_formal_run/mini_vpn.log"
+  write_summary "$m1_formal_run"
+  grep -Fq -- '- m1_slo_evidence: MISMATCH' \
+    "$m1_formal_run/summary.md" || \
+    die "self-test: mismatched terminal local-close egress met the M1 SLO"
+  mv "$m1_formal_run/mini_vpn.terminal.log" "$m1_formal_run/mini_vpn.log"
+  cp "$m1_formal_run/mini_vpn.log" "$m1_formal_run/mini_vpn.terminal.log"
+  sed -i '' \
+    '/tcp-handle-close handle=SocketHandle[(]17[)]/ s/can_send=false/can_send=true/' \
+    "$m1_formal_run/mini_vpn.log"
+  write_summary "$m1_formal_run"
+  grep -Fq -- '- m1_slo_evidence: MISMATCH' \
+    "$m1_formal_run/summary.md" || \
+    die "self-test: send-capable terminal local-close egress met the M1 SLO"
+  mv "$m1_formal_run/mini_vpn.terminal.log" "$m1_formal_run/mini_vpn.log"
   cp "$m1_formal_run/mini_vpn.log" "$m1_formal_run/mini_vpn.drained.log"
   sed -i '' '$d' "$m1_formal_run/mini_vpn.log"
   write_summary "$m1_formal_run"
