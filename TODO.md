@@ -4,7 +4,41 @@
 
 ### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
 
-#### Latest decision (2026-08-12 — current-service handoff qualification passed; formal M2 reopened)
+#### Latest decision (2026-08-12 — formal M2 rejected ACK-progress path reset; retirement ready for qualification)
+
+Exact-source `fe7b809` formal artifact
+`/tmp/mini_vpn_knife15_macos_20260812_102923.tar.gz` (SHA-256
+`eb1888a1...`) passed baseline, direct, smoke, all preflights, twenty complete
+cycles, 181 phases, and cleanup, then cycle 22 `tcp-forward` lost three
+complete Target receiver intervals. Paired Exit SHA-256 `ce2478a...` had zero
+drops and proved continuous low-RTT Exit-to-Target service. Formal M2 remains
+failed and M3 remains blocked.
+
+The exact current flow retained ACK progress, but a PLPMTUD black-hole
+increment authorized `Connection::path_changed()` on an unchanged real path.
+Its cwnd fell `24,285 -> 12,000B`; Target zeros followed. The reviewed
+current-service handoff later worked, but cannot migrate an existing TCP byte
+stream from its draining predecessor. This hits the explicit stop rule and
+rejects connection-local path reset without parameter tuning.
+
+Reviewed `0a3cc9c` removes that authority and all mini_vpn `path_changed()`
+execution while preserving exact ACK-stall/UDP Endpoint rebind, native Quinn
+recovery, replacement, handoff, and drain. All local correctness, transport,
+script, capacity (`240.079 Mbit/s`), and code-review gates pass with no
+unresolved P0/P1. Result:
+`docs/tech/2026-08-12-knife15-m2-ack-progress-path-reset-retirement-local-results.md`.
+
+Next:
+
+1. pull/rebuild the reviewed pushed descendant on the HK Mac;
+2. run exactly one paired `m2-ipv6-check -> baseline -> direct-discriminator
+   -> start -> smoke -> fresh .33 observer start -> m2-qualification ->
+   status -> stop -> observer freeze/bundle`;
+3. reserve about 45 uninterrupted minutes and sync both bundles;
+4. do not run formal M2 or tune/repeat unchanged. A clean qualification only
+   reopens one fresh formal M2.
+
+#### Previous decision (2026-08-12 — current-service handoff qualification passed; formal M2 reopened)
 
 Exact-source `579fff4` artifact
 `/tmp/mini_vpn_knife15_macos_20260812_092030.tar.gz` (SHA-256

@@ -4,7 +4,41 @@
 
 ## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-12)
 
-- **Latest accepted position:** exact-source `579fff4` paired qualification
+- **Latest accepted position:** exact-source `fe7b809` formal artifact
+  `/tmp/mini_vpn_knife15_macos_20260812_102923.tar.gz` (SHA-256
+  `eb1888a1...`) passed baseline, direct, smoke, every preflight, twenty
+  complete cycles, 181 phases, and cleanup before cycle 22 `tcp-forward`
+  produced three complete Target receiver-zero intervals. Formal M2 remains
+  failed; M3 remains blocked.
+- Paired Exit SHA-256 `ce2478a...` captured `35,179,614` packets with zero
+  capture/kernel drops. The exact Exit-to-Target socket kept continuous ACKs,
+  about `1..8ms` RTT, negligible send queue, and no payload-supply gap above
+  `320.240ms`. Mac-to-Exit QUIC supply was insufficient; Target, Exit path,
+  operator, D16, TUN, Endpoint, process, routes, DNS, and cleanup were clean.
+- The exact current flow kept ACK progress. At about 163 seconds, one PLPMTUD
+  black-hole increment nevertheless authorized `Connection::path_changed()`
+  on the unchanged path, collapsing cwnd `24,285 -> 12,000B`. Receiver zeros
+  followed. Replacement later proved the inherited `24,285B` service floor,
+  but the established stream correctly remained on its draining predecessor.
+  This hits the stop rule and rejects connection-local path reset; do not tune
+  or repeat `fe7b809`.
+- Reviewed `0a3cc9c` removes `TcpPathDegraded -> ResetConnectionPath`, its
+  executor/adapter/state, and all mini_vpn `path_changed()` calls. Exact
+  ACK-stall/UDP Endpoint rebind, native Quinn recovery/PLPMTUD, replacement,
+  current-service handoff, and predecessor drain remain unchanged.
+- Root `705+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  established Clippy, shell/runner/observer self-tests, vendored Quinn
+  `40+3 ignored` plus doc `1`, quinn-proto `330` plus docs `3`, root docs,
+  fmt/diff/provenance/secret, exact `240.079 Mbit/s` capacity, and review pass
+  with no unresolved P0/P1. Result:
+  `docs/tech/2026-08-12-knife15-m2-ack-progress-path-reset-retirement-local-results.md`.
+- Pull/rebuild the pushed reviewed descendant and take exactly one paired
+  `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke ->
+  fresh .33 observer start -> m2-qualification -> status -> stop -> observer
+  freeze/bundle`. Do not run formal M2 or repeat/tune unchanged. A clean
+  qualification only reopens one fresh formal M2.
+
+- **Previous accepted position:** exact-source `579fff4` paired qualification
   artifact `/tmp/mini_vpn_knife15_macos_20260812_092030.tar.gz` (SHA-256
   `c6d9c339...`) passed baseline `38.274/61.255 Mbit/s`, bounded direct at
   `19.125 Mbit/s`, smoke, every preflight, two cycles/eight phases, two DNS

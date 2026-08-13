@@ -2,7 +2,8 @@
 
 Date: 2026-08-12
 
-Status: **TASKS 1-6 COMPLETE; COMMIT/PUSH NEXT; FORMAL M2 AND M3 BLOCKED**
+Status: **TASKS 1-7 COMPLETE; PAIRED QUALIFICATION NEXT; FORMAL M2 AND M3
+BLOCKED**
 
 Architecture:
 `docs/tech/2026-08-12-knife15-m2-ack-progress-path-reset-retirement-architecture-spec.md`.
@@ -59,7 +60,7 @@ errors.
 
 ## Task 7: Commit, push, and next acceptance
 
-Create one coherent conventional commit and push the current branch. Because
-Rust production recovery behavior changes, the next Mac action is one fresh
-paired `m2-qualification`, not formal M2. A clean qualification reopens one
-fresh formal M2; M3 remains blocked until formal M2 and cleanup pass.
+Completed in reviewed commit `0a3cc9c`. Because Rust production recovery
+behavior changed, the next Mac action is one fresh paired
+`m2-qualification`, not formal M2. A clean qualification reopens one fresh
+formal M2; M3 remains blocked until formal M2 and cleanup pass.

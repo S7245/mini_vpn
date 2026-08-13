@@ -2,14 +2,14 @@
 
 Date: 2026-07-30
 
-Status: **FORMAL M2 READY ON A CLEAN REVIEWED DESCENDANT OF `579fff4` — the
-paired two-cycle qualification is complete and must not be repeated**
+Status: **PAIRED M2 QUALIFICATION REQUIRED ON A CLEAN REVIEWED DESCENDANT OF
+`0a3cc9c` — FORMAL M2 MUST NOT RUN YET**
 
-This is the reviewed formal M2 sequence. The current next run is the frozen
-24-hour workload, which uses the controlled IPv4 full tunnel and temporarily
-changes the active physical network service DNS. Reserve about 25 wall-clock
-hours. `stop` is mandatory even after a successful `m2` because cleanup is
-part of formal acceptance.
+This is the reviewed sequence for the current non-acceptance qualification.
+It uses the controlled IPv4 full tunnel and temporarily changes the active
+physical network service DNS. Reserve about 45 wall-clock minutes. `stop` is
+mandatory after `m2-qualification`; a clean result only reopens one later
+formal M2 and does not itself accept M2.
 
 ## Before Opening The Test Terminal
 
@@ -28,12 +28,12 @@ part of formal acceptance.
    pre-start failure; once `start` is invoked, restore only after `stop`, using
    the exact procedure below.
 
-Do not terminate macOS system daemons manually. Formal `m2` has an exact
-controlled-lifecycle preflight: only runner-owned iperf and HTTP relays must
-drain, while ambient system/App relay and fake-IP counts remain recorded
-observations. If it fails, preserve evidence and run `status/snapshot/stop`;
-the evidence distinguishes controlled ownership, malformed replay, Endpoint
-debt, and DNS drops.
+Do not terminate macOS system daemons manually. The qualification has the
+same exact controlled-lifecycle preflight as formal `m2`: only runner-owned
+iperf and HTTP relays must drain, while ambient system/App relay and fake-IP
+counts remain recorded observations. If it fails, preserve evidence and run
+`status/snapshot/stop`; the evidence distinguishes controlled ownership,
+malformed replay, Endpoint debt, and DNS drops.
 
 Slow HK bandwidth is not itself a bug. The baseline derives offered rates, and
 M2 judges continuity, UDP loss, lifecycle, resources, routes, and cleanup.
@@ -50,7 +50,7 @@ git switch codex/knife14d-downlink-reap-open
 git pull --ff-only origin codex/knife14d-downlink-reap-open
 git status --short
 git rev-parse HEAD
-git merge-base --is-ancestor 579fff4 HEAD && echo 'PASS: M2 source accepted'
+git merge-base --is-ancestor 0a3cc9c HEAD && echo 'PASS: M2 source accepted'
 
 unset M0_BASELINE_DIR M0_DIRECT_DIR
 unset M1_BASELINE_DIR M1_DIRECT_DIR
@@ -224,34 +224,36 @@ Export its `direct_dir`, for example:
 export M2_DIRECT_DIR='/tmp/mini_vpn_knife15_macos_direct_REPLACE_WITH_ACTUAL_TIMESTAMP'
 ```
 
-Continue immediately. M2 must consume this evidence within 15 minutes.
+Continue immediately. The qualification must consume this evidence within 15
+minutes.
 If the direct discriminator fails, no TUN was started; preserve its directory
 and restore IPv6 using the pre-start branch in section 8.
 
-## 6. Start, Smoke, And Formal M2
+## 6. Start, Smoke, And Paired M2 Qualification
 
 Before `start`, confirm that the `.33` Exit and `.77` Target services can stay
-powered and reachable for about 25 hours. Formal M2 now requires one fresh v2
-Exit observer. It records bounded recent Target/TUIC packets plus per-second
-four-direction counters and is automatically frozen/bundled when `m2` exits.
-Do not reuse an expired observer directory.
+powered and reachable for about 45 minutes. The qualification requires one
+fresh v2 Exit observer. It records bounded recent Target/TUIC packets plus
+per-second four-direction counters. Do not reuse an expired observer
+directory.
 
 ```bash
 sudo -v
 sudo -E bash scripts/knife15-macos-soak.sh start
 sudo -E bash scripts/knife15-macos-soak.sh smoke
 OBSERVER_TIMEOUT_SECS=93600 bash scripts/knife15-exit-target-observer.sh start
-caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2
+caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2-qualification
 ```
 
-Start the observer only after smoke passes, then invoke `m2` promptly. Formal
-preflight rejects a mismatched Exit/Target/port, any dead observer component,
-and an observer older than 900 seconds. It also requires
+Start the observer only after smoke passes, then invoke `m2-qualification`
+promptly. The preflight rejects a mismatched Exit/Target/port, any dead
+observer component, and an observer older than 900 seconds. It also requires
 `EXIT_SSH_HOST` to match the recorded Exit IP. If observer start fails, do not
-run `m2`; preserve its output and continue with Mac `status/snapshot/stop`.
+run the qualification; preserve its output and continue with Mac
+`status/snapshot/stop`.
 
 Do not press `Ctrl+C`, close the terminal, start Clash, or change the network.
-Before starting the formal schedule, `m2` waits up to the
+Before starting the qualification schedule, `m2-qualification` waits up to the
 existing smoke hard timeout (normally about 50 seconds) for fresh Endpoint
 conservation, zero
 runner-controlled TCP relays, valid lifecycle replay, and zero DNS drops.
@@ -259,19 +261,22 @@ Ambient Apple/system relays and fake-IP entries are allowed and recorded. A
 failure here saves a long run and leaves the TUN/full tunnel available
 for `status/snapshot/stop`.
 
-The formal schedule runs for 86,400 planned seconds across steady, quiet,
-churn, idle/resume, DNS/HTTPS, and final-drain windows. The runner samples
-process, utun, Endpoint, Exit, gateway, and physical-interface evidence every
-30 seconds. A traffic success remains `PENDING_CLEANUP` until `stop` restores
-owned DNS/routes, removes the TUN, and finalizes the immutable bundle.
+The qualification runs exactly two mixed cycles with eight traffic phases,
+two DNS checks, and two real-client checks. It normally takes about 30 minutes.
+The runner samples process, utun, Endpoint, Exit, gateway, and physical-
+interface evidence every 30 seconds. A traffic success remains
+`PENDING_CLEANUP` until `stop` restores owned DNS/routes, removes the TUN, and
+finalizes the immutable bundle. Its successful verdict is
+`PASS_NON_ACCEPTANCE`, not formal acceptance.
 
-During M2, the Mac's public IPv4 should be the Exit VPS. That is expected.
+During the qualification, the Mac's public IPv4 should be the Exit VPS. That
+is expected.
 The runner blocks a routable physical IPv6 path instead of claiming a
 dual-stack leak-free result.
 
 ## 7. Mandatory Status And Stop
 
-After `m2` returns, successful or failed:
+After `m2-qualification` returns, successful or failed:
 
 ```bash
 sudo -E bash scripts/knife15-macos-soak.sh status
@@ -283,10 +288,15 @@ secrets, creates one immutable bundle, and prints its SHA-256. Only a complete
 formal workload with a valid pre-stop verdict and successful cleanup becomes
 `formal_m2_acceptance: PASS`.
 
-The `m2` action also prints the remote Exit observer bundle path and SHA-256
-inside `m2-exit-observer-finalization.txt`. Sync that remote bundle together
-with the Mac bundle; do not run a second observer `stop` or `bundle` after
-successful automatic finalization.
+After Mac `stop` succeeds, freeze and bundle the paired observer explicitly:
+
+```bash
+bash scripts/knife15-exit-target-observer.sh freeze
+bash scripts/knife15-exit-target-observer.sh bundle
+```
+
+Sync the printed Exit observer bundle together with the Mac bundle. Do not
+start another observer until both paths and checksums have been preserved.
 
 Send both lines:
 
@@ -328,8 +338,8 @@ service and mode; do not source or `eval` that file.
 
 ## Failure Procedure
 
-If `start`, `smoke`, or `m2` fails, do not retry and do not tune any value.
-Run:
+If `start`, `smoke`, or `m2-qualification` fails, do not retry and do not tune
+any value. Run:
 
 ```bash
 sudo -E bash scripts/knife15-macos-soak.sh status || true
@@ -357,7 +367,7 @@ build/self-test/preflight   about 1–3 minutes
 baseline                    about 40–90 seconds
 direct discriminator        a little over 5 minutes
 start + smoke               about 1–2 minutes
-formal m2                   about 25 wall-clock hours
+m2 qualification           about 30 minutes
 status + stop + bundle      about 1–3 minutes
 IPv6 restoration           about 1 minute
 ```
