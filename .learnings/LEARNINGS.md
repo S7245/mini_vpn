@@ -1,5 +1,24 @@
 # Learnings
 
+## 2026-08-14 - Resource identity must be copied and evidence-bound before TUN ownership
+
+- A provider name, ASN, route product, or 64-character digest is only a claim.
+  Copy the input profile first, then require sanitized provider/route evidence
+  files—and saturation/capacity evidence for a same-route exception—to match
+  the claimed hashes.
+- Keep resource admission outside the root-owned TUN runner. A nonsudo,
+  read-only preflight can verify source, client/direct/observer/server hashes,
+  endpoint/Target/SSH/interface identity, service health, and remote resource
+  evidence without creating route or cleanup regression risk.
+- Exact evidence tools must reject option-shaped SSH identities, symlinked
+  inputs, mutable post-copy reads, substituted network binaries, Python path
+  poisoning, and credential-like assignments before sealing an archive.
+- Test fixtures that use public-looking IPs and synthetic hashes are strictly
+  parser evidence. They can never be promoted to a real resource manifest.
+
+Result:
+`docs/tech/2026-08-14-knife15-m2-resource-admission-local-results.md`.
+
 ## 2026-08-14 - Bound strict path experiments before changing the product SLI
 
 - When the selected failure is loss/congestion on Mac-to-Exit and the Exit is

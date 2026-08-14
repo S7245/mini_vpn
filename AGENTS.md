@@ -189,6 +189,17 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-14:
 
+- Tiered-resource Tasks 1–2 are complete through `c688ce3`. The closed
+  resource-profile schema accepts only a different provider and ASN, an
+  independently contracted route, or a hash-proved saturation replacement.
+  The isolated nonsudo preflight binds copied provider/route evidence, exact
+  source/binary/direct/observer/server hashes, endpoint/Target/SSH/interface,
+  remote service health, resource evidence, secret scan, and immutable bundle.
+- The root/TUN runner and strict `m2` SLI are unchanged. Complete profile,
+  preflight, and unchanged macOS-runner self-tests pass; code review has no
+  unresolved P0/P1. No real candidate has been admitted. Task 3 must bind
+  strict qualification/formal runs to the admitted profile before any Mac
+  long test.
 - The user canceled mature-client/commercial-VPN comparison and accepted a
   two-tier continuity strategy. Do not run the implemented C0 harness or ask
   the user to open a TUIC client. Its reviewed complete-interval reducer may
@@ -217,6 +228,8 @@ Current Knife15 summary, as of 2026-08-14:
   `docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-spec.md`
   and
   `docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-implementation-plan.md`.
+  Task-2 result:
+  `docs/tech/2026-08-14-knife15-m2-resource-admission-local-results.md`.
 - Exact-source `cdbfe36` formal artifact
   `/tmp/mini_vpn_knife15_macos_20260814_014536.tar.gz` (SHA-256
   `2c002684...`) passed baseline `32.701/56.515 Mbit/s`, bounded direct

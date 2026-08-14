@@ -1,7 +1,7 @@
 # Knife15 M2 Tiered Continuity And Resource Strategy Implementation Plan
 
-Status: **TASK 1 COMPLETE; TASK 2 RESOURCE-MANIFEST TDD IS NEXT; FORMAL M2 AND
-M3 REMAIN BLOCKED**
+Status: **TASKS 1–2 COMPLETE THROUGH `c688ce3`; TASK 3 STRICT-RUN PROFILE
+BINDING IS NEXT; FORMAL M2 AND M3 REMAIN BLOCKED**
 
 > **For agentic workers:** use `diagnose` and `tdd` for each behavior change;
 > use `code-review` before requesting a long macOS run.

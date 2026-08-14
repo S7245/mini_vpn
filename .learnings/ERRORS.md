@@ -1,5 +1,19 @@
 # Errors
 
+## 2026-08-14 - Initial resource preflight trusted identity claims without their evidence files
+
+- The first local draft structurally validated provider/ASN, route, and
+  saturation digest fields, but an arbitrary well-formed digest could still
+  make a same-route saturation replacement look eligible. It also read the
+  original profiles again after copying them and accepted option-shaped SSH
+  destinations.
+- These issues were found in concentrated review before commit or any real
+  resource/VPS action. No false candidate was admitted and no external state
+  changed.
+- The repair binds copied provider/route and optional saturation/capacity
+  evidence files to the exact digests, performs all classification and reads
+  from the copies, and restricts SSH identity plus production network tools.
+
 ## 2026-08-14 - An unexecuted comparison route remained active after the product decision changed
 
 - The market-calibration harness was correctly implemented and reviewed, but
