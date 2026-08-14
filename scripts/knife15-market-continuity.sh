@@ -989,7 +989,7 @@ observer_call_to_file() {
 
 start_observer_and_bind() {
   local evidence_dir="$1" observer_script="$2" target="$3" iperf_port="$4"
-  local tuic_port="$5" start_text status_text remote_run_dir
+  local tuic_port="$5" start_text status_text remote_run_dir recovery_status
   [[ -d "$evidence_dir" && ! -L "$evidence_dir" ]] || return 1
   MARKET_OBSERVER_ARMED=0
   MARKET_OBSERVER_FINALIZE_ATTEMPTED=0
@@ -1010,9 +1010,24 @@ start_observer_and_bind() {
     return 1
   fi
   start_text="$(sed -n '1,40p' "$evidence_dir/observer-start.txt")"
-  remote_run_dir="$(value_from_text "$start_text" run_dir)" || return 1
-  [[ "$remote_run_dir" =~ ^/tmp/mini_vpn_knife15_exit_target_observer_[0-9]{8}_[0-9]{6}$ ]] || \
+  if ! remote_run_dir="$(value_from_text "$start_text" run_dir 2>/dev/null)" || \
+    [[ ! "$remote_run_dir" =~ ^/tmp/mini_vpn_knife15_exit_target_observer_[0-9]{8}_[0-9]{6}$ ]]; then
+    if observer_call_to_file \
+      "$evidence_dir/observer-start-recovery-status.txt" 30 \
+      "$observer_script" status "$target" "$iperf_port" "$tuic_port"; then
+      recovery_status="$(sed -n '1,80p' \
+        "$evidence_dir/observer-start-recovery-status.txt")"
+      remote_run_dir="$(value_from_text "$recovery_status" run_dir \
+        2>/dev/null || true)"
+      if [[ "$remote_run_dir" =~ ^/tmp/mini_vpn_knife15_exit_target_observer_[0-9]{8}_[0-9]{6}$ ]] && \
+        observer_status_is_valid "$recovery_status" "$target" "$iperf_port" \
+          "$tuic_port" "$remote_run_dir"; then
+        MARKET_OBSERVER_REMOTE_RUN_DIR="$remote_run_dir"
+        MARKET_OBSERVER_ARMED=1
+      fi
+    fi
     return 1
+  fi
   MARKET_OBSERVER_REMOTE_RUN_DIR="$remote_run_dir"
   MARKET_OBSERVER_ARMED=1
   grep -Fxq 'PASS: Exit observer started' \
@@ -1965,6 +1980,7 @@ EOF_NETWORK
     '  start)' \
     '    [[ ! -e "$MARKET_TEST_OBSERVER_STATE" ]] || exit 1' \
     '    printf "active\n" >"$MARKET_TEST_OBSERVER_STATE"' \
+    '    if [[ "${MARKET_TEST_OBSERVER_MALFORM_START:-}" == 1 ]]; then printf "PASS: Exit observer started\n"; exit 0; fi' \
     '    printf "PASS: Exit observer started\nrun_dir=%s\ntcpdump_pid=11\nsampler_pid=12\ncounter_sampler_pid=13\n" "$MARKET_TEST_OBSERVER_RUN_DIR"' \
     '    ;;' \
     '  status)' \
@@ -1996,6 +2012,22 @@ EOF_NETWORK
   [[ "$(awk 'END {print NR}' "$observer_actions")" == 1 ]] || \
     die "self-test: pre-existing observer was mutated"
   rm -f "$MARKET_TEST_OBSERVER_STATE" "$observer_actions"
+  export MARKET_TEST_OBSERVER_MALFORM_START=1
+  observer_evidence="$tmp/observer-malformed-start"
+  mkdir "$observer_evidence"
+  if start_observer_and_bind "$observer_evidence" "$observer_mock" \
+    43.130.32.77 5201 8443; then
+    die "self-test: malformed observer start evidence was accepted"
+  fi
+  [[ "$MARKET_OBSERVER_ARMED" == 1 ]] || \
+    die "self-test: successfully started observer could not be recovered"
+  finalize_bound_observer "$observer_evidence" "$observer_mock" \
+    43.130.32.77 5201 8443 malformed-start || \
+    die "self-test: recovered observer could not be finalized"
+  [[ ! -e "$MARKET_TEST_OBSERVER_STATE" ]] || \
+    die "self-test: malformed-start observer leaked remote ownership"
+  unset MARKET_TEST_OBSERVER_MALFORM_START
+  rm -f "$observer_actions"
   observer_evidence="$tmp/observer-owned"
   mkdir "$observer_evidence"
   start_observer_and_bind "$observer_evidence" "$observer_mock" \
