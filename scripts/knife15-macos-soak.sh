@@ -3306,10 +3306,10 @@ runner_self_test() {
   resource_observer_sha="$(sha256_file "$M2_EXIT_OBSERVER_SCRIPT")"
   mkdir "$resource_evidence"
   printf '%s\n' 'schema=knife15-direct-fixture-v1' >"$resource_direct"
-  printf '%s\n' 'provider=independent-provider' \
-    >"$resource_evidence/provider-identity.txt"
-  printf '%s\n' 'route_contract=candidate-premium-a' \
-    >"$resource_evidence/route-identity.txt"
+  cp "$SCRIPT_DIR/fixtures/knife15-m2-resource/distinct-provider-identity.txt" \
+    "$resource_evidence/provider-identity.txt"
+  cp "$SCRIPT_DIR/fixtures/knife15-m2-resource/distinct-route-identity.txt" \
+    "$resource_evidence/route-identity.txt"
   resource_provider_sha="$(sha256_file \
     "$resource_evidence/provider-identity.txt")"
   resource_route_sha="$(sha256_file "$resource_evidence/route-identity.txt")"
@@ -3333,6 +3333,11 @@ runner_self_test() {
     --reference "$resource_evidence/reference-profile.json" \
     --candidate "$resource_candidate" \
     >"$resource_evidence/eligibility.json"
+  /usr/bin/python3 -I "$M2_RESOURCE_PROFILE_HELPER" validate-evidence \
+    --candidate "$resource_candidate" \
+    --provider-evidence "$resource_evidence/provider-identity.txt" \
+    --route-evidence "$resource_evidence/route-identity.txt" \
+    >"$resource_evidence/evidence-binding.json"
   cp "$resource_direct" "$resource_evidence/direct-manifest.txt"
   printf '%s\n' \
     'route to: 1.1.1.1' 'interface: en0' \
@@ -3373,6 +3378,8 @@ runner_self_test() {
     "profile_helper_sha256=$(sha256_file "$M2_RESOURCE_PROFILE_HELPER")" \
     "preflight_runner_sha256=$(sha256_file "$M2_RESOURCE_PREFLIGHT_RUNNER")" \
     "eligibility_sha256=$(sha256_file "$resource_evidence/eligibility.json")" \
+    "evidence_binding_sha256=$(sha256_file \
+      "$resource_evidence/evidence-binding.json")" \
     "provider_identity_sha256=$resource_provider_sha" \
     "route_identity_sha256=$resource_route_sha" \
     "remote_sha256=$(sha256_file "$resource_evidence/remote.txt")" \
@@ -3384,6 +3391,7 @@ runner_self_test() {
   : >"$resource_evidence/SHA256SUMS"
   for resource_file in \
     reference-profile.json candidate-profile.json eligibility.json \
+    evidence-binding.json \
     direct-manifest.txt provider-identity.txt route-identity.txt \
     exit.route.txt target.route.txt exit.traceroute.txt target.traceroute.txt \
     remote.txt remote.stderr secret-scan.txt result.txt; do
@@ -8204,6 +8212,7 @@ m2_resource_result_value() {
 m2_resource_evidence_name_is_allowed() {
   case "${1:-}" in
     reference-profile.json|candidate-profile.json|eligibility.json|\
+    evidence-binding.json|\
     direct-manifest.txt|provider-identity.txt|route-identity.txt|\
     prior-saturation.txt|replacement-capacity.txt|exit.route.txt|\
     target.route.txt|exit.traceroute.txt|target.traceroute.txt|remote.txt|\
@@ -8272,6 +8281,7 @@ m2_resource_evidence_is_valid() {
   local expected_iperf_port="${9:-}" expected_interface="${10:-}"
   local required_file evidence_file evidence_name expected_eligibility
   local observed_eligibility candidate_validation reference_validation
+  local observed_evidence_binding expected_evidence_binding
   local candidate_profile_sha reference_profile_sha eligibility_reason
   local result_file result_text remote_file candidate_file reference_file
   local actual_sha expected_sha result_key remote_cpu remote_memory
@@ -8279,6 +8289,7 @@ m2_resource_evidence_is_valid() {
   [[ -d "$evidence_dir" && ! -L "$evidence_dir" ]] || return 1
   for required_file in \
     reference-profile.json candidate-profile.json eligibility.json \
+    evidence-binding.json \
     direct-manifest.txt provider-identity.txt route-identity.txt \
     exit.route.txt target.route.txt exit.traceroute.txt target.traceroute.txt \
     remote.txt remote.stderr secret-scan.txt result.txt SHA256SUMS; do
@@ -8302,6 +8313,14 @@ m2_resource_evidence_is_valid() {
   [[ "$observed_eligibility" == "$expected_eligibility" && \
     "$(m2_resource_json_value "$evidence_dir/eligibility.json" eligible)" == \
       true ]] || return 1
+  observed_evidence_binding="$(tr -d '\n' \
+    <"$evidence_dir/evidence-binding.json")"
+  expected_evidence_binding="$(/usr/bin/python3 -I \
+    "$M2_RESOURCE_PROFILE_HELPER" validate-evidence \
+    --candidate "$candidate_file" \
+    --provider-evidence "$evidence_dir/provider-identity.txt" \
+    --route-evidence "$evidence_dir/route-identity.txt")" || return 1
+  [[ "$observed_evidence_binding" == "$expected_evidence_binding" ]] || return 1
   candidate_validation="$(/usr/bin/python3 -I \
     "$M2_RESOURCE_PROFILE_HELPER" validate "$candidate_file")" || return 1
   reference_validation="$(/usr/bin/python3 -I \
@@ -8377,14 +8396,18 @@ m2_resource_evidence_is_valid() {
     "$(m2_resource_result_value "$result_file" profile_helper_sha256)" == \
       "$(sha256_file "$M2_RESOURCE_PROFILE_HELPER")" && \
     "$(m2_resource_result_value "$result_file" preflight_runner_sha256)" == \
-      "$(sha256_file "$M2_RESOURCE_PREFLIGHT_RUNNER")" ]] || return 1
+      "$(sha256_file "$M2_RESOURCE_PREFLIGHT_RUNNER")" && \
+    "$(m2_resource_result_value "$result_file" evidence_binding_sha256)" == \
+      "$(sha256_file "$evidence_dir/evidence-binding.json")" ]] || return 1
   [[ "$result_text" != *$'\n\n'* ]] || return 1
 
   for evidence_name in \
-    eligibility.json provider-identity.txt route-identity.txt remote.txt \
+    eligibility.json evidence-binding.json provider-identity.txt \
+    route-identity.txt remote.txt \
     exit.route.txt target.route.txt exit.traceroute.txt target.traceroute.txt; do
     case "$evidence_name" in
       eligibility.json) result_key=eligibility_sha256 ;;
+      evidence-binding.json) result_key=evidence_binding_sha256 ;;
       provider-identity.txt) result_key=provider_identity_sha256 ;;
       route-identity.txt) result_key=route_identity_sha256 ;;
       remote.txt) result_key=remote_sha256 ;;
