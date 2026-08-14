@@ -122,6 +122,7 @@ RESOURCE_IDENTITY_FIELDS = (
     "target_iperf_port",
     "server_binary_sha256",
     "server_config_sha256",
+    "mac_interface",
     "prior_saturation_proven",
     "prior_saturation_evidence_sha256",
     "replacement_capacity_proven",
@@ -1948,6 +1949,16 @@ def self_test() -> None:
     )
     with tempfile.TemporaryDirectory(prefix="knife15-m2-ledger-") as tmp:
         artifact_root = Path(tmp)
+        resource_fixture = read_json(
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "knife15-m2-resource"
+            / "distinct-provider.json"
+        )
+        changed_interface = json.loads(canonical_json(resource_fixture))
+        changed_interface["mac_interface"] = "en5"
+        if resource_identity(resource_fixture) == resource_identity(changed_interface):
+            raise AssertionError("Mac physical-interface drift kept one resource identity")
         empty = read_json(fixture_path("ledger-template.json"))
         assert evaluate(empty, artifact_root)["status"] == "TIER_A_PENDING"
         ledgers: dict[str, dict[str, Any]] = {}
