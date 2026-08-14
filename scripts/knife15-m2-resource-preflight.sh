@@ -101,14 +101,13 @@ tuic_server_parts() {
 }
 
 tuic_handshake_probe_is_valid() {
-  local output="$1" stderr_file="$2" target="$3" port="$4"
+  local output="$1" stderr_file="$2" target="$3" port="$4" report_pattern
+  report_pattern="^tuic_tcp_sink_probe target=$target:$port requested_duration_secs=1 elapsed_ms=[0-9]+ bytes=[0-9]+ read_mbps=[0-9]+\\.[0-9]{3} reads=[0-9]+ first_rx_ms=(none|[0-9]+) max_read_gap_ms=[0-9]+ eof=(true|false)$"
   [[ -f "$output" && ! -L "$output" && \
     -f "$stderr_file" && ! -L "$stderr_file" && \
     ! -s "$stderr_file" && \
-    "$(awk 'END {print NR + 0}' "$output")" == 1 ]] || return 1
-  grep -Eq \
-    "^tuic_tcp_sink_probe target=$target:$port requested_duration_secs=1 elapsed_ms=[0-9]+ bytes=[0-9]+ read_mbps=[0-9]+\\.[0-9]{3} reads=[0-9]+ first_rx_ms=(none|[0-9]+) max_read_gap_ms=[0-9]+ eof=(true|false)$" \
-    "$output"
+    "$(grep -Ec "$report_pattern" "$output" || true)" == 1 ]] || return 1
+  tail -n 1 "$output" | grep -Eq "$report_pattern"
 }
 
 run_tuic_handshake_probe() {
@@ -177,6 +176,7 @@ runner_self_test() {
   cat >"$tmp/mini_vpn-probe" <<'EOF_FAKE_TUIC_PROBE'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >"$M2_TEST_PROBE_ARGS"
+printf '%s\n' 'fixture QUIC startup diagnostic'
 printf '%s\n' \
   'tuic_tcp_sink_probe target=43.130.32.77:5201 requested_duration_secs=1 elapsed_ms=1000 bytes=0 read_mbps=0.000 reads=0 first_rx_ms=none max_read_gap_ms=0 eof=false'
 EOF_FAKE_TUIC_PROBE

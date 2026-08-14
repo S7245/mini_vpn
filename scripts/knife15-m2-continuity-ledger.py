@@ -844,7 +844,14 @@ def validate_mac_bundle(attempt: dict[str, Any], artifact_root: Path) -> None:
             r"reads=[0-9]+ first_rx_ms=(?:none|[0-9]+) "
             r"max_read_gap_ms=[0-9]+ eof=(?:true|false)"
         )
-        if len(probe_lines) != 1 or probe_pattern.fullmatch(probe_lines[0]) is None:
+        matching_probe_lines = [
+            line for line in probe_lines if probe_pattern.fullmatch(line) is not None
+        ]
+        if (
+            len(matching_probe_lines) != 1
+            or not probe_lines
+            or probe_lines[-1] != matching_probe_lines[0]
+        ):
             raise LedgerError("resource TUIC handshake probe is malformed")
         if archive.bytes(f"{resource_dir}/tuic-handshake-probe.stderr.txt"):
             raise LedgerError("resource TUIC handshake probe wrote stderr")
@@ -1560,6 +1567,7 @@ def make_valid_evidence_attempt(artifact_root: Path, role: str) -> dict[str, Any
         "valid": True,
     }
     tuic_handshake_probe = (
+        b"fixture QUIC startup diagnostic\n"
         b"tuic_tcp_sink_probe target=43.130.32.77:5201 "
         b"requested_duration_secs=1 elapsed_ms=1000 bytes=0 "
         b"read_mbps=0.000 reads=0 first_rx_ms=none "

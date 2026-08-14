@@ -3385,6 +3385,7 @@ runner_self_test() {
     'udp_summary_end' 'interface_counters_begin' 'eth0 fixture' \
     'interface_counters_end' >"$resource_evidence/remote.txt"
   printf '%s\n' \
+    'fixture QUIC startup diagnostic' \
     'tuic_tcp_sink_probe target=43.130.32.77:5201 requested_duration_secs=1 elapsed_ms=1000 bytes=0 read_mbps=0.000 reads=0 first_rx_ms=none max_read_gap_ms=0 eof=false' \
     >"$resource_evidence/tuic-handshake-probe.txt"
   : >"$resource_evidence/tuic-handshake-probe.stderr.txt"
@@ -8360,7 +8361,7 @@ m2_resource_evidence_is_valid() {
   local candidate_profile_sha reference_profile_sha eligibility_reason
   local result_file result_text remote_file candidate_file reference_file
   local actual_sha expected_sha result_key remote_cpu remote_memory
-  local bounded_evidence bounded_size
+  local bounded_evidence bounded_size probe_pattern
 
   [[ -d "$evidence_dir" && ! -L "$evidence_dir" ]] || return 1
   for required_file in \
@@ -8513,11 +8514,12 @@ m2_resource_evidence_is_valid() {
   done
   [[ "$(sed -n '1p' "$evidence_dir/secret-scan.txt")" == \
     'PASS: no credential-like assignment found' ]] || return 1
-  [[ "$(awk 'END {print NR + 0}' \
-      "$evidence_dir/tuic-handshake-probe.txt")" == 1 && \
-    "$(sed -n '1p' "$evidence_dir/tuic-handshake-probe.txt")" == \
-      "tuic_tcp_sink_probe target=$expected_target:$expected_iperf_port requested_duration_secs=1 "* && \
-    ! -s "$evidence_dir/tuic-handshake-probe.stderr.txt" ]] || return 1
+  probe_pattern="^tuic_tcp_sink_probe target=$expected_target:$expected_iperf_port requested_duration_secs=1 elapsed_ms=[0-9]+ bytes=[0-9]+ read_mbps=[0-9]+\\.[0-9]{3} reads=[0-9]+ first_rx_ms=(none|[0-9]+) max_read_gap_ms=[0-9]+ eof=(true|false)$"
+  [[ ! -s "$evidence_dir/tuic-handshake-probe.stderr.txt" && \
+    "$(grep -Ec "$probe_pattern" \
+      "$evidence_dir/tuic-handshake-probe.txt" || true)" == 1 ]] || return 1
+  tail -n 1 "$evidence_dir/tuic-handshake-probe.txt" | \
+    grep -Eq "$probe_pattern" || return 1
 
   remote_file="$evidence_dir/remote.txt"
   remote_cpu="$(m2_resource_result_value "$remote_file" cpu_count)" || return 1
