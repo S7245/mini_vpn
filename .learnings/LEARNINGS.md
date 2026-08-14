@@ -1,5 +1,28 @@
 # Learnings
 
+## 2026-08-14 - Long remote Mac tests need process-owned wakefulness and transport-level admission
+
+- `ttyskeepawake=1` does not protect traffic started through a non-TTY SSH
+  command. With system sleep set to one minute, unrelated gateway, Target,
+  Exit, and DNS probes all developed the same multi-second stalls. One bounded,
+  PID-owned `caffeinate -dimsu` assertion removed them. Enforce that assertion
+  before baseline, direct, TUN start, qualification, and formal entry.
+- A healthy remote service and local UDP listener do not prove a public path.
+  A cloud security group can discard every TUIC packet before guest capture.
+  Resource admission therefore needs an actual client handshake,
+  authentication, and stream open from the test Mac before TUN ownership.
+- Cleanup authority differs before and after TUN readiness. If no owned utun
+  identity was recorded, compare the complete pre-start/current utun sets and
+  accept only an exact no-addition result. Any added interface remains
+  ambiguous and must fail closed.
+- Dedicated-host isolation is a whole-environment contract: suppress cloud
+  agents and automatic maintenance only for the bounded window, preserve exact
+  host/service identity, and harden SSH to key-only access when vendor agents
+  are removed.
+
+Result:
+`docs/tech/2026-08-14-knife15-m2-alibaba-candidate1-provisioning-and-preflight-results.md`.
+
 ## 2026-08-14 - Nominal provider preference follows failure-domain eligibility
 
 - No public VPS is truly unbounded: instance NICs, public bandwidth caps,

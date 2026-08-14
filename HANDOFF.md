@@ -4,6 +4,27 @@
 
 ## Next Planned Stage — Knife15 M2 Tiered Resource Continuity (2026-08-14)
 
+- **Latest candidate-1 position:** Alibaba ECS
+  `i-rj9cabfprph7x3sard3z`, EIP `47.89.211.4`, `us-west-1b`, AS45102, and the
+  exact sing-box service are provisioned and healthy. Host key, server hashes,
+  Target reachability, key-only SSH, a real observer lifecycle, and local
+  identity/capacity gates pass. Aegis/Alibaba agents/modules and apt timers are
+  inactive for the dedicated window; sing-box remains active with zero
+  restarts.
+- Qualification is `NOT_RUN`. HK-Mac UDP 8443 probes produce zero guest
+  packets even after Cloud Security Center protection was disabled. Add one
+  Alibaba inbound allow rule for `UDP/8443` from the current HK public IPv4
+  only (`119.13.90.246/32` when last observed), never `0.0.0.0/0`, then require
+  the new live TUIC preflight to pass before TUN.
+- Reviewed repair `74cb1d8` adds that no-TUN handshake/auth/Connect probe,
+  makes baseline/direct/start/qualification/formal fail closed without an
+  active `PreventUserIdleSystemSleep` assertion, and permits pre-ready cleanup
+  only when the utun set is unchanged from its snapshot. Scripts/ledger bind
+  the exact probe evidence. Local shell/self-tests, diff/secret, and review
+  pass with no unresolved P0/P1. No Rust or frozen value changed. Strict source
+  admission now requires `74cb1d8` or a descendant. Result:
+  `docs/tech/2026-08-14-knife15-m2-alibaba-candidate1-provisioning-and-preflight-results.md`.
+
 - **HK Mac is agent-operated:** use
   `ssh -i ~/.ssh/vpn xiaoou@192.168.133.109` and the clean
   `/Users/xiaoou/mini_vpn` worktree. The Desktop clone is unreadable to SSH due
@@ -14,12 +35,12 @@
   echo the password. The user no longer needs to run Mac shell commands.
   Result:
   `docs/tech/2026-08-14-knife15-m2-hk-mac-agent-access-results.md`.
-- **Latest Task-6 position:** `.111` and `.27` are ineligible before traffic:
+- **Previous Task-6 selection:** `.111` and `.27` are ineligible before traffic:
   both are Tencent AS132203 like `.33`; historical Client/Exit roles do not
   create a different failure domain. `.111` also has an unverified changed SSH
   host key and `.27` currently closes SSH. Ordinary Tencent remains
   ineligible; Tencent AIA is a separate costly contracted-route option, not
-  the default VPS. Candidate 1 is selected, but not yet created or admitted:
+  the default VPS. The selected candidate shape was:
   Alibaba Cloud ECS `us-west-1`, `ecs.c8i.large` 2-vCPU/4-GiB Ubuntu 24.04,
   directly attached 200-Mbit/s pay-by-data-transfer EIP. AWS Lightsail is the
   provisioning/candidate-2 fallback. The assigned address must still prove a
@@ -37,13 +58,14 @@
 - Resource comparison rejects drift from the frozen `.33` reference and `.77`
   Target. Provider/route evidence is now semantically matched, `64KiB` bounded,
   post-copy verified, and independently replayed by the root runner and ledger.
-  Strict source admission requires `9909465` or a descendant. The runbook also
+  Historical strict source admission required `9909465` or a descendant. The
+  runbook also
   preserves the exact candidate baseline outside `/tmp`. Root `725+3 ignored`,
   main `2`, integration `10+4 ignored`, release, established Clippy, vendor,
   docs, shell/self-tests, provenance/secret, `240.108 Mbit/s` Endpoint, and
   review pass with no unresolved P0/P1. Rust and strict `receiver_zero == 0`
-  are unchanged. No real candidate is admitted. Task 6 must provision/review
-  candidate 1 before asking for a Mac run. Result:
+  are unchanged. Candidate provisioning has since completed; use the latest
+  position above. Result:
   `docs/tech/2026-08-14-knife15-m2-strict-resource-local-results.md`.
 - **Latest accepted position:** the user canceled mature-client/commercial-VPN
   comparison before C0 and selected a bounded two-tier policy. Do not ask the

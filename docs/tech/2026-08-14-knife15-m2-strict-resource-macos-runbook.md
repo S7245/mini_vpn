@@ -2,8 +2,8 @@
 
 Date: 2026-08-14
 
-Status: **REVIEWED PROCEDURE; DO NOT START UNTIL A REAL CANDIDATE PROFILE AND
-SANITIZED PROVIDER/ROUTE EVIDENCE ARE SUPPLIED**
+Status: **CANDIDATE 1 PROVISIONED; DO NOT START UNTIL ITS CLOUD SECURITY GROUP
+ADMITS HK-MAC UDP 8443 AND THE LIVE TUIC PROBE PASSES**
 
 This is the only active Knife15 Tier-A Mac procedure. The old `.33` formal M2
 runbook and market-client comparison are historical and must not be executed.
@@ -84,6 +84,15 @@ VPS setup and health checks do not use the Mac TUN and may be performed before
 the user session. Do not purchase or count a second candidate until the first
 candidate's ledger state is `rejected`.
 
+Candidate 1 is Alibaba Cloud ECS `i-rj9cabfprph7x3sard3z`, EIP
+`47.89.211.4`, region/zone `us-west-1/us-west-1b`, AS45102, with EIP contract
+`eip-rj9hj9g6dbtxwwxfqmw0t`. Its security group must allow inbound
+`UDP/8443` from the current HK Mac public IPv4 `119.13.90.246/32`. Do not use
+`0.0.0.0/0`. Recheck the Mac public IPv4 immediately before changing the rule;
+if it changed, use the new exact `/32`. A local listener or successful SSH is
+not proof of this rule: the resource preflight's live TUIC handshake is the
+decisive admission.
+
 ## 1. One Clean Test Source Per Candidate
 
 On the HK test Mac, quit Clash completely and disable Clash-TUN and every
@@ -100,7 +109,7 @@ git fetch origin
 git switch codex/knife14d-downlink-reap-open
 git pull --ff-only origin codex/knife14d-downlink-reap-open
 git status --short
-git merge-base --is-ancestor 9909465 HEAD && \
+git merge-base --is-ancestor 74cb1d8 HEAD && \
   echo 'PASS: strict resource source accepted'
 export TEST_SOURCE_COMMIT="$(git rev-parse HEAD)"
 
@@ -125,21 +134,21 @@ qualification and formal runs.
 Export only the reviewed candidate values supplied by the agent:
 
 ```bash
-export M2_CANDIDATE_ID='REPLACE_WITH_CANDIDATE_ID'
-export M2_CANDIDATE_PROVIDER='REPLACE_WITH_PROVIDER'
-export M2_CANDIDATE_RESOURCE_ID='REPLACE_WITH_RESOURCE_ID'
-export M2_CANDIDATE_REGION='REPLACE_WITH_REGION'
-export M2_CANDIDATE_IPV4='REPLACE_WITH_PUBLIC_IPV4'
-export M2_CANDIDATE_ASN='REPLACE_WITH_INTEGER_ASN'
-export M2_CANDIDATE_ROUTE_CLASS='REPLACE_WITH_ROUTE_CLASS'
-export M2_CANDIDATE_ROUTE_CONTRACT_ID='REPLACE_WITH_ROUTE_CONTRACT_ID'
+export M2_CANDIDATE_ID='candidate1-alibaba-usw1'
+export M2_CANDIDATE_PROVIDER='alibaba-cloud'
+export M2_CANDIDATE_RESOURCE_ID='i-rj9cabfprph7x3sard3z'
+export M2_CANDIDATE_REGION='us-west-1'
+export M2_CANDIDATE_IPV4='47.89.211.4'
+export M2_CANDIDATE_ASN='45102'
+export M2_CANDIDATE_ROUTE_CLASS='public-internet'
+export M2_CANDIDATE_ROUTE_CONTRACT_ID='eip-rj9hj9g6dbtxwwxfqmw0t'
 export M2_CANDIDATE_TUIC_PORT=8443
-export M2_SERVER_BINARY_SHA256='REPLACE_WITH_64_HEX'
-export M2_SERVER_CONFIG_SHA256='REPLACE_WITH_64_HEX'
-export M2_PROVIDER_IDENTITY_EVIDENCE='/tmp/REPLACE_provider-identity.txt'
-export M2_ROUTE_IDENTITY_EVIDENCE='/tmp/REPLACE_route-identity.txt'
+export M2_SERVER_BINARY_SHA256='4ea794fddcb2ad84532adeab979a9b0d7b2052822bb3439dfb321c33c941da19'
+export M2_SERVER_CONFIG_SHA256='9aa397471060d1ef11afea858ee2a7550c426a2e133cfee1d2468c55425f33d8'
+export M2_PROVIDER_IDENTITY_EVIDENCE='/tmp/knife15-m2-candidate1-alibaba-usw1-provider-identity.txt'
+export M2_ROUTE_IDENTITY_EVIDENCE='/tmp/knife15-m2-candidate1-alibaba-usw1-route-identity.txt'
 
-export EXIT_SSH_HOST="ubuntu@$M2_CANDIDATE_IPV4"
+export EXIT_SSH_HOST="root@$M2_CANDIDATE_IPV4"
 export EXIT_SSH_KEY="$HOME/.ssh/vpn"
 export M2_EXIT_SERVER_CONFIG_PATH='/etc/sing-box/config.json'
 
@@ -243,6 +252,26 @@ The runner self-test intentionally prints
 `ERROR: command exceeded hard timeout of 1s`; it passes only when the last
 line includes `knife15 macOS runner self-test passed`. These commands start no
 TUN. On failure, preserve output and restore IPv6 through section 9.
+
+Start one global, bounded sleep inhibitor before baseline and keep its exact
+PID in this shell through cleanup. This is mandatory for agent-operated
+non-TTY traffic; `ttyskeepawake` does not cover an SSH command without a TTY.
+
+```bash
+export KNIFE15_CAFFEINATE_SECS=100800
+export KNIFE15_CAFFEINATE_LOG="/tmp/mini_vpn_knife15_caffeinate_${M2_CANDIDATE_ID}_$(date -u '+%Y%m%d_%H%M%S').log"
+nohup /usr/bin/caffeinate -dimsu -t "$KNIFE15_CAFFEINATE_SECS" \
+  >"$KNIFE15_CAFFEINATE_LOG" 2>&1 &
+export KNIFE15_CAFFEINATE_PID=$!
+sleep 2
+kill -0 "$KNIFE15_CAFFEINATE_PID"
+pmset -g assertions | grep 'PreventUserIdleSystemSleep'
+```
+
+Require `PreventUserIdleSystemSleep` to be `1`. The runner independently
+enforces the assertion at baseline, direct, start, qualification, and formal
+entry. If the process exits or the assertion disappears, the attempt is
+environment-invalid and must not start or continue.
 
 ## 4. Candidate Workload Baseline
 
@@ -405,9 +434,11 @@ export M2_RESOURCE_PREFLIGHT_DIR="$OUT_DIR"
 
 Require `PASS: distinct Knife15 M2 resource preflight completed` and preserve
 its directory, tar path, and SHA-256 line. It verifies live physical routes,
-traceroutes, remote health/headroom, exact sing-box hashes/listener, and every
-profile/source/binary/direct/observer identity without changing routes or
-starting TUN. Continue promptly: the M2 action requires the fresh direct
+traceroutes, remote health/headroom, exact sing-box hashes/listener, and a real
+one-second TUIC handshake/authentication/Connect probe to `.77:5201`, plus
+every profile/source/binary/direct/observer identity, without changing routes
+or starting TUN. A security-group or authentication failure therefore stops
+before `start`. Continue promptly: the M2 action requires the fresh direct
 result to be no older than 15 minutes.
 
 ## 6. Start, Smoke, Observer, And The Authorized Action
@@ -432,13 +463,13 @@ observer. Run exactly one action authorized by the ledger state:
 Qualification (about 30 minutes of workload, about 45 minutes overall):
 
 ```bash
-caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2-qualification
+sudo -E bash scripts/knife15-macos-soak.sh m2-qualification
 ```
 
 Formal 1 or formal 2 (86,400-second schedule; reserve about 25 hours):
 
 ```bash
-caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2
+sudo -E bash scripts/knife15-macos-soak.sh m2
 ```
 
 Do not press `Ctrl+C`, close the terminal, start another VPN, change the
@@ -489,6 +520,18 @@ fi
 Preserve and synchronize the Mac and Exit tar bundles plus both checksum
 files. Do not retry or start another candidate until their exact contents are
 classified and sealed in the ledger.
+
+After Mac/observer evidence is safely finalized, stop only the recorded global
+sleep inhibitor and verify the assertion is gone:
+
+```bash
+if ps -p "$KNIFE15_CAFFEINATE_PID" -o command= | \
+  grep -Fq "/usr/bin/caffeinate -dimsu -t $KNIFE15_CAFFEINATE_SECS"; then
+  kill "$KNIFE15_CAFFEINATE_PID"
+fi
+wait "$KNIFE15_CAFFEINATE_PID" 2>/dev/null || true
+pmset -g assertions | grep 'PreventUserIdleSystemSleep' || true
+```
 
 ## 8. Ledger Classification
 

@@ -189,6 +189,20 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-14:
 
+- Alibaba candidate 1 is provisioned as ECS `i-rj9cabfprph7x3sard3z`, EIP
+  `47.89.211.4`, `us-west-1b`, AS45102. Exact host key, sing-box binary/config,
+  key-only SSH, Target reachability, listener, observer lifecycle, and host
+  isolation pass. Qualification is `NOT_RUN`: the Alibaba security group drops
+  HK-Mac UDP 8443 before the guest. Allow only the current HK public `/32`,
+  then require a live TUIC preflight before TUN.
+- Reviewed `74cb1d8` performs the no-TUN TUIC handshake/auth/Connect probe,
+  requires `PreventUserIdleSystemSleep` at baseline/direct/start/M2 entry, and
+  makes pre-ready cleanup prove no new utun. Runner and ledger hash/replay the
+  probe. Local self-tests, diff/secret, and review pass; no Rust production or
+  frozen behavior changed. Strict source admission requires `74cb1d8` or a
+  descendant. Result:
+  `docs/tech/2026-08-14-knife15-m2-alibaba-candidate1-provisioning-and-preflight-results.md`.
+
 - Standing HK Mac execution access is now
   `ssh -i ~/.ssh/vpn xiaoou@192.168.133.109`. The agent may build, run the
   authorized TUN workflow, and collect/analyze logs without asking the user to
@@ -198,12 +212,13 @@ Current Knife15 summary, as of 2026-08-14:
   `/Users/xiaoou/mini_vpn`. Source `a16f661` release build and full runner
   self-test pass; routes to `.33`/`.77` use physical `en0`. Result:
   `docs/tech/2026-08-14-knife15-m2-hk-mac-agent-access-results.md`.
-- Task 6 has rejected `.111` and `.27` before traffic because both remain
+- Earlier Task-6 selection rejected `.111` and `.27` before traffic because
+  both remain
   Tencent AS132203 like `.33`; changing their historical role does not create
   a different provider/ASN failure domain. `.111` also presents an unverified
   changed SSH host key and `.27` currently closes SSH. Ordinary new Tencent
   CVM is ineligible; Tencent AIA is a separate contracted-route option, not
-  the default VPS. Candidate 1 is selected but not admitted: Alibaba Cloud ECS
+  the default VPS. It selected Alibaba Cloud ECS
   `us-west-1`, `ecs.c8i.large` 2-vCPU/4-GiB Ubuntu 24.04, with a directly
   attached 200-Mbit/s pay-by-data-transfer EIP. AWS Lightsail is the fallback.
   Require actual non-AS132203 allocation, out-of-band host-key verification,
@@ -228,16 +243,16 @@ Current Knife15 summary, as of 2026-08-14:
   consecutive valid formal passes. Invalid infrastructure evidence has no
   decision effect.
 - Resource comparison rejects drift from the frozen `.33` reference identity
-  and `.77` Target. Strict runner and ledger source admission require
-  `9909465` or a descendant. The runbook preserves the exact baseline outside
+  and `.77` Target. Historical strict runner and ledger admission required
+  `9909465` or a descendant; the latest floor is above. The runbook preserves
+  the exact baseline outside
   `/tmp`, replays it after reboot, and keeps one candidate source/binary/
   workload/server contract. Rust production and strict `m2` are unchanged.
   Root `725+3 ignored`, main `2`, integration `10+4 ignored`, release, Clippy,
   vendored Quinn `40+3`/doc `1`, quinn-proto `330`/docs `3`, shell/self-tests,
   fmt/diff/provenance/secret, and review pass. Exact Endpoint capacity was
-  `240.108 Mbit/s`, terminal `61,440/0/0B`, zero would-block. No real
-  candidate has been admitted. Task 6 candidate 1 provisioning and read-only
-  admission are next; do not request a Mac long test yet. Result:
+  `240.108 Mbit/s`, terminal `61,440/0/0B`, zero would-block. Candidate 1 has
+  since been provisioned; use the latest position above. Result:
   `docs/tech/2026-08-14-knife15-m2-strict-resource-local-results.md`.
 - The user canceled mature-client/commercial-VPN comparison and accepted a
   two-tier continuity strategy. Do not run the implemented C0 harness or ask

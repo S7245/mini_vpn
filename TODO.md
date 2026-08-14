@@ -6,6 +6,16 @@
 
 #### Latest decision (2026-08-14 — strict resources first, bounded low-frequency SLI second)
 
+Candidate 1 is now provisioned and host/service-ready at Alibaba EIP
+`47.89.211.4` (AS45102). Qualification has not run: the cloud security group
+still drops HK-Mac UDP 8443 before it reaches the guest. The only external
+action is a narrow inbound UDP 8443 allow from the current HK public `/32`.
+After that rule, reviewed source `74cb1d8` must pass its new live no-TUN TUIC
+handshake preflight before any TUN start. It also enforces a global
+`PreventUserIdleSystemSleep` assertion and repairs exact pre-ready cleanup.
+Result:
+`docs/tech/2026-08-14-knife15-m2-alibaba-candidate1-provisioning-and-preflight-results.md`.
+
 The `cdbfe36` formal M2 failure remains genuine and immutable. The user
 canceled the mature-client comparison before C0. The completed comparison
 harness remains historical; do not ask the user to open a TUIC client. Its
@@ -28,12 +38,11 @@ Next:
    bind/limit semantic provider and route evidence, preserve the exact
    baseline outside `/tmp`, and pass complete local review gates;
 5. **IN PROGRESS:** `.111`/`.27` and ordinary new Tencent CVM were rejected as
-   Tencent/AS132203 failure-domain equivalents. Create the selected Alibaba
-   Cloud `us-west-1` `ecs.c8i.large` candidate with a directly attached
-   200-Mbit/s pay-by-data-transfer EIP, verify its actual provider/ASN and host
-   key, then provision and pass read-only resource admission. AWS Lightsail is
-   the fallback; Tencent AIA is only an explicit separately contracted-route
-   option. Selection contract:
+   Tencent/AS132203 failure-domain equivalents. Alibaba candidate 1 is now
+   created, identity-verified, hardened, and service-ready. Add the narrow
+   inbound UDP rule, then pass the external TUIC/resource admission. AWS
+   Lightsail remains candidate-2 fallback only after a genuine candidate-1
+   quality rejection. Selection contract:
    `docs/tech/2026-08-14-knife15-m2-strict-candidate1-resource-selection.md`;
 6. for each, run one strict qualification and, only if clean, two consecutive
    strict 24-hour formal runs; reject the candidate on its first genuine

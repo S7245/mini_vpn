@@ -1,5 +1,33 @@
 # Errors
 
+## 2026-08-14 - Static candidate preflight missed sleep, cloud-filter, and pre-ready cleanup failures
+
+- Two 300-second direct attempts were invalidated when the agent-operated HK
+  Mac slept. The simultaneous local-gateway and multi-destination stalls prove
+  this was host wakefulness, not mini_vpn throughput. A caffeinated 300-second
+  discriminator then passed.
+- The original resource preflight checked SSH, sing-box state, hashes, and the
+  guest UDP listener but did not send a real TUIC handshake. It passed while
+  Alibaba's security group dropped all HK-Mac UDP 8443 traffic. The first TUN
+  start consequently timed out before readiness. A no-TUN live handshake now
+  owns the admission decision.
+- That pre-ready failure had a valid `utun.before` snapshot but no recorded
+  owned utun. The old `stop` path treated missing ownership as a leaked TUN and
+  could not finalize evidence. Cleanup now accepts only an unchanged utun set;
+  any added interface still fails closed.
+- Alibaba Cloud Security Center blocked deliberate removal of an Aegis startup
+  symlink and labeled it destructive client-file activity. After protection
+  was disabled, the bounded host-isolation change and reboot completed. This
+  alert was unrelated to the separate cloud security-group UDP block.
+- A broad `pkill -f /usr/local/aegis/` matched its own remote command and ended
+  that shell before reboot. Use exact process identities and verify the boot ID
+  after any remote maintenance transaction.
+- macOS does not provide GNU `timeout` by default; run bounded capture timeout
+  on the Linux candidate rather than wrapping SSH with a local `timeout`.
+
+No qualification or formal attempt ran, so these invalidations consumed no
+Tier-A evidence slot.
+
 ## 2026-08-14 - GitHub SSH keys were unavailable while HTTPS credentials remained valid
 
 - A docs push using the generic GitHub SSH route and the configured S7245 key
