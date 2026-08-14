@@ -5764,10 +5764,10 @@ EOF_FAKE_EXIT_OBSERVER
     "$observer_exit_run/m2-exit-observer-finalization.txt" || \
     die "self-test: formal M2 unexpected-exit reason missing"
   M2_EXIT_OBSERVER_SCRIPT="$original_m2_exit_observer_script"
-  ! m2_source_is_accepted 18c0e14 || \
-    die "self-test: source missing strict ledger/reference gates was accepted"
-  m2_source_is_accepted a52b048 || \
-    die "self-test: reviewed strict ledger/reference gates were rejected"
+  ! m2_source_is_accepted ffd99af || \
+    die "self-test: source with unowned live route claims was accepted"
+  m2_source_is_accepted 211e7c3 || \
+    die "self-test: reviewed live route evidence ownership was rejected"
   stale_release_binary="$tmp/stale-release-binary"
   cp "$BIN" "$stale_release_binary"
   touch -t 200001010000 "$stale_release_binary"
@@ -8192,7 +8192,7 @@ m2_real_client_envelope() {
 
 m2_source_is_accepted() {
   local revision="${1:-HEAD}"
-  git -C "$REPO" merge-base --is-ancestor a52b048 "$revision" >/dev/null 2>&1
+  git -C "$REPO" merge-base --is-ancestor 211e7c3 "$revision" >/dev/null 2>&1
 }
 
 m2_resource_result_value() {
@@ -9005,7 +9005,7 @@ run_m2_action() {
     "$M2_EXPECTED_CYCLES $M2_EXPECTED_TCP_RESULTS $M2_EXPECTED_UDP_RESULTS $M2_EXPECTED_PHASE_RESULTS" ]] || \
     die "$action_description requires the immutable formal M2 count model"
   m2_source_is_accepted || \
-    die "$action_description requires strict ledger/reference gates at a52b048 or a descendant"
+    die "$action_description requires live route evidence ownership at 211e7c3 or a descendant"
   m2_worktree_is_clean || \
     die "$action_description requires a clean worktree, including no untracked files, for exact-source evidence"
   run_dir="$(run_dir_from_state)" || die "no Knife15 run state"
