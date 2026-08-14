@@ -4,19 +4,21 @@
 
 ## Next Planned Stage — Knife15 M2 Tiered Resource Continuity (2026-08-14)
 
-- **Latest implementation position:** Tasks 1–3 are complete through
-  `18c0e14`. Strict qualification/formal M2 now import an eligible preflight,
-  bind its exact candidate/profile/result, source/binary/direct/observer/server
-  and endpoint identity into root-owned state and stage evidence, and compare
-  the copied directory with every member of its immutable archive before route
-  mutation and final acceptance. Strict source admission requires `ef5a433`
-  or a descendant.
-- Profile/preflight, complete macOS runner, and Exit observer self-tests plus
-  syntax/diff/frozen-value/secret checks pass. Review has no unresolved P0/P1;
-  Rust production and strict `receiver_zero == 0` are unchanged. No real
-  candidate has been admitted. Task 4 strict-attempt ledger is next; do not
-  ask for a Mac/VPS run yet. Result:
-  `docs/tech/2026-08-14-knife15-m2-strict-resource-binding-local-results.md`.
+- **Latest implementation position:** Tasks 1–4 are complete through
+  `ffd99af`. The closed strict-attempt ledger validates paired bundle content,
+  exact source/tool/binary/workload/resource/server/observer identity, observer
+  coverage, strict SLI, safety, and cleanup before reducing evidence. It
+  serializes at most two candidates and requires qualification plus two
+  consecutive valid formal passes. Invalid infrastructure evidence has no
+  decision effect.
+- Resource comparison now rejects any drift from the frozen `.33` reference
+  identity and `.77` Target. Strict qualification/formal and ledger source
+  admission require `a52b048` or a descendant. Profile/preflight, ledger,
+  complete macOS runner, and Exit observer self-tests pass; review has no
+  unresolved P0/P1. Rust production and strict `receiver_zero == 0` are
+  unchanged. No real candidate has been admitted. Task 5 runbook and complete
+  local gates are next; do not ask for a Mac/VPS run yet. Result:
+  `docs/tech/2026-08-14-knife15-m2-strict-attempt-ledger-local-results.md`.
 - **Latest accepted position:** the user canceled mature-client/commercial-VPN
   comparison before C0 and selected a bounded two-tier policy. Do not ask the
   user to open a TUIC client and do not execute the old calibration runbook.
@@ -39,9 +41,9 @@
   one immutable profile, including one uninterrupted four-epoch/24-hour
   process-and-TUN lifetime. A later invalid infrastructure event does not erase
   already sealed valid epochs; reducers never bridge unknown evidence.
-- Next implementation work is the strict attempt ledger, reviewed runbook,
-  and local gates. Formal M2 and M3 remain
-  blocked until that implementation supplies exact instructions. Spec and
+- Next implementation work is the reviewed runbook and complete local gates.
+  Formal M2 and M3 remain blocked until that implementation supplies exact
+  instructions. Spec and
   plan:
   `docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-spec.md`
   and

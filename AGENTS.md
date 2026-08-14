@@ -189,7 +189,7 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-14:
 
-- Tiered-resource Tasks 1–3 are complete through `18c0e14`. The closed
+- Tiered-resource Tasks 1–4 are complete through `ffd99af`. The closed
   resource-profile schema accepts only a different provider and ASN, an
   independently contracted route, or a hash-proved saturation replacement.
   The isolated nonsudo preflight binds copied provider/route evidence, exact
@@ -198,12 +198,19 @@ Current Knife15 summary, as of 2026-08-14:
 - Strict qualification/formal M2 now bind the exact candidate/profile/result,
   copied directory and archive, source/binary/direct/observer/server identity,
   and endpoint/Target/interface into root-owned state and stage evidence.
-  Strict source admission requires `ef5a433` or a descendant.
-- Rust production and the strict `m2` SLI are unchanged. Complete profile,
-  preflight, macOS-runner, and Exit-observer self-tests pass; code review has
-  no unresolved P0/P1. No real candidate has been admitted. Task 4 strict
-  attempt ledger is next; do not request a Mac long test yet. Result:
-  `docs/tech/2026-08-14-knife15-m2-strict-resource-binding-local-results.md`.
+  The ledger then validates paired bundle content and exact source/tool,
+  workload, resource, server, observer, SLI, safety, and cleanup evidence.
+  It serializes at most two candidates and requires one qualification plus two
+  consecutive valid formal passes. Invalid infrastructure evidence has no
+  decision effect.
+- Resource comparison rejects drift from the frozen `.33` reference identity
+  and `.77` Target. Strict runner and ledger source admission require
+  `a52b048` or a descendant. Rust production and the strict `m2` SLI are
+  unchanged. Complete profile, preflight, ledger, macOS-runner, and
+  Exit-observer self-tests pass; code review has no unresolved P0/P1. No real
+  candidate has been admitted. Task 5 runbook/full local gates are next; do
+  not request a Mac long test yet. Result:
+  `docs/tech/2026-08-14-knife15-m2-strict-attempt-ledger-local-results.md`.
 - The user canceled mature-client/commercial-VPN comparison and accepted a
   two-tier continuity strategy. Do not run the implemented C0 harness or ask
   the user to open a TUIC client. Its reviewed complete-interval reducer may
@@ -227,8 +234,8 @@ Current Knife15 summary, as of 2026-08-14:
   immutable profile and at least one uninterrupted four-epoch/24-hour
   process-and-TUN lifetime. Complete epochs survive an unrelated later
   infrastructure failure; unknown evidence is never bridged.
-- Formal M2/M3 remain blocked until the resource manifest, strict ledger, and
-  reviewed runbook implementation are complete. Specification and plan:
+- Formal M2/M3 remain blocked until the reviewed runbook and complete local
+  gates are complete. Specification and plan:
   `docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-spec.md`
   and
   `docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-implementation-plan.md`.

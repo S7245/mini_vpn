@@ -1,7 +1,7 @@
 # Knife15 M2 Tiered Continuity And Resource Strategy Implementation Plan
 
-Status: **TASKS 1–3 COMPLETE THROUGH `18c0e14`; TASK 4 STRICT ATTEMPT
-LEDGER IS NEXT; FORMAL M2 AND M3 REMAIN BLOCKED**
+Status: **TASKS 1–4 COMPLETE THROUGH `ffd99af`; TASK 5 RUNBOOK AND FULL
+LOCAL GATES ARE NEXT; FORMAL M2 AND M3 REMAIN BLOCKED**
 
 > **For agentic workers:** use `diagnose` and `tdd` for each behavior change;
 > use `code-review` before requesting a long macOS run.
@@ -110,7 +110,7 @@ system evidence, SHA-256 manifests, tar bundles, Rust workspace gates.
 Completed by `ef5a433` plus source-floor closure `18c0e14`. Result:
 `docs/tech/2026-08-14-knife15-m2-strict-resource-binding-local-results.md`.
 
-### Task 4: Strict-attempt ledger RED/GREEN
+### Task 4: Strict-attempt ledger RED/GREEN — COMPLETE
 
 **Files:**
 
@@ -133,6 +133,9 @@ Completed by `ef5a433` plus source-floor closure `18c0e14`. Result:
    passes on one immutable candidate.
 6. Run self-tests, syntax checks, and secret scan.
 7. Commit and push.
+
+Completed by `a52b048` plus source-floor closure `ffd99af`. Result:
+`docs/tech/2026-08-14-knife15-m2-strict-attempt-ledger-local-results.md`.
 
 ### Task 5: Strict-resource operator runbook and local review gate
 

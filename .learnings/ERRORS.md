@@ -1,5 +1,20 @@
 # Errors
 
+## 2026-08-14 - Initial strict ledger review found portability and false-admission holes
+
+- The first CLI draft rejected a symlinked artifact root. That would reject
+  ordinary `/tmp` on macOS even though every bundle was a regular file. It now
+  resolves the root once and retains exact bundle symlink/hash checks.
+- The first resource comparison trusted whichever structurally valid profile
+  was labeled `reference`; a drifted Exit or Target could therefore authorize
+  a false candidate. Expected REDs now require the frozen `.33` identity and
+  `.77` Target.
+- The first state reducer allowed candidate 2 while candidate 1 was still
+  pending and let invalid profile/Exit hashes participate in valid-attempt
+  uniqueness. Both contradicted the bounded experiment policy. Candidate
+  execution is now serialized and invalid evidence is decision-neutral.
+- All issues were found before any candidate provisioning or Mac/VPS traffic.
+
 ## 2026-08-14 - A portable tar-root check used an unescaped awk delimiter
 
 - The first archive/directory equality RED used `/^[^/]+\/$/` in a BSD `awk`

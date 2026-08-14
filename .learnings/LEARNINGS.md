@@ -1,5 +1,28 @@
 # Learnings
 
+## 2026-08-14 - Decision ledgers must distinguish configuration identity from fresh run evidence
+
+- A fresh direct/route observation legitimately changes the complete resource
+  profile hash on every run. Candidate continuity must instead bind a stable
+  material-resource identity while separately requiring a unique, fully
+  verified per-run profile.
+- “Invalid does not count” must be true in the reducer, not only in prose.
+  Invalid power/VPS/operator evidence cannot consume a candidate, break a
+  completed formal-pass sequence, or collide with valid profile/Exit
+  uniqueness checks.
+- Serialize expensive experiments in the state machine: candidate 2 cannot
+  start until candidate 1 is genuinely rejected, and no valid attempt may
+  follow a terminal rejection or acceptance.
+- Freeze the identity of the historical comparator itself. Comparing against
+  an arbitrary well-formed `reference` file is not evidence that the candidate
+  differs from the accepted `.33` failure domain.
+- Resolve macOS's system `/tmp` symlink once, then reject symlinked bundle
+  files individually. Portability and evidence safety are compatible when
+  ownership is checked at the right boundary.
+
+Result:
+`docs/tech/2026-08-14-knife15-m2-strict-attempt-ledger-local-results.md`.
+
 ## 2026-08-14 - Long-run identity needs three-way binding, not parallel checks
 
 - A valid copied directory and a valid immutable tar SHA do not prove they

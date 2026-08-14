@@ -18,18 +18,20 @@ Next:
 2. **DONE through `18c0e14`:** bind strict qualification/formal evidence to
    the exact root-owned resource state, copied directory, and immutable archive
    without weakening `receiver_zero == 0`;
-3. **NEXT:** implement the strict attempt ledger and operator runbook;
-4. admit at most two resources that change both provider and ASN, or
+3. **DONE through `ffd99af`:** implement the strict attempt ledger, exact
+   paired-artifact/source reducer, and frozen `.33` reference identity;
+4. **NEXT:** write the operator runbook and complete local review gates;
+5. admit at most two resources that change both provider and ASN, or
    independently contracted route from `.33`;
-5. for each, run one strict qualification and, only if clean, two consecutive
+6. for each, run one strict qualification and, only if clean, two consecutive
    strict 24-hour formal runs; reject the candidate on its first genuine
    quality failure without tuning or favorable-sample repetition;
-6. if one candidate passes twice, accept Tier A and reopen M3;
-7. only if both candidates genuinely fail, implement Tier B as a separate
+7. if one candidate passes twice, accept Tier A and reopen M3;
+8. only if both candidates genuinely fail, implement Tier B as a separate
    action: at most three isolated one-second episodes/rolling 24h, at most one
    /rolling 6h, no consecutive zero intervals, 72 valid hours including one
    uninterrupted 24-hour process/TUN lifetime;
-8. preserve every other M2 safety, UDP, lifecycle, ownership, observer, and
+9. preserve every other M2 safety, UDP, lifecycle, ownership, observer, and
    cleanup gate.
 
 Specifications:
@@ -40,6 +42,8 @@ Task-2 result:
 `docs/tech/2026-08-14-knife15-m2-resource-admission-local-results.md`.
 Task-3 result:
 `docs/tech/2026-08-14-knife15-m2-strict-resource-binding-local-results.md`.
+Task-4 result:
+`docs/tech/2026-08-14-knife15-m2-strict-attempt-ledger-local-results.md`.
 
 #### Formal-failure basis (2026-08-14 — M2 reached the standard-TUIC one-second continuity stop)
 
