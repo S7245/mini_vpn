@@ -4,27 +4,40 @@
 
 ## Next Planned Stage — Knife15 M2 Market Continuity Calibration (2026-08-14)
 
-- **Latest decision:** the one-second zero-tolerance Target receiver SLI is a
-  valid internal discriminator, but public mature-VPN contracts do not support
-  treating it as a mainstream uninterrupted per-flow guarantee. Do not select
-  a custom resumable/path-diverse protocol from the `cdbfe36` failure alone.
-- Implement the isolated market-calibration harness specified in
-  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-spec.md`
-  and its seven-task implementation plan. Keep the frozen formal runner and
-  production data plane unchanged during harness construction.
-- The decisive first gate is a roughly 90-minute, six-cycle mature TUIC trial
-  using the same HK Mac, `.33:8443` TUIC service, `.77:5201` Target, one frozen
-  direct-derived load profile, and a fresh paired Exit observer. Quality events
-  are recorded and the schedule continues; invalid evidence still fails closed.
+- **Latest accepted position:** calibration implementation Tasks 1–6 are
+  complete and pushed through reviewed `3474dff`; Task 7 is one user-run C0 on
+  the HK Mac. No Rust production code, frozen formal runner behavior, workload
+  constant, or data-plane parameter changed.
+- The isolated harness deterministically reduces iperf JSON, derives one
+  immutable direct-baseline profile, proves external-client route/egress/source
+  ownership read-only, runs six bounded mixed cycles, automatically owns and
+  finalizes one fresh paired Exit observer, creates secret-scanned immutable
+  Mac evidence, and classifies only integrity-checked role-bound bundles.
+- Code review found and repaired one P1 before HITL: a remotely successful
+  observer start with malformed output could precede local ownership. The
+  harness now recovers the exact healthy target/port/run identity from status,
+  marks the trial invalid, and safely finalizes the observer. The deterministic
+  RED/GREEN and complete harness/observer/formal-runner self-tests pass.
+- The decisive next gate is exactly one roughly 90-minute, six-cycle mature
+  TUIC C0 trial using the same HK Mac, `.33:8443` TUIC service, `.77:5201`
+  Target, one frozen direct-derived profile, and a fresh paired Exit observer.
+  Follow only
+  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-runbook.md`.
+  Quality events are recorded and the schedule continues; invalid evidence
+  still fails closed.
 - If the mature client also has complete one-second receiver-zero intervals,
   recalibrate the product SLI rather than replace the architecture. If it has
   none, run matched alternating mature/mini_vpn trials before attributing a
   mini_vpn-specific gap. Commercial VPNs with their own exits are QoE evidence
   only and cannot decide client causality.
 - Do not run formal M2 or M3 and do not tune frozen values during calibration.
-  Result and plan:
+  Spec, plan, and operator runbook:
   `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-spec.md` and
-  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-implementation-plan.md`.
+  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-implementation-plan.md`
+  and
+  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-runbook.md`.
+  Local result:
+  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-local-results.md`.
 
 - **Accepted formal-failure basis:** exact-source `cdbfe36` formal artifact
   `/tmp/mini_vpn_knife15_macos_20260814_014536.tar.gz` (SHA-256

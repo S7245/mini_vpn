@@ -1,5 +1,8 @@
 # Knife15 M2 Market Continuity Calibration Implementation Plan
 
+Status: **TASKS 1–6 IMPLEMENTED AND REVIEWED AT `3474dff`; TASK 7 C0 HITL IS
+NEXT; FORMAL M2/M3 REMAIN BLOCKED**
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans
 > to implement this plan task-by-task.
 
@@ -203,9 +206,12 @@ Support:
 
 ```bash
 CLIENT_LABEL=mihomo-tuic \
+CLIENT_VERSION='Mihomo REPLACE_WITH_EXACT_VERSION' \
 EXPECTED_VPN_IF=utun9 \
 PHYSICAL_IF=en0 \
+TUIC_EXIT_IPV4=43.153.32.33 \
 EXPECTED_EXIT_IPV4=43.153.32.33 \
+DNS_TARGET=8.8.8.8 \
 PROFILE_FILE=/absolute/profile \
 bash scripts/knife15-market-continuity.sh preflight
 ```
@@ -271,9 +277,14 @@ Support:
 
 ```bash
 CLIENT_LABEL=mihomo-tuic \
+CLIENT_VERSION='Mihomo REPLACE_WITH_EXACT_VERSION' \
+CLIENT_KIND=mature \
 EXPECTED_VPN_IF=utun9 \
 PHYSICAL_IF=en0 \
+TUIC_EXIT_IPV4=43.153.32.33 \
 EXPECTED_EXIT_IPV4=43.153.32.33 \
+DNS_TARGET=8.8.8.8 \
+DNS_NAME=example.com \
 PROFILE_FILE=/absolute/profile \
 EXIT_SSH_HOST=ubuntu@43.153.32.33 \
 EXIT_SSH_KEY="$HOME/.ssh/vpn" \
@@ -399,8 +410,15 @@ The classifier reports evidence; it must not select a custom protocol.
 Add:
 
 ```bash
-bash scripts/knife15-market-continuity.sh summarize RUN_DIR...
+bash scripts/knife15-market-continuity.sh summarize \
+  mature=/absolute/immutable-market-bundle.tar.gz \
+  mini_vpn=/absolute/immutable-market-bundle.tar.gz
 ```
+
+The recorded `client_kind` inside each immutable manifest must equal the
+command-line role. A role mismatch or malformed event table produces
+`NO_DECISION`; the same bundle cannot be relabeled to manufacture a matched
+result.
 
 The runbook must keep credentials as placeholders and separate these operator
 boundaries:

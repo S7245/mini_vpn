@@ -189,23 +189,32 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-14:
 
-- The accepted next stage is market continuity calibration, not an immediate
-  architecture replacement. Public mature-VPN contracts do not establish a
-  hard guarantee that every established flow receives bytes in every complete
-  one-second interval. The `cdbfe36` formal failure remains valid, but it is
-  not sufficient product evidence for a custom resumable/path-diverse server.
-- First implement the isolated harness in the accepted calibration spec/plan,
-  then run one roughly 90-minute mature-TUIC C0 trial using the same HK Mac,
-  `.33:8443` Exit, `.77:5201` Target, one immutable direct-derived load
-  profile, and a fresh paired observer. Quality events continue; invalid
-  evidence fails closed. If mature TUIC is clean, use matched alternating C1
-  trials before attributing a mini_vpn differential. Commercial VPNs on their
-  own exits are QoE evidence only.
+- Market continuity calibration implementation Tasks 1–6 are complete and
+  pushed through reviewed `3474dff`; Task 7 is one user-run C0 on the HK Mac.
+  The harness has deterministic iperf reduction, immutable direct-derived
+  profiles, read-only external-client route/egress/source admission, six
+  bounded mixed cycles, exact Exit-observer ownership/finalization,
+  secret-scanned immutable evidence, and role-bound bundle classification.
+- Code review found and repaired one P1 before HITL: remote observer start
+  could succeed before malformed output established local ownership. Exact
+  healthy status now recovers that owned run so the invalid trial can finalize
+  it safely. The focused RED/GREEN and complete local shell/Python/formal-runner
+  gates pass; no Rust production or frozen behavior changed.
+- Run exactly one roughly 90-minute mature-TUIC C0 using the same HK Mac,
+  `.33:8443` Exit, `.77:5201` Target, one immutable direct-derived profile,
+  and a fresh paired observer. Follow only the market calibration runbook.
+  Quality events continue; invalid evidence fails closed. If mature TUIC is
+  clean, use matched alternating C1 before attributing a mini_vpn differential.
+  Commercial VPNs on their own exits remain QoE evidence only.
 - Do not change the frozen formal runner or Rust data plane, run formal M2/M3,
   tune frozen values, or open a custom-server branch during calibration.
-  Specifications:
+  Specification, plan, and runbook:
   `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-spec.md` and
-  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-implementation-plan.md`.
+  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-implementation-plan.md`
+  and
+  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-runbook.md`.
+  Local result:
+  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-local-results.md`.
 - Exact-source `cdbfe36` formal artifact
   `/tmp/mini_vpn_knife15_macos_20260814_014536.tar.gz` (SHA-256
   `2c002684...`) passed baseline `32.701/56.515 Mbit/s`, bounded direct

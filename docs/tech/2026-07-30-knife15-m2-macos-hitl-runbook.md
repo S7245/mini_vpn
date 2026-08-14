@@ -15,6 +15,8 @@ Exit-to-Target TCP, Endpoint, D16/TUN, runner, and cleanup. See
 The sequence below is retained as historical operational evidence only. Do
 not run it again unchanged and do not tune frozen values. The accepted next
 step is the isolated same-path market calibration in
+`docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-runbook.md`,
+governed by
 `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-spec.md`.
 Formal M2 and M3 remain blocked until that calibration determines whether the
 one-second event is a mini_vpn differential or a path/market property.

@@ -1,5 +1,24 @@
 # Learnings
 
+## 2026-08-14 - Comparative evidence needs artifact-owned roles and transactional observer ownership
+
+- A comparison role supplied only at summary time is forgeable metadata. Write
+  `mature`, `mini_vpn`, or `commercial` into the immutable run manifest and
+  reject any command-line role that does not match it.
+- Remote ownership begins when `start` succeeds, not when its stdout has been
+  parsed. If the start response is malformed, recover the exact healthy
+  target/port/run identity through status, fail the trial closed, and finalize
+  the resource instead of leaking it.
+- Quality and validity are orthogonal. Receiver-zero and UDP-loss events should
+  continue the bounded calibration schedule, while malformed results, route
+  drift, source/profile mismatch, observer loss, or capture drops invalidate
+  evidence immediately.
+- Put the shortest causal control before the expensive acceptance run. The
+  completed harness turns the next decision into about 90 minutes of same-path
+  mature-TUIC evidence, not another speculative 25-hour formal M2.
+- Runbook:
+  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-runbook.md`.
+
 ## 2026-08-14 - Calibrate an internal continuity SLI before funding architecture replacement
 
 - A valid internal test failure does not prove that its zero-tolerance SLI is

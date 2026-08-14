@@ -1,5 +1,27 @@
 # Errors
 
+## 2026-08-14 - A zsh loop variable named `path` erased command lookup
+
+- A final read-only docs scan used `for path in ...` under zsh. Lowercase
+  `path` is a special array tied to `PATH`, so the loop replaced command lookup
+  and the later `git`, `rg`, and `head` calls returned `command not found`.
+- No file or external state changed. The scan was rerun successfully with
+  `required_file`. Avoid `path` as a zsh variable in operator/gate commands.
+
+## 2026-08-14 - Successful observer start preceded local response ownership
+
+- Concentrated calibration-runner review found that the remote Exit observer
+  could successfully start while its stdout omitted or malformed `run_dir`.
+  The old branch returned before setting local ownership, so the active remote
+  observer could survive and block the next trial for up to its 26-hour bound.
+- A deterministic mock reproduced the leak. The repair queries exact status
+  only after a successful start, requires the same Target/iperf/TUIC ports and
+  healthy run identity, then marks the trial invalid and performs the ordinary
+  bounded freeze/bundle finalization. A failed start remains unclaimed so the
+  harness cannot stop another operator's observer.
+- Future behavior: define ownership at the remote mutation boundary and test
+  malformed success responses, not only command failures.
+
 ## 2026-08-14 - The first formal-failure interpretation jumped from an internal SLI to a product architecture choice
 
 - The `cdbfe36` receiver-zero evidence correctly failed formal M2 and correctly

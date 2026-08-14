@@ -4,7 +4,7 @@
 
 ### Market continuity calibration before an established-stream architecture decision
 
-#### Latest decision (2026-08-14 — calibrate the one-second SLI before changing architecture)
+#### Latest decision (2026-08-14 — calibration harness ready; one mature-TUIC C0 is next)
 
 The `cdbfe36` formal M2 failure remains genuine and immutable, but public
 mature-VPN contracts emphasize availability, reconnect, kill-switch behavior,
@@ -12,23 +12,37 @@ and aggregate service rather than guaranteeing nonzero delivery in every
 one-second interval of every established TCP flow. The evidence therefore does
 not yet justify a custom resumable/path-diverse protocol and server.
 
+Reviewed implementation is pushed through `3474dff`. It adds deterministic
+iperf reduction, immutable direct-derived profile binding, read-only external
+client admission, the exact six-cycle workload, fresh Exit-observer ownership
+and finalization, immutable secret-scanned evidence, and role-bound decision
+summaries. No Rust production code, formal runner behavior, or frozen value
+changed. Code review's malformed-successful-observer-start RED is GREEN and no
+P0/P1 remains.
+
 Next:
 
-1. implement the isolated calibration harness without changing the frozen
-   formal M2 runner or Rust production data plane;
-2. derive one immutable offered-load profile with VPN off;
-3. run one roughly 90-minute/six-cycle C0 trial using a mature TUIC client on
+1. follow only the new market calibration runbook on the HK Mac;
+2. with every VPN off, derive one immutable offered-load profile from a clean
+   direct baseline after pulling the final reviewed descendant;
+3. configure one mature Mihomo/Clash TUIC v5 client for the same credentials,
+   CA trust, Cubic/native settings, `.33:8443` Exit, and full TUN;
+4. run one roughly 90-minute/six-cycle C0 trial using the mature TUIC client on
    the same HK Mac, `.33:8443` Exit, `.77:5201` Target, and fresh paired Exit
    observer;
-4. record quality events and continue, but fail closed on invalid evidence;
-5. if mature TUIC also has receiver-zero intervals, recalibrate the product
+5. record quality events and continue, but fail closed on invalid evidence;
+6. if mature TUIC also has receiver-zero intervals, recalibrate the product
    SLI; if it has none, run matched alternating mature/mini_vpn C1 trials
    before selecting an architecture investigation;
-6. keep formal M2 and M3 blocked and do not tune frozen values.
+7. keep formal M2 and M3 blocked and do not tune frozen values.
 
 Specifications:
 `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-spec.md` and
-`docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-implementation-plan.md`.
+`docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-implementation-plan.md`
+and
+`docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-runbook.md`.
+Local result:
+`docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-local-results.md`.
 
 #### Formal-failure basis (2026-08-14 — M2 reached the standard-TUIC one-second continuity stop)
 
