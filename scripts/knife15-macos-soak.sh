@@ -8285,6 +8285,7 @@ m2_resource_evidence_is_valid() {
   local candidate_profile_sha reference_profile_sha eligibility_reason
   local result_file result_text remote_file candidate_file reference_file
   local actual_sha expected_sha result_key remote_cpu remote_memory
+  local bounded_evidence bounded_size
 
   [[ -d "$evidence_dir" && ! -L "$evidence_dir" ]] || return 1
   for required_file in \
@@ -8300,6 +8301,12 @@ m2_resource_evidence_is_valid() {
     [[ -f "$evidence_file" && ! -L "$evidence_file" ]] || return 1
     evidence_name="$(basename "$evidence_file")"
     m2_resource_evidence_name_is_allowed "$evidence_name" || return 1
+  done
+  for bounded_evidence in provider-identity.txt route-identity.txt; do
+    bounded_size="$(wc -c <"$evidence_dir/$bounded_evidence" | \
+      tr -d '[:space:]')"
+    [[ "$bounded_size" =~ ^[0-9]+$ && 10#$bounded_size -gt 0 && \
+      10#$bounded_size -le 65536 ]] || return 1
   done
   (cd "$evidence_dir" && \
     /usr/bin/shasum -a 256 -c SHA256SUMS >/dev/null 2>&1) || return 1
@@ -8342,6 +8349,12 @@ m2_resource_evidence_is_valid() {
       ! -L "$evidence_dir/prior-saturation.txt" && \
       -f "$evidence_dir/replacement-capacity.txt" && \
       ! -L "$evidence_dir/replacement-capacity.txt" ]] || return 1
+    for bounded_evidence in prior-saturation.txt replacement-capacity.txt; do
+      bounded_size="$(wc -c <"$evidence_dir/$bounded_evidence" | \
+        tr -d '[:space:]')"
+      [[ "$bounded_size" =~ ^[0-9]+$ && 10#$bounded_size -gt 0 && \
+        10#$bounded_size -le 65536 ]] || return 1
+    done
   else
     [[ ! -e "$evidence_dir/prior-saturation.txt" && \
       ! -e "$evidence_dir/replacement-capacity.txt" ]] || return 1

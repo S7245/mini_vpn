@@ -159,6 +159,16 @@ runner_self_test() {
     rm -rf "$tmp"
     die "mismatched hash-bound evidence was accepted"
   fi
+  dd if=/dev/zero of="$tmp/oversized.txt" bs=65537 count=1 2>/dev/null
+  if (
+    local OUT_DIR="$tmp/out"
+    copy_hash_bound_evidence "$tmp/oversized.txt" \
+      "$(sha256_file "$tmp/oversized.txt")" \
+      "$OUT_DIR/provider-oversized.txt" "provider identity"
+  ) >/dev/null 2>&1; then
+    rm -rf "$tmp"
+    die "oversized hash-bound evidence was accepted"
+  fi
   rm -rf "$tmp"
   echo "knife15 M2 resource preflight self-test passed"
 }
@@ -206,11 +216,18 @@ remote_value() {
 
 copy_hash_bound_evidence() {
   local source_file="$1" expected_sha="$2" output_file="$3" label="$4"
+  local size
   [[ -n "$source_file" && -f "$source_file" && ! -L "$source_file" ]] || \
     die "set exact regular $label evidence; evidence: $OUT_DIR"
+  size="$(wc -c <"$source_file" | tr -d '[:space:]')"
+  [[ "$size" =~ ^[0-9]+$ && 10#$size -gt 0 && 10#$size -le 65536 ]] || \
+    die "$label evidence must be nonempty and at most 64KiB; evidence: $OUT_DIR"
   [[ "$(sha256_file "$source_file")" == "$expected_sha" ]] || \
     die "$label evidence hash does not match the profile; evidence: $OUT_DIR"
   cp "$source_file" "$output_file"
+  [[ -f "$output_file" && ! -L "$output_file" && \
+    "$(sha256_file "$output_file")" == "$expected_sha" ]] || \
+    die "$label evidence changed while copying; evidence: $OUT_DIR"
 }
 
 run_preflight() {

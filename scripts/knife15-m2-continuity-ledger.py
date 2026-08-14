@@ -816,8 +816,12 @@ def validate_mac_bundle(attempt: dict[str, Any], artifact_root: Path) -> None:
         )
         validate_resource_identity_evidence(
             candidate,
-            archive.bytes(f"{resource_dir}/provider-identity.txt"),
-            archive.bytes(f"{resource_dir}/route-identity.txt"),
+            archive.bytes(
+                f"{resource_dir}/provider-identity.txt", 64 * 1024
+            ),
+            archive.bytes(
+                f"{resource_dir}/route-identity.txt", 64 * 1024
+            ),
             evidence_binding,
         )
         resource_result = parse_key_values(
