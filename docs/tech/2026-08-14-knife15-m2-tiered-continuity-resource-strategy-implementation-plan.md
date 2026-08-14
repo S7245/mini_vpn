@@ -1,7 +1,7 @@
 # Knife15 M2 Tiered Continuity And Resource Strategy Implementation Plan
 
 Status: **TASKS 1–5 COMPLETE THROUGH SOURCE-FLOOR CLOSURE `bcd63b4`; TASK 6
-CANDIDATE 1 PROVISIONING/ADMISSION IS NEXT; M3 REMAINS BLOCKED**
+CANDIDATE 1 SELECTED, CREATION/ADMISSION NEXT; M3 REMAINS BLOCKED**
 
 > **For agentic workers:** use `diagnose` and `tdd` for each behavior change;
 > use `code-review` before requesting a long macOS run.
@@ -164,6 +164,13 @@ Completed through strict source-floor closure `bcd63b4`. Result:
 `docs/tech/2026-08-14-knife15-m2-strict-resource-local-results.md`.
 
 ### Task 6: Execute at most two strict candidates
+
+**IN PROGRESS.** The existing `.111` and `.27` hosts were rejected before
+admission because they share Tencent AS132203 with `.33`. Candidate 1 is
+selected as an Amazon Lightsail compute-optimized 4GB/2-vCPU Ubuntu 24.04
+resource in `us-west-2`, subject to actual post-allocation ASN/provider and
+live route admission. Exact creation and out-of-band host identity contract:
+`docs/tech/2026-08-14-knife15-m2-strict-candidate1-resource-selection.md`.
 
 **Evidence:**
 

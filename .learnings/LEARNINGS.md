@@ -1,5 +1,23 @@
 # Learnings
 
+## 2026-08-14 - A historical role change is not a resource failure-domain change
+
+- `.27` was a Client and `.111` was an independent Exit in Knife14, but both
+  are announced by Tencent AS132203 just like the failed `.33` reference.
+  Host roles and public-IP prefixes are not provider/ASN independence.
+- Reject equivalent resources before provisioning traffic. SSH availability,
+  a changed host key, or prior throughput does not make an otherwise
+  ineligible provider/ASN resource eligible.
+- Select a non-burst compute resource for long-path attribution when the price
+  difference is small. This removes CPU-credit depletion as a preventable
+  long-duration confounder while live admission still proves headroom.
+- Expected ASN is not evidence. A cloud product is only a selection until its
+  assigned static IPv4, provider/ASN, host key, server hashes, route, Target
+  reachability, and immutable profile all pass admission.
+
+Result:
+`docs/tech/2026-08-14-knife15-m2-strict-candidate1-resource-selection.md`.
+
 ## 2026-08-14 - Resource evidence needs semantic ownership and durable workload identity
 
 - Hash equality proves bytes, not meaning. Provider/route evidence must use a

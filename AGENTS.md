@@ -189,6 +189,16 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-14:
 
+- Task 6 has rejected `.111` and `.27` before traffic because both remain
+  Tencent AS132203 like `.33`; changing their historical role does not create
+  a different provider/ASN failure domain. `.111` also presents an unverified
+  changed SSH host key and `.27` currently closes SSH. Candidate 1 is selected
+  but not admitted: Amazon Lightsail `us-west-2`, compute-optimized 4GB/2-vCPU
+  Ubuntu 24.04 with static IPv4. Require actual non-AS132203 allocation,
+  out-of-band host-key verification, exact service/Target/route/capacity
+  evidence, and read-only resource preflight before issuing Mac commands.
+  Selection contract:
+  `docs/tech/2026-08-14-knife15-m2-strict-candidate1-resource-selection.md`.
 - Tiered-resource Tasks 1–5 are complete through strict source-floor closure
   `bcd63b4`. The closed resource-profile schema accepts only a different
   provider and ASN, an independently contracted route, or a hash-proved

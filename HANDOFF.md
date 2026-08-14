@@ -4,6 +4,17 @@
 
 ## Next Planned Stage — Knife15 M2 Tiered Resource Continuity (2026-08-14)
 
+- **Latest Task-6 position:** `.111` and `.27` are ineligible before traffic:
+  both are Tencent AS132203 like `.33`; historical Client/Exit roles do not
+  create a different failure domain. `.111` also has an unverified changed SSH
+  host key and `.27` currently closes SSH. Candidate 1 is selected, but not
+  yet created or admitted: Amazon Lightsail `us-west-2`, compute-optimized
+  4GB/2-vCPU Ubuntu 24.04, static IPv4. The assigned address must still prove a
+  non-AS132203 provider/ASN and pass exact host-key, service, Target, route,
+  capacity, and immutable-profile admission. Do not start a Mac long run yet.
+  Selection contract:
+  `docs/tech/2026-08-14-knife15-m2-strict-candidate1-resource-selection.md`.
+
 - **Latest implementation position:** Tasks 1–5 are complete through strict
   source-floor closure `bcd63b4`. The strict ledger validates paired bundle
   content, source/tool/binary/workload/resource/server/observer identity,

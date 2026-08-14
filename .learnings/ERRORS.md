@@ -1,5 +1,16 @@
 # Errors
 
+## 2026-08-14 - Do not replace an SSH host key during resource eligibility discovery
+
+- The read-only `.111` probe stopped because its ED25519 host key differs from
+  the pinned `known_hosts` entry. No key was deleted, replaced, or trusted.
+- A cloud instance can be rebuilt behind the same address, so provider history
+  is not sufficient host identity. Require an out-of-band fingerprint from the
+  current provider console before updating a pinned host entry.
+- The current Mac also routes candidate addresses through Clash `utun1024`.
+  Do not preserve that traceroute as physical-path evidence; collect the live
+  candidate route only after every external VPN/TUN is stopped.
+
 ## 2026-08-14 - Final strict-resource review found false-proof and persistence gaps
 
 - The first candidate schema asked for predeclared route/traceroute hashes,
