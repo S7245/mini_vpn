@@ -624,6 +624,25 @@ m2_ipv6_route_classification_from_text() {
   fi
 }
 
+m2_prevent_idle_sleep_is_asserted_from_text() {
+  awk '
+    $1 == "PreventUserIdleSystemSleep" && $2 == "1" { asserted = 1 }
+    END { exit(asserted ? 0 : 1) }
+  '
+}
+
+m2_prevent_idle_sleep_is_asserted() {
+  pmset -g assertions 2>/dev/null | \
+    m2_prevent_idle_sleep_is_asserted_from_text
+}
+
+knife15_action_requires_prevent_idle_sleep() {
+  case "${1:-}" in
+    baseline|direct-discriminator|start|m2|m2-qualification) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 observe_m2_ipv6_route() {
   local classification
   M2_IPV6_ROUTE_TEXT="$(
@@ -1398,6 +1417,11 @@ common_preflight() {
   validate_positive_integer "$IPERF_PORT" || die "IPERF_PORT must be a positive integer"
   ((10#$IPERF_PORT <= 65535)) || die "IPERF_PORT must be at most 65535"
   ((10#$LOG_KEEP_BYTES < 10#$MAX_LOG_BYTES)) || die "LOG_KEEP_BYTES must be below MAX_LOG_BYTES"
+  if knife15_action_requires_prevent_idle_sleep "$ACTION"; then
+    require_command pmset
+    m2_prevent_idle_sleep_is_asserted || \
+      die "Knife15 M2 requires an active PreventUserIdleSystemSleep assertion; start caffeinate before baseline/direct/start"
+  fi
 
   exit_if="$(route_interface "$SERVER_HOST")"
   target_if="$(route_interface "$TARGET")"
@@ -3360,6 +3384,10 @@ runner_self_test() {
     'tuic_udp_listener=1' 'udp_summary_begin' 'UDP: 1' \
     'udp_summary_end' 'interface_counters_begin' 'eth0 fixture' \
     'interface_counters_end' >"$resource_evidence/remote.txt"
+  printf '%s\n' \
+    'tuic_tcp_sink_probe target=43.130.32.77:5201 requested_duration_secs=1 elapsed_ms=1000 bytes=0 read_mbps=0.000 reads=0 first_rx_ms=none max_read_gap_ms=0 eof=false' \
+    >"$resource_evidence/tuic-handshake-probe.txt"
+  : >"$resource_evidence/tuic-handshake-probe.stderr.txt"
   printf '%s\n' 'PASS: no credential-like assignment found' \
     >"$resource_evidence/secret-scan.txt"
   printf '%s\n' \
@@ -3383,6 +3411,8 @@ runner_self_test() {
     "provider_identity_sha256=$resource_provider_sha" \
     "route_identity_sha256=$resource_route_sha" \
     "remote_sha256=$(sha256_file "$resource_evidence/remote.txt")" \
+    "tuic_handshake_probe_sha256=$(sha256_file \
+      "$resource_evidence/tuic-handshake-probe.txt")" \
     "exit_route_sha256=$(sha256_file "$resource_evidence/exit.route.txt")" \
     "target_route_sha256=$(sha256_file "$resource_evidence/target.route.txt")" \
     "exit_traceroute_sha256=$(sha256_file "$resource_evidence/exit.traceroute.txt")" \
@@ -3394,7 +3424,8 @@ runner_self_test() {
     evidence-binding.json \
     direct-manifest.txt provider-identity.txt route-identity.txt \
     exit.route.txt target.route.txt exit.traceroute.txt target.traceroute.txt \
-    remote.txt remote.stderr secret-scan.txt result.txt; do
+    remote.txt remote.stderr tuic-handshake-probe.txt \
+    tuic-handshake-probe.stderr.txt secret-scan.txt result.txt; do
     printf '%s  %s\n' "$(sha256_file "$resource_evidence/$resource_file")" \
       "$resource_file" >>"$resource_evidence/SHA256SUMS"
   done
@@ -3531,6 +3562,20 @@ EOF_NETWORK_SERVICES
   )"
   [[ "$ipv6_class" == "unknown" && "$ipv6_interface" == "none" ]] || \
     die "self-test: successful IPv6 lookup without interface was accepted"
+  printf '%s\n' \
+    '   PreventUserIdleSystemSleep     1' | \
+    m2_prevent_idle_sleep_is_asserted_from_text || \
+    die "self-test: active M2 idle-sleep assertion was rejected"
+  ! printf '%s\n' \
+    '   PreventUserIdleSystemSleep     0' | \
+    m2_prevent_idle_sleep_is_asserted_from_text || \
+    die "self-test: inactive M2 idle-sleep assertion was accepted"
+  for result_label in baseline direct-discriminator start m2 m2-qualification; do
+    knife15_action_requires_prevent_idle_sleep "$result_label" || \
+      die "self-test: $result_label omitted the idle-sleep gate"
+  done
+  ! knife15_action_requires_prevent_idle_sleep status || \
+    die "self-test: status unexpectedly requires an idle-sleep assertion"
   cleanup_class="$(m2_owned_route_cleanup_classification \
     utun42 '' utun42 en0 192.168.50.1 1)"
   [[ "$cleanup_class" == "delete_owned" ]] || \
@@ -3551,6 +3596,16 @@ EOF_NETWORK_SERVICES
     en0 192.168.60.1 utun42 en0 192.168.50.1 0)"
   [[ "$cleanup_class" == "mismatch" ]] || \
     die "self-test: wrong-gateway M2 route mutation was accepted"
+
+  printf '%s\n' utun0 utun1 >"$tmp/pre-ready-utun.before"
+  printf '%s\n' utun0 utun1 >"$tmp/pre-ready-utun.current"
+  utun_snapshot_has_no_additions \
+    "$tmp/pre-ready-utun.before" "$tmp/pre-ready-utun.current" || \
+    die "self-test: pre-ready start without a new utun could not clean up"
+  printf '%s\n' utun0 utun1 utun2 >"$tmp/pre-ready-utun.current"
+  ! utun_snapshot_has_no_additions \
+    "$tmp/pre-ready-utun.before" "$tmp/pre-ready-utun.current" || \
+    die "self-test: ambiguous new pre-ready utun was accepted as clean"
 
   m2_route_state="$tmp/m2-route-state"
   m2_run="$tmp/m2-route-run"
@@ -8216,7 +8271,8 @@ m2_resource_evidence_name_is_allowed() {
     direct-manifest.txt|provider-identity.txt|route-identity.txt|\
     prior-saturation.txt|replacement-capacity.txt|exit.route.txt|\
     target.route.txt|exit.traceroute.txt|target.traceroute.txt|remote.txt|\
-    remote.stderr|secret-scan.txt|result.txt|SHA256SUMS)
+    remote.stderr|tuic-handshake-probe.txt|\
+    tuic-handshake-probe.stderr.txt|secret-scan.txt|result.txt|SHA256SUMS)
       return 0
       ;;
     *)
@@ -8293,7 +8349,8 @@ m2_resource_evidence_is_valid() {
     evidence-binding.json \
     direct-manifest.txt provider-identity.txt route-identity.txt \
     exit.route.txt target.route.txt exit.traceroute.txt target.traceroute.txt \
-    remote.txt remote.stderr secret-scan.txt result.txt SHA256SUMS; do
+    remote.txt remote.stderr tuic-handshake-probe.txt \
+    tuic-handshake-probe.stderr.txt secret-scan.txt result.txt SHA256SUMS; do
     [[ -f "$evidence_dir/$required_file" && \
       ! -L "$evidence_dir/$required_file" ]] || return 1
   done
@@ -8416,7 +8473,7 @@ m2_resource_evidence_is_valid() {
 
   for evidence_name in \
     eligibility.json evidence-binding.json provider-identity.txt \
-    route-identity.txt remote.txt \
+    route-identity.txt remote.txt tuic-handshake-probe.txt \
     exit.route.txt target.route.txt exit.traceroute.txt target.traceroute.txt; do
     case "$evidence_name" in
       eligibility.json) result_key=eligibility_sha256 ;;
@@ -8424,6 +8481,7 @@ m2_resource_evidence_is_valid() {
       provider-identity.txt) result_key=provider_identity_sha256 ;;
       route-identity.txt) result_key=route_identity_sha256 ;;
       remote.txt) result_key=remote_sha256 ;;
+      tuic-handshake-probe.txt) result_key=tuic_handshake_probe_sha256 ;;
       exit.route.txt) result_key=exit_route_sha256 ;;
       target.route.txt) result_key=target_route_sha256 ;;
       exit.traceroute.txt) result_key=exit_traceroute_sha256 ;;
@@ -8436,6 +8494,11 @@ m2_resource_evidence_is_valid() {
   done
   [[ "$(sed -n '1p' "$evidence_dir/secret-scan.txt")" == \
     'PASS: no credential-like assignment found' ]] || return 1
+  [[ "$(awk 'END {print NR + 0}' \
+      "$evidence_dir/tuic-handshake-probe.txt")" == 1 && \
+    "$(sed -n '1p' "$evidence_dir/tuic-handshake-probe.txt")" == \
+      "tuic_tcp_sink_probe target=$expected_target:$expected_iperf_port requested_duration_secs=1 "* && \
+    ! -s "$evidence_dir/tuic-handshake-probe.stderr.txt" ]] || return 1
 
   remote_file="$evidence_dir/remote.txt"
   remote_cpu="$(m2_resource_result_value "$remote_file" cpu_count)" || return 1
@@ -9035,6 +9098,9 @@ run_m2_action() {
       ;;
   esac
   require_root
+  require_command pmset
+  m2_prevent_idle_sleep_is_asserted || \
+    die "$action_description requires an active PreventUserIdleSystemSleep assertion"
   validate_m2_formal_config || \
     die "$action_description requires frozen M2 rates/durations and 30s sampling; unset M2_* overrides"
   [[ "$(m2_formal_count_model)" == \
@@ -10262,10 +10328,31 @@ owned_routes_are_restored() {
   fi
 }
 
+utun_snapshot_has_no_additions() {
+  local before_file="$1" current_file="$2" additions
+  [[ -f "$before_file" && ! -L "$before_file" && -r "$current_file" ]] || \
+    return 1
+  additions="$(comm -13 "$before_file" "$current_file")" || return 1
+  [[ -z "$additions" ]]
+}
+
 owned_tun_is_unavailable() {
-  local utun attempt
+  local utun attempt run_dir before_file current_file result
   utun="$(read_state utun 2>/dev/null || true)"
-  [[ -n "$utun" ]] || return 1
+  if [[ -z "$utun" ]]; then
+    run_dir="$(run_dir_from_state)" || return 1
+    before_file="$run_dir/utun.before"
+    current_file="$run_dir/.utun.stop.current.$$"
+    [[ ! -e "$current_file" && ! -L "$current_file" ]] || return 1
+    if ! list_utuns >"$current_file"; then
+      rm -f "$current_file"
+      return 1
+    fi
+    result=1
+    utun_snapshot_has_no_additions "$before_file" "$current_file" && result=0
+    rm -f "$current_file" || return 1
+    return "$result"
+  fi
   for ((attempt = 0; attempt < 5; attempt++)); do
     if ! ifconfig "$utun" >/dev/null 2>&1; then
       return 0

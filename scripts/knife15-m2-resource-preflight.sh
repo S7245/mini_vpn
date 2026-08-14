@@ -100,6 +100,37 @@ tuic_server_parts() {
   printf '%s %s\n' "${value%:*}" "${value##*:}"
 }
 
+tuic_handshake_probe_is_valid() {
+  local output="$1" stderr_file="$2" target="$3" port="$4"
+  [[ -f "$output" && ! -L "$output" && \
+    -f "$stderr_file" && ! -L "$stderr_file" && \
+    ! -s "$stderr_file" && \
+    "$(awk 'END {print NR + 0}' "$output")" == 1 ]] || return 1
+  grep -Eq \
+    "^tuic_tcp_sink_probe target=$target:$port requested_duration_secs=1 elapsed_ms=[0-9]+ bytes=[0-9]+ read_mbps=[0-9]+\\.[0-9]{3} reads=[0-9]+ first_rx_ms=(none|[0-9]+) max_read_gap_ms=[0-9]+ eof=(true|false)$" \
+    "$output"
+}
+
+run_tuic_handshake_probe() {
+  local output="$1" target="$2" port="$3" stderr_file
+  [[ -n "$output" && ! -e "$output" && ! -L "$output" ]] || return 1
+  [[ "$target" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ && \
+    "$port" =~ ^[0-9]+$ && 10#$port -le 65535 ]] || return 1
+  stderr_file="${output%.txt}.stderr.txt"
+  [[ ! -e "$stderr_file" && ! -L "$stderr_file" ]] || return 1
+  MINI_VPN_TUIC_CC=cubic \
+    MINI_VPN_TUIC_UDP_MODE=native \
+    MINI_VPN_TUIC_MTU_POLICY=default \
+    MINI_VPN_TUIC_ZERO_RTT=false \
+    MINI_VPN_TUIC_GSO_POLICY=enabled \
+    MINI_VPN_TUIC_UDP_SEND_SERVICE=quinn \
+    MINI_VPN_TUIC_PACING_POLICY=endpoint-window-v1 \
+    MINI_VPN_TUIC_TCP_POOL=2 \
+    "$BIN" tuic-tcp-sink-probe "$target:$port" 1 \
+      >"$output" 2>"$stderr_file" || return 1
+  tuic_handshake_probe_is_valid "$output" "$stderr_file" "$target" "$port"
+}
+
 runner_self_test() {
   local reference="$SCRIPT_DIR/knife15-m2-reference-33.json"
   local candidate="$SCRIPT_DIR/fixtures/knife15-m2-resource/distinct-provider.json"
@@ -143,6 +174,24 @@ runner_self_test() {
     candidate-distinct-provider ]] || die "profile value lookup failed"
   tmp="$(mktemp -d)"
   mkdir "$tmp/out"
+  cat >"$tmp/mini_vpn-probe" <<'EOF_FAKE_TUIC_PROBE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >"$M2_TEST_PROBE_ARGS"
+printf '%s\n' \
+  'tuic_tcp_sink_probe target=43.130.32.77:5201 requested_duration_secs=1 elapsed_ms=1000 bytes=0 read_mbps=0.000 reads=0 first_rx_ms=none max_read_gap_ms=0 eof=false'
+EOF_FAKE_TUIC_PROBE
+  chmod +x "$tmp/mini_vpn-probe"
+  (
+    local BIN="$tmp/mini_vpn-probe"
+    export M2_TEST_PROBE_ARGS="$tmp/probe.args"
+    run_tuic_handshake_probe "$tmp/probe.txt" 43.130.32.77 5201
+  ) || die "TUIC handshake probe fixture was rejected"
+  grep -Fqx 'tuic-tcp-sink-probe 43.130.32.77:5201 1' \
+    "$tmp/probe.args" || die "TUIC handshake probe command drifted"
+  printf '%s\n' 'unexpected second line' >>"$tmp/probe.txt"
+  ! tuic_handshake_probe_is_valid "$tmp/probe.txt" \
+    "$tmp/probe.stderr.txt" 43.130.32.77 5201 || \
+    die "multi-line TUIC handshake evidence was accepted"
   printf '%s\n' 'provider=fixture' >"$tmp/provider.txt"
   evidence_sha="$(sha256_file "$tmp/provider.txt")"
   (
@@ -398,6 +447,9 @@ run_preflight() {
   [[ "$remote_binary_sha" == "$expected_server_binary_sha" && \
     "$remote_config_sha" == "$expected_server_config_sha" ]] || \
     die "candidate server hash does not match the profile; evidence: $OUT_DIR"
+  run_tuic_handshake_probe "$OUT_DIR/tuic-handshake-probe.txt" \
+    "$candidate_target" "$candidate_iperf_port" || \
+    die "candidate TUIC handshake/authentication probe failed; evidence: $OUT_DIR"
 
   if grep -E -i \
     '(password|secret|token|private[ _-]?key|access[ _-]?key)[[:space:]]*[:=]' \
@@ -429,6 +481,7 @@ run_preflight() {
     echo "provider_identity_sha256=$(sha256_file "$OUT_DIR/provider-identity.txt")"
     echo "route_identity_sha256=$(sha256_file "$OUT_DIR/route-identity.txt")"
     echo "remote_sha256=$(sha256_file "$OUT_DIR/remote.txt")"
+    echo "tuic_handshake_probe_sha256=$(sha256_file "$OUT_DIR/tuic-handshake-probe.txt")"
     echo "exit_route_sha256=$(sha256_file "$OUT_DIR/exit.route.txt")"
     echo "target_route_sha256=$(sha256_file "$OUT_DIR/target.route.txt")"
     echo "exit_traceroute_sha256=$(sha256_file "$OUT_DIR/exit.traceroute.txt")"
@@ -440,7 +493,8 @@ run_preflight() {
     evidence-binding.json \
     provider-identity.txt route-identity.txt direct-manifest.txt \
     exit.route.txt target.route.txt exit.traceroute.txt target.traceroute.txt \
-    remote.txt remote.stderr secret-scan.txt result.txt; do
+    remote.txt remote.stderr tuic-handshake-probe.txt \
+    tuic-handshake-probe.stderr.txt secret-scan.txt result.txt; do
     printf '%s  %s\n' "$(sha256_file "$OUT_DIR/$evidence_file")" \
       "$evidence_file" >>"$OUT_DIR/SHA256SUMS"
   done

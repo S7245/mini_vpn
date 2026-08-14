@@ -649,6 +649,8 @@ def validate_resource_archive(mac: EvidenceArchive, stage: str) -> None:
             "target.traceroute.txt",
             "remote.txt",
             "remote.stderr",
+            "tuic-handshake-probe.txt",
+            "tuic-handshake-probe.stderr.txt",
             "secret-scan.txt",
             "result.txt",
             "SHA256SUMS",
@@ -829,6 +831,29 @@ def validate_mac_bundle(attempt: dict[str, Any], artifact_root: Path) -> None:
             archive.text(f"{resource_dir}/result.txt"),
             "resource preflight result",
         )
+        probe_bytes = archive.bytes(
+            f"{resource_dir}/tuic-handshake-probe.txt", 4096
+        )
+        probe_lines = archive.text(
+            f"{resource_dir}/tuic-handshake-probe.txt", 4096
+        ).splitlines()
+        probe_pattern = re.compile(
+            rf"tuic_tcp_sink_probe target={re.escape(attempt['target_ipv4'])}:"
+            rf"{attempt['target_iperf_port']} requested_duration_secs=1 "
+            r"elapsed_ms=[0-9]+ bytes=[0-9]+ read_mbps=[0-9]+\.[0-9]{3} "
+            r"reads=[0-9]+ first_rx_ms=(?:none|[0-9]+) "
+            r"max_read_gap_ms=[0-9]+ eof=(?:true|false)"
+        )
+        if len(probe_lines) != 1 or probe_pattern.fullmatch(probe_lines[0]) is None:
+            raise LedgerError("resource TUIC handshake probe is malformed")
+        if archive.bytes(f"{resource_dir}/tuic-handshake-probe.stderr.txt"):
+            raise LedgerError("resource TUIC handshake probe wrote stderr")
+        if required(
+            resource_result,
+            "tuic_handshake_probe_sha256",
+            "resource preflight result",
+        ) != sha256_bytes(probe_bytes):
+            raise LedgerError("resource TUIC handshake probe SHA-256 mismatch")
         resource_status = archive.text(
             f"{stage}-resource-admission.status",
             1024,
@@ -1534,6 +1559,12 @@ def make_valid_evidence_attempt(artifact_root: Path, role: str) -> dict[str, Any
         "route_identity_evidence_sha256": route_evidence_sha,
         "valid": True,
     }
+    tuic_handshake_probe = (
+        b"tuic_tcp_sink_probe target=43.130.32.77:5201 "
+        b"requested_duration_secs=1 elapsed_ms=1000 bytes=0 "
+        b"read_mbps=0.000 reads=0 first_rx_ms=none "
+        b"max_read_gap_ms=0 eof=false\n"
+    )
     resource_result = {
         "schema": "knife15-m2-resource-preflight-v1",
         "status": "pass",
@@ -1550,6 +1581,7 @@ def make_valid_evidence_attempt(artifact_root: Path, role: str) -> dict[str, Any
         "evidence_binding_sha256": sha256_bytes(
             (canonical_json(evidence_binding) + "\n").encode()
         ),
+        "tuic_handshake_probe_sha256": sha256_bytes(tuic_handshake_probe),
     }
     resource_files: dict[str, bytes] = {
         "reference-profile.json": (
@@ -1569,6 +1601,8 @@ def make_valid_evidence_attempt(artifact_root: Path, role: str) -> dict[str, Any
         "target.traceroute.txt": b"target traceroute\n",
         "remote.txt": b"schema=knife15-m2-resource-remote-v1\n",
         "remote.stderr": b"",
+        "tuic-handshake-probe.txt": tuic_handshake_probe,
+        "tuic-handshake-probe.stderr.txt": b"",
         "secret-scan.txt": b"PASS: no credential-like assignment found\n",
         "result.txt": key_value_bytes(resource_result),
     }
