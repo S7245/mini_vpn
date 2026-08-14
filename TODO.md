@@ -16,6 +16,8 @@ handshake preflight before any TUN start. It also enforces a global
 interface/gateway pre-ready cleanup.
 Result:
 `docs/tech/2026-08-14-knife15-m2-alibaba-candidate1-provisioning-and-preflight-results.md`.
+The real failed pre-ready state is now finalized with cleanup PASS in bundle
+SHA-256 `228533d3...`; no qualification slot was consumed.
 
 The `cdbfe36` formal M2 failure remains genuine and immutable. The user
 canceled the mature-client comparison before C0. The completed comparison

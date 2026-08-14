@@ -25,6 +25,11 @@
   pass with no unresolved P0/P1. No Rust or frozen value changed. Strict source
   admission now requires `0a1cf1c` or a descendant. Result:
   `docs/tech/2026-08-14-knife15-m2-alibaba-candidate1-provisioning-and-preflight-results.md`.
+- Real macOS GREEN: repaired `stop` finalized the pre-ready invalid run as
+  SHA-256 `228533d3...`; utun and Target/Exit/DNS restoration passed,
+  `cleanup_evidence=PASS`, qualification remains `not_run`, and formal
+  acceptance is `NOT_RUN`. The temporary caffeinate process is stopped and
+  TUIC credential variables are unset.
 
 - **HK Mac is agent-operated:** use
   `ssh -i ~/.ssh/vpn xiaoou@192.168.133.109` and the clean

@@ -203,6 +203,11 @@ Current Knife15 summary, as of 2026-08-14:
   frozen behavior changed. Strict source admission requires `0a1cf1c` or a
   descendant. Result:
   `docs/tech/2026-08-14-knife15-m2-alibaba-candidate1-provisioning-and-preflight-results.md`.
+- The exact invalid pre-ready state was finalized with the repaired cleanup.
+  Bundle SHA-256 `228533d3...` records unchanged utun ownership, restored
+  Target/Exit/DNS routes, `cleanup_evidence=PASS`, qualification `not_run`, and
+  formal acceptance `NOT_RUN`. It consumes no ledger slot. The bounded
+  caffeinate process was stopped and TUIC credential variables were unset.
 
 - Standing HK Mac execution access is now
   `ssh -i ~/.ssh/vpn xiaoou@192.168.133.109`. The agent may build, run the

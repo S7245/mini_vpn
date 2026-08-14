@@ -127,6 +127,21 @@ resource-preflight self-test, complete macOS runner self-test, continuity
 ledger self-test, diff check, and credential scan pass. Code review found no
 unresolved P0/P1.
 
+The repaired cleanup was then exercised against the exact failed pre-ready
+Mac state. The utun set was unchanged; Target, Exit, and DNS all matched their
+recorded pre-start `en0/192.168.133.1` route; `stop cleanup complete` was
+recorded; `cleanup_evidence=PASS`; and the secret scan passed. The finalized
+diagnostic bundle is:
+
+- path: `/tmp/mini_vpn_knife15_macos_20260814_112106.tar.gz`
+- SHA-256:
+  `228533d3c9669880d26a457482a706d1c176e03053d356477d85fbfb163cdb07`
+- immutable verdict: `m2_qualification_status=not_run`,
+  `formal_m2_acceptance=NOT_RUN`
+
+The temporary four-hour `caffeinate` process was stopped and all TUIC
+credential environment variables were unset after finalization.
+
 No Rust production code, TUIC data-plane behavior, M2 workload, SLI, rate,
 duration, D16, Endpoint pacing, MTU, QUIC windows, pool, chunk, Cubic, GSO, or
 self-wake value changed.
@@ -136,10 +151,9 @@ self-wake value changed.
 1. Add the narrow Alibaba inbound UDP 8443 `/32` rule.
 2. Prove one packet reaches the guest, then pull the reviewed descendant of
    `0a1cf1c` on the HK Mac.
-3. Finalize the invalid pre-ready run with the repaired `stop` path.
-4. Start a fresh bounded global `caffeinate`, rebuild, and capture a fresh
+3. Start a fresh bounded global `caffeinate`, rebuild, and capture a fresh
    baseline/direct/profile/resource preflight. The live TUIC probe must pass.
-5. Only then run one fresh smoke, observer, and strict qualification.
+4. Only then run one fresh smoke, observer, and strict qualification.
 
 Formal run 1, formal run 2, and M3 remain blocked until the strict
 qualification is sealed as PASS.
