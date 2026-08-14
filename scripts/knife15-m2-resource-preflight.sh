@@ -101,7 +101,7 @@ tuic_server_parts() {
 }
 
 runner_self_test() {
-  local reference="$SCRIPT_DIR/fixtures/knife15-m2-resource/reference-33.json"
+  local reference="$SCRIPT_DIR/knife15-m2-reference-33.json"
   local candidate="$SCRIPT_DIR/fixtures/knife15-m2-resource/distinct-provider.json"
   local equivalent="$SCRIPT_DIR/fixtures/knife15-m2-resource/equivalent-resize.json"
   local result tmp evidence_sha

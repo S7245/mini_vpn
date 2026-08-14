@@ -3313,7 +3313,7 @@ runner_self_test() {
   resource_provider_sha="$(sha256_file \
     "$resource_evidence/provider-identity.txt")"
   resource_route_sha="$(sha256_file "$resource_evidence/route-identity.txt")"
-  cp "$SCRIPT_DIR/fixtures/knife15-m2-resource/reference-33.json" \
+  cp "$SCRIPT_DIR/knife15-m2-reference-33.json" \
     "$resource_evidence/reference-profile.json"
   jq --arg source "$resource_source" \
     --arg binary "$resource_binary_sha" \

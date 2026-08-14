@@ -71,6 +71,10 @@ def fixture_path(name: str) -> Path:
     return Path(__file__).resolve().parent / "fixtures" / "knife15-m2-resource" / name
 
 
+def reference_path() -> Path:
+    return Path(__file__).resolve().parent / "knife15-m2-reference-33.json"
+
+
 def object_value(value: Any, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be an object")
@@ -349,7 +353,7 @@ def validate_profile(value: Any) -> dict[str, Any]:
 
 
 def self_test() -> None:
-    reference: Any = read_json(str(fixture_path("reference-33.json")))
+    reference: Any = read_json(str(reference_path()))
     candidate: Any = read_json(str(fixture_path("distinct-provider.json")))
     minimal_reference = {
         "schema": "knife15-m2-resource-reference-v1",
