@@ -1,5 +1,19 @@
 # Errors
 
+## 2026-08-14 - The first formal-failure interpretation jumped from an internal SLI to a product architecture choice
+
+- The `cdbfe36` receiver-zero evidence correctly failed formal M2 and correctly
+  proved that standard TUIC cannot migrate that already-open remote TCP socket.
+  It did not prove that mainstream VPN products promise zero complete
+  one-second receive gaps on the same lossy path.
+- Treating the next choice as immediately binary between a custom resumable
+  server and weakening acceptance skipped the cheaper same-path mature-client
+  discriminator. That would risk funding a large architecture for a stricter
+  requirement than the product needs.
+- Future behavior: preserve the failure, freeze formal M2/M3, implement the
+  market-calibration harness, and use matched evidence before selecting any
+  architecture replacement.
+
 ## 2026-08-14 - Formal M2 failed on an ACK-progressing established TUIC stream
 
 - Exact-source `cdbfe36` passed every preflight, four complete cycles, 36

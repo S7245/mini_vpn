@@ -189,6 +189,23 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-14:
 
+- The accepted next stage is market continuity calibration, not an immediate
+  architecture replacement. Public mature-VPN contracts do not establish a
+  hard guarantee that every established flow receives bytes in every complete
+  one-second interval. The `cdbfe36` formal failure remains valid, but it is
+  not sufficient product evidence for a custom resumable/path-diverse server.
+- First implement the isolated harness in the accepted calibration spec/plan,
+  then run one roughly 90-minute mature-TUIC C0 trial using the same HK Mac,
+  `.33:8443` Exit, `.77:5201` Target, one immutable direct-derived load
+  profile, and a fresh paired observer. Quality events continue; invalid
+  evidence fails closed. If mature TUIC is clean, use matched alternating C1
+  trials before attributing a mini_vpn differential. Commercial VPNs on their
+  own exits are QoE evidence only.
+- Do not change the frozen formal runner or Rust data plane, run formal M2/M3,
+  tune frozen values, or open a custom-server branch during calibration.
+  Specifications:
+  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-spec.md` and
+  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-implementation-plan.md`.
 - Exact-source `cdbfe36` formal artifact
   `/tmp/mini_vpn_knife15_macos_20260814_014536.tar.gz` (SHA-256
   `2c002684...`) passed baseline `32.701/56.515 Mbit/s`, bounded direct
@@ -214,10 +231,9 @@ Current Knife15 summary, as of 2026-08-14:
   path-diverse established stream requires a custom Upstream protocol/server,
   contradicting ADR-0004's accepted client-only sing-box interoperability.
 - Freeze reviewed `cdbfe36`. Do not repeat formal M2 unchanged or tune frozen
-  values. The next work is an explicit architecture/product decision between
-  a custom resumable/path-diverse Upstream and a product-evidenced change to
-  the one-second continuity acceptance contract. Until then formal M2 and M3
-  remain blocked. Result:
+  values. The calibration stage now determines whether the one-second event is
+  a mini_vpn differential or a path/market property. Formal M2 and M3 remain
+  blocked. Result:
   `docs/tech/2026-08-14-knife15-m2-ack-progress-native-loss-recovery-formal-failure-results.md`.
 
 - Exact-source `d91f205` paired qualification artifact

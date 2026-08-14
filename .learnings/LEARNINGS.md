@@ -1,5 +1,25 @@
 # Learnings
 
+## 2026-08-14 - Calibrate an internal continuity SLI before funding architecture replacement
+
+- A valid internal test failure does not prove that its zero-tolerance SLI is
+  a market contract. Availability, automatic reconnect, kill switch, aggregate
+  throughput, and per-flow one-second continuity are different product claims.
+- Use a same-path mature-client control for causal comparison: same Mac, TUIC
+  Exit/server, Target, offered-load profile, and paired observer. A commercial
+  VPN with its own exit is useful QoE evidence but cannot isolate client code.
+- Continue a short calibration through quality events so frequency and runs
+  are measurable; stop only when evidence is invalid. This is different from
+  a formal acceptance run that must fail on the first SLI breach.
+- Escalate test cost in stages: one roughly 90-minute mature-client C0, then
+  matched alternating C1 only if C0 is clean. Do not spend another 25 hours or
+  design a custom protocol while the cheaper discriminator is unresolved.
+- Preserve the historical artifact verdict. Correcting the next decision does
+  not rewrite a genuine formal failure.
+- Specifications:
+  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-spec.md` and
+  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-implementation-plan.md`.
+
 ## 2026-08-14 - ACK progress and aggregate throughput do not prove one-second continuity
 
 - A QUIC connection can keep ACKing bytes and recover acceptable aggregate

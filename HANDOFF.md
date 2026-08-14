@@ -2,9 +2,31 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 M2 Architecture Decision (2026-08-14)
+## Next Planned Stage — Knife15 M2 Market Continuity Calibration (2026-08-14)
 
-- **Latest accepted position:** exact-source `cdbfe36` formal artifact
+- **Latest decision:** the one-second zero-tolerance Target receiver SLI is a
+  valid internal discriminator, but public mature-VPN contracts do not support
+  treating it as a mainstream uninterrupted per-flow guarantee. Do not select
+  a custom resumable/path-diverse protocol from the `cdbfe36` failure alone.
+- Implement the isolated market-calibration harness specified in
+  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-spec.md`
+  and its seven-task implementation plan. Keep the frozen formal runner and
+  production data plane unchanged during harness construction.
+- The decisive first gate is a roughly 90-minute, six-cycle mature TUIC trial
+  using the same HK Mac, `.33:8443` TUIC service, `.77:5201` Target, one frozen
+  direct-derived load profile, and a fresh paired Exit observer. Quality events
+  are recorded and the schedule continues; invalid evidence still fails closed.
+- If the mature client also has complete one-second receiver-zero intervals,
+  recalibrate the product SLI rather than replace the architecture. If it has
+  none, run matched alternating mature/mini_vpn trials before attributing a
+  mini_vpn-specific gap. Commercial VPNs with their own exits are QoE evidence
+  only and cannot decide client causality.
+- Do not run formal M2 or M3 and do not tune frozen values during calibration.
+  Result and plan:
+  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-spec.md` and
+  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-implementation-plan.md`.
+
+- **Accepted formal-failure basis:** exact-source `cdbfe36` formal artifact
   `/tmp/mini_vpn_knife15_macos_20260814_014536.tar.gz` (SHA-256
   `2c002684...`) passed baseline `32.701/56.515 Mbit/s`, bounded direct
   `16.341 Mbit/s`, smoke, every preflight, four complete cycles/36 phases,
@@ -30,11 +52,10 @@
   socket. Established-stream migration requires a custom resumable Upstream
   protocol/server and conflicts with ADR-0004's accepted sing-box/client-only
   direction.
-- Do not repeat formal M2 unchanged and do not tune frozen values. The next
-  work is an explicit architecture/product decision: authorize a resumable or
-  path-diverse server protocol, or revise the one-second continuity acceptance
-  contract with product evidence. Until then, freeze `cdbfe36`; M2 and M3 are
-  blocked. Result:
+- Do not repeat formal M2 unchanged and do not tune frozen values. Freeze
+  `cdbfe36`; M2 and M3 remain blocked while the accepted market-calibration
+  stage determines whether the one-second event is a mini_vpn differential or
+  a path/market property. Result:
   `docs/tech/2026-08-14-knife15-m2-ack-progress-native-loss-recovery-formal-failure-results.md`.
 
 - **Previous accepted position:** exact-source `d91f205` paired qualification

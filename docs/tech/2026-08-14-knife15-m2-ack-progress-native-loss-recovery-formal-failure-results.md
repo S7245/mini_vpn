@@ -165,3 +165,20 @@ formal M2 until a separate architecture decision either:
 
 Neither decision is implicit in this result. Formal M2 remains failed and M3
 remains blocked.
+
+## Subsequent Market-Calibration Decision
+
+The architecture boundary above remains correct: standard TUIC cannot migrate
+the already-established remote TCP socket. A subsequent product review found
+that this formal result alone does not establish that zero complete one-second
+receiver gaps is a mainstream VPN contract. Mature products publicly describe
+availability, reconnection, kill-switch behavior, and aggregate service, not
+this exact per-flow zero-tolerance guarantee.
+
+Therefore the accepted next step is not an immediate custom protocol/server.
+It is a same-path mature-TUIC calibration using the same Mac, `.33` Exit,
+`.77` Target, immutable offered-load profile, and paired observer. The original
+artifact remains `FORMAL M2 FAIL`; only the next-decision scope changed. See:
+
+- `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-spec.md`;
+- `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-implementation-plan.md`.

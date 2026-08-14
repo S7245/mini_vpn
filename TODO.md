@@ -2,9 +2,35 @@
 
 ## Current Knife15 Plan (2026-08-14)
 
-### Established-stream continuity architecture decision after the formal HK gate
+### Market continuity calibration before an established-stream architecture decision
 
-#### Latest decision (2026-08-14 — formal M2 reached the standard-TUIC established-stream architecture stop)
+#### Latest decision (2026-08-14 — calibrate the one-second SLI before changing architecture)
+
+The `cdbfe36` formal M2 failure remains genuine and immutable, but public
+mature-VPN contracts emphasize availability, reconnect, kill-switch behavior,
+and aggregate service rather than guaranteeing nonzero delivery in every
+one-second interval of every established TCP flow. The evidence therefore does
+not yet justify a custom resumable/path-diverse protocol and server.
+
+Next:
+
+1. implement the isolated calibration harness without changing the frozen
+   formal M2 runner or Rust production data plane;
+2. derive one immutable offered-load profile with VPN off;
+3. run one roughly 90-minute/six-cycle C0 trial using a mature TUIC client on
+   the same HK Mac, `.33:8443` Exit, `.77:5201` Target, and fresh paired Exit
+   observer;
+4. record quality events and continue, but fail closed on invalid evidence;
+5. if mature TUIC also has receiver-zero intervals, recalibrate the product
+   SLI; if it has none, run matched alternating mature/mini_vpn C1 trials
+   before selecting an architecture investigation;
+6. keep formal M2 and M3 blocked and do not tune frozen values.
+
+Specifications:
+`docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-spec.md` and
+`docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-implementation-plan.md`.
+
+#### Formal-failure basis (2026-08-14 — M2 reached the standard-TUIC one-second continuity stop)
 
 Exact-source `cdbfe36` formal artifact
 `/tmp/mini_vpn_knife15_macos_20260814_014536.tar.gz` (SHA-256 `2c002684...`)
@@ -29,15 +55,13 @@ opens, but neither can migrate the established Target TCP socket. Reusing
 same-path reset/rebind is formally rejected; a duplicate TUIC Connect is a
 different Target socket.
 
-Next:
+Previous next decision, now superseded by the market-calibration stage above:
 
 1. do not repeat formal M2 unchanged and do not tune any frozen value;
 2. freeze reviewed behavior at `cdbfe36`;
-3. make an explicit product/architecture decision between a custom resumable
-   or path-diverse Upstream protocol/server and a product-evidenced change to
-   the one-second continuity acceptance contract;
-4. keep formal M2 failed and M3 blocked until that decision produces a new
-   sufficient architecture and deterministic test seam.
+3. do not choose between a custom Upstream and a revised acceptance contract
+   until the same-path mature-client discriminator is complete;
+4. keep formal M2 failed and M3 blocked meanwhile.
 
 Result:
 `docs/tech/2026-08-14-knife15-m2-ack-progress-native-loss-recovery-formal-failure-results.md`.
