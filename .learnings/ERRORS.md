@@ -1,5 +1,14 @@
 # Errors
 
+## 2026-08-14 - A multi-command final gate did not fail fast
+
+- `git diff --check` reported one extra blank line at EOF, but the shell block
+  lacked `set -e`, so later staging/commit/push commands still ran. No runtime
+  behavior was affected; a follow-up docs commit removed the whitespace.
+- Future behavior: run final mutation blocks with `set -e` or gate each step
+  explicitly before staging. Never infer that an early command controlled later
+  newline-separated commands.
+
 ## 2026-08-14 - A zsh loop variable named `path` erased command lookup
 
 - A final read-only docs scan used `for path in ...` under zsh. Lowercase

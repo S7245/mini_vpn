@@ -123,4 +123,3 @@ Exit observer sha256=ed550b968978df549d9b37b86e6f4f423ddbd142fc3abd458c92eab6e4e
 - Identity, integrity, source/profile, route, observer, result, or cleanup
   evidence is invalid: `NO_DECISION`; repair and repeat only that invalid C0.
 - Do not run formal M2/M3 or tune production/frozen values during calibration.
-
