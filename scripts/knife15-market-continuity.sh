@@ -16,6 +16,22 @@ MARKET_TCP_SECS=300
 MARKET_UDP_SECS=180
 MARKET_SHORT_SECS=10
 MARKET_SHORT_COUNT=6
+MARKET_ACTIVE_COMMAND_PID=''
+MARKET_ACTIVE_WATCHDOG_PID=''
+MARKET_OBSERVER_ARMED=0
+MARKET_OBSERVER_FINALIZE_ATTEMPTED=0
+MARKET_OBSERVER_FINALIZATION_STATUS=not_started
+MARKET_OBSERVER_REMOTE_RUN_DIR=''
+MARKET_OBSERVER_BUNDLE=''
+MARKET_OBSERVER_SHA256=''
+MARKET_INTERRUPT_SIGNAL=''
+MARKET_RUN_DIR=''
+MARKET_OBSERVER_SCRIPT=''
+MARKET_OBSERVER_TARGET=''
+MARKET_OBSERVER_IPERF_PORT=''
+MARKET_OBSERVER_TUIC_PORT=''
+MARKET_MAC_BUNDLE=''
+MARKET_MAC_SHA256=''
 
 die() {
   echo "ERROR: $*" >&2
@@ -286,6 +302,9 @@ validate_client_identity() {
   [[ -n "$version" && ${#version} -le 160 && \
     "$version" != *$'\n'* && "$version" != *$'\r'* && "$version" != *$'\t'* ]] || \
     return 1
+  [[ ! "$version" =~ [0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12} && \
+    "$version" != *MINI_VPN_TUIC_UUID* && \
+    "$version" != *MINI_VPN_TUIC_PASSWORD* ]] || return 1
   [[ "$vpn_if" =~ ^utun[0-9]+$ ]] || return 1
   [[ "$physical_if" =~ ^[a-z][a-z0-9]*$ && \
     "$physical_if" != utun* && "$physical_if" != lo0 ]] || return 1
@@ -654,6 +673,7 @@ run_market_phase() {
   local receiver_zero max_zero_run sender_zero gap_bytes loss_percent
   local protocol_cli
   local -a command
+  [[ -z "$MARKET_INTERRUPT_SIGNAL" ]] || return 1
   result_file="$run_dir/cycle_$(printf '%03d' "$cycle")_${phase}.json"
   summary_file="$run_dir/cycle_$(printf '%03d' "$cycle")_${phase}.summary.json"
   timeout_secs=$((10#$duration + 10#$timeout_grace))
@@ -746,9 +766,33 @@ validate_dns_name() {
 run_cycle_probes() {
   local run_dir="$1" cycle="$2" dig_bin="$3" curl_bin="$4"
   local dns_target="$5" dns_name="$6" expected_egress="$7"
-  local dns_file egress_file dns_ipv4='' line egress timestamp
+  local route_bin="$8" vpn_if="$9" physical_if="${10}" tuic_exit_ipv4="${11}"
+  local dns_file egress_file dns_ipv4='' line egress timestamp prefix
+  local target_route_text exit_route_text default_route_text dns_route_text
+  [[ -z "$MARKET_INTERRUPT_SIGNAL" ]] || return 1
+  prefix="$run_dir/cycle_$(printf '%03d' "$cycle")"
   dns_file="$run_dir/cycle_$(printf '%03d' "$cycle")_dns.txt"
   egress_file="$run_dir/cycle_$(printf '%03d' "$cycle")_egress.txt"
+  "$route_bin" -n get "$TARGET" >"${prefix}_route-target.txt" 2>&1 && \
+    "$route_bin" -n get "$tuic_exit_ipv4" >"${prefix}_route-exit.txt" 2>&1 && \
+    "$route_bin" -n get default >"${prefix}_route-default.txt" 2>&1 && \
+    "$route_bin" -n get "$dns_target" >"${prefix}_route-dns.txt" 2>&1 || {
+    printf '%s\t%s\tcycle-probes\troute_snapshot_failed\t%s\n' \
+      "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$cycle" \
+      "$(basename "$prefix")" >>"$run_dir/invalid.tsv"
+    return 1
+  }
+  target_route_text="$(sed -n '1,80p' "${prefix}_route-target.txt")"
+  exit_route_text="$(sed -n '1,80p' "${prefix}_route-exit.txt")"
+  default_route_text="$(sed -n '1,80p' "${prefix}_route-default.txt")"
+  dns_route_text="$(sed -n '1,80p' "${prefix}_route-dns.txt")"
+  route_contract_is_valid "$target_route_text" "$exit_route_text" \
+    "$default_route_text" "$dns_route_text" "$vpn_if" "$physical_if" || {
+    printf '%s\t%s\tcycle-probes\troute_contract_failed\t%s\n' \
+      "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$cycle" \
+      "$(basename "$prefix")" >>"$run_dir/invalid.tsv"
+    return 1
+  }
   if ! run_logged_with_timeout "$dns_file" 10 "$dig_bin" \
     +time=5 +tries=1 +short A "$dns_name" "@$dns_target"; then
     printf '%s\t%s\tcycle-probes\tdns_command_failed\t%s\n' \
@@ -791,13 +835,16 @@ run_market_workload() {
   local run_dir="$1" profile_file="$2" iperf_bin="$3" timeout_grace="$4"
   local dig_bin="$5" curl_bin="$6" dns_target="$7" dns_name="$8"
   local expected_egress="$9"
+  local route_bin="${10}" vpn_if="${11}" physical_if="${12}"
+  local tuic_exit_ipv4="${13}"
   local cycles tcp_secs udp_secs short_secs short_count forward_rate reverse_rate
   local udp_rate short_forward_rate short_reverse_rate cycle short_index
   local phase reverse rate event_count
   [[ -d "$run_dir" && ! -L "$run_dir" && -x "$iperf_bin" && \
-    -x "$dig_bin" && -x "$curl_bin" ]] || return 1
+    -x "$dig_bin" && -x "$curl_bin" && -x "$route_bin" ]] || return 1
   validate_ipv4 "$dns_target" && validate_dns_name "$dns_name" && \
-    validate_ipv4 "$expected_egress" || return 1
+    validate_ipv4 "$expected_egress" && validate_client_identity market-health \
+      internal "$vpn_if" "$physical_if" "$tuic_exit_ipv4" || return 1
   [[ "$timeout_grace" =~ ^[0-9]+$ && 10#$timeout_grace -le 30 ]] || return 1
   cycles="$(profile_value "$profile_file" cycles)" || return 1
   tcp_secs="$(profile_value "$profile_file" tcp_secs)" || return 1
@@ -860,7 +907,8 @@ run_market_workload() {
       }
     done
     run_cycle_probes "$run_dir" "$cycle" "$dig_bin" "$curl_bin" \
-      "$dns_target" "$dns_name" "$expected_egress" || {
+      "$dns_target" "$dns_name" "$expected_egress" "$route_bin" "$vpn_if" \
+      "$physical_if" "$tuic_exit_ipv4" || {
       printf '%s\n' INVALID >"$run_dir/status"
       return 1
     }
@@ -873,12 +921,570 @@ run_market_workload() {
   fi
 }
 
+value_from_text() {
+  local text="$1" key="$2"
+  awk -F= -v key="$key" '
+    $1 == key {
+      count++
+      value = substr($0, length(key) + 2)
+    }
+    END {
+      if (count != 1 || value == "") exit 1
+      print value
+    }
+  ' <<<"$text"
+}
+
+observer_status_identity_matches() {
+  local status_text="$1" target="$2" iperf_port="$3" tuic_port="$4"
+  local expected_run_dir="$5"
+  [[ "$(value_from_text "$status_text" schema)" == \
+    knife15-exit-target-observer-v2 ]] || return 1
+  [[ "$(value_from_text "$status_text" run_dir)" == "$expected_run_dir" ]] || \
+    return 1
+  [[ "$(value_from_text "$status_text" target)" == "$target" ]] || return 1
+  [[ "$(value_from_text "$status_text" iperf_port)" == "$iperf_port" ]] || \
+    return 1
+  [[ "$(value_from_text "$status_text" tuic_port)" == "$tuic_port" ]] || \
+    return 1
+  [[ "$(value_from_text "$status_text" timeout_secs)" == 93600 ]]
+}
+
+observer_status_is_valid() {
+  local status_text="$1" target="$2" iperf_port="$3" tuic_port="$4"
+  local expected_run_dir="$5" elapsed drops
+  observer_status_identity_matches "$status_text" "$target" "$iperf_port" \
+    "$tuic_port" "$expected_run_dir" || return 1
+  [[ "$(value_from_text "$status_text" status)" == active ]] || return 1
+  [[ "$(value_from_text "$status_text" observer_healthy)" == 1 ]] || return 1
+  [[ "$(value_from_text "$status_text" tcpdump_live)" == 1 ]] || return 1
+  [[ "$(value_from_text "$status_text" sampler_live)" == 1 ]] || return 1
+  [[ "$(value_from_text "$status_text" counter_sampler_live)" == 1 ]] || return 1
+  elapsed="$(value_from_text "$status_text" elapsed_secs)" || return 1
+  [[ "$elapsed" =~ ^[0-9]+$ && 10#$elapsed -le 900 ]] || return 1
+  drops="$(value_from_text "$status_text" capture_kernel_drops)" || return 1
+  [[ "$drops" == unknown || "$drops" == 0 ]]
+}
+
+observer_call() {
+  local observer_script="$1" action="$2" target="$3" iperf_port="$4"
+  local tuic_port="$5"
+  regular_file "$observer_script" || return 1
+  TARGET="$target" IPERF_PORT="$iperf_port" TUIC_PORT="$tuic_port" \
+    OBSERVER_TIMEOUT_SECS=93600 /bin/bash "$observer_script" "$action"
+}
+
+observer_call_to_file() {
+  local output_file="$1" timeout_secs="$2" observer_script="$3" action="$4"
+  local target="$5" iperf_port="$6" tuic_port="$7"
+  regular_file "$observer_script" || return 1
+  run_logged_with_timeout "$output_file" "$timeout_secs" /usr/bin/env \
+    "TARGET=$target" "IPERF_PORT=$iperf_port" "TUIC_PORT=$tuic_port" \
+    OBSERVER_TIMEOUT_SECS=93600 /bin/bash "$observer_script" "$action"
+}
+
+start_observer_and_bind() {
+  local evidence_dir="$1" observer_script="$2" target="$3" iperf_port="$4"
+  local tuic_port="$5" start_text status_text remote_run_dir
+  [[ -d "$evidence_dir" && ! -L "$evidence_dir" ]] || return 1
+  MARKET_OBSERVER_ARMED=0
+  MARKET_OBSERVER_FINALIZE_ATTEMPTED=0
+  MARKET_OBSERVER_FINALIZATION_STATUS=not_started
+  MARKET_OBSERVER_REMOTE_RUN_DIR=''
+  MARKET_OBSERVER_BUNDLE=''
+  MARKET_OBSERVER_SHA256=''
+  if observer_call_to_file "$evidence_dir/observer-pre-start-status.txt" 30 \
+    "$observer_script" status "$target" "$iperf_port" "$tuic_port"; then
+    printf 'reason=preexisting_observer_state\n' \
+      >"$evidence_dir/observer-start-failure.txt"
+    return 1
+  fi
+  if ! observer_call_to_file "$evidence_dir/observer-start.txt" 60 \
+    "$observer_script" start "$target" "$iperf_port" "$tuic_port"; then
+    printf 'reason=observer_start_failed\n' \
+      >"$evidence_dir/observer-start-failure.txt"
+    return 1
+  fi
+  start_text="$(sed -n '1,40p' "$evidence_dir/observer-start.txt")"
+  remote_run_dir="$(value_from_text "$start_text" run_dir)" || return 1
+  [[ "$remote_run_dir" =~ ^/tmp/mini_vpn_knife15_exit_target_observer_[0-9]{8}_[0-9]{6}$ ]] || \
+    return 1
+  MARKET_OBSERVER_REMOTE_RUN_DIR="$remote_run_dir"
+  MARKET_OBSERVER_ARMED=1
+  grep -Fxq 'PASS: Exit observer started' \
+    "$evidence_dir/observer-start.txt" || return 1
+  printf '%s\n' \
+    'schema=knife15-market-observer-binding-v1' \
+    "bound_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    "observer_script_sha256=$(sha256_file "$observer_script")" \
+    "remote_run_dir=$remote_run_dir" \
+    "target=$target" \
+    "iperf_port=$iperf_port" \
+    "tuic_port=$tuic_port" \
+    >"$evidence_dir/observer-binding.txt" || return 1
+  if ! observer_call_to_file "$evidence_dir/observer-start-status.txt" 30 \
+    "$observer_script" status "$target" "$iperf_port" "$tuic_port"; then
+    return 1
+  fi
+  status_text="$(sed -n '1,80p' "$evidence_dir/observer-start-status.txt")"
+  observer_status_is_valid "$status_text" "$target" "$iperf_port" \
+    "$tuic_port" "$remote_run_dir"
+}
+
+finalize_bound_observer() {
+  local evidence_dir="$1" observer_script="$2" target="$3" iperf_port="$4"
+  local tuic_port="$5" reason="$6" final_file status_text freeze_text bundle_text
+  local bundle sha256 frozen_status_text capture_drops finalization_valid=1
+  if [[ "$MARKET_OBSERVER_ARMED" != 1 ]]; then
+    [[ "$MARKET_OBSERVER_FINALIZATION_STATUS" == complete ]]
+    return
+  fi
+  if [[ "$MARKET_OBSERVER_FINALIZE_ATTEMPTED" == 1 ]]; then
+    [[ "$MARKET_OBSERVER_FINALIZATION_STATUS" == complete ]]
+    return
+  fi
+  MARKET_OBSERVER_FINALIZE_ATTEMPTED=1
+  MARKET_OBSERVER_FINALIZATION_STATUS=failed
+  final_file="$evidence_dir/observer-finalization.txt"
+  printf '%s\n' \
+    'schema=knife15-market-observer-finalization-v1' \
+    "started_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    "reason=$reason" >"$final_file" || return 1
+  if ! observer_call_to_file "$evidence_dir/observer-final-status.txt" 30 \
+    "$observer_script" status "$target" "$iperf_port" "$tuic_port"; then
+    printf 'finalization_status=status_failed\n' >>"$final_file"
+    MARKET_OBSERVER_ARMED=0
+    return 1
+  fi
+  status_text="$(sed -n '1,80p' "$evidence_dir/observer-final-status.txt")"
+  if ! observer_status_identity_matches "$status_text" "$target" "$iperf_port" \
+    "$tuic_port" "$MARKET_OBSERVER_REMOTE_RUN_DIR"; then
+    printf 'finalization_status=identity_mismatch\n' >>"$final_file"
+    MARKET_OBSERVER_ARMED=0
+    return 1
+  fi
+  if ! observer_call_to_file "$evidence_dir/observer-freeze.txt" 60 \
+    "$observer_script" freeze "$target" "$iperf_port" "$tuic_port"; then
+    printf 'finalization_status=freeze_failed\n' >>"$final_file"
+    MARKET_OBSERVER_ARMED=0
+    return 1
+  fi
+  freeze_text="$(sed -n '1,40p' "$evidence_dir/observer-freeze.txt")"
+  if [[ "$(value_from_text "$freeze_text" run_dir)" != \
+    "$MARKET_OBSERVER_REMOTE_RUN_DIR" ]] || \
+    ! grep -Fxq 'PASS: Exit observer frozen' "$evidence_dir/observer-freeze.txt"; then
+    printf 'finalization_status=freeze_identity_mismatch\n' >>"$final_file"
+    MARKET_OBSERVER_ARMED=0
+    return 1
+  fi
+  if ! observer_call_to_file "$evidence_dir/observer-frozen-status.txt" 30 \
+    "$observer_script" status "$target" "$iperf_port" "$tuic_port"; then
+    finalization_valid=0
+  else
+    frozen_status_text="$(sed -n '1,80p' \
+      "$evidence_dir/observer-frozen-status.txt")"
+    if ! observer_status_identity_matches "$frozen_status_text" "$target" \
+      "$iperf_port" "$tuic_port" "$MARKET_OBSERVER_REMOTE_RUN_DIR"; then
+      finalization_valid=0
+    else
+      capture_drops="$(value_from_text "$frozen_status_text" \
+        capture_kernel_drops 2>/dev/null || echo unknown)"
+      [[ "$capture_drops" == 0 ]] || finalization_valid=0
+    fi
+  fi
+  if ! observer_call_to_file "$evidence_dir/observer-bundle.txt" 120 \
+    "$observer_script" bundle "$target" "$iperf_port" "$tuic_port"; then
+    printf 'finalization_status=bundle_failed\n' >>"$final_file"
+    MARKET_OBSERVER_ARMED=0
+    return 1
+  fi
+  bundle_text="$(sed -n '1,40p' "$evidence_dir/observer-bundle.txt")"
+  grep -Fxq 'PASS: Exit observer bundle finalized' \
+    "$evidence_dir/observer-bundle.txt" || {
+    printf 'finalization_status=bundle_evidence_invalid\n' >>"$final_file"
+    MARKET_OBSERVER_ARMED=0
+    return 1
+  }
+  bundle="$(value_from_text "$bundle_text" bundle)" || {
+    printf 'finalization_status=bundle_path_missing\n' >>"$final_file"
+    MARKET_OBSERVER_ARMED=0
+    return 1
+  }
+  sha256="$(value_from_text "$bundle_text" sha256)" || {
+    printf 'finalization_status=bundle_sha_missing\n' >>"$final_file"
+    MARKET_OBSERVER_ARMED=0
+    return 1
+  }
+  [[ "$bundle" =~ ^/tmp/mini_vpn_knife15_exit_target_observer_[0-9]{8}_[0-9]{6}[.]tar[.]gz$ && \
+    "$sha256" =~ ^[0-9a-f]{64}$ ]] || {
+    printf 'finalization_status=bundle_identity_invalid\n' >>"$final_file"
+    MARKET_OBSERVER_ARMED=0
+    return 1
+  }
+  MARKET_OBSERVER_BUNDLE="$bundle"
+  MARKET_OBSERVER_SHA256="$sha256"
+  MARKET_OBSERVER_ARMED=0
+  if ((finalization_valid == 1)); then
+    MARKET_OBSERVER_FINALIZATION_STATUS=complete
+  else
+    MARKET_OBSERVER_FINALIZATION_STATUS=evidence_invalid
+  fi
+  printf '%s\n' \
+    "observer_bundle=$bundle" \
+    "observer_sha256=$sha256" \
+    "finalization_status=$MARKET_OBSERVER_FINALIZATION_STATUS" >>"$final_file"
+  ((finalization_valid == 1))
+}
+
+market_secret_scan() {
+  local run_dir="$1" result_file="$run_dir/secret-scan.txt" scan_status
+  grep -Erq --exclude='secret-scan.txt' --exclude='SHA256SUMS' -- \
+    'MINI_VPN_TUIC_(UUID|PASSWORD)[=:]|BEGIN [A-Z ]*PRIVATE KEY|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' \
+    "$run_dir" 2>/dev/null
+  scan_status=$?
+  case "$scan_status" in
+    0)
+      printf 'FAIL: secret-shaped material found; bundle not created\n' \
+        >"$result_file"
+      return 1
+      ;;
+    1)
+      printf 'PASS: no credential names, private-key markers, or UUID-shaped values found\n' \
+        >"$result_file"
+      ;;
+    *)
+      printf 'FAIL: secret scan could not read every input\n' >"$result_file"
+      return 1
+      ;;
+  esac
+}
+
+market_bundle_is_valid() {
+  local run_dir="$1" bundle checksum_file
+  local fields expected name
+  bundle="$run_dir.tar.gz"
+  checksum_file="$run_dir.tar.gz.sha256"
+  regular_file "$bundle" && regular_file "$checksum_file" || return 1
+  fields="$(awk 'NF == 2 {count++; print $1 "\t" $2} END {
+    if (count != 1) exit 1
+  }' "$checksum_file")" || return 1
+  IFS=$'\t' read -r expected name <<<"$fields"
+  [[ "$expected" =~ ^[0-9a-f]{64}$ && "$name" == "$bundle" ]] || return 1
+  [[ "$expected" == "$(sha256_file "$bundle")" ]]
+}
+
+publish_market_bundle() {
+  local run_dir="$1" bundle checksum_file
+  local parent base tmp_bundle tmp_checksum sums_tmp checksum relative hash
+  bundle="$run_dir.tar.gz"
+  checksum_file="$run_dir.tar.gz.sha256"
+  [[ -d "$run_dir" && ! -L "$run_dir" ]] || return 1
+  if market_bundle_is_valid "$run_dir"; then
+    MARKET_MAC_BUNDLE="$bundle"
+    MARKET_MAC_SHA256="$(sha256_file "$bundle")"
+    return 0
+  fi
+  [[ ! -e "$bundle" && ! -L "$bundle" && ! -e "$checksum_file" && \
+    ! -L "$checksum_file" ]] || return 1
+  market_secret_scan "$run_dir" || return 1
+  parent="$(dirname "$run_dir")"
+  base="$(basename "$run_dir")"
+  sums_tmp="$(mktemp "$parent/.knife15-market-sums.XXXXXX")" || return 1
+  if ! (
+    cd "$run_dir"
+    while IFS= read -r relative; do
+      hash="$(sha256_file "$relative")" || exit 1
+      printf '%s  %s\n' "$hash" "$relative"
+    done < <(find . -type f ! -name SHA256SUMS | LC_ALL=C sort)
+  ) >"$sums_tmp"; then
+    rm -f "$sums_tmp"
+    return 1
+  fi
+  mv "$sums_tmp" "$run_dir/SHA256SUMS" || {
+    rm -f "$sums_tmp"
+    return 1
+  }
+  tmp_bundle="$bundle.tmp.$$"
+  tmp_checksum="$checksum_file.tmp.$$"
+  [[ ! -e "$tmp_bundle" && ! -e "$tmp_checksum" ]] || return 1
+  tar -C "$parent" -czf "$tmp_bundle" "$base" || {
+    rm -f "$tmp_bundle" "$tmp_checksum"
+    return 1
+  }
+  checksum="$(sha256_file "$tmp_bundle")" || {
+    rm -f "$tmp_bundle" "$tmp_checksum"
+    return 1
+  }
+  printf '%s  %s\n' "$checksum" "$bundle" >"$tmp_checksum" || {
+    rm -f "$tmp_bundle" "$tmp_checksum"
+    return 1
+  }
+  mv "$tmp_bundle" "$bundle" || {
+    rm -f "$tmp_bundle" "$tmp_checksum"
+    return 1
+  }
+  mv "$tmp_checksum" "$checksum_file" || {
+    rm -f "$tmp_checksum"
+    return 1
+  }
+  chmod 0644 "$bundle" "$checksum_file" || return 1
+  market_bundle_is_valid "$run_dir" || return 1
+  MARKET_MAC_BUNDLE="$bundle"
+  MARKET_MAC_SHA256="$checksum"
+}
+
+write_market_run_manifest() {
+  local run_dir="$1" binding_profile="$2" workload_profile="$3"
+  local client_label="$4" client_version="$5" final_status="$6" reason="$7"
+  local phase_count=0 probe_count=0 event_count=0 invalid_count=0
+  [[ ! -f "$run_dir/workload/phases.tsv" ]] || \
+    phase_count="$(awk 'END {print (NR > 0 ? NR-1 : 0)}' \
+      "$run_dir/workload/phases.tsv")"
+  [[ ! -f "$run_dir/workload/probes.tsv" ]] || \
+    probe_count="$(awk 'END {print (NR > 0 ? NR-1 : 0)}' \
+      "$run_dir/workload/probes.tsv")"
+  [[ ! -f "$run_dir/workload/events.tsv" ]] || \
+    event_count="$(awk 'END {print (NR > 0 ? NR-1 : 0)}' \
+      "$run_dir/workload/events.tsv")"
+  [[ ! -f "$run_dir/workload/invalid.tsv" ]] || \
+    invalid_count="$(awk 'END {print (NR > 0 ? NR-1 : 0)}' \
+      "$run_dir/workload/invalid.tsv")"
+  printf '%s\n' \
+    'schema=knife15-market-run-v1' \
+    "status=$final_status" \
+    "reason=$reason" \
+    "completed_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    "source_commit=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)" \
+    "runner_sha256=$(sha256_file "$SCRIPT_PATH")" \
+    "summary_sha256=$(sha256_file "$SCRIPT_DIR/knife15-market-iperf-summary.py")" \
+    "binding_profile_sha256=$(sha256_file "$binding_profile")" \
+    "workload_profile_sha256=$(sha256_file "$workload_profile")" \
+    "client_label=$client_label" \
+    "client_version=$client_version" \
+    "phase_count=$phase_count" \
+    "probe_count=$probe_count" \
+    "quality_event_count=$event_count" \
+    "invalid_evidence_count=$invalid_count" \
+    "interrupt_signal=${MARKET_INTERRUPT_SIGNAL:-none}" \
+    "observer_remote_run_dir=${MARKET_OBSERVER_REMOTE_RUN_DIR:-unavailable}" \
+    "observer_bundle=${MARKET_OBSERVER_BUNDLE:-unavailable}" \
+    "observer_sha256=${MARKET_OBSERVER_SHA256:-unavailable}" \
+    "observer_finalization_status=$MARKET_OBSERVER_FINALIZATION_STATUS" \
+    >"$run_dir/manifest.txt"
+}
+
+preserve_market_baseline() {
+  local run_dir="$1" profile_file="$2" baseline_dir
+  baseline_dir="$(profile_value "$profile_file" baseline_dir)" || return 1
+  [[ -d "$baseline_dir" && ! -L "$baseline_dir" ]] || return 1
+  mkdir "$run_dir/baseline" || return 1
+  cp "$baseline_dir/direct-forward.json" "$run_dir/baseline/direct-forward.json" && \
+    cp "$baseline_dir/direct-reverse.json" "$run_dir/baseline/direct-reverse.json"
+}
+
+execute_market_run() {
+  local run_dir="$1" binding_profile="$2" workload_profile="$3"
+  local client_label="$4" client_version="$5" vpn_if="$6" physical_if="$7"
+  local tuic_exit_ipv4="$8" expected_egress="$9" dns_target="${10}"
+  local dns_name="${11}" client_binary="${12}" timeout_grace="${13}"
+  local observer_script="${14}" tuic_port="${15}" route_bin="${16}"
+  local ifconfig_bin="${17}" scutil_bin="${18}" networksetup_bin="${19}"
+  local curl_bin="${20}" dig_bin="${21}" iperf_bin="${22}" git_bin="${23}"
+  local workload_ok=0 workload_status=INVALID final_status reason
+  [[ -d "$run_dir" && ! -L "$run_dir" ]] || return 1
+  mkdir "$run_dir/preflight" "$run_dir/observer" "$run_dir/workload" || return 1
+  if ! perform_preflight "$run_dir/preflight" "$binding_profile" "$client_label" \
+    "$client_version" "$vpn_if" "$physical_if" "$tuic_exit_ipv4" \
+    "$expected_egress" "$dns_target" "$client_binary" "$route_bin" \
+    "$ifconfig_bin" "$scutil_bin" "$networksetup_bin" "$curl_bin" \
+    "$iperf_bin" "$git_bin"; then
+    printf 'INVALID\n' >"$run_dir/status"
+    write_market_run_manifest "$run_dir" "$binding_profile" "$workload_profile" \
+      "$client_label" "$client_version" INVALID preflight_failed || return 1
+    publish_market_bundle "$run_dir" || return 1
+    return 1
+  fi
+  if ! preserve_market_baseline "$run_dir" "$binding_profile"; then
+    printf 'INVALID\n' >"$run_dir/status"
+    write_market_run_manifest "$run_dir" "$binding_profile" "$workload_profile" \
+      "$client_label" "$client_version" INVALID baseline_preservation_failed || \
+      return 1
+    publish_market_bundle "$run_dir" || return 1
+    return 1
+  fi
+  if ! start_observer_and_bind "$run_dir/observer" "$observer_script" \
+    "$TARGET" "$IPERF_PORT" "$tuic_port"; then
+    if [[ "$MARKET_OBSERVER_ARMED" == 1 ]]; then
+      finalize_bound_observer "$run_dir/observer" "$observer_script" \
+        "$TARGET" "$IPERF_PORT" "$tuic_port" start-validation-failure || true
+    fi
+    printf 'INVALID\n' >"$run_dir/status"
+    write_market_run_manifest "$run_dir" "$binding_profile" "$workload_profile" \
+      "$client_label" "$client_version" INVALID observer_start_failed || return 1
+    publish_market_bundle "$run_dir" || return 1
+    return 1
+  fi
+  if run_market_workload "$run_dir/workload" "$workload_profile" "$iperf_bin" \
+    "$timeout_grace" "$dig_bin" "$curl_bin" "$dns_target" "$dns_name" \
+    "$expected_egress" "$route_bin" "$vpn_if" "$physical_if" \
+    "$tuic_exit_ipv4"; then
+    workload_ok=1
+  fi
+  workload_status="$(sed -n '1p' "$run_dir/workload/status" 2>/dev/null || \
+    echo INVALID)"
+  if ((workload_ok == 1)); then
+    reason=workload_complete
+  elif [[ -n "$MARKET_INTERRUPT_SIGNAL" ]]; then
+    reason=interrupted
+  else
+    reason=workload_invalid
+  fi
+  if ! finalize_bound_observer "$run_dir/observer" "$observer_script" \
+    "$TARGET" "$IPERF_PORT" "$tuic_port" "$reason"; then
+    workload_ok=0
+    reason=observer_finalization_failed
+  fi
+  if ((workload_ok == 1)) && \
+    [[ "$workload_status" == PASS_NO_EVENTS || \
+      "$workload_status" == PASS_WITH_EVENTS ]]; then
+    final_status="$workload_status"
+  else
+    final_status=INVALID
+  fi
+  printf '%s\n' "$final_status" >"$run_dir/status"
+  write_market_run_manifest "$run_dir" "$binding_profile" "$workload_profile" \
+    "$client_label" "$client_version" "$final_status" "$reason" || return 1
+  publish_market_bundle "$run_dir" || return 1
+  [[ "$final_status" == PASS_NO_EVENTS || "$final_status" == PASS_WITH_EVENTS ]]
+}
+
+market_signal_handler() {
+  local signal="$1"
+  [[ -z "$MARKET_INTERRUPT_SIGNAL" ]] || return 0
+  MARKET_INTERRUPT_SIGNAL="$signal"
+  if [[ "$MARKET_ACTIVE_COMMAND_PID" =~ ^[1-9][0-9]*$ ]]; then
+    kill -TERM "$MARKET_ACTIVE_COMMAND_PID" 2>/dev/null || true
+  fi
+  if [[ "$MARKET_ACTIVE_WATCHDOG_PID" =~ ^[1-9][0-9]*$ ]]; then
+    kill -TERM "$MARKET_ACTIVE_WATCHDOG_PID" 2>/dev/null || true
+  fi
+}
+
+market_emergency_exit_trap() {
+  local exit_status="$1"
+  trap - EXIT INT TERM HUP
+  market_signal_handler unexpected-exit || true
+  if [[ "$MARKET_OBSERVER_ARMED" == 1 && -n "$MARKET_RUN_DIR" && \
+    -n "$MARKET_OBSERVER_SCRIPT" ]]; then
+    finalize_bound_observer "$MARKET_RUN_DIR/observer" "$MARKET_OBSERVER_SCRIPT" \
+      "$MARKET_OBSERVER_TARGET" "$MARKET_OBSERVER_IPERF_PORT" \
+      "$MARKET_OBSERVER_TUIC_PORT" unexpected-exit || true
+  fi
+  if [[ -n "$MARKET_RUN_DIR" && -d "$MARKET_RUN_DIR" ]] && \
+    ! market_bundle_is_valid "$MARKET_RUN_DIR"; then
+    printf 'INVALID\n' >"$MARKET_RUN_DIR/status" 2>/dev/null || true
+    printf 'exit_status=%s\n' "$exit_status" \
+      >"$MARKET_RUN_DIR/unexpected-exit.txt" 2>/dev/null || true
+    publish_market_bundle "$MARKET_RUN_DIR" >/dev/null 2>&1 || true
+  fi
+}
+
+validate_exit_ssh_host() {
+  local ssh_host="$1" expected_ipv4="$2"
+  [[ "$ssh_host" =~ ^[a-z_][A-Za-z0-9_-]*@([0-9]+[.]){3}[0-9]+$ ]] || \
+    return 1
+  [[ "${ssh_host#*@}" == "$expected_ipv4" ]]
+}
+
+run_action() {
+  local profile_file="${PROFILE_FILE:-}" client_label="${CLIENT_LABEL:-}"
+  local client_version="${CLIENT_VERSION:-}" vpn_if="${EXPECTED_VPN_IF:-}"
+  local physical_if="${PHYSICAL_IF:-}" tuic_exit_ipv4="${TUIC_EXIT_IPV4:-}"
+  local expected_egress="${EXPECTED_EXIT_IPV4:-}" dns_target="${DNS_TARGET:-}"
+  local dns_name="${DNS_NAME:-}" client_binary="${CLIENT_BINARY:-}"
+  local tuic_port="${TUIC_PORT:-8443}" observer_script
+  local run_root run_dir route_bin ifconfig_bin scutil_bin networksetup_bin
+  local curl_bin dig_bin iperf_bin git_bin result=0 final_status
+  [[ -n "$profile_file" && -n "$client_label" && -n "$client_version" && \
+    -n "$vpn_if" && -n "$physical_if" && -n "$tuic_exit_ipv4" && \
+    -n "$expected_egress" && -n "$dns_target" && -n "$dns_name" ]] || \
+    die "run requires PROFILE_FILE, CLIENT_LABEL, CLIENT_VERSION, EXPECTED_VPN_IF, PHYSICAL_IF, TUIC_EXIT_IPV4, EXPECTED_EXIT_IPV4, DNS_TARGET, and DNS_NAME"
+  validate_client_identity "$client_label" "$client_version" "$vpn_if" \
+    "$physical_if" "$tuic_exit_ipv4" || die "invalid market client identity"
+  validate_ipv4 "$expected_egress" && validate_ipv4 "$dns_target" && \
+    validate_dns_name "$dns_name" && validate_port "$tuic_port" || \
+    die "invalid market network identity"
+  verify_profile "$profile_file" || die "market profile verification failed"
+  observer_script="$SCRIPT_DIR/knife15-exit-target-observer.sh"
+  regular_file "$observer_script" || die "exact tracked Exit observer is unavailable"
+  [[ -n "${EXIT_SSH_HOST:-}" && -n "${EXIT_SSH_KEY:-}" ]] || \
+    die "run requires EXIT_SSH_HOST and EXIT_SSH_KEY for paired evidence"
+  validate_exit_ssh_host "$EXIT_SSH_HOST" "$tuic_exit_ipv4" || \
+    die "EXIT_SSH_HOST must be user@$tuic_exit_ipv4"
+  regular_file "$EXIT_SSH_KEY" || die "EXIT_SSH_KEY must be a real readable file"
+  [[ -d "$MARKET_RUN_ROOT" && ! -L "$MARKET_RUN_ROOT" ]] || \
+    die "MARKET_RUN_ROOT must be an existing real directory"
+  run_root="$(cd "$MARKET_RUN_ROOT" && pwd -P)" || die "cannot resolve MARKET_RUN_ROOT"
+  run_dir="$run_root/mini_vpn_knife15_market_${client_label}_$(date -u '+%Y%m%d_%H%M%S')"
+  mkdir -m 0700 "$run_dir" || die "cannot create market run directory"
+  route_bin="$(preferred_command /sbin/route route)" || \
+    die "route unavailable; evidence: $run_dir"
+  ifconfig_bin="$(preferred_command /sbin/ifconfig ifconfig)" || \
+    die "ifconfig unavailable; evidence: $run_dir"
+  scutil_bin="$(preferred_command /usr/sbin/scutil scutil)" || \
+    die "scutil unavailable; evidence: $run_dir"
+  networksetup_bin="$(preferred_command /usr/sbin/networksetup networksetup)" || \
+    die "networksetup unavailable; evidence: $run_dir"
+  curl_bin="$(preferred_command /usr/bin/curl curl)" || \
+    die "curl unavailable; evidence: $run_dir"
+  dig_bin="$(preferred_command /usr/bin/dig dig)" || \
+    die "dig unavailable; evidence: $run_dir"
+  iperf_bin="$(command -v iperf3)" || die "iperf3 unavailable; evidence: $run_dir"
+  git_bin="$(command -v git)" || die "git unavailable; evidence: $run_dir"
+  MARKET_RUN_DIR="$run_dir"
+  MARKET_OBSERVER_SCRIPT="$observer_script"
+  MARKET_OBSERVER_TARGET="$TARGET"
+  MARKET_OBSERVER_IPERF_PORT="$IPERF_PORT"
+  MARKET_OBSERVER_TUIC_PORT="$tuic_port"
+  MARKET_INTERRUPT_SIGNAL=''
+  trap 'market_emergency_exit_trap "$?"' EXIT
+  trap 'market_signal_handler INT' INT
+  trap 'market_signal_handler TERM' TERM
+  trap 'market_signal_handler HUP' HUP
+  if ! execute_market_run "$run_dir" "$profile_file" "$profile_file" \
+    "$client_label" "$client_version" "$vpn_if" "$physical_if" \
+    "$tuic_exit_ipv4" "$expected_egress" "$dns_target" "$dns_name" \
+    "$client_binary" 30 "$observer_script" "$tuic_port" "$route_bin" \
+    "$ifconfig_bin" "$scutil_bin" "$networksetup_bin" "$curl_bin" \
+    "$dig_bin" "$iperf_bin" "$git_bin"; then
+    result=1
+  fi
+  trap - EXIT INT TERM HUP
+  final_status="$(sed -n '1p' "$run_dir/status" 2>/dev/null || echo INVALID)"
+  printf '%s\n' \
+    "market_status=$final_status" \
+    "run_dir=$run_dir" \
+    "bundle=${MARKET_MAC_BUNDLE:-unavailable}" \
+    "sha256=${MARKET_MAC_SHA256:-unavailable}" \
+    "observer_bundle=${MARKET_OBSERVER_BUNDLE:-unavailable}" \
+    "observer_sha256=${MARKET_OBSERVER_SHA256:-unavailable}"
+  if ((result == 0)); then
+    printf 'PASS: market calibration trial completed; this is not formal M2 acceptance\n'
+  else
+    printf 'ERROR: market calibration evidence is INVALID; external VPN client remains operator-owned\n' >&2
+  fi
+  return "$result"
+}
+
 self_test() {
   local tmp baseline_dir profile_file public_output public_profile bad_profile
   local zero_baseline target_route exit_route default_route dns_route
   local fake_bin fake_command preflight_dir invalid_preflight_dir current_commit
   local target_ready_json wrong_ready_json
   local workload_profile workload_dir invalid_workload_dir workload_count
+  local observer_status_text
+  local observer_mock observer_evidence drop_observer_evidence observer_actions action_count
+  local bundle_run_dir secret_run_dir full_run_dir
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/knife15-market-self-test.XXXXXX")"
   trap 'rm -rf "$tmp"' RETURN
   baseline_dir="$tmp/baseline"
@@ -1008,6 +1614,7 @@ EOF_NETWORK
     '  curl) printf "%s\n" "${MARKET_TEST_EGRESS:-43.153.32.33}" ;;' \
     '  iperf3)' \
     '    if [[ -z "${MARKET_TEST_IPERF_COUNT_FILE:-}" ]]; then /bin/cat "$MARKET_TEST_READY_JSON"; exit 0; fi' \
+    '    if [[ -n "${MARKET_TEST_IPERF_SKIP_ONCE_FILE:-}" && ! -e "$MARKET_TEST_IPERF_SKIP_ONCE_FILE" ]]; then printf "skip\n" >"$MARKET_TEST_IPERF_SKIP_ONCE_FILE"; /bin/cat "$MARKET_TEST_READY_JSON"; exit 0; fi' \
     '    count=0' \
     '    [[ ! -f "$MARKET_TEST_IPERF_COUNT_FILE" ]] || count="$(sed -n "1p" "$MARKET_TEST_IPERF_COUNT_FILE")"' \
     '    count=$((count + 1))' \
@@ -1147,7 +1754,7 @@ EOF_NETWORK
   export MARKET_TEST_IPERF_COUNT_FILE="$tmp/iperf-count"
   if ! run_market_workload "$workload_dir" "$workload_profile" \
     "$fake_bin/iperf3" 0 "$fake_bin/dig" "$fake_bin/curl" 8.8.8.8 \
-    example.com 43.153.32.33; then
+    example.com 43.153.32.33 "$fake_bin/route" utun9 en0 43.153.32.33; then
     die "self-test: quality-event workload did not complete"
   fi
   workload_count="$(sed -n '1p' "$MARKET_TEST_IPERF_COUNT_FILE")"
@@ -1169,7 +1776,8 @@ EOF_NETWORK
     export MARKET_TEST_IPERF_FAIL_AT=4; \
     run_market_workload "$invalid_workload_dir" "$workload_profile" \
       "$fake_bin/iperf3" 0 "$fake_bin/dig" "$fake_bin/curl" 8.8.8.8 \
-      example.com 43.153.32.33); then
+      example.com 43.153.32.33 "$fake_bin/route" utun9 en0 \
+      43.153.32.33); then
     die "self-test: command-failed workload was accepted"
   fi
   [[ "$(sed -n '1p' "$invalid_workload_dir/status")" == INVALID ]] || \
@@ -1182,7 +1790,8 @@ EOF_NETWORK
     export MARKET_TEST_IPERF_MALFORMED_AT=2; \
     run_market_workload "$invalid_workload_dir" "$workload_profile" \
       "$fake_bin/iperf3" 0 "$fake_bin/dig" "$fake_bin/curl" 8.8.8.8 \
-      example.com 43.153.32.33); then
+      example.com 43.153.32.33 "$fake_bin/route" utun9 en0 \
+      43.153.32.33); then
     die "self-test: malformed workload evidence was accepted"
   fi
   [[ "$(sed -n '1p' "$tmp/iperf-malformed-count")" == 2 ]] || \
@@ -1193,11 +1802,133 @@ EOF_NETWORK
     export MARKET_TEST_IPERF_HANG_AT=2; \
     run_market_workload "$invalid_workload_dir" "$workload_profile" \
       "$fake_bin/iperf3" 0 "$fake_bin/dig" "$fake_bin/curl" 8.8.8.8 \
-      example.com 43.153.32.33); then
+      example.com 43.153.32.33 "$fake_bin/route" utun9 en0 \
+      43.153.32.33); then
     die "self-test: timed-out workload was accepted"
   fi
   [[ "$(sed -n '1p' "$tmp/iperf-timeout-count")" == 2 ]] || \
     die "self-test: timeout did not stop at exact phase"
+  observer_status_text=$'schema=knife15-exit-target-observer-v2\nstatus=active\nobserver_healthy=1\nrun_dir=/tmp/mini_vpn_knife15_exit_target_observer_20260814_120000\ntarget=43.130.32.77\niperf_port=5201\ntuic_port=8443\ntimeout_secs=93600\nelapsed_secs=2\ntcpdump_live=1\nsampler_live=1\ncounter_sampler_live=1\ncapture_kernel_drops=unknown'
+  observer_status_is_valid "$observer_status_text" 43.130.32.77 5201 8443 \
+    /tmp/mini_vpn_knife15_exit_target_observer_20260814_120000 || \
+    die "self-test: valid observer identity rejected"
+  if observer_status_is_valid "${observer_status_text/tuic_port=8443/tuic_port=8444}" \
+    43.130.32.77 5201 8443 \
+    /tmp/mini_vpn_knife15_exit_target_observer_20260814_120000; then
+    die "self-test: mismatched observer identity accepted"
+  fi
+  observer_mock="$tmp/fake-observer.sh"
+  observer_actions="$tmp/observer-actions.log"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    'action="${1:-}"' \
+    'printf "%s\n" "$action" >>"$MARKET_TEST_OBSERVER_ACTIONS"' \
+    'case "$action" in' \
+    '  start)' \
+    '    [[ ! -e "$MARKET_TEST_OBSERVER_STATE" ]] || exit 1' \
+    '    printf "active\n" >"$MARKET_TEST_OBSERVER_STATE"' \
+    '    printf "PASS: Exit observer started\nrun_dir=%s\ntcpdump_pid=11\nsampler_pid=12\ncounter_sampler_pid=13\n" "$MARKET_TEST_OBSERVER_RUN_DIR"' \
+    '    ;;' \
+    '  status)' \
+    '    [[ -f "$MARKET_TEST_OBSERVER_STATE" ]] || exit 1' \
+    '    printf "schema=knife15-exit-target-observer-v2\nstatus=active\nobserver_healthy=1\nrun_dir=%s\ntarget=%s\niperf_port=%s\ntuic_port=%s\ntimeout_secs=93600\nelapsed_secs=2\ntcpdump_live=1\nsampler_live=1\ncounter_sampler_live=1\ncapture_kernel_drops=%s\n" "$MARKET_TEST_OBSERVER_RUN_DIR" "$TARGET" "$IPERF_PORT" "$TUIC_PORT" "${MARKET_TEST_OBSERVER_DROPS:-0}"' \
+    '    ;;' \
+    '  freeze)' \
+    '    [[ -f "$MARKET_TEST_OBSERVER_STATE" ]] || exit 1' \
+    '    printf "PASS: Exit observer frozen\nrun_dir=%s\n" "$MARKET_TEST_OBSERVER_RUN_DIR"' \
+    '    ;;' \
+    '  bundle)' \
+    '    [[ -f "$MARKET_TEST_OBSERVER_STATE" ]] || exit 1' \
+    '    rm -f "$MARKET_TEST_OBSERVER_STATE"' \
+    '    printf "PASS: Exit observer bundle finalized\nbundle=/tmp/mini_vpn_knife15_exit_target_observer_20260814_120000.tar.gz\nsha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"' \
+    '    ;;' \
+    '  *) exit 1 ;;' \
+    'esac' >"$observer_mock"
+  chmod 0700 "$observer_mock"
+  export MARKET_TEST_OBSERVER_STATE="$tmp/observer-state"
+  export MARKET_TEST_OBSERVER_ACTIONS="$observer_actions"
+  export MARKET_TEST_OBSERVER_RUN_DIR=/tmp/mini_vpn_knife15_exit_target_observer_20260814_120000
+  printf 'preexisting\n' >"$MARKET_TEST_OBSERVER_STATE"
+  observer_evidence="$tmp/observer-preexisting"
+  mkdir "$observer_evidence"
+  if start_observer_and_bind "$observer_evidence" "$observer_mock" \
+    43.130.32.77 5201 8443; then
+    die "self-test: pre-existing observer ownership was claimed"
+  fi
+  [[ "$(awk 'END {print NR}' "$observer_actions")" == 1 ]] || \
+    die "self-test: pre-existing observer was mutated"
+  rm -f "$MARKET_TEST_OBSERVER_STATE" "$observer_actions"
+  observer_evidence="$tmp/observer-owned"
+  mkdir "$observer_evidence"
+  start_observer_and_bind "$observer_evidence" "$observer_mock" \
+    43.130.32.77 5201 8443 || die "self-test: fresh observer bind failed"
+  finalize_bound_observer "$observer_evidence" "$observer_mock" \
+    43.130.32.77 5201 8443 normal-completion || \
+    die "self-test: owned observer finalization failed"
+  finalize_bound_observer "$observer_evidence" "$observer_mock" \
+    43.130.32.77 5201 8443 repeated-finalization || \
+    die "self-test: observer finalization was not idempotent"
+  action_count="$(awk 'END {print NR}' "$observer_actions")"
+  [[ "$action_count" == 7 ]] || \
+    die "self-test: observer lifecycle call count mismatch: $action_count"
+  grep -Fxq 'finalization_status=complete' \
+    "$observer_evidence/observer-finalization.txt"
+  rm -f "$observer_actions" "$MARKET_TEST_OBSERVER_STATE"
+  unset MARKET_TEST_OBSERVER_DROPS
+  drop_observer_evidence="$tmp/observer-drops"
+  mkdir "$drop_observer_evidence"
+  start_observer_and_bind "$drop_observer_evidence" "$observer_mock" \
+    43.130.32.77 5201 8443 || die "self-test: drop-case observer bind failed"
+  export MARKET_TEST_OBSERVER_DROPS=5
+  if finalize_bound_observer "$drop_observer_evidence" "$observer_mock" \
+    43.130.32.77 5201 8443 capture-drop-test; then
+    die "self-test: observer kernel drops were accepted"
+  fi
+  [[ "$MARKET_OBSERVER_FINALIZATION_STATUS" == evidence_invalid && \
+    "$MARKET_OBSERVER_BUNDLE" == \
+      /tmp/mini_vpn_knife15_exit_target_observer_20260814_120000.tar.gz && \
+    ! -e "$MARKET_TEST_OBSERVER_STATE" ]] || \
+    die "self-test: drop-case observer evidence was not preserved"
+  grep -Fxq 'finalization_status=evidence_invalid' \
+    "$drop_observer_evidence/observer-finalization.txt"
+  unset MARKET_TEST_OBSERVER_DROPS
+  rm -f "$observer_actions" "$MARKET_TEST_OBSERVER_STATE"
+  export MARKET_TEST_IPERF_COUNT_FILE="$tmp/iperf-full-run-count"
+  export MARKET_TEST_IPERF_SKIP_ONCE_FILE="$tmp/iperf-full-run-skip"
+  full_run_dir="$tmp/mini_vpn_knife15_market_mihomo_20260814_130000"
+  mkdir "$full_run_dir"
+  execute_market_run "$full_run_dir" "$profile_file" "$workload_profile" \
+    mihomo-tuic 'Mihomo 1.19.0' utun9 en0 43.153.32.33 43.153.32.33 \
+    8.8.8.8 example.com '' 0 "$observer_mock" 8443 \
+    "$fake_bin/route" "$fake_bin/ifconfig" "$fake_bin/scutil" \
+    "$fake_bin/networksetup" "$fake_bin/curl" "$fake_bin/dig" \
+    "$fake_bin/iperf3" "$fake_bin/git" || \
+    die "self-test: complete market run wiring failed"
+  [[ "$(sed -n '1p' "$full_run_dir/status")" == PASS_WITH_EVENTS ]] || \
+    die "self-test: complete market run status mismatch: $(sed -n '1p' "$full_run_dir/status" 2>/dev/null || echo missing) / $(sed -n '1,6p' "$full_run_dir/manifest.txt" 2>/dev/null | tr '\n' ' ')"
+  grep -Fxq 'observer_finalization_status=complete' "$full_run_dir/manifest.txt"
+  market_bundle_is_valid "$full_run_dir" || \
+    die "self-test: complete market run bundle invalid"
+  bundle_run_dir="$tmp/mini_vpn_knife15_market_mihomo_20260814_120000"
+  mkdir "$bundle_run_dir"
+  printf 'PASS_WITH_EVENTS\n' >"$bundle_run_dir/status"
+  printf 'safe evidence\n' >"$bundle_run_dir/evidence.txt"
+  publish_market_bundle "$bundle_run_dir" || \
+    die "self-test: safe market bundle publication failed"
+  market_bundle_is_valid "$bundle_run_dir" || \
+    die "self-test: published market bundle is invalid"
+  publish_market_bundle "$bundle_run_dir" || \
+    die "self-test: market bundle publication was not idempotent"
+  secret_run_dir="$tmp/mini_vpn_knife15_market_secret_20260814_120000"
+  mkdir "$secret_run_dir"
+  printf 'peer=123e4567-e89b-12d3-a456-426614174000\n' \
+    >"$secret_run_dir/evidence.txt"
+  if publish_market_bundle "$secret_run_dir"; then
+    die "self-test: secret-shaped market evidence was bundled"
+  fi
+  [[ ! -e "$secret_run_dir.tar.gz" ]] || \
+    die "self-test: rejected secret evidence left a bundle"
   echo "knife15 market continuity self-test passed"
 }
 
@@ -1208,6 +1939,7 @@ Usage:
   bash scripts/knife15-market-continuity.sh profile BASELINE_DIR
   bash scripts/knife15-market-continuity.sh verify-profile PROFILE_FILE
   bash scripts/knife15-market-continuity.sh preflight
+  bash scripts/knife15-market-continuity.sh run
 USAGE
 }
 
@@ -1216,6 +1948,7 @@ case "$ACTION" in
   profile) profile_action "${2:-}" ;;
   verify-profile) verify_profile_action "${2:-}" ;;
   preflight) preflight_action ;;
+  run) run_action ;;
   --help|-h|help) usage ;;
   *) usage >&2; exit 64 ;;
 esac
