@@ -13,6 +13,10 @@ reviewed complete-interval reducer may be reused locally.
 
 Next:
 
+0. **DONE:** establish agent-operated HK Mac access at
+   `xiaoou@192.168.133.109`, preserve the TCC-blocked Desktop clone, create
+   clean `/Users/xiaoou/mini_vpn` at `a16f661`, and pass release build plus the
+   full runner self-test. The user no longer runs Mac test commands;
 1. **DONE at `c688ce3`:** implement and review the immutable resource
    manifest/admission helper and isolated nonsudo preflight;
 2. **DONE through `18c0e14`:** bind strict qualification/formal evidence to

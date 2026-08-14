@@ -10,6 +10,13 @@ runbook and market-client comparison are historical and must not be executed.
 The user does **not** open Clash, Mihomo, a TUIC client, or another VPN: the
 `mini_vpn client-tun` process started by this runner is the tested client.
 
+The HK Mac is now agent-operated over
+`ssh -i ~/.ssh/vpn xiaoou@192.168.133.109`; the user does not run these command
+blocks. Use the clean `/Users/xiaoou/mini_vpn` clone. Do not use
+`/Users/xiaoou/Desktop/mini_vpn`: macOS Desktop privacy denies SSH access and
+that original directory remains user-owned. Privileged actions use a real SSH
+TTY and an interactive `sudo` prompt; never persist the login password.
+
 ## Fixed Decision Policy
 
 - `.33` is the already-rejected strict reference and is not a candidate.
@@ -87,7 +94,7 @@ the baseline derives the frozen offered load.
 Open a fresh terminal:
 
 ```bash
-cd /Users/liushan/Documents/Personal/Languages/Rust/mini_vpn
+cd /Users/xiaoou/mini_vpn
 
 git fetch origin
 git switch codex/knife14d-downlink-reap-open

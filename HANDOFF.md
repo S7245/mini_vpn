@@ -4,6 +4,16 @@
 
 ## Next Planned Stage — Knife15 M2 Tiered Resource Continuity (2026-08-14)
 
+- **HK Mac is agent-operated:** use
+  `ssh -i ~/.ssh/vpn xiaoou@192.168.133.109` and the clean
+  `/Users/xiaoou/mini_vpn` worktree. The Desktop clone is unreadable to SSH due
+  to macOS TCC and remains untouched. Exact `a16f661` release SHA-256
+  `5e946af2...`, runner self-test, physical `en0` routes, and shared SSH-key
+  identity pass. `sudo -n` is intentionally unavailable; privileged runner
+  actions require a writable SSH TTY and interactive prompt. Never store or
+  echo the password. The user no longer needs to run Mac shell commands.
+  Result:
+  `docs/tech/2026-08-14-knife15-m2-hk-mac-agent-access-results.md`.
 - **Latest Task-6 position:** `.111` and `.27` are ineligible before traffic:
   both are Tencent AS132203 like `.33`; historical Client/Exit roles do not
   create a different failure domain. `.111` also has an unverified changed SSH

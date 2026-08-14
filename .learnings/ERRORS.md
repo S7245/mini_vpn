@@ -1,5 +1,27 @@
 # Errors
 
+## 2026-08-14 - GitHub SSH keys were unavailable while HTTPS credentials remained valid
+
+- A docs push using the generic GitHub SSH route and the configured S7245 key
+  both failed with `Permission denied (publickey)`. No remote state changed.
+- One noninteractive `GIT_TERMINAL_PROMPT=0 git push origin` succeeded through
+  the existing HTTPS credential helper without printing credentials or
+  changing `origin`.
+- Until GitHub SSH authorization is restored, use one bounded noninteractive
+  HTTPS push on this Mac. If it fails, stop instead of entering credentials or
+  retrying an interactive prompt; never force-push.
+
+## 2026-08-14 - macOS SSH could not read the Desktop worktree
+
+- `ls` and Git under `/Users/xiaoou/Desktop/mini_vpn` failed with
+  `Operation not permitted` even though the directory exists and SSH key login
+  succeeds. This is macOS TCC, not repository corruption or a dirty worktree.
+- The original directory was not modified. A clean exact-source clone at
+  `/Users/xiaoou/mini_vpn` passed release build and runner self-test.
+- Future remote Mac commands must set
+  `PATH=/opt/homebrew/bin:$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin` so
+  Homebrew `iperf3` and Rust tools are available in non-login SSH shells.
+
 ## 2026-08-14 - Do not replace an SSH host key during resource eligibility discovery
 
 - The read-only `.111` probe stopped because its ED25519 host key differs from

@@ -189,6 +189,15 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-14:
 
+- Standing HK Mac execution access is now
+  `ssh -i ~/.ssh/vpn xiaoou@192.168.133.109`. The agent may build, run the
+  authorized TUN workflow, and collect/analyze logs without asking the user to
+  execute commands. Never persist or echo the login password; use a true SSH
+  TTY for interactive sudo. macOS TCC blocks SSH reads of the user's Desktop
+  clone, so preserve it and use the clean agent worktree
+  `/Users/xiaoou/mini_vpn`. Source `a16f661` release build and full runner
+  self-test pass; routes to `.33`/`.77` use physical `en0`. Result:
+  `docs/tech/2026-08-14-knife15-m2-hk-mac-agent-access-results.md`.
 - Task 6 has rejected `.111` and `.27` before traffic because both remain
   Tencent AS132203 like `.33`; changing their historical role does not create
   a different provider/ASN failure domain. `.111` also presents an unverified
@@ -2280,6 +2289,10 @@ Use the `self-improving-agent` pattern for project-local memory:
 
 Current acceptance hosts:
 
+- HK macOS acceptance host `xiaoou@192.168.133.109`: connect with
+  `ssh -i ~/.ssh/vpn`; use `/Users/xiaoou/mini_vpn`, not the TCC-protected
+  Desktop clone. The agent is authorized to run code/TUN tests and collect
+  logs. Use interactive TTY sudo and never store the user's password.
 - Client VPS `.27` (`43.172.75.27`): run mini_vpn from
   `/home/ubuntu/mini_vpn`.
 - Exit VPS `.33` (`43.153.32.33`): sing-box/TUIC host. Check service with

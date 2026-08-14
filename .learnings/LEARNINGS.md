@@ -1,5 +1,24 @@
 # Learnings
 
+## 2026-08-14 - Remote macOS acceptance needs a non-TCC worktree and exact key ownership
+
+- Successful SSH login does not imply access to Desktop/Documents. On the HK
+  Mac, `sshd` can stat the Desktop repository but macOS TCC denies content
+  reads. A clean clone in the home directory avoids weakening privacy policy
+  and preserves the user's original worktree.
+- Verify the exact remote source, release hash, tool PATH, physical routes,
+  runner self-test, and SSH-key fingerprint before treating remote access as
+  test readiness.
+- The presence of `utun` interfaces alone is not VPN ownership. Require tested
+  endpoint routes and relevant process checks; `.33` and `.77` both currently
+  route over physical `en0` with no external VPN process.
+- Remote privileged testing should use a real TTY and an interactive sudo
+  prompt. Never turn a user-supplied password into a command, file, log, or
+  durable project-memory value.
+
+Result:
+`docs/tech/2026-08-14-knife15-m2-hk-mac-agent-access-results.md`.
+
 ## 2026-08-14 - A historical role change is not a resource failure-domain change
 
 - `.27` was a Client and `.111` was an independent Exit in Knife14, but both
