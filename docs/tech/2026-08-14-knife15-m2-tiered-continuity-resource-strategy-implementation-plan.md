@@ -1,7 +1,7 @@
 # Knife15 M2 Tiered Continuity And Resource Strategy Implementation Plan
 
-Status: **TASKS 1–4 COMPLETE THROUGH `ffd99af`; TASK 5 RUNBOOK AND FULL
-LOCAL GATES ARE NEXT; FORMAL M2 AND M3 REMAIN BLOCKED**
+Status: **TASKS 1–5 COMPLETE THROUGH SOURCE-FLOOR CLOSURE `bcd63b4`; TASK 6
+CANDIDATE 1 PROVISIONING/ADMISSION IS NEXT; M3 REMAINS BLOCKED**
 
 > **For agentic workers:** use `diagnose` and `tdd` for each behavior change;
 > use `code-review` before requesting a long macOS run.
@@ -72,8 +72,10 @@ system evidence, SHA-256 manifests, tar bundles, Rust workspace gates.
    provider-and-ASN candidate, and an ineligible same-route resize.
 2. Implement canonical JSON validation and SHA-256 output. Require candidate
    ID, provider/resource ID, region, public IPv4, ASN, route class, TUIC port,
-   Target, server hashes, Mac route fingerprints, source, binary, profile, and
-   observer hashes.
+   Target, provider/route evidence hashes, server hashes, source, binary,
+   direct profile, physical interface, and observer hashes. Own fresh Mac
+   route/traceroute fingerprints in the immutable preflight evidence rather
+   than accepting unverifiable hashes in the input profile.
 3. Make eligibility compare the candidate with the immutable `.33` reference.
    Accept a distinct provider and ASN, or an independently contracted route;
    reject a nominal resize without exact prior saturation evidence.
@@ -137,7 +139,7 @@ Completed by `ef5a433` plus source-floor closure `18c0e14`. Result:
 Completed by `a52b048` plus source-floor closure `ffd99af`. Result:
 `docs/tech/2026-08-14-knife15-m2-strict-attempt-ledger-local-results.md`.
 
-### Task 5: Strict-resource operator runbook and local review gate
+### Task 5: Strict-resource operator runbook and local review gate — COMPLETE
 
 **Files:**
 
@@ -157,6 +159,9 @@ Completed by `a52b048` plus source-floor closure `ffd99af`. Result:
    false-pass, and false-rejection paths. Resolve all P0/P1 findings.
 5. Record the exact reviewed commit and commands in local results.
 6. Commit and push; only then issue the Mac/VPS operations list.
+
+Completed through strict source-floor closure `bcd63b4`. Result:
+`docs/tech/2026-08-14-knife15-m2-strict-resource-local-results.md`.
 
 ### Task 6: Execute at most two strict candidates
 

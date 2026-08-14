@@ -20,9 +20,11 @@ Next:
    without weakening `receiver_zero == 0`;
 3. **DONE through `ffd99af`:** implement the strict attempt ledger, exact
    paired-artifact/source reducer, and frozen `.33` reference identity;
-4. **NEXT:** write the operator runbook and complete local review gates;
-5. admit at most two resources that change both provider and ASN, or
-   independently contracted route from `.33`;
+4. **DONE through source-floor closure `bcd63b4`:** write the operator runbook,
+   bind/limit semantic provider and route evidence, preserve the exact
+   baseline outside `/tmp`, and pass complete local review gates;
+5. **NEXT:** provision and admit candidate 1; admit at most two resources that
+   change both provider and ASN, or independently contracted route from `.33`;
 6. for each, run one strict qualification and, only if clean, two consecutive
    strict 24-hour formal runs; reject the candidate on its first genuine
    quality failure without tuning or favorable-sample repetition;
@@ -44,6 +46,8 @@ Task-3 result:
 `docs/tech/2026-08-14-knife15-m2-strict-resource-binding-local-results.md`.
 Task-4 result:
 `docs/tech/2026-08-14-knife15-m2-strict-attempt-ledger-local-results.md`.
+Task-5 result:
+`docs/tech/2026-08-14-knife15-m2-strict-resource-local-results.md`.
 
 #### Formal-failure basis (2026-08-14 — M2 reached the standard-TUIC one-second continuity stop)
 

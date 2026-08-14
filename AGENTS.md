@@ -189,12 +189,14 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-14:
 
-- Tiered-resource Tasks 1–4 are complete through `ffd99af`. The closed
-  resource-profile schema accepts only a different provider and ASN, an
-  independently contracted route, or a hash-proved saturation replacement.
-  The isolated nonsudo preflight binds copied provider/route evidence, exact
-  source/binary/direct/observer/server hashes, endpoint/Target/SSH/interface,
-  remote service health, resource evidence, secret scan, and immutable bundle.
+- Tiered-resource Tasks 1–5 are complete through strict source-floor closure
+  `bcd63b4`. The closed resource-profile schema accepts only a different
+  provider and ASN, an independently contracted route, or a hash-proved
+  saturation replacement. Provider/route evidence now has closed semantics,
+  exact profile agreement, a `64KiB` bound, and post-copy hash validation.
+  The isolated nonsudo preflight binds exact source/binary/direct/observer/
+  server hashes, endpoint/Target/SSH/interface, live route/traceroute, remote
+  service health, secret scan, and immutable bundle.
 - Strict qualification/formal M2 now bind the exact candidate/profile/result,
   copied directory and archive, source/binary/direct/observer/server identity,
   and endpoint/Target/interface into root-owned state and stage evidence.
@@ -205,12 +207,16 @@ Current Knife15 summary, as of 2026-08-14:
   decision effect.
 - Resource comparison rejects drift from the frozen `.33` reference identity
   and `.77` Target. Strict runner and ledger source admission require
-  `a52b048` or a descendant. Rust production and the strict `m2` SLI are
-  unchanged. Complete profile, preflight, ledger, macOS-runner, and
-  Exit-observer self-tests pass; code review has no unresolved P0/P1. No real
-  candidate has been admitted. Task 5 runbook/full local gates are next; do
-  not request a Mac long test yet. Result:
-  `docs/tech/2026-08-14-knife15-m2-strict-attempt-ledger-local-results.md`.
+  `9909465` or a descendant. The runbook preserves the exact baseline outside
+  `/tmp`, replays it after reboot, and keeps one candidate source/binary/
+  workload/server contract. Rust production and strict `m2` are unchanged.
+  Root `725+3 ignored`, main `2`, integration `10+4 ignored`, release, Clippy,
+  vendored Quinn `40+3`/doc `1`, quinn-proto `330`/docs `3`, shell/self-tests,
+  fmt/diff/provenance/secret, and review pass. Exact Endpoint capacity was
+  `240.108 Mbit/s`, terminal `61,440/0/0B`, zero would-block. No real
+  candidate has been admitted. Task 6 candidate 1 provisioning and read-only
+  admission are next; do not request a Mac long test yet. Result:
+  `docs/tech/2026-08-14-knife15-m2-strict-resource-local-results.md`.
 - The user canceled mature-client/commercial-VPN comparison and accepted a
   two-tier continuity strategy. Do not run the implemented C0 harness or ask
   the user to open a TUIC client. Its reviewed complete-interval reducer may

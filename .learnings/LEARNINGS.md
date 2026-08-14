@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-08-14 - Resource evidence needs semantic ownership and durable workload identity
+
+- Hash equality proves bytes, not meaning. Provider/route evidence must use a
+  closed schema and match candidate provider, ASN, resource, Exit, Target,
+  route class, and contract before eligibility can affect a decision.
+- Revalidate at every trust boundary. The nonsudo preflight creates the
+  binding; the root runner recomputes it before route mutation; the ledger
+  independently replays it from paired immutable artifacts.
+- External evidence is input to a data-plane transaction, so it needs a byte
+  bound and post-copy hash just like a queue or buffer. `64KiB` is ample for
+  sanitized identity records and prevents accidental archive amplification.
+- A workload baseline stored only in `/tmp` is not an immutable multi-day
+  contract. Preserve the exact directory in a SHA-256-bound archive outside
+  `/tmp`, restore only to its original safe basename, and replay validation.
+- Fresh route/traceroute belongs to the live preflight archive, not to an
+  input profile that cannot know future observations.
+- A stable resource identity must include the Mac physical interface; otherwise
+  qualification and formal passes can silently combine different local paths.
+
+Result:
+`docs/tech/2026-08-14-knife15-m2-strict-resource-local-results.md`.
+
 ## 2026-08-14 - Decision ledgers must distinguish configuration identity from fresh run evidence
 
 - A fresh direct/route observation legitimately changes the complete resource

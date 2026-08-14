@@ -99,7 +99,9 @@ immutable manifest must identify:
 - hashes of sanitized provider-identity and route-contract evidence;
 - Exit TUIC endpoint and exact server configuration hashes;
 - unchanged `.77` Target identity;
-- Mac physical interface and route/traceroute fingerprints;
+- Mac physical interface, with fresh route/traceroute fingerprints owned by
+  the immutable per-run preflight archive rather than asserted in the input
+  profile;
 - tested source commit, release-binary hash, workload-profile hash, and
   observer version.
 
@@ -120,10 +122,11 @@ path.
 Before a long run, one bounded qualification must prove:
 
 - the manifest is complete, immutable, and secret-free;
-- direct Mac-to-Target and Mac-to-candidate connectivity have no complete
-  receiver-zero intervals under the derived offered load;
-- Exit CPU, memory, UDP socket/drop counters, queueing, and link capacity have
-  headroom above the offered profile;
+- direct Mac-to-Target continuity has no complete receiver-zero interval, and
+  bounded physical route/SSH/TUIC checks reach the exact candidate;
+- the qualification sustains the exact offered profile while Exit CPU,
+  memory, UDP socket/drop counters, queueing, and link behavior show no
+  resource-saturation discriminator;
 - the observer matches the exact candidate TUIC port and `.77` Target;
 - the release binary and tracked worktree match the admitted source;
 - the existing two-cycle `m2-qualification` schedule and cleanup pass.

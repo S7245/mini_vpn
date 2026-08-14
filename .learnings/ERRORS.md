@@ -1,5 +1,26 @@
 # Errors
 
+## 2026-08-14 - Final strict-resource review found false-proof and persistence gaps
+
+- The first candidate schema asked for predeclared route/traceroute hashes,
+  although those observations exist only at live preflight time. Keeping the
+  fields would create unverifiable claims; live evidence now owns them.
+- Hash-bound provider/route files could contain claims inconsistent with the
+  candidate profile. Closed schemas and exact semantic replay now reject that
+  false admission in helper, preflight, runner, and ledger.
+- External evidence had no byte limit and was not rehashed after copying. A
+  deterministic oversized-input RED failed, then passed with a nonempty
+  `64KiB` limit and exact post-copy verification.
+- The first runbook froze a baseline only by retaining its `/tmp` path. A Mac
+  reboot between qualification and formal runs could therefore force a new
+  workload contract and waste a valid result. The accepted procedure creates
+  and verifies a durable immutable backup before the first direct run.
+- The first stable identity omitted `mac_interface`, allowing evidence from
+  two local path types to share one candidate state. A focused RED now proves
+  interface drift changes the resource identity.
+- All defects were found locally before candidate provisioning or Mac/VPS
+  qualification; no evidence or test time was lost.
+
 ## 2026-08-14 - Initial strict ledger review found portability and false-admission holes
 
 - The first CLI draft rejected a symlinked artifact root. That would reject

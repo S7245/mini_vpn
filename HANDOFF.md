@@ -4,21 +4,23 @@
 
 ## Next Planned Stage — Knife15 M2 Tiered Resource Continuity (2026-08-14)
 
-- **Latest implementation position:** Tasks 1–4 are complete through
-  `ffd99af`. The closed strict-attempt ledger validates paired bundle content,
-  exact source/tool/binary/workload/resource/server/observer identity, observer
-  coverage, strict SLI, safety, and cleanup before reducing evidence. It
-  serializes at most two candidates and requires qualification plus two
-  consecutive valid formal passes. Invalid infrastructure evidence has no
-  decision effect.
-- Resource comparison now rejects any drift from the frozen `.33` reference
-  identity and `.77` Target. Strict qualification/formal and ledger source
-  admission require `a52b048` or a descendant. Profile/preflight, ledger,
-  complete macOS runner, and Exit observer self-tests pass; review has no
-  unresolved P0/P1. Rust production and strict `receiver_zero == 0` are
-  unchanged. No real candidate has been admitted. Task 5 runbook and complete
-  local gates are next; do not ask for a Mac/VPS run yet. Result:
-  `docs/tech/2026-08-14-knife15-m2-strict-attempt-ledger-local-results.md`.
+- **Latest implementation position:** Tasks 1–5 are complete through strict
+  source-floor closure `bcd63b4`. The strict ledger validates paired bundle
+  content, source/tool/binary/workload/resource/server/observer identity,
+  coverage, strict SLI, safety, and cleanup; it serializes two candidates and
+  requires qualification plus two formal passes. Invalid evidence remains
+  decision-neutral.
+- Resource comparison rejects drift from the frozen `.33` reference and `.77`
+  Target. Provider/route evidence is now semantically matched, `64KiB` bounded,
+  post-copy verified, and independently replayed by the root runner and ledger.
+  Strict source admission requires `9909465` or a descendant. The runbook also
+  preserves the exact candidate baseline outside `/tmp`. Root `725+3 ignored`,
+  main `2`, integration `10+4 ignored`, release, established Clippy, vendor,
+  docs, shell/self-tests, provenance/secret, `240.108 Mbit/s` Endpoint, and
+  review pass with no unresolved P0/P1. Rust and strict `receiver_zero == 0`
+  are unchanged. No real candidate is admitted. Task 6 must provision/review
+  candidate 1 before asking for a Mac run. Result:
+  `docs/tech/2026-08-14-knife15-m2-strict-resource-local-results.md`.
 - **Latest accepted position:** the user canceled mature-client/commercial-VPN
   comparison before C0 and selected a bounded two-tier policy. Do not ask the
   user to open a TUIC client and do not execute the old calibration runbook.
@@ -41,10 +43,10 @@
   one immutable profile, including one uninterrupted four-epoch/24-hour
   process-and-TUN lifetime. A later invalid infrastructure event does not erase
   already sealed valid epochs; reducers never bridge unknown evidence.
-- Next implementation work is the reviewed runbook and complete local gates.
-  Formal M2 and M3 remain blocked until that implementation supplies exact
-  instructions. Spec and
-  plan:
+- Next work is Task 6 candidate 1 provisioning, exact provider/route/server
+  evidence, and read-only resource admission. Do not issue placeholder Mac
+  exports; supply one concrete reviewed candidate first. M3 remains blocked.
+  Spec and plan:
   `docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-spec.md`
   and
   `docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-implementation-plan.md`.
