@@ -2,7 +2,7 @@
 
 Date: 2026-07-30
 
-Status: **BLOCKED DURING MARKET CONTINUITY CALIBRATION — DO NOT EXECUTE OR
+Status: **BLOCKED DURING TIERED RESOURCE CONTINUITY WORK — DO NOT EXECUTE OR
 REPEAT THIS FORMAL M2 RUNBOOK**
 
 The 2026-08-14 formal run reached the current standard-TUIC established-stream
@@ -13,13 +13,13 @@ Exit-to-Target TCP, Endpoint, D16/TUN, runner, and cleanup. See
 `docs/tech/2026-08-14-knife15-m2-ack-progress-native-loss-recovery-formal-failure-results.md`.
 
 The sequence below is retained as historical operational evidence only. Do
-not run it again unchanged and do not tune frozen values. The accepted next
-step is the isolated same-path market calibration in
-`docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-runbook.md`,
-governed by
-`docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-spec.md`.
-Formal M2 and M3 remain blocked until that calibration determines whether the
-one-second event is a mini_vpn differential or a path/market property.
+not run it again unchanged and do not tune frozen values. The market-client
+comparison was canceled. The accepted next step is the bounded Tier-A
+resource strategy, followed only after exhaustion by the Tier-B low-frequency
+gate, in
+`docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-spec.md`.
+Formal M2 and M3 remain blocked until that plan admits a resource and supplies
+new reviewed run instructions.
 
 This was the reviewed sequence for the formal M2 acceptance run.
 It uses the controlled IPv4 full tunnel and temporarily changes the active

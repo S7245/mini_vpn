@@ -1,5 +1,18 @@
 # Errors
 
+## 2026-08-14 - An unexecuted comparison route remained active after the product decision changed
+
+- The market-calibration harness was correctly implemented and reviewed, but
+  its HITL comparison was still the active handoff when the user selected a
+  direct two-tier SLI policy instead.
+- Running C0 after that decision would spend operator time without deciding
+  either accepted tier. No C0 was run, so no test time or external state was
+  lost.
+- Future behavior: mark the old spec, plan, runbook, and local result
+  `SUPERSEDED/CANCELED`; keep reusable deterministic parsing code, but update
+  AGENTS, HANDOFF, TODO, learnings, and the formal-failure result in the same
+  decision commit.
+
 ## 2026-08-14 - A multi-command final gate did not fail fast
 
 - `git diff --check` reported one extra blank line at EOF, but the shell block

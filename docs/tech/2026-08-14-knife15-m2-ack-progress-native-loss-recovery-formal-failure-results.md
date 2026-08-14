@@ -166,19 +166,24 @@ formal M2 until a separate architecture decision either:
 Neither decision is implicit in this result. Formal M2 remains failed and M3
 remains blocked.
 
-## Subsequent Market-Calibration Decision
+## Subsequent Tiered Resource Decision
 
 The architecture boundary above remains correct: standard TUIC cannot migrate
-the already-established remote TCP socket. A subsequent product review found
-that this formal result alone does not establish that zero complete one-second
-receiver gaps is a mainstream VPN contract. Mature products publicly describe
-availability, reconnection, kill-switch behavior, and aggregate service, not
-this exact per-flow zero-tolerance guarantee.
+the already-established remote TCP socket. The user canceled the proposed
+mature-client comparison and selected a bounded product decision instead.
 
-Therefore the accepted next step is not an immediate custom protocol/server.
-It is a same-path mature-TUIC calibration using the same Mac, `.33` Exit,
-`.77` Target, immutable offered-load profile, and paired observer. The original
-artifact remains `FORMAL M2 FAIL`; only the next-decision scope changed. See:
+First preserve the strict zero-complete-second SLI while trying at most two
+new resources that materially change the HK-to-Exit provider/ASN or contracted
+route. The current `.33` configuration is already the failed reference;
+equivalent resizing or parameter tuning is not another attempt. A candidate is
+accepted only by two consecutive clean strict formal runs.
 
-- `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-spec.md`;
-- `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-implementation-plan.md`.
+If both new candidates genuinely fail, change to a separate low-frequency
+gate: at most three isolated one-second receiver-zero episodes in any rolling
+24 hours, at most one in rolling six hours, and never two consecutive zero
+intervals. All other M2 safety and quality gates remain unchanged. The
+original artifact remains `FORMAL M2 FAIL`; only the next-decision scope
+changed. See:
+
+- `docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-spec.md`;
+- `docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-implementation-plan.md`.

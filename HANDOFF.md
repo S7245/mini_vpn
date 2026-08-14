@@ -2,42 +2,37 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 M2 Market Continuity Calibration (2026-08-14)
+## Next Planned Stage — Knife15 M2 Tiered Resource Continuity (2026-08-14)
 
-- **Latest accepted position:** calibration implementation Tasks 1–6 are
-  complete and pushed through reviewed `3474dff`; Task 7 is one user-run C0 on
-  the HK Mac. No Rust production code, frozen formal runner behavior, workload
-  constant, or data-plane parameter changed.
-- The isolated harness deterministically reduces iperf JSON, derives one
-  immutable direct-baseline profile, proves external-client route/egress/source
-  ownership read-only, runs six bounded mixed cycles, automatically owns and
-  finalizes one fresh paired Exit observer, creates secret-scanned immutable
-  Mac evidence, and classifies only integrity-checked role-bound bundles.
-- Code review found and repaired one P1 before HITL: a remotely successful
-  observer start with malformed output could precede local ownership. The
-  harness now recovers the exact healthy target/port/run identity from status,
-  marks the trial invalid, and safely finalizes the observer. The deterministic
-  RED/GREEN and complete harness/observer/formal-runner self-tests pass.
-- The decisive next gate is exactly one roughly 90-minute, six-cycle mature
-  TUIC C0 trial using the same HK Mac, `.33:8443` TUIC service, `.77:5201`
-  Target, one frozen direct-derived profile, and a fresh paired Exit observer.
-  Follow only
-  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-runbook.md`.
-  Quality events are recorded and the schedule continues; invalid evidence
-  still fails closed.
-- If the mature client also has complete one-second receiver-zero intervals,
-  recalibrate the product SLI rather than replace the architecture. If it has
-  none, run matched alternating mature/mini_vpn trials before attributing a
-  mini_vpn-specific gap. Commercial VPNs with their own exits are QoE evidence
-  only and cannot decide client causality.
-- Do not run formal M2 or M3 and do not tune frozen values during calibration.
-  Spec, plan, and operator runbook:
-  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-spec.md` and
-  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-implementation-plan.md`
+- **Latest accepted position:** the user canceled mature-client/commercial-VPN
+  comparison before C0 and selected a bounded two-tier policy. Do not ask the
+  user to open a TUIC client and do not execute the old calibration runbook.
+- **Tier A remains strict:** zero complete one-second TCP receiver-zero
+  intervals. `.33` is the already-failed reference. Admit no more than two new
+  Exit candidates that materially change provider/ASN or independently
+  contracted route. Equivalent CPU/RAM/bandwidth resize, pool/window/buffer
+  changes, and frozen-value tuning are not candidates.
+- A candidate first passes one bounded strict qualification. It is accepted
+  only after two consecutive clean 24-hour strict formal runs with identical
+  source, binary, workload profile, resource, and server configuration. A
+  genuine quality failure rejects it without repetition; an operator/VPS/power
+  invalidation neither rejects nor passes it.
+- Only after two eligible candidates are rejected does **Tier B** open. It
+  permits at most three isolated one-second receiver-zero episodes in rolling
+  24 hours, at most one in rolling six hours, and never two consecutive zero
+  intervals. All UDP, TCP-gap, DNS, real-client, D16/Endpoint/TUN, observer,
+  lifecycle, and cleanup gates stay unchanged.
+- Tier B requires twelve valid six-hour evidence epochs (72 valid hours) under
+  one immutable profile, including one uninterrupted four-epoch/24-hour
+  process-and-TUN lifetime. A later invalid infrastructure event does not erase
+  already sealed valid epochs; reducers never bridge unknown evidence.
+- Next implementation work is the resource manifest/admission layer, strict
+  attempt ledger, reviewed runbook, and local gates. Formal M2 and M3 remain
+  blocked until that implementation supplies exact instructions. Spec and
+  plan:
+  `docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-spec.md`
   and
-  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-runbook.md`.
-  Local result:
-  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-local-results.md`.
+  `docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-implementation-plan.md`.
 
 - **Accepted formal-failure basis:** exact-source `cdbfe36` formal artifact
   `/tmp/mini_vpn_knife15_macos_20260814_014536.tar.gz` (SHA-256
@@ -66,9 +61,9 @@
   protocol/server and conflicts with ADR-0004's accepted sing-box/client-only
   direction.
 - Do not repeat formal M2 unchanged and do not tune frozen values. Freeze
-  `cdbfe36`; M2 and M3 remain blocked while the accepted market-calibration
-  stage determines whether the one-second event is a mini_vpn differential or
-  a path/market property. Result:
+  `cdbfe36`; M2 and M3 remain blocked while the accepted tiered-resource
+  stage determines whether a materially different path can satisfy strict
+  continuity or the low-frequency SLI must be used. Result:
   `docs/tech/2026-08-14-knife15-m2-ack-progress-native-loss-recovery-formal-failure-results.md`.
 
 - **Previous accepted position:** exact-source `d91f205` paired qualification

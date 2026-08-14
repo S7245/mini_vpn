@@ -189,32 +189,34 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-14:
 
-- Market continuity calibration implementation Tasks 1–6 are complete and
-  pushed through reviewed `3474dff`; Task 7 is one user-run C0 on the HK Mac.
-  The harness has deterministic iperf reduction, immutable direct-derived
-  profiles, read-only external-client route/egress/source admission, six
-  bounded mixed cycles, exact Exit-observer ownership/finalization,
-  secret-scanned immutable evidence, and role-bound bundle classification.
-- Code review found and repaired one P1 before HITL: remote observer start
-  could succeed before malformed output established local ownership. Exact
-  healthy status now recovers that owned run so the invalid trial can finalize
-  it safely. The focused RED/GREEN and complete local shell/Python/formal-runner
-  gates pass; no Rust production or frozen behavior changed.
-- Run exactly one roughly 90-minute mature-TUIC C0 using the same HK Mac,
-  `.33:8443` Exit, `.77:5201` Target, one immutable direct-derived profile,
-  and a fresh paired observer. Follow only the market calibration runbook.
-  Quality events continue; invalid evidence fails closed. If mature TUIC is
-  clean, use matched alternating C1 before attributing a mini_vpn differential.
-  Commercial VPNs on their own exits remain QoE evidence only.
-- Do not change the frozen formal runner or Rust data plane, run formal M2/M3,
-  tune frozen values, or open a custom-server branch during calibration.
-  Specification, plan, and runbook:
-  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-spec.md` and
-  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-implementation-plan.md`
+- The user canceled mature-client/commercial-VPN comparison and accepted a
+  two-tier continuity strategy. Do not run the implemented C0 harness or ask
+  the user to open a TUIC client. Its reviewed complete-interval reducer may
+  be reused locally; its comparison workflow is historical only.
+- Tier A keeps formal M2 strict: zero complete one-second TCP receiver-zero
+  intervals. `.33` is the already-failed reference. Admit at most two new Exit
+  candidates that materially change provider/ASN or independently contracted
+  route; CPU/RAM/nominal-bandwidth resize on an equivalent unsaturated path,
+  pool/window/buffer changes, and frozen-value tuning do not count.
+- Each candidate gets one bounded strict qualification, then—only if clean—two
+  consecutive strict 24-hour formal runs on identical source, binary, profile,
+  resource, and server configuration. A genuine quality failure rejects that
+  candidate without repetition; invalid infrastructure evidence neither
+  rejects nor passes it.
+- Only after two eligible candidates are rejected may Tier B open. Its exact
+  limit is at most three isolated one-second receiver-zero episodes per
+  rolling 24 hours, at most one per rolling six hours, and no consecutive zero
+  intervals. All existing UDP, TCP-gap, DNS, real-client, D16/Endpoint/TUN,
+  observer, lifecycle, and cleanup gates remain unchanged.
+- Tier B requires twelve valid six-hour epochs (72 valid hours) under one
+  immutable profile and at least one uninterrupted four-epoch/24-hour
+  process-and-TUN lifetime. Complete epochs survive an unrelated later
+  infrastructure failure; unknown evidence is never bridged.
+- Formal M2/M3 remain blocked until the resource manifest, strict ledger, and
+  reviewed runbook implementation are complete. Specification and plan:
+  `docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-spec.md`
   and
-  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-runbook.md`.
-  Local result:
-  `docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-local-results.md`.
+  `docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-implementation-plan.md`.
 - Exact-source `cdbfe36` formal artifact
   `/tmp/mini_vpn_knife15_macos_20260814_014536.tar.gz` (SHA-256
   `2c002684...`) passed baseline `32.701/56.515 Mbit/s`, bounded direct

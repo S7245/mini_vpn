@@ -1,7 +1,12 @@
 # Knife15 M2 Market Continuity Calibration Implementation Plan
 
-Status: **TASKS 1–6 IMPLEMENTED AND REVIEWED AT `3474dff`; TASK 7 C0 HITL IS
-NEXT; FORMAL M2/M3 REMAIN BLOCKED**
+Status: **SUPERSEDED AFTER TASKS 1–6; DO NOT EXECUTE TASK 7 C0**
+
+The implemented harness and review evidence remain valid, but the user
+canceled the mature-client comparison before HITL. Continue only with
+`docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-implementation-plan.md`.
+The deterministic iperf reducer may be reused by that plan; external-client
+ownership and C0/C1 execution must not be started.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans
 > to implement this plan task-by-task.

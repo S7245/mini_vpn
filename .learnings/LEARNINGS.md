@@ -1,5 +1,30 @@
 # Learnings
 
+## 2026-08-14 - Bound strict path experiments before changing the product SLI
+
+- When the selected failure is loss/congestion on Mac-to-Exit and the Exit is
+  not saturated, extra CPU, RAM, buffers, pools, or nominal same-route
+  bandwidth are not independent experiments. A meaningful resource candidate
+  must change provider/ASN or an independently contracted route.
+- Preserve the zero-complete-second goal first, but cap the search: `.33` is
+  the failed reference and no more than two eligible new path candidates may
+  be tried. One strict qualification precedes expensive formal runs; a genuine
+  failure rejects that candidate without tuning or favorable-sample repeats.
+- If strict resources are exhausted, translate “a few interruptions per day”
+  into exact rolling limits: at most three isolated one-second episodes per 24
+  hours, at most one per six hours, and never consecutive zero intervals.
+- Seal complete evidence epochs so an unrelated later VPS/power failure does
+  not erase useful hours, while still requiring one uninterrupted 24-hour
+  process/TUN lifetime for lifecycle coverage.
+- A user-owned product SLI decision supersedes an unexecuted competitor
+  comparison. Preserve the reviewed reducer but remove every active runbook
+  instruction that would ask the user to open the external client.
+
+Specifications:
+`docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-spec.md`
+and
+`docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-implementation-plan.md`.
+
 ## 2026-08-14 - Comparative evidence needs artifact-owned roles and transactional observer ownership
 
 - A comparison role supplied only at summary time is forgeable metadata. Write

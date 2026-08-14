@@ -2,47 +2,38 @@
 
 ## Current Knife15 Plan (2026-08-14)
 
-### Market continuity calibration before an established-stream architecture decision
+### Tiered resource continuity before an established-stream architecture decision
 
-#### Latest decision (2026-08-14 — calibration harness ready; one mature-TUIC C0 is next)
+#### Latest decision (2026-08-14 — strict resources first, bounded low-frequency SLI second)
 
-The `cdbfe36` formal M2 failure remains genuine and immutable, but public
-mature-VPN contracts emphasize availability, reconnect, kill-switch behavior,
-and aggregate service rather than guaranteeing nonzero delivery in every
-one-second interval of every established TCP flow. The evidence therefore does
-not yet justify a custom resumable/path-diverse protocol and server.
-
-Reviewed implementation is pushed through `3474dff`. It adds deterministic
-iperf reduction, immutable direct-derived profile binding, read-only external
-client admission, the exact six-cycle workload, fresh Exit-observer ownership
-and finalization, immutable secret-scanned evidence, and role-bound decision
-summaries. No Rust production code, formal runner behavior, or frozen value
-changed. Code review's malformed-successful-observer-start RED is GREEN and no
-P0/P1 remains.
+The `cdbfe36` formal M2 failure remains genuine and immutable. The user
+canceled the mature-client comparison before C0. The completed comparison
+harness remains historical; do not ask the user to open a TUIC client. Its
+reviewed complete-interval reducer may be reused locally.
 
 Next:
 
-1. follow only the new market calibration runbook on the HK Mac;
-2. with every VPN off, derive one immutable offered-load profile from a clean
-   direct baseline after pulling the final reviewed descendant;
-3. configure one mature Mihomo/Clash TUIC v5 client for the same credentials,
-   CA trust, Cubic/native settings, `.33:8443` Exit, and full TUN;
-4. run one roughly 90-minute/six-cycle C0 trial using the mature TUIC client on
-   the same HK Mac, `.33:8443` Exit, `.77:5201` Target, and fresh paired Exit
-   observer;
-5. record quality events and continue, but fail closed on invalid evidence;
-6. if mature TUIC also has receiver-zero intervals, recalibrate the product
-   SLI; if it has none, run matched alternating mature/mini_vpn C1 trials
-   before selecting an architecture investigation;
-7. keep formal M2 and M3 blocked and do not tune frozen values.
+1. implement and review the immutable resource manifest/admission helper;
+2. bind strict qualification/formal evidence to the exact resource without
+   weakening `receiver_zero == 0`;
+3. implement the strict attempt ledger and operator runbook;
+4. admit at most two resources that materially change provider/ASN or
+   independently contracted route from `.33`;
+5. for each, run one strict qualification and, only if clean, two consecutive
+   strict 24-hour formal runs; reject the candidate on its first genuine
+   quality failure without tuning or favorable-sample repetition;
+6. if one candidate passes twice, accept Tier A and reopen M3;
+7. only if both candidates genuinely fail, implement Tier B as a separate
+   action: at most three isolated one-second episodes/rolling 24h, at most one
+   /rolling 6h, no consecutive zero intervals, 72 valid hours including one
+   uninterrupted 24-hour process/TUN lifetime;
+8. preserve every other M2 safety, UDP, lifecycle, ownership, observer, and
+   cleanup gate.
 
 Specifications:
-`docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-spec.md` and
-`docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-implementation-plan.md`
+`docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-spec.md`
 and
-`docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-runbook.md`.
-Local result:
-`docs/tech/2026-08-14-knife15-m2-market-continuity-calibration-local-results.md`.
+`docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-implementation-plan.md`.
 
 #### Formal-failure basis (2026-08-14 — M2 reached the standard-TUIC one-second continuity stop)
 
@@ -69,12 +60,12 @@ opens, but neither can migrate the established Target TCP socket. Reusing
 same-path reset/rebind is formally rejected; a duplicate TUIC Connect is a
 different Target socket.
 
-Previous next decision, now superseded by the market-calibration stage above:
+Previous next decision, now superseded by the tiered-resource stage above:
 
 1. do not repeat formal M2 unchanged and do not tune any frozen value;
 2. freeze reviewed behavior at `cdbfe36`;
-3. do not choose between a custom Upstream and a revised acceptance contract
-   until the same-path mature-client discriminator is complete;
+3. do not choose a custom Upstream until two eligible strict resource
+   candidates and, if necessary, the bounded low-frequency gate are complete;
 4. keep formal M2 failed and M3 blocked meanwhile.
 
 Result:

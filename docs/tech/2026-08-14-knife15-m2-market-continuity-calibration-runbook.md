@@ -2,7 +2,13 @@
 
 Date: 2026-08-14
 
-Status: **READY FOR ONE MATURE-TUIC C0 TRIAL; THIS IS NOT FORMAL M2**
+Status: **CANCELED; DO NOT EXECUTE**
+
+The user explicitly canceled the mature-client comparison. This runbook is
+historical only. Follow the bounded Tier-A resource / Tier-B low-frequency
+strategy in
+`docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-spec.md`;
+do not open a TUIC client or run this C0 workflow.
 
 This runbook measures whether the existing strict one-second receiver-zero
 event is specific to mini_vpn or is also observable through a mature TUIC

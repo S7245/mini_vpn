@@ -2,7 +2,14 @@
 
 Date: 2026-08-14
 
-Status: **ACCEPTED FOR IMPLEMENTATION; FORMAL M2 AND M3 REMAIN BLOCKED**
+Status: **SUPERSEDED; DO NOT RUN THE MATURE-CLIENT COMPARISON**
+
+The user replaced this comparison route with the bounded Tier-A resource and
+Tier-B low-frequency continuity strategy in
+`docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-spec.md`.
+This document is retained only as historical decision evidence. Its existing
+reducer may be reused for complete-interval parsing, but its cohorts and C0/C1
+decision tree are no longer active.
 
 ## Decision
 

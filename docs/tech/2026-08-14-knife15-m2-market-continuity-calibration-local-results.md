@@ -2,7 +2,12 @@
 
 Date: 2026-08-14
 
-Status: **PASS — TASKS 1–6 READY; ONE MATURE-TUIC C0 HITL IS NEXT**
+Status: **LOCAL IMPLEMENTATION PASS; HITL ROUTE CANCELED AND SUPERSEDED**
+
+The implementation and review results below remain accurate. The user later
+canceled the mature-client comparison before C0. Do not run its HITL
+workflow. The reviewed complete-interval reducer may be reused under the
+tiered resource strategy, but external-client comparison is no longer a gate.
 
 ## Outcome
 
