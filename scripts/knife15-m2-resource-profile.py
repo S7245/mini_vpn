@@ -64,6 +64,7 @@ REFERENCE_IDENTITY = {
     "target_ipv4": "43.130.32.77",
     "target_iperf_port": 5201,
 }
+REFERENCE_FIELDS = {"schema", *REFERENCE_IDENTITY}
 
 
 def fixture_path(name: str) -> Path:
@@ -229,6 +230,34 @@ def profile_identity(value: Any, label: str) -> dict[str, Any]:
     }
 
 
+def reference_identity(value: Any) -> dict[str, Any]:
+    reference = object_value(value, "reference")
+    missing = sorted(REFERENCE_FIELDS - reference.keys())
+    unknown = sorted(reference.keys() - REFERENCE_FIELDS)
+    if missing:
+        raise ValueError(f"reference is missing fields: {','.join(missing)}")
+    if unknown:
+        raise ValueError(f"reference has unknown fields: {','.join(unknown)}")
+    if reference.get("schema") != "knife15-m2-resource-reference-v1":
+        raise ValueError("reference.schema is not knife15-m2-resource-reference-v1")
+    for field in (
+        "candidate_id",
+        "provider",
+        "resource_id",
+        "region",
+        "route_class",
+        "route_contract_id",
+    ):
+        token_value(reference.get(field), f"reference.{field}")
+    public_ipv4_value(reference.get("public_ipv4"), "reference.public_ipv4")
+    public_ipv4_value(reference.get("target_ipv4"), "reference.target_ipv4")
+    positive_integer(reference.get("asn"), "reference.asn")
+    port_value(reference.get("tuic_port"), "reference.tuic_port")
+    port_value(reference.get("target_iperf_port"), "reference.target_iperf_port")
+    validate_reference_identity(reference)
+    return reference
+
+
 def canonical_profile_sha256(value: dict[str, Any]) -> str:
     encoded = json.dumps(
         value, ensure_ascii=True, sort_keys=True, separators=(",", ":")
@@ -243,48 +272,47 @@ def validate_reference_identity(value: dict[str, Any]) -> None:
 
 
 def classify_profiles(reference: Any, candidate: Any) -> dict[str, Any]:
-    reference_identity = profile_identity(reference, "reference")
+    frozen_reference = reference_identity(reference)
     candidate_identity = profile_identity(candidate, "candidate")
     reference_profile = object_value(reference, "reference")
     candidate_profile = object_value(candidate, "candidate")
-    validate_reference_identity(reference_profile)
 
     def result(eligible: bool, reason: str) -> dict[str, Any]:
         return {
             "schema": "knife15-m2-resource-eligibility-v1",
             "eligible": eligible,
             "reason": reason,
-            "reference_id": reference_identity["candidate_id"],
+            "reference_id": frozen_reference["candidate_id"],
             "candidate_id": candidate_identity["candidate_id"],
             "reference_profile_sha256": canonical_profile_sha256(reference_profile),
             "candidate_profile_sha256": canonical_profile_sha256(candidate_profile),
         }
 
-    if candidate_identity["target_ipv4"] != reference_identity["target_ipv4"]:
+    if candidate_identity["target_ipv4"] != frozen_reference["target_ipv4"]:
         raise ValueError("candidate.target_ipv4 does not match the reference target")
     if (
         candidate_identity["target_iperf_port"]
-        != reference_identity["target_iperf_port"]
+        != frozen_reference["target_iperf_port"]
     ):
         raise ValueError(
             "candidate.target_iperf_port does not match the reference target"
         )
-    if candidate_identity["candidate_id"] == reference_identity["candidate_id"]:
+    if candidate_identity["candidate_id"] == frozen_reference["candidate_id"]:
         return result(False, "same_candidate_id")
-    if candidate_identity["public_ipv4"] == reference_identity["public_ipv4"]:
+    if candidate_identity["public_ipv4"] == frozen_reference["public_ipv4"]:
         return result(False, "same_exit_ipv4")
     provider_differs = (
         candidate_identity["provider"].casefold()
-        != reference_identity["provider"].casefold()
+        != frozen_reference["provider"].casefold()
     )
-    asn_differs = candidate_identity["asn"] != reference_identity["asn"]
+    asn_differs = candidate_identity["asn"] != frozen_reference["asn"]
     if provider_differs and asn_differs:
         return result(True, "distinct_provider_and_asn")
     independent_route = (
         candidate_identity["route_class"].casefold()
-        != reference_identity["route_class"].casefold()
+        != frozen_reference["route_class"].casefold()
         and candidate_identity["route_contract_id"]
-        != reference_identity["route_contract_id"]
+        != frozen_reference["route_contract_id"]
     )
     if independent_route:
         return result(True, "independent_route_contract")
@@ -307,8 +335,11 @@ def read_json(path: str) -> Any:
 
 
 def validate_profile(value: Any) -> dict[str, Any]:
-    identity = profile_identity(value, "profile")
     profile = object_value(value, "profile")
+    if profile.get("schema") == "knife15-m2-resource-reference-v1":
+        identity = reference_identity(profile)
+    else:
+        identity = profile_identity(profile, "profile")
     return {
         "schema": "knife15-m2-resource-validation-v1",
         "candidate_id": identity["candidate_id"],
@@ -320,6 +351,12 @@ def validate_profile(value: Any) -> dict[str, Any]:
 def self_test() -> None:
     reference: Any = read_json(str(fixture_path("reference-33.json")))
     candidate: Any = read_json(str(fixture_path("distinct-provider.json")))
+    minimal_reference = {
+        "schema": "knife15-m2-resource-reference-v1",
+        **REFERENCE_IDENTITY,
+    }
+    minimal_result = classify_profiles(minimal_reference, candidate)
+    assert minimal_result["eligible"] is True
     result = classify_profiles(reference, candidate)
     assert result["eligible"] is True
     assert result["reason"] == "distinct_provider_and_asn"

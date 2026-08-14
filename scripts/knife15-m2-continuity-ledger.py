@@ -36,6 +36,20 @@ REFERENCE = {
     ),
     "verdict": "REJECTED_STRICT_REFERENCE",
 }
+RESOURCE_REFERENCE = {
+    "schema": "knife15-m2-resource-reference-v1",
+    "candidate_id": "reference-33",
+    "provider": "tencent-cloud",
+    "resource_id": "reference-exit-33",
+    "region": "us-west-reference",
+    "public_ipv4": "43.153.32.33",
+    "asn": 132203,
+    "route_class": "public-internet",
+    "route_contract_id": "reference-default",
+    "tuic_port": 8443,
+    "target_ipv4": "43.130.32.77",
+    "target_iperf_port": 5201,
+}
 LEDGER_FIELDS = {"schema", "reference", "attempts"}
 ATTEMPT_FIELDS = {
     "schema",
@@ -681,6 +695,13 @@ def validate_mac_bundle(attempt: dict[str, Any], artifact_root: Path) -> None:
         exact_object(candidate, RESOURCE_PROFILE_FIELDS, "candidate profile")
         if candidate.get("schema") != "knife15-m2-resource-profile-v1":
             raise LedgerError("candidate profile schema mismatch")
+        reference = json_bytes(
+            archive.bytes(f"{resource_dir}/reference-profile.json"),
+            "resource reference",
+        )
+        exact_object(reference, set(RESOURCE_REFERENCE), "resource reference")
+        if reference != RESOURCE_REFERENCE:
+            raise LedgerError("resource reference is not the frozen .33 identity")
         eligibility = json_bytes(
             archive.bytes(f"{resource_dir}/eligibility.json"),
             "resource eligibility",
@@ -1375,7 +1396,9 @@ def make_valid_evidence_attempt(artifact_root: Path, role: str) -> dict[str, Any
         "preflight_runner_sha256": "f" * 64,
     }
     resource_files: dict[str, bytes] = {
-        "reference-profile.json": b"{}\n",
+        "reference-profile.json": (
+            canonical_json(RESOURCE_REFERENCE) + "\n"
+        ).encode(),
         "candidate-profile.json": (canonical_json(candidate) + "\n").encode(),
         "eligibility.json": (canonical_json(eligibility) + "\n").encode(),
         "direct-manifest.txt": direct_manifest,

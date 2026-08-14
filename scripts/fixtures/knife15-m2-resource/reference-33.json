@@ -1,5 +1,5 @@
 {
-  "schema": "knife15-m2-resource-profile-v1",
+  "schema": "knife15-m2-resource-reference-v1",
   "candidate_id": "reference-33",
   "provider": "tencent-cloud",
   "resource_id": "reference-exit-33",
@@ -8,20 +8,7 @@
   "asn": 132203,
   "route_class": "public-internet",
   "route_contract_id": "reference-default",
-  "provider_identity_evidence_sha256": "abababababababababababababababababababababababababababababababab",
-  "route_identity_evidence_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "tuic_port": 8443,
   "target_ipv4": "43.130.32.77",
-  "target_iperf_port": 5201,
-  "server_binary_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
-  "server_config_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
-  "observer_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
-  "source_commit": "4444444444444444444444444444444444444444",
-  "client_binary_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
-  "workload_profile_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
-  "mac_interface": "en0",
-  "prior_saturation_proven": false,
-  "prior_saturation_evidence_sha256": "",
-  "replacement_capacity_proven": false,
-  "replacement_capacity_evidence_sha256": ""
+  "target_iperf_port": 5201
 }
