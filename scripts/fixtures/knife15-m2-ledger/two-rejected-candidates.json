@@ -1,0 +1,25 @@
+{
+  "schema": "knife15-m2-ledger-scenario-v1",
+  "name": "two_rejected_candidates",
+  "expected_status": "TIER_A_EXHAUSTED",
+  "attempts": [
+    {
+      "candidate": "candidate-a",
+      "role": "qualification",
+      "evidence_class": "quality_failure",
+      "reason": "receiver_zero"
+    },
+    {
+      "candidate": "candidate-b",
+      "role": "qualification",
+      "evidence_class": "pass",
+      "reason": "strict_pass"
+    },
+    {
+      "candidate": "candidate-b",
+      "role": "formal",
+      "evidence_class": "quality_failure",
+      "reason": "udp_loss"
+    }
+  ]
+}

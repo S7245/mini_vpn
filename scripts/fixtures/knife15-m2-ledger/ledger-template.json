@@ -1,0 +1,12 @@
+{
+  "schema": "knife15-m2-tier-a-ledger-v1",
+  "reference": {
+    "candidate_id": "reference-33",
+    "exit_ipv4": "43.153.32.33",
+    "source_commit": "cdbfe36ae72f9049e766e4c140476af146e15064",
+    "mac_bundle_sha256": "2c0026847884602d0f44b359b7081974fd4478413fd14cfbd631b880c3203329",
+    "exit_bundle_sha256": "ba37874360aebdc0bb189f45876031ad439a520baed1a999e8bda72c35724501",
+    "verdict": "REJECTED_STRICT_REFERENCE"
+  },
+  "attempts": []
+}

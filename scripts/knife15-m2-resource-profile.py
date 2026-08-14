@@ -57,6 +57,19 @@ REQUIRED_SHA256_FIELDS = (
     "provider_identity_evidence_sha256",
     "route_identity_evidence_sha256",
 )
+REFERENCE_IDENTITY = {
+    "candidate_id": "reference-33",
+    "provider": "tencent-cloud",
+    "resource_id": "reference-exit-33",
+    "region": "us-west-reference",
+    "public_ipv4": "43.153.32.33",
+    "asn": 132203,
+    "route_class": "public-internet",
+    "route_contract_id": "reference-default",
+    "tuic_port": 8443,
+    "target_ipv4": "43.130.32.77",
+    "target_iperf_port": 5201,
+}
 
 
 def fixture_path(name: str) -> Path:
@@ -229,11 +242,18 @@ def canonical_profile_sha256(value: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def validate_reference_identity(value: dict[str, Any]) -> None:
+    for field, expected in REFERENCE_IDENTITY.items():
+        if value.get(field) != expected:
+            raise ValueError(f"reference.{field} does not match frozen .33 identity")
+
+
 def classify_profiles(reference: Any, candidate: Any) -> dict[str, Any]:
     reference_identity = profile_identity(reference, "reference")
     candidate_identity = profile_identity(candidate, "candidate")
     reference_profile = object_value(reference, "reference")
     candidate_profile = object_value(candidate, "candidate")
+    validate_reference_identity(reference_profile)
 
     def result(eligible: bool, reason: str) -> dict[str, Any]:
         return {
@@ -365,6 +385,24 @@ def self_test() -> None:
     independent_result = classify_profiles(reference, independent_route)
     assert independent_result["eligible"] is True
     assert independent_result["reason"] == "independent_route_contract"
+    drifted_reference = copy.deepcopy(reference)
+    drifted_reference["public_ipv4"] = "8.8.8.8"
+    try:
+        classify_profiles(drifted_reference, candidate)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a drifted historical reference was accepted")
+    drifted_reference = copy.deepcopy(reference)
+    drifted_reference["target_ipv4"] = "1.0.0.1"
+    drifted_candidate = copy.deepcopy(candidate)
+    drifted_candidate["target_ipv4"] = "1.0.0.1"
+    try:
+        classify_profiles(drifted_reference, drifted_candidate)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a drifted historical Target was accepted")
     try:
         json.loads(
             '{"schema":"first","schema":"second"}',

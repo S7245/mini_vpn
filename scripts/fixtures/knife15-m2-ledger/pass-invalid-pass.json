@@ -1,0 +1,31 @@
+{
+  "schema": "knife15-m2-ledger-scenario-v1",
+  "name": "pass_invalid_pass",
+  "expected_status": "TIER_A_ACCEPTED",
+  "attempts": [
+    {
+      "candidate": "candidate-a",
+      "role": "qualification",
+      "evidence_class": "pass",
+      "reason": "strict_pass"
+    },
+    {
+      "candidate": "candidate-a",
+      "role": "formal",
+      "evidence_class": "pass",
+      "reason": "strict_pass"
+    },
+    {
+      "candidate": "candidate-a",
+      "role": "formal",
+      "evidence_class": "invalid",
+      "reason": "power_loss"
+    },
+    {
+      "candidate": "candidate-a",
+      "role": "formal",
+      "evidence_class": "pass",
+      "reason": "strict_pass"
+    }
+  ]
+}

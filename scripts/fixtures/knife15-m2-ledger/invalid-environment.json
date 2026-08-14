@@ -1,0 +1,13 @@
+{
+  "schema": "knife15-m2-ledger-scenario-v1",
+  "name": "invalid_environment",
+  "expected_status": "TIER_A_PENDING",
+  "attempts": [
+    {
+      "candidate": "candidate-a",
+      "role": "qualification",
+      "evidence_class": "invalid",
+      "reason": "vps_outage"
+    }
+  ]
+}
