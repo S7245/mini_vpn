@@ -1,5 +1,29 @@
 # Learnings
 
+## 2026-08-14 - ACK progress and aggregate throughput do not prove one-second continuity
+
+- A QUIC connection can keep ACKing bytes and recover acceptable aggregate
+  throughput while native loss recovery contracts cwnd enough to create whole
+  one-second Target receiver gaps. Preserve the distinction between liveness,
+  aggregate rate, and the frozen continuity SLI.
+- Paired observation must follow payload supply across both legs. When
+  Target-egress bytes track TUIC-ingress bytes while the Exit-to-Target socket
+  has continuous ACKs, negligible retransmission, and a small send queue, the
+  missing supply belongs to Mac-to-Exit even if the Target is where the zero
+  interval is measured.
+- Endpoint `max_service_gap` compares consecutive grants across idle periods;
+  it is not a continuously-backlogged fairness SLI. Interpret it together
+  with waiter ownership, delay events, conservation, and per-path pacing.
+- A module must not claim false leverage. Generation replacement deeply owns
+  future-open handoff, but standard TUIC has no interface for migrating an
+  established stream or its remote TCP socket. Putting that claim behind the
+  existing seam would destroy byte-ownership locality rather than deepen it.
+- A short formal failure can be more valuable than a 24-hour pass when it
+  reaches the exact architecture stop rule. Do not spend another long run on
+  an unchanged architecture merely because the previous run ended early.
+- Result:
+  `docs/tech/2026-08-14-knife15-m2-ack-progress-native-loss-recovery-formal-failure-results.md`.
+
 ## 2026-08-13 - A short qualification can validate the real handoff branch without weakening formal duration
 
 - The two-cycle run reached an actual auxiliary replacement: exact current

@@ -1,5 +1,24 @@
 # Errors
 
+## 2026-08-14 - Formal M2 failed on an ACK-progressing established TUIC stream
+
+- Exact-source `cdbfe36` passed every preflight, four complete cycles, 36
+  phases, four DNS/real-client checks, and cleanup, then cycle 5
+  `tcp-forward` produced five complete Target receiver-zero intervals.
+- The paired Exit captured `25,857,901` packets with zero kernel drops. Its
+  Target socket had only `2,725B` retransmission and a maximum `30,350B` send
+  queue; Target egress fell with TUIC ingress. This excludes the Target and
+  Exit-to-Target TCP path as primary causes.
+- The established Mac-to-Exit QUIC stream kept ACK progress while cwnd fell
+  `2,675,530 -> 24,463B`, loss and congestion events advanced, and PLPMTUD
+  black holes moved `4 -> 36`. Standard TUIC cannot migrate its already-open
+  Target TCP socket to another generation.
+- No local P0/P1, Endpoint conservation failure, D16/TUN leak, runner false
+  negative, or safe in-scope repair was found. Formal M2 remains failed; do
+  not repeat or tune `cdbfe36` unchanged.
+- Result:
+  `docs/tech/2026-08-14-knife15-m2-ack-progress-native-loss-recovery-formal-failure-results.md`.
+
 ## 2026-08-13 - Formal source floor initially stopped at production before its runner repair
 
 - After qualification, a focused source-policy RED showed exact `c06a9d0`

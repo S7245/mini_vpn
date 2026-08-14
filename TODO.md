@@ -1,10 +1,48 @@
 # TODO
 
-## Current Knife15 Plan (2026-08-13)
+## Current Knife15 Plan (2026-08-14)
 
-### Long-duration release readiness with HK HITL qualification and a Shenzhen soak lane
+### Established-stream continuity architecture decision after the formal HK gate
 
-#### Latest decision (2026-08-13 — paired successor install qualification passed; formal M2 reopened)
+#### Latest decision (2026-08-14 — formal M2 reached the standard-TUIC established-stream architecture stop)
+
+Exact-source `cdbfe36` formal artifact
+`/tmp/mini_vpn_knife15_macos_20260814_014536.tar.gz` (SHA-256 `2c002684...`)
+passed baseline `32.701/56.515 Mbit/s`, bounded direct `16.341 Mbit/s`, smoke,
+all preflights, four complete cycles/36 phases, four DNS and real-client
+checks, and cleanup. Cycle 5 `tcp-forward` then produced five complete Target
+receiver-zero intervals, so formal M2 failed and M3 remains blocked.
+
+Paired Exit SHA-256 `ba378743...` captured `25,857,901` packets with zero
+kernel drops. Target egress fell with TUIC ingress; the exact Target socket
+retained ACK progress with only `2,725B` retransmitted, a maximum `30,350B`
+send queue, and a `996.276ms` maximum payload-supply gap. The failed stream's
+Mac-side QUIC connection retained ACK progress while cwnd contracted
+`2,675,530 -> 24,463B`, lost bytes advanced `2,467,761 -> 3,795,148`, and
+PLPMTUD black holes advanced `4 -> 36`. D16, TUN, Endpoint, process, routes,
+DNS, observer, Target, and Exit-to-Target TCP were clean.
+
+Targeted code review found no unresolved local P0/P1 and no correct
+implementation seam within the frozen standard-TUIC architecture. Existing
+generation replacement and the VLESS/REALITY Transport can protect future
+opens, but neither can migrate the established Target TCP socket. Reusing
+same-path reset/rebind is formally rejected; a duplicate TUIC Connect is a
+different Target socket.
+
+Next:
+
+1. do not repeat formal M2 unchanged and do not tune any frozen value;
+2. freeze reviewed behavior at `cdbfe36`;
+3. make an explicit product/architecture decision between a custom resumable
+   or path-diverse Upstream protocol/server and a product-evidenced change to
+   the one-second continuity acceptance contract;
+4. keep formal M2 failed and M3 blocked until that decision produces a new
+   sufficient architecture and deterministic test seam.
+
+Result:
+`docs/tech/2026-08-14-knife15-m2-ack-progress-native-loss-recovery-formal-failure-results.md`.
+
+#### Previous decision (2026-08-13 — paired successor install qualification passed; formal M2 reopened)
 
 Exact-source `d91f205` paired Mac artifact
 `/tmp/mini_vpn_knife15_macos_20260813_095649.tar.gz` (SHA-256 `db8297c6...`)

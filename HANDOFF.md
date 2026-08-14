@@ -2,9 +2,42 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 M2 Release Readiness (2026-08-13)
+## Next Planned Stage — Knife15 M2 Architecture Decision (2026-08-14)
 
-- **Latest accepted position:** exact-source `d91f205` paired qualification
+- **Latest accepted position:** exact-source `cdbfe36` formal artifact
+  `/tmp/mini_vpn_knife15_macos_20260814_014536.tar.gz` (SHA-256
+  `2c002684...`) passed baseline `32.701/56.515 Mbit/s`, bounded direct
+  `16.341 Mbit/s`, smoke, every preflight, four complete cycles/36 phases,
+  four DNS and real-client checks, and cleanup. Cycle 5 `tcp-forward` then
+  produced five complete Target receiver-zero intervals. Formal M2 failed;
+  M3 remains blocked.
+- Paired Exit SHA-256 `ba378743...` captured `25,857,901` packets with zero
+  kernel drops. Its exact Target socket had only `2,725B` retransmitted,
+  maximum `30,350B` send queue, and a `996.276ms` maximum payload-supply gap.
+  Per-second Target egress fell with TUIC ingress. This selects Mac-to-Exit
+  QUIC supply, not Target, Exit-to-Target TCP, observer, or cleanup.
+- The established stream retained ACK progress while its owning connection
+  moved from `2,675,530B` to `24,463B` cwnd; lost bytes advanced
+  `2,467,761 -> 3,795,148`, congestion events `1,552 -> 2,029`, and PLPMTUD
+  black holes `4 -> 36`. Endpoint conservation ended `61,414/0/0B`, with
+  zero abandon, would-block, and delay events. D16/TUN/process/routes/DNS were
+  clean. No mini_vpn path reset, Endpoint rebind, or generation replacement
+  occurred.
+- Concentrated code review found no unresolved local P0/P1. Rebinding or
+  resetting an ACK-progressing same path reopens the rejected path-reset
+  branch; generation replacement and VLESS/REALITY only own future opens;
+  duplicate standard TUIC streams cannot preserve one remote Target TCP
+  socket. Established-stream migration requires a custom resumable Upstream
+  protocol/server and conflicts with ADR-0004's accepted sing-box/client-only
+  direction.
+- Do not repeat formal M2 unchanged and do not tune frozen values. The next
+  work is an explicit architecture/product decision: authorize a resumable or
+  path-diverse server protocol, or revise the one-second continuity acceptance
+  contract with product evidence. Until then, freeze `cdbfe36`; M2 and M3 are
+  blocked. Result:
+  `docs/tech/2026-08-14-knife15-m2-ack-progress-native-loss-recovery-formal-failure-results.md`.
+
+- **Previous accepted position:** exact-source `d91f205` paired qualification
   artifact `/tmp/mini_vpn_knife15_macos_20260813_095649.tar.gz` (SHA-256
   `db8297c6...`) passed baseline `19.549/52.870 Mbit/s`, bounded direct
   `9.771 Mbit/s`, smoke, every preflight, two cycles/eight phases, two DNS and

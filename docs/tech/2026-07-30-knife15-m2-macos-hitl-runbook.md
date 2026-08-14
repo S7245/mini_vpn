@@ -2,10 +2,22 @@
 
 Date: 2026-07-30
 
-Status: **ONE FRESH FORMAL M2 REQUIRED ON A CLEAN REVIEWED DESCENDANT OF
-`cce3bf8` — DO NOT REPEAT QUALIFICATION**
+Status: **BLOCKED AFTER EXACT-SOURCE `cdbfe36` FORMAL ARCHITECTURE FAILURE —
+DO NOT EXECUTE OR REPEAT THIS RUNBOOK UNTIL A NEW ARCHITECTURE DECISION**
 
-This is the reviewed sequence for the current formal M2 acceptance run.
+The 2026-08-14 formal run reached the current standard-TUIC established-stream
+continuity stop rule after four complete cycles. Its established stream kept
+ACK progress while native QUIC loss recovery contracted cwnd and produced five
+complete Target receiver-zero intervals. Paired evidence excludes the Target,
+Exit-to-Target TCP, Endpoint, D16/TUN, runner, and cleanup. See
+`docs/tech/2026-08-14-knife15-m2-ack-progress-native-loss-recovery-formal-failure-results.md`.
+
+The sequence below is retained as historical operational evidence only. Do
+not run it again unchanged and do not tune frozen values. Formal M2 and M3 are
+blocked pending an explicit resumable/path-diverse Upstream decision or a
+product-evidenced change to the one-second continuity acceptance contract.
+
+This was the reviewed sequence for the formal M2 acceptance run.
 It uses the controlled IPv4 full tunnel and temporarily changes the active
 physical network service DNS. Reserve about 25 uninterrupted wall-clock hours.
 `stop` is mandatory after `m2`; only a complete formal schedule plus cleanup
