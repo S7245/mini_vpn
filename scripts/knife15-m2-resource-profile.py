@@ -36,9 +36,6 @@ PROFILE_FIELDS = {
     "client_binary_sha256",
     "workload_profile_sha256",
     "mac_interface",
-    "mac_target_route_sha256",
-    "mac_exit_route_sha256",
-    "traceroute_sha256",
     "prior_saturation_proven",
     "prior_saturation_evidence_sha256",
     "replacement_capacity_proven",
@@ -51,9 +48,6 @@ REQUIRED_SHA256_FIELDS = (
     "observer_sha256",
     "client_binary_sha256",
     "workload_profile_sha256",
-    "mac_target_route_sha256",
-    "mac_exit_route_sha256",
-    "traceroute_sha256",
     "provider_identity_evidence_sha256",
     "route_identity_evidence_sha256",
 )
@@ -385,6 +379,14 @@ def self_test() -> None:
     independent_result = classify_profiles(reference, independent_route)
     assert independent_result["eligible"] is True
     assert independent_result["reason"] == "independent_route_contract"
+    unbound_route_claim = copy.deepcopy(candidate)
+    unbound_route_claim["traceroute_sha256"] = "0" * 64
+    try:
+        classify_profiles(reference, unbound_route_claim)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unbound predeclared route fingerprint was accepted")
     drifted_reference = copy.deepcopy(reference)
     drifted_reference["public_ipv4"] = "8.8.8.8"
     try:
