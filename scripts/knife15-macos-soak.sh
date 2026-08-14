@@ -3606,6 +3606,25 @@ EOF_NETWORK_SERVICES
   ! utun_snapshot_has_no_additions \
     "$tmp/pre-ready-utun.before" "$tmp/pre-ready-utun.current" || \
     die "self-test: ambiguous new pre-ready utun was accepted as clean"
+  printf '%s\n' \
+    'destination: default' 'gateway: 192.168.50.1' 'interface: en0' \
+    >"$tmp/pre-ready-route.before"
+  cp "$tmp/pre-ready-route.before" "$tmp/pre-ready-route.current"
+  route_snapshot_matches_current_files \
+    "$tmp/pre-ready-route.before" "$tmp/pre-ready-route.current" || \
+    die "self-test: restored pre-ready route was rejected"
+  printf '%s\n' \
+    'destination: default' 'gateway: 192.168.50.1' 'interface: utun2' \
+    >"$tmp/pre-ready-route.current"
+  ! route_snapshot_matches_current_files \
+    "$tmp/pre-ready-route.before" "$tmp/pre-ready-route.current" || \
+    die "self-test: pre-ready route on a new utun was accepted"
+  printf '%s\n' \
+    'destination: default' 'gateway: 192.168.50.254' 'interface: en0' \
+    >"$tmp/pre-ready-route.current"
+  ! route_snapshot_matches_current_files \
+    "$tmp/pre-ready-route.before" "$tmp/pre-ready-route.current" || \
+    die "self-test: pre-ready route with a changed gateway was accepted"
 
   m2_route_state="$tmp/m2-route-state"
   m2_run="$tmp/m2-route-run"
@@ -10312,12 +10331,26 @@ bundle_is_finalized() {
 }
 
 owned_routes_are_restored() {
-  local utun target exit_host dns_target
+  local utun target exit_host dns_target run_dir
   utun="$(read_state utun 2>/dev/null || true)"
   target="$(read_state target 2>/dev/null || true)"
   exit_host="$(read_state exit_host 2>/dev/null || true)"
   dns_target="$(read_state dns_target 2>/dev/null || true)"
-  [[ -n "$utun" && -n "$target" && -n "$exit_host" ]] || return 1
+  [[ -n "$target" && -n "$exit_host" ]] || return 1
+  if [[ -z "$utun" ]]; then
+    run_dir="$(run_dir_from_state)" || return 1
+    pre_ready_utun_set_is_unchanged "$run_dir" || return 1
+    route_matches_before_file \
+      "$target" "$run_dir/target.route.before" target || return 1
+    route_matches_before_file \
+      "$exit_host" "$run_dir/exit.route.before" exit || return 1
+    if [[ -n "$dns_target" ]]; then
+      route_matches_before_file \
+        "$dns_target" "$run_dir/dns.route.before" dns || return 1
+    fi
+    [[ -z "$(read_state m2.full_tunnel 2>/dev/null || true)" ]]
+    return
+  fi
   [[ "$(route_interface "$target")" != "$utun" ]] || return 1
   [[ "$(route_interface "$exit_host")" != "$utun" ]] || return 1
   [[ -z "$dns_target" || "$(route_interface "$dns_target")" != "$utun" ]] || \
@@ -10336,22 +10369,58 @@ utun_snapshot_has_no_additions() {
   [[ -z "$additions" ]]
 }
 
+route_snapshot_matches_current_files() {
+  local before_file="$1" current_file="$2"
+  local before_interface current_interface before_gateway current_gateway
+  [[ -f "$before_file" && ! -L "$before_file" && \
+    -f "$current_file" && ! -L "$current_file" ]] || return 1
+  before_interface="$(route_interface_from_text <"$before_file")"
+  current_interface="$(route_interface_from_text <"$current_file")"
+  before_gateway="$(route_gateway_from_text <"$before_file")"
+  current_gateway="$(route_gateway_from_text <"$current_file")"
+  [[ -n "$before_interface" && "$current_interface" == "$before_interface" && \
+    "$current_gateway" == "$before_gateway" ]]
+}
+
+route_matches_before_file() {
+  local destination="$1" before_file="$2" label="$3"
+  local run_dir current_file result
+  run_dir="$(run_dir_from_state)" || return 1
+  current_file="$run_dir/.${label}.route.stop.current.$$"
+  [[ ! -e "$current_file" && ! -L "$current_file" ]] || return 1
+  if ! route -n get "$destination" >"$current_file" 2>&1; then
+    rm -f "$current_file"
+    return 1
+  fi
+  result=1
+  route_snapshot_matches_current_files "$before_file" "$current_file" && \
+    result=0
+  rm -f "$current_file" || return 1
+  return "$result"
+}
+
+pre_ready_utun_set_is_unchanged() {
+  local run_dir="$1" before_file current_file result
+  before_file="$run_dir/utun.before"
+  current_file="$run_dir/.utun.stop.current.$$"
+  [[ ! -e "$current_file" && ! -L "$current_file" ]] || return 1
+  if ! list_utuns >"$current_file"; then
+    rm -f "$current_file"
+    return 1
+  fi
+  result=1
+  utun_snapshot_has_no_additions "$before_file" "$current_file" && result=0
+  rm -f "$current_file" || return 1
+  return "$result"
+}
+
 owned_tun_is_unavailable() {
-  local utun attempt run_dir before_file current_file result
+  local utun attempt run_dir
   utun="$(read_state utun 2>/dev/null || true)"
   if [[ -z "$utun" ]]; then
     run_dir="$(run_dir_from_state)" || return 1
-    before_file="$run_dir/utun.before"
-    current_file="$run_dir/.utun.stop.current.$$"
-    [[ ! -e "$current_file" && ! -L "$current_file" ]] || return 1
-    if ! list_utuns >"$current_file"; then
-      rm -f "$current_file"
-      return 1
-    fi
-    result=1
-    utun_snapshot_has_no_additions "$before_file" "$current_file" && result=0
-    rm -f "$current_file" || return 1
-    return "$result"
+    pre_ready_utun_set_is_unchanged "$run_dir"
+    return
   fi
   for ((attempt = 0; attempt < 5; attempt++)); do
     if ! ifconfig "$utun" >/dev/null 2>&1; then
