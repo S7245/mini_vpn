@@ -311,6 +311,10 @@ validate_client_identity() {
   validate_ipv4 "$exit_ipv4"
 }
 
+validate_client_kind() {
+  [[ "$1" == mature || "$1" == mini_vpn || "$1" == commercial ]]
+}
+
 network_service_for_interface_from_text() {
   local interface="$1"
   awk -v interface="$interface" '
@@ -1235,7 +1239,8 @@ publish_market_bundle() {
 
 write_market_run_manifest() {
   local run_dir="$1" binding_profile="$2" workload_profile="$3"
-  local client_label="$4" client_version="$5" final_status="$6" reason="$7"
+  local client_label="$4" client_version="$5" client_kind="$6"
+  local final_status="$7" reason="$8"
   local phase_count=0 probe_count=0 event_count=0 invalid_count=0
   [[ ! -f "$run_dir/workload/phases.tsv" ]] || \
     phase_count="$(awk 'END {print (NR > 0 ? NR-1 : 0)}' \
@@ -1261,6 +1266,7 @@ write_market_run_manifest() {
     "workload_profile_sha256=$(sha256_file "$workload_profile")" \
     "client_label=$client_label" \
     "client_version=$client_version" \
+    "client_kind=$client_kind" \
     "phase_count=$phase_count" \
     "probe_count=$probe_count" \
     "quality_event_count=$event_count" \
@@ -1284,14 +1290,16 @@ preserve_market_baseline() {
 
 execute_market_run() {
   local run_dir="$1" binding_profile="$2" workload_profile="$3"
-  local client_label="$4" client_version="$5" vpn_if="$6" physical_if="$7"
-  local tuic_exit_ipv4="$8" expected_egress="$9" dns_target="${10}"
-  local dns_name="${11}" client_binary="${12}" timeout_grace="${13}"
-  local observer_script="${14}" tuic_port="${15}" route_bin="${16}"
-  local ifconfig_bin="${17}" scutil_bin="${18}" networksetup_bin="${19}"
-  local curl_bin="${20}" dig_bin="${21}" iperf_bin="${22}" git_bin="${23}"
+  local client_label="$4" client_version="$5" client_kind="$6"
+  local vpn_if="$7" physical_if="$8" tuic_exit_ipv4="$9"
+  local expected_egress="${10}" dns_target="${11}" dns_name="${12}"
+  local client_binary="${13}" timeout_grace="${14}" observer_script="${15}"
+  local tuic_port="${16}" route_bin="${17}" ifconfig_bin="${18}"
+  local scutil_bin="${19}" networksetup_bin="${20}" curl_bin="${21}"
+  local dig_bin="${22}" iperf_bin="${23}" git_bin="${24}"
   local workload_ok=0 workload_status=INVALID final_status reason
   [[ -d "$run_dir" && ! -L "$run_dir" ]] || return 1
+  validate_client_kind "$client_kind" || return 1
   mkdir "$run_dir/preflight" "$run_dir/observer" "$run_dir/workload" || return 1
   if ! perform_preflight "$run_dir/preflight" "$binding_profile" "$client_label" \
     "$client_version" "$vpn_if" "$physical_if" "$tuic_exit_ipv4" \
@@ -1300,14 +1308,16 @@ execute_market_run() {
     "$iperf_bin" "$git_bin"; then
     printf 'INVALID\n' >"$run_dir/status"
     write_market_run_manifest "$run_dir" "$binding_profile" "$workload_profile" \
-      "$client_label" "$client_version" INVALID preflight_failed || return 1
+      "$client_label" "$client_version" "$client_kind" INVALID preflight_failed || \
+      return 1
     publish_market_bundle "$run_dir" || return 1
     return 1
   fi
   if ! preserve_market_baseline "$run_dir" "$binding_profile"; then
     printf 'INVALID\n' >"$run_dir/status"
     write_market_run_manifest "$run_dir" "$binding_profile" "$workload_profile" \
-      "$client_label" "$client_version" INVALID baseline_preservation_failed || \
+      "$client_label" "$client_version" "$client_kind" INVALID \
+      baseline_preservation_failed || \
       return 1
     publish_market_bundle "$run_dir" || return 1
     return 1
@@ -1320,7 +1330,8 @@ execute_market_run() {
     fi
     printf 'INVALID\n' >"$run_dir/status"
     write_market_run_manifest "$run_dir" "$binding_profile" "$workload_profile" \
-      "$client_label" "$client_version" INVALID observer_start_failed || return 1
+      "$client_label" "$client_version" "$client_kind" INVALID \
+      observer_start_failed || return 1
     publish_market_bundle "$run_dir" || return 1
     return 1
   fi
@@ -1353,7 +1364,8 @@ execute_market_run() {
   fi
   printf '%s\n' "$final_status" >"$run_dir/status"
   write_market_run_manifest "$run_dir" "$binding_profile" "$workload_profile" \
-    "$client_label" "$client_version" "$final_status" "$reason" || return 1
+    "$client_label" "$client_version" "$client_kind" "$final_status" \
+    "$reason" || return 1
   publish_market_bundle "$run_dir" || return 1
   [[ "$final_status" == PASS_NO_EVENTS || "$final_status" == PASS_WITH_EVENTS ]]
 }
@@ -1398,7 +1410,8 @@ validate_exit_ssh_host() {
 
 run_action() {
   local profile_file="${PROFILE_FILE:-}" client_label="${CLIENT_LABEL:-}"
-  local client_version="${CLIENT_VERSION:-}" vpn_if="${EXPECTED_VPN_IF:-}"
+  local client_version="${CLIENT_VERSION:-}" client_kind="${CLIENT_KIND:-}"
+  local vpn_if="${EXPECTED_VPN_IF:-}"
   local physical_if="${PHYSICAL_IF:-}" tuic_exit_ipv4="${TUIC_EXIT_IPV4:-}"
   local expected_egress="${EXPECTED_EXIT_IPV4:-}" dns_target="${DNS_TARGET:-}"
   local dns_name="${DNS_NAME:-}" client_binary="${CLIENT_BINARY:-}"
@@ -1406,11 +1419,13 @@ run_action() {
   local run_root run_dir route_bin ifconfig_bin scutil_bin networksetup_bin
   local curl_bin dig_bin iperf_bin git_bin result=0 final_status
   [[ -n "$profile_file" && -n "$client_label" && -n "$client_version" && \
+    -n "$client_kind" && \
     -n "$vpn_if" && -n "$physical_if" && -n "$tuic_exit_ipv4" && \
     -n "$expected_egress" && -n "$dns_target" && -n "$dns_name" ]] || \
-    die "run requires PROFILE_FILE, CLIENT_LABEL, CLIENT_VERSION, EXPECTED_VPN_IF, PHYSICAL_IF, TUIC_EXIT_IPV4, EXPECTED_EXIT_IPV4, DNS_TARGET, and DNS_NAME"
+    die "run requires PROFILE_FILE, CLIENT_LABEL, CLIENT_VERSION, CLIENT_KIND, EXPECTED_VPN_IF, PHYSICAL_IF, TUIC_EXIT_IPV4, EXPECTED_EXIT_IPV4, DNS_TARGET, and DNS_NAME"
   validate_client_identity "$client_label" "$client_version" "$vpn_if" \
     "$physical_if" "$tuic_exit_ipv4" || die "invalid market client identity"
+  validate_client_kind "$client_kind" || die "CLIENT_KIND must be mature, mini_vpn, or commercial"
   validate_ipv4 "$expected_egress" && validate_ipv4 "$dns_target" && \
     validate_dns_name "$dns_name" && validate_port "$tuic_port" || \
     die "invalid market network identity"
@@ -1452,7 +1467,7 @@ run_action() {
   trap 'market_signal_handler TERM' TERM
   trap 'market_signal_handler HUP' HUP
   if ! execute_market_run "$run_dir" "$profile_file" "$profile_file" \
-    "$client_label" "$client_version" "$vpn_if" "$physical_if" \
+    "$client_label" "$client_version" "$client_kind" "$vpn_if" "$physical_if" \
     "$tuic_exit_ipv4" "$expected_egress" "$dns_target" "$dns_name" \
     "$client_binary" 30 "$observer_script" "$tuic_port" "$route_bin" \
     "$ifconfig_bin" "$scutil_bin" "$networksetup_bin" "$curl_bin" \
@@ -1474,6 +1489,128 @@ run_action() {
     printf 'ERROR: market calibration evidence is INVALID; external VPN client remains operator-owned\n' >&2
   fi
   return "$result"
+}
+
+classify_market_counts() {
+  local mature_trials="$1" mature_receiver_event_trials="$2"
+  local mini_trials="$3" mini_receiver_event_trials="$4"
+  if ((10#$mature_receiver_event_trials > 0)); then
+    printf 'CALIBRATE_PRODUCT_SLI\n'
+  elif ((10#$mature_trials == 0)); then
+    printf 'NO_DECISION\n'
+  elif ((10#$mature_trials >= 2 && 10#$mini_trials >= 2 && \
+    10#$mini_receiver_event_trials == 10#$mini_trials)); then
+    printf 'MINI_VPN_DIFFERENTIAL\n'
+  elif ((10#$mini_trials > 0 && 10#$mini_receiver_event_trials == 0)); then
+    printf 'EXTEND_MATCHED_DURATION\n'
+  else
+    printf 'RUN_MATCHED_C1\n'
+  fi
+}
+
+market_bundle_manifest() {
+  local bundle="$1" run_dir base
+  [[ "$bundle" == /*.tar.gz ]] || return 1
+  run_dir="${bundle%.tar.gz}"
+  market_bundle_is_valid "$run_dir" || return 1
+  base="$(basename "$run_dir")"
+  tar -xOf "$bundle" "$base/manifest.txt" 2>/dev/null
+}
+
+market_bundle_receiver_event_count() {
+  local bundle="$1" run_dir base
+  run_dir="${bundle%.tar.gz}"
+  base="$(basename "$run_dir")"
+  tar -xOf "$bundle" "$base/workload/events.tsv" 2>/dev/null | \
+    awk -F '\t' '
+      NR == 1 {
+        if ($0 != "timestamp\tcycle\tphase\tkind\tvalue\tdetail\tevidence") {
+          invalid = 1
+        }
+        next
+      }
+      NF != 7 { invalid = 1; next }
+      $4 == "receiver_zero_interval" {
+        if ($5 !~ /^[1-9][0-9]*$/) {
+          invalid = 1
+          next
+        }
+        count += $5
+      }
+      END {
+        if (NR < 1 || invalid) exit 1
+        print count + 0
+      }
+    '
+}
+
+summarize_market_trials() {
+  local token role bundle manifest status receiver_events recorded_kind
+  local mature_trials=0 mature_event_trials=0 mini_trials=0 mini_event_trials=0
+  local commercial_trials=0 invalid_trials=0 decision
+  (($# > 0)) || return 1
+  for token in "$@"; do
+    [[ "$token" == *=* ]] || return 1
+    role="${token%%=*}"
+    bundle="${token#*=}"
+    [[ "$role" == mature || "$role" == mini_vpn || "$role" == commercial ]] || \
+      return 1
+    if ! manifest="$(market_bundle_manifest "$bundle")"; then
+      invalid_trials=$((invalid_trials + 1))
+      continue
+    fi
+    status="$(value_from_text "$manifest" status 2>/dev/null || echo INVALID)"
+    recorded_kind="$(value_from_text "$manifest" client_kind 2>/dev/null || \
+      echo missing)"
+    if [[ "$recorded_kind" != "$role" ]]; then
+      invalid_trials=$((invalid_trials + 1))
+      continue
+    fi
+    if [[ "$status" != PASS_NO_EVENTS && "$status" != PASS_WITH_EVENTS ]]; then
+      invalid_trials=$((invalid_trials + 1))
+      continue
+    fi
+    receiver_events="$(market_bundle_receiver_event_count "$bundle")" || {
+      invalid_trials=$((invalid_trials + 1))
+      continue
+    }
+    [[ "$receiver_events" =~ ^[0-9]+$ ]] || {
+      invalid_trials=$((invalid_trials + 1))
+      continue
+    }
+    case "$role" in
+      mature)
+        mature_trials=$((mature_trials + 1))
+        ((10#$receiver_events == 0)) || \
+          mature_event_trials=$((mature_event_trials + 1))
+        ;;
+      mini_vpn)
+        mini_trials=$((mini_trials + 1))
+        ((10#$receiver_events == 0)) || mini_event_trials=$((mini_event_trials + 1))
+        ;;
+      commercial) commercial_trials=$((commercial_trials + 1)) ;;
+    esac
+  done
+  if ((invalid_trials > 0)); then
+    decision=NO_DECISION
+  else
+    decision="$(classify_market_counts "$mature_trials" "$mature_event_trials" \
+      "$mini_trials" "$mini_event_trials")" || return 1
+  fi
+  printf '%s\n' \
+    'schema=knife15-market-decision-v1' \
+    "mature_trials=$mature_trials" \
+    "mature_receiver_event_trials=$mature_event_trials" \
+    "mini_vpn_trials=$mini_trials" \
+    "mini_vpn_receiver_event_trials=$mini_event_trials" \
+    "commercial_qoe_trials=$commercial_trials" \
+    "invalid_trials=$invalid_trials" \
+    "decision=$decision"
+}
+
+summarize_action() {
+  summarize_market_trials "$@" || \
+    die "summarize requires role=/absolute/immutable-bundle.tar.gz inputs"
 }
 
 self_test() {
@@ -1899,7 +2036,7 @@ EOF_NETWORK
   full_run_dir="$tmp/mini_vpn_knife15_market_mihomo_20260814_130000"
   mkdir "$full_run_dir"
   execute_market_run "$full_run_dir" "$profile_file" "$workload_profile" \
-    mihomo-tuic 'Mihomo 1.19.0' utun9 en0 43.153.32.33 43.153.32.33 \
+    mihomo-tuic 'Mihomo 1.19.0' mature utun9 en0 43.153.32.33 43.153.32.33 \
     8.8.8.8 example.com '' 0 "$observer_mock" 8443 \
     "$fake_bin/route" "$fake_bin/ifconfig" "$fake_bin/scutil" \
     "$fake_bin/networksetup" "$fake_bin/curl" "$fake_bin/dig" \
@@ -1910,6 +2047,20 @@ EOF_NETWORK
   grep -Fxq 'observer_finalization_status=complete' "$full_run_dir/manifest.txt"
   market_bundle_is_valid "$full_run_dir" || \
     die "self-test: complete market run bundle invalid"
+  [[ "$(summarize_market_trials \
+    "mature=$full_run_dir.tar.gz" | \
+    awk -F= '$1 == "decision" {print $2}')" == CALIBRATE_PRODUCT_SLI ]] || \
+    die "self-test: mature receiver-zero decision mismatch"
+  [[ "$(summarize_market_trials \
+    "mini_vpn=$full_run_dir.tar.gz" | \
+    awk -F= '$1 == "decision" {print $2}')" == NO_DECISION ]] || \
+    die "self-test: mismatched immutable client role was accepted"
+  [[ "$(classify_market_counts 2 0 2 2)" == MINI_VPN_DIFFERENTIAL ]] || \
+    die "self-test: matched differential decision mismatch"
+  [[ "$(classify_market_counts 2 0 2 0)" == EXTEND_MATCHED_DURATION ]] || \
+    die "self-test: all-clean matched decision mismatch"
+  [[ "$(classify_market_counts 1 0 0 0)" == RUN_MATCHED_C1 ]] || \
+    die "self-test: clean C0 decision mismatch"
   bundle_run_dir="$tmp/mini_vpn_knife15_market_mihomo_20260814_120000"
   mkdir "$bundle_run_dir"
   printf 'PASS_WITH_EVENTS\n' >"$bundle_run_dir/status"
@@ -1940,6 +2091,8 @@ Usage:
   bash scripts/knife15-market-continuity.sh verify-profile PROFILE_FILE
   bash scripts/knife15-market-continuity.sh preflight
   bash scripts/knife15-market-continuity.sh run
+  bash scripts/knife15-market-continuity.sh summarize \
+    mature=/absolute/market-bundle.tar.gz [mini_vpn=/absolute/market-bundle.tar.gz ...]
 USAGE
 }
 
@@ -1949,6 +2102,7 @@ case "$ACTION" in
   verify-profile) verify_profile_action "${2:-}" ;;
   preflight) preflight_action ;;
   run) run_action ;;
+  summarize) shift; summarize_action "$@" ;;
   --help|-h|help) usage ;;
   *) usage >&2; exit 64 ;;
 esac
