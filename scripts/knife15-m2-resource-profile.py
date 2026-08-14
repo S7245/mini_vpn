@@ -69,6 +69,15 @@ def object_value(value: Any, label: str) -> dict[str, Any]:
     return value
 
 
+def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
 def string_value(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{label} must be a non-empty string")
@@ -278,9 +287,9 @@ def classify_profiles(reference: Any, candidate: Any) -> dict[str, Any]:
 
 def read_json(path: str) -> Any:
     if path == "-":
-        return json.load(sys.stdin)
+        return json.load(sys.stdin, object_pairs_hook=unique_object)
     with Path(path).open(encoding="utf-8") as handle:
-        return json.load(handle)
+        return json.load(handle, object_pairs_hook=unique_object)
 
 
 def validate_profile(value: Any) -> dict[str, Any]:
@@ -295,18 +304,15 @@ def validate_profile(value: Any) -> dict[str, Any]:
 
 
 def self_test() -> None:
-    with fixture_path("reference-33.json").open(encoding="utf-8") as handle:
-        reference: Any = json.load(handle)
-    with fixture_path("distinct-provider.json").open(encoding="utf-8") as handle:
-        candidate: Any = json.load(handle)
+    reference: Any = read_json(str(fixture_path("reference-33.json")))
+    candidate: Any = read_json(str(fixture_path("distinct-provider.json")))
     result = classify_profiles(reference, candidate)
     assert result["eligible"] is True
     assert result["reason"] == "distinct_provider_and_asn"
     assert result["candidate_id"] == "candidate-distinct-provider"
     assert len(result["reference_profile_sha256"]) == 64
     assert len(result["candidate_profile_sha256"]) == 64
-    with fixture_path("equivalent-resize.json").open(encoding="utf-8") as handle:
-        equivalent: Any = json.load(handle)
+    equivalent: Any = read_json(str(fixture_path("equivalent-resize.json")))
     equivalent_result = classify_profiles(reference, equivalent)
     assert equivalent_result["eligible"] is False
     assert equivalent_result["reason"] == "equivalent_unsaturated_route"
@@ -359,6 +365,15 @@ def self_test() -> None:
     independent_result = classify_profiles(reference, independent_route)
     assert independent_result["eligible"] is True
     assert independent_result["reason"] == "independent_route_contract"
+    try:
+        json.loads(
+            '{"schema":"first","schema":"second"}',
+            object_pairs_hook=unique_object,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("resource profile with a duplicate JSON key was accepted")
     malformed = copy.deepcopy(candidate)
     malformed["candidate_id"] = "candidate\ninjected=value"
     try:

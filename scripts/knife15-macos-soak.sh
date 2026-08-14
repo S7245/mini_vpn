@@ -36,6 +36,9 @@ M1_BASELINE_DIR="${M1_BASELINE_DIR:-}"
 M1_DIRECT_DIR="${M1_DIRECT_DIR:-}"
 M2_BASELINE_DIR="${M2_BASELINE_DIR:-}"
 M2_DIRECT_DIR="${M2_DIRECT_DIR:-}"
+M2_RESOURCE_PREFLIGHT_DIR="${M2_RESOURCE_PREFLIGHT_DIR:-}"
+M2_RESOURCE_PROFILE_HELPER="$SCRIPT_DIR/knife15-m2-resource-profile.py"
+M2_RESOURCE_PREFLIGHT_RUNNER="$SCRIPT_DIR/knife15-m2-resource-preflight.sh"
 M0_DIRECT_MAX_AGE_SECS=900
 M0_TOTAL_SECS="${M0_TOTAL_SECS:-7200}"
 M0_TCP_SECS="${M0_TCP_SECS:-300}"
@@ -177,6 +180,7 @@ Important optional environment:
   M1_DIRECT_DIR=/tmp/mini_vpn_knife15_macos_direct_REPLACE_WITH_TIMESTAMP
   M2_BASELINE_DIR=/tmp/mini_vpn_knife15_macos_baseline_REPLACE_WITH_TIMESTAMP
   M2_DIRECT_DIR=/tmp/mini_vpn_knife15_macos_direct_REPLACE_WITH_TIMESTAMP
+  M2_RESOURCE_PREFLIGHT_DIR=/tmp/mini_vpn_knife15_resource_REPLACE_WITH_TIMESTAMP
   EXIT_SSH_HOST=ubuntu@43.153.32.33
   EXIT_SSH_KEY=$HOME/.ssh/vpn
 
@@ -227,7 +231,7 @@ stop immediately, and the result can never satisfy formal M1 acceptance.
 M2 workflow (use a fresh terminal; M2 temporarily owns IPv4 split-default
 routes and the active physical service DNS until stop):
   1. unset M0_BASELINE_DIR M0_DIRECT_DIR M1_BASELINE_DIR M1_DIRECT_DIR
-  2. unset M2_BASELINE_DIR M2_DIRECT_DIR
+  2. unset M2_BASELINE_DIR M2_DIRECT_DIR M2_RESOURCE_PREFLIGHT_DIR
   3. cargo build --release
   4. export the five MINI_VPN_TUIC_* values and TARGET/DNS/IPERF settings
   5. bash scripts/knife15-macos-soak.sh --self-test
@@ -238,18 +242,19 @@ routes and the active physical service DNS until stop):
   9. export M2_BASELINE_DIR='REPLACE_WITH_BASELINE_DIRECTORY_FROM_STEP_8'
  10. bash scripts/knife15-macos-soak.sh direct-discriminator
  11. export M2_DIRECT_DIR='REPLACE_WITH_DIRECT_DIRECTORY_FROM_STEP_10'
- 12. sudo -v
- 13. sudo -E bash scripts/knife15-macos-soak.sh start
- 14. sudo -E bash scripts/knife15-macos-soak.sh smoke
- 15. export EXIT_SSH_HOST=ubuntu@43.153.32.33
- 16. export EXIT_SSH_KEY="$HOME/.ssh/vpn"
- 17. OBSERVER_TIMEOUT_SECS=93600 bash scripts/knife15-exit-target-observer.sh start
- 18. caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2
- 19. sudo -E bash scripts/knife15-macos-soak.sh status
- 20. sudo -E bash scripts/knife15-macos-soak.sh stop
+ 12. run the reviewed resource preflight and export its exact
+     M2_RESOURCE_PREFLIGHT_DIR (do not use repository fixtures)
+ 13. sudo -v
+ 14. sudo -E bash scripts/knife15-macos-soak.sh start
+ 15. sudo -E bash scripts/knife15-macos-soak.sh smoke
+ 16. export EXIT_SSH_HOST for the admitted candidate
+ 17. export EXIT_SSH_KEY="$HOME/.ssh/vpn"
+ 18. OBSERVER_TIMEOUT_SECS=93600 bash scripts/knife15-exit-target-observer.sh start
+ 19. caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2
+ 20. sudo -E bash scripts/knife15-macos-soak.sh status
+ 21. sudo -E bash scripts/knife15-macos-soak.sh stop
 
-Before another formal M2 after an initial-stream architecture change, replace
-step 18 with:
+For the strict resource qualification, replace step 19 with:
   caffeinate -dimsu sudo -E bash scripts/knife15-macos-soak.sh m2-qualification
 
 M2 qualification runs exactly two 300s forward + 300s reverse + 180s
@@ -432,6 +437,43 @@ validate_baseline_dir_path() {
 validate_direct_dir_path() {
   local value="${1:-}"
   [[ "$value" =~ ^/tmp/mini_vpn_knife15_macos_direct_[A-Za-z0-9._-]+$ ]]
+}
+
+validate_resource_preflight_dir_path() {
+  local value="${1:-}"
+  [[ "$value" =~ ^/tmp/mini_vpn_knife15_resource_[A-Za-z0-9._-]+$ ]]
+}
+
+m2_resource_json_value() {
+  local file_path="${1:-}" key="${2:-}"
+  [[ -f "$file_path" && ! -L "$file_path" && \
+    "$key" =~ ^[a-z][a-z0-9_]*$ ]] || return 1
+  /usr/bin/python3 -I - "$file_path" "$key" <<'PY_M2_RESOURCE_JSON'
+import json
+import sys
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    root = json.load(handle, object_pairs_hook=unique_object)
+if not isinstance(root, dict) or sys.argv[2] not in root:
+    raise SystemExit(1)
+value = root[sys.argv[2]]
+if isinstance(value, bool):
+    print("true" if value else "false")
+elif isinstance(value, (str, int)):
+    print(value)
+else:
+    raise SystemExit(1)
+PY_M2_RESOURCE_JSON
 }
 
 selected_direct_baseline_dir() {
@@ -3226,6 +3268,10 @@ runner_self_test() {
   local m2_qualification_run m2_qualification_fail_run
   local observer_status observer_run observer_fake observer_calls
   local observer_exit_run observer_exit_status original_m2_exit_observer_script
+  local resource_evidence resource_direct resource_source resource_binary_sha
+  local resource_observer_sha resource_provider_sha resource_route_sha
+  local resource_candidate resource_file resource_source_dir resource_copy_dir
+  local resource_archive resource_state_dir resource_original_state_dir
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/knife15-macos-self-test.XXXXXX")" || return 1
   good_log="$tmp/good.log"
   bad_log="$tmp/bad.log"
@@ -3242,6 +3288,165 @@ runner_self_test() {
   ! validate_dns_name $'bad\nname' || die "self-test: invalid DNS name accepted"
   validate_run_dir_path /tmp/mini_vpn_knife15_macos_20260714_010203 || \
     die "self-test: valid run directory rejected"
+  validate_resource_preflight_dir_path \
+    /tmp/mini_vpn_knife15_resource_candidate_a || \
+    die "self-test: valid resource preflight directory rejected"
+  ! validate_resource_preflight_dir_path \
+    /tmp/mini_vpn_knife15_resource_../victim || \
+    die "self-test: traversal resource preflight directory accepted"
+  [[ "$(m2_resource_json_value \
+    "$SCRIPT_DIR/fixtures/knife15-m2-resource/distinct-provider.json" \
+    candidate_id)" == candidate-distinct-provider ]] || \
+    die "self-test: resource JSON value lookup failed"
+  resource_evidence="$tmp/resource-evidence"
+  resource_direct="$tmp/resource-direct-manifest.txt"
+  resource_candidate="$resource_evidence/candidate-profile.json"
+  resource_source="$(printf '4%.0s' {1..40})"
+  resource_binary_sha="$(printf '5%.0s' {1..64})"
+  resource_observer_sha="$(sha256_file "$M2_EXIT_OBSERVER_SCRIPT")"
+  mkdir "$resource_evidence"
+  printf '%s\n' 'schema=knife15-direct-fixture-v1' >"$resource_direct"
+  printf '%s\n' 'provider=independent-provider' \
+    >"$resource_evidence/provider-identity.txt"
+  printf '%s\n' 'route_contract=candidate-premium-a' \
+    >"$resource_evidence/route-identity.txt"
+  resource_provider_sha="$(sha256_file \
+    "$resource_evidence/provider-identity.txt")"
+  resource_route_sha="$(sha256_file "$resource_evidence/route-identity.txt")"
+  cp "$SCRIPT_DIR/fixtures/knife15-m2-resource/reference-33.json" \
+    "$resource_evidence/reference-profile.json"
+  jq --arg source "$resource_source" \
+    --arg binary "$resource_binary_sha" \
+    --arg direct "$(sha256_file "$resource_direct")" \
+    --arg observer "$resource_observer_sha" \
+    --arg provider_evidence "$resource_provider_sha" \
+    --arg route_evidence "$resource_route_sha" \
+    '.source_commit = $source |
+      .client_binary_sha256 = $binary |
+      .workload_profile_sha256 = $direct |
+      .observer_sha256 = $observer |
+      .provider_identity_evidence_sha256 = $provider_evidence |
+      .route_identity_evidence_sha256 = $route_evidence' \
+    "$SCRIPT_DIR/fixtures/knife15-m2-resource/distinct-provider.json" \
+    >"$resource_candidate"
+  /usr/bin/python3 -I "$M2_RESOURCE_PROFILE_HELPER" compare \
+    --reference "$resource_evidence/reference-profile.json" \
+    --candidate "$resource_candidate" \
+    >"$resource_evidence/eligibility.json"
+  cp "$resource_direct" "$resource_evidence/direct-manifest.txt"
+  printf '%s\n' \
+    'route to: 1.1.1.1' 'interface: en0' \
+    >"$resource_evidence/exit.route.txt"
+  printf '%s\n' \
+    'route to: 43.130.32.77' 'interface: en0' \
+    >"$resource_evidence/target.route.txt"
+  printf '%s\n' 'traceroute fixture exit' \
+    >"$resource_evidence/exit.traceroute.txt"
+  printf '%s\n' 'traceroute fixture target' \
+    >"$resource_evidence/target.traceroute.txt"
+  : >"$resource_evidence/remote.stderr"
+  printf '%s\n' \
+    'schema=knife15-m2-resource-remote-v1' \
+    'service_active=active' \
+    'server_binary_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+    'server_config_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+    'cpu_count=4' 'loadavg=0.1,0.2,0.3,1/100,1' \
+    'memtotal=8388608kB' 'memavailable=6291456kB' \
+    'tuic_udp_listener=1' 'udp_summary_begin' 'UDP: 1' \
+    'udp_summary_end' 'interface_counters_begin' 'eth0 fixture' \
+    'interface_counters_end' >"$resource_evidence/remote.txt"
+  printf '%s\n' 'PASS: no credential-like assignment found' \
+    >"$resource_evidence/secret-scan.txt"
+  printf '%s\n' \
+    'schema=knife15-m2-resource-preflight-v1' \
+    'status=pass' \
+    'candidate_id=candidate-distinct-provider' \
+    'candidate_ipv4=1.1.1.1' \
+    'candidate_tuic_port=8443' \
+    'target=43.130.32.77' \
+    'target_iperf_port=5201' \
+    'physical_interface=en0' \
+    "source_commit=$resource_source" \
+    "binary_sha256=$resource_binary_sha" \
+    "direct_manifest_sha256=$(sha256_file "$resource_direct")" \
+    "observer_sha256=$resource_observer_sha" \
+    "profile_helper_sha256=$(sha256_file "$M2_RESOURCE_PROFILE_HELPER")" \
+    "preflight_runner_sha256=$(sha256_file "$M2_RESOURCE_PREFLIGHT_RUNNER")" \
+    "eligibility_sha256=$(sha256_file "$resource_evidence/eligibility.json")" \
+    "provider_identity_sha256=$resource_provider_sha" \
+    "route_identity_sha256=$resource_route_sha" \
+    "remote_sha256=$(sha256_file "$resource_evidence/remote.txt")" \
+    "exit_route_sha256=$(sha256_file "$resource_evidence/exit.route.txt")" \
+    "target_route_sha256=$(sha256_file "$resource_evidence/target.route.txt")" \
+    "exit_traceroute_sha256=$(sha256_file "$resource_evidence/exit.traceroute.txt")" \
+    "target_traceroute_sha256=$(sha256_file "$resource_evidence/target.traceroute.txt")" \
+    >"$resource_evidence/result.txt"
+  : >"$resource_evidence/SHA256SUMS"
+  for resource_file in \
+    reference-profile.json candidate-profile.json eligibility.json \
+    direct-manifest.txt provider-identity.txt route-identity.txt \
+    exit.route.txt target.route.txt exit.traceroute.txt target.traceroute.txt \
+    remote.txt remote.stderr secret-scan.txt result.txt; do
+    printf '%s  %s\n' "$(sha256_file "$resource_evidence/$resource_file")" \
+      "$resource_file" >>"$resource_evidence/SHA256SUMS"
+  done
+  m2_resource_evidence_is_valid "$resource_evidence" \
+    "$resource_source" "$resource_binary_sha" "$resource_direct" \
+    "$resource_observer_sha" 1.1.1.1 8443 43.130.32.77 5201 en0 || \
+    die "self-test: valid resource evidence rejected"
+  resource_source_dir="/tmp/mini_vpn_knife15_resource_selftest_$$"
+  resource_copy_dir="$tmp/resource-evidence-copy"
+  resource_archive="${resource_source_dir}.tar.gz"
+  rm -rf "$resource_source_dir" "$resource_archive" \
+    "${resource_archive}.sha256"
+  cp -R "$resource_evidence" "$resource_source_dir"
+  COPYFILE_DISABLE=1 tar -C /tmp -czf "$resource_archive" \
+    "$(basename "$resource_source_dir")"
+  printf '%s  %s\n' "$(sha256_file "$resource_archive")" \
+    "$resource_archive" >"${resource_archive}.sha256"
+  m2_copy_resource_preflight_evidence \
+    "$resource_source_dir" "$resource_copy_dir" || \
+    die "self-test: valid resource evidence copy rejected"
+  m2_resource_evidence_is_valid "$resource_copy_dir" \
+    "$resource_source" "$resource_binary_sha" "$resource_direct" \
+    "$resource_observer_sha" 1.1.1.1 8443 43.130.32.77 5201 en0 || \
+    die "self-test: copied resource evidence rejected"
+  resource_original_state_dir="$STATE_DIR"
+  resource_state_dir="$tmp/resource-state"
+  mkdir "$resource_state_dir"
+  STATE_DIR="$resource_state_dir"
+  write_state m2.resource_stage m2-qualification
+  write_state m2.resource_candidate candidate-distinct-provider
+  write_state m2.resource_profile_sha256 \
+    "$(m2_resource_json_value "$resource_copy_dir/eligibility.json" \
+      candidate_profile_sha256)"
+  write_state m2.resource_result_sha256 \
+    "$(sha256_file "$resource_copy_dir/result.txt")"
+  m2_resource_state_binding_is_valid m2-qualification \
+    candidate-distinct-provider \
+    "$(m2_resource_json_value "$resource_copy_dir/eligibility.json" \
+      candidate_profile_sha256)" \
+    "$(sha256_file "$resource_copy_dir/result.txt")" || \
+    die "self-test: exact resource state binding rejected"
+  write_state m2.resource_candidate mutated-candidate
+  ! m2_resource_state_binding_is_valid m2-qualification \
+    candidate-distinct-provider \
+    "$(m2_resource_json_value "$resource_copy_dir/eligibility.json" \
+      candidate_profile_sha256)" \
+    "$(sha256_file "$resource_copy_dir/result.txt")" || \
+    die "self-test: changed resource state binding accepted"
+  STATE_DIR="$resource_original_state_dir"
+  printf '%s\n' mutation >>"$resource_copy_dir/direct-manifest.txt"
+  ! m2_resource_archive_matches_directory \
+    "$resource_copy_dir" "${resource_copy_dir}.tar.gz" || \
+    die "self-test: resource directory/archive mismatch accepted"
+  rm -rf "$resource_source_dir" "$resource_archive" \
+    "${resource_archive}.sha256"
+  printf '%s\n' mutation >>"$resource_evidence/direct-manifest.txt"
+  ! m2_resource_evidence_is_valid "$resource_evidence" \
+    "$resource_source" "$resource_binary_sha" "$resource_direct" \
+    "$resource_observer_sha" 1.1.1.1 8443 43.130.32.77 5201 en0 || \
+    die "self-test: mutated resource evidence accepted"
   ! validate_run_dir_path /tmp/other || die "self-test: unrelated run directory accepted"
   ! validate_run_dir_path /tmp/mini_vpn_knife15_macos_../victim || \
     die "self-test: traversal run directory accepted"
@@ -7990,6 +8195,319 @@ m2_source_is_accepted() {
   git -C "$REPO" merge-base --is-ancestor cce3bf8 "$revision" >/dev/null 2>&1
 }
 
+m2_resource_result_value() {
+  local file_path="${1:-}" key="${2:-}"
+  [[ -f "$file_path" && ! -L "$file_path" ]] || return 1
+  m2_exit_observer_value_from_text "$key" <"$file_path"
+}
+
+m2_resource_evidence_name_is_allowed() {
+  case "${1:-}" in
+    reference-profile.json|candidate-profile.json|eligibility.json|\
+    direct-manifest.txt|provider-identity.txt|route-identity.txt|\
+    prior-saturation.txt|replacement-capacity.txt|exit.route.txt|\
+    target.route.txt|exit.traceroute.txt|target.traceroute.txt|remote.txt|\
+    remote.stderr|secret-scan.txt|result.txt|SHA256SUMS)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+m2_resource_archive_matches_directory() {
+  local evidence_dir="${1:-}" archive="${2:-}"
+  local archive_listing expected_listing archive_root evidence_file name
+  [[ -d "$evidence_dir" && ! -L "$evidence_dir" && \
+    -f "$archive" && ! -L "$archive" ]] || return 1
+  archive_listing="$(tar -tzf "$archive" 2>/dev/null | LC_ALL=C sort)" || \
+    return 1
+  archive_root="$(printf '%s\n' "$archive_listing" | \
+    awk '{
+      value = $0
+      slash_count = gsub(/\//, "/", value)
+      if (slash_count == 1 && substr($0, length($0), 1) == "/") {
+        count++
+        root = $0
+      }
+    }
+    END {if (count != 1) exit 1; print root}')" || \
+    return 1
+  [[ "$archive_root" =~ \
+    ^mini_vpn_knife15_resource_[A-Za-z0-9._-]+/$ ]] || return 1
+  expected_listing="$archive_root"
+  for evidence_file in "$evidence_dir"/*; do
+    [[ -f "$evidence_file" && ! -L "$evidence_file" ]] || return 1
+    name="$(basename "$evidence_file")"
+    m2_resource_evidence_name_is_allowed "$name" || return 1
+    expected_listing+=$'\n'"$archive_root$name"
+  done
+  expected_listing="$(printf '%s\n' "$expected_listing" | LC_ALL=C sort)"
+  [[ "$archive_listing" == "$expected_listing" ]] || return 1
+  for evidence_file in "$evidence_dir"/*; do
+    name="$(basename "$evidence_file")"
+    cmp -s "$evidence_file" \
+      <(tar -xOzf "$archive" "$archive_root$name" 2>/dev/null) || return 1
+  done
+}
+
+m2_resource_state_binding_is_valid() {
+  local stage="${1:-}" candidate_id="${2:-}"
+  local profile_sha="${3:-}" result_sha="${4:-}"
+  [[ "$stage" == m2 || "$stage" == m2-qualification ]] || return 1
+  [[ -n "$candidate_id" && "$profile_sha" =~ ^[0-9a-f]{64}$ && \
+    "$result_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ "$(read_state m2.resource_stage)" == "$stage" && \
+    "$(read_state m2.resource_candidate)" == "$candidate_id" && \
+    "$(read_state m2.resource_profile_sha256)" == "$profile_sha" && \
+    "$(read_state m2.resource_result_sha256)" == "$result_sha" ]]
+}
+
+m2_resource_evidence_is_valid() {
+  local evidence_dir="${1:-}" expected_source="${2:-}"
+  local expected_binary_sha="${3:-}" expected_direct_manifest="${4:-}"
+  local expected_observer_sha="${5:-}" expected_exit="${6:-}"
+  local expected_tuic_port="${7:-}" expected_target="${8:-}"
+  local expected_iperf_port="${9:-}" expected_interface="${10:-}"
+  local required_file evidence_file evidence_name expected_eligibility
+  local observed_eligibility candidate_validation reference_validation
+  local candidate_profile_sha reference_profile_sha eligibility_reason
+  local result_file result_text remote_file candidate_file reference_file
+  local actual_sha expected_sha result_key remote_cpu remote_memory
+
+  [[ -d "$evidence_dir" && ! -L "$evidence_dir" ]] || return 1
+  for required_file in \
+    reference-profile.json candidate-profile.json eligibility.json \
+    direct-manifest.txt provider-identity.txt route-identity.txt \
+    exit.route.txt target.route.txt exit.traceroute.txt target.traceroute.txt \
+    remote.txt remote.stderr secret-scan.txt result.txt SHA256SUMS; do
+    [[ -f "$evidence_dir/$required_file" && \
+      ! -L "$evidence_dir/$required_file" ]] || return 1
+  done
+  for evidence_file in "$evidence_dir"/*; do
+    [[ -f "$evidence_file" && ! -L "$evidence_file" ]] || return 1
+    evidence_name="$(basename "$evidence_file")"
+    m2_resource_evidence_name_is_allowed "$evidence_name" || return 1
+  done
+  (cd "$evidence_dir" && \
+    /usr/bin/shasum -a 256 -c SHA256SUMS >/dev/null 2>&1) || return 1
+
+  candidate_file="$evidence_dir/candidate-profile.json"
+  reference_file="$evidence_dir/reference-profile.json"
+  observed_eligibility="$(tr -d '\n' <"$evidence_dir/eligibility.json")"
+  expected_eligibility="$(/usr/bin/python3 -I \
+    "$M2_RESOURCE_PROFILE_HELPER" compare --reference "$reference_file" \
+    --candidate "$candidate_file")" || return 1
+  [[ "$observed_eligibility" == "$expected_eligibility" && \
+    "$(m2_resource_json_value "$evidence_dir/eligibility.json" eligible)" == \
+      true ]] || return 1
+  candidate_validation="$(/usr/bin/python3 -I \
+    "$M2_RESOURCE_PROFILE_HELPER" validate "$candidate_file")" || return 1
+  reference_validation="$(/usr/bin/python3 -I \
+    "$M2_RESOURCE_PROFILE_HELPER" validate "$reference_file")" || return 1
+  candidate_profile_sha="$(printf '%s\n' "$candidate_validation" | \
+    sed -nE 's/^.*"profile_sha256":"([0-9a-f]{64})".*$/\1/p')"
+  reference_profile_sha="$(printf '%s\n' "$reference_validation" | \
+    sed -nE 's/^.*"profile_sha256":"([0-9a-f]{64})".*$/\1/p')"
+  [[ -n "$candidate_profile_sha" && -n "$reference_profile_sha" && \
+    "$candidate_profile_sha" == "$(m2_resource_json_value \
+      "$evidence_dir/eligibility.json" candidate_profile_sha256)" && \
+    "$reference_profile_sha" == "$(m2_resource_json_value \
+      "$evidence_dir/eligibility.json" reference_profile_sha256)" ]] || return 1
+
+  eligibility_reason="$(m2_resource_json_value \
+    "$evidence_dir/eligibility.json" reason)" || return 1
+  if [[ "$eligibility_reason" == proved_saturation_replacement ]]; then
+    [[ -f "$evidence_dir/prior-saturation.txt" && \
+      ! -L "$evidence_dir/prior-saturation.txt" && \
+      -f "$evidence_dir/replacement-capacity.txt" && \
+      ! -L "$evidence_dir/replacement-capacity.txt" ]] || return 1
+  else
+    [[ ! -e "$evidence_dir/prior-saturation.txt" && \
+      ! -e "$evidence_dir/replacement-capacity.txt" ]] || return 1
+  fi
+
+  [[ "$(m2_resource_json_value "$candidate_file" source_commit)" == \
+    "$expected_source" && \
+    "$(m2_resource_json_value "$candidate_file" client_binary_sha256)" == \
+      "$expected_binary_sha" && \
+    "$(m2_resource_json_value "$candidate_file" workload_profile_sha256)" == \
+      "$(sha256_file "$expected_direct_manifest")" && \
+    "$(m2_resource_json_value "$candidate_file" observer_sha256)" == \
+      "$expected_observer_sha" && \
+    "$(m2_resource_json_value "$candidate_file" public_ipv4)" == \
+      "$expected_exit" && \
+    "$(m2_resource_json_value "$candidate_file" tuic_port)" == \
+      "$expected_tuic_port" && \
+    "$(m2_resource_json_value "$candidate_file" target_ipv4)" == \
+      "$expected_target" && \
+    "$(m2_resource_json_value "$candidate_file" target_iperf_port)" == \
+      "$expected_iperf_port" && \
+    "$(m2_resource_json_value "$candidate_file" mac_interface)" == \
+      "$expected_interface" ]] || return 1
+  cmp -s "$evidence_dir/direct-manifest.txt" "$expected_direct_manifest" || \
+    return 1
+
+  result_file="$evidence_dir/result.txt"
+  result_text="$(cat "$result_file")"
+  [[ "$(m2_resource_result_value "$result_file" schema)" == \
+      knife15-m2-resource-preflight-v1 && \
+    "$(m2_resource_result_value "$result_file" status)" == pass && \
+    "$(m2_resource_result_value "$result_file" candidate_id)" == \
+      "$(m2_resource_json_value "$candidate_file" candidate_id)" && \
+    "$(m2_resource_result_value "$result_file" candidate_ipv4)" == \
+      "$expected_exit" && \
+    "$(m2_resource_result_value "$result_file" candidate_tuic_port)" == \
+      "$expected_tuic_port" && \
+    "$(m2_resource_result_value "$result_file" target)" == \
+      "$expected_target" && \
+    "$(m2_resource_result_value "$result_file" target_iperf_port)" == \
+      "$expected_iperf_port" && \
+    "$(m2_resource_result_value "$result_file" physical_interface)" == \
+      "$expected_interface" && \
+    "$(m2_resource_result_value "$result_file" source_commit)" == \
+      "$expected_source" && \
+    "$(m2_resource_result_value "$result_file" binary_sha256)" == \
+      "$expected_binary_sha" && \
+    "$(m2_resource_result_value "$result_file" direct_manifest_sha256)" == \
+      "$(sha256_file "$expected_direct_manifest")" && \
+    "$(m2_resource_result_value "$result_file" observer_sha256)" == \
+      "$expected_observer_sha" && \
+    "$(m2_resource_result_value "$result_file" profile_helper_sha256)" == \
+      "$(sha256_file "$M2_RESOURCE_PROFILE_HELPER")" && \
+    "$(m2_resource_result_value "$result_file" preflight_runner_sha256)" == \
+      "$(sha256_file "$M2_RESOURCE_PREFLIGHT_RUNNER")" ]] || return 1
+  [[ "$result_text" != *$'\n\n'* ]] || return 1
+
+  for evidence_name in \
+    eligibility.json provider-identity.txt route-identity.txt remote.txt \
+    exit.route.txt target.route.txt exit.traceroute.txt target.traceroute.txt; do
+    case "$evidence_name" in
+      eligibility.json) result_key=eligibility_sha256 ;;
+      provider-identity.txt) result_key=provider_identity_sha256 ;;
+      route-identity.txt) result_key=route_identity_sha256 ;;
+      remote.txt) result_key=remote_sha256 ;;
+      exit.route.txt) result_key=exit_route_sha256 ;;
+      target.route.txt) result_key=target_route_sha256 ;;
+      exit.traceroute.txt) result_key=exit_traceroute_sha256 ;;
+      target.traceroute.txt) result_key=target_traceroute_sha256 ;;
+    esac
+    actual_sha="$(sha256_file "$evidence_dir/$evidence_name")"
+    expected_sha="$(m2_resource_result_value "$result_file" "$result_key")" || \
+      return 1
+    [[ "$actual_sha" == "$expected_sha" ]] || return 1
+  done
+  [[ "$(sed -n '1p' "$evidence_dir/secret-scan.txt")" == \
+    'PASS: no credential-like assignment found' ]] || return 1
+
+  remote_file="$evidence_dir/remote.txt"
+  remote_cpu="$(m2_resource_result_value "$remote_file" cpu_count)" || return 1
+  remote_memory="$(m2_resource_result_value "$remote_file" memavailable)" || \
+    return 1
+  [[ "$(m2_resource_result_value "$remote_file" schema)" == \
+      knife15-m2-resource-remote-v1 && \
+    "$(m2_resource_result_value "$remote_file" service_active)" == active && \
+    "$(m2_resource_result_value "$remote_file" tuic_udp_listener)" == 1 && \
+    "$(m2_resource_result_value "$remote_file" server_binary_sha256)" == \
+      "$(m2_resource_json_value "$candidate_file" server_binary_sha256)" && \
+    "$(m2_resource_result_value "$remote_file" server_config_sha256)" == \
+      "$(m2_resource_json_value "$candidate_file" server_config_sha256)" && \
+    "$remote_cpu" =~ ^[1-9][0-9]*$ && \
+    "$remote_memory" =~ ^[1-9][0-9]*kB$ && \
+    -n "$(m2_resource_result_value "$remote_file" loadavg)" && \
+    ! -s "$evidence_dir/remote.stderr" && \
+    "$(grep -Fxc udp_summary_begin "$remote_file")" == 1 && \
+    "$(grep -Fxc udp_summary_end "$remote_file")" == 1 && \
+    "$(grep -Fxc interface_counters_begin "$remote_file")" == 1 && \
+    "$(grep -Fxc interface_counters_end "$remote_file")" == 1 ]] || \
+    return 1
+}
+
+m2_copy_resource_preflight_evidence() {
+  local source_dir="${1:-}" destination_dir="${2:-}"
+  local archive expected_archive_sha actual_archive_sha evidence_file name
+  validate_resource_preflight_dir_path "$source_dir" || return 1
+  [[ -d "$source_dir" && ! -L "$source_dir" && \
+    ! -e "$destination_dir" ]] || return 1
+  archive="${source_dir}.tar.gz"
+  [[ -f "$archive" && ! -L "$archive" && \
+    -f "${archive}.sha256" && ! -L "${archive}.sha256" && \
+    "$(awk 'END {print NR + 0}' "${archive}.sha256")" == 1 ]] || return 1
+  expected_archive_sha="$(awk '{print $1}' "${archive}.sha256")"
+  [[ "$expected_archive_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  actual_archive_sha="$(sha256_file "$archive")"
+  [[ "$actual_archive_sha" == "$expected_archive_sha" ]] || return 1
+  m2_resource_archive_matches_directory "$source_dir" "$archive" || return 1
+
+  mkdir "$destination_dir" || return 1
+  for evidence_file in "$source_dir"/*; do
+    name="$(basename "$evidence_file")"
+    cp "$evidence_file" "$destination_dir/$name" || return 1
+  done
+  cp "$archive" "${destination_dir}.tar.gz" || return 1
+  printf '%s  %s\n' "$actual_archive_sha" \
+    "$(basename "${destination_dir}.tar.gz")" \
+    >"${destination_dir}.tar.gz.sha256" || return 1
+}
+
+m2_resource_binding_is_valid() {
+  local run_dir="${1:-}" evidence_name="${2:-}"
+  local resource_dir status_file profile_file direct_manifest candidate_file
+  local candidate_id candidate_profile_sha result_sha archive archive_sha
+  local source binary_sha observer_sha exit_host server_port target iperf_port
+  local physical_interface
+  [[ "$evidence_name" == m2 || "$evidence_name" == m2-qualification ]] || \
+    return 1
+  resource_dir="$run_dir/${evidence_name}-resource-preflight"
+  status_file="$run_dir/${evidence_name}-resource-admission.status"
+  profile_file="$run_dir/${evidence_name}-workload.txt"
+  direct_manifest="$run_dir/${evidence_name}-direct/manifest.txt"
+  candidate_file="$resource_dir/candidate-profile.json"
+  [[ -d "$run_dir" && ! -L "$run_dir" && \
+    -f "$status_file" && ! -L "$status_file" && \
+    "$(sed -n '1p' "$status_file")" == pass && \
+    "$(awk 'END {print NR + 0}' "$status_file")" == 1 && \
+    -f "$profile_file" && ! -L "$profile_file" && \
+    -f "$direct_manifest" && ! -L "$direct_manifest" ]] || return 1
+
+  source="$(git -C "$REPO" rev-parse HEAD)" || return 1
+  binary_sha="$(sha256_file "$BIN")"
+  observer_sha="$(sha256_file "$M2_EXIT_OBSERVER_SCRIPT")"
+  exit_host="$(read_state exit_host)" || return 1
+  server_port="$(read_state server_port)" || return 1
+  target="$(read_state target)" || return 1
+  iperf_port="$(read_state iperf_port)" || return 1
+  physical_interface="$(m2_resource_json_value \
+    "$candidate_file" mac_interface)" || return 1
+  m2_resource_evidence_is_valid "$resource_dir" "$source" "$binary_sha" \
+    "$direct_manifest" "$observer_sha" "$exit_host" "$server_port" \
+    "$target" "$iperf_port" "$physical_interface" || return 1
+
+  candidate_id="$(m2_resource_json_value "$candidate_file" candidate_id)" || \
+    return 1
+  candidate_profile_sha="$(m2_resource_json_value \
+    "$resource_dir/eligibility.json" candidate_profile_sha256)" || return 1
+  result_sha="$(sha256_file "$resource_dir/result.txt")"
+  [[ "$(m2_resource_result_value "$profile_file" resource_candidate_id)" == \
+      "$candidate_id" && \
+    "$(m2_resource_result_value "$profile_file" resource_profile_sha256)" == \
+      "$candidate_profile_sha" && \
+    "$(m2_resource_result_value \
+      "$profile_file" resource_preflight_result_sha256)" == "$result_sha" ]] || \
+    return 1
+  m2_resource_state_binding_is_valid "$evidence_name" "$candidate_id" \
+    "$candidate_profile_sha" "$result_sha" || return 1
+
+  archive="${resource_dir}.tar.gz"
+  archive_sha="$(awk '{print $1}' "${archive}.sha256" 2>/dev/null)" || return 1
+  [[ -f "$archive" && ! -L "$archive" && \
+    -f "${archive}.sha256" && ! -L "${archive}.sha256" && \
+    "$archive_sha" =~ ^[0-9a-f]{64}$ && \
+    "$(sha256_file "$archive")" == "$archive_sha" ]] || return 1
+  m2_resource_archive_matches_directory "$resource_dir" "$archive"
+}
+
 m2_execution_requires_paired_observer() {
   [[ "${1:-}" == "formal" || "${1:-}" == "qualification" ]]
 }
@@ -8455,6 +8973,9 @@ run_m2_action() {
   local quiescence_status
   local action_description stage label evidence_dir status_file
   local baseline_evidence_dir direct_evidence_dir
+  local resource_evidence_dir resource_status_file resource_candidate_id
+  local resource_profile_sha current_source binary_sha observer_sha
+  local physical_interface
   local observer_finalization_status=0
   case "$execution_mode" in
     formal)
@@ -8548,6 +9069,61 @@ run_m2_action() {
   validate_direct_continuity_dir "$M2_DIRECT_DIR" "$M2_BASELINE_DIR" "$target" || \
     die "$action_description requires a matching 300s direct continuity PASS completed within 15 minutes"
 
+  [[ "$M2_RESOURCE_PROFILE_HELPER" == \
+      "$SCRIPT_DIR/knife15-m2-resource-profile.py" && \
+    -f "$M2_RESOURCE_PROFILE_HELPER" && ! -L "$M2_RESOURCE_PROFILE_HELPER" && \
+    "$M2_RESOURCE_PREFLIGHT_RUNNER" == \
+      "$SCRIPT_DIR/knife15-m2-resource-preflight.sh" && \
+    -f "$M2_RESOURCE_PREFLIGHT_RUNNER" && \
+    ! -L "$M2_RESOURCE_PREFLIGHT_RUNNER" ]] || \
+    die "$action_description requires exact tracked resource admission tools"
+  validate_resource_preflight_dir_path "$M2_RESOURCE_PREFLIGHT_DIR" || \
+    die "$action_description requires the exact /tmp resource preflight directory"
+  resource_evidence_dir="$run_dir/${evidence_dir}-resource-preflight"
+  resource_status_file="$run_dir/${evidence_dir}-resource-admission.status"
+  [[ ! -e "$resource_evidence_dir" && ! -e "$resource_status_file" ]] || \
+    die "$action_description resource admission already ran in this TUN"
+  printf '%s\n' preparing >"$resource_status_file" || \
+    die "cannot create resource admission status"
+  current_source="$(git -C "$REPO" rev-parse HEAD)"
+  binary_sha="$(sha256_file "$BIN")"
+  observer_sha="$(sha256_file "$M2_EXIT_OBSERVER_SCRIPT")"
+  physical_interface="$(route_interface "$exit_host")"
+  [[ -n "$physical_interface" && "$physical_interface" != utun* ]] || {
+    printf '%s\n' failed >"$resource_status_file"
+    die "$action_description Exit has no physical resource-admission route"
+  }
+  if ! m2_copy_resource_preflight_evidence \
+    "$M2_RESOURCE_PREFLIGHT_DIR" "$resource_evidence_dir" || \
+    ! m2_resource_evidence_is_valid "$resource_evidence_dir" \
+      "$current_source" "$binary_sha" "$M2_DIRECT_DIR/manifest.txt" \
+      "$observer_sha" "$exit_host" "$server_port" "$target" "$iperf_port" \
+      "$physical_interface"; then
+    printf '%s\n' failed >"$resource_status_file"
+    append_event_to "$run_dir" \
+      "$stage resource admission failed preflight=$(basename "$M2_RESOURCE_PREFLIGHT_DIR")"
+    die "$action_description resource profile/preflight evidence is invalid; no workload ran"
+  fi
+  resource_candidate_id="$(m2_resource_json_value \
+    "$resource_evidence_dir/candidate-profile.json" candidate_id)" || {
+    printf '%s\n' failed >"$resource_status_file"
+    die "$action_description admitted resource candidate ID is invalid"
+  }
+  resource_profile_sha="$(m2_resource_json_value \
+    "$resource_evidence_dir/eligibility.json" candidate_profile_sha256)" || {
+    printf '%s\n' failed >"$resource_status_file"
+    die "$action_description admitted resource profile hash is invalid"
+  }
+  write_state m2.resource_stage "$evidence_dir"
+  write_state m2.resource_candidate "$resource_candidate_id"
+  write_state m2.resource_profile_sha256 "$resource_profile_sha"
+  write_state m2.resource_result_sha256 \
+    "$(sha256_file "$resource_evidence_dir/result.txt")"
+  printf '%s\n' pass >"$resource_status_file" || \
+    die "cannot finalize resource admission status"
+  append_event_to "$run_dir" \
+    "$stage resource admission complete candidate=$resource_candidate_id profile=$resource_profile_sha"
+
   if m2_execution_requires_paired_observer "$execution_mode"; then
     [[ "$M2_EXIT_OBSERVER_SCRIPT" == \
       "$SCRIPT_DIR/knife15-exit-target-observer.sh" ]] || \
@@ -8599,9 +9175,19 @@ run_m2_action() {
     "direct_dir=$M2_DIRECT_DIR" \
     "direct_manifest_sha256=$(sha256_file "$M2_DIRECT_DIR/manifest.txt")" \
     "direct_result_sha256=$(sha256_file "$M2_DIRECT_DIR/direct-forward-300s.json")" \
+    "resource_candidate_id=$resource_candidate_id" \
+    "resource_profile_sha256=$resource_profile_sha" \
+    "resource_preflight_dir=$M2_RESOURCE_PREFLIGHT_DIR" \
+    "resource_preflight_result_sha256=$(sha256_file "$resource_evidence_dir/result.txt")" \
     >>"$profile_file" || die "cannot bind direct evidence to M2 profile"
   append_event_to "$run_dir" \
     "$stage prepared baseline=$(basename "$M2_BASELINE_DIR") profile=$(sha256_file "$profile_file")"
+  if ! m2_resource_binding_is_valid "$run_dir" "$evidence_dir"; then
+    printf '%s\n' failed >"$run_dir/$status_file"
+    printf '%s\n' failed >"$resource_status_file"
+    append_event_to "$run_dir" "$stage failed: final resource binding"
+    die "$action_description resource binding changed before full-tunnel activation"
+  fi
   activate_m2_full_tunnel "$run_dir" || {
     printf '%s\n' failed >"$run_dir/$status_file"
     die "M2 full-tunnel activation failed or rolled back; use status/snapshot/stop"
@@ -8682,6 +9268,7 @@ run_m2_action() {
       clear_workload_state
       sample_once_for "$run_dir" || true
       if ! m2_qualification_result_slo "$run_dir" 2 || \
+        ! m2_resource_binding_is_valid "$run_dir" m2-qualification || \
         ! wait_for_m2_qualification_terminal_safety \
           "$run_dir" "$quiescence_timeout_secs" || \
         ! m0_assert_run_healthy "$run_dir" || \
@@ -8721,7 +9308,8 @@ run_m2_action() {
     fi
     clear_workload_state
     sample_once_for "$run_dir" || true
-    if ! m2_workload_slo "$run_dir"; then
+    if ! m2_workload_slo "$run_dir" || \
+      ! m2_resource_binding_is_valid "$run_dir" m2; then
       printf '%s\n' failed >"$run_dir/m2.status"
       append_event_to "$run_dir" "m2 failed: acceptance SLO mismatch"
       write_summary "$run_dir"
@@ -8770,6 +9358,15 @@ show_status() {
   echo "m2_status=$(sed -n '1p' "$run_dir/m2.status" 2>/dev/null || echo not_run)"
   echo "m2_qualification_status=$(sed -n '1p' \
     "$run_dir/m2-qualification.status" 2>/dev/null || echo not_run)"
+  echo "m2_resource_admission=$(sed -n '1p' \
+    "$run_dir/m2-resource-admission.status" 2>/dev/null || echo not_run)"
+  echo "m2_qualification_resource_admission=$(sed -n '1p' \
+    "$run_dir/m2-qualification-resource-admission.status" \
+    2>/dev/null || echo not_run)"
+  echo "m2_resource_stage=$(read_state m2.resource_stage 2>/dev/null || echo not_run)"
+  echo "m2_resource_candidate=$(read_state m2.resource_candidate 2>/dev/null || echo not_run)"
+  echo "m2_resource_profile_sha256=$(read_state \
+    m2.resource_profile_sha256 2>/dev/null || echo not_run)"
   echo "m2_full_tunnel=$(read_state m2.full_tunnel 2>/dev/null || echo not_run)"
   if [[ -f "$run_dir/m2-ipv6-preflight.txt" ]]; then
     echo "m2_ipv6_preflight_classification=$(m0_profile_value \
@@ -8872,6 +9469,7 @@ append_m2_summary() {
   local cleanup_restored=NOT_APPLICABLE formal_m2_acceptance m2_slo_evidence
   local ipv6_preflight_classification=not_run ipv6_preflight_interface=unknown
   local ipv6_preflight_route_status=unknown
+  local resource_admission resource_candidate=not_run resource_profile=not_run
   status="$(sed -n '1p' "$run_dir/m2.status" 2>/dev/null || true)"
   status="${status:-not_run}"
   active_windows="$(grep -Ec $'\tm2 active .* complete planned_secs=' \
@@ -8896,6 +9494,17 @@ append_m2_summary() {
     checkpoint_first_threads checkpoint_final_threads checkpoint_max_threads \
     checkpoint_threads_delta checkpoint_ownership_failures \
     <<<"$(m2_checkpoint_envelope "$run_dir/m2-checkpoints.csv")"
+  resource_admission="$(sed -n '1p' \
+    "$run_dir/m2-resource-admission.status" 2>/dev/null || true)"
+  resource_admission="${resource_admission:-not_run}"
+  if [[ -f "$run_dir/m2-resource-preflight/candidate-profile.json" ]]; then
+    resource_candidate="$(m2_resource_json_value \
+      "$run_dir/m2-resource-preflight/candidate-profile.json" \
+      candidate_id 2>/dev/null || echo invalid)"
+    resource_profile="$(m2_resource_json_value \
+      "$run_dir/m2-resource-preflight/eligibility.json" \
+      candidate_profile_sha256 2>/dev/null || echo invalid)"
+  fi
   if m2_pre_stop_verdict_is_valid "$run_dir/m2-pre-stop-verdict.txt"; then
     pre_stop=PASS
   elif [[ "$status" != "not_run" ]]; then
@@ -8960,6 +9569,9 @@ append_m2_summary() {
 - m2_ipv6_preflight_classification: $ipv6_preflight_classification
 - m2_ipv6_preflight_interface: $ipv6_preflight_interface
 - m2_ipv6_preflight_route_status: $ipv6_preflight_route_status
+- m2_resource_admission: $resource_admission
+- m2_resource_candidate: $resource_candidate
+- m2_resource_profile_sha256: $resource_profile
 - m2_slo_evidence: $m2_slo_evidence
 - m2_full_tunnel_state: $full_tunnel_state
 - m2_cleanup_restored: $cleanup_restored
@@ -8972,6 +9584,7 @@ append_m2_qualification_summary() {
   local status phase_results phase_failures cycles dns
   local tcp_results udp_results tcp_gap udp_loss invalid_results
   local sender_zero receiver_zero real_results invalid_real verdict=NOT_RUN
+  local resource_admission resource_candidate=not_run resource_profile=not_run
   status="$(sed -n '1p' \
     "$run_dir/m2-qualification.status" 2>/dev/null || true)"
   status="${status:-not_run}"
@@ -8989,6 +9602,18 @@ append_m2_qualification_summary() {
   read -r real_results invalid_real \
     <<<"$(m2_real_client_envelope \
       "$run_dir/m2-qualification-real-client")"
+  resource_admission="$(sed -n '1p' \
+    "$run_dir/m2-qualification-resource-admission.status" \
+    2>/dev/null || true)"
+  resource_admission="${resource_admission:-not_run}"
+  if [[ -f "$run_dir/m2-qualification-resource-preflight/candidate-profile.json" ]]; then
+    resource_candidate="$(m2_resource_json_value \
+      "$run_dir/m2-qualification-resource-preflight/candidate-profile.json" \
+      candidate_id 2>/dev/null || echo invalid)"
+    resource_profile="$(m2_resource_json_value \
+      "$run_dir/m2-qualification-resource-preflight/eligibility.json" \
+      candidate_profile_sha256 2>/dev/null || echo invalid)"
+  fi
   if [[ -f "$run_dir/m2-qualification-verdict.txt" && \
     ! -L "$run_dir/m2-qualification-verdict.txt" && \
     "$(sed -n '1p' "$run_dir/m2-qualification-verdict.txt")" == \
@@ -9019,6 +9644,9 @@ append_m2_qualification_summary() {
 - m2_qualification_invalid_result_files: ${invalid_results:-0}
 - m2_qualification_sender_zero_intervals: ${sender_zero:-0}
 - m2_qualification_receiver_zero_intervals: ${receiver_zero:-0}
+- m2_qualification_resource_admission: $resource_admission
+- m2_qualification_resource_candidate: $resource_candidate
+- m2_qualification_resource_profile_sha256: $resource_profile
 - m2_qualification_verdict: $verdict
 - m2_qualification_formal_m2_acceptance: NOT_RUN
 EOF_M2_QUALIFICATION_SUMMARY

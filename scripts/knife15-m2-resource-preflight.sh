@@ -3,6 +3,8 @@ set -euo pipefail
 umask 077
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
+COPYFILE_DISABLE=1
+export COPYFILE_DISABLE
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -52,8 +54,18 @@ profile_value() {
 import json
 import sys
 
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
 with open(sys.argv[1], encoding="utf-8") as handle:
-    value = json.load(handle)
+    value = json.load(handle, object_pairs_hook=unique_object)
 result = value.get(sys.argv[2])
 if isinstance(result, bool):
     print("true" if result else "false")
@@ -160,7 +172,11 @@ printf 'server_binary_sha256=%s\n' "$(sha256sum "$server_bin" | awk '{print $1}'
 printf 'server_config_sha256=%s\n' "$(sudo -n sha256sum "$server_config" | awk '{print $1}')"
 printf 'cpu_count=%s\n' "$(getconf _NPROCESSORS_ONLN)"
 printf 'loadavg=%s\n' "$(tr ' ' ',' </proc/loadavg)"
-awk '/MemTotal:|MemAvailable:/ {printf "%s=%s%s\n", tolower($1), $2, $3}' \
+awk '/MemTotal:|MemAvailable:/ {
+  key = tolower($1)
+  sub(/:$/, "", key)
+  printf "%s=%s%s\n", key, $2, $3
+}' \
   /proc/meminfo
 if ss -H -lun "sport = :$tuic_port" | grep -q .; then
   printf 'tuic_udp_listener=1\n'
@@ -191,6 +207,7 @@ copy_hash_bound_evidence() {
 
 run_preflight() {
   local candidate_id candidate_ip candidate_port candidate_target
+  local candidate_iperf_port
   local candidate_interface candidate_source candidate_binary_sha
   local candidate_direct_sha candidate_observer_sha classification
   local current_source current_binary_sha current_direct_sha current_observer_sha
@@ -256,6 +273,8 @@ run_preflight() {
     die "candidate TUIC port is missing"
   candidate_target="$(profile_value "$candidate_copy" target_ipv4)" || \
     die "candidate Target is missing"
+  candidate_iperf_port="$(profile_value "$candidate_copy" target_iperf_port)" || \
+    die "candidate Target iperf port is missing"
   candidate_interface="$(profile_value "$candidate_copy" mac_interface)" || \
     die "candidate physical interface is missing"
   candidate_source="$(profile_value "$candidate_copy" source_commit)" || \
@@ -366,6 +385,7 @@ run_preflight() {
     echo "candidate_ipv4=$candidate_ip"
     echo "candidate_tuic_port=$candidate_port"
     echo "target=$candidate_target"
+    echo "target_iperf_port=$candidate_iperf_port"
     echo "physical_interface=$candidate_interface"
     echo "source_commit=$current_source"
     echo "binary_sha256=$current_binary_sha"
