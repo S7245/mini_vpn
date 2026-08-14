@@ -10,9 +10,10 @@ Candidate 1 is now provisioned and host/service-ready at Alibaba EIP
 `47.89.211.4` (AS45102). Qualification has not run: the cloud security group
 still drops HK-Mac UDP 8443 before it reaches the guest. The only external
 action is a narrow inbound UDP 8443 allow from the current HK public `/32`.
-After that rule, reviewed source `74cb1d8` must pass its new live no-TUN TUIC
+After that rule, reviewed source `0a1cf1c` must pass its new live no-TUN TUIC
 handshake preflight before any TUN start. It also enforces a global
-`PreventUserIdleSystemSleep` assertion and repairs exact pre-ready cleanup.
+`PreventUserIdleSystemSleep` assertion and repairs exact utun plus
+interface/gateway pre-ready cleanup.
 Result:
 `docs/tech/2026-08-14-knife15-m2-alibaba-candidate1-provisioning-and-preflight-results.md`.
 

@@ -109,7 +109,7 @@ git fetch origin
 git switch codex/knife14d-downlink-reap-open
 git pull --ff-only origin codex/knife14d-downlink-reap-open
 git status --short
-git merge-base --is-ancestor 74cb1d8 HEAD && \
+git merge-base --is-ancestor 0a1cf1c HEAD && \
   echo 'PASS: strict resource source accepted'
 export TEST_SOURCE_COMMIT="$(git rev-parse HEAD)"
 

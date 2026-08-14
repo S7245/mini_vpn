@@ -13,8 +13,11 @@
   owns the admission decision.
 - That pre-ready failure had a valid `utun.before` snapshot but no recorded
   owned utun. The old `stop` path treated missing ownership as a leaked TUN and
-  could not finalize evidence. Cleanup now accepts only an unchanged utun set;
-  any added interface still fails closed.
+  could not finalize evidence. The first repair accepted an unchanged utun set
+  but the later route-restoration check still required the missing utun
+  identity. The complete repair requires an unchanged utun set plus exact
+  pre-start interface/gateway matches; any added interface or route drift still
+  fails closed.
 - Alibaba Cloud Security Center blocked deliberate removal of an Aegis startup
   symlink and labeled it destructive client-file activity. After protection
   was disabled, the bounded host-isolation change and reboot completed. This

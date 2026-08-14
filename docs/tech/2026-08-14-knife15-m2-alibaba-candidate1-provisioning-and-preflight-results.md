@@ -108,7 +108,7 @@ independent of the still-closed network security-group rule.
 
 ## Local Repairs
 
-Reviewed source `74cb1d8` closes three locally preventable invalid-run paths:
+Reviewed source `0a1cf1c` closes four locally preventable invalid-run paths:
 
 1. resource preflight now performs a real one-second TUIC handshake,
    authentication, and Connect/open probe to the exact Target before TUN;
@@ -116,7 +116,10 @@ Reviewed source `74cb1d8` closes three locally preventable invalid-run paths:
    `PreventUserIdleSystemSleep` assertion;
 3. cleanup after a pre-ready start compares the current utun set with the
    pre-start snapshot, accepting only exact no-addition state and retaining
-   fail-closed behavior for any new or owned utun.
+   fail-closed behavior for any new or owned utun;
+4. the same pre-ready cleanup verifies each Target/Exit/DNS interface and
+   gateway against its pre-start route snapshot. It does not require a missing
+   ownership identity, and it does not accept a merely non-utun route.
 
 The resource archive, root runner, and continuity ledger all require and hash
 the exact single-line handshake report plus empty stderr. Shell syntax,
@@ -132,7 +135,7 @@ self-wake value changed.
 
 1. Add the narrow Alibaba inbound UDP 8443 `/32` rule.
 2. Prove one packet reaches the guest, then pull the reviewed descendant of
-   `74cb1d8` on the HK Mac.
+   `0a1cf1c` on the HK Mac.
 3. Finalize the invalid pre-ready run with the repaired `stop` path.
 4. Start a fresh bounded global `caffeinate`, rebuild, and capture a fresh
    baseline/direct/profile/resource preflight. The live TUIC probe must pass.

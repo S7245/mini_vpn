@@ -195,11 +195,12 @@ Current Knife15 summary, as of 2026-08-14:
   isolation pass. Qualification is `NOT_RUN`: the Alibaba security group drops
   HK-Mac UDP 8443 before the guest. Allow only the current HK public `/32`,
   then require a live TUIC preflight before TUN.
-- Reviewed `74cb1d8` performs the no-TUN TUIC handshake/auth/Connect probe,
+- Reviewed `0a1cf1c` performs the no-TUN TUIC handshake/auth/Connect probe,
   requires `PreventUserIdleSystemSleep` at baseline/direct/start/M2 entry, and
-  makes pre-ready cleanup prove no new utun. Runner and ledger hash/replay the
-  probe. Local self-tests, diff/secret, and review pass; no Rust production or
-  frozen behavior changed. Strict source admission requires `74cb1d8` or a
+  makes pre-ready cleanup prove no new utun plus exact pre-start
+  interface/gateway restoration. Runner and ledger hash/replay the probe.
+  Local self-tests, diff/secret, and review pass; no Rust production or
+  frozen behavior changed. Strict source admission requires `0a1cf1c` or a
   descendant. Result:
   `docs/tech/2026-08-14-knife15-m2-alibaba-candidate1-provisioning-and-preflight-results.md`.
 

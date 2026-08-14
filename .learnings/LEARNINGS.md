@@ -13,8 +13,9 @@
   authentication, and stream open from the test Mac before TUN ownership.
 - Cleanup authority differs before and after TUN readiness. If no owned utun
   identity was recorded, compare the complete pre-start/current utun sets and
-  accept only an exact no-addition result. Any added interface remains
-  ambiguous and must fail closed.
+  accept only an exact no-addition result. Also require current
+  Target/Exit/DNS interface and gateway to match their pre-start snapshots;
+  any added interface or route drift remains ambiguous and must fail closed.
 - Dedicated-host isolation is a whole-environment contract: suppress cloud
   agents and automatic maintenance only for the bounded window, preserve exact
   host/service identity, and harden SSH to key-only access when vendor agents

@@ -16,13 +16,14 @@
   Alibaba inbound allow rule for `UDP/8443` from the current HK public IPv4
   only (`119.13.90.246/32` when last observed), never `0.0.0.0/0`, then require
   the new live TUIC preflight to pass before TUN.
-- Reviewed repair `74cb1d8` adds that no-TUN handshake/auth/Connect probe,
+- Reviewed repair `0a1cf1c` adds that no-TUN handshake/auth/Connect probe,
   makes baseline/direct/start/qualification/formal fail closed without an
   active `PreventUserIdleSystemSleep` assertion, and permits pre-ready cleanup
-  only when the utun set is unchanged from its snapshot. Scripts/ledger bind
-  the exact probe evidence. Local shell/self-tests, diff/secret, and review
+  only when the utun set and Target/Exit/DNS interface+gateway match their
+  pre-start snapshots. Scripts/ledger bind the exact probe evidence. Local
+  shell/self-tests, diff/secret, and review
   pass with no unresolved P0/P1. No Rust or frozen value changed. Strict source
-  admission now requires `74cb1d8` or a descendant. Result:
+  admission now requires `0a1cf1c` or a descendant. Result:
   `docs/tech/2026-08-14-knife15-m2-alibaba-candidate1-provisioning-and-preflight-results.md`.
 
 - **HK Mac is agent-operated:** use
