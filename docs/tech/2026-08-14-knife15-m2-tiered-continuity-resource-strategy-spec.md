@@ -96,14 +96,16 @@ immutable manifest must identify:
 - provider and account/resource identity;
 - region, public IPv4, and provider ASN;
 - advertised route class or product class;
+- hashes of sanitized provider-identity and route-contract evidence;
 - Exit TUIC endpoint and exact server configuration hashes;
 - unchanged `.77` Target identity;
 - Mac physical interface and route/traceroute fingerprints;
 - tested source commit, release-binary hash, workload-profile hash, and
   observer version.
 
-At least one of provider/ASN or independently contracted route class must
-differ from `.33`. A same-provider same-route resize is ineligible unless the
+Both provider and ASN must differ from `.33`, unless an independently
+contracted route class and contract identity differ instead. A same-provider
+same-route resize is ineligible unless the
 preflight demonstrates that the old Exit was resource-saturated and the new
 resource removes that exact saturation. Existing evidence does not show such
 saturation.

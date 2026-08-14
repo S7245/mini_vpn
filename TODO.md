@@ -17,7 +17,7 @@ Next:
 2. bind strict qualification/formal evidence to the exact resource without
    weakening `receiver_zero == 0`;
 3. implement the strict attempt ledger and operator runbook;
-4. admit at most two resources that materially change provider/ASN or
+4. admit at most two resources that change both provider and ASN, or
    independently contracted route from `.33`;
 5. for each, run one strict qualification and, only if clean, two consecutive
    strict 24-hour formal runs; reject the candidate on its first genuine

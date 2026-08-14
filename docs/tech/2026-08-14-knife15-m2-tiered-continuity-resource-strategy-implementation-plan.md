@@ -61,25 +61,28 @@ system evidence, SHA-256 manifests, tar bundles, Rust workspace gates.
 **Files:**
 
 - Create: `scripts/knife15-m2-resource-profile.py`
+- Create: `scripts/knife15-m2-resource-preflight.sh`
 - Create: `scripts/fixtures/knife15-m2-resource/reference-33.json`
 - Create: `scripts/fixtures/knife15-m2-resource/distinct-provider.json`
 - Create: `scripts/fixtures/knife15-m2-resource/equivalent-resize.json`
-- Modify: `scripts/knife15-macos-soak.sh`
 
 **Steps:**
 
 1. Add failing self-tests for a complete immutable profile, a distinct
-   provider/ASN candidate, and an ineligible same-route resize.
+   provider-and-ASN candidate, and an ineligible same-route resize.
 2. Implement canonical JSON validation and SHA-256 output. Require candidate
    ID, provider/resource ID, region, public IPv4, ASN, route class, TUIC port,
    Target, server hashes, Mac route fingerprints, source, binary, profile, and
    observer hashes.
 3. Make eligibility compare the candidate with the immutable `.33` reference.
-   Accept a distinct provider/ASN or independently contracted route class;
+   Accept a distinct provider and ASN, or an independently contracted route;
    reject a nominal resize without exact prior saturation evidence.
-4. Add `resource-preflight` to the runner. It records read-only Mac/Exit
-   capacity and resource evidence but does not mutate routes or start TUN.
-5. Run the helper self-test and complete runner self-test.
+4. Keep read-only resource admission isolated from the root-owned TUN runner:
+   add `knife15-m2-resource-preflight.sh`. It validates the exact profile,
+   source, binary, direct profile, local route/interface, remote service,
+   server hashes, and headroom evidence without mutating routes or starting
+   TUN.
+5. Run both helper self-tests and the unchanged complete runner self-test.
 6. Commit and push.
 
 ### Task 3: Bind strict runs to one immutable resource profile

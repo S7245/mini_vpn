@@ -5,7 +5,7 @@
 - When the selected failure is loss/congestion on Mac-to-Exit and the Exit is
   not saturated, extra CPU, RAM, buffers, pools, or nominal same-route
   bandwidth are not independent experiments. A meaningful resource candidate
-  must change provider/ASN or an independently contracted route.
+  must change both provider and ASN, or use an independently contracted route.
 - Preserve the zero-complete-second goal first, but cap the search: `.33` is
   the failed reference and no more than two eligible new path candidates may
   be tried. One strict qualification precedes expensive formal runs; a genuine

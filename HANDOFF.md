@@ -9,7 +9,7 @@
   user to open a TUIC client and do not execute the old calibration runbook.
 - **Tier A remains strict:** zero complete one-second TCP receiver-zero
   intervals. `.33` is the already-failed reference. Admit no more than two new
-  Exit candidates that materially change provider/ASN or independently
+  Exit candidates that change both provider and ASN, or independently
   contracted route. Equivalent CPU/RAM/bandwidth resize, pool/window/buffer
   changes, and frozen-value tuning are not candidates.
 - A candidate first passes one bounded strict qualification. It is accepted

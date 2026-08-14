@@ -195,7 +195,7 @@ Current Knife15 summary, as of 2026-08-14:
   be reused locally; its comparison workflow is historical only.
 - Tier A keeps formal M2 strict: zero complete one-second TCP receiver-zero
   intervals. `.33` is the already-failed reference. Admit at most two new Exit
-  candidates that materially change provider/ASN or independently contracted
+  candidates that change both provider and ASN, or independently contracted
   route; CPU/RAM/nominal-bandwidth resize on an equivalent unsaturated path,
   pool/window/buffer changes, and frozen-value tuning do not count.
 - Each candidate gets one bounded strict qualification, then—only if clean—two
