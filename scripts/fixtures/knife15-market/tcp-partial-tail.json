@@ -1,0 +1,24 @@
+{
+  "start": {"test_start": {"protocol": "TCP", "reverse": 1, "duration": 2}},
+  "intervals": [
+    {"sum": {"start": 0.0, "end": 1.0, "bytes": 100, "bits_per_second": 800}},
+    {"sum": {"start": 1.0, "end": 2.0, "bytes": 100, "bits_per_second": 800}},
+    {"sum": {"start": 2.001, "end": 2.165, "bytes": 0, "bits_per_second": 0}}
+  ],
+  "end": {
+    "sum_sent": {"bytes": 200, "bits_per_second": 740},
+    "sum_received": {"bytes": 200, "bits_per_second": 740}
+  },
+  "server_output_json": {
+    "start": {"test_start": {"protocol": "TCP", "reverse": 1, "duration": 2}},
+    "intervals": [
+      {"sum": {"start": 0.0, "end": 1.0, "bytes": 100, "bits_per_second": 800}},
+      {"sum": {"start": 1.0, "end": 2.0, "bytes": 100, "bits_per_second": 800}},
+      {"sum": {"start": 2.001, "end": 2.165, "bytes": 10, "bits_per_second": 488}}
+    ],
+    "end": {
+      "sum_sent": {"bytes": 210, "bits_per_second": 777},
+      "sum_received": {"bytes": 210, "bits_per_second": 777}
+    }
+  }
+}

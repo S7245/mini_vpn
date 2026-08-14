@@ -4,6 +4,8 @@
 /third_party/*/.cargo-ok
 
 .DS_Store
+__pycache__/
+*.py[cod]
 
 # Claude Code session worktrees and local state — never commit into the repo tree
 .claude/

@@ -73,8 +73,8 @@ Expected: failure because the reducer is not implemented.
 The command interface is:
 
 ```bash
-python3 scripts/knife15-market-iperf-summary.py tcp RESULT.json
-python3 scripts/knife15-market-iperf-summary.py udp RESULT.json
+python3 scripts/knife15-market-iperf-summary.py tcp --reverse 0 RESULT.json
+python3 scripts/knife15-market-iperf-summary.py udp --reverse 1 RESULT.json
 python3 scripts/knife15-market-iperf-summary.py --self-test
 ```
 
@@ -90,7 +90,8 @@ Run:
 
 ```bash
 python3 scripts/knife15-market-iperf-summary.py --self-test
-printf '{"intervals":[]}' | python3 scripts/knife15-market-iperf-summary.py tcp -
+printf '{"intervals":[]}' | \
+  python3 scripts/knife15-market-iperf-summary.py tcp --reverse 0 -
 ```
 
 Expected: self-test prints `knife15 market iperf summary self-test passed`;
