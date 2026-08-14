@@ -27,10 +27,13 @@ Next:
 4. **DONE through source-floor closure `bcd63b4`:** write the operator runbook,
    bind/limit semantic provider and route evidence, preserve the exact
    baseline outside `/tmp`, and pass complete local review gates;
-5. **IN PROGRESS:** `.111`/`.27` were rejected as Tencent AS132203 equivalents;
-   create the selected Amazon Lightsail `us-west-2` compute-optimized 4GB
-   candidate, verify its actual provider/ASN and host key, then provision and
-   pass read-only resource admission. Selection contract:
+5. **IN PROGRESS:** `.111`/`.27` and ordinary new Tencent CVM were rejected as
+   Tencent/AS132203 failure-domain equivalents. Create the selected Alibaba
+   Cloud `us-west-1` `ecs.c8i.large` candidate with a directly attached
+   200-Mbit/s pay-by-data-transfer EIP, verify its actual provider/ASN and host
+   key, then provision and pass read-only resource admission. AWS Lightsail is
+   the fallback; Tencent AIA is only an explicit separately contracted-route
+   option. Selection contract:
    `docs/tech/2026-08-14-knife15-m2-strict-candidate1-resource-selection.md`;
 6. for each, run one strict qualification and, only if clean, two consecutive
    strict 24-hour formal runs; reject the candidate on its first genuine

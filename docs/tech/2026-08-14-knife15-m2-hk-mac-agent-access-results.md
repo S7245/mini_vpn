@@ -61,11 +61,12 @@ outside Desktop's TCC boundary and is the only agent-owned acceptance worktree.
 ## Next Action
 
 Do not run baseline, direct, start, smoke, qualification, or formal M2 yet.
-First create the selected AWS Lightsail candidate and return its nonsecret
-static IPv4, Availability Zone, and out-of-band SSH host-key fingerprint.
+First create the selected Alibaba Cloud ECS/EIP candidate and return its
+nonsecret EIP, Availability Zone, and out-of-band SSH host-key fingerprint.
 The agent will bootstrap the server with the existing RSA key, add the shared
-ED25519 public key, provision the exact service, and then run resource admission
-from this HK Mac.
+ED25519 public key, provision the exact service, and then run resource
+admission from this HK Mac. AWS Lightsail is the fallback; an ordinary new
+Tencent CVM is not an independent candidate.
 
 Candidate contract:
 `docs/tech/2026-08-14-knife15-m2-strict-candidate1-resource-selection.md`.

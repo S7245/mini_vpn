@@ -17,9 +17,12 @@
 - **Latest Task-6 position:** `.111` and `.27` are ineligible before traffic:
   both are Tencent AS132203 like `.33`; historical Client/Exit roles do not
   create a different failure domain. `.111` also has an unverified changed SSH
-  host key and `.27` currently closes SSH. Candidate 1 is selected, but not
-  yet created or admitted: Amazon Lightsail `us-west-2`, compute-optimized
-  4GB/2-vCPU Ubuntu 24.04, static IPv4. The assigned address must still prove a
+  host key and `.27` currently closes SSH. Ordinary Tencent remains
+  ineligible; Tencent AIA is a separate costly contracted-route option, not
+  the default VPS. Candidate 1 is selected, but not yet created or admitted:
+  Alibaba Cloud ECS `us-west-1`, `ecs.c8i.large` 2-vCPU/4-GiB Ubuntu 24.04,
+  directly attached 200-Mbit/s pay-by-data-transfer EIP. AWS Lightsail is the
+  provisioning/candidate-2 fallback. The assigned address must still prove a
   non-AS132203 provider/ASN and pass exact host-key, service, Target, route,
   capacity, and immutable-profile admission. Do not start a Mac long run yet.
   Selection contract:

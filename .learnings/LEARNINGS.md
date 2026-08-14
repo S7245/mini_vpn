@@ -1,5 +1,23 @@
 # Learnings
 
+## 2026-08-14 - Nominal provider preference follows failure-domain eligibility
+
+- No public VPS is truly unbounded: instance NICs, public bandwidth caps,
+  transfer quotas, best-effort service, or billing limits always apply.
+- Provider preference is evaluated only after candidate eligibility. An
+  ordinary new Tencent CVM does not change the failed Tencent/AS132203 public
+  Internet failure domain; Tencent AIA would be a separate contracted-route
+  experiment with a different cost model, not an ordinary VPS substitute.
+- For the current sub-100-Mbit/s frozen workload, an Alibaba Cloud Silicon
+  Valley 200-Mbit/s EIP has sufficient nominal capacity, but only the live
+  read-only resource preflight can establish usable headroom. A published peak
+  is not acceptance evidence.
+- Keep AWS as the provisioning/candidate-2 fallback, so the strict ledger's
+  two-candidate limit and provider diversity remain intact.
+
+Result:
+`docs/tech/2026-08-14-knife15-m2-strict-candidate1-resource-selection.md`.
+
 ## 2026-08-14 - Remote macOS acceptance needs a non-TCC worktree and exact key ownership
 
 - Successful SSH login does not imply access to Desktop/Documents. On the HK

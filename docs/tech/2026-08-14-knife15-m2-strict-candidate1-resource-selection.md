@@ -23,11 +23,22 @@ candidates:
   candidate route/traceroute must be captured on the HK Mac, on its physical
   interface, with every external VPN/TUN stopped.
 
-The selected candidate-1 product is Amazon Lightsail in `us-west-2` (Oregon),
-subject to exact post-allocation ASN and route admission. It materially changes
-the cloud provider and is expected to change the announcing ASN, but expectation
-is not evidence: the assigned static IPv4 must be checked and the candidate is
-rejected before TUN ownership if its actual ASN is still AS132203.
+No candidate is unbounded. Ordinary Tencent CVM is still ineligible because it
+does not change the failed Tencent/AS132203 public-Internet failure domain.
+Tencent Anycast Internet Acceleration (AIA) could qualify as an independently
+contracted route, but it is a separate bandwidth-capped, 95th-percentile-billed
+acceleration product rather than an ordinary new VPS. It is not the default
+candidate because its exact account availability and purchase-page cost are
+not yet bounded.
+
+Following the user's provider preference after removing the ineligible
+ordinary-Tencent option, the selected candidate-1 product is Alibaba Cloud ECS
+plus an EIP in US (Silicon Valley), `us-west-1`, subject to exact
+post-allocation ASN and route admission. AWS Lightsail becomes the provisioning
+fallback and, after a genuine candidate-1 quality rejection, the preferred
+candidate 2. Expected provider/ASN diversity is not evidence: the assigned EIP
+must be checked and the candidate is rejected before TUN ownership if its
+actual provider/ASN is equivalent to the `.33` reference.
 
 ## Exact Creation Contract
 
@@ -35,77 +46,87 @@ Create exactly one resource with these stable values:
 
 | Field | Required value |
 | --- | --- |
-| Provider/product | Amazon Lightsail |
-| Region | US West (Oregon), `us-west-2` |
-| Platform | Linux/Unix, OS-only |
+| Provider/product | Alibaba Cloud ECS plus EIP |
+| Region | US (Silicon Valley), `us-west-1` |
+| Zone | any available `us-west-1` zone; record the exact allocated zone |
+| Platform | Linux, VPC |
 | Image | Ubuntu 24.04 LTS |
-| Plan | Compute Optimized, 4GB RAM, 2 vCPU, public IPv4 |
-| Instance name | `knife15-m2-candidate1-usw2` |
-| Static-IP name | `knife15-m2-c1-usw2-ip` |
-| Addressing | dual-stack instance with an attached static IPv4 |
+| Instance type | `ecs.c8i.large`, 2 vCPU, 4 GiB |
+| System disk | 40 GiB ESSD, PL0 or higher |
+| Instance name | `knife15-m2-candidate1-usw1` |
+| EIP name | `knife15-m2-c1-usw1-eip` |
+| Addressing | IPv4 EIP attached directly to this ECS instance |
+| EIP metering | pay-by-data-transfer |
+| EIP peak bandwidth | exactly 200 Mbit/s |
 | SSH key | upload the RSA public key derived from `~/.ssh/VPN-test.pem` |
 | Inbound TCP | port 22 from the HK test operator's stable public IPv4 `/32` |
-| Inbound UDP | port 8443 from IPv4 clients |
+| Inbound UDP | port 8443 from the HK test operator's stable public IPv4 `/32` |
 | Other inbound | none |
 
-Do not install an application blueprint, load balancer, CDN, managed database,
-or automatic snapshot. Do not open TCP 8443; TUIC uses UDP 8443. Keep the
-instance and static IPv4 attached until the candidate is accepted or rejected
-and every paired artifact is sealed.
+Do not add a load balancer, CDN, shared-bandwidth product, NAT gateway, managed
+database, or automatic snapshot. Do not open TCP 8443; TUIC uses UDP 8443.
+Keep the instance and EIP attached until the candidate is accepted or rejected
+and every paired artifact is sealed. Do not silently substitute another
+instance family, region, bandwidth cap, or billing mode: first record the
+purchase-page availability and estimated price.
 
-Lightsail's import API requires an RSA public key, while `~/.ssh/vpn` is
-ED25519. Before opening the create-instance page, derive only the public half
-of the existing RSA key on the Mac:
+Before opening the create-instance page, derive only the public half of the
+existing RSA key on the Mac:
 
 ```bash
 ssh-keygen -y -f "$HOME/.ssh/VPN-test.pem" > \
-  /tmp/knife15-lightsail-usw2.pub
-ssh-keygen -lf /tmp/knife15-lightsail-usw2.pub
+  /tmp/knife15-alibaba-usw1.pub
+ssh-keygen -lf /tmp/knife15-alibaba-usw1.pub
 ```
 
-Upload `/tmp/knife15-lightsail-usw2.pub`; never upload or paste
+Upload `/tmp/knife15-alibaba-usw1.pub`; never upload or paste
 `~/.ssh/VPN-test.pem`. The agent will use that existing private key only from
 the Mac filesystem.
 
-The selected compute-optimized plan is deliberate. The general-purpose 4GB
-plan has burstable CPU behavior, which would introduce another long-duration
-resource variable. AWS currently lists the compute-optimized 4GB/2-vCPU public
-IPv4 bundle at USD 42/month with 5TB transfer and on-demand hourly billing up
-to that monthly maximum. At roughly 55 hours for qualification plus two formal
-runs, compute cost is approximately USD 3.20 before tax, assuming the resource
-is deleted after evidence closure and transfer stays within the bundle.
+The selected compute-optimized plan is deliberate: it avoids a burst-credit
+CPU variable. The instance has substantially more internal-network capacity
+than the 200 Mbit/s Internet EIP. Alibaba documents the pay-by-data-transfer
+EIP cap as best effort rather than guaranteed. That is acceptable only because
+the frozen M2 offered load is below 100 Mbit/s and the read-only admission gate
+must independently prove path, throughput, CPU, queue, socket, and drop
+headroom before the candidate consumes a slot. The cap must remain fixed for
+qualification and both formal attempts.
+
+The 200 Mbit/s pay-by-data-transfer EIP is selected instead of a high fixed
+bandwidth purchase to keep a roughly 55-hour experiment economically bounded.
+Only outbound Internet data is charged under this mode. Capture the console's
+exact instance, EIP, and estimated-transfer prices before purchase; price is
+not part of technical admission and must not be guessed from this document.
 
 Official references checked on 2026-08-14:
 
+- <https://www.alibabacloud.com/help/en/ecs/user-guide/regions-and-zones>
+- <https://www.alibabacloud.com/help/en/ecs/user-guide/compute-optimized-instance-families>
+- <https://www.alibabacloud.com/help/en/ecs/user-guide/network-bandwidth/>
+- <https://www.alibabacloud.com/help/en/eip/product-overview/limits>
+- <https://www.alibabacloud.com/help/en/eip/pay-as-you-go/>
+- <https://www.tencentcloud.com/jp/document/product/213/12523>
+- <https://www.tencentcloud.com/ko/document/product/644/12628>
+- <https://www.tencentcloud.com/ko/document/product/684/67493>
 - <https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-bundles.html>
-- <https://docs.aws.amazon.com/lightsail/latest/userguide/understanding-regions-and-availability-zones-in-amazon-lightsail.html>
-- <https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-frequently-asked-questions-faq-billing-and-account-management.html>
-- <https://docs.aws.amazon.com/lightsail/latest/userguide/lightsail-create-static-ip.html>
-- <https://docs.aws.amazon.com/lightsail/latest/userguide/understanding-firewall-and-port-mappings-in-amazon-lightsail.html>
+- <https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-faq-data-transfer-allowance.html>
 
 ## Out-of-Band Identity Handoff
 
-Before the agent first connects, use the Lightsail browser terminal on the new
+Before the agent first connects, use Alibaba Cloud ECS Workbench/VNC on the new
 instance and collect only these nonsecret values:
 
 ```bash
-printf 'instance_name=%s\n' 'knife15-m2-candidate1-usw2'
-printf 'static_ip_resource=%s\n' 'knife15-m2-c1-usw2-ip'
-token="$(curl -fsS -X PUT \
-  -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
-  http://169.254.169.254/latest/api/token)"
-printf 'availability_zone=%s\n' "$(curl -fsS \
-  -H "X-aws-ec2-metadata-token: $token" \
-  http://169.254.169.254/latest/meta-data/placement/availability-zone)"
+printf 'instance_name=%s\n' 'knife15-m2-candidate1-usw1'
+printf 'eip_resource=%s\n' 'knife15-m2-c1-usw1-eip'
+printf 'availability_zone=%s\n' '<copy exact zone from ECS console>'
 printf 'ssh_ed25519_fingerprint=';
 sudo ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub | awk '{print $2}'
 ```
 
-If the metadata query fails, read the Availability Zone from the Lightsail
-instance page instead. Return the static IPv4, instance name, static-IP
-resource name, Availability Zone, and SSH ED25519 fingerprint. Never return an
-AWS account ID, access key, secret key, private SSH key, TUIC UUID, or TUIC
-password.
+Return the EIP, instance name, EIP resource name, Availability Zone, and SSH
+ED25519 fingerprint. Never return an Alibaba account ID, AccessKey ID/secret,
+private SSH key, TUIC UUID, or TUIC password.
 
 ## Agent-Owned Admission After Creation
 

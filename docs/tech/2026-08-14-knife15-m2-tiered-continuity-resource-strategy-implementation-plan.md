@@ -165,11 +165,15 @@ Completed through strict source-floor closure `bcd63b4`. Result:
 
 ### Task 6: Execute at most two strict candidates
 
-**IN PROGRESS.** The existing `.111` and `.27` hosts were rejected before
-admission because they share Tencent AS132203 with `.33`. Candidate 1 is
-selected as an Amazon Lightsail compute-optimized 4GB/2-vCPU Ubuntu 24.04
-resource in `us-west-2`, subject to actual post-allocation ASN/provider and
-live route admission. Exact creation and out-of-band host identity contract:
+**IN PROGRESS.** The existing `.111` and `.27` hosts and an ordinary new
+Tencent CVM were rejected before admission because they do not change the
+failed Tencent/AS132203 public-Internet failure domain. Candidate 1 is selected
+as an Alibaba Cloud `ecs.c8i.large` 2-vCPU/4-GiB Ubuntu 24.04 resource in
+`us-west-1` with a directly attached 200-Mbit/s pay-by-data-transfer EIP,
+subject to actual post-allocation ASN/provider and live route admission. AWS
+Lightsail is the fallback. Tencent AIA is eligible only as an explicit,
+separately contracted route. Exact creation and out-of-band host identity
+contract:
 `docs/tech/2026-08-14-knife15-m2-strict-candidate1-resource-selection.md`.
 
 **Evidence:**
