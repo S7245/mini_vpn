@@ -579,11 +579,306 @@ preflight_action() {
   printf 'PASS: market external-client preflight\npreflight_dir=%s\n' "$out_dir"
 }
 
+monotonic_millis() {
+  python3 -c 'import time; print(time.monotonic_ns() // 1_000_000)'
+}
+
+run_logged_with_timeout() {
+  local output_file="$1" timeout_secs="$2" command_pid watchdog_pid status
+  local timeout_marker
+  shift 2
+  [[ "$timeout_secs" =~ ^[1-9][0-9]*$ ]] || return 2
+  timeout_marker="$output_file.timeout.$$"
+  rm -f "$timeout_marker"
+  (exec "$@" >"$output_file" 2>&1) &
+  command_pid=$!
+  MARKET_ACTIVE_COMMAND_PID="$command_pid"
+  (
+    sleep "$timeout_secs"
+    kill -0 "$command_pid" 2>/dev/null || exit 0
+    printf 'timeout\n' >"$timeout_marker"
+    kill -TERM "$command_pid" 2>/dev/null || exit 0
+    sleep 2
+    kill -KILL "$command_pid" 2>/dev/null || true
+  ) &
+  watchdog_pid=$!
+  MARKET_ACTIVE_WATCHDOG_PID="$watchdog_pid"
+  if wait "$command_pid" 2>/dev/null; then
+    status=0
+  else
+    status=$?
+  fi
+  kill -TERM "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  MARKET_ACTIVE_COMMAND_PID=''
+  MARKET_ACTIVE_WATCHDOG_PID=''
+  if [[ -f "$timeout_marker" ]]; then
+    printf 'ERROR: command exceeded hard timeout of %ss\n' "$timeout_secs" \
+      >>"$output_file"
+    status=124
+  fi
+  rm -f "$timeout_marker"
+  return "$status"
+}
+
+validate_phase_identity() {
+  local json_file="$1" protocol="$2" reverse="$3" duration="$4"
+  jq -e --arg target "$TARGET" --arg protocol "$protocol" \
+    --argjson port "$IPERF_PORT" --argjson reverse "$reverse" \
+    --argjson duration "$duration" '
+    (.error? // "") == ""
+    and .start.connecting_to.host == $target
+    and .start.connecting_to.port == $port
+    and .start.test_start.protocol == $protocol
+    and .start.test_start.reverse == $reverse
+    and .start.test_start.duration == $duration
+    and .server_output_json.start.test_start.protocol == $protocol
+    and .server_output_json.start.test_start.reverse == $reverse
+    and .server_output_json.start.test_start.duration == $duration
+  ' "$json_file" >/dev/null 2>&1
+}
+
+append_quality_event() {
+  local run_dir="$1" cycle="$2" phase="$3" kind="$4" value="$5"
+  local detail="$6" evidence="$7"
+  [[ "$detail" != *$'\t'* && "$detail" != *$'\n'* ]] || return 1
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$cycle" "$phase" "$kind" \
+    "$value" "$detail" "$evidence" >>"$run_dir/events.tsv"
+}
+
+run_market_phase() {
+  local run_dir="$1" cycle="$2" phase="$3" protocol="$4" reverse="$5"
+  local duration="$6" rate_bps="$7" iperf_bin="$8" timeout_grace="$9"
+  local result_file summary_file timeout_secs start_utc end_utc start_ms end_ms
+  local receiver_zero max_zero_run sender_zero gap_bytes loss_percent
+  local protocol_cli
+  local -a command
+  result_file="$run_dir/cycle_$(printf '%03d' "$cycle")_${phase}.json"
+  summary_file="$run_dir/cycle_$(printf '%03d' "$cycle")_${phase}.summary.json"
+  timeout_secs=$((10#$duration + 10#$timeout_grace))
+  command=("$iperf_bin" -c "$TARGET" -p "$IPERF_PORT" -t "$duration" -P 1
+    --connect-timeout 5000 -b "$rate_bps" --json --get-server-output)
+  [[ "$reverse" == "0" ]] || command+=(-R)
+  if [[ "$protocol" == UDP ]]; then
+    command+=(-u -l 1160)
+  fi
+  start_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  start_ms="$(monotonic_millis)" || return 1
+  if ! run_logged_with_timeout "$result_file" "$timeout_secs" "${command[@]}"; then
+    printf '%s\t%s\t%s\tcommand_failed\t%s\n' \
+      "$start_utc" "$cycle" "$phase" "$(basename "$result_file")" \
+      >>"$run_dir/invalid.tsv"
+    return 1
+  fi
+  end_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  end_ms="$(monotonic_millis)" || return 1
+  validate_phase_identity "$result_file" "$protocol" "$reverse" "$duration" || {
+    printf '%s\t%s\t%s\tidentity_mismatch\t%s\n' \
+      "$end_utc" "$cycle" "$phase" "$(basename "$result_file")" \
+      >>"$run_dir/invalid.tsv"
+    return 1
+  }
+  if [[ "$protocol" == TCP ]]; then protocol_cli=tcp; else protocol_cli=udp; fi
+  python3 "$SCRIPT_DIR/knife15-market-iperf-summary.py" \
+    "$protocol_cli" --reverse "$reverse" "$result_file" >"$summary_file" 2>&1 || {
+    printf '%s\t%s\t%s\tresult_invalid\t%s\n' \
+      "$end_utc" "$cycle" "$phase" "$(basename "$result_file")" \
+      >>"$run_dir/invalid.tsv"
+    return 1
+  }
+  jq -e --argjson duration "$duration" '
+    .complete_receiver_intervals >= ($duration - 1)
+    and .complete_receiver_intervals <= ($duration + 1)
+    and .complete_sender_intervals >= ($duration - 1)
+    and .complete_sender_intervals <= ($duration + 1)
+  ' "$summary_file" >/dev/null 2>&1 || {
+    printf '%s\t%s\t%s\tincomplete_intervals\t%s\n' \
+      "$end_utc" "$cycle" "$phase" "$(basename "$summary_file")" \
+      >>"$run_dir/invalid.tsv"
+    return 1
+  }
+  receiver_zero="$(jq -er '.receiver_zero_intervals' "$summary_file")" || return 1
+  max_zero_run="$(jq -er '.max_consecutive_receiver_zero_intervals' \
+    "$summary_file")" || return 1
+  sender_zero="$(jq -er '.sender_zero_intervals' "$summary_file")" || return 1
+  if ((10#$receiver_zero > 0)); then
+    append_quality_event "$run_dir" "$cycle" "$phase" receiver_zero_interval \
+      "$receiver_zero" "max_consecutive=$max_zero_run" \
+      "$(basename "$summary_file")" || return 1
+  fi
+  if ((10#$sender_zero > 0)); then
+    append_quality_event "$run_dir" "$cycle" "$phase" sender_zero_interval \
+      "$sender_zero" observed "$(basename "$summary_file")" || return 1
+  fi
+  if [[ "$protocol" == TCP ]]; then
+    gap_bytes="$(jq -er '.sender_receiver_gap_bytes' "$summary_file")" || return 1
+    if ((10#$gap_bytes > 16777216)); then
+      append_quality_event "$run_dir" "$cycle" "$phase" \
+        tcp_sender_receiver_gap_bytes "$gap_bytes" above_16MiB \
+        "$(basename "$summary_file")" || return 1
+    fi
+  else
+    loss_percent="$(jq -er '.lost_percent' "$summary_file")" || return 1
+    if awk -v loss="$loss_percent" 'BEGIN {exit !(loss > 3.0)}'; then
+      append_quality_event "$run_dir" "$cycle" "$phase" udp_loss_percent \
+        "$loss_percent" above_3_percent "$(basename "$summary_file")" || return 1
+    fi
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$start_utc" "$end_utc" "$start_ms" "$end_ms" "$cycle" "$phase" \
+    "$protocol" "$reverse" "$duration" "$rate_bps" \
+    "$(basename "$result_file")" "$(basename "$summary_file")" valid \
+    >>"$run_dir/phases.tsv"
+}
+
+validate_workload_value() {
+  local value="$1" maximum="$2"
+  [[ "$value" =~ ^[1-9][0-9]*$ && 10#$value -le 10#$maximum ]]
+}
+
+validate_dns_name() {
+  local name="$1"
+  [[ -n "$name" && ${#name} -le 253 && "$name" =~ ^[A-Za-z0-9.-]+$ && \
+    "$name" != .* && "$name" != *. && "$name" != *..* ]]
+}
+
+run_cycle_probes() {
+  local run_dir="$1" cycle="$2" dig_bin="$3" curl_bin="$4"
+  local dns_target="$5" dns_name="$6" expected_egress="$7"
+  local dns_file egress_file dns_ipv4='' line egress timestamp
+  dns_file="$run_dir/cycle_$(printf '%03d' "$cycle")_dns.txt"
+  egress_file="$run_dir/cycle_$(printf '%03d' "$cycle")_egress.txt"
+  if ! run_logged_with_timeout "$dns_file" 10 "$dig_bin" \
+    +time=5 +tries=1 +short A "$dns_name" "@$dns_target"; then
+    printf '%s\t%s\tcycle-probes\tdns_command_failed\t%s\n' \
+      "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$cycle" "$(basename "$dns_file")" \
+      >>"$run_dir/invalid.tsv"
+    return 1
+  fi
+  while IFS= read -r line; do
+    if validate_ipv4 "$line"; then
+      dns_ipv4="$line"
+      break
+    fi
+  done <"$dns_file"
+  [[ -n "$dns_ipv4" ]] || {
+    printf '%s\t%s\tcycle-probes\tdns_evidence_invalid\t%s\n' \
+      "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$cycle" "$(basename "$dns_file")" \
+      >>"$run_dir/invalid.tsv"
+    return 1
+  }
+  if ! run_logged_with_timeout "$egress_file" 20 "$curl_bin" -4 --fail \
+    --silent --show-error --max-time 15 https://api.ipify.org; then
+    printf '%s\t%s\tcycle-probes\tegress_command_failed\t%s\n' \
+      "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$cycle" \
+      "$(basename "$egress_file")" >>"$run_dir/invalid.tsv"
+    return 1
+  fi
+  egress="$(tr -d '\r\n' <"$egress_file")"
+  [[ "$egress" == "$expected_egress" ]] || {
+    printf '%s\t%s\tcycle-probes\tegress_identity_mismatch\t%s\n' \
+      "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$cycle" \
+      "$(basename "$egress_file")" >>"$run_dir/invalid.tsv"
+    return 1
+  }
+  timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$timestamp" "$cycle" "$dns_name" \
+    "$dns_ipv4" "$egress" >>"$run_dir/probes.tsv"
+}
+
+run_market_workload() {
+  local run_dir="$1" profile_file="$2" iperf_bin="$3" timeout_grace="$4"
+  local dig_bin="$5" curl_bin="$6" dns_target="$7" dns_name="$8"
+  local expected_egress="$9"
+  local cycles tcp_secs udp_secs short_secs short_count forward_rate reverse_rate
+  local udp_rate short_forward_rate short_reverse_rate cycle short_index
+  local phase reverse rate event_count
+  [[ -d "$run_dir" && ! -L "$run_dir" && -x "$iperf_bin" && \
+    -x "$dig_bin" && -x "$curl_bin" ]] || return 1
+  validate_ipv4 "$dns_target" && validate_dns_name "$dns_name" && \
+    validate_ipv4 "$expected_egress" || return 1
+  [[ "$timeout_grace" =~ ^[0-9]+$ && 10#$timeout_grace -le 30 ]] || return 1
+  cycles="$(profile_value "$profile_file" cycles)" || return 1
+  tcp_secs="$(profile_value "$profile_file" tcp_secs)" || return 1
+  udp_secs="$(profile_value "$profile_file" udp_secs)" || return 1
+  short_secs="$(profile_value "$profile_file" short_secs)" || return 1
+  short_count="$(profile_value "$profile_file" short_count)" || return 1
+  forward_rate="$(profile_value "$profile_file" forward_rate_bps)" || return 1
+  reverse_rate="$(profile_value "$profile_file" reverse_rate_bps)" || return 1
+  udp_rate="$(profile_value "$profile_file" udp_reverse_rate_bps)" || return 1
+  short_forward_rate="$(profile_value "$profile_file" short_forward_rate_bps)" || \
+    return 1
+  short_reverse_rate="$(profile_value "$profile_file" short_reverse_rate_bps)" || \
+    return 1
+  validate_workload_value "$cycles" 6 && validate_workload_value "$tcp_secs" 300 && \
+    validate_workload_value "$udp_secs" 180 && \
+    validate_workload_value "$short_secs" 10 && \
+    validate_workload_value "$short_count" 6 || return 1
+  for rate in "$forward_rate" "$reverse_rate" "$udp_rate" \
+    "$short_forward_rate" "$short_reverse_rate"; do
+    validate_workload_value "$rate" 1000000000000 || return 1
+  done
+  printf '%s\n' RUNNING >"$run_dir/status"
+  printf 'timestamp\tcycle\tphase\tkind\tvalue\tdetail\tevidence\n' \
+    >"$run_dir/events.tsv"
+  printf 'timestamp\tcycle\tphase\treason\tevidence\n' >"$run_dir/invalid.tsv"
+  printf 'start_utc\tend_utc\tstart_monotonic_ms\tend_monotonic_ms\tcycle\tphase\tprotocol\treverse\tduration_secs\trate_bps\tresult\tsummary\tstatus\n' \
+    >"$run_dir/phases.tsv"
+  printf 'timestamp\tcycle\tdns_name\tdns_ipv4\tpublic_egress_ipv4\n' \
+    >"$run_dir/probes.tsv"
+  for ((cycle = 1; cycle <= 10#$cycles; cycle++)); do
+    run_market_phase "$run_dir" "$cycle" tcp-forward TCP 0 "$tcp_secs" \
+      "$forward_rate" "$iperf_bin" "$timeout_grace" || {
+      printf '%s\n' INVALID >"$run_dir/status"
+      return 1
+    }
+    run_market_phase "$run_dir" "$cycle" tcp-reverse TCP 1 "$tcp_secs" \
+      "$reverse_rate" "$iperf_bin" "$timeout_grace" || {
+      printf '%s\n' INVALID >"$run_dir/status"
+      return 1
+    }
+    run_market_phase "$run_dir" "$cycle" udp-reverse UDP 1 "$udp_secs" \
+      "$udp_rate" "$iperf_bin" "$timeout_grace" || {
+      printf '%s\n' INVALID >"$run_dir/status"
+      return 1
+    }
+    for ((short_index = 1; short_index <= 10#$short_count; short_index++)); do
+      if ((short_index % 2 == 1)); then
+        phase="short-forward-$short_index"
+        reverse=0
+        rate="$short_forward_rate"
+      else
+        phase="short-reverse-$short_index"
+        reverse=1
+        rate="$short_reverse_rate"
+      fi
+      run_market_phase "$run_dir" "$cycle" "$phase" TCP "$reverse" \
+        "$short_secs" "$rate" "$iperf_bin" "$timeout_grace" || {
+        printf '%s\n' INVALID >"$run_dir/status"
+        return 1
+      }
+    done
+    run_cycle_probes "$run_dir" "$cycle" "$dig_bin" "$curl_bin" \
+      "$dns_target" "$dns_name" "$expected_egress" || {
+      printf '%s\n' INVALID >"$run_dir/status"
+      return 1
+    }
+  done
+  event_count="$(awk 'END {print NR-1}' "$run_dir/events.tsv")"
+  if ((10#$event_count > 0)); then
+    printf '%s\n' PASS_WITH_EVENTS >"$run_dir/status"
+  else
+    printf '%s\n' PASS_NO_EVENTS >"$run_dir/status"
+  fi
+}
+
 self_test() {
   local tmp baseline_dir profile_file public_output public_profile bad_profile
   local zero_baseline target_route exit_route default_route dns_route
   local fake_bin fake_command preflight_dir invalid_preflight_dir current_commit
   local target_ready_json wrong_ready_json
+  local workload_profile workload_dir invalid_workload_dir workload_count
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/knife15-market-self-test.XXXXXX")"
   trap 'rm -rf "$tmp"' RETURN
   baseline_dir="$tmp/baseline"
@@ -709,8 +1004,60 @@ EOF_NETWORK
     '  networksetup)' \
     '    printf "(1) Wi-Fi\n(Hardware Port: Wi-Fi, Device: en0)\n"' \
     '    ;;' \
+    '  dig) printf "93.184.216.34\n" ;;' \
     '  curl) printf "%s\n" "${MARKET_TEST_EGRESS:-43.153.32.33}" ;;' \
-    '  iperf3) /bin/cat "$MARKET_TEST_READY_JSON" ;;' \
+    '  iperf3)' \
+    '    if [[ -z "${MARKET_TEST_IPERF_COUNT_FILE:-}" ]]; then /bin/cat "$MARKET_TEST_READY_JSON"; exit 0; fi' \
+    '    count=0' \
+    '    [[ ! -f "$MARKET_TEST_IPERF_COUNT_FILE" ]] || count="$(sed -n "1p" "$MARKET_TEST_IPERF_COUNT_FILE")"' \
+    '    count=$((count + 1))' \
+    '    printf "%s\n" "$count" >"$MARKET_TEST_IPERF_COUNT_FILE"' \
+    '    [[ "${MARKET_TEST_IPERF_FAIL_AT:-}" != "$count" ]] || exit 2' \
+    '    if [[ "${MARKET_TEST_IPERF_HANG_AT:-}" == "$count" ]]; then sleep 5; fi' \
+    '    if [[ "${MARKET_TEST_IPERF_MALFORMED_AT:-}" == "$count" ]]; then printf "{}\n"; exit 0; fi' \
+    '    protocol=TCP; reverse=0; duration=0' \
+    '    while (($#)); do' \
+    '      case "$1" in' \
+    '        -u) protocol=UDP ;;' \
+    '        -R) reverse=1 ;;' \
+    '        -t) shift; duration="$1" ;;' \
+    '      esac' \
+    '      shift' \
+    '    done' \
+    '    if [[ "$protocol" == UDP ]]; then' \
+    '      jq --argjson reverse "$reverse" --argjson duration "$duration" --argjson quality "$([[ "$count" == 3 ]] && echo 1 || echo 0)" '\''
+        .start.connecting_to.host = "43.130.32.77"
+        | .start.connecting_to.port = 5201
+        | .start.test_start.protocol = "UDP"
+        | .start.test_start.reverse = $reverse
+        | .start.test_start.duration = $duration
+        | .server_output_json.start.test_start.protocol = "UDP"
+        | .server_output_json.start.test_start.reverse = $reverse
+        | .server_output_json.start.test_start.duration = $duration
+        | .intervals = [.intervals[0]]
+        | .server_output_json.intervals = [.server_output_json.intervals[0]]
+        | .end.sum.lost_percent = (if $quality == 1 then 4.5 else 1.0 end)
+        | .end.sum.lost_packets = (if $quality == 1 then 4 else 1 end)
+        | .end.sum.packets = 100
+      '\'' "$MARKET_TEST_UDP_JSON"' \
+    '    else' \
+    '      jq --argjson reverse "$reverse" --argjson duration "$duration" --argjson quality "$([[ "$count" == 2 ]] && echo 1 || echo 0)" '\''
+        .start.connecting_to.host = "43.130.32.77"
+        | .start.connecting_to.port = 5201
+        | .start.test_start.protocol = "TCP"
+        | .start.test_start.reverse = $reverse
+        | .start.test_start.duration = $duration
+        | .server_output_json.start.test_start.protocol = "TCP"
+        | .server_output_json.start.test_start.reverse = $reverse
+        | .server_output_json.start.test_start.duration = $duration
+        | .intervals = [.intervals[0]]
+        | .server_output_json.intervals = [.server_output_json.intervals[0]]
+        | if $reverse == 1 and $quality == 1
+          then .intervals[0].sum.bits_per_second = 0
+          else . end
+      '\'' "$MARKET_TEST_TCP_JSON"' \
+    '    fi' \
+    '    ;;' \
     '  git)' \
     '    if [[ "$*" == *"status --porcelain --untracked-files=all"* ]]; then exit 0; fi' \
     '    if [[ "$*" == *"rev-parse HEAD"* ]]; then printf "%s\n" "$MARKET_TEST_COMMIT"; exit 0; fi' \
@@ -719,7 +1066,7 @@ EOF_NETWORK
     '  *) exit 1 ;;' \
     'esac' >"$fake_command"
   chmod 0700 "$fake_command"
-  for fake_name in route ifconfig scutil networksetup curl iperf3 git; do
+  for fake_name in route ifconfig scutil networksetup curl dig iperf3 git; do
     ln -s "$fake_command" "$fake_bin/$fake_name"
   done
   current_commit="$(git -C "$REPO" rev-parse HEAD)"
@@ -732,6 +1079,8 @@ EOF_NETWORK
       | .server_output_json.intervals = [.server_output_json.intervals[0]]' \
     "$baseline_dir/direct-forward.json" >"$target_ready_json"
   export MARKET_TEST_READY_JSON="$target_ready_json"
+  export MARKET_TEST_TCP_JSON="$target_ready_json"
+  export MARKET_TEST_UDP_JSON="$SCRIPT_DIR/fixtures/knife15-market/udp-complete.json"
   export MARKET_TEST_COMMIT="$current_commit"
   preflight_dir="$tmp/preflight"
   mkdir "$preflight_dir"
@@ -784,6 +1133,71 @@ EOF_NETWORK
   fi
   grep -Fxq 'reason=target_readiness_evidence_invalid' \
     "$invalid_preflight_dir/failure.txt"
+  workload_profile="$tmp/test-workload-profile.txt"
+  awk '
+    /^cycles=/ {print "cycles=2"; next}
+    /^tcp_secs=/ {print "tcp_secs=1"; next}
+    /^udp_secs=/ {print "udp_secs=1"; next}
+    /^short_secs=/ {print "short_secs=1"; next}
+    /^short_count=/ {print "short_count=2"; next}
+    {print}
+  ' "$profile_file" >"$workload_profile"
+  workload_dir="$tmp/workload"
+  mkdir "$workload_dir"
+  export MARKET_TEST_IPERF_COUNT_FILE="$tmp/iperf-count"
+  if ! run_market_workload "$workload_dir" "$workload_profile" \
+    "$fake_bin/iperf3" 0 "$fake_bin/dig" "$fake_bin/curl" 8.8.8.8 \
+    example.com 43.153.32.33; then
+    die "self-test: quality-event workload did not complete"
+  fi
+  workload_count="$(sed -n '1p' "$MARKET_TEST_IPERF_COUNT_FILE")"
+  [[ "$workload_count" == "10" ]] || \
+    die "self-test: quality events stopped the schedule at $workload_count/10"
+  [[ "$(sed -n '1p' "$workload_dir/status")" == PASS_WITH_EVENTS ]] || \
+    die "self-test: quality-event workload status mismatch"
+  [[ "$(awk 'END {print NR-1}' "$workload_dir/phases.tsv")" == "10" ]] || \
+    die "self-test: workload phase evidence count mismatch"
+  [[ "$(awk 'END {print NR-1}' "$workload_dir/probes.tsv")" == "2" ]] || \
+    die "self-test: cycle probe evidence count mismatch"
+  [[ "$(awk 'END {print NR-1}' "$workload_dir/events.tsv")" == "2" ]] || \
+    die "self-test: workload quality event count mismatch"
+  grep -Fq $'\treceiver_zero_interval\t1\t' "$workload_dir/events.tsv"
+  grep -Fq $'\tudp_loss_percent\t4.5\t' "$workload_dir/events.tsv"
+  invalid_workload_dir="$tmp/workload-command-failure"
+  mkdir "$invalid_workload_dir"
+  if (export MARKET_TEST_IPERF_COUNT_FILE="$tmp/iperf-fail-count"; \
+    export MARKET_TEST_IPERF_FAIL_AT=4; \
+    run_market_workload "$invalid_workload_dir" "$workload_profile" \
+      "$fake_bin/iperf3" 0 "$fake_bin/dig" "$fake_bin/curl" 8.8.8.8 \
+      example.com 43.153.32.33); then
+    die "self-test: command-failed workload was accepted"
+  fi
+  [[ "$(sed -n '1p' "$invalid_workload_dir/status")" == INVALID ]] || \
+    die "self-test: command failure did not invalidate workload"
+  [[ "$(sed -n '1p' "$tmp/iperf-fail-count")" == 4 ]] || \
+    die "self-test: command failure did not stop at exact phase"
+  invalid_workload_dir="$tmp/workload-malformed"
+  mkdir "$invalid_workload_dir"
+  if (export MARKET_TEST_IPERF_COUNT_FILE="$tmp/iperf-malformed-count"; \
+    export MARKET_TEST_IPERF_MALFORMED_AT=2; \
+    run_market_workload "$invalid_workload_dir" "$workload_profile" \
+      "$fake_bin/iperf3" 0 "$fake_bin/dig" "$fake_bin/curl" 8.8.8.8 \
+      example.com 43.153.32.33); then
+    die "self-test: malformed workload evidence was accepted"
+  fi
+  [[ "$(sed -n '1p' "$tmp/iperf-malformed-count")" == 2 ]] || \
+    die "self-test: malformed evidence did not stop at exact phase"
+  invalid_workload_dir="$tmp/workload-timeout"
+  mkdir "$invalid_workload_dir"
+  if (export MARKET_TEST_IPERF_COUNT_FILE="$tmp/iperf-timeout-count"; \
+    export MARKET_TEST_IPERF_HANG_AT=2; \
+    run_market_workload "$invalid_workload_dir" "$workload_profile" \
+      "$fake_bin/iperf3" 0 "$fake_bin/dig" "$fake_bin/curl" 8.8.8.8 \
+      example.com 43.153.32.33); then
+    die "self-test: timed-out workload was accepted"
+  fi
+  [[ "$(sed -n '1p' "$tmp/iperf-timeout-count")" == 2 ]] || \
+    die "self-test: timeout did not stop at exact phase"
   echo "knife15 market continuity self-test passed"
 }
 
