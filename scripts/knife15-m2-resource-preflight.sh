@@ -103,6 +103,8 @@ tuic_server_parts() {
 runner_self_test() {
   local reference="$SCRIPT_DIR/knife15-m2-reference-33.json"
   local candidate="$SCRIPT_DIR/fixtures/knife15-m2-resource/distinct-provider.json"
+  local provider_evidence="$SCRIPT_DIR/fixtures/knife15-m2-resource/distinct-provider-identity.txt"
+  local route_evidence="$SCRIPT_DIR/fixtures/knife15-m2-resource/distinct-route-identity.txt"
   local equivalent="$SCRIPT_DIR/fixtures/knife15-m2-resource/equivalent-resize.json"
   local result tmp evidence_sha
   python3 -I "$PROFILE_HELPER" --self-test >/dev/null || \
@@ -117,6 +119,12 @@ runner_self_test() {
     die "equivalent resource fixture was not classifiable"
   [[ "$result" == *'"eligible":false'* ]] || \
     die "equivalent resource fixture was accepted"
+  result="$(python3 -I "$PROFILE_HELPER" validate-evidence \
+    --candidate "$candidate" --provider-evidence "$provider_evidence" \
+    --route-evidence "$route_evidence")" || \
+    die "matching resource identity evidence was rejected"
+  [[ "$result" == *'"valid":true'* ]] || \
+    die "matching resource identity evidence did not produce validity"
   ssh_host_matches_ipv4 ubuntu@43.153.32.33 43.153.32.33 || \
     die "matching SSH identity was rejected"
   ! ssh_host_matches_ipv4 ubuntu@43.130.32.77 43.153.32.33 || \
@@ -302,6 +310,12 @@ run_preflight() {
   copy_hash_bound_evidence "$ROUTE_IDENTITY_EVIDENCE" \
     "$expected_route_evidence_sha" "$OUT_DIR/route-identity.txt" \
     "route identity"
+  python3 -I "$PROFILE_HELPER" validate-evidence \
+    --candidate "$candidate_copy" \
+    --provider-evidence "$OUT_DIR/provider-identity.txt" \
+    --route-evidence "$OUT_DIR/route-identity.txt" \
+    >"$OUT_DIR/evidence-binding.json" || \
+    die "provider/route evidence does not match the candidate profile; evidence: $OUT_DIR"
   if [[ "$eligibility_reason" == proved_saturation_replacement ]]; then
     expected_prior_saturation_sha="$(profile_value \
       "$candidate_copy" prior_saturation_evidence_sha256)" || \
@@ -394,6 +408,7 @@ run_preflight() {
     echo "profile_helper_sha256=$(sha256_file "$PROFILE_HELPER")"
     echo "preflight_runner_sha256=$(sha256_file "$PREFLIGHT_RUNNER")"
     echo "eligibility_sha256=$(sha256_file "$OUT_DIR/eligibility.json")"
+    echo "evidence_binding_sha256=$(sha256_file "$OUT_DIR/evidence-binding.json")"
     echo "provider_identity_sha256=$(sha256_file "$OUT_DIR/provider-identity.txt")"
     echo "route_identity_sha256=$(sha256_file "$OUT_DIR/route-identity.txt")"
     echo "remote_sha256=$(sha256_file "$OUT_DIR/remote.txt")"
@@ -405,6 +420,7 @@ run_preflight() {
   : >"$OUT_DIR/SHA256SUMS"
   for evidence_file in \
     reference-profile.json candidate-profile.json eligibility.json \
+    evidence-binding.json \
     provider-identity.txt route-identity.txt direct-manifest.txt \
     exit.route.txt target.route.txt exit.traceroute.txt target.traceroute.txt \
     remote.txt remote.stderr secret-scan.txt result.txt; do

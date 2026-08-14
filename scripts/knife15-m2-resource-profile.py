@@ -65,6 +65,23 @@ REFERENCE_IDENTITY = {
     "target_iperf_port": 5201,
 }
 REFERENCE_FIELDS = {"schema", *REFERENCE_IDENTITY}
+PROVIDER_EVIDENCE_FIELDS = {
+    "schema",
+    "candidate_id",
+    "provider",
+    "resource_id",
+    "region",
+    "public_ipv4",
+    "asn",
+}
+ROUTE_EVIDENCE_FIELDS = {
+    "schema",
+    "candidate_id",
+    "public_ipv4",
+    "target_ipv4",
+    "route_class",
+    "route_contract_id",
+}
 
 
 def fixture_path(name: str) -> Path:
@@ -338,6 +355,79 @@ def read_json(path: str) -> Any:
         return json.load(handle, object_pairs_hook=unique_object)
 
 
+def read_identity_evidence(path: Path, fields: set[str], label: str) -> dict[str, str]:
+    if not path.is_file() or path.is_symlink():
+        raise ValueError(f"{label} must be a regular non-symlink file")
+    result: dict[str, str] = {}
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if line.count("=") != 1:
+            raise ValueError(f"{label} line {number} must contain one assignment")
+        key, value = line.split("=", 1)
+        if re.fullmatch(r"[a-z][a-z0-9_]*", key) is None or not value:
+            raise ValueError(f"{label} line {number} is malformed")
+        if key in result:
+            raise ValueError(f"{label} has duplicate key: {key}")
+        result[key] = value
+    missing = sorted(fields - result.keys())
+    unknown = sorted(result.keys() - fields)
+    if missing:
+        raise ValueError(f"{label} is missing fields: {','.join(missing)}")
+    if unknown:
+        raise ValueError(f"{label} has unknown fields: {','.join(unknown)}")
+    return result
+
+
+def validate_identity_evidence(
+    candidate: Any,
+    provider_path: Path,
+    route_path: Path,
+) -> dict[str, Any]:
+    profile_identity(candidate, "candidate")
+    profile = object_value(candidate, "candidate")
+    provider = read_identity_evidence(
+        provider_path, PROVIDER_EVIDENCE_FIELDS, "provider evidence"
+    )
+    route = read_identity_evidence(
+        route_path, ROUTE_EVIDENCE_FIELDS, "route evidence"
+    )
+    if provider["schema"] != "knife15-m2-provider-identity-v1":
+        raise ValueError("provider evidence schema mismatch")
+    if route["schema"] != "knife15-m2-route-identity-v1":
+        raise ValueError("route evidence schema mismatch")
+    for field in (
+        "candidate_id",
+        "provider",
+        "resource_id",
+        "region",
+        "public_ipv4",
+        "asn",
+    ):
+        if provider[field] != str(profile[field]):
+            raise ValueError(f"provider evidence/profile mismatch: {field}")
+    for field in (
+        "candidate_id",
+        "public_ipv4",
+        "target_ipv4",
+        "route_class",
+        "route_contract_id",
+    ):
+        if route[field] != str(profile[field]):
+            raise ValueError(f"route evidence/profile mismatch: {field}")
+    provider_sha = hashlib.sha256(provider_path.read_bytes()).hexdigest()
+    route_sha = hashlib.sha256(route_path.read_bytes()).hexdigest()
+    if provider_sha != profile["provider_identity_evidence_sha256"]:
+        raise ValueError("provider evidence SHA-256 mismatch")
+    if route_sha != profile["route_identity_evidence_sha256"]:
+        raise ValueError("route evidence SHA-256 mismatch")
+    return {
+        "schema": "knife15-m2-resource-evidence-binding-v1",
+        "candidate_id": profile["candidate_id"],
+        "provider_identity_evidence_sha256": provider_sha,
+        "route_identity_evidence_sha256": route_sha,
+        "valid": True,
+    }
+
+
 def validate_profile(value: Any) -> dict[str, Any]:
     profile = object_value(value, "profile")
     if profile.get("schema") == "knife15-m2-resource-reference-v1":
@@ -355,6 +445,24 @@ def validate_profile(value: Any) -> dict[str, Any]:
 def self_test() -> None:
     reference: Any = read_json(str(reference_path()))
     candidate: Any = read_json(str(fixture_path("distinct-provider.json")))
+    evidence_binding = validate_identity_evidence(
+        candidate,
+        fixture_path("distinct-provider-identity.txt"),
+        fixture_path("distinct-route-identity.txt"),
+    )
+    assert evidence_binding["valid"] is True
+    mismatched_provider = copy.deepcopy(candidate)
+    mismatched_provider["provider"] = "wrong-provider"
+    try:
+        validate_identity_evidence(
+            mismatched_provider,
+            fixture_path("distinct-provider-identity.txt"),
+            fixture_path("distinct-route-identity.txt"),
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("provider evidence/profile mismatch was accepted")
     minimal_reference = {
         "schema": "knife15-m2-resource-reference-v1",
         **REFERENCE_IDENTITY,
@@ -479,14 +587,26 @@ def main() -> int:
     compare_parser = subparsers.add_parser("compare")
     compare_parser.add_argument("--reference", required=True)
     compare_parser.add_argument("--candidate", required=True)
+    evidence_parser = subparsers.add_parser("validate-evidence")
+    evidence_parser.add_argument("--candidate", required=True)
+    evidence_parser.add_argument("--provider-evidence", required=True)
+    evidence_parser.add_argument("--route-evidence", required=True)
     args = parser.parse_args()
     if args.command == "validate":
         result = validate_profile(read_json(args.profile))
-    else:
+    elif args.command == "compare":
         if args.reference == "-" or args.candidate == "-":
             raise ValueError("compare requires two file paths")
         result = classify_profiles(
             read_json(args.reference), read_json(args.candidate)
+        )
+    else:
+        if "-" in (args.candidate, args.provider_evidence, args.route_evidence):
+            raise ValueError("validate-evidence requires three file paths")
+        result = validate_identity_evidence(
+            read_json(args.candidate),
+            Path(args.provider_evidence),
+            Path(args.route_evidence),
         )
     json.dump(result, sys.stdout, sort_keys=True, separators=(",", ":"))
     sys.stdout.write("\n")

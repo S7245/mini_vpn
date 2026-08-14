@@ -1,0 +1,7 @@
+schema=knife15-m2-provider-identity-v1
+candidate_id=candidate-distinct-provider
+provider=independent-provider
+resource_id=candidate-exit-a
+region=us-west-candidate
+public_ipv4=1.1.1.1
+asn=13335

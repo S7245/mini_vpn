@@ -154,6 +154,30 @@ RESOURCE_PROFILE_FIELDS = {
     "replacement_capacity_proven",
     "replacement_capacity_evidence_sha256",
 }
+PROVIDER_EVIDENCE_FIELDS = {
+    "schema",
+    "candidate_id",
+    "provider",
+    "resource_id",
+    "region",
+    "public_ipv4",
+    "asn",
+}
+ROUTE_EVIDENCE_FIELDS = {
+    "schema",
+    "candidate_id",
+    "public_ipv4",
+    "target_ipv4",
+    "route_class",
+    "route_contract_id",
+}
+EVIDENCE_BINDING_FIELDS = {
+    "schema",
+    "candidate_id",
+    "provider_identity_evidence_sha256",
+    "route_identity_evidence_sha256",
+    "valid",
+}
 WORKLOAD_CONTRACT_FIELDS = (
     "schema",
     "target",
@@ -416,6 +440,82 @@ def parse_key_values(text: str, label: str) -> dict[str, str]:
     return result
 
 
+def parse_closed_key_values(
+    value: bytes,
+    fields: set[str],
+    label: str,
+) -> dict[str, str]:
+    try:
+        text = value.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise LedgerError(f"{label} is not UTF-8") from error
+    result: dict[str, str] = {}
+    for number, line in enumerate(text.splitlines(), 1):
+        if line.count("=") != 1:
+            raise LedgerError(f"{label} line {number} is malformed")
+        key, item = line.split("=", 1)
+        if re.fullmatch(r"[a-z][a-z0-9_]*", key) is None or not item:
+            raise LedgerError(f"{label} line {number} is malformed")
+        if key in result:
+            raise LedgerError(f"{label} has duplicate key: {key}")
+        result[key] = item
+    exact_object(result, fields, label)
+    return result
+
+
+def validate_resource_identity_evidence(
+    candidate: dict[str, Any],
+    provider_bytes: bytes,
+    route_bytes: bytes,
+    binding: dict[str, Any],
+) -> None:
+    provider = parse_closed_key_values(
+        provider_bytes, PROVIDER_EVIDENCE_FIELDS, "provider evidence"
+    )
+    route = parse_closed_key_values(
+        route_bytes, ROUTE_EVIDENCE_FIELDS, "route evidence"
+    )
+    exact_object(binding, EVIDENCE_BINDING_FIELDS, "resource evidence binding")
+    if provider["schema"] != "knife15-m2-provider-identity-v1":
+        raise LedgerError("provider evidence schema mismatch")
+    if route["schema"] != "knife15-m2-route-identity-v1":
+        raise LedgerError("route evidence schema mismatch")
+    for field in (
+        "candidate_id",
+        "provider",
+        "resource_id",
+        "region",
+        "public_ipv4",
+        "asn",
+    ):
+        if provider[field] != str(candidate[field]):
+            raise LedgerError(f"provider evidence/profile mismatch: {field}")
+    for field in (
+        "candidate_id",
+        "public_ipv4",
+        "target_ipv4",
+        "route_class",
+        "route_contract_id",
+    ):
+        if route[field] != str(candidate[field]):
+            raise LedgerError(f"route evidence/profile mismatch: {field}")
+    provider_sha = sha256_bytes(provider_bytes)
+    route_sha = sha256_bytes(route_bytes)
+    if provider_sha != candidate["provider_identity_evidence_sha256"]:
+        raise LedgerError("provider evidence SHA-256 mismatch")
+    if route_sha != candidate["route_identity_evidence_sha256"]:
+        raise LedgerError("route evidence SHA-256 mismatch")
+    expected_binding = {
+        "schema": "knife15-m2-resource-evidence-binding-v1",
+        "candidate_id": candidate["candidate_id"],
+        "provider_identity_evidence_sha256": provider_sha,
+        "route_identity_evidence_sha256": route_sha,
+        "valid": True,
+    }
+    if binding != expected_binding:
+        raise LedgerError("resource evidence binding does not match exact evidence")
+
+
 def parse_summary(text: str) -> dict[str, str]:
     result: dict[str, str] = {}
     for line in text.splitlines():
@@ -538,6 +638,7 @@ def validate_resource_archive(mac: EvidenceArchive, stage: str) -> None:
             "reference-profile.json",
             "candidate-profile.json",
             "eligibility.json",
+            "evidence-binding.json",
             "direct-manifest.txt",
             "provider-identity.txt",
             "route-identity.txt",
@@ -706,6 +807,19 @@ def validate_mac_bundle(attempt: dict[str, Any], artifact_root: Path) -> None:
             archive.bytes(f"{resource_dir}/eligibility.json"),
             "resource eligibility",
         )
+        evidence_binding_bytes = archive.bytes(
+            f"{resource_dir}/evidence-binding.json"
+        )
+        evidence_binding = json_bytes(
+            evidence_binding_bytes,
+            "resource evidence binding",
+        )
+        validate_resource_identity_evidence(
+            candidate,
+            archive.bytes(f"{resource_dir}/provider-identity.txt"),
+            archive.bytes(f"{resource_dir}/route-identity.txt"),
+            evidence_binding,
+        )
         resource_result = parse_key_values(
             archive.text(f"{resource_dir}/result.txt"),
             "resource preflight result",
@@ -798,6 +912,10 @@ def validate_mac_bundle(attempt: dict[str, Any], artifact_root: Path) -> None:
             (
                 "preflight_runner_sha256",
                 attempt["resource_preflight_runner_sha256"],
+            ),
+            (
+                "evidence_binding_sha256",
+                sha256_bytes(evidence_binding_bytes),
             ),
         ):
             if required(resource_result, key, "resource preflight result") != expected:
@@ -1344,6 +1462,29 @@ def make_valid_evidence_attempt(artifact_root: Path, role: str) -> dict[str, Any
     server_config_sha = "5" * 64
     direct_manifest = b"schema=knife15-macos-direct-continuity-v1\nstatus=pass\n"
     direct_sha = sha256_bytes(direct_manifest)
+    provider_evidence = key_value_bytes(
+        {
+            "schema": "knife15-m2-provider-identity-v1",
+            "candidate_id": candidate_id,
+            "provider": "provider-parser",
+            "resource_id": "resource-parser",
+            "region": "us-parser",
+            "public_ipv4": "1.1.1.1",
+            "asn": 13335,
+        }
+    )
+    route_evidence = key_value_bytes(
+        {
+            "schema": "knife15-m2-route-identity-v1",
+            "candidate_id": candidate_id,
+            "public_ipv4": "1.1.1.1",
+            "target_ipv4": "43.130.32.77",
+            "route_class": "premium-parser",
+            "route_contract_id": "contract-parser",
+        }
+    )
+    provider_evidence_sha = sha256_bytes(provider_evidence)
+    route_evidence_sha = sha256_bytes(route_evidence)
     candidate: dict[str, Any] = {
         "schema": "knife15-m2-resource-profile-v1",
         "candidate_id": candidate_id,
@@ -1354,8 +1495,8 @@ def make_valid_evidence_attempt(artifact_root: Path, role: str) -> dict[str, Any
         "asn": 13335,
         "route_class": "premium-parser",
         "route_contract_id": "contract-parser",
-        "provider_identity_evidence_sha256": "7" * 64,
-        "route_identity_evidence_sha256": "8" * 64,
+        "provider_identity_evidence_sha256": provider_evidence_sha,
+        "route_identity_evidence_sha256": route_evidence_sha,
         "tuic_port": 8443,
         "target_ipv4": "43.130.32.77",
         "target_iperf_port": 5201,
@@ -1381,6 +1522,13 @@ def make_valid_evidence_attempt(artifact_root: Path, role: str) -> dict[str, Any
         "reference_profile_sha256": "c" * 64,
         "candidate_profile_sha256": profile_sha,
     }
+    evidence_binding = {
+        "schema": "knife15-m2-resource-evidence-binding-v1",
+        "candidate_id": candidate_id,
+        "provider_identity_evidence_sha256": provider_evidence_sha,
+        "route_identity_evidence_sha256": route_evidence_sha,
+        "valid": True,
+    }
     resource_result = {
         "schema": "knife15-m2-resource-preflight-v1",
         "status": "pass",
@@ -1394,6 +1542,9 @@ def make_valid_evidence_attempt(artifact_root: Path, role: str) -> dict[str, Any
         "observer_sha256": observer_sha,
         "profile_helper_sha256": "e" * 64,
         "preflight_runner_sha256": "f" * 64,
+        "evidence_binding_sha256": sha256_bytes(
+            (canonical_json(evidence_binding) + "\n").encode()
+        ),
     }
     resource_files: dict[str, bytes] = {
         "reference-profile.json": (
@@ -1401,9 +1552,12 @@ def make_valid_evidence_attempt(artifact_root: Path, role: str) -> dict[str, Any
         ).encode(),
         "candidate-profile.json": (canonical_json(candidate) + "\n").encode(),
         "eligibility.json": (canonical_json(eligibility) + "\n").encode(),
+        "evidence-binding.json": (
+            canonical_json(evidence_binding) + "\n"
+        ).encode(),
         "direct-manifest.txt": direct_manifest,
-        "provider-identity.txt": b"provider=fixture\n",
-        "route-identity.txt": b"route=fixture\n",
+        "provider-identity.txt": provider_evidence,
+        "route-identity.txt": route_evidence,
         "exit.route.txt": b"interface: en0\n",
         "target.route.txt": b"interface: en0\n",
         "exit.traceroute.txt": b"exit traceroute\n",
@@ -1806,6 +1960,54 @@ def self_test() -> None:
             "qualification",
         )
         validate_attempt(qualification_attempt, artifact_root)
+        qualification_archive = EvidenceArchive(
+            artifact_root / qualification_attempt["mac_bundle_name"],
+            "qualification identity fixture",
+        )
+        try:
+            resource_prefix = "m2-qualification-resource-preflight"
+            fixture_candidate = json_bytes(
+                qualification_archive.bytes(
+                    f"{resource_prefix}/candidate-profile.json"
+                ),
+                "fixture candidate",
+            )
+            fixture_provider = qualification_archive.bytes(
+                f"{resource_prefix}/provider-identity.txt"
+            )
+            fixture_route = qualification_archive.bytes(
+                f"{resource_prefix}/route-identity.txt"
+            )
+            fixture_binding = json_bytes(
+                qualification_archive.bytes(
+                    f"{resource_prefix}/evidence-binding.json"
+                ),
+                "fixture binding",
+            )
+            validate_resource_identity_evidence(
+                fixture_candidate,
+                fixture_provider,
+                fixture_route,
+                fixture_binding,
+            )
+            try:
+                validate_resource_identity_evidence(
+                    fixture_candidate,
+                    fixture_provider.replace(
+                        b"provider=provider-parser\n",
+                        b"provider=wrong-provider\n",
+                    ),
+                    fixture_route,
+                    fixture_binding,
+                )
+            except LedgerError:
+                pass
+            else:
+                raise AssertionError(
+                    "ledger accepted provider evidence/profile mismatch"
+                )
+        finally:
+            qualification_archive.close()
         formal_attempt = make_valid_evidence_attempt(artifact_root, "formal")
         validate_attempt(formal_attempt, artifact_root)
         derived_formal = derive_attempt(
