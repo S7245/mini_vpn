@@ -1,7 +1,7 @@
 # Knife15 M2 Tiered Continuity And Resource Strategy Implementation Plan
 
-Status: **TASKS 1–2 COMPLETE THROUGH `c688ce3`; TASK 3 STRICT-RUN PROFILE
-BINDING IS NEXT; FORMAL M2 AND M3 REMAIN BLOCKED**
+Status: **TASKS 1–3 COMPLETE THROUGH `18c0e14`; TASK 4 STRICT ATTEMPT
+LEDGER IS NEXT; FORMAL M2 AND M3 REMAIN BLOCKED**
 
 > **For agentic workers:** use `diagnose` and `tdd` for each behavior change;
 > use `code-review` before requesting a long macOS run.
@@ -85,7 +85,7 @@ system evidence, SHA-256 manifests, tar bundles, Rust workspace gates.
 5. Run both helper self-tests and the unchanged complete runner self-test.
 6. Commit and push.
 
-### Task 3: Bind strict runs to one immutable resource profile
+### Task 3: Bind strict runs to one immutable resource profile — COMPLETE
 
 **Files:**
 
@@ -106,6 +106,9 @@ system evidence, SHA-256 manifests, tar bundles, Rust workspace gates.
    cleanup contract are unchanged.
 6. Run focused and complete runner/observer self-tests.
 7. Commit and push.
+
+Completed by `ef5a433` plus source-floor closure `18c0e14`. Result:
+`docs/tech/2026-08-14-knife15-m2-strict-resource-binding-local-results.md`.
 
 ### Task 4: Strict-attempt ledger RED/GREEN
 

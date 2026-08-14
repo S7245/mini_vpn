@@ -15,9 +15,10 @@ Next:
 
 1. **DONE at `c688ce3`:** implement and review the immutable resource
    manifest/admission helper and isolated nonsudo preflight;
-2. **NEXT:** bind strict qualification/formal evidence to the exact resource without
-   weakening `receiver_zero == 0`;
-3. implement the strict attempt ledger and operator runbook;
+2. **DONE through `18c0e14`:** bind strict qualification/formal evidence to
+   the exact root-owned resource state, copied directory, and immutable archive
+   without weakening `receiver_zero == 0`;
+3. **NEXT:** implement the strict attempt ledger and operator runbook;
 4. admit at most two resources that change both provider and ASN, or
    independently contracted route from `.33`;
 5. for each, run one strict qualification and, only if clean, two consecutive
@@ -37,6 +38,8 @@ and
 `docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-implementation-plan.md`.
 Task-2 result:
 `docs/tech/2026-08-14-knife15-m2-resource-admission-local-results.md`.
+Task-3 result:
+`docs/tech/2026-08-14-knife15-m2-strict-resource-binding-local-results.md`.
 
 #### Formal-failure basis (2026-08-14 — M2 reached the standard-TUIC one-second continuity stop)
 

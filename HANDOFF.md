@@ -4,17 +4,19 @@
 
 ## Next Planned Stage — Knife15 M2 Tiered Resource Continuity (2026-08-14)
 
-- **Latest implementation position:** Tasks 1–2 are complete through
-  `c688ce3`. The closed profile validator and isolated nonsudo resource
-  preflight bind materially distinct provider/ASN or contracted-route
-  identity to copied evidence, exact source/binary/direct/observer/server
-  hashes, endpoint/Target/SSH/interface, remote health, secret scan, and an
-  immutable bundle. The root/TUN runner and strict M2 SLI are unchanged.
-- Profile/preflight self-tests, the complete unchanged macOS runner self-test,
-  syntax/diff/secret checks, and code review pass with no unresolved P0/P1.
-  No real candidate has been admitted. Task 3 strict-run profile binding is
-  next; do not ask for a Mac/VPS run yet. Result:
-  `docs/tech/2026-08-14-knife15-m2-resource-admission-local-results.md`.
+- **Latest implementation position:** Tasks 1–3 are complete through
+  `18c0e14`. Strict qualification/formal M2 now import an eligible preflight,
+  bind its exact candidate/profile/result, source/binary/direct/observer/server
+  and endpoint identity into root-owned state and stage evidence, and compare
+  the copied directory with every member of its immutable archive before route
+  mutation and final acceptance. Strict source admission requires `ef5a433`
+  or a descendant.
+- Profile/preflight, complete macOS runner, and Exit observer self-tests plus
+  syntax/diff/frozen-value/secret checks pass. Review has no unresolved P0/P1;
+  Rust production and strict `receiver_zero == 0` are unchanged. No real
+  candidate has been admitted. Task 4 strict-attempt ledger is next; do not
+  ask for a Mac/VPS run yet. Result:
+  `docs/tech/2026-08-14-knife15-m2-strict-resource-binding-local-results.md`.
 - **Latest accepted position:** the user canceled mature-client/commercial-VPN
   comparison before C0 and selected a bounded two-tier policy. Do not ask the
   user to open a TUIC client and do not execute the old calibration runbook.
@@ -37,8 +39,8 @@
   one immutable profile, including one uninterrupted four-epoch/24-hour
   process-and-TUN lifetime. A later invalid infrastructure event does not erase
   already sealed valid epochs; reducers never bridge unknown evidence.
-- Next implementation work is strict-run profile binding, the strict attempt
-  ledger, reviewed runbook, and local gates. Formal M2 and M3 remain
+- Next implementation work is the strict attempt ledger, reviewed runbook,
+  and local gates. Formal M2 and M3 remain
   blocked until that implementation supplies exact instructions. Spec and
   plan:
   `docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-spec.md`

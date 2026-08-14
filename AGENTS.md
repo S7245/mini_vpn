@@ -189,17 +189,21 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-14:
 
-- Tiered-resource Tasks 1–2 are complete through `c688ce3`. The closed
+- Tiered-resource Tasks 1–3 are complete through `18c0e14`. The closed
   resource-profile schema accepts only a different provider and ASN, an
   independently contracted route, or a hash-proved saturation replacement.
   The isolated nonsudo preflight binds copied provider/route evidence, exact
   source/binary/direct/observer/server hashes, endpoint/Target/SSH/interface,
   remote service health, resource evidence, secret scan, and immutable bundle.
-- The root/TUN runner and strict `m2` SLI are unchanged. Complete profile,
-  preflight, and unchanged macOS-runner self-tests pass; code review has no
-  unresolved P0/P1. No real candidate has been admitted. Task 3 must bind
-  strict qualification/formal runs to the admitted profile before any Mac
-  long test.
+- Strict qualification/formal M2 now bind the exact candidate/profile/result,
+  copied directory and archive, source/binary/direct/observer/server identity,
+  and endpoint/Target/interface into root-owned state and stage evidence.
+  Strict source admission requires `ef5a433` or a descendant.
+- Rust production and the strict `m2` SLI are unchanged. Complete profile,
+  preflight, macOS-runner, and Exit-observer self-tests pass; code review has
+  no unresolved P0/P1. No real candidate has been admitted. Task 4 strict
+  attempt ledger is next; do not request a Mac long test yet. Result:
+  `docs/tech/2026-08-14-knife15-m2-strict-resource-binding-local-results.md`.
 - The user canceled mature-client/commercial-VPN comparison and accepted a
   two-tier continuity strategy. Do not run the implemented C0 harness or ask
   the user to open a TUIC client. Its reviewed complete-interval reducer may

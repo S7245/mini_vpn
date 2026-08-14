@@ -1,5 +1,15 @@
 # Errors
 
+## 2026-08-14 - A portable tar-root check used an unescaped awk delimiter
+
+- The first archive/directory equality RED used `/^[^/]+\/$/` in a BSD `awk`
+  slash-delimited pattern. The slash inside the character class terminated the
+  pattern and the macOS runner self-test rejected valid evidence.
+- No production run or external resource changed. The repair counts `/`
+  characters explicitly and requires exactly one safe archive root directory.
+- A separate gate wrapper used zsh's read-only `status` parameter; use `rc`
+  for captured exit codes in zsh-facing commands.
+
 ## 2026-08-14 - Initial resource preflight trusted identity claims without their evidence files
 
 - The first local draft structurally validated provider/ASN, route, and

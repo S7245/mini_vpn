@@ -1,5 +1,21 @@
 # Learnings
 
+## 2026-08-14 - Long-run identity needs three-way binding, not parallel checks
+
+- A valid copied directory and a valid immutable tar SHA do not prove they
+  still describe the same bytes. Compare the complete member set and every
+  member at each decisive pre-run/final gate.
+- Exact evidence also needs an execution owner. Persist stage, candidate,
+  canonical profile hash, and result hash in root-owned state, then require
+  state, workload profile, copied evidence, archive, and live endpoint to agree.
+- JSON evidence must reject duplicate keys at every parsing seam; otherwise
+  different readers can validate different meanings from the same file.
+- Keep resource admission before full-tunnel mutation and workload
+  registration. A false rejection then costs minutes, not another long run.
+
+Result:
+`docs/tech/2026-08-14-knife15-m2-strict-resource-binding-local-results.md`.
+
 ## 2026-08-14 - Resource identity must be copied and evidence-bound before TUN ownership
 
 - A provider name, ASN, route product, or 64-character digest is only a claim.
