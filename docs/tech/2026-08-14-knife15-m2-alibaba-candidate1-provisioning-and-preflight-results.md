@@ -2,19 +2,18 @@
 
 Date: 2026-08-14
 
-Status: **RESOURCE CONFIGURATION PASS; QUALIFICATION NOT RUN; CLOUD SECURITY
-GROUP BLOCKED**
+Status: **RESOURCE AND EXTERNAL TUIC PATH PASS; QUALIFICATION NOT RUN**
 
 ## Decision
 
-Alibaba candidate 1 is materially eligible and its host/service configuration
-is ready, but it is not yet traffic-admitted. The HK Mac's UDP packets to the
-candidate's TUIC port do not reach the guest. This is an Alibaba security-group
-block, not a `mini_vpn`, sing-box, Target, Mac route, or bandwidth failure.
+Alibaba candidate 1 is materially eligible, host/service-ready, and externally
+traffic-admitted. The narrow Alibaba security-group rule now passes HK-Mac UDP
+8443 to the guest. A real no-TUN mini_vpn probe completed TUIC handshake,
+authentication, and Target Connect in `1002ms` with exit code zero.
 
-Do not start TUN or an observer until the cloud rule is fixed and the new live
-TUIC preflight passes. This invalid pre-start attempt neither passes nor
-rejects candidate 1 and consumes no Tier-A qualification slot.
+Qualification has not run. The earlier invalid pre-start attempt neither
+passes nor rejects candidate 1 and consumes no Tier-A qualification slot. Take
+one fresh qualification only from the reviewed diagnostic-preserving source.
 
 ## Exact Candidate Identity
 
@@ -84,7 +83,7 @@ and its older static resource archive SHA-256 was
 `1c7dc885958077a64a5733540d99dd33b91ea28b199a8824110120abf40e2842`.
 These are diagnostic evidence only; no qualification was run.
 
-## Selected External Blocker
+## Resolved External Blocker
 
 The first TUN `start` stopped during `tuic handshake: timed out` before TUN
 readiness. A candidate-side `tcpdump` saw zero packets while the HK Mac sent
@@ -104,11 +103,23 @@ The required cloud rule is:
 The Cloud Security Center alert about “malicious destruction of client files”
 was caused by the deliberate removal of the Aegis startup symlink for this
 dedicated test host. It explains the earlier file-operation denial, but it is
-independent of the still-closed network security-group rule.
+independent of the network security-group rule that was subsequently opened.
+
+After the narrow rule was added, candidate-side capture recorded
+`119.13.90.246 -> 172.18.188.19:8443/UDP`. The exact release probe then emitted
+one final report:
+
+```text
+tuic_tcp_sink_probe target=43.130.32.77:5201 requested_duration_secs=1 elapsed_ms=1002 bytes=0 read_mbps=0.000 reads=0 first_rx_ms=none max_read_gap_ms=0 eof=false
+```
+
+The zero payload is expected because the probe only needs handshake,
+authentication, and Connect/open ownership; its one-second Target sink does
+not run an iperf transaction.
 
 ## Local Repairs
 
-Reviewed source `0a1cf1c` closes four locally preventable invalid-run paths:
+Reviewed source `218467b` closes five locally preventable invalid-run paths:
 
 1. resource preflight now performs a real one-second TUIC handshake,
    authentication, and Connect/open probe to the exact Target before TUN;
@@ -119,10 +130,14 @@ Reviewed source `0a1cf1c` closes four locally preventable invalid-run paths:
    fail-closed behavior for any new or owned utun;
 4. the same pre-ready cleanup verifies each Target/Exit/DNS interface and
    gateway against its pre-start route snapshot. It does not require a missing
-   ownership identity, and it does not accept a merely non-utun route.
+   ownership identity, and it does not accept a merely non-utun route;
+5. the hash-bound probe stdout preserves controlled QUIC/Endpoint diagnostics
+   and requires exactly one well-formed report as its final line. Extra report
+   lines, a non-report tail, or nonempty stderr fail closed.
 
-The resource archive, root runner, and continuity ledger all require and hash
-the exact single-line handshake report plus empty stderr. Shell syntax,
+The resource archive, root runner, and continuity ledger all hash the complete
+stdout, independently require its unique final report, and require empty
+stderr. Shell syntax,
 resource-preflight self-test, complete macOS runner self-test, continuity
 ledger self-test, diff check, and credential scan pass. Code review found no
 unresolved P0/P1.
@@ -148,12 +163,10 @@ self-wake value changed.
 
 ## Exact Next Step
 
-1. Add the narrow Alibaba inbound UDP 8443 `/32` rule.
-2. Prove one packet reaches the guest, then pull the reviewed descendant of
-   `0a1cf1c` on the HK Mac.
-3. Start a fresh bounded global `caffeinate`, rebuild, and capture a fresh
+1. Pull the reviewed descendant of `218467b` on the HK Mac.
+2. Keep the fresh bounded global `caffeinate`, rebuild, and capture a fresh
    baseline/direct/profile/resource preflight. The live TUIC probe must pass.
-4. Only then run one fresh smoke, observer, and strict qualification.
+3. Only then run one fresh smoke, observer, and strict qualification.
 
 Formal run 1, formal run 2, and M3 remain blocked until the strict
 qualification is sealed as PASS.

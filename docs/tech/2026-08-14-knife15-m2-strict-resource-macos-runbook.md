@@ -2,8 +2,8 @@
 
 Date: 2026-08-14
 
-Status: **CANDIDATE 1 PROVISIONED; DO NOT START UNTIL ITS CLOUD SECURITY GROUP
-ADMITS HK-MAC UDP 8443 AND THE LIVE TUIC PROBE PASSES**
+Status: **CANDIDATE 1 NETWORK-ADMITTED; USE REVIEWED SOURCE AND TAKE ONE FRESH
+STRICT QUALIFICATION**
 
 This is the only active Knife15 Tier-A Mac procedure. The old `.33` formal M2
 runbook and market-client comparison are historical and must not be executed.
@@ -109,7 +109,7 @@ git fetch origin
 git switch codex/knife14d-downlink-reap-open
 git pull --ff-only origin codex/knife14d-downlink-reap-open
 git status --short
-git merge-base --is-ancestor 0a1cf1c HEAD && \
+git merge-base --is-ancestor 218467b HEAD && \
   echo 'PASS: strict resource source accepted'
 export TEST_SOURCE_COMMIT="$(git rev-parse HEAD)"
 

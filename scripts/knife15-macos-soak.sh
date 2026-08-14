@@ -5847,9 +5847,9 @@ EOF_FAKE_EXIT_OBSERVER
     "$observer_exit_run/m2-exit-observer-finalization.txt" || \
     die "self-test: formal M2 unexpected-exit reason missing"
   M2_EXIT_OBSERVER_SCRIPT="$original_m2_exit_observer_script"
-  ! m2_source_is_accepted 74cb1d8 || \
+  ! m2_source_is_accepted 0a1cf1c || \
     die "self-test: source without fail-closed candidate preflight was accepted"
-  m2_source_is_accepted 0a1cf1c || \
+  m2_source_is_accepted 218467b || \
     die "self-test: reviewed fail-closed candidate preflight was rejected"
   stale_release_binary="$tmp/stale-release-binary"
   cp "$BIN" "$stale_release_binary"
@@ -8275,7 +8275,7 @@ m2_real_client_envelope() {
 
 m2_source_is_accepted() {
   local revision="${1:-HEAD}"
-  git -C "$REPO" merge-base --is-ancestor 0a1cf1c "$revision" >/dev/null 2>&1
+  git -C "$REPO" merge-base --is-ancestor 218467b "$revision" >/dev/null 2>&1
 }
 
 m2_resource_result_value() {
@@ -9128,7 +9128,7 @@ run_m2_action() {
     "$M2_EXPECTED_CYCLES $M2_EXPECTED_TCP_RESULTS $M2_EXPECTED_UDP_RESULTS $M2_EXPECTED_PHASE_RESULTS" ]] || \
     die "$action_description requires the immutable formal M2 count model"
   m2_source_is_accepted || \
-    die "$action_description requires fail-closed candidate preflight 0a1cf1c or a descendant"
+    die "$action_description requires fail-closed candidate preflight 218467b or a descendant"
   m2_worktree_is_clean || \
     die "$action_description requires a clean worktree, including no untracked files, for exact-source evidence"
   run_dir="$(run_dir_from_state)" || die "no Knife15 run state"

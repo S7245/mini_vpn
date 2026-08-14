@@ -6,12 +6,12 @@
 
 #### Latest decision (2026-08-14 — strict resources first, bounded low-frequency SLI second)
 
-Candidate 1 is now provisioned and host/service-ready at Alibaba EIP
-`47.89.211.4` (AS45102). Qualification has not run: the cloud security group
-still drops HK-Mac UDP 8443 before it reaches the guest. The only external
-action is a narrow inbound UDP 8443 allow from the current HK public `/32`.
-After that rule, reviewed source `0a1cf1c` must pass its new live no-TUN TUIC
-handshake preflight before any TUN start. It also enforces a global
+Candidate 1 is now provisioned, host/service-ready, and externally
+traffic-admitted at Alibaba EIP `47.89.211.4` (AS45102). Guest capture sees the
+narrowly admitted HK-Mac UDP 8443, and a real no-TUN TUIC handshake/auth/
+Target-Connect probe passes in `1002ms`. Qualification has not run. Reviewed
+source `218467b` preserves controlled probe diagnostics while requiring one
+valid final report before TUN. It also enforces a global
 `PreventUserIdleSystemSleep` assertion and repairs exact utun plus
 interface/gateway pre-ready cleanup.
 Result:

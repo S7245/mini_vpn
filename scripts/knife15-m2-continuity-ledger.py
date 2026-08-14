@@ -23,7 +23,7 @@ LEDGER_SCHEMA = "knife15-m2-tier-a-ledger-v1"
 ATTEMPT_SCHEMA = "knife15-m2-tier-a-attempt-v1"
 RESULT_SCHEMA = "knife15-m2-tier-a-ledger-result-v1"
 SCENARIO_SCHEMA = "knife15-m2-ledger-scenario-v1"
-STRICT_RESOURCE_SOURCE_FLOOR = "0a1cf1c"
+STRICT_RESOURCE_SOURCE_FLOOR = "218467b"
 REFERENCE = {
     "candidate_id": "reference-33",
     "exit_ipv4": "43.153.32.33",

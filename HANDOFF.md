@@ -11,25 +11,28 @@
   identity/capacity gates pass. Aegis/Alibaba agents/modules and apt timers are
   inactive for the dedicated window; sing-box remains active with zero
   restarts.
-- Qualification is `NOT_RUN`. HK-Mac UDP 8443 probes produce zero guest
-  packets even after Cloud Security Center protection was disabled. Add one
-  Alibaba inbound allow rule for `UDP/8443` from the current HK public IPv4
-  only (`119.13.90.246/32` when last observed), never `0.0.0.0/0`, then require
-  the new live TUIC preflight to pass before TUN.
-- Reviewed repair `0a1cf1c` adds that no-TUN handshake/auth/Connect probe,
+- Qualification is `NOT_RUN`. The narrow inbound rule is now active: guest
+  capture sees HK-Mac UDP 8443, and a real TUIC handshake/auth/Target-Connect
+  probe passes in `1002ms`. Keep the rule limited to the current HK public
+  `/32`; do not broaden it.
+- Reviewed repair `218467b` adds that no-TUN handshake/auth/Connect probe,
   makes baseline/direct/start/qualification/formal fail closed without an
   active `PreventUserIdleSystemSleep` assertion, and permits pre-ready cleanup
   only when the utun set and Target/Exit/DNS interface+gateway match their
   pre-start snapshots. Scripts/ledger bind the exact probe evidence. Local
   shell/self-tests, diff/secret, and review
   pass with no unresolved P0/P1. No Rust or frozen value changed. Strict source
-  admission now requires `0a1cf1c` or a descendant. Result:
+  admission now requires `218467b` or a descendant. Result:
   `docs/tech/2026-08-14-knife15-m2-alibaba-candidate1-provisioning-and-preflight-results.md`.
 - Real macOS GREEN: repaired `stop` finalized the pre-ready invalid run as
   SHA-256 `228533d3...`; utun and Target/Exit/DNS restoration passed,
   `cleanup_evidence=PASS`, qualification remains `not_run`, and formal
   acceptance is `NOT_RUN`. The temporary caffeinate process is stopped and
   TUIC credential variables are unset.
+- A fresh 28-hour caffeinate is active as PID `85019`. The exact release probe
+  revealed controlled startup diagnostics before its report; reviewed source
+  preserves and hashes them while requiring one valid final report and empty
+  stderr. Pull the reviewed descendant and begin a fresh baseline.
 
 - **HK Mac is agent-operated:** use
   `ssh -i ~/.ssh/vpn xiaoou@192.168.133.109` and the clean

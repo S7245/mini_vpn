@@ -192,15 +192,15 @@ Current Knife15 summary, as of 2026-08-14:
 - Alibaba candidate 1 is provisioned as ECS `i-rj9cabfprph7x3sard3z`, EIP
   `47.89.211.4`, `us-west-1b`, AS45102. Exact host key, sing-box binary/config,
   key-only SSH, Target reachability, listener, observer lifecycle, and host
-  isolation pass. Qualification is `NOT_RUN`: the Alibaba security group drops
-  HK-Mac UDP 8443 before the guest. Allow only the current HK public `/32`,
-  then require a live TUIC preflight before TUN.
-- Reviewed `0a1cf1c` performs the no-TUN TUIC handshake/auth/Connect probe,
+  isolation pass. The narrow Alibaba rule now passes HK-Mac UDP 8443 to the
+  guest, and the real TUIC handshake/auth/Connect probe passes in `1002ms`.
+  Qualification remains `NOT_RUN`; take one fresh reviewed-source run.
+- Reviewed `218467b` performs the no-TUN TUIC handshake/auth/Connect probe,
   requires `PreventUserIdleSystemSleep` at baseline/direct/start/M2 entry, and
   makes pre-ready cleanup prove no new utun plus exact pre-start
   interface/gateway restoration. Runner and ledger hash/replay the probe.
   Local self-tests, diff/secret, and review pass; no Rust production or
-  frozen behavior changed. Strict source admission requires `0a1cf1c` or a
+  frozen behavior changed. Strict source admission requires `218467b` or a
   descendant. Result:
   `docs/tech/2026-08-14-knife15-m2-alibaba-candidate1-provisioning-and-preflight-results.md`.
 - The exact invalid pre-ready state was finalized with the repaired cleanup.
@@ -208,6 +208,11 @@ Current Knife15 summary, as of 2026-08-14:
   Target/Exit/DNS routes, `cleanup_evidence=PASS`, qualification `not_run`, and
   formal acceptance `NOT_RUN`. It consumes no ledger slot. The bounded
   caffeinate process was stopped and TUIC credential variables were unset.
+- A new bounded 28-hour caffeinate is active on the HK Mac as PID `85019`.
+  The first nested-SSH probe attempt consumed its script stdin; `ssh -n`
+  exposed the real multi-line diagnostic stdout. Reviewed source accepts
+  controlled diagnostics but requires exactly one valid final report and empty
+  stderr before TUN.
 
 - Standing HK Mac execution access is now
   `ssh -i ~/.ssh/vpn xiaoou@192.168.133.109`. The agent may build, run the

@@ -27,6 +27,14 @@
   after any remote maintenance transaction.
 - macOS does not provide GNU `timeout` by default; run bounded capture timeout
   on the Linux candidate rather than wrapping SSH with a local `timeout`.
+- The first memory-only credential probe used nested SSH without `-n`. It
+  consumed the outer stdin script after reading the remote config, returned
+  shell status zero, and emitted no report. Exit zero without the typed report
+  is not handshake evidence.
+- The initial live-probe validator required the entire stdout to be one line,
+  but the exact release binary emits controlled QUIC/Endpoint diagnostics
+  before its final report. Three trust-boundary RED/GREEN tests now preserve
+  full stdout and require exactly one valid final report plus empty stderr.
 
 No qualification or formal attempt ran, so these invalidations consumed no
 Tier-A evidence slot.

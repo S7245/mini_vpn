@@ -11,6 +11,12 @@
   A cloud security group can discard every TUIC packet before guest capture.
   Resource admission therefore needs an actual client handshake,
   authentication, and stream open from the test Mac before TUN ownership.
+- Probe evidence should preserve bounded startup diagnostics, not assume a
+  report-only stdout. Bind the complete bytes, then require exactly one typed
+  report as the final line and empty stderr at every trust boundary.
+- A nested `ssh` inside a stdin-fed remote script must use `-n`; otherwise it
+  can consume the remaining script and make an unexecuted probe look like a
+  clean shell EOF.
 - Cleanup authority differs before and after TUN readiness. If no owned utun
   identity was recorded, compare the complete pre-start/current utun sets and
   accept only an exact no-addition result. Also require current
