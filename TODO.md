@@ -23,10 +23,18 @@ The strict ledger sealed `attempt-002` as
 and emits `TIER_A_PENDING`. Do not repeat or tune candidate 1. Result:
 `docs/tech/2026-08-15-knife15-m2-strict-candidate1-formal-failure-results.md`.
 
-Next: create exactly one AWS Lightsail compute-optimized 2-vCPU/4-GiB public
-IPv4 instance in Tokyo, `ap-northeast-1`, attach a static IPv4, and return its
-nonsecret identity handoff. Candidate 2 is the final Tier-A resource. Contract:
+Candidate 2 is now created as Alibaba ECS `i-6weckus0r7voaarxz2k3`, EIP
+`8.211.176.98`, Tokyo `ap-northeast-1c`, `ecs.c8ine.large` 2-vCPU/4-GiB class,
+Ubuntu 24.04. Its out-of-band ED25519 key matches network scan and strict SSH;
+instance/image/VPC/EIP identity and no global IPv6 pass. Next: agent-owned
+service provisioning, host isolation, external TUIC/resource preflight, and
+exact qualification. Candidate 2 is the final Tier-A resource. Contract:
 `docs/tech/2026-08-15-knife15-m2-strict-candidate2-resource-selection.md`.
+
+The user explicitly substituted Alibaba Tokyo for AWS Tokyo. This candidate is
+distinct from frozen `.33` Tencent/AS132203 but shares Alibaba/AS45102 with
+candidate 1; preserve that weaker provider discrimination. A genuine quality
+failure exhausts Tier A and opens Tier B without a later AWS retry.
 
 The following candidate-1 provisioning text is historical context.
 

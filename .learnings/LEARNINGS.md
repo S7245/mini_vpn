@@ -1,5 +1,22 @@
 # Learnings
 
+## 2026-08-15 - A user-selected final candidate needs an explicit discrimination boundary
+
+- Alibaba Tokyo is eligible relative to the frozen Tencent/AS132203 reference,
+  but it shares Alibaba/AS45102 with the rejected Silicon Valley candidate.
+  Geography, instance, EIP, and measured route change; provider/ASN does not.
+- Record that reduced independence before traffic instead of inheriting the
+  superseded AWS claim. Candidate serialization and the two-candidate limit
+  still apply, so a genuine Tokyo quality failure opens Tier B rather than an
+  unbounded provider search.
+- Treat cloud-console selections as claims until guest metadata, external EIP,
+  and an out-of-band host key all agree. The first Tokyo image was Ubuntu 22.04
+  despite the 24.04 contract; pre-deployment verification prevented a multi-day
+  run on the wrong kernel/userspace.
+
+Result:
+`docs/tech/2026-08-15-knife15-m2-strict-candidate2-resource-selection.md`.
+
 ## 2026-08-15 - Separate application report granularity from wire continuity without rewriting the gate
 
 - A zero iperf3 receiver interval is authoritative for the frozen

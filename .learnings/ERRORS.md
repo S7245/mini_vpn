@@ -1,5 +1,21 @@
 # Errors
 
+## 2026-08-15 - Candidate-2 image and host-key identity had to be re-established before deployment
+
+- The first Alibaba Tokyo system disk reported Ubuntu 22.04 through both
+  `/etc/os-release` and instance metadata, although the reviewed contract
+  required Ubuntu 24.04. No service or test traffic was deployed. The system
+  disk was rebuilt and now reports the exact Ubuntu 24.04 image.
+- Rebuilding changed the ED25519 host key. The old `known_hosts` entry was not
+  accepted: the new key was first collected out of band, independently matched
+  by `ssh-keyscan`, and only then pinned through strict SSH.
+- A first local fingerprint command was rejected before execution because its
+  temporary-file trap used a disallowed `rm -f` cleanup. No host record changed.
+  The corrected feedback loop pipes `ssh-keyscan` directly to `ssh-keygen`, so
+  it needs no temporary file or cleanup command.
+- Future behavior: verify image ID, region/zone, instance type, VPC/EIP, IPv6,
+  external source IPv4, and host key before installing any acceptance service.
+
 ## 2026-08-15 - Alibaba candidate 1 failed its first formal strict run
 
 - The valid source/resource/observer-bound formal run stopped after

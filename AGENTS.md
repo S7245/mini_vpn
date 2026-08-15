@@ -218,14 +218,20 @@ Current Knife15 summary, as of 2026-08-15:
   Do not repeat, resize, tune, or change source/workload/frozen values.
   Result:
   `docs/tech/2026-08-15-knife15-m2-strict-candidate1-formal-failure-results.md`.
-- Candidate 2 is the final permitted Tier-A resource: AWS Lightsail
-  compute-optimized 2-vCPU/4-GiB with static IPv4 in Tokyo,
-  `ap-northeast-1`. It is not created yet. The user must create the exact
-  console resource and return only static IPv4, zone, names, SSH command, and
-  out-of-band ED25519 host-key fingerprint. All service provisioning,
-  admission, Mac qualification/formal execution, and evidence handling then
-  remain agent-owned. Contract:
+- Candidate 2 is the final permitted Tier-A resource: Alibaba ECS
+  `i-6weckus0r7voaarxz2k3`, `ecs.c8ine.large` 2-vCPU/4-GiB class, directly
+  attached EIP `8.211.176.98`, Tokyo `ap-northeast-1c`, Ubuntu 24.04. The
+  out-of-band ED25519 fingerprint
+  `SHA256:r7JYHgl+fH36CCVXrb7fc5ADsg1fnM9Z8j6KowZZYYM` matches `ssh-keyscan`
+  and strict SSH; instance/EIP/VPC/image metadata and no global IPv6 pass.
+  Service provisioning and traffic admission are pending and agent-owned.
+  Contract:
   `docs/tech/2026-08-15-knife15-m2-strict-candidate2-resource-selection.md`.
+- The user explicitly substituted Alibaba Tokyo for the previously reviewed
+  AWS Tokyo resource. Candidate 2 differs from frozen `.33` Tencent/AS132203,
+  but it shares Alibaba/AS45102 with rejected candidate 1; record that reduced
+  provider discrimination honestly. A genuine candidate-2 quality failure
+  exhausts Tier A and opens Tier B; it does not authorize a later AWS retry.
 
 - Alibaba candidate 1 is provisioned as ECS `i-rj9cabfprph7x3sard3z`, EIP
   `47.89.211.4`, `us-west-1b`, AS45102. Exact host key, sing-box binary/config,

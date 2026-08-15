@@ -27,12 +27,17 @@
 - Cleanup is complete: Endpoint final `61,403/0/0B`, Mac routes/DNS/TUN and
   Exit observer ownership restored, sing-box active with zero restarts,
   bounded caffeinate stopped, and TUIC credential variables unset.
-- **Only next step:** user creates the final permitted Tier-A resource from
-  the exact AWS Lightsail Tokyo compute-optimized 2-vCPU/4-GiB/static-IPv4
-  contract, then returns static IPv4, zone, resource names, SSH command, and
-  ED25519 host-key fingerprint. The agent owns every subsequent host, service,
-  preflight, Mac, observer, ledger, and cleanup operation. Contract:
+- **Only next step:** provision and traffic-admit final Tier-A candidate 2,
+  Alibaba ECS `i-6weckus0r7voaarxz2k3`, EIP `8.211.176.98`, Tokyo
+  `ap-northeast-1c`, `ecs.c8ine.large` 2-vCPU/4-GiB class, Ubuntu 24.04. The
+  out-of-band ED25519 fingerprint `SHA256:r7JYHgl+...KowZZYYM` matches the
+  network and strict SSH; image, instance, VPC/EIP, and IPv6 identity pass.
+  The agent owns service, preflight, Mac, observer, ledger, and cleanup. Contract:
   `docs/tech/2026-08-15-knife15-m2-strict-candidate2-resource-selection.md`.
+- The user explicitly substituted Alibaba Tokyo for AWS Tokyo. It differs from
+  frozen `.33` Tencent/AS132203 but shares Alibaba/AS45102 with candidate 1;
+  do not claim provider diversity between candidates. A genuine candidate-2
+  quality failure exhausts Tier A and opens Tier B, not an AWS retry.
 
 - **Latest candidate-1 position:** Alibaba ECS
   `i-rj9cabfprph7x3sard3z`, EIP `47.89.211.4`, `us-west-1b`, AS45102, and the
