@@ -6,6 +6,14 @@
 
 #### Latest decision (2026-08-15 — candidate 2 qualification passed; Formal 1 next)
 
+Formal 1 is now active in detached Mac screen `knife15_c2_formal1`. Exact Mac
+run `/tmp/mini_vpn_knife15_macos_20260815_113344` and Exit observer
+`/tmp/mini_vpn_knife15_exit_target_observer_20260815_113432` passed fresh
+direct/resource/start/smoke/observer gates and entered the 86,400-second
+schedule near `2026-08-15T11:34:32Z`. Monitor read-only; after the action,
+require automatic observer finalization plus Mac status/stop and seal the
+paired result. Do not change source, server, workload, route, or network.
+
 Exact-source `b4244a7` candidate-2 qualification pair SHA-256
 `71a61c55.../516ff6d4...` passed its complete strict envelope: baseline
 `22.809/36.695 Mbit/s`, bounded direct `11.404318 Mbit/s`, resource admission,

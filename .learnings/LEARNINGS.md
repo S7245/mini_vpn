@@ -1,5 +1,20 @@
 # Learnings
 
+## 2026-08-15 - Full self-tests require a neutral public environment
+
+- A valid production input can invalidate a harness meta-test when exported
+  too early. `M2_BASELINE_DIR` is required for formal execution, but the runner
+  self-test deliberately exercises M0/M1/M2 baseline selection and must begin
+  with all public baseline selectors unset.
+- Order the transaction as: fixed identity and archive hash checks, neutral
+  self-tests, then export and replay the exact frozen baseline immediately
+  before fresh direct/resource/formal gates. This preserves both exact-input
+  continuity and self-test isolation.
+- Read-only observer probes must pass the exact candidate `EXIT_SSH_HOST`, key,
+  Target, and ports. Invoking the observer helper with defaults checks `.33`
+  and can falsely appear to show missing Tokyo state even while all Tokyo
+  processes and counters are live.
+
 ## 2026-08-15 - Long remote qualification needs local process ownership and shell-portable evidence selection
 
 - An SSH connection can supervise setup but must not own a multi-hour Mac

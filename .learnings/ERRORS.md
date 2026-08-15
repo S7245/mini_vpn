@@ -1,5 +1,19 @@
 # Errors
 
+## 2026-08-15 - The first Formal-1 controller polluted runner self-test state
+
+- The controller verified and exported the frozen candidate-2
+  `M2_BASELINE_DIR` before invoking the complete runner self-test. The
+  self-test's direct-discriminator baseline-selection case expected to own its
+  own M0/M1/M2 selectors and failed closed before direct, TUN, or observer.
+- Cleanup restored IPv6 Automatic; screen, caffeinate, mini_vpn, observer, and
+  strict candidate ownership were absent. The attempt is environment-invalid
+  and consumes no ledger slot.
+- The corrected controller keeps public baseline selectors unset through all
+  self-tests, then exports and replays the exact frozen baseline. Formal 1
+  subsequently passed direct/resource/start/smoke/observer admission and is
+  active.
+
 ## 2026-08-15 - Three candidate-2 controller attempts failed before qualification ownership
 
 - The first wrapper used GNU `find -maxdepth` on macOS. Selection returned

@@ -4,6 +4,22 @@
 
 ## Next Planned Stage — Knife15 M2 Tiered Resource Continuity (2026-08-15)
 
+- **Formal 1 is currently active:** exact-source `b4244a7` candidate 2 is in
+  detached Mac screen `knife15_c2_formal1`. Controller log:
+  `/tmp/mini_vpn_knife15_candidate2_formal1_controller_20260815_112645.log`;
+  Mac run: `/tmp/mini_vpn_knife15_macos_20260815_113344`; Exit observer:
+  `/tmp/mini_vpn_knife15_exit_target_observer_20260815_113432`. Fresh direct
+  SHA-256 `b0600fcc...`, resource archive SHA-256 `db8508fe...`, start/smoke,
+  and observer admission passed. The 86,400-second schedule started near
+  `2026-08-15T11:34:32Z`; observer status is `active/healthy=1`, and tcpdump,
+  socket sampler, counter sampler, screen, caffeinate, TUN, and services are
+  live. Monitor read-only until result/automatic observer finalization/stop.
+- The first controller entry failed before direct/TUN because
+  `M2_BASELINE_DIR` was exported before runner self-test. IPv6 was restored and
+  no observer or candidate slot was owned. The corrected controller executes
+  self-tests with baseline variables unset, then replays the exact frozen
+  baseline. Do not stop or restart the active run for that invalid setup.
+
 - **Latest accepted position:** exact-source `b4244a7` Alibaba Tokyo
   candidate-2 qualification pair SHA-256 `71a61c55.../516ff6d4...` passed
   baseline `22.809/36.695 Mbit/s`, bounded direct `11.404318 Mbit/s`, live

@@ -189,6 +189,22 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-15:
 
+- **Formal 1 is active:** exact-source `b4244a7` candidate 2 uses controller
+  `/tmp/mini_vpn_knife15_candidate2_formal1_controller_20260815_112645.log`,
+  Mac run `/tmp/mini_vpn_knife15_macos_20260815_113344`, and Exit observer
+  `/tmp/mini_vpn_knife15_exit_target_observer_20260815_113432`. Fresh direct
+  SHA-256 is `b0600fcc...`; resource preflight archive SHA-256 is
+  `db8508fe...`. Start/smoke passed and the 86,400-second schedule began at
+  about `2026-08-15T11:34:32Z`. The observer is `active/healthy=1` with all
+  three processes live; screen, caffeinate, TUN, routes, and Exit service are
+  owned. Monitor without changing source, workload, network, or services.
+- The first Formal-1 controller entry stopped before direct/TUN because it
+  exported `M2_BASELINE_DIR` before the runner self-test and contaminated the
+  self-test's baseline-selection cases. Cleanup restored IPv6 with no TUN or
+  observer. The corrected controller runs all self-tests in a neutral
+  baseline environment and only then exports/replays the frozen candidate-2
+  baseline.
+
 - Exact-source `b4244a7` Alibaba Tokyo candidate-2 qualification pair
   SHA-256 `71a61c55.../516ff6d4...` passed baseline `22.809/36.695 Mbit/s`,
   bounded direct `11.404318 Mbit/s`, resource admission, smoke, two
