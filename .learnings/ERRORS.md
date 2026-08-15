@@ -1,5 +1,29 @@
 # Errors
 
+## 2026-08-15 - Three candidate-2 controller attempts failed before qualification ownership
+
+- The first wrapper used GNU `find -maxdepth` on macOS. Selection returned
+  empty, Bash 3.2 did not stop at the standalone compound guard, and tar wrote
+  a 29-byte junk archive. Baseline itself was valid; no TUN or candidate slot
+  was owned.
+- The second wrapper left resource-preflight `OUT_DIR` exported. The runner's
+  exact-output guard correctly rejected `start` before TUN. The runbook now
+  copies the path to `M2_RESOURCE_PREFLIGHT_DIR` and unsets the generic name.
+- The third wrapper depended on the SSH control connection, which timed out
+  during self-test. Cleanup restored IPv6 and no TUN was owned. The valid run
+  moved control into a persistent Mac `screen` session with an independent log
+  and same-TTY sudo keepalive.
+- A later generic `shasum -c manifest.txt` check failed because the Mac
+  manifest is key/value metadata, not a checksum list. Artifact hashes and
+  ledger validation remained clean; future checks must use the format's
+  owning validator.
+
+All three setup attempts are decision-neutral and consumed no strict ledger
+slot. The final exact qualification passed.
+
+Result:
+`docs/tech/2026-08-15-knife15-m2-strict-candidate2-qualification-results.md`.
+
 ## 2026-08-15 - Candidate-2 image and host-key identity had to be re-established before deployment
 
 - The first Alibaba Tokyo system disk reported Ubuntu 22.04 through both

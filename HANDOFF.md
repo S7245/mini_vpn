@@ -4,6 +4,33 @@
 
 ## Next Planned Stage — Knife15 M2 Tiered Resource Continuity (2026-08-15)
 
+- **Latest accepted position:** exact-source `b4244a7` Alibaba Tokyo
+  candidate-2 qualification pair SHA-256 `71a61c55.../516ff6d4...` passed
+  baseline `22.809/36.695 Mbit/s`, bounded direct `11.404318 Mbit/s`, live
+  resource admission, smoke, two cycles/eight phases, two DNS and two
+  real-client checks, observer, safety, and cleanup. Target receiver-zero and
+  sender-zero were zero; maximum TCP gap was `7,077,888B`; maximum UDP loss
+  was `0.145685%`.
+- Endpoint terminal ownership was `61,402/0/0B`, with zero abandon,
+  socket-would-block, and interface errors. Three `Stopped(0)` writes were
+  exact timed-transfer tails with D16 queued/leased/reserved `0/0/0B`. The
+  Exit captured `7,517,117` packets with zero kernel drops and released all
+  observer ownership. Native Quinn absorbed one PLPMTUD black-hole event;
+  there was no mini_vpn path reset, Endpoint rebind, generation replacement,
+  ordered-gap recovery, or gap-ACK reinforcement.
+- The strict ledger seals sequence 3 as `pass/strict_pass`, candidate 2 is
+  `awaiting_formal`, and Tier A remains `PENDING`. Qualification does not
+  accept Tier A. Reuse the preserved exact baseline, take a fresh direct and
+  resource preflight, then run Formal 1 under the frozen source/binary/server/
+  workload contract. A clean Formal 1 opens Formal 2; a genuine failure
+  rejects candidate 2 and exhausts Tier A. M3 remains blocked. Result:
+  `docs/tech/2026-08-15-knife15-m2-strict-candidate2-qualification-results.md`.
+- Three controller/setup failures before the valid qualification consumed no
+  ledger slot: GNU-only `find -maxdepth`, leaked `OUT_DIR`, and an SSH
+  control-link timeout. The active runbook now unsets `OUT_DIR`; remote long
+  runs must be owned by a persistent Mac terminal session plus bounded
+  same-TTY sudo keepalive and an independent controller log.
+
 - **Latest accepted position:** exact-source `b4244a7` Alibaba candidate-1
   formal pair SHA-256 `0791b4e5.../8778fe15...` ran `13h04m21s`, passed 49
   complete cycles, three idle/resume boundaries, 503 phases, every resource,

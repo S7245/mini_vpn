@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-08-15 - Long remote qualification needs local process ownership and shell-portable evidence selection
+
+- An SSH connection can supervise setup but must not own a multi-hour Mac
+  acceptance lifetime. A persistent Mac terminal multiplexer, independent
+  controller log, one interactive sudo authentication, and bounded same-TTY
+  `sudo -n -v` keepalive survived control-link loss without storing a password.
+- Evidence selectors run on the target OS. macOS BSD `find` has no GNU
+  `-maxdepth`, and Bash 3.2 compound-command `errexit` behavior is not a
+  reliable missing-result guard. Use Bash-compatible globs plus explicit
+  `if` validation before hashing or archiving.
+- Environment variables are shared API state. A generic `OUT_DIR` exported for
+  resource preflight can alter the following root runner action. Copy the
+  exact path into the typed `M2_RESOURCE_PREFLIGHT_DIR`, then immediately
+  `unset OUT_DIR`.
+- The Mac `manifest.txt` is a key/value identity record, not a checksum-list
+  input to `shasum -c`. Validate outer archives by sidecar, internal Exit
+  `SHA256SUMS` with `shasum -c`, and Mac manifest semantics with the reviewed
+  ledger.
+
+Result:
+`docs/tech/2026-08-15-knife15-m2-strict-candidate2-qualification-results.md`.
+
 ## 2026-08-15 - A user-selected final candidate needs an explicit discrimination boundary
 
 - Alibaba Tokyo is eligible relative to the frozen Tencent/AS132203 reference,

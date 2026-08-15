@@ -2,8 +2,8 @@
 
 Date: 2026-08-14
 
-Status: **CANDIDATE 1 NETWORK-ADMITTED; USE REVIEWED SOURCE AND TAKE ONE FRESH
-STRICT QUALIFICATION**
+Status: **CANDIDATE 2 STRICT QUALIFICATION PASSED; USE THE EXACT FROZEN
+CANDIDATE-2 SOURCE/BASELINE/SERVER CONTRACT AND TAKE FORMAL 1**
 
 This is the only active Knife15 Tier-A Mac procedure. The old `.33` formal M2
 runbook and market-client comparison are historical and must not be executed.
@@ -15,7 +15,12 @@ The HK Mac is now agent-operated over
 blocks. Use the clean `/Users/xiaoou/mini_vpn` clone. Do not use
 `/Users/xiaoou/Desktop/mini_vpn`: macOS Desktop privacy denies SSH access and
 that original directory remains user-owned. Privileged actions use a real SSH
-TTY and an interactive `sudo` prompt; never persist the login password.
+TTY and an interactive `sudo` prompt; never persist the login password. A
+remote agent-owned qualification or formal run must execute inside a
+persistent macOS terminal multiplexer session. Authenticate once in that TTY,
+keep the sudo timestamp alive with bounded `sudo -n -v` checks, and write a
+controller log outside the run directory. The SSH control connection is not
+the lifetime owner of a multi-hour run.
 
 ## Fixed Decision Policy
 
@@ -84,9 +89,9 @@ VPS setup and health checks do not use the Mac TUN and may be performed before
 the user session. Do not purchase or count a second candidate until the first
 candidate's ledger state is `rejected`.
 
-Candidate 1 is Alibaba Cloud ECS `i-rj9cabfprph7x3sard3z`, EIP
-`47.89.211.4`, region/zone `us-west-1/us-west-1b`, AS45102, with EIP contract
-`eip-rj9hj9g6dbtxwwxfqmw0t`. Its security group must allow inbound
+Candidate 2 is Alibaba Cloud ECS `i-6weckus0r7voaarxz2k3`, EIP
+`8.211.176.98`, region/zone `ap-northeast-1/ap-northeast-1c`, AS45102, with
+route contract `alibaba-eip-8.211.176.98`. Its security group must allow inbound
 `UDP/8443` from the current HK Mac public IPv4 `119.13.90.246/32`. Do not use
 `0.0.0.0/0`. Recheck the Mac public IPv4 immediately before changing the rule;
 if it changed, use the new exact `/32`. A local listener or successful SSH is
@@ -106,11 +111,11 @@ Open a fresh terminal:
 cd /Users/xiaoou/mini_vpn
 
 git fetch origin
-git switch codex/knife14d-downlink-reap-open
-git pull --ff-only origin codex/knife14d-downlink-reap-open
+git switch --detach b4244a7c3fb58efe9fbfc832cda402d6ed4e96d7
 git status --short
-git merge-base --is-ancestor 218467b HEAD && \
-  echo 'PASS: strict resource source accepted'
+test "$(git rev-parse HEAD)" = \
+  'b4244a7c3fb58efe9fbfc832cda402d6ed4e96d7' && \
+  echo 'PASS: exact candidate-2 source accepted'
 export TEST_SOURCE_COMMIT="$(git rev-parse HEAD)"
 
 unset M0_BASELINE_DIR M0_DIRECT_DIR M1_BASELINE_DIR M1_DIRECT_DIR
@@ -127,26 +132,27 @@ export METRICS_SECS=30
 export SAMPLE_SECS=30
 ```
 
-`git status --short` must print nothing. Keep `TEST_SOURCE_COMMIT` unchanged
-until this candidate is accepted or rejected; do not pull between its
-qualification and formal runs.
+`git status --short` must print nothing. Candidate 2 qualification fixed
+`TEST_SOURCE_COMMIT` to the exact detached commit above. Keep it unchanged
+until this candidate is accepted or rejected; do not pull or switch branches
+between qualification and formal runs.
 
 Export only the reviewed candidate values supplied by the agent:
 
 ```bash
-export M2_CANDIDATE_ID='candidate1-alibaba-usw1'
+export M2_CANDIDATE_ID='candidate2-alibaba-tokyo'
 export M2_CANDIDATE_PROVIDER='alibaba-cloud'
-export M2_CANDIDATE_RESOURCE_ID='i-rj9cabfprph7x3sard3z'
-export M2_CANDIDATE_REGION='us-west-1'
-export M2_CANDIDATE_IPV4='47.89.211.4'
+export M2_CANDIDATE_RESOURCE_ID='i-6weckus0r7voaarxz2k3'
+export M2_CANDIDATE_REGION='ap-northeast-1'
+export M2_CANDIDATE_IPV4='8.211.176.98'
 export M2_CANDIDATE_ASN='45102'
 export M2_CANDIDATE_ROUTE_CLASS='public-internet'
-export M2_CANDIDATE_ROUTE_CONTRACT_ID='eip-rj9hj9g6dbtxwwxfqmw0t'
+export M2_CANDIDATE_ROUTE_CONTRACT_ID='alibaba-eip-8.211.176.98'
 export M2_CANDIDATE_TUIC_PORT=8443
 export M2_SERVER_BINARY_SHA256='4ea794fddcb2ad84532adeab979a9b0d7b2052822bb3439dfb321c33c941da19'
-export M2_SERVER_CONFIG_SHA256='9aa397471060d1ef11afea858ee2a7550c426a2e133cfee1d2468c55425f33d8'
-export M2_PROVIDER_IDENTITY_EVIDENCE='/tmp/knife15-m2-candidate1-alibaba-usw1-provider-identity.txt'
-export M2_ROUTE_IDENTITY_EVIDENCE='/tmp/knife15-m2-candidate1-alibaba-usw1-route-identity.txt'
+export M2_SERVER_CONFIG_SHA256='0c48b68369253dfa427a953f7f05a0945a9a7023073713b2a10423390d288c40'
+export M2_PROVIDER_IDENTITY_EVIDENCE='/tmp/knife15-m2-candidate2-alibaba-tokyo-provider-identity.txt'
+export M2_ROUTE_IDENTITY_EVIDENCE='/tmp/knife15-m2-candidate2-alibaba-tokyo-route-identity.txt'
 
 export EXIT_SSH_HOST="root@$M2_CANDIDATE_IPV4"
 export EXIT_SSH_KEY="$HOME/.ssh/vpn"
@@ -274,6 +280,12 @@ entry. If the process exits or the assertion disappears, the attempt is
 environment-invalid and must not start or continue.
 
 ## 4. Candidate Workload Baseline
+
+Candidate 2 already sealed qualification with baseline directory
+`/tmp/mini_vpn_knife15_macos_baseline_20260815_102133`. Formal 1 and Formal 2
+must set that exact `M2_BASELINE_DIR`, verify it with `baseline-check`, and, if
+`/tmp` was cleared, restore its exact basename only from the read-only archive
+under `M2_EVIDENCE_HOME`. Do not execute a new baseline for candidate 2.
 
 Run this section once for the candidate's first valid qualification:
 
@@ -430,6 +442,7 @@ export OUT_DIR="/tmp/mini_vpn_knife15_resource_${M2_CANDIDATE_ID}_$(date -u '+%Y
 
 bash scripts/knife15-m2-resource-preflight.sh run
 export M2_RESOURCE_PREFLIGHT_DIR="$OUT_DIR"
+unset OUT_DIR
 ```
 
 Require `PASS: distinct Knife15 M2 resource preflight completed` and preserve

@@ -4,7 +4,32 @@
 
 ### Tiered resource continuity before an established-stream architecture decision
 
-#### Latest decision (2026-08-15 — candidate 1 rejected, final strict candidate 2 next)
+#### Latest decision (2026-08-15 — candidate 2 qualification passed; Formal 1 next)
+
+Exact-source `b4244a7` candidate-2 qualification pair SHA-256
+`71a61c55.../516ff6d4...` passed its complete strict envelope: baseline
+`22.809/36.695 Mbit/s`, bounded direct `11.404318 Mbit/s`, resource admission,
+smoke, two cycles/eight phases, DNS/real-client checks, paired observer,
+safety, and cleanup. Receiver-zero and sender-zero were zero; maximum TCP gap
+was `7,077,888B`; maximum UDP loss was `0.145685%`. Endpoint terminal
+available/live/outstanding was `61,402/0/0B`; the Exit captured `7,517,117`
+packets with zero kernel drops.
+
+The strict ledger sealed `attempt-003` as `pass/strict_pass`, marks
+`candidate2-alibaba-tokyo` `awaiting_formal`, and emits `TIER_A_PENDING`.
+Next: reuse the preserved exact qualification baseline, take one fresh direct
+and resource preflight, then run Formal 1 with the same source, release binary,
+candidate, server, observer, and workload contract. A clean Formal 1 opens
+Formal 2; a genuine quality failure rejects candidate 2 and exhausts Tier A.
+M3 remains blocked. Result:
+`docs/tech/2026-08-15-knife15-m2-strict-candidate2-qualification-results.md`.
+
+Three invalid controller attempts before qualification were decision-neutral
+and consumed no slot. The active runbook now clears resource-preflight
+`OUT_DIR`; multi-hour remote Mac execution must live in a persistent local
+terminal session with bounded same-TTY sudo keepalive and a separate log.
+
+#### Previous decision (2026-08-15 — candidate 1 rejected, final strict candidate 2 next)
 
 Exact-source `b4244a7` Alibaba candidate 1 passed qualification, then its
 first formal run failed after `13h04m21s`. It completed 49 cycles, three
@@ -72,16 +97,12 @@ Next:
 4. **DONE through source-floor closure `bcd63b4`:** write the operator runbook,
    bind/limit semantic provider and route evidence, preserve the exact
    baseline outside `/tmp`, and pass complete local review gates;
-5. **IN PROGRESS:** `.111`/`.27` and ordinary new Tencent CVM were rejected as
-   Tencent/AS132203 failure-domain equivalents. Alibaba candidate 1 is now
-   created, identity-verified, hardened, and service-ready. Add the narrow
-   inbound UDP rule, then pass the external TUIC/resource admission. AWS
-   Lightsail remains candidate-2 fallback only after a genuine candidate-1
-   quality rejection. Selection contract:
-   `docs/tech/2026-08-14-knife15-m2-strict-candidate1-resource-selection.md`;
-6. for each, run one strict qualification and, only if clean, two consecutive
-   strict 24-hour formal runs; reject the candidate on its first genuine
-   quality failure without tuning or favorable-sample repetition;
+5. **DONE:** candidate 1 was rejected by its first formal strict failure;
+   candidate 2 Alibaba Tokyo was provisioned, identity-bound, traffic-admitted,
+   and passed its one strict qualification;
+6. **IN PROGRESS:** run candidate-2 Formal 1 and, only if clean, Formal 2;
+   reject the candidate on its first genuine quality failure without tuning
+   or favorable-sample repetition;
 7. if one candidate passes twice, accept Tier A and reopen M3;
 8. only if both candidates genuinely fail, implement Tier B as a separate
    action: at most three isolated one-second episodes/rolling 24h, at most one

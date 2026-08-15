@@ -189,6 +189,33 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-15:
 
+- Exact-source `b4244a7` Alibaba Tokyo candidate-2 qualification pair
+  SHA-256 `71a61c55.../516ff6d4...` passed baseline `22.809/36.695 Mbit/s`,
+  bounded direct `11.404318 Mbit/s`, resource admission, smoke, two
+  cycles/eight phases, DNS/real-client checks, observer, safety, and cleanup.
+  Target receiver-zero and sender-zero were zero, maximum TCP gap was
+  `7,077,888B`, and maximum UDP loss was `0.145685%`.
+- Endpoint conservation was `61,440B`, terminal ownership was
+  `61,402/0/0B`, and abandon, socket would-block, and interface errors were
+  zero. Three `Stopped(0)` writes were exact timed-transfer tails with D16
+  queued/leased/reserved `0/0/0B`. The Exit captured `7,517,117` packets with
+  zero kernel drops and cleaned all observer ownership.
+- One native Quinn PLPMTUD black-hole/congestion contraction remained
+  continuous. No mini_vpn path reset, Endpoint rebind, generation replacement,
+  ordered-gap recovery, or gap-ACK reinforcement occurred. This is a clean
+  qualification, not rare-branch reachability proof.
+- The strict ledger seals `attempt-003` as `pass/strict_pass`, marks candidate
+  2 `awaiting_formal`, and emits `TIER_A_PENDING`. Reuse the preserved exact
+  qualification baseline, take a fresh direct/resource preflight, and run
+  Formal 1 under the exact source/binary/server/workload contract. Two
+  consecutive clean formal runs are still required; M3 remains blocked.
+- Three setup-controller failures before the valid run were decision-neutral:
+  GNU-only `find -maxdepth` on macOS, leaked preflight `OUT_DIR`, and an SSH
+  control-link timeout. Long agent-owned Mac runs now use a persistent local
+  terminal multiplexer, same-TTY sudo keepalive, and independent log; the
+  active runbook unsets `OUT_DIR`. Result:
+  `docs/tech/2026-08-15-knife15-m2-strict-candidate2-qualification-results.md`.
+
 - Exact-source `b4244a7` Alibaba candidate-1 formal artifact
   `/tmp/mini_vpn_knife15_macos_20260814_135029.tar.gz` (SHA-256
   `0791b4e5...`) passed baseline `23.752/51.250 Mbit/s`, bounded direct
