@@ -187,7 +187,45 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-08-14:
+Current Knife15 summary, as of 2026-08-15:
+
+- Exact-source `b4244a7` Alibaba candidate-1 formal artifact
+  `/tmp/mini_vpn_knife15_macos_20260814_135029.tar.gz` (SHA-256
+  `0791b4e5...`) passed baseline `23.752/51.250 Mbit/s`, bounded direct
+  `11.870 Mbit/s`, smoke, every preflight, 49 complete cycles, three complete
+  idle/resume boundaries, 503 phases, 49 DNS and real-client checks, safety,
+  and cleanup. Cycle 53 `short-forward-1` then produced the only complete
+  Target receiver-zero interval among 228 forward results. Formal M2 failed
+  after `13h04m21s`; M3 remains blocked.
+- Paired Exit SHA-256 `8778fe15...` captured `235,650,063` packets with zero
+  kernel drops. Exact failure-window QUIC ingress and Exit-to-Target maximum
+  gaps were only `144.568/165.236ms`; Target RTT was `1..5ms`, Exit TCP
+  retransmitted `1,371B`, and its sampled send queue was at most `5,524B`.
+  The first approximately one-second Target window carried `128,505B` raw TCP
+  payload (`128,468B` test data), `2,604B` below iperf3's `131,072B`
+  application block, so the first application
+  interval reported zero without a one-second wire blackout. The frozen
+  application-observed strict SLI still makes this a valid candidate failure.
+- Endpoint terminal conservation was `61,403/0/0B`; D16, TUN, routes, DNS,
+  process, observer, and Exit cleanup passed. Observer state/nftables ownership
+  is gone; candidate sing-box remains active with zero restarts. All bounded
+  caffeinate processes are stopped and credential variables were unset.
+- The reviewed ledger sealed sequence 2 as
+  `quality_failure/receiver_zero`. Candidate 1 is `rejected`, formal passes
+  remain zero, and evaluation status is `TIER_A_PENDING`. Immutable paired
+  evidence is under
+  `/Users/liushan/knife15-evidence/candidate1-alibaba-usw1/b4244a7c3fb58efe9fbfc832cda402d6ed4e96d7`.
+  Do not repeat, resize, tune, or change source/workload/frozen values.
+  Result:
+  `docs/tech/2026-08-15-knife15-m2-strict-candidate1-formal-failure-results.md`.
+- Candidate 2 is the final permitted Tier-A resource: AWS Lightsail
+  compute-optimized 2-vCPU/4-GiB with static IPv4 in Tokyo,
+  `ap-northeast-1`. It is not created yet. The user must create the exact
+  console resource and return only static IPv4, zone, names, SSH command, and
+  out-of-band ED25519 host-key fingerprint. All service provisioning,
+  admission, Mac qualification/formal execution, and evidence handling then
+  remain agent-owned. Contract:
+  `docs/tech/2026-08-15-knife15-m2-strict-candidate2-resource-selection.md`.
 
 - Alibaba candidate 1 is provisioned as ECS `i-rj9cabfprph7x3sard3z`, EIP
   `47.89.211.4`, `us-west-1b`, AS45102. Exact host key, sing-box binary/config,

@@ -1,10 +1,34 @@
 # TODO
 
-## Current Knife15 Plan (2026-08-14)
+## Current Knife15 Plan (2026-08-15)
 
 ### Tiered resource continuity before an established-stream architecture decision
 
-#### Latest decision (2026-08-14 — strict resources first, bounded low-frequency SLI second)
+#### Latest decision (2026-08-15 — candidate 1 rejected, final strict candidate 2 next)
+
+Exact-source `b4244a7` Alibaba candidate 1 passed qualification, then its
+first formal run failed after `13h04m21s`. It completed 49 cycles, three
+idle/resume boundaries, 503 phases, 49 DNS/real-client checks, safety, and
+cleanup before cycle 53 `short-forward-1` produced one Target receiver-zero
+interval. The paired Exit captured `235,650,063` packets with zero kernel
+drops. Failure-window QUIC/Target payload gaps were only
+`144.568/165.236ms`; the first Target window carried `128,505B` raw TCP
+payload (`128,468B` test data), just below the `131,072B` iperf3 application
+block. This is not a D16/Endpoint/TUN or
+one-second wire blackout, but it is a valid failure under the frozen
+application-observed strict SLI.
+
+The strict ledger sealed `attempt-002` as
+`quality_failure/receiver_zero`, marks `candidate1-alibaba-usw1` rejected,
+and emits `TIER_A_PENDING`. Do not repeat or tune candidate 1. Result:
+`docs/tech/2026-08-15-knife15-m2-strict-candidate1-formal-failure-results.md`.
+
+Next: create exactly one AWS Lightsail compute-optimized 2-vCPU/4-GiB public
+IPv4 instance in Tokyo, `ap-northeast-1`, attach a static IPv4, and return its
+nonsecret identity handoff. Candidate 2 is the final Tier-A resource. Contract:
+`docs/tech/2026-08-15-knife15-m2-strict-candidate2-resource-selection.md`.
+
+The following candidate-1 provisioning text is historical context.
 
 Candidate 1 is now provisioned, host/service-ready, and externally
 traffic-admitted at Alibaba EIP `47.89.211.4` (AS45102). Guest capture sees the

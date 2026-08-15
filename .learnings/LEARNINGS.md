@@ -1,5 +1,29 @@
 # Learnings
 
+## 2026-08-15 - Separate application report granularity from wire continuity without rewriting the gate
+
+- A zero iperf3 receiver interval is authoritative for the frozen
+  application-observed SLI, but it does not by itself prove a full second with
+  no TCP payload on the wire. In candidate 1's only failure, paired pcap showed
+  `128,505B` raw TCP payload (`128,468B` test data) in the first Target window
+  and packet gaps below `166ms`; the `131,072B` application read block deferred
+  reporting across the interval boundary.
+- Preserve both conclusions: reject the candidate according to the immutable
+  strict ledger, while explicitly excluding D16, Endpoint, TUN, and a
+  one-second transport blackout. Do not convert measurement granularity into
+  a speculative data-plane repair or silently omit the first interval.
+- Long-run evidence remains useful when a run stops early. The first formal
+  attempt completed 49 cycles and three idle/resume boundaries before its one
+  decisive result; paired hashes plus a clean transaction make the entire
+  `13h04m21s` useful evidence rather than lost time.
+- A resource experiment needs a hard stop. Once a valid quality failure is
+  sealed, candidate state changes to rejected and no amount of resizing,
+  tuning, or rerunning can reopen it. The next action must be the one remaining
+  independent candidate.
+
+Result:
+`docs/tech/2026-08-15-knife15-m2-strict-candidate1-formal-failure-results.md`.
+
 ## 2026-08-14 - Long remote Mac tests need process-owned wakefulness and transport-level admission
 
 - `ttyskeepawake=1` does not protect traffic started through a non-TTY SSH

@@ -1,7 +1,7 @@
 # Knife15 M2 Tiered Continuity And Resource Strategy Implementation Plan
 
-Status: **TASKS 1–5 COMPLETE THROUGH SOURCE-FLOOR CLOSURE `bcd63b4`; TASK 6
-CANDIDATE 1 SELECTED, CREATION/ADMISSION NEXT; M3 REMAINS BLOCKED**
+Status: **TASKS 1–5 COMPLETE; TASK 6 CANDIDATE 1 REJECTED BY FORMAL STRICT
+FAILURE, CANDIDATE 2 AWS CREATION NEXT; M3 REMAINS BLOCKED**
 
 > **For agentic workers:** use `diagnose` and `tdd` for each behavior change;
 > use `code-review` before requesting a long macOS run.
@@ -175,6 +175,18 @@ Lightsail is the fallback. Tencent AIA is eligible only as an explicit,
 separately contracted route. Exact creation and out-of-band host identity
 contract:
 `docs/tech/2026-08-14-knife15-m2-strict-candidate1-resource-selection.md`.
+
+Candidate 1 was subsequently admitted and passed strict qualification, then
+failed formal run 1 after `13h04m21s` on one first-interval Target
+receiver-zero. Exact paired evidence, safety, and cleanup passed; the strict
+ledger seals it as `quality_failure/receiver_zero` and marks candidate 1
+`rejected`. Do not repeat or tune it. Result:
+`docs/tech/2026-08-15-knife15-m2-strict-candidate1-formal-failure-results.md`.
+
+Candidate 2 is now selected as AWS Lightsail compute-optimized 2-vCPU/4-GiB in
+Tokyo, `ap-northeast-1`, with one directly attached static IPv4. Creation and
+identity handoff contract:
+`docs/tech/2026-08-15-knife15-m2-strict-candidate2-resource-selection.md`.
 
 **Evidence:**
 

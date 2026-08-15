@@ -1,5 +1,39 @@
 # Errors
 
+## 2026-08-15 - Alibaba candidate 1 failed its first formal strict run
+
+- The valid source/resource/observer-bound formal run stopped after
+  `13h04m21s` at cycle 53 `short-forward-1` because the Target's first complete
+  application interval reported zero bytes. All environment, safety, result,
+  and cleanup evidence passed, so the strict ledger correctly sealed a quality
+  failure and rejected candidate 1.
+- Paired pcap prevents the wrong repair: QUIC ingress and Target payload gaps
+  stayed below `166ms`, Target RTT was `1..5ms`, and `128,505B` raw TCP
+  payload (`128,468B` test data) reached the Target wire during the first
+  window. The missing application report was a `2,604B` shortfall against
+  iperf3's `131,072B` read block, not a complete wire outage or local ownership
+  regression.
+- Future behavior: do not rerun Alibaba candidate 1, do not change iperf block
+  size or first-interval semantics, and do not tune production data-plane
+  values. Preserve the exact distinction in the result and proceed only to
+  the final eligible AWS candidate.
+
+Result:
+`docs/tech/2026-08-15-knife15-m2-strict-candidate1-formal-failure-results.md`.
+
+## 2026-08-15 - A zsh scalar made a secret scan look clean after an I/O error
+
+- A docs-only gate stored newline-separated changed paths in one zsh scalar
+  and expanded it as a single argument to `rg`. `rg` correctly reported a
+  nonexistent long pathname, but the surrounding `if` treated every nonzero
+  status as “no credential match” and printed PASS.
+- No credential was written or exposed, and commit had not started. The gate
+  was rerun with an explicit path array and now accepts only `rg` status 1 as
+  “no match”; status 2 or any other error fails the transaction.
+- Future behavior: never use an undifferentiated grep/rg condition as a secret
+  gate. Preserve and classify its exit status so unreadable or missing inputs
+  cannot manufacture a clean scan.
+
 ## 2026-08-14 - Static candidate preflight missed sleep, cloud-filter, and pre-ready cleanup failures
 
 - Two 300-second direct attempts were invalidated when the agent-operated HK

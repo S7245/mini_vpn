@@ -2,7 +2,11 @@
 
 Date: 2026-08-14
 
-Status: **RESOURCE AND EXTERNAL TUIC PATH PASS; QUALIFICATION NOT RUN**
+Status: **HISTORICAL PRE-FLIGHT PASS; CANDIDATE LATER QUALIFIED AND WAS
+REJECTED BY FORMAL STRICT FAILURE**
+
+Subsequent result:
+`docs/tech/2026-08-15-knife15-m2-strict-candidate1-formal-failure-results.md`.
 
 ## Decision
 

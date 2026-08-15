@@ -2,7 +2,37 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 M2 Tiered Resource Continuity (2026-08-14)
+## Next Planned Stage — Knife15 M2 Tiered Resource Continuity (2026-08-15)
+
+- **Latest accepted position:** exact-source `b4244a7` Alibaba candidate-1
+  formal pair SHA-256 `0791b4e5.../8778fe15...` ran `13h04m21s`, passed 49
+  complete cycles, three idle/resume boundaries, 503 phases, every resource,
+  observer, safety, and cleanup gate, then failed cycle 53
+  `short-forward-1` on one Target receiver-zero interval. This is the only
+  receiver-zero among 228 forward results. Formal M2 failed; M3 is blocked.
+- Paired failure-window evidence excludes a one-second wire blackout:
+  Mac-to-Exit QUIC ingress maximum gap `144.568ms`, Exit-to-Target payload
+  maximum gap `165.236ms`, Target RTT `1..5ms`, one `1,371B` retransmission,
+  and sampled send queue at most `5,524B`. The first Target window carried
+  `128,505B` raw TCP payload (`128,468B` test data), only `2,604B` below
+  iperf3's `131,072B` application block, so
+  the first application interval reported zero. The strict
+  application-observed SLI remains frozen and therefore rejects the candidate.
+- The immutable strict ledger sealed `attempt-002` as
+  `quality_failure/receiver_zero`; candidate 1 is `rejected` with zero formal
+  passes and Tier A remains `PENDING`. Evidence root:
+  `/Users/liushan/knife15-evidence/candidate1-alibaba-usw1/b4244a7c3fb58efe9fbfc832cda402d6ed4e96d7`.
+  Do not rerun or tune Alibaba candidate 1. Result:
+  `docs/tech/2026-08-15-knife15-m2-strict-candidate1-formal-failure-results.md`.
+- Cleanup is complete: Endpoint final `61,403/0/0B`, Mac routes/DNS/TUN and
+  Exit observer ownership restored, sing-box active with zero restarts,
+  bounded caffeinate stopped, and TUIC credential variables unset.
+- **Only next step:** user creates the final permitted Tier-A resource from
+  the exact AWS Lightsail Tokyo compute-optimized 2-vCPU/4-GiB/static-IPv4
+  contract, then returns static IPv4, zone, resource names, SSH command, and
+  ED25519 host-key fingerprint. The agent owns every subsequent host, service,
+  preflight, Mac, observer, ledger, and cleanup operation. Contract:
+  `docs/tech/2026-08-15-knife15-m2-strict-candidate2-resource-selection.md`.
 
 - **Latest candidate-1 position:** Alibaba ECS
   `i-rj9cabfprph7x3sard3z`, EIP `47.89.211.4`, `us-west-1b`, AS45102, and the
