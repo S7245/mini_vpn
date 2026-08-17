@@ -252,6 +252,9 @@ eligible candidate histories.
 
 ### Task 8: Separate Tier-B epoch action and immutable ledger
 
+**Status (2026-08-17):** local implementation/review PASS at implementation
+floor `15c9e47`; source-floor closure and Task 9 operational runbook are next.
+
 **Files:**
 
 - Modify: `scripts/knife15-macos-soak.sh`

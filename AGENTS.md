@@ -204,21 +204,24 @@ Current Knife15 summary, as of 2026-08-17:
   `96e50cd2.../8a953089...` reject both candidates and emit
   `TIER_A_EXHAUSTED`. Do not add a third Tier-A VPS or reopen AWS. M3 remains
   blocked.
-- Task 7 is locally complete. `scripts/knife15-m2-frequency-summary.py`
-  enforces isolated maximal episodes, rolling six-/24-hour half-open windows,
-  matching UTC/monotonic authority, exact immutable identity, bounded
-  evidence, and no bridge across unknown periods. Missing interval/epoch,
-  invalid epoch, clock reversal, identity drift, segment/lifetime reuse, and
-  path escape fail closed. Focused self-tests, old reducers/ledger, compile,
-  diff/secret, and review pass with no unresolved P0/P1. No Rust, strict `m2`,
-  workload, transport, pool, MTU, QUIC, Endpoint, or frozen value changed.
-- Next: Task 8 TDD for a separately named `m2-frequency` action and immutable
-  epoch ledger, then Task 9 runbook/review. Require twelve valid six-hour
-  epochs and one uninterrupted four-epoch/24-hour TUN/process lifetime while
-  retaining all existing UDP/gap/DNS/real-client/ownership/observer/safety/
-  cleanup gates. Do not start a Tier-B long run before those local gates pass.
-  Result:
-  `docs/tech/2026-08-17-knife15-m2-candidate2-formal1-udp-loss-and-tier-b-reducer-local-results.md`.
+- Task 8 local implementation/review passes at implementation floor
+  `15c9e47`. The separate `m2-frequency` action requires exact Tier-A
+  exhaustion, seals one to four exact six-hour epochs, preserves complete
+  epochs after a later failed/interrupted parent, and requires twelve epochs
+  plus one uninterrupted four-epoch/24-hour process/TUN lifetime. Strict `m2`
+  rejects Tier-B inputs.
+- Only complete receiver-zero intervals may continue. UDP/gap/DNS/real-client,
+  D16/Endpoint, resource/observer, recovery, network, and cleanup gates remain
+  fail-closed. Archive replay binds exact epoch paths, source/binary/workload,
+  stable resource/server/route identity, fresh direct/resource evidence,
+  paired Exit capture, and cleanup. Full runner/observer/resource/market/
+  ledger tests, syntax/compile/diff/secret, and review pass with no unresolved
+  P0/P1. No Rust, transport, pool, MTU, QUIC, Endpoint, or frozen rate changed.
+- Next: close the source-floor commit, write/review the Task 9 detached Mac
+  runbook and best-effort completion-email controller, repeat local gates,
+  verify Mac/VPS health, then start the first four-epoch/24-hour run. M3 stays
+  blocked until twelve valid epochs pass the immutable ledger. Result:
+  `docs/tech/2026-08-17-knife15-m2-tier-b-epoch-ledger-local-results.md`.
 - For agent-owned long Mac actions, send one best-effort completion notice
   after M2/m2-frequency returns on either success or failure with
   `printf "Subject: 执行结束~" | msmtp 870941563@qq.com`. Notification status

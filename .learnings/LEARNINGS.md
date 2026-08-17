@@ -1,5 +1,26 @@
 # Learnings
 
+## 2026-08-17 - Long evidence needs stable identity separated from fresh proof
+
+- A resource profile can contain both stable identity and per-run freshness.
+  Hashing the whole profile across a multi-run ledger falsely turns a new
+  direct-preflight hash into provider/server drift. Compare stable provider,
+  route, server, endpoint, and interface fields across runs while validating
+  the full fresh profile and archive inside every run.
+- Independently sealing a child epoch is useful only if the parent terminal
+  state is modeled. Ordinary failure must publish `failed`, signal termination
+  may publish `interrupted`, and either can preserve only child epochs with an
+  exact seal event, complete paired observer coverage, and final cleanup.
+- Safe relative paths are not sufficient evidence ownership. Bind every TCP
+  result to its exact epoch directory and prohibit one Exit capture from
+  serving multiple Mac runs.
+- A 24-hour sampling-coverage ratio must scale consistently when evidence is
+  split into six-hour units. The existing 2700/2880 ratio becomes at least
+  675 samples per epoch, not an arbitrary smaller count.
+
+Result:
+`docs/tech/2026-08-17-knife15-m2-tier-b-epoch-ledger-local-results.md`.
+
 ## 2026-08-17 - Frequency evidence needs single-use continuity segments and two clocks
 
 - A rolling-window reducer cannot treat a segment label as an ordinary group

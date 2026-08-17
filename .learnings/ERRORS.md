@@ -1,5 +1,22 @@
 # Errors
 
+## 2026-08-17 - A broad patch inserted execution-mode logic into runner self-test setup
+
+- The first Task-8 wiring patch matched a repeated
+  `SOAK_CONTINUE_DATA_QUALITY=0` block and inserted an `execution_mode` check
+  inside `runner_self_test`, where that variable does not exist. Full runner
+  self-test failed immediately with an unbound-variable error; no Mac/VPS run
+  or production data plane was involved.
+- The fix removed the misplaced line and added the receiver-zero-only switch
+  under the uniquely scoped `run_m2_action` stage setup. A focused policy test
+  now proves receiver-zero continuation while UDP above `3%` still stops.
+- Future behavior: patches against long shell runners must include a unique
+  function-level context, then run `bash -n` and the complete runner self-test
+  before any operational command.
+
+Result:
+`docs/tech/2026-08-17-knife15-m2-tier-b-epoch-ledger-local-results.md`.
+
 ## 2026-08-17 - Candidate-2 Formal 1 exceeded the frozen UDP loss ceiling
 
 - The exact repaired-runner attempt passed setup, resource and observer

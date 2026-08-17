@@ -376,7 +376,7 @@ m2_mode_inputs_are_isolated() {
 
 m2_frequency_source_is_accepted() {
   local revision="${1:-HEAD}"
-  git -C "$REPO" merge-base --is-ancestor f32f624 "$revision" >/dev/null 2>&1
+  git -C "$REPO" merge-base --is-ancestor 15c9e47 "$revision" >/dev/null 2>&1
 }
 
 m2_frequency_tier_a_admission() {
@@ -6153,6 +6153,10 @@ EOF_FAKE_EXIT_OBSERVER
     die "self-test: frequency M2 rejected its explicit Tier-A admission inputs"
   M2_FREQUENCY_TIER_A_LEDGER=
   M2_FREQUENCY_TIER_A_ARTIFACT_ROOT=
+  m2_frequency_source_is_accepted HEAD || \
+    die "self-test: reviewed frequency source floor rejected HEAD"
+  ! m2_frequency_source_is_accepted 27a7ca0 || \
+    die "self-test: pre-implementation source entered frequency execution"
   m2_frequency_interrupt_run="$tmp/m2-frequency-interrupt-run"
   mkdir -p "$m2_frequency_interrupt_run/state"
   printf 'timestamp\tevent\n' >"$m2_frequency_interrupt_run/events.tsv"

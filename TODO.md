@@ -4,7 +4,7 @@
 
 ### Tiered resource continuity before an established-stream architecture decision
 
-#### Latest decision (2026-08-17 — Tier A exhausted; Task 7 PASS; Task 8 next)
+#### Latest decision (2026-08-17 — Tier A exhausted; Task 8 local PASS; Task 9 next)
 
 Candidate-2 Formal 1 is complete and rejected. Exact-source `27a7ca0`
 Mac/Exit bundles SHA-256 `0501d259.../2453a153...` passed resource admission,
@@ -21,24 +21,24 @@ candidate 2 are both rejected with zero formal passes; evaluation SHA-256
 candidate 2, resize, tune, or reopen AWS. Tier B is now active; M3 remains
 blocked.
 
-Task 7 is locally complete. `scripts/knife15-m2-frequency-summary.py` reuses
-the reviewed complete-interval parser and enforces isolated maximal episodes,
-at most one episode/rolling six hours, at most three episodes and three zero
-intervals/rolling 24 hours, exact half-open boundaries, dual UTC/monotonic
-authority, immutable identity, bounded paths/input, and no bridge across an
-unknown evidence gap. Missing interval/epoch, invalid epoch, clock reversal,
-identity drift, and evidence-segment reuse fail closed. Focused self-tests,
-the prior market reducer, Tier-A ledger replay, Python compile, diff, secret,
-and concentrated review pass with no unresolved P0/P1.
+Task 8 local implementation/review passes at source floor `15c9e47`. The
+separate `m2-frequency` action requires the exact Tier-A exhaustion pair,
+seals one to four exact six-hour epochs, preserves complete epochs across a
+later failed/interrupted parent, and accepts only twelve valid epochs with one
+uninterrupted four-epoch/24-hour process/TUN lifetime. Strict `m2` rejects
+Tier-B inputs. UDP/gap/DNS/real-client/D16/Endpoint/resource/observer/cleanup
+gates remain fail-closed; only complete receiver-zero intervals reach the
+frequency reducer.
 
-Next: Task 8 TDD for the separately named `m2-frequency` six-hour action and
-immutable epoch ledger. Strict `m2` must remain unchanged. Require twelve
-valid epochs/72 valid hours under one exact identity and one uninterrupted
-four-epoch/24-hour TUN/process lifetime while preserving all existing UDP,
-gap, DNS, real-client, D16/Endpoint/TUN, observer, safety, and cleanup gates.
-No long Mac/VPS Tier-B run starts before Task 8, Task 9 runbook, and complete
-local review pass. Result:
-`docs/tech/2026-08-17-knife15-m2-candidate2-formal1-udp-loss-and-tier-b-reducer-local-results.md`.
+Archive replay binds exact epoch paths, source/binary/workload, stable
+provider/route/server identity, fresh per-run direct/resource evidence, paired
+Exit capture, and cleanup. Full runner/observer/resource/market/ledger tests,
+compile, diff/secret, and concentrated review pass with no unresolved P0/P1.
+Next: close the reviewed source floor, write the Task 9 detached Mac runbook
+and once-only best-effort email controller, re-run local gates, check Mac/VPS
+health, then launch the first four-epoch/24-hour run. M3 remains blocked.
+Result:
+`docs/tech/2026-08-17-knife15-m2-tier-b-epoch-ledger-local-results.md`.
 
 #### Superseded decision (2026-08-17 — Formal 1 control-invalid; reviewed retry next)
 

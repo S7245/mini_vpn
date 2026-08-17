@@ -36,7 +36,7 @@ FREQUENCY_RECORD_SCHEMA = "knife15-m2-frequency-sealed-epoch-v1"
 FREQUENCY_RAW_EPOCH_SCHEMA = "knife15-m2-frequency-raw-epoch-v1"
 FREQUENCY_LEDGER_RESULT_SCHEMA = "knife15-m2-frequency-ledger-result-v1"
 FREQUENCY_SAFETY_SCHEMA = "knife15-m2-frequency-epoch-safety-v1"
-FREQUENCY_SOURCE_FLOOR = "f32f624"
+FREQUENCY_SOURCE_FLOOR = "15c9e47"
 FREQUENCY_LEDGER_FIELDS = {
     "schema",
     "tier_a_ledger_sha256",
