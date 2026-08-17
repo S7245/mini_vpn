@@ -150,9 +150,10 @@ For every run:
 9. require the fresh direct result to remain under the runner's 15-minute age
    limit when `m2-frequency` begins.
 
-Before starting the observer, require `command -v msmtp` to return an
-executable path. Missing email configuration is not a test failure, but it
-must be known before entrusting progress visibility to the completion notice.
+Before starting the observer, require `command -v msmtp` or
+`test -x /opt/homebrew/bin/msmtp` to pass and require the user's msmtp config
+to exist. Missing email configuration is not a test failure, but it must be
+known before entrusting progress visibility to the completion notice.
 
 The exact profile-generation and IPv6 procedures are sections 2–5 of
 `docs/tech/2026-08-14-knife15-m2-strict-resource-macos-runbook.md`. Do not use

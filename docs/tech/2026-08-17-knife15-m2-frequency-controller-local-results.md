@@ -33,7 +33,9 @@ controller classifies the observer as:
 
 Success, workload failure, expired sudo, notification failure/hang, active
 observer recovery, already-finalized observer, and unproved observer state are
-covered. No unresolved P0/P1 remains.
+covered. The controller also finds Homebrew `msmtp` at its absolute Apple
+Silicon or Intel prefix when a detached shell has a reduced PATH. No
+unresolved P0/P1 remains.
 
 ## Local Gates
 

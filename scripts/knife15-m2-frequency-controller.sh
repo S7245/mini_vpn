@@ -13,6 +13,15 @@ RUNNER="${KNIFE15_FREQUENCY_RUNNER:-$SCRIPT_DIR/knife15-macos-soak.sh}"
 OBSERVER="${KNIFE15_FREQUENCY_OBSERVER:-$SCRIPT_DIR/knife15-exit-target-observer.sh}"
 SUDO_BIN="${KNIFE15_FREQUENCY_SUDO_BIN:-/usr/bin/sudo}"
 MSMTP_BIN="${KNIFE15_FREQUENCY_MSMTP_BIN:-$(command -v msmtp 2>/dev/null || true)}"
+if [[ -z "$MSMTP_BIN" ]]; then
+  for msmtp_candidate in /opt/homebrew/bin/msmtp /usr/local/bin/msmtp; do
+    if [[ -x "$msmtp_candidate" ]]; then
+      MSMTP_BIN="$msmtp_candidate"
+      break
+    fi
+  done
+  unset msmtp_candidate
+fi
 NOTICE_RECIPIENT=870941563@qq.com
 
 notified=0
