@@ -19,8 +19,8 @@
   SHA-256 `96e50cd2.../8a953089...` reject both candidates and emit
   `TIER_A_EXHAUSTED`. Do not add a third Tier-A resource, retry candidate 2,
   resize, tune, or substitute AWS. M3 remains blocked.
-- **Task 8 local implementation/review passes.** Implementation floor
-  `15c9e47` adds a separate `m2-frequency` action admitted only by the exact
+- **Task 8 local implementation/review passes.** Source floor `5ca79d4` adds
+  a separate `m2-frequency` action admitted only by the exact
   Tier-A exhaustion hashes. It seals one to four exact six-hour epochs, keeps
   valid sealed epochs after a later failed/interrupted parent, and requires
   twelve epochs plus one uninterrupted four-epoch/24-hour process/TUN
@@ -36,10 +36,18 @@
   review pass with no unresolved P0/P1. No Rust, strict workload, transport,
   pool, MTU, QUIC, Endpoint, or frozen traffic value changed. Result:
   `docs/tech/2026-08-17-knife15-m2-tier-b-epoch-ledger-local-results.md`.
-- **Only next step:** close the source-floor commit, write/review the Task 9
-  detached Mac runbook and best-effort completion-email controller, repeat
-  local gates, verify Mac/VPS health, then start the first four-epoch/24-hour
-  run. M3 remains blocked until twelve valid epochs pass the immutable ledger.
+- **Task 9 local gates pass.** The detached controller maintains same-TTY sudo,
+  sends the once-only best-effort email after the action returns, always
+  attempts Mac status/snapshot/stop, and freezes/bundles a still-active Exit
+  observer after an early runner failure. Unknown observer status fails
+  closed. Root `713+3 ignored`, main `2`, integration `10+4 ignored`, release,
+  Clippy, vendored Quinn/proto/docs, shell/self-tests, provenance/secret,
+  Endpoint `240.511 Mbit/s`, D16 batch, and full-TUN gates pass. Concentrated
+  review has no unresolved P0/P1. Result:
+  `docs/tech/2026-08-17-knife15-m2-frequency-controller-local-results.md`.
+- **Only next step:** commit/push the Task-9 gate, verify Alibaba US candidate
+  1 and HK Mac health/identity, then start the first four-epoch/24-hour run.
+  M3 remains blocked until twelve valid epochs pass the immutable ledger.
 - Preserve the user-requested once-only completion notice in every detached
   long-run controller: after M2/m2-frequency returns on success or failure,
   run `printf "Subject: 执行结束~" | msmtp 870941563@qq.com`. It is

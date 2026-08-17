@@ -204,8 +204,8 @@ Current Knife15 summary, as of 2026-08-17:
   `96e50cd2.../8a953089...` reject both candidates and emit
   `TIER_A_EXHAUSTED`. Do not add a third Tier-A VPS or reopen AWS. M3 remains
   blocked.
-- Task 8 local implementation/review passes at implementation floor
-  `15c9e47`. The separate `m2-frequency` action requires exact Tier-A
+- Task 8 local implementation/review passes at source floor `5ca79d4`. The
+  separate `m2-frequency` action requires exact Tier-A
   exhaustion, seals one to four exact six-hour epochs, preserves complete
   epochs after a later failed/interrupted parent, and requires twelve epochs
   plus one uninterrupted four-epoch/24-hour process/TUN lifetime. Strict `m2`
@@ -217,11 +217,17 @@ Current Knife15 summary, as of 2026-08-17:
   paired Exit capture, and cleanup. Full runner/observer/resource/market/
   ledger tests, syntax/compile/diff/secret, and review pass with no unresolved
   P0/P1. No Rust, transport, pool, MTU, QUIC, Endpoint, or frozen rate changed.
-- Next: close the source-floor commit, write/review the Task 9 detached Mac
-  runbook and best-effort completion-email controller, repeat local gates,
-  verify Mac/VPS health, then start the first four-epoch/24-hour run. M3 stays
-  blocked until twelve valid epochs pass the immutable ledger. Result:
-  `docs/tech/2026-08-17-knife15-m2-tier-b-epoch-ledger-local-results.md`.
+- Task 9 detached-controller/runbook local gates pass. The controller keeps
+  same-TTY sudo alive, sends the requested completion email once, always
+  attempts Mac status/snapshot/stop, and recovers a still-active Exit observer
+  after an early runner failure. Unknown observer cleanup fails closed. Root
+  `713+3 ignored`, main `2`, integration `10+4 ignored`, release, Clippy,
+  vendored Quinn/proto/docs, script/syntax, provenance/secret, Endpoint
+  `240.511 Mbit/s`, D16 batch, and full-TUN gates pass with no unresolved
+  P0/P1. Next: commit/push, verify Mac/VPS health and immutable inputs, then
+  start the first Alibaba-US four-epoch run. M3 stays blocked until twelve
+  valid epochs pass the immutable ledger. Result:
+  `docs/tech/2026-08-17-knife15-m2-frequency-controller-local-results.md`.
 - For agent-owned long Mac actions, send one best-effort completion notice
   after M2/m2-frequency returns on either success or failure with
   `printf "Subject: 执行结束~" | msmtp 870941563@qq.com`. Notification status

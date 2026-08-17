@@ -1,5 +1,22 @@
 # Learnings
 
+## 2026-08-17 - Detached cleanup must own both sides of paired evidence
+
+- A Mac controller that always stops TUN can still leak remote observer
+  ownership when the runner fails after observer start but before its Exit
+  trap is armed. Detached ownership spans Mac and Exit, not just the process
+  that produced the workload status.
+- Cleanup should classify remote state. Active observers need freeze/bundle,
+  inactive observers need bundle, exact absent state represents an already
+  published bundle, and an unproved state must fail closed.
+- A user notification is an orthogonal side effect. Send it once after the
+  workload returns with a hard deadline; never let failure or a hung mail
+  transport rewrite evidence or prevent status/snapshot/stop and
+  paired-observer cleanup.
+
+Result:
+`docs/tech/2026-08-17-knife15-m2-frequency-controller-local-results.md`.
+
 ## 2026-08-17 - Long evidence needs stable identity separated from fresh proof
 
 - A resource profile can contain both stable identity and per-run freshness.

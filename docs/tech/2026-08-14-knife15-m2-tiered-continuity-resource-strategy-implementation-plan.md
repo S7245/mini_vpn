@@ -252,8 +252,9 @@ eligible candidate histories.
 
 ### Task 8: Separate Tier-B epoch action and immutable ledger
 
-**Status (2026-08-17):** local implementation/review PASS at implementation
-floor `15c9e47`; source-floor closure and Task 9 operational runbook are next.
+**COMPLETE locally.** Implementation commit `15c9e47` plus source-floor
+closure `5ca79d4` pass the complete script/replay review. Result:
+`docs/tech/2026-08-17-knife15-m2-tier-b-epoch-ledger-local-results.md`.
 
 **Files:**
 
@@ -284,10 +285,14 @@ floor `15c9e47`; source-floor closure and Task 9 operational runbook are next.
 
 ### Task 9: Tier-B review, HITL run, and architecture stop
 
+**Status (2026-08-17):** detached-controller and runbook local gates PASS;
+environment admission and the first four-epoch run are next.
+
 **Files:**
 
-- Create: `docs/tech/2026-08-14-knife15-m2-frequency-macos-runbook.md`
-- Create after evidence: `docs/tech/2026-08-14-knife15-m2-frequency-results.md`
+- Create: `scripts/knife15-m2-frequency-controller.sh`
+- Create: `docs/tech/2026-08-17-knife15-m2-frequency-macos-runbook.md`
+- Create after evidence: `docs/tech/2026-08-17-knife15-m2-frequency-results.md`
 
 **Steps:**
 

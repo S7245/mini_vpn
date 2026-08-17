@@ -4,7 +4,7 @@
 
 ### Tiered resource continuity before an established-stream architecture decision
 
-#### Latest decision (2026-08-17 — Tier A exhausted; Task 8 local PASS; Task 9 next)
+#### Latest decision (2026-08-17 — Tier A exhausted; Task 9 local PASS; environment admission next)
 
 Candidate-2 Formal 1 is complete and rejected. Exact-source `27a7ca0`
 Mac/Exit bundles SHA-256 `0501d259.../2453a153...` passed resource admission,
@@ -21,7 +21,7 @@ candidate 2 are both rejected with zero formal passes; evaluation SHA-256
 candidate 2, resize, tune, or reopen AWS. Tier B is now active; M3 remains
 blocked.
 
-Task 8 local implementation/review passes at source floor `15c9e47`. The
+Task 8 local implementation/review passes at source floor `5ca79d4`. The
 separate `m2-frequency` action requires the exact Tier-A exhaustion pair,
 seals one to four exact six-hour epochs, preserves complete epochs across a
 later failed/interrupted parent, and accepts only twelve valid epochs with one
@@ -32,13 +32,19 @@ frequency reducer.
 
 Archive replay binds exact epoch paths, source/binary/workload, stable
 provider/route/server identity, fresh per-run direct/resource evidence, paired
-Exit capture, and cleanup. Full runner/observer/resource/market/ledger tests,
-compile, diff/secret, and concentrated review pass with no unresolved P0/P1.
-Next: close the reviewed source floor, write the Task 9 detached Mac runbook
-and once-only best-effort email controller, re-run local gates, check Mac/VPS
-health, then launch the first four-epoch/24-hour run. M3 remains blocked.
-Result:
-`docs/tech/2026-08-17-knife15-m2-tier-b-epoch-ledger-local-results.md`.
+Exit capture, and cleanup. Task 9 now also has a reviewed detached controller
+and exact macOS runbook. The controller maintains same-TTY sudo ownership,
+sends the requested best-effort completion email once, always attempts Mac
+status/snapshot/stop, and recovers an observer started before runner ownership
+was armed. Unknown observer cleanup fails closed.
+
+Root `713+3 ignored`, main `2`, integration `10+4 ignored`, release, Clippy,
+vendored Quinn/proto/docs, script self-tests, syntax, provenance, diff/secret,
+Endpoint `240.511 Mbit/s`, D16 batch, and full-TUN gates pass. Concentrated
+review has no unresolved P0/P1. Next: commit/push the Task-9 gate, verify
+Mac/VPS health and immutable inputs, then launch the first four-epoch/24-hour
+run. M3 remains blocked. Result:
+`docs/tech/2026-08-17-knife15-m2-frequency-controller-local-results.md`.
 
 #### Superseded decision (2026-08-17 — Formal 1 control-invalid; reviewed retry next)
 

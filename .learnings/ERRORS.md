@@ -1,5 +1,22 @@
 # Errors
 
+## 2026-08-17 - Two exploratory Rust gates had invalid provenance or zero tests
+
+- Running the vendored Quinn manifest directly selected registry
+  `quinn-proto` because the independent manifest does not inherit the root
+  patch. The missing fork APIs were a command-provenance failure, not a code
+  regression. The accepted gate used an explicit absolute local proto patch
+  and verified Cargo metadata.
+- Initial exact release filters omitted the real `quic::path_probe` module
+  path and the `harness` feature, so each reported zero tests. Those outputs
+  were rejected; listing names first and rerunning nonzero exact tests produced
+  Endpoint `240.511 Mbit/s` plus passing D16 batch/full-TUN results.
+- Future behavior: a Rust gate is not evidence unless dependency provenance
+  is local and the intended test count is nonzero.
+
+Result:
+`docs/tech/2026-08-17-knife15-m2-frequency-controller-local-results.md`.
+
 ## 2026-08-17 - A broad patch inserted execution-mode logic into runner self-test setup
 
 - The first Task-8 wiring patch matched a repeated
