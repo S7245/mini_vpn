@@ -1,5 +1,24 @@
 # Errors
 
+## 2026-08-17 - Candidate-2 Formal 1 false-failed at a live-log checkpoint boundary
+
+- The run completed 17 cycles and a full 600-second `idle-1`; a fresh sample
+  at the idle boundary proved mini_vpn, routes, interface, and probes healthy.
+  Four seconds later the runner failed with no checkpoint row and no health,
+  phase, timeout, or interrupt event.
+- The checkpoint parsed `mini_vpn.log` while it was being appended. The
+  data-plane envelope required complete numeric fields, but replay counted a
+  bare `📊 数据面:` tail and classified partial lifecycle EOF records as
+  invalid. Active-lease parsing could likewise let an empty tail hide the
+  latest numeric record. Completed archive replay was therefore clean.
+- Future behavior: use shared complete-record authority, preserve a RED for
+  incomplete EOF and a fail-closed test for completed malformed records, and
+  never attribute a header-only checkpoint failure to the VPS or data plane
+  before replaying the exact boundary.
+
+Result:
+`docs/tech/2026-08-17-knife15-m2-candidate2-formal1-control-failure-local-results.md`.
+
 ## 2026-08-15 - The first Formal-1 controller polluted runner self-test state
 
 - The controller verified and exported the frozen candidate-2

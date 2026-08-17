@@ -187,17 +187,38 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-08-15:
+Current Knife15 summary, as of 2026-08-17:
 
-- **Formal 1 is active:** exact-source `b4244a7` candidate 2 uses controller
+- **Formal 1 is not active.** Candidate-2 Formal-1 pair SHA-256
+  `5d26e42d.../d6e1dad8...` completed 17 cycles and the active portion of
+  cycle 18, then false-failed after the healthy 600-second `idle-1` boundary
+  but before its first checkpoint row. Completed receiver-zero was zero,
+  maximum UDP loss was `0.561407%`, Exit capture was `64,792,664` packets with
+  zero kernel drops, and cleanup passed. This is invalid evidence, not a
+  candidate rejection; sequence 3 remains `awaiting_formal/TIER_A_PENDING`.
+- Reviewed runner SHA-256 `8b0d0c9e...` makes correlated live-log readers use
+  complete-record authority and defers only syntactically incomplete EOF
+  records; completed malformed records remain fail-closed. The ledger bridges
+  only exact runner hashes `c55dc940.../8b0d0c9e...` with the exact Mac release
+  SHA-256 `5e946af2...`. No Rust, workload, server, resource, observer, or
+  frozen value changed. Local script/ledger/resource/observer/shell/Python/
+  diff/secret/replay/review gates pass with no unresolved P0/P1.
+- Candidate Exit precheck passes exact identity/service/config/listener,
+  observer absence, clock/capacity, and Target path. Its prior shutdown was a
+  deliberate ACPI power action. Next: commit/push, sync/build on the HK Mac,
+  isolate bounded VPS maintenance, take fresh direct/resource evidence, and
+  run a fresh Formal 1. Result:
+  `docs/tech/2026-08-17-knife15-m2-candidate2-formal1-control-failure-local-results.md`.
+
+- **Historical superseded status:** exact-source `b4244a7` candidate 2 used controller
   `/tmp/mini_vpn_knife15_candidate2_formal1_controller_20260815_112645.log`,
   Mac run `/tmp/mini_vpn_knife15_macos_20260815_113344`, and Exit observer
   `/tmp/mini_vpn_knife15_exit_target_observer_20260815_113432`. Fresh direct
   SHA-256 is `b0600fcc...`; resource preflight archive SHA-256 is
   `db8508fe...`. Start/smoke passed and the 86,400-second schedule began at
-  about `2026-08-15T11:34:32Z`. The observer is `active/healthy=1` with all
-  three processes live; screen, caffeinate, TUN, routes, and Exit service are
-  owned. Monitor without changing source, workload, network, or services.
+  about `2026-08-15T11:34:32Z`. The observer was `active/healthy=1` during
+  execution; screen, caffeinate, TUN, routes, observer, and Exit ownership are
+  now cleaned.
 - The first Formal-1 controller entry stopped before direct/TUN because it
   exported `M2_BASELINE_DIR` before the runner self-test and contaminated the
   self-test's baseline-selection cases. Cleanup restored IPv6 with no TUN or
@@ -223,7 +244,8 @@ Current Knife15 summary, as of 2026-08-15:
 - The strict ledger seals `attempt-003` as `pass/strict_pass`, marks candidate
   2 `awaiting_formal`, and emits `TIER_A_PENDING`. Reuse the preserved exact
   qualification baseline, take a fresh direct/resource preflight, and run
-  Formal 1 under the exact source/binary/server/workload contract. Two
+  Formal 1 under the exact reviewed runner bridge plus frozen binary/server/
+  workload contract. Two
   consecutive clean formal runs are still required; M3 remains blocked.
 - Three setup-controller failures before the valid run were decision-neutral:
   GNU-only `find -maxdepth` on macOS, leaked preflight `OUT_DIR`, and an SSH

@@ -2,23 +2,36 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 M2 Tiered Resource Continuity (2026-08-15)
+## Next Planned Stage — Knife15 M2 Tiered Resource Continuity (2026-08-17)
 
-- **Formal 1 is currently active:** exact-source `b4244a7` candidate 2 is in
-  detached Mac screen `knife15_c2_formal1`. Controller log:
-  `/tmp/mini_vpn_knife15_candidate2_formal1_controller_20260815_112645.log`;
-  Mac run: `/tmp/mini_vpn_knife15_macos_20260815_113344`; Exit observer:
-  `/tmp/mini_vpn_knife15_exit_target_observer_20260815_113432`. Fresh direct
-  SHA-256 `b0600fcc...`, resource archive SHA-256 `db8508fe...`, start/smoke,
-  and observer admission passed. The 86,400-second schedule started near
-  `2026-08-15T11:34:32Z`; observer status is `active/healthy=1`, and tcpdump,
-  socket sampler, counter sampler, screen, caffeinate, TUN, and services are
-  live. Monitor read-only until result/automatic observer finalization/stop.
-- The first controller entry failed before direct/TUN because
-  `M2_BASELINE_DIR` was exported before runner self-test. IPv6 was restored and
-  no observer or candidate slot was owned. The corrected controller executes
-  self-tests with baseline variables unset, then replays the exact frozen
-  baseline. Do not stop or restart the active run for that invalid setup.
+- **Formal 1 is not active.** Exact-source `b4244a7` candidate-2 Formal 1
+  bundles SHA-256 `5d26e42d.../d6e1dad8...` completed 17 cycles plus the
+  active portion of cycle 18, then failed between the healthy end of the first
+  600-second idle window and its first checkpoint row. All completed
+  receiver-zero counts were zero, maximum UDP loss was `0.561407%`, the Exit
+  captured `64,792,664` packets with zero kernel drops, and cleanup passed.
+  This is invalid evidence, not a candidate quality failure; the ledger stays
+  at sequence 3 with candidate 2 `awaiting_formal`, zero formal passes, and
+  `TIER_A_PENDING`.
+- Root cause is concurrent append parsing in the evidence runner. The old
+  envelope ignored an incomplete `📊 数据面:` tail while replay counted it;
+  incomplete replay lifecycle and active-lease EOF records had the same false
+  mismatch risk. Reviewed local RED/GREEN now uses complete-record authority
+  and preserves fail-closed handling once a malformed record is proved
+  complete. Repaired runner SHA-256 is `8b0d0c9e...`; no Rust, binary behavior,
+  workload, server, observer, resource, or frozen value changed.
+- The strict ledger permits only the exact qualified/repaired runner pair with
+  Mac release SHA-256 `5e946af2...` as one evidence-reader compatibility
+  class. Arbitrary source/runner/binary drift still fails. Runner, resource
+  profile/preflight, ledger, observer, shell, Python, diff, secret, existing
+  ledger replay, and focused review pass with no unresolved P0/P1.
+- Candidate Exit precheck passes exact identity, service/config hashes, UDP
+  8443 listener, clean observer ownership, capacity, clock, and Target path.
+  Its previous shutdown was an explicit ACPI power action, not a crash. Before
+  retry: commit/push, sync/build on the HK Mac, prove exact release hash,
+  disable bounded-window automatic maintenance, take fresh direct/resource
+  evidence, and launch a fresh Formal 1. Result:
+  `docs/tech/2026-08-17-knife15-m2-candidate2-formal1-control-failure-local-results.md`.
 
 - **Latest accepted position:** exact-source `b4244a7` Alibaba Tokyo
   candidate-2 qualification pair SHA-256 `71a61c55.../516ff6d4...` passed
@@ -37,8 +50,8 @@
 - The strict ledger seals sequence 3 as `pass/strict_pass`, candidate 2 is
   `awaiting_formal`, and Tier A remains `PENDING`. Qualification does not
   accept Tier A. Reuse the preserved exact baseline, take a fresh direct and
-  resource preflight, then run Formal 1 under the frozen source/binary/server/
-  workload contract. A clean Formal 1 opens Formal 2; a genuine failure
+  resource preflight, then run Formal 1 under the reviewed runner bridge and
+  frozen binary/server/workload contract. A clean Formal 1 opens Formal 2; a genuine failure
   rejects candidate 2 and exhausts Tier A. M3 remains blocked. Result:
   `docs/tech/2026-08-15-knife15-m2-strict-candidate2-qualification-results.md`.
 - Three controller/setup failures before the valid qualification consumed no

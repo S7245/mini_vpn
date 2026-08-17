@@ -1261,14 +1261,27 @@ tcp_pool_latest_active_leases() {
   local log_file="$1"
   [[ -f "$log_file" ]] || return 1
   awk '
+    {
+      if (deferred_empty) {
+        malformed = 1
+        deferred_empty = 0
+      }
+    }
     /tuic-tcp-pool-activity active_leases=/ {
       value = $0
       sub(/^.*tuic-tcp-pool-activity active_leases=/, "", value)
-      latest = value
-      found = 1
+      if (value ~ /^[0-9]+$/) {
+        latest = value
+        found = 1
+        malformed = 0
+      } else if (value != "") {
+        malformed = 1
+      } else {
+        deferred_empty = 1
+      }
     }
     END {
-      if (!found) exit 1
+      if (!found || malformed) exit 1
       print latest
     }
   ' "$log_file"
@@ -1891,6 +1904,12 @@ m2_controlled_tcp_replay_envelope() {
   awk -v controlled_one="$controlled_one" \
     -v controlled_two="$controlled_two" \
     -v controlled_three="$controlled_three" '
+    {
+      if (deferred_syntax_invalid) {
+        invalid += deferred_syntax_invalid
+        deferred_syntax_invalid = 0
+      }
+    }
     /tuic-open-tcp target=/ {
       target = $0
       sub(/^.*tuic-open-tcp target=/, "", target)
@@ -1902,7 +1921,7 @@ m2_controlled_tcp_replay_envelope() {
       sub(/^.* epoch=/, "", epoch)
       sub(/ .*/, "", epoch)
       if (target == "" || handle !~ /^[0-9]+$/ || epoch !~ /^[0-9]+$/) {
-        invalid++
+        deferred_syntax_invalid++
         next
       }
       key = handle SUBSEP epoch
@@ -1922,8 +1941,11 @@ m2_controlled_tcp_replay_envelope() {
       sub(/^.* epoch=/, "", epoch)
       sub(/ .*/, "", epoch)
       key = handle SUBSEP epoch
-      if (handle !~ /^[0-9]+$/ || epoch !~ /^[0-9]+$/ ||
-          !(key in pending_target) || handle in active_target) {
+      if (handle !~ /^[0-9]+$/ || epoch !~ /^[0-9]+$/) {
+        deferred_syntax_invalid++
+        next
+      }
+      if (!(key in pending_target) || handle in active_target) {
         invalid++
         next
       }
@@ -1943,8 +1965,11 @@ m2_controlled_tcp_replay_envelope() {
       sub(/^.*迟到 open 结果\(epoch /, "", epoch)
       sub(/≠.*/, "", epoch)
       key = handle SUBSEP epoch
-      if (handle !~ /^[0-9]+$/ || epoch !~ /^[0-9]+$/ ||
-          !(key in pending_target)) {
+      if (handle !~ /^[0-9]+$/ || epoch !~ /^[0-9]+$/) {
+        deferred_syntax_invalid++
+        next
+      }
+      if (!(key in pending_target)) {
         invalid++
         next
       }
@@ -1956,7 +1981,7 @@ m2_controlled_tcp_replay_envelope() {
       sub(/^.*tcp-lifecycle-transition handle=SocketHandle\(/, "", handle)
       sub(/\).*/, "", handle)
       if (handle !~ /^[0-9]+$/) {
-        invalid++
+        deferred_syntax_invalid++
         next
       }
       if (handle in active_target) {
@@ -1972,7 +1997,7 @@ m2_controlled_tcp_replay_envelope() {
       sub(/^.*tcp-handle-close handle=SocketHandle\(/, "", handle)
       sub(/\).*/, "", handle)
       if (handle !~ /^[0-9]+$/) {
-        invalid++
+        deferred_syntax_invalid++
         next
       }
       if (handle in active_target) {
@@ -1998,7 +2023,7 @@ m2_controlled_tcp_replay_envelope() {
       }
       next
     }
-    /📊 数据面:/ {
+    /📊 数据面: DNS forge=[0-9]+\/drop=[0-9]+ \| TCP relay 活跃=[0-9]+\/累计=[0-9]+ \| fake-IP 活跃=[0-9]+\/在册=[0-9]+/ {
       samples++
       replayed = 0
       controlled_active = 0
@@ -4038,10 +4063,45 @@ EOF_M2_FAKE_CURL
     >>"$tmp/tcp-pool-activity.log"
   tcp_pool_activity_is_idle "$tmp/tcp-pool-activity.log" || \
     die "self-test: exact zero TCP-pool ownership was rejected"
+  printf '%s' '🔎 tuic-tcp-pool-activity active_leases=' \
+    >>"$tmp/tcp-pool-activity.log"
+  tcp_pool_activity_is_idle "$tmp/tcp-pool-activity.log" || \
+    die "self-test: incomplete TCP-pool tail hid the latest complete ownership"
+  printf '\n%s\n' 'ordinary log line' >>"$tmp/tcp-pool-activity.log"
+  ! tcp_pool_activity_is_idle "$tmp/tcp-pool-activity.log" || \
+    die "self-test: completed empty TCP-pool record did not fail closed"
   printf '%s\n' '🔎 tuic-tcp-pool-activity active_leases=unknown' \
     >"$tmp/tcp-pool-activity.log"
   ! tcp_pool_activity_is_idle "$tmp/tcp-pool-activity.log" || \
     die "self-test: malformed TCP-pool activity evidence was accepted as idle"
+
+  printf '%s\n' \
+    '📊 数据面: DNS forge=1/drop=0 | TCP relay 活跃=0/累计=0 | fake-IP 活跃=0/在册=0 | UDP↓丢=0 背压=0 | UDP↑丢=0 stream兜底=0 | leg=-' \
+    '📊 数据面:' \
+    >"$tmp/partial-data-plane.log"
+  [[ "$(m2_data_plane_envelope "$tmp/partial-data-plane.log" | awk '{print $1}')" == "1" ]] || \
+    die "self-test: complete data-plane sample fixture mismatch"
+  [[ "$(m2_controlled_tcp_replay_envelope \
+    "$tmp/partial-data-plane.log" one.example:443 two.example:443 \
+    three.example:443 | awk '{print $1}')" == "1" ]] || \
+    die "self-test: partial data-plane tail was counted as a replay sample"
+
+  printf '%s\n' \
+    '📊 数据面: DNS forge=1/drop=0 | TCP relay 活跃=0/累计=0 | fake-IP 活跃=0/在册=0 | UDP↓丢=0 背压=0 | UDP↑丢=0 stream兜底=0 | leg=-' \
+    >"$tmp/partial-replay-event.log"
+  printf '%s' '🔎 tuic-open-tcp target=one.example:443' \
+    >>"$tmp/partial-replay-event.log"
+  [[ "$(m2_controlled_tcp_replay_envelope \
+    "$tmp/partial-replay-event.log" one.example:443 two.example:443 \
+    three.example:443 | awk '{print $4}')" == "0" ]] || \
+    die "self-test: incomplete replay event tail was classified as invalid"
+  printf '\n%s\n' \
+    '📊 数据面: DNS forge=2/drop=0 | TCP relay 活跃=0/累计=0 | fake-IP 活跃=0/在册=0 | UDP↓丢=0 背压=0 | UDP↑丢=0 stream兜底=0 | leg=-' \
+    >>"$tmp/partial-replay-event.log"
+  [[ "$(m2_controlled_tcp_replay_envelope \
+    "$tmp/partial-replay-event.log" one.example:443 two.example:443 \
+    three.example:443 | awk '{print $4}')" == "1" ]] || \
+    die "self-test: completed malformed replay event did not fail closed"
 
   baseline_dir="$tmp/baseline"
   mkdir "$baseline_dir"

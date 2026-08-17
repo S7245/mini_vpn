@@ -1,5 +1,23 @@
 # Learnings
 
+## 2026-08-17 - Live append-only evidence needs shared complete-record authority
+
+- Parsing the same live log with different record-completion predicates can
+  manufacture a transient invariant failure that disappears in the finalized
+  archive. At a checkpoint, every correlated reader must either use one
+  immutable snapshot or accept exactly the same complete prefix.
+- EOF syntax failure is ambiguous while the writer is alive. Defer only the
+  syntactic invalidity of the final incomplete record; if any later record
+  arrives, the earlier malformed record is proved complete and must fail
+  closed. Semantic lifecycle contradictions remain immediately invalid.
+- A valid qualification should not be discarded for an evidence-reader-only
+  repair, but source immutability must not be broadly relaxed. Bind a narrow
+  compatibility bridge to exact old/new runner hashes plus the exact release
+  binary, workload, resource, server, observer, and helper identities.
+
+Result:
+`docs/tech/2026-08-17-knife15-m2-candidate2-formal1-control-failure-local-results.md`.
+
 ## 2026-08-15 - Full self-tests require a neutral public environment
 
 - A valid production input can invalidate a harness meta-test when exported

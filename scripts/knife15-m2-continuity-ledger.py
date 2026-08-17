@@ -107,6 +107,13 @@ SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
 COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 IPV4_RE = re.compile(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}\Z")
 BUNDLE_RE = re.compile(r"mini_vpn_knife15_[A-Za-z0-9._-]+\.tar\.gz\Z")
+CHECKPOINT_READER_BRIDGE_BINARY_SHA256 = (
+    "5e946af25ac05e74fa54d607fe4a67d7b22a1305c3b0a2e042fffb3d3cbf3032"
+)
+CHECKPOINT_READER_BRIDGE_RUNNERS = {
+    "c55dc940d974539f98e2f449387159965972249dcda476fad451c44d3466e192",
+    "8b0d0c9ed220075481f4459dbfbde7d8ef88738d9ca6f2afc802b65d96f25a86",
+}
 RESOURCE_IDENTITY_FIELDS = (
     "provider",
     "resource_id",
@@ -1185,15 +1192,22 @@ def validate_attempt(
     return attempt
 
 
+def source_runner_contract(attempt: dict[str, Any]) -> tuple[str, ...]:
+    if (
+        attempt["binary_sha256"] == CHECKPOINT_READER_BRIDGE_BINARY_SHA256
+        and attempt["runner_sha256"] in CHECKPOINT_READER_BRIDGE_RUNNERS
+    ):
+        return ("checkpoint-reader-complete-tail-v1",)
+    return ("exact", attempt["source_commit"], attempt["runner_sha256"])
+
+
 def candidate_contract(attempt: dict[str, Any]) -> tuple[Any, ...]:
     return tuple(
         attempt[field]
         for field in (
             "candidate_id",
             "resource_identity_sha256",
-            "source_commit",
             "binary_sha256",
-            "runner_sha256",
             "resource_profile_helper_sha256",
             "resource_preflight_runner_sha256",
             "workload_contract_sha256",
@@ -1205,7 +1219,7 @@ def candidate_contract(attempt: dict[str, Any]) -> tuple[Any, ...]:
             "target_ipv4",
             "target_iperf_port",
         )
-    )
+    ) + (source_runner_contract(attempt),)
 
 
 def evaluate(
@@ -2183,6 +2197,35 @@ def self_test() -> None:
             pass
         else:
             raise AssertionError("candidate contract drift was accepted")
+
+        runner_bridge = json.loads(canonical_json(ledgers["one-formal-pass.json"]))
+        runner_bridge["attempts"][0]["source_commit"] = "1" * 40
+        runner_bridge["attempts"][0]["binary_sha256"] = (
+            "5e946af25ac05e74fa54d607fe4a67d7b22a1305c3b0a2e042fffb3d3cbf3032"
+        )
+        runner_bridge["attempts"][0]["runner_sha256"] = (
+            "c55dc940d974539f98e2f449387159965972249dcda476fad451c44d3466e192"
+        )
+        runner_bridge["attempts"][1]["source_commit"] = "2" * 40
+        runner_bridge["attempts"][1]["binary_sha256"] = (
+            "5e946af25ac05e74fa54d607fe4a67d7b22a1305c3b0a2e042fffb3d3cbf3032"
+        )
+        runner_bridge["attempts"][1]["runner_sha256"] = (
+            "8b0d0c9ed220075481f4459dbfbde7d8ef88738d9ca6f2afc802b65d96f25a86"
+        )
+        evaluate(runner_bridge, artifact_root, verify_contents=False)
+
+        wrong_binary_bridge = json.loads(canonical_json(runner_bridge))
+        for attempt in wrong_binary_bridge["attempts"]:
+            attempt["binary_sha256"] = "8" * 64
+        try:
+            evaluate(wrong_binary_bridge, artifact_root, verify_contents=False)
+        except LedgerError:
+            pass
+        else:
+            raise AssertionError(
+                "checkpoint reader bridge accepted a different release binary"
+            )
 
         duplicate_resource = json.loads(
             canonical_json(ledgers["two-rejected-candidates.json"])

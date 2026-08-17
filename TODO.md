@@ -1,18 +1,32 @@
 # TODO
 
-## Current Knife15 Plan (2026-08-15)
+## Current Knife15 Plan (2026-08-17)
 
 ### Tiered resource continuity before an established-stream architecture decision
 
-#### Latest decision (2026-08-15 — candidate 2 qualification passed; Formal 1 next)
+#### Latest decision (2026-08-17 — Formal 1 control-invalid; reviewed retry next)
 
-Formal 1 is now active in detached Mac screen `knife15_c2_formal1`. Exact Mac
-run `/tmp/mini_vpn_knife15_macos_20260815_113344` and Exit observer
-`/tmp/mini_vpn_knife15_exit_target_observer_20260815_113432` passed fresh
-direct/resource/start/smoke/observer gates and entered the 86,400-second
-schedule near `2026-08-15T11:34:32Z`. Monitor read-only; after the action,
-require automatic observer finalization plus Mac status/stop and seal the
-paired result. Do not change source, server, workload, route, or network.
+Formal 1 is not active. Candidate-2 bundles SHA-256
+`5d26e42d.../d6e1dad8...` completed 17 cycles and reached the healthy end of
+`idle-1`, then failed before the first checkpoint row. Completed traffic had
+zero receiver-zero intervals, maximum UDP loss `0.561407%`, Exit packet capture
+`64,792,664` with zero kernel drops, and clean safety/cleanup. The failure is a
+live-log partial-tail mismatch in the checkpoint reader, not VPS, Mac, TUN,
+Endpoint, data-plane, or candidate quality. It consumes no formal result;
+candidate 2 remains `awaiting_formal` with zero passes and `TIER_A_PENDING`.
+
+Local TDD/review repaired complete-record authority for data-plane samples,
+replay lifecycle syntax, and active leases. Repaired runner SHA-256 is
+`8b0d0c9e...`; the ledger bridges only the exact qualified/repaired runner pair
+when the exact Mac release hash remains `5e946af2...`. No Rust or frozen
+workload/value changed, and arbitrary source/runner/binary drift remains
+rejected. Relevant self-tests, shell/Python/diff/secret gates, existing ledger
+replay, and review pass.
+
+Next: commit/push, sync and exact-build the HK Mac, apply bounded candidate-VPS
+maintenance isolation, run fresh detached control/resource preflight, then one
+fresh Formal 1. Do not tune or repeat a genuine quality failure. Result:
+`docs/tech/2026-08-17-knife15-m2-candidate2-formal1-control-failure-local-results.md`.
 
 Exact-source `b4244a7` candidate-2 qualification pair SHA-256
 `71a61c55.../516ff6d4...` passed its complete strict envelope: baseline
@@ -26,8 +40,8 @@ packets with zero kernel drops.
 The strict ledger sealed `attempt-003` as `pass/strict_pass`, marks
 `candidate2-alibaba-tokyo` `awaiting_formal`, and emits `TIER_A_PENDING`.
 Next: reuse the preserved exact qualification baseline, take one fresh direct
-and resource preflight, then run Formal 1 with the same source, release binary,
-candidate, server, observer, and workload contract. A clean Formal 1 opens
+and resource preflight, then run Formal 1 with the reviewed runner bridge and
+the same release binary, candidate, server, observer, and workload contract. A clean Formal 1 opens
 Formal 2; a genuine quality failure rejects candidate 2 and exhausts Tier A.
 M3 remains blocked. Result:
 `docs/tech/2026-08-15-knife15-m2-strict-candidate2-qualification-results.md`.
