@@ -1,5 +1,41 @@
 # Errors
 
+## 2026-08-17 - Candidate-2 Formal 1 exceeded the frozen UDP loss ceiling
+
+- The exact repaired-runner attempt passed setup, resource and observer
+  admission, TCP forward/reverse, result integrity, and cleanup, then its first
+  complete UDP reverse result measured `6.164314%` loss versus the frozen
+  `3%` maximum. It is a genuine quality failure, not the earlier checkpoint
+  control false negative.
+- Mac relay/TUN/Endpoint drop counters and Exit kernel-capture drops were zero;
+  Exit egress stayed steady. Gateway loss remained zero while Exit control
+  probes reached `33.3%`. Future behavior: classify the failure as transient
+  HK-to-Tokyo public-route loss after Exit egress, not a production-code or
+  fixed-capacity failure.
+- Attempt 4 rejects candidate 2 and produces `TIER_A_EXHAUSTED`. Do not repeat,
+  resize, tune, add AWS, or seek a favorable Tier-A sample. Proceed only to the
+  already accepted Tier-B implementation.
+
+Result:
+`docs/tech/2026-08-17-knife15-m2-candidate2-formal1-udp-loss-and-tier-b-reducer-local-results.md`.
+
+## 2026-08-17 - The first Tier-B reducer draft allowed closed segment reuse
+
+- Local code review found that grouping events only by
+  `evidence_segment_id` allowed an input sequence `A -> B -> A` to join the
+  two A ranges across an unknown period. This could understate a rolling
+  frequency failure before any real Tier-B run.
+- The draft was not committed or used for acceptance. A focused fixture now
+  requires fail-closed rejection of segment and lifetime ID reuse; exact gap
+  coverage, UTC/monotonic duration agreement, identity, path confinement, and
+  input bounds are also enforced.
+- Future behavior: continuity identifiers are transaction identities, not
+  reusable labels. Every new segment starts at index zero and every prior ID
+  remains permanently closed.
+
+Result:
+`docs/tech/2026-08-17-knife15-m2-candidate2-formal1-udp-loss-and-tier-b-reducer-local-results.md`.
+
 ## 2026-08-17 - Candidate-2 Formal 1 false-failed at a live-log checkpoint boundary
 
 - The run completed 17 cycles and a full 600-second `idle-1`; a fresh sample

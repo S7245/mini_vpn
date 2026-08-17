@@ -1,0 +1,11 @@
+{
+  "schema": "knife15-m2-frequency-generated-scenario-v1",
+  "epoch_count": 3,
+  "events": [
+    {"offset_seconds": 3600, "path": "results/one-zero.json", "reverse": 0},
+    {"offset_seconds": 25200, "path": "results/one-zero.json", "reverse": 0},
+    {"offset_seconds": 46800, "path": "results/one-zero.json", "reverse": 0}
+  ],
+  "mutation": "segment_reuse",
+  "expect": {"error_contains": "reuses a closed evidence segment"}
+}

@@ -1,0 +1,13 @@
+{
+  "schema": "knife15-m2-frequency-generated-scenario-v1",
+  "epoch_count": 1,
+  "events": [
+    {"offset_seconds": 3600, "path": "results/partial-final-zero.json", "reverse": 1}
+  ],
+  "mutation": "none",
+  "expect": {
+    "status": "PASS",
+    "receiver_zero_episodes": 0,
+    "receiver_zero_intervals": 0
+  }
+}

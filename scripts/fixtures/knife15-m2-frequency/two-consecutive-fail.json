@@ -1,0 +1,17 @@
+{
+  "schema": "knife15-m2-frequency-generated-scenario-v1",
+  "epoch_count": 1,
+  "events": [
+    {"offset_seconds": 3600, "path": "results/two-consecutive-zero.json", "reverse": 0}
+  ],
+  "mutation": "none",
+  "expect": {
+    "status": "FAIL",
+    "receiver_zero_episodes": 1,
+    "receiver_zero_intervals": 2,
+    "max_consecutive_receiver_zero_intervals": 2,
+    "violations": [
+      "max_consecutive_receiver_zero_intervals"
+    ]
+  }
+}

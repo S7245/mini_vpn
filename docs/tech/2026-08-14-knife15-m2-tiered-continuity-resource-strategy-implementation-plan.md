@@ -165,7 +165,7 @@ Completed through strict source-floor closure `bcd63b4`. Result:
 
 ### Task 6: Execute at most two strict candidates
 
-**IN PROGRESS.** The existing `.111` and `.27` hosts and an ordinary new
+**COMPLETE: `TIER_A_EXHAUSTED`.** The existing `.111` and `.27` hosts and an ordinary new
 Tencent CVM were rejected before admission because they do not change the
 failed Tencent/AS132203 public-Internet failure domain. Candidate 1 is selected
 as an Alibaba Cloud `ecs.c8i.large` 2-vCPU/4-GiB Ubuntu 24.04 resource in
@@ -183,10 +183,16 @@ ledger seals it as `quality_failure/receiver_zero` and marks candidate 1
 `rejected`. Do not repeat or tune it. Result:
 `docs/tech/2026-08-15-knife15-m2-strict-candidate1-formal-failure-results.md`.
 
-Candidate 2 is now selected as AWS Lightsail compute-optimized 2-vCPU/4-GiB in
-Tokyo, `ap-northeast-1`, with one directly attached static IPv4. Creation and
-identity handoff contract:
+The user substituted Alibaba Tokyo for the reviewed AWS fallback. Candidate 2
+was Alibaba ECS `i-6weckus0r7voaarxz2k3`, EIP `8.211.176.98`,
+`ap-northeast-1c`. It passed strict qualification. Its fresh Formal 1 then
+failed the first UDP reverse phase at `6.164314%` loss with valid paired
+resource, observer, result-integrity, and cleanup evidence. Attempt 4 is
+`quality_failure/udp_loss`; both candidates are rejected and the ledger emits
+`TIER_A_EXHAUSTED`. Do not add AWS or another Tier-A candidate. Selection and
+result contracts:
 `docs/tech/2026-08-15-knife15-m2-strict-candidate2-resource-selection.md`.
+`docs/tech/2026-08-17-knife15-m2-candidate2-formal1-udp-loss-and-tier-b-reducer-local-results.md`.
 
 **Evidence:**
 
@@ -210,6 +216,14 @@ identity handoff contract:
    reopen M3. If it emits `TIER_A_EXHAUSTED`, proceed to Task 7.
 
 ### Task 7: Tier-B episode reducer RED/GREEN, only after exhaustion
+
+**COMPLETE locally.** The exact Tier-A ledger emits `TIER_A_EXHAUSTED`.
+The reducer and fixtures implement all four inequalities, half-open exact
+six-/24-hour boundaries, UTC/monotonic agreement, immutable identity, bounded
+evidence, explicit non-bridging gaps, and fail-closed malformed evidence.
+Self-tests, prior reducer/ledger replay, compile, diff/secret, and concentrated
+review pass with no unresolved P0/P1. Result:
+`docs/tech/2026-08-17-knife15-m2-candidate2-formal1-udp-loss-and-tier-b-reducer-local-results.md`.
 
 **Precondition:** the strict ledger must emit `TIER_A_EXHAUSTED` from two
 eligible candidate histories.
@@ -259,8 +273,11 @@ eligible candidate histories.
    observer, and cleanup gates.
 6. Add signal and cleanup RED/GREEN cases so a failed epoch leaves actionable
    evidence without manufacturing a pass.
-7. Run complete runner and observer self-tests.
-8. Commit and push.
+7. Make the detached controller send one best-effort user completion email
+   after `m2-frequency` returns on either success or failure; notification
+   failure cannot alter evidence or skip cleanup.
+8. Run complete runner and observer self-tests.
+9. Commit and push.
 
 ### Task 9: Tier-B review, HITL run, and architecture stop
 

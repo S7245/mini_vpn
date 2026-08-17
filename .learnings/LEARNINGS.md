@@ -1,5 +1,45 @@
 # Learnings
 
+## 2026-08-17 - Frequency evidence needs single-use continuity segments and two clocks
+
+- A rolling-window reducer cannot treat a segment label as an ordinary group
+  key. If a closed label can reappear as `A -> B -> A`, events on both sides of
+  an unknown gap are silently rejoined. Segment and lifetime identifiers must
+  be single-use, indexed, and paired with an exact positive gap record.
+- Rolling six-/24-hour policy needs explicit half-open boundaries. Removing
+  events whose timestamp is `<= current - window` makes events exactly six or
+  24 hours apart belong to different windows and prevents an off-by-one policy
+  failure.
+- UTC establishes audit chronology; monotonic time establishes elapsed-time
+  authority. Validate each epoch/result/gap with both, run both reducers, and
+  reject disagreement instead of selecting whichever clock gives the better
+  verdict.
+- Reusing a reviewed “complete interval” parser is not sufficient to prove a
+  complete sequence. Add a separate continuity check so deletion of a whole
+  one-second row fails closed while a proven final partial tail remains
+  excluded.
+
+Result:
+`docs/tech/2026-08-17-knife15-m2-candidate2-formal1-udp-loss-and-tier-b-reducer-local-results.md`.
+
+## 2026-08-17 - Paired UDP evidence can separate path loss from local relay drops
+
+- A complete iperf UDP loss result is a quality verdict, but attribution needs
+  counters at every ownership boundary. Zero mini_vpn UDP drops/backpressure,
+  zero Endpoint would-block, steady Exit kernel egress, and zero capture drops
+  exclude the local queue and Exit service without denying the observed loss.
+- Simultaneous zero-loss gateway probes and degraded Exit probes distinguish
+  physical Mac/link health from the public route. Here the receiver loss and
+  bidirectional control-probe loss recovered together, selecting transient
+  HK-to-Tokyo path behavior rather than fixed bandwidth saturation.
+- A valid quality failure remains valid even when a separate low-sample
+  diagnostic is partial. The ledger should bind the complete authoritative
+  result, resource/observer identity, and cleanup, while recording the partial
+  diagnostic honestly instead of converting it into an infrastructure retry.
+
+Result:
+`docs/tech/2026-08-17-knife15-m2-candidate2-formal1-udp-loss-and-tier-b-reducer-local-results.md`.
+
 ## 2026-08-17 - Live append-only evidence needs shared complete-record authority
 
 - Parsing the same live log with different record-completion predicates can

@@ -1,0 +1,17 @@
+{
+  "schema": "knife15-m2-frequency-generated-scenario-v1",
+  "epoch_count": 5,
+  "events": [
+    {"offset_seconds": 1800, "path": "results/one-zero.json", "reverse": 0},
+    {"offset_seconds": 23400, "path": "results/one-zero.json", "reverse": 0},
+    {"offset_seconds": 45000, "path": "results/one-zero.json", "reverse": 0},
+    {"offset_seconds": 88200, "path": "results/one-zero.json", "reverse": 0}
+  ],
+  "mutation": "none",
+  "expect": {
+    "status": "PASS",
+    "max_receiver_zero_episodes_rolling_6h": 1,
+    "max_receiver_zero_episodes_rolling_24h": 3,
+    "max_receiver_zero_intervals_rolling_24h": 3
+  }
+}

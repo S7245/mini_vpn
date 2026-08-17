@@ -1,0 +1,55 @@
+{
+  "schema": "knife15-m2-frequency-scenario-v1",
+  "expect": {
+    "status": "PASS",
+    "receiver_zero_episodes": 1,
+    "receiver_zero_intervals": 1,
+    "max_consecutive_receiver_zero_intervals": 1,
+    "max_receiver_zero_episodes_rolling_6h": 1,
+    "max_receiver_zero_episodes_rolling_24h": 1,
+    "max_receiver_zero_intervals_rolling_24h": 1
+  },
+  "collection": {
+    "schema": "knife15-m2-frequency-collection-v1",
+    "epochs": [
+      {
+        "schema": "knife15-m2-frequency-epoch-v1",
+        "epoch_id": "epoch-000",
+        "evidence_segment_id": "evidence-a",
+        "evidence_segment_index": 0,
+        "lifetime_id": "lifetime-a",
+        "lifetime_index": 0,
+        "gap_before": null,
+        "started_utc": "2026-08-01T00:00:00Z",
+        "ended_utc": "2026-08-01T06:00:00Z",
+        "started_monotonic_ns": 1000000000,
+        "ended_monotonic_ns": 21601000000000,
+        "valid": true,
+        "identity": {
+          "candidate_id": "candidate-2-alibaba-tokyo",
+          "source_commit": "1111111111111111111111111111111111111111",
+          "binary_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+          "runner_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "resource_profile_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+          "workload_contract_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+          "server_binary_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+          "server_config_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+          "observer_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+          "exit_ipv4": "8.211.176.98",
+          "target_ipv4": "43.130.32.77",
+          "tuic_port": 8443,
+          "target_iperf_port": 5201
+        },
+        "tcp_results": [
+          {
+            "result_id": "tcp-forward-000",
+            "path": "results/one-zero.json",
+            "reverse": 0,
+            "started_utc": "2026-08-01T01:00:00Z",
+            "started_monotonic_ns": 3601000000000
+          }
+        ]
+      }
+    ]
+  }
+}

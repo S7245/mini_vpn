@@ -1,0 +1,9 @@
+{
+  "schema": "knife15-m2-frequency-generated-scenario-v1",
+  "epoch_count": 1,
+  "events": [
+    {"offset_seconds": 3600, "path": "results/missing-interval.json", "reverse": 0}
+  ],
+  "mutation": "none",
+  "expect": {"error_contains": "interval sequence has a gap"}
+}

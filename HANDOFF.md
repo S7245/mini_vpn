@@ -4,7 +4,49 @@
 
 ## Next Planned Stage — Knife15 M2 Tiered Resource Continuity (2026-08-17)
 
-- **Formal 1 is not active.** Exact-source `b4244a7` candidate-2 Formal 1
+- **Latest accepted position: Tier A is exhausted and Tier B is open.**
+  Exact-source `27a7ca0` candidate-2 Formal-1 Mac/Exit bundle SHA-256
+  `0501d259.../2453a153...` passed resource/observer/result-integrity/cleanup
+  admission but the first complete `udp-reverse` result measured `6.164314%`
+  loss above the frozen `3%` limit. TCP sender/receiver zero was zero.
+- mini_vpn reported zero UDP drop/backpressure, zero Endpoint would-block, and
+  zero interface errors. The Exit retained the full failure window with zero
+  kernel drops and steady TUIC egress; gateway probes had zero loss while
+  Mac-to-Exit control probes reached `33.3%`. This selects transient
+  HK-to-Tokyo public-path loss after Exit kernel egress, not Target, Exit
+  service, TUN, D16, Endpoint, or a fixed-capacity bottleneck.
+- Strict attempt 4 is sealed as `quality_failure/udp_loss`. Ledger/evaluation
+  SHA-256 `96e50cd2.../8a953089...` reject both candidates and emit
+  `TIER_A_EXHAUSTED`. Do not add a third Tier-A resource, retry candidate 2,
+  resize, tune, or substitute AWS. M3 remains blocked.
+- **Task 7 is locally complete.** New
+  `scripts/knife15-m2-frequency-summary.py` reuses the reviewed complete TCP
+  interval parser and enforces the four accepted Tier-B inequalities over
+  exact half-open six-/24-hour windows with matching UTC/monotonic authority.
+  Missing intervals/epochs, identity drift, clock reversal, invalid epochs,
+  evidence segment reuse, path escape, and unbounded inputs fail closed;
+  unknown evidence gaps are never bridged.
+- Focused fixtures cover isolated/pass, consecutive/fail, clustered six-hour,
+  four/day, exact boundary, partial-tail, gap, and malformed evidence cases.
+  Frequency/market/ledger self-tests, Python compile, diff/secret checks, and
+  concentrated review pass with no unresolved P0/P1. No Rust, strict `m2`,
+  workload, server, transport, pool, MTU, QUIC, Endpoint, or frozen constant
+  changed. Result:
+  `docs/tech/2026-08-17-knife15-m2-candidate2-formal1-udp-loss-and-tier-b-reducer-local-results.md`.
+- **Only next implementation step:** Task 8 adds a separately named
+  `m2-frequency` action and immutable epoch ledger. Strict `m2` must remain
+  unchanged. Require twelve valid six-hour epochs, one uninterrupted
+  four-epoch/24-hour TUN/process lifetime, one immutable identity, and every
+  existing UDP/gap/DNS/real-client/ownership/observer/safety/cleanup gate.
+  Complete Task 8, Task 9 runbook, and local review before any Tier-B Mac/VPS
+  long run.
+- Preserve the user-requested once-only completion notice in every detached
+  long-run controller: after M2/m2-frequency returns on success or failure,
+  run `printf "Subject: 执行结束~" | msmtp 870941563@qq.com`. It is
+  best-effort and must not replace evidence cleanup or alter the verdict. The
+  current operational controller already includes it.
+
+- **Historical superseded status:** exact-source `b4244a7` candidate-2 Formal 1
   bundles SHA-256 `5d26e42d.../d6e1dad8...` completed 17 cycles plus the
   active portion of cycle 18, then failed between the healthy end of the first
   600-second idle window and its first checkpoint row. All completed
