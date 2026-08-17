@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
+import importlib.util
 import io
 import ipaddress
 import json
@@ -23,6 +25,75 @@ LEDGER_SCHEMA = "knife15-m2-tier-a-ledger-v1"
 ATTEMPT_SCHEMA = "knife15-m2-tier-a-attempt-v1"
 RESULT_SCHEMA = "knife15-m2-tier-a-ledger-result-v1"
 SCENARIO_SCHEMA = "knife15-m2-ledger-scenario-v1"
+TIER_A_EXHAUSTED_LEDGER_SHA256 = (
+    "96e50cd21bc9cc277596d82e90d4c7fc0a5856c24e05f94d58ab8b3dec7b1989"
+)
+TIER_A_EXHAUSTED_EVALUATION_SHA256 = (
+    "8a95308964bb464fcaef1686eaebc7627839f269b174960365d0be4c0c2d8733"
+)
+FREQUENCY_LEDGER_SCHEMA = "knife15-m2-frequency-ledger-v1"
+FREQUENCY_RECORD_SCHEMA = "knife15-m2-frequency-sealed-epoch-v1"
+FREQUENCY_RAW_EPOCH_SCHEMA = "knife15-m2-frequency-raw-epoch-v1"
+FREQUENCY_LEDGER_RESULT_SCHEMA = "knife15-m2-frequency-ledger-result-v1"
+FREQUENCY_SAFETY_SCHEMA = "knife15-m2-frequency-epoch-safety-v1"
+FREQUENCY_SOURCE_FLOOR = "f32f624"
+FREQUENCY_LEDGER_FIELDS = {
+    "schema",
+    "tier_a_ledger_sha256",
+    "tier_a_evaluation_sha256",
+    "epochs",
+}
+FREQUENCY_RECORD_FIELDS = {
+    "schema",
+    "sequence",
+    "raw_epoch",
+    "raw_epoch_sha256",
+    "mac_bundle_name",
+    "mac_bundle_sha256",
+    "exit_bundle_name",
+    "exit_bundle_sha256",
+}
+FREQUENCY_RAW_EPOCH_FIELDS = {
+    "schema",
+    "epoch_id",
+    "run_id",
+    "run_epoch_index",
+    "started_utc",
+    "ended_utc",
+    "started_monotonic_ns",
+    "ended_monotonic_ns",
+    "identity",
+    "tcp_results",
+    "safety",
+}
+FREQUENCY_SAFETY_FIELDS = {
+    "schema",
+    "status",
+    "tcp_results",
+    "udp_results",
+    "tcp_max_gap_bytes",
+    "udp_max_loss_percent",
+    "invalid_result_files",
+    "dns_results",
+    "invalid_dns_results",
+    "real_client_results",
+    "invalid_real_client_results",
+    "process_samples",
+    "network_samples",
+    "endpoint_samples",
+    "endpoint_conservation_max_bytes",
+    "endpoint_live_bytes",
+    "endpoint_outstanding_bytes",
+    "resource_binding_pass",
+    "observer_match",
+    "network_control_pass",
+    "d16_terminal_ownership_pass",
+    "recovery_safety_pass",
+    "interface_error_samples",
+    "physical_interface_error_samples",
+    "log_compactions",
+    "internal_failure_matches",
+}
 STRICT_RESOURCE_SOURCE_FLOOR = "218467b"
 REFERENCE = {
     "candidate_id": "reference-33",
@@ -1381,6 +1452,799 @@ def evaluate(
     }
 
 
+def verify_exhaustion_certificate(
+    ledger_path: Path,
+    evaluation_path: Path,
+    *,
+    expected_ledger_sha256: str = TIER_A_EXHAUSTED_LEDGER_SHA256,
+    expected_evaluation_sha256: str = TIER_A_EXHAUSTED_EVALUATION_SHA256,
+) -> dict[str, Any]:
+    """Verify the compact, hash-pinned Tier-A exhaustion admission pair."""
+
+    digest(expected_ledger_sha256, "expected Tier-A ledger SHA-256")
+    digest(expected_evaluation_sha256, "expected Tier-A evaluation SHA-256")
+    if ledger_path.is_symlink() or not ledger_path.is_file():
+        raise LedgerError("Tier-A ledger must be a regular non-symlink file")
+    if evaluation_path.is_symlink() or not evaluation_path.is_file():
+        raise LedgerError("Tier-A evaluation must be a regular non-symlink file")
+    if ledger_path.stat().st_size > 1024 * 1024:
+        raise LedgerError("Tier-A ledger exceeds the compact admission bound")
+    if evaluation_path.stat().st_size > 1024 * 1024:
+        raise LedgerError("Tier-A evaluation exceeds the compact admission bound")
+    if sha256_file(ledger_path) != expected_ledger_sha256:
+        raise LedgerError("Tier-A ledger SHA-256 does not match the reviewed exhaustion pair")
+    if sha256_file(evaluation_path) != expected_evaluation_sha256:
+        raise LedgerError(
+            "Tier-A evaluation SHA-256 does not match the reviewed exhaustion pair"
+        )
+
+    ledger = exact_object(read_json(ledger_path), LEDGER_FIELDS, "Tier-A ledger")
+    if ledger["schema"] != LEDGER_SCHEMA:
+        raise LedgerError("Tier-A ledger schema mismatch")
+    validate_reference(ledger["reference"])
+    attempts = ledger["attempts"]
+    if not isinstance(attempts, list) or not attempts:
+        raise LedgerError("Tier-A exhaustion ledger has no attempts")
+    validated_attempts = [
+        validate_attempt(item, ledger_path.parent, verify_artifacts=False)
+        for item in attempts
+    ]
+    if [item["sequence"] for item in validated_attempts] != list(
+        range(1, len(validated_attempts) + 1)
+    ):
+        raise LedgerError("Tier-A exhaustion attempt sequence is not contiguous")
+
+    evaluation = exact_object(
+        read_json(evaluation_path),
+        {
+            "schema",
+            "status",
+            "accepted_candidate",
+            "candidate_states",
+            "ignored_invalid_mac_bundle_sha256",
+            "supporting_bundle_sha256",
+        },
+        "Tier-A evaluation",
+    )
+    if evaluation["schema"] != RESULT_SCHEMA:
+        raise LedgerError("Tier-A evaluation schema mismatch")
+    if evaluation["status"] != "TIER_A_EXHAUSTED":
+        raise LedgerError("Tier-A evaluation is not TIER_A_EXHAUSTED")
+    if evaluation["accepted_candidate"] != "":
+        raise LedgerError("Tier-A exhaustion evaluation names an accepted candidate")
+    expected_supporting: list[str] = []
+    for attempt in validated_attempts:
+        if attempt["evidence_class"] == "invalid":
+            continue
+        expected_supporting.extend(
+            (attempt["mac_bundle_sha256"], attempt["exit_bundle_sha256"])
+        )
+    if evaluation["supporting_bundle_sha256"] != expected_supporting:
+        raise LedgerError("Tier-A evaluation supporting bundles do not match the ledger")
+    rejected = [
+        state
+        for state in evaluation["candidate_states"]
+        if isinstance(state, dict) and state.get("state") == "rejected"
+    ]
+    if len(rejected) != 2:
+        raise LedgerError("Tier-A exhaustion does not contain exactly two rejected candidates")
+    return {
+        "schema": "knife15-m2-tier-a-exhaustion-admission-v1",
+        "status": "PASS",
+        "tier_a_status": "TIER_A_EXHAUSTED",
+        "ledger_sha256": expected_ledger_sha256,
+        "evaluation_sha256": expected_evaluation_sha256,
+        "supporting_bundle_sha256": expected_supporting,
+    }
+
+
+def load_frequency_module() -> Any:
+    path = Path(__file__).resolve().with_name("knife15-m2-frequency-summary.py")
+    specification = importlib.util.spec_from_file_location(
+        "knife15_m2_frequency_summary", path
+    )
+    if specification is None or specification.loader is None:
+        raise LedgerError("cannot load the Tier-B frequency reducer")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+FREQUENCY = load_frequency_module()
+
+
+def validate_frequency_safety(value: Any) -> dict[str, Any]:
+    safety = exact_object(value, FREQUENCY_SAFETY_FIELDS, "frequency epoch safety")
+    if safety["schema"] != FREQUENCY_SAFETY_SCHEMA or safety["status"] != "PASS":
+        raise LedgerError("frequency epoch safety status is not exact PASS")
+    for field in (
+        "tcp_results",
+        "udp_results",
+        "dns_results",
+        "real_client_results",
+    ):
+        positive_integer(safety[field], f"frequency safety.{field}")
+    for field in (
+        "tcp_max_gap_bytes",
+        "invalid_result_files",
+        "invalid_dns_results",
+        "invalid_real_client_results",
+        "process_samples",
+        "network_samples",
+        "endpoint_samples",
+        "endpoint_conservation_max_bytes",
+        "endpoint_live_bytes",
+        "endpoint_outstanding_bytes",
+        "interface_error_samples",
+        "physical_interface_error_samples",
+        "log_compactions",
+        "internal_failure_matches",
+    ):
+        nonnegative_integer(safety[field], f"frequency safety.{field}")
+    if safety["tcp_max_gap_bytes"] > 16 * 1024 * 1024:
+        raise LedgerError("frequency epoch exceeds the 16MiB TCP gap gate")
+    if percentage(
+        safety["udp_max_loss_percent"], "frequency safety.udp_max_loss_percent"
+    ) > Decimal("3.0"):
+        raise LedgerError("frequency epoch exceeds the 3 percent UDP gate")
+    for field in (
+        "invalid_result_files",
+        "invalid_dns_results",
+        "invalid_real_client_results",
+        "endpoint_live_bytes",
+        "endpoint_outstanding_bytes",
+        "interface_error_samples",
+        "physical_interface_error_samples",
+        "log_compactions",
+        "internal_failure_matches",
+    ):
+        if safety[field] != 0:
+            raise LedgerError(f"frequency epoch safety is nonzero: {field}")
+    if safety["endpoint_conservation_max_bytes"] > 61_440:
+        raise LedgerError("frequency epoch violates Endpoint conservation")
+    for field in ("process_samples", "network_samples", "endpoint_samples"):
+        if safety[field] < 675:
+            raise LedgerError(f"frequency epoch sample coverage is too small: {field}")
+    for field in (
+        "resource_binding_pass",
+        "observer_match",
+        "network_control_pass",
+        "d16_terminal_ownership_pass",
+        "recovery_safety_pass",
+    ):
+        if boolean(safety[field], f"frequency safety.{field}") is not True:
+            raise LedgerError(f"frequency epoch gate did not pass: {field}")
+    return safety
+
+
+def validate_raw_frequency_epoch(value: Any) -> dict[str, Any]:
+    raw = exact_object(value, FREQUENCY_RAW_EPOCH_FIELDS, "raw frequency epoch")
+    if raw["schema"] != FREQUENCY_RAW_EPOCH_SCHEMA:
+        raise LedgerError("raw frequency epoch schema mismatch")
+    token(raw["epoch_id"], "raw frequency epoch id")
+    token(raw["run_id"], "raw frequency run id")
+    index = nonnegative_integer(raw["run_epoch_index"], "raw run epoch index")
+    if index > 3:
+        raise LedgerError("one frequency run may contain at most four epochs")
+    started_utc = FREQUENCY.utc(raw["started_utc"], "raw epoch start")
+    ended_utc = FREQUENCY.utc(raw["ended_utc"], "raw epoch end")
+    started_mono = nonnegative_integer(
+        raw["started_monotonic_ns"], "raw epoch monotonic start"
+    )
+    ended_mono = nonnegative_integer(
+        raw["ended_monotonic_ns"], "raw epoch monotonic end"
+    )
+    if FREQUENCY.utc_ns(ended_utc) - FREQUENCY.utc_ns(started_utc) != (
+        FREQUENCY.EPOCH_NANOSECONDS
+    ):
+        raise LedgerError("raw frequency epoch is not exactly six UTC hours")
+    if ended_mono - started_mono != FREQUENCY.EPOCH_NANOSECONDS:
+        raise LedgerError("raw frequency epoch is not exactly six monotonic hours")
+    FREQUENCY.validate_identity(raw["identity"])
+    results = raw["tcp_results"]
+    if not isinstance(results, list) or not results:
+        raise LedgerError("raw frequency epoch has no TCP results")
+    if len(results) > FREQUENCY.MAX_TCP_RESULTS_PER_EPOCH:
+        raise LedgerError("raw frequency epoch has too many TCP results")
+    expected_result_parent = PurePosixPath(
+        "m2-frequency", f"epoch_{index + 1:03d}", "results"
+    )
+    for result in results:
+        exact_object(result, FREQUENCY.TCP_RESULT_FIELDS, "frequency TCP result")
+        path = PurePosixPath(result["path"])
+        if path.parent != expected_result_parent:
+            raise LedgerError("frequency TCP result is outside its exact epoch directory")
+    validate_frequency_safety(raw["safety"])
+    if raw["safety"]["tcp_results"] != len(results):
+        raise LedgerError("raw frequency epoch TCP result count does not match safety")
+    return raw
+
+
+def build_raw_frequency_epoch(
+    *,
+    identity_path: Path,
+    safety_path: Path,
+    index_path: Path,
+    evidence_root: Path,
+    epoch_id: str,
+    run_id: str,
+    run_epoch_index: int,
+    started_utc: str,
+    ended_utc: str,
+    started_monotonic_ns: int,
+    ended_monotonic_ns: int,
+) -> dict[str, Any]:
+    for path, label, maximum in (
+        (identity_path, "frequency identity", 64 * 1024),
+        (safety_path, "frequency safety", 64 * 1024),
+        (index_path, "frequency TCP index", 1024 * 1024),
+    ):
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > maximum:
+            raise LedgerError(f"{label} is missing, linked, or oversized")
+    identity = read_json(identity_path)
+    safety = read_json(safety_path)
+    lines = index_path.read_text(encoding="utf-8").splitlines()
+    expected_header = (
+        "result_id\tpath\treverse\tstarted_utc\tstarted_monotonic_ns"
+    )
+    if not lines or lines[0] != expected_header:
+        raise LedgerError("frequency TCP result index header is invalid")
+    results: list[dict[str, Any]] = []
+    result_ids: set[str] = set()
+    for number, line in enumerate(lines[1:], 2):
+        fields = line.split("\t")
+        if len(fields) != 5:
+            raise LedgerError(f"frequency TCP result index row {number} is malformed")
+        result_id, path, reverse_text, result_utc, result_mono_text = fields
+        token(result_id, f"frequency TCP result row {number} id")
+        if result_id in result_ids:
+            raise LedgerError("frequency TCP result id is duplicated")
+        result_ids.add(result_id)
+        relative = PurePosixPath(path)
+        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+            raise LedgerError("frequency TCP result path escapes the evidence root")
+        if reverse_text not in {"0", "1"}:
+            raise LedgerError("frequency TCP result reverse flag is invalid")
+        FREQUENCY.utc(result_utc, f"frequency TCP result row {number} UTC")
+        if re.fullmatch(r"[0-9]+", result_mono_text) is None:
+            raise LedgerError("frequency TCP result monotonic timestamp is invalid")
+        results.append(
+            {
+                "result_id": result_id,
+                "path": relative.as_posix(),
+                "reverse": int(reverse_text),
+                "started_utc": result_utc,
+                "started_monotonic_ns": int(result_mono_text),
+            }
+        )
+    raw = {
+        "schema": FREQUENCY_RAW_EPOCH_SCHEMA,
+        "epoch_id": epoch_id,
+        "run_id": run_id,
+        "run_epoch_index": run_epoch_index,
+        "started_utc": started_utc,
+        "ended_utc": ended_utc,
+        "started_monotonic_ns": started_monotonic_ns,
+        "ended_monotonic_ns": ended_monotonic_ns,
+        "identity": identity,
+        "tcp_results": results,
+        "safety": safety,
+    }
+    validate_raw_frequency_epoch(raw)
+    trial_raw = copy.deepcopy(raw)
+    trial_raw["run_epoch_index"] = 0
+    trial_epoch = frequency_epoch_from_raw(
+        trial_raw, previous=None, path_prefix="evidence"
+    )
+    for result in trial_epoch["tcp_results"]:
+        result["path"] = result["path"].removeprefix("evidence/")
+    trial_epoch["evidence_segment_index"] = 0
+    trial_epoch["lifetime_index"] = 0
+    summary = FREQUENCY.summarize_collection(
+        {"schema": FREQUENCY.COLLECTION_SCHEMA, "epochs": [trial_epoch]},
+        evidence_root=evidence_root,
+    )
+    if summary["status"] != "PASS":
+        raise LedgerError("frequency epoch violates the Tier-B per-epoch continuity gate")
+    return raw
+
+
+def frequency_epoch_from_raw(
+    raw: dict[str, Any],
+    *,
+    previous: dict[str, Any] | None,
+    path_prefix: str,
+) -> dict[str, Any]:
+    epoch = {
+        "schema": FREQUENCY.EPOCH_SCHEMA,
+        "epoch_id": raw["epoch_id"],
+        "evidence_segment_id": raw["run_id"],
+        "evidence_segment_index": raw["run_epoch_index"],
+        "lifetime_id": raw["run_id"],
+        "lifetime_index": raw["run_epoch_index"],
+        "gap_before": None,
+        "started_utc": raw["started_utc"],
+        "ended_utc": raw["ended_utc"],
+        "started_monotonic_ns": raw["started_monotonic_ns"],
+        "ended_monotonic_ns": raw["ended_monotonic_ns"],
+        "valid": True,
+        "identity": copy.deepcopy(raw["identity"]),
+        "tcp_results": copy.deepcopy(raw["tcp_results"]),
+    }
+    for result in epoch["tcp_results"]:
+        if path_prefix:
+            result["path"] = f"{path_prefix}/{result['path']}"
+    if previous is None:
+        if raw["run_epoch_index"] != 0:
+            raise LedgerError("the first sealed epoch must start a run at index zero")
+        return epoch
+    if raw["run_id"] == previous["run_id"]:
+        if raw["run_epoch_index"] != previous["run_epoch_index"] + 1:
+            raise LedgerError("a frequency run is missing a sealed epoch")
+        return epoch
+    if raw["run_epoch_index"] != 0:
+        raise LedgerError("a new frequency run must start at epoch index zero")
+    previous_end_utc = FREQUENCY.utc(previous["ended_utc"], "previous epoch end")
+    current_start_utc = FREQUENCY.utc(raw["started_utc"], "current epoch start")
+    previous_end_mono = previous["ended_monotonic_ns"]
+    current_start_mono = raw["started_monotonic_ns"]
+    if current_start_utc <= previous_end_utc or current_start_mono <= previous_end_mono:
+        raise LedgerError("a new frequency run must leave an explicit positive evidence gap")
+    epoch["gap_before"] = {
+        "reason": "evidence-unavailable",
+        "started_utc": previous["ended_utc"],
+        "ended_utc": raw["started_utc"],
+        "started_monotonic_ns": previous_end_mono,
+        "ended_monotonic_ns": current_start_mono,
+    }
+    return epoch
+
+
+def summarize_raw_frequency_run(
+    raw_epochs: list[Any], evidence_root: Path
+) -> dict[str, Any]:
+    if not raw_epochs or len(raw_epochs) > 4:
+        raise LedgerError("a raw frequency run requires one to four epochs")
+    epochs: list[dict[str, Any]] = []
+    previous: dict[str, Any] | None = None
+    for item in raw_epochs:
+        raw = validate_raw_frequency_epoch(item)
+        if previous is not None and raw["run_id"] != previous["run_id"]:
+            raise LedgerError("one raw frequency run changed run identity")
+        epochs.append(
+            frequency_epoch_from_raw(raw, previous=previous, path_prefix="")
+        )
+        previous = raw
+    return FREQUENCY.summarize_collection(
+        {"schema": FREQUENCY.COLLECTION_SCHEMA, "epochs": epochs},
+        evidence_root=evidence_root,
+    )
+
+
+def validate_frequency_record(
+    value: Any,
+    artifact_root: Path,
+    *,
+    verify_artifacts: bool,
+) -> dict[str, Any]:
+    record = exact_object(value, FREQUENCY_RECORD_FIELDS, "frequency epoch record")
+    if record["schema"] != FREQUENCY_RECORD_SCHEMA:
+        raise LedgerError("frequency epoch record schema mismatch")
+    positive_integer(record["sequence"], "frequency epoch sequence", 12)
+    raw = validate_raw_frequency_epoch(record["raw_epoch"])
+    digest(record["raw_epoch_sha256"], "raw frequency epoch SHA-256")
+    if canonical_sha256(raw) != record["raw_epoch_sha256"]:
+        raise LedgerError("raw frequency epoch SHA-256 mismatch")
+    mac_name = bundle_name(record["mac_bundle_name"], "frequency Mac bundle")
+    exit_name = bundle_name(record["exit_bundle_name"], "frequency Exit bundle")
+    digest(record["mac_bundle_sha256"], "frequency Mac bundle SHA-256")
+    digest(record["exit_bundle_sha256"], "frequency Exit bundle SHA-256")
+    if verify_artifacts:
+        verify_bundle(
+            artifact_root,
+            mac_name,
+            record["mac_bundle_sha256"],
+            "frequency Mac bundle",
+        )
+        verify_bundle(
+            artifact_root,
+            exit_name,
+            record["exit_bundle_sha256"],
+            "frequency Exit bundle",
+        )
+    return record
+
+
+def validate_and_materialize_frequency_record(
+    record: dict[str, Any], artifact_root: Path, materialized_root: Path
+) -> None:
+    raw = record["raw_epoch"]
+    identity = raw["identity"]
+    archive = EvidenceArchive(
+        artifact_root / record["mac_bundle_name"], "frequency Mac bundle"
+    )
+    epoch_directory = f"m2-frequency/epoch_{raw['run_epoch_index'] + 1:03d}"
+    try:
+        archived_raw = json_bytes(
+            archive.bytes(f"{epoch_directory}/epoch.json"),
+            "archived frequency epoch",
+        )
+        if archived_raw != raw:
+            raise LedgerError("sealed frequency epoch does not match its Mac bundle")
+        manifest = parse_key_values(archive.text("manifest.txt"), "Mac manifest")
+        summary = parse_summary(archive.text("summary.md"))
+        resource_directory = "m2-frequency-resource-preflight"
+        candidate = json_bytes(
+            archive.bytes(f"{resource_directory}/candidate-profile.json"),
+            "frequency resource profile",
+        )
+        exact_object(candidate, RESOURCE_PROFILE_FIELDS, "frequency resource profile")
+        if candidate.get("schema") != "knife15-m2-resource-profile-v1":
+            raise LedgerError("frequency resource profile schema mismatch")
+        eligibility = json_bytes(
+            archive.bytes(f"{resource_directory}/eligibility.json"),
+            "frequency resource eligibility",
+        )
+        binding = json_bytes(
+            archive.bytes(f"{resource_directory}/evidence-binding.json"),
+            "frequency resource evidence binding",
+        )
+        validate_resource_identity_evidence(
+            candidate,
+            archive.bytes(f"{resource_directory}/provider-identity.txt"),
+            archive.bytes(f"{resource_directory}/route-identity.txt"),
+            binding,
+        )
+        validate_resource_archive(archive, "m2-frequency")
+        if eligibility.get("eligible") is not True or eligibility.get(
+            "candidate_profile_sha256"
+        ) != canonical_sha256(candidate):
+            raise LedgerError("frequency resource eligibility/profile mismatch")
+        resource_result = parse_key_values(
+            archive.text(f"{resource_directory}/result.txt"),
+            "frequency resource preflight result",
+        )
+        for key, expected in (
+            ("status", "pass"),
+            ("candidate_id", identity["candidate_id"]),
+            ("candidate_ipv4", identity["exit_ipv4"]),
+            ("candidate_tuic_port", str(identity["tuic_port"])),
+            ("target", identity["target_ipv4"]),
+            ("target_iperf_port", str(identity["target_iperf_port"])),
+            ("source_commit", identity["source_commit"]),
+            ("binary_sha256", identity["binary_sha256"]),
+            ("observer_sha256", identity["observer_sha256"]),
+        ):
+            if required(resource_result, key, "frequency resource preflight") != expected:
+                raise LedgerError(f"frequency resource preflight mismatch: {key}")
+        admission = json_bytes(
+            archive.bytes("m2-frequency-tier-a-admission.json"),
+            "frequency Tier-A admission",
+        )
+        expected_admission = {
+            "schema": "knife15-m2-tier-a-exhaustion-admission-v1",
+            "status": "PASS",
+            "tier_a_status": "TIER_A_EXHAUSTED",
+            "ledger_sha256": TIER_A_EXHAUSTED_LEDGER_SHA256,
+            "evaluation_sha256": TIER_A_EXHAUSTED_EVALUATION_SHA256,
+        }
+        for key, expected in expected_admission.items():
+            if admission.get(key) != expected:
+                raise LedgerError(f"frequency Tier-A admission mismatch: {key}")
+        if archive.text("m2-frequency-resource-admission.status", 64).splitlines() != [
+            "pass"
+        ]:
+            raise LedgerError("frequency resource admission is not exact PASS")
+        if archive.text("m2-frequency.status", 64).splitlines() not in (
+            ["complete"],
+            ["failed"],
+            ["interrupted"],
+        ):
+            raise LedgerError("frequency parent run has no terminal status")
+        for key, expected in (
+            ("source_commit", identity["source_commit"]),
+            ("binary_sha256", identity["binary_sha256"]),
+            ("runner_sha256", identity["runner_sha256"]),
+            ("exit_host", identity["exit_ipv4"]),
+            ("exit_port", str(identity["tuic_port"])),
+            ("target", identity["target_ipv4"]),
+            ("iperf_port", str(identity["target_iperf_port"])),
+        ):
+            if required(manifest, key, "Mac manifest") != expected:
+                raise LedgerError(f"frequency Mac manifest mismatch: {key}")
+        for key, expected in (
+            ("candidate_id", identity["candidate_id"]),
+            ("source_commit", identity["source_commit"]),
+            ("client_binary_sha256", identity["binary_sha256"]),
+            ("server_binary_sha256", identity["server_binary_sha256"]),
+            ("server_config_sha256", identity["server_config_sha256"]),
+            ("observer_sha256", identity["observer_sha256"]),
+            ("public_ipv4", identity["exit_ipv4"]),
+            ("tuic_port", identity["tuic_port"]),
+            ("target_ipv4", identity["target_ipv4"]),
+            ("target_iperf_port", identity["target_iperf_port"]),
+        ):
+            if candidate.get(key) != expected:
+                raise LedgerError(f"frequency resource profile mismatch: {key}")
+        if resource_identity(candidate) != identity["resource_profile_sha256"]:
+            raise LedgerError("frequency stable resource identity SHA-256 mismatch")
+        contract = archive.bytes("m2-frequency-workload-contract.txt", 64 * 1024)
+        if sha256_bytes(contract) != identity["workload_contract_sha256"]:
+            raise LedgerError("frequency workload contract SHA-256 mismatch")
+        contract_values = parse_key_values(
+            contract.decode("utf-8"), "frequency workload contract"
+        )
+        for key, expected in (
+            ("schema", "knife15-m2-frequency-workload-v1"),
+            ("epoch_secs", "21600"),
+            ("active_planned_secs", "20700"),
+            ("boundary_reserve_secs", "900"),
+            ("mode_order", "steady,quiet,churn,steady"),
+            ("max_epochs_per_run", "4"),
+            ("minimum_process_network_endpoint_samples_per_epoch", "675"),
+            ("udp_loss_limit_percent", "3.0"),
+            ("tcp_gap_limit_bytes", "16777216"),
+            ("target", identity["target_ipv4"]),
+            ("iperf_port", str(identity["target_iperf_port"])),
+        ):
+            if required(contract_values, key, "frequency workload contract") != expected:
+                raise LedgerError(f"frequency workload contract mismatch: {key}")
+        for key in ("baseline_forward_sha256", "baseline_reverse_sha256"):
+            digest(
+                required(contract_values, key, "frequency workload contract"),
+                f"frequency workload contract.{key}",
+            )
+        observer_status = parse_key_values(
+            archive.text(f"{epoch_directory}/observer-status.txt"),
+            "frequency epoch observer status",
+        )
+        for key, expected in (
+            ("status", "active"),
+            ("observer_healthy", "1"),
+            ("target", identity["target_ipv4"]),
+            ("iperf_port", str(identity["target_iperf_port"])),
+            ("tuic_port", str(identity["tuic_port"])),
+        ):
+            if required(observer_status, key, "frequency epoch observer status") != expected:
+                raise LedgerError(f"frequency epoch observer mismatch: {key}")
+        finalization = parse_key_values(
+            archive.text("m2-exit-observer-finalization.txt"),
+            "frequency observer finalization",
+        )
+        for key, expected in (
+            ("observer_script_sha256", identity["observer_sha256"]),
+            ("sha256", record["exit_bundle_sha256"]),
+            ("finalization_status", "complete"),
+        ):
+            if required(finalization, key, "frequency observer finalization") != expected:
+                raise LedgerError(f"frequency observer finalization mismatch: {key}")
+        for key, expected in (
+            ("cleanup_evidence", "PASS"),
+            ("stop_cleanup_complete", "1"),
+            ("endpoint_conservation", "PASS"),
+            ("recovery_evidence_safety", "PASS"),
+            ("interface_error_samples", "0"),
+            ("physical_interface_error_samples", "0"),
+        ):
+            if required(summary, key, "frequency Mac summary") != expected:
+                raise LedgerError(f"frequency Mac final safety mismatch: {key}")
+        secret = archive.text("secret-scan.txt", 4096).splitlines()
+        if len(secret) != 1 or not secret[0].startswith("PASS:"):
+            raise LedgerError("frequency Mac secret scan did not pass")
+        events = archive.text("events.tsv")
+        sealed_pattern = (
+            rf"^[^\t]+\tm2-frequency epoch sealed epoch_id="
+            rf"{re.escape(raw['epoch_id'])} index={raw['run_epoch_index']} "
+            rf"ended_utc={re.escape(raw['ended_utc'])} "
+            rf"ended_monotonic_ns={raw['ended_monotonic_ns']}$"
+        )
+        if len(re.findall(sealed_pattern, events, re.M)) != 1:
+            raise LedgerError("frequency epoch has no exact seal event")
+        destination_prefix = materialized_root / record["mac_bundle_sha256"]
+        for result in raw["tcp_results"]:
+            relative = PurePosixPath(result["path"])
+            data = archive.bytes(relative.as_posix())
+            destination = destination_prefix.joinpath(*relative.parts)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                if destination.read_bytes() != data:
+                    raise LedgerError("frequency result path changed within one Mac bundle")
+            else:
+                destination.write_bytes(data)
+    finally:
+        archive.close()
+    validate_exit_bundle(
+        {
+            "exit_bundle_name": record["exit_bundle_name"],
+            "target_ipv4": identity["target_ipv4"],
+            "target_iperf_port": identity["target_iperf_port"],
+            "tuic_port": identity["tuic_port"],
+            "started_utc": raw["started_utc"],
+            "ended_utc": raw["ended_utc"],
+        },
+        artifact_root,
+    )
+
+
+def validate_frequency_source_tree(record: dict[str, Any], repo: Path) -> None:
+    source = record["raw_epoch"]["identity"]["source_commit"]
+    floor = git_command(repo, ["rev-parse", f"{FREQUENCY_SOURCE_FLOOR}^{{commit}}"])
+    if floor.returncode != 0:
+        raise LedgerError("frequency source floor is unavailable")
+    source_commit = git_command(repo, ["rev-parse", f"{source}^{{commit}}"])
+    if source_commit.returncode != 0:
+        raise LedgerError("frequency source commit is unavailable")
+    ancestor = git_command(
+        repo,
+        ["merge-base", "--is-ancestor", floor.stdout.decode().strip(), source],
+    )
+    if ancestor.returncode != 0:
+        raise LedgerError("frequency source predates its reviewed source floor")
+    runner = git_command(repo, ["show", f"{source}:scripts/knife15-macos-soak.sh"])
+    if runner.returncode != 0:
+        raise LedgerError("cannot read the frequency runner at the tested source")
+    if sha256_bytes(runner.stdout) != record["raw_epoch"]["identity"]["runner_sha256"]:
+        raise LedgerError("frequency runner hash does not match the tested source")
+    for relative in (
+        "scripts/knife15-m2-continuity-ledger.py",
+        "scripts/knife15-m2-frequency-summary.py",
+    ):
+        blob = git_command(repo, ["show", f"{source}:{relative}"])
+        if blob.returncode != 0:
+            raise LedgerError(f"frequency source is missing {relative}")
+
+
+def derive_frequency_record(
+    *,
+    artifact_root: Path,
+    repo: Path,
+    sequence: int,
+    run_epoch_index: int,
+    mac_bundle_name: str,
+    mac_bundle_sha256: str,
+    exit_bundle_name: str,
+    exit_bundle_sha256: str,
+) -> dict[str, Any]:
+    positive_integer(sequence, "frequency epoch sequence", 12)
+    nonnegative_integer(run_epoch_index, "frequency run epoch index")
+    if run_epoch_index > 3:
+        raise LedgerError("frequency run epoch index exceeds three")
+    bundle_name(mac_bundle_name, "frequency Mac bundle")
+    bundle_name(exit_bundle_name, "frequency Exit bundle")
+    digest(mac_bundle_sha256, "frequency Mac bundle SHA-256")
+    digest(exit_bundle_sha256, "frequency Exit bundle SHA-256")
+    verify_bundle(artifact_root, mac_bundle_name, mac_bundle_sha256, "frequency Mac bundle")
+    verify_bundle(artifact_root, exit_bundle_name, exit_bundle_sha256, "frequency Exit bundle")
+    archive = EvidenceArchive(artifact_root / mac_bundle_name, "frequency Mac bundle")
+    try:
+        raw = json_bytes(
+            archive.bytes(
+                f"m2-frequency/epoch_{run_epoch_index + 1:03d}/epoch.json"
+            ),
+            "sealed frequency epoch",
+        )
+    finally:
+        archive.close()
+    record = {
+        "schema": FREQUENCY_RECORD_SCHEMA,
+        "sequence": sequence,
+        "raw_epoch": raw,
+        "raw_epoch_sha256": canonical_sha256(raw),
+        "mac_bundle_name": mac_bundle_name,
+        "mac_bundle_sha256": mac_bundle_sha256,
+        "exit_bundle_name": exit_bundle_name,
+        "exit_bundle_sha256": exit_bundle_sha256,
+    }
+    validate_frequency_record(record, artifact_root, verify_artifacts=True)
+    with tempfile.TemporaryDirectory(prefix="knife15-frequency-seal-") as tmp:
+        validate_and_materialize_frequency_record(record, artifact_root, Path(tmp))
+    validate_frequency_source_tree(record, repo)
+    return record
+
+
+def evaluate_frequency_ledger(
+    value: Any,
+    evidence_root: Path,
+    *,
+    verify_artifacts: bool = False,
+) -> dict[str, Any]:
+    ledger = exact_object(value, FREQUENCY_LEDGER_FIELDS, "frequency ledger")
+    if ledger["schema"] != FREQUENCY_LEDGER_SCHEMA:
+        raise LedgerError("frequency ledger schema mismatch")
+    if ledger["tier_a_ledger_sha256"] != TIER_A_EXHAUSTED_LEDGER_SHA256:
+        raise LedgerError("frequency ledger is not bound to the reviewed Tier-A ledger")
+    if ledger["tier_a_evaluation_sha256"] != TIER_A_EXHAUSTED_EVALUATION_SHA256:
+        raise LedgerError("frequency ledger is not bound to Tier-A exhaustion")
+    raw_records = ledger["epochs"]
+    if not isinstance(raw_records, list) or not raw_records:
+        raise LedgerError("frequency ledger must contain at least one sealed epoch")
+    if len(raw_records) > 12:
+        raise LedgerError("frequency ledger exceeds twelve sealed epochs")
+    records = [
+        validate_frequency_record(item, evidence_root, verify_artifacts=verify_artifacts)
+        for item in raw_records
+    ]
+    materialized: tempfile.TemporaryDirectory[str] | None = None
+    summary_root = evidence_root
+    if verify_artifacts:
+        materialized = tempfile.TemporaryDirectory(prefix="knife15-m2-frequency-ledger-")
+        summary_root = Path(materialized.name)
+        for record in records:
+            validate_and_materialize_frequency_record(
+                record, evidence_root, summary_root
+            )
+    if [record["sequence"] for record in records] != list(range(1, len(records) + 1)):
+        raise LedgerError("frequency epoch sequence must be contiguous from one")
+    identity = records[0]["raw_epoch"]["identity"]
+    if any(record["raw_epoch"]["identity"] != identity for record in records[1:]):
+        raise LedgerError("frequency epochs changed immutable identity")
+    epoch_ids = [record["raw_epoch"]["epoch_id"] for record in records]
+    if len(epoch_ids) != len(set(epoch_ids)):
+        raise LedgerError("frequency epoch id was reused")
+    bundle_pairs: dict[str, str] = {}
+    reverse_bundle_pairs: dict[str, str] = {}
+    epochs: list[dict[str, Any]] = []
+    previous: dict[str, Any] | None = None
+    for record in records:
+        mac_sha = record["mac_bundle_sha256"]
+        exit_sha = record["exit_bundle_sha256"]
+        prior_exit = bundle_pairs.setdefault(mac_sha, exit_sha)
+        if prior_exit != exit_sha:
+            raise LedgerError("one frequency Mac bundle names multiple Exit bundles")
+        prior_mac = reverse_bundle_pairs.setdefault(exit_sha, mac_sha)
+        if prior_mac != mac_sha:
+            raise LedgerError("one frequency Exit bundle names multiple Mac runs")
+        raw = record["raw_epoch"]
+        epochs.append(
+            frequency_epoch_from_raw(
+                raw,
+                previous=previous,
+                path_prefix=mac_sha,
+            )
+        )
+        previous = raw
+    summary = FREQUENCY.summarize_collection(
+        {"schema": FREQUENCY.COLLECTION_SCHEMA, "epochs": epochs},
+        evidence_root=summary_root,
+    )
+    if materialized is not None:
+        materialized.cleanup()
+    violations = list(summary["violations"])
+    if len(records) == 12 and summary["max_contiguous_valid_epochs_same_lifetime"] < 4:
+        violations.append("uninterrupted_four_epoch_lifetime")
+    if summary["status"] == "FAIL" or violations:
+        status = "TIER_B_FAILED"
+    elif len(records) == 12:
+        status = "TIER_B_ACCEPTED"
+    else:
+        status = "TIER_B_PENDING"
+    return {
+        "schema": FREQUENCY_LEDGER_RESULT_SCHEMA,
+        "status": status,
+        "valid_epochs": summary["valid_epochs"],
+        "valid_hours": summary["valid_hours"],
+        "identity_sha256": summary["identity_sha256"],
+        "receiver_zero_episodes": summary["receiver_zero_episodes"],
+        "receiver_zero_intervals": summary["receiver_zero_intervals"],
+        "max_consecutive_receiver_zero_intervals": summary[
+            "max_consecutive_receiver_zero_intervals"
+        ],
+        "max_receiver_zero_episodes_rolling_6h": summary[
+            "max_receiver_zero_episodes_rolling_6h"
+        ],
+        "max_receiver_zero_episodes_rolling_24h": summary[
+            "max_receiver_zero_episodes_rolling_24h"
+        ],
+        "max_receiver_zero_intervals_rolling_24h": summary[
+            "max_receiver_zero_intervals_rolling_24h"
+        ],
+        "max_contiguous_valid_epochs_same_lifetime": summary[
+            "max_contiguous_valid_epochs_same_lifetime"
+        ],
+        "violations": violations,
+    }
+
+
 def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
@@ -1840,6 +2704,245 @@ def make_valid_evidence_attempt(artifact_root: Path, role: str) -> dict[str, Any
     }
 
 
+def make_valid_frequency_record(artifact_root: Path) -> dict[str, Any]:
+    """Build one fully replayable interrupted-parent frequency epoch fixture."""
+    base_attempt = make_valid_evidence_attempt(artifact_root, "formal")
+    base_archive = EvidenceArchive(
+        artifact_root / base_attempt["mac_bundle_name"],
+        "frequency fixture base Mac bundle",
+    )
+    try:
+        candidate = json_bytes(
+            base_archive.bytes("m2-resource-preflight/candidate-profile.json"),
+            "frequency fixture candidate",
+        )
+        resource_members = {
+            name.removeprefix("m2-resource-preflight/"): base_archive.bytes(name)
+            for name in base_archive.files
+            if name.startswith("m2-resource-preflight/")
+        }
+        resource_archive = base_archive.bytes(
+            "m2-resource-preflight.tar.gz", 32 * 1024 * 1024
+        )
+        resource_archive_sha = base_archive.bytes(
+            "m2-resource-preflight.tar.gz.sha256", 1024
+        )
+    finally:
+        base_archive.close()
+
+    contract = key_value_bytes(
+        {
+            "schema": "knife15-m2-frequency-workload-v1",
+            "epoch_secs": 21600,
+            "active_planned_secs": 20700,
+            "boundary_reserve_secs": 900,
+            "mode_order": "steady,quiet,churn,steady",
+            "max_epochs_per_run": 4,
+            "minimum_process_network_endpoint_samples_per_epoch": 675,
+            "udp_loss_limit_percent": "3.0",
+            "tcp_gap_limit_bytes": 16777216,
+            "baseline_forward_sha256": "7" * 64,
+            "baseline_reverse_sha256": "8" * 64,
+            "baseline_forward_bps": 20_000_000,
+            "baseline_reverse_bps": 40_000_000,
+            "target": candidate["target_ipv4"],
+            "iperf_port": candidate["target_iperf_port"],
+        }
+    )
+    identity = {
+        "candidate_id": candidate["candidate_id"],
+        "source_commit": base_attempt["source_commit"],
+        "binary_sha256": base_attempt["binary_sha256"],
+        "runner_sha256": base_attempt["runner_sha256"],
+        "resource_profile_sha256": resource_identity(candidate),
+        "workload_contract_sha256": sha256_bytes(contract),
+        "server_binary_sha256": candidate["server_binary_sha256"],
+        "server_config_sha256": candidate["server_config_sha256"],
+        "observer_sha256": candidate["observer_sha256"],
+        "exit_ipv4": candidate["public_ipv4"],
+        "target_ipv4": candidate["target_ipv4"],
+        "tuic_port": candidate["tuic_port"],
+        "target_iperf_port": candidate["target_iperf_port"],
+    }
+    generated = FREQUENCY.generated_collection(
+        {
+            "schema": FREQUENCY.GENERATED_SCENARIO_SCHEMA,
+            "epoch_count": 1,
+            "events": [],
+            "mutation": "none",
+            "expect": {},
+        }
+    )["epochs"][0]
+    raw = {
+        "schema": FREQUENCY_RAW_EPOCH_SCHEMA,
+        "epoch_id": "frequency-parser-run-1",
+        "run_id": "frequency-parser-run",
+        "run_epoch_index": 0,
+        "started_utc": generated["started_utc"],
+        "ended_utc": generated["ended_utc"],
+        "started_monotonic_ns": generated["started_monotonic_ns"],
+        "ended_monotonic_ns": generated["ended_monotonic_ns"],
+        "identity": identity,
+        "tcp_results": copy.deepcopy(generated["tcp_results"]),
+        "safety": {
+            "schema": FREQUENCY_SAFETY_SCHEMA,
+            "status": "PASS",
+            "tcp_results": len(generated["tcp_results"]),
+            "udp_results": 1,
+            "tcp_max_gap_bytes": 0,
+            "udp_max_loss_percent": "0.000000",
+            "invalid_result_files": 0,
+            "dns_results": 1,
+            "invalid_dns_results": 0,
+            "real_client_results": 1,
+            "invalid_real_client_results": 0,
+            "process_samples": 720,
+            "network_samples": 720,
+            "endpoint_samples": 720,
+            "endpoint_conservation_max_bytes": 61_440,
+            "endpoint_live_bytes": 0,
+            "endpoint_outstanding_bytes": 0,
+            "resource_binding_pass": True,
+            "observer_match": True,
+            "network_control_pass": True,
+            "d16_terminal_ownership_pass": True,
+            "recovery_safety_pass": True,
+            "interface_error_samples": 0,
+            "physical_interface_error_samples": 0,
+            "log_compactions": 0,
+            "internal_failure_matches": 0,
+        },
+    }
+    for result in raw["tcp_results"]:
+        result["path"] = f"m2-frequency/epoch_001/{result['path']}"
+    validate_raw_frequency_epoch(raw)
+
+    exit_name = "mini_vpn_knife15_exit_frequency_parser.tar.gz"
+    exit_path = artifact_root / exit_name
+    exit_files: dict[str, bytes] = {
+        "metadata.txt": key_value_bytes(
+            {
+                "schema": "knife15-exit-target-observer-v2",
+                "started_at": raw["started_utc"],
+                "target": identity["target_ipv4"],
+                "iperf_port": identity["target_iperf_port"],
+                "tuic_port": identity["tuic_port"],
+                "stopped_at": raw["ended_utc"],
+                "frozen_at": raw["ended_utc"],
+            }
+        ),
+        "counters.csv": (
+            b"timestamp,epoch,target_ingress_packets,target_ingress_bytes,"
+            b"target_egress_packets,target_egress_bytes,tuic_ingress_packets,"
+            b"tuic_ingress_bytes,tuic_egress_packets,tuic_egress_bytes\n"
+            + f"{raw['started_utc']},1,1,100,1,100,1,100,1,100\n".encode()
+            + f"{raw['ended_utc']},2,2,200,2,200,2,200,2,200\n".encode()
+        ),
+        "tcpdump.stderr": b"10 packets captured\n0 packets dropped by kernel\n",
+        "secret-scan.txt": b"PASS: no credential names found\n",
+        "capture.pcap00": b"frequency fixture capture",
+    }
+    exit_files["SHA256SUMS"] = "".join(
+        f"{sha256_bytes(value)}  ./{name}\n"
+        for name, value in sorted(exit_files.items())
+    ).encode()
+    write_test_archive(exit_path, "mini_vpn_knife15_exit_frequency_parser", exit_files)
+    exit_sha = sha256_file(exit_path)
+
+    admission = {
+        "schema": "knife15-m2-tier-a-exhaustion-admission-v1",
+        "status": "PASS",
+        "tier_a_status": "TIER_A_EXHAUSTED",
+        "ledger_sha256": TIER_A_EXHAUSTED_LEDGER_SHA256,
+        "evaluation_sha256": TIER_A_EXHAUSTED_EVALUATION_SHA256,
+        "supporting_bundle_sha256": [],
+    }
+    epoch_directory = "m2-frequency/epoch_001"
+    summary = "# frequency fixture\n\n" + "".join(
+        f"- {key}: {value}\n"
+        for key, value in {
+            "cleanup_evidence": "PASS",
+            "stop_cleanup_complete": "1",
+            "endpoint_conservation": "PASS",
+            "recovery_evidence_safety": "PASS",
+            "interface_error_samples": "0",
+            "physical_interface_error_samples": "0",
+        }.items()
+    )
+    mac_files: dict[str, bytes] = {
+        "manifest.txt": key_value_bytes(
+            {
+                "source_commit": identity["source_commit"],
+                "binary_sha256": identity["binary_sha256"],
+                "runner_sha256": identity["runner_sha256"],
+                "exit_host": identity["exit_ipv4"],
+                "exit_port": identity["tuic_port"],
+                "target": identity["target_ipv4"],
+                "iperf_port": identity["target_iperf_port"],
+            }
+        ),
+        "summary.md": summary.encode(),
+        "secret-scan.txt": b"PASS: no credential names found\n",
+        "m2-frequency.status": b"interrupted\n",
+        "m2-frequency-resource-admission.status": b"pass\n",
+        "m2-frequency-tier-a-admission.json": (
+            canonical_json(admission) + "\n"
+        ).encode(),
+        "m2-frequency-workload-contract.txt": contract,
+        "m2-frequency-resource-preflight/candidate-profile.json": (
+            canonical_json(candidate) + "\n"
+        ).encode(),
+        "m2-frequency-resource-preflight.tar.gz": resource_archive,
+        "m2-frequency-resource-preflight.tar.gz.sha256": resource_archive_sha,
+        f"{epoch_directory}/epoch.json": (canonical_json(raw) + "\n").encode(),
+        f"{epoch_directory}/observer-status.txt": key_value_bytes(
+            {
+                "status": "active",
+                "observer_healthy": 1,
+                "target": identity["target_ipv4"],
+                "iperf_port": identity["target_iperf_port"],
+                "tuic_port": identity["tuic_port"],
+            }
+        ),
+        "m2-exit-observer-finalization.txt": key_value_bytes(
+            {
+                "observer_script_sha256": identity["observer_sha256"],
+                "sha256": exit_sha,
+                "finalization_status": "complete",
+            }
+        ),
+        "events.tsv": (
+            "timestamp\tevent\n"
+            f"{raw['ended_utc']}\tm2-frequency epoch sealed "
+            f"epoch_id={raw['epoch_id']} index=0 "
+            f"ended_utc={raw['ended_utc']} "
+            f"ended_monotonic_ns={raw['ended_monotonic_ns']}\n"
+        ).encode(),
+    }
+    for name, value in resource_members.items():
+        mac_files[f"m2-frequency-resource-preflight/{name}"] = value
+    fixture_root = Path(__file__).resolve().parent / "fixtures" / (
+        "knife15-m2-frequency"
+    )
+    for result in raw["tcp_results"]:
+        source_path = PurePosixPath(result["path"])
+        fixture_relative = PurePosixPath(*source_path.parts[2:])
+        mac_files[result["path"]] = (fixture_root / fixture_relative).read_bytes()
+    mac_name = "mini_vpn_knife15_macos_frequency_parser.tar.gz"
+    mac_path = artifact_root / mac_name
+    write_test_archive(mac_path, "mini_vpn_knife15_macos_frequency_parser", mac_files)
+    return {
+        "schema": FREQUENCY_RECORD_SCHEMA,
+        "sequence": 1,
+        "raw_epoch": raw,
+        "raw_epoch_sha256": canonical_sha256(raw),
+        "mac_bundle_name": mac_name,
+        "mac_bundle_sha256": sha256_file(mac_path),
+        "exit_bundle_name": exit_name,
+        "exit_bundle_sha256": exit_sha,
+    }
+
+
 def derive_attempt(
     artifact_root: Path,
     sequence: int,
@@ -2055,6 +3158,22 @@ def self_test() -> None:
                 ),
                 "fixture binding",
             )
+            refreshed_direct = copy.deepcopy(fixture_candidate)
+            refreshed_direct["workload_profile_sha256"] = "9" * 64
+            if resource_identity(refreshed_direct) != resource_identity(
+                fixture_candidate
+            ):
+                raise AssertionError(
+                    "fresh direct evidence changed the stable frequency resource identity"
+                )
+            changed_server = copy.deepcopy(fixture_candidate)
+            changed_server["server_config_sha256"] = "9" * 64
+            if resource_identity(changed_server) == resource_identity(
+                fixture_candidate
+            ):
+                raise AssertionError(
+                    "server configuration drift kept one frequency resource identity"
+                )
             validate_resource_identity_evidence(
                 fixture_candidate,
                 fixture_provider,
@@ -2177,6 +3296,237 @@ def self_test() -> None:
             verify_contents=False,
         )
         assert len(exhausted["candidate_states"]) == 2
+        exhaustion_ledger_path = artifact_root / "exhaustion-ledger.json"
+        exhaustion_evaluation_path = artifact_root / "exhaustion-evaluation.json"
+        exhaustion_ledger_path.write_text(
+            canonical_json(ledgers["two-rejected-candidates.json"]) + "\n",
+            encoding="utf-8",
+        )
+        exhaustion_evaluation_path.write_text(
+            canonical_json(exhausted) + "\n",
+            encoding="utf-8",
+        )
+        admission = verify_exhaustion_certificate(
+            exhaustion_ledger_path,
+            exhaustion_evaluation_path,
+            expected_ledger_sha256=sha256_file(exhaustion_ledger_path),
+            expected_evaluation_sha256=sha256_file(exhaustion_evaluation_path),
+        )
+        assert admission["tier_a_status"] == "TIER_A_EXHAUSTED"
+        pending_evaluation = json.loads(canonical_json(exhausted))
+        pending_evaluation["status"] = "TIER_A_PENDING"
+        exhaustion_evaluation_path.write_text(
+            canonical_json(pending_evaluation) + "\n",
+            encoding="utf-8",
+        )
+        try:
+            verify_exhaustion_certificate(
+                exhaustion_ledger_path,
+                exhaustion_evaluation_path,
+                expected_ledger_sha256=sha256_file(exhaustion_ledger_path),
+                expected_evaluation_sha256=sha256_file(exhaustion_evaluation_path),
+            )
+        except LedgerError:
+            pass
+        else:
+            raise AssertionError("Tier-B admission accepted a pending Tier-A evaluation")
+
+        frequency_scenario = {
+            "schema": FREQUENCY.GENERATED_SCENARIO_SCHEMA,
+            "epoch_count": 12,
+            "events": [],
+            "mutation": "none",
+            "expect": {},
+        }
+        frequency_collection = FREQUENCY.generated_collection(frequency_scenario)
+        FREQUENCY.open_generated_evidence_segment(
+            frequency_collection["epochs"], 4, "fixture-segment-b"
+        )
+        FREQUENCY.open_generated_evidence_segment(
+            frequency_collection["epochs"], 8, "fixture-segment-c"
+        )
+        frequency_records: list[dict[str, Any]] = []
+        fixture_frequency_root = Path(__file__).resolve().parent / "fixtures" / (
+            "knife15-m2-frequency"
+        )
+        for index, generated_epoch in enumerate(frequency_collection["epochs"]):
+            run_number = index // 4
+            run_id = f"frequency-fixture-run-{run_number + 1}"
+            mac_sha = hashlib.sha256(run_id.encode()).hexdigest()
+            exit_sha = hashlib.sha256(f"exit-{run_id}".encode()).hexdigest()
+            prefix = artifact_root / mac_sha
+            epoch_results = copy.deepcopy(generated_epoch["tcp_results"])
+            for result in epoch_results:
+                source_result = fixture_frequency_root / result["path"]
+                result["path"] = (
+                    f"m2-frequency/epoch_{index % 4 + 1:03d}/{result['path']}"
+                )
+                destination = prefix / result["path"]
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if not destination.exists():
+                    destination.write_bytes(source_result.read_bytes())
+            raw_epoch = {
+                "schema": FREQUENCY_RAW_EPOCH_SCHEMA,
+                "epoch_id": generated_epoch["epoch_id"],
+                "run_id": run_id,
+                "run_epoch_index": index % 4,
+                "started_utc": generated_epoch["started_utc"],
+                "ended_utc": generated_epoch["ended_utc"],
+                "started_monotonic_ns": generated_epoch["started_monotonic_ns"],
+                "ended_monotonic_ns": generated_epoch["ended_monotonic_ns"],
+                "identity": generated_epoch["identity"],
+                "tcp_results": epoch_results,
+                "safety": {
+                    "schema": FREQUENCY_SAFETY_SCHEMA,
+                    "status": "PASS",
+                    "tcp_results": len(generated_epoch["tcp_results"]),
+                    "udp_results": 1,
+                    "tcp_max_gap_bytes": 0,
+                    "udp_max_loss_percent": "0.000000",
+                    "invalid_result_files": 0,
+                    "dns_results": 1,
+                    "invalid_dns_results": 0,
+                    "real_client_results": 1,
+                    "invalid_real_client_results": 0,
+                    "process_samples": 720,
+                    "network_samples": 720,
+                    "endpoint_samples": 720,
+                    "endpoint_conservation_max_bytes": 61_440,
+                    "endpoint_live_bytes": 0,
+                    "endpoint_outstanding_bytes": 0,
+                    "resource_binding_pass": True,
+                    "observer_match": True,
+                    "network_control_pass": True,
+                    "d16_terminal_ownership_pass": True,
+                    "recovery_safety_pass": True,
+                    "interface_error_samples": 0,
+                    "physical_interface_error_samples": 0,
+                    "log_compactions": 0,
+                    "internal_failure_matches": 0,
+                },
+            }
+            frequency_records.append(
+                {
+                    "schema": FREQUENCY_RECORD_SCHEMA,
+                    "sequence": index + 1,
+                    "raw_epoch": raw_epoch,
+                    "raw_epoch_sha256": canonical_sha256(raw_epoch),
+                    "mac_bundle_name": (
+                        f"mini_vpn_knife15_macos_frequency_{run_number + 1}.tar.gz"
+                    ),
+                    "mac_bundle_sha256": mac_sha,
+                    "exit_bundle_name": (
+                        f"mini_vpn_knife15_exit_frequency_{run_number + 1}.tar.gz"
+                    ),
+                    "exit_bundle_sha256": exit_sha,
+                }
+            )
+        frequency_ledger = {
+            "schema": FREQUENCY_LEDGER_SCHEMA,
+            "tier_a_ledger_sha256": TIER_A_EXHAUSTED_LEDGER_SHA256,
+            "tier_a_evaluation_sha256": TIER_A_EXHAUSTED_EVALUATION_SHA256,
+            "epochs": frequency_records,
+        }
+        frequency_result = evaluate_frequency_ledger(
+            frequency_ledger, artifact_root
+        )
+        assert frequency_result["status"] == "TIER_B_ACCEPTED"
+        assert frequency_result["valid_epochs"] == 12
+        assert frequency_result["max_contiguous_valid_epochs_same_lifetime"] == 4
+        pending_frequency = copy.deepcopy(frequency_ledger)
+        pending_frequency["epochs"] = pending_frequency["epochs"][:11]
+        assert evaluate_frequency_ledger(
+            pending_frequency, artifact_root
+        )["status"] == "TIER_B_PENDING"
+        reused_exit = copy.deepcopy(frequency_ledger)
+        for record in reused_exit["epochs"][8:12]:
+            record["exit_bundle_name"] = reused_exit["epochs"][0][
+                "exit_bundle_name"
+            ]
+            record["exit_bundle_sha256"] = reused_exit["epochs"][0][
+                "exit_bundle_sha256"
+            ]
+        try:
+            evaluate_frequency_ledger(reused_exit, artifact_root)
+        except LedgerError:
+            pass
+        else:
+            raise AssertionError("Tier-B ledger reused one Exit capture across runs")
+        unsafe_frequency = copy.deepcopy(frequency_ledger)
+        unsafe_frequency["epochs"][0]["raw_epoch"]["safety"][
+            "udp_max_loss_percent"
+        ] = "3.000001"
+        unsafe_frequency["epochs"][0]["raw_epoch_sha256"] = canonical_sha256(
+            unsafe_frequency["epochs"][0]["raw_epoch"]
+        )
+        try:
+            evaluate_frequency_ledger(unsafe_frequency, artifact_root)
+        except LedgerError:
+            pass
+        else:
+            raise AssertionError("Tier-B ledger accepted a non-continuity gate failure")
+        builder_raw = frequency_records[0]["raw_epoch"]
+        builder_identity = artifact_root / "frequency-identity.json"
+        builder_safety = artifact_root / "frequency-safety.json"
+        builder_index = artifact_root / "frequency-index.tsv"
+        builder_identity.write_text(
+            canonical_json(builder_raw["identity"]) + "\n", encoding="utf-8"
+        )
+        builder_safety.write_text(
+            canonical_json(builder_raw["safety"]) + "\n", encoding="utf-8"
+        )
+        builder_index.write_text(
+            "result_id\tpath\treverse\tstarted_utc\tstarted_monotonic_ns\n"
+            + "\n".join(
+                "\t".join(
+                    (
+                        result["result_id"],
+                        result["path"],
+                        str(result["reverse"]),
+                        result["started_utc"],
+                        str(result["started_monotonic_ns"]),
+                    )
+                )
+                for result in builder_raw["tcp_results"]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        rebuilt = build_raw_frequency_epoch(
+            identity_path=builder_identity,
+            safety_path=builder_safety,
+            index_path=builder_index,
+            evidence_root=artifact_root / frequency_records[0]["mac_bundle_sha256"],
+            epoch_id=builder_raw["epoch_id"],
+            run_id=builder_raw["run_id"],
+            run_epoch_index=builder_raw["run_epoch_index"],
+            started_utc=builder_raw["started_utc"],
+            ended_utc=builder_raw["ended_utc"],
+            started_monotonic_ns=builder_raw["started_monotonic_ns"],
+            ended_monotonic_ns=builder_raw["ended_monotonic_ns"],
+        )
+        assert rebuilt == builder_raw
+        misplaced_result = copy.deepcopy(builder_raw)
+        misplaced_result["tcp_results"][0]["path"] = (
+            "m2-frequency/epoch_002/results/partial-final-zero.json"
+        )
+        try:
+            validate_raw_frequency_epoch(misplaced_result)
+        except LedgerError:
+            pass
+        else:
+            raise AssertionError("frequency epoch accepted another epoch's TCP result")
+
+        replayable_frequency = make_valid_frequency_record(artifact_root)
+        validate_frequency_record(
+            replayable_frequency, artifact_root, verify_artifacts=True
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="knife15-frequency-parser-self-test-"
+        ) as materialized:
+            validate_and_materialize_frequency_record(
+                replayable_frequency, artifact_root, Path(materialized)
+            )
 
         tampered = json.loads(canonical_json(ledgers["two-formal-passes.json"]))
         first_name = tampered["attempts"][0]["mac_bundle_name"]
@@ -2329,7 +3679,203 @@ def main() -> int:
     seal_parser.add_argument("--exit-bundle", required=True)
     seal_parser.add_argument("--exit-sha256", required=True)
     seal_parser.add_argument("--output", type=Path, required=True)
+    exhaustion_parser = subparsers.add_parser("verify-exhaustion")
+    exhaustion_parser.add_argument("--ledger", type=Path, required=True)
+    exhaustion_parser.add_argument("--evaluation", type=Path, required=True)
+    exhaustion_parser.add_argument("--output", type=Path)
+    frequency_resource_parser = subparsers.add_parser(
+        "frequency-resource-identity"
+    )
+    frequency_resource_parser.add_argument("--candidate", type=Path, required=True)
+    build_frequency_parser = subparsers.add_parser("build-frequency-epoch")
+    build_frequency_parser.add_argument("--identity", type=Path, required=True)
+    build_frequency_parser.add_argument("--safety", type=Path, required=True)
+    build_frequency_parser.add_argument("--index", type=Path, required=True)
+    build_frequency_parser.add_argument("--evidence-root", type=Path, required=True)
+    build_frequency_parser.add_argument("--epoch-id", required=True)
+    build_frequency_parser.add_argument("--run-id", required=True)
+    build_frequency_parser.add_argument("--run-epoch-index", type=int, required=True)
+    build_frequency_parser.add_argument("--started-utc", required=True)
+    build_frequency_parser.add_argument("--ended-utc", required=True)
+    build_frequency_parser.add_argument(
+        "--started-monotonic-ns", type=int, required=True
+    )
+    build_frequency_parser.add_argument(
+        "--ended-monotonic-ns", type=int, required=True
+    )
+    build_frequency_parser.add_argument("--output", type=Path, required=True)
+    raw_frequency_parser = subparsers.add_parser("evaluate-frequency-run")
+    raw_frequency_parser.add_argument("--epochs-dir", type=Path, required=True)
+    raw_frequency_parser.add_argument("--evidence-root", type=Path, required=True)
+    raw_frequency_parser.add_argument("--output", type=Path)
+    seal_frequency_parser = subparsers.add_parser("seal-frequency-epoch")
+    seal_frequency_parser.add_argument("--artifact-root", type=Path, required=True)
+    seal_frequency_parser.add_argument(
+        "--repo", type=Path, default=Path(__file__).resolve().parent.parent
+    )
+    seal_frequency_parser.add_argument("--sequence", type=int, required=True)
+    seal_frequency_parser.add_argument(
+        "--run-epoch-index", type=int, required=True
+    )
+    seal_frequency_parser.add_argument("--mac-bundle", required=True)
+    seal_frequency_parser.add_argument("--mac-sha256", required=True)
+    seal_frequency_parser.add_argument("--exit-bundle", required=True)
+    seal_frequency_parser.add_argument("--exit-sha256", required=True)
+    seal_frequency_parser.add_argument("--output", type=Path, required=True)
+    new_frequency_parser = subparsers.add_parser("new-frequency-ledger")
+    new_frequency_parser.add_argument("--output", type=Path, required=True)
+    append_frequency_parser = subparsers.add_parser("append-frequency-epoch")
+    append_frequency_parser.add_argument("--ledger", type=Path, required=True)
+    append_frequency_parser.add_argument("--record", type=Path, required=True)
+    append_frequency_parser.add_argument("--artifact-root", type=Path, required=True)
+    append_frequency_parser.add_argument(
+        "--repo", type=Path, default=Path(__file__).resolve().parent.parent
+    )
+    append_frequency_parser.add_argument("--output", type=Path, required=True)
+    evaluate_frequency_parser = subparsers.add_parser("evaluate-frequency")
+    evaluate_frequency_parser.add_argument("ledger", type=Path)
+    evaluate_frequency_parser.add_argument(
+        "--artifact-root", type=Path, required=True
+    )
+    evaluate_frequency_parser.add_argument(
+        "--repo", type=Path, default=Path(__file__).resolve().parent.parent
+    )
+    evaluate_frequency_parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.command == "frequency-resource-identity":
+        candidate_path = args.candidate
+        if (
+            candidate_path.is_symlink()
+            or not candidate_path.is_file()
+            or candidate_path.stat().st_size > 64 * 1024
+        ):
+            raise LedgerError("frequency resource candidate is missing or unsafe")
+        candidate = exact_object(
+            read_json(candidate_path),
+            RESOURCE_PROFILE_FIELDS,
+            "frequency resource candidate",
+        )
+        if candidate["schema"] != "knife15-m2-resource-profile-v1":
+            raise LedgerError("frequency resource candidate schema mismatch")
+        sys.stdout.write(resource_identity(candidate) + "\n")
+        return 0
+    if args.command == "verify-exhaustion":
+        result = verify_exhaustion_certificate(args.ledger, args.evaluation)
+        encoded = canonical_json(result) + "\n"
+        if args.output is None:
+            sys.stdout.write(encoded)
+        elif args.output.exists():
+            raise LedgerError("refuse to replace an existing exhaustion admission result")
+        else:
+            args.output.write_text(encoded, encoding="utf-8")
+        return 0
+    if args.command == "build-frequency-epoch":
+        evidence_root = args.evidence_root.resolve(strict=True)
+        if not evidence_root.is_dir():
+            raise LedgerError("frequency evidence root must be a directory")
+        result = build_raw_frequency_epoch(
+            identity_path=args.identity,
+            safety_path=args.safety,
+            index_path=args.index,
+            evidence_root=evidence_root,
+            epoch_id=args.epoch_id,
+            run_id=args.run_id,
+            run_epoch_index=args.run_epoch_index,
+            started_utc=args.started_utc,
+            ended_utc=args.ended_utc,
+            started_monotonic_ns=args.started_monotonic_ns,
+            ended_monotonic_ns=args.ended_monotonic_ns,
+        )
+        if args.output.exists():
+            raise LedgerError("refuse to replace an existing frequency epoch")
+        args.output.write_text(canonical_json(result) + "\n", encoding="utf-8")
+        return 0
+    if args.command == "evaluate-frequency-run":
+        epochs_dir = args.epochs_dir.resolve(strict=True)
+        evidence_root = args.evidence_root.resolve(strict=True)
+        if not epochs_dir.is_dir() or not evidence_root.is_dir():
+            raise LedgerError("raw frequency run paths must be directories")
+        epoch_paths = sorted(epochs_dir.glob("epoch_*/epoch.json"))
+        if not epoch_paths or len(epoch_paths) > 4 or any(
+            path.is_symlink() for path in epoch_paths
+        ):
+            raise LedgerError("raw frequency run epoch set is invalid")
+        result = summarize_raw_frequency_run(
+            [read_json(path) for path in epoch_paths], evidence_root
+        )
+        encoded = canonical_json(result) + "\n"
+        if args.output is None:
+            sys.stdout.write(encoded)
+        elif args.output.exists():
+            raise LedgerError("refuse to replace a raw frequency run result")
+        else:
+            args.output.write_text(encoded, encoding="utf-8")
+        return 0
+    if args.command == "new-frequency-ledger":
+        if args.output.exists():
+            raise LedgerError("refuse to replace an existing frequency ledger")
+        result = {
+            "schema": FREQUENCY_LEDGER_SCHEMA,
+            "tier_a_ledger_sha256": TIER_A_EXHAUSTED_LEDGER_SHA256,
+            "tier_a_evaluation_sha256": TIER_A_EXHAUSTED_EVALUATION_SHA256,
+            "epochs": [],
+        }
+        args.output.write_text(canonical_json(result) + "\n", encoding="utf-8")
+        return 0
+    if args.command in {
+        "seal-frequency-epoch",
+        "append-frequency-epoch",
+        "evaluate-frequency",
+    }:
+        artifact_root = args.artifact_root.resolve(strict=True)
+        if not artifact_root.is_dir():
+            raise LedgerError("frequency artifact root must resolve to a directory")
+        if args.command == "seal-frequency-epoch":
+            result = derive_frequency_record(
+                artifact_root=artifact_root,
+                repo=args.repo,
+                sequence=args.sequence,
+                run_epoch_index=args.run_epoch_index,
+                mac_bundle_name=args.mac_bundle,
+                mac_bundle_sha256=args.mac_sha256,
+                exit_bundle_name=args.exit_bundle,
+                exit_bundle_sha256=args.exit_sha256,
+            )
+            if args.output.exists():
+                raise LedgerError("refuse to replace an existing frequency record")
+            args.output.write_text(canonical_json(result) + "\n", encoding="utf-8")
+            return 0
+        if args.command == "append-frequency-epoch":
+            ledger = read_json(args.ledger)
+            exact_object(ledger, FREQUENCY_LEDGER_FIELDS, "frequency ledger")
+            record = read_json(args.record)
+            if not isinstance(ledger.get("epochs"), list):
+                raise LedgerError("frequency ledger epochs must be an array")
+            candidate = copy.deepcopy(ledger)
+            candidate["epochs"].append(record)
+            evaluate_frequency_ledger(
+                candidate, artifact_root, verify_artifacts=True
+            )
+            for item in candidate["epochs"]:
+                validate_frequency_source_tree(item, args.repo)
+            if args.output.exists():
+                raise LedgerError("refuse to replace an existing frequency ledger")
+            args.output.write_text(canonical_json(candidate) + "\n", encoding="utf-8")
+            return 0
+        ledger = read_json(args.ledger)
+        result = evaluate_frequency_ledger(
+            ledger, artifact_root, verify_artifacts=True
+        )
+        for record in ledger["epochs"]:
+            validate_frequency_source_tree(record, args.repo)
+        encoded = canonical_json(result) + "\n"
+        if args.output is None:
+            sys.stdout.write(encoded)
+        elif args.output.exists():
+            raise LedgerError("refuse to replace an existing frequency result")
+        else:
+            args.output.write_text(encoded, encoding="utf-8")
+        return 0
     artifact_root = args.artifact_root.resolve(strict=True)
     if not artifact_root.is_dir():
         raise LedgerError("artifact root must resolve to a directory")

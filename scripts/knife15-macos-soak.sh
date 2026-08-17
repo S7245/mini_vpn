@@ -39,6 +39,7 @@ M2_DIRECT_DIR="${M2_DIRECT_DIR:-}"
 M2_RESOURCE_PREFLIGHT_DIR="${M2_RESOURCE_PREFLIGHT_DIR:-}"
 M2_RESOURCE_PROFILE_HELPER="$SCRIPT_DIR/knife15-m2-resource-profile.py"
 M2_RESOURCE_PREFLIGHT_RUNNER="$SCRIPT_DIR/knife15-m2-resource-preflight.sh"
+M2_CONTINUITY_LEDGER_HELPER="$SCRIPT_DIR/knife15-m2-continuity-ledger.py"
 M0_DIRECT_MAX_AGE_SECS=900
 M0_TOTAL_SECS="${M0_TOTAL_SECS:-7200}"
 M0_TCP_SECS="${M0_TCP_SECS:-300}"
@@ -87,6 +88,9 @@ M2_EGRESS_URL=https://api.ipify.org
 M2_BROWSER_URL=https://example.com/
 M2_EGRESS_TARGET=api.ipify.org:443
 M2_BROWSER_TARGET=example.com:443
+M2_FREQUENCY_TIER_A_LEDGER="${M2_FREQUENCY_TIER_A_LEDGER:-}"
+M2_FREQUENCY_TIER_A_ARTIFACT_ROOT="${M2_FREQUENCY_TIER_A_ARTIFACT_ROOT:-}"
+M2_FREQUENCY_EPOCHS="${M2_FREQUENCY_EPOCHS:-4}"
 # iperf only reports completed application buffers. Shenzhen's 0.131 Mbit/s
 # reverse path delivered about 16KiB/s with an 8.3KiB cwnd, so a 1KiB observer
 # preserves multiple visible blocks per second while forward stays unchanged.
@@ -118,9 +122,11 @@ SOAK_LABEL=M0
 SOAK_EVIDENCE_DIR=m0
 SOAK_STATUS_FILE=m0.status
 SOAK_CONTINUE_DATA_QUALITY=0
+SOAK_CONTINUE_RECEIVER_ZERO_ONLY=0
 SOAK_VIOLATIONS_FILE=
 SOAK_SUCCESS_STATUS=complete
 SOAK_REAL_CLIENT_PROBE=0
+SOAK_FREQUENCY_INDEX_FILE=
 M2_REAL_CLIENT_EVIDENCE_DIR=m2-real-client
 M2_COMPLETE_CYCLE_INDEX=0
 M2_EXIT_OBSERVER_ARMED=0
@@ -156,6 +162,7 @@ Usage:
   sudo -E bash scripts/knife15-macos-soak.sh m1-diagnostic
   sudo -E bash scripts/knife15-macos-soak.sh m2-qualification
   sudo -E bash scripts/knife15-macos-soak.sh m2
+  sudo -E bash scripts/knife15-macos-soak.sh m2-frequency
   sudo -E bash scripts/knife15-macos-soak.sh stop
   sudo -E bash scripts/knife15-macos-soak.sh bundle
 
@@ -273,6 +280,11 @@ timestamp() {
   date -u '+%Y-%m-%dT%H:%M:%SZ'
 }
 
+m2_frequency_clock_pair() {
+  /usr/bin/python3 -I -c \
+    'import datetime,time; print(datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") + "\t" + str(time.monotonic_ns()))'
+}
+
 die() {
   echo "ERROR: $*" >&2
   exit 1
@@ -343,6 +355,56 @@ validate_m2_formal_config() {
     "$M2_EGRESS_TARGET" == "api.ipify.org:443" && \
     "$M2_BROWSER_TARGET" == "example.com:443" && \
     "$METRICS_SECS" == "30" && "$SAMPLE_SECS" == "30" ]]
+}
+
+m2_mode_inputs_are_isolated() {
+  local execution_mode="${1:-}"
+  case "$execution_mode" in
+    formal|qualification)
+      [[ -z "$M2_FREQUENCY_TIER_A_LEDGER" && \
+        -z "$M2_FREQUENCY_TIER_A_ARTIFACT_ROOT" ]]
+      ;;
+    frequency)
+      [[ -n "$M2_FREQUENCY_TIER_A_LEDGER" && \
+        -n "$M2_FREQUENCY_TIER_A_ARTIFACT_ROOT" ]]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+m2_frequency_source_is_accepted() {
+  local revision="${1:-HEAD}"
+  git -C "$REPO" merge-base --is-ancestor f32f624 "$revision" >/dev/null 2>&1
+}
+
+m2_frequency_tier_a_admission() {
+  local output_file="${1:-}"
+  local evaluation_file
+  [[ "$M2_CONTINUITY_LEDGER_HELPER" == \
+      "$SCRIPT_DIR/knife15-m2-continuity-ledger.py" && \
+    -f "$M2_CONTINUITY_LEDGER_HELPER" && \
+    ! -L "$M2_CONTINUITY_LEDGER_HELPER" ]] || return 1
+  [[ -n "$output_file" && ! -e "$output_file" && \
+    -f "$M2_FREQUENCY_TIER_A_LEDGER" && \
+    ! -L "$M2_FREQUENCY_TIER_A_LEDGER" && \
+    -d "$M2_FREQUENCY_TIER_A_ARTIFACT_ROOT" && \
+    ! -L "$M2_FREQUENCY_TIER_A_ARTIFACT_ROOT" ]] || return 1
+  evaluation_file="$M2_FREQUENCY_TIER_A_ARTIFACT_ROOT/evaluation-004.json"
+  [[ -f "$evaluation_file" && ! -L "$evaluation_file" ]] || return 1
+  /usr/bin/python3 -I "$M2_CONTINUITY_LEDGER_HELPER" verify-exhaustion \
+    --ledger "$M2_FREQUENCY_TIER_A_LEDGER" \
+    --evaluation "$evaluation_file" --output "$output_file" || return 1
+  [[ "$(m2_resource_json_value "$output_file" schema)" == \
+      knife15-m2-tier-a-exhaustion-admission-v1 && \
+    "$(m2_resource_json_value "$output_file" status)" == PASS && \
+    "$(m2_resource_json_value "$output_file" tier_a_status)" == \
+      TIER_A_EXHAUSTED && \
+    "$(m2_resource_json_value "$output_file" ledger_sha256)" == \
+      96e50cd21bc9cc277596d82e90d4c7fc0a5856c24e05f94d58ab8b3dec7b1989 && \
+    "$(m2_resource_json_value "$output_file" evaluation_sha256)" == \
+      8a95308964bb464fcaef1686eaebc7627839f269b174960365d0be4c0c2d8733 ]]
 }
 
 m2_window_count_model() {
@@ -3049,7 +3111,10 @@ record_soak_data_quality_violation() {
   local detail="$6"
   local evidence_file="$7"
   local relative_evidence
-  [[ "${SOAK_CONTINUE_DATA_QUALITY:-0}" == "1" ]] || return 1
+  if [[ "${SOAK_CONTINUE_DATA_QUALITY:-0}" != "1" ]]; then
+    [[ "${SOAK_CONTINUE_RECEIVER_ZERO_ONLY:-0}" == "1" && \
+      "$kind" == receiver_zero_interval ]] || return 1
+  fi
   [[ -n "${SOAK_VIOLATIONS_FILE:-}" && -f "$SOAK_VIOLATIONS_FILE" ]] || return 1
   [[ "$detail" != *$'\t'* && "$detail" != *$'\n'* ]] || return 1
   relative_evidence="${evidence_file#"$run_dir"/}"
@@ -3309,6 +3374,113 @@ expected_checkpoints=$M2_EXPECTED_CHECKPOINTS
 egress_url=$M2_EGRESS_URL
 browser_url=$M2_BROWSER_URL
 EOF_M2_PROFILE
+}
+
+write_m2_frequency_contract() {
+  local profile_file="$1"
+  local output_file="$2"
+  local key
+  printf '%s\n' \
+    'schema=knife15-m2-frequency-workload-v1' \
+    'epoch_secs=21600' \
+    'active_planned_secs=20700' \
+    'boundary_reserve_secs=900' \
+    'mode_order=steady,quiet,churn,steady' \
+    'max_epochs_per_run=4' \
+    'minimum_process_network_endpoint_samples_per_epoch=675' \
+    'udp_loss_limit_percent=3.0' \
+    'tcp_gap_limit_bytes=16777216' \
+    >"$output_file" || return 1
+  for key in \
+    baseline_forward_sha256 baseline_reverse_sha256 \
+    baseline_forward_bps baseline_reverse_bps \
+    target iperf_port dns_target dns_name rate_cap_bps \
+    steady_tcp_forward_bps steady_tcp_reverse_bps steady_udp_reverse_bps \
+    steady_short_forward_bps steady_short_reverse_bps \
+    steady_short_connections_per_cycle \
+    quiet_tcp_forward_bps quiet_tcp_reverse_bps quiet_udp_reverse_bps \
+    quiet_short_forward_bps quiet_short_reverse_bps \
+    quiet_short_connections_per_cycle \
+    churn_tcp_forward_bps churn_tcp_reverse_bps churn_udp_reverse_bps \
+    churn_short_forward_bps churn_short_reverse_bps \
+    churn_short_connections_per_cycle tcp_reverse_iperf_length_bytes \
+    udp_payload_bytes tcp_epoch_secs udp_epoch_secs short_epoch_secs \
+    egress_url browser_url; do
+    printf '%s=%s\n' "$key" "$(m0_profile_value "$profile_file" "$key")" \
+      >>"$output_file" || return 1
+  done
+}
+
+m2_frequency_utc_plus_seconds() {
+  local value="$1" seconds="$2"
+  /usr/bin/python3 -I -c \
+    'import datetime,sys; value=datetime.datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc); print((value + datetime.timedelta(seconds=int(sys.argv[2]))).strftime("%Y-%m-%dT%H:%M:%SZ"))' \
+    "$value" "$seconds"
+}
+
+m2_frequency_monotonic_ns() {
+  /usr/bin/python3 -I -c 'import time; print(time.monotonic_ns())'
+}
+
+m2_frequency_sleep_until() {
+  local run_dir="$1" output_file="$2" deadline_ns="$3"
+  local now_ns remaining_ns remaining_secs after_ns
+  now_ns="$(m2_frequency_monotonic_ns)" || return 1
+  [[ "$now_ns" =~ ^[0-9]+$ && "$deadline_ns" =~ ^[0-9]+$ && \
+    10#$now_ns -lt 10#$deadline_ns ]] || return 1
+  remaining_ns=$((10#$deadline_ns - 10#$now_ns))
+  remaining_secs=$(((remaining_ns + 999999999) / 1000000000))
+  run_m0_logged "$output_file" "$((remaining_secs + 30))" \
+    "$M0_SLEEP_BIN" "$remaining_secs" || return 1
+  m0_assert_run_healthy "$run_dir" || return 1
+  after_ns="$(m2_frequency_monotonic_ns)" || return 1
+  [[ "$after_ns" =~ ^[0-9]+$ && 10#$after_ns -ge 10#$deadline_ns && \
+    $((10#$after_ns - 10#$deadline_ns)) -le 30000000000 ]]
+}
+
+m2_frequency_write_identity() {
+  local output_file="$1" contract_file="$2" resource_dir="$3"
+  local source binary_sha runner_sha candidate_id profile_sha
+  local server_binary_sha server_config_sha observer_sha exit_host target
+  local tuic_port iperf_port
+  source="$(git -C "$REPO" rev-parse HEAD)" || return 1
+  binary_sha="$(sha256_file "$BIN")" || return 1
+  runner_sha="$(sha256_file "$SCRIPT_PATH")" || return 1
+  candidate_id="$(m2_resource_json_value \
+    "$resource_dir/candidate-profile.json" candidate_id)" || return 1
+  profile_sha="$(/usr/bin/python3 -I "$M2_CONTINUITY_LEDGER_HELPER" \
+    frequency-resource-identity \
+    --candidate "$resource_dir/candidate-profile.json")" || return 1
+  [[ "$profile_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  server_binary_sha="$(m2_resource_json_value \
+    "$resource_dir/candidate-profile.json" server_binary_sha256)" || return 1
+  server_config_sha="$(m2_resource_json_value \
+    "$resource_dir/candidate-profile.json" server_config_sha256)" || return 1
+  observer_sha="$(m2_resource_json_value \
+    "$resource_dir/candidate-profile.json" observer_sha256)" || return 1
+  exit_host="$(read_state exit_host)" || return 1
+  target="$(read_state target)" || return 1
+  tuic_port="$(read_state server_port)" || return 1
+  iperf_port="$(read_state iperf_port)" || return 1
+  jq -n \
+    --arg candidate_id "$candidate_id" --arg source_commit "$source" \
+    --arg binary_sha256 "$binary_sha" --arg runner_sha256 "$runner_sha" \
+    --arg resource_profile_sha256 "$profile_sha" \
+    --arg workload_contract_sha256 "$(sha256_file "$contract_file")" \
+    --arg server_binary_sha256 "$server_binary_sha" \
+    --arg server_config_sha256 "$server_config_sha" \
+    --arg observer_sha256 "$observer_sha" --arg exit_ipv4 "$exit_host" \
+    --arg target_ipv4 "$target" --argjson tuic_port "$tuic_port" \
+    --argjson target_iperf_port "$iperf_port" \
+    '{candidate_id:$candidate_id,source_commit:$source_commit,
+      binary_sha256:$binary_sha256,runner_sha256:$runner_sha256,
+      resource_profile_sha256:$resource_profile_sha256,
+      workload_contract_sha256:$workload_contract_sha256,
+      server_binary_sha256:$server_binary_sha256,
+      server_config_sha256:$server_config_sha256,
+      observer_sha256:$observer_sha256,exit_ipv4:$exit_ipv4,
+      target_ipv4:$target_ipv4,tuic_port:$tuic_port,
+      target_iperf_port:$target_iperf_port}' >"$output_file"
 }
 
 runner_self_test() {
@@ -4530,6 +4702,31 @@ EOF_FAKE_SLEEP
     "$m1_stage_run/events.tsv" || \
     die "self-test: formal boundary-loss UDP phase did not complete"
   unset M0_TEST_IPERF_UDP_LOSS
+  SOAK_CONTINUE_RECEIVER_ZERO_ONLY=1
+  SOAK_VIOLATIONS_FILE="$m1_stage_run/frequency-violations.tsv"
+  printf '%s\n' $'timestamp\tcycle\tphase\tkind\tvalue\tdetail\tevidence' \
+    >"$SOAK_VIOLATIONS_FILE"
+  M0_TEST_IPERF_RECEIVER_ZERO=1
+  export M0_TEST_IPERF_RECEIVER_ZERO
+  run_m0_iperf_phase "$m1_stage_run" 43.130.32.77 5201 9 \
+    tcp-forward 1 4522378 0 0 || \
+    die "self-test: receiver-zero-only policy rejected its exact exception"
+  grep -Fq $'\t9\ttcp-forward\treceiver_zero_interval\t1\t' \
+    "$SOAK_VIOLATIONS_FILE" || \
+    die "self-test: receiver-zero-only policy lost its typed evidence"
+  unset M0_TEST_IPERF_RECEIVER_ZERO
+  M0_TEST_IPERF_UDP_LOSS=3.000001
+  export M0_TEST_IPERF_UDP_LOSS
+  if run_m0_iperf_phase "$m1_stage_run" 43.130.32.77 5201 10 \
+    udp-reverse 1 4522378 1 1; then
+    die "self-test: receiver-zero-only policy weakened the UDP loss gate"
+  fi
+  ! grep -Fq $'\t10\tudp-reverse\tudp_loss_percent\t' \
+    "$SOAK_VIOLATIONS_FILE" || \
+    die "self-test: receiver-zero-only policy recorded UDP loss as continuable"
+  unset M0_TEST_IPERF_UDP_LOSS
+  SOAK_CONTINUE_RECEIVER_ZERO_ONLY=0
+  SOAK_VIOLATIONS_FILE=
   m1_run="$tmp/m1-run"
   m1_test_profile="$tmp/m1-test-workload.txt"
   mkdir -p "$m1_run/m1"
@@ -4625,6 +4822,7 @@ EOF_FAKE_SLEEP
   SOAK_LABEL=M1
   SOAK_SUCCESS_STATUS=complete
   SOAK_CONTINUE_DATA_QUALITY=0
+  SOAK_CONTINUE_RECEIVER_ZERO_ONLY=0
   SOAK_VIOLATIONS_FILE=
   SOAK_STAGE=m2
   SOAK_LABEL=M2
@@ -5805,6 +6003,8 @@ EOF_FAIL_IPERF
     die "self-test: M2 qualification did not require paired Exit evidence"
   m2_execution_requires_paired_observer formal || \
     die "self-test: formal M2 did not require paired Exit evidence"
+  m2_execution_requires_paired_observer frequency || \
+    die "self-test: frequency M2 did not require paired Exit evidence"
   ! m2_execution_requires_paired_observer unknown || \
     die "self-test: unknown M2 execution mode acquired observer authority"
   m2_exit_observer_ssh_host_matches_exit \
@@ -5941,6 +6141,37 @@ EOF_FAKE_EXIT_OBSERVER
   M2_EGRESS_TARGET=api.ipify.org:443
   [[ "$(m2_formal_count_model)" == "93 934 95 1029" ]] || \
     die "self-test: M2 formal schedule count model mismatch"
+  M2_FREQUENCY_TIER_A_LEDGER=
+  M2_FREQUENCY_TIER_A_ARTIFACT_ROOT=
+  m2_mode_inputs_are_isolated formal || \
+    die "self-test: strict M2 rejected an empty Tier-B environment"
+  M2_FREQUENCY_TIER_A_LEDGER=/tmp/tier-a-ledger.json
+  M2_FREQUENCY_TIER_A_ARTIFACT_ROOT=/tmp/tier-a-artifacts
+  ! m2_mode_inputs_are_isolated formal || \
+    die "self-test: strict M2 consumed Tier-B admission inputs"
+  m2_mode_inputs_are_isolated frequency || \
+    die "self-test: frequency M2 rejected its explicit Tier-A admission inputs"
+  M2_FREQUENCY_TIER_A_LEDGER=
+  M2_FREQUENCY_TIER_A_ARTIFACT_ROOT=
+  m2_frequency_interrupt_run="$tmp/m2-frequency-interrupt-run"
+  mkdir -p "$m2_frequency_interrupt_run/state"
+  printf 'timestamp\tevent\n' >"$m2_frequency_interrupt_run/events.tsv"
+  if ( STATE_DIR="$m2_frequency_interrupt_run/state" \
+    SOAK_STATUS_FILE=m2-frequency.status SOAK_STAGE=m2-frequency \
+    SOAK_LABEL=M2-FREQUENCY \
+    interrupt_m0 "$m2_frequency_interrupt_run" TERM ); then
+    die "self-test: frequency signal handler returned success"
+  else
+    m2_frequency_interrupt_status=$?
+  fi
+  [[ "$m2_frequency_interrupt_status" == "130" ]] || \
+    die "self-test: frequency signal handler exit status mismatch"
+  grep -Fxq interrupted \
+    "$m2_frequency_interrupt_run/m2-frequency.status" || \
+    die "self-test: frequency signal did not preserve terminal status"
+  grep -Fq $'\tm2-frequency interrupted by TERM; TUN left running for evidence' \
+    "$m2_frequency_interrupt_run/events.tsv" || \
+    die "self-test: frequency signal evidence event missing"
   M2_TOTAL_SECS=86399
   ! validate_m2_formal_config || die "self-test: shortened formal M2 schedule accepted"
   M2_TOTAL_SECS=86400
@@ -7277,7 +7508,8 @@ m0_assert_run_healthy() {
     return 1
   fi
   if [[ ( "$SOAK_STAGE" == "m2" || \
-    "$SOAK_STAGE" == "m2-qualification" ) ]] && \
+    "$SOAK_STAGE" == "m2-qualification" || \
+    "$SOAK_STAGE" == "m2-frequency" ) ]] && \
     ! m2_full_tunnel_is_active; then
     append_event_to "$run_dir" \
       "$SOAK_STAGE health failed: full-tunnel route, DNS, or IPv6 invariant"
@@ -7296,11 +7528,19 @@ run_m0_iperf_phase() {
   local reverse="$8"
   local udp="$9"
   local output_file validation_reason violation_value violation_detail udp_loss
+  local frequency_started_utc= frequency_started_monotonic_ns= frequency_pair
   output_file="$run_dir/$SOAK_EVIDENCE_DIR/cycle_$(printf '%03d' "$cycle")_${phase}.json"
   m0_assert_run_healthy "$run_dir" || return 1
   append_event_to "$run_dir" \
     "$SOAK_STAGE phase start cycle=$cycle phase=$phase duration=$duration rate_bps=$rate_bps"
   m0_progress "$SOAK_LABEL cycle=$cycle phase=$phase duration=${duration}s rate_bps=$rate_bps start"
+  if [[ -n "${SOAK_FREQUENCY_INDEX_FILE:-}" && "$udp" == "0" ]]; then
+    frequency_pair="$(m2_frequency_clock_pair)" || return 1
+    IFS=$'\t' read -r frequency_started_utc frequency_started_monotonic_ns \
+      <<<"$frequency_pair"
+    [[ -n "$frequency_started_utc" && \
+      "$frequency_started_monotonic_ns" =~ ^[0-9]+$ ]] || return 1
+  fi
   if [[ "$udp" == "1" && "$reverse" == "1" ]]; then
     run_m0_logged "$output_file" "$((10#$duration + 30))" \
       "$M0_IPERF3_BIN" -c "$target" -p "$iperf_port" \
@@ -7328,7 +7568,8 @@ run_m0_iperf_phase() {
     "$output_file" "$([[ "$udp" == "1" ]] && echo UDP || echo TCP)" "$reverse")"
   if [[ "$validation_reason" != "ok" ]]; then
     if [[ "$validation_reason" == "receiver_zero_interval" && \
-      "${SOAK_CONTINUE_DATA_QUALITY:-0}" == "1" ]] && \
+      ( "${SOAK_CONTINUE_DATA_QUALITY:-0}" == "1" || \
+        "${SOAK_CONTINUE_RECEIVER_ZERO_ONLY:-0}" == "1" ) ]] && \
       validate_m0_iperf_result "$output_file" \
         "$([[ "$udp" == "1" ]] && echo UDP || echo TCP)" "$reverse" 1; then
       read -r violation_value violation_detail \
@@ -7358,6 +7599,15 @@ run_m0_iperf_phase() {
   fi
   append_event_to "$run_dir" \
     "$SOAK_STAGE phase complete cycle=$cycle phase=$phase"
+  if [[ -n "${SOAK_FREQUENCY_INDEX_FILE:-}" && "$udp" == "0" ]]; then
+    [[ -f "$SOAK_FREQUENCY_INDEX_FILE" && \
+      ! -L "$SOAK_FREQUENCY_INDEX_FILE" ]] || return 1
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "cycle_$(printf '%03d' "$cycle")_${phase}" \
+      "${output_file#"$run_dir"/}" "$reverse" "$frequency_started_utc" \
+      "$frequency_started_monotonic_ns" >>"$SOAK_FREQUENCY_INDEX_FILE" || \
+      return 1
+  fi
   m0_progress "$SOAK_LABEL cycle=$cycle phase=$phase complete"
   if [[ "${M0_RESUME_PENDING:-0}" == "1" ]]; then
     append_event_to "$run_dir" \
@@ -7463,7 +7713,7 @@ run_m0_active_window() {
     done
     ((remaining > 0)) || break
     run_m0_dns_phase "$run_dir" "$dns_target" "$dns_name" "$M0_CYCLE_INDEX" || return 1
-    if [[ "$SOAK_STAGE" == "m2" ]]; then
+    if [[ "$SOAK_STAGE" == "m2" || "$SOAK_STAGE" == "m2-frequency" ]]; then
       M2_COMPLETE_CYCLE_INDEX=$((M2_COMPLETE_CYCLE_INDEX + 1))
     fi
     if [[ "${SOAK_REAL_CLIENT_PROBE:-0}" == "1" ]]; then
@@ -7774,6 +8024,100 @@ run_m2_schedule() {
     append_event_to "$run_dir" "m2 failed"
     return "$result"
   fi
+}
+
+run_m2_frequency_schedule() {
+  local run_dir="$1" profile_file="$2" identity_file="$3" epoch_count="$4"
+  local status_file="$run_dir/m2-frequency.status"
+  local run_id start_pair started_utc ended_utc
+  local started_mono ended_mono epoch_index epoch_dir mode
+  local process_before network_before endpoint_before rest partial_result
+  [[ "$epoch_count" =~ ^[1-4]$ ]] || return 1
+  run_id="frequency-$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+  start_pair="$(m2_frequency_clock_pair)" || return 1
+  IFS=$'\t' read -r started_utc started_mono <<<"$start_pair"
+  [[ -n "$started_utc" && "$started_mono" =~ ^[0-9]+$ ]] || return 1
+  M0_RESUME_PENDING=0
+  printf '%s\n' running >"$status_file" || return 1
+  append_event_to "$run_dir" \
+    "m2-frequency start run_id=$run_id exact_epochs=$epoch_count"
+  for ((epoch_index = 0; epoch_index < 10#$epoch_count; epoch_index++)); do
+    epoch_dir="$run_dir/m2-frequency/epoch_$(printf '%03d' "$((epoch_index + 1))")"
+    mkdir "$epoch_dir" "$epoch_dir/results" "$epoch_dir/real-client" || return 1
+    printf '%s\n' \
+      $'result_id\tpath\treverse\tstarted_utc\tstarted_monotonic_ns' \
+      >"$epoch_dir/tcp-results.tsv" || return 1
+    printf '%s\n' \
+      $'timestamp\tcycle\tphase\tkind\tvalue\tdetail\tevidence' \
+      >"$epoch_dir/continuity-violations.tsv" || return 1
+    ended_utc="$(m2_frequency_utc_plus_seconds "$started_utc" 21600)" || return 1
+    ended_mono=$((10#$started_mono + 21600000000000))
+    case "$epoch_index" in
+      0|3) mode=steady ;;
+      1) mode=quiet ;;
+      2) mode=churn ;;
+      *) return 1 ;;
+    esac
+    sample_once_for "$run_dir" || return 1
+    read -r process_before _ \
+      <<<"$(process_resource_envelope "$run_dir/process.csv")"
+    read -r network_before rest \
+      <<<"$(network_control_envelope "$run_dir/network.csv")"
+    read -r endpoint_before rest \
+      <<<"$(endpoint_resource_envelope "$run_dir/mini_vpn.log")"
+    [[ "$process_before" =~ ^[0-9]+$ && "$network_before" =~ ^[0-9]+$ && \
+      "$endpoint_before" =~ ^[0-9]+$ ]] || return 1
+    SOAK_EVIDENCE_DIR="m2-frequency/epoch_$(printf '%03d' \
+      "$((epoch_index + 1))")/results"
+    M2_REAL_CLIENT_EVIDENCE_DIR="m2-frequency/epoch_$(printf '%03d' \
+      "$((epoch_index + 1))")/real-client"
+    SOAK_FREQUENCY_INDEX_FILE="$epoch_dir/tcp-results.tsv"
+    SOAK_VIOLATIONS_FILE="$epoch_dir/continuity-violations.tsv"
+    M0_CYCLE_INDEX=0
+    M2_COMPLETE_CYCLE_INDEX=0
+    append_event_to "$run_dir" \
+      "m2-frequency epoch start epoch_id=$run_id-$((epoch_index + 1)) index=$epoch_index mode=$mode started_utc=$started_utc started_monotonic_ns=$started_mono"
+    run_m0_active_window "$run_dir" "epoch-$((epoch_index + 1))-$mode" \
+      20700 "$profile_file" "$mode" || return 1
+    [[ "$M0_RESUME_PENDING" == "0" ]] || return 1
+    append_event_to "$run_dir" \
+      "m2-frequency boundary drain start epoch_id=$run_id-$((epoch_index + 1)) deadline_monotonic_ns=$ended_mono"
+    m2_frequency_sleep_until "$run_dir" "$epoch_dir/boundary.sleep.log" \
+      "$ended_mono" || return 1
+    sample_once_for "$run_dir" || return 1
+    m2_exit_observer_require_active "$run_dir" \
+      "$(read_state target)" "$(read_state iperf_port)" \
+      "$(read_state server_port)" || return 1
+    cp "$run_dir/m2-exit-observer-status.txt" \
+      "$epoch_dir/observer-status.txt" || return 1
+    m2_frequency_write_epoch_safety "$run_dir" "$epoch_dir" \
+      "$epoch_dir/real-client" "$epoch_dir/safety.json" \
+      "$process_before" "$network_before" "$endpoint_before" || return 1
+    /usr/bin/python3 -I "$M2_CONTINUITY_LEDGER_HELPER" \
+      build-frequency-epoch --identity "$identity_file" \
+      --safety "$epoch_dir/safety.json" --index "$epoch_dir/tcp-results.tsv" \
+      --evidence-root "$run_dir" --epoch-id "$run_id-$((epoch_index + 1))" \
+      --run-id "$run_id" --run-epoch-index "$epoch_index" \
+      --started-utc "$started_utc" --ended-utc "$ended_utc" \
+      --started-monotonic-ns "$started_mono" \
+      --ended-monotonic-ns "$ended_mono" --output "$epoch_dir/epoch.json" || \
+      return 1
+    partial_result="$run_dir/m2-frequency-result-$((epoch_index + 1)).json"
+    /usr/bin/python3 -I "$M2_CONTINUITY_LEDGER_HELPER" \
+      evaluate-frequency-run --epochs-dir "$run_dir/m2-frequency" \
+      --evidence-root "$run_dir" --output "$partial_result" || return 1
+    [[ "$(m2_resource_json_value "$partial_result" status)" == PASS ]] || \
+      return 1
+    append_event_to "$run_dir" \
+      "m2-frequency epoch sealed epoch_id=$run_id-$((epoch_index + 1)) index=$epoch_index ended_utc=$ended_utc ended_monotonic_ns=$ended_mono"
+    started_utc="$ended_utc"
+    started_mono="$ended_mono"
+  done
+  SOAK_FREQUENCY_INDEX_FILE=
+  SOAK_VIOLATIONS_FILE=
+  printf '%s\n' complete >"$status_file" || return 1
+  append_event_to "$run_dir" \
+    "m2-frequency complete run_id=$run_id sealed_epochs=$epoch_count"
 }
 
 run_m2_qualification_body() {
@@ -8400,7 +8744,8 @@ m2_resource_archive_matches_directory() {
 m2_resource_state_binding_is_valid() {
   local stage="${1:-}" candidate_id="${2:-}"
   local profile_sha="${3:-}" result_sha="${4:-}"
-  [[ "$stage" == m2 || "$stage" == m2-qualification ]] || return 1
+  [[ "$stage" == m2 || "$stage" == m2-qualification || \
+    "$stage" == m2-frequency ]] || return 1
   [[ -n "$candidate_id" && "$profile_sha" =~ ^[0-9a-f]{64}$ && \
     "$result_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
   [[ "$(read_state m2.resource_stage)" == "$stage" && \
@@ -8637,7 +8982,8 @@ m2_resource_binding_is_valid() {
   local candidate_id candidate_profile_sha result_sha archive archive_sha
   local source binary_sha observer_sha exit_host server_port target iperf_port
   local physical_interface
-  [[ "$evidence_name" == m2 || "$evidence_name" == m2-qualification ]] || \
+  [[ "$evidence_name" == m2 || "$evidence_name" == m2-qualification || \
+    "$evidence_name" == m2-frequency ]] || \
     return 1
   resource_dir="$run_dir/${evidence_name}-resource-preflight"
   status_file="$run_dir/${evidence_name}-resource-admission.status"
@@ -8689,7 +9035,8 @@ m2_resource_binding_is_valid() {
 }
 
 m2_execution_requires_paired_observer() {
-  [[ "${1:-}" == "formal" || "${1:-}" == "qualification" ]]
+  [[ "${1:-}" == "formal" || "${1:-}" == "qualification" || \
+    "${1:-}" == "frequency" ]]
 }
 
 m2_exit_observer_value_from_text() {
@@ -9022,6 +9369,102 @@ wait_for_m2_qualification_terminal_safety() {
   m2_qualification_terminal_safety "$run_dir"
 }
 
+m2_frequency_write_epoch_safety() {
+  local run_dir="$1" epoch_dir="$2" real_dir="$3" output_file="$4"
+  local process_before="$5" network_before="$6" endpoint_before="$7"
+  local tcp_results udp_results tcp_gap udp_loss invalid_results
+  local sender_zero receiver_zero dns_results invalid_dns real_results invalid_real
+  local process_after process_delta network_after network_delta endpoint_after
+  local endpoint_delta endpoint_max endpoint_available endpoint_live
+  local endpoint_outstanding endpoint_max_live endpoint_max_outstanding
+  local exit_samples exit_missing exit_rtt gateway_samples gateway_missing
+  local physical_samples exit_loss exit_rtt gateway_loss physical_errors rest
+  local interface_errors internal_failures log_compactions value
+  read -r tcp_results udp_results tcp_gap udp_loss invalid_results \
+    sender_zero receiver_zero <<<"$(m0_result_envelope "$epoch_dir/results")"
+  read -r dns_results invalid_dns \
+    <<<"$(m0_dns_result_envelope "$epoch_dir/results")"
+  read -r real_results invalid_real <<<"$(m2_real_client_envelope "$real_dir")"
+  read -r process_after _ <<<"$(process_resource_envelope "$run_dir/process.csv")"
+  read -r network_after exit_samples exit_missing exit_rtt gateway_samples \
+    gateway_missing physical_samples exit_loss exit_rtt gateway_loss \
+    physical_errors rest <<<"$(network_control_envelope "$run_dir/network.csv")"
+  read -r endpoint_after endpoint_max endpoint_available endpoint_live \
+    endpoint_outstanding endpoint_max_live endpoint_max_outstanding \
+    <<<"$(endpoint_resource_envelope "$run_dir/mini_vpn.log")"
+  for value in "$tcp_results" "$udp_results" "$tcp_gap" "$invalid_results" \
+    "$dns_results" "$invalid_dns" "$real_results" "$invalid_real" \
+    "$process_before" "$process_after" "$network_before" "$network_after" \
+    "$endpoint_before" "$endpoint_after" "$endpoint_max" "$endpoint_live" \
+    "$endpoint_outstanding" "$physical_errors"; do
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  done
+  process_delta=$((10#$process_after - 10#$process_before))
+  network_delta=$((10#$network_after - 10#$network_before))
+  endpoint_delta=$((10#$endpoint_after - 10#$endpoint_before))
+  ((tcp_results > 0 && udp_results > 0 && invalid_results == 0 && \
+    dns_results > 0 && invalid_dns == 0 && real_results > 0 && \
+    invalid_real == 0 && tcp_gap <= 16777216 && process_delta >= 675 && \
+    network_delta >= 675 && endpoint_delta >= 675 && endpoint_max <= 61440 && \
+    endpoint_live == 0 && endpoint_outstanding == 0 && physical_errors == 0)) || \
+    return 1
+  decimal_le "$udp_loss" 3.0 || return 1
+  interface_errors="$(awk -F, '
+    NR > 1 && (($5 ~ /^[0-9]+$/ && $5 + 0 > 0) ||
+      ($8 ~ /^[0-9]+$/ && $8 + 0 > 0)) { count++ }
+    END { print count + 0 }
+  ' "$run_dir/interface.csv" 2>/dev/null)"
+  internal_failures="$(grep -Ec \
+    'pump_full_waits=[1-9][0-9]*|pump_read_errors=[1-9][0-9]*|send_slice_errors=[1-9][0-9]*|tun_flush_tx_failures=[1-9][0-9]*|terminal_pending_reap_bytes=[1-9][0-9]*|reason=stalled_write_timeout|reason=idle_timeout|tuic-endpoint-rebind-failed generation=' \
+    "$run_dir/mini_vpn.log" 2>/dev/null || true)"
+  log_compactions="$(grep -Fc $'\twatchdog compacted mini_vpn.log' \
+    "$run_dir/events.tsv" 2>/dev/null || true)"
+  [[ "$interface_errors" == "0" && "$internal_failures" == "0" && \
+    "$log_compactions" == "0" ]] || return 1
+  m2_resource_binding_is_valid "$run_dir" m2-frequency || return 1
+  network_control_is_sufficient "$run_dir" 5 && network_control_is_recent || \
+    return 1
+  m2_qualification_terminal_safety "$run_dir" || return 1
+  jq -n \
+    --arg schema knife15-m2-frequency-epoch-safety-v1 \
+    --arg status PASS --arg udp_max_loss_percent "$udp_loss" \
+    --argjson tcp_results "$tcp_results" --argjson udp_results "$udp_results" \
+    --argjson tcp_max_gap_bytes "$tcp_gap" \
+    --argjson invalid_result_files "$invalid_results" \
+    --argjson dns_results "$dns_results" --argjson invalid_dns_results "$invalid_dns" \
+    --argjson real_client_results "$real_results" \
+    --argjson invalid_real_client_results "$invalid_real" \
+    --argjson process_samples "$process_delta" \
+    --argjson network_samples "$network_delta" \
+    --argjson endpoint_samples "$endpoint_delta" \
+    --argjson endpoint_conservation_max_bytes "$endpoint_max" \
+    --argjson endpoint_live_bytes "$endpoint_live" \
+    --argjson endpoint_outstanding_bytes "$endpoint_outstanding" \
+    --argjson interface_error_samples "$interface_errors" \
+    --argjson physical_interface_error_samples "$physical_errors" \
+    --argjson internal_failure_matches "$internal_failures" \
+    --argjson log_compactions "$log_compactions" \
+    '{schema:$schema,status:$status,tcp_results:$tcp_results,
+      udp_results:$udp_results,tcp_max_gap_bytes:$tcp_max_gap_bytes,
+      udp_max_loss_percent:$udp_max_loss_percent,
+      invalid_result_files:$invalid_result_files,dns_results:$dns_results,
+      invalid_dns_results:$invalid_dns_results,
+      real_client_results:$real_client_results,
+      invalid_real_client_results:$invalid_real_client_results,
+      process_samples:$process_samples,network_samples:$network_samples,
+      endpoint_samples:$endpoint_samples,
+      endpoint_conservation_max_bytes:$endpoint_conservation_max_bytes,
+      endpoint_live_bytes:$endpoint_live_bytes,
+      endpoint_outstanding_bytes:$endpoint_outstanding_bytes,
+      resource_binding_pass:true,observer_match:true,
+      network_control_pass:true,d16_terminal_ownership_pass:true,
+      recovery_safety_pass:true,interface_error_samples:$interface_error_samples,
+      physical_interface_error_samples:$physical_interface_error_samples,
+      log_compactions:$log_compactions,
+      internal_failure_matches:$internal_failure_matches}' \
+    >"$output_file"
+}
+
 free_kb_for_path() {
   df -Pk "$1" 2>/dev/null | awk 'NR == 2 && $4 ~ /^[0-9]+$/ {print $4; exit}'
 }
@@ -9157,6 +9600,7 @@ run_m2_action() {
   local resource_profile_sha current_source binary_sha observer_sha
   local physical_interface
   local observer_finalization_status=0
+  local frequency_contract_file frequency_identity_file
   case "$execution_mode" in
     formal)
       action_description="formal M2"
@@ -9174,11 +9618,21 @@ run_m2_action() {
       status_file=m2-qualification.status
       M2_REAL_CLIENT_EVIDENCE_DIR=m2-qualification-real-client
       ;;
+    frequency)
+      action_description="Tier-B M2 frequency"
+      stage=m2-frequency
+      label=M2-FREQUENCY
+      evidence_dir=m2-frequency
+      status_file=m2-frequency.status
+      M2_REAL_CLIENT_EVIDENCE_DIR=m2-frequency-real-client
+      ;;
     *)
       die "unknown M2 execution mode: $execution_mode"
       ;;
   esac
   require_root
+  m2_mode_inputs_are_isolated "$execution_mode" || \
+    die "$action_description received inputs owned by a different M2 policy"
   require_command pmset
   m2_prevent_idle_sleep_is_asserted || \
     die "$action_description requires an active PreventUserIdleSystemSleep assertion"
@@ -9187,8 +9641,15 @@ run_m2_action() {
   [[ "$(m2_formal_count_model)" == \
     "$M2_EXPECTED_CYCLES $M2_EXPECTED_TCP_RESULTS $M2_EXPECTED_UDP_RESULTS $M2_EXPECTED_PHASE_RESULTS" ]] || \
     die "$action_description requires the immutable formal M2 count model"
-  m2_source_is_accepted || \
-    die "$action_description requires fail-closed candidate preflight 218467b or a descendant"
+  if [[ "$execution_mode" == frequency ]]; then
+    m2_frequency_source_is_accepted || \
+      die "$action_description requires the reviewed Tier-B source floor"
+    [[ "$M2_FREQUENCY_EPOCHS" =~ ^[1-4]$ ]] || \
+      die "$action_description requires M2_FREQUENCY_EPOCHS in 1..4"
+  else
+    m2_source_is_accepted || \
+      die "$action_description requires fail-closed candidate preflight 218467b or a descendant"
+  fi
   m2_worktree_is_clean || \
     die "$action_description requires a clean worktree, including no untracked files, for exact-source evidence"
   run_dir="$(run_dir_from_state)" || die "no Knife15 run state"
@@ -9200,8 +9661,15 @@ run_m2_action() {
     ! -e "$run_dir/m1.status" && ! -e "$run_dir/m1" && \
     ! -e "$run_dir/m2.status" && ! -e "$run_dir/m2" && \
     ! -e "$run_dir/m2-qualification.status" && \
-    ! -e "$run_dir/m2-qualification" ]] || \
+    ! -e "$run_dir/m2-qualification" && \
+    ! -e "$run_dir/m2-frequency.status" && \
+    ! -e "$run_dir/m2-frequency" ]] || \
     die "this TUN run already has soak evidence; stop and start a fresh run"
+  if [[ "$execution_mode" == frequency ]]; then
+    m2_frequency_tier_a_admission \
+      "$run_dir/m2-frequency-tier-a-admission.json" || \
+      die "$action_description requires the exact reviewed TIER_A_EXHAUSTED ledger/evaluation pair"
+  fi
   [[ -z "$M0_BASELINE_DIR" && -z "$M0_DIRECT_DIR" && \
     -z "$M1_BASELINE_DIR" && -z "$M1_DIRECT_DIR" ]] || \
     die "$action_description requires every M0/M1 baseline and direct variable to be unset"
@@ -9323,11 +9791,11 @@ run_m2_action() {
       "$stage Exit observer admission complete target=$target iperf_port=$iperf_port tuic_port=$server_port"
   fi
 
-  if [[ "$execution_mode" == "formal" ]]; then
+  if [[ "$execution_mode" == "formal" || "$execution_mode" == "frequency" ]]; then
     m2_exit_observer_arm "$run_dir" "$target" "$iperf_port" "$server_port"
     trap 'm2_exit_observer_exit_trap "$?"' EXIT
     append_event_to "$run_dir" \
-      "m2 Exit observer ownership armed target=$target iperf_port=$iperf_port tuic_port=$server_port"
+      "$stage Exit observer ownership armed target=$target iperf_port=$iperf_port tuic_port=$server_port"
   fi
 
   mkdir "$run_dir/$evidence_dir" "$baseline_evidence_dir" "$direct_evidence_dir" \
@@ -9363,6 +9831,19 @@ run_m2_action() {
     "resource_preflight_dir=$M2_RESOURCE_PREFLIGHT_DIR" \
     "resource_preflight_result_sha256=$(sha256_file "$resource_evidence_dir/result.txt")" \
     >>"$profile_file" || die "cannot bind direct evidence to M2 profile"
+  if [[ "$execution_mode" == frequency ]]; then
+    frequency_contract_file="$run_dir/m2-frequency-workload-contract.txt"
+    frequency_identity_file="$run_dir/m2-frequency-identity.json"
+    write_m2_frequency_contract "$profile_file" "$frequency_contract_file" || {
+      printf '%s\n' failed >"$run_dir/$status_file"
+      die "cannot derive the immutable Tier-B workload contract"
+    }
+    m2_frequency_write_identity "$frequency_identity_file" \
+      "$frequency_contract_file" "$resource_evidence_dir" || {
+      printf '%s\n' failed >"$run_dir/$status_file"
+      die "cannot bind the Tier-B source/resource/observer identity"
+    }
+  fi
   append_event_to "$run_dir" \
     "$stage prepared baseline=$(basename "$M2_BASELINE_DIR") profile=$(sha256_file "$profile_file")"
   if ! m2_resource_binding_is_valid "$run_dir" "$evidence_dir"; then
@@ -9385,6 +9866,8 @@ run_m2_action() {
   SOAK_STATUS_FILE="$status_file"
   SOAK_SUCCESS_STATUS=complete
   SOAK_CONTINUE_DATA_QUALITY=0
+  SOAK_CONTINUE_RECEIVER_ZERO_ONLY=0
+  [[ "$execution_mode" == frequency ]] && SOAK_CONTINUE_RECEIVER_ZERO_ONLY=1
   SOAK_VIOLATIONS_FILE=
   SOAK_REAL_CLIENT_PROBE=1
   sample_once_for "$run_dir" || true
@@ -9443,6 +9926,56 @@ run_m2_action() {
   trap "interrupt_m0 '$run_dir' INT" INT
   trap "interrupt_m0 '$run_dir' TERM" TERM
   trap "interrupt_m0 '$run_dir' HUP" HUP
+  if [[ "$execution_mode" == "frequency" ]]; then
+    echo "Starting Tier-B M2 frequency workload; each epoch is exactly six hours."
+    echo "This run requests $M2_FREQUENCY_EPOCHS epoch(s); four epochs exercise one uninterrupted 24-hour TUN/process lifetime."
+    if run_m2_frequency_schedule "$run_dir" "$profile_file" \
+      "$frequency_identity_file" "$M2_FREQUENCY_EPOCHS"; then
+      trap - INT TERM HUP
+      if ! m2_exit_observer_finalize_armed workload-complete; then
+        printf '%s\n' failed >"$run_dir/m2-frequency.status"
+        append_event_to "$run_dir" \
+          "m2-frequency failed: Exit observer finalization"
+        clear_workload_state
+        write_summary "$run_dir"
+        die "M2 frequency epochs completed but Exit observer freeze/bundle failed; use status/snapshot/stop"
+      fi
+      clear_workload_state
+      sample_once_for "$run_dir" || true
+      if ! m2_resource_binding_is_valid "$run_dir" m2-frequency || \
+        ! m0_assert_run_healthy "$run_dir" || \
+        ! network_control_is_sufficient "$run_dir" 5 || \
+        ! m2_qualification_terminal_safety "$run_dir"; then
+        printf '%s\n' failed >"$run_dir/m2-frequency.status"
+        append_event_to "$run_dir" \
+          "m2-frequency failed: final health, resource, or Endpoint evidence"
+        write_summary "$run_dir"
+        die "M2 frequency traffic passed but final safety evidence failed; use status/snapshot/stop"
+      fi
+      printf '%s\n' \
+        'm2_frequency_epoch_evidence=PASS' \
+        'tier_b_acceptance=PENDING_LEDGER_AND_CLEANUP' \
+        >"$run_dir/m2-frequency-pre-stop-verdict.txt" || \
+        die "cannot record the Tier-B pre-stop verdict"
+      write_summary "$run_dir"
+      echo "PASS: $M2_FREQUENCY_EPOCHS Tier-B epoch(s) completed; ledger and cleanup acceptance are pending."
+      echo "run_dir=$run_dir"
+      echo "Next: sudo -E bash scripts/knife15-macos-soak.sh status"
+      echo "Then: sudo -E bash scripts/knife15-macos-soak.sh stop"
+      return 0
+    fi
+    trap - INT TERM HUP
+    printf '%s\n' failed >"$run_dir/m2-frequency.status" || \
+      warn "cannot mark the failed M2 frequency parent run"
+    m2_exit_observer_finalize_armed workload-failed || \
+      observer_finalization_status=$?
+    clear_workload_state
+    sample_once_for "$run_dir" || true
+    if [[ "$observer_finalization_status" != "0" ]]; then
+      warn "M2 frequency failed and Exit observer finalization also failed; preserve completed epochs and recover observer evidence"
+    fi
+    die "M2 frequency workload failed; completed sealed epochs remain evidence, and full tunnel/TUN remain for status/snapshot/stop"
+  fi
   if [[ "$execution_mode" == "qualification" ]]; then
     echo "Starting Knife15 M2 qualification; two exact mixed cycles take about 30 minutes."
     echo "This action can never satisfy formal M2 acceptance."
@@ -9541,10 +10074,15 @@ show_status() {
   echo "m2_status=$(sed -n '1p' "$run_dir/m2.status" 2>/dev/null || echo not_run)"
   echo "m2_qualification_status=$(sed -n '1p' \
     "$run_dir/m2-qualification.status" 2>/dev/null || echo not_run)"
+  echo "m2_frequency_status=$(sed -n '1p' \
+    "$run_dir/m2-frequency.status" 2>/dev/null || echo not_run)"
   echo "m2_resource_admission=$(sed -n '1p' \
     "$run_dir/m2-resource-admission.status" 2>/dev/null || echo not_run)"
   echo "m2_qualification_resource_admission=$(sed -n '1p' \
     "$run_dir/m2-qualification-resource-admission.status" \
+    2>/dev/null || echo not_run)"
+  echo "m2_frequency_resource_admission=$(sed -n '1p' \
+    "$run_dir/m2-frequency-resource-admission.status" \
     2>/dev/null || echo not_run)"
   echo "m2_resource_stage=$(read_state m2.resource_stage 2>/dev/null || echo not_run)"
   echo "m2_resource_candidate=$(read_state m2.resource_candidate 2>/dev/null || echo not_run)"
@@ -9833,6 +10371,83 @@ append_m2_qualification_summary() {
 - m2_qualification_verdict: $verdict
 - m2_qualification_formal_m2_acceptance: NOT_RUN
 EOF_M2_QUALIFICATION_SUMMARY
+}
+
+append_m2_frequency_summary() {
+  local run_dir="$1"
+  local status sealed_epochs local_status=not_run pre_stop=MISMATCH
+  local resource_admission resource_candidate=not_run resource_profile=not_run
+  local full_tunnel_state cleanup_complete cleanup_restored=MISMATCH verdict
+  local latest_result result_file
+  status="$(sed -n '1p' "$run_dir/m2-frequency.status" 2>/dev/null || true)"
+  status="${status:-not_run}"
+  sealed_epochs="$(grep -Fc $'\tm2-frequency epoch sealed ' \
+    "$run_dir/events.tsv" 2>/dev/null || true)"
+  latest_result=
+  for result_file in "$run_dir"/m2-frequency-result-*.json; do
+    [[ -f "$result_file" && ! -L "$result_file" ]] || continue
+    latest_result="$result_file"
+  done
+  if [[ -n "$latest_result" ]]; then
+    local_status="$(m2_resource_json_value "$latest_result" status \
+      2>/dev/null || echo invalid)"
+  fi
+  if [[ -f "$run_dir/m2-frequency-pre-stop-verdict.txt" && \
+    "$(sed -n '1p' "$run_dir/m2-frequency-pre-stop-verdict.txt")" == \
+      m2_frequency_epoch_evidence=PASS && \
+    "$(sed -n '2p' "$run_dir/m2-frequency-pre-stop-verdict.txt")" == \
+      tier_b_acceptance=PENDING_LEDGER_AND_CLEANUP && \
+    "$(awk 'END { print NR + 0 }' \
+      "$run_dir/m2-frequency-pre-stop-verdict.txt")" == 2 ]]; then
+    pre_stop=PASS
+  elif [[ "$status" == not_run ]]; then
+    pre_stop=NOT_RUN
+  fi
+  resource_admission="$(sed -n '1p' \
+    "$run_dir/m2-frequency-resource-admission.status" 2>/dev/null || true)"
+  resource_admission="${resource_admission:-not_run}"
+  if [[ -f "$run_dir/m2-frequency-resource-preflight/candidate-profile.json" ]]; then
+    resource_candidate="$(m2_resource_json_value \
+      "$run_dir/m2-frequency-resource-preflight/candidate-profile.json" \
+      candidate_id 2>/dev/null || echo invalid)"
+    resource_profile="$(m2_resource_json_value \
+      "$run_dir/m2-frequency-resource-preflight/eligibility.json" \
+      candidate_profile_sha256 2>/dev/null || echo invalid)"
+  fi
+  full_tunnel_state="$(read_state m2.full_tunnel 2>/dev/null || true)"
+  full_tunnel_state="${full_tunnel_state:-not_run}"
+  cleanup_complete="$(grep -Fc $'\tstop cleanup complete' \
+    "$run_dir/events.tsv" 2>/dev/null || true)"
+  if [[ "$full_tunnel_state" == inactive ]] && m2_full_tunnel_is_restored; then
+    cleanup_restored=PASS
+  fi
+  if [[ "$status" == complete && "$pre_stop" == PASS && \
+    "$local_status" == PASS && "$cleanup_complete" =~ ^[1-9][0-9]*$ && \
+    "$cleanup_restored" == PASS ]]; then
+    verdict=SEALED_PENDING_LEDGER
+  elif [[ "$status" == complete && "$pre_stop" == PASS && \
+    "$local_status" == PASS && "$full_tunnel_state" == active ]]; then
+    verdict=PENDING_CLEANUP
+  elif [[ "$status" == not_run ]]; then
+    verdict=NOT_RUN
+  else
+    verdict=FAIL_OR_INCOMPLETE
+  fi
+  cat >>"$run_dir/summary.md" <<EOF_M2_FREQUENCY_SUMMARY
+
+## Knife15 M2 Frequency
+
+- m2_frequency_status: $status
+- m2_frequency_sealed_epochs: ${sealed_epochs:-0}
+- m2_frequency_local_reducer: $local_status
+- m2_frequency_resource_admission: $resource_admission
+- m2_frequency_resource_candidate: $resource_candidate
+- m2_frequency_resource_profile_sha256: $resource_profile
+- m2_frequency_pre_stop_evidence: $pre_stop
+- m2_frequency_cleanup_restored: $cleanup_restored
+- tier_b_run_verdict: $verdict
+- tier_b_acceptance: PENDING_IMMUTABLE_12_EPOCH_LEDGER
+EOF_M2_FREQUENCY_SUMMARY
 }
 
 write_summary() {
@@ -10375,6 +10990,7 @@ counters, close-tail ownership, and cleanup together.
 EOF_SUMMARY
   append_m2_summary "$run_dir"
   append_m2_qualification_summary "$run_dir"
+  append_m2_frequency_summary "$run_dir"
 }
 
 bundle_is_finalized() {
@@ -10674,6 +11290,9 @@ case "$ACTION" in
     ;;
   m2-qualification)
     run_m2_action qualification
+    ;;
+  m2-frequency)
+    run_m2_action frequency
     ;;
   m2)
     run_m2_action formal
