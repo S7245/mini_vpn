@@ -23,9 +23,11 @@ pub use capacity::{
 };
 
 pub use protocol::{
-    AttachNonce, AttachProof, ByteOffset, Direction, FRAME_HEADER_BYTES, FRAME_PROTOCOL_VERSION,
-    FeatureSet, Frame, LegGeneration, MAX_DATA_PAYLOAD_BYTES, OpenResultCode, ProtocolError,
-    Record, ResetReason, SESSION_PROTOCOL_VERSION, SessionFlowId, SessionId, ValidatedFrameHeader,
+    AttachNonce, AttachProof, ByteOffset, DecodedFrame, Direction, FRAME_HEADER_BYTES,
+    FRAME_PROTOCOL_VERSION, FeatureSet, Frame, HintSequence, LegControlFrame, LegControlRecord,
+    LegEpochNonce, LegGeneration, MAX_DATA_PAYLOAD_BYTES, OpenResultCode, ProbeSequence,
+    ProtocolError, Record, ResetReason, SESSION_PROTOCOL_VERSION, STANDBY_CONTROL_V1,
+    SessionFlowId, SessionId, StandbyNonce, StandbyProof, SwitchHintCause, ValidatedFrameHeader,
 };
 pub use session::{
     FlowFinishReason, LocalFlow, PeerOpenRequest, ReceiveBudgetLimits, ReplayAcknowledged,

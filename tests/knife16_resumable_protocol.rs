@@ -1,8 +1,10 @@
 use bytes::Bytes;
 use mini_vpn::resumable::{
-    AttachNonce, AttachProof, ByteOffset, Direction, FRAME_HEADER_BYTES, FeatureSet, Frame,
-    LegGeneration, MAX_DATA_PAYLOAD_BYTES, OpenResultCode, ProtocolError, Record, ResetReason,
-    SessionFlowId, SessionId, ValidatedFrameHeader,
+    AttachNonce, AttachProof, ByteOffset, DecodedFrame, Direction, FRAME_HEADER_BYTES, FeatureSet,
+    Frame, HintSequence, LegControlFrame, LegControlRecord, LegEpochNonce, LegGeneration,
+    MAX_DATA_PAYLOAD_BYTES, OpenResultCode, ProbeSequence, ProtocolError, Record, ResetReason,
+    SESSION_PROTOCOL_VERSION, STANDBY_CONTROL_V1, SessionFlowId, SessionId, StandbyNonce,
+    StandbyProof, SwitchHintCause, ValidatedFrameHeader,
 };
 use mini_vpn::shared::TargetAddr;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
@@ -11,6 +13,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 fn valid_frame(leg_generation: LegGeneration, record: Record) -> Frame {
     Frame::try_new(leg_generation, record).expect("test record must construct a valid frame")
+}
+
+fn valid_leg_control_frame(
+    leg_generation: LegGeneration,
+    record: LegControlRecord,
+) -> LegControlFrame {
+    LegControlFrame::try_new(leg_generation, record, STANDBY_CONTROL_V1)
+        .expect("test record must construct a valid feature-gated leg-control frame")
 }
 
 struct TrackedBacking {
@@ -695,6 +705,472 @@ fn v1_wire_golden_vectors_freeze_every_record_and_target_encoding() {
             "decode {name}"
         );
     }
+}
+
+#[test]
+fn standby_control_v1_wire_golden_vectors_freeze_all_five_leg_control_records() {
+    assert_eq!(STANDBY_CONTROL_V1.bits(), 0x10);
+    assert_eq!(FeatureSet::STANDBY_CONTROL_V1, STANDBY_CONTROL_V1);
+    let leg = LegGeneration::new(0x0102_0304_0506_0708).unwrap();
+    let session_id = SessionId::new([0x11; 16]).unwrap();
+    let standby_nonce = StandbyNonce::new([0x22; 16]).unwrap();
+    let leg_epoch_nonce = LegEpochNonce::new([0x44; 16]).unwrap();
+    let records = [
+        (
+            "standby_register",
+            valid_leg_control_frame(
+                leg,
+                LegControlRecord::StandbyRegister {
+                    session_id,
+                    standby_nonce,
+                    selected_version: SESSION_PROTOCOL_VERSION,
+                    features: STANDBY_CONTROL_V1,
+                    proof: StandbyProof::new([0x33; 32]).unwrap(),
+                },
+            ),
+        ),
+        (
+            "standby_accepted",
+            valid_leg_control_frame(
+                leg,
+                LegControlRecord::StandbyAccepted {
+                    session_id,
+                    standby_nonce,
+                    selected_version: SESSION_PROTOCOL_VERSION,
+                    features: STANDBY_CONTROL_V1,
+                },
+            ),
+        ),
+        (
+            "leg_probe",
+            valid_leg_control_frame(
+                leg,
+                LegControlRecord::LegProbe {
+                    session_id,
+                    leg_epoch_nonce,
+                    probe_sequence: ProbeSequence::new(5).unwrap(),
+                },
+            ),
+        ),
+        (
+            "leg_probe_ack",
+            valid_leg_control_frame(
+                leg,
+                LegControlRecord::LegProbeAck {
+                    session_id,
+                    leg_epoch_nonce,
+                    probe_sequence: ProbeSequence::new(5).unwrap(),
+                },
+            ),
+        ),
+        (
+            "switch_hint",
+            valid_leg_control_frame(
+                leg,
+                LegControlRecord::SwitchHint {
+                    session_id,
+                    standby_nonce,
+                    hint_sequence: HintSequence::new(6).unwrap(),
+                    flow_id: SessionFlowId::new(9).unwrap(),
+                    direction: Direction::TargetToClient,
+                    oldest_unacknowledged: ByteOffset::new(16),
+                    cause: SwitchHintCause::ReverseApplicationAckStall,
+                },
+            ),
+        ),
+    ];
+    let expected_hex = [
+        "4d56504e00010a000000005201020304050607081111111111111111111111111111111122222222222222222222222222222222000100000000000000103333333333333333333333333333333333333333333333333333333333333333",
+        "4d56504e00010b00000000320102030405060708111111111111111111111111111111112222222222222222222222222222222200010000000000000010",
+        "4d56504e00010c0000000030010203040506070811111111111111111111111111111111444444444444444444444444444444440000000000000005",
+        "4d56504e00010d0000000030010203040506070811111111111111111111111111111111444444444444444444444444444444440000000000000005",
+        "4d56504e00010e000000004301020304050607081111111111111111111111111111111122222222222222222222222222222222000000000000000600000000000000090100000000000000100001",
+    ];
+
+    for ((name, frame), expected_hex) in records.into_iter().zip(expected_hex) {
+        let expected = decode_hex(expected_hex);
+        assert_eq!(
+            frame.encode(STANDBY_CONTROL_V1).unwrap().as_ref(),
+            expected,
+            "encode {name}"
+        );
+        assert_eq!(
+            DecodedFrame::decode_exact(&expected, STANDBY_CONTROL_V1).unwrap(),
+            DecodedFrame::LegControl(frame),
+            "decode {name}"
+        );
+    }
+}
+
+#[test]
+fn standby_control_requires_negotiation_and_is_classified_away_from_session_frames() {
+    let leg = LegGeneration::new(2).unwrap();
+    let record = LegControlRecord::StandbyRegister {
+        session_id: SessionId::new([0x11; 16]).unwrap(),
+        standby_nonce: StandbyNonce::new([0x22; 16]).unwrap(),
+        selected_version: SESSION_PROTOCOL_VERSION,
+        features: STANDBY_CONTROL_V1,
+        proof: StandbyProof::new([0x33; 32]).unwrap(),
+    };
+    assert_eq!(
+        LegControlFrame::try_new(leg, record.clone(), FeatureSet::new(0)),
+        Err(ProtocolError::StandbyControlNotNegotiated { negotiated: 0 })
+    );
+    let frame = valid_leg_control_frame(leg, record);
+    assert_eq!(
+        frame.encode(FeatureSet::new(0)),
+        Err(ProtocolError::StandbyControlNotNegotiated { negotiated: 0 })
+    );
+    let encoded = frame.encode(STANDBY_CONTROL_V1).unwrap();
+    assert_eq!(
+        DecodedFrame::decode_owned_exact(encoded.clone(), STANDBY_CONTROL_V1).unwrap(),
+        DecodedFrame::LegControl(frame.clone())
+    );
+    assert_eq!(
+        ValidatedFrameHeader::decode(&encoded),
+        Err(ProtocolError::StandbyControlNotNegotiated { negotiated: 0 })
+    );
+    assert_eq!(
+        Frame::decode_exact(&encoded),
+        Err(ProtocolError::StandbyControlNotNegotiated { negotiated: 0 })
+    );
+    assert_eq!(
+        DecodedFrame::decode_exact(&encoded, FeatureSet::new(0)),
+        Err(ProtocolError::StandbyControlNotNegotiated { negotiated: 0 })
+    );
+
+    let header = ValidatedFrameHeader::decode_with_features(&encoded, STANDBY_CONTROL_V1).unwrap();
+    let body = Bytes::copy_from_slice(&encoded[FRAME_HEADER_BYTES..]);
+    assert_eq!(
+        header.decode_body(body.clone()),
+        Err(ProtocolError::LegControlRequiresClassification)
+    );
+    assert!(matches!(
+        header.decode_classified_body(body).unwrap(),
+        DecodedFrame::LegControl(_)
+    ));
+
+    let session = valid_frame(
+        leg,
+        Record::Reset {
+            flow_id: SessionFlowId::new(1).unwrap(),
+            reason: ResetReason::Unspecified,
+        },
+    );
+    assert!(matches!(
+        DecodedFrame::decode_exact(&session.encode().unwrap(), STANDBY_CONTROL_V1).unwrap(),
+        DecodedFrame::Session(decoded) if decoded == session
+    ));
+
+    assert_eq!(
+        LegControlFrame::try_new(
+            leg,
+            LegControlRecord::StandbyAccepted {
+                session_id: SessionId::new([0x11; 16]).unwrap(),
+                standby_nonce: StandbyNonce::new([0x22; 16]).unwrap(),
+                selected_version: SESSION_PROTOCOL_VERSION,
+                features: FeatureSet::new(0),
+            },
+            STANDBY_CONTROL_V1,
+        ),
+        Err(ProtocolError::StandbyControlFeatureMissing { features: 0 })
+    );
+}
+
+#[test]
+fn leg_control_envelope_is_the_only_active_generation_authority() {
+    let leg = LegGeneration::new(0x0102_0304_0506_0708).unwrap();
+    let session_id = SessionId::new([0x11; 16]).unwrap();
+    let standby_nonce = StandbyNonce::new([0x22; 16]).unwrap();
+    let frame = valid_leg_control_frame(
+        leg,
+        LegControlRecord::StandbyAccepted {
+            session_id,
+            standby_nonce,
+            selected_version: SESSION_PROTOCOL_VERSION,
+            features: STANDBY_CONTROL_V1,
+        },
+    );
+    let encoded = frame.encode(STANDBY_CONTROL_V1).unwrap();
+
+    assert_eq!(frame.leg_generation(), leg);
+    assert_eq!(&encoded[12..20], &leg.get().to_be_bytes());
+    assert_eq!(&encoded[20..36], session_id.as_bytes());
+    assert_eq!(&encoded[36..52], standby_nonce.as_bytes());
+    assert!(matches!(
+        frame.record(),
+        LegControlRecord::StandbyAccepted {
+            session_id: decoded_session,
+            standby_nonce: decoded_nonce,
+            ..
+        } if *decoded_session == session_id && *decoded_nonce == standby_nonce
+    ));
+}
+
+#[test]
+fn malformed_standby_control_records_fail_closed_at_every_parser_boundary() {
+    let leg = LegGeneration::new(2).unwrap();
+    let session_id = SessionId::new([0x11; 16]).unwrap();
+    let standby_nonce = StandbyNonce::new([0x22; 16]).unwrap();
+    let leg_epoch_nonce = LegEpochNonce::new([0x44; 16]).unwrap();
+    let frames = [
+        (
+            0x0a,
+            82usize,
+            valid_leg_control_frame(
+                leg,
+                LegControlRecord::StandbyRegister {
+                    session_id,
+                    standby_nonce,
+                    selected_version: SESSION_PROTOCOL_VERSION,
+                    features: STANDBY_CONTROL_V1,
+                    proof: StandbyProof::new([0x33; 32]).unwrap(),
+                },
+            ),
+        ),
+        (
+            0x0b,
+            50,
+            valid_leg_control_frame(
+                leg,
+                LegControlRecord::StandbyAccepted {
+                    session_id,
+                    standby_nonce,
+                    selected_version: SESSION_PROTOCOL_VERSION,
+                    features: STANDBY_CONTROL_V1,
+                },
+            ),
+        ),
+        (
+            0x0c,
+            48,
+            valid_leg_control_frame(
+                leg,
+                LegControlRecord::LegProbe {
+                    session_id,
+                    leg_epoch_nonce,
+                    probe_sequence: ProbeSequence::new(5).unwrap(),
+                },
+            ),
+        ),
+        (
+            0x0d,
+            48,
+            valid_leg_control_frame(
+                leg,
+                LegControlRecord::LegProbeAck {
+                    session_id,
+                    leg_epoch_nonce,
+                    probe_sequence: ProbeSequence::new(5).unwrap(),
+                },
+            ),
+        ),
+        (
+            0x0e,
+            67,
+            valid_leg_control_frame(
+                leg,
+                LegControlRecord::SwitchHint {
+                    session_id,
+                    standby_nonce,
+                    hint_sequence: HintSequence::new(6).unwrap(),
+                    flow_id: SessionFlowId::new(9).unwrap(),
+                    direction: Direction::TargetToClient,
+                    oldest_unacknowledged: ByteOffset::new(16),
+                    cause: SwitchHintCause::ReverseApplicationAckStall,
+                },
+            ),
+        ),
+    ];
+
+    for (record_type, body_len, frame) in frames.clone() {
+        let encoded = frame.encode(STANDBY_CONTROL_V1).unwrap();
+        for (declared, expected) in [
+            (
+                body_len - 1,
+                ProtocolError::InvalidRecordLength {
+                    record_type,
+                    len: body_len - 1,
+                },
+            ),
+            (body_len + 1, ProtocolError::FrameTooLarge),
+        ] {
+            let mut bad = encoded[..FRAME_HEADER_BYTES].to_vec();
+            bad[8..12].copy_from_slice(&(declared as u32).to_be_bytes());
+            assert_eq!(
+                ValidatedFrameHeader::decode_with_features(&bad, STANDBY_CONTROL_V1),
+                Err(expected)
+            );
+        }
+
+        let mut truncated = encoded.to_vec();
+        truncated.pop();
+        assert!(matches!(
+            DecodedFrame::decode_exact(&truncated, STANDBY_CONTROL_V1),
+            Err(ProtocolError::Truncated { .. })
+        ));
+        let mut trailing = encoded.to_vec();
+        trailing.push(0);
+        assert!(matches!(
+            DecodedFrame::decode_exact(&trailing, STANDBY_CONTROL_V1),
+            Err(ProtocolError::TrailingBytes { .. })
+        ));
+    }
+
+    let mut unknown = frames[0].2.encode(STANDBY_CONTROL_V1).unwrap().to_vec();
+    unknown[6] = 0x0f;
+    assert_eq!(
+        ValidatedFrameHeader::decode_with_features(&unknown, STANDBY_CONTROL_V1),
+        Err(ProtocolError::UnknownRecordType(0x0f))
+    );
+
+    let mut register = frames[0].2.encode(STANDBY_CONTROL_V1).unwrap().to_vec();
+    register[12..20].fill(0);
+    assert_eq!(
+        DecodedFrame::decode_exact(&register, STANDBY_CONTROL_V1),
+        Err(ProtocolError::ZeroLegGeneration)
+    );
+    let mut register = frames[0].2.encode(STANDBY_CONTROL_V1).unwrap().to_vec();
+    register[20..36].fill(0);
+    assert_eq!(
+        DecodedFrame::decode_exact(&register, STANDBY_CONTROL_V1),
+        Err(ProtocolError::ZeroSessionId)
+    );
+    let mut register = frames[0].2.encode(STANDBY_CONTROL_V1).unwrap().to_vec();
+    register[36..52].fill(0);
+    assert_eq!(
+        DecodedFrame::decode_exact(&register, STANDBY_CONTROL_V1),
+        Err(ProtocolError::ZeroStandbyNonce)
+    );
+    let mut register = frames[0].2.encode(STANDBY_CONTROL_V1).unwrap().to_vec();
+    register[52..54].fill(0);
+    assert_eq!(
+        DecodedFrame::decode_exact(&register, STANDBY_CONTROL_V1),
+        Err(ProtocolError::InvalidVersionRange { min: 0, max: 0 })
+    );
+    let mut register = frames[0].2.encode(STANDBY_CONTROL_V1).unwrap().to_vec();
+    register[54..62].fill(0);
+    assert_eq!(
+        DecodedFrame::decode_exact(&register, STANDBY_CONTROL_V1),
+        Err(ProtocolError::StandbyControlFeatureMissing { features: 0 })
+    );
+    let mut register = frames[0].2.encode(STANDBY_CONTROL_V1).unwrap().to_vec();
+    register[62..94].fill(0);
+    assert_eq!(
+        DecodedFrame::decode_exact(&register, STANDBY_CONTROL_V1),
+        Err(ProtocolError::ZeroStandbyProof)
+    );
+
+    let mut probe = frames[2].2.encode(STANDBY_CONTROL_V1).unwrap().to_vec();
+    probe[36..52].fill(0);
+    assert_eq!(
+        DecodedFrame::decode_exact(&probe, STANDBY_CONTROL_V1),
+        Err(ProtocolError::ZeroLegEpochNonce)
+    );
+    let mut probe = frames[2].2.encode(STANDBY_CONTROL_V1).unwrap().to_vec();
+    probe[52..60].fill(0);
+    assert_eq!(
+        DecodedFrame::decode_exact(&probe, STANDBY_CONTROL_V1),
+        Err(ProtocolError::ZeroProbeSequence)
+    );
+
+    let mut hint = frames[4].2.encode(STANDBY_CONTROL_V1).unwrap().to_vec();
+    hint[52..60].fill(0);
+    assert_eq!(
+        DecodedFrame::decode_exact(&hint, STANDBY_CONTROL_V1),
+        Err(ProtocolError::ZeroHintSequence)
+    );
+    let mut hint = frames[4].2.encode(STANDBY_CONTROL_V1).unwrap().to_vec();
+    hint[60..68].fill(0);
+    assert_eq!(
+        DecodedFrame::decode_exact(&hint, STANDBY_CONTROL_V1),
+        Err(ProtocolError::ZeroFlowId)
+    );
+    let mut hint = frames[4].2.encode(STANDBY_CONTROL_V1).unwrap().to_vec();
+    hint[68] = 0;
+    assert_eq!(
+        DecodedFrame::decode_exact(&hint, STANDBY_CONTROL_V1),
+        Err(ProtocolError::InvalidSwitchHintDirection(
+            Direction::ClientToTarget
+        ))
+    );
+    let mut hint = frames[4].2.encode(STANDBY_CONTROL_V1).unwrap().to_vec();
+    hint[68] = 2;
+    assert_eq!(
+        DecodedFrame::decode_exact(&hint, STANDBY_CONTROL_V1),
+        Err(ProtocolError::InvalidDirection(2))
+    );
+    let mut hint = frames[4].2.encode(STANDBY_CONTROL_V1).unwrap().to_vec();
+    hint[77..79].copy_from_slice(&u16::MAX.to_be_bytes());
+    assert_eq!(
+        DecodedFrame::decode_exact(&hint, STANDBY_CONTROL_V1),
+        Err(ProtocolError::InvalidSwitchHintCause(u16::MAX))
+    );
+}
+
+#[test]
+fn standby_control_nonce_and_sequence_types_reject_zero_and_checked_overflow() {
+    assert_eq!(
+        StandbyNonce::new([0; 16]),
+        Err(ProtocolError::ZeroStandbyNonce)
+    );
+    assert_eq!(
+        LegEpochNonce::new([0; 16]),
+        Err(ProtocolError::ZeroLegEpochNonce)
+    );
+    assert_eq!(ProbeSequence::new(0), Err(ProtocolError::ZeroProbeSequence));
+    assert_eq!(HintSequence::new(0), Err(ProtocolError::ZeroHintSequence));
+    assert_eq!(
+        StandbyProof::new([0; 32]),
+        Err(ProtocolError::ZeroStandbyProof)
+    );
+    assert_eq!(
+        ProbeSequence::new(u64::MAX).unwrap().checked_next(),
+        Err(ProtocolError::ProbeSequenceOverflow)
+    );
+    assert_eq!(
+        HintSequence::new(u64::MAX).unwrap().checked_next(),
+        Err(ProtocolError::HintSequenceOverflow)
+    );
+
+    let attach_nonce = AttachNonce::new([0x55; 16]).unwrap();
+    let standby_nonce = StandbyNonce::new([0x66; 16]).unwrap();
+    assert_eq!(
+        LegEpochNonce::from(attach_nonce).as_bytes(),
+        attach_nonce.as_bytes()
+    );
+    assert_eq!(
+        LegEpochNonce::from(standby_nonce).as_bytes(),
+        standby_nonce.as_bytes()
+    );
+}
+
+#[test]
+fn standby_control_debug_redacts_proof_and_nonce_material() {
+    let proof = StandbyProof::new([0x5a; 32]).unwrap();
+    let standby_nonce = StandbyNonce::new([0x4e; 16]).unwrap();
+    let leg_epoch_nonce = LegEpochNonce::from(standby_nonce);
+    let frame = valid_leg_control_frame(
+        LegGeneration::new(2).unwrap(),
+        LegControlRecord::StandbyRegister {
+            session_id: SessionId::new([0x53; 16]).unwrap(),
+            standby_nonce,
+            selected_version: SESSION_PROTOCOL_VERSION,
+            features: STANDBY_CONTROL_V1,
+            proof,
+        },
+    );
+
+    let debug = format!("{frame:?}");
+    assert!(debug.contains("[REDACTED]"));
+    assert!(!debug.contains("90, 90"));
+    assert!(!debug.contains("78, 78"));
+    assert!(!debug.contains("session_id"));
+    assert!(!debug.contains("standby_nonce"));
+    assert!(!debug.contains("proof"));
+    assert_eq!(format!("{proof:?}"), "StandbyProof([REDACTED])");
+    assert_eq!(format!("{standby_nonce:?}"), "StandbyNonce([REDACTED])");
+    assert_eq!(format!("{leg_epoch_nonce:?}"), "LegEpochNonce([REDACTED])");
 }
 
 fn decode_hex(hex: &str) -> Vec<u8> {

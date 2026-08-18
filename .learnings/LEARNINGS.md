@@ -1,5 +1,25 @@
 # Learnings
 
+## 2026-08-18 - Leg control needs classified wire facts and one correlation authority
+
+- A control-plane wire extension must not enlarge the session reducer's
+  `Record` sum type when those records are not legal reducer inputs. Decode
+  feature-gated leg control through a separate classified frame type so no
+  caller can accidentally mint `SessionEvent::PeerFrame` from a probe, hint,
+  or standby-registration record.
+- Correlation widths are protocol invariants. A probe epoch derived from an
+  existing 128-bit attach nonce must preserve all 128 bits; shortening it to a
+  convenient integer silently destroys exact-leg correlation.
+- One fact needs one wire authority. The frame envelope is the active
+  generation for standby control, so duplicating generation inside the record
+  body would create conflicting authentication and routing interpretations.
+- Negotiation must fail at both admission and use: the header rejects standby
+  control without `STANDBY_CONTROL_V1`, and the legacy session-frame decoder
+  still refuses the record after a feature-aware header admits it.
+
+This is only the R6 protocol-fact layer. Authentication, exact-seal standby
+registration, switching, and blackout recovery remain separate gates.
+
 ## 2026-08-18 - Irreversible source and scheduler work need category-owned admission
 
 - A TCP source read must reserve its ordered message slot, per-flow and

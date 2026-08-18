@@ -1,5 +1,20 @@
 # Errors
 
+## 2026-08-18 - The first standby-control RED duplicated and narrowed authority
+
+- The initial local protocol draft represented standby/probe nonces as `u64`,
+  although the active-leg epoch must be derived exactly from the existing
+  128-bit `AttachNonce`.
+- It also carried active generation in both the frame envelope and the record
+  body without requiring equality, leaving two conflicting facts for HMAC and
+  controller routing.
+- The design preflight caught both before acceptance. The corrected wire uses
+  16-byte nonzero nonce types and the envelope as the sole generation fact;
+  old wire goldens and all new classified-control tests pass.
+
+This was a local RED/design failure only. No TUN, VPS, WAN traffic, user data,
+or throughput acceptance was involved.
+
 ## 2026-08-18 - Task-4 foundation review found four local false-pass boundaries
 
 - Source extraction could occur without reducer-aligned replay-segment

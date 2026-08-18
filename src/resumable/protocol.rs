@@ -10,6 +10,11 @@ const DATA_FIXED_BODY_BYTES: usize = 8 + 8 + 1 + 8;
 const ATTACH_FIXED_BODY_BYTES: usize = 8 + 16 + 16 + 2 + 2 + 8 + 8 + 32;
 const ATTACH_ACCEPTED_FIXED_BODY_BYTES: usize = 8 + 16 + 16 + 2 + 8;
 const ATTACH_GENERATION_STATUS_FIXED_BODY_BYTES: usize = 8 + 16 + 8 + 16;
+const STANDBY_REGISTER_FIXED_BODY_BYTES: usize = 8 + 16 + 16 + 2 + 8 + 32;
+const STANDBY_ACCEPTED_FIXED_BODY_BYTES: usize = 8 + 16 + 16 + 2 + 8;
+const LEG_PROBE_FIXED_BODY_BYTES: usize = 8 + 16 + 16 + 8;
+const LEG_PROBE_ACK_FIXED_BODY_BYTES: usize = 8 + 16 + 16 + 8;
+const SWITCH_HINT_FIXED_BODY_BYTES: usize = 8 + 16 + 16 + 8 + 8 + 1 + 8 + 2;
 const OPEN_RESULT_FIXED_BODY_BYTES: usize = 8 + 8 + 2;
 const ACK_FIXED_BODY_BYTES: usize = 8 + 8 + 1 + 8 + 1;
 const CLOSE_FIXED_BODY_BYTES: usize = 8 + 8 + 1 + 8;
@@ -27,6 +32,11 @@ const RECORD_RESET: u8 = 0x06;
 const RECORD_ATTACH_ACCEPTED: u8 = 0x07;
 const RECORD_OPEN_RESULT: u8 = 0x08;
 const RECORD_ATTACH_GENERATION_STATUS: u8 = 0x09;
+const RECORD_STANDBY_REGISTER: u8 = 0x0a;
+const RECORD_STANDBY_ACCEPTED: u8 = 0x0b;
+const RECORD_LEG_PROBE: u8 = 0x0c;
+const RECORD_LEG_PROBE_ACK: u8 = 0x0d;
+const RECORD_SWITCH_HINT: u8 = 0x0e;
 const TARGET_DOMAIN: u8 = 0x00;
 const TARGET_IPV4: u8 = 0x01;
 const TARGET_IPV6: u8 = 0x02;
@@ -36,6 +46,8 @@ pub const FRAME_HEADER_BYTES: usize = 12;
 pub const FRAME_PROTOCOL_VERSION: u16 = 1;
 /// Current negotiated resumable-session semantics carried by ATTACH.
 pub const SESSION_PROTOCOL_VERSION: u16 = 1;
+/// Named feature gate for the five Knife16 standby leg-control records.
+pub const STANDBY_CONTROL_V1: FeatureSet = FeatureSet::new(0x10);
 /// Hard wire-defense ceiling for one DATA record. Replay ownership limits are
 /// injected policy and are deliberately separate from this framing limit.
 pub const MAX_DATA_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -184,6 +196,9 @@ impl Direction {
 pub struct FeatureSet(u64);
 
 impl FeatureSet {
+    /// Negotiates the Knife16 registered-standby control-plane records.
+    pub const STANDBY_CONTROL_V1: Self = STANDBY_CONTROL_V1;
+
     pub const fn new(bits: u64) -> Self {
         Self(bits)
     }
@@ -194,6 +209,128 @@ impl FeatureSet {
 
     pub const fn contains(self, required: Self) -> bool {
         self.0 & required.0 == required.0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StandbyNonce([u8; 16]);
+
+impl StandbyNonce {
+    pub fn new(value: [u8; 16]) -> Result<Self, ProtocolError> {
+        if value == [0; 16] {
+            return Err(ProtocolError::ZeroStandbyNonce);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for StandbyNonce {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StandbyNonce([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LegEpochNonce([u8; 16]);
+
+impl LegEpochNonce {
+    pub fn new(value: [u8; 16]) -> Result<Self, ProtocolError> {
+        if value == [0; 16] {
+            return Err(ProtocolError::ZeroLegEpochNonce);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+impl From<AttachNonce> for LegEpochNonce {
+    fn from(value: AttachNonce) -> Self {
+        Self(value.0)
+    }
+}
+
+impl From<StandbyNonce> for LegEpochNonce {
+    fn from(value: StandbyNonce) -> Self {
+        Self(value.0)
+    }
+}
+
+impl fmt::Debug for LegEpochNonce {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LegEpochNonce([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProbeSequence(NonZeroU64);
+
+impl ProbeSequence {
+    pub fn new(value: u64) -> Result<Self, ProtocolError> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(ProtocolError::ZeroProbeSequence)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    pub fn checked_next(self) -> Result<Self, ProtocolError> {
+        self.get()
+            .checked_add(1)
+            .ok_or(ProtocolError::ProbeSequenceOverflow)
+            .and_then(Self::new)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HintSequence(NonZeroU64);
+
+impl HintSequence {
+    pub fn new(value: u64) -> Result<Self, ProtocolError> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(ProtocolError::ZeroHintSequence)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    pub fn checked_next(self) -> Result<Self, ProtocolError> {
+        self.get()
+            .checked_add(1)
+            .ok_or(ProtocolError::HintSequenceOverflow)
+            .and_then(Self::new)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StandbyProof([u8; 32]);
+
+impl StandbyProof {
+    pub fn new(value: [u8; 32]) -> Result<Self, ProtocolError> {
+        if value == [0; 32] {
+            return Err(ProtocolError::ZeroStandbyProof);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for StandbyProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StandbyProof([REDACTED])")
     }
 }
 
@@ -249,6 +386,21 @@ impl ResetReason {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum SwitchHintCause {
+    ReverseApplicationAckStall = 1,
+}
+
+impl SwitchHintCause {
+    fn decode(value: u16) -> Result<Self, ProtocolError> {
+        match value {
+            1 => Ok(Self::ReverseApplicationAckStall),
+            other => Err(ProtocolError::InvalidSwitchHintCause(other)),
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum Record {
     Attach {
@@ -300,6 +452,95 @@ pub enum Record {
         flow_id: SessionFlowId,
         reason: ResetReason,
     },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum LegControlRecord {
+    StandbyRegister {
+        session_id: SessionId,
+        standby_nonce: StandbyNonce,
+        selected_version: u16,
+        features: FeatureSet,
+        proof: StandbyProof,
+    },
+    StandbyAccepted {
+        session_id: SessionId,
+        standby_nonce: StandbyNonce,
+        selected_version: u16,
+        features: FeatureSet,
+    },
+    LegProbe {
+        session_id: SessionId,
+        leg_epoch_nonce: LegEpochNonce,
+        probe_sequence: ProbeSequence,
+    },
+    LegProbeAck {
+        session_id: SessionId,
+        leg_epoch_nonce: LegEpochNonce,
+        probe_sequence: ProbeSequence,
+    },
+    SwitchHint {
+        session_id: SessionId,
+        standby_nonce: StandbyNonce,
+        hint_sequence: HintSequence,
+        flow_id: SessionFlowId,
+        direction: Direction,
+        oldest_unacknowledged: ByteOffset,
+        cause: SwitchHintCause,
+    },
+}
+
+impl fmt::Debug for LegControlRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StandbyRegister {
+                selected_version,
+                features,
+                ..
+            } => formatter
+                .debug_struct("StandbyRegister")
+                .field("authentication", &"[REDACTED]")
+                .field("selected_version", selected_version)
+                .field("features", features)
+                .finish(),
+            Self::LegProbe { probe_sequence, .. } => formatter
+                .debug_struct("LegProbe")
+                .field("correlation", &"[REDACTED]")
+                .field("probe_sequence", probe_sequence)
+                .finish(),
+            Self::LegProbeAck { probe_sequence, .. } => formatter
+                .debug_struct("LegProbeAck")
+                .field("correlation", &"[REDACTED]")
+                .field("probe_sequence", probe_sequence)
+                .finish(),
+            Self::StandbyAccepted {
+                selected_version,
+                features,
+                ..
+            } => formatter
+                .debug_struct("StandbyAccepted")
+                .field("correlation", &"[REDACTED]")
+                .field("selected_version", selected_version)
+                .field("features", features)
+                .finish(),
+            Self::SwitchHint {
+                hint_sequence,
+                flow_id,
+                direction,
+                oldest_unacknowledged,
+                cause,
+                ..
+            } => formatter
+                .debug_struct("SwitchHint")
+                .field("correlation", &"[REDACTED]")
+                .field("hint_sequence", hint_sequence)
+                .field("flow_id", flow_id)
+                .field("direction", direction)
+                .field("oldest_unacknowledged", oldest_unacknowledged)
+                .field("cause", cause)
+                .finish(),
+        }
+    }
 }
 
 impl fmt::Debug for Record {
@@ -401,6 +642,13 @@ pub struct ValidatedFrameHeader {
 
 impl ValidatedFrameHeader {
     pub fn decode(encoded: &[u8]) -> Result<Self, ProtocolError> {
+        Self::decode_with_features(encoded, FeatureSet::default())
+    }
+
+    pub fn decode_with_features(
+        encoded: &[u8],
+        negotiated_features: FeatureSet,
+    ) -> Result<Self, ProtocolError> {
         if encoded.len() < FRAME_HEADER_BYTES {
             return Err(ProtocolError::Truncated {
                 needed: FRAME_HEADER_BYTES,
@@ -422,6 +670,7 @@ impl ValidatedFrameHeader {
         let body_len =
             u32::from_be_bytes([encoded[8], encoded[9], encoded[10], encoded[11]]) as usize;
         validate_declared_body_len(record_type, body_len)?;
+        require_standby_control_feature(record_type, negotiated_features)?;
         Ok(Self {
             record_type,
             body_len,
@@ -457,6 +706,33 @@ impl ValidatedFrameHeader {
         self.decode_compact_body(Bytes::copy_from_slice(&body))
     }
 
+    pub fn decode_classified_body(self, body: Bytes) -> Result<DecodedFrame, ProtocolError> {
+        if body.len() < self.body_len {
+            return Err(ProtocolError::Truncated {
+                needed: self.body_len,
+                available: body.len(),
+            });
+        }
+        if body.len() != self.body_len {
+            return Err(ProtocolError::TrailingBytes {
+                expected: self.body_len,
+                actual: body.len(),
+            });
+        }
+        self.decode_classified_compact_body(Bytes::copy_from_slice(&body))
+    }
+
+    fn decode_classified_compact_body(self, body: Bytes) -> Result<DecodedFrame, ProtocolError> {
+        match self.record_type {
+            RECORD_STANDBY_REGISTER => decode_standby_register(body).map(DecodedFrame::LegControl),
+            RECORD_STANDBY_ACCEPTED => decode_standby_accepted(body).map(DecodedFrame::LegControl),
+            RECORD_LEG_PROBE => decode_leg_probe(body).map(DecodedFrame::LegControl),
+            RECORD_LEG_PROBE_ACK => decode_leg_probe_ack(body).map(DecodedFrame::LegControl),
+            RECORD_SWITCH_HINT => decode_switch_hint(body).map(DecodedFrame::LegControl),
+            _ => self.decode_compact_body(body).map(DecodedFrame::Session),
+        }
+    }
+
     fn decode_compact_body(self, body: Bytes) -> Result<Frame, ProtocolError> {
         match self.record_type {
             RECORD_ATTACH => decode_attach(body),
@@ -468,8 +744,196 @@ impl ValidatedFrameHeader {
             RECORD_ACK => decode_ack(body),
             RECORD_CLOSE => decode_close(body),
             RECORD_RESET => decode_reset(body),
+            RECORD_STANDBY_REGISTER
+            | RECORD_STANDBY_ACCEPTED
+            | RECORD_LEG_PROBE
+            | RECORD_LEG_PROBE_ACK
+            | RECORD_SWITCH_HINT => Err(ProtocolError::LegControlRequiresClassification),
             other => Err(ProtocolError::UnknownRecordType(other)),
         }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct LegControlFrame {
+    leg_generation: LegGeneration,
+    record: LegControlRecord,
+}
+
+impl fmt::Debug for LegControlFrame {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LegControlFrame")
+            .field("leg_generation", &self.leg_generation)
+            .field("record", &self.record)
+            .finish()
+    }
+}
+
+impl LegControlFrame {
+    pub fn try_new(
+        leg_generation: LegGeneration,
+        record: LegControlRecord,
+        negotiated_features: FeatureSet,
+    ) -> Result<Self, ProtocolError> {
+        require_negotiated_standby_control(negotiated_features)?;
+        validate_leg_control_record(&record)?;
+        Ok(Self {
+            leg_generation,
+            record,
+        })
+    }
+
+    fn new(leg_generation: LegGeneration, record: LegControlRecord) -> Self {
+        Self {
+            leg_generation,
+            record,
+        }
+    }
+
+    pub fn leg_generation(&self) -> LegGeneration {
+        self.leg_generation
+    }
+
+    pub fn record(&self) -> &LegControlRecord {
+        &self.record
+    }
+
+    pub fn encode(&self, negotiated_features: FeatureSet) -> Result<Bytes, ProtocolError> {
+        require_negotiated_standby_control(negotiated_features)?;
+        validate_leg_control_record(&self.record)?;
+        match &self.record {
+            LegControlRecord::StandbyRegister {
+                session_id,
+                standby_nonce,
+                selected_version,
+                features,
+                proof,
+            } => {
+                let mut encoded =
+                    BytesMut::with_capacity(FRAME_HEADER_BYTES + STANDBY_REGISTER_FIXED_BODY_BYTES);
+                encode_header(
+                    &mut encoded,
+                    RECORD_STANDBY_REGISTER,
+                    STANDBY_REGISTER_FIXED_BODY_BYTES,
+                )?;
+                encoded.put_u64(self.leg_generation.get());
+                encoded.extend_from_slice(session_id.as_bytes());
+                encoded.extend_from_slice(standby_nonce.as_bytes());
+                encoded.put_u16(*selected_version);
+                encoded.put_u64(features.bits());
+                encoded.extend_from_slice(proof.as_bytes());
+                Ok(encoded.freeze())
+            }
+            LegControlRecord::StandbyAccepted {
+                session_id,
+                standby_nonce,
+                selected_version,
+                features,
+            } => {
+                let mut encoded =
+                    BytesMut::with_capacity(FRAME_HEADER_BYTES + STANDBY_ACCEPTED_FIXED_BODY_BYTES);
+                encode_header(
+                    &mut encoded,
+                    RECORD_STANDBY_ACCEPTED,
+                    STANDBY_ACCEPTED_FIXED_BODY_BYTES,
+                )?;
+                encoded.put_u64(self.leg_generation.get());
+                encoded.extend_from_slice(session_id.as_bytes());
+                encoded.extend_from_slice(standby_nonce.as_bytes());
+                encoded.put_u16(*selected_version);
+                encoded.put_u64(features.bits());
+                Ok(encoded.freeze())
+            }
+            LegControlRecord::LegProbe {
+                session_id,
+                leg_epoch_nonce,
+                probe_sequence,
+            } => {
+                let mut encoded =
+                    BytesMut::with_capacity(FRAME_HEADER_BYTES + LEG_PROBE_FIXED_BODY_BYTES);
+                encode_header(&mut encoded, RECORD_LEG_PROBE, LEG_PROBE_FIXED_BODY_BYTES)?;
+                encoded.put_u64(self.leg_generation.get());
+                encoded.extend_from_slice(session_id.as_bytes());
+                encoded.extend_from_slice(leg_epoch_nonce.as_bytes());
+                encoded.put_u64(probe_sequence.get());
+                Ok(encoded.freeze())
+            }
+            LegControlRecord::LegProbeAck {
+                session_id,
+                leg_epoch_nonce,
+                probe_sequence,
+            } => {
+                let mut encoded =
+                    BytesMut::with_capacity(FRAME_HEADER_BYTES + LEG_PROBE_ACK_FIXED_BODY_BYTES);
+                encode_header(
+                    &mut encoded,
+                    RECORD_LEG_PROBE_ACK,
+                    LEG_PROBE_ACK_FIXED_BODY_BYTES,
+                )?;
+                encoded.put_u64(self.leg_generation.get());
+                encoded.extend_from_slice(session_id.as_bytes());
+                encoded.extend_from_slice(leg_epoch_nonce.as_bytes());
+                encoded.put_u64(probe_sequence.get());
+                Ok(encoded.freeze())
+            }
+            LegControlRecord::SwitchHint {
+                session_id,
+                standby_nonce,
+                hint_sequence,
+                flow_id,
+                direction,
+                oldest_unacknowledged,
+                cause,
+            } => {
+                let mut encoded =
+                    BytesMut::with_capacity(FRAME_HEADER_BYTES + SWITCH_HINT_FIXED_BODY_BYTES);
+                encode_header(
+                    &mut encoded,
+                    RECORD_SWITCH_HINT,
+                    SWITCH_HINT_FIXED_BODY_BYTES,
+                )?;
+                encoded.put_u64(self.leg_generation.get());
+                encoded.extend_from_slice(session_id.as_bytes());
+                encoded.extend_from_slice(standby_nonce.as_bytes());
+                encoded.put_u64(hint_sequence.get());
+                encoded.put_u64(flow_id.get());
+                encoded.put_u8(direction.encode());
+                encoded.put_u64(oldest_unacknowledged.get());
+                encoded.put_u16(*cause as u16);
+                Ok(encoded.freeze())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecodedFrame {
+    Session(Frame),
+    LegControl(LegControlFrame),
+}
+
+impl DecodedFrame {
+    pub fn decode_exact(
+        encoded: &[u8],
+        negotiated_features: FeatureSet,
+    ) -> Result<Self, ProtocolError> {
+        let header = ValidatedFrameHeader::decode_with_features(encoded, negotiated_features)?;
+        let total_len = header.total_len()?;
+        validate_exact_frame_len(encoded.len(), total_len)?;
+        header
+            .decode_classified_compact_body(Bytes::copy_from_slice(&encoded[FRAME_HEADER_BYTES..]))
+    }
+
+    pub fn decode_owned_exact(
+        encoded: Bytes,
+        negotiated_features: FeatureSet,
+    ) -> Result<Self, ProtocolError> {
+        let header = ValidatedFrameHeader::decode_with_features(&encoded, negotiated_features)?;
+        let total_len = header.total_len()?;
+        validate_exact_frame_len(encoded.len(), total_len)?;
+        header
+            .decode_classified_compact_body(Bytes::copy_from_slice(&encoded[FRAME_HEADER_BYTES..]))
     }
 }
 
@@ -755,6 +1219,26 @@ fn validate_declared_body_len(record_type: u8, body_len: usize) -> Result<(), Pr
         RECORD_ACK => (body_len == ACK_FIXED_BODY_BYTES, ACK_FIXED_BODY_BYTES),
         RECORD_CLOSE => (body_len == CLOSE_FIXED_BODY_BYTES, CLOSE_FIXED_BODY_BYTES),
         RECORD_RESET => (body_len == RESET_FIXED_BODY_BYTES, RESET_FIXED_BODY_BYTES),
+        RECORD_STANDBY_REGISTER => (
+            body_len == STANDBY_REGISTER_FIXED_BODY_BYTES,
+            STANDBY_REGISTER_FIXED_BODY_BYTES,
+        ),
+        RECORD_STANDBY_ACCEPTED => (
+            body_len == STANDBY_ACCEPTED_FIXED_BODY_BYTES,
+            STANDBY_ACCEPTED_FIXED_BODY_BYTES,
+        ),
+        RECORD_LEG_PROBE => (
+            body_len == LEG_PROBE_FIXED_BODY_BYTES,
+            LEG_PROBE_FIXED_BODY_BYTES,
+        ),
+        RECORD_LEG_PROBE_ACK => (
+            body_len == LEG_PROBE_ACK_FIXED_BODY_BYTES,
+            LEG_PROBE_ACK_FIXED_BODY_BYTES,
+        ),
+        RECORD_SWITCH_HINT => (
+            body_len == SWITCH_HINT_FIXED_BODY_BYTES,
+            SWITCH_HINT_FIXED_BODY_BYTES,
+        ),
         other => return Err(ProtocolError::UnknownRecordType(other)),
     };
     if !valid {
@@ -768,6 +1252,64 @@ fn validate_declared_body_len(record_type: u8, body_len: usize) -> Result<(), Pr
         });
     }
     Ok(())
+}
+
+fn require_standby_control_feature(
+    record_type: u8,
+    negotiated_features: FeatureSet,
+) -> Result<(), ProtocolError> {
+    if matches!(
+        record_type,
+        RECORD_STANDBY_REGISTER
+            | RECORD_STANDBY_ACCEPTED
+            | RECORD_LEG_PROBE
+            | RECORD_LEG_PROBE_ACK
+            | RECORD_SWITCH_HINT
+    ) {
+        require_negotiated_standby_control(negotiated_features)?;
+    }
+    Ok(())
+}
+
+fn require_negotiated_standby_control(
+    negotiated_features: FeatureSet,
+) -> Result<(), ProtocolError> {
+    if !negotiated_features.contains(FeatureSet::STANDBY_CONTROL_V1) {
+        return Err(ProtocolError::StandbyControlNotNegotiated {
+            negotiated: negotiated_features.bits(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_leg_control_record(record: &LegControlRecord) -> Result<(), ProtocolError> {
+    match record {
+        LegControlRecord::StandbyRegister {
+            selected_version,
+            features,
+            ..
+        }
+        | LegControlRecord::StandbyAccepted {
+            selected_version,
+            features,
+            ..
+        } => {
+            validate_selected_version(*selected_version)?;
+            if !features.contains(FeatureSet::STANDBY_CONTROL_V1) {
+                return Err(ProtocolError::StandbyControlFeatureMissing {
+                    features: features.bits(),
+                });
+            }
+            Ok(())
+        }
+        LegControlRecord::LegProbe { .. } | LegControlRecord::LegProbeAck { .. } => Ok(()),
+        LegControlRecord::SwitchHint { direction, .. } => {
+            if *direction != Direction::TargetToClient {
+                return Err(ProtocolError::InvalidSwitchHintDirection(*direction));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Checks every dynamic record invariant without allocating or taking
@@ -1019,6 +1561,92 @@ fn decode_attach_generation_status(body: Bytes) -> Result<Frame, ProtocolError> 
     ))
 }
 
+fn decode_standby_register(body: Bytes) -> Result<LegControlFrame, ProtocolError> {
+    let leg_generation = LegGeneration::new(read_u64(&body, 0, RECORD_STANDBY_REGISTER)?)?;
+    let session_id = SessionId::new(read_array(&body, 8, RECORD_STANDBY_REGISTER)?)?;
+    let standby_nonce = StandbyNonce::new(read_array(&body, 24, RECORD_STANDBY_REGISTER)?)?;
+    let selected_version = read_u16(&body, 40, RECORD_STANDBY_REGISTER)?;
+    let features = FeatureSet::new(read_u64(&body, 42, RECORD_STANDBY_REGISTER)?);
+    let proof = StandbyProof::new(read_array(&body, 50, RECORD_STANDBY_REGISTER)?)?;
+    let record = LegControlRecord::StandbyRegister {
+        session_id,
+        standby_nonce,
+        selected_version,
+        features,
+        proof,
+    };
+    validate_leg_control_record(&record)?;
+    Ok(LegControlFrame::new(leg_generation, record))
+}
+
+fn decode_standby_accepted(body: Bytes) -> Result<LegControlFrame, ProtocolError> {
+    let leg_generation = LegGeneration::new(read_u64(&body, 0, RECORD_STANDBY_ACCEPTED)?)?;
+    let session_id = SessionId::new(read_array(&body, 8, RECORD_STANDBY_ACCEPTED)?)?;
+    let standby_nonce = StandbyNonce::new(read_array(&body, 24, RECORD_STANDBY_ACCEPTED)?)?;
+    let selected_version = read_u16(&body, 40, RECORD_STANDBY_ACCEPTED)?;
+    let features = FeatureSet::new(read_u64(&body, 42, RECORD_STANDBY_ACCEPTED)?);
+    let record = LegControlRecord::StandbyAccepted {
+        session_id,
+        standby_nonce,
+        selected_version,
+        features,
+    };
+    validate_leg_control_record(&record)?;
+    Ok(LegControlFrame::new(leg_generation, record))
+}
+
+fn decode_leg_probe(body: Bytes) -> Result<LegControlFrame, ProtocolError> {
+    let leg_generation = LegGeneration::new(read_u64(&body, 0, RECORD_LEG_PROBE)?)?;
+    let session_id = SessionId::new(read_array(&body, 8, RECORD_LEG_PROBE)?)?;
+    let leg_epoch_nonce = LegEpochNonce::new(read_array(&body, 24, RECORD_LEG_PROBE)?)?;
+    let probe_sequence = ProbeSequence::new(read_u64(&body, 40, RECORD_LEG_PROBE)?)?;
+    Ok(LegControlFrame::new(
+        leg_generation,
+        LegControlRecord::LegProbe {
+            session_id,
+            leg_epoch_nonce,
+            probe_sequence,
+        },
+    ))
+}
+
+fn decode_leg_probe_ack(body: Bytes) -> Result<LegControlFrame, ProtocolError> {
+    let leg_generation = LegGeneration::new(read_u64(&body, 0, RECORD_LEG_PROBE_ACK)?)?;
+    let session_id = SessionId::new(read_array(&body, 8, RECORD_LEG_PROBE_ACK)?)?;
+    let leg_epoch_nonce = LegEpochNonce::new(read_array(&body, 24, RECORD_LEG_PROBE_ACK)?)?;
+    let probe_sequence = ProbeSequence::new(read_u64(&body, 40, RECORD_LEG_PROBE_ACK)?)?;
+    Ok(LegControlFrame::new(
+        leg_generation,
+        LegControlRecord::LegProbeAck {
+            session_id,
+            leg_epoch_nonce,
+            probe_sequence,
+        },
+    ))
+}
+
+fn decode_switch_hint(body: Bytes) -> Result<LegControlFrame, ProtocolError> {
+    let leg_generation = LegGeneration::new(read_u64(&body, 0, RECORD_SWITCH_HINT)?)?;
+    let session_id = SessionId::new(read_array(&body, 8, RECORD_SWITCH_HINT)?)?;
+    let standby_nonce = StandbyNonce::new(read_array(&body, 24, RECORD_SWITCH_HINT)?)?;
+    let hint_sequence = HintSequence::new(read_u64(&body, 40, RECORD_SWITCH_HINT)?)?;
+    let flow_id = SessionFlowId::new(read_u64(&body, 48, RECORD_SWITCH_HINT)?)?;
+    let direction = Direction::decode(body[56])?;
+    let oldest_unacknowledged = ByteOffset::new(read_u64(&body, 57, RECORD_SWITCH_HINT)?);
+    let cause = SwitchHintCause::decode(read_u16(&body, 65, RECORD_SWITCH_HINT)?)?;
+    let record = LegControlRecord::SwitchHint {
+        session_id,
+        standby_nonce,
+        hint_sequence,
+        flow_id,
+        direction,
+        oldest_unacknowledged,
+        cause,
+    };
+    validate_leg_control_record(&record)?;
+    Ok(LegControlFrame::new(leg_generation, record))
+}
+
 fn validate_negotiation(
     min_version: u16,
     max_version: u16,
@@ -1214,6 +1842,20 @@ pub enum ProtocolError {
     ZeroAttachNonce,
     #[error("attach proof zero is reserved")]
     ZeroAttachProof,
+    #[error("standby registration nonce zero is reserved")]
+    ZeroStandbyNonce,
+    #[error("leg epoch nonce zero is reserved")]
+    ZeroLegEpochNonce,
+    #[error("probe sequence zero is reserved")]
+    ZeroProbeSequence,
+    #[error("probe sequence overflow")]
+    ProbeSequenceOverflow,
+    #[error("switch-hint sequence zero is reserved")]
+    ZeroHintSequence,
+    #[error("switch-hint sequence overflow")]
+    HintSequenceOverflow,
+    #[error("standby registration proof zero is reserved")]
+    ZeroStandbyProof,
     #[error("leg generation zero is reserved")]
     ZeroLegGeneration,
     #[error("invalid TCP direction {0}")]
@@ -1242,6 +1884,148 @@ pub enum ProtocolError {
     InvalidOpenResult(u16),
     #[error("invalid RESET reason {0}")]
     InvalidResetReason(u16),
+    #[error("invalid SWITCH_HINT cause {0}")]
+    InvalidSwitchHintCause(u16),
+    #[error("SWITCH_HINT direction must be TargetToClient, got {0:?}")]
+    InvalidSwitchHintDirection(Direction),
     #[error("invalid boolean encoding {0}")]
     InvalidBoolean(u8),
+    #[error("STANDBY_CONTROL_V1 was not negotiated; negotiated bits {negotiated:#018x}")]
+    StandbyControlNotNegotiated { negotiated: u64 },
+    #[error("standby-control record omits STANDBY_CONTROL_V1; record bits {features:#018x}")]
+    StandbyControlFeatureMissing { features: u64 },
+    #[error("leg-control records require classified decoding")]
+    LegControlRequiresClassification,
+}
+
+#[cfg(test)]
+mod standby_control_tests {
+    use super::*;
+
+    #[test]
+    fn standby_register_round_trips_through_the_feature_gated_classifier() {
+        let negotiated = FeatureSet::STANDBY_CONTROL_V1;
+        let frame = LegControlFrame::try_new(
+            LegGeneration::new(2).unwrap(),
+            LegControlRecord::StandbyRegister {
+                session_id: SessionId::new([0x11; 16]).unwrap(),
+                standby_nonce: StandbyNonce::new([0x33; 16]).unwrap(),
+                selected_version: SESSION_PROTOCOL_VERSION,
+                features: negotiated,
+                proof: StandbyProof::new([0x44; 32]).unwrap(),
+            },
+            negotiated,
+        )
+        .unwrap();
+
+        let encoded = frame.encode(negotiated).unwrap();
+        assert_eq!(encoded.len(), 94);
+        assert_eq!(encoded[6], 0x0a);
+        assert_eq!(u32::from_be_bytes(encoded[8..12].try_into().unwrap()), 82);
+        assert_eq!(
+            DecodedFrame::decode_exact(&encoded, negotiated).unwrap(),
+            DecodedFrame::LegControl(frame)
+        );
+    }
+
+    #[test]
+    fn standby_accepted_round_trips_with_the_exact_registered_contract() {
+        let negotiated = FeatureSet::STANDBY_CONTROL_V1;
+        let frame = LegControlFrame::try_new(
+            LegGeneration::new(2).unwrap(),
+            LegControlRecord::StandbyAccepted {
+                session_id: SessionId::new([0x11; 16]).unwrap(),
+                standby_nonce: StandbyNonce::new([0x33; 16]).unwrap(),
+                selected_version: SESSION_PROTOCOL_VERSION,
+                features: negotiated,
+            },
+            negotiated,
+        )
+        .unwrap();
+
+        let encoded = frame.encode(negotiated).unwrap();
+        assert_eq!(encoded.len(), 62);
+        assert_eq!(encoded[6], 0x0b);
+        assert_eq!(u32::from_be_bytes(encoded[8..12].try_into().unwrap()), 50);
+        assert_eq!(
+            DecodedFrame::decode_exact(&encoded, negotiated).unwrap(),
+            DecodedFrame::LegControl(frame)
+        );
+    }
+
+    #[test]
+    fn leg_probe_round_trips_with_nonzero_epoch_and_sequence() {
+        let negotiated = FeatureSet::STANDBY_CONTROL_V1;
+        let frame = LegControlFrame::try_new(
+            LegGeneration::new(2).unwrap(),
+            LegControlRecord::LegProbe {
+                session_id: SessionId::new([0x11; 16]).unwrap(),
+                leg_epoch_nonce: LegEpochNonce::new([0x77; 16]).unwrap(),
+                probe_sequence: ProbeSequence::new(9).unwrap(),
+            },
+            negotiated,
+        )
+        .unwrap();
+
+        let encoded = frame.encode(negotiated).unwrap();
+        assert_eq!(encoded.len(), 60);
+        assert_eq!(encoded[6], 0x0c);
+        assert_eq!(u32::from_be_bytes(encoded[8..12].try_into().unwrap()), 48);
+        assert_eq!(
+            DecodedFrame::decode_exact(&encoded, negotiated).unwrap(),
+            DecodedFrame::LegControl(frame)
+        );
+    }
+
+    #[test]
+    fn leg_probe_ack_round_trips_the_exact_probe_correlation() {
+        let negotiated = FeatureSet::STANDBY_CONTROL_V1;
+        let frame = LegControlFrame::try_new(
+            LegGeneration::new(2).unwrap(),
+            LegControlRecord::LegProbeAck {
+                session_id: SessionId::new([0x11; 16]).unwrap(),
+                leg_epoch_nonce: LegEpochNonce::new([0x77; 16]).unwrap(),
+                probe_sequence: ProbeSequence::new(9).unwrap(),
+            },
+            negotiated,
+        )
+        .unwrap();
+
+        let encoded = frame.encode(negotiated).unwrap();
+        assert_eq!(encoded.len(), 60);
+        assert_eq!(encoded[6], 0x0d);
+        assert_eq!(u32::from_be_bytes(encoded[8..12].try_into().unwrap()), 48);
+        assert_eq!(
+            DecodedFrame::decode_exact(&encoded, negotiated).unwrap(),
+            DecodedFrame::LegControl(frame)
+        );
+    }
+
+    #[test]
+    fn switch_hint_round_trips_the_closed_reverse_stall_evidence() {
+        let negotiated = FeatureSet::STANDBY_CONTROL_V1;
+        let frame = LegControlFrame::try_new(
+            LegGeneration::new(2).unwrap(),
+            LegControlRecord::SwitchHint {
+                session_id: SessionId::new([0x11; 16]).unwrap(),
+                standby_nonce: StandbyNonce::new([0x33; 16]).unwrap(),
+                hint_sequence: HintSequence::new(5).unwrap(),
+                flow_id: SessionFlowId::new(7).unwrap(),
+                direction: Direction::TargetToClient,
+                oldest_unacknowledged: ByteOffset::new(1024),
+                cause: SwitchHintCause::ReverseApplicationAckStall,
+            },
+            negotiated,
+        )
+        .unwrap();
+
+        let encoded = frame.encode(negotiated).unwrap();
+        assert_eq!(encoded.len(), 79);
+        assert_eq!(encoded[6], 0x0e);
+        assert_eq!(u32::from_be_bytes(encoded[8..12].try_into().unwrap()), 67);
+        assert_eq!(
+            DecodedFrame::decode_exact(&encoded, negotiated).unwrap(),
+            DecodedFrame::LegControl(frame)
+        );
+    }
 }
