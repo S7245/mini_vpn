@@ -5,9 +5,10 @@
 //! side owns [`ResumableTcpFlow`]; one session supervisor owns
 //! [`ResumableTcpDriver`]. Uplink DATA and CLOSE share one ordered source lane;
 //! terminal RESET and sink completions use physically separate bounded lanes.
-//! DATA is admitted only after both a message slot and its exact byte permit
-//! are reserved, and that permit remains attached to the message until the
-//! supervisor explicitly releases it.
+//! DATA is admitted only after its message slot, exact byte permits, and one
+//! per-flow plus session-global replay-segment permit are reserved. Capacity
+//! remains attached through reducer replay ownership until exact ACK or
+//! terminal release.
 
 use std::fmt;
 use std::sync::{
@@ -21,9 +22,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::resumable::{
     ByteOffset, Direction, FlowFinishReason, LocalFlow, MAX_DATA_PAYLOAD_BYTES, ReplayAcknowledged,
-    ReplayStored, ResetReason, SessionEffect, SessionEvent, SessionFlowId, SinkHalfClose,
-    SinkOffer, TcpDataSegment,
+    ReplayStored, ResetReason, SessionEffect, SessionEvent, SessionFlowId, SessionId,
+    SinkHalfClose, SinkOffer, TcpDataSegment,
 };
+
+use super::supervisor::TcpFactoryOrigin;
 
 const TERMINAL_RESET_LANE_CAPACITY: usize = 1;
 const TERMINAL_ACTION_LANE_CAPACITY: usize = 1;
@@ -98,6 +101,10 @@ pub enum FlowPortConfigError {
     UplinkByteCapacityTooLarge { value: usize },
     #[error("uplink DATA message capacity must be non-zero")]
     ZeroUplinkMessageCapacity,
+    #[error("per-flow uplink replay segment capacity must be non-zero")]
+    ZeroUplinkSegmentCapacity,
+    #[error("session uplink replay segment capacity must be non-zero")]
+    ZeroSessionUplinkSegmentCapacity,
     #[error("control message capacity must be non-zero")]
     ZeroControlCapacity,
     #[error("downlink action capacity must be non-zero")]
@@ -105,6 +112,12 @@ pub enum FlowPortConfigError {
     #[error("{lane} channel capacity {value} exceeds Tokio's bound {max}")]
     ChannelCapacityTooLarge {
         lane: &'static str,
+        value: usize,
+        max: usize,
+    },
+    #[error("{scope} uplink replay segment capacity {value} exceeds Tokio's bound {max}")]
+    SegmentCapacityTooLarge {
+        scope: &'static str,
         value: usize,
         max: usize,
     },
@@ -128,6 +141,8 @@ pub enum FlowPortError {
     UplinkTerminalMismatch,
     #[error("ordered uplink source message lane is full")]
     UplinkMessageLaneFull,
+    #[error("an ordered uplink source reservation is already outstanding")]
+    UplinkSourceReservationActive,
     #[error("control message lane is full")]
     ControlLaneFull,
     #[error("terminal reset lane already contains a reset")]
@@ -140,6 +155,21 @@ pub enum FlowPortError {
     UplinkByteBudgetExhausted { requested: usize, available: usize },
     #[error("session uplink byte budget cannot admit {requested} bytes; {available} are available")]
     UplinkGlobalByteBudgetExhausted { requested: usize, available: usize },
+    #[error("uplink replay segment budget is exhausted; {available} segments are available")]
+    UplinkSegmentBudgetExhausted { available: usize },
+    #[error(
+        "session uplink replay segment budget is exhausted; {available} segments are available"
+    )]
+    UplinkGlobalSegmentBudgetExhausted { available: usize },
+    #[error("flow factory is already bound to another resumable session")]
+    CrossSessionFlowFactory,
+    #[error("flow factory direction {expected:?} does not match capability direction {actual:?}")]
+    FlowFactoryDirectionMismatch {
+        expected: Direction,
+        actual: Direction,
+    },
+    #[error("local flow authority {attempted} is not newer than factory high-water {highest}")]
+    LocalFlowAuthorityNotMonotonic { highest: u64, attempted: u64 },
     #[error("sink capability belongs to another flow")]
     CrossFlowSinkCapability,
     #[error("sink capability direction {actual:?} does not match expected {expected:?}")]
@@ -170,6 +200,89 @@ pub enum FlowPortError {
 struct UplinkByteLedger {
     budget: Arc<Semaphore>,
     capacity: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FactoryFlowGate {
+    Unbound,
+    Bound {
+        session_id: SessionId,
+        direction: Direction,
+        highest_authority_id: u64,
+    },
+}
+
+impl FactoryFlowGate {
+    fn admit(&mut self, flow: LocalFlow) -> Result<(), FlowPortError> {
+        match self {
+            Self::Unbound => {
+                *self = Self::Bound {
+                    session_id: flow.session_id(),
+                    direction: flow.direction(),
+                    highest_authority_id: flow.authority_id(),
+                };
+                Ok(())
+            }
+            Self::Bound {
+                session_id,
+                direction,
+                highest_authority_id,
+            } => {
+                if *session_id != flow.session_id() {
+                    return Err(FlowPortError::CrossSessionFlowFactory);
+                }
+                if *direction != flow.direction() {
+                    return Err(FlowPortError::FlowFactoryDirectionMismatch {
+                        expected: *direction,
+                        actual: flow.direction(),
+                    });
+                }
+                let attempted = flow.authority_id();
+                if attempted <= *highest_authority_id {
+                    return Err(FlowPortError::LocalFlowAuthorityNotMonotonic {
+                        highest: *highest_authority_id,
+                        attempted,
+                    });
+                }
+                *highest_authority_id = attempted;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Cloneable session-global replay-segment ledger. One permit represents one
+/// reducer-owned DATA extent, independent of its byte length.
+#[derive(Clone)]
+struct UplinkSegmentLedger {
+    budget: Arc<Semaphore>,
+    capacity: usize,
+}
+
+impl UplinkSegmentLedger {
+    fn new(capacity: usize) -> Result<Self, FlowPortConfigError> {
+        validate_segment_capacity(
+            "session",
+            capacity,
+            FlowPortConfigError::ZeroSessionUplinkSegmentCapacity,
+        )?;
+        Ok(Self {
+            budget: Arc::new(Semaphore::new(capacity)),
+            capacity,
+        })
+    }
+
+    const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn available_segments(&self) -> usize {
+        self.budget.available_permits()
+    }
+
+    fn owned_segments(&self) -> usize {
+        self.capacity.saturating_sub(self.available_segments())
+    }
 }
 
 impl UplinkByteLedger {
@@ -210,23 +323,106 @@ impl fmt::Debug for UplinkByteLedger {
 }
 
 /// Session-scoped constructor for every TCP port owned by one resumable
-/// session. Clones share the same exact aggregate byte ledger, so an adapter
-/// cannot accidentally create a fresh "global" budget for each flow.
+/// session. Clones share the exact aggregate byte and replay-segment ledgers,
+/// so an adapter cannot accidentally create fresh "global" budgets per flow.
 #[derive(Clone)]
 pub struct ResumableTcpPortFactory {
     config: FlowPortConfig,
     session_uplink_ledger: UplinkByteLedger,
+    per_flow_uplink_segment_capacity: usize,
+    session_uplink_segment_ledger: UplinkSegmentLedger,
+    flow_gate: Arc<Mutex<FactoryFlowGate>>,
+    origin: Option<TcpFactoryOrigin>,
 }
 
 impl ResumableTcpPortFactory {
-    pub fn new(
+    /// Isolated constructor for TCP unit tests and fake adapter fixtures.
+    /// Production factories are minted exactly once by `SessionSupervisor` and
+    /// carry its opaque origin capability.
+    #[cfg(test)]
+    pub(crate) fn new_unbound_for_test(
         config: FlowPortConfig,
         session_uplink_byte_capacity: usize,
+        per_flow_uplink_segment_capacity: usize,
+        session_uplink_segment_capacity: usize,
     ) -> Result<Self, FlowPortConfigError> {
+        Self::new_internal(
+            config,
+            session_uplink_byte_capacity,
+            per_flow_uplink_segment_capacity,
+            session_uplink_segment_capacity,
+            FactoryFlowGate::Unbound,
+            None,
+        )
+    }
+
+    pub(super) fn new_bound(
+        config: FlowPortConfig,
+        session_id: SessionId,
+        direction: Direction,
+        session_uplink_byte_capacity: usize,
+        per_flow_uplink_segment_capacity: usize,
+        session_uplink_segment_capacity: usize,
+        origin: TcpFactoryOrigin,
+    ) -> Result<Self, FlowPortConfigError> {
+        Self::new_internal(
+            config,
+            session_uplink_byte_capacity,
+            per_flow_uplink_segment_capacity,
+            session_uplink_segment_capacity,
+            FactoryFlowGate::Bound {
+                session_id,
+                direction,
+                highest_authority_id: 0,
+            },
+            Some(origin),
+        )
+    }
+
+    fn new_internal(
+        config: FlowPortConfig,
+        session_uplink_byte_capacity: usize,
+        per_flow_uplink_segment_capacity: usize,
+        session_uplink_segment_capacity: usize,
+        flow_gate: FactoryFlowGate,
+        origin: Option<TcpFactoryOrigin>,
+    ) -> Result<Self, FlowPortConfigError> {
+        validate_segment_capacity(
+            "per-flow",
+            per_flow_uplink_segment_capacity,
+            FlowPortConfigError::ZeroUplinkSegmentCapacity,
+        )?;
         Ok(Self {
             config,
             session_uplink_ledger: UplinkByteLedger::new(session_uplink_byte_capacity)?,
+            per_flow_uplink_segment_capacity,
+            session_uplink_segment_ledger: UplinkSegmentLedger::new(
+                session_uplink_segment_capacity,
+            )?,
+            flow_gate: Arc::new(Mutex::new(flow_gate)),
+            origin,
         })
+    }
+
+    /// Fault-injection seam proving that a reducer-capacity miss after source
+    /// consumption is quarantined. Production cloning deliberately cannot
+    /// create these independent ledgers.
+    #[cfg(test)]
+    pub(crate) fn fork_with_independent_ledgers_for_test(
+        &self,
+    ) -> Result<Self, FlowPortConfigError> {
+        let gate = *self
+            .flow_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::new_internal(
+            self.config,
+            self.session_uplink_byte_capacity(),
+            self.per_flow_uplink_segment_capacity,
+            self.session_uplink_segment_capacity(),
+            gate,
+            self.origin.clone(),
+        )
     }
 
     pub const fn config(&self) -> FlowPortConfig {
@@ -241,8 +437,34 @@ impl ResumableTcpPortFactory {
         self.session_uplink_ledger.owned_bytes()
     }
 
-    pub fn open_flow(&self, flow: LocalFlow) -> (ResumableTcpFlow, ResumableTcpDriver) {
-        ResumableTcpFlow::bounded_pair(flow, self.config, self.session_uplink_ledger.clone())
+    pub const fn per_flow_uplink_segment_capacity(&self) -> usize {
+        self.per_flow_uplink_segment_capacity
+    }
+
+    pub fn session_uplink_segment_capacity(&self) -> usize {
+        self.session_uplink_segment_ledger.capacity()
+    }
+
+    pub fn session_uplink_owned_segments(&self) -> usize {
+        self.session_uplink_segment_ledger.owned_segments()
+    }
+
+    pub fn open_flow(
+        &self,
+        flow: LocalFlow,
+    ) -> Result<(ResumableTcpFlow, ResumableTcpDriver), FlowPortError> {
+        self.flow_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .admit(flow)?;
+        Ok(ResumableTcpFlow::bounded_pair(
+            flow,
+            self.config,
+            self.session_uplink_ledger.clone(),
+            self.per_flow_uplink_segment_capacity,
+            self.session_uplink_segment_ledger.clone(),
+            self.origin.clone(),
+        ))
     }
 }
 
@@ -259,6 +481,18 @@ impl fmt::Debug for ResumableTcpPortFactory {
                 "session_uplink_owned_bytes",
                 &self.session_uplink_owned_bytes(),
             )
+            .field(
+                "per_flow_uplink_segment_capacity",
+                &self.per_flow_uplink_segment_capacity(),
+            )
+            .field(
+                "session_uplink_segment_capacity",
+                &self.session_uplink_segment_capacity(),
+            )
+            .field(
+                "session_uplink_owned_segments",
+                &self.session_uplink_owned_segments(),
+            )
             .finish()
     }
 }
@@ -267,26 +501,44 @@ struct PortState {
     uplink_budget: Arc<Semaphore>,
     uplink_byte_capacity: usize,
     session_uplink_ledger: UplinkByteLedger,
+    uplink_segment_budget: Arc<Semaphore>,
+    uplink_segment_capacity: usize,
+    session_uplink_segment_ledger: UplinkSegmentLedger,
     pending_downlink_actions: AtomicUsize,
     reserved_completion_slots: AtomicUsize,
     observed_leg_losses: AtomicU64,
     next_uplink_offset: AtomicU64,
+    source_reservation_active: AtomicBool,
+    ordered_source_closed: AtomicBool,
     retired: AtomicBool,
     admission_gate: Mutex<()>,
+    origin: Option<TcpFactoryOrigin>,
 }
 
 impl PortState {
-    fn new(uplink_byte_capacity: usize, session_uplink_ledger: UplinkByteLedger) -> Self {
+    fn new(
+        uplink_byte_capacity: usize,
+        session_uplink_ledger: UplinkByteLedger,
+        uplink_segment_capacity: usize,
+        session_uplink_segment_ledger: UplinkSegmentLedger,
+        origin: Option<TcpFactoryOrigin>,
+    ) -> Self {
         Self {
             uplink_budget: Arc::new(Semaphore::new(uplink_byte_capacity)),
             uplink_byte_capacity,
             session_uplink_ledger,
+            uplink_segment_budget: Arc::new(Semaphore::new(uplink_segment_capacity)),
+            uplink_segment_capacity,
+            session_uplink_segment_ledger,
             pending_downlink_actions: AtomicUsize::new(0),
             reserved_completion_slots: AtomicUsize::new(0),
             observed_leg_losses: AtomicU64::new(0),
             next_uplink_offset: AtomicU64::new(0),
+            source_reservation_active: AtomicBool::new(false),
+            ordered_source_closed: AtomicBool::new(false),
             retired: AtomicBool::new(false),
             admission_gate: Mutex::new(()),
+            origin,
         }
     }
 
@@ -305,6 +557,9 @@ impl PortState {
             uplink_owned_bytes: self
                 .uplink_byte_capacity
                 .saturating_sub(self.uplink_budget.available_permits()),
+            uplink_owned_segments: self
+                .uplink_segment_capacity
+                .saturating_sub(self.uplink_segment_budget.available_permits()),
             pending_downlink_actions: self.pending_downlink_actions.load(Ordering::Acquire),
             reserved_completion_slots: self.reserved_completion_slots.load(Ordering::Acquire),
             observed_leg_losses: self.observed_leg_losses.load(Ordering::Acquire),
@@ -336,6 +591,7 @@ impl fmt::Debug for FlowPortProbe {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FlowPortSnapshot {
     uplink_owned_bytes: usize,
+    uplink_owned_segments: usize,
     pending_downlink_actions: usize,
     reserved_completion_slots: usize,
     observed_leg_losses: u64,
@@ -344,6 +600,10 @@ pub struct FlowPortSnapshot {
 impl FlowPortSnapshot {
     pub const fn uplink_owned_bytes(self) -> usize {
         self.uplink_owned_bytes
+    }
+
+    pub const fn uplink_owned_segments(self) -> usize {
+        self.uplink_owned_segments
     }
 
     pub const fn pending_downlink_actions(self) -> usize {
@@ -360,6 +620,7 @@ impl FlowPortSnapshot {
 
     pub const fn is_quiescent(self) -> bool {
         self.uplink_owned_bytes == 0
+            && self.uplink_owned_segments == 0
             && self.pending_downlink_actions == 0
             && self.reserved_completion_slots == 0
     }
@@ -384,6 +645,9 @@ impl ResumableTcpFlow {
         flow: LocalFlow,
         config: FlowPortConfig,
         session_uplink_ledger: UplinkByteLedger,
+        per_flow_uplink_segment_capacity: usize,
+        session_uplink_segment_ledger: UplinkSegmentLedger,
+        origin: Option<TcpFactoryOrigin>,
     ) -> (Self, ResumableTcpDriver) {
         let (source_tx, source_rx) = mpsc::channel(config.uplink_data_messages);
         let (control_tx, control_rx) = mpsc::channel(config.control_messages);
@@ -394,6 +658,9 @@ impl ResumableTcpFlow {
         let state = Arc::new(PortState::new(
             config.uplink_byte_capacity,
             session_uplink_ledger,
+            per_flow_uplink_segment_capacity,
+            session_uplink_segment_ledger,
+            origin,
         ));
         (
             Self {
@@ -427,6 +694,15 @@ impl ResumableTcpFlow {
         FlowPortProbe {
             state: Arc::clone(&self.state),
         }
+    }
+
+    /// Reserves one ordered source slot plus `max_bytes` of exact flow and
+    /// session capacity before a socket source is touched.
+    pub(crate) fn try_reserve_uplink_source(
+        &self,
+        max_bytes: usize,
+    ) -> Result<UplinkSourceReservation, FlowPortError> {
+        reserve_uplink_source(self.flow, &self.source_tx, &self.state, max_bytes)
     }
 
     /// Splits the single TUN-side owner into independently movable, still
@@ -535,6 +811,15 @@ impl ResumableTcpUplink {
         }
     }
 
+    /// Reserves one ordered source slot plus `max_bytes` of exact flow and
+    /// session capacity before a socket source is touched.
+    pub(crate) fn try_reserve_uplink_source(
+        &self,
+        max_bytes: usize,
+    ) -> Result<UplinkSourceReservation, FlowPortError> {
+        reserve_uplink_source(self.flow, &self.source_tx, &self.state, max_bytes)
+    }
+
     pub fn try_send_uplink_with<F>(
         &self,
         byte_len: usize,
@@ -617,10 +902,10 @@ impl fmt::Debug for ResumableTcpDownlink {
 
 /// Single-supervisor endpoint for one resumable TCP flow.
 ///
-/// Receiving [`UplinkData`] does not release its byte permit.  The supervisor
-/// must bind the returned [`UplinkOwnership`] to the exact DATA frame emitted
-/// by the reducer and retain the resulting [`UplinkReplayOwnership`] until an
-/// application ACK accepted by that reducer covers the whole extent.
+/// Receiving [`UplinkData`] releases neither byte nor replay-segment permits.
+/// The supervisor must bind [`UplinkOwnership`] to the exact DATA frame emitted
+/// by the reducer and retain [`UplinkReplayOwnership`] until an application ACK
+/// accepted by that reducer covers the whole extent.
 pub struct ResumableTcpDriver {
     flow: LocalFlow,
     source_rx: mpsc::Receiver<UplinkSource>,
@@ -972,8 +1257,8 @@ impl LocalReset {
     }
 }
 
-/// Admitted TUN-to-session DATA.  It is non-cloneable and still owns the
-/// port-level exact byte permit.
+/// Admitted TUN-to-session DATA. It is non-cloneable and still owns its exact
+/// byte and replay-segment permits.
 pub struct UplinkData {
     flow: LocalFlow,
     payload: Bytes,
@@ -1019,9 +1304,9 @@ impl fmt::Debug for UplinkData {
     }
 }
 
-/// Exact uplink byte ownership separated from the reducer event.  Dropping it
-/// is safe cleanup; normal supervisor code should call `release` at its exact
-/// transfer point so ownership changes remain reviewable.
+/// Exact uplink byte and replay-segment ownership separated from the reducer
+/// event. Dropping it is safe cleanup; normal supervisor code binds it to the
+/// reducer receipt so ownership changes remain reviewable.
 pub struct UplinkOwnership {
     flow: LocalFlow,
     bytes: usize,
@@ -1029,11 +1314,18 @@ pub struct UplinkOwnership {
     expected_end: ByteOffset,
     payload: Option<Bytes>,
     permits: Option<UplinkPermits>,
+    origin: Option<TcpFactoryOrigin>,
 }
 
 impl UplinkOwnership {
     pub const fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    pub(super) fn matches_factory_origin(&self, expected: &TcpFactoryOrigin) -> bool {
+        self.origin
+            .as_ref()
+            .is_some_and(|actual| actual.matches(expected))
     }
 
     /// Binds staging ownership only to the opaque authority emitted after
@@ -1070,6 +1362,7 @@ impl UplinkOwnership {
             end,
             bytes: self.bytes,
             permits: self.permits.take(),
+            origin: self.origin.take(),
         })
     }
 }
@@ -1083,7 +1376,8 @@ impl fmt::Debug for UplinkOwnership {
     }
 }
 
-/// Port-level ownership for one reducer-assigned replay extent.
+/// Port-level byte and segment ownership for one reducer-assigned replay
+/// extent.
 ///
 /// This is deliberately non-cloneable. A partial ACK conservatively keeps the
 /// whole permit. Release is authorized only by the opaque receipt emitted
@@ -1096,6 +1390,7 @@ pub struct UplinkReplayOwnership {
     end: ByteOffset,
     bytes: usize,
     permits: Option<UplinkPermits>,
+    origin: Option<TcpFactoryOrigin>,
 }
 
 impl UplinkReplayOwnership {
@@ -1117,6 +1412,12 @@ impl UplinkReplayOwnership {
 
     pub const fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    pub(super) fn matches_factory_origin(&self, expected: &TcpFactoryOrigin) -> bool {
+        self.origin
+            .as_ref()
+            .is_some_and(|actual| actual.matches(expected))
     }
 
     pub fn is_released(&self) -> bool {
@@ -1547,7 +1848,7 @@ fn try_send_uplink_parts<F>(
 where
     F: FnOnce() -> Bytes,
 {
-    let admission = reserve_uplink(flow, source_tx, state, byte_len)?;
+    let reservation = reserve_uplink_source(flow, source_tx, state, byte_len)?;
     let extracted = extractor();
     if extracted.len() != byte_len {
         return Err(FlowPortError::UplinkLengthMismatch {
@@ -1558,7 +1859,7 @@ where
     // `Bytes` does not expose backing capacity. Normalize at this queue
     // ownership boundary so a tiny slice cannot retain an uncharged
     // attacker-sized allocation while waiting for the supervisor.
-    admission.commit(Bytes::copy_from_slice(&extracted))
+    reservation.commit_normalized(Bytes::copy_from_slice(&extracted))
 }
 
 fn try_send_uplink_vec_parts<F>(
@@ -1571,7 +1872,7 @@ fn try_send_uplink_vec_parts<F>(
 where
     F: FnOnce() -> Vec<u8>,
 {
-    let admission = reserve_uplink(flow, source_tx, state, byte_len)?;
+    let reservation = reserve_uplink_source(flow, source_tx, state, byte_len)?;
     let extracted = extractor();
     if extracted.len() != byte_len {
         return Err(FlowPortError::UplinkLengthMismatch {
@@ -1587,58 +1888,184 @@ where
         // allocation ownership without another payload copy.
         Bytes::copy_from_slice(&extracted)
     };
-    admission.commit(payload)
+    reservation.commit_normalized(payload)
 }
 
-struct UplinkAdmission {
+/// One pre-read reservation for a local TCP source. It owns both bounded byte
+/// budgets and the exact FIFO message slot before any socket bytes are
+/// consumed. The type is deliberately non-cloneable.
+pub(crate) struct UplinkSourceReservation {
     flow: LocalFlow,
-    byte_len: usize,
-    expected_start: ByteOffset,
-    expected_end: ByteOffset,
-    source_slot: mpsc::OwnedPermit<UplinkSource>,
-    flow_byte_permit: OwnedSemaphorePermit,
-    session_byte_permit: OwnedSemaphorePermit,
+    reserved_bytes: usize,
+    source_slot: Option<mpsc::OwnedPermit<UplinkSource>>,
+    flow_byte_permit: Option<OwnedSemaphorePermit>,
+    session_byte_permit: Option<OwnedSemaphorePermit>,
+    flow_segment_permit: Option<OwnedSemaphorePermit>,
+    session_segment_permit: Option<OwnedSemaphorePermit>,
     state: Arc<PortState>,
+    active: bool,
+}
+
+impl fmt::Debug for UplinkSourceReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UplinkSourceReservation")
+            .field("reserved_bytes", &self.reserved_bytes)
+            .field("active", &self.active)
+            .finish_non_exhaustive()
+    }
 }
 
 struct UplinkPermits {
     _flow: OwnedSemaphorePermit,
     _session: OwnedSemaphorePermit,
+    _flow_segment: OwnedSemaphorePermit,
+    _session_segment: OwnedSemaphorePermit,
 }
 
-impl UplinkAdmission {
-    fn commit(self, payload: Bytes) -> Result<(), FlowPortError> {
+impl UplinkSourceReservation {
+    /// Commits the positive prefix actually consumed by the socket source.
+    /// `Bytes` is normalized at this ownership boundary so a small slice cannot
+    /// retain unaccounted backing storage.
+    pub(crate) fn commit(self, payload: Bytes) -> Result<(), FlowPortError> {
+        if payload.is_empty() || payload.len() > self.reserved_bytes {
+            return Err(FlowPortError::UplinkLengthMismatch {
+                reserved: self.reserved_bytes,
+                actual: payload.len(),
+            });
+        }
+        self.commit_normalized(Bytes::copy_from_slice(&payload))
+    }
+
+    /// Commits an already-observed local EOF through the exact ordered source
+    /// slot reserved before the source was touched. No byte or replay-segment
+    /// ownership survives because CLOSE contains no payload.
+    pub(crate) fn commit_eof(self) -> Result<(), FlowPortError> {
+        self.commit_close()
+    }
+
+    pub(crate) fn commit_close(mut self) -> Result<(), FlowPortError> {
+        let flow = self.flow;
         let state = Arc::clone(&self.state);
         let _admission = state.admission_guard();
         if state.is_retired() {
             return Err(FlowPortError::Closed);
         }
+        if state.ordered_source_closed.load(Ordering::Acquire) {
+            return Err(FlowPortError::Closed);
+        }
+        let source_slot = self.source_slot.take().ok_or(FlowPortError::Closed)?;
+
+        // EOF consumes no replay extent. Release all speculative capacity
+        // before publishing the unique ordered close fact.
+        self.flow_byte_permit.take();
+        self.session_byte_permit.take();
+        self.flow_segment_permit.take();
+        self.session_segment_permit.take();
+        let _sender = source_slot.send(UplinkSource::LocalClose { flow });
+        state.ordered_source_closed.store(true, Ordering::Release);
+        self.release_ordered_source();
+        Ok(())
+    }
+
+    fn commit_normalized(mut self, payload: Bytes) -> Result<(), FlowPortError> {
+        let actual = payload.len();
+        if actual == 0 || actual > self.reserved_bytes {
+            return Err(FlowPortError::UplinkLengthMismatch {
+                reserved: self.reserved_bytes,
+                actual,
+            });
+        }
+        let flow = self.flow;
+        let reserved_bytes = self.reserved_bytes;
+        let state = Arc::clone(&self.state);
+        let _admission = state.admission_guard();
+        if state.is_retired() {
+            return Err(FlowPortError::Closed);
+        }
+        let current = state.next_uplink_offset.load(Ordering::Acquire);
+        let actual_u64 = u64::try_from(actual).map_err(|_| FlowPortError::UplinkOffsetExhausted)?;
+        let next = current
+            .checked_add(actual_u64)
+            .ok_or(FlowPortError::UplinkOffsetExhausted)?;
+        let expected_start = ByteOffset::new(current);
+        let expected_end = expected_start
+            .checked_advance(actual)
+            .map_err(|_| FlowPortError::UplinkOffsetExhausted)?;
+        let mut flow_byte_permit = self.flow_byte_permit.take().ok_or(FlowPortError::Closed)?;
+        let mut session_byte_permit = self
+            .session_byte_permit
+            .take()
+            .ok_or(FlowPortError::Closed)?;
+        let flow_segment_permit = self
+            .flow_segment_permit
+            .take()
+            .ok_or(FlowPortError::Closed)?;
+        let session_segment_permit = self
+            .session_segment_permit
+            .take()
+            .ok_or(FlowPortError::Closed)?;
+        let exact_flow_permit =
+            flow_byte_permit
+                .split(actual)
+                .ok_or(FlowPortError::UplinkLengthMismatch {
+                    reserved: reserved_bytes,
+                    actual,
+                })?;
+        let exact_session_permit =
+            session_byte_permit
+                .split(actual)
+                .ok_or(FlowPortError::UplinkLengthMismatch {
+                    reserved: reserved_bytes,
+                    actual,
+                })?;
+        let source_slot = self.source_slot.take().ok_or(FlowPortError::Closed)?;
         let ownership = UplinkOwnership {
-            flow: self.flow,
-            bytes: self.byte_len,
-            expected_start: self.expected_start,
-            expected_end: self.expected_end,
+            flow,
+            bytes: actual,
+            expected_start,
+            expected_end,
             payload: Some(payload.clone()),
             permits: Some(UplinkPermits {
-                _flow: self.flow_byte_permit,
-                _session: self.session_byte_permit,
+                _flow: exact_flow_permit,
+                _session: exact_session_permit,
+                _flow_segment: flow_segment_permit,
+                _session_segment: session_segment_permit,
             }),
+            origin: state.origin.clone(),
         };
-        let _sender = self.source_slot.send(UplinkSource::Data(UplinkData {
-            flow: self.flow,
+        state.next_uplink_offset.store(next, Ordering::Release);
+        let _sender = source_slot.send(UplinkSource::Data(UplinkData {
+            flow,
             payload,
             ownership,
         }));
+        self.release_ordered_source();
         Ok(())
+    }
+
+    fn release_ordered_source(&mut self) {
+        if self.active {
+            self.state
+                .source_reservation_active
+                .store(false, Ordering::Release);
+            self.active = false;
+        }
     }
 }
 
-fn reserve_uplink(
+impl Drop for UplinkSourceReservation {
+    fn drop(&mut self) {
+        self.release_ordered_source();
+    }
+}
+
+fn reserve_uplink_source(
     flow: LocalFlow,
     source_tx: &mpsc::Sender<UplinkSource>,
     state: &Arc<PortState>,
     byte_len: usize,
-) -> Result<UplinkAdmission, FlowPortError> {
+) -> Result<UplinkSourceReservation, FlowPortError> {
     if byte_len == 0 || byte_len > MAX_DATA_PAYLOAD_BYTES {
         return Err(FlowPortError::InvalidUplinkLength { len: byte_len });
     }
@@ -1653,6 +2080,19 @@ fn reserve_uplink(
     if state.is_retired() {
         return Err(FlowPortError::Closed);
     }
+    if state.ordered_source_closed.load(Ordering::Acquire) {
+        return Err(FlowPortError::Closed);
+    }
+    if state.source_reservation_active.load(Ordering::Acquire) {
+        return Err(FlowPortError::UplinkSourceReservationActive);
+    }
+    let requested_u64 =
+        u64::try_from(byte_len).map_err(|_| FlowPortError::UplinkOffsetExhausted)?;
+    state
+        .next_uplink_offset
+        .load(Ordering::Acquire)
+        .checked_add(requested_u64)
+        .ok_or(FlowPortError::UplinkOffsetExhausted)?;
     let source_slot = reserve_owned(source_tx, FlowPortError::UplinkMessageLaneFull)?;
     let permits = u32::try_from(byte_len)
         .map_err(|_| FlowPortError::InvalidUplinkLength { len: byte_len })?;
@@ -1668,27 +2108,29 @@ fn reserve_uplink(
             requested: byte_len,
             available: state.session_uplink_ledger.available_bytes(),
         })?;
-    let byte_len_u64 = u64::try_from(byte_len).map_err(|_| FlowPortError::UplinkOffsetExhausted)?;
-    let expected_start = state
-        .next_uplink_offset
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            current.checked_add(byte_len_u64)
-        })
-        .map(ByteOffset::new)
-        .map_err(|_| FlowPortError::UplinkOffsetExhausted)?;
-    let expected_end = expected_start
-        .checked_advance(byte_len)
-        .map_err(|_| FlowPortError::UplinkOffsetExhausted)?;
-
-    Ok(UplinkAdmission {
+    let flow_segment_permit = Arc::clone(&state.uplink_segment_budget)
+        .try_acquire_owned()
+        .map_err(|_| FlowPortError::UplinkSegmentBudgetExhausted {
+            available: state.uplink_segment_budget.available_permits(),
+        })?;
+    let session_segment_permit = Arc::clone(&state.session_uplink_segment_ledger.budget)
+        .try_acquire_owned()
+        .map_err(|_| FlowPortError::UplinkGlobalSegmentBudgetExhausted {
+            available: state.session_uplink_segment_ledger.available_segments(),
+        })?;
+    state
+        .source_reservation_active
+        .store(true, Ordering::Release);
+    Ok(UplinkSourceReservation {
         flow,
-        byte_len,
-        expected_start,
-        expected_end,
-        source_slot,
-        flow_byte_permit,
-        session_byte_permit,
+        reserved_bytes: byte_len,
+        source_slot: Some(source_slot),
+        flow_byte_permit: Some(flow_byte_permit),
+        session_byte_permit: Some(session_byte_permit),
+        flow_segment_permit: Some(flow_segment_permit),
+        session_segment_permit: Some(session_segment_permit),
         state: Arc::clone(state),
+        active: true,
     })
 }
 
@@ -1701,12 +2143,20 @@ fn send_ordered_close(
     if state.is_retired() {
         return Err(FlowPortError::Closed);
     }
+    if state.ordered_source_closed.load(Ordering::Acquire) {
+        return Err(FlowPortError::Closed);
+    }
+    if state.source_reservation_active.load(Ordering::Acquire) {
+        return Err(FlowPortError::UplinkSourceReservationActive);
+    }
     sender
         .try_send(UplinkSource::LocalClose { flow })
         .map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => FlowPortError::UplinkMessageLaneFull,
             mpsc::error::TrySendError::Closed(_) => FlowPortError::Closed,
-        })
+        })?;
+    state.ordered_source_closed.store(true, Ordering::Release);
+    Ok(())
 }
 
 fn send_reset(
@@ -1744,6 +2194,24 @@ fn validate_channel_capacity(lane: &'static str, value: usize) -> Result<(), Flo
     if value > Semaphore::MAX_PERMITS {
         return Err(FlowPortConfigError::ChannelCapacityTooLarge {
             lane,
+            value,
+            max: Semaphore::MAX_PERMITS,
+        });
+    }
+    Ok(())
+}
+
+fn validate_segment_capacity(
+    scope: &'static str,
+    value: usize,
+    zero_error: FlowPortConfigError,
+) -> Result<(), FlowPortConfigError> {
+    if value == 0 {
+        return Err(zero_error);
+    }
+    if value > Semaphore::MAX_PERMITS {
+        return Err(FlowPortConfigError::SegmentCapacityTooLarge {
+            scope,
             value,
             max: Semaphore::MAX_PERMITS,
         });
@@ -1901,9 +2369,10 @@ mod tests {
         flow: LocalFlow,
         config: FlowPortConfig,
     ) -> (ResumableTcpFlow, ResumableTcpDriver) {
-        ResumableTcpPortFactory::new(config, config.uplink_byte_capacity())
+        ResumableTcpPortFactory::new_unbound_for_test(config, config.uplink_byte_capacity(), 8, 16)
             .unwrap()
             .open_flow(flow)
+            .unwrap()
     }
 
     fn open_another_local_flow(fixture: &mut Fixture, port: u16) -> LocalFlow {
@@ -2020,12 +2489,124 @@ mod tests {
     }
 
     #[test]
+    fn replay_segment_factory_exposes_exact_reducer_aligned_capacities() {
+        let config = port_config(8, 1, 1, 1);
+        let factory = ResumableTcpPortFactory::new_unbound_for_test(config, 32, 3, 11).unwrap();
+        assert_eq!(factory.per_flow_uplink_segment_capacity(), 3);
+        assert_eq!(factory.session_uplink_segment_capacity(), 11);
+        assert_eq!(factory.session_uplink_owned_segments(), 0);
+        assert_eq!(
+            ResumableTcpPortFactory::new_unbound_for_test(config, 32, 0, 11).unwrap_err(),
+            FlowPortConfigError::ZeroUplinkSegmentCapacity
+        );
+        assert_eq!(
+            ResumableTcpPortFactory::new_unbound_for_test(config, 32, 3, 0).unwrap_err(),
+            FlowPortConfigError::ZeroSessionUplinkSegmentCapacity
+        );
+    }
+
+    #[test]
+    fn cloned_factory_rejects_duplicate_local_flow_authority_before_source_admission() {
+        let fixture = fixture();
+        let factory =
+            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 1, 1), 16, 8, 16)
+                .unwrap();
+        let duplicate_caller = factory.clone();
+
+        let (flow, mut driver) = factory.open_flow(fixture.flow).unwrap();
+        assert!(matches!(
+            duplicate_caller.open_flow(fixture.flow),
+            Err(FlowPortError::LocalFlowAuthorityNotMonotonic {
+                highest: 1,
+                attempted: 1,
+            })
+        ));
+        assert_eq!(factory.session_uplink_owned_bytes(), 0);
+        assert_eq!(factory.session_uplink_owned_segments(), 0);
+
+        flow.try_send_uplink_with(1, || Bytes::from_static(b"x"))
+            .unwrap();
+        assert!(matches!(
+            driver.try_recv_next().unwrap(),
+            Some(DriverInput::Data(data)) if data.payload() == b"x"
+        ));
+    }
+
+    #[test]
+    fn factory_binding_rejects_cross_session_and_cross_direction_capabilities() {
+        let session = SessionId::new([0x91; 16]).unwrap();
+        let factory =
+            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 1, 1), 16, 8, 16)
+                .unwrap();
+        let first = LocalFlow::for_adapter_test(
+            session,
+            SessionFlowId::new(1).unwrap(),
+            Direction::ClientToTarget,
+            1,
+        );
+        factory.open_flow(first).unwrap();
+
+        let cross_session = LocalFlow::for_adapter_test(
+            SessionId::new([0x92; 16]).unwrap(),
+            SessionFlowId::new(2).unwrap(),
+            Direction::ClientToTarget,
+            2,
+        );
+        assert!(matches!(
+            factory.open_flow(cross_session),
+            Err(FlowPortError::CrossSessionFlowFactory)
+        ));
+
+        let cross_direction = LocalFlow::for_adapter_test(
+            session,
+            SessionFlowId::new(2).unwrap(),
+            Direction::TargetToClient,
+            2,
+        );
+        assert!(matches!(
+            factory.open_flow(cross_direction),
+            Err(FlowPortError::FlowFactoryDirectionMismatch {
+                expected: Direction::ClientToTarget,
+                actual: Direction::TargetToClient,
+            })
+        ));
+    }
+
+    #[test]
+    fn factory_accepts_authority_gaps_but_rejects_a_later_stale_capability() {
+        let session = SessionId::new([0x93; 16]).unwrap();
+        let factory =
+            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 1, 1), 16, 8, 16)
+                .unwrap();
+        let flow = |flow_id, authority_id| {
+            LocalFlow::for_adapter_test(
+                session,
+                SessionFlowId::new(flow_id).unwrap(),
+                Direction::ClientToTarget,
+                authority_id,
+            )
+        };
+
+        factory.open_flow(flow(1, 1)).unwrap();
+        factory.open_flow(flow(3, 3)).unwrap();
+        assert!(matches!(
+            factory.open_flow(flow(2, 2)),
+            Err(FlowPortError::LocalFlowAuthorityNotMonotonic {
+                highest: 3,
+                attempted: 2,
+            })
+        ));
+    }
+
+    #[test]
     fn session_uplink_ledger_backpressures_across_flows_before_extraction() {
         let mut fixture = fixture();
         let second_flow = open_another_local_flow(&mut fixture, 8443);
-        let factory = ResumableTcpPortFactory::new(port_config(4, 1, 1, 1), 4).unwrap();
-        let (first, mut first_driver) = factory.open_flow(fixture.flow);
-        let (second, _second_driver) = factory.open_flow(second_flow);
+        let factory =
+            ResumableTcpPortFactory::new_unbound_for_test(port_config(4, 1, 1, 1), 4, 8, 16)
+                .unwrap();
+        let (first, mut first_driver) = factory.open_flow(fixture.flow).unwrap();
+        let (second, _second_driver) = factory.open_flow(second_flow).unwrap();
         let calls = AtomicUsize::new(0);
 
         first
@@ -2111,6 +2692,7 @@ mod tests {
         assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 8);
         drop(ownership);
         assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 4);
+        assert_eq!(flow.probe().snapshot().uplink_owned_segments(), 1);
         drop(first_replay);
         assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 0);
     }
@@ -2278,6 +2860,465 @@ mod tests {
     }
 
     #[test]
+    fn replay_segment_permits_survive_source_dequeue_until_exact_ack() {
+        let mut fixture = fixture();
+        let factory =
+            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 2, 1), 8, 2, 2)
+                .unwrap();
+        let (flow, mut driver) = factory.open_flow(fixture.flow).unwrap();
+        let mut retained = Vec::new();
+
+        for payload in [b"a".as_slice(), b"b".as_slice()] {
+            flow.try_send_uplink_with(1, || Bytes::copy_from_slice(payload))
+                .unwrap();
+            let Some(DriverInput::Data(data)) = driver.try_recv_next().unwrap() else {
+                panic!("expected admitted DATA")
+            };
+            let (event, mut ownership) = data.into_event_and_ownership();
+            let mut effects = fixture.model.reduce(event).unwrap();
+            retained.push(
+                ownership
+                    .bind_replay(take_replay_stored(&mut effects))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(flow.probe().snapshot().uplink_owned_segments(), 2);
+        assert_eq!(factory.session_uplink_owned_segments(), 2);
+
+        let extractions = AtomicUsize::new(0);
+        assert_eq!(
+            flow.try_send_uplink_with(1, || {
+                extractions.fetch_add(1, Ordering::SeqCst);
+                Bytes::from_static(b"c")
+            })
+            .unwrap_err(),
+            FlowPortError::UplinkSegmentBudgetExhausted { available: 0 }
+        );
+        assert_eq!(extractions.load(Ordering::SeqCst), 0);
+
+        let acknowledged = Frame::try_new(
+            fixture.leg.generation(),
+            Record::Ack {
+                flow_id: fixture.flow.flow_id(),
+                direction: Direction::ClientToTarget,
+                next_accepted: ByteOffset::new(1),
+                final_accepted: false,
+            },
+        )
+        .unwrap();
+        let mut effects = fixture
+            .model
+            .reduce(SessionEvent::PeerFrame {
+                leg: fixture.leg,
+                frame: acknowledged,
+            })
+            .unwrap();
+        assert!(
+            retained[0]
+                .release_after_reducer_ack(&take_replay_acknowledged(&mut effects))
+                .unwrap()
+        );
+        assert_eq!(flow.probe().snapshot().uplink_owned_segments(), 1);
+
+        flow.try_send_uplink_with(1, || {
+            extractions.fetch_add(1, Ordering::SeqCst);
+            Bytes::from_static(b"c")
+        })
+        .unwrap();
+        assert_eq!(extractions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn replay_segment_limits_are_per_flow_and_session_global_before_extraction() {
+        let mut fixture = fixture();
+        let second_flow = open_another_local_flow(&mut fixture, 8443);
+        let third_flow = open_another_local_flow(&mut fixture, 9443);
+        let factory =
+            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 2, 1), 8, 1, 2)
+                .unwrap();
+        let (first, mut first_driver) = factory.open_flow(fixture.flow).unwrap();
+        let (second, mut second_driver) = factory.open_flow(second_flow).unwrap();
+        let (third, mut third_driver) = factory.open_flow(third_flow).unwrap();
+        let extractions = AtomicUsize::new(0);
+
+        first
+            .try_send_uplink_with(1, || {
+                extractions.fetch_add(1, Ordering::SeqCst);
+                Bytes::from_static(b"a")
+            })
+            .unwrap();
+        let Some(DriverInput::Data(first_data)) = first_driver.try_recv_next().unwrap() else {
+            panic!("expected first DATA")
+        };
+        assert_eq!(
+            first
+                .try_send_uplink_with(1, || {
+                    extractions.fetch_add(1, Ordering::SeqCst);
+                    Bytes::from_static(b"x")
+                })
+                .unwrap_err(),
+            FlowPortError::UplinkSegmentBudgetExhausted { available: 0 }
+        );
+
+        second
+            .try_send_uplink_with(1, || {
+                extractions.fetch_add(1, Ordering::SeqCst);
+                Bytes::from_static(b"b")
+            })
+            .unwrap();
+        let Some(DriverInput::Data(second_data)) = second_driver.try_recv_next().unwrap() else {
+            panic!("expected second DATA")
+        };
+        assert_eq!(factory.session_uplink_owned_segments(), 2);
+        assert_eq!(
+            third
+                .try_send_uplink_with(1, || {
+                    extractions.fetch_add(1, Ordering::SeqCst);
+                    Bytes::from_static(b"c")
+                })
+                .unwrap_err(),
+            FlowPortError::UplinkGlobalSegmentBudgetExhausted { available: 0 }
+        );
+        assert_eq!(extractions.load(Ordering::SeqCst), 2);
+
+        drop(first_data);
+        assert_eq!(factory.session_uplink_owned_segments(), 1);
+        third
+            .try_send_uplink_with(1, || {
+                extractions.fetch_add(1, Ordering::SeqCst);
+                Bytes::from_static(b"c")
+            })
+            .unwrap();
+        assert!(matches!(
+            third_driver.try_recv_next().unwrap(),
+            Some(DriverInput::Data(_))
+        ));
+        assert_eq!(extractions.load(Ordering::SeqCst), 3);
+        drop(second_data);
+    }
+
+    #[test]
+    fn source_reservation_commits_eof_through_its_pre_reserved_fifo_slot() {
+        let fixture = fixture();
+        let factory =
+            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 1, 1), 8, 1, 1)
+                .unwrap();
+        let (flow, mut driver) = factory.open_flow(fixture.flow).unwrap();
+        let eof_reads = AtomicUsize::new(0);
+
+        let reservation = flow.try_reserve_uplink_source(8).unwrap();
+        eof_reads.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            flow.try_send_close().unwrap_err(),
+            FlowPortError::UplinkSourceReservationActive
+        );
+        reservation.commit_eof().unwrap();
+
+        assert_eq!(eof_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 0);
+        assert_eq!(flow.probe().snapshot().uplink_owned_segments(), 0);
+        assert_eq!(factory.session_uplink_owned_bytes(), 0);
+        assert_eq!(factory.session_uplink_owned_segments(), 0);
+        assert_eq!(flow.try_send_close().unwrap_err(), FlowPortError::Closed);
+        let post_eof_extractions = AtomicUsize::new(0);
+        assert_eq!(
+            flow.try_send_uplink_with(1, || {
+                post_eof_extractions.fetch_add(1, Ordering::SeqCst);
+                Bytes::from_static(b"late")
+            })
+            .unwrap_err(),
+            FlowPortError::Closed
+        );
+        assert_eq!(post_eof_extractions.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            driver.try_recv_next().unwrap(),
+            Some(DriverInput::Control(SessionEvent::LocalClose { flow: observed }))
+                if observed == fixture.flow
+        ));
+        assert!(driver.try_recv_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn committed_eof_cannot_overtake_preceding_data_on_a_one_slot_lane() {
+        let fixture = fixture();
+        let factory =
+            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 1, 1), 8, 2, 2)
+                .unwrap();
+        let (flow, mut driver) = factory.open_flow(fixture.flow).unwrap();
+        let eof_reads = AtomicUsize::new(0);
+
+        flow.try_send_uplink_with(1, || Bytes::from_static(b"x"))
+            .unwrap();
+        assert!(matches!(
+            flow.try_reserve_uplink_source(1),
+            Err(FlowPortError::UplinkMessageLaneFull)
+        ));
+        assert_eq!(eof_reads.load(Ordering::SeqCst), 0);
+
+        let Some(DriverInput::Data(data)) = driver.try_recv_next().unwrap() else {
+            panic!("preceding DATA must be observed before EOF can reserve its slot")
+        };
+        let reservation = flow.try_reserve_uplink_source(1).unwrap();
+        eof_reads.fetch_add(1, Ordering::SeqCst);
+        reservation.commit_eof().unwrap();
+
+        assert_eq!(data.payload(), b"x");
+        assert!(matches!(
+            driver.try_recv_next().unwrap(),
+            Some(DriverInput::Control(SessionEvent::LocalClose { flow: observed }))
+                if observed == fixture.flow
+        ));
+        assert_eq!(eof_reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn uplink_source_reservation_shrinks_max_budget_to_committed_bytes() {
+        let mut fixture = fixture();
+        let factory =
+            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 1, 1), 8, 8, 16)
+                .unwrap();
+        let (flow, mut driver) = factory.open_flow(fixture.flow).unwrap();
+
+        let reservation = flow.try_reserve_uplink_source(8).unwrap();
+        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 8);
+        assert_eq!(factory.session_uplink_owned_bytes(), 8);
+        reservation.commit(Bytes::from_static(b"abc")).unwrap();
+        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 3);
+        assert_eq!(factory.session_uplink_owned_bytes(), 3);
+
+        let Some(DriverInput::Data(data)) = driver.try_recv_next().unwrap() else {
+            panic!("expected committed source DATA")
+        };
+        let (event, mut ownership) = data.into_event_and_ownership();
+        let mut effects = fixture.model.reduce(event).unwrap();
+        let stored = take_replay_stored(&mut effects);
+        let replay = ownership.bind_replay(stored).unwrap();
+        assert_eq!(replay.start(), ByteOffset::new(0));
+        assert_eq!(replay.end(), ByteOffset::new(3));
+        drop(replay);
+        assert_eq!(factory.session_uplink_owned_bytes(), 0);
+    }
+
+    #[test]
+    fn invalid_source_commit_releases_reservation_without_advancing_offset() {
+        let mut fixture = fixture();
+        let factory =
+            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 1, 1), 8, 8, 16)
+                .unwrap();
+        let (flow, mut driver) = factory.open_flow(fixture.flow).unwrap();
+
+        assert_eq!(
+            flow.try_reserve_uplink_source(8)
+                .unwrap()
+                .commit(Bytes::new())
+                .unwrap_err(),
+            FlowPortError::UplinkLengthMismatch {
+                reserved: 8,
+                actual: 0,
+            }
+        );
+        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 0);
+        assert_eq!(factory.session_uplink_owned_bytes(), 0);
+        assert!(driver.try_recv_next().unwrap().is_none());
+
+        flow.try_reserve_uplink_source(8)
+            .unwrap()
+            .commit(Bytes::from_static(b"abc"))
+            .unwrap();
+        let Some(DriverInput::Data(data)) = driver.try_recv_next().unwrap() else {
+            panic!("expected valid DATA after rejected empty commit")
+        };
+        let (event, mut ownership) = data.into_event_and_ownership();
+        let mut effects = fixture.model.reduce(event).unwrap();
+        let stored = take_replay_stored(&mut effects);
+        let replay = ownership.bind_replay(stored).unwrap();
+        assert_eq!(replay.start(), ByteOffset::new(0));
+        assert_eq!(replay.end(), ByteOffset::new(3));
+    }
+
+    #[test]
+    fn exhausted_source_offset_rejects_before_touching_the_socket_extractor() {
+        let fixture = fixture();
+        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 1, 1, 1));
+        flow.state
+            .next_uplink_offset
+            .store(u64::MAX, Ordering::Release);
+        let extractions = AtomicUsize::new(0);
+
+        assert_eq!(
+            flow.try_send_uplink_with(1, || {
+                extractions.fetch_add(1, Ordering::SeqCst);
+                Bytes::from_static(b"x")
+            })
+            .unwrap_err(),
+            FlowPortError::UplinkOffsetExhausted
+        );
+        assert_eq!(extractions.load(Ordering::SeqCst), 0);
+        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 0);
+        assert_eq!(flow.probe().snapshot().uplink_owned_segments(), 0);
+        assert!(driver.try_recv_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn ordered_close_waits_for_outstanding_source_reservation() {
+        let fixture = fixture();
+        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 2, 1, 1));
+
+        let reservation = flow.try_reserve_uplink_source(8).unwrap();
+        assert_eq!(
+            flow.try_send_close().unwrap_err(),
+            FlowPortError::UplinkSourceReservationActive
+        );
+        assert!(driver.try_recv_next().unwrap().is_none());
+
+        drop(reservation);
+        flow.try_send_close().unwrap();
+        assert!(matches!(
+            driver.try_recv_next().unwrap(),
+            Some(DriverInput::Control(SessionEvent::LocalClose { flow: observed }))
+                if observed == fixture.flow
+        ));
+    }
+
+    #[test]
+    fn extractor_length_mismatch_does_not_advance_later_source_offsets() {
+        let mut fixture = fixture();
+        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 2, 1, 1));
+
+        assert_eq!(
+            flow.try_send_uplink_with(8, || Bytes::from_static(b"bad"))
+                .unwrap_err(),
+            FlowPortError::UplinkLengthMismatch {
+                reserved: 8,
+                actual: 3,
+            }
+        );
+        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 0);
+
+        let mut replays = Vec::new();
+        for payload in [b"abc".as_slice(), b"def".as_slice()] {
+            flow.try_send_uplink_with(payload.len(), || Bytes::copy_from_slice(payload))
+                .unwrap();
+            let Some(DriverInput::Data(data)) = driver.try_recv_next().unwrap() else {
+                panic!("expected valid DATA after mismatch")
+            };
+            let (event, mut ownership) = data.into_event_and_ownership();
+            let mut effects = fixture.model.reduce(event).unwrap();
+            let stored = take_replay_stored(&mut effects);
+            replays.push(ownership.bind_replay(stored).unwrap());
+        }
+
+        assert_eq!(replays[0].start(), ByteOffset::new(0));
+        assert_eq!(replays[0].end(), ByteOffset::new(3));
+        assert_eq!(replays[1].start(), ByteOffset::new(3));
+        assert_eq!(replays[1].end(), ByteOffset::new(6));
+    }
+
+    #[test]
+    fn source_error_drops_reservation_without_capacity_or_offset_ownership() {
+        let mut fixture = fixture();
+        let factory =
+            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 1, 1), 8, 8, 16)
+                .unwrap();
+        let (flow, mut driver) = factory.open_flow(fixture.flow).unwrap();
+
+        let reservation = flow.try_reserve_uplink_source(8).unwrap();
+        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 8);
+        assert_eq!(factory.session_uplink_owned_bytes(), 8);
+        let source_result = Result::<Bytes, &'static str>::Err("would block");
+        match source_result {
+            Ok(payload) => reservation.commit(payload).unwrap(),
+            Err(_) => drop(reservation),
+        }
+        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 0);
+        assert_eq!(factory.session_uplink_owned_bytes(), 0);
+        assert!(driver.try_recv_next().unwrap().is_none());
+
+        flow.try_reserve_uplink_source(8)
+            .unwrap()
+            .commit(Bytes::from_static(b"abc"))
+            .unwrap();
+        let Some(DriverInput::Data(data)) = driver.try_recv_next().unwrap() else {
+            panic!("expected valid DATA after source error")
+        };
+        let (event, mut ownership) = data.into_event_and_ownership();
+        let mut effects = fixture.model.reduce(event).unwrap();
+        let stored = take_replay_stored(&mut effects);
+        let replay = ownership.bind_replay(stored).unwrap();
+        assert_eq!(replay.start(), ByteOffset::new(0));
+        assert_eq!(replay.end(), ByteOffset::new(3));
+    }
+
+    #[test]
+    fn source_reservations_share_the_session_global_byte_budget() {
+        let mut fixture = fixture();
+        let second_flow = open_another_local_flow(&mut fixture, 8443);
+        let factory =
+            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 1, 1), 4, 8, 16)
+                .unwrap();
+        let (first, _first_driver) = factory.open_flow(fixture.flow).unwrap();
+        let (second, mut second_driver) = factory.open_flow(second_flow).unwrap();
+
+        let first_reservation = first.try_reserve_uplink_source(4).unwrap();
+        assert_eq!(factory.session_uplink_owned_bytes(), 4);
+        let Err(error) = second.try_reserve_uplink_source(1) else {
+            panic!("the second flow must not bypass the shared session byte budget")
+        };
+        assert_eq!(
+            error,
+            FlowPortError::UplinkGlobalByteBudgetExhausted {
+                requested: 1,
+                available: 0,
+            }
+        );
+
+        drop(first_reservation);
+        assert_eq!(factory.session_uplink_owned_bytes(), 0);
+        second
+            .try_reserve_uplink_source(1)
+            .unwrap()
+            .commit(Bytes::from_static(b"x"))
+            .unwrap();
+        assert_eq!(factory.session_uplink_owned_bytes(), 1);
+        let Some(DriverInput::Data(data)) = second_driver.try_recv_next().unwrap() else {
+            panic!("expected second flow DATA after shared capacity was released")
+        };
+        drop(data);
+        assert_eq!(factory.session_uplink_owned_bytes(), 0);
+    }
+
+    #[test]
+    fn one_source_reservation_blocks_ordered_sources_but_not_urgent_reset() {
+        let fixture = fixture();
+        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 2, 1, 1));
+
+        let reservation = flow.try_reserve_uplink_source(8).unwrap();
+        let Err(error) = flow.try_reserve_uplink_source(1) else {
+            panic!("a flow must not hold two ordered-source reservations")
+        };
+        assert_eq!(error, FlowPortError::UplinkSourceReservationActive);
+        flow.try_send_reset(ResetReason::LocalAbandon).unwrap();
+        assert!(matches!(
+            driver.try_recv_next().unwrap(),
+            Some(DriverInput::Control(SessionEvent::LocalReset {
+                flow: reset_flow,
+                reason: ResetReason::LocalAbandon,
+            })) if reset_flow == fixture.flow
+        ));
+
+        drop(reservation);
+        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 0);
+        flow.try_reserve_uplink_source(1)
+            .unwrap()
+            .commit(Bytes::from_static(b"x"))
+            .unwrap();
+        assert!(matches!(
+            driver.try_recv_next().unwrap(),
+            Some(DriverInput::Data(_))
+        ));
+    }
+
+    #[test]
     fn uplink_queue_normalizes_a_small_slice_before_taking_ownership() {
         let fixture = fixture();
         let (flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 1, 1, 1));
@@ -2370,12 +3411,14 @@ mod tests {
             FlowPortError::UplinkTerminalMismatch
         );
         assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 4);
+        assert_eq!(flow.probe().snapshot().uplink_owned_segments(), 1);
         let terminal = terminal_effects
             .iter()
             .find(|effect| matches!(effect, SessionEffect::FlowFinished { .. }))
             .unwrap();
         assert!(replay.release_after_reducer_terminal(terminal).unwrap());
         assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 0);
+        assert_eq!(flow.probe().snapshot().uplink_owned_segments(), 0);
     }
 
     #[test]

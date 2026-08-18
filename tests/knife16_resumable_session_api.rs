@@ -1,7 +1,7 @@
 use mini_vpn::resumable::{
-    FlowFinishReason, LocalFlow, PeerOpenRequest, ReceiveBudgetLimits, ReplayAcknowledged,
-    ReplayBudgetLimits, ReplayStored, SessionConfig, SessionEffect, SessionEvent, SessionModel,
-    SinkHalfClose, SinkOffer, TerminalGrace,
+    FlowFinishReason, GenerationCatchUp, LocalFlow, PeerOpenRequest, PendingGenerationCatchUp,
+    ReceiveBudgetLimits, ReplayAcknowledged, ReplayBudgetLimits, ReplayStored, SessionConfig,
+    SessionEffect, SessionEvent, SessionModel, SinkHalfClose, SinkOffer, TerminalGrace,
 };
 
 // This integration test deliberately lives outside the crate. It prevents the
@@ -11,8 +11,10 @@ use mini_vpn::resumable::{
 fn session_adapter_surface_is_public_and_exhaustive() {
     fn assert_public<T>() {}
     assert_public::<FlowFinishReason>();
+    assert_public::<GenerationCatchUp>();
     assert_public::<LocalFlow>();
     assert_public::<PeerOpenRequest>();
+    assert_public::<PendingGenerationCatchUp>();
     assert_public::<ReceiveBudgetLimits>();
     assert_public::<ReplayBudgetLimits>();
     assert_public::<ReplayAcknowledged>();
@@ -26,6 +28,7 @@ fn session_adapter_surface_is_public_and_exhaustive() {
     fn consume_event(event: SessionEvent) {
         match event {
             SessionEvent::ReplacementAttached { .. }
+            | SessionEvent::ReplacementCaughtUp { .. }
             | SessionEvent::LegLost { .. }
             | SessionEvent::ResumeGraceExpired { .. }
             | SessionEvent::LocalOpen { .. }

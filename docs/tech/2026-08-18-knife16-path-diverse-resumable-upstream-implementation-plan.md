@@ -2,7 +2,8 @@
 
 Date: 2026-08-18
 
-Status: **IN PROGRESS; TASKS 1–3 COMPLETE; TASK 4 NEXT; M3 BLOCKED**
+Status: **IN PROGRESS; TASKS 1–3 COMPLETE; TASK 4 R1–R5 FOUNDATION
+ACCEPTED; R6 NEXT; M3 BLOCKED**
 
 > Use `diagnose` and `tdd` for each behavior change. Use
 > `improve-codebase-architecture` when a test cannot reach the required
@@ -84,7 +85,7 @@ WAN, and throughput remain unimplemented. See
 
 ## Task 4: Deterministic two-leg transport harness
 
-Status: **NEXT**
+Status: **IN PROGRESS — R1–R5 FOUNDATION ACCEPTED LOCALLY; R6–R9 OPEN**
 
 - Build in-memory client/ingress/owner legs with deterministic clocks.
 - Inject drop, reorder, duplicate, delayed ACK, primary blackouts from
@@ -96,6 +97,21 @@ Status: **NEXT**
 Acceptance: every injected sub-second single-leg outage preserves exact TCP
 delivery with no complete one-second receiver interruption. Unexpected REDs
 stop for causal repair; timing constants are not tuned around them.
+
+Foundation result: R1–R5 now pass locally through the production-shared
+codec, exact leg seal, attach transaction, single-owner supervisor, typed
+source/replay ownership, `TargetIo`, one-event wire scheduler, category-owned
+work budgets, and a complete byte-level baseline. Source admission precedes
+irreversible reads, transient reducer pressure returns exact inputs, one
+pristine supervisor is the sole factory mint, and final continuation/replay/
+Target/wire ownership is zero. Independent reviews report P0/P1 `0/0` for
+this foundation.
+
+This does not meet Task-4 acceptance. Standby registration, authenticated
+probe/hint control, a production-shared switch controller, ordered
+acceptance-before-recovery, stale-A retirement, the R8 fault matrix, and R9
+real-smoltcp parity remain open. Result:
+`docs/tech/2026-08-18-knife16-two-leg-foundation-local-results.md`.
 
 ## Task 5: UDP dual-leg delivery engine
 

@@ -4,7 +4,7 @@
 
 ### Path-diverse resumable upstream
 
-#### Latest decision (2026-08-18 — Knife16 Task 3 complete; Task 4 next)
+#### Latest decision (2026-08-18 — Task 4 R1–R5 foundation accepted; R6 next)
 
 Knife16 Task 3 now passes locally. The crate-private `OwnedUpstream` facade
 preserves exact legacy TCP relay variants and UDP/TUIC/Reality/Failover
@@ -29,9 +29,18 @@ legacy, and no production two-leg transport, server owner, blackout recovery,
 WAN result, or `>170 Mbit/s` claim exists. Result:
 `docs/tech/2026-08-18-knife16-owned-upstream-local-results.md`.
 
-Next implement Task 4 only: the deterministic in-memory two-leg transport
-harness with authenticated attach, blackout, reorder, duplicate, delayed ACK,
-stale-leg, and fairness injection. Do not start a WAN test.
+Task 4 R1–R5 now pass locally through the production-shared codec, exact-leg
+seal, attach transaction, single-owner supervisor, typed replay/source
+ownership, `TargetIo`, one-event wire scheduler, category-owned work budget,
+and complete byte-level baseline. Final ownership is zero and independent
+reviews report P0/P1 `0/0`. This is foundation acceptance only: R6–R9 and
+Task 4 remain open.
+
+Next implement only R6's protocol/auth/exact-leg vertical: freeze
+`STANDBY_CONTROL_V1`, add the five bounded leg-control records, independent
+standby HMAC, and exact-leg control capabilities. Then add the production-
+shared controller's actual-close tracer. Do not start a WAN test. Result:
+`docs/tech/2026-08-18-knife16-two-leg-foundation-local-results.md`.
 
 #### Prior decision context (2026-08-18 — Knife15 Tier B failed)
 
@@ -62,8 +71,8 @@ Current execution order:
 1. protocol model and capacity characterization — **COMPLETE**;
 2. deep `OwnedUpstream` abstraction behind existing client interfaces —
    **COMPLETE**;
-3. deterministic two-leg TCP blackout and UDP path-switch harnesses —
-   **NEXT**;
+3. deterministic two-leg TCP blackout harness — **IN PROGRESS: R1–R5
+   COMPLETE; R6–R9 OPEN**;
 4. `mini_vpn-upstreamd` single session owner and loopback lifecycle tests;
 5. local real-socket `>170 Mbit/s` capacity gate;
 6. security/review gates;

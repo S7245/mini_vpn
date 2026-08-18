@@ -12,9 +12,9 @@ mod tcp;
 pub use auth::{
     AttachAlpn, AttachAuthority, AttachConfigError, AttachCredentials, AttachFrameOutcome,
     AttachPolicy, AttachReject, AttachRequest, AttachTransportBinding, CommittedLeg,
-    DevicePrincipal, DeviceSecret, FeatureOffer, GenerationResynchronization,
-    MAX_ATTACH_ALPN_BYTES, MAX_ATTACH_TRANSCRIPT_BYTES, OwnerIdentity, ResumeSecret,
-    TlsExporterBinding, VersionRange,
+    DevicePrincipal, DeviceSecret, FeatureOffer, GenerationCatchUp, GenerationResynchronization,
+    MAX_ATTACH_ALPN_BYTES, MAX_ATTACH_TRANSCRIPT_BYTES, OwnerIdentity, PendingGenerationCatchUp,
+    ResumeSecret, TlsExporterBinding, VersionRange,
 };
 pub use capacity::{
     BitsPerSecond, DirectionalByteLimits, DirectionalRates, DirectionalReplayStorageLimits,

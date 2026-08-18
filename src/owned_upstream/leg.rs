@@ -7,8 +7,9 @@
 //! 0-RTT behavior.
 
 use crate::resumable::{
-    AttachReject, AttachRequest, AttachTransportBinding, CommittedLeg, Frame,
-    GenerationResynchronization, LegGeneration, Record, SessionEvent,
+    AttachAuthority, AttachReject, AttachRequest, AttachTransportBinding, CommittedLeg, Frame,
+    GenerationCatchUp, GenerationResynchronization, LegGeneration, PendingGenerationCatchUp,
+    Record, SessionConfig, SessionEffect, SessionError, SessionEvent, SessionModel, SessionRole,
 };
 use crate::shared::TargetAddr;
 use std::fmt;
@@ -69,6 +70,93 @@ impl EstablishedLeg {
             frame,
         }
     }
+
+    /// Authenticates and commits the initial owner ATTACH on this exact
+    /// transport without exposing the committed reducer capability.
+    ///
+    /// The retry-safe pending bootstrap retains authority ownership. After a
+    /// successful CAS, every remaining step needed to construct the initial
+    /// owner model is infallible and no acceptance can be published before the
+    /// supervisor consumes this opaque value.
+    pub(super) fn authenticate_initial_owner_attach(
+        &self,
+        received: LegBoundFrame,
+        authority: &AttachAuthority,
+    ) -> Result<AuthenticatedInitialOwnerAttach, LegProvenanceError> {
+        if !self.seal.same_connection(&received.seal) {
+            return Err(LegProvenanceError::WrongLeg);
+        }
+
+        let LegBoundFrame { seal, frame } = received;
+        let committed = authority
+            .verify_and_commit_frame(&frame, &self.binding)
+            .map_err(LegProvenanceError::from)?;
+        Ok(AuthenticatedInitialOwnerAttach {
+            attached: AttachedLeg { seal, committed },
+            acceptance: committed.attach_accepted_frame(),
+        })
+    }
+
+    /// Authenticates, model-preflights, and commits an ATTACH received on this
+    /// exact transport.
+    ///
+    /// The model preflight token retains its exclusive mutable borrow through
+    /// the authority CAS and is consumed immediately afterward. The returned
+    /// capability, correlated response, and recovery effects therefore exist
+    /// only after model installation; this method still performs no wire I/O.
+    pub(crate) fn transact_owner_attach(
+        &self,
+        received: LegBoundFrame,
+        authority: &AttachAuthority,
+        model: &mut SessionModel,
+    ) -> Result<Result<OwnerAttachTransaction, SessionError>, LegProvenanceError> {
+        if !self.seal.same_connection(&received.seal) {
+            return Err(LegProvenanceError::WrongLeg);
+        }
+
+        let LegBoundFrame { seal, frame } = received;
+        match authority
+            .preflight_model_and_commit_or_resynchronize_frame(&frame, &self.binding, model)
+            .map_err(LegProvenanceError::from)?
+        {
+            Ok(Ok((committed, recovery))) => Ok(Ok(OwnerAttachTransaction::Installed {
+                attached: AttachedLeg { seal, committed },
+                acceptance: committed.attach_accepted_frame(),
+                recovery,
+            })),
+            Ok(Err(error)) => Ok(Err(error)),
+            Err(resynchronization) => Ok(Ok(OwnerAttachTransaction::Resynchronize {
+                status: resynchronization.status_frame(),
+            })),
+        }
+    }
+}
+
+/// Exact initial owner commit whose authority, model seed, and response have
+/// not yet been published separately.
+///
+/// This value is intentionally opaque and non-cloneable. Only the session
+/// supervisor may consume it, preventing a byte-path harness from acquiring a
+/// bare [`CommittedLeg`] or bypassing owner-model installation.
+pub(super) struct AuthenticatedInitialOwnerAttach {
+    attached: AttachedLeg,
+    acceptance: Frame,
+}
+
+impl AuthenticatedInitialOwnerAttach {
+    pub(super) fn into_owner_parts(
+        self,
+        config: SessionConfig,
+    ) -> (SessionModel, AttachedLeg, Frame) {
+        let model = SessionModel::new(SessionRole::Owner, config, self.attached.committed);
+        (model, self.attached, self.acceptance)
+    }
+}
+
+impl fmt::Debug for AuthenticatedInitialOwnerAttach {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthenticatedInitialOwnerAttach([REDACTED])")
+    }
 }
 
 impl fmt::Debug for EstablishedLeg {
@@ -108,7 +196,9 @@ impl PendingAttach {
                 .map_err(LegProvenanceError::from),
             Record::AttachGenerationStatus { .. } => request
                 .validate_generation_status_frame(&binding, &response.frame)
-                .map(AttachResponse::GenerationStatus)
+                .map(|status| {
+                    AttachResponse::GenerationStatus(LegGenerationStatus { seal, status })
+                })
                 .map_err(LegProvenanceError::from),
             _ => Err(LegProvenanceError::Rejected),
         }
@@ -126,6 +216,135 @@ impl fmt::Debug for PendingAttach {
 pub(crate) struct LegBoundFrame {
     seal: LegSeal,
     frame: Frame,
+}
+
+/// Authenticated generation status tied to the exact connection that carried
+/// the correlated response.
+///
+/// This non-cloneable wrapper is the only adapter entry into generation
+/// catch-up. It retains the status-leg seal until it is consumed while the
+/// follow-up attach receives an independent exact-leg seal.
+pub(crate) struct LegGenerationStatus {
+    seal: LegSeal,
+    status: GenerationResynchronization,
+}
+
+impl LegGenerationStatus {
+    pub(crate) fn current_generation(&self) -> LegGeneration {
+        self.status.current_generation()
+    }
+
+    pub(crate) fn requested_generation(&self) -> LegGeneration {
+        self.status.requested_generation()
+    }
+
+    pub(crate) fn transport_binding(&self) -> AttachTransportBinding {
+        self.status.transport_binding()
+    }
+
+    pub(crate) fn begin_catch_up(
+        self,
+        follow_up_leg: &EstablishedLeg,
+        nonce: crate::resumable::AttachNonce,
+    ) -> Result<PendingCatchUpAttach, LegProvenanceError> {
+        let pending = self.status.begin_catch_up(nonce)?;
+        Ok(PendingCatchUpAttach {
+            _status_seal: self.seal,
+            follow_up_seal: follow_up_leg.seal.share(),
+            follow_up_binding: follow_up_leg.binding,
+            pending,
+        })
+    }
+}
+
+impl fmt::Debug for LegGenerationStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LegGenerationStatus([REDACTED])")
+    }
+}
+
+/// Status-derived follow-up attach bound to one exact follow-up connection.
+pub(crate) struct PendingCatchUpAttach {
+    _status_seal: LegSeal,
+    follow_up_seal: LegSeal,
+    follow_up_binding: AttachTransportBinding,
+    pending: PendingGenerationCatchUp,
+}
+
+impl PendingCatchUpAttach {
+    pub(crate) fn request(&self) -> AttachRequest {
+        self.pending.request()
+    }
+
+    pub(crate) fn transport_binding(&self) -> AttachTransportBinding {
+        self.follow_up_binding
+    }
+
+    pub(crate) fn validate_response(
+        self,
+        response: LegBoundFrame,
+    ) -> Result<CaughtUpAttachedLeg, LegProvenanceError> {
+        if !self.follow_up_seal.same_connection(&response.seal) {
+            return Err(LegProvenanceError::WrongLeg);
+        }
+        if !matches!(response.frame.record(), Record::AttachAccepted { .. }) {
+            return Err(LegProvenanceError::Rejected);
+        }
+        let catch_up = self
+            .pending
+            .validate_accepted_frame(&self.follow_up_binding, &response.frame)?;
+        Ok(CaughtUpAttachedLeg {
+            seal: self.follow_up_seal,
+            catch_up,
+        })
+    }
+}
+
+impl fmt::Debug for PendingCatchUpAttach {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PendingCatchUpAttach([REDACTED])")
+    }
+}
+
+/// Successfully caught-up data-plane authority bound to the exact follow-up
+/// transport connection.
+pub(crate) struct CaughtUpAttachedLeg {
+    seal: LegSeal,
+    catch_up: GenerationCatchUp,
+}
+
+impl CaughtUpAttachedLeg {
+    pub(crate) fn generation(&self) -> LegGeneration {
+        self.catch_up.accepted_leg().generation()
+    }
+
+    pub(crate) fn replacement_caught_up_event(&self) -> SessionEvent {
+        SessionEvent::ReplacementCaughtUp {
+            catch_up: self.catch_up,
+        }
+    }
+
+    pub(crate) fn accept_frame(
+        &self,
+        received: LegBoundFrame,
+    ) -> Result<SessionEvent, LegProvenanceError> {
+        if !self.seal.same_connection(&received.seal) {
+            return Err(LegProvenanceError::WrongLeg);
+        }
+        if is_attach_record(received.frame.record()) {
+            return Err(LegProvenanceError::Rejected);
+        }
+        Ok(SessionEvent::PeerFrame {
+            leg: self.catch_up.accepted_leg(),
+            frame: received.frame,
+        })
+    }
+}
+
+impl fmt::Debug for CaughtUpAttachedLeg {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CaughtUpAttachedLeg([REDACTED])")
+    }
 }
 
 /// Successfully attached, connection-bound data-plane authority.
@@ -150,6 +369,12 @@ impl AttachedLeg {
 
     pub(crate) fn transport_binding(&self) -> AttachTransportBinding {
         self.committed.transport_binding()
+    }
+
+    /// Seeds the client reducer while retaining this exact live-leg seal.
+    /// The committed capability never leaves the provenance wrapper.
+    pub(super) fn initial_client_model(&self, config: SessionConfig) -> SessionModel {
+        SessionModel::new(SessionRole::Client, config, self.committed)
     }
 
     pub(crate) fn replacement_attached_event(&self) -> SessionEvent {
@@ -184,12 +409,7 @@ impl AttachedLeg {
         if !self.seal.same_connection(&received.seal) {
             return Err(LegProvenanceError::WrongLeg);
         }
-        if matches!(
-            received.frame.record(),
-            Record::Attach { .. }
-                | Record::AttachAccepted { .. }
-                | Record::AttachGenerationStatus { .. }
-        ) {
+        if is_attach_record(received.frame.record()) {
             return Err(LegProvenanceError::Rejected);
         }
         Ok(SessionEvent::PeerFrame {
@@ -213,7 +433,35 @@ impl fmt::Debug for LegBoundFrame {
 
 pub(crate) enum AttachResponse {
     Accepted(AttachedLeg),
-    GenerationStatus(GenerationResynchronization),
+    GenerationStatus(LegGenerationStatus),
+}
+
+/// Owner-side result of consuming one exact-leg ATTACH frame.
+///
+/// Only a committed result carries data-plane authority.  A resynchronization
+/// result contains solely its correlated status frame.
+pub(crate) enum OwnerAttachTransaction {
+    Installed {
+        attached: AttachedLeg,
+        acceptance: Frame,
+        recovery: Vec<SessionEffect>,
+    },
+    Resynchronize {
+        status: Frame,
+    },
+}
+
+impl fmt::Debug for OwnerAttachTransaction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Installed { .. } => {
+                formatter.write_str("OwnerAttachTransaction::Installed([REDACTED])")
+            }
+            Self::Resynchronize { .. } => {
+                formatter.write_str("OwnerAttachTransaction::Resynchronize([REDACTED])")
+            }
+        }
+    }
 }
 
 impl fmt::Debug for AttachResponse {
@@ -239,4 +487,13 @@ impl From<AttachReject> for LegProvenanceError {
     fn from(_: AttachReject) -> Self {
         Self::Rejected
     }
+}
+
+fn is_attach_record(record: &Record) -> bool {
+    matches!(
+        record,
+        Record::Attach { .. }
+            | Record::AttachAccepted { .. }
+            | Record::AttachGenerationStatus { .. }
+    )
 }

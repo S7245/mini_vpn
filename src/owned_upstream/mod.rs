@@ -5,9 +5,15 @@
 //! data plane.  Transport legs and replay mechanics stay behind this facade.
 
 pub(crate) mod leg;
+pub(crate) mod leg_io;
 mod legacy;
+pub(crate) mod owner_target;
 pub(crate) mod session;
+pub(crate) mod supervisor;
+pub(crate) mod target;
 mod tcp;
+pub(crate) mod two_leg;
+pub(crate) mod two_leg_harness;
 mod udp;
 
 use crate::shared::{ClientError, TargetAddr};

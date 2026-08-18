@@ -9,6 +9,7 @@ use super::protocol::{
     AttachNonce, AttachProof, FRAME_PROTOCOL_VERSION, FeatureSet, Frame, LegGeneration,
     ProtocolError, Record, SESSION_PROTOCOL_VERSION, SessionId,
 };
+use super::session::{SessionEffect, SessionError, SessionModel};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::fmt;
@@ -16,6 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 type HmacSha256 = Hmac<Sha256>;
+type ModelCommitResult = Result<(CommittedLeg, Vec<SessionEffect>), SessionError>;
+type ResynchronizableModelCommit = Result<ModelCommitResult, GenerationResynchronization>;
+type ModelAttachResult = Result<ResynchronizableModelCommit, AttachReject>;
 
 const ATTACH_PROTOCOL_CONTEXT: &[u8] = b"mini_vpn/resumable/attach/v1";
 const RESUME_PROOF_CONTEXT: &[u8] = b"resume-authority";
@@ -696,6 +700,154 @@ impl GenerationResynchronization {
             self.features,
         ))
     }
+
+    /// Starts the only bounded catch-up sequence accepted by the client
+    /// reducer: the original correlated request must be the client's exact
+    /// next generation, the server reports its authenticated high-water mark,
+    /// and the follow-up request is exactly one generation after that mark.
+    ///
+    /// This permits recovery after more than one lost acceptance without
+    /// granting a caller a bare generation-jump API. The returned pending value
+    /// retains the correlated original request/status facts until the exact
+    /// high-water successor is accepted.
+    pub fn begin_catch_up(
+        self,
+        nonce: AttachNonce,
+    ) -> Result<PendingGenerationCatchUp, AttachReject> {
+        if self.current_generation.get() < self.requested_generation.get() {
+            return Err(AttachReject::Rejected);
+        }
+        let expected_local_generation = self
+            .requested_generation
+            .get()
+            .checked_sub(1)
+            .and_then(|generation| LegGeneration::new(generation).ok())
+            .ok_or(AttachReject::Rejected)?;
+        let request = self.next_request(nonce)?;
+        Ok(PendingGenerationCatchUp {
+            original_requested_generation: self.requested_generation,
+            original_nonce: self.nonce,
+            observed_generation: self.current_generation,
+            expected_local_generation,
+            status_transport_binding: self.transport_binding,
+            request,
+        })
+    }
+}
+
+/// Correlated client-side attach attempt that may mint one generation
+/// catch-up capability after its exact acceptance is validated.
+///
+/// Construction is restricted to [`GenerationResynchronization::begin_catch_up`]
+/// and fields are private so an adapter cannot invent a skipped-generation
+/// transition.  It is intentionally not `Clone` or `Copy`.
+pub struct PendingGenerationCatchUp {
+    original_requested_generation: LegGeneration,
+    original_nonce: AttachNonce,
+    observed_generation: LegGeneration,
+    expected_local_generation: LegGeneration,
+    status_transport_binding: AttachTransportBinding,
+    request: AttachRequest,
+}
+
+impl PendingGenerationCatchUp {
+    /// The exact request that must be proved and sent on the authenticated leg.
+    pub const fn request(&self) -> AttachRequest {
+        self.request
+    }
+
+    /// Validates the exact status-derived acceptance and mints the sole typed
+    /// authority that can advance a lagging client session model. `binding`
+    /// belongs to this follow-up attach and may differ from the authenticated
+    /// leg that carried the generation status; the transport adapter must bind
+    /// each response to its own exact connection seal.
+    pub(crate) fn validate_accepted_frame(
+        self,
+        binding: &AttachTransportBinding,
+        frame: &Frame,
+    ) -> Result<GenerationCatchUp, AttachReject> {
+        let accepted_leg = self.request.validate_accepted_frame(binding, frame)?;
+        let expected_accepted = self
+            .observed_generation
+            .get()
+            .checked_add(1)
+            .ok_or(AttachReject::GenerationExhausted)?;
+        if accepted_leg.generation().get() != expected_accepted {
+            return Err(AttachReject::Rejected);
+        }
+        Ok(GenerationCatchUp {
+            expected_local_generation: self.expected_local_generation,
+            original_requested_generation: self.original_requested_generation,
+            original_nonce: self.original_nonce,
+            observed_generation: self.observed_generation,
+            status_transport_binding: self.status_transport_binding,
+            accepted_leg,
+        })
+    }
+}
+
+impl fmt::Debug for PendingGenerationCatchUp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingGenerationCatchUp")
+            .field("expected_local_generation", &self.expected_local_generation)
+            .field("observed_generation", &self.observed_generation)
+            .field("requested_generation", &self.request.requested_generation())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Opaque proof that one or more lost acceptances were observed through an
+/// authenticated high-water status and that its exact successor was accepted.
+/// The status and successor may use distinct authenticated transport legs;
+/// both bindings remain captured in this capability. Private construction
+/// prevents generation jumps without that exact chain.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct GenerationCatchUp {
+    expected_local_generation: LegGeneration,
+    original_requested_generation: LegGeneration,
+    original_nonce: AttachNonce,
+    observed_generation: LegGeneration,
+    status_transport_binding: AttachTransportBinding,
+    accepted_leg: CommittedLeg,
+}
+
+impl GenerationCatchUp {
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.accepted_leg.session_id()
+    }
+
+    pub(crate) const fn expected_local_generation(&self) -> LegGeneration {
+        self.expected_local_generation
+    }
+
+    pub(crate) const fn original_requested_generation(&self) -> LegGeneration {
+        self.original_requested_generation
+    }
+
+    pub(crate) const fn observed_generation(&self) -> LegGeneration {
+        self.observed_generation
+    }
+
+    pub(crate) const fn accepted_leg(&self) -> CommittedLeg {
+        self.accepted_leg
+    }
+}
+
+impl fmt::Debug for GenerationCatchUp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GenerationCatchUp")
+            .field("expected_local_generation", &self.expected_local_generation)
+            .field(
+                "original_requested_generation",
+                &self.original_requested_generation,
+            )
+            .field("observed_generation", &self.observed_generation)
+            .field("accepted_generation", &self.accepted_leg.generation())
+            .field("correlation", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// One session's single generation authority.  `compare_exchange` makes two
@@ -706,6 +858,18 @@ pub struct AttachAuthority {
     current_generation: AtomicU64,
     credentials: AttachCredentials,
     policy: AttachPolicy,
+}
+
+/// Proof-valid exact-next attach that has not advanced generation authority.
+///
+/// This capability never crosses the authentication boundary.  The owner
+/// adapter supplies a read-only model preflight, then this module consumes the
+/// prepared value in the compare-exchange.  Keeping preparation private makes
+/// it impossible for an adapter to synthesize a commit from bare generation
+/// numbers or to roll back a failed model installation.
+struct PreparedAttach {
+    expected_current_generation: u64,
+    committed: CommittedLeg,
 }
 
 impl AttachAuthority {
@@ -725,6 +889,26 @@ impl AttachAuthority {
 
     pub fn current_generation(&self) -> u64 {
         self.current_generation.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    /// Verifies that an already-installed model leg belongs to this exact
+    /// authority policy. The exporter is intentionally leg-local and may
+    /// change across replacements; every stable authenticated and negotiated
+    /// session fact must agree.
+    #[cfg(test)]
+    pub(crate) fn matches_existing_leg_semantics(&self, leg: &CommittedLeg) -> bool {
+        let binding = leg.transport_binding();
+        leg.session_id() == self.session_id
+            && binding.owner_identity() == self.policy.owner_identity
+            && binding.alpn() == self.policy.alpn
+            && binding.device_principal() == self.policy.device_principal
+            && leg.session_protocol_version() == self.policy.session_protocol_version
+            && leg.negotiated_features() & !self.policy.supported_features == 0
     }
 
     /// Authenticates and commits the exact fields present in a decoded ATTACH
@@ -768,6 +952,77 @@ impl AttachAuthority {
         binding: &AttachTransportBinding,
         proof: &AttachProof,
     ) -> Result<CommittedLeg, AttachReject> {
+        let prepared = self.prepare(request, binding, proof)?;
+        self.commit_prepared(prepared)
+    }
+
+    /// Authenticates a decoded ATTACH, invokes the owner's read-only model
+    /// preflight before generation mutation, then commits with one CAS.
+    ///
+    /// The nested result deliberately keeps the private [`PreparedAttach`]
+    /// inside this module:
+    ///
+    /// - outer `Err` is a public authentication/protocol rejection;
+    /// - outer `Ok(Err(_))` is authenticated generation resynchronization;
+    /// - `Ok(Ok(Err(_)))` is model-preflight rejection with no CAS;
+    /// - `Ok(Ok(Ok(_)))` is the single committed winner plus the recovery
+    ///   effects produced by consuming its opaque model-install token.
+    pub(crate) fn preflight_model_and_commit_or_resynchronize_frame(
+        &self,
+        frame: &Frame,
+        binding: &AttachTransportBinding,
+        model: &mut SessionModel,
+    ) -> ModelAttachResult {
+        self.preflight_model_and_commit_with_hook(frame, binding, model, || {})
+    }
+
+    /// Test-hookable implementation kept private to the authentication module.
+    /// The hook can coordinate a deterministic CAS race but cannot replace the
+    /// mandatory model preflight or manufacture its opaque installation token.
+    fn preflight_model_and_commit_with_hook(
+        &self,
+        frame: &Frame,
+        binding: &AttachTransportBinding,
+        model: &mut SessionModel,
+        before_commit: impl FnOnce(),
+    ) -> ModelAttachResult {
+        let (request, proof) = AttachRequest::from_attach_frame(frame)?;
+        let prepared = match self.prepare(&request, binding, &proof) {
+            Ok(prepared) => prepared,
+            Err(AttachReject::GenerationNotNext { current, .. }) => {
+                return self.resynchronization(&request, binding, current).map(Err);
+            }
+            Err(AttachReject::GenerationExhausted) => {
+                return self
+                    .resynchronization(&request, binding, self.current_generation())
+                    .map(Err);
+            }
+            Err(AttachReject::Rejected) => return Err(AttachReject::Rejected),
+        };
+
+        let model_preflight = match model.preflight_owner_replacement(prepared.committed) {
+            Ok(preflight) => preflight,
+            Err(error) => return Ok(Ok(Err(error))),
+        };
+        before_commit();
+        match self.commit_prepared(prepared) {
+            Ok(committed) => Ok(Ok(Ok((committed, model_preflight.install())))),
+            Err(AttachReject::GenerationNotNext { current, .. }) => {
+                self.resynchronization(&request, binding, current).map(Err)
+            }
+            Err(AttachReject::GenerationExhausted) => self
+                .resynchronization(&request, binding, self.current_generation())
+                .map(Err),
+            Err(AttachReject::Rejected) => Err(AttachReject::Rejected),
+        }
+    }
+
+    fn prepare(
+        &self,
+        request: &AttachRequest,
+        binding: &AttachTransportBinding,
+        proof: &AttachProof,
+    ) -> Result<PreparedAttach, AttachReject> {
         let proof_valid = self.credentials.verifies(request, binding, proof);
         let identity_valid = request.session_id == self.session_id
             && binding.owner_identity == self.policy.owner_identity
@@ -790,20 +1045,28 @@ impl AttachAuthority {
             return Err(AttachReject::GenerationNotNext { current, requested });
         }
 
-        match self.current_generation.compare_exchange(
-            current,
-            requested,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => Ok(CommittedLeg {
+        Ok(PreparedAttach {
+            expected_current_generation: current,
+            committed: CommittedLeg {
                 session_id: self.session_id,
                 generation: request.requested_generation,
                 nonce: request.nonce,
                 transport_binding: *binding,
                 session_protocol_version: self.policy.session_protocol_version,
                 negotiated_features: request.features.offered & self.policy.supported_features,
-            }),
+            },
+        })
+    }
+
+    fn commit_prepared(&self, prepared: PreparedAttach) -> Result<CommittedLeg, AttachReject> {
+        let requested = prepared.committed.generation().get();
+        match self.current_generation.compare_exchange(
+            prepared.expected_current_generation,
+            requested,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(prepared.committed),
             Err(actual) => Err(AttachReject::GenerationNotNext {
                 current: actual,
                 requested,
@@ -907,6 +1170,9 @@ pub enum AttachReject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resumable::{
+        ReceiveBudgetLimits, ReplayBudgetLimits, SessionConfig, SessionRole, TcpWindowLimits,
+    };
     use std::sync::{Arc, Barrier};
 
     const SUPPORTED_FEATURES: u64 = 0b1111;
@@ -1001,6 +1267,31 @@ mod tests {
             credentials(),
             policy(),
         )
+    }
+
+    fn session_config() -> SessionConfig {
+        SessionConfig::new(
+            4,
+            4,
+            TcpWindowLimits::new(64, 8).unwrap(),
+            TcpWindowLimits::new(64, 8).unwrap(),
+            ReplayBudgetLimits::new(64, 8).unwrap(),
+            ReplayBudgetLimits::new(64, 8).unwrap(),
+            ReceiveBudgetLimits::new(128, 16).unwrap(),
+            64,
+        )
+        .unwrap()
+    }
+
+    fn owner_model_at_generation_two() -> SessionModel {
+        let authority = authority_at(1);
+        let request = normal_request();
+        let binding = binding();
+        let proof = signer().prove(&request, &binding).unwrap();
+        let leg = authority
+            .verify_and_commit(&request, &binding, &proof)
+            .unwrap();
+        SessionModel::new(SessionRole::Owner, session_config(), leg)
     }
 
     #[test]
@@ -1226,6 +1517,121 @@ mod tests {
                 requested: 2
             })
         ));
+    }
+
+    #[test]
+    fn concurrent_preflighted_attaches_have_exactly_one_commit_winner() {
+        let authority = Arc::new(authority_at(2));
+        let request = request(
+            session(0x11),
+            3,
+            0x33,
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(0b0111, 0b0001).unwrap(),
+        );
+        let binding = binding();
+        let proof = signer().prove(&request, &binding).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let mut model_a = owner_model_at_generation_two();
+        let mut model_b = owner_model_at_generation_two();
+
+        let results = std::thread::scope(|scope| {
+            let authority_a = Arc::clone(&authority);
+            let barrier_a = Arc::clone(&barrier);
+            let model_a = &mut model_a;
+            let attempt_a = scope.spawn(move || {
+                authority_a.preflight_model_and_commit_with_hook(
+                    &request.to_attach_frame(proof),
+                    &binding,
+                    model_a,
+                    || {
+                        // Both proof-valid candidates and both real model
+                        // tokens exist before either authority CAS proceeds.
+                        barrier_a.wait();
+                    },
+                )
+            });
+            let authority_b = Arc::clone(&authority);
+            let barrier_b = Arc::clone(&barrier);
+            let model_b = &mut model_b;
+            let attempt_b = scope.spawn(move || {
+                authority_b.preflight_model_and_commit_with_hook(
+                    &request.to_attach_frame(proof),
+                    &binding,
+                    model_b,
+                    || {
+                        barrier_b.wait();
+                    },
+                )
+            });
+            barrier.wait();
+            [attempt_a.join().unwrap(), attempt_b.join().unwrap()]
+        });
+
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Ok(Ok(Ok((_committed, _recovery))))))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Ok(Err(_status))))
+                .count(),
+            1
+        );
+        assert_eq!(authority.current_generation(), 3);
+        assert_eq!(
+            [
+                model_a.snapshot().generation().get(),
+                model_b.snapshot().generation().get()
+            ]
+            .into_iter()
+            .filter(|generation| *generation == 3)
+            .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn owner_attach_transaction_rejects_client_model_before_authority_commit() {
+        let authority = authority_at(2);
+        let request = request(
+            session(0x11),
+            3,
+            0x33,
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(0b0111, 0b0001).unwrap(),
+        );
+        let binding = binding();
+        let proof = signer().prove(&request, &binding).unwrap();
+        let owner_model = owner_model_at_generation_two();
+        let mut model = SessionModel::new(
+            SessionRole::Client,
+            session_config(),
+            owner_model.current_leg(),
+        );
+        let before = model.snapshot();
+
+        let outcome = authority
+            .preflight_model_and_commit_or_resynchronize_frame(
+                &request.to_attach_frame(proof),
+                &binding,
+                &mut model,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            Err(SessionError::RoleCannotAcceptOwnerAttach(
+                SessionRole::Client
+            ))
+        );
+        assert_eq!(authority.current_generation(), 2);
+        assert_eq!(model.snapshot(), before);
     }
 
     #[test]
@@ -1552,6 +1958,68 @@ mod tests {
             .unwrap();
         assert!(matches!(stale, AttachFrameOutcome::Resynchronize(_)));
         assert_eq!(authority.current_generation(), 3);
+    }
+
+    #[test]
+    fn catch_up_authority_binds_authenticated_high_water_across_successive_legs() {
+        let far_ahead = authority_at(4);
+        let original = normal_request();
+        let status_binding = binding();
+        let proof = signer().prove(&original, &status_binding).unwrap();
+        let AttachFrameOutcome::Resynchronize(status) = far_ahead
+            .verify_and_commit_or_resynchronize_frame(
+                &original.to_attach_frame(proof),
+                &status_binding,
+            )
+            .unwrap()
+        else {
+            panic!("a stale authenticated request must return status");
+        };
+        let client_status = original
+            .validate_generation_status_frame(&status_binding, &status.status_frame())
+            .unwrap();
+        assert_eq!(client_status.current_generation().get(), 4);
+        assert_eq!(client_status.requested_generation().get(), 2);
+        let pending = client_status.begin_catch_up(nonce(0x61)).unwrap();
+        let next = pending.request();
+        assert_eq!(next.requested_generation().get(), 5);
+        let accepted_binding = binding_with_exporter(0x99);
+        let proof = signer().prove(&next, &accepted_binding).unwrap();
+        let AttachFrameOutcome::Committed(accepted) = far_ahead
+            .verify_and_commit_or_resynchronize_frame(
+                &next.to_attach_frame(proof),
+                &accepted_binding,
+            )
+            .unwrap()
+        else {
+            panic!("the authenticated high-water successor must commit");
+        };
+        let accepted_frame = accepted.attach_accepted_frame();
+        let exact = pending
+            .validate_accepted_frame(&accepted_binding, &accepted_frame)
+            .unwrap();
+        assert_eq!(exact.expected_local_generation().get(), 1);
+        assert_eq!(exact.original_requested_generation().get(), 2);
+        assert_eq!(exact.observed_generation().get(), 4);
+        assert_eq!(exact.status_transport_binding, status_binding);
+        assert_eq!(exact.accepted_leg().transport_binding(), accepted_binding);
+        assert_eq!(exact.accepted_leg(), accepted);
+
+        let impossible_status = Frame::new(
+            LegGeneration::new(1).unwrap(),
+            Record::AttachGenerationStatus {
+                session_id: original.session_id(),
+                requested_generation: original.requested_generation(),
+                nonce: original.nonce(),
+            },
+        );
+        let below_request = original
+            .validate_generation_status_frame(&status_binding, &impossible_status)
+            .unwrap();
+        assert!(matches!(
+            below_request.begin_catch_up(nonce(0x62)),
+            Err(AttachReject::Rejected)
+        ));
     }
 
     #[test]

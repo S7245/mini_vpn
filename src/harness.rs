@@ -3386,9 +3386,11 @@ mod tests {
                     first_ack_gate,
                     trace,
                     opens: AtomicU64::new(0),
-                    port_factory: ResumableTcpPortFactory::new(
+                    port_factory: ResumableTcpPortFactory::new_unbound_for_test(
                         FlowPortConfig::new(PORT_BYTES, 1, 8, 4).unwrap(),
                         PORT_BYTES,
+                        8,
+                        8,
                     )
                     .unwrap(),
                     tasks: Mutex::new(Vec::new()),
@@ -3417,7 +3419,11 @@ mod tests {
                         "fake resumable open failed: {error}"
                     )))
                 })?;
-                let (port, driver) = self.port_factory.open_flow(flow);
+                let (port, driver) = self.port_factory.open_flow(flow).map_err(|error| {
+                    ClientError::Io(std::io::Error::other(format!(
+                        "fake resumable port admission failed: {error}"
+                    )))
+                })?;
                 *self.trace.probe.lock().unwrap() = Some(port.probe());
 
                 let trace = Arc::clone(&self.trace);

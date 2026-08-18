@@ -24000,12 +24000,14 @@ mod tests {
             crate::resumable::Direction::ClientToTarget,
             1,
         );
-        let factory = crate::owned_upstream::ResumableTcpPortFactory::new(
+        let factory = crate::owned_upstream::ResumableTcpPortFactory::new_unbound_for_test(
             crate::owned_upstream::FlowPortConfig::new(64, 2, 2, 2).unwrap(),
             64,
+            2,
+            2,
         )
         .unwrap();
-        let (endpoint, driver) = factory.open_flow(flow);
+        let (endpoint, driver) = factory.open_flow(flow).unwrap();
         (endpoint, driver, flow)
     }
 

@@ -2,7 +2,8 @@
 
 Date: 2026-08-18
 
-Status: **TASK 3 LOCAL ADAPTER COMPLETE; TASK 4 NEXT; M3 BLOCKED**
+Status: **TASK 4 R1–R5 FOUNDATION ACCEPTED LOCALLY; R6 NEXT;
+TASK 4 NOT PASS; M3 BLOCKED**
 
 ## Goal
 
@@ -60,9 +61,15 @@ bounded flow ports, typed application-acceptance receipts, and exact
 transport-leg provenance. The real smoltcp event loop can select either branch
 without learning replay or leg mechanics, and resumable sink bytes remain
 behind the existing D16/local-egress admission actor. The public production
-entry still selects the legacy adapter; Task 4 must supply the deterministic
-two-leg transport before any production/WAN claim. Result:
-`docs/tech/2026-08-18-knife16-owned-upstream-local-results.md`.
+entry still selects the legacy adapter.
+
+Task 4 R1–R5 now add the production-shared codec/seal, exact attach
+transaction, single-owner supervisor, `TargetIo`, bounded one-event wire
+scheduler, category-owned work budget, and one complete byte-level baseline.
+R6–R9 must still supply the real standby/control/switch path and deterministic
+failure acceptance before any production/WAN claim. Results:
+`docs/tech/2026-08-18-knife16-owned-upstream-local-results.md` and
+`docs/tech/2026-08-18-knife16-two-leg-foundation-local-results.md`.
 
 ## Protocol identity and security
 
@@ -292,6 +299,9 @@ attributed inside the owner rather than only around it.
 
 ## Task-2 local closure
 
+The following was the exact position at Task-2 closure; Tasks 3 and Task-4
+R1–R5 have since added the adapter and foundation described above.
+
 The transport-independent `resumable` fixed core now contains:
 
 - bounded wire codec and literal golden vectors for every v1 record;
@@ -314,16 +324,20 @@ capability.
 Focused `94/94`, root `807 + 3 ignored`, protocol `19/19`, public API `1/1`,
 harness `819 + 3 ignored`, concurrency `10 + 4 ignored`, release, Clippy,
 rustdoc, vendored Quinn `40 + 3 ignored`, quinn-proto `330`, fmt, and diff
-gates pass. Two independent reviews report no unresolved P0/P1. No production
-adapter, socket, two-leg harness, WAN run, or throughput claim exists yet.
+gates pass. Two independent reviews report no unresolved P0/P1. At Task-2
+closure no production adapter, socket, two-leg harness, WAN run, or throughput
+claim existed.
 Detailed result:
 `docs/tech/2026-08-18-knife16-resumable-protocol-capacity-local-results.md`.
 
 ## Design score
 
-**9/10 after Task-2 deterministic protocol/capacity proof.** The architecture
-puts socket and byte ownership at the only layer that can resume established
-flows, isolates leg backpressure, has explicit bounds, and preserves the
-mature local data plane. It reaches **10/10** only after the adapter, two-leg
-harness, local real-socket capacity gate, independent-path WAN acceptance, and
-operational cleanup evidence pass.
+The currently implemented architecture is **8/10**. The fixed core, deep
+adapter, and reviewed R1–R5 production-shared foundation put byte ownership at
+the resumable boundary, isolate leg pressure, and make local work explicitly
+bounded. Task 4 reaches **9/10** only after R6–R9 prove standby registration,
+genuine liveness, authenticated switch authority, stale-leg retirement, the
+fault matrix, and real-smoltcp parity through the same seams. It reaches
+**10/10** only after Task 5 UDP, Task 6 real owner/socket adapters, Task 7
+real-socket capacity, Task 8 security, Task 9 independent-path WAN, and Task 10
+long macOS acceptance pass.

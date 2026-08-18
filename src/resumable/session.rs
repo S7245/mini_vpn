@@ -26,7 +26,7 @@ use thiserror::Error;
 
 use crate::shared::TargetAddr;
 
-use super::auth::CommittedLeg;
+use super::auth::{CommittedLeg, GenerationCatchUp};
 use super::capacity::{DirectionalReplayStorageLimits, ReplayStorageLimit, ReplayStoragePlan};
 use super::protocol::{
     ByteOffset, Direction, Frame, LegGeneration, OpenResultCode, ProtocolError, Record,
@@ -276,6 +276,36 @@ impl SessionConfig {
     pub const fn max_receive_normalized_backing_bytes(self) -> usize {
         self.max_receive_normalized_backing_bytes
     }
+
+    /// Conservative exact bound for one owner recovery vector: one activation,
+    /// one replayable terminal control per tombstone, up to OPEN/ACK/CLOSE per
+    /// live flow, and every direction's globally bounded replay segment.
+    pub(crate) fn owner_recovery_effect_bound(self) -> Option<usize> {
+        let per_flow_control = self.max_flows.checked_mul(3)?;
+        let replay_segments = self
+            .client_to_target_replay
+            .max_segments()
+            .checked_add(self.target_to_client_replay.max_segments())?;
+        1usize
+            .checked_add(self.max_terminal_tombstones)?
+            .checked_add(per_flow_control)?
+            .checked_add(replay_segments)
+    }
+
+    /// Full owner work-DAG bound for effects that can be retained between
+    /// bounded executor turns. Each accepted receive byte can create at most
+    /// one sink offer and one ACK; each flow contributes at most OPEN result,
+    /// half-close, reset, finish, and one fixed control edge. Recovery is
+    /// bounded separately above and the final three slots cover the largest
+    /// incremental reducer burst.
+    pub(crate) fn owner_pending_work_bound(self) -> Option<usize> {
+        let receive_chain = self.max_receive_owned_bytes.checked_mul(2)?;
+        let per_flow_lifecycle = self.max_flows.checked_mul(5)?;
+        self.owner_recovery_effect_bound()?
+            .checked_add(receive_chain)?
+            .checked_add(per_flow_lifecycle)?
+            .checked_add(3)
+    }
 }
 
 const fn storage_limit(
@@ -445,6 +475,13 @@ impl LocalFlow {
 
     pub const fn direction(self) -> Direction {
         self.direction
+    }
+
+    /// Session-internal one-shot authority sequence used by owned adapters to
+    /// reject a duplicated or stale flow capability before touching a local
+    /// byte source. It is intentionally not part of the public protocol API.
+    pub(crate) const fn authority_id(self) -> u64 {
+        self.authority_id
     }
 }
 
@@ -653,6 +690,9 @@ pub enum SessionEvent {
     ReplacementAttached {
         leg: CommittedLeg,
     },
+    ReplacementCaughtUp {
+        catch_up: GenerationCatchUp,
+    },
     LegLost {
         leg: CommittedLeg,
     },
@@ -752,6 +792,10 @@ impl fmt::Debug for SessionEvent {
             Self::ReplacementAttached { leg } => formatter
                 .debug_struct("ReplacementAttached")
                 .field("generation", &leg.generation())
+                .finish(),
+            Self::ReplacementCaughtUp { catch_up } => formatter
+                .debug_struct("ReplacementCaughtUp")
+                .field("catch_up", catch_up)
                 .finish(),
             Self::LegLost { leg } => formatter
                 .debug_struct("LegLost")
@@ -1028,6 +1072,36 @@ pub struct SessionModel {
     receive_usage: ReplayBudgetUsage,
 }
 
+/// Exclusive proof that one exact replacement passed every fallible reducer
+/// check against one frozen model state.
+///
+/// The token owns the model's mutable borrow, so its current phase,
+/// generation, and stable session semantics cannot change between preflight
+/// and installation.  Its fields are private and it is intentionally neither
+/// `Clone` nor `Copy`; the only installation API consumes it.
+pub(super) struct PreflightedReplacement<'model> {
+    model: &'model mut SessionModel,
+    candidate: CommittedLeg,
+    _expected_current_leg: CommittedLeg,
+    _expected_phase: SessionPhase,
+}
+
+impl PreflightedReplacement<'_> {
+    /// Consumes the exclusive preflight proof and performs the mutation half
+    /// of the transaction.  No condition remains that can reject here.
+    pub(super) fn install(self) -> Vec<SessionEffect> {
+        let Self {
+            model,
+            candidate,
+            _expected_current_leg: _,
+            _expected_phase: _,
+        } = self;
+        model.current_leg = candidate;
+        model.phase = SessionPhase::Active;
+        model.recovery_effects()
+    }
+}
+
 impl SessionModel {
     pub fn new(role: SessionRole, config: SessionConfig, initial_leg: CommittedLeg) -> Self {
         Self {
@@ -1063,6 +1137,11 @@ impl SessionModel {
         self.config
     }
 
+    #[cfg(test)]
+    pub(crate) const fn current_leg(&self) -> CommittedLeg {
+        self.current_leg
+    }
+
     pub fn snapshot(&self) -> SessionSnapshot {
         let mut outstanding_sink_offers = 0usize;
         for flow in self.flows.values() {
@@ -1095,6 +1174,7 @@ impl SessionModel {
     pub fn reduce(&mut self, event: SessionEvent) -> Result<Vec<SessionEffect>, SessionError> {
         match event {
             SessionEvent::ReplacementAttached { leg } => self.attach_replacement(leg),
+            SessionEvent::ReplacementCaughtUp { catch_up } => self.attach_catch_up(catch_up),
             SessionEvent::LegLost { leg } => self.lose_leg(leg),
             SessionEvent::ResumeGraceExpired { leg } => self.expire_resume_grace(leg),
             SessionEvent::LocalOpen { leg, target } => self.local_open(leg, target),
@@ -1119,6 +1199,29 @@ impl SessionModel {
         &mut self,
         leg: CommittedLeg,
     ) -> Result<Vec<SessionEffect>, SessionError> {
+        let preflighted = self.preflight_replacement(leg)?;
+        Ok(preflighted.install())
+    }
+
+    /// Read-only half of the owner attach transaction. Every condition that
+    /// can reject a replacement is checked before the independent generation
+    /// authority performs its CAS.
+    pub(super) fn preflight_owner_replacement(
+        &mut self,
+        leg: CommittedLeg,
+    ) -> Result<PreflightedReplacement<'_>, SessionError> {
+        if self.role != SessionRole::Owner {
+            return Err(SessionError::RoleCannotAcceptOwnerAttach(self.role));
+        }
+        self.preflight_replacement(leg)
+    }
+
+    /// Read-only replacement preflight shared by the owner transaction and
+    /// the pure client reducer path.
+    pub(super) fn preflight_replacement(
+        &mut self,
+        leg: CommittedLeg,
+    ) -> Result<PreflightedReplacement<'_>, SessionError> {
         if leg.session_id() != self.session_id {
             return Err(SessionError::CrossSessionLeg {
                 expected: self.session_id,
@@ -1142,7 +1245,58 @@ impl SessionModel {
             });
         }
 
-        self.current_leg = leg;
+        Ok(PreflightedReplacement {
+            _expected_current_leg: self.current_leg,
+            _expected_phase: self.phase,
+            model: self,
+            candidate: leg,
+        })
+    }
+
+    fn attach_catch_up(
+        &mut self,
+        catch_up: GenerationCatchUp,
+    ) -> Result<Vec<SessionEffect>, SessionError> {
+        if catch_up.session_id() != self.session_id {
+            return Err(SessionError::CrossSessionLeg {
+                expected: self.session_id,
+                actual: catch_up.session_id(),
+            });
+        }
+        if self.phase == SessionPhase::Expired {
+            return Err(SessionError::SessionExpired);
+        }
+        if self.phase != SessionPhase::Legless {
+            return Err(SessionError::CatchUpRequiresLegless { actual: self.phase });
+        }
+        let accepted_leg = catch_up.accepted_leg();
+        if !same_session_semantics(&self.current_leg, &accepted_leg) {
+            return Err(SessionError::LegCapabilityMismatch);
+        }
+        let current = self.current_leg.generation().get();
+        let expected_local = catch_up.expected_local_generation().get();
+        if current != expected_local {
+            return Err(SessionError::CatchUpGenerationMismatch {
+                current,
+                expected: expected_local,
+            });
+        }
+
+        let lost_generation = current
+            .checked_add(1)
+            .ok_or(SessionError::LegGenerationExhausted)?;
+        let observed_generation = catch_up.observed_generation().get();
+        let accepted_generation = observed_generation
+            .checked_add(1)
+            .ok_or(SessionError::LegGenerationExhausted)?;
+        if catch_up.original_requested_generation().get() != lost_generation
+            || observed_generation < lost_generation
+            || accepted_leg.generation().get() != accepted_generation
+        {
+            return Err(SessionError::InvalidCatchUpCapability);
+        }
+
+        self.current_leg = accepted_leg;
         self.phase = SessionPhase::Active;
         Ok(self.recovery_effects())
     }
@@ -2587,10 +2741,18 @@ pub enum SessionError {
     FrameGenerationMismatch { current: u64, actual: u64 },
     #[error("replacement generation {requested} is not current {current} plus one")]
     ReplacementGenerationNotNext { current: u64, requested: u64 },
+    #[error("catch-up authority expected local generation {expected}, got {current}")]
+    CatchUpGenerationMismatch { current: u64, expected: u64 },
+    #[error("catch-up authority requires a legless session, got {actual:?}")]
+    CatchUpRequiresLegless { actual: SessionPhase },
+    #[error("catch-up authority does not encode an exact authenticated high-water chain")]
+    InvalidCatchUpCapability,
     #[error("leg generation is exhausted")]
     LegGenerationExhausted,
     #[error("session resume grace expired")]
     SessionExpired,
+    #[error("{0:?} role cannot accept an owner-side replacement ATTACH")]
+    RoleCannotAcceptOwnerAttach(SessionRole),
     #[error("resume grace is not active")]
     ResumeGraceNotActive,
     #[error("peer frame arrived while the session has no active leg")]
@@ -2710,14 +2872,28 @@ mod tests {
 
     use super::*;
     use crate::resumable::auth::{
-        AttachAlpn, AttachAuthority, AttachCredentials, AttachPolicy, AttachRequest,
-        AttachTransportBinding, DevicePrincipal, DeviceSecret, FeatureOffer, OwnerIdentity,
-        ResumeSecret, TlsExporterBinding, VersionRange,
+        AttachAlpn, AttachAuthority, AttachCredentials, AttachFrameOutcome, AttachPolicy,
+        AttachRequest, AttachTransportBinding, DevicePrincipal, DeviceSecret, FeatureOffer,
+        OwnerIdentity, ResumeSecret, TlsExporterBinding, VersionRange,
     };
     use crate::resumable::capacity::{
         BitsPerSecond, DirectionalRates, ReplayCapacitySpec, ReplayStorageGeometry,
     };
     use crate::resumable::protocol::{AttachNonce, AttachProof, SESSION_PROTOCOL_VERSION};
+
+    // Inference becomes ambiguous if the opaque transaction token ever gains
+    // `Clone`, making non-cloneability a compile-time seam without another
+    // test dependency.
+    trait AmbiguousIfClone<Marker> {
+        fn marker() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+    impl<T: Clone> AmbiguousIfClone<u8> for T {}
+
+    const _: fn() = || {
+        let _ = <PreflightedReplacement<'static> as AmbiguousIfClone<_>>::marker;
+    };
 
     struct LegIssuer {
         authority: AttachAuthority,
@@ -3058,6 +3234,32 @@ mod tests {
                 .reduce(SessionEvent::ReplacementAttached { leg: leg3 })
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn replacement_installation_requires_the_consumed_preflight_token() {
+        let issuer = LegIssuer::new(0x13);
+        let leg2 = issuer.issue(2);
+        let leg3 = issuer.issue(3);
+        let mut model = SessionModel::new(SessionRole::Client, config(), leg2);
+        let before = model.snapshot();
+
+        // This type-checks only with the opaque, non-cloneable value minted by
+        // `preflight_replacement`; there is no install method accepting a bare
+        // `CommittedLeg`. Its exclusive borrow also makes any intervening
+        // reducer mutation fail to compile.
+        fn install(preflighted: PreflightedReplacement<'_>) -> Vec<SessionEffect> {
+            preflighted.install()
+        }
+
+        let preflighted = model.preflight_replacement(leg3).unwrap();
+        let effects = install(preflighted);
+        assert_eq!(before.generation().get(), 2);
+        assert_eq!(model.snapshot().generation().get(), 3);
+        assert!(matches!(
+            effects.first(),
+            Some(SessionEffect::LegActivated { generation }) if generation.get() == 3
+        ));
     }
 
     #[test]
@@ -3764,6 +3966,285 @@ mod tests {
                 .iter()
                 .any(|record| matches!(record, Record::Data { .. } | Record::Close { .. }))
         );
+    }
+
+    #[test]
+    fn lost_replacement_acceptance_resynchronizes_live_client_model_before_next_attach() {
+        let issuer = LegIssuer::new(0x4a);
+        let leg2 = issuer.issue(2);
+        let mut model = SessionModel::new(SessionRole::Client, config(), leg2);
+        let flow_id = local_open(&mut model, leg2, target(443));
+        let local = local_flow(&model, flow_id);
+        model
+            .reduce(SessionEvent::LocalData {
+                flow: local,
+                payload: Bytes::from_static(b"unacked"),
+            })
+            .unwrap();
+        model.reduce(SessionEvent::LegLost { leg: leg2 }).unwrap();
+        let before = model.snapshot();
+        assert_eq!(before.generation().get(), 2);
+        assert_eq!(before.flow_count(), 1);
+        assert_eq!(before.replay_usage(Direction::ClientToTarget).bytes(), 7);
+
+        let versions =
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap();
+        let features = FeatureOffer::new(0b0111, 0b0001).unwrap();
+        let lost_request = AttachRequest::new(
+            issuer.session_id,
+            LegGeneration::new(3).unwrap(),
+            AttachNonce::new([0x33; 16]).unwrap(),
+            versions,
+            features,
+        );
+        let lost_proof = signing_credentials()
+            .prove(&lost_request, &issuer.binding)
+            .unwrap();
+        let AttachFrameOutcome::Committed(lost_server_leg) = issuer
+            .authority
+            .verify_and_commit_or_resynchronize_frame(
+                &lost_request.to_attach_frame(lost_proof),
+                &issuer.binding,
+            )
+            .unwrap()
+        else {
+            panic!("the server must commit generation 3 before its acceptance is lost");
+        };
+
+        let retry = AttachRequest::new(
+            issuer.session_id,
+            LegGeneration::new(3).unwrap(),
+            AttachNonce::new([0x34; 16]).unwrap(),
+            versions,
+            features,
+        );
+        let retry_proof = signing_credentials()
+            .prove(&retry, &issuer.binding)
+            .unwrap();
+        let AttachFrameOutcome::Resynchronize(server_status) = issuer
+            .authority
+            .verify_and_commit_or_resynchronize_frame(
+                &retry.to_attach_frame(retry_proof),
+                &issuer.binding,
+            )
+            .unwrap()
+        else {
+            panic!("the authenticated retry must disclose only correlated status");
+        };
+        let client_status = retry
+            .validate_generation_status_frame(&issuer.binding, &server_status.status_frame())
+            .unwrap();
+        let pending_catch_up = client_status
+            .begin_catch_up(AttachNonce::new([0x35; 16]).unwrap())
+            .unwrap();
+        let next_request = pending_catch_up.request();
+        assert_eq!(next_request.requested_generation().get(), 4);
+        let next_proof = signing_credentials()
+            .prove(&next_request, &issuer.binding)
+            .unwrap();
+        let AttachFrameOutcome::Committed(server_leg4) = issuer
+            .authority
+            .verify_and_commit_or_resynchronize_frame(
+                &next_request.to_attach_frame(next_proof),
+                &issuer.binding,
+            )
+            .unwrap()
+        else {
+            panic!("the status-derived generation 4 must commit");
+        };
+        let catch_up = pending_catch_up
+            .validate_accepted_frame(&issuer.binding, &server_leg4.attach_accepted_frame())
+            .unwrap();
+
+        let mut active_model = SessionModel::new(SessionRole::Client, config(), leg2);
+        let active_flow_id = local_open(&mut active_model, leg2, target(8443));
+        let active_flow = local_flow(&active_model, active_flow_id);
+        active_model
+            .reduce(SessionEvent::LocalData {
+                flow: active_flow,
+                payload: Bytes::from_static(b"active-unacked"),
+            })
+            .unwrap();
+        let active_before = active_model.snapshot();
+        let active_flow_before = active_model.flow_snapshot(active_flow_id);
+        assert!(matches!(
+            active_model.reduce(SessionEvent::ReplacementCaughtUp { catch_up }),
+            Err(SessionError::CatchUpRequiresLegless {
+                actual: SessionPhase::Active,
+            })
+        ));
+        assert_eq!(active_model.snapshot(), active_before);
+        assert_eq!(
+            active_model.flow_snapshot(active_flow_id),
+            active_flow_before
+        );
+
+        let effects = model
+            .reduce(SessionEvent::ReplacementCaughtUp { catch_up })
+            .unwrap();
+        assert_eq!(model.snapshot().generation().get(), 4);
+        assert_eq!(model.snapshot().flow_count(), 1);
+        assert_eq!(
+            model
+                .snapshot()
+                .replay_usage(Direction::ClientToTarget)
+                .bytes(),
+            7
+        );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            SessionEffect::LegActivated { generation } if generation.get() == 4
+        )));
+        assert!(transmitted_records(&effects).iter().any(|record| matches!(
+            record,
+            Record::Data {
+                flow_id: replay_flow,
+                direction: Direction::ClientToTarget,
+                offset,
+                payload,
+            } if *replay_flow == flow_id
+                && *offset == ByteOffset::new(0)
+                && payload.as_ref() == b"unacked"
+        )));
+
+        let caught_up = model.snapshot();
+        let caught_up_flow = model.flow_snapshot(flow_id);
+        assert!(matches!(
+            model.reduce(SessionEvent::ReplacementCaughtUp { catch_up }),
+            Err(SessionError::CatchUpRequiresLegless {
+                actual: SessionPhase::Active,
+            })
+        ));
+        assert_eq!(model.snapshot(), caught_up);
+        assert_eq!(model.flow_snapshot(flow_id), caught_up_flow);
+
+        model
+            .reduce(SessionEvent::LegLost { leg: server_leg4 })
+            .unwrap();
+        let caught_up_legless = model.snapshot();
+        let caught_up_legless_flow = model.flow_snapshot(flow_id);
+        assert!(matches!(
+            model.reduce(SessionEvent::ReplacementCaughtUp { catch_up }),
+            Err(SessionError::CatchUpGenerationMismatch {
+                current: 4,
+                expected: 2,
+            })
+        ));
+        assert_eq!(model.snapshot(), caught_up_legless);
+        assert_eq!(model.flow_snapshot(flow_id), caught_up_legless_flow);
+
+        let delayed_leg3 = lost_request
+            .validate_accepted_frame(&issuer.binding, &lost_server_leg.attach_accepted_frame())
+            .unwrap();
+        assert!(matches!(
+            model.reduce(SessionEvent::ReplacementAttached { leg: delayed_leg3 }),
+            Err(SessionError::ReplacementGenerationNotNext {
+                current: 4,
+                requested: 3,
+            })
+        ));
+        assert_eq!(model.snapshot(), caught_up_legless);
+        assert_eq!(model.flow_snapshot(flow_id), caught_up_legless_flow);
+    }
+
+    #[test]
+    fn consecutive_lost_acceptances_use_authenticated_high_water_for_bounded_catch_up() {
+        let issuer = LegIssuer::new(0x4b);
+        let leg2 = issuer.issue(2);
+        let mut model = SessionModel::new(SessionRole::Client, config(), leg2);
+        let flow_id = local_open(&mut model, leg2, target(443));
+        let local = local_flow(&model, flow_id);
+        model
+            .reduce(SessionEvent::LocalData {
+                flow: local,
+                payload: Bytes::from_static(b"still-live"),
+            })
+            .unwrap();
+        model.reduce(SessionEvent::LegLost { leg: leg2 }).unwrap();
+
+        // Both acceptances are lost before the client reducer observes either
+        // generation. The server's authenticated authority is nevertheless at
+        // generation 4 while the live client model remains at generation 2.
+        let _lost_leg3 = issuer.issue(3);
+        let _lost_leg4 = issuer.issue(4);
+        let versions =
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap();
+        let features = FeatureOffer::new(0b0111, 0b0001).unwrap();
+        let retry = AttachRequest::new(
+            issuer.session_id,
+            LegGeneration::new(3).unwrap(),
+            AttachNonce::new([0x43; 16]).unwrap(),
+            versions,
+            features,
+        );
+        let retry_proof = signing_credentials()
+            .prove(&retry, &issuer.binding)
+            .unwrap();
+        let AttachFrameOutcome::Resynchronize(server_status) = issuer
+            .authority
+            .verify_and_commit_or_resynchronize_frame(
+                &retry.to_attach_frame(retry_proof),
+                &issuer.binding,
+            )
+            .unwrap()
+        else {
+            panic!("the stale retry must receive authenticated high-water status");
+        };
+        assert_eq!(server_status.current_generation().get(), 4);
+        let client_status = retry
+            .validate_generation_status_frame(&issuer.binding, &server_status.status_frame())
+            .unwrap();
+        let pending_catch_up = client_status
+            .begin_catch_up(AttachNonce::new([0x45; 16]).unwrap())
+            .unwrap();
+        let next_request = pending_catch_up.request();
+        assert_eq!(next_request.requested_generation().get(), 5);
+
+        // The status and final acceptance may come from successive physical
+        // legs. Each proof remains bound to its own TLS exporter.
+        let accepted_binding = AttachTransportBinding::new(
+            issuer.binding.owner_identity(),
+            issuer.binding.alpn(),
+            TlsExporterBinding::new([0x77; 32]).unwrap(),
+            issuer.binding.device_principal(),
+        );
+        let next_proof = signing_credentials()
+            .prove(&next_request, &accepted_binding)
+            .unwrap();
+        let AttachFrameOutcome::Committed(server_leg5) = issuer
+            .authority
+            .verify_and_commit_or_resynchronize_frame(
+                &next_request.to_attach_frame(next_proof),
+                &accepted_binding,
+            )
+            .unwrap()
+        else {
+            panic!("the authenticated high-water successor must commit");
+        };
+        let catch_up = pending_catch_up
+            .validate_accepted_frame(&accepted_binding, &server_leg5.attach_accepted_frame())
+            .unwrap();
+        let effects = model
+            .reduce(SessionEvent::ReplacementCaughtUp { catch_up })
+            .unwrap();
+
+        assert_eq!(model.snapshot().generation().get(), 5);
+        assert_eq!(model.snapshot().flow_count(), 1);
+        assert_eq!(
+            model
+                .snapshot()
+                .replay_usage(Direction::ClientToTarget)
+                .bytes(),
+            10
+        );
+        assert!(transmitted_records(&effects).iter().any(|record| matches!(
+            record,
+            Record::Data {
+                flow_id: replay_flow,
+                payload,
+                ..
+            } if *replay_flow == flow_id && payload.as_ref() == b"still-live"
+        )));
     }
 
     #[test]

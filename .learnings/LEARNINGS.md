@@ -1,5 +1,30 @@
 # Learnings
 
+## 2026-08-18 - Irreversible source and scheduler work need category-owned admission
+
+- A TCP source read must reserve its ordered message slot, per-flow and
+  session-global byte permits, replay-segment permits, and offset headroom
+  before invoking the extractor. EOF must commit through that same reserved
+  FIFO slot.
+- Retryable reducer pressure must return the exact owned event or command in
+  its original lane. Reconstructing or dropping an input after admission
+  failure loses retry and ownership authority.
+- A session-global budget is global only when one pristine supervisor mints
+  the sole factory and an opaque origin follows staging ownership into replay
+  ownership. Numeric session identity alone is not provenance.
+- One aggregate harness budget is not a bounded-work proof. Derive and
+  validate wire-send, wire-delivery, acceptance, ACK, and fixed-actor turns
+  plus wire-send, wire-delivery, and non-wire bytes independently. Make charge
+  plus schedule transactional.
+- Non-cloneable attach publication proves at-most-once ownership, not ordered
+  transport admission. Recovery must consume an acceptance enqueue/send
+  receipt before the first controller can claim acceptance-before-replay.
+- These rules close the R1-R5 foundation only; they do not prove switching,
+  blackout recovery, WAN behavior, or throughput.
+
+Result:
+`docs/tech/2026-08-18-knife16-two-leg-foundation-local-results.md`.
+
 ## 2026-08-18 - Ownership adapters need typed receipts at irreversible boundaries
 
 - Reserve both message and session-global byte capacity before calling the

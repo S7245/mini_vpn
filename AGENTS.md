@@ -190,7 +190,8 @@ the frozen local architecture/capacity baseline.
 
 Current Knife16/Knife15 summary, as of 2026-08-18:
 
-- **Knife16 Task 3 is complete locally; Task 4 is next.** The crate-private
+- **Knife16 Task 4 R1–R5 foundation is accepted locally; R6 is next.** The
+  crate-private
   `OwnedUpstream` facade preserves exact legacy relay variants and
   UDP/TUIC/Reality/Failover behavior while the real TUN/smoltcp loop can drive
   typed resumable flow ports. The public production entry remains legacy
@@ -206,10 +207,25 @@ Current Knife16/Knife15 summary, as of 2026-08-18:
   `10 + 4 ignored`, typed provenance `101/101`, real-smoltcp fake adapter
   `2/2` plus 100-repeat, release, strict Clippy, rustdoc, vendored Quinn/proto,
   fmt, and diff pass. Four concentrated reviews report P0/P1 `0/0`. This is a
-  local seam result, not a production transport, blackout recovery, WAN, or
-  throughput claim. Next implement only Task 4's deterministic two-leg
-  transport harness; do not run macOS TUN or VPS. Result:
-  `docs/tech/2026-08-18-knife16-owned-upstream-local-results.md`.
+  local Task-3 seam result, not a production transport, blackout recovery,
+  WAN, or throughput claim.
+- Task 4 R1–R5 now cross the production-shared codec, exact leg seal, attach
+  transaction, sole supervisor/factory mint, typed source/replay ownership,
+  `TargetIo`, one-event checked scheduler, category-owned work budget, and one
+  complete byte-level baseline. Source extraction owns message, byte,
+  segment, and offset authority first; retryable reducer pressure returns the
+  exact input; final continuation/replay/quarantine/Target/wire ownership is
+  zero. Focused owned-upstream `179/179`, root `1003 + 3 ignored`, concurrency
+  `10 + 4 ignored`, typed provenance `114/114`, protocol `19/19`, session API
+  `1/1`, fake adapter `2/2` plus 100-repeat, release, strict Clippy, rustdoc,
+  vendored Quinn/proto, fmt, and diff pass. Independent reviews report
+  P0/P1 `0/0`.
+- This is foundation acceptance only. R6–R9, Task 4, production transport/
+  owner, blackout recovery, WAN, and throughput all remain open. Next
+  implement only R6's `STANDBY_CONTROL_V1` protocol/auth/exact-leg vertical;
+  do not run macOS TUN or VPS. Results:
+  `docs/tech/2026-08-18-knife16-owned-upstream-local-results.md` and
+  `docs/tech/2026-08-18-knife16-two-leg-foundation-local-results.md`.
 
 - **Knife15 is closed by a genuine Tier-B quality failure; Knife16 is the
   active architecture stage.** Exact-source `d5b8304` passed baseline,

@@ -4,8 +4,9 @@
 
 ## Next Planned Stage — Knife16 Path-Diverse Resumable Upstream (2026-08-18)
 
-- **Latest accepted position: Knife16 Task 3 is complete locally; Task 4 is
-  next.** The new crate-private `OwnedUpstream` branch preserves exact legacy
+- **Latest accepted position: Knife16 Task 4 R1–R5 foundation is accepted
+  locally; R6 is next.** The crate-private `OwnedUpstream` branch preserves
+  exact legacy
   `Generic`/`Native`/`NativeByteOwned`, TUIC UDP, Reality, and Failover
   behavior while allowing the real TUN/smoltcp loop to drive typed resumable
   flow ports without knowing transport-leg or replay mechanics. The public
@@ -28,10 +29,21 @@
   Focused `43/43`, all-target harness `875 + 3 ignored`, concurrency
   `10 + 4 ignored`, typed provenance `101/101`, fake adapter `2/2` plus
   100-repeat, release, strict Clippy, rustdoc, vendored Quinn/proto, fmt, and
-  diff gates pass. Four concentrated reviews report P0/P1 `0/0`. This is a
-  local adapter result only: no production two-leg transport, owner, blackout
-  recovery, WAN result, or throughput claim exists. Result:
-  `docs/tech/2026-08-18-knife16-owned-upstream-local-results.md`.
+  diff gates pass. Four concentrated reviews report P0/P1 `0/0` for Task 3.
+- Task 4 R1–R5 now add the production-shared codec/seal, exact attach
+  transaction, single-owner supervisor, source/replay receipts, `TargetIo`,
+  one-event checked wire scheduler, category-owned work budget, and one full
+  byte-level baseline. Source extraction reserves message/byte/segment/offset
+  authority first; transient reducer pressure returns the exact input; one
+  pristine supervisor is the sole factory mint; Target, continuation, replay,
+  quarantine, queue, and scheduler ownership all finish at zero. Independent
+  foundation reviews report P0/P1 `0/0`.
+- This is still local foundation evidence only. There is no standby control
+  protocol, production switch controller, blackout recovery, stale-A matrix,
+  real owner/transport, WAN result, or throughput result. Task 4 is NOT PASS.
+  Results:
+  `docs/tech/2026-08-18-knife16-owned-upstream-local-results.md` and
+  `docs/tech/2026-08-18-knife16-two-leg-foundation-local-results.md`.
 - **Latest accepted position: Knife15 is closed by a genuine Tier-B quality
   failure.** Exact-source `d5b8304` entered the first valid frequency schedule,
   completed eleven cycles, and failed cycle 12 `udp-reverse` at
@@ -59,13 +71,14 @@
   bounded queues, dedup, deadline, and hot failover; permanent full-rate 2x
   duplication is rejected by HK capacity math. Standard TUIC remains a
   compatibility profile.
-- **Only next step:** implement Knife16 Task 4 locally: build the deterministic
-  in-memory two-leg transport harness with authenticated attach, `300..800ms`
-  blackout, reorder, duplicate, delayed ACK, stale-leg, and bidirectional
-  fairness injection. Prove exact TCP delivery, one Target open, unrelated-
-  flow survival, and bounded replay before implementing a production
-  transport. Do not run macOS TUN, VPS, WAN, or throughput acceptance. Then
-  continue Tasks 5–8 in order; a bounded two-ingress qualification must pass
+- **Only next step:** implement R6's P/A/L vertical locally: freeze
+  `STANDBY_CONTROL_V1`, add five bounded leg-control records, independent
+  standby HMAC, exact-leg control/liveness capabilities, and the typed
+  acceptance-enqueue receipt required before recovery. Then add the
+  production-shared controller's actual-close tracer; the harness must never
+  read its fault oracle to switch. Do not run macOS TUN, VPS, WAN, or
+  throughput acceptance. Then continue Tasks 5–10 in order; a bounded
+  two-ingress qualification must pass
   before any long macOS run. Spec/plan/results:
   `docs/tech/2026-08-18-knife16-path-diverse-resumable-upstream-architecture-spec.md`,
   `docs/tech/2026-08-18-knife16-path-diverse-resumable-upstream-implementation-plan.md`,

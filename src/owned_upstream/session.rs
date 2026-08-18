@@ -1,5 +1,6 @@
 //! Bounded, priority-aware ingress for one resumable session owner.
 
+use super::tcp::DriverInput;
 use crate::resumable::{Record, SessionEvent};
 use std::fmt;
 use thiserror::Error;
@@ -54,37 +55,71 @@ impl SessionOwnerMailbox {
 
 #[derive(Clone)]
 pub(crate) struct SessionOwnerIngress {
-    control_tx: mpsc::Sender<SessionEvent>,
-    data_tx: mpsc::Sender<SessionEvent>,
+    control_tx: mpsc::Sender<SessionOwnerCommand>,
+    data_tx: mpsc::Sender<SessionOwnerCommand>,
 }
 
 impl SessionOwnerIngress {
-    pub(crate) async fn send(&self, event: SessionEvent) -> Result<(), SessionMailboxSendError> {
-        let sender = if is_ordered_source_event(&event) {
+    pub(crate) async fn send_event(
+        &self,
+        event: SessionEvent,
+    ) -> Result<(), SessionMailboxSendError> {
+        self.send_command(SessionOwnerCommand::Event(event)).await
+    }
+
+    pub(crate) async fn send_driver(
+        &self,
+        input: DriverInput,
+    ) -> Result<(), SessionMailboxSendError> {
+        self.send_command(SessionOwnerCommand::Driver(input)).await
+    }
+
+    async fn send_command(
+        &self,
+        command: SessionOwnerCommand,
+    ) -> Result<(), SessionMailboxSendError> {
+        let sender = if command.is_ordered_source() {
             &self.data_tx
         } else {
             &self.control_tx
         };
         sender
-            .send(event)
+            .send(command)
             .await
             .map_err(|error| SessionMailboxSendError {
-                event: Box::new(error.0),
+                command: Box::new(error.0),
             })
     }
 
-    pub(crate) fn try_send(&self, event: SessionEvent) -> Result<(), SessionMailboxTrySendError> {
-        let sender = if is_ordered_source_event(&event) {
+    pub(crate) fn try_send_event(
+        &self,
+        event: SessionEvent,
+    ) -> Result<(), SessionMailboxTrySendError> {
+        self.try_send_command(SessionOwnerCommand::Event(event))
+    }
+
+    pub(crate) fn try_send_driver(
+        &self,
+        input: DriverInput,
+    ) -> Result<(), SessionMailboxTrySendError> {
+        self.try_send_command(SessionOwnerCommand::Driver(input))
+    }
+
+    fn try_send_command(
+        &self,
+        command: SessionOwnerCommand,
+    ) -> Result<(), SessionMailboxTrySendError> {
+        let sender = if command.is_ordered_source() {
             &self.data_tx
         } else {
             &self.control_tx
         };
-        sender.try_send(event).map_err(|error| match error {
-            mpsc::error::TrySendError::Full(event) => {
-                SessionMailboxTrySendError::Full(Box::new(event))
+        sender.try_send(command).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(command) => {
+                SessionMailboxTrySendError::Full(Box::new(command))
             }
-            mpsc::error::TrySendError::Closed(event) => {
-                SessionMailboxTrySendError::Closed(Box::new(event))
+            mpsc::error::TrySendError::Closed(command) => {
+                SessionMailboxTrySendError::Closed(Box::new(command))
             }
         })
     }
@@ -97,13 +132,13 @@ impl fmt::Debug for SessionOwnerIngress {
 }
 
 pub(crate) struct SessionOwnerInbox {
-    control_rx: mpsc::Receiver<SessionEvent>,
-    data_rx: mpsc::Receiver<SessionEvent>,
+    control_rx: mpsc::Receiver<SessionOwnerCommand>,
+    data_rx: mpsc::Receiver<SessionOwnerCommand>,
     control_streak: usize,
 }
 
 impl SessionOwnerInbox {
-    pub(crate) async fn recv_next(&mut self) -> Option<SessionEvent> {
+    pub(crate) async fn recv_next(&mut self) -> Option<SessionOwnerCommand> {
         let mut control_closed = false;
         let mut data_closed = false;
         loop {
@@ -206,6 +241,30 @@ impl fmt::Debug for SessionOwnerInbox {
     }
 }
 
+pub(crate) enum SessionOwnerCommand {
+    Event(SessionEvent),
+    Driver(DriverInput),
+}
+
+impl SessionOwnerCommand {
+    pub(crate) fn is_ordered_source(&self) -> bool {
+        match self {
+            Self::Event(event) => is_ordered_source_event(event),
+            Self::Driver(DriverInput::Data(_)) => true,
+            Self::Driver(DriverInput::Control(event)) => is_ordered_source_event(event),
+        }
+    }
+}
+
+impl fmt::Debug for SessionOwnerCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Event(event) => formatter.debug_tuple("Event").field(event).finish(),
+            Self::Driver(input) => formatter.debug_tuple("Driver").field(input).finish(),
+        }
+    }
+}
+
 fn is_ordered_source_event(event: &SessionEvent) -> bool {
     // CLOSE freezes the final byte offset, so it must share FIFO ownership
     // with preceding DATA from the same source. RESET remains urgent control:
@@ -221,12 +280,12 @@ fn is_ordered_source_event(event: &SessionEvent) -> bool {
 }
 
 pub(crate) struct SessionMailboxSendError {
-    event: Box<SessionEvent>,
+    command: Box<SessionOwnerCommand>,
 }
 
 impl SessionMailboxSendError {
-    pub(crate) fn into_event(self) -> SessionEvent {
-        *self.event
+    pub(crate) fn into_command(self) -> SessionOwnerCommand {
+        *self.command
     }
 }
 
@@ -245,14 +304,14 @@ impl fmt::Display for SessionMailboxSendError {
 impl std::error::Error for SessionMailboxSendError {}
 
 pub(crate) enum SessionMailboxTrySendError {
-    Full(Box<SessionEvent>),
-    Closed(Box<SessionEvent>),
+    Full(Box<SessionOwnerCommand>),
+    Closed(Box<SessionOwnerCommand>),
 }
 
 impl SessionMailboxTrySendError {
-    pub(crate) fn into_event(self) -> SessionEvent {
+    pub(crate) fn into_command(self) -> SessionOwnerCommand {
         match self {
-            Self::Full(event) | Self::Closed(event) => *event,
+            Self::Full(command) | Self::Closed(command) => *command,
         }
     }
 }
@@ -453,6 +512,17 @@ mod tests {
         })
     }
 
+    async fn recv_event(inbox: &mut SessionOwnerInbox) -> Option<SessionEvent> {
+        match inbox.recv_next().await {
+            Some(SessionOwnerCommand::Event(event))
+            | Some(SessionOwnerCommand::Driver(DriverInput::Control(event))) => Some(event),
+            Some(SessionOwnerCommand::Driver(DriverInput::Data(_))) => {
+                panic!("expected an event command, got owned DATA")
+            }
+            None => None,
+        }
+    }
+
     #[test]
     fn invalid_lane_capacities_are_rejected_without_entering_tokio_panics() {
         assert!(matches!(
@@ -476,20 +546,20 @@ mod tests {
     #[tokio::test]
     async fn a_full_data_lane_does_not_block_control_and_control_is_received_first() {
         let (ingress, mut inbox) = SessionOwnerMailbox::bounded(2, 1).unwrap();
-        ingress.try_send(peer_data(b"first-secret")).unwrap();
+        ingress.try_send_event(peer_data(b"first-secret")).unwrap();
         assert!(matches!(
-            ingress.try_send(peer_data(b"second-secret")),
+            ingress.try_send_event(peer_data(b"second-secret")),
             Err(SessionMailboxTrySendError::Full(_))
         ));
-        ingress.try_send(peer_ack()).unwrap();
+        ingress.try_send_event(peer_ack()).unwrap();
 
         assert!(matches!(
-            inbox.recv_next().await,
+            recv_event(&mut inbox).await,
             Some(SessionEvent::PeerFrame { frame, .. })
                 if matches!(frame.record(), Record::Ack { .. })
         ));
         assert!(matches!(
-            inbox.recv_next().await,
+            recv_event(&mut inbox).await,
             Some(SessionEvent::PeerFrame { frame, .. })
                 if matches!(frame.record(), Record::Data { .. })
         ));
@@ -499,40 +569,42 @@ mod tests {
     async fn event_classification_is_internal_and_covers_data_and_control_families() {
         let (ingress, mut inbox) = SessionOwnerMailbox::bounded(5, 1).unwrap();
         let (flow, offer) = local_flow_and_offer();
-        ingress.try_send(peer_data(b"fill-data-lane")).unwrap();
+        ingress
+            .try_send_event(peer_data(b"fill-data-lane"))
+            .unwrap();
         assert!(matches!(
-            ingress.try_send(SessionEvent::LocalData {
+            ingress.try_send_event(SessionEvent::LocalData {
                 flow,
                 payload: Bytes::from_static(b"local-secret"),
             }),
             Err(SessionMailboxTrySendError::Full(_))
         ));
 
-        ingress.try_send(peer_ack()).unwrap();
-        ingress.try_send(peer_attach_accepted()).unwrap();
-        ingress.try_send(peer_reset()).unwrap();
+        ingress.try_send_event(peer_ack()).unwrap();
+        ingress.try_send_event(peer_attach_accepted()).unwrap();
+        ingress.try_send_event(peer_reset()).unwrap();
         ingress
-            .try_send(SessionEvent::SinkAccepted { offer, bytes: 1 })
+            .try_send_event(SessionEvent::SinkAccepted { offer, bytes: 1 })
             .unwrap();
 
         assert!(matches!(
-            inbox.recv_next().await,
+            recv_event(&mut inbox).await,
             Some(SessionEvent::PeerFrame { frame, .. }) if matches!(frame.record(), Record::Ack { .. })
         ));
         assert!(matches!(
-            inbox.recv_next().await,
+            recv_event(&mut inbox).await,
             Some(SessionEvent::PeerFrame { frame, .. }) if matches!(frame.record(), Record::AttachAccepted { .. })
         ));
         assert!(matches!(
-            inbox.recv_next().await,
+            recv_event(&mut inbox).await,
             Some(SessionEvent::PeerFrame { frame, .. }) if matches!(frame.record(), Record::Reset { .. })
         ));
         assert!(matches!(
-            inbox.recv_next().await,
+            recv_event(&mut inbox).await,
             Some(SessionEvent::SinkAccepted { .. })
         ));
         assert!(matches!(
-            inbox.recv_next().await,
+            recv_event(&mut inbox).await,
             Some(SessionEvent::PeerFrame { frame, .. }) if matches!(frame.record(), Record::Data { .. })
         ));
     }
@@ -542,37 +614,37 @@ mod tests {
         let (local_ingress, mut local_inbox) = SessionOwnerMailbox::bounded(1, 2).unwrap();
         let (flow, _) = local_flow_and_offer();
         local_ingress
-            .try_send(SessionEvent::LocalData {
+            .try_send_event(SessionEvent::LocalData {
                 flow,
                 payload: Bytes::from_static(b"local-before-close"),
             })
             .unwrap();
         local_ingress
-            .try_send(SessionEvent::LocalClose { flow })
+            .try_send_event(SessionEvent::LocalClose { flow })
             .unwrap();
 
         assert!(matches!(
-            local_inbox.recv_next().await,
+            recv_event(&mut local_inbox).await,
             Some(SessionEvent::LocalData { .. })
         ));
         assert!(matches!(
-            local_inbox.recv_next().await,
+            recv_event(&mut local_inbox).await,
             Some(SessionEvent::LocalClose { .. })
         ));
 
         let (peer_ingress, mut peer_inbox) = SessionOwnerMailbox::bounded(1, 2).unwrap();
         peer_ingress
-            .try_send(peer_data(b"peer-before-close"))
+            .try_send_event(peer_data(b"peer-before-close"))
             .unwrap();
-        peer_ingress.try_send(peer_close()).unwrap();
+        peer_ingress.try_send_event(peer_close()).unwrap();
 
         assert!(matches!(
-            peer_inbox.recv_next().await,
+            recv_event(&mut peer_inbox).await,
             Some(SessionEvent::PeerFrame { frame, .. })
                 if matches!(frame.record(), Record::Data { .. })
         ));
         assert!(matches!(
-            peer_inbox.recv_next().await,
+            recv_event(&mut peer_inbox).await,
             Some(SessionEvent::PeerFrame { frame, .. })
                 if matches!(frame.record(), Record::Close { .. })
         ));
@@ -581,12 +653,12 @@ mod tests {
     #[tokio::test]
     async fn continuous_control_cannot_starve_an_already_queued_source_event() {
         let (ingress, mut inbox) = SessionOwnerMailbox::bounded(2, 1).unwrap();
-        ingress.try_send(peer_data(b"must-progress")).unwrap();
-        ingress.try_send(peer_ack()).unwrap();
+        ingress.try_send_event(peer_data(b"must-progress")).unwrap();
+        ingress.try_send_event(peer_ack()).unwrap();
 
         let mut controls_seen = 0usize;
         loop {
-            match inbox.recv_next().await {
+            match recv_event(&mut inbox).await {
                 Some(SessionEvent::PeerFrame { frame, .. })
                     if matches!(frame.record(), Record::Data { .. }) =>
                 {
@@ -594,7 +666,7 @@ mod tests {
                 }
                 Some(_) => {
                     controls_seen = controls_seen.saturating_add(1);
-                    ingress.try_send(peer_ack()).unwrap();
+                    ingress.try_send_event(peer_ack()).unwrap();
                 }
                 None => panic!("mailbox closed before queued source progress"),
             }
@@ -609,12 +681,12 @@ mod tests {
     #[tokio::test]
     async fn queued_control_remains_low_latency_under_source_pressure() {
         let (ingress, mut inbox) = SessionOwnerMailbox::bounded(1, 2).unwrap();
-        ingress.try_send(peer_data(b"bulk-one")).unwrap();
-        ingress.try_send(peer_data(b"bulk-two")).unwrap();
-        ingress.try_send(peer_ack()).unwrap();
+        ingress.try_send_event(peer_data(b"bulk-one")).unwrap();
+        ingress.try_send_event(peer_data(b"bulk-two")).unwrap();
+        ingress.try_send_event(peer_ack()).unwrap();
 
         assert!(matches!(
-            inbox.recv_next().await,
+            recv_event(&mut inbox).await,
             Some(SessionEvent::PeerFrame { frame, .. })
                 if matches!(frame.record(), Record::Ack { .. })
         ));
@@ -624,26 +696,27 @@ mod tests {
     async fn close_rejects_new_ingress_and_drains_both_lanes_without_loss() {
         let (ingress, mut inbox) = SessionOwnerMailbox::bounded(2, 2).unwrap();
         let cloned_ingress = ingress.clone();
-        ingress.try_send(peer_data(b"queued-data")).unwrap();
-        ingress.try_send(peer_ack()).unwrap();
+        ingress.try_send_event(peer_data(b"queued-data")).unwrap();
+        ingress.try_send_event(peer_ack()).unwrap();
 
         inbox.close();
-        let error = cloned_ingress.try_send(peer_ack()).unwrap_err();
+        let error = cloned_ingress.try_send_event(peer_ack()).unwrap_err();
         assert!(matches!(error, SessionMailboxTrySendError::Closed(_)));
         assert!(matches!(
-            error.into_event(),
-            SessionEvent::PeerFrame { frame, .. } if matches!(frame.record(), Record::Ack { .. })
+            error.into_command(),
+            SessionOwnerCommand::Event(SessionEvent::PeerFrame { frame, .. })
+                if matches!(frame.record(), Record::Ack { .. })
         ));
 
         assert!(matches!(
-            inbox.recv_next().await,
+            recv_event(&mut inbox).await,
             Some(SessionEvent::PeerFrame { frame, .. }) if matches!(frame.record(), Record::Ack { .. })
         ));
         assert!(matches!(
-            inbox.recv_next().await,
+            recv_event(&mut inbox).await,
             Some(SessionEvent::PeerFrame { frame, .. }) if matches!(frame.record(), Record::Data { .. })
         ));
-        assert!(inbox.recv_next().await.is_none());
+        assert!(recv_event(&mut inbox).await.is_none());
     }
 
     #[tokio::test]
@@ -653,20 +726,20 @@ mod tests {
         assert_eq!(format!("{ingress:?}"), "SessionOwnerIngress([REDACTED])");
         assert_eq!(format!("{inbox:?}"), "SessionOwnerInbox([REDACTED])");
 
-        ingress.try_send(peer_data(b"fill")).unwrap();
-        let full = ingress.try_send(peer_data(SECRET)).unwrap_err();
+        ingress.try_send_event(peer_data(b"fill")).unwrap();
+        let full = ingress.try_send_event(peer_data(SECRET)).unwrap_err();
         assert_eq!(
             format!("{full:?}"),
             "SessionMailboxTrySendError::Full([REDACTED])"
         );
         assert!(!format!("{full:?}").contains("MAILBOX_PAYLOAD"));
-        let _recovered = full.into_event();
+        let _recovered = full.into_command();
 
         inbox.close();
-        let closed = ingress.send(peer_data(SECRET)).await.unwrap_err();
+        let closed = ingress.send_event(peer_data(SECRET)).await.unwrap_err();
         assert_eq!(format!("{closed:?}"), "SessionMailboxSendError([REDACTED])");
         assert!(!format!("{closed:?}").contains("MAILBOX_PAYLOAD"));
-        let _recovered = closed.into_event();
+        let _recovered = closed.into_command();
     }
 
     // The sole receiver must stay non-cloneable even though ingress is

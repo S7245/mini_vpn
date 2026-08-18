@@ -1,5 +1,38 @@
 # Errors
 
+## 2026-08-18 - Task-4 foundation review found four local false-pass boundaries
+
+- Source extraction could occur without reducer-aligned replay-segment
+  capacity, allowing many tiny DATA records to fail only after an irreversible
+  read. The fix reserves message, byte, segment, and offset authority before
+  extraction and commits EOF through the reserved source slot.
+- Retryable reducer-capacity errors consumed their input shape. The fix returns
+  exact `RejectedEvent`/`RejectedCommand` ownership, preserving Event versus
+  `Driver::Control` lanes for deterministic retry.
+- Independently constructed factories could model separate "global" ledgers.
+  The fix makes a pristine `SessionSupervisor` the sole production mint,
+  carries one opaque origin through staging/replay, and poisons plus
+  quarantines foreign or impossible post-admission ownership.
+- A total event/byte budget allowed one work category to borrow another's
+  allowance, while a hard-coded step ceiling could false-pass. The fix derives
+  per-category turn and byte limits from the manifest, validates them
+  separately, and does not burn observed work when scheduling fails.
+
+Strict Clippy also exposed eight Task-4-local type/readability findings after
+the behavioral gates passed; all were repaired narrowly. An attempted
+standalone Quinn gate then resolved ignored `Cargo.lock` to crates.io
+quinn-proto `0.11.17` and failed against the patched Quinn API. Pinning the
+exact local `0.11.16` patch restored `40 + 3 ignored` and doctest `1/1`; the
+generated vendored lock/target state was removed. Future vendor gates must
+pin the local proto path before resolution.
+
+All were local RED/review or validation findings. No macOS TUN, VPS, WAN
+traffic, user data, or throughput acceptance was involved. R6-R9 and Task 4
+remain open.
+
+Result:
+`docs/tech/2026-08-18-knife16-two-leg-foundation-local-results.md`.
+
 ## 2026-08-18 - Task-3 review found global-budget and uninstalled-open ownership leaks
 
 - The first client integration treated only per-flow replay exhaustion as
