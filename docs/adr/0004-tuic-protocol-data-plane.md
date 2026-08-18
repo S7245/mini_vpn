@@ -1,5 +1,10 @@
 # Adopt the TUIC v5 protocol for the data plane (implemented on quinn), instead of a self-designed transport
 
+Status update (2026-08-18): **partially superseded by ADR-0015** for the
+enhanced-continuity profile after Knife15 exhausted standard single-path TUIC.
+This ADR remains accepted for the TUIC compatibility profile and ecosystem
+interoperability.
+
 The data plane will speak the **TUIC v5 protocol** (a mature, QUIC-based 0-RTT proxy protocol), **implemented
 on our existing quinn stack**, replacing the previously-planned self-designed TCP→QUIC transport. We keep the
 TUN interception + fake-IP DNS front-end we already built.

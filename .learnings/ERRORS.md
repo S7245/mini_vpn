@@ -1,5 +1,41 @@
 # Errors
 
+## 2026-08-18 - zsh validation reused the special `path` variable
+
+- A docs-link validation command stored many filenames in one scalar and
+  expected shell word splitting. zsh passed it to `rg` as one nonexistent
+  filename. Its read loop then assigned to zsh's special `path` array, which
+  rewrote `PATH` and made the following `git` checks report `command not
+  found`.
+- No project check ran and no repository state changed. The output is invalid
+  evidence. Future behavior: use a zsh array for filename arguments and never
+  use `path` as a loop variable; rerun every skipped check explicitly.
+
+## 2026-08-18 - First valid Tier-B run exceeded the immutable UDP loss gate
+
+- Exact-source `d5b8304` passed baseline/direct/resource/start/smoke and eleven
+  complete cycles, then cycle 12 `udp-reverse` lost `13,760 / 447,313`
+  packets (`3.076146%`) above the frozen `3%` limit. The controller correctly
+  failed closed, sent the completion notice, preserved paired evidence, and
+  completed all cleanup.
+- No six-hour epoch sealed. This supplies zero ledger credit but is still a
+  genuine quality failure under the accepted Tier-B policy. Do not rerun the
+  epoch, change the threshold, add an equivalent VPS, or tune frozen local
+  constants.
+- Paired evidence attributes `11,124` packets to the boundary after Exit
+  Target capture and before observed outer TUIC egress, with `2,636` additional
+  packets after egress/before application receive. Mac drop/backpressure and
+  Exit capture-drop evidence are clean.
+- The observer omitted live UDP socket overflow and server QUIC send-queue
+  state, so exact internal attribution is unavailable. Future behavior: add
+  those counters before the next WAN qualification; never promote the bounded
+  boundary inference into a proved sing-box defect.
+- Standard single-path TUIC is now closed for the enhanced-continuity goal.
+  ADR-0015 and Knife16 own the next work; M3 remains blocked.
+
+Result:
+`docs/tech/2026-08-18-knife15-m2-frequency-first-run-udp-loss-results.md`.
+
 ## 2026-08-18 - Two Tier-B attempts failed before the first epoch
 
 - Attempt 1 started an observer successfully as `xiaoou`, but the root runner

@@ -1,10 +1,52 @@
 # TODO
 
-## Current Knife15 Plan (2026-08-18)
+## Current Knife16 Plan (2026-08-18)
 
-### Tiered resource continuity before an established-stream architecture decision
+### Path-diverse resumable upstream
 
-#### Latest decision (2026-08-18 — two pre-action failures repaired locally; fresh source/evidence next)
+#### Latest decision (2026-08-18 — Knife15 Tier B failed; architecture replacement next)
+
+Knife15 is closed without acceptance. Exact-source `d5b8304` passed all
+pre-action gates and eleven complete cycles, then cycle 12 `udp-reverse` lost
+`13,760 / 447,313` packets (`3.076146%`) against the frozen `3%` limit. No
+six-hour epoch was sealed, but the genuine non-continuity quality failure is
+terminal to Tier B and does not authorize a retry. Mac/Exit bundles are
+`c96b342d.../567409b7...`; notification, evidence finalization, and cleanup
+passed. M3 remains blocked.
+
+Paired capture observed `447,313` Target packets at the Exit, `436,189` outer
+TUIC application-sized packets leaving it, and `433,553` at the Mac receiver.
+The dominant `11,124`-packet loss boundary is after Target capture and before
+outer TUIC egress. Mac TUN/D16/Endpoint/interface evidence and Exit capture
+drops are clean. Existing evidence does not distinguish the exact Exit UDP
+socket, sing-box, and QUIC send-queue sub-boundary.
+
+Do not rerun standard single-path TUIC, relax the threshold, add another
+equivalent resource, tune frozen constants, or switch to all-stream UDP.
+ADR-0015 accepts a single server-side session owner reachable through at least
+two independent ingress paths. It provides application-byte ACK/replay for TCP
+and independent bounded per-leg queues, sequence/dedup/feedback, and hot
+failover for UDP. TUIC remains a compatibility profile.
+
+Current execution order:
+
+1. protocol model and capacity characterization;
+2. deep `OwnedUpstream` abstraction behind existing client interfaces;
+3. deterministic two-leg TCP blackout and UDP path-switch harnesses;
+4. `mini_vpn-upstreamd` single session owner and loopback lifecycle tests;
+5. local real-socket `>170 Mbit/s` capacity gate;
+6. security/review gates;
+7. bounded independent two-ingress qualification;
+8. only then a Knife16 long macOS acceptance run.
+
+Spec and plan:
+`docs/tech/2026-08-18-knife16-path-diverse-resumable-upstream-architecture-spec.md`
+and
+`docs/tech/2026-08-18-knife16-path-diverse-resumable-upstream-implementation-plan.md`.
+Knife15 result:
+`docs/tech/2026-08-18-knife15-m2-frequency-first-run-udp-loss-results.md`.
+
+#### Superseded decision (2026-08-18 — two pre-action failures repaired locally)
 
 The first Tier-B epoch has not started. Two exact-source `ce164e6` attempts
 passed baseline/direct/resource/start/smoke but failed closed before schedule

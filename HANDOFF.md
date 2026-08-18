@@ -2,7 +2,46 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 M2 Tiered Resource Continuity (2026-08-18)
+## Next Planned Stage — Knife16 Path-Diverse Resumable Upstream (2026-08-18)
+
+- **Latest accepted position: Knife15 is closed by a genuine Tier-B quality
+  failure.** Exact-source `d5b8304` entered the first valid frequency schedule,
+  completed eleven cycles, and failed cycle 12 `udp-reverse` at
+  `13,760 / 447,313` lost packets (`3.076146%`) above the frozen `3%` limit.
+  No six-hour epoch sealed; zero epoch credit does not permit a retry. Mac/Exit
+  bundle SHA-256 values are `c96b342d.../567409b7...`. The once-only email,
+  paired evidence finalization, status/snapshot/stop, TUN/routes, observer,
+  caffeinate, and IPv6 cleanup all completed. M3 remains blocked.
+- Paired packet accounting observed all `447,313` Target datagrams at the Exit,
+  `436,189` outer TUIC application-sized egress datagrams, and `433,553` Mac
+  receiver packets. `11,124` packets (`2.486849%`) disappeared between the
+  Exit Target capture and outer TUIC egress; a further `2,636` (`0.589297%`)
+  disappeared afterward. Exit capture drops and Mac TUN/D16/Endpoint/interface
+  drop/backpressure evidence are zero. The dominant boundary is the Exit UDP
+  socket / sing-box / QUIC send handoff; exact internal attribution remains
+  unknown because live socket-overflow and server QUIC-queue counters were not
+  captured.
+- Do not repeat Tier B, add another equivalent VPS, relax `3%`, tune D16,
+  Endpoint, MTU, pool, windows, Cubic, GSO, or switch to all-stream UDP.
+  Standard single-path TUIC exhausted its bounded Knife15 decision tree.
+- ADR-0015 accepts a mini_vpn-owned server-side session owner reachable through
+  two independent ingress provider/ASN paths. TCP uses application byte
+  offsets, ACKs, bounded replay, and dedup across replaceable legs while one
+  owner keeps the Target socket. UDP uses sequence, feedback, independent
+  bounded queues, dedup, deadline, and hot failover; permanent full-rate 2x
+  duplication is rejected by HK capacity math. Standard TUIC remains a
+  compatibility profile.
+- **Only next step:** implement Knife16 Tasks 2–8 locally: pure protocol and
+  capacity TDD, deep `OwnedUpstream` abstraction, deterministic two-leg
+  blackout/path-switch harnesses, single-owner server, real-socket
+  `>170 Mbit/s` gate, and security/review. A bounded two-ingress qualification
+  must pass before any long macOS run. Spec/plan/result:
+  `docs/tech/2026-08-18-knife16-path-diverse-resumable-upstream-architecture-spec.md`,
+  `docs/tech/2026-08-18-knife16-path-diverse-resumable-upstream-implementation-plan.md`,
+  and
+  `docs/tech/2026-08-18-knife15-m2-frequency-first-run-udp-loss-results.md`.
+
+### Historical Knife15 position
 
 - **Latest accepted position: first Tier-B run has not started.** Two
   exact-source `ce164e6` attempts passed start/smoke and failed closed before

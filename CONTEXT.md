@@ -12,6 +12,53 @@ _Avoid_: relay-server, gateway (when meaning the proxy box)
 How the client carries its tunnel to the **Upstream**. Today: **TUIC over QUIC** (the data plane — TCP relay streams plus a UDP datagram plane). A second transport, **VLESS over REALITY over TCP**, is the anti-censorship fallback for when QUIC is degraded or blocked.
 _Avoid_: protocol (overloaded), connection (a transport can span reconnects)
 
+**Resumable Upstream session**:
+The Knife16 enhanced-continuity session that survives replacement of one
+**Transport leg**. It owns authentication, monotonically increasing leg
+generation, application byte/packet acknowledgement, replay/dedup state, and
+flow lifecycle. It is distinct from a QUIC connection: multiple sequential or
+briefly overlapping legs may attach to one session without reopening Target
+TCP sockets.
+_Avoid_: QUIC session (the lifetime is above QUIC), retry (the same owned byte range is resumed), reconnect epoch (that is the older client connection generation)
+
+**Upstream session owner**:
+The one mini_vpn server-side process/lifecycle owner that holds a resumable
+session's Target sockets and authoritative TCP offsets/UDP sequence state.
+Independent L4 ingresses forward encrypted transport packets to it without
+terminating session authentication; they do not inherit or recreate its Target
+sockets. First-stage resumability covers Transport-leg loss, not owner-process
+loss.
+_Avoid_: Exit pool (there is one socket owner), active-active Target (a kernel TCP socket cannot be shared across owners), ingress server (ingress is only a path endpoint)
+
+**Transport leg**:
+One authenticated path from the client, through one independently admitted
+ingress/provider/ASN route, to the same **Upstream session owner**. Each leg has
+its own queue, worker, cancellation, and path evidence. Losing a leg does not
+close the session or its Target sockets.
+_Avoid_: connection pool slot (legs are replaceable paths for one session), Exit (the ingress need not own Target sockets)
+
+**TCP replay window**:
+For one resumable flow direction, the exact bounded byte interval
+`[peer_acked, next_sent)` retained by its owner until the peer publishes an
+application ACK. Transport/QUIC ACK does not release this ownership. Overflow
+backpressures TCP; it never drops or silently truncates bytes.
+_Avoid_: retry buffer (offset ownership and dedup make this continuation, not a new attempt), send queue (the window survives a leg change)
+
+**Application ACK**:
+A resumable-protocol acknowledgement of the next contiguous TCP byte accepted
+by the receiving data-plane boundary: Target socket on client-to-server, or
+smoltcp/D16 terminal ownership on server-to-client. It alone advances the
+**TCP replay window**; QUIC ACK proves only one Transport leg delivered an
+encrypted packet.
+_Avoid_: QUIC ACK, socket readability, transport progress
+
+**UDP delivery sequence**:
+The session-owner-assigned packet number for one UDP flow, used with bounded
+receiver feedback, deadlines, and dedup across Transport legs. It permits hot
+path switching and bounded transition duplication without turning real-time
+UDP into an unbounded reliable byte stream.
+_Avoid_: QUIC packet number (scope is the application flow), TCP offset (expired UDP packets may be dropped explicitly)
+
 **TUIC TCP pool path service**:
 The current send-side service estimate of one TUIC TCP pool slot, represented by that QUIC path's congestion window divided by its RTT. It is a point-in-time placement input for service-normalized admission when every admitted candidate is busy and known, and remains the equal-load tie-break inside the bounded fallback. It is not a bandwidth promise, a health verdict, or permission to change congestion-control constants. Unknown or idle evidence falls back to the pool's stable lease-aware ordering.
 _Avoid_: connection speed, bandwidth score, priority (the estimate is transient transport state, not a configured class of service)

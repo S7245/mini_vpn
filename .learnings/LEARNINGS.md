@@ -1,5 +1,30 @@
 # Learnings
 
+## 2026-08-18 - Paired packet boundaries must precede internal root-cause claims
+
+- A valid end-to-end loss percentage does not locate loss. Reconcile Target
+  application sequence, Exit ingress capture, Exit outer transport egress, and
+  client application receive counts before changing client or server code.
+- The first Tier-B failure had `447,313` Target packets at Exit, `436,189`
+  outer TUIC application-sized egress packets, and `433,553` receiver packets.
+  This proves the dominant loss is before observed outer egress and excludes
+  Mac TUN/D16/Endpoint as primary, but it does not identify the exact server
+  socket or QUIC-queue site.
+- A capture reporting zero kernel capture drops proves capture integrity, not
+  zero UDP socket overflow. Future server observers must record live socket
+  overflow, kernel UDP queue, application ingress/egress sequence, and
+  transport queue state together.
+- A bounded reliable-datagram queue can turn transport congestion into
+  upstream socket pressure when the packet copy loop is synchronous. Queue
+  capacity math belongs in architecture review even when each component is
+  individually bounded and correct.
+- Zero completed evidence epochs is not retry authority after a genuine
+  fail-closed quality gate fires. Separate ledger credit from the architecture
+  stop decision.
+
+Result:
+`docs/tech/2026-08-18-knife15-m2-frequency-first-run-udp-loss-results.md`.
+
 ## 2026-08-18 - New actions need an ownership-boundary integration checklist
 
 - A public action can pass parser, admission, evidence, schedule, and cleanup

@@ -1,7 +1,7 @@
 # Knife15 M2 Tiered Continuity And Resource Strategy Implementation Plan
 
-Status: **TASKS 1–5 COMPLETE; TASK 6 CANDIDATE 1 REJECTED BY FORMAL STRICT
-FAILURE, CANDIDATE 2 AWS CREATION NEXT; M3 REMAINS BLOCKED**
+Status: **TASKS 1–9 COMPLETE; TIER A EXHAUSTED; TIER B FAILED; KNIFE15
+CLOSED; M3 BLOCKED**
 
 > **For agentic workers:** use `diagnose` and `tdd` for each behavior change;
 > use `code-review` before requesting a long macOS run.
@@ -285,14 +285,19 @@ closure `5ca79d4` pass the complete script/replay review. Result:
 
 ### Task 9: Tier-B review, HITL run, and architecture stop
 
-**Status (2026-08-17):** detached-controller and runbook local gates PASS;
-environment admission and the first four-epoch run are next.
+**Status (2026-08-18): COMPLETE WITH GENUINE QUALITY FAILURE.** The first
+valid run completed eleven cycles and failed cycle 12 `udp-reverse` at
+`3.076146%` above the frozen `3%` limit. No epoch sealed. Paired evidence and
+cleanup passed. Per step 5, standard-TUIC resource/parameter work is closed
+and ADR-0015 plus the Knife16 architecture spec own the next stage. Result:
+`docs/tech/2026-08-18-knife15-m2-frequency-first-run-udp-loss-results.md`.
 
 **Files:**
 
 - Create: `scripts/knife15-m2-frequency-controller.sh`
 - Create: `docs/tech/2026-08-17-knife15-m2-frequency-macos-runbook.md`
-- Create after evidence: `docs/tech/2026-08-17-knife15-m2-frequency-results.md`
+- Create after evidence:
+  `docs/tech/2026-08-18-knife15-m2-frequency-first-run-udp-loss-results.md`
 
 **Steps:**
 

@@ -2,8 +2,14 @@
 
 Date: 2026-08-14
 
-Status: **ACCEPTED DIRECTION; RESOURCE-STAGE IMPLEMENTATION REQUIRED; FORMAL
-M2 AND M3 REMAIN BLOCKED**
+Status: **CLOSED — TIER A EXHAUSTED AND TIER B FAILED; M3 BLOCKED**
+
+Closure (2026-08-18): the first valid Tier-B run failed cycle 12
+`udp-reverse` at `3.076146%`, above the frozen `3%` limit. Per this document's
+architecture stop rule, standard single-path TUIC is exhausted. Do not repeat
+or tune it. ADR-0015 and the Knife16 path-diverse resumable-upstream spec now
+own the next stage. Result:
+`docs/tech/2026-08-18-knife15-m2-frequency-first-run-udp-loss-results.md`.
 
 Supersedes the market-client comparison decision in the 2026-08-14 market
 continuity calibration documents. Do not run the mature-client C0 trial.

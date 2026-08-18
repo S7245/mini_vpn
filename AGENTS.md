@@ -189,6 +189,40 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-18:
 
+- **Knife15 is closed by a genuine Tier-B quality failure; Knife16 is the
+  active architecture stage.** Exact-source `d5b8304` passed baseline,
+  direct/resource admission, start, smoke, and eleven complete cycles. Cycle
+  12 `udp-reverse` then lost `13,760 / 447,313` packets (`3.076146%`) above
+  the frozen `3%` ceiling. No six-hour epoch completed; zero epoch credit does
+  not grant retry authority. Mac/Exit bundle SHA-256 values are
+  `c96b342d.../567409b7...`; completion email and Mac/Exit/TUN/route/
+  caffeinate/IPv6 cleanup passed. M3 remains blocked.
+- Exact paired accounting observed all `447,313` Target packets at the Exit,
+  only `436,189` corresponding outer TUIC datagrams leaving it, and `433,553`
+  packets at the Mac receiver. Thus `11,124` packets (`2.486849%`) were lost
+  after Exit Target capture but before observed outer TUIC egress; another
+  `2,636` (`0.589297%`) were lost afterward. Exit capture had zero kernel
+  capture drops; Mac UDP drop/backpressure, Endpoint would-block, and
+  interface errors were zero. Existing evidence selects the Exit UDP socket /
+  sing-box / QUIC-datagram handoff under backpressure as the dominant boundary
+  but does not identify an exact internal drop site because live socket
+  overflow and server QUIC-queue counters were absent.
+- Do not rerun Tier B, relax the SLI, add an equivalent VPS, tune D16/Endpoint/
+  MTU/pool/QUIC/Cubic/GSO, or switch to all-stream UDP. ADR-0015 now selects a
+  server-owned resumable session reachable through two independent ingress
+  paths. Standard TUIC remains a compatibility profile. The next work is the
+  Knife16 implementation plan: protocol/ownership TDD, deep `OwnedUpstream`
+  seam, deterministic two-leg blackout tests, bounded UDP path switching,
+  single-owner server, local `>170 Mbit/s` gate, then bounded two-ingress
+  qualification before any long macOS run. Results/spec/plan:
+  `docs/tech/2026-08-18-knife15-m2-frequency-first-run-udp-loss-results.md`,
+  `docs/tech/2026-08-18-knife16-path-diverse-resumable-upstream-architecture-spec.md`,
+  and
+  `docs/tech/2026-08-18-knife16-path-diverse-resumable-upstream-implementation-plan.md`.
+
+- **Historical superseded status:** the first Tier-B epoch had not started.
+  Two exact-source `ce164e6` attempts passed start/smoke and failed closed
+  before schedule entry. Their control repairs were completed by `d5b8304`.
 - The first Tier-B epoch has not started. Two exact-source `ce164e6`
   attempts passed start/smoke and failed closed before schedule entry. Attempt
   1 Mac/Exit SHA-256 `18dd409b.../72c7fec7...` exposed a stale destroyed-ECS
