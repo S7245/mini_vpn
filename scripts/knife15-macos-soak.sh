@@ -228,9 +228,9 @@ For a longitudinal diagnostic instead of formal acceptance, replace step 13
 with:
   sudo -E bash scripts/knife15-macos-soak.sh m1-diagnostic
 
-Never run m0, m1, m1-diagnostic, m2-qualification, and m2 in one TUN run. Both M1 actions have a
-28,800-second traffic/drain budget and normally take slightly more than eight
-wall hours.
+Never run m0, m1, m1-diagnostic, m2-qualification, m2, and m2-frequency in
+one TUN run. Both M1 actions have a 28,800-second traffic/drain budget and
+normally take slightly more than eight wall hours.
 Use m1-diagnostic only when a complete longitudinal artifact is required:
 data-quality violations are recorded and continued, safety failures still
 stop immediately, and the result can never satisfy formal M1 acceptance.
@@ -700,7 +700,7 @@ m2_prevent_idle_sleep_is_asserted() {
 
 knife15_action_requires_prevent_idle_sleep() {
   case "${1:-}" in
-    baseline|direct-discriminator|start|m2|m2-qualification) return 0 ;;
+    baseline|direct-discriminator|start|m2|m2-qualification|m2-frequency) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -1316,6 +1316,7 @@ workload_command_matches() {
     "$command_text" == *"knife15-macos-soak.sh m1" || \
     "$command_text" == *"knife15-macos-soak.sh m1-diagnostic" || \
     "$command_text" == *"knife15-macos-soak.sh m2-qualification" || \
+    "$command_text" == *"knife15-macos-soak.sh m2-frequency" || \
     "$command_text" == *"knife15-macos-soak.sh m2" ]]
 }
 
@@ -3768,7 +3769,8 @@ EOF_NETWORK_SERVICES
     '   PreventUserIdleSystemSleep     0' | \
     m2_prevent_idle_sleep_is_asserted_from_text || \
     die "self-test: inactive M2 idle-sleep assertion was accepted"
-  for result_label in baseline direct-discriminator start m2 m2-qualification; do
+  for result_label in baseline direct-discriminator start m2 m2-qualification \
+    m2-frequency; do
     knife15_action_requires_prevent_idle_sleep "$result_label" || \
       die "self-test: $result_label omitted the idle-sleep gate"
   done
@@ -4219,6 +4221,10 @@ EOF_M2_FAKE_CURL
     die "self-test: M2 qualification workload command rejected"
   workload_command_matches 'bash scripts/knife15-macos-soak.sh m2' || \
     die "self-test: M2 workload command rejected"
+  workload_command_matches 'bash scripts/knife15-macos-soak.sh m2-frequency' || \
+    die "self-test: M2 frequency workload command rejected"
+  ! workload_command_matches 'bash scripts/knife15-macos-soak.sh m2-frequency-replay' || \
+    die "self-test: non-exact M2 frequency workload command accepted"
   ! workload_command_matches 'bash scripts/knife15-macos-soak.sh smoke' || \
     die "self-test: non-M0 workload command accepted"
 
@@ -6212,6 +6218,8 @@ EOF_FAKE_EXIT_OBSERVER
     die "self-test: public direct continuity action missing from help"
   grep -Fq 'scripts/knife15-macos-soak.sh m2-qualification' <<<"$usage_text" || \
     die "self-test: public M2 qualification action missing from help"
+  grep -Fq 'scripts/knife15-macos-soak.sh m2-frequency' <<<"$usage_text" || \
+    die "self-test: public M2 frequency action missing from help"
   grep -Fq 'scripts/knife15-macos-soak.sh baseline-check' <<<"$usage_text" || \
     die "self-test: public baseline evidence replay action missing from help"
   grep -Fq 'scripts/knife15-macos-soak.sh m0' <<<"$usage_text" || \
@@ -8257,7 +8265,9 @@ run_m0_action() {
     ! -e "$run_dir/m1-workload.txt" && ! -e "$run_dir/m1" && \
     ! -e "$run_dir/m2.status" && ! -e "$run_dir/m2-workload.txt" && \
     ! -e "$run_dir/m2" && ! -e "$run_dir/m2-qualification.status" && \
-    ! -e "$run_dir/m2-qualification" ]] || \
+    ! -e "$run_dir/m2-qualification" && \
+    ! -e "$run_dir/m2-frequency.status" && \
+    ! -e "$run_dir/m2-frequency" ]] || \
     die "this TUN run already has soak evidence; stop and start a fresh run"
   validate_baseline_dir_path "$M0_BASELINE_DIR" || \
     die "M0_BASELINE_DIR must be the simple /tmp baseline directory printed by baseline"
@@ -8482,7 +8492,9 @@ run_m1_action() {
     ! -e "$run_dir/m1-workload.txt" && ! -e "$run_dir/m1" && \
     ! -e "$run_dir/m2.status" && ! -e "$run_dir/m2-workload.txt" && \
     ! -e "$run_dir/m2" && ! -e "$run_dir/m2-qualification.status" && \
-    ! -e "$run_dir/m2-qualification" ]] || \
+    ! -e "$run_dir/m2-qualification" && \
+    ! -e "$run_dir/m2-frequency.status" && \
+    ! -e "$run_dir/m2-frequency" ]] || \
     die "this TUN run already has soak evidence; stop and start a fresh run"
   [[ -z "$M0_BASELINE_DIR" && -z "$M0_DIRECT_DIR" ]] || \
     die "$action_description requires M0_BASELINE_DIR and M0_DIRECT_DIR to be unset"

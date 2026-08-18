@@ -187,7 +187,27 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-08-17:
+Current Knife15 summary, as of 2026-08-18:
+
+- The first Tier-B epoch has not started. Two exact-source `ce164e6`
+  attempts passed start/smoke and failed closed before schedule entry. Attempt
+  1 Mac/Exit SHA-256 `18dd409b.../72c7fec7...` exposed a stale destroyed-ECS
+  key in root's `known_hosts`; the accepted replacement ED25519 fingerprint
+  was independently reverified and exact root SSH now passes. Attempt 2
+  Mac/Exit SHA-256 `dc5c83cd.../b066908a...` exposed `m2-frequency` missing
+  from the workload PID command allowlist, so identity registration was
+  deterministically impossible. Both attempts sent notice and completed
+  Mac/Exit/TUN/route/caffeinate/IPv6 cleanup; they consume no epoch or ledger
+  sequence.
+- Local TDD now admits only the exact frequency workload command, includes it
+  in sleep and same-TUN isolation policy, and makes the detached controller
+  validate the exact root observer identity before workload launch. All
+  related runner/controller/frequency/ledger/resource/observer gates pass;
+  review has no unresolved P0/P1. No Rust, workload, SLI, server, network, or
+  frozen value changed. Next: commit/push, sync/build a new exact HK source,
+  take a new baseline plus fresh direct/resource evidence, and start the first
+  four-epoch run. Result:
+  `docs/tech/2026-08-18-knife15-m2-frequency-preaction-control-failures-local-results.md`.
 
 - The original Alibaba US candidate-1 ECS was destroyed after Tier A was
   sealed and before any Tier-B epoch began. The retained EIP

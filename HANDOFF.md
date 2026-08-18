@@ -2,7 +2,27 @@
 
 给后续 **逐刀接力的新 session**。每刀单独开 session（省 token），按本文件冷启动。
 
-## Next Planned Stage — Knife15 M2 Tiered Resource Continuity (2026-08-17)
+## Next Planned Stage — Knife15 M2 Tiered Resource Continuity (2026-08-18)
+
+- **Latest accepted position: first Tier-B run has not started.** Two
+  exact-source `ce164e6` attempts passed start/smoke and failed closed before
+  the first epoch. Attempt 1 Mac/Exit SHA-256
+  `18dd409b.../72c7fec7...` exposed the destroyed ECS key still present in
+  root's `known_hosts`; the out-of-band replacement ED25519 fingerprint was
+  reverified and exact root SSH now passes. Attempt 2 Mac/Exit SHA-256
+  `dc5c83cd.../b066908a...` exposed `m2-frequency` missing from the workload
+  PID command allowlist, making identity registration deterministically
+  impossible. Both attempts sent the completion notice and cleaned TUN,
+  routes, observer, caffeinate, and IPv6. They consume no epoch or ledger
+  sequence.
+- Local TDD now admits only the exact `m2-frequency` workload command and
+  rejects suffixed variants, includes frequency in sleep and same-TUN
+  isolation policies, and makes the detached controller validate the exact
+  root observer identity before workload launch. Runner/controller and all
+  related script/reducer/ledger/resource/observer gates pass; review has no
+  unresolved P0/P1. No Rust, workload, SLI, network, or frozen value changed.
+  Result:
+  `docs/tech/2026-08-18-knife15-m2-frequency-preaction-control-failures-local-results.md`.
 
 - **Current resource transaction:** the original Alibaba US candidate-1 ECS
   was destroyed after Tier A was sealed and before any Tier-B epoch started.
@@ -65,10 +85,10 @@
   Endpoint `240.511 Mbit/s`, D16 batch, and full-TUN gates pass. Concentrated
   review has no unresolved P0/P1. Result:
   `docs/tech/2026-08-17-knife15-m2-frequency-controller-local-results.md`.
-- **Only next step:** finish review/gates for the replacement-identity closure,
-  commit/push and sync/build the HK Mac, take fresh baseline/direct/resource
-  evidence, then start the first four-epoch/24-hour run. M3 remains blocked
-  until twelve valid epochs pass the immutable ledger.
+- **Only next step:** commit/push this control-plane repair, sync/build the HK
+  Mac at the new exact source, rerun script gates, take a new baseline plus
+  fresh direct/resource evidence, then start the first four-epoch/24-hour run.
+  M3 remains blocked until twelve valid epochs pass the immutable ledger.
 - Preserve the user-requested once-only completion notice in every detached
   long-run controller: after M2/m2-frequency returns on success or failure,
   run `printf "Subject: 执行结束~" | msmtp 870941563@qq.com`. It is

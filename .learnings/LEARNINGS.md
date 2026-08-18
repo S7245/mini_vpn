@@ -1,5 +1,27 @@
 # Learnings
 
+## 2026-08-18 - New actions need an ownership-boundary integration checklist
+
+- A public action can pass parser, admission, evidence, schedule, and cleanup
+  tests yet still be impossible to run if a PID-command allowlist is updated
+  separately. Every new long-running action must be checked at action switch,
+  exact command identity, interruption, child tracking, same-TUN exclusion,
+  sleep ownership, status/summary, and cleanup boundaries.
+- Test the real process identity string, including exact suffix rejection.
+  Schedule fixtures alone cannot prove that `register_m0_workload()` will
+  accept the production shell command.
+- A preflight performed as the login user does not prove the same SSH trust
+  state under `sudo`. When a root runner will re-enter an observer or remote
+  service, the detached owner should exercise that exact root/HOME/known-hosts
+  path before creating the long workload PID.
+- Failures before the first epoch remain useful control evidence but are not
+  quality samples. Preserve paired bundles, prove cleanup, repair the control
+  seam locally, advance exact source before the first valid epoch, and take a
+  new source-bound baseline/direct/resource transaction.
+
+Result:
+`docs/tech/2026-08-18-knife15-m2-frequency-preaction-control-failures-local-results.md`.
+
 ## 2026-08-17 - Large remote artifacts need process ownership plus inner-content hashes
 
 - A long `ssh`/`scp` call is not complete merely because the orchestration

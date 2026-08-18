@@ -1,10 +1,36 @@
 # TODO
 
-## Current Knife15 Plan (2026-08-17)
+## Current Knife15 Plan (2026-08-18)
 
 ### Tiered resource continuity before an established-stream architecture decision
 
-#### Latest decision (2026-08-17 — Tier A exhausted; replacement Exit admission PASS; fresh evidence next)
+#### Latest decision (2026-08-18 — two pre-action failures repaired locally; fresh source/evidence next)
+
+The first Tier-B epoch has not started. Two exact-source `ce164e6` attempts
+passed baseline/direct/resource/start/smoke but failed closed before schedule
+entry. The first found the destroyed predecessor ECS key in root's
+`known_hosts`; the accepted replacement ED25519 fingerprint was independently
+reverified and root strict SSH now passes. The second found the exact
+`m2-frequency` command missing from `workload_command_matches()`, so PID
+identity registration could never succeed. Mac/Exit artifact SHA-256 pairs
+are `18dd409b.../72c7fec7...` and `dc5c83cd.../b066908a...`; both attempts
+completed notice, status/snapshot/stop, observer finalization, route/TUN,
+caffeinate, and IPv6 cleanup. They consume no epoch or ledger sequence.
+
+Local TDD admits the exact frequency command and rejects suffix drift. The
+adjacent sleep-inhibitor and M0/M1 same-TUN policies now include frequency.
+The detached controller validates one active/healthy observer report through
+the exact root SSH identity before starting workload; transport failure and
+inactive success reports both stop before workload. Complete runner,
+controller, frequency, ledger, resource, and process-visible observer
+self-tests plus syntax/diff/secret/review pass with no unresolved P0/P1. No
+Rust, workload, SLI, server, network, or frozen value changed. Next:
+commit/push, sync/build the HK Mac at the new exact source, rerun script gates,
+take a new baseline and fresh direct/resource evidence, then launch the first
+four-epoch run. Result:
+`docs/tech/2026-08-18-knife15-m2-frequency-preaction-control-failures-local-results.md`.
+
+#### Superseded decision (2026-08-17 — Tier A exhausted; replacement Exit admission PASS; fresh evidence next)
 
 The original Alibaba US candidate-1 ECS was destroyed after Tier A was sealed
 and before any Tier-B epoch began. Its retained EIP `47.89.211.4` /

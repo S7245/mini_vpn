@@ -2,8 +2,8 @@
 
 Date: 2026-08-17
 
-Status: **LOCAL GATES AND REPLACEMENT EXIT ADMISSION PASS; FIRST FOUR-EPOCH
-RUN NOT STARTED**
+Status: **PRE-ACTION CONTROL REPAIRS PASS LOCALLY; FIRST FOUR-EPOCH RUN NOT
+STARTED**
 
 This is the only active Tier-B procedure. It does not reopen Tier A, add a
 third candidate, tune a frozen value, or change mini_vpn production code. The
@@ -142,7 +142,8 @@ For every run:
    capacity, observer absence, and the exact security-group contract: only
    TCP 22 and UDP 8443 from HK `119.13.90.246/32`, with no public 443 or other
    SSH source; prove `aegis.service` disabled/inactive and no `AliSecGuard`
-   module after reboot;
+   module after reboot; prove the same accepted host key through the root
+   identity used by the sudo runner, not only the login user;
 2. prove the Mac has no other VPN/TUN, stays on power and one physical network,
    and has an active bounded `caffeinate -dimsu` owner;
 3. safely record and disable physical IPv6 exactly as section 2 of the strict
@@ -208,6 +209,9 @@ controller exits and evidence is synchronized.
 
 The versioned controller:
 
+- validates exactly one active/healthy observer report through the same
+  `sudo -n -E` root SSH identity used by `m2-frequency` before creating the
+  workload PID;
 - executes only `m2-frequency`;
 - maintains the same-TTY sudo ticket every 45 seconds while the root workload
   owns the 24-hour run;

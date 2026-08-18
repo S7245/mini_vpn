@@ -1,5 +1,32 @@
 # Errors
 
+## 2026-08-18 - Two Tier-B attempts failed before the first epoch
+
+- Attempt 1 started an observer successfully as `xiaoou`, but the root runner
+  rejected it because `/var/root/.ssh/known_hosts` retained the destroyed ECS
+  ECDSA key. The accepted replacement ED25519 fingerprint was independently
+  reverified, the single host entry was replaced with a backup, and exact root
+  strict SSH passed. Future behavior: validate observer status through the
+  exact root identity before controller workload launch.
+- Attempt 2 passed resource and root observer admission, then
+  `register_m0_workload()` rejected its own process. The new public
+  `m2-frequency` action was missing from `workload_command_matches()` and its
+  self-test allowlist. A focused RED reproduced that exact error. Future
+  behavior: apply the ownership-boundary integration checklist to every new
+  action and test both the accepted exact command and a rejected suffix.
+- Both controllers sent the requested email and completed status/snapshot/
+  stop, observer finalization, TUN/route, caffeinate, and IPv6 cleanup. No
+  epoch began, so neither artifact changes the Tier-B ledger or candidate
+  quality decision.
+- One resource preflight between direct and start also failed a transient TUIC
+  authentication handshake. Exit stayed active/zero-restart and logged auth
+  timeouts; an exact immediately instrumented probe passed in `1002ms` with
+  `23 packets / 11,732B`, and one complete fresh preflight then passed. Treat
+  this as bounded pre-start path evidence, not a parameter or code defect.
+
+Result:
+`docs/tech/2026-08-18-knife15-m2-frequency-preaction-control-failures-local-results.md`.
+
 ## 2026-08-17 - Replacement Exit transfer and cloud-control claims failed closed
 
 - The first Tokyo-to-US tar stream ended after about 30 seconds and installed

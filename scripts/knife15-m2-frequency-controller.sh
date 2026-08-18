@@ -119,6 +119,17 @@ run_sudo_keepalive() {
   done
 }
 
+root_observer_is_active() {
+  local output
+  if ! output="$("$SUDO_BIN" -n -E bash "$OBSERVER" status 2>&1)"; then
+    printf '%s\n' "$output" >&2
+    return 1
+  fi
+  printf '%s\n' "$output"
+  [[ "$(grep -Fxc 'status=active' <<<"$output" || true)" == 1 && \
+    "$(grep -Fxc 'observer_healthy=1' <<<"$output" || true)" == 1 ]]
+}
+
 controller_exit() {
   local original_rc="$?" final_rc
   trap - EXIT
@@ -166,6 +177,10 @@ controller_main() {
   fi
   "$SUDO_BIN" -n -v || {
     echo "ERROR: detached controller requires a live noninteractive sudo ticket" >&2
+    return 1
+  }
+  root_observer_is_active || {
+    echo "ERROR: detached controller requires an active observer under the exact root SSH identity" >&2
     return 1
   }
 
@@ -216,6 +231,21 @@ if [[ "${1:-}" == "-n" && "${2:-}" == "-v" ]]; then
   exit "${KNIFE15_TEST_SUDO_TICKET_RC:-0}"
 fi
 action="${@: -1}"
+target="${@: -2:1}"
+if [[ "$action" == status && "$target" == */observer.sh ]]; then
+  printf 'sudo:root-observer-status\n' >>"$KNIFE15_TEST_EVENTS"
+  if [[ "${KNIFE15_TEST_ROOT_OBSERVER_STATUS_RC:-0}" != 0 ]]; then
+    printf '%s\n' 'ERROR: root observer transport failed'
+    exit "$KNIFE15_TEST_ROOT_OBSERVER_STATUS_RC"
+  fi
+  case "${KNIFE15_TEST_ROOT_OBSERVER_STATE:-active}" in
+    active) printf '%s\n' 'status=active' 'observer_healthy=1' ;;
+    inactive) printf '%s\n' 'status=inactive' 'observer_healthy=1' ;;
+    malformed) printf '%s\n' 'status=active' 'status=active' 'observer_healthy=1' ;;
+    *) exit 64 ;;
+  esac
+  exit 0
+fi
 printf 'sudo:%s\n' "$action" >>"$KNIFE15_TEST_EVENTS"
 if [[ "$action" == m2-frequency ]]; then
   exit "${KNIFE15_TEST_WORKLOAD_RC:-0}"
@@ -273,6 +303,7 @@ EOF_FAKE_OBSERVER
     return 1
   }
   diff -u - "$events" <<'EOF_EXPECTED_FAILURE'
+sudo:root-observer-status
 sudo:m2-frequency
 notify:870941563@qq.com:Subject: 执行结束~
 sudo:status
@@ -320,6 +351,46 @@ observer:freeze
 observer:bundle
 notify:870941563@qq.com:Subject: 执行结束~
 EOF_EXPECTED_EARLY_FAILURE
+
+  : >"$events"
+  if KNIFE15_FREQUENCY_CONTROLLER_TEST_ONLY=1 \
+    KNIFE15_FREQUENCY_RUNNER="$fake_runner" \
+    KNIFE15_FREQUENCY_OBSERVER="$fake_observer" \
+    KNIFE15_FREQUENCY_SUDO_BIN="$fake_sudo" \
+    KNIFE15_FREQUENCY_MSMTP_BIN="$fake_msmtp" \
+    KNIFE15_TEST_EVENTS="$events" KNIFE15_TEST_WORKLOAD_RC=0 \
+    KNIFE15_TEST_ROOT_OBSERVER_STATUS_RC=9 \
+    KNIFE15_TEST_OBSERVER_STATE=active \
+    bash "$SCRIPT_PATH" __test-run >"$output" 2>&1; then
+    echo "ERROR: self-test started with an unproved root observer identity" >&2
+    return 1
+  fi
+  ! grep -Fxq 'sudo:m2-frequency' "$events" || {
+    echo "ERROR: self-test launched workload before root observer admission" >&2
+    return 1
+  }
+  grep -Fxq 'sudo:root-observer-status' "$events" || {
+    echo "ERROR: self-test did not exercise root observer admission" >&2
+    return 1
+  }
+
+  : >"$events"
+  if KNIFE15_FREQUENCY_CONTROLLER_TEST_ONLY=1 \
+    KNIFE15_FREQUENCY_RUNNER="$fake_runner" \
+    KNIFE15_FREQUENCY_OBSERVER="$fake_observer" \
+    KNIFE15_FREQUENCY_SUDO_BIN="$fake_sudo" \
+    KNIFE15_FREQUENCY_MSMTP_BIN="$fake_msmtp" \
+    KNIFE15_TEST_EVENTS="$events" KNIFE15_TEST_WORKLOAD_RC=0 \
+    KNIFE15_TEST_ROOT_OBSERVER_STATE=inactive \
+    KNIFE15_TEST_OBSERVER_STATE=active \
+    bash "$SCRIPT_PATH" __test-run >"$output" 2>&1; then
+    echo "ERROR: self-test accepted an inactive root observer report" >&2
+    return 1
+  fi
+  ! grep -Fxq 'sudo:m2-frequency' "$events" || {
+    echo "ERROR: self-test launched workload after inactive root observer report" >&2
+    return 1
+  }
 
   : >"$events"
   if KNIFE15_FREQUENCY_CONTROLLER_TEST_ONLY=1 \
