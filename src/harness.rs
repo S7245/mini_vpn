@@ -3317,4 +3317,782 @@ mod tests {
         assert_eq!(budget.snapshot().total_bytes(), 0);
         assert!(budget.snapshot().high_water_bytes <= 4 * FLOW_BYTES);
     }
+
+    mod knife16_resumable_adapter {
+        use super::*;
+        use crate::client_tun::{TCP_SOCKET_BUFFER_SIZE, run_owned_event_loop};
+        use crate::owned_upstream::{
+            DriverInput, FlowPortConfig, FlowPortProbe, OpenedOwnedTcp, OwnedUpstream,
+            ResumableTcpDriver, ResumableTcpPortFactory, TcpOwnershipMode, UdpDownlinkSource,
+            UdpUplink,
+        };
+        use crate::resumable::{
+            AttachAlpn, AttachAuthority, AttachCredentials, AttachNonce, AttachPolicy,
+            AttachRequest, AttachTransportBinding, ByteOffset, CommittedLeg, DevicePrincipal,
+            DeviceSecret, Direction, FeatureOffer, FlowFinishReason, Frame, LegGeneration,
+            LocalFlow, MAX_DATA_PAYLOAD_BYTES, OpenResultCode, OwnerIdentity, ReceiveBudgetLimits,
+            Record, ReplayAcknowledged, ReplayBudgetLimits, ReplayStored, ResumeSecret,
+            SESSION_PROTOCOL_VERSION, SessionConfig, SessionEffect, SessionEvent, SessionId,
+            SessionModel, SessionRole, TcpWindowLimits, TlsExporterBinding, VersionRange,
+        };
+        const PORT_BYTES: usize = TCP_SOCKET_BUFFER_SIZE;
+        const SUFFIX_BYTES: usize = 97;
+
+        #[derive(Default)]
+        struct ResumableTrace {
+            probe: Mutex<Option<FlowPortProbe>>,
+            data_lengths: Mutex<Vec<usize>>,
+            sink_offers: Mutex<Vec<usize>>,
+            sink_acceptances: Mutex<Vec<usize>>,
+            local_close_seen: AtomicBool,
+            local_close_events: AtomicU64,
+            sink_half_closed_seen: AtomicBool,
+            sink_half_closed_events: AtomicU64,
+            graceful_terminal_seen: AtomicBool,
+            graceful_terminal_events: AtomicU64,
+            errors: Mutex<Vec<String>>,
+        }
+
+        impl ResumableTrace {
+            fn fail(&self, error: impl Into<String>) {
+                self.errors.lock().unwrap().push(error.into());
+            }
+
+            fn probe(&self) -> Option<FlowPortProbe> {
+                self.probe.lock().unwrap().clone()
+            }
+        }
+
+        struct FakeResumableUpstream {
+            open_gate: OpenStallControl,
+            driver_gate: OpenStallControl,
+            first_ack_gate: OpenStallControl,
+            trace: Arc<ResumableTrace>,
+            opens: AtomicU64,
+            port_factory: ResumableTcpPortFactory,
+            tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+        }
+
+        impl FakeResumableUpstream {
+            fn new(
+                open_gate: OpenStallControl,
+                driver_gate: OpenStallControl,
+                first_ack_gate: OpenStallControl,
+                trace: Arc<ResumableTrace>,
+            ) -> Self {
+                Self {
+                    open_gate,
+                    driver_gate,
+                    first_ack_gate,
+                    trace,
+                    opens: AtomicU64::new(0),
+                    port_factory: ResumableTcpPortFactory::new(
+                        FlowPortConfig::new(PORT_BYTES, 1, 8, 4).unwrap(),
+                        PORT_BYTES,
+                    )
+                    .unwrap(),
+                    tasks: Mutex::new(Vec::new()),
+                }
+            }
+
+            fn stop_tasks(&self) {
+                for task in self.tasks.lock().unwrap().drain(..) {
+                    task.abort();
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl OwnedUpstream for FakeResumableUpstream {
+            async fn open_tcp_flow(
+                &self,
+                target: &TargetAddr,
+            ) -> Result<OpenedOwnedTcp, ClientError> {
+                self.opens.fetch_add(1, Ordering::Relaxed);
+                self.open_gate.mark_waiting();
+                self.open_gate.wait_released().await;
+
+                let (model, leg, flow) = open_client_model(target.clone()).map_err(|error| {
+                    ClientError::Io(std::io::Error::other(format!(
+                        "fake resumable open failed: {error}"
+                    )))
+                })?;
+                let (port, driver) = self.port_factory.open_flow(flow);
+                *self.trace.probe.lock().unwrap() = Some(port.probe());
+
+                let trace = Arc::clone(&self.trace);
+                let driver_gate = self.driver_gate.clone();
+                let first_ack_gate = self.first_ack_gate.clone();
+                let task = tokio::spawn(async move {
+                    driver_gate.mark_waiting();
+                    driver_gate.wait_released().await;
+                    if let Err(error) =
+                        run_fake_resumable_driver(driver, model, leg, first_ack_gate, &trace).await
+                    {
+                        trace.fail(error);
+                    }
+                });
+                self.tasks.lock().unwrap().push(task);
+                Ok(OpenedOwnedTcp::Resumable(port))
+            }
+
+            async fn send_udp(&self, _uplink: UdpUplink<'_>) {}
+
+            fn tcp_ownership_mode(&self) -> TcpOwnershipMode {
+                TcpOwnershipMode::Resumable
+            }
+
+            fn open_is_cheap(&self) -> bool {
+                false
+            }
+        }
+
+        fn attach_credentials() -> AttachCredentials {
+            AttachCredentials::new(
+                DeviceSecret::new([0x31; 32]).unwrap(),
+                ResumeSecret::new([0x53; 32]).unwrap(),
+            )
+            .unwrap()
+        }
+
+        fn committed_leg() -> CommittedLeg {
+            let session_id = SessionId::new([0x16; 16]).unwrap();
+            let owner = OwnerIdentity::new([0x21; 32]).unwrap();
+            let principal = DevicePrincipal::new([0x34; 16]).unwrap();
+            let alpn = AttachAlpn::new(b"mini-vpn-owned/1").unwrap();
+            let binding = AttachTransportBinding::new(
+                owner,
+                alpn,
+                TlsExporterBinding::new([0x55; 32]).unwrap(),
+                principal,
+            );
+            let policy =
+                AttachPolicy::new(owner, alpn, principal, SESSION_PROTOCOL_VERSION, 0b1111)
+                    .unwrap();
+            let authority = AttachAuthority::new(
+                session_id,
+                LegGeneration::new(1).unwrap(),
+                attach_credentials(),
+                policy,
+            );
+            let request = AttachRequest::new(
+                session_id,
+                LegGeneration::new(2).unwrap(),
+                AttachNonce::new([0x62; 16]).unwrap(),
+                VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+                FeatureOffer::new(0b0111, 0b0001).unwrap(),
+            );
+            let proof = attach_credentials().prove(&request, &binding).unwrap();
+            authority
+                .verify_and_commit(&request, &binding, &proof)
+                .unwrap()
+        }
+
+        fn session_config() -> SessionConfig {
+            SessionConfig::new(
+                2,
+                8,
+                TcpWindowLimits::new(PORT_BYTES, 8).unwrap(),
+                TcpWindowLimits::new(PORT_BYTES, 8).unwrap(),
+                ReplayBudgetLimits::new(PORT_BYTES, 8).unwrap(),
+                ReplayBudgetLimits::new(PORT_BYTES, 8).unwrap(),
+                ReceiveBudgetLimits::new(PORT_BYTES * 2, 16).unwrap(),
+                MAX_DATA_PAYLOAD_BYTES,
+            )
+            .unwrap()
+        }
+
+        fn open_client_model(
+            target: TargetAddr,
+        ) -> Result<(SessionModel, CommittedLeg, LocalFlow), String> {
+            let leg = committed_leg();
+            let mut model = SessionModel::new(SessionRole::Client, session_config(), leg);
+            let effects = model
+                .reduce(SessionEvent::LocalOpen { leg, target })
+                .map_err(|error| error.to_string())?;
+            let flow = effects
+                .into_iter()
+                .find_map(|effect| match effect {
+                    SessionEffect::LocalFlowOpened { flow } => Some(flow),
+                    _ => None,
+                })
+                .ok_or_else(|| "LocalOpen emitted no LocalFlowOpened authority".to_string())?;
+            let frame = Frame::try_new(
+                leg.generation(),
+                Record::OpenResult {
+                    flow_id: flow.flow_id(),
+                    result: OpenResultCode::Opened,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            model
+                .reduce(SessionEvent::PeerFrame { leg, frame })
+                .map_err(|error| error.to_string())?;
+            Ok((model, leg, flow))
+        }
+
+        fn take_replay_stored(effects: &mut Vec<SessionEffect>) -> Result<ReplayStored, String> {
+            let index = effects
+                .iter()
+                .position(|effect| matches!(effect, SessionEffect::ReplayStored { .. }))
+                .ok_or_else(|| "LocalData emitted no ReplayStored authority".to_string())?;
+            match effects.remove(index) {
+                SessionEffect::ReplayStored { receipt } => Ok(receipt),
+                _ => unreachable!("located exact ReplayStored variant"),
+            }
+        }
+
+        fn take_replay_acknowledged(
+            effects: &mut Vec<SessionEffect>,
+        ) -> Result<ReplayAcknowledged, String> {
+            let index = effects
+                .iter()
+                .position(|effect| matches!(effect, SessionEffect::ReplayAcknowledged { .. }))
+                .ok_or_else(|| {
+                    "accepted ACK emitted no ReplayAcknowledged authority".to_string()
+                })?;
+            match effects.remove(index) {
+                SessionEffect::ReplayAcknowledged { receipt } => Ok(receipt),
+                _ => unreachable!("located exact ReplayAcknowledged variant"),
+            }
+        }
+
+        fn peer_frame(leg: CommittedLeg, record: Record) -> Result<SessionEvent, String> {
+            let frame = Frame::try_new(leg.generation(), record)
+                .map_err(|error| format!("invalid fake peer frame: {error}"))?;
+            Ok(SessionEvent::PeerFrame { leg, frame })
+        }
+
+        fn dispatch_effects(
+            driver: &mut ResumableTcpDriver,
+            effects: Vec<SessionEffect>,
+            trace: &ResumableTrace,
+        ) -> Result<(), String> {
+            for effect in effects {
+                match effect {
+                    SessionEffect::OfferToSink { offer, segments } => {
+                        trace.sink_offers.lock().unwrap().push(offer.len());
+                        driver
+                            .try_deliver_sink(offer, segments)
+                            .map_err(|error| format!("sink delivery failed: {error}"))?;
+                    }
+                    SessionEffect::HalfCloseSink { completion } => driver
+                        .try_deliver_half_close(completion)
+                        .map_err(|error| format!("half-close delivery failed: {error}"))?,
+                    SessionEffect::FlowFinished {
+                        reason: FlowFinishReason::Graceful,
+                        ..
+                    } => {
+                        driver
+                            .try_deliver_terminal_effect(&effect)
+                            .map_err(|error| format!("terminal delivery failed: {error}"))?;
+                        trace.graceful_terminal_seen.store(true, Ordering::Release);
+                        trace
+                            .graceful_terminal_events
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    SessionEffect::FlowFinished { .. } => {
+                        driver
+                            .try_deliver_terminal_effect(&effect)
+                            .map_err(|error| format!("terminal delivery failed: {error}"))?;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+
+        async fn handle_driver_data(
+            driver: &mut ResumableTcpDriver,
+            model: &mut SessionModel,
+            leg: CommittedLeg,
+            first_ack_gate: &OpenStallControl,
+            trace: &ResumableTrace,
+            data: crate::owned_upstream::UplinkData,
+            peer_offset: &mut ByteOffset,
+        ) -> Result<(), String> {
+            let payload = Bytes::copy_from_slice(data.payload());
+            let data_len = data.len();
+            let (event, mut ownership) = data.into_event_and_ownership();
+            let mut effects = model.reduce(event).map_err(|error| error.to_string())?;
+            let stored = take_replay_stored(&mut effects)?;
+            let mut replay = ownership
+                .bind_replay(stored)
+                .map_err(|error| format!("replay bind failed: {error}"))?;
+            dispatch_effects(driver, effects, trace)?;
+
+            let first = trace.data_lengths.lock().unwrap().is_empty();
+            trace.data_lengths.lock().unwrap().push(data_len);
+            if first {
+                first_ack_gate.mark_waiting();
+                first_ack_gate.wait_released().await;
+            }
+
+            let mut ack_effects = model
+                .reduce(peer_frame(
+                    leg,
+                    Record::Ack {
+                        flow_id: replay.flow_id(),
+                        direction: replay.direction(),
+                        next_accepted: replay.end(),
+                        final_accepted: false,
+                    },
+                )?)
+                .map_err(|error| error.to_string())?;
+            let acknowledged = take_replay_acknowledged(&mut ack_effects)?;
+            if !replay
+                .release_after_reducer_ack(&acknowledged)
+                .map_err(|error| format!("replay release failed: {error}"))?
+            {
+                return Err("complete reducer ACK retained the exact replay permit".into());
+            }
+            dispatch_effects(driver, ack_effects, trace)?;
+
+            let offset = *peer_offset;
+            *peer_offset = peer_offset
+                .checked_advance(payload.len())
+                .map_err(|error| error.to_string())?;
+            let echo_effects = model
+                .reduce(peer_frame(
+                    leg,
+                    Record::Data {
+                        flow_id: replay.flow_id(),
+                        direction: Direction::TargetToClient,
+                        offset,
+                        payload,
+                    },
+                )?)
+                .map_err(|error| error.to_string())?;
+            dispatch_effects(driver, echo_effects, trace)
+        }
+
+        fn handle_local_close(
+            driver: &mut ResumableTcpDriver,
+            model: &mut SessionModel,
+            leg: CommittedLeg,
+            flow: LocalFlow,
+            peer_offset: ByteOffset,
+            trace: &ResumableTrace,
+        ) -> Result<(), String> {
+            trace.local_close_seen.store(true, Ordering::Release);
+            trace.local_close_events.fetch_add(1, Ordering::Relaxed);
+            let effects = model
+                .reduce(SessionEvent::LocalClose { flow })
+                .map_err(|error| error.to_string())?;
+            dispatch_effects(driver, effects, trace)?;
+
+            let ack_effects = model
+                .reduce(peer_frame(
+                    leg,
+                    Record::Ack {
+                        flow_id: flow.flow_id(),
+                        direction: Direction::ClientToTarget,
+                        next_accepted: ByteOffset::new(
+                            trace.data_lengths.lock().unwrap().iter().sum::<usize>() as u64,
+                        ),
+                        final_accepted: true,
+                    },
+                )?)
+                .map_err(|error| error.to_string())?;
+            dispatch_effects(driver, ack_effects, trace)?;
+
+            let close_effects = model
+                .reduce(peer_frame(
+                    leg,
+                    Record::Close {
+                        flow_id: flow.flow_id(),
+                        direction: Direction::TargetToClient,
+                        final_offset: peer_offset,
+                    },
+                )?)
+                .map_err(|error| error.to_string())?;
+            dispatch_effects(driver, close_effects, trace)
+        }
+
+        async fn run_fake_resumable_driver(
+            mut driver: ResumableTcpDriver,
+            mut model: SessionModel,
+            leg: CommittedLeg,
+            first_ack_gate: OpenStallControl,
+            trace: &ResumableTrace,
+        ) -> Result<(), String> {
+            let flow = driver.local_flow();
+            let mut peer_offset = ByteOffset::new(0);
+            while let Some(input) = driver.recv_next().await {
+                match input {
+                    DriverInput::Data(data) => {
+                        handle_driver_data(
+                            &mut driver,
+                            &mut model,
+                            leg,
+                            &first_ack_gate,
+                            trace,
+                            data,
+                            &mut peer_offset,
+                        )
+                        .await?;
+                    }
+                    DriverInput::Control(event) => {
+                        match &event {
+                            SessionEvent::SinkAccepted { bytes, .. } => {
+                                trace.sink_acceptances.lock().unwrap().push(*bytes);
+                            }
+                            SessionEvent::SinkHalfClosed { .. } => {
+                                trace.sink_half_closed_seen.store(true, Ordering::Release);
+                                trace
+                                    .sink_half_closed_events
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            SessionEvent::SinkAbandoned { .. }
+                            | SessionEvent::SinkHalfCloseFailed { .. }
+                            | SessionEvent::LocalReset { .. } => {
+                                return Err(format!("unexpected happy-path control: {event:?}"));
+                            }
+                            _ => {}
+                        }
+                        if matches!(event, SessionEvent::LocalClose { .. }) {
+                            handle_local_close(
+                                &mut driver,
+                                &mut model,
+                                leg,
+                                flow,
+                                peer_offset,
+                                trace,
+                            )?;
+                        } else {
+                            let effects = model.reduce(event).map_err(|error| error.to_string())?;
+                            dispatch_effects(&mut driver, effects, trace)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn generator_iface(device: &mut GeneratorDevice) -> Interface {
+            let config = SmolConfig::new(smoltcp::wire::HardwareAddress::Ip);
+            let mut iface = Interface::new(config, device, SmolInstant::now());
+            iface.update_ip_addrs(|addresses| {
+                addresses
+                    .push(IpCidr::new(IpAddress::Ipv4(GEN_IP), 24))
+                    .unwrap();
+            });
+            iface.routes_mut().add_default_ipv4_route(GEN_IP).unwrap();
+            iface
+        }
+
+        #[tokio::test]
+        async fn tun_selects_resumable_and_preserves_exact_ownership_through_fin() {
+            let open_gate = OpenStallControl::new();
+            let driver_gate = OpenStallControl::new();
+            let first_ack_gate = OpenStallControl::new();
+            let trace = Arc::new(ResumableTrace::default());
+            let upstream = Arc::new(FakeResumableUpstream::new(
+                open_gate.clone(),
+                driver_gate.clone(),
+                first_ack_gate.clone(),
+                Arc::clone(&trace),
+            ));
+
+            let gen_to_sut = PacketLink::new();
+            let sut_to_gen = PacketLink::new();
+            let sut_device = LoopbackTunDevice::new(gen_to_sut.clone(), sut_to_gen.clone());
+            let (_udp_tx, udp_rx) = mpsc::channel(1);
+            let config = TunRuntimeConfig::from_sources(Some("1")).unwrap();
+            let metrics = Arc::new(Metrics::new());
+            let recorded = Arc::new(Mutex::new(Recorded::default()));
+            let sut = tokio::spawn(run_owned_event_loop(
+                sut_device,
+                Arc::clone(&upstream),
+                UdpDownlinkSource::owned(udp_rx),
+                config,
+                metrics,
+                RecordingSink::new(recorded),
+            ));
+
+            let mut gen_device = GeneratorDevice::new(sut_to_gen, gen_to_sut);
+            let mut gen_iface = generator_iface(&mut gen_device);
+            let payload: Vec<u8> = (0..PORT_BYTES + SUFFIX_BYTES)
+                .map(|index| (index as u8).wrapping_mul(17).wrapping_add(3))
+                .collect();
+            let buffer_bytes = payload.len() * 2;
+            let mut socket = tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0; buffer_bytes]),
+                tcp::SocketBuffer::new(vec![0; buffer_bytes]),
+            );
+            socket
+                .connect(
+                    gen_iface.context(),
+                    (IpAddress::Ipv4(TARGET_IP), TARGET_PORT_BASE),
+                    40_016,
+                )
+                .unwrap();
+            let mut sockets = SocketSet::new(vec![]);
+            let handle = sockets.add(socket);
+            let mut sent = 0usize;
+            let mut received = Vec::with_capacity(payload.len());
+
+            let preopen_started = Instant::now();
+            while preopen_started.elapsed() < Duration::from_secs(2) {
+                gen_iface.poll(SmolInstant::now(), &mut gen_device, &mut sockets);
+                let socket = sockets.get_mut::<tcp::Socket>(handle);
+                if sent < payload.len() && socket.can_send() {
+                    sent += socket.send_slice(&payload[sent..]).unwrap_or(0);
+                }
+                if open_gate.is_waiting()
+                    && sent == payload.len()
+                    && socket.send_queue() == SUFFIX_BYTES
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_micros(100)).await;
+            }
+            assert!(open_gate.is_waiting(), "async resumable open never started");
+            assert_eq!(sent, payload.len(), "generator did not enqueue all bytes");
+            assert_eq!(
+                sockets.get::<tcp::Socket>(handle).send_queue(),
+                SUFFIX_BYTES,
+                "open-pending path consumed bytes before a resumable port existed"
+            );
+            assert!(trace.probe().is_none());
+
+            open_gate.release();
+            let queued_started = Instant::now();
+            loop {
+                gen_iface.poll(SmolInstant::now(), &mut gen_device, &mut sockets);
+                if trace
+                    .probe()
+                    .is_some_and(|probe| probe.snapshot().uplink_owned_bytes() == PORT_BYTES)
+                {
+                    break;
+                }
+                assert!(
+                    queued_started.elapsed() < Duration::from_secs(2),
+                    "resumable port never reserved the exact pre-recv extent"
+                );
+                tokio::time::sleep(Duration::from_micros(100)).await;
+            }
+            assert!(driver_gate.is_waiting());
+            assert!(trace.data_lengths.lock().unwrap().is_empty());
+
+            let suffix_arrival_started = Instant::now();
+            while sockets.get::<tcp::Socket>(handle).send_queue() != 0
+                && suffix_arrival_started.elapsed() < Duration::from_secs(2)
+            {
+                gen_iface.poll(SmolInstant::now(), &mut gen_device, &mut sockets);
+                tokio::time::sleep(Duration::from_micros(100)).await;
+            }
+            assert_eq!(sockets.get::<tcp::Socket>(handle).send_queue(), 0);
+            assert_eq!(
+                trace.probe().unwrap().snapshot().uplink_owned_bytes(),
+                PORT_BYTES,
+                "full message lane must retain exact pre-recv byte ownership"
+            );
+
+            driver_gate.release();
+            let first_data_started = Instant::now();
+            while !first_ack_gate.is_waiting()
+                && first_data_started.elapsed() < Duration::from_secs(2)
+            {
+                gen_iface.poll(SmolInstant::now(), &mut gen_device, &mut sockets);
+                tokio::time::sleep(Duration::from_micros(100)).await;
+            }
+            assert!(first_ack_gate.is_waiting());
+            assert_eq!(*trace.data_lengths.lock().unwrap(), vec![PORT_BYTES]);
+            for _ in 0..100 {
+                gen_iface.poll(SmolInstant::now(), &mut gen_device, &mut sockets);
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(*trace.data_lengths.lock().unwrap(), vec![PORT_BYTES]);
+            assert_eq!(
+                trace.probe().unwrap().snapshot().uplink_owned_bytes(),
+                PORT_BYTES,
+                "full byte ledger must leave the already-arrived suffix in smoltcp"
+            );
+
+            first_ack_gate.release();
+            let echo_started = Instant::now();
+            while received.len() < payload.len() && echo_started.elapsed() < Duration::from_secs(3)
+            {
+                gen_iface.poll(SmolInstant::now(), &mut gen_device, &mut sockets);
+                let socket = sockets.get_mut::<tcp::Socket>(handle);
+                while socket.can_recv() {
+                    let result = socket.recv(|bytes| {
+                        received.extend_from_slice(bytes);
+                        (bytes.len(), ())
+                    });
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_micros(100)).await;
+            }
+            assert_eq!(
+                received, payload,
+                "resumable echo changed or lost owned bytes"
+            );
+            assert_eq!(
+                *trace.data_lengths.lock().unwrap(),
+                vec![PORT_BYTES, SUFFIX_BYTES],
+                "byte saturation must defer, not consume or merge, the suffix"
+            );
+
+            sockets.get_mut::<tcp::Socket>(handle).close();
+            let fin_started = Instant::now();
+            while !(trace.local_close_seen.load(Ordering::Acquire)
+                && trace.sink_half_closed_seen.load(Ordering::Acquire)
+                && trace.graceful_terminal_seen.load(Ordering::Acquire))
+                && fin_started.elapsed() < Duration::from_secs(3)
+            {
+                gen_iface.poll(SmolInstant::now(), &mut gen_device, &mut sockets);
+                tokio::time::sleep(Duration::from_micros(100)).await;
+            }
+
+            let terminal_delivery_started = Instant::now();
+            while !trace.probe().unwrap().snapshot().is_quiescent()
+                && terminal_delivery_started.elapsed() < Duration::from_secs(2)
+            {
+                gen_iface.poll(SmolInstant::now(), &mut gen_device, &mut sockets);
+                tokio::time::sleep(Duration::from_micros(100)).await;
+            }
+
+            assert!(trace.local_close_seen.load(Ordering::Acquire));
+            assert!(trace.sink_half_closed_seen.load(Ordering::Acquire));
+            assert!(trace.graceful_terminal_seen.load(Ordering::Acquire));
+            assert_eq!(trace.local_close_events.load(Ordering::Relaxed), 1);
+            assert_eq!(trace.sink_half_closed_events.load(Ordering::Relaxed), 1);
+            assert_eq!(trace.graceful_terminal_events.load(Ordering::Relaxed), 1);
+            assert!(trace.probe().unwrap().snapshot().is_quiescent());
+            let sink_offers = trace.sink_offers.lock().unwrap().clone();
+            let sink_acceptances = trace.sink_acceptances.lock().unwrap().clone();
+            assert_eq!(
+                sink_acceptances.iter().sum::<usize>(),
+                payload.len(),
+                "SinkAccepted must account only exact bytes accepted by real send_slice calls"
+            );
+            assert!(sink_acceptances.iter().all(|accepted| *accepted > 0));
+            assert_eq!(sink_acceptances.len(), sink_offers.len());
+            assert!(
+                sink_acceptances
+                    .iter()
+                    .zip(&sink_offers)
+                    .all(|(accepted, offered)| accepted <= offered)
+            );
+            assert_eq!(upstream.opens.load(Ordering::Relaxed), 1);
+            assert_eq!(upstream.port_factory.session_uplink_owned_bytes(), 0);
+            let errors = trace.errors.lock().unwrap().clone();
+            assert!(errors.is_empty(), "{errors:?}");
+
+            sut.abort();
+            let _ = sut.await;
+            upstream.stop_tasks();
+        }
+
+        #[tokio::test]
+        async fn async_resumable_open_reenters_zero_byte_closewait_and_emits_one_fin() {
+            let open_gate = OpenStallControl::new();
+            let driver_gate = OpenStallControl::new();
+            let first_ack_gate = OpenStallControl::new();
+            let trace = Arc::new(ResumableTrace::default());
+            let upstream = Arc::new(FakeResumableUpstream::new(
+                open_gate.clone(),
+                driver_gate.clone(),
+                first_ack_gate,
+                Arc::clone(&trace),
+            ));
+
+            let gen_to_sut = PacketLink::new();
+            let sut_to_gen = PacketLink::new();
+            let sut_device = LoopbackTunDevice::new(gen_to_sut.clone(), sut_to_gen.clone());
+            let (_udp_tx, udp_rx) = mpsc::channel(1);
+            let config = TunRuntimeConfig::from_sources(Some("1")).unwrap();
+            let metrics = Arc::new(Metrics::new());
+            let recorded = Arc::new(Mutex::new(Recorded::default()));
+            let sut = tokio::spawn(run_owned_event_loop(
+                sut_device,
+                Arc::clone(&upstream),
+                UdpDownlinkSource::owned(udp_rx),
+                config,
+                metrics,
+                RecordingSink::new(recorded),
+            ));
+
+            let mut gen_device = GeneratorDevice::new(sut_to_gen, gen_to_sut);
+            let mut gen_iface = generator_iface(&mut gen_device);
+            let mut socket = tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0; 4096]),
+                tcp::SocketBuffer::new(vec![0; 4096]),
+            );
+            socket
+                .connect(
+                    gen_iface.context(),
+                    (IpAddress::Ipv4(TARGET_IP), TARGET_PORT_BASE),
+                    40_017,
+                )
+                .unwrap();
+            let mut sockets = SocketSet::new(vec![]);
+            let handle = sockets.add(socket);
+
+            let connect_started = Instant::now();
+            while !sockets.get::<tcp::Socket>(handle).may_send()
+                && connect_started.elapsed() < Duration::from_secs(2)
+            {
+                gen_iface.poll(SmolInstant::now(), &mut gen_device, &mut sockets);
+                tokio::time::sleep(Duration::from_micros(100)).await;
+            }
+            assert!(sockets.get::<tcp::Socket>(handle).may_send());
+            sockets.get_mut::<tcp::Socket>(handle).close();
+
+            let pending_started = Instant::now();
+            while !open_gate.is_waiting() && pending_started.elapsed() < Duration::from_secs(2) {
+                gen_iface.poll(SmolInstant::now(), &mut gen_device, &mut sockets);
+                tokio::time::sleep(Duration::from_micros(100)).await;
+            }
+            assert!(
+                open_gate.is_waiting(),
+                "zero-byte CloseWait never opened owner flow"
+            );
+            assert!(!trace.local_close_seen.load(Ordering::Acquire));
+            assert!(trace.probe().is_none());
+
+            open_gate.release();
+            driver_gate.release();
+            let fin_started = Instant::now();
+            while !(trace.local_close_seen.load(Ordering::Acquire)
+                && trace.sink_half_closed_seen.load(Ordering::Acquire)
+                && trace.graceful_terminal_seen.load(Ordering::Acquire))
+                && fin_started.elapsed() < Duration::from_secs(3)
+            {
+                gen_iface.poll(SmolInstant::now(), &mut gen_device, &mut sockets);
+                tokio::time::sleep(Duration::from_micros(100)).await;
+            }
+
+            let terminal_delivery_started = Instant::now();
+            while !trace.probe().unwrap().snapshot().is_quiescent()
+                && terminal_delivery_started.elapsed() < Duration::from_secs(2)
+            {
+                gen_iface.poll(SmolInstant::now(), &mut gen_device, &mut sockets);
+                tokio::time::sleep(Duration::from_micros(100)).await;
+            }
+
+            assert!(trace.local_close_seen.load(Ordering::Acquire));
+            assert!(trace.sink_half_closed_seen.load(Ordering::Acquire));
+            assert!(trace.graceful_terminal_seen.load(Ordering::Acquire));
+            assert_eq!(trace.local_close_events.load(Ordering::Relaxed), 1);
+            assert_eq!(trace.sink_half_closed_events.load(Ordering::Relaxed), 1);
+            assert_eq!(trace.graceful_terminal_events.load(Ordering::Relaxed), 1);
+            assert!(trace.probe().unwrap().snapshot().is_quiescent());
+            assert!(trace.data_lengths.lock().unwrap().is_empty());
+            assert!(trace.sink_offers.lock().unwrap().is_empty());
+            assert!(trace.sink_acceptances.lock().unwrap().is_empty());
+            assert_eq!(upstream.opens.load(Ordering::Relaxed), 1);
+            assert_eq!(upstream.port_factory.session_uplink_owned_bytes(), 0);
+            let errors = trace.errors.lock().unwrap().clone();
+            assert!(errors.is_empty(), "{errors:?}");
+
+            sut.abort();
+            let _ = sut.await;
+            upstream.stop_tasks();
+        }
+    }
 }

@@ -2,7 +2,7 @@
 
 Date: 2026-08-18
 
-Status: **TASK 2 LOCAL FIXED CORE COMPLETE; TASK 3 NEXT; M3 BLOCKED**
+Status: **TASK 3 LOCAL ADAPTER COMPLETE; TASK 4 NEXT; M3 BLOCKED**
 
 ## Goal
 
@@ -52,6 +52,17 @@ This is a parallel implementation behind existing `ProxyUpstream` and
 `DatagramUpstream` boundaries. `TuicUpstream` remains available unchanged.
 `FailoverUpstream` remains future-open failover and is not relabeled as stream
 migration.
+
+Task 3 now implements that local branch through an object-safe
+`OwnedUpstream` facade. Its legacy adapter delegates the exact existing relay
+variants and UDP behavior, while its resumable branch uses session-scoped
+bounded flow ports, typed application-acceptance receipts, and exact
+transport-leg provenance. The real smoltcp event loop can select either branch
+without learning replay or leg mechanics, and resumable sink bytes remain
+behind the existing D16/local-egress admission actor. The public production
+entry still selects the legacy adapter; Task 4 must supply the deterministic
+two-leg transport before any production/WAN claim. Result:
+`docs/tech/2026-08-18-knife16-owned-upstream-local-results.md`.
 
 ## Protocol identity and security
 

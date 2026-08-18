@@ -1,5 +1,32 @@
 # Errors
 
+## 2026-08-18 - Task-3 review found global-budget and uninstalled-open ownership leaks
+
+- The first client integration treated only per-flow replay exhaustion as
+  backpressure. Session-global exhaustion fell through the generic error path,
+  which closed/reset a healthy flow even though the bytes had not been
+  consumed. Future behavior: classify every bounded producer-capacity result
+  before the generic lifecycle error arm, and test two flows against one
+  shared ledger.
+- A stale async resumable open was initially dropped when its socket epoch no
+  longer matched. Dropping endpoint senders did not provide the reducer a
+  terminal authority, so the logical flow and replay could remain live. The
+  same hole existed when the handshake completion receiver had closed or the
+  legacy seam unexpectedly received a resumable result. Future behavior:
+  every uninstalled async result must be consumed by one explicit abandonment
+  helper that queues exact `LocalReset(LocalAbandon)` before dropping senders.
+- Strict Clippy rejected a pair-producing method named `new` and a large
+  inline mailbox error. The fix renamed the pair constructor to `bounded` and
+  boxed events only on the failure path. Future behavior: run strict Clippy on
+  new internal architecture seams before final review; do not globally allow
+  a lint or add a hot-path box to make an error type smaller.
+
+All three failures were local RED/review findings. No WAN, macOS TUN, VPS, or
+user data was involved. Final Task-3 review reports no unresolved P0/P1.
+
+Result:
+`docs/tech/2026-08-18-knife16-owned-upstream-local-results.md`.
+
 ## 2026-08-18 - Task-2 validation commands crossed tool and permission boundaries
 
 - A partial symbol search after the first `FlowId` rename missed a remaining

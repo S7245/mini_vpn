@@ -168,7 +168,7 @@ observed counters before modifying code again. Do not continue with the same
 class of tweak if the run proves that class of fix was only necessary, not
 sufficient.
 
-## Current Agent Role And Knife15 Position
+## Current Agent Role And Knife16 Position
 
 The agent's role in this repository is data-plane engineering for the
 mini_vpn core: read evidence, design small testable stages, implement Rust and
@@ -182,32 +182,34 @@ duration, and stable quality.
 For cold-start grounding, read this file, `Rules.md`, `HANDOFF.md`, `TODO.md`,
 latest `.learnings/LEARNINGS.md` / `.learnings/ERRORS.md`, and the relevant
 `docs/tech/2026-*.md` files. The older numbered `docs/tech/*.md` files are
-historical background; do not load all of them by default. For current
-release-readiness work, prioritize the latest Knife15 result, long-duration
-plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
-documents as the frozen architecture/capacity baseline.
+historical background; do not load all of them by default. For current work,
+prioritize the latest Knife16 result, architecture specification, and
+implementation plan. Keep the latest Knife15 failure as the motivating WAN
+evidence, and use the Knife14 endpoint-pacing and VPS completion documents as
+the frozen local architecture/capacity baseline.
 
 Current Knife16/Knife15 summary, as of 2026-08-18:
 
-- **Knife16 Task 2 is complete locally; Task 3 is next.** The new pure
-  `resumable` fixed core implements a bounded/golden-tested v1 codec,
-  exporter/device/session/generation-bound attach authority, lost-response
-  generation resynchronization, directional TCP replay/receive ownership,
-  stable cross-leg session capabilities, two-phase FIN, bounded terminal
-  tombstones, and checked replay/storage/copy math. Application ACK advances
-  only after sink acceptance; decode, buffering, and abandon cannot mint it.
-  Receive budget admission and commit share one TCP-owned algorithm, whose
-  reservation is crate-private.
-- At a 500ms total horizon, 100/170/240 Mbit/s require
-  `6,250,000/10,625,000/15,000,000B` per direction. Focused `94/94`, root
-  `807 + 3 ignored`, protocol/API `19/19 + 1/1`, harness
-  `819 + 3 ignored`, concurrency `10 + 4 ignored`, release, Clippy, rustdoc,
-  vendored Quinn/proto, fmt, and diff pass. Protocol/auth/capacity and
-  session/lifecycle reviews have no unresolved P0/P1. This stage has no
-  production adapter, socket, WAN test, or throughput claim. Next implement
-  only the deep `OwnedUpstream` abstraction and typed TLS-leg provenance; keep
-  TUIC/failover behavior unchanged. Result:
-  `docs/tech/2026-08-18-knife16-resumable-protocol-capacity-local-results.md`.
+- **Knife16 Task 3 is complete locally; Task 4 is next.** The crate-private
+  `OwnedUpstream` facade preserves exact legacy relay variants and
+  UDP/TUIC/Reality/Failover behavior while the real TUN/smoltcp loop can drive
+  typed resumable flow ports. The public production entry remains legacy
+  until a real two-leg transport and owner exist.
+- One session-scoped factory owns aggregate uplink capacity; message,
+  per-flow, and global bytes are reserved before smoltcp extraction. Reducer-
+  minted receipts own replay storage/release, and application ACK advances
+  only after exact positive `send_slice` acceptance behind the unchanged D16/
+  local-egress actor. Exact leg seals, ordered DATA/CLOSE, bounded control
+  fairness, FIN/terminal, owner loss, epochs, and uninstalled async opens are
+  capability-bound.
+- Focused `43/43`, all-target harness `875 + 3 ignored`, concurrency
+  `10 + 4 ignored`, typed provenance `101/101`, real-smoltcp fake adapter
+  `2/2` plus 100-repeat, release, strict Clippy, rustdoc, vendored Quinn/proto,
+  fmt, and diff pass. Four concentrated reviews report P0/P1 `0/0`. This is a
+  local seam result, not a production transport, blackout recovery, WAN, or
+  throughput claim. Next implement only Task 4's deterministic two-leg
+  transport harness; do not run macOS TUN or VPS. Result:
+  `docs/tech/2026-08-18-knife16-owned-upstream-local-results.md`.
 
 - **Knife15 is closed by a genuine Tier-B quality failure; Knife16 is the
   active architecture stage.** Exact-source `d5b8304` passed baseline,

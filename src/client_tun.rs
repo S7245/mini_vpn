@@ -4,7 +4,13 @@ use crate::failover::FailoverUpstream;
 use crate::fake_ip::FakeIpPool;
 use crate::loop_profiler::LoopProfiler;
 use crate::metrics::Metrics;
+use crate::owned_upstream::{
+    FlowPortError, HalfCloseDelivery, LegacyOwnedUpstream, LocalAssociationId, OpenedOwnedTcp,
+    OwnedUpstream, ResumableTcpDownlink, ResumableTcpUplink, SinkDelivery, TcpOwnershipMode,
+    TerminalAction, TunAction, UdpDownlinkEvent, UdpDownlinkSource, UdpUplink,
+};
 use crate::reality_upstream::RealityUpstream;
+use crate::resumable::{FlowFinishReason, LocalFlow, MAX_DATA_PAYLOAD_BYTES, ResetReason};
 use crate::shared::{ClientError, TargetAddr};
 #[cfg(feature = "harness")]
 use crate::tcp_downlink_pump::ByteQueueConfigError;
@@ -21,9 +27,7 @@ use crate::tcp_stream_service::{
     LocalAdmissionProgress, StreamServiceBlockedReason, StreamServiceController,
     StreamServiceWindow, format_stream_service_window_fields,
 };
-use crate::tuic::{
-    AssocTable, FragReassembler, TuicClientConfig, TuicUpstream, decode_packet_meta, encode_packet,
-};
+use crate::tuic::{AssocTable, TuicClientConfig, TuicUpstream};
 use crate::udp_relay::{
     FourTuple, UDP_FLOW_IDLE_SECS, UdpInbound, build_udp_ip_packet, parse_inbound_udp,
 };
@@ -44,13 +48,18 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use tokio::sync::{mpsc, watch};
+use std::fmt;
+use tokio::sync::{mpsc, oneshot, watch};
 
 pub(crate) const TCP_SOCKET_BUFFER_SIZE: usize = 65_535;
 const MIN_TCP_SOCKET_BUFFER_BYTES: usize = 4 * 1024;
 const MAX_TCP_SOCKET_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 const RELAY_CHANNEL_CAPACITY: usize = 1024;
 const _: () = assert!(RELAY_CHANNEL_CAPACITY >= 1);
+/// Protocol-owned sink/FIN/terminal completions must remain serviceable while
+/// the legacy bulk-data channel is paused by local egress backpressure.
+const OWNED_ACTION_CHANNEL_CAPACITY: usize = 1024;
+const _: () = assert!(OWNED_ACTION_CHANNEL_CAPACITY >= 1);
 const RELAY_GLOBAL_RX_CRITICAL_FREE_SLOTS: usize = 8;
 const _: () = assert!(RELAY_GLOBAL_RX_CRITICAL_FREE_SLOTS > 0);
 const RELAY_REMOTE_READ_BURST_MAX_CHUNKS: usize = 16;
@@ -160,6 +169,10 @@ const RELAY_WRITER_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// Knife14o/14r：relay 已关闭但仍有 downlink_pending 时，给 dirty flush 一个短窗口；
 /// 14r 起窗口按“最近一次 pending 下降”刷新。无进展超过窗口才 hard reap，防永久脏槽。
 const DEFERRED_CLOSE_PENDING_GRACE_SECS: u64 = 5;
+/// A clean protocol-owned TCP close may make the local smoltcp socket
+/// inactive just before the reducer's exact graceful terminal capability is
+/// forwarded. Keep that race bounded without rewriting it as LocalReset.
+const OWNED_TERMINAL_WAIT_GRACE_SECS: u64 = 5;
 /// Knife14as：TUN/qdisc drop feedback 后，本地 egress tail 可能需要一轮 TCP 重传/ACK
 /// 才能下降；给它一个更长但仍有界的 close-drain 窗口，避免 dead-slot reap 抢跑。
 const DEFERRED_CLOSE_EGRESS_DROP_GRACE_SECS: u64 = 15;
@@ -1844,6 +1857,108 @@ enum RelayEvent {
     Closed(RelayClose),
 }
 
+/// Protocol-owned sink/control wakeup on a lane independent of legacy bulk
+/// DATA. The exact completion capability remains owned until the single TUN
+/// actor observes real smoltcp acceptance or fails it closed.
+#[derive(Debug)]
+struct OwnedActionEvent {
+    handle: SocketHandle,
+    epoch: u64,
+    action: OwnedAction,
+}
+
+#[derive(Debug)]
+enum OwnedAction {
+    Tun(TunAction),
+    /// The sole session driver disappeared without first publishing an exact
+    /// reducer terminal. Keep this epoch-tagged and flow-tagged so only the
+    /// installed socket incarnation is failed closed.
+    PortClosed {
+        flow: LocalFlow,
+    },
+}
+
+/// Cancellation owner for the one downlink-action forwarder attached to a
+/// resumable flow. Dropping it wakes the task; any in-flight Sink/HalfClose
+/// action then uses its fail-closed `Drop` completion.
+struct ResumableActionBridge {
+    cancel: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl fmt::Debug for ResumableActionBridge {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResumableActionBridge")
+            .field("cancel_armed", &self.cancel.is_some())
+            .field("task_finished", &self.task.is_finished())
+            .finish()
+    }
+}
+
+impl Drop for ResumableActionBridge {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        // Drop is synchronous, so it cannot await the join handle. Aborting
+        // after the cooperative wake guarantees the task is not detached;
+        // Tokio drops any in-flight TunAction and its fail-closed completion.
+        self.task.abort();
+    }
+}
+
+fn spawn_resumable_action_bridge(
+    handle: SocketHandle,
+    epoch: u64,
+    mut downlink: ResumableTcpDownlink,
+    owned_action_tx: mpsc::Sender<OwnedActionEvent>,
+) -> ResumableActionBridge {
+    let (cancel_tx, mut cancel_rx) = oneshot::channel();
+    let flow = downlink.local_flow();
+    let task = tokio::spawn(async move {
+        loop {
+            let received = tokio::select! {
+                biased;
+                _ = &mut cancel_rx => break,
+                action = downlink.recv_action() => action,
+            };
+            let (action, stop_after_send) = match received {
+                Some(action) => {
+                    // An exact reducer terminal is the final action for this
+                    // flow. Stop after forwarding it so the driver's normal
+                    // teardown cannot be misreported as an owner-loss
+                    // `PortClosed` for the same still-draining TCP epoch.
+                    let is_terminal = matches!(&action, TunAction::Terminal(_));
+                    (OwnedAction::Tun(action), is_terminal)
+                }
+                None => (OwnedAction::PortClosed { flow }, true),
+            };
+            let event = OwnedActionEvent {
+                handle,
+                epoch,
+                action,
+            };
+            tokio::select! {
+                biased;
+                _ = &mut cancel_rx => break,
+                sent = owned_action_tx.send(event) => {
+                    if sent.is_err() {
+                        break;
+                    }
+                }
+            }
+            if stop_after_send {
+                break;
+            }
+        }
+    });
+    ResumableActionBridge {
+        cancel: Some(cancel_tx),
+        task,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RelayReadCredit {
     paused: bool,
@@ -2142,6 +2257,24 @@ struct SocketCtx {
     state: SocketState,
     /// Sender used to push local payloads into the remote relay task for this slot only.
     uplink_tx: Option<mpsc::Sender<RelayCommand>>,
+    /// Knife16 Task 3: mutually exclusive protocol-owned uplink. Its byte
+    /// reservation is acquired before smoltcp `recv`, unlike the legacy
+    /// message-only relay channel above.
+    resumable_uplink: Option<ResumableTcpUplink>,
+    /// Exact sink offer currently awaiting real smoltcp acceptance.
+    resumable_sink: Option<SinkDelivery>,
+    /// Two-phase peer FIN awaiting application to the local smoltcp socket.
+    resumable_half_close: Option<HalfCloseDelivery>,
+    /// Reducer-owned terminal decision. Graceful completion waits for the
+    /// local FIN to drain; reset/open-failure decisions abort this flow only.
+    resumable_terminal: Option<TerminalAction>,
+    /// Sole downlink receiver task for this flow; dropping the bridge cancels
+    /// it and fail-closes any in-flight completion capability.
+    resumable_action_bridge: Option<ResumableActionBridge>,
+    /// Contract selected before an asynchronous upstream open. It prevents an
+    /// adapter from returning a flow whose extraction order differs from the
+    /// one used while the open was in flight.
+    pending_open_mode: Option<TcpOwnershipMode>,
     /// Sender used to feed local egress pressure back to the relay read half.
     relay_read_credit_tx: Option<watch::Sender<RelayReadCredit>>,
     /// H10d16: the only remote payload reservoir for this flow. Global relay
@@ -2159,6 +2292,14 @@ struct SocketCtx {
     local_fin_sent: bool,
     /// Whether remote EOF has been propagated to the intercepted local TCP peer with a FIN.
     local_eof_sent: bool,
+    /// An already-issued sink/FIN capability was invalidated by an exact
+    /// reducer terminal before the TUN actor could apply it. While set, local
+    /// source reads wait for the already-queued terminal action.
+    owned_terminal_pending: bool,
+    /// Bounded wait start for the exact reducer terminal after both TCP
+    /// half-closes have been committed. This prevents the one-second dead-slot
+    /// sweep from racing a queued graceful terminal action.
+    owned_terminal_wait_since_secs: Option<u64>,
     /// Monotonic event-loop seconds when local finish became pending but was deferred for reverse traffic.
     local_fin_pending_since_secs: Option<u64>,
     /// Latest remote-to-local progress while a local finish is pending.
@@ -2230,6 +2371,12 @@ impl SocketCtx {
             local_port,
             state: SocketState::Listening,
             uplink_tx: None,
+            resumable_uplink: None,
+            resumable_sink: None,
+            resumable_half_close: None,
+            resumable_terminal: None,
+            resumable_action_bridge: None,
+            pending_open_mode: None,
             relay_read_credit_tx: None,
             d16_downlink_queue: None,
             d16_egress_phase: EgressPhase::Running,
@@ -2237,6 +2384,8 @@ impl SocketCtx {
             relay_read_credit_progress_generation_sent: 0,
             local_fin_sent: false,
             local_eof_sent: false,
+            owned_terminal_pending: false,
+            owned_terminal_wait_since_secs: None,
             local_fin_pending_since_secs: None,
             local_fin_last_remote_progress_secs: None,
             downlink_pending: Vec::new(),
@@ -2274,6 +2423,34 @@ impl SocketCtx {
         }
         self.uplink_buffer.extend_from_slice(payload);
         true
+    }
+
+    fn resumable_sink_pending_bytes(&self) -> usize {
+        self.resumable_sink
+            .as_ref()
+            .map(SinkDelivery::offered_len)
+            .unwrap_or(0)
+    }
+
+    fn pending_downlink_bytes(&self) -> usize {
+        self.downlink_pending
+            .len()
+            .saturating_add(self.resumable_sink_pending_bytes())
+    }
+
+    fn has_live_uplink(&self) -> bool {
+        self.uplink_tx.is_some() || self.resumable_uplink.is_some()
+    }
+
+    fn uses_owned_egress_actor(&self) -> bool {
+        self.d16_downlink_queue.is_some() || self.downlink_d3_actor_flow
+    }
+
+    fn awaits_owned_graceful_terminal(&self) -> bool {
+        self.resumable_uplink.is_some()
+            && self.local_fin_sent
+            && self.local_eof_sent
+            && self.resumable_terminal.is_none()
     }
 
     fn append_downlink_pending_with_permit(
@@ -2429,7 +2606,7 @@ fn dirty_contains_d16_flow(
     dirty.iter().any(|handle| {
         socket_ctxs
             .get(handle)
-            .is_some_and(|ctx| ctx.d16_downlink_queue.is_some())
+            .is_some_and(SocketCtx::uses_owned_egress_actor)
     })
 }
 
@@ -2497,7 +2674,7 @@ fn transition_dirty_d16_egress_phases(
         let Some(ctx) = socket_ctxs.get_mut(handle) else {
             continue;
         };
-        if ctx.d16_downlink_queue.is_none() {
+        if !ctx.uses_owned_egress_actor() {
             continue;
         }
         let previous = ctx.d16_egress_phase;
@@ -2529,7 +2706,7 @@ fn apply_d16_global_recovery_evidence(
     let handles: Vec<SocketHandle> = socket_ctxs
         .iter()
         .filter_map(|(handle, ctx)| {
-            (ctx.d16_downlink_queue.is_some() && ctx.d16_egress_phase == EgressPhase::DrainOnly)
+            (ctx.uses_owned_egress_actor() && ctx.d16_egress_phase == EgressPhase::DrainOnly)
                 .then_some(*handle)
         })
         .collect();
@@ -2568,7 +2745,7 @@ fn force_all_d16_flows_to_drain_only_for_tun_rx_backlog(
 ) -> usize {
     let handles: Vec<SocketHandle> = socket_ctxs
         .iter()
-        .filter_map(|(handle, ctx)| ctx.d16_downlink_queue.is_some().then_some(*handle))
+        .filter_map(|(handle, ctx)| ctx.uses_owned_egress_actor().then_some(*handle))
         .collect();
     let mut transitioned = 0usize;
     for handle in handles {
@@ -2607,7 +2784,7 @@ fn recover_all_eligible_d16_flows_after_clean_tun_rx_edge(
     let handles: Vec<SocketHandle> = socket_ctxs
         .iter()
         .filter_map(|(handle, ctx)| {
-            (ctx.d16_downlink_queue.is_some() && ctx.d16_egress_phase == EgressPhase::DrainOnly)
+            (ctx.uses_owned_egress_actor() && ctx.d16_egress_phase == EgressPhase::DrainOnly)
                 .then_some(*handle)
         })
         .collect();
@@ -2881,7 +3058,16 @@ const MAX_UPLINK_BUFFER: usize = 256 * 1024;
 struct HandshakeDone {
     handle: SocketHandle,
     epoch: u64,
-    result: Result<OpenedTcpRelay, ClientError>,
+    result: Result<OpenedOwnedTcp, ClientError>,
+}
+
+async fn publish_handshake_done(sender: &mpsc::Sender<HandshakeDone>, done: HandshakeDone) {
+    if let Err(error) = sender.send(done).await {
+        let HandshakeDone { result, .. } = error.0;
+        if let Ok(opened) = result {
+            abandon_uninstalled_owned_tcp(opened, "handshake_receiver_closed");
+        }
+    }
 }
 
 /// 刀9 M3：`handshake_done` channel 容量。满时 spawn 的 send().await 背压（不丢，等主循环排空）。
@@ -4013,6 +4199,229 @@ fn flush_downlink(
     }
 }
 
+/// Knife16 application-ACK boundary for protocol-owned downlink DATA.
+///
+/// A `SinkDelivery` never enters the legacy byte vector or D16 permit path.
+/// Its opaque completion is retained until this exact `send_slice` call says
+/// how many bytes smoltcp accepted. A positive partial write destroys all old
+/// suffix views; the reducer must issue a fresh offer for the remainder.
+fn flush_resumable_sink(
+    handle: SocketHandle,
+    tcp_socket: &mut TcpSocket<'_>,
+    ctx: &mut SocketCtx,
+    max_bytes_per_flush: usize,
+    downlink_backpressure: DownlinkBackpressureConfig,
+    tun_mtu: usize,
+    downlink_egress_drop_debt: &mut DownlinkEgressDropDebt,
+) -> DownlinkFlushOutcome {
+    let Some(delivery) = ctx.resumable_sink.take() else {
+        return DownlinkFlushOutcome::NO_ADMISSION;
+    };
+    if !delivery.is_live() {
+        // The reducer terminal won the lifecycle race before any local socket
+        // mutation. The exact terminal action is already queued on the
+        // independent lane; suppress uplink service until it arrives.
+        ctx.owned_terminal_pending = true;
+        return DownlinkFlushOutcome::NO_ADMISSION;
+    }
+    let offered = delivery.offered_len();
+    let first_segment_len = delivery.first_segment_slice().len();
+    let send_window = TcpSendWindowSnapshot::from_socket(tcp_socket);
+    ctx.downlink_diag.note_send_window(send_window, offered);
+    if !send_window.can_send {
+        ctx.downlink_diag
+            .note_flush_attempt(offered, max_bytes_per_flush);
+        ctx.downlink_diag.note_no_send_capacity(offered);
+        ctx.resumable_sink = Some(delivery);
+        return DownlinkFlushOutcome::NO_ADMISSION;
+    }
+    let controlled_max_bytes_per_flush = ctx.downlink_credit_controller.flush_budget(
+        max_bytes_per_flush,
+        downlink_backpressure,
+        tun_mtu,
+    );
+    let flush_policy = downlink_flush_policy_for_ctx(ctx);
+    let flush_limit = bounded_downlink_flush_limit_for_window_with_clock_drop_and_policy(
+        first_segment_len,
+        controlled_max_bytes_per_flush,
+        send_window,
+        downlink_backpressure,
+        &mut ctx.downlink_egress_clock,
+        downlink_egress_drop_debt,
+        flush_policy,
+    );
+    ctx.downlink_diag
+        .note_flush_limit(offered, controlled_max_bytes_per_flush, flush_limit);
+    if flush_limit.len == 0 {
+        let used =
+            ctx.downlink_egress_clock
+                .note_flush_result(send_window.send_queue, 0, flush_limit);
+        ctx.downlink_diag.note_drain_credit_used(used);
+        ctx.downlink_credit_controller
+            .note_flush_feedback_with_accepted(flush_limit, 0, downlink_backpressure, tun_mtu);
+        ctx.resumable_sink = Some(delivery);
+        return DownlinkFlushOutcome {
+            accepted_bytes: 0,
+            headroom_limited: flush_limit.headroom_limited,
+        };
+    }
+
+    let write_result = match delivery
+        .with_live_first_segment(|segment| tcp_socket.send_slice(&segment[..flush_limit.len]))
+    {
+        Ok(result) => result,
+        Err(FlowPortError::SinkCapabilityRevoked) => {
+            ctx.owned_terminal_pending = true;
+            return DownlinkFlushOutcome::NO_ADMISSION;
+        }
+        Err(error) => {
+            tcp_diag_log!(
+                "🔎 owned-sink-live-guard-error handle={:?} offered={} error={error}",
+                handle,
+                offered
+            );
+            ctx.state = SocketState::Closing;
+            return DownlinkFlushOutcome::NO_ADMISSION;
+        }
+    };
+
+    match write_result {
+        Ok(0) => {
+            let used =
+                ctx.downlink_egress_clock
+                    .note_flush_result(send_window.send_queue, 0, flush_limit);
+            ctx.downlink_diag.note_drain_credit_used(used);
+            ctx.downlink_diag.note_send_slice_ok(0, offered);
+            ctx.downlink_credit_controller
+                .note_flush_feedback_with_accepted(flush_limit, 0, downlink_backpressure, tun_mtu);
+            ctx.resumable_sink = delivery.complete_write(0).ok().flatten();
+            DownlinkFlushOutcome {
+                accepted_bytes: 0,
+                headroom_limited: flush_limit.headroom_limited,
+            }
+        }
+        Ok(accepted) => {
+            let used = ctx.downlink_egress_clock.note_flush_result(
+                send_window.send_queue,
+                accepted,
+                flush_limit,
+            );
+            ctx.downlink_diag.note_drain_credit_used(used);
+            ctx.downlink_diag
+                .note_send_slice_ok(accepted, offered.saturating_sub(accepted));
+            ctx.downlink_credit_controller
+                .note_flush_feedback_with_accepted(
+                    flush_limit,
+                    accepted,
+                    downlink_backpressure,
+                    tun_mtu,
+                );
+            if let Err(error) = delivery.complete_write(accepted) {
+                tcp_diag_log!(
+                    "🔎 owned-sink-completion-error handle={:?} accepted={} error={error}",
+                    handle,
+                    accepted
+                );
+                ctx.state = SocketState::Closing;
+            }
+            DownlinkFlushOutcome {
+                accepted_bytes: accepted,
+                headroom_limited: flush_limit.headroom_limited,
+            }
+        }
+        Err(_) => {
+            let used =
+                ctx.downlink_egress_clock
+                    .note_flush_result(send_window.send_queue, 0, flush_limit);
+            ctx.downlink_diag.note_drain_credit_used(used);
+            ctx.downlink_diag.note_send_slice_error();
+            ctx.downlink_credit_controller
+                .note_flush_feedback_with_accepted(flush_limit, 0, downlink_backpressure, tun_mtu);
+            tcp_diag_log!(
+                "🔎 owned-sink-send-slice-error handle={:?} offered={} state={:?} → abandon",
+                handle,
+                offered,
+                ctx.state
+            );
+            delivery.abandon();
+            ctx.state = SocketState::Closing;
+            DownlinkFlushOutcome {
+                accepted_bytes: 0,
+                headroom_limited: flush_limit.headroom_limited,
+            }
+        }
+    }
+}
+
+/// Apply peer FIN only after the reducer has observed acceptance of every
+/// preceding byte. `HalfCloseDelivery` reports success only after the local
+/// smoltcp state transition is actually invoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnedHalfCloseDisposition {
+    WaitForSink,
+    Apply,
+    Fail,
+}
+
+fn owned_half_close_disposition(
+    snapshot: SocketCloseSnapshot,
+    sink_pending: bool,
+    local_eof_sent: bool,
+) -> OwnedHalfCloseDisposition {
+    if sink_pending {
+        return OwnedHalfCloseDisposition::WaitForSink;
+    }
+    // `can_send` includes tx-buffer capacity. A full buffer does not prevent
+    // smoltcp from queuing the FIN state transition; `may_send` is the exact
+    // transmit-half lifecycle authority.
+    if snapshot.active && snapshot.may_send && !local_eof_sent {
+        OwnedHalfCloseDisposition::Apply
+    } else {
+        OwnedHalfCloseDisposition::Fail
+    }
+}
+
+fn apply_resumable_half_close(tcp_socket: &mut TcpSocket<'_>, ctx: &mut SocketCtx) -> bool {
+    let snapshot = SocketCloseSnapshot::from_socket(tcp_socket);
+    if owned_half_close_disposition(snapshot, ctx.resumable_sink.is_some(), ctx.local_eof_sent)
+        == OwnedHalfCloseDisposition::WaitForSink
+    {
+        return false;
+    }
+    let Some(completion) = ctx.resumable_half_close.take() else {
+        return false;
+    };
+    if !completion.is_live() {
+        ctx.owned_terminal_pending = true;
+        return false;
+    }
+    match owned_half_close_disposition(snapshot, false, ctx.local_eof_sent) {
+        OwnedHalfCloseDisposition::Apply => {
+            match completion.with_live(|| tcp_socket.close()) {
+                Ok(()) => {}
+                Err(FlowPortError::SinkCapabilityRevoked) => {
+                    ctx.owned_terminal_pending = true;
+                    return false;
+                }
+                Err(error) => {
+                    tcp_diag_log!("🔎 owned-half-close-live-guard-error error={error}");
+                    completion.fail();
+                    ctx.state = SocketState::Closing;
+                    return false;
+                }
+            }
+            ctx.local_eof_sent = true;
+            completion.succeed();
+            true
+        }
+        OwnedHalfCloseDisposition::Fail | OwnedHalfCloseDisposition::WaitForSink => {
+            completion.fail();
+            ctx.state = SocketState::Closing;
+            false
+        }
+    }
+}
+
 fn with_downlink_admission<F>(
     ctx: &mut SocketCtx,
     origin: DownlinkAdmissionOrigin,
@@ -4021,14 +4430,15 @@ fn with_downlink_admission<F>(
 where
     F: FnOnce(&mut SocketCtx, bool) -> DownlinkFlushOutcome,
 {
-    let d16_flow = ctx.d16_downlink_queue.is_some();
-    let origin = origin.for_flow(d16_flow);
-    if d16_flow && !origin.allows_d16_admission() {
+    let actor_flow = ctx.uses_owned_egress_actor();
+    let queue_flow = ctx.d16_downlink_queue.is_some();
+    let origin = origin.for_flow(actor_flow);
+    if actor_flow && !origin.allows_d16_admission() {
         return DownlinkFlushOutcome::NO_ADMISSION;
     }
-    let outcome = admit(ctx, d16_flow);
+    let outcome = admit(ctx, queue_flow);
     ctx.downlink_diag
-        .note_d16_admission(origin, outcome.accepted_bytes, d16_flow);
+        .note_d16_admission(origin, outcome.accepted_bytes, actor_flow);
     outcome
 }
 
@@ -4044,7 +4454,7 @@ fn admit_downlink_for_handle(
     origin: DownlinkAdmissionOrigin,
 ) -> DownlinkFlushOutcome {
     let existing_send_queue_bytes = tcp_socket.send_queue();
-    let (origin, max_bytes_per_flush) = if ctx.d16_downlink_queue.is_some() {
+    let (origin, max_bytes_per_flush) = if ctx.uses_owned_egress_actor() {
         let permissions = EgressPermissions::for_phase(ctx.d16_egress_phase);
         (
             if permissions.allow_admission {
@@ -4063,15 +4473,27 @@ fn admit_downlink_for_handle(
         if d16_flow {
             let _ = drain_d16_owned_queue_into_pending(ctx, max_bytes_per_flush);
         }
-        flush_downlink(
-            handle,
-            tcp_socket,
-            ctx,
-            max_bytes_per_flush,
-            downlink_backpressure,
-            tun_mtu,
-            downlink_egress_drop_debt,
-        )
+        if ctx.resumable_sink.is_some() {
+            flush_resumable_sink(
+                handle,
+                tcp_socket,
+                ctx,
+                max_bytes_per_flush,
+                downlink_backpressure,
+                tun_mtu,
+                downlink_egress_drop_debt,
+            )
+        } else {
+            flush_downlink(
+                handle,
+                tcp_socket,
+                ctx,
+                max_bytes_per_flush,
+                downlink_backpressure,
+                tun_mtu,
+                downlink_egress_drop_debt,
+            )
+        }
     })
 }
 
@@ -4628,7 +5050,7 @@ fn downlink_pending_stats<'a>(
 ) -> DownlinkPressureStats {
     let mut stats = DownlinkPressureStats::default();
     for ctx in ctxs {
-        stats.note_pending(ctx.downlink_pending.len());
+        stats.note_pending(ctx.pending_downlink_bytes());
     }
     stats
 }
@@ -4643,7 +5065,7 @@ fn downlink_pressure_stats(
         let Some(ctx) = socket_ctxs.get(handle) else {
             continue;
         };
-        stats.note_pending(ctx.downlink_pending.len());
+        stats.note_pending(ctx.pending_downlink_bytes());
     }
     for (handle, socket) in sockets.iter() {
         if !dirty.contains(&handle) || !socket_ctxs.contains_key(&handle) {
@@ -4675,7 +5097,7 @@ fn dirty_downlink_pending_total(
         .iter()
         .filter_map(|handle| socket_ctxs.get(handle))
         .fold(0usize, |total, ctx| {
-            total.saturating_add(ctx.downlink_pending.len())
+            total.saturating_add(ctx.pending_downlink_bytes())
         })
 }
 
@@ -5051,7 +5473,7 @@ fn tcp_downlink_aggregate<'a>(
 ) -> TcpDownlinkAggregate {
     let mut aggregate = TcpDownlinkAggregate::default();
     for ctx in ctxs {
-        let pending = ctx.downlink_pending.len();
+        let pending = ctx.pending_downlink_bytes();
         aggregate.pending_total = aggregate.pending_total.saturating_add(pending);
         aggregate.pending_max = aggregate.pending_max.max(pending);
         aggregate.pending_high = aggregate
@@ -7890,17 +8312,43 @@ fn select_upstream_kind(env: Option<&str>) -> UpstreamKind {
 /// （sockets / iface / registry / fake DNS / fake_pool / assoc_table）在此内部构造，与生产逐字一致，
 /// 使 harness 也忠实地走同一套 SYN inspector / DNS / relay 调度路径。
 pub async fn run_event_loop<D, U, M>(
-    mut device: D,
+    device: D,
     upstream: Arc<U>,
-    mut tuic_downlink_rx: mpsc::Receiver<Vec<u8>>,
+    tuic_downlink_rx: mpsc::Receiver<Vec<u8>>,
     runtime_config: TunRuntimeConfig,
     // 刀11：进程级数据面计数/gauge 句柄（与计时导向的 `metrics: M` 正交）。run_event_loop 写
     // dns_*/relays_spawned + 30s tick 发布 gauge；同一 Arc 也被 TuicUpstream::start_udp clone（写 UDP 计数）。
     metrics_handle: Arc<Metrics>,
-    mut metrics: M,
+    metrics: M,
 ) where
     D: TunIo,
     U: ProxyUpstream + DatagramUpstream + 'static,
+    M: MetricsSink,
+{
+    run_owned_event_loop(
+        device,
+        Arc::new(LegacyOwnedUpstream::new(upstream)),
+        UdpDownlinkSource::legacy_raw(tuic_downlink_rx),
+        runtime_config,
+        metrics_handle,
+        metrics,
+    )
+    .await;
+}
+
+/// Knife16 branch-by-abstraction entry. The TUN/smoltcp owner consumes only
+/// protocol-owned TCP/UDP facts; legacy TUIC/REALITY behavior is supplied by
+/// [`LegacyOwnedUpstream`] and [`UdpDownlinkSource::legacy_raw`].
+pub(crate) async fn run_owned_event_loop<D, U, M>(
+    mut device: D,
+    upstream: Arc<U>,
+    mut udp_downlink: UdpDownlinkSource,
+    runtime_config: TunRuntimeConfig,
+    metrics_handle: Arc<Metrics>,
+    mut metrics: M,
+) where
+    D: TunIo,
+    U: OwnedUpstream + 'static,
     M: MetricsSink,
 {
     let pool_size = runtime_config.listener.pool_size;
@@ -7908,6 +8356,8 @@ pub async fn run_event_loop<D, U, M>(
     // 全局回信通道（TCP relay 通用回程）：接收端 global_rx 留在主循环，发送端 global_tx 克隆给每个后台车厢。
     let (global_tx, mut global_rx) =
         tokio::sync::mpsc::channel::<(SocketHandle, RelayEvent)>(RELAY_CHANNEL_CAPACITY);
+    let (owned_action_tx, mut owned_action_rx) =
+        tokio::sync::mpsc::channel::<OwnedActionEvent>(OWNED_ACTION_CHANNEL_CAPACITY);
 
     // 刀9 M3 / 刀14d：spawn 出主循环的 remote-open 完成后经此回灌主循环安装 relay。
     // 明确 cheap 的测试/mock 路径仍可 inline，不走此通道。
@@ -7959,11 +8409,10 @@ pub async fn run_event_loop<D, U, M>(
     // 初始化定时器 (每 5 毫秒触发一次)
     let mut timer = tokio::time::interval(std::time::Duration::from_millis(5));
 
-    // Stage 13b：UDP over TUIC Packet。AssocTable 主循环独占；upstream 与下行 rx 由调用方注入
-    // （生产=真 TuicUpstream::start_udp()；harness=mock echo 回环）。
+    // UDP flow ownership remains in the event loop. Wire decoding/reassembly
+    // belongs to the selected downlink source, so this layer never interprets
+    // TUIC records or a future resumable UDP envelope.
     let mut assoc_table = AssocTable::new();
-    // 刀3：native 下行分片重组器（主循环独占、无锁，与 AssocTable 同寿）。
-    let mut reassembler = FragReassembler::new();
     let udp_clock = std::time::Instant::now();
     let mut udp_sweep = tokio::time::interval(std::time::Duration::from_secs(1));
     // review #7：fake-IP 池回收单独走低频 tick（TTL=300s，无需每秒全表扫）。
@@ -8139,6 +8588,40 @@ pub async fn run_event_loop<D, U, M>(
             downlink_stats_raw.total_pending,
         );
         tokio::select! {
+            // Protocol-owned application acceptance/FIN/terminal actions use
+            // an independent bounded lane. They must remain serviceable when
+            // legacy bulk DATA reception is paused by local egress pressure.
+            Some(OwnedActionEvent { handle, epoch, action }) = owned_action_rx.recv() => {
+                metrics.loop_park_end();
+                let active = match action {
+                    OwnedAction::Tun(action) => handle_owned_tun_action(
+                        handle,
+                        epoch,
+                        action,
+                        &mut sockets,
+                        &mut socket_ctxs,
+                        &mut fake_pool,
+                        udp_clock.elapsed().as_secs(),
+                    ),
+                    OwnedAction::PortClosed { flow } => handle_owned_port_closed(
+                        handle,
+                        epoch,
+                        flow,
+                        &mut sockets,
+                        &mut socket_ctxs,
+                        &mut fake_pool,
+                        udp_clock.elapsed().as_secs(),
+                    ),
+                };
+                if active {
+                    dirty.insert(handle);
+                } else if socket_ctxs
+                    .get(&handle)
+                    .is_none_or(|ctx| ctx.state == SocketState::Listening)
+                {
+                    dirty.remove(&handle);
+                }
+            }
             // TCP relay 回程：后台车厢把远端回传字节送回主循环 → 注入对应 smoltcp socket。
             //   TUIC 自重连（live_conn），不需要 legacy 的 disconnect/复位分支。
             Some((handle, event)) = global_rx.recv(), if !global_rx_paused =>{
@@ -8193,6 +8676,7 @@ pub async fn run_event_loop<D, U, M>(
                                 &mut dirty,
                                 &handshake_done_tx,
                                 &global_tx,
+                                &owned_action_tx,
                                 &mut metrics,
                                 downlink_flush_max_bytes,
                                 downlink_backpressure,
@@ -8336,6 +8820,7 @@ pub async fn run_event_loop<D, U, M>(
                                 &mut dirty,
                                 &handshake_done_tx,
                                 &global_tx,
+                                &owned_action_tx,
                                 &mut metrics,
                                 downlink_flush_max_bytes,
                                 downlink_backpressure,
@@ -8386,6 +8871,7 @@ pub async fn run_event_loop<D, U, M>(
                                 &mut dirty,
                                 &handshake_done_tx,
                                 &global_tx,
+                                &owned_action_tx,
                                 &mut metrics,
                                 downlink_flush_max_bytes,
                                 downlink_backpressure,
@@ -8471,6 +8957,7 @@ pub async fn run_event_loop<D, U, M>(
                                 &mut dirty,
                                 &handshake_done_tx,
                                 &global_tx,
+                                &owned_action_tx,
                                 &mut metrics,
                                 downlink_flush_max_bytes,
                                 downlink_backpressure,
@@ -8584,6 +9071,7 @@ pub async fn run_event_loop<D, U, M>(
                                 &mut dirty,
                                 &handshake_done_tx,
                                 &global_tx,
+                                &owned_action_tx,
                                 &mut metrics,
                                 downlink_flush_max_bytes,
                                 downlink_backpressure,
@@ -8661,6 +9149,7 @@ pub async fn run_event_loop<D, U, M>(
                             &mut dirty,
                             &handshake_done_tx,
                             &global_tx,
+                            &owned_action_tx,
                             &mut metrics,
                             downlink_flush_max_bytes,
                             downlink_backpressure,
@@ -8721,6 +9210,7 @@ pub async fn run_event_loop<D, U, M>(
                             &mut dirty,
                             &handshake_done_tx,
                             &global_tx,
+                            &owned_action_tx,
                             &mut metrics,
                             downlink_flush_max_bytes,
                             downlink_backpressure,
@@ -8787,6 +9277,7 @@ pub async fn run_event_loop<D, U, M>(
                         &mut dirty,
                         &handshake_done_tx,
                         &global_tx,
+                        &owned_action_tx,
                         &mut metrics,
                         downlink_flush_max_bytes,
                         downlink_backpressure,
@@ -8845,6 +9336,7 @@ pub async fn run_event_loop<D, U, M>(
                             &mut dirty,
                             &handshake_done_tx,
                             &global_tx,
+                            &owned_action_tx,
                             &mut metrics,
                             downlink_flush_max_bytes,
                             downlink_backpressure,
@@ -8875,6 +9367,7 @@ pub async fn run_event_loop<D, U, M>(
                             &mut dirty,
                             &handshake_done_tx,
                             &global_tx,
+                            &owned_action_tx,
                             &mut metrics,
                             downlink_flush_max_bytes,
                             downlink_backpressure,
@@ -8921,6 +9414,7 @@ pub async fn run_event_loop<D, U, M>(
                             &mut dirty,
                             &handshake_done_tx,
                             &global_tx,
+                            &owned_action_tx,
                             &mut metrics,
                             downlink_flush_max_bytes,
                             downlink_backpressure,
@@ -8947,54 +9441,61 @@ pub async fn run_event_loop<D, U, M>(
             // 带 epoch 防串话。
             Some(done) = handshake_done_rx.recv() => {
                 metrics.loop_park_end();
+                let completed_handle = done.handle;
                 let relay_read_hard_pause = tun_rx_drain_diag.backlog_guard().is_active()
                     || if buffered_downlink.enabled {
                         tun_egress_feedback.is_paused()
                     } else {
                         downlink_rx_paused || tun_egress_feedback.is_paused()
                     };
-                handle_handshake_done(
+                if handle_handshake_done(
                     done,
                     &mut sockets,
                     &mut socket_ctxs,
                     &global_tx,
+                    &owned_action_tx,
                     &mut fake_pool,
                     udp_clock.elapsed().as_secs(),
                     &metrics_handle,
                     downlink_backpressure,
                     relay_read_hard_pause,
-                );
+                ) {
+                    // A protocol-owned async open may have completed after a zero-byte FIN
+                    // caused the previous dirty pass to remove this handle.
+                    // Wake the installed flow so its ordered LocalClose is
+                    // delivered even when no further packet arrives.
+                    dirty.insert(completed_handle);
+                }
             }
-            // Stage 13b/刀3: TUIC 下行（datagram 或 uni-stream）→ decode_packet_meta → 分片重组
-            // → AssocTable 解路由 → 造回程 IP/UDP 注入 TUN。FRAG_TOTAL==1 直通；>1 集齐才注入。
-            Some(dg) = tuic_downlink_rx.recv() => {
+            // 刀16 Task 3：上游中性 UDP 下行事件 → AssocTable 解路由 →
+            // 造回程 IP/UDP 注入 TUN。Legacy source 在 facade 内保留 TUIC 解码/分片重组；
+            // 每个 raw item 只产生一次 select 调度，不在 source 内循环改变公平性。
+            Some(event) = udp_downlink.recv(&udp_clock) => {
                 metrics.loop_park_end();
-                if let Some(meta) = decode_packet_meta(&dg) {
-                    let assoc_id = meta.assoc_id;
-                    // 分片重组：单帧直通；多帧集齐返回整包，否则缓存等后续帧。
-                    if let Some(payload) = reassembler.accept(&meta, udp_clock.elapsed().as_secs()) {
-                        // 先取出路由信息(Copy),释放 assoc_table 借用后再 touch。
-                        let routed = assoc_table
-                            .resolve(assoc_id)
-                            .map(|e| (e.target_src(), e.app_endpoint()));
-                        if let Some((src, dst)) = routed {
-                            let pkt = build_udp_ip_packet(src, dst, &payload);
-                            device.inject_ip_packet(&pkt);
-                            assoc_table.touch(assoc_id, udp_clock.elapsed().as_secs());
-                            let (flush_result, _) = flush_tx_and_release_downlink_permits(
-                                &mut device,
-                                &sockets,
-                                &mut socket_ctxs,
-                                "udp_downlink",
-                            )
-                            .await;
-                            if let Err(e) = flush_result {
-                                trace_log!("UDP 下行 flush 失败: {e}");
-                            }
-                        } else {
-                            // assoc 已回收/未知 → 丢弃该回程(应用会重发/重查,自愈)。
-                            trace_log!("🗑️ TUIC UDP↓ assoc={assoc_id} 无映射，丢弃 {}B", payload.len());
+                if let UdpDownlinkEvent::Deliver(downlink) = event {
+                    let (association, payload) = downlink.into_parts();
+                    let assoc_id = association.get();
+                    // 先取出路由信息(Copy),释放 assoc_table 借用后再 touch。
+                    let routed = assoc_table
+                        .resolve(assoc_id)
+                        .map(|e| (e.target_src(), e.app_endpoint()));
+                    if let Some((src, dst)) = routed {
+                        let pkt = build_udp_ip_packet(src, dst, &payload);
+                        device.inject_ip_packet(&pkt);
+                        assoc_table.touch(assoc_id, udp_clock.elapsed().as_secs());
+                        let (flush_result, _) = flush_tx_and_release_downlink_permits(
+                            &mut device,
+                            &sockets,
+                            &mut socket_ctxs,
+                            "udp_downlink",
+                        )
+                        .await;
+                        if let Err(e) = flush_result {
+                            trace_log!("UDP 下行 flush 失败: {e}");
                         }
+                    } else {
+                        // assoc 已回收/未知 → 丢弃该回程(应用会重发/重查,自愈)。
+                        trace_log!("🗑️ UDP↓ assoc={assoc_id} 无映射，丢弃 {}B", payload.len());
                     }
                 }
             }
@@ -9006,8 +9507,9 @@ pub async fn run_event_loop<D, U, M>(
                 for ip in assoc_table.sweep(now, UDP_FLOW_IDLE_SECS) {
                     fake_pool.release(ip, now);
                 }
-                // 刀3：回收未集齐且超时的下行分片包（丢片自愈，防内存泄漏）。
-                reassembler.sweep(now, crate::tuic::FRAG_REASSEMBLY_TTL_SECS);
+                // 刀16 Task 3：Legacy source 保留原 TUIC 未集齐分片的 TTL 回收；
+                // owned UDP source 在这个中性边界不持有 TUIC fragment state。
+                udp_downlink.sweep(now, crate::tuic::FRAG_REASSEMBLY_TTL_SECS);
                 // review #1/#2：回收已死/卡住的 TCP listener 槽（本地关闭/开远端失败的 teardown 缺口），
                 // 释放其 fake-IP refcount 并让槽回 Listen 复用，防 refcount 泄漏 + 槽数涨到 Capped。
                 reap_dead_slots(
@@ -9212,6 +9714,7 @@ pub async fn run_event_loop<D, U, M>(
                         &mut dirty,
                         &handshake_done_tx,
                         &global_tx,
+                        &owned_action_tx,
                         &mut metrics,
                         downlink_flush_max_bytes,
                         downlink_backpressure,
@@ -9252,6 +9755,7 @@ pub async fn run_event_loop<D, U, M>(
                     &upstream,
                     &handshake_done_tx,
                     &global_tx,
+                    &owned_action_tx,
                     &mut fake_pool,
                     udp_clock.elapsed().as_secs(),
                     &metrics_handle,
@@ -9284,6 +9788,7 @@ pub async fn run_event_loop<D, U, M>(
                         &mut dirty,
                         &handshake_done_tx,
                         &global_tx,
+                        &owned_action_tx,
                         &mut metrics,
                         downlink_flush_max_bytes,
                         downlink_backpressure,
@@ -9335,7 +9840,7 @@ async fn prepare_ready_tun_rx_packet<D, U>(
 ) -> TunRxPacketKind
 where
     D: TunIo,
-    U: ProxyUpstream + DatagramUpstream + 'static,
+    U: OwnedUpstream + 'static,
 {
     // rx 分流（stage-12 D1 + 刀5）：任意 :53 → 裸包 DNS 劫持；其它 UDP → 裸 relay；
     // 非 UDP → 既有 smoltcp 路径。前两类 take 走、不进 iface.poll。
@@ -9433,6 +9938,7 @@ async fn process_ready_tun_rx_packet<D, U, M>(
     dirty: &mut HashSet<SocketHandle>,
     handshake_done_tx: &mpsc::Sender<HandshakeDone>,
     global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    owned_action_tx: &mpsc::Sender<OwnedActionEvent>,
     metrics: &mut M,
     downlink_flush_max_bytes: usize,
     downlink_backpressure: DownlinkBackpressureConfig,
@@ -9446,7 +9952,7 @@ async fn process_ready_tun_rx_packet<D, U, M>(
 ) -> TunRxPacketKind
 where
     D: TunIo,
-    U: ProxyUpstream + DatagramUpstream + 'static,
+    U: OwnedUpstream + 'static,
     M: MetricsSink,
 {
     let packet_kind = prepare_ready_tun_rx_packet(
@@ -9487,6 +9993,7 @@ where
         upstream,
         handshake_done_tx,
         global_tx,
+        owned_action_tx,
         fake_pool,
         now_secs,
         metrics_handle,
@@ -9521,6 +10028,7 @@ async fn drain_ready_tun_rx<D, U, M>(
     dirty: &mut HashSet<SocketHandle>,
     handshake_done_tx: &mpsc::Sender<HandshakeDone>,
     global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    owned_action_tx: &mpsc::Sender<OwnedActionEvent>,
     metrics: &mut M,
     downlink_flush_max_bytes: usize,
     downlink_backpressure: DownlinkBackpressureConfig,
@@ -9536,7 +10044,7 @@ async fn drain_ready_tun_rx<D, U, M>(
 ) -> usize
 where
     D: TunIo,
-    U: ProxyUpstream + DatagramUpstream + 'static,
+    U: OwnedUpstream + 'static,
     M: MetricsSink,
 {
     if budget == 0 {
@@ -9660,6 +10168,7 @@ where
             upstream,
             handshake_done_tx,
             global_tx,
+            owned_action_tx,
             fake_pool,
             now_secs,
             metrics_handle,
@@ -9717,6 +10226,7 @@ async fn service_local_egress_until<D, U, M>(
     dirty: &mut HashSet<SocketHandle>,
     handshake_done_tx: &mpsc::Sender<HandshakeDone>,
     global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    owned_action_tx: &mpsc::Sender<OwnedActionEvent>,
     metrics: &mut M,
     downlink_flush_max_bytes: usize,
     downlink_backpressure: DownlinkBackpressureConfig,
@@ -9734,7 +10244,7 @@ async fn service_local_egress_until<D, U, M>(
 ) -> LocalEgressServiceProgress
 where
     D: TunIo,
-    U: ProxyUpstream + DatagramUpstream + 'static,
+    U: OwnedUpstream + 'static,
     M: MetricsSink,
 {
     let mut total = LocalEgressServiceProgress::default();
@@ -9799,6 +10309,7 @@ where
             dirty,
             handshake_done_tx,
             global_tx,
+            owned_action_tx,
             metrics,
             downlink_flush_max_bytes,
             downlink_backpressure,
@@ -9865,6 +10376,7 @@ where
             upstream,
             handshake_done_tx,
             global_tx,
+            owned_action_tx,
             fake_pool,
             now_secs,
             metrics_handle,
@@ -9998,6 +10510,7 @@ async fn process_dirty_relay<U, M>(
     upstream: &Arc<U>,
     handshake_done_tx: &mpsc::Sender<HandshakeDone>,
     global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    owned_action_tx: &mpsc::Sender<OwnedActionEvent>,
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
     metrics_handle: &Metrics,
@@ -10012,7 +10525,7 @@ async fn process_dirty_relay<U, M>(
     buffered_downlink: BufferedDownlinkConfig,
     admission_origin: DownlinkAdmissionOrigin,
 ) where
-    U: ProxyUpstream + 'static,
+    U: OwnedUpstream + 'static,
     M: MetricsSink,
 {
     metrics.enter_relay();
@@ -10027,7 +10540,7 @@ async fn process_dirty_relay<U, M>(
         let pending_before = if buffered_downlink.enabled {
             socket_ctxs
                 .get(&handle)
-                .map(|ctx| ctx.downlink_pending.len())
+                .map(SocketCtx::pending_downlink_bytes)
                 .unwrap_or(0)
         } else {
             0
@@ -10039,6 +10552,7 @@ async fn process_dirty_relay<U, M>(
             upstream,
             handshake_done_tx,
             global_tx,
+            owned_action_tx,
             fake_pool,
             now_secs,
             metrics_handle,
@@ -10065,34 +10579,39 @@ async fn process_dirty_relay<U, M>(
                 has_d16_actor_work,
                 has_d16_phase_work,
                 needs_local_finish,
+                has_owned_control_work,
             ) = socket_ctxs
                 .get_mut(&handle)
                 .map(|c| {
                     log_tcp_lifecycle_observation(handle, c, snapshot, now_secs, "dirty_relay");
                     (
-                        !c.downlink_pending.is_empty(),
+                        c.pending_downlink_bytes() > 0,
                         c.downlink_inflight_permit_bytes() > 0,
                         d16_queue_has_actor_work(c),
-                        c.d16_downlink_queue.is_some()
-                            && c.d16_egress_phase != EgressPhase::Running,
-                        snapshot.tcp_state == TcpState::CloseWait
-                            && c.uplink_tx.is_some()
+                        c.uses_owned_egress_actor() && c.d16_egress_phase != EgressPhase::Running,
+                        (if c.resumable_uplink.is_some() {
+                            resumable_local_source_eof(snapshot)
+                        } else {
+                            snapshot.tcp_state == TcpState::CloseWait
+                        }) && c.has_live_uplink()
                             && !c.local_fin_sent,
+                        c.resumable_half_close.is_some() || c.resumable_terminal.is_some(),
                     )
                 })
-                .unwrap_or((false, false, false, false, false));
+                .unwrap_or((false, false, false, false, false, false));
             has_recv
                 || has_pending
                 || has_inflight_permits
                 || has_d16_actor_work
                 || has_d16_phase_work
                 || needs_local_finish
+                || has_owned_control_work
                 || snapshot.send_queue > downlink_backpressure.low_bytes
         };
         if buffered_downlink.enabled {
             let pending_after = socket_ctxs
                 .get(&handle)
-                .map(|ctx| ctx.downlink_pending.len())
+                .map(SocketCtx::pending_downlink_bytes)
                 .unwrap_or(0);
             current_global_pending = current_global_pending
                 .saturating_sub(pending_before)
@@ -10185,6 +10704,43 @@ fn should_reap_slot_with_snapshot(
     snapshot: SocketCloseSnapshot,
     now_secs: u64,
 ) -> bool {
+    let exact_graceful_terminal_ready = matches!(
+        ctx.resumable_terminal,
+        Some(TerminalAction::FlowFinished(FlowFinishReason::Graceful))
+    );
+    if exact_graceful_terminal_ready {
+        let wait_started = *ctx.owned_terminal_wait_since_secs.get_or_insert(now_secs);
+        let wait_expired = now_secs.saturating_sub(wait_started) >= OWNED_TERMINAL_WAIT_GRACE_SECS;
+        if !snapshot.active || wait_expired {
+            // The reducer already owns terminal cleanup, so this forced reap
+            // is clean: rearm observes `resumable_terminal` and does not mint
+            // a synthetic LocalReset. Bound LastAck/Closing stalls instead of
+            // retaining the slot and bridge forever.
+            ctx.owned_terminal_wait_since_secs = None;
+            return true;
+        }
+        return false;
+    }
+    if ctx.owned_terminal_pending {
+        let wait_started = *ctx.owned_terminal_wait_since_secs.get_or_insert(now_secs);
+        if now_secs.saturating_sub(wait_started) < OWNED_TERMINAL_WAIT_GRACE_SECS {
+            return false;
+        }
+        // An exact reducer terminal retired the port, but its independently
+        // queued TUN action failed to arrive within the bounded local transit
+        // window. Fail this socket incarnation closed; the retired port will
+        // reject any synthetic reset, so terminal ownership is not duplicated.
+        ctx.owned_terminal_wait_since_secs = None;
+        return true;
+    }
+    if should_defer_owned_terminal_reap(
+        ctx.awaits_owned_graceful_terminal(),
+        snapshot.active,
+        &mut ctx.owned_terminal_wait_since_secs,
+        now_secs,
+    ) {
+        return false;
+    }
     if ctx.pending_relay_close.is_some() && snapshot.active && snapshot.can_send {
         note_deferred_close_egress_progress(ctx, snapshot.send_queue, now_secs);
         return false;
@@ -10198,6 +10754,20 @@ fn should_reap_slot_with_snapshot(
     )
 }
 
+fn should_defer_owned_terminal_reap(
+    awaits_terminal: bool,
+    socket_active: bool,
+    wait_started_secs: &mut Option<u64>,
+    now_secs: u64,
+) -> bool {
+    if awaits_terminal && !socket_active {
+        let wait_started = *wait_started_secs.get_or_insert(now_secs);
+        return now_secs.saturating_sub(wait_started) < OWNED_TERMINAL_WAIT_GRACE_SECS;
+    }
+    *wait_started_secs = None;
+    false
+}
+
 fn should_reap_slot(
     ctx: &SocketCtx,
     tcp_state: TcpState,
@@ -10205,10 +10775,10 @@ fn should_reap_slot(
     can_send: bool,
     now_secs: u64,
 ) -> bool {
-    if ctx.state == SocketState::Listening {
+    if ctx.state == SocketState::Listening && tcp_state == TcpState::Listen {
         return false;
     }
-    if !ctx.downlink_pending.is_empty() {
+    if ctx.pending_downlink_bytes() > 0 {
         if active {
             return false;
         }
@@ -10231,9 +10801,9 @@ fn should_reap_slot(
         return true;
     }
     if tcp_state == TcpState::CloseWait {
-        return ctx.uplink_tx.is_none() && !ctx.local_fin_sent;
+        return !ctx.has_live_uplink() && !ctx.local_fin_sent;
     }
-    ctx.state == SocketState::OpeningRemote && ctx.uplink_tx.is_none()
+    ctx.state == SocketState::OpeningRemote && !ctx.has_live_uplink()
 }
 
 fn relay_allows_remote_payload(ctx: &SocketCtx) -> bool {
@@ -10679,6 +11249,90 @@ fn pump_established_uplink(
     EstablishedUplink::Handled
 }
 
+/// Protocol-owned uplink pump. `peek` determines the exact contiguous extent
+/// without consuming it; the flow port then reserves both its message slot
+/// and exact replay bytes before the extractor dequeues anything from smoltcp.
+fn resumable_local_source_eof(snapshot: SocketCloseSnapshot) -> bool {
+    !snapshot.may_recv
+        && matches!(
+            snapshot.tcp_state,
+            TcpState::CloseWait | TcpState::Closing | TcpState::TimeWait | TcpState::LastAck
+        )
+}
+
+fn resumable_uplink_admission_is_backpressure(error: &FlowPortError) -> bool {
+    matches!(
+        error,
+        FlowPortError::UplinkMessageLaneFull
+            | FlowPortError::UplinkByteBudgetExhausted { .. }
+            | FlowPortError::UplinkGlobalByteBudgetExhausted { .. }
+    )
+}
+
+fn pump_resumable_uplink(
+    ctx: &mut SocketCtx,
+    tcp_socket: &mut TcpSocket<'_>,
+    snapshot: SocketCloseSnapshot,
+) -> EstablishedUplink {
+    if ctx.owned_terminal_pending {
+        return EstablishedUplink::Handled;
+    }
+    let Some(uplink) = ctx.resumable_uplink.as_ref() else {
+        return EstablishedUplink::NotEstablished;
+    };
+
+    for _ in 0..MAX_ESTABLISHED_UPLINK_BATCH {
+        let byte_len = match tcp_socket.peek(MAX_DATA_PAYLOAD_BYTES) {
+            Ok(bytes) => bytes.len(),
+            Err(_) => 0,
+        };
+        if byte_len == 0 {
+            if resumable_local_source_eof(snapshot) && !ctx.local_fin_sent {
+                match uplink.try_send_close() {
+                    Ok(()) => {
+                        ctx.local_fin_sent = true;
+                        ctx.state = SocketState::Relaying;
+                    }
+                    Err(FlowPortError::UplinkMessageLaneFull) => {}
+                    Err(FlowPortError::Closed) => return EstablishedUplink::Closed,
+                    Err(error) => {
+                        tcp_diag_log!("🔎 owned-uplink-close-error error={error}");
+                        return EstablishedUplink::Closed;
+                    }
+                }
+            }
+            return EstablishedUplink::Handled;
+        }
+
+        let admitted = uplink.try_send_uplink_vec_with(byte_len, || {
+            let mut payload = vec![0u8; byte_len];
+            match tcp_socket.recv_slice(&mut payload) {
+                Ok(read) => {
+                    payload.truncate(read);
+                    payload
+                }
+                Err(_) => Vec::new(),
+            }
+        });
+        match admitted {
+            Ok(()) => ctx.state = SocketState::Relaying,
+            Err(error) if resumable_uplink_admission_is_backpressure(&error) => {
+                return EstablishedUplink::Handled;
+            }
+            Err(FlowPortError::Closed) => return EstablishedUplink::Closed,
+            Err(error) => {
+                // A length mismatch after reservation would mean the
+                // single-owner peek/recv transaction drifted. Bytes may have
+                // been consumed, so fail this flow closed rather than retrying
+                // and risking duplication.
+                tcp_diag_log!("🔎 owned-uplink-admission-error error={error}");
+                return EstablishedUplink::Closed;
+            }
+        }
+    }
+    EstablishedUplink::Handled
+}
+
 fn rearm_socket_with_reason(
     handle: SocketHandle,
     socket: &mut TcpSocket<'_>,
@@ -10863,12 +11517,38 @@ fn rearm_socket(
     ctx.state = SocketState::Closing;
     socket.abort();
     ctx.uplink_tx = None;
+    // Knife16 Task 3: end local ownership explicitly. A pending sink/FIN owns
+    // a reserved completion slot and therefore must be failed before its
+    // flow port disappears. LocalReset owns an independent reserved terminal
+    // lane, so ordinary source/completion pressure cannot erase teardown.
+    ctx.resumable_action_bridge = None;
+    if let Some(sink) = ctx.resumable_sink.take() {
+        sink.abandon();
+    }
+    if let Some(half_close) = ctx.resumable_half_close.take() {
+        half_close.fail();
+    }
+    let had_reducer_terminal = ctx.resumable_terminal.take().is_some();
+    if let Some(uplink) = ctx.resumable_uplink.take()
+        && !had_reducer_terminal
+    {
+        match uplink.try_send_reset(ResetReason::LocalAbandon) {
+            Ok(()) | Err(FlowPortError::TerminalLaneFull) => {}
+            Err(FlowPortError::Closed) => {}
+            Err(error) => {
+                tcp_diag_log!("🔎 owned-uplink-reset-error error={error}");
+            }
+        }
+    }
+    ctx.pending_open_mode = None;
     ctx.relay_read_credit_tx = None;
     ctx.d16_downlink_queue = None;
     ctx.d16_egress_phase = EgressPhase::Running;
     ctx.d16_tun_rx_ack_barrier = false;
     ctx.local_fin_sent = false;
     ctx.local_eof_sent = false;
+    ctx.owned_terminal_pending = false;
+    ctx.owned_terminal_wait_since_secs = None;
     ctx.local_fin_pending_since_secs = None;
     ctx.local_fin_last_remote_progress_secs = None;
     ctx.clear_downlink_pending();
@@ -10907,13 +11587,14 @@ fn rearm_socket(
 /// Process one listener slot after iface polling.
 /// 中文要点：主循环只负责遍历 handle，真正的房间处理逻辑都收口在这里。
 #[allow(clippy::too_many_arguments)]
-async fn process_listener_activity<U: ProxyUpstream + 'static>(
+async fn process_listener_activity<U: OwnedUpstream + 'static>(
     handle: SocketHandle,
     sockets: &mut SocketSet<'_>,
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
     upstream: &Arc<U>,
     handshake_done_tx: &mpsc::Sender<HandshakeDone>,
     global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    owned_action_tx: &mpsc::Sender<OwnedActionEvent>,
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
     metrics_handle: &Metrics,
@@ -10930,6 +11611,20 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
     {
         let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
         if let Some(ctx) = socket_ctxs.get_mut(&handle) {
+            let graceful_owned_terminal = matches!(
+                ctx.resumable_terminal,
+                Some(TerminalAction::FlowFinished(FlowFinishReason::Graceful))
+            );
+            if graceful_owned_terminal && !tcp_socket.is_active() {
+                // The reducer has completed protocol ownership and the local
+                // FIN has now drained. Clear the flow capability before the
+                // generic rearm path so it does not synthesize a new reset.
+                ctx.resumable_terminal = None;
+                ctx.resumable_action_bridge = None;
+                ctx.resumable_uplink = None;
+                rearm_socket(tcp_socket, ctx, fake_pool, now_secs);
+                return Ok(());
+            }
             let flush_outcome = admit_downlink_for_handle(
                 handle,
                 tcp_socket,
@@ -10941,6 +11636,7 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
                 admission_origin,
             );
             note_downlink_pending_progress(ctx, now_secs, flush_outcome.accepted_bytes);
+            let _ = apply_resumable_half_close(tcp_socket, ctx);
             if install_d16_remote_eof_if_ready(ctx, now_secs) {
                 tcp_diag_log!(
                     "🔎 tcp-d16-remote-eof-observed handle={:?} epoch={} pending={} inflight_permit_bytes={}",
@@ -10962,6 +11658,38 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
                 return Ok(());
             }
         }
+    }
+
+    // Knife16 Task 3: protocol-owned flows get first claim on uplink service.
+    // The pump reserves exact replay ownership before dequeuing smoltcp bytes.
+    let resumable_uplink = {
+        let Some(ctx) = socket_ctxs.get_mut(&handle) else {
+            return Ok(());
+        };
+        let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
+        ctx.downlink_diag
+            .note_uplink_recv_queue(tcp_socket.recv_queue());
+        let snapshot = SocketCloseSnapshot::from_socket(tcp_socket);
+        pump_resumable_uplink(ctx, tcp_socket, snapshot)
+    };
+    match resumable_uplink {
+        EstablishedUplink::Handled => return Ok(()),
+        EstablishedUplink::Closed => {
+            let tcp_socket = sockets.get_mut::<TcpSocket>(handle);
+            if let Some(ctx) = socket_ctxs.get_mut(&handle) {
+                rearm_socket_with_reason(
+                    handle,
+                    tcp_socket,
+                    ctx,
+                    fake_pool,
+                    now_secs,
+                    "local_to_owner",
+                    "owned_uplink_closed",
+                );
+            }
+            return Ok(());
+        }
+        EstablishedUplink::NotEstablished => {}
     }
 
     // 刀13 ② / 刀14s：已建立 relay 的上行必须非阻塞。先抢 mpsc permit，再从 smoltcp 取字节；
@@ -11037,6 +11765,53 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
             return Ok(());
         }
         EstablishedUplink::NotEstablished => {}
+    }
+
+    if upstream.tcp_ownership_mode() == TcpOwnershipMode::Resumable {
+        return open_resumable_listener_if_ready(
+            handle,
+            sockets,
+            socket_ctxs,
+            upstream,
+            handshake_done_tx,
+            owned_action_tx,
+            fake_pool,
+            now_secs,
+            relay_read_hard_pause,
+        )
+        .await;
+    }
+
+    // A local peer may complete SYN then immediately FIN without sending a
+    // payload. Legacy mode has nothing to open upstream for, but the listener
+    // incarnation still must be reclaimed instead of remaining forever in a
+    // logical Listening state over a CloseWait/Closed smoltcp socket.
+    let legacy_empty_close = {
+        let socket = sockets.get::<TcpSocket>(handle);
+        socket.recv_queue() == 0
+            && matches!(
+                socket.state(),
+                TcpState::CloseWait
+                    | TcpState::Closing
+                    | TcpState::TimeWait
+                    | TcpState::LastAck
+                    | TcpState::Closed
+            )
+    };
+    if legacy_empty_close {
+        let socket = sockets.get_mut::<TcpSocket>(handle);
+        if let Some(ctx) = socket_ctxs.get_mut(&handle) {
+            rearm_socket_with_reason(
+                handle,
+                socket,
+                ctx,
+                fake_pool,
+                now_secs,
+                "local",
+                "empty_local_close",
+            );
+        }
+        return Ok(());
     }
 
     // 取首包的同时读 local_endpoint：它就是被拦截连接真正想去的目的 endpoint。
@@ -11124,8 +11899,164 @@ async fn process_listener_activity<U: ProxyUpstream + 'static>(
     .await
 }
 
+/// Open a protocol-owned TCP flow without first consuming the local smoltcp
+/// receive queue. This is the critical difference from the frozen legacy
+/// path: replay capacity does not exist until the returned flow port is
+/// installed, so all bytes remain under TCP-window backpressure meanwhile.
 #[allow(clippy::too_many_arguments)]
-async fn handle_local_payload<U: ProxyUpstream + 'static>(
+async fn open_resumable_listener_if_ready<U: OwnedUpstream + 'static>(
+    handle: SocketHandle,
+    sockets: &mut SocketSet<'_>,
+    socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
+    upstream: &Arc<U>,
+    handshake_done_tx: &mpsc::Sender<HandshakeDone>,
+    owned_action_tx: &mpsc::Sender<OwnedActionEvent>,
+    fake_pool: &mut FakeIpPool,
+    now_secs: u64,
+    hard_pause_active: bool,
+) -> Result<(), ClientError> {
+    let Some(ctx) = socket_ctxs.get_mut(&handle) else {
+        return Ok(());
+    };
+    if ctx.state == SocketState::HandshakePending {
+        return Ok(());
+    }
+    if ctx.resumable_uplink.is_some() || ctx.uplink_tx.is_some() {
+        return Err(ClientError::Io(std::io::Error::other(
+            "attempted a second upstream install for one socket incarnation",
+        )));
+    }
+
+    let endpoint = {
+        let socket = sockets.get_mut::<TcpSocket>(handle);
+        let snapshot = SocketCloseSnapshot::from_socket(socket);
+        if !socket.can_recv() && !resumable_local_source_eof(snapshot) {
+            return Ok(());
+        }
+        socket.local_endpoint()
+    };
+    let Some(endpoint) = endpoint else {
+        return Ok(());
+    };
+    let (target, fake_ip) = match resolve_target(endpoint, fake_pool) {
+        TargetResolve::Direct { target, fake_ip } => (target, fake_ip),
+        TargetResolve::Refuse => {
+            let socket = sockets.get_mut::<TcpSocket>(handle);
+            rearm_socket_with_reason(
+                handle,
+                socket,
+                ctx,
+                fake_pool,
+                now_secs,
+                "target",
+                "fake_ip_refuse",
+            );
+            return Ok(());
+        }
+        TargetResolve::Block => {
+            let socket = sockets.get_mut::<TcpSocket>(handle);
+            rearm_socket_with_reason(
+                handle,
+                socket,
+                ctx,
+                fake_pool,
+                now_secs,
+                "policy",
+                "encrypted_dns_block",
+            );
+            return Ok(());
+        }
+    };
+
+    if upstream.open_is_cheap() {
+        ctx.state = SocketState::OpeningRemote;
+        let opened = with_tcp_relay_open_diag(
+            TcpRelayOpenDiag {
+                handle: format!("{handle:?}"),
+                epoch: ctx.conn_epoch,
+            },
+            upstream.open_tcp_flow(&target),
+        )
+        .await;
+        match opened {
+            Ok(OpenedOwnedTcp::Resumable(flow)) => {
+                if let Some(ip) = fake_ip {
+                    fake_pool.acquire(ip, now_secs);
+                    ctx.fake_ip = Some(ip);
+                }
+                install_resumable_tcp_flow(
+                    handle,
+                    ctx.conn_epoch,
+                    ctx,
+                    flow,
+                    owned_action_tx,
+                    hard_pause_active,
+                );
+                Ok(())
+            }
+            Ok(OpenedOwnedTcp::Legacy(_)) => {
+                let socket = sockets.get_mut::<TcpSocket>(handle);
+                rearm_socket_with_reason(
+                    handle,
+                    socket,
+                    ctx,
+                    fake_pool,
+                    now_secs,
+                    "remote_open",
+                    "ownership_mode_mismatch",
+                );
+                Ok(())
+            }
+            Err(error) => {
+                let socket = sockets.get_mut::<TcpSocket>(handle);
+                rearm_socket_with_reason(
+                    handle,
+                    socket,
+                    ctx,
+                    fake_pool,
+                    now_secs,
+                    "remote_open",
+                    "resumable_open_failed",
+                );
+                Err(error)
+            }
+        }
+    } else {
+        ctx.state = SocketState::HandshakePending;
+        ctx.pending_open_mode = Some(TcpOwnershipMode::Resumable);
+        ctx.conn_epoch = ctx.conn_epoch.wrapping_add(1);
+        let epoch = ctx.conn_epoch;
+        if let Some(ip) = fake_ip {
+            fake_pool.acquire(ip, now_secs);
+            ctx.fake_ip = Some(ip);
+        }
+        // Unlike the legacy path, no local DATA is extracted or copied while
+        // this open is in flight. `uplink_buffer` must remain empty.
+        debug_assert!(ctx.uplink_buffer.is_empty());
+        let up = Arc::clone(upstream);
+        let done_tx = handshake_done_tx.clone();
+        let open_diag = TcpRelayOpenDiag {
+            handle: format!("{handle:?}"),
+            epoch,
+        };
+        tokio::spawn(async move {
+            let result = with_tcp_relay_open_diag(open_diag, up.open_tcp_flow(&target)).await;
+            publish_handshake_done(
+                &done_tx,
+                HandshakeDone {
+                    handle,
+                    epoch,
+                    result,
+                },
+            )
+            .await;
+        });
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_local_payload<U: OwnedUpstream + 'static>(
     handle: SocketHandle,
     payload: Vec<u8>,
     target: Option<TargetAddr>,
@@ -11141,6 +12072,11 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
     downlink_backpressure: DownlinkBackpressureConfig,
     relay_read_hard_pause: bool,
 ) -> Result<(), ClientError> {
+    if upstream.tcp_ownership_mode() != TcpOwnershipMode::LegacyRelay {
+        return Err(ClientError::Io(std::io::Error::other(
+            "legacy payload path selected for a resumable upstream",
+        )));
+    }
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
         return Ok(());
     };
@@ -11179,7 +12115,7 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
                 handle: format!("{handle:?}"),
                 epoch: ctx.conn_epoch,
             },
-            upstream.open_tcp_relay(&target),
+            open_legacy_owned_tcp(upstream.as_ref(), &target),
         )
         .await?;
         trace_log!("🚪 handle {:?} remote session opened", handle);
@@ -11225,6 +12161,7 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
         // —— 不廉价上游：把远端 TCP open spawn 出主循环并发化（刀9 M3 / 刀14d）——
         // 主循环立即返回处理其它 flow，不被这条慢 open stall。完成后经 handshake_done channel 回灌。
         ctx.state = SocketState::HandshakePending;
+        ctx.pending_open_mode = Some(TcpOwnershipMode::LegacyRelay);
         ctx.conn_epoch = ctx.conn_epoch.wrapping_add(1); // 新 remote-open 代次
         let epoch = ctx.conn_epoch;
         // fake-IP 在 spawn 时 acquire（与 inline「成功后才 acquire」不同——spawn 路径无早返回，
@@ -11254,59 +12191,144 @@ async fn handle_local_payload<U: ProxyUpstream + 'static>(
             epoch,
         };
         tokio::spawn(async move {
-            let result = with_tcp_relay_open_diag(open_diag, up.open_tcp_relay(&target)).await; // production open_tcp implementations carry their own timeout budget
-            // channel 满 → send().await 背压（不丢，等主循环排空）；主循环已退出 → send 失败、忽略。
-            let _ = done_tx
-                .send(HandshakeDone {
+            let result = with_tcp_relay_open_diag(open_diag, up.open_tcp_flow(&target)).await; // production open implementations carry their own timeout budget
+            // channel 满 → send().await 背压（不丢，等主循环排空）；主循环退出时，
+            // resumable result still emits exact LocalAbandon before it is dropped.
+            publish_handshake_done(
+                &done_tx,
+                HandshakeDone {
                     handle,
                     epoch,
                     result,
-                })
-                .await;
+                },
+            )
+            .await;
         });
         Ok(())
     }
 }
 
+/// Exact legacy extraction. A resumable flow is never coerced into
+/// `AsyncRead/AsyncWrite`, because that would erase application-ACK and replay
+/// ownership.
+async fn open_legacy_owned_tcp<U: OwnedUpstream + ?Sized>(
+    upstream: &U,
+    target: &TargetAddr,
+) -> Result<OpenedTcpRelay, ClientError> {
+    match upstream.open_tcp_flow(target).await? {
+        OpenedOwnedTcp::Legacy(relay) => Ok(relay),
+        OpenedOwnedTcp::Resumable(flow) => {
+            abandon_uninstalled_owned_tcp(
+                OpenedOwnedTcp::Resumable(flow),
+                "legacy_open_received_resumable",
+            );
+            Err(ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "resumable TCP flow requires the owned SocketCtx path",
+            )))
+        }
+    }
+}
+
+fn install_resumable_tcp_flow(
+    handle: SocketHandle,
+    epoch: u64,
+    ctx: &mut SocketCtx,
+    flow: crate::owned_upstream::ResumableTcpFlow,
+    owned_action_tx: &mpsc::Sender<OwnedActionEvent>,
+    hard_pause_active: bool,
+) {
+    let (uplink, downlink) = flow.into_split();
+    ctx.uplink_tx = None;
+    ctx.relay_read_credit_tx = None;
+    ctx.resumable_sink = None;
+    ctx.resumable_half_close = None;
+    ctx.resumable_terminal = None;
+    ctx.owned_terminal_pending = false;
+    ctx.owned_terminal_wait_since_secs = None;
+    ctx.resumable_action_bridge = Some(spawn_resumable_action_bridge(
+        handle,
+        epoch,
+        downlink,
+        owned_action_tx.clone(),
+    ));
+    ctx.resumable_uplink = Some(uplink);
+    ctx.downlink_d3_actor_flow = true;
+    ctx.d16_tun_rx_ack_barrier = false;
+    ctx.d16_egress_phase = if hard_pause_active {
+        EgressPhase::DrainOnly
+    } else {
+        EgressPhase::Running
+    };
+    ctx.pending_open_mode = None;
+    ctx.state = SocketState::Relaying;
+}
+
+fn abandon_uninstalled_owned_tcp(opened: OpenedOwnedTcp, cause: &'static str) {
+    let OpenedOwnedTcp::Resumable(flow) = opened else {
+        return;
+    };
+    if let Err(error) = flow.abandon_before_install() {
+        tcp_diag_log!("🔎 owned-open-abandon-error cause={cause} error={error}");
+    }
+}
+
 /// 处理一次 spawned remote-open 的完成事件。**epoch 防串话置于一切之前**——迟到结果绝不装到新一代 socket。
 /// 成功 → 安装 uplink channel + 按序 flush open 期间缓存 + spawn relay；失败 → rearm。
+///
+/// 返回值仅表示“新安装的 protocol-owned flow 需要立即重新进入 dirty
+/// service”。Legacy relay 仍以原有 global event 作为唤醒权威，因此安装成功也返回
+/// `false`，不应将该值解释为通用 success flag。
 fn handle_handshake_done(
     done: HandshakeDone,
     sockets: &mut SocketSet<'_>,
     socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
     global_tx: &mpsc::Sender<(SocketHandle, RelayEvent)>,
+    owned_action_tx: &mpsc::Sender<OwnedActionEvent>,
     fake_pool: &mut FakeIpPool,
     now_secs: u64,
     metrics_handle: &Metrics,
     downlink_backpressure: DownlinkBackpressureConfig,
     relay_read_hard_pause: bool,
-) {
+) -> bool {
     let HandshakeDone {
         handle,
         epoch,
         result,
     } = done;
     let Some(ctx) = socket_ctxs.get_mut(&handle) else {
-        return; // 槽已不存在：丢弃（Ok 的流随作用域 drop 关闭）
+        if let Ok(opened) = result {
+            abandon_uninstalled_owned_tcp(opened, "socket_missing");
+        }
+        return false;
     };
     // 防串话（V2 patch 3）：epoch 比较置于状态检查**之前**。不匹配 = 本槽已 rearm/换代/复位 →
-    // 迟到的 open 结果丢弃，绝不装到新一代 socket。Ok 的流随作用域结束 drop 而干净关闭。
+    // 迟到的 open 结果绝不装到新一代 socket；protocol-owned 结果还必须显式留下
+    // LocalAbandon，不能把 endpoint drop 误当成 session flow 已终止。
     if ctx.conn_epoch != epoch {
-        if result.is_ok() {
+        let completed = result.is_ok();
+        if completed {
             trace_log!(
                 "🗑️ handle {:?} 迟到 open 结果(epoch {epoch}≠{}) 丢弃，不装到新代 socket",
                 handle,
                 ctx.conn_epoch
             );
         }
-        return;
+        if let Ok(opened) = result {
+            abandon_uninstalled_owned_tcp(opened, "stale_socket_epoch");
+        }
+        return false;
     }
     // 二次防御：epoch 匹配但状态已非 HandshakePending（理论不该发生）→ 不装。
     if ctx.state != SocketState::HandshakePending {
-        return;
+        if let Ok(opened) = result {
+            abandon_uninstalled_owned_tcp(opened, "socket_state_changed");
+        }
+        return false;
     }
-    match result {
-        Ok(stream) => {
+    let expected_mode = ctx.pending_open_mode.take();
+    match (expected_mode, result) {
+        (Some(TcpOwnershipMode::LegacyRelay), Ok(OpenedOwnedTcp::Legacy(stream))) => {
             let (tx, rx) = tokio::sync::mpsc::channel(RELAY_CHANNEL_CAPACITY);
             // 按序 flush open 期间缓存的上行字节（首包 + 在飞期到达的后续包，FIFO）。新 channel 容量充足、
             // rx 未 drop、仅 1 条消息 → try_send 必成（避免 await-with-borrow）。防御性：万一失败（未来
@@ -11328,7 +12350,7 @@ fn handle_handshake_done(
                         "local_to_remote",
                         "handshake_buffer_flush_failed",
                     );
-                    return; // stream 随作用域 drop 干净关闭
+                    return false; // stream 随作用域 drop 干净关闭
                 }
             }
             ctx.uplink_tx = Some(tx);
@@ -11348,8 +12370,81 @@ fn handle_handshake_done(
                 initial_relay_read_credit(relay_read_hard_pause),
             );
             install_spawned_remote_relay(ctx, spawned, relay_read_hard_pause);
+            // Preserve the legacy scheduler exactly: its spawned relay/global
+            // event is the wakeup authority, as before Knife16.
+            false
         }
-        Err(e) => {
+        (Some(TcpOwnershipMode::Resumable), Ok(OpenedOwnedTcp::Resumable(flow))) => {
+            if !ctx.uplink_buffer.is_empty() {
+                // Resumable open must never have consumed/buffered local bytes
+                // before its replay port was installed.
+                let socket = sockets.get_mut::<TcpSocket>(handle);
+                rearm_socket_with_reason(
+                    handle,
+                    socket,
+                    ctx,
+                    fake_pool,
+                    now_secs,
+                    "local_to_owner",
+                    "resumable_open_buffer_invariant",
+                );
+                abandon_uninstalled_owned_tcp(
+                    OpenedOwnedTcp::Resumable(flow),
+                    "buffered_before_resumable_install",
+                );
+                return false;
+            }
+            install_resumable_tcp_flow(
+                handle,
+                epoch,
+                ctx,
+                flow,
+                owned_action_tx,
+                relay_read_hard_pause,
+            );
+            trace_log!(
+                "🚪 handle {:?} protocol-owned TCP flow opened (epoch={epoch})",
+                handle
+            );
+            true
+        }
+        (Some(expected), Ok(opened)) => {
+            let actual = match &opened {
+                OpenedOwnedTcp::Legacy(_) => TcpOwnershipMode::LegacyRelay,
+                OpenedOwnedTcp::Resumable(_) => TcpOwnershipMode::Resumable,
+            };
+            println!(
+                "❌ handle {:?} upstream ownership mismatch: expected={expected:?} actual={actual:?} → rearm",
+                handle
+            );
+            let socket = sockets.get_mut::<TcpSocket>(handle);
+            rearm_socket_with_reason(
+                handle,
+                socket,
+                ctx,
+                fake_pool,
+                now_secs,
+                "remote_open",
+                "ownership_mode_mismatch",
+            );
+            abandon_uninstalled_owned_tcp(opened, "ownership_mode_mismatch");
+            false
+        }
+        (None, Ok(opened)) => {
+            let socket = sockets.get_mut::<TcpSocket>(handle);
+            rearm_socket_with_reason(
+                handle,
+                socket,
+                ctx,
+                fake_pool,
+                now_secs,
+                "remote_open",
+                "missing_open_ownership_mode",
+            );
+            abandon_uninstalled_owned_tcp(opened, "missing_open_ownership_mode");
+            false
+        }
+        (_, Err(e)) => {
             println!(
                 "❌ handle {:?} spawned remote open failed: {e} → rearm",
                 handle
@@ -11364,6 +12459,7 @@ fn handle_handshake_done(
                 "remote_open",
                 "handshake_failed",
             ); // 释放 spawn 时 acquire 的 fake-IP（平衡）
+            false
         }
     }
 }
@@ -11700,6 +12796,205 @@ fn handle_relay_closed(
         close.reason,
     );
     false
+}
+
+fn handle_owned_port_closed(
+    handle: SocketHandle,
+    epoch: u64,
+    flow: LocalFlow,
+    sockets: &mut SocketSet<'_>,
+    socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
+    fake_pool: &mut FakeIpPool,
+    now_secs: u64,
+) -> bool {
+    let Some(ctx) = socket_ctxs.get_mut(&handle) else {
+        return false;
+    };
+    if ctx.conn_epoch != epoch || ctx.resumable_uplink.is_none() {
+        return false;
+    }
+    let expected_flow = ctx
+        .resumable_uplink
+        .as_ref()
+        .map(ResumableTcpUplink::local_flow);
+    let reason = if ctx.owned_terminal_pending {
+        "owned_terminal_delivery_lost"
+    } else if expected_flow == Some(flow) {
+        "owned_flow_port_closed"
+    } else {
+        "cross_flow_owned_port_close"
+    };
+    let socket = sockets.get_mut::<TcpSocket>(handle);
+    rearm_socket_with_reason(
+        handle,
+        socket,
+        ctx,
+        fake_pool,
+        now_secs,
+        "owner_to_local",
+        reason,
+    );
+    false
+}
+
+fn handle_owned_tun_action(
+    handle: SocketHandle,
+    epoch: u64,
+    action: TunAction,
+    sockets: &mut SocketSet<'_>,
+    socket_ctxs: &mut HashMap<SocketHandle, SocketCtx>,
+    fake_pool: &mut FakeIpPool,
+    now_secs: u64,
+) -> bool {
+    let Some(ctx) = socket_ctxs.get_mut(&handle) else {
+        return false;
+    };
+    if ctx.conn_epoch != epoch || ctx.resumable_uplink.is_none() {
+        // Dropping Sink/HalfClose is fail-closed and reports the exact
+        // abandonment through its already-reserved completion slot.
+        return false;
+    }
+    let expected_flow = ctx
+        .resumable_uplink
+        .as_ref()
+        .map(ResumableTcpUplink::local_flow);
+    let action_matches_flow = match &action {
+        TunAction::Sink(delivery) => expected_flow.is_some_and(|flow| {
+            delivery.offer().session_id() == flow.session_id()
+                && delivery.offer().flow_id() == flow.flow_id()
+        }),
+        TunAction::HalfClose(delivery) => expected_flow.is_some_and(|flow| {
+            delivery.capability().session_id() == flow.session_id()
+                && delivery.capability().flow_id() == flow.flow_id()
+        }),
+        TunAction::Terminal(delivery) => expected_flow == Some(delivery.local_flow()),
+    };
+    if !action_matches_flow {
+        let socket = sockets.get_mut::<TcpSocket>(handle);
+        rearm_socket_with_reason(
+            handle,
+            socket,
+            ctx,
+            fake_pool,
+            now_secs,
+            "owner_to_local",
+            "cross_flow_owned_action",
+        );
+        return false;
+    }
+
+    let local_capability_live = match &action {
+        TunAction::Sink(delivery) => delivery.is_live(),
+        TunAction::HalfClose(delivery) => delivery.is_live(),
+        TunAction::Terminal(_) => true,
+    };
+    if !local_capability_live {
+        ctx.owned_terminal_pending = true;
+        return false;
+    }
+
+    if matches!(&action, TunAction::Terminal(_)) {
+        ctx.owned_terminal_pending = false;
+    }
+    match action {
+        TunAction::Sink(delivery) => {
+            if ctx.resumable_sink.is_some()
+                || ctx.resumable_half_close.is_some()
+                || ctx.resumable_terminal.is_some()
+            {
+                let socket = sockets.get_mut::<TcpSocket>(handle);
+                rearm_socket_with_reason(
+                    handle,
+                    socket,
+                    ctx,
+                    fake_pool,
+                    now_secs,
+                    "owner_to_local",
+                    "overlapping_owned_sink_action",
+                );
+                false
+            } else {
+                ctx.resumable_sink = Some(delivery);
+                true
+            }
+        }
+        TunAction::HalfClose(delivery) => {
+            if ctx.resumable_sink.is_some()
+                || ctx.resumable_half_close.is_some()
+                || ctx.resumable_terminal.is_some()
+            {
+                let socket = sockets.get_mut::<TcpSocket>(handle);
+                rearm_socket_with_reason(
+                    handle,
+                    socket,
+                    ctx,
+                    fake_pool,
+                    now_secs,
+                    "owner_to_local",
+                    "out_of_order_owned_half_close",
+                );
+                false
+            } else {
+                ctx.resumable_half_close = Some(delivery);
+                true
+            }
+        }
+        TunAction::Terminal(delivery) => match delivery.action() {
+            TerminalAction::FlowFinished(FlowFinishReason::Graceful) => {
+                if ctx.resumable_sink.is_some()
+                    || ctx.resumable_half_close.is_some()
+                    || !ctx.local_eof_sent
+                {
+                    // Graceful completion without the two-phase local FIN is
+                    // a protocol ownership violation; do not turn it into a
+                    // silent clean close.
+                    ctx.resumable_action_bridge = None;
+                    ctx.resumable_uplink = None;
+                    let socket = sockets.get_mut::<TcpSocket>(handle);
+                    rearm_socket_with_reason(
+                        handle,
+                        socket,
+                        ctx,
+                        fake_pool,
+                        now_secs,
+                        "owner_to_local",
+                        "premature_owned_graceful_finish",
+                    );
+                    false
+                } else {
+                    // Start a distinct bounded local-FIN drain window when
+                    // the exact reducer terminal first arrives. Do not reuse
+                    // time already spent waiting for this action in transit.
+                    ctx.owned_terminal_wait_since_secs = None;
+                    ctx.resumable_terminal = Some(delivery.action());
+                    true
+                }
+            }
+            TerminalAction::FlowFinished(
+                FlowFinishReason::PeerReset(_)
+                | FlowFinishReason::LocalReset(_)
+                | FlowFinishReason::OpenFailed(_),
+            ) => {
+                // The reducer already owns this terminal decision. Clear the
+                // uplink first so generic rearm cannot manufacture a second
+                // LocalReset event for a retired flow.
+                ctx.resumable_action_bridge = None;
+                ctx.resumable_uplink = None;
+                ctx.resumable_terminal = None;
+                let socket = sockets.get_mut::<TcpSocket>(handle);
+                rearm_socket_with_reason(
+                    handle,
+                    socket,
+                    ctx,
+                    fake_pool,
+                    now_secs,
+                    "owner_to_local",
+                    "owned_flow_terminal",
+                );
+                false
+            }
+        },
+    }
 }
 
 fn finish_deferred_relay_close_if_drained(
@@ -15218,9 +16513,9 @@ fn classify_inbound(pkt: &[u8]) -> Inbound {
 }
 
 /// 处理一个被拦截的 UDP 上行包：解析 → fake-IP 改写 target → 铸 assoc-id →
-/// 编码 TUIC Packet → `TuicUpstream::send_udp`。
+/// 交给 transport-neutral `OwnedUpstream`。Legacy adapter 内部仍只编码一次 TUIC Packet。
 /// 中文要点：fake 无映射 → 丢弃(短 TTL 自愈)；send_udp 自带丢弃计数(UDP 语义)。
-async fn handle_tuic_udp_uplink<U: DatagramUpstream>(
+async fn handle_tuic_udp_uplink<U: OwnedUpstream>(
     pkt: &[u8],
     assoc_table: &mut AssocTable,
     fake_pool: &mut FakeIpPool,
@@ -15276,8 +16571,17 @@ async fn handle_tuic_udp_uplink<U: DatagramUpstream>(
     for ip in assoc_table.take_reclaimed_fake_ips() {
         fake_pool.release(ip, now_secs);
     }
+    let Some(association) = LocalAssociationId::new(assoc_id) else {
+        // AssocTable 的 0 值保留为未分配；如果该不变式被破坏，本包 fail closed，
+        // 不把伪造 association 交给上游。
+        trace_log!(
+            "⚠️ UDP↑ AssocTable 返回保留的 assoc=0，丢弃 {}B",
+            udp.payload.len()
+        );
+        return;
+    };
     upstream
-        .send_udp(encode_packet(assoc_id, &target, udp.payload))
+        .send_udp(UdpUplink::new(association, &target, udp.payload))
         .await;
 }
 
@@ -18837,6 +20141,51 @@ mod tests {
     }
 
     #[test]
+    fn protocol_owned_flow_joins_existing_local_egress_actor_without_d16_queue() {
+        let legacy = SocketCtx::new(443);
+        assert!(!legacy.uses_owned_egress_actor());
+
+        let d16 = d16_admission_test_ctx(0);
+        assert!(d16.uses_owned_egress_actor());
+
+        let mut resumable = SocketCtx::new(443);
+        resumable.downlink_d3_actor_flow = true;
+        assert!(resumable.uses_owned_egress_actor());
+        let mut called = false;
+        let blocked = with_downlink_admission(
+            &mut resumable,
+            DownlinkAdmissionOrigin::ControlOnly,
+            |_, _| {
+                called = true;
+                DownlinkFlushOutcome {
+                    accepted_bytes: 1,
+                    headroom_limited: false,
+                }
+            },
+        );
+        assert_eq!(blocked, DownlinkFlushOutcome::NO_ADMISSION);
+        assert!(
+            !called,
+            "ControlOnly must not reach protocol-owned send_slice"
+        );
+
+        let admitted = with_downlink_admission(
+            &mut resumable,
+            DownlinkAdmissionOrigin::EgressActor,
+            |_, queue_flow| {
+                assert!(!queue_flow, "resumable bytes stay in reducer ownership");
+                DownlinkFlushOutcome {
+                    accepted_bytes: 1,
+                    headroom_limited: false,
+                }
+            },
+        );
+        assert_eq!(admitted.accepted_bytes, 1);
+        assert_eq!(resumable.downlink_diag.actor_admitted_bytes, 1);
+        assert_eq!(resumable.downlink_diag.actor_bypass_admitted_bytes, 0);
+    }
+
+    #[test]
     fn d16_remote_eof_requires_closed_and_empty_queue() {
         assert!(!remote_eof_ready_for_local_close(false, true, 0, 0));
         assert!(!remote_eof_ready_for_local_close(true, false, 1, 0));
@@ -20904,9 +22253,191 @@ mod tests {
 
         let listening = SocketCtx::new(443);
         assert!(
-            !should_reap_slot(&listening, TcpState::Closed, false, false, 0),
-            "空闲 Listening 槽永不 reap"
+            !should_reap_slot(&listening, TcpState::Listen, false, false, 0),
+            "真实 Listen 的空闲槽永不 reap"
         );
+        assert!(
+            should_reap_slot(&listening, TcpState::Closed, false, false, 0),
+            "logical Listening over a closed zero-payload incarnation must be reclaimed"
+        );
+    }
+
+    #[test]
+    fn owned_half_close_uses_lifecycle_not_tx_capacity() {
+        let snapshot = SocketCloseSnapshot {
+            tcp_state: TcpState::Established,
+            active: true,
+            can_send: false,
+            can_recv: true,
+            may_send: true,
+            may_recv: true,
+            send_capacity: 0,
+            send_queue: TCP_SOCKET_BUFFER_SIZE,
+            recv_queue: 0,
+        };
+        assert_eq!(
+            owned_half_close_disposition(snapshot, false, false),
+            OwnedHalfCloseDisposition::Apply,
+            "a full tx buffer must not turn a legal smoltcp close into flow failure"
+        );
+        assert_eq!(
+            owned_half_close_disposition(snapshot, true, false),
+            OwnedHalfCloseDisposition::WaitForSink
+        );
+    }
+
+    #[test]
+    fn resumable_local_source_eof_covers_both_fin_orders_once_buffered_data_drains() {
+        let snapshot = |tcp_state, may_recv| SocketCloseSnapshot {
+            tcp_state,
+            active: !matches!(tcp_state, TcpState::TimeWait | TcpState::Closed),
+            can_send: false,
+            can_recv: may_recv,
+            may_send: false,
+            may_recv,
+            send_capacity: 0,
+            send_queue: 0,
+            recv_queue: usize::from(may_recv),
+        };
+        assert!(resumable_local_source_eof(snapshot(
+            TcpState::CloseWait,
+            false
+        )));
+        assert!(resumable_local_source_eof(snapshot(
+            TcpState::LastAck,
+            false
+        )));
+        assert!(resumable_local_source_eof(snapshot(
+            TcpState::Closing,
+            false
+        )));
+        assert!(resumable_local_source_eof(snapshot(
+            TcpState::TimeWait,
+            false
+        )));
+        assert!(!resumable_local_source_eof(snapshot(
+            TcpState::FinWait2,
+            true
+        )));
+        assert!(!resumable_local_source_eof(snapshot(
+            TcpState::CloseWait,
+            true
+        )));
+    }
+
+    #[test]
+    fn missing_owned_terminal_wait_is_bounded() {
+        let mut started = None;
+        assert!(should_defer_owned_terminal_reap(
+            true,
+            false,
+            &mut started,
+            10
+        ));
+        assert_eq!(started, Some(10));
+        assert!(should_defer_owned_terminal_reap(
+            true,
+            false,
+            &mut started,
+            14
+        ));
+        assert!(!should_defer_owned_terminal_reap(
+            true,
+            false,
+            &mut started,
+            15
+        ));
+
+        started = Some(1);
+        assert!(!should_defer_owned_terminal_reap(
+            false,
+            false,
+            &mut started,
+            99
+        ));
+        assert_eq!(
+            started, None,
+            "one-sided/reset closure must not get clean grace"
+        );
+    }
+
+    #[test]
+    fn exact_owned_terminal_reaps_inactive_immediately_and_bounds_active_fin_drain() {
+        let active_last_ack = SocketCloseSnapshot {
+            tcp_state: TcpState::LastAck,
+            active: true,
+            can_send: false,
+            can_recv: false,
+            may_send: false,
+            may_recv: false,
+            send_capacity: 0,
+            send_queue: 0,
+            recv_queue: 0,
+        };
+        let mut ctx = SocketCtx::new(443);
+        ctx.state = SocketState::Relaying;
+        ctx.resumable_terminal = Some(TerminalAction::FlowFinished(FlowFinishReason::Graceful));
+
+        assert!(!should_reap_slot_with_snapshot(
+            &mut ctx,
+            active_last_ack,
+            10
+        ));
+        assert_eq!(ctx.owned_terminal_wait_since_secs, Some(10));
+        assert!(!should_reap_slot_with_snapshot(
+            &mut ctx,
+            active_last_ack,
+            14
+        ));
+        assert!(should_reap_slot_with_snapshot(
+            &mut ctx,
+            active_last_ack,
+            15
+        ));
+
+        let mut inactive = active_last_ack;
+        inactive.tcp_state = TcpState::Closed;
+        inactive.active = false;
+        let mut inactive_ctx = SocketCtx::new(443);
+        inactive_ctx.state = SocketState::Relaying;
+        inactive_ctx.resumable_terminal =
+            Some(TerminalAction::FlowFinished(FlowFinishReason::Graceful));
+        assert!(should_reap_slot_with_snapshot(
+            &mut inactive_ctx,
+            inactive,
+            10
+        ));
+        assert_eq!(inactive_ctx.owned_terminal_wait_since_secs, None);
+    }
+
+    #[test]
+    fn retired_owned_action_waits_for_terminal_delivery_but_cannot_leak_a_slot() {
+        for active in [true, false] {
+            let snapshot = SocketCloseSnapshot {
+                tcp_state: if active {
+                    TcpState::Established
+                } else {
+                    TcpState::Closed
+                },
+                active,
+                can_send: active,
+                can_recv: false,
+                may_send: active,
+                may_recv: false,
+                send_capacity: usize::from(active),
+                send_queue: 0,
+                recv_queue: 0,
+            };
+            let mut ctx = SocketCtx::new(443);
+            ctx.state = SocketState::Relaying;
+            ctx.owned_terminal_pending = true;
+
+            assert!(!should_reap_slot_with_snapshot(&mut ctx, snapshot, 10));
+            assert_eq!(ctx.owned_terminal_wait_since_secs, Some(10));
+            assert!(!should_reap_slot_with_snapshot(&mut ctx, snapshot, 14));
+            assert!(should_reap_slot_with_snapshot(&mut ctx, snapshot, 15));
+            assert_eq!(ctx.owned_terminal_wait_since_secs, None);
+        }
     }
 
     #[test]
@@ -21737,22 +23268,26 @@ mod tests {
         assert_eq!(pool.sweep(1000, 300), 1, "release 后映射可回收");
 
         let (global_tx, _grx) = mpsc::channel(8);
+        let (owned_action_tx, _owned_action_rx) = mpsc::channel(8);
         let stale = HandshakeDone {
             handle: closed_pending,
             epoch: 9,
-            result: Ok(OpenedTcpRelay::Generic(Box::new(tokio::io::duplex(64).0))),
+            result: Ok(OpenedOwnedTcp::Legacy(OpenedTcpRelay::Generic(Box::new(
+                tokio::io::duplex(64).0,
+            )))),
         };
-        handle_handshake_done(
+        assert!(!handle_handshake_done(
             stale,
             &mut sockets,
             &mut ctxs,
             &global_tx,
+            &owned_action_tx,
             &mut pool,
             2,
             &Metrics::new(),
             DownlinkBackpressureConfig::default(),
             false,
-        );
+        ));
         let closed_ctx = ctxs.get(&closed_pending).unwrap();
         assert_eq!(
             closed_ctx.state,
@@ -21778,6 +23313,12 @@ mod tests {
             local_port: 80,
             state: SocketState::Relaying,
             uplink_tx: Some(tx),
+            resumable_uplink: None,
+            resumable_sink: None,
+            resumable_half_close: None,
+            resumable_terminal: None,
+            resumable_action_bridge: None,
+            pending_open_mode: None,
             relay_read_credit_tx: None,
             d16_downlink_queue: None,
             d16_egress_phase: EgressPhase::Running,
@@ -21785,6 +23326,8 @@ mod tests {
             relay_read_credit_progress_generation_sent: 0,
             local_fin_sent: true,
             local_eof_sent: true,
+            owned_terminal_pending: false,
+            owned_terminal_wait_since_secs: None,
             local_fin_pending_since_secs: Some(3),
             local_fin_last_remote_progress_secs: Some(4),
             downlink_pending: Vec::new(),
@@ -22345,6 +23888,30 @@ mod tests {
     }
 
     #[test]
+    fn resumable_uplink_treats_flow_and_session_budget_exhaustion_as_backpressure() {
+        for error in [
+            FlowPortError::UplinkMessageLaneFull,
+            FlowPortError::UplinkByteBudgetExhausted {
+                requested: 97,
+                available: 0,
+            },
+            FlowPortError::UplinkGlobalByteBudgetExhausted {
+                requested: 97,
+                available: 0,
+            },
+        ] {
+            assert!(
+                resumable_uplink_admission_is_backpressure(&error),
+                "{error} must preserve unread smoltcp bytes instead of closing the flow"
+            );
+        }
+
+        assert!(!resumable_uplink_admission_is_backpressure(
+            &FlowPortError::Closed
+        ));
+    }
+
+    #[test]
     fn established_uplink_defers_finish_after_payloads_drain() {
         let (tx, mut rx) = mpsc::channel(4);
         let mut ctx = SocketCtx::new(80);
@@ -22418,7 +23985,98 @@ mod tests {
         let mut ctx = SocketCtx::new(12345);
         ctx.state = SocketState::HandshakePending;
         ctx.conn_epoch = epoch;
+        ctx.pending_open_mode = Some(TcpOwnershipMode::LegacyRelay);
         ctx
+    }
+
+    fn resumable_adapter_test_pair() -> (
+        crate::owned_upstream::ResumableTcpFlow,
+        crate::owned_upstream::ResumableTcpDriver,
+        LocalFlow,
+    ) {
+        let flow = LocalFlow::for_adapter_test(
+            crate::resumable::SessionId::new([0x51; 16]).unwrap(),
+            crate::resumable::SessionFlowId::new(1).unwrap(),
+            crate::resumable::Direction::ClientToTarget,
+            1,
+        );
+        let factory = crate::owned_upstream::ResumableTcpPortFactory::new(
+            crate::owned_upstream::FlowPortConfig::new(64, 2, 2, 2).unwrap(),
+            64,
+        )
+        .unwrap();
+        let (endpoint, driver) = factory.open_flow(flow);
+        (endpoint, driver, flow)
+    }
+
+    #[tokio::test]
+    async fn closed_handshake_receiver_abandons_uninstalled_resumable_flow() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(build_listener_socket(&ListenerSpec { local_port: 12345 }));
+        let (endpoint, mut driver, expected_flow) = resumable_adapter_test_pair();
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+
+        publish_handshake_done(
+            &tx,
+            HandshakeDone {
+                handle,
+                epoch: 1,
+                result: Ok(OpenedOwnedTcp::Resumable(endpoint)),
+            },
+        )
+        .await;
+
+        let Some(crate::owned_upstream::DriverInput::Control(
+            crate::resumable::SessionEvent::LocalReset { flow, reason },
+        )) = driver.try_recv_next().unwrap()
+        else {
+            panic!("closed completion receiver must preserve exact terminal ownership")
+        };
+        assert_eq!(flow, expected_flow);
+        assert_eq!(reason, ResetReason::LocalAbandon);
+    }
+
+    #[test]
+    fn stale_resumable_handshake_result_abandons_old_epoch_without_installing() {
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(build_listener_socket(&ListenerSpec { local_port: 12345 }));
+        let mut ctx = mk_pending_ctx(5);
+        ctx.pending_open_mode = Some(TcpOwnershipMode::Resumable);
+        let mut socket_ctxs = HashMap::from([(handle, ctx)]);
+        let (global_tx, _global_rx) = mpsc::channel(1);
+        let (owned_action_tx, _owned_action_rx) = mpsc::channel(1);
+        let mut pool = FakeIpPool::new();
+        let (endpoint, mut driver, expected_flow) = resumable_adapter_test_pair();
+
+        assert!(!handle_handshake_done(
+            HandshakeDone {
+                handle,
+                epoch: 4,
+                result: Ok(OpenedOwnedTcp::Resumable(endpoint)),
+            },
+            &mut sockets,
+            &mut socket_ctxs,
+            &global_tx,
+            &owned_action_tx,
+            &mut pool,
+            0,
+            &Metrics::new(),
+            DownlinkBackpressureConfig::default(),
+            false,
+        ));
+        let ctx = socket_ctxs.get(&handle).unwrap();
+        assert_eq!(ctx.conn_epoch, 5);
+        assert!(ctx.resumable_uplink.is_none());
+
+        let Some(crate::owned_upstream::DriverInput::Control(
+            crate::resumable::SessionEvent::LocalReset { flow, reason },
+        )) = driver.try_recv_next().unwrap()
+        else {
+            panic!("stale resumable open must leave exact LocalAbandon for its supervisor")
+        };
+        assert_eq!(flow, expected_flow);
+        assert_eq!(reason, ResetReason::LocalAbandon);
     }
 
     /// epoch 防串话：迟到结果（epoch 不匹配）丢弃、不装到 socket；匹配 + Ok → 安装 relay。
@@ -22429,25 +24087,29 @@ mod tests {
         let mut socket_ctxs = HashMap::new();
         socket_ctxs.insert(handle, mk_pending_ctx(5));
         let (global_tx, _grx) = mpsc::channel(8);
+        let (owned_action_tx, _owned_action_rx) = mpsc::channel(8);
         let mut pool = FakeIpPool::new();
 
         // 迟到 epoch 3 ≠ 5 → 丢弃，状态/uplink_tx 不变。
         let stale = HandshakeDone {
             handle,
             epoch: 3,
-            result: Ok(OpenedTcpRelay::Generic(Box::new(tokio::io::duplex(64).0))),
+            result: Ok(OpenedOwnedTcp::Legacy(OpenedTcpRelay::Generic(Box::new(
+                tokio::io::duplex(64).0,
+            )))),
         };
-        handle_handshake_done(
+        assert!(!handle_handshake_done(
             stale,
             &mut sockets,
             &mut socket_ctxs,
             &global_tx,
+            &owned_action_tx,
             &mut pool,
             0,
             &Metrics::new(),
             DownlinkBackpressureConfig::default(),
             false,
-        );
+        ));
         let ctx = socket_ctxs.get(&handle).unwrap();
         assert_eq!(
             ctx.state,
@@ -22460,19 +24122,22 @@ mod tests {
         let ok = HandshakeDone {
             handle,
             epoch: 5,
-            result: Ok(OpenedTcpRelay::Generic(Box::new(tokio::io::duplex(64).0))),
+            result: Ok(OpenedOwnedTcp::Legacy(OpenedTcpRelay::Generic(Box::new(
+                tokio::io::duplex(64).0,
+            )))),
         };
-        handle_handshake_done(
+        assert!(!handle_handshake_done(
             ok,
             &mut sockets,
             &mut socket_ctxs,
             &global_tx,
+            &owned_action_tx,
             &mut pool,
             0,
             &Metrics::new(),
             DownlinkBackpressureConfig::default(),
             false,
-        );
+        ));
         let ctx = socket_ctxs.get(&handle).unwrap();
         assert_eq!(
             ctx.state,
@@ -22496,6 +24161,7 @@ mod tests {
         let mut socket_ctxs = HashMap::new();
         socket_ctxs.insert(handle, ctx);
         let (global_tx, _grx) = mpsc::channel(8);
+        let (owned_action_tx, _owned_action_rx) = mpsc::channel(8);
 
         let err = HandshakeDone {
             handle,
@@ -22507,6 +24173,7 @@ mod tests {
             &mut sockets,
             &mut socket_ctxs,
             &global_tx,
+            &owned_action_tx,
             &mut pool,
             1,
             &Metrics::new(),
@@ -22542,6 +24209,7 @@ mod tests {
         let mut socket_ctxs = HashMap::new();
         socket_ctxs.insert(handle, ctx);
         let (global_tx, _grx) = mpsc::channel(8);
+        let (owned_action_tx, _owned_action_rx) = mpsc::channel(8);
         let mut pool = FakeIpPool::new();
 
         // near = relay 写入端（上游流）；far = 测试读端（模拟出口收到的上行）。
@@ -22549,13 +24217,16 @@ mod tests {
         let ok = HandshakeDone {
             handle,
             epoch: 1,
-            result: Ok(OpenedTcpRelay::Generic(Box::new(near))),
+            result: Ok(OpenedOwnedTcp::Legacy(OpenedTcpRelay::Generic(Box::new(
+                near,
+            )))),
         };
         handle_handshake_done(
             ok,
             &mut sockets,
             &mut socket_ctxs,
             &global_tx,
+            &owned_action_tx,
             &mut pool,
             0,
             &Metrics::new(),
@@ -28794,7 +30465,7 @@ mod tests {
             &mut device,
             smoltcp::time::Instant::now(),
         );
-        let upstream = Arc::new(NoopTestUpstream);
+        let upstream = Arc::new(LegacyOwnedUpstream::new(Arc::new(NoopTestUpstream)));
         let metrics = Metrics::new();
         let mut assoc_table = AssocTable::new();
         let mut fake_pool = FakeIpPool::new();
@@ -28807,6 +30478,7 @@ mod tests {
         let mut dirty = HashSet::new();
         let (handshake_done_tx, _handshake_done_rx) = mpsc::channel(1);
         let (global_tx, _global_rx) = mpsc::channel(1);
+        let (owned_action_tx, _owned_action_rx) = mpsc::channel(1);
         let mut sink = CountingSink::default();
         let cfg = default_downlink_backpressure_for_tun_egress(1200, 500);
         let mut drop_debt = DownlinkEgressDropDebt::default();
@@ -28828,6 +30500,7 @@ mod tests {
             &mut dirty,
             &handshake_done_tx,
             &global_tx,
+            &owned_action_tx,
             &mut sink,
             DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
             cfg,
@@ -28963,7 +30636,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_egress_service_stops_on_no_work_hard_pause_and_no_progress() {
-        let upstream = Arc::new(NoopTestUpstream);
+        let upstream = Arc::new(LegacyOwnedUpstream::new(Arc::new(NoopTestUpstream)));
         let metrics = Metrics::new();
         let mut device = DnsInjectRecorder::default();
         let mut iface = Interface::new(
@@ -28979,6 +30652,7 @@ mod tests {
         let mut dirty = HashSet::new();
         let (handshake_done_tx, _handshake_done_rx) = mpsc::channel(1);
         let (global_tx, _global_rx) = mpsc::channel(1);
+        let (owned_action_tx, _owned_action_rx) = mpsc::channel(1);
         let mut sink = NoopSink;
         let cfg = DownlinkBackpressureConfig {
             high_bytes: 100,
@@ -29009,6 +30683,7 @@ mod tests {
             &mut dirty,
             &handshake_done_tx,
             &global_tx,
+            &owned_action_tx,
             &mut sink,
             DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
             cfg,
@@ -29045,6 +30720,7 @@ mod tests {
             &mut dirty,
             &handshake_done_tx,
             &global_tx,
+            &owned_action_tx,
             &mut sink,
             DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
             cfg,
@@ -29082,6 +30758,7 @@ mod tests {
             &mut dirty,
             &handshake_done_tx,
             &global_tx,
+            &owned_action_tx,
             &mut sink,
             DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
             cfg,
@@ -29123,6 +30800,7 @@ mod tests {
             &mut dirty,
             &handshake_done_tx,
             &global_tx,
+            &owned_action_tx,
             &mut sink,
             DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
             cfg,
@@ -29148,7 +30826,7 @@ mod tests {
 
     #[tokio::test]
     async fn d16_drain_only_keeps_poll_and_flush_progress() {
-        let upstream = Arc::new(NoopTestUpstream);
+        let upstream = Arc::new(LegacyOwnedUpstream::new(Arc::new(NoopTestUpstream)));
         let metrics = Metrics::new();
         let mut device = DnsInjectRecorder::default();
         let mut iface = Interface::new(
@@ -29174,6 +30852,7 @@ mod tests {
         let mut dirty = HashSet::from([handle]);
         let (handshake_done_tx, _handshake_done_rx) = mpsc::channel(1);
         let (global_tx, _global_rx) = mpsc::channel(1);
+        let (owned_action_tx, _owned_action_rx) = mpsc::channel(1);
         let mut sink = NoopSink;
         let cfg = DownlinkBackpressureConfig {
             high_bytes: 100,
@@ -29199,6 +30878,7 @@ mod tests {
             &mut dirty,
             &handshake_done_tx,
             &global_tx,
+            &owned_action_tx,
             &mut sink,
             DEFAULT_DOWNLINK_FLUSH_MAX_BYTES,
             cfg,

@@ -4,28 +4,34 @@
 
 ## Next Planned Stage — Knife16 Path-Diverse Resumable Upstream (2026-08-18)
 
-- **Latest accepted position: Knife16 Task 2 is complete locally; Task 3 is
-  next.** The new transport-independent `resumable` fixed core contains the
-  bounded v1 codec, exporter/device/session/generation-bound attach authority,
-  lost-response generation resynchronization, directional TCP ownership
-  windows, checked replay/storage/copy capacity, and a pure session reducer.
-  Application ACK advances only after sink acceptance; async local completion
-  capabilities survive leg replacement; FIN is two-phase; terminal flows
-  reclaim live capacity into bounded tombstones. Receive budget admission and
-  commit use one TCP-owned algorithm, and its reservation is crate-private.
-- At a 500ms total horizon, 100/170/240 Mbit/s require
-  `6,250,000/10,625,000/15,000,000B` per direction and
-  `12,500,000/21,250,000/30,000,000B` full duplex. Physical backing/copy
-  bounds use the maximum legal wire allocation rather than the intended
-  coalescer width. Codec and state construction normalize small slices/strings
-  so they cannot retain uncharged caller backing.
-- Focused `94/94`, root `807 + 3 ignored`, all-target protocol/API
-  `19/19 + 1/1`, harness `819 + 3 ignored`, concurrency `10 + 4 ignored`,
-  release, Clippy, rustdoc, vendored Quinn `40 + 3 ignored`, quinn-proto `330`,
-  fmt, and diff gates pass. Protocol/auth/capacity and session/lifecycle reviews
-  have no unresolved P0/P1. No socket, production adapter, two-leg harness,
-  WAN test, or throughput claim exists yet. Result:
-  `docs/tech/2026-08-18-knife16-resumable-protocol-capacity-local-results.md`.
+- **Latest accepted position: Knife16 Task 3 is complete locally; Task 4 is
+  next.** The new crate-private `OwnedUpstream` branch preserves exact legacy
+  `Generic`/`Native`/`NativeByteOwned`, TUIC UDP, Reality, and Failover
+  behavior while allowing the real TUN/smoltcp loop to drive typed resumable
+  flow ports without knowing transport-leg or replay mechanics. The public
+  production entry remains legacy until a real transport and owner exist.
+- One session-scoped port factory owns the aggregate uplink-byte ledger.
+  Message, per-flow, and global-byte capacity are reserved before smoltcp
+  extraction, and all exhaustion is backpressure rather than drop/reset.
+  Reducer-minted `ReplayStored` and `ReplayAcknowledged` receipts bind replay
+  storage and release. DATA/CLOSE ordering, bounded control fairness, FIN,
+  terminal, stale epoch, owner loss, and uninstalled async opens are all
+  capability-owned and fail closed.
+- Application ACK advances only for exact positive `TcpSocket::send_slice`
+  acceptance. Resumable sink traffic stays behind the unchanged D16/local-
+  egress phase, credit, pressure/debt, headroom, and flush-feedback actor.
+  Exact transport-leg seals prevent frames from an equally configured second
+  TLS connection from borrowing another leg's authority.
+- The real-smoltcp fake adapter proves pre-extraction reservation, one shared
+  `65,535B` ledger, a retained `97B` saturation suffix, exact `65,632B` echo,
+  one-to-one sink acceptance, unique FIN/terminal, and zero final ownership.
+  Focused `43/43`, all-target harness `875 + 3 ignored`, concurrency
+  `10 + 4 ignored`, typed provenance `101/101`, fake adapter `2/2` plus
+  100-repeat, release, strict Clippy, rustdoc, vendored Quinn/proto, fmt, and
+  diff gates pass. Four concentrated reviews report P0/P1 `0/0`. This is a
+  local adapter result only: no production two-leg transport, owner, blackout
+  recovery, WAN result, or throughput claim exists. Result:
+  `docs/tech/2026-08-18-knife16-owned-upstream-local-results.md`.
 - **Latest accepted position: Knife15 is closed by a genuine Tier-B quality
   failure.** Exact-source `d5b8304` entered the first valid frequency schedule,
   completed eleven cycles, and failed cycle 12 `udp-reverse` at
@@ -53,14 +59,17 @@
   bounded queues, dedup, deadline, and hot failover; permanent full-rate 2x
   duplication is rejected by HK capacity math. Standard TUIC remains a
   compatibility profile.
-- **Only next step:** implement Knife16 Task 3 locally: place a deep
-  `OwnedUpstream` abstraction behind the existing `ProxyUpstream` and
-  `DatagramUpstream` call sites, keep TUIC/failover behavior unchanged, and
-  bind decoded attach responses to the exact authenticated TLS leg. Then
-  continue Tasks 4–8 in order. A bounded two-ingress qualification must pass
+- **Only next step:** implement Knife16 Task 4 locally: build the deterministic
+  in-memory two-leg transport harness with authenticated attach, `300..800ms`
+  blackout, reorder, duplicate, delayed ACK, stale-leg, and bidirectional
+  fairness injection. Prove exact TCP delivery, one Target open, unrelated-
+  flow survival, and bounded replay before implementing a production
+  transport. Do not run macOS TUN, VPS, WAN, or throughput acceptance. Then
+  continue Tasks 5–8 in order; a bounded two-ingress qualification must pass
   before any long macOS run. Spec/plan/results:
   `docs/tech/2026-08-18-knife16-path-diverse-resumable-upstream-architecture-spec.md`,
   `docs/tech/2026-08-18-knife16-path-diverse-resumable-upstream-implementation-plan.md`,
+  `docs/tech/2026-08-18-knife16-owned-upstream-local-results.md`,
   `docs/tech/2026-08-18-knife16-resumable-protocol-capacity-local-results.md`,
   and
   `docs/tech/2026-08-18-knife15-m2-frequency-first-run-udp-loss-results.md`.

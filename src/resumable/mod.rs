@@ -28,10 +28,10 @@ pub use protocol::{
     Record, ResetReason, SESSION_PROTOCOL_VERSION, SessionFlowId, SessionId, ValidatedFrameHeader,
 };
 pub use session::{
-    FlowFinishReason, LocalFlow, PeerOpenRequest, ReceiveBudgetLimits, ReplayBudgetLimits,
-    ReplayBudgetUsage, SessionConfig, SessionConfigError, SessionEffect, SessionError,
-    SessionEvent, SessionFlowSnapshot, SessionModel, SessionPhase, SessionRole, SessionSnapshot,
-    SinkHalfClose, SinkOffer, TerminalGrace,
+    FlowFinishReason, LocalFlow, PeerOpenRequest, ReceiveBudgetLimits, ReplayAcknowledged,
+    ReplayBudgetLimits, ReplayBudgetUsage, ReplayStored, SessionConfig, SessionConfigError,
+    SessionEffect, SessionError, SessionEvent, SessionFlowSnapshot, SessionModel, SessionPhase,
+    SessionRole, SessionSnapshot, SinkHalfClose, SinkOffer, TerminalGrace,
 };
 pub use tcp::{
     TcpDataSegment, TcpOwnershipError, TcpReceiveAbandon, TcpReceiveAccept, TcpReceiveClose,

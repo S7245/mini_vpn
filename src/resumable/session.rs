@@ -415,16 +415,160 @@ impl SinkOffer {
 pub struct LocalFlow {
     session_id: SessionId,
     flow_id: SessionFlowId,
+    direction: Direction,
     authority_id: u64,
 }
 
 impl LocalFlow {
+    #[cfg(test)]
+    pub(crate) const fn for_adapter_test(
+        session_id: SessionId,
+        flow_id: SessionFlowId,
+        direction: Direction,
+        authority_id: u64,
+    ) -> Self {
+        Self {
+            session_id,
+            flow_id,
+            direction,
+            authority_id,
+        }
+    }
+
     pub const fn session_id(self) -> SessionId {
         self.session_id
     }
 
     pub const fn flow_id(self) -> SessionFlowId {
         self.flow_id
+    }
+
+    pub const fn direction(self) -> Direction {
+        self.direction
+    }
+}
+
+/// Reducer-issued authority proving that one exact local DATA extent is now
+/// retained by the session replay window.
+///
+/// Fields are private so an adapter cannot manufacture replay ownership from
+/// a merely well-formed wire frame. The retained `Bytes` handle shares the
+/// replay window's already-accounted allocation and is never printed.
+#[derive(PartialEq, Eq)]
+pub struct ReplayStored {
+    local_flow: LocalFlow,
+    direction: Direction,
+    start: ByteOffset,
+    end: ByteOffset,
+    payload: Bytes,
+}
+
+impl ReplayStored {
+    pub const fn session_id(&self) -> SessionId {
+        self.local_flow.session_id
+    }
+
+    pub const fn flow_id(&self) -> SessionFlowId {
+        self.local_flow.flow_id
+    }
+
+    pub const fn direction(&self) -> Direction {
+        self.direction
+    }
+
+    pub const fn start(&self) -> ByteOffset {
+        self.start
+    }
+
+    pub const fn end(&self) -> ByteOffset {
+        self.end
+    }
+
+    pub fn len(&self) -> usize {
+        self.payload.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.payload.is_empty()
+    }
+
+    pub(crate) const fn local_flow(&self) -> LocalFlow {
+        self.local_flow
+    }
+
+    pub(crate) fn payload(&self) -> &Bytes {
+        &self.payload
+    }
+}
+
+impl fmt::Debug for ReplayStored {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReplayStored")
+            .field("flow_id", &self.local_flow.flow_id)
+            .field("direction", &self.direction)
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .field("payload_len", &self.payload.len())
+            .finish()
+    }
+}
+
+/// Reducer-issued authority proving that the current authenticated peer leg
+/// advanced one exact local sender ACK frontier.
+///
+/// This type is deliberately non-`Clone` and has private construction. A
+/// well-formed or replayed wire ACK is not release authority until the
+/// reducer has accepted it for this session, flow, direction, and leg.
+#[derive(PartialEq, Eq)]
+pub struct ReplayAcknowledged {
+    local_flow: LocalFlow,
+    generation: LegGeneration,
+    direction: Direction,
+    next_accepted: ByteOffset,
+    final_accepted: bool,
+}
+
+impl ReplayAcknowledged {
+    pub const fn session_id(&self) -> SessionId {
+        self.local_flow.session_id
+    }
+
+    pub const fn flow_id(&self) -> SessionFlowId {
+        self.local_flow.flow_id
+    }
+
+    pub const fn generation(&self) -> LegGeneration {
+        self.generation
+    }
+
+    pub const fn direction(&self) -> Direction {
+        self.direction
+    }
+
+    pub const fn next_accepted(&self) -> ByteOffset {
+        self.next_accepted
+    }
+
+    pub const fn final_accepted(&self) -> bool {
+        self.final_accepted
+    }
+
+    pub(crate) const fn local_flow(&self) -> LocalFlow {
+        self.local_flow
+    }
+}
+
+impl fmt::Debug for ReplayAcknowledged {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReplayAcknowledged")
+            .field("flow_id", &self.local_flow.flow_id)
+            .field("generation", &self.generation)
+            .field("direction", &self.direction)
+            .field("next_accepted", &self.next_accepted)
+            .field("final_accepted", &self.final_accepted)
+            .finish()
     }
 }
 
@@ -474,18 +618,25 @@ impl SinkHalfClose {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TerminalGrace {
-    session_id: SessionId,
-    flow_id: SessionFlowId,
+    local_flow: LocalFlow,
     tombstone_id: u64,
 }
 
 impl TerminalGrace {
     pub const fn session_id(self) -> SessionId {
-        self.session_id
+        self.local_flow.session_id
     }
 
     pub const fn flow_id(self) -> SessionFlowId {
-        self.flow_id
+        self.local_flow.flow_id
+    }
+
+    pub const fn direction(self) -> Direction {
+        self.local_flow.direction
+    }
+
+    pub(crate) const fn local_flow(self) -> LocalFlow {
+        self.local_flow
     }
 }
 
@@ -549,7 +700,7 @@ pub enum SessionEvent {
     },
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum SessionEffect {
     LegActivated {
         generation: LegGeneration,
@@ -558,6 +709,12 @@ pub enum SessionEffect {
         generation: LegGeneration,
     },
     SessionExpired,
+    ReplayStored {
+        receipt: ReplayStored,
+    },
+    ReplayAcknowledged {
+        receipt: ReplayAcknowledged,
+    },
     Transmit(Frame),
     LocalFlowOpened {
         flow: LocalFlow,
@@ -671,6 +828,8 @@ impl fmt::Debug for SessionEffect {
                 .field("generation", generation)
                 .finish(),
             Self::SessionExpired => formatter.write_str("SessionExpired"),
+            Self::ReplayStored { receipt } => receipt.fmt(formatter),
+            Self::ReplayAcknowledged { receipt } => receipt.fmt(formatter),
             Self::Transmit(frame) => formatter
                 .debug_struct("Transmit")
                 .field("generation", &frame.leg_generation())
@@ -1055,6 +1214,7 @@ impl SessionModel {
         let local_flow = LocalFlow {
             session_id: self.session_id,
             flow_id,
+            direction: self.role.local_send_direction(),
             authority_id,
         };
         let mut flow = FlowState::new(target, FlowOrigin::Local, self.config);
@@ -1108,12 +1268,21 @@ impl SessionModel {
             append.segments_added(),
         )?;
 
-        Ok(self.transmit_if_active(Record::Data {
+        let receipt = ReplayStored {
+            local_flow,
+            direction,
+            start: append.offset(),
+            end: append.end_offset(),
+            payload: owned_payload.clone(),
+        };
+        let mut effects = vec![SessionEffect::ReplayStored { receipt }];
+        effects.extend(self.transmit_if_active(Record::Data {
             flow_id,
             direction,
             offset: append.offset(),
             payload: owned_payload,
-        }))
+        }));
+        Ok(effects)
     }
 
     fn local_close(&mut self, local_flow: LocalFlow) -> Result<Vec<SessionEffect>, SessionError> {
@@ -1290,6 +1459,7 @@ impl SessionModel {
         let local_flow = LocalFlow {
             session_id: self.session_id,
             flow_id,
+            direction: self.role.local_send_direction(),
             authority_id,
         };
         let mut flow = FlowState::new(target.clone(), FlowOrigin::Peer, self.config);
@@ -1423,6 +1593,13 @@ impl SessionModel {
         if may_finish {
             self.precheck_terminal_capacity()?;
         }
+        let local_flow = self
+            .flows
+            .get(&flow_id)
+            .and_then(|flow| flow.local_flow)
+            .ok_or(SessionError::InvariantViolation(
+                "live flow has no local ACK authority",
+            ))?;
         let acknowledged = {
             let flow = self.flow_mut(flow_id)?;
             flow.send
@@ -1439,6 +1616,19 @@ impl SessionModel {
             .get(&flow_id)
             .map(|flow| flow.send.final_accepted() && flow.receive_final_accepted)
             .unwrap_or(false);
+        let accepted_final = self
+            .flows
+            .get(&flow_id)
+            .map(|flow| flow.send.final_accepted())
+            .ok_or(SessionError::UnknownFlow(flow_id))?;
+        let receipt = ReplayAcknowledged {
+            local_flow,
+            generation: self.current_leg.generation(),
+            direction,
+            next_accepted: acknowledged.peer_acked(),
+            final_accepted: accepted_final,
+        };
+        let mut effects = vec![SessionEffect::ReplayAcknowledged { receipt }];
         if finished {
             let flow = self
                 .flows
@@ -1450,10 +1640,9 @@ impl SessionModel {
                 next_accepted: flow.receive.accepted(),
                 final_accepted: true,
             };
-            self.finish_flow(flow_id, FlowFinishReason::Graceful, Some(control))
-        } else {
-            Ok(Vec::new())
+            effects.extend(self.finish_flow(flow_id, FlowFinishReason::Graceful, Some(control))?);
         }
+        Ok(effects)
     }
 
     fn receive_close(
@@ -1696,17 +1885,18 @@ impl SessionModel {
         &mut self,
         terminal: TerminalGrace,
     ) -> Result<Vec<SessionEffect>, SessionError> {
-        if terminal.session_id != self.session_id {
+        if terminal.session_id() != self.session_id {
             return Err(SessionError::CrossSessionTerminalGrace);
         }
+        let flow_id = terminal.flow_id();
         let tombstone = self
             .terminal_tombstones
-            .get(&terminal.flow_id)
+            .get(&flow_id)
             .ok_or(SessionError::UnknownTerminalGrace)?;
         if tombstone.terminal != terminal {
             return Err(SessionError::UnknownTerminalGrace);
         }
-        self.terminal_tombstones.remove(&terminal.flow_id);
+        self.terminal_tombstones.remove(&flow_id);
         Ok(Vec::new())
     }
 
@@ -2158,7 +2348,7 @@ impl SessionModel {
     ) -> Result<Vec<SessionEffect>, SessionError> {
         self.precheck_terminal_capacity()?;
         let direction = self.role.local_send_direction();
-        let (target, send_bytes, send_segments, receive_bytes, receive_ranges) = {
+        let (local_flow, target, send_bytes, send_segments, receive_bytes, receive_ranges) = {
             let flow = self
                 .flows
                 .get(&flow_id)
@@ -2166,6 +2356,9 @@ impl SessionModel {
             let send = flow.send.snapshot();
             let receive = flow.receive.snapshot();
             (
+                flow.local_flow.ok_or(SessionError::InvariantViolation(
+                    "terminal flow has no local authority",
+                ))?,
                 flow.target.clone(),
                 send.retained_bytes(),
                 send.segment_count(),
@@ -2194,8 +2387,7 @@ impl SessionModel {
             .next_tombstone_id
             .ok_or(SessionError::TerminalTombstoneIdExhausted)?;
         let terminal = TerminalGrace {
-            session_id: self.session_id,
-            flow_id,
+            local_flow,
             tombstone_id,
         };
 
@@ -2950,6 +3142,114 @@ mod tests {
     }
 
     #[test]
+    fn local_data_emits_exact_replay_storage_authority_without_another_payload_copy() {
+        let issuer = LegIssuer::new(0x10);
+        let leg = issuer.issue(2);
+        let mut model = SessionModel::new(SessionRole::Client, config(), leg);
+        let flow_id = local_open(&mut model, leg, target(443));
+        let local = local_flow(&model, flow_id);
+
+        let effects = model
+            .reduce(SessionEvent::LocalData {
+                flow: local,
+                payload: Bytes::from_static(b"receipt-secret"),
+            })
+            .unwrap();
+        let stored = effects
+            .iter()
+            .find_map(|effect| match effect {
+                SessionEffect::ReplayStored { receipt } => Some(receipt),
+                _ => None,
+            })
+            .expect("successful LocalData must publish replay ownership authority");
+        let transmitted = effects
+            .iter()
+            .find_map(|effect| match effect {
+                SessionEffect::Transmit(frame) => match frame.record() {
+                    Record::Data { payload, .. } => Some(payload),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("active leg must transmit stored DATA");
+
+        assert_eq!(stored.session_id(), model.session_id());
+        assert_eq!(stored.flow_id(), flow_id);
+        assert_eq!(stored.direction(), Direction::ClientToTarget);
+        assert_eq!(stored.start(), ByteOffset::new(0));
+        assert_eq!(stored.end(), ByteOffset::new(14));
+        assert_eq!(stored.len(), 14);
+        assert_eq!(stored.payload.as_ptr(), transmitted.as_ptr());
+        assert!(!format!("{stored:?}").contains("receipt-secret"));
+    }
+
+    #[test]
+    fn only_current_authenticated_peer_ack_emits_replay_release_authority() {
+        let issuer = LegIssuer::new(0x10);
+        let leg2 = issuer.issue(2);
+        let mut model = SessionModel::new(SessionRole::Client, config(), leg2);
+        let flow_id = local_open(&mut model, leg2, target(443));
+        let local = local_flow(&model, flow_id);
+        model
+            .reduce(SessionEvent::LocalData {
+                flow: local,
+                payload: Bytes::from_static(b"data"),
+            })
+            .unwrap();
+
+        let leg3 = issuer.issue(3);
+        model
+            .reduce(SessionEvent::ReplacementAttached { leg: leg3 })
+            .unwrap();
+        let before_stale = model.snapshot();
+        assert!(matches!(
+            model.reduce(SessionEvent::PeerFrame {
+                leg: leg2,
+                frame: frame(
+                    leg2,
+                    Record::Ack {
+                        flow_id,
+                        direction: Direction::ClientToTarget,
+                        next_accepted: ByteOffset::new(4),
+                        final_accepted: false,
+                    },
+                ),
+            }),
+            Err(SessionError::LegGenerationMismatch { .. })
+        ));
+        assert_eq!(model.snapshot(), before_stale);
+
+        let effects = model
+            .reduce(SessionEvent::PeerFrame {
+                leg: leg3,
+                frame: frame(
+                    leg3,
+                    Record::Ack {
+                        flow_id,
+                        direction: Direction::ClientToTarget,
+                        next_accepted: ByteOffset::new(4),
+                        final_accepted: false,
+                    },
+                ),
+            })
+            .unwrap();
+        let receipt = effects
+            .iter()
+            .find_map(|effect| match effect {
+                SessionEffect::ReplayAcknowledged { receipt } => Some(receipt),
+                _ => None,
+            })
+            .expect("accepted current-leg ACK must publish release authority");
+        assert_eq!(receipt.session_id(), model.session_id());
+        assert_eq!(receipt.flow_id(), flow_id);
+        assert_eq!(receipt.generation(), leg3.generation());
+        assert_eq!(receipt.direction(), Direction::ClientToTarget);
+        assert_eq!(receipt.next_accepted(), ByteOffset::new(4));
+        assert!(!receipt.final_accepted());
+        assert!(!format!("{receipt:?}").contains("data"));
+    }
+
+    #[test]
     fn local_data_and_partial_ack_update_exact_global_budget_before_backpressure() {
         let issuer = LegIssuer::new(0x11);
         let leg = issuer.issue(2);
@@ -3532,7 +3832,12 @@ mod tests {
                 payload: Bytes::from_static(b"queued"),
             })
             .unwrap();
-        assert!(effects.is_empty());
+        assert!(matches!(
+            effects.as_slice(),
+            [SessionEffect::ReplayStored { receipt }]
+                if receipt.start() == ByteOffset::new(0)
+                    && receipt.end() == ByteOffset::new(6)
+        ));
         assert_eq!(
             model
                 .snapshot()

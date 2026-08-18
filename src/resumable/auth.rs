@@ -384,7 +384,7 @@ impl AttachRequest {
     /// TLS leg represented by `binding`. The transport adapter must preserve
     /// that frame-to-leg association; this model then verifies the request's
     /// exact session, nonce, generation, and negotiated result.
-    pub fn validate_accepted_frame(
+    pub(crate) fn validate_accepted_frame(
         &self,
         binding: &AttachTransportBinding,
         frame: &Frame,
@@ -424,7 +424,7 @@ impl AttachRequest {
     /// attach attempt.  The echoed session, requested generation, and nonce
     /// prevent a response for another (or older) request from minting a
     /// resynchronization capability.
-    pub fn validate_generation_status_frame(
+    pub(crate) fn validate_generation_status_frame(
         &self,
         binding: &AttachTransportBinding,
         frame: &Frame,

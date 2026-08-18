@@ -4,28 +4,34 @@
 
 ### Path-diverse resumable upstream
 
-#### Latest decision (2026-08-18 — Knife16 Task 2 complete; Task 3 next)
+#### Latest decision (2026-08-18 — Knife16 Task 3 complete; Task 4 next)
 
-Knife16 Task 2 now passes locally. The transport-independent `resumable` fixed
-core implements the bounded v1 codec, authenticated exact-next attach and
-response-loss generation resynchronization, directional TCP replay/receive
-ownership, stable cross-leg session capabilities, two-phase FIN, bounded
-terminal tombstones, and checked capacity/storage/copy math. Application ACK
-advances only after actual sink acceptance. Invalid or small-but-large-backing
-DATA/OPEN inputs cannot enter persistent state uncharged.
+Knife16 Task 3 now passes locally. The crate-private `OwnedUpstream` facade
+preserves exact legacy TCP relay variants and UDP/TUIC/Reality/Failover
+behavior while the real TUN/smoltcp loop can select typed resumable flow
+ports. One session factory owns the aggregate uplink-byte ledger; reservation
+precedes local extraction; exact reducer receipts own replay storage/release;
+and per-flow, message, and global capacity exhaustion all backpressure without
+consuming or closing local TCP.
 
-At a 500ms total retained horizon, 100/170/240 Mbit/s require
-`6,250,000/10,625,000/15,000,000B` per direction. Focused `94/94`, root
-`807 + 3 ignored`, protocol/API `19/19 + 1/1`, harness
-`819 + 3 ignored`, concurrency `10 + 4 ignored`, release, Clippy, rustdoc,
-vendored Quinn/proto, fmt, diff, and two concentrated reviews pass with no
-unresolved P0/P1. This is a necessary pure stage: no production adapter,
-socket, two-leg harness, WAN result, or `>170 Mbit/s` claim exists yet. Result:
-`docs/tech/2026-08-18-knife16-resumable-protocol-capacity-local-results.md`.
+Application ACK is emitted only after exact positive smoltcp `send_slice`
+acceptance. Sink/FIN traffic remains behind the existing D16/local-egress
+actor. DATA/CLOSE ordering, bounded control fairness, exact TLS-leg
+provenance, terminal/owner-loss handling, stale epoch, and every uninstalled
+async open path are capability-owned and fail closed.
 
-Next implement Task 3 only: the deep `OwnedUpstream` adapter seam and exact
-TLS-leg provenance, while preserving existing TUIC/failover behavior. Do not
-start a WAN test.
+Focused `43/43`, all-target harness `875 + 3 ignored`, concurrency
+`10 + 4 ignored`, typed provenance `101/101`, real-smoltcp fake adapter `2/2`
+plus 100-repeat, release, strict Clippy, rustdoc, vendored Quinn/proto, fmt,
+diff, and four concentrated reviews pass with P0/P1 `0/0`. This is still a
+local branch-by-abstraction result: the public production entry remains
+legacy, and no production two-leg transport, server owner, blackout recovery,
+WAN result, or `>170 Mbit/s` claim exists. Result:
+`docs/tech/2026-08-18-knife16-owned-upstream-local-results.md`.
+
+Next implement Task 4 only: the deterministic in-memory two-leg transport
+harness with authenticated attach, blackout, reorder, duplicate, delayed ACK,
+stale-leg, and fairness injection. Do not start a WAN test.
 
 #### Prior decision context (2026-08-18 — Knife15 Tier B failed)
 
@@ -55,8 +61,9 @@ Current execution order:
 
 1. protocol model and capacity characterization — **COMPLETE**;
 2. deep `OwnedUpstream` abstraction behind existing client interfaces —
+   **COMPLETE**;
+3. deterministic two-leg TCP blackout and UDP path-switch harnesses —
    **NEXT**;
-3. deterministic two-leg TCP blackout and UDP path-switch harnesses;
 4. `mini_vpn-upstreamd` single session owner and loopback lifecycle tests;
 5. local real-socket `>170 Mbit/s` capacity gate;
 6. security/review gates;
@@ -67,6 +74,8 @@ Spec and plan:
 `docs/tech/2026-08-18-knife16-path-diverse-resumable-upstream-architecture-spec.md`
 and
 `docs/tech/2026-08-18-knife16-path-diverse-resumable-upstream-implementation-plan.md`.
+Task-3 result:
+`docs/tech/2026-08-18-knife16-owned-upstream-local-results.md`.
 Knife15 result:
 `docs/tech/2026-08-18-knife15-m2-frequency-first-run-udp-loss-results.md`.
 

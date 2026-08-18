@@ -1,5 +1,38 @@
 # Learnings
 
+## 2026-08-18 - Ownership adapters need typed receipts at irreversible boundaries
+
+- Reserve both message and session-global byte capacity before calling the
+  smoltcp receive extractor. Per-flow exhaustion and global exhaustion are the
+  same producer-backpressure class; neither authorizes consuming bytes or
+  closing a TCP flow.
+- Wire records are not ownership receipts. Replay storage, application ACK,
+  FIN, and terminal release need reducer-minted, non-cloneable capabilities
+  bound to the exact session, flow, direction, extent, and operation.
+- The application-ACK boundary remains the exact positive return from local
+  `TcpSocket::send_slice`. Decode, leg receipt, mailbox admission, D16 state,
+  and queueing are all too early; terminal abandon must never share the ACK
+  release path.
+- Terminal retirement and sink/half-close mutation must be linearized by one
+  liveness gate. A standalone `is_live()` check leaves a check-to-use race in
+  which a retired flow can still write or half-close a local socket.
+- Every async result needs an explicit uninstalled-result disposition. Stale
+  epoch, changed state, closed completion channel, and wrong adapter variant
+  all need the same typed LocalAbandon path before senders are dropped.
+- Compatibility adapters must delegate the deepest established operation.
+  Calling `open_tcp` instead of `open_tcp_relay` would silently erase
+  `NativeByteOwned` and its D16 ownership contract even if bytes still moved.
+- Attach validation is not enough transport provenance. Keep an exact
+  unforgeable leg seal after attach and require it for every post-attach frame;
+  generation numbers and identical TLS exporter inputs do not identify one
+  physical connection.
+- Lifecycle actions need a bounded lane independent of bulk relay DATA.
+  Otherwise unrelated flow pressure can starve the ACK/FIN/terminal actions
+  required to release that same pressure.
+
+Result:
+`docs/tech/2026-08-18-knife16-owned-upstream-local-results.md`.
+
 ## 2026-08-18 - Resumable ownership needs exact acceptance and capability boundaries
 
 - Application ACK belongs at the actual local sink-acceptance boundary. DATA

@@ -2,7 +2,7 @@
 
 Date: 2026-08-18
 
-Status: **IN PROGRESS; TASKS 1–2 COMPLETE; TASK 3 NEXT; M3 BLOCKED**
+Status: **IN PROGRESS; TASKS 1–3 COMPLETE; TASK 4 NEXT; M3 BLOCKED**
 
 > Use `diagnose` and `tdd` for each behavior change. Use
 > `improve-codebase-architecture` when a test cannot reach the required
@@ -55,7 +55,7 @@ unresolved P0/P1. No network or production adapter exists yet. See
 
 ## Task 3: Deep `OwnedUpstream` abstraction
 
-Status: **NEXT**
+Status: **COMPLETE**
 
 - Introduce a protocol-owned session/flow interface behind the current
   `ProxyUpstream` and `DatagramUpstream` call sites.
@@ -68,7 +68,23 @@ Status: **NEXT**
 Acceptance: TUN/smoltcp relay code selects either adapter without knowing
 transport, leg, or replay mechanics. Architecture depth target: **9/10**.
 
+Result: PASS for the Task-3 local seam. The object-safe facade preserves all
+legacy relay variants and UDP behavior while a crate-private adapter-aware
+event loop drives typed resumable flow ports through the real smoltcp path.
+Session-global byte reservation precedes local extraction; application ACK is
+minted only from exact `send_slice` acceptance; TLS-leg, replay, sink, FIN,
+terminal, epoch, and uninstalled-open ownership are capability-bound. The
+existing D16/local-egress actor remains the sole admission authority. Focused
+`43/43`, all-target harness `875 + 3 ignored`, concurrency `10 + 4 ignored`,
+typed provenance `101/101`, real fake-adapter `2/2` plus 100-repeat, release,
+strict Clippy, rustdoc, vendored Quinn/proto, fmt, diff, and four concentrated
+reviews pass with no unresolved P0/P1. Production two-leg transport, owner,
+WAN, and throughput remain unimplemented. See
+`docs/tech/2026-08-18-knife16-owned-upstream-local-results.md`.
+
 ## Task 4: Deterministic two-leg transport harness
+
+Status: **NEXT**
 
 - Build in-memory client/ingress/owner legs with deterministic clocks.
 - Inject drop, reorder, duplicate, delayed ACK, primary blackouts from

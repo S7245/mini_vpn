@@ -8,6 +8,11 @@ pub mod fake_ip;
 pub mod harness;
 pub mod loop_profiler;
 pub mod metrics;
+// Task 3 deliberately lands the internal branch-by-abstraction surface before
+// Task 4/6 provide the real two-leg transport and owner. Keep that dormant
+// half of the facade private without turning its staged API into warning noise.
+#[allow(dead_code, unused_imports)]
+pub(crate) mod owned_upstream;
 pub mod quic;
 pub(crate) mod quic_udp_send_service;
 pub mod reality;
