@@ -1,5 +1,69 @@
 # Errors
 
+## 2026-08-17 - Replacement Exit transfer and cloud-control claims failed closed
+
+- The first Tokyo-to-US tar stream ended after about 30 seconds and installed
+  only `8,447,488B` of a `68,478,432B` sing-box binary. A later direct download
+  similarly retained only `4,700,160B`. Both files looked ordinary until the
+  exact frozen SHA-256 rejected them. The official generic v1.13.14 archive
+  also produced a different build hash and was correctly rejected.
+- The accepted transfer retained the command session through exit, then
+  verified archive, inner-binary, and installed hashes. Future behavior: any
+  yielded long transfer must be polled by session ID; never retry the same
+  opaque one-shot path or infer completion from file size.
+- After the user reported security-group completion, an arbitrary HK Python
+  UDP datagram sent from physical `en0` / `119.13.90.246` produced no guest
+  counter. That negative probe was not authoritative for QUIC/TUIC admission.
+  The exact no-TUN TUIC handshake/auth/Connect probe then passed in `1002ms`
+  while the guest UDP 8443 counter advanced by `23 packets / 11,726B`, proving
+  the security group and real protocol path are admitted. Future behavior:
+  use the exact application protocol before classifying a UDP ingress rule.
+- Root `systemctl disable --now aegis.service` remained blocked with
+  `Access denied`; the unit stayed enabled, although inactive. Do not reboot
+  or start Tier-B evidence until the new instance's Cloud Security precise
+  defense/self-protection exception is proved and a reboot shows no AliSec
+  module or agent ownership.
+- After the Aegis reboot gate passed, direct SSH from the non-HK controller
+  unexpectedly printed `UNEXPECTED_DIRECT_SSH_PASS`. This proves the user had
+  closed Agent Protection but had not yet removed every extra security-group
+  SSH source. Do not conflate those independent control-plane actions or start
+  Tier-B evidence until the negative control is blocked.
+
+No TUN, observer, or Tier-B epoch began, so these failures are environment
+setup evidence and invalidate no product result.
+
+## 2026-08-17 - Resource self-test command used the wrong artifact type
+
+- A combined local gate invoked nonexistent
+  `scripts/knife15-m2-resource-profile.sh`; the checked-in profile validator is
+  Python, `scripts/knife15-m2-resource-profile.py`, while only resource
+  preflight is a shell script.
+- The command stopped before later gates and produced no false PASS. Rebuilding
+  the list from `rg --files scripts` and rerunning the exact Python/shell
+  entrypoints passed profile, preflight, frequency, ledger, compile, diff, and
+  secret gates.
+- Future behavior: enumerate actual tool paths before composing a large gate;
+  do not infer language or extension from neighboring Knife15 tools.
+
+## 2026-08-17 - Sandboxed macOS ps false-failed the observer self-test
+
+- The observer self-test returned `1` in the default Codex sandbox because
+  `process_command` invokes macOS `ps`, and that sandbox returned
+  `Operation not permitted`. The intentionally suppressed `ps` stderr made
+  `observer_healthy` look like a dead/ambiguous fake process.
+- Xtrace plus a direct `ps` probe selected the permission boundary rather than
+  fake timeout/PID lifetime. The exact unchanged self-test passed with
+  `exit=0` when run in its operational permission domain, and all failed-loop
+  temporary directories had no live processes before exact cleanup.
+- Future behavior: run this process-identity self-test with permission to read
+  `ps`; never modify observer ownership logic or report a regression from the
+  restricted-sandbox result.
+
+- The first exact `git add` could not create `.git/index.lock` in the default
+  filesystem sandbox. It made no partial index change. Repository write
+  operations in this environment must use the already authorized elevated Git
+  boundary; never treat this as an existing lock or delete `.git` state.
+
 ## 2026-08-17 - Two exploratory Rust gates had invalid provenance or zero tests
 
 - Running the vendored Quinn manifest directly selected registry

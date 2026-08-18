@@ -1,5 +1,48 @@
 # Learnings
 
+## 2026-08-17 - Large remote artifacts need process ownership plus inner-content hashes
+
+- A long `ssh`/`scp` call is not complete merely because the orchestration
+  wrapper returned no stderr. If the command yields a session ID, retain and
+  poll that exact process until it publishes an exit status; otherwise the
+  session can end at the yield boundary and leave a plausible-size partial
+  file.
+- Validate both the transport container and the installed artifact. The
+  accepted sing-box transfer used a completed persistent session, an archive
+  SHA-256, an inner extracted-binary SHA-256, and a post-install SHA-256. File
+  presence, mode, and an ELF header are not sufficient.
+- A same-EIP resource replacement still changes instance, host-key, and
+  server identity. When no evidence epoch has begun, freeze one new identity
+  before the first run; never relabel the destroyed instance as continuous or
+  reuse its provider-identity file.
+- Cloud control-plane claims need endpoint evidence. An arbitrary short UDP
+  datagram can be filtered even when the real QUIC/TUIC path works, so bind
+  ingress admission to the exact handshake/auth/Connect protocol plus guest
+  counter, physical route, and source IP. Root service state must separately
+  prove that self-protection was actually disabled.
+
+Result:
+`docs/tech/2026-08-17-knife15-m2-frequency-macos-runbook.md`.
+
+## 2026-08-17 - Agent isolation needs reboot authority; ingress needs a negative control
+
+- A stopped Aegis service was not sufficient while its unit remained enabled
+  and `AliSecGuard` stayed loaded. After disabling Agent Protection, removing
+  the startup unit, and rebooting, the accepted authority is: unit absent,
+  service inactive, zero matching processes, and zero matching modules.
+- A screenshot showing the intended HK rule and a successful HK connection do
+  not prove exclusivity. A direct SSH attempt from the non-HK controller still
+  succeeded, selecting a remaining extra source rule. Require both the
+  non-HK negative control and HK SSH/TUIC positive controls before freezing the
+  security-group contract.
+- Process-identity gates inherit an execution-domain requirement: a sandbox
+  that denies `ps` cannot authoritatively evaluate PID/command ownership.
+  Reproduce once under the same permission boundary as formal operations
+  before changing lifecycle code.
+
+Result:
+`docs/tech/2026-08-17-knife15-m2-frequency-usw1-replacement-exit-admission-results.md`.
+
 ## 2026-08-17 - Detached cleanup must own both sides of paired evidence
 
 - A Mac controller that always stops TUN can still leak remote observer

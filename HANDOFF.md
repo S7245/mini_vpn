@@ -4,6 +4,26 @@
 
 ## Next Planned Stage — Knife15 M2 Tiered Resource Continuity (2026-08-17)
 
+- **Current resource transaction:** the original Alibaba US candidate-1 ECS
+  was destroyed after Tier A was sealed and before any Tier-B epoch started.
+  The retained EIP `47.89.211.4` / `eip-rj9hj9g6dbtxwwxfqmw0t` is attached to
+  replacement ECS `i-rj9c5rn1psf504mf1zo2`, `us-west-1b`, `ecs.c8i.large`,
+  Ubuntu 24.04. Freeze this as Tier-B resource
+  `tierb-alibaba-usw1-r1`, not as a third Tier-A candidate. Its strict host
+  key is `SHA256:km4qtBz/r+jNuPv4WKoCP3LoIyw1U6nfRNMIWpW9K24`; frozen
+  sing-box binary/config hashes are `4ea794fd.../0c48b683...`; key-only SSH,
+  Target reachability, listener, clock, capacity, and apt isolation pass.
+  The exact no-TUN TUIC handshake/auth/Connect probe from HK passed in
+  `1002ms`, and the guest UDP 8443 counter advanced by `23 packets / 11,726B`,
+  so real TUIC admission passes. Aegis Agent Protection was disabled and the
+  `2026-08-17 14:44:14Z` reboot proves its unit absent/inactive plus zero agent
+  processes and zero `AliSecGuard` modules; sing-box, hashes, listener, Target,
+  IPv6, clock, and timer isolation pass. After the three extra ingress rules
+  were removed, non-HK direct SSH failed while HK strict SSH and a fresh exact
+  TUIC probe passed in `1001ms`; the guest counter observed `25 packets /
+  11,843B` and temporary nftables ownership cleaned. Replacement Exit
+  admission passes. No TUN, observer, or Tier-B epoch has started. Result:
+  `docs/tech/2026-08-17-knife15-m2-frequency-usw1-replacement-exit-admission-results.md`.
 - **Latest accepted position: Tier A is exhausted and Tier B is open.**
   Exact-source `27a7ca0` candidate-2 Formal-1 Mac/Exit bundle SHA-256
   `0501d259.../2453a153...` passed resource/observer/result-integrity/cleanup
@@ -45,9 +65,10 @@
   Endpoint `240.511 Mbit/s`, D16 batch, and full-TUN gates pass. Concentrated
   review has no unresolved P0/P1. Result:
   `docs/tech/2026-08-17-knife15-m2-frequency-controller-local-results.md`.
-- **Only next step:** commit/push the Task-9 gate, verify Alibaba US candidate
-  1 and HK Mac health/identity, then start the first four-epoch/24-hour run.
-  M3 remains blocked until twelve valid epochs pass the immutable ledger.
+- **Only next step:** finish review/gates for the replacement-identity closure,
+  commit/push and sync/build the HK Mac, take fresh baseline/direct/resource
+  evidence, then start the first four-epoch/24-hour run. M3 remains blocked
+  until twelve valid epochs pass the immutable ledger.
 - Preserve the user-requested once-only completion notice in every detached
   long-run controller: after M2/m2-frequency returns on success or failure,
   run `printf "Subject: 执行结束~" | msmtp 870941563@qq.com`. It is

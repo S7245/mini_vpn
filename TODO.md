@@ -4,7 +4,27 @@
 
 ### Tiered resource continuity before an established-stream architecture decision
 
-#### Latest decision (2026-08-17 — Tier A exhausted; Task 9 local PASS; environment admission next)
+#### Latest decision (2026-08-17 — Tier A exhausted; replacement Exit admission PASS; fresh evidence next)
+
+The original Alibaba US candidate-1 ECS was destroyed after Tier A was sealed
+and before any Tier-B epoch began. Its retained EIP `47.89.211.4` /
+`eip-rj9hj9g6dbtxwwxfqmw0t` is now attached to replacement ECS
+`i-rj9c5rn1psf504mf1zo2` in `us-west-1b`. This is frozen as the new Tier-B
+identity `tierb-alibaba-usw1-r1`; it is not a third Tier-A candidate and it
+does not invalidate evidence because no epoch existed. Exact host key and
+server binary/config identities are
+`SHA256:km4qtBz/r+jNuPv4WKoCP3LoIyw1U6nfRNMIWpW9K24` and
+`4ea794fd.../0c48b683...`. Guest service, Target path, SSH, capacity, clock, and
+apt isolation pass. The exact no-TUN TUIC handshake/auth/Connect probe passed
+in `1002ms`, with the guest UDP 8443 counter advancing by `23 packets /
+11,726B`; real TUIC admission passes. Aegis Agent Protection is now disabled;
+the `2026-08-17 14:44:14Z` reboot proves no Aegis unit/process or `AliSecGuard`
+module, while sing-box and all frozen hashes remain healthy. The three extra
+ingress rules were removed; non-HK direct SSH then failed while HK strict SSH
+and a fresh exact TUIC probe passed in `1001ms`, with guest evidence `25
+packets / 11,843B` and exact nftables cleanup. Replacement Exit admission now
+passes. No TUN, observer, or Tier-B epoch has started. Result:
+`docs/tech/2026-08-17-knife15-m2-frequency-usw1-replacement-exit-admission-results.md`.
 
 Candidate-2 Formal 1 is complete and rejected. Exact-source `27a7ca0`
 Mac/Exit bundles SHA-256 `0501d259.../2453a153...` passed resource admission,
@@ -41,9 +61,10 @@ was armed. Unknown observer cleanup fails closed.
 Root `713+3 ignored`, main `2`, integration `10+4 ignored`, release, Clippy,
 vendored Quinn/proto/docs, script self-tests, syntax, provenance, diff/secret,
 Endpoint `240.511 Mbit/s`, D16 batch, and full-TUN gates pass. Concentrated
-review has no unresolved P0/P1. Next: commit/push the Task-9 gate, verify
-Mac/VPS health and immutable inputs, then launch the first four-epoch/24-hour
-run. M3 remains blocked. Result:
+review has no unresolved P0/P1. Next: review/commit/push the replacement-
+identity closure, sync/build the HK Mac, take fresh baseline/direct/resource
+evidence, and then launch the first four-epoch/24-hour run. M3 remains blocked.
+Result:
 `docs/tech/2026-08-17-knife15-m2-frequency-controller-local-results.md`.
 
 #### Superseded decision (2026-08-17 — Formal 1 control-invalid; reviewed retry next)

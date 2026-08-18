@@ -75,8 +75,14 @@ nonzero exact gates.
 
 ## Decision
 
-The Task-9 local gate is complete. The next transaction is read-only health
-and exact-identity admission on Alibaba US candidate 1 and the HK Mac,
-followed by one fresh baseline/direct/resource/start/smoke/observer setup and
-the first four-epoch run. M3 remains blocked until twelve valid epochs and the
-immutable ledger emit `TIER_B_ACCEPTED`.
+The Task-9 local gate is complete. The original Alibaba US candidate-1 ECS was
+destroyed before any Tier-B epoch began, while its EIP and route contract were
+retained. Replacement Tier-B resource `tierb-alibaba-usw1-r1` has passed exact
+TUIC plus Aegis/reboot admission. After removing the extra ingress rules, the
+non-HK/HK negative-positive SSH pair and a fresh exact TUIC/guest-counter probe
+also passed. Take one fresh baseline/direct/resource/start/smoke/observer setup
+and start the first four-epoch run. This replacement is not a third Tier-A
+candidate and cannot bridge any old resource identity into the new ledger. M3
+remains blocked until twelve valid epochs and the immutable ledger emit
+`TIER_B_ACCEPTED`. Replacement admission result:
+`docs/tech/2026-08-17-knife15-m2-frequency-usw1-replacement-exit-admission-results.md`.

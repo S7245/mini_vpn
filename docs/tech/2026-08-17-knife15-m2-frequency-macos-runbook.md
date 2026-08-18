@@ -2,7 +2,8 @@
 
 Date: 2026-08-17
 
-Status: **LOCAL GATES PASS; FIRST FOUR-EPOCH RUN NOT STARTED**
+Status: **LOCAL GATES AND REPLACEMENT EXIT ADMISSION PASS; FIRST FOUR-EPOCH
+RUN NOT STARTED**
 
 This is the only active Tier-B procedure. It does not reopen Tier A, add a
 third candidate, tune a frozen value, or change mini_vpn production code. The
@@ -13,10 +14,14 @@ separate TUIC client.
 
 ## Fixed decision and resource
 
-- Use Alibaba US West candidate 1, `47.89.211.4`, for all twelve epochs. Its
-  strict run previously maintained the `3%` UDP gate for 13 hours and exposed
-  the isolated receiver-zero behavior Tier B measures. Do not use rejected
-  Tokyo candidate 2, whose first UDP phase reached `6.164314%`.
+- Use the replacement Alibaba US West Tier-B Exit, `47.89.211.4`, for all
+  twelve epochs. The original candidate-1 ECS was destroyed after Tier A was
+  sealed but before any Tier-B epoch began. The directly attached EIP and
+  route contract survived; the replacement ECS, host key, server
+  configuration, and candidate ID are therefore frozen as a new Tier-B
+  resource identity before the first epoch. This is not a third Tier-A
+  candidate or an unchanged strict retry. Do not use rejected Tokyo candidate
+  2, whose first UDP phase reached `6.164314%`.
 - One run requests four exact six-hour epochs. Three valid four-epoch runs
   produce 72 valid hours and independently satisfy the uninterrupted 24-hour
   process/TUN lifetime requirement.
@@ -36,9 +41,9 @@ separate TUIC client.
 Candidate anchors:
 
 ```text
-candidate_id=candidate1-alibaba-usw1
+candidate_id=tierb-alibaba-usw1-r1
 provider=alibaba-cloud
-resource_id=i-rj9cabfprph7x3sard3z
+resource_id=i-rj9c5rn1psf504mf1zo2
 region=us-west-1
 public_ipv4=47.89.211.4
 asn=45102
@@ -48,8 +53,10 @@ tuic_port=8443
 target_ipv4=43.130.32.77
 target_iperf_port=5201
 server_binary_sha256=4ea794fddcb2ad84532adeab979a9b0d7b2052822bb3439dfb321c33c941da19
-server_config_sha256=9aa397471060d1ef11afea858ee2a7550c426a2e133cfee1d2468c55425f33d8
-host_key_ed25519=SHA256:79dk6jK0kPdeegRLpduVuA/EjZ43TZVwMsQ67gZ5B1o
+server_config_sha256=0c48b68369253dfa427a953f7f05a0945a9a7023073713b2a10423390d288c40
+host_key_ed25519=SHA256:km4qtBz/r+jNuPv4WKoCP3LoIyw1U6nfRNMIWpW9K24
+provider_identity_sha256=4d24f9e0ae327c3657555a96485d03c8820d27c4e42a1145792effb085ae6355
+route_identity_sha256=66118cd71c558ddba3391950ebd258d8d1955d8ff722c66a335f27bdc29a82ea
 ```
 
 ## One-time source and Tier-A admission setup
@@ -99,9 +106,9 @@ export PARALLEL=1
 export METRICS_SECS=30
 export SAMPLE_SECS=30
 
-export M2_CANDIDATE_ID='candidate1-alibaba-usw1'
+export M2_CANDIDATE_ID='tierb-alibaba-usw1-r1'
 export M2_CANDIDATE_PROVIDER='alibaba-cloud'
-export M2_CANDIDATE_RESOURCE_ID='i-rj9cabfprph7x3sard3z'
+export M2_CANDIDATE_RESOURCE_ID='i-rj9c5rn1psf504mf1zo2'
 export M2_CANDIDATE_REGION='us-west-1'
 export M2_CANDIDATE_IPV4='47.89.211.4'
 export M2_CANDIDATE_ASN='45102'
@@ -109,9 +116,9 @@ export M2_CANDIDATE_ROUTE_CLASS='public-internet'
 export M2_CANDIDATE_ROUTE_CONTRACT_ID='eip-rj9hj9g6dbtxwwxfqmw0t'
 export M2_CANDIDATE_TUIC_PORT=8443
 export M2_SERVER_BINARY_SHA256='4ea794fddcb2ad84532adeab979a9b0d7b2052822bb3439dfb321c33c941da19'
-export M2_SERVER_CONFIG_SHA256='9aa397471060d1ef11afea858ee2a7550c426a2e133cfee1d2468c55425f33d8'
-export M2_PROVIDER_IDENTITY_EVIDENCE="$HOME/knife15-evidence/resource-identities/candidate1-alibaba-usw1-provider-identity.txt"
-export M2_ROUTE_IDENTITY_EVIDENCE="$HOME/knife15-evidence/resource-identities/candidate1-alibaba-usw1-route-identity.txt"
+export M2_SERVER_CONFIG_SHA256='0c48b68369253dfa427a953f7f05a0945a9a7023073713b2a10423390d288c40'
+export M2_PROVIDER_IDENTITY_EVIDENCE="$HOME/knife15-evidence/resource-identities/tierb-alibaba-usw1-r1-provider-identity.txt"
+export M2_ROUTE_IDENTITY_EVIDENCE="$HOME/knife15-evidence/resource-identities/tierb-alibaba-usw1-r1-route-identity.txt"
 export EXIT_SSH_HOST='root@47.89.211.4'
 export EXIT_SSH_KEY="$HOME/.ssh/vpn"
 export M2_EXIT_SERVER_CONFIG_PATH='/etc/sing-box/config.json'
@@ -132,7 +139,10 @@ For every run:
 
 1. prove candidate host key, `sing-box` active/zero restarts, exact binary and
    config hashes, UDP 8443 listener, Target `43.130.32.77:5201`, clock,
-   capacity, observer absence, and the current HK `/32` security rule;
+   capacity, observer absence, and the exact security-group contract: only
+   TCP 22 and UDP 8443 from HK `119.13.90.246/32`, with no public 443 or other
+   SSH source; prove `aegis.service` disabled/inactive and no `AliSecGuard`
+   module after reboot;
 2. prove the Mac has no other VPN/TUN, stays on power and one physical network,
    and has an active bounded `caffeinate -dimsu` owner;
 3. safely record and disable physical IPv6 exactly as section 2 of the strict

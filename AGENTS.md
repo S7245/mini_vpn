@@ -189,6 +189,29 @@ documents as the frozen architecture/capacity baseline.
 
 Current Knife15 summary, as of 2026-08-17:
 
+- The original Alibaba US candidate-1 ECS was destroyed after Tier A was
+  sealed and before any Tier-B epoch began. The retained EIP
+  `47.89.211.4` / `eip-rj9hj9g6dbtxwwxfqmw0t` is now attached to replacement
+  ECS `i-rj9c5rn1psf504mf1zo2`, `us-west-1b`, `ecs.c8i.large`, Ubuntu 24.04.
+  Its out-of-band ED25519 fingerprint
+  `SHA256:km4qtBz/r+jNuPv4WKoCP3LoIyw1U6nfRNMIWpW9K24` matches strict SSH.
+  Exact sing-box binary/config hashes are `4ea794fd.../0c48b683...`, Target is
+  reachable, key-only SSH and apt isolation pass, and the service listens on
+  UDP 8443. Freeze it as new Tier-B identity `tierb-alibaba-usw1-r1`; do not
+  reuse the destroyed ECS identity or describe this as a third Tier-A
+  candidate. The exact no-TUN TUIC handshake/auth/Connect probe from HK
+  `119.13.90.246` passed in `1002ms`, while the guest UDP 8443 counter advanced
+  by `23 packets / 11,726B`; initial HK ingress and real TUIC admission passed.
+  Arbitrary short UDP alone was not authoritative. Aegis Agent
+  Protection was then disabled; after reboot at `2026-08-17 14:44:14Z`, its
+  unit is absent/inactive, agent process and `AliSecGuard` module counts are
+  zero, while sing-box remains active/zero-restart with exact binary/config/
+  unit hashes and Target reachability. After the three extra ingress rules
+  were removed, non-HK direct SSH failed while HK strict SSH and a fresh exact
+  TUIC probe passed in `1001ms`; its guest counter was `25 packets / 11,843B`
+  and the temporary nftables table cleaned. Replacement Exit admission now
+  passes. No TUN, observer, or Tier-B epoch has started. Result:
+  `docs/tech/2026-08-17-knife15-m2-frequency-usw1-replacement-exit-admission-results.md`.
 - **Tier A is exhausted; Tier B is open.** Exact-source `27a7ca0`
   candidate-2 Formal-1 Mac/Exit bundle SHA-256
   `0501d259.../2453a153...` passed resource/observer/result-integrity/cleanup
