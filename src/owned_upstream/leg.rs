@@ -7,9 +7,11 @@
 //! 0-RTT behavior.
 
 use crate::resumable::{
-    AttachAuthority, AttachReject, AttachRequest, AttachTransportBinding, CommittedLeg, Frame,
-    GenerationCatchUp, GenerationResynchronization, LegGeneration, PendingGenerationCatchUp,
-    Record, SessionConfig, SessionEffect, SessionError, SessionEvent, SessionModel, SessionRole,
+    AttachAuthority, AttachReject, AttachRequest, AttachTransportBinding,
+    AuthenticatedStandbyRegistration, CommittedLeg, Frame, GenerationCatchUp,
+    GenerationResynchronization, LegControlFrame, LegGeneration, PendingGenerationCatchUp, Record,
+    SessionConfig, SessionEffect, SessionError, SessionEvent, SessionModel, SessionRole,
+    StandbyNonce, StandbyRegistrationReject, StandbyRegistrationRequest,
 };
 use crate::shared::TargetAddr;
 use std::fmt;
@@ -72,7 +74,7 @@ impl LegSeal {
             .map(|()| lease)
     }
 
-    fn outbound_queue_was_lost(&self) -> bool {
+    pub(super) fn outbound_queue_was_lost(&self) -> bool {
         self.0.outbound_queue_claimed.load(Ordering::Acquire)
             && self
                 .0
@@ -117,6 +119,16 @@ impl EstablishedLeg {
         }
     }
 
+    pub(super) fn bind_received_control_frame(
+        &self,
+        frame: LegControlFrame,
+    ) -> LegBoundControlFrame {
+        LegBoundControlFrame {
+            seal: self.seal.share(),
+            frame,
+        }
+    }
+
     /// Atomically mints the sole outbound queue authority for this live
     /// transport endpoint. The claim remains consumed after queue drop so an
     /// ordered stream cannot be silently replaced by another FIFO.
@@ -134,6 +146,14 @@ impl EstablishedLeg {
 
     pub(super) fn belongs_to_transport(&self, seal: &LegSeal) -> bool {
         self.seal.same_connection(seal)
+    }
+
+    pub(super) fn standby_seal(&self) -> LegSeal {
+        self.seal.share()
+    }
+
+    pub(super) const fn standby_transport_binding(&self) -> AttachTransportBinding {
+        self.binding
     }
 
     /// Non-owning liveness witness for the exact authenticated endpoint. This
@@ -290,6 +310,27 @@ pub(crate) struct LegBoundFrame {
     frame: Frame,
 }
 
+/// Classified inbound facts retain disjoint protocol namespaces after exact
+/// transport provenance is minted. Leg-control facts cannot be passed to the
+/// session reducer without an explicit impossible type conversion.
+pub(crate) enum BoundInbound {
+    Session(LegBoundFrame),
+    LegControl(LegBoundControlFrame),
+}
+
+/// One decoded leg-control frame bound to the exact authenticated connection
+/// that carried its bytes. Construction remains private to [`EstablishedLeg`].
+pub(crate) struct LegBoundControlFrame {
+    seal: LegSeal,
+    frame: LegControlFrame,
+}
+
+impl LegBoundControlFrame {
+    pub(super) fn into_parts(self) -> (LegSeal, LegControlFrame) {
+        (self.seal, self.frame)
+    }
+}
+
 /// Authenticated generation status tied to the exact connection that carried
 /// the correlated response.
 ///
@@ -443,6 +484,22 @@ impl AttachedLeg {
         self.committed.transport_binding()
     }
 
+    pub(super) fn standby_registration_request(
+        &self,
+        nonce: StandbyNonce,
+    ) -> Result<StandbyRegistrationRequest, StandbyRegistrationReject> {
+        StandbyRegistrationRequest::from_installed_leg(&self.committed, nonce)
+    }
+
+    pub(super) fn authenticate_standby_registration(
+        &self,
+        authority: &AttachAuthority,
+        binding: &AttachTransportBinding,
+        frame: &LegControlFrame,
+    ) -> Result<AuthenticatedStandbyRegistration, StandbyRegistrationReject> {
+        authority.verify_standby_registration_frame(&self.committed, binding, frame)
+    }
+
     pub(super) fn belongs_to_transport(&self, seal: &LegSeal) -> bool {
         self.seal.same_connection(seal)
     }
@@ -533,6 +590,21 @@ impl fmt::Debug for AttachedLeg {
 impl fmt::Debug for LegBoundFrame {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("LegBoundFrame([REDACTED])")
+    }
+}
+
+impl fmt::Debug for LegBoundControlFrame {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LegBoundControlFrame([REDACTED])")
+    }
+}
+
+impl fmt::Debug for BoundInbound {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Session(_) => formatter.write_str("BoundInbound::Session([REDACTED])"),
+            Self::LegControl(_) => formatter.write_str("BoundInbound::LegControl([REDACTED])"),
+        }
     }
 }
 

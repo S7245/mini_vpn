@@ -16,6 +16,9 @@ pub use auth::{
     MAX_ATTACH_ALPN_BYTES, MAX_ATTACH_TRANSCRIPT_BYTES, OwnerIdentity, PendingGenerationCatchUp,
     ResumeSecret, TlsExporterBinding, VersionRange,
 };
+pub(crate) use auth::{
+    AuthenticatedStandbyRegistration, StandbyRegistrationReject, StandbyRegistrationRequest,
+};
 pub use capacity::{
     BitsPerSecond, DirectionalByteLimits, DirectionalRates, DirectionalReplayStorageLimits,
     ReplayCapacityError, ReplayCapacityPlan, ReplayCapacitySpec, ReplayCopyAllocationBounds,

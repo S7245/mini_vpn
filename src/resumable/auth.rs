@@ -6,8 +6,9 @@
 //! canonical HMAC transcript and grants a new leg generation exactly once.
 
 use super::protocol::{
-    AttachNonce, AttachProof, FRAME_PROTOCOL_VERSION, FeatureSet, Frame, LegGeneration,
-    ProtocolError, Record, SESSION_PROTOCOL_VERSION, SessionId,
+    AttachNonce, AttachProof, FRAME_PROTOCOL_VERSION, FeatureSet, Frame, LegControlFrame,
+    LegControlRecord, LegGeneration, ProtocolError, Record, SESSION_PROTOCOL_VERSION,
+    STANDBY_CONTROL_V1, SessionId, StandbyNonce, StandbyProof,
 };
 use super::session::{SessionEffect, SessionError, SessionModel};
 use hmac::{Hmac, Mac};
@@ -22,6 +23,7 @@ type ResynchronizableModelCommit = Result<ModelCommitResult, GenerationResynchro
 type ModelAttachResult = Result<ResynchronizableModelCommit, AttachReject>;
 
 const ATTACH_PROTOCOL_CONTEXT: &[u8] = b"mini_vpn/resumable/attach/v1";
+const STANDBY_REGISTER_PROTOCOL_CONTEXT: &[u8] = b"mini_vpn/resumable/standby-register/v1";
 const RESUME_PROOF_CONTEXT: &[u8] = b"resume-authority";
 const DEVICE_PROOF_CONTEXT: &[u8] = b"device-authority";
 const SECRET_BYTES: usize = 32;
@@ -30,6 +32,7 @@ const EXPORTER_BINDING_BYTES: usize = 32;
 const DEVICE_PRINCIPAL_BYTES: usize = 16;
 pub const MAX_ATTACH_ALPN_BYTES: usize = 32;
 pub const MAX_ATTACH_TRANSCRIPT_BYTES: usize = 256;
+pub const MAX_STANDBY_REGISTER_TRANSCRIPT_BYTES: usize = 320;
 
 #[derive(PartialEq, Eq)]
 struct Secret32([u8; SECRET_BYTES]);
@@ -459,6 +462,136 @@ impl AttachRequest {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct InstalledSessionContract {
+    session_id: SessionId,
+    current_generation: LegGeneration,
+    selected_version: u16,
+    features: FeatureSet,
+    owner_identity: OwnerIdentity,
+    alpn: AttachAlpn,
+    device_principal: DevicePrincipal,
+}
+
+impl InstalledSessionContract {
+    fn from_leg(leg: &CommittedLeg) -> Result<Self, StandbyRegistrationReject> {
+        let features = FeatureSet::new(leg.negotiated_features());
+        if !features.contains(STANDBY_CONTROL_V1) {
+            return Err(StandbyRegistrationReject::Rejected);
+        }
+        let binding = leg.transport_binding();
+        Ok(Self {
+            session_id: leg.session_id(),
+            current_generation: leg.generation(),
+            selected_version: leg.session_protocol_version(),
+            features,
+            owner_identity: binding.owner_identity(),
+            alpn: binding.alpn(),
+            device_principal: binding.device_principal(),
+        })
+    }
+}
+
+/// Exact standby registration request derived from an already-installed leg.
+/// It authenticates a second transport without granting replacement authority.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct StandbyRegistrationRequest {
+    installed: InstalledSessionContract,
+    nonce: StandbyNonce,
+}
+
+impl StandbyRegistrationRequest {
+    pub fn from_installed_leg(
+        installed_leg: &CommittedLeg,
+        nonce: StandbyNonce,
+    ) -> Result<Self, StandbyRegistrationReject> {
+        Ok(Self {
+            installed: InstalledSessionContract::from_leg(installed_leg)?,
+            nonce,
+        })
+    }
+
+    pub fn to_frame(
+        self,
+        proof: StandbyProof,
+    ) -> Result<LegControlFrame, StandbyRegistrationReject> {
+        LegControlFrame::try_new(
+            self.installed.current_generation,
+            LegControlRecord::StandbyRegister {
+                session_id: self.installed.session_id,
+                standby_nonce: self.nonce,
+                selected_version: self.installed.selected_version,
+                features: self.installed.features,
+                proof,
+            },
+            self.installed.features,
+        )
+        .map_err(|_| StandbyRegistrationReject::Rejected)
+    }
+
+    pub const fn standby_nonce(&self) -> StandbyNonce {
+        self.nonce
+    }
+}
+
+impl fmt::Debug for StandbyRegistrationRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StandbyRegistrationRequest")
+            .field("authentication", &"[REDACTED]")
+            .field("current_generation", &self.installed.current_generation)
+            .field("selected_version", &self.installed.selected_version)
+            .field("features", &self.installed.features)
+            .finish()
+    }
+}
+
+/// Authenticated registration of a distinct standby transport.  This is not
+/// an attach capability and cannot advance or replace the installed leg.
+#[derive(PartialEq, Eq)]
+pub struct AuthenticatedStandbyRegistration {
+    request: StandbyRegistrationRequest,
+    transport_binding: AttachTransportBinding,
+}
+
+impl AuthenticatedStandbyRegistration {
+    pub const fn session_id(&self) -> SessionId {
+        self.request.installed.session_id
+    }
+
+    pub const fn current_generation(&self) -> LegGeneration {
+        self.request.installed.current_generation
+    }
+
+    pub const fn standby_nonce(&self) -> StandbyNonce {
+        self.request.standby_nonce()
+    }
+
+    pub const fn selected_version(&self) -> u16 {
+        self.request.installed.selected_version
+    }
+
+    pub const fn features(&self) -> FeatureSet {
+        self.request.installed.features
+    }
+
+    pub const fn transport_binding(&self) -> AttachTransportBinding {
+        self.transport_binding
+    }
+}
+
+impl fmt::Debug for AuthenticatedStandbyRegistration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedStandbyRegistration")
+            .field("authentication", &"[REDACTED]")
+            .field("current_generation", &self.current_generation())
+            .field("selected_version", &self.selected_version())
+            .field("features", &self.features())
+            .finish()
+    }
+}
+
 /// Immutable session-side attach policy.  The TLS exporter remains leg-local
 /// and is supplied separately in [`AttachTransportBinding`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -523,6 +656,20 @@ impl AttachCredentials {
         AttachProof::new(proof).map_err(AttachConfigError::InvalidProofEncoding)
     }
 
+    pub fn prove_standby_registration(
+        &self,
+        request: &StandbyRegistrationRequest,
+        binding: &AttachTransportBinding,
+    ) -> Result<StandbyProof, AttachConfigError> {
+        let transcript = encode_standby_register_transcript(request, binding);
+        let proof = self
+            .standby_proof_mac(&transcript)?
+            .finalize()
+            .into_bytes()
+            .into();
+        StandbyProof::new(proof).map_err(AttachConfigError::InvalidStandbyProofEncoding)
+    }
+
     fn verifies(
         &self,
         request: &AttachRequest,
@@ -550,6 +697,34 @@ impl AttachCredentials {
         // `resume_tag` already authenticates the complete transcript.  The
         // outer MAC adds the independent device authority without hashing the
         // transcript a second time.
+        device_mac.update(&resume_tag);
+        Ok(device_mac)
+    }
+
+    fn verifies_standby_registration(
+        &self,
+        request: &StandbyRegistrationRequest,
+        binding: &AttachTransportBinding,
+        proof: &StandbyProof,
+    ) -> bool {
+        let transcript = encode_standby_register_transcript(request, binding);
+        self.standby_proof_mac(&transcript)
+            .map(|mac| mac.verify_slice(proof.as_bytes()).is_ok())
+            .unwrap_or(false)
+    }
+
+    fn standby_proof_mac(&self, transcript: &[u8]) -> Result<HmacSha256, AttachConfigError> {
+        let mut resume_mac = <HmacSha256 as Mac>::new_from_slice(self.resume_secret.0.expose())
+            .map_err(|_| AttachConfigError::InvalidHmacKey)?;
+        resume_mac.update(STANDBY_REGISTER_PROTOCOL_CONTEXT);
+        resume_mac.update(RESUME_PROOF_CONTEXT);
+        resume_mac.update(transcript);
+        let resume_tag = resume_mac.finalize().into_bytes();
+
+        let mut device_mac = <HmacSha256 as Mac>::new_from_slice(self.device_secret.0.expose())
+            .map_err(|_| AttachConfigError::InvalidHmacKey)?;
+        device_mac.update(STANDBY_REGISTER_PROTOCOL_CONTEXT);
+        device_mac.update(DEVICE_PROOF_CONTEXT);
         device_mac.update(&resume_tag);
         Ok(device_mac)
     }
@@ -956,6 +1131,65 @@ impl AttachAuthority {
         self.commit_prepared(prepared)
     }
 
+    /// Authenticates a standby transport against the exact installed session
+    /// contract without invoking attach preparation or generation mutation.
+    pub fn verify_standby_registration_frame(
+        &self,
+        installed_leg: &CommittedLeg,
+        binding: &AttachTransportBinding,
+        frame: &LegControlFrame,
+    ) -> Result<AuthenticatedStandbyRegistration, StandbyRegistrationReject> {
+        let installed = InstalledSessionContract::from_leg(installed_leg)?;
+        let LegControlRecord::StandbyRegister {
+            session_id,
+            standby_nonce,
+            selected_version,
+            features,
+            proof,
+        } = frame.record()
+        else {
+            return Err(StandbyRegistrationReject::Rejected);
+        };
+        let request = StandbyRegistrationRequest {
+            installed: InstalledSessionContract {
+                session_id: *session_id,
+                current_generation: frame.leg_generation(),
+                selected_version: *selected_version,
+                features: *features,
+                owner_identity: installed.owner_identity,
+                alpn: installed.alpn,
+                device_principal: installed.device_principal,
+            },
+            nonce: *standby_nonce,
+        };
+        let binding_matches_installed = binding.owner_identity == installed.owner_identity
+            && binding.alpn == installed.alpn
+            && binding.device_principal == installed.device_principal;
+        let installed_matches_authority = installed.session_id == self.session_id
+            && installed.current_generation.get() == self.current_generation()
+            && installed.owner_identity == self.policy.owner_identity
+            && installed.alpn == self.policy.alpn
+            && installed.device_principal == self.policy.device_principal
+            && installed.selected_version == self.policy.session_protocol_version
+            && installed.features.bits() & !self.policy.supported_features == 0;
+        // Verify the MAC before combining public checks, matching ATTACH's
+        // rejection shape rather than making field validity a cheap oracle.
+        let proof_valid = self
+            .credentials
+            .verifies_standby_registration(&request, binding, proof);
+        if !(proof_valid
+            && request.installed == installed
+            && binding_matches_installed
+            && installed_matches_authority)
+        {
+            return Err(StandbyRegistrationReject::Rejected);
+        }
+        Ok(AuthenticatedStandbyRegistration {
+            request,
+            transport_binding: *binding,
+        })
+    }
+
     /// Authenticates a decoded ATTACH, invokes the owner's read-only model
     /// preflight before generation mutation, then commits with one CAS.
     ///
@@ -1125,6 +1359,32 @@ fn encode_transcript(request: &AttachRequest, binding: &AttachTransportBinding) 
     transcript
 }
 
+fn encode_standby_register_transcript(
+    request: &StandbyRegistrationRequest,
+    binding: &AttachTransportBinding,
+) -> Vec<u8> {
+    let installed = request.installed;
+    let mut transcript = Vec::with_capacity(MAX_STANDBY_REGISTER_TRANSCRIPT_BYTES);
+    transcript.extend_from_slice(STANDBY_REGISTER_PROTOCOL_CONTEXT);
+    transcript.extend_from_slice(&FRAME_PROTOCOL_VERSION.to_be_bytes());
+    transcript.extend_from_slice(installed.session_id.as_bytes());
+    transcript.extend_from_slice(&installed.current_generation.get().to_be_bytes());
+    transcript.extend_from_slice(&installed.selected_version.to_be_bytes());
+    transcript.extend_from_slice(&installed.features.bits().to_be_bytes());
+    transcript.extend_from_slice(installed.owner_identity.as_bytes());
+    transcript.push(installed.alpn.len);
+    transcript.extend_from_slice(installed.alpn.as_bytes());
+    transcript.extend_from_slice(installed.device_principal.as_bytes());
+    transcript.extend_from_slice(binding.owner_identity.as_bytes());
+    transcript.push(binding.alpn.len);
+    transcript.extend_from_slice(binding.alpn.as_bytes());
+    transcript.extend_from_slice(binding.exporter.as_bytes());
+    transcript.extend_from_slice(binding.device_principal.as_bytes());
+    transcript.extend_from_slice(request.nonce.as_bytes());
+    debug_assert!(transcript.len() <= MAX_STANDBY_REGISTER_TRANSCRIPT_BYTES);
+    transcript
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AttachConfigError {
     #[error("device secret must not be all-zero")]
@@ -1153,6 +1413,16 @@ pub enum AttachConfigError {
     InvalidHmacKey,
     #[error("HMAC output did not form a legal attach proof: {0}")]
     InvalidProofEncoding(ProtocolError),
+    #[error("HMAC output did not form a legal standby registration proof: {0}")]
+    InvalidStandbyProofEncoding(ProtocolError),
+}
+
+/// Public standby-authentication failure.  All malformed, unknown, stale, and
+/// unauthenticated inputs are deliberately indistinguishable.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum StandbyRegistrationReject {
+    #[error("standby registration rejected")]
+    Rejected,
 }
 
 /// Public attach failure.  Unknown session and invalid authentication are
@@ -1269,6 +1539,44 @@ mod tests {
         )
     }
 
+    fn standby_authority_and_installed() -> (
+        AttachAuthority,
+        CommittedLeg,
+        AttachTransportBinding,
+        AttachTransportBinding,
+    ) {
+        let negotiated_features = STANDBY_CONTROL_V1.bits() | 0b0111;
+        let binding_a = binding_with_exporter(0x42);
+        let authority = AttachAuthority::new(
+            session(0x11),
+            LegGeneration::new(1).unwrap(),
+            credentials(),
+            AttachPolicy::new(
+                binding_a.owner_identity(),
+                binding_a.alpn(),
+                binding_a.device_principal(),
+                SESSION_PROTOCOL_VERSION,
+                negotiated_features,
+            )
+            .unwrap(),
+        );
+        let attach = request(
+            session(0x11),
+            2,
+            0x22,
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(negotiated_features, STANDBY_CONTROL_V1.bits()).unwrap(),
+        );
+        let installed = authority
+            .verify_and_commit(
+                &attach,
+                &binding_a,
+                &signer().prove(&attach, &binding_a).unwrap(),
+            )
+            .unwrap();
+        (authority, installed, binding_a, binding_with_exporter(0x99))
+    }
+
     fn session_config() -> SessionConfig {
         SessionConfig::new(
             4,
@@ -1316,6 +1624,314 @@ mod tests {
         );
         assert_eq!(committed.negotiated_features(), 0b0111);
         assert_eq!(authority.current_generation(), 2);
+    }
+
+    #[test]
+    fn authenticated_standby_registers_a_distinct_b_exporter_without_advancing_generation() {
+        let (authority, installed, binding_a, binding_b) = standby_authority_and_installed();
+        assert_ne!(binding_a, binding_b);
+        let standby = StandbyRegistrationRequest::from_installed_leg(
+            &installed,
+            StandbyNonce::new([0x33; 16]).unwrap(),
+        )
+        .unwrap();
+        let standby_proof = signer()
+            .prove_standby_registration(&standby, &binding_b)
+            .unwrap();
+        let frame = standby.to_frame(standby_proof).unwrap();
+        let before = authority.current_generation();
+
+        let authenticated = authority
+            .verify_standby_registration_frame(&installed, &binding_b, &frame)
+            .unwrap();
+
+        assert_eq!(authenticated.session_id(), installed.session_id());
+        assert_eq!(authenticated.current_generation(), installed.generation());
+        assert_eq!(
+            authenticated.standby_nonce(),
+            StandbyNonce::new([0x33; 16]).unwrap()
+        );
+        assert_eq!(authenticated.selected_version(), SESSION_PROTOCOL_VERSION);
+        assert_eq!(
+            authenticated.features().bits(),
+            STANDBY_CONTROL_V1.bits() | 0b0111
+        );
+        assert_eq!(authenticated.transport_binding(), binding_b);
+        assert_eq!(authority.current_generation(), before);
+    }
+
+    #[test]
+    fn standby_authentication_debug_redacts_all_identity_and_correlation_material() {
+        let (authority, installed, _binding_a, binding_b) = standby_authority_and_installed();
+        let standby = StandbyRegistrationRequest::from_installed_leg(
+            &installed,
+            StandbyNonce::new([0x33; 16]).unwrap(),
+        )
+        .unwrap();
+        let proof = signer()
+            .prove_standby_registration(&standby, &binding_b)
+            .unwrap();
+        let authenticated = authority
+            .verify_standby_registration_frame(
+                &installed,
+                &binding_b,
+                &standby.to_frame(proof).unwrap(),
+            )
+            .unwrap();
+
+        for debug in [format!("{standby:?}"), format!("{authenticated:?}")] {
+            assert!(debug.contains("[REDACTED]"));
+            assert!(!debug.contains("mini-vpn-owned/1"));
+            assert!(!debug.contains("1111111111111111"));
+            assert!(!debug.contains("3333333333333333"));
+            assert!(!debug.contains("9999999999999999"));
+        }
+        assert_eq!(format!("{proof:?}"), "StandbyProof([REDACTED])");
+    }
+
+    #[test]
+    fn every_standby_transcript_field_mutation_has_one_public_rejection() {
+        let (authority, installed, _binding_a, binding_b) = standby_authority_and_installed();
+        let standby = StandbyRegistrationRequest::from_installed_leg(
+            &installed,
+            StandbyNonce::new([0x33; 16]).unwrap(),
+        )
+        .unwrap();
+        let proof = signer()
+            .prove_standby_registration(&standby, &binding_b)
+            .unwrap();
+        let original_features = FeatureSet::new(installed.negotiated_features());
+        let register = |generation, session_id, standby_nonce, selected_version, features| {
+            LegControlFrame::try_new(
+                LegGeneration::new(generation).unwrap(),
+                LegControlRecord::StandbyRegister {
+                    session_id,
+                    standby_nonce,
+                    selected_version,
+                    features,
+                    proof,
+                },
+                original_features,
+            )
+            .unwrap()
+        };
+        let changed_frames = [
+            register(
+                2,
+                session(0x99),
+                StandbyNonce::new([0x33; 16]).unwrap(),
+                SESSION_PROTOCOL_VERSION,
+                original_features,
+            ),
+            register(
+                3,
+                installed.session_id(),
+                StandbyNonce::new([0x33; 16]).unwrap(),
+                SESSION_PROTOCOL_VERSION,
+                original_features,
+            ),
+            register(
+                2,
+                installed.session_id(),
+                StandbyNonce::new([0x34; 16]).unwrap(),
+                SESSION_PROTOCOL_VERSION,
+                original_features,
+            ),
+            register(
+                2,
+                installed.session_id(),
+                StandbyNonce::new([0x33; 16]).unwrap(),
+                SESSION_PROTOCOL_VERSION + 1,
+                original_features,
+            ),
+            register(
+                2,
+                installed.session_id(),
+                StandbyNonce::new([0x33; 16]).unwrap(),
+                SESSION_PROTOCOL_VERSION,
+                FeatureSet::new(original_features.bits() & !0b0010),
+            ),
+            register(
+                2,
+                installed.session_id(),
+                StandbyNonce::new([0x33; 16]).unwrap(),
+                SESSION_PROTOCOL_VERSION,
+                FeatureSet::new(original_features.bits() | 0x20),
+            ),
+        ];
+        for changed in changed_frames {
+            assert_eq!(
+                authority.verify_standby_registration_frame(&installed, &binding_b, &changed,),
+                Err(StandbyRegistrationReject::Rejected)
+            );
+            assert_eq!(authority.current_generation(), 2);
+        }
+
+        let wrong_kind = LegControlFrame::try_new(
+            installed.generation(),
+            LegControlRecord::StandbyAccepted {
+                session_id: installed.session_id(),
+                standby_nonce: StandbyNonce::new([0x33; 16]).unwrap(),
+                selected_version: SESSION_PROTOCOL_VERSION,
+                features: original_features,
+            },
+            original_features,
+        )
+        .unwrap();
+        assert_eq!(
+            authority.verify_standby_registration_frame(&installed, &binding_b, &wrong_kind),
+            Err(StandbyRegistrationReject::Rejected)
+        );
+        assert_eq!(authority.current_generation(), 2);
+
+        let changed_bindings = [
+            AttachTransportBinding::new(
+                owner(0x99),
+                binding_b.alpn(),
+                exporter(0x99),
+                binding_b.device_principal(),
+            ),
+            AttachTransportBinding::new(
+                binding_b.owner_identity(),
+                AttachAlpn::new(b"other-alpn/1").unwrap(),
+                exporter(0x99),
+                binding_b.device_principal(),
+            ),
+            binding_with_exporter(0x98),
+            AttachTransportBinding::new(
+                binding_b.owner_identity(),
+                binding_b.alpn(),
+                exporter(0x99),
+                principal(0x99),
+            ),
+        ];
+        let frame = standby.to_frame(proof).unwrap();
+        for changed in changed_bindings {
+            assert_eq!(
+                authority.verify_standby_registration_frame(&installed, &changed, &frame),
+                Err(StandbyRegistrationReject::Rejected)
+            );
+            assert_eq!(authority.current_generation(), 2);
+        }
+
+        let installed_binding = installed.transport_binding();
+        let changed_installed = [
+            CommittedLeg {
+                session_id: session(0x99),
+                ..installed
+            },
+            CommittedLeg {
+                generation: LegGeneration::new(3).unwrap(),
+                ..installed
+            },
+            CommittedLeg {
+                transport_binding: AttachTransportBinding::new(
+                    owner(0x99),
+                    installed_binding.alpn(),
+                    exporter(0x42),
+                    installed_binding.device_principal(),
+                ),
+                ..installed
+            },
+            CommittedLeg {
+                transport_binding: AttachTransportBinding::new(
+                    installed_binding.owner_identity(),
+                    AttachAlpn::new(b"other-alpn/1").unwrap(),
+                    exporter(0x42),
+                    installed_binding.device_principal(),
+                ),
+                ..installed
+            },
+            CommittedLeg {
+                transport_binding: AttachTransportBinding::new(
+                    installed_binding.owner_identity(),
+                    installed_binding.alpn(),
+                    exporter(0x42),
+                    principal(0x99),
+                ),
+                ..installed
+            },
+            CommittedLeg {
+                session_protocol_version: SESSION_PROTOCOL_VERSION + 1,
+                ..installed
+            },
+            CommittedLeg {
+                negotiated_features: original_features.bits() | 0x20,
+                ..installed
+            },
+        ];
+        for changed in changed_installed {
+            assert_eq!(
+                authority.verify_standby_registration_frame(&changed, &binding_b, &frame),
+                Err(StandbyRegistrationReject::Rejected)
+            );
+            assert_eq!(authority.current_generation(), 2);
+        }
+    }
+
+    #[test]
+    fn attach_and_standby_proof_bytes_cannot_cross_authentication_domains() {
+        let (authority, installed, _binding_a, binding_b) = standby_authority_and_installed();
+        let standby = StandbyRegistrationRequest::from_installed_leg(
+            &installed,
+            StandbyNonce::new([0x33; 16]).unwrap(),
+        )
+        .unwrap();
+        let standby_proof = signer()
+            .prove_standby_registration(&standby, &binding_b)
+            .unwrap();
+        let attach = request(
+            installed.session_id(),
+            3,
+            0x44,
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(installed.negotiated_features(), STANDBY_CONTROL_V1.bits()).unwrap(),
+        );
+        let attach_proof = signer().prove(&attach, &binding_b).unwrap();
+
+        let standby_from_attach = StandbyProof::new(*attach_proof.as_bytes()).unwrap();
+        assert_eq!(
+            authority.verify_standby_registration_frame(
+                &installed,
+                &binding_b,
+                &standby.to_frame(standby_from_attach).unwrap(),
+            ),
+            Err(StandbyRegistrationReject::Rejected)
+        );
+
+        let attach_from_standby = AttachProof::new(*standby_proof.as_bytes()).unwrap();
+        assert_eq!(
+            authority.verify_and_commit(&attach, &binding_b, &attach_from_standby),
+            Err(AttachReject::Rejected)
+        );
+        assert_eq!(authority.current_generation(), 2);
+    }
+
+    #[test]
+    fn standby_transcript_and_nested_hmac_match_independent_known_answer() {
+        // Generated independently with Python stdlib `hmac`/`hashlib` from
+        // the documented field order and standby-only domain.
+        const TRANSCRIPT_HEX: &str = "6d696e695f76706e2f726573756d61626c652f7374616e6462792d72656769737465722f76310001111111111111111111111111111111110000000000000002000100000000000000173131313131313131313131313131313131313131313131313131313131313131106d696e692d76706e2d6f776e65642f31535353535353535353535353535353533131313131313131313131313131313131313131313131313131313131313131106d696e692d76706e2d6f776e65642f3199999999999999999999999999999999999999999999999999999999999999995353535353535353535353535353535333333333333333333333333333333333";
+        const PROOF_HEX: &str = "378a10fbc2fe0980de9709056343a48c4488baaf064ade5e86fd43d097aa817a";
+        let (_authority, installed, _binding_a, binding_b) = standby_authority_and_installed();
+        let standby = StandbyRegistrationRequest::from_installed_leg(
+            &installed,
+            StandbyNonce::new([0x33; 16]).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            encode_standby_register_transcript(&standby, &binding_b),
+            decode_hex(TRANSCRIPT_HEX)
+        );
+        assert_eq!(
+            signer()
+                .prove_standby_registration(&standby, &binding_b)
+                .unwrap()
+                .as_bytes()
+                .as_slice(),
+            decode_hex(PROOF_HEX)
+        );
     }
 
     #[test]
@@ -2183,6 +2799,18 @@ mod tests {
         let proof = signer().prove(&request, &binding).unwrap();
         assert_eq!(proof.as_bytes().as_slice(), decode_hex(PROOF_HEX));
     }
+
+    // A verified standby registration is a consuming owner-side capability,
+    // not a copyable wire fact. Ambiguous inference fails to compile if it
+    // ever gains a `Clone` implementation.
+    trait AmbiguousIfClone<Marker> {
+        fn marker() {}
+    }
+    impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+    impl<T: Clone> AmbiguousIfClone<u8> for T {}
+    const _: fn() = || {
+        let _ = <AuthenticatedStandbyRegistration as AmbiguousIfClone<_>>::marker;
+    };
 
     fn decode_hex(hex: &str) -> Vec<u8> {
         assert_eq!(hex.len() % 2, 0);

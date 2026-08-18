@@ -9,6 +9,7 @@ pub(crate) mod leg_io;
 mod legacy;
 pub(crate) mod owner_target;
 pub(crate) mod session;
+pub(crate) mod standby;
 pub(crate) mod supervisor;
 pub(crate) mod target;
 mod tcp;

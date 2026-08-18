@@ -1,5 +1,23 @@
 # Errors
 
+## 2026-08-18 - The first standby queue integration ordered session frames only
+
+- The first L implementation correctly put leg-control and session records in
+  the same sole FIFO, but marked every `LegControlFrame` as unordered.
+- A held or delayed `STANDBY_REGISTER`/`STANDBY_ACCEPTED` was therefore popped
+  from local ownership immediately. A later `ATTACH_ACCEPTED` or replay could
+  enter another lane and arrive first even though queue insertion order looked
+  correct.
+- The corrected boundary permits one outstanding ordered delivery for every
+  queue item. Session and leg-control use distinct private, non-cloneable
+  completion tokens bound to the exact route and real wire send ordinal.
+- Drop, duplicate, and reorder actions fail before ordered transport ownership;
+  hold/delay retains the barrier; wrong ordinals, duplicate completion, and
+  endpoint loss cannot unlock or resurrect it.
+
+This was found by a deterministic local fault script and independent review.
+No TUN, VPS, WAN traffic, or production throughput claim was involved.
+
 ## 2026-08-18 - The first acceptance receipt did not prove an ordered leg boundary
 
 - The first local implementation bound recovery only to a weak queue identity.

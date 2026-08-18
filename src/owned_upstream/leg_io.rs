@@ -14,7 +14,7 @@ use std::sync::{Arc, Weak};
 use thiserror::Error;
 
 use crate::owned_upstream::leg::{
-    AttachedLeg, EstablishedLeg, LegBoundFrame, LegOutboundQueueLease, LegSeal,
+    AttachedLeg, BoundInbound, EstablishedLeg, LegBoundFrame, LegOutboundQueueLease, LegSeal,
     LegTransportEndpoint,
 };
 use crate::owned_upstream::two_leg::{
@@ -22,7 +22,8 @@ use crate::owned_upstream::two_leg::{
     WireDirection, WireError, WireLane, WireRoute,
 };
 use crate::resumable::{
-    AttachNonce, AttachTransportBinding, Frame, LegGeneration, ProtocolError, Record, SessionId,
+    AttachNonce, AttachTransportBinding, DecodedFrame, FeatureSet, Frame, LegControlFrame,
+    LegGeneration, ProtocolError, Record, SessionId,
 };
 
 /// Local endpoint role for one authenticated transport connection.
@@ -131,6 +132,8 @@ pub(crate) struct LegIoCounters {
     pub(crate) inbound_bytes: u64,
     pub(crate) bound_messages: u64,
     pub(crate) bound_bytes: u64,
+    pub(crate) bound_session_messages: u64,
+    pub(crate) bound_leg_control_messages: u64,
     pub(crate) wrong_route_rejections: u64,
     pub(crate) wrong_lane_rejections: u64,
     pub(crate) decode_rejections: u64,
@@ -182,17 +185,40 @@ struct OrderedDeliveryState {
 
 struct OrderedDeliveryWait(Arc<OrderedDeliveryState>);
 
-/// Non-cloneable completion authority carried only into the exact transport
-/// submission. A conforming ordered actor marks it after that byte message is
-/// actually delivered at its serialization boundary, never at queue admission.
-pub(crate) struct OrderedDeliveryToken(Arc<OrderedDeliveryState>);
+/// Non-cloneable session-frame completion authority. Its private constructor
+/// prevents leg-control delivery from being presented as attach/recovery
+/// completion before both enter the opaque transport submission.
+pub(crate) struct OrderedSessionDeliveryToken(Arc<OrderedDeliveryState>);
+
+/// Non-cloneable leg-control completion authority. Keeping this type distinct
+/// from [`OrderedSessionDeliveryToken`] prevents a queue branch from mixing a
+/// standby-control barrier with attach/recovery completion.
+pub(crate) struct OrderedLegControlDeliveryToken(Arc<OrderedDeliveryState>);
+
+/// The exact completion carried by one opaque ordered submission. Variants
+/// preserve the queue-side class distinction while the sole transport actor
+/// serializes both classes through the same route and send ordinal.
+pub(crate) enum OrderedDeliveryToken {
+    Session(OrderedSessionDeliveryToken),
+    LegControl(OrderedLegControlDeliveryToken),
+}
 
 impl OrderedDeliveryWait {
-    fn pair() -> (Self, OrderedDeliveryToken) {
+    fn state_pair() -> (Self, Arc<OrderedDeliveryState>) {
         let state = Arc::new(OrderedDeliveryState {
             delivered: AtomicBool::new(false),
         });
-        (Self(Arc::clone(&state)), OrderedDeliveryToken(state))
+        (Self(Arc::clone(&state)), state)
+    }
+
+    fn session_pair() -> (Self, OrderedSessionDeliveryToken) {
+        let (wait, state) = Self::state_pair();
+        (wait, OrderedSessionDeliveryToken(state))
+    }
+
+    fn leg_control_pair() -> (Self, OrderedLegControlDeliveryToken) {
+        let (wait, state) = Self::state_pair();
+        (wait, OrderedLegControlDeliveryToken(state))
     }
 
     fn is_delivered(&self) -> bool {
@@ -202,7 +228,11 @@ impl OrderedDeliveryWait {
 
 impl OrderedDeliveryToken {
     pub(crate) fn mark_delivered(self) {
-        self.0.delivered.store(true, Ordering::Release);
+        let state = match self {
+            Self::Session(token) => token.0,
+            Self::LegControl(token) => token.0,
+        };
+        state.delivered.store(true, Ordering::Release);
     }
 }
 
@@ -242,7 +272,7 @@ pub(crate) trait EncodedLegTransport {
         bytes: Vec<u8>,
     ) -> Result<(), EncodedLegTransportError>;
 
-    /// Ordered attach traffic is fail-closed unless the transport explicitly
+    /// Ordered leg traffic is fail-closed unless the transport explicitly
     /// supplies actual delivery completion across Control/Data lanes.
     #[cfg(test)]
     fn send_attach_ordered_encoded(
@@ -264,8 +294,16 @@ enum LegOutboundSessionPhase {
     Active,
 }
 
+enum QueuedProtocolFrame {
+    Session(Frame),
+    LegControl {
+        frame: LegControlFrame,
+        features: FeatureSet,
+    },
+}
+
 struct QueuedOutboundFrame {
-    frame: Frame,
+    frame: QueuedProtocolFrame,
     bytes: usize,
     ordered: bool,
 }
@@ -355,6 +393,46 @@ impl LegOutboundQueue {
         })
     }
 
+    /// Admits one leg-control record into this authenticated leg's sole FIFO.
+    /// Leg-control leaves the session phase unchanged, so a drained standby
+    /// handshake may precede the first ATTACH_ACCEPTED without creating a
+    /// second queue or bypassing the ordered transport actor.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the error must return the exact unconsumed control frame"
+    )]
+    pub(super) fn push_leg_control(
+        &mut self,
+        seal: &LegSeal,
+        frame: LegControlFrame,
+        features: FeatureSet,
+    ) -> Result<LegControlEnqueued, LegControlQueueError> {
+        if !self.binds_seal(seal) {
+            return Err(LegControlQueueError::new(
+                frame,
+                LegControlQueueErrorKind::WrongLeg,
+            ));
+        }
+        if self.endpoint_is_lost() {
+            return Err(LegControlQueueError::new(
+                frame,
+                LegControlQueueErrorKind::EndpointLost,
+            ));
+        }
+        if self.session_phase == LegOutboundSessionPhase::AttachRecovery {
+            return Err(LegControlQueueError::new(
+                frame,
+                LegControlQueueErrorKind::AttachRecoveryPending,
+            ));
+        }
+        let ordinal = self.push_control_inner(frame, features)?;
+        Ok(LegControlEnqueued {
+            queue: Arc::downgrade(&self.identity),
+            endpoint: self.endpoint.clone(),
+            ordinal,
+        })
+    }
+
     /// Admits the exact correlated ATTACH_ACCEPTED into this FIFO and mints a
     /// non-cloneable proof of that queue transition. Recovery code cannot
     /// manufacture this receipt from a bare frame or from another record
@@ -396,6 +474,13 @@ impl LegOutboundQueue {
                 frame,
                 LegOutboundQueueErrorKind::MismatchedAttachAcceptance,
             ));
+        }
+        if self
+            .ordered_delivery_wait
+            .as_ref()
+            .is_some_and(OrderedDeliveryWait::is_delivered)
+        {
+            self.ordered_delivery_wait = None;
         }
         // This is the first *session/recovery* admission, not necessarily the
         // queue's absolute ordinal. Future STANDBY leg-control may use this
@@ -472,9 +557,60 @@ impl LegOutboundQueue {
             ));
         }
         self.frames.push_back(QueuedOutboundFrame {
-            frame,
+            frame: QueuedProtocolFrame::Session(frame),
             bytes,
             ordered,
+        });
+        self.owned_bytes = next_bytes;
+        self.next_enqueue_ordinal = next_ordinal;
+        Ok(ordinal)
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "the error must return the exact unconsumed control frame"
+    )]
+    fn push_control_inner(
+        &mut self,
+        frame: LegControlFrame,
+        features: FeatureSet,
+    ) -> Result<u64, LegControlQueueError> {
+        let bytes = match frame.encode(features) {
+            Ok(encoded) => encoded.len(),
+            Err(source) => {
+                return Err(LegControlQueueError::new(
+                    frame,
+                    LegControlQueueErrorKind::InvalidFrame(source),
+                ));
+            }
+        };
+        let ordinal = self.next_enqueue_ordinal;
+        let Some(next_ordinal) = ordinal.checked_add(1) else {
+            return Err(LegControlQueueError::new(
+                frame,
+                LegControlQueueErrorKind::EnqueueOrdinalExhausted,
+            ));
+        };
+        let Some(next_bytes) = self.owned_bytes.checked_add(bytes) else {
+            return Err(LegControlQueueError::new(
+                frame,
+                LegControlQueueErrorKind::ByteCountOverflow,
+            ));
+        };
+        if self.frames.len() >= self.max_frames || next_bytes > self.max_bytes {
+            return Err(LegControlQueueError::new(
+                frame,
+                LegControlQueueErrorKind::CapacityExceeded {
+                    queued_frames: self.frames.len(),
+                    queued_bytes: self.owned_bytes,
+                    incoming_bytes: bytes,
+                },
+            ));
+        }
+        self.frames.push_back(QueuedOutboundFrame {
+            frame: QueuedProtocolFrame::LegControl { frame, features },
+            bytes,
+            ordered: true,
         });
         self.owned_bytes = next_bytes;
         self.next_enqueue_ordinal = next_ordinal;
@@ -504,15 +640,29 @@ impl LegOutboundQueue {
         let Some(queued) = self.frames.front() else {
             return Ok(None);
         };
-        let frame = &queued.frame;
-        let is_ack = matches!(frame.record(), Record::Ack { .. });
-        let (wait, completion) = if queued.ordered {
-            let (wait, completion) = OrderedDeliveryWait::pair();
-            (Some(wait), Some(completion))
-        } else {
-            (None, None)
+        let is_ack = matches!(
+            &queued.frame,
+            QueuedProtocolFrame::Session(frame) if matches!(frame.record(), Record::Ack { .. })
+        );
+        let wait = match &queued.frame {
+            QueuedProtocolFrame::Session(frame) => {
+                if queued.ordered {
+                    let (wait, completion) = OrderedDeliveryWait::session_pair();
+                    endpoint.send_retained_frame(transport, now, frame, Some(completion))?;
+                    Some(wait)
+                } else {
+                    endpoint.send_retained_frame(transport, now, frame, None)?;
+                    None
+                }
+            }
+            QueuedProtocolFrame::LegControl { frame, features } => {
+                debug_assert!(queued.ordered);
+                let (wait, completion) = OrderedDeliveryWait::leg_control_pair();
+                endpoint
+                    .send_retained_control_frame(transport, now, frame, *features, completion)?;
+                Some(wait)
+            }
         };
-        endpoint.send_retained_frame(transport, now, frame, completion)?;
         let queued = self.frames.pop_front().ok_or(LegIoError::CounterOverflow)?;
         self.owned_bytes = self
             .owned_bytes
@@ -587,6 +737,12 @@ impl LegOutboundQueue {
         }
     }
 
+    fn binds_seal(&self, seal: &LegSeal) -> bool {
+        self.seal
+            .as_ref()
+            .is_some_and(|owned| owned.same_connection(seal))
+    }
+
     fn endpoint_is_lost(&self) -> bool {
         self.endpoint
             .as_ref()
@@ -634,6 +790,87 @@ impl fmt::Debug for AttachAcceptanceEnqueued {
             .field("queue_live", &self.queue_is_live())
             .finish()
     }
+}
+
+/// Non-cloneable proof that one exact leg-control record entered this leg's
+/// sole bounded FIFO. It witnesses queue/endpoint liveness without keeping
+/// either resource alive on behalf of a registration capability.
+pub(super) struct LegControlEnqueued {
+    queue: Weak<LegOutboundQueueIdentity>,
+    endpoint: Option<Weak<LegTransportEndpoint>>,
+    ordinal: u64,
+}
+
+impl LegControlEnqueued {
+    pub(super) fn queue_is_live(&self) -> bool {
+        self.queue.upgrade().is_some()
+            && self
+                .endpoint
+                .as_ref()
+                .is_none_or(|endpoint| endpoint.upgrade().is_some())
+    }
+
+    pub(super) fn belongs_to_queue(&self, queue: &LegOutboundQueue) -> bool {
+        self.queue
+            .upgrade()
+            .is_some_and(|identity| Arc::ptr_eq(&identity, &queue.identity))
+    }
+}
+
+impl fmt::Debug for LegControlEnqueued {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LegControlEnqueued")
+            .field("ordinal", &self.ordinal)
+            .field("queue_live", &self.queue_is_live())
+            .finish()
+    }
+}
+
+/// Control enqueue rejection returns the exact unconsumed wire fact. Debug
+/// deliberately omits all authentication and correlation fields.
+pub(super) struct LegControlQueueError {
+    kind: LegControlQueueErrorKind,
+    frame: LegControlFrame,
+}
+
+impl LegControlQueueError {
+    fn new(frame: LegControlFrame, kind: LegControlQueueErrorKind) -> Self {
+        Self { kind, frame }
+    }
+
+    pub(super) const fn kind(&self) -> &LegControlQueueErrorKind {
+        &self.kind
+    }
+
+    pub(super) fn into_frame(self) -> LegControlFrame {
+        self.frame
+    }
+}
+
+impl fmt::Debug for LegControlQueueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LegControlQueueError")
+            .field("kind", &self.kind)
+            .field("frame", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LegControlQueueErrorKind {
+    InvalidFrame(ProtocolError),
+    ByteCountOverflow,
+    EnqueueOrdinalExhausted,
+    EndpointLost,
+    WrongLeg,
+    AttachRecoveryPending,
+    CapacityExceeded {
+        queued_frames: usize,
+        queued_bytes: usize,
+        incoming_bytes: usize,
+    },
 }
 
 impl fmt::Debug for LegOutboundQueue {
@@ -926,15 +1163,15 @@ pub(crate) struct MemoryLegSender<'a> {
     transport: &'a mut MemoryLegTransport,
 }
 
-impl EncodedLegTransport for MemoryLegSender<'_> {
-    #[cfg(test)]
-    fn send_encoded(
+#[cfg(test)]
+impl MemoryLegSender<'_> {
+    fn send_encoded_inner(
         &mut self,
         now: SimTime,
         route: WireRoute,
         lane: WireLane,
         bytes: Vec<u8>,
-    ) -> Result<(), EncodedLegTransportError> {
+    ) -> Result<u64, EncodedLegTransportError> {
         if self.transport.ordered_deliveries[memory_route_index(route)].is_some() {
             return Err(EncodedLegTransportError::OrderedDeliveryPending { route });
         }
@@ -957,13 +1194,27 @@ impl EncodedLegTransport for MemoryLegSender<'_> {
             FaultAction::Pass
         };
 
-        self.transport
+        let outcome = self
+            .transport
             .wire
             .send(now, route, lane, bytes, action)
             .map_err(EncodedLegTransportError::Wire)?;
         self.transport.fault_script.directives.remove(&ordinal);
         self.transport.next_submission_ordinal = next_ordinal;
-        Ok(())
+        Ok(outcome.send_ordinal())
+    }
+}
+
+impl EncodedLegTransport for MemoryLegSender<'_> {
+    #[cfg(test)]
+    fn send_encoded(
+        &mut self,
+        now: SimTime,
+        route: WireRoute,
+        lane: WireLane,
+        bytes: Vec<u8>,
+    ) -> Result<(), EncodedLegTransportError> {
+        self.send_encoded_inner(now, route, lane, bytes).map(|_| ())
     }
 
     #[cfg(test)]
@@ -995,10 +1246,10 @@ impl EncodedLegTransport for MemoryLegSender<'_> {
         {
             return Err(EncodedLegTransportError::UnreliableOrderedFault { ordinal });
         }
-        self.send_encoded(now, route, lane, bytes)?;
+        let send_ordinal = self.send_encoded_inner(now, route, lane, bytes)?;
         self.transport.ordered_deliveries[memory_route_index(route)] =
             Some(MemoryOrderedDelivery {
-                send_ordinal: ordinal,
+                send_ordinal,
                 completion,
             });
         Ok(())
@@ -1047,13 +1298,13 @@ pub(crate) enum EncodedLegTransportError {
         expected_lane: WireLane,
         actual_lane: WireLane,
     },
-    #[error("encoded transport has not implemented ordered attach delivery completion")]
+    #[error("encoded transport has not implemented ordered leg delivery completion")]
     OrderedSubmissionUnsupported,
     #[error("encoded transport submission requires a queue-minted opaque capability")]
     SubmissionCapabilityUnsupported,
     #[error("ordered delivery remains pending on route {route:?}")]
     OrderedDeliveryPending { route: WireRoute },
-    #[error("fault action at submission {ordinal} cannot preserve ordered attach delivery")]
+    #[error("fault action at submission {ordinal} cannot preserve ordered leg delivery")]
     UnreliableOrderedFault { ordinal: u64 },
     #[error("encoded leg submission ordinal exhausted")]
     SubmissionOrdinalExhausted,
@@ -1111,7 +1362,7 @@ impl LegIo {
         transport: &mut T,
         now: SimTime,
         frame: &Frame,
-        ordered_completion: Option<OrderedDeliveryToken>,
+        ordered_completion: Option<OrderedSessionDeliveryToken>,
     ) -> Result<(), LegIoError> {
         let lane = lane_for_record(frame.record());
         let encoded = frame.encode().map_err(LegIoError::Encode)?;
@@ -1123,7 +1374,7 @@ impl LegIo {
                 route: self.outbound_route(),
                 lane,
                 bytes: encoded.to_vec(),
-                ordered_completion,
+                ordered_completion: ordered_completion.map(OrderedDeliveryToken::Session),
             })
             .map_err(LegIoError::Transport)?;
         self.counters.outbound_messages = messages;
@@ -1139,12 +1390,56 @@ impl LegIo {
         Ok(())
     }
 
+    fn send_retained_control_frame<T: EncodedLegTransport + ?Sized>(
+        &mut self,
+        transport: &mut T,
+        now: SimTime,
+        frame: &LegControlFrame,
+        features: FeatureSet,
+        ordered_completion: OrderedLegControlDeliveryToken,
+    ) -> Result<(), LegIoError> {
+        let encoded = frame.encode(features).map_err(LegIoError::Encode)?;
+        let encoded_len = u64::try_from(encoded.len()).map_err(|_| LegIoError::CounterOverflow)?;
+        let (messages, bytes) = self.preflight_outbound(encoded_len)?;
+        transport
+            .submit_encoded(EncodedLegSubmission {
+                now,
+                route: self.outbound_route(),
+                lane: WireLane::Control,
+                bytes: encoded.to_vec(),
+                ordered_completion: Some(OrderedDeliveryToken::LegControl(ordered_completion)),
+            })
+            .map_err(LegIoError::Transport)?;
+        self.counters.outbound_messages = messages;
+        self.counters.outbound_bytes = bytes;
+        self.counters.outbound_control_messages = self
+            .counters
+            .outbound_control_messages
+            .checked_add(1)
+            .ok_or(LegIoError::CounterOverflow)?;
+        Ok(())
+    }
+
     /// Validates transport metadata, decodes one exact byte message, validates
     /// its production lane, and only then mints this endpoint's provenance.
     pub(crate) fn receive_delivery(
         &mut self,
         delivery: EncodedDelivery,
     ) -> Result<LegBoundFrame, LegIoError> {
+        match self.receive_classified_delivery(delivery, FeatureSet::default())? {
+            BoundInbound::Session(frame) => Ok(frame),
+            BoundInbound::LegControl(_) => Err(LegIoError::UnexpectedLegControl),
+        }
+    }
+
+    /// Feature-aware classified receive boundary. The installed feature set
+    /// is supplied by local authenticated session state, never taken from the
+    /// incoming record itself.
+    pub(crate) fn receive_classified_delivery(
+        &mut self,
+        delivery: EncodedDelivery,
+        installed_features: FeatureSet,
+    ) -> Result<BoundInbound, LegIoError> {
         let actual_route = delivery.route();
         let actual_lane = delivery.lane();
         let encoded = delivery.into_bytes();
@@ -1162,14 +1457,18 @@ impl LegIo {
             });
         }
 
-        let frame = match Frame::decode_owned_exact(Bytes::from(encoded)) {
-            Ok(frame) => frame,
-            Err(error) => {
-                self.counters.decode_rejections += 1;
-                return Err(LegIoError::Decode(error));
-            }
+        let decoded =
+            match DecodedFrame::decode_owned_exact(Bytes::from(encoded), installed_features) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.counters.decode_rejections += 1;
+                    return Err(LegIoError::Decode(error));
+                }
+            };
+        let expected_lane = match &decoded {
+            DecodedFrame::Session(frame) => lane_for_record(frame.record()),
+            DecodedFrame::LegControl(_) => WireLane::Control,
         };
-        let expected_lane = lane_for_record(frame.record());
         if actual_lane != expected_lane {
             self.counters.wrong_lane_rejections += 1;
             return Err(LegIoError::WrongLane {
@@ -1184,7 +1483,28 @@ impl LegIo {
             .bound_bytes
             .checked_add(encoded_len)
             .ok_or(LegIoError::CounterOverflow)?;
-        Ok(self.established.bind_received_frame(frame))
+        match decoded {
+            DecodedFrame::Session(frame) => {
+                self.counters.bound_session_messages = self
+                    .counters
+                    .bound_session_messages
+                    .checked_add(1)
+                    .ok_or(LegIoError::CounterOverflow)?;
+                Ok(BoundInbound::Session(
+                    self.established.bind_received_frame(frame),
+                ))
+            }
+            DecodedFrame::LegControl(frame) => {
+                self.counters.bound_leg_control_messages = self
+                    .counters
+                    .bound_leg_control_messages
+                    .checked_add(1)
+                    .ok_or(LegIoError::CounterOverflow)?;
+                Ok(BoundInbound::LegControl(
+                    self.established.bind_received_control_frame(frame),
+                ))
+            }
+        }
     }
 
     fn preflight_outbound(&self, len: u64) -> Result<(u64, u64), LegIoError> {
@@ -1266,6 +1586,8 @@ pub(crate) enum LegIoError {
     InboundByteBudgetExceeded,
     #[error("leg I/O counter overflow")]
     CounterOverflow,
+    #[error("classified leg-control record reached the session-only receive API")]
+    UnexpectedLegControl,
     #[error("outbound queue belongs to a different authenticated transport leg")]
     WrongOutboundQueueLeg,
     #[error("outbound queue's authenticated transport endpoint was dropped")]
@@ -1306,9 +1628,9 @@ mod tests {
     use crate::resumable::{
         AttachAlpn, AttachAuthority, AttachCredentials, AttachNonce, AttachPolicy, AttachRequest,
         AttachTransportBinding, ByteOffset, DevicePrincipal, DeviceSecret, Direction, FeatureOffer,
-        FeatureSet, Frame, LegGeneration, OwnerIdentity, ReceiveBudgetLimits, Record,
-        ReplayBudgetLimits, ResumeSecret, SESSION_PROTOCOL_VERSION, SessionConfig, SessionFlowId,
-        SessionId, TcpWindowLimits, TlsExporterBinding, VersionRange,
+        FeatureSet, Frame, LegControlRecord, LegGeneration, OwnerIdentity, ReceiveBudgetLimits,
+        Record, ReplayBudgetLimits, ResumeSecret, SESSION_PROTOCOL_VERSION, SessionConfig,
+        SessionFlowId, SessionId, StandbyNonce, TcpWindowLimits, TlsExporterBinding, VersionRange,
     };
     use std::time::Duration;
 
@@ -1417,6 +1739,21 @@ mod tests {
                 offset: ByteOffset::new(offset),
                 payload: Bytes::from_static(payload),
             },
+        )
+        .unwrap()
+    }
+
+    fn standby_accepted_control(generation: LegGeneration) -> LegControlFrame {
+        let features = FeatureSet::STANDBY_CONTROL_V1;
+        LegControlFrame::try_new(
+            generation,
+            LegControlRecord::StandbyAccepted {
+                session_id: SessionId::new([0x11; 16]).unwrap(),
+                standby_nonce: StandbyNonce::new([0x33; 16]).unwrap(),
+                selected_version: SESSION_PROTOCOL_VERSION,
+                features,
+            },
+            features,
         )
         .unwrap()
     }
@@ -1882,6 +2219,305 @@ mod tests {
         ));
     }
 
+    fn assert_leg_control_blocks_later_acceptance(
+        fault_action: FaultAction,
+        completion_at: SimTime,
+    ) {
+        let mut owner = endpoint(LegId::B, LegEndpointRole::Owner);
+        let request = request();
+        let proof = credentials().prove(&request, &binding()).unwrap();
+        let authenticated = owner
+            .established_leg()
+            .authenticate_initial_owner_attach(
+                owner
+                    .established_leg()
+                    .bind_received_frame(request.to_attach_frame(proof)),
+                &authority(),
+            )
+            .unwrap();
+        let (_, attached, acceptance) = authenticated.into_owner_parts(session_config());
+        let features = FeatureSet::STANDBY_CONTROL_V1;
+        let standby_accepted = standby_accepted_control(attached.generation());
+        let seal = owner.established_leg().standby_seal();
+        let route = owner.outbound_route();
+        let mut queue = LegOutboundQueue::for_leg(owner.established_leg(), 2, 2_048).unwrap();
+        let control_receipt = queue
+            .push_leg_control(&seal, standby_accepted, features)
+            .unwrap();
+        assert_eq!(control_receipt.ordinal, 1);
+
+        let mut faults = MemoryFaultScript::new(1);
+        faults
+            .insert(0, route, WireLane::Control, fault_action)
+            .unwrap();
+        let mut transport = MemoryLegTransport::new(wire(), faults);
+        queue
+            .try_flush(
+                &mut owner,
+                &mut transport.controller_sender(),
+                SimTime::ZERO,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(queue.is_empty());
+        assert!(transport.try_recv_next(route).unwrap().is_none());
+
+        let blocked = queue
+            .push_attach_acceptance(&attached, acceptance)
+            .unwrap_err();
+        assert!(matches!(
+            blocked.kind(),
+            LegOutboundQueueErrorKind::AttachAcceptanceNotFirst {
+                next_ordinal: 2,
+                queued_frames: 0,
+                queued_bytes: 0,
+            }
+        ));
+        assert_eq!(owner.counters().outbound_messages, 1);
+        assert_eq!(transport.wire_counters().submitted_messages, 1);
+
+        if let FaultAction::Hold { token } = fault_action {
+            transport.release_hold(token, completion_at).unwrap();
+        }
+        release_due_events_through(&mut transport, completion_at);
+        let delivered_control = transport.try_recv_next(route).unwrap().unwrap();
+        let DecodedFrame::LegControl(delivered_control) =
+            DecodedFrame::decode_owned_exact(Bytes::from(delivered_control.into_bytes()), features)
+                .unwrap()
+        else {
+            panic!("exact held/delayed leg-control changed protocol class");
+        };
+        assert_eq!(delivered_control.leg_generation(), attached.generation());
+        assert!(matches!(
+            delivered_control.record(),
+            LegControlRecord::StandbyAccepted {
+                session_id,
+                standby_nonce,
+                selected_version: SESSION_PROTOCOL_VERSION,
+                features: delivered_features,
+            } if *session_id == request.session_id()
+                && *standby_nonce == StandbyNonce::new([0x33; 16]).unwrap()
+                && *delivered_features == features
+        ));
+
+        let acceptance_receipt = queue
+            .push_attach_acceptance(&attached, blocked.into_frame())
+            .unwrap();
+        assert_eq!(acceptance_receipt.ordinal, 2);
+        queue
+            .try_flush(
+                &mut owner,
+                &mut transport.controller_sender(),
+                completion_at,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(transport.wire_counters().submitted_messages, 2);
+    }
+
+    #[test]
+    fn held_or_delayed_leg_control_blocks_later_acceptance_until_exact_delivery() {
+        assert_leg_control_blocks_later_acceptance(FaultAction::Hold { token: 42 }, SimTime::ZERO);
+        assert_leg_control_blocks_later_acceptance(
+            FaultAction::Delay {
+                release_at: SimTime::from_nanos(10),
+            },
+            SimTime::from_nanos(10),
+        );
+    }
+
+    fn assert_unreliable_control_fault_does_not_mint_completion(action: FaultAction) {
+        let mut owner = endpoint(LegId::B, LegEndpointRole::Owner);
+        let features = FeatureSet::STANDBY_CONTROL_V1;
+        let seal = owner.established_leg().standby_seal();
+        let route = owner.outbound_route();
+        let mut queue = LegOutboundQueue::for_leg(owner.established_leg(), 1, 1_024).unwrap();
+        let receipt = queue
+            .push_leg_control(
+                &seal,
+                standby_accepted_control(LegGeneration::new(2).unwrap()),
+                features,
+            )
+            .unwrap();
+        let retained_bytes = queue.owned_bytes();
+        let mut faults = MemoryFaultScript::new(1);
+        faults.insert(0, route, WireLane::Control, action).unwrap();
+        let mut rejected_transport = MemoryLegTransport::new(wire(), faults);
+
+        assert!(matches!(
+            queue.try_flush(
+                &mut owner,
+                &mut rejected_transport.controller_sender(),
+                SimTime::ZERO,
+            ),
+            Err(LegIoError::Transport(
+                EncodedLegTransportError::UnreliableOrderedFault { ordinal: 0 }
+            ))
+        ));
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.owned_bytes(), retained_bytes);
+        assert!(receipt.queue_is_live());
+        assert_eq!(owner.counters().outbound_messages, 0);
+        assert_eq!(rejected_transport.wire_counters().submitted_messages, 0);
+
+        let mut retry_transport = memory_transport();
+        queue
+            .try_flush(
+                &mut owner,
+                &mut retry_transport.controller_sender(),
+                SimTime::ZERO,
+            )
+            .unwrap()
+            .unwrap();
+        release_due_events_through(&mut retry_transport, SimTime::ZERO);
+        let delivered = retry_transport.try_recv_next(route).unwrap().unwrap();
+        assert_eq!(delivered.send_ordinal(), 0);
+        assert!(matches!(
+            DecodedFrame::decode_owned_exact(Bytes::from(delivered.into_bytes()), features)
+                .unwrap(),
+            DecodedFrame::LegControl(_)
+        ));
+        assert!(
+            queue
+                .try_flush(
+                    &mut owner,
+                    &mut retry_transport.controller_sender(),
+                    SimTime::ZERO,
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn drop_duplicate_or_reorder_cannot_mint_or_permanently_block_control_completion() {
+        for action in [
+            FaultAction::Drop,
+            FaultAction::Duplicate,
+            FaultAction::ReorderAdjacent,
+        ] {
+            assert_unreliable_control_fault_does_not_mint_completion(action);
+        }
+    }
+
+    #[test]
+    fn wrong_send_ordinal_cannot_complete_an_ordered_leg_control() {
+        let mut owner = endpoint(LegId::B, LegEndpointRole::Owner);
+        let features = FeatureSet::STANDBY_CONTROL_V1;
+        let seal = owner.established_leg().standby_seal();
+        let route = owner.outbound_route();
+        let mut queue = LegOutboundQueue::for_leg(owner.established_leg(), 1, 1_024).unwrap();
+        queue
+            .push_leg_control(
+                &seal,
+                standby_accepted_control(LegGeneration::new(2).unwrap()),
+                features,
+            )
+            .unwrap();
+        let mut faults = MemoryFaultScript::new(1);
+        faults
+            .insert(0, route, WireLane::Control, FaultAction::Hold { token: 43 })
+            .unwrap();
+        let mut transport = MemoryLegTransport::new(wire(), faults);
+        queue
+            .try_flush(
+                &mut owner,
+                &mut transport.controller_sender(),
+                SimTime::ZERO,
+            )
+            .unwrap()
+            .unwrap();
+
+        // A later same-route delivery cannot discharge the token for the
+        // held earlier send ordinal.
+        transport
+            .inject_encoded_test_message(SimTime::ZERO, route, WireLane::Control, vec![0xaa])
+            .unwrap();
+        release_due_events_through(&mut transport, SimTime::ZERO);
+        let unrelated = transport.try_recv_next(route).unwrap().unwrap();
+        assert_eq!(unrelated.send_ordinal(), 1);
+        assert_eq!(
+            queue
+                .try_flush(
+                    &mut owner,
+                    &mut transport.controller_sender(),
+                    SimTime::ZERO,
+                )
+                .unwrap_err(),
+            LegIoError::OrderedDeliveryPending
+        );
+
+        transport.release_hold(43, SimTime::ZERO).unwrap();
+        release_due_events_through(&mut transport, SimTime::ZERO);
+        let exact = transport.try_recv_next(route).unwrap().unwrap();
+        assert_eq!(exact.send_ordinal(), 0);
+        assert!(transport.ordered_deliveries[memory_route_index(route)].is_none());
+        assert!(
+            queue
+                .try_flush(
+                    &mut owner,
+                    &mut transport.controller_sender(),
+                    SimTime::ZERO,
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn endpoint_loss_makes_a_pending_control_receipt_inert_despite_live_token() {
+        let mut owner = endpoint(LegId::B, LegEndpointRole::Owner);
+        let features = FeatureSet::STANDBY_CONTROL_V1;
+        let seal = owner.established_leg().standby_seal();
+        let route = owner.outbound_route();
+        let mut queue = LegOutboundQueue::for_leg(owner.established_leg(), 1, 1_024).unwrap();
+        let receipt = queue
+            .push_leg_control(
+                &seal,
+                standby_accepted_control(LegGeneration::new(2).unwrap()),
+                features,
+            )
+            .unwrap();
+        let mut faults = MemoryFaultScript::new(1);
+        faults
+            .insert(0, route, WireLane::Control, FaultAction::Hold { token: 44 })
+            .unwrap();
+        let mut transport = MemoryLegTransport::new(wire(), faults);
+        queue
+            .try_flush(
+                &mut owner,
+                &mut transport.controller_sender(),
+                SimTime::ZERO,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(receipt.queue_is_live());
+        assert!(queue.ordered_delivery_wait.is_some());
+
+        drop(owner);
+        assert!(!receipt.queue_is_live());
+        assert!(queue.endpoint_is_lost());
+        let mut replacement = endpoint(LegId::B, LegEndpointRole::Owner);
+        assert_eq!(
+            queue
+                .try_flush(
+                    &mut replacement,
+                    &mut transport.controller_sender(),
+                    SimTime::ZERO,
+                )
+                .unwrap_err(),
+            LegIoError::OutboundQueueEndpointLost
+        );
+
+        transport.release_hold(44, SimTime::ZERO).unwrap();
+        release_due_events_through(&mut transport, SimTime::ZERO);
+        let _delivered_after_retirement = transport.try_recv_next(route).unwrap().unwrap();
+        assert!(!receipt.queue_is_live());
+        assert!(queue.endpoint_is_lost());
+        drop(queue);
+        assert!(!receipt.queue_is_live());
+    }
+
     #[test]
     fn attach_acceptance_rejects_a_prefilled_same_leg_queue_without_mutation() {
         let leg = EstablishedLeg::for_authenticated_transport(binding());
@@ -2045,6 +2681,10 @@ mod tests {
     const _: fn() = || {
         let _ = <LegIo as AmbiguousIfClone<_>>::marker;
         let _ = <AttachAcceptanceEnqueued as AmbiguousIfClone<_>>::marker;
+        let _ = <LegControlEnqueued as AmbiguousIfClone<_>>::marker;
+        let _ = <OrderedSessionDeliveryToken as AmbiguousIfClone<_>>::marker;
+        let _ = <OrderedLegControlDeliveryToken as AmbiguousIfClone<_>>::marker;
+        let _ = <OrderedDeliveryToken as AmbiguousIfClone<_>>::marker;
     };
 
     #[test]

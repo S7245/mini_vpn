@@ -1,5 +1,29 @@
 # Learnings
 
+## 2026-08-18 - A standby is an exact-leg typestate, not an authenticated frame
+
+- The standby HMAC proves an exact installed session contract and candidate
+  transport binding, but the verified value must remain non-cloneable and be
+  consumed into one bounded slot tied to the process-local leg seal.
+- Wire control stays outside the session reducer. Feature-aware decoding must
+  return a classified, seal-bound control value with no conversion into
+  `Frame`, `LegBoundFrame`, `SessionEvent`, or data-plane authority.
+- Idempotence means re-enqueuing `STANDBY_ACCEPTED` for the same exact
+  seal/nonce/full contract while preserving the original registered
+  capability. It does not mean cloning or replacing that capability.
+- The standby leg owns one FIFO for its whole lifetime. Registration control,
+  the later `ATTACH_ACCEPTED`, and replay must use that same queue; earlier
+  control advances the absolute ordinal without advancing the session/recovery
+  phase.
+- Every ordered queue item needs actual-delivery completion. A held control
+  frame is just as capable of being overtaken across lanes as a held session
+  frame, so class-specific non-cloneable tokens must bind the exact queue,
+  route, and transport send ordinal.
+
+This stage authenticates and registers a local deterministic standby. It does
+not yet provide a production transport adapter, liveness controller, or WAN
+failover result.
+
 ## 2026-08-18 - Ordered attach recovery is a whole-transition capability
 
 - A weak reference proving that *some* queue is alive is not an ordered-send
