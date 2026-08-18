@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
+use std::sync::{Arc, Weak};
 
 use thiserror::Error;
 
@@ -16,7 +17,8 @@ use crate::resumable::{
     SessionEffect, SessionEvent, SessionFlowId, SinkOffer, TcpDataSegment, TerminalGrace,
 };
 
-use super::leg::{AttachedLeg, EstablishedLeg, LegBoundFrame};
+use super::leg::{AttachedLeg, EstablishedLeg, LegBoundFrame, LegTransportEndpoint};
+use super::leg_io::{AttachAcceptanceEnqueued, LegOutboundQueue, LegOutboundQueueErrorKind};
 use super::session::SessionOwnerCommand;
 use super::supervisor::{
     OwnerAttachPublication, ReducerAdmissionBlock, SessionSupervisor, SessionSupervisorError,
@@ -145,14 +147,48 @@ pub(crate) enum OwnerTargetOutput {
     NeedsResume { resume: OwnerTargetResume },
 }
 
+/// Post-attach recovery observations after every wire frame has crossed the
+/// exact acceptance queue. This type deliberately has no `Transmit(Frame)`
+/// variant, so replay bytes cannot escape the serialized FIFO boundary.
+pub(crate) enum OwnerTargetRecoveryOutput {
+    LegActivated {
+        generation: LegGeneration,
+    },
+    ResumeGraceStarted {
+        generation: LegGeneration,
+    },
+    TerminalGraceStarted {
+        terminal: TerminalGrace,
+    },
+    SessionExpired,
+    NeedsResume {
+        resume: OwnerTargetRecoveryResume,
+    },
+    /// Initial recovery and every continuation are durably ordered behind the
+    /// acceptance. Only this terminal observation releases receive authority.
+    RecoveryCompleted {
+        attached: AttachedLeg,
+    },
+}
+
+struct OwnerTargetExecutorIdentity;
+
 /// Non-cloneable authority to execute exactly one following bounded effect
 /// turn. Transport must schedule this capability once and cannot manufacture
 /// a second wakeup for the same pending work.
 #[must_use = "pending owner Target effects require exactly one resumed turn"]
-#[derive(PartialEq, Eq)]
 pub(crate) struct OwnerTargetResume {
+    owner: Weak<OwnerTargetExecutorIdentity>,
     id: u64,
 }
+
+impl PartialEq for OwnerTargetResume {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && Weak::ptr_eq(&self.owner, &other.owner)
+    }
+}
+
+impl Eq for OwnerTargetResume {}
 
 impl fmt::Debug for OwnerTargetResume {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -160,18 +196,41 @@ impl fmt::Debug for OwnerTargetResume {
     }
 }
 
+/// Exact continuation for one bounded post-attach recovery turn. It retains
+/// the acceptance queue receipt, preventing the generic owner resume path
+/// from publishing later replay on a different queue.
+#[must_use = "post-attach recovery continuation must resume on its acceptance queue"]
+pub(crate) struct OwnerTargetRecoveryResume {
+    attached: AttachedLeg,
+    acceptance: AttachAcceptanceEnqueued,
+    resume: OwnerTargetResume,
+}
+
+impl fmt::Debug for OwnerTargetRecoveryResume {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnerTargetRecoveryResume")
+            .field("generation", &self.attached.generation())
+            .field("acceptance", &self.acceptance)
+            .field("resume", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Owner attach result whose recovery work remains deliberately unpublished.
 ///
-/// On `Installed`, transport must enqueue `acceptance` on the exact attached
-/// leg before passing `recovery` back to [`OwnerTargetExecutor`].  Keeping the
-/// reducer effects opaque prevents a caller from dispatching replay before the
-/// serialized attach barrier has published its acceptance.
+/// On `Installed`, transport must consume `pending` through its bounded queue
+/// admission method. Only that successful transition exposes the attached leg
+/// and a recovery capability, preventing replay from overtaking the serialized
+/// acceptance barrier.
 #[must_use = "owner attach publication must send acceptance/status and retain recovery ordering"]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the non-cloneable installed transaction stays inline so dropping or returning the enum preserves one exact ownership path"
+)]
 pub(crate) enum OwnerTargetAttachPublication {
     Installed {
-        attached: AttachedLeg,
-        acceptance: Frame,
-        recovery: PendingOwnerTargetRecovery,
+        pending: PendingOwnerTargetAttachPublication,
     },
     Resynchronize {
         status: Frame,
@@ -181,9 +240,9 @@ pub(crate) enum OwnerTargetAttachPublication {
 impl fmt::Debug for OwnerTargetAttachPublication {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Installed { recovery, .. } => formatter
+            Self::Installed { pending } => formatter
                 .debug_struct("Installed")
-                .field("recovery_effects", &recovery.effects.len())
+                .field("recovery_effects", &pending.effects.len())
                 .finish_non_exhaustive(),
             Self::Resynchronize { .. } => formatter
                 .debug_struct("Resynchronize")
@@ -192,20 +251,180 @@ impl fmt::Debug for OwnerTargetAttachPublication {
     }
 }
 
-/// Non-cloneable post-acceptance owner recovery work.
-#[must_use = "owner attach recovery must be dispatched after acceptance or explicitly aborted"]
-pub(crate) struct PendingOwnerTargetRecovery {
+/// One installed owner attach whose correlated acceptance and recovery have
+/// not yet crossed the same bounded FIFO admission boundary.
+#[must_use = "owner attach acceptance must be queued before recovery can be dispatched"]
+pub(crate) struct PendingOwnerTargetAttachPublication {
+    owner: Weak<OwnerTargetExecutorIdentity>,
+    endpoint: Weak<LegTransportEndpoint>,
+    attached: AttachedLeg,
+    acceptance: Frame,
     effects: Vec<SessionEffect>,
 }
 
-impl fmt::Debug for PendingOwnerTargetRecovery {
+impl PendingOwnerTargetAttachPublication {
+    pub(crate) fn acceptance_encoded_len(&self) -> Result<usize, crate::resumable::ProtocolError> {
+        self.acceptance.encode().map(|encoded| encoded.len())
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "queue pressure must return the exact non-cloneable attach publication without allocation"
+    )]
+    pub(crate) fn enqueue_acceptance(
+        self,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<EnqueuedOwnerTargetAttach, OwnerTargetAttachEnqueueError> {
+        let Self {
+            owner,
+            endpoint,
+            attached,
+            acceptance,
+            effects,
+        } = self;
+        match queue.push_attach_acceptance(&attached, acceptance) {
+            Ok(acceptance) => Ok(EnqueuedOwnerTargetAttach {
+                owner,
+                attached,
+                recovery: EnqueuedOwnerTargetRecovery {
+                    acceptance,
+                    effects,
+                },
+            }),
+            Err(error) => {
+                let kind = error.kind().clone();
+                Err(OwnerTargetAttachEnqueueError {
+                    kind,
+                    publication: Self {
+                        owner,
+                        endpoint,
+                        attached,
+                        acceptance: error.into_frame(),
+                        effects,
+                    },
+                })
+            }
+        }
+    }
+}
+
+impl fmt::Debug for PendingOwnerTargetAttachPublication {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("PendingOwnerTargetRecovery")
+            .debug_struct("PendingOwnerTargetAttachPublication")
+            .field("effects", &self.effects.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Successful admission of the exact acceptance plus the only recovery
+/// capability that may follow it.
+pub(crate) struct EnqueuedOwnerTargetAttach {
+    owner: Weak<OwnerTargetExecutorIdentity>,
+    attached: AttachedLeg,
+    recovery: EnqueuedOwnerTargetRecovery,
+}
+
+impl EnqueuedOwnerTargetAttach {
+    pub(crate) fn generation(&self) -> LegGeneration {
+        self.attached.generation()
+    }
+}
+
+impl fmt::Debug for EnqueuedOwnerTargetAttach {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EnqueuedOwnerTargetAttach")
+            .field("generation", &self.attached.generation())
+            .field("acceptance", &self.recovery.acceptance)
+            .field("recovery_effects", &self.recovery.effects.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Non-cloneable post-acceptance owner recovery work. Construction is private
+/// to a successful [`LegOutboundQueue::push_attach_acceptance`] transition.
+#[must_use = "queued owner attach recovery must be dispatched or explicitly aborted"]
+pub(crate) struct EnqueuedOwnerTargetRecovery {
+    acceptance: AttachAcceptanceEnqueued,
+    effects: Vec<SessionEffect>,
+}
+
+impl fmt::Debug for EnqueuedOwnerTargetRecovery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EnqueuedOwnerTargetRecovery")
+            .field("acceptance", &self.acceptance)
             .field("effects", &self.effects.len())
             .finish()
     }
 }
+
+/// Exact post-reducer output cursor retained when the acceptance queue cannot
+/// admit every recovery transmit. It owns the failed frame, all later work,
+/// and any non-wire outputs already observed during the same effect turn.
+#[must_use = "blocked owner recovery drain must retry on its exact acceptance queue"]
+pub(crate) struct OwnerTargetRecoveryDrain {
+    owner: Weak<OwnerTargetExecutorIdentity>,
+    attached: Option<AttachedLeg>,
+    acceptance: Option<AttachAcceptanceEnqueued>,
+    pending: VecDeque<OwnerTargetOutput>,
+    ready: Vec<OwnerTargetRecoveryOutput>,
+}
+
+impl fmt::Debug for OwnerTargetRecoveryDrain {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnerTargetRecoveryDrain")
+            .field(
+                "generation",
+                &self.attached.as_ref().map(AttachedLeg::generation),
+            )
+            .field("acceptance", &self.acceptance)
+            .field("pending_outputs", &self.pending.len())
+            .field("ready_outputs", &self.ready.len())
+            .finish()
+    }
+}
+
+/// Queue-pressure rejection that returns the exact attach publication. The
+/// acceptance frame and recovery effects remain owned for a later retry.
+pub(crate) struct OwnerTargetAttachEnqueueError {
+    kind: LegOutboundQueueErrorKind,
+    publication: PendingOwnerTargetAttachPublication,
+}
+
+impl OwnerTargetAttachEnqueueError {
+    pub(crate) const fn kind(&self) -> &LegOutboundQueueErrorKind {
+        &self.kind
+    }
+
+    pub(crate) fn into_publication(self) -> PendingOwnerTargetAttachPublication {
+        self.publication
+    }
+}
+
+impl fmt::Debug for OwnerTargetAttachEnqueueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnerTargetAttachEnqueueError")
+            .field("kind", &self.kind)
+            .field("publication", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl fmt::Display for OwnerTargetAttachEnqueueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "owner attach acceptance queue admission failed: {:?}",
+            self.kind
+        )
+    }
+}
+
+impl std::error::Error for OwnerTargetAttachEnqueueError {}
 
 /// Fail-closed ownership returned only if the audited reducer fan-out bound is
 /// violated. Keeping the generated effects inside the error prevents a
@@ -246,6 +465,31 @@ impl fmt::Debug for OwnerTargetOutput {
                 .finish(),
             Self::SessionExpired => formatter.write_str("SessionExpired"),
             Self::NeedsResume { .. } => formatter.write_str("NeedsResume([REDACTED])"),
+        }
+    }
+}
+
+impl fmt::Debug for OwnerTargetRecoveryOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LegActivated { generation } => formatter
+                .debug_struct("LegActivated")
+                .field("generation", generation)
+                .finish(),
+            Self::ResumeGraceStarted { generation } => formatter
+                .debug_struct("ResumeGraceStarted")
+                .field("generation", generation)
+                .finish(),
+            Self::TerminalGraceStarted { terminal } => formatter
+                .debug_struct("TerminalGraceStarted")
+                .field("terminal", terminal)
+                .finish(),
+            Self::SessionExpired => formatter.write_str("SessionExpired"),
+            Self::NeedsResume { .. } => formatter.write_str("NeedsResume([REDACTED])"),
+            Self::RecoveryCompleted { attached } => formatter
+                .debug_struct("RecoveryCompleted")
+                .field("generation", &attached.generation())
+                .finish(),
         }
     }
 }
@@ -386,6 +630,7 @@ enum TargetIoOperation {
 
 /// Sole Target-effect executor for one owner-side session supervisor.
 pub(crate) struct OwnerTargetExecutor<T> {
+    identity: Arc<OwnerTargetExecutorIdentity>,
     config: OwnerTargetConfig,
     supervisor: SessionSupervisor,
     target: T,
@@ -397,6 +642,7 @@ pub(crate) struct OwnerTargetExecutor<T> {
     next_resume_id: Option<u64>,
     max_recovery_effects: usize,
     aborted_effects: Option<AbortedOwnerTargetEffects>,
+    attach_barrier_pending: bool,
 }
 
 impl<T: TargetIo> OwnerTargetExecutor<T> {
@@ -443,6 +689,7 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         }
         let source_factory = supervisor.mint_tcp_port_factory(source_config)?;
         Ok(Self {
+            identity: Arc::new(OwnerTargetExecutorIdentity),
             config,
             supervisor,
             target,
@@ -454,6 +701,7 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
             next_resume_id: Some(1),
             max_recovery_effects: recovery_bound,
             aborted_effects: None,
+            attach_barrier_pending: false,
         })
     }
 
@@ -496,6 +744,10 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         &self.target
     }
 
+    /// Test-only instrumentation for deterministic Target adapters. Production
+    /// controllers must drive all Target work through barrier-aware executor
+    /// entry points and cannot acquire raw mutable I/O authority.
+    #[cfg(test)]
     pub(crate) fn target_mut(&mut self) -> &mut T {
         &mut self.target
     }
@@ -588,9 +840,9 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
     }
 
     /// Authenticates and installs one exact owner attach without publishing
-    /// recovery before its acceptance.  The returned recovery capability must
-    /// be consumed only after transport has queued `acceptance` on that same
-    /// exact leg.
+    /// recovery before its acceptance. The installed result keeps acceptance,
+    /// attached-leg authority, and recovery indivisible until the acceptance
+    /// enters a bounded [`LegOutboundQueue`].
     pub(crate) fn accept_owner_attach(
         &mut self,
         leg: &EstablishedLeg,
@@ -607,11 +859,18 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
                 attached,
                 acceptance,
                 recovery,
-            } => Ok(OwnerTargetAttachPublication::Installed {
-                attached,
-                acceptance,
-                recovery: PendingOwnerTargetRecovery { effects: recovery },
-            }),
+            } => {
+                self.attach_barrier_pending = true;
+                Ok(OwnerTargetAttachPublication::Installed {
+                    pending: PendingOwnerTargetAttachPublication {
+                        owner: Arc::downgrade(&self.identity),
+                        endpoint: leg.endpoint_liveness(),
+                        attached,
+                        acceptance,
+                        effects: recovery,
+                    },
+                })
+            }
             OwnerAttachPublication::Resynchronize { status } => {
                 Ok(OwnerTargetAttachPublication::Resynchronize { status })
             }
@@ -620,16 +879,43 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
 
     pub(crate) fn execute_attached_recovery(
         &mut self,
-        recovery: PendingOwnerTargetRecovery,
-    ) -> Result<Vec<OwnerTargetOutput>, OwnerTargetError> {
-        if let Some(block) = self.input_admission_block(None) {
+        recovery: EnqueuedOwnerTargetAttach,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<Vec<OwnerTargetRecoveryOutput>, OwnerTargetError> {
+        if let Some(block) = self.recovery_owner_block(&recovery.owner) {
             return Err(OwnerTargetError::RejectedAttachedRecovery {
                 block,
                 recovery: Box::new(recovery),
             });
         }
-        let effects = recovery
-            .effects
+        if !recovery.recovery.acceptance.queue_is_live() {
+            return Err(OwnerTargetError::RejectedAttachedRecovery {
+                block: OwnerTargetInputBlock::AcceptanceQueueLost,
+                recovery: Box::new(recovery),
+            });
+        }
+        if !recovery.recovery.acceptance.belongs_to_queue(queue) {
+            return Err(OwnerTargetError::RejectedAttachedRecovery {
+                block: OwnerTargetInputBlock::WrongAcceptanceQueue,
+                recovery: Box::new(recovery),
+            });
+        }
+        if let Some(block) = self.recovery_admission_block() {
+            return Err(OwnerTargetError::RejectedAttachedRecovery {
+                block,
+                recovery: Box::new(recovery),
+            });
+        }
+        let EnqueuedOwnerTargetAttach {
+            owner,
+            attached,
+            recovery:
+                EnqueuedOwnerTargetRecovery {
+                    acceptance,
+                    effects,
+                },
+        } = recovery;
+        let effects = effects
             .into_iter()
             .map(OwnerTargetWork::Effect)
             .collect::<VecDeque<_>>();
@@ -644,7 +930,362 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
                 actual,
             });
         }
-        self.execute_queue(effects)
+        let outputs = self.execute_queue(effects)?;
+        self.drain_attached_recovery_outputs(
+            OwnerTargetRecoveryDrain {
+                owner,
+                attached: Some(attached),
+                acceptance: Some(acceptance),
+                pending: outputs.into(),
+                ready: Vec::new(),
+            },
+            queue,
+        )
+    }
+
+    /// Retries only the bounded queue drain after pressure. Reducer and Target
+    /// work were already consumed by the first turn and are never repeated.
+    pub(crate) fn resume_attached_recovery_drain(
+        &mut self,
+        drain: OwnerTargetRecoveryDrain,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<Vec<OwnerTargetRecoveryOutput>, OwnerTargetError> {
+        if let Some(block) = self.recovery_owner_block(&drain.owner) {
+            return Err(OwnerTargetError::RejectedAttachedRecoveryDrain {
+                block,
+                drain: Box::new(drain),
+            });
+        }
+        if let Some(block) = self.recovery_admission_block_allow_pending_turn() {
+            return Err(OwnerTargetError::RejectedAttachedRecoveryDrain {
+                block,
+                drain: Box::new(drain),
+            });
+        }
+        let Some(acceptance) = drain.acceptance.as_ref() else {
+            return Err(OwnerTargetError::AttachedRecoveryOutputInvariant {
+                drain: Box::new(drain),
+            });
+        };
+        if !acceptance.queue_is_live() {
+            return Err(OwnerTargetError::RejectedAttachedRecoveryDrain {
+                block: OwnerTargetInputBlock::AcceptanceQueueLost,
+                drain: Box::new(drain),
+            });
+        }
+        if !acceptance.belongs_to_queue(queue) {
+            return Err(OwnerTargetError::RejectedAttachedRecoveryDrain {
+                block: OwnerTargetInputBlock::WrongAcceptanceQueue,
+                drain: Box::new(drain),
+            });
+        }
+        self.drain_attached_recovery_outputs(drain, queue)
+    }
+
+    /// Consumes one exact recovery continuation and drains its following wire
+    /// effects through the same queue. The generic owner resume capability is
+    /// never exposed to transport/controller code on this path.
+    pub(crate) fn resume_attached_recovery_effects(
+        &mut self,
+        recovery: OwnerTargetRecoveryResume,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<Vec<OwnerTargetRecoveryOutput>, OwnerTargetError> {
+        if let Some(block) = self.recovery_owner_block(&recovery.resume.owner) {
+            return Err(OwnerTargetError::RejectedAttachedRecoveryResume {
+                block,
+                recovery: Box::new(recovery),
+            });
+        }
+        if let Some(block) = self.recovery_admission_block_allow_pending_turn() {
+            return Err(OwnerTargetError::RejectedAttachedRecoveryResume {
+                block,
+                recovery: Box::new(recovery),
+            });
+        }
+        if !recovery.acceptance.queue_is_live() {
+            return Err(OwnerTargetError::RejectedAttachedRecoveryResume {
+                block: OwnerTargetInputBlock::AcceptanceQueueLost,
+                recovery: Box::new(recovery),
+            });
+        }
+        if !recovery.acceptance.belongs_to_queue(queue) {
+            return Err(OwnerTargetError::RejectedAttachedRecoveryResume {
+                block: OwnerTargetInputBlock::WrongAcceptanceQueue,
+                recovery: Box::new(recovery),
+            });
+        }
+        let OwnerTargetRecoveryResume {
+            attached,
+            acceptance,
+            resume,
+        } = recovery;
+        let owner = resume.owner.clone();
+        let outputs = self.resume_pending_effects_inner(resume)?;
+        self.drain_attached_recovery_outputs(
+            OwnerTargetRecoveryDrain {
+                owner,
+                attached: Some(attached),
+                acceptance: Some(acceptance),
+                pending: outputs.into(),
+                ready: Vec::new(),
+            },
+            queue,
+        )
+    }
+
+    /// Abandons an installed attach only after its exact endpoint was destroyed
+    /// before queue mint, or its exact sole queue was claimed and then lost
+    /// before acceptance admission. The committed generation remains installed;
+    /// clearing this publication barrier only reopens authenticated status and
+    /// catch-up handling.
+    pub(crate) fn abandon_lost_pending_attach(
+        &mut self,
+        pending: PendingOwnerTargetAttachPublication,
+    ) -> Result<(), OwnerTargetError> {
+        if let Some(block) = self.recovery_owner_block(&pending.owner) {
+            return Err(OwnerTargetError::RejectedPendingAttachAbandon {
+                block,
+                pending: Box::new(pending),
+            });
+        }
+        let exact_endpoint_lost = pending.endpoint.upgrade().is_none();
+        let exact_queue_lost = pending.attached.outbound_queue_was_lost();
+        if !exact_endpoint_lost && !exact_queue_lost {
+            return Err(OwnerTargetError::RejectedPendingAttachAbandon {
+                block: OwnerTargetInputBlock::AcceptanceQueueStillLive,
+                pending: Box::new(pending),
+            });
+        }
+        if let Some(block) = self.recovery_admission_block() {
+            return Err(OwnerTargetError::RejectedPendingAttachAbandon {
+                block,
+                pending: Box::new(pending),
+            });
+        }
+        self.finish_lost_attach_barrier();
+        Ok(())
+    }
+
+    /// Consumes the exact enqueue rejection only when it proves that the
+    /// correlated transport endpoint or already-claimed sole queue is gone.
+    /// Other admission failures remain retryable and cannot clear the barrier.
+    pub(crate) fn abandon_lost_pending_attach_enqueue(
+        &mut self,
+        error: OwnerTargetAttachEnqueueError,
+    ) -> Result<(), OwnerTargetError> {
+        if let Some(block) = self.recovery_owner_block(&error.publication.owner) {
+            return Err(OwnerTargetError::RejectedAttachEnqueueAbandon {
+                block,
+                error: Box::new(error),
+            });
+        }
+        let exact_transport_lost = error.kind == LegOutboundQueueErrorKind::EndpointLost;
+        let exact_queue_lost = error.publication.attached.outbound_queue_was_lost();
+        if !exact_transport_lost && !exact_queue_lost {
+            return Err(OwnerTargetError::RejectedAttachEnqueueAbandon {
+                block: OwnerTargetInputBlock::AcceptanceQueueStillLive,
+                error: Box::new(error),
+            });
+        }
+        if let Some(block) = self.recovery_admission_block() {
+            return Err(OwnerTargetError::RejectedAttachEnqueueAbandon {
+                block,
+                error: Box::new(error),
+            });
+        }
+        self.finish_lost_attach_barrier();
+        Ok(())
+    }
+
+    /// Consumes recovery authority whose exact acceptance queue or transport
+    /// endpoint is gone. Recovery effects are a deterministic projection of
+    /// the installed model, so a later authenticated high-water successor
+    /// will regenerate them; no Target operation is repeated here.
+    pub(crate) fn abandon_lost_attached_recovery(
+        &mut self,
+        recovery: EnqueuedOwnerTargetAttach,
+    ) -> Result<(), OwnerTargetError> {
+        if let Some(block) = self.recovery_owner_block(&recovery.owner) {
+            return Err(OwnerTargetError::RejectedAttachedRecovery {
+                block,
+                recovery: Box::new(recovery),
+            });
+        }
+        if recovery.recovery.acceptance.queue_is_live() {
+            return Err(OwnerTargetError::RejectedAttachedRecovery {
+                block: OwnerTargetInputBlock::AcceptanceQueueStillLive,
+                recovery: Box::new(recovery),
+            });
+        }
+        if let Some(block) = self.recovery_admission_block() {
+            return Err(OwnerTargetError::RejectedAttachedRecovery {
+                block,
+                recovery: Box::new(recovery),
+            });
+        }
+        self.finish_lost_attach_barrier();
+        Ok(())
+    }
+
+    pub(crate) fn abandon_lost_attached_recovery_drain(
+        &mut self,
+        drain: OwnerTargetRecoveryDrain,
+    ) -> Result<(), OwnerTargetError> {
+        if let Some(block) = self.recovery_owner_block(&drain.owner) {
+            return Err(OwnerTargetError::RejectedAttachedRecoveryDrain {
+                block,
+                drain: Box::new(drain),
+            });
+        }
+        let queue_live = drain
+            .acceptance
+            .as_ref()
+            .is_some_and(AttachAcceptanceEnqueued::queue_is_live);
+        if queue_live {
+            return Err(OwnerTargetError::RejectedAttachedRecoveryDrain {
+                block: OwnerTargetInputBlock::AcceptanceQueueStillLive,
+                drain: Box::new(drain),
+            });
+        }
+        if let Some(block) = self.recovery_admission_block_allow_pending_turn() {
+            return Err(OwnerTargetError::RejectedAttachedRecoveryDrain {
+                block,
+                drain: Box::new(drain),
+            });
+        }
+        self.finish_lost_attach_barrier();
+        Ok(())
+    }
+
+    pub(crate) fn abandon_lost_attached_recovery_resume(
+        &mut self,
+        recovery: OwnerTargetRecoveryResume,
+    ) -> Result<(), OwnerTargetError> {
+        if let Some(block) = self.recovery_owner_block(&recovery.resume.owner) {
+            return Err(OwnerTargetError::RejectedAttachedRecoveryResume {
+                block,
+                recovery: Box::new(recovery),
+            });
+        }
+        if recovery.acceptance.queue_is_live() {
+            return Err(OwnerTargetError::RejectedAttachedRecoveryResume {
+                block: OwnerTargetInputBlock::AcceptanceQueueStillLive,
+                recovery: Box::new(recovery),
+            });
+        }
+        if let Some(block) = self.recovery_admission_block_allow_pending_turn() {
+            return Err(OwnerTargetError::RejectedAttachedRecoveryResume {
+                block,
+                recovery: Box::new(recovery),
+            });
+        }
+        self.finish_lost_attach_barrier();
+        Ok(())
+    }
+
+    fn finish_lost_attach_barrier(&mut self) {
+        self.pending_effects.clear();
+        self.outstanding_resume = None;
+        self.attach_barrier_pending = false;
+    }
+
+    fn drain_attached_recovery_outputs(
+        &mut self,
+        mut drain: OwnerTargetRecoveryDrain,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<Vec<OwnerTargetRecoveryOutput>, OwnerTargetError> {
+        while let Some(output) = drain.pending.pop_front() {
+            match output {
+                OwnerTargetOutput::Transmit(frame) => {
+                    if let Err(error) = queue.push(frame) {
+                        let kind = error.kind().clone();
+                        drain
+                            .pending
+                            .push_front(OwnerTargetOutput::Transmit(error.into_frame()));
+                        return Err(OwnerTargetError::AttachedRecoveryQueueBlocked {
+                            kind,
+                            drain: Box::new(drain),
+                        });
+                    }
+                }
+                OwnerTargetOutput::LegActivated { generation } => drain
+                    .ready
+                    .push(OwnerTargetRecoveryOutput::LegActivated { generation }),
+                OwnerTargetOutput::ResumeGraceStarted { generation } => drain
+                    .ready
+                    .push(OwnerTargetRecoveryOutput::ResumeGraceStarted { generation }),
+                OwnerTargetOutput::TerminalGraceStarted { terminal } => drain
+                    .ready
+                    .push(OwnerTargetRecoveryOutput::TerminalGraceStarted { terminal }),
+                OwnerTargetOutput::SessionExpired => {
+                    drain.ready.push(OwnerTargetRecoveryOutput::SessionExpired)
+                }
+                OwnerTargetOutput::NeedsResume { resume } => {
+                    if !drain.pending.is_empty() {
+                        drain
+                            .pending
+                            .push_front(OwnerTargetOutput::NeedsResume { resume });
+                        return Err(OwnerTargetError::AttachedRecoveryOutputInvariant {
+                            drain: Box::new(drain),
+                        });
+                    }
+                    let Some(acceptance) = drain.acceptance.take() else {
+                        drain
+                            .pending
+                            .push_front(OwnerTargetOutput::NeedsResume { resume });
+                        return Err(OwnerTargetError::AttachedRecoveryOutputInvariant {
+                            drain: Box::new(drain),
+                        });
+                    };
+                    let Some(attached) = drain.attached.take() else {
+                        drain.acceptance = Some(acceptance);
+                        drain
+                            .pending
+                            .push_front(OwnerTargetOutput::NeedsResume { resume });
+                        return Err(OwnerTargetError::AttachedRecoveryOutputInvariant {
+                            drain: Box::new(drain),
+                        });
+                    };
+                    drain.ready.push(OwnerTargetRecoveryOutput::NeedsResume {
+                        resume: OwnerTargetRecoveryResume {
+                            attached,
+                            acceptance,
+                            resume,
+                        },
+                    });
+                    return Ok(drain.ready);
+                }
+            }
+        }
+        let Some(attached) = drain.attached.take() else {
+            return Err(OwnerTargetError::AttachedRecoveryOutputInvariant {
+                drain: Box::new(drain),
+            });
+        };
+        if !self.attach_barrier_pending {
+            drain.attached = Some(attached);
+            return Err(OwnerTargetError::AttachedRecoveryOutputInvariant {
+                drain: Box::new(drain),
+            });
+        }
+        let Some(acceptance) = drain.acceptance.take() else {
+            drain.attached = Some(attached);
+            return Err(OwnerTargetError::AttachedRecoveryOutputInvariant {
+                drain: Box::new(drain),
+            });
+        };
+        if !queue.finish_attach_recovery(&acceptance) {
+            drain.attached = Some(attached);
+            drain.acceptance = Some(acceptance);
+            return Err(OwnerTargetError::AttachedRecoveryOutputInvariant {
+                drain: Box::new(drain),
+            });
+        }
+        self.attach_barrier_pending = false;
+        drain
+            .ready
+            .push(OwnerTargetRecoveryOutput::RecoveryCompleted { attached });
+        Ok(drain.ready)
     }
 
     /// Consumes the exact wakeup minted by the previous bounded turn.
@@ -652,6 +1293,25 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         &mut self,
         resume: OwnerTargetResume,
     ) -> Result<Vec<OwnerTargetOutput>, OwnerTargetError> {
+        if self.attach_barrier_pending {
+            return Err(OwnerTargetError::RejectedEffectResume {
+                block: OwnerTargetInputBlock::AttachBarrierPending,
+                resume: Box::new(resume),
+            });
+        }
+        self.resume_pending_effects_inner(resume)
+    }
+
+    fn resume_pending_effects_inner(
+        &mut self,
+        resume: OwnerTargetResume,
+    ) -> Result<Vec<OwnerTargetOutput>, OwnerTargetError> {
+        if let Some(block) = self.recovery_owner_block(&resume.owner) {
+            return Err(OwnerTargetError::RejectedEffectResume {
+                block,
+                resume: Box::new(resume),
+            });
+        }
         let Some(expected) = self.outstanding_resume else {
             return Err(OwnerTargetError::NoPendingEffectTurn);
         };
@@ -1744,6 +2404,8 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
     fn require_no_pending_effects(&self) -> Result<(), OwnerTargetError> {
         if self.aborted_effects.is_some() {
             Err(OwnerTargetError::AbortedEffectInvariant)
+        } else if self.attach_barrier_pending {
+            Err(OwnerTargetError::AttachBarrierPending)
         } else if self.pending_effects.is_empty() && self.outstanding_resume.is_none() {
             Ok(())
         } else {
@@ -1773,6 +2435,9 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         if self.aborted_effects.is_some() {
             return Some(OwnerTargetInputBlock::AbortedEffectInvariant);
         }
+        if self.attach_barrier_pending {
+            return Some(OwnerTargetInputBlock::AttachBarrierPending);
+        }
         if !self.pending_effects.is_empty() || self.outstanding_resume.is_some() {
             return Some(OwnerTargetInputBlock::PendingEffectTurn);
         }
@@ -1782,6 +2447,41 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
                 .is_some_and(|flow| flow.pending_completion.is_some())
                 .then_some(OwnerTargetInputBlock::PendingTargetCompletion { flow_id })
         })
+    }
+
+    fn recovery_owner_block(
+        &self,
+        owner: &Weak<OwnerTargetExecutorIdentity>,
+    ) -> Option<OwnerTargetInputBlock> {
+        match owner.upgrade() {
+            None => Some(OwnerTargetInputBlock::OwnerTargetExecutorLost),
+            Some(identity) if !Arc::ptr_eq(&identity, &self.identity) => {
+                Some(OwnerTargetInputBlock::WrongOwnerTargetExecutor)
+            }
+            Some(_) => None,
+        }
+    }
+
+    fn recovery_admission_block(&self) -> Option<OwnerTargetInputBlock> {
+        if !self.attach_barrier_pending {
+            return Some(OwnerTargetInputBlock::AttachBarrierNotPending);
+        }
+        if self.aborted_effects.is_some() {
+            return Some(OwnerTargetInputBlock::AbortedEffectInvariant);
+        }
+        if !self.pending_effects.is_empty() || self.outstanding_resume.is_some() {
+            return Some(OwnerTargetInputBlock::PendingEffectTurn);
+        }
+        None
+    }
+
+    fn recovery_admission_block_allow_pending_turn(&self) -> Option<OwnerTargetInputBlock> {
+        if !self.attach_barrier_pending {
+            return Some(OwnerTargetInputBlock::AttachBarrierNotPending);
+        }
+        self.aborted_effects
+            .is_some()
+            .then_some(OwnerTargetInputBlock::AbortedEffectInvariant)
     }
 
     fn extend_effects(
@@ -1882,7 +2582,10 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
             .ok_or(OwnerTargetError::EffectResumeIdExhausted)?;
         self.next_resume_id = id.checked_add(1);
         self.outstanding_resume = Some(id);
-        Ok(OwnerTargetResume { id })
+        Ok(OwnerTargetResume {
+            owner: Arc::downgrade(&self.identity),
+            id,
+        })
     }
 }
 
@@ -1977,6 +2680,13 @@ impl<T> OwnerTargetExecutor<T> {
 pub(crate) enum OwnerTargetInputBlock {
     PendingEffectTurn,
     AbortedEffectInvariant,
+    AttachBarrierPending,
+    AttachBarrierNotPending,
+    OwnerTargetExecutorLost,
+    WrongOwnerTargetExecutor,
+    AcceptanceQueueLost,
+    AcceptanceQueueStillLive,
+    WrongAcceptanceQueue,
     PendingTargetCompletion { flow_id: SessionFlowId },
     ReducerAdmission(ReducerAdmissionBlock),
 }
@@ -1993,10 +2703,17 @@ pub(crate) enum OwnerTargetError {
     EffectStepOverflow,
     #[error("owner Target has a pending effect turn; consume its exact resume capability first")]
     PendingEffectTurn,
+    #[error("owner Target attach acceptance/recovery barrier is still pending")]
+    AttachBarrierPending,
     #[error("owner Target has no pending effect turn")]
     NoPendingEffectTurn,
     #[error("owner Target effect resume {actual} does not match outstanding resume {expected}")]
     InvalidEffectResume { expected: u64, actual: u64 },
+    #[error("owner Target rejected an effect resume before consuming it: {block:?}")]
+    RejectedEffectResume {
+        block: OwnerTargetInputBlock,
+        resume: Box<OwnerTargetResume>,
+    },
     #[error("owner Target attempted to mint a second effect resume capability")]
     DuplicateEffectResume,
     #[error("owner Target effect resume ID space is exhausted")]
@@ -2022,10 +2739,39 @@ pub(crate) enum OwnerTargetError {
         block: OwnerTargetInputBlock,
         received: Box<LegBoundFrame>,
     },
+    #[error("owner Target rejected pending attach abandonment before consuming it: {block:?}")]
+    RejectedPendingAttachAbandon {
+        block: OwnerTargetInputBlock,
+        pending: Box<PendingOwnerTargetAttachPublication>,
+    },
+    #[error("owner Target rejected attach-enqueue abandonment before consuming it: {block:?}")]
+    RejectedAttachEnqueueAbandon {
+        block: OwnerTargetInputBlock,
+        error: Box<OwnerTargetAttachEnqueueError>,
+    },
     #[error("owner Target rejected post-acceptance recovery before consuming it: {block:?}")]
     RejectedAttachedRecovery {
         block: OwnerTargetInputBlock,
-        recovery: Box<PendingOwnerTargetRecovery>,
+        recovery: Box<EnqueuedOwnerTargetAttach>,
+    },
+    #[error("owner Target rejected a retained recovery drain before consuming it: {block:?}")]
+    RejectedAttachedRecoveryDrain {
+        block: OwnerTargetInputBlock,
+        drain: Box<OwnerTargetRecoveryDrain>,
+    },
+    #[error("owner Target rejected a post-attach recovery continuation: {block:?}")]
+    RejectedAttachedRecoveryResume {
+        block: OwnerTargetInputBlock,
+        recovery: Box<OwnerTargetRecoveryResume>,
+    },
+    #[error("owner Target recovery queue is blocked: {kind:?}")]
+    AttachedRecoveryQueueBlocked {
+        kind: LegOutboundQueueErrorKind,
+        drain: Box<OwnerTargetRecoveryDrain>,
+    },
+    #[error("owner Target recovery output ordering invariant failed")]
+    AttachedRecoveryOutputInvariant {
+        drain: Box<OwnerTargetRecoveryDrain>,
     },
     #[error("peer OPEN effect for flow {flow_id:?} was duplicate or mismatched")]
     DuplicateOrMismatchedPeerOpen { flow_id: SessionFlowId },
@@ -2116,11 +2862,16 @@ const fn open_failure_result(failure: TargetOpenFailure) -> OpenResultCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::owned_upstream::leg_io::{
+        EncodedLegTransport, EncodedLegTransportError, LegEndpointRole, LegIo, LegIoConfigError,
+        LegIoLimits, OrderedDeliveryToken,
+    };
     use crate::owned_upstream::target::{
         MemoryTarget, MemoryTargetConfig, MemoryWriteDirective, TargetExpireCompletion,
         TargetFailure, TargetOpenFailure, TargetReadCompletion, TargetReadFeedCompletion,
         TargetReadiness,
     };
+    use crate::owned_upstream::two_leg::{LegId, SimTime, WireLane, WireRoute};
     use crate::resumable::{
         AttachAlpn, AttachAuthority, AttachCredentials, AttachNonce, AttachPolicy, AttachRequest,
         AttachTransportBinding, ByteOffset, DevicePrincipal, DeviceSecret, Direction, FeatureOffer,
@@ -2131,6 +2882,37 @@ mod tests {
     use crate::shared::TargetAddr;
     use bytes::Bytes;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+    #[derive(Default)]
+    struct CapturingTransport {
+        frames: Vec<Vec<u8>>,
+    }
+
+    impl EncodedLegTransport for CapturingTransport {
+        fn send_encoded(
+            &mut self,
+            _now: SimTime,
+            _route: WireRoute,
+            _lane: WireLane,
+            bytes: Vec<u8>,
+        ) -> Result<(), EncodedLegTransportError> {
+            self.frames.push(bytes);
+            Ok(())
+        }
+
+        fn send_attach_ordered_encoded(
+            &mut self,
+            _now: SimTime,
+            _route: WireRoute,
+            _lane: WireLane,
+            bytes: Vec<u8>,
+            completion: OrderedDeliveryToken,
+        ) -> Result<(), EncodedLegTransportError> {
+            self.frames.push(bytes);
+            completion.mark_delivered();
+            Ok(())
+        }
+    }
 
     fn credentials() -> AttachCredentials {
         AttachCredentials::new(
@@ -2217,6 +2999,32 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    fn attach_executor() -> OwnerTargetExecutor<MemoryTarget> {
+        let initial = committed_leg(2, 0x22, 0x42);
+        let model = SessionModel::new(SessionRole::Owner, session_config(), initial);
+        let authority = AttachAuthority::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(2).unwrap(),
+            credentials(),
+            AttachPolicy::new(
+                OwnerIdentity::new([0x31; 32]).unwrap(),
+                AttachAlpn::new(b"mini-vpn-owned/1").unwrap(),
+                DevicePrincipal::new([0x53; 16]).unwrap(),
+                SESSION_PROTOCOL_VERSION,
+                0b1111,
+            )
+            .unwrap(),
+        );
+        let supervisor = SessionSupervisor::new_owner(model, authority).unwrap();
+        OwnerTargetExecutor::new(
+            OwnerTargetConfig::new(128, 1_024, 64).unwrap(),
+            supervisor,
+            MemoryTarget::new(MemoryTargetConfig::new(4, 256, 512, 128, 128, 16).unwrap()),
+            source_config(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -2567,7 +3375,7 @@ mod tests {
     }
 
     #[test]
-    fn target_open_is_exactly_once_across_duplicate_open_and_replacement_replay() {
+    fn replacement_replay_can_drain_only_through_its_acceptance_queue() {
         let leg2 = committed_leg(2, 0x22, 0x42);
         let model = SessionModel::new(SessionRole::Owner, session_config(), leg2);
         let authority = AttachAuthority::new(
@@ -2618,7 +3426,13 @@ mod tests {
             .apply_event(SessionEvent::LegLost { leg: leg2 })
             .unwrap();
         let transport_binding = binding(0x43);
-        let established = EstablishedLeg::for_authenticated_transport(transport_binding);
+        let mut endpoint = LegIo::for_authenticated_transport(
+            LegId::A,
+            LegEndpointRole::Owner,
+            transport_binding,
+            LegIoLimits::new(1_024, 8, 8_192, 8, 8_192).unwrap(),
+        );
+        let established = endpoint.established_leg();
         let request = AttachRequest::new(
             SessionId::new([0x11; 16]).unwrap(),
             LegGeneration::new(3).unwrap(),
@@ -2629,32 +3443,92 @@ mod tests {
         let proof = credentials().prove(&request, &transport_binding).unwrap();
         let publication = executor
             .accept_owner_attach(
-                &established,
+                established,
                 established.bind_received_frame(request.to_attach_frame(proof)),
             )
             .unwrap();
-        let OwnerTargetAttachPublication::Installed {
-            attached,
-            acceptance,
-            recovery,
-        } = publication
-        else {
+        let OwnerTargetAttachPublication::Installed { pending } = publication else {
             panic!("exact-next replacement unexpectedly requested resynchronization");
         };
-        assert_eq!(attached.generation().get(), 3);
-        assert!(matches!(acceptance.record(), Record::AttachAccepted { .. }));
-        let recovery = executor.execute_attached_recovery(recovery).unwrap();
-        assert!(transmitted(&recovery).iter().any(|record| matches!(
-            record,
+        let acceptance_len = pending.acceptance_encoded_len().unwrap();
+        let mut acceptance_queue = LegOutboundQueue::for_leg(established, 1, 1_024).unwrap();
+        let enqueued = pending.enqueue_acceptance(&mut acceptance_queue).unwrap();
+        assert_eq!(enqueued.generation().get(), 3);
+        assert_eq!(acceptance_queue.len(), 1);
+
+        let other_leg = EstablishedLeg::for_authenticated_transport(binding(0x44));
+        let mut other_queue = LegOutboundQueue::for_leg(&other_leg, 4, acceptance_len * 4).unwrap();
+        let recovery = match executor.execute_attached_recovery(enqueued, &mut other_queue) {
+            Err(OwnerTargetError::RejectedAttachedRecovery {
+                block: OwnerTargetInputBlock::WrongAcceptanceQueue,
+                recovery,
+            }) => recovery,
+            other => panic!("queue B must not drain queue A recovery, got {other:?}"),
+        };
+        assert!(other_queue.is_empty());
+        assert_eq!(executor.target().snapshot().open_attempts, 1);
+
+        let drain = match executor.execute_attached_recovery(*recovery, &mut acceptance_queue) {
+            Err(OwnerTargetError::AttachedRecoveryQueueBlocked {
+                kind: LegOutboundQueueErrorKind::CapacityExceeded { .. },
+                drain,
+            }) => drain,
+            other => panic!("full acceptance queue must retain replay drain, got {other:?}"),
+        };
+        assert_eq!(acceptance_queue.len(), 1);
+        assert_eq!(executor.target().snapshot().open_attempts, 1);
+        assert!(!format!("{drain:?}").contains("33333333"));
+
+        let drain = match executor.resume_attached_recovery_drain(*drain, &mut other_queue) {
+            Err(OwnerTargetError::RejectedAttachedRecoveryDrain {
+                block: OwnerTargetInputBlock::WrongAcceptanceQueue,
+                drain,
+            }) => drain,
+            other => panic!("queue B must not resume queue A drain, got {other:?}"),
+        };
+        let mut transport = CapturingTransport::default();
+        acceptance_queue
+            .try_flush(&mut endpoint, &mut transport, SimTime::ZERO)
+            .unwrap()
+            .unwrap();
+        let outputs = executor
+            .resume_attached_recovery_drain(*drain, &mut acceptance_queue)
+            .unwrap();
+        assert!(outputs.iter().any(|output| matches!(
+            output,
+            OwnerTargetRecoveryOutput::LegActivated { generation }
+                if generation.get() == 3
+        )));
+        assert!(outputs.iter().any(|output| matches!(
+            output,
+            OwnerTargetRecoveryOutput::RecoveryCompleted { attached }
+                if attached.generation().get() == 3
+        )));
+        assert_eq!(acceptance_queue.len(), 1);
+        acceptance_queue
+            .try_flush(&mut endpoint, &mut transport, SimTime::ZERO)
+            .unwrap()
+            .unwrap();
+        assert_eq!(transport.frames.len(), 2);
+        assert!(matches!(
+            Frame::decode_owned_exact(Bytes::from(transport.frames[0].clone()))
+                .unwrap()
+                .record(),
+            Record::AttachAccepted { .. }
+        ));
+        assert!(matches!(
+            Frame::decode_owned_exact(Bytes::from(transport.frames[1].clone()))
+                .unwrap()
+                .record(),
             Record::OpenResult { flow_id: observed, result: OpenResultCode::Opened }
                 if *observed == flow_id
-        )));
+        ));
         assert_eq!(executor.target().snapshot().open_attempts, 1);
         assert_eq!(executor.target().snapshot().opened_flows, 1);
     }
 
     #[test]
-    fn owner_attach_keeps_recovery_opaque_until_acceptance_is_ready_to_publish() {
+    fn owner_attach_recovery_requires_exact_acceptance_queue_admission() {
         let initial = committed_leg(2, 0x22, 0x42);
         let model = SessionModel::new(SessionRole::Owner, session_config(), initial);
         let authority = AttachAuthority::new(
@@ -2698,30 +3572,390 @@ mod tests {
             )
             .unwrap();
 
-        let OwnerTargetAttachPublication::Installed {
-            attached,
-            acceptance,
-            recovery,
-        } = publication
-        else {
+        let OwnerTargetAttachPublication::Installed { pending } = publication else {
             panic!("exact-next attach unexpectedly requested resynchronization");
         };
-        assert_eq!(attached.generation().get(), 3);
-        assert!(matches!(
-            acceptance.record(),
-            Record::AttachAccepted { nonce, .. } if *nonce == request.nonce()
-        ));
         assert_eq!(executor.snapshot().session.session.generation().get(), 3);
 
-        // The caller can publish `acceptance` before explicitly consuming the
-        // non-cloneable recovery token.
-        let recovered = executor.execute_attached_recovery(recovery).unwrap();
-        assert_eq!(
-            recovered,
-            vec![OwnerTargetOutput::LegActivated {
-                generation: LegGeneration::new(3).unwrap(),
-            }]
+        let acceptance_len = pending.acceptance_encoded_len().unwrap();
+        let mut queue = LegOutboundQueue::for_leg(&established, 1, acceptance_len).unwrap();
+        let enqueued = pending.enqueue_acceptance(&mut queue).unwrap();
+        assert_eq!(enqueued.generation().get(), 3);
+        assert_eq!(queue.len(), 1);
+
+        let (_, mut wrong_executor) = self::executor();
+        let enqueued = match wrong_executor.execute_attached_recovery(enqueued, &mut queue) {
+            Err(OwnerTargetError::RejectedAttachedRecovery {
+                block: OwnerTargetInputBlock::WrongOwnerTargetExecutor,
+                recovery,
+            }) => *recovery,
+            other => panic!("another executor must return the exact recovery, got {other:?}"),
+        };
+        assert_eq!(wrong_executor.target().snapshot().open_attempts, 0);
+
+        drop(established);
+        let recovery = match executor.execute_attached_recovery(enqueued, &mut queue) {
+            Err(OwnerTargetError::RejectedAttachedRecovery {
+                block: OwnerTargetInputBlock::AcceptanceQueueLost,
+                recovery,
+            }) => recovery,
+            other => panic!("destroyed endpoint must retain recovery, got {other:?}"),
+        };
+        assert!(format!("{recovery:?}").contains("queue_live: false"));
+        drop(queue);
+        executor.abandon_lost_attached_recovery(*recovery).unwrap();
+
+        let status_binding = binding(0x44);
+        let status_leg = EstablishedLeg::for_authenticated_transport(status_binding);
+        let status_request = AttachRequest::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(3).unwrap(),
+            AttachNonce::new([0x34; 16]).unwrap(),
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(0b111, 0b001).unwrap(),
         );
+        let status_proof = credentials()
+            .prove(&status_request, &status_binding)
+            .unwrap();
+        let OwnerTargetAttachPublication::Resynchronize { status } = executor
+            .accept_owner_attach(
+                &status_leg,
+                status_leg.bind_received_frame(status_request.to_attach_frame(status_proof)),
+            )
+            .unwrap()
+        else {
+            panic!("same-generation retry must return authenticated status")
+        };
+        assert!(
+            matches!(
+                status.record(),
+                Record::AttachGenerationStatus {
+                    requested_generation,
+                    ..
+                } if requested_generation.get() == 3
+            ) && status.leg_generation().get() == 3
+        );
+
+        let follow_up_binding = binding(0x45);
+        let follow_up_leg = EstablishedLeg::for_authenticated_transport(follow_up_binding);
+        let follow_up = AttachRequest::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(4).unwrap(),
+            AttachNonce::new([0x35; 16]).unwrap(),
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(0b111, 0b001).unwrap(),
+        );
+        let follow_up_proof = credentials().prove(&follow_up, &follow_up_binding).unwrap();
+        let OwnerTargetAttachPublication::Installed { pending } = executor
+            .accept_owner_attach(
+                &follow_up_leg,
+                follow_up_leg.bind_received_frame(follow_up.to_attach_frame(follow_up_proof)),
+            )
+            .unwrap()
+        else {
+            panic!("high-water successor must install")
+        };
+        let mut follow_up_queue = LegOutboundQueue::for_leg(&follow_up_leg, 4, 4_096).unwrap();
+        let recovery = pending.enqueue_acceptance(&mut follow_up_queue).unwrap();
+        let outputs = executor
+            .execute_attached_recovery(recovery, &mut follow_up_queue)
+            .unwrap();
+        assert!(outputs.iter().any(|output| matches!(
+            output,
+            OwnerTargetRecoveryOutput::RecoveryCompleted { attached }
+                if attached.generation().get() == 4
+        )));
+    }
+
+    #[test]
+    fn pre_enqueue_endpoint_loss_can_abandon_exact_attach_without_generation_rollback() {
+        let mut executor = attach_executor();
+        let transport_binding = binding(0x63);
+        let established = EstablishedLeg::for_authenticated_transport(transport_binding);
+        let request = AttachRequest::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(3).unwrap(),
+            AttachNonce::new([0x63; 16]).unwrap(),
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(0b111, 0b001).unwrap(),
+        );
+        let proof = credentials().prove(&request, &transport_binding).unwrap();
+        let OwnerTargetAttachPublication::Installed { pending } = executor
+            .accept_owner_attach(
+                &established,
+                established.bind_received_frame(request.to_attach_frame(proof)),
+            )
+            .unwrap()
+        else {
+            panic!("exact-next attach unexpectedly requested resynchronization")
+        };
+        let mut queue = LegOutboundQueue::for_leg(&established, 4, 4_096).unwrap();
+        drop(established);
+        let enqueue_error = pending.enqueue_acceptance(&mut queue).unwrap_err();
+        assert_eq!(
+            enqueue_error.kind(),
+            &LegOutboundQueueErrorKind::EndpointLost
+        );
+
+        let (_, mut wrong_executor) = self::executor();
+        let enqueue_error = match wrong_executor.abandon_lost_pending_attach_enqueue(enqueue_error)
+        {
+            Err(OwnerTargetError::RejectedAttachEnqueueAbandon {
+                block: OwnerTargetInputBlock::WrongOwnerTargetExecutor,
+                error,
+            }) => *error,
+            other => panic!("wrong executor must return exact enqueue error, got {other:?}"),
+        };
+        executor
+            .abandon_lost_pending_attach_enqueue(enqueue_error)
+            .unwrap();
+        assert_eq!(executor.snapshot().session.session.generation().get(), 3);
+
+        let status_binding = binding(0x64);
+        let status_leg = EstablishedLeg::for_authenticated_transport(status_binding);
+        let status_request = AttachRequest::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(3).unwrap(),
+            AttachNonce::new([0x64; 16]).unwrap(),
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(0b111, 0b001).unwrap(),
+        );
+        let status_proof = credentials()
+            .prove(&status_request, &status_binding)
+            .unwrap();
+        let OwnerTargetAttachPublication::Resynchronize { status } = executor
+            .accept_owner_attach(
+                &status_leg,
+                status_leg.bind_received_frame(status_request.to_attach_frame(status_proof)),
+            )
+            .unwrap()
+        else {
+            panic!("same-generation retry must return authenticated status")
+        };
+        assert!(
+            matches!(
+                status.record(),
+                Record::AttachGenerationStatus {
+                    requested_generation,
+                    ..
+                } if requested_generation.get() == 3
+            ) && status.leg_generation().get() == 3
+        );
+
+        let next_binding = binding(0x65);
+        let next_leg = EstablishedLeg::for_authenticated_transport(next_binding);
+        let next_request = AttachRequest::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(4).unwrap(),
+            AttachNonce::new([0x65; 16]).unwrap(),
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(0b111, 0b001).unwrap(),
+        );
+        let next_proof = credentials().prove(&next_request, &next_binding).unwrap();
+        let OwnerTargetAttachPublication::Installed { .. } = executor
+            .accept_owner_attach(
+                &next_leg,
+                next_leg.bind_received_frame(next_request.to_attach_frame(next_proof)),
+            )
+            .unwrap()
+        else {
+            panic!("authenticated high-water successor must install")
+        };
+        assert_eq!(executor.snapshot().session.session.generation().get(), 4);
+    }
+
+    #[test]
+    fn endpoint_loss_before_sole_queue_claim_can_abandon_then_status_and_advance() {
+        let mut executor = attach_executor();
+        let transport_binding = binding(0x73);
+        let established = EstablishedLeg::for_authenticated_transport(transport_binding);
+        let request = AttachRequest::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(3).unwrap(),
+            AttachNonce::new([0x73; 16]).unwrap(),
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(0b111, 0b001).unwrap(),
+        );
+        let proof = credentials().prove(&request, &transport_binding).unwrap();
+        let OwnerTargetAttachPublication::Installed { pending } = executor
+            .accept_owner_attach(
+                &established,
+                established.bind_received_frame(request.to_attach_frame(proof)),
+            )
+            .unwrap()
+        else {
+            panic!("exact-next attach unexpectedly requested resynchronization")
+        };
+
+        let pending = match executor.abandon_lost_pending_attach(pending) {
+            Err(OwnerTargetError::RejectedPendingAttachAbandon {
+                block: OwnerTargetInputBlock::AcceptanceQueueStillLive,
+                pending,
+            }) => *pending,
+            other => panic!("live unclaimed endpoint must retain publication, got {other:?}"),
+        };
+
+        // No queue was ever claimed, so only the publication's exact endpoint
+        // witness can prove that acceptance admission became impossible.
+        drop(established);
+        executor.abandon_lost_pending_attach(pending).unwrap();
+        assert_eq!(executor.snapshot().session.session.generation().get(), 3);
+
+        let status_binding = binding(0x74);
+        let status_leg = EstablishedLeg::for_authenticated_transport(status_binding);
+        let status_request = AttachRequest::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(3).unwrap(),
+            AttachNonce::new([0x74; 16]).unwrap(),
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(0b111, 0b001).unwrap(),
+        );
+        let status_proof = credentials()
+            .prove(&status_request, &status_binding)
+            .unwrap();
+        let OwnerTargetAttachPublication::Resynchronize { status } = executor
+            .accept_owner_attach(
+                &status_leg,
+                status_leg.bind_received_frame(status_request.to_attach_frame(status_proof)),
+            )
+            .unwrap()
+        else {
+            panic!("same-generation retry must return authenticated status")
+        };
+        assert!(
+            matches!(
+                status.record(),
+                Record::AttachGenerationStatus {
+                    requested_generation,
+                    ..
+                } if requested_generation.get() == 3
+            ) && status.leg_generation().get() == 3
+        );
+
+        let next_binding = binding(0x75);
+        let next_leg = EstablishedLeg::for_authenticated_transport(next_binding);
+        let next_request = AttachRequest::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(4).unwrap(),
+            AttachNonce::new([0x75; 16]).unwrap(),
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(0b111, 0b001).unwrap(),
+        );
+        let next_proof = credentials().prove(&next_request, &next_binding).unwrap();
+        let OwnerTargetAttachPublication::Installed { .. } = executor
+            .accept_owner_attach(
+                &next_leg,
+                next_leg.bind_received_frame(next_request.to_attach_frame(next_proof)),
+            )
+            .unwrap()
+        else {
+            panic!("authenticated high-water successor must install")
+        };
+        assert_eq!(executor.snapshot().session.session.generation().get(), 4);
+    }
+
+    #[test]
+    fn pre_enqueue_sole_queue_loss_is_exact_and_live_queue_cannot_be_abandoned() {
+        let mut executor = attach_executor();
+        let transport_binding = binding(0x66);
+        let established = EstablishedLeg::for_authenticated_transport(transport_binding);
+        let request = AttachRequest::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(3).unwrap(),
+            AttachNonce::new([0x66; 16]).unwrap(),
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(0b111, 0b001).unwrap(),
+        );
+        let proof = credentials().prove(&request, &transport_binding).unwrap();
+        let OwnerTargetAttachPublication::Installed { pending } = executor
+            .accept_owner_attach(
+                &established,
+                established.bind_received_frame(request.to_attach_frame(proof)),
+            )
+            .unwrap()
+        else {
+            panic!("exact-next attach unexpectedly requested resynchronization")
+        };
+        let queue = LegOutboundQueue::for_leg(&established, 4, 4_096).unwrap();
+
+        let pending = match executor.abandon_lost_pending_attach(pending) {
+            Err(OwnerTargetError::RejectedPendingAttachAbandon {
+                block: OwnerTargetInputBlock::AcceptanceQueueStillLive,
+                pending,
+            }) => *pending,
+            other => panic!("live exact queue must retain pending attach, got {other:?}"),
+        };
+        let (_, mut wrong_executor) = self::executor();
+        let pending = match wrong_executor.abandon_lost_pending_attach(pending) {
+            Err(OwnerTargetError::RejectedPendingAttachAbandon {
+                block: OwnerTargetInputBlock::WrongOwnerTargetExecutor,
+                pending,
+            }) => *pending,
+            other => panic!("wrong executor must return exact pending attach, got {other:?}"),
+        };
+
+        drop(queue);
+        executor.abandon_lost_pending_attach(pending).unwrap();
+        assert_eq!(executor.snapshot().session.session.generation().get(), 3);
+        assert!(!executor.attach_barrier_pending);
+    }
+
+    #[test]
+    fn owner_attach_acceptance_rejects_a_queue_minted_by_another_leg() {
+        let initial = committed_leg(2, 0x22, 0x42);
+        let model = SessionModel::new(SessionRole::Owner, session_config(), initial);
+        let authority = AttachAuthority::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(2).unwrap(),
+            credentials(),
+            AttachPolicy::new(
+                OwnerIdentity::new([0x31; 32]).unwrap(),
+                AttachAlpn::new(b"mini-vpn-owned/1").unwrap(),
+                DevicePrincipal::new([0x53; 16]).unwrap(),
+                SESSION_PROTOCOL_VERSION,
+                0b1111,
+            )
+            .unwrap(),
+        );
+        let supervisor = SessionSupervisor::new_owner(model, authority).unwrap();
+        let mut executor = OwnerTargetExecutor::new(
+            OwnerTargetConfig::new(128, 1_024, 64).unwrap(),
+            supervisor,
+            MemoryTarget::new(MemoryTargetConfig::new(4, 256, 512, 128, 128, 16).unwrap()),
+            source_config(),
+        )
+        .unwrap();
+
+        let accepted_binding = binding(0x43);
+        let accepted_leg = EstablishedLeg::for_authenticated_transport(accepted_binding);
+        let wrong_leg = EstablishedLeg::for_authenticated_transport(binding(0x44));
+        let request = AttachRequest::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(3).unwrap(),
+            AttachNonce::new([0x33; 16]).unwrap(),
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(0b111, 0b001).unwrap(),
+        );
+        let proof = credentials().prove(&request, &accepted_binding).unwrap();
+        let OwnerTargetAttachPublication::Installed { pending } = executor
+            .accept_owner_attach(
+                &accepted_leg,
+                accepted_leg.bind_received_frame(request.to_attach_frame(proof)),
+            )
+            .unwrap()
+        else {
+            panic!("exact-next attach unexpectedly requested resynchronization")
+        };
+
+        let acceptance_len = pending.acceptance_encoded_len().unwrap();
+        let mut wrong_queue = LegOutboundQueue::for_leg(&wrong_leg, 2, acceptance_len * 2).unwrap();
+        let error = pending.enqueue_acceptance(&mut wrong_queue).unwrap_err();
+
+        assert_eq!(error.kind(), &LegOutboundQueueErrorKind::WrongLeg);
+        assert!(wrong_queue.is_empty());
+        let pending = error.into_publication();
+        assert_eq!(pending.acceptance_encoded_len().unwrap(), acceptance_len);
+        assert!(!format!("{pending:?}").contains("33333333"));
     }
 
     #[test]
@@ -2797,12 +4031,72 @@ mod tests {
         let publication = executor
             .accept_owner_attach(&established, *received)
             .unwrap();
-        let OwnerTargetAttachPublication::Installed {
-            attached, recovery, ..
-        } = publication
-        else {
+        let OwnerTargetAttachPublication::Installed { pending } = publication else {
             panic!("retained exact-next ATTACH must install")
         };
+        let acceptance_len = pending.acceptance_encoded_len().unwrap();
+        let mut outbound = LegOutboundQueue::for_leg(&established, 4, acceptance_len * 4).unwrap();
+        let enqueued = pending.enqueue_acceptance(&mut outbound).unwrap();
+        assert!(matches!(
+            executor.apply_event(SessionEvent::LegLost { leg: initial }),
+            Err(OwnerTargetError::RejectedEvent {
+                block: OwnerTargetInputBlock::AttachBarrierPending,
+                ..
+            })
+        ));
+        assert!(matches!(
+            executor.try_read_target(flow_id),
+            Err(OwnerTargetError::AttachBarrierPending)
+        ));
+
+        let other_leg = EstablishedLeg::for_authenticated_transport(binding(0x44));
+        let mut other_queue = LegOutboundQueue::for_leg(&other_leg, 4, acceptance_len * 4).unwrap();
+        let mut recovered = executor
+            .execute_attached_recovery(enqueued, &mut outbound)
+            .unwrap();
+        let mut activated = None;
+        let mut attached = None;
+        loop {
+            let mut resume = None;
+            for output in recovered {
+                match output {
+                    OwnerTargetRecoveryOutput::LegActivated { generation } => {
+                        activated = Some(generation)
+                    }
+                    OwnerTargetRecoveryOutput::NeedsResume { resume: next } => {
+                        assert!(resume.replace(next).is_none());
+                    }
+                    OwnerTargetRecoveryOutput::RecoveryCompleted {
+                        attached: completed,
+                    } => {
+                        assert!(attached.replace(completed).is_none());
+                    }
+                    OwnerTargetRecoveryOutput::ResumeGraceStarted { .. }
+                    | OwnerTargetRecoveryOutput::TerminalGraceStarted { .. }
+                    | OwnerTargetRecoveryOutput::SessionExpired => {}
+                }
+            }
+            let Some(resume) = resume else {
+                break;
+            };
+            let resume = match executor.resume_attached_recovery_effects(resume, &mut other_queue) {
+                Err(OwnerTargetError::RejectedAttachedRecoveryResume {
+                    block: OwnerTargetInputBlock::WrongAcceptanceQueue,
+                    recovery,
+                }) => *recovery,
+                other => panic!("recovery continuation escaped to queue B: {other:?}"),
+            };
+            recovered = executor
+                .resume_attached_recovery_effects(resume, &mut outbound)
+                .unwrap();
+        }
+        let attached = attached.expect("recovery completion must release attached authority");
+        assert_eq!(activated, Some(attached.generation()));
+        assert_eq!(attached.nonce(), request.nonce());
+        assert_eq!(
+            LegOutboundQueue::for_leg(&established, 4, acceptance_len * 4).unwrap_err(),
+            LegIoConfigError::OutboundQueueAlreadyMinted
+        );
 
         let data_event = attached
             .accept_frame(
@@ -2821,23 +4115,15 @@ mod tests {
             )
             .unwrap();
         let mut data = executor.apply_event(data_event).unwrap();
-        let data_resume = data
+        let index = data
             .iter()
             .position(|output| matches!(output, OwnerTargetOutput::NeedsResume { .. }))
-            .map(|index| data.remove(index));
-        let Some(OwnerTargetOutput::NeedsResume {
+            .expect("one-step DATA must retain its generated ACK");
+        let OwnerTargetOutput::NeedsResume {
             resume: data_resume,
-        }) = data_resume
+        } = data.remove(index)
         else {
-            panic!("one-step DATA must retain its generated ACK")
-        };
-
-        let recovery = match executor.execute_attached_recovery(recovery) {
-            Err(OwnerTargetError::RejectedAttachedRecovery {
-                block: OwnerTargetInputBlock::PendingEffectTurn,
-                recovery,
-            }) => recovery,
-            other => panic!("pending DATA must return exact recovery ownership, got {other:?}"),
+            unreachable!()
         };
         assert!(
             transmitted(&executor.resume_pending_effects(data_resume).unwrap())
@@ -2847,22 +4133,6 @@ mod tests {
                     Record::Ack { flow_id: observed, .. } if *observed == flow_id
                 ))
         );
-
-        let mut recovered = executor.execute_attached_recovery(*recovery).unwrap();
-        while let Some(index) = recovered
-            .iter()
-            .position(|output| matches!(output, OwnerTargetOutput::NeedsResume { .. }))
-        {
-            let OwnerTargetOutput::NeedsResume { resume } = recovered.remove(index) else {
-                unreachable!()
-            };
-            recovered.extend(executor.resume_pending_effects(resume).unwrap());
-        }
-        assert!(recovered.iter().any(|output| matches!(
-            output,
-            OwnerTargetOutput::LegActivated { generation }
-                if *generation == attached.generation()
-        )));
     }
 
     #[test]
@@ -4480,4 +5750,18 @@ mod tests {
         assert_eq!(executor.target().snapshot().live_flows, 0);
         assert_eq!(executor.target().snapshot().joined_flows, 0);
     }
+
+    trait AmbiguousIfClone<Marker> {
+        fn marker() {}
+    }
+    impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+    impl<T: Clone> AmbiguousIfClone<u8> for T {}
+    const _: fn() = || {
+        let _ = <PendingOwnerTargetAttachPublication as AmbiguousIfClone<_>>::marker;
+        let _ = <EnqueuedOwnerTargetAttach as AmbiguousIfClone<_>>::marker;
+        let _ = <EnqueuedOwnerTargetRecovery as AmbiguousIfClone<_>>::marker;
+        let _ = <OwnerTargetRecoveryDrain as AmbiguousIfClone<_>>::marker;
+        let _ = <OwnerTargetRecoveryResume as AmbiguousIfClone<_>>::marker;
+        let _ = <OwnerTargetRecoveryOutput as AmbiguousIfClone<_>>::marker;
+    };
 }

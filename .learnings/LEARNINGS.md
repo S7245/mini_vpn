@@ -1,5 +1,32 @@
 # Learnings
 
+## 2026-08-18 - Ordered attach recovery is a whole-transition capability
+
+- A weak reference proving that *some* queue is alive is not an ordered-send
+  receipt. The queue must be the sole FIFO claimed by the exact authenticated
+  leg, remain tied to the live transport endpoint, and accept
+  `ATTACH_ACCEPTED` as its first session/recovery record.
+- FIFO admission alone does not order independent transport lanes. Recovery
+  must remain non-submittable until the exact acceptance has produced a
+  queue-owned delivery completion; a held control record must prevent later
+  data from passing it even when a different sender handle is used.
+- Recovery authority includes the attached leg, every replay frame, bounded
+  continuation state, and the exact executor that owns the reducer turn.
+  Releasing `AttachedLeg` early or returning a bare `Transmit(Frame)` lets a
+  caller route recovery through another queue and defeats the barrier.
+- Installing a replacement must put the executor behind an explicit barrier.
+  Normal events, Target reads, and generic resumes cannot advance the new leg
+  until acceptance and recovery have crossed the same FIFO boundary.
+- Fail-closed must still be recoverable. If the queue or endpoint disappears
+  after generation commit, a typed abandon/supersede transition must preserve
+  the committed generation and reopen the authenticated status-to-next-attach
+  path. The pending transition therefore needs the exact endpoint lease even
+  before the sole queue is first claimed; silently clearing or permanently
+  retaining the barrier is wrong.
+
+These constraints are transport ordering and lifecycle guarantees, not proof
+that a standby transport is authenticated or installed.
+
 ## 2026-08-18 - Leg control needs classified wire facts and one correlation authority
 
 - A control-plane wire extension must not enlarge the session reducer's

@@ -13,28 +13,72 @@ use crate::resumable::{
 };
 use crate::shared::TargetAddr;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 use thiserror::Error;
 
 /// One authenticated connection's process-local, unforgeable identity.
 ///
 /// There is intentionally no numeric identifier: equality is the identity of
 /// the live allocation shared by values minted from the same connection.
-struct LegSeal(Arc<LegSealInner>);
+pub(super) struct LegSeal(Arc<LegSealInner>);
 
-struct LegSealInner;
+struct LegSealInner {
+    outbound_queue_claimed: AtomicBool,
+    outbound_queue_lease: OnceLock<Weak<LegOutboundQueueLease>>,
+}
+
+/// Exact lifetime witness held only by the sole outbound queue minted for a
+/// transport leg. The seal keeps only a weak reference, so a pending attach
+/// can distinguish a live queue from a permanently lost claimed queue without
+/// gaining authority to recreate it.
+pub(super) struct LegOutboundQueueLease;
+
+/// Liveness lease held only by the authenticated transport endpoint. Queue
+/// receipts retain a weak reference, so dropping `LegIo`/`EstablishedLeg`
+/// cannot leave apparently sendable recovery authority behind.
+pub(super) struct LegTransportEndpoint;
 
 impl LegSeal {
     fn fresh() -> Self {
-        Self(Arc::new(LegSealInner))
+        Self(Arc::new(LegSealInner {
+            outbound_queue_claimed: AtomicBool::new(false),
+            outbound_queue_lease: OnceLock::new(),
+        }))
     }
 
-    fn share(&self) -> Self {
+    pub(super) fn share(&self) -> Self {
         Self(Arc::clone(&self.0))
     }
 
-    fn same_connection(&self, other: &Self) -> bool {
+    pub(super) fn same_connection(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    fn try_claim_outbound_queue(&self) -> Option<Arc<LegOutboundQueueLease>> {
+        let claimed = self
+            .0
+            .outbound_queue_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if !claimed {
+            return None;
+        }
+        let lease = Arc::new(LegOutboundQueueLease);
+        self.0
+            .outbound_queue_lease
+            .set(Arc::downgrade(&lease))
+            .ok()
+            .map(|()| lease)
+    }
+
+    fn outbound_queue_was_lost(&self) -> bool {
+        self.0.outbound_queue_claimed.load(Ordering::Acquire)
+            && self
+                .0
+                .outbound_queue_lease
+                .get()
+                .is_some_and(|lease| lease.upgrade().is_none())
     }
 }
 
@@ -45,6 +89,7 @@ impl LegSeal {
 /// transport-authenticated.
 pub(crate) struct EstablishedLeg {
     seal: LegSeal,
+    endpoint: Arc<LegTransportEndpoint>,
     binding: AttachTransportBinding,
 }
 
@@ -52,6 +97,7 @@ impl EstablishedLeg {
     pub(super) fn for_authenticated_transport(binding: AttachTransportBinding) -> Self {
         Self {
             seal: LegSeal::fresh(),
+            endpoint: Arc::new(LegTransportEndpoint),
             binding,
         }
     }
@@ -69,6 +115,32 @@ impl EstablishedLeg {
             seal: self.seal.share(),
             frame,
         }
+    }
+
+    /// Atomically mints the sole outbound queue authority for this live
+    /// transport endpoint. The claim remains consumed after queue drop so an
+    /// ordered stream cannot be silently replaced by another FIFO.
+    pub(super) fn try_claim_outbound_queue(
+        &self,
+    ) -> Option<(
+        LegSeal,
+        Weak<LegTransportEndpoint>,
+        Arc<LegOutboundQueueLease>,
+    )> {
+        self.seal
+            .try_claim_outbound_queue()
+            .map(|lease| (self.seal.share(), Arc::downgrade(&self.endpoint), lease))
+    }
+
+    pub(super) fn belongs_to_transport(&self, seal: &LegSeal) -> bool {
+        self.seal.same_connection(seal)
+    }
+
+    /// Non-owning liveness witness for the exact authenticated endpoint. This
+    /// lets an installed attach distinguish "queue not minted yet" from "the
+    /// endpoint was destroyed before its sole queue could be minted."
+    pub(super) fn endpoint_liveness(&self) -> Weak<LegTransportEndpoint> {
+        Arc::downgrade(&self.endpoint)
     }
 
     /// Authenticates and commits the initial owner ATTACH on this exact
@@ -369,6 +441,39 @@ impl AttachedLeg {
 
     pub(crate) fn transport_binding(&self) -> AttachTransportBinding {
         self.committed.transport_binding()
+    }
+
+    pub(super) fn belongs_to_transport(&self, seal: &LegSeal) -> bool {
+        self.seal.same_connection(seal)
+    }
+
+    #[cfg(test)]
+    pub(super) fn try_claim_unbound_test_queue(
+        &self,
+    ) -> Option<(LegSeal, Arc<LegOutboundQueueLease>)> {
+        self.seal
+            .try_claim_outbound_queue()
+            .map(|lease| (self.seal.share(), lease))
+    }
+
+    pub(super) fn outbound_queue_was_lost(&self) -> bool {
+        self.seal.outbound_queue_was_lost()
+    }
+
+    pub(super) fn matches_attach_acceptance(&self, frame: &Frame) -> bool {
+        frame.leg_generation() == self.committed.generation()
+            && matches!(
+                frame.record(),
+                Record::AttachAccepted {
+                    session_id,
+                    nonce,
+                    selected_version,
+                    features,
+                } if *session_id == self.committed.session_id()
+                    && *nonce == self.committed.nonce()
+                    && *selected_version == self.committed.session_protocol_version()
+                    && features.bits() == self.committed.negotiated_features()
+            )
     }
 
     /// Seeds the client reducer while retaining this exact live-leg seal.

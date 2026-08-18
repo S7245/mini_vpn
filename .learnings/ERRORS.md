@@ -1,5 +1,30 @@
 # Errors
 
+## 2026-08-18 - The first acceptance receipt did not prove an ordered leg boundary
+
+- The first local implementation bound recovery only to a weak queue identity.
+  The queue was not tied to the exact `LegSeal`, a second queue could be minted
+  for the same leg, and dropping the endpoint left the receipt apparently live.
+- It also treated queue admission as transport ordering. A held control-lane
+  `ATTACH_ACCEPTED` could be overtaken by a later data-lane replay, and the raw
+  sender remained callable outside the queue.
+- It also released the bare `AttachedLeg` before replay admission and returned
+  raw recovery `Transmit(Frame)` values. A caller could therefore enqueue the
+  acceptance on one queue and replay on another.
+- Deeper review found two related bypasses: ordinary executor work could run
+  after generation install but before acceptance, and same-numbered resume
+  tokens from different executors were interchangeable. A final RED found the
+  pre-queue window: if the exact endpoint died before the sole queue was ever
+  claimed, no existing abandon capability could release the committed barrier.
+- The corrected design uses a sole/live acceptance-first FIFO, an
+  executor-local seal, a full attach barrier, queue-owned delivery completion,
+  and non-cloneable drain/resume cursors. Queue or endpoint loss has an exact
+  authenticated recovery transition rather than rolling generation back or
+  leaving the executor permanently blocked.
+
+All findings were local RED/review failures. No TUN, VPS, WAN traffic, user
+data, or throughput acceptance was involved.
+
 ## 2026-08-18 - The first standby-control RED duplicated and narrowed authority
 
 - The initial local protocol draft represented standby/probe nonces as `u64`,
