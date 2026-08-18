@@ -15,7 +15,7 @@ use thiserror::Error;
 
 use crate::owned_upstream::leg::{
     AttachedLeg, BoundInbound, EstablishedLeg, LegBoundFrame, LegOutboundQueueLease, LegSeal,
-    LegTransportEndpoint,
+    LegTransportEndpoint, LegTransportReporter,
 };
 use crate::owned_upstream::two_leg::{
     EncodedDelivery, FaultAction, LegId, SimTime, TwoLegWire, WireCapacity, WireCounters,
@@ -678,6 +678,7 @@ impl LegOutboundQueue {
     /// ordered submission is actually delivered.
     pub(crate) fn finish_attach_recovery(&mut self, acceptance: &AttachAcceptanceEnqueued) -> bool {
         if self.session_phase != LegOutboundSessionPhase::AttachRecovery
+            || !acceptance.queue_is_live()
             || !acceptance.belongs_to_queue(self)
         {
             return false;
@@ -744,9 +745,11 @@ impl LegOutboundQueue {
     }
 
     fn endpoint_is_lost(&self) -> bool {
-        self.endpoint
-            .as_ref()
-            .is_some_and(|endpoint| endpoint.upgrade().is_none())
+        self.endpoint.as_ref().is_some_and(|endpoint| {
+            endpoint
+                .upgrade()
+                .is_none_or(|endpoint| !endpoint.is_open())
+        })
     }
 }
 
@@ -766,10 +769,11 @@ pub(crate) struct AttachAcceptanceEnqueued {
 impl AttachAcceptanceEnqueued {
     pub(crate) fn queue_is_live(&self) -> bool {
         self.queue.upgrade().is_some()
-            && self
-                .endpoint
-                .as_ref()
-                .is_none_or(|endpoint| endpoint.upgrade().is_some())
+            && self.endpoint.as_ref().is_none_or(|endpoint| {
+                endpoint
+                    .upgrade()
+                    .is_some_and(|endpoint| endpoint.is_open())
+            })
     }
 
     pub(crate) fn belongs_to_queue(&self, queue: &LegOutboundQueue) -> bool {
@@ -804,10 +808,11 @@ pub(super) struct LegControlEnqueued {
 impl LegControlEnqueued {
     pub(super) fn queue_is_live(&self) -> bool {
         self.queue.upgrade().is_some()
-            && self
-                .endpoint
-                .as_ref()
-                .is_none_or(|endpoint| endpoint.upgrade().is_some())
+            && self.endpoint.as_ref().is_none_or(|endpoint| {
+                endpoint
+                    .upgrade()
+                    .is_some_and(|endpoint| endpoint.is_open())
+            })
     }
 
     pub(super) fn belongs_to_queue(&self, queue: &LegOutboundQueue) -> bool {
@@ -1311,19 +1316,57 @@ pub(crate) enum EncodedLegTransportError {
 }
 
 impl LegIo {
+    fn authenticated_transport_parts(
+        leg_id: LegId,
+        role: LegEndpointRole,
+        binding: AttachTransportBinding,
+        limits: LegIoLimits,
+    ) -> (Self, LegTransportReporter) {
+        let (established, reporter) =
+            EstablishedLeg::for_authenticated_transport_with_reporter(binding);
+        (
+            Self {
+                leg_id,
+                role,
+                established,
+                limits,
+                counters: LegIoCounters::default(),
+            },
+            reporter,
+        )
+    }
+
+    /// Production construction always transfers the sole terminal reporter
+    /// to the concrete authenticated transport actor.
+    #[cfg(not(test))]
+    pub(crate) fn for_authenticated_transport(
+        leg_id: LegId,
+        role: LegEndpointRole,
+        binding: AttachTransportBinding,
+        limits: LegIoLimits,
+    ) -> (Self, LegTransportReporter) {
+        Self::authenticated_transport_parts(leg_id, role, binding, limits)
+    }
+
+    /// Legacy deterministic harness construction cannot exist in production.
+    #[cfg(test)]
     pub(crate) fn for_authenticated_transport(
         leg_id: LegId,
         role: LegEndpointRole,
         binding: AttachTransportBinding,
         limits: LegIoLimits,
     ) -> Self {
-        Self {
-            leg_id,
-            role,
-            established: EstablishedLeg::for_authenticated_transport(binding),
-            limits,
-            counters: LegIoCounters::default(),
-        }
+        Self::authenticated_transport_parts(leg_id, role, binding, limits).0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_authenticated_transport_with_reporter(
+        leg_id: LegId,
+        role: LegEndpointRole,
+        binding: AttachTransportBinding,
+        limits: LegIoLimits,
+    ) -> (Self, LegTransportReporter) {
+        Self::authenticated_transport_parts(leg_id, role, binding, limits)
     }
 
     pub(crate) const fn outbound_route(&self) -> WireRoute {
@@ -1622,7 +1665,10 @@ const fn lane_for_record(record: &Record) -> WireLane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::owned_upstream::leg::{AttachResponse, LegProvenanceError};
+    use crate::owned_upstream::leg::{
+        AttachResponse, CaughtUpAttachedLeg, CaughtUpLegTerminalMismatch, ExactLegTerminal,
+        LegProvenanceError, LegTransportReporter, LegTransportTerminalReason, PendingLegLoss,
+    };
     use crate::owned_upstream::supervisor::SessionSupervisor;
     use crate::owned_upstream::two_leg::{WireBounds, WireCapacity, WireCapacitySpec};
     use crate::resumable::{
@@ -1743,6 +1789,177 @@ mod tests {
         .unwrap()
     }
 
+    fn attached_and_acceptance_for(endpoint: &LegIo) -> (AttachedLeg, Frame) {
+        let request = request();
+        let transport = binding();
+        let proof = credentials().prove(&request, &transport).unwrap();
+        let authenticated = endpoint
+            .established_leg()
+            .authenticate_initial_owner_attach(
+                endpoint
+                    .established_leg()
+                    .bind_received_frame(request.to_attach_frame(proof)),
+                &authority(),
+            )
+            .unwrap();
+        let (_, attached, acceptance) = authenticated.into_owner_parts(session_config());
+        (attached, acceptance)
+    }
+
+    fn attached_for(endpoint: &LegIo) -> AttachedLeg {
+        attached_and_acceptance_for(endpoint).0
+    }
+
+    struct RetryablePressureTransport;
+
+    impl EncodedLegTransport for RetryablePressureTransport {
+        fn send_encoded(
+            &mut self,
+            _now: SimTime,
+            _route: WireRoute,
+            _lane: WireLane,
+            _bytes: Vec<u8>,
+        ) -> Result<(), EncodedLegTransportError> {
+            Err(EncodedLegTransportError::Wire(
+                WireError::LiveMessageCapacityExceeded,
+            ))
+        }
+    }
+
+    #[test]
+    fn exact_transport_terminal_immediately_closes_a_live_queue_without_dropping_leg_io() {
+        let (endpoint, reporter) = LegIo::for_authenticated_transport_with_reporter(
+            LegId::A,
+            LegEndpointRole::Client,
+            binding(),
+            limits(),
+        );
+        let mut queue = LegOutboundQueue::for_leg(endpoint.established_leg(), 1, 1_024).unwrap();
+
+        assert!(!queue.endpoint_is_lost());
+        assert_eq!(format!("{reporter:?}"), "LegTransportReporter([REDACTED])");
+        let terminal = reporter.report(LegTransportTerminalReason::PeerClosed);
+
+        assert!(queue.endpoint_is_lost());
+        let error = queue.push(data_frame(0, b"must-stay-owned")).unwrap_err();
+        assert_eq!(error.kind(), &LegOutboundQueueErrorKind::EndpointLost);
+        assert_eq!(terminal.reason(), LegTransportTerminalReason::PeerClosed);
+        assert_eq!(format!("{terminal:?}"), "ExactLegTerminal([REDACTED])");
+        assert_eq!(endpoint.counters(), LegIoCounters::default());
+    }
+
+    #[test]
+    fn attached_leg_consumes_only_its_exact_terminal_and_wrong_leg_returns_both() {
+        let (endpoint_a, reporter_a) = LegIo::for_authenticated_transport_with_reporter(
+            LegId::A,
+            LegEndpointRole::Client,
+            binding(),
+            limits(),
+        );
+        let (endpoint_b, reporter_b) = LegIo::for_authenticated_transport_with_reporter(
+            LegId::B,
+            LegEndpointRole::Client,
+            binding(),
+            limits(),
+        );
+        let attached_a = attached_for(&endpoint_a);
+        let attached_b = attached_for(&endpoint_b);
+        let terminal_b = reporter_b.report(LegTransportTerminalReason::Reset);
+
+        let mismatch = attached_a.bind_terminal(terminal_b).unwrap_err();
+        assert_eq!(format!("{mismatch:?}"), "LegTerminalMismatch([REDACTED])");
+        let (attached_a, terminal_b) = mismatch.into_parts();
+
+        let pending_b = attached_b.bind_terminal(terminal_b).unwrap();
+        assert_eq!(pending_b.reason(), LegTransportTerminalReason::Reset);
+        assert!(matches!(
+            pending_b.into_event(),
+            crate::resumable::SessionEvent::LegLost { leg }
+                if leg.generation() == LegGeneration::new(2).unwrap()
+        ));
+
+        let pending_a = attached_a
+            .bind_terminal(reporter_a.report(LegTransportTerminalReason::FatalIo))
+            .unwrap();
+        assert_eq!(format!("{pending_a:?}"), "PendingLegLoss([REDACTED])");
+        assert!(matches!(
+            pending_a.into_event(),
+            crate::resumable::SessionEvent::LegLost { leg }
+                if leg.generation() == LegGeneration::new(2).unwrap()
+        ));
+    }
+
+    #[test]
+    fn retryable_transport_pressure_cannot_transition_or_mint_terminal_state() {
+        let (mut endpoint, reporter) = LegIo::for_authenticated_transport_with_reporter(
+            LegId::A,
+            LegEndpointRole::Client,
+            binding(),
+            limits(),
+        );
+        let mut queue = LegOutboundQueue::for_leg(endpoint.established_leg(), 1, 1_024).unwrap();
+        queue.push(data_frame(0, b"retry-exactly")).unwrap();
+
+        assert_eq!(
+            queue.try_flush(
+                &mut endpoint,
+                &mut RetryablePressureTransport,
+                SimTime::ZERO,
+            ),
+            Err(LegIoError::Transport(EncodedLegTransportError::Wire(
+                WireError::LiveMessageCapacityExceeded,
+            )))
+        );
+        assert!(!queue.endpoint_is_lost());
+        assert_eq!(queue.len(), 1);
+
+        let _terminal = reporter.report(LegTransportTerminalReason::PeerClosed);
+        assert!(queue.endpoint_is_lost());
+    }
+
+    #[test]
+    fn consuming_pending_leg_loss_releases_the_last_endpoint_owner() {
+        let (endpoint, reporter) = LegIo::for_authenticated_transport_with_reporter(
+            LegId::A,
+            LegEndpointRole::Client,
+            binding(),
+            limits(),
+        );
+        let endpoint_liveness = endpoint.established_leg().endpoint_liveness();
+        let attached = attached_for(&endpoint);
+        let pending = attached
+            .bind_terminal(reporter.report(LegTransportTerminalReason::PeerClosed))
+            .unwrap();
+
+        drop(endpoint);
+        assert!(endpoint_liveness.upgrade().is_some());
+        let event = pending.into_event();
+        assert!(matches!(
+            event,
+            crate::resumable::SessionEvent::LegLost { .. }
+        ));
+        assert!(endpoint_liveness.upgrade().is_none());
+    }
+
+    #[test]
+    fn terminal_acceptance_receipt_cannot_finish_recovery_on_its_live_queue() {
+        let (endpoint, reporter) = LegIo::for_authenticated_transport_with_reporter(
+            LegId::A,
+            LegEndpointRole::Owner,
+            binding(),
+            limits(),
+        );
+        let (attached, acceptance) = attached_and_acceptance_for(&endpoint);
+        let mut queue = LegOutboundQueue::for_leg(endpoint.established_leg(), 1, 1_024).unwrap();
+        let receipt = queue.push_attach_acceptance(&attached, acceptance).unwrap();
+        assert!(receipt.queue_is_live());
+
+        let _terminal = reporter.report(LegTransportTerminalReason::Reset);
+
+        assert!(!receipt.queue_is_live());
+        assert!(!queue.finish_attach_recovery(&receipt));
+    }
+
     fn standby_accepted_control(generation: LegGeneration) -> LegControlFrame {
         let features = FeatureSet::STANDBY_CONTROL_V1;
         LegControlFrame::try_new(
@@ -1806,7 +2023,7 @@ mod tests {
             panic!("correlated response changed response kind");
         };
         let client_bootstrap =
-            SessionSupervisor::bootstrap_client(session_config(), client_attached);
+            SessionSupervisor::bootstrap_client(session_config(), client_attached).unwrap();
         let (client_supervisor, client_attached) = client_bootstrap.into_parts();
         assert_eq!(client_supervisor.snapshot().session.generation().get(), 2);
         assert_eq!(client_attached.generation().get(), 2);
@@ -2685,6 +2902,11 @@ mod tests {
         let _ = <OrderedSessionDeliveryToken as AmbiguousIfClone<_>>::marker;
         let _ = <OrderedLegControlDeliveryToken as AmbiguousIfClone<_>>::marker;
         let _ = <OrderedDeliveryToken as AmbiguousIfClone<_>>::marker;
+        let _ = <LegTransportReporter as AmbiguousIfClone<_>>::marker;
+        let _ = <ExactLegTerminal as AmbiguousIfClone<_>>::marker;
+        let _ = <PendingLegLoss as AmbiguousIfClone<_>>::marker;
+        let _ = <CaughtUpAttachedLeg as AmbiguousIfClone<_>>::marker;
+        let _ = <CaughtUpLegTerminalMismatch as AmbiguousIfClone<_>>::marker;
     };
 
     #[test]

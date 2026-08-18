@@ -1,5 +1,30 @@
 # Learnings
 
+## 2026-08-18 - Transport termination is an exact monotonic fact
+
+- A live `Weak`/`Arc` allocation proves only that an actor lease still exists;
+  it does not prove the transport remains open. Queue admission, receipts,
+  standby registration, and typed abandon must all consult the same monotonic
+  endpoint state set by the sole transport reporter.
+- The transport actor owns one non-cloneable reporter. Its consuming terminal
+  fact is bound to the exact process-local leg seal and may be converted into
+  `LegLost` only by consuming the installed authority for that same leg.
+- Every type that can become the current data-plane leg needs the same terminal
+  contract. Ordinary accepted, initial-bootstrap, replacement, and
+  status-derived catch-up legs must all carry exact endpoint liveness, reject
+  installation after terminal, and consume an exact terminal once after
+  installation.
+- Semantic equality is not process-local authority. A stored active-leg
+  contract must include the exact seal as well as generation, nonce, and TLS
+  binding; otherwise a different leg with identical wire facts can authorize
+  standby registration.
+- Wrong-leg terminal binding must return both non-cloneable values intact;
+  transient pressure and would-block are never terminal authority.
+
+This closes a local C1 prerequisite only. It does not yet implement the
+production switch controller, real transport adapter, blackout recovery, or a
+throughput claim.
+
 ## 2026-08-18 - A standby is an exact-leg typestate, not an authenticated frame
 
 - The standby HMAC proves an exact installed session contract and candidate

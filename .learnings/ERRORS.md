@@ -1,5 +1,31 @@
 # Errors
 
+## 2026-08-18 - The first terminal review equated allocation with liveness
+
+- The initial exact-terminal slice correctly added a sole consuming transport
+  reporter, but the pre-enqueue attach-abandon path still checked only whether
+  its endpoint `Weak` could upgrade. After terminal was reported, the reporter
+  lease kept the allocation alive, so the committed attach barrier could not
+  be abandoned even though every queue operation already failed closed.
+- The same review considered only ordinary `AttachedLeg`. The independent
+  status-catch-up path installs `CaughtUpAttachedLeg` as the current authority,
+  but that type initially had no endpoint liveness or exact terminal bind. A
+  dead catch-up leg could therefore be installed or remain active forever.
+- A later delta review found the symmetric gap in the ordinary client path:
+  `PendingAttach`/`AttachedLeg` did not carry endpoint liveness, so both initial
+  bootstrap and replacement install could still accept an already-terminal
+  transport. It also found that owner standby authentication compared only
+  generation, nonce, and binding, allowing a same-contract different-seal leg
+  to stand in for the current process-local authority.
+- The correction uses one terminal-aware endpoint predicate across every
+  attach path, returns exact attached ownership on failed client bootstrap,
+  carries the follow-up endpoint through catch-up validation, and binds the
+  owner active contract to its exact seal. Terminal-before-install is inert;
+  terminal-after-install consumes one exact authority into one `LegLost`.
+
+Both failures were deterministic local RED/review findings. No TUN, VPS, WAN
+traffic, user data, or throughput acceptance was involved.
+
 ## 2026-08-18 - The first standby queue integration ordered session frames only
 
 - The first L implementation correctly put leg-control and session records in

@@ -15,6 +15,12 @@ use std::fmt;
 use std::sync::Weak;
 use thiserror::Error;
 
+fn endpoint_is_open(endpoint: &Weak<LegTransportEndpoint>) -> bool {
+    endpoint
+        .upgrade()
+        .is_some_and(|endpoint| endpoint.is_open())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct StandbyContract {
     session_id: SessionId,
@@ -130,7 +136,7 @@ impl PendingStandbyRegistration {
             return Err(StandbyRegistrationError::Rejected);
         }
         let endpoint = candidate.endpoint_liveness();
-        if endpoint.upgrade().is_none() {
+        if !endpoint_is_open(&endpoint) {
             return Err(StandbyRegistrationError::EndpointLost);
         }
         let request = active
@@ -159,7 +165,7 @@ impl PendingStandbyRegistration {
         mut self,
         queue: &mut LegOutboundQueue,
     ) -> Result<AwaitingStandbyAccepted, StandbyEnqueueFailure> {
-        if self.endpoint.upgrade().is_none() {
+        if !endpoint_is_open(&self.endpoint) {
             return Err(StandbyEnqueueFailure::new(
                 self,
                 LegControlQueueErrorKind::EndpointLost,
@@ -396,7 +402,7 @@ impl ExactAuthenticatedStandby {
         if !candidate_seal.same_connection(&received_seal)
             || active.belongs_to_transport(&candidate_seal)
             || active.transport_binding() == binding
-            || endpoint.upgrade().is_none()
+            || !endpoint_is_open(&endpoint)
             || candidate_seal.outbound_queue_was_lost()
         {
             return Err(StandbyRegistrationReject::Rejected);
@@ -432,7 +438,7 @@ struct OwnerRegisteredStandby {
 
 impl OwnerRegisteredStandby {
     fn is_live(&self) -> bool {
-        self.candidate.endpoint.upgrade().is_some() && self.receipt.queue_is_live()
+        endpoint_is_open(&self.candidate.endpoint) && self.receipt.queue_is_live()
     }
 }
 
@@ -473,7 +479,7 @@ impl OwnerStandbySlot {
             Some(registered) if registered.candidate.same_registration(&candidate) => true,
             Some(_) => return Err(OwnerStandbyAdmissionFailure::rejected()),
         };
-        if candidate.endpoint.upgrade().is_none() {
+        if !endpoint_is_open(&candidate.endpoint) {
             return Err(OwnerStandbyAdmissionFailure::retry(
                 candidate,
                 LegControlQueueErrorKind::EndpointLost,
@@ -579,7 +585,9 @@ impl fmt::Debug for RetiredOwnerStandby {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::owned_upstream::leg::{AttachResponse, EstablishedLeg, OwnerAttachTransaction};
+    use crate::owned_upstream::leg::{
+        AttachResponse, EstablishedLeg, LegTransportTerminalReason, OwnerAttachTransaction,
+    };
     use crate::owned_upstream::leg_io::{
         LegEndpointRole, LegIo, LegIoLimits, LegOutboundQueue, MemoryFaultScript,
         MemoryLegTransport,
@@ -703,6 +711,127 @@ mod tests {
     fn release(transport: &mut MemoryLegTransport) {
         while transport.advance_one_due(SimTime::ZERO).unwrap() {}
         transport.advance_idle_to(SimTime::ZERO).unwrap();
+    }
+
+    #[test]
+    fn terminal_candidate_cannot_begin_registration_while_leg_io_is_still_owned() {
+        let (_authority, _model, client_active, _owner_active) = active_pair();
+        let (candidate, reporter) = LegIo::for_authenticated_transport_with_reporter(
+            LegId::B,
+            LegEndpointRole::Client,
+            binding(0x99),
+            limits(),
+        );
+        let _terminal = reporter.report(LegTransportTerminalReason::PeerClosed);
+
+        assert_eq!(
+            PendingStandbyRegistration::begin(
+                &client_active,
+                candidate.established_leg(),
+                StandbyNonce::new([0x33; 16]).unwrap(),
+                &credentials(),
+            )
+            .unwrap_err(),
+            StandbyRegistrationError::EndpointLost
+        );
+        assert_eq!(candidate.counters(), Default::default());
+    }
+
+    #[test]
+    fn owner_authentication_rejects_terminal_candidate_with_live_leg_io() {
+        let (authority, _model, client_active, owner_active) = active_pair();
+        let client_b = LegIo::for_authenticated_transport(
+            LegId::B,
+            LegEndpointRole::Client,
+            binding(0x99),
+            limits(),
+        );
+        let (owner_b, reporter) = LegIo::for_authenticated_transport_with_reporter(
+            LegId::B,
+            LegEndpointRole::Owner,
+            binding(0x99),
+            limits(),
+        );
+        let pending = PendingStandbyRegistration::begin(
+            &client_active,
+            client_b.established_leg(),
+            StandbyNonce::new([0x34; 16]).unwrap(),
+            &credentials(),
+        )
+        .unwrap();
+        let inbound = BoundInbound::LegControl(
+            owner_b
+                .established_leg()
+                .bind_received_control_frame(pending.frame),
+        );
+        let _terminal = reporter.report(LegTransportTerminalReason::Reset);
+
+        assert_eq!(
+            ExactAuthenticatedStandby::authenticate(
+                &owner_active,
+                owner_b.established_leg(),
+                inbound,
+                &authority,
+            )
+            .unwrap_err(),
+            StandbyRegistrationReject::Rejected
+        );
+    }
+
+    #[test]
+    fn terminal_report_immediately_retires_both_registered_standby_receipts() {
+        let (authority, _model, client_active, owner_active) = active_pair();
+        let (mut client_b, client_reporter) = LegIo::for_authenticated_transport_with_reporter(
+            LegId::B,
+            LegEndpointRole::Client,
+            binding(0x99),
+            limits(),
+        );
+        let (mut owner_b, owner_reporter) = LegIo::for_authenticated_transport_with_reporter(
+            LegId::B,
+            LegEndpointRole::Owner,
+            binding(0x99),
+            limits(),
+        );
+        let mut client_queue =
+            LegOutboundQueue::for_leg(client_b.established_leg(), 2, 2_048).unwrap();
+        let mut owner_queue =
+            LegOutboundQueue::for_leg(owner_b.established_leg(), 2, 2_048).unwrap();
+        let mut transport = transport();
+        let (awaiting, candidate) = deliver_registration(
+            &client_active,
+            &owner_active,
+            &mut client_b,
+            &mut owner_b,
+            &mut client_queue,
+            &mut transport,
+            &authority,
+            0x35,
+        );
+        let mut slot = OwnerStandbySlot::new();
+        assert_eq!(
+            slot.admit(candidate, &mut owner_queue).unwrap(),
+            OwnerStandbyAdmission::Installed
+        );
+        let accepted = deliver_acceptance(
+            &mut owner_b,
+            &mut client_b,
+            &mut owner_queue,
+            &mut transport,
+        );
+        let registered = awaiting.validate(accepted).unwrap();
+        assert!(registered.is_live());
+        assert!(slot.registered_is_live());
+
+        let _client_terminal = client_reporter.report(LegTransportTerminalReason::PeerClosed);
+        let _owner_terminal = owner_reporter.report(LegTransportTerminalReason::FatalIo);
+
+        assert!(!registered.is_live());
+        assert!(registered.retire_lost().is_ok());
+        assert!(!slot.registered_is_live());
+        assert!(slot.retire_lost().is_some());
+        assert!(client_queue.is_empty());
+        assert!(owner_queue.is_empty());
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -39,7 +39,87 @@ pub(super) struct LegOutboundQueueLease;
 /// Liveness lease held only by the authenticated transport endpoint. Queue
 /// receipts retain a weak reference, so dropping `LegIo`/`EstablishedLeg`
 /// cannot leave apparently sendable recovery authority behind.
-pub(super) struct LegTransportEndpoint;
+pub(super) struct LegTransportEndpoint {
+    terminal: AtomicBool,
+}
+
+impl LegTransportEndpoint {
+    fn open() -> Self {
+        Self {
+            terminal: AtomicBool::new(false),
+        }
+    }
+
+    pub(super) fn is_open(&self) -> bool {
+        !self.terminal.load(Ordering::Acquire)
+    }
+}
+
+/// Observes the exact authenticated transport lease without extending it.
+/// Terminal state is authoritative even while the actor or a terminal token
+/// still retains the endpoint allocation.
+pub(super) fn transport_endpoint_is_open(endpoint: &Weak<LegTransportEndpoint>) -> bool {
+    endpoint
+        .upgrade()
+        .is_some_and(|endpoint| endpoint.is_open())
+}
+
+/// Closed set of terminal facts that the authenticated transport actor may
+/// report. Transient pressure and retryable I/O deliberately have no variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LegTransportTerminalReason {
+    PeerClosed,
+    Reset,
+    FatalIo,
+}
+
+/// Sole process-local authority for reporting one authenticated endpoint's
+/// terminal transition. The concrete transport actor owns this non-cloneable
+/// value; session/controller code receives only the resulting exact fact.
+pub(crate) struct LegTransportReporter {
+    seal: LegSeal,
+    endpoint: Arc<LegTransportEndpoint>,
+}
+
+impl LegTransportReporter {
+    pub(crate) fn report(self, reason: LegTransportTerminalReason) -> ExactLegTerminal {
+        let was_terminal = self.endpoint.terminal.swap(true, Ordering::AcqRel);
+        debug_assert!(
+            !was_terminal,
+            "the sole non-cloneable transport reporter cannot report twice"
+        );
+        ExactLegTerminal {
+            seal: self.seal,
+            endpoint: self.endpoint,
+            reason,
+        }
+    }
+}
+
+impl fmt::Debug for LegTransportReporter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LegTransportReporter([REDACTED])")
+    }
+}
+
+/// Exact, once-minted terminal fact for one authenticated endpoint.
+pub(crate) struct ExactLegTerminal {
+    seal: LegSeal,
+    endpoint: Arc<LegTransportEndpoint>,
+    reason: LegTransportTerminalReason,
+}
+
+impl ExactLegTerminal {
+    pub(crate) const fn reason(&self) -> LegTransportTerminalReason {
+        self.reason
+    }
+}
+
+impl fmt::Debug for ExactLegTerminal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ExactLegTerminal([REDACTED])")
+    }
+}
 
 impl LegSeal {
     fn fresh() -> Self {
@@ -96,17 +176,36 @@ pub(crate) struct EstablishedLeg {
 }
 
 impl EstablishedLeg {
+    pub(super) fn for_authenticated_transport_with_reporter(
+        binding: AttachTransportBinding,
+    ) -> (Self, LegTransportReporter) {
+        let seal = LegSeal::fresh();
+        let endpoint = Arc::new(LegTransportEndpoint::open());
+        let reporter = LegTransportReporter {
+            seal: seal.share(),
+            endpoint: Arc::clone(&endpoint),
+        };
+        (
+            Self {
+                seal,
+                endpoint,
+                binding,
+            },
+            reporter,
+        )
+    }
+
+    /// Legacy construction is confined to deterministic tests. Production
+    /// must retain the sole reporter returned by `LegIo` construction.
+    #[cfg(test)]
     pub(super) fn for_authenticated_transport(binding: AttachTransportBinding) -> Self {
-        Self {
-            seal: LegSeal::fresh(),
-            endpoint: Arc::new(LegTransportEndpoint),
-            binding,
-        }
+        Self::for_authenticated_transport_with_reporter(binding).0
     }
 
     pub(crate) fn begin_attach(&self, request: AttachRequest) -> PendingAttach {
         PendingAttach {
             seal: self.seal.share(),
+            endpoint: Arc::downgrade(&self.endpoint),
             binding: self.binding,
             request,
         }
@@ -184,7 +283,11 @@ impl EstablishedLeg {
             .verify_and_commit_frame(&frame, &self.binding)
             .map_err(LegProvenanceError::from)?;
         Ok(AuthenticatedInitialOwnerAttach {
-            attached: AttachedLeg { seal, committed },
+            attached: AttachedLeg {
+                seal,
+                endpoint: Arc::downgrade(&self.endpoint),
+                committed,
+            },
             acceptance: committed.attach_accepted_frame(),
         })
     }
@@ -212,7 +315,11 @@ impl EstablishedLeg {
             .map_err(LegProvenanceError::from)?
         {
             Ok(Ok((committed, recovery))) => Ok(Ok(OwnerAttachTransaction::Installed {
-                attached: AttachedLeg { seal, committed },
+                attached: AttachedLeg {
+                    seal,
+                    endpoint: Arc::downgrade(&self.endpoint),
+                    committed,
+                },
                 acceptance: committed.attach_accepted_frame(),
                 recovery,
             })),
@@ -263,6 +370,7 @@ impl fmt::Debug for EstablishedLeg {
 /// validation attempt consumes it, so a response cannot mint two capabilities.
 pub(crate) struct PendingAttach {
     seal: LegSeal,
+    endpoint: Weak<LegTransportEndpoint>,
     binding: AttachTransportBinding,
     request: AttachRequest,
 }
@@ -278,13 +386,20 @@ impl PendingAttach {
 
         let Self {
             seal,
+            endpoint,
             binding,
             request,
         } = self;
         match response.frame.record() {
             Record::AttachAccepted { .. } => request
                 .validate_accepted_frame(&binding, &response.frame)
-                .map(|committed| AttachResponse::Accepted(AttachedLeg { seal, committed }))
+                .map(|committed| {
+                    AttachResponse::Accepted(AttachedLeg {
+                        seal,
+                        endpoint,
+                        committed,
+                    })
+                })
                 .map_err(LegProvenanceError::from),
             Record::AttachGenerationStatus { .. } => request
                 .validate_generation_status_frame(&binding, &response.frame)
@@ -364,6 +479,7 @@ impl LegGenerationStatus {
         Ok(PendingCatchUpAttach {
             _status_seal: self.seal,
             follow_up_seal: follow_up_leg.seal.share(),
+            follow_up_endpoint: follow_up_leg.endpoint_liveness(),
             follow_up_binding: follow_up_leg.binding,
             pending,
         })
@@ -380,6 +496,7 @@ impl fmt::Debug for LegGenerationStatus {
 pub(crate) struct PendingCatchUpAttach {
     _status_seal: LegSeal,
     follow_up_seal: LegSeal,
+    follow_up_endpoint: Weak<LegTransportEndpoint>,
     follow_up_binding: AttachTransportBinding,
     pending: PendingGenerationCatchUp,
 }
@@ -408,6 +525,7 @@ impl PendingCatchUpAttach {
             .validate_accepted_frame(&self.follow_up_binding, &response.frame)?;
         Ok(CaughtUpAttachedLeg {
             seal: self.follow_up_seal,
+            endpoint: self.follow_up_endpoint,
             catch_up,
         })
     }
@@ -423,12 +541,39 @@ impl fmt::Debug for PendingCatchUpAttach {
 /// transport connection.
 pub(crate) struct CaughtUpAttachedLeg {
     seal: LegSeal,
+    endpoint: Weak<LegTransportEndpoint>,
     catch_up: GenerationCatchUp,
 }
 
 impl CaughtUpAttachedLeg {
     pub(crate) fn generation(&self) -> LegGeneration {
         self.catch_up.accepted_leg().generation()
+    }
+
+    pub(super) fn transport_is_open(&self) -> bool {
+        transport_endpoint_is_open(&self.endpoint)
+    }
+
+    /// Consumes a status-derived installed leg only for the terminal fact
+    /// minted by its exact follow-up transport.
+    #[allow(
+        clippy::result_large_err,
+        reason = "a mismatch must return both exact non-cloneable capabilities"
+    )]
+    pub(crate) fn bind_terminal(
+        self,
+        terminal: ExactLegTerminal,
+    ) -> Result<PendingLegLoss, CaughtUpLegTerminalMismatch> {
+        if !self.seal.same_connection(&terminal.seal) || terminal.endpoint.is_open() {
+            return Err(CaughtUpLegTerminalMismatch {
+                caught_up: self,
+                terminal,
+            });
+        }
+        Ok(PendingLegLoss {
+            leg: self.catch_up.accepted_leg(),
+            terminal,
+        })
     }
 
     pub(crate) fn replacement_caught_up_event(&self) -> SessionEvent {
@@ -460,6 +605,25 @@ impl fmt::Debug for CaughtUpAttachedLeg {
     }
 }
 
+/// Ownership-preserving rejection for a status-derived leg paired with a
+/// terminal fact from another authenticated connection.
+pub(crate) struct CaughtUpLegTerminalMismatch {
+    caught_up: CaughtUpAttachedLeg,
+    terminal: ExactLegTerminal,
+}
+
+impl CaughtUpLegTerminalMismatch {
+    pub(crate) fn into_parts(self) -> (CaughtUpAttachedLeg, ExactLegTerminal) {
+        (self.caught_up, self.terminal)
+    }
+}
+
+impl fmt::Debug for CaughtUpLegTerminalMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CaughtUpLegTerminalMismatch([REDACTED])")
+    }
+}
+
 /// Successfully attached, connection-bound data-plane authority.
 ///
 /// The authenticated [`CommittedLeg`] deliberately remains private inside
@@ -468,6 +632,7 @@ impl fmt::Debug for CaughtUpAttachedLeg {
 /// connection seal that authenticated the ATTACH response.
 pub(crate) struct AttachedLeg {
     seal: LegSeal,
+    endpoint: Weak<LegTransportEndpoint>,
     committed: CommittedLeg,
 }
 
@@ -482,6 +647,10 @@ impl AttachedLeg {
 
     pub(crate) fn transport_binding(&self) -> AttachTransportBinding {
         self.committed.transport_binding()
+    }
+
+    pub(super) fn transport_is_open(&self) -> bool {
+        transport_endpoint_is_open(&self.endpoint)
     }
 
     pub(super) fn standby_registration_request(
@@ -502,6 +671,12 @@ impl AttachedLeg {
 
     pub(super) fn belongs_to_transport(&self, seal: &LegSeal) -> bool {
         self.seal.same_connection(seal)
+    }
+
+    /// Shares only the process-local seal needed by the supervisor's active
+    /// owner barrier; it exposes no committed reducer capability.
+    pub(super) fn active_transport_seal(&self) -> LegSeal {
+        self.seal.share()
     }
 
     #[cfg(test)]
@@ -545,10 +720,26 @@ impl AttachedLeg {
         }
     }
 
-    pub(crate) fn leg_lost_event(&self) -> SessionEvent {
-        SessionEvent::LegLost {
-            leg: self.committed,
+    /// Consumes the installed leg only when the sole transport reporter
+    /// supplied a terminal fact for this exact process-local connection.
+    #[allow(
+        clippy::result_large_err,
+        reason = "a mismatch must return both exact non-cloneable capabilities"
+    )]
+    pub(crate) fn bind_terminal(
+        self,
+        terminal: ExactLegTerminal,
+    ) -> Result<PendingLegLoss, LegTerminalMismatch> {
+        if !self.seal.same_connection(&terminal.seal) || terminal.endpoint.is_open() {
+            return Err(LegTerminalMismatch {
+                attached: self,
+                terminal,
+            });
         }
+        Ok(PendingLegLoss {
+            leg: self.committed,
+            terminal,
+        })
     }
 
     pub(crate) fn resume_grace_expired_event(&self) -> SessionEvent {
@@ -587,6 +778,49 @@ impl fmt::Debug for AttachedLeg {
     }
 }
 
+/// Exact installed-leg loss awaiting its single reducer transition.
+pub(crate) struct PendingLegLoss {
+    leg: CommittedLeg,
+    terminal: ExactLegTerminal,
+}
+
+impl PendingLegLoss {
+    pub(crate) const fn reason(&self) -> LegTransportTerminalReason {
+        self.terminal.reason()
+    }
+
+    pub(crate) fn into_event(self) -> SessionEvent {
+        let Self { leg, terminal } = self;
+        debug_assert!(!terminal.endpoint.is_open());
+        SessionEvent::LegLost { leg }
+    }
+}
+
+impl fmt::Debug for PendingLegLoss {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PendingLegLoss([REDACTED])")
+    }
+}
+
+/// Exact ownership-preserving rejection for a terminal fact from another
+/// authenticated connection.
+pub(crate) struct LegTerminalMismatch {
+    attached: AttachedLeg,
+    terminal: ExactLegTerminal,
+}
+
+impl LegTerminalMismatch {
+    pub(crate) fn into_parts(self) -> (AttachedLeg, ExactLegTerminal) {
+        (self.attached, self.terminal)
+    }
+}
+
+impl fmt::Debug for LegTerminalMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LegTerminalMismatch([REDACTED])")
+    }
+}
+
 impl fmt::Debug for LegBoundFrame {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("LegBoundFrame([REDACTED])")
@@ -617,6 +851,10 @@ pub(crate) enum AttachResponse {
 ///
 /// Only a committed result carries data-plane authority.  A resynchronization
 /// result contains solely its correlated status frame.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "exact non-cloneable attach ownership stays inline without adding allocation to the successful control path"
+)]
 pub(crate) enum OwnerAttachTransaction {
     Installed {
         attached: AttachedLeg,

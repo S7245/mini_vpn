@@ -17,9 +17,13 @@ use crate::resumable::{
     SessionEffect, SessionEvent, SessionFlowId, SinkOffer, TcpDataSegment, TerminalGrace,
 };
 
-use super::leg::{AttachedLeg, EstablishedLeg, LegBoundFrame, LegTransportEndpoint};
+use super::leg::{
+    AttachedLeg, BoundInbound, EstablishedLeg, LegBoundFrame, LegTransportEndpoint,
+    transport_endpoint_is_open,
+};
 use super::leg_io::{AttachAcceptanceEnqueued, LegOutboundQueue, LegOutboundQueueErrorKind};
 use super::session::SessionOwnerCommand;
+use super::standby::ExactAuthenticatedStandby;
 use super::supervisor::{
     OwnerAttachPublication, ReducerAdmissionBlock, SessionSupervisor, SessionSupervisorError,
     SessionSupervisorSnapshot, TcpPortFactoryMintError,
@@ -839,6 +843,27 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         self.execute_effects(effects)
     }
 
+    /// Delegates one exact standby registration to the supervisor-owned
+    /// authority only after all input and attach-ordering barriers are clear.
+    /// A transient executor block returns the original classified wire fact
+    /// intact so the controller can retry it without decoding or rebinding.
+    pub(crate) fn authenticate_owner_standby(
+        &self,
+        active: &AttachedLeg,
+        candidate: &EstablishedLeg,
+        inbound: BoundInbound,
+    ) -> Result<ExactAuthenticatedStandby, OwnerTargetError> {
+        if let Some(block) = self.input_admission_block(None) {
+            return Err(OwnerTargetError::RejectedOwnerStandbyAuthentication {
+                block,
+                inbound: Box::new(inbound),
+            });
+        }
+        self.supervisor
+            .authenticate_owner_standby(active, candidate, inbound)
+            .map_err(OwnerTargetError::Supervisor)
+    }
+
     /// Authenticates and installs one exact owner attach without publishing
     /// recovery before its acceptance. The installed result keeps acceptance,
     /// attached-leg authority, and recovery indivisible until the acceptance
@@ -1033,11 +1058,11 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         )
     }
 
-    /// Abandons an installed attach only after its exact endpoint was destroyed
-    /// before queue mint, or its exact sole queue was claimed and then lost
-    /// before acceptance admission. The committed generation remains installed;
-    /// clearing this publication barrier only reopens authenticated status and
-    /// catch-up handling.
+    /// Abandons an installed attach only after its exact endpoint became
+    /// terminal or was destroyed before queue mint, or its exact sole queue
+    /// was claimed and then lost before acceptance admission. The committed
+    /// generation remains installed; clearing this publication barrier only
+    /// reopens authenticated status and catch-up handling.
     pub(crate) fn abandon_lost_pending_attach(
         &mut self,
         pending: PendingOwnerTargetAttachPublication,
@@ -1048,7 +1073,7 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
                 pending: Box::new(pending),
             });
         }
-        let exact_endpoint_lost = pending.endpoint.upgrade().is_none();
+        let exact_endpoint_lost = !transport_endpoint_is_open(&pending.endpoint);
         let exact_queue_lost = pending.attached.outbound_queue_was_lost();
         if !exact_endpoint_lost && !exact_queue_lost {
             return Err(OwnerTargetError::RejectedPendingAttachAbandon {
@@ -2739,6 +2764,11 @@ pub(crate) enum OwnerTargetError {
         block: OwnerTargetInputBlock,
         received: Box<LegBoundFrame>,
     },
+    #[error("owner Target rejected exact standby authentication before consuming it: {block:?}")]
+    RejectedOwnerStandbyAuthentication {
+        block: OwnerTargetInputBlock,
+        inbound: Box<BoundInbound>,
+    },
     #[error("owner Target rejected pending attach abandonment before consuming it: {block:?}")]
     RejectedPendingAttachAbandon {
         block: OwnerTargetInputBlock,
@@ -2862,26 +2892,31 @@ const fn open_failure_result(failure: TargetOpenFailure) -> OpenResultCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::owned_upstream::leg::{BoundInbound, LegTransportTerminalReason};
     use crate::owned_upstream::leg_io::{
         EncodedLegTransport, EncodedLegTransportError, LegEndpointRole, LegIo, LegIoConfigError,
         LegIoLimits, OrderedDeliveryToken,
     };
+    use crate::owned_upstream::standby::{ExactAuthenticatedStandby, OwnerStandbySlot};
     use crate::owned_upstream::target::{
         MemoryTarget, MemoryTargetConfig, MemoryWriteDirective, TargetExpireCompletion,
         TargetFailure, TargetOpenFailure, TargetReadCompletion, TargetReadFeedCompletion,
         TargetReadiness,
     };
-    use crate::owned_upstream::two_leg::{LegId, SimTime, WireLane, WireRoute};
+    use crate::owned_upstream::two_leg::{EncodedDelivery, LegId, SimTime, WireLane, WireRoute};
     use crate::resumable::{
         AttachAlpn, AttachAuthority, AttachCredentials, AttachNonce, AttachPolicy, AttachRequest,
         AttachTransportBinding, ByteOffset, DevicePrincipal, DeviceSecret, Direction, FeatureOffer,
-        LegGeneration, OwnerIdentity, ReceiveBudgetLimits, Record, ReplayBudgetLimits, ResetReason,
-        ResumeSecret, SESSION_PROTOCOL_VERSION, SessionConfig, SessionId, SessionModel,
-        SessionRole, TcpWindowLimits, TlsExporterBinding, VersionRange,
+        FeatureSet, LegGeneration, OwnerIdentity, ReceiveBudgetLimits, Record, ReplayBudgetLimits,
+        ResetReason, ResumeSecret, SESSION_PROTOCOL_VERSION, STANDBY_CONTROL_V1, SessionConfig,
+        SessionId, SessionModel, SessionRole, StandbyNonce, TcpWindowLimits, TlsExporterBinding,
+        VersionRange,
     };
     use crate::shared::TargetAddr;
     use bytes::Bytes;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+    const STANDBY_FEATURES: u64 = STANDBY_CONTROL_V1.bits() | 0b0111;
 
     #[derive(Default)]
     struct CapturingTransport {
@@ -2928,6 +2963,95 @@ mod tests {
             AttachAlpn::new(b"mini-vpn-owned/1").unwrap(),
             TlsExporterBinding::new([exporter; 32]).unwrap(),
             DevicePrincipal::new([0x53; 16]).unwrap(),
+        )
+    }
+
+    fn standby_authority(current_generation: u64) -> AttachAuthority {
+        AttachAuthority::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(current_generation).unwrap(),
+            credentials(),
+            AttachPolicy::new(
+                OwnerIdentity::new([0x31; 32]).unwrap(),
+                AttachAlpn::new(b"mini-vpn-owned/1").unwrap(),
+                DevicePrincipal::new([0x53; 16]).unwrap(),
+                SESSION_PROTOCOL_VERSION,
+                STANDBY_FEATURES,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn standby_attach_request(generation: u64, nonce: u8) -> AttachRequest {
+        AttachRequest::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(generation).unwrap(),
+            AttachNonce::new([nonce; 16]).unwrap(),
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(STANDBY_FEATURES, STANDBY_CONTROL_V1.bits()).unwrap(),
+        )
+    }
+
+    fn bootstrap_standby_executor() -> (OwnerTargetExecutor<MemoryTarget>, AttachedLeg) {
+        let transport = binding(0x42);
+        let owner_leg = EstablishedLeg::for_authenticated_transport(transport);
+        let request = standby_attach_request(2, 0x22);
+        let proof = credentials().prove(&request, &transport).unwrap();
+        let mut pending = SessionSupervisor::prepare_owner(session_config(), standby_authority(1));
+        let (supervisor, active, _acceptance) = pending
+            .accept(
+                &owner_leg,
+                owner_leg.bind_received_frame(request.to_attach_frame(proof)),
+            )
+            .unwrap()
+            .into_parts();
+        let executor = OwnerTargetExecutor::new(
+            OwnerTargetConfig::new(128, 1_024, 64).unwrap(),
+            supervisor,
+            MemoryTarget::new(MemoryTargetConfig::new(4, 256, 512, 128, 128, 16).unwrap()),
+            source_config(),
+        )
+        .unwrap();
+        (executor, active)
+    }
+
+    fn classified_standby_inbound(
+        active: &AttachedLeg,
+        candidate: &mut LegIo,
+        nonce: u8,
+    ) -> BoundInbound {
+        let request = active
+            .standby_registration_request(StandbyNonce::new([nonce; 16]).unwrap())
+            .unwrap();
+        let proof = credentials()
+            .prove_standby_registration(
+                &request,
+                &candidate.established_leg().standby_transport_binding(),
+            )
+            .unwrap();
+        let frame = request.to_frame(proof).unwrap();
+        let delivery = EncodedDelivery::from_memory_ingress(
+            candidate.inbound_route(),
+            WireLane::Control,
+            frame
+                .encode(FeatureSet::new(STANDBY_FEATURES))
+                .unwrap()
+                .to_vec(),
+            1,
+            0,
+        )
+        .unwrap();
+        candidate
+            .receive_classified_delivery(delivery, FeatureSet::new(STANDBY_FEATURES))
+            .unwrap()
+    }
+
+    fn owner_standby_leg(exporter: u8) -> LegIo {
+        LegIo::for_authenticated_transport(
+            LegId::B,
+            LegEndpointRole::Owner,
+            binding(exporter),
+            LegIoLimits::new(4_096, 8, 32_768, 8, 32_768).unwrap(),
         )
     }
 
@@ -3111,6 +3235,76 @@ mod tests {
                 available: 128,
             })
         ));
+    }
+
+    #[test]
+    fn owner_target_delegates_private_standby_auth_and_returns_exact_inbound_at_attach_barrier() {
+        let (mut executor, active) = bootstrap_standby_executor();
+        let mut candidate_b = owner_standby_leg(0x91);
+        let inbound_b = classified_standby_inbound(&active, &mut candidate_b, 0x31);
+        let before = executor.snapshot();
+        let slot = OwnerStandbySlot::new();
+
+        let authenticated: ExactAuthenticatedStandby = executor
+            .authenticate_owner_standby(&active, candidate_b.established_leg(), inbound_b)
+            .unwrap();
+        assert_eq!(
+            format!("{authenticated:?}"),
+            "ExactAuthenticatedStandby([REDACTED])"
+        );
+        assert_eq!(executor.snapshot(), before);
+        assert!(!slot.registered_is_live());
+        drop(authenticated);
+
+        let replacement_binding = binding(0x92);
+        let replacement = EstablishedLeg::for_authenticated_transport(replacement_binding);
+        let request = standby_attach_request(3, 0x23);
+        let proof = credentials().prove(&request, &replacement_binding).unwrap();
+        let OwnerTargetAttachPublication::Installed { pending } = executor
+            .accept_owner_attach(
+                &replacement,
+                replacement.bind_received_frame(request.to_attach_frame(proof)),
+            )
+            .unwrap()
+        else {
+            panic!("exact-next attach unexpectedly returned status");
+        };
+        let mut candidate_c = owner_standby_leg(0x93);
+        let inbound_c = classified_standby_inbound(&pending.attached, &mut candidate_c, 0x32);
+        let barrier_before = executor.snapshot();
+        let inbound_c = match executor.authenticate_owner_standby(
+            &pending.attached,
+            candidate_c.established_leg(),
+            inbound_c,
+        ) {
+            Err(OwnerTargetError::RejectedOwnerStandbyAuthentication {
+                block: OwnerTargetInputBlock::AttachBarrierPending,
+                inbound,
+            }) => inbound,
+            other => panic!("attach barrier must return exact classified B input, got {other:?}"),
+        };
+        assert_eq!(executor.snapshot(), barrier_before);
+        assert!(!slot.registered_is_live());
+
+        let mut queue = LegOutboundQueue::for_leg(&replacement, 8, 32_768).unwrap();
+        let recovery = pending.enqueue_acceptance(&mut queue).unwrap();
+        let outputs = executor
+            .execute_attached_recovery(recovery, &mut queue)
+            .unwrap();
+        let current_active = outputs
+            .into_iter()
+            .find_map(|output| match output {
+                OwnerTargetRecoveryOutput::RecoveryCompleted { attached } => Some(attached),
+                _ => None,
+            })
+            .expect("bounded initial recovery must return the current active leg");
+
+        let after_barrier = executor.snapshot();
+        let _: ExactAuthenticatedStandby = executor
+            .authenticate_owner_standby(&current_active, candidate_c.established_leg(), *inbound_c)
+            .unwrap();
+        assert_eq!(executor.snapshot(), after_barrier);
+        assert!(!slot.registered_is_live());
     }
 
     fn peer_frame<T: TargetIo>(
@@ -3556,7 +3750,8 @@ mod tests {
         .unwrap();
 
         let transport_binding = binding(0x43);
-        let established = EstablishedLeg::for_authenticated_transport(transport_binding);
+        let (established, reporter) =
+            EstablishedLeg::for_authenticated_transport_with_reporter(transport_binding);
         let request = AttachRequest::new(
             SessionId::new([0x11; 16]).unwrap(),
             LegGeneration::new(3).unwrap(),
@@ -3593,17 +3788,20 @@ mod tests {
         };
         assert_eq!(wrong_executor.target().snapshot().open_attempts, 0);
 
-        drop(established);
+        let endpoint_liveness = established.endpoint_liveness();
+        let terminal = reporter.report(LegTransportTerminalReason::FatalIo);
+        assert!(endpoint_liveness.upgrade().is_some());
         let recovery = match executor.execute_attached_recovery(enqueued, &mut queue) {
             Err(OwnerTargetError::RejectedAttachedRecovery {
                 block: OwnerTargetInputBlock::AcceptanceQueueLost,
                 recovery,
             }) => recovery,
-            other => panic!("destroyed endpoint must retain recovery, got {other:?}"),
+            other => panic!("terminal endpoint must retain recovery, got {other:?}"),
         };
         assert!(format!("{recovery:?}").contains("queue_live: false"));
-        drop(queue);
         executor.abandon_lost_attached_recovery(*recovery).unwrap();
+        assert!(!executor.attach_barrier_pending);
+        drop((queue, established, terminal));
 
         let status_binding = binding(0x44);
         let status_leg = EstablishedLeg::for_authenticated_transport(status_binding);
@@ -3852,6 +4050,107 @@ mod tests {
             panic!("authenticated high-water successor must install")
         };
         assert_eq!(executor.snapshot().session.session.generation().get(), 4);
+    }
+
+    #[test]
+    fn terminal_report_before_queue_claim_can_directly_abandon_then_status_and_advance() {
+        let mut executor = attach_executor();
+        let transport_binding = binding(0x76);
+        let (endpoint, reporter) = LegIo::for_authenticated_transport_with_reporter(
+            LegId::A,
+            LegEndpointRole::Owner,
+            transport_binding,
+            LegIoLimits::new(4_096, 8, 32_768, 8, 32_768).unwrap(),
+        );
+        let request = AttachRequest::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(3).unwrap(),
+            AttachNonce::new([0x76; 16]).unwrap(),
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(0b111, 0b001).unwrap(),
+        );
+        let proof = credentials().prove(&request, &transport_binding).unwrap();
+        let OwnerTargetAttachPublication::Installed { pending } = executor
+            .accept_owner_attach(
+                endpoint.established_leg(),
+                endpoint
+                    .established_leg()
+                    .bind_received_frame(request.to_attach_frame(proof)),
+            )
+            .unwrap()
+        else {
+            panic!("exact-next attach unexpectedly requested resynchronization")
+        };
+
+        let pending = match executor.abandon_lost_pending_attach(pending) {
+            Err(OwnerTargetError::RejectedPendingAttachAbandon {
+                block: OwnerTargetInputBlock::AcceptanceQueueStillLive,
+                pending,
+            }) => *pending,
+            other => panic!("live unclaimed endpoint must retain publication, got {other:?}"),
+        };
+
+        let terminal = reporter.report(LegTransportTerminalReason::PeerClosed);
+        assert_eq!(terminal.reason(), LegTransportTerminalReason::PeerClosed);
+        executor.abandon_lost_pending_attach(pending).unwrap();
+        assert_eq!(executor.snapshot().session.session.generation().get(), 3);
+        assert!(!executor.attach_barrier_pending);
+
+        let status_binding = binding(0x77);
+        let status_leg = EstablishedLeg::for_authenticated_transport(status_binding);
+        let status_request = AttachRequest::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(3).unwrap(),
+            AttachNonce::new([0x77; 16]).unwrap(),
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(0b111, 0b001).unwrap(),
+        );
+        let status_proof = credentials()
+            .prove(&status_request, &status_binding)
+            .unwrap();
+        let OwnerTargetAttachPublication::Resynchronize { status } = executor
+            .accept_owner_attach(
+                &status_leg,
+                status_leg.bind_received_frame(status_request.to_attach_frame(status_proof)),
+            )
+            .unwrap()
+        else {
+            panic!("same-generation retry must return authenticated status")
+        };
+        assert!(
+            matches!(
+                status.record(),
+                Record::AttachGenerationStatus {
+                    requested_generation,
+                    ..
+                } if requested_generation.get() == 3
+            ) && status.leg_generation().get() == 3
+        );
+
+        let next_binding = binding(0x78);
+        let next_leg = EstablishedLeg::for_authenticated_transport(next_binding);
+        let next_request = AttachRequest::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(4).unwrap(),
+            AttachNonce::new([0x78; 16]).unwrap(),
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(0b111, 0b001).unwrap(),
+        );
+        let next_proof = credentials().prove(&next_request, &next_binding).unwrap();
+        let OwnerTargetAttachPublication::Installed { .. } = executor
+            .accept_owner_attach(
+                &next_leg,
+                next_leg.bind_received_frame(next_request.to_attach_frame(next_proof)),
+            )
+            .unwrap()
+        else {
+            panic!("authenticated high-water successor must install")
+        };
+        assert_eq!(executor.snapshot().session.session.generation().get(), 4);
+
+        // Keep both strong endpoint owners alive through direct abandonment;
+        // terminal state, not Arc destruction, is the authoritative loss fact.
+        drop((endpoint, terminal));
     }
 
     #[test]

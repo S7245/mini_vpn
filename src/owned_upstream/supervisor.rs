@@ -13,15 +13,17 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::resumable::{
-    AttachAuthority, ByteOffset, Direction, Frame, SessionConfig, SessionEffect, SessionError,
-    SessionEvent, SessionFlowId, SessionModel, SessionPhase, SessionRole, SessionSnapshot,
+    AttachAuthority, AttachNonce, AttachTransportBinding, ByteOffset, Direction, Frame,
+    LegGeneration, SessionConfig, SessionEffect, SessionError, SessionEvent, SessionFlowId,
+    SessionModel, SessionPhase, SessionRole, SessionSnapshot,
 };
 
 use super::leg::{
-    AttachedLeg, CaughtUpAttachedLeg, EstablishedLeg, LegBoundFrame, LegProvenanceError,
-    OwnerAttachTransaction,
+    AttachedLeg, BoundInbound, CaughtUpAttachedLeg, EstablishedLeg, LegBoundFrame,
+    LegProvenanceError, LegSeal, OwnerAttachTransaction,
 };
 use super::session::SessionOwnerCommand;
+use super::standby::ExactAuthenticatedStandby;
 use super::tcp::{
     DriverInput, FlowPortConfig, FlowPortConfigError, FlowPortError, ResumableTcpPortFactory,
     UplinkOwnership, UplinkReplayOwnership,
@@ -78,6 +80,31 @@ pub(crate) struct SessionSupervisorSnapshot {
 enum QuarantinedUplinkOwnership {
     Staging(UplinkOwnership),
     Replay(UplinkReplayOwnership),
+}
+
+struct OwnerActiveContract {
+    seal: LegSeal,
+    generation: LegGeneration,
+    nonce: AttachNonce,
+    binding: AttachTransportBinding,
+}
+
+impl OwnerActiveContract {
+    fn from_attached(active: &AttachedLeg) -> Self {
+        Self {
+            seal: active.active_transport_seal(),
+            generation: active.generation(),
+            nonce: active.nonce(),
+            binding: active.transport_binding(),
+        }
+    }
+
+    fn matches(&self, active: &AttachedLeg) -> bool {
+        active.belongs_to_transport(&self.seal)
+            && self.generation == active.generation()
+            && self.nonce == active.nonce()
+            && self.binding == active.transport_binding()
+    }
 }
 
 impl QuarantinedUplinkOwnership {
@@ -165,6 +192,7 @@ impl ReducerAdmissionBlock {
 pub(crate) struct SessionSupervisor {
     model: SessionModel,
     attach_authority: Option<AttachAuthority>,
+    owner_active_contract: Option<OwnerActiveContract>,
     tcp_factory_origin: Option<TcpFactoryOrigin>,
     uplink_replay: BTreeMap<ReplayExtentKey, UplinkReplayOwnership>,
     poisoned: bool,
@@ -180,6 +208,7 @@ impl SessionSupervisor {
         Self {
             model,
             attach_authority: None,
+            owner_active_contract: None,
             tcp_factory_origin: None,
             uplink_replay: BTreeMap::new(),
             poisoned: false,
@@ -201,22 +230,30 @@ impl SessionSupervisor {
 
     /// Constructs the initial client model from one exact, correlated
     /// ATTACH_ACCEPTED capability while retaining its live transport seal.
+    #[allow(
+        clippy::result_large_err,
+        reason = "terminal rejection returns exact non-cloneable AttachedLeg ownership without adding allocation to the successful bootstrap path"
+    )]
     pub(crate) fn bootstrap_client(
         config: SessionConfig,
         attached: AttachedLeg,
-    ) -> ClientSessionBootstrap {
+    ) -> Result<ClientSessionBootstrap, ClientBootstrapError> {
+        if !attached.transport_is_open() {
+            return Err(ClientBootstrapError::endpoint_lost(attached));
+        }
         let model = attached.initial_client_model(config);
-        ClientSessionBootstrap {
+        Ok(ClientSessionBootstrap {
             supervisor: Self {
                 model,
                 attach_authority: None,
+                owner_active_contract: None,
                 tcp_factory_origin: None,
                 uplink_replay: BTreeMap::new(),
                 poisoned: false,
                 quarantined_uplink: Vec::new(),
             },
             attached,
-        }
+        })
     }
 
     /// Isolated constructor-validation seam. Production owner sessions are
@@ -248,6 +285,9 @@ impl SessionSupervisor {
         Ok(Self {
             model,
             attach_authority: Some(attach_authority),
+            // This test-only bare-model seam has no exact process-local
+            // AttachedLeg seal and therefore cannot authorize standby.
+            owner_active_contract: None,
             tcp_factory_origin: None,
             uplink_replay: BTreeMap::new(),
             poisoned: false,
@@ -423,6 +463,49 @@ impl SessionSupervisor {
         self.consume_after_model_commit(effects)
     }
 
+    /// Authenticates one exact classified standby registration while keeping
+    /// the owner's attach authority private to this supervisor.
+    ///
+    /// This step is deliberately read-only: it neither installs the standby
+    /// slot nor authorizes an ATTACH. Every wire/authentication mismatch has
+    /// one public rejection shape, while an ownership-poisoned supervisor and
+    /// an internal authority/model generation split remain fail-closed
+    /// invariants.
+    pub(crate) fn authenticate_owner_standby(
+        &self,
+        active: &AttachedLeg,
+        candidate: &EstablishedLeg,
+        inbound: BoundInbound,
+    ) -> Result<ExactAuthenticatedStandby, SessionSupervisorError> {
+        self.require_healthy()?;
+        let snapshot = self.model.snapshot();
+        let Some(authority) = self.attach_authority.as_ref() else {
+            return Err(SessionSupervisorError::OwnerStandbyAuthenticationRejected);
+        };
+        if self.model.role() != SessionRole::Owner || snapshot.phase() != SessionPhase::Active {
+            return Err(SessionSupervisorError::OwnerStandbyAuthenticationRejected);
+        }
+        let model_generation = snapshot.generation().get();
+        let authority_generation = authority.current_generation();
+        if model_generation != authority_generation {
+            return Err(SessionSupervisorError::AuthorityModelGenerationMismatch {
+                model: model_generation,
+                authority: authority_generation,
+            });
+        }
+        let active_matches = self
+            .owner_active_contract
+            .as_ref()
+            .is_some_and(|installed| {
+                installed.generation.get() == model_generation && installed.matches(active)
+            });
+        if !active_matches {
+            return Err(SessionSupervisorError::OwnerStandbyAuthenticationRejected);
+        }
+        ExactAuthenticatedStandby::authenticate(active, candidate, inbound, authority)
+            .map_err(|_| SessionSupervisorError::OwnerStandbyAuthenticationRejected)
+    }
+
     /// Serializes owner authentication commit, reducer installation, and
     /// response publication ownership in one non-awaiting turn.
     ///
@@ -458,6 +541,7 @@ impl SessionSupervisor {
                 recovery,
             } => {
                 let recovery = self.consume_after_model_commit(recovery)?;
+                self.owner_active_contract = Some(OwnerActiveContract::from_attached(&attached));
                 Ok(OwnerAttachPublication::Installed {
                     attached,
                     acceptance,
@@ -477,6 +561,9 @@ impl SessionSupervisor {
         &mut self,
         leg: &CaughtUpAttachedLeg,
     ) -> Result<Vec<SessionEffect>, SessionSupervisorError> {
+        if !leg.transport_is_open() {
+            return Err(SessionSupervisorError::ReplacementEndpointLost);
+        }
         self.install_client_replacement(leg.replacement_caught_up_event())
     }
 
@@ -486,6 +573,9 @@ impl SessionSupervisor {
         &mut self,
         leg: &AttachedLeg,
     ) -> Result<Vec<SessionEffect>, SessionSupervisorError> {
+        if !leg.transport_is_open() {
+            return Err(SessionSupervisorError::ReplacementEndpointLost);
+        }
         self.install_client_replacement(leg.replacement_attached_event())
     }
 
@@ -698,9 +788,11 @@ impl PendingOwnerBootstrap {
             }
         };
         let (model, attached, acceptance) = authenticated.into_owner_parts(self.config);
+        let owner_active_contract = OwnerActiveContract::from_attached(&attached);
         let supervisor = SessionSupervisor {
             model,
             attach_authority: Some(authority),
+            owner_active_contract: Some(owner_active_contract),
             tcp_factory_origin: None,
             uplink_replay: BTreeMap::new(),
             poisoned: false,
@@ -752,6 +844,43 @@ pub(crate) struct ClientSessionBootstrap {
     attached: AttachedLeg,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClientBootstrapErrorKind {
+    EndpointLost,
+}
+
+/// Typed bootstrap rejection that returns the exact non-cloneable accepted
+/// leg so the outer transport actor can pair it with its terminal fact.
+#[derive(Error)]
+#[error("client bootstrap rejected a terminal transport endpoint")]
+pub(crate) struct ClientBootstrapError {
+    kind: ClientBootstrapErrorKind,
+    attached: AttachedLeg,
+}
+
+impl ClientBootstrapError {
+    fn endpoint_lost(attached: AttachedLeg) -> Self {
+        Self {
+            kind: ClientBootstrapErrorKind::EndpointLost,
+            attached,
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> ClientBootstrapErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn into_attached(self) -> AttachedLeg {
+        self.attached
+    }
+}
+
+impl fmt::Debug for ClientBootstrapError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ClientBootstrapError([REDACTED])")
+    }
+}
+
 impl ClientSessionBootstrap {
     pub(crate) fn into_parts(self) -> (SessionSupervisor, AttachedLeg) {
         (self.supervisor, self.attached)
@@ -772,6 +901,10 @@ impl fmt::Debug for ClientSessionBootstrap {
 /// For `Installed`, the model is already on the attached generation. Transport
 /// code must publish `acceptance` first, retain `attached` as the receive seal,
 /// and only then dispatch `recovery` on that same leg.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "exact non-cloneable publication ownership stays inline without adding allocation to the successful control path"
+)]
 pub(crate) enum OwnerAttachPublication {
     Installed {
         attached: AttachedLeg,
@@ -828,6 +961,8 @@ pub(crate) enum SessionSupervisorError {
     LegProvenance(#[from] LegProvenanceError),
     #[error("this session supervisor has no owner attach authority")]
     MissingAttachAuthority,
+    #[error("owner standby authentication rejected")]
+    OwnerStandbyAuthenticationRejected,
     #[error("initial owner bootstrap has already completed")]
     OwnerBootstrapCompleted,
     #[cfg(test)]
@@ -853,6 +988,8 @@ pub(crate) enum SessionSupervisorError {
     OwnerAttachTransactionRequired,
     #[error("replacement installation requires an exact attached-leg provenance capability")]
     ReplacementProvenanceRequired,
+    #[error("replacement installation rejected a terminal transport endpoint")]
+    ReplacementEndpointLost,
     #[error("LocalData did not emit its exact ReplayStored receipt")]
     MissingReplayStored,
     #[error("LocalData emitted more than one ReplayStored receipt")]
@@ -868,18 +1005,38 @@ pub(crate) enum SessionSupervisorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::owned_upstream::leg::AttachResponse;
+    use crate::owned_upstream::leg::{
+        AttachResponse, BoundInbound, LegTransportReporter, LegTransportTerminalReason,
+    };
+    use crate::owned_upstream::leg_io::{LegEndpointRole, LegIo, LegIoLimits};
+    use crate::owned_upstream::standby::{ExactAuthenticatedStandby, OwnerStandbySlot};
+    use crate::owned_upstream::two_leg::{EncodedDelivery, LegId, WireLane};
     use crate::owned_upstream::{FlowPortConfig, ResumableTcpPortFactory};
     use crate::resumable::{
         AttachAlpn, AttachCredentials, AttachNonce, AttachPolicy, AttachRequest,
-        AttachTransportBinding, DevicePrincipal, DeviceSecret, FeatureOffer, Frame, LegGeneration,
-        OpenResultCode, OwnerIdentity, ReceiveBudgetLimits, Record, ReplayBudgetLimits,
-        ResetReason, ResumeSecret, SESSION_PROTOCOL_VERSION, SessionConfig, SessionId, SessionRole,
-        TcpWindowLimits, TlsExporterBinding, VersionRange,
+        AttachTransportBinding, DevicePrincipal, DeviceSecret, FeatureOffer, FeatureSet, Frame,
+        LegGeneration, OpenResultCode, OwnerIdentity, ReceiveBudgetLimits, Record,
+        ReplayBudgetLimits, ResetReason, ResumeSecret, SESSION_PROTOCOL_VERSION,
+        STANDBY_CONTROL_V1, SessionConfig, SessionId, SessionRole, StandbyNonce, TcpWindowLimits,
+        TlsExporterBinding, VersionRange,
     };
     use crate::shared::TargetAddr;
     use bytes::Bytes;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+    const STANDBY_FEATURES: u64 = STANDBY_CONTROL_V1.bits() | 0b0111;
+
+    trait AmbiguousIfClone<Marker> {
+        fn marker() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+    impl<T: Clone> AmbiguousIfClone<u8> for T {}
+
+    #[test]
+    fn client_bootstrap_endpoint_loss_returns_a_nonclone_capability() {
+        let _ = <ClientBootstrapError as AmbiguousIfClone<_>>::marker;
+    }
 
     fn credentials() -> AttachCredentials {
         AttachCredentials::new(
@@ -978,6 +1135,22 @@ mod tests {
         )
     }
 
+    fn standby_authority(current_generation: u64) -> AttachAuthority {
+        AttachAuthority::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(current_generation).unwrap(),
+            credentials(),
+            AttachPolicy::new(
+                OwnerIdentity::new([0x31; 32]).unwrap(),
+                AttachAlpn::new(b"mini-vpn-owned/1").unwrap(),
+                DevicePrincipal::new([0x53; 16]).unwrap(),
+                SESSION_PROTOCOL_VERSION,
+                STANDBY_FEATURES,
+            )
+            .unwrap(),
+        )
+    }
+
     fn attach_request(generation: u64, nonce: u8) -> AttachRequest {
         AttachRequest::new(
             SessionId::new([0x11; 16]).unwrap(),
@@ -985,6 +1158,103 @@ mod tests {
             AttachNonce::new([nonce; 16]).unwrap(),
             VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
             FeatureOffer::new(0b111, 0b001).unwrap(),
+        )
+    }
+
+    fn standby_attach_request(generation: u64, nonce: u8) -> AttachRequest {
+        AttachRequest::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(generation).unwrap(),
+            AttachNonce::new([nonce; 16]).unwrap(),
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(STANDBY_FEATURES, STANDBY_CONTROL_V1.bits()).unwrap(),
+        )
+    }
+
+    fn bootstrap_owner_and_client() -> (
+        SessionSupervisor,
+        AttachedLeg,
+        SessionSupervisor,
+        AttachedLeg,
+    ) {
+        let (owner, owner_active, client, client_active, _reporter) =
+            bootstrap_owner_and_client_with_reporter();
+        (owner, owner_active, client, client_active)
+    }
+
+    fn bootstrap_owner_and_client_with_reporter() -> (
+        SessionSupervisor,
+        AttachedLeg,
+        SessionSupervisor,
+        AttachedLeg,
+        LegTransportReporter,
+    ) {
+        let transport = binding(0x42);
+        let client_leg = EstablishedLeg::for_authenticated_transport(transport);
+        let (owner_leg, reporter) =
+            EstablishedLeg::for_authenticated_transport_with_reporter(transport);
+        let request = standby_attach_request(2, 0x22);
+        let pending_client = client_leg.begin_attach(request);
+        let proof = credentials().prove(&request, &transport).unwrap();
+        let mut pending_owner =
+            SessionSupervisor::prepare_owner(session_config(), standby_authority(1));
+        let (owner, owner_active, acceptance) = pending_owner
+            .accept(
+                &owner_leg,
+                owner_leg.bind_received_frame(request.to_attach_frame(proof)),
+            )
+            .unwrap()
+            .into_parts();
+        let AttachResponse::Accepted(client_active) = pending_client
+            .validate_response(client_leg.bind_received_frame(acceptance))
+            .unwrap()
+        else {
+            panic!("initial owner bootstrap changed response kind");
+        };
+        let (client, client_active) =
+            SessionSupervisor::bootstrap_client(session_config(), client_active)
+                .unwrap()
+                .into_parts();
+        (owner, owner_active, client, client_active, reporter)
+    }
+
+    fn classified_standby_inbound(
+        active: &AttachedLeg,
+        candidate: &mut LegIo,
+        proof_binding: AttachTransportBinding,
+        signing_credentials: &AttachCredentials,
+        nonce: u8,
+    ) -> BoundInbound {
+        let request = active
+            .standby_registration_request(StandbyNonce::new([nonce; 16]).unwrap())
+            .unwrap();
+        let proof = signing_credentials
+            .prove_standby_registration(&request, &proof_binding)
+            .unwrap();
+        let frame = request.to_frame(proof).unwrap();
+        let bytes = frame
+            .encode(FeatureSet::new(STANDBY_FEATURES))
+            .unwrap()
+            .to_vec();
+        let delivery = EncodedDelivery::from_memory_ingress(
+            candidate.inbound_route(),
+            WireLane::Control,
+            bytes,
+            1,
+            0,
+        )
+        .unwrap();
+        candidate
+            .receive_classified_delivery(delivery, FeatureSet::new(STANDBY_FEATURES))
+            .unwrap()
+    }
+
+    fn standby_leg(exporter: u8) -> LegIo {
+        LegIo::for_authenticated_transport(
+            LegId::B,
+            LegEndpointRole::Owner,
+            binding(exporter),
+            LegIoLimits::new(4_096, 8, 32_768, 8, 32_768).unwrap(),
         )
     }
 
@@ -2157,6 +2427,74 @@ mod tests {
     }
 
     #[test]
+    fn terminal_normal_replacement_is_inert_before_client_install() {
+        let initial = committed_leg();
+        let model = SessionModel::new(SessionRole::Client, session_config(), initial);
+        let mut supervisor = SessionSupervisor::new(model);
+        let transport = binding(0x72);
+        let (established, reporter) =
+            EstablishedLeg::for_authenticated_transport_with_reporter(transport);
+        let request = attach_request(3, 0x72);
+        let pending = established.begin_attach(request);
+        let proof = credentials().prove(&request, &transport).unwrap();
+        let committed = authority(2)
+            .verify_and_commit(&request, &transport, &proof)
+            .unwrap();
+        let AttachResponse::Accepted(attached) = pending
+            .validate_response(established.bind_received_frame(committed.attach_accepted_frame()))
+            .unwrap()
+        else {
+            panic!("the exact correlated acceptance changed response kind");
+        };
+        let before = supervisor.snapshot();
+        let terminal = reporter.report(LegTransportTerminalReason::PeerClosed);
+
+        assert!(matches!(
+            supervisor.install_attached_leg(&attached),
+            Err(SessionSupervisorError::ReplacementEndpointLost)
+        ));
+        assert_eq!(supervisor.snapshot(), before);
+
+        // Both strong endpoint owners remain alive, so only the terminal bit
+        // can reject installation; allocation destruction is not this proof.
+        drop((attached, established, terminal));
+    }
+
+    #[test]
+    fn terminal_initial_client_leg_is_rejected_before_bootstrap() {
+        let transport = binding(0x73);
+        let (established, reporter) =
+            EstablishedLeg::for_authenticated_transport_with_reporter(transport);
+        let request = attach_request(2, 0x73);
+        let pending = established.begin_attach(request);
+        let proof = credentials().prove(&request, &transport).unwrap();
+        let committed = authority(1)
+            .verify_and_commit(&request, &transport, &proof)
+            .unwrap();
+        let AttachResponse::Accepted(attached) = pending
+            .validate_response(established.bind_received_frame(committed.attach_accepted_frame()))
+            .unwrap()
+        else {
+            panic!("the exact correlated acceptance changed response kind");
+        };
+        let terminal = reporter.report(LegTransportTerminalReason::Reset);
+
+        let error = match SessionSupervisor::bootstrap_client(session_config(), attached) {
+            Ok(_) => panic!("terminal initial leg incorrectly bootstrapped an active client"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ClientBootstrapErrorKind::EndpointLost);
+        assert_eq!(format!("{error:?}"), "ClientBootstrapError([REDACTED])");
+        let attached = error.into_attached();
+        let loss = attached.bind_terminal(terminal).unwrap();
+        assert_eq!(loss.reason(), LegTransportTerminalReason::Reset);
+
+        // The rejected bootstrap returns its exact non-cloneable capability,
+        // allowing the outer actor to bind and dispose the terminal pair.
+        drop((established, loss));
+    }
+
+    #[test]
     fn session_expiry_releases_every_adapter_owned_replay_extent() {
         let leg = committed_leg();
         let model = SessionModel::new(SessionRole::Client, session_config(), leg);
@@ -2212,6 +2550,332 @@ mod tests {
         supervisor.apply_command(command).unwrap();
         assert_eq!(probe.snapshot().uplink_owned_bytes(), 4);
         assert_eq!(supervisor.snapshot().uplink_replay_owned_bytes, 4);
+    }
+
+    #[test]
+    fn owner_bootstrap_privately_authenticates_exact_b_without_mutating_model_or_slot() {
+        let (owner, owner_active, _client, _client_active) = bootstrap_owner_and_client();
+        let mut candidate = standby_leg(0x99);
+        let inbound = classified_standby_inbound(
+            &owner_active,
+            &mut candidate,
+            binding(0x99),
+            &credentials(),
+            0x33,
+        );
+        let before = owner.snapshot();
+        let authority_generation = owner
+            .attach_authority
+            .as_ref()
+            .unwrap()
+            .current_generation();
+        let slot = OwnerStandbySlot::new();
+
+        let authenticated: ExactAuthenticatedStandby = owner
+            .authenticate_owner_standby(&owner_active, candidate.established_leg(), inbound)
+            .unwrap();
+
+        assert_eq!(
+            format!("{authenticated:?}"),
+            "ExactAuthenticatedStandby([REDACTED])"
+        );
+        assert_eq!(owner.snapshot(), before);
+        assert_eq!(
+            owner
+                .attach_authority
+                .as_ref()
+                .unwrap()
+                .current_generation(),
+            authority_generation
+        );
+        assert!(!slot.registered_is_live());
+    }
+
+    #[test]
+    fn same_semantic_different_seal_active_cannot_authenticate_owner_standby() {
+        let (owner, exact_active, _client, same_contract_wrong_seal) = bootstrap_owner_and_client();
+        assert_eq!(
+            exact_active.generation(),
+            same_contract_wrong_seal.generation()
+        );
+        assert_eq!(exact_active.nonce(), same_contract_wrong_seal.nonce());
+        assert_eq!(
+            exact_active.transport_binding(),
+            same_contract_wrong_seal.transport_binding()
+        );
+        let registration_nonce = StandbyNonce::new([0x39; 16]).unwrap();
+        assert_eq!(
+            exact_active.standby_registration_request(registration_nonce),
+            same_contract_wrong_seal.standby_registration_request(registration_nonce)
+        );
+        let wrong_seal = same_contract_wrong_seal.active_transport_seal();
+        assert!(!exact_active.belongs_to_transport(&wrong_seal));
+
+        let mut candidate = standby_leg(0x96);
+        let inbound = classified_standby_inbound(
+            &same_contract_wrong_seal,
+            &mut candidate,
+            binding(0x96),
+            &credentials(),
+            0x39,
+        );
+        let before = owner.snapshot();
+        let authority_generation = owner
+            .attach_authority
+            .as_ref()
+            .unwrap()
+            .current_generation();
+        let slot = OwnerStandbySlot::new();
+
+        assert!(matches!(
+            owner.authenticate_owner_standby(
+                &same_contract_wrong_seal,
+                candidate.established_leg(),
+                inbound,
+            ),
+            Err(SessionSupervisorError::OwnerStandbyAuthenticationRejected)
+        ));
+        assert_eq!(owner.snapshot(), before);
+        assert_eq!(
+            owner
+                .attach_authority
+                .as_ref()
+                .unwrap()
+                .current_generation(),
+            authority_generation
+        );
+        assert!(!slot.registered_is_live());
+
+        let exact_inbound = classified_standby_inbound(
+            &exact_active,
+            &mut candidate,
+            binding(0x96),
+            &credentials(),
+            0x3a,
+        );
+        let _: ExactAuthenticatedStandby = owner
+            .authenticate_owner_standby(&exact_active, candidate.established_leg(), exact_inbound)
+            .unwrap();
+        assert_eq!(owner.snapshot(), before);
+        assert!(!slot.registered_is_live());
+    }
+
+    #[test]
+    fn standby_authentication_failures_are_uniform_and_leave_owner_and_client_unchanged() {
+        let (mut owner, owner_active, client, client_active) = bootstrap_owner_and_client();
+        let owner_before = owner.snapshot();
+        let client_before = client.snapshot();
+        let authority_generation = owner
+            .attach_authority
+            .as_ref()
+            .unwrap()
+            .current_generation();
+        let slot = OwnerStandbySlot::new();
+
+        let mut client_candidate = standby_leg(0x91);
+        let client_inbound = classified_standby_inbound(
+            &client_active,
+            &mut client_candidate,
+            binding(0x91),
+            &credentials(),
+            0x31,
+        );
+        assert!(matches!(
+            client.authenticate_owner_standby(
+                &client_active,
+                client_candidate.established_leg(),
+                client_inbound,
+            ),
+            Err(SessionSupervisorError::OwnerStandbyAuthenticationRejected)
+        ));
+
+        let mut candidate = standby_leg(0x92);
+        let mut wrong_seal = standby_leg(0x93);
+        let wrong_seal_inbound = classified_standby_inbound(
+            &owner_active,
+            &mut wrong_seal,
+            binding(0x92),
+            &credentials(),
+            0x32,
+        );
+        assert!(matches!(
+            owner.authenticate_owner_standby(
+                &owner_active,
+                candidate.established_leg(),
+                wrong_seal_inbound,
+            ),
+            Err(SessionSupervisorError::OwnerStandbyAuthenticationRejected)
+        ));
+
+        let wrong_credentials = AttachCredentials::new(
+            DeviceSecret::new([0xba; 32]).unwrap(),
+            ResumeSecret::new([0xdb; 32]).unwrap(),
+        )
+        .unwrap();
+        let wrong_proof_inbound = classified_standby_inbound(
+            &owner_active,
+            &mut candidate,
+            binding(0x92),
+            &wrong_credentials,
+            0x34,
+        );
+        assert!(matches!(
+            owner.authenticate_owner_standby(
+                &owner_active,
+                candidate.established_leg(),
+                wrong_proof_inbound,
+            ),
+            Err(SessionSupervisorError::OwnerStandbyAuthenticationRejected)
+        ));
+
+        assert_eq!(owner.snapshot(), owner_before);
+        assert_eq!(client.snapshot(), client_before);
+        assert_eq!(
+            owner
+                .attach_authority
+                .as_ref()
+                .unwrap()
+                .current_generation(),
+            authority_generation
+        );
+        assert!(!slot.registered_is_live());
+
+        owner.poisoned = true;
+        let poisoned_before = owner.snapshot();
+        let mut poisoned_candidate = standby_leg(0x94);
+        let poisoned_inbound = classified_standby_inbound(
+            &owner_active,
+            &mut poisoned_candidate,
+            binding(0x94),
+            &credentials(),
+            0x35,
+        );
+        assert!(matches!(
+            owner.authenticate_owner_standby(
+                &owner_active,
+                poisoned_candidate.established_leg(),
+                poisoned_inbound,
+            ),
+            Err(SessionSupervisorError::PoisonedOwnershipInvariant)
+        ));
+        assert_eq!(owner.snapshot(), poisoned_before);
+    }
+
+    #[test]
+    fn terminally_legless_owner_rejects_same_contract_standby_authentication_without_mutation() {
+        let (mut owner, owner_active, _client, same_contract_active, reporter) =
+            bootstrap_owner_and_client_with_reporter();
+        let loss = owner_active
+            .bind_terminal(reporter.report(LegTransportTerminalReason::PeerClosed))
+            .unwrap();
+        owner.apply_event(loss.into_event()).unwrap();
+        assert_eq!(owner.snapshot().session.phase(), SessionPhase::Legless);
+
+        let mut candidate = standby_leg(0x95);
+        let inbound = classified_standby_inbound(
+            &same_contract_active,
+            &mut candidate,
+            binding(0x95),
+            &credentials(),
+            0x38,
+        );
+        let before = owner.snapshot();
+        let authority_generation = owner
+            .attach_authority
+            .as_ref()
+            .unwrap()
+            .current_generation();
+        let slot = OwnerStandbySlot::new();
+
+        assert!(matches!(
+            owner.authenticate_owner_standby(
+                &same_contract_active,
+                candidate.established_leg(),
+                inbound,
+            ),
+            Err(SessionSupervisorError::OwnerStandbyAuthenticationRejected)
+        ));
+        assert_eq!(owner.snapshot(), before);
+        assert_eq!(
+            owner
+                .attach_authority
+                .as_ref()
+                .unwrap()
+                .current_generation(),
+            authority_generation
+        );
+        assert!(!slot.registered_is_live());
+    }
+
+    #[test]
+    fn stale_active_standby_authentication_is_uniform_and_cannot_advance_authority() {
+        let (mut owner, stale_active, _client, _client_active) = bootstrap_owner_and_client();
+        let replacement_binding = binding(0x61);
+        let replacement = EstablishedLeg::for_authenticated_transport(replacement_binding);
+        let request = standby_attach_request(3, 0x23);
+        let proof = credentials().prove(&request, &replacement_binding).unwrap();
+        let OwnerAttachPublication::Installed {
+            attached: current_active,
+            ..
+        } = owner
+            .accept_owner_attach(
+                &replacement,
+                replacement.bind_received_frame(request.to_attach_frame(proof)),
+            )
+            .unwrap()
+        else {
+            panic!("exact-next replacement unexpectedly returned status");
+        };
+        let before = owner.snapshot();
+        let authority_generation = owner
+            .attach_authority
+            .as_ref()
+            .unwrap()
+            .current_generation();
+        let slot = OwnerStandbySlot::new();
+        let mut candidate = standby_leg(0x99);
+        let stale_inbound = classified_standby_inbound(
+            &stale_active,
+            &mut candidate,
+            binding(0x99),
+            &credentials(),
+            0x36,
+        );
+
+        assert!(matches!(
+            owner.authenticate_owner_standby(
+                &stale_active,
+                candidate.established_leg(),
+                stale_inbound,
+            ),
+            Err(SessionSupervisorError::OwnerStandbyAuthenticationRejected)
+        ));
+        assert_eq!(owner.snapshot(), before);
+        assert_eq!(
+            owner
+                .attach_authority
+                .as_ref()
+                .unwrap()
+                .current_generation(),
+            authority_generation
+        );
+        assert!(!slot.registered_is_live());
+
+        let current_inbound = classified_standby_inbound(
+            &current_active,
+            &mut candidate,
+            binding(0x99),
+            &credentials(),
+            0x37,
+        );
+        let _: ExactAuthenticatedStandby = owner
+            .authenticate_owner_standby(
+                &current_active,
+                candidate.established_leg(),
+                current_inbound,
+            )
+            .unwrap();
+        assert_eq!(owner.snapshot(), before);
     }
 
     #[test]
@@ -2379,6 +3043,149 @@ mod tests {
         ));
         assert_eq!(status.leg_generation().get(), 3);
         assert_eq!(supervisor.snapshot(), before);
+    }
+
+    fn caught_up_client_with_reporter() -> (
+        SessionSupervisor,
+        CaughtUpAttachedLeg,
+        LegIo,
+        LegTransportReporter,
+    ) {
+        let initial = committed_leg();
+        let mut client = SessionSupervisor::new(SessionModel::new(
+            SessionRole::Client,
+            session_config(),
+            initial,
+        ));
+        client
+            .apply_event(SessionEvent::LegLost { leg: initial })
+            .unwrap();
+        let mut owner = SessionSupervisor::new_owner(
+            SessionModel::new(SessionRole::Owner, session_config(), initial),
+            authority(2),
+        )
+        .unwrap();
+
+        let lost_binding = binding(0x71);
+        let lost_leg = EstablishedLeg::for_authenticated_transport(lost_binding);
+        let lost_request = attach_request(3, 0x71);
+        let lost_proof = credentials().prove(&lost_request, &lost_binding).unwrap();
+        let OwnerAttachPublication::Installed { .. } = owner
+            .accept_owner_attach(
+                &lost_leg,
+                lost_leg.bind_received_frame(lost_request.to_attach_frame(lost_proof)),
+            )
+            .unwrap()
+        else {
+            panic!("generation 3 setup attach did not commit")
+        };
+
+        let status_binding = binding(0x72);
+        let status_leg = EstablishedLeg::for_authenticated_transport(status_binding);
+        let retry = attach_request(3, 0x72);
+        let retry_pending = status_leg.begin_attach(retry);
+        let retry_proof = credentials().prove(&retry, &status_binding).unwrap();
+        let OwnerAttachPublication::Resynchronize { status } = owner
+            .accept_owner_attach(
+                &status_leg,
+                status_leg.bind_received_frame(retry.to_attach_frame(retry_proof)),
+            )
+            .unwrap()
+        else {
+            panic!("same-generation retry did not return status")
+        };
+        let AttachResponse::GenerationStatus(status) = retry_pending
+            .validate_response(status_leg.bind_received_frame(status))
+            .unwrap()
+        else {
+            panic!("status response minted data-plane authority")
+        };
+
+        let follow_up_binding = binding(0x73);
+        let (follow_up_endpoint, reporter) = LegIo::for_authenticated_transport_with_reporter(
+            LegId::B,
+            LegEndpointRole::Client,
+            follow_up_binding,
+            LegIoLimits::new(4_096, 8, 32_768, 8, 32_768).unwrap(),
+        );
+        let pending = status
+            .begin_catch_up(
+                follow_up_endpoint.established_leg(),
+                AttachNonce::new([0x73; 16]).unwrap(),
+            )
+            .unwrap();
+        let follow_up = pending.request();
+        let proof = credentials()
+            .prove(&follow_up, &pending.transport_binding())
+            .unwrap();
+        let OwnerAttachPublication::Installed { acceptance, .. } = owner
+            .accept_owner_attach(
+                follow_up_endpoint.established_leg(),
+                follow_up_endpoint
+                    .established_leg()
+                    .bind_received_frame(follow_up.to_attach_frame(proof)),
+            )
+            .unwrap()
+        else {
+            panic!("status-derived generation 4 attach did not commit")
+        };
+        let caught_up = pending
+            .validate_response(
+                follow_up_endpoint
+                    .established_leg()
+                    .bind_received_frame(acceptance),
+            )
+            .unwrap();
+        (client, caught_up, follow_up_endpoint, reporter)
+    }
+
+    #[test]
+    fn terminal_caught_up_leg_is_inert_before_client_install() {
+        let (mut client, caught_up, endpoint, reporter) = caught_up_client_with_reporter();
+        let before = client.snapshot();
+        let terminal = reporter.report(LegTransportTerminalReason::PeerClosed);
+
+        assert!(matches!(
+            client.install_caught_up_leg(&caught_up),
+            Err(SessionSupervisorError::ReplacementEndpointLost)
+        ));
+        assert_eq!(client.snapshot(), before);
+
+        // Keep both endpoint owners alive so only the terminal bit can reject
+        // installation; Weak destruction is not part of this proof.
+        drop((caught_up, endpoint, terminal));
+    }
+
+    #[test]
+    fn installed_caught_up_leg_consumes_only_its_exact_terminal_into_one_leg_loss() {
+        let (mut client_a, caught_up_a, endpoint_a, reporter_a) = caught_up_client_with_reporter();
+        let (mut client_b, caught_up_b, endpoint_b, reporter_b) = caught_up_client_with_reporter();
+        client_a.install_caught_up_leg(&caught_up_a).unwrap();
+        client_b.install_caught_up_leg(&caught_up_b).unwrap();
+        assert_eq!(client_a.snapshot().session.phase(), SessionPhase::Active);
+        assert_eq!(client_b.snapshot().session.phase(), SessionPhase::Active);
+
+        let terminal_b = reporter_b.report(LegTransportTerminalReason::Reset);
+        let mismatch = caught_up_a.bind_terminal(terminal_b).unwrap_err();
+        assert_eq!(
+            format!("{mismatch:?}"),
+            "CaughtUpLegTerminalMismatch([REDACTED])"
+        );
+        let (caught_up_a, terminal_b) = mismatch.into_parts();
+
+        let loss_b = caught_up_b.bind_terminal(terminal_b).unwrap();
+        assert_eq!(loss_b.reason(), LegTransportTerminalReason::Reset);
+        client_b.apply_event(loss_b.into_event()).unwrap();
+        assert_eq!(client_b.snapshot().session.phase(), SessionPhase::Legless);
+
+        let loss_a = caught_up_a
+            .bind_terminal(reporter_a.report(LegTransportTerminalReason::FatalIo))
+            .unwrap();
+        assert_eq!(loss_a.reason(), LegTransportTerminalReason::FatalIo);
+        client_a.apply_event(loss_a.into_event()).unwrap();
+        assert_eq!(client_a.snapshot().session.phase(), SessionPhase::Legless);
+
+        drop((endpoint_a, endpoint_b));
     }
 
     #[test]

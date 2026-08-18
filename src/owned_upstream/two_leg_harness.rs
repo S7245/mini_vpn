@@ -781,7 +781,8 @@ impl R5BaselineHarness {
                 return Err("baseline initial attach returned generation status".to_owned());
             };
             let bootstrap =
-                SessionSupervisor::bootstrap_client(baseline_session_config()?, attached);
+                SessionSupervisor::bootstrap_client(baseline_session_config()?, attached)
+                    .map_err(|error| error.to_string())?;
             let (mut supervisor, attached) = bootstrap.into_parts();
             let port_factory = supervisor
                 .mint_tcp_port_factory(baseline_port_config()?)
