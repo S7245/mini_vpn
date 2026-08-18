@@ -12,6 +12,7 @@ pub mod quic;
 pub(crate) mod quic_udp_send_service;
 pub mod reality;
 pub mod reality_upstream;
+pub mod resumable;
 pub mod shared;
 pub mod tcp_downlink_pump;
 pub mod tcp_egress;

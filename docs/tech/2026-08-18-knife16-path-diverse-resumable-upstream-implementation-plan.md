@@ -2,7 +2,7 @@
 
 Date: 2026-08-18
 
-Status: **PLANNED; IMPLEMENTATION NOT STARTED; M3 BLOCKED**
+Status: **IN PROGRESS; TASKS 1–2 COMPLETE; TASK 3 NEXT; M3 BLOCKED**
 
 > Use `diagnose` and `tdd` for each behavior change. Use
 > `improve-codebase-architecture` when a test cannot reach the required
@@ -26,7 +26,7 @@ upstream. No long WAN test is authorized by a necessary-only partial stage.
 Acceptance: one unambiguous current position says Knife15 failed, zero epoch
 credit does not grant a retry, and M3 is blocked.
 
-## Task 2: Protocol model and capacity characterization
+## Task 2: Protocol model and capacity characterization — COMPLETE
 
 - Define versioned records, limits, errors, authentication binding, and state
   machines without I/O.
@@ -40,7 +40,22 @@ credit does not grant a retry, and M3 is blocked.
 Acceptance: pure tests establish all TCP invariants and bounded memory math;
 no network or production adapter exists yet.
 
+Result: PASS. The pure fixed core implements the bounded v1 codec, exact
+request-correlated authenticated attach and generation resynchronization,
+directional TCP ownership windows, stable cross-leg session capabilities,
+two-phase FIN, bounded terminal tombstones, and checked replay/storage/copy
+math. At a 500 ms total horizon, 100/170/240 Mbit/s require
+6,250,000/10,625,000/15,000,000 application bytes per direction. Aggregate
+capacity is derived independently from aggregate rate. Focused `94/94`, root
+`807 + 3 ignored`, protocol `19/19`, public API `1/1`, harness
+`819 + 3 ignored`, concurrency `10 + 4 ignored`, release, Clippy, rustdoc,
+vendored Quinn/proto, fmt, diff, and two concentrated reviews pass with no
+unresolved P0/P1. No network or production adapter exists yet. See
+`docs/tech/2026-08-18-knife16-resumable-protocol-capacity-local-results.md`.
+
 ## Task 3: Deep `OwnedUpstream` abstraction
+
+Status: **NEXT**
 
 - Introduce a protocol-owned session/flow interface behind the current
   `ProxyUpstream` and `DatagramUpstream` call sites.

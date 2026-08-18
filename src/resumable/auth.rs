@@ -1,0 +1,1729 @@
+//! Pure authenticated-attach authority for Knife16 resumable sessions.
+//!
+//! TLS and device provisioning stay outside this module.  The caller supplies
+//! a fixed-size TLS exporter binding and the identity facts established by the
+//! authenticated transport.  This module binds those facts into one bounded,
+//! canonical HMAC transcript and grants a new leg generation exactly once.
+
+use super::protocol::{
+    AttachNonce, AttachProof, FRAME_PROTOCOL_VERSION, FeatureSet, Frame, LegGeneration,
+    ProtocolError, Record, SESSION_PROTOCOL_VERSION, SessionId,
+};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use thiserror::Error;
+
+type HmacSha256 = Hmac<Sha256>;
+
+const ATTACH_PROTOCOL_CONTEXT: &[u8] = b"mini_vpn/resumable/attach/v1";
+const RESUME_PROOF_CONTEXT: &[u8] = b"resume-authority";
+const DEVICE_PROOF_CONTEXT: &[u8] = b"device-authority";
+const SECRET_BYTES: usize = 32;
+const OWNER_IDENTITY_BYTES: usize = 32;
+const EXPORTER_BINDING_BYTES: usize = 32;
+const DEVICE_PRINCIPAL_BYTES: usize = 16;
+pub const MAX_ATTACH_ALPN_BYTES: usize = 32;
+pub const MAX_ATTACH_TRANSCRIPT_BYTES: usize = 256;
+
+#[derive(PartialEq, Eq)]
+struct Secret32([u8; SECRET_BYTES]);
+
+impl Secret32 {
+    fn new(
+        value: [u8; SECRET_BYTES],
+        zero_error: AttachConfigError,
+    ) -> Result<Self, AttachConfigError> {
+        if value == [0; SECRET_BYTES] {
+            return Err(zero_error);
+        }
+        Ok(Self(value))
+    }
+
+    fn expose(&self) -> &[u8; SECRET_BYTES] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret32 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+/// Per-device credential material.  Its bytes are intentionally private and
+/// its `Debug` representation never includes key material.
+pub struct DeviceSecret(Secret32);
+
+impl DeviceSecret {
+    pub fn new(value: [u8; SECRET_BYTES]) -> Result<Self, AttachConfigError> {
+        Secret32::new(value, AttachConfigError::ZeroDeviceSecret).map(Self)
+    }
+}
+
+impl fmt::Debug for DeviceSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DeviceSecret([REDACTED])")
+    }
+}
+
+/// Session-specific resume authority.  It is independent from the device
+/// credential and is minted only after the original authenticated session.
+pub struct ResumeSecret(Secret32);
+
+impl ResumeSecret {
+    pub fn new(value: [u8; SECRET_BYTES]) -> Result<Self, AttachConfigError> {
+        Secret32::new(value, AttachConfigError::ZeroResumeSecret).map(Self)
+    }
+}
+
+impl fmt::Debug for ResumeSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ResumeSecret([REDACTED])")
+    }
+}
+
+/// The stable cryptographic identity of the expected session owner.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OwnerIdentity([u8; OWNER_IDENTITY_BYTES]);
+
+impl OwnerIdentity {
+    pub fn new(value: [u8; OWNER_IDENTITY_BYTES]) -> Result<Self, AttachConfigError> {
+        if value == [0; OWNER_IDENTITY_BYTES] {
+            return Err(AttachConfigError::ZeroOwnerIdentity);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; OWNER_IDENTITY_BYTES] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for OwnerIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OwnerIdentity([REDACTED])")
+    }
+}
+
+/// The device principal established before session attach.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DevicePrincipal([u8; DEVICE_PRINCIPAL_BYTES]);
+
+impl DevicePrincipal {
+    pub fn new(value: [u8; DEVICE_PRINCIPAL_BYTES]) -> Result<Self, AttachConfigError> {
+        if value == [0; DEVICE_PRINCIPAL_BYTES] {
+            return Err(AttachConfigError::ZeroDevicePrincipal);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; DEVICE_PRINCIPAL_BYTES] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for DevicePrincipal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DevicePrincipal([REDACTED])")
+    }
+}
+
+/// A fixed-length value exported from the exact TLS 1.3 leg.  It is not a
+/// wire field: the transport adapter must obtain it from that live channel.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TlsExporterBinding([u8; EXPORTER_BINDING_BYTES]);
+
+impl TlsExporterBinding {
+    pub fn new(value: [u8; EXPORTER_BINDING_BYTES]) -> Result<Self, AttachConfigError> {
+        if value == [0; EXPORTER_BINDING_BYTES] {
+            return Err(AttachConfigError::ZeroExporterBinding);
+        }
+        Ok(Self(value))
+    }
+
+    fn as_bytes(&self) -> &[u8; EXPORTER_BINDING_BYTES] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for TlsExporterBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("TlsExporterBinding([REDACTED])")
+    }
+}
+
+/// Bounded ALPN selected by the exact TLS leg.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AttachAlpn {
+    bytes: [u8; MAX_ATTACH_ALPN_BYTES],
+    len: u8,
+}
+
+impl AttachAlpn {
+    pub fn new(value: &[u8]) -> Result<Self, AttachConfigError> {
+        if value.is_empty() {
+            return Err(AttachConfigError::EmptyAlpn);
+        }
+        if value.len() > MAX_ATTACH_ALPN_BYTES {
+            return Err(AttachConfigError::AlpnTooLong {
+                len: value.len(),
+                max: MAX_ATTACH_ALPN_BYTES,
+            });
+        }
+        let mut bytes = [0; MAX_ATTACH_ALPN_BYTES];
+        bytes[..value.len()].copy_from_slice(value);
+        Ok(Self {
+            bytes,
+            len: value.len() as u8,
+        })
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+impl fmt::Debug for AttachAlpn {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("AttachAlpn")
+            .field(&String::from_utf8_lossy(self.as_bytes()))
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VersionRange {
+    min: u16,
+    max: u16,
+}
+
+impl VersionRange {
+    pub fn new(min: u16, max: u16) -> Result<Self, AttachConfigError> {
+        if min == 0 || min > max {
+            return Err(AttachConfigError::InvalidVersionRange { min, max });
+        }
+        Ok(Self { min, max })
+    }
+
+    pub const fn min(self) -> u16 {
+        self.min
+    }
+
+    pub const fn max(self) -> u16 {
+        self.max
+    }
+
+    pub const fn contains(self, version: u16) -> bool {
+        self.min <= version && version <= self.max
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FeatureOffer {
+    offered: u64,
+    required: u64,
+}
+
+impl FeatureOffer {
+    pub fn new(offered: u64, required: u64) -> Result<Self, AttachConfigError> {
+        if required & !offered != 0 {
+            return Err(AttachConfigError::RequiredFeaturesNotOffered { offered, required });
+        }
+        Ok(Self { offered, required })
+    }
+
+    pub const fn offered(self) -> u64 {
+        self.offered
+    }
+
+    pub const fn required(self) -> u64 {
+        self.required
+    }
+}
+
+/// Facts taken from the authenticated TLS leg rather than from attach wire
+/// bytes.  Mutating any field invalidates an already-created proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttachTransportBinding {
+    owner_identity: OwnerIdentity,
+    alpn: AttachAlpn,
+    exporter: TlsExporterBinding,
+    device_principal: DevicePrincipal,
+}
+
+impl AttachTransportBinding {
+    pub const fn new(
+        owner_identity: OwnerIdentity,
+        alpn: AttachAlpn,
+        exporter: TlsExporterBinding,
+        device_principal: DevicePrincipal,
+    ) -> Self {
+        Self {
+            owner_identity,
+            alpn,
+            exporter,
+            device_principal,
+        }
+    }
+
+    pub const fn owner_identity(&self) -> OwnerIdentity {
+        self.owner_identity
+    }
+
+    pub const fn alpn(&self) -> AttachAlpn {
+        self.alpn
+    }
+
+    pub const fn device_principal(&self) -> DevicePrincipal {
+        self.device_principal
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttachRequest {
+    session_id: SessionId,
+    requested_generation: LegGeneration,
+    nonce: AttachNonce,
+    versions: VersionRange,
+    features: FeatureOffer,
+}
+
+impl AttachRequest {
+    pub const fn new(
+        session_id: SessionId,
+        requested_generation: LegGeneration,
+        nonce: AttachNonce,
+        versions: VersionRange,
+        features: FeatureOffer,
+    ) -> Self {
+        Self {
+            session_id,
+            requested_generation,
+            nonce,
+            versions,
+            features,
+        }
+    }
+
+    pub const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub const fn requested_generation(&self) -> LegGeneration {
+        self.requested_generation
+    }
+
+    pub const fn nonce(&self) -> AttachNonce {
+        self.nonce
+    }
+
+    pub const fn versions(&self) -> VersionRange {
+        self.versions
+    }
+
+    pub const fn features(&self) -> FeatureOffer {
+        self.features
+    }
+
+    /// Builds the only wire ATTACH representation of this signed request.
+    /// Keeping generation and negotiation fields behind this conversion avoids
+    /// adapters signing one request and manually encoding another.
+    pub fn to_attach_frame(self, proof: AttachProof) -> Frame {
+        Frame::new(
+            self.requested_generation,
+            Record::Attach {
+                session_id: self.session_id,
+                nonce: self.nonce,
+                min_version: self.versions.min,
+                max_version: self.versions.max,
+                offered_features: FeatureSet::new(self.features.offered),
+                required_features: FeatureSet::new(self.features.required),
+                proof,
+            },
+        )
+    }
+
+    /// Extracts the exact authenticated request carried by a decoded ATTACH.
+    /// The frame generation is the requested generation by construction.
+    pub fn from_attach_frame(frame: &Frame) -> Result<(Self, AttachProof), AttachReject> {
+        let Record::Attach {
+            session_id,
+            nonce,
+            min_version,
+            max_version,
+            offered_features,
+            required_features,
+            proof,
+        } = frame.record()
+        else {
+            return Err(AttachReject::Rejected);
+        };
+        let versions =
+            VersionRange::new(*min_version, *max_version).map_err(|_| AttachReject::Rejected)?;
+        let features = FeatureOffer::new(offered_features.bits(), required_features.bits())
+            .map_err(|_| AttachReject::Rejected)?;
+        Ok((
+            Self::new(
+                *session_id,
+                frame.leg_generation(),
+                *nonce,
+                versions,
+                features,
+            ),
+            *proof,
+        ))
+    }
+
+    /// Validates the server's exact ATTACH_ACCEPTED response and mints the
+    /// client-side capability for that authenticated transport leg.
+    ///
+    /// This pure validator assumes `frame` arrived on the exact authenticated
+    /// TLS leg represented by `binding`. The transport adapter must preserve
+    /// that frame-to-leg association; this model then verifies the request's
+    /// exact session, nonce, generation, and negotiated result.
+    pub fn validate_accepted_frame(
+        &self,
+        binding: &AttachTransportBinding,
+        frame: &Frame,
+    ) -> Result<CommittedLeg, AttachReject> {
+        if frame.leg_generation() != self.requested_generation {
+            return Err(AttachReject::Rejected);
+        }
+        let Record::AttachAccepted {
+            session_id,
+            nonce,
+            selected_version,
+            features,
+        } = frame.record()
+        else {
+            return Err(AttachReject::Rejected);
+        };
+        let negotiated_features = features.bits();
+        if *session_id != self.session_id
+            || *nonce != self.nonce
+            || !self.versions.contains(*selected_version)
+            || negotiated_features & !self.features.offered != 0
+            || self.features.required & !negotiated_features != 0
+        {
+            return Err(AttachReject::Rejected);
+        }
+        Ok(CommittedLeg {
+            session_id: self.session_id,
+            generation: self.requested_generation,
+            nonce: self.nonce,
+            transport_binding: *binding,
+            session_protocol_version: *selected_version,
+            negotiated_features,
+        })
+    }
+
+    /// Validates an authenticated generation-status response for this exact
+    /// attach attempt.  The echoed session, requested generation, and nonce
+    /// prevent a response for another (or older) request from minting a
+    /// resynchronization capability.
+    pub fn validate_generation_status_frame(
+        &self,
+        binding: &AttachTransportBinding,
+        frame: &Frame,
+    ) -> Result<GenerationResynchronization, AttachReject> {
+        let Record::AttachGenerationStatus {
+            session_id,
+            requested_generation,
+            nonce,
+        } = frame.record()
+        else {
+            return Err(AttachReject::Rejected);
+        };
+        if *session_id != self.session_id
+            || *requested_generation != self.requested_generation
+            || *nonce != self.nonce
+        {
+            return Err(AttachReject::Rejected);
+        }
+        Ok(GenerationResynchronization {
+            session_id: self.session_id,
+            current_generation: frame.leg_generation(),
+            requested_generation: self.requested_generation,
+            nonce: self.nonce,
+            transport_binding: *binding,
+            versions: self.versions,
+            features: self.features,
+        })
+    }
+}
+
+/// Immutable session-side attach policy.  The TLS exporter remains leg-local
+/// and is supplied separately in [`AttachTransportBinding`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttachPolicy {
+    owner_identity: OwnerIdentity,
+    alpn: AttachAlpn,
+    device_principal: DevicePrincipal,
+    session_protocol_version: u16,
+    supported_features: u64,
+}
+
+impl AttachPolicy {
+    pub fn new(
+        owner_identity: OwnerIdentity,
+        alpn: AttachAlpn,
+        device_principal: DevicePrincipal,
+        session_protocol_version: u16,
+        supported_features: u64,
+    ) -> Result<Self, AttachConfigError> {
+        if session_protocol_version != SESSION_PROTOCOL_VERSION {
+            return Err(AttachConfigError::UnsupportedProtocolVersion(
+                session_protocol_version,
+            ));
+        }
+        Ok(Self {
+            owner_identity,
+            alpn,
+            device_principal,
+            session_protocol_version,
+            supported_features,
+        })
+    }
+}
+
+/// The two independent authorities needed to attach a replacement leg.
+pub struct AttachCredentials {
+    device_secret: DeviceSecret,
+    resume_secret: ResumeSecret,
+}
+
+impl AttachCredentials {
+    pub fn new(
+        device_secret: DeviceSecret,
+        resume_secret: ResumeSecret,
+    ) -> Result<Self, AttachConfigError> {
+        if device_secret.0 == resume_secret.0 {
+            return Err(AttachConfigError::SecretsNotIndependent);
+        }
+        Ok(Self {
+            device_secret,
+            resume_secret,
+        })
+    }
+
+    pub fn prove(
+        &self,
+        request: &AttachRequest,
+        binding: &AttachTransportBinding,
+    ) -> Result<AttachProof, AttachConfigError> {
+        let transcript = encode_transcript(request, binding);
+        let proof = self.proof_mac(&transcript)?.finalize().into_bytes().into();
+        AttachProof::new(proof).map_err(AttachConfigError::InvalidProofEncoding)
+    }
+
+    fn verifies(
+        &self,
+        request: &AttachRequest,
+        binding: &AttachTransportBinding,
+        proof: &AttachProof,
+    ) -> bool {
+        let transcript = encode_transcript(request, binding);
+        self.proof_mac(&transcript)
+            .map(|mac| mac.verify_slice(proof.as_bytes()).is_ok())
+            .unwrap_or(false)
+    }
+
+    fn proof_mac(&self, transcript: &[u8]) -> Result<HmacSha256, AttachConfigError> {
+        let mut resume_mac = <HmacSha256 as Mac>::new_from_slice(self.resume_secret.0.expose())
+            .map_err(|_| AttachConfigError::InvalidHmacKey)?;
+        resume_mac.update(ATTACH_PROTOCOL_CONTEXT);
+        resume_mac.update(RESUME_PROOF_CONTEXT);
+        resume_mac.update(transcript);
+        let resume_tag = resume_mac.finalize().into_bytes();
+
+        let mut device_mac = <HmacSha256 as Mac>::new_from_slice(self.device_secret.0.expose())
+            .map_err(|_| AttachConfigError::InvalidHmacKey)?;
+        device_mac.update(ATTACH_PROTOCOL_CONTEXT);
+        device_mac.update(DEVICE_PROOF_CONTEXT);
+        // `resume_tag` already authenticates the complete transcript.  The
+        // outer MAC adds the independent device authority without hashing the
+        // transcript a second time.
+        device_mac.update(&resume_tag);
+        Ok(device_mac)
+    }
+}
+
+impl fmt::Debug for AttachCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AttachCredentials")
+            .field("device_secret", &self.device_secret)
+            .field("resume_secret", &self.resume_secret)
+            .finish()
+    }
+}
+
+/// Capability returned only by a successful, atomic attach commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommittedLeg {
+    session_id: SessionId,
+    generation: LegGeneration,
+    nonce: AttachNonce,
+    transport_binding: AttachTransportBinding,
+    session_protocol_version: u16,
+    negotiated_features: u64,
+}
+
+impl CommittedLeg {
+    pub const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub const fn generation(&self) -> LegGeneration {
+        self.generation
+    }
+
+    pub const fn nonce(&self) -> AttachNonce {
+        self.nonce
+    }
+
+    pub const fn owner_identity(&self) -> OwnerIdentity {
+        self.transport_binding.owner_identity
+    }
+
+    pub const fn device_principal(&self) -> DevicePrincipal {
+        self.transport_binding.device_principal
+    }
+
+    /// Exact authenticated channel facts from which this capability was
+    /// minted. Secret and exporter bytes remain redacted by their leaf types.
+    pub const fn transport_binding(&self) -> AttachTransportBinding {
+        self.transport_binding
+    }
+
+    pub const fn session_protocol_version(&self) -> u16 {
+        self.session_protocol_version
+    }
+
+    pub const fn negotiated_features(&self) -> u64 {
+        self.negotiated_features
+    }
+
+    /// Builds the sole wire acceptance corresponding to this committed leg.
+    pub fn attach_accepted_frame(self) -> Frame {
+        Frame::new(
+            self.generation,
+            Record::AttachAccepted {
+                session_id: self.session_id,
+                nonce: self.nonce,
+                selected_version: self.session_protocol_version,
+                features: FeatureSet::new(self.negotiated_features),
+            },
+        )
+    }
+}
+
+/// Proof-valid outcome of processing an ATTACH frame.  A status response is
+/// returned only after the same authentication, identity, and protocol checks
+/// required for a commit; unknown sessions and bad proofs remain generic
+/// public rejections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachFrameOutcome {
+    Committed(CommittedLeg),
+    Resynchronize(GenerationResynchronization),
+}
+
+/// Client/server capability tied to one authenticated attach attempt and TLS
+/// leg.  It can emit the correlated wire status and derive only the exact next
+/// generation, never mutate the server generation itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GenerationResynchronization {
+    session_id: SessionId,
+    current_generation: LegGeneration,
+    requested_generation: LegGeneration,
+    nonce: AttachNonce,
+    transport_binding: AttachTransportBinding,
+    versions: VersionRange,
+    features: FeatureOffer,
+}
+
+impl GenerationResynchronization {
+    pub const fn current_generation(&self) -> LegGeneration {
+        self.current_generation
+    }
+
+    pub const fn requested_generation(&self) -> LegGeneration {
+        self.requested_generation
+    }
+
+    pub const fn transport_binding(&self) -> AttachTransportBinding {
+        self.transport_binding
+    }
+
+    /// Builds the sole status record corresponding to this authenticated
+    /// attempt.  The current generation lives in the frame envelope; request
+    /// correlation fields are repeated in the body.  The record deliberately
+    /// has no second application MAC and must travel on the exact authenticated
+    /// TLS leg represented by [`Self::transport_binding`].
+    pub fn status_frame(self) -> Frame {
+        Frame::new(
+            self.current_generation,
+            Record::AttachGenerationStatus {
+                session_id: self.session_id,
+                requested_generation: self.requested_generation,
+                nonce: self.nonce,
+            },
+        )
+    }
+
+    /// Derives a fresh attach for exactly `current_generation + 1`, retaining
+    /// the authenticated session's version and feature offer.  Callers must
+    /// supply a fresh nonce and sign the returned request for the live leg.
+    pub fn next_request(self, nonce: AttachNonce) -> Result<AttachRequest, AttachReject> {
+        if nonce == self.nonce {
+            return Err(AttachReject::Rejected);
+        }
+        let next = self
+            .current_generation
+            .get()
+            .checked_add(1)
+            .ok_or(AttachReject::GenerationExhausted)?;
+        let requested_generation =
+            LegGeneration::new(next).map_err(|_| AttachReject::GenerationExhausted)?;
+        Ok(AttachRequest::new(
+            self.session_id,
+            requested_generation,
+            nonce,
+            self.versions,
+            self.features,
+        ))
+    }
+}
+
+/// One session's single generation authority.  `compare_exchange` makes two
+/// concurrent, correctly authenticated requests for the same next generation
+/// race safely: exactly one commits and the loser observes `GenerationNotNext`.
+pub struct AttachAuthority {
+    session_id: SessionId,
+    current_generation: AtomicU64,
+    credentials: AttachCredentials,
+    policy: AttachPolicy,
+}
+
+impl AttachAuthority {
+    pub fn new(
+        session_id: SessionId,
+        current_generation: LegGeneration,
+        credentials: AttachCredentials,
+        policy: AttachPolicy,
+    ) -> Self {
+        Self {
+            session_id,
+            current_generation: AtomicU64::new(current_generation.get()),
+            credentials,
+            policy,
+        }
+    }
+
+    pub fn current_generation(&self) -> u64 {
+        self.current_generation.load(Ordering::Acquire)
+    }
+
+    /// Authenticates and commits the exact fields present in a decoded ATTACH
+    /// frame. This strict entry preserves the original generation-error API;
+    /// adapters that must recover a lost acceptance should use
+    /// [`Self::verify_and_commit_or_resynchronize_frame`].
+    pub fn verify_and_commit_frame(
+        &self,
+        frame: &Frame,
+        binding: &AttachTransportBinding,
+    ) -> Result<CommittedLeg, AttachReject> {
+        let (request, proof) = AttachRequest::from_attach_frame(frame)?;
+        self.verify_and_commit(&request, binding, &proof)
+    }
+
+    /// Authenticates the exact decoded ATTACH and either commits it or returns
+    /// an authenticated current-generation status.  Generation state is never
+    /// disclosed for a malformed frame, unknown session, wrong transport
+    /// identity, unsupported negotiation, or invalid proof.
+    pub fn verify_and_commit_or_resynchronize_frame(
+        &self,
+        frame: &Frame,
+        binding: &AttachTransportBinding,
+    ) -> Result<AttachFrameOutcome, AttachReject> {
+        let (request, proof) = AttachRequest::from_attach_frame(frame)?;
+        match self.verify_and_commit(&request, binding, &proof) {
+            Ok(committed) => Ok(AttachFrameOutcome::Committed(committed)),
+            Err(AttachReject::GenerationNotNext { current, .. }) => self
+                .resynchronization(&request, binding, current)
+                .map(AttachFrameOutcome::Resynchronize),
+            Err(AttachReject::GenerationExhausted) => self
+                .resynchronization(&request, binding, self.current_generation())
+                .map(AttachFrameOutcome::Resynchronize),
+            Err(AttachReject::Rejected) => Err(AttachReject::Rejected),
+        }
+    }
+
+    pub fn verify_and_commit(
+        &self,
+        request: &AttachRequest,
+        binding: &AttachTransportBinding,
+        proof: &AttachProof,
+    ) -> Result<CommittedLeg, AttachReject> {
+        let proof_valid = self.credentials.verifies(request, binding, proof);
+        let identity_valid = request.session_id == self.session_id
+            && binding.owner_identity == self.policy.owner_identity
+            && binding.alpn == self.policy.alpn
+            && binding.device_principal == self.policy.device_principal;
+        let protocol_valid = request
+            .versions
+            .contains(self.policy.session_protocol_version)
+            && request.features.required & !self.policy.supported_features == 0;
+        if !(proof_valid && identity_valid && protocol_valid) {
+            return Err(AttachReject::Rejected);
+        }
+
+        let current = self.current_generation.load(Ordering::Acquire);
+        let Some(expected) = current.checked_add(1) else {
+            return Err(AttachReject::GenerationExhausted);
+        };
+        let requested = request.requested_generation.get();
+        if requested != expected {
+            return Err(AttachReject::GenerationNotNext { current, requested });
+        }
+
+        match self.current_generation.compare_exchange(
+            current,
+            requested,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(CommittedLeg {
+                session_id: self.session_id,
+                generation: request.requested_generation,
+                nonce: request.nonce,
+                transport_binding: *binding,
+                session_protocol_version: self.policy.session_protocol_version,
+                negotiated_features: request.features.offered & self.policy.supported_features,
+            }),
+            Err(actual) => Err(AttachReject::GenerationNotNext {
+                current: actual,
+                requested,
+            }),
+        }
+    }
+
+    fn resynchronization(
+        &self,
+        request: &AttachRequest,
+        binding: &AttachTransportBinding,
+        current: u64,
+    ) -> Result<GenerationResynchronization, AttachReject> {
+        let current_generation = LegGeneration::new(current).map_err(|_| AttachReject::Rejected)?;
+        Ok(GenerationResynchronization {
+            session_id: request.session_id,
+            current_generation,
+            requested_generation: request.requested_generation,
+            nonce: request.nonce,
+            transport_binding: *binding,
+            versions: request.versions,
+            features: request.features,
+        })
+    }
+}
+
+impl fmt::Debug for AttachAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AttachAuthority")
+            .field("session_id", &self.session_id)
+            .field("current_generation", &self.current_generation())
+            .field("credentials", &self.credentials)
+            .field("policy", &self.policy)
+            .finish()
+    }
+}
+
+fn encode_transcript(request: &AttachRequest, binding: &AttachTransportBinding) -> Vec<u8> {
+    let mut transcript = Vec::with_capacity(MAX_ATTACH_TRANSCRIPT_BYTES);
+    transcript.extend_from_slice(ATTACH_PROTOCOL_CONTEXT);
+    transcript.extend_from_slice(&FRAME_PROTOCOL_VERSION.to_be_bytes());
+    transcript.extend_from_slice(binding.owner_identity.as_bytes());
+    transcript.push(binding.alpn.len);
+    transcript.extend_from_slice(binding.alpn.as_bytes());
+    transcript.extend_from_slice(binding.exporter.as_bytes());
+    transcript.extend_from_slice(binding.device_principal.as_bytes());
+    transcript.extend_from_slice(request.session_id.as_bytes());
+    transcript.extend_from_slice(&request.requested_generation.get().to_be_bytes());
+    transcript.extend_from_slice(request.nonce.as_bytes());
+    transcript.extend_from_slice(&request.versions.min.to_be_bytes());
+    transcript.extend_from_slice(&request.versions.max.to_be_bytes());
+    transcript.extend_from_slice(&request.features.offered.to_be_bytes());
+    transcript.extend_from_slice(&request.features.required.to_be_bytes());
+    debug_assert!(transcript.len() <= MAX_ATTACH_TRANSCRIPT_BYTES);
+    transcript
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum AttachConfigError {
+    #[error("device secret must not be all-zero")]
+    ZeroDeviceSecret,
+    #[error("resume secret must not be all-zero")]
+    ZeroResumeSecret,
+    #[error("device and resume secrets must be independent")]
+    SecretsNotIndependent,
+    #[error("owner identity must not be all-zero")]
+    ZeroOwnerIdentity,
+    #[error("device principal must not be all-zero")]
+    ZeroDevicePrincipal,
+    #[error("TLS exporter binding must not be all-zero")]
+    ZeroExporterBinding,
+    #[error("attach ALPN must not be empty")]
+    EmptyAlpn,
+    #[error("attach ALPN length {len} exceeds {max}")]
+    AlpnTooLong { len: usize, max: usize },
+    #[error("invalid version range {min}..={max}")]
+    InvalidVersionRange { min: u16, max: u16 },
+    #[error("required feature bits {required:#x} are not included in offered bits {offered:#x}")]
+    RequiredFeaturesNotOffered { offered: u64, required: u64 },
+    #[error("unsupported protocol version {0}")]
+    UnsupportedProtocolVersion(u16),
+    #[error("HMAC rejected a fixed-size key")]
+    InvalidHmacKey,
+    #[error("HMAC output did not form a legal attach proof: {0}")]
+    InvalidProofEncoding(ProtocolError),
+}
+
+/// Public attach failure.  Unknown session and invalid authentication are
+/// deliberately indistinguishable.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum AttachReject {
+    #[error("attach rejected")]
+    Rejected,
+    #[error("requested leg generation {requested} is not current {current} plus one")]
+    GenerationNotNext { current: u64, requested: u64 },
+    #[error("leg generation is exhausted")]
+    GenerationExhausted,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    const SUPPORTED_FEATURES: u64 = 0b1111;
+
+    fn session(byte: u8) -> SessionId {
+        SessionId::new([byte; 16]).unwrap()
+    }
+
+    fn nonce(byte: u8) -> AttachNonce {
+        AttachNonce::new([byte; 16]).unwrap()
+    }
+
+    fn owner(byte: u8) -> OwnerIdentity {
+        OwnerIdentity::new([byte; 32]).unwrap()
+    }
+
+    fn principal(byte: u8) -> DevicePrincipal {
+        DevicePrincipal::new([byte; 16]).unwrap()
+    }
+
+    fn exporter(byte: u8) -> TlsExporterBinding {
+        TlsExporterBinding::new([byte; 32]).unwrap()
+    }
+
+    fn credentials() -> AttachCredentials {
+        AttachCredentials::new(
+            DeviceSecret::new([0xde; 32]).unwrap(),
+            ResumeSecret::new([0xad; 32]).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn signer() -> AttachCredentials {
+        credentials()
+    }
+
+    fn binding() -> AttachTransportBinding {
+        binding_with_exporter(0x42)
+    }
+
+    fn binding_with_exporter(exporter_byte: u8) -> AttachTransportBinding {
+        AttachTransportBinding::new(
+            owner(0x31),
+            AttachAlpn::new(b"mini-vpn-owned/1").unwrap(),
+            exporter(exporter_byte),
+            principal(0x53),
+        )
+    }
+
+    fn policy() -> AttachPolicy {
+        let binding = binding();
+        AttachPolicy::new(
+            binding.owner_identity(),
+            binding.alpn(),
+            binding.device_principal(),
+            SESSION_PROTOCOL_VERSION,
+            SUPPORTED_FEATURES,
+        )
+        .unwrap()
+    }
+
+    fn request(
+        session_id: SessionId,
+        generation: u64,
+        nonce_byte: u8,
+        versions: VersionRange,
+        features: FeatureOffer,
+    ) -> AttachRequest {
+        AttachRequest::new(
+            session_id,
+            LegGeneration::new(generation).unwrap(),
+            nonce(nonce_byte),
+            versions,
+            features,
+        )
+    }
+
+    fn normal_request() -> AttachRequest {
+        request(
+            session(0x11),
+            2,
+            0x22,
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(0b0111, 0b0001).unwrap(),
+        )
+    }
+
+    fn authority_at(generation: u64) -> AttachAuthority {
+        AttachAuthority::new(
+            session(0x11),
+            LegGeneration::new(generation).unwrap(),
+            credentials(),
+            policy(),
+        )
+    }
+
+    #[test]
+    fn authenticated_attach_commits_exact_next_generation() {
+        let authority = authority_at(1);
+        let request = normal_request();
+        let binding = binding();
+        let proof = signer().prove(&request, &binding).unwrap();
+
+        let committed = authority
+            .verify_and_commit(&request, &binding, &proof)
+            .unwrap();
+
+        assert_eq!(committed.session_id(), session(0x11));
+        assert_eq!(committed.generation().get(), 2);
+        assert_eq!(committed.nonce(), nonce(0x22));
+        assert_eq!(committed.owner_identity(), owner(0x31));
+        assert_eq!(committed.device_principal(), principal(0x53));
+        assert_eq!(
+            committed.session_protocol_version(),
+            SESSION_PROTOCOL_VERSION
+        );
+        assert_eq!(committed.negotiated_features(), 0b0111);
+        assert_eq!(authority.current_generation(), 2);
+    }
+
+    #[test]
+    fn every_bound_transcript_field_invalidates_an_existing_proof() {
+        let authority = authority_at(1);
+        let original_request = normal_request();
+        let original_binding = binding();
+        let proof = signer()
+            .prove(&original_request, &original_binding)
+            .unwrap();
+
+        let changed_requests = [
+            request(
+                session(0x99),
+                2,
+                0x22,
+                original_request.versions(),
+                original_request.features(),
+            ),
+            request(
+                original_request.session_id(),
+                3,
+                0x22,
+                original_request.versions(),
+                original_request.features(),
+            ),
+            request(
+                original_request.session_id(),
+                2,
+                0x99,
+                original_request.versions(),
+                original_request.features(),
+            ),
+            request(
+                original_request.session_id(),
+                2,
+                0x22,
+                VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION + 1).unwrap(),
+                original_request.features(),
+            ),
+            request(
+                original_request.session_id(),
+                2,
+                0x22,
+                original_request.versions(),
+                FeatureOffer::new(0b1111, 0b0001).unwrap(),
+            ),
+            request(
+                original_request.session_id(),
+                2,
+                0x22,
+                original_request.versions(),
+                FeatureOffer::new(0b0111, 0b0010).unwrap(),
+            ),
+        ];
+        for changed in changed_requests {
+            assert_eq!(
+                authority.verify_and_commit(&changed, &original_binding, &proof),
+                Err(AttachReject::Rejected)
+            );
+            assert_eq!(authority.current_generation(), 1);
+        }
+
+        let changed_bindings = [
+            AttachTransportBinding::new(
+                owner(0x99),
+                original_binding.alpn(),
+                exporter(0x42),
+                original_binding.device_principal(),
+            ),
+            AttachTransportBinding::new(
+                original_binding.owner_identity(),
+                AttachAlpn::new(b"other-alpn/1").unwrap(),
+                exporter(0x42),
+                original_binding.device_principal(),
+            ),
+            AttachTransportBinding::new(
+                original_binding.owner_identity(),
+                original_binding.alpn(),
+                exporter(0x99),
+                original_binding.device_principal(),
+            ),
+            AttachTransportBinding::new(
+                original_binding.owner_identity(),
+                original_binding.alpn(),
+                exporter(0x42),
+                principal(0x99),
+            ),
+        ];
+        for changed in changed_bindings {
+            assert_eq!(
+                authority.verify_and_commit(&original_request, &changed, &proof),
+                Err(AttachReject::Rejected)
+            );
+            assert_eq!(authority.current_generation(), 1);
+        }
+
+        assert!(
+            authority
+                .verify_and_commit(&original_request, &original_binding, &proof)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn unknown_session_and_bad_proof_have_the_same_public_rejection() {
+        let authority = authority_at(1);
+        let binding = binding();
+        let normal = normal_request();
+        let unknown = request(session(0x99), 2, 0x22, normal.versions(), normal.features());
+        let unknown_proof = signer().prove(&unknown, &binding).unwrap();
+        let bad_proof = AttachProof::new([0x77; 32]).unwrap();
+
+        assert_eq!(
+            authority.verify_and_commit(&unknown, &binding, &unknown_proof),
+            Err(AttachReject::Rejected)
+        );
+        assert_eq!(
+            authority.verify_and_commit(&normal, &binding, &bad_proof),
+            Err(AttachReject::Rejected)
+        );
+        assert_eq!(
+            authority.verify_and_commit_frame(&unknown.to_attach_frame(unknown_proof), &binding),
+            Err(AttachReject::Rejected)
+        );
+        assert_eq!(
+            authority.verify_and_commit_frame(&normal.to_attach_frame(bad_proof), &binding),
+            Err(AttachReject::Rejected)
+        );
+        assert_eq!(authority.current_generation(), 1);
+    }
+
+    #[test]
+    fn both_independent_secret_authorities_are_required() {
+        let authority = authority_at(1);
+        let request = normal_request();
+        let binding = binding();
+        let wrong_device = AttachCredentials::new(
+            DeviceSecret::new([0xdf; 32]).unwrap(),
+            ResumeSecret::new([0xad; 32]).unwrap(),
+        )
+        .unwrap();
+        let wrong_resume = AttachCredentials::new(
+            DeviceSecret::new([0xde; 32]).unwrap(),
+            ResumeSecret::new([0xae; 32]).unwrap(),
+        )
+        .unwrap();
+
+        for proof in [
+            wrong_device.prove(&request, &binding).unwrap(),
+            wrong_resume.prove(&request, &binding).unwrap(),
+        ] {
+            assert_eq!(
+                authority.verify_and_commit(&request, &binding, &proof),
+                Err(AttachReject::Rejected)
+            );
+            assert_eq!(authority.current_generation(), 1);
+        }
+    }
+
+    #[test]
+    fn concurrent_same_generation_attach_commits_once_and_replay_is_stale() {
+        let authority = Arc::new(authority_at(1));
+        let request = normal_request();
+        let binding = binding();
+        let proof = signer().prove(&request, &binding).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+
+        let results = std::thread::scope(|scope| {
+            let mut joins = Vec::new();
+            for _ in 0..2 {
+                let authority = authority.clone();
+                let barrier = barrier.clone();
+                joins.push(scope.spawn(move || {
+                    barrier.wait();
+                    authority.verify_and_commit(&request, &binding, &proof)
+                }));
+            }
+            barrier.wait();
+            joins
+                .into_iter()
+                .map(|join| join.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(AttachReject::GenerationNotNext { .. })))
+                .count(),
+            1
+        );
+        assert_eq!(authority.current_generation(), 2);
+        assert!(matches!(
+            authority.verify_and_commit(&request, &binding, &proof),
+            Err(AttachReject::GenerationNotNext {
+                current: 2,
+                requested: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn stale_and_skipped_generations_fail_without_mutation() {
+        let authority = authority_at(7);
+        let binding = binding();
+        for generation in [7, 9] {
+            let request = request(
+                session(0x11),
+                generation,
+                generation as u8,
+                VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+                FeatureOffer::new(1, 1).unwrap(),
+            );
+            let proof = signer().prove(&request, &binding).unwrap();
+            assert!(matches!(
+                authority.verify_and_commit(&request, &binding, &proof),
+                Err(AttachReject::GenerationNotNext {
+                    current: 7,
+                    requested
+                }) if requested == generation
+            ));
+            assert_eq!(authority.current_generation(), 7);
+        }
+    }
+
+    #[test]
+    fn generation_overflow_fails_without_mutation() {
+        let authority = authority_at(u64::MAX);
+        let binding = binding();
+        let request = request(
+            session(0x11),
+            u64::MAX,
+            0x44,
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(1, 1).unwrap(),
+        );
+        let proof = signer().prove(&request, &binding).unwrap();
+
+        assert_eq!(
+            authority.verify_and_commit(&request, &binding, &proof),
+            Err(AttachReject::GenerationExhausted)
+        );
+        assert_eq!(authority.current_generation(), u64::MAX);
+    }
+
+    #[test]
+    fn secrets_exporter_and_authority_debug_are_redacted() {
+        let device = DeviceSecret::new([0xde; 32]).unwrap();
+        let resume = ResumeSecret::new([0xad; 32]).unwrap();
+        assert_eq!(format!("{device:?}"), "DeviceSecret([REDACTED])");
+        assert_eq!(format!("{resume:?}"), "ResumeSecret([REDACTED])");
+        assert_eq!(
+            format!("{:?}", exporter(0x42)),
+            "TlsExporterBinding([REDACTED])"
+        );
+
+        let authority = authority_at(1);
+        let debug = format!("{authority:?}");
+        assert!(debug.contains("device_secret: DeviceSecret([REDACTED])"));
+        assert!(debug.contains("resume_secret: ResumeSecret([REDACTED])"));
+        assert!(!debug.contains("222"));
+        assert!(!debug.contains("173"));
+    }
+
+    #[test]
+    fn attach_inputs_are_bounded_and_secrets_must_be_independent() {
+        assert_eq!(
+            AttachAlpn::new(&[b'x'; MAX_ATTACH_ALPN_BYTES + 1]),
+            Err(AttachConfigError::AlpnTooLong {
+                len: MAX_ATTACH_ALPN_BYTES + 1,
+                max: MAX_ATTACH_ALPN_BYTES
+            })
+        );
+        assert_eq!(
+            FeatureOffer::new(0b0001, 0b0010),
+            Err(AttachConfigError::RequiredFeaturesNotOffered {
+                offered: 0b0001,
+                required: 0b0010
+            })
+        );
+        assert!(matches!(
+            AttachCredentials::new(
+                DeviceSecret::new([0x55; 32]).unwrap(),
+                ResumeSecret::new([0x55; 32]).unwrap(),
+            ),
+            Err(AttachConfigError::SecretsNotIndependent)
+        ));
+        assert!(
+            encode_transcript(&normal_request(), &binding()).len() <= MAX_ATTACH_TRANSCRIPT_BYTES
+        );
+    }
+
+    #[test]
+    fn attach_wire_and_auth_models_form_one_exact_end_to_end_negotiation() {
+        let authority = authority_at(1);
+        let request = normal_request();
+        let binding = binding();
+        let proof = signer().prove(&request, &binding).unwrap();
+
+        let encoded_attach = request.to_attach_frame(proof).encode().unwrap();
+        let decoded_attach = Frame::decode_owned_exact(encoded_attach).unwrap();
+        let (wire_request, wire_proof) = AttachRequest::from_attach_frame(&decoded_attach).unwrap();
+        assert_eq!(wire_request, request);
+        assert_eq!(wire_proof, proof);
+
+        let server_leg = authority
+            .verify_and_commit_frame(&decoded_attach, &binding)
+            .unwrap();
+        let encoded_accepted = server_leg.attach_accepted_frame().encode().unwrap();
+        let decoded_accepted = Frame::decode_owned_exact(encoded_accepted).unwrap();
+        let client_leg = request
+            .validate_accepted_frame(&binding, &decoded_accepted)
+            .unwrap();
+
+        assert_eq!(client_leg, server_leg);
+        assert_eq!(client_leg.transport_binding(), binding);
+        assert_eq!(authority.current_generation(), 2);
+    }
+
+    #[test]
+    fn server_frame_entry_authenticates_the_exact_decoded_attach_fields() {
+        let authority = authority_at(1);
+        let original = normal_request();
+        let binding = binding();
+        let proof = signer().prove(&original, &binding).unwrap();
+
+        let changed = request(
+            original.session_id(),
+            original.requested_generation().get(),
+            0x99,
+            original.versions(),
+            original.features(),
+        );
+        let changed_frame =
+            Frame::decode_owned_exact(changed.to_attach_frame(proof).encode().unwrap()).unwrap();
+        assert_eq!(
+            authority.verify_and_commit_frame(&changed_frame, &binding),
+            Err(AttachReject::Rejected)
+        );
+
+        let wrong_kind = Frame::new(
+            original.requested_generation(),
+            Record::AttachAccepted {
+                session_id: original.session_id(),
+                nonce: original.nonce(),
+                selected_version: SESSION_PROTOCOL_VERSION,
+                features: FeatureSet::new(original.features().offered()),
+            },
+        );
+        assert_eq!(
+            authority.verify_and_commit_frame(&wrong_kind, &binding),
+            Err(AttachReject::Rejected)
+        );
+        assert_eq!(authority.current_generation(), 1);
+    }
+
+    #[test]
+    fn client_rejects_mutated_attach_acceptance_without_minting_a_leg() {
+        let request = normal_request();
+        let binding = binding();
+        let accepted = |generation, selected_version, features| {
+            Frame::new(
+                LegGeneration::new(generation).unwrap(),
+                Record::AttachAccepted {
+                    session_id: request.session_id(),
+                    nonce: request.nonce(),
+                    selected_version,
+                    features: FeatureSet::new(features),
+                },
+            )
+        };
+
+        let mutations = [
+            accepted(3, SESSION_PROTOCOL_VERSION, 0b0111),
+            accepted(2, SESSION_PROTOCOL_VERSION + 1, 0b0111),
+            accepted(2, SESSION_PROTOCOL_VERSION, 0b1111),
+            accepted(2, SESSION_PROTOCOL_VERSION, 0b0110),
+            request.to_attach_frame(AttachProof::new([0x77; 32]).unwrap()),
+        ];
+        for mutation in mutations {
+            assert_eq!(
+                request.validate_accepted_frame(&binding, &mutation),
+                Err(AttachReject::Rejected)
+            );
+        }
+    }
+
+    #[test]
+    fn attach_acceptance_requires_exact_session_and_nonce_correlation() {
+        let request = normal_request();
+        let binding = binding();
+        let accepted_for = |session_id, accepted_nonce| {
+            Frame::new(
+                request.requested_generation(),
+                Record::AttachAccepted {
+                    session_id,
+                    nonce: accepted_nonce,
+                    selected_version: SESSION_PROTOCOL_VERSION,
+                    features: FeatureSet::new(request.features().offered()),
+                },
+            )
+        };
+
+        assert!(
+            request
+                .validate_accepted_frame(
+                    &binding,
+                    &accepted_for(request.session_id(), request.nonce()),
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            request
+                .validate_accepted_frame(&binding, &accepted_for(session(0x99), request.nonce()),),
+            Err(AttachReject::Rejected)
+        );
+        assert_eq!(
+            request.validate_accepted_frame(
+                &binding,
+                &accepted_for(request.session_id(), nonce(0x99)),
+            ),
+            Err(AttachReject::Rejected)
+        );
+    }
+
+    #[test]
+    fn lost_attach_request_retries_exact_next_generation_without_resynchronizing() {
+        let authority = authority_at(1);
+        let lost = normal_request();
+        let replacement_binding = binding_with_exporter(0x43);
+        let retry = request(
+            lost.session_id(),
+            lost.requested_generation().get(),
+            0x23,
+            lost.versions(),
+            lost.features(),
+        );
+        let proof = signer().prove(&retry, &replacement_binding).unwrap();
+        let decoded =
+            Frame::decode_owned_exact(retry.to_attach_frame(proof).encode().unwrap()).unwrap();
+
+        let outcome = authority
+            .verify_and_commit_or_resynchronize_frame(&decoded, &replacement_binding)
+            .unwrap();
+        let AttachFrameOutcome::Committed(server_leg) = outcome else {
+            panic!("an unobserved request must not advance server generation");
+        };
+        let client_leg = retry
+            .validate_accepted_frame(&replacement_binding, &server_leg.attach_accepted_frame())
+            .unwrap();
+
+        assert_eq!(client_leg, server_leg);
+        assert_eq!(authority.current_generation(), 2);
+    }
+
+    #[test]
+    fn lost_attach_response_resynchronizes_then_commits_exact_next_generation() {
+        let authority = authority_at(1);
+        let original = normal_request();
+        let original_binding = binding();
+        let original_proof = signer().prove(&original, &original_binding).unwrap();
+        let original_frame =
+            Frame::decode_owned_exact(original.to_attach_frame(original_proof).encode().unwrap())
+                .unwrap();
+        let first = authority
+            .verify_and_commit_or_resynchronize_frame(&original_frame, &original_binding)
+            .unwrap();
+        assert!(matches!(first, AttachFrameOutcome::Committed(_)));
+        assert_eq!(authority.current_generation(), 2);
+        // The first ATTACH_ACCEPTED is deliberately lost here.
+
+        let replacement_binding = binding_with_exporter(0x43);
+        let retry = request(
+            original.session_id(),
+            original.requested_generation().get(),
+            0x23,
+            original.versions(),
+            original.features(),
+        );
+        let retry_proof = signer().prove(&retry, &replacement_binding).unwrap();
+        let retry_frame =
+            Frame::decode_owned_exact(retry.to_attach_frame(retry_proof).encode().unwrap())
+                .unwrap();
+        let outcome = authority
+            .verify_and_commit_or_resynchronize_frame(&retry_frame, &replacement_binding)
+            .unwrap();
+        let AttachFrameOutcome::Resynchronize(server_status) = outcome else {
+            panic!("a proof-valid stale generation must return authenticated status");
+        };
+        assert_eq!(authority.current_generation(), 2);
+
+        let decoded_status =
+            Frame::decode_owned_exact(server_status.status_frame().encode().unwrap()).unwrap();
+        let client_status = retry
+            .validate_generation_status_frame(&replacement_binding, &decoded_status)
+            .unwrap();
+        assert_eq!(client_status, server_status);
+        assert_eq!(client_status.current_generation().get(), 2);
+        assert_eq!(client_status.transport_binding(), replacement_binding);
+
+        let next = client_status.next_request(nonce(0x24)).unwrap();
+        assert_eq!(next.requested_generation().get(), 3);
+        let next_proof = signer().prove(&next, &replacement_binding).unwrap();
+        let next_frame =
+            Frame::decode_owned_exact(next.to_attach_frame(next_proof).encode().unwrap()).unwrap();
+        let outcome = authority
+            .verify_and_commit_or_resynchronize_frame(&next_frame, &replacement_binding)
+            .unwrap();
+        let AttachFrameOutcome::Committed(server_leg) = outcome else {
+            panic!("the status-derived exact next generation must commit");
+        };
+        assert_eq!(authority.current_generation(), 3);
+        let accepted =
+            Frame::decode_owned_exact(server_leg.attach_accepted_frame().encode().unwrap())
+                .unwrap();
+        assert!(
+            next.validate_accepted_frame(&replacement_binding, &accepted)
+                .is_ok()
+        );
+
+        let stale = authority
+            .verify_and_commit_or_resynchronize_frame(&retry_frame, &replacement_binding)
+            .unwrap();
+        assert!(matches!(stale, AttachFrameOutcome::Resynchronize(_)));
+        assert_eq!(authority.current_generation(), 3);
+    }
+
+    #[test]
+    fn generation_status_requires_valid_auth_and_exact_request_correlation() {
+        let authority = authority_at(2);
+        let binding = binding();
+        let original = normal_request();
+        let valid_proof = signer().prove(&original, &binding).unwrap();
+        let bad_proof = AttachProof::new([0x77; 32]).unwrap();
+        let unknown = request(
+            session(0x99),
+            original.requested_generation().get(),
+            0x22,
+            original.versions(),
+            original.features(),
+        );
+        let unknown_proof = signer().prove(&unknown, &binding).unwrap();
+
+        assert_eq!(
+            authority.verify_and_commit_or_resynchronize_frame(
+                &original.to_attach_frame(bad_proof),
+                &binding,
+            ),
+            Err(AttachReject::Rejected)
+        );
+        assert_eq!(
+            authority.verify_and_commit_or_resynchronize_frame(
+                &unknown.to_attach_frame(unknown_proof),
+                &binding,
+            ),
+            Err(AttachReject::Rejected)
+        );
+
+        let AttachFrameOutcome::Resynchronize(status) = authority
+            .verify_and_commit_or_resynchronize_frame(
+                &original.to_attach_frame(valid_proof),
+                &binding,
+            )
+            .unwrap()
+        else {
+            panic!("valid stale attach must receive generation status");
+        };
+        let status_frame = status.status_frame();
+        let Record::AttachGenerationStatus {
+            session_id,
+            requested_generation,
+            nonce: status_nonce,
+        } = status_frame.record()
+        else {
+            panic!("status capability emitted the wrong record");
+        };
+        let mutations = [
+            Frame::new(
+                status.current_generation(),
+                Record::AttachGenerationStatus {
+                    session_id: session(0x99),
+                    requested_generation: *requested_generation,
+                    nonce: *status_nonce,
+                },
+            ),
+            Frame::new(
+                status.current_generation(),
+                Record::AttachGenerationStatus {
+                    session_id: *session_id,
+                    requested_generation: LegGeneration::new(3).unwrap(),
+                    nonce: *status_nonce,
+                },
+            ),
+            Frame::new(
+                status.current_generation(),
+                Record::AttachGenerationStatus {
+                    session_id: *session_id,
+                    requested_generation: *requested_generation,
+                    nonce: nonce(0x99),
+                },
+            ),
+            Frame::new(
+                status.current_generation(),
+                Record::AttachAccepted {
+                    session_id: original.session_id(),
+                    nonce: original.nonce(),
+                    selected_version: SESSION_PROTOCOL_VERSION,
+                    features: FeatureSet::new(original.features().offered()),
+                },
+            ),
+        ];
+        for mutation in mutations {
+            assert_eq!(
+                original.validate_generation_status_frame(&binding, &mutation),
+                Err(AttachReject::Rejected)
+            );
+        }
+        assert_eq!(authority.current_generation(), 2);
+    }
+
+    #[test]
+    fn exhausted_authenticated_status_cannot_derive_or_commit_a_generation() {
+        let authority = authority_at(u64::MAX);
+        let binding = binding();
+        let original = request(
+            session(0x11),
+            u64::MAX,
+            0x44,
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(1, 1).unwrap(),
+        );
+        let proof = signer().prove(&original, &binding).unwrap();
+
+        let AttachFrameOutcome::Resynchronize(status) = authority
+            .verify_and_commit_or_resynchronize_frame(&original.to_attach_frame(proof), &binding)
+            .unwrap()
+        else {
+            panic!("an exhausted proof-valid authority must return bounded status");
+        };
+        let decoded = Frame::decode_owned_exact(status.status_frame().encode().unwrap()).unwrap();
+        let client_status = original
+            .validate_generation_status_frame(&binding, &decoded)
+            .unwrap();
+
+        assert_eq!(client_status.current_generation().get(), u64::MAX);
+        assert_eq!(
+            client_status.next_request(nonce(0x45)),
+            Err(AttachReject::GenerationExhausted)
+        );
+        assert_eq!(authority.current_generation(), u64::MAX);
+    }
+
+    #[test]
+    fn generation_resynchronization_rejects_reusing_the_attach_nonce() {
+        let authority = authority_at(2);
+        let binding = binding();
+        let original = normal_request();
+        let proof = signer().prove(&original, &binding).unwrap();
+        let AttachFrameOutcome::Resynchronize(status) = authority
+            .verify_and_commit_or_resynchronize_frame(&original.to_attach_frame(proof), &binding)
+            .unwrap()
+        else {
+            panic!("a proof-valid stale attach must return generation status");
+        };
+
+        assert_eq!(
+            status.next_request(original.nonce()),
+            Err(AttachReject::Rejected)
+        );
+        assert_eq!(authority.current_generation(), 2);
+    }
+
+    #[test]
+    fn attach_transcript_and_nested_hmac_match_independent_known_answer() {
+        // Generated once with Python stdlib `hmac`/`hashlib`; these literals do
+        // not reuse this module's transcript or HMAC implementation.
+        const TRANSCRIPT_HEX: &str = "6d696e695f76706e2f726573756d61626c652f6174746163682f763100013131313131313131313131313131313131313131313131313131313131313131106d696e692d76706e2d6f776e65642f31424242424242424242424242424242424242424242424242424242424242424253535353535353535353535353535353111111111111111111111111111111110000000000000002222222222222222222222222222222220001000100000000000000070000000000000001";
+        const PROOF_HEX: &str = "48a657e42cdd46ed1334297189cb6982559a2e99c287cbfa746ef4d607bb7b3f";
+        let request = normal_request();
+        let binding = binding();
+
+        assert_eq!(
+            encode_transcript(&request, &binding),
+            decode_hex(TRANSCRIPT_HEX)
+        );
+        let proof = signer().prove(&request, &binding).unwrap();
+        assert_eq!(proof.as_bytes().as_slice(), decode_hex(PROOF_HEX));
+    }
+
+    fn decode_hex(hex: &str) -> Vec<u8> {
+        assert_eq!(hex.len() % 2, 0);
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair).unwrap();
+                u8::from_str_radix(pair, 16).unwrap()
+            })
+            .collect()
+    }
+}

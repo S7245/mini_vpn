@@ -47,14 +47,25 @@ _Avoid_: retry buffer (offset ownership and dedup make this continuation, not a 
 **Application ACK**:
 A resumable-protocol acknowledgement of the next contiguous TCP byte accepted
 by the receiving data-plane boundary: Target socket on client-to-server, or
-smoltcp/D16 terminal ownership on server-to-client. It alone advances the
-**TCP replay window**; QUIC ACK proves only one Transport leg delivered an
-encrypted packet.
+the local smoltcp TCP socket's `send_slice` boundary on server-to-client. It is
+never emitted merely because DATA decoded, entered D16, or released a D16
+permit: terminal-drop release is not delivery. It alone advances the **TCP
+replay window**; QUIC ACK proves only one Transport leg delivered an encrypted
+packet.
 _Avoid_: QUIC ACK, socket readability, transport progress
 
+**SessionFlowId**:
+A nonzero `u64` scoped to one **Resumable Upstream session**, identifying a
+TCP flow now and the Knife16 UDP delivery flow later. It is deliberately named
+and typed separately from TUIC's existing `flow-id`/`assoc-id` `u32` concepts;
+no identifier is translated by width-changing casts.
+_Avoid_: flow-id (already names the legacy UDP `u32`), stream id (Transport-specific), global flow id (scope is one session)
+
 **UDP delivery sequence**:
-The session-owner-assigned packet number for one UDP flow, used with bounded
-receiver feedback, deadlines, and dedup across Transport legs. It permits hot
+A per-direction sender-assigned packet number for one UDP flow, validated by
+the **Upstream session owner** and used with bounded receiver feedback,
+sender-relative TTL, and dedup across Transport legs. Separate directional
+namespaces avoid an allocation round trip for client uplink. It permits hot
 path switching and bounded transition duplication without turning real-time
 UDP into an unbounded reliable byte stream.
 _Avoid_: QUIC packet number (scope is the application flow), TCP offset (expired UDP packets may be dropped explicitly)

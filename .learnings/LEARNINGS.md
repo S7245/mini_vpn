@@ -1,5 +1,38 @@
 # Learnings
 
+## 2026-08-18 - Resumable ownership needs exact acceptance and capability boundaries
+
+- Application ACK belongs at the actual local sink-acceptance boundary. DATA
+  decode, reorder buffering, queue admission, and a permit release that may
+  also mean terminal drop cannot transfer peer-authoritative byte ownership.
+- Async local completions must use stable session/flow/operation capabilities,
+  not a transport-leg capability. A legitimate leg replacement may happen
+  while a Target connect, sink write, or half-close is in flight.
+- A server commit response must correlate session, request nonce, generation,
+  and negotiation. Because commit can precede response delivery, the protocol
+  also needs a proof-valid generation-resynchronization path rather than
+  guessing whether to retry `N` or `N+1`.
+- Preflight and commit should have one algorithm owner. Duplicating receive
+  coverage in the session layer created a future partial-mutation hazard; a
+  TCP-owned reservation lets the aggregate budget check the exact delta before
+  immediate commit. Do not export such a token unless it is also bound to one
+  exact window instance.
+- Logical byte bounds do not prove physical memory bounds. A tiny `Bytes`
+  slice or `String` can retain a huge caller allocation, and an intended
+  coalescer width does not limit every legal wire allocation. Normalize at the
+  persistent ownership boundary and derive backing/compaction ceilings from
+  the maximum admitted allocation.
+- Retained-suffix compaction must compare live bytes with the original backing,
+  not the current slice length. Otherwise repeated one-byte progress can keep
+  a large allocation forever while the apparent ratio looks healthy.
+- Terminal flow entries cannot count against `max_flows` forever. Release live
+  byte/range ownership immediately, retain only a count-bounded tombstone for
+  lost terminal control, and keep a monotonic ID high-water mark to prevent
+  delayed records from opening a new Target socket.
+
+Result:
+`docs/tech/2026-08-18-knife16-resumable-protocol-capacity-local-results.md`.
+
 ## 2026-08-18 - Paired packet boundaries must precede internal root-cause claims
 
 - A valid end-to-end loss percentage does not locate loss. Reconcile Target

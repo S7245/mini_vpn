@@ -4,6 +4,28 @@
 
 ## Next Planned Stage — Knife16 Path-Diverse Resumable Upstream (2026-08-18)
 
+- **Latest accepted position: Knife16 Task 2 is complete locally; Task 3 is
+  next.** The new transport-independent `resumable` fixed core contains the
+  bounded v1 codec, exporter/device/session/generation-bound attach authority,
+  lost-response generation resynchronization, directional TCP ownership
+  windows, checked replay/storage/copy capacity, and a pure session reducer.
+  Application ACK advances only after sink acceptance; async local completion
+  capabilities survive leg replacement; FIN is two-phase; terminal flows
+  reclaim live capacity into bounded tombstones. Receive budget admission and
+  commit use one TCP-owned algorithm, and its reservation is crate-private.
+- At a 500ms total horizon, 100/170/240 Mbit/s require
+  `6,250,000/10,625,000/15,000,000B` per direction and
+  `12,500,000/21,250,000/30,000,000B` full duplex. Physical backing/copy
+  bounds use the maximum legal wire allocation rather than the intended
+  coalescer width. Codec and state construction normalize small slices/strings
+  so they cannot retain uncharged caller backing.
+- Focused `94/94`, root `807 + 3 ignored`, all-target protocol/API
+  `19/19 + 1/1`, harness `819 + 3 ignored`, concurrency `10 + 4 ignored`,
+  release, Clippy, rustdoc, vendored Quinn `40 + 3 ignored`, quinn-proto `330`,
+  fmt, and diff gates pass. Protocol/auth/capacity and session/lifecycle reviews
+  have no unresolved P0/P1. No socket, production adapter, two-leg harness,
+  WAN test, or throughput claim exists yet. Result:
+  `docs/tech/2026-08-18-knife16-resumable-protocol-capacity-local-results.md`.
 - **Latest accepted position: Knife15 is closed by a genuine Tier-B quality
   failure.** Exact-source `d5b8304` entered the first valid frequency schedule,
   completed eleven cycles, and failed cycle 12 `udp-reverse` at
@@ -31,13 +53,15 @@
   bounded queues, dedup, deadline, and hot failover; permanent full-rate 2x
   duplication is rejected by HK capacity math. Standard TUIC remains a
   compatibility profile.
-- **Only next step:** implement Knife16 Tasks 2–8 locally: pure protocol and
-  capacity TDD, deep `OwnedUpstream` abstraction, deterministic two-leg
-  blackout/path-switch harnesses, single-owner server, real-socket
-  `>170 Mbit/s` gate, and security/review. A bounded two-ingress qualification
-  must pass before any long macOS run. Spec/plan/result:
+- **Only next step:** implement Knife16 Task 3 locally: place a deep
+  `OwnedUpstream` abstraction behind the existing `ProxyUpstream` and
+  `DatagramUpstream` call sites, keep TUIC/failover behavior unchanged, and
+  bind decoded attach responses to the exact authenticated TLS leg. Then
+  continue Tasks 4–8 in order. A bounded two-ingress qualification must pass
+  before any long macOS run. Spec/plan/results:
   `docs/tech/2026-08-18-knife16-path-diverse-resumable-upstream-architecture-spec.md`,
   `docs/tech/2026-08-18-knife16-path-diverse-resumable-upstream-implementation-plan.md`,
+  `docs/tech/2026-08-18-knife16-resumable-protocol-capacity-local-results.md`,
   and
   `docs/tech/2026-08-18-knife15-m2-frequency-first-run-udp-loss-results.md`.
 

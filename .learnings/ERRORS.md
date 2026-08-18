@@ -1,5 +1,25 @@
 # Errors
 
+## 2026-08-18 - Task-2 validation commands crossed tool and permission boundaries
+
+- A partial symbol search after the first `FlowId` rename missed a remaining
+  reference. Future behavior: run `rg` across the complete new module and its
+  external tests after every public vocabulary change; do not infer closure
+  from one compiler path.
+- `cargo test` accepts one positional name filter, and `cargo fmt` does not
+  accept a source directory as a formatting target. Use one module-prefix
+  filter or separate test invocations, and use `cargo fmt --all -- --check`.
+- The first standalone vendored-Quinn run failed 22 loopback tests with
+  `Operation not permitted` because the sandbox denied local UDP sockets. That
+  was permission-domain invalid evidence, not a Quinn or mini_vpn regression.
+  The identical offline command, pinned to the local vendored quinn-proto,
+  passed outside the sandbox (`40 + 3 ignored`, doctest `1/1`). Future
+  behavior: rerun socket-based gates in their required execution domain before
+  diagnosing product code.
+- Strict Clippy found new Task-2-only API/style findings plus one unrelated
+  existing boolean-assert lint. Fix new findings; carry only explicit known
+  legacy allowances. Do not weaken `-D warnings` globally.
+
 ## 2026-08-18 - zsh validation reused the special `path` variable
 
 - A docs-link validation command stored many filenames in one scalar and

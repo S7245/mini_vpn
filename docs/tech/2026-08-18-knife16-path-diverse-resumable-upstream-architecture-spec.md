@@ -2,7 +2,7 @@
 
 Date: 2026-08-18
 
-Status: **ACCEPTED DIRECTION; IMPLEMENTATION NOT STARTED; M3 BLOCKED**
+Status: **TASK 2 LOCAL FIXED CORE COMPLETE; TASK 3 NEXT; M3 BLOCKED**
 
 ## Goal
 
@@ -66,17 +66,33 @@ migration.
 
 ## TCP ownership
 
-Minimum records:
+The Task-2 v1 fixed core implements these records:
 
 ```text
+ATTACH(session_id, nonce, version_range, features, proof)
+ATTACH_ACCEPTED(session_id, nonce, selected_version, features)
+ATTACH_GENERATION_STATUS(session_id, requested_generation, nonce)
 OPEN(flow_id, target)
-C2S_DATA(flow_id, offset, bytes)
-S2C_DATA(flow_id, offset, bytes)
-ACK(flow_id, direction, next_contiguous_offset)
+OPEN_RESULT(flow_id, result)
+DATA(flow_id, direction, offset, bytes)
+ACK(flow_id, direction, next_contiguous_offset, final_accepted)
 CLOSE(flow_id, direction, final_offset)
 RESET(flow_id, reason)
-ATTACH(session_id, leg_generation, proof)
 ```
+
+The fixed frame envelope carries the leg generation. Frame version and
+negotiated session version are distinct. `ATTACH_ACCEPTED` echoes the exact
+session and request nonce; a proof-valid stale attach can receive an
+authenticated, correlated generation status so a lost acceptance response
+does not strand the client on an unknowable generation.
+
+`OPEN` domain targets carry the exact non-empty, NUL-free UTF-8 resolver input
+in at most 253 bytes. The framing layer neither applies IDNA nor treats the
+value as canonical DNS ASCII; trailing dots, Unicode, and other resolver input
+remain byte-exact. Resolution policy belongs to the session owner, and an
+unresolvable or policy-rejected value produces a stable `OPEN_RESULT` rather
+than a protocol parser failure. IP targets and non-zero ports remain encoded
+without text conversion.
 
 The client acknowledges downlink bytes only after the local smoltcp TCP socket
 accepts them into its transmit buffer; subsequent packet ownership remains
@@ -100,7 +116,9 @@ Additional invariants:
 
 - exactly one live Target socket is owned by one session owner per TCP flow;
 - duplicate or replayed records never duplicate Target or local delivery;
-- gaps and conflicting overlaps fail closed;
+- an in-window gap is buffered within explicit byte/range bounds and grants no
+  ACK or delivery authority until filled; out-of-window gaps and conflicting
+  overlaps fail closed;
 - a transport-leg failure does not close the Target socket until explicit
   close or the bounded resume grace expires;
 - replay-buffer exhaustion backpressures the producer; it never drops TCP;
@@ -113,9 +131,12 @@ non-destructive.
 
 ## UDP ownership
 
-Each UDP flow has an owner-assigned packet sequence and deadline. Each leg has
-an independent bounded queue and cancellation domain. Receiver feedback
-reports contiguous/high-water progress and a bounded loss bitmap.
+Each UDP flow has a separate per-direction sequence allocated by that
+direction's sender and validated inside owner-authoritative flow state; client
+uplink does not require a sequence-allocation round trip. Each packet also has
+a sender-relative TTL rather than an unportable absolute monotonic timestamp.
+Each leg has an independent bounded queue and cancellation domain. Receiver
+feedback reports contiguous/high-water progress and a bounded loss bitmap.
 
 - one primary leg carries ordinary traffic;
 - the secondary stays authenticated and path-probed at low rate;
@@ -141,18 +162,27 @@ not.
 
 ## Capacity and bounds
 
-At the required local `100 Mbit/s` design point:
+Replay capacity uses application bytes and checked integer arithmetic:
 
 ```text
-100 Mbit/s = 12.5 MB/s
-500ms retained TCP replay = 6.25 MB per direction
+bytes/direction = ceil(rate_bps * effective_horizon_ns / 8,000,000,000)
+effective_horizon = injected_blackout_budget + max_normal_application_ACK_age
+
+rate       500ms characterization/direction   full duplex
+100 Mbit/s                    6,250,000B       12,500,000B
+170 Mbit/s                   10,625,000B       21,250,000B
+240 Mbit/s                   15,000,000B       30,000,000B
 ```
 
 Implementation must derive per-flow and global replay bounds from target rate
-and accepted resume horizon, then prove them with deterministic tests. The
-initial design must support at least a 500ms injected primary blackout at
-100 Mbit/s without exceeding a bounded global allocation. It must not freeze
-an arbitrary production value before measurement.
+and accepted resume horizon, then prove them with deterministic tests. A
+500ms value with zero ACK allowance describes total retained coverage only;
+support for an additional 500ms blackout must add the measured/configured
+normal application-ACK age. The initial design must support at least a 500ms
+injected primary blackout at 100 Mbit/s without exceeding a bounded global
+allocation. Global capacity derives from aggregate directional rate, never
+`per_flow * flow_count`. It must not freeze an arbitrary production value
+before measurement.
 
 Queues are per leg and per traffic class. Control/ACK/attach records cannot be
 starved by bulk replay. No queue, dedup window, replay range, pending open, or
@@ -249,10 +279,40 @@ attributed inside the owner rather than only around it.
 6. Only then run the long macOS gate with the existing strict TCP receiver-zero
    and UDP `<=3%` limits.
 
+## Task-2 local closure
+
+The transport-independent `resumable` fixed core now contains:
+
+- bounded wire codec and literal golden vectors for every v1 record;
+- exporter/device/session/generation-bound attach HMAC plus exact-next atomic
+  generation authority and response-loss resynchronization;
+- directional TCP replay/reorder/dedup/final-offset ownership windows;
+- a pure session reducer whose local completion capabilities survive leg
+  replacement while peer mutation requires the exact committed leg;
+- checked per-flow/global capacity and physical backing/copy characterization
+  at 100/170/240 Mbit/s.
+
+Application ACK is emitted only for bytes the local sink actually accepted;
+decode, buffering, and abandon do not advance it. FIN acknowledgement is
+two-phase and follows successful sink half-close. Live-flow capacity is
+reclaimed into count-bounded tombstones without permitting flow-id reuse.
+Receive-budget admission and ownership commit share one TCP-owned algorithm;
+its reservation is crate-private and cannot become a public cross-window
+capability.
+
+Focused `94/94`, root `807 + 3 ignored`, protocol `19/19`, public API `1/1`,
+harness `819 + 3 ignored`, concurrency `10 + 4 ignored`, release, Clippy,
+rustdoc, vendored Quinn `40 + 3 ignored`, quinn-proto `330`, fmt, and diff
+gates pass. Two independent reviews report no unresolved P0/P1. No production
+adapter, socket, two-leg harness, WAN run, or throughput claim exists yet.
+Detailed result:
+`docs/tech/2026-08-18-knife16-resumable-protocol-capacity-local-results.md`.
+
 ## Design score
 
-**8/10 before implementation.** The architecture puts socket and byte
-ownership at the only layer that can resume established flows, isolates leg
-backpressure, has explicit bounds, and preserves the mature local data plane.
-It reaches **9/10** after deterministic protocol/capacity proof and **10/10**
-only after independent-path WAN acceptance and operational cleanup evidence.
+**9/10 after Task-2 deterministic protocol/capacity proof.** The architecture
+puts socket and byte ownership at the only layer that can resume established
+flows, isolates leg backpressure, has explicit bounds, and preserves the
+mature local data plane. It reaches **10/10** only after the adapter, two-leg
+harness, local real-socket capacity gate, independent-path WAN acceptance, and
+operational cleanup evidence pass.

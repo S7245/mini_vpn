@@ -187,7 +187,27 @@ release-readiness work, prioritize the latest Knife15 result, long-duration
 plan, and macOS HITL runbook. Use the Knife14 endpoint-pacing and VPS completion
 documents as the frozen architecture/capacity baseline.
 
-Current Knife15 summary, as of 2026-08-18:
+Current Knife16/Knife15 summary, as of 2026-08-18:
+
+- **Knife16 Task 2 is complete locally; Task 3 is next.** The new pure
+  `resumable` fixed core implements a bounded/golden-tested v1 codec,
+  exporter/device/session/generation-bound attach authority, lost-response
+  generation resynchronization, directional TCP replay/receive ownership,
+  stable cross-leg session capabilities, two-phase FIN, bounded terminal
+  tombstones, and checked replay/storage/copy math. Application ACK advances
+  only after sink acceptance; decode, buffering, and abandon cannot mint it.
+  Receive budget admission and commit share one TCP-owned algorithm, whose
+  reservation is crate-private.
+- At a 500ms total horizon, 100/170/240 Mbit/s require
+  `6,250,000/10,625,000/15,000,000B` per direction. Focused `94/94`, root
+  `807 + 3 ignored`, protocol/API `19/19 + 1/1`, harness
+  `819 + 3 ignored`, concurrency `10 + 4 ignored`, release, Clippy, rustdoc,
+  vendored Quinn/proto, fmt, and diff pass. Protocol/auth/capacity and
+  session/lifecycle reviews have no unresolved P0/P1. This stage has no
+  production adapter, socket, WAN test, or throughput claim. Next implement
+  only the deep `OwnedUpstream` abstraction and typed TLS-leg provenance; keep
+  TUIC/failover behavior unchanged. Result:
+  `docs/tech/2026-08-18-knife16-resumable-protocol-capacity-local-results.md`.
 
 - **Knife15 is closed by a genuine Tier-B quality failure; Knife16 is the
   active architecture stage.** Exact-source `d5b8304` passed baseline,

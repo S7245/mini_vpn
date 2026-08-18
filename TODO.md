@@ -4,7 +4,30 @@
 
 ### Path-diverse resumable upstream
 
-#### Latest decision (2026-08-18 — Knife15 Tier B failed; architecture replacement next)
+#### Latest decision (2026-08-18 — Knife16 Task 2 complete; Task 3 next)
+
+Knife16 Task 2 now passes locally. The transport-independent `resumable` fixed
+core implements the bounded v1 codec, authenticated exact-next attach and
+response-loss generation resynchronization, directional TCP replay/receive
+ownership, stable cross-leg session capabilities, two-phase FIN, bounded
+terminal tombstones, and checked capacity/storage/copy math. Application ACK
+advances only after actual sink acceptance. Invalid or small-but-large-backing
+DATA/OPEN inputs cannot enter persistent state uncharged.
+
+At a 500ms total retained horizon, 100/170/240 Mbit/s require
+`6,250,000/10,625,000/15,000,000B` per direction. Focused `94/94`, root
+`807 + 3 ignored`, protocol/API `19/19 + 1/1`, harness
+`819 + 3 ignored`, concurrency `10 + 4 ignored`, release, Clippy, rustdoc,
+vendored Quinn/proto, fmt, diff, and two concentrated reviews pass with no
+unresolved P0/P1. This is a necessary pure stage: no production adapter,
+socket, two-leg harness, WAN result, or `>170 Mbit/s` claim exists yet. Result:
+`docs/tech/2026-08-18-knife16-resumable-protocol-capacity-local-results.md`.
+
+Next implement Task 3 only: the deep `OwnedUpstream` adapter seam and exact
+TLS-leg provenance, while preserving existing TUIC/failover behavior. Do not
+start a WAN test.
+
+#### Prior decision context (2026-08-18 — Knife15 Tier B failed)
 
 Knife15 is closed without acceptance. Exact-source `d5b8304` passed all
 pre-action gates and eleven complete cycles, then cycle 12 `udp-reverse` lost
@@ -30,8 +53,9 @@ failover for UDP. TUIC remains a compatibility profile.
 
 Current execution order:
 
-1. protocol model and capacity characterization;
-2. deep `OwnedUpstream` abstraction behind existing client interfaces;
+1. protocol model and capacity characterization — **COMPLETE**;
+2. deep `OwnedUpstream` abstraction behind existing client interfaces —
+   **NEXT**;
 3. deterministic two-leg TCP blackout and UDP path-switch harnesses;
 4. `mini_vpn-upstreamd` single session owner and loopback lifecycle tests;
 5. local real-socket `>170 Mbit/s` capacity gate;
