@@ -14,16 +14,17 @@ use std::sync::{Arc, Weak};
 use thiserror::Error;
 
 use crate::owned_upstream::leg::{
-    AttachedLeg, BoundInbound, EstablishedLeg, LegBoundFrame, LegOutboundQueueLease, LegSeal,
-    LegTransportEndpoint, LegTransportReporter,
+    AttachedLeg, BoundInbound, EstablishedLeg, LegBoundFrame, LegOutboundQueueLease,
+    LegProvenanceError, LegSeal, LegTransportEndpoint, LegTransportReporter, PendingInitialAttach,
 };
 use crate::owned_upstream::two_leg::{
     EncodedDelivery, FaultAction, LegId, SimTime, TwoLegWire, WireCapacity, WireCounters,
     WireDirection, WireError, WireLane, WireRoute,
 };
 use crate::resumable::{
-    AttachNonce, AttachTransportBinding, DecodedFrame, FeatureSet, Frame, LegControlFrame,
-    LegGeneration, ProtocolError, Record, SessionId,
+    ATTACH_ACCEPTED_ENCODED_BYTES, AttachNonce, AttachRequest, AttachTransportBinding,
+    DecodedFrame, FeatureSet, Frame, LegControlFrame, LegGeneration, ProtocolError, Record,
+    SessionId,
 };
 
 /// Local endpoint role for one authenticated transport connection.
@@ -290,6 +291,9 @@ pub(crate) trait EncodedLegTransport {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LegOutboundSessionPhase {
     AwaitingAttachAcceptance,
+    AttachAcceptanceReserved,
+    AttachRequestPending,
+    AttachStatusPending,
     AttachRecovery,
     Active,
 }
@@ -306,6 +310,7 @@ struct QueuedOutboundFrame {
     frame: QueuedProtocolFrame,
     bytes: usize,
     ordered: bool,
+    delivery_state: Option<Arc<OrderedDeliveryState>>,
 }
 
 /// Bounded production-shared owner of encoded protocol frames awaiting one
@@ -385,6 +390,38 @@ impl LegOutboundQueue {
         reason = "the error must return the exact unconsumed frame without a hot-path allocation"
     )]
     pub(crate) fn push(&mut self, frame: Frame) -> Result<(), LegOutboundQueueError> {
+        let restricted = match frame.record() {
+            Record::Attach { .. } => {
+                Some(LegOutboundQueueErrorKind::RegisteredAttachAdmissionRequired)
+            }
+            Record::AttachAccepted { .. } => {
+                Some(LegOutboundQueueErrorKind::AttachAcceptanceAdmissionRequired)
+            }
+            Record::AttachGenerationStatus { .. } => {
+                Some(LegOutboundQueueErrorKind::AuthenticatedAttachStatusAdmissionRequired)
+            }
+            _ => None,
+        };
+        if let Some(kind) = restricted {
+            return Err(LegOutboundQueueError::new(frame, kind));
+        }
+        let blocked_kind = match self.session_phase {
+            LegOutboundSessionPhase::AttachAcceptanceReserved => {
+                Some(LegOutboundQueueErrorKind::AttachAcceptanceReserved)
+            }
+            LegOutboundSessionPhase::AttachRequestPending => {
+                Some(LegOutboundQueueErrorKind::AttachRequestPending)
+            }
+            LegOutboundSessionPhase::AttachStatusPending => {
+                Some(LegOutboundQueueErrorKind::AttachStatusPending)
+            }
+            LegOutboundSessionPhase::AwaitingAttachAcceptance
+            | LegOutboundSessionPhase::AttachRecovery
+            | LegOutboundSessionPhase::Active => None,
+        };
+        if let Some(kind) = blocked_kind {
+            return Err(LegOutboundQueueError::new(frame, kind));
+        }
         let ordered = self.session_phase == LegOutboundSessionPhase::AttachRecovery;
         self.push_inner(frame, ordered).map(|_| {
             if self.session_phase == LegOutboundSessionPhase::AwaitingAttachAcceptance {
@@ -419,17 +456,319 @@ impl LegOutboundQueue {
                 LegControlQueueErrorKind::EndpointLost,
             ));
         }
-        if self.session_phase == LegOutboundSessionPhase::AttachRecovery {
+        if matches!(
+            self.session_phase,
+            LegOutboundSessionPhase::AttachAcceptanceReserved
+                | LegOutboundSessionPhase::AttachRequestPending
+                | LegOutboundSessionPhase::AttachStatusPending
+                | LegOutboundSessionPhase::AttachRecovery
+        ) {
             return Err(LegControlQueueError::new(
                 frame,
-                LegControlQueueErrorKind::AttachRecoveryPending,
+                match self.session_phase {
+                    LegOutboundSessionPhase::AttachAcceptanceReserved => {
+                        LegControlQueueErrorKind::AttachAcceptanceReserved
+                    }
+                    LegOutboundSessionPhase::AttachRequestPending => {
+                        LegControlQueueErrorKind::AttachRequestPending
+                    }
+                    LegOutboundSessionPhase::AttachStatusPending => {
+                        LegControlQueueErrorKind::AttachStatusPending
+                    }
+                    LegOutboundSessionPhase::AttachRecovery => {
+                        LegControlQueueErrorKind::AttachRecoveryPending
+                    }
+                    LegOutboundSessionPhase::AwaitingAttachAcceptance
+                    | LegOutboundSessionPhase::Active => unreachable!(),
+                },
             ));
         }
+        let delivery_state = Arc::new(OrderedDeliveryState {
+            delivered: AtomicBool::new(false),
+        });
         let ordinal = self.push_control_inner(frame, features)?;
+        if let Some(queued) = self.frames.back_mut() {
+            queued.delivery_state = Some(Arc::clone(&delivery_state));
+        }
         Ok(LegControlEnqueued {
             queue: Arc::downgrade(&self.identity),
             endpoint: self.endpoint.clone(),
             ordinal,
+            delivery_state,
+        })
+    }
+
+    /// Admits the exact signed ATTACH derived from a registered standby into
+    /// that transport's sole FIFO. Unlike generic session admission, this
+    /// transition remains pre-active until the correlated response is
+    /// validated and installed by the client recovery typestate.
+    #[allow(
+        clippy::result_large_err,
+        reason = "bounded pressure must return the exact signed ATTACH frame"
+    )]
+    pub(super) fn push_registered_attach_request(
+        &mut self,
+        seal: &LegSeal,
+        request: AttachRequest,
+        frame: Frame,
+    ) -> Result<AttachRequestEnqueued, LegOutboundQueueError> {
+        if !self.binds_seal(seal) {
+            return Err(LegOutboundQueueError::new(
+                frame,
+                LegOutboundQueueErrorKind::WrongLeg,
+            ));
+        }
+        if self.endpoint_is_lost() {
+            return Err(LegOutboundQueueError::new(
+                frame,
+                LegOutboundQueueErrorKind::EndpointLost,
+            ));
+        }
+        let carried = match AttachRequest::from_attach_frame(&frame) {
+            Ok((carried, _proof)) => carried,
+            Err(_) => {
+                return Err(LegOutboundQueueError::new(
+                    frame,
+                    LegOutboundQueueErrorKind::NotAttachRequest,
+                ));
+            }
+        };
+        if carried != request {
+            return Err(LegOutboundQueueError::new(
+                frame,
+                LegOutboundQueueErrorKind::MismatchedAttachRequest,
+            ));
+        }
+        if self
+            .ordered_delivery_wait
+            .as_ref()
+            .is_some_and(OrderedDeliveryWait::is_delivered)
+        {
+            self.ordered_delivery_wait = None;
+        }
+        if self.session_phase != LegOutboundSessionPhase::AwaitingAttachAcceptance
+            || !self.frames.is_empty()
+            || self.owned_bytes != 0
+            || self.ordered_delivery_wait.is_some()
+        {
+            return Err(LegOutboundQueueError::new(
+                frame,
+                LegOutboundQueueErrorKind::AttachRequestNotFirst {
+                    next_ordinal: self.next_enqueue_ordinal,
+                    queued_frames: self.frames.len(),
+                    queued_bytes: self.owned_bytes,
+                },
+            ));
+        }
+        let delivery_state = Arc::new(OrderedDeliveryState {
+            delivered: AtomicBool::new(false),
+        });
+        let ordinal = self.push_inner(frame, true)?;
+        if let Some(queued) = self.frames.back_mut() {
+            queued.delivery_state = Some(Arc::clone(&delivery_state));
+        }
+        self.session_phase = LegOutboundSessionPhase::AttachRequestPending;
+        Ok(AttachRequestEnqueued {
+            queue: Arc::downgrade(&self.identity),
+            endpoint: self.endpoint.clone(),
+            ordinal,
+            request,
+            delivery_state,
+        })
+    }
+
+    /// Dedicated initial-bootstrap admission. It deliberately returns a
+    /// distinct receipt so neither registered-standby recovery nor a generic
+    /// ATTACH producer can be substituted for the initial client authority.
+    #[allow(
+        clippy::result_large_err,
+        reason = "bounded pressure returns the exact signed initial ATTACH"
+    )]
+    fn push_initial_attach_request(
+        &mut self,
+        seal: &LegSeal,
+        request: AttachRequest,
+        frame: Frame,
+    ) -> Result<InitialAttachRequestEnqueued, LegOutboundQueueError> {
+        self.push_registered_attach_request(seal, request, frame)
+            .map(InitialAttachRequestEnqueued)
+    }
+
+    /// Dedicated ordered admission for a stale request re-signed onto a fresh
+    /// status-only transport after the registered B request was delivered and
+    /// its sole validator was lost.
+    #[allow(
+        clippy::result_large_err,
+        reason = "bounded pressure returns the exact signed status-retry frame"
+    )]
+    pub(super) fn push_status_retry_attach_request(
+        &mut self,
+        seal: &LegSeal,
+        request: AttachRequest,
+        frame: Frame,
+    ) -> Result<StatusRetryAttachEnqueued, LegOutboundQueueError> {
+        self.push_registered_attach_request(seal, request, frame)
+            .map(StatusRetryAttachEnqueued)
+    }
+
+    /// Dedicated ordered admission for the exact successor derived from an
+    /// authenticated high-water status. It cannot activate the queue before
+    /// the correlated acceptance is validated by client typestate.
+    #[allow(
+        clippy::result_large_err,
+        reason = "bounded pressure returns the exact signed catch-up frame"
+    )]
+    pub(super) fn push_catch_up_attach_request(
+        &mut self,
+        seal: &LegSeal,
+        request: AttachRequest,
+        frame: Frame,
+    ) -> Result<CatchUpAttachEnqueued, LegOutboundQueueError> {
+        self.push_registered_attach_request(seal, request, frame)
+            .map(CatchUpAttachEnqueued)
+    }
+
+    /// Admits a proof-authenticated stale/exhausted ATTACH status through the
+    /// exact status leg's sole FIFO. The queue remains non-active and the
+    /// returned receipt exposes actual ordered delivery completion.
+    #[allow(
+        clippy::result_large_err,
+        reason = "bounded pressure returns the exact correlated status frame"
+    )]
+    pub(super) fn push_authenticated_attach_status(
+        &mut self,
+        seal: &LegSeal,
+        frame: Frame,
+    ) -> Result<AttachStatusEnqueued, LegOutboundQueueError> {
+        let (generation, session_id, requested_generation, nonce) = match frame.record() {
+            Record::AttachGenerationStatus {
+                session_id,
+                requested_generation,
+                nonce,
+            } => (
+                frame.leg_generation(),
+                *session_id,
+                *requested_generation,
+                *nonce,
+            ),
+            _ => {
+                return Err(LegOutboundQueueError::new(
+                    frame,
+                    LegOutboundQueueErrorKind::NotAttachStatus,
+                ));
+            }
+        };
+        if !self.binds_seal(seal) {
+            return Err(LegOutboundQueueError::new(
+                frame,
+                LegOutboundQueueErrorKind::WrongLeg,
+            ));
+        }
+        if self.endpoint_is_lost() {
+            return Err(LegOutboundQueueError::new(
+                frame,
+                LegOutboundQueueErrorKind::EndpointLost,
+            ));
+        }
+        if self
+            .ordered_delivery_wait
+            .as_ref()
+            .is_some_and(OrderedDeliveryWait::is_delivered)
+        {
+            self.ordered_delivery_wait = None;
+        }
+        if self.session_phase != LegOutboundSessionPhase::AwaitingAttachAcceptance
+            || !self.frames.is_empty()
+            || self.owned_bytes != 0
+            || self.ordered_delivery_wait.is_some()
+        {
+            return Err(LegOutboundQueueError::new(
+                frame,
+                LegOutboundQueueErrorKind::AttachStatusNotFirst {
+                    next_ordinal: self.next_enqueue_ordinal,
+                    queued_frames: self.frames.len(),
+                    queued_bytes: self.owned_bytes,
+                },
+            ));
+        }
+        let delivery_state = Arc::new(OrderedDeliveryState {
+            delivered: AtomicBool::new(false),
+        });
+        let ordinal = self.push_inner(frame, true)?;
+        if let Some(queued) = self.frames.back_mut() {
+            queued.delivery_state = Some(Arc::clone(&delivery_state));
+        }
+        self.session_phase = LegOutboundSessionPhase::AttachStatusPending;
+        Ok(AttachStatusEnqueued {
+            queue: Arc::downgrade(&self.identity),
+            endpoint: self.endpoint.clone(),
+            ordinal,
+            generation,
+            session_id,
+            requested_generation,
+            nonce,
+            delivery_state,
+        })
+    }
+
+    /// Exclusively reserves this exact leg's sole empty pre-attach FIFO before
+    /// the owner generation CAS. The reservation is non-cloneable and must be
+    /// either explicitly released before a failed transaction or carried by
+    /// the installed publication into the same queue's acceptance admission.
+    pub(super) fn reserve_attach_acceptance(
+        &mut self,
+        leg: &EstablishedLeg,
+    ) -> Result<AttachAcceptanceReservation, AttachAcceptanceReserveError> {
+        if !self.binds_established_leg(leg) {
+            return Err(AttachAcceptanceReserveError::WrongLeg);
+        }
+        if self.endpoint_is_lost() {
+            return Err(AttachAcceptanceReserveError::EndpointLost);
+        }
+        if self
+            .ordered_delivery_wait
+            .as_ref()
+            .is_some_and(OrderedDeliveryWait::is_delivered)
+        {
+            self.ordered_delivery_wait = None;
+        }
+        if self.session_phase != LegOutboundSessionPhase::AwaitingAttachAcceptance
+            || !self.frames.is_empty()
+            || self.owned_bytes != 0
+            || self.ordered_delivery_wait.is_some()
+        {
+            return Err(AttachAcceptanceReserveError::NotAwaiting {
+                queued_frames: self.frames.len(),
+                queued_bytes: self.owned_bytes,
+                ordered_delivery_pending: self.ordered_delivery_wait.is_some(),
+            });
+        }
+        let Some(seal) = self.seal.as_ref().map(LegSeal::share) else {
+            return Err(AttachAcceptanceReserveError::WrongLeg);
+        };
+        let ordinal = self.next_enqueue_ordinal;
+        let Some(next_ordinal) = ordinal.checked_add(1) else {
+            return Err(AttachAcceptanceReserveError::EnqueueOrdinalExhausted);
+        };
+        let Some(next_owned_bytes) = self.owned_bytes.checked_add(ATTACH_ACCEPTED_ENCODED_BYTES)
+        else {
+            return Err(AttachAcceptanceReserveError::ByteCountOverflow);
+        };
+        if self.frames.len() >= self.max_frames || next_owned_bytes > self.max_bytes {
+            return Err(AttachAcceptanceReserveError::CapacityExceeded {
+                queued_frames: self.frames.len(),
+                queued_bytes: self.owned_bytes,
+                incoming_bytes: ATTACH_ACCEPTED_ENCODED_BYTES,
+            });
+        }
+        self.session_phase = LegOutboundSessionPhase::AttachAcceptanceReserved;
+        Ok(AttachAcceptanceReservation {
+            queue: Arc::downgrade(&self.identity),
+            endpoint: self.endpoint.clone(),
+            seal,
+            ordinal,
+            next_ordinal,
+            next_owned_bytes,
         })
     }
 
@@ -441,10 +780,124 @@ impl LegOutboundQueue {
         clippy::result_large_err,
         reason = "the error must return the exact unconsumed frame without a hot-path allocation"
     )]
+    #[cfg(test)]
     pub(crate) fn push_attach_acceptance(
         &mut self,
         attached: &AttachedLeg,
         frame: Frame,
+    ) -> Result<AttachAcceptanceEnqueued, LegOutboundQueueError> {
+        self.push_attach_acceptance_in_phase(
+            attached,
+            frame,
+            LegOutboundSessionPhase::AwaitingAttachAcceptance,
+        )
+    }
+
+    /// Consumes the wire acceptance only through the exact pre-CAS queue
+    /// reservation retained by the installed owner publication.
+    #[allow(
+        clippy::result_large_err,
+        reason = "reserved admission failure must return both exact reservation and frame ownership"
+    )]
+    pub(super) fn push_reserved_attach_acceptance(
+        &mut self,
+        reservation: AttachAcceptanceReservation,
+        attached: &AttachedLeg,
+        frame: Frame,
+    ) -> Result<AttachAcceptanceEnqueued, ReservedAttachAcceptanceError> {
+        if !reservation.belongs_to_queue(self)
+            || !reservation.belongs_to_attached(attached)
+            || !reservation.endpoint_matches(self)
+            || !reservation.matches_reserved_state(self)
+        {
+            return Err(ReservedAttachAcceptanceError::new(
+                reservation,
+                frame,
+                LegOutboundQueueErrorKind::WrongAttachAcceptanceReservation,
+            ));
+        }
+        let (generation, session_id, nonce) = match frame.record() {
+            Record::AttachAccepted {
+                session_id, nonce, ..
+            } => (frame.leg_generation(), *session_id, *nonce),
+            _ => {
+                return Err(ReservedAttachAcceptanceError::new(
+                    reservation,
+                    frame,
+                    LegOutboundQueueErrorKind::NotAttachAcceptance,
+                ));
+            }
+        };
+        if !self.binds_attached_leg(attached) {
+            return Err(ReservedAttachAcceptanceError::new(
+                reservation,
+                frame,
+                LegOutboundQueueErrorKind::WrongLeg,
+            ));
+        }
+        if self.endpoint_is_lost() {
+            return Err(ReservedAttachAcceptanceError::new(
+                reservation,
+                frame,
+                LegOutboundQueueErrorKind::EndpointLost,
+            ));
+        }
+        if !attached.matches_attach_acceptance(&frame) {
+            return Err(ReservedAttachAcceptanceError::new(
+                reservation,
+                frame,
+                LegOutboundQueueErrorKind::MismatchedAttachAcceptance,
+            ));
+        }
+        let ordinal = reservation.ordinal;
+        self.frames.push_back(QueuedOutboundFrame {
+            frame: QueuedProtocolFrame::Session(frame),
+            bytes: ATTACH_ACCEPTED_ENCODED_BYTES,
+            ordered: true,
+            delivery_state: None,
+        });
+        self.owned_bytes = reservation.next_owned_bytes;
+        self.next_enqueue_ordinal = reservation.next_ordinal;
+        self.session_phase = LegOutboundSessionPhase::AttachRecovery;
+        Ok(AttachAcceptanceEnqueued {
+            queue: Arc::downgrade(&self.identity),
+            endpoint: self.endpoint.clone(),
+            ordinal,
+            generation,
+            session_id,
+            nonce,
+        })
+    }
+
+    /// Initial owner bootstrap has no recovery effects. The exact reserved
+    /// acceptance admission and transition to Active therefore happen under
+    /// one mutable queue borrow; capacity pressure can never ask the owner to
+    /// repeat its already-committed generation CAS.
+    #[allow(
+        clippy::result_large_err,
+        reason = "post-CAS pressure must return the exact reservation and acceptance frame"
+    )]
+    pub(super) fn push_reserved_initial_attach_acceptance(
+        &mut self,
+        reservation: AttachAcceptanceReservation,
+        attached: &AttachedLeg,
+        frame: Frame,
+    ) -> Result<AttachAcceptanceEnqueued, ReservedAttachAcceptanceError> {
+        let acceptance = self.push_reserved_attach_acceptance(reservation, attached, frame)?;
+        debug_assert_eq!(self.session_phase, LegOutboundSessionPhase::AttachRecovery);
+        self.session_phase = LegOutboundSessionPhase::Active;
+        Ok(acceptance)
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "bounded acceptance pressure must return the exact unconsumed frame"
+    )]
+    fn push_attach_acceptance_in_phase(
+        &mut self,
+        attached: &AttachedLeg,
+        frame: Frame,
+        required_phase: LegOutboundSessionPhase,
     ) -> Result<AttachAcceptanceEnqueued, LegOutboundQueueError> {
         let (generation, session_id, nonce) = match frame.record() {
             Record::AttachAccepted {
@@ -487,7 +940,7 @@ impl LegOutboundQueue {
         // sole FIFO first, provided that earlier leg-control has completed and
         // leaves this phase unchanged. A prior generic Frame permanently moves
         // the queue to Active and is still rejected here.
-        if self.session_phase != LegOutboundSessionPhase::AwaitingAttachAcceptance
+        if self.session_phase != required_phase
             || !self.frames.is_empty()
             || self.owned_bytes != 0
             || self.ordered_delivery_wait.is_some()
@@ -560,6 +1013,7 @@ impl LegOutboundQueue {
             frame: QueuedProtocolFrame::Session(frame),
             bytes,
             ordered,
+            delivery_state: None,
         });
         self.owned_bytes = next_bytes;
         self.next_enqueue_ordinal = next_ordinal;
@@ -611,6 +1065,7 @@ impl LegOutboundQueue {
             frame: QueuedProtocolFrame::LegControl { frame, features },
             bytes,
             ordered: true,
+            delivery_state: None,
         });
         self.owned_bytes = next_bytes;
         self.next_enqueue_ordinal = next_ordinal;
@@ -647,7 +1102,13 @@ impl LegOutboundQueue {
         let wait = match &queued.frame {
             QueuedProtocolFrame::Session(frame) => {
                 if queued.ordered {
-                    let (wait, completion) = OrderedDeliveryWait::session_pair();
+                    let (wait, completion) = match queued.delivery_state.as_ref() {
+                        Some(state) => (
+                            OrderedDeliveryWait(Arc::clone(state)),
+                            OrderedSessionDeliveryToken(Arc::clone(state)),
+                        ),
+                        None => OrderedDeliveryWait::session_pair(),
+                    };
                     endpoint.send_retained_frame(transport, now, frame, Some(completion))?;
                     Some(wait)
                 } else {
@@ -657,7 +1118,13 @@ impl LegOutboundQueue {
             }
             QueuedProtocolFrame::LegControl { frame, features } => {
                 debug_assert!(queued.ordered);
-                let (wait, completion) = OrderedDeliveryWait::leg_control_pair();
+                let (wait, completion) = match queued.delivery_state.as_ref() {
+                    Some(state) => (
+                        OrderedDeliveryWait(Arc::clone(state)),
+                        OrderedLegControlDeliveryToken(Arc::clone(state)),
+                    ),
+                    None => OrderedDeliveryWait::leg_control_pair(),
+                };
                 endpoint
                     .send_retained_control_frame(transport, now, frame, *features, completion)?;
                 Some(wait)
@@ -687,6 +1154,37 @@ impl LegOutboundQueue {
         true
     }
 
+    /// Consumes the delivered initial request receipt and activates only its
+    /// exact sole queue. This transition allocates and enqueues nothing, so a
+    /// successful response cannot be re-run because of local pressure.
+    pub(crate) fn finish_initial_client_attach(
+        &mut self,
+        request: &InitialAttachRequestEnqueued,
+    ) -> Result<(), InitialAttachActivationError> {
+        if !request.belongs_to_queue(self) {
+            return Err(InitialAttachActivationError::WrongQueue);
+        }
+        if !request.queue_is_live() || self.endpoint_is_lost() {
+            return Err(InitialAttachActivationError::EndpointOrQueueLost);
+        }
+        if !request.was_delivered() {
+            return Err(InitialAttachActivationError::RequestNotDelivered);
+        }
+        if self.session_phase != LegOutboundSessionPhase::AttachRequestPending
+            || !self.frames.is_empty()
+            || self.owned_bytes != 0
+            || self
+                .ordered_delivery_wait
+                .as_ref()
+                .is_some_and(|wait| !wait.is_delivered())
+        {
+            return Err(InitialAttachActivationError::NotAwaitingInitialAttach);
+        }
+        self.ordered_delivery_wait = None;
+        self.session_phase = LegOutboundSessionPhase::Active;
+        Ok(())
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.frames.len()
     }
@@ -697,6 +1195,19 @@ impl LegOutboundQueue {
 
     pub(crate) const fn owned_bytes(&self) -> usize {
         self.owned_bytes
+    }
+
+    #[cfg(test)]
+    pub(super) fn mark_active_for_test(&mut self) -> bool {
+        if self.session_phase != LegOutboundSessionPhase::AwaitingAttachAcceptance
+            || !self.frames.is_empty()
+            || self.owned_bytes != 0
+            || self.ordered_delivery_wait.is_some()
+        {
+            return false;
+        }
+        self.session_phase = LegOutboundSessionPhase::Active;
+        true
     }
 
     fn binds_attached_leg(&mut self, attached: &AttachedLeg) -> bool {
@@ -766,6 +1277,596 @@ pub(crate) struct AttachAcceptanceEnqueued {
     nonce: AttachNonce,
 }
 
+/// Distinct ordered receipt for the initial client ATTACH. It cannot be
+/// substituted with a registered B, status retry, or catch-up request.
+pub(crate) struct InitialAttachRequestEnqueued(AttachRequestEnqueued);
+
+/// Signed initial ATTACH whose sole queue admission has not yet occurred.
+impl PendingInitialAttach {
+    #[allow(
+        clippy::result_large_err,
+        reason = "bounded pressure returns the exact signed initial ATTACH"
+    )]
+    pub(crate) fn enqueue(
+        mut self,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<AwaitingInitialAttach, InitialAttachEnqueueFailure> {
+        match queue.push_initial_attach_request(&self.queue_seal, self.request, self.frame) {
+            Ok(request_receipt) => Ok(AwaitingInitialAttach {
+                pending: self.pending,
+                request_receipt,
+            }),
+            Err(error) => {
+                let kind = error.kind().clone();
+                self.frame = error.into_frame();
+                Err(InitialAttachEnqueueFailure {
+                    pending: self,
+                    kind,
+                })
+            }
+        }
+    }
+}
+
+/// Initial ATTACH queue rejection retaining the exact signed request.
+pub(crate) struct InitialAttachEnqueueFailure {
+    pending: PendingInitialAttach,
+    kind: LegOutboundQueueErrorKind,
+}
+
+impl InitialAttachEnqueueFailure {
+    pub(crate) const fn kind(&self) -> &LegOutboundQueueErrorKind {
+        &self.kind
+    }
+
+    pub(crate) fn into_pending(self) -> PendingInitialAttach {
+        self.pending
+    }
+}
+
+impl fmt::Debug for InitialAttachEnqueueFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InitialAttachEnqueueFailure")
+            .field("kind", &self.kind)
+            .field("pending", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Initial request whose ordered delivery and exact response provenance must
+/// be consumed together.
+pub(crate) struct AwaitingInitialAttach {
+    pending: crate::owned_upstream::leg::PendingAttach,
+    request_receipt: InitialAttachRequestEnqueued,
+}
+
+impl AwaitingInitialAttach {
+    #[allow(
+        clippy::result_large_err,
+        reason = "response rejection returns exact pending and received ownership"
+    )]
+    pub(crate) fn validate_response(
+        self,
+        queue: &LegOutboundQueue,
+        received: LegBoundFrame,
+    ) -> Result<AcceptedInitialAttach, InitialAttachResponseFailure> {
+        if !self.request_receipt.queue_is_live() {
+            return Err(InitialAttachResponseFailure::new(
+                self,
+                received,
+                InitialAttachResponseErrorKind::EndpointOrQueueLost,
+            ));
+        }
+        if !self.request_receipt.belongs_to_queue(queue) {
+            return Err(InitialAttachResponseFailure::new(
+                self,
+                received,
+                InitialAttachResponseErrorKind::WrongQueue,
+            ));
+        }
+        if !self.request_receipt.was_delivered() {
+            return Err(InitialAttachResponseFailure::new(
+                self,
+                received,
+                InitialAttachResponseErrorKind::RequestNotDelivered,
+            ));
+        }
+        let Self {
+            pending,
+            request_receipt,
+        } = self;
+        match pending.validate_initial_acceptance_preserving(received) {
+            Ok(attached) => Ok(AcceptedInitialAttach {
+                attached,
+                request_receipt,
+            }),
+            Err(failure) => {
+                let (pending, received, kind) = failure.into_parts();
+                Err(InitialAttachResponseFailure::new(
+                    Self {
+                        pending,
+                        request_receipt,
+                    },
+                    received,
+                    kind.into(),
+                ))
+            }
+        }
+    }
+}
+
+impl fmt::Debug for AwaitingInitialAttach {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AwaitingInitialAttach([REDACTED])")
+    }
+}
+
+/// Queue-bound initial acceptance. The attached leg remains private until
+/// the same exact request queue performs its allocation-free Active
+/// transition.
+pub(crate) struct AcceptedInitialAttach {
+    attached: AttachedLeg,
+    request_receipt: InitialAttachRequestEnqueued,
+}
+
+impl AcceptedInitialAttach {
+    pub(crate) fn generation(&self) -> LegGeneration {
+        self.attached.generation()
+    }
+
+    pub(crate) fn queue_is_live(&self) -> bool {
+        self.request_receipt.queue_is_live()
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "activation failure returns the exact queue-bound initial acceptance"
+    )]
+    pub(super) fn activate_on_queue(
+        self,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<AttachedLeg, AcceptedInitialAttachActivationFailure> {
+        if !self.request_receipt.queue_is_live() || !self.attached.transport_is_open() {
+            return Err(AcceptedInitialAttachActivationFailure::new(
+                self,
+                InitialAttachActivationError::EndpointOrQueueLost,
+            ));
+        }
+        if let Err(kind) = queue.finish_initial_client_attach(&self.request_receipt) {
+            return Err(AcceptedInitialAttachActivationFailure::new(self, kind));
+        }
+        Ok(self.attached)
+    }
+}
+
+impl fmt::Debug for AcceptedInitialAttach {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AcceptedInitialAttach([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub(crate) enum InitialAttachResponseErrorKind {
+    #[error("initial ATTACH response belongs to another sole queue")]
+    WrongQueue,
+    #[error("initial ATTACH endpoint or sole queue was lost")]
+    EndpointOrQueueLost,
+    #[error("initial ATTACH request has not completed ordered delivery")]
+    RequestNotDelivered,
+    #[error("initial ATTACH response was rejected")]
+    Rejected,
+}
+
+impl From<LegProvenanceError> for InitialAttachResponseErrorKind {
+    fn from(_: LegProvenanceError) -> Self {
+        Self::Rejected
+    }
+}
+
+pub(crate) struct InitialAttachResponseFailure {
+    awaiting: AwaitingInitialAttach,
+    received: LegBoundFrame,
+    kind: InitialAttachResponseErrorKind,
+}
+
+impl InitialAttachResponseFailure {
+    fn new(
+        awaiting: AwaitingInitialAttach,
+        received: LegBoundFrame,
+        kind: InitialAttachResponseErrorKind,
+    ) -> Self {
+        Self {
+            awaiting,
+            received,
+            kind,
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> InitialAttachResponseErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn into_parts(self) -> (AwaitingInitialAttach, LegBoundFrame) {
+        (self.awaiting, self.received)
+    }
+}
+
+impl fmt::Debug for InitialAttachResponseFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InitialAttachResponseFailure")
+            .field("kind", &self.kind)
+            .field("ownership", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub(crate) enum InitialAttachActivationError {
+    #[error("initial ATTACH activation belongs to another sole queue")]
+    WrongQueue,
+    #[error("initial ATTACH endpoint or sole queue was lost")]
+    EndpointOrQueueLost,
+    #[error("initial ATTACH request has not completed ordered delivery")]
+    RequestNotDelivered,
+    #[error("initial ATTACH queue is not awaiting its correlated response")]
+    NotAwaitingInitialAttach,
+}
+
+pub(crate) struct AcceptedInitialAttachActivationFailure {
+    accepted: AcceptedInitialAttach,
+    kind: InitialAttachActivationError,
+}
+
+impl AcceptedInitialAttachActivationFailure {
+    fn new(accepted: AcceptedInitialAttach, kind: InitialAttachActivationError) -> Self {
+        Self { accepted, kind }
+    }
+
+    pub(crate) const fn kind(&self) -> InitialAttachActivationError {
+        self.kind
+    }
+
+    pub(crate) fn into_accepted(self) -> AcceptedInitialAttach {
+        self.accepted
+    }
+}
+
+impl fmt::Debug for AcceptedInitialAttachActivationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AcceptedInitialAttachActivationFailure")
+            .field("kind", &self.kind)
+            .field("accepted", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Non-cloneable proof that one registered standby's exact signed ATTACH
+/// entered its sole bounded FIFO without making that pre-acceptance queue
+/// active.
+pub(super) struct AttachRequestEnqueued {
+    queue: Weak<LegOutboundQueueIdentity>,
+    endpoint: Option<Weak<LegTransportEndpoint>>,
+    ordinal: u64,
+    request: AttachRequest,
+    delivery_state: Arc<OrderedDeliveryState>,
+}
+
+/// Exact ordered request receipt for the fresh C status-retry transport.
+pub(super) struct StatusRetryAttachEnqueued(AttachRequestEnqueued);
+
+/// Exact ordered request receipt for the fresh D catch-up transport.
+pub(super) struct CatchUpAttachEnqueued(AttachRequestEnqueued);
+
+/// Exact ordered-delivery receipt for a status-only attach response.
+pub(super) struct AttachStatusEnqueued {
+    queue: Weak<LegOutboundQueueIdentity>,
+    endpoint: Option<Weak<LegTransportEndpoint>>,
+    ordinal: u64,
+    generation: LegGeneration,
+    session_id: SessionId,
+    requested_generation: LegGeneration,
+    nonce: AttachNonce,
+    delivery_state: Arc<OrderedDeliveryState>,
+}
+
+/// Exclusive pre-CAS claim on one exact leg's sole empty outbound FIFO.
+/// Dropping this value never changes queue state: callers must explicitly
+/// release a failed transaction or transfer it into an installed publication.
+pub(super) struct AttachAcceptanceReservation {
+    queue: Weak<LegOutboundQueueIdentity>,
+    endpoint: Option<Weak<LegTransportEndpoint>>,
+    seal: LegSeal,
+    ordinal: u64,
+    next_ordinal: u64,
+    next_owned_bytes: usize,
+}
+
+/// Ownership-preserving rejection from reserved acceptance admission.
+/// Neither the exact reservation nor its correlated frame can be lost under
+/// pressure, wrong-queue routing, or endpoint failure.
+pub(super) struct ReservedAttachAcceptanceError {
+    reservation: AttachAcceptanceReservation,
+    frame: Frame,
+    kind: LegOutboundQueueErrorKind,
+}
+
+impl ReservedAttachAcceptanceError {
+    fn new(
+        reservation: AttachAcceptanceReservation,
+        frame: Frame,
+        kind: LegOutboundQueueErrorKind,
+    ) -> Self {
+        Self {
+            reservation,
+            frame,
+            kind,
+        }
+    }
+
+    pub(super) const fn kind(&self) -> &LegOutboundQueueErrorKind {
+        &self.kind
+    }
+
+    pub(super) fn into_parts(self) -> (AttachAcceptanceReservation, Frame) {
+        (self.reservation, self.frame)
+    }
+}
+
+impl fmt::Debug for ReservedAttachAcceptanceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReservedAttachAcceptanceError")
+            .field("kind", &self.kind)
+            .field("reservation", &self.reservation)
+            .field("frame", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl AttachAcceptanceReservation {
+    pub(super) fn belongs_to_queue(&self, queue: &LegOutboundQueue) -> bool {
+        self.queue
+            .upgrade()
+            .is_some_and(|identity| Arc::ptr_eq(&identity, &queue.identity))
+    }
+
+    pub(super) fn belongs_to_leg(&self, leg: &EstablishedLeg) -> bool {
+        leg.belongs_to_transport(&self.seal)
+    }
+
+    fn belongs_to_attached(&self, attached: &AttachedLeg) -> bool {
+        attached.belongs_to_transport(&self.seal)
+    }
+
+    fn endpoint_matches(&self, queue: &LegOutboundQueue) -> bool {
+        match (&self.endpoint, &queue.endpoint) {
+            (Some(expected), Some(actual)) => Weak::ptr_eq(expected, actual),
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
+        }
+    }
+
+    fn matches_reserved_state(&self, queue: &LegOutboundQueue) -> bool {
+        queue.session_phase == LegOutboundSessionPhase::AttachAcceptanceReserved
+            && queue.frames.is_empty()
+            && queue.owned_bytes == 0
+            && queue.ordered_delivery_wait.is_none()
+            && queue.next_enqueue_ordinal == self.ordinal
+            && self.next_ordinal == self.ordinal.checked_add(1).unwrap_or(self.ordinal)
+            && self.next_owned_bytes == ATTACH_ACCEPTED_ENCODED_BYTES
+            && self.next_owned_bytes <= queue.max_bytes
+            && queue.max_frames >= 1
+    }
+
+    pub(super) fn endpoint_is_open(&self) -> bool {
+        self.endpoint.as_ref().is_none_or(|endpoint| {
+            endpoint
+                .upgrade()
+                .is_some_and(|endpoint| endpoint.is_open())
+        })
+    }
+
+    /// Restores only its exact queue to the pre-attach phase. A mismatch
+    /// returns this same non-cloneable reservation and leaves both queues
+    /// unchanged/fail-closed.
+    pub(super) fn release(
+        self,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<(), AttachAcceptanceReservation> {
+        if !self.belongs_to_queue(queue)
+            || !self.endpoint_matches(queue)
+            || !self.matches_reserved_state(queue)
+        {
+            return Err(self);
+        }
+        queue.session_phase = LegOutboundSessionPhase::AwaitingAttachAcceptance;
+        Ok(())
+    }
+}
+
+impl fmt::Debug for AttachAcceptanceReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AttachAcceptanceReservation")
+            .field("queue_live", &self.queue.upgrade().is_some())
+            .field("endpoint_open", &self.endpoint_is_open())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub(crate) enum AttachAcceptanceReserveError {
+    #[error("attach acceptance reservation belongs to another leg or queue")]
+    WrongLeg,
+    #[error("attach acceptance reservation endpoint is terminal")]
+    EndpointLost,
+    #[error("attach acceptance reservation byte counter overflowed")]
+    ByteCountOverflow,
+    #[error("attach acceptance reservation enqueue ordinal is exhausted")]
+    EnqueueOrdinalExhausted,
+    #[error(
+        "attach acceptance reservation capacity exceeded ({queued_frames} frames/{queued_bytes} bytes, incoming {incoming_bytes} bytes)"
+    )]
+    CapacityExceeded {
+        queued_frames: usize,
+        queued_bytes: usize,
+        incoming_bytes: usize,
+    },
+    #[error(
+        "attach acceptance reservation requires an empty awaiting queue ({queued_frames} frames/{queued_bytes} bytes; ordered pending={ordered_delivery_pending})"
+    )]
+    NotAwaiting {
+        queued_frames: usize,
+        queued_bytes: usize,
+        ordered_delivery_pending: bool,
+    },
+}
+
+impl AttachStatusEnqueued {
+    pub(super) fn queue_is_live(&self) -> bool {
+        self.queue.upgrade().is_some()
+            && self.endpoint.as_ref().is_none_or(|endpoint| {
+                endpoint
+                    .upgrade()
+                    .is_some_and(|endpoint| endpoint.is_open())
+            })
+    }
+
+    pub(super) fn belongs_to_queue(&self, queue: &LegOutboundQueue) -> bool {
+        self.queue
+            .upgrade()
+            .is_some_and(|identity| Arc::ptr_eq(&identity, &queue.identity))
+    }
+
+    pub(super) fn was_delivered(&self) -> bool {
+        self.delivery_state.delivered.load(Ordering::Acquire)
+    }
+}
+
+impl fmt::Debug for AttachStatusEnqueued {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _correlation = (self.session_id, self.requested_generation, self.nonce);
+        formatter
+            .debug_struct("AttachStatusEnqueued")
+            .field("ordinal", &self.ordinal)
+            .field("generation", &self.generation)
+            .field("correlation", &"[REDACTED]")
+            .field("queue_live", &self.queue_is_live())
+            .field("delivered", &self.was_delivered())
+            .finish()
+    }
+}
+
+impl AttachRequestEnqueued {
+    pub(super) fn queue_is_live(&self) -> bool {
+        self.queue.upgrade().is_some()
+            && self.endpoint.as_ref().is_none_or(|endpoint| {
+                endpoint
+                    .upgrade()
+                    .is_some_and(|endpoint| endpoint.is_open())
+            })
+    }
+
+    pub(super) fn belongs_to_queue(&self, queue: &LegOutboundQueue) -> bool {
+        self.queue
+            .upgrade()
+            .is_some_and(|identity| Arc::ptr_eq(&identity, &queue.identity))
+    }
+
+    pub(super) fn matches_request(&self, request: AttachRequest) -> bool {
+        self.request == request
+    }
+
+    pub(super) fn was_delivered(&self) -> bool {
+        self.delivery_state.delivered.load(Ordering::Acquire)
+    }
+}
+
+impl InitialAttachRequestEnqueued {
+    pub(crate) fn queue_is_live(&self) -> bool {
+        self.0.queue_is_live()
+    }
+
+    pub(crate) fn belongs_to_queue(&self, queue: &LegOutboundQueue) -> bool {
+        self.0.belongs_to_queue(queue)
+    }
+
+    pub(crate) fn was_delivered(&self) -> bool {
+        self.0.was_delivered()
+    }
+}
+
+impl fmt::Debug for InitialAttachRequestEnqueued {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("InitialAttachRequestEnqueued")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+impl StatusRetryAttachEnqueued {
+    pub(super) fn queue_is_live(&self) -> bool {
+        self.0.queue_is_live()
+    }
+
+    pub(super) fn belongs_to_queue(&self, queue: &LegOutboundQueue) -> bool {
+        self.0.belongs_to_queue(queue)
+    }
+
+    pub(super) fn was_delivered(&self) -> bool {
+        self.0.was_delivered()
+    }
+}
+
+impl fmt::Debug for StatusRetryAttachEnqueued {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("StatusRetryAttachEnqueued")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+impl CatchUpAttachEnqueued {
+    pub(super) fn queue_is_live(&self) -> bool {
+        self.0.queue_is_live()
+    }
+
+    pub(super) fn belongs_to_queue(&self, queue: &LegOutboundQueue) -> bool {
+        self.0.belongs_to_queue(queue)
+    }
+
+    pub(super) fn was_delivered(&self) -> bool {
+        self.0.was_delivered()
+    }
+}
+
+impl fmt::Debug for CatchUpAttachEnqueued {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("CatchUpAttachEnqueued")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+impl fmt::Debug for AttachRequestEnqueued {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AttachRequestEnqueued")
+            .field("ordinal", &self.ordinal)
+            .field("generation", &self.request.requested_generation())
+            .field("correlation", &"[REDACTED]")
+            .field("queue_live", &self.queue_is_live())
+            .field("delivered", &self.was_delivered())
+            .finish()
+    }
+}
+
 impl AttachAcceptanceEnqueued {
     pub(crate) fn queue_is_live(&self) -> bool {
         self.queue.upgrade().is_some()
@@ -803,6 +1904,7 @@ pub(super) struct LegControlEnqueued {
     queue: Weak<LegOutboundQueueIdentity>,
     endpoint: Option<Weak<LegTransportEndpoint>>,
     ordinal: u64,
+    delivery_state: Arc<OrderedDeliveryState>,
 }
 
 impl LegControlEnqueued {
@@ -820,6 +1922,10 @@ impl LegControlEnqueued {
             .upgrade()
             .is_some_and(|identity| Arc::ptr_eq(&identity, &queue.identity))
     }
+
+    pub(super) fn was_delivered(&self) -> bool {
+        self.delivery_state.delivered.load(Ordering::Acquire)
+    }
 }
 
 impl fmt::Debug for LegControlEnqueued {
@@ -828,6 +1934,7 @@ impl fmt::Debug for LegControlEnqueued {
             .debug_struct("LegControlEnqueued")
             .field("ordinal", &self.ordinal)
             .field("queue_live", &self.queue_is_live())
+            .field("delivered", &self.was_delivered())
             .finish()
     }
 }
@@ -870,6 +1977,9 @@ pub(crate) enum LegControlQueueErrorKind {
     EnqueueOrdinalExhausted,
     EndpointLost,
     WrongLeg,
+    AttachAcceptanceReserved,
+    AttachRequestPending,
+    AttachStatusPending,
     AttachRecoveryPending,
     CapacityExceeded {
         queued_frames: usize,
@@ -949,8 +2059,36 @@ impl fmt::Display for LegOutboundQueueError {
             LegOutboundQueueErrorKind::NotAttachAcceptance => {
                 formatter.write_str("outbound frame is not an ATTACH_ACCEPTED record")
             }
+            LegOutboundQueueErrorKind::RegisteredAttachAdmissionRequired => {
+                formatter.write_str("outbound ATTACH requires registered-standby admission")
+            }
+            LegOutboundQueueErrorKind::AttachAcceptanceAdmissionRequired => {
+                formatter.write_str("outbound ATTACH_ACCEPTED requires exact acceptance admission")
+            }
+            LegOutboundQueueErrorKind::AuthenticatedAttachStatusAdmissionRequired => formatter
+                .write_str("outbound generation status requires authenticated status admission"),
+            LegOutboundQueueErrorKind::AttachRequestPending => {
+                formatter.write_str("outbound registered ATTACH response is still pending")
+            }
+            LegOutboundQueueErrorKind::AttachAcceptanceReserved => {
+                formatter.write_str("outbound attach acceptance queue is reserved")
+            }
+            LegOutboundQueueErrorKind::AttachStatusPending => {
+                formatter.write_str("outbound authenticated generation status is pending")
+            }
+            LegOutboundQueueErrorKind::NotAttachRequest => {
+                formatter.write_str("outbound frame is not an ATTACH record")
+            }
+            LegOutboundQueueErrorKind::NotAttachStatus => {
+                formatter.write_str("outbound frame is not an ATTACH_GENERATION_STATUS record")
+            }
             LegOutboundQueueErrorKind::WrongLeg => {
                 formatter.write_str("outbound frame belongs to a different transport leg")
+            }
+            LegOutboundQueueErrorKind::WrongAttachAcceptanceReservation => formatter
+                .write_str("outbound acceptance reservation belongs to another queue or leg"),
+            LegOutboundQueueErrorKind::MismatchedAttachRequest => {
+                formatter.write_str("outbound ATTACH does not match its registered request")
             }
             LegOutboundQueueErrorKind::MismatchedAttachAcceptance => {
                 formatter.write_str("outbound ATTACH_ACCEPTED does not match its attached leg")
@@ -962,6 +2100,22 @@ impl fmt::Display for LegOutboundQueueError {
             } => write!(
                 formatter,
                 "outbound ATTACH_ACCEPTED must be the first session/recovery admission after completed leg-control: next ordinal {next_ordinal}, {queued_frames} frames/{queued_bytes} bytes queued"
+            ),
+            LegOutboundQueueErrorKind::AttachRequestNotFirst {
+                next_ordinal,
+                queued_frames,
+                queued_bytes,
+            } => write!(
+                formatter,
+                "outbound registered ATTACH must follow completed standby control: next ordinal {next_ordinal}, {queued_frames} frames/{queued_bytes} bytes queued"
+            ),
+            LegOutboundQueueErrorKind::AttachStatusNotFirst {
+                next_ordinal,
+                queued_frames,
+                queued_bytes,
+            } => write!(
+                formatter,
+                "outbound authenticated generation status must be first: next ordinal {next_ordinal}, {queued_frames} frames/{queued_bytes} bytes queued"
             ),
             LegOutboundQueueErrorKind::CapacityExceeded {
                 queued_frames,
@@ -983,8 +2137,20 @@ impl std::error::Error for LegOutboundQueueError {
             | LegOutboundQueueErrorKind::EnqueueOrdinalExhausted
             | LegOutboundQueueErrorKind::EndpointLost
             | LegOutboundQueueErrorKind::NotAttachAcceptance
+            | LegOutboundQueueErrorKind::RegisteredAttachAdmissionRequired
+            | LegOutboundQueueErrorKind::AttachAcceptanceAdmissionRequired
+            | LegOutboundQueueErrorKind::AuthenticatedAttachStatusAdmissionRequired
+            | LegOutboundQueueErrorKind::AttachAcceptanceReserved
+            | LegOutboundQueueErrorKind::AttachRequestPending
+            | LegOutboundQueueErrorKind::AttachStatusPending
+            | LegOutboundQueueErrorKind::NotAttachRequest
+            | LegOutboundQueueErrorKind::NotAttachStatus
             | LegOutboundQueueErrorKind::WrongLeg
+            | LegOutboundQueueErrorKind::WrongAttachAcceptanceReservation
+            | LegOutboundQueueErrorKind::MismatchedAttachRequest
             | LegOutboundQueueErrorKind::MismatchedAttachAcceptance
+            | LegOutboundQueueErrorKind::AttachRequestNotFirst { .. }
+            | LegOutboundQueueErrorKind::AttachStatusNotFirst { .. }
             | LegOutboundQueueErrorKind::AttachAcceptanceNotFirst { .. }
             | LegOutboundQueueErrorKind::CapacityExceeded { .. } => None,
         }
@@ -998,8 +2164,28 @@ pub(crate) enum LegOutboundQueueErrorKind {
     EnqueueOrdinalExhausted,
     EndpointLost,
     NotAttachAcceptance,
+    RegisteredAttachAdmissionRequired,
+    AttachAcceptanceAdmissionRequired,
+    AuthenticatedAttachStatusAdmissionRequired,
+    AttachAcceptanceReserved,
+    AttachRequestPending,
+    AttachStatusPending,
+    NotAttachRequest,
+    NotAttachStatus,
     WrongLeg,
+    WrongAttachAcceptanceReservation,
+    MismatchedAttachRequest,
     MismatchedAttachAcceptance,
+    AttachRequestNotFirst {
+        next_ordinal: u64,
+        queued_frames: usize,
+        queued_bytes: usize,
+    },
+    AttachStatusNotFirst {
+        next_ordinal: u64,
+        queued_frames: usize,
+        queued_bytes: usize,
+    },
     AttachAcceptanceNotFirst {
         next_ordinal: u64,
         queued_frames: usize,
@@ -1675,8 +2861,9 @@ mod tests {
         AttachAlpn, AttachAuthority, AttachCredentials, AttachNonce, AttachPolicy, AttachRequest,
         AttachTransportBinding, ByteOffset, DevicePrincipal, DeviceSecret, Direction, FeatureOffer,
         FeatureSet, Frame, LegControlRecord, LegGeneration, OwnerIdentity, ReceiveBudgetLimits,
-        Record, ReplayBudgetLimits, ResumeSecret, SESSION_PROTOCOL_VERSION, SessionConfig,
-        SessionFlowId, SessionId, StandbyNonce, TcpWindowLimits, TlsExporterBinding, VersionRange,
+        Record, ReplayBudgetLimits, ResumeSecret, SESSION_PROTOCOL_VERSION, STANDBY_CONTROL_V1,
+        SessionConfig, SessionFlowId, SessionId, StandbyNonce, TcpWindowLimits, TlsExporterBinding,
+        VersionRange,
     };
     use std::time::Duration;
 
@@ -1810,6 +2997,270 @@ mod tests {
         attached_and_acceptance_for(endpoint).0
     }
 
+    #[test]
+    fn attach_records_and_reserved_acceptance_cannot_use_generic_queue_admission() {
+        let exact_leg = endpoint(LegId::B, LegEndpointRole::Owner);
+        let mut queue = LegOutboundQueue::for_leg(exact_leg.established_leg(), 8, 8_192).unwrap();
+        let (attached, acceptance) = attached_and_acceptance_for(&exact_leg);
+        let attach = {
+            let request = request();
+            let proof = credentials().prove(&request, &binding()).unwrap();
+            request.to_attach_frame(proof)
+        };
+        let status = Frame::try_new(
+            LegGeneration::new(2).unwrap(),
+            Record::AttachGenerationStatus {
+                session_id: request().session_id(),
+                requested_generation: request().requested_generation(),
+                nonce: request().nonce(),
+            },
+        )
+        .unwrap();
+
+        for (frame, expected) in [
+            (
+                attach,
+                LegOutboundQueueErrorKind::RegisteredAttachAdmissionRequired,
+            ),
+            (
+                acceptance.clone(),
+                LegOutboundQueueErrorKind::AttachAcceptanceAdmissionRequired,
+            ),
+            (
+                status,
+                LegOutboundQueueErrorKind::AuthenticatedAttachStatusAdmissionRequired,
+            ),
+        ] {
+            let error = queue.push(frame).unwrap_err();
+            assert_eq!(error.kind(), &expected);
+            let _returned_frame = error.into_frame();
+            assert!(queue.is_empty());
+            assert_eq!(
+                queue.session_phase,
+                LegOutboundSessionPhase::AwaitingAttachAcceptance
+            );
+        }
+
+        let reservation = queue
+            .reserve_attach_acceptance(exact_leg.established_leg())
+            .unwrap();
+        let data = data_frame(0, b"held-by-reservation");
+        let error = queue.push(data).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &LegOutboundQueueErrorKind::AttachAcceptanceReserved
+        );
+        let _returned_frame = error.into_frame();
+        let control = LegControlFrame::try_new(
+            LegGeneration::new(2).unwrap(),
+            LegControlRecord::StandbyAccepted {
+                session_id: request().session_id(),
+                standby_nonce: StandbyNonce::new([0x33; 16]).unwrap(),
+                selected_version: SESSION_PROTOCOL_VERSION,
+                features: STANDBY_CONTROL_V1,
+            },
+            STANDBY_CONTROL_V1,
+        )
+        .unwrap();
+        let control_error = queue
+            .push_leg_control(
+                &exact_leg.established_leg().standby_seal(),
+                control,
+                STANDBY_CONTROL_V1,
+            )
+            .unwrap_err();
+        assert_eq!(
+            control_error.kind(),
+            &LegControlQueueErrorKind::AttachAcceptanceReserved
+        );
+        let _returned_control = control_error.into_frame();
+
+        let wrong_endpoint = endpoint(LegId::A, LegEndpointRole::Owner);
+        let mut wrong_queue =
+            LegOutboundQueue::for_leg(wrong_endpoint.established_leg(), 8, 8_192).unwrap();
+        let error = wrong_queue
+            .push_reserved_attach_acceptance(reservation, &attached, acceptance)
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &LegOutboundQueueErrorKind::WrongAttachAcceptanceReservation
+        );
+        let (reservation, acceptance) = error.into_parts();
+        reservation.release(&mut queue).unwrap();
+        assert_eq!(
+            queue.session_phase,
+            LegOutboundSessionPhase::AwaitingAttachAcceptance
+        );
+        let _returned_acceptance = acceptance;
+
+        assert!(queue.push(data_frame(0, b"now-active")).is_ok());
+        assert!(matches!(
+            queue.reserve_attach_acceptance(exact_leg.established_leg()),
+            Err(AttachAcceptanceReserveError::NotAwaiting { .. })
+        ));
+    }
+
+    #[test]
+    fn attach_acceptance_reservation_owns_exact_slot_bytes_and_ordinal_before_commit() {
+        let too_small_leg = endpoint(LegId::A, LegEndpointRole::Owner);
+        let mut too_small = LegOutboundQueue::for_leg(
+            too_small_leg.established_leg(),
+            1,
+            ATTACH_ACCEPTED_ENCODED_BYTES - 1,
+        )
+        .unwrap();
+        assert_eq!(
+            too_small
+                .reserve_attach_acceptance(too_small_leg.established_leg())
+                .unwrap_err(),
+            AttachAcceptanceReserveError::CapacityExceeded {
+                queued_frames: 0,
+                queued_bytes: 0,
+                incoming_bytes: ATTACH_ACCEPTED_ENCODED_BYTES,
+            }
+        );
+        assert!(too_small.is_empty());
+        assert_eq!(too_small.owned_bytes(), 0);
+
+        let exact_leg = endpoint(LegId::B, LegEndpointRole::Owner);
+        let mut exact = LegOutboundQueue::for_leg(
+            exact_leg.established_leg(),
+            1,
+            ATTACH_ACCEPTED_ENCODED_BYTES,
+        )
+        .unwrap();
+        let (attached, acceptance) = attached_and_acceptance_for(&exact_leg);
+        let reservation = exact
+            .reserve_attach_acceptance(exact_leg.established_leg())
+            .unwrap();
+        reservation.release(&mut exact).unwrap();
+        let reservation = exact
+            .reserve_attach_acceptance(exact_leg.established_leg())
+            .unwrap();
+        let receipt = exact
+            .push_reserved_attach_acceptance(reservation, &attached, acceptance)
+            .unwrap();
+        assert!(receipt.belongs_to_queue(&exact));
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact.owned_bytes(), ATTACH_ACCEPTED_ENCODED_BYTES);
+        assert_eq!(exact.next_enqueue_ordinal, 2);
+
+        let exhausted_leg = endpoint(LegId::A, LegEndpointRole::Owner);
+        let mut exhausted = LegOutboundQueue::for_leg(
+            exhausted_leg.established_leg(),
+            1,
+            ATTACH_ACCEPTED_ENCODED_BYTES,
+        )
+        .unwrap();
+        exhausted.next_enqueue_ordinal = u64::MAX;
+        assert_eq!(
+            exhausted
+                .reserve_attach_acceptance(exhausted_leg.established_leg())
+                .unwrap_err(),
+            AttachAcceptanceReserveError::EnqueueOrdinalExhausted
+        );
+        assert!(exhausted.is_empty());
+        assert_eq!(exhausted.owned_bytes(), 0);
+    }
+
+    #[test]
+    fn initial_client_acceptance_requires_actual_delivery_and_the_same_live_queue() {
+        let transport_binding = binding();
+        let mut client = endpoint(LegId::A, LegEndpointRole::Client);
+        let mut owner = endpoint(LegId::A, LegEndpointRole::Owner);
+        let request = request();
+        let proof = credentials().prove(&request, &transport_binding).unwrap();
+        let pending = client
+            .established_leg()
+            .begin_attach(request)
+            .bind_initial_frame(request.to_attach_frame(proof))
+            .unwrap();
+        assert_eq!(format!("{pending:?}"), "PendingInitialAttach([REDACTED])");
+        let mut queue = LegOutboundQueue::for_leg(client.established_leg(), 4, 4_096).unwrap();
+        let awaiting = pending.enqueue(&mut queue).unwrap();
+        assert_eq!(format!("{awaiting:?}"), "AwaitingInitialAttach([REDACTED])");
+
+        let committed = authority()
+            .verify_and_commit(&request, &transport_binding, &proof)
+            .unwrap();
+        let received = client
+            .established_leg()
+            .bind_received_frame(committed.attach_accepted_frame());
+        let error = awaiting.validate_response(&queue, received).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            InitialAttachResponseErrorKind::RequestNotDelivered
+        );
+        assert_eq!(
+            format!("{error:?}"),
+            "InitialAttachResponseFailure { kind: RequestNotDelivered, ownership: \"[REDACTED]\" }"
+        );
+        let (awaiting, received) = error.into_parts();
+
+        let mut wire = memory_transport();
+        queue
+            .try_flush(&mut client, &mut wire.controller_sender(), SimTime::ZERO)
+            .unwrap()
+            .unwrap();
+        release_due_events_through(&mut wire, SimTime::ZERO);
+        let delivery = wire.try_recv_next(owner.inbound_route()).unwrap().unwrap();
+        owner.receive_delivery(delivery).unwrap();
+
+        let accepted = awaiting.validate_response(&queue, received).unwrap();
+        assert_eq!(accepted.generation(), request.requested_generation());
+        assert_eq!(format!("{accepted:?}"), "AcceptedInitialAttach([REDACTED])");
+
+        let wrong_endpoint = endpoint(LegId::B, LegEndpointRole::Client);
+        let mut wrong_queue =
+            LegOutboundQueue::for_leg(wrong_endpoint.established_leg(), 4, 4_096).unwrap();
+        let error = accepted.activate_on_queue(&mut wrong_queue).unwrap_err();
+        assert_eq!(error.kind(), InitialAttachActivationError::WrongQueue);
+        assert_eq!(
+            format!("{error:?}"),
+            "AcceptedInitialAttachActivationFailure { kind: WrongQueue, accepted: \"[REDACTED]\" }"
+        );
+        let accepted = error.into_accepted();
+        let attached = accepted.activate_on_queue(&mut queue).unwrap();
+        assert_eq!(attached.generation(), request.requested_generation());
+        assert!(queue.push(data_frame(0, b"active-after-initial")).is_ok());
+    }
+
+    #[test]
+    fn initial_client_queue_loss_returns_exact_pending_and_response_fail_closed() {
+        let transport_binding = binding();
+        let client = endpoint(LegId::A, LegEndpointRole::Client);
+        let request = request();
+        let proof = credentials().prove(&request, &transport_binding).unwrap();
+        let pending = client
+            .established_leg()
+            .begin_attach(request)
+            .bind_initial_frame(request.to_attach_frame(proof))
+            .unwrap();
+        let mut queue = LegOutboundQueue::for_leg(client.established_leg(), 4, 4_096).unwrap();
+        let awaiting = pending.enqueue(&mut queue).unwrap();
+        drop(queue);
+
+        let other = endpoint(LegId::B, LegEndpointRole::Client);
+        let other_queue = LegOutboundQueue::for_leg(other.established_leg(), 4, 4_096).unwrap();
+        let committed = authority()
+            .verify_and_commit(&request, &transport_binding, &proof)
+            .unwrap();
+        let response = client
+            .established_leg()
+            .bind_received_frame(committed.attach_accepted_frame());
+        let error = awaiting
+            .validate_response(&other_queue, response)
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            InitialAttachResponseErrorKind::EndpointOrQueueLost
+        );
+        assert!(format!("{error:?}").contains("ownership: \"[REDACTED]\""));
+        let (awaiting, response) = error.into_parts();
+        assert_eq!(format!("{awaiting:?}"), "AwaitingInitialAttach([REDACTED])");
+        assert_eq!(format!("{response:?}"), "LegBoundFrame([REDACTED])");
+    }
+
     struct RetryablePressureTransport;
 
     impl EncodedLegTransport for RetryablePressureTransport {
@@ -1838,7 +3289,9 @@ mod tests {
 
         assert!(!queue.endpoint_is_lost());
         assert_eq!(format!("{reporter:?}"), "LegTransportReporter([REDACTED])");
-        let terminal = reporter.report(LegTransportTerminalReason::PeerClosed);
+        let terminal = reporter
+            .report(LegTransportTerminalReason::PeerClosed)
+            .unwrap();
 
         assert!(queue.endpoint_is_lost());
         let error = queue.push(data_frame(0, b"must-stay-owned")).unwrap_err();
@@ -1864,7 +3317,9 @@ mod tests {
         );
         let attached_a = attached_for(&endpoint_a);
         let attached_b = attached_for(&endpoint_b);
-        let terminal_b = reporter_b.report(LegTransportTerminalReason::Reset);
+        let terminal_b = reporter_b
+            .report(LegTransportTerminalReason::Reset)
+            .unwrap();
 
         let mismatch = attached_a.bind_terminal(terminal_b).unwrap_err();
         assert_eq!(format!("{mismatch:?}"), "LegTerminalMismatch([REDACTED])");
@@ -1879,7 +3334,11 @@ mod tests {
         ));
 
         let pending_a = attached_a
-            .bind_terminal(reporter_a.report(LegTransportTerminalReason::FatalIo))
+            .bind_terminal(
+                reporter_a
+                    .report(LegTransportTerminalReason::FatalIo)
+                    .unwrap(),
+            )
             .unwrap();
         assert_eq!(format!("{pending_a:?}"), "PendingLegLoss([REDACTED])");
         assert!(matches!(
@@ -1928,7 +3387,11 @@ mod tests {
         let endpoint_liveness = endpoint.established_leg().endpoint_liveness();
         let attached = attached_for(&endpoint);
         let pending = attached
-            .bind_terminal(reporter.report(LegTransportTerminalReason::PeerClosed))
+            .bind_terminal(
+                reporter
+                    .report(LegTransportTerminalReason::PeerClosed)
+                    .unwrap(),
+            )
             .unwrap();
 
         drop(endpoint);
@@ -1991,39 +3454,46 @@ mod tests {
             limits(),
         );
         let request = request();
-        let pending = client.established_leg().begin_attach(request);
         let proof = credentials().prove(&request, &transport).unwrap();
+        let pending = client
+            .established_leg()
+            .begin_attach(request)
+            .bind_initial_frame(request.to_attach_frame(proof))
+            .unwrap();
+        let mut client_queue =
+            LegOutboundQueue::for_leg(client.established_leg(), 4, 4_096).unwrap();
+        let awaiting = pending.enqueue(&mut client_queue).unwrap();
+        let mut owner_queue = LegOutboundQueue::for_leg(owner.established_leg(), 4, 4_096).unwrap();
         let mut wire = memory_transport();
 
-        send(
-            &mut client,
-            &mut wire,
-            SimTime::ZERO,
-            request.to_attach_frame(proof),
-        )
-        .unwrap();
+        client_queue
+            .try_flush(&mut client, &mut wire.controller_sender(), SimTime::ZERO)
+            .unwrap()
+            .unwrap();
         release_due_events_through(&mut wire, SimTime::ZERO);
         let delivery = wire.try_recv_next(owner.inbound_route()).unwrap().unwrap();
         let received = owner.receive_delivery(delivery).unwrap();
         let mut pending_owner = SessionSupervisor::prepare_owner(session_config(), authority());
         let owner_bootstrap = pending_owner
-            .accept(owner.established_leg(), received)
+            .accept(owner.established_leg(), received, &mut owner_queue)
+            .unwrap()
+            .enqueue_acceptance(&mut owner_queue)
             .unwrap();
-        let (owner_supervisor, owner_attached, acceptance) = owner_bootstrap.into_parts();
+        let (owner_supervisor, owner_attached) = owner_bootstrap.into_parts();
         assert_eq!(owner_supervisor.snapshot().session.generation().get(), 2);
         assert_eq!(owner_attached.generation().get(), 2);
 
-        send(&mut owner, &mut wire, SimTime::ZERO, acceptance).unwrap();
+        owner_queue
+            .try_flush(&mut owner, &mut wire.controller_sender(), SimTime::ZERO)
+            .unwrap()
+            .unwrap();
         release_due_events_through(&mut wire, SimTime::ZERO);
         let delivery = wire.try_recv_next(client.inbound_route()).unwrap().unwrap();
         let response = client.receive_delivery(delivery).unwrap();
-        let AttachResponse::Accepted(client_attached) =
-            pending.validate_response(response).unwrap()
-        else {
-            panic!("correlated response changed response kind");
-        };
+        let accepted = awaiting.validate_response(&client_queue, response).unwrap();
         let client_bootstrap =
-            SessionSupervisor::bootstrap_client(session_config(), client_attached).unwrap();
+            SessionSupervisor::bootstrap_client(session_config(), accepted, &mut client_queue)
+                .unwrap();
         let (client_supervisor, client_attached) = client_bootstrap.into_parts();
         assert_eq!(client_supervisor.snapshot().session.generation().get(), 2);
         assert_eq!(client_attached.generation().get(), 2);
@@ -2132,17 +3602,23 @@ mod tests {
         let mut client_b = endpoint(LegId::B, LegEndpointRole::Client);
         let mut owner_b = endpoint(LegId::B, LegEndpointRole::Owner);
         let request = request();
-        let pending = client_a.established_leg().begin_attach(request);
         let proof = credentials().prove(&request, &binding()).unwrap();
+        let pending = client_a
+            .established_leg()
+            .begin_attach(request)
+            .bind_initial_frame(request.to_attach_frame(proof))
+            .unwrap();
+        let mut client_queue =
+            LegOutboundQueue::for_leg(client_a.established_leg(), 4, 4_096).unwrap();
+        let awaiting = pending.enqueue(&mut client_queue).unwrap();
+        let mut owner_queue =
+            LegOutboundQueue::for_leg(owner_a.established_leg(), 4, 4_096).unwrap();
         let mut wire = memory_transport();
 
-        send(
-            &mut client_a,
-            &mut wire,
-            SimTime::ZERO,
-            request.to_attach_frame(proof),
-        )
-        .unwrap();
+        client_queue
+            .try_flush(&mut client_a, &mut wire.controller_sender(), SimTime::ZERO)
+            .unwrap()
+            .unwrap();
         release_due_events_through(&mut wire, SimTime::ZERO);
         let attach = owner_a
             .receive_delivery(
@@ -2153,10 +3629,15 @@ mod tests {
             .unwrap();
         let mut pending_owner = SessionSupervisor::prepare_owner(session_config(), authority());
         let owner_bootstrap = pending_owner
-            .accept(owner_a.established_leg(), attach)
+            .accept(owner_a.established_leg(), attach, &mut owner_queue)
+            .unwrap()
+            .enqueue_acceptance(&mut owner_queue)
             .unwrap();
-        let (_owner_supervisor, _owner_attached, acceptance) = owner_bootstrap.into_parts();
-        send(&mut owner_a, &mut wire, SimTime::ZERO, acceptance).unwrap();
+        let (_owner_supervisor, _owner_attached) = owner_bootstrap.into_parts();
+        owner_queue
+            .try_flush(&mut owner_a, &mut wire.controller_sender(), SimTime::ZERO)
+            .unwrap()
+            .unwrap();
         release_due_events_through(&mut wire, SimTime::ZERO);
         let response = client_a
             .receive_delivery(
@@ -2165,10 +3646,11 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let AttachResponse::Accepted(attached_a) = pending.validate_response(response).unwrap()
-        else {
-            panic!("correlated response changed response kind");
-        };
+        let accepted = awaiting.validate_response(&client_queue, response).unwrap();
+        let (_client_supervisor, attached_a) =
+            SessionSupervisor::bootstrap_client(session_config(), accepted, &mut client_queue)
+                .unwrap()
+                .into_parts();
 
         send(
             &mut owner_b,
@@ -2897,7 +4379,15 @@ mod tests {
     impl<T: Clone> AmbiguousIfClone<u8> for T {}
     const _: fn() = || {
         let _ = <LegIo as AmbiguousIfClone<_>>::marker;
+        let _ = <PendingInitialAttach as AmbiguousIfClone<_>>::marker;
+        let _ = <AwaitingInitialAttach as AmbiguousIfClone<_>>::marker;
+        let _ = <AcceptedInitialAttach as AmbiguousIfClone<_>>::marker;
+        let _ = <InitialAttachEnqueueFailure as AmbiguousIfClone<_>>::marker;
+        let _ = <InitialAttachResponseFailure as AmbiguousIfClone<_>>::marker;
+        let _ = <AcceptedInitialAttachActivationFailure as AmbiguousIfClone<_>>::marker;
         let _ = <AttachAcceptanceEnqueued as AmbiguousIfClone<_>>::marker;
+        let _ = <AttachAcceptanceReservation as AmbiguousIfClone<_>>::marker;
+        let _ = <ReservedAttachAcceptanceError as AmbiguousIfClone<_>>::marker;
         let _ = <LegControlEnqueued as AmbiguousIfClone<_>>::marker;
         let _ = <OrderedSessionDeliveryToken as AmbiguousIfClone<_>>::marker;
         let _ = <OrderedLegControlDeliveryToken as AmbiguousIfClone<_>>::marker;

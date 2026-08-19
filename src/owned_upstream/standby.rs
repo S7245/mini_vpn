@@ -4,12 +4,21 @@
 //! an attach generation, mutate the session reducer, or mint data-plane
 //! authority.
 
-use super::leg::{AttachedLeg, BoundInbound, EstablishedLeg, LegSeal, LegTransportEndpoint};
-use super::leg_io::{LegControlEnqueued, LegControlQueueErrorKind, LegOutboundQueue};
+use super::leg::{
+    AttachResponse, AttachedLeg, BoundInbound, CaughtUpAttachedLeg, EstablishedLeg,
+    ExactLegTerminal, LegBoundFrame, LegGenerationStatus, LegProvenanceError, LegSeal,
+    LegTransportEndpoint, LostPendingAttach, PendingAttach, PendingCatchUpAttach,
+};
+use super::leg_io::{
+    AttachAcceptanceReservation, AttachAcceptanceReserveError, AttachRequestEnqueued,
+    CatchUpAttachEnqueued, LegControlEnqueued, LegControlQueueErrorKind, LegOutboundQueue,
+    LegOutboundQueueErrorKind, StatusRetryAttachEnqueued,
+};
 use crate::resumable::{
-    AttachAuthority, AttachCredentials, AttachTransportBinding, AuthenticatedStandbyRegistration,
-    FeatureSet, LegControlFrame, LegControlRecord, LegGeneration, SessionId, StandbyNonce,
-    StandbyRegistrationReject,
+    AttachAuthority, AttachCredentials, AttachNonce, AttachRequest, AttachTransportBinding,
+    AuthenticatedStandbyRegistration, FeatureOffer, FeatureSet, Frame, LegControlFrame,
+    LegControlRecord, LegGeneration, SessionId, StandbyNonce, StandbyRegistrationReject,
+    VersionRange,
 };
 use std::fmt;
 use std::sync::Weak;
@@ -19,6 +28,91 @@ fn endpoint_is_open(endpoint: &Weak<LegTransportEndpoint>) -> bool {
     endpoint
         .upgrade()
         .is_some_and(|endpoint| endpoint.is_open())
+}
+
+/// One-shot authority minted only while consuming an exact registered
+/// standby. Its private fields prevent another `owned_upstream` sibling from
+/// synthesizing a raw response validator from an arbitrary established leg.
+pub(super) struct RegisteredPendingAttachAuthority {
+    seal: LegSeal,
+    endpoint: Weak<LegTransportEndpoint>,
+    binding: AttachTransportBinding,
+    request: AttachRequest,
+}
+
+impl RegisteredPendingAttachAuthority {
+    fn new(
+        seal: LegSeal,
+        endpoint: Weak<LegTransportEndpoint>,
+        binding: AttachTransportBinding,
+        request: AttachRequest,
+    ) -> Self {
+        Self {
+            seal,
+            endpoint,
+            binding,
+            request,
+        }
+    }
+
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        LegSeal,
+        Weak<LegTransportEndpoint>,
+        AttachTransportBinding,
+        AttachRequest,
+    ) {
+        (self.seal, self.endpoint, self.binding, self.request)
+    }
+}
+
+/// Delivery gate minted only after a typed B/C request receipt has proved
+/// actual transport completion.
+pub(super) struct RegisteredAttachResponseGate {
+    _private: (),
+}
+
+impl RegisteredAttachResponseGate {
+    fn delivered() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Gate proving that catch-up derivation began from the opaque registered
+/// generation-status wrapper which still owns its exact C receipt.
+pub(super) struct RegisteredCatchUpBeginGate {
+    _private: (),
+}
+
+impl RegisteredCatchUpBeginGate {
+    fn from_registered_status() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Gate allowing only the registered wrapper to reassemble internally signed
+/// catch-up parts with the retained status receipt.
+pub(super) struct RegisteredCatchUpAssemblyGate {
+    _private: (),
+}
+
+impl RegisteredCatchUpAssemblyGate {
+    fn from_registered_status() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Delivery gate minted only after the exact D queue receipt is live and its
+/// signed ATTACH bytes were actually transported.
+pub(super) struct RegisteredCatchUpResponseGate {
+    _private: (),
+}
+
+impl RegisteredCatchUpResponseGate {
+    fn delivered() -> Self {
+        Self { _private: () }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -95,6 +189,18 @@ impl StandbyContract {
                     && *selected_version == self.selected_version
                     && *features == self.features
             )
+    }
+
+    fn matches_exact_next_attach(self, request: AttachRequest) -> bool {
+        let Some(next) = self.generation.get().checked_add(1) else {
+            return false;
+        };
+        request.session_id() == self.session_id
+            && request.requested_generation().get() == next
+            && request.versions().min() == self.selected_version
+            && request.versions().max() == self.selected_version
+            && request.features().offered() == self.features.bits()
+            && request.features().required() == self.features.bits()
     }
 }
 
@@ -175,6 +281,7 @@ impl PendingStandbyRegistration {
         match queue.push_leg_control(&self.seal, self.frame, self.contract.features) {
             Ok(receipt) => Ok(AwaitingStandbyAccepted {
                 seal: self.seal,
+                endpoint: self.endpoint,
                 contract: self.contract,
                 retry_frame: retained,
                 receipt,
@@ -234,6 +341,7 @@ impl fmt::Debug for StandbyEnqueueFailure {
 /// One successfully queued registration awaiting its exact B acceptance.
 pub(crate) struct AwaitingStandbyAccepted {
     seal: LegSeal,
+    endpoint: Weak<LegTransportEndpoint>,
     contract: StandbyContract,
     retry_frame: LegControlFrame,
     receipt: LegControlEnqueued,
@@ -279,6 +387,7 @@ impl AwaitingStandbyAccepted {
         }
         Ok(ClientRegisteredStandby {
             seal: self.seal,
+            endpoint: self.endpoint,
             contract: self.contract,
             receipt: self.receipt,
         })
@@ -340,6 +449,7 @@ impl fmt::Debug for StandbyAcceptanceFailure {
 /// or attached-leg conversion.
 pub(crate) struct ClientRegisteredStandby {
     seal: LegSeal,
+    endpoint: Weak<LegTransportEndpoint>,
     contract: StandbyContract,
     receipt: LegControlEnqueued,
 }
@@ -347,7 +457,97 @@ pub(crate) struct ClientRegisteredStandby {
 impl ClientRegisteredStandby {
     pub(crate) fn is_live(&self) -> bool {
         let _exact_identity = (&self.seal, self.contract);
-        self.receipt.queue_is_live()
+        endpoint_is_open(&self.endpoint) && self.receipt.queue_is_live()
+    }
+
+    /// Consumes the exact registered B capability and derives its sole
+    /// next-generation ATTACH. Session, generation, negotiated version,
+    /// features, and transport binding come only from the authenticated
+    /// standby contract; callers supply only a fresh correlation nonce and
+    /// the signing credentials.
+    #[allow(
+        clippy::result_large_err,
+        reason = "begin rejection returns the exact non-cloneable registered standby"
+    )]
+    pub(crate) fn begin_exact_next_attach(
+        self,
+        nonce: AttachNonce,
+        credentials: &AttachCredentials,
+    ) -> Result<PendingRegisteredAttach, RegisteredAttachBeginFailure> {
+        if !self.is_live() {
+            return Err(RegisteredAttachBeginFailure::new(
+                self,
+                RegisteredAttachBeginErrorKind::EndpointOrQueueLost,
+            ));
+        }
+        let Some(next_generation) = self.contract.generation.get().checked_add(1) else {
+            return Err(RegisteredAttachBeginFailure::new(
+                self,
+                RegisteredAttachBeginErrorKind::GenerationExhausted,
+            ));
+        };
+        let requested_generation = match LegGeneration::new(next_generation) {
+            Ok(generation) => generation,
+            Err(_) => {
+                return Err(RegisteredAttachBeginFailure::new(
+                    self,
+                    RegisteredAttachBeginErrorKind::GenerationExhausted,
+                ));
+            }
+        };
+        let versions = match VersionRange::new(
+            self.contract.selected_version,
+            self.contract.selected_version,
+        ) {
+            Ok(versions) => versions,
+            Err(_) => {
+                return Err(RegisteredAttachBeginFailure::new(
+                    self,
+                    RegisteredAttachBeginErrorKind::Rejected,
+                ));
+            }
+        };
+        let features =
+            match FeatureOffer::new(self.contract.features.bits(), self.contract.features.bits()) {
+                Ok(features) => features,
+                Err(_) => {
+                    return Err(RegisteredAttachBeginFailure::new(
+                        self,
+                        RegisteredAttachBeginErrorKind::Rejected,
+                    ));
+                }
+            };
+        let request = AttachRequest::new(
+            self.contract.session_id,
+            requested_generation,
+            nonce,
+            versions,
+            features,
+        );
+        let proof = match credentials.prove(&request, &self.contract.binding) {
+            Ok(proof) => proof,
+            Err(_) => {
+                return Err(RegisteredAttachBeginFailure::new(
+                    self,
+                    RegisteredAttachBeginErrorKind::Rejected,
+                ));
+            }
+        };
+        let frame = request.to_attach_frame(proof);
+        let authority = RegisteredPendingAttachAuthority::new(
+            self.seal.share(),
+            self.endpoint.clone(),
+            self.contract.binding,
+            request,
+        );
+        Ok(PendingRegisteredAttach {
+            seal: self.seal,
+            endpoint: self.endpoint,
+            request,
+            frame,
+            registration: self.receipt,
+            authority,
+        })
     }
 
     #[allow(
@@ -360,6 +560,1137 @@ impl ClientRegisteredStandby {
         } else {
             Ok(RetiredClientStandby)
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub(crate) enum RegisteredAttachBeginErrorKind {
+    #[error("registered standby endpoint or sole queue was lost")]
+    EndpointOrQueueLost,
+    #[error("registered standby generation is exhausted")]
+    GenerationExhausted,
+    #[error("registered standby attach derivation was rejected")]
+    Rejected,
+}
+
+pub(crate) struct RegisteredAttachBeginFailure {
+    registered: ClientRegisteredStandby,
+    kind: RegisteredAttachBeginErrorKind,
+}
+
+impl RegisteredAttachBeginFailure {
+    fn new(registered: ClientRegisteredStandby, kind: RegisteredAttachBeginErrorKind) -> Self {
+        Self { registered, kind }
+    }
+
+    pub(crate) const fn kind(&self) -> RegisteredAttachBeginErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn into_registered(self) -> ClientRegisteredStandby {
+        self.registered
+    }
+}
+
+impl fmt::Debug for RegisteredAttachBeginFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegisteredAttachBeginFailure")
+            .field("kind", &self.kind)
+            .field("registered", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Exact registered-standby ATTACH retained until the sole B queue admits
+/// its signed bytes. Neither the request nor its frame is exposed to the
+/// controller.
+pub(crate) struct PendingRegisteredAttach {
+    seal: LegSeal,
+    endpoint: Weak<LegTransportEndpoint>,
+    request: AttachRequest,
+    frame: Frame,
+    registration: LegControlEnqueued,
+    authority: RegisteredPendingAttachAuthority,
+}
+
+impl PendingRegisteredAttach {
+    pub(crate) fn encoded_len(&self) -> Result<usize, crate::resumable::ProtocolError> {
+        self.frame.encode().map(|encoded| encoded.len())
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "bounded queue pressure returns the exact registered attach"
+    )]
+    pub(crate) fn enqueue(
+        mut self,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<AwaitingRegisteredAttach, RegisteredAttachEnqueueFailure> {
+        if !endpoint_is_open(&self.endpoint)
+            || !self.registration.queue_is_live()
+            || !self.registration.belongs_to_queue(queue)
+        {
+            return Err(RegisteredAttachEnqueueFailure::new(
+                self,
+                LegOutboundQueueErrorKind::EndpointLost,
+            ));
+        }
+        match queue.push_registered_attach_request(&self.seal, self.request, self.frame) {
+            Ok(request_receipt) => Ok(AwaitingRegisteredAttach {
+                pending: PendingAttach::for_registered_standby(self.authority),
+                request_receipt,
+            }),
+            Err(error) => {
+                let kind = error.kind().clone();
+                self.frame = error.into_frame();
+                Err(RegisteredAttachEnqueueFailure::new(self, kind))
+            }
+        }
+    }
+}
+
+impl fmt::Debug for PendingRegisteredAttach {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PendingRegisteredAttach([REDACTED])")
+    }
+}
+
+pub(crate) struct RegisteredAttachEnqueueFailure {
+    pending: PendingRegisteredAttach,
+    kind: LegOutboundQueueErrorKind,
+}
+
+impl RegisteredAttachEnqueueFailure {
+    fn new(pending: PendingRegisteredAttach, kind: LegOutboundQueueErrorKind) -> Self {
+        Self { pending, kind }
+    }
+
+    pub(crate) const fn kind(&self) -> &LegOutboundQueueErrorKind {
+        &self.kind
+    }
+
+    pub(crate) fn into_pending(self) -> PendingRegisteredAttach {
+        self.pending
+    }
+}
+
+impl fmt::Debug for RegisteredAttachEnqueueFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegisteredAttachEnqueueFailure")
+            .field("kind", &self.kind)
+            .field("pending", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Registered B request whose exact queue admission and response provenance
+/// must be consumed together.
+pub(crate) struct AwaitingRegisteredAttach {
+    pending: PendingAttach,
+    request_receipt: AttachRequestEnqueued,
+}
+
+impl AwaitingRegisteredAttach {
+    #[allow(
+        clippy::result_large_err,
+        reason = "invalid response returns exact pending and received ownership"
+    )]
+    pub(crate) fn validate_response(
+        self,
+        inbound: BoundInbound,
+    ) -> Result<RegisteredAttachResponse, RegisteredAttachResponseFailure> {
+        if !self.request_receipt.queue_is_live() {
+            return Err(RegisteredAttachResponseFailure::new(
+                self,
+                inbound,
+                RegisteredAttachResponseErrorKind::QueueLost,
+            ));
+        }
+        if !self.request_receipt.was_delivered() {
+            return Err(RegisteredAttachResponseFailure::new(
+                self,
+                inbound,
+                RegisteredAttachResponseErrorKind::RequestNotDelivered,
+            ));
+        }
+        let BoundInbound::Session(received) = inbound else {
+            return Err(RegisteredAttachResponseFailure::new(
+                self,
+                inbound,
+                RegisteredAttachResponseErrorKind::Rejected,
+            ));
+        };
+        let Self {
+            pending,
+            request_receipt,
+        } = self;
+        match pending.validate_registered_response_preserving(
+            received,
+            RegisteredAttachResponseGate::delivered(),
+        ) {
+            Ok(AttachResponse::Accepted(attached)) => Ok(RegisteredAttachResponse::Accepted(
+                AcceptedClientRegisteredAttach {
+                    attached,
+                    request_receipt,
+                },
+            )),
+            Ok(AttachResponse::GenerationStatus(status)) => Ok(
+                RegisteredAttachResponse::GenerationStatus(RegisteredAttachGenerationStatus {
+                    status,
+                    request_receipt: AttachStatusRequestReceipt::Registered(request_receipt),
+                }),
+            ),
+            Err(failure) => {
+                let (pending, received, kind) = failure.into_parts();
+                Err(RegisteredAttachResponseFailure::new(
+                    Self {
+                        pending,
+                        request_receipt,
+                    },
+                    BoundInbound::Session(received),
+                    kind.into(),
+                ))
+            }
+        }
+    }
+
+    /// Retires the old B validator only for its exact terminal fact after the
+    /// signed request completed ordered transport delivery. The returned
+    /// authority can re-sign that immutable request once for a fresh status
+    /// leg; a late B acceptance has no remaining validator capability.
+    #[allow(
+        clippy::result_large_err,
+        reason = "mismatch returns exact awaiting request plus terminal fact"
+    )]
+    pub(crate) fn into_status_retry_after_terminal(
+        self,
+        terminal: ExactLegTerminal,
+    ) -> Result<RegisteredAttachStatusRetryAuthority, RegisteredAttachTerminalRetryFailure> {
+        if !self.request_receipt.was_delivered() {
+            return Err(RegisteredAttachTerminalRetryFailure::new(
+                self,
+                terminal,
+                RegisteredAttachStatusRetryErrorKind::RequestNotDelivered,
+            ));
+        }
+        let Self {
+            pending,
+            request_receipt,
+        } = self;
+        match pending.into_lost_after_terminal(terminal) {
+            Ok(lost) => {
+                drop(request_receipt);
+                Ok(RegisteredAttachStatusRetryAuthority { lost })
+            }
+            Err(failure) => {
+                let (pending, terminal) = failure.into_parts();
+                Err(RegisteredAttachTerminalRetryFailure::new(
+                    Self {
+                        pending,
+                        request_receipt,
+                    },
+                    terminal,
+                    RegisteredAttachStatusRetryErrorKind::WrongTerminal,
+                ))
+            }
+        }
+    }
+
+    /// Queue-loss counterpart to [`Self::into_status_retry_after_terminal`].
+    /// Merely holding a live B or an unminted queue cannot authorize a retry.
+    #[allow(
+        clippy::result_large_err,
+        reason = "live or undelivered rejection returns the exact awaiting request"
+    )]
+    pub(crate) fn into_status_retry_after_queue_loss(
+        self,
+    ) -> Result<RegisteredAttachStatusRetryAuthority, RegisteredAttachQueueLossRetryFailure> {
+        if !self.request_receipt.was_delivered() || self.request_receipt.queue_is_live() {
+            let kind = if self.request_receipt.was_delivered() {
+                RegisteredAttachStatusRetryErrorKind::OriginalTransportStillLive
+            } else {
+                RegisteredAttachStatusRetryErrorKind::RequestNotDelivered
+            };
+            return Err(RegisteredAttachQueueLossRetryFailure::new(self, kind));
+        }
+        let Self {
+            pending,
+            request_receipt,
+        } = self;
+        match pending.into_lost_after_queue_loss() {
+            Ok(lost) => {
+                drop(request_receipt);
+                Ok(RegisteredAttachStatusRetryAuthority { lost })
+            }
+            Err(pending) => Err(RegisteredAttachQueueLossRetryFailure::new(
+                Self {
+                    pending,
+                    request_receipt,
+                },
+                RegisteredAttachStatusRetryErrorKind::OriginalTransportStillLive,
+            )),
+        }
+    }
+}
+
+impl fmt::Debug for AwaitingRegisteredAttach {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AwaitingRegisteredAttach([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub(crate) enum RegisteredAttachStatusRetryErrorKind {
+    #[error("registered attach request was not actually delivered")]
+    RequestNotDelivered,
+    #[error("terminal fact belongs to another authenticated transport")]
+    WrongTerminal,
+    #[error("registered attach transport and sole queue remain live")]
+    OriginalTransportStillLive,
+    #[error("fresh status retry transport was rejected")]
+    FreshStatusTransportRejected,
+}
+
+pub(crate) struct RegisteredAttachTerminalRetryFailure {
+    awaiting: AwaitingRegisteredAttach,
+    terminal: ExactLegTerminal,
+    kind: RegisteredAttachStatusRetryErrorKind,
+}
+
+impl RegisteredAttachTerminalRetryFailure {
+    fn new(
+        awaiting: AwaitingRegisteredAttach,
+        terminal: ExactLegTerminal,
+        kind: RegisteredAttachStatusRetryErrorKind,
+    ) -> Self {
+        Self {
+            awaiting,
+            terminal,
+            kind,
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> RegisteredAttachStatusRetryErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn into_parts(self) -> (AwaitingRegisteredAttach, ExactLegTerminal) {
+        (self.awaiting, self.terminal)
+    }
+}
+
+impl fmt::Debug for RegisteredAttachTerminalRetryFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegisteredAttachTerminalRetryFailure")
+            .field("kind", &self.kind)
+            .field("ownership", &"[REDACTED]")
+            .finish()
+    }
+}
+
+pub(crate) struct RegisteredAttachQueueLossRetryFailure {
+    awaiting: AwaitingRegisteredAttach,
+    kind: RegisteredAttachStatusRetryErrorKind,
+}
+
+impl RegisteredAttachQueueLossRetryFailure {
+    fn new(awaiting: AwaitingRegisteredAttach, kind: RegisteredAttachStatusRetryErrorKind) -> Self {
+        Self { awaiting, kind }
+    }
+
+    pub(crate) const fn kind(&self) -> RegisteredAttachStatusRetryErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn into_awaiting(self) -> AwaitingRegisteredAttach {
+        self.awaiting
+    }
+}
+
+impl fmt::Debug for RegisteredAttachQueueLossRetryFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegisteredAttachQueueLossRetryFailure")
+            .field("kind", &self.kind)
+            .field("awaiting", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Delivered B request whose original response validator has been consumed by
+/// exact terminal/queue-loss evidence. It can bind only one fresh C transport.
+pub(crate) struct RegisteredAttachStatusRetryAuthority {
+    lost: LostPendingAttach,
+}
+
+impl RegisteredAttachStatusRetryAuthority {
+    #[allow(
+        clippy::result_large_err,
+        reason = "fresh status leg rejection returns the exact retry authority"
+    )]
+    pub(crate) fn bind_fresh_status_leg(
+        self,
+        leg: &EstablishedLeg,
+        credentials: &AttachCredentials,
+    ) -> Result<PendingRegisteredAttachStatusRetry, RegisteredAttachStatusRetryBindFailure> {
+        match self.lost.bind_fresh_status_leg(leg, credentials) {
+            Ok(signed) => {
+                let (seal, pending, request, frame) = signed.into_parts();
+                Ok(PendingRegisteredAttachStatusRetry {
+                    seal,
+                    pending,
+                    request,
+                    frame,
+                })
+            }
+            Err(failure) => {
+                let (lost, _source) = failure.into_parts();
+                Err(RegisteredAttachStatusRetryBindFailure {
+                    authority: Self { lost },
+                    kind: RegisteredAttachStatusRetryErrorKind::FreshStatusTransportRejected,
+                })
+            }
+        }
+    }
+}
+
+impl fmt::Debug for RegisteredAttachStatusRetryAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RegisteredAttachStatusRetryAuthority([REDACTED])")
+    }
+}
+
+pub(crate) struct RegisteredAttachStatusRetryBindFailure {
+    authority: RegisteredAttachStatusRetryAuthority,
+    kind: RegisteredAttachStatusRetryErrorKind,
+}
+
+impl RegisteredAttachStatusRetryBindFailure {
+    pub(crate) const fn kind(&self) -> RegisteredAttachStatusRetryErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn into_authority(self) -> RegisteredAttachStatusRetryAuthority {
+        self.authority
+    }
+}
+
+impl fmt::Debug for RegisteredAttachStatusRetryBindFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegisteredAttachStatusRetryBindFailure")
+            .field("kind", &self.kind)
+            .field("authority", &"[REDACTED]")
+            .finish()
+    }
+}
+
+pub(crate) struct PendingRegisteredAttachStatusRetry {
+    seal: LegSeal,
+    pending: PendingAttach,
+    request: AttachRequest,
+    frame: Frame,
+}
+
+impl PendingRegisteredAttachStatusRetry {
+    #[allow(
+        clippy::result_large_err,
+        reason = "bounded pressure returns the exact signed status retry"
+    )]
+    pub(crate) fn enqueue(
+        mut self,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<AwaitingRegisteredAttachStatus, RegisteredAttachStatusRetryEnqueueFailure> {
+        match queue.push_status_retry_attach_request(&self.seal, self.request, self.frame) {
+            Ok(receipt) => Ok(AwaitingRegisteredAttachStatus {
+                pending: self.pending,
+                request_receipt: receipt,
+            }),
+            Err(error) => {
+                let kind = error.kind().clone();
+                self.frame = error.into_frame();
+                Err(RegisteredAttachStatusRetryEnqueueFailure {
+                    pending: self,
+                    kind,
+                })
+            }
+        }
+    }
+}
+
+impl fmt::Debug for PendingRegisteredAttachStatusRetry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PendingRegisteredAttachStatusRetry([REDACTED])")
+    }
+}
+
+pub(crate) struct RegisteredAttachStatusRetryEnqueueFailure {
+    pending: PendingRegisteredAttachStatusRetry,
+    kind: LegOutboundQueueErrorKind,
+}
+
+impl RegisteredAttachStatusRetryEnqueueFailure {
+    pub(crate) const fn kind(&self) -> &LegOutboundQueueErrorKind {
+        &self.kind
+    }
+
+    pub(crate) fn into_pending(self) -> PendingRegisteredAttachStatusRetry {
+        self.pending
+    }
+}
+
+impl fmt::Debug for RegisteredAttachStatusRetryEnqueueFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegisteredAttachStatusRetryEnqueueFailure")
+            .field("kind", &self.kind)
+            .field("pending", &"[REDACTED]")
+            .finish()
+    }
+}
+
+pub(crate) struct AwaitingRegisteredAttachStatus {
+    pending: PendingAttach,
+    request_receipt: StatusRetryAttachEnqueued,
+}
+
+impl AwaitingRegisteredAttachStatus {
+    #[allow(
+        clippy::result_large_err,
+        reason = "wrong status returns exact pending request and inbound fact"
+    )]
+    pub(crate) fn validate_status(
+        self,
+        inbound: BoundInbound,
+    ) -> Result<RegisteredAttachGenerationStatus, RegisteredAttachStatusResponseFailure> {
+        if !self.request_receipt.queue_is_live() {
+            return Err(RegisteredAttachStatusResponseFailure::new(
+                self,
+                inbound,
+                RegisteredAttachResponseErrorKind::QueueLost,
+            ));
+        }
+        if !self.request_receipt.was_delivered() {
+            return Err(RegisteredAttachStatusResponseFailure::new(
+                self,
+                inbound,
+                RegisteredAttachResponseErrorKind::RequestNotDelivered,
+            ));
+        }
+        let BoundInbound::Session(received) = inbound else {
+            return Err(RegisteredAttachStatusResponseFailure::new(
+                self,
+                inbound,
+                RegisteredAttachResponseErrorKind::Rejected,
+            ));
+        };
+        let Self {
+            pending,
+            request_receipt,
+        } = self;
+        match pending.validate_registered_generation_status_preserving(
+            received,
+            RegisteredAttachResponseGate::delivered(),
+        ) {
+            Ok(status) => Ok(RegisteredAttachGenerationStatus {
+                status,
+                request_receipt: AttachStatusRequestReceipt::StatusRetry(request_receipt),
+            }),
+            Err(failure) => {
+                let (pending, received, kind) = failure.into_parts();
+                Err(RegisteredAttachStatusResponseFailure::new(
+                    Self {
+                        pending,
+                        request_receipt,
+                    },
+                    BoundInbound::Session(received),
+                    kind.into(),
+                ))
+            }
+        }
+    }
+}
+
+impl fmt::Debug for AwaitingRegisteredAttachStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AwaitingRegisteredAttachStatus([REDACTED])")
+    }
+}
+
+pub(crate) struct RegisteredAttachStatusResponseFailure {
+    awaiting: AwaitingRegisteredAttachStatus,
+    inbound: BoundInbound,
+    kind: RegisteredAttachResponseErrorKind,
+}
+
+impl RegisteredAttachStatusResponseFailure {
+    fn new(
+        awaiting: AwaitingRegisteredAttachStatus,
+        inbound: BoundInbound,
+        kind: RegisteredAttachResponseErrorKind,
+    ) -> Self {
+        Self {
+            awaiting,
+            inbound,
+            kind,
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> RegisteredAttachResponseErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn into_parts(self) -> (AwaitingRegisteredAttachStatus, BoundInbound) {
+        (self.awaiting, self.inbound)
+    }
+}
+
+impl fmt::Debug for RegisteredAttachStatusResponseFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegisteredAttachStatusResponseFailure")
+            .field("kind", &self.kind)
+            .field("ownership", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub(crate) enum RegisteredAttachResponseErrorKind {
+    #[error("registered attach response was rejected")]
+    Rejected,
+    #[error("registered attach sole queue was lost")]
+    QueueLost,
+    #[error("registered attach request has not completed exact transport delivery")]
+    RequestNotDelivered,
+}
+
+impl From<LegProvenanceError> for RegisteredAttachResponseErrorKind {
+    fn from(_: LegProvenanceError) -> Self {
+        Self::Rejected
+    }
+}
+
+pub(crate) struct RegisteredAttachResponseFailure {
+    awaiting: AwaitingRegisteredAttach,
+    inbound: BoundInbound,
+    kind: RegisteredAttachResponseErrorKind,
+}
+
+impl RegisteredAttachResponseFailure {
+    fn new(
+        awaiting: AwaitingRegisteredAttach,
+        inbound: BoundInbound,
+        kind: RegisteredAttachResponseErrorKind,
+    ) -> Self {
+        Self {
+            awaiting,
+            inbound,
+            kind,
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> RegisteredAttachResponseErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn into_parts(self) -> (AwaitingRegisteredAttach, BoundInbound) {
+        (self.awaiting, self.inbound)
+    }
+}
+
+impl fmt::Debug for RegisteredAttachResponseFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegisteredAttachResponseFailure")
+            .field("kind", &self.kind)
+            .field("ownership", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// C1b never exposes a bare `AttachedLeg` from a registered request. C1c's
+/// dedicated client installation consumes these wrappers with the exact
+/// request-queue receipt still attached.
+pub(crate) enum RegisteredAttachResponse {
+    Accepted(AcceptedClientRegisteredAttach),
+    GenerationStatus(RegisteredAttachGenerationStatus),
+}
+
+pub(crate) struct AcceptedClientRegisteredAttach {
+    attached: AttachedLeg,
+    request_receipt: AttachRequestEnqueued,
+}
+
+impl AcceptedClientRegisteredAttach {
+    pub(crate) fn generation(&self) -> LegGeneration {
+        self.attached.generation()
+    }
+
+    pub(crate) fn request_queue_is_live(&self) -> bool {
+        self.request_receipt.queue_is_live()
+    }
+}
+
+pub(crate) struct RegisteredAttachGenerationStatus {
+    status: LegGenerationStatus,
+    request_receipt: AttachStatusRequestReceipt,
+}
+
+enum AttachStatusRequestReceipt {
+    Registered(AttachRequestEnqueued),
+    StatusRetry(StatusRetryAttachEnqueued),
+}
+
+impl RegisteredAttachGenerationStatus {
+    pub(crate) fn current_generation(&self) -> LegGeneration {
+        self.status.current_generation()
+    }
+
+    pub(crate) fn request_queue_is_live(&self) -> bool {
+        match &self.request_receipt {
+            AttachStatusRequestReceipt::Registered(receipt) => receipt.queue_is_live(),
+            AttachStatusRequestReceipt::StatusRetry(receipt) => receipt.queue_is_live(),
+        }
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "begin rejection returns the exact status and queue receipt"
+    )]
+    pub(crate) fn begin_catch_up(
+        self,
+        follow_up_leg: &EstablishedLeg,
+        nonce: AttachNonce,
+        credentials: &AttachCredentials,
+    ) -> Result<PendingRegisteredCatchUpAttach, RegisteredCatchUpBeginFailure> {
+        let Self {
+            status,
+            request_receipt,
+        } = self;
+        match status.begin_registered_signed_catch_up(
+            follow_up_leg,
+            nonce,
+            credentials,
+            RegisteredCatchUpBeginGate::from_registered_status(),
+        ) {
+            Ok(signed) => {
+                let (seal, pending, request, frame) = signed
+                    .into_registered_parts(RegisteredCatchUpAssemblyGate::from_registered_status());
+                Ok(PendingRegisteredCatchUpAttach {
+                    seal,
+                    pending,
+                    request,
+                    frame,
+                    status_request_receipt: request_receipt,
+                })
+            }
+            Err(failure) => {
+                let (status, _source) = failure.into_parts();
+                Err(RegisteredCatchUpBeginFailure {
+                    status: Self {
+                        status,
+                        request_receipt,
+                    },
+                })
+            }
+        }
+    }
+}
+
+pub(crate) struct RegisteredCatchUpBeginFailure {
+    status: RegisteredAttachGenerationStatus,
+}
+
+impl RegisteredCatchUpBeginFailure {
+    pub(crate) fn into_status(self) -> RegisteredAttachGenerationStatus {
+        self.status
+    }
+}
+
+impl fmt::Debug for RegisteredCatchUpBeginFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RegisteredCatchUpBeginFailure([REDACTED])")
+    }
+}
+
+pub(crate) struct PendingRegisteredCatchUpAttach {
+    seal: LegSeal,
+    pending: PendingCatchUpAttach,
+    request: AttachRequest,
+    frame: Frame,
+    status_request_receipt: AttachStatusRequestReceipt,
+}
+
+impl PendingRegisteredCatchUpAttach {
+    #[allow(
+        clippy::result_large_err,
+        reason = "bounded pressure returns the exact signed catch-up request"
+    )]
+    pub(crate) fn enqueue(
+        mut self,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<AwaitingRegisteredCatchUpAttach, RegisteredCatchUpEnqueueFailure> {
+        match queue.push_catch_up_attach_request(&self.seal, self.request, self.frame) {
+            Ok(request_receipt) => Ok(AwaitingRegisteredCatchUpAttach {
+                pending: self.pending,
+                status_request_receipt: self.status_request_receipt,
+                request_receipt,
+            }),
+            Err(error) => {
+                let kind = error.kind().clone();
+                self.frame = error.into_frame();
+                Err(RegisteredCatchUpEnqueueFailure {
+                    pending: self,
+                    kind,
+                })
+            }
+        }
+    }
+}
+
+impl fmt::Debug for PendingRegisteredCatchUpAttach {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PendingRegisteredCatchUpAttach([REDACTED])")
+    }
+}
+
+pub(crate) struct RegisteredCatchUpEnqueueFailure {
+    pending: PendingRegisteredCatchUpAttach,
+    kind: LegOutboundQueueErrorKind,
+}
+
+impl RegisteredCatchUpEnqueueFailure {
+    pub(crate) const fn kind(&self) -> &LegOutboundQueueErrorKind {
+        &self.kind
+    }
+
+    pub(crate) fn into_pending(self) -> PendingRegisteredCatchUpAttach {
+        self.pending
+    }
+}
+
+impl fmt::Debug for RegisteredCatchUpEnqueueFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegisteredCatchUpEnqueueFailure")
+            .field("kind", &self.kind)
+            .field("pending", &"[REDACTED]")
+            .finish()
+    }
+}
+
+pub(crate) struct AwaitingRegisteredCatchUpAttach {
+    pending: PendingCatchUpAttach,
+    status_request_receipt: AttachStatusRequestReceipt,
+    request_receipt: CatchUpAttachEnqueued,
+}
+
+impl AwaitingRegisteredCatchUpAttach {
+    #[allow(
+        clippy::result_large_err,
+        reason = "wrong acceptance returns exact catch-up request and inbound fact"
+    )]
+    pub(crate) fn validate_response(
+        self,
+        inbound: BoundInbound,
+    ) -> Result<AcceptedClientRegisteredCatchUp, RegisteredCatchUpResponseFailure> {
+        if !self.request_receipt.queue_is_live() {
+            return Err(RegisteredCatchUpResponseFailure::new(
+                self,
+                inbound,
+                RegisteredAttachResponseErrorKind::QueueLost,
+            ));
+        }
+        if !self.request_receipt.was_delivered() {
+            return Err(RegisteredCatchUpResponseFailure::new(
+                self,
+                inbound,
+                RegisteredAttachResponseErrorKind::RequestNotDelivered,
+            ));
+        }
+        let BoundInbound::Session(received) = inbound else {
+            return Err(RegisteredCatchUpResponseFailure::new(
+                self,
+                inbound,
+                RegisteredAttachResponseErrorKind::Rejected,
+            ));
+        };
+        let Self {
+            pending,
+            status_request_receipt,
+            request_receipt,
+        } = self;
+        match pending.validate_registered_response_preserving(
+            received,
+            RegisteredCatchUpResponseGate::delivered(),
+        ) {
+            Ok(attached) => Ok(AcceptedClientRegisteredCatchUp {
+                attached,
+                status_request_receipt,
+                request_receipt,
+            }),
+            Err(failure) => {
+                let (pending, received, kind) = failure.into_parts();
+                Err(RegisteredCatchUpResponseFailure::new(
+                    Self {
+                        pending,
+                        status_request_receipt,
+                        request_receipt,
+                    },
+                    BoundInbound::Session(received),
+                    kind.into(),
+                ))
+            }
+        }
+    }
+
+    /// Retires a delivered follow-up validator only for its exact terminal
+    /// and recovers the original stale correlation retained by the catch-up
+    /// authority. This does not expose or reconstruct a caller-controlled raw
+    /// request.
+    #[allow(
+        clippy::result_large_err,
+        reason = "mismatch returns exact catch-up request plus terminal fact"
+    )]
+    pub(crate) fn into_status_retry_after_terminal(
+        self,
+        terminal: ExactLegTerminal,
+    ) -> Result<RegisteredAttachStatusRetryAuthority, RegisteredCatchUpTerminalRetryFailure> {
+        if !self.request_receipt.was_delivered() {
+            return Err(RegisteredCatchUpTerminalRetryFailure::new(
+                self,
+                terminal,
+                RegisteredAttachStatusRetryErrorKind::RequestNotDelivered,
+            ));
+        }
+        let Self {
+            pending,
+            status_request_receipt,
+            request_receipt,
+        } = self;
+        match pending.into_original_lost_after_terminal(terminal) {
+            Ok(lost) => {
+                drop((status_request_receipt, request_receipt));
+                Ok(RegisteredAttachStatusRetryAuthority { lost })
+            }
+            Err(failure) => {
+                let (pending, terminal) = failure.into_parts();
+                Err(RegisteredCatchUpTerminalRetryFailure::new(
+                    Self {
+                        pending,
+                        status_request_receipt,
+                        request_receipt,
+                    },
+                    terminal,
+                    RegisteredAttachStatusRetryErrorKind::WrongTerminal,
+                ))
+            }
+        }
+    }
+
+    /// Queue-loss counterpart to [`Self::into_status_retry_after_terminal`].
+    /// A live or not-yet-delivered D remains the sole response validator and
+    /// is returned unchanged.
+    #[allow(
+        clippy::result_large_err,
+        reason = "live or undelivered rejection returns the exact catch-up request"
+    )]
+    pub(crate) fn into_status_retry_after_queue_loss(
+        self,
+    ) -> Result<RegisteredAttachStatusRetryAuthority, RegisteredCatchUpQueueLossRetryFailure> {
+        if !self.request_receipt.was_delivered() || self.request_receipt.queue_is_live() {
+            let kind = if self.request_receipt.was_delivered() {
+                RegisteredAttachStatusRetryErrorKind::OriginalTransportStillLive
+            } else {
+                RegisteredAttachStatusRetryErrorKind::RequestNotDelivered
+            };
+            return Err(RegisteredCatchUpQueueLossRetryFailure::new(self, kind));
+        }
+        let Self {
+            pending,
+            status_request_receipt,
+            request_receipt,
+        } = self;
+        match pending.into_original_lost_after_queue_loss() {
+            Ok(lost) => {
+                drop((status_request_receipt, request_receipt));
+                Ok(RegisteredAttachStatusRetryAuthority { lost })
+            }
+            Err(pending) => Err(RegisteredCatchUpQueueLossRetryFailure::new(
+                Self {
+                    pending,
+                    status_request_receipt,
+                    request_receipt,
+                },
+                RegisteredAttachStatusRetryErrorKind::OriginalTransportStillLive,
+            )),
+        }
+    }
+}
+
+impl fmt::Debug for AwaitingRegisteredCatchUpAttach {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AwaitingRegisteredCatchUpAttach([REDACTED])")
+    }
+}
+
+pub(crate) struct RegisteredCatchUpTerminalRetryFailure {
+    awaiting: AwaitingRegisteredCatchUpAttach,
+    terminal: ExactLegTerminal,
+    kind: RegisteredAttachStatusRetryErrorKind,
+}
+
+impl RegisteredCatchUpTerminalRetryFailure {
+    fn new(
+        awaiting: AwaitingRegisteredCatchUpAttach,
+        terminal: ExactLegTerminal,
+        kind: RegisteredAttachStatusRetryErrorKind,
+    ) -> Self {
+        Self {
+            awaiting,
+            terminal,
+            kind,
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> RegisteredAttachStatusRetryErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn into_parts(self) -> (AwaitingRegisteredCatchUpAttach, ExactLegTerminal) {
+        (self.awaiting, self.terminal)
+    }
+}
+
+impl fmt::Debug for RegisteredCatchUpTerminalRetryFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegisteredCatchUpTerminalRetryFailure")
+            .field("kind", &self.kind)
+            .field("ownership", &"[REDACTED]")
+            .finish()
+    }
+}
+
+pub(crate) struct RegisteredCatchUpQueueLossRetryFailure {
+    awaiting: AwaitingRegisteredCatchUpAttach,
+    kind: RegisteredAttachStatusRetryErrorKind,
+}
+
+impl RegisteredCatchUpQueueLossRetryFailure {
+    fn new(
+        awaiting: AwaitingRegisteredCatchUpAttach,
+        kind: RegisteredAttachStatusRetryErrorKind,
+    ) -> Self {
+        Self { awaiting, kind }
+    }
+
+    pub(crate) const fn kind(&self) -> RegisteredAttachStatusRetryErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn into_awaiting(self) -> AwaitingRegisteredCatchUpAttach {
+        self.awaiting
+    }
+}
+
+impl fmt::Debug for RegisteredCatchUpQueueLossRetryFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegisteredCatchUpQueueLossRetryFailure")
+            .field("kind", &self.kind)
+            .field("awaiting", &"[REDACTED]")
+            .finish()
+    }
+}
+
+pub(crate) struct RegisteredCatchUpResponseFailure {
+    awaiting: AwaitingRegisteredCatchUpAttach,
+    inbound: BoundInbound,
+    kind: RegisteredAttachResponseErrorKind,
+}
+
+impl RegisteredCatchUpResponseFailure {
+    fn new(
+        awaiting: AwaitingRegisteredCatchUpAttach,
+        inbound: BoundInbound,
+        kind: RegisteredAttachResponseErrorKind,
+    ) -> Self {
+        Self {
+            awaiting,
+            inbound,
+            kind,
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> RegisteredAttachResponseErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn into_parts(self) -> (AwaitingRegisteredCatchUpAttach, BoundInbound) {
+        (self.awaiting, self.inbound)
+    }
+}
+
+impl fmt::Debug for RegisteredCatchUpResponseFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegisteredCatchUpResponseFailure")
+            .field("kind", &self.kind)
+            .field("ownership", &"[REDACTED]")
+            .finish()
+    }
+}
+
+pub(crate) struct AcceptedClientRegisteredCatchUp {
+    attached: CaughtUpAttachedLeg,
+    status_request_receipt: AttachStatusRequestReceipt,
+    request_receipt: CatchUpAttachEnqueued,
+}
+
+impl AcceptedClientRegisteredCatchUp {
+    pub(crate) fn generation(&self) -> LegGeneration {
+        self.attached.generation()
+    }
+
+    pub(crate) fn follow_up_queue_is_live(&self) -> bool {
+        self.request_receipt.queue_is_live()
+    }
+}
+
+impl fmt::Debug for AcceptedClientRegisteredCatchUp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _status_receipt = &self.status_request_receipt;
+        formatter.write_str("AcceptedClientRegisteredCatchUp([REDACTED])")
+    }
+}
+
+impl fmt::Debug for RegisteredAttachResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Accepted(_) => {
+                formatter.write_str("RegisteredAttachResponse::Accepted([REDACTED])")
+            }
+            Self::GenerationStatus(_) => {
+                formatter.write_str("RegisteredAttachResponse::GenerationStatus([REDACTED])")
+            }
+        }
+    }
+}
+
+impl fmt::Debug for AcceptedClientRegisteredAttach {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AcceptedClientRegisteredAttach([REDACTED])")
+    }
+}
+
+impl fmt::Debug for RegisteredAttachGenerationStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RegisteredAttachGenerationStatus([REDACTED])")
     }
 }
 
@@ -511,6 +1842,141 @@ impl OwnerStandbySlot {
         }
         self.registered.take().map(|_| RetiredOwnerStandby)
     }
+
+    /// Removes the exact registered B authority only after a read-only gate
+    /// proves its delivered registration acceptance, live queue/endpoint,
+    /// transport seal/binding, and immutable exact-next request contract.
+    /// The returned non-cloneable gate restores the slot on every non-install
+    /// outcome and is consumed only after supervisor installation succeeds.
+    pub(super) fn begin_exact_next_attach(
+        &mut self,
+        leg: &EstablishedLeg,
+        received: &LegBoundFrame,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<OwnerRegisteredAttachGate, OwnerRegisteredAttachGateError> {
+        let registered = self
+            .registered
+            .as_ref()
+            .ok_or(OwnerRegisteredAttachGateError::Rejected)?;
+        if !registered.is_live()
+            || !registered.receipt.was_delivered()
+            || !registered.receipt.belongs_to_queue(queue)
+            || !leg.belongs_to_transport(&registered.candidate.seal)
+            || !received.belongs_to_transport(leg)
+            || leg.standby_transport_binding() != registered.candidate.contract().binding
+        {
+            return Err(OwnerRegisteredAttachGateError::Rejected);
+        }
+        let request = received
+            .attach_request()
+            .map_err(|_| OwnerRegisteredAttachGateError::Rejected)?;
+        let contract = registered.candidate.contract();
+        if !contract.matches_exact_next_attach(request) {
+            return Err(OwnerRegisteredAttachGateError::Rejected);
+        }
+        let reservation = queue
+            .reserve_attach_acceptance(leg)
+            .map_err(OwnerRegisteredAttachGateError::QueueReservation)?;
+        let Some(registered) = self.registered.take() else {
+            let _retained = reservation.release(queue).err();
+            return Err(OwnerRegisteredAttachGateError::Rejected);
+        };
+        Ok(OwnerRegisteredAttachGate {
+            registered,
+            contract,
+            request,
+            reservation,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub(crate) enum OwnerRegisteredAttachGateError {
+    #[error("owner registered standby does not authorize this exact ATTACH")]
+    Rejected,
+    #[error("owner registered standby queue reservation failed: {0}")]
+    QueueReservation(AttachAcceptanceReserveError),
+}
+
+/// Temporary exclusive ownership of the sole registered B slot during one
+/// synchronous owner transaction. It is intentionally non-cloneable.
+pub(super) struct OwnerRegisteredAttachGate {
+    registered: OwnerRegisteredStandby,
+    contract: StandbyContract,
+    request: AttachRequest,
+    reservation: AttachAcceptanceReservation,
+}
+
+impl OwnerRegisteredAttachGate {
+    pub(super) fn current_generation(&self) -> LegGeneration {
+        self.contract.generation
+    }
+
+    pub(super) fn matches_transaction(
+        &self,
+        leg: &EstablishedLeg,
+        received: &LegBoundFrame,
+    ) -> bool {
+        self.registered.is_live()
+            && self.registered.receipt.was_delivered()
+            && self.reservation.endpoint_is_open()
+            && self.reservation.belongs_to_leg(leg)
+            && leg.belongs_to_transport(&self.registered.candidate.seal)
+            && leg.standby_transport_binding() == self.contract.binding
+            && received.belongs_to_transport(leg)
+            && received
+                .attach_request()
+                .is_ok_and(|request| request == self.request)
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "restore failure must retain the exact registered slot and queue reservation gate"
+    )]
+    pub(super) fn restore(
+        self,
+        slot: &mut OwnerStandbySlot,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<(), OwnerRegisteredAttachGate> {
+        if slot.registered.is_some() {
+            return Err(self);
+        }
+        let Self {
+            registered,
+            contract,
+            request,
+            reservation,
+        } = self;
+        match reservation.release(queue) {
+            Ok(()) => {
+                slot.registered = Some(registered);
+                Ok(())
+            }
+            Err(reservation) => Err(Self {
+                registered,
+                contract,
+                request,
+                reservation,
+            }),
+        }
+    }
+
+    pub(super) fn consume_after_install(
+        self,
+        attached: &AttachedLeg,
+    ) -> AttachAcceptanceReservation {
+        debug_assert!(attached.belongs_to_transport(&self.registered.candidate.seal));
+        debug_assert_eq!(attached.generation(), self.request.requested_generation());
+        debug_assert_eq!(attached.nonce(), self.request.nonce());
+        debug_assert_eq!(attached.transport_binding(), self.contract.binding);
+        self.reservation
+    }
+}
+
+impl fmt::Debug for OwnerRegisteredAttachGate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OwnerRegisteredAttachGate([REDACTED])")
+    }
 }
 
 impl fmt::Debug for OwnerStandbySlot {
@@ -592,6 +2058,12 @@ mod tests {
         LegEndpointRole, LegIo, LegIoLimits, LegOutboundQueue, MemoryFaultScript,
         MemoryLegTransport,
     };
+    use crate::owned_upstream::owner_target::{
+        OwnerTargetAttachPublication, OwnerTargetConfig, OwnerTargetError, OwnerTargetExecutor,
+    };
+    use crate::owned_upstream::supervisor::SessionSupervisor;
+    use crate::owned_upstream::target::{MemoryTarget, MemoryTargetConfig};
+    use crate::owned_upstream::tcp::FlowPortConfig;
     use crate::owned_upstream::two_leg::{
         LegId, SimTime, TwoLegWire, WireBounds, WireCapacity, WireCapacitySpec,
     };
@@ -1678,7 +3150,7 @@ mod tests {
 
     #[test]
     fn real_leg_control_keeps_the_sole_queue_open_for_ordered_attach_acceptance() {
-        let (authority, mut model, client_active, owner_active) = active_pair();
+        let (authority, model, client_active, owner_active) = active_pair();
         let mut client_b = LegIo::for_authenticated_transport(
             LegId::B,
             LegEndpointRole::Client,
@@ -1719,16 +3191,20 @@ mod tests {
         );
         let registered = awaiting.validate(standby_accepted).unwrap();
 
-        let request = AttachRequest::new(
-            SessionId::new([0x11; 16]).unwrap(),
-            LegGeneration::new(3).unwrap(),
-            AttachNonce::new([0x44; 16]).unwrap(),
-            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
-            FeatureOffer::new(FEATURES, STANDBY_CONTROL_V1.bits()).unwrap(),
-        );
-        let pending_attach = client_b.established_leg().begin_attach(request);
-        let proof = credentials().prove(&request, &binding(0x99)).unwrap();
-        client_queue.push(request.to_attach_frame(proof)).unwrap();
+        let supervisor =
+            SessionSupervisor::new_owner_with_active(model, authority, &owner_active).unwrap();
+        let mut executor = OwnerTargetExecutor::new(
+            OwnerTargetConfig::new(64, 1_024, 64).unwrap(),
+            supervisor,
+            MemoryTarget::new(MemoryTargetConfig::new(4, 256, 512, 128, 128, 16).unwrap()),
+            FlowPortConfig::new(64, 8, 8, 8).unwrap(),
+        )
+        .unwrap();
+
+        let pending_attach = registered
+            .begin_exact_next_attach(AttachNonce::new([0x44; 16]).unwrap(), &credentials())
+            .unwrap();
+        let awaiting_attach = pending_attach.enqueue(&mut client_queue).unwrap();
         client_queue
             .try_flush(
                 &mut client_b,
@@ -1746,46 +3222,45 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let OwnerAttachTransaction::Installed {
-            attached,
-            acceptance,
-            recovery,
-        } = owner_b
-            .established_leg()
-            .transact_owner_attach(received_attach, &authority, &mut model)
-            .unwrap()
-            .unwrap()
-        else {
-            panic!("exact B attach unexpectedly resynchronized");
-        };
-        assert!(matches!(
-            recovery.as_slice(),
-            [crate::resumable::SessionEffect::LegActivated { generation }]
-                if *generation == LegGeneration::new(3).unwrap()
-        ));
-        let attach_receipt = owner_queue
-            .push_attach_acceptance(&attached, acceptance)
-            .unwrap();
-
         let registered_owner = slot.registered.as_ref().unwrap();
         let later_control = registered_owner
             .candidate
             .contract()
             .acceptance_frame()
             .unwrap();
-        let error = owner_queue
-            .push_leg_control(
-                &registered_owner.candidate.seal,
-                later_control,
-                registered_owner.candidate.contract().features,
+        let registered_features = registered_owner.candidate.contract().features;
+        let owner_b_seal = owner_b.established_leg().standby_seal();
+        let OwnerTargetAttachPublication::Installed { pending } = executor
+            .accept_registered_owner_attach(
+                &mut slot,
+                owner_b.established_leg(),
+                received_attach,
+                &mut owner_queue,
             )
+            .unwrap()
+        else {
+            panic!("exact B attach unexpectedly resynchronized");
+        };
+        assert!(!slot.registered_is_live());
+        assert!(slot.registered.is_none());
+        let recovery = pending.enqueue_acceptance(&mut owner_queue).unwrap();
+        let error = owner_queue
+            .push_leg_control(&owner_b_seal, later_control, registered_features)
             .unwrap_err();
         assert_eq!(
             error.kind(),
             &LegControlQueueErrorKind::AttachRecoveryPending
         );
         let later_control = error.into_frame();
-        assert!(owner_queue.finish_attach_recovery(&attach_receipt));
+        let recovery_outputs = executor
+            .execute_attached_recovery(recovery, &mut owner_queue)
+            .unwrap();
+        assert!(recovery_outputs.iter().any(|output| matches!(
+            output,
+            crate::owned_upstream::owner_target::OwnerTargetRecoveryOutput::RecoveryCompleted {
+                attached
+            } if attached.generation() == LegGeneration::new(3).unwrap()
+        )));
 
         owner_queue
             .try_flush(
@@ -1796,11 +3271,7 @@ mod tests {
             .unwrap()
             .unwrap();
         owner_queue
-            .push_leg_control(
-                &registered_owner.candidate.seal,
-                later_control,
-                registered_owner.candidate.contract().features,
-            )
+            .push_leg_control(&owner_b_seal, later_control, registered_features)
             .unwrap();
         assert_eq!(
             owner_queue.try_flush(
@@ -1821,8 +3292,10 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            pending_attach.validate_response(accepted).unwrap(),
-            AttachResponse::Accepted(_)
+            awaiting_attach
+                .validate_response(BoundInbound::Session(accepted))
+                .unwrap(),
+            RegisteredAttachResponse::Accepted(_)
         ));
         owner_queue
             .try_flush(
@@ -1833,9 +3306,732 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(owner_queue.is_empty());
-        assert!(registered.is_live());
-        assert!(slot.registered_is_live());
-        assert_eq!(authority.current_generation(), 3);
+        assert!(!slot.registered_is_live());
+        assert_eq!(executor.snapshot().session.session.generation().get(), 3);
+
+        let duplicate = AttachRequest::new(
+            SessionId::new([0x11; 16]).unwrap(),
+            LegGeneration::new(3).unwrap(),
+            AttachNonce::new([0x44; 16]).unwrap(),
+            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
+            FeatureOffer::new(FEATURES, FEATURES).unwrap(),
+        );
+        let duplicate_proof = credentials().prove(&duplicate, &binding(0x99)).unwrap();
+        let duplicate = owner_b
+            .established_leg()
+            .bind_received_frame(duplicate.to_attach_frame(duplicate_proof));
+        let before_duplicate = executor.snapshot();
+        let returned = match executor.accept_registered_owner_attach(
+            &mut slot,
+            owner_b.established_leg(),
+            duplicate,
+            &mut owner_queue,
+        ) {
+            Err(OwnerTargetError::RejectedRegisteredOwnerAttach { received, .. }) => received,
+            other => panic!("consumed registered slot must reject duplicate, got {other:?}"),
+        };
+        drop(returned);
+        assert_eq!(executor.snapshot(), before_duplicate);
+    }
+
+    #[test]
+    fn registered_lost_acceptance_catch_up_crosses_b_c_d_bytes_without_raw_requests() {
+        let (authority, model, client_active, owner_active) = active_pair();
+        let (mut client_b, client_b_reporter) = LegIo::for_authenticated_transport_with_reporter(
+            LegId::B,
+            LegEndpointRole::Client,
+            binding(0x99),
+            limits(),
+        );
+        let mut owner_b = LegIo::for_authenticated_transport(
+            LegId::B,
+            LegEndpointRole::Owner,
+            binding(0x99),
+            limits(),
+        );
+        let mut client_b_queue =
+            LegOutboundQueue::for_leg(client_b.established_leg(), 4, 4_096).unwrap();
+        let mut owner_b_queue =
+            LegOutboundQueue::for_leg(owner_b.established_leg(), 4, 4_096).unwrap();
+        let mut transport_b = transport();
+        let (awaiting_registration, candidate) = deliver_registration(
+            &client_active,
+            &owner_active,
+            &mut client_b,
+            &mut owner_b,
+            &mut client_b_queue,
+            &mut transport_b,
+            &authority,
+            0x33,
+        );
+        let mut slot = OwnerStandbySlot::new();
+        assert_eq!(
+            slot.admit(candidate, &mut owner_b_queue).unwrap(),
+            OwnerStandbyAdmission::Installed
+        );
+        let registered = awaiting_registration
+            .validate(deliver_acceptance(
+                &mut owner_b,
+                &mut client_b,
+                &mut owner_b_queue,
+                &mut transport_b,
+            ))
+            .unwrap();
+        let supervisor =
+            SessionSupervisor::new_owner_with_active(model, authority, &owner_active).unwrap();
+        let mut executor = OwnerTargetExecutor::new(
+            OwnerTargetConfig::new(64, 1_024, 64).unwrap(),
+            supervisor,
+            MemoryTarget::new(MemoryTargetConfig::new(4, 256, 512, 128, 128, 16).unwrap()),
+            FlowPortConfig::new(64, 8, 8, 8).unwrap(),
+        )
+        .unwrap();
+
+        // Registered B derives, signs, queues, and delivers generation 3
+        // without exposing an AttachRequest or Frame to this controller test.
+        let awaiting_b = registered
+            .begin_exact_next_attach(AttachNonce::new([0x44; 16]).unwrap(), &credentials())
+            .unwrap()
+            .enqueue(&mut client_b_queue)
+            .unwrap();
+        client_b_queue
+            .try_flush(
+                &mut client_b,
+                &mut transport_b.controller_sender(),
+                SimTime::ZERO,
+            )
+            .unwrap()
+            .unwrap();
+        release(&mut transport_b);
+        let received_b = owner_b
+            .receive_delivery(
+                transport_b
+                    .try_recv_next(owner_b.inbound_route())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let OwnerTargetAttachPublication::Installed { pending } = executor
+            .accept_registered_owner_attach(
+                &mut slot,
+                owner_b.established_leg(),
+                received_b,
+                &mut owner_b_queue,
+            )
+            .unwrap()
+        else {
+            panic!("registered B must install generation 3");
+        };
+        let recovery = pending.enqueue_acceptance(&mut owner_b_queue).unwrap();
+        executor
+            .execute_attached_recovery(recovery, &mut owner_b_queue)
+            .unwrap();
+        owner_b_queue
+            .try_flush(
+                &mut owner_b,
+                &mut transport_b.controller_sender(),
+                SimTime::ZERO,
+            )
+            .unwrap()
+            .unwrap();
+        release(&mut transport_b);
+        assert_eq!(executor.snapshot().session.session.generation().get(), 3);
+
+        // B's acceptance is lost. Its exact terminal fact converts only this
+        // delivered request into a non-cloneable stale-status retry authority.
+        let client_b_terminal = client_b_reporter
+            .report(LegTransportTerminalReason::FatalIo)
+            .unwrap();
+        let mut retry = awaiting_b
+            .into_status_retry_after_terminal(client_b_terminal)
+            .unwrap();
+
+        let base_c = binding(0x9a);
+        for wrong_identity_binding in [
+            AttachTransportBinding::new(
+                OwnerIdentity::new([0x32; 32]).unwrap(),
+                base_c.alpn(),
+                TlsExporterBinding::new([0xe1; 32]).unwrap(),
+                base_c.device_principal(),
+            ),
+            AttachTransportBinding::new(
+                base_c.owner_identity(),
+                AttachAlpn::new(b"mini-vpn-wrong/1").unwrap(),
+                TlsExporterBinding::new([0xe2; 32]).unwrap(),
+                base_c.device_principal(),
+            ),
+            AttachTransportBinding::new(
+                base_c.owner_identity(),
+                base_c.alpn(),
+                TlsExporterBinding::new([0xe3; 32]).unwrap(),
+                DevicePrincipal::new([0x54; 16]).unwrap(),
+            ),
+        ] {
+            let wrong_identity_c =
+                EstablishedLeg::for_authenticated_transport(wrong_identity_binding);
+            retry = retry
+                .bind_fresh_status_leg(&wrong_identity_c, &credentials())
+                .unwrap_err()
+                .into_authority();
+        }
+        let (terminal_c, terminal_c_reporter) =
+            EstablishedLeg::for_authenticated_transport_with_reporter(binding(0xa4));
+        let _terminal_c_fact = terminal_c_reporter
+            .report(LegTransportTerminalReason::Reset)
+            .unwrap();
+        retry = retry
+            .bind_fresh_status_leg(&terminal_c, &credentials())
+            .unwrap_err()
+            .into_authority();
+        retry = retry
+            .bind_fresh_status_leg(client_b.established_leg(), &credentials())
+            .unwrap_err()
+            .into_authority();
+
+        // Fresh C internally re-signs B's immutable request contract, uses
+        // C's sole ordered queue, and receives a typed generation status.
+        let mut client_c = LegIo::for_authenticated_transport(
+            LegId::A,
+            LegEndpointRole::Client,
+            binding(0x9a),
+            limits(),
+        );
+        let mut owner_c = LegIo::for_authenticated_transport(
+            LegId::A,
+            LegEndpointRole::Owner,
+            binding(0x9a),
+            limits(),
+        );
+        let mut client_c_queue =
+            LegOutboundQueue::for_leg(client_c.established_leg(), 4, 4_096).unwrap();
+        let mut owner_c_queue =
+            LegOutboundQueue::for_leg(owner_c.established_leg(), 4, 4_096).unwrap();
+        let mut transport_c = transport();
+        let pending_c = retry
+            .bind_fresh_status_leg(client_c.established_leg(), &credentials())
+            .unwrap();
+        let wrong_c = EstablishedLeg::for_authenticated_transport(binding(0x9b));
+        let mut wrong_c_queue = LegOutboundQueue::for_leg(&wrong_c, 4, 4_096).unwrap();
+        let pending_c = pending_c
+            .enqueue(&mut wrong_c_queue)
+            .unwrap_err()
+            .into_pending();
+        let awaiting_c = pending_c.enqueue(&mut client_c_queue).unwrap();
+        client_c_queue
+            .try_flush(
+                &mut client_c,
+                &mut transport_c.controller_sender(),
+                SimTime::ZERO,
+            )
+            .unwrap()
+            .unwrap();
+        release(&mut transport_c);
+        let received_c = owner_c
+            .receive_delivery(
+                transport_c
+                    .try_recv_next(owner_c.inbound_route())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let enqueued_status = executor
+            .resynchronize_owner_attach(owner_c.established_leg(), received_c)
+            .unwrap()
+            .enqueue(&mut owner_c_queue)
+            .unwrap();
+        owner_c_queue
+            .try_flush(
+                &mut owner_c,
+                &mut transport_c.controller_sender(),
+                SimTime::ZERO,
+            )
+            .unwrap()
+            .unwrap();
+        release(&mut transport_c);
+        let received_status = client_c
+            .receive_delivery(
+                transport_c
+                    .try_recv_next(client_c.inbound_route())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        executor
+            .arm_owner_catch_up_after_status_delivery(enqueued_status, &owner_c_queue)
+            .unwrap();
+        let mut status = awaiting_c
+            .validate_status(BoundInbound::Session(received_status))
+            .unwrap();
+
+        let base_d = binding(0x9d);
+        for wrong_identity_binding in [
+            AttachTransportBinding::new(
+                OwnerIdentity::new([0x32; 32]).unwrap(),
+                base_d.alpn(),
+                TlsExporterBinding::new([0xe4; 32]).unwrap(),
+                base_d.device_principal(),
+            ),
+            AttachTransportBinding::new(
+                base_d.owner_identity(),
+                AttachAlpn::new(b"mini-vpn-wrong/1").unwrap(),
+                TlsExporterBinding::new([0xe5; 32]).unwrap(),
+                base_d.device_principal(),
+            ),
+            AttachTransportBinding::new(
+                base_d.owner_identity(),
+                base_d.alpn(),
+                TlsExporterBinding::new([0xe6; 32]).unwrap(),
+                DevicePrincipal::new([0x54; 16]).unwrap(),
+            ),
+        ] {
+            let wrong_identity_d =
+                EstablishedLeg::for_authenticated_transport(wrong_identity_binding);
+            status = status
+                .begin_catch_up(
+                    &wrong_identity_d,
+                    AttachNonce::new([0x55; 16]).unwrap(),
+                    &credentials(),
+                )
+                .unwrap_err()
+                .into_status();
+        }
+        let (terminal_d, terminal_d_reporter) =
+            EstablishedLeg::for_authenticated_transport_with_reporter(binding(0xa5));
+        let _terminal_d_fact = terminal_d_reporter
+            .report(LegTransportTerminalReason::FatalIo)
+            .unwrap();
+        status = status
+            .begin_catch_up(
+                &terminal_d,
+                AttachNonce::new([0x55; 16]).unwrap(),
+                &credentials(),
+            )
+            .unwrap_err()
+            .into_status();
+        status = status
+            .begin_catch_up(
+                client_c.established_leg(),
+                AttachNonce::new([0x55; 16]).unwrap(),
+                &credentials(),
+            )
+            .unwrap_err()
+            .into_status();
+
+        // The status capability derives and signs only generation 4 for fresh
+        // D, which again must cross its exact sole ordered queue.
+        let (mut client_d, client_d_reporter) = LegIo::for_authenticated_transport_with_reporter(
+            LegId::B,
+            LegEndpointRole::Client,
+            binding(0x9d),
+            limits(),
+        );
+        let mut owner_d = LegIo::for_authenticated_transport(
+            LegId::B,
+            LegEndpointRole::Owner,
+            binding(0x9d),
+            limits(),
+        );
+        let mut client_d_queue =
+            LegOutboundQueue::for_leg(client_d.established_leg(), 4, 4_096).unwrap();
+        let mut owner_d_queue =
+            LegOutboundQueue::for_leg(owner_d.established_leg(), 4, 4_096).unwrap();
+        let mut transport_d = transport();
+        let pending_d = status
+            .begin_catch_up(
+                client_d.established_leg(),
+                AttachNonce::new([0x55; 16]).unwrap(),
+                &credentials(),
+            )
+            .unwrap();
+        let wrong_d = EstablishedLeg::for_authenticated_transport(binding(0x9e));
+        let mut wrong_d_queue = LegOutboundQueue::for_leg(&wrong_d, 4, 4_096).unwrap();
+        let pending_d = pending_d
+            .enqueue(&mut wrong_d_queue)
+            .unwrap_err()
+            .into_pending();
+        let awaiting_d = pending_d.enqueue(&mut client_d_queue).unwrap();
+        let failure = awaiting_d.into_status_retry_after_queue_loss().unwrap_err();
+        assert_eq!(
+            failure.kind(),
+            RegisteredAttachStatusRetryErrorKind::RequestNotDelivered
+        );
+        let awaiting_d = failure.into_awaiting();
+        client_d_queue
+            .try_flush(
+                &mut client_d,
+                &mut transport_d.controller_sender(),
+                SimTime::ZERO,
+            )
+            .unwrap()
+            .unwrap();
+        release(&mut transport_d);
+        let received_d = owner_d
+            .receive_delivery(
+                transport_d
+                    .try_recv_next(owner_d.inbound_route())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let failure = awaiting_d.into_status_retry_after_queue_loss().unwrap_err();
+        assert_eq!(
+            failure.kind(),
+            RegisteredAttachStatusRetryErrorKind::OriginalTransportStillLive
+        );
+        let awaiting_d = failure.into_awaiting();
+        let OwnerTargetAttachPublication::Installed { pending } = executor
+            .accept_catch_up_owner_attach(owner_d.established_leg(), received_d, &mut owner_d_queue)
+            .unwrap()
+        else {
+            panic!("fresh D must install generation 4");
+        };
+        let recovery = pending.enqueue_acceptance(&mut owner_d_queue).unwrap();
+        executor
+            .execute_attached_recovery(recovery, &mut owner_d_queue)
+            .unwrap();
+        owner_d_queue
+            .try_flush(
+                &mut owner_d,
+                &mut transport_d.controller_sender(),
+                SimTime::ZERO,
+            )
+            .unwrap()
+            .unwrap();
+        release(&mut transport_d);
+
+        // D's generation-4 acceptance is lost as well. A wrong terminal must
+        // return both exact values; only D's own terminal can retire its
+        // delivered validator and recover the original B/gen3 correlation.
+        let (_wrong_d, wrong_d_reporter) =
+            EstablishedLeg::for_authenticated_transport_with_reporter(binding(0xa6));
+        let wrong_d_terminal = wrong_d_reporter
+            .report(LegTransportTerminalReason::FatalIo)
+            .unwrap();
+        let failure = awaiting_d
+            .into_status_retry_after_terminal(wrong_d_terminal)
+            .unwrap_err();
+        assert_eq!(
+            failure.kind(),
+            RegisteredAttachStatusRetryErrorKind::WrongTerminal
+        );
+        let (awaiting_d, _wrong_d_terminal) = failure.into_parts();
+        let client_d_terminal = client_d_reporter
+            .report(LegTransportTerminalReason::FatalIo)
+            .unwrap();
+        let retry = awaiting_d
+            .into_status_retry_after_terminal(client_d_terminal)
+            .unwrap();
+        assert_eq!(executor.snapshot().session.session.generation().get(), 4);
+        assert!(!executor.snapshot().session.owner_catch_up_permit);
+
+        // Fresh C2 must internally re-sign the original B/gen3 stale
+        // correlation. Re-signing D/gen4 would derive the wrong local floor
+        // and cannot validate the final generation-5 client catch-up.
+        let mut client_c2 = LegIo::for_authenticated_transport(
+            LegId::A,
+            LegEndpointRole::Client,
+            binding(0xa7),
+            limits(),
+        );
+        let mut owner_c2 = LegIo::for_authenticated_transport(
+            LegId::A,
+            LegEndpointRole::Owner,
+            binding(0xa7),
+            limits(),
+        );
+        let mut client_c2_queue =
+            LegOutboundQueue::for_leg(client_c2.established_leg(), 4, 4_096).unwrap();
+        let mut owner_c2_queue =
+            LegOutboundQueue::for_leg(owner_c2.established_leg(), 4, 4_096).unwrap();
+        let mut transport_c2 = transport();
+        let awaiting_c2 = retry
+            .bind_fresh_status_leg(client_c2.established_leg(), &credentials())
+            .unwrap()
+            .enqueue(&mut client_c2_queue)
+            .unwrap();
+        client_c2_queue
+            .try_flush(
+                &mut client_c2,
+                &mut transport_c2.controller_sender(),
+                SimTime::ZERO,
+            )
+            .unwrap()
+            .unwrap();
+        release(&mut transport_c2);
+        let received_c2 = owner_c2
+            .receive_delivery(
+                transport_c2
+                    .try_recv_next(owner_c2.inbound_route())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let enqueued_status = executor
+            .resynchronize_owner_attach(owner_c2.established_leg(), received_c2)
+            .unwrap()
+            .enqueue(&mut owner_c2_queue)
+            .unwrap();
+        owner_c2_queue
+            .try_flush(
+                &mut owner_c2,
+                &mut transport_c2.controller_sender(),
+                SimTime::ZERO,
+            )
+            .unwrap()
+            .unwrap();
+        release(&mut transport_c2);
+        let received_status = client_c2
+            .receive_delivery(
+                transport_c2
+                    .try_recv_next(client_c2.inbound_route())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        executor
+            .arm_owner_catch_up_after_status_delivery(enqueued_status, &owner_c2_queue)
+            .unwrap();
+        let status = awaiting_c2
+            .validate_status(BoundInbound::Session(received_status))
+            .unwrap();
+        assert_eq!(status.current_generation().get(), 4);
+
+        // The second status derives exactly E/gen5 on another fresh sole
+        // queue. The resulting wrapper retains the E request receipt and the
+        // original client floor inside its catch-up authority.
+        let mut client_e = LegIo::for_authenticated_transport(
+            LegId::B,
+            LegEndpointRole::Client,
+            binding(0xa8),
+            limits(),
+        );
+        let mut owner_e = LegIo::for_authenticated_transport(
+            LegId::B,
+            LegEndpointRole::Owner,
+            binding(0xa8),
+            limits(),
+        );
+        let mut client_e_queue =
+            LegOutboundQueue::for_leg(client_e.established_leg(), 4, 4_096).unwrap();
+        let mut owner_e_queue =
+            LegOutboundQueue::for_leg(owner_e.established_leg(), 4, 4_096).unwrap();
+        let mut transport_e = transport();
+        let awaiting_e = status
+            .begin_catch_up(
+                client_e.established_leg(),
+                AttachNonce::new([0x66; 16]).unwrap(),
+                &credentials(),
+            )
+            .unwrap()
+            .enqueue(&mut client_e_queue)
+            .unwrap();
+        client_e_queue
+            .try_flush(
+                &mut client_e,
+                &mut transport_e.controller_sender(),
+                SimTime::ZERO,
+            )
+            .unwrap()
+            .unwrap();
+        release(&mut transport_e);
+        let received_e = owner_e
+            .receive_delivery(
+                transport_e
+                    .try_recv_next(owner_e.inbound_route())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let OwnerTargetAttachPublication::Installed { pending } = executor
+            .accept_catch_up_owner_attach(owner_e.established_leg(), received_e, &mut owner_e_queue)
+            .unwrap()
+        else {
+            panic!("fresh E must install generation 5")
+        };
+        let recovery = pending.enqueue_acceptance(&mut owner_e_queue).unwrap();
+        executor
+            .execute_attached_recovery(recovery, &mut owner_e_queue)
+            .unwrap();
+        owner_e_queue
+            .try_flush(
+                &mut owner_e,
+                &mut transport_e.controller_sender(),
+                SimTime::ZERO,
+            )
+            .unwrap()
+            .unwrap();
+        release(&mut transport_e);
+        let accepted = awaiting_e
+            .validate_response(BoundInbound::Session(
+                client_e
+                    .receive_delivery(
+                        transport_e
+                            .try_recv_next(client_e.inbound_route())
+                            .unwrap()
+                            .unwrap(),
+                    )
+                    .unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(accepted.generation().get(), 5);
+        assert!(accepted.follow_up_queue_is_live());
+        assert_eq!(executor.snapshot().session.session.generation().get(), 5);
+        assert!(!executor.snapshot().session.owner_catch_up_permit);
+    }
+
+    #[test]
+    fn status_retry_consumes_only_delivered_exact_terminal_or_lost_sole_queue() {
+        let (authority, _model, client_active, owner_active) = active_pair();
+        let mut client_b = LegIo::for_authenticated_transport(
+            LegId::B,
+            LegEndpointRole::Client,
+            binding(0xa1),
+            limits(),
+        );
+        let mut owner_b = LegIo::for_authenticated_transport(
+            LegId::B,
+            LegEndpointRole::Owner,
+            binding(0xa1),
+            limits(),
+        );
+        let mut client_b_queue =
+            LegOutboundQueue::for_leg(client_b.established_leg(), 4, 4_096).unwrap();
+        let mut owner_b_queue =
+            LegOutboundQueue::for_leg(owner_b.established_leg(), 4, 4_096).unwrap();
+        let mut transport_b = transport();
+        let (awaiting_registration, candidate) = deliver_registration(
+            &client_active,
+            &owner_active,
+            &mut client_b,
+            &mut owner_b,
+            &mut client_b_queue,
+            &mut transport_b,
+            &authority,
+            0x71,
+        );
+        let mut slot = OwnerStandbySlot::new();
+        slot.admit(candidate, &mut owner_b_queue).unwrap();
+        let registered = awaiting_registration
+            .validate(deliver_acceptance(
+                &mut owner_b,
+                &mut client_b,
+                &mut owner_b_queue,
+                &mut transport_b,
+            ))
+            .unwrap();
+        let mut awaiting = registered
+            .begin_exact_next_attach(AttachNonce::new([0x72; 16]).unwrap(), &credentials())
+            .unwrap()
+            .enqueue(&mut client_b_queue)
+            .unwrap();
+
+        let failure = awaiting.into_status_retry_after_queue_loss().unwrap_err();
+        assert_eq!(
+            failure.kind(),
+            RegisteredAttachStatusRetryErrorKind::RequestNotDelivered
+        );
+        awaiting = failure.into_awaiting();
+
+        let (_wrong_leg, wrong_reporter) =
+            EstablishedLeg::for_authenticated_transport_with_reporter(binding(0xa2));
+        let wrong_terminal = wrong_reporter
+            .report(LegTransportTerminalReason::Reset)
+            .unwrap();
+        let failure = awaiting
+            .into_status_retry_after_terminal(wrong_terminal)
+            .unwrap_err();
+        assert_eq!(
+            failure.kind(),
+            RegisteredAttachStatusRetryErrorKind::RequestNotDelivered
+        );
+        let (returned, wrong_terminal) = failure.into_parts();
+        awaiting = returned;
+
+        client_b_queue
+            .try_flush(
+                &mut client_b,
+                &mut transport_b.controller_sender(),
+                SimTime::ZERO,
+            )
+            .unwrap()
+            .unwrap();
+        release(&mut transport_b);
+        let _delivered_request = owner_b
+            .receive_delivery(
+                transport_b
+                    .try_recv_next(owner_b.inbound_route())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let failure = awaiting
+            .into_status_retry_after_terminal(wrong_terminal)
+            .unwrap_err();
+        assert_eq!(
+            failure.kind(),
+            RegisteredAttachStatusRetryErrorKind::WrongTerminal
+        );
+        let (returned, _wrong_terminal) = failure.into_parts();
+        awaiting = returned;
+
+        let failure = awaiting.into_status_retry_after_queue_loss().unwrap_err();
+        assert_eq!(
+            failure.kind(),
+            RegisteredAttachStatusRetryErrorKind::OriginalTransportStillLive
+        );
+        awaiting = failure.into_awaiting();
+        drop(client_b_queue);
+        assert!(client_b.established_leg().transport_is_open());
+        let authority = awaiting.into_status_retry_after_queue_loss().unwrap();
+
+        let fresh_c = EstablishedLeg::for_authenticated_transport(binding(0xa3));
+        let mut fresh_c_queue = LegOutboundQueue::for_leg(&fresh_c, 4, 4_096).unwrap();
+        authority
+            .bind_fresh_status_leg(&fresh_c, &credentials())
+            .unwrap()
+            .enqueue(&mut fresh_c_queue)
+            .unwrap();
+        assert_eq!(fresh_c_queue.len(), 1);
+    }
+
+    #[test]
+    fn terminal_report_serializes_with_attach_control_and_poison_fails_closed() {
+        let (leg, reporter) =
+            EstablishedLeg::for_authenticated_transport_with_reporter(binding(0xb1));
+        let transition = leg.lock_terminal_transition().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            completed_tx
+                .send(reporter.report(LegTransportTerminalReason::PeerClosed))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            completed_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(leg.transport_is_open());
+        drop(transition);
+        let terminal = completed_rx.recv().unwrap().unwrap();
+        worker.join().unwrap();
+        assert_eq!(terminal.reason(), LegTransportTerminalReason::PeerClosed);
+        assert!(!leg.transport_is_open());
+
+        let (poisoned, poisoned_reporter) =
+            EstablishedLeg::for_authenticated_transport_with_reporter(binding(0xb2));
+        poisoned.poison_terminal_transition_for_test();
+        assert!(matches!(
+            poisoned.lock_terminal_transition(),
+            Err(crate::owned_upstream::leg::LegTerminalTransitionError::Poisoned)
+        ));
+        assert!(!poisoned.transport_is_open());
+        assert!(matches!(
+            poisoned_reporter.report(LegTransportTerminalReason::FatalIo),
+            Err(crate::owned_upstream::leg::LegTerminalTransitionError::Poisoned)
+        ));
     }
 
     #[test]
@@ -1924,5 +4120,11 @@ mod tests {
         let _ = <OwnerRegisteredStandby as AmbiguousIfClone<_>>::marker;
         let _ = <OwnerStandbySlot as AmbiguousIfClone<_>>::marker;
         let _ = <LegControlEnqueued as AmbiguousIfClone<_>>::marker;
+        let _ = <RegisteredPendingAttachAuthority as AmbiguousIfClone<_>>::marker;
+        let _ = <RegisteredAttachResponseGate as AmbiguousIfClone<_>>::marker;
+        let _ = <RegisteredCatchUpBeginGate as AmbiguousIfClone<_>>::marker;
+        let _ = <RegisteredCatchUpAssemblyGate as AmbiguousIfClone<_>>::marker;
+        let _ = <RegisteredCatchUpResponseGate as AmbiguousIfClone<_>>::marker;
+        let _ = <AcceptedClientRegisteredCatchUp as AmbiguousIfClone<_>>::marker;
     };
 }

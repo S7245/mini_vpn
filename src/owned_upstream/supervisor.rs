@@ -13,17 +13,24 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::resumable::{
-    AttachAuthority, AttachNonce, AttachTransportBinding, ByteOffset, Direction, Frame,
-    LegGeneration, SessionConfig, SessionEffect, SessionError, SessionEvent, SessionFlowId,
-    SessionModel, SessionPhase, SessionRole, SessionSnapshot,
+    AttachAuthority, AttachNonce, AttachTransportBinding, AuthenticatedAttachStatus, ByteOffset,
+    Direction, Frame, LegGeneration, SessionConfig, SessionEffect, SessionError, SessionEvent,
+    SessionFlowId, SessionModel, SessionPhase, SessionRole, SessionSnapshot,
 };
 
+#[cfg(test)]
+use super::leg::CaughtUpAttachedLeg;
 use super::leg::{
-    AttachedLeg, BoundInbound, CaughtUpAttachedLeg, EstablishedLeg, LegBoundFrame,
-    LegProvenanceError, LegSeal, OwnerAttachTransaction,
+    AttachedLeg, BoundInbound, EstablishedLeg, ExactLegTerminal, LegBoundFrame, LegProvenanceError,
+    LegSeal, LegTerminalTransitionError, LegTransportTerminalReason, OwnerAttachTransaction,
+};
+use super::leg_io::{
+    AcceptedInitialAttach, AcceptedInitialAttachActivationFailure, AttachAcceptanceEnqueued,
+    AttachAcceptanceReservation, AttachAcceptanceReserveError, InitialAttachActivationError,
+    LegOutboundQueue, LegOutboundQueueErrorKind,
 };
 use super::session::SessionOwnerCommand;
-use super::standby::ExactAuthenticatedStandby;
+use super::standby::{ExactAuthenticatedStandby, OwnerRegisteredAttachGate};
 use super::tcp::{
     DriverInput, FlowPortConfig, FlowPortConfigError, FlowPortError, ResumableTcpPortFactory,
     UplinkOwnership, UplinkReplayOwnership,
@@ -75,6 +82,8 @@ pub(crate) struct SessionSupervisorSnapshot {
     pub(crate) poisoned: bool,
     pub(crate) quarantined_uplink_extents: usize,
     pub(crate) quarantined_uplink_owned_bytes: usize,
+    pub(crate) owner_catch_up_permit: bool,
+    pub(crate) owner_catch_up_permit_armed: bool,
 }
 
 enum QuarantinedUplinkOwnership {
@@ -87,6 +96,84 @@ struct OwnerActiveContract {
     generation: LegGeneration,
     nonce: AttachNonce,
     binding: AttachTransportBinding,
+    selected_version: u16,
+    negotiated_features: u64,
+}
+
+struct OwnerCatchUpPermitIdentity;
+
+struct OwnerCatchUpPermit {
+    identity: Arc<OwnerCatchUpPermitIdentity>,
+    authenticated: AuthenticatedAttachStatus,
+    status_seal: LegSeal,
+    status_binding: AttachTransportBinding,
+    armed: bool,
+}
+
+impl OwnerCatchUpPermit {
+    fn same_contract(
+        &self,
+        authenticated: &AuthenticatedAttachStatus,
+        leg: &EstablishedLeg,
+    ) -> bool {
+        self.authenticated.same_catch_up_contract(authenticated)
+            && leg.belongs_to_transport(&self.status_seal)
+            && leg.standby_transport_binding() == self.status_binding
+    }
+
+    fn permits(
+        &self,
+        active: &OwnerActiveContract,
+        leg: &EstablishedLeg,
+        received: &LegBoundFrame,
+    ) -> bool {
+        self.armed
+            && !leg.belongs_to_transport(&self.status_seal)
+            && leg.standby_transport_binding() != self.status_binding
+            && !leg.belongs_to_transport(&active.seal)
+            && leg.standby_transport_binding() != active.binding
+            && received.belongs_to_transport(leg)
+            && received.attach_request().is_ok_and(|request| {
+                request.nonce() != active.nonce
+                    && self
+                        .authenticated
+                        .permits_follow_up(&request, &leg.standby_transport_binding())
+            })
+    }
+
+    fn matches_current(&self, snapshot: SessionSnapshot) -> bool {
+        snapshot.phase() != SessionPhase::Expired
+            && snapshot.generation() == self.authenticated.current_generation()
+    }
+}
+
+/// Non-cloneable authority to arm exactly the bounded stale correlation that
+/// produced a status response. It has no commit or frame construction API.
+pub(super) struct OwnerCatchUpArm {
+    identity: Arc<OwnerCatchUpPermitIdentity>,
+}
+
+/// Authenticated status-only publication. OwnerTarget must route its frame
+/// through the exact status leg's dedicated ordered admission before the
+/// optional catch-up arm can be consumed.
+pub(super) struct AuthenticatedOwnerAttachStatus {
+    status: Frame,
+    arm: Option<OwnerCatchUpArm>,
+}
+
+impl AuthenticatedOwnerAttachStatus {
+    pub(super) fn into_parts(self) -> (Frame, Option<OwnerCatchUpArm>) {
+        (self.status, self.arm)
+    }
+}
+
+impl fmt::Debug for AuthenticatedOwnerAttachStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedOwnerAttachStatus")
+            .field("catch_up", &self.arm.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl OwnerActiveContract {
@@ -96,6 +183,8 @@ impl OwnerActiveContract {
             generation: active.generation(),
             nonce: active.nonce(),
             binding: active.transport_binding(),
+            selected_version: active.session_protocol_version(),
+            negotiated_features: active.negotiated_features(),
         }
     }
 
@@ -104,6 +193,8 @@ impl OwnerActiveContract {
             && self.generation == active.generation()
             && self.nonce == active.nonce()
             && self.binding == active.transport_binding()
+            && self.selected_version == active.session_protocol_version()
+            && self.negotiated_features == active.negotiated_features()
     }
 }
 
@@ -193,6 +284,7 @@ pub(crate) struct SessionSupervisor {
     model: SessionModel,
     attach_authority: Option<AttachAuthority>,
     owner_active_contract: Option<OwnerActiveContract>,
+    owner_catch_up_permit: Option<OwnerCatchUpPermit>,
     tcp_factory_origin: Option<TcpFactoryOrigin>,
     uplink_replay: BTreeMap<ReplayExtentKey, UplinkReplayOwnership>,
     poisoned: bool,
@@ -209,6 +301,7 @@ impl SessionSupervisor {
             model,
             attach_authority: None,
             owner_active_contract: None,
+            owner_catch_up_permit: None,
             tcp_factory_origin: None,
             uplink_replay: BTreeMap::new(),
             poisoned: false,
@@ -228,25 +321,29 @@ impl SessionSupervisor {
         }
     }
 
-    /// Constructs the initial client model from one exact, correlated
-    /// ATTACH_ACCEPTED capability while retaining its live transport seal.
+    /// Constructs the initial client model only after one queue-bound,
+    /// actually delivered ATTACH has received its exact correlated
+    /// acceptance. The same sole queue transitions to Active without an
+    /// allocation or another pressure-sensitive admission.
     #[allow(
         clippy::result_large_err,
-        reason = "terminal rejection returns exact non-cloneable AttachedLeg ownership without adding allocation to the successful bootstrap path"
+        reason = "bootstrap rejection returns the exact queue-bound acceptance capability"
     )]
     pub(crate) fn bootstrap_client(
         config: SessionConfig,
-        attached: AttachedLeg,
+        accepted: AcceptedInitialAttach,
+        queue: &mut LegOutboundQueue,
     ) -> Result<ClientSessionBootstrap, ClientBootstrapError> {
-        if !attached.transport_is_open() {
-            return Err(ClientBootstrapError::endpoint_lost(attached));
-        }
+        let attached = accepted
+            .activate_on_queue(queue)
+            .map_err(ClientBootstrapError::activation)?;
         let model = attached.initial_client_model(config);
         Ok(ClientSessionBootstrap {
             supervisor: Self {
                 model,
                 attach_authority: None,
                 owner_active_contract: None,
+                owner_catch_up_permit: None,
                 tcp_factory_origin: None,
                 uplink_replay: BTreeMap::new(),
                 poisoned: false,
@@ -288,11 +385,32 @@ impl SessionSupervisor {
             // This test-only bare-model seam has no exact process-local
             // AttachedLeg seal and therefore cannot authorize standby.
             owner_active_contract: None,
+            owner_catch_up_permit: None,
             tcp_factory_origin: None,
             uplink_replay: BTreeMap::new(),
             poisoned: false,
             quarantined_uplink: Vec::new(),
         })
+    }
+
+    /// Test-only bridge for an already-created exact owner `AttachedLeg`.
+    /// Production still enters exclusively through `PendingOwnerBootstrap`.
+    #[cfg(test)]
+    pub(crate) fn new_owner_with_active(
+        model: SessionModel,
+        attach_authority: AttachAuthority,
+        active: &AttachedLeg,
+    ) -> Result<Self, SessionSupervisorError> {
+        let model_leg = model.current_leg();
+        if active.generation() != model_leg.generation()
+            || active.nonce() != model_leg.nonce()
+            || active.transport_binding() != model_leg.transport_binding()
+        {
+            return Err(SessionSupervisorError::OwnerStandbyAuthenticationRejected);
+        }
+        let mut supervisor = Self::new_owner(model, attach_authority)?;
+        supervisor.owner_active_contract = Some(OwnerActiveContract::from_attached(active));
+        Ok(supervisor)
     }
 
     pub(crate) fn snapshot(&self) -> SessionSupervisorSnapshot {
@@ -311,6 +429,11 @@ impl SessionSupervisor {
                 .iter()
                 .map(QuarantinedUplinkOwnership::bytes)
                 .sum(),
+            owner_catch_up_permit: self.owner_catch_up_permit.is_some(),
+            owner_catch_up_permit_armed: self
+                .owner_catch_up_permit
+                .as_ref()
+                .is_some_and(|permit| permit.armed),
         }
     }
 
@@ -344,6 +467,25 @@ impl SessionSupervisor {
         &mut self,
         config: FlowPortConfig,
     ) -> Result<ResumableTcpPortFactory, TcpPortFactoryMintError> {
+        self.mint_tcp_port_factory_in_phase(config, SessionPhase::Active)
+    }
+
+    /// Initial acceptance loss constructs OwnerTarget only after the exact
+    /// leg has already moved this pristine session to Legless. This narrow
+    /// entry preserves every ordinary factory invariant while avoiding a
+    /// global relaxation of Active-only construction.
+    pub(super) fn mint_tcp_port_factory_for_legless_bootstrap(
+        &mut self,
+        config: FlowPortConfig,
+    ) -> Result<ResumableTcpPortFactory, TcpPortFactoryMintError> {
+        self.mint_tcp_port_factory_in_phase(config, SessionPhase::Legless)
+    }
+
+    fn mint_tcp_port_factory_in_phase(
+        &mut self,
+        config: FlowPortConfig,
+        required_phase: SessionPhase,
+    ) -> Result<ResumableTcpPortFactory, TcpPortFactoryMintError> {
         if self.tcp_factory_origin.is_some() {
             return Err(TcpPortFactoryMintError::AlreadyMinted);
         }
@@ -357,7 +499,7 @@ impl SessionSupervisor {
         let replay_segments = client_replay
             .segments()
             .saturating_add(target_replay.segments());
-        if snapshot.phase() != SessionPhase::Active
+        if snapshot.phase() != required_phase
             || snapshot.flow_count() != 0
             || replay_bytes != 0
             || replay_segments != 0
@@ -512,7 +654,208 @@ impl SessionSupervisor {
     /// A committed publication is returned only after the owner reducer has
     /// installed the exact same-leg capability. The caller must queue the
     /// acceptance on that leg before dispatching the returned recovery effects.
-    pub(crate) fn accept_owner_attach(
+    #[cfg(test)]
+    pub(crate) fn accept_owner_attach_for_test(
+        &mut self,
+        leg: &EstablishedLeg,
+        received: LegBoundFrame,
+    ) -> Result<OwnerAttachPublication, SessionSupervisorError> {
+        if self.owner_catch_up_permit.is_some() {
+            return Err(SessionSupervisorError::OwnerCatchUpPermitConflict);
+        }
+        self.accept_owner_attach_inner(leg, received)
+    }
+
+    /// Only a gate removed from the exact registered B slot may authorize a
+    /// normal exact-next owner commit in production.
+    pub(super) fn accept_registered_owner_attach(
+        &mut self,
+        gate: &OwnerRegisteredAttachGate,
+        leg: &EstablishedLeg,
+        received: LegBoundFrame,
+    ) -> Result<OwnerAttachPublication, SessionSupervisorError> {
+        let model_generation = self.model.snapshot().generation();
+        if gate.current_generation() != model_generation
+            || !gate.matches_transaction(leg, &received)
+        {
+            return Err(SessionSupervisorError::OwnerRegisteredAttachGateRejected);
+        }
+        let publication = self.accept_owner_attach_inner(leg, received)?;
+        if matches!(publication, OwnerAttachPublication::Installed { .. }) {
+            self.owner_catch_up_permit = None;
+        }
+        Ok(publication)
+    }
+
+    /// Authenticates a stale/exhausted request and publishes only its
+    /// correlated generation status. A single catch-up permit is installed
+    /// idempotently for the same stale correlation; conflicts are inert.
+    pub(super) fn resynchronize_owner_attach(
+        &mut self,
+        leg: &EstablishedLeg,
+        received: LegBoundFrame,
+    ) -> Result<AuthenticatedOwnerAttachStatus, SessionSupervisorError> {
+        self.require_healthy()?;
+        self.invalidate_owner_catch_up_permit();
+        let snapshot = self.model.snapshot();
+        if self.model.role() != SessionRole::Owner || snapshot.phase() == SessionPhase::Expired {
+            return Err(SessionSupervisorError::OwnerCatchUpStatusRejected);
+        }
+        let authority = self
+            .attach_authority
+            .as_ref()
+            .ok_or(SessionSupervisorError::MissingAttachAuthority)?;
+        let model_generation = snapshot.generation().get();
+        let authority_generation = authority.current_generation();
+        if model_generation != authority_generation {
+            return Err(SessionSupervisorError::AuthorityModelGenerationMismatch {
+                model: model_generation,
+                authority: authority_generation,
+            });
+        }
+        let authenticated = leg.authenticate_owner_resynchronization(received, authority)?;
+        if authenticated.current_generation().get() != model_generation {
+            return Err(SessionSupervisorError::AuthorityModelGenerationMismatch {
+                model: model_generation,
+                authority: authenticated.current_generation().get(),
+            });
+        }
+        let Some(active) = self.owner_active_contract.as_ref() else {
+            return Err(SessionSupervisorError::OwnerCatchUpStatusRejected);
+        };
+        if active.generation.get() != model_generation
+            || !authenticated
+                .matches_active_negotiation(active.selected_version, active.negotiated_features)
+        {
+            return Err(SessionSupervisorError::OwnerCatchUpStatusRejected);
+        }
+        let status = authenticated.status_frame();
+        let arm = if authenticated.can_catch_up() {
+            match self.owner_catch_up_permit.as_ref() {
+                None => {
+                    let identity = Arc::new(OwnerCatchUpPermitIdentity);
+                    let arm = OwnerCatchUpArm {
+                        identity: Arc::clone(&identity),
+                    };
+                    self.owner_catch_up_permit = Some(OwnerCatchUpPermit {
+                        identity,
+                        status_binding: authenticated.transport_binding(),
+                        status_seal: leg.standby_seal(),
+                        authenticated,
+                        armed: false,
+                    });
+                    Some(arm)
+                }
+                // The original pending publication remains the sole arm
+                // authority. Before it is delivered, a same-contract status
+                // publication without that arm could occupy the exact C FIFO
+                // and permanently strand the permit. Once armed, status-only
+                // authentication remains state-idempotent without promising
+                // that a controller will republish it on the wire.
+                Some(existing)
+                    if existing.same_contract(&authenticated, leg) && !existing.armed =>
+                {
+                    return Err(SessionSupervisorError::OwnerCatchUpPermitPending);
+                }
+                Some(existing) if existing.same_contract(&authenticated, leg) => None,
+                Some(_) => return Err(SessionSupervisorError::OwnerCatchUpPermitConflict),
+            }
+        } else {
+            None
+        };
+        Ok(AuthenticatedOwnerAttachStatus { status, arm })
+    }
+
+    /// Arms one reserved stale correlation only after OwnerTarget has consumed
+    /// the exact queue receipt proving ordered status delivery.
+    pub(super) fn arm_owner_catch_up(
+        &mut self,
+        arm: OwnerCatchUpArm,
+    ) -> Result<(), SessionSupervisorError> {
+        self.require_healthy()?;
+        self.invalidate_owner_catch_up_permit();
+        let Some(permit) = self.owner_catch_up_permit.as_mut() else {
+            return Err(SessionSupervisorError::OwnerCatchUpPermitMissing);
+        };
+        if !Arc::ptr_eq(&permit.identity, &arm.identity) {
+            return Err(SessionSupervisorError::OwnerCatchUpArmRejected);
+        }
+        permit.armed = true;
+        Ok(())
+    }
+
+    /// Clears only the exact still-unarmed permit whose status publication is
+    /// proven lost by OwnerTarget. Armed or mismatched authority is inert.
+    pub(super) fn abandon_unarmed_owner_catch_up(
+        &mut self,
+        arm: &OwnerCatchUpArm,
+    ) -> Result<(), SessionSupervisorError> {
+        self.invalidate_owner_catch_up_permit();
+        let Some(permit) = self.owner_catch_up_permit.as_ref() else {
+            return Err(SessionSupervisorError::OwnerCatchUpPermitMissing);
+        };
+        if permit.armed || !Arc::ptr_eq(&permit.identity, &arm.identity) {
+            return Err(SessionSupervisorError::OwnerCatchUpArmRejected);
+        }
+        self.owner_catch_up_permit = None;
+        Ok(())
+    }
+
+    /// The only non-registered production commit path consumes a bounded
+    /// permit derived from an earlier proof-valid stale request. Failed auth,
+    /// model rejection, or resynchronization retains the exact permit.
+    pub(super) fn preflight_catch_up_owner_attach(
+        &self,
+        leg: &EstablishedLeg,
+        received: &LegBoundFrame,
+    ) -> Result<(), SessionSupervisorError> {
+        self.require_healthy()?;
+        let authority = self
+            .attach_authority
+            .as_ref()
+            .ok_or(SessionSupervisorError::MissingAttachAuthority)?;
+        let snapshot = self.model.snapshot();
+        let model_generation = snapshot.generation().get();
+        let authority_generation = authority.current_generation();
+        if model_generation != authority_generation {
+            return Err(SessionSupervisorError::AuthorityModelGenerationMismatch {
+                model: model_generation,
+                authority: authority_generation,
+            });
+        }
+        let permit = self
+            .owner_catch_up_permit
+            .as_ref()
+            .ok_or(SessionSupervisorError::OwnerCatchUpPermitMissing)?;
+        if !permit.matches_current(snapshot) {
+            return Err(SessionSupervisorError::OwnerCatchUpAttachGateRejected);
+        }
+        if !permit.armed {
+            return Err(SessionSupervisorError::OwnerCatchUpPermitNotArmed);
+        }
+        let Some(active) = self.owner_active_contract.as_ref() else {
+            return Err(SessionSupervisorError::OwnerCatchUpAttachGateRejected);
+        };
+        if !permit.permits(active, leg, received) {
+            return Err(SessionSupervisorError::OwnerCatchUpAttachGateRejected);
+        }
+        Ok(())
+    }
+
+    pub(super) fn accept_catch_up_owner_attach(
+        &mut self,
+        leg: &EstablishedLeg,
+        received: LegBoundFrame,
+    ) -> Result<OwnerAttachPublication, SessionSupervisorError> {
+        self.preflight_catch_up_owner_attach(leg, &received)?;
+        let publication = self.accept_owner_attach_inner(leg, received)?;
+        if matches!(publication, OwnerAttachPublication::Installed { .. }) {
+            self.owner_catch_up_permit = None;
+        }
+        Ok(publication)
+    }
+
+    fn accept_owner_attach_inner(
         &mut self,
         leg: &EstablishedLeg,
         received: LegBoundFrame,
@@ -532,7 +875,7 @@ impl SessionSupervisor {
         }
 
         let outcome = leg
-            .transact_owner_attach(received, authority, &mut self.model)?
+            .transact_owner_attach_from_supervisor(received, authority, &mut self.model)?
             .map_err(SessionSupervisorError::Reducer)?;
         match outcome {
             OwnerAttachTransaction::Installed {
@@ -540,7 +883,11 @@ impl SessionSupervisor {
                 acceptance,
                 recovery,
             } => {
-                let recovery = self.consume_after_model_commit(recovery)?;
+                // `PreflightedReplacement::install` constructs only visible
+                // activation/replay effects.  Keep the post-CAS half of this
+                // transaction infallible: slot and queue authority must never
+                // be restored after the generation/model commit succeeded.
+                self.invalidate_owner_catch_up_permit();
                 self.owner_active_contract = Some(OwnerActiveContract::from_attached(&attached));
                 Ok(OwnerAttachPublication::Installed {
                     attached,
@@ -557,6 +904,7 @@ impl SessionSupervisor {
     /// Installs an exact status-derived client replacement after both the
     /// status response and follow-up acceptance crossed their own live-leg
     /// provenance gates.
+    #[cfg(test)]
     pub(crate) fn install_caught_up_leg(
         &mut self,
         leg: &CaughtUpAttachedLeg,
@@ -569,6 +917,7 @@ impl SessionSupervisor {
 
     /// Installs a normal client replacement only from the exact live-leg
     /// capability minted by its correlated ATTACH_ACCEPTED response.
+    #[cfg(test)]
     pub(crate) fn install_attached_leg(
         &mut self,
         leg: &AttachedLeg,
@@ -690,11 +1039,26 @@ impl SessionSupervisor {
         effects: Vec<SessionEffect>,
     ) -> Result<Vec<SessionEffect>, SessionSupervisorError> {
         match self.consume_internal_receipts(effects) {
-            Ok(visible) => Ok(visible),
+            Ok(visible) => {
+                self.invalidate_owner_catch_up_permit();
+                Ok(visible)
+            }
             Err(error) => {
                 self.poisoned = true;
+                self.owner_catch_up_permit = None;
                 Err(error)
             }
+        }
+    }
+
+    fn invalidate_owner_catch_up_permit(&mut self) {
+        let snapshot = self.model.snapshot();
+        if self
+            .owner_catch_up_permit
+            .as_ref()
+            .is_some_and(|permit| !permit.matches_current(snapshot))
+        {
+            self.owner_catch_up_permit = None;
         }
     }
 
@@ -771,20 +1135,75 @@ pub(crate) struct PendingOwnerBootstrap {
 }
 
 impl PendingOwnerBootstrap {
+    #[allow(
+        clippy::result_large_err,
+        reason = "bootstrap rejection returns the exact inbound capability and any unreleased queue reservation"
+    )]
     pub(crate) fn accept(
         &mut self,
         leg: &EstablishedLeg,
         received: LegBoundFrame,
-    ) -> Result<OwnerSessionBootstrap, SessionSupervisorError> {
-        let authority = self
-            .authority
-            .take()
-            .ok_or(SessionSupervisorError::OwnerBootstrapCompleted)?;
-        let authenticated = match leg.authenticate_initial_owner_attach(received, &authority) {
+        queue: &mut LegOutboundQueue,
+    ) -> Result<PendingInitialOwnerBootstrapPublication, InitialOwnerBootstrapAcceptFailure> {
+        if self.authority.is_none() {
+            return Err(InitialOwnerBootstrapAcceptFailure::new(
+                received,
+                InitialOwnerBootstrapAcceptErrorKind::AlreadyCompleted,
+            ));
+        }
+        let reservation = match queue.reserve_attach_acceptance(leg) {
+            Ok(reservation) => reservation,
+            Err(source) => {
+                return Err(InitialOwnerBootstrapAcceptFailure::new(
+                    received,
+                    InitialOwnerBootstrapAcceptErrorKind::QueueReservation(source),
+                ));
+            }
+        };
+        let _terminal_transition = match leg.lock_terminal_transition() {
+            Ok(transition) => transition,
+            Err(source) => {
+                return Err(Self::release_failed_reservation(
+                    queue,
+                    reservation,
+                    received,
+                    InitialOwnerBootstrapAcceptErrorKind::TerminalTransition(source),
+                ));
+            }
+        };
+        if !leg.transport_is_open() {
+            return Err(Self::release_failed_reservation(
+                queue,
+                reservation,
+                received,
+                InitialOwnerBootstrapAcceptErrorKind::EndpointLost,
+            ));
+        }
+        let Some(authority) = self.authority.take() else {
+            return Err(Self::release_failed_reservation(
+                queue,
+                reservation,
+                received,
+                InitialOwnerBootstrapAcceptErrorKind::AlreadyCompleted,
+            ));
+        };
+        let authenticated = match leg
+            .authenticate_initial_owner_attach_preserving(received, &authority)
+        {
             Ok(authenticated) => authenticated,
-            Err(error) => {
+            Err(failure) => {
+                let (received, source) = failure.into_parts();
                 self.authority = Some(authority);
-                return Err(SessionSupervisorError::LegProvenance(error));
+                let kind = match source {
+                    LegProvenanceError::WrongLeg => InitialOwnerBootstrapAcceptErrorKind::WrongLeg,
+                    LegProvenanceError::Rejected => InitialOwnerBootstrapAcceptErrorKind::Rejected,
+                };
+                return Err(Self::release_failed_reservation(
+                    queue,
+                    reservation,
+                    received,
+                    kind,
+                ));
             }
         };
         let (model, attached, acceptance) = authenticated.into_owner_parts(self.config);
@@ -793,16 +1212,34 @@ impl PendingOwnerBootstrap {
             model,
             attach_authority: Some(authority),
             owner_active_contract: Some(owner_active_contract),
+            owner_catch_up_permit: None,
             tcp_factory_origin: None,
             uplink_replay: BTreeMap::new(),
             poisoned: false,
             quarantined_uplink: Vec::new(),
         };
-        Ok(OwnerSessionBootstrap {
+        Ok(PendingInitialOwnerBootstrapPublication {
             supervisor,
             attached,
             acceptance,
+            reservation,
         })
+    }
+
+    fn release_failed_reservation(
+        queue: &mut LegOutboundQueue,
+        reservation: AttachAcceptanceReservation,
+        received: LegBoundFrame,
+        kind: InitialOwnerBootstrapAcceptErrorKind,
+    ) -> InitialOwnerBootstrapAcceptFailure {
+        match reservation.release(queue) {
+            Ok(()) => InitialOwnerBootstrapAcceptFailure::new(received, kind),
+            Err(reservation) => InitialOwnerBootstrapAcceptFailure {
+                received,
+                kind: InitialOwnerBootstrapAcceptErrorKind::ReservationInvariant,
+                reservation: Some(reservation),
+            },
+        }
     }
 }
 
@@ -815,17 +1252,376 @@ impl fmt::Debug for PendingOwnerBootstrap {
     }
 }
 
-/// Fully installed initial owner session. Acceptance becomes accessible only
-/// together with the matching supervisor and exact live-leg capability.
-pub(crate) struct OwnerSessionBootstrap {
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub(crate) enum InitialOwnerBootstrapAcceptErrorKind {
+    #[error("initial owner bootstrap already completed")]
+    AlreadyCompleted,
+    #[error("initial owner queue reservation failed: {0}")]
+    QueueReservation(AttachAcceptanceReserveError),
+    #[error("initial owner terminal transition failed: {0}")]
+    TerminalTransition(LegTerminalTransitionError),
+    #[error("initial owner endpoint was lost before authentication")]
+    EndpointLost,
+    #[error("initial owner ATTACH belongs to another leg")]
+    WrongLeg,
+    #[error("initial owner ATTACH authentication was rejected")]
+    Rejected,
+    #[error("initial owner queue reservation could not be restored")]
+    ReservationInvariant,
+}
+
+/// Retry-safe initial-owner rejection. Authentication authority remains in
+/// `PendingOwnerBootstrap`; an exceptional reservation release mismatch is
+/// returned here rather than silently losing the exact queue claim.
+pub(crate) struct InitialOwnerBootstrapAcceptFailure {
+    received: LegBoundFrame,
+    kind: InitialOwnerBootstrapAcceptErrorKind,
+    reservation: Option<AttachAcceptanceReservation>,
+}
+
+impl InitialOwnerBootstrapAcceptFailure {
+    fn new(received: LegBoundFrame, kind: InitialOwnerBootstrapAcceptErrorKind) -> Self {
+        Self {
+            received,
+            kind,
+            reservation: None,
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> InitialOwnerBootstrapAcceptErrorKind {
+        self.kind
+    }
+
+    pub(super) fn into_parts(self) -> (LegBoundFrame, Option<AttachAcceptanceReservation>) {
+        (self.received, self.reservation)
+    }
+}
+
+impl fmt::Debug for InitialOwnerBootstrapAcceptFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InitialOwnerBootstrapAcceptFailure")
+            .field("kind", &self.kind)
+            .field("reservation_retained", &self.reservation.is_some())
+            .field("received", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl fmt::Display for InitialOwnerBootstrapAcceptFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.kind.fmt(formatter)
+    }
+}
+
+impl std::error::Error for InitialOwnerBootstrapAcceptFailure {}
+
+/// Committed initial owner session whose exact queue reservation still owns
+/// the sole acceptance publication path.
+#[must_use = "initial owner acceptance must enter its reserved exact queue"]
+pub(crate) struct PendingInitialOwnerBootstrapPublication {
     supervisor: SessionSupervisor,
     attached: AttachedLeg,
     acceptance: Frame,
+    reservation: AttachAcceptanceReservation,
+}
+
+impl PendingInitialOwnerBootstrapPublication {
+    #[allow(
+        clippy::result_large_err,
+        reason = "queue rejection returns the exact committed publication for fail-closed handling"
+    )]
+    pub(crate) fn enqueue_acceptance(
+        self,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<OwnerSessionBootstrap, InitialOwnerBootstrapEnqueueFailure> {
+        let Self {
+            supervisor,
+            attached,
+            acceptance,
+            reservation,
+        } = self;
+        match queue.push_reserved_initial_attach_acceptance(reservation, &attached, acceptance) {
+            Ok(acceptance) => Ok(OwnerSessionBootstrap {
+                supervisor,
+                attached,
+                acceptance,
+            }),
+            Err(error) => {
+                let kind = error.kind().clone();
+                let (reservation, acceptance) = error.into_parts();
+                Err(InitialOwnerBootstrapEnqueueFailure {
+                    publication: Self {
+                        supervisor,
+                        attached,
+                        acceptance,
+                        reservation,
+                    },
+                    kind,
+                })
+            }
+        }
+    }
+
+    /// Consumes a committed-but-unpublished initial attach only for the exact
+    /// transport terminal that owns its installed leg. The same supervisor
+    /// applies `LegLost` once and moves to a typed legless high-water
+    /// bootstrap; queue loss alone has no conversion API and therefore keeps
+    /// this bounded publication waiting for terminal authority.
+    #[allow(
+        clippy::result_large_err,
+        reason = "wrong terminal returns the exact committed publication and terminal fact"
+    )]
+    pub(crate) fn lose_before_acceptance(
+        self,
+        terminal: ExactLegTerminal,
+    ) -> Result<LeglessOwnerSessionBootstrap, InitialOwnerBootstrapTerminalFailure> {
+        let Self {
+            mut supervisor,
+            attached,
+            acceptance,
+            reservation,
+        } = self;
+        let high_water_generation = attached.generation();
+        let resume_grace_expired = attached.resume_grace_expired_event();
+        let loss = match attached.bind_terminal(terminal) {
+            Ok(loss) => loss,
+            Err(mismatch) => {
+                let (attached, terminal) = mismatch.into_parts();
+                return Err(InitialOwnerBootstrapTerminalFailure::WrongTerminal {
+                    publication: Self {
+                        supervisor,
+                        attached,
+                        acceptance,
+                        reservation,
+                    },
+                    terminal,
+                });
+            }
+        };
+        let reason = loss.reason();
+        let effects = match supervisor.apply_event(loss.into_event()) {
+            Ok(effects) => effects,
+            Err(source) => {
+                return Err(InitialOwnerBootstrapTerminalFailure::SupervisorInvariant {
+                    supervisor,
+                    source,
+                });
+            }
+        };
+        if effects.as_slice()
+            != [SessionEffect::ResumeGraceStarted {
+                generation: high_water_generation,
+            }]
+        {
+            return Err(InitialOwnerBootstrapTerminalFailure::EffectInvariant {
+                supervisor,
+                effects,
+            });
+        }
+        drop((acceptance, reservation, effects));
+        Ok(LeglessOwnerSessionBootstrap {
+            supervisor,
+            high_water: PendingOwnerHighWater {
+                generation: high_water_generation,
+                reason,
+                resume_grace_expired,
+            },
+        })
+    }
+}
+
+impl fmt::Debug for PendingInitialOwnerBootstrapPublication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingInitialOwnerBootstrapPublication")
+            .field("snapshot", &self.supervisor.snapshot())
+            .field("acceptance", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Queue rejection after the owner generation CAS. The exact committed
+/// publication retains both its reserved queue claim and acceptance frame, so
+/// the actor can retry admission without authenticating or committing again.
+pub(crate) struct InitialOwnerBootstrapEnqueueFailure {
+    publication: PendingInitialOwnerBootstrapPublication,
+    kind: LegOutboundQueueErrorKind,
+}
+
+impl InitialOwnerBootstrapEnqueueFailure {
+    pub(crate) const fn kind(&self) -> &LegOutboundQueueErrorKind {
+        &self.kind
+    }
+
+    pub(crate) fn into_publication(self) -> PendingInitialOwnerBootstrapPublication {
+        self.publication
+    }
+}
+
+impl fmt::Debug for InitialOwnerBootstrapEnqueueFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InitialOwnerBootstrapEnqueueFailure")
+            .field("kind", &self.kind)
+            .field("publication", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl fmt::Display for InitialOwnerBootstrapEnqueueFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "initial owner acceptance queue rejected: {:?}",
+            self.kind
+        )
+    }
+}
+
+impl std::error::Error for InitialOwnerBootstrapEnqueueFailure {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InitialOwnerBootstrapTerminalErrorKind {
+    WrongTerminal,
+    SupervisorInvariant,
+    EffectInvariant,
+}
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "terminal mismatch must return the exact committed publication and terminal fact"
+)]
+pub(crate) enum InitialOwnerBootstrapTerminalFailure {
+    WrongTerminal {
+        publication: PendingInitialOwnerBootstrapPublication,
+        terminal: ExactLegTerminal,
+    },
+    SupervisorInvariant {
+        supervisor: SessionSupervisor,
+        source: SessionSupervisorError,
+    },
+    EffectInvariant {
+        supervisor: SessionSupervisor,
+        effects: Vec<SessionEffect>,
+    },
+}
+
+impl InitialOwnerBootstrapTerminalFailure {
+    pub(crate) const fn kind(&self) -> InitialOwnerBootstrapTerminalErrorKind {
+        match self {
+            Self::WrongTerminal { .. } => InitialOwnerBootstrapTerminalErrorKind::WrongTerminal,
+            Self::SupervisorInvariant { .. } => {
+                InitialOwnerBootstrapTerminalErrorKind::SupervisorInvariant
+            }
+            Self::EffectInvariant { .. } => InitialOwnerBootstrapTerminalErrorKind::EffectInvariant,
+        }
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "non-mismatch failures retain their exact supervisor ownership"
+    )]
+    pub(crate) fn into_exact_parts(
+        self,
+    ) -> Result<
+        (PendingInitialOwnerBootstrapPublication, ExactLegTerminal),
+        InitialOwnerBootstrapTerminalFailure,
+    > {
+        match self {
+            Self::WrongTerminal {
+                publication,
+                terminal,
+            } => Ok((publication, terminal)),
+            other => Err(other),
+        }
+    }
+}
+
+impl fmt::Debug for InitialOwnerBootstrapTerminalFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("InitialOwnerBootstrapTerminalFailure");
+        debug.field("kind", &self.kind());
+        match self {
+            Self::WrongTerminal { .. } => debug.field("ownership", &"[REDACTED]").finish(),
+            Self::SupervisorInvariant { supervisor, source } => debug
+                .field("snapshot", &supervisor.snapshot())
+                .field("source", source)
+                .finish(),
+            Self::EffectInvariant {
+                supervisor,
+                effects,
+            } => debug
+                .field("snapshot", &supervisor.snapshot())
+                .field("effects", &effects.len())
+                .finish(),
+        }
+    }
+}
+
+/// Committed owner state after the initial leg died before its acceptance
+/// could be published. It owns the same supervisor and a single high-water
+/// timer authority suitable for construction of a legless OwnerTarget.
+pub(crate) struct LeglessOwnerSessionBootstrap {
+    supervisor: SessionSupervisor,
+    high_water: PendingOwnerHighWater,
+}
+
+impl LeglessOwnerSessionBootstrap {
+    pub(crate) fn snapshot(&self) -> SessionSupervisorSnapshot {
+        self.supervisor.snapshot()
+    }
+
+    pub(crate) const fn high_water_generation(&self) -> LegGeneration {
+        self.high_water.generation
+    }
+
+    pub(super) fn into_parts(self) -> (SessionSupervisor, PendingOwnerHighWater) {
+        (self.supervisor, self.high_water)
+    }
+}
+
+impl fmt::Debug for LeglessOwnerSessionBootstrap {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LeglessOwnerSessionBootstrap")
+            .field("snapshot", &self.supervisor.snapshot())
+            .field("high_water_generation", &self.high_water.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Unbound exact high-water authority. OwnerTarget construction binds it to
+/// one executor identity before exposing its one-shot resume-grace expiry.
+pub(super) struct PendingOwnerHighWater {
+    generation: LegGeneration,
+    reason: LegTransportTerminalReason,
+    resume_grace_expired: SessionEvent,
+}
+
+impl PendingOwnerHighWater {
+    pub(super) fn into_parts(self) -> (LegGeneration, LegTransportTerminalReason, SessionEvent) {
+        (self.generation, self.reason, self.resume_grace_expired)
+    }
+}
+
+/// Fully installed initial owner session whose zero-recovery acceptance has
+/// already crossed the exact reserved queue admission boundary.
+pub(crate) struct OwnerSessionBootstrap {
+    supervisor: SessionSupervisor,
+    attached: AttachedLeg,
+    acceptance: AttachAcceptanceEnqueued,
 }
 
 impl OwnerSessionBootstrap {
-    pub(crate) fn into_parts(self) -> (SessionSupervisor, AttachedLeg, Frame) {
-        (self.supervisor, self.attached, self.acceptance)
+    pub(crate) fn into_parts(self) -> (SessionSupervisor, AttachedLeg) {
+        let Self {
+            supervisor,
+            attached,
+            acceptance,
+        } = self;
+        drop(acceptance);
+        (supervisor, attached)
     }
 }
 
@@ -834,6 +1630,7 @@ impl fmt::Debug for OwnerSessionBootstrap {
         formatter
             .debug_struct("OwnerSessionBootstrap")
             .field("snapshot", &self.supervisor.snapshot())
+            .field("acceptance", &self.acceptance)
             .finish_non_exhaustive()
     }
 }
@@ -846,7 +1643,10 @@ pub(crate) struct ClientSessionBootstrap {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClientBootstrapErrorKind {
+    WrongQueue,
     EndpointLost,
+    RequestNotDelivered,
+    NotAwaitingInitialAttach,
 }
 
 /// Typed bootstrap rejection that returns the exact non-cloneable accepted
@@ -855,14 +1655,26 @@ pub(crate) enum ClientBootstrapErrorKind {
 #[error("client bootstrap rejected a terminal transport endpoint")]
 pub(crate) struct ClientBootstrapError {
     kind: ClientBootstrapErrorKind,
-    attached: AttachedLeg,
+    accepted: AcceptedInitialAttach,
 }
 
 impl ClientBootstrapError {
-    fn endpoint_lost(attached: AttachedLeg) -> Self {
+    fn activation(failure: AcceptedInitialAttachActivationFailure) -> Self {
+        let kind = match failure.kind() {
+            InitialAttachActivationError::WrongQueue => ClientBootstrapErrorKind::WrongQueue,
+            InitialAttachActivationError::EndpointOrQueueLost => {
+                ClientBootstrapErrorKind::EndpointLost
+            }
+            InitialAttachActivationError::RequestNotDelivered => {
+                ClientBootstrapErrorKind::RequestNotDelivered
+            }
+            InitialAttachActivationError::NotAwaitingInitialAttach => {
+                ClientBootstrapErrorKind::NotAwaitingInitialAttach
+            }
+        };
         Self {
-            kind: ClientBootstrapErrorKind::EndpointLost,
-            attached,
+            kind,
+            accepted: failure.into_accepted(),
         }
     }
 
@@ -870,8 +1682,8 @@ impl ClientBootstrapError {
         self.kind
     }
 
-    pub(crate) fn into_attached(self) -> AttachedLeg {
-        self.attached
+    pub(crate) fn into_accepted(self) -> AcceptedInitialAttach {
+        self.accepted
     }
 }
 
@@ -963,6 +1775,22 @@ pub(crate) enum SessionSupervisorError {
     MissingAttachAuthority,
     #[error("owner standby authentication rejected")]
     OwnerStandbyAuthenticationRejected,
+    #[error("owner registered standby gate rejected the exact-next ATTACH")]
+    OwnerRegisteredAttachGateRejected,
+    #[error("owner catch-up permit is absent")]
+    OwnerCatchUpPermitMissing,
+    #[error("owner catch-up permit is not armed by actual status delivery")]
+    OwnerCatchUpPermitNotArmed,
+    #[error("the exact owner catch-up status publication is still pending delivery")]
+    OwnerCatchUpPermitPending,
+    #[error("owner catch-up arm does not match the bounded stale correlation")]
+    OwnerCatchUpArmRejected,
+    #[error("owner catch-up status is incompatible with the current installed session")]
+    OwnerCatchUpStatusRejected,
+    #[error("a conflicting stale ATTACH cannot replace the bounded owner catch-up permit")]
+    OwnerCatchUpPermitConflict,
+    #[error("owner catch-up permit rejected the follow-up ATTACH")]
+    OwnerCatchUpAttachGateRejected,
     #[error("initial owner bootstrap has already completed")]
     OwnerBootstrapCompleted,
     #[cfg(test)]
@@ -1008,9 +1836,13 @@ mod tests {
     use crate::owned_upstream::leg::{
         AttachResponse, BoundInbound, LegTransportReporter, LegTransportTerminalReason,
     };
-    use crate::owned_upstream::leg_io::{LegEndpointRole, LegIo, LegIoLimits};
+    use crate::owned_upstream::leg_io::{
+        LegEndpointRole, LegIo, LegIoLimits, MemoryFaultScript, MemoryLegTransport,
+    };
     use crate::owned_upstream::standby::{ExactAuthenticatedStandby, OwnerStandbySlot};
-    use crate::owned_upstream::two_leg::{EncodedDelivery, LegId, WireLane};
+    use crate::owned_upstream::two_leg::{
+        EncodedDelivery, LegId, SimTime, TwoLegWire, WireBounds, WireCapacitySpec, WireLane,
+    };
     use crate::owned_upstream::{FlowPortConfig, ResumableTcpPortFactory};
     use crate::resumable::{
         AttachAlpn, AttachCredentials, AttachNonce, AttachPolicy, AttachRequest,
@@ -1023,6 +1855,7 @@ mod tests {
     use crate::shared::TargetAddr;
     use bytes::Bytes;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::time::Duration;
 
     const STANDBY_FEATURES: u64 = STANDBY_CONTROL_V1.bits() | 0b0111;
 
@@ -1034,8 +1867,13 @@ mod tests {
     impl<T: Clone> AmbiguousIfClone<u8> for T {}
 
     #[test]
-    fn client_bootstrap_endpoint_loss_returns_a_nonclone_capability() {
+    fn initial_bootstrap_authorities_are_nonclone_capabilities() {
         let _ = <ClientBootstrapError as AmbiguousIfClone<_>>::marker;
+        let _ = <PendingOwnerBootstrap as AmbiguousIfClone<_>>::marker;
+        let _ = <PendingInitialOwnerBootstrapPublication as AmbiguousIfClone<_>>::marker;
+        let _ = <InitialOwnerBootstrapAcceptFailure as AmbiguousIfClone<_>>::marker;
+        let _ = <InitialOwnerBootstrapEnqueueFailure as AmbiguousIfClone<_>>::marker;
+        let _ = <OwnerSessionBootstrap as AmbiguousIfClone<_>>::marker;
     }
 
     fn credentials() -> AttachCredentials {
@@ -1190,29 +2028,74 @@ mod tests {
         LegTransportReporter,
     ) {
         let transport = binding(0x42);
-        let client_leg = EstablishedLeg::for_authenticated_transport(transport);
-        let (owner_leg, reporter) =
-            EstablishedLeg::for_authenticated_transport_with_reporter(transport);
+        let limits = LegIoLimits::new(4_096, 8, 32_768, 8, 32_768).unwrap();
+        let mut client_leg = LegIo::for_authenticated_transport(
+            LegId::A,
+            LegEndpointRole::Client,
+            transport,
+            limits,
+        );
+        let (mut owner_leg, reporter) = LegIo::for_authenticated_transport_with_reporter(
+            LegId::A,
+            LegEndpointRole::Owner,
+            transport,
+            limits,
+        );
         let request = standby_attach_request(2, 0x22);
-        let pending_client = client_leg.begin_attach(request);
         let proof = credentials().prove(&request, &transport).unwrap();
-        let mut pending_owner =
-            SessionSupervisor::prepare_owner(session_config(), standby_authority(1));
-        let (owner, owner_active, acceptance) = pending_owner
-            .accept(
-                &owner_leg,
-                owner_leg.bind_received_frame(request.to_attach_frame(proof)),
+        let pending_client = client_leg
+            .established_leg()
+            .begin_attach(request)
+            .bind_initial_frame(request.to_attach_frame(proof))
+            .unwrap();
+        let mut client_queue =
+            LegOutboundQueue::for_leg(client_leg.established_leg(), 4, 4_096).unwrap();
+        let awaiting = pending_client.enqueue(&mut client_queue).unwrap();
+        let mut owner_queue =
+            LegOutboundQueue::for_leg(owner_leg.established_leg(), 4, 4_096).unwrap();
+        let capacity = WireCapacitySpec::new(1_000_000, Duration::from_secs(1), 4_096, 128, 1)
+            .unwrap()
+            .derive()
+            .unwrap();
+        let wire = TwoLegWire::new(WireBounds::new(capacity, 16, 32_768, 2, 2).unwrap());
+        let mut wire = MemoryLegTransport::new(wire, MemoryFaultScript::new(0));
+        client_queue
+            .try_flush(
+                &mut client_leg,
+                &mut wire.controller_sender(),
+                SimTime::ZERO,
             )
             .unwrap()
-            .into_parts();
-        let AttachResponse::Accepted(client_active) = pending_client
-            .validate_response(client_leg.bind_received_frame(acceptance))
+            .unwrap();
+        while wire.advance_one_due(SimTime::ZERO).unwrap() {}
+        wire.advance_idle_to(SimTime::ZERO).unwrap();
+        let request_delivery = wire
+            .try_recv_next(owner_leg.inbound_route())
             .unwrap()
-        else {
-            panic!("initial owner bootstrap changed response kind");
-        };
+            .unwrap();
+        let received = owner_leg.receive_delivery(request_delivery).unwrap();
+        let mut pending_owner =
+            SessionSupervisor::prepare_owner(session_config(), standby_authority(1));
+        let (owner, owner_active) = pending_owner
+            .accept(owner_leg.established_leg(), received, &mut owner_queue)
+            .unwrap()
+            .enqueue_acceptance(&mut owner_queue)
+            .unwrap()
+            .into_parts();
+        owner_queue
+            .try_flush(&mut owner_leg, &mut wire.controller_sender(), SimTime::ZERO)
+            .unwrap()
+            .unwrap();
+        while wire.advance_one_due(SimTime::ZERO).unwrap() {}
+        wire.advance_idle_to(SimTime::ZERO).unwrap();
+        let acceptance_delivery = wire
+            .try_recv_next(client_leg.inbound_route())
+            .unwrap()
+            .unwrap();
+        let response = client_leg.receive_delivery(acceptance_delivery).unwrap();
+        let accepted = awaiting.validate_response(&client_queue, response).unwrap();
         let (client, client_active) =
-            SessionSupervisor::bootstrap_client(session_config(), client_active)
+            SessionSupervisor::bootstrap_client(session_config(), accepted, &mut client_queue)
                 .unwrap()
                 .into_parts();
         (owner, owner_active, client, client_active, reporter)
@@ -2292,7 +3175,7 @@ mod tests {
             .prove(&owner_request, &owner_transport)
             .unwrap();
         assert!(matches!(
-            supervisor.accept_owner_attach(
+            supervisor.accept_owner_attach_for_test(
                 &owner_leg,
                 owner_leg.bind_received_frame(owner_request.to_attach_frame(owner_proof)),
             ),
@@ -2447,7 +3330,9 @@ mod tests {
             panic!("the exact correlated acceptance changed response kind");
         };
         let before = supervisor.snapshot();
-        let terminal = reporter.report(LegTransportTerminalReason::PeerClosed);
+        let terminal = reporter
+            .report(LegTransportTerminalReason::PeerClosed)
+            .unwrap();
 
         assert!(matches!(
             supervisor.install_attached_leg(&attached),
@@ -2463,35 +3348,73 @@ mod tests {
     #[test]
     fn terminal_initial_client_leg_is_rejected_before_bootstrap() {
         let transport = binding(0x73);
-        let (established, reporter) =
-            EstablishedLeg::for_authenticated_transport_with_reporter(transport);
+        let limits = LegIoLimits::new(4_096, 8, 32_768, 8, 32_768).unwrap();
+        let (mut client, reporter) = LegIo::for_authenticated_transport_with_reporter(
+            LegId::A,
+            LegEndpointRole::Client,
+            transport,
+            limits,
+        );
+        let mut owner =
+            LegIo::for_authenticated_transport(LegId::A, LegEndpointRole::Owner, transport, limits);
         let request = attach_request(2, 0x73);
-        let pending = established.begin_attach(request);
         let proof = credentials().prove(&request, &transport).unwrap();
-        let committed = authority(1)
-            .verify_and_commit(&request, &transport, &proof)
+        let pending = client
+            .established_leg()
+            .begin_attach(request)
+            .bind_initial_frame(request.to_attach_frame(proof))
             .unwrap();
-        let AttachResponse::Accepted(attached) = pending
-            .validate_response(established.bind_received_frame(committed.attach_accepted_frame()))
+        let mut client_queue =
+            LegOutboundQueue::for_leg(client.established_leg(), 4, 4_096).unwrap();
+        let awaiting = pending.enqueue(&mut client_queue).unwrap();
+        let mut owner_queue = LegOutboundQueue::for_leg(owner.established_leg(), 4, 4_096).unwrap();
+        let capacity = WireCapacitySpec::new(1_000_000, Duration::from_secs(1), 4_096, 128, 1)
             .unwrap()
-        else {
-            panic!("the exact correlated acceptance changed response kind");
-        };
-        let terminal = reporter.report(LegTransportTerminalReason::Reset);
+            .derive()
+            .unwrap();
+        let wire = TwoLegWire::new(WireBounds::new(capacity, 16, 32_768, 2, 2).unwrap());
+        let mut wire = MemoryLegTransport::new(wire, MemoryFaultScript::new(0));
+        client_queue
+            .try_flush(&mut client, &mut wire.controller_sender(), SimTime::ZERO)
+            .unwrap()
+            .unwrap();
+        while wire.advance_one_due(SimTime::ZERO).unwrap() {}
+        wire.advance_idle_to(SimTime::ZERO).unwrap();
+        let delivery = wire.try_recv_next(owner.inbound_route()).unwrap().unwrap();
+        let received = owner.receive_delivery(delivery).unwrap();
+        let mut pending_owner = SessionSupervisor::prepare_owner(session_config(), authority(1));
+        let _owner_bootstrap = pending_owner
+            .accept(owner.established_leg(), received, &mut owner_queue)
+            .unwrap()
+            .enqueue_acceptance(&mut owner_queue)
+            .unwrap();
+        owner_queue
+            .try_flush(&mut owner, &mut wire.controller_sender(), SimTime::ZERO)
+            .unwrap()
+            .unwrap();
+        while wire.advance_one_due(SimTime::ZERO).unwrap() {}
+        wire.advance_idle_to(SimTime::ZERO).unwrap();
+        let delivery = wire.try_recv_next(client.inbound_route()).unwrap().unwrap();
+        let response = client.receive_delivery(delivery).unwrap();
+        let accepted = awaiting.validate_response(&client_queue, response).unwrap();
+        let terminal = reporter.report(LegTransportTerminalReason::Reset).unwrap();
 
-        let error = match SessionSupervisor::bootstrap_client(session_config(), attached) {
+        let error = match SessionSupervisor::bootstrap_client(
+            session_config(),
+            accepted,
+            &mut client_queue,
+        ) {
             Ok(_) => panic!("terminal initial leg incorrectly bootstrapped an active client"),
             Err(error) => error,
         };
         assert_eq!(error.kind(), ClientBootstrapErrorKind::EndpointLost);
         assert_eq!(format!("{error:?}"), "ClientBootstrapError([REDACTED])");
-        let attached = error.into_attached();
-        let loss = attached.bind_terminal(terminal).unwrap();
-        assert_eq!(loss.reason(), LegTransportTerminalReason::Reset);
+        let accepted = error.into_accepted();
+        assert!(!accepted.queue_is_live());
 
         // The rejected bootstrap returns its exact non-cloneable capability,
-        // allowing the outer actor to bind and dispose the terminal pair.
-        drop((established, loss));
+        // while the independent terminal fact remains linear and fail-closed.
+        drop((client, owner, accepted, terminal));
     }
 
     #[test]
@@ -2766,7 +3689,11 @@ mod tests {
         let (mut owner, owner_active, _client, same_contract_active, reporter) =
             bootstrap_owner_and_client_with_reporter();
         let loss = owner_active
-            .bind_terminal(reporter.report(LegTransportTerminalReason::PeerClosed))
+            .bind_terminal(
+                reporter
+                    .report(LegTransportTerminalReason::PeerClosed)
+                    .unwrap(),
+            )
             .unwrap();
         owner.apply_event(loss.into_event()).unwrap();
         assert_eq!(owner.snapshot().session.phase(), SessionPhase::Legless);
@@ -2818,7 +3745,7 @@ mod tests {
             attached: current_active,
             ..
         } = owner
-            .accept_owner_attach(
+            .accept_owner_attach_for_test(
                 &replacement,
                 replacement.bind_received_frame(request.to_attach_frame(proof)),
             )
@@ -2889,7 +3816,9 @@ mod tests {
         let proof = credentials().prove(&request, &transport).unwrap();
         let received = leg.bind_received_frame(request.to_attach_frame(proof));
 
-        let publication = supervisor.accept_owner_attach(&leg, received).unwrap();
+        let publication = supervisor
+            .accept_owner_attach_for_test(&leg, received)
+            .unwrap();
         assert_eq!(supervisor.snapshot().session.generation().get(), 3);
         let OwnerAttachPublication::Installed {
             attached,
@@ -2913,6 +3842,147 @@ mod tests {
     }
 
     #[test]
+    fn initial_owner_reserves_the_exact_empty_queue_before_generation_commit() {
+        let transport = binding(0x40);
+        let leg = EstablishedLeg::for_authenticated_transport(transport);
+        let mut queue = LegOutboundQueue::for_leg(&leg, 4, 4_096).unwrap();
+        queue
+            .push(
+                Frame::try_new(
+                    LegGeneration::new(2).unwrap(),
+                    Record::Data {
+                        flow_id: SessionFlowId::new(1).unwrap(),
+                        direction: Direction::ClientToTarget,
+                        offset: ByteOffset::new(0),
+                        payload: Bytes::from_static(b"preexisting"),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let request = attach_request(2, 0x20);
+        let proof = credentials().prove(&request, &transport).unwrap();
+        let received = leg.bind_received_frame(request.to_attach_frame(proof));
+        let mut pending = SessionSupervisor::prepare_owner(session_config(), authority(1));
+
+        let error = pending.accept(&leg, received, &mut queue).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            InitialOwnerBootstrapAcceptErrorKind::QueueReservation(
+                AttachAcceptanceReserveError::NotAwaiting { .. }
+            )
+        ));
+        assert_eq!(pending.authority.as_ref().unwrap().current_generation(), 1);
+        assert_eq!(queue.len(), 1);
+        let debug = format!("{error:?}");
+        assert!(debug.contains("QueueReservation(NotAwaiting"));
+        assert!(debug.contains("received: \"[REDACTED]\""));
+        assert!(!debug.contains("preexisting"));
+        let (_received, reservation) = error.into_parts();
+        assert!(reservation.is_none());
+    }
+
+    #[test]
+    fn initial_owner_rejects_unpublishable_acceptance_capacity_before_generation_commit() {
+        let transport = binding(0x40);
+        let leg = EstablishedLeg::for_authenticated_transport(transport);
+        let mut queue =
+            LegOutboundQueue::for_leg(&leg, 1, crate::resumable::ATTACH_ACCEPTED_ENCODED_BYTES - 1)
+                .unwrap();
+        let request = attach_request(2, 0x20);
+        let proof = credentials().prove(&request, &transport).unwrap();
+        let received = leg.bind_received_frame(request.to_attach_frame(proof));
+        let mut pending = SessionSupervisor::prepare_owner(session_config(), authority(1));
+        let error = pending.accept(&leg, received, &mut queue).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            InitialOwnerBootstrapAcceptErrorKind::QueueReservation(
+                AttachAcceptanceReserveError::CapacityExceeded {
+                    queued_frames: 0,
+                    queued_bytes: 0,
+                    incoming_bytes: crate::resumable::ATTACH_ACCEPTED_ENCODED_BYTES,
+                }
+            )
+        ));
+        let (received, reservation) = error.into_parts();
+        assert!(reservation.is_none());
+        assert!(received.belongs_to_transport(&leg));
+        assert_eq!(received.attach_request().unwrap(), request);
+        assert_eq!(pending.authority.as_ref().unwrap().current_generation(), 1);
+        assert!(matches!(
+            queue.reserve_attach_acceptance(&leg),
+            Err(AttachAcceptanceReserveError::CapacityExceeded { .. })
+        ));
+
+        let fresh_leg = EstablishedLeg::for_authenticated_transport(transport);
+        let mut exact_queue = LegOutboundQueue::for_leg(
+            &fresh_leg,
+            1,
+            crate::resumable::ATTACH_ACCEPTED_ENCODED_BYTES,
+        )
+        .unwrap();
+        let retry_proof = credentials().prove(&request, &transport).unwrap();
+        let publication = pending
+            .accept(
+                &fresh_leg,
+                fresh_leg.bind_received_frame(request.to_attach_frame(retry_proof)),
+                &mut exact_queue,
+            )
+            .unwrap();
+        assert!(pending.authority.is_none());
+        let bootstrap = publication.enqueue_acceptance(&mut exact_queue).unwrap();
+        let (_supervisor, attached) = bootstrap.into_parts();
+        assert_eq!(attached.generation().get(), 2);
+        assert_eq!(
+            exact_queue.owned_bytes(),
+            crate::resumable::ATTACH_ACCEPTED_ENCODED_BYTES
+        );
+    }
+
+    #[test]
+    fn initial_owner_exact_terminal_after_commit_yields_legless_high_water_bootstrap() {
+        let transport = binding(0x40);
+        let (leg, reporter) = EstablishedLeg::for_authenticated_transport_with_reporter(transport);
+        let mut queue =
+            LegOutboundQueue::for_leg(&leg, 1, crate::resumable::ATTACH_ACCEPTED_ENCODED_BYTES)
+                .unwrap();
+        let request = attach_request(2, 0x20);
+        let proof = credentials().prove(&request, &transport).unwrap();
+        let mut pending = SessionSupervisor::prepare_owner(session_config(), authority(1));
+        let publication = pending
+            .accept(
+                &leg,
+                leg.bind_received_frame(request.to_attach_frame(proof)),
+                &mut queue,
+            )
+            .unwrap();
+        assert!(pending.authority.is_none());
+
+        let (_wrong_leg, wrong_reporter) =
+            EstablishedLeg::for_authenticated_transport_with_reporter(binding(0x41));
+        let wrong_terminal = wrong_reporter
+            .report(LegTransportTerminalReason::FatalIo)
+            .unwrap();
+        let failure = publication
+            .lose_before_acceptance(wrong_terminal)
+            .unwrap_err();
+        assert_eq!(
+            failure.kind(),
+            InitialOwnerBootstrapTerminalErrorKind::WrongTerminal
+        );
+        let (publication, _wrong_terminal) = failure.into_exact_parts().unwrap();
+        let terminal = reporter
+            .report(LegTransportTerminalReason::FatalIo)
+            .unwrap();
+        let legless = publication.lose_before_acceptance(terminal).unwrap();
+        assert_eq!(legless.snapshot().session.phase(), SessionPhase::Legless);
+        assert_eq!(legless.snapshot().session.generation().get(), 2);
+        assert_eq!(legless.high_water_generation().get(), 2);
+        assert_eq!(queue.len(), 0);
+        assert_eq!(queue.owned_bytes(), 0);
+    }
+
+    #[test]
     fn rejected_initial_owner_attempts_preserve_the_same_generation_one_authority_for_retry() {
         let mut pending = SessionSupervisor::prepare_owner(session_config(), authority(1));
         let transport = binding(0x40);
@@ -2920,14 +3990,16 @@ mod tests {
         let valid_proof = credentials().prove(&request, &transport).unwrap();
         let leg_a = EstablishedLeg::for_authenticated_transport(transport);
         let leg_b = EstablishedLeg::for_authenticated_transport(transport);
+        let mut queue_a = LegOutboundQueue::for_leg(&leg_a, 4, 4_096).unwrap();
+        let mut queue_b = LegOutboundQueue::for_leg(&leg_b, 4, 4_096).unwrap();
 
         let wrong_seal = leg_a.bind_received_frame(request.to_attach_frame(valid_proof));
-        assert!(matches!(
-            pending.accept(&leg_b, wrong_seal),
-            Err(SessionSupervisorError::LegProvenance(
-                LegProvenanceError::WrongLeg
-            ))
-        ));
+        let error = pending
+            .accept(&leg_b, wrong_seal, &mut queue_b)
+            .unwrap_err();
+        assert_eq!(error.kind(), InitialOwnerBootstrapAcceptErrorKind::WrongLeg);
+        let (_received, reservation) = error.into_parts();
+        assert!(reservation.is_none());
         assert_eq!(pending.authority.as_ref().unwrap().current_generation(), 1);
 
         let wrong_credentials = AttachCredentials::new(
@@ -2937,25 +4009,24 @@ mod tests {
         .unwrap();
         let bad_proof = wrong_credentials.prove(&request, &transport).unwrap();
         let bad_auth = leg_a.bind_received_frame(request.to_attach_frame(bad_proof));
-        assert!(matches!(
-            pending.accept(&leg_a, bad_auth),
-            Err(SessionSupervisorError::LegProvenance(
-                LegProvenanceError::Rejected
-            ))
-        ));
+        let error = pending.accept(&leg_a, bad_auth, &mut queue_a).unwrap_err();
+        assert_eq!(error.kind(), InitialOwnerBootstrapAcceptErrorKind::Rejected);
+        let (_received, reservation) = error.into_parts();
+        assert!(reservation.is_none());
         assert_eq!(pending.authority.as_ref().unwrap().current_generation(), 1);
 
         let valid = leg_a.bind_received_frame(request.to_attach_frame(valid_proof));
-        let (supervisor, attached, acceptance) =
-            pending.accept(&leg_a, valid).unwrap().into_parts();
+        let (supervisor, attached) = pending
+            .accept(&leg_a, valid, &mut queue_a)
+            .unwrap()
+            .enqueue_acceptance(&mut queue_a)
+            .unwrap()
+            .into_parts();
         assert!(pending.authority.is_none());
         assert_eq!(supervisor.snapshot().session.generation().get(), 2);
         assert_eq!(attached.generation().get(), 2);
-        assert!(matches!(
-            acceptance.record(),
-            Record::AttachAccepted { session_id, nonce, .. }
-                if *session_id == request.session_id() && *nonce == request.nonce()
-        ));
+        assert_eq!(queue_a.len(), 1);
+        assert!(queue_a.owned_bytes() > 0);
 
         let retry = attach_request(3, 0x21);
         let retry_proof = credentials().prove(&retry, &transport).unwrap();
@@ -2963,8 +4034,9 @@ mod tests {
             pending.accept(
                 &leg_a,
                 leg_a.bind_received_frame(retry.to_attach_frame(retry_proof)),
+                &mut queue_a,
             ),
-            Err(SessionSupervisorError::OwnerBootstrapCompleted)
+            Err(error) if error.kind() == InitialOwnerBootstrapAcceptErrorKind::AlreadyCompleted
         ));
     }
 
@@ -2988,7 +4060,7 @@ mod tests {
         let before = supervisor.snapshot();
 
         assert!(matches!(
-            supervisor.accept_owner_attach(&leg, received),
+            supervisor.accept_owner_attach_for_test(&leg, received),
             Err(SessionSupervisorError::Reducer(
                 SessionError::SessionExpired
             ))
@@ -3016,7 +4088,9 @@ mod tests {
         let proof_a = credentials().prove(&request_a, &transport_a).unwrap();
         let received_a = leg_a.bind_received_frame(request_a.to_attach_frame(proof_a));
         assert!(matches!(
-            supervisor.accept_owner_attach(&leg_a, received_a).unwrap(),
+            supervisor
+                .accept_owner_attach_for_test(&leg_a, received_a)
+                .unwrap(),
             OwnerAttachPublication::Installed { .. }
         ));
 
@@ -3026,8 +4100,9 @@ mod tests {
         let proof_b = credentials().prove(&request_b, &transport_b).unwrap();
         let received_b = leg_b.bind_received_frame(request_b.to_attach_frame(proof_b));
         let before = supervisor.snapshot();
-        let OwnerAttachPublication::Resynchronize { status } =
-            supervisor.accept_owner_attach(&leg_b, received_b).unwrap()
+        let OwnerAttachPublication::Resynchronize { status } = supervisor
+            .accept_owner_attach_for_test(&leg_b, received_b)
+            .unwrap()
         else {
             panic!("second same-generation owner attach minted a second capability");
         };
@@ -3071,7 +4146,7 @@ mod tests {
         let lost_request = attach_request(3, 0x71);
         let lost_proof = credentials().prove(&lost_request, &lost_binding).unwrap();
         let OwnerAttachPublication::Installed { .. } = owner
-            .accept_owner_attach(
+            .accept_owner_attach_for_test(
                 &lost_leg,
                 lost_leg.bind_received_frame(lost_request.to_attach_frame(lost_proof)),
             )
@@ -3086,7 +4161,7 @@ mod tests {
         let retry_pending = status_leg.begin_attach(retry);
         let retry_proof = credentials().prove(&retry, &status_binding).unwrap();
         let OwnerAttachPublication::Resynchronize { status } = owner
-            .accept_owner_attach(
+            .accept_owner_attach_for_test(
                 &status_leg,
                 status_leg.bind_received_frame(retry.to_attach_frame(retry_proof)),
             )
@@ -3119,7 +4194,7 @@ mod tests {
             .prove(&follow_up, &pending.transport_binding())
             .unwrap();
         let OwnerAttachPublication::Installed { acceptance, .. } = owner
-            .accept_owner_attach(
+            .accept_owner_attach_for_test(
                 follow_up_endpoint.established_leg(),
                 follow_up_endpoint
                     .established_leg()
@@ -3165,7 +4240,9 @@ mod tests {
         assert_eq!(client_a.snapshot().session.phase(), SessionPhase::Active);
         assert_eq!(client_b.snapshot().session.phase(), SessionPhase::Active);
 
-        let terminal_b = reporter_b.report(LegTransportTerminalReason::Reset);
+        let terminal_b = reporter_b
+            .report(LegTransportTerminalReason::Reset)
+            .unwrap();
         let mismatch = caught_up_a.bind_terminal(terminal_b).unwrap_err();
         assert_eq!(
             format!("{mismatch:?}"),
@@ -3179,7 +4256,11 @@ mod tests {
         assert_eq!(client_b.snapshot().session.phase(), SessionPhase::Legless);
 
         let loss_a = caught_up_a
-            .bind_terminal(reporter_a.report(LegTransportTerminalReason::FatalIo))
+            .bind_terminal(
+                reporter_a
+                    .report(LegTransportTerminalReason::FatalIo)
+                    .unwrap(),
+            )
             .unwrap();
         assert_eq!(loss_a.reason(), LegTransportTerminalReason::FatalIo);
         client_a.apply_event(loss_a.into_event()).unwrap();
@@ -3225,7 +4306,7 @@ mod tests {
         let lost_proof = credentials().prove(&lost_request, &lost_binding).unwrap();
         let lost_pending = lost_leg.begin_attach(lost_request);
         let OwnerAttachPublication::Installed { .. } = owner
-            .accept_owner_attach(
+            .accept_owner_attach_for_test(
                 &lost_leg,
                 lost_leg.bind_received_frame(lost_request.to_attach_frame(lost_proof)),
             )
@@ -3245,7 +4326,7 @@ mod tests {
         let retry_pending = status_leg.begin_attach(retry);
         let retry_proof = credentials().prove(&retry, &status_binding).unwrap();
         let OwnerAttachPublication::Resynchronize { status } = owner
-            .accept_owner_attach(
+            .accept_owner_attach_for_test(
                 &status_leg,
                 status_leg.bind_received_frame(retry.to_attach_frame(retry_proof)),
             )
@@ -3271,7 +4352,7 @@ mod tests {
             .prove(&follow_up, &pending.transport_binding())
             .unwrap();
         let OwnerAttachPublication::Installed { acceptance, .. } = owner
-            .accept_owner_attach(
+            .accept_owner_attach_for_test(
                 &follow_up_leg,
                 follow_up_leg.bind_received_frame(follow_up.to_attach_frame(proof)),
             )
@@ -3372,7 +4453,7 @@ mod tests {
             .prove(&cross_session_request, &cross_session_transport)
             .unwrap();
         assert!(matches!(
-            supervisor.accept_owner_attach(
+            supervisor.accept_owner_attach_for_test(
                 &cross_session_leg,
                 cross_session_leg.bind_received_frame(
                     cross_session_request.to_attach_frame(cross_session_proof),
@@ -3402,7 +4483,7 @@ mod tests {
         let request = attach_request(3, 0x33);
         let proof = credentials().prove(&request, &wrong_identity).unwrap();
         assert!(matches!(
-            supervisor.accept_owner_attach(
+            supervisor.accept_owner_attach_for_test(
                 &wrong_leg,
                 wrong_leg.bind_received_frame(request.to_attach_frame(proof)),
             ),
@@ -3423,7 +4504,7 @@ mod tests {
         );
         let feature_proof = credentials().prove(&feature_request, &transport).unwrap();
         assert!(matches!(
-            supervisor.accept_owner_attach(
+            supervisor.accept_owner_attach_for_test(
                 &feature_leg,
                 feature_leg.bind_received_frame(feature_request.to_attach_frame(feature_proof)),
             ),

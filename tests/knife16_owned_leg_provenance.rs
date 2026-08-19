@@ -37,6 +37,36 @@ mod resumable {
     pub use tcp::*;
 }
 
+// `leg.rs` is compiled standalone here to prove its raw capabilities remain
+// non-cloneable. Production obtains these gates from the sibling standby
+// typestate; the uninhabited shim keeps this provenance crate unable to mint
+// any of them while preserving the exact production signatures.
+mod standby {
+    use crate::leg::{LegSeal, LegTransportEndpoint};
+    use crate::resumable::{AttachRequest, AttachTransportBinding};
+    use std::sync::Weak;
+
+    pub(super) enum RegisteredPendingAttachAuthority {}
+
+    impl RegisteredPendingAttachAuthority {
+        pub(super) fn into_parts(
+            self,
+        ) -> (
+            LegSeal,
+            Weak<LegTransportEndpoint>,
+            AttachTransportBinding,
+            AttachRequest,
+        ) {
+            match self {}
+        }
+    }
+
+    pub(super) enum RegisteredAttachResponseGate {}
+    pub(super) enum RegisteredCatchUpBeginGate {}
+    pub(super) enum RegisteredCatchUpAssemblyGate {}
+    pub(super) enum RegisteredCatchUpResponseGate {}
+}
+
 #[path = "../src/owned_upstream/leg.rs"]
 mod leg;
 
@@ -191,7 +221,7 @@ fn owner_commit_returns_same_leg_attached_capability_and_correlated_acceptance()
         acceptance,
         recovery,
     } = established
-        .transact_owner_attach(received, &authority, &mut model)
+        .transact_owner_attach_for_provenance_test(received, &authority, &mut model)
         .unwrap()
         .unwrap()
     else {
@@ -225,7 +255,7 @@ fn owner_attach_rejects_a_frame_bound_by_another_identical_leg_before_commit() {
     let received_on_a = leg_a.bind_received_frame(attach(request, transport));
 
     assert!(matches!(
-        leg_b.transact_owner_attach(received_on_a, &authority, &mut model),
+        leg_b.transact_owner_attach_for_provenance_test(received_on_a, &authority, &mut model),
         Err(LegProvenanceError::WrongLeg)
     ));
     assert_eq!(authority.current_generation(), 2);
@@ -262,7 +292,7 @@ fn owner_attach_rejects_data_and_non_attach_records_without_committing() {
         let received = leg
             .bind_received_frame(Frame::try_new(LegGeneration::new(3).unwrap(), record).unwrap());
         assert!(matches!(
-            leg.transact_owner_attach(received, &authority, &mut model),
+            leg.transact_owner_attach_for_provenance_test(received, &authority, &mut model),
             Err(LegProvenanceError::Rejected)
         ));
         assert_eq!(authority.current_generation(), 2);
@@ -280,7 +310,7 @@ fn owner_stale_attach_returns_only_correlated_generation_status() {
     let received = leg.bind_received_frame(attach(request, transport));
 
     let OwnerAttachTransaction::Resynchronize { status } = leg
-        .transact_owner_attach(received, &authority, &mut model)
+        .transact_owner_attach_for_provenance_test(received, &authority, &mut model)
         .unwrap()
         .unwrap()
     else {
@@ -308,13 +338,13 @@ fn simultaneous_next_generation_attaches_mint_one_capability_and_one_status() {
     let (outcome_a, outcome_b) = std::thread::scope(|scope| {
         let attempt_a = scope.spawn(|| {
             leg_a
-                .transact_owner_attach(received_a, &authority, &mut model_a)
+                .transact_owner_attach_for_provenance_test(received_a, &authority, &mut model_a)
                 .unwrap()
                 .unwrap()
         });
         let attempt_b = scope.spawn(|| {
             leg_b
-                .transact_owner_attach(received_b, &authority, &mut model_b)
+                .transact_owner_attach_for_provenance_test(received_b, &authority, &mut model_b)
                 .unwrap()
                 .unwrap()
         });
@@ -367,7 +397,7 @@ fn owner_attach_outcomes_redact_capability_and_response_state() {
     let committed_leg = EstablishedLeg::for_authenticated_transport(transport);
     let committed_request = request_for(3, 0x33);
     let committed = committed_leg
-        .transact_owner_attach(
+        .transact_owner_attach_for_provenance_test(
             committed_leg.bind_received_frame(attach(committed_request, transport)),
             &committed_authority,
             &mut committed_model,
@@ -383,7 +413,7 @@ fn owner_attach_outcomes_redact_capability_and_response_state() {
     let mut stale_model = initial_owner_model();
     let stale_leg = EstablishedLeg::for_authenticated_transport(transport);
     let stale = stale_leg
-        .transact_owner_attach(
+        .transact_owner_attach_for_provenance_test(
             stale_leg.bind_received_frame(attach(request(), transport)),
             &stale_authority,
             &mut stale_model,

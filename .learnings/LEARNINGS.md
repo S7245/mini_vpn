@@ -1,5 +1,45 @@
 # Learnings
 
+## 2026-08-18 - An attach reservation must close every post-CAS fallible edge
+
+- Reserving only a queue phase or frame slot is not enough before an attach
+  generation CAS. The reservation must own the exact encoded acceptance bytes,
+  enqueue ordinal and overflow headroom, exact queue and leg seal, and the
+  transport terminal transition. After CAS, acceptance publication must be an
+  infallible move of that already-owned capacity.
+- A reliable-wire fact that has left the transport still belongs to the
+  application until it is admitted. In particular, a catch-up ATTACH arriving
+  after status delivery but before the owner arms its permit must be returned
+  intact, not converted into a lossy `NotArmed` error or entrusted to scheduler
+  ordering.
+- Repeated lost acceptances must retain the client's original stale floor and
+  correlation. Re-signing the most recently attempted replacement generation
+  raises the expected local generation and can permanently lock out the client
+  that never observed that acceptance.
+- Queue or endpoint disappearance is not terminal authority. Pending,
+  enqueued, draining, and resuming recovery states must retain their complete
+  bounded tail until an exact-leg terminal fact is consumed; only an explicit
+  same-supervisor discard may emit one `LegLost` and clear the attach barrier.
+- Initial ATTACH needs its own production typed admission and ordered-delivery
+  receipt. It is neither a generic-frame exception nor a registered-standby
+  attach, and a test-only bypass would leave the production composition
+  unproved.
+- Focused tests cannot certify a sealed API migration. The full R5 and typed
+  provenance targets are what exposed the remaining generic initial-ATTACH and
+  raw owner-commit call sites.
+- Rust `pub(super)` at the `owned_upstream` child level is visible to every
+  sibling, not to one chosen sibling. A standby-only composition boundary must
+  therefore consume a non-cloneable capability whose fields and constructor
+  remain private to `standby`; visibility alone cannot express that contract.
+- Catch-up validation is not authoritative without both transport receipts.
+  The B/C status response, D derivation/assembly, and D acceptance each need a
+  separately consuming private gate so no sibling can discard receipts and
+  recover a bare installable leg.
+
+This is a deterministic local transaction/liveness result. It does not claim a
+production controller, real transport integration, TUN/VPS behavior, or a
+throughput result.
+
 ## 2026-08-18 - Transport termination is an exact monotonic fact
 
 - A live `Weak`/`Arc` allocation proves only that an actor lease still exists;

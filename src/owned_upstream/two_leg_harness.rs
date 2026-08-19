@@ -12,9 +12,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use crate::owned_upstream::leg::{AttachResponse, AttachedLeg, LegBoundFrame, PendingAttach};
+use crate::owned_upstream::leg::{AttachedLeg, LegBoundFrame, PendingInitialAttach};
 use crate::owned_upstream::leg_io::{
-    EncodedLegTransport, EncodedLegTransportError, LegIoError, LegOutboundQueue,
+    AwaitingInitialAttach, EncodedLegTransport, EncodedLegTransportError, LegIoError,
+    LegOutboundQueue, OrderedDeliveryToken,
 };
 use crate::owned_upstream::owner_target::{
     OwnerTargetConfig, OwnerTargetExecutor, OwnerTargetOutput, OwnerTargetResume,
@@ -44,9 +45,16 @@ use crate::shared::TargetAddr;
 
 const MEMORY_LINK_DELAY: Duration = Duration::from_nanos(1);
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the scheduler retains exact non-cloneable bootstrap authority inline without unaccounted heap ownership"
+)]
 enum HarnessAction {
-    WireDelivery(EncodedDelivery),
-    StartAttach(Frame),
+    WireDelivery {
+        delivery: EncodedDelivery,
+        completion: Option<OrderedDeliveryToken>,
+    },
+    StartAttach(PendingInitialAttach),
     OwnerBound(LegBoundFrame),
     ClientBound(LegBoundFrame),
     StartOpen,
@@ -74,7 +82,7 @@ enum HarnessAction {
 
 impl HarnessAction {
     const fn is_wire_delivery(&self) -> bool {
-        matches!(self, Self::WireDelivery(_))
+        matches!(self, Self::WireDelivery { .. })
     }
 }
 
@@ -172,13 +180,14 @@ struct ScheduledEncodedSender<'a> {
     observed_work: &'a mut HarnessObservedWork,
 }
 
-impl EncodedLegTransport for ScheduledEncodedSender<'_> {
-    fn send_encoded(
+impl ScheduledEncodedSender<'_> {
+    fn schedule_encoded(
         &mut self,
         now: SimTime,
         route: WireRoute,
         lane: WireLane,
         bytes: Vec<u8>,
+        completion: Option<OrderedDeliveryToken>,
     ) -> Result<(), EncodedLegTransportError> {
         let ordinal = self.harness.next_send_ordinal;
         // A rejected submission creates no wire ownership. Its retry is the
@@ -233,12 +242,38 @@ impl EncodedLegTransport for ScheduledEncodedSender<'_> {
                 actor_for_route(route),
                 owned_bytes,
                 wire_trace_tag(route, lane, ordinal),
-                HarnessAction::WireDelivery(delivery),
+                HarnessAction::WireDelivery {
+                    delivery,
+                    completion,
+                },
             ))
             .map_err(|error| EncodedLegTransportError::Wire(WireError::Schedule(error)))?;
         *self.observed_work = charged;
         self.harness.next_send_ordinal = next_ordinal;
         Ok(())
+    }
+}
+
+impl EncodedLegTransport for ScheduledEncodedSender<'_> {
+    fn send_encoded(
+        &mut self,
+        now: SimTime,
+        route: WireRoute,
+        lane: WireLane,
+        bytes: Vec<u8>,
+    ) -> Result<(), EncodedLegTransportError> {
+        self.schedule_encoded(now, route, lane, bytes, None)
+    }
+
+    fn send_attach_ordered_encoded(
+        &mut self,
+        now: SimTime,
+        route: WireRoute,
+        lane: WireLane,
+        bytes: Vec<u8>,
+        completion: OrderedDeliveryToken,
+    ) -> Result<(), EncodedLegTransportError> {
+        self.schedule_encoded(now, route, lane, bytes, Some(completion))
     }
 }
 
@@ -464,7 +499,7 @@ struct R5BaselineHarness {
     owner_outbound: LegOutboundQueue,
     client_flush_scheduled: bool,
     owner_flush_scheduled: bool,
-    client_pending: Option<PendingAttach>,
+    client_pending: Option<AwaitingInitialAttach>,
     owner_pending: Option<PendingOwnerBootstrap>,
     client_attached: Option<AttachedLeg>,
     owner_attached: Option<AttachedLeg>,
@@ -532,12 +567,14 @@ impl R5BaselineHarness {
         let proof = baseline_credentials()?
             .prove(&request, &binding)
             .map_err(|error| error.to_string())?;
-        let client_pending = client_leg_io.established_leg().begin_attach(request);
         let attach_frame = request.to_attach_frame(proof);
-        let attach_owned_bytes = attach_frame
-            .encode()
-            .map_err(|error| error.to_string())?
-            .len();
+        let client_pending = client_leg_io
+            .established_leg()
+            .begin_initial_attach(request, attach_frame)
+            .map_err(|error| format!("initial ATTACH binding failed: {error:?}"))?;
+        let attach_owned_bytes = client_pending
+            .encoded_len()
+            .map_err(|error| error.to_string())?;
         let authority = AttachAuthority::new(
             session_id,
             LegGeneration::new(1).map_err(|error| error.to_string())?,
@@ -573,23 +610,27 @@ impl R5BaselineHarness {
                 CLIENT_SUPERVISOR,
                 attach_owned_bytes,
                 0x100,
-                HarnessAction::StartAttach(attach_frame),
+                HarnessAction::StartAttach(client_pending),
             )
             .map_err(|error| error.to_string())?;
         observed_work = scheduled_observed;
+        let client_outbound =
+            LegOutboundQueue::for_leg(client_leg_io.established_leg(), 16, 16 * 1_024)
+                .map_err(|error| error.to_string())?;
+        let owner_outbound =
+            LegOutboundQueue::for_leg(owner_leg_io.established_leg(), 16, 16 * 1_024)
+                .map_err(|error| error.to_string())?;
         Ok(Self {
             work_budget,
             observed_work,
             scheduler,
             client_leg_io,
             owner_leg_io,
-            client_outbound: LegOutboundQueue::new(16, 16 * 1_024)
-                .map_err(|error| error.to_string())?,
-            owner_outbound: LegOutboundQueue::new(16, 16 * 1_024)
-                .map_err(|error| error.to_string())?,
+            client_outbound,
+            owner_outbound,
             client_flush_scheduled: false,
             owner_flush_scheduled: false,
-            client_pending: Some(client_pending),
+            client_pending: None,
             owner_pending: Some(SessionSupervisor::prepare_owner(
                 baseline_session_config()?,
                 authority,
@@ -653,8 +694,11 @@ impl R5BaselineHarness {
 
     fn handle_action(&mut self, now: SimTime, action: HarnessAction) -> Result<(), String> {
         match action {
-            HarnessAction::WireDelivery(delivery) => self.receive_wire(now, delivery),
-            HarnessAction::StartAttach(frame) => self.send_client_frame(now, frame),
+            HarnessAction::WireDelivery {
+                delivery,
+                completion,
+            } => self.receive_wire(now, delivery, completion),
+            HarnessAction::StartAttach(pending) => self.start_initial_attach(now, pending),
             HarnessAction::OwnerBound(received) => self.handle_owner_bound(now, received),
             HarnessAction::ClientBound(received) => self.handle_client_bound(now, received),
             HarnessAction::StartOpen => self.start_open(now),
@@ -688,7 +732,12 @@ impl R5BaselineHarness {
         }
     }
 
-    fn receive_wire(&mut self, now: SimTime, delivery: EncodedDelivery) -> Result<(), String> {
+    fn receive_wire(
+        &mut self,
+        now: SimTime,
+        delivery: EncodedDelivery,
+        completion: Option<OrderedDeliveryToken>,
+    ) -> Result<(), String> {
         let retained_bytes = delivery.bytes().len();
         match delivery.route().direction() {
             WireDirection::ClientToOwner => {
@@ -696,6 +745,9 @@ impl R5BaselineHarness {
                     .owner_leg_io
                     .receive_delivery(delivery)
                     .map_err(|error| error.to_string())?;
+                if let Some(completion) = completion {
+                    completion.mark_delivered();
+                }
                 self.schedule(
                     now,
                     EventPhase::SupervisorCommand,
@@ -710,6 +762,9 @@ impl R5BaselineHarness {
                     .client_leg_io
                     .receive_delivery(delivery)
                     .map_err(|error| error.to_string())?;
+                if let Some(completion) = completion {
+                    completion.mark_delivered();
+                }
                 self.schedule(
                     now,
                     EventPhase::SupervisorCommand,
@@ -722,16 +777,38 @@ impl R5BaselineHarness {
         }
     }
 
+    fn start_initial_attach(
+        &mut self,
+        now: SimTime,
+        pending: PendingInitialAttach,
+    ) -> Result<(), String> {
+        if self.client_pending.is_some() {
+            return Err("initial client ATTACH was scheduled twice".to_owned());
+        }
+        let awaiting = pending
+            .enqueue(&mut self.client_outbound)
+            .map_err(|error| format!("initial ATTACH queue rejected: {error:?}"))?;
+        self.client_pending = Some(awaiting);
+        self.schedule_client_outbound_flush(now)
+    }
+
     fn handle_owner_bound(&mut self, now: SimTime, received: LegBoundFrame) -> Result<(), String> {
         if self.owner.is_none() {
             let pending = self
                 .owner_pending
                 .as_mut()
                 .ok_or_else(|| "owner bootstrap state disappeared".to_owned())?;
-            let bootstrap = pending
-                .accept(self.owner_leg_io.established_leg(), received)
+            let publication = pending
+                .accept(
+                    self.owner_leg_io.established_leg(),
+                    received,
+                    &mut self.owner_outbound,
+                )
                 .map_err(|error| error.to_string())?;
-            let (supervisor, attached, acceptance) = bootstrap.into_parts();
+            let bootstrap = publication
+                .enqueue_acceptance(&mut self.owner_outbound)
+                .map_err(|error| error.to_string())?;
+            let (supervisor, attached) = bootstrap.into_parts();
             self.owner_attached = Some(attached);
             self.owner = Some(
                 OwnerTargetExecutor::new(
@@ -747,7 +824,7 @@ impl R5BaselineHarness {
                 )
                 .map_err(|error| error.to_string())?,
             );
-            self.send_owner_frame(now, acceptance)?;
+            self.schedule_owner_outbound_flush(now)?;
             return Ok(());
         }
 
@@ -774,15 +851,15 @@ impl R5BaselineHarness {
 
     fn handle_client_bound(&mut self, now: SimTime, received: LegBoundFrame) -> Result<(), String> {
         if let Some(pending) = self.client_pending.take() {
-            let AttachResponse::Accepted(attached) = pending
-                .validate_response(received)
-                .map_err(|error| error.to_string())?
-            else {
-                return Err("baseline initial attach returned generation status".to_owned());
-            };
-            let bootstrap =
-                SessionSupervisor::bootstrap_client(baseline_session_config()?, attached)
-                    .map_err(|error| error.to_string())?;
+            let accepted = pending
+                .validate_response(&self.client_outbound, received)
+                .map_err(|error| format!("initial response rejected: {error:?}"))?;
+            let bootstrap = SessionSupervisor::bootstrap_client(
+                baseline_session_config()?,
+                accepted,
+                &mut self.client_outbound,
+            )
+            .map_err(|error| error.to_string())?;
             let (mut supervisor, attached) = bootstrap.into_parts();
             let port_factory = supervisor
                 .mint_tcp_port_factory(baseline_port_config()?)
@@ -1516,24 +1593,28 @@ impl R5BaselineHarness {
         self.client_outbound
             .push(frame)
             .map_err(|error| error.to_string())?;
-        if !self.client_flush_scheduled {
-            let before = self.observed_work;
-            self.observed_work = charged;
-            if let Err(error) = self.schedule_next(
-                now,
-                EventPhase::SupervisorCommand,
-                CLIENT_SUPERVISOR,
-                0,
-                0x801,
-                HarnessAction::FlushClientOutbound,
-            ) {
-                self.observed_work = before;
-                return Err(error);
-            }
-            self.client_flush_scheduled = true;
-        } else {
-            self.observed_work = charged;
+        let before = self.observed_work;
+        self.observed_work = charged;
+        if let Err(error) = self.schedule_client_outbound_flush(now) {
+            self.observed_work = before;
+            return Err(error);
         }
+        Ok(())
+    }
+
+    fn schedule_client_outbound_flush(&mut self, now: SimTime) -> Result<(), String> {
+        if self.client_flush_scheduled {
+            return Ok(());
+        }
+        self.schedule_next(
+            now,
+            EventPhase::SupervisorCommand,
+            CLIENT_SUPERVISOR,
+            0,
+            0x801,
+            HarnessAction::FlushClientOutbound,
+        )?;
+        self.client_flush_scheduled = true;
         Ok(())
     }
 
@@ -1548,24 +1629,28 @@ impl R5BaselineHarness {
         self.owner_outbound
             .push(frame)
             .map_err(|error| error.to_string())?;
-        if !self.owner_flush_scheduled {
-            let before = self.observed_work;
-            self.observed_work = charged;
-            if let Err(error) = self.schedule_next(
-                now,
-                EventPhase::SupervisorCommand,
-                OWNER_SUPERVISOR,
-                0,
-                0x802,
-                HarnessAction::FlushOwnerOutbound,
-            ) {
-                self.observed_work = before;
-                return Err(error);
-            }
-            self.owner_flush_scheduled = true;
-        } else {
-            self.observed_work = charged;
+        let before = self.observed_work;
+        self.observed_work = charged;
+        if let Err(error) = self.schedule_owner_outbound_flush(now) {
+            self.observed_work = before;
+            return Err(error);
         }
+        Ok(())
+    }
+
+    fn schedule_owner_outbound_flush(&mut self, now: SimTime) -> Result<(), String> {
+        if self.owner_flush_scheduled {
+            return Ok(());
+        }
+        self.schedule_next(
+            now,
+            EventPhase::SupervisorCommand,
+            OWNER_SUPERVISOR,
+            0,
+            0x802,
+            HarnessAction::FlushOwnerOutbound,
+        )?;
+        self.owner_flush_scheduled = true;
         Ok(())
     }
 
@@ -1985,22 +2070,28 @@ mod tests {
         }
 
         assert_eq!(harness.pending_actions(), 2);
-        let HarnessAction::WireDelivery(first) =
-            harness.pop_next_checked().unwrap().unwrap().into_payload()
+        let HarnessAction::WireDelivery {
+            delivery: first,
+            completion: first_completion,
+        } = harness.pop_next_checked().unwrap().unwrap().into_payload()
         else {
             panic!("wire-only fixture scheduled a non-wire action")
         };
+        assert!(first_completion.is_none());
         assert_eq!(
             first.route(),
             WireRoute::new(LegId::A, WireDirection::ClientToOwner)
         );
         assert_eq!(first.lane(), WireLane::Data);
         assert_eq!(harness.pending_actions(), 1);
-        let HarnessAction::WireDelivery(second) =
-            harness.pop_next_checked().unwrap().unwrap().into_payload()
+        let HarnessAction::WireDelivery {
+            delivery: second,
+            completion: second_completion,
+        } = harness.pop_next_checked().unwrap().unwrap().into_payload()
         else {
             panic!("wire-only fixture scheduled a non-wire action")
         };
+        assert!(second_completion.is_none());
         assert_eq!(second.route(), first.route());
         assert_eq!(second.lane(), WireLane::Data);
         assert_eq!(harness.pending_actions(), 0);
@@ -2229,8 +2320,12 @@ mod tests {
             .unwrap()
             .prove(&request, &binding)
             .unwrap();
-        let frame = request.to_attach_frame(proof);
-        let owned_bytes = frame.encode().unwrap().len();
+        let pending =
+            crate::owned_upstream::leg::EstablishedLeg::for_authenticated_transport(binding)
+                .begin_attach(request)
+                .bind_initial_frame(request.to_attach_frame(proof))
+                .unwrap();
+        let owned_bytes = pending.encoded_len().unwrap();
         let mut scheduler =
             ByteHarnessScheduler::new(EventBudget::new(1, owned_bytes.saturating_sub(1)).unwrap());
 
@@ -2242,7 +2337,7 @@ mod tests {
                     CLIENT_SUPERVISOR,
                     owned_bytes,
                     0xdead,
-                    HarnessAction::StartAttach(frame),
+                    HarnessAction::StartAttach(pending),
                 )
                 .unwrap_err(),
             ScheduleError::ByteBudgetExceeded

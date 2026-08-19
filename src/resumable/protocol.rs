@@ -42,6 +42,12 @@ const TARGET_IPV4: u8 = 0x01;
 const TARGET_IPV6: u8 = 0x02;
 
 pub const FRAME_HEADER_BYTES: usize = 12;
+/// Fixed encoded capacity required for one correlated ATTACH_ACCEPTED. Owner
+/// queues reserve this exact amount before a generation commit, keeping wire
+/// layout authority in the protocol codec rather than duplicating a magic
+/// byte count in transport typestate.
+pub(crate) const ATTACH_ACCEPTED_ENCODED_BYTES: usize =
+    FRAME_HEADER_BYTES + ATTACH_ACCEPTED_FIXED_BODY_BYTES;
 /// Version of the fixed frame envelope and record parser.
 pub const FRAME_PROTOCOL_VERSION: u16 = 1;
 /// Current negotiated resumable-session semantics carried by ATTACH.
@@ -1901,6 +1907,21 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod standby_control_tests {
     use super::*;
+
+    #[test]
+    fn attach_accepted_capacity_constant_matches_the_codec() {
+        let frame = Frame::try_new(
+            LegGeneration::new(2).unwrap(),
+            Record::AttachAccepted {
+                session_id: SessionId::new([0x11; 16]).unwrap(),
+                nonce: AttachNonce::new([0x22; 16]).unwrap(),
+                selected_version: SESSION_PROTOCOL_VERSION,
+                features: FeatureSet::new(0b1111),
+            },
+        )
+        .unwrap();
+        assert_eq!(frame.encode().unwrap().len(), ATTACH_ACCEPTED_ENCODED_BYTES);
+    }
 
     #[test]
     fn standby_register_round_trips_through_the_feature_gated_classifier() {

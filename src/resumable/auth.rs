@@ -824,6 +824,91 @@ pub struct GenerationResynchronization {
     features: FeatureOffer,
 }
 
+/// Proof-valid stale/exhausted ATTACH authenticated for one exact transport,
+/// with no commit capability. This non-cloneable fact can produce only its
+/// correlated status and a narrowly checked catch-up contract.
+pub(crate) struct AuthenticatedAttachStatus {
+    status: GenerationResynchronization,
+    selected_version: u16,
+    negotiated_features: u64,
+}
+
+impl AuthenticatedAttachStatus {
+    pub(crate) fn status_frame(&self) -> Frame {
+        self.status.status_frame()
+    }
+
+    pub(crate) fn current_generation(&self) -> LegGeneration {
+        self.status.current_generation
+    }
+
+    pub(crate) fn can_catch_up(&self) -> bool {
+        self.status
+            .current_generation
+            .get()
+            .checked_add(1)
+            .is_some()
+            && self.status.requested_generation.get() > 1
+            && self.status.requested_generation.get() <= self.status.current_generation.get()
+    }
+
+    pub(crate) const fn transport_binding(&self) -> AttachTransportBinding {
+        self.status.transport_binding
+    }
+
+    pub(crate) fn matches_active_negotiation(
+        &self,
+        selected_version: u16,
+        negotiated_features: u64,
+    ) -> bool {
+        self.selected_version == selected_version && self.negotiated_features == negotiated_features
+    }
+
+    pub(crate) fn same_catch_up_contract(&self, other: &Self) -> bool {
+        self.status.session_id == other.status.session_id
+            && self.status.current_generation == other.status.current_generation
+            && self.status.requested_generation == other.status.requested_generation
+            && self.status.nonce == other.status.nonce
+            && self.status.versions == other.status.versions
+            && self.status.features == other.status.features
+            && same_stable_transport_identity(
+                &self.status.transport_binding,
+                &other.status.transport_binding,
+            )
+    }
+
+    pub(crate) fn permits_follow_up(
+        &self,
+        request: &AttachRequest,
+        binding: &AttachTransportBinding,
+    ) -> bool {
+        let Some(next) = self.status.current_generation.get().checked_add(1) else {
+            return false;
+        };
+        request.session_id == self.status.session_id
+            && request.requested_generation.get() == next
+            && request.nonce != self.status.nonce
+            && request.versions == self.status.versions
+            && request.features == self.status.features
+            && same_stable_transport_identity(&self.status.transport_binding, binding)
+    }
+}
+
+impl fmt::Debug for AuthenticatedAttachStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthenticatedAttachStatus([REDACTED])")
+    }
+}
+
+fn same_stable_transport_identity(
+    left: &AttachTransportBinding,
+    right: &AttachTransportBinding,
+) -> bool {
+    left.owner_identity == right.owner_identity
+        && left.alpn == right.alpn
+        && left.device_principal == right.device_principal
+}
+
 impl GenerationResynchronization {
     pub const fn current_generation(&self) -> LegGeneration {
         self.current_generation
@@ -936,19 +1021,36 @@ impl PendingGenerationCatchUp {
     /// belongs to this follow-up attach and may differ from the authenticated
     /// leg that carried the generation status; the transport adapter must bind
     /// each response to its own exact connection seal.
+    #[cfg(test)]
     pub(crate) fn validate_accepted_frame(
         self,
         binding: &AttachTransportBinding,
         frame: &Frame,
     ) -> Result<GenerationCatchUp, AttachReject> {
-        let accepted_leg = self.request.validate_accepted_frame(binding, frame)?;
-        let expected_accepted = self
-            .observed_generation
-            .get()
-            .checked_add(1)
-            .ok_or(AttachReject::GenerationExhausted)?;
+        self.validate_accepted_frame_preserving(binding, frame)
+            .map_err(|(_pending, error)| error)
+    }
+
+    /// Ownership-preserving form used by the registered recovery typestate.
+    /// A wrong response must not destroy the sole status-derived retry.
+    #[allow(
+        clippy::result_large_err,
+        reason = "validation rejection must return the exact non-cloneable catch-up authority"
+    )]
+    pub(crate) fn validate_accepted_frame_preserving(
+        self,
+        binding: &AttachTransportBinding,
+        frame: &Frame,
+    ) -> Result<GenerationCatchUp, (Self, AttachReject)> {
+        let accepted_leg = match self.request.validate_accepted_frame(binding, frame) {
+            Ok(accepted) => accepted,
+            Err(error) => return Err((self, error)),
+        };
+        let Some(expected_accepted) = self.observed_generation.get().checked_add(1) else {
+            return Err((self, AttachReject::GenerationExhausted));
+        };
         if accepted_leg.generation().get() != expected_accepted {
-            return Err(AttachReject::Rejected);
+            return Err((self, AttachReject::Rejected));
         }
         Ok(GenerationCatchUp {
             expected_local_generation: self.expected_local_generation,
@@ -1119,6 +1221,33 @@ impl AttachAuthority {
                 .map(AttachFrameOutcome::Resynchronize),
             Err(AttachReject::Rejected) => Err(AttachReject::Rejected),
         }
+    }
+
+    /// Authenticates only a stale or generation-exhausted ATTACH. Exact-next
+    /// requests are deliberately rejected here so this path cannot invoke a
+    /// CAS, mint `CommittedLeg`, or bypass registered/catch-up owner gates.
+    pub(crate) fn authenticate_resynchronization_frame(
+        &self,
+        frame: &Frame,
+        binding: &AttachTransportBinding,
+    ) -> Result<AuthenticatedAttachStatus, AttachReject> {
+        let (request, proof) = AttachRequest::from_attach_frame(frame)?;
+        let current = match self.prepare(&request, binding, &proof) {
+            Ok(_exact_next) => return Err(AttachReject::Rejected),
+            Err(AttachReject::GenerationNotNext { current, requested }) => {
+                if requested > current {
+                    return Err(AttachReject::Rejected);
+                }
+                current
+            }
+            Err(AttachReject::GenerationExhausted) => self.current_generation(),
+            Err(AttachReject::Rejected) => return Err(AttachReject::Rejected),
+        };
+        Ok(AuthenticatedAttachStatus {
+            status: self.resynchronization(&request, binding, current)?,
+            selected_version: self.policy.session_protocol_version,
+            negotiated_features: request.features.offered & self.policy.supported_features,
+        })
     }
 
     pub fn verify_and_commit(

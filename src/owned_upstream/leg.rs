@@ -6,18 +6,32 @@
 //! exact connection.  This module deliberately contains no Quinn, socket, or
 //! 0-RTT behavior.
 
+use super::standby::{
+    RegisteredAttachResponseGate, RegisteredCatchUpAssemblyGate, RegisteredCatchUpBeginGate,
+    RegisteredCatchUpResponseGate, RegisteredPendingAttachAuthority,
+};
+
 use crate::resumable::{
-    AttachAuthority, AttachReject, AttachRequest, AttachTransportBinding,
-    AuthenticatedStandbyRegistration, CommittedLeg, Frame, GenerationCatchUp,
-    GenerationResynchronization, LegControlFrame, LegGeneration, PendingGenerationCatchUp, Record,
-    SessionConfig, SessionEffect, SessionError, SessionEvent, SessionModel, SessionRole,
-    StandbyNonce, StandbyRegistrationReject, StandbyRegistrationRequest,
+    AttachAuthority, AttachCredentials, AttachReject, AttachRequest, AttachTransportBinding,
+    AuthenticatedAttachStatus, AuthenticatedStandbyRegistration, CommittedLeg, Frame,
+    GenerationCatchUp, GenerationResynchronization, LegControlFrame, LegGeneration,
+    PendingGenerationCatchUp, Record, SessionConfig, SessionEffect, SessionError, SessionEvent,
+    SessionModel, SessionRole, StandbyNonce, StandbyRegistrationReject, StandbyRegistrationRequest,
 };
 use crate::shared::TargetAddr;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use thiserror::Error;
+
+fn same_stable_transport_identity(
+    left: AttachTransportBinding,
+    right: AttachTransportBinding,
+) -> bool {
+    left.owner_identity() == right.owner_identity()
+        && left.alpn() == right.alpn()
+        && left.device_principal() == right.device_principal()
+}
 
 /// One authenticated connection's process-local, unforgeable identity.
 ///
@@ -41,17 +55,28 @@ pub(super) struct LegOutboundQueueLease;
 /// cannot leave apparently sendable recovery authority behind.
 pub(super) struct LegTransportEndpoint {
     terminal: AtomicBool,
+    terminal_transition: Mutex<()>,
 }
 
 impl LegTransportEndpoint {
     fn open() -> Self {
         Self {
             terminal: AtomicBool::new(false),
+            terminal_transition: Mutex::new(()),
         }
     }
 
     pub(super) fn is_open(&self) -> bool {
         !self.terminal.load(Ordering::Acquire)
+    }
+
+    pub(super) fn lock_terminal_transition(
+        &self,
+    ) -> Result<MutexGuard<'_, ()>, LegTerminalTransitionError> {
+        self.terminal_transition.lock().map_err(|_| {
+            self.terminal.store(true, Ordering::Release);
+            LegTerminalTransitionError::Poisoned
+        })
     }
 }
 
@@ -82,18 +107,29 @@ pub(crate) struct LegTransportReporter {
 }
 
 impl LegTransportReporter {
-    pub(crate) fn report(self, reason: LegTransportTerminalReason) -> ExactLegTerminal {
+    pub(crate) fn report(
+        self,
+        reason: LegTransportTerminalReason,
+    ) -> Result<ExactLegTerminal, LegTerminalTransitionError> {
+        let _transition = self.endpoint.lock_terminal_transition()?;
         let was_terminal = self.endpoint.terminal.swap(true, Ordering::AcqRel);
         debug_assert!(
             !was_terminal,
             "the sole non-cloneable transport reporter cannot report twice"
         );
-        ExactLegTerminal {
+        drop(_transition);
+        Ok(ExactLegTerminal {
             seal: self.seal,
             endpoint: self.endpoint,
             reason,
-        }
+        })
     }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub(crate) enum LegTerminalTransitionError {
+    #[error("authenticated transport terminal transition lock is poisoned")]
+    Poisoned,
 }
 
 impl fmt::Debug for LegTransportReporter {
@@ -202,13 +238,49 @@ impl EstablishedLeg {
         Self::for_authenticated_transport_with_reporter(binding).0
     }
 
-    pub(crate) fn begin_attach(&self, request: AttachRequest) -> PendingAttach {
+    fn pending_attach(&self, request: AttachRequest) -> PendingAttach {
         PendingAttach {
             seal: self.seal.share(),
             endpoint: Arc::downgrade(&self.endpoint),
             binding: self.binding,
             request,
         }
+    }
+
+    /// Binds one signed initial ATTACH directly into its closed queue-admission
+    /// typestate. Production callers never receive the intermediate raw
+    /// validator that can mint a bare `AttachedLeg`.
+    #[allow(
+        clippy::result_large_err,
+        reason = "a mismatched initial frame returns the exact request and signed frame"
+    )]
+    pub(crate) fn begin_initial_attach(
+        &self,
+        request: AttachRequest,
+        frame: Frame,
+    ) -> Result<PendingInitialAttach, InitialAttachBeginFailure> {
+        let carried = match AttachRequest::from_attach_frame(&frame) {
+            Ok((carried, _proof)) => carried,
+            Err(_) => return Err(InitialAttachBeginFailure { request, frame }),
+        };
+        if carried != request {
+            return Err(InitialAttachBeginFailure { request, frame });
+        }
+        let pending = self.pending_attach(request);
+        Ok(PendingInitialAttach {
+            queue_seal: pending.seal.share(),
+            request,
+            pending,
+            frame,
+        })
+    }
+
+    /// Raw attach construction remains only for protocol/provenance tests.
+    /// Production initial, registered, status, and catch-up paths each expose
+    /// their own queue-bound typestate instead.
+    #[cfg(test)]
+    pub(crate) fn begin_attach(&self, request: AttachRequest) -> PendingAttach {
+        self.pending_attach(request)
     }
 
     pub(super) fn bind_received_frame(&self, frame: Frame) -> LegBoundFrame {
@@ -262,6 +334,28 @@ impl EstablishedLeg {
         Arc::downgrade(&self.endpoint)
     }
 
+    pub(super) fn lock_terminal_transition(
+        &self,
+    ) -> Result<MutexGuard<'_, ()>, LegTerminalTransitionError> {
+        self.endpoint.lock_terminal_transition()
+    }
+
+    pub(super) fn transport_is_open(&self) -> bool {
+        self.endpoint.is_open()
+    }
+
+    #[cfg(test)]
+    pub(super) fn poison_terminal_transition_for_test(&self) {
+        let endpoint = Arc::clone(&self.endpoint);
+        let _caught = std::panic::catch_unwind(move || {
+            let _guard = endpoint
+                .terminal_transition
+                .lock()
+                .expect("test intentionally acquires the unpoisoned terminal lock");
+            panic!("intentional terminal transition poison");
+        });
+    }
+
     /// Authenticates and commits the initial owner ATTACH on this exact
     /// transport without exposing the committed reducer capability.
     ///
@@ -274,14 +368,39 @@ impl EstablishedLeg {
         received: LegBoundFrame,
         authority: &AttachAuthority,
     ) -> Result<AuthenticatedInitialOwnerAttach, LegProvenanceError> {
+        self.authenticate_initial_owner_attach_preserving(received, authority)
+            .map_err(InitialOwnerAttachAuthenticationFailure::into_kind)
+    }
+
+    /// Ownership-preserving initial-owner authentication used by the queued
+    /// bootstrap transaction. A rejected proof or wrong exact seal returns
+    /// the same inbound capability so no controller must reconstruct bytes.
+    #[allow(
+        clippy::result_large_err,
+        reason = "authentication rejection returns the exact inbound frame capability"
+    )]
+    pub(super) fn authenticate_initial_owner_attach_preserving(
+        &self,
+        received: LegBoundFrame,
+        authority: &AttachAuthority,
+    ) -> Result<AuthenticatedInitialOwnerAttach, InitialOwnerAttachAuthenticationFailure> {
         if !self.seal.same_connection(&received.seal) {
-            return Err(LegProvenanceError::WrongLeg);
+            return Err(InitialOwnerAttachAuthenticationFailure::new(
+                received,
+                LegProvenanceError::WrongLeg,
+            ));
         }
 
         let LegBoundFrame { seal, frame } = received;
-        let committed = authority
-            .verify_and_commit_frame(&frame, &self.binding)
-            .map_err(LegProvenanceError::from)?;
+        let committed = match authority.verify_and_commit_frame(&frame, &self.binding) {
+            Ok(committed) => committed,
+            Err(error) => {
+                return Err(InitialOwnerAttachAuthenticationFailure::new(
+                    LegBoundFrame { seal, frame },
+                    error.into(),
+                ));
+            }
+        };
         Ok(AuthenticatedInitialOwnerAttach {
             attached: AttachedLeg {
                 seal,
@@ -299,7 +418,7 @@ impl EstablishedLeg {
     /// the authority CAS and is consumed immediately afterward. The returned
     /// capability, correlated response, and recovery effects therefore exist
     /// only after model installation; this method still performs no wire I/O.
-    pub(crate) fn transact_owner_attach(
+    pub(super) fn transact_owner_attach_from_supervisor(
         &self,
         received: LegBoundFrame,
         authority: &AttachAuthority,
@@ -328,6 +447,36 @@ impl EstablishedLeg {
                 status: resynchronization.status_frame(),
             })),
         }
+    }
+
+    /// Preserves the byte/provenance integration floor without reopening the
+    /// production generic owner-commit surface. Only test crates can invoke
+    /// this explicit compatibility seam; production commits remain reachable
+    /// solely through `SessionSupervisor` and `OwnerTargetExecutor` gates.
+    #[cfg(test)]
+    pub(crate) fn transact_owner_attach_for_provenance_test(
+        &self,
+        received: LegBoundFrame,
+        authority: &AttachAuthority,
+        model: &mut SessionModel,
+    ) -> Result<Result<OwnerAttachTransaction, SessionError>, LegProvenanceError> {
+        self.transact_owner_attach_from_supervisor(received, authority, model)
+    }
+
+    /// Authenticates a stale/exhausted ATTACH on this exact transport without
+    /// invoking the owner reducer or generation CAS. The returned fact has no
+    /// attached-leg conversion.
+    pub(super) fn authenticate_owner_resynchronization(
+        &self,
+        received: LegBoundFrame,
+        authority: &AttachAuthority,
+    ) -> Result<AuthenticatedAttachStatus, LegProvenanceError> {
+        if !self.seal.same_connection(&received.seal) {
+            return Err(LegProvenanceError::WrongLeg);
+        }
+        authority
+            .authenticate_resynchronization_frame(&received.frame, &self.binding)
+            .map_err(LegProvenanceError::from)
     }
 }
 
@@ -358,6 +507,35 @@ impl fmt::Debug for AuthenticatedInitialOwnerAttach {
     }
 }
 
+pub(super) struct InitialOwnerAttachAuthenticationFailure {
+    received: LegBoundFrame,
+    kind: LegProvenanceError,
+}
+
+impl InitialOwnerAttachAuthenticationFailure {
+    fn new(received: LegBoundFrame, kind: LegProvenanceError) -> Self {
+        Self { received, kind }
+    }
+
+    fn into_kind(self) -> LegProvenanceError {
+        self.kind
+    }
+
+    pub(super) fn into_parts(self) -> (LegBoundFrame, LegProvenanceError) {
+        (self.received, self.kind)
+    }
+}
+
+impl fmt::Debug for InitialOwnerAttachAuthenticationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InitialOwnerAttachAuthenticationFailure")
+            .field("kind", &self.kind)
+            .field("received", &"[REDACTED]")
+            .finish()
+    }
+}
+
 impl fmt::Debug for EstablishedLeg {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("EstablishedLeg([REDACTED])")
@@ -376,39 +554,439 @@ pub(crate) struct PendingAttach {
 }
 
 impl PendingAttach {
-    pub(crate) fn validate_response(
+    /// Binds the signed bytes for the one initial client ATTACH to the exact
+    /// pending validator that created them.  This is deliberately distinct
+    /// from registered-standby admission: an initial transport has no prior
+    /// standby registration capability to consume.
+    #[allow(
+        clippy::result_large_err,
+        reason = "a mismatched signed frame returns both exact non-cloneable inputs"
+    )]
+    pub(crate) fn bind_initial_frame(
         self,
-        response: LegBoundFrame,
-    ) -> Result<AttachResponse, LegProvenanceError> {
-        if !self.seal.same_connection(&response.seal) {
-            return Err(LegProvenanceError::WrongLeg);
+        frame: Frame,
+    ) -> Result<PendingInitialAttach, PendingInitialAttachBindingFailure> {
+        let carried = match AttachRequest::from_attach_frame(&frame) {
+            Ok((request, _proof)) => request,
+            Err(_) => {
+                return Err(PendingInitialAttachBindingFailure {
+                    pending: self,
+                    frame,
+                });
+            }
+        };
+        if carried != self.request {
+            return Err(PendingInitialAttachBindingFailure {
+                pending: self,
+                frame,
+            });
         }
+        Ok(PendingInitialAttach {
+            queue_seal: self.seal.share(),
+            request: self.request,
+            pending: self,
+            frame,
+        })
+    }
 
-        let Self {
+    pub(super) fn for_registered_standby(authority: RegisteredPendingAttachAuthority) -> Self {
+        let (seal, endpoint, binding, request) = authority.into_parts();
+        Self {
             seal,
             endpoint,
             binding,
             request,
-        } = self;
-        match response.frame.record() {
-            Record::AttachAccepted { .. } => request
-                .validate_accepted_frame(&binding, &response.frame)
-                .map(|committed| {
-                    AttachResponse::Accepted(AttachedLeg {
-                        seal,
-                        endpoint,
-                        committed,
-                    })
-                })
-                .map_err(LegProvenanceError::from),
-            Record::AttachGenerationStatus { .. } => request
-                .validate_generation_status_frame(&binding, &response.frame)
-                .map(|status| {
-                    AttachResponse::GenerationStatus(LegGenerationStatus { seal, status })
-                })
-                .map_err(LegProvenanceError::from),
-            _ => Err(LegProvenanceError::Rejected),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validate_response(
+        self,
+        response: LegBoundFrame,
+    ) -> Result<AttachResponse, LegProvenanceError> {
+        self.validate_response_inner(response)
+            .map_err(PendingAttachValidationFailure::into_kind)
+    }
+
+    /// Registered-only response validation. The private standby-minted gate
+    /// proves the exact request receipt completed before any raw leg value can
+    /// be derived inside this module.
+    #[allow(
+        clippy::result_large_err,
+        reason = "rejected validation returns the exact pending attach and received frame"
+    )]
+    pub(super) fn validate_registered_response_preserving(
+        self,
+        response: LegBoundFrame,
+        _gate: RegisteredAttachResponseGate,
+    ) -> Result<AttachResponse, PendingAttachValidationFailure> {
+        self.validate_response_inner(response)
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "rejected validation returns the exact pending attach and received frame"
+    )]
+    fn validate_response_inner(
+        self,
+        response: LegBoundFrame,
+    ) -> Result<AttachResponse, PendingAttachValidationFailure> {
+        if !self.seal.same_connection(&response.seal) {
+            return Err(PendingAttachValidationFailure::new(
+                self,
+                response,
+                LegProvenanceError::WrongLeg,
+            ));
+        }
+        enum Validated {
+            Accepted(CommittedLeg),
+            GenerationStatus(GenerationResynchronization),
+        }
+        let validated = match response.frame.record() {
+            Record::AttachAccepted { .. } => self
+                .request
+                .validate_accepted_frame(&self.binding, &response.frame)
+                .map(Validated::Accepted),
+            Record::AttachGenerationStatus { .. } => self
+                .request
+                .validate_generation_status_frame(&self.binding, &response.frame)
+                .map(Validated::GenerationStatus),
+            _ => Err(AttachReject::Rejected),
+        };
+        let validated = match validated {
+            Ok(validated) => validated,
+            Err(error) => {
+                return Err(PendingAttachValidationFailure::new(
+                    self,
+                    response,
+                    error.into(),
+                ));
+            }
+        };
+        let Self {
+            seal,
+            endpoint,
+            binding: _,
+            request,
+        } = self;
+        match validated {
+            Validated::Accepted(committed) => Ok(AttachResponse::Accepted(AttachedLeg {
+                seal,
+                endpoint,
+                committed,
+            })),
+            Validated::GenerationStatus(status) => {
+                Ok(AttachResponse::GenerationStatus(LegGenerationStatus {
+                    seal,
+                    status,
+                    status_request: request,
+                }))
+            }
+        }
+    }
+
+    /// Validates only the initial correlated ATTACH_ACCEPTED branch while
+    /// retaining both exact inputs on every rejection.  Initial bootstrap has
+    /// no installed session from which a generation-status recovery could be
+    /// authorized.
+    #[allow(
+        clippy::result_large_err,
+        reason = "rejected validation returns the exact pending attach and received frame"
+    )]
+    pub(super) fn validate_initial_acceptance_preserving(
+        self,
+        response: LegBoundFrame,
+    ) -> Result<AttachedLeg, PendingAttachValidationFailure> {
+        if !self.seal.same_connection(&response.seal) {
+            return Err(PendingAttachValidationFailure::new(
+                self,
+                response,
+                LegProvenanceError::WrongLeg,
+            ));
+        }
+        if !matches!(response.frame.record(), Record::AttachAccepted { .. }) {
+            return Err(PendingAttachValidationFailure::new(
+                self,
+                response,
+                LegProvenanceError::Rejected,
+            ));
+        }
+        let committed = match self
+            .request
+            .validate_accepted_frame(&self.binding, &response.frame)
+        {
+            Ok(committed) => committed,
+            Err(error) => {
+                return Err(PendingAttachValidationFailure::new(
+                    self,
+                    response,
+                    error.into(),
+                ));
+            }
+        };
+        let Self {
+            seal,
+            endpoint,
+            binding: _,
+            request: _,
+        } = self;
+        Ok(AttachedLeg {
+            seal,
+            endpoint,
+            committed,
+        })
+    }
+
+    /// Validates only the correlated generation-status branch while retaining
+    /// both exact inputs on every rejection. A status-retry leg must never
+    /// accept an ATTACH_ACCEPTED as a shortcut around the owner permit.
+    #[allow(
+        clippy::result_large_err,
+        reason = "rejected validation returns the exact pending attach and received frame"
+    )]
+    pub(super) fn validate_registered_generation_status_preserving(
+        self,
+        response: LegBoundFrame,
+        _gate: RegisteredAttachResponseGate,
+    ) -> Result<LegGenerationStatus, PendingAttachValidationFailure> {
+        if !self.seal.same_connection(&response.seal) {
+            return Err(PendingAttachValidationFailure::new(
+                self,
+                response,
+                LegProvenanceError::WrongLeg,
+            ));
+        }
+        if !matches!(
+            response.frame.record(),
+            Record::AttachGenerationStatus { .. }
+        ) {
+            return Err(PendingAttachValidationFailure::new(
+                self,
+                response,
+                LegProvenanceError::Rejected,
+            ));
+        }
+        let status = match self
+            .request
+            .validate_generation_status_frame(&self.binding, &response.frame)
+        {
+            Ok(status) => status,
+            Err(error) => {
+                return Err(PendingAttachValidationFailure::new(
+                    self,
+                    response,
+                    error.into(),
+                ));
+            }
+        };
+        let Self {
+            seal,
+            endpoint: _,
+            binding: _,
+            request,
+        } = self;
+        Ok(LegGenerationStatus {
+            seal,
+            status,
+            status_request: request,
+        })
+    }
+
+    /// Converts a delivered request into stale-retry authority only for the
+    /// terminal fact minted by this exact authenticated transport.
+    #[allow(
+        clippy::result_large_err,
+        reason = "a mismatch returns the exact pending request and terminal fact"
+    )]
+    pub(super) fn into_lost_after_terminal(
+        self,
+        terminal: ExactLegTerminal,
+    ) -> Result<LostPendingAttach, PendingAttachTerminalMismatch> {
+        if !self.seal.same_connection(&terminal.seal)
+            || !Weak::ptr_eq(&self.endpoint, &Arc::downgrade(&terminal.endpoint))
+            || terminal.endpoint.is_open()
+        {
+            return Err(PendingAttachTerminalMismatch {
+                pending: self,
+                terminal,
+            });
+        }
+        Ok(LostPendingAttach {
+            seal: self.seal,
+            binding: self.binding,
+            request: self.request,
+        })
+    }
+
+    /// Converts a delivered request only after its once-claimed sole queue is
+    /// provably gone. The old pending validator is consumed by this move.
+    #[allow(
+        clippy::result_large_err,
+        reason = "a live queue rejection must return the exact non-cloneable pending attach"
+    )]
+    pub(super) fn into_lost_after_queue_loss(self) -> Result<LostPendingAttach, Self> {
+        if !self.seal.outbound_queue_was_lost() {
+            return Err(self);
+        }
+        Ok(LostPendingAttach {
+            seal: self.seal,
+            binding: self.binding,
+            request: self.request,
+        })
+    }
+}
+
+/// Exact delivered ATTACH whose original transport can no longer validate a
+/// response. It may only re-sign the same immutable request for one fresh
+/// status-only transport.
+pub(super) struct LostPendingAttach {
+    seal: LegSeal,
+    binding: AttachTransportBinding,
+    request: AttachRequest,
+}
+
+impl LostPendingAttach {
+    #[allow(
+        clippy::result_large_err,
+        reason = "fresh-leg rejection returns the exact lost request authority"
+    )]
+    pub(super) fn bind_fresh_status_leg(
+        self,
+        leg: &EstablishedLeg,
+        credentials: &AttachCredentials,
+    ) -> Result<SignedStatusRetryAttach, LostPendingAttachRebindFailure> {
+        if self.seal.same_connection(&leg.seal)
+            || self.binding == leg.binding
+            || !same_stable_transport_identity(self.binding, leg.binding)
+            || !leg.transport_is_open()
+            || leg.seal.outbound_queue_was_lost()
+        {
+            return Err(LostPendingAttachRebindFailure {
+                lost: self,
+                kind: LegProvenanceError::Rejected,
+            });
+        }
+        let proof = match credentials.prove(&self.request, &leg.binding) {
+            Ok(proof) => proof,
+            Err(_error) => {
+                return Err(LostPendingAttachRebindFailure {
+                    lost: self,
+                    kind: LegProvenanceError::Rejected,
+                });
+            }
+        };
+        let request = self.request;
+        Ok(SignedStatusRetryAttach {
+            queue_seal: leg.seal.share(),
+            pending: PendingAttach {
+                seal: leg.seal.share(),
+                endpoint: Arc::downgrade(&leg.endpoint),
+                binding: leg.binding,
+                request,
+            },
+            request,
+            frame: request.to_attach_frame(proof),
+        })
+    }
+}
+
+impl fmt::Debug for LostPendingAttach {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LostPendingAttach([REDACTED])")
+    }
+}
+
+pub(super) struct LostPendingAttachRebindFailure {
+    lost: LostPendingAttach,
+    kind: LegProvenanceError,
+}
+
+impl LostPendingAttachRebindFailure {
+    pub(super) fn into_parts(self) -> (LostPendingAttach, LegProvenanceError) {
+        (self.lost, self.kind)
+    }
+}
+
+impl fmt::Debug for LostPendingAttachRebindFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LostPendingAttachRebindFailure")
+            .field("kind", &self.kind)
+            .field("lost", &"[REDACTED]")
+            .finish()
+    }
+}
+
+pub(super) struct SignedStatusRetryAttach {
+    queue_seal: LegSeal,
+    pending: PendingAttach,
+    request: AttachRequest,
+    frame: Frame,
+}
+
+impl SignedStatusRetryAttach {
+    pub(super) fn into_parts(self) -> (LegSeal, PendingAttach, AttachRequest, Frame) {
+        (self.queue_seal, self.pending, self.request, self.frame)
+    }
+}
+
+impl fmt::Debug for SignedStatusRetryAttach {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SignedStatusRetryAttach([REDACTED])")
+    }
+}
+
+pub(super) struct PendingAttachTerminalMismatch {
+    pending: PendingAttach,
+    terminal: ExactLegTerminal,
+}
+
+impl PendingAttachTerminalMismatch {
+    pub(super) fn into_parts(self) -> (PendingAttach, ExactLegTerminal) {
+        (self.pending, self.terminal)
+    }
+}
+
+impl fmt::Debug for PendingAttachTerminalMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PendingAttachTerminalMismatch([REDACTED])")
+    }
+}
+
+/// Ownership-preserving response rejection used by registered-standby
+/// typestate. Legacy callers may discard it through `validate_response`, but
+/// C1b never loses either side of the exact correlation.
+pub(super) struct PendingAttachValidationFailure {
+    pending: PendingAttach,
+    response: LegBoundFrame,
+    kind: LegProvenanceError,
+}
+
+impl PendingAttachValidationFailure {
+    fn new(pending: PendingAttach, response: LegBoundFrame, kind: LegProvenanceError) -> Self {
+        Self {
+            pending,
+            response,
+            kind,
+        }
+    }
+
+    fn into_kind(self) -> LegProvenanceError {
+        self.kind
+    }
+
+    pub(super) fn into_parts(self) -> (PendingAttach, LegBoundFrame, LegProvenanceError) {
+        (self.pending, self.response, self.kind)
+    }
+}
+
+impl fmt::Debug for PendingAttachValidationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingAttachValidationFailure")
+            .field("kind", &self.kind)
+            .field("ownership", &"[REDACTED]")
+            .finish()
     }
 }
 
@@ -418,11 +996,84 @@ impl fmt::Debug for PendingAttach {
     }
 }
 
+/// Initial client ATTACH retained until the exact transport's sole queue
+/// admits its signed bytes.  It is neither a registered-standby request nor a
+/// generic session frame, and it exposes no raw request/proof accessors.
+pub(crate) struct PendingInitialAttach {
+    pub(super) queue_seal: LegSeal,
+    pub(super) pending: PendingAttach,
+    pub(super) request: AttachRequest,
+    pub(super) frame: Frame,
+}
+
+impl PendingInitialAttach {
+    pub(crate) fn encoded_len(&self) -> Result<usize, crate::resumable::ProtocolError> {
+        self.frame.encode().map(|encoded| encoded.len())
+    }
+}
+
+impl fmt::Debug for PendingInitialAttach {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PendingInitialAttach([REDACTED])")
+    }
+}
+
+/// Exact binding rejection for a signed initial frame that does not carry the
+/// pending validator's immutable request.
+pub(crate) struct PendingInitialAttachBindingFailure {
+    pending: PendingAttach,
+    frame: Frame,
+}
+
+/// Exact input return from the closed initial constructor. It deliberately
+/// exposes only the caller-owned request and signed frame, never the raw
+/// validator capable of minting a bare attached leg.
+pub(crate) struct InitialAttachBeginFailure {
+    request: AttachRequest,
+    frame: Frame,
+}
+
+impl InitialAttachBeginFailure {
+    pub(crate) fn into_parts(self) -> (AttachRequest, Frame) {
+        (self.request, self.frame)
+    }
+}
+
+impl fmt::Debug for InitialAttachBeginFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InitialAttachBeginFailure([REDACTED])")
+    }
+}
+
+impl PendingInitialAttachBindingFailure {
+    pub(crate) fn into_parts(self) -> (PendingAttach, Frame) {
+        (self.pending, self.frame)
+    }
+}
+
+impl fmt::Debug for PendingInitialAttachBindingFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PendingInitialAttachBindingFailure([REDACTED])")
+    }
+}
+
 /// A decoded frame whose provenance was minted by the exact connection's
 /// sole receive adapter.  Fields and constructors remain private.
 pub(crate) struct LegBoundFrame {
     seal: LegSeal,
     frame: Frame,
+}
+
+impl LegBoundFrame {
+    pub(super) fn belongs_to_transport(&self, leg: &EstablishedLeg) -> bool {
+        leg.belongs_to_transport(&self.seal)
+    }
+
+    pub(super) fn attach_request(&self) -> Result<AttachRequest, LegProvenanceError> {
+        AttachRequest::from_attach_frame(&self.frame)
+            .map(|(request, _proof)| request)
+            .map_err(LegProvenanceError::from)
+    }
 }
 
 /// Classified inbound facts retain disjoint protocol namespaces after exact
@@ -455,6 +1106,7 @@ impl LegBoundControlFrame {
 pub(crate) struct LegGenerationStatus {
     seal: LegSeal,
     status: GenerationResynchronization,
+    status_request: AttachRequest,
 }
 
 impl LegGenerationStatus {
@@ -466,10 +1118,12 @@ impl LegGenerationStatus {
         self.status.requested_generation()
     }
 
+    #[cfg(test)]
     pub(crate) fn transport_binding(&self) -> AttachTransportBinding {
         self.status.transport_binding()
     }
 
+    #[cfg(test)]
     pub(crate) fn begin_catch_up(
         self,
         follow_up_leg: &EstablishedLeg,
@@ -481,7 +1135,70 @@ impl LegGenerationStatus {
             follow_up_seal: follow_up_leg.seal.share(),
             follow_up_endpoint: follow_up_leg.endpoint_liveness(),
             follow_up_binding: follow_up_leg.binding,
+            status_request: self.status_request,
             pending,
+        })
+    }
+
+    /// Consumes the exact status and internally derives/signs its sole
+    /// high-water successor for a distinct fresh transport. No raw request or
+    /// binding leaves this adapter boundary.
+    #[allow(
+        clippy::result_large_err,
+        reason = "begin rejection returns the exact status capability"
+    )]
+    pub(super) fn begin_registered_signed_catch_up(
+        self,
+        follow_up_leg: &EstablishedLeg,
+        nonce: crate::resumable::AttachNonce,
+        credentials: &AttachCredentials,
+        _gate: RegisteredCatchUpBeginGate,
+    ) -> Result<SignedPendingCatchUpAttach, LegGenerationCatchUpBeginFailure> {
+        if self.seal.same_connection(&follow_up_leg.seal)
+            || self.status.transport_binding() == follow_up_leg.binding
+            || !same_stable_transport_identity(
+                self.status.transport_binding(),
+                follow_up_leg.binding,
+            )
+            || !follow_up_leg.transport_is_open()
+            || follow_up_leg.seal.outbound_queue_was_lost()
+        {
+            return Err(LegGenerationCatchUpBeginFailure {
+                status: self,
+                kind: LegProvenanceError::Rejected,
+            });
+        }
+        let pending = match self.status.begin_catch_up(nonce) {
+            Ok(pending) => pending,
+            Err(_error) => {
+                return Err(LegGenerationCatchUpBeginFailure {
+                    status: self,
+                    kind: LegProvenanceError::Rejected,
+                });
+            }
+        };
+        let request = pending.request();
+        let proof = match credentials.prove(&request, &follow_up_leg.binding) {
+            Ok(proof) => proof,
+            Err(_error) => {
+                return Err(LegGenerationCatchUpBeginFailure {
+                    status: self,
+                    kind: LegProvenanceError::Rejected,
+                });
+            }
+        };
+        Ok(SignedPendingCatchUpAttach {
+            queue_seal: follow_up_leg.seal.share(),
+            pending: PendingCatchUpAttach {
+                _status_seal: self.seal,
+                follow_up_seal: follow_up_leg.seal.share(),
+                follow_up_endpoint: follow_up_leg.endpoint_liveness(),
+                follow_up_binding: follow_up_leg.binding,
+                status_request: self.status_request,
+                pending,
+            },
+            request,
+            frame: request.to_attach_frame(proof),
         })
     }
 }
@@ -498,36 +1215,261 @@ pub(crate) struct PendingCatchUpAttach {
     follow_up_seal: LegSeal,
     follow_up_endpoint: Weak<LegTransportEndpoint>,
     follow_up_binding: AttachTransportBinding,
+    status_request: AttachRequest,
     pending: PendingGenerationCatchUp,
 }
 
 impl PendingCatchUpAttach {
+    #[cfg(test)]
     pub(crate) fn request(&self) -> AttachRequest {
         self.pending.request()
     }
 
+    #[cfg(test)]
     pub(crate) fn transport_binding(&self) -> AttachTransportBinding {
         self.follow_up_binding
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_response(
         self,
         response: LegBoundFrame,
     ) -> Result<CaughtUpAttachedLeg, LegProvenanceError> {
+        self.validate_response_inner(response)
+            .map_err(PendingCatchUpValidationFailure::into_kind)
+    }
+
+    /// Registered-only D acceptance validation. The private delivery gate is
+    /// minted only while consuming the opaque awaiting wrapper that retains
+    /// both C and D queue receipts.
+    #[allow(
+        clippy::result_large_err,
+        reason = "wrong response returns exact catch-up and inbound ownership"
+    )]
+    pub(super) fn validate_registered_response_preserving(
+        self,
+        response: LegBoundFrame,
+        _gate: RegisteredCatchUpResponseGate,
+    ) -> Result<CaughtUpAttachedLeg, PendingCatchUpValidationFailure> {
+        self.validate_response_inner(response)
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "wrong response returns exact catch-up and inbound ownership"
+    )]
+    fn validate_response_inner(
+        self,
+        response: LegBoundFrame,
+    ) -> Result<CaughtUpAttachedLeg, PendingCatchUpValidationFailure> {
         if !self.follow_up_seal.same_connection(&response.seal) {
-            return Err(LegProvenanceError::WrongLeg);
+            return Err(PendingCatchUpValidationFailure::new(
+                self,
+                response,
+                LegProvenanceError::WrongLeg,
+            ));
         }
         if !matches!(response.frame.record(), Record::AttachAccepted { .. }) {
-            return Err(LegProvenanceError::Rejected);
+            return Err(PendingCatchUpValidationFailure::new(
+                self,
+                response,
+                LegProvenanceError::Rejected,
+            ));
         }
-        let catch_up = self
-            .pending
-            .validate_accepted_frame(&self.follow_up_binding, &response.frame)?;
+        let Self {
+            _status_seal,
+            follow_up_seal,
+            follow_up_endpoint,
+            follow_up_binding,
+            status_request,
+            pending,
+        } = self;
+        let catch_up =
+            match pending.validate_accepted_frame_preserving(&follow_up_binding, &response.frame) {
+                Ok(catch_up) => catch_up,
+                Err((pending, error)) => {
+                    return Err(PendingCatchUpValidationFailure::new(
+                        Self {
+                            _status_seal,
+                            follow_up_seal,
+                            follow_up_endpoint,
+                            follow_up_binding,
+                            status_request,
+                            pending,
+                        },
+                        response,
+                        error.into(),
+                    ));
+                }
+            };
         Ok(CaughtUpAttachedLeg {
-            seal: self.follow_up_seal,
-            endpoint: self.follow_up_endpoint,
+            seal: follow_up_seal,
+            endpoint: follow_up_endpoint,
             catch_up,
         })
+    }
+
+    /// Converts a delivered, lost follow-up request into authority to retry
+    /// the original stale correlation on one fresh status transport. The
+    /// original request remains inside `PendingGenerationCatchUp`; callers
+    /// never receive a raw request or binding.
+    #[allow(
+        clippy::result_large_err,
+        reason = "a mismatch returns the exact catch-up validator and terminal fact"
+    )]
+    pub(super) fn into_original_lost_after_terminal(
+        self,
+        terminal: ExactLegTerminal,
+    ) -> Result<LostPendingAttach, PendingCatchUpTerminalMismatch> {
+        if !self.follow_up_seal.same_connection(&terminal.seal)
+            || !Weak::ptr_eq(
+                &self.follow_up_endpoint,
+                &Arc::downgrade(&terminal.endpoint),
+            )
+            || terminal.endpoint.is_open()
+        {
+            return Err(PendingCatchUpTerminalMismatch {
+                pending: self,
+                terminal,
+            });
+        }
+        let Self {
+            _status_seal: _,
+            follow_up_seal,
+            follow_up_endpoint: _,
+            follow_up_binding,
+            status_request,
+            pending: _,
+        } = self;
+        Ok(LostPendingAttach {
+            seal: follow_up_seal,
+            binding: follow_up_binding,
+            request: status_request,
+        })
+    }
+
+    /// Queue-loss counterpart to [`Self::into_original_lost_after_terminal`].
+    /// The once-claimed D queue must be gone before its validator can be
+    /// converted into another status-only retry.
+    #[allow(
+        clippy::result_large_err,
+        reason = "a live queue rejection returns the exact catch-up validator"
+    )]
+    pub(super) fn into_original_lost_after_queue_loss(self) -> Result<LostPendingAttach, Self> {
+        if !self.follow_up_seal.outbound_queue_was_lost() {
+            return Err(self);
+        }
+        let Self {
+            _status_seal: _,
+            follow_up_seal,
+            follow_up_endpoint: _,
+            follow_up_binding,
+            status_request,
+            pending: _,
+        } = self;
+        Ok(LostPendingAttach {
+            seal: follow_up_seal,
+            binding: follow_up_binding,
+            request: status_request,
+        })
+    }
+}
+
+pub(super) struct PendingCatchUpTerminalMismatch {
+    pending: PendingCatchUpAttach,
+    terminal: ExactLegTerminal,
+}
+
+impl PendingCatchUpTerminalMismatch {
+    pub(super) fn into_parts(self) -> (PendingCatchUpAttach, ExactLegTerminal) {
+        (self.pending, self.terminal)
+    }
+}
+
+impl fmt::Debug for PendingCatchUpTerminalMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PendingCatchUpTerminalMismatch([REDACTED])")
+    }
+}
+
+pub(super) struct SignedPendingCatchUpAttach {
+    queue_seal: LegSeal,
+    pending: PendingCatchUpAttach,
+    request: AttachRequest,
+    frame: Frame,
+}
+
+impl SignedPendingCatchUpAttach {
+    pub(super) fn into_registered_parts(
+        self,
+        _gate: RegisteredCatchUpAssemblyGate,
+    ) -> (LegSeal, PendingCatchUpAttach, AttachRequest, Frame) {
+        (self.queue_seal, self.pending, self.request, self.frame)
+    }
+}
+
+impl fmt::Debug for SignedPendingCatchUpAttach {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SignedPendingCatchUpAttach([REDACTED])")
+    }
+}
+
+pub(super) struct LegGenerationCatchUpBeginFailure {
+    status: LegGenerationStatus,
+    kind: LegProvenanceError,
+}
+
+impl LegGenerationCatchUpBeginFailure {
+    pub(super) fn into_parts(self) -> (LegGenerationStatus, LegProvenanceError) {
+        (self.status, self.kind)
+    }
+}
+
+impl fmt::Debug for LegGenerationCatchUpBeginFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LegGenerationCatchUpBeginFailure")
+            .field("kind", &self.kind)
+            .field("status", &"[REDACTED]")
+            .finish()
+    }
+}
+
+pub(super) struct PendingCatchUpValidationFailure {
+    pending: PendingCatchUpAttach,
+    response: LegBoundFrame,
+    kind: LegProvenanceError,
+}
+
+impl PendingCatchUpValidationFailure {
+    fn new(
+        pending: PendingCatchUpAttach,
+        response: LegBoundFrame,
+        kind: LegProvenanceError,
+    ) -> Self {
+        Self {
+            pending,
+            response,
+            kind,
+        }
+    }
+
+    fn into_kind(self) -> LegProvenanceError {
+        self.kind
+    }
+
+    pub(super) fn into_parts(self) -> (PendingCatchUpAttach, LegBoundFrame, LegProvenanceError) {
+        (self.pending, self.response, self.kind)
+    }
+}
+
+impl fmt::Debug for PendingCatchUpValidationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingCatchUpValidationFailure")
+            .field("kind", &self.kind)
+            .field("ownership", &"[REDACTED]")
+            .finish()
     }
 }
 
@@ -647,6 +1589,14 @@ impl AttachedLeg {
 
     pub(crate) fn transport_binding(&self) -> AttachTransportBinding {
         self.committed.transport_binding()
+    }
+
+    pub(super) fn session_protocol_version(&self) -> u16 {
+        self.committed.session_protocol_version()
+    }
+
+    pub(super) fn negotiated_features(&self) -> u64 {
+        self.committed.negotiated_features()
     }
 
     pub(super) fn transport_is_open(&self) -> bool {

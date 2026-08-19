@@ -17,7 +17,8 @@ pub use auth::{
     ResumeSecret, TlsExporterBinding, VersionRange,
 };
 pub(crate) use auth::{
-    AuthenticatedStandbyRegistration, StandbyRegistrationReject, StandbyRegistrationRequest,
+    AuthenticatedAttachStatus, AuthenticatedStandbyRegistration, StandbyRegistrationReject,
+    StandbyRegistrationRequest,
 };
 pub use capacity::{
     BitsPerSecond, DirectionalByteLimits, DirectionalRates, DirectionalReplayStorageLimits,
@@ -25,6 +26,7 @@ pub use capacity::{
     ReplayHorizon, ReplayStorageGeometry, ReplayStorageLimit, ReplayStoragePlan,
 };
 
+pub(crate) use protocol::ATTACH_ACCEPTED_ENCODED_BYTES;
 pub use protocol::{
     AttachNonce, AttachProof, ByteOffset, DecodedFrame, Direction, FRAME_HEADER_BYTES,
     FRAME_PROTOCOL_VERSION, FeatureSet, Frame, HintSequence, LegControlFrame, LegControlRecord,

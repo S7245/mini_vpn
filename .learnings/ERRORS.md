@@ -1,5 +1,63 @@
 # Errors
 
+## 2026-08-18 - C1b final review found three delivered-authority leaks
+
+- An enqueued generation-status publication could be abandoned after its
+  actual-delivery receipt was already complete if the exact status leg became
+  terminal before the owner processed the arm action. That cleared the sole
+  unarmed permit even though the client could already send the authorized next
+  ATTACH, leaving that exact request stuck at `NotArmed`.
+- The correction makes delivery monotonic authority: only an undelivered
+  publication whose endpoint or queue is lost may abandon its permit. A
+  delivered publication is returned intact and can still arm after the status
+  leg terminates.
+- A separate review found the legacy client chain `begin_attach -> raw response
+  validation -> install_attached_leg`, plus bare acceptance admission, still
+  compiled in production. It could construct and install an `AttachedLeg`
+  without registered-standby authority, an exact request queue receipt, or
+  actual delivery.
+- The correction confines those raw seams to deterministic tests and gives
+  initial bootstrap a one-shot production constructor that consumes the exact
+  request and signed frame without exposing bare pending/attached authority.
+  Registered and catch-up replacement remain reachable only through their
+  opaque typed wrappers; C1c must consume those wrappers rather than restore a
+  generic installer.
+- A third review found that `pub(super)` raw catch-up helpers remained callable
+  by every `owned_upstream` sibling. A sibling could synthesize the registered
+  pending validator from an established leg, discard the C/D queue receipts,
+  validate a bare caught-up leg, and invoke the raw supervisor installer.
+- The correction makes each raw helper consume a standby-private, non-cloneable
+  gate minted only by the corresponding opaque wrapper after actual delivery.
+  Raw catch-up response validation and installation are test-only; production
+  stops at `AcceptedClientRegisteredCatchUp` until C1c adds its consuming
+  accepted-to-installed transition.
+
+All three defects were found by independent local review after the first broad
+green gate. No TUN, VPS, WAN traffic, or production throughput claim was used.
+
+## 2026-08-18 - C1b broad gates exposed sealed bypasses and exhausted build storage
+
+- Closing generic ATTACH admission made three R5 production-baseline tests fail
+  with `RegisteredAttachAdmissionRequired`. Those were initial bootstrap A,
+  not registered replacement B. The correction was a distinct production
+  initial-attach admission with the same exact queue and delivery boundary;
+  restoring a test-only generic bypass would have hidden the missing seam.
+- Removing the raw owner attach transaction then produced eight `E0599`
+  failures in `knife16_owned_leg_provenance`. The correction was an explicitly
+  named `#[cfg(test)]` provenance-only wrapper; the production generic commit
+  method remained sealed.
+- A later all-target rebuild failed before compilation with only `122 MiB`
+  free while this project's renewable `target/` tree occupied about `33 GiB`
+  (`debug/deps` about `27 GiB`, incremental about `4 GiB`). Cleaning only this
+  project's rebuildable Cargo output released `80.8 GiB`; the unchanged source
+  then passed the full all-target, debug/release check, format, and diff gates.
+- Before future broad Rust gates, inspect free space and the project target
+  footprint. Remove only rebuildable project artifacts; never clean captured
+  evidence, source, or unrelated worktrees to solve ENOSPC.
+
+All failures and repairs were local. No TUN, VPS, WAN traffic, credentials, or
+user data were involved.
+
 ## 2026-08-18 - The first terminal review equated allocation with liveness
 
 - The initial exact-terminal slice correctly added a sole consuming transport
