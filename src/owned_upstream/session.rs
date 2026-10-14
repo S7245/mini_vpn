@@ -1,10 +1,22 @@
 //! Bounded, priority-aware ingress for one resumable session owner.
+//!
+//! Owns two channel lanes and one prefetch cell per lane. Capacity observation
+//! owns only progress metadata, never commands; one observer covers both lanes.
+//! Dequeue commits custody and its checked epoch before invoking a user Waker.
+//! Close ends admission, not command settlement or whole-session ownership.
+//! Entry is bounded/try_send/recv_next; progress tests live in session/tests/.
 
-use super::tcp::DriverInput;
+use super::tcp::{ClientControllerDriverInput, DriverInput};
 use crate::resumable::{Record, SessionEvent};
 use std::fmt;
+use std::future::{Future, poll_fn};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::futures::OwnedNotified;
+use tokio::sync::{Notify, mpsc};
 
 /// Ordinary control keeps low latency without allowing a continuously
 /// replenished ACK/completion stream to starve already-owned source bytes.
@@ -39,15 +51,19 @@ impl SessionOwnerMailbox {
         }
         let (control_tx, control_rx) = mpsc::channel(control_capacity);
         let (data_tx, data_rx) = mpsc::channel(data_capacity);
+        let progress = Arc::new(SessionMailboxProgress::default());
         Ok((
             SessionOwnerIngress {
                 control_tx,
                 data_tx,
+                progress: Arc::clone(&progress),
             },
             SessionOwnerInbox {
                 control_rx,
                 data_rx,
                 control_streak: 0,
+                prefetch: [None, None],
+                progress,
             },
         ))
     }
@@ -57,38 +73,35 @@ impl SessionOwnerMailbox {
 pub(crate) struct SessionOwnerIngress {
     control_tx: mpsc::Sender<SessionOwnerCommand>,
     data_tx: mpsc::Sender<SessionOwnerCommand>,
+    progress: Arc<SessionMailboxProgress>,
 }
 
 impl SessionOwnerIngress {
-    pub(crate) async fn send_event(
+    /// Acquire before trying either lane. Progress is a retry hint, not a
+    /// reservation. One persistent observer can survive cancelled waits.
+    pub(crate) fn observe_capacity(
         &self,
-        event: SessionEvent,
-    ) -> Result<(), SessionMailboxSendError> {
-        self.send_command(SessionOwnerCommand::Event(event)).await
-    }
-
-    pub(crate) async fn send_driver(
-        &self,
-        input: DriverInput,
-    ) -> Result<(), SessionMailboxSendError> {
-        self.send_command(SessionOwnerCommand::Driver(input)).await
-    }
-
-    async fn send_command(
-        &self,
-        command: SessionOwnerCommand,
-    ) -> Result<(), SessionMailboxSendError> {
-        let sender = if command.is_ordered_source() {
-            &self.data_tx
-        } else {
-            &self.control_tx
+    ) -> Result<SessionMailboxCapacityObservation, SessionMailboxObserverBusy> {
+        self.progress
+            .observer_held
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| SessionMailboxObserverBusy)?;
+        // Admit before allocating: rejected contenders own no cache. Local
+        // reverse-drop order unlinks a constructed registration before lease.
+        let lease = SessionMailboxObserverLease {
+            progress: Arc::clone(&self.progress),
         };
-        sender
-            .send(command)
-            .await
-            .map_err(|error| SessionMailboxSendError {
-                command: Box::new(error.0),
-            })
+        let mut registration = Box::pin(Arc::clone(&lease.progress.notify).notified_owned());
+        let seen = lease.progress.epochs();
+        // The notification baseline must not predate the reported epoch pair.
+        registration
+            .as_mut()
+            .set(Arc::clone(&lease.progress.notify).notified_owned());
+        Ok(SessionMailboxCapacityObservation {
+            registration,
+            lease,
+            seen,
+        })
     }
 
     pub(crate) fn try_send_event(
@@ -109,6 +122,9 @@ impl SessionOwnerIngress {
         &self,
         command: SessionOwnerCommand,
     ) -> Result<(), SessionMailboxTrySendError> {
+        if self.progress.terminal.load(Ordering::Acquire) != MAILBOX_OPEN {
+            return Err(SessionMailboxTrySendError::Closed(Box::new(command)));
+        }
         let sender = if command.is_ordered_source() {
             &self.data_tx
         } else {
@@ -135,103 +151,275 @@ pub(crate) struct SessionOwnerInbox {
     control_rx: mpsc::Receiver<SessionOwnerCommand>,
     data_rx: mpsc::Receiver<SessionOwnerCommand>,
     control_streak: usize,
+    prefetch: [Option<SessionOwnerCommand>; 2],
+    progress: Arc<SessionMailboxProgress>,
+}
+
+const MAILBOX_OPEN: u8 = 0;
+const MAILBOX_CLOSED: u8 = 1;
+const MAILBOX_EPOCH_EXHAUSTED: u8 = 2;
+
+#[derive(Default)]
+struct SessionMailboxProgress {
+    epochs: [AtomicU64; 2],
+    terminal: AtomicU8,
+    observer_held: AtomicBool,
+    notify: Arc<Notify>,
+}
+
+impl SessionMailboxProgress {
+    fn epochs(&self) -> [u64; 2] {
+        self.epochs
+            .each_ref()
+            .map(|epoch| epoch.load(Ordering::Acquire))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SessionMailboxObserverBusy;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SessionMailboxCapacityChange {
+    Control,
+    OrderedSource,
+    Both,
+    Closed,
+    EpochExhausted,
+}
+
+/// Non-Clone lease on the mailbox's sole capacity observer. It retains only
+/// metadata, not a sender, receiver, command, task, or capacity reservation.
+pub(crate) struct SessionMailboxCapacityObservation {
+    // Declaration order is the destruction contract: remove the cached Waker
+    // before another observer may acquire the exclusive lease.
+    registration: Pin<Box<OwnedNotified>>,
+    lease: SessionMailboxObserverLease,
+    seen: [u64; 2],
+}
+
+impl SessionMailboxCapacityObservation {
+    pub(crate) async fn changed(&mut self) -> SessionMailboxCapacityChange {
+        poll_fn(|cx| self.poll_changed(cx)).await
+    }
+
+    fn poll_changed(&mut self, cx: &mut Context<'_>) -> Poll<SessionMailboxCapacityChange> {
+        // This closed graph has one Inbox writer and broadcast-only progress.
+        // At most one already-observed broadcast can arrive late: <=2 cached
+        // polls and <=3 state checks; no self-wake or synthetic Pending. This
+        // bounds calls, not dependency lock latency or a process-wide park.
+        loop {
+            let terminal = self.lease.progress.terminal.load(Ordering::Acquire);
+            if terminal == MAILBOX_EPOCH_EXHAUSTED {
+                self.reset_registration();
+                return Poll::Ready(SessionMailboxCapacityChange::EpochExhausted);
+            }
+            if terminal == MAILBOX_CLOSED {
+                self.reset_registration();
+                return Poll::Ready(SessionMailboxCapacityChange::Closed);
+            }
+            let epochs = self.lease.progress.epochs();
+            let changed = match (epochs[0] != self.seen[0], epochs[1] != self.seen[1]) {
+                (true, true) => Some(SessionMailboxCapacityChange::Both),
+                (true, false) => Some(SessionMailboxCapacityChange::Control),
+                (false, true) => Some(SessionMailboxCapacityChange::OrderedSource),
+                (false, false) => None,
+            };
+            if let Some(changed) = changed {
+                // Reset can drop a user Waker. Do not consume epochs until
+                // that operation finishes, so unwind permits exact re-entry.
+                self.reset_registration();
+                self.seen = epochs;
+                return Poll::Ready(changed);
+            }
+            // OwnedNotified captures broadcast count at creation. Poll either
+            // observes a raced broadcast or installs the persistent Waker;
+            // cancellation of changed() no longer unlinks that registration.
+            if self.registration.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.reset_registration();
+        }
+    }
+
+    fn reset_registration(&mut self) {
+        // Reuse the sole pinned allocation, including after a fused Ready.
+        self.registration
+            .as_mut()
+            .set(Arc::clone(&self.lease.progress.notify).notified_owned());
+    }
+}
+
+struct SessionMailboxObserverLease {
+    progress: Arc<SessionMailboxProgress>,
+}
+
+impl Drop for SessionMailboxObserverLease {
+    fn drop(&mut self) {
+        self.progress.observer_held.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SessionMailboxLane {
+    Control,
+    OrderedSource,
+}
+
+impl SessionMailboxLane {
+    fn index(self) -> usize {
+        match self {
+            Self::Control => 0,
+            Self::OrderedSource => 1,
+        }
+    }
 }
 
 impl SessionOwnerInbox {
     pub(crate) async fn recv_next(&mut self) -> Option<SessionOwnerCommand> {
-        let mut control_closed = false;
-        let mut data_closed = false;
-        loop {
-            let source_due = self.control_streak >= CONTROL_BURST_LIMIT;
-            if source_due {
-                match self.data_rx.try_recv() {
-                    Ok(event) => {
-                        self.control_streak = 0;
-                        return Some(event);
-                    }
-                    Err(mpsc::error::TryRecvError::Disconnected) => data_closed = true,
-                    Err(mpsc::error::TryRecvError::Empty) => {}
-                }
-            }
-            if !control_closed {
-                match self.control_rx.try_recv() {
-                    Ok(event) => {
-                        self.control_streak = self.control_streak.saturating_add(1);
-                        return Some(event);
-                    }
-                    Err(mpsc::error::TryRecvError::Disconnected) => control_closed = true,
-                    Err(mpsc::error::TryRecvError::Empty) => {}
-                }
-            }
-            if !data_closed {
-                match self.data_rx.try_recv() {
-                    Ok(event) => {
-                        self.control_streak = 0;
-                        return Some(event);
-                    }
-                    Err(mpsc::error::TryRecvError::Disconnected) => data_closed = true,
-                    Err(mpsc::error::TryRecvError::Empty) => {}
-                }
-            }
-            if control_closed && data_closed {
-                return None;
-            }
+        std::future::poll_fn(|cx| self.poll_next(cx)).await
+    }
 
-            if source_due && !data_closed {
-                tokio::select! {
-                    biased;
-                    event = self.data_rx.recv() => {
-                        match event {
-                            Some(event) => {
-                                self.control_streak = 0;
-                                return Some(event);
-                            }
-                            None => data_closed = true,
-                        }
-                    }
-                    event = self.control_rx.recv(), if !control_closed => {
-                        match event {
-                            Some(event) => {
-                                self.control_streak = self.control_streak.saturating_add(1);
-                                return Some(event);
-                            }
-                            None => control_closed = true,
-                        }
-                    }
-                    else => return None,
-                }
-            } else {
-                tokio::select! {
-                    biased;
-                    event = self.control_rx.recv(), if !control_closed => {
-                        match event {
-                            Some(event) => {
-                                self.control_streak = self.control_streak.saturating_add(1);
-                                return Some(event);
-                            }
-                            None => control_closed = true,
-                        }
-                    }
-                    event = self.data_rx.recv(), if !data_closed => {
-                        match event {
-                            Some(event) => {
-                                self.control_streak = 0;
-                                return Some(event);
-                            }
-                            None => data_closed = true,
-                        }
-                    }
-                    else => return None,
-                }
+    /// One Owner-selected lane only. The checked Controller stores the returned
+    /// command immediately in Held before validating or reducing it. A capacity
+    /// callback unwind leaves this exact command in the original prefetch.
+    /// Bound callers never mix this operation with the legacy mixed receive.
+    pub(super) fn poll_selected(
+        &mut self,
+        lane: SessionMailboxLane,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<SessionOwnerCommand>> {
+        if let Some(command) = self.prefetch[lane.index()].take() {
+            return Poll::Ready(Some(command));
+        }
+        // The wrapper contains exactly one raw receive, not prefetch, capacity
+        // notification or caller work. Only private try-send producers exist;
+        // returning its permit cannot invoke an async sender's user Waker.
+        let received = {
+            let receiver = match lane {
+                SessionMailboxLane::Control => &mut self.control_rx,
+                SessionMailboxLane::OrderedSource => &mut self.data_rx,
+            };
+            let mut receive = std::pin::pin!(tokio::task::unconstrained(poll_fn(|cx| {
+                receiver.poll_recv(cx)
+            })));
+            receive.as_mut().poll(cx)
+        };
+        match received {
+            Poll::Ready(Some(command)) => {
+                self.prefetch[lane.index()] = Some(command);
+                self.control_streak = match lane {
+                    SessionMailboxLane::Control => self.control_streak.saturating_add(1),
+                    SessionMailboxLane::OrderedSource => 0,
+                };
+                self.publish_capacity(lane);
+                Poll::Ready(self.prefetch[lane.index()].take())
             }
+            // None closes only this lane. It is neither the other lane's EOF
+            // nor proof that either prefetch or the complete mailbox is empty.
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<SessionOwnerCommand>> {
+        // Only the selected lane is prefetched in one poll. If its notification
+        // unwound, deliver that selection before touching either channel again.
+        for held in &mut self.prefetch {
+            if let Some(command) = held.take() {
+                return Poll::Ready(Some(command));
+            }
+        }
+        let order = if self.control_streak >= CONTROL_BURST_LIMIT {
+            [
+                SessionMailboxLane::OrderedSource,
+                SessionMailboxLane::Control,
+            ]
+        } else {
+            [
+                SessionMailboxLane::Control,
+                SessionMailboxLane::OrderedSource,
+            ]
+        };
+        let mut all_closed = true;
+        // At most two channel polls. Unlike try_recv's Busy path, this does
+        // not park the owner thread waiting for an in-flight producer push.
+        // The private try-only ports cannot register semaphore waiters, so
+        // permit return cannot invoke an async sender's user Waker here.
+        for lane in order {
+            let received = match lane {
+                SessionMailboxLane::Control => self.control_rx.poll_recv(cx),
+                SessionMailboxLane::OrderedSource => self.data_rx.poll_recv(cx),
+            };
+            match received {
+                Poll::Ready(Some(command)) => {
+                    self.prefetch[lane.index()] = Some(command);
+                    self.control_streak = match lane {
+                        SessionMailboxLane::Control => self.control_streak.saturating_add(1),
+                        SessionMailboxLane::OrderedSource => 0,
+                    };
+                    self.publish_capacity(lane);
+                    return Poll::Ready(self.prefetch[lane.index()].take());
+                }
+                Poll::Ready(None) => {}
+                Poll::Pending => all_closed = false,
+            }
+        }
+        if all_closed {
+            self.close();
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
         }
     }
 
     /// Prevents new sends while retaining every already-queued event for the
     /// sole owner to drain through [`Self::recv_next`].
     pub(crate) fn close(&mut self) {
+        // One monotonic terminal word ends both logical lanes before any wake.
+        // A send that passed its precheck already still uses its actual result.
+        let previous = self
+            .progress
+            .terminal
+            .fetch_max(MAILBOX_CLOSED, Ordering::AcqRel);
+        self.close_channels();
+        if previous == MAILBOX_OPEN {
+            self.progress.notify.notify_waiters();
+        }
+    }
+
+    fn close_channels(&mut self) {
+        // Raw sender ports cannot install semaphore/closed waiters. Both
+        // physical closes therefore precede our sole capacity observer wake.
         self.control_rx.close();
         self.data_rx.close();
+    }
+
+    fn publish_capacity(&mut self, lane: SessionMailboxLane) {
+        if self.progress.terminal.load(Ordering::Acquire) == MAILBOX_EPOCH_EXHAUSTED {
+            return;
+        }
+        let epoch = &self.progress.epochs[lane.index()];
+        match epoch.load(Ordering::Relaxed).checked_add(1) {
+            Some(next) => epoch.store(next, Ordering::Release),
+            None => {
+                self.progress
+                    .terminal
+                    .store(MAILBOX_EPOCH_EXHAUSTED, Ordering::Release);
+                self.close_channels();
+            }
+        }
+        // A single exclusive observer + mutable changed() borrow bounds this
+        // Notify to one waiter. Panic cannot skip another observer's Waker.
+        // The actual command and streak already belong to the inbox above.
+        self.progress.notify.notify_waiters();
+    }
+}
+
+impl Drop for SessionOwnerInbox {
+    fn drop(&mut self) {
+        // Normal destruction must terminate an observation that outlives us.
+        // This is no drain/clean-zero claim; double-panic abort is not recovery.
+        self.close();
     }
 }
 
@@ -244,6 +432,7 @@ impl fmt::Debug for SessionOwnerInbox {
 pub(crate) enum SessionOwnerCommand {
     Event(SessionEvent),
     Driver(DriverInput),
+    ClientDriver(ClientControllerDriverInput),
 }
 
 impl SessionOwnerCommand {
@@ -252,6 +441,10 @@ impl SessionOwnerCommand {
             Self::Event(event) => is_ordered_source_event(event),
             Self::Driver(DriverInput::Data(_)) => true,
             Self::Driver(DriverInput::Control(event)) => is_ordered_source_event(event),
+            Self::ClientDriver(input) => match input.as_inner() {
+                DriverInput::Data(_) => true,
+                DriverInput::Control(event) => is_ordered_source_event(event),
+            },
         }
     }
 }
@@ -261,6 +454,9 @@ impl fmt::Debug for SessionOwnerCommand {
         match self {
             Self::Event(event) => formatter.debug_tuple("Event").field(event).finish(),
             Self::Driver(input) => formatter.debug_tuple("Driver").field(input).finish(),
+            Self::ClientDriver(input) => {
+                formatter.debug_tuple("ClientDriver").field(input).finish()
+            }
         }
     }
 }
@@ -278,30 +474,6 @@ fn is_ordered_source_event(event: &SessionEvent) -> bool {
             if matches!(frame.record(), Record::Data { .. } | Record::Close { .. })
     )
 }
-
-pub(crate) struct SessionMailboxSendError {
-    command: Box<SessionOwnerCommand>,
-}
-
-impl SessionMailboxSendError {
-    pub(crate) fn into_command(self) -> SessionOwnerCommand {
-        *self.command
-    }
-}
-
-impl fmt::Debug for SessionMailboxSendError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("SessionMailboxSendError([REDACTED])")
-    }
-}
-
-impl fmt::Display for SessionMailboxSendError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("session owner mailbox is closed")
-    }
-}
-
-impl std::error::Error for SessionMailboxSendError {}
 
 pub(crate) enum SessionMailboxTrySendError {
     Full(Box<SessionOwnerCommand>),
@@ -341,6 +513,8 @@ pub(crate) enum SessionMailboxConfigError {
 
 #[cfg(test)]
 mod tests {
+    mod progress;
+
     use super::*;
     use crate::resumable::{
         AttachAlpn, AttachCredentials, AttachNonce, AttachPolicy, AttachRequest,
@@ -518,6 +692,9 @@ mod tests {
             | Some(SessionOwnerCommand::Driver(DriverInput::Control(event))) => Some(event),
             Some(SessionOwnerCommand::Driver(DriverInput::Data(_))) => {
                 panic!("expected an event command, got owned DATA")
+            }
+            Some(SessionOwnerCommand::ClientDriver(_)) => {
+                panic!("session mailbox cannot receive a controller-only typed driver command")
             }
             None => None,
         }
@@ -736,8 +913,11 @@ mod tests {
         let _recovered = full.into_command();
 
         inbox.close();
-        let closed = ingress.send_event(peer_data(SECRET)).await.unwrap_err();
-        assert_eq!(format!("{closed:?}"), "SessionMailboxSendError([REDACTED])");
+        let closed = ingress.try_send_event(peer_data(SECRET)).unwrap_err();
+        assert_eq!(
+            format!("{closed:?}"),
+            "SessionMailboxTrySendError::Closed([REDACTED])"
+        );
         assert!(!format!("{closed:?}").contains("MAILBOX_PAYLOAD"));
         let _recovered = closed.into_command();
     }

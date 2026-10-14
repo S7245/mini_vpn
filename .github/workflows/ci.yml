@@ -31,6 +31,11 @@ jobs:
         with:
           components: clippy
 
+      - name: Code-growth governance
+        run: |
+          rustc -D warnings --edition=2024 --test tests/code_growth_governance.rs -o "$RUNNER_TEMP/code-growth-governance"
+          "$RUNNER_TEMP/code-growth-governance"
+
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
 

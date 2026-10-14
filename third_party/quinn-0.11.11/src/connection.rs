@@ -6,8 +6,8 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Weak,
     },
     task::{ready, Context, Poll, Waker},
 };
@@ -27,9 +27,13 @@ use crate::{
     udp_transmit, ConnectionEvent, ConnectionToEndpointEvent, Duration, Instant, VarInt,
 };
 use proto::{
-    congestion::Controller, ConnectionError, ConnectionHandle, ConnectionStats, Dir,
-    Side, StreamEvent, StreamId,
+    congestion::Controller, ConnectionError, ConnectionHandle, ConnectionStats, Dir, Side,
+    StreamEvent, StreamId,
 };
+
+#[cfg(test)]
+#[path = "connection/tests/mod.rs"]
+mod retirement_tests;
 
 fn authenticated_current_socket_generation(
     authenticated_before: u64,
@@ -46,8 +50,83 @@ fn authenticated_current_socket_generation(
 #[derive(Debug)]
 pub struct Connecting {
     conn: Option<ConnectionRef>,
+    endpoint_released: Option<oneshot::Receiver<()>>,
+    driver_released: Option<oneshot::Receiver<()>>,
     connected: oneshot::Receiver<bool>,
     handshake_data_ready: Option<oneshot::Receiver<()>>,
+}
+
+/// A restricted handle for waiting until one exact connection's endpoint
+/// entry and protocol driver are both released.
+///
+/// This does not expose streams or application data and therefore cannot be
+/// used to bypass handshake completion or 0-RTT policy. `abandon` is restricted
+/// to unpublished attempts; a published owner may only perform ordinary
+/// connection close and consume `drained`.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct ConnectionDrain {
+    connection: ConnectionRef,
+    endpoint_released: oneshot::Receiver<()>,
+    driver_released: oneshot::Receiver<()>,
+}
+
+impl ConnectionDrain {
+    /// Terminate this unpublished connection attempt immediately, without the
+    /// ordinary closing timer, and wake its protocol driver for endpoint
+    /// cleanup.
+    #[doc(hidden)]
+    pub fn abandon(&self) {
+        let conn = &mut *self.connection.state.lock("drain_handle_abandon");
+        conn.inner.abandon();
+        conn.terminate(ConnectionError::LocallyClosed, &self.connection.shared);
+        // Do not rely on the connection driver being polled again. It may have
+        // already exited after an endpoint or socket I/O error. Forward the
+        // exact Drained event while holding the same connection-state lock so
+        // the endpoint-release acknowledgement is minted at most once.
+        conn.forward_endpoint_events();
+        conn.wake();
+    }
+
+    /// Wait until this exact connection's endpoint entry and protocol driver
+    /// have both been released. The handle is consumed so each witness has one
+    /// waiter.
+    #[doc(hidden)]
+    pub async fn drained(self) -> bool {
+        let Self {
+            connection,
+            endpoint_released,
+            driver_released,
+        } = self;
+        drop(connection);
+        wait_for_connection_release(endpoint_released, driver_released).await
+    }
+}
+
+async fn wait_for_connection_release(
+    endpoint_released: oneshot::Receiver<()>,
+    driver_released: oneshot::Receiver<()>,
+) -> bool {
+    let endpoint_released = endpoint_released.await.is_ok();
+    let driver_released = driver_released.await.is_ok();
+    endpoint_released && driver_released
+}
+
+async fn drive_connection_and_report_release<F, R>(driver: F, report_release: R)
+where
+    F: Future<Output = Result<(), io::Error>> + Unpin,
+    R: FnOnce(),
+{
+    // The driver owns a ConnectionRef. End that ownership scope before
+    // reporting normal completion so a release witness cannot overtake the
+    // exact reference and socket Arcs held by the driver future.
+    let mut driver = driver;
+    let result = (&mut driver).await;
+    drop(driver);
+    match result {
+        Ok(()) => report_release(),
+        Err(e) => tracing::error!("I/O error: {e}"),
+    }
 }
 
 impl Connecting {
@@ -61,6 +140,8 @@ impl Connecting {
     ) -> Self {
         let (on_handshake_data_send, on_handshake_data_recv) = oneshot::channel();
         let (on_connected_send, on_connected_recv) = oneshot::channel();
+        let (endpoint_released_send, endpoint_released_recv) = oneshot::channel();
+        let (driver_released_send, driver_released_recv) = oneshot::channel();
         let conn = ConnectionRef::new(
             handle,
             conn,
@@ -68,24 +149,49 @@ impl Connecting {
             conn_events,
             on_handshake_data_send,
             on_connected_send,
+            endpoint_released_send,
             socket,
             runtime.clone(),
         );
 
         let driver = ConnectionDriver(conn.clone());
         runtime.spawn(Box::pin(
-            async {
-                if let Err(e) = driver.await {
-                    tracing::error!("I/O error: {e}");
-                }
-            }
+            drive_connection_and_report_release(driver, move || {
+                let _ = driver_released_send.send(());
+            })
             .instrument(Span::current()),
         ));
 
         Self {
             conn: Some(conn),
+            endpoint_released: Some(endpoint_released_recv),
+            driver_released: Some(driver_released_recv),
             connected: on_connected_recv,
             handshake_data_ready: Some(on_handshake_data_recv),
+        }
+    }
+
+    /// Obtain a restricted cleanup handle for this exact connection attempt.
+    ///
+    /// The handle can await this exact connection's endpoint-map removal and
+    /// normal driver completion. It can abandon an unpublished attempt, but it
+    /// cannot send application data or weaken handshake policy.
+    #[doc(hidden)]
+    pub fn take_drain_handle(&mut self) -> Option<ConnectionDrain> {
+        let connection = self.conn.as_ref()?.clone();
+        let endpoint_released = self.endpoint_released.take();
+        let driver_released = self.driver_released.take();
+        match (endpoint_released, driver_released) {
+            (Some(endpoint_released), Some(driver_released)) => Some(ConnectionDrain {
+                connection,
+                endpoint_released,
+                driver_released,
+            }),
+            (endpoint_released, driver_released) => {
+                self.endpoint_released = endpoint_released;
+                self.driver_released = driver_released;
+                None
+            }
         }
     }
 
@@ -399,6 +505,24 @@ impl Connection {
         }
     }
 
+    /// Open one established 1-RTT stream without waiting, paired with its exact retirement witness.
+    /// Handshaking, closure, and exhausted stream credit allocate no stream or notification waiter.
+    #[doc(hidden)]
+    pub fn try_open_uni_1rtt_with_retirement(&self) -> Option<(SendStream, SendStreamRetirement)> {
+        let mut state = self.0.state.lock("try_open_uni_1rtt_with_retirement");
+        if state.error.is_some() || state.inner.is_handshaking() {
+            return None;
+        }
+        let stream = state.inner.streams().open(Dir::Uni)?;
+        let retirement = SendStreamRetirement {
+            connection: Arc::downgrade(&self.0 .0),
+            stream,
+            destroyed: self.0.retirement_sentinel.0.clone(),
+        };
+        drop(state);
+        Some((SendStream::new(self.0.clone(), stream, false), retirement))
+    }
+
     /// Initiate a new outgoing bidirectional stream.
     ///
     /// Streams are cheap and instantaneous to open unless blocked by flow control. As a
@@ -414,6 +538,45 @@ impl Connection {
             conn: &self.0,
             notify: self.0.shared.stream_budget_available[Dir::Bi as usize].notified(),
         }
+    }
+
+    /// Read local bi-open guards atomically: next index, peer limit, handshaking,
+    /// protocol closed, and driver error. This consumes no credit and proves no peer acceptance.
+    #[doc(hidden)]
+    pub fn bi_stream_open_snapshot(&self) -> (u64, u64, bool, bool, bool) {
+        let mut state = self.0.state.lock("bi_stream_open_snapshot");
+        let (next, limit) = state.inner.streams().local_open_budget(Dir::Bi);
+        (
+            next,
+            limit,
+            state.inner.is_handshaking(),
+            state.inner.is_closed(),
+            state.error.is_some(),
+        )
+    }
+
+    /// Atomically open an established 1-RTT bi stream with its exact two-map witness.
+    /// Handshaking, closure and exhausted credit allocate no stream or notification waiter.
+    #[doc(hidden)]
+    pub fn try_open_bi_1rtt_with_retirement(
+        &self,
+    ) -> Option<(SendStream, RecvStream, BiStreamRetirement)> {
+        let mut state = self.0.state.lock("try_open_bi_1rtt_with_retirement");
+        if state.error.is_some() || state.inner.is_handshaking() {
+            return None;
+        }
+        let stream = state.inner.streams().open(Dir::Bi)?;
+        let retirement = BiStreamRetirement {
+            connection: Arc::downgrade(&self.0 .0),
+            stream,
+            destroyed: self.0.retirement_sentinel.0.clone(),
+        };
+        drop(state);
+        Some((
+            SendStream::new(self.0.clone(), stream, false),
+            RecvStream::new(self.0.clone(), stream, false),
+            retirement,
+        ))
     }
 
     /// Accept the next incoming uni-directional stream
@@ -1017,6 +1180,7 @@ impl ConnectionRef {
         conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
         on_handshake_data: oneshot::Sender<()>,
         on_connected: oneshot::Sender<bool>,
+        endpoint_released: oneshot::Sender<()>,
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
@@ -1033,6 +1197,7 @@ impl ConnectionRef {
                 timer_deadline: None,
                 conn_events,
                 endpoint_events,
+                endpoint_released: Some(endpoint_released),
                 current_socket_rx_rebind_generation: 0,
                 blocked_writers: FxHashMap::default(),
                 blocked_readers: FxHashMap::default(),
@@ -1045,6 +1210,9 @@ impl ConnectionRef {
                 buffered_transmit: None,
             }),
             shared: Shared::default(),
+            #[cfg(test)]
+            retirement_barrier: Mutex::new(None),
+            retirement_sentinel: ConnectionRetirementSentinel(Arc::new(AtomicBool::new(false))),
         }))
     }
 
@@ -1089,6 +1257,80 @@ impl std::ops::Deref for ConnectionRef {
 pub(crate) struct ConnectionInner {
     pub(crate) state: Mutex<State>,
     pub(crate) shared: Shared,
+    #[cfg(test)]
+    retirement_barrier: Mutex<Option<retirement_tests::DestructionBarrier>>,
+    // Field order is part of the witness: protocol state and shared storage drop before this flag.
+    retirement_sentinel: ConnectionRetirementSentinel,
+}
+
+#[derive(Debug)]
+struct ConnectionRetirementSentinel(Arc<AtomicBool>);
+
+impl Drop for ConnectionRetirementSentinel {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Read-only custody of one exact 1-RTT send stream, without retaining its connection storage.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct SendStreamRetirement {
+    connection: Weak<ConnectionInner>,
+    stream: StreamId,
+    destroyed: Arc<AtomicBool>,
+}
+
+impl SendStreamRetirement {
+    /// Whether the send-map entry is absent or the complete connection value has been destroyed.
+    /// Close signals, STOP_SENDING and a weak-upgrade failure during destruction are insufficient.
+    #[doc(hidden)]
+    pub fn is_retired(&self) -> bool {
+        if self.destroyed.load(Ordering::Acquire) {
+            return true;
+        }
+        let Some(connection) = self.connection.upgrade() else {
+            return false;
+        };
+        let retired = {
+            let mut state = connection.state.lock("SendStreamRetirement::is_retired");
+            state.inner.send_stream(self.stream).stopped().is_err()
+        };
+        // This bare Arc never participates in ConnectionRef's public-handle ref_count.
+        drop(connection);
+        retired
+    }
+}
+
+/// Read-only custody of one exact 1-RTT bi stream, without retaining connection storage.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct BiStreamRetirement {
+    connection: Weak<ConnectionInner>,
+    stream: StreamId,
+    destroyed: Arc<AtomicBool>,
+}
+
+impl BiStreamRetirement {
+    /// Whether BOTH send/recv map entries are absent, or complete connection storage is destroyed.
+    /// Reset, STOP_SENDING, close and weak-upgrade failure during destruction are insufficient.
+    /// This does not certify peer application completion or retirement of unrelated resources.
+    #[doc(hidden)]
+    pub fn is_retired(&self) -> bool {
+        if self.destroyed.load(Ordering::Acquire) {
+            return true;
+        }
+        let Some(connection) = self.connection.upgrade() else {
+            return false;
+        };
+        let retired = {
+            let mut state = connection.state.lock("BiStreamRetirement::is_retired");
+            state.inner.streams().stream_maps_absent(self.stream)
+        };
+        // A bare Arc does not add public I/O-handle authority.
+        drop(connection);
+        retired
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1118,6 +1360,7 @@ pub(crate) struct State {
     timer_deadline: Option<Instant>,
     conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
     endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, ConnectionToEndpointEvent)>,
+    endpoint_released: Option<oneshot::Sender<()>>,
     current_socket_rx_rebind_generation: u64,
     pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
     pub(crate) blocked_readers: FxHashMap<StreamId, Waker>,
@@ -1246,10 +1489,18 @@ impl State {
 
     fn forward_endpoint_events(&mut self) {
         while let Some(event) = self.inner.poll_endpoint_events() {
+            let endpoint_released = event
+                .is_drained()
+                .then(|| self.endpoint_released.take())
+                .flatten();
             // If the endpoint driver is gone, noop.
-            let _ = self
-                .endpoint_events
-                .send((self.handle, ConnectionToEndpointEvent::Proto(event)));
+            let _ = self.endpoint_events.send((
+                self.handle,
+                ConnectionToEndpointEvent::Proto {
+                    event,
+                    endpoint_released,
+                },
+            ));
         }
     }
 
@@ -1270,11 +1521,12 @@ impl State {
                     event,
                     current_socket_rx_rebind_generation,
                 })) => {
-                    let candidate_generation = current_socket_rx_rebind_generation.filter(
-                        |generation| *generation > self.current_socket_rx_rebind_generation,
-                    );
-                    let authenticated_before = candidate_generation
-                        .map(|_| self.inner.authenticated_packets());
+                    let candidate_generation =
+                        current_socket_rx_rebind_generation.filter(|generation| {
+                            *generation > self.current_socket_rx_rebind_generation
+                        });
+                    let authenticated_before =
+                        candidate_generation.map(|_| self.inner.authenticated_packets());
                     self.inner.handle_event(event);
                     let generation = authenticated_before.and_then(|authenticated_before| {
                         authenticated_current_socket_generation(
@@ -1466,6 +1718,111 @@ impl State {
 }
 
 #[cfg(test)]
+mod connection_release_tests {
+    use std::{
+        future::Future,
+        io,
+        pin::Pin,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        task::{Context, Poll},
+    };
+
+    use super::{drive_connection_and_report_release, wait_for_connection_release};
+
+    struct DropObservedDriver {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Future for DropObservedDriver {
+        type Output = io::Result<()>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Drop for DropObservedDriver {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_driver_release_ack_follows_driver_drop() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&dropped);
+
+        drive_connection_and_report_release(
+            DropObservedDriver { dropped },
+            move || {
+                assert!(
+                    observed.load(Ordering::Acquire),
+                    "normal completion cannot be acknowledged while the driver still owns its connection reference",
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn endpoint_ack_alone_cannot_complete_the_release_witness() {
+        let (endpoint_tx, endpoint_rx) = tokio::sync::oneshot::channel();
+        let (driver_tx, driver_rx) = tokio::sync::oneshot::channel();
+        let mut released = Box::pin(wait_for_connection_release(endpoint_rx, driver_rx));
+
+        endpoint_tx
+            .send(())
+            .expect("endpoint ack receiver remains live");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), released.as_mut())
+                .await
+                .is_err(),
+            "endpoint removal cannot release capacity while the driver remains live",
+        );
+        driver_tx
+            .send(())
+            .expect("driver witness receiver remains live");
+        assert!(released.await);
+    }
+
+    #[tokio::test]
+    async fn driver_ack_alone_cannot_complete_the_release_witness() {
+        let (endpoint_tx, endpoint_rx) = tokio::sync::oneshot::channel();
+        let (driver_tx, driver_rx) = tokio::sync::oneshot::channel();
+        let mut released = Box::pin(wait_for_connection_release(endpoint_rx, driver_rx));
+
+        driver_tx
+            .send(())
+            .expect("driver witness receiver remains live");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), released.as_mut())
+                .await
+                .is_err(),
+            "driver completion cannot release capacity while the endpoint entry remains live",
+        );
+        endpoint_tx
+            .send(())
+            .expect("endpoint acknowledgement receiver remains live");
+        assert!(released.await);
+    }
+
+    #[tokio::test]
+    async fn abnormal_driver_loss_fails_the_combined_release_witness() {
+        let (endpoint_tx, endpoint_rx) = tokio::sync::oneshot::channel();
+        let (driver_tx, driver_rx) = tokio::sync::oneshot::channel();
+        endpoint_tx
+            .send(())
+            .expect("endpoint ack receiver remains live");
+        drop(driver_tx);
+
+        assert!(!wait_for_connection_release(endpoint_rx, driver_rx).await);
+    }
+}
+
+#[cfg(test)]
 mod rebind_authentication_tests {
     use super::authenticated_current_socket_generation;
 
@@ -1490,14 +1847,16 @@ mod rebind_authentication_tests {
 impl Drop for State {
     fn drop(&mut self) {
         self.abandon_and_detach_endpoint_pacing();
-        if !self.inner.is_drained() {
-            // Ensure the endpoint can tidy up
-            let _ = self
-                .endpoint_events
-                .send((
-                    self.handle,
-                    ConnectionToEndpointEvent::Proto(proto::EndpointEvent::drained()),
-                ));
+        if let Some(endpoint_released) = self.endpoint_released.take() {
+            // Ensure the endpoint can tidy up, and make exact removal observable
+            // even when the ordinary drained event was not forwarded.
+            let _ = self.endpoint_events.send((
+                self.handle,
+                ConnectionToEndpointEvent::Proto {
+                    event: proto::EndpointEvent::drained(),
+                    endpoint_released: Some(endpoint_released),
+                },
+            ));
         }
     }
 }
@@ -1808,6 +2167,7 @@ mod endpoint_pacing_driver_tests {
             timer_deadline: None,
             conn_events,
             endpoint_events,
+            endpoint_released: None,
             current_socket_rx_rebind_generation: 0,
             blocked_writers: Default::default(),
             blocked_readers: Default::default(),

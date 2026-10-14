@@ -99,6 +99,218 @@ impl ReplayHorizon {
     }
 }
 
+/// Complete recovery route whose elapsed time must fit inside one retained
+/// replay horizon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryPath {
+    Hard,
+    Reverse,
+}
+
+/// Checked inputs for the two complete recovery routes.
+///
+/// `ReplayHorizon::max_normal_ack_age` is the common prefix from the last
+/// positive application ACK to the point at which abnormal delay may begin.
+/// The two detection fields therefore measure only the additional delay after
+/// that normal allowance. Attach/install and replay-to-first-application-ACK
+/// are shared suffixes. This representation prevents an adapter from assigning
+/// the full retained horizon independently to each stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryStageBudgets {
+    /// Additional hard-failure detection time after the normal ACK allowance.
+    pub hard_liveness_after_normal_ack: Duration,
+    /// Additional reverse-path stall detection time after normal ACK allowance.
+    pub reverse_stall_after_normal_ack: Duration,
+    /// Time allowed to authenticate and accept a reverse-path switch hint.
+    pub authenticated_hint: Duration,
+    /// Time allowed to attach and install the replacement transport leg.
+    pub attach_install: Duration,
+    /// Time from replay start through the first positive application ACK.
+    pub replay_to_first_application_ack: Duration,
+}
+
+/// One retained replay horizon paired with explicitly named recovery stages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryBudgetSpec {
+    horizon: ReplayHorizon,
+    stages: RecoveryStageBudgets,
+}
+
+impl RecoveryBudgetSpec {
+    pub const fn new(horizon: ReplayHorizon, stages: RecoveryStageBudgets) -> Self {
+        Self { horizon, stages }
+    }
+
+    pub fn derive(self) -> Result<RecoveryBudget, RecoveryBudgetError> {
+        let normal_ack_age = self.horizon.max_normal_ack_age();
+        let hard_last_ack_to_signal = checked_recovery_path_sum(
+            RecoveryPath::Hard,
+            [normal_ack_age, self.stages.hard_liveness_after_normal_ack],
+        )?;
+        let hard_total = checked_recovery_path_sum(
+            RecoveryPath::Hard,
+            [
+                hard_last_ack_to_signal,
+                self.stages.attach_install,
+                self.stages.replay_to_first_application_ack,
+            ],
+        )?;
+        reject_path_over_horizon(RecoveryPath::Hard, hard_total, self.horizon.effective())?;
+
+        let reverse_last_ack_to_stall = checked_recovery_path_sum(
+            RecoveryPath::Reverse,
+            [normal_ack_age, self.stages.reverse_stall_after_normal_ack],
+        )?;
+        let reverse_total = checked_recovery_path_sum(
+            RecoveryPath::Reverse,
+            [
+                reverse_last_ack_to_stall,
+                self.stages.authenticated_hint,
+                self.stages.attach_install,
+                self.stages.replay_to_first_application_ack,
+            ],
+        )?;
+        reject_path_over_horizon(
+            RecoveryPath::Reverse,
+            reverse_total,
+            self.horizon.effective(),
+        )?;
+
+        Ok(RecoveryBudget {
+            horizon: self.horizon,
+            stages: self.stages,
+            hard_last_ack_to_signal,
+            reverse_last_ack_to_stall,
+            hard_total,
+            reverse_total,
+        })
+    }
+}
+
+/// Validated recovery timing policy and the authoritative replay horizon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryBudget {
+    horizon: ReplayHorizon,
+    stages: RecoveryStageBudgets,
+    hard_last_ack_to_signal: Duration,
+    reverse_last_ack_to_stall: Duration,
+    hard_total: Duration,
+    reverse_total: Duration,
+}
+
+impl RecoveryBudget {
+    pub const fn horizon(self) -> ReplayHorizon {
+        self.horizon
+    }
+
+    pub const fn retained_horizon(self) -> Duration {
+        self.horizon.effective()
+    }
+
+    pub const fn normal_application_ack_age(self) -> Duration {
+        self.horizon.max_normal_ack_age()
+    }
+
+    pub const fn hard_liveness_after_normal_ack(self) -> Duration {
+        self.stages.hard_liveness_after_normal_ack
+    }
+
+    pub const fn reverse_stall_after_normal_ack(self) -> Duration {
+        self.stages.reverse_stall_after_normal_ack
+    }
+
+    pub const fn authenticated_hint(self) -> Duration {
+        self.stages.authenticated_hint
+    }
+
+    pub const fn attach_install(self) -> Duration {
+        self.stages.attach_install
+    }
+
+    pub const fn replay_to_first_application_ack(self) -> Duration {
+        self.stages.replay_to_first_application_ack
+    }
+
+    pub const fn hard_last_ack_to_signal(self) -> Duration {
+        self.hard_last_ack_to_signal
+    }
+
+    pub const fn reverse_last_ack_to_stall(self) -> Duration {
+        self.reverse_last_ack_to_stall
+    }
+
+    pub const fn hard_total(self) -> Duration {
+        self.hard_total
+    }
+
+    pub const fn reverse_total(self) -> Duration {
+        self.reverse_total
+    }
+}
+
+fn checked_recovery_path_sum<const N: usize>(
+    path: RecoveryPath,
+    components: [Duration; N],
+) -> Result<Duration, RecoveryBudgetError> {
+    components
+        .into_iter()
+        .try_fold(Duration::ZERO, |total, component| {
+            total
+                .checked_add(component)
+                .ok_or(RecoveryBudgetError::PathDurationOverflow { path })
+        })
+}
+
+fn reject_path_over_horizon(
+    path: RecoveryPath,
+    total: Duration,
+    horizon: Duration,
+) -> Result<(), RecoveryBudgetError> {
+    if total > horizon {
+        return Err(RecoveryBudgetError::PathExceedsHorizon {
+            path,
+            total,
+            horizon,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryBudgetError {
+    PathDurationOverflow {
+        path: RecoveryPath,
+    },
+    PathExceedsHorizon {
+        path: RecoveryPath,
+        total: Duration,
+        horizon: Duration,
+    },
+}
+
+impl fmt::Display for RecoveryBudgetError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PathDurationOverflow { path } => {
+                write!(
+                    formatter,
+                    "{path:?} recovery path duration overflows Duration"
+                )
+            }
+            Self::PathExceedsHorizon {
+                path,
+                total,
+                horizon,
+            } => write!(
+                formatter,
+                "{path:?} recovery path {total:?} exceeds retained horizon {horizon:?}"
+            ),
+        }
+    }
+}
+
+impl Error for RecoveryBudgetError {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectionalByteLimits {
     client_to_target_bytes: u64,
@@ -129,6 +341,28 @@ impl ReplayCapacitySpec {
         blackout_budget: Duration,
         max_normal_ack_age: Duration,
     ) -> Result<Self, ReplayCapacityError> {
+        Self::with_horizon(
+            per_flow,
+            aggregate,
+            ReplayHorizon::new(blackout_budget, max_normal_ack_age)?,
+        )
+    }
+
+    /// Binds replay storage to the exact horizon already validated for both
+    /// complete recovery paths. No component is added again at this bridge.
+    pub fn from_recovery_budget(
+        per_flow: DirectionalRates,
+        aggregate: DirectionalRates,
+        recovery: RecoveryBudget,
+    ) -> Result<Self, ReplayCapacityError> {
+        Self::with_horizon(per_flow, aggregate, recovery.horizon())
+    }
+
+    fn with_horizon(
+        per_flow: DirectionalRates,
+        aggregate: DirectionalRates,
+        horizon: ReplayHorizon,
+    ) -> Result<Self, ReplayCapacityError> {
         if per_flow.client_to_target().get() > aggregate.client_to_target().get()
             || per_flow.target_to_client().get() > aggregate.target_to_client().get()
         {
@@ -140,7 +374,7 @@ impl ReplayCapacitySpec {
         Ok(Self {
             per_flow,
             aggregate,
-            horizon: ReplayHorizon::new(blackout_budget, max_normal_ack_age)?,
+            horizon,
         })
     }
 
@@ -237,6 +471,7 @@ impl ReplayCapacityPlan {
             "global",
         )?;
         Ok(ReplayStoragePlan {
+            horizon: self.horizon,
             geometry,
             per_flow,
             global,
@@ -386,12 +621,22 @@ impl DirectionalReplayStorageLimits {
 /// Checked byte, segment, backing, and copy/allocation characterization.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplayStoragePlan {
+    horizon: ReplayHorizon,
     geometry: ReplayStorageGeometry,
     per_flow: DirectionalReplayStorageLimits,
     global: DirectionalReplayStorageLimits,
 }
 
 impl ReplayStoragePlan {
+    /// Exact time horizon used to derive every byte and segment limit.
+    ///
+    /// Keeping this witness on the platform-sized storage plan lets the
+    /// production owner reject a timing/storage mismatch without re-deriving
+    /// or guessing the arithmetic inputs.
+    pub const fn horizon(self) -> ReplayHorizon {
+        self.horizon
+    }
+
     pub const fn geometry(self) -> ReplayStorageGeometry {
         self.geometry
     }
@@ -690,6 +935,154 @@ mod tests {
     fn symmetric_rates(mbit_per_second: u64) -> DirectionalRates {
         let rate = BitsPerSecond::new(mbit_per_second * 1_000_000).unwrap();
         DirectionalRates::symmetric(rate)
+    }
+
+    fn exact_500ms_recovery_stages() -> RecoveryStageBudgets {
+        RecoveryStageBudgets {
+            hard_liveness_after_normal_ack: Duration::from_millis(250),
+            reverse_stall_after_normal_ack: Duration::from_millis(100),
+            authenticated_hint: Duration::from_millis(150),
+            attach_install: Duration::from_millis(100),
+            replay_to_first_application_ack: Duration::from_millis(100),
+        }
+    }
+
+    #[test]
+    fn recovery_budget_accepts_exact_500ms_and_rejects_either_path_at_500ms_plus_1ns() {
+        let horizon =
+            ReplayHorizon::new(Duration::from_millis(450), Duration::from_millis(50)).unwrap();
+        let stages = exact_500ms_recovery_stages();
+        let exact = RecoveryBudgetSpec::new(horizon, stages).derive().unwrap();
+
+        assert_eq!(exact.retained_horizon(), Duration::from_millis(500));
+        assert_eq!(exact.hard_total(), Duration::from_millis(500));
+        assert_eq!(exact.reverse_total(), Duration::from_millis(500));
+
+        let hard_error = RecoveryBudgetSpec::new(
+            horizon,
+            RecoveryStageBudgets {
+                hard_liveness_after_normal_ack: stages.hard_liveness_after_normal_ack
+                    + Duration::from_nanos(1),
+                ..stages
+            },
+        )
+        .derive()
+        .unwrap_err();
+        assert_eq!(
+            hard_error,
+            RecoveryBudgetError::PathExceedsHorizon {
+                path: RecoveryPath::Hard,
+                total: Duration::from_millis(500) + Duration::from_nanos(1),
+                horizon: Duration::from_millis(500),
+            }
+        );
+
+        let reverse_error = RecoveryBudgetSpec::new(
+            horizon,
+            RecoveryStageBudgets {
+                authenticated_hint: stages.authenticated_hint + Duration::from_nanos(1),
+                ..stages
+            },
+        )
+        .derive()
+        .unwrap_err();
+        assert_eq!(
+            reverse_error,
+            RecoveryBudgetError::PathExceedsHorizon {
+                path: RecoveryPath::Reverse,
+                total: Duration::from_millis(500) + Duration::from_nanos(1),
+                horizon: Duration::from_millis(500),
+            }
+        );
+    }
+
+    #[test]
+    fn recovery_budget_rejects_checked_add_overflow_on_each_complete_path() {
+        let almost_maximum = ReplayHorizon::new(
+            Duration::from_nanos(1),
+            Duration::MAX - Duration::from_nanos(1),
+        )
+        .unwrap();
+        let hard_error = RecoveryBudgetSpec::new(
+            almost_maximum,
+            RecoveryStageBudgets {
+                hard_liveness_after_normal_ack: Duration::from_nanos(2),
+                reverse_stall_after_normal_ack: Duration::ZERO,
+                authenticated_hint: Duration::ZERO,
+                attach_install: Duration::ZERO,
+                replay_to_first_application_ack: Duration::ZERO,
+            },
+        )
+        .derive()
+        .unwrap_err();
+        assert_eq!(
+            hard_error,
+            RecoveryBudgetError::PathDurationOverflow {
+                path: RecoveryPath::Hard,
+            }
+        );
+
+        let reverse_error = RecoveryBudgetSpec::new(
+            almost_maximum,
+            RecoveryStageBudgets {
+                hard_liveness_after_normal_ack: Duration::ZERO,
+                reverse_stall_after_normal_ack: Duration::from_nanos(1),
+                authenticated_hint: Duration::from_nanos(1),
+                attach_install: Duration::ZERO,
+                replay_to_first_application_ack: Duration::ZERO,
+            },
+        )
+        .derive()
+        .unwrap_err();
+        assert_eq!(
+            reverse_error,
+            RecoveryBudgetError::PathDurationOverflow {
+                path: RecoveryPath::Reverse,
+            }
+        );
+    }
+
+    #[test]
+    fn recovery_budget_is_the_single_replay_horizon_and_admits_100_five_ms_quanta() {
+        let horizon =
+            ReplayHorizon::new(Duration::from_millis(450), Duration::from_millis(50)).unwrap();
+        let budget = RecoveryBudgetSpec::new(horizon, exact_500ms_recovery_stages())
+            .derive()
+            .unwrap();
+        assert_eq!(
+            budget.normal_application_ack_age(),
+            Duration::from_millis(50)
+        );
+        assert_eq!(budget.hard_last_ack_to_signal(), Duration::from_millis(300));
+        assert_eq!(
+            budget.reverse_last_ack_to_stall(),
+            Duration::from_millis(150)
+        );
+        assert_eq!(budget.hard_total(), Duration::from_millis(500));
+        assert_eq!(budget.reverse_total(), Duration::from_millis(500));
+        let replay = ReplayCapacitySpec::from_recovery_budget(
+            symmetric_rates(100),
+            symmetric_rates(100),
+            budget,
+        )
+        .unwrap()
+        .derive()
+        .unwrap();
+        let quantum_bytes = 62_500usize;
+        let storage = replay
+            .storage_plan(ReplayStorageGeometry::new(quantum_bytes, 1).unwrap())
+            .unwrap();
+
+        assert_eq!(replay.horizon(), horizon);
+        assert_eq!(storage.horizon(), budget.horizon());
+        assert_eq!(replay.per_flow().client_to_target_bytes(), 6_250_000);
+        assert_eq!(replay.per_flow().target_to_client_bytes(), 6_250_000);
+        assert_eq!(storage.per_flow().client_to_target().max_segments(), 100);
+        assert_eq!(storage.per_flow().target_to_client().max_segments(), 100);
+        assert_eq!(
+            replay.per_flow().client_to_target_bytes() as usize / quantum_bytes,
+            100
+        );
     }
 
     #[test]

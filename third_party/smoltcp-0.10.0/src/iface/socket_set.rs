@@ -137,6 +137,14 @@ impl<'a> SocketSet<'a> {
         self.items_mut().map(|i| (i.meta.handle, &mut i.socket))
     }
 
+    pub(crate) fn item(&self, handle: SocketHandle) -> Option<&Item<'a>> {
+        self.sockets.get(handle.0)?.inner.as_ref()
+    }
+
+    pub(crate) fn item_mut(&mut self, handle: SocketHandle) -> Option<&mut Item<'a>> {
+        self.sockets.get_mut(handle.0)?.inner.as_mut()
+    }
+
     /// Iterate every socket in this set.
     pub(crate) fn items(&self) -> impl Iterator<Item = &Item<'a>> + '_ {
         self.sockets.iter().filter_map(|x| x.inner.as_ref())

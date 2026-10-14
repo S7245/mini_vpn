@@ -69,21 +69,21 @@ pub use proto::{
     TokenReuseError, TokenStore, Transmit, TransportConfig, TransportErrorCode, UdpStats,
     ValidationTokenConfig, VarInt, VarIntBoundsExceeded, Written,
 };
-#[doc(hidden)]
-pub use proto::{SuccessorServiceTurnFailure, SuccessorServiceTurnStats};
 #[cfg(feature = "qlog")]
 pub use proto::{QlogConfig, QlogStream};
+#[doc(hidden)]
+pub use proto::{SuccessorServiceTurnFailure, SuccessorServiceTurnStats};
 #[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
 pub use rustls;
 pub use udp;
 
 pub use crate::connection::{
-    AcceptBi, AcceptUni, Connecting, Connection, OpenBi, OpenUni, ReadDatagram, SendDatagram,
-    SendDatagramError, ZeroRttAccepted,
+    AcceptBi, AcceptUni, Connecting, Connection, ConnectionDrain, OpenBi, OpenUni, ReadDatagram,
+    SendDatagram, SendDatagramError, ZeroRttAccepted,
 };
 #[doc(hidden)]
-pub use crate::connection::SuccessorServiceTurnError;
-pub use crate::endpoint::{Accept, Endpoint, EndpointStats};
+pub use crate::connection::{BiStreamRetirement, SendStreamRetirement, SuccessorServiceTurnError};
+pub use crate::endpoint::{Accept, Endpoint, EndpointDriverDrain, EndpointStats};
 pub use crate::incoming::{Incoming, IncomingFuture, RetryError};
 pub use crate::recv_stream::{
     ReadError, ReadExactError, ReadToEndError, RecvStream, RecvStreamProgress, ResetError,
@@ -115,7 +115,10 @@ enum ConnectionEvent {
 
 #[derive(Debug)]
 enum ConnectionToEndpointEvent {
-    Proto(proto::EndpointEvent),
+    Proto {
+        event: proto::EndpointEvent,
+        endpoint_released: Option<tokio::sync::oneshot::Sender<()>>,
+    },
     AuthenticatedCurrentSocketRx(u64),
 }
 

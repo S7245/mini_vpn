@@ -2,8 +2,9 @@
 
 Date: 2026-08-18
 
-Status: **TASK 4 R1–R5 FOUNDATION ACCEPTED LOCALLY; R6 NEXT;
-TASK 4 NOT PASS; M3 BLOCKED**
+Status: **TASK 4 R1–R5 FOUNDATION AND R6A–D NECESSARY LOCAL SLICES ACCEPTED;
+R7A–D AND R8–R9 OPEN; TASK 4 NOT PASS; PRODUCTION TUN/WAN/M2 NOT RUN; M3
+BLOCKED**
 
 ## Goal
 
@@ -66,10 +67,54 @@ entry still selects the legacy adapter.
 Task 4 R1–R5 now add the production-shared codec/seal, exact attach
 transaction, single-owner supervisor, `TargetIo`, bounded one-event wire
 scheduler, category-owned work budget, and one complete byte-level baseline.
-R6–R9 must still supply the real standby/control/switch path and deterministic
-failure acceptance before any production/WAN claim. Results:
+R6d now additionally supplies checked aggregate recovery capacity and the
+production-shared composition root/nursery. The remaining R7–R9 work must
+still supply the authenticated reverse-only switch/fault matrix and
+deterministic failure acceptance before any end-to-end production/WAN claim.
+Results:
 `docs/tech/2026-08-18-knife16-owned-upstream-local-results.md` and
 `docs/tech/2026-08-18-knife16-two-leg-foundation-local-results.md`.
+
+R6a–c now also have production-shared necessary seams for exact actor/controller
+incarnation composition, retired-A structural join/clear, bounded raw inbound,
+and spontaneous current-terminal propagation before physical close-tail
+completion. The accepted post-loss transaction now installs ordinary
+registered B after real A loss, sends non-empty replay through B, requires the
+existing Target and owner reducer to produce the first positive application
+ACK, and clears only exact terminal-bound joined A. These seams preserve one
+logical loss and exact replay/cleanup authority under fatal, policy, shutdown,
+and caller-cancellation races.
+
+R6b additionally binds exact physical/correlation probe authority to positive
+ordered Quinn writer completion, enforces receive-time deadlines, and shares
+one first-failure transaction across silent expiry, spontaneous close, and
+shutdown. R6c then locks down all three late-record routes: retired physical A
+is inert regardless of claimed generation, owner-B/client-A fails exact
+generation validation, and current physical B carrying A generation is
+rejected. Equal A/B DELIVERED ordinals stay actor-private, and only the
+Target-backed B application ACK releases replay and completes recovery. No
+production runtime behavior was changed for R6c because the existing shared
+contracts already satisfied the matrix. Results:
+`docs/tech/2026-08-25-knife16-r6b-silent-probe-arbitration-local-results.md`
+and
+`docs/tech/2026-08-25-knife16-r6c-late-record-closure-local-results.md`.
+
+R6d closes the two remaining R6 prerequisites locally: exact hard/reverse
+recovery paths share one checked `<=500ms` horizon, and one bounded
+production-shared root owns real Quinn composition, prepared TCP Open,
+nonpolling fair progress, lifecycle-linearized shutdown, semantic/transport
+drain, and an exact session-inclusive zero witness. Final lifecycle review
+also closes the shutdown-CAS/watch-publication gap and returns an already
+selected command without commit when shutdown wins. Result:
+`docs/tech/2026-08-25-knife16-r6d-recovery-capacity-production-root-local-results.md`.
+
+These are necessary-only local results. R7 is next: reverse-only failure must
+not use a local fault oracle, and authenticated hints, rejection, and the
+hard-failure/local-stall/hint trigger race remain open. R7 deadline or
+combined-horizon acceptance also requires an actor-captured, same-clock
+arrival timestamp preserved from transport-read admission through
+queue/publication; the current publication epoch proves ordering only. R8–R9,
+UDP, real TUN, owner/server, WAN, throughput, and M2 remain open and unrun.
 
 ## Protocol identity and security
 
@@ -332,12 +377,13 @@ Detailed result:
 
 ## Design score
 
-The currently implemented architecture is **8/10**. The fixed core, deep
-adapter, and reviewed R1–R5 production-shared foundation put byte ownership at
-the resumable boundary, isolate leg pressure, and make local work explicitly
-bounded. Task 4 reaches **9/10** only after R6–R9 prove standby registration,
-genuine liveness, authenticated switch authority, stale-leg retirement, the
-fault matrix, and real-smoltcp parity through the same seams. It reaches
+The currently implemented necessary-only architecture is **8.5/10**. The
+fixed core, deep adapter, reviewed R1–R6d production-shared root, checked
+capacity, exact byte ownership, bounded progress, and lifecycle cleanup put
+the local session boundary behind one deep seam. Task 4 reaches **9/10** only
+after R7–R9 prove reverse-only no-oracle behavior, authenticated switch
+authority, the fault matrix, and real-smoltcp replacement parity through that
+same root. It reaches
 **10/10** only after Task 5 UDP, Task 6 real owner/socket adapters, Task 7
 real-socket capacity, Task 8 security, Task 9 independent-path WAN, and Task 10
 long macOS acceptance pass.

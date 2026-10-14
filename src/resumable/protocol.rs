@@ -1,10 +1,10 @@
+mod cold_inventory;
 use crate::shared::TargetAddr;
 use bytes::{BufMut, Bytes, BytesMut};
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::num::NonZeroU64;
 use thiserror::Error;
-
 const MAGIC: [u8; 4] = *b"MVPN";
 const DATA_FIXED_BODY_BYTES: usize = 8 + 8 + 1 + 8;
 const ATTACH_FIXED_BODY_BYTES: usize = 8 + 16 + 16 + 2 + 2 + 8 + 8 + 32;
@@ -57,6 +57,11 @@ pub const STANDBY_CONTROL_V1: FeatureSet = FeatureSet::new(0x10);
 /// Hard wire-defense ceiling for one DATA record. Replay ownership limits are
 /// injected policy and are deliberately separate from this framing limit.
 pub const MAX_DATA_PAYLOAD_BYTES: usize = 64 * 1024;
+/// Largest complete encoded DATA frame accepted by the protocol codec.
+/// Transport frame limits must include both the protocol envelope and DATA's
+/// fixed routing fields rather than reusing the payload-only ceiling.
+pub const MAX_ENCODED_DATA_FRAME_BYTES: usize =
+    FRAME_HEADER_BYTES + DATA_FIXED_BODY_BYTES + MAX_DATA_PAYLOAD_BYTES;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionId([u8; 16]);
@@ -992,6 +997,42 @@ impl Frame {
         &self.record
     }
 
+    /// Returns the exact wire length after applying the same semantic and
+    /// framing validation as [`Self::encode`], without allocating an encoded
+    /// frame or temporary Target representation.
+    pub fn encoded_len_checked(&self) -> Result<usize, ProtocolError> {
+        // Internal reducers may use the unchecked constructor after their own
+        // preflight. Keep this audit fail-closed exactly like serialization.
+        validate_record(&self.record)?;
+        let (record_type, body_len) = match &self.record {
+            Record::Attach { .. } => (RECORD_ATTACH, ATTACH_FIXED_BODY_BYTES),
+            Record::AttachAccepted { .. } => {
+                (RECORD_ATTACH_ACCEPTED, ATTACH_ACCEPTED_FIXED_BODY_BYTES)
+            }
+            Record::AttachGenerationStatus { .. } => (
+                RECORD_ATTACH_GENERATION_STATUS,
+                ATTACH_GENERATION_STATUS_FIXED_BODY_BYTES,
+            ),
+            Record::Open { target, .. } => {
+                let body_len = OPEN_PREFIX_BODY_BYTES
+                    .checked_add(encoded_target_len(target))
+                    .ok_or(ProtocolError::FrameTooLarge)?;
+                (RECORD_OPEN, body_len)
+            }
+            Record::Data { payload, .. } => {
+                let body_len = DATA_FIXED_BODY_BYTES
+                    .checked_add(payload.len())
+                    .ok_or(ProtocolError::FrameTooLarge)?;
+                (RECORD_DATA, body_len)
+            }
+            Record::OpenResult { .. } => (RECORD_OPEN_RESULT, OPEN_RESULT_FIXED_BODY_BYTES),
+            Record::Ack { .. } => (RECORD_ACK, ACK_FIXED_BODY_BYTES),
+            Record::Close { .. } => (RECORD_CLOSE, CLOSE_FIXED_BODY_BYTES),
+            Record::Reset { .. } => (RECORD_RESET, RESET_FIXED_BODY_BYTES),
+        };
+        checked_encoded_frame_len(record_type, body_len)
+    }
+
     pub fn encode(&self) -> Result<Bytes, ProtocolError> {
         // Internal reducers may use the unchecked constructor after their own
         // preflight. Revalidate here so serialization remains fail-closed.
@@ -1188,7 +1229,7 @@ fn encode_header(
     record_type: u8,
     body_len: usize,
 ) -> Result<(), ProtocolError> {
-    validate_declared_body_len(record_type, body_len)?;
+    let _ = checked_encoded_frame_len(record_type, body_len)?;
     let body_len = u32::try_from(body_len).map_err(|_| ProtocolError::FrameTooLarge)?;
     encoded.extend_from_slice(&MAGIC);
     encoded.put_u16(FRAME_PROTOCOL_VERSION);
@@ -1196,6 +1237,14 @@ fn encode_header(
     encoded.put_u8(0);
     encoded.put_u32(body_len);
     Ok(())
+}
+
+fn checked_encoded_frame_len(record_type: u8, body_len: usize) -> Result<usize, ProtocolError> {
+    validate_declared_body_len(record_type, body_len)?;
+    let _ = u32::try_from(body_len).map_err(|_| ProtocolError::FrameTooLarge)?;
+    FRAME_HEADER_BYTES
+        .checked_add(body_len)
+        .ok_or(ProtocolError::FrameTooLarge)
 }
 
 fn validate_declared_body_len(record_type: u8, body_len: usize) -> Result<(), ProtocolError> {
@@ -1378,7 +1427,13 @@ fn normalize_record_ownership(record: Record) -> Record {
     }
 }
 
-fn validate_target(target: &TargetAddr) -> Result<(), ProtocolError> {
+/// Validates a borrowed Target before a caller performs any ownership copy.
+///
+/// The session reducer uses this narrow seam to reject an oversized caller
+/// allocation while it can still return that exact allocation to the command
+/// owner. Construction through [`Frame::try_new`] remains the authoritative
+/// normalization boundary.
+pub(super) fn validate_target(target: &TargetAddr) -> Result<(), ProtocolError> {
     match target {
         TargetAddr::IpPort(SocketAddr::V4(address)) => validate_target_port(address.port()),
         TargetAddr::IpPort(SocketAddr::V6(address)) => {
@@ -1405,6 +1460,23 @@ fn validate_target(target: &TargetAddr) -> Result<(), ProtocolError> {
     }
 }
 
+/// Returns exact-sized Target ownership for a bounded asynchronous command
+/// while leaving the caller's original allocation untouched. This is used by
+/// the production root so a failed command can return the exact input even if
+/// the task accepted and later lost its reply channel.
+pub(crate) fn normalize_target_for_owned_command(
+    target: &TargetAddr,
+) -> Result<TargetAddr, ProtocolError> {
+    validate_target(target)?;
+    Ok(match target {
+        TargetAddr::IpPort(address) => TargetAddr::IpPort(*address),
+        TargetAddr::DomainPort { host, port } => TargetAddr::DomainPort {
+            host: Box::<str>::from(host.as_str()).into_string(),
+            port: *port,
+        },
+    })
+}
+
 fn encode_target(target: &TargetAddr) -> Result<Bytes, ProtocolError> {
     validate_target(target)?;
     let mut encoded = BytesMut::new();
@@ -1428,6 +1500,14 @@ fn encode_target(target: &TargetAddr) -> Result<Bytes, ProtocolError> {
         }
     }
     Ok(encoded.freeze())
+}
+
+fn encoded_target_len(target: &TargetAddr) -> usize {
+    match target {
+        TargetAddr::IpPort(SocketAddr::V4(_)) => 1 + 2 + 4,
+        TargetAddr::IpPort(SocketAddr::V6(_)) => 1 + 2 + 16,
+        TargetAddr::DomainPort { host, .. } => 1 + 2 + 1 + host.len(),
+    }
 }
 
 fn decode_open(body: Bytes) -> Result<Frame, ProtocolError> {
@@ -1905,148 +1985,8 @@ pub enum ProtocolError {
 }
 
 #[cfg(test)]
-mod standby_control_tests {
-    use super::*;
-
-    #[test]
-    fn attach_accepted_capacity_constant_matches_the_codec() {
-        let frame = Frame::try_new(
-            LegGeneration::new(2).unwrap(),
-            Record::AttachAccepted {
-                session_id: SessionId::new([0x11; 16]).unwrap(),
-                nonce: AttachNonce::new([0x22; 16]).unwrap(),
-                selected_version: SESSION_PROTOCOL_VERSION,
-                features: FeatureSet::new(0b1111),
-            },
-        )
-        .unwrap();
-        assert_eq!(frame.encode().unwrap().len(), ATTACH_ACCEPTED_ENCODED_BYTES);
-    }
-
-    #[test]
-    fn standby_register_round_trips_through_the_feature_gated_classifier() {
-        let negotiated = FeatureSet::STANDBY_CONTROL_V1;
-        let frame = LegControlFrame::try_new(
-            LegGeneration::new(2).unwrap(),
-            LegControlRecord::StandbyRegister {
-                session_id: SessionId::new([0x11; 16]).unwrap(),
-                standby_nonce: StandbyNonce::new([0x33; 16]).unwrap(),
-                selected_version: SESSION_PROTOCOL_VERSION,
-                features: negotiated,
-                proof: StandbyProof::new([0x44; 32]).unwrap(),
-            },
-            negotiated,
-        )
-        .unwrap();
-
-        let encoded = frame.encode(negotiated).unwrap();
-        assert_eq!(encoded.len(), 94);
-        assert_eq!(encoded[6], 0x0a);
-        assert_eq!(u32::from_be_bytes(encoded[8..12].try_into().unwrap()), 82);
-        assert_eq!(
-            DecodedFrame::decode_exact(&encoded, negotiated).unwrap(),
-            DecodedFrame::LegControl(frame)
-        );
-    }
-
-    #[test]
-    fn standby_accepted_round_trips_with_the_exact_registered_contract() {
-        let negotiated = FeatureSet::STANDBY_CONTROL_V1;
-        let frame = LegControlFrame::try_new(
-            LegGeneration::new(2).unwrap(),
-            LegControlRecord::StandbyAccepted {
-                session_id: SessionId::new([0x11; 16]).unwrap(),
-                standby_nonce: StandbyNonce::new([0x33; 16]).unwrap(),
-                selected_version: SESSION_PROTOCOL_VERSION,
-                features: negotiated,
-            },
-            negotiated,
-        )
-        .unwrap();
-
-        let encoded = frame.encode(negotiated).unwrap();
-        assert_eq!(encoded.len(), 62);
-        assert_eq!(encoded[6], 0x0b);
-        assert_eq!(u32::from_be_bytes(encoded[8..12].try_into().unwrap()), 50);
-        assert_eq!(
-            DecodedFrame::decode_exact(&encoded, negotiated).unwrap(),
-            DecodedFrame::LegControl(frame)
-        );
-    }
-
-    #[test]
-    fn leg_probe_round_trips_with_nonzero_epoch_and_sequence() {
-        let negotiated = FeatureSet::STANDBY_CONTROL_V1;
-        let frame = LegControlFrame::try_new(
-            LegGeneration::new(2).unwrap(),
-            LegControlRecord::LegProbe {
-                session_id: SessionId::new([0x11; 16]).unwrap(),
-                leg_epoch_nonce: LegEpochNonce::new([0x77; 16]).unwrap(),
-                probe_sequence: ProbeSequence::new(9).unwrap(),
-            },
-            negotiated,
-        )
-        .unwrap();
-
-        let encoded = frame.encode(negotiated).unwrap();
-        assert_eq!(encoded.len(), 60);
-        assert_eq!(encoded[6], 0x0c);
-        assert_eq!(u32::from_be_bytes(encoded[8..12].try_into().unwrap()), 48);
-        assert_eq!(
-            DecodedFrame::decode_exact(&encoded, negotiated).unwrap(),
-            DecodedFrame::LegControl(frame)
-        );
-    }
-
-    #[test]
-    fn leg_probe_ack_round_trips_the_exact_probe_correlation() {
-        let negotiated = FeatureSet::STANDBY_CONTROL_V1;
-        let frame = LegControlFrame::try_new(
-            LegGeneration::new(2).unwrap(),
-            LegControlRecord::LegProbeAck {
-                session_id: SessionId::new([0x11; 16]).unwrap(),
-                leg_epoch_nonce: LegEpochNonce::new([0x77; 16]).unwrap(),
-                probe_sequence: ProbeSequence::new(9).unwrap(),
-            },
-            negotiated,
-        )
-        .unwrap();
-
-        let encoded = frame.encode(negotiated).unwrap();
-        assert_eq!(encoded.len(), 60);
-        assert_eq!(encoded[6], 0x0d);
-        assert_eq!(u32::from_be_bytes(encoded[8..12].try_into().unwrap()), 48);
-        assert_eq!(
-            DecodedFrame::decode_exact(&encoded, negotiated).unwrap(),
-            DecodedFrame::LegControl(frame)
-        );
-    }
-
-    #[test]
-    fn switch_hint_round_trips_the_closed_reverse_stall_evidence() {
-        let negotiated = FeatureSet::STANDBY_CONTROL_V1;
-        let frame = LegControlFrame::try_new(
-            LegGeneration::new(2).unwrap(),
-            LegControlRecord::SwitchHint {
-                session_id: SessionId::new([0x11; 16]).unwrap(),
-                standby_nonce: StandbyNonce::new([0x33; 16]).unwrap(),
-                hint_sequence: HintSequence::new(5).unwrap(),
-                flow_id: SessionFlowId::new(7).unwrap(),
-                direction: Direction::TargetToClient,
-                oldest_unacknowledged: ByteOffset::new(1024),
-                cause: SwitchHintCause::ReverseApplicationAckStall,
-            },
-            negotiated,
-        )
-        .unwrap();
-
-        let encoded = frame.encode(negotiated).unwrap();
-        assert_eq!(encoded.len(), 79);
-        assert_eq!(encoded[6], 0x0e);
-        assert_eq!(u32::from_be_bytes(encoded[8..12].try_into().unwrap()), 67);
-        assert_eq!(
-            DecodedFrame::decode_exact(&encoded, negotiated).unwrap(),
-            DecodedFrame::LegControl(frame)
-        );
-    }
-}
+// This source is also compiled through an explicit `#[path]` by the ownership
+// provenance target. Keep the external test body location unambiguous in both
+// the library module tree and that standalone source-compilation tree.
+#[path = "protocol/tests/mod.rs"]
+mod tests;

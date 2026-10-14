@@ -4,11 +4,21 @@
 //! legacy TUIC/REALITY relay implementations and the resumable session owned
 //! data plane.  Transport legs and replay mechanics stay behind this facade.
 
+pub(crate) mod client_controller;
 pub(crate) mod leg;
 pub(crate) mod leg_io;
 mod legacy;
+pub(crate) mod owner_output_drain;
+mod owner_ready;
+pub(crate) mod owner_session_capacity;
+pub(crate) mod owner_session_controller;
 pub(crate) mod owner_target;
+pub(crate) mod quinn_client_root;
+pub(crate) mod quinn_leg_actor;
+pub(crate) mod quinn_leg_composition;
+pub(crate) mod reverse_switch;
 pub(crate) mod session;
+pub(crate) mod session_clock;
 pub(crate) mod standby;
 pub(crate) mod supervisor;
 pub(crate) mod target;
@@ -55,6 +65,13 @@ pub enum TcpOwnershipMode {
 /// Transport-independent upstream facade selected by the TUN data plane.
 #[async_trait::async_trait]
 pub trait OwnedUpstream: Send + Sync {
+    fn staged_tcp_open(
+        self: std::sync::Arc<Self>,
+        _request: crate::upstream::TcpOpenRequest,
+    ) -> crate::upstream::StagedTcpOpen<OpenedOwnedTcp> {
+        Err(crate::upstream::TcpOpenUnavailable::Unsupported)
+    }
+
     async fn open_tcp_flow(&self, target: &TargetAddr) -> Result<OpenedOwnedTcp, ClientError>;
 
     async fn send_udp(&self, uplink: UdpUplink<'_>);
@@ -81,3 +98,5 @@ pub trait OwnedUpstream: Send + Sync {
         0
     }
 }
+
+pub(crate) use udp::generation;

@@ -12,6 +12,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
+use crate::owned_upstream::client_controller::{
+    ClientControllerDriverApply, ClientInboundDisposition, ClientSessionController,
+};
 use crate::owned_upstream::leg::{AttachedLeg, LegBoundFrame, PendingInitialAttach};
 use crate::owned_upstream::leg_io::{
     AwaitingInitialAttach, EncodedLegTransport, EncodedLegTransportError, LegIoError,
@@ -20,7 +23,9 @@ use crate::owned_upstream::leg_io::{
 use crate::owned_upstream::owner_target::{
     OwnerTargetConfig, OwnerTargetExecutor, OwnerTargetOutput, OwnerTargetResume,
 };
-use crate::owned_upstream::session::SessionOwnerCommand;
+use crate::owned_upstream::reverse_switch::{
+    OwnerProgressCapacity, OwnerProgressCapacityError, owner_reverse_scan_turns,
+};
 use crate::owned_upstream::supervisor::{PendingOwnerBootstrap, SessionSupervisor};
 use crate::owned_upstream::target::{MemoryTarget, MemoryTargetConfig, MemoryWriteDirective};
 use crate::owned_upstream::tcp::{
@@ -35,15 +40,27 @@ use crate::owned_upstream::two_leg::{
 };
 use crate::resumable::{
     AttachAlpn, AttachAuthority, AttachCredentials, AttachNonce, AttachPolicy, AttachRequest,
-    AttachTransportBinding, DevicePrincipal, DeviceSecret, Direction, FeatureOffer,
+    AttachTransportBinding, DevicePrincipal, DeviceSecret, Direction, FeatureOffer, FeatureSet,
     FlowFinishReason, Frame, LegGeneration, OpenResultCode, OwnerIdentity, ReceiveBudgetLimits,
-    Record, ReplayBudgetLimits, ResumeSecret, SESSION_PROTOCOL_VERSION, SessionConfig,
-    SessionEffect, SessionEvent, SessionFlowId, SessionId, TcpWindowLimits, TerminalGrace,
-    TlsExporterBinding, VersionRange,
+    Record, ReplayBudgetLimits, ReplayStorageLimit, ReplayStoragePlan, ResumeSecret,
+    SESSION_PROTOCOL_VERSION, SessionConfig, SessionEffect, SessionEvent, SessionFlowId, SessionId,
+    SessionRole, TcpWindowLimits, TerminalGrace, TlsExporterBinding, VersionRange,
 };
 use crate::shared::TargetAddr;
 
 const MEMORY_LINK_DELAY: Duration = Duration::from_nanos(1);
+
+/// Compile-time seal for the deterministic legacy harness's raw owner
+/// bootstrap decomposition. This test-only module is the sole minter.
+pub(super) struct LegacyOwnerBootstrapDecompositionGate {
+    _private: (),
+}
+
+impl LegacyOwnerBootstrapDecompositionGate {
+    fn mint() -> Self {
+        Self { _private: () }
+    }
+}
 
 #[allow(
     clippy::large_enum_variant,
@@ -57,6 +74,7 @@ enum HarnessAction {
     StartAttach(PendingInitialAttach),
     OwnerBound(LegBoundFrame),
     ClientBound(LegBoundFrame),
+    ClientDelivery(EncodedDelivery),
     StartOpen,
     SendClientData(Bytes),
     RetryOwnerWrite,
@@ -186,7 +204,7 @@ impl ScheduledEncodedSender<'_> {
         now: SimTime,
         route: WireRoute,
         lane: WireLane,
-        bytes: Vec<u8>,
+        bytes: Bytes,
         completion: Option<OrderedDeliveryToken>,
     ) -> Result<(), EncodedLegTransportError> {
         let ordinal = self.harness.next_send_ordinal;
@@ -260,7 +278,7 @@ impl EncodedLegTransport for ScheduledEncodedSender<'_> {
         now: SimTime,
         route: WireRoute,
         lane: WireLane,
-        bytes: Vec<u8>,
+        bytes: Bytes,
     ) -> Result<(), EncodedLegTransportError> {
         self.schedule_encoded(now, route, lane, bytes, None)
     }
@@ -270,7 +288,7 @@ impl EncodedLegTransport for ScheduledEncodedSender<'_> {
         now: SimTime,
         route: WireRoute,
         lane: WireLane,
-        bytes: Vec<u8>,
+        bytes: Bytes,
         completion: OrderedDeliveryToken,
     ) -> Result<(), EncodedLegTransportError> {
         self.schedule_encoded(now, route, lane, bytes, Some(completion))
@@ -305,6 +323,1343 @@ const OWNER_TIMER: ActorId = ActorId::new(15);
 const TERMINAL_GRACE_DELAY: Duration = Duration::from_nanos(32);
 const CLIENT_BYTES: &[u8] = b"client-production-bytes";
 const OWNER_BYTES: &[u8] = b"owner-production-bytes";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum R7CapacityError {
+    ZeroMaxFlows,
+    ZeroCompletedScanEpisodes,
+    ZeroFlowEpisodes,
+    ZeroProbeEpisodes,
+    ZeroTerminalTombstones,
+    OwnerProgressCapacity(OwnerProgressCapacityError),
+    ScanAttemptsOverflow,
+    ScanAttemptTurnsOverflow {
+        turns_per_attempt: usize,
+        max_attempts: usize,
+    },
+    DataCapacity(CapacityError),
+    ApplicationAckMessagesOverflow,
+    ApplicationAckBytesOverflow,
+    WireMessagesOverflow,
+    WireBytesOverflow,
+    FixedWireRowBytesOverflow {
+        kind: R7FixedWireKind,
+    },
+    FixedWireMessagesOverflow,
+    FixedWireBytesOverflow,
+    ReplacementRecoveryMessagesOverflow {
+        kind: R7FixedWireKind,
+    },
+    WirePlatformCapacityOverflow,
+    LiveByteCapacityOverflow,
+    ReplayLiveByteCapacityOverflow,
+    ReplayLiveByteCapacityTooSmall {
+        required: usize,
+        actual: usize,
+    },
+    SessionConfigDerivationFailed {
+        role: SessionRole,
+    },
+    SessionConfigNotDerivedFromReplayStorage {
+        role: SessionRole,
+    },
+    SessionTerminalTombstoneCapacityMismatch {
+        client: usize,
+        owner: usize,
+    },
+    HistoricalByteCapacityOverflow,
+    FlowTerminalMessagesOverflow {
+        max_flow_episodes: usize,
+    },
+}
+
+/// Checked reverse-scan work over typed live-plus-terminal progress capacity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct R7OwnerScanCapacity {
+    direction_entries: usize,
+    turns_per_attempt: usize,
+    max_attempts: usize,
+    max_turns: usize,
+}
+
+impl R7OwnerScanCapacity {
+    fn derive(
+        progress_capacity: OwnerProgressCapacity,
+        episodes: R7ScenarioEpisodeBounds,
+    ) -> Result<Self, R7CapacityError> {
+        let direction_entries = progress_capacity.max_entries();
+        if direction_entries == 0 {
+            return Err(R7CapacityError::ZeroMaxFlows);
+        }
+        if episodes.owner_scans == 0 {
+            return Err(R7CapacityError::ZeroCompletedScanEpisodes);
+        }
+        let max_attempts = episodes
+            .owner_scans
+            .checked_add(episodes.owner_scan_revision_resets)
+            .ok_or(R7CapacityError::ScanAttemptsOverflow)?;
+        let turns_per_attempt = owner_reverse_scan_turns(direction_entries);
+        let max_turns = turns_per_attempt.checked_mul(max_attempts).ok_or(
+            R7CapacityError::ScanAttemptTurnsOverflow {
+                turns_per_attempt,
+                max_attempts,
+            },
+        )?;
+        Ok(Self {
+            direction_entries,
+            turns_per_attempt,
+            max_attempts,
+            max_turns,
+        })
+    }
+}
+
+/// Independent cumulative work bounds for one finite physical scenario.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct R7ScenarioEpisodeBounds {
+    owner_scans: usize,
+    owner_scan_revision_resets: usize,
+    flow_lifecycles: usize,
+    probe_rounds: usize,
+}
+
+impl R7ScenarioEpisodeBounds {
+    const fn new(owner_scans: usize, flow_lifecycles: usize, probe_rounds: usize) -> Self {
+        Self {
+            owner_scans,
+            owner_scan_revision_resets: 0,
+            flow_lifecycles,
+            probe_rounds,
+        }
+    }
+
+    const fn with_owner_scan_revision_resets(mut self, max_revision_resets: usize) -> Self {
+        self.owner_scan_revision_resets = max_revision_resets;
+        self
+    }
+}
+
+const R7_DATA_FRAME_OVERHEAD_BYTES: usize = 37;
+
+/// Named, non-DATA wire work required by one complete R7 physical scenario.
+///
+/// Each row is global to the scenario. DATA replay is separately derived from
+/// the exact replay-storage plan; fixed rows are encoded once per declared
+/// message and may only be duplicated by the bounded wire injector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum R7FixedWireKind {
+    InitialAttach,
+    InitialAttachAccepted,
+    Open,
+    OpenResult,
+    StandbyRegistration,
+    StandbyRegistrationAccepted,
+    CurrentAProbe,
+    CurrentAProbeAck,
+    StandbyBProbe,
+    StandbyBProbeAck,
+    SwitchHint,
+    ReplacementAttach,
+    ReplacementAttachAccepted,
+    GenerationStatus,
+    StatusFollowUpAttach,
+    FirstBApplicationAck,
+    Terminal,
+    ReplacementRecoveryTombstone,
+    ReplacementRecoveryOpen,
+    ReplacementRecoveryOpenResult,
+    ReplacementRecoveryAck,
+    ReplacementRecoveryClose,
+}
+
+impl R7FixedWireKind {
+    const COUNT: usize = 22;
+
+    const ALL: [Self; Self::COUNT] = [
+        Self::InitialAttach,
+        Self::InitialAttachAccepted,
+        Self::Open,
+        Self::OpenResult,
+        Self::StandbyRegistration,
+        Self::StandbyRegistrationAccepted,
+        Self::CurrentAProbe,
+        Self::CurrentAProbeAck,
+        Self::StandbyBProbe,
+        Self::StandbyBProbeAck,
+        Self::SwitchHint,
+        Self::ReplacementAttach,
+        Self::ReplacementAttachAccepted,
+        Self::GenerationStatus,
+        Self::StatusFollowUpAttach,
+        Self::FirstBApplicationAck,
+        Self::Terminal,
+        Self::ReplacementRecoveryTombstone,
+        Self::ReplacementRecoveryOpen,
+        Self::ReplacementRecoveryOpenResult,
+        Self::ReplacementRecoveryAck,
+        Self::ReplacementRecoveryClose,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct R7FixedWireRow {
+    kind: R7FixedWireKind,
+    max_messages: usize,
+    encoded_bytes_per_message: usize,
+}
+
+impl R7FixedWireRow {
+    const fn new(
+        kind: R7FixedWireKind,
+        max_messages: usize,
+        encoded_bytes_per_message: usize,
+    ) -> Self {
+        Self {
+            kind,
+            max_messages,
+            encoded_bytes_per_message,
+        }
+    }
+
+    fn encoded_bytes(self) -> Result<usize, R7CapacityError> {
+        self.max_messages
+            .checked_mul(self.encoded_bytes_per_message)
+            .ok_or(R7CapacityError::FixedWireRowBytesOverflow { kind: self.kind })
+    }
+}
+
+/// Non-DATA records that the two role-local reducers can replay after one or
+/// more declared replacement recoveries.
+///
+/// DATA uses the directional replay-storage segment limits. These controls are
+/// independently additive: each endpoint can retain every configured terminal
+/// tombstone, while the client and owner each retain one role-specific
+/// OPEN/OPEN_RESULT plus ACK/CLOSE control per live flow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct R7ReplacementRecoveryWireCapacity {
+    tombstone_messages: usize,
+    open_messages: usize,
+    open_result_messages: usize,
+    ack_messages: usize,
+    close_messages: usize,
+}
+
+impl R7ReplacementRecoveryWireCapacity {
+    const ZERO: Self = Self {
+        tombstone_messages: 0,
+        open_messages: 0,
+        open_result_messages: 0,
+        ack_messages: 0,
+        close_messages: 0,
+    };
+
+    fn derive(
+        sessions: R7SessionCapacityWitness,
+        replacement_recoveries: u8,
+    ) -> Result<Self, R7CapacityError> {
+        let recoveries = usize::from(replacement_recoveries);
+        let both_tombstones = sessions
+            .client
+            .max_terminal_tombstones()
+            .checked_add(sessions.owner.max_terminal_tombstones())
+            .ok_or(R7CapacityError::ReplacementRecoveryMessagesOverflow {
+                kind: R7FixedWireKind::ReplacementRecoveryTombstone,
+            })?;
+        let both_flows = sessions
+            .client
+            .max_flows()
+            .checked_add(sessions.owner.max_flows())
+            .ok_or(R7CapacityError::ReplacementRecoveryMessagesOverflow {
+                kind: R7FixedWireKind::ReplacementRecoveryAck,
+            })?;
+        Ok(Self {
+            tombstone_messages: Self::repeat(
+                both_tombstones,
+                recoveries,
+                R7FixedWireKind::ReplacementRecoveryTombstone,
+            )?,
+            open_messages: Self::repeat(
+                sessions.client.max_flows(),
+                recoveries,
+                R7FixedWireKind::ReplacementRecoveryOpen,
+            )?,
+            open_result_messages: Self::repeat(
+                sessions.owner.max_flows(),
+                recoveries,
+                R7FixedWireKind::ReplacementRecoveryOpenResult,
+            )?,
+            ack_messages: Self::repeat(
+                both_flows,
+                recoveries,
+                R7FixedWireKind::ReplacementRecoveryAck,
+            )?,
+            close_messages: Self::repeat(
+                both_flows,
+                recoveries,
+                R7FixedWireKind::ReplacementRecoveryClose,
+            )?,
+        })
+    }
+
+    fn repeat(
+        per_recovery: usize,
+        recoveries: usize,
+        kind: R7FixedWireKind,
+    ) -> Result<usize, R7CapacityError> {
+        per_recovery
+            .checked_mul(recoveries)
+            .ok_or(R7CapacityError::ReplacementRecoveryMessagesOverflow { kind })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct R7FixedWireCapacity {
+    rows: [R7FixedWireRow; R7FixedWireKind::COUNT],
+    max_messages: usize,
+    encoded_once_bytes: usize,
+}
+
+impl R7FixedWireCapacity {
+    fn derive(
+        max_flow_episodes: usize,
+        max_terminal_messages: usize,
+        max_probe_episodes: usize,
+        recovery: R7ReplacementRecoveryWireCapacity,
+    ) -> Result<Self, R7CapacityError> {
+        // These sizes are the exact current codec envelopes: 12-byte frame
+        // header plus each fixed record body. Terminal reserves the larger
+        // CLOSE representation (37B rather than the 30B RESET).
+        let rows = [
+            R7FixedWireRow::new(R7FixedWireKind::InitialAttach, 1, 104),
+            R7FixedWireRow::new(R7FixedWireKind::InitialAttachAccepted, 1, 62),
+            R7FixedWireRow::new(R7FixedWireKind::Open, max_flow_episodes, 285),
+            R7FixedWireRow::new(R7FixedWireKind::OpenResult, max_flow_episodes, 30),
+            R7FixedWireRow::new(R7FixedWireKind::StandbyRegistration, 1, 94),
+            R7FixedWireRow::new(R7FixedWireKind::StandbyRegistrationAccepted, 1, 62),
+            R7FixedWireRow::new(R7FixedWireKind::CurrentAProbe, max_probe_episodes, 60),
+            R7FixedWireRow::new(R7FixedWireKind::CurrentAProbeAck, max_probe_episodes, 60),
+            R7FixedWireRow::new(R7FixedWireKind::StandbyBProbe, max_probe_episodes, 60),
+            R7FixedWireRow::new(R7FixedWireKind::StandbyBProbeAck, max_probe_episodes, 60),
+            R7FixedWireRow::new(R7FixedWireKind::SwitchHint, 1, 79),
+            R7FixedWireRow::new(R7FixedWireKind::ReplacementAttach, 1, 104),
+            R7FixedWireRow::new(R7FixedWireKind::ReplacementAttachAccepted, 1, 62),
+            R7FixedWireRow::new(R7FixedWireKind::GenerationStatus, 1, 60),
+            R7FixedWireRow::new(R7FixedWireKind::StatusFollowUpAttach, 1, 104),
+            R7FixedWireRow::new(R7FixedWireKind::FirstBApplicationAck, 1, 38),
+            R7FixedWireRow::new(R7FixedWireKind::Terminal, max_terminal_messages, 37),
+            R7FixedWireRow::new(
+                R7FixedWireKind::ReplacementRecoveryTombstone,
+                recovery.tombstone_messages,
+                38,
+            ),
+            R7FixedWireRow::new(
+                R7FixedWireKind::ReplacementRecoveryOpen,
+                recovery.open_messages,
+                285,
+            ),
+            R7FixedWireRow::new(
+                R7FixedWireKind::ReplacementRecoveryOpenResult,
+                recovery.open_result_messages,
+                30,
+            ),
+            R7FixedWireRow::new(
+                R7FixedWireKind::ReplacementRecoveryAck,
+                recovery.ack_messages,
+                38,
+            ),
+            R7FixedWireRow::new(
+                R7FixedWireKind::ReplacementRecoveryClose,
+                recovery.close_messages,
+                37,
+            ),
+        ];
+        let mut max_messages = 0_usize;
+        let mut encoded_once_bytes = 0_usize;
+        for row in rows {
+            max_messages = max_messages
+                .checked_add(row.max_messages)
+                .ok_or(R7CapacityError::FixedWireMessagesOverflow)?;
+            encoded_once_bytes = encoded_once_bytes
+                .checked_add(row.encoded_bytes()?)
+                .ok_or(R7CapacityError::FixedWireBytesOverflow)?;
+        }
+        Ok(Self {
+            rows,
+            max_messages,
+            encoded_once_bytes,
+        })
+    }
+
+    const fn row(self, kind: R7FixedWireKind) -> R7FixedWireRow {
+        self.rows[kind.index()]
+    }
+
+    const fn max_messages(self) -> usize {
+        self.max_messages
+    }
+
+    const fn encoded_once_bytes(self) -> usize {
+        self.encoded_once_bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct R7WireFaultBounds {
+    max_positive_accept_pieces: usize,
+    replay_copies: u8,
+    duplicates_per_send: u8,
+}
+
+impl R7WireFaultBounds {
+    const fn new(
+        max_positive_accept_pieces: usize,
+        replay_copies: u8,
+        duplicates_per_send: u8,
+    ) -> Self {
+        Self {
+            max_positive_accept_pieces,
+            replay_copies,
+            duplicates_per_send,
+        }
+    }
+}
+
+/// Directional DATA and application-ACK work derived from the same checked
+/// replay-storage witness consumed by production session construction.
+///
+/// `max_segments` is authoritative. Recomputing a single ceil from bytes would
+/// lose the storage plan's additive one-tail-per-live-flow allowance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct R7DirectionalWireCapacity {
+    coalesced_record_payload_bytes: usize,
+    data_application_bytes: u64,
+    data_logical_messages: u64,
+    data_tail_segment_allowance: u64,
+    data_encoded_once_bytes: u64,
+    application_ack_messages: u64,
+    application_ack_encoded_once_bytes: u64,
+}
+
+impl R7DirectionalWireCapacity {
+    fn derive(
+        coalesced_record_payload_bytes: usize,
+        storage: ReplayStorageLimit,
+        max_positive_accept_pieces: usize,
+        application_ack_bytes_per_message: u64,
+    ) -> Result<Self, R7CapacityError> {
+        let data_application_bytes = u64::try_from(storage.max_bytes())
+            .map_err(|_| R7CapacityError::WirePlatformCapacityOverflow)?;
+        let data_logical_messages = u64::try_from(storage.max_segments())
+            .map_err(|_| R7CapacityError::WirePlatformCapacityOverflow)?;
+        let data_tail_segment_allowance = u64::try_from(storage.tail_segment_allowance())
+            .map_err(|_| R7CapacityError::WirePlatformCapacityOverflow)?;
+        let overhead = u64::try_from(R7_DATA_FRAME_OVERHEAD_BYTES)
+            .map_err(|_| R7CapacityError::WirePlatformCapacityOverflow)?;
+        let data_encoded_once_bytes = data_logical_messages
+            .checked_mul(overhead)
+            .and_then(|value| value.checked_add(data_application_bytes))
+            .ok_or(R7CapacityError::WireBytesOverflow)?;
+        let positive_accept_pieces = u64::try_from(max_positive_accept_pieces)
+            .map_err(|_| R7CapacityError::WirePlatformCapacityOverflow)?;
+        let application_ack_messages = data_logical_messages
+            .checked_mul(positive_accept_pieces)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(R7CapacityError::ApplicationAckMessagesOverflow)?;
+        let application_ack_encoded_once_bytes = application_ack_messages
+            .checked_mul(application_ack_bytes_per_message)
+            .ok_or(R7CapacityError::ApplicationAckBytesOverflow)?;
+        Ok(Self {
+            coalesced_record_payload_bytes,
+            data_application_bytes,
+            data_logical_messages,
+            data_tail_segment_allowance,
+            data_encoded_once_bytes,
+            application_ack_messages,
+            application_ack_encoded_once_bytes,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct R7WireCapacity {
+    client_to_target: R7DirectionalWireCapacity,
+    target_to_client: R7DirectionalWireCapacity,
+    data_encoded_once_messages: u64,
+    data_encoded_once_bytes: u64,
+    application_ack_messages: u64,
+    application_ack_encoded_once_bytes: u64,
+    fixed: R7FixedWireCapacity,
+    max_send_messages: u64,
+    max_send_bytes: u64,
+    max_delivery_messages: u64,
+    max_delivery_bytes: u64,
+    max_wire_delivery_events: usize,
+    max_wire_delivery_owned_bytes: usize,
+}
+
+impl R7WireCapacity {
+    fn derive(
+        storage: ReplayStoragePlan,
+        faults: R7WireFaultBounds,
+        fixed: R7FixedWireCapacity,
+    ) -> Result<Self, R7CapacityError> {
+        if faults.max_positive_accept_pieces == 0 {
+            return Err(R7CapacityError::DataCapacity(
+                CapacityError::ZeroPositiveAcceptancePieces,
+            ));
+        }
+        if faults.replay_copies > 1 {
+            return Err(R7CapacityError::DataCapacity(
+                CapacityError::TooManyReplayCopies,
+            ));
+        }
+        if faults.duplicates_per_send > 1 {
+            return Err(R7CapacityError::DataCapacity(
+                CapacityError::TooManyDuplicateCopies,
+            ));
+        }
+        let fixed_messages = u64::try_from(fixed.max_messages())
+            .map_err(|_| R7CapacityError::WirePlatformCapacityOverflow)?;
+        let fixed_bytes = u64::try_from(fixed.encoded_once_bytes())
+            .map_err(|_| R7CapacityError::WirePlatformCapacityOverflow)?;
+        let application_ack_bytes_per_message = u64::try_from(
+            fixed
+                .row(R7FixedWireKind::FirstBApplicationAck)
+                .encoded_bytes_per_message,
+        )
+        .map_err(|_| R7CapacityError::WirePlatformCapacityOverflow)?;
+        let coalesced_record_payload_bytes = storage.geometry().coalesced_record_payload_bytes();
+        let global = storage.global();
+        let client_to_target = R7DirectionalWireCapacity::derive(
+            coalesced_record_payload_bytes,
+            global.client_to_target(),
+            faults.max_positive_accept_pieces,
+            application_ack_bytes_per_message,
+        )?;
+        let target_to_client = R7DirectionalWireCapacity::derive(
+            coalesced_record_payload_bytes,
+            global.target_to_client(),
+            faults.max_positive_accept_pieces,
+            application_ack_bytes_per_message,
+        )?;
+        let data_encoded_once_messages = client_to_target
+            .data_logical_messages
+            .checked_add(target_to_client.data_logical_messages)
+            .ok_or(R7CapacityError::WireMessagesOverflow)?;
+        let data_encoded_once_bytes = client_to_target
+            .data_encoded_once_bytes
+            .checked_add(target_to_client.data_encoded_once_bytes)
+            .ok_or(R7CapacityError::WireBytesOverflow)?;
+        let application_ack_messages = client_to_target
+            .application_ack_messages
+            .checked_add(target_to_client.application_ack_messages)
+            .ok_or(R7CapacityError::ApplicationAckMessagesOverflow)?;
+        let fixed_first_application_ack = u64::try_from(
+            fixed
+                .row(R7FixedWireKind::FirstBApplicationAck)
+                .max_messages,
+        )
+        .map_err(|_| R7CapacityError::WirePlatformCapacityOverflow)?;
+        let ordinary_application_ack_messages = application_ack_messages
+            .checked_sub(fixed_first_application_ack)
+            .ok_or(R7CapacityError::ApplicationAckMessagesOverflow)?;
+        let ordinary_application_ack_bytes = ordinary_application_ack_messages
+            .checked_mul(application_ack_bytes_per_message)
+            .ok_or(R7CapacityError::ApplicationAckBytesOverflow)?;
+        let application_ack_encoded_once_bytes = client_to_target
+            .application_ack_encoded_once_bytes
+            .checked_add(target_to_client.application_ack_encoded_once_bytes)
+            .ok_or(R7CapacityError::ApplicationAckBytesOverflow)?;
+        let send_factor = u64::from(faults.replay_copies) + 1;
+        let delivery_factor = u64::from(faults.duplicates_per_send) + 1;
+        let max_send_messages = data_encoded_once_messages
+            .checked_mul(send_factor)
+            .and_then(|value| value.checked_add(ordinary_application_ack_messages))
+            .and_then(|value| value.checked_add(fixed_messages))
+            .ok_or(R7CapacityError::WireMessagesOverflow)?;
+        let max_send_bytes = data_encoded_once_bytes
+            .checked_mul(send_factor)
+            .and_then(|value| value.checked_add(ordinary_application_ack_bytes))
+            .and_then(|value| value.checked_add(fixed_bytes))
+            .ok_or(R7CapacityError::WireBytesOverflow)?;
+        let max_delivery_messages = fixed_messages
+            .checked_mul(delivery_factor)
+            .and_then(|fixed_delivery| {
+                data_encoded_once_messages
+                    .checked_mul(send_factor)
+                    .and_then(|value| value.checked_mul(delivery_factor))
+                    .and_then(|value| {
+                        ordinary_application_ack_messages
+                            .checked_mul(delivery_factor)
+                            .and_then(|ack_delivery| value.checked_add(ack_delivery))
+                    })
+                    .and_then(|value| value.checked_add(fixed_delivery))
+            })
+            .ok_or(R7CapacityError::WireMessagesOverflow)?;
+        let max_delivery_bytes = fixed_bytes
+            .checked_mul(delivery_factor)
+            .and_then(|fixed_delivery| {
+                data_encoded_once_bytes
+                    .checked_mul(send_factor)
+                    .and_then(|value| value.checked_mul(delivery_factor))
+                    .and_then(|value| {
+                        ordinary_application_ack_bytes
+                            .checked_mul(delivery_factor)
+                            .and_then(|ack_delivery| value.checked_add(ack_delivery))
+                    })
+                    .and_then(|value| value.checked_add(fixed_delivery))
+            })
+            .ok_or(R7CapacityError::WireBytesOverflow)?;
+        let max_wire_delivery_events = usize::try_from(max_delivery_messages)
+            .map_err(|_| R7CapacityError::WirePlatformCapacityOverflow)?;
+        let max_wire_delivery_owned_bytes = usize::try_from(max_delivery_bytes)
+            .map_err(|_| R7CapacityError::WirePlatformCapacityOverflow)?;
+        Ok(Self {
+            client_to_target,
+            target_to_client,
+            data_encoded_once_messages,
+            data_encoded_once_bytes,
+            application_ack_messages,
+            application_ack_encoded_once_bytes,
+            fixed,
+            max_send_messages,
+            max_send_bytes,
+            max_delivery_messages,
+            max_delivery_bytes,
+            max_wire_delivery_events,
+            max_wire_delivery_owned_bytes,
+        })
+    }
+}
+
+trait R7SlotIndex: Copy {
+    fn index(self) -> usize;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum R7ClientTimerSlot {
+    HardLiveness,
+    LocalApplicationAckStall,
+    StandbyBProbe,
+    TerminalGrace,
+}
+
+impl R7ClientTimerSlot {
+    const COUNT: usize = 4;
+    const ALL: [Self; Self::COUNT] = [
+        Self::HardLiveness,
+        Self::LocalApplicationAckStall,
+        Self::StandbyBProbe,
+        Self::TerminalGrace,
+    ];
+}
+
+impl R7SlotIndex for R7ClientTimerSlot {
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum R7OwnerTimerSlot {
+    HardLiveness,
+    CurrentAProbe,
+    StandbyBProbe,
+    AggregateReverseStall,
+    TerminalGrace,
+}
+
+impl R7OwnerTimerSlot {
+    const COUNT: usize = 5;
+    const ALL: [Self; Self::COUNT] = [
+        Self::HardLiveness,
+        Self::CurrentAProbe,
+        Self::StandbyBProbe,
+        Self::AggregateReverseStall,
+        Self::TerminalGrace,
+    ];
+}
+
+impl R7SlotIndex for R7OwnerTimerSlot {
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum R7ClientRootSlot {
+    CurrentActor,
+    StandbyActor,
+    AttachCandidateActor,
+    RetiredActor,
+    ClassifiedBControl,
+    OrderedDeliveryWait,
+    HintValidator,
+    ArbiterIntent,
+    PendingAttach,
+    TerminalStamp,
+    Quarantine,
+    JoinState,
+    EndpointAuthority,
+    SessionAuthority,
+    ShutdownAdmission,
+}
+
+impl R7ClientRootSlot {
+    const COUNT: usize = 15;
+    const ALL: [Self; Self::COUNT] = [
+        Self::CurrentActor,
+        Self::StandbyActor,
+        Self::AttachCandidateActor,
+        Self::RetiredActor,
+        Self::ClassifiedBControl,
+        Self::OrderedDeliveryWait,
+        Self::HintValidator,
+        Self::ArbiterIntent,
+        Self::PendingAttach,
+        Self::TerminalStamp,
+        Self::Quarantine,
+        Self::JoinState,
+        Self::EndpointAuthority,
+        Self::SessionAuthority,
+        Self::ShutdownAdmission,
+    ];
+}
+
+impl R7SlotIndex for R7ClientRootSlot {
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum R7OwnerRootSlot {
+    CurrentActor,
+    StandbyActor,
+    AttachCandidateActor,
+    RetiredActor,
+    ActiveTargetHandoff,
+    RetiredTargetHandoff,
+    OutputPage,
+    OutputContinuation,
+    ReverseProgressCursor,
+    PendingProbeResponse,
+    ProbeFreshness,
+    PendingHint,
+    GenerationStatus,
+    TerminalStamp,
+    LeglessHighWater,
+    Quarantine,
+    JoinState,
+    EndpointAuthority,
+    SessionAuthority,
+    ShutdownAdmission,
+}
+
+impl R7OwnerRootSlot {
+    const COUNT: usize = 20;
+    const ALL: [Self; Self::COUNT] = [
+        Self::CurrentActor,
+        Self::StandbyActor,
+        Self::AttachCandidateActor,
+        Self::RetiredActor,
+        Self::ActiveTargetHandoff,
+        Self::RetiredTargetHandoff,
+        Self::OutputPage,
+        Self::OutputContinuation,
+        Self::ReverseProgressCursor,
+        Self::PendingProbeResponse,
+        Self::ProbeFreshness,
+        Self::PendingHint,
+        Self::GenerationStatus,
+        Self::TerminalStamp,
+        Self::LeglessHighWater,
+        Self::Quarantine,
+        Self::JoinState,
+        Self::EndpointAuthority,
+        Self::SessionAuthority,
+        Self::ShutdownAdmission,
+    ];
+}
+
+impl R7SlotIndex for R7OwnerRootSlot {
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct R7NamedSlotCapacity<D, const N: usize> {
+    limits: [usize; N],
+    _domain: std::marker::PhantomData<fn(D)>,
+}
+
+impl<D: R7SlotIndex, const N: usize> R7NamedSlotCapacity<D, N> {
+    const fn new(limits: [usize; N]) -> Self {
+        Self {
+            limits,
+            _domain: std::marker::PhantomData,
+        }
+    }
+
+    fn limit(self, domain: D) -> usize {
+        self.limits[domain.index()]
+    }
+
+    fn ledger(self) -> R7NamedSlotLedger<D, N> {
+        R7NamedSlotLedger {
+            capacity: self,
+            live: [0; N],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct R7NamedSlotLedger<D, const N: usize> {
+    capacity: R7NamedSlotCapacity<D, N>,
+    live: [usize; N],
+}
+
+impl<D: R7SlotIndex, const N: usize> R7NamedSlotLedger<D, N> {
+    fn try_admit(&mut self, domain: D, additional: usize) -> Result<(), R7SlotAdmissionError<D>> {
+        let index = domain.index();
+        let current = self.live[index];
+        let attempted =
+            current
+                .checked_add(additional)
+                .ok_or(R7SlotAdmissionError::CountOverflow {
+                    domain,
+                    current,
+                    additional,
+                })?;
+        let limit = self.capacity.limit(domain);
+        if attempted > limit {
+            return Err(R7SlotAdmissionError::CapacityExceeded {
+                domain,
+                attempted,
+                limit,
+            });
+        }
+        self.live[index] = attempted;
+        Ok(())
+    }
+
+    fn release(&mut self, domain: D, count: usize) -> Result<(), R7SlotAdmissionError<D>> {
+        let index = domain.index();
+        let current = self.live[index];
+        let remaining =
+            current
+                .checked_sub(count)
+                .ok_or(R7SlotAdmissionError::ReleaseUnderflow {
+                    domain,
+                    current,
+                    released: count,
+                })?;
+        self.live[index] = remaining;
+        Ok(())
+    }
+
+    fn live(self, domain: D) -> usize {
+        self.live[domain.index()]
+    }
+
+    fn is_exact_zero(&self) -> bool {
+        self.live.iter().all(|count| *count == 0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum R7SlotAdmissionError<D> {
+    CountOverflow {
+        domain: D,
+        current: usize,
+        additional: usize,
+    },
+    CapacityExceeded {
+        domain: D,
+        attempted: usize,
+        limit: usize,
+    },
+    ReleaseUnderflow {
+        domain: D,
+        current: usize,
+        released: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct R7PhysicalSlotCapacities {
+    client_timers: R7NamedSlotCapacity<R7ClientTimerSlot, { R7ClientTimerSlot::COUNT }>,
+    owner_timers: R7NamedSlotCapacity<R7OwnerTimerSlot, { R7OwnerTimerSlot::COUNT }>,
+    client_root: R7NamedSlotCapacity<R7ClientRootSlot, { R7ClientRootSlot::COUNT }>,
+    owner_root: R7NamedSlotCapacity<R7OwnerRootSlot, { R7OwnerRootSlot::COUNT }>,
+}
+
+impl R7PhysicalSlotCapacities {
+    fn derive(max_terminal_tombstones: usize) -> Self {
+        let mut client_timer_limits = [1; R7ClientTimerSlot::COUNT];
+        client_timer_limits[R7ClientTimerSlot::TerminalGrace.index()] = max_terminal_tombstones;
+        let mut owner_timer_limits = [1; R7OwnerTimerSlot::COUNT];
+        owner_timer_limits[R7OwnerTimerSlot::TerminalGrace.index()] = max_terminal_tombstones;
+        Self {
+            client_timers: R7NamedSlotCapacity::new(client_timer_limits),
+            owner_timers: R7NamedSlotCapacity::new(owner_timer_limits),
+            client_root: R7NamedSlotCapacity::new([1; R7ClientRootSlot::COUNT]),
+            owner_root: R7NamedSlotCapacity::new([1; R7OwnerRootSlot::COUNT]),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum R7LiveByteDimension {
+    ActorChannels,
+    ActorFifos,
+    OrderedDeliveryWait,
+    RootOutputFifo,
+    ControllerTargetTurns,
+    Replay,
+    Continuation,
+    PendingControl,
+    DriverPort,
+    Quarantine,
+    TerminalResidual,
+    ShutdownResidual,
+}
+
+impl R7LiveByteDimension {
+    const COUNT: usize = 12;
+    const ALL: [Self; Self::COUNT] = [
+        Self::ActorChannels,
+        Self::ActorFifos,
+        Self::OrderedDeliveryWait,
+        Self::RootOutputFifo,
+        Self::ControllerTargetTurns,
+        Self::Replay,
+        Self::Continuation,
+        Self::PendingControl,
+        Self::DriverPort,
+        Self::Quarantine,
+        Self::TerminalResidual,
+        Self::ShutdownResidual,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum R7HistoricalByteDimension {
+    ReturnedOnRejection,
+    TerminalDiscarded,
+    FatalDiscarded,
+    CancelledDiscarded,
+    ShutdownDiscarded,
+}
+
+impl R7HistoricalByteDimension {
+    const COUNT: usize = 5;
+    const ALL: [Self; Self::COUNT] = [
+        Self::ReturnedOnRejection,
+        Self::TerminalDiscarded,
+        Self::FatalDiscarded,
+        Self::CancelledDiscarded,
+        Self::ShutdownDiscarded,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum R7ByteDimension {
+    Live(R7LiveByteDimension),
+    Historical(R7HistoricalByteDimension),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum R7ByteLedgerError {
+    CounterOverflow {
+        dimension: R7ByteDimension,
+        current: usize,
+        additional: usize,
+    },
+    TotalCounterOverflow {
+        historical: bool,
+    },
+    CapacityExceeded {
+        dimension: R7ByteDimension,
+        attempted: usize,
+        limit: usize,
+    },
+    SettlementUnderflow {
+        dimension: R7LiveByteDimension,
+        current: usize,
+        settled: usize,
+    },
+    LiveTotalSettlementUnderflow {
+        current: usize,
+        settled: usize,
+    },
+}
+
+/// Independently bounded live ownership and sticky settlement history.
+///
+/// History never contributes to the live-zero predicate. Moving live bytes to
+/// history is one transactional settlement: if history cannot admit them, the
+/// original live ownership remains unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct R7ByteLedgerPlan {
+    live_limits: [usize; R7LiveByteDimension::COUNT],
+    historical_limits: [usize; R7HistoricalByteDimension::COUNT],
+    max_live_bytes: usize,
+    max_historical_bytes: usize,
+}
+
+impl R7ByteLedgerPlan {
+    fn new(
+        live_limits: [usize; R7LiveByteDimension::COUNT],
+        historical_limits: [usize; R7HistoricalByteDimension::COUNT],
+    ) -> Result<Self, R7CapacityError> {
+        let mut max_live_bytes = 0_usize;
+        for limit in live_limits {
+            max_live_bytes = max_live_bytes
+                .checked_add(limit)
+                .ok_or(R7CapacityError::LiveByteCapacityOverflow)?;
+        }
+        let mut max_historical_bytes = 0_usize;
+        for limit in historical_limits {
+            max_historical_bytes = max_historical_bytes
+                .checked_add(limit)
+                .ok_or(R7CapacityError::HistoricalByteCapacityOverflow)?;
+        }
+        Ok(Self {
+            live_limits,
+            historical_limits,
+            max_live_bytes,
+            max_historical_bytes,
+        })
+    }
+
+    const fn live_limit(self, dimension: R7LiveByteDimension) -> usize {
+        self.live_limits[dimension.index()]
+    }
+
+    const fn historical_limit(self, dimension: R7HistoricalByteDimension) -> usize {
+        self.historical_limits[dimension.index()]
+    }
+
+    const fn max_live_bytes(self) -> usize {
+        self.max_live_bytes
+    }
+
+    const fn max_historical_bytes(self) -> usize {
+        self.max_historical_bytes
+    }
+
+    const fn ledger(self) -> R7ByteLedger {
+        R7ByteLedger {
+            plan: self,
+            live: [0; R7LiveByteDimension::COUNT],
+            historical: [0; R7HistoricalByteDimension::COUNT],
+            live_total: 0,
+            historical_total: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct R7ByteLedger {
+    plan: R7ByteLedgerPlan,
+    live: [usize; R7LiveByteDimension::COUNT],
+    historical: [usize; R7HistoricalByteDimension::COUNT],
+    live_total: usize,
+    historical_total: usize,
+}
+
+impl R7ByteLedger {
+    fn try_add_live(
+        &mut self,
+        dimension: R7LiveByteDimension,
+        additional: usize,
+    ) -> Result<(), R7ByteLedgerError> {
+        let index = dimension.index();
+        let current = self.live[index];
+        let next = Self::checked_next(
+            R7ByteDimension::Live(dimension),
+            current,
+            additional,
+            self.plan.live_limit(dimension),
+        )?;
+        let next_total = self
+            .live_total
+            .checked_add(additional)
+            .ok_or(R7ByteLedgerError::TotalCounterOverflow { historical: false })?;
+        self.live[index] = next;
+        self.live_total = next_total;
+        Ok(())
+    }
+
+    /// Releases successfully consumed ownership without fabricating discard
+    /// history. Rejection/fatal/cancel/shutdown settlement uses the explicit
+    /// live-to-history transaction below instead.
+    fn release_live(
+        &mut self,
+        dimension: R7LiveByteDimension,
+        bytes: usize,
+    ) -> Result<(), R7ByteLedgerError> {
+        let (next_live, next_live_total) = self.preflight_live_release(dimension, bytes)?;
+        self.live[dimension.index()] = next_live;
+        self.live_total = next_live_total;
+        Ok(())
+    }
+
+    fn settle_live_to_history(
+        &mut self,
+        live_dimension: R7LiveByteDimension,
+        historical_dimension: R7HistoricalByteDimension,
+        bytes: usize,
+    ) -> Result<(), R7ByteLedgerError> {
+        let (next_live, next_live_total) = self.preflight_live_release(live_dimension, bytes)?;
+        let (next_history, next_history_total) =
+            self.preflight_historical(historical_dimension, bytes)?;
+        self.live[live_dimension.index()] = next_live;
+        self.live_total = next_live_total;
+        self.historical[historical_dimension.index()] = next_history;
+        self.historical_total = next_history_total;
+        Ok(())
+    }
+
+    fn preflight_live_release(
+        self,
+        dimension: R7LiveByteDimension,
+        bytes: usize,
+    ) -> Result<(usize, usize), R7ByteLedgerError> {
+        let current = self.live[dimension.index()];
+        let next = current
+            .checked_sub(bytes)
+            .ok_or(R7ByteLedgerError::SettlementUnderflow {
+                dimension,
+                current,
+                settled: bytes,
+            })?;
+        let next_total = self.live_total.checked_sub(bytes).ok_or(
+            R7ByteLedgerError::LiveTotalSettlementUnderflow {
+                current: self.live_total,
+                settled: bytes,
+            },
+        )?;
+        Ok((next, next_total))
+    }
+
+    fn checked_next(
+        dimension: R7ByteDimension,
+        current: usize,
+        additional: usize,
+        limit: usize,
+    ) -> Result<usize, R7ByteLedgerError> {
+        let attempted =
+            current
+                .checked_add(additional)
+                .ok_or(R7ByteLedgerError::CounterOverflow {
+                    dimension,
+                    current,
+                    additional,
+                })?;
+        if attempted > limit {
+            return Err(R7ByteLedgerError::CapacityExceeded {
+                dimension,
+                attempted,
+                limit,
+            });
+        }
+        Ok(attempted)
+    }
+
+    fn preflight_historical(
+        self,
+        dimension: R7HistoricalByteDimension,
+        additional: usize,
+    ) -> Result<(usize, usize), R7ByteLedgerError> {
+        let next = Self::checked_next(
+            R7ByteDimension::Historical(dimension),
+            self.historical[dimension.index()],
+            additional,
+            self.plan.historical_limit(dimension),
+        )?;
+        let next_total = self
+            .historical_total
+            .checked_add(additional)
+            .ok_or(R7ByteLedgerError::TotalCounterOverflow { historical: true })?;
+        Ok((next, next_total))
+    }
+
+    const fn live_bytes(self, dimension: R7LiveByteDimension) -> usize {
+        self.live[dimension.index()]
+    }
+
+    const fn historical_bytes(self, dimension: R7HistoricalByteDimension) -> usize {
+        self.historical[dimension.index()]
+    }
+
+    const fn live_total(self) -> usize {
+        self.live_total
+    }
+
+    const fn historical_total(self) -> usize {
+        self.historical_total
+    }
+
+    fn live_is_exact_zero(&self) -> bool {
+        self.live_total == 0 && self.live.iter().all(|bytes| *bytes == 0)
+    }
+}
+
+/// Exact reducer-capacity witness shared by both physical session roles.
+///
+/// The caller cannot substitute a tombstone scalar or a session configuration
+/// derived from different replay geometry: both role-local configurations are
+/// reconstructed from this exact storage plan before the witness is minted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct R7SessionCapacityWitness {
+    replay_storage: ReplayStoragePlan,
+    client: SessionConfig,
+    owner: SessionConfig,
+    max_terminal_tombstones: usize,
+}
+
+impl R7SessionCapacityWitness {
+    fn derive(
+        replay_storage: ReplayStoragePlan,
+        client: SessionConfig,
+        owner: SessionConfig,
+    ) -> Result<Self, R7CapacityError> {
+        Self::validate_role(SessionRole::Client, replay_storage, client)?;
+        Self::validate_role(SessionRole::Owner, replay_storage, owner)?;
+        let client_tombstones = client.max_terminal_tombstones();
+        let owner_tombstones = owner.max_terminal_tombstones();
+        if client_tombstones != owner_tombstones {
+            return Err(R7CapacityError::SessionTerminalTombstoneCapacityMismatch {
+                client: client_tombstones,
+                owner: owner_tombstones,
+            });
+        }
+        Ok(Self {
+            replay_storage,
+            client,
+            owner,
+            max_terminal_tombstones: client_tombstones,
+        })
+    }
+
+    fn validate_role(
+        role: SessionRole,
+        replay_storage: ReplayStoragePlan,
+        supplied: SessionConfig,
+    ) -> Result<(), R7CapacityError> {
+        let expected = SessionConfig::from_storage_plan(
+            role,
+            supplied.max_terminal_tombstones(),
+            replay_storage,
+            supplied.max_sink_offer_bytes(),
+        )
+        .map_err(|_| R7CapacityError::SessionConfigDerivationFailed { role })?;
+        if supplied != expected {
+            return Err(R7CapacityError::SessionConfigNotDerivedFromReplayStorage { role });
+        }
+        Ok(())
+    }
+}
+
+/// Necessary-only capacity contract for the future physical R7 byte harness.
+///
+/// This manifest does not mint actors, hints, permits, a physical incarnation,
+/// or a clean-join witness. Its scalar ledgers cannot prove that later roots
+/// actually use these capacities. It only freezes finite work/ownership
+/// dimensions so a later no-oracle scenario cannot rely on pooled slack or
+/// unbounded history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct R7NoOracleCapacityManifest {
+    episodes: R7ScenarioEpisodeBounds,
+    sessions: R7SessionCapacityWitness,
+    owner_scan: R7OwnerScanCapacity,
+    wire: R7WireCapacity,
+    slots: R7PhysicalSlotCapacities,
+    bytes: R7ByteLedgerPlan,
+    required_replay_live_bytes: usize,
+}
+
+impl R7NoOracleCapacityManifest {
+    fn derive(
+        sessions: R7SessionCapacityWitness,
+        episodes: R7ScenarioEpisodeBounds,
+        wire_faults: R7WireFaultBounds,
+        bytes: R7ByteLedgerPlan,
+    ) -> Result<Self, R7CapacityError> {
+        if episodes.flow_lifecycles == 0 {
+            return Err(R7CapacityError::ZeroFlowEpisodes);
+        }
+        if episodes.probe_rounds == 0 {
+            return Err(R7CapacityError::ZeroProbeEpisodes);
+        }
+        let replay_storage = sessions.replay_storage;
+        let progress_capacity = OwnerProgressCapacity::checked(
+            replay_storage.geometry().max_flows(),
+            sessions.max_terminal_tombstones,
+        )
+        .map_err(R7CapacityError::OwnerProgressCapacity)?;
+        let owner_scan = R7OwnerScanCapacity::derive(progress_capacity, episodes)?;
+        let max_terminal_messages = episodes.flow_lifecycles.checked_mul(2).ok_or(
+            R7CapacityError::FlowTerminalMessagesOverflow {
+                max_flow_episodes: episodes.flow_lifecycles,
+            },
+        )?;
+        let recovery =
+            R7ReplacementRecoveryWireCapacity::derive(sessions, wire_faults.replay_copies)?;
+        let fixed = R7FixedWireCapacity::derive(
+            episodes.flow_lifecycles,
+            max_terminal_messages,
+            episodes.probe_rounds,
+            recovery,
+        )?;
+        let wire = R7WireCapacity::derive(replay_storage, wire_faults, fixed)?;
+        let global_replay = replay_storage.global();
+        let required_replay_live_bytes = global_replay
+            .client_to_target()
+            .max_bytes()
+            .checked_add(global_replay.target_to_client().max_bytes())
+            .ok_or(R7CapacityError::ReplayLiveByteCapacityOverflow)?;
+        let actual_replay_live_bytes = bytes.live_limit(R7LiveByteDimension::Replay);
+        if actual_replay_live_bytes < required_replay_live_bytes {
+            return Err(R7CapacityError::ReplayLiveByteCapacityTooSmall {
+                required: required_replay_live_bytes,
+                actual: actual_replay_live_bytes,
+            });
+        }
+        let slots = R7PhysicalSlotCapacities::derive(sessions.max_terminal_tombstones);
+        Ok(Self {
+            episodes,
+            sessions,
+            owner_scan,
+            wire,
+            slots,
+            bytes,
+            required_replay_live_bytes,
+        })
+    }
+}
 
 /// Complete finite inputs for the R5 byte baseline. The directional wire
 /// declaration uses the larger 23-byte payload; the other direction is one
@@ -493,17 +1848,16 @@ struct R5BaselineHarness {
     work_budget: HarnessWorkBudget,
     observed_work: HarnessObservedWork,
     scheduler: ByteHarnessScheduler,
-    client_leg_io: crate::owned_upstream::leg_io::LegIo,
+    client_leg_io: Option<crate::owned_upstream::leg_io::LegIo>,
     owner_leg_io: crate::owned_upstream::leg_io::LegIo,
-    client_outbound: LegOutboundQueue,
+    client_outbound: Option<LegOutboundQueue>,
     owner_outbound: LegOutboundQueue,
     client_flush_scheduled: bool,
     owner_flush_scheduled: bool,
     client_pending: Option<AwaitingInitialAttach>,
     owner_pending: Option<PendingOwnerBootstrap>,
-    client_attached: Option<AttachedLeg>,
+    client_controller: Option<ClientSessionController>,
     owner_attached: Option<AttachedLeg>,
-    client_supervisor: Option<SessionSupervisor>,
     owner: Option<OwnerTargetExecutor<MemoryTarget>>,
     client_port_factory: Option<ResumableTcpPortFactory>,
     client_flow: Option<ResumableTcpFlow>,
@@ -624,20 +1978,19 @@ impl R5BaselineHarness {
             work_budget,
             observed_work,
             scheduler,
-            client_leg_io,
+            client_leg_io: Some(client_leg_io),
             owner_leg_io,
-            client_outbound,
+            client_outbound: Some(client_outbound),
             owner_outbound,
             client_flush_scheduled: false,
             owner_flush_scheduled: false,
             client_pending: None,
-            owner_pending: Some(SessionSupervisor::prepare_owner(
+            owner_pending: Some(SessionSupervisor::prepare_owner_unproven_for_harness(
                 baseline_session_config()?,
                 authority,
             )),
-            client_attached: None,
+            client_controller: None,
             owner_attached: None,
-            client_supervisor: None,
             owner: None,
             client_port_factory: None,
             client_flow: None,
@@ -701,6 +2054,7 @@ impl R5BaselineHarness {
             HarnessAction::StartAttach(pending) => self.start_initial_attach(now, pending),
             HarnessAction::OwnerBound(received) => self.handle_owner_bound(now, received),
             HarnessAction::ClientBound(received) => self.handle_client_bound(now, received),
+            HarnessAction::ClientDelivery(delivery) => self.handle_client_delivery(now, delivery),
             HarnessAction::StartOpen => self.start_open(now),
             HarnessAction::SendClientData(payload) => self.send_client_data(now, payload),
             HarnessAction::RetryOwnerWrite => self.retry_owner_write(now),
@@ -758,8 +2112,23 @@ impl R5BaselineHarness {
                 )
             }
             WireDirection::OwnerToClient => {
+                if self.client_controller.is_some() {
+                    if let Some(completion) = completion {
+                        completion.mark_delivered();
+                    }
+                    return self.schedule(
+                        now,
+                        EventPhase::SupervisorCommand,
+                        CLIENT_SUPERVISOR,
+                        retained_bytes,
+                        0x202,
+                        HarnessAction::ClientDelivery(delivery),
+                    );
+                }
                 let received = self
                     .client_leg_io
+                    .as_mut()
+                    .ok_or_else(|| "raw client endpoint disappeared before bootstrap".to_owned())?
                     .receive_delivery(delivery)
                     .map_err(|error| error.to_string())?;
                 if let Some(completion) = completion {
@@ -786,7 +2155,11 @@ impl R5BaselineHarness {
             return Err("initial client ATTACH was scheduled twice".to_owned());
         }
         let awaiting = pending
-            .enqueue(&mut self.client_outbound)
+            .enqueue(
+                self.client_outbound
+                    .as_mut()
+                    .ok_or_else(|| "raw client queue disappeared before bootstrap".to_owned())?,
+            )
             .map_err(|error| format!("initial ATTACH queue rejected: {error:?}"))?;
         self.client_pending = Some(awaiting);
         self.schedule_client_outbound_flush(now)
@@ -808,7 +2181,8 @@ impl R5BaselineHarness {
             let bootstrap = publication
                 .enqueue_acceptance(&mut self.owner_outbound)
                 .map_err(|error| error.to_string())?;
-            let (supervisor, attached) = bootstrap.into_parts();
+            let legacy_gate = LegacyOwnerBootstrapDecompositionGate::mint();
+            let (supervisor, attached) = bootstrap.into_legacy_parts(&legacy_gate);
             self.owner_attached = Some(attached);
             self.owner = Some(
                 OwnerTargetExecutor::new(
@@ -834,7 +2208,11 @@ impl R5BaselineHarness {
             .ok_or_else(|| "owner exact attached leg disappeared".to_owned())?
             .accept_frame(received)
             .map_err(|error| error.to_string())?;
-        self.charge_ack_decode(&event)?;
+        self.charge_ack_decode(matches!(
+            &event,
+            SessionEvent::PeerFrame { frame, .. }
+                if matches!(frame.record(), Record::Ack { .. })
+        ))?;
         let target_before = self.target_write_counters()?;
         let outputs = self
             .owner
@@ -850,60 +2228,84 @@ impl R5BaselineHarness {
     }
 
     fn handle_client_bound(&mut self, now: SimTime, received: LegBoundFrame) -> Result<(), String> {
-        if let Some(pending) = self.client_pending.take() {
-            let accepted = pending
-                .validate_response(&self.client_outbound, received)
-                .map_err(|error| format!("initial response rejected: {error:?}"))?;
-            let bootstrap = SessionSupervisor::bootstrap_client(
-                baseline_session_config()?,
-                accepted,
-                &mut self.client_outbound,
+        let pending = self
+            .client_pending
+            .take()
+            .ok_or_else(|| "raw client-bound frame arrived after bootstrap".to_owned())?;
+        let accepted = pending
+            .validate_response(
+                self.client_outbound
+                    .as_ref()
+                    .ok_or_else(|| "raw client queue disappeared before validation".to_owned())?,
+                received,
             )
+            .map_err(|error| format!("initial response rejected: {error:?}"))?;
+        let config = baseline_session_config()?;
+        let io = self
+            .client_leg_io
+            .take()
+            .ok_or_else(|| "raw client endpoint disappeared before bootstrap".to_owned())?;
+        let queue = self
+            .client_outbound
+            .take()
+            .ok_or_else(|| "raw client queue disappeared before bootstrap".to_owned())?;
+        let mut controller =
+            ClientSessionController::bootstrap_initial(config, accepted, io, queue)
+                .map_err(|error| format!("{error:?}"))?;
+        let port_factory = controller
+            .mint_tcp_port_factory(baseline_port_config()?)
             .map_err(|error| error.to_string())?;
-            let (mut supervisor, attached) = bootstrap.into_parts();
-            let port_factory = supervisor
-                .mint_tcp_port_factory(baseline_port_config()?)
-                .map_err(|error| error.to_string())?;
-            self.client_port_factory = Some(port_factory);
-            self.client_supervisor = Some(supervisor);
-            self.client_attached = Some(attached);
-            return self.schedule_next(
-                now,
-                EventPhase::SupervisorCommand,
-                CLIENT_SUPERVISOR,
-                0,
-                0x301,
-                HarnessAction::StartOpen,
-            );
-        }
+        self.client_port_factory = Some(port_factory);
+        self.client_controller = Some(controller);
+        self.schedule_next(
+            now,
+            EventPhase::SupervisorCommand,
+            CLIENT_SUPERVISOR,
+            0,
+            0x301,
+            HarnessAction::StartOpen,
+        )
+    }
 
-        let event = self
-            .client_attached
-            .as_ref()
-            .ok_or_else(|| "client exact attached leg disappeared".to_owned())?
-            .accept_frame(received)
-            .map_err(|error| error.to_string())?;
-        self.charge_ack_decode(&event)?;
-        let effects = self
-            .client_supervisor
+    fn handle_client_delivery(
+        &mut self,
+        now: SimTime,
+        delivery: EncodedDelivery,
+    ) -> Result<(), String> {
+        let is_ack = matches!(
+            Frame::decode_exact(delivery.bytes())
+                .map_err(|error| error.to_string())?
+                .record(),
+            Record::Ack { .. }
+        );
+        self.charge_ack_decode(is_ack)?;
+        let disposition = self
+            .client_controller
             .as_mut()
-            .ok_or_else(|| "client supervisor disappeared".to_owned())?
-            .apply_event(event)
+            .ok_or_else(|| "client controller disappeared".to_owned())?
+            .receive_current(delivery, FeatureSet::new(0b0111))
             .map_err(|error| error.to_string())?;
-        self.process_client_effects(now, effects)
+        match disposition {
+            ClientInboundDisposition::Applied { effects, .. } => {
+                self.process_client_effects(now, effects)
+            }
+            ClientInboundDisposition::ReducerRejected(error) => Err(error.to_string()),
+            ClientInboundDisposition::Blocked(_)
+            | ClientInboundDisposition::ProbeAcked { .. }
+            | ClientInboundDisposition::Retired(_)
+            | ClientInboundDisposition::Rejected => {
+                Err("baseline client delivery was not applied by its controller".to_owned())
+            }
+        }
     }
 
     fn start_open(&mut self, now: SimTime) -> Result<(), String> {
-        let event = self
-            .client_attached
-            .as_ref()
-            .ok_or_else(|| "client attached leg missing at OPEN".to_owned())?
-            .local_open_event(self.target.clone());
         let effects = self
-            .client_supervisor
+            .client_controller
             .as_mut()
-            .ok_or_else(|| "client supervisor missing at OPEN".to_owned())?
-            .apply_event(event)
+            .ok_or_else(|| "client controller missing at OPEN".to_owned())?
+            .open_local(self.target.clone())
+            .ok_or_else(|| "client controller has no active leg at OPEN".to_owned())?
             .map_err(|error| error.to_string())?;
         self.process_client_effects(now, effects)
     }
@@ -923,15 +2325,21 @@ impl R5BaselineHarness {
             .client_driver
             .as_mut()
             .ok_or_else(|| "client driver missing".to_owned())?
-            .try_recv_next()
+            .try_recv_next_for_client_controller()
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "scheduled client driver turn had no input".to_owned())?;
-        let effects = self
-            .client_supervisor
+        let applied = self
+            .client_controller
             .as_mut()
-            .ok_or_else(|| "client supervisor missing".to_owned())?
-            .apply_command(SessionOwnerCommand::Driver(input))
-            .map_err(|error| error.to_string())?;
+            .ok_or_else(|| "client controller missing".to_owned())?
+            .apply_driver_input(input);
+        let effects = match applied {
+            ClientControllerDriverApply::Applied(effects) => effects,
+            ClientControllerDriverApply::Deferred { block, .. } => {
+                return Err(format!("client reducer deferred driver input: {block:?}"));
+            }
+            ClientControllerDriverApply::Failed(error) => return Err(error.to_string()),
+        };
         self.process_client_effects(now, effects)
     }
 
@@ -1297,10 +2705,10 @@ impl R5BaselineHarness {
         terminal: TerminalGrace,
     ) -> Result<(), String> {
         let effects = self
-            .client_supervisor
+            .client_controller
             .as_mut()
-            .ok_or_else(|| "client supervisor missing at terminal expiry".to_owned())?
-            .apply_event(SessionEvent::TerminalGraceExpired { terminal })
+            .ok_or_else(|| "client controller missing at terminal expiry".to_owned())?
+            .expire_terminal_grace(terminal)
             .map_err(|error| error.to_string())?;
         self.process_client_effects(now, effects)
     }
@@ -1484,10 +2892,10 @@ impl R5BaselineHarness {
     }
 
     fn client_replay_bytes(&self, direction: Direction) -> usize {
-        self.client_supervisor
+        self.client_controller
             .as_ref()
-            .map(|supervisor| {
-                supervisor
+            .map(|controller| {
+                controller
                     .snapshot()
                     .session
                     .replay_usage(direction)
@@ -1515,11 +2923,8 @@ impl R5BaselineHarness {
             .ok_or_else(|| "baseline flow id missing".to_owned())
     }
 
-    fn charge_ack_decode(&mut self, event: &SessionEvent) -> Result<(), String> {
-        if matches!(
-            event,
-            SessionEvent::PeerFrame { frame, .. } if matches!(frame.record(), Record::Ack { .. })
-        ) {
+    fn charge_ack_decode(&mut self, is_ack: bool) -> Result<(), String> {
+        if is_ack {
             self.observed_work
                 .charge(self.work_budget, HarnessWorkCategory::AckDecode, 1)
                 .map_err(|error| error.to_string())?;
@@ -1590,8 +2995,11 @@ impl R5BaselineHarness {
         } else {
             self.observed_work
         };
-        self.client_outbound
-            .push(frame)
+        self.client_controller
+            .as_mut()
+            .ok_or_else(|| "client controller missing at outbound admission".to_owned())?
+            .enqueue_current_frame(frame)
+            .ok_or_else(|| "client controller has no active outbound queue".to_owned())?
             .map_err(|error| error.to_string())?;
         let before = self.observed_work;
         self.observed_work = charged;
@@ -1657,18 +3065,30 @@ impl R5BaselineHarness {
     fn flush_client_outbound(&mut self, now: SimTime) -> Result<(), String> {
         self.client_flush_scheduled = false;
         let work_budget = self.work_budget;
-        let result = {
+        let result = if let Some(controller) = self.client_controller.as_mut() {
+            controller.try_flush_current(
+                &mut self
+                    .scheduler
+                    .controller_sender(work_budget, &mut self.observed_work),
+                now,
+            )
+        } else {
             let (queue, endpoint, scheduler, observed_work) = (
                 &mut self.client_outbound,
                 &mut self.client_leg_io,
                 &mut self.scheduler,
                 &mut self.observed_work,
             );
-            queue.try_flush(
-                endpoint,
-                &mut scheduler.controller_sender(work_budget, observed_work),
-                now,
-            )
+            queue
+                .as_mut()
+                .ok_or_else(|| "raw client queue disappeared before flush".to_owned())?
+                .try_flush(
+                    endpoint
+                        .as_mut()
+                        .ok_or_else(|| "raw client endpoint disappeared before flush".to_owned())?,
+                    &mut scheduler.controller_sender(work_budget, observed_work),
+                    now,
+                )
         };
         if let Some(error) = self.scheduler.take_work_error() {
             return Err(error.to_string());
@@ -1683,7 +3103,14 @@ impl R5BaselineHarness {
             }
             Err(error) => return Err(error.to_string()),
         }
-        if !self.client_outbound.is_empty() {
+        let queue_is_empty = if let Some(controller) = self.client_controller.as_ref() {
+            controller.current_queue_is_empty().unwrap_or(true)
+        } else {
+            self.client_outbound
+                .as_ref()
+                .is_none_or(LegOutboundQueue::is_empty)
+        };
+        if !queue_is_empty {
             self.schedule_next(
                 now,
                 EventPhase::SupervisorCommand,
@@ -1786,11 +3213,11 @@ impl R5BaselineHarness {
         if !self.close_started || !self.client_terminal_seen || !self.owner_terminal_seen {
             return Err("R5 ended before both graceful terminals".to_owned());
         }
-        let client_snapshot = self
-            .client_supervisor
+        let client_controller = self
+            .client_controller
             .as_ref()
-            .ok_or_else(|| "client supervisor missing at report".to_owned())?
-            .snapshot();
+            .ok_or_else(|| "client controller missing at report".to_owned())?;
+        let client_snapshot = client_controller.snapshot();
         let owner = self
             .owner
             .as_ref()
@@ -1805,15 +3232,17 @@ impl R5BaselineHarness {
             .snapshot();
         let client_port_owned_bytes = client_port.uplink_owned_bytes();
         let client_port_quiescent = client_port.is_quiescent();
-        let client_leg = self.client_leg_io.counters();
+        let client_leg = client_controller
+            .current_counters()
+            .ok_or_else(|| "client controller lost its current counters".to_owned())?;
         let owner_leg = self.owner_leg_io.counters();
-        let outbound_queued_frames = self
-            .client_outbound
-            .len()
+        let outbound_queued_frames = client_controller
+            .current_queued_frames()
+            .ok_or_else(|| "client controller lost its current queue".to_owned())?
             .saturating_add(self.owner_outbound.len());
-        let outbound_queued_bytes = self
-            .client_outbound
-            .owned_bytes()
+        let outbound_queued_bytes = client_controller
+            .current_queued_bytes()
+            .ok_or_else(|| "client controller lost its current queue".to_owned())?
             .saturating_add(self.owner_outbound.owned_bytes());
         let client_session = client_snapshot.session;
         let owner_session = owner_snapshot.session.session;
@@ -1991,502 +3420,4 @@ fn run_r5_baseline() -> Result<R5BaselineReport, String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use bytes::Bytes;
-
-    use super::*;
-    use crate::owned_upstream::leg_io::{LegEndpointRole, LegIo, LegIoLimits};
-    use crate::owned_upstream::two_leg::{
-        EventBudget, LegId, SimTime, WireDirection, WireLane, WireRoute,
-    };
-    use crate::resumable::{
-        AttachAlpn, AttachTransportBinding, ByteOffset, DevicePrincipal, Direction, Frame,
-        LegGeneration, OwnerIdentity, Record, SessionFlowId, TlsExporterBinding,
-    };
-
-    fn test_transport_binding() -> AttachTransportBinding {
-        AttachTransportBinding::new(
-            OwnerIdentity::new([0x31; 32]).unwrap(),
-            AttachAlpn::new(b"mini-vpn-owned/1").unwrap(),
-            TlsExporterBinding::new([0x51; 32]).unwrap(),
-            DevicePrincipal::new([0x53; 16]).unwrap(),
-        )
-    }
-
-    struct RejectOnceTransport {
-        reject_next: bool,
-        accepted: Vec<Vec<u8>>,
-    }
-
-    impl EncodedLegTransport for RejectOnceTransport {
-        fn send_encoded(
-            &mut self,
-            _now: SimTime,
-            _route: WireRoute,
-            _lane: WireLane,
-            bytes: Vec<u8>,
-        ) -> Result<(), EncodedLegTransportError> {
-            if self.reject_next {
-                self.reject_next = false;
-                return Err(EncodedLegTransportError::Wire(
-                    WireError::LiveMessageCapacityExceeded,
-                ));
-            }
-            self.accepted.push(bytes);
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn global_scheduler_releases_exactly_one_wire_message_per_turn() {
-        let mut harness = ByteHarnessScheduler::new(EventBudget::new(8, 1_024).unwrap());
-        let limits = LegIoLimits::new(1_024, 4, 4_096, 4, 4_096).unwrap();
-        let binding = test_transport_binding();
-        let mut client =
-            LegIo::for_authenticated_transport(LegId::A, LegEndpointRole::Client, binding, limits);
-        let work_budget = R5ScenarioManifest::baseline().work_budget().unwrap();
-        let mut observed_work = HarnessObservedWork::default();
-        {
-            let mut sender = harness.controller_sender(work_budget, &mut observed_work);
-
-            for offset in [0, 1] {
-                client
-                    .send_frame(
-                        &mut sender,
-                        SimTime::ZERO,
-                        Frame::try_new(
-                            LegGeneration::new(1).unwrap(),
-                            Record::Data {
-                                flow_id: SessionFlowId::new(1).unwrap(),
-                                direction: Direction::ClientToTarget,
-                                offset: ByteOffset::new(offset),
-                                payload: Bytes::from_static(b"x"),
-                            },
-                        )
-                        .unwrap(),
-                    )
-                    .unwrap();
-            }
-        }
-
-        assert_eq!(harness.pending_actions(), 2);
-        let HarnessAction::WireDelivery {
-            delivery: first,
-            completion: first_completion,
-        } = harness.pop_next_checked().unwrap().unwrap().into_payload()
-        else {
-            panic!("wire-only fixture scheduled a non-wire action")
-        };
-        assert!(first_completion.is_none());
-        assert_eq!(
-            first.route(),
-            WireRoute::new(LegId::A, WireDirection::ClientToOwner)
-        );
-        assert_eq!(first.lane(), WireLane::Data);
-        assert_eq!(harness.pending_actions(), 1);
-        let HarnessAction::WireDelivery {
-            delivery: second,
-            completion: second_completion,
-        } = harness.pop_next_checked().unwrap().unwrap().into_payload()
-        else {
-            panic!("wire-only fixture scheduled a non-wire action")
-        };
-        assert!(second_completion.is_none());
-        assert_eq!(second.route(), first.route());
-        assert_eq!(second.lane(), WireLane::Data);
-        assert_eq!(harness.pending_actions(), 0);
-    }
-
-    #[test]
-    fn failed_wire_schedule_does_not_commit_any_observed_work() {
-        let mut harness = ByteHarnessScheduler::new(EventBudget::new(1, 1_024).unwrap());
-        harness
-            .schedule(
-                SimTime::ZERO,
-                EventPhase::SupervisorCommand,
-                CLIENT_SUPERVISOR,
-                0,
-                0xdead,
-                HarnessAction::StartOpen,
-            )
-            .unwrap();
-        let work_budget = R5ScenarioManifest::baseline().work_budget().unwrap();
-        let mut observed_work = HarnessObservedWork::default();
-        let frame = Frame::try_new(
-            LegGeneration::new(1).unwrap(),
-            Record::Data {
-                flow_id: SessionFlowId::new(1).unwrap(),
-                direction: Direction::ClientToTarget,
-                offset: ByteOffset::new(0),
-                payload: Bytes::from_static(b"transactional"),
-            },
-        )
-        .unwrap();
-        let encoded = frame.encode().unwrap();
-
-        let error = harness
-            .controller_sender(work_budget, &mut observed_work)
-            .send_encoded(
-                SimTime::ZERO,
-                WireRoute::new(LegId::A, WireDirection::ClientToOwner),
-                WireLane::Data,
-                encoded.to_vec(),
-            )
-            .unwrap_err();
-
-        assert_eq!(
-            error,
-            EncodedLegTransportError::Wire(
-                WireError::Schedule(ScheduleError::EventBudgetExceeded,)
-            )
-        );
-        assert_eq!(observed_work, HarnessObservedWork::default());
-        assert_eq!(harness.next_send_ordinal, 0);
-        assert_eq!(harness.pending_actions(), 1);
-    }
-
-    #[test]
-    fn failed_multi_category_wire_charge_does_not_commit_earlier_categories() {
-        let work_budget = R5ScenarioManifest::baseline().work_budget().unwrap();
-        let mut harness = ByteHarnessScheduler::new(work_budget.event_budget());
-        let mut observed_work = HarnessObservedWork::default();
-        observed_work
-            .charge(
-                work_budget,
-                HarnessWorkCategory::WireDelivery,
-                work_budget.categories().wire_delivery_turns(),
-            )
-            .unwrap();
-        let before = observed_work;
-        let frame = Frame::try_new(
-            LegGeneration::new(1).unwrap(),
-            Record::Data {
-                flow_id: SessionFlowId::new(1).unwrap(),
-                direction: Direction::ClientToTarget,
-                offset: ByteOffset::new(0),
-                payload: Bytes::from_static(b"transactional"),
-            },
-        )
-        .unwrap();
-
-        harness
-            .controller_sender(work_budget, &mut observed_work)
-            .send_encoded(
-                SimTime::ZERO,
-                WireRoute::new(LegId::A, WireDirection::ClientToOwner),
-                WireLane::Data,
-                frame.encode().unwrap().to_vec(),
-            )
-            .unwrap_err();
-
-        assert_eq!(observed_work, before);
-        assert_eq!(
-            harness.take_work_error(),
-            Some(CapacityError::HarnessWorkCategoryExceeded {
-                category: HarnessWorkCategory::WireDelivery,
-            })
-        );
-        assert_eq!(harness.next_send_ordinal, 0);
-        assert_eq!(harness.pending_actions(), 0);
-    }
-
-    #[test]
-    fn rejected_transport_send_retains_exact_bounded_frame_for_retry() {
-        let limits = LegIoLimits::new(1_024, 4, 4_096, 4, 4_096).unwrap();
-        let mut endpoint = LegIo::for_authenticated_transport(
-            LegId::A,
-            LegEndpointRole::Client,
-            test_transport_binding(),
-            limits,
-        );
-        let frame = Frame::try_new(
-            LegGeneration::new(1).unwrap(),
-            Record::Data {
-                flow_id: SessionFlowId::new(1).unwrap(),
-                direction: Direction::ClientToTarget,
-                offset: ByteOffset::new(0),
-                payload: Bytes::from_static(b"retained"),
-            },
-        )
-        .unwrap();
-        let encoded_len = frame.encode().unwrap().len();
-        let mut queue = LegOutboundQueue::new(1, encoded_len).unwrap();
-        queue.push(frame).unwrap();
-        let mut transport = RejectOnceTransport {
-            reject_next: true,
-            accepted: Vec::new(),
-        };
-
-        assert_eq!(
-            queue
-                .try_flush(&mut endpoint, &mut transport, SimTime::ZERO)
-                .unwrap_err(),
-            LegIoError::Transport(EncodedLegTransportError::Wire(
-                WireError::LiveMessageCapacityExceeded,
-            ))
-        );
-        assert_eq!(queue.len(), 1);
-        assert_eq!(queue.owned_bytes(), encoded_len);
-        assert_eq!(endpoint.counters().outbound_messages, 0);
-        assert!(transport.accepted.is_empty());
-
-        assert!(
-            !queue
-                .try_flush(&mut endpoint, &mut transport, SimTime::ZERO)
-                .unwrap()
-                .unwrap()
-                .is_ack
-        );
-        assert_eq!(queue.len(), 0);
-        assert_eq!(queue.owned_bytes(), 0);
-        assert_eq!(endpoint.counters().outbound_messages, 1);
-        assert_eq!(transport.accepted.len(), 1);
-        let decoded = Frame::decode_owned_exact(Bytes::from(transport.accepted.remove(0))).unwrap();
-        assert!(matches!(
-            decoded.record(),
-            Record::Data { payload, .. } if payload.as_ref() == b"retained"
-        ));
-    }
-
-    #[test]
-    fn full_outbound_queue_returns_exact_unconsumed_frame_to_producer() {
-        let first = Frame::try_new(
-            LegGeneration::new(1).unwrap(),
-            Record::Data {
-                flow_id: SessionFlowId::new(1).unwrap(),
-                direction: Direction::ClientToTarget,
-                offset: ByteOffset::new(0),
-                payload: Bytes::from_static(b"first"),
-            },
-        )
-        .unwrap();
-        let second = Frame::try_new(
-            LegGeneration::new(1).unwrap(),
-            Record::Data {
-                flow_id: SessionFlowId::new(1).unwrap(),
-                direction: Direction::ClientToTarget,
-                offset: ByteOffset::new(5),
-                payload: Bytes::from_static(b"secret-returned-frame"),
-            },
-        )
-        .unwrap();
-        let second_payload_ptr = match second.record() {
-            Record::Data { payload, .. } => payload.as_ptr(),
-            _ => unreachable!(),
-        };
-        let max_bytes = first.encode().unwrap().len() + second.encode().unwrap().len();
-        let mut queue = LegOutboundQueue::new(1, max_bytes).unwrap();
-        queue.push(first).unwrap();
-        let before_len = queue.len();
-        let before_bytes = queue.owned_bytes();
-
-        let error = queue.push(second).unwrap_err();
-        assert!(matches!(
-            error.kind(),
-            crate::owned_upstream::leg_io::LegOutboundQueueErrorKind::CapacityExceeded {
-                queued_frames: 1,
-                ..
-            }
-        ));
-        assert!(!format!("{error:?}").contains("secret-returned-frame"));
-        let returned = error.into_frame();
-        assert_eq!(queue.len(), before_len);
-        assert_eq!(queue.owned_bytes(), before_bytes);
-        assert!(matches!(
-            returned.record(),
-            Record::Data {
-                flow_id,
-                direction: Direction::ClientToTarget,
-                offset,
-                payload,
-            } if *flow_id == SessionFlowId::new(1).unwrap()
-                && *offset == ByteOffset::new(5)
-                && payload.as_ref() == b"secret-returned-frame"
-                && payload.as_ptr() == second_payload_ptr
-        ));
-    }
-
-    #[test]
-    fn attach_action_is_charged_to_global_scheduler_byte_budget() {
-        let binding = baseline_binding().unwrap();
-        let request = AttachRequest::new(
-            SessionId::new([0x16; 16]).unwrap(),
-            LegGeneration::new(2).unwrap(),
-            AttachNonce::new([0x62; 16]).unwrap(),
-            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
-            FeatureOffer::new(0b0111, 0b0001).unwrap(),
-        );
-        let proof = baseline_credentials()
-            .unwrap()
-            .prove(&request, &binding)
-            .unwrap();
-        let pending =
-            crate::owned_upstream::leg::EstablishedLeg::for_authenticated_transport(binding)
-                .begin_attach(request)
-                .bind_initial_frame(request.to_attach_frame(proof))
-                .unwrap();
-        let owned_bytes = pending.encoded_len().unwrap();
-        let mut scheduler =
-            ByteHarnessScheduler::new(EventBudget::new(1, owned_bytes.saturating_sub(1)).unwrap());
-
-        assert_eq!(
-            scheduler
-                .schedule(
-                    SimTime::ZERO,
-                    EventPhase::SupervisorCommand,
-                    CLIENT_SUPERVISOR,
-                    owned_bytes,
-                    0xdead,
-                    HarnessAction::StartAttach(pending),
-                )
-                .unwrap_err(),
-            ScheduleError::ByteBudgetExceeded
-        );
-        assert_eq!(scheduler.pending_actions(), 0);
-        assert_eq!(scheduler.pending_bytes(), 0);
-    }
-
-    #[test]
-    fn production_baseline_uses_one_derived_budget_and_validates_every_work_category() {
-        let budget = R5ScenarioManifest::baseline().work_budget().unwrap();
-        let report = run_r5_baseline().unwrap();
-        let limits = budget.categories();
-        let observed = report.observed_work.categories();
-
-        assert_eq!(report.work_budget, budget);
-        assert_eq!(report.scheduler_event_budget, budget.event_budget());
-        assert_eq!(report.step_limit, budget.max_turns());
-        assert_eq!(budget.validate_observed(report.observed_work), Ok(()));
-        assert_eq!(budget.max_wire_send_owned_bytes(), 776);
-        assert_eq!(budget.max_wire_delivery_owned_bytes(), 776);
-        assert_eq!(budget.max_non_wire_owned_bytes(), 6_656);
-        assert_eq!(budget.max_owned_bytes(), 8_208);
-        assert_eq!(budget.max_turns(), 118);
-        assert_eq!(limits.wire_send_turns(), 16);
-        assert_eq!(limits.wire_delivery_turns(), 16);
-        assert_eq!(limits.positive_accept_turns(), 4);
-        assert_eq!(limits.zero_would_block_turns(), 2);
-        assert_eq!(limits.ack_construct_turns(), 8);
-        assert_eq!(limits.ack_decode_turns(), 8);
-        assert_eq!(limits.fixed_actor_turns(), 64);
-        assert_eq!(report.observed_work.wire_send_owned_bytes(), 728);
-        assert_eq!(report.observed_work.wire_delivery_owned_bytes(), 728);
-        assert_eq!(report.observed_work.non_wire_owned_bytes(), 981);
-        assert_eq!(report.observed_work.total_owned_bytes(), Ok(2_437));
-        assert_eq!(observed.wire_send_turns(), 16);
-        assert_eq!(observed.wire_delivery_turns(), 16);
-        assert_eq!(observed.positive_accept_turns(), 4);
-        assert_eq!(observed.zero_would_block_turns(), 2);
-        assert_eq!(observed.ack_construct_turns(), 8);
-        assert_eq!(observed.ack_decode_turns(), 8);
-        assert_eq!(observed.fixed_actor_turns(), 55);
-        assert!(report.steps <= report.step_limit);
-    }
-
-    #[test]
-    fn production_byte_baseline_crosses_real_attach_wire_target_and_clean_fin() {
-        let report = run_r5_baseline().unwrap();
-
-        assert_eq!(report.target_open_attempts, 1);
-        assert_eq!(report.target_opened_flows, 1);
-        assert_eq!(report.client_to_target, b"client-production-bytes");
-        assert_eq!(report.target_to_client, b"owner-production-bytes");
-        assert_eq!(report.target_zero_accepts, 1);
-        assert_eq!(report.client_zero_accepts, 1);
-        assert!(report.target_positive_accepts >= 2);
-        assert!(report.client_positive_accepts >= 2);
-        assert_eq!(report.target_accepted_bytes, CLIENT_BYTES.len() as u64);
-        assert_eq!(report.client_accepted_bytes, OWNER_BYTES.len());
-        assert_eq!(report.client_replay_bytes, 0);
-        assert_eq!(report.owner_replay_bytes, 0);
-        assert_eq!(report.client_port_owned_bytes, 0);
-        assert_eq!(report.owner_port_owned_bytes, 0);
-        assert_eq!(report.owner_port_owned_segments, 0);
-        assert_eq!(report.target_live_flows, 0);
-        assert_eq!(report.target_tombstones, 0);
-        assert_eq!(report.client_live_flows, 0);
-        assert_eq!(report.owner_live_flows, 0);
-        assert_eq!(report.client_terminal_tombstones, 0);
-        assert_eq!(report.owner_terminal_tombstones, 0);
-        assert_eq!(report.owner_target_flows, 0);
-        assert_eq!(report.owner_pending_writes, 0);
-        assert_eq!(report.owner_pending_joins, 0);
-        assert!(report.client_port_quiescent);
-        assert!(report.client_ack_frames > 0);
-        assert!(report.owner_ack_frames > 0);
-        assert_eq!(report.outbound_queued_frames, 0);
-        assert_eq!(report.outbound_queued_bytes, 0);
-        assert_eq!(report.outbound_retries, 0);
-        assert_eq!(report.scheduler_pending_actions, 0);
-        assert_eq!(report.scheduler_pending_bytes, 0);
-        assert_eq!(report.zero_ledger, R5ZeroLedger::default());
-        assert!(report.encoded_messages >= 10);
-        assert!(report.bound_messages >= 10);
-        assert!(report.steps < 256);
-        assert_ne!(report.trace_hash, 0);
-    }
-
-    #[test]
-    fn production_baseline_retries_retained_attach_after_transport_pressure() {
-        let baseline = run_r5_baseline().unwrap();
-        let report = R5BaselineHarness::new_with_rejection(Some(0))
-            .unwrap()
-            .run()
-            .unwrap();
-        let baseline_turns = baseline.observed_work.categories();
-        let retry_turns = report.observed_work.categories();
-
-        assert_eq!(report.outbound_retries, 1);
-        assert_eq!(
-            retry_turns.fixed_actor_turns(),
-            baseline_turns.fixed_actor_turns() + 1
-        );
-        assert_eq!(
-            retry_turns.wire_send_turns(),
-            baseline_turns.wire_send_turns()
-        );
-        assert_eq!(
-            retry_turns.wire_delivery_turns(),
-            baseline_turns.wire_delivery_turns()
-        );
-        assert_eq!(
-            retry_turns.positive_accept_turns(),
-            baseline_turns.positive_accept_turns()
-        );
-        assert_eq!(
-            retry_turns.zero_would_block_turns(),
-            baseline_turns.zero_would_block_turns()
-        );
-        assert_eq!(
-            retry_turns.ack_construct_turns(),
-            baseline_turns.ack_construct_turns()
-        );
-        assert_eq!(
-            retry_turns.ack_decode_turns(),
-            baseline_turns.ack_decode_turns()
-        );
-        assert_eq!(
-            report.observed_work.wire_send_owned_bytes(),
-            baseline.observed_work.wire_send_owned_bytes()
-        );
-        assert_eq!(
-            report.observed_work.wire_delivery_owned_bytes(),
-            baseline.observed_work.wire_delivery_owned_bytes()
-        );
-        assert_eq!(
-            report.observed_work.non_wire_owned_bytes(),
-            baseline.observed_work.non_wire_owned_bytes()
-        );
-        assert_eq!(
-            report.work_budget.validate_observed(report.observed_work),
-            Ok(())
-        );
-        assert_eq!(report.target_open_attempts, 1);
-        assert_eq!(report.client_to_target, CLIENT_BYTES);
-        assert_eq!(report.target_to_client, OWNER_BYTES);
-        assert_eq!(report.outbound_queued_frames, 0);
-        assert_eq!(report.outbound_queued_bytes, 0);
-        assert_eq!(report.scheduler_pending_actions, 0);
-        assert_eq!(report.scheduler_pending_bytes, 0);
-    }
-}
+mod tests;

@@ -2,8 +2,8 @@
 
 Date: 2026-08-18
 
-Status: **IN PROGRESS; TASKS 1–3 COMPLETE; TASK 4 R1–R5 FOUNDATION
-ACCEPTED; R6 NEXT; M3 BLOCKED**
+Status: **IN PROGRESS; TASKS 1–3 COMPLETE; TASK 4 R1–R5 AND R6A–D NECESSARY
+LOCAL SLICES ACCEPTED; R7A–D AND R8–R9 OPEN; M2 NOT RUN; M3 BLOCKED**
 
 > Use `diagnose` and `tdd` for each behavior change. Use
 > `improve-codebase-architecture` when a test cannot reach the required
@@ -85,7 +85,8 @@ WAN, and throughput remain unimplemented. See
 
 ## Task 4: Deterministic two-leg transport harness
 
-Status: **IN PROGRESS — R1–R5 FOUNDATION ACCEPTED LOCALLY; R6–R9 OPEN**
+Status: **IN PROGRESS — R1–R5 AND R6A–D NECESSARY LOCAL SLICES ACCEPTED;
+R7A–D AND R8–R9 OPEN**
 
 - Build in-memory client/ingress/owner legs with deterministic clocks.
 - Inject drop, reorder, duplicate, delayed ACK, primary blackouts from
@@ -107,10 +108,105 @@ pristine supervisor is the sole factory mint, and final continuation/replay/
 Target/wire ownership is zero. Independent reviews report P0/P1 `0/0` for
 this foundation.
 
-This does not meet Task-4 acceptance. Standby registration, authenticated
-probe/hint control, a production-shared switch controller, ordered
-acceptance-before-recovery, stale-A retirement, the R8 fault matrix, and R9
-real-smoltcp parity remain open. Result:
+R6 local result: the authenticated initial/registered/catch-up transaction now
+has a by-value client controller, bounded pre-encoded recovery, exact queue and
+delivery ownership, an inbound barrier before decoding, replay-range-bound
+positive application ACK completion, and two-phase current-leg terminal
+handling. Deterministic normal and catch-up replacement tests cover pressure,
+FIFO order, acceptance loss, and exact-return failures. See
+`docs/tech/2026-08-20-knife16-r6-client-replacement-transaction-local-results.md`.
+
+The fixed Quinn actor Slice A now additionally owns one exact actor
+incarnation, the live exporter-derived transport, independent bounded DATA and
+DELIVERED lanes, cooperative cancel, one root plus four fixed children, exact
+zero-ownership join, and role-correct private/shared Endpoint cleanup. Its
+real-loopback tracer, shared-listener isolation, unclean termination guards,
+source provenance, 100-repeat, and broad local gates pass. See
+`docs/tech/2026-08-22-knife16-r6-quinn-leg-actor-local-results.md`.
+
+The exact retired-A composition slice now binds the controller's policy
+incarnation to the real actor runtime incarnation, moves only retired A into
+one bounded split-phase cleanup task, and lets only A's real joined witness
+synchronously clear A's controller slot. The real Quinn tracer proves no early
+capacity, independent wrong-actor rejection, ordered active-B delivery while A
+is joining and after A clears, no false logical loss, and monotonic
+caller-cancellation-safe final shutdown. It passes 100 consecutive runs and
+three final reviews report P0/P1/P2 `0/0/0`. See
+`docs/tech/2026-08-24-knife16-r6-retired-actor-join-composition-local-results.md`.
+
+The actor-inbound composition slice now moves one bounded real Quinn raw record
+through the exact current or retired controller slot without exposing raw
+bytes, caller feature authority, or actor permits. Recovery blocks before
+dequeue/decode; active B remains driveable while retired A is Joining; late A
+is inert. Physical DELIVERED commits only after route/decode/lane
+classification and remains separate from application ACK/replay. The bridge
+adds no task, queue, permit, byte copy, or capacity increase. Its real positive
+and fatal/no-ACK tracers each pass `100/100`; broad local, provenance,
+real-smoltcp, Clippy, rustdoc, and vendored Quinn/proto gates pass. Three
+independent final reviews report P0/P1/P2 `0/0/0`; architecture score is
+`8.5/10`. See
+`docs/tech/2026-08-24-knife16-r6-actor-inbound-composition-local-results.md`.
+
+The current-terminal composition sub-slice now publishes a real actor terminal
+after zero actor message/byte/DELIVERED ownership but before the physical close
+tail, binds it to the same controller/runtime incarnation, and consumes exactly
+one existing `LegLost`. Actor fatal, current policy, and Unbound shutdown share
+one first-failure mutex; pre-bind rejection restores the terminal, and
+post-consumption failures remain sticky through structural join. Real
+peer-close, Recovering-B/retired-A, and reporter-failure/handoff-closure
+tracers each pass `100/100`; final review reports P0/P1/P2 `0/0/0`. See
+`docs/tech/2026-08-24-knife16-r6-current-actor-terminal-composition-local-results.md`.
+
+The post-loss B sub-slice now begins only after real A loss, installs ordinary
+registered B, replays non-empty DATA through B into the existing Target,
+requires the owner reducer's exact first positive application ACK, releases
+the intersecting replay range, and clears only terminal-bound joined A. Exact
+rollback, pending-ACK shutdown, caller cancellation, missing-runtime, and
+wrong-retired-identity ownership are closed locally. See
+`docs/tech/2026-08-24-knife16-r6-post-loss-b-recovery-transaction-local-results.md`.
+
+R6b now binds current A and registered B to exact physical/correlation probe
+authority only after positive ordered Quinn writer completion. Both ACK paths
+enforce the supplied actor-observation time; exact deadline is accepted and
+deadline plus one nanosecond is inert at that local seam. This is not a
+transport-arrival timestamp and therefore is not R7 deadline acceptance. Probe
+expiry, spontaneous close, and shutdown share one first-failure transaction.
+Its real-Quinn recovery tracer reaches the existing Target and requires B's
+first positive application ACK before replay release and exact retired-A
+clear. See
+`docs/tech/2026-08-25-knife16-r6b-silent-probe-arbitration-local-results.md`.
+
+R6c closes the deterministic late-record matrix without changing production
+runtime behavior. Retired physical A DATA/ACK/CLOSE/RESET is inert for either
+claimed generation; owner-B/client-A and current-B/stale-A routes fail their
+exact generation checks. Equal numeric A/B DELIVERED ordinals remain
+actor-private, terminal-bound prequeued A input drains before classification,
+and only the Target-backed B application ACK advances recovery and releases
+replay. Six critical tracers each pass `100/100`; independent reviews report
+P0/P1/P2 `0/0/0`. See
+`docs/tech/2026-08-25-knife16-r6c-late-record-closure-local-results.md`.
+
+R6d now closes the checked aggregate `<=500ms` recovery-capacity sum and the
+production-shared composition root/nursery lifecycle locally. The root owns
+real Quinn composition, one sole factory, prepared Open, bounded fair
+categories, nonpolling progress cursors, same-clock semantic timers,
+shutdown/fatal drains, lifecycle-linearized admission cutoff, and an exact
+session-inclusive zero witness. Focused and broad local gates plus the final
+lifecycle race repeats pass. See
+`docs/tech/2026-08-25-knife16-r6d-recovery-capacity-production-root-local-results.md`.
+
+This still does not meet Task-4 acceptance. The real TUN path selects the
+legacy upstream and no real owner/server or second ingress exists. R7a–d are
+now next and remain unimplemented: reverse-only failure must not use a local
+fault oracle, while authenticated hint, rejection matrix, and
+hard-failure/local-stall/hint trigger-race arbitration have no
+production-shared closure. Before R7 deadline or combined-horizon acceptance,
+the Quinn actor must capture same-monotonic-clock arrival time at
+transport-read admission and preserve it through queue/publication; the
+existing publication epoch is ordering-only. The R8 fault matrix, R9
+real-smoltcp replacement parity, UDP, and one-second M2 acceptance remain
+open. No TUN, VPS, WAN, throughput, or M2 run is authorized by this local
+result. Foundation result:
 `docs/tech/2026-08-18-knife16-two-leg-foundation-local-results.md`.
 
 ## Task 5: UDP dual-leg delivery engine

@@ -6,6 +6,8 @@ use std::num::NonZeroU16;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+pub(crate) mod generation;
+
 /// The non-zero local association selected by the TUN UDP flow table.
 ///
 /// This remains deliberately distinct from the session-scoped
@@ -126,6 +128,7 @@ pub enum UdpDownlinkEvent {
 }
 
 enum UdpDownlinkSourceInner {
+    Generation(generation::Source),
     LegacyRaw {
         receiver: mpsc::Receiver<Vec<u8>>,
         reassembler: FragReassembler,
@@ -147,6 +150,14 @@ pub struct UdpDownlinkSource {
 }
 
 impl UdpDownlinkSource {
+    #[cfg(test)]
+    pub(crate) fn generation_pending(&self) -> Option<usize> {
+        match &self.inner {
+            UdpDownlinkSourceInner::Generation(source) => Some(source.pending()),
+            _ => None,
+        }
+    }
+
     pub fn legacy_raw(receiver: mpsc::Receiver<Vec<u8>>) -> Self {
         Self {
             inner: UdpDownlinkSourceInner::LegacyRaw {
@@ -166,6 +177,7 @@ impl UdpDownlinkSource {
     /// side is closed and drained.
     pub async fn recv(&mut self, clock: &Instant) -> Option<UdpDownlinkEvent> {
         match &mut self.inner {
+            UdpDownlinkSourceInner::Generation(source) => source.recv(clock).await,
             UdpDownlinkSourceInner::LegacyRaw {
                 receiver,
                 reassembler,
@@ -195,6 +207,9 @@ impl UdpDownlinkSource {
     /// Preserve the existing explicit legacy fragment TTL sweep. Owned UDP
     /// delivery has no TUIC fragments at this boundary.
     pub fn sweep(&mut self, now_secs: u64, ttl_secs: u64) {
+        if let UdpDownlinkSourceInner::Generation(source) = &mut self.inner {
+            source.sweep(now_secs, ttl_secs);
+        }
         if let UdpDownlinkSourceInner::LegacyRaw { reassembler, .. } = &mut self.inner {
             reassembler.sweep(now_secs, ttl_secs);
         }

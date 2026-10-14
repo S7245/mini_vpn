@@ -30,7 +30,7 @@ use proto::{
 use rustc_hash::{FxHashMap, FxHashSet};
 #[cfg(all(not(wasm_browser), any(feature = "aws-lc-rs", feature = "ring"),))]
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::sync::{futures::Notified, mpsc, Notify};
+use tokio::sync::{futures::Notified, mpsc, oneshot, Notify};
 use tracing::{Instrument, Span};
 use udp::{RecvMeta, BATCH_SIZE};
 
@@ -50,6 +50,28 @@ pub struct Endpoint {
     pub(crate) inner: EndpointRef,
     pub(crate) default_client_config: Option<ClientConfig>,
     runtime: Arc<dyn Runtime>,
+    driver_drain: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+}
+
+/// A single-use witness that one exact endpoint I/O driver completed normally.
+///
+/// The witness cannot complete while a clone of its [`Endpoint`] remains live.
+/// An I/O error, panic, task abort, or runtime shutdown drops the completion
+/// sender and therefore fails [`drained`](Self::drained) closed.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct EndpointDriverDrain {
+    driver_released: oneshot::Receiver<()>,
+}
+
+impl EndpointDriverDrain {
+    /// Wait for normal completion of the exact endpoint I/O driver.
+    ///
+    /// The handle is consumed so the completion witness has only one waiter.
+    #[doc(hidden)]
+    pub async fn drained(self) -> bool {
+        self.driver_released.await.is_ok()
+    }
 }
 
 impl Endpoint {
@@ -160,10 +182,20 @@ impl Endpoint {
             runtime.clone(),
         );
         let driver = EndpointDriver(rc.clone());
+        let (driver_released_send, driver_released_recv) = oneshot::channel();
         runtime.spawn(Box::pin(
             async {
-                if let Err(e) = driver.await {
-                    tracing::error!("I/O error: {}", e);
+                // The await temporary, including its EndpointRef and socket
+                // ownership, is dropped at this statement boundary. Only then
+                // may normal completion mint the release acknowledgement.
+                let result = driver.await;
+                match result {
+                    Ok(()) => {
+                        let _ = driver_released_send.send(());
+                    }
+                    Err(e) => {
+                        tracing::error!("I/O error: {}", e);
+                    }
                 }
             }
             .instrument(Span::current()),
@@ -172,7 +204,21 @@ impl Endpoint {
             inner: rc,
             default_client_config: None,
             runtime,
+            driver_drain: Arc::new(Mutex::new(Some(driver_released_recv))),
         })
+    }
+
+    /// Take the sole normal-completion witness for this endpoint's I/O driver.
+    ///
+    /// All endpoint clones share one slot, so at most one caller can obtain the
+    /// witness. The returned handle does not retain an endpoint reference.
+    #[doc(hidden)]
+    pub fn take_driver_drain_handle(&mut self) -> Option<EndpointDriverDrain> {
+        self.driver_drain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .map(|driver_released| EndpointDriverDrain { driver_released })
     }
 
     /// Get the next incoming connection attempt from a client
@@ -353,6 +399,37 @@ impl Endpoint {
             .await;
         }
     }
+
+    /// Wait for all connections to be removed, failing closed if the endpoint
+    /// driver exits before that condition can be observed.
+    #[doc(hidden)]
+    pub async fn wait_idle_or_driver_lost(&self) -> bool {
+        loop {
+            let notified = {
+                let endpoint = &mut *self.inner.state.lock().unwrap();
+                if let Some(idle) = idle_or_driver_lost(
+                    endpoint.driver_lost,
+                    endpoint.recv_state.connections.is_empty(),
+                ) {
+                    return idle;
+                }
+                // Construct the future while locked to avoid losing either an
+                // idle transition or a driver-loss notification.
+                self.inner.shared.idle.notified()
+            };
+            notified.await;
+        }
+    }
+}
+
+fn idle_or_driver_lost(driver_lost: bool, connections_empty: bool) -> Option<bool> {
+    if driver_lost {
+        Some(false)
+    } else if connections_empty {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 /// Statistics on [Endpoint] activity
@@ -430,6 +507,13 @@ impl Drop for EndpointDriver {
         let mut endpoint = self.0.state.lock().unwrap();
         endpoint.driver_lost = true;
         self.0.shared.incoming.notify_waiters();
+        self.0.shared.idle.notify_waiters();
+        // No endpoint event can be acknowledged once this driver is gone.
+        // Close and drain the receiver so queued acknowledgement senders are
+        // dropped now and all later sends fail, allowing exact cleanup waiters
+        // to fail closed instead of waiting forever.
+        endpoint.events.close();
+        while endpoint.events.try_recv().is_ok() {}
         // Drop all outgoing channels, signaling the termination of the endpoint to the associated
         // connections.
         endpoint.recv_state.connections.senders.clear();
@@ -525,10 +609,7 @@ struct PreviousSocketConnections {
 }
 
 impl PreviousSocketConnections {
-    fn at_rebind(
-        generation: u64,
-        connections: impl IntoIterator<Item = ConnectionHandle>,
-    ) -> Self {
+    fn at_rebind(generation: u64, connections: impl IntoIterator<Item = ConnectionHandle>) -> Self {
         Self {
             generation,
             pending: connections.into_iter().collect(),
@@ -609,7 +690,7 @@ impl State {
                 }
             };
 
-            let event = match event {
+            let (event, endpoint_released) = match event {
                 ConnectionToEndpointEvent::AuthenticatedCurrentSocketRx(generation) => {
                     self.stats.current_socket_rx_rebind_generation = self
                         .stats
@@ -622,9 +703,11 @@ impl State {
                     }
                     continue;
                 }
-                ConnectionToEndpointEvent::Proto(event) => event,
+                ConnectionToEndpointEvent::Proto {
+                    event,
+                    endpoint_released,
+                } => (event, endpoint_released),
             };
-
             if event.is_drained() {
                 self.recv_state.connections.senders.remove(&ch);
                 self.prev_socket_connections.note_connection_drained(ch);
@@ -635,7 +718,11 @@ impl State {
                     shared.idle.notify_waiters();
                 }
             }
-            let Some(event) = self.inner.handle_event(ch, event) else {
+            let event = self.inner.handle_event(ch, event);
+            if let Some(endpoint_released) = endpoint_released {
+                let _ = endpoint_released.send(());
+            }
+            let Some(event) = event else {
                 continue;
             };
             // Ignoring errors from dropped connections that haven't yet been cleaned up
@@ -957,9 +1044,7 @@ impl RecvState {
                     }
                 }
                 Poll::Pending => {
-                    return Ok(PollProgress {
-                        keep_going: false,
-                    });
+                    return Ok(PollProgress { keep_going: false });
                 }
                 // Ignore ECONNRESET as it's undefined in QUIC and may be injected by an
                 // attacker
@@ -971,9 +1056,7 @@ impl RecvState {
                 }
             }
             if !self.recv_limiter.allow_work(|| runtime.now()) {
-                return Ok(PollProgress {
-                    keep_going: true,
-                });
+                return Ok(PollProgress { keep_going: true });
             }
         }
     }
@@ -994,6 +1077,18 @@ impl fmt::Debug for RecvState {
 struct PollProgress {
     /// Whether datagram handling was interrupted early by the work limiter for fairness
     keep_going: bool,
+}
+
+#[cfg(test)]
+mod endpoint_driver_loss_tests {
+    use super::idle_or_driver_lost;
+
+    #[test]
+    fn driver_loss_is_fail_closed_even_after_connection_map_is_empty() {
+        assert_eq!(idle_or_driver_lost(true, true), Some(false));
+        assert_eq!(idle_or_driver_lost(false, true), Some(true));
+        assert_eq!(idle_or_driver_lost(false, false), None);
+    }
 }
 
 #[cfg(test)]

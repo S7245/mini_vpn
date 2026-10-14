@@ -1,3 +1,17 @@
+#[cfg(all(
+    feature = "medium-ip",
+    feature = "proto-ipv4",
+    feature = "socket-tcp",
+    feature = "socket-udp"
+))]
+mod egress;
+#[cfg(all(
+    feature = "medium-ip",
+    feature = "proto-ipv4",
+    feature = "socket-tcp",
+    feature = "socket-udp"
+))]
+mod ingress_effects;
 #[cfg(feature = "proto-ipv4")]
 mod ipv4;
 #[cfg(feature = "proto-ipv6")]

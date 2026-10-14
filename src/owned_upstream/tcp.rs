@@ -10,15 +10,19 @@
 //! remains attached through reducer replay ownership until exact ACK or
 //! terminal release.
 
+pub(super) mod cold_inventory;
+mod driver_receive;
+mod factory_construction;
+mod uplink_replay;
 use std::fmt;
 use std::sync::{
-    Arc, Mutex, MutexGuard,
+    Arc, Mutex, MutexGuard, Weak,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use bytes::Bytes;
 use thiserror::Error;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
 use crate::resumable::{
     ByteOffset, Direction, FlowFinishReason, LocalFlow, MAX_DATA_PAYLOAD_BYTES, ReplayAcknowledged,
@@ -26,12 +30,16 @@ use crate::resumable::{
     SinkHalfClose, SinkOffer, TcpDataSegment,
 };
 
-use super::supervisor::TcpFactoryOrigin;
+use super::supervisor::{ClientControllerDriverReducerGate, TcpFactoryOrigin};
 
 const TERMINAL_RESET_LANE_CAPACITY: usize = 1;
 const TERMINAL_ACTION_LANE_CAPACITY: usize = 1;
 const CONTROL_BURST_LIMIT: usize = 8;
-
+const MAX_EXACT_UPLINK_BYTE_CAPACITY: usize = if (u32::MAX as usize) < Semaphore::MAX_PERMITS {
+    u32::MAX as usize
+} else {
+    Semaphore::MAX_PERMITS
+};
 /// Exact queue and byte bounds for one TCP flow port.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlowPortConfig {
@@ -40,7 +48,6 @@ pub struct FlowPortConfig {
     control_messages: usize,
     downlink_actions: usize,
 }
-
 impl FlowPortConfig {
     pub fn new(
         uplink_byte_capacity: usize,
@@ -48,14 +55,7 @@ impl FlowPortConfig {
         control_messages: usize,
         downlink_actions: usize,
     ) -> Result<Self, FlowPortConfigError> {
-        if uplink_byte_capacity == 0 {
-            return Err(FlowPortConfigError::ZeroUplinkByteCapacity);
-        }
-        if u32::try_from(uplink_byte_capacity).is_err() {
-            return Err(FlowPortConfigError::UplinkByteCapacityTooLarge {
-                value: uplink_byte_capacity,
-            });
-        }
+        validate_uplink_byte_capacity(uplink_byte_capacity)?;
         if uplink_data_messages == 0 {
             return Err(FlowPortConfigError::ZeroUplinkMessageCapacity);
         }
@@ -80,6 +80,10 @@ impl FlowPortConfig {
         self.uplink_byte_capacity
     }
 
+    pub(crate) const fn max_exact_uplink_byte_capacity() -> usize {
+        MAX_EXACT_UPLINK_BYTE_CAPACITY
+    }
+
     pub const fn uplink_data_messages(self) -> usize {
         self.uplink_data_messages
     }
@@ -97,8 +101,8 @@ impl FlowPortConfig {
 pub enum FlowPortConfigError {
     #[error("uplink byte capacity must be non-zero")]
     ZeroUplinkByteCapacity,
-    #[error("uplink byte capacity {value} exceeds the semaphore's exact u32 permit range")]
-    UplinkByteCapacityTooLarge { value: usize },
+    #[error("uplink byte capacity {value} exceeds the exact permit ceiling {max}")]
+    UplinkByteCapacityTooLarge { value: usize, max: usize },
     #[error("uplink DATA message capacity must be non-zero")]
     ZeroUplinkMessageCapacity,
     #[error("per-flow uplink replay segment capacity must be non-zero")]
@@ -121,8 +125,9 @@ pub enum FlowPortConfigError {
         value: usize,
         max: usize,
     },
+    #[error("per-flow TCP channel slot envelope overflowed")]
+    ChannelEnvelopeOverflow,
 }
-
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum FlowPortError {
     #[error("uplink DATA length must be between 1 and {MAX_DATA_PAYLOAD_BYTES} bytes, got {len}")]
@@ -151,6 +156,10 @@ pub enum FlowPortError {
     DownlinkLaneFull,
     #[error("flow port is closed")]
     Closed,
+    #[error("flow driver admission is sealed for local abandonment")]
+    DriverAdmissionSealed,
+    #[error("flow factory admission is closed for session shutdown")]
+    FactoryAdmissionClosed,
     #[error("uplink byte budget cannot admit {requested} bytes; {available} are available")]
     UplinkByteBudgetExhausted { requested: usize, available: usize },
     #[error("session uplink byte budget cannot admit {requested} bytes; {available} are available")]
@@ -179,6 +188,10 @@ pub enum FlowPortError {
     },
     #[error("local sink capability was revoked by flow terminal authority")]
     SinkCapabilityRevoked,
+    #[error("Owner terminal retains completions={completions}, actions={actions}")]
+    OwnerTerminalOwnershipPending { completions: usize, actions: usize },
+    #[error("Owner source admission mutex is poisoned")]
+    OwnerAdmissionPoisoned,
     #[error("terminal effect belongs to another flow")]
     CrossFlowTerminalEffect,
     #[error("session effect is not a TUN terminal action")]
@@ -190,7 +203,6 @@ pub enum FlowPortError {
     #[error("sink reported {accepted} bytes but the exposed first segment contains {available}")]
     InvalidSinkAcceptance { accepted: usize, available: usize },
 }
-
 /// Cloneable handle to one session's exact aggregate uplink ownership budget.
 ///
 /// Every flow port in the same resumable session must be constructed with a
@@ -203,7 +215,7 @@ struct UplinkByteLedger {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum FactoryFlowGate {
+enum FactoryFlowBinding {
     Unbound,
     Bound {
         session_id: SessionId,
@@ -212,18 +224,52 @@ enum FactoryFlowGate {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FactoryFlowGate {
+    binding: FactoryFlowBinding,
+    closed: bool,
+}
+
 impl FactoryFlowGate {
+    const fn unbound() -> Self {
+        Self {
+            binding: FactoryFlowBinding::Unbound,
+            closed: false,
+        }
+    }
+
+    const fn bound(session_id: SessionId, direction: Direction) -> Self {
+        Self {
+            binding: FactoryFlowBinding::Bound {
+                session_id,
+                direction,
+                highest_authority_id: 0,
+            },
+            closed: false,
+        }
+    }
+
+    const fn bound_direction(self) -> Option<Direction> {
+        match self.binding {
+            FactoryFlowBinding::Unbound => None,
+            FactoryFlowBinding::Bound { direction, .. } => Some(direction),
+        }
+    }
+
     fn admit(&mut self, flow: LocalFlow) -> Result<(), FlowPortError> {
-        match self {
-            Self::Unbound => {
-                *self = Self::Bound {
+        if self.closed {
+            return Err(FlowPortError::FactoryAdmissionClosed);
+        }
+        match &mut self.binding {
+            FactoryFlowBinding::Unbound => {
+                self.binding = FactoryFlowBinding::Bound {
                     session_id: flow.session_id(),
                     direction: flow.direction(),
                     highest_authority_id: flow.authority_id(),
                 };
                 Ok(())
             }
-            Self::Bound {
+            FactoryFlowBinding::Bound {
                 session_id,
                 direction,
                 highest_authority_id,
@@ -248,6 +294,130 @@ impl FactoryFlowGate {
                 Ok(())
             }
         }
+    }
+
+    fn close(&mut self) -> TcpFactoryAdmissionClose {
+        if self.closed {
+            return TcpFactoryAdmissionClose::AlreadyClosed;
+        }
+        self.closed = true;
+        TcpFactoryAdmissionClose::ClosedNow
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TcpFactoryAdmissionClose {
+    ClosedNow,
+    AlreadyClosed,
+}
+
+/// Opaque snapshot of one factory's shared progress sequence. Its private
+/// weak identity prevents a cursor from one factory being accepted by a
+/// sibling factory, while not extending the factory lifetime by itself.
+#[derive(Clone)]
+pub(crate) struct TcpFactoryProgressCursor {
+    factory: Weak<FactoryProgress>,
+    epoch: u64,
+}
+
+impl fmt::Debug for TcpFactoryProgressCursor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("TcpFactoryProgressCursor([OPAQUE])")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub(crate) enum TcpFactoryProgressWaitError {
+    #[error("progress cursor belongs to another TCP flow factory")]
+    WrongFactory,
+    #[error("TCP flow factory progress source closed unexpectedly")]
+    ProgressSourceClosed,
+}
+
+struct FactoryProgress {
+    epoch: watch::Sender<u64>,
+}
+
+impl FactoryProgress {
+    fn new() -> Arc<Self> {
+        let (epoch, _initial_receiver) = watch::channel(0);
+        Arc::new(Self { epoch })
+    }
+
+    fn cursor(progress: &Arc<Self>) -> TcpFactoryProgressCursor {
+        let epoch = *progress.epoch.borrow();
+        TcpFactoryProgressCursor {
+            factory: Arc::downgrade(progress),
+            epoch,
+        }
+    }
+
+    fn publish(&self) {
+        // Saturation preserves cursor monotonicity and cannot wrap back to an
+        // ancient cursor. Reaching `u64::MAX` requires exhausting the process
+        // lifetime's practical event budget, matching actor readiness policy.
+        let _changed = self.epoch.send_if_modified(|epoch| {
+            let next = epoch.saturating_add(1);
+            if next == *epoch {
+                false
+            } else {
+                *epoch = next;
+                true
+            }
+        });
+    }
+
+    async fn wait(
+        progress: &Arc<Self>,
+        cursor: &TcpFactoryProgressCursor,
+    ) -> Result<TcpFactoryProgressCursor, TcpFactoryProgressWaitError> {
+        let Some(cursor_factory) = cursor.factory.upgrade() else {
+            return Err(TcpFactoryProgressWaitError::WrongFactory);
+        };
+        if !Arc::ptr_eq(progress, &cursor_factory) {
+            return Err(TcpFactoryProgressWaitError::WrongFactory);
+        }
+        drop(cursor_factory);
+
+        // Subscribe before inspecting the epoch. A publication between the
+        // caller's scan and this wait is therefore either already visible or
+        // wakes `changed`; cancelling this receiver consumes no shared state.
+        let mut changed = progress.epoch.subscribe();
+        loop {
+            let observed = *changed.borrow_and_update();
+            if observed != cursor.epoch {
+                return Ok(TcpFactoryProgressCursor {
+                    factory: Arc::downgrade(progress),
+                    epoch: observed,
+                });
+            }
+            changed
+                .changed()
+                .await
+                .map_err(|_| TcpFactoryProgressWaitError::ProgressSourceClosed)?;
+        }
+    }
+}
+
+/// Sole non-cloneable authority that seals every clone of one session's TCP
+/// factory against later flow admission. Existing ports remain owned by their
+/// drivers and must be drained or terminalized by the session root.
+pub(super) struct TcpFactoryAdmission {
+    flow_gate: Arc<Mutex<FactoryFlowGate>>,
+}
+
+impl TcpFactoryAdmission {
+    pub(super) fn close(&mut self) -> TcpFactoryAdmissionClose {
+        self.flow_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .close()
+    }
+}
+
+impl Drop for TcpFactoryAdmission {
+    fn drop(&mut self) {
+        let _ = self.close();
     }
 }
 
@@ -287,12 +457,7 @@ impl UplinkSegmentLedger {
 
 impl UplinkByteLedger {
     pub fn new(capacity: usize) -> Result<Self, FlowPortConfigError> {
-        if capacity == 0 {
-            return Err(FlowPortConfigError::ZeroUplinkByteCapacity);
-        }
-        if u32::try_from(capacity).is_err() {
-            return Err(FlowPortConfigError::UplinkByteCapacityTooLarge { value: capacity });
-        }
+        validate_uplink_byte_capacity(capacity)?;
         Ok(Self {
             budget: Arc::new(Semaphore::new(capacity)),
             capacity,
@@ -325,13 +490,121 @@ impl fmt::Debug for UplinkByteLedger {
 /// Session-scoped constructor for every TCP port owned by one resumable
 /// session. Clones share the exact aggregate byte and replay-segment ledgers,
 /// so an adapter cannot accidentally create fresh "global" budgets per flow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TcpPortFactoryCapacityWitness {
+    flow_port: FlowPortConfig,
+    bound_direction: Option<Direction>,
+    session_uplink_byte_capacity: usize,
+    per_flow_uplink_segment_capacity: usize,
+    session_uplink_segment_capacity: usize,
+    fixed_reset_slots: usize,
+    fixed_terminal_slots: usize,
+    per_flow_channel_slots: usize,
+    max_single_data_payload_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TcpPortFactoryCapacityLayout {
+    flow_port: FlowPortConfig,
+    session_uplink_byte_capacity: usize,
+    per_flow_uplink_segment_capacity: usize,
+    session_uplink_segment_capacity: usize,
+    fixed_reset_slots: usize,
+    fixed_terminal_slots: usize,
+    per_flow_channel_slots: usize,
+    max_single_data_payload_bytes: usize,
+}
+
+impl TcpPortFactoryCapacityLayout {
+    fn checked(
+        flow_port: FlowPortConfig,
+        session_uplink_byte_capacity: usize,
+        per_flow_uplink_segment_capacity: usize,
+        session_uplink_segment_capacity: usize,
+    ) -> Result<Self, FlowPortConfigError> {
+        let per_flow_channel_slots = flow_port
+            .uplink_data_messages()
+            .checked_add(flow_port.control_messages())
+            .and_then(|slots| slots.checked_add(flow_port.downlink_actions()))
+            .and_then(|slots| slots.checked_add(TERMINAL_RESET_LANE_CAPACITY))
+            .and_then(|slots| slots.checked_add(TERMINAL_ACTION_LANE_CAPACITY))
+            .ok_or(FlowPortConfigError::ChannelEnvelopeOverflow)?;
+        Ok(Self {
+            flow_port,
+            session_uplink_byte_capacity,
+            per_flow_uplink_segment_capacity,
+            session_uplink_segment_capacity,
+            fixed_reset_slots: TERMINAL_RESET_LANE_CAPACITY,
+            fixed_terminal_slots: TERMINAL_ACTION_LANE_CAPACITY,
+            per_flow_channel_slots,
+            max_single_data_payload_bytes: flow_port
+                .uplink_byte_capacity()
+                .min(MAX_DATA_PAYLOAD_BYTES),
+        })
+    }
+
+    const fn observe(self, bound_direction: Option<Direction>) -> TcpPortFactoryCapacityWitness {
+        TcpPortFactoryCapacityWitness {
+            flow_port: self.flow_port,
+            bound_direction,
+            session_uplink_byte_capacity: self.session_uplink_byte_capacity,
+            per_flow_uplink_segment_capacity: self.per_flow_uplink_segment_capacity,
+            session_uplink_segment_capacity: self.session_uplink_segment_capacity,
+            fixed_reset_slots: self.fixed_reset_slots,
+            fixed_terminal_slots: self.fixed_terminal_slots,
+            per_flow_channel_slots: self.per_flow_channel_slots,
+            max_single_data_payload_bytes: self.max_single_data_payload_bytes,
+        }
+    }
+}
+
+impl TcpPortFactoryCapacityWitness {
+    pub(crate) const fn flow_port(self) -> FlowPortConfig {
+        self.flow_port
+    }
+
+    pub(crate) const fn bound_direction(self) -> Option<Direction> {
+        self.bound_direction
+    }
+
+    pub(crate) const fn session_uplink_byte_capacity(self) -> usize {
+        self.session_uplink_byte_capacity
+    }
+
+    pub(crate) const fn per_flow_uplink_segment_capacity(self) -> usize {
+        self.per_flow_uplink_segment_capacity
+    }
+
+    pub(crate) const fn session_uplink_segment_capacity(self) -> usize {
+        self.session_uplink_segment_capacity
+    }
+
+    pub(crate) const fn fixed_reset_slots(self) -> usize {
+        self.fixed_reset_slots
+    }
+
+    pub(crate) const fn fixed_terminal_slots(self) -> usize {
+        self.fixed_terminal_slots
+    }
+
+    pub(crate) const fn per_flow_channel_slots(self) -> usize {
+        self.per_flow_channel_slots
+    }
+
+    pub(crate) const fn max_single_data_payload_bytes(self) -> usize {
+        self.max_single_data_payload_bytes
+    }
+}
+
 #[derive(Clone)]
 pub struct ResumableTcpPortFactory {
     config: FlowPortConfig,
+    capacity: TcpPortFactoryCapacityLayout,
     session_uplink_ledger: UplinkByteLedger,
     per_flow_uplink_segment_capacity: usize,
     session_uplink_segment_ledger: UplinkSegmentLedger,
     flow_gate: Arc<Mutex<FactoryFlowGate>>,
+    progress: Arc<FactoryProgress>,
     origin: Option<TcpFactoryOrigin>,
 }
 
@@ -351,57 +624,30 @@ impl ResumableTcpPortFactory {
             session_uplink_byte_capacity,
             per_flow_uplink_segment_capacity,
             session_uplink_segment_capacity,
-            FactoryFlowGate::Unbound,
+            FactoryFlowGate::unbound(),
             None,
         )
     }
 
-    pub(super) fn new_bound(
+    #[cfg(test)]
+    fn new_unbound_with_admission_for_test(
         config: FlowPortConfig,
-        session_id: SessionId,
-        direction: Direction,
         session_uplink_byte_capacity: usize,
         per_flow_uplink_segment_capacity: usize,
         session_uplink_segment_capacity: usize,
-        origin: TcpFactoryOrigin,
-    ) -> Result<Self, FlowPortConfigError> {
-        Self::new_internal(
+    ) -> Result<(Self, TcpFactoryAdmission), FlowPortConfigError> {
+        let factory = Self::new_internal(
             config,
             session_uplink_byte_capacity,
             per_flow_uplink_segment_capacity,
             session_uplink_segment_capacity,
-            FactoryFlowGate::Bound {
-                session_id,
-                direction,
-                highest_authority_id: 0,
-            },
-            Some(origin),
-        )
-    }
-
-    fn new_internal(
-        config: FlowPortConfig,
-        session_uplink_byte_capacity: usize,
-        per_flow_uplink_segment_capacity: usize,
-        session_uplink_segment_capacity: usize,
-        flow_gate: FactoryFlowGate,
-        origin: Option<TcpFactoryOrigin>,
-    ) -> Result<Self, FlowPortConfigError> {
-        validate_segment_capacity(
-            "per-flow",
-            per_flow_uplink_segment_capacity,
-            FlowPortConfigError::ZeroUplinkSegmentCapacity,
+            FactoryFlowGate::unbound(),
+            None,
         )?;
-        Ok(Self {
-            config,
-            session_uplink_ledger: UplinkByteLedger::new(session_uplink_byte_capacity)?,
-            per_flow_uplink_segment_capacity,
-            session_uplink_segment_ledger: UplinkSegmentLedger::new(
-                session_uplink_segment_capacity,
-            )?,
-            flow_gate: Arc::new(Mutex::new(flow_gate)),
-            origin,
-        })
+        let admission = TcpFactoryAdmission {
+            flow_gate: Arc::clone(&factory.flow_gate),
+        };
+        Ok((factory, admission))
     }
 
     /// Fault-injection seam proving that a reducer-capacity miss after source
@@ -429,6 +675,15 @@ impl ResumableTcpPortFactory {
         self.config
     }
 
+    pub(super) fn capacity_witness(&self) -> TcpPortFactoryCapacityWitness {
+        let bound_direction = self
+            .flow_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .bound_direction();
+        self.capacity.observe(bound_direction)
+    }
+
     pub fn session_uplink_byte_capacity(&self) -> usize {
         self.session_uplink_ledger.capacity()
     }
@@ -449,22 +704,53 @@ impl ResumableTcpPortFactory {
         self.session_uplink_segment_ledger.owned_segments()
     }
 
+    /// Captures the current shared edge for all flow endpoints and drivers
+    /// minted by this exact factory.
+    pub(crate) fn progress_cursor(&self) -> TcpFactoryProgressCursor {
+        FactoryProgress::cursor(&self.progress)
+    }
+
+    /// Waits without consuming any driver input. The returned cursor covers
+    /// every publication since `cursor`; dropping this future leaves both the
+    /// cursor and the shared progress sequence intact.
+    pub(crate) async fn wait_for_progress(
+        &self,
+        cursor: &TcpFactoryProgressCursor,
+    ) -> Result<TcpFactoryProgressCursor, TcpFactoryProgressWaitError> {
+        FactoryProgress::wait(&self.progress, cursor).await
+    }
+
     pub fn open_flow(
         &self,
         flow: LocalFlow,
     ) -> Result<(ResumableTcpFlow, ResumableTcpDriver), FlowPortError> {
-        self.flow_gate
+        self.with_flow_admission(flow, || {
+            ResumableTcpFlow::bounded_pair(
+                flow,
+                self.config,
+                self.session_uplink_ledger.clone(),
+                self.per_flow_uplink_segment_capacity,
+                self.session_uplink_segment_ledger.clone(),
+                Arc::clone(&self.progress),
+                self.origin.clone(),
+            )
+        })
+    }
+
+    /// Keeps the shared admission gate held through construction of the
+    /// admitted value. Session shutdown therefore cannot report the factory
+    /// sealed while an earlier admission is still constructing its flow pair.
+    fn with_flow_admission<T>(
+        &self,
+        flow: LocalFlow,
+        construct: impl FnOnce() -> T,
+    ) -> Result<T, FlowPortError> {
+        let mut admission = self
+            .flow_gate
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .admit(flow)?;
-        Ok(ResumableTcpFlow::bounded_pair(
-            flow,
-            self.config,
-            self.session_uplink_ledger.clone(),
-            self.per_flow_uplink_segment_capacity,
-            self.session_uplink_segment_ledger.clone(),
-            self.origin.clone(),
-        ))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        admission.admit(flow)?;
+        Ok(construct())
     }
 }
 
@@ -473,6 +759,7 @@ impl fmt::Debug for ResumableTcpPortFactory {
         formatter
             .debug_struct("ResumableTcpPortFactory")
             .field("config", &self.config)
+            .field("capacity", &self.capacity_witness())
             .field(
                 "session_uplink_byte_capacity",
                 &self.session_uplink_byte_capacity(),
@@ -510,8 +797,11 @@ struct PortState {
     next_uplink_offset: AtomicU64,
     source_reservation_active: AtomicBool,
     ordered_source_closed: AtomicBool,
+    driver_admission_sealed: AtomicBool,
+    reset_admitted: AtomicBool,
     retired: AtomicBool,
     admission_gate: Mutex<()>,
+    progress: Arc<FactoryProgress>,
     origin: Option<TcpFactoryOrigin>,
 }
 
@@ -521,6 +811,7 @@ impl PortState {
         session_uplink_ledger: UplinkByteLedger,
         uplink_segment_capacity: usize,
         session_uplink_segment_ledger: UplinkSegmentLedger,
+        progress: Arc<FactoryProgress>,
         origin: Option<TcpFactoryOrigin>,
     ) -> Self {
         Self {
@@ -536,8 +827,11 @@ impl PortState {
             next_uplink_offset: AtomicU64::new(0),
             source_reservation_active: AtomicBool::new(false),
             ordered_source_closed: AtomicBool::new(false),
+            driver_admission_sealed: AtomicBool::new(false),
+            reset_admitted: AtomicBool::new(false),
             retired: AtomicBool::new(false),
             admission_gate: Mutex::new(()),
+            progress,
             origin,
         }
     }
@@ -552,6 +846,14 @@ impl PortState {
         self.retired.load(Ordering::Acquire)
     }
 
+    fn is_driver_admission_sealed(&self) -> bool {
+        self.driver_admission_sealed.load(Ordering::Acquire)
+    }
+
+    fn publish_progress(&self) {
+        self.progress.publish();
+    }
+
     fn snapshot(&self) -> FlowPortSnapshot {
         FlowPortSnapshot {
             uplink_owned_bytes: self
@@ -564,6 +866,22 @@ impl PortState {
             reserved_completion_slots: self.reserved_completion_slots.load(Ordering::Acquire),
             observed_leg_losses: self.observed_leg_losses.load(Ordering::Acquire),
         }
+    }
+}
+
+struct FactoryProgressGuard {
+    progress: Arc<FactoryProgress>,
+}
+
+impl FactoryProgressGuard {
+    fn new(progress: Arc<FactoryProgress>) -> Self {
+        Self { progress }
+    }
+}
+
+impl Drop for FactoryProgressGuard {
+    fn drop(&mut self) {
+        self.progress.publish();
     }
 }
 
@@ -638,6 +956,10 @@ pub struct ResumableTcpFlow {
     downlink_rx: mpsc::Receiver<TunAction>,
     terminal_rx: mpsc::Receiver<TunAction>,
     state: Arc<PortState>,
+    // Keep both guards after every channel endpoint so their edges publish
+    // only after endpoint drop has released queued capacity and ownership.
+    _uplink_progress_on_drop: FactoryProgressGuard,
+    _downlink_progress_on_drop: FactoryProgressGuard,
 }
 
 impl ResumableTcpFlow {
@@ -647,6 +969,7 @@ impl ResumableTcpFlow {
         session_uplink_ledger: UplinkByteLedger,
         per_flow_uplink_segment_capacity: usize,
         session_uplink_segment_ledger: UplinkSegmentLedger,
+        progress: Arc<FactoryProgress>,
         origin: Option<TcpFactoryOrigin>,
     ) -> (Self, ResumableTcpDriver) {
         let (source_tx, source_rx) = mpsc::channel(config.uplink_data_messages);
@@ -660,6 +983,7 @@ impl ResumableTcpFlow {
             session_uplink_ledger,
             per_flow_uplink_segment_capacity,
             session_uplink_segment_ledger,
+            Arc::clone(&progress),
             origin,
         ));
         (
@@ -671,6 +995,8 @@ impl ResumableTcpFlow {
                 downlink_rx,
                 terminal_rx,
                 state: Arc::clone(&state),
+                _uplink_progress_on_drop: FactoryProgressGuard::new(Arc::clone(&progress)),
+                _downlink_progress_on_drop: FactoryProgressGuard::new(Arc::clone(&progress)),
             },
             ResumableTcpDriver {
                 flow,
@@ -717,12 +1043,14 @@ impl ResumableTcpFlow {
                 _completion_liveness_tx: self.completion_liveness_tx,
                 reset_tx: self.reset_tx,
                 state: Arc::clone(&self.state),
+                _progress_on_drop: self._uplink_progress_on_drop,
             },
             ResumableTcpDownlink {
                 flow: self.flow,
                 downlink_rx: self.downlink_rx,
                 terminal_rx: self.terminal_rx,
                 state: self.state,
+                _progress_on_drop: self._downlink_progress_on_drop,
             },
         )
     }
@@ -798,6 +1126,8 @@ pub struct ResumableTcpUplink {
     _completion_liveness_tx: mpsc::Sender<FlowControl>,
     reset_tx: mpsc::Sender<LocalReset>,
     state: Arc<PortState>,
+    // Must remain last so sender closure precedes the progress edge.
+    _progress_on_drop: FactoryProgressGuard,
 }
 
 impl ResumableTcpUplink {
@@ -868,6 +1198,8 @@ pub struct ResumableTcpDownlink {
     downlink_rx: mpsc::Receiver<TunAction>,
     terminal_rx: mpsc::Receiver<TunAction>,
     state: Arc<PortState>,
+    // Must remain last so queued action release precedes the progress edge.
+    _progress_on_drop: FactoryProgressGuard,
 }
 
 impl ResumableTcpDownlink {
@@ -918,15 +1250,182 @@ pub struct ResumableTcpDriver {
     consecutive_controls: usize,
 }
 
+/// Ownership-preserving sink-admission failure for the session root. The
+/// reducer-minted offer and its exact segment vector can be retried after
+/// bounded pressure clears; diagnostics deliberately expose neither payload
+/// bytes nor segment metadata.
+pub(crate) struct SinkDeliveryFailure {
+    kind: FlowPortError,
+    offer: SinkOffer,
+    segments: Vec<TcpDataSegment>,
+}
+
+impl SinkDeliveryFailure {
+    fn new(kind: FlowPortError, offer: SinkOffer, segments: Vec<TcpDataSegment>) -> Self {
+        Self {
+            kind,
+            offer,
+            segments,
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> FlowPortError {
+        self.kind
+    }
+
+    pub(crate) fn into_parts(self) -> (SinkOffer, Vec<TcpDataSegment>) {
+        (self.offer, self.segments)
+    }
+
+    fn into_kind(self) -> FlowPortError {
+        self.kind
+    }
+}
+
+impl fmt::Debug for SinkDeliveryFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SinkDeliveryFailure")
+            .field("kind", &self.kind)
+            .field("ownership", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Ownership-preserving half-close admission failure for the session root.
+/// The capability remains available for one exact retry after pressure clears.
+pub(crate) struct HalfCloseDeliveryFailure {
+    kind: FlowPortError,
+    capability: SinkHalfClose,
+}
+
+impl HalfCloseDeliveryFailure {
+    fn new(kind: FlowPortError, capability: SinkHalfClose) -> Self {
+        Self { kind, capability }
+    }
+
+    pub(crate) const fn kind(&self) -> FlowPortError {
+        self.kind
+    }
+
+    pub(crate) const fn into_capability(self) -> SinkHalfClose {
+        self.capability
+    }
+
+    fn into_kind(self) -> FlowPortError {
+        self.kind
+    }
+}
+
+impl fmt::Debug for HalfCloseDeliveryFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HalfCloseDeliveryFailure([REDACTED])")
+    }
+}
+
+/// One linearized disposition from the non-cloneable driver owner. A reset
+/// dequeued before sealing remains owned by that caller and is never replaced
+/// by a second synthesized reset.
+#[must_use = "the root must retain or reduce the returned reset ownership"]
+pub(crate) enum TcpDriverLocalAbandonSeal {
+    Sealed(ClientControllerDriverInput),
+    PriorResetAlreadyDequeued,
+    AlreadySealed,
+    TerminalRetired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TcpTerminalDeliveryDisposition {
+    Queued,
+    ReceiverDetached,
+}
+
+impl fmt::Debug for TcpDriverLocalAbandonSeal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sealed(_) => formatter.write_str("TcpDriverLocalAbandonSeal::Sealed([REDACTED])"),
+            Self::PriorResetAlreadyDequeued => {
+                formatter.write_str("TcpDriverLocalAbandonSeal::PriorResetAlreadyDequeued")
+            }
+            Self::AlreadySealed => formatter.write_str("TcpDriverLocalAbandonSeal::AlreadySealed"),
+            Self::TerminalRetired => {
+                formatter.write_str("TcpDriverLocalAbandonSeal::TerminalRetired")
+            }
+        }
+    }
+}
+
 impl ResumableTcpDriver {
     pub const fn local_flow(&self) -> LocalFlow {
         self.flow
+    }
+
+    /// Read-only root-shutdown witness. Only the non-cloneable driver owner
+    /// can perform the seal, but the root needs to distinguish a flow that
+    /// still requires its one exact shutdown transaction from one whose reset
+    /// ownership is already retained by the reducer/effect pipeline.
+    pub(crate) fn local_abandon_is_sealed(&self) -> bool {
+        self.state.is_driver_admission_sealed()
     }
 
     pub fn probe(&self) -> FlowPortProbe {
         FlowPortProbe {
             state: Arc::clone(&self.state),
         }
+    }
+
+    /// Permanently seals local source, completion, and reset admission for one
+    /// flow and drains every fact that has not entered the reducer. It returns
+    /// the queued or synthesized reset input, or identifies the reset already
+    /// dequeued by the root. The independent terminal action lane remains open
+    /// for the reducer's later `FlowFinished` effect.
+    pub(crate) fn seal_for_local_abandon(&mut self) -> TcpDriverLocalAbandonSeal {
+        let state = Arc::clone(&self.state);
+        let _admission = state.admission_guard();
+        if state.is_retired() {
+            return TcpDriverLocalAbandonSeal::TerminalRetired;
+        }
+        if state.is_driver_admission_sealed() {
+            return TcpDriverLocalAbandonSeal::AlreadySealed;
+        }
+
+        state.driver_admission_sealed.store(true, Ordering::Release);
+        self.source_rx.close();
+        self.control_rx.close();
+        self.reset_rx.close();
+
+        // The reset lane has physical capacity one. Take it before draining
+        // ordinary lanes so an already-admitted reason wins over synthesized
+        // LocalAbandon regardless of queued DATA/completion pressure.
+        let queued_reset = self.reset_rx.try_recv().ok();
+        while self.reset_rx.try_recv().is_ok() {}
+        while self.source_rx.try_recv().is_ok() {}
+        while self.control_rx.try_recv().is_ok() {}
+        self.consecutive_controls = 0;
+        state.publish_progress();
+
+        if let Some(reset) = queued_reset {
+            state.reset_admitted.store(true, Ordering::Release);
+            return TcpDriverLocalAbandonSeal::Sealed(
+                ClientControllerDriverInput::from_driver_dequeue(DriverInput::Control(
+                    reset.into_session_event(),
+                )),
+            );
+        }
+        if state.reset_admitted.load(Ordering::Acquire) {
+            return TcpDriverLocalAbandonSeal::PriorResetAlreadyDequeued;
+        }
+
+        state.reset_admitted.store(true, Ordering::Release);
+        TcpDriverLocalAbandonSeal::Sealed(ClientControllerDriverInput::from_driver_dequeue(
+            DriverInput::Control(
+                LocalReset {
+                    flow: self.flow,
+                    reason: ResetReason::LocalAbandon,
+                }
+                .into_session_event(),
+            ),
+        ))
     }
 
     /// Records a transport-leg loss without closing either flow lane.  Flow
@@ -939,99 +1438,15 @@ impl ResumableTcpDriver {
         );
     }
 
-    /// Nonblocking weighted-priority receive. A terminal reset always wins.
-    /// Ordinary sink completions may run for a bounded burst, after which one
-    /// ready ordered source fact must make progress.
-    pub fn try_recv_next(&mut self) -> Result<Option<DriverInput>, FlowPortError> {
-        match self.reset_rx.try_recv() {
-            Ok(reset) => return Ok(Some(DriverInput::Control(reset.into_session_event()))),
-            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {}
-        }
-        if self.consecutive_controls < CONTROL_BURST_LIMIT {
-            match self.control_rx.try_recv() {
-                Ok(control) => {
-                    self.consecutive_controls = self.consecutive_controls.saturating_add(1);
-                    return Ok(Some(DriverInput::Control(control.into_session_event())));
-                }
-                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
-                }
-            }
-        }
-        match self.source_rx.try_recv() {
-            Ok(source) => {
-                self.consecutive_controls = 0;
-                return Ok(Some(source.into_driver_input()));
-            }
-            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {}
-        }
-        match self.control_rx.try_recv() {
-            Ok(control) => {
-                self.consecutive_controls = self.consecutive_controls.saturating_add(1);
-                Ok(Some(DriverInput::Control(control.into_session_event())))
-            }
-            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                if self.reset_rx.is_closed() && self.source_rx.is_closed() {
-                    Err(FlowPortError::Closed)
-                } else {
-                    Ok(None)
-                }
-            }
-        }
-    }
-
-    /// Awaitable counterpart to [`Self::try_recv_next`]. The biased select
-    /// uses the same bounded control burst. One closed lane never terminates
-    /// the supervisor while another lane can still produce a reserved fact.
-    pub async fn recv_next(&mut self) -> Option<DriverInput> {
-        loop {
-            match self.try_recv_next() {
-                Ok(Some(input)) => return Some(input),
-                Ok(None) => {}
-                Err(FlowPortError::Closed) => return None,
-                Err(_) => return None,
-            }
-
-            let reset_open = !self.reset_rx.is_closed();
-            let control_open = !self.control_rx.is_closed();
-            let source_open = !self.source_rx.is_closed();
-            if !reset_open && !control_open && !source_open {
-                return None;
-            }
-            if self.consecutive_controls >= CONTROL_BURST_LIMIT {
-                tokio::select! {
-                    biased;
-                    reset = self.reset_rx.recv(), if reset_open => if let Some(reset) = reset {
-                        return Some(DriverInput::Control(reset.into_session_event()));
-                    },
-                    source = self.source_rx.recv(), if source_open => if let Some(source) = source {
-                        self.consecutive_controls = 0;
-                        return Some(source.into_driver_input());
-                    },
-                    control = self.control_rx.recv(), if control_open => if let Some(control) = control {
-                        self.consecutive_controls = self.consecutive_controls.saturating_add(1);
-                        return Some(DriverInput::Control(control.into_session_event()));
-                    },
-                    else => return None,
-                }
-            } else {
-                tokio::select! {
-                    biased;
-                    reset = self.reset_rx.recv(), if reset_open => if let Some(reset) = reset {
-                        return Some(DriverInput::Control(reset.into_session_event()));
-                    },
-                    control = self.control_rx.recv(), if control_open => if let Some(control) = control {
-                        self.consecutive_controls = self.consecutive_controls.saturating_add(1);
-                        return Some(DriverInput::Control(control.into_session_event()));
-                    },
-                    source = self.source_rx.recv(), if source_open => if let Some(source) = source {
-                        self.consecutive_controls = 0;
-                        return Some(source.into_driver_input());
-                    },
-                    else => return None,
-                }
-            }
-        }
+    /// Dequeues one input with provenance that only the client controller may
+    /// consume. The opaque wrapper cannot be built from a sibling-created
+    /// `DriverInput`, so peer frames cannot enter through the local driver
+    /// command seam and bypass current-leg observation.
+    pub(super) fn try_recv_next_for_client_controller(
+        &mut self,
+    ) -> Result<Option<ClientControllerDriverInput>, FlowPortError> {
+        self.try_recv_next()
+            .map(|input| input.map(ClientControllerDriverInput::from_driver_dequeue))
     }
 
     /// Queues a typed sink offer only after reserving the exact future
@@ -1042,13 +1457,44 @@ impl ResumableTcpDriver {
         offer: SinkOffer,
         segments: Vec<TcpDataSegment>,
     ) -> Result<(), FlowPortError> {
-        self.validate_sink_coverage(offer, &segments)?;
+        self.try_deliver_sink_exact(offer, segments)
+            .map_err(SinkDeliveryFailure::into_kind)
+    }
+
+    /// Root-facing ownership-preserving counterpart to
+    /// [`Self::try_deliver_sink`]. Every rejection returns the exact input so
+    /// the root can retain one bounded deferred effect and retry it unchanged.
+    pub(crate) fn try_deliver_sink_exact(
+        &self,
+        offer: SinkOffer,
+        segments: Vec<TcpDataSegment>,
+    ) -> Result<(), SinkDeliveryFailure> {
+        if let Err(kind) = self.validate_sink_coverage(offer, &segments) {
+            return Err(SinkDeliveryFailure::new(kind, offer, segments));
+        }
         let _admission = self.state.admission_guard();
         if self.state.is_retired() {
-            return Err(FlowPortError::Closed);
+            return Err(SinkDeliveryFailure::new(
+                FlowPortError::Closed,
+                offer,
+                segments,
+            ));
         }
-        let completion = self.reserve_completion()?;
-        let action_slot = reserve_owned(&self.downlink_tx, FlowPortError::DownlinkLaneFull)?;
+        if self.state.is_driver_admission_sealed() {
+            return Err(SinkDeliveryFailure::new(
+                FlowPortError::DriverAdmissionSealed,
+                offer,
+                segments,
+            ));
+        }
+        let completion = match self.reserve_completion() {
+            Ok(completion) => completion,
+            Err(kind) => return Err(SinkDeliveryFailure::new(kind, offer, segments)),
+        };
+        let action_slot = match reserve_owned(&self.downlink_tx, FlowPortError::DownlinkLaneFull) {
+            Ok(action_slot) => action_slot,
+            Err(kind) => return Err(SinkDeliveryFailure::new(kind, offer, segments)),
+        };
         let guard = ActionGuard::new(Arc::clone(&self.state));
         let _sender = action_slot.send(TunAction::Sink(SinkDelivery {
             offer,
@@ -1060,6 +1506,58 @@ impl ResumableTcpDriver {
     }
 
     pub fn try_deliver_half_close(
+        &self,
+        completion_capability: SinkHalfClose,
+    ) -> Result<(), FlowPortError> {
+        self.try_deliver_half_close_exact(completion_capability)
+            .map_err(HalfCloseDeliveryFailure::into_kind)
+    }
+
+    /// Root-facing ownership-preserving counterpart to
+    /// [`Self::try_deliver_half_close`]. Every rejection returns the exact
+    /// reducer-minted completion capability.
+    pub(crate) fn try_deliver_half_close_exact(
+        &self,
+        completion_capability: SinkHalfClose,
+    ) -> Result<(), HalfCloseDeliveryFailure> {
+        if let Err(kind) = self.validate_half_close(completion_capability) {
+            return Err(HalfCloseDeliveryFailure::new(kind, completion_capability));
+        }
+        let _admission = self.state.admission_guard();
+        if self.state.is_retired() {
+            return Err(HalfCloseDeliveryFailure::new(
+                FlowPortError::Closed,
+                completion_capability,
+            ));
+        }
+        if self.state.is_driver_admission_sealed() {
+            return Err(HalfCloseDeliveryFailure::new(
+                FlowPortError::DriverAdmissionSealed,
+                completion_capability,
+            ));
+        }
+        let completion = match self.reserve_completion() {
+            Ok(completion) => completion,
+            Err(kind) => {
+                return Err(HalfCloseDeliveryFailure::new(kind, completion_capability));
+            }
+        };
+        let action_slot = match reserve_owned(&self.downlink_tx, FlowPortError::DownlinkLaneFull) {
+            Ok(action_slot) => action_slot,
+            Err(kind) => {
+                return Err(HalfCloseDeliveryFailure::new(kind, completion_capability));
+            }
+        };
+        let guard = ActionGuard::new(Arc::clone(&self.state));
+        let _sender = action_slot.send(TunAction::HalfClose(HalfCloseDelivery {
+            capability: completion_capability,
+            completion: Some(completion),
+            _guard: guard,
+        }));
+        Ok(())
+    }
+
+    fn validate_half_close(
         &self,
         completion_capability: SinkHalfClose,
     ) -> Result<(), FlowPortError> {
@@ -1075,18 +1573,6 @@ impl ResumableTcpDriver {
                 actual: completion_capability.direction(),
             });
         }
-        let _admission = self.state.admission_guard();
-        if self.state.is_retired() {
-            return Err(FlowPortError::Closed);
-        }
-        let completion = self.reserve_completion()?;
-        let action_slot = reserve_owned(&self.downlink_tx, FlowPortError::DownlinkLaneFull)?;
-        let guard = ActionGuard::new(Arc::clone(&self.state));
-        let _sender = action_slot.send(TunAction::HalfClose(HalfCloseDelivery {
-            capability: completion_capability,
-            completion: Some(completion),
-            _guard: guard,
-        }));
         Ok(())
     }
 
@@ -1095,7 +1581,7 @@ impl ResumableTcpDriver {
     pub fn try_deliver_terminal_effect(
         &mut self,
         effect: &SessionEffect,
-    ) -> Result<(), FlowPortError> {
+    ) -> Result<TcpTerminalDeliveryDisposition, FlowPortError> {
         let (flow_id, action) = match effect {
             SessionEffect::FlowFinished {
                 flow_id,
@@ -1116,7 +1602,7 @@ impl ResumableTcpDriver {
         &mut self,
         flow_id: SessionFlowId,
         action: TerminalAction,
-    ) -> Result<(), FlowPortError> {
+    ) -> Result<TcpTerminalDeliveryDisposition, FlowPortError> {
         if flow_id != self.flow.flow_id() {
             return Err(FlowPortError::CrossFlowTerminalEffect);
         }
@@ -1125,7 +1611,15 @@ impl ResumableTcpDriver {
         if state.is_retired() {
             return Err(FlowPortError::TerminalAlreadyDelivered);
         }
-        let action_slot = reserve_owned(&self.terminal_tx, FlowPortError::DownlinkLaneFull)?;
+        let action_slot = match reserve_owned(&self.terminal_tx, FlowPortError::DownlinkLaneFull) {
+            Ok(action_slot) => Some(action_slot),
+            // The endpoint may already be gone while a SinkDelivery or
+            // HalfCloseDelivery lives in SocketCtx. Reducer terminal remains
+            // the revocation point: retire under the same admission lock even
+            // though there is no receiver for the terminal notification.
+            Err(FlowPortError::Closed) => None,
+            Err(error) => return Err(error),
+        };
         state.retired.store(true, Ordering::Release);
         self.reset_rx.close();
         self.control_rx.close();
@@ -1133,13 +1627,17 @@ impl ResumableTcpDriver {
         while self.reset_rx.try_recv().is_ok() {}
         while self.control_rx.try_recv().is_ok() {}
         while self.source_rx.try_recv().is_ok() {}
+        let Some(action_slot) = action_slot else {
+            state.publish_progress();
+            return Ok(TcpTerminalDeliveryDisposition::ReceiverDetached);
+        };
         let guard = ActionGuard::new(Arc::clone(&self.state));
         let _sender = action_slot.send(TunAction::Terminal(TerminalDelivery {
             flow: self.flow,
             action,
             _guard: guard,
         }));
-        Ok(())
+        Ok(TcpTerminalDeliveryDisposition::Queued)
     }
 
     fn reserve_completion(&self) -> Result<CompletionReservation, FlowPortError> {
@@ -1212,6 +1710,41 @@ impl fmt::Debug for ResumableTcpDriver {
 pub enum DriverInput {
     Control(SessionEvent),
     Data(UplinkData),
+}
+
+/// Opaque proof that an input came from the exact bounded TCP driver lanes.
+/// Its tuple field is private to this module, and the type is deliberately
+/// neither `Clone` nor publicly re-exported.
+pub(crate) struct ClientControllerDriverInput(Box<DriverInput>);
+
+impl ClientControllerDriverInput {
+    fn from_driver_dequeue(input: DriverInput) -> Self {
+        Self(Box::new(input))
+    }
+
+    pub(super) fn as_inner(&self) -> &DriverInput {
+        &self.0
+    }
+
+    pub(super) fn into_inner(self, _gate: &ClientControllerDriverReducerGate) -> DriverInput {
+        *self.0
+    }
+
+    /// Restores the opaque typed boundary only from a reducer rejection that
+    /// returned the exact driver command. Only the supervisor can mint the
+    /// reducer gate, so sibling adapters cannot wrap an arbitrary raw input.
+    pub(super) fn from_rejected_driver(
+        input: DriverInput,
+        _gate: &ClientControllerDriverReducerGate,
+    ) -> Self {
+        Self(Box::new(input))
+    }
+}
+
+impl fmt::Debug for ClientControllerDriverInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ClientControllerDriverInput([REDACTED])")
+    }
 }
 
 impl fmt::Debug for DriverInput {
@@ -1321,19 +1854,25 @@ impl UplinkOwnership {
     pub const fn bytes(&self) -> usize {
         self.bytes
     }
-
     pub(super) fn matches_factory_origin(&self, expected: &TcpFactoryOrigin) -> bool {
         self.origin
             .as_ref()
             .is_some_and(|actual| actual.matches(expected))
     }
-
     /// Binds staging ownership only to the opaque authority emitted after
     /// `SessionModel::reduce(LocalData)` retained this exact flow, direction,
     /// range, and payload. A successful bind does not release any bytes.
     pub fn bind_replay(
         &mut self,
         stored: ReplayStored,
+    ) -> Result<UplinkReplayOwnership, FlowPortError> {
+        self.bind_owner_replay(&stored)
+    }
+    /// Owner keeps the original receipt journal-held on every rejection.
+    /// The legacy by-value entry above shares these exact checks and commit.
+    pub(super) fn bind_owner_replay(
+        &mut self,
+        stored: &ReplayStored,
     ) -> Result<UplinkReplayOwnership, FlowPortError> {
         let Some(payload) = self.payload.as_ref() else {
             return Err(FlowPortError::UplinkOwnershipAlreadyBound);
@@ -1391,75 +1930,6 @@ pub struct UplinkReplayOwnership {
     bytes: usize,
     permits: Option<UplinkPermits>,
     origin: Option<TcpFactoryOrigin>,
-}
-
-impl UplinkReplayOwnership {
-    pub const fn flow_id(&self) -> SessionFlowId {
-        self.flow.flow_id()
-    }
-
-    pub const fn direction(&self) -> Direction {
-        self.direction
-    }
-
-    pub const fn start(&self) -> ByteOffset {
-        self.start
-    }
-
-    pub const fn end(&self) -> ByteOffset {
-        self.end
-    }
-
-    pub const fn bytes(&self) -> usize {
-        self.bytes
-    }
-
-    pub(super) fn matches_factory_origin(&self, expected: &TcpFactoryOrigin) -> bool {
-        self.origin
-            .as_ref()
-            .is_some_and(|actual| actual.matches(expected))
-    }
-
-    pub fn is_released(&self) -> bool {
-        self.permits.is_none()
-    }
-
-    /// Releases the exact byte permit only when the reducer-accepted ACK
-    /// covers this complete DATA extent. Partial coverage returns `false` and
-    /// deliberately retains the whole permit.
-    pub fn release_after_reducer_ack(
-        &mut self,
-        acknowledged: &ReplayAcknowledged,
-    ) -> Result<bool, FlowPortError> {
-        if acknowledged.local_flow() != self.flow || acknowledged.direction() != self.direction {
-            return Err(FlowPortError::UplinkAckMismatch);
-        }
-        if acknowledged.next_accepted() < self.end {
-            return Ok(false);
-        }
-        let released = self.permits.take().is_some();
-        Ok(released)
-    }
-
-    /// Explicit cleanup after the reducer has emitted the exact terminal
-    /// authority for this flow. A peer-reset notification alone is not enough;
-    /// `FlowFinished` is the ownership-release point.
-    pub fn release_after_reducer_terminal(
-        &mut self,
-        effect: &SessionEffect,
-    ) -> Result<bool, FlowPortError> {
-        let SessionEffect::FlowFinished {
-            flow_id, terminal, ..
-        } = effect
-        else {
-            return Err(FlowPortError::UplinkTerminalMismatch);
-        };
-        if *flow_id != self.flow.flow_id() || terminal.local_flow() != self.flow {
-            return Err(FlowPortError::UplinkTerminalMismatch);
-        }
-        let released = self.permits.take().is_some();
-        Ok(released)
-    }
 }
 
 impl fmt::Debug for UplinkReplayOwnership {
@@ -1682,9 +2152,12 @@ impl fmt::Debug for HalfCloseDelivery {
     }
 }
 
-fn drain_nonterminal_actions(actions: &mut mpsc::Receiver<TunAction>) {
+fn drain_nonterminal_actions(actions: &mut mpsc::Receiver<TunAction>, state: &Arc<PortState>) {
     actions.close();
-    while actions.try_recv().is_ok() {}
+    while let Ok(action) = actions.try_recv() {
+        state.publish_progress();
+        drop(action);
+    }
 }
 
 fn try_recv_tun_action(
@@ -1694,13 +2167,14 @@ fn try_recv_tun_action(
 ) -> Result<Option<TunAction>, FlowPortError> {
     match terminal.try_recv() {
         Ok(action) => {
-            drain_nonterminal_actions(actions);
+            state.publish_progress();
+            drain_nonterminal_actions(actions, state);
             return Ok(Some(action));
         }
         Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {}
     }
-    if state.is_retired() {
-        drain_nonterminal_actions(actions);
+    if state.is_retired() || state.is_driver_admission_sealed() {
+        drain_nonterminal_actions(actions, state);
         return if terminal.is_closed() {
             Err(FlowPortError::Closed)
         } else {
@@ -1708,7 +2182,10 @@ fn try_recv_tun_action(
         };
     }
     match actions.try_recv() {
-        Ok(action) => Ok(Some(action)),
+        Ok(action) => {
+            state.publish_progress();
+            Ok(Some(action))
+        }
         Err(mpsc::error::TryRecvError::Empty) => Ok(None),
         Err(mpsc::error::TryRecvError::Disconnected) => {
             if terminal.is_closed() {
@@ -1732,22 +2209,33 @@ async fn recv_tun_action(
             Err(FlowPortError::Closed) => return None,
             Err(_) => return None,
         }
-        if state.is_retired() {
+        if state.is_retired() || state.is_driver_admission_sealed() {
             let action = terminal.recv().await;
-            drain_nonterminal_actions(actions);
+            if action.is_some() {
+                state.publish_progress();
+            }
+            drain_nonterminal_actions(actions, state);
             return action;
         }
         tokio::select! {
             biased;
             action = terminal.recv() => {
                 if let Some(action) = action {
-                    drain_nonterminal_actions(actions);
+                    state.publish_progress();
+                    drain_nonterminal_actions(actions, state);
                     return Some(action);
                 }
             },
             action = actions.recv() => match action {
-                Some(action) if !state.is_retired() => return Some(action),
-                Some(action) => drop(action),
+                Some(action)
+                    if !state.is_retired() && !state.is_driver_admission_sealed() => {
+                    state.publish_progress();
+                    return Some(action);
+                },
+                Some(action) => {
+                    state.publish_progress();
+                    drop(action);
+                },
                 None if terminal.is_closed() => return None,
                 None => {}
             },
@@ -1788,19 +2276,22 @@ impl CompletionReservation {
             .fetch_sub(1, Ordering::AcqRel);
         if let Some(permit) = permit {
             let _admission = self.state.admission_guard();
-            if !self.state.is_retired() {
+            if !self.state.is_retired() && !self.state.is_driver_admission_sealed() {
                 let _sender = permit.send(control);
             }
         }
+        self.state.publish_progress();
     }
 }
 
 impl Drop for CompletionReservation {
     fn drop(&mut self) {
-        if self.permit.take().is_some() {
+        if let Some(permit) = self.permit.take() {
+            drop(permit);
             self.state
                 .reserved_completion_slots
                 .fetch_sub(1, Ordering::AcqRel);
+            self.state.publish_progress();
         }
     }
 }
@@ -1818,12 +2309,12 @@ impl ActionGuard {
     }
 
     fn is_live(&self) -> bool {
-        !self.state.is_retired()
+        !self.state.is_retired() && !self.state.is_driver_admission_sealed()
     }
 
     fn with_live<R>(&self, apply: impl FnOnce() -> R) -> Result<R, FlowPortError> {
         let _admission = self.state.admission_guard();
-        if self.state.is_retired() {
+        if self.state.is_retired() || self.state.is_driver_admission_sealed() {
             return Err(FlowPortError::SinkCapabilityRevoked);
         }
         Ok(apply())
@@ -1835,6 +2326,7 @@ impl Drop for ActionGuard {
         self.state
             .pending_downlink_actions
             .fetch_sub(1, Ordering::AcqRel);
+        self.state.publish_progress();
     }
 }
 
@@ -1904,6 +2396,8 @@ pub(crate) struct UplinkSourceReservation {
     session_segment_permit: Option<OwnedSemaphorePermit>,
     state: Arc<PortState>,
     active: bool,
+    // Must remain last: Rust drops struct fields in declaration order.
+    _progress_on_drop: FactoryProgressGuard,
 }
 
 impl fmt::Debug for UplinkSourceReservation {
@@ -1921,6 +2415,8 @@ struct UplinkPermits {
     _session: OwnedSemaphorePermit,
     _flow_segment: OwnedSemaphorePermit,
     _session_segment: OwnedSemaphorePermit,
+    // Must remain last so every byte/segment permit is released first.
+    _progress_on_drop: FactoryProgressGuard,
 }
 
 impl UplinkSourceReservation {
@@ -1950,6 +2446,9 @@ impl UplinkSourceReservation {
         let _admission = state.admission_guard();
         if state.is_retired() {
             return Err(FlowPortError::Closed);
+        }
+        if state.is_driver_admission_sealed() {
+            return Err(FlowPortError::DriverAdmissionSealed);
         }
         if state.ordered_source_closed.load(Ordering::Acquire) {
             return Err(FlowPortError::Closed);
@@ -1982,6 +2481,9 @@ impl UplinkSourceReservation {
         let _admission = state.admission_guard();
         if state.is_retired() {
             return Err(FlowPortError::Closed);
+        }
+        if state.is_driver_admission_sealed() {
+            return Err(FlowPortError::DriverAdmissionSealed);
         }
         let current = state.next_uplink_offset.load(Ordering::Acquire);
         let actual_u64 = u64::try_from(actual).map_err(|_| FlowPortError::UplinkOffsetExhausted)?;
@@ -2031,6 +2533,7 @@ impl UplinkSourceReservation {
                 _session: exact_session_permit,
                 _flow_segment: flow_segment_permit,
                 _session_segment: session_segment_permit,
+                _progress_on_drop: FactoryProgressGuard::new(Arc::clone(&state.progress)),
             }),
             origin: state.origin.clone(),
         };
@@ -2076,9 +2579,18 @@ fn reserve_uplink_source(
         });
     }
 
+    // This guard is declared before any queue or semaphore acquisition and is
+    // therefore dropped last on every partial-reservation error. On success it
+    // moves into the returned reservation and publishes only when that exact
+    // ownership is committed or rolled back.
+    let progress_on_rollback = FactoryProgressGuard::new(Arc::clone(&state.progress));
+
     let _admission = state.admission_guard();
     if state.is_retired() {
         return Err(FlowPortError::Closed);
+    }
+    if state.is_driver_admission_sealed() {
+        return Err(FlowPortError::DriverAdmissionSealed);
     }
     if state.ordered_source_closed.load(Ordering::Acquire) {
         return Err(FlowPortError::Closed);
@@ -2131,6 +2643,7 @@ fn reserve_uplink_source(
         session_segment_permit: Some(session_segment_permit),
         state: Arc::clone(state),
         active: true,
+        _progress_on_drop: progress_on_rollback,
     })
 }
 
@@ -2142,6 +2655,9 @@ fn send_ordered_close(
     let _admission = state.admission_guard();
     if state.is_retired() {
         return Err(FlowPortError::Closed);
+    }
+    if state.is_driver_admission_sealed() {
+        return Err(FlowPortError::DriverAdmissionSealed);
     }
     if state.ordered_source_closed.load(Ordering::Acquire) {
         return Err(FlowPortError::Closed);
@@ -2156,6 +2672,7 @@ fn send_ordered_close(
             mpsc::error::TrySendError::Closed(_) => FlowPortError::Closed,
         })?;
     state.ordered_source_closed.store(true, Ordering::Release);
+    state.publish_progress();
     Ok(())
 }
 
@@ -2169,12 +2686,25 @@ fn send_reset(
     if state.is_retired() {
         return Err(FlowPortError::Closed);
     }
+    if state.is_driver_admission_sealed() {
+        return Err(FlowPortError::DriverAdmissionSealed);
+    }
+    if state.reset_admitted.load(Ordering::Acquire) {
+        return Err(FlowPortError::TerminalLaneFull);
+    }
     sender
         .try_send(LocalReset { flow, reason })
         .map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => FlowPortError::TerminalLaneFull,
             mpsc::error::TrySendError::Closed(_) => FlowPortError::Closed,
-        })
+        })?;
+    // Keep the logical once-only admission bit in the same critical section
+    // as physical publication. A concurrent seal can therefore observe
+    // either a queued reset or one already owned by the root, never a gap in
+    // which it could synthesize a second terminal fact.
+    state.reset_admitted.store(true, Ordering::Release);
+    state.publish_progress();
+    Ok(())
 }
 
 fn reserve_owned<T>(
@@ -2201,6 +2731,19 @@ fn validate_channel_capacity(lane: &'static str, value: usize) -> Result<(), Flo
     Ok(())
 }
 
+fn validate_uplink_byte_capacity(capacity: usize) -> Result<(), FlowPortConfigError> {
+    if capacity == 0 {
+        return Err(FlowPortConfigError::ZeroUplinkByteCapacity);
+    }
+    if capacity > MAX_EXACT_UPLINK_BYTE_CAPACITY {
+        return Err(FlowPortConfigError::UplinkByteCapacityTooLarge {
+            value: capacity,
+            max: MAX_EXACT_UPLINK_BYTE_CAPACITY,
+        });
+    }
+    Ok(())
+}
+
 fn validate_segment_capacity(
     scope: &'static str,
     value: usize,
@@ -2220,1926 +2763,4 @@ fn validate_segment_capacity(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use super::*;
-    use crate::resumable::{
-        AttachAlpn, AttachAuthority, AttachCredentials, AttachNonce, AttachPolicy, AttachRequest,
-        AttachTransportBinding, ByteOffset, DevicePrincipal, DeviceSecret, Direction, FeatureOffer,
-        Frame, LegGeneration, OpenResultCode, OwnerIdentity, ReceiveBudgetLimits, Record,
-        ReplayBudgetLimits, ResumeSecret, SESSION_PROTOCOL_VERSION, SessionConfig, SessionEffect,
-        SessionId, SessionModel, SessionRole, TcpWindowLimits, TlsExporterBinding, VersionRange,
-    };
-    use crate::shared::TargetAddr;
-
-    struct Fixture {
-        model: SessionModel,
-        leg: crate::resumable::CommittedLeg,
-        flow: LocalFlow,
-    }
-
-    fn test_leg_for_session(session_byte: u8) -> crate::resumable::CommittedLeg {
-        let session_id = SessionId::new([session_byte; 16]).unwrap();
-        let owner = OwnerIdentity::new([0x31; 32]).unwrap();
-        let principal = DevicePrincipal::new([0x41; 16]).unwrap();
-        let alpn = AttachAlpn::new(b"mini-vpn-owned/1").unwrap();
-        let binding = AttachTransportBinding::new(
-            owner,
-            alpn,
-            TlsExporterBinding::new([0x51; 32]).unwrap(),
-            principal,
-        );
-        let credentials = AttachCredentials::new(
-            DeviceSecret::new([0x61; 32]).unwrap(),
-            ResumeSecret::new([0x71; 32]).unwrap(),
-        )
-        .unwrap();
-        let request = AttachRequest::new(
-            session_id,
-            LegGeneration::new(2).unwrap(),
-            AttachNonce::new([0x81; 16]).unwrap(),
-            VersionRange::new(SESSION_PROTOCOL_VERSION, SESSION_PROTOCOL_VERSION).unwrap(),
-            FeatureOffer::new(0b11, 0b01).unwrap(),
-        );
-        let proof = credentials.prove(&request, &binding).unwrap();
-        let authority = AttachAuthority::new(
-            session_id,
-            LegGeneration::new(1).unwrap(),
-            credentials,
-            AttachPolicy::new(owner, alpn, principal, SESSION_PROTOCOL_VERSION, 0b11).unwrap(),
-        );
-        authority
-            .verify_and_commit(&request, &binding, &proof)
-            .unwrap()
-    }
-
-    fn test_leg() -> crate::resumable::CommittedLeg {
-        test_leg_for_session(0x21)
-    }
-
-    fn test_session_config() -> SessionConfig {
-        SessionConfig::new(
-            4,
-            8,
-            TcpWindowLimits::new(64, 8).unwrap(),
-            TcpWindowLimits::new(64, 8).unwrap(),
-            ReplayBudgetLimits::new(128, 16).unwrap(),
-            ReplayBudgetLimits::new(128, 16).unwrap(),
-            ReceiveBudgetLimits::new(128, 16).unwrap(),
-            64,
-        )
-        .unwrap()
-    }
-
-    fn fixture_for_session(session_byte: u8) -> Fixture {
-        let leg = test_leg_for_session(session_byte);
-        let config = test_session_config();
-        let mut model = SessionModel::new(SessionRole::Client, config, leg);
-        let effects = model
-            .reduce(SessionEvent::LocalOpen {
-                leg,
-                target: TargetAddr::IpPort(SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::LOCALHOST,
-                    443,
-                ))),
-            })
-            .unwrap();
-        let flow = effects
-            .iter()
-            .find_map(|effect| match effect {
-                SessionEffect::LocalFlowOpened { flow } => Some(*flow),
-                _ => None,
-            })
-            .unwrap();
-        Fixture { model, leg, flow }
-    }
-
-    fn fixture() -> Fixture {
-        fixture_for_session(0x21)
-    }
-
-    fn owner_fixture() -> Fixture {
-        let leg = test_leg();
-        let mut model = SessionModel::new(SessionRole::Owner, test_session_config(), leg);
-        let flow_id = SessionFlowId::new(1).unwrap();
-        let effects = model
-            .reduce(SessionEvent::PeerFrame {
-                leg,
-                frame: Frame::try_new(
-                    leg.generation(),
-                    Record::Open {
-                        flow_id,
-                        target: TargetAddr::IpPort(SocketAddr::V4(SocketAddrV4::new(
-                            Ipv4Addr::LOCALHOST,
-                            443,
-                        ))),
-                    },
-                )
-                .unwrap(),
-            })
-            .unwrap();
-        let (request, flow) = effects
-            .iter()
-            .find_map(|effect| match effect {
-                SessionEffect::PeerOpenRequested { request, flow, .. } => Some((*request, *flow)),
-                _ => None,
-            })
-            .unwrap();
-        model
-            .reduce(SessionEvent::PeerOpenResolved {
-                request,
-                result: OpenResultCode::Opened,
-            })
-            .unwrap();
-        Fixture { model, leg, flow }
-    }
-
-    fn port_config(
-        bytes: usize,
-        data_messages: usize,
-        controls: usize,
-        downlink: usize,
-    ) -> FlowPortConfig {
-        FlowPortConfig::new(bytes, data_messages, controls, downlink).unwrap()
-    }
-
-    fn isolated_pair(
-        flow: LocalFlow,
-        config: FlowPortConfig,
-    ) -> (ResumableTcpFlow, ResumableTcpDriver) {
-        ResumableTcpPortFactory::new_unbound_for_test(config, config.uplink_byte_capacity(), 8, 16)
-            .unwrap()
-            .open_flow(flow)
-            .unwrap()
-    }
-
-    fn open_another_local_flow(fixture: &mut Fixture, port: u16) -> LocalFlow {
-        fixture
-            .model
-            .reduce(SessionEvent::LocalOpen {
-                leg: fixture.leg,
-                target: TargetAddr::IpPort(SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::LOCALHOST,
-                    port,
-                ))),
-            })
-            .unwrap()
-            .into_iter()
-            .find_map(|effect| match effect {
-                SessionEffect::LocalFlowOpened { flow } => Some(flow),
-                _ => None,
-            })
-            .unwrap()
-    }
-
-    fn take_replay_stored(effects: &mut Vec<SessionEffect>) -> ReplayStored {
-        let index = effects
-            .iter()
-            .position(|effect| matches!(effect, SessionEffect::ReplayStored { .. }))
-            .expect("LocalData must return replay storage authority");
-        match effects.remove(index) {
-            SessionEffect::ReplayStored { receipt } => receipt,
-            _ => unreachable!("located exact ReplayStored variant"),
-        }
-    }
-
-    fn take_replay_acknowledged(effects: &mut Vec<SessionEffect>) -> ReplayAcknowledged {
-        let index = effects
-            .iter()
-            .position(|effect| matches!(effect, SessionEffect::ReplayAcknowledged { .. }))
-            .expect("accepted peer ACK must return replay release authority");
-        match effects.remove(index) {
-            SessionEffect::ReplayAcknowledged { receipt } => receipt,
-            _ => unreachable!("located exact ReplayAcknowledged variant"),
-        }
-    }
-
-    fn open_peer(fixture: &mut Fixture) {
-        let frame = Frame::try_new(
-            fixture.leg.generation(),
-            Record::OpenResult {
-                flow_id: fixture.flow.flow_id(),
-                result: OpenResultCode::Opened,
-            },
-        )
-        .unwrap();
-        fixture
-            .model
-            .reduce(SessionEvent::PeerFrame {
-                leg: fixture.leg,
-                frame,
-            })
-            .unwrap();
-    }
-
-    fn sink_offer(fixture: &mut Fixture, payload: &[u8]) -> (SinkOffer, Vec<TcpDataSegment>) {
-        open_peer(fixture);
-        let frame = Frame::try_new(
-            fixture.leg.generation(),
-            Record::Data {
-                flow_id: fixture.flow.flow_id(),
-                direction: Direction::TargetToClient,
-                offset: ByteOffset::new(0),
-                payload: Bytes::copy_from_slice(payload),
-            },
-        )
-        .unwrap();
-        let effects = fixture
-            .model
-            .reduce(SessionEvent::PeerFrame {
-                leg: fixture.leg,
-                frame,
-            })
-            .unwrap();
-        effects
-            .into_iter()
-            .find_map(|effect| match effect {
-                SessionEffect::OfferToSink { offer, segments } => Some((offer, segments)),
-                _ => None,
-            })
-            .unwrap()
-    }
-
-    fn half_close(fixture: &mut Fixture) -> SinkHalfClose {
-        open_peer(fixture);
-        let frame = Frame::try_new(
-            fixture.leg.generation(),
-            Record::Close {
-                flow_id: fixture.flow.flow_id(),
-                direction: Direction::TargetToClient,
-                final_offset: ByteOffset::new(0),
-            },
-        )
-        .unwrap();
-        fixture
-            .model
-            .reduce(SessionEvent::PeerFrame {
-                leg: fixture.leg,
-                frame,
-            })
-            .unwrap()
-            .into_iter()
-            .find_map(|effect| match effect {
-                SessionEffect::HalfCloseSink { completion } => Some(completion),
-                _ => None,
-            })
-            .unwrap()
-    }
-
-    #[test]
-    fn replay_segment_factory_exposes_exact_reducer_aligned_capacities() {
-        let config = port_config(8, 1, 1, 1);
-        let factory = ResumableTcpPortFactory::new_unbound_for_test(config, 32, 3, 11).unwrap();
-        assert_eq!(factory.per_flow_uplink_segment_capacity(), 3);
-        assert_eq!(factory.session_uplink_segment_capacity(), 11);
-        assert_eq!(factory.session_uplink_owned_segments(), 0);
-        assert_eq!(
-            ResumableTcpPortFactory::new_unbound_for_test(config, 32, 0, 11).unwrap_err(),
-            FlowPortConfigError::ZeroUplinkSegmentCapacity
-        );
-        assert_eq!(
-            ResumableTcpPortFactory::new_unbound_for_test(config, 32, 3, 0).unwrap_err(),
-            FlowPortConfigError::ZeroSessionUplinkSegmentCapacity
-        );
-    }
-
-    #[test]
-    fn cloned_factory_rejects_duplicate_local_flow_authority_before_source_admission() {
-        let fixture = fixture();
-        let factory =
-            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 1, 1), 16, 8, 16)
-                .unwrap();
-        let duplicate_caller = factory.clone();
-
-        let (flow, mut driver) = factory.open_flow(fixture.flow).unwrap();
-        assert!(matches!(
-            duplicate_caller.open_flow(fixture.flow),
-            Err(FlowPortError::LocalFlowAuthorityNotMonotonic {
-                highest: 1,
-                attempted: 1,
-            })
-        ));
-        assert_eq!(factory.session_uplink_owned_bytes(), 0);
-        assert_eq!(factory.session_uplink_owned_segments(), 0);
-
-        flow.try_send_uplink_with(1, || Bytes::from_static(b"x"))
-            .unwrap();
-        assert!(matches!(
-            driver.try_recv_next().unwrap(),
-            Some(DriverInput::Data(data)) if data.payload() == b"x"
-        ));
-    }
-
-    #[test]
-    fn factory_binding_rejects_cross_session_and_cross_direction_capabilities() {
-        let session = SessionId::new([0x91; 16]).unwrap();
-        let factory =
-            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 1, 1), 16, 8, 16)
-                .unwrap();
-        let first = LocalFlow::for_adapter_test(
-            session,
-            SessionFlowId::new(1).unwrap(),
-            Direction::ClientToTarget,
-            1,
-        );
-        factory.open_flow(first).unwrap();
-
-        let cross_session = LocalFlow::for_adapter_test(
-            SessionId::new([0x92; 16]).unwrap(),
-            SessionFlowId::new(2).unwrap(),
-            Direction::ClientToTarget,
-            2,
-        );
-        assert!(matches!(
-            factory.open_flow(cross_session),
-            Err(FlowPortError::CrossSessionFlowFactory)
-        ));
-
-        let cross_direction = LocalFlow::for_adapter_test(
-            session,
-            SessionFlowId::new(2).unwrap(),
-            Direction::TargetToClient,
-            2,
-        );
-        assert!(matches!(
-            factory.open_flow(cross_direction),
-            Err(FlowPortError::FlowFactoryDirectionMismatch {
-                expected: Direction::ClientToTarget,
-                actual: Direction::TargetToClient,
-            })
-        ));
-    }
-
-    #[test]
-    fn factory_accepts_authority_gaps_but_rejects_a_later_stale_capability() {
-        let session = SessionId::new([0x93; 16]).unwrap();
-        let factory =
-            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 1, 1), 16, 8, 16)
-                .unwrap();
-        let flow = |flow_id, authority_id| {
-            LocalFlow::for_adapter_test(
-                session,
-                SessionFlowId::new(flow_id).unwrap(),
-                Direction::ClientToTarget,
-                authority_id,
-            )
-        };
-
-        factory.open_flow(flow(1, 1)).unwrap();
-        factory.open_flow(flow(3, 3)).unwrap();
-        assert!(matches!(
-            factory.open_flow(flow(2, 2)),
-            Err(FlowPortError::LocalFlowAuthorityNotMonotonic {
-                highest: 3,
-                attempted: 2,
-            })
-        ));
-    }
-
-    #[test]
-    fn session_uplink_ledger_backpressures_across_flows_before_extraction() {
-        let mut fixture = fixture();
-        let second_flow = open_another_local_flow(&mut fixture, 8443);
-        let factory =
-            ResumableTcpPortFactory::new_unbound_for_test(port_config(4, 1, 1, 1), 4, 8, 16)
-                .unwrap();
-        let (first, mut first_driver) = factory.open_flow(fixture.flow).unwrap();
-        let (second, _second_driver) = factory.open_flow(second_flow).unwrap();
-        let calls = AtomicUsize::new(0);
-
-        first
-            .try_send_uplink_with(4, || Bytes::from_static(b"full"))
-            .unwrap();
-        assert_eq!(factory.session_uplink_owned_bytes(), 4);
-        assert_eq!(
-            second
-                .try_send_uplink_with(1, || {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    Bytes::from_static(b"x")
-                })
-                .unwrap_err(),
-            FlowPortError::UplinkGlobalByteBudgetExhausted {
-                requested: 1,
-                available: 0,
-            }
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-
-        let Some(DriverInput::Data(first_data)) = first_driver.try_recv_next().unwrap() else {
-            panic!("expected first flow DATA ownership")
-        };
-        drop(first_data);
-        assert_eq!(factory.session_uplink_owned_bytes(), 0);
-        second
-            .try_send_uplink_with(1, || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Bytes::from_static(b"x")
-            })
-            .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(factory.session_uplink_owned_bytes(), 1);
-    }
-
-    #[test]
-    fn replay_storage_receipt_rejects_equal_length_wrong_payload() {
-        let mut fixture = fixture();
-        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 2, 1, 1));
-
-        // First advance both the port's source extent and the reducer's replay
-        // extent in lockstep. The retained replay ownership intentionally
-        // stays live while the second equal-sized extent is checked.
-        flow.try_send_uplink_with(4, || Bytes::from_static(b"good"))
-            .unwrap();
-        let Some(DriverInput::Data(data)) = driver.try_recv_next().unwrap() else {
-            panic!("expected admitted DATA")
-        };
-        let (first_event, mut first_ownership) = data.into_event_and_ownership();
-        let mut first_effects = fixture.model.reduce(first_event).unwrap();
-        let first_receipt = take_replay_stored(&mut first_effects);
-        let first_replay = first_ownership.bind_replay(first_receipt).unwrap();
-        assert_eq!(first_replay.start(), ByteOffset::new(0));
-        assert_eq!(first_replay.end(), ByteOffset::new(4));
-
-        flow.try_send_uplink_with(4, || Bytes::from_static(b"good"))
-            .unwrap();
-        let Some(DriverInput::Data(data)) = driver.try_recv_next().unwrap() else {
-            panic!("expected second admitted DATA")
-        };
-        let (_real_event, mut ownership) = data.into_event_and_ownership();
-
-        // Mint a genuine reducer receipt for the same flow, direction, range,
-        // and length but different bytes. Metadata equality alone must never
-        // transfer the second port permit to this replay extent.
-        let wrong_receipt = fixture
-            .model
-            .reduce(SessionEvent::LocalData {
-                flow: fixture.flow,
-                payload: Bytes::from_static(b"evil"),
-            })
-            .unwrap()
-            .into_iter()
-            .find_map(|effect| match effect {
-                SessionEffect::ReplayStored { receipt } => Some(receipt),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(
-            ownership.bind_replay(wrong_receipt).unwrap_err(),
-            FlowPortError::UplinkReplayReceiptMismatch
-        );
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 8);
-        drop(ownership);
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 4);
-        assert_eq!(flow.probe().snapshot().uplink_owned_segments(), 1);
-        drop(first_replay);
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 0);
-    }
-
-    #[test]
-    fn replay_storage_receipt_rejects_wrong_direction() {
-        let client = fixture();
-        let mut owner = owner_fixture();
-        assert_eq!(client.flow.session_id(), owner.flow.session_id());
-        assert_eq!(client.flow.flow_id(), owner.flow.flow_id());
-        assert_ne!(client.flow.direction(), owner.flow.direction());
-
-        let (flow, mut driver) = isolated_pair(client.flow, port_config(4, 1, 1, 1));
-        flow.try_send_uplink_with(4, || Bytes::from_static(b"same"))
-            .unwrap();
-        let Some(DriverInput::Data(data)) = driver.try_recv_next().unwrap() else {
-            panic!("expected admitted DATA")
-        };
-        let (_event, mut ownership) = data.into_event_and_ownership();
-        let wrong_direction = owner
-            .model
-            .reduce(SessionEvent::LocalData {
-                flow: owner.flow,
-                payload: Bytes::from_static(b"same"),
-            })
-            .unwrap()
-            .into_iter()
-            .find_map(|effect| match effect {
-                SessionEffect::ReplayStored { receipt } => Some(receipt),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(
-            ownership.bind_replay(wrong_direction).unwrap_err(),
-            FlowPortError::UplinkReplayReceiptMismatch
-        );
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 4);
-        drop(ownership);
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 0);
-    }
-
-    #[test]
-    fn identical_payload_receipt_cannot_bind_a_different_source_extent() {
-        let mut fixture = fixture();
-        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 2, 1, 1));
-        flow.try_send_uplink_with(4, || Bytes::from_static(b"same"))
-            .unwrap();
-        flow.try_send_uplink_with(4, || Bytes::from_static(b"same"))
-            .unwrap();
-        let Some(DriverInput::Data(first)) = driver.try_recv_next().unwrap() else {
-            panic!("expected first identical DATA")
-        };
-        let Some(DriverInput::Data(second)) = driver.try_recv_next().unwrap() else {
-            panic!("expected second identical DATA")
-        };
-        let (first_event, first_ownership) = first.into_event_and_ownership();
-        let (second_event, mut second_ownership) = second.into_event_and_ownership();
-        let mut first_effects = fixture.model.reduce(first_event).unwrap();
-        let first_receipt = take_replay_stored(&mut first_effects);
-        let mut second_effects = fixture.model.reduce(second_event).unwrap();
-        let second_receipt = take_replay_stored(&mut second_effects);
-
-        assert_eq!(
-            second_ownership.bind_replay(first_receipt).unwrap_err(),
-            FlowPortError::UplinkReplayReceiptMismatch
-        );
-        let second_replay = second_ownership.bind_replay(second_receipt).unwrap();
-        assert_eq!(second_replay.start(), ByteOffset::new(4));
-        assert_eq!(second_replay.end(), ByteOffset::new(8));
-        drop(first_ownership);
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 4);
-        drop(second_replay);
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 0);
-    }
-
-    #[test]
-    fn uplink_reserves_message_and_exact_bytes_before_extraction() {
-        let mut fixture = fixture();
-        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(4, 1, 2, 1));
-        let calls = AtomicUsize::new(0);
-
-        flow.try_send_uplink_with(4, || {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Bytes::from_static(b"data")
-        })
-        .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 4);
-
-        let error = flow
-            .try_send_uplink_with(1, || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Bytes::from_static(b"x")
-            })
-            .unwrap_err();
-        assert_eq!(error, FlowPortError::UplinkMessageLaneFull);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        let DriverInput::Data(data) = driver.try_recv_next().unwrap().unwrap() else {
-            panic!("expected DATA")
-        };
-        let (event, mut ownership) = data.into_event_and_ownership();
-        let error = flow
-            .try_send_uplink_with(1, || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Bytes::from_static(b"x")
-            })
-            .unwrap_err();
-        assert_eq!(
-            error,
-            FlowPortError::UplinkByteBudgetExhausted {
-                requested: 1,
-                available: 0,
-            }
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        let mut stored_effects = fixture.model.reduce(event).unwrap();
-        let stored = take_replay_stored(&mut stored_effects);
-        let mut replay = ownership.bind_replay(stored).unwrap();
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 4);
-
-        let partial_ack = Frame::try_new(
-            fixture.leg.generation(),
-            Record::Ack {
-                flow_id: fixture.flow.flow_id(),
-                direction: Direction::ClientToTarget,
-                next_accepted: ByteOffset::new(2),
-                final_accepted: false,
-            },
-        )
-        .unwrap();
-        let mut partial_effects = fixture
-            .model
-            .reduce(SessionEvent::PeerFrame {
-                leg: fixture.leg,
-                frame: partial_ack,
-            })
-            .unwrap();
-        let partial_receipt = take_replay_acknowledged(&mut partial_effects);
-        assert!(!replay.release_after_reducer_ack(&partial_receipt).unwrap());
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 4);
-
-        let full_ack = Frame::try_new(
-            fixture.leg.generation(),
-            Record::Ack {
-                flow_id: fixture.flow.flow_id(),
-                direction: Direction::ClientToTarget,
-                next_accepted: ByteOffset::new(4),
-                final_accepted: false,
-            },
-        )
-        .unwrap();
-        let mut full_effects = fixture
-            .model
-            .reduce(SessionEvent::PeerFrame {
-                leg: fixture.leg,
-                frame: full_ack,
-            })
-            .unwrap();
-        let full_receipt = take_replay_acknowledged(&mut full_effects);
-        assert!(replay.release_after_reducer_ack(&full_receipt).unwrap());
-        assert!(!replay.release_after_reducer_ack(&full_receipt).unwrap());
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 0);
-    }
-
-    #[test]
-    fn replay_segment_permits_survive_source_dequeue_until_exact_ack() {
-        let mut fixture = fixture();
-        let factory =
-            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 2, 1), 8, 2, 2)
-                .unwrap();
-        let (flow, mut driver) = factory.open_flow(fixture.flow).unwrap();
-        let mut retained = Vec::new();
-
-        for payload in [b"a".as_slice(), b"b".as_slice()] {
-            flow.try_send_uplink_with(1, || Bytes::copy_from_slice(payload))
-                .unwrap();
-            let Some(DriverInput::Data(data)) = driver.try_recv_next().unwrap() else {
-                panic!("expected admitted DATA")
-            };
-            let (event, mut ownership) = data.into_event_and_ownership();
-            let mut effects = fixture.model.reduce(event).unwrap();
-            retained.push(
-                ownership
-                    .bind_replay(take_replay_stored(&mut effects))
-                    .unwrap(),
-            );
-        }
-        assert_eq!(flow.probe().snapshot().uplink_owned_segments(), 2);
-        assert_eq!(factory.session_uplink_owned_segments(), 2);
-
-        let extractions = AtomicUsize::new(0);
-        assert_eq!(
-            flow.try_send_uplink_with(1, || {
-                extractions.fetch_add(1, Ordering::SeqCst);
-                Bytes::from_static(b"c")
-            })
-            .unwrap_err(),
-            FlowPortError::UplinkSegmentBudgetExhausted { available: 0 }
-        );
-        assert_eq!(extractions.load(Ordering::SeqCst), 0);
-
-        let acknowledged = Frame::try_new(
-            fixture.leg.generation(),
-            Record::Ack {
-                flow_id: fixture.flow.flow_id(),
-                direction: Direction::ClientToTarget,
-                next_accepted: ByteOffset::new(1),
-                final_accepted: false,
-            },
-        )
-        .unwrap();
-        let mut effects = fixture
-            .model
-            .reduce(SessionEvent::PeerFrame {
-                leg: fixture.leg,
-                frame: acknowledged,
-            })
-            .unwrap();
-        assert!(
-            retained[0]
-                .release_after_reducer_ack(&take_replay_acknowledged(&mut effects))
-                .unwrap()
-        );
-        assert_eq!(flow.probe().snapshot().uplink_owned_segments(), 1);
-
-        flow.try_send_uplink_with(1, || {
-            extractions.fetch_add(1, Ordering::SeqCst);
-            Bytes::from_static(b"c")
-        })
-        .unwrap();
-        assert_eq!(extractions.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn replay_segment_limits_are_per_flow_and_session_global_before_extraction() {
-        let mut fixture = fixture();
-        let second_flow = open_another_local_flow(&mut fixture, 8443);
-        let third_flow = open_another_local_flow(&mut fixture, 9443);
-        let factory =
-            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 2, 1), 8, 1, 2)
-                .unwrap();
-        let (first, mut first_driver) = factory.open_flow(fixture.flow).unwrap();
-        let (second, mut second_driver) = factory.open_flow(second_flow).unwrap();
-        let (third, mut third_driver) = factory.open_flow(third_flow).unwrap();
-        let extractions = AtomicUsize::new(0);
-
-        first
-            .try_send_uplink_with(1, || {
-                extractions.fetch_add(1, Ordering::SeqCst);
-                Bytes::from_static(b"a")
-            })
-            .unwrap();
-        let Some(DriverInput::Data(first_data)) = first_driver.try_recv_next().unwrap() else {
-            panic!("expected first DATA")
-        };
-        assert_eq!(
-            first
-                .try_send_uplink_with(1, || {
-                    extractions.fetch_add(1, Ordering::SeqCst);
-                    Bytes::from_static(b"x")
-                })
-                .unwrap_err(),
-            FlowPortError::UplinkSegmentBudgetExhausted { available: 0 }
-        );
-
-        second
-            .try_send_uplink_with(1, || {
-                extractions.fetch_add(1, Ordering::SeqCst);
-                Bytes::from_static(b"b")
-            })
-            .unwrap();
-        let Some(DriverInput::Data(second_data)) = second_driver.try_recv_next().unwrap() else {
-            panic!("expected second DATA")
-        };
-        assert_eq!(factory.session_uplink_owned_segments(), 2);
-        assert_eq!(
-            third
-                .try_send_uplink_with(1, || {
-                    extractions.fetch_add(1, Ordering::SeqCst);
-                    Bytes::from_static(b"c")
-                })
-                .unwrap_err(),
-            FlowPortError::UplinkGlobalSegmentBudgetExhausted { available: 0 }
-        );
-        assert_eq!(extractions.load(Ordering::SeqCst), 2);
-
-        drop(first_data);
-        assert_eq!(factory.session_uplink_owned_segments(), 1);
-        third
-            .try_send_uplink_with(1, || {
-                extractions.fetch_add(1, Ordering::SeqCst);
-                Bytes::from_static(b"c")
-            })
-            .unwrap();
-        assert!(matches!(
-            third_driver.try_recv_next().unwrap(),
-            Some(DriverInput::Data(_))
-        ));
-        assert_eq!(extractions.load(Ordering::SeqCst), 3);
-        drop(second_data);
-    }
-
-    #[test]
-    fn source_reservation_commits_eof_through_its_pre_reserved_fifo_slot() {
-        let fixture = fixture();
-        let factory =
-            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 1, 1), 8, 1, 1)
-                .unwrap();
-        let (flow, mut driver) = factory.open_flow(fixture.flow).unwrap();
-        let eof_reads = AtomicUsize::new(0);
-
-        let reservation = flow.try_reserve_uplink_source(8).unwrap();
-        eof_reads.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(
-            flow.try_send_close().unwrap_err(),
-            FlowPortError::UplinkSourceReservationActive
-        );
-        reservation.commit_eof().unwrap();
-
-        assert_eq!(eof_reads.load(Ordering::SeqCst), 1);
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 0);
-        assert_eq!(flow.probe().snapshot().uplink_owned_segments(), 0);
-        assert_eq!(factory.session_uplink_owned_bytes(), 0);
-        assert_eq!(factory.session_uplink_owned_segments(), 0);
-        assert_eq!(flow.try_send_close().unwrap_err(), FlowPortError::Closed);
-        let post_eof_extractions = AtomicUsize::new(0);
-        assert_eq!(
-            flow.try_send_uplink_with(1, || {
-                post_eof_extractions.fetch_add(1, Ordering::SeqCst);
-                Bytes::from_static(b"late")
-            })
-            .unwrap_err(),
-            FlowPortError::Closed
-        );
-        assert_eq!(post_eof_extractions.load(Ordering::SeqCst), 0);
-        assert!(matches!(
-            driver.try_recv_next().unwrap(),
-            Some(DriverInput::Control(SessionEvent::LocalClose { flow: observed }))
-                if observed == fixture.flow
-        ));
-        assert!(driver.try_recv_next().unwrap().is_none());
-    }
-
-    #[test]
-    fn committed_eof_cannot_overtake_preceding_data_on_a_one_slot_lane() {
-        let fixture = fixture();
-        let factory =
-            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 1, 1), 8, 2, 2)
-                .unwrap();
-        let (flow, mut driver) = factory.open_flow(fixture.flow).unwrap();
-        let eof_reads = AtomicUsize::new(0);
-
-        flow.try_send_uplink_with(1, || Bytes::from_static(b"x"))
-            .unwrap();
-        assert!(matches!(
-            flow.try_reserve_uplink_source(1),
-            Err(FlowPortError::UplinkMessageLaneFull)
-        ));
-        assert_eq!(eof_reads.load(Ordering::SeqCst), 0);
-
-        let Some(DriverInput::Data(data)) = driver.try_recv_next().unwrap() else {
-            panic!("preceding DATA must be observed before EOF can reserve its slot")
-        };
-        let reservation = flow.try_reserve_uplink_source(1).unwrap();
-        eof_reads.fetch_add(1, Ordering::SeqCst);
-        reservation.commit_eof().unwrap();
-
-        assert_eq!(data.payload(), b"x");
-        assert!(matches!(
-            driver.try_recv_next().unwrap(),
-            Some(DriverInput::Control(SessionEvent::LocalClose { flow: observed }))
-                if observed == fixture.flow
-        ));
-        assert_eq!(eof_reads.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn uplink_source_reservation_shrinks_max_budget_to_committed_bytes() {
-        let mut fixture = fixture();
-        let factory =
-            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 1, 1), 8, 8, 16)
-                .unwrap();
-        let (flow, mut driver) = factory.open_flow(fixture.flow).unwrap();
-
-        let reservation = flow.try_reserve_uplink_source(8).unwrap();
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 8);
-        assert_eq!(factory.session_uplink_owned_bytes(), 8);
-        reservation.commit(Bytes::from_static(b"abc")).unwrap();
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 3);
-        assert_eq!(factory.session_uplink_owned_bytes(), 3);
-
-        let Some(DriverInput::Data(data)) = driver.try_recv_next().unwrap() else {
-            panic!("expected committed source DATA")
-        };
-        let (event, mut ownership) = data.into_event_and_ownership();
-        let mut effects = fixture.model.reduce(event).unwrap();
-        let stored = take_replay_stored(&mut effects);
-        let replay = ownership.bind_replay(stored).unwrap();
-        assert_eq!(replay.start(), ByteOffset::new(0));
-        assert_eq!(replay.end(), ByteOffset::new(3));
-        drop(replay);
-        assert_eq!(factory.session_uplink_owned_bytes(), 0);
-    }
-
-    #[test]
-    fn invalid_source_commit_releases_reservation_without_advancing_offset() {
-        let mut fixture = fixture();
-        let factory =
-            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 1, 1), 8, 8, 16)
-                .unwrap();
-        let (flow, mut driver) = factory.open_flow(fixture.flow).unwrap();
-
-        assert_eq!(
-            flow.try_reserve_uplink_source(8)
-                .unwrap()
-                .commit(Bytes::new())
-                .unwrap_err(),
-            FlowPortError::UplinkLengthMismatch {
-                reserved: 8,
-                actual: 0,
-            }
-        );
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 0);
-        assert_eq!(factory.session_uplink_owned_bytes(), 0);
-        assert!(driver.try_recv_next().unwrap().is_none());
-
-        flow.try_reserve_uplink_source(8)
-            .unwrap()
-            .commit(Bytes::from_static(b"abc"))
-            .unwrap();
-        let Some(DriverInput::Data(data)) = driver.try_recv_next().unwrap() else {
-            panic!("expected valid DATA after rejected empty commit")
-        };
-        let (event, mut ownership) = data.into_event_and_ownership();
-        let mut effects = fixture.model.reduce(event).unwrap();
-        let stored = take_replay_stored(&mut effects);
-        let replay = ownership.bind_replay(stored).unwrap();
-        assert_eq!(replay.start(), ByteOffset::new(0));
-        assert_eq!(replay.end(), ByteOffset::new(3));
-    }
-
-    #[test]
-    fn exhausted_source_offset_rejects_before_touching_the_socket_extractor() {
-        let fixture = fixture();
-        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 1, 1, 1));
-        flow.state
-            .next_uplink_offset
-            .store(u64::MAX, Ordering::Release);
-        let extractions = AtomicUsize::new(0);
-
-        assert_eq!(
-            flow.try_send_uplink_with(1, || {
-                extractions.fetch_add(1, Ordering::SeqCst);
-                Bytes::from_static(b"x")
-            })
-            .unwrap_err(),
-            FlowPortError::UplinkOffsetExhausted
-        );
-        assert_eq!(extractions.load(Ordering::SeqCst), 0);
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 0);
-        assert_eq!(flow.probe().snapshot().uplink_owned_segments(), 0);
-        assert!(driver.try_recv_next().unwrap().is_none());
-    }
-
-    #[test]
-    fn ordered_close_waits_for_outstanding_source_reservation() {
-        let fixture = fixture();
-        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 2, 1, 1));
-
-        let reservation = flow.try_reserve_uplink_source(8).unwrap();
-        assert_eq!(
-            flow.try_send_close().unwrap_err(),
-            FlowPortError::UplinkSourceReservationActive
-        );
-        assert!(driver.try_recv_next().unwrap().is_none());
-
-        drop(reservation);
-        flow.try_send_close().unwrap();
-        assert!(matches!(
-            driver.try_recv_next().unwrap(),
-            Some(DriverInput::Control(SessionEvent::LocalClose { flow: observed }))
-                if observed == fixture.flow
-        ));
-    }
-
-    #[test]
-    fn extractor_length_mismatch_does_not_advance_later_source_offsets() {
-        let mut fixture = fixture();
-        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 2, 1, 1));
-
-        assert_eq!(
-            flow.try_send_uplink_with(8, || Bytes::from_static(b"bad"))
-                .unwrap_err(),
-            FlowPortError::UplinkLengthMismatch {
-                reserved: 8,
-                actual: 3,
-            }
-        );
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 0);
-
-        let mut replays = Vec::new();
-        for payload in [b"abc".as_slice(), b"def".as_slice()] {
-            flow.try_send_uplink_with(payload.len(), || Bytes::copy_from_slice(payload))
-                .unwrap();
-            let Some(DriverInput::Data(data)) = driver.try_recv_next().unwrap() else {
-                panic!("expected valid DATA after mismatch")
-            };
-            let (event, mut ownership) = data.into_event_and_ownership();
-            let mut effects = fixture.model.reduce(event).unwrap();
-            let stored = take_replay_stored(&mut effects);
-            replays.push(ownership.bind_replay(stored).unwrap());
-        }
-
-        assert_eq!(replays[0].start(), ByteOffset::new(0));
-        assert_eq!(replays[0].end(), ByteOffset::new(3));
-        assert_eq!(replays[1].start(), ByteOffset::new(3));
-        assert_eq!(replays[1].end(), ByteOffset::new(6));
-    }
-
-    #[test]
-    fn source_error_drops_reservation_without_capacity_or_offset_ownership() {
-        let mut fixture = fixture();
-        let factory =
-            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 1, 1), 8, 8, 16)
-                .unwrap();
-        let (flow, mut driver) = factory.open_flow(fixture.flow).unwrap();
-
-        let reservation = flow.try_reserve_uplink_source(8).unwrap();
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 8);
-        assert_eq!(factory.session_uplink_owned_bytes(), 8);
-        let source_result = Result::<Bytes, &'static str>::Err("would block");
-        match source_result {
-            Ok(payload) => reservation.commit(payload).unwrap(),
-            Err(_) => drop(reservation),
-        }
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 0);
-        assert_eq!(factory.session_uplink_owned_bytes(), 0);
-        assert!(driver.try_recv_next().unwrap().is_none());
-
-        flow.try_reserve_uplink_source(8)
-            .unwrap()
-            .commit(Bytes::from_static(b"abc"))
-            .unwrap();
-        let Some(DriverInput::Data(data)) = driver.try_recv_next().unwrap() else {
-            panic!("expected valid DATA after source error")
-        };
-        let (event, mut ownership) = data.into_event_and_ownership();
-        let mut effects = fixture.model.reduce(event).unwrap();
-        let stored = take_replay_stored(&mut effects);
-        let replay = ownership.bind_replay(stored).unwrap();
-        assert_eq!(replay.start(), ByteOffset::new(0));
-        assert_eq!(replay.end(), ByteOffset::new(3));
-    }
-
-    #[test]
-    fn source_reservations_share_the_session_global_byte_budget() {
-        let mut fixture = fixture();
-        let second_flow = open_another_local_flow(&mut fixture, 8443);
-        let factory =
-            ResumableTcpPortFactory::new_unbound_for_test(port_config(8, 1, 1, 1), 4, 8, 16)
-                .unwrap();
-        let (first, _first_driver) = factory.open_flow(fixture.flow).unwrap();
-        let (second, mut second_driver) = factory.open_flow(second_flow).unwrap();
-
-        let first_reservation = first.try_reserve_uplink_source(4).unwrap();
-        assert_eq!(factory.session_uplink_owned_bytes(), 4);
-        let Err(error) = second.try_reserve_uplink_source(1) else {
-            panic!("the second flow must not bypass the shared session byte budget")
-        };
-        assert_eq!(
-            error,
-            FlowPortError::UplinkGlobalByteBudgetExhausted {
-                requested: 1,
-                available: 0,
-            }
-        );
-
-        drop(first_reservation);
-        assert_eq!(factory.session_uplink_owned_bytes(), 0);
-        second
-            .try_reserve_uplink_source(1)
-            .unwrap()
-            .commit(Bytes::from_static(b"x"))
-            .unwrap();
-        assert_eq!(factory.session_uplink_owned_bytes(), 1);
-        let Some(DriverInput::Data(data)) = second_driver.try_recv_next().unwrap() else {
-            panic!("expected second flow DATA after shared capacity was released")
-        };
-        drop(data);
-        assert_eq!(factory.session_uplink_owned_bytes(), 0);
-    }
-
-    #[test]
-    fn one_source_reservation_blocks_ordered_sources_but_not_urgent_reset() {
-        let fixture = fixture();
-        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 2, 1, 1));
-
-        let reservation = flow.try_reserve_uplink_source(8).unwrap();
-        let Err(error) = flow.try_reserve_uplink_source(1) else {
-            panic!("a flow must not hold two ordered-source reservations")
-        };
-        assert_eq!(error, FlowPortError::UplinkSourceReservationActive);
-        flow.try_send_reset(ResetReason::LocalAbandon).unwrap();
-        assert!(matches!(
-            driver.try_recv_next().unwrap(),
-            Some(DriverInput::Control(SessionEvent::LocalReset {
-                flow: reset_flow,
-                reason: ResetReason::LocalAbandon,
-            })) if reset_flow == fixture.flow
-        ));
-
-        drop(reservation);
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 0);
-        flow.try_reserve_uplink_source(1)
-            .unwrap()
-            .commit(Bytes::from_static(b"x"))
-            .unwrap();
-        assert!(matches!(
-            driver.try_recv_next().unwrap(),
-            Some(DriverInput::Data(_))
-        ));
-    }
-
-    #[test]
-    fn uplink_queue_normalizes_a_small_slice_before_taking_ownership() {
-        let fixture = fixture();
-        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 1, 1, 1));
-        let backing = Bytes::from(vec![0x5a; 1024 * 1024]);
-        let tiny = backing.slice(512..516);
-        let unbounded_pointer = tiny.as_ptr();
-        flow.try_send_uplink_with(4, move || tiny).unwrap();
-        let Some(DriverInput::Data(data)) = driver.try_recv_next().unwrap() else {
-            panic!("expected normalized DATA")
-        };
-        assert_eq!(data.payload(), [0x5a; 4]);
-        assert_ne!(data.payload().as_ptr(), unbounded_pointer);
-    }
-
-    #[test]
-    fn exact_vec_extractor_transfers_without_second_copy_and_compacts_excess_capacity() {
-        let fixture = fixture();
-        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(4, 1, 1, 1));
-        let mut exact_pointer = 0usize;
-        flow.try_send_uplink_vec_with(4, || {
-            let payload = vec![1, 2, 3, 4];
-            assert_eq!(payload.capacity(), payload.len());
-            exact_pointer = payload.as_ptr() as usize;
-            payload
-        })
-        .unwrap();
-        let Some(DriverInput::Data(exact)) = driver.try_recv_next().unwrap() else {
-            panic!("expected exact Vec DATA")
-        };
-        assert_eq!(exact.payload().as_ptr() as usize, exact_pointer);
-
-        let calls = AtomicUsize::new(0);
-        assert_eq!(
-            flow.try_send_uplink_vec_with(1, || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                vec![9]
-            })
-            .unwrap_err(),
-            FlowPortError::UplinkByteBudgetExhausted {
-                requested: 1,
-                available: 0,
-            }
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        drop(exact);
-
-        let mut excess_pointer = 0usize;
-        flow.try_send_uplink_vec_with(4, || {
-            let mut payload = Vec::with_capacity(1024 * 1024);
-            payload.extend_from_slice(&[5, 6, 7, 8]);
-            excess_pointer = payload.as_ptr() as usize;
-            payload
-        })
-        .unwrap();
-        let Some(DriverInput::Data(compacted)) = driver.try_recv_next().unwrap() else {
-            panic!("expected compacted Vec DATA")
-        };
-        assert_eq!(compacted.payload(), [5, 6, 7, 8]);
-        assert_ne!(compacted.payload().as_ptr() as usize, excess_pointer);
-    }
-
-    #[test]
-    fn uplink_replay_budget_releases_only_on_exact_terminal_reducer_effect() {
-        let mut fixture = fixture();
-        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 1, 2, 1));
-        flow.try_send_uplink_with(4, || Bytes::from_static(b"data"))
-            .unwrap();
-        let Some(DriverInput::Data(data)) = driver.try_recv_next().unwrap() else {
-            panic!("expected DATA")
-        };
-        let (event, mut ownership) = data.into_event_and_ownership();
-        let mut stored_effects = fixture.model.reduce(event).unwrap();
-        let stored = take_replay_stored(&mut stored_effects);
-        let mut replay = ownership.bind_replay(stored).unwrap();
-        let terminal_effects = fixture
-            .model
-            .reduce(SessionEvent::LocalReset {
-                flow: fixture.flow,
-                reason: ResetReason::LocalAbandon,
-            })
-            .unwrap();
-        let nonterminal = terminal_effects
-            .iter()
-            .find(|effect| matches!(effect, SessionEffect::Transmit(_)))
-            .unwrap();
-        assert_eq!(
-            replay
-                .release_after_reducer_terminal(nonterminal)
-                .unwrap_err(),
-            FlowPortError::UplinkTerminalMismatch
-        );
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 4);
-        assert_eq!(flow.probe().snapshot().uplink_owned_segments(), 1);
-        let terminal = terminal_effects
-            .iter()
-            .find(|effect| matches!(effect, SessionEffect::FlowFinished { .. }))
-            .unwrap();
-        assert!(replay.release_after_reducer_terminal(terminal).unwrap());
-        assert_eq!(flow.probe().snapshot().uplink_owned_bytes(), 0);
-        assert_eq!(flow.probe().snapshot().uplink_owned_segments(), 0);
-    }
-
-    #[test]
-    fn local_close_cannot_overtake_preceding_uplink_data() {
-        let mut fixture = fixture();
-        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 2, 2, 1));
-        flow.try_send_uplink_with(1, || Bytes::from_static(b"x"))
-            .unwrap();
-        flow.try_send_close().unwrap();
-
-        let Some(DriverInput::Data(data)) = driver.try_recv_next().unwrap() else {
-            panic!("DATA queued before local FIN must be reduced first")
-        };
-        let (data_event, mut ownership) = data.into_event_and_ownership();
-        let mut data_effects = fixture.model.reduce(data_event).unwrap();
-        let stored = take_replay_stored(&mut data_effects);
-        let data_frame = data_effects
-            .iter()
-            .find_map(|effect| match effect {
-                SessionEffect::Transmit(frame) => Some(frame),
-                _ => None,
-            })
-            .unwrap();
-        assert!(matches!(
-            data_frame.record(),
-            Record::Data {
-                offset,
-                payload,
-                ..
-            } if *offset == ByteOffset::new(0) && payload.as_ref() == b"x"
-        ));
-        let _replay = ownership.bind_replay(stored).unwrap();
-
-        let Some(DriverInput::Control(close_event @ SessionEvent::LocalClose { .. })) =
-            driver.try_recv_next().unwrap()
-        else {
-            panic!("local FIN must follow every preceding DATA extent")
-        };
-        let close_frame = fixture
-            .model
-            .reduce(close_event)
-            .unwrap()
-            .into_iter()
-            .find_map(|effect| match effect {
-                SessionEffect::Transmit(frame) => Some(frame),
-                _ => None,
-            })
-            .unwrap();
-        assert!(matches!(
-            close_frame.record(),
-            Record::Close { final_offset, .. } if *final_offset == ByteOffset::new(1)
-        ));
-    }
-
-    #[test]
-    fn local_reset_has_reserved_terminal_capacity_and_urgent_priority() {
-        let mut fixture = fixture();
-        let (offer, segments) = sink_offer(&mut fixture, b"peer-data");
-        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 1, 1, 1));
-
-        // Reserving the sink completion occupies the sole ordinary control
-        // slot. A queued DATA extent simultaneously occupies the source lane.
-        driver.try_deliver_sink(offer, segments).unwrap();
-        flow.try_send_uplink_with(1, || Bytes::from_static(b"x"))
-            .unwrap();
-
-        flow.try_send_reset(ResetReason::LocalAbandon).unwrap();
-        let Some(DriverInput::Control(reset @ SessionEvent::LocalReset { .. })) =
-            driver.try_recv_next().unwrap()
-        else {
-            panic!("the reserved terminal reset must outrank ordinary source/control work")
-        };
-        assert!(
-            fixture
-                .model
-                .reduce(reset)
-                .unwrap()
-                .iter()
-                .any(|effect| matches!(
-                    effect,
-                    SessionEffect::FlowFinished {
-                        reason: FlowFinishReason::LocalReset(ResetReason::LocalAbandon),
-                        ..
-                    }
-                ))
-        );
-    }
-
-    #[test]
-    fn abandoning_an_uninstalled_flow_emits_exact_local_reset() {
-        let fixture = fixture();
-        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 1, 1, 1));
-
-        flow.abandon_before_install().unwrap();
-
-        let Some(DriverInput::Control(SessionEvent::LocalReset {
-            flow: reset_flow,
-            reason,
-        })) = driver.try_recv_next().unwrap()
-        else {
-            panic!("an uninstalled TUN owner must leave one exact reset for the supervisor")
-        };
-        assert_eq!(reset_flow, fixture.flow);
-        assert_eq!(reason, ResetReason::LocalAbandon);
-    }
-
-    #[test]
-    fn bounded_control_burst_cannot_starve_ready_ordered_source() {
-        let mut fixture = fixture();
-        let (offer, _) = sink_offer(&mut fixture, b"peer-data");
-        let (flow, mut driver) =
-            isolated_pair(fixture.flow, port_config(1, 1, CONTROL_BURST_LIMIT + 1, 1));
-        flow.try_send_uplink_with(1, || Bytes::from_static(b"x"))
-            .unwrap();
-        let control = driver.completion_tx.upgrade().unwrap();
-        for _ in 0..=CONTROL_BURST_LIMIT {
-            control
-                .try_send(FlowControl::SinkAbandoned { offer })
-                .unwrap();
-        }
-
-        for _ in 0..CONTROL_BURST_LIMIT {
-            assert!(matches!(
-                driver.try_recv_next().unwrap(),
-                Some(DriverInput::Control(_))
-            ));
-            control
-                .try_send(FlowControl::SinkAbandoned { offer })
-                .unwrap();
-        }
-        assert!(matches!(
-            driver.try_recv_next().unwrap(),
-            Some(DriverInput::Data(_))
-        ));
-    }
-
-    #[test]
-    fn ready_completion_preempts_an_ordered_source_flood() {
-        let mut fixture = fixture();
-        let (offer, _) = sink_offer(&mut fixture, b"peer-data");
-        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(4, 4, 1, 1));
-        for _ in 0..4 {
-            flow.try_send_uplink_with(1, || Bytes::from_static(b"x"))
-                .unwrap();
-        }
-        driver
-            .completion_tx
-            .upgrade()
-            .unwrap()
-            .try_send(FlowControl::SinkAbandoned { offer })
-            .unwrap();
-        assert!(matches!(
-            driver.try_recv_next().unwrap(),
-            Some(DriverInput::Control(_))
-        ));
-        assert!(matches!(
-            driver.try_recv_next().unwrap(),
-            Some(DriverInput::Data(_))
-        ));
-    }
-
-    #[test]
-    fn sink_completion_has_priority_over_ordered_source_and_leg_loss_is_not_terminal() {
-        let mut fixture = fixture();
-        let (offer, segments) = sink_offer(&mut fixture, b"peer-data");
-        let (mut flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 2, 2, 1));
-        flow.try_send_uplink_with(1, || Bytes::from_static(b"x"))
-            .unwrap();
-        driver.try_deliver_sink(offer, segments).unwrap();
-        let TunAction::Sink(delivery) = flow.try_recv_action().unwrap().unwrap() else {
-            panic!("expected sink delivery")
-        };
-        delivery.abandon();
-        driver.note_leg_lost();
-
-        assert!(matches!(
-            driver.try_recv_next().unwrap(),
-            Some(DriverInput::Control(SessionEvent::SinkAbandoned { offer: observed }))
-                if observed == offer
-        ));
-        assert!(matches!(
-            driver.try_recv_next().unwrap(),
-            Some(DriverInput::Data(_))
-        ));
-        assert_eq!(driver.probe().snapshot().observed_leg_losses(), 1);
-    }
-
-    #[test]
-    fn partial_sink_completion_discards_old_suffix_and_waits_for_new_offer() {
-        let mut fixture = fixture();
-        let (offer, segments) = sink_offer(&mut fixture, b"abcdef");
-        let (mut flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 2, 2, 2));
-        driver.try_deliver_sink(offer, segments).unwrap();
-        let TunAction::Sink(delivery) = flow.try_recv_action().unwrap().unwrap() else {
-            panic!("expected sink delivery")
-        };
-        assert_eq!(delivery.first_segment_slice(), b"abcdef");
-        let delivery = delivery.complete_write(0).unwrap().unwrap();
-        assert_eq!(driver.probe().snapshot().reserved_completion_slots(), 1);
-        assert!(delivery.complete_write(2).unwrap().is_none());
-
-        let Some(DriverInput::Control(event @ SessionEvent::SinkAccepted { bytes: 2, .. })) =
-            driver.try_recv_next().unwrap()
-        else {
-            panic!("expected exact sink acceptance")
-        };
-        let effects = fixture.model.reduce(event).unwrap();
-        let (new_offer, new_segments) = effects
-            .into_iter()
-            .find_map(|effect| match effect {
-                SessionEffect::OfferToSink { offer, segments } => Some((offer, segments)),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(new_offer.offset(), ByteOffset::new(2));
-        assert_eq!(new_offer.len(), 4);
-        assert_eq!(new_segments[0].payload(), &Bytes::from_static(b"cdef"));
-        assert_eq!(driver.probe().snapshot().reserved_completion_slots(), 0);
-    }
-
-    #[test]
-    fn abandon_uses_pre_reserved_control_slot() {
-        let mut fixture = fixture();
-        let (offer, segments) = sink_offer(&mut fixture, b"payload");
-        let (mut flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 1, 1, 1));
-        driver.try_deliver_sink(offer, segments).unwrap();
-        assert_eq!(driver.probe().snapshot().reserved_completion_slots(), 1);
-        let TunAction::Sink(delivery) = flow.try_recv_action().unwrap().unwrap() else {
-            panic!("expected sink delivery")
-        };
-        delivery.abandon();
-        assert!(matches!(
-            driver.try_recv_next().unwrap(),
-            Some(DriverInput::Control(SessionEvent::SinkAbandoned { offer: observed }))
-                if observed == offer
-        ));
-    }
-
-    #[test]
-    fn cancellation_drop_fails_closed_for_sink_and_half_close() {
-        let mut sink_fixture = fixture();
-        let (offer, segments) = sink_offer(&mut sink_fixture, b"payload");
-        let (mut sink_flow, mut sink_driver) =
-            isolated_pair(sink_fixture.flow, port_config(8, 1, 1, 1));
-        sink_driver.try_deliver_sink(offer, segments).unwrap();
-        let TunAction::Sink(delivery) = sink_flow.try_recv_action().unwrap().unwrap() else {
-            panic!("expected sink delivery")
-        };
-        drop(delivery);
-        assert!(matches!(
-            sink_driver.try_recv_next().unwrap(),
-            Some(DriverInput::Control(SessionEvent::SinkAbandoned { offer: observed }))
-                if observed == offer
-        ));
-
-        let mut close_fixture = fixture();
-        let capability = half_close(&mut close_fixture);
-        let (mut close_flow, mut close_driver) =
-            isolated_pair(close_fixture.flow, port_config(8, 1, 1, 1));
-        close_driver.try_deliver_half_close(capability).unwrap();
-        let TunAction::HalfClose(delivery) = close_flow.try_recv_action().unwrap().unwrap() else {
-            panic!("expected half-close delivery")
-        };
-        drop(delivery);
-        assert!(matches!(
-            close_driver.try_recv_next().unwrap(),
-            Some(DriverInput::Control(SessionEvent::SinkHalfCloseFailed { completion }))
-                if completion == capability
-        ));
-    }
-
-    #[test]
-    fn downlink_refuses_delivery_when_completion_lane_has_no_slot() {
-        let mut fixture = fixture();
-        let (offer, segments) = sink_offer(&mut fixture, b"payload");
-        let retry_segments = segments.clone();
-        let (mut flow, driver) = isolated_pair(fixture.flow, port_config(8, 1, 1, 1));
-        driver.try_deliver_sink(offer, segments).unwrap();
-        let TunAction::Sink(delivery) = flow.try_recv_action().unwrap().unwrap() else {
-            panic!("expected sink delivery")
-        };
-        delivery.abandon();
-        assert_eq!(
-            driver.try_deliver_sink(offer, retry_segments).unwrap_err(),
-            FlowPortError::ControlLaneFull
-        );
-        assert_eq!(driver.probe().snapshot().pending_downlink_actions(), 0);
-    }
-
-    #[test]
-    fn sink_and_half_close_capabilities_cannot_cross_direction() {
-        let client = fixture();
-        let mut owner = owner_fixture();
-        assert_eq!(client.flow.session_id(), owner.flow.session_id());
-        assert_eq!(client.flow.flow_id(), owner.flow.flow_id());
-        assert_ne!(client.flow.direction(), owner.flow.direction());
-        let (_flow, driver) = isolated_pair(client.flow, port_config(8, 1, 2, 2));
-
-        let offered = owner
-            .model
-            .reduce(SessionEvent::PeerFrame {
-                leg: owner.leg,
-                frame: Frame::try_new(
-                    owner.leg.generation(),
-                    Record::Data {
-                        flow_id: owner.flow.flow_id(),
-                        direction: Direction::ClientToTarget,
-                        offset: ByteOffset::new(0),
-                        payload: Bytes::from_static(b"x"),
-                    },
-                )
-                .unwrap(),
-            })
-            .unwrap();
-        let (offer, segments) = offered
-            .into_iter()
-            .find_map(|effect| match effect {
-                SessionEffect::OfferToSink { offer, segments } => Some((offer, segments)),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(
-            driver.try_deliver_sink(offer, segments).unwrap_err(),
-            FlowPortError::SinkDirectionMismatch {
-                expected: Direction::TargetToClient,
-                actual: Direction::ClientToTarget,
-            }
-        );
-
-        let mut close_owner = owner_fixture();
-        let closed = close_owner
-            .model
-            .reduce(SessionEvent::PeerFrame {
-                leg: close_owner.leg,
-                frame: Frame::try_new(
-                    close_owner.leg.generation(),
-                    Record::Close {
-                        flow_id: close_owner.flow.flow_id(),
-                        direction: Direction::ClientToTarget,
-                        final_offset: ByteOffset::new(0),
-                    },
-                )
-                .unwrap(),
-            })
-            .unwrap();
-        let completion = closed
-            .into_iter()
-            .find_map(|effect| match effect {
-                SessionEffect::HalfCloseSink { completion } => Some(completion),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(
-            driver.try_deliver_half_close(completion).unwrap_err(),
-            FlowPortError::SinkDirectionMismatch {
-                expected: Direction::TargetToClient,
-                actual: Direction::ClientToTarget,
-            }
-        );
-        assert!(driver.probe().snapshot().is_quiescent());
-    }
-
-    #[test]
-    fn half_close_reports_success_or_failure_only_after_local_completion() {
-        let mut success_fixture = fixture();
-        let success_capability = half_close(&mut success_fixture);
-        let (mut success_flow, mut success_driver) =
-            isolated_pair(success_fixture.flow, port_config(8, 1, 1, 1));
-        success_driver
-            .try_deliver_half_close(success_capability)
-            .unwrap();
-        assert!(success_driver.try_recv_next().unwrap().is_none());
-        let TunAction::HalfClose(delivery) = success_flow.try_recv_action().unwrap().unwrap()
-        else {
-            panic!("expected half-close")
-        };
-        delivery.succeed();
-        assert!(matches!(
-            success_driver.try_recv_next().unwrap(),
-            Some(DriverInput::Control(SessionEvent::SinkHalfClosed { completion }))
-                if completion == success_capability
-        ));
-
-        let mut failure_fixture = fixture();
-        let failure_capability = half_close(&mut failure_fixture);
-        let (mut failure_flow, mut failure_driver) =
-            isolated_pair(failure_fixture.flow, port_config(8, 1, 1, 1));
-        failure_driver
-            .try_deliver_half_close(failure_capability)
-            .unwrap();
-        let TunAction::HalfClose(delivery) = failure_flow.try_recv_action().unwrap().unwrap()
-        else {
-            panic!("expected half-close")
-        };
-        delivery.fail();
-        assert!(matches!(
-            failure_driver.try_recv_next().unwrap(),
-            Some(DriverInput::Control(SessionEvent::SinkHalfCloseFailed { completion }))
-                if completion == failure_capability
-        ));
-    }
-
-    #[test]
-    fn split_halves_remain_independent_nonaliasing_owners() {
-        let fixture = fixture();
-        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 2, 2, 2));
-        let probe = flow.probe();
-        let (uplink, downlink) = flow.into_split();
-        assert_eq!(uplink.local_flow(), fixture.flow);
-        assert_eq!(downlink.local_flow(), fixture.flow);
-
-        drop(downlink);
-        uplink
-            .try_send_uplink_with(4, || Bytes::from_static(b"data"))
-            .unwrap();
-        let Some(DriverInput::Data(data)) = driver.try_recv_next().unwrap() else {
-            panic!("expected independently admitted uplink DATA")
-        };
-        assert_eq!(probe.snapshot().uplink_owned_bytes(), 4);
-        drop(data);
-        assert!(probe.snapshot().is_quiescent());
-        drop(uplink);
-        drop(driver);
-        assert!(probe.snapshot().is_quiescent());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn async_driver_waits_for_reserved_completion_after_uplink_half_closes() {
-        let mut fixture = fixture();
-        let (offer, segments) = sink_offer(&mut fixture, b"payload");
-        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 1, 1, 1));
-        let (uplink, mut downlink) = flow.into_split();
-        driver.try_deliver_sink(offer, segments).unwrap();
-        let TunAction::Sink(delivery) = downlink.try_recv_action().unwrap().unwrap() else {
-            panic!("expected sink delivery")
-        };
-        drop(uplink);
-
-        let waiting = tokio::spawn(async move { driver.recv_next().await });
-        tokio::task::yield_now().await;
-        assert!(!waiting.is_finished());
-        delivery.abandon();
-        assert!(matches!(
-            waiting.await.unwrap(),
-            Some(DriverInput::Control(SessionEvent::SinkAbandoned { offer: observed }))
-                if observed == offer
-        ));
-    }
-
-    #[test]
-    fn reducer_terminal_effects_are_forwarded_as_typed_tun_actions() {
-        let mut fixture = fixture();
-        let (flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 1, 1, 2));
-        let (_uplink, mut downlink) = flow.into_split();
-        let constructible_notification = SessionEffect::PeerReset {
-            flow_id: fixture.flow.flow_id(),
-            reason: ResetReason::TargetFailure,
-        };
-        assert_eq!(
-            driver
-                .try_deliver_terminal_effect(&constructible_notification)
-                .unwrap_err(),
-            FlowPortError::NotTerminalEffect
-        );
-        let mut other = fixture_for_session(0x99);
-        assert_eq!(other.flow.flow_id(), fixture.flow.flow_id());
-        let other_effects = other
-            .model
-            .reduce(SessionEvent::PeerFrame {
-                leg: other.leg,
-                frame: Frame::try_new(
-                    other.leg.generation(),
-                    Record::Reset {
-                        flow_id: other.flow.flow_id(),
-                        reason: ResetReason::TargetFailure,
-                    },
-                )
-                .unwrap(),
-            })
-            .unwrap();
-        let other_terminal = other_effects
-            .iter()
-            .find(|effect| matches!(effect, SessionEffect::FlowFinished { .. }))
-            .unwrap();
-        assert_eq!(
-            driver
-                .try_deliver_terminal_effect(other_terminal)
-                .unwrap_err(),
-            FlowPortError::CrossFlowTerminalEffect
-        );
-        let mut opposite = owner_fixture();
-        assert_eq!(opposite.flow.session_id(), fixture.flow.session_id());
-        assert_eq!(opposite.flow.flow_id(), fixture.flow.flow_id());
-        assert_ne!(opposite.flow.direction(), fixture.flow.direction());
-        let opposite_effects = opposite
-            .model
-            .reduce(SessionEvent::LocalReset {
-                flow: opposite.flow,
-                reason: ResetReason::LocalAbandon,
-            })
-            .unwrap();
-        let opposite_terminal = opposite_effects
-            .iter()
-            .find(|effect| matches!(effect, SessionEffect::FlowFinished { .. }))
-            .unwrap();
-        assert_eq!(
-            driver
-                .try_deliver_terminal_effect(opposite_terminal)
-                .unwrap_err(),
-            FlowPortError::CrossFlowTerminalEffect
-        );
-        let terminal_effects = fixture
-            .model
-            .reduce(SessionEvent::PeerFrame {
-                leg: fixture.leg,
-                frame: Frame::try_new(
-                    fixture.leg.generation(),
-                    Record::Reset {
-                        flow_id: fixture.flow.flow_id(),
-                        reason: ResetReason::TargetFailure,
-                    },
-                )
-                .unwrap(),
-            })
-            .unwrap();
-        let terminal = terminal_effects
-            .iter()
-            .find(|effect| matches!(effect, SessionEffect::FlowFinished { .. }))
-            .unwrap();
-        driver.try_deliver_terminal_effect(terminal).unwrap();
-        assert_eq!(
-            driver.try_deliver_terminal_effect(terminal).unwrap_err(),
-            FlowPortError::TerminalAlreadyDelivered
-        );
-        let TunAction::Terminal(terminal) = downlink.try_recv_action().unwrap().unwrap() else {
-            panic!("expected terminal action")
-        };
-        assert_eq!(terminal.local_flow(), fixture.flow);
-        assert_eq!(
-            terminal.action(),
-            TerminalAction::FlowFinished(FlowFinishReason::PeerReset(ResetReason::TargetFailure))
-        );
-    }
-
-    #[test]
-    fn terminal_authority_drains_queued_source_and_completion_ownership() {
-        let mut fixture = fixture();
-        let (offer, segments) = sink_offer(&mut fixture, b"peer-data");
-        let (mut flow, mut driver) = isolated_pair(fixture.flow, port_config(8, 2, 2, 1));
-        let probe = flow.probe();
-        flow.try_send_uplink_with(4, || Bytes::from_static(b"late"))
-            .unwrap();
-        driver.try_deliver_sink(offer, segments).unwrap();
-        let TunAction::Sink(delivery) = flow.try_recv_action().unwrap().unwrap() else {
-            panic!("expected sink delivery")
-        };
-        delivery.abandon();
-        assert_eq!(probe.snapshot().uplink_owned_bytes(), 4);
-
-        let effects = fixture
-            .model
-            .reduce(SessionEvent::PeerFrame {
-                leg: fixture.leg,
-                frame: Frame::try_new(
-                    fixture.leg.generation(),
-                    Record::Reset {
-                        flow_id: fixture.flow.flow_id(),
-                        reason: ResetReason::TargetFailure,
-                    },
-                )
-                .unwrap(),
-            })
-            .unwrap();
-        let terminal = effects
-            .iter()
-            .find(|effect| matches!(effect, SessionEffect::FlowFinished { .. }))
-            .unwrap();
-        driver.try_deliver_terminal_effect(terminal).unwrap();
-        assert_eq!(probe.snapshot().uplink_owned_bytes(), 0);
-        assert_eq!(probe.snapshot().reserved_completion_slots(), 0);
-        assert!(!matches!(driver.try_recv_next(), Ok(Some(_))));
-
-        let calls = AtomicUsize::new(0);
-        assert_eq!(
-            flow.try_send_uplink_with(1, || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Bytes::from_static(b"x")
-            })
-            .unwrap_err(),
-            FlowPortError::Closed
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        let TunAction::Terminal(terminal) = flow.try_recv_action().unwrap().unwrap() else {
-            panic!("expected exact terminal delivery")
-        };
-        assert_eq!(
-            terminal.action(),
-            TerminalAction::FlowFinished(FlowFinishReason::PeerReset(ResetReason::TargetFailure))
-        );
-        drop(terminal);
-        assert!(probe.snapshot().is_quiescent());
-    }
-
-    #[test]
-    fn terminal_authority_revokes_already_forwarded_sink_capabilities() {
-        let mut sink_fixture = fixture();
-        let (offer, segments) = sink_offer(&mut sink_fixture, b"peer-data");
-        let (mut sink_flow, mut sink_driver) =
-            isolated_pair(sink_fixture.flow, port_config(8, 1, 1, 1));
-        let sink_probe = sink_flow.probe();
-        sink_driver.try_deliver_sink(offer, segments).unwrap();
-        let TunAction::Sink(sink_delivery) = sink_flow.try_recv_action().unwrap().unwrap() else {
-            panic!("expected forwarded sink capability")
-        };
-        assert!(sink_delivery.is_live());
-        let sink_mutations = AtomicUsize::new(0);
-        sink_delivery
-            .with_live_first_segment(|segment| {
-                assert_eq!(segment, b"peer-data");
-                sink_mutations.fetch_add(1, Ordering::SeqCst);
-            })
-            .unwrap();
-        let sink_terminal = sink_fixture
-            .model
-            .reduce(SessionEvent::LocalReset {
-                flow: sink_fixture.flow,
-                reason: ResetReason::LocalAbandon,
-            })
-            .unwrap();
-        let sink_terminal = sink_terminal
-            .iter()
-            .find(|effect| matches!(effect, SessionEffect::FlowFinished { .. }))
-            .unwrap();
-        sink_driver
-            .try_deliver_terminal_effect(sink_terminal)
-            .unwrap();
-        assert!(!sink_delivery.is_live());
-        assert_eq!(
-            sink_delivery
-                .with_live_first_segment(|_| {
-                    sink_mutations.fetch_add(1, Ordering::SeqCst);
-                })
-                .unwrap_err(),
-            FlowPortError::SinkCapabilityRevoked
-        );
-        assert_eq!(sink_mutations.load(Ordering::SeqCst), 1);
-        drop(sink_delivery);
-        let terminal = sink_flow.try_recv_action().unwrap().unwrap();
-        drop(terminal);
-        assert!(sink_probe.snapshot().is_quiescent());
-
-        let mut close_fixture = fixture();
-        let completion = half_close(&mut close_fixture);
-        let (mut close_flow, mut close_driver) =
-            isolated_pair(close_fixture.flow, port_config(8, 1, 1, 1));
-        let close_probe = close_flow.probe();
-        close_driver.try_deliver_half_close(completion).unwrap();
-        let TunAction::HalfClose(close_delivery) = close_flow.try_recv_action().unwrap().unwrap()
-        else {
-            panic!("expected forwarded half-close capability")
-        };
-        assert!(close_delivery.is_live());
-        let close_mutations = AtomicUsize::new(0);
-        close_delivery
-            .with_live(|| {
-                close_mutations.fetch_add(1, Ordering::SeqCst);
-            })
-            .unwrap();
-        let close_terminal = close_fixture
-            .model
-            .reduce(SessionEvent::LocalReset {
-                flow: close_fixture.flow,
-                reason: ResetReason::LocalAbandon,
-            })
-            .unwrap();
-        let close_terminal = close_terminal
-            .iter()
-            .find(|effect| matches!(effect, SessionEffect::FlowFinished { .. }))
-            .unwrap();
-        close_driver
-            .try_deliver_terminal_effect(close_terminal)
-            .unwrap();
-        assert!(!close_delivery.is_live());
-        assert_eq!(
-            close_delivery
-                .with_live(|| {
-                    close_mutations.fetch_add(1, Ordering::SeqCst);
-                })
-                .unwrap_err(),
-            FlowPortError::SinkCapabilityRevoked
-        );
-        assert_eq!(close_mutations.load(Ordering::SeqCst), 1);
-        drop(close_delivery);
-        let terminal = close_flow.try_recv_action().unwrap().unwrap();
-        drop(terminal);
-        assert!(close_probe.snapshot().is_quiescent());
-    }
-
-    #[test]
-    fn debug_is_redacted_and_endpoint_drop_releases_all_port_ownership() {
-        let mut fixture = fixture();
-        let (offer, segments) = sink_offer(&mut fixture, b"DOWNLINK_SECRET_SENTINEL");
-        let (mut flow, mut driver) = isolated_pair(fixture.flow, port_config(64, 2, 2, 2));
-        let probe = flow.probe();
-        flow.try_send_uplink_with(22, || Bytes::from_static(b"UPLINK_SECRET_SENTINEL"))
-            .unwrap();
-        let DriverInput::Data(data) = driver.try_recv_next().unwrap().unwrap() else {
-            panic!("expected DATA")
-        };
-        let debug = format!("{data:?}");
-        assert!(!debug.contains("UPLINK_SECRET_SENTINEL"));
-        driver.try_deliver_sink(offer, segments).unwrap();
-        let action = flow.try_recv_action().unwrap().unwrap();
-        let debug = format!("{action:?}");
-        assert!(!debug.contains("DOWNLINK_SECRET_SENTINEL"));
-        assert!(!probe.snapshot().is_quiescent());
-
-        drop(data);
-        drop(action);
-        drop(flow);
-        drop(driver);
-        assert!(probe.snapshot().is_quiescent());
-    }
-}
+mod tests;

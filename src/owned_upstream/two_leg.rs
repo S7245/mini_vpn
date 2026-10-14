@@ -4,10 +4,13 @@
 //! are encoded byte messages, so faults cannot manufacture decoded frames,
 //! session events, attach commits, or switch decisions.
 
+use bytes::Bytes;
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::time::Duration;
+
+use super::quinn_leg_actor::QuinnLegActorInboundGate;
 
 /// Monotonic virtual time used by the deterministic harness.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1433,7 +1436,7 @@ impl Blackout {
 struct WireEnvelope {
     route: WireRoute,
     lane: WireLane,
-    bytes: Vec<u8>,
+    bytes: Bytes,
     send_ordinal: u64,
     copy_index: u8,
 }
@@ -1472,11 +1475,12 @@ impl HeldWire {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(Clone))]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct EncodedDelivery {
     route: WireRoute,
     lane: WireLane,
-    bytes: Vec<u8>,
+    bytes: Bytes,
     send_ordinal: u64,
     copy_index: u8,
 }
@@ -1486,13 +1490,14 @@ impl EncodedDelivery {
     ///
     /// The constructor is restricted to the `owned_upstream` adapter: session
     /// controllers receive only the completed delivery and cannot mint one.
-    pub(super) fn from_memory_ingress(
+    pub(super) fn from_memory_ingress<B: Into<Bytes>>(
         route: WireRoute,
         lane: WireLane,
-        bytes: Vec<u8>,
+        bytes: B,
         send_ordinal: u64,
         copy_index: u8,
     ) -> Result<Self, WireError> {
+        let bytes = bytes.into();
         if bytes.is_empty() {
             return Err(WireError::EmptyMessage);
         }
@@ -1503,6 +1508,19 @@ impl EncodedDelivery {
             send_ordinal,
             copy_index,
         })
+    }
+
+    /// Creates one byte message released by the fixed Quinn actor's bounded
+    /// ingress. The private actor gate prevents a sibling from presenting
+    /// caller-created bytes as authenticated physical ingress.
+    pub(super) fn from_quinn_actor_ingress(
+        _gate: &QuinnLegActorInboundGate,
+        route: WireRoute,
+        lane: WireLane,
+        bytes: Bytes,
+        send_ordinal: u64,
+    ) -> Result<Self, WireError> {
+        Self::from_memory_ingress(route, lane, bytes, send_ordinal, 0)
     }
 
     pub(crate) const fn route(&self) -> WireRoute {
@@ -1525,7 +1543,7 @@ impl EncodedDelivery {
         &self.bytes
     }
 
-    pub(crate) fn into_bytes(self) -> Vec<u8> {
+    pub(crate) fn into_bytes(self) -> Bytes {
         self.bytes
     }
 }
@@ -1749,14 +1767,15 @@ impl TwoLegWire {
         Ok(())
     }
 
-    pub(crate) fn send(
+    pub(crate) fn send<B: Into<Bytes>>(
         &mut self,
         now: SimTime,
         route: WireRoute,
         lane: WireLane,
-        bytes: Vec<u8>,
+        bytes: B,
         action: FaultAction,
     ) -> Result<SendOutcome, WireError> {
+        let bytes = bytes.into();
         if bytes.is_empty() {
             return Err(WireError::EmptyMessage);
         }
@@ -1992,7 +2011,7 @@ impl TwoLegWire {
         now: SimTime,
         route: WireRoute,
         lane: WireLane,
-        bytes: Vec<u8>,
+        bytes: Bytes,
         action: FaultAction,
         in_blackout: bool,
         reorder_index: usize,
@@ -3159,7 +3178,12 @@ mod tests {
         }
         assert_eq!(
             delivered,
-            vec![(vec![2], 0), (vec![2], 1), (vec![4], 0), (vec![3], 0)]
+            vec![
+                (Bytes::from_static(&[2]), 0),
+                (Bytes::from_static(&[2]), 1),
+                (Bytes::from_static(&[4]), 0),
+                (Bytes::from_static(&[3]), 0),
+            ]
         );
 
         let counters = wire.counters();
@@ -3308,7 +3332,14 @@ mod tests {
             let copy_index = message.copy_index();
             delivered.push((message.into_bytes(), copy_index));
         }
-        assert_eq!(delivered, vec![(vec![2], 0), (vec![2], 1), (vec![1], 0)]);
+        assert_eq!(
+            delivered,
+            vec![
+                (Bytes::from_static(&[2]), 0),
+                (Bytes::from_static(&[2]), 1),
+                (Bytes::from_static(&[1]), 0),
+            ]
+        );
         assert_eq!(wire.live_messages(), 0);
         assert_eq!(wire.live_bytes(), 0);
         assert_eq!(wire.counters().duplicate_copies, 1);

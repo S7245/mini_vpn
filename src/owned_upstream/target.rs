@@ -4,13 +4,18 @@
 //! responsible for translating them into reducer events. Implementations of
 //! this module never mint session, ACK, sink, or terminal authority.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::task::{Context, Poll};
 
 use crate::resumable::SessionFlowId;
 use crate::shared::TargetAddr;
 use bytes::Bytes;
+
+mod memory_io;
+mod memory_ready;
+use memory_ready::{MemoryReadiness, ReadyChange};
 
 /// Closed configuration for one session's Target adapter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +27,8 @@ pub(crate) struct MemoryTargetConfig {
     max_read_chunk: usize,
     max_write_chunk: usize,
     max_write_directives_per_flow: usize,
+    max_write_directives: usize,
+    requested_storage_peak: std::alloc::Layout,
 }
 
 impl MemoryTargetConfig {
@@ -49,10 +56,10 @@ impl MemoryTargetConfig {
                 return Err(TargetIoConfigError::ZeroCapacity { field });
             }
         }
-        max_flows
+        let max_write_directives = max_flows
             .checked_mul(max_write_directives_per_flow)
             .ok_or(TargetIoConfigError::DirectiveCapacityOverflow)?;
-        Ok(Self {
+        let mut config = Self {
             max_flows,
             // Preserve the original constructor while keeping the retained
             // terminal history explicitly finite. Callers whose reducer uses
@@ -64,7 +71,11 @@ impl MemoryTargetConfig {
             max_read_chunk,
             max_write_chunk,
             max_write_directives_per_flow,
-        })
+            max_write_directives,
+            requested_storage_peak: std::alloc::Layout::new::<MemoryTarget>(),
+        };
+        config.requested_storage_peak = MemoryTargetStorage::checked_peak(&config)?;
+        Ok(config)
     }
 
     pub(crate) fn with_max_terminal_tombstones(
@@ -77,6 +88,7 @@ impl MemoryTargetConfig {
             });
         }
         self.max_terminal_tombstones = max_terminal_tombstones;
+        self.requested_storage_peak = MemoryTargetStorage::checked_peak(&self)?;
         Ok(self)
     }
 
@@ -87,12 +99,23 @@ impl MemoryTargetConfig {
     pub(crate) const fn max_terminal_tombstones(self) -> usize {
         self.max_terminal_tombstones
     }
+
+    pub(crate) const fn capacity_witness(self) -> TargetIoCapacityWitness {
+        TargetIoCapacityWitness {
+            max_flows: self.max_flows,
+            max_terminal_tombstones: self.max_terminal_tombstones,
+            max_buffered_bytes: self.global_buffer_bytes,
+            max_write_directives: self.max_write_directives,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TargetIoConfigError {
     ZeroCapacity { field: &'static str },
     DirectiveCapacityOverflow,
+    ReadinessLayoutOverflow,
+    StorageLayoutOverflow,
 }
 
 impl fmt::Display for TargetIoConfigError {
@@ -102,11 +125,202 @@ impl fmt::Display for TargetIoConfigError {
             Self::DirectiveCapacityOverflow => {
                 formatter.write_str("Target write-directive capacity overflow")
             }
+            Self::StorageLayoutOverflow => {
+                formatter.write_str("Target node storage layout overflow")
+            }
+            Self::ReadinessLayoutOverflow => {
+                formatter.write_str("Target readiness layout overflow")
+            }
         }
     }
 }
 
 impl std::error::Error for TargetIoConfigError {}
+
+/// Immutable storage/count envelope declared by one concrete Target adapter.
+/// A session root retains this value and compares it with the installed
+/// reducer/controller plan before accepting physical ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TargetIoCapacityWitness {
+    max_flows: usize,
+    max_terminal_tombstones: usize,
+    max_buffered_bytes: usize,
+    max_write_directives: usize,
+}
+
+impl TargetIoCapacityWitness {
+    pub(crate) const fn max_flows(self) -> usize {
+        self.max_flows
+    }
+
+    pub(crate) const fn max_terminal_tombstones(self) -> usize {
+        self.max_terminal_tombstones
+    }
+
+    pub(crate) const fn max_buffered_bytes(self) -> usize {
+        self.max_buffered_bytes
+    }
+
+    pub(crate) const fn max_write_directives(self) -> usize {
+        self.max_write_directives
+    }
+}
+
+/// Independently scanned live Target ownership. `summed_*` values come from
+/// the concrete per-flow containers; `stored_*` values are adapter counters
+/// used only as mirrors and are never added to canonical live bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TargetIoColdInventory {
+    live_flows: usize,
+    terminal_tombstones: usize,
+    summed_buffered_bytes: usize,
+    stored_buffered_bytes: usize,
+    summed_write_directives: usize,
+    stored_write_directives: usize,
+}
+
+impl TargetIoColdInventory {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn checked(
+        capacity: TargetIoCapacityWitness,
+        live_flows: usize,
+        terminal_tombstones: usize,
+        summed_buffered_bytes: usize,
+        stored_buffered_bytes: usize,
+        summed_write_directives: usize,
+        stored_write_directives: usize,
+    ) -> Result<Self, TargetIoColdInventoryError> {
+        for (domain, actual, max) in [
+            ("live_flows", live_flows, capacity.max_flows),
+            (
+                "terminal_tombstones",
+                terminal_tombstones,
+                capacity.max_terminal_tombstones,
+            ),
+            (
+                "buffered_bytes",
+                stored_buffered_bytes,
+                capacity.max_buffered_bytes,
+            ),
+            (
+                "write_directives",
+                stored_write_directives,
+                capacity.max_write_directives,
+            ),
+        ] {
+            if actual > max {
+                return Err(TargetIoColdInventoryError::CapacityExceeded {
+                    domain,
+                    actual,
+                    max,
+                });
+            }
+        }
+        if summed_buffered_bytes != stored_buffered_bytes {
+            return Err(TargetIoColdInventoryError::StoredMismatch {
+                domain: "buffered_bytes",
+                summed: summed_buffered_bytes,
+                stored: stored_buffered_bytes,
+            });
+        }
+        if summed_write_directives != stored_write_directives {
+            return Err(TargetIoColdInventoryError::StoredMismatch {
+                domain: "write_directives",
+                summed: summed_write_directives,
+                stored: stored_write_directives,
+            });
+        }
+        Ok(Self {
+            live_flows,
+            terminal_tombstones,
+            summed_buffered_bytes,
+            stored_buffered_bytes,
+            summed_write_directives,
+            stored_write_directives,
+        })
+    }
+
+    pub(crate) const fn live_flows(self) -> usize {
+        self.live_flows
+    }
+
+    pub(crate) const fn terminal_tombstones(self) -> usize {
+        self.terminal_tombstones
+    }
+
+    pub(crate) const fn summed_buffered_bytes(self) -> usize {
+        self.summed_buffered_bytes
+    }
+
+    pub(crate) const fn stored_buffered_bytes(self) -> usize {
+        self.stored_buffered_bytes
+    }
+
+    pub(crate) const fn summed_write_directives(self) -> usize {
+        self.summed_write_directives
+    }
+
+    pub(crate) const fn stored_write_directives(self) -> usize {
+        self.stored_write_directives
+    }
+
+    pub(crate) const fn is_quiescent(self) -> bool {
+        self.live_flows == 0
+            && self.terminal_tombstones == 0
+            && self.summed_buffered_bytes == 0
+            && self.stored_buffered_bytes == 0
+            && self.summed_write_directives == 0
+            && self.stored_write_directives == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TargetIoColdInventoryError {
+    CounterOverflow {
+        domain: &'static str,
+    },
+    CapacityExceeded {
+        domain: &'static str,
+        actual: usize,
+        max: usize,
+    },
+    StoredMismatch {
+        domain: &'static str,
+        summed: usize,
+        stored: usize,
+    },
+}
+
+impl fmt::Display for TargetIoColdInventoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CounterOverflow { domain } => {
+                write!(
+                    formatter,
+                    "Target cold-inventory {domain} counter overflowed"
+                )
+            }
+            Self::CapacityExceeded {
+                domain,
+                actual,
+                max,
+            } => write!(
+                formatter,
+                "Target cold-inventory {domain} exceeds capacity ({actual} > {max})",
+            ),
+            Self::StoredMismatch {
+                domain,
+                summed,
+                stored,
+            } => write!(
+                formatter,
+                "Target cold-inventory {domain} mismatch (summed {summed}, stored {stored})",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TargetIoColdInventoryError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TargetOpenCompletion {
@@ -241,6 +455,19 @@ pub(crate) struct TargetReadiness {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TargetReadyInterest {
+    Read,
+    Write,
+    Join,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TargetReadyOutcome {
+    Attempt,
+    Failed(TargetFailure),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TargetTerminalKind {
     Graceful,
     Reset,
@@ -288,6 +515,10 @@ impl MemoryWriteDirective {
 /// executor can retain the exact in-flight capability and fail closed without
 /// guessing whether retrying the I/O would duplicate a side effect.
 pub(crate) trait TargetIo {
+    fn capacity_witness(&self) -> TargetIoCapacityWitness;
+
+    fn cold_inventory(&self) -> Result<TargetIoColdInventory, TargetIoColdInventoryError>;
+
     fn open(
         &mut self,
         flow_id: SessionFlowId,
@@ -322,6 +553,16 @@ pub(crate) trait TargetIo {
 
     fn readiness(&self, flow_id: SessionFlowId) -> Result<TargetReadiness, TargetIoError>;
 
+    fn poll_readiness(
+        &mut self,
+        flow_id: SessionFlowId,
+        interest: TargetReadyInterest,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<TargetReadyOutcome, TargetIoError>>;
+
+    fn poll_ready_notifications(&mut self, cx: &mut Context<'_>)
+    -> Poll<Result<(), TargetIoError>>;
+
     /// Releases the live Target handle into a bounded terminal tombstone.
     /// The tombstone preserves duplicate/late OPEN identity until the reducer
     /// authorizes its exact retirement.
@@ -338,6 +579,12 @@ pub(crate) trait TargetIo {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TargetIoError {
+    ReadinessInvariant(&'static str),
+    StorageLayout,
+    StorageReserve,
+    OutputPublicationUnknown {
+        flow_id: SessionFlowId,
+    },
     StaleFlowId {
         flow_id: SessionFlowId,
         highest_seen: SessionFlowId,
@@ -390,6 +637,18 @@ pub(crate) enum TargetIoError {
 impl fmt::Display for TargetIoError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::StorageLayout => formatter.write_str("Target storage layout overflow"),
+            Self::StorageReserve => formatter.write_str("Target storage allocation refused"),
+            Self::OutputPublicationUnknown { flow_id } => {
+                write!(
+                    formatter,
+                    "Target flow {} retains an interrupted output",
+                    flow_id.get()
+                )
+            }
+            Self::ReadinessInvariant(cause) => {
+                write!(formatter, "Target readiness invariant: {cause}")
+            }
             Self::StaleFlowId {
                 flow_id,
                 highest_seen,
@@ -495,10 +754,12 @@ pub(crate) struct MemoryTargetSnapshot {
 }
 
 struct MemoryTargetFlow {
+    ready_position: usize,
     target: TargetAddr,
     written: VecDeque<u8>,
     readable: VecDeque<u8>,
     write_directives: VecDeque<MemoryWriteDirective>,
+    output: MemoryTargetOutput,
     read_eof_queued: bool,
     read_eof_delivered: bool,
     write_half_closed: bool,
@@ -507,7 +768,73 @@ struct MemoryTargetFlow {
 
 impl MemoryTargetFlow {
     fn buffered_bytes(&self) -> usize {
-        self.written.len().saturating_add(self.readable.len())
+        self.written
+            .len()
+            .saturating_add(self.readable.len())
+            .saturating_add(self.output.len())
+    }
+
+    fn require_output_idle(&self, flow_id: SessionFlowId) -> Result<(), TargetIoError> {
+        match self.output {
+            MemoryTargetOutput::Idle => Ok(()),
+            MemoryTargetOutput::Publishing { .. } => {
+                Err(TargetIoError::OutputPublicationUnknown { flow_id })
+            }
+        }
+    }
+
+    fn released_buffers(&self) -> Result<ReleasedTargetBuffers, TargetIoError> {
+        let mut read_bytes = self.readable.len();
+        let mut written_bytes = self.written.len();
+        if let MemoryTargetOutput::Publishing { direction, bytes } = &self.output {
+            let count = match direction {
+                MemoryTargetOutputDirection::Read => &mut read_bytes,
+                MemoryTargetOutputDirection::Written => &mut written_bytes,
+            };
+            *count = count
+                .checked_add(bytes.len())
+                .ok_or(TargetIoError::CounterOverflow {
+                    counter: "released_buffered_bytes",
+                })?;
+        }
+        Ok(ReleasedTargetBuffers {
+            read_bytes,
+            written_bytes,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MemoryTargetOutputDirection {
+    Read,
+    Written,
+}
+
+// Concrete copied output stays in its original flow across controlled Waker
+// calls. It is charged once until infallible return or explicit terminal discard.
+enum MemoryTargetOutput {
+    Idle,
+    Publishing {
+        direction: MemoryTargetOutputDirection,
+        bytes: Bytes,
+    },
+}
+
+impl MemoryTargetOutput {
+    fn len(&self) -> usize {
+        match self {
+            Self::Idle => 0,
+            Self::Publishing { bytes, .. } => bytes.len(),
+        }
+    }
+
+    fn finish(&mut self) -> Bytes {
+        // The exclusive flow borrow published this exact state immediately
+        // before notification; no caller can replace it during the callback.
+        match std::mem::replace(self, Self::Idle) {
+            Self::Publishing { bytes, .. } => bytes,
+            Self::Idle => unreachable!("the original flow owns its prepared output"),
+        }
     }
 }
 
@@ -517,9 +844,8 @@ struct ReleasedTargetBuffers {
     written_bytes: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerminalizeOutcome {
-    Changed(ReleasedTargetBuffers),
+    Changed(ReleasedTargetBuffers, memory_ready::ReadyMutation),
     Existing(TargetTerminalKind),
 }
 
@@ -528,749 +854,42 @@ struct JoinedTargetFlow {
     terminal: TargetTerminalKind,
 }
 
+// One actual Layout owns each phase; join never allocates a second node.
+type TargetNodeLink = Option<Box<[TargetNode; 1]>>;
+enum TargetNodePhase {
+    Vacant,
+    Live(MemoryTargetFlow),
+    Joined(JoinedTargetFlow),
+}
+struct TargetNode {
+    key: SessionFlowId,
+    phase: TargetNodePhase,
+    left: TargetNodeLink,
+    right: TargetNodeLink,
+    height: u8,
+}
+#[derive(Default)]
+struct MemoryTargetStorage {
+    live: TargetNodeLink,
+    joined: TargetNodeLink,
+    free: TargetNodeLink,
+    live_len: usize,
+    joined_len: usize,
+    free_len: usize,
+}
+
 /// Bounded deterministic Target adapter used by Task 4's virtual scheduler.
 pub(crate) struct MemoryTarget {
     config: MemoryTargetConfig,
-    flows: BTreeMap<SessionFlowId, MemoryTargetFlow>,
-    joined: BTreeMap<SessionFlowId, JoinedTargetFlow>,
+    ready: MemoryReadiness,
+    storage: MemoryTargetStorage,
+    owned_address_capacity: usize,
     snapshot: MemoryTargetSnapshot,
     buffered_bytes: usize,
     buffer_high_water: usize,
     queued_write_directives: usize,
     directive_high_water: usize,
     highest_flow_id: Option<SessionFlowId>,
-}
-
-impl MemoryTarget {
-    pub(crate) fn new(config: MemoryTargetConfig) -> Self {
-        Self {
-            config,
-            flows: BTreeMap::new(),
-            joined: BTreeMap::new(),
-            snapshot: MemoryTargetSnapshot::default(),
-            buffered_bytes: 0,
-            buffer_high_water: 0,
-            queued_write_directives: 0,
-            directive_high_water: 0,
-            highest_flow_id: None,
-        }
-    }
-
-    pub(crate) fn snapshot(&self) -> MemoryTargetSnapshot {
-        let mut snapshot = self.snapshot;
-        snapshot.live_flows = self.flows.len();
-        snapshot.joined_flows = self.joined.len();
-        snapshot.buffered_bytes = self.buffered_bytes;
-        snapshot.buffer_high_water = self.buffer_high_water;
-        snapshot.queued_write_directives = self.queued_write_directives;
-        snapshot.directive_high_water = self.directive_high_water;
-        snapshot.highest_flow_id = self.highest_flow_id;
-        snapshot
-    }
-
-    pub(crate) fn push_write_directive(
-        &mut self,
-        flow_id: SessionFlowId,
-        directive: MemoryWriteDirective,
-    ) -> Result<(), TargetIoError> {
-        let flow = self
-            .flows
-            .get_mut(&flow_id)
-            .ok_or(TargetIoError::UnknownFlow { flow_id })?;
-        if let Some(kind) = flow.terminal {
-            return Err(TargetIoError::FlowTerminal { flow_id, kind });
-        }
-        if flow.write_directives.len() >= self.config.max_write_directives_per_flow {
-            return Err(TargetIoError::WriteDirectiveLimit {
-                flow_id,
-                max: self.config.max_write_directives_per_flow,
-            });
-        }
-        let queued_write_directives =
-            self.queued_write_directives
-                .checked_add(1)
-                .ok_or(TargetIoError::CounterOverflow {
-                    counter: "queued_write_directives",
-                })?;
-        flow.write_directives.push_back(directive);
-        self.queued_write_directives = queued_write_directives;
-        self.directive_high_water = self.directive_high_water.max(self.queued_write_directives);
-        Ok(())
-    }
-
-    fn terminalize(
-        &mut self,
-        flow_id: SessionFlowId,
-        kind: TargetTerminalKind,
-    ) -> Result<TerminalizeOutcome, TargetIoError> {
-        let flow = self
-            .flows
-            .get(&flow_id)
-            .ok_or(TargetIoError::UnknownFlow { flow_id })?;
-        if let Some(existing) = flow.terminal {
-            return Ok(TerminalizeOutcome::Existing(existing));
-        }
-        let released = ReleasedTargetBuffers {
-            read_bytes: flow.readable.len(),
-            written_bytes: flow.written.len(),
-        };
-        let released_total = released
-            .read_bytes
-            .checked_add(released.written_bytes)
-            .ok_or(TargetIoError::CounterOverflow {
-                counter: "released_buffered_bytes",
-            })?;
-        let released_directives = flow.write_directives.len();
-        let buffered_bytes = self.buffered_bytes.checked_sub(released_total).ok_or(
-            TargetIoError::CounterOverflow {
-                counter: "buffered_bytes",
-            },
-        )?;
-        let queued_write_directives = self
-            .queued_write_directives
-            .checked_sub(released_directives)
-            .ok_or(TargetIoError::CounterOverflow {
-                counter: "queued_write_directives",
-            })?;
-        let flow = self
-            .flows
-            .get_mut(&flow_id)
-            .ok_or(TargetIoError::UnknownFlow { flow_id })?;
-        flow.readable.clear();
-        flow.written.clear();
-        flow.write_directives.clear();
-        flow.terminal = Some(kind);
-        self.buffered_bytes = buffered_bytes;
-        self.queued_write_directives = queued_write_directives;
-        Ok(TerminalizeOutcome::Changed(released))
-    }
-
-    pub(crate) fn feed_read(
-        &mut self,
-        flow_id: SessionFlowId,
-        bytes: Bytes,
-    ) -> Result<TargetReadFeedCompletion, TargetIoError> {
-        if bytes.is_empty() {
-            return Err(TargetIoError::EmptyReadFeed);
-        }
-        let flow = self
-            .flows
-            .get_mut(&flow_id)
-            .ok_or(TargetIoError::UnknownFlow { flow_id })?;
-        if let Some(kind) = flow.terminal {
-            return Err(TargetIoError::FlowTerminal { flow_id, kind });
-        }
-        if flow.read_eof_queued {
-            return Err(TargetIoError::ReadEofAlreadyQueued { flow_id });
-        }
-        let flow_available = self
-            .config
-            .per_flow_buffer_bytes
-            .saturating_sub(flow.buffered_bytes());
-        let global_available = self
-            .config
-            .global_buffer_bytes
-            .saturating_sub(self.buffered_bytes);
-        let available = flow_available.min(global_available);
-        if bytes.len() > available {
-            return Err(TargetIoError::BufferCapacityExceeded {
-                flow_id,
-                requested: bytes.len(),
-                available,
-            });
-        }
-        let len = bytes.len();
-        let buffered_bytes =
-            self.buffered_bytes
-                .checked_add(len)
-                .ok_or(TargetIoError::CounterOverflow {
-                    counter: "buffered_bytes",
-                })?;
-        flow.readable.extend(bytes);
-        self.buffered_bytes = buffered_bytes;
-        self.buffer_high_water = self.buffer_high_water.max(self.buffered_bytes);
-        Ok(TargetReadFeedCompletion::Queued { bytes: len })
-    }
-
-    pub(crate) fn finish_read(
-        &mut self,
-        flow_id: SessionFlowId,
-    ) -> Result<TargetReadEofCompletion, TargetIoError> {
-        let flow = self
-            .flows
-            .get_mut(&flow_id)
-            .ok_or(TargetIoError::UnknownFlow { flow_id })?;
-        if let Some(kind) = flow.terminal {
-            return Err(TargetIoError::FlowTerminal { flow_id, kind });
-        }
-        if flow.read_eof_queued {
-            return Ok(TargetReadEofCompletion::AlreadyQueued);
-        }
-        flow.read_eof_queued = true;
-        Ok(TargetReadEofCompletion::Queued)
-    }
-
-    /// Drains bytes already accepted by the memory Target application.
-    pub(crate) fn take_written(
-        &mut self,
-        flow_id: SessionFlowId,
-        max_bytes: usize,
-    ) -> Result<Bytes, TargetIoError> {
-        if max_bytes == 0 {
-            return Err(TargetIoError::ZeroDrainLimit);
-        }
-        let flow = self
-            .flows
-            .get_mut(&flow_id)
-            .ok_or(TargetIoError::UnknownFlow { flow_id })?;
-        let count = max_bytes.min(flow.written.len());
-        let buffered_bytes =
-            self.buffered_bytes
-                .checked_sub(count)
-                .ok_or(TargetIoError::CounterOverflow {
-                    counter: "buffered_bytes",
-                })?;
-        let bytes = flow.written.drain(..count).collect::<Vec<_>>();
-        self.buffered_bytes = buffered_bytes;
-        Ok(Bytes::from(bytes))
-    }
-}
-
-impl TargetIo for MemoryTarget {
-    fn open(
-        &mut self,
-        flow_id: SessionFlowId,
-        target: &TargetAddr,
-    ) -> Result<TargetOpenCompletion, TargetIoError> {
-        bump(&mut self.snapshot.open_attempts, "open_attempts")?;
-        if let Some(flow) = self.joined.get(&flow_id) {
-            if flow.target == *target {
-                bump(&mut self.snapshot.duplicate_opens, "duplicate_opens")?;
-                return Ok(TargetOpenCompletion::AlreadyTerminal(flow.terminal));
-            }
-            bump(&mut self.snapshot.conflicting_opens, "conflicting_opens")?;
-            return Err(TargetIoError::ConflictingTarget { flow_id });
-        }
-        if let Some(flow) = self.flows.get(&flow_id) {
-            if flow.target == *target {
-                bump(&mut self.snapshot.duplicate_opens, "duplicate_opens")?;
-                return Ok(match flow.terminal {
-                    Some(kind) => TargetOpenCompletion::AlreadyTerminal(kind),
-                    None => TargetOpenCompletion::AlreadyOpen,
-                });
-            }
-            bump(&mut self.snapshot.conflicting_opens, "conflicting_opens")?;
-            return Err(TargetIoError::ConflictingTarget { flow_id });
-        }
-        if let Some(highest_seen) = self
-            .highest_flow_id
-            .filter(|highest_seen| flow_id <= *highest_seen)
-        {
-            return Err(TargetIoError::StaleFlowId {
-                flow_id,
-                highest_seen,
-            });
-        }
-        if self.flows.len() >= self.config.max_flows {
-            // Consuming a new flow ID is monotonic even when live-handle
-            // admission fails. A later stale copy of that OPEN must never gain
-            // a socket merely because capacity became available.
-            self.highest_flow_id = Some(flow_id);
-            return Ok(TargetOpenCompletion::Failed(
-                TargetOpenFailure::ResourceExhausted,
-            ));
-        }
-        let opened_flows =
-            self.snapshot
-                .opened_flows
-                .checked_add(1)
-                .ok_or(TargetIoError::CounterOverflow {
-                    counter: "opened_flows",
-                })?;
-        self.highest_flow_id = Some(flow_id);
-        self.flows.insert(
-            flow_id,
-            MemoryTargetFlow {
-                target: target.clone(),
-                written: VecDeque::new(),
-                readable: VecDeque::new(),
-                write_directives: VecDeque::new(),
-                read_eof_queued: false,
-                read_eof_delivered: false,
-                write_half_closed: false,
-                terminal: None,
-            },
-        );
-        self.snapshot.opened_flows = opened_flows;
-        Ok(TargetOpenCompletion::Opened)
-    }
-
-    fn write(
-        &mut self,
-        flow_id: SessionFlowId,
-        bytes: &[u8],
-    ) -> Result<TargetWriteCompletion, TargetIoError> {
-        if bytes.is_empty() {
-            return Err(TargetIoError::EmptyWrite);
-        }
-        bump(&mut self.snapshot.write_calls, "write_calls")?;
-
-        let flow = self
-            .flows
-            .get_mut(&flow_id)
-            .ok_or(TargetIoError::UnknownFlow { flow_id })?;
-        if let Some(kind) = flow.terminal {
-            return Err(TargetIoError::FlowTerminal { flow_id, kind });
-        }
-        if flow.write_half_closed {
-            return Err(TargetIoError::WriteAfterHalfClose { flow_id });
-        }
-        match flow.write_directives.front().copied() {
-            Some(MemoryWriteDirective::WouldBlock) => {
-                let queued_write_directives = self.queued_write_directives.checked_sub(1).ok_or(
-                    TargetIoError::CounterOverflow {
-                        counter: "queued_write_directives",
-                    },
-                )?;
-                let write_would_block = self.snapshot.write_would_block.checked_add(1).ok_or(
-                    TargetIoError::CounterOverflow {
-                        counter: "write_would_block",
-                    },
-                )?;
-                flow.write_directives.pop_front();
-                self.queued_write_directives = queued_write_directives;
-                self.snapshot.write_would_block = write_would_block;
-                return Ok(TargetWriteCompletion::WouldBlock);
-            }
-            Some(MemoryWriteDirective::Zero) => {
-                let queued_write_directives = self.queued_write_directives.checked_sub(1).ok_or(
-                    TargetIoError::CounterOverflow {
-                        counter: "queued_write_directives",
-                    },
-                )?;
-                let write_zero = self.snapshot.write_zero.checked_add(1).ok_or(
-                    TargetIoError::CounterOverflow {
-                        counter: "write_zero",
-                    },
-                )?;
-                flow.write_directives.pop_front();
-                self.queued_write_directives = queued_write_directives;
-                self.snapshot.write_zero = write_zero;
-                return Ok(TargetWriteCompletion::Zero);
-            }
-            Some(MemoryWriteDirective::AcceptAtMost(_)) | None => {}
-        }
-
-        let flow_available = self
-            .config
-            .per_flow_buffer_bytes
-            .saturating_sub(flow.buffered_bytes());
-        let global_available = self
-            .config
-            .global_buffer_bytes
-            .saturating_sub(self.buffered_bytes);
-        let directive_limit = match flow.write_directives.front().copied() {
-            Some(MemoryWriteDirective::AcceptAtMost(limit)) => limit.get(),
-            Some(MemoryWriteDirective::WouldBlock | MemoryWriteDirective::Zero) => {
-                return Err(TargetIoError::CounterOverflow {
-                    counter: "write_directive_order",
-                });
-            }
-            None => self.config.max_write_chunk,
-        };
-        let accepted = bytes
-            .len()
-            .min(self.config.max_write_chunk)
-            .min(directive_limit)
-            .min(flow_available)
-            .min(global_available);
-        if accepted == 0 {
-            bump(&mut self.snapshot.write_would_block, "write_would_block")?;
-            return Ok(TargetWriteCompletion::WouldBlock);
-        }
-        let consumes_directive = matches!(
-            flow.write_directives.front(),
-            Some(MemoryWriteDirective::AcceptAtMost(_))
-        );
-        let queued_write_directives = if consumes_directive {
-            self.queued_write_directives
-                .checked_sub(1)
-                .ok_or(TargetIoError::CounterOverflow {
-                    counter: "queued_write_directives",
-                })?
-        } else {
-            self.queued_write_directives
-        };
-        let buffered_bytes =
-            self.buffered_bytes
-                .checked_add(accepted)
-                .ok_or(TargetIoError::CounterOverflow {
-                    counter: "buffered_bytes",
-                })?;
-        let accepted_u64 = u64::try_from(accepted).map_err(|_| TargetIoError::CounterOverflow {
-            counter: "write_accepted_bytes",
-        })?;
-        let write_accepted_bytes = self
-            .snapshot
-            .write_accepted_bytes
-            .checked_add(accepted_u64)
-            .ok_or(TargetIoError::CounterOverflow {
-                counter: "write_accepted_bytes",
-            })?;
-        let completion = TargetWriteCompletion::accepted(accepted)?;
-        if consumes_directive {
-            flow.write_directives.pop_front();
-        }
-        flow.written.extend(&bytes[..accepted]);
-        self.queued_write_directives = queued_write_directives;
-        self.buffered_bytes = buffered_bytes;
-        self.buffer_high_water = self.buffer_high_water.max(self.buffered_bytes);
-        self.snapshot.write_accepted_bytes = write_accepted_bytes;
-        Ok(completion)
-    }
-
-    fn read(
-        &mut self,
-        flow_id: SessionFlowId,
-        max_bytes: usize,
-    ) -> Result<TargetReadCompletion, TargetIoError> {
-        if max_bytes == 0 {
-            return Err(TargetIoError::ZeroReadLimit);
-        }
-        bump(&mut self.snapshot.read_calls, "read_calls")?;
-        let flow = self
-            .flows
-            .get_mut(&flow_id)
-            .ok_or(TargetIoError::UnknownFlow { flow_id })?;
-        if let Some(kind @ (TargetTerminalKind::Reset | TargetTerminalKind::Cancelled)) =
-            flow.terminal
-        {
-            return Err(TargetIoError::FlowTerminal { flow_id, kind });
-        }
-        if flow.read_eof_delivered {
-            return Err(TargetIoError::ReadAfterEof { flow_id });
-        }
-        if !flow.readable.is_empty() {
-            let count = max_bytes
-                .min(self.config.max_read_chunk)
-                .min(flow.readable.len());
-            let buffered_bytes =
-                self.buffered_bytes
-                    .checked_sub(count)
-                    .ok_or(TargetIoError::CounterOverflow {
-                        counter: "buffered_bytes",
-                    })?;
-            let read_delivered_bytes = checked_add_usize_to_u64(
-                self.snapshot.read_delivered_bytes,
-                count,
-                "read_delivered_bytes",
-            )?;
-            let bytes = flow.readable.drain(..count).collect::<Vec<_>>();
-            self.buffered_bytes = buffered_bytes;
-            self.snapshot.read_delivered_bytes = read_delivered_bytes;
-            return Ok(TargetReadCompletion::Data(Bytes::from(bytes)));
-        }
-        if flow.read_eof_queued {
-            let read_eof =
-                self.snapshot
-                    .read_eof
-                    .checked_add(1)
-                    .ok_or(TargetIoError::CounterOverflow {
-                        counter: "read_eof",
-                    })?;
-            let graceful = flow.write_half_closed;
-            let released_directives = if graceful {
-                flow.write_directives.len()
-            } else {
-                0
-            };
-            let queued_write_directives = self
-                .queued_write_directives
-                .checked_sub(released_directives)
-                .ok_or(TargetIoError::CounterOverflow {
-                    counter: "queued_write_directives",
-                })?;
-            let graceful_flows = if graceful {
-                self.snapshot.graceful_flows.checked_add(1).ok_or(
-                    TargetIoError::CounterOverflow {
-                        counter: "graceful_flows",
-                    },
-                )?
-            } else {
-                self.snapshot.graceful_flows
-            };
-            flow.read_eof_delivered = true;
-            self.snapshot.read_eof = read_eof;
-            if graceful {
-                flow.write_directives.clear();
-                flow.terminal = Some(TargetTerminalKind::Graceful);
-                self.queued_write_directives = queued_write_directives;
-                self.snapshot.graceful_flows = graceful_flows;
-            }
-            return Ok(TargetReadCompletion::Eof);
-        }
-        bump(&mut self.snapshot.read_would_block, "read_would_block")?;
-        Ok(TargetReadCompletion::WouldBlock)
-    }
-
-    fn half_close_write(
-        &mut self,
-        flow_id: SessionFlowId,
-    ) -> Result<TargetHalfCloseCompletion, TargetIoError> {
-        let flow = self
-            .flows
-            .get_mut(&flow_id)
-            .ok_or(TargetIoError::UnknownFlow { flow_id })?;
-        if let Some(kind @ (TargetTerminalKind::Reset | TargetTerminalKind::Cancelled)) =
-            flow.terminal
-        {
-            return Err(TargetIoError::FlowTerminal { flow_id, kind });
-        }
-        if flow.write_half_closed {
-            return Ok(TargetHalfCloseCompletion::AlreadyClosed);
-        }
-        let write_half_closes = self.snapshot.write_half_closes.checked_add(1).ok_or(
-            TargetIoError::CounterOverflow {
-                counter: "write_half_closes",
-            },
-        )?;
-        let graceful = flow.read_eof_delivered;
-        let released_directives = if graceful {
-            flow.write_directives.len()
-        } else {
-            0
-        };
-        let queued_write_directives = self
-            .queued_write_directives
-            .checked_sub(released_directives)
-            .ok_or(TargetIoError::CounterOverflow {
-                counter: "queued_write_directives",
-            })?;
-        let graceful_flows = if graceful {
-            self.snapshot
-                .graceful_flows
-                .checked_add(1)
-                .ok_or(TargetIoError::CounterOverflow {
-                    counter: "graceful_flows",
-                })?
-        } else {
-            self.snapshot.graceful_flows
-        };
-        flow.write_half_closed = true;
-        self.snapshot.write_half_closes = write_half_closes;
-        if graceful {
-            flow.write_directives.clear();
-            flow.terminal = Some(TargetTerminalKind::Graceful);
-            self.queued_write_directives = queued_write_directives;
-            self.snapshot.graceful_flows = graceful_flows;
-        }
-        Ok(TargetHalfCloseCompletion::Closed)
-    }
-
-    fn reset(&mut self, flow_id: SessionFlowId) -> Result<TargetResetCompletion, TargetIoError> {
-        let needs_increment = self
-            .flows
-            .get(&flow_id)
-            .ok_or(TargetIoError::UnknownFlow { flow_id })?
-            .terminal
-            .is_none();
-        let reset_flows = if needs_increment {
-            self.snapshot
-                .reset_flows
-                .checked_add(1)
-                .ok_or(TargetIoError::CounterOverflow {
-                    counter: "reset_flows",
-                })?
-        } else {
-            self.snapshot.reset_flows
-        };
-        match self.terminalize(flow_id, TargetTerminalKind::Reset)? {
-            TerminalizeOutcome::Changed(released) => {
-                self.snapshot.reset_flows = reset_flows;
-                Ok(TargetResetCompletion::Reset {
-                    released_read_bytes: released.read_bytes,
-                    released_written_bytes: released.written_bytes,
-                })
-            }
-            TerminalizeOutcome::Existing(TargetTerminalKind::Reset) => {
-                Ok(TargetResetCompletion::AlreadyReset)
-            }
-            TerminalizeOutcome::Existing(kind) => Ok(TargetResetCompletion::AlreadyTerminal(kind)),
-        }
-    }
-
-    fn cancel(&mut self, flow_id: SessionFlowId) -> Result<TargetCancelCompletion, TargetIoError> {
-        let needs_increment = self
-            .flows
-            .get(&flow_id)
-            .ok_or(TargetIoError::UnknownFlow { flow_id })?
-            .terminal
-            .is_none();
-        let cancelled_flows = if needs_increment {
-            self.snapshot
-                .cancelled_flows
-                .checked_add(1)
-                .ok_or(TargetIoError::CounterOverflow {
-                    counter: "cancelled_flows",
-                })?
-        } else {
-            self.snapshot.cancelled_flows
-        };
-        match self.terminalize(flow_id, TargetTerminalKind::Cancelled)? {
-            TerminalizeOutcome::Changed(released) => {
-                self.snapshot.cancelled_flows = cancelled_flows;
-                Ok(TargetCancelCompletion::Cancelled {
-                    released_read_bytes: released.read_bytes,
-                    released_written_bytes: released.written_bytes,
-                })
-            }
-            TerminalizeOutcome::Existing(TargetTerminalKind::Cancelled) => {
-                Ok(TargetCancelCompletion::AlreadyCancelled)
-            }
-            TerminalizeOutcome::Existing(kind) => Ok(TargetCancelCompletion::AlreadyTerminal(kind)),
-        }
-    }
-
-    fn expire_session_flow(
-        &mut self,
-        flow_id: SessionFlowId,
-    ) -> Result<TargetExpireCompletion, TargetIoError> {
-        let flow = self
-            .flows
-            .get(&flow_id)
-            .ok_or(TargetIoError::UnknownFlow { flow_id })?;
-        let released_read_bytes = flow.readable.len();
-        let released_written_bytes = flow.written.len();
-        let released_total = released_read_bytes
-            .checked_add(released_written_bytes)
-            .ok_or(TargetIoError::CounterOverflow {
-                counter: "released_buffered_bytes",
-            })?;
-        let released_directives = flow.write_directives.len();
-        let buffered_bytes = self.buffered_bytes.checked_sub(released_total).ok_or(
-            TargetIoError::CounterOverflow {
-                counter: "buffered_bytes",
-            },
-        )?;
-        let queued_write_directives = self
-            .queued_write_directives
-            .checked_sub(released_directives)
-            .ok_or(TargetIoError::CounterOverflow {
-                counter: "queued_write_directives",
-            })?;
-        let terminal = flow.terminal.unwrap_or(TargetTerminalKind::Cancelled);
-        let newly_cancelled = flow.terminal.is_none();
-        let cancelled_flows = if newly_cancelled {
-            self.snapshot
-                .cancelled_flows
-                .checked_add(1)
-                .ok_or(TargetIoError::CounterOverflow {
-                    counter: "cancelled_flows",
-                })?
-        } else {
-            self.snapshot.cancelled_flows
-        };
-
-        let flow = self
-            .flows
-            .get_mut(&flow_id)
-            .ok_or(TargetIoError::UnknownFlow { flow_id })?;
-        flow.readable.clear();
-        flow.written.clear();
-        flow.write_directives.clear();
-        flow.terminal = Some(terminal);
-        self.buffered_bytes = buffered_bytes;
-        self.queued_write_directives = queued_write_directives;
-        self.snapshot.cancelled_flows = cancelled_flows;
-        Ok(TargetExpireCompletion {
-            terminal,
-            released_read_bytes,
-            released_written_bytes,
-        })
-    }
-
-    fn readiness(&self, flow_id: SessionFlowId) -> Result<TargetReadiness, TargetIoError> {
-        if let Some(flow) = self.joined.get(&flow_id) {
-            return Err(TargetIoError::FlowJoined {
-                flow_id,
-                kind: flow.terminal,
-            });
-        }
-        let flow = self
-            .flows
-            .get(&flow_id)
-            .ok_or(TargetIoError::UnknownFlow { flow_id })?;
-        let flow_available = self
-            .config
-            .per_flow_buffer_bytes
-            .saturating_sub(flow.buffered_bytes());
-        let global_available = self
-            .config
-            .global_buffer_bytes
-            .saturating_sub(self.buffered_bytes);
-        let directive_ready = !matches!(
-            flow.write_directives.front(),
-            Some(MemoryWriteDirective::WouldBlock)
-        );
-        Ok(TargetReadiness {
-            readable: !flow.readable.is_empty()
-                || (flow.read_eof_queued && !flow.read_eof_delivered),
-            writable: flow.terminal.is_none()
-                && !flow.write_half_closed
-                && directive_ready
-                && flow_available > 0
-                && global_available > 0,
-            joinable: flow.terminal.is_some()
-                && flow.buffered_bytes() == 0
-                && flow.write_directives.is_empty(),
-            terminal: flow.terminal,
-        })
-    }
-
-    fn join(&mut self, flow_id: SessionFlowId) -> Result<TargetJoinCompletion, TargetIoError> {
-        if let Some(flow) = self.joined.get(&flow_id) {
-            return Ok(TargetJoinCompletion::AlreadyJoined(flow.terminal));
-        }
-        let flow = self
-            .flows
-            .get(&flow_id)
-            .ok_or(TargetIoError::UnknownFlow { flow_id })?;
-        let Some(terminal) = flow.terminal else {
-            return Err(TargetIoError::JoinBeforeTerminal { flow_id });
-        };
-        let bytes = flow.buffered_bytes();
-        let directives = flow.write_directives.len();
-        if bytes != 0 || directives != 0 {
-            return Ok(TargetJoinCompletion::PendingOwnedState { bytes, directives });
-        }
-        if self.joined.len() >= self.config.max_terminal_tombstones {
-            return Ok(TargetJoinCompletion::PendingTerminalCapacity {
-                max: self.config.max_terminal_tombstones,
-            });
-        }
-        let flow = self
-            .flows
-            .remove(&flow_id)
-            .ok_or(TargetIoError::UnknownFlow { flow_id })?;
-        self.joined.insert(
-            flow_id,
-            JoinedTargetFlow {
-                target: flow.target,
-                terminal,
-            },
-        );
-        Ok(TargetJoinCompletion::Joined(terminal))
-    }
-
-    fn retire_terminal_tombstone(
-        &mut self,
-        flow_id: SessionFlowId,
-    ) -> Result<TargetTombstoneRetireCompletion, TargetIoError> {
-        Ok(match self.joined.remove(&flow_id) {
-            Some(flow) => TargetTombstoneRetireCompletion::Retired(flow.terminal),
-            None => TargetTombstoneRetireCompletion::Absent,
-        })
-    }
 }
 
 fn bump(counter: &mut u64, name: &'static str) -> Result<(), TargetIoError> {
@@ -1303,6 +922,12 @@ impl fmt::Debug for MemoryTarget {
 
 #[cfg(test)]
 mod tests {
+    mod address_storage;
+    mod node_storage;
+    mod owner_readiness;
+    mod retained_backing;
+    mod storage_peak;
+
     use super::*;
 
     fn flow(value: u64) -> SessionFlowId {
@@ -1333,7 +958,7 @@ mod tests {
                 counter: "opened_flows"
             })
         );
-        assert!(!io.flows.contains_key(&flow));
+        assert!(io.storage.get(&flow).is_none());
         assert_eq!(io.highest_flow_id, None);
 
         io.snapshot.opened_flows = 0;
@@ -1347,7 +972,7 @@ mod tests {
                 counter: "write_accepted_bytes"
             })
         );
-        let retained = io.flows.get(&flow).unwrap();
+        let retained = io.storage.get(&flow).unwrap();
         assert!(retained.written.is_empty());
         assert_eq!(retained.write_directives.len(), 1);
         assert_eq!(io.buffered_bytes, 0);
@@ -1361,7 +986,7 @@ mod tests {
                 counter: "read_delivered_bytes"
             })
         );
-        let retained = io.flows.get(&flow).unwrap();
+        let retained = io.storage.get(&flow).unwrap();
         assert_eq!(
             retained.readable.iter().copied().collect::<Vec<_>>(),
             b"xyz"
@@ -1375,7 +1000,7 @@ mod tests {
                 counter: "write_half_closes"
             })
         );
-        assert!(!io.flows.get(&flow).unwrap().write_half_closed);
+        assert!(!io.storage.get(&flow).unwrap().write_half_closed);
 
         io.snapshot.reset_flows = u64::MAX;
         assert_eq!(
@@ -1384,7 +1009,7 @@ mod tests {
                 counter: "reset_flows"
             })
         );
-        let retained = io.flows.get(&flow).unwrap();
+        let retained = io.storage.get(&flow).unwrap();
         assert_eq!(retained.terminal, None);
         assert_eq!(retained.readable.len(), 3);
         assert_eq!(retained.write_directives.len(), 1);
@@ -1406,7 +1031,7 @@ mod tests {
                 counter: "read_eof"
             })
         );
-        assert!(!io.flows.get(&flow).unwrap().read_eof_delivered);
+        assert!(!io.storage.get(&flow).unwrap().read_eof_delivered);
 
         io.snapshot.read_eof = 0;
         assert_eq!(io.read(flow, 1), Ok(TargetReadCompletion::Eof));
@@ -1419,7 +1044,7 @@ mod tests {
                 counter: "graceful_flows"
             })
         );
-        let retained = io.flows.get(&flow).unwrap();
+        let retained = io.storage.get(&flow).unwrap();
         assert!(!retained.write_half_closed);
         assert_eq!(retained.terminal, None);
         assert_eq!(retained.write_directives.len(), 1);

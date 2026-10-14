@@ -1,22 +1,31 @@
-//! Single-owner transaction boundary for one resumable session.
+//! Single-owner reducer transaction and original source-factory validation.
 //!
-//! The supervisor is the only adapter layer allowed to split an admitted
-//! [`super::tcp::UplinkData`] into a reducer event and its byte ownership. It consumes the
-//! reducer's opaque replay receipts before returning effects to transport or
-//! TUN adapters, so staging permits cannot be released by a merely well-formed
-//! wire ACK.
+//! Only this authority splits admitted UplinkData and consumes replay receipts;
+//! wire ACKs alone never release staging permits or bypass receipt settlement.
 
-use std::collections::BTreeMap;
-use std::fmt;
-use std::sync::Arc;
-
-use thiserror::Error;
-
+mod driver_input;
+mod owner_observation;
+mod source_factory;
+use super::client_controller::{ClientControllerBootstrapGate, ClientControllerObservedApplyGate};
+use super::owner_session_capacity::OwnerSessionCapacityPlan;
+use super::owner_target::{
+    OwnerTargetInitialBootstrapInstallGate, OwnerTargetLeglessBootstrapInstallGate,
+    OwnerTargetObservedApplyGate,
+};
+#[cfg(test)]
+use super::two_leg_harness::LegacyOwnerBootstrapDecompositionGate;
 use crate::resumable::{
     AttachAuthority, AttachNonce, AttachTransportBinding, AuthenticatedAttachStatus, ByteOffset,
-    Direction, Frame, LegGeneration, SessionConfig, SessionEffect, SessionError, SessionEvent,
-    SessionFlowId, SessionModel, SessionPhase, SessionRole, SessionSnapshot,
+    CommittedLeg, Direction, Frame, GenerationCatchUp, LegGeneration,
+    PreparedLocalOpenAdapterFailure, PreparedLocalOpenAdapterRejection, PreparedLocalOpenInput,
+    ReducerCommittedLocalOpen, ReplayStoragePlan, SessionConfig, SessionEffect, SessionError,
+    SessionEvent, SessionFlowId, SessionId, SessionModel, SessionPhase, SessionRole,
+    SessionSnapshot, TerminalGrace,
 };
+use std::fmt;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use thiserror::Error;
 
 #[cfg(test)]
 use super::leg::CaughtUpAttachedLeg;
@@ -26,29 +35,364 @@ use super::leg::{
 };
 use super::leg_io::{
     AcceptedInitialAttach, AcceptedInitialAttachActivationFailure, AttachAcceptanceEnqueued,
-    AttachAcceptanceReservation, AttachAcceptanceReserveError, InitialAttachActivationError,
+    AttachAcceptanceReservation, AttachAcceptanceReserveError, InitialAttachActivationError, LegIo,
     LegOutboundQueue, LegOutboundQueueErrorKind,
 };
 use super::session::SessionOwnerCommand;
 use super::standby::{ExactAuthenticatedStandby, OwnerRegisteredAttachGate};
 use super::tcp::{
-    DriverInput, FlowPortConfig, FlowPortConfigError, FlowPortError, ResumableTcpPortFactory,
-    UplinkOwnership, UplinkReplayOwnership,
+    ClientControllerDriverInput, DriverInput, FlowPortConfig, FlowPortConfigError, FlowPortError,
+    ResumableTcpPortFactory, TcpFactoryAdmission, TcpFactoryAdmissionClose, UplinkOwnership,
+    UplinkReplayOwnership,
 };
 
 struct TcpFactoryOriginSeal;
 
-/// Opaque identity shared only by the one factory minted for this supervisor.
-/// The seal is private to this module, so sibling adapters can carry and
-/// compare this capability but cannot manufacture another valid origin.
+/// Ownership-preserving reducer/supervisor rejection for the prepared local
+/// OPEN path. The exact caller Target stays outside the diagnostic error, so
+/// no validation path must clone an unbounded `String` merely to retain retry
+/// authority.
+pub(super) struct PreparedClientLocalOpenSupervisorFailure {
+    target: crate::shared::TargetAddr,
+    error: SessionSupervisorError,
+    block: Option<ReducerAdmissionBlock>,
+}
+
+impl PreparedClientLocalOpenSupervisorFailure {
+    pub(super) const fn target(&self) -> &crate::shared::TargetAddr {
+        &self.target
+    }
+
+    pub(super) const fn block(&self) -> Option<ReducerAdmissionBlock> {
+        self.block
+    }
+
+    pub(super) fn into_parts(self) -> (crate::shared::TargetAddr, SessionSupervisorError) {
+        (self.target, self.error)
+    }
+}
+
+impl fmt::Debug for PreparedClientLocalOpenSupervisorFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedClientLocalOpenSupervisorFailure")
+            .field("target", &"[REDACTED]")
+            .field("error", &self.error)
+            .field("block", &self.block)
+            .finish()
+    }
+}
+
+/// Seals raw-driver extraction and exact rejection rewrapping inside the sole
+/// session supervisor. The type is visible to the TCP wrapper, but its value
+/// cannot be minted by sibling adapters.
+pub(super) struct ClientControllerDriverReducerGate {
+    _private: (),
+}
+
+impl ClientControllerDriverReducerGate {
+    fn mint() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// One-shot evidence that the client reducer committed the same generation
+/// whose opaque accepted transport wrapper is about to be installed.
+pub(super) struct ClientReplacementCommit;
+
+/// Non-authoritative scalar observation minted only after the reducer ACK
+/// receipt has released matching adapter replay ownership. The receipt itself
+/// never leaves this supervisor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ReducerApplicationAckAdvanced {
+    session_id: SessionId,
+    flow_id: SessionFlowId,
+    generation: LegGeneration,
+    direction: Direction,
+    previous_accepted: ByteOffset,
+    next_accepted: ByteOffset,
+    released_bytes: NonZeroUsize,
+    final_accepted: bool,
+    remaining_oldest: Option<ByteOffset>,
+    session_has_outstanding_replay: bool,
+}
+
+/// Exact local sink frontier minted only after the matching `SinkAccepted`
+/// event commits. A decoded DATA frame or an `OfferToSink` effect cannot
+/// manufacture this fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ReducerSinkAcceptedFrontier {
+    session_id: SessionId,
+    flow_id: SessionFlowId,
+    generation: LegGeneration,
+    direction: Direction,
+    previous_accepted: ByteOffset,
+    next_accepted: ByteOffset,
+}
+
+impl ReducerSinkAcceptedFrontier {
+    pub(super) const fn session_id(self) -> SessionId {
+        self.session_id
+    }
+
+    pub(super) const fn flow_id(self) -> SessionFlowId {
+        self.flow_id
+    }
+
+    pub(super) const fn generation(self) -> LegGeneration {
+        self.generation
+    }
+
+    pub(super) const fn direction(self) -> Direction {
+        self.direction
+    }
+
+    pub(super) const fn previous_accepted(self) -> ByteOffset {
+        self.previous_accepted
+    }
+
+    pub(super) const fn next_accepted(self) -> ByteOffset {
+        self.next_accepted
+    }
+}
+
+/// Fixed-size reducer facts available only through the client-controller
+/// observation gate. This first vertical slice carries the committed local
+/// sink frontier; later progress facts can be added without widening the
+/// legacy effects-only API.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct ReducerClientObservations {
+    replay_became_outstanding: Option<ReducerReplayBecameOutstanding>,
+    sink_accepted_frontier: Option<ReducerSinkAcceptedFrontier>,
+    flow_terminal: Option<ReducerFlowDirectionTerminal>,
+    session_expired: Option<ReducerSessionExpired>,
+    session_has_outstanding_replay: bool,
+}
+
+impl ReducerClientObservations {
+    pub(super) fn into_replay_became_outstanding(
+        &mut self,
+    ) -> Option<ReducerReplayBecameOutstanding> {
+        self.replay_became_outstanding.take()
+    }
+
+    pub(super) fn into_sink_accepted_frontier(&mut self) -> Option<ReducerSinkAcceptedFrontier> {
+        self.sink_accepted_frontier.take()
+    }
+
+    pub(super) fn into_flow_terminal(&mut self) -> Option<ReducerFlowDirectionTerminal> {
+        self.flow_terminal.take()
+    }
+
+    pub(super) fn into_session_expired(&mut self) -> Option<ReducerSessionExpired> {
+        self.session_expired.take()
+    }
+
+    pub(super) const fn session_has_outstanding_replay(&self) -> bool {
+        self.session_has_outstanding_replay
+    }
+}
+
+impl ReducerApplicationAckAdvanced {
+    pub(super) const fn session_id(self) -> SessionId {
+        self.session_id
+    }
+    pub(super) const fn flow_id(self) -> SessionFlowId {
+        self.flow_id
+    }
+    pub(super) const fn generation(self) -> LegGeneration {
+        self.generation
+    }
+    pub(super) const fn direction(self) -> Direction {
+        self.direction
+    }
+    pub(super) const fn previous_accepted(self) -> ByteOffset {
+        self.previous_accepted
+    }
+    pub(super) const fn next_accepted(self) -> ByteOffset {
+        self.next_accepted
+    }
+    pub(super) const fn released_bytes(self) -> usize {
+        self.released_bytes.get()
+    }
+    pub(super) const fn final_accepted(self) -> bool {
+        self.final_accepted
+    }
+    pub(super) const fn remaining_oldest(self) -> Option<ByteOffset> {
+        self.remaining_oldest
+    }
+    pub(super) const fn session_has_outstanding_replay(self) -> bool {
+        self.session_has_outstanding_replay
+    }
+}
+
+/// Fixed-size owner evidence emitted only after one owned DATA command has
+/// committed both reducer replay and the matching adapter byte ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ReducerReplayBecameOutstanding {
+    session_id: SessionId,
+    flow_id: SessionFlowId,
+    generation: LegGeneration,
+    direction: Direction,
+    start: ByteOffset,
+    end: ByteOffset,
+    session_became_nonempty: bool,
+}
+
+impl ReducerReplayBecameOutstanding {
+    pub(super) const fn session_id(self) -> SessionId {
+        self.session_id
+    }
+    pub(super) const fn flow_id(self) -> SessionFlowId {
+        self.flow_id
+    }
+    pub(super) const fn generation(self) -> LegGeneration {
+        self.generation
+    }
+    pub(super) const fn direction(self) -> Direction {
+        self.direction
+    }
+    pub(super) const fn start(self) -> ByteOffset {
+        self.start
+    }
+    pub(super) const fn end(self) -> ByteOffset {
+        self.end
+    }
+    pub(super) const fn session_became_nonempty(self) -> bool {
+        self.session_became_nonempty
+    }
+}
+
+/// Fixed-size original terminal fact. Closed owner code may borrow its exact
+/// identity; Target cleanup remains in the serialized executor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ReducerFlowDirectionTerminal {
+    terminal: TerminalGrace,
+    generation: LegGeneration,
+}
+
+impl ReducerFlowDirectionTerminal {
+    pub(super) const fn session_id(self) -> SessionId {
+        self.terminal.session_id()
+    }
+    pub(super) const fn flow_id(self) -> SessionFlowId {
+        self.terminal.flow_id()
+    }
+    pub(super) const fn generation(self) -> LegGeneration {
+        self.generation
+    }
+    pub(super) const fn direction(self) -> Direction {
+        self.terminal.direction()
+    }
+    pub(super) const fn terminal(&self) -> &TerminalGrace {
+        &self.terminal
+    }
+}
+
+/// Fixed-size session terminal fact. It is separate from the visible cleanup
+/// effect so an owner controller never needs to infer reducer state from I/O.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ReducerSessionExpired {
+    session_id: SessionId,
+    generation: LegGeneration,
+}
+
+impl ReducerSessionExpired {
+    pub(super) const fn session_id(self) -> SessionId {
+        self.session_id
+    }
+    pub(super) const fn generation(self) -> LegGeneration {
+        self.generation
+    }
+}
+
+/// At most one scalar of each reducer fact can be produced by one serialized
+/// owner turn. This fixed bound deliberately stores no payload or ACK history.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct ReducerOwnerObservations {
+    replay_became_outstanding: Option<ReducerReplayBecameOutstanding>,
+    application_ack: Option<ReducerApplicationAckAdvanced>,
+    flow_terminal: Option<ReducerFlowDirectionTerminal>,
+    session_expired: Option<ReducerSessionExpired>,
+}
+
+impl ReducerOwnerObservations {
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        Option<ReducerReplayBecameOutstanding>,
+        Option<ReducerApplicationAckAdvanced>,
+        Option<ReducerFlowDirectionTerminal>,
+        Option<ReducerSessionExpired>,
+    ) {
+        (
+            self.replay_became_outstanding,
+            self.application_ack,
+            self.flow_terminal,
+            self.session_expired,
+        )
+    }
+    pub(super) fn is_empty(&self) -> bool {
+        self.replay_became_outstanding.is_none()
+            && self.application_ack.is_none()
+            && self.flow_terminal.is_none()
+            && self.session_expired.is_none()
+    }
+}
+
+pub(super) struct ReducerObservedApply {
+    effects: crate::resumable::effect_storage::SessionEffectBatch,
+    observations: ReducerOwnerObservations,
+    sink_accepted_frontier: Option<ReducerSinkAcceptedFrontier>,
+    session_has_outstanding_replay: bool,
+}
+
+impl ReducerObservedApply {
+    fn into_effects(self) -> Vec<SessionEffect> {
+        self.effects.into_parts().0
+    }
+    pub(super) fn into_parts(self) -> (Vec<SessionEffect>, Option<ReducerApplicationAckAdvanced>) {
+        (
+            self.effects.into_parts().0,
+            self.observations.application_ack,
+        )
+    }
+    pub(super) fn into_owner_parts(
+        self,
+    ) -> (
+        crate::resumable::effect_storage::SessionEffectBatch,
+        ReducerOwnerObservations,
+    ) {
+        (self.effects, self.observations)
+    }
+
+    pub(super) fn into_client_parts(self) -> (Vec<SessionEffect>, ReducerClientObservations) {
+        let Self {
+            effects,
+            observations,
+            sink_accepted_frontier,
+            session_has_outstanding_replay,
+        } = self;
+        (
+            effects.into_parts().0,
+            ReducerClientObservations {
+                replay_became_outstanding: observations.replay_became_outstanding,
+                sink_accepted_frontier,
+                flow_terminal: observations.flow_terminal,
+                session_expired: observations.session_expired,
+                session_has_outstanding_replay,
+            },
+        )
+    }
+}
+
+/// Sole factory origin: siblings can compare/carry it, never mint its private seal.
 #[derive(Clone)]
 pub(super) struct TcpFactoryOrigin(Arc<TcpFactoryOriginSeal>);
-
 impl TcpFactoryOrigin {
     fn mint() -> Self {
         Self(Arc::new(TcpFactoryOriginSeal))
     }
-
     pub(super) fn matches(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -80,15 +424,12 @@ pub(crate) struct SessionSupervisorSnapshot {
     pub(crate) uplink_replay_extents: usize,
     pub(crate) uplink_replay_owned_bytes: usize,
     pub(crate) poisoned: bool,
+    pub(crate) retained_receipt_effects: usize,
+    pub(crate) retained_receipt_observations: usize,
     pub(crate) quarantined_uplink_extents: usize,
     pub(crate) quarantined_uplink_owned_bytes: usize,
     pub(crate) owner_catch_up_permit: bool,
     pub(crate) owner_catch_up_permit_armed: bool,
-}
-
-enum QuarantinedUplinkOwnership {
-    Staging(UplinkOwnership),
-    Replay(UplinkReplayOwnership),
 }
 
 struct OwnerActiveContract {
@@ -198,28 +539,18 @@ impl OwnerActiveContract {
     }
 }
 
-impl QuarantinedUplinkOwnership {
-    fn bytes(&self) -> usize {
-        match self {
-            Self::Staging(ownership) => ownership.bytes(),
-            Self::Replay(ownership) => ownership.bytes(),
-        }
-    }
-}
-
-/// Exact reducer byte capacities that bound owner Target reads before the sole
-/// source factory is minted. Segment and session-global factory capacities are
-/// always derived directly inside [`SessionSupervisor::mint_tcp_port_factory`].
+/// Exact pre-mint byte bounds; mint_tcp_port_factory derives segment/session bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OwnerTargetReplayCapacity {
     pub(crate) per_flow_bytes: usize,
     pub(crate) session_bytes: usize,
 }
-
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub(crate) enum TcpPortFactoryMintError {
     #[error("this session supervisor already minted its TCP port factory")]
     AlreadyMinted,
+    #[error("TCP port factory admission is permanently closed for session shutdown")]
+    FactoryAdmissionClosed,
     #[error("a poisoned session supervisor cannot mint a TCP port factory")]
     PoisonedSupervisor,
     #[error(
@@ -240,6 +571,27 @@ pub(crate) enum TcpPortFactoryMintError {
     PerFlowBytesExceedReducer { requested: usize, available: usize },
     #[error("TCP port factory capacity cannot represent the reducer limits: {0}")]
     InvalidDerivedCapacity(#[from] FlowPortConfigError),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OwnerSourceIdentityError {
+    OwnerRoleRequired,
+    PoisonedSupervisor,
+    SessionExpired,
+    ActiveSessionRequired,
+    ActiveAttachmentMismatch,
+    FactoryNotMinted,
+    FactoryAdmissionClosed,
+    ReservationSessionMismatch,
+    FactoryOriginMismatch,
+    FactoryAdmissionMismatch,
+    FactoryGatePoisoned,
+    FactoryGateClosed,
+    FactoryGateBindingMismatch,
+}
+enum TcpFactoryAdmissionState {
+    Unminted,
+    Minted(TcpFactoryAdmission),
+    Closed,
 }
 
 /// Reducer-wide admission pressure for which retrying the exact same input is
@@ -279,16 +631,37 @@ impl ReducerAdmissionBlock {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OwnerDataUnwindPoint {
+    Staging,
+    ReplayBound,
+    ReplayPublished,
+    ReceiptTerminal,
+    ReceiptSinkAccepted,
+}
+
+struct SupervisorReceiptJournal {
+    effects: crate::resumable::effect_storage::SessionEffectBatch,
+    observations: ReducerOwnerObservations,
+    sink_accepted_frontier: Option<ReducerSinkAcceptedFrontier>,
+}
+
 /// Sole mutable owner of the pure reducer and its adapter-side byte permits.
 pub(crate) struct SessionSupervisor {
     model: SessionModel,
+    installed_replay_storage: Option<ReplayStoragePlan>,
     attach_authority: Option<AttachAuthority>,
     owner_active_contract: Option<OwnerActiveContract>,
     owner_catch_up_permit: Option<OwnerCatchUpPermit>,
     tcp_factory_origin: Option<TcpFactoryOrigin>,
-    uplink_replay: BTreeMap<ReplayExtentKey, UplinkReplayOwnership>,
+    tcp_factory_admission: TcpFactoryAdmissionState,
+    uplink_replay: driver_input::UplinkStorage,
     poisoned: bool,
-    quarantined_uplink: Vec<QuarantinedUplinkOwnership>,
+    receipt_journal: Option<SupervisorReceiptJournal>,
+    ordinary_effects: owner_observation::OrdinaryEffectStorage,
+    #[cfg(test)]
+    owner_data_unwind_once: Option<OwnerDataUnwindPoint>,
 }
 
 impl SessionSupervisor {
@@ -299,56 +672,133 @@ impl SessionSupervisor {
     pub(crate) fn new(model: SessionModel) -> Self {
         Self {
             model,
+            installed_replay_storage: None,
             attach_authority: None,
             owner_active_contract: None,
             owner_catch_up_permit: None,
             tcp_factory_origin: None,
-            uplink_replay: BTreeMap::new(),
+            tcp_factory_admission: TcpFactoryAdmissionState::Unminted,
+            uplink_replay: driver_input::UplinkStorage::default(),
             poisoned: false,
-            quarantined_uplink: Vec::new(),
+            receipt_journal: None,
+            ordinary_effects: owner_observation::OrdinaryEffectStorage::Uninstalled,
+            #[cfg(test)]
+            owner_data_unwind_once: None,
         }
     }
 
-    /// Creates reusable pre-session state for exact-leg owner bootstrap.
-    /// Rejected attempts retain this same authority and config for retry.
+    /// Creates reusable pre-session state from one atomically derived owner
+    /// session/replay plan. Rejections retain the exact plan and authority.
     pub(crate) fn prepare_owner(
+        plan: OwnerSessionCapacityPlan,
+        authority: AttachAuthority,
+    ) -> PendingOwnerBootstrap {
+        PendingOwnerBootstrap {
+            state: Some(PendingOwnerBootstrapState {
+                session: PendingOwnerBootstrapSession::Proven(plan),
+                authority,
+            }),
+        }
+    }
+
+    /// Legacy reducer-fixture entry. It deliberately carries no replay-plan
+    /// provenance and therefore cannot pass checked owner-controller build.
+    #[cfg(test)]
+    pub(crate) fn prepare_owner_unproven_for_test(
+        config: SessionConfig,
+        authority: AttachAuthority,
+    ) -> PendingOwnerBootstrap {
+        Self::prepare_owner_unproven(config, authority)
+    }
+
+    /// R5 byte-harness compatibility entry. The harness predates physical R7
+    /// provenance and cannot feed the checked owner production root.
+    pub(super) fn prepare_owner_unproven_for_harness(
+        config: SessionConfig,
+        authority: AttachAuthority,
+    ) -> PendingOwnerBootstrap {
+        Self::prepare_owner_unproven(config, authority)
+    }
+
+    fn prepare_owner_unproven(
         config: SessionConfig,
         authority: AttachAuthority,
     ) -> PendingOwnerBootstrap {
         PendingOwnerBootstrap {
-            config,
-            authority: Some(authority),
+            state: Some(PendingOwnerBootstrapState {
+                session: PendingOwnerBootstrapSession::Unproven(config),
+                authority,
+            }),
         }
     }
 
-    /// Constructs the initial client model only after one queue-bound,
-    /// actually delivered ATTACH has received its exact correlated
-    /// acceptance. The same sole queue transitions to Active without an
-    /// allocation or another pressure-sensitive admission.
-    #[allow(
-        clippy::result_large_err,
-        reason = "bootstrap rejection returns the exact queue-bound acceptance capability"
-    )]
-    pub(crate) fn bootstrap_client(
+    /// Atomic owner-plan fixture constructor. It builds the reducer from the
+    /// plan internally; tests cannot pair an arbitrary model with provenance.
+    #[cfg(test)]
+    pub(crate) fn from_owner_capacity_plan_for_test(
+        plan: OwnerSessionCapacityPlan,
+        initial_leg: CommittedLeg,
+    ) -> Self {
+        Self {
+            model: SessionModel::new(SessionRole::Owner, plan.session_config(), initial_leg),
+            installed_replay_storage: Some(plan.replay_storage()),
+            attach_authority: None,
+            owner_active_contract: None,
+            owner_catch_up_permit: None,
+            tcp_factory_origin: None,
+            tcp_factory_admission: TcpFactoryAdmissionState::Unminted,
+            uplink_replay: driver_input::UplinkStorage::default(),
+            poisoned: false,
+            receipt_journal: None,
+            ordinary_effects: owner_observation::OrdinaryEffectStorage::Uninstalled,
+            #[cfg(test)]
+            owner_data_unwind_once: None,
+        }
+    }
+
+    /// Infallible construction used only after the client controller has
+    /// consumed and activated the accepted leg's exact endpoint/FIFO bundle.
+    pub(super) fn from_initial_client(
+        config: SessionConfig,
+        attached: &AttachedLeg,
+        _gate: &ClientControllerBootstrapGate,
+    ) -> Self {
+        Self::from_initial_client_inner(config, attached)
+    }
+
+    fn from_initial_client_inner(config: SessionConfig, attached: &AttachedLeg) -> Self {
+        let model = attached.initial_client_model(config);
+        Self {
+            model,
+            installed_replay_storage: None,
+            attach_authority: None,
+            owner_active_contract: None,
+            owner_catch_up_permit: None,
+            tcp_factory_origin: None,
+            tcp_factory_admission: TcpFactoryAdmissionState::Unminted,
+            uplink_replay: driver_input::UplinkStorage::default(),
+            poisoned: false,
+            receipt_journal: None,
+            ordinary_effects: owner_observation::OrdinaryEffectStorage::Uninstalled,
+            #[cfg(test)]
+            owner_data_unwind_once: None,
+        }
+    }
+
+    /// Test-only decomposition seam for provenance tests that intentionally
+    /// compare exact attached-leg seals without publishing a production
+    /// controller.
+    #[cfg(test)]
+    pub(crate) fn bootstrap_client_for_test(
         config: SessionConfig,
         accepted: AcceptedInitialAttach,
         queue: &mut LegOutboundQueue,
     ) -> Result<ClientSessionBootstrap, ClientBootstrapError> {
         let attached = accepted
-            .activate_on_queue(queue)
+            .activate_on_queue_for_test(queue)
             .map_err(ClientBootstrapError::activation)?;
-        let model = attached.initial_client_model(config);
         Ok(ClientSessionBootstrap {
-            supervisor: Self {
-                model,
-                attach_authority: None,
-                owner_active_contract: None,
-                owner_catch_up_permit: None,
-                tcp_factory_origin: None,
-                uplink_replay: BTreeMap::new(),
-                poisoned: false,
-                quarantined_uplink: Vec::new(),
-            },
+            supervisor: Self::from_initial_client_inner(config, &attached),
             attached,
         })
     }
@@ -381,15 +831,20 @@ impl SessionSupervisor {
         }
         Ok(Self {
             model,
+            installed_replay_storage: None,
             attach_authority: Some(attach_authority),
             // This test-only bare-model seam has no exact process-local
             // AttachedLeg seal and therefore cannot authorize standby.
             owner_active_contract: None,
             owner_catch_up_permit: None,
             tcp_factory_origin: None,
-            uplink_replay: BTreeMap::new(),
+            tcp_factory_admission: TcpFactoryAdmissionState::Unminted,
+            uplink_replay: driver_input::UplinkStorage::default(),
             poisoned: false,
-            quarantined_uplink: Vec::new(),
+            receipt_journal: None,
+            ordinary_effects: owner_observation::OrdinaryEffectStorage::Uninstalled,
+            #[cfg(test)]
+            owner_data_unwind_once: None,
         })
     }
 
@@ -413,32 +868,100 @@ impl SessionSupervisor {
         Ok(supervisor)
     }
 
-    pub(crate) fn snapshot(&self) -> SessionSupervisorSnapshot {
-        SessionSupervisorSnapshot {
-            session: self.model.snapshot(),
-            uplink_replay_extents: self.uplink_replay.len(),
-            uplink_replay_owned_bytes: self
-                .uplink_replay
-                .values()
-                .map(UplinkReplayOwnership::bytes)
-                .sum(),
-            poisoned: self.poisoned,
-            quarantined_uplink_extents: self.quarantined_uplink.len(),
-            quarantined_uplink_owned_bytes: self
-                .quarantined_uplink
-                .iter()
-                .map(QuarantinedUplinkOwnership::bytes)
-                .sum(),
-            owner_catch_up_permit: self.owner_catch_up_permit.is_some(),
-            owner_catch_up_permit_armed: self
-                .owner_catch_up_permit
-                .as_ref()
-                .is_some_and(|permit| permit.armed),
-        }
+    pub(super) const fn installed_replay_storage_plan(&self) -> Option<ReplayStoragePlan> {
+        self.installed_replay_storage
+    }
+
+    /// Read-only configuration witness for the client composition owner.
+    /// Capacity-sensitive outer roots compare this exact installed value with
+    /// their preflight plan before consuming the one-shot TCP factory mint.
+    pub(super) fn session_config(&self) -> SessionConfig {
+        self.model.config()
+    }
+
+    pub(super) fn session_id_for_client_controller(
+        &self,
+        _gate: &ClientControllerObservedApplyGate,
+    ) -> SessionId {
+        self.model.session_id()
     }
 
     pub(crate) fn owner_recovery_effect_bound(&self) -> Option<usize> {
         self.model.config().owner_recovery_effect_bound()
+    }
+
+    pub(super) fn client_recovery_effect_bound(&self) -> Option<usize> {
+        self.model.config().client_recovery_effect_bound()
+    }
+
+    /// Performs all reducer checks and lets the closed client adapter reserve
+    /// exact recovery resources before the generation changes. An adapter
+    /// rejection is nested and leaves the model bit-for-bit unchanged.
+    pub(super) fn install_prepared_client_replacement<T, E>(
+        &mut self,
+        candidate: CommittedLeg,
+        prepare: impl FnOnce(Vec<SessionEffect>) -> Result<T, E>,
+    ) -> Result<Result<(T, ClientReplacementCommit), E>, SessionSupervisorError> {
+        self.require_healthy()?;
+        self.model
+            .install_prepared_client_replacement(candidate, prepare)
+            .map(|result| result.map(|prepared| (prepared, ClientReplacementCommit)))
+            .map_err(SessionSupervisorError::Reducer)
+    }
+
+    /// Authenticated generation-jump counterpart to normal client
+    /// replacement. The catch-up proof remains opaque and is consumed once.
+    pub(super) fn install_prepared_client_catch_up<T, E>(
+        &mut self,
+        catch_up: GenerationCatchUp,
+        prepare: impl FnOnce(Vec<SessionEffect>) -> Result<T, E>,
+    ) -> Result<Result<(T, ClientReplacementCommit), E>, SessionSupervisorError> {
+        self.require_healthy()?;
+        self.model
+            .install_prepared_client_catch_up(catch_up, prepare)
+            .map(|result| result.map(|prepared| (prepared, ClientReplacementCommit)))
+            .map_err(SessionSupervisorError::Reducer)
+    }
+
+    /// Local-OPEN counterpart to the replacement prepare/commit seam. The
+    /// adapter callback receives the final local-flow authority and exact OPEN
+    /// ownership needed to create its port pair plus self-owned FIFO
+    /// reservation before adapter success makes the reducer commit infallible.
+    pub(super) fn install_prepared_client_local_open<T, E>(
+        &mut self,
+        leg: CommittedLeg,
+        target: crate::shared::TargetAddr,
+        prepare: impl FnOnce(PreparedLocalOpenInput) -> Result<T, PreparedLocalOpenAdapterRejection<E>>,
+    ) -> Result<
+        Result<ReducerCommittedLocalOpen<T>, PreparedLocalOpenAdapterFailure<E>>,
+        PreparedClientLocalOpenSupervisorFailure,
+    > {
+        if let Err(error) = self.require_healthy() {
+            return Err(PreparedClientLocalOpenSupervisorFailure {
+                target,
+                error,
+                block: None,
+            });
+        }
+        match self
+            .model
+            .install_prepared_client_local_open(leg, target, prepare)
+        {
+            Ok(Ok(committed)) => {
+                self.invalidate_owner_catch_up_permit();
+                Ok(Ok(committed))
+            }
+            Ok(Err(adapter)) => Ok(Err(adapter)),
+            Err(failure) => {
+                let (target, error) = failure.into_parts();
+                let block = ReducerAdmissionBlock::from_error(&error);
+                Err(PreparedClientLocalOpenSupervisorFailure {
+                    target,
+                    error: SessionSupervisorError::Reducer(error),
+                    block,
+                })
+            }
+        }
     }
 
     pub(crate) fn owner_pending_work_bound(&self) -> Option<usize> {
@@ -458,113 +981,121 @@ impl SessionSupervisor {
         })
     }
 
-    /// Mints the only production TCP source factory for this session. The
-    /// session-global byte/segment bounds and per-flow segment bound are
-    /// derived from the reducer itself; callers may select only a smaller
-    /// per-flow byte/channel shape. A rejected construction leaves the one-shot
-    /// claim available for a corrected configuration.
-    pub(crate) fn mint_tcp_port_factory(
-        &mut self,
-        config: FlowPortConfig,
-    ) -> Result<ResumableTcpPortFactory, TcpPortFactoryMintError> {
-        self.mint_tcp_port_factory_in_phase(config, SessionPhase::Active)
+    /// Seal all factory clones before await; existing ports still drain through their drivers.
+    pub(super) fn close_tcp_factory_admission(&mut self) -> TcpFactoryAdmissionClose {
+        match std::mem::replace(
+            &mut self.tcp_factory_admission,
+            TcpFactoryAdmissionState::Closed,
+        ) {
+            TcpFactoryAdmissionState::Unminted => TcpFactoryAdmissionClose::ClosedNow,
+            TcpFactoryAdmissionState::Minted(mut admission) => admission.close(),
+            TcpFactoryAdmissionState::Closed => TcpFactoryAdmissionClose::AlreadyClosed,
+        }
     }
 
-    /// Initial acceptance loss constructs OwnerTarget only after the exact
-    /// leg has already moved this pristine session to Legless. This narrow
-    /// entry preserves every ordinary factory invariant while avoiding a
-    /// global relaxation of Active-only construction.
-    pub(super) fn mint_tcp_port_factory_for_legless_bootstrap(
-        &mut self,
-        config: FlowPortConfig,
-    ) -> Result<ResumableTcpPortFactory, TcpPortFactoryMintError> {
-        self.mint_tcp_port_factory_in_phase(config, SessionPhase::Legless)
-    }
-
-    fn mint_tcp_port_factory_in_phase(
-        &mut self,
-        config: FlowPortConfig,
-        required_phase: SessionPhase,
-    ) -> Result<ResumableTcpPortFactory, TcpPortFactoryMintError> {
-        if self.tcp_factory_origin.is_some() {
-            return Err(TcpPortFactoryMintError::AlreadyMinted);
-        }
-        if self.poisoned {
-            return Err(TcpPortFactoryMintError::PoisonedSupervisor);
-        }
-        let snapshot = self.model.snapshot();
-        let client_replay = snapshot.replay_usage(Direction::ClientToTarget);
-        let target_replay = snapshot.replay_usage(Direction::TargetToClient);
-        let replay_bytes = client_replay.bytes().saturating_add(target_replay.bytes());
-        let replay_segments = client_replay
-            .segments()
-            .saturating_add(target_replay.segments());
-        if snapshot.phase() != required_phase
-            || snapshot.flow_count() != 0
-            || replay_bytes != 0
-            || replay_segments != 0
-            || snapshot.terminal_tombstones() != 0
-            || snapshot.next_local_flow_id() != Some(1)
-            || snapshot.highest_peer_flow_id() != 0
-        {
-            return Err(TcpPortFactoryMintError::SessionNotPristine {
-                phase: snapshot.phase(),
-                flow_count: snapshot.flow_count(),
-                replay_bytes,
-                replay_segments,
-                terminal_tombstones: snapshot.terminal_tombstones(),
-                next_local_flow_id: snapshot.next_local_flow_id(),
-                highest_peer_flow_id: snapshot.highest_peer_flow_id(),
-            });
-        }
-        let direction = self.model.role().local_send_direction();
-        let per_flow = self.model.config().send_window();
-        if config.uplink_byte_capacity() > per_flow.max_bytes() {
-            return Err(TcpPortFactoryMintError::PerFlowBytesExceedReducer {
-                requested: config.uplink_byte_capacity(),
-                available: per_flow.max_bytes(),
-            });
-        }
-        let session = self.model.config().replay_limit(direction);
-        let origin = TcpFactoryOrigin::mint();
-        let factory = ResumableTcpPortFactory::new_bound(
-            config,
-            self.model.session_id(),
-            direction,
-            session.max_bytes(),
-            per_flow.max_segments(),
-            session.max_segments(),
-            origin.clone(),
-        )?;
-        self.tcp_factory_origin = Some(origin);
-        Ok(factory)
+    pub(super) fn tcp_factory_admission_is_closed(&self) -> bool {
+        matches!(self.tcp_factory_admission, TcpFactoryAdmissionState::Closed)
     }
 
     pub(crate) fn apply_command(
         &mut self,
         command: SessionOwnerCommand,
     ) -> Result<Vec<SessionEffect>, SessionSupervisorError> {
+        self.apply_command_observed_inner(command)
+            .map(ReducerObservedApply::into_effects)
+    }
+
+    /// Applies one exact owner command and returns only fixed-size facts that
+    /// were proven after reducer and adapter ownership commit. The private
+    /// gate prevents sibling adapters from treating decoded wire input as
+    /// owner progress evidence.
+    pub(super) fn apply_owner_command_observed(
+        &mut self,
+        command: SessionOwnerCommand,
+        _gate: &OwnerTargetObservedApplyGate,
+    ) -> Result<ReducerObservedApply, SessionSupervisorError> {
+        match command {
+            SessionOwnerCommand::Driver(DriverInput::Data(data)) => {
+                self.apply_owner_data_observed(data)
+            }
+            command => self.apply_command_observed_inner(command),
+        }
+    }
+
+    fn apply_command_observed_inner(
+        &mut self,
+        command: SessionOwnerCommand,
+    ) -> Result<ReducerObservedApply, SessionSupervisorError> {
         self.require_healthy()?;
         match command {
             SessionOwnerCommand::Event(event) => {
-                self.apply_carried_event_command(event, SessionOwnerCommand::Event)
+                self.apply_carried_event_command_observed(event, SessionOwnerCommand::Event)
             }
             SessionOwnerCommand::Driver(DriverInput::Control(event)) => self
-                .apply_carried_event_command(event, |event| {
+                .apply_carried_event_command_observed(event, |event| {
                     SessionOwnerCommand::Driver(DriverInput::Control(event))
                 }),
             SessionOwnerCommand::Driver(input @ DriverInput::Data(_)) => {
-                self.apply_driver_input(input)
+                self.apply_driver_input_observed(input)
+            }
+            SessionOwnerCommand::ClientDriver(input) => {
+                self.apply_client_controller_driver_input_observed(input)
             }
         }
     }
 
+    fn apply_client_controller_driver_input(
+        &mut self,
+        input: ClientControllerDriverInput,
+    ) -> Result<Vec<SessionEffect>, SessionSupervisorError> {
+        self.apply_client_controller_driver_input_observed(input)
+            .map(ReducerObservedApply::into_effects)
+    }
+
+    /// Gated client counterpart to the legacy effects-only driver seam.
+    /// Reducer facts never become visible to a sibling adapter that merely
+    /// possesses a decoded event or transport acknowledgement.
+    pub(super) fn apply_client_driver_input_observed(
+        &mut self,
+        input: ClientControllerDriverInput,
+        _gate: &ClientControllerObservedApplyGate,
+    ) -> Result<ReducerObservedApply, SessionSupervisorError> {
+        self.require_healthy()?;
+        self.apply_client_controller_driver_input_observed(input)
+    }
+    fn apply_client_controller_driver_input_observed(
+        &mut self,
+        input: ClientControllerDriverInput,
+    ) -> Result<ReducerObservedApply, SessionSupervisorError> {
+        let gate = ClientControllerDriverReducerGate::mint();
+        match input.into_inner(&gate) {
+            DriverInput::Control(event) => {
+                self.apply_carried_event_command_observed(event, |event| {
+                    SessionOwnerCommand::ClientDriver(
+                        ClientControllerDriverInput::from_rejected_driver(
+                            DriverInput::Control(event),
+                            &gate,
+                        ),
+                    )
+                })
+            }
+            input @ DriverInput::Data(_) => self.apply_driver_input_observed(input),
+        }
+    }
     fn apply_carried_event_command(
         &mut self,
         event: SessionEvent,
         rebuild: impl FnOnce(SessionEvent) -> SessionOwnerCommand,
     ) -> Result<Vec<SessionEffect>, SessionSupervisorError> {
-        match self.apply_event(event) {
+        self.apply_carried_event_command_observed(event, rebuild)
+            .map(ReducerObservedApply::into_effects)
+    }
+    fn apply_carried_event_command_observed(
+        &mut self,
+        event: SessionEvent,
+        rebuild: impl FnOnce(SessionEvent) -> SessionOwnerCommand,
+    ) -> Result<ReducerObservedApply, SessionSupervisorError> {
+        match self.apply_event_observed_inner(event) {
             Err(SessionSupervisorError::RejectedEvent { block, event }) => {
                 Err(SessionSupervisorError::RejectedCommand {
                     block,
@@ -574,37 +1105,20 @@ impl SessionSupervisor {
             result => result,
         }
     }
-
     pub(crate) fn apply_event(
         &mut self,
         event: SessionEvent,
     ) -> Result<Vec<SessionEffect>, SessionSupervisorError> {
-        self.require_healthy()?;
-        if matches!(event, SessionEvent::LocalData { .. }) {
-            return Err(SessionSupervisorError::UnownedLocalData);
-        }
-        if matches!(
-            event,
-            SessionEvent::ReplacementAttached { .. } | SessionEvent::ReplacementCaughtUp { .. }
-        ) {
-            return Err(SessionSupervisorError::ReplacementProvenanceRequired);
-        }
-        let retry = event.clone();
-        let effects = match self.model.reduce(event) {
-            Ok(effects) => effects,
-            Err(error) => {
-                if let Some(block) = ReducerAdmissionBlock::from_error(&error) {
-                    return Err(SessionSupervisorError::RejectedEvent {
-                        block,
-                        event: Box::new(retry),
-                    });
-                }
-                return Err(SessionSupervisorError::Reducer(error));
-            }
-        };
-        self.consume_after_model_commit(effects)
+        self.apply_event_observed_inner(event)
+            .map(ReducerObservedApply::into_effects)
     }
-
+    pub(super) fn apply_current_event_observed(
+        &mut self,
+        event: SessionEvent,
+        _gate: &ClientControllerObservedApplyGate,
+    ) -> Result<ReducerObservedApply, SessionSupervisorError> {
+        self.apply_event_observed_inner(event)
+    }
     /// Authenticates one exact classified standby registration while keeping
     /// the owner's attach authority private to this supervisor.
     ///
@@ -876,17 +1390,24 @@ impl SessionSupervisor {
 
         let outcome = leg
             .transact_owner_attach_from_supervisor(received, authority, &mut self.model)?
-            .map_err(SessionSupervisorError::Reducer)?;
+            .map_err(|failure| match failure {
+                super::leg::OwnerModelPreflightError::Existing(source) => {
+                    SessionSupervisorError::Reducer(source)
+                }
+                super::leg::OwnerModelPreflightError::Storage { source, received } => {
+                    SessionSupervisorError::RecoveryEffectStorage { source, received }
+                }
+            })?;
         match outcome {
             OwnerAttachTransaction::Installed {
                 attached,
                 acceptance,
                 recovery,
             } => {
-                // `PreflightedReplacement::install` constructs only visible
-                // activation/replay effects.  Keep the post-CAS half of this
-                // transaction infallible: slot and queue authority must never
-                // be restored after the generation/model commit succeeded.
+                // `PreparedReplacement::install` moves only recovery effects
+                // materialized before the generation CAS. Keep the post-CAS
+                // half of this transaction infallible: slot and queue authority
+                // must never be restored after the generation/model commit.
                 self.invalidate_owner_catch_up_permit();
                 self.owner_active_contract = Some(OwnerActiveContract::from_attached(&attached));
                 Ok(OwnerAttachPublication::Installed {
@@ -944,182 +1465,15 @@ impl SessionSupervisor {
         &mut self,
         input: DriverInput,
     ) -> Result<Vec<SessionEffect>, SessionSupervisorError> {
-        match input {
-            DriverInput::Control(event) => self.apply_event(event),
-            DriverInput::Data(data) => {
-                let (event, mut staging) = data.into_event_and_ownership();
-                let provenance_matches = self
-                    .tcp_factory_origin
-                    .as_ref()
-                    .is_some_and(|expected| staging.matches_factory_origin(expected));
-                if !provenance_matches {
-                    self.poisoned = true;
-                    self.quarantined_uplink
-                        .push(QuarantinedUplinkOwnership::Staging(staging));
-                    return Err(SessionSupervisorError::UplinkFactoryProvenanceMismatch);
-                }
-                let effects = match self.model.reduce(event) {
-                    Ok(effects) => effects,
-                    Err(
-                        source @ (SessionError::ReplayByteBudgetExceeded { .. }
-                        | SessionError::ReplaySegmentBudgetExceeded { .. }),
-                    ) => {
-                        self.poisoned = true;
-                        self.quarantined_uplink
-                            .push(QuarantinedUplinkOwnership::Staging(staging));
-                        return Err(SessionSupervisorError::ReducerReplayCapacityInvariant {
-                            source,
-                        });
-                    }
-                    Err(error) => return Err(SessionSupervisorError::Reducer(error)),
-                };
-                let mut stored = None;
-                let mut visible = Vec::with_capacity(effects.len());
-                for effect in effects {
-                    match effect {
-                        SessionEffect::ReplayStored { receipt } => {
-                            if stored.replace(receipt).is_some() {
-                                self.poisoned = true;
-                                self.quarantined_uplink
-                                    .push(QuarantinedUplinkOwnership::Staging(staging));
-                                return Err(SessionSupervisorError::DuplicateReplayStored);
-                            }
-                        }
-                        effect => visible.push(effect),
-                    }
-                }
-                let Some(stored) = stored else {
-                    self.poisoned = true;
-                    self.quarantined_uplink
-                        .push(QuarantinedUplinkOwnership::Staging(staging));
-                    return Err(SessionSupervisorError::MissingReplayStored);
-                };
-                let ownership = match staging.bind_replay(stored) {
-                    Ok(ownership) => ownership,
-                    Err(error) => {
-                        self.poisoned = true;
-                        self.quarantined_uplink
-                            .push(QuarantinedUplinkOwnership::Staging(staging));
-                        return Err(SessionSupervisorError::FlowPort(error));
-                    }
-                };
-                let provenance_matches = self
-                    .tcp_factory_origin
-                    .as_ref()
-                    .is_some_and(|expected| ownership.matches_factory_origin(expected));
-                if !provenance_matches {
-                    self.poisoned = true;
-                    self.quarantined_uplink
-                        .push(QuarantinedUplinkOwnership::Replay(ownership));
-                    return Err(SessionSupervisorError::UplinkFactoryProvenanceMismatch);
-                }
-                let key = ReplayExtentKey::of(&ownership);
-                if self.uplink_replay.contains_key(&key) {
-                    self.poisoned = true;
-                    self.quarantined_uplink
-                        .push(QuarantinedUplinkOwnership::Replay(ownership));
-                    return Err(SessionSupervisorError::DuplicateReplayExtent);
-                }
-                let previous = self.uplink_replay.insert(key, ownership);
-                debug_assert!(previous.is_none());
-                self.consume_after_model_commit(visible)
-            }
-        }
+        self.apply_driver_input_observed(input)
+            .map(ReducerObservedApply::into_effects)
     }
 
     fn require_healthy(&self) -> Result<(), SessionSupervisorError> {
-        if self.poisoned {
+        if self.poisoned || self.ordinary_effects.is_entered_or_transferred() {
             return Err(SessionSupervisorError::PoisonedOwnershipInvariant);
         }
         Ok(())
-    }
-
-    fn consume_after_model_commit(
-        &mut self,
-        effects: Vec<SessionEffect>,
-    ) -> Result<Vec<SessionEffect>, SessionSupervisorError> {
-        match self.consume_internal_receipts(effects) {
-            Ok(visible) => {
-                self.invalidate_owner_catch_up_permit();
-                Ok(visible)
-            }
-            Err(error) => {
-                self.poisoned = true;
-                self.owner_catch_up_permit = None;
-                Err(error)
-            }
-        }
-    }
-
-    fn invalidate_owner_catch_up_permit(&mut self) {
-        let snapshot = self.model.snapshot();
-        if self
-            .owner_catch_up_permit
-            .as_ref()
-            .is_some_and(|permit| !permit.matches_current(snapshot))
-        {
-            self.owner_catch_up_permit = None;
-        }
-    }
-
-    fn consume_internal_receipts(
-        &mut self,
-        effects: Vec<SessionEffect>,
-    ) -> Result<Vec<SessionEffect>, SessionSupervisorError> {
-        let mut visible = Vec::with_capacity(effects.len());
-        for effect in effects {
-            match effect {
-                SessionEffect::ReplayStored { .. } => {
-                    return Err(SessionSupervisorError::UnownedReplayStored);
-                }
-                SessionEffect::ReplayAcknowledged { receipt } => {
-                    let candidates = self
-                        .uplink_replay
-                        .iter_mut()
-                        .filter(|(key, _)| {
-                            key.flow_id == receipt.flow_id() && key.direction == receipt.direction()
-                        })
-                        .map(|(key, ownership)| {
-                            ownership
-                                .release_after_reducer_ack(&receipt)
-                                .map(|released| (*key, released))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    for (key, released) in candidates {
-                        if released {
-                            self.uplink_replay.remove(&key);
-                        }
-                    }
-                }
-                SessionEffect::SessionExpired => {
-                    // This effect is emitted only after this exact reducer
-                    // terminally clears every flow and replay window. Dropping
-                    // the matching adapter ownership releases both per-flow
-                    // and session-global byte permits in the same owner turn.
-                    self.uplink_replay.clear();
-                    visible.push(SessionEffect::SessionExpired);
-                }
-                effect @ SessionEffect::FlowFinished { flow_id, .. } => {
-                    let candidates = self
-                        .uplink_replay
-                        .keys()
-                        .copied()
-                        .filter(|key| key.flow_id == flow_id)
-                        .collect::<Vec<_>>();
-                    for key in candidates {
-                        let ownership = self
-                            .uplink_replay
-                            .get_mut(&key)
-                            .ok_or(SessionSupervisorError::ReplayExtentDisappeared)?;
-                        ownership.release_after_reducer_terminal(&effect)?;
-                        self.uplink_replay.remove(&key);
-                    }
-                    visible.push(effect);
-                }
-                effect => visible.push(effect),
-            }
-        }
-        Ok(visible)
     }
 }
 
@@ -1130,11 +1484,48 @@ impl SessionSupervisor {
 /// returning. A successful CAS is followed only by infallible model and
 /// supervisor construction, after which this value is permanently consumed.
 pub(crate) struct PendingOwnerBootstrap {
-    config: SessionConfig,
-    authority: Option<AttachAuthority>,
+    state: Option<PendingOwnerBootstrapState>,
+}
+
+struct PendingOwnerBootstrapState {
+    session: PendingOwnerBootstrapSession,
+    authority: AttachAuthority,
+}
+
+enum PendingOwnerBootstrapSession {
+    Proven(OwnerSessionCapacityPlan),
+    Unproven(SessionConfig),
+}
+
+impl PendingOwnerBootstrapSession {
+    const fn session_config(&self) -> SessionConfig {
+        match self {
+            Self::Proven(plan) => plan.session_config(),
+            Self::Unproven(config) => *config,
+        }
+    }
+
+    const fn replay_storage(&self) -> Option<ReplayStoragePlan> {
+        match self {
+            Self::Proven(plan) => Some(plan.replay_storage()),
+            Self::Unproven(_) => None,
+        }
+    }
 }
 
 impl PendingOwnerBootstrap {
+    #[cfg(test)]
+    fn authority_generation_for_test(&self) -> Option<u64> {
+        self.state
+            .as_ref()
+            .map(|state| state.authority.current_generation())
+    }
+
+    #[cfg(test)]
+    const fn is_completed_for_test(&self) -> bool {
+        self.state.is_none()
+    }
+
     #[allow(
         clippy::result_large_err,
         reason = "bootstrap rejection returns the exact inbound capability and any unreleased queue reservation"
@@ -1145,7 +1536,7 @@ impl PendingOwnerBootstrap {
         received: LegBoundFrame,
         queue: &mut LegOutboundQueue,
     ) -> Result<PendingInitialOwnerBootstrapPublication, InitialOwnerBootstrapAcceptFailure> {
-        if self.authority.is_none() {
+        if self.state.is_none() {
             return Err(InitialOwnerBootstrapAcceptFailure::new(
                 received,
                 InitialOwnerBootstrapAcceptErrorKind::AlreadyCompleted,
@@ -1179,7 +1570,7 @@ impl PendingOwnerBootstrap {
                 InitialOwnerBootstrapAcceptErrorKind::EndpointLost,
             ));
         }
-        let Some(authority) = self.authority.take() else {
+        let Some(state) = self.state.take() else {
             return Err(Self::release_failed_reservation(
                 queue,
                 reservation,
@@ -1188,12 +1579,12 @@ impl PendingOwnerBootstrap {
             ));
         };
         let authenticated = match leg
-            .authenticate_initial_owner_attach_preserving(received, &authority)
+            .authenticate_initial_owner_attach_preserving(received, &state.authority)
         {
             Ok(authenticated) => authenticated,
             Err(failure) => {
                 let (received, source) = failure.into_parts();
-                self.authority = Some(authority);
+                self.state = Some(state);
                 let kind = match source {
                     LegProvenanceError::WrongLeg => InitialOwnerBootstrapAcceptErrorKind::WrongLeg,
                     LegProvenanceError::Rejected => InitialOwnerBootstrapAcceptErrorKind::Rejected,
@@ -1206,17 +1597,24 @@ impl PendingOwnerBootstrap {
                 ));
             }
         };
-        let (model, attached, acceptance) = authenticated.into_owner_parts(self.config);
+        let installed_replay_storage = state.session.replay_storage();
+        let (model, attached, acceptance) =
+            authenticated.into_owner_parts(state.session.session_config());
         let owner_active_contract = OwnerActiveContract::from_attached(&attached);
         let supervisor = SessionSupervisor {
             model,
-            attach_authority: Some(authority),
+            installed_replay_storage,
+            attach_authority: Some(state.authority),
             owner_active_contract: Some(owner_active_contract),
             owner_catch_up_permit: None,
             tcp_factory_origin: None,
-            uplink_replay: BTreeMap::new(),
+            tcp_factory_admission: TcpFactoryAdmissionState::Unminted,
+            uplink_replay: driver_input::UplinkStorage::default(),
             poisoned: false,
-            quarantined_uplink: Vec::new(),
+            receipt_journal: None,
+            ordinary_effects: owner_observation::OrdinaryEffectStorage::Uninstalled,
+            #[cfg(test)]
+            owner_data_unwind_once: None,
         };
         Ok(PendingInitialOwnerBootstrapPublication {
             supervisor,
@@ -1247,7 +1645,7 @@ impl fmt::Debug for PendingOwnerBootstrap {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PendingOwnerBootstrap")
-            .field("completed", &self.authority.is_none())
+            .field("completed", &self.state.is_none())
             .finish_non_exhaustive()
     }
 }
@@ -1576,8 +1974,22 @@ impl LeglessOwnerSessionBootstrap {
         self.high_water.generation
     }
 
-    pub(super) fn into_parts(self) -> (SessionSupervisor, PendingOwnerHighWater) {
+    pub(super) fn into_legless_target_install_parts(
+        self,
+        _gate: &OwnerTargetLeglessBootstrapInstallGate,
+    ) -> (SessionSupervisor, PendingOwnerHighWater) {
         (self.supervisor, self.high_water)
+    }
+
+    pub(super) fn from_legless_target_install_parts(
+        supervisor: SessionSupervisor,
+        high_water: PendingOwnerHighWater,
+        _gate: &OwnerTargetLeglessBootstrapInstallGate,
+    ) -> Self {
+        Self {
+            supervisor,
+            high_water,
+        }
     }
 }
 
@@ -1614,6 +2026,56 @@ pub(crate) struct OwnerSessionBootstrap {
 }
 
 impl OwnerSessionBootstrap {
+    /// Private install decomposition. The gate can be minted only by the
+    /// OwnerTarget module, which immediately rebinds every part to one executor
+    /// identity before returning to a physical caller.
+    pub(super) fn into_target_install_parts(
+        self,
+        _gate: &OwnerTargetInitialBootstrapInstallGate,
+    ) -> (SessionSupervisor, AttachedLeg, AttachAcceptanceEnqueued) {
+        let Self {
+            supervisor,
+            attached,
+            acceptance,
+        } = self;
+        (supervisor, attached, acceptance)
+    }
+
+    /// Reassembles exact ownership after a fallible Target construction. This
+    /// is gated by the same private install transaction and cannot construct a
+    /// bootstrap from scalar transport data.
+    pub(super) fn from_target_install_parts(
+        supervisor: SessionSupervisor,
+        attached: AttachedLeg,
+        acceptance: AttachAcceptanceEnqueued,
+        _gate: &OwnerTargetInitialBootstrapInstallGate,
+    ) -> Self {
+        Self {
+            supervisor,
+            attached,
+            acceptance,
+        }
+    }
+
+    /// Explicit legacy deterministic-harness decomposition. It retains the
+    /// historical behavior in the non-physical harness only; new owner roots
+    /// must use `OwnerTargetExecutor::from_initial_bootstrap`.
+    #[cfg(test)]
+    pub(super) fn into_legacy_parts(
+        self,
+        _gate: &LegacyOwnerBootstrapDecompositionGate,
+    ) -> (SessionSupervisor, AttachedLeg) {
+        let Self {
+            supervisor,
+            attached,
+            acceptance,
+        } = self;
+        drop(acceptance);
+        (supervisor, attached)
+    }
+
+    /// Test-only raw decomposition for pre-existing reducer fixtures.
+    #[cfg(test)]
     pub(crate) fn into_parts(self) -> (SessionSupervisor, AttachedLeg) {
         let Self {
             supervisor,
@@ -1636,12 +2098,14 @@ impl fmt::Debug for OwnerSessionBootstrap {
 }
 
 /// Fully installed initial client session retaining the exact accepted leg.
+#[cfg(test)]
 pub(crate) struct ClientSessionBootstrap {
     supervisor: SessionSupervisor,
     attached: AttachedLeg,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum ClientBootstrapErrorKind {
     WrongQueue,
     EndpointLost,
@@ -1653,11 +2117,13 @@ pub(crate) enum ClientBootstrapErrorKind {
 /// leg so the outer transport actor can pair it with its terminal fact.
 #[derive(Error)]
 #[error("client bootstrap rejected a terminal transport endpoint")]
+#[cfg(test)]
 pub(crate) struct ClientBootstrapError {
     kind: ClientBootstrapErrorKind,
     accepted: AcceptedInitialAttach,
 }
 
+#[cfg(test)]
 impl ClientBootstrapError {
     fn activation(failure: AcceptedInitialAttachActivationFailure) -> Self {
         let kind = match failure.kind() {
@@ -1687,18 +2153,21 @@ impl ClientBootstrapError {
     }
 }
 
+#[cfg(test)]
 impl fmt::Debug for ClientBootstrapError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ClientBootstrapError([REDACTED])")
     }
 }
 
+#[cfg(test)]
 impl ClientSessionBootstrap {
     pub(crate) fn into_parts(self) -> (SessionSupervisor, AttachedLeg) {
         (self.supervisor, self.attached)
     }
 }
 
+#[cfg(test)]
 impl fmt::Debug for ClientSessionBootstrap {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1753,6 +2222,17 @@ impl fmt::Debug for SessionSupervisor {
 
 #[derive(Debug, Error)]
 pub(crate) enum SessionSupervisorError {
+    #[error("uplink storage admission exceeds its checked replay-node bound")]
+    UplinkStorageCapacity { input: DriverInput },
+    #[error("uplink storage admission has an unrepresentable backing Layout")]
+    UplinkStorageLayout { input: DriverInput },
+    #[error("uplink storage preparation could not reserve original backing")]
+    UplinkStorageReserve { input: DriverInput },
+    #[error("recovery effect storage rejected before generation commit: {source}")]
+    RecoveryEffectStorage {
+        source: SessionError,
+        received: LegBoundFrame,
+    },
     #[error("session supervisor is fail-closed after a post-model ownership invariant failure")]
     PoisonedOwnershipInvariant,
     #[error("session reducer rejected an owned command: {0}")]
@@ -1820,10 +2300,24 @@ pub(crate) enum SessionSupervisorError {
     ReplacementEndpointLost,
     #[error("LocalData did not emit its exact ReplayStored receipt")]
     MissingReplayStored,
+    #[error("DATA transaction lost its exact staging or replay custody")]
+    DataCustodyInvariant,
     #[error("LocalData emitted more than one ReplayStored receipt")]
     DuplicateReplayStored,
     #[error("a raw reducer path emitted ReplayStored outside owned DATA handling")]
     UnownedReplayStored,
+    #[error("one reducer turn emitted more than one positive replay ACK observation")]
+    DuplicateReplayAcknowledgedObservation,
+    #[error("one reducer turn emitted more than one committed sink-frontier observation")]
+    DuplicateSinkAcceptedObservation,
+    #[error("one reducer turn emitted more than one replay-outstanding observation")]
+    DuplicateReplayOutstandingObservation,
+    #[error("one reducer turn emitted more than one flow-terminal observation")]
+    DuplicateFlowTerminalObservation,
+    #[error("one reducer turn emitted more than one session-expired observation")]
+    DuplicateSessionExpiredObservation,
+    #[error("a positive replay ACK observation reported zero released reducer bytes")]
+    InvalidReplayAcknowledgedDelta,
     #[error("two owned DATA commands produced the same replay extent")]
     DuplicateReplayExtent,
     #[error("a replay extent disappeared during terminal cleanup")]
@@ -1833,6 +2327,9 @@ pub(crate) enum SessionSupervisorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::owned_upstream::client_controller::{
+        ClientControllerBootstrapErrorKind, ClientSessionController,
+    };
     use crate::owned_upstream::leg::{
         AttachResponse, BoundInbound, LegTransportReporter, LegTransportTerminalReason,
     };
@@ -2074,8 +2571,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let received = owner_leg.receive_delivery(request_delivery).unwrap();
-        let mut pending_owner =
-            SessionSupervisor::prepare_owner(session_config(), standby_authority(1));
+        let mut pending_owner = SessionSupervisor::prepare_owner_unproven_for_test(
+            session_config(),
+            standby_authority(1),
+        );
         let (owner, owner_active) = pending_owner
             .accept(owner_leg.established_leg(), received, &mut owner_queue)
             .unwrap()
@@ -2094,10 +2593,13 @@ mod tests {
             .unwrap();
         let response = client_leg.receive_delivery(acceptance_delivery).unwrap();
         let accepted = awaiting.validate_response(&client_queue, response).unwrap();
-        let (client, client_active) =
-            SessionSupervisor::bootstrap_client(session_config(), accepted, &mut client_queue)
-                .unwrap()
-                .into_parts();
+        let (client, client_active) = SessionSupervisor::bootstrap_client_for_test(
+            session_config(),
+            accepted,
+            &mut client_queue,
+        )
+        .unwrap()
+        .into_parts();
         (owner, owner_active, client, client_active, reporter)
     }
 
@@ -2708,6 +3210,82 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the test verifies exact prepared OPEN ownership is returned inline"
+    )]
+    fn prepared_local_open_adopts_one_factory_pair_only_after_adapter_success() {
+        let leg = committed_leg();
+        let model = SessionModel::new(SessionRole::Client, session_config(), leg);
+        let mut supervisor = SessionSupervisor::new(model);
+        let before = supervisor.snapshot();
+        let rejected_ownership = Bytes::from(vec![0x6d; 19]);
+        let rejected_ptr = rejected_ownership.as_ptr();
+
+        let rejected = supervisor
+            .install_prepared_client_local_open(leg, target(), |input| {
+                Err::<(), _>(input.reject(rejected_ownership))
+            })
+            .expect("healthy supervisor reaches adapter preparation")
+            .expect_err("adapter rejection is not a reducer commit");
+        let (_target, input, rejected) = rejected.into_parts();
+        assert_eq!(rejected.as_ptr(), rejected_ptr);
+        assert!(matches!(input.into_parts().1.record(), Record::Open { .. }));
+        assert_eq!(supervisor.snapshot(), before);
+
+        let factory = supervisor
+            .mint_tcp_port_factory(FlowPortConfig::new(8, 2, 2, 2).unwrap())
+            .expect("the exact session factory mints once");
+        let committed = supervisor
+            .install_prepared_client_local_open(leg, target(), |input| {
+                let (local_flow, open_frame) = input.into_parts();
+                match factory.open_flow(local_flow) {
+                    Ok(pair) => Ok((pair, open_frame)),
+                    Err(error) => {
+                        Err(PreparedLocalOpenInput::from_parts(local_flow, open_frame)
+                            .reject(error))
+                    }
+                }
+            })
+            .expect("healthy supervisor reaches adapter preparation")
+            .expect("the prevalidated factory pair is created");
+        let (((flow, driver), open_frame), local_flow) = committed.into_parts();
+
+        assert_eq!(supervisor.snapshot().session.flow_count(), 1);
+        assert_eq!(local_flow, flow.local_flow());
+        assert!(matches!(
+            open_frame.record(),
+            Record::Open { flow_id, .. }
+                if *flow_id == flow.local_flow().flow_id()
+        ));
+        drop(flow);
+        drop(driver);
+    }
+
+    #[test]
+    fn closing_factory_admission_before_mint_is_irreversible() {
+        let leg = committed_leg();
+        let model = SessionModel::new(SessionRole::Client, session_config(), leg);
+        let mut supervisor = SessionSupervisor::new(model);
+
+        assert_eq!(
+            supervisor.close_tcp_factory_admission(),
+            TcpFactoryAdmissionClose::ClosedNow,
+        );
+        assert_eq!(
+            supervisor.close_tcp_factory_admission(),
+            TcpFactoryAdmissionClose::AlreadyClosed,
+        );
+        assert_eq!(
+            supervisor
+                .mint_tcp_port_factory(FlowPortConfig::new(8, 2, 2, 2).unwrap())
+                .unwrap_err(),
+            TcpPortFactoryMintError::FactoryAdmissionClosed,
+        );
+        assert!(supervisor.tcp_factory_origin.is_none());
+    }
+
+    #[test]
     fn derived_factory_capacity_failure_does_not_consume_the_one_shot_claim() {
         let leg = committed_leg();
         let too_many_segments = tokio::sync::Semaphore::MAX_PERMITS.checked_add(1).unwrap();
@@ -2830,431 +3408,7 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn data_from_unbound_test_factory_is_quarantined_before_reducer_mutation() {
-        let leg = committed_leg();
-        let model = SessionModel::new(SessionRole::Client, session_config(), leg);
-        let mut supervisor = SessionSupervisor::new(model);
-        let local_flow = opened_flow(&mut supervisor, leg);
-        let raw = ResumableTcpPortFactory::new_unbound_for_test(
-            FlowPortConfig::new(8, 2, 2, 2).unwrap(),
-            64,
-            8,
-            8,
-        )
-        .unwrap();
-        let (flow, mut driver) = raw.open_flow(local_flow).unwrap();
-        flow.try_send_uplink_with(1, || Bytes::from_static(b"x"))
-            .unwrap();
-        let before = supervisor.snapshot().session;
-
-        assert!(matches!(
-            supervisor.apply_command(SessionOwnerCommand::Driver(
-                driver.try_recv_next().unwrap().unwrap(),
-            )),
-            Err(SessionSupervisorError::UplinkFactoryProvenanceMismatch)
-        ));
-        let poisoned = supervisor.snapshot();
-        assert_eq!(poisoned.session, before);
-        assert!(poisoned.poisoned);
-        assert_eq!(poisoned.uplink_replay_extents, 0);
-        assert_eq!(poisoned.quarantined_uplink_extents, 1);
-        assert_eq!(poisoned.quarantined_uplink_owned_bytes, 1);
-        assert_eq!(raw.session_uplink_owned_bytes(), 1);
-        assert_eq!(raw.session_uplink_owned_segments(), 1);
-        assert_eq!(
-            supervisor
-                .mint_tcp_port_factory(FlowPortConfig::new(8, 2, 2, 2).unwrap())
-                .unwrap_err(),
-            TcpPortFactoryMintError::PoisonedSupervisor
-        );
-
-        drop(supervisor);
-        assert_eq!(raw.session_uplink_owned_bytes(), 0);
-        assert_eq!(raw.session_uplink_owned_segments(), 0);
-    }
-
-    #[test]
-    fn correctly_provenanced_replay_segment_overrun_is_quarantined_and_poisons() {
-        let leg = committed_leg();
-        let config = SessionConfig::new(
-            2,
-            2,
-            TcpWindowLimits::new(8, 2).unwrap(),
-            TcpWindowLimits::new(8, 2).unwrap(),
-            ReplayBudgetLimits::new(8, 1).unwrap(),
-            ReplayBudgetLimits::new(8, 1).unwrap(),
-            ReceiveBudgetLimits::new(16, 4).unwrap(),
-            8,
-        )
-        .unwrap();
-        let model = SessionModel::new(SessionRole::Client, config, leg);
-        let mut supervisor = SessionSupervisor::new(model);
-        let first_factory = supervisor
-            .mint_tcp_port_factory(FlowPortConfig::new(8, 2, 2, 2).unwrap())
-            .unwrap();
-        let second_factory = first_factory
-            .fork_with_independent_ledgers_for_test()
-            .unwrap();
-        let first_flow = opened_flow(&mut supervisor, leg);
-        let second_flow = opened_flow(&mut supervisor, leg);
-        let (first, mut first_driver) = first_factory.open_flow(first_flow).unwrap();
-        let (second, mut second_driver) = second_factory.open_flow(second_flow).unwrap();
-
-        first
-            .try_send_uplink_with(1, || Bytes::from_static(b"a"))
-            .unwrap();
-        supervisor
-            .apply_command(SessionOwnerCommand::Driver(
-                first_driver.try_recv_next().unwrap().unwrap(),
-            ))
-            .unwrap();
-        second
-            .try_send_uplink_with(1, || Bytes::from_static(b"b"))
-            .unwrap();
-
-        assert!(matches!(
-            supervisor.apply_command(SessionOwnerCommand::Driver(
-                second_driver.try_recv_next().unwrap().unwrap(),
-            )),
-            Err(SessionSupervisorError::ReducerReplayCapacityInvariant {
-                source: SessionError::ReplaySegmentBudgetExceeded {
-                    direction: Direction::ClientToTarget,
-                    attempted: 2,
-                    max: 1,
-                }
-            })
-        ));
-        let poisoned = supervisor.snapshot();
-        assert!(poisoned.poisoned);
-        assert_eq!(poisoned.uplink_replay_extents, 1);
-        assert_eq!(poisoned.uplink_replay_owned_bytes, 1);
-        assert_eq!(poisoned.quarantined_uplink_extents, 1);
-        assert_eq!(poisoned.quarantined_uplink_owned_bytes, 1);
-        assert_eq!(first_factory.session_uplink_owned_segments(), 1);
-        assert_eq!(second_factory.session_uplink_owned_segments(), 1);
-
-        drop(supervisor);
-        assert_eq!(first_factory.session_uplink_owned_segments(), 0);
-        assert_eq!(second_factory.session_uplink_owned_segments(), 0);
-    }
-
-    #[test]
-    fn correctly_provenanced_replay_byte_overrun_is_quarantined_and_poisons() {
-        let leg = committed_leg();
-        let config = SessionConfig::new(
-            2,
-            2,
-            TcpWindowLimits::new(8, 2).unwrap(),
-            TcpWindowLimits::new(8, 2).unwrap(),
-            ReplayBudgetLimits::new(1, 2).unwrap(),
-            ReplayBudgetLimits::new(1, 2).unwrap(),
-            ReceiveBudgetLimits::new(16, 4).unwrap(),
-            8,
-        )
-        .unwrap();
-        let model = SessionModel::new(SessionRole::Client, config, leg);
-        let mut supervisor = SessionSupervisor::new(model);
-        let first_factory = supervisor
-            .mint_tcp_port_factory(FlowPortConfig::new(1, 2, 2, 2).unwrap())
-            .unwrap();
-        let second_factory = first_factory
-            .fork_with_independent_ledgers_for_test()
-            .unwrap();
-        let first_flow = opened_flow(&mut supervisor, leg);
-        let second_flow = opened_flow(&mut supervisor, leg);
-        let (first, mut first_driver) = first_factory.open_flow(first_flow).unwrap();
-        let (second, mut second_driver) = second_factory.open_flow(second_flow).unwrap();
-
-        first
-            .try_send_uplink_with(1, || Bytes::from_static(b"a"))
-            .unwrap();
-        supervisor
-            .apply_command(SessionOwnerCommand::Driver(
-                first_driver.try_recv_next().unwrap().unwrap(),
-            ))
-            .unwrap();
-        second
-            .try_send_uplink_with(1, || Bytes::from_static(b"b"))
-            .unwrap();
-
-        assert!(matches!(
-            supervisor.apply_command(SessionOwnerCommand::Driver(
-                second_driver.try_recv_next().unwrap().unwrap(),
-            )),
-            Err(SessionSupervisorError::ReducerReplayCapacityInvariant {
-                source: SessionError::ReplayByteBudgetExceeded {
-                    direction: Direction::ClientToTarget,
-                    attempted: 2,
-                    max: 1,
-                }
-            })
-        ));
-        let poisoned = supervisor.snapshot();
-        assert!(poisoned.poisoned);
-        assert_eq!(poisoned.uplink_replay_owned_bytes, 1);
-        assert_eq!(poisoned.quarantined_uplink_owned_bytes, 1);
-        assert_eq!(first_factory.session_uplink_owned_bytes(), 1);
-        assert_eq!(second_factory.session_uplink_owned_bytes(), 1);
-
-        drop(supervisor);
-        assert_eq!(first_factory.session_uplink_owned_bytes(), 0);
-        assert_eq!(second_factory.session_uplink_owned_bytes(), 0);
-    }
-
-    #[test]
-    fn terminal_superseded_queued_data_releases_staging_without_poisoning() {
-        let leg = committed_leg();
-        let model = SessionModel::new(SessionRole::Client, session_config(), leg);
-        let mut supervisor = SessionSupervisor::new(model);
-        let factory = port_factory(&mut supervisor);
-        let local_flow = opened_flow(&mut supervisor, leg);
-        let (flow, mut driver) = factory.open_flow(local_flow).unwrap();
-        flow.try_send_uplink_with(1, || Bytes::from_static(b"s"))
-            .unwrap();
-        let queued = driver.try_recv_next().unwrap().unwrap();
-        supervisor
-            .apply_event(SessionEvent::LocalReset {
-                flow: local_flow,
-                reason: ResetReason::LocalAbandon,
-            })
-            .unwrap();
-
-        assert!(matches!(
-            supervisor.apply_command(SessionOwnerCommand::Driver(queued)),
-            Err(SessionSupervisorError::Reducer(SessionError::RetiredFlow(
-                flow_id
-            ))) if flow_id == local_flow.flow_id()
-        ));
-        let snapshot = supervisor.snapshot();
-        assert!(!snapshot.poisoned);
-        assert_eq!(snapshot.uplink_replay_extents, 0);
-        assert_eq!(snapshot.quarantined_uplink_extents, 0);
-        assert_eq!(factory.session_uplink_owned_bytes(), 0);
-        assert_eq!(factory.session_uplink_owned_segments(), 0);
-    }
-
-    #[test]
-    fn dequeued_uplink_ownership_survives_until_reducer_application_ack() {
-        let leg = committed_leg();
-        let model = SessionModel::new(SessionRole::Client, session_config(), leg);
-        let mut supervisor = SessionSupervisor::new(model);
-        let factory = port_factory(&mut supervisor);
-        let local_flow = opened_flow(&mut supervisor, leg);
-        let (flow, mut driver) = factory.open_flow(local_flow).unwrap();
-        let probe = flow.probe();
-
-        flow.try_send_uplink_with(4, || Bytes::from_static(b"data"))
-            .unwrap();
-        let input = driver.try_recv_next().unwrap().unwrap();
-        assert_eq!(probe.snapshot().uplink_owned_bytes(), 4);
-        assert_eq!(factory.session_uplink_owned_bytes(), 4);
-
-        let effects = supervisor
-            .apply_command(SessionOwnerCommand::Driver(input))
-            .unwrap();
-        assert!(effects.iter().any(|effect| matches!(
-            effect,
-            SessionEffect::Transmit(frame)
-                if matches!(frame.record(), Record::Data { payload, .. } if payload.as_ref() == b"data")
-        )));
-        assert_eq!(supervisor.snapshot().uplink_replay_extents, 1);
-        assert_eq!(supervisor.snapshot().uplink_replay_owned_bytes, 4);
-        assert_eq!(probe.snapshot().uplink_owned_bytes(), 4);
-        assert_eq!(factory.session_uplink_owned_bytes(), 4);
-
-        let visible = supervisor
-            .apply_event(SessionEvent::PeerFrame {
-                leg,
-                frame: Frame::try_new(
-                    leg.generation(),
-                    Record::Ack {
-                        flow_id: local_flow.flow_id(),
-                        direction: Direction::ClientToTarget,
-                        next_accepted: ByteOffset::new(4),
-                        final_accepted: false,
-                    },
-                )
-                .unwrap(),
-            })
-            .unwrap();
-        assert!(visible.is_empty());
-        assert_eq!(supervisor.snapshot().uplink_replay_extents, 0);
-        assert_eq!(supervisor.snapshot().uplink_replay_owned_bytes, 0);
-        assert_eq!(probe.snapshot().uplink_owned_bytes(), 0);
-        assert_eq!(factory.session_uplink_owned_bytes(), 0);
-    }
-
-    #[test]
-    fn post_reduce_receipt_mismatch_quarantines_ownership_and_poisons_every_mutator() {
-        let leg = committed_leg();
-        let model = SessionModel::new(SessionRole::Client, session_config(), leg);
-        let mut supervisor = SessionSupervisor::new(model);
-        let factory = port_factory(&mut supervisor);
-        let duplicate_factory = factory.fork_with_independent_ledgers_for_test().unwrap();
-        let local_flow = opened_flow(&mut supervisor, leg);
-        let (first, mut first_driver) = factory.open_flow(local_flow).unwrap();
-        let (second, mut second_driver) = duplicate_factory.open_flow(local_flow).unwrap();
-
-        first
-            .try_send_uplink_with(1, || Bytes::from_static(b"a"))
-            .unwrap();
-        supervisor
-            .apply_command(SessionOwnerCommand::Driver(
-                first_driver.try_recv_next().unwrap().unwrap(),
-            ))
-            .unwrap();
-
-        // A second endpoint for the same capability starts its local source
-        // offset at zero. The reducer has already retained this byte at offset
-        // one before the adapter can detect the mismatched storage receipt.
-        second
-            .try_send_uplink_with(1, || Bytes::from_static(b"b"))
-            .unwrap();
-        assert!(matches!(
-            supervisor.apply_command(SessionOwnerCommand::Driver(
-                second_driver.try_recv_next().unwrap().unwrap(),
-            )),
-            Err(SessionSupervisorError::FlowPort(
-                FlowPortError::UplinkReplayReceiptMismatch
-            ))
-        ));
-
-        let poisoned = supervisor.snapshot();
-        assert!(poisoned.poisoned);
-        assert_eq!(poisoned.uplink_replay_extents, 1);
-        assert_eq!(poisoned.uplink_replay_owned_bytes, 1);
-        assert_eq!(poisoned.quarantined_uplink_extents, 1);
-        assert_eq!(poisoned.quarantined_uplink_owned_bytes, 1);
-        assert_eq!(
-            poisoned
-                .session
-                .replay_usage(Direction::ClientToTarget)
-                .bytes(),
-            2
-        );
-        assert_eq!(first.probe().snapshot().uplink_owned_segments(), 1);
-        assert_eq!(second.probe().snapshot().uplink_owned_segments(), 1);
-        assert_eq!(factory.session_uplink_owned_bytes(), 1);
-        assert_eq!(factory.session_uplink_owned_segments(), 1);
-        assert_eq!(duplicate_factory.session_uplink_owned_bytes(), 1);
-        assert_eq!(duplicate_factory.session_uplink_owned_segments(), 1);
-
-        assert!(matches!(
-            supervisor.apply_event(SessionEvent::LegLost { leg }),
-            Err(SessionSupervisorError::PoisonedOwnershipInvariant)
-        ));
-        assert!(matches!(
-            supervisor.apply_command(SessionOwnerCommand::Event(SessionEvent::LegLost { leg })),
-            Err(SessionSupervisorError::PoisonedOwnershipInvariant)
-        ));
-
-        let transport = binding(0x71);
-        let established = EstablishedLeg::for_authenticated_transport(transport);
-        let request = attach_request(3, 0x71);
-        let pending = established.begin_attach(request);
-        let proof = credentials().prove(&request, &transport).unwrap();
-        let committed = authority(2)
-            .verify_and_commit(&request, &transport, &proof)
-            .unwrap();
-        let AttachResponse::Accepted(attached) = pending
-            .validate_response(established.bind_received_frame(committed.attach_accepted_frame()))
-            .unwrap()
-        else {
-            panic!("the exact correlated acceptance changed response kind");
-        };
-        assert!(matches!(
-            supervisor.install_attached_leg(&attached),
-            Err(SessionSupervisorError::PoisonedOwnershipInvariant)
-        ));
-
-        let owner_transport = binding(0x72);
-        let owner_leg = EstablishedLeg::for_authenticated_transport(owner_transport);
-        let owner_request = attach_request(3, 0x72);
-        let owner_proof = credentials()
-            .prove(&owner_request, &owner_transport)
-            .unwrap();
-        assert!(matches!(
-            supervisor.accept_owner_attach_for_test(
-                &owner_leg,
-                owner_leg.bind_received_frame(owner_request.to_attach_frame(owner_proof)),
-            ),
-            Err(SessionSupervisorError::PoisonedOwnershipInvariant)
-        ));
-
-        assert_eq!(supervisor.snapshot(), poisoned);
-        drop(supervisor);
-        assert_eq!(factory.session_uplink_owned_bytes(), 0);
-        assert_eq!(factory.session_uplink_owned_segments(), 0);
-        assert_eq!(duplicate_factory.session_uplink_owned_bytes(), 0);
-        assert_eq!(duplicate_factory.session_uplink_owned_segments(), 0);
-    }
-
-    #[test]
-    fn duplicate_replay_extent_keeps_the_original_ownership_and_quarantines_the_new_one() {
-        let leg = committed_leg();
-        let model = SessionModel::new(SessionRole::Client, session_config(), leg);
-        let mut supervisor = SessionSupervisor::new(model);
-        let factory = port_factory(&mut supervisor);
-        let local_flow = opened_flow(&mut supervisor, leg);
-        let (flow, mut driver) = factory.open_flow(local_flow).unwrap();
-
-        flow.try_send_uplink_with(1, || Bytes::from_static(b"a"))
-            .unwrap();
-        supervisor
-            .apply_command(SessionOwnerCommand::Driver(
-                driver.try_recv_next().unwrap().unwrap(),
-            ))
-            .unwrap();
-
-        // Fault-inject the adapter index only: the ownership itself remains
-        // the reducer's first 0..1 extent. The next valid DATA produces 1..2,
-        // exercising the duplicate-key branch without constructing permits
-        // outside the factory.
-        let first_key = ReplayExtentKey {
-            flow_id: local_flow.flow_id(),
-            direction: Direction::ClientToTarget,
-            start: ByteOffset::new(0),
-            end: ByteOffset::new(1),
-        };
-        let original = supervisor.uplink_replay.remove(&first_key).unwrap();
-        let duplicate_key = ReplayExtentKey {
-            start: ByteOffset::new(1),
-            end: ByteOffset::new(2),
-            ..first_key
-        };
-        assert!(
-            supervisor
-                .uplink_replay
-                .insert(duplicate_key, original)
-                .is_none()
-        );
-
-        flow.try_send_uplink_with(1, || Bytes::from_static(b"b"))
-            .unwrap();
-        assert!(matches!(
-            supervisor.apply_command(SessionOwnerCommand::Driver(
-                driver.try_recv_next().unwrap().unwrap(),
-            )),
-            Err(SessionSupervisorError::DuplicateReplayExtent)
-        ));
-
-        let retained = supervisor.uplink_replay.get(&duplicate_key).unwrap();
-        assert_eq!(retained.start(), ByteOffset::new(0));
-        assert_eq!(retained.end(), ByteOffset::new(1));
-        let poisoned = supervisor.snapshot();
-        assert!(poisoned.poisoned);
-        assert_eq!(poisoned.uplink_replay_extents, 1);
-        assert_eq!(poisoned.quarantined_uplink_extents, 1);
-        assert_eq!(poisoned.uplink_replay_owned_bytes, 1);
-        assert_eq!(poisoned.quarantined_uplink_owned_bytes, 1);
-        assert_eq!(factory.session_uplink_owned_bytes(), 2);
-        assert_eq!(factory.session_uplink_owned_segments(), 2);
-
-        drop(supervisor);
-        assert_eq!(factory.session_uplink_owned_bytes(), 0);
-        assert_eq!(factory.session_uplink_owned_segments(), 0);
-    }
+    mod replay_receipts;
 
     #[test]
     fn raw_local_data_cannot_bypass_the_owned_driver_command() {
@@ -3345,9 +3499,16 @@ mod tests {
         drop((attached, established, terminal));
     }
 
-    #[test]
-    fn terminal_initial_client_leg_is_rejected_before_bootstrap() {
-        let transport = binding(0x73);
+    struct InitialClientBootstrapFixture {
+        config: SessionConfig,
+        accepted: AcceptedInitialAttach,
+        client: LegIo,
+        client_queue: LegOutboundQueue,
+        reporter: LegTransportReporter,
+    }
+
+    fn initial_client_bootstrap_fixture(exporter: u8) -> InitialClientBootstrapFixture {
+        let transport = binding(exporter);
         let limits = LegIoLimits::new(4_096, 8, 32_768, 8, 32_768).unwrap();
         let (mut client, reporter) = LegIo::for_authenticated_transport_with_reporter(
             LegId::A,
@@ -3357,7 +3518,7 @@ mod tests {
         );
         let mut owner =
             LegIo::for_authenticated_transport(LegId::A, LegEndpointRole::Owner, transport, limits);
-        let request = attach_request(2, 0x73);
+        let request = attach_request(2, exporter);
         let proof = credentials().prove(&request, &transport).unwrap();
         let pending = client
             .established_leg()
@@ -3382,7 +3543,8 @@ mod tests {
         wire.advance_idle_to(SimTime::ZERO).unwrap();
         let delivery = wire.try_recv_next(owner.inbound_route()).unwrap().unwrap();
         let received = owner.receive_delivery(delivery).unwrap();
-        let mut pending_owner = SessionSupervisor::prepare_owner(session_config(), authority(1));
+        let mut pending_owner =
+            SessionSupervisor::prepare_owner_unproven_for_test(session_config(), authority(1));
         let _owner_bootstrap = pending_owner
             .accept(owner.established_leg(), received, &mut owner_queue)
             .unwrap()
@@ -3397,24 +3559,139 @@ mod tests {
         let delivery = wire.try_recv_next(client.inbound_route()).unwrap().unwrap();
         let response = client.receive_delivery(delivery).unwrap();
         let accepted = awaiting.validate_response(&client_queue, response).unwrap();
+
+        InitialClientBootstrapFixture {
+            config: session_config(),
+            accepted,
+            client,
+            client_queue,
+            reporter,
+        }
+    }
+
+    #[test]
+    fn terminal_initial_client_leg_is_rejected_before_bootstrap() {
+        let InitialClientBootstrapFixture {
+            config,
+            accepted,
+            client,
+            client_queue,
+            reporter,
+        } = initial_client_bootstrap_fixture(0x73);
         let terminal = reporter.report(LegTransportTerminalReason::Reset).unwrap();
 
-        let error = match SessionSupervisor::bootstrap_client(
-            session_config(),
+        let error = match ClientSessionController::bootstrap_initial(
+            config,
             accepted,
-            &mut client_queue,
+            client,
+            client_queue,
         ) {
             Ok(_) => panic!("terminal initial leg incorrectly bootstrapped an active client"),
             Err(error) => error,
         };
-        assert_eq!(error.kind(), ClientBootstrapErrorKind::EndpointLost);
-        assert_eq!(format!("{error:?}"), "ClientBootstrapError([REDACTED])");
-        let accepted = error.into_accepted();
+        assert_eq!(
+            error.kind(),
+            ClientControllerBootstrapErrorKind::EndpointLost
+        );
+        assert_eq!(
+            format!("{error:?}"),
+            "ClientControllerBootstrapFailure([REDACTED])"
+        );
+        let (returned_config, accepted, client, client_queue) = error.into_parts();
+        assert_eq!(returned_config, config);
         assert!(!accepted.queue_is_live());
 
         // The rejected bootstrap returns its exact non-cloneable capability,
         // while the independent terminal fact remains linear and fail-closed.
-        drop((client, owner, accepted, terminal));
+        drop((client, client_queue, accepted, terminal));
+    }
+
+    #[test]
+    fn terminal_initial_acceptance_rejects_an_unrelated_live_bundle_as_wrong_queue() {
+        let InitialClientBootstrapFixture {
+            config,
+            accepted,
+            client,
+            client_queue,
+            reporter,
+        } = initial_client_bootstrap_fixture(0x74);
+        let terminal = reporter.report(LegTransportTerminalReason::Reset).unwrap();
+        let unrelated_transport = binding(0x75);
+        let limits = LegIoLimits::new(4_096, 8, 32_768, 8, 32_768).unwrap();
+        let unrelated = LegIo::for_authenticated_transport(
+            LegId::B,
+            LegEndpointRole::Client,
+            unrelated_transport,
+            limits,
+        );
+        let unrelated_queue =
+            LegOutboundQueue::for_leg(unrelated.established_leg(), 4, 4_096).unwrap();
+
+        let error = match ClientSessionController::bootstrap_initial(
+            config,
+            accepted,
+            unrelated,
+            unrelated_queue,
+        ) {
+            Ok(_) => panic!("an initial acceptance accepted the wrong sole queue"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ClientControllerBootstrapErrorKind::WrongQueue);
+        let (returned_config, accepted, unrelated, unrelated_queue) = error.into_parts();
+        assert_eq!(returned_config, config);
+        assert!(!accepted.queue_is_live());
+
+        drop((
+            accepted,
+            unrelated,
+            unrelated_queue,
+            client,
+            client_queue,
+            terminal,
+        ));
+    }
+
+    #[test]
+    fn live_initial_queue_rejects_an_unrelated_io_as_wrong_transport() {
+        let InitialClientBootstrapFixture {
+            config,
+            accepted,
+            client,
+            client_queue,
+            reporter,
+        } = initial_client_bootstrap_fixture(0x76);
+        let unrelated = LegIo::for_authenticated_transport(
+            LegId::B,
+            LegEndpointRole::Client,
+            binding(0x77),
+            LegIoLimits::new(4_096, 8, 32_768, 8, 32_768).unwrap(),
+        );
+
+        let error = match ClientSessionController::bootstrap_initial(
+            config,
+            accepted,
+            unrelated,
+            client_queue,
+        ) {
+            Ok(_) => panic!("an initial queue accepted the wrong endpoint"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            ClientControllerBootstrapErrorKind::WrongTransport
+        );
+        let (returned_config, accepted, unrelated, client_queue) = error.into_parts();
+        assert_eq!(returned_config, config);
+        drop(unrelated);
+
+        let controller = ClientSessionController::bootstrap_initial(
+            returned_config,
+            accepted,
+            client,
+            client_queue,
+        )
+        .expect("identity-only rejection must return the exact retryable inputs");
+        drop((controller, reporter));
     }
 
     #[test]
@@ -3863,7 +4140,8 @@ mod tests {
         let request = attach_request(2, 0x20);
         let proof = credentials().prove(&request, &transport).unwrap();
         let received = leg.bind_received_frame(request.to_attach_frame(proof));
-        let mut pending = SessionSupervisor::prepare_owner(session_config(), authority(1));
+        let mut pending =
+            SessionSupervisor::prepare_owner_unproven_for_test(session_config(), authority(1));
 
         let error = pending.accept(&leg, received, &mut queue).unwrap_err();
         assert!(matches!(
@@ -3872,7 +4150,7 @@ mod tests {
                 AttachAcceptanceReserveError::NotAwaiting { .. }
             )
         ));
-        assert_eq!(pending.authority.as_ref().unwrap().current_generation(), 1);
+        assert_eq!(pending.authority_generation_for_test(), Some(1));
         assert_eq!(queue.len(), 1);
         let debug = format!("{error:?}");
         assert!(debug.contains("QueueReservation(NotAwaiting"));
@@ -3892,7 +4170,8 @@ mod tests {
         let request = attach_request(2, 0x20);
         let proof = credentials().prove(&request, &transport).unwrap();
         let received = leg.bind_received_frame(request.to_attach_frame(proof));
-        let mut pending = SessionSupervisor::prepare_owner(session_config(), authority(1));
+        let mut pending =
+            SessionSupervisor::prepare_owner_unproven_for_test(session_config(), authority(1));
         let error = pending.accept(&leg, received, &mut queue).unwrap_err();
         assert!(matches!(
             error.kind(),
@@ -3908,7 +4187,7 @@ mod tests {
         assert!(reservation.is_none());
         assert!(received.belongs_to_transport(&leg));
         assert_eq!(received.attach_request().unwrap(), request);
-        assert_eq!(pending.authority.as_ref().unwrap().current_generation(), 1);
+        assert_eq!(pending.authority_generation_for_test(), Some(1));
         assert!(matches!(
             queue.reserve_attach_acceptance(&leg),
             Err(AttachAcceptanceReserveError::CapacityExceeded { .. })
@@ -3929,7 +4208,7 @@ mod tests {
                 &mut exact_queue,
             )
             .unwrap();
-        assert!(pending.authority.is_none());
+        assert!(pending.is_completed_for_test());
         let bootstrap = publication.enqueue_acceptance(&mut exact_queue).unwrap();
         let (_supervisor, attached) = bootstrap.into_parts();
         assert_eq!(attached.generation().get(), 2);
@@ -3948,7 +4227,8 @@ mod tests {
                 .unwrap();
         let request = attach_request(2, 0x20);
         let proof = credentials().prove(&request, &transport).unwrap();
-        let mut pending = SessionSupervisor::prepare_owner(session_config(), authority(1));
+        let mut pending =
+            SessionSupervisor::prepare_owner_unproven_for_test(session_config(), authority(1));
         let publication = pending
             .accept(
                 &leg,
@@ -3956,7 +4236,7 @@ mod tests {
                 &mut queue,
             )
             .unwrap();
-        assert!(pending.authority.is_none());
+        assert!(pending.is_completed_for_test());
 
         let (_wrong_leg, wrong_reporter) =
             EstablishedLeg::for_authenticated_transport_with_reporter(binding(0x41));
@@ -3984,7 +4264,8 @@ mod tests {
 
     #[test]
     fn rejected_initial_owner_attempts_preserve_the_same_generation_one_authority_for_retry() {
-        let mut pending = SessionSupervisor::prepare_owner(session_config(), authority(1));
+        let mut pending =
+            SessionSupervisor::prepare_owner_unproven_for_test(session_config(), authority(1));
         let transport = binding(0x40);
         let request = attach_request(2, 0x20);
         let valid_proof = credentials().prove(&request, &transport).unwrap();
@@ -4000,7 +4281,7 @@ mod tests {
         assert_eq!(error.kind(), InitialOwnerBootstrapAcceptErrorKind::WrongLeg);
         let (_received, reservation) = error.into_parts();
         assert!(reservation.is_none());
-        assert_eq!(pending.authority.as_ref().unwrap().current_generation(), 1);
+        assert_eq!(pending.authority_generation_for_test(), Some(1));
 
         let wrong_credentials = AttachCredentials::new(
             DeviceSecret::new([0xba; 32]).unwrap(),
@@ -4013,7 +4294,7 @@ mod tests {
         assert_eq!(error.kind(), InitialOwnerBootstrapAcceptErrorKind::Rejected);
         let (_received, reservation) = error.into_parts();
         assert!(reservation.is_none());
-        assert_eq!(pending.authority.as_ref().unwrap().current_generation(), 1);
+        assert_eq!(pending.authority_generation_for_test(), Some(1));
 
         let valid = leg_a.bind_received_frame(request.to_attach_frame(valid_proof));
         let (supervisor, attached) = pending
@@ -4022,7 +4303,7 @@ mod tests {
             .enqueue_acceptance(&mut queue_a)
             .unwrap()
             .into_parts();
-        assert!(pending.authority.is_none());
+        assert!(pending.is_completed_for_test());
         assert_eq!(supervisor.snapshot().session.generation().get(), 2);
         assert_eq!(attached.generation().get(), 2);
         assert_eq!(queue_a.len(), 1);

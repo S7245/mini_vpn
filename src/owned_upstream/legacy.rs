@@ -19,11 +19,50 @@ impl<U> LegacyOwnedUpstream<U> {
     }
 }
 
+struct LegacyTcpOpen {
+    inner: Box<dyn crate::upstream::TcpOpenAttempt<crate::upstream::OpenedTcpRelay>>,
+}
+
+impl crate::upstream::TcpOpenAttempt<OpenedOwnedTcp> for LegacyTcpOpen {
+    fn step(&mut self, cx: &mut std::task::Context<'_>, now: std::time::Instant) {
+        self.inner.step(cx, now);
+    }
+    fn view(&self) -> crate::upstream::TcpOpenView {
+        self.inner.view()
+    }
+    fn cancel(&mut self, reason: crate::upstream::TcpOpenCancel, deadline: std::time::Instant) {
+        self.inner.cancel(reason, deadline);
+    }
+    fn take_carrier(&mut self, now: std::time::Instant) -> Option<OpenedOwnedTcp> {
+        self.inner.take_carrier(now).map(OpenedOwnedTcp::Legacy)
+    }
+    fn settle(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        now: std::time::Instant,
+        deadline: std::time::Instant,
+    ) {
+        self.inner.settle(cx, now, deadline);
+    }
+    fn failure(&self) -> Option<&ClientError> {
+        self.inner.failure()
+    }
+}
+
 #[async_trait::async_trait]
 impl<U> OwnedUpstream for LegacyOwnedUpstream<U>
 where
     U: ProxyUpstream + DatagramUpstream + 'static,
 {
+    fn staged_tcp_open(
+        self: Arc<Self>,
+        request: crate::upstream::TcpOpenRequest,
+    ) -> crate::upstream::StagedTcpOpen<OpenedOwnedTcp> {
+        Ok(Box::new(LegacyTcpOpen {
+            inner: self.inner.clone().staged_tcp_open(request)?,
+        }))
+    }
+
     async fn open_tcp_flow(&self, target: &TargetAddr) -> Result<OpenedOwnedTcp, ClientError> {
         self.inner
             .open_tcp_relay(target)

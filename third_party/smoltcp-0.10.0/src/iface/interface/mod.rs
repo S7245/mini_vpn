@@ -2,8 +2,11 @@
 // of RFC 1122 that discuss Ethernet, ARP and IP for any IPv4 work
 // and RFCs 8200 and 4861 for any IPv6 and NDISC work.
 
+mod egress;
+mod ingress_effects;
 #[cfg(test)]
 mod tests;
+pub use ingress_effects::IngressEffects;
 
 #[cfg(feature = "medium-ethernet")]
 mod ethernet;
@@ -236,6 +239,8 @@ pub struct Interface {
 /// methods on the `Interface` in this time (since its `device` field is borrowed
 /// exclusively). However, it is still possible to call methods on its `inner` field.
 pub struct InterfaceInner {
+    ingress_effects: IngressEffects,
+    frame_ingress_effect: IngressEffects,
     caps: DeviceCapabilities,
     now: Instant,
     rand: Rand,
@@ -515,6 +520,8 @@ impl Interface {
             },
             fragmenter: Fragmenter::new(),
             inner: InterfaceInner {
+                ingress_effects: IngressEffects::None,
+                frame_ingress_effect: IngressEffects::None,
                 now,
                 caps,
                 hardware_addr: config.hardware_addr,
@@ -703,6 +710,48 @@ impl Interface {
     where
         D: Device + ?Sized,
     {
+        self.poll_with_egress_targets(
+            timestamp,
+            device,
+            sockets,
+            None::<core::iter::Empty<crate::iface::SocketHandle>>,
+        )
+    }
+
+    /// Poll ingress normally and restrict egress to an explicitly complete set.
+    ///
+    /// The caller must cover every socket affected by ALL available input, plus
+    /// previously pending work that must flush before lifecycle processing.
+    /// Targets must be finite, unique and stable across clones. Their order is
+    /// the egress scheduling order; no sorting or allocation is performed here.
+    /// The caller must continue regular full polls for other TX and timers.
+    /// None, stale/non-TCP handles or unsupported features fall back to
+    /// full polling. Empty targets use actual consumed TCP effects, or fall back
+    /// to full polling if no input was consumed. A nonempty list alone is not proof.
+    pub fn poll_with_egress_targets<D, I>(
+        &mut self,
+        timestamp: Instant,
+        device: &mut D,
+        sockets: &mut SocketSet<'_>,
+        targets: Option<I>,
+    ) -> bool
+    where
+        D: Device + ?Sized,
+        I: Iterator<Item = crate::iface::SocketHandle> + Clone,
+    {
+        let targets = targets.filter(|targets| {
+            self.supports_egress_targets()
+                && targets.clone().all(|h| {
+                    sockets.item(h).map_or(false, |item| {
+                        #[cfg(feature = "socket-tcp")]
+                        if matches!(item.socket, Socket::Tcp(_)) {
+                            return true;
+                        }
+                        let _ = item;
+                        false
+                    })
+                })
+        });
         self.inner.now = timestamp;
 
         #[cfg(feature = "_proto-fragmentation")]
@@ -732,7 +781,7 @@ impl Interface {
         loop {
             let mut did_something = false;
             did_something |= self.socket_ingress(device, sockets);
-            did_something |= self.socket_egress(device, sockets);
+            did_something |= self.socket_egress_with_ingress(device, sockets, &targets);
 
             #[cfg(feature = "proto-igmp")]
             {
@@ -749,6 +798,26 @@ impl Interface {
         readiness_may_have_changed
     }
 
+    fn supports_egress_targets(&self) -> bool {
+        #[cfg(all(
+            feature = "medium-ip",
+            feature = "proto-ipv4",
+            feature = "socket-tcp",
+            not(any(
+                feature = "_proto-fragmentation",
+                feature = "proto-ipv6",
+                feature = "socket-raw",
+                feature = "socket-icmp",
+                feature = "socket-dhcpv4",
+                feature = "socket-dns",
+                feature = "proto-igmp"
+            ))
+        ))]
+        if self.inner.caps.medium == Medium::Ip {
+            return true;
+        }
+        false
+    }
     /// Return a _soft deadline_ for calling [poll] the next time.
     /// The [Instant] returned is the time at which you should call [poll] next.
     /// It is harmless (but wastes energy) to call it before the [Instant], and
@@ -806,6 +875,10 @@ impl Interface {
         let mut processed_any = false;
 
         while let Some((rx_token, tx_token)) = device.receive(self.inner.now) {
+            if self.inner.frame_ingress_effect != IngressEffects::None {
+                self.inner.ingress_effects = IngressEffects::FullFallback;
+            }
+            self.inner.frame_ingress_effect = IngressEffects::FullFallback;
             let rx_meta = rx_token.meta();
             rx_token.consume(|frame| {
                 match self.inner.caps.medium {
@@ -861,112 +934,16 @@ impl Interface {
                 }
                 processed_any = true;
             });
+            let effect = if self.supports_egress_targets() {
+                self.inner.frame_ingress_effect
+            } else {
+                IngressEffects::FullFallback
+            };
+            self.inner.ingress_effects.merge(effect);
+            self.inner.frame_ingress_effect = IngressEffects::None;
         }
 
         processed_any
-    }
-
-    fn socket_egress<D>(&mut self, device: &mut D, sockets: &mut SocketSet<'_>) -> bool
-    where
-        D: Device + ?Sized,
-    {
-        let _caps = device.capabilities();
-
-        enum EgressError {
-            Exhausted,
-            Dispatch(DispatchError),
-        }
-
-        let mut emitted_any = false;
-        for item in sockets.items_mut() {
-            if !item
-                .meta
-                .egress_permitted(self.inner.now, |ip_addr| self.inner.has_neighbor(&ip_addr))
-            {
-                continue;
-            }
-
-            let mut neighbor_addr = None;
-            let mut respond = |inner: &mut InterfaceInner, meta: PacketMeta, response: IpPacket| {
-                neighbor_addr = Some(response.ip_repr().dst_addr());
-                let t = device.transmit(inner.now).ok_or_else(|| {
-                    net_debug!("failed to transmit IP: device exhausted");
-                    EgressError::Exhausted
-                })?;
-
-                inner
-                    .dispatch_ip(t, meta, response, &mut self.fragmenter)
-                    .map_err(EgressError::Dispatch)?;
-
-                emitted_any = true;
-
-                Ok(())
-            };
-
-            let result = match &mut item.socket {
-                #[cfg(feature = "socket-raw")]
-                Socket::Raw(socket) => socket.dispatch(&mut self.inner, |inner, response| {
-                    respond(inner, PacketMeta::default(), IpPacket::Raw(response))
-                }),
-                #[cfg(feature = "socket-icmp")]
-                Socket::Icmp(socket) => {
-                    socket.dispatch(&mut self.inner, |inner, response| match response {
-                        #[cfg(feature = "proto-ipv4")]
-                        (IpRepr::Ipv4(ipv4_repr), IcmpRepr::Ipv4(icmpv4_repr)) => respond(
-                            inner,
-                            PacketMeta::default(),
-                            IpPacket::Icmpv4((ipv4_repr, icmpv4_repr)),
-                        ),
-                        #[cfg(feature = "proto-ipv6")]
-                        (IpRepr::Ipv6(ipv6_repr), IcmpRepr::Ipv6(icmpv6_repr)) => respond(
-                            inner,
-                            PacketMeta::default(),
-                            IpPacket::Icmpv6((ipv6_repr, icmpv6_repr)),
-                        ),
-                        #[allow(unreachable_patterns)]
-                        _ => unreachable!(),
-                    })
-                }
-                #[cfg(feature = "socket-udp")]
-                Socket::Udp(socket) => socket.dispatch(&mut self.inner, |inner, meta, response| {
-                    respond(inner, meta, IpPacket::Udp(response))
-                }),
-                #[cfg(feature = "socket-tcp")]
-                Socket::Tcp(socket) => socket.dispatch(&mut self.inner, |inner, response| {
-                    respond(inner, PacketMeta::default(), IpPacket::Tcp(response))
-                }),
-                #[cfg(feature = "socket-dhcpv4")]
-                Socket::Dhcpv4(socket) => socket.dispatch(&mut self.inner, |inner, response| {
-                    respond(inner, PacketMeta::default(), IpPacket::Dhcpv4(response))
-                }),
-                #[cfg(feature = "socket-dns")]
-                Socket::Dns(socket) => {
-                    socket.dispatch(&mut self.inner, |inner, (ip, udp, payload)| {
-                        respond(
-                            inner,
-                            PacketMeta::default(),
-                            IpPacket::Udp((ip, udp, payload)),
-                        )
-                    })
-                }
-            };
-
-            match result {
-                Err(EgressError::Exhausted) => break, // Device buffer full.
-                Err(EgressError::Dispatch(_)) => {
-                    // `NeighborCache` already takes care of rate limiting the neighbor discovery
-                    // requests from the socket. However, without an additional rate limiting
-                    // mechanism, we would spin on every socket that has yet to discover its
-                    // neighbor.
-                    item.meta.neighbor_missing(
-                        self.inner.now,
-                        neighbor_addr.expect("non-IP response packet"),
-                    );
-                }
-                Ok(()) => {}
-            }
-        }
-        emitted_any
     }
 
     /// Process fragments that still need to be sent for IPv4 packets.
@@ -1102,6 +1079,8 @@ impl InterfaceInner {
     #[cfg(test)]
     pub(crate) fn mock() -> Self {
         Self {
+            ingress_effects: IngressEffects::None,
+            frame_ingress_effect: IngressEffects::None,
             caps: DeviceCapabilities {
                 #[cfg(feature = "medium-ethernet")]
                 medium: crate::phy::Medium::Ethernet,
@@ -1445,11 +1424,12 @@ impl InterfaceInner {
             &self.caps.checksum
         ));
 
-        for tcp_socket in sockets
-            .items_mut()
-            .filter_map(|i| tcp::Socket::downcast_mut(&mut i.socket))
-        {
+        for item in sockets.items_mut() {
+            let Some(tcp_socket) = tcp::Socket::downcast_mut(&mut item.socket) else {
+                continue;
+            };
             if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
+                self.frame_ingress_effect = IngressEffects::Tcp(item.meta.handle);
                 return tcp_socket
                     .process(self, &ip_repr, &tcp_repr)
                     .map(IpPacket::Tcp);

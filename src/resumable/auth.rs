@@ -1363,13 +1363,13 @@ impl AttachAuthority {
             Err(AttachReject::Rejected) => return Err(AttachReject::Rejected),
         };
 
-        let model_preflight = match model.preflight_owner_replacement(prepared.committed) {
-            Ok(preflight) => preflight,
+        let prepared_model_install = match model.prepare_owner_replacement(prepared.committed) {
+            Ok(prepared) => prepared,
             Err(error) => return Ok(Ok(Err(error))),
         };
         before_commit();
         match self.commit_prepared(prepared) {
-            Ok(committed) => Ok(Ok(Ok((committed, model_preflight.install())))),
+            Ok(committed) => Ok(Ok(Ok((committed, prepared_model_install.install())))),
             Err(AttachReject::GenerationNotNext { current, .. }) => {
                 self.resynchronization(&request, binding, current).map(Err)
             }

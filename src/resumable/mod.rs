@@ -5,6 +5,8 @@
 
 mod auth;
 mod capacity;
+pub(crate) mod effect_storage;
+pub(crate) mod payload_inventory;
 mod protocol;
 mod session;
 mod tcp;
@@ -22,23 +24,29 @@ pub(crate) use auth::{
 };
 pub use capacity::{
     BitsPerSecond, DirectionalByteLimits, DirectionalRates, DirectionalReplayStorageLimits,
+    RecoveryBudget, RecoveryBudgetError, RecoveryBudgetSpec, RecoveryPath, RecoveryStageBudgets,
     ReplayCapacityError, ReplayCapacityPlan, ReplayCapacitySpec, ReplayCopyAllocationBounds,
     ReplayHorizon, ReplayStorageGeometry, ReplayStorageLimit, ReplayStoragePlan,
 };
 
-pub(crate) use protocol::ATTACH_ACCEPTED_ENCODED_BYTES;
+pub(crate) use protocol::{ATTACH_ACCEPTED_ENCODED_BYTES, normalize_target_for_owned_command};
 pub use protocol::{
     AttachNonce, AttachProof, ByteOffset, DecodedFrame, Direction, FRAME_HEADER_BYTES,
     FRAME_PROTOCOL_VERSION, FeatureSet, Frame, HintSequence, LegControlFrame, LegControlRecord,
-    LegEpochNonce, LegGeneration, MAX_DATA_PAYLOAD_BYTES, OpenResultCode, ProbeSequence,
-    ProtocolError, Record, ResetReason, SESSION_PROTOCOL_VERSION, STANDBY_CONTROL_V1,
-    SessionFlowId, SessionId, StandbyNonce, StandbyProof, SwitchHintCause, ValidatedFrameHeader,
+    LegEpochNonce, LegGeneration, MAX_DATA_PAYLOAD_BYTES, MAX_ENCODED_DATA_FRAME_BYTES,
+    OpenResultCode, ProbeSequence, ProtocolError, Record, ResetReason, SESSION_PROTOCOL_VERSION,
+    STANDBY_CONTROL_V1, SessionFlowId, SessionId, StandbyNonce, StandbyProof, SwitchHintCause,
+    ValidatedFrameHeader,
 };
 pub use session::{
     FlowFinishReason, LocalFlow, PeerOpenRequest, ReceiveBudgetLimits, ReplayAcknowledged,
     ReplayBudgetLimits, ReplayBudgetUsage, ReplayStored, SessionConfig, SessionConfigError,
     SessionEffect, SessionError, SessionEvent, SessionFlowSnapshot, SessionModel, SessionPhase,
     SessionRole, SessionSnapshot, SinkHalfClose, SinkOffer, TerminalGrace,
+};
+pub(crate) use session::{
+    PreparedLocalOpenAdapterFailure, PreparedLocalOpenAdapterRejection, PreparedLocalOpenInput,
+    ReducerCommittedLocalOpen,
 };
 pub use tcp::{
     TcpDataSegment, TcpOwnershipError, TcpReceiveAbandon, TcpReceiveAccept, TcpReceiveClose,

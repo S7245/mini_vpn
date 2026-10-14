@@ -1833,6 +1833,18 @@ impl Connection {
         self.state.is_drained()
     }
 
+    /// Terminate this connection immediately without a closing period.
+    ///
+    /// This is intended for application bootstrap attempts that have not
+    /// published usable connection ownership and must release admission
+    /// capacity without waiting through the normal draining timer.
+    #[doc(hidden)]
+    pub fn abandon(&mut self) {
+        if !self.state.is_drained() {
+            self.kill(ConnectionError::LocallyClosed);
+        }
+    }
+
     /// For clients, if the peer accepted the 0-RTT data packets
     ///
     /// The value is meaningless until after the handshake completes.

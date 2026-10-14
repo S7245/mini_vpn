@@ -13,7 +13,8 @@
 
 use crate::client_tun::{D16HarnessFlow, MetricsSink, TunRuntimeConfig, run_event_loop};
 use crate::device::{
-    TunFlushedTcpPacket, TunIngressPumpSnapshot, TunIo, summarize_flushed_ip_tcp_packet,
+    DeviceShutdown, IngressPacketSource, PumpPacket, SourceRead, TunFlushedTcpPacket,
+    TunIngressPump, TunIngressPumpSnapshot, TunIo, device_closed, summarize_flushed_ip_tcp_packet,
 };
 use crate::metrics::Metrics;
 use crate::shared::{ClientError, TargetAddr};
@@ -53,13 +54,13 @@ impl PacketLink {
     fn new() -> Self {
         Self::default()
     }
-    fn bounded(capacity_packets: usize) -> Self {
+    pub(crate) fn bounded(capacity_packets: usize) -> Self {
         Self {
             capacity_packets: Some(capacity_packets.max(1)),
             ..Self::default()
         }
     }
-    fn push(&self, pkt: BytesMut) -> bool {
+    pub(crate) fn push(&self, pkt: BytesMut) -> bool {
         let mut queue = self.queue.lock().unwrap();
         if self
             .capacity_packets
@@ -78,11 +79,23 @@ impl PacketLink {
     fn pop(&self) -> Option<BytesMut> {
         self.queue.lock().unwrap().pop_front()
     }
-    fn dropped_packets(&self) -> u64 {
+    pub(crate) fn dropped_packets(&self) -> u64 {
         self.dropped_packets.load(Ordering::Relaxed)
     }
-    fn high_water_packets(&self) -> u64 {
+    pub(crate) fn high_water_packets(&self) -> u64 {
         self.high_water_packets.load(Ordering::Relaxed)
+    }
+}
+
+impl IngressPacketSource for PacketLink {
+    async fn read_packet(&mut self, slot: &mut PumpPacket) -> std::io::Result<SourceRead> {
+        loop {
+            if let Some(packet) = self.pop() {
+                slot.adopt(packet);
+                return Ok(SourceRead::Packet);
+            }
+            self.notify.notified().await;
+        }
     }
 }
 
@@ -159,9 +172,11 @@ pub struct LoopbackTunDevice {
     iface_rx_queue: VecDeque<BytesMut>,
     tx_queue: VecDeque<BytesMut>,
     flushed_tcp_packets: Vec<TunFlushedTcpPacket>,
-    inbound: PacketLink,  // 发生器 → SUT
-    outbound: PacketLink, // SUT → 发生器
-    ingress_pump: Option<LoopbackIngressPump>,
+    inbound: Option<PacketLink>,  // 发生器 → SUT
+    outbound: Option<PacketLink>, // SUT → 发生器
+    ingress_pump: Option<TunIngressPump>,
+    stopping: bool,
+    shutdown_failure: Option<std::io::ErrorKind>,
     /// 刀12：每次 `flush_tx` 注入的合成 on-loop CPU 成本（busy-spin）。默认 ZERO。
     /// `flush_tx` 在主循环 poll 段内（enter_poll/leave_poll 括起）→ 该 burn 计入 poll_time / loop-active，
     /// 用于验证 profiler 能侦测「主循环被 on-loop CPU 拖满」的饱和信号（T4 spike）。
@@ -172,39 +187,8 @@ pub struct LoopbackTunDevice {
     mtu: usize,
 }
 
-struct LoopbackIngressPump {
-    receiver: mpsc::Receiver<BytesMut>,
-    task: tokio::task::JoinHandle<()>,
-    stats: Arc<LoopbackIngressPumpStats>,
-    capacity_packets: usize,
-}
-
-#[derive(Default)]
-struct LoopbackIngressPumpStats {
-    packets: AtomicU64,
-    bytes: AtomicU64,
-    queue_high_water: AtomicU64,
-    full_waits: AtomicU64,
-    closed: AtomicU64,
-}
-
-impl LoopbackIngressPumpStats {
-    fn snapshot(&self, capacity_packets: usize) -> TunIngressPumpSnapshot {
-        TunIngressPumpSnapshot {
-            enabled: true,
-            packets: self.packets.load(Ordering::Relaxed),
-            bytes: self.bytes.load(Ordering::Relaxed),
-            queue_high_water: self.queue_high_water.load(Ordering::Relaxed),
-            capacity_packets,
-            full_waits: self.full_waits.load(Ordering::Relaxed),
-            read_errors: 0,
-            closed: self.closed.load(Ordering::Relaxed),
-        }
-    }
-}
-
 impl LoopbackTunDevice {
-    fn new(inbound: PacketLink, outbound: PacketLink) -> Self {
+    pub(crate) fn new(inbound: PacketLink, outbound: PacketLink) -> Self {
         Self::with_options(inbound, outbound, Duration::ZERO, false)
     }
 
@@ -231,8 +215,10 @@ impl LoopbackTunDevice {
             iface_rx_queue: VecDeque::new(),
             tx_queue: VecDeque::new(),
             flushed_tcp_packets: Vec::new(),
-            inbound,
-            outbound,
+            inbound: Some(inbound),
+            outbound: Some(outbound),
+            stopping: false,
+            shutdown_failure: None,
             ingress_pump: None,
             cpu_burn_per_flush,
             suppress_wait_after_tcp_payload_flush,
@@ -252,59 +238,52 @@ impl LoopbackTunDevice {
         self.mtu = mtu;
         self
     }
-
     #[cfg(test)]
-    fn with_ingress_pump(mut self, capacity_packets: usize) -> Self {
-        let capacity_packets = capacity_packets.max(1);
-        let inbound = self.inbound.clone();
-        let (sender, receiver) = mpsc::channel(capacity_packets);
-        let stats = Arc::new(LoopbackIngressPumpStats::default());
-        let task_stats = Arc::clone(&stats);
-        let task = tokio::spawn(async move {
-            loop {
-                let packet = loop {
-                    if let Some(packet) = inbound.pop() {
-                        break packet;
-                    }
-                    inbound.notify.notified().await;
-                };
-                let occupied = capacity_packets.saturating_sub(sender.capacity());
-                task_stats.queue_high_water.fetch_max(
-                    occupied.saturating_add(1).min(capacity_packets) as u64,
-                    Ordering::Relaxed,
-                );
-                if sender.capacity() == 0 {
-                    task_stats.full_waits.fetch_add(1, Ordering::Relaxed);
-                }
-                let bytes = packet.len();
-                if sender.send(packet).await.is_err() {
-                    break;
-                }
-                task_stats.packets.fetch_add(1, Ordering::Relaxed);
-                task_stats.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    pub(crate) fn with_ingress_pump(mut self, capacity_packets: usize) -> Self {
+        if !self.stopping && self.ingress_pump.is_none() {
+            if let Some(inbound) = &self.inbound {
+                self.ingress_pump = Some(TunIngressPump::spawn_source(
+                    inbound.clone(),
+                    capacity_packets,
+                ));
             }
-            task_stats.closed.fetch_add(1, Ordering::Relaxed);
-        });
-        self.ingress_pump = Some(LoopbackIngressPump {
-            receiver,
-            task,
-            stats,
-            capacity_packets,
-        });
+        }
         self
     }
 }
-
 impl Drop for LoopbackTunDevice {
     fn drop(&mut self) {
-        if let Some(pump) = &self.ingress_pump {
-            pump.task.abort();
-        }
+        self.request_stop();
     }
 }
-
 impl TunIo for LoopbackTunDevice {
+    fn request_stop(&mut self) {
+        self.stopping = true;
+        if let Some(pump) = &self.ingress_pump {
+            pump.request_stop();
+        }
+    }
+    fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<DeviceShutdown> {
+        self.request_stop();
+        let result = if let Some(pump) = &mut self.ingress_pump {
+            std::task::ready!(pump.poll_shutdown(cx))
+        } else {
+            DeviceShutdown::from_status(self.shutdown_failure)
+        };
+        self.shutdown_failure = result.io_kind();
+        self.ingress_pump.take();
+        self.inbound.take();
+        self.outbound.take();
+        self.rx_buffer.take();
+        drop(std::mem::take(&mut self.iface_rx_queue));
+        drop(std::mem::take(&mut self.tx_queue));
+        drop(std::mem::take(&mut self.flushed_tcp_packets));
+        Poll::Ready(result)
+    }
     async fn wait_for_rx(&mut self) -> std::io::Result<()> {
+        if self.stopping {
+            return Err(device_closed());
+        }
         if self.rx_buffer.is_some() {
             return Ok(());
         }
@@ -312,53 +291,56 @@ impl TunIo for LoopbackTunDevice {
             return std::future::pending::<std::io::Result<()>>().await;
         }
         if let Some(pump) = &mut self.ingress_pump {
-            self.rx_buffer = Some(pump.receiver.recv().await.ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "loopback ingress pump closed",
-                )
-            })?);
+            self.rx_buffer = Some(pump.recv().await.ok_or_else(device_closed)??);
             return Ok(());
         }
+        let inbound = self.inbound.as_ref().ok_or_else(device_closed)?;
         loop {
-            if let Some(pkt) = self.inbound.pop() {
+            if let Some(pkt) = inbound.pop() {
                 self.rx_buffer = Some(pkt);
                 return Ok(());
             }
             // notify_one 在无 waiter 时保留 1 个 permit，不丢唤醒（pop→None 与 notified 之间的竞态安全）。
-            self.inbound.notify.notified().await;
+            inbound.notify.notified().await;
         }
     }
     fn try_recv_rx(&mut self) -> std::io::Result<bool> {
+        if self.stopping {
+            return Err(device_closed());
+        }
         if self.rx_buffer.is_some() {
             return Ok(true);
         }
-        if let Some(pump) = &mut self.ingress_pump {
-            return match pump.receiver.try_recv() {
-                Ok(packet) => {
-                    self.rx_buffer = Some(packet);
-                    Ok(true)
-                }
-                Err(mpsc::error::TryRecvError::Empty) => Ok(false),
-                Err(mpsc::error::TryRecvError::Disconnected) => Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "loopback ingress pump closed",
-                )),
-            };
-        }
-        if let Some(pkt) = self.inbound.pop() {
-            self.rx_buffer = Some(pkt);
-            return Ok(true);
-        }
-        Ok(false)
+        self.rx_buffer = if let Some(pump) = &mut self.ingress_pump {
+            match pump.try_recv() {
+                Ok(packet) => Some(packet?),
+                Err(mpsc::error::TryRecvError::Empty) => None,
+                Err(mpsc::error::TryRecvError::Disconnected) => return Err(device_closed()),
+            }
+        } else {
+            self.inbound.as_ref().and_then(PacketLink::pop)
+        };
+        Ok(self.rx_buffer.is_some())
     }
     fn rx_peek(&self) -> Option<&[u8]> {
+        if self.stopping {
+            return None;
+        }
         self.rx_buffer.as_deref()
     }
     fn rx_take(&mut self) -> Option<BytesMut> {
+        if self.stopping {
+            return None;
+        }
         self.rx_buffer.take()
     }
+    fn can_stage_single_iface_rx(&self) -> bool {
+        self.iface_rx_queue.is_empty()
+    }
     fn stage_rx_for_iface(&mut self) -> bool {
+        if self.stopping {
+            return false;
+        }
         let Some(packet) = self.rx_buffer.take() else {
             return false;
         };
@@ -366,6 +348,10 @@ impl TunIo for LoopbackTunDevice {
         true
     }
     async fn flush_tx(&mut self) -> std::io::Result<()> {
+        if self.stopping {
+            return Err(device_closed());
+        }
+        let outbound = self.outbound.as_ref().ok_or_else(device_closed)?;
         busy_spin(self.cpu_burn_per_flush); // 刀12：合成 on-loop CPU（默认 ZERO 即 no-op）。
         let mut tcp_payload_packets = 0u64;
         while let Some(pkt) = self.tx_queue.pop_front() {
@@ -376,7 +362,7 @@ impl TunIo for LoopbackTunDevice {
                 }
                 self.flushed_tcp_packets.push(packet);
             }
-            self.outbound.push(pkt);
+            outbound.push(pkt);
         }
         self.max_tcp_payload_packets_per_flush
             .fetch_max(tcp_payload_packets, Ordering::Relaxed);
@@ -391,10 +377,13 @@ impl TunIo for LoopbackTunDevice {
     fn tun_ingress_pump_snapshot(&self) -> TunIngressPumpSnapshot {
         self.ingress_pump
             .as_ref()
-            .map(|pump| pump.stats.snapshot(pump.capacity_packets))
+            .map(TunIngressPump::snapshot)
             .unwrap_or_default()
     }
     fn inject_ip_packet(&mut self, pkt: &[u8]) {
+        if self.stopping {
+            return;
+        }
         self.tx_queue.push_back(BytesMut::from(pkt));
     }
 }
@@ -406,6 +395,9 @@ impl Device for LoopbackTunDevice {
         loopback_caps_with_mtu(self.mtu)
     }
     fn receive(&mut self, _t: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if self.stopping {
+            return None;
+        }
         self.iface_rx_queue.pop_front().map(|buffer| {
             (
                 RawRxToken { buffer },
@@ -416,6 +408,9 @@ impl Device for LoopbackTunDevice {
         })
     }
     fn transmit(&mut self, _t: SmolInstant) -> Option<Self::TxToken<'_>> {
+        if self.stopping {
+            return None;
+        }
         Some(QueueTxToken {
             queue: &mut self.tx_queue,
         })

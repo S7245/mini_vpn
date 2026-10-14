@@ -1,12 +1,17 @@
+use crate::shared::errors::{FailureOrigin, FailurePhase, FailureResource, RetainedFailure};
 use bytes::BytesMut;
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io::{ErrorKind, Read};
 use std::net::Ipv4Addr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf}; // ⚠️ 极其重要：引入异步读写魔法
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tun::Device as TunDevice;
 
@@ -17,6 +22,8 @@ const UTUN_IPV4_HEADER: [u8; 4] = [0, 0, 0, 2];
 /// 虚拟 TUN 设备包装器：连接异步物理网卡与同步 smoltcp 协议栈的桥梁
 pub struct VirtualTunDevice {
     backend: VirtualTunBackend,
+    stopping: bool,
+    shutdown_failure: Option<ErrorKind>,
     /// OS interface name when the platform exposes it (diagnostics only).
     interface_name: Option<String>,
     /// 刀14c：真实 TUN IP MTU。必须和 OS TUN MTU / smoltcp capability 保持一致。
@@ -31,13 +38,11 @@ pub struct VirtualTunDevice {
 }
 
 enum VirtualTunBackend {
+    Stopped,
     Direct(tun::AsyncDevice),
     Pumped {
         writer: WriteHalf<tun::AsyncDevice>,
-        receiver: mpsc::Receiver<std::io::Result<BytesMut>>,
-        task: JoinHandle<()>,
-        stats: Arc<TunIngressPumpStats>,
-        capacity_packets: usize,
+        ingress: TunIngressPump,
     },
 }
 
@@ -78,54 +83,531 @@ impl TunIngressPumpStats {
     }
 }
 
-fn spawn_tun_ingress_pump<R>(
+/// Local tasks, backend and owned queues are released; diagnostic shells may remain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceShutdownState {
+    Settled,
+    FailedSettled,
+}
+
+/// Non-cloneable shutdown result. Earlier I/O errors remain the caller's responsibility.
+pub struct DeviceShutdown {
+    failure_kind: Option<ErrorKind>,
+    failure: Option<RetainedFailure>,
+    additional_failures: u64,
+}
+
+impl DeviceShutdown {
+    /// For implementations that have explicitly released all of their owned resources.
+    pub fn settled() -> Self {
+        Self::from_status(None)
+    }
+
+    /// Resources are released but the implementation failed. Its original error stays
+    /// with its caller or owner; the implementation must preserve this kind on repeats.
+    pub fn failed(kind: ErrorKind) -> Self {
+        Self::from_status(Some(kind))
+    }
+
+    pub fn state(&self) -> DeviceShutdownState {
+        if self.failure_kind.is_some() {
+            DeviceShutdownState::FailedSettled
+        } else {
+            DeviceShutdownState::Settled
+        }
+    }
+
+    pub fn io_kind(&self) -> Option<ErrorKind> {
+        self.failure_kind
+    }
+
+    pub(crate) fn from_status(failure_kind: Option<ErrorKind>) -> Self {
+        Self {
+            failure_kind,
+            failure: None,
+            additional_failures: 0,
+        }
+    }
+
+    /// Move the saturated extra-error delta once; repeated observations carry zero.
+    pub(crate) fn take_additional_failures(&mut self) -> u64 {
+        std::mem::take(&mut self.additional_failures)
+    }
+
+    pub(crate) fn take_failure(&mut self) -> Option<RetainedFailure> {
+        self.failure.take()
+    }
+}
+
+pub(crate) fn device_closed() -> std::io::Error {
+    std::io::Error::from(ErrorKind::BrokenPipe)
+}
+
+/// The ingress role owns its receiver, one join handle and one bounded first-error slot.
+/// Packet backing stays charged until dropped or moved to the device. The outer device,
+/// writer and session are not settled here; lifecycle tracers live in tests/lifecycle.rs.
+pub(crate) struct TunIngressPump {
+    receiver: mpsc::Receiver<PumpPacket>,
+    task: PumpTask,
+    control: Arc<PumpControl>,
+    capacity_packets: usize,
+    error_delivered: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpExit {
+    StopRequested,
+    ConsumerClosed,
+    Failed(PumpFailureId),
+}
+
+enum PumpTask {
+    Running(JoinHandle<PumpExit>),
+    Observed(PumpExit),
+}
+
+/// Identifies the sole failure slot within this physical pump role, not a global registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PumpFailureId;
+
+enum PumpFailureSlot {
+    Empty,
+    Retained(RetainedFailure),
+    Transferred(ErrorKind),
+}
+
+struct PumpControl {
+    stop: AtomicBool,
+    stop_wake: Notify,
+    failure_wake: Notify,
+    failed: AtomicBool,
+    first_failure: Mutex<PumpFailureSlot>,
+    additional_failures: AtomicU64,
+    producer_backing: AtomicU64,
+    queued_backing: AtomicU64,
+    stats: TunIngressPumpStats,
+}
+
+impl PumpControl {
+    fn new() -> Self {
+        Self {
+            stop: AtomicBool::new(false),
+            stop_wake: Notify::new(),
+            failure_wake: Notify::new(),
+            failed: AtomicBool::new(false),
+            first_failure: Mutex::new(PumpFailureSlot::Empty),
+            additional_failures: AtomicU64::new(0),
+            producer_backing: AtomicU64::new(0),
+            queued_backing: AtomicU64::new(0),
+            stats: TunIngressPumpStats::default(),
+        }
+    }
+
+    fn origin(phase: FailurePhase) -> FailureOrigin {
+        FailureOrigin {
+            phase,
+            resource: FailureResource::TunPump,
+            resource_id: 0,
+            attempt_id: None,
+        }
+    }
+
+    fn record(&self, failure: RetainedFailure) {
+        let mut slot = self.first_failure.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(*slot, PumpFailureSlot::Empty) {
+            *slot = PumpFailureSlot::Retained(failure);
+            self.failed.store(true, Ordering::Release);
+        } else {
+            let _ =
+                self.additional_failures
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                        Some(n.saturating_add(1))
+                    });
+        }
+        drop(slot);
+        self.failure_wake.notify_waiters();
+    }
+
+    fn exit(&self, terminal: PumpExit) -> PumpExit {
+        if self.failed.load(Ordering::Acquire) {
+            PumpExit::Failed(PumpFailureId)
+        } else {
+            terminal
+        }
+    }
+
+    fn request_stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        self.stop_wake.notify_waiters();
+    }
+
+    async fn stopped(&self) {
+        let notified = self.stop_wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.stop.load(Ordering::Acquire) {
+            notified.await;
+        }
+    }
+
+    fn failure_kind(&self) -> ErrorKind {
+        let slot = self.first_failure.lock().unwrap_or_else(|e| e.into_inner());
+        match &*slot {
+            PumpFailureSlot::Retained(failure) => {
+                failure.facts().io_kind.unwrap_or(ErrorKind::Other)
+            }
+            PumpFailureSlot::Transferred(kind) => *kind,
+            PumpFailureSlot::Empty => ErrorKind::Other,
+        }
+    }
+}
+
+impl TunIngressPump {
+    pub(crate) fn request_stop(&self) {
+        self.control.request_stop();
+    }
+
+    /// Cancellation leaves the same handle in this role until JoinHandle is actually Ready.
+    fn poll_join(&mut self, cx: &mut Context<'_>) -> Poll<PumpExit> {
+        let result = match &mut self.task {
+            PumpTask::Running(task) => std::task::ready!(Pin::new(task).poll(cx)),
+            PumpTask::Observed(exit) => return Poll::Ready(self.control.exit(*exit)),
+        };
+        let exit = match result {
+            Ok(exit) => self.control.exit(exit),
+            Err(error) => {
+                self.control.record(RetainedFailure::from_join(
+                    PumpControl::origin(FailurePhase::DeviceJoin),
+                    error,
+                ));
+                PumpExit::Failed(PumpFailureId)
+            }
+        };
+        self.task = PumpTask::Observed(exit);
+        Poll::Ready(exit)
+    }
+
+    async fn observe_join(&mut self) -> PumpExit {
+        std::future::poll_fn(|cx| self.poll_join(cx)).await
+    }
+
+    pub(crate) fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<DeviceShutdown> {
+        self.request_stop();
+        let exit = std::task::ready!(self.poll_join(cx));
+        self.drain();
+        let mut result = DeviceShutdown::settled();
+        result.additional_failures = self.control.additional_failures.swap(0, Ordering::Relaxed);
+        if matches!(exit, PumpExit::Failed(_)) {
+            result.failure_kind = Some(self.control.failure_kind());
+            result.failure = self.take_failure();
+        }
+        Poll::Ready(result)
+    }
+
+    pub(crate) fn snapshot(&self) -> TunIngressPumpSnapshot {
+        self.control.stats.snapshot(self.capacity_packets)
+    }
+
+    fn take_failure(&mut self) -> Option<RetainedFailure> {
+        let mut slot = self
+            .control
+            .first_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let kind = match &*slot {
+            PumpFailureSlot::Retained(failure) => {
+                failure.facts().io_kind.unwrap_or(ErrorKind::Other)
+            }
+            _ => return None,
+        };
+        match std::mem::replace(&mut *slot, PumpFailureSlot::Transferred(kind)) {
+            PumpFailureSlot::Retained(failure) => Some(failure),
+            _ => None,
+        }
+    }
+
+    pub(crate) async fn recv(&mut self) -> Option<std::io::Result<BytesMut>> {
+        loop {
+            match self.try_recv() {
+                Ok(event) => return Some(event),
+                Err(mpsc::error::TryRecvError::Disconnected) => return None,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+            let control = Arc::clone(&self.control);
+            let notified = control.failure_wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.try_recv() {
+                Ok(event) => return Some(event),
+                Err(mpsc::error::TryRecvError::Disconnected) => return None,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+            tokio::select! {
+                biased;
+                _ = &mut notified, if !self.error_delivered => continue,
+                packet = self.receiver.recv() => {
+                    if let Some(packet) = packet {
+                        return Some(Ok(packet.into_bytes()));
+                    }
+                    // Re-enter the ready path to deliver a retained terminal error once.
+                }
+            }
+        }
+    }
+
+    pub(crate) fn try_recv(
+        &mut self,
+    ) -> Result<std::io::Result<BytesMut>, mpsc::error::TryRecvError> {
+        match self.receiver.try_recv() {
+            Ok(packet) => Ok(Ok(packet.into_bytes())),
+            Err(status) => {
+                if self.error_delivered || !self.control.failed.load(Ordering::Acquire) {
+                    return Err(status);
+                }
+                // Recheck after acquiring failure publication: every earlier packet was
+                // enqueued before that publication, including a concurrent first check.
+                if let Ok(packet) = self.receiver.try_recv() {
+                    return Ok(Ok(packet.into_bytes()));
+                }
+                self.error_delivered = true;
+                Ok(Err(std::io::Error::from(self.control.failure_kind())))
+            }
+        }
+    }
+
+    fn drain(&mut self) {
+        while self.receiver.try_recv().is_ok() {}
+    }
+}
+
+impl Drop for TunIngressPump {
+    fn drop(&mut self) {
+        self.request_stop();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PacketCustody {
+    Producer,
+    Queue,
+    Transferred,
+}
+
+pub(crate) struct PumpPacket {
+    bytes: BytesMut,
+    backing: u64,
+    custody: PacketCustody,
+    control: Arc<PumpControl>,
+}
+
+impl PumpPacket {
+    fn new(control: Arc<PumpControl>) -> Self {
+        Self {
+            bytes: BytesMut::new(),
+            backing: 0,
+            custody: PacketCustody::Producer,
+            control,
+        }
+    }
+
+    /// Adopt synchronously before the source can yield; empty packets retain their backing.
+    pub(crate) fn adopt(&mut self, bytes: BytesMut) {
+        self.release_charge();
+        self.bytes = bytes;
+        self.backing = self.bytes.capacity() as u64;
+        self.custody = PacketCustody::Producer;
+        self.control
+            .producer_backing
+            .fetch_add(self.backing, Ordering::Relaxed);
+    }
+
+    fn enqueue(&mut self) {
+        self.control
+            .producer_backing
+            .fetch_sub(self.backing, Ordering::Relaxed);
+        self.control
+            .queued_backing
+            .fetch_add(self.backing, Ordering::Relaxed);
+        self.custody = PacketCustody::Queue;
+    }
+
+    fn release_charge(&mut self) {
+        match self.custody {
+            PacketCustody::Producer => &self.control.producer_backing,
+            PacketCustody::Queue => &self.control.queued_backing,
+            PacketCustody::Transferred => return,
+        }
+        .fetch_sub(self.backing, Ordering::Relaxed);
+        self.custody = PacketCustody::Transferred;
+    }
+
+    fn into_bytes(mut self) -> BytesMut {
+        self.release_charge();
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+impl Drop for PumpPacket {
+    fn drop(&mut self) {
+        self.release_charge();
+    }
+}
+
+/// Catches poll and destruction panics before Tokio can retain an opaque completed result.
+struct PumpGuard<F> {
+    inner: Option<Pin<Box<F>>>,
+    control: Arc<PumpControl>,
+    settled: bool,
+}
+
+impl<F> PumpGuard<F> {
+    fn dispose(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(inner))) {
+                self.control.record(RetainedFailure::from_panic(
+                    PumpControl::origin(FailurePhase::DeviceJoin),
+                    payload,
+                ));
+            }
+        }
+        if !self.settled {
+            self.settled = true;
+            self.control.stats.closed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl<F: Future<Output = PumpExit>> Future for PumpGuard<F> {
+    type Output = PumpExit;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let result = catch_unwind(AssertUnwindSafe(|| match this.inner.as_mut() {
+            Some(inner) => inner.as_mut().poll(cx),
+            None => Poll::Pending,
+        }));
+        match result {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(exit)) => {
+                this.dispose();
+                Poll::Ready(this.control.exit(exit))
+            }
+            Err(payload) => {
+                this.control.record(RetainedFailure::from_panic(
+                    PumpControl::origin(FailurePhase::DeviceRead),
+                    payload,
+                ));
+                this.dispose();
+                Poll::Ready(PumpExit::Failed(PumpFailureId))
+            }
+        }
+    }
+}
+
+impl<F> Drop for PumpGuard<F> {
+    fn drop(&mut self) {
+        self.dispose();
+    }
+}
+
+pub(crate) enum SourceRead {
+    Packet,
+    Eof,
+}
+
+/// Sources fill the borrowed owner slot before any await after acquiring a packet.
+/// The source supplies framing; generic pump code neither interprets PI nor copies packets.
+pub(crate) trait IngressPacketSource: Send + 'static {
+    fn read_packet(
+        &mut self,
+        packet: &mut PumpPacket,
+    ) -> impl Future<Output = std::io::Result<SourceRead>> + Send;
+}
+
+struct AsyncReadPacketSource<R> {
     reader: R,
     mtu: usize,
-    capacity_packets: usize,
-) -> (
-    mpsc::Receiver<std::io::Result<BytesMut>>,
-    JoinHandle<()>,
-    Arc<TunIngressPumpStats>,
-)
+}
+
+impl<R: AsyncRead + Unpin + Send + 'static> IngressPacketSource for AsyncReadPacketSource<R> {
+    async fn read_packet(&mut self, packet: &mut PumpPacket) -> std::io::Result<SourceRead> {
+        packet.adopt(BytesMut::zeroed(rx_buffer_capacity_for_mtu(self.mtu)));
+        let bytes = self.reader.read(&mut packet.bytes).await?;
+        packet.bytes.truncate(bytes);
+        Ok(if bytes == 0 {
+            SourceRead::Eof
+        } else {
+            SourceRead::Packet
+        })
+    }
+}
+
+fn spawn_tun_ingress_pump<R>(reader: R, mtu: usize, capacity_packets: usize) -> TunIngressPump
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    let capacity_packets = capacity_packets.max(1);
-    let (sender, receiver) = mpsc::channel(capacity_packets);
-    let stats = Arc::new(TunIngressPumpStats::default());
-    let task_stats = Arc::clone(&stats);
-    let task = tokio::spawn(run_tun_ingress_pump(
-        reader,
-        sender,
-        task_stats,
-        mtu,
-        capacity_packets,
-    ));
-    (receiver, task, stats)
+    TunIngressPump::spawn_source(AsyncReadPacketSource { reader, mtu }, capacity_packets)
 }
 
-async fn run_tun_ingress_pump<R>(
-    mut reader: R,
-    sender: mpsc::Sender<std::io::Result<BytesMut>>,
-    stats: Arc<TunIngressPumpStats>,
-    mtu: usize,
+impl TunIngressPump {
+    pub(crate) fn spawn_source<S: IngressPacketSource>(source: S, capacity_packets: usize) -> Self {
+        let capacity_packets = capacity_packets.max(1);
+        let (sender, receiver) = mpsc::channel(capacity_packets);
+        let control = Arc::new(PumpControl::new());
+        let inner = run_tun_ingress_pump(source, sender, Arc::clone(&control), capacity_packets);
+        let task = tokio::spawn(PumpGuard {
+            inner: Some(Box::pin(inner)),
+            control: Arc::clone(&control),
+            settled: false,
+        });
+        Self {
+            receiver,
+            task: PumpTask::Running(task),
+            control,
+            capacity_packets,
+            error_delivered: false,
+        }
+    }
+}
+
+async fn run_tun_ingress_pump<S: IngressPacketSource>(
+    mut source: S,
+    sender: mpsc::Sender<PumpPacket>,
+    control: Arc<PumpControl>,
     capacity_packets: usize,
-) where
-    R: AsyncRead + Unpin,
-{
+) -> PumpExit {
+    let stats = &control.stats;
     loop {
-        let mut packet = BytesMut::zeroed(rx_buffer_capacity_for_mtu(mtu));
-        let bytes = match reader.read(&mut packet).await {
-            Ok(0) => break,
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+        let mut packet = PumpPacket::new(Arc::clone(&control));
+        let result = tokio::select! {
+            biased;
+            _ = control.stopped() => return PumpExit::StopRequested,
+            _ = sender.closed() => return PumpExit::ConsumerClosed,
+            result = source.read_packet(&mut packet) => result,
+        };
+        let bytes = match result {
+            Ok(SourceRead::Eof) => {
+                control.record(RetainedFailure::from_io(
+                    PumpControl::origin(FailurePhase::DeviceRead),
+                    std::io::Error::from(ErrorKind::UnexpectedEof),
+                ));
+                return PumpExit::Failed(PumpFailureId);
+            }
+            Ok(SourceRead::Packet) => packet.bytes.len(),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {
+                drop(error);
+                tokio::task::yield_now().await;
+                continue;
+            }
             Err(error) => {
                 stats.read_errors.fetch_add(1, Ordering::Relaxed);
-                let _ = sender.send(Err(error)).await;
-                break;
+                control.record(RetainedFailure::from_io(
+                    PumpControl::origin(FailurePhase::DeviceRead),
+                    error,
+                ));
+                return PumpExit::Failed(PumpFailureId);
             }
         };
-        packet.truncate(bytes);
         let occupied = capacity_packets.saturating_sub(sender.capacity());
         stats.queue_high_water.fetch_max(
             occupied.saturating_add(1).min(capacity_packets) as u64,
@@ -135,18 +617,22 @@ async fn run_tun_ingress_pump<R>(
             Ok(permit) => permit,
             Err(mpsc::error::TrySendError::Full(())) => {
                 stats.full_waits.fetch_add(1, Ordering::Relaxed);
-                match sender.reserve().await {
-                    Ok(permit) => permit,
-                    Err(_) => break,
+                tokio::select! {
+                    biased;
+                    _ = control.stopped() => return PumpExit::StopRequested,
+                    permit = sender.reserve() => match permit {
+                        Ok(permit) => permit,
+                        Err(_) => return PumpExit::ConsumerClosed,
+                    }
                 }
             }
-            Err(mpsc::error::TrySendError::Closed(())) => break,
+            Err(mpsc::error::TrySendError::Closed(())) => return PumpExit::ConsumerClosed,
         };
-        permit.send(Ok(packet));
+        packet.enqueue();
+        permit.send(packet);
         stats.packets.fetch_add(1, Ordering::Relaxed);
         stats.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
     }
-    stats.closed.fetch_add(1, Ordering::Relaxed);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -165,6 +651,8 @@ impl VirtualTunDevice {
         let interface_name = TunDevice::name(device.get_ref()).ok();
         Self {
             backend: VirtualTunBackend::Direct(device),
+            stopping: false,
+            shutdown_failure: None,
             interface_name,
             mtu,
             rx_buffer: None,
@@ -178,15 +666,11 @@ impl VirtualTunDevice {
         let interface_name = TunDevice::name(device.get_ref()).ok();
         let (reader, writer): (ReadHalf<_>, WriteHalf<_>) = tokio::io::split(device);
         let capacity_packets = capacity_packets.max(1);
-        let (receiver, task, stats) = spawn_tun_ingress_pump(reader, mtu, capacity_packets);
+        let ingress = spawn_tun_ingress_pump(reader, mtu, capacity_packets);
         Self {
-            backend: VirtualTunBackend::Pumped {
-                writer,
-                receiver,
-                task,
-                stats,
-                capacity_packets,
-            },
+            backend: VirtualTunBackend::Pumped { writer, ingress },
+            stopping: false,
+            shutdown_failure: None,
             interface_name,
             mtu,
             rx_buffer: None,
@@ -200,17 +684,21 @@ impl VirtualTunDevice {
     // 当这个方法(wait_for_rx())被 .await 唤醒时，说明底层的 tun0 网卡来数据包了，我们需要把它读出来，存进 rx_buffer 这个“收货仓库”里，准备等下喂给 smoltcp。
     /// 异步进货：等待物理网卡吐出数据，存入 rx_buffer
     pub async fn wait_for_rx(&mut self) -> std::io::Result<()> {
+        if self.stopping {
+            return Err(device_closed());
+        }
         if self.rx_buffer.is_some() {
             return Ok(());
         }
         let mut buf = match &mut self.backend {
+            VirtualTunBackend::Stopped => return Err(device_closed()),
             VirtualTunBackend::Direct(device) => {
                 let mut buf = BytesMut::zeroed(rx_buffer_capacity_for_mtu(self.mtu));
                 let n = device.read(&mut buf).await?;
                 buf.truncate(n);
                 buf
             }
-            VirtualTunBackend::Pumped { receiver, .. } => match receiver.recv().await {
+            VirtualTunBackend::Pumped { ingress, .. } => match ingress.recv().await {
                 Some(Ok(packet)) => packet,
                 Some(Err(error)) => return Err(error),
                 None => {
@@ -252,11 +740,15 @@ impl VirtualTunDevice {
     }
 
     pub fn try_recv_rx(&mut self) -> std::io::Result<bool> {
+        if self.stopping {
+            return Err(device_closed());
+        }
         if self.rx_buffer.is_some() {
             return Ok(true);
         }
 
         let packet = match &mut self.backend {
+            VirtualTunBackend::Stopped => return Err(device_closed()),
             VirtualTunBackend::Direct(device) => {
                 let mut buf = BytesMut::zeroed(rx_buffer_capacity_for_mtu(self.mtu));
                 loop {
@@ -272,7 +764,7 @@ impl VirtualTunDevice {
                     }
                 }
             }
-            VirtualTunBackend::Pumped { receiver, .. } => match receiver.try_recv() {
+            VirtualTunBackend::Pumped { ingress, .. } => match ingress.try_recv() {
                 Ok(Ok(packet)) => packet,
                 Ok(Err(error)) => return Err(error),
                 Err(mpsc::error::TryRecvError::Empty) => return Ok(false),
@@ -290,6 +782,9 @@ impl VirtualTunDevice {
     }
 
     pub async fn flush_tx(&mut self) -> std::io::Result<()> {
+        if self.stopping {
+            return Err(device_closed());
+        }
         // // 1. 从发货仓库里取一个包
         // let packet = self.tx_queue.pop_front().ok_or("发货仓库为空")?;
         // // 2. 异步写入网卡
@@ -300,6 +795,7 @@ impl VirtualTunDevice {
             let flushed_tcp_packet = summarize_flushed_tcp_packet(&packet);
             // 无论是 macOS 还是 Linux，发货仓库里的包已经是完美形态了，直接发！
             match &mut self.backend {
+                VirtualTunBackend::Stopped => return Err(device_closed()),
                 VirtualTunBackend::Direct(device) => device.write_all(&packet).await?,
                 VirtualTunBackend::Pumped { writer, .. } => writer.write_all(&packet).await?,
             }
@@ -313,20 +809,32 @@ impl VirtualTunDevice {
     /// 下行注入：把构造好的裸 IPv4/UDP 包塞进发货队列，等 `flush_tx` 发出。
     /// 中文要点：UDP relay 绕过 smoltcp，回程包由主循环用 etherparse 造好后经此注入。
     pub fn inject_ip_packet(&mut self, pkt: &[u8]) {
+        if self.stopping {
+            return;
+        }
         push_injected(&mut self.tx_queue, pkt);
     }
 
     /// 只读窥视当前收货仓库（不取走）：classify_inbound / inspect_inbound_syn 热路径用。
     pub fn rx_peek(&self) -> Option<&[u8]> {
+        if self.stopping {
+            return None;
+        }
         self.rx_buffer.as_deref()
     }
 
     /// 取走当前收货仓库（UDP relay 把包 take 走、不进 iface.poll）。
     pub fn rx_take(&mut self) -> Option<BytesMut> {
+        if self.stopping {
+            return None;
+        }
         self.rx_buffer.take()
     }
 
     pub fn stage_rx_for_iface(&mut self) -> bool {
+        if self.stopping {
+            return false;
+        }
         let Some(packet) = self.rx_buffer.take() else {
             return false;
         };
@@ -340,21 +848,19 @@ impl VirtualTunDevice {
 
     pub fn tun_ingress_pump_snapshot(&self) -> TunIngressPumpSnapshot {
         match &self.backend {
-            VirtualTunBackend::Direct(_) => TunIngressPumpSnapshot::default(),
-            VirtualTunBackend::Pumped {
-                stats,
-                capacity_packets,
-                ..
-            } => stats.snapshot(*capacity_packets),
+            VirtualTunBackend::Stopped | VirtualTunBackend::Direct(_) => {
+                TunIngressPumpSnapshot::default()
+            }
+            VirtualTunBackend::Pumped { ingress, .. } => {
+                ingress.control.stats.snapshot(ingress.capacity_packets)
+            }
         }
     }
 }
 
 impl Drop for VirtualTunDevice {
     fn drop(&mut self) {
-        if let VirtualTunBackend::Pumped { task, .. } = &self.backend {
-            task.abort();
-        }
+        self.request_stop();
     }
 }
 
@@ -366,6 +872,10 @@ impl Drop for VirtualTunDevice {
 /// 含 GAT、非对象安全），生产热路径零 dyn 开销。
 #[allow(async_fn_in_trait)] // 仅作泛型约束使用、从不 `dyn TunIo`，无需 auto-trait 边界
 pub trait TunIo: Device {
+    /// Close admission and wake owned background tasks. This does not claim settlement.
+    fn request_stop(&mut self);
+    /// Observe real joins and release this device's backend and owned queue backing.
+    fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<DeviceShutdown>;
     /// 异步进货：等待下一个 IP 包就绪并存入内部 rx 槽。
     async fn wait_for_rx(&mut self) -> std::io::Result<()>;
     /// 非阻塞进货：若已有 IP 包 ready，则存入内部 rx 槽；无包时返回 Ok(false)。
@@ -376,6 +886,11 @@ pub trait TunIo: Device {
     fn rx_take(&mut self) -> Option<BytesMut>;
     /// 将已分类的 TCP rx 包从原始单槽移交给 smoltcp FIFO。
     fn stage_rx_for_iface(&mut self) -> bool;
+    /// True only when the staged FIFO is empty AND Device::receive consumes
+    /// exclusively that FIFO. Unknown devices conservatively use full polling.
+    fn can_stage_single_iface_rx(&self) -> bool {
+        false
+    }
     /// 异步发货：把发货队列里排队的包全部写出。
     async fn flush_tx(&mut self) -> std::io::Result<()>;
     /// 当前等待写入 OS TUN 的 IP 包字节数。默认 0，真实/回环设备可覆盖用于诊断本地 egress 进展。
@@ -398,6 +913,29 @@ pub trait TunIo: Device {
 }
 
 impl TunIo for VirtualTunDevice {
+    fn request_stop(&mut self) {
+        self.stopping = true;
+        if let VirtualTunBackend::Pumped { ingress, .. } = &self.backend {
+            ingress.request_stop();
+        }
+    }
+
+    fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<DeviceShutdown> {
+        self.request_stop();
+        let result = if let VirtualTunBackend::Pumped { ingress, .. } = &mut self.backend {
+            std::task::ready!(ingress.poll_shutdown(cx))
+        } else {
+            DeviceShutdown::from_status(self.shutdown_failure)
+        };
+        self.shutdown_failure = result.io_kind();
+        self.backend = VirtualTunBackend::Stopped;
+        self.rx_buffer.take();
+        drop(std::mem::take(&mut self.iface_rx_queue));
+        drop(std::mem::take(&mut self.tx_queue));
+        drop(std::mem::take(&mut self.flushed_tcp_packets));
+        Poll::Ready(result)
+    }
+
     // 委托既有 inherent 方法（inherent 优先于 trait 解析，不会递归）。
     async fn wait_for_rx(&mut self) -> std::io::Result<()> {
         VirtualTunDevice::wait_for_rx(self).await
@@ -410,6 +948,9 @@ impl TunIo for VirtualTunDevice {
     }
     fn rx_take(&mut self) -> Option<BytesMut> {
         VirtualTunDevice::rx_take(self)
+    }
+    fn can_stage_single_iface_rx(&self) -> bool {
+        self.iface_rx_queue.is_empty()
     }
     fn stage_rx_for_iface(&mut self) -> bool {
         VirtualTunDevice::stage_rx_for_iface(self)
@@ -565,6 +1106,9 @@ impl Device for VirtualTunDevice {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if self.stopping {
+            return None;
+        }
         // ⚠️ 这里的逻辑是将 rx_buffer 里的数据拿出来，打包成 RxToken
         // 如果仓库里有货，就 take() 拿走，打包成收货单和发货单交给 smoltcp
         // 如果仓库里没有货，就返回 None
@@ -580,6 +1124,9 @@ impl Device for VirtualTunDevice {
     }
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+        if self.stopping {
+            return None;
+        }
         // 只需要返回一个持有 tx_queue 可变引用的 TxToken 即可
         // 直接给一张发货单，里面带着发货仓库的钥匙
         // （不在此 println! tx_queue——每次发包热路径，同步 stdout 会拖垮主循环）
@@ -629,184 +1176,4 @@ fn device_capabilities_for_mtu(mtu: usize) -> DeviceCapabilities {
 接收包：None
 */
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-    use std::time::Duration;
-    use tokio::io::{AsyncWriteExt, ReadBuf};
-
-    fn frame_tx_test_packet(packet: Vec<u8>) -> Vec<u8> {
-        #[cfg(target_os = "macos")]
-        {
-            let mut framed = Vec::with_capacity(UTUN_IPV4_HEADER.len() + packet.len());
-            framed.extend_from_slice(&UTUN_IPV4_HEADER);
-            framed.extend_from_slice(&packet);
-            framed
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            packet
-        }
-    }
-
-    #[test]
-    fn inject_enqueues_with_platform_header() {
-        let mut q: VecDeque<BytesMut> = VecDeque::new();
-        let pkt = vec![69u8, 0, 0, 28]; // IPv4 header start (version=4, ihl=5)
-        push_injected(&mut q, &pkt);
-        let framed = q.pop_front().expect("packet enqueued");
-        #[cfg(target_os = "macos")]
-        {
-            assert_eq!(&framed[..4], &[0, 0, 0, 2], "macOS PI header prepended");
-            assert_eq!(&framed[4..], &pkt[..]);
-        }
-        #[cfg(not(target_os = "macos"))]
-        assert_eq!(&framed[..], &pkt[..]);
-    }
-
-    #[test]
-    fn rx_buffer_capacity_tracks_configured_mtu() {
-        #[cfg(target_os = "macos")]
-        assert_eq!(rx_buffer_capacity_for_mtu(1200), 1204);
-        #[cfg(not(target_os = "macos"))]
-        assert_eq!(rx_buffer_capacity_for_mtu(1200), 1200);
-    }
-
-    #[test]
-    fn device_capabilities_tracks_configured_mtu() {
-        let caps = device_capabilities_for_mtu(1200);
-        assert_eq!(caps.medium, Medium::Ip);
-        assert_eq!(caps.max_transmission_unit, 1200);
-        assert!(matches!(caps.checksum.tcp, smoltcp::phy::Checksum::Tx));
-        assert!(matches!(caps.checksum.ipv4, smoltcp::phy::Checksum::Tx));
-        assert!(matches!(caps.checksum.icmpv4, smoltcp::phy::Checksum::Tx));
-    }
-
-    #[test]
-    fn summarize_flushed_tcp_packet_reports_payload_tuple() {
-        let src = [10, 0, 0, 2];
-        let dst = [203, 0, 113, 9];
-        let payload = b"payload-bytes";
-        let builder = etherparse::PacketBuilder::ipv4(src, dst, 64).tcp(443, 53124, 1, 1024);
-        let mut packet = Vec::with_capacity(builder.size(payload.len()));
-        builder.write(&mut packet, payload).unwrap();
-        let packet = frame_tx_test_packet(packet);
-
-        let summary = summarize_flushed_tcp_packet(&packet).expect("tcp payload summary");
-
-        assert_eq!(summary.src_addr, Ipv4Addr::from(src));
-        assert_eq!(summary.dst_addr, Ipv4Addr::from(dst));
-        assert_eq!(summary.src_port, 443);
-        assert_eq!(summary.dst_port, 53124);
-        assert_eq!(summary.payload_bytes, payload.len());
-    }
-
-    #[test]
-    fn summarize_flushed_tcp_packet_ignores_ack_only_packets() {
-        let builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [203, 0, 113, 9], 64)
-            .tcp(443, 53124, 1, 1024);
-        let mut packet = Vec::with_capacity(builder.size(0));
-        builder.write(&mut packet, &[]).unwrap();
-        let packet = frame_tx_test_packet(packet);
-
-        assert!(summarize_flushed_tcp_packet(&packet).is_none());
-    }
-
-    #[tokio::test]
-    async fn tun_ingress_pump_preserves_fifo_and_accounts_full_wait() {
-        let (mut writer, reader) = tokio::io::duplex(4096);
-        let (mut receiver, task, stats) = spawn_tun_ingress_pump(reader, 1200, 1);
-        let first = vec![0x11; 16];
-        let second = vec![0x22; 16];
-
-        writer.write_all(&first).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while stats.packets.load(Ordering::Relaxed) != 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("first packet should enter the bounded FIFO");
-
-        writer.write_all(&second).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while stats.full_waits.load(Ordering::Relaxed) != 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("second packet should wait behind the full one-packet FIFO");
-
-        assert_eq!(receiver.recv().await.unwrap().unwrap().as_ref(), first);
-        assert_eq!(receiver.recv().await.unwrap().unwrap().as_ref(), second);
-        drop(writer);
-        task.await.unwrap();
-
-        assert_eq!(
-            stats.snapshot(1),
-            TunIngressPumpSnapshot {
-                enabled: true,
-                packets: 2,
-                bytes: 32,
-                queue_high_water: 1,
-                capacity_packets: 1,
-                full_waits: 1,
-                read_errors: 0,
-                closed: 1,
-            }
-        );
-    }
-
-    struct FailingPacketReader;
-
-    impl AsyncRead for FailingPacketReader {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _buf: &mut ReadBuf<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "synthetic TUN read failure",
-            )))
-        }
-    }
-
-    #[tokio::test]
-    async fn tun_ingress_pump_surfaces_read_error_once_then_closes() {
-        let (mut receiver, task, stats) = spawn_tun_ingress_pump(FailingPacketReader, 1200, 4);
-
-        let error = receiver
-            .recv()
-            .await
-            .expect("one terminal error event")
-            .expect_err("event should retain the read error");
-        assert_eq!(error.kind(), ErrorKind::InvalidData);
-        task.await.unwrap();
-        assert!(receiver.recv().await.is_none());
-
-        let snapshot = stats.snapshot(4);
-        assert_eq!(snapshot.read_errors, 1);
-        assert_eq!(snapshot.closed, 1);
-        assert_eq!(snapshot.packets, 0);
-    }
-
-    #[tokio::test]
-    async fn tun_ingress_pump_stops_when_consumer_closes() {
-        let (mut writer, reader) = tokio::io::duplex(4096);
-        let (receiver, task, stats) = spawn_tun_ingress_pump(reader, 1200, 4);
-        drop(receiver);
-
-        writer.write_all(&[0x33; 16]).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .expect("pump should stop after its bounded FIFO consumer closes")
-            .expect("pump task should not panic");
-
-        let snapshot = stats.snapshot(4);
-        assert_eq!(snapshot.closed, 1);
-        assert_eq!(snapshot.packets, 0);
-        assert_eq!(snapshot.read_errors, 0);
-    }
-}
+mod tests;

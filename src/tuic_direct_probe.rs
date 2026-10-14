@@ -207,6 +207,18 @@ async fn finish_bridge(
     }
 }
 
+pub(super) fn validate_direct_probe_generic_mode(policy: &RelayFamilyPolicy) -> Result<(), String> {
+    let mode = policy.tuic_generic_mode();
+    if mode == TuicTcpRelayMode::OrderedJoin {
+        Ok(())
+    } else {
+        Err(format!(
+            "direct TUIC probe requires ordered_join, got {}",
+            mode.as_str()
+        ))
+    }
+}
+
 async fn run_cross_host_direct_tuic_probe_from_env() -> Result<(), String> {
     let target = TargetAddr::parse(&required_probe_env("MINI_VPN_KNIFE14_DIRECT_TUIC_TARGET")?)
         .map_err(|err| format!("direct TUIC probe target: {err:?}"))?;
@@ -223,15 +235,10 @@ async fn run_cross_host_direct_tuic_probe_from_env() -> Result<(), String> {
             "direct TUIC probe duration out of range: {duration_secs}"
         ));
     }
-    if tuic_tcp_relay_mode() != TuicTcpRelayMode::OrderedJoin {
-        return Err(format!(
-            "direct TUIC probe requires ordered_join, got {}",
-            tuic_tcp_relay_mode().as_str()
-        ));
-    }
-
-    let mut config =
-        TuicClientConfig::from_env().map_err(|err| format!("direct TUIC probe config: {err:?}"))?;
+    let relay_policy = Arc::new(RelayFamilyPolicy::from_env());
+    validate_direct_probe_generic_mode(&relay_policy)?;
+    let mut config = TuicClientConfig::from_env_with_relay_policy(relay_policy)
+        .map_err(|err| format!("direct TUIC probe config: {err:?}"))?;
     config.congestion_control = "cubic".to_string();
     config.mtu_policy = "safe1200".to_string();
     config.tcp_pool = 1;

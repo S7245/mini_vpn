@@ -10,11 +10,11 @@ use std::{
     future::Future,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
-    pin::{Pin, pin},
+    pin::{pin, Pin},
     str,
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
@@ -22,11 +22,11 @@ use std::{
 use crate::runtime::TokioRuntime;
 use crate::{Duration, Instant};
 use bytes::Bytes;
-use proto::{RandomConnectionIdGenerator, crypto::rustls::QuicClientConfig};
-use rand::{RngCore, SeedableRng, rngs::StdRng};
+use proto::{crypto::rustls::QuicClientConfig, RandomConnectionIdGenerator};
+use rand::{rngs::StdRng, RngCore, SeedableRng};
 use rustls::{
-    RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    RootCertStore,
 };
 use tokio::time::{sleep, timeout};
 use tokio::{
@@ -37,7 +37,99 @@ use tracing::{error_span, info};
 use tracing_futures::Instrument as _;
 use tracing_subscriber::EnvFilter;
 
-use super::{ClientConfig, Endpoint, EndpointConfig, RecvStream, SendStream, TransportConfig};
+use super::{
+    AsyncUdpSocket, ClientConfig, Endpoint, EndpointConfig, RecvStream, SendStream,
+    TransportConfig, UdpPoller,
+};
+
+#[derive(Debug)]
+struct EndpointDriverFailureSocket;
+
+impl AsyncUdpSocket for EndpointDriverFailureSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        Box::pin(EndpointDriverReadyPoller)
+    }
+
+    fn try_send(&self, _transmit: &crate::udp::Transmit<'_>) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn poll_recv(
+        &self,
+        _cx: &mut Context,
+        _bufs: &mut [io::IoSliceMut<'_>],
+        _meta: &mut [crate::udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::Error::other(
+            "deterministic endpoint driver failure",
+        )))
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, 50002)))
+    }
+}
+
+#[derive(Debug)]
+struct EndpointDriverReadyPoller;
+
+impl UdpPoller for EndpointDriverReadyPoller {
+    fn poll_writable(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn endpoint_driver_drain_waits_for_the_last_endpoint_handle() {
+    let mut endpoint = Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("construct client endpoint");
+    let mut retained = endpoint.clone();
+    let drain = endpoint
+        .take_driver_drain_handle()
+        .expect("one exact endpoint driver witness");
+    assert!(
+        retained.take_driver_drain_handle().is_none(),
+        "all endpoint clones share one consuming driver witness slot",
+    );
+    drop(endpoint);
+    let mut drain = Box::pin(drain.drained());
+
+    assert!(
+        timeout(Duration::from_millis(10), drain.as_mut())
+            .await
+            .is_err(),
+        "driver completion cannot precede release of the final endpoint handle",
+    );
+    drop(retained);
+    assert!(
+        timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("endpoint driver completion is bounded"),
+        "normal endpoint driver completion mints the exact witness",
+    );
+}
+
+#[tokio::test]
+async fn endpoint_driver_drain_fails_closed_on_socket_io_error() {
+    let mut endpoint = Endpoint::new_with_abstract_socket(
+        EndpointConfig::default(),
+        None,
+        Arc::new(EndpointDriverFailureSocket),
+        Arc::new(TokioRuntime),
+    )
+    .expect("construct deterministic failing endpoint");
+    let drain = endpoint
+        .take_driver_drain_handle()
+        .expect("one exact endpoint driver witness");
+
+    assert!(
+        !timeout(Duration::from_secs(1), drain.drained())
+            .await
+            .expect("endpoint driver failure is bounded"),
+        "I/O failure cannot mint a normal endpoint driver completion witness",
+    );
+    drop(endpoint);
+}
 
 #[test]
 fn handshake_timeout() {
@@ -138,19 +230,27 @@ async fn send_stream_progress_handle_tracks_acknowledgements() {
             .expect("server handshake");
         let mut recv = connection.accept_uni().await.expect("incoming stream");
         let mut data = vec![0; MSG.len()];
-        recv.read_exact(&mut data).await.expect("read stream payload");
+        recv.read_exact(&mut data)
+            .await
+            .expect("read stream payload");
         assert_eq!(data, MSG);
     });
 
     let connection = endpoint
-        .connect(endpoint.local_addr().expect("endpoint address"), "localhost")
+        .connect(
+            endpoint.local_addr().expect("endpoint address"),
+            "localhost",
+        )
         .expect("start connection")
         .await
         .expect("client handshake");
     let mut send = connection.open_uni().await.expect("open stream");
     let progress = send.progress_handle();
     send.write_all(MSG).await.expect("write stream payload");
-    assert_eq!(progress.sample().expect("written progress").written_bytes, MSG.len() as u64);
+    assert_eq!(
+        progress.sample().expect("written progress").written_bytes,
+        MSG.len() as u64
+    );
 
     timeout(Duration::from_secs(2), async {
         loop {
@@ -187,9 +287,10 @@ async fn recv_stream_progress_handle_tracks_ordered_delivery() {
 
         timeout(Duration::from_secs(2), async {
             loop {
-                if progress.sample().is_ok_and(|sample| {
-                    sample.highest_received_offset == MSG.len() as u64
-                }) {
+                if progress
+                    .sample()
+                    .is_ok_and(|sample| sample.highest_received_offset == MSG.len() as u64)
+                {
                     break;
                 }
                 sleep(Duration::from_millis(10)).await;
@@ -204,7 +305,9 @@ async fn recv_stream_progress_handle_tracks_ordered_delivery() {
         assert_eq!(buffered.ordered_gap_bytes, 0);
 
         let mut data = vec![0; MSG.len()];
-        recv.read_exact(&mut data).await.expect("read stream payload");
+        recv.read_exact(&mut data)
+            .await
+            .expect("read stream payload");
         assert_eq!(data, MSG);
         let delivered = progress.sample().expect("delivered progress");
         assert_eq!(delivered.read_offset, MSG.len() as u64);
@@ -220,7 +323,10 @@ async fn recv_stream_progress_handle_tracks_ordered_delivery() {
     });
 
     let connection = endpoint
-        .connect(endpoint.local_addr().expect("endpoint address"), "localhost")
+        .connect(
+            endpoint.local_addr().expect("endpoint address"),
+            "localhost",
+        )
         .expect("start connection")
         .await
         .expect("client handshake");
@@ -254,12 +360,17 @@ async fn connection_path_changed_resets_transport_state_and_preserves_stream() {
         recv.read_exact(&mut first).await.expect("first payload");
         assert!(first.iter().all(|byte| *byte == 0xA5));
         let mut second = vec![0; SECOND.len()];
-        recv.read_exact(&mut second).await.expect("post-reset payload");
+        recv.read_exact(&mut second)
+            .await
+            .expect("post-reset payload");
         assert_eq!(second, SECOND);
     });
 
     let connection = endpoint
-        .connect(endpoint.local_addr().expect("endpoint address"), "localhost")
+        .connect(
+            endpoint.local_addr().expect("endpoint address"),
+            "localhost",
+        )
         .expect("start connection")
         .await
         .expect("client handshake");
@@ -296,7 +407,9 @@ async fn connection_path_changed_resets_transport_state_and_preserves_stream() {
         reset.cwnd
     );
 
-    send.write_all(SECOND).await.expect("write after path reset");
+    send.write_all(SECOND)
+        .await
+        .expect("write after path reset");
     send.finish().expect("finish same stream");
     server.await.expect("server task");
 
@@ -323,22 +436,25 @@ async fn send_stream_atomic_priority_restore_delivers_bytes() {
             .expect("server handshake");
         let mut recv = connection.accept_uni().await.expect("incoming stream");
         let mut data = vec![0; MSG.len()];
-        recv.read_exact(&mut data).await.expect("read stream payload");
+        recv.read_exact(&mut data)
+            .await
+            .expect("read stream payload");
         assert_eq!(data, MSG);
     });
 
     let connection = endpoint
-        .connect(endpoint.local_addr().expect("endpoint address"), "localhost")
+        .connect(
+            endpoint.local_addr().expect("endpoint address"),
+            "localhost",
+        )
         .expect("start connection")
         .await
         .expect("client handshake");
     let mut send = connection.open_uni().await.expect("open stream");
     send.set_priority(1).expect("arm startup priority");
-    std::future::poll_fn(|cx| {
-        Pin::new(&mut send).poll_write_then_set_priority(cx, MSG, 0)
-    })
-    .await
-    .expect("write startup payload");
+    std::future::poll_fn(|cx| Pin::new(&mut send).poll_write_then_set_priority(cx, MSG, 0))
+        .await
+        .expect("write startup payload");
     assert_eq!(send.priority().expect("restored priority"), 0);
     send.finish().expect("finish stream");
 
@@ -990,7 +1106,10 @@ async fn rebind_recv() {
     write_send.notify_one();
     assert_eq!(stream.id(), stream_id);
     assert_eq!(progress.id(), stream_id);
-    assert_eq!(stream.read_to_end(AFTER_REBIND.len()).await.unwrap(), AFTER_REBIND);
+    assert_eq!(
+        stream.read_to_end(AFTER_REBIND.len()).await.unwrap(),
+        AFTER_REBIND
+    );
     assert_eq!(client.stats().current_socket_rx_rebind_generation, 1);
     assert_eq!(connection.current_socket_rx_rebind_generation(), 1);
     server.await.unwrap();

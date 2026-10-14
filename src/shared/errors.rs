@@ -17,3 +17,8 @@ pub enum ClientError {
     #[error("REALITY error: {0}")]
     Reality(String),
 }
+
+mod retained;
+pub(crate) use retained::{
+    FailureClass, FailureFacts, FailureOrigin, FailurePhase, FailureResource, RetainedFailure,
+};

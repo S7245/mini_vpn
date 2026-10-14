@@ -1,22 +1,15 @@
-//! Serialized owner-side Target effect execution for one resumable session.
-//!
-//! This is the production-shared boundary between the pure session reducer and
-//! a concrete [`TargetIo`].  It consumes reducer-issued capabilities, performs
-//! the corresponding Target operation exactly once, and feeds only the exact
-//! completion back through [`SessionSupervisor`].  It never manufactures an
-//! ACK, replay receipt, terminal capability, or raw `LocalData` event.
-
-use std::collections::{BTreeMap, VecDeque};
-use std::fmt;
-use std::sync::{Arc, Weak};
-
-use thiserror::Error;
-
-use crate::resumable::{
-    FlowFinishReason, Frame, LegGeneration, OpenResultCode, PeerOpenRequest, Record, ResetReason,
-    SessionEffect, SessionEvent, SessionFlowId, SinkOffer, TcpDataSegment, TerminalGrace,
-};
-
+//! Sole Target owner; executes original capabilities once; Bound commands stay local.
+mod binding;
+mod commands;
+mod completion;
+mod construction;
+mod effect_storage;
+pub(in crate::owned_upstream) mod error_inventory;
+mod observed_turn;
+mod read_source;
+mod service;
+#[cfg(test)]
+pub(super) struct OwnerCommandPrototype(commands::SessionCommands);
 use super::leg::{
     AttachedLeg, BoundInbound, EstablishedLeg, ExactLegTerminal, LegBoundFrame, LegSeal,
     LegTerminalTransitionError, LegTransportEndpoint, LegTransportTerminalReason, PendingLegLoss,
@@ -24,29 +17,40 @@ use super::leg::{
 };
 use super::leg_io::{
     AttachAcceptanceEnqueued, AttachAcceptanceReservation, AttachAcceptanceReserveError,
-    AttachStatusEnqueued, LegOutboundQueue, LegOutboundQueueErrorKind,
+    AttachStatusEnqueued, LegIo, LegOutboundQueue, LegOutboundQueueErrorKind,
+    PhysicalLegActorBinding, PhysicalLegRuntimeIncarnation,
 };
 use super::session::SessionOwnerCommand;
 use super::standby::{ExactAuthenticatedStandby, OwnerRegisteredAttachGateError, OwnerStandbySlot};
 use super::supervisor::{
     AuthenticatedOwnerAttachStatus, LeglessOwnerSessionBootstrap, OwnerAttachPublication,
-    OwnerCatchUpArm, ReducerAdmissionBlock, SessionSupervisor, SessionSupervisorError,
-    SessionSupervisorSnapshot, TcpPortFactoryMintError,
+    OwnerCatchUpArm, OwnerSessionBootstrap, ReducerAdmissionBlock, ReducerApplicationAckAdvanced,
+    ReducerFlowDirectionTerminal, ReducerOwnerObservations, ReducerReplayBecameOutstanding,
+    ReducerSessionExpired, SessionSupervisor, SessionSupervisorError, SessionSupervisorSnapshot,
+    TcpPortFactoryMintError,
 };
 use super::target::{
-    TargetCancelCompletion, TargetHalfCloseCompletion, TargetIo, TargetIoError,
-    TargetJoinCompletion, TargetOpenCompletion, TargetOpenFailure, TargetResetCompletion,
-    TargetTerminalKind, TargetTombstoneRetireCompletion, TargetWriteCompletion,
+    TargetCancelCompletion, TargetHalfCloseCompletion, TargetIo, TargetIoCapacityWitness,
+    TargetIoColdInventory, TargetIoColdInventoryError, TargetIoError, TargetJoinCompletion,
+    TargetOpenCompletion, TargetOpenFailure, TargetResetCompletion, TargetTerminalKind,
+    TargetTombstoneRetireCompletion, TargetWriteCompletion,
 };
 use super::tcp::{
     DriverInput, FlowPortConfig, FlowPortConfigError, FlowPortError, ResumableTcpDriver,
-    ResumableTcpFlow, ResumableTcpPortFactory,
+    ResumableTcpFlow, ResumableTcpPortFactory, TcpPortFactoryCapacityWitness,
 };
-
+use crate::resumable::{
+    AttachNonce, ByteOffset, Direction, FlowFinishReason, Frame, LegGeneration,
+    MAX_DATA_PAYLOAD_BYTES, OpenResultCode, PeerOpenRequest, Record, ResetReason, SessionEffect,
+    SessionEvent, SessionFlowId, SessionId, SinkOffer, TcpDataSegment, TerminalGrace,
+};
+use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
+use std::sync::{Arc, Weak};
+use thiserror::Error;
 // Audited reducer fan-out for every non-recovery command the Target executor
 // can issue: one Transmit, one HalfClose/FlowFinished, and one following offer.
 const MAX_INCREMENTAL_EFFECT_BURST: usize = 3;
-
 /// Closed work bound for one synchronous reducer/Target turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OwnerTargetConfig {
@@ -54,7 +58,6 @@ pub(crate) struct OwnerTargetConfig {
     max_pending_effects: usize,
     max_target_read_bytes: usize,
 }
-
 impl OwnerTargetConfig {
     pub(crate) fn new(
         max_effect_steps: usize,
@@ -89,9 +92,10 @@ impl OwnerTargetConfig {
         self.max_pending_effects
     }
 }
-
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub(crate) enum OwnerTargetConfigError {
+    #[error("owner effect backing cannot be prepared: {0}")]
+    EffectStorage(#[from] crate::resumable::effect_storage::EffectStorageError),
     #[error("owner Target effect-step bound must be non-zero")]
     ZeroEffectSteps,
     #[error("owner Target read bound must be non-zero")]
@@ -104,6 +108,10 @@ pub(crate) enum OwnerTargetConfigError {
     TargetReadExceedsFlowCapacity { requested: usize, available: usize },
     #[error("owner Target read bound {requested} exceeds session source capacity {available}")]
     TargetReadExceedsSessionCapacity { requested: usize, available: usize },
+    #[error(
+        "owner Target read bound {requested} exceeds one source DATA record capacity {available}"
+    )]
+    TargetReadExceedsSingleDataPayload { requested: usize, available: usize },
     #[error("owner recovery effect-capacity derivation overflowed")]
     RecoveryEffectCapacityOverflow,
     #[error(
@@ -136,14 +144,14 @@ impl From<TcpPortFactoryMintError> for OwnerTargetConfigError {
             TcpPortFactoryMintError::InvalidDerivedCapacity(source) => {
                 Self::InvalidSourceFactoryCapacity(source)
             }
-            state @ (TcpPortFactoryMintError::PoisonedSupervisor
+            state @ (TcpPortFactoryMintError::FactoryAdmissionClosed
+            | TcpPortFactoryMintError::PoisonedSupervisor
             | TcpPortFactoryMintError::SessionNotPristine { .. }) => {
                 Self::InvalidSourceFactoryState(state)
             }
         }
     }
 }
-
 /// Transport and lifecycle facts that remain after Target effects are fully
 /// consumed.  Only a reducer-produced `Frame` can become transport output.
 #[derive(PartialEq, Eq)]
@@ -155,7 +163,302 @@ pub(crate) enum OwnerTargetOutput {
     SessionExpired,
     NeedsResume { resume: OwnerTargetResume },
 }
+/// Reducer-committed positive application-ACK progress observed only through
+/// the serialized owner Target executor. The reducer receipt and its replay
+/// ownership never leave the supervisor.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OwnerTargetApplicationAckAdvanced(ReducerApplicationAckAdvanced);
 
+impl OwnerTargetApplicationAckAdvanced {
+    pub(crate) const fn session_id(&self) -> crate::resumable::SessionId {
+        self.0.session_id()
+    }
+
+    pub(crate) const fn flow_id(&self) -> SessionFlowId {
+        self.0.flow_id()
+    }
+
+    pub(crate) const fn generation(&self) -> LegGeneration {
+        self.0.generation()
+    }
+
+    pub(crate) const fn direction(&self) -> crate::resumable::Direction {
+        self.0.direction()
+    }
+
+    pub(crate) const fn previous_accepted(&self) -> crate::resumable::ByteOffset {
+        self.0.previous_accepted()
+    }
+
+    pub(crate) const fn next_accepted(&self) -> crate::resumable::ByteOffset {
+        self.0.next_accepted()
+    }
+
+    pub(crate) const fn released_bytes(&self) -> usize {
+        self.0.released_bytes()
+    }
+
+    pub(crate) const fn final_accepted(&self) -> bool {
+        self.0.final_accepted()
+    }
+
+    /// Exact oldest byte still retained for this flow/direction after the
+    /// whole reducer turn, including any same-turn terminal cleanup.
+    pub(crate) const fn remaining_oldest(&self) -> Option<ByteOffset> {
+        self.0.remaining_oldest()
+    }
+}
+/// Reducer-proven first transition from no replay to outstanding replay for
+/// one exact flow direction. No byte payload or replay authority escapes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OwnerTargetReplayBecameOutstanding(ReducerReplayBecameOutstanding);
+
+impl OwnerTargetReplayBecameOutstanding {
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.0.session_id()
+    }
+
+    pub(crate) const fn flow_id(&self) -> SessionFlowId {
+        self.0.flow_id()
+    }
+
+    pub(crate) const fn generation(&self) -> LegGeneration {
+        self.0.generation()
+    }
+
+    pub(crate) const fn direction(&self) -> Direction {
+        self.0.direction()
+    }
+
+    pub(crate) const fn start(&self) -> ByteOffset {
+        self.0.start()
+    }
+
+    pub(crate) const fn end(&self) -> ByteOffset {
+        self.0.end()
+    }
+}
+/// Reducer-proven terminal transition for one exact flow direction.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OwnerTargetFlowDirectionTerminal(ReducerFlowDirectionTerminal);
+impl OwnerTargetFlowDirectionTerminal {
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.0.session_id()
+    }
+    pub(crate) const fn flow_id(&self) -> SessionFlowId {
+        self.0.flow_id()
+    }
+    pub(crate) const fn generation(&self) -> LegGeneration {
+        self.0.generation()
+    }
+    pub(crate) const fn direction(&self) -> Direction {
+        self.0.direction()
+    }
+
+    pub(super) const fn terminal(&self) -> &TerminalGrace {
+        self.0.terminal()
+    }
+}
+/// Reducer-proven retirement of one complete flow after its exact terminal
+/// grace token committed. This is stronger than a directional terminal fact
+/// and is the only progress observation that authorizes releasing both
+/// directional entries.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OwnerTargetFlowRetired {
+    session_id: SessionId,
+    flow_id: SessionFlowId,
+    generation: LegGeneration,
+}
+
+impl OwnerTargetFlowRetired {
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub(crate) const fn flow_id(&self) -> SessionFlowId {
+        self.flow_id
+    }
+
+    pub(crate) const fn generation(&self) -> LegGeneration {
+        self.generation
+    }
+}
+/// Reducer-proven terminal transition for the whole session.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OwnerTargetSessionExpired(ReducerSessionExpired);
+
+impl OwnerTargetSessionExpired {
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.0.session_id()
+    }
+
+    pub(crate) const fn generation(&self) -> LegGeneration {
+        self.0.generation()
+    }
+}
+/// Fixed-size reducer facts from one serialized owner turn. Each optional
+/// field is single-valued and stores neither replay bytes nor ACK history.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct OwnerTargetReducerObservations {
+    replay_became_outstanding: Option<OwnerTargetReplayBecameOutstanding>,
+    application_ack: Option<OwnerTargetApplicationAckAdvanced>,
+    flow_terminal: Option<OwnerTargetFlowDirectionTerminal>,
+    flow_retired: Option<OwnerTargetFlowRetired>,
+    session_expired: Option<OwnerTargetSessionExpired>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnerTargetObservationKind {
+    ReplayBecameOutstanding,
+    ApplicationAck,
+    FlowTerminal,
+    FlowRetired,
+    SessionExpired,
+}
+
+impl OwnerTargetReducerObservations {
+    fn from_supervisor(observations: ReducerOwnerObservations) -> Self {
+        let (replay_became_outstanding, application_ack, flow_terminal, session_expired) =
+            observations.into_parts();
+        Self {
+            replay_became_outstanding: replay_became_outstanding
+                .map(OwnerTargetReplayBecameOutstanding),
+            application_ack: application_ack.map(OwnerTargetApplicationAckAdvanced),
+            flow_terminal: flow_terminal.map(OwnerTargetFlowDirectionTerminal),
+            flow_retired: None,
+            session_expired: session_expired.map(OwnerTargetSessionExpired),
+        }
+    }
+    pub(crate) const fn replay_became_outstanding(
+        &self,
+    ) -> Option<&OwnerTargetReplayBecameOutstanding> {
+        self.replay_became_outstanding.as_ref()
+    }
+    pub(crate) const fn application_ack(&self) -> Option<&OwnerTargetApplicationAckAdvanced> {
+        self.application_ack.as_ref()
+    }
+    pub(crate) const fn flow_terminal(&self) -> Option<&OwnerTargetFlowDirectionTerminal> {
+        self.flow_terminal.as_ref()
+    }
+
+    pub(crate) const fn flow_retired(&self) -> Option<&OwnerTargetFlowRetired> {
+        self.flow_retired.as_ref()
+    }
+
+    pub(crate) const fn session_expired(&self) -> Option<&OwnerTargetSessionExpired> {
+        self.session_expired.as_ref()
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.replay_became_outstanding.is_none()
+            && self.application_ack.is_none()
+            && self.flow_terminal.is_none()
+            && self.flow_retired.is_none()
+            && self.session_expired.is_none()
+    }
+
+    /// Counts reducer facts, not the presence of the fixed-size container.
+    /// Empty post-commit bundles therefore own zero observation facts.
+    pub(super) fn fact_count(&self) -> usize {
+        usize::from(self.replay_became_outstanding.is_some())
+            + usize::from(self.application_ack.is_some())
+            + usize::from(self.flow_terminal.is_some())
+            + usize::from(self.flow_retired.is_some())
+            + usize::from(self.session_expired.is_some())
+    }
+
+    pub(super) fn into_terminal_fact(self) -> Option<OwnerTargetFlowDirectionTerminal> {
+        self.flow_terminal
+    }
+    fn into_application_ack(self) -> Option<OwnerTargetApplicationAckAdvanced> {
+        self.application_ack
+    }
+
+    fn try_merge(&mut self, observations: Self) -> Result<(), OwnerTargetError> {
+        let conflict = [
+            (
+                self.replay_became_outstanding.is_some()
+                    && observations.replay_became_outstanding.is_some(),
+                OwnerTargetObservationKind::ReplayBecameOutstanding,
+            ),
+            (
+                self.application_ack.is_some() && observations.application_ack.is_some(),
+                OwnerTargetObservationKind::ApplicationAck,
+            ),
+            (
+                self.flow_terminal.is_some() && observations.flow_terminal.is_some(),
+                OwnerTargetObservationKind::FlowTerminal,
+            ),
+            (
+                self.flow_retired.is_some() && observations.flow_retired.is_some(),
+                OwnerTargetObservationKind::FlowRetired,
+            ),
+            (
+                self.session_expired.is_some() && observations.session_expired.is_some(),
+                OwnerTargetObservationKind::SessionExpired,
+            ),
+        ]
+        .into_iter()
+        .find_map(|(conflict, kind)| conflict.then_some(kind));
+        if let Some(kind) = conflict {
+            return Err(OwnerTargetError::PostCommitObservationConflict {
+                kind,
+                observations: Box::new(observations),
+            });
+        }
+        let Self {
+            replay_became_outstanding,
+            application_ack,
+            flow_terminal,
+            flow_retired,
+            session_expired,
+        } = observations;
+        if replay_became_outstanding.is_some() {
+            self.replay_became_outstanding = replay_became_outstanding;
+        }
+        if application_ack.is_some() {
+            self.application_ack = application_ack;
+        }
+        if flow_terminal.is_some() {
+            self.flow_terminal = flow_terminal;
+        }
+        if flow_retired.is_some() {
+            self.flow_retired = flow_retired;
+        }
+        if session_expired.is_some() {
+            self.session_expired = session_expired;
+        }
+        Ok(())
+    }
+}
+/// One fully executed owner Target turn plus its fixed post-commit reducer
+/// observations. Existing callers continue to use `apply_event` and receive
+/// the exact same output vector; the legacy `into_parts` ACK shape is retained.
+pub(crate) struct OwnerTargetObservedApply {
+    outputs: Vec<OwnerTargetOutput>,
+    observations: OwnerTargetReducerObservations,
+}
+
+impl OwnerTargetObservedApply {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<OwnerTargetOutput>,
+        Option<OwnerTargetApplicationAckAdvanced>,
+    ) {
+        (self.outputs, self.observations.into_application_ack())
+    }
+
+    pub(crate) fn into_progress_parts(
+        self,
+    ) -> (Vec<OwnerTargetOutput>, OwnerTargetReducerObservations) {
+        (self.outputs, self.observations)
+    }
+
+    fn into_outputs(self) -> Vec<OwnerTargetOutput> {
+        self.outputs
+    }
+}
 /// Post-attach recovery observations after every wire frame has crossed the
 /// exact acceptance queue. This type deliberately has no `Transmit(Frame)`
 /// variant, so replay bytes cannot escape the serialized FIFO boundary.
@@ -176,12 +479,628 @@ pub(crate) enum OwnerTargetRecoveryOutput {
     /// Initial recovery and every continuation are durably ordered behind the
     /// acceptance. Only this terminal observation releases receive authority.
     RecoveryCompleted {
-        attached: AttachedLeg,
+        handoff: OwnerTargetRecoveryHandoff,
     },
 }
 
 struct OwnerTargetExecutorIdentity;
+pub(super) struct OwnerTargetColdPreparationGate(());
+/// Private gate allowing only this module to decompose an initial owner
+/// bootstrap while constructing the executor-bound handoff in the same call.
+/// No physical caller can obtain the intermediate bare `AttachedLeg`.
+pub(super) struct OwnerTargetInitialBootstrapInstallGate {
+    _private: (),
+}
 
+impl OwnerTargetInitialBootstrapInstallGate {
+    fn mint() -> Self {
+        Self { _private: () }
+    }
+}
+/// Private gate allowing only this module to decompose and, on rejection,
+/// exactly reassemble one legless bootstrap around a fallible executor build.
+pub(super) struct OwnerTargetLeglessBootstrapInstallGate {
+    _private: (),
+}
+
+impl OwnerTargetLeglessBootstrapInstallGate {
+    fn mint() -> Self {
+        Self { _private: () }
+    }
+}
+/// Exact record-specific delivery/settlement state for the initial acceptance.
+/// No variant is inferred from aggregate queue length or ordered-wait state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnerTargetInitialAcceptanceDelivery {
+    AdmittedDeliveryPending,
+    DeliveredAwaitingSettlement,
+    Settled,
+}
+/// Borrow-only exact ownership inventory for the initial owner handoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OwnerTargetInitialHandoffInventory {
+    attached_authorities: usize,
+    acceptance_receipts: usize,
+    executor_identity_live: bool,
+    physical_actor_identities: usize,
+    physical_actor_identity_live: bool,
+    acceptance_queue_live: bool,
+    delivery: OwnerTargetInitialAcceptanceDelivery,
+}
+
+impl OwnerTargetInitialHandoffInventory {
+    pub(crate) const fn attached_authorities(self) -> usize {
+        self.attached_authorities
+    }
+
+    pub(crate) const fn acceptance_receipts(self) -> usize {
+        self.acceptance_receipts
+    }
+
+    pub(crate) const fn executor_identity_live(self) -> bool {
+        self.executor_identity_live
+    }
+
+    pub(crate) const fn physical_actor_identities(self) -> usize {
+        self.physical_actor_identities
+    }
+
+    pub(crate) const fn physical_actor_identity_live(self) -> bool {
+        self.physical_actor_identity_live
+    }
+
+    pub(crate) const fn acceptance_queue_live(self) -> bool {
+        self.acceptance_queue_live
+    }
+
+    pub(crate) const fn delivery(self) -> OwnerTargetInitialAcceptanceDelivery {
+        self.delivery
+    }
+}
+/// Executor-bound initial owner authority. It keeps the initial AttachedLeg
+/// transport seal and its exact acceptance FIFO receipt together; neither is
+/// exposed as a naked production value.
+#[must_use = "initial owner handoff must remain attached to its executor and acceptance receipt"]
+pub(crate) struct OwnerTargetInitialHandoff {
+    owner: Weak<OwnerTargetExecutorIdentity>,
+    attached: AttachedLeg,
+    acceptance: Option<AttachAcceptanceEnqueued>,
+    physical_actor: Option<PhysicalLegActorBinding>,
+}
+
+impl OwnerTargetInitialHandoff {
+    pub(crate) fn generation(&self) -> LegGeneration {
+        self.attached.generation()
+    }
+
+    pub(crate) fn nonce(&self) -> crate::resumable::AttachNonce {
+        self.attached.nonce()
+    }
+
+    pub(crate) const fn retained_acceptance_receipts(&self) -> usize {
+        if self.acceptance.is_some() { 1 } else { 0 }
+    }
+
+    pub(crate) fn acceptance_queue_is_live(&self) -> bool {
+        self.acceptance
+            .as_ref()
+            .is_some_and(AttachAcceptanceEnqueued::queue_is_live)
+    }
+
+    pub(crate) const fn physical_actor_identities(&self) -> usize {
+        if self.physical_actor.is_some() { 1 } else { 0 }
+    }
+
+    pub(super) fn acceptance_belongs_to_queue(&self, queue: &LegOutboundQueue) -> bool {
+        self.acceptance
+            .as_ref()
+            .is_some_and(|acceptance| acceptance.belongs_to_queue(queue))
+            || self
+                .physical_actor
+                .as_ref()
+                .is_some_and(|actor| actor.belongs_to_queue(queue))
+    }
+
+    /// Inventories the exact receipt without mutating the FIFO. Aggregate
+    /// queue frames/waits cannot identify this receipt after later traffic or
+    /// cleanup, so they are audited only for internal consistency and never
+    /// promoted into a record-specific delivery claim.
+    pub(super) fn inventory(
+        &self,
+        queue: &LegOutboundQueue,
+    ) -> Result<OwnerTargetInitialHandoffInventory, OwnerTargetInputBlock> {
+        if !self.acceptance_belongs_to_queue(queue) {
+            return Err(OwnerTargetInputBlock::WrongAcceptanceQueue);
+        }
+        let _inventory = queue
+            .cold_inventory()
+            .ok_or(OwnerTargetInputBlock::InitialAcceptanceQueueInvariant)?;
+        let delivery = match self.acceptance.as_ref() {
+            Some(acceptance) if acceptance.was_delivered() => {
+                OwnerTargetInitialAcceptanceDelivery::DeliveredAwaitingSettlement
+            }
+            Some(_) => OwnerTargetInitialAcceptanceDelivery::AdmittedDeliveryPending,
+            None => OwnerTargetInitialAcceptanceDelivery::Settled,
+        };
+        Ok(OwnerTargetInitialHandoffInventory {
+            attached_authorities: 1,
+            acceptance_receipts: self.retained_acceptance_receipts(),
+            executor_identity_live: self.owner.upgrade().is_some(),
+            physical_actor_identities: self.physical_actor_identities(),
+            physical_actor_identity_live: self
+                .physical_actor
+                .as_ref()
+                .is_some_and(PhysicalLegActorBinding::actor_is_live),
+            acceptance_queue_live: self.acceptance_queue_is_live(),
+            delivery,
+        })
+    }
+
+    pub(super) fn belongs_to_transport(&self, leg: &EstablishedLeg) -> bool {
+        self.matches_transport_identity(leg) && leg.transport_is_open()
+    }
+
+    fn matches_transport_identity(&self, leg: &EstablishedLeg) -> bool {
+        self.attached.belongs_to_transport(&leg.standby_seal())
+    }
+
+    pub(super) fn accept_frame(
+        &self,
+        received: LegBoundFrame,
+    ) -> Result<SessionEvent, super::leg::LegProvenanceError> {
+        self.attached.accept_frame(received)
+    }
+}
+
+impl fmt::Debug for OwnerTargetInitialHandoff {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnerTargetInitialHandoff")
+            .field("generation", &self.generation())
+            .field("owner_live", &self.owner.upgrade().is_some())
+            .field("physical_actor", &self.physical_actor.is_some())
+            .field("acceptance", &self.acceptance)
+            .finish_non_exhaustive()
+    }
+}
+/// Initial A after the owner reducer has already committed B as its exact
+/// replacement.  The embedded AttachedLeg is deliberately unreachable: this
+/// type can only validate and consume A's joined terminal, never construct a
+/// second data-plane event or report `LegLost` for the now-current B.
+#[must_use = "retired initial owner handoff must settle its exact joined terminal"]
+pub(crate) struct OwnerTargetRetiredInitialHandoff {
+    owner: Weak<OwnerTargetExecutorIdentity>,
+    attached: AttachedLeg,
+    physical_actor: PhysicalLegActorBinding,
+    replacement_generation: LegGeneration,
+    replacement_nonce: AttachNonce,
+}
+
+impl OwnerTargetRetiredInitialHandoff {
+    pub(crate) fn retired_generation(&self) -> LegGeneration {
+        self.attached.generation()
+    }
+
+    pub(crate) const fn replacement_generation(&self) -> LegGeneration {
+        self.replacement_generation
+    }
+
+    pub(crate) const fn replacement_nonce(&self) -> AttachNonce {
+        self.replacement_nonce
+    }
+}
+
+impl fmt::Debug for OwnerTargetRetiredInitialHandoff {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnerTargetRetiredInitialHandoff")
+            .field("retired_generation", &self.retired_generation())
+            .field("replacement_generation", &self.replacement_generation)
+            .field("owner_live", &self.owner.upgrade().is_some())
+            .finish_non_exhaustive()
+    }
+}
+/// Fully checked A-retirement plan.  Preparation is the last fallible step;
+/// after B installation commits, converting this value to the retired type is
+/// allocation-free and infallible.
+#[must_use = "prepared initial retirement must be restored or committed after B install"]
+pub(super) struct PreparedOwnerInitialRetirement<'queue> {
+    _a_queue: &'queue mut LegOutboundQueue,
+    owner: Weak<OwnerTargetExecutorIdentity>,
+    attached: AttachedLeg,
+    physical_actor: PhysicalLegActorBinding,
+    replacement_generation: LegGeneration,
+    replacement_nonce: AttachNonce,
+}
+
+impl PreparedOwnerInitialRetirement<'_> {
+    pub(super) fn restore_initial(self) -> OwnerTargetInitialHandoff {
+        let Self {
+            _a_queue: _,
+            owner,
+            attached,
+            physical_actor,
+            replacement_generation: _,
+            replacement_nonce: _,
+        } = self;
+        OwnerTargetInitialHandoff {
+            owner,
+            attached,
+            acceptance: None,
+            physical_actor: Some(physical_actor),
+        }
+    }
+
+    pub(super) fn commit_after_b_install(self) -> OwnerTargetRetiredInitialHandoff {
+        let Self {
+            _a_queue: _,
+            owner,
+            attached,
+            physical_actor,
+            replacement_generation,
+            replacement_nonce,
+        } = self;
+        OwnerTargetRetiredInitialHandoff {
+            owner,
+            attached,
+            physical_actor,
+            replacement_generation,
+            replacement_nonce,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnerTargetInitialRetirementErrorKind {
+    WrongInitialOwner,
+    WrongReplacementOwner,
+    AcceptanceNotSettled,
+    MissingPhysicalActor,
+    WrongPhysicalActor,
+    ReplacementNotNewer,
+    InitialOutboundQueueInvariant,
+    InitialOutboundNotPristine {
+        was_active: bool,
+        queued_frames: usize,
+        summed_frame_bytes: usize,
+        stored_owned_bytes: usize,
+        ordered_delivery_wait: bool,
+    },
+}
+/// Precommit retirement rejection.  B is borrowed and remains controller
+/// owned; this value returns the exact initial handoff for an unchanged retry.
+#[must_use = "rejected initial retirement returns the exact current-A handoff"]
+pub(super) struct OwnerTargetInitialRetirementFailure {
+    kind: OwnerTargetInitialRetirementErrorKind,
+    initial: OwnerTargetInitialHandoff,
+}
+
+impl OwnerTargetInitialRetirementFailure {
+    pub(super) const fn kind(&self) -> OwnerTargetInitialRetirementErrorKind {
+        self.kind
+    }
+
+    pub(super) fn into_initial(self) -> OwnerTargetInitialHandoff {
+        self.initial
+    }
+}
+
+impl fmt::Debug for OwnerTargetInitialRetirementFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnerTargetInitialRetirementFailure")
+            .field("kind", &self.kind)
+            .field("initial", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnerTargetRetiredInitialSettlementErrorKind {
+    WrongRetiredOwner,
+    WrongActiveOwner,
+    WrongReplacement,
+    WrongJoinedActor,
+    MissingTerminal,
+    WrongTerminal,
+}
+/// Rejected retired-A settlement returns both exact linear owners.  The outer
+/// joined-actor transaction restores `terminal` before the caller regains the
+/// handoff, so a mismatch is fully retryable without reconstruction.
+#[must_use = "rejected retired-A settlement retains handoff and terminal ownership"]
+pub(super) struct OwnerTargetRetiredInitialSettlementFailure {
+    kind: OwnerTargetRetiredInitialSettlementErrorKind,
+    retired: OwnerTargetRetiredInitialHandoff,
+    terminal: Option<ExactLegTerminal>,
+}
+
+impl OwnerTargetRetiredInitialSettlementFailure {
+    pub(super) const fn kind(&self) -> OwnerTargetRetiredInitialSettlementErrorKind {
+        self.kind
+    }
+
+    pub(super) fn into_parts(self) -> (OwnerTargetRetiredInitialHandoff, Option<ExactLegTerminal>) {
+        (self.retired, self.terminal)
+    }
+}
+
+impl fmt::Debug for OwnerTargetRetiredInitialSettlementFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnerTargetRetiredInitialSettlementFailure")
+            .field("kind", &self.kind)
+            .field("retired", &"[REDACTED]")
+            .field("terminal", &"[REDACTED]")
+            .finish()
+    }
+}
+/// Historical value-only witness emitted only after the exact retired A
+/// handoff, joined runtime, and terminal were consumed together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OwnerTargetRetiredInitialSettled {
+    retired_generation: LegGeneration,
+    replacement_generation: LegGeneration,
+    reason: LegTransportTerminalReason,
+}
+
+impl OwnerTargetRetiredInitialSettled {
+    pub(crate) const fn retired_generation(self) -> LegGeneration {
+        self.retired_generation
+    }
+
+    pub(crate) const fn replacement_generation(self) -> LegGeneration {
+        self.replacement_generation
+    }
+
+    pub(crate) const fn reason(self) -> LegTransportTerminalReason {
+        self.reason
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnerTargetInitialAcceptanceSettlementDisposition {
+    SettledNow,
+    AlreadySettled,
+}
+/// Exact initial active handoff returned after every settlement attempt. A
+/// repeated call is value-only and returns `AlreadySettled`; it cannot mint a
+/// second receipt or AttachedLeg authority.
+#[must_use = "initial acceptance settlement returns the still-live active handoff"]
+pub(crate) struct OwnerTargetInitialAcceptanceSettlement {
+    disposition: OwnerTargetInitialAcceptanceSettlementDisposition,
+    handoff: OwnerTargetInitialHandoff,
+}
+
+impl OwnerTargetInitialAcceptanceSettlement {
+    pub(crate) const fn disposition(&self) -> OwnerTargetInitialAcceptanceSettlementDisposition {
+        self.disposition
+    }
+
+    pub(crate) fn into_handoff(self) -> OwnerTargetInitialHandoff {
+        self.handoff
+    }
+}
+
+impl fmt::Debug for OwnerTargetInitialAcceptanceSettlement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnerTargetInitialAcceptanceSettlement")
+            .field("disposition", &self.disposition)
+            .field("handoff", &"[REDACTED]")
+            .finish()
+    }
+}
+/// Ownership-preserving whole-bootstrap construction failure.
+#[must_use = "failed initial owner construction retains bootstrap and Target ownership"]
+pub(crate) struct OwnerTargetInitialBootstrapFailure<T> {
+    source: OwnerTargetConfigError,
+    config: OwnerTargetConfig,
+    bootstrap: OwnerSessionBootstrap,
+    target: T,
+    source_config: FlowPortConfig,
+}
+
+impl<T> OwnerTargetInitialBootstrapFailure<T> {
+    pub(crate) const fn source(&self) -> OwnerTargetConfigError {
+        self.source
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        OwnerTargetConfigError,
+        OwnerTargetConfig,
+        OwnerSessionBootstrap,
+        T,
+        FlowPortConfig,
+    ) {
+        (
+            self.source,
+            self.config,
+            self.bootstrap,
+            self.target,
+            self.source_config,
+        )
+    }
+}
+
+impl<T> fmt::Debug for OwnerTargetInitialBootstrapFailure<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnerTargetInitialBootstrapFailure")
+            .field("source", &self.source)
+            .field("config", &self.config)
+            .field("bootstrap", &self.bootstrap)
+            .field("target", &"[REDACTED]")
+            .field("source_config", &self.source_config)
+            .finish()
+    }
+}
+
+impl<T> fmt::Display for OwnerTargetInitialBootstrapFailure<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "initial owner Target construction failed: {}",
+            self.source
+        )
+    }
+}
+
+impl<T> std::error::Error for OwnerTargetInitialBootstrapFailure<T> {}
+/// Ownership-preserving legless construction failure. The committed
+/// high-water timer remains nested in its bootstrap and can be retried with a
+/// corrected configuration without reconstruction or oracle state.
+#[must_use = "failed legless owner construction retains bootstrap and Target ownership"]
+pub(crate) struct OwnerTargetLeglessBootstrapFailure<T> {
+    source: OwnerTargetConfigError,
+    config: OwnerTargetConfig,
+    bootstrap: LeglessOwnerSessionBootstrap,
+    target: T,
+    source_config: FlowPortConfig,
+}
+
+impl<T> OwnerTargetLeglessBootstrapFailure<T> {
+    pub(crate) const fn source(&self) -> OwnerTargetConfigError {
+        self.source
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        OwnerTargetConfigError,
+        OwnerTargetConfig,
+        LeglessOwnerSessionBootstrap,
+        T,
+        FlowPortConfig,
+    ) {
+        (
+            self.source,
+            self.config,
+            self.bootstrap,
+            self.target,
+            self.source_config,
+        )
+    }
+}
+
+impl<T> fmt::Debug for OwnerTargetLeglessBootstrapFailure<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnerTargetLeglessBootstrapFailure")
+            .field("source", &self.source)
+            .field("config", &self.config)
+            .field("bootstrap", &self.bootstrap)
+            .field("target", &"[REDACTED]")
+            .field("source_config", &self.source_config)
+            .finish()
+    }
+}
+
+impl<T> fmt::Display for OwnerTargetLeglessBootstrapFailure<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "legless owner Target construction failed: {}",
+            self.source
+        )
+    }
+}
+
+impl<T> std::error::Error for OwnerTargetLeglessBootstrapFailure<T> {}
+/// Precommit rejection returning the exact initial handoff unchanged.
+#[must_use = "rejected initial handoff retains its AttachedLeg and acceptance receipt"]
+pub(crate) struct OwnerTargetInitialHandoffOwnerFailure {
+    block: OwnerTargetInputBlock,
+    handoff: OwnerTargetInitialHandoff,
+}
+
+impl OwnerTargetInitialHandoffOwnerFailure {
+    pub(crate) const fn block(&self) -> OwnerTargetInputBlock {
+        self.block
+    }
+
+    pub(crate) fn into_handoff(self) -> OwnerTargetInitialHandoff {
+        self.handoff
+    }
+}
+
+impl fmt::Debug for OwnerTargetInitialHandoffOwnerFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnerTargetInitialHandoffOwnerFailure")
+            .field("block", &self.block)
+            .field("handoff", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl fmt::Display for OwnerTargetInitialHandoffOwnerFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "initial owner handoff rejected: {:?}",
+            self.block
+        )
+    }
+}
+
+impl std::error::Error for OwnerTargetInitialHandoffOwnerFailure {}
+/// Executor-bound recovery completion. Keeping owner identity beside the
+/// installed leg prevents a different controller from installing or
+/// terminalizing a capability merely because it matches the transport.
+pub(crate) struct OwnerTargetRecoveryHandoff {
+    owner: Weak<OwnerTargetExecutorIdentity>,
+    attached: AttachedLeg,
+}
+
+impl OwnerTargetRecoveryHandoff {
+    pub(crate) fn generation(&self) -> LegGeneration {
+        self.attached.generation()
+    }
+
+    pub(super) fn belongs_to_transport(&self, leg: &EstablishedLeg) -> bool {
+        self.attached.belongs_to_transport(&leg.standby_seal()) && leg.transport_is_open()
+    }
+
+    pub(crate) fn nonce(&self) -> crate::resumable::AttachNonce {
+        self.attached.nonce()
+    }
+
+    pub(super) fn accept_frame(
+        &self,
+        received: LegBoundFrame,
+    ) -> Result<SessionEvent, super::leg::LegProvenanceError> {
+        self.attached.accept_frame(received)
+    }
+
+    #[cfg(test)]
+    pub(super) fn into_attached_for_test(self) -> AttachedLeg {
+        self.attached
+    }
+}
+
+impl fmt::Debug for OwnerTargetRecoveryHandoff {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnerTargetRecoveryHandoff")
+            .field("generation", &self.generation())
+            .field("owner_live", &self.owner.upgrade().is_some())
+            .finish_non_exhaustive()
+    }
+}
+/// Read-only reducer observation authority. The constructor is private to
+/// this module, so only the sole owner Target executor can request the
+/// supervisor's post-commit application-ACK fact.
+pub(super) struct OwnerTargetObservedApplyGate {
+    _private: (),
+}
+
+impl OwnerTargetObservedApplyGate {
+    fn mint() -> Self {
+        Self { _private: () }
+    }
+}
 /// Non-cloneable authority to execute exactly one following bounded effect
 /// turn. Transport must schedule this capability once and cannot manufacture
 /// a second wakeup for the same pending work.
@@ -204,7 +1123,6 @@ impl fmt::Debug for OwnerTargetResume {
         formatter.write_str("OwnerTargetResume([REDACTED])")
     }
 }
-
 /// Exact owner high-water after initial acceptance loss. The resume-grace
 /// expiry event stays private and is bound to one constructed Target executor;
 /// callers can observe only the generation and terminal reason.
@@ -249,7 +1167,59 @@ pub(crate) struct PendingOwnerAttachLoss {
     resume_grace_expired: SessionEvent,
     loss: PendingLegLoss,
     tail: TerminalOwnerAttachTail,
-    pending_turn_allowed: bool,
+    phase: OwnerRecoveryLossPhase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnerRecoveryLossPhase {
+    BarrierStrict,
+    BarrierPendingTurn,
+    BarrierCleared,
+}
+
+/// Exact precommit rejection from binding one in-flight owner recovery to a
+/// transport terminal. The generic input keeps this seam reusable across the
+/// four recovery typestates while guaranteeing that neither authority can be
+/// lost behind an opaque executor error.
+pub(super) struct OwnerRecoveryTerminalizationFailure<I> {
+    block: OwnerTargetInputBlock,
+    input: I,
+    terminal: ExactLegTerminal,
+}
+
+impl<I> OwnerRecoveryTerminalizationFailure<I> {
+    pub(super) const fn block(&self) -> OwnerTargetInputBlock {
+        self.block
+    }
+
+    pub(super) fn into_parts(self) -> (I, ExactLegTerminal) {
+        (self.input, self.terminal)
+    }
+}
+
+pub(super) enum OwnerTerminalAttachDiscardFailure {
+    Blocked {
+        block: OwnerTargetInputBlock,
+        pending: PendingOwnerAttachLoss,
+    },
+    Quarantined(QuarantinedOwnerAttachLoss),
+}
+
+pub(super) struct QuarantinedOwnerAttachLoss {
+    pending: PendingOwnerAttachLoss,
+    source: OwnerTerminalAttachDiscardQuarantineSource,
+}
+
+enum OwnerTerminalAttachDiscardQuarantineSource {
+    Supervisor(SessionSupervisorError),
+    Storage {
+        source: SessionSupervisorError,
+        effects: crate::resumable::effect_storage::SessionEffectBatch,
+    },
+    Effects {
+        generation: LegGeneration,
+        effects: Vec<SessionEffect>,
+    },
 }
 
 impl PendingOwnerAttachLoss {
@@ -290,6 +1260,7 @@ enum TerminalOwnerAttachTail {
         acceptance: AttachAcceptanceEnqueued,
         resume: OwnerTargetResume,
     },
+    HandoffReady,
 }
 
 impl TerminalOwnerAttachTail {
@@ -308,6 +1279,7 @@ impl TerminalOwnerAttachTail {
                 ready,
             } => drop((acceptance, pending, ready)),
             Self::Resume { acceptance, resume } => drop((acceptance, resume)),
+            Self::HandoffReady => {}
         }
     }
 }
@@ -326,6 +1298,7 @@ impl fmt::Debug for TerminalOwnerAttachTail {
                 .field("ready", &ready.len())
                 .finish_non_exhaustive(),
             Self::Resume { .. } => formatter.write_str("Resume([REDACTED])"),
+            Self::HandoffReady => formatter.write_str("HandoffReady"),
         }
     }
 }
@@ -547,6 +1520,10 @@ pub(crate) struct OwnerTargetRecoveryDrain {
     ready: Vec<OwnerTargetRecoveryOutput>,
 }
 
+/// The scheduling-facing name for an already-executed FIFO publication turn.
+/// `OwnerTargetRecoveryDrain` remains the legacy adapter/error name.
+pub(crate) type OwnerTargetRecoveryPublishCursor = OwnerTargetRecoveryDrain;
+
 impl fmt::Debug for OwnerTargetRecoveryDrain {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -559,6 +1536,63 @@ impl fmt::Debug for OwnerTargetRecoveryDrain {
             .field("pending_outputs", &self.pending.len())
             .field("ready_outputs", &self.ready.len())
             .finish()
+    }
+}
+
+impl OwnerTargetRecoveryDrain {
+    /// Exact output values still owned by this unpublished recovery cursor.
+    /// Wire frames remain in `pending`; already-classified lifecycle values
+    /// remain in `ready` until the whole page commits.
+    pub(super) fn retained_output_count(&self) -> usize {
+        self.pending.len() + self.ready.len()
+    }
+}
+
+/// One fully executed post-attach recovery page. Reducer observations are
+/// returned before the caller mutates the acceptance FIFO; the cursor owns
+/// every page output until that exact queue publishes it.
+#[must_use = "observed owner recovery must be consumed before its page is published"]
+pub(crate) struct OwnerTargetObservedRecoveryPage {
+    publish: OwnerTargetRecoveryDrain,
+    observations: OwnerTargetReducerObservations,
+}
+
+impl OwnerTargetObservedRecoveryPage {
+    pub(crate) fn into_progress_parts(
+        self,
+    ) -> (
+        OwnerTargetRecoveryPublishCursor,
+        OwnerTargetReducerObservations,
+    ) {
+        (self.publish, self.observations)
+    }
+}
+
+impl fmt::Debug for OwnerTargetObservedRecoveryPage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnerTargetObservedRecoveryPage")
+            .field("publish", &self.publish)
+            .field("observations_empty", &self.observations.is_empty())
+            .finish()
+    }
+}
+
+struct OwnerTargetRecoveryGuard {
+    owner: Weak<OwnerTargetExecutorIdentity>,
+    attached: AttachedLeg,
+    acceptance: AttachAcceptanceEnqueued,
+}
+
+impl OwnerTargetRecoveryGuard {
+    fn into_publish_cursor(self, outputs: Vec<OwnerTargetOutput>) -> OwnerTargetRecoveryDrain {
+        OwnerTargetRecoveryDrain {
+            owner: self.owner,
+            attached: Some(self.attached),
+            acceptance: Some(self.acceptance),
+            pending: outputs.into(),
+            ready: Vec::new(),
+        }
     }
 }
 
@@ -723,12 +1757,19 @@ impl fmt::Display for OwnerAttachStatusEnqueueError {
 
 impl std::error::Error for OwnerAttachStatusEnqueueError {}
 
-/// Fail-closed ownership returned only if the audited reducer fan-out bound is
-/// violated. Keeping the generated effects inside the error prevents a
-/// post-mutation drop from masquerading as successful continuation.
+/// Fail-closed quarantine for exact work after an owner execution invariant.
+/// Co-owns effects, outputs, observations and at most one recovery cursor.
+#[derive(Default)]
 pub(crate) struct AbortedOwnerTargetEffects {
     effects: VecDeque<OwnerTargetWork>,
     outputs: Vec<OwnerTargetOutput>,
+    observations: Option<OwnerTargetReducerObservations>,
+    recovery: Option<OwnerTargetRecoveryDrain>,
+    incoming: Option<effect_storage::OwnerTargetIncomingReduction>,
+    source: Option<TargetReadSource>,
+    current: Option<OwnerTargetWork>,
+    source_releasing: bool,
+    open_outcome: Option<TargetOpenCompletion>,
 }
 
 impl fmt::Debug for AbortedOwnerTargetEffects {
@@ -737,6 +1778,10 @@ impl fmt::Debug for AbortedOwnerTargetEffects {
             .debug_struct("AbortedOwnerTargetEffects")
             .field("effects", &self.effects.len())
             .field("outputs", &self.outputs.len())
+            .field("observations", &usize::from(self.observations.is_some()))
+            .field("recovery", &usize::from(self.recovery.is_some()))
+            .field("incoming", &usize::from(self.incoming.is_some()))
+            .field("source", &usize::from(self.source.is_some()))
             .finish_non_exhaustive()
     }
 }
@@ -783,14 +1828,13 @@ impl fmt::Debug for OwnerTargetRecoveryOutput {
                 .finish(),
             Self::SessionExpired => formatter.write_str("SessionExpired"),
             Self::NeedsResume { .. } => formatter.write_str("NeedsResume([REDACTED])"),
-            Self::RecoveryCompleted { attached } => formatter
+            Self::RecoveryCompleted { handoff } => formatter
                 .debug_struct("RecoveryCompleted")
-                .field("generation", &attached.generation())
+                .field("generation", &handoff.generation())
                 .finish(),
         }
     }
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OwnerTargetSnapshot {
     pub(crate) session: SessionSupervisorSnapshot,
@@ -803,30 +1847,56 @@ pub(crate) struct OwnerTargetSnapshot {
     pub(crate) pending_effects: usize,
     pub(crate) needs_resume: bool,
     pub(crate) pending_target_completions: usize,
+    pub(crate) aborted_effect_guards: usize,
     pub(crate) aborted_effects: usize,
     pub(crate) aborted_outputs: usize,
+    pub(crate) aborted_observations: usize,
+    pub(crate) aborted_ordinary_outputs: usize,
+    pub(crate) aborted_ordinary_observations: usize,
+    pub(crate) aborted_recovery_outputs: usize,
+    pub(crate) aborted_recovery_observations: usize,
+    pub(crate) aborted_recovery_guards: usize,
 }
-
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum OwnerReadyInstallError {
+    AlreadyBound,
+    NotBound,
+    Handoff(OwnerTargetInputBlock),
+    Source(super::supervisor::OwnerSourceIdentityError),
+    Reservation(super::owner_ready::OwnerReadyReservationError),
+    Mailbox(commands::OwnerMailboxPreparationError),
+    Layout,
+    Reserve,
+    FlowState(SessionFlowId),
+}
 struct PendingTargetWrite {
     offer: SinkOffer,
     segments: Vec<TcpDataSegment>,
 }
-
+enum PendingTargetSink {
+    Write(PendingTargetWrite),
+    HalfClose(crate::resumable::SinkHalfClose),
+}
 struct TargetFlowOwner {
     target_present: bool,
     source: Option<TargetReadSource>,
-    pending_write: Option<PendingTargetWrite>,
+    pending_sink: Option<PendingTargetSink>,
     terminal: Option<TargetTerminalKind>,
     join_pending: bool,
     retire_after_join: bool,
     pending_completion: Option<PendingTargetCompletion>,
+    service_position: Option<usize>,
 }
-
 enum PendingTargetCompletion {
-    Open {
-        request: PeerOpenRequest,
-        result: OpenResultCode,
+    Failed {
+        work: OwnerTargetWork,
+        cause: super::target::TargetFailure,
+        feedback: completion::TargetFailureFeedback,
     },
+    StagedReset(crate::resumable::LocalFlow),
+    TerminalSettling(completion::TerminalFlowSettlement),
+    Open(completion::OpenFlowSettlement),
+    DriverReturned(completion::DriverCompletionState),
     Failure {
         event: SessionEvent,
     },
@@ -834,77 +1904,25 @@ enum PendingTargetCompletion {
         event: SessionEvent,
     },
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingTargetCompletionKind {
     Open,
     Failure,
     HalfClose,
 }
-
-impl PendingTargetCompletion {
-    const fn kind(&self) -> PendingTargetCompletionKind {
-        match self {
-            Self::Open { .. } => PendingTargetCompletionKind::Open,
-            Self::Failure { .. } => PendingTargetCompletionKind::Failure,
-            Self::HalfClose { .. } => PendingTargetCompletionKind::HalfClose,
-        }
-    }
-
-    fn into_command(self) -> SessionOwnerCommand {
-        match self {
-            Self::Open { request, result } => {
-                SessionOwnerCommand::Event(SessionEvent::PeerOpenResolved { request, result })
-            }
-            Self::Failure { event } => SessionOwnerCommand::Driver(DriverInput::Control(event)),
-            Self::HalfClose { event } => SessionOwnerCommand::Event(event),
-        }
-    }
-
-    fn from_carried_command(
-        expected: PendingTargetCompletionKind,
-        flow_id: SessionFlowId,
-        command: SessionOwnerCommand,
-    ) -> Result<Self, OwnerTargetError> {
-        match (expected, command) {
-            (
-                PendingTargetCompletionKind::Open,
-                SessionOwnerCommand::Event(SessionEvent::PeerOpenResolved { request, result }),
-            ) if request.flow_id() == flow_id => Ok(Self::Open { request, result }),
-            (
-                PendingTargetCompletionKind::Failure,
-                SessionOwnerCommand::Driver(DriverInput::Control(
-                    event @ SessionEvent::LocalReset {
-                        flow,
-                        reason: ResetReason::TargetFailure,
-                    },
-                )),
-            ) if flow.flow_id() == flow_id => Ok(Self::Failure { event }),
-            (
-                PendingTargetCompletionKind::HalfClose,
-                SessionOwnerCommand::Event(event @ SessionEvent::SinkHalfClosed { completion }),
-            ) if completion.flow_id() == flow_id => Ok(Self::HalfClose { event }),
-            _ => Err(OwnerTargetError::CarriedTargetCompletionMismatch { flow_id }),
-        }
-    }
-}
-
 struct TargetReadSource {
     flow: ResumableTcpFlow,
     driver: ResumableTcpDriver,
 }
-
 enum TargetJoinAttempt {
     Joined,
     Pending(TargetJoinBlock),
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TargetJoinBlock {
     OwnedState,
     TerminalCapacity,
 }
-
 enum OwnerTargetWork {
     Effect(SessionEffect),
     ExpireNextTarget,
@@ -913,18 +1931,17 @@ enum OwnerTargetWork {
         operation: TargetIoOperation,
     },
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TargetIoOperation {
     Read,
     ReadCompletion,
+    WriteCompletion,
     OpenCompletion,
     HalfCloseCompletion,
     FailureCompletion,
     Join,
     TerminalRetirement,
 }
-
 /// Sole Target-effect executor for one owner-side session supervisor.
 pub(crate) struct OwnerTargetExecutor<T> {
     identity: Arc<OwnerTargetExecutorIdentity>,
@@ -935,110 +1952,43 @@ pub(crate) struct OwnerTargetExecutor<T> {
     flows: BTreeMap<SessionFlowId, TargetFlowOwner>,
     target_tombstones: BTreeMap<SessionFlowId, TargetTerminalKind>,
     pending_effects: VecDeque<OwnerTargetWork>,
+    prepared_outputs: Vec<OwnerTargetOutput>,
     outstanding_resume: Option<u64>,
     next_resume_id: Option<u64>,
     max_recovery_effects: usize,
     aborted_effects: Option<AbortedOwnerTargetEffects>,
     attach_barrier_pending: bool,
+    service: service::OwnerTargetServiceState,
 }
-
+struct OwnerTargetConstructionFailure<T> {
+    source: OwnerTargetConfigError,
+    supervisor: SessionSupervisor,
+    target: T,
+}
+impl<T> OwnerTargetConstructionFailure<T> {
+    fn into_parts(self) -> (OwnerTargetConfigError, SessionSupervisor, T) {
+        (self.source, self.supervisor, self.target)
+    }
+}
 impl<T: TargetIo> OwnerTargetExecutor<T> {
-    pub(crate) fn new(
-        config: OwnerTargetConfig,
-        supervisor: SessionSupervisor,
-        target: T,
-        source_config: FlowPortConfig,
-    ) -> Result<Self, OwnerTargetConfigError> {
-        Self::new_in_phase(config, supervisor, target, source_config, false)
-    }
-
-    /// Constructs the sole Target executor from a committed initial attach
-    /// whose exact transport died before acceptance publication. The returned
-    /// high-water token is bound to this executor and owns the one resume
-    /// grace expiry event; ordinary construction remains Active-only.
-    pub(crate) fn new_legless_bootstrap(
-        config: OwnerTargetConfig,
-        bootstrap: LeglessOwnerSessionBootstrap,
-        target: T,
-        source_config: FlowPortConfig,
-    ) -> Result<(Self, OwnerLeglessHighWater), OwnerTargetConfigError> {
-        let (supervisor, pending_high_water) = bootstrap.into_parts();
-        let executor = Self::new_in_phase(config, supervisor, target, source_config, true)?;
-        let (generation, reason, resume_grace_expired) = pending_high_water.into_parts();
-        let high_water = OwnerLeglessHighWater {
-            owner: Arc::downgrade(&executor.identity),
-            generation,
-            reason,
-            resume_grace_expired,
-        };
-        Ok((executor, high_water))
-    }
-
-    fn new_in_phase(
-        config: OwnerTargetConfig,
-        mut supervisor: SessionSupervisor,
-        target: T,
-        source_config: FlowPortConfig,
-        legless_bootstrap: bool,
-    ) -> Result<Self, OwnerTargetConfigError> {
-        let reducer_capacity = supervisor
-            .owner_target_replay_capacity()
-            .ok_or(OwnerTargetConfigError::OwnerRoleRequired)?;
-        let recovery_bound = supervisor
-            .owner_recovery_effect_bound()
-            .ok_or(OwnerTargetConfigError::RecoveryEffectCapacityOverflow)?;
-        let required_pending_effects = supervisor
-            .owner_pending_work_bound()
-            .ok_or(OwnerTargetConfigError::RecoveryEffectCapacityOverflow)?;
-        if config.max_pending_effects < required_pending_effects {
-            return Err(OwnerTargetConfigError::PendingEffectCapacityTooSmall {
-                required: required_pending_effects,
-                available: config.max_pending_effects,
-            });
-        }
-        let flow_capacity = source_config.uplink_byte_capacity();
-        if flow_capacity > reducer_capacity.per_flow_bytes {
-            return Err(OwnerTargetConfigError::PerFlowBytesExceedReducer {
-                requested: flow_capacity,
-                available: reducer_capacity.per_flow_bytes,
-            });
-        }
-        let session_capacity = reducer_capacity.session_bytes;
-        if config.max_target_read_bytes > flow_capacity {
-            return Err(OwnerTargetConfigError::TargetReadExceedsFlowCapacity {
-                requested: config.max_target_read_bytes,
-                available: flow_capacity,
-            });
-        }
-        if config.max_target_read_bytes > session_capacity {
-            return Err(OwnerTargetConfigError::TargetReadExceedsSessionCapacity {
-                requested: config.max_target_read_bytes,
-                available: session_capacity,
-            });
-        }
-        let source_factory = if legless_bootstrap {
-            supervisor.mint_tcp_port_factory_for_legless_bootstrap(source_config)?
-        } else {
-            supervisor.mint_tcp_port_factory(source_config)?
-        };
-        Ok(Self {
-            identity: Arc::new(OwnerTargetExecutorIdentity),
-            config,
-            supervisor,
-            target,
-            source_factory,
-            flows: BTreeMap::new(),
-            target_tombstones: BTreeMap::new(),
-            pending_effects: VecDeque::new(),
-            outstanding_resume: None,
-            next_resume_id: Some(1),
-            max_recovery_effects: recovery_bound,
-            aborted_effects: None,
-            attach_barrier_pending: false,
-        })
-    }
-
     pub(crate) fn snapshot(&self) -> OwnerTargetSnapshot {
+        let aborted_is_recovery = self
+            .aborted_effects
+            .as_ref()
+            .is_some_and(|aborted| aborted.recovery.is_some());
+        let aborted_outputs = self
+            .aborted_effects
+            .as_ref()
+            .map_or(0, |aborted| aborted.outputs.len());
+        let (aborted_effects, aborted_observations, aborted_observation_facts) = self
+            .aborted_effects
+            .as_ref()
+            .map_or((0, 0, 0), AbortedOwnerTargetEffects::retained_inventory);
+        let aborted_recovery_cursor_outputs = self
+            .aborted_effects
+            .as_ref()
+            .and_then(|aborted| aborted.recovery.as_ref())
+            .map_or(0, OwnerTargetRecoveryDrain::retained_output_count);
         OwnerTargetSnapshot {
             session: self.supervisor.snapshot(),
             target_flows: self.flows.len(),
@@ -1046,7 +1996,7 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
             pending_writes: self
                 .flows
                 .values()
-                .filter(|flow| flow.pending_write.is_some())
+                .filter(|flow| matches!(flow.pending_sink, Some(PendingTargetSink::Write(_))))
                 .count(),
             pending_joins: self.flows.values().filter(|flow| flow.join_pending).count(),
             target_read_owned_bytes: self.source_factory.session_uplink_owned_bytes(),
@@ -1056,25 +2006,90 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
             pending_target_completions: self
                 .flows
                 .values()
-                .filter(|flow| flow.pending_completion.is_some())
+                .filter_map(|flow| flow.pending_completion.as_ref())
+                .filter(|completion| completion.needs_feedback())
                 .count(),
-            aborted_effects: self
+            aborted_effect_guards: usize::from(self.aborted_effects.is_some()),
+            aborted_effects,
+            aborted_outputs,
+            aborted_observations,
+            aborted_ordinary_outputs: if aborted_is_recovery {
+                0
+            } else {
+                aborted_outputs
+            },
+            aborted_ordinary_observations: if aborted_is_recovery {
+                0
+            } else {
+                aborted_observation_facts
+            },
+            aborted_recovery_outputs: if aborted_is_recovery {
+                aborted_outputs + aborted_recovery_cursor_outputs
+            } else {
+                0
+            },
+            aborted_recovery_observations: if aborted_is_recovery {
+                aborted_observation_facts
+            } else {
+                0
+            },
+            aborted_recovery_guards: self
                 .aborted_effects
                 .as_ref()
-                .map_or(0, |aborted| aborted.effects.len()),
-            aborted_outputs: self
-                .aborted_effects
-                .as_ref()
-                .map_or(0, |aborted| aborted.outputs.len()),
+                .map_or(0, |aborted| usize::from(aborted.recovery.is_some())),
         }
     }
 
     pub(crate) const fn config(&self) -> OwnerTargetConfig {
         self.config
     }
+    /// Exact reducer configuration already installed behind this executor.
+    /// Capacity-sensitive composition may compare it with an injected storage
+    /// plan, but it cannot acquire or mutate the supervisor itself.
+    pub(super) fn installed_session_config(&self) -> crate::resumable::SessionConfig {
+        self.supervisor.session_config()
+    }
+    /// Exact replay-storage provenance carried from the atomic initial owner
+    /// bootstrap. Legacy reducer fixtures report `None` and cannot enter a
+    /// checked physical owner controller.
+    pub(super) fn installed_replay_storage_plan(
+        &self,
+    ) -> Option<crate::resumable::ReplayStoragePlan> {
+        self.supervisor.installed_replay_storage_plan()
+    }
+
+    /// Immutable queue/ledger layout installed by the sole source factory.
+    /// This is capacity provenance, not factory identity; ownership identity
+    /// remains carried by the whole executor and its private origin token.
+    pub(super) fn source_factory_capacity_witness(&self) -> TcpPortFactoryCapacityWitness {
+        self.source_factory.capacity_witness()
+    }
+
+    /// Fixed recovery vector bound retained by the executor at construction.
+    /// Exposing the scalar lets the controller reject internal plan drift
+    /// without exposing executor queues or the supervisor.
+    pub(super) const fn installed_recovery_effect_bound(&self) -> usize {
+        self.max_recovery_effects
+    }
+
+    /// Exact reducer flow bound used by the production owner policy
+    /// controller to derive its two-directions-per-flow progress capacity.
+    pub(super) fn owner_progress_max_flows(&self) -> usize {
+        self.supervisor.session_config().max_flows()
+    }
 
     pub(crate) fn target(&self) -> &T {
         &self.target
+    }
+
+    /// Returns the sole fixed-size observation retained when reducer commit
+    /// succeeded but later Target/effect execution failed. The executor stays
+    /// fail-closed with its exact aborted work and outputs after this value is
+    /// taken; no command can create a second retained observation.
+    pub(crate) fn take_retained_observations_after_failure(
+        &mut self,
+    ) -> Option<OwnerTargetReducerObservations> {
+        self.aborted_effects.as_mut()?.observations.take()
     }
 
     /// Test-only instrumentation for deterministic Target adapters. Production
@@ -1085,6 +2100,28 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         &mut self.target
     }
 
+    #[cfg(test)]
+    pub(super) fn exhaust_effect_resume_ids_for_test(&mut self) {
+        self.next_resume_id = None;
+    }
+
+    /// Test-only bridge to the supervisor's exact post-model receipt
+    /// correlation failpoint. Production callers cannot mutate replay
+    /// ownership behind reducer keys.
+    #[cfg(test)]
+    pub(crate) fn swap_uplink_replay_ownership_for_test(
+        &mut self,
+        first_flow_id: SessionFlowId,
+        second_flow_id: SessionFlowId,
+        direction: Direction,
+    ) -> bool {
+        self.supervisor.swap_uplink_replay_ownership_for_test(
+            first_flow_id,
+            second_flow_id,
+            direction,
+        )
+    }
+
     pub(crate) fn apply_command(
         &mut self,
         command: SessionOwnerCommand,
@@ -1092,6 +2129,12 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         if let Some(block) = self.input_admission_block(command_flow_id(&command)) {
             return Err(OwnerTargetError::RejectedCommand {
                 block,
+                command: Box::new(command),
+            });
+        }
+        if let Err(source) = self.prepare_effect_entry(3) {
+            return Err(OwnerTargetError::RejectedCommand {
+                block: OwnerTargetInputBlock::EffectStorage(source),
                 command: Box::new(command),
             });
         }
@@ -1112,64 +2155,8 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         &mut self,
         event: SessionEvent,
     ) -> Result<Vec<OwnerTargetOutput>, OwnerTargetError> {
-        if let Some(block) = self.input_admission_block(event_flow_id(&event)) {
-            return Err(OwnerTargetError::RejectedEvent {
-                block,
-                event: Box::new(event),
-            });
-        }
-        let terminal_retirement = match &event {
-            SessionEvent::TerminalGraceExpired { terminal } => Some(terminal.flow_id()),
-            _ => None,
-        };
-        let mut effects = match self.supervisor.apply_event(event) {
-            Ok(effects) => effects,
-            Err(SessionSupervisorError::RejectedEvent { block, event }) => {
-                return Err(OwnerTargetError::RejectedEvent {
-                    block: OwnerTargetInputBlock::ReducerAdmission(block),
-                    event,
-                });
-            }
-            Err(error) => return Err(OwnerTargetError::Supervisor(error)),
-        };
-        if let Some(flow_id) = terminal_retirement {
-            if let Err(error) = self.retire_target_tombstone(flow_id) {
-                let mut retained = effects
-                    .into_iter()
-                    .map(OwnerTargetWork::Effect)
-                    .collect::<VecDeque<_>>();
-                let mut outputs = Vec::new();
-                return self.abort_owner_error(
-                    OwnerTargetWork::TargetIoInvariant {
-                        flow_id,
-                        operation: TargetIoOperation::TerminalRetirement,
-                    },
-                    &mut retained,
-                    &mut outputs,
-                    error,
-                );
-            }
-            match self.retry_one_pending_target_completion() {
-                Ok(retried) => effects.extend(retried),
-                Err(error) => {
-                    let mut retained = effects
-                        .into_iter()
-                        .map(OwnerTargetWork::Effect)
-                        .collect::<VecDeque<_>>();
-                    let mut outputs = Vec::new();
-                    return self.abort_owner_error(
-                        OwnerTargetWork::TargetIoInvariant {
-                            flow_id,
-                            operation: TargetIoOperation::FailureCompletion,
-                        },
-                        &mut retained,
-                        &mut outputs,
-                        error,
-                    );
-                }
-            }
-        }
-        self.execute_effects(effects)
+        self.apply_event_observed(event)
+            .map(OwnerTargetObservedApply::into_outputs)
     }
 
     /// Consumes the one high-water timer only on the executor that was built
@@ -1216,6 +2203,48 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         self.supervisor
             .authenticate_owner_standby(active, candidate, inbound)
             .map_err(OwnerTargetError::Supervisor)
+    }
+
+    /// Owner-physical-root entry for authenticating B without exposing the
+    /// initial active `AttachedLeg`.  The complete executor-bound handoff must
+    /// already represent a settled, still-live physical A; every precommit
+    /// rejection returns the exact classified B registration unchanged.
+    pub(super) fn authenticate_owner_standby_from_initial(
+        &self,
+        active: &OwnerTargetInitialHandoff,
+        candidate: &EstablishedLeg,
+        inbound: BoundInbound,
+    ) -> Result<ExactAuthenticatedStandby, OwnerTargetError> {
+        if let Some(block) = self.initial_standby_authentication_block(active) {
+            return Err(OwnerTargetError::RejectedOwnerStandbyAuthentication {
+                block,
+                inbound: Box::new(inbound),
+            });
+        }
+        self.authenticate_owner_standby(&active.attached, candidate, inbound)
+    }
+
+    /// Borrow-only preflight used before the owner actor moves the exact B
+    /// registration envelope out of its inbound slot.
+    pub(super) fn initial_standby_authentication_block(
+        &self,
+        active: &OwnerTargetInitialHandoff,
+    ) -> Option<OwnerTargetInputBlock> {
+        self.recovery_owner_block(&active.owner)
+            .or_else(|| {
+                active
+                    .acceptance
+                    .is_some()
+                    .then_some(OwnerTargetInputBlock::InitialAcceptanceSettlementPending)
+            })
+            .or_else(|| {
+                (!active
+                    .physical_actor
+                    .as_ref()
+                    .is_some_and(PhysicalLegActorBinding::actor_is_live))
+                .then_some(OwnerTargetInputBlock::InitialPhysicalActorNotBound)
+            })
+            .or_else(|| self.input_admission_block(None))
     }
 
     /// Authenticates and installs one exact owner attach without publishing
@@ -1316,8 +2345,13 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         {
             Ok(publication) => publication,
             Err(error) => {
-                if gate.restore(slot, queue).is_err() {
-                    return Err(OwnerTargetError::RegisteredOwnerAttachReservationInvariant);
+                if let Err(source) = gate.restore(slot, queue) {
+                    return Err(OwnerTargetError::RegisteredOwnerAttachRestoreFailure(
+                        Box::new(effect_storage::OwnerRegisteredRestoreFailure {
+                            source,
+                            error: Box::new(error),
+                        }),
+                    ));
                 }
                 return Err(OwnerTargetError::Supervisor(error));
             }
@@ -1443,8 +2477,13 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         let publication = match self.supervisor.accept_catch_up_owner_attach(leg, received) {
             Ok(publication) => publication,
             Err(error) => {
-                if reservation.release(queue).is_err() {
-                    return Err(OwnerTargetError::OwnerAttachReservationInvariant);
+                if let Err(reservation) = reservation.release(queue) {
+                    return Err(OwnerTargetError::CatchUpOwnerAttachReleaseFailure(
+                        Box::new(effect_storage::OwnerCatchUpReleaseFailure {
+                            error: Box::new(error),
+                            reservation: Box::new(reservation),
+                        }),
+                    ));
                 }
                 return Err(OwnerTargetError::Supervisor(error));
             }
@@ -1606,65 +2645,8 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         recovery: EnqueuedOwnerTargetAttach,
         queue: &mut LegOutboundQueue,
     ) -> Result<Vec<OwnerTargetRecoveryOutput>, OwnerTargetError> {
-        if let Some(block) = self.recovery_owner_block(&recovery.owner) {
-            return Err(OwnerTargetError::RejectedAttachedRecovery {
-                block,
-                recovery: Box::new(recovery),
-            });
-        }
-        if !recovery.recovery.acceptance.queue_is_live() {
-            return Err(OwnerTargetError::RejectedAttachedRecovery {
-                block: OwnerTargetInputBlock::AcceptanceQueueLost,
-                recovery: Box::new(recovery),
-            });
-        }
-        if !recovery.recovery.acceptance.belongs_to_queue(queue) {
-            return Err(OwnerTargetError::RejectedAttachedRecovery {
-                block: OwnerTargetInputBlock::WrongAcceptanceQueue,
-                recovery: Box::new(recovery),
-            });
-        }
-        if let Some(block) = self.recovery_admission_block() {
-            return Err(OwnerTargetError::RejectedAttachedRecovery {
-                block,
-                recovery: Box::new(recovery),
-            });
-        }
-        let EnqueuedOwnerTargetAttach {
-            owner,
-            attached,
-            recovery:
-                EnqueuedOwnerTargetRecovery {
-                    acceptance,
-                    effects,
-                },
-        } = recovery;
-        let effects = effects
-            .into_iter()
-            .map(OwnerTargetWork::Effect)
-            .collect::<VecDeque<_>>();
-        if effects.len() > self.max_recovery_effects {
-            let actual = effects.len();
-            self.aborted_effects = Some(AbortedOwnerTargetEffects {
-                effects,
-                outputs: Vec::new(),
-            });
-            return Err(OwnerTargetError::GeneratedEffectBoundExceeded {
-                max: self.max_recovery_effects,
-                actual,
-            });
-        }
-        let outputs = self.execute_queue(effects)?;
-        self.drain_attached_recovery_outputs(
-            OwnerTargetRecoveryDrain {
-                owner,
-                attached: Some(attached),
-                acceptance: Some(acceptance),
-                pending: outputs.into(),
-                ready: Vec::new(),
-            },
-            queue,
-        )
+        let page = self.execute_attached_recovery_observed(recovery, queue)?;
+        self.publish_legacy_attached_recovery_page(page, queue)
     }
 
     /// Retries only the bounded queue drain after pressure. Reducer and Target
@@ -1672,6 +2654,17 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
     pub(crate) fn resume_attached_recovery_drain(
         &mut self,
         drain: OwnerTargetRecoveryDrain,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<Vec<OwnerTargetRecoveryOutput>, OwnerTargetError> {
+        self.publish_attached_recovery_page(drain, queue)
+    }
+
+    /// Publishes one already-executed recovery page through its exact
+    /// acceptance FIFO. Queue pressure returns this cursor, so retry cannot
+    /// repeat reducer or Target work.
+    pub(crate) fn publish_attached_recovery_page(
+        &mut self,
+        drain: OwnerTargetRecoveryPublishCursor,
         queue: &mut LegOutboundQueue,
     ) -> Result<Vec<OwnerTargetRecoveryOutput>, OwnerTargetError> {
         if let Some(block) = self.recovery_owner_block(&drain.owner) {
@@ -1714,47 +2707,172 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         recovery: OwnerTargetRecoveryResume,
         queue: &mut LegOutboundQueue,
     ) -> Result<Vec<OwnerTargetRecoveryOutput>, OwnerTargetError> {
-        if let Some(block) = self.recovery_owner_block(&recovery.resume.owner) {
-            return Err(OwnerTargetError::RejectedAttachedRecoveryResume {
+        let page = self.resume_attached_recovery_effects_observed(recovery, queue)?;
+        self.publish_legacy_attached_recovery_page(page, queue)
+    }
+
+    /// Binds the accepted initial active handoff to its exact terminal without
+    /// reclassifying it as a recovery handoff.  Physical delivery is not the
+    /// commit point: the record-specific acceptance receipt must already have
+    /// been synchronously settled by the owner controller.
+    #[allow(
+        clippy::result_large_err,
+        reason = "precommit rejection returns the exact initial handoff and terminal authority"
+    )]
+    fn terminalize_initial_handoff_exact(
+        &mut self,
+        handoff: OwnerTargetInitialHandoff,
+        terminal: ExactLegTerminal,
+    ) -> Result<
+        PendingOwnerAttachLoss,
+        OwnerRecoveryTerminalizationFailure<OwnerTargetInitialHandoff>,
+    > {
+        if let Some(block) = self.recovery_owner_block(&handoff.owner) {
+            return Err(OwnerRecoveryTerminalizationFailure {
                 block,
-                recovery: Box::new(recovery),
+                input: handoff,
+                terminal,
             });
         }
-        if let Some(block) = self.recovery_admission_block_allow_pending_turn() {
-            return Err(OwnerTargetError::RejectedAttachedRecoveryResume {
+        if handoff.acceptance.is_some() {
+            return Err(OwnerRecoveryTerminalizationFailure {
+                block: OwnerTargetInputBlock::InitialAcceptanceSettlementPending,
+                input: handoff,
+                terminal,
+            });
+        }
+        if handoff.physical_actor.is_none() {
+            return Err(OwnerRecoveryTerminalizationFailure {
+                block: OwnerTargetInputBlock::InitialPhysicalActorNotBound,
+                input: handoff,
+                terminal,
+            });
+        }
+        if self.attach_barrier_pending {
+            return Err(OwnerRecoveryTerminalizationFailure {
+                block: OwnerTargetInputBlock::AttachBarrierPending,
+                input: handoff,
+                terminal,
+            });
+        }
+        if let Some(block) = self.input_admission_block(None) {
+            return Err(OwnerRecoveryTerminalizationFailure {
                 block,
-                recovery: Box::new(recovery),
+                input: handoff,
+                terminal,
             });
         }
-        if !recovery.acceptance.queue_is_live() {
-            return Err(OwnerTargetError::RejectedAttachedRecoveryResume {
-                block: OwnerTargetInputBlock::AcceptanceQueueLost,
-                recovery: Box::new(recovery),
-            });
-        }
-        if !recovery.acceptance.belongs_to_queue(queue) {
-            return Err(OwnerTargetError::RejectedAttachedRecoveryResume {
-                block: OwnerTargetInputBlock::WrongAcceptanceQueue,
-                recovery: Box::new(recovery),
-            });
-        }
-        let OwnerTargetRecoveryResume {
+
+        let OwnerTargetInitialHandoff {
+            owner,
             attached,
             acceptance,
-            resume,
-        } = recovery;
-        let owner = resume.owner.clone();
-        let outputs = self.resume_pending_effects_inner(resume)?;
-        self.drain_attached_recovery_outputs(
-            OwnerTargetRecoveryDrain {
-                owner,
-                attached: Some(attached),
-                acceptance: Some(acceptance),
-                pending: outputs.into(),
-                ready: Vec::new(),
-            },
+            physical_actor,
+        } = handoff;
+        let generation = attached.generation();
+        let resume_grace_expired = attached.resume_grace_expired_event();
+        let loss = match attached.bind_terminal(terminal) {
+            Ok(loss) => loss,
+            Err(mismatch) => {
+                let (attached, terminal) = mismatch.into_parts();
+                return Err(OwnerRecoveryTerminalizationFailure {
+                    block: OwnerTargetInputBlock::WrongLegTerminal,
+                    input: OwnerTargetInitialHandoff {
+                        owner,
+                        attached,
+                        acceptance,
+                        physical_actor,
+                    },
+                    terminal,
+                });
+            }
+        };
+        let reason = loss.reason();
+        drop((acceptance, physical_actor));
+        Ok(PendingOwnerAttachLoss {
+            owner,
+            generation,
+            reason,
+            resume_grace_expired,
+            loss,
+            tail: TerminalOwnerAttachTail::HandoffReady,
+            phase: OwnerRecoveryLossPhase::BarrierCleared,
+        })
+    }
+
+    /// Physical wrapper for initial A terminalization.  The immutable runtime
+    /// identity, policy leg and sole FIFO must still match the binding captured
+    /// during initial adoption. Queue cleanup commits only after logical
+    /// terminalization succeeds; every rejection leaves the FIFO untouched.
+    #[allow(
+        clippy::result_large_err,
+        reason = "physical rejection returns the exact initial handoff and terminal authority"
+    )]
+    pub(super) fn terminalize_initial_handoff_physical_exact(
+        &mut self,
+        handoff: OwnerTargetInitialHandoff,
+        terminal: ExactLegTerminal,
+        runtime: &PhysicalLegRuntimeIncarnation,
+        io: &LegIo,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<
+        PendingOwnerAttachLoss,
+        OwnerRecoveryTerminalizationFailure<OwnerTargetInitialHandoff>,
+    > {
+        let Some(binding) = handoff.physical_actor.as_ref() else {
+            return Err(OwnerRecoveryTerminalizationFailure {
+                block: OwnerTargetInputBlock::InitialPhysicalActorNotBound,
+                input: handoff,
+                terminal,
+            });
+        };
+        if !binding.matches(runtime, io, queue)
+            || !handoff.matches_transport_identity(io.established_leg())
+        {
+            return Err(OwnerRecoveryTerminalizationFailure {
+                block: OwnerTargetInputBlock::WrongInitialPhysicalActor,
+                input: handoff,
+                terminal,
+            });
+        }
+        self.terminalize_with_physical_queue_exact(
+            handoff,
+            terminal,
+            io.established_leg(),
             queue,
+            Self::terminalize_initial_handoff_exact,
         )
+    }
+
+    fn terminalize_with_physical_queue_exact<I>(
+        &mut self,
+        input: I,
+        terminal: ExactLegTerminal,
+        leg: &EstablishedLeg,
+        queue: &mut LegOutboundQueue,
+        terminalize: impl FnOnce(
+            &mut Self,
+            I,
+            ExactLegTerminal,
+        ) -> Result<
+            PendingOwnerAttachLoss,
+            OwnerRecoveryTerminalizationFailure<I>,
+        >,
+    ) -> Result<PendingOwnerAttachLoss, OwnerRecoveryTerminalizationFailure<I>> {
+        let Some(cleanup) = queue.begin_owner_terminal_cleanup(leg, &terminal) else {
+            return Err(OwnerRecoveryTerminalizationFailure {
+                block: OwnerTargetInputBlock::WrongTerminalQueue,
+                input,
+                terminal,
+            });
+        };
+        match terminalize(self, input, terminal) {
+            Ok(pending) => {
+                let _discarded = cleanup.commit();
+                Ok(pending)
+            }
+            Err(failure) => Err(failure),
+        }
     }
 
     /// Binds an unpublished replacement and all of its unsent recovery tail
@@ -1765,23 +2883,26 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         clippy::result_large_err,
         reason = "every pre-transition rejection returns the exact publication and terminal authority"
     )]
-    pub(crate) fn terminalize_pending_attach_before_acceptance(
+    pub(super) fn terminalize_pending_attach_before_acceptance_exact(
         &mut self,
         pending: PendingOwnerTargetAttachPublication,
         terminal: ExactLegTerminal,
-    ) -> Result<PendingOwnerAttachLoss, OwnerTargetError> {
+    ) -> Result<
+        PendingOwnerAttachLoss,
+        OwnerRecoveryTerminalizationFailure<PendingOwnerTargetAttachPublication>,
+    > {
         if let Some(block) = self.recovery_owner_block(&pending.owner) {
-            return Err(OwnerTargetError::RejectedPendingAttachLoss {
+            return Err(OwnerRecoveryTerminalizationFailure {
                 block,
-                pending: Box::new(pending),
-                terminal: Box::new(terminal),
+                input: pending,
+                terminal,
             });
         }
         if let Some(block) = self.recovery_admission_block() {
-            return Err(OwnerTargetError::RejectedPendingAttachLoss {
+            return Err(OwnerRecoveryTerminalizationFailure {
                 block,
-                pending: Box::new(pending),
-                terminal: Box::new(terminal),
+                input: pending,
+                terminal,
             });
         }
 
@@ -1799,17 +2920,17 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
             Ok(loss) => loss,
             Err(mismatch) => {
                 let (attached, terminal) = mismatch.into_parts();
-                return Err(OwnerTargetError::RejectedPendingAttachLoss {
+                return Err(OwnerRecoveryTerminalizationFailure {
                     block: OwnerTargetInputBlock::WrongLegTerminal,
-                    pending: Box::new(PendingOwnerTargetAttachPublication {
+                    input: PendingOwnerTargetAttachPublication {
                         owner,
                         endpoint,
                         attached,
                         acceptance,
                         effects: recovery_effects,
                         admission,
-                    }),
-                    terminal: Box::new(terminal),
+                    },
+                    terminal,
                 });
             }
         };
@@ -1826,31 +2947,70 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
                 effects: recovery_effects,
                 admission,
             },
-            pending_turn_allowed: false,
+            phase: OwnerRecoveryLossPhase::BarrierStrict,
         })
+    }
+
+    pub(super) fn terminalize_pending_attach_before_acceptance_physical_exact(
+        &mut self,
+        pending: PendingOwnerTargetAttachPublication,
+        terminal: ExactLegTerminal,
+        leg: &EstablishedLeg,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<
+        PendingOwnerAttachLoss,
+        OwnerRecoveryTerminalizationFailure<PendingOwnerTargetAttachPublication>,
+    > {
+        self.terminalize_with_physical_queue_exact(
+            pending,
+            terminal,
+            leg,
+            queue,
+            Self::terminalize_pending_attach_before_acceptance_exact,
+        )
+    }
+
+    pub(crate) fn terminalize_pending_attach_before_acceptance(
+        &mut self,
+        pending: PendingOwnerTargetAttachPublication,
+        terminal: ExactLegTerminal,
+    ) -> Result<PendingOwnerAttachLoss, OwnerTargetError> {
+        self.terminalize_pending_attach_before_acceptance_exact(pending, terminal)
+            .map_err(|failure| {
+                let block = failure.block();
+                let (pending, terminal) = failure.into_parts();
+                OwnerTargetError::RejectedPendingAttachLoss {
+                    block,
+                    pending: Box::new(pending),
+                    terminal: Box::new(terminal),
+                }
+            })
     }
 
     #[allow(
         clippy::result_large_err,
         reason = "terminal mismatch returns the exact enqueued recovery and terminal authority"
     )]
-    pub(crate) fn terminalize_enqueued_attach_recovery(
+    pub(super) fn terminalize_enqueued_attach_recovery_exact(
         &mut self,
         recovery: EnqueuedOwnerTargetAttach,
         terminal: ExactLegTerminal,
-    ) -> Result<PendingOwnerAttachLoss, OwnerTargetError> {
+    ) -> Result<
+        PendingOwnerAttachLoss,
+        OwnerRecoveryTerminalizationFailure<EnqueuedOwnerTargetAttach>,
+    > {
         if let Some(block) = self.recovery_owner_block(&recovery.owner) {
-            return Err(OwnerTargetError::RejectedAttachedRecoveryTerminalization {
+            return Err(OwnerRecoveryTerminalizationFailure {
                 block,
-                recovery: Box::new(recovery),
-                terminal: Box::new(terminal),
+                input: recovery,
+                terminal,
             });
         }
         if let Some(block) = self.recovery_admission_block() {
-            return Err(OwnerTargetError::RejectedAttachedRecoveryTerminalization {
+            return Err(OwnerRecoveryTerminalizationFailure {
                 block,
-                recovery: Box::new(recovery),
-                terminal: Box::new(terminal),
+                input: recovery,
+                terminal,
             });
         }
         let EnqueuedOwnerTargetAttach {
@@ -1864,14 +3024,14 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
             Ok(loss) => loss,
             Err(mismatch) => {
                 let (attached, terminal) = mismatch.into_parts();
-                return Err(OwnerTargetError::RejectedAttachedRecoveryTerminalization {
+                return Err(OwnerRecoveryTerminalizationFailure {
                     block: OwnerTargetInputBlock::WrongLegTerminal,
-                    recovery: Box::new(EnqueuedOwnerTargetAttach {
+                    input: EnqueuedOwnerTargetAttach {
                         owner,
                         attached,
                         recovery,
-                    }),
-                    terminal: Box::new(terminal),
+                    },
+                    terminal,
                 });
             }
         };
@@ -1882,36 +3042,69 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
             resume_grace_expired,
             loss,
             tail: TerminalOwnerAttachTail::Enqueued(recovery),
-            pending_turn_allowed: false,
+            phase: OwnerRecoveryLossPhase::BarrierStrict,
         })
+    }
+
+    pub(super) fn terminalize_enqueued_attach_recovery_physical_exact(
+        &mut self,
+        recovery: EnqueuedOwnerTargetAttach,
+        terminal: ExactLegTerminal,
+        leg: &EstablishedLeg,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<
+        PendingOwnerAttachLoss,
+        OwnerRecoveryTerminalizationFailure<EnqueuedOwnerTargetAttach>,
+    > {
+        self.terminalize_with_physical_queue_exact(
+            recovery,
+            terminal,
+            leg,
+            queue,
+            Self::terminalize_enqueued_attach_recovery_exact,
+        )
+    }
+
+    pub(crate) fn terminalize_enqueued_attach_recovery(
+        &mut self,
+        recovery: EnqueuedOwnerTargetAttach,
+        terminal: ExactLegTerminal,
+    ) -> Result<PendingOwnerAttachLoss, OwnerTargetError> {
+        self.terminalize_enqueued_attach_recovery_exact(recovery, terminal)
+            .map_err(|failure| {
+                let block = failure.block();
+                let (recovery, terminal) = failure.into_parts();
+                OwnerTargetError::RejectedAttachedRecoveryTerminalization {
+                    block,
+                    recovery: Box::new(recovery),
+                    terminal: Box::new(terminal),
+                }
+            })
     }
 
     #[allow(
         clippy::result_large_err,
         reason = "terminal mismatch returns the exact retained drain and terminal authority"
     )]
-    pub(crate) fn terminalize_attached_recovery_drain(
+    pub(super) fn terminalize_attached_recovery_drain_exact(
         &mut self,
         drain: OwnerTargetRecoveryDrain,
         terminal: ExactLegTerminal,
-    ) -> Result<PendingOwnerAttachLoss, OwnerTargetError> {
+    ) -> Result<PendingOwnerAttachLoss, OwnerRecoveryTerminalizationFailure<OwnerTargetRecoveryDrain>>
+    {
         if let Some(block) = self.recovery_owner_block(&drain.owner) {
-            return Err(
-                OwnerTargetError::RejectedAttachedRecoveryDrainTerminalization {
-                    block,
-                    drain: Box::new(drain),
-                    terminal: Box::new(terminal),
-                },
-            );
+            return Err(OwnerRecoveryTerminalizationFailure {
+                block,
+                input: drain,
+                terminal,
+            });
         }
         if let Some(block) = self.recovery_admission_block_allow_pending_turn() {
-            return Err(
-                OwnerTargetError::RejectedAttachedRecoveryDrainTerminalization {
-                    block,
-                    drain: Box::new(drain),
-                    terminal: Box::new(terminal),
-                },
-            );
+            return Err(OwnerRecoveryTerminalizationFailure {
+                block,
+                input: drain,
+                terminal,
+            });
         }
         let OwnerTargetRecoveryDrain {
             owner,
@@ -1921,19 +3114,17 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
             ready,
         } = drain;
         let Some(attached) = attached.take() else {
-            return Err(
-                OwnerTargetError::RejectedAttachedRecoveryDrainTerminalization {
-                    block: OwnerTargetInputBlock::MissingAttachedRecovery,
-                    drain: Box::new(OwnerTargetRecoveryDrain {
-                        owner,
-                        attached,
-                        acceptance,
-                        pending,
-                        ready,
-                    }),
-                    terminal: Box::new(terminal),
+            return Err(OwnerRecoveryTerminalizationFailure {
+                block: OwnerTargetInputBlock::MissingAttachedRecovery,
+                input: OwnerTargetRecoveryDrain {
+                    owner,
+                    attached,
+                    acceptance,
+                    pending,
+                    ready,
                 },
-            );
+                terminal,
+            });
         };
         let generation = attached.generation();
         let resume_grace_expired = attached.resume_grace_expired_event();
@@ -1941,19 +3132,17 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
             Ok(loss) => loss,
             Err(mismatch) => {
                 let (attached, terminal) = mismatch.into_parts();
-                return Err(
-                    OwnerTargetError::RejectedAttachedRecoveryDrainTerminalization {
-                        block: OwnerTargetInputBlock::WrongLegTerminal,
-                        drain: Box::new(OwnerTargetRecoveryDrain {
-                            owner,
-                            attached: Some(attached),
-                            acceptance,
-                            pending,
-                            ready,
-                        }),
-                        terminal: Box::new(terminal),
+                return Err(OwnerRecoveryTerminalizationFailure {
+                    block: OwnerTargetInputBlock::WrongLegTerminal,
+                    input: OwnerTargetRecoveryDrain {
+                        owner,
+                        attached: Some(attached),
+                        acceptance,
+                        pending,
+                        ready,
                     },
-                );
+                    terminal,
+                });
             }
         };
         Ok(PendingOwnerAttachLoss {
@@ -1967,36 +3156,69 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
                 pending,
                 ready,
             },
-            pending_turn_allowed: true,
+            phase: OwnerRecoveryLossPhase::BarrierPendingTurn,
         })
+    }
+
+    pub(super) fn terminalize_attached_recovery_drain_physical_exact(
+        &mut self,
+        drain: OwnerTargetRecoveryDrain,
+        terminal: ExactLegTerminal,
+        leg: &EstablishedLeg,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<PendingOwnerAttachLoss, OwnerRecoveryTerminalizationFailure<OwnerTargetRecoveryDrain>>
+    {
+        self.terminalize_with_physical_queue_exact(
+            drain,
+            terminal,
+            leg,
+            queue,
+            Self::terminalize_attached_recovery_drain_exact,
+        )
+    }
+
+    pub(crate) fn terminalize_attached_recovery_drain(
+        &mut self,
+        drain: OwnerTargetRecoveryDrain,
+        terminal: ExactLegTerminal,
+    ) -> Result<PendingOwnerAttachLoss, OwnerTargetError> {
+        self.terminalize_attached_recovery_drain_exact(drain, terminal)
+            .map_err(|failure| {
+                let block = failure.block();
+                let (drain, terminal) = failure.into_parts();
+                OwnerTargetError::RejectedAttachedRecoveryDrainTerminalization {
+                    block,
+                    drain: Box::new(drain),
+                    terminal: Box::new(terminal),
+                }
+            })
     }
 
     #[allow(
         clippy::result_large_err,
         reason = "terminal mismatch returns the exact retained resume and terminal authority"
     )]
-    pub(crate) fn terminalize_attached_recovery_resume(
+    pub(super) fn terminalize_attached_recovery_resume_exact(
         &mut self,
         recovery: OwnerTargetRecoveryResume,
         terminal: ExactLegTerminal,
-    ) -> Result<PendingOwnerAttachLoss, OwnerTargetError> {
+    ) -> Result<
+        PendingOwnerAttachLoss,
+        OwnerRecoveryTerminalizationFailure<OwnerTargetRecoveryResume>,
+    > {
         if let Some(block) = self.recovery_owner_block(&recovery.resume.owner) {
-            return Err(
-                OwnerTargetError::RejectedAttachedRecoveryResumeTerminalization {
-                    block,
-                    recovery: Box::new(recovery),
-                    terminal: Box::new(terminal),
-                },
-            );
+            return Err(OwnerRecoveryTerminalizationFailure {
+                block,
+                input: recovery,
+                terminal,
+            });
         }
         if let Some(block) = self.recovery_admission_block_allow_pending_turn() {
-            return Err(
-                OwnerTargetError::RejectedAttachedRecoveryResumeTerminalization {
-                    block,
-                    recovery: Box::new(recovery),
-                    terminal: Box::new(terminal),
-                },
-            );
+            return Err(OwnerRecoveryTerminalizationFailure {
+                block,
+                input: recovery,
+                terminal,
+            });
         }
         let OwnerTargetRecoveryResume {
             attached,
@@ -2010,17 +3232,15 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
             Ok(loss) => loss,
             Err(mismatch) => {
                 let (attached, terminal) = mismatch.into_parts();
-                return Err(
-                    OwnerTargetError::RejectedAttachedRecoveryResumeTerminalization {
-                        block: OwnerTargetInputBlock::WrongLegTerminal,
-                        recovery: Box::new(OwnerTargetRecoveryResume {
-                            attached,
-                            acceptance,
-                            resume,
-                        }),
-                        terminal: Box::new(terminal),
+                return Err(OwnerRecoveryTerminalizationFailure {
+                    block: OwnerTargetInputBlock::WrongLegTerminal,
+                    input: OwnerTargetRecoveryResume {
+                        attached,
+                        acceptance,
+                        resume,
                     },
-                );
+                    terminal,
+                });
             }
         };
         Ok(PendingOwnerAttachLoss {
@@ -2030,8 +3250,120 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
             resume_grace_expired,
             loss,
             tail: TerminalOwnerAttachTail::Resume { acceptance, resume },
-            pending_turn_allowed: true,
+            phase: OwnerRecoveryLossPhase::BarrierPendingTurn,
         })
+    }
+
+    pub(super) fn terminalize_attached_recovery_resume_physical_exact(
+        &mut self,
+        recovery: OwnerTargetRecoveryResume,
+        terminal: ExactLegTerminal,
+        leg: &EstablishedLeg,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<
+        PendingOwnerAttachLoss,
+        OwnerRecoveryTerminalizationFailure<OwnerTargetRecoveryResume>,
+    > {
+        self.terminalize_with_physical_queue_exact(
+            recovery,
+            terminal,
+            leg,
+            queue,
+            Self::terminalize_attached_recovery_resume_exact,
+        )
+    }
+
+    pub(crate) fn terminalize_attached_recovery_resume(
+        &mut self,
+        recovery: OwnerTargetRecoveryResume,
+        terminal: ExactLegTerminal,
+    ) -> Result<PendingOwnerAttachLoss, OwnerTargetError> {
+        self.terminalize_attached_recovery_resume_exact(recovery, terminal)
+            .map_err(|failure| {
+                let block = failure.block();
+                let (recovery, terminal) = failure.into_parts();
+                OwnerTargetError::RejectedAttachedRecoveryResumeTerminalization {
+                    block,
+                    recovery: Box::new(recovery),
+                    terminal: Box::new(terminal),
+                }
+            })
+    }
+
+    /// Binds a fully published recovery handoff after the attach barrier has
+    /// cleared. Owner identity remains paired with the AttachedLeg, so a
+    /// foreign controller or terminal mismatch returns both exact inputs.
+    pub(super) fn terminalize_recovery_handoff_exact(
+        &mut self,
+        handoff: OwnerTargetRecoveryHandoff,
+        terminal: ExactLegTerminal,
+    ) -> Result<
+        PendingOwnerAttachLoss,
+        OwnerRecoveryTerminalizationFailure<OwnerTargetRecoveryHandoff>,
+    > {
+        if let Some(block) = self.recovery_owner_block(&handoff.owner) {
+            return Err(OwnerRecoveryTerminalizationFailure {
+                block,
+                input: handoff,
+                terminal,
+            });
+        }
+        if self.attach_barrier_pending {
+            return Err(OwnerRecoveryTerminalizationFailure {
+                block: OwnerTargetInputBlock::AttachBarrierPending,
+                input: handoff,
+                terminal,
+            });
+        }
+        if let Some(block) = self.input_admission_block(None) {
+            return Err(OwnerRecoveryTerminalizationFailure {
+                block,
+                input: handoff,
+                terminal,
+            });
+        }
+        let OwnerTargetRecoveryHandoff { owner, attached } = handoff;
+        let generation = attached.generation();
+        let resume_grace_expired = attached.resume_grace_expired_event();
+        let loss = match attached.bind_terminal(terminal) {
+            Ok(loss) => loss,
+            Err(mismatch) => {
+                let (attached, terminal) = mismatch.into_parts();
+                return Err(OwnerRecoveryTerminalizationFailure {
+                    block: OwnerTargetInputBlock::WrongLegTerminal,
+                    input: OwnerTargetRecoveryHandoff { owner, attached },
+                    terminal,
+                });
+            }
+        };
+        Ok(PendingOwnerAttachLoss {
+            owner,
+            generation,
+            reason: loss.reason(),
+            resume_grace_expired,
+            loss,
+            tail: TerminalOwnerAttachTail::HandoffReady,
+            phase: OwnerRecoveryLossPhase::BarrierCleared,
+        })
+    }
+
+    pub(super) fn terminalize_recovery_handoff_physical_exact(
+        &mut self,
+        handoff: OwnerTargetRecoveryHandoff,
+        terminal: ExactLegTerminal,
+        leg: &EstablishedLeg,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<
+        PendingOwnerAttachLoss,
+        OwnerRecoveryTerminalizationFailure<OwnerTargetRecoveryHandoff>,
+    > {
+        self.terminalize_with_physical_queue_exact(
+            handoff,
+            terminal,
+            leg,
+            queue,
+            Self::terminalize_recovery_handoff_exact,
+        )
     }
 
     /// Explicitly discards one terminal-bound unpublished recovery tail, then
@@ -2041,26 +3373,71 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         clippy::result_large_err,
         reason = "wrong executor or barrier state returns the complete terminal-bound recovery"
     )]
-    pub(crate) fn discard_terminal_attach_recovery(
+    pub(super) fn discard_terminal_attach_recovery_exact(
         &mut self,
         pending: PendingOwnerAttachLoss,
-    ) -> Result<OwnerLeglessHighWater, OwnerTargetError> {
+    ) -> Result<OwnerLeglessHighWater, OwnerTerminalAttachDiscardFailure> {
         if let Some(block) = self.recovery_owner_block(&pending.owner) {
-            return Err(OwnerTargetError::RejectedTerminalAttachRecoveryDiscard {
-                block,
-                pending: Box::new(pending),
-            });
+            return Err(OwnerTerminalAttachDiscardFailure::Blocked { block, pending });
         }
-        let admission = if pending.pending_turn_allowed {
-            self.recovery_admission_block_allow_pending_turn()
-        } else {
-            self.recovery_admission_block()
+        let admission = match pending.phase {
+            OwnerRecoveryLossPhase::BarrierStrict => self.recovery_admission_block(),
+            OwnerRecoveryLossPhase::BarrierPendingTurn => {
+                self.recovery_admission_block_allow_pending_turn()
+            }
+            OwnerRecoveryLossPhase::BarrierCleared => {
+                if self.attach_barrier_pending {
+                    Some(OwnerTargetInputBlock::AttachBarrierPending)
+                } else {
+                    self.input_admission_block(None)
+                }
+            }
         };
         if let Some(block) = admission {
-            return Err(OwnerTargetError::RejectedTerminalAttachRecoveryDiscard {
-                block,
-                pending: Box::new(pending),
-            });
+            return Err(OwnerTerminalAttachDiscardFailure::Blocked { block, pending });
+        }
+        let generation = pending.generation;
+        let effects = match self.supervisor.apply_event(pending.loss.event()) {
+            Ok(effects) => effects,
+            Err(SessionSupervisorError::RejectedEvent { block, event }) => {
+                drop(event);
+                return Err(OwnerTerminalAttachDiscardFailure::Blocked {
+                    block: OwnerTargetInputBlock::ReducerAdmission(block),
+                    pending,
+                });
+            }
+            Err(source) => {
+                return Err(OwnerTerminalAttachDiscardFailure::Quarantined(
+                    QuarantinedOwnerAttachLoss {
+                        pending,
+                        source: OwnerTerminalAttachDiscardQuarantineSource::Supervisor(source),
+                    },
+                ));
+            }
+        };
+        if effects.as_slice() != [SessionEffect::ResumeGraceStarted { generation }] {
+            return Err(OwnerTerminalAttachDiscardFailure::Quarantined(
+                QuarantinedOwnerAttachLoss {
+                    pending,
+                    source: OwnerTerminalAttachDiscardQuarantineSource::Effects {
+                        generation,
+                        effects,
+                    },
+                },
+            ));
+        }
+        let mut batch = crate::resumable::effect_storage::SessionEffectBatch::from_vec(effects);
+        drop(batch.remove(0)); // The checked value-only ResumeGraceStarted is consumed here.
+        if let Err(source) = self.supervisor.reclaim_effect_batch(&mut batch) {
+            return Err(OwnerTerminalAttachDiscardFailure::Quarantined(
+                QuarantinedOwnerAttachLoss {
+                    pending,
+                    source: OwnerTerminalAttachDiscardQuarantineSource::Storage {
+                        source,
+                        effects: batch,
+                    },
+                },
+            ));
         }
         let PendingOwnerAttachLoss {
             owner: _,
@@ -2069,17 +3446,10 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
             resume_grace_expired,
             loss,
             tail,
-            pending_turn_allowed: _,
+            phase: _,
         } = pending;
         tail.discard();
-        let effects = self.supervisor.apply_event(loss.into_event())?;
-        if effects.as_slice() != [SessionEffect::ResumeGraceStarted { generation }] {
-            return Err(OwnerTargetError::PendingAttachLossEffectInvariant {
-                generation,
-                effects,
-            });
-        }
-        drop(effects);
+        drop(loss);
         self.finish_lost_attach_barrier();
         Ok(OwnerLeglessHighWater {
             owner: Arc::downgrade(&self.identity),
@@ -2087,6 +3457,47 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
             reason,
             resume_grace_expired,
         })
+    }
+
+    pub(crate) fn discard_terminal_attach_recovery(
+        &mut self,
+        pending: PendingOwnerAttachLoss,
+    ) -> Result<OwnerLeglessHighWater, OwnerTargetError> {
+        self.discard_terminal_attach_recovery_exact(pending)
+            .map_err(|failure| match failure {
+                OwnerTerminalAttachDiscardFailure::Blocked { block, pending } => {
+                    OwnerTargetError::RejectedTerminalAttachRecoveryDiscard {
+                        block,
+                        pending: Box::new(pending),
+                    }
+                }
+                OwnerTerminalAttachDiscardFailure::Quarantined(quarantine) => {
+                    let QuarantinedOwnerAttachLoss { pending, source } = quarantine;
+                    match source {
+                        OwnerTerminalAttachDiscardQuarantineSource::Storage { source, effects } => {
+                            OwnerTargetError::TerminalAttachRecoveryStorageInvariant {
+                                source,
+                                effects,
+                                pending: Box::new(pending),
+                            }
+                        }
+                        OwnerTerminalAttachDiscardQuarantineSource::Supervisor(source) => {
+                            OwnerTargetError::TerminalAttachRecoveryDiscardInvariant {
+                                source,
+                                pending: Box::new(pending),
+                            }
+                        }
+                        OwnerTerminalAttachDiscardQuarantineSource::Effects {
+                            generation,
+                            effects,
+                        } => OwnerTargetError::PendingAttachLossEffectInvariant {
+                            generation,
+                            effects,
+                            pending: Box::new(pending),
+                        },
+                    }
+                }
+            })
     }
 
     fn finish_lost_attach_barrier(&mut self) {
@@ -2190,46 +3601,32 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         self.attach_barrier_pending = false;
         drain
             .ready
-            .push(OwnerTargetRecoveryOutput::RecoveryCompleted { attached });
+            .push(OwnerTargetRecoveryOutput::RecoveryCompleted {
+                handoff: OwnerTargetRecoveryHandoff {
+                    owner: Arc::downgrade(&self.identity),
+                    attached,
+                },
+            });
         Ok(drain.ready)
     }
 
-    /// Consumes the exact wakeup minted by the previous bounded turn.
-    pub(crate) fn resume_pending_effects(
+    fn publish_legacy_attached_recovery_page(
         &mut self,
-        resume: OwnerTargetResume,
-    ) -> Result<Vec<OwnerTargetOutput>, OwnerTargetError> {
-        if self.attach_barrier_pending {
-            return Err(OwnerTargetError::RejectedEffectResume {
-                block: OwnerTargetInputBlock::AttachBarrierPending,
-                resume: Box::new(resume),
-            });
+        page: OwnerTargetObservedRecoveryPage,
+        queue: &mut LegOutboundQueue,
+    ) -> Result<Vec<OwnerTargetRecoveryOutput>, OwnerTargetError> {
+        let (publish, observations) = page.into_progress_parts();
+        if observations.is_empty() {
+            return self.publish_attached_recovery_page(publish, queue);
         }
-        self.resume_pending_effects_inner(resume)
-    }
-
-    fn resume_pending_effects_inner(
-        &mut self,
-        resume: OwnerTargetResume,
-    ) -> Result<Vec<OwnerTargetOutput>, OwnerTargetError> {
-        if let Some(block) = self.recovery_owner_block(&resume.owner) {
-            return Err(OwnerTargetError::RejectedEffectResume {
-                block,
-                resume: Box::new(resume),
-            });
-        }
-        let Some(expected) = self.outstanding_resume else {
-            return Err(OwnerTargetError::NoPendingEffectTurn);
+        let error = match self.retain_observations_on_failure::<()>(
+            Err(OwnerTargetError::AttachedRecoveryObservationInvariant),
+            observations,
+        ) {
+            Err(error) => error,
+            Ok(()) => OwnerTargetError::AttachedRecoveryObservationInvariant,
         };
-        if resume.id != expected {
-            return Err(OwnerTargetError::InvalidEffectResume {
-                expected,
-                actual: resume.id,
-            });
-        }
-        self.outstanding_resume = None;
-        let effects = std::mem::take(&mut self.pending_effects);
-        self.execute_queue(effects)
+        Err(self.retain_failed_recovery_cursor(publish, error))
     }
 
     /// Retries one retained Target sink offer.  Zero and would-block retain the
@@ -2239,20 +3636,8 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         &mut self,
         flow_id: SessionFlowId,
     ) -> Result<Vec<OwnerTargetOutput>, OwnerTargetError> {
-        self.require_no_pending_effects()?;
-        self.require_no_pending_target_completion(flow_id)?;
-        let pending = self
-            .flows
-            .get_mut(&flow_id)
-            .ok_or(OwnerTargetError::UnknownTargetFlow { flow_id })?
-            .pending_write
-            .take()
-            .ok_or(OwnerTargetError::NoPendingTargetWrite { flow_id })?;
-        let mut effects = VecDeque::new();
-        let mut outputs = Vec::new();
-        self.attempt_target_write(pending, &mut effects, &mut outputs)?;
-        outputs.extend(self.execute_queue(effects)?);
-        Ok(outputs)
+        self.retry_target_write_observed(flow_id)
+            .map(OwnerTargetObservedApply::into_outputs)
     }
 
     /// Attempts to finish one Target join whose owned application buffers were
@@ -2283,1030 +3668,6 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
             }
         }
     }
-
-    /// Reserves the source FIFO slot and maximum byte permits before touching
-    /// `TargetIo`.  A positive read shrinks that reservation to the exact
-    /// bytes and reaches the reducer only through the non-cloneable driver
-    /// command. EOF releases the read reservation before entering the same
-    /// ordered source lane as DATA.
-    pub(crate) fn try_read_target(
-        &mut self,
-        flow_id: SessionFlowId,
-    ) -> Result<Vec<OwnerTargetOutput>, OwnerTargetError> {
-        self.require_no_pending_effects()?;
-        self.require_no_pending_target_completion(flow_id)?;
-        let reservation = self
-            .flows
-            .get(&flow_id)
-            .ok_or(OwnerTargetError::UnknownTargetFlow { flow_id })?
-            .source
-            .as_ref()
-            .ok_or(OwnerTargetError::MissingTargetReadSource { flow_id })?
-            .flow
-            .try_reserve_uplink_source(self.config.max_target_read_bytes)?;
-        let read = match self.target.read(flow_id, self.config.max_target_read_bytes) {
-            Ok(read) => read,
-            Err(error) => {
-                drop(reservation);
-                return self.abort_direct_target_io(flow_id, TargetIoOperation::Read, error);
-            }
-        };
-        let source_fact = match read {
-            super::target::TargetReadCompletion::Data(bytes) => {
-                if let Err(error) = reservation.commit(bytes) {
-                    return self.abort_direct_owner_error(
-                        flow_id,
-                        TargetIoOperation::ReadCompletion,
-                        OwnerTargetError::FlowPort(error),
-                    );
-                }
-                TargetSourceFact::Data
-            }
-            super::target::TargetReadCompletion::Eof => {
-                if let Err(error) = reservation.commit_eof() {
-                    return self.abort_direct_owner_error(
-                        flow_id,
-                        TargetIoOperation::ReadCompletion,
-                        OwnerTargetError::FlowPort(error),
-                    );
-                }
-                TargetSourceFact::Eof
-            }
-            super::target::TargetReadCompletion::WouldBlock => {
-                drop(reservation);
-                return Ok(Vec::new());
-            }
-            super::target::TargetReadCompletion::Failed(_) => {
-                drop(reservation);
-                let mut effects = VecDeque::new();
-                let mut outputs = Vec::new();
-                if let Err(error) = self.apply_target_failure(flow_id, &mut effects, &mut outputs) {
-                    return self.abort_direct_owner_error(
-                        flow_id,
-                        TargetIoOperation::FailureCompletion,
-                        error,
-                    );
-                }
-                outputs.extend(self.execute_queue(effects)?);
-                return Ok(outputs);
-            }
-        };
-        let input_result = match self.flows.get_mut(&flow_id) {
-            Some(flow) => match flow.source.as_mut() {
-                Some(source) => source.driver.try_recv_next(),
-                None => {
-                    return self.abort_direct_owner_error(
-                        flow_id,
-                        TargetIoOperation::ReadCompletion,
-                        OwnerTargetError::MissingTargetReadSource { flow_id },
-                    );
-                }
-            },
-            None => {
-                return self.abort_direct_owner_error(
-                    flow_id,
-                    TargetIoOperation::ReadCompletion,
-                    OwnerTargetError::UnknownTargetFlow { flow_id },
-                );
-            }
-        };
-        let input = match input_result {
-            Ok(Some(input)) => input,
-            Ok(None) => {
-                return self.abort_direct_owner_error(
-                    flow_id,
-                    TargetIoOperation::ReadCompletion,
-                    OwnerTargetError::MissingTargetReadDriverInput { flow_id },
-                );
-            }
-            Err(error) => {
-                return self.abort_direct_owner_error(
-                    flow_id,
-                    TargetIoOperation::ReadCompletion,
-                    OwnerTargetError::FlowPort(error),
-                );
-            }
-        };
-        let exact_source_fact = match (&input, source_fact) {
-            (DriverInput::Data(data), TargetSourceFact::Data) => data.flow().flow_id() == flow_id,
-            (DriverInput::Control(SessionEvent::LocalClose { flow }), TargetSourceFact::Eof) => {
-                flow.flow_id() == flow_id
-            }
-            _ => false,
-        };
-        if !exact_source_fact {
-            return self.abort_direct_owner_error(
-                flow_id,
-                TargetIoOperation::ReadCompletion,
-                OwnerTargetError::UnexpectedTargetReadDriverInput { flow_id },
-            );
-        }
-        let effects = match self
-            .supervisor
-            .apply_command(SessionOwnerCommand::Driver(input))
-        {
-            Ok(effects) => effects,
-            Err(error) => {
-                return self.abort_direct_owner_error(
-                    flow_id,
-                    TargetIoOperation::ReadCompletion,
-                    OwnerTargetError::Supervisor(error),
-                );
-            }
-        };
-        self.execute_effects(effects)
-    }
-
-    fn execute_effects(
-        &mut self,
-        effects: Vec<SessionEffect>,
-    ) -> Result<Vec<OwnerTargetOutput>, OwnerTargetError> {
-        self.require_no_pending_effects()?;
-        let effects = effects
-            .into_iter()
-            .map(OwnerTargetWork::Effect)
-            .collect::<VecDeque<_>>();
-        if effects.len() > MAX_INCREMENTAL_EFFECT_BURST {
-            let actual = effects.len();
-            self.aborted_effects = Some(AbortedOwnerTargetEffects {
-                effects,
-                outputs: Vec::new(),
-            });
-            return Err(OwnerTargetError::GeneratedEffectBoundExceeded {
-                max: MAX_INCREMENTAL_EFFECT_BURST,
-                actual,
-            });
-        }
-        self.execute_queue(effects)
-    }
-
-    fn execute_queue(
-        &mut self,
-        mut effects: VecDeque<OwnerTargetWork>,
-    ) -> Result<Vec<OwnerTargetOutput>, OwnerTargetError> {
-        let mut outputs = Vec::new();
-        let mut steps = 0usize;
-        while steps < self.config.max_effect_steps {
-            let Some(work) = effects.pop_front() else {
-                return Ok(outputs);
-            };
-            steps = match steps.checked_add(1) {
-                Some(steps) => steps,
-                None => {
-                    return self.abort_owner_error(
-                        work,
-                        &mut effects,
-                        &mut outputs,
-                        OwnerTargetError::EffectStepOverflow,
-                    );
-                }
-            };
-            let effect = match work {
-                OwnerTargetWork::Effect(effect) => effect,
-                OwnerTargetWork::ExpireNextTarget => {
-                    match self.expire_next_target() {
-                        Ok(true) => effects.push_front(OwnerTargetWork::ExpireNextTarget),
-                        Ok(false) => outputs.push(OwnerTargetOutput::SessionExpired),
-                        Err(error) => {
-                            return self.abort_owner_error(
-                                OwnerTargetWork::ExpireNextTarget,
-                                &mut effects,
-                                &mut outputs,
-                                error,
-                            );
-                        }
-                    }
-                    continue;
-                }
-                current @ OwnerTargetWork::TargetIoInvariant { .. } => {
-                    return self.abort_owner_error(
-                        current,
-                        &mut effects,
-                        &mut outputs,
-                        OwnerTargetError::AbortedEffectInvariant,
-                    );
-                }
-            };
-            let reserved = incremental_effect_burst(&effect);
-            let admitted = effects
-                .len()
-                .checked_add(reserved)
-                .is_some_and(|attempted| attempted <= self.config.max_pending_effects);
-            if !admitted {
-                effects.push_front(OwnerTargetWork::Effect(effect));
-                let attempted = effects.len().saturating_add(reserved);
-                self.aborted_effects = Some(AbortedOwnerTargetEffects { effects, outputs });
-                return Err(OwnerTargetError::PendingEffectCapacityInvariant {
-                    max: self.config.max_pending_effects,
-                    attempted,
-                });
-            }
-            match effect {
-                SessionEffect::Transmit(frame) => {
-                    outputs.push(OwnerTargetOutput::Transmit(frame));
-                }
-                SessionEffect::LegActivated { generation } => {
-                    outputs.push(OwnerTargetOutput::LegActivated { generation });
-                }
-                SessionEffect::ResumeGraceStarted { generation } => {
-                    outputs.push(OwnerTargetOutput::ResumeGraceStarted { generation });
-                }
-                SessionEffect::SessionExpired => {
-                    effects.push_front(OwnerTargetWork::ExpireNextTarget);
-                }
-                SessionEffect::PeerOpenRequested {
-                    request,
-                    flow,
-                    target,
-                } => {
-                    let flow_id = request.flow_id();
-                    if flow.flow_id() != flow_id || self.flows.contains_key(&flow_id) {
-                        return self.abort_owner_error(
-                            OwnerTargetWork::Effect(SessionEffect::PeerOpenRequested {
-                                request,
-                                flow,
-                                target,
-                            }),
-                            &mut effects,
-                            &mut outputs,
-                            OwnerTargetError::DuplicateOrMismatchedPeerOpen { flow_id },
-                        );
-                    }
-                    // Consume the one-shot LocalFlow authority before Target
-                    // admission. A factory invariant failure must not leave an
-                    // opened Target that was never entered in `self.flows`.
-                    let source = match self.source_factory.open_flow(flow) {
-                        Ok((flow, driver)) => TargetReadSource { flow, driver },
-                        Err(error) => {
-                            return self.abort_owner_error(
-                                OwnerTargetWork::Effect(SessionEffect::PeerOpenRequested {
-                                    request,
-                                    flow,
-                                    target,
-                                }),
-                                &mut effects,
-                                &mut outputs,
-                                OwnerTargetError::FlowPort(error),
-                            );
-                        }
-                    };
-                    let (result, target_present, retain_source, terminal) =
-                        match self.target.open(flow_id, &target) {
-                            Ok(
-                                TargetOpenCompletion::Opened | TargetOpenCompletion::AlreadyOpen,
-                            ) => (OpenResultCode::Opened, true, true, None),
-                            Ok(TargetOpenCompletion::AlreadyTerminal(kind)) => {
-                                (OpenResultCode::Internal, true, false, Some(kind))
-                            }
-                            Ok(TargetOpenCompletion::Failed(failure)) => {
-                                (open_failure_result(failure), false, false, None)
-                            }
-                            Err(error) => {
-                                return self.abort_target_io(
-                                    OwnerTargetWork::Effect(SessionEffect::PeerOpenRequested {
-                                        request,
-                                        flow,
-                                        target,
-                                    }),
-                                    &mut effects,
-                                    &mut outputs,
-                                    error,
-                                );
-                            }
-                        };
-                    // Retain the reducer flow even when Target admission
-                    // failed: `PeerOpenResolved` will emit `FlowFinished`,
-                    // which must retire this owner record without pretending
-                    // that a Target resource exists.
-                    let source = retain_source.then_some(source);
-                    self.flows.insert(
-                        flow_id,
-                        TargetFlowOwner {
-                            target_present,
-                            source,
-                            pending_write: None,
-                            terminal,
-                            join_pending: false,
-                            retire_after_join: false,
-                            pending_completion: None,
-                        },
-                    );
-                    let generated = match self.submit_target_completion(
-                        flow_id,
-                        PendingTargetCompletion::Open { request, result },
-                    ) {
-                        Ok(generated) => generated,
-                        Err(error) => {
-                            return self.abort_owner_error(
-                                OwnerTargetWork::TargetIoInvariant {
-                                    flow_id,
-                                    operation: TargetIoOperation::OpenCompletion,
-                                },
-                                &mut effects,
-                                &mut outputs,
-                                error,
-                            );
-                        }
-                    };
-                    self.extend_effects(&mut effects, &mut outputs, generated)?;
-                }
-                SessionEffect::OfferToSink { offer, segments } => {
-                    let flow_id = offer.flow_id();
-                    let pending = PendingTargetWrite { offer, segments };
-                    let flow = match self.flows.get(&flow_id) {
-                        Some(flow) => flow,
-                        None => {
-                            return self.abort_owner_error(
-                                OwnerTargetWork::Effect(SessionEffect::OfferToSink {
-                                    offer: pending.offer,
-                                    segments: pending.segments,
-                                }),
-                                &mut effects,
-                                &mut outputs,
-                                OwnerTargetError::UnknownTargetFlow { flow_id },
-                            );
-                        }
-                    };
-                    if flow.pending_write.is_some() {
-                        return self.abort_owner_error(
-                            OwnerTargetWork::Effect(SessionEffect::OfferToSink {
-                                offer: pending.offer,
-                                segments: pending.segments,
-                            }),
-                            &mut effects,
-                            &mut outputs,
-                            OwnerTargetError::DuplicatePendingTargetWrite { flow_id },
-                        );
-                    }
-                    self.attempt_target_write(pending, &mut effects, &mut outputs)?;
-                }
-                SessionEffect::HalfCloseSink { completion } => {
-                    let flow_id = completion.flow_id();
-                    let flow = match self.flows.get(&flow_id) {
-                        Some(flow) => flow,
-                        None => {
-                            return self.abort_owner_error(
-                                OwnerTargetWork::Effect(SessionEffect::HalfCloseSink {
-                                    completion,
-                                }),
-                                &mut effects,
-                                &mut outputs,
-                                OwnerTargetError::UnknownTargetFlow { flow_id },
-                            );
-                        }
-                    };
-                    if flow.pending_write.is_some() {
-                        return self.abort_owner_error(
-                            OwnerTargetWork::Effect(SessionEffect::HalfCloseSink { completion }),
-                            &mut effects,
-                            &mut outputs,
-                            OwnerTargetError::HalfCloseBeforePendingWrite { flow_id },
-                        );
-                    }
-                    let completion_event = match self.target.half_close_write(flow_id) {
-                        Ok(
-                            TargetHalfCloseCompletion::Closed
-                            | TargetHalfCloseCompletion::AlreadyClosed,
-                        ) => SessionEvent::SinkHalfClosed { completion },
-                        Ok(TargetHalfCloseCompletion::Failed(_)) => {
-                            if let Err(error) =
-                                self.apply_target_failure(flow_id, &mut effects, &mut outputs)
-                            {
-                                return self.abort_owner_error(
-                                    OwnerTargetWork::Effect(SessionEffect::HalfCloseSink {
-                                        completion,
-                                    }),
-                                    &mut effects,
-                                    &mut outputs,
-                                    error,
-                                );
-                            }
-                            continue;
-                        }
-                        Err(error) => {
-                            return self.abort_target_io(
-                                OwnerTargetWork::Effect(SessionEffect::HalfCloseSink {
-                                    completion,
-                                }),
-                                &mut effects,
-                                &mut outputs,
-                                error,
-                            );
-                        }
-                    };
-                    let generated = match self.submit_target_completion(
-                        flow_id,
-                        PendingTargetCompletion::HalfClose {
-                            event: completion_event,
-                        },
-                    ) {
-                        Ok(generated) => generated,
-                        Err(error) => {
-                            return self.abort_owner_error(
-                                OwnerTargetWork::TargetIoInvariant {
-                                    flow_id,
-                                    operation: TargetIoOperation::HalfCloseCompletion,
-                                },
-                                &mut effects,
-                                &mut outputs,
-                                error,
-                            );
-                        }
-                    };
-                    self.extend_effects(&mut effects, &mut outputs, generated)?;
-                }
-                SessionEffect::PeerReset { flow_id, reason } => {
-                    if !self.flows.contains_key(&flow_id) {
-                        return self.abort_owner_error(
-                            OwnerTargetWork::Effect(SessionEffect::PeerReset { flow_id, reason }),
-                            &mut effects,
-                            &mut outputs,
-                            OwnerTargetError::UnknownTargetFlow { flow_id },
-                        );
-                    }
-                    let terminal = match self.target.reset(flow_id) {
-                        Err(error) => {
-                            return self.abort_target_io(
-                                OwnerTargetWork::Effect(SessionEffect::PeerReset {
-                                    flow_id,
-                                    reason,
-                                }),
-                                &mut effects,
-                                &mut outputs,
-                                error,
-                            );
-                        }
-                        Ok(completion) => match completion {
-                            TargetResetCompletion::Reset { .. }
-                            | TargetResetCompletion::AlreadyReset => TargetTerminalKind::Reset,
-                            TargetResetCompletion::AlreadyTerminal(kind) => kind,
-                        },
-                    };
-                    if let Some(flow) = self.flows.get_mut(&flow_id) {
-                        flow.pending_write = None;
-                        flow.terminal = Some(terminal);
-                    }
-                }
-                SessionEffect::FlowFinished {
-                    flow_id,
-                    reason,
-                    terminal,
-                } => {
-                    if let Err(error) = self.finish_target_flow(flow_id, reason) {
-                        return self.abort_owner_error(
-                            OwnerTargetWork::Effect(SessionEffect::FlowFinished {
-                                flow_id,
-                                reason,
-                                terminal,
-                            }),
-                            &mut effects,
-                            &mut outputs,
-                            error,
-                        );
-                    }
-                    outputs.push(OwnerTargetOutput::TerminalGraceStarted { terminal });
-                }
-                unexpected @ (SessionEffect::ReplayStored { .. }
-                | SessionEffect::ReplayAcknowledged { .. }) => {
-                    return self.abort_owner_error(
-                        OwnerTargetWork::Effect(unexpected),
-                        &mut effects,
-                        &mut outputs,
-                        OwnerTargetError::InternalReceiptEscapedSupervisor,
-                    );
-                }
-                unexpected @ (SessionEffect::LocalFlowOpened { .. }
-                | SessionEffect::LocalOpenResolved { .. }) => {
-                    return self.abort_owner_error(
-                        OwnerTargetWork::Effect(unexpected),
-                        &mut effects,
-                        &mut outputs,
-                        OwnerTargetError::ClientOnlyEffectAtOwner,
-                    );
-                }
-            }
-        }
-        if effects.is_empty() {
-            return Ok(outputs);
-        }
-        if effects.len() > self.config.max_pending_effects {
-            let attempted = effects.len();
-            self.aborted_effects = Some(AbortedOwnerTargetEffects { effects, outputs });
-            return Err(OwnerTargetError::PendingEffectCapacityInvariant {
-                max: self.config.max_pending_effects,
-                attempted,
-            });
-        }
-        self.pending_effects = effects;
-        let resume = match self.issue_resume() {
-            Ok(resume) => resume,
-            Err(error) => {
-                self.aborted_effects = Some(AbortedOwnerTargetEffects {
-                    effects: std::mem::take(&mut self.pending_effects),
-                    outputs,
-                });
-                return Err(error);
-            }
-        };
-        outputs.push(OwnerTargetOutput::NeedsResume { resume });
-        Ok(outputs)
-    }
-
-    fn attempt_target_write(
-        &mut self,
-        pending: PendingTargetWrite,
-        effects: &mut VecDeque<OwnerTargetWork>,
-        outputs: &mut Vec<OwnerTargetOutput>,
-    ) -> Result<(), OwnerTargetError> {
-        let flow_id = pending.offer.flow_id();
-        let Some(first) = pending.segments.first() else {
-            return self.abort_owner_error(
-                OwnerTargetWork::Effect(SessionEffect::OfferToSink {
-                    offer: pending.offer,
-                    segments: pending.segments,
-                }),
-                effects,
-                outputs,
-                OwnerTargetError::EmptyTargetOffer { flow_id },
-            );
-        };
-        match self.target.write(flow_id, first.payload()) {
-            Ok(TargetWriteCompletion::Accepted(bytes)) => {
-                let accepted = bytes.get();
-                let exposed = first.len();
-                let offered = pending.offer.len();
-                if accepted > exposed || accepted > offered {
-                    return self.abort_owner_error(
-                        OwnerTargetWork::Effect(SessionEffect::OfferToSink {
-                            offer: pending.offer,
-                            segments: pending.segments,
-                        }),
-                        effects,
-                        outputs,
-                        OwnerTargetError::InvalidTargetWriteAcceptance {
-                            flow_id,
-                            accepted,
-                            exposed,
-                            offered,
-                        },
-                    );
-                }
-                let generated = match self.supervisor.apply_event(SessionEvent::SinkAccepted {
-                    offer: pending.offer,
-                    bytes: accepted,
-                }) {
-                    Ok(generated) => generated,
-                    Err(error) => {
-                        return self.abort_owner_error(
-                            OwnerTargetWork::Effect(SessionEffect::OfferToSink {
-                                offer: pending.offer,
-                                segments: pending.segments,
-                            }),
-                            effects,
-                            outputs,
-                            OwnerTargetError::Supervisor(error),
-                        );
-                    }
-                };
-                self.extend_effects(effects, outputs, generated)?;
-            }
-            Ok(TargetWriteCompletion::Zero | TargetWriteCompletion::WouldBlock) => {
-                let flow = match self.flows.get_mut(&flow_id) {
-                    Some(flow) => flow,
-                    None => {
-                        return self.abort_owner_error(
-                            OwnerTargetWork::Effect(SessionEffect::OfferToSink {
-                                offer: pending.offer,
-                                segments: pending.segments,
-                            }),
-                            effects,
-                            outputs,
-                            OwnerTargetError::UnknownTargetFlow { flow_id },
-                        );
-                    }
-                };
-                if flow.pending_write.is_some() {
-                    return self.abort_owner_error(
-                        OwnerTargetWork::Effect(SessionEffect::OfferToSink {
-                            offer: pending.offer,
-                            segments: pending.segments,
-                        }),
-                        effects,
-                        outputs,
-                        OwnerTargetError::DuplicatePendingTargetWrite { flow_id },
-                    );
-                }
-                flow.pending_write = Some(pending);
-            }
-            Ok(TargetWriteCompletion::Failed(_)) => {
-                if let Err(error) = self.apply_target_failure(flow_id, effects, outputs) {
-                    return self.abort_owner_error(
-                        OwnerTargetWork::Effect(SessionEffect::OfferToSink {
-                            offer: pending.offer,
-                            segments: pending.segments,
-                        }),
-                        effects,
-                        outputs,
-                        error,
-                    );
-                }
-            }
-            Err(error) => {
-                return self.abort_target_io(
-                    OwnerTargetWork::Effect(SessionEffect::OfferToSink {
-                        offer: pending.offer,
-                        segments: pending.segments,
-                    }),
-                    effects,
-                    outputs,
-                    error,
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn apply_target_failure(
-        &mut self,
-        flow_id: SessionFlowId,
-        effects: &mut VecDeque<OwnerTargetWork>,
-        outputs: &mut Vec<OwnerTargetOutput>,
-    ) -> Result<(), OwnerTargetError> {
-        let source = self
-            .flows
-            .get(&flow_id)
-            .ok_or(OwnerTargetError::UnknownTargetFlow { flow_id })?
-            .source
-            .as_ref()
-            .ok_or(OwnerTargetError::MissingTargetReadSource { flow_id })?;
-        source.flow.try_send_reset(ResetReason::TargetFailure)?;
-        let input = self
-            .flows
-            .get_mut(&flow_id)
-            .ok_or(OwnerTargetError::UnknownTargetFlow { flow_id })?
-            .source
-            .as_mut()
-            .ok_or(OwnerTargetError::MissingTargetReadSource { flow_id })?
-            .driver
-            .try_recv_next()?
-            .ok_or(OwnerTargetError::MissingTargetFailureDriverInput { flow_id })?;
-        let event = match input {
-            DriverInput::Control(
-                event @ SessionEvent::LocalReset {
-                    flow,
-                    reason: ResetReason::TargetFailure,
-                },
-            ) if flow.flow_id() == flow_id => event,
-            _ => return Err(OwnerTargetError::UnexpectedTargetFailureDriverInput { flow_id }),
-        };
-        let generated = match self
-            .submit_target_completion(flow_id, PendingTargetCompletion::Failure { event })
-        {
-            Ok(generated) => generated,
-            Err(error) => {
-                return self.abort_owner_error(
-                    OwnerTargetWork::TargetIoInvariant {
-                        flow_id,
-                        operation: TargetIoOperation::FailureCompletion,
-                    },
-                    effects,
-                    outputs,
-                    error,
-                );
-            }
-        };
-        self.extend_effects(effects, outputs, generated)
-    }
-
-    fn submit_target_completion(
-        &mut self,
-        flow_id: SessionFlowId,
-        completion: PendingTargetCompletion,
-    ) -> Result<Vec<SessionEffect>, OwnerTargetError> {
-        if self
-            .flows
-            .get(&flow_id)
-            .ok_or(OwnerTargetError::UnknownTargetFlow { flow_id })?
-            .pending_completion
-            .is_some()
-        {
-            return Err(OwnerTargetError::DuplicatePendingTargetCompletion { flow_id });
-        }
-        let expected = completion.kind();
-        match self.supervisor.apply_command(completion.into_command()) {
-            Ok(effects) => Ok(effects),
-            Err(SessionSupervisorError::RejectedCommand {
-                block: ReducerAdmissionBlock::TerminalTombstoneCapacityExceeded { .. },
-                command,
-            }) => {
-                let completion =
-                    PendingTargetCompletion::from_carried_command(expected, flow_id, *command)?;
-                self.flows
-                    .get_mut(&flow_id)
-                    .ok_or(OwnerTargetError::UnknownTargetFlow { flow_id })?
-                    .pending_completion = Some(completion);
-                Ok(Vec::new())
-            }
-            Err(SessionSupervisorError::RejectedCommand { block, command }) => {
-                let completion =
-                    PendingTargetCompletion::from_carried_command(expected, flow_id, *command)?;
-                self.flows
-                    .get_mut(&flow_id)
-                    .ok_or(OwnerTargetError::UnknownTargetFlow { flow_id })?
-                    .pending_completion = Some(completion);
-                Err(OwnerTargetError::UnexpectedTargetCompletionAdmission { flow_id, block })
-            }
-            Err(error) => Err(OwnerTargetError::Supervisor(error)),
-        }
-    }
-
-    fn retry_one_pending_target_completion(
-        &mut self,
-    ) -> Result<Vec<SessionEffect>, OwnerTargetError> {
-        let Some(flow_id) = self
-            .flows
-            .iter()
-            .find_map(|(flow_id, flow)| flow.pending_completion.is_some().then_some(*flow_id))
-        else {
-            return Ok(Vec::new());
-        };
-        let completion = self
-            .flows
-            .get_mut(&flow_id)
-            .ok_or(OwnerTargetError::UnknownTargetFlow { flow_id })?
-            .pending_completion
-            .take()
-            .ok_or(OwnerTargetError::MissingPendingTargetCompletion { flow_id })?;
-        let expected = completion.kind();
-        match self.supervisor.apply_command(completion.into_command()) {
-            Ok(effects) => Ok(effects),
-            Err(SessionSupervisorError::RejectedCommand {
-                block: ReducerAdmissionBlock::TerminalTombstoneCapacityExceeded { .. },
-                command,
-            }) => {
-                let completion =
-                    PendingTargetCompletion::from_carried_command(expected, flow_id, *command)?;
-                self.flows
-                    .get_mut(&flow_id)
-                    .ok_or(OwnerTargetError::UnknownTargetFlow { flow_id })?
-                    .pending_completion = Some(completion);
-                Ok(Vec::new())
-            }
-            Err(SessionSupervisorError::RejectedCommand { block, command }) => {
-                let completion =
-                    PendingTargetCompletion::from_carried_command(expected, flow_id, *command)?;
-                self.flows
-                    .get_mut(&flow_id)
-                    .ok_or(OwnerTargetError::UnknownTargetFlow { flow_id })?
-                    .pending_completion = Some(completion);
-                Err(OwnerTargetError::UnexpectedTargetCompletionAdmission { flow_id, block })
-            }
-            Err(error) => Err(OwnerTargetError::Supervisor(error)),
-        }
-    }
-
-    fn finish_target_flow(
-        &mut self,
-        flow_id: SessionFlowId,
-        reason: FlowFinishReason,
-    ) -> Result<(), OwnerTargetError> {
-        let target_present = self
-            .flows
-            .get(&flow_id)
-            .ok_or(OwnerTargetError::UnknownTargetFlow { flow_id })?
-            .target_present;
-        if !target_present {
-            self.flows.remove(&flow_id);
-            return Ok(());
-        }
-        match reason {
-            FlowFinishReason::PeerReset(_) => {
-                if self
-                    .flows
-                    .get(&flow_id)
-                    .is_some_and(|flow| flow.terminal.is_none())
-                {
-                    let terminal = match self.target.reset(flow_id)? {
-                        TargetResetCompletion::Reset { .. }
-                        | TargetResetCompletion::AlreadyReset => TargetTerminalKind::Reset,
-                        TargetResetCompletion::AlreadyTerminal(kind) => kind,
-                    };
-                    self.flows
-                        .get_mut(&flow_id)
-                        .ok_or(OwnerTargetError::UnknownTargetFlow { flow_id })?
-                        .terminal = Some(terminal);
-                }
-            }
-            FlowFinishReason::LocalReset(_) | FlowFinishReason::OpenFailed(_) => {
-                if self
-                    .flows
-                    .get(&flow_id)
-                    .is_some_and(|flow| flow.terminal.is_none())
-                {
-                    let terminal = match self.target.cancel(flow_id)? {
-                        TargetCancelCompletion::Cancelled { .. }
-                        | TargetCancelCompletion::AlreadyCancelled => TargetTerminalKind::Cancelled,
-                        TargetCancelCompletion::AlreadyTerminal(kind) => kind,
-                    };
-                    self.flows
-                        .get_mut(&flow_id)
-                        .ok_or(OwnerTargetError::UnknownTargetFlow { flow_id })?
-                        .terminal = Some(terminal);
-                }
-            }
-            FlowFinishReason::Graceful => {
-                // The Target adapter owns the graceful terminal transition:
-                // all reads reached EOF and the write side was half-closed.
-            }
-        }
-        self.flows
-            .get_mut(&flow_id)
-            .ok_or(OwnerTargetError::UnknownTargetFlow { flow_id })?
-            .pending_write = None;
-        let _ = self.try_join_target_flow(flow_id)?;
-        Ok(())
-    }
-
-    fn retire_target_tombstone(&mut self, flow_id: SessionFlowId) -> Result<(), OwnerTargetError> {
-        if self.target_tombstones.contains_key(&flow_id) {
-            self.retire_recorded_target_tombstone(flow_id)?;
-        } else {
-            match self.target.retire_terminal_tombstone(flow_id)? {
-                TargetTombstoneRetireCompletion::Retired(actual) => {
-                    return Err(OwnerTargetError::UnexpectedTargetTombstone { flow_id, actual });
-                }
-                TargetTombstoneRetireCompletion::Absent => {
-                    if let Some(flow) = self
-                        .flows
-                        .get_mut(&flow_id)
-                        .filter(|flow| flow.target_present && flow.join_pending)
-                    {
-                        // Terminal grace can expire while the Target still
-                        // owns application buffers or while the bounded
-                        // tombstone table blocks join. Preserve that exact
-                        // retirement fact and consume it immediately after
-                        // a later successful join.
-                        flow.retire_after_join = true;
-                    }
-                }
-            }
-        }
-        self.drain_pending_target_joins()
-    }
-
-    fn retire_recorded_target_tombstone(
-        &mut self,
-        flow_id: SessionFlowId,
-    ) -> Result<(), OwnerTargetError> {
-        let expected = self
-            .target_tombstones
-            .get(&flow_id)
-            .copied()
-            .ok_or(OwnerTargetError::UnrecordedTargetTombstone { flow_id })?;
-        match self.target.retire_terminal_tombstone(flow_id)? {
-            TargetTombstoneRetireCompletion::Retired(actual) if actual == expected => {
-                self.target_tombstones.remove(&flow_id);
-                Ok(())
-            }
-            TargetTombstoneRetireCompletion::Retired(actual) => {
-                Err(OwnerTargetError::TargetTombstoneKindMismatch {
-                    flow_id,
-                    expected,
-                    actual,
-                })
-            }
-            TargetTombstoneRetireCompletion::Absent => {
-                Err(OwnerTargetError::MissingTargetTombstone { flow_id })
-            }
-        }
-    }
-
-    fn try_join_target_flow(
-        &mut self,
-        flow_id: SessionFlowId,
-    ) -> Result<TargetJoinAttempt, OwnerTargetError> {
-        let retire_after_join = self
-            .flows
-            .get(&flow_id)
-            .ok_or(OwnerTargetError::UnknownTargetFlow { flow_id })?
-            .retire_after_join;
-        if !retire_after_join && self.target_tombstones.contains_key(&flow_id) {
-            return Err(OwnerTargetError::DuplicateTargetTombstone { flow_id });
-        }
-        let terminal = match self.target.join(flow_id)? {
-            TargetJoinCompletion::Joined(terminal)
-            | TargetJoinCompletion::AlreadyJoined(terminal) => terminal,
-            TargetJoinCompletion::PendingOwnedState { .. } => {
-                self.flows
-                    .get_mut(&flow_id)
-                    .ok_or(OwnerTargetError::UnknownTargetFlow { flow_id })?
-                    .join_pending = true;
-                return Ok(TargetJoinAttempt::Pending(TargetJoinBlock::OwnedState));
-            }
-            TargetJoinCompletion::PendingTerminalCapacity { .. } => {
-                self.flows
-                    .get_mut(&flow_id)
-                    .ok_or(OwnerTargetError::UnknownTargetFlow { flow_id })?
-                    .join_pending = true;
-                return Ok(TargetJoinAttempt::Pending(
-                    TargetJoinBlock::TerminalCapacity,
-                ));
-            }
-        };
-        if retire_after_join {
-            self.retire_just_joined_tombstone(flow_id, terminal)?;
-        } else {
-            let previous = self.target_tombstones.insert(flow_id, terminal);
-            debug_assert!(previous.is_none());
-        }
-        self.flows.remove(&flow_id);
-        Ok(TargetJoinAttempt::Joined)
-    }
-
-    fn retire_just_joined_tombstone(
-        &mut self,
-        flow_id: SessionFlowId,
-        expected: TargetTerminalKind,
-    ) -> Result<(), OwnerTargetError> {
-        match self.target.retire_terminal_tombstone(flow_id)? {
-            TargetTombstoneRetireCompletion::Retired(actual) if actual == expected => Ok(()),
-            TargetTombstoneRetireCompletion::Retired(actual) => {
-                Err(OwnerTargetError::TargetTombstoneKindMismatch {
-                    flow_id,
-                    expected,
-                    actual,
-                })
-            }
-            TargetTombstoneRetireCompletion::Absent => {
-                Err(OwnerTargetError::MissingTargetTombstone { flow_id })
-            }
-        }
-    }
-
-    fn drain_pending_target_joins(&mut self) -> Result<(), OwnerTargetError> {
-        let pending = self
-            .flows
-            .iter()
-            .filter_map(|(flow_id, flow)| flow.join_pending.then_some(*flow_id))
-            .collect::<Vec<_>>();
-        for flow_id in pending {
-            match self.try_join_target_flow(flow_id)? {
-                TargetJoinAttempt::Joined
-                | TargetJoinAttempt::Pending(TargetJoinBlock::OwnedState) => {}
-                TargetJoinAttempt::Pending(TargetJoinBlock::TerminalCapacity) => {
-                    // The table is session-scoped: once one join observes it
-                    // full, no later pending flow can make progress until the
-                    // next exact retirement. Avoid an O(pending) tail of
-                    // equivalent failed Target calls.
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Performs at most one Target retirement/expiry transaction. Returning
-    /// `true` asks the bounded executor to schedule another exact cleanup
-    /// step; `false` proves all Target ownership is gone.
-    fn expire_next_target(&mut self) -> Result<bool, OwnerTargetError> {
-        // Session expiry invalidates every reducer terminal capability. Retire
-        // already-joined Target tombstones first so the finite table cannot
-        // block cancellation/join of a live flow.
-        if let Some(flow_id) = self.target_tombstones.keys().next().copied() {
-            self.retire_recorded_target_tombstone(flow_id)?;
-            return Ok(true);
-        }
-        let Some(flow_id) = self.flows.keys().next().copied() else {
-            return Ok(false);
-        };
-        if !self
-            .flows
-            .get(&flow_id)
-            .is_some_and(|flow| flow.target_present)
-        {
-            self.flows.remove(&flow_id);
-            return Ok(true);
-        }
-        let terminal = self.target.expire_session_flow(flow_id)?.terminal;
-        if let Some(flow) = self.flows.get_mut(&flow_id) {
-            flow.pending_write = None;
-            flow.terminal = Some(terminal);
-        }
-        let joined_terminal = match self.target.join(flow_id)? {
-            TargetJoinCompletion::Joined(terminal)
-            | TargetJoinCompletion::AlreadyJoined(terminal) => terminal,
-            TargetJoinCompletion::PendingOwnedState { .. }
-            | TargetJoinCompletion::PendingTerminalCapacity { .. } => {
-                return Err(OwnerTargetError::UnexpectedPendingTargetJoin { flow_id });
-            }
-        };
-        // Do not fill the bounded tombstone table during session-wide
-        // teardown. Join and retire this exact flow before moving to the next.
-        self.retire_just_joined_tombstone(flow_id, joined_terminal)?;
-        self.flows.remove(&flow_id);
-        Ok(true)
-    }
-
     fn require_no_pending_effects(&self) -> Result<(), OwnerTargetError> {
         if self.aborted_effects.is_some() {
             Err(OwnerTargetError::AbortedEffectInvariant)
@@ -3318,7 +3679,6 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
             Err(OwnerTargetError::PendingEffectTurn)
         }
     }
-
     fn require_no_pending_target_completion(
         &self,
         flow_id: SessionFlowId,
@@ -3327,13 +3687,12 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
             .flows
             .get(&flow_id)
             .ok_or(OwnerTargetError::UnknownTargetFlow { flow_id })?;
-        if flow.pending_completion.is_some() {
+        if flow.completion_blocks_input(&self.service) {
             Err(OwnerTargetError::PendingTargetCompletion { flow_id })
         } else {
             Ok(())
         }
     }
-
     fn input_admission_block(
         &self,
         flow_id: Option<SessionFlowId>,
@@ -3350,11 +3709,16 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         flow_id.and_then(|flow_id| {
             self.flows
                 .get(&flow_id)
-                .is_some_and(|flow| flow.pending_completion.is_some())
+                .is_some_and(|flow| flow.completion_blocks_input(&self.service))
                 .then_some(OwnerTargetInputBlock::PendingTargetCompletion { flow_id })
         })
     }
-
+    /// Borrow-only preflight used by the closed physical owner before it
+    /// consumes an actor envelope. A blocked ATTACH therefore remains wholly
+    /// actor-owned and can retry with its original arrival/ordinal evidence.
+    pub(super) fn owner_attach_admission_block(&self) -> Option<OwnerTargetInputBlock> {
+        self.input_admission_block(None)
+    }
     fn recovery_owner_block(
         &self,
         owner: &Weak<OwnerTargetExecutorIdentity>,
@@ -3367,7 +3731,313 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
             Some(_) => None,
         }
     }
+    /// Precommit identity check for the controller handoff. The capability is
+    /// only borrowed here, so a wrong controller can reject it without ever
+    /// storing or consuming the exact recovery ownership.
+    pub(super) fn owns_enqueued_attached_recovery(
+        &self,
+        recovery: &EnqueuedOwnerTargetAttach,
+    ) -> bool {
+        self.recovery_owner_block(&recovery.owner).is_none()
+    }
 
+    pub(super) fn owns_recovery_handoff(&self, handoff: &OwnerTargetRecoveryHandoff) -> bool {
+        self.recovery_owner_block(&handoff.owner).is_none()
+    }
+    /// Performs every fallible check needed to turn the settled initial A
+    /// handoff into a retired-only capability when B becomes current.  The
+    /// returned plan is consumed only after the controller installs B; until
+    /// then `restore_initial` reconstructs the exact original handoff.
+    #[allow(
+        clippy::result_large_err,
+        reason = "precommit rejection must return the exact initial handoff"
+    )]
+    pub(super) fn prepare_initial_retirement<'queue>(
+        &self,
+        mut initial: OwnerTargetInitialHandoff,
+        replacement: &OwnerTargetRecoveryHandoff,
+        a_runtime: &PhysicalLegRuntimeIncarnation,
+        a_io: &LegIo,
+        a_queue: &'queue mut LegOutboundQueue,
+    ) -> Result<PreparedOwnerInitialRetirement<'queue>, OwnerTargetInitialRetirementFailure> {
+        if self.recovery_owner_block(&initial.owner).is_some() {
+            return Err(OwnerTargetInitialRetirementFailure {
+                kind: OwnerTargetInitialRetirementErrorKind::WrongInitialOwner,
+                initial,
+            });
+        }
+        if self.recovery_owner_block(&replacement.owner).is_some() {
+            return Err(OwnerTargetInitialRetirementFailure {
+                kind: OwnerTargetInitialRetirementErrorKind::WrongReplacementOwner,
+                initial,
+            });
+        }
+        if initial.acceptance.is_some() {
+            return Err(OwnerTargetInitialRetirementFailure {
+                kind: OwnerTargetInitialRetirementErrorKind::AcceptanceNotSettled,
+                initial,
+            });
+        }
+        let Some(binding) = initial.physical_actor.as_ref() else {
+            return Err(OwnerTargetInitialRetirementFailure {
+                kind: OwnerTargetInitialRetirementErrorKind::MissingPhysicalActor,
+                initial,
+            });
+        };
+        if !binding.matches(a_runtime, a_io, a_queue)
+            || !initial.matches_transport_identity(a_io.established_leg())
+        {
+            return Err(OwnerTargetInitialRetirementFailure {
+                kind: OwnerTargetInitialRetirementErrorKind::WrongPhysicalActor,
+                initial,
+            });
+        }
+        if replacement.generation().get() <= initial.generation().get() {
+            return Err(OwnerTargetInitialRetirementFailure {
+                kind: OwnerTargetInitialRetirementErrorKind::ReplacementNotNewer,
+                initial,
+            });
+        }
+        let Some(a_inventory) = a_queue.cold_inventory() else {
+            return Err(OwnerTargetInitialRetirementFailure {
+                kind: OwnerTargetInitialRetirementErrorKind::InitialOutboundQueueInvariant,
+                initial,
+            });
+        };
+        if !a_inventory.is_exact_active_zero() {
+            return Err(OwnerTargetInitialRetirementFailure {
+                kind: OwnerTargetInitialRetirementErrorKind::InitialOutboundNotPristine {
+                    was_active: a_inventory.was_active(),
+                    queued_frames: a_inventory.queued_frames(),
+                    summed_frame_bytes: a_inventory.summed_frame_bytes(),
+                    stored_owned_bytes: a_inventory.stored_owned_bytes(),
+                    ordered_delivery_wait: a_inventory.ordered_delivery_wait(),
+                },
+                initial,
+            });
+        }
+
+        let Some(physical_actor) = initial.physical_actor.take() else {
+            return Err(OwnerTargetInitialRetirementFailure {
+                kind: OwnerTargetInitialRetirementErrorKind::MissingPhysicalActor,
+                initial,
+            });
+        };
+        let OwnerTargetInitialHandoff {
+            owner,
+            attached,
+            acceptance,
+            physical_actor: remaining_physical_actor,
+        } = initial;
+        drop((acceptance, remaining_physical_actor));
+        Ok(PreparedOwnerInitialRetirement {
+            _a_queue: a_queue,
+            owner,
+            attached,
+            physical_actor,
+            replacement_generation: replacement.generation(),
+            replacement_nonce: replacement.nonce(),
+        })
+    }
+    /// Retired-only joined transaction.  It validates A's frozen actor and B
+    /// replacement identities, then consumes the exact A terminal without
+    /// creating a pending loss or applying another reducer event.
+    #[allow(
+        clippy::result_large_err,
+        reason = "settlement rejection must return retired handoff and terminal ownership"
+    )]
+    pub(super) fn settle_retired_initial_terminal(
+        &self,
+        retired: OwnerTargetRetiredInitialHandoff,
+        active_b: Option<&OwnerTargetRecoveryHandoff>,
+        a_runtime: &PhysicalLegRuntimeIncarnation,
+        terminal: Option<ExactLegTerminal>,
+    ) -> Result<OwnerTargetRetiredInitialSettled, OwnerTargetRetiredInitialSettlementFailure> {
+        if self.recovery_owner_block(&retired.owner).is_some() {
+            return Err(OwnerTargetRetiredInitialSettlementFailure {
+                kind: OwnerTargetRetiredInitialSettlementErrorKind::WrongRetiredOwner,
+                retired,
+                terminal,
+            });
+        }
+        if active_b.is_some_and(|active_b| self.recovery_owner_block(&active_b.owner).is_some()) {
+            return Err(OwnerTargetRetiredInitialSettlementFailure {
+                kind: OwnerTargetRetiredInitialSettlementErrorKind::WrongActiveOwner,
+                retired,
+                terminal,
+            });
+        }
+        let committed_generation = self.supervisor.snapshot().session.generation();
+        if committed_generation != retired.replacement_generation
+            || active_b.is_some_and(|active_b| {
+                active_b.generation() != retired.replacement_generation
+                    || active_b.nonce() != retired.replacement_nonce
+            })
+        {
+            return Err(OwnerTargetRetiredInitialSettlementFailure {
+                kind: OwnerTargetRetiredInitialSettlementErrorKind::WrongReplacement,
+                retired,
+                terminal,
+            });
+        }
+        if !retired.physical_actor.matches_joined_actor(a_runtime) {
+            return Err(OwnerTargetRetiredInitialSettlementFailure {
+                kind: OwnerTargetRetiredInitialSettlementErrorKind::WrongJoinedActor,
+                retired,
+                terminal,
+            });
+        }
+        let Some(terminal) = terminal else {
+            return Err(OwnerTargetRetiredInitialSettlementFailure {
+                kind: OwnerTargetRetiredInitialSettlementErrorKind::MissingTerminal,
+                retired,
+                terminal: None,
+            });
+        };
+        if !retired.attached.matches_terminal(&terminal) {
+            return Err(OwnerTargetRetiredInitialSettlementFailure {
+                kind: OwnerTargetRetiredInitialSettlementErrorKind::WrongTerminal,
+                retired,
+                terminal: Some(terminal),
+            });
+        }
+
+        let OwnerTargetRetiredInitialHandoff {
+            owner,
+            attached,
+            physical_actor,
+            replacement_generation,
+            replacement_nonce,
+        } = retired;
+        let retired_generation = attached.generation();
+        let reason = terminal.reason();
+        drop((owner, attached, physical_actor, replacement_nonce, terminal));
+        Ok(OwnerTargetRetiredInitialSettled {
+            retired_generation,
+            replacement_generation,
+            reason,
+        })
+    }
+    /// Consuming precommit validation for the initial physical controller.
+    /// A wrong/lost executor returns the exact handoff, including both its
+    /// AttachedLeg authority and acceptance receipt, without touching either.
+    #[allow(
+        clippy::result_large_err,
+        reason = "wrong executor must return the exact non-cloneable handoff"
+    )]
+    pub(super) fn validate_initial_handoff_owner(
+        &self,
+        handoff: OwnerTargetInitialHandoff,
+    ) -> Result<OwnerTargetInitialHandoff, OwnerTargetInitialHandoffOwnerFailure> {
+        if let Some(block) = self.recovery_owner_block(&handoff.owner) {
+            return Err(OwnerTargetInitialHandoffOwnerFailure { block, handoff });
+        }
+        Ok(handoff)
+    }
+    /// Binds the complete initial handoff to one pointer-identical physical
+    /// runtime -> LegIo policy -> EstablishedLeg -> FIFO chain. Every mismatch
+    /// returns the original non-cloneable handoff without mutation.
+    #[allow(
+        clippy::result_large_err,
+        reason = "physical binding rejection must return the exact initial handoff"
+    )]
+    pub(super) fn bind_initial_handoff_to_physical_actor(
+        &self,
+        mut handoff: OwnerTargetInitialHandoff,
+        runtime: &PhysicalLegRuntimeIncarnation,
+        io: &LegIo,
+        queue: &LegOutboundQueue,
+    ) -> Result<OwnerTargetInitialHandoff, OwnerTargetInitialHandoffOwnerFailure> {
+        if let Some(block) = self.recovery_owner_block(&handoff.owner) {
+            return Err(OwnerTargetInitialHandoffOwnerFailure { block, handoff });
+        }
+        if handoff.physical_actor.is_some() {
+            return Err(OwnerTargetInitialHandoffOwnerFailure {
+                block: OwnerTargetInputBlock::InitialPhysicalActorAlreadyBound,
+                handoff,
+            });
+        }
+        let Some(binding) = PhysicalLegActorBinding::try_bind(runtime, io, queue) else {
+            return Err(OwnerTargetInitialHandoffOwnerFailure {
+                block: OwnerTargetInputBlock::WrongInitialPhysicalActor,
+                handoff,
+            });
+        };
+        if !handoff.matches_transport_identity(io.established_leg()) {
+            return Err(OwnerTargetInitialHandoffOwnerFailure {
+                block: OwnerTargetInputBlock::WrongInitialPhysicalActor,
+                handoff,
+            });
+        }
+        if !handoff
+            .acceptance
+            .as_ref()
+            .is_some_and(|acceptance| acceptance.belongs_to_queue(queue))
+        {
+            return Err(OwnerTargetInitialHandoffOwnerFailure {
+                block: OwnerTargetInputBlock::WrongAcceptanceQueue,
+                handoff,
+            });
+        }
+        handoff.physical_actor = Some(binding);
+        Ok(handoff)
+    }
+    /// Consumes the exact acceptance receipt only after its own ordered record
+    /// reports delivery through the same physical actor/FIFO binding. Pending
+    /// or mismatched attempts return the original handoff; a repeat after the
+    /// first settlement is an inert typed success.
+    #[allow(
+        clippy::result_large_err,
+        reason = "settlement rejection must return exact AttachedLeg and receipt ownership"
+    )]
+    pub(super) fn settle_initial_acceptance_delivery(
+        &self,
+        mut handoff: OwnerTargetInitialHandoff,
+        runtime: &PhysicalLegRuntimeIncarnation,
+        io: &LegIo,
+        queue: &LegOutboundQueue,
+    ) -> Result<OwnerTargetInitialAcceptanceSettlement, OwnerTargetInitialHandoffOwnerFailure> {
+        if let Some(block) = self.recovery_owner_block(&handoff.owner) {
+            return Err(OwnerTargetInitialHandoffOwnerFailure { block, handoff });
+        }
+        let Some(binding) = handoff.physical_actor.as_ref() else {
+            return Err(OwnerTargetInitialHandoffOwnerFailure {
+                block: OwnerTargetInputBlock::InitialPhysicalActorNotBound,
+                handoff,
+            });
+        };
+        if !binding.matches(runtime, io, queue)
+            || !handoff.matches_transport_identity(io.established_leg())
+        {
+            return Err(OwnerTargetInitialHandoffOwnerFailure {
+                block: OwnerTargetInputBlock::WrongInitialPhysicalActor,
+                handoff,
+            });
+        }
+        let Some(acceptance) = handoff.acceptance.as_ref() else {
+            return Ok(OwnerTargetInitialAcceptanceSettlement {
+                disposition: OwnerTargetInitialAcceptanceSettlementDisposition::AlreadySettled,
+                handoff,
+            });
+        };
+        if !acceptance.belongs_to_queue(queue) {
+            return Err(OwnerTargetInitialHandoffOwnerFailure {
+                block: OwnerTargetInputBlock::WrongAcceptanceQueue,
+                handoff,
+            });
+        }
+        if !acceptance.was_delivered() {
+            return Err(OwnerTargetInitialHandoffOwnerFailure {
+                block: OwnerTargetInputBlock::InitialAcceptanceDeliveryPending,
+                handoff,
+            });
+        }
+        drop(handoff.acceptance.take());
+        Ok(OwnerTargetInitialAcceptanceSettlement {
+            disposition: OwnerTargetInitialAcceptanceSettlementDisposition::SettledNow,
+            handoff,
+        })
+    }
     fn recovery_admission_block(&self) -> Option<OwnerTargetInputBlock> {
         if !self.attach_barrier_pending {
             return Some(OwnerTargetInputBlock::AttachBarrierNotPending);
@@ -3380,7 +4050,6 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         }
         None
     }
-
     fn recovery_admission_block_allow_pending_turn(&self) -> Option<OwnerTargetInputBlock> {
         if !self.attach_barrier_pending {
             return Some(OwnerTargetInputBlock::AttachBarrierNotPending);
@@ -3388,110 +4057,6 @@ impl<T: TargetIo> OwnerTargetExecutor<T> {
         self.aborted_effects
             .is_some()
             .then_some(OwnerTargetInputBlock::AbortedEffectInvariant)
-    }
-
-    fn extend_effects(
-        &mut self,
-        pending: &mut VecDeque<OwnerTargetWork>,
-        outputs: &mut Vec<OwnerTargetOutput>,
-        generated: Vec<SessionEffect>,
-    ) -> Result<(), OwnerTargetError> {
-        let generated_len = generated.len();
-        let attempted = pending.len().saturating_add(generated_len);
-        pending.extend(generated.into_iter().map(OwnerTargetWork::Effect));
-        if generated_len > MAX_INCREMENTAL_EFFECT_BURST {
-            self.aborted_effects = Some(AbortedOwnerTargetEffects {
-                effects: std::mem::take(pending),
-                outputs: std::mem::take(outputs),
-            });
-            Err(OwnerTargetError::GeneratedEffectBoundExceeded {
-                max: MAX_INCREMENTAL_EFFECT_BURST,
-                actual: generated_len,
-            })
-        } else if attempted > self.config.max_pending_effects {
-            self.aborted_effects = Some(AbortedOwnerTargetEffects {
-                effects: std::mem::take(pending),
-                outputs: std::mem::take(outputs),
-            });
-            Err(OwnerTargetError::PendingEffectCapacityInvariant {
-                max: self.config.max_pending_effects,
-                attempted,
-            })
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Retains the exact work item and every already-generated output before
-    /// surfacing a fatal owner/Target invariant. The executor is permanently
-    /// poisoned after this point: no retry can accidentally repeat I/O whose
-    /// commit status is no longer trusted.
-    fn abort_owner_error<R>(
-        &mut self,
-        current: OwnerTargetWork,
-        pending: &mut VecDeque<OwnerTargetWork>,
-        outputs: &mut Vec<OwnerTargetOutput>,
-        error: OwnerTargetError,
-    ) -> Result<R, OwnerTargetError> {
-        if self.aborted_effects.is_some() {
-            return Err(error);
-        }
-        pending.push_front(current);
-        self.aborted_effects = Some(AbortedOwnerTargetEffects {
-            effects: std::mem::take(pending),
-            outputs: std::mem::take(outputs),
-        });
-        Err(error)
-    }
-
-    fn abort_target_io<R>(
-        &mut self,
-        current: OwnerTargetWork,
-        pending: &mut VecDeque<OwnerTargetWork>,
-        outputs: &mut Vec<OwnerTargetOutput>,
-        error: TargetIoError,
-    ) -> Result<R, OwnerTargetError> {
-        self.abort_owner_error(current, pending, outputs, OwnerTargetError::Target(error))
-    }
-
-    fn abort_direct_target_io<R>(
-        &mut self,
-        flow_id: SessionFlowId,
-        operation: TargetIoOperation,
-        error: TargetIoError,
-    ) -> Result<R, OwnerTargetError> {
-        self.abort_direct_owner_error(flow_id, operation, OwnerTargetError::Target(error))
-    }
-
-    fn abort_direct_owner_error<R>(
-        &mut self,
-        flow_id: SessionFlowId,
-        operation: TargetIoOperation,
-        error: OwnerTargetError,
-    ) -> Result<R, OwnerTargetError> {
-        let mut pending = VecDeque::new();
-        let mut outputs = Vec::new();
-        self.abort_owner_error(
-            OwnerTargetWork::TargetIoInvariant { flow_id, operation },
-            &mut pending,
-            &mut outputs,
-            error,
-        )
-    }
-
-    fn issue_resume(&mut self) -> Result<OwnerTargetResume, OwnerTargetError> {
-        if self.outstanding_resume.is_some() {
-            return Err(OwnerTargetError::DuplicateEffectResume);
-        }
-        let id = self
-            .next_resume_id
-            .ok_or(OwnerTargetError::EffectResumeIdExhausted)?;
-        self.next_resume_id = id.checked_add(1);
-        self.outstanding_resume = Some(id);
-        Ok(OwnerTargetResume {
-            owner: Arc::downgrade(&self.identity),
-            id,
-        })
     }
 }
 
@@ -3506,6 +4071,10 @@ fn command_flow_id(command: &SessionOwnerCommand) -> Option<SessionFlowId> {
         SessionOwnerCommand::Event(event)
         | SessionOwnerCommand::Driver(DriverInput::Control(event)) => event_flow_id(event),
         SessionOwnerCommand::Driver(DriverInput::Data(data)) => Some(data.flow().flow_id()),
+        SessionOwnerCommand::ClientDriver(input) => match input.as_inner() {
+            DriverInput::Control(event) => event_flow_id(event),
+            DriverInput::Data(data) => Some(data.flow().flow_id()),
+        },
     }
 }
 
@@ -3575,7 +4144,7 @@ impl<T> OwnerTargetExecutor<T> {
             self.target_tombstones.len(),
             self.flows
                 .values()
-                .filter(|flow| flow.pending_write.is_some())
+                .filter(|flow| matches!(flow.pending_sink, Some(PendingTargetSink::Write(_))))
                 .count(),
             self.flows.values().filter(|flow| flow.join_pending).count(),
         )
@@ -3584,15 +4153,26 @@ impl<T> OwnerTargetExecutor<T> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OwnerTargetInputBlock {
+    EffectStorage(crate::resumable::effect_storage::EffectStorageError),
+    ReadyReceiptInvariant,
     PendingEffectTurn,
+    NoPendingEffectTurn,
+    InvalidEffectResume { expected: u64, actual: u64 },
     AbortedEffectInvariant,
     AttachBarrierPending,
     AttachBarrierNotPending,
     OwnerTargetExecutorLost,
     WrongOwnerTargetExecutor,
+    InitialPhysicalActorAlreadyBound,
+    InitialPhysicalActorNotBound,
+    WrongInitialPhysicalActor,
+    InitialAcceptanceDeliveryPending,
+    InitialAcceptanceSettlementPending,
     WrongLegTerminal,
+    WrongTerminalQueue,
     MissingAttachedRecovery,
     AcceptanceQueueLost,
+    InitialAcceptanceQueueInvariant,
     AcceptanceQueueStillLive,
     WrongAcceptanceQueue,
     WrongStatusQueue,
@@ -3601,9 +4181,12 @@ pub(crate) enum OwnerTargetInputBlock {
     PendingTargetCompletion { flow_id: SessionFlowId },
     ReducerAdmission(ReducerAdmissionBlock),
 }
-
 #[derive(Debug, Error)]
 pub(crate) enum OwnerTargetError {
+    #[error("owner effect backing preparation failed: {0}")]
+    EffectStorage(#[from] crate::resumable::effect_storage::EffectStorageError),
+    #[error("Bound source work requires its selected ready-service transaction")]
+    BoundSourceRequiresSelectedService,
     #[error("session supervisor rejected owner Target work: {0}")]
     Supervisor(#[from] SessionSupervisorError),
     #[error("Target I/O rejected owner work: {0}")]
@@ -3616,10 +4199,6 @@ pub(crate) enum OwnerTargetError {
     PendingEffectTurn,
     #[error("owner Target attach acceptance/recovery barrier is still pending")]
     AttachBarrierPending,
-    #[error("owner Target has no pending effect turn")]
-    NoPendingEffectTurn,
-    #[error("owner Target effect resume {actual} does not match outstanding resume {expected}")]
-    InvalidEffectResume { expected: u64, actual: u64 },
     #[error("owner Target rejected an effect resume before consuming it: {block:?}")]
     RejectedEffectResume {
         block: OwnerTargetInputBlock,
@@ -3635,6 +4214,22 @@ pub(crate) enum OwnerTargetError {
     GeneratedEffectBoundExceeded { max: usize, actual: usize },
     #[error("owner Target is fail-closed with retained aborted effects")]
     AbortedEffectInvariant,
+    #[error("owner Target could not retain a second post-commit observation after effect failure")]
+    PostCommitObservationRetentionInvariant {
+        error: Box<OwnerTargetError>,
+        observations: Box<OwnerTargetReducerObservations>,
+        effects: crate::resumable::effect_storage::SessionEffectBatch,
+    },
+    #[error("owner Target could not retain a second exact attached-recovery cursor after failure")]
+    PostCommitRecoveryRetentionInvariant {
+        error: Box<OwnerTargetError>,
+        recovery: Box<OwnerTargetRecoveryDrain>,
+    },
+    #[error("owner Target produced a second {kind:?} observation in one fixed-size turn")]
+    PostCommitObservationConflict {
+        kind: OwnerTargetObservationKind,
+        observations: Box<OwnerTargetReducerObservations>,
+    },
     #[error("owner Target rejected a command before consuming it: {block:?}")]
     RejectedCommand {
         block: OwnerTargetInputBlock,
@@ -3675,6 +4270,8 @@ pub(crate) enum OwnerTargetError {
         "registered owner ATTACH could not restore its exact queue reservation; state remains fail-closed"
     )]
     RegisteredOwnerAttachReservationInvariant,
+    #[error("owner attach rejection retained with exact registered restore failure: {0:?}")]
+    RegisteredOwnerAttachRestoreFailure(Box<effect_storage::OwnerRegisteredRestoreFailure>),
     #[error("owner ATTACH terminal transition failed: {source}")]
     OwnerAttachTerminalTransition {
         source: LegTerminalTransitionError,
@@ -3691,6 +4288,8 @@ pub(crate) enum OwnerTargetError {
         "owner ATTACH could not restore its exact queue reservation; state remains fail-closed"
     )]
     OwnerAttachReservationInvariant,
+    #[error("owner catch-up rejection retained with its unreleased acceptance reservation: {0:?}")]
+    CatchUpOwnerAttachReleaseFailure(Box<effect_storage::OwnerCatchUpReleaseFailure>),
     #[error(
         "owner Target rejected catch-up arm before consuming its exact status receipt: {block:?}"
     )]
@@ -3761,11 +4360,27 @@ pub(crate) enum OwnerTargetError {
         pending: Box<PendingOwnerAttachLoss>,
     },
     #[error(
+        "owner Target terminal recovery cleanup failed with the exact pending loss quarantined: {source}"
+    )]
+    TerminalAttachRecoveryDiscardInvariant {
+        source: SessionSupervisorError,
+        pending: Box<PendingOwnerAttachLoss>,
+    },
+    #[error(
+        "owner Target retained terminal-loss effect backing after reclamation failed: {source}"
+    )]
+    TerminalAttachRecoveryStorageInvariant {
+        source: SessionSupervisorError,
+        effects: crate::resumable::effect_storage::SessionEffectBatch,
+        pending: Box<PendingOwnerAttachLoss>,
+    },
+    #[error(
         "owner Target pending attach loss emitted an invalid effect set for generation {generation:?}"
     )]
     PendingAttachLossEffectInvariant {
         generation: LegGeneration,
         effects: Vec<SessionEffect>,
+        pending: Box<PendingOwnerAttachLoss>,
     },
     #[error("owner Target rejected post-acceptance recovery before consuming it: {block:?}")]
     RejectedAttachedRecovery {
@@ -3791,6 +4406,8 @@ pub(crate) enum OwnerTargetError {
     AttachedRecoveryOutputInvariant {
         drain: Box<OwnerTargetRecoveryDrain>,
     },
+    #[error("legacy attached-recovery adapter observed an unsupported reducer fact")]
+    AttachedRecoveryObservationInvariant,
     #[error("peer OPEN effect for flow {flow_id:?} was duplicate or mismatched")]
     DuplicateOrMismatchedPeerOpen { flow_id: SessionFlowId },
     #[error("owner Target has no live flow {flow_id:?}")]
@@ -3909,6 +4526,13 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
     const STANDBY_FEATURES: u64 = STANDBY_CONTROL_V1.bits() | 0b0111;
+    mod owner_data_retention;
+    mod r7_attached_recovery_pages;
+    mod r7_initial_bootstrap_handoff;
+    mod r7_nested_abort;
+    mod r7_observed_pages;
+    mod r7_owner_ack;
+    mod target_overacceptance;
 
     #[test]
     fn source_provenance_closes_generic_owner_commit_and_raw_client_catch_up() {
@@ -3934,7 +4558,7 @@ mod tests {
         // distinguished below by their exact visibility and `cfg(test)` seal.
         let leg_production = leg_source;
         let standby_production = standby_source
-            .split_once("#[cfg(test)]\nmod tests")
+            .split_once("#[cfg(test)]\npub(super) mod tests")
             .unwrap()
             .0;
         let two_leg_harness_production = two_leg_harness_source
@@ -4022,9 +4646,178 @@ mod tests {
         );
     }
 
+    #[test]
+    fn source_provenance_closes_split_initial_client_bootstrap() {
+        let controller_source = include_str!("client_controller.rs");
+        let leg_io_source = include_str!("leg_io.rs");
+        let supervisor_source = include_str!("supervisor.rs");
+        let controller_production = controller_source
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let supervisor_production = supervisor_source
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let leg_io_production = leg_io_source
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+
+        assert!(
+            !supervisor_production.contains("pub(crate) fn bootstrap_client(")
+                && !supervisor_production.contains("pub(crate) fn into_controller("),
+            "borrowed bootstrap followed by into_controller leaves raw LegIo/queue authority with the caller between successful activation and controller publication"
+        );
+        assert_eq!(
+            controller_production
+                .matches("pub(crate) fn bootstrap_initial(")
+                .count(),
+            1
+        );
+        assert!(!controller_production.contains("fn from_initial_parts("));
+        assert!(
+            controller_production.contains(
+                "pub(super) struct ClientControllerBootstrapGate {\n    _private: (),\n}"
+            )
+        );
+        assert_eq!(
+            controller_production
+                .matches("ClientControllerBootstrapGate::mint()")
+                .count(),
+            1
+        );
+        assert!(!leg_io_production.contains("pub(super) fn activate_on_queue("));
+        assert!(leg_io_production.contains("_gate: &ClientControllerBootstrapGate,"));
+        assert!(supervisor_production.contains("_gate: &ClientControllerBootstrapGate,"));
+    }
+
+    #[test]
+    fn source_provenance_closes_client_ack_observation_command_bypass() {
+        let controller_source = include_str!("client_controller.rs");
+        let supervisor_source = include_str!("supervisor.rs");
+        let tcp_source = include_str!("tcp.rs");
+        let harness_source = include_str!("two_leg_harness.rs");
+        let controller_production = controller_source
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let supervisor_production = supervisor_source
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let tcp_production = tcp_source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let legacy_driver_adapter = controller_production
+            .split_once("pub(super) fn apply_driver_input(")
+            .expect("legacy driver adapter remains production-reachable")
+            .1
+            .split_once("pub(super) fn apply_driver_input_observed(")
+            .expect("observed driver adapter follows the legacy adapter")
+            .0;
+        let observed_driver_adapter = controller_production
+            .split_once("pub(super) fn apply_driver_input_observed(")
+            .expect("observed driver adapter remains production-reachable")
+            .1
+            .split_once("pub(crate) fn expire_terminal_grace(")
+            .expect("terminal-grace API follows the observed adapter")
+            .0;
+
+        assert!(!controller_production.contains("fn apply_driver_command("));
+        assert!(controller_production.contains("pub(super) fn apply_driver_input("));
+        assert!(
+            controller_production.contains("input: ClientControllerDriverInput,"),
+            "the controller must accept only a driver-minted opaque input"
+        );
+        assert!(
+            !controller_production.contains("input: DriverInput,"),
+            "a sibling-forgeable DriverInput would restore the PeerFrame ACK bypass"
+        );
+        assert_eq!(
+            controller_production
+                .matches("let command = SessionOwnerCommand::ClientDriver(input);")
+                .count(),
+            1,
+            "the controller must carry the opaque wrapper into the supervisor unchanged"
+        );
+        assert_eq!(
+            legacy_driver_adapter
+                .matches("SessionOwnerCommand::ClientDriver(input) =>")
+                .count(),
+            1,
+            "the legacy adapter must return the same rejected opaque wrapper exactly once"
+        );
+        assert_eq!(
+            observed_driver_adapter
+                .matches("SessionOwnerCommand::ClientDriver(input) =>")
+                .count(),
+            1,
+            "the observed adapter must return the same rejected opaque wrapper exactly once"
+        );
+        assert_eq!(
+            controller_production.matches("input.into_inner").count(),
+            0,
+            "the controller must never expose a raw DriverInput while carrying typed provenance"
+        );
+        assert!(
+            tcp_production
+                .contains("pub(crate) struct ClientControllerDriverInput(Box<DriverInput>);")
+        );
+        assert!(tcp_production.contains("pub(super) fn try_recv_next_for_client_controller("));
+        assert_eq!(
+            tcp_production
+                .matches(".map(ClientControllerDriverInput::from_driver_dequeue)")
+                .count(),
+            1,
+            "only the real driver dequeue may mint controller input provenance"
+        );
+        assert_eq!(
+            tcp_production
+                .matches("fn from_driver_dequeue(input: DriverInput) -> Self")
+                .count(),
+            1,
+            "the initial wrapper constructor remains private to the TCP driver module"
+        );
+        assert!(tcp_production.contains(
+            "pub(super) fn from_rejected_driver(\n        input: DriverInput,\n        _gate: &ClientControllerDriverReducerGate,"
+        ));
+        assert!(supervisor_production.contains(
+            "pub(super) struct ClientControllerDriverReducerGate {\n    _private: (),\n}"
+        ));
+        assert!(!supervisor_production.contains("pub(super) fn mint() -> Self"));
+        assert_eq!(
+            supervisor_production
+                .matches("ClientControllerDriverReducerGate::mint()")
+                .count(),
+            1,
+            "only the supervisor may mint the raw-driver extraction/rewrap gate"
+        );
+        assert_eq!(
+            supervisor_production
+                .matches("input.into_inner(&gate)")
+                .count(),
+            1,
+            "only the gated supervisor command path may consume the opaque wrapper"
+        );
+        assert_eq!(
+            supervisor_production
+                .matches("ClientControllerDriverInput::from_rejected_driver(")
+                .count(),
+            1,
+            "only the gated supervisor rejection path may rewrap raw driver ownership"
+        );
+        assert!(harness_source.contains(".try_recv_next_for_client_controller()"));
+        assert_eq!(
+            controller_production
+                .matches(".apply_current_event_observed(")
+                .count(),
+            1
+        );
+        assert!(supervisor_production.contains("_gate: &ClientControllerObservedApplyGate,"));
+    }
+
     #[derive(Default)]
     struct CapturingTransport {
-        frames: Vec<Vec<u8>>,
+        frames: Vec<Bytes>,
     }
 
     impl EncodedLegTransport for CapturingTransport {
@@ -4033,7 +4826,7 @@ mod tests {
             _now: SimTime,
             _route: WireRoute,
             _lane: WireLane,
-            bytes: Vec<u8>,
+            bytes: Bytes,
         ) -> Result<(), EncodedLegTransportError> {
             self.frames.push(bytes);
             Ok(())
@@ -4044,7 +4837,7 @@ mod tests {
             _now: SimTime,
             _route: WireRoute,
             _lane: WireLane,
-            bytes: Vec<u8>,
+            bytes: Bytes,
             completion: OrderedDeliveryToken,
         ) -> Result<(), EncodedLegTransportError> {
             self.frames.push(bytes);
@@ -4101,7 +4894,10 @@ mod tests {
         let owner_leg = EstablishedLeg::for_authenticated_transport(transport);
         let request = standby_attach_request(2, 0x22);
         let proof = credentials().prove(&request, &transport).unwrap();
-        let mut pending = SessionSupervisor::prepare_owner(session_config(), standby_authority(1));
+        let mut pending = SessionSupervisor::prepare_owner_unproven_for_test(
+            session_config(),
+            standby_authority(1),
+        );
         let mut queue = LegOutboundQueue::for_leg(&owner_leg, 4, 4_096).unwrap();
         let (supervisor, active) = pending
             .accept(
@@ -4422,8 +5218,10 @@ mod tests {
         let initial_proof = credentials()
             .prove(&initial_request, &active_binding)
             .unwrap();
-        let mut bootstrap =
-            SessionSupervisor::prepare_owner(session_config(), standby_authority(1));
+        let mut bootstrap = SessionSupervisor::prepare_owner_unproven_for_test(
+            session_config(),
+            standby_authority(1),
+        );
         let mut queue = LegOutboundQueue::for_leg(&owner_leg, 4, 4_096).unwrap();
         let (supervisor, active) = bootstrap
             .accept(
@@ -4495,8 +5293,10 @@ mod tests {
         let initial_proof = credentials()
             .prove(&initial_request, &active_binding)
             .unwrap();
-        let mut bootstrap =
-            SessionSupervisor::prepare_owner(session_config(), standby_authority(1));
+        let mut bootstrap = SessionSupervisor::prepare_owner_unproven_for_test(
+            session_config(),
+            standby_authority(1),
+        );
         let mut initial_queue = LegOutboundQueue::for_leg(&owner_leg, 4, 4_096).unwrap();
         let publication = bootstrap
             .accept(
@@ -5518,7 +6318,7 @@ mod tests {
         let current_active = outputs
             .into_iter()
             .find_map(|output| match output {
-                OwnerTargetRecoveryOutput::RecoveryCompleted { attached } => Some(attached),
+                OwnerTargetRecoveryOutput::RecoveryCompleted { handoff } => Some(handoff.attached),
                 _ => None,
             })
             .expect("bounded initial recovery must return the current active leg");
@@ -5591,205 +6391,6 @@ mod tests {
                 _ => None,
             })
             .expect("flow completion must publish its reducer-minted terminal capability")
-    }
-
-    struct OverAcceptingTarget {
-        inner: MemoryTarget,
-    }
-
-    struct FailOnceTarget {
-        inner: MemoryTarget,
-        open: Option<TargetOpenFailure>,
-        write: Option<TargetFailure>,
-        write_invariant: Option<TargetIoError>,
-        read: Option<TargetFailure>,
-        half_close: Option<TargetFailure>,
-        half_close_invariant: Option<TargetIoError>,
-        open_calls: usize,
-        write_calls: usize,
-        read_calls: usize,
-        half_close_calls: usize,
-    }
-
-    impl FailOnceTarget {
-        fn new() -> Self {
-            Self {
-                inner: MemoryTarget::new(
-                    MemoryTargetConfig::new(4, 256, 512, 128, 128, 16).unwrap(),
-                ),
-                open: None,
-                write: None,
-                write_invariant: None,
-                read: None,
-                half_close: None,
-                half_close_invariant: None,
-                open_calls: 0,
-                write_calls: 0,
-                read_calls: 0,
-                half_close_calls: 0,
-            }
-        }
-    }
-
-    impl TargetIo for FailOnceTarget {
-        fn open(
-            &mut self,
-            flow_id: SessionFlowId,
-            target: &TargetAddr,
-        ) -> Result<TargetOpenCompletion, TargetIoError> {
-            self.open_calls += 1;
-            if let Some(failure) = self.open.take() {
-                return Ok(TargetOpenCompletion::Failed(failure));
-            }
-            self.inner.open(flow_id, target)
-        }
-
-        fn write(
-            &mut self,
-            flow_id: SessionFlowId,
-            bytes: &[u8],
-        ) -> Result<TargetWriteCompletion, TargetIoError> {
-            self.write_calls += 1;
-            if let Some(error) = self.write_invariant.take() {
-                return Err(error);
-            }
-            if let Some(failure) = self.write.take() {
-                return Ok(TargetWriteCompletion::Failed(failure));
-            }
-            self.inner.write(flow_id, bytes)
-        }
-
-        fn read(
-            &mut self,
-            flow_id: SessionFlowId,
-            max_bytes: usize,
-        ) -> Result<TargetReadCompletion, TargetIoError> {
-            self.read_calls += 1;
-            if let Some(failure) = self.read.take() {
-                return Ok(TargetReadCompletion::Failed(failure));
-            }
-            self.inner.read(flow_id, max_bytes)
-        }
-
-        fn half_close_write(
-            &mut self,
-            flow_id: SessionFlowId,
-        ) -> Result<TargetHalfCloseCompletion, TargetIoError> {
-            self.half_close_calls += 1;
-            if let Some(error) = self.half_close_invariant.take() {
-                return Err(error);
-            }
-            if let Some(failure) = self.half_close.take() {
-                return Ok(TargetHalfCloseCompletion::Failed(failure));
-            }
-            self.inner.half_close_write(flow_id)
-        }
-
-        fn reset(
-            &mut self,
-            flow_id: SessionFlowId,
-        ) -> Result<TargetResetCompletion, TargetIoError> {
-            self.inner.reset(flow_id)
-        }
-
-        fn cancel(
-            &mut self,
-            flow_id: SessionFlowId,
-        ) -> Result<TargetCancelCompletion, TargetIoError> {
-            self.inner.cancel(flow_id)
-        }
-
-        fn expire_session_flow(
-            &mut self,
-            flow_id: SessionFlowId,
-        ) -> Result<TargetExpireCompletion, TargetIoError> {
-            self.inner.expire_session_flow(flow_id)
-        }
-
-        fn readiness(&self, flow_id: SessionFlowId) -> Result<TargetReadiness, TargetIoError> {
-            self.inner.readiness(flow_id)
-        }
-
-        fn join(&mut self, flow_id: SessionFlowId) -> Result<TargetJoinCompletion, TargetIoError> {
-            self.inner.join(flow_id)
-        }
-
-        fn retire_terminal_tombstone(
-            &mut self,
-            flow_id: SessionFlowId,
-        ) -> Result<TargetTombstoneRetireCompletion, TargetIoError> {
-            self.inner.retire_terminal_tombstone(flow_id)
-        }
-    }
-
-    impl TargetIo for OverAcceptingTarget {
-        fn open(
-            &mut self,
-            flow_id: SessionFlowId,
-            target: &TargetAddr,
-        ) -> Result<TargetOpenCompletion, TargetIoError> {
-            self.inner.open(flow_id, target)
-        }
-
-        fn write(
-            &mut self,
-            flow_id: SessionFlowId,
-            bytes: &[u8],
-        ) -> Result<TargetWriteCompletion, TargetIoError> {
-            self.inner.readiness(flow_id)?;
-            TargetWriteCompletion::accepted(bytes.len() + 1)
-        }
-
-        fn read(
-            &mut self,
-            flow_id: SessionFlowId,
-            max_bytes: usize,
-        ) -> Result<TargetReadCompletion, TargetIoError> {
-            self.inner.read(flow_id, max_bytes)
-        }
-
-        fn half_close_write(
-            &mut self,
-            flow_id: SessionFlowId,
-        ) -> Result<TargetHalfCloseCompletion, TargetIoError> {
-            self.inner.half_close_write(flow_id)
-        }
-
-        fn reset(
-            &mut self,
-            flow_id: SessionFlowId,
-        ) -> Result<TargetResetCompletion, TargetIoError> {
-            self.inner.reset(flow_id)
-        }
-
-        fn cancel(
-            &mut self,
-            flow_id: SessionFlowId,
-        ) -> Result<TargetCancelCompletion, TargetIoError> {
-            self.inner.cancel(flow_id)
-        }
-
-        fn expire_session_flow(
-            &mut self,
-            flow_id: SessionFlowId,
-        ) -> Result<super::super::target::TargetExpireCompletion, TargetIoError> {
-            self.inner.expire_session_flow(flow_id)
-        }
-
-        fn readiness(&self, flow_id: SessionFlowId) -> Result<TargetReadiness, TargetIoError> {
-            self.inner.readiness(flow_id)
-        }
-
-        fn join(&mut self, flow_id: SessionFlowId) -> Result<TargetJoinCompletion, TargetIoError> {
-            self.inner.join(flow_id)
-        }
-
-        fn retire_terminal_tombstone(
-            &mut self,
-            flow_id: SessionFlowId,
-        ) -> Result<TargetTombstoneRetireCompletion, TargetIoError> {
-            self.inner.retire_terminal_tombstone(flow_id)
-        }
     }
 
     #[test]
@@ -5919,8 +6520,8 @@ mod tests {
         )));
         assert!(outputs.iter().any(|output| matches!(
             output,
-            OwnerTargetRecoveryOutput::RecoveryCompleted { attached }
-                if attached.generation().get() == 3
+            OwnerTargetRecoveryOutput::RecoveryCompleted { handoff }
+                if handoff.generation().get() == 3
         )));
         assert_eq!(acceptance_queue.len(), 1);
         acceptance_queue
@@ -6621,10 +7222,8 @@ mod tests {
                     OwnerTargetRecoveryOutput::NeedsResume { resume: next } => {
                         assert!(resume.replace(next).is_none());
                     }
-                    OwnerTargetRecoveryOutput::RecoveryCompleted {
-                        attached: completed,
-                    } => {
-                        assert!(attached.replace(completed).is_none());
+                    OwnerTargetRecoveryOutput::RecoveryCompleted { handoff } => {
+                        assert!(attached.replace(handoff.attached).is_none());
                     }
                     OwnerTargetRecoveryOutput::ResumeGraceStarted { .. }
                     | OwnerTargetRecoveryOutput::TerminalGraceStarted { .. }
@@ -7223,502 +7822,6 @@ mod tests {
     }
 
     #[test]
-    fn operational_open_failures_map_exactly_once_without_target_ownership() {
-        let cases = [
-            (TargetOpenFailure::Refused, OpenResultCode::TargetRefused),
-            (
-                TargetOpenFailure::Unreachable,
-                OpenResultCode::TargetUnreachable,
-            ),
-            (TargetOpenFailure::TimedOut, OpenResultCode::TimedOut),
-            (
-                TargetOpenFailure::ResourceExhausted,
-                OpenResultCode::ResourceExhausted,
-            ),
-            (
-                TargetOpenFailure::PolicyDenied,
-                OpenResultCode::PolicyDenied,
-            ),
-            (TargetOpenFailure::Internal, OpenResultCode::Internal),
-        ];
-        for (index, (failure, expected)) in cases.into_iter().enumerate() {
-            let leg = committed_leg(2, 0x22, 0x42);
-            let model = SessionModel::new(SessionRole::Owner, session_config(), leg);
-            let supervisor = SessionSupervisor::new(model);
-            let mut target_io = FailOnceTarget::new();
-            target_io.open = Some(failure);
-            let mut executor = OwnerTargetExecutor::new(
-                OwnerTargetConfig::new(128, 1_024, 64).unwrap(),
-                supervisor,
-                target_io,
-                source_config(),
-            )
-            .unwrap();
-            let flow_id = SessionFlowId::new((index + 1) as u64).unwrap();
-
-            let outputs = open_flow(&mut executor, leg, flow_id, target(443));
-            assert_eq!(
-                transmitted(&outputs)
-                    .iter()
-                    .filter(|record| matches!(
-                        record,
-                        Record::OpenResult {
-                            flow_id: observed,
-                            result,
-                        } if *observed == flow_id && *result == expected
-                    ))
-                    .count(),
-                1
-            );
-            assert_eq!(executor.target().open_calls, 1);
-            assert_eq!(executor.snapshot().target_flows, 0);
-            assert_eq!(executor.snapshot().target_read_owned_bytes, 0);
-            assert_eq!(executor.snapshot().target_read_owned_segments, 0);
-            assert_eq!(executor.target().inner.snapshot().live_flows, 0);
-        }
-    }
-
-    #[test]
-    fn operational_read_failure_is_one_urgent_target_failure_reset_and_other_flow_progresses() {
-        let leg = committed_leg(2, 0x22, 0x42);
-        let model = SessionModel::new(SessionRole::Owner, session_config(), leg);
-        let supervisor = SessionSupervisor::new(model);
-        let mut target_io = FailOnceTarget::new();
-        target_io.read = Some(TargetFailure::ConnectionLost);
-        let mut executor = OwnerTargetExecutor::new(
-            OwnerTargetConfig::new(128, 1_024, 64).unwrap(),
-            supervisor,
-            target_io,
-            source_config(),
-        )
-        .unwrap();
-        let failed = SessionFlowId::new(1).unwrap();
-        let live = SessionFlowId::new(2).unwrap();
-        open_flow(&mut executor, leg, failed, target(443));
-        open_flow(&mut executor, leg, live, target(8443));
-
-        let outputs = executor.try_read_target(failed).unwrap();
-        assert_eq!(executor.target().read_calls, 1);
-        assert!(transmitted(&outputs).iter().any(|record| matches!(
-            record,
-            Record::Reset {
-                flow_id,
-                reason: ResetReason::TargetFailure,
-            } if *flow_id == failed
-        )));
-        assert_eq!(executor.snapshot().target_flows, 1);
-        assert_eq!(executor.target().inner.snapshot().live_flows, 1);
-        assert!(matches!(
-            executor.try_read_target(failed),
-            Err(OwnerTargetError::UnknownTargetFlow { flow_id }) if flow_id == failed
-        ));
-        assert_eq!(executor.target().read_calls, 1);
-
-        executor
-            .target_mut()
-            .inner
-            .feed_read(live, Bytes::from_static(b"ok"))
-            .unwrap();
-        let progressed = executor.try_read_target(live).unwrap();
-        assert!(transmitted(&progressed).iter().any(|record| matches!(
-            record,
-            Record::Data { flow_id, payload, .. }
-                if *flow_id == live && payload.as_ref() == b"ok"
-        )));
-    }
-
-    #[test]
-    fn operational_write_and_half_close_failures_reset_but_invariant_errors_stay_fatal() {
-        let leg = committed_leg(2, 0x22, 0x42);
-        let model = SessionModel::new(SessionRole::Owner, session_config(), leg);
-        let supervisor = SessionSupervisor::new(model);
-        let mut target_io = FailOnceTarget::new();
-        target_io.write = Some(TargetFailure::ResourceExhausted);
-        target_io.half_close = Some(TargetFailure::ConnectionLost);
-        let mut executor = OwnerTargetExecutor::new(
-            OwnerTargetConfig::new(128, 1_024, 64).unwrap(),
-            supervisor,
-            target_io,
-            source_config(),
-        )
-        .unwrap();
-        let write_failed = SessionFlowId::new(1).unwrap();
-        let close_failed = SessionFlowId::new(2).unwrap();
-        open_flow(&mut executor, leg, write_failed, target(443));
-        open_flow(&mut executor, leg, close_failed, target(8443));
-
-        let write = peer_frame(
-            &mut executor,
-            leg,
-            Record::Data {
-                flow_id: write_failed,
-                direction: Direction::ClientToTarget,
-                offset: ByteOffset::new(0),
-                payload: Bytes::from_static(b"owned"),
-            },
-        )
-        .unwrap();
-        assert!(transmitted(&write).iter().any(|record| matches!(
-            record,
-            Record::Reset { flow_id, reason: ResetReason::TargetFailure }
-                if *flow_id == write_failed
-        )));
-        assert_eq!(executor.target().write_calls, 1);
-
-        let close = peer_frame(
-            &mut executor,
-            leg,
-            Record::Close {
-                flow_id: close_failed,
-                direction: Direction::ClientToTarget,
-                final_offset: ByteOffset::new(0),
-            },
-        )
-        .unwrap();
-        assert!(transmitted(&close).iter().any(|record| matches!(
-            record,
-            Record::Reset { flow_id, reason: ResetReason::TargetFailure }
-                if *flow_id == close_failed
-        )));
-        assert_eq!(executor.target().half_close_calls, 1);
-        assert_eq!(executor.snapshot().target_flows, 0);
-
-        let model = SessionModel::new(SessionRole::Owner, session_config(), leg);
-        let supervisor = SessionSupervisor::new(model);
-        let mut target_io = FailOnceTarget::new();
-        target_io.write_invariant = Some(TargetIoError::CounterOverflow {
-            counter: "injected_write_invariant",
-        });
-        let mut invariant_executor = OwnerTargetExecutor::new(
-            OwnerTargetConfig::new(128, 1_024, 64).unwrap(),
-            supervisor,
-            target_io,
-            source_config(),
-        )
-        .unwrap();
-        let flow_id = SessionFlowId::new(1).unwrap();
-        open_flow(&mut invariant_executor, leg, flow_id, target(443));
-        assert!(matches!(
-            peer_frame(
-                &mut invariant_executor,
-                leg,
-                Record::Data {
-                    flow_id,
-                    direction: Direction::ClientToTarget,
-                    offset: ByteOffset::new(0),
-                    payload: Bytes::from_static(b"fatal"),
-                },
-            ),
-            Err(OwnerTargetError::Target(TargetIoError::CounterOverflow {
-                counter: "injected_write_invariant"
-            }))
-        ));
-        assert_eq!(invariant_executor.target().write_calls, 1);
-        assert_eq!(invariant_executor.snapshot().aborted_effects, 1);
-        assert_eq!(
-            invariant_executor
-                .snapshot()
-                .session
-                .session
-                .outstanding_sink_offers(),
-            1
-        );
-        match invariant_executor.apply_event(SessionEvent::LegLost { leg }) {
-            Err(OwnerTargetError::RejectedEvent {
-                block: OwnerTargetInputBlock::AbortedEffectInvariant,
-                event,
-            }) => assert_eq!(*event, SessionEvent::LegLost { leg }),
-            other => panic!("poisoned owner must return exact rejected event, got {other:?}"),
-        }
-        assert_eq!(invariant_executor.target().write_calls, 1);
-        assert_eq!(
-            invariant_executor.snapshot().session.session.phase(),
-            crate::resumable::SessionPhase::Active
-        );
-    }
-
-    #[test]
-    fn terminal_capacity_retains_failed_read_completion_without_repeating_target_io() {
-        let leg = committed_leg(2, 0x22, 0x42);
-        let config = SessionConfig::new(
-            4,
-            1,
-            TcpWindowLimits::new(128, 16).unwrap(),
-            TcpWindowLimits::new(128, 16).unwrap(),
-            ReplayBudgetLimits::new(128, 16).unwrap(),
-            ReplayBudgetLimits::new(128, 16).unwrap(),
-            ReceiveBudgetLimits::new(256, 32).unwrap(),
-            128,
-        )
-        .unwrap();
-        let model = SessionModel::new(SessionRole::Owner, config, leg);
-        let supervisor = SessionSupervisor::new(model);
-        let mut target_io = FailOnceTarget::new();
-        target_io.read = Some(TargetFailure::TimedOut);
-        let mut executor = OwnerTargetExecutor::new(
-            OwnerTargetConfig::new(128, 1_024, 64).unwrap(),
-            supervisor,
-            target_io,
-            source_config(),
-        )
-        .unwrap();
-        let terminal_flow = SessionFlowId::new(1).unwrap();
-        let failed = SessionFlowId::new(2).unwrap();
-        let live = SessionFlowId::new(3).unwrap();
-        open_flow(&mut executor, leg, terminal_flow, target(443));
-        let terminal_outputs = peer_frame(
-            &mut executor,
-            leg,
-            Record::Reset {
-                flow_id: terminal_flow,
-                reason: ResetReason::TargetFailure,
-            },
-        )
-        .unwrap();
-        let terminal = terminal_grace(&terminal_outputs);
-        open_flow(&mut executor, leg, failed, target(8443));
-
-        assert!(executor.try_read_target(failed).unwrap().is_empty());
-        assert_eq!(executor.target().read_calls, 1);
-        assert_eq!(executor.snapshot().pending_target_completions, 1);
-        assert!(matches!(
-            executor.try_read_target(failed),
-            Err(OwnerTargetError::PendingTargetCompletion { flow_id }) if flow_id == failed
-        ));
-        assert_eq!(executor.target().read_calls, 1);
-
-        let live_open = open_flow(&mut executor, leg, live, target(9443));
-        assert!(transmitted(&live_open).iter().any(|record| matches!(
-            record,
-            Record::OpenResult { flow_id, result: OpenResultCode::Opened }
-                if *flow_id == live
-        )));
-        let retried = executor
-            .apply_event(SessionEvent::TerminalGraceExpired { terminal })
-            .unwrap();
-        assert!(transmitted(&retried).iter().any(|record| matches!(
-            record,
-            Record::Reset { flow_id, reason: ResetReason::TargetFailure }
-                if *flow_id == failed
-        )));
-        assert_eq!(executor.target().read_calls, 1);
-        assert_eq!(executor.snapshot().pending_target_completions, 0);
-        assert_eq!(executor.snapshot().target_flows, 1);
-        assert_eq!(executor.target().inner.snapshot().live_flows, 1);
-    }
-
-    #[test]
-    fn successive_terminal_retirements_advance_pending_completions_in_flow_order() {
-        let leg = committed_leg(2, 0x22, 0x42);
-        let config = SessionConfig::new(
-            4,
-            1,
-            TcpWindowLimits::new(128, 16).unwrap(),
-            TcpWindowLimits::new(128, 16).unwrap(),
-            ReplayBudgetLimits::new(128, 16).unwrap(),
-            ReplayBudgetLimits::new(128, 16).unwrap(),
-            ReceiveBudgetLimits::new(256, 32).unwrap(),
-            128,
-        )
-        .unwrap();
-        let model = SessionModel::new(SessionRole::Owner, config, leg);
-        let supervisor = SessionSupervisor::new(model);
-        let mut executor = OwnerTargetExecutor::new(
-            OwnerTargetConfig::new(128, 1_024, 64).unwrap(),
-            supervisor,
-            FailOnceTarget::new(),
-            source_config(),
-        )
-        .unwrap();
-        let occupying = SessionFlowId::new(1).unwrap();
-        let first = SessionFlowId::new(2).unwrap();
-        let second = SessionFlowId::new(3).unwrap();
-        open_flow(&mut executor, leg, occupying, target(443));
-        open_flow(&mut executor, leg, first, target(8443));
-        open_flow(&mut executor, leg, second, target(9443));
-        let occupying_terminal = terminal_grace(
-            &peer_frame(
-                &mut executor,
-                leg,
-                Record::Reset {
-                    flow_id: occupying,
-                    reason: ResetReason::TargetFailure,
-                },
-            )
-            .unwrap(),
-        );
-
-        executor.target_mut().read = Some(TargetFailure::TimedOut);
-        assert!(executor.try_read_target(first).unwrap().is_empty());
-        executor.target_mut().read = Some(TargetFailure::ConnectionLost);
-        assert!(executor.try_read_target(second).unwrap().is_empty());
-        assert_eq!(executor.snapshot().pending_target_completions, 2);
-        assert_eq!(executor.target().read_calls, 2);
-
-        let first_retry = executor
-            .apply_event(SessionEvent::TerminalGraceExpired {
-                terminal: occupying_terminal,
-            })
-            .unwrap();
-        let first_terminal = terminal_grace(&first_retry);
-        assert_eq!(first_terminal.flow_id(), first);
-        assert_eq!(executor.snapshot().pending_target_completions, 1);
-        assert_eq!(executor.target().read_calls, 2);
-
-        let second_retry = executor
-            .apply_event(SessionEvent::TerminalGraceExpired {
-                terminal: first_terminal,
-            })
-            .unwrap();
-        let second_terminal = terminal_grace(&second_retry);
-        assert_eq!(second_terminal.flow_id(), second);
-        assert_eq!(executor.snapshot().pending_target_completions, 0);
-        assert_eq!(executor.target().read_calls, 2);
-
-        executor
-            .apply_event(SessionEvent::TerminalGraceExpired {
-                terminal: second_terminal,
-            })
-            .unwrap();
-        assert_eq!(executor.snapshot().target_flows, 0);
-        assert_eq!(executor.snapshot().target_tombstones, 0);
-        assert_eq!(executor.target().inner.snapshot().joined_flows, 0);
-    }
-
-    #[test]
-    fn terminal_capacity_retains_successful_half_close_without_repeating_target_io() {
-        let leg = committed_leg(2, 0x22, 0x42);
-        let config = SessionConfig::new(
-            4,
-            1,
-            TcpWindowLimits::new(128, 16).unwrap(),
-            TcpWindowLimits::new(128, 16).unwrap(),
-            ReplayBudgetLimits::new(128, 16).unwrap(),
-            ReplayBudgetLimits::new(128, 16).unwrap(),
-            ReceiveBudgetLimits::new(256, 32).unwrap(),
-            128,
-        )
-        .unwrap();
-        let model = SessionModel::new(SessionRole::Owner, config, leg);
-        let supervisor = SessionSupervisor::new(model);
-        let mut executor = OwnerTargetExecutor::new(
-            OwnerTargetConfig::new(128, 1_024, 64).unwrap(),
-            supervisor,
-            FailOnceTarget::new(),
-            source_config(),
-        )
-        .unwrap();
-        let occupying = SessionFlowId::new(1).unwrap();
-        let blocked = SessionFlowId::new(2).unwrap();
-        open_flow(&mut executor, leg, occupying, target(443));
-        open_flow(&mut executor, leg, blocked, target(8443));
-
-        let occupying_outputs = peer_frame(
-            &mut executor,
-            leg,
-            Record::Reset {
-                flow_id: occupying,
-                reason: ResetReason::TargetFailure,
-            },
-        )
-        .unwrap();
-        let occupying_terminal = terminal_grace(&occupying_outputs);
-
-        executor.target_mut().inner.finish_read(blocked).unwrap();
-        let eof = executor.try_read_target(blocked).unwrap();
-        assert!(transmitted(&eof).iter().any(|record| matches!(
-            record,
-            Record::Close {
-                flow_id,
-                direction: Direction::TargetToClient,
-                final_offset,
-            } if *flow_id == blocked && *final_offset == ByteOffset::new(0)
-        )));
-        peer_frame(
-            &mut executor,
-            leg,
-            Record::Ack {
-                flow_id: blocked,
-                direction: Direction::TargetToClient,
-                next_accepted: ByteOffset::new(0),
-                final_accepted: true,
-            },
-        )
-        .unwrap();
-
-        let blocked_completion = peer_frame(
-            &mut executor,
-            leg,
-            Record::Close {
-                flow_id: blocked,
-                direction: Direction::ClientToTarget,
-                final_offset: ByteOffset::new(0),
-            },
-        )
-        .unwrap();
-        assert!(
-            !blocked_completion
-                .iter()
-                .any(|output| matches!(output, OwnerTargetOutput::TerminalGraceStarted { .. }))
-        );
-        assert_eq!(executor.target().half_close_calls, 1);
-        assert_eq!(executor.snapshot().pending_target_completions, 1);
-
-        let deferred_event = SessionEvent::PeerFrame {
-            leg,
-            frame: Frame::try_new(
-                leg.generation(),
-                Record::Close {
-                    flow_id: blocked,
-                    direction: Direction::ClientToTarget,
-                    final_offset: ByteOffset::new(0),
-                },
-            )
-            .unwrap(),
-        };
-        let retained_event = match executor.apply_event(deferred_event) {
-            Err(OwnerTargetError::RejectedEvent {
-                block: OwnerTargetInputBlock::PendingTargetCompletion { flow_id },
-                event,
-            }) if flow_id == blocked => event,
-            other => panic!("blocked completion must return exact same-flow input, got {other:?}"),
-        };
-        assert_eq!(event_flow_id(&retained_event), Some(blocked));
-        assert_eq!(executor.target().half_close_calls, 1);
-
-        let retried = executor
-            .apply_event(SessionEvent::TerminalGraceExpired {
-                terminal: occupying_terminal,
-            })
-            .unwrap();
-        let blocked_terminal = terminal_grace(&retried);
-        assert_eq!(blocked_terminal.flow_id(), blocked);
-        assert_eq!(executor.target().half_close_calls, 1);
-        assert_eq!(executor.snapshot().pending_target_completions, 0);
-        assert_eq!(executor.snapshot().target_flows, 0);
-
-        let duplicate = executor.apply_event(*retained_event).unwrap();
-        assert!(transmitted(&duplicate).iter().any(|record| matches!(
-            record,
-            Record::Ack {
-                flow_id,
-                direction: Direction::ClientToTarget,
-                final_accepted: true,
-                ..
-            } if *flow_id == blocked
-        )));
-        assert_eq!(executor.target().half_close_calls, 1);
-
-        executor
-            .apply_event(SessionEvent::TerminalGraceExpired {
-                terminal: blocked_terminal,
-            })
-            .unwrap();
-        assert_eq!(executor.snapshot().target_tombstones, 0);
-        assert_eq!(executor.target().inner.snapshot().joined_flows, 0);
-    }
-
-    #[test]
     fn zero_and_would_block_never_ack_while_positive_partial_write_advances_exactly() {
         let (leg, mut executor) = executor();
         let flow_id = SessionFlowId::new(1).unwrap();
@@ -7781,55 +7884,6 @@ mod tests {
             &executor.target_mut().take_written(flow_id, 8).unwrap()[..],
             b"def"
         );
-    }
-
-    #[test]
-    fn target_cannot_ack_more_bytes_than_the_slice_it_was_given() {
-        let leg = committed_leg(2, 0x22, 0x42);
-        let model = SessionModel::new(SessionRole::Owner, session_config(), leg);
-        let supervisor = SessionSupervisor::new(model);
-        let target_io = OverAcceptingTarget {
-            inner: MemoryTarget::new(MemoryTargetConfig::new(4, 256, 512, 128, 128, 16).unwrap()),
-        };
-        let mut executor = OwnerTargetExecutor::new(
-            OwnerTargetConfig::new(128, 1_024, 64).unwrap(),
-            supervisor,
-            target_io,
-            source_config(),
-        )
-        .unwrap();
-        let flow_id = SessionFlowId::new(1).unwrap();
-        open_flow(&mut executor, leg, flow_id, target(443));
-
-        let result = peer_frame(
-            &mut executor,
-            leg,
-            Record::Data {
-                flow_id,
-                direction: Direction::ClientToTarget,
-                offset: ByteOffset::new(0),
-                payload: Bytes::from_static(b"abcdef"),
-            },
-        );
-
-        assert!(matches!(
-            result,
-            Err(OwnerTargetError::InvalidTargetWriteAcceptance {
-                flow_id: observed,
-                accepted: 7,
-                exposed: 6,
-                offered: 6,
-            }) if observed == flow_id
-        ));
-        assert_eq!(
-            executor
-                .snapshot()
-                .session
-                .session
-                .outstanding_sink_offers(),
-            1
-        );
-        assert_eq!(executor.target().inner.snapshot().write_accepted_bytes, 0);
     }
 
     #[test]

@@ -14,11 +14,10 @@
 //! backing storage strictly less than four times live payload;
 //! [`SessionConfig`] exposes a conservative four-times bound. A decoded input
 //! DATA frame is transient and is not part of that bound.
-//! Finished flows leave only a count-bounded compact tombstone until the
-//! adapter returns its [`TerminalGrace`] expiry capability; live-flow capacity
-//! is reclaimed immediately while monotonically increasing IDs prevent reuse.
+//! Finished flows retain count-bounded tombstones in their live-sized nodes.
+//! [`TerminalGrace`] expiry recycles those nodes; logical live-flow capacity is
+//! reclaimed at finish while monotonically increasing IDs prevent flow reuse.
 
-use std::collections::BTreeMap;
 use std::fmt;
 
 use bytes::Bytes;
@@ -28,14 +27,18 @@ use crate::shared::TargetAddr;
 
 use super::auth::{CommittedLeg, GenerationCatchUp};
 use super::capacity::{DirectionalReplayStorageLimits, ReplayStorageLimit, ReplayStoragePlan};
+use super::effect_storage::{EffectStorageError, SessionEffectBatch, exact_vec};
 use super::protocol::{
     ByteOffset, Direction, Frame, LegGeneration, OpenResultCode, ProtocolError, Record,
-    ResetReason, SessionFlowId, SessionId, validate_record,
+    ResetReason, SessionFlowId, SessionId, validate_record, validate_target,
 };
 use super::tcp::{
     TcpDataSegment, TcpOwnershipError, TcpReceiveSnapshot, TcpReceiveWindow, TcpSendSnapshot,
     TcpSendWindow, TcpWindowLimits,
 };
+
+mod effects;
+mod flow_lifecycle;
 
 const NORMALIZED_BACKING_FACTOR: usize = 4;
 
@@ -277,10 +280,10 @@ impl SessionConfig {
         self.max_receive_normalized_backing_bytes
     }
 
-    /// Conservative exact bound for one owner recovery vector: one activation,
+    /// Conservative exact bound for one replacement recovery vector: one activation,
     /// one replayable terminal control per tombstone, up to OPEN/ACK/CLOSE per
     /// live flow, and every direction's globally bounded replay segment.
-    pub(crate) fn owner_recovery_effect_bound(self) -> Option<usize> {
+    pub(crate) fn replacement_recovery_effect_bound(self) -> Option<usize> {
         let per_flow_control = self.max_flows.checked_mul(3)?;
         let replay_segments = self
             .client_to_target_replay
@@ -290,6 +293,46 @@ impl SessionConfig {
             .checked_add(self.max_terminal_tombstones)?
             .checked_add(per_flow_control)?
             .checked_add(replay_segments)
+    }
+
+    /// Tight client-role replacement bound: the client can replay only the
+    /// client-to-target global segment budget. The owner bound remains the
+    /// conservative role-neutral ceiling used by the existing owner target.
+    pub(crate) fn client_recovery_effect_bound(self) -> Option<usize> {
+        self.max_flows
+            .checked_mul(3)?
+            .checked_add(self.max_terminal_tombstones)?
+            .checked_add(self.client_to_target_replay.max_segments())?
+            .checked_add(1)
+    }
+
+    /// Exact maximum effects produced by one ordinary client-root reducer
+    /// mutation. An active local OPEN makes the bound tight with
+    /// `LocalFlowOpened + Transmit`; driver and peer-inbound terminal paths can
+    /// likewise produce two effects. `OfferToSink` and `HalfCloseSink` cannot
+    /// coexist: an offer requires contiguous bytes beyond the accepted offset,
+    /// while half-close readiness requires the final offset to equal it.
+    pub(crate) const fn client_incremental_effect_bound(self) -> usize {
+        2
+    }
+
+    /// Checked pending-effect capacity for the client root.
+    ///
+    /// Replacement recovery admission and ordinary open/driver/inbound
+    /// mutations are distinct scheduler phases: the root must drain retained
+    /// incremental effects before entering recovery and must not mutate an
+    /// incremental source while it installs the prepared recovery vector.
+    /// Their ownership therefore overlaps by phase, not by accumulation, so
+    /// the required capacity is their maximum rather than their sum.
+    pub(crate) fn client_pending_effect_bound(self) -> Option<usize> {
+        Some(
+            self.client_recovery_effect_bound()?
+                .max(self.client_incremental_effect_bound()),
+        )
+    }
+
+    pub(crate) fn owner_recovery_effect_bound(self) -> Option<usize> {
+        self.replacement_recovery_effect_bound()
     }
 
     /// Full owner work-DAG bound for effects that can be retained between
@@ -562,7 +605,9 @@ pub struct ReplayAcknowledged {
     local_flow: LocalFlow,
     generation: LegGeneration,
     direction: Direction,
+    previous_accepted: ByteOffset,
     next_accepted: ByteOffset,
+    released_bytes: usize,
     final_accepted: bool,
 }
 
@@ -583,8 +628,16 @@ impl ReplayAcknowledged {
         self.direction
     }
 
+    pub const fn previous_accepted(&self) -> ByteOffset {
+        self.previous_accepted
+    }
+
     pub const fn next_accepted(&self) -> ByteOffset {
         self.next_accepted
+    }
+
+    pub const fn released_bytes(&self) -> usize {
+        self.released_bytes
     }
 
     pub const fn final_accepted(&self) -> bool {
@@ -603,7 +656,9 @@ impl fmt::Debug for ReplayAcknowledged {
             .field("flow_id", &self.local_flow.flow_id)
             .field("generation", &self.generation)
             .field("direction", &self.direction)
+            .field("previous_accepted", &self.previous_accepted)
             .field("next_accepted", &self.next_accepted)
+            .field("released_bytes", &self.released_bytes)
             .field("final_accepted", &self.final_accepted)
             .finish()
     }
@@ -1053,13 +1108,13 @@ struct TerminalTombstone {
 }
 
 pub struct SessionModel {
+    failed_effects: Option<SessionEffectBatch>,
     session_id: SessionId,
     role: SessionRole,
     config: SessionConfig,
     phase: SessionPhase,
     current_leg: CommittedLeg,
-    flows: BTreeMap<SessionFlowId, FlowState>,
-    terminal_tombstones: BTreeMap<SessionFlowId, TerminalTombstone>,
+    flow_storage: flow_lifecycle::FlowStorage,
     next_local_flow_id: Option<u64>,
     highest_peer_flow_id: u64,
     next_local_authority_id: Option<u64>,
@@ -1079,39 +1134,289 @@ pub struct SessionModel {
 /// generation, and stable session semantics cannot change between preflight
 /// and installation.  Its fields are private and it is intentionally neither
 /// `Clone` nor `Copy`; the only installation API consumes it.
-pub(super) struct PreflightedReplacement<'model> {
+struct PreflightedReplacement<'model> {
     model: &'model mut SessionModel,
     candidate: CommittedLeg,
     _expected_current_leg: CommittedLeg,
     _expected_phase: SessionPhase,
 }
 
-impl PreflightedReplacement<'_> {
-    /// Consumes the exclusive preflight proof and performs the mutation half
-    /// of the transaction.  No condition remains that can reject here.
+/// Exact replacement plus its already-materialized recovery effects. Recovery
+/// allocation and inspection happen before the model changes; consuming this
+/// value is the infallible reducer commit.
+pub(super) struct PreparedReplacement<'model> {
+    model: &'model mut SessionModel,
+    candidate: CommittedLeg,
+    recovery: Vec<SessionEffect>,
+    _expected_current_leg: CommittedLeg,
+    _expected_phase: SessionPhase,
+}
+
+/// Exact local OPEN state materialized before any flow/id mutation. The token
+/// owns the model's mutable borrow, so an adapter may perform its independent
+/// fallible preparation against the final `LocalFlow`, OPEN frame, and visible
+/// effects before the reducer commit becomes irreversible.
+pub(super) struct PreparedLocalOpen<'model> {
+    model: &'model mut SessionModel,
+    flow_id: SessionFlowId,
+    flow: FlowState,
+    prepared_node: flow_lifecycle::PreparedFlowNode,
+    local_flow: LocalFlow,
+    next_local_flow_id: Option<u64>,
+    next_local_authority_id: Option<u64>,
+    open_frame: Frame,
+    transmit_open: bool,
+    retry_target: TargetAddr,
+    effects: Vec<SessionEffect>,
+}
+
+/// Exact reducer-prepared adapter input. Moving the OPEN frame, rather than
+/// lending it, lets the sole outbound FIFO reservation retain that same
+/// ownership through the later allocation-free commit.
+#[must_use = "the prepared OPEN input owns the exact frame until adapter commit or rejection"]
+pub(crate) struct PreparedLocalOpenInput {
+    local_flow: LocalFlow,
+    open_frame: Frame,
+}
+
+impl PreparedLocalOpenInput {
+    pub(crate) const fn from_parts(local_flow: LocalFlow, open_frame: Frame) -> Self {
+        Self {
+            local_flow,
+            open_frame,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn local_flow(&self) -> LocalFlow {
+        self.local_flow
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn open_frame(&self) -> &Frame {
+        &self.open_frame
+    }
+
+    pub(crate) fn into_parts(self) -> (LocalFlow, Frame) {
+        (self.local_flow, self.open_frame)
+    }
+
+    pub(crate) fn reject<E>(self, error: E) -> PreparedLocalOpenAdapterRejection<E> {
+        PreparedLocalOpenAdapterRejection { input: self, error }
+    }
+}
+
+/// Ownership-preserving adapter rejection. The input's exact OPEN frame must
+/// return with every failed queue/factory preparation so the reducer can stay
+/// wholly uncommitted without fabricating compensation.
+pub(crate) struct PreparedLocalOpenAdapterRejection<E> {
+    input: PreparedLocalOpenInput,
+    error: E,
+}
+
+impl<E> PreparedLocalOpenAdapterRejection<E> {
+    fn into_parts(self) -> (PreparedLocalOpenInput, E) {
+        (self.input, self.error)
+    }
+}
+
+/// Adapter ownership paired with one reducer-committed local OPEN. The adapter
+/// value already owns the moved OPEN-frame reservation; this wrapper adds only
+/// the reducer's matching local-flow authority.
+pub(crate) struct ReducerCommittedLocalOpen<T> {
+    prepared_adapter: T,
+    local_flow: LocalFlow,
+}
+
+impl<T> ReducerCommittedLocalOpen<T> {
+    pub(crate) fn into_parts(self) -> (T, LocalFlow) {
+        (self.prepared_adapter, self.local_flow)
+    }
+}
+
+impl<T> fmt::Debug for ReducerCommittedLocalOpen<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReducerCommittedLocalOpen")
+            .field("prepared_adapter", &"[REDACTED]")
+            .field("local_flow", &self.local_flow)
+            .finish()
+    }
+}
+
+/// Reducer preflight failure that returns the exact caller-owned Target. This
+/// prevents a validation failure from forcing an eager clone of a potentially
+/// over-allocated `String` merely to make a retry event.
+pub(crate) struct PreparedLocalOpenReducerFailure {
+    target: TargetAddr,
+    error: SessionError,
+}
+
+impl PreparedLocalOpenReducerFailure {
+    fn new(target: TargetAddr, error: SessionError) -> Self {
+        Self { target, error }
+    }
+
+    pub(crate) fn into_parts(self) -> (TargetAddr, SessionError) {
+        (self.target, self.error)
+    }
+}
+
+impl fmt::Debug for PreparedLocalOpenReducerFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedLocalOpenReducerFailure")
+            .field("target", &"[REDACTED]")
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+/// Adapter rejection before reducer commit. The exact input Target remains
+/// available to a bounded retry owner while adapter-specific ownership stays
+/// in `error`.
+pub(crate) struct PreparedLocalOpenAdapterFailure<E> {
+    target: TargetAddr,
+    input: PreparedLocalOpenInput,
+    error: E,
+}
+
+impl<E> PreparedLocalOpenAdapterFailure<E> {
+    pub(crate) fn into_parts(self) -> (TargetAddr, PreparedLocalOpenInput, E) {
+        (self.target, self.input, self.error)
+    }
+}
+
+impl<E> fmt::Debug for PreparedLocalOpenAdapterFailure<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedLocalOpenAdapterFailure")
+            .field("target", &"[REDACTED]")
+            .field("error", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl<'model> PreflightedReplacement<'model> {
+    fn prepare_recovery(self) -> Result<PreparedReplacement<'model>, SessionError> {
+        let Self {
+            model,
+            candidate,
+            _expected_current_leg,
+            _expected_phase,
+        } = self;
+        let recovery = model.recovery_effects_for(candidate.generation())?;
+        Ok(PreparedReplacement {
+            model,
+            candidate,
+            recovery,
+            _expected_current_leg,
+            _expected_phase,
+        })
+    }
+}
+
+impl PreparedReplacement<'_> {
     pub(super) fn install(self) -> Vec<SessionEffect> {
         let Self {
             model,
             candidate,
+            recovery,
             _expected_current_leg: _,
             _expected_phase: _,
         } = self;
         model.current_leg = candidate;
         model.phase = SessionPhase::Active;
-        model.recovery_effects()
+        recovery
+    }
+
+    fn commit_with<T, E>(
+        self,
+        prepare: impl FnOnce(Vec<SessionEffect>) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let Self {
+            model,
+            candidate,
+            recovery,
+            _expected_current_leg: _,
+            _expected_phase: _,
+        } = self;
+        let prepared_adapter = prepare(recovery)?;
+        model.current_leg = candidate;
+        model.phase = SessionPhase::Active;
+        Ok(prepared_adapter)
     }
 }
 
 impl SessionModel {
+    fn require_effects_live(&self) -> Result<(), SessionError> {
+        if self.failed_effects.is_some() {
+            Err(SessionError::EffectStorageOverflow)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Runs a fallible adapter preflight against the exact materialized normal
+    /// replacement recovery, then commits only when that callback succeeds.
+    /// The nested result makes the no-mutation adapter rejection distinct from
+    /// reducer rejection without exporting the raw install token.
+    pub(crate) fn install_prepared_client_replacement<T, E>(
+        &mut self,
+        leg: CommittedLeg,
+        prepare: impl FnOnce(Vec<SessionEffect>) -> Result<T, E>,
+    ) -> Result<Result<T, E>, SessionError> {
+        self.require_effects_live()?;
+        if self.role != SessionRole::Client {
+            return Err(SessionError::RoleCannotAcceptClientAttach(self.role));
+        }
+        let prepared = self.preflight_replacement(leg)?.prepare_recovery()?;
+        Ok(prepared.commit_with(prepare))
+    }
+
+    /// Catch-up counterpart to [`Self::install_prepared_client_replacement`].
+    /// Generation jumps remain valid only through the opaque authenticated
+    /// `GenerationCatchUp` proof.
+    pub(crate) fn install_prepared_client_catch_up<T, E>(
+        &mut self,
+        catch_up: GenerationCatchUp,
+        prepare: impl FnOnce(Vec<SessionEffect>) -> Result<T, E>,
+    ) -> Result<Result<T, E>, SessionError> {
+        self.require_effects_live()?;
+        if self.role != SessionRole::Client {
+            return Err(SessionError::RoleCannotAcceptClientAttach(self.role));
+        }
+        let prepared = self.preflight_catch_up(catch_up)?;
+        Ok(prepared.commit_with(prepare))
+    }
+
+    /// Performs the fallible adapter half of a local OPEN while flow/id state
+    /// is still unchanged. The callback receives ownership of the exact OPEN
+    /// frame so its successful adapter value can retain an infallible FIFO
+    /// reservation; rejection returns through the inner result with no reducer
+    /// mutation.
+    pub(crate) fn install_prepared_client_local_open<T, E>(
+        &mut self,
+        leg: CommittedLeg,
+        target: TargetAddr,
+        prepare: impl FnOnce(PreparedLocalOpenInput) -> Result<T, PreparedLocalOpenAdapterRejection<E>>,
+    ) -> Result<
+        Result<ReducerCommittedLocalOpen<T>, PreparedLocalOpenAdapterFailure<E>>,
+        PreparedLocalOpenReducerFailure,
+    > {
+        let prepared = self.preflight_local_open(leg, target, true)?;
+        Ok(prepared.commit_with(prepare))
+    }
+
     pub fn new(role: SessionRole, config: SessionConfig, initial_leg: CommittedLeg) -> Self {
         Self {
+            failed_effects: None,
             session_id: initial_leg.session_id(),
             role,
             config,
             phase: SessionPhase::Active,
             current_leg: initial_leg,
-            flows: BTreeMap::new(),
-            terminal_tombstones: BTreeMap::new(),
+            flow_storage: flow_lifecycle::FlowStorage::default(),
             next_local_flow_id: Some(1),
             highest_peer_flow_id: 0,
             next_local_authority_id: Some(1),
@@ -1142,86 +1447,38 @@ impl SessionModel {
         self.current_leg
     }
 
-    pub fn snapshot(&self) -> SessionSnapshot {
-        let mut outstanding_sink_offers = 0usize;
-        for flow in self.flows.values() {
-            outstanding_sink_offers += usize::from(flow.pending_sink_offer.is_some());
-        }
-        SessionSnapshot {
-            phase: self.phase,
-            generation: self.current_leg.generation(),
-            flow_count: self.flows.len(),
-            client_to_target_replay: self.client_to_target_replay,
-            target_to_client_replay: self.target_to_client_replay,
-            receive_owned_bytes: self.receive_usage.bytes,
-            receive_ranges: self.receive_usage.segments,
-            outstanding_sink_offers,
-            terminal_tombstones: self.terminal_tombstones.len(),
-            next_local_flow_id: self.next_local_flow_id,
-            highest_peer_flow_id: self.highest_peer_flow_id,
-        }
-    }
-
-    pub fn flow_snapshot(&self, flow_id: SessionFlowId) -> Option<SessionFlowSnapshot> {
-        self.flows.get(&flow_id).map(|flow| SessionFlowSnapshot {
-            send: flow.send.snapshot(),
-            receive: flow.receive.snapshot(),
-            has_outstanding_sink_offer: flow.pending_sink_offer.is_some(),
-            has_pending_half_close: flow.pending_half_close.is_some(),
-        })
-    }
-
-    pub fn reduce(&mut self, event: SessionEvent) -> Result<Vec<SessionEffect>, SessionError> {
-        match event {
-            SessionEvent::ReplacementAttached { leg } => self.attach_replacement(leg),
-            SessionEvent::ReplacementCaughtUp { catch_up } => self.attach_catch_up(catch_up),
-            SessionEvent::LegLost { leg } => self.lose_leg(leg),
-            SessionEvent::ResumeGraceExpired { leg } => self.expire_resume_grace(leg),
-            SessionEvent::LocalOpen { leg, target } => self.local_open(leg, target),
-            SessionEvent::LocalData { flow, payload } => self.local_data(flow, payload),
-            SessionEvent::LocalClose { flow } => self.local_close(flow),
-            SessionEvent::LocalReset { flow, reason } => self.local_reset(flow, reason),
-            SessionEvent::PeerOpenResolved { request, result } => {
-                self.peer_open_resolved(request, result)
-            }
-            SessionEvent::PeerFrame { leg, frame } => self.peer_frame(leg, frame),
-            SessionEvent::SinkAccepted { offer, bytes } => self.sink_accepted(offer, bytes),
-            SessionEvent::SinkAbandoned { offer } => self.sink_abandoned(offer),
-            SessionEvent::SinkHalfClosed { completion } => self.sink_half_closed(completion),
-            SessionEvent::SinkHalfCloseFailed { completion } => {
-                self.sink_half_close_failed(completion)
-            }
-            SessionEvent::TerminalGraceExpired { terminal } => self.expire_terminal_grace(terminal),
-        }
-    }
-
     fn attach_replacement(
         &mut self,
         leg: CommittedLeg,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
-        let preflighted = self.preflight_replacement(leg)?;
-        Ok(preflighted.install())
+        effects: &mut SessionEffectBatch,
+    ) -> Result<(), SessionError> {
+        let prepared = self.preflight_replacement(leg)?.prepare_recovery()?;
+        effects.mark_mutation();
+        effects.install_prepared(prepared.install());
+        Ok(())
     }
 
     /// Read-only half of the owner attach transaction. Every condition that
     /// can reject a replacement is checked before the independent generation
     /// authority performs its CAS.
-    pub(super) fn preflight_owner_replacement(
+    pub(super) fn prepare_owner_replacement(
         &mut self,
         leg: CommittedLeg,
-    ) -> Result<PreflightedReplacement<'_>, SessionError> {
+    ) -> Result<PreparedReplacement<'_>, SessionError> {
+        self.require_effects_live()?;
         if self.role != SessionRole::Owner {
             return Err(SessionError::RoleCannotAcceptOwnerAttach(self.role));
         }
-        self.preflight_replacement(leg)
+        self.preflight_replacement(leg)?.prepare_recovery()
     }
 
     /// Read-only replacement preflight shared by the owner transaction and
     /// the pure client reducer path.
-    pub(super) fn preflight_replacement(
+    fn preflight_replacement(
         &mut self,
         leg: CommittedLeg,
     ) -> Result<PreflightedReplacement<'_>, SessionError> {
+        self.require_effects_live()?;
         if leg.session_id() != self.session_id {
             return Err(SessionError::CrossSessionLeg {
                 expected: self.session_id,
@@ -1256,7 +1513,23 @@ impl SessionModel {
     fn attach_catch_up(
         &mut self,
         catch_up: GenerationCatchUp,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
+        effects: &mut SessionEffectBatch,
+    ) -> Result<(), SessionError> {
+        let prepared = self.preflight_catch_up(catch_up)?;
+        effects.mark_mutation();
+        effects.install_prepared(prepared.install());
+        Ok(())
+    }
+
+    /// Materializes the exact catch-up recovery before changing generation or
+    /// phase. C1c can therefore reserve the exact endpoint/queue budget before
+    /// the infallible mutation half, while the pure reducer keeps identical
+    /// externally visible semantics.
+    pub(super) fn preflight_catch_up(
+        &mut self,
+        catch_up: GenerationCatchUp,
+    ) -> Result<PreparedReplacement<'_>, SessionError> {
+        self.require_effects_live()?;
         if catch_up.session_id() != self.session_id {
             return Err(SessionError::CrossSessionLeg {
                 expected: self.session_id,
@@ -1296,762 +1569,14 @@ impl SessionModel {
             return Err(SessionError::InvalidCatchUpCapability);
         }
 
-        self.current_leg = accepted_leg;
-        self.phase = SessionPhase::Active;
-        Ok(self.recovery_effects())
-    }
-
-    fn lose_leg(&mut self, leg: CommittedLeg) -> Result<Vec<SessionEffect>, SessionError> {
-        self.validate_current_capability(&leg)?;
-        if self.phase == SessionPhase::Legless {
-            return Ok(Vec::new());
-        }
-        self.phase = SessionPhase::Legless;
-        Ok(vec![SessionEffect::ResumeGraceStarted {
-            generation: leg.generation(),
-        }])
-    }
-
-    fn expire_resume_grace(
-        &mut self,
-        leg: CommittedLeg,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
-        self.validate_current_capability(&leg)?;
-        if self.phase != SessionPhase::Legless {
-            return Err(SessionError::ResumeGraceNotActive);
-        }
-        self.flows.clear();
-        self.terminal_tombstones.clear();
-        self.client_to_target_replay = ReplayBudgetUsage::default();
-        self.target_to_client_replay = ReplayBudgetUsage::default();
-        self.receive_usage = ReplayBudgetUsage::default();
-        self.phase = SessionPhase::Expired;
-        Ok(vec![SessionEffect::SessionExpired])
-    }
-
-    fn local_open(
-        &mut self,
-        leg: CommittedLeg,
-        target: TargetAddr,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
-        self.validate_current_capability(&leg)?;
-        if self.role != SessionRole::Client {
-            return Err(SessionError::RoleCannotInitiateOpen(self.role));
-        }
-        self.precheck_flow_capacity()?;
-        let raw = self
-            .next_local_flow_id
-            .ok_or(SessionError::FlowIdExhausted)?;
-        let flow_id = SessionFlowId::new(raw).map_err(|_| SessionError::FlowIdExhausted)?;
-        let authority_id = self
-            .next_local_authority_id
-            .ok_or(SessionError::LocalFlowAuthorityExhausted)?;
-        if self.flows.contains_key(&flow_id) || self.terminal_tombstones.contains_key(&flow_id) {
-            return Err(SessionError::InvariantViolation(
-                "fresh local flow id already existed",
-            ));
-        }
-        let open_frame = Frame::try_new(
-            self.current_leg.generation(),
-            Record::Open { flow_id, target },
-        )
-        .map_err(|source| SessionError::InvalidProtocolRecord { source })?;
-        let target = match open_frame.record() {
-            Record::Open { target, .. } => target.clone(),
-            _ => {
-                return Err(SessionError::InvariantViolation(
-                    "local OPEN record construction changed variant",
-                ));
-            }
-        };
-        let next = raw.checked_add(1);
-        let local_flow = LocalFlow {
-            session_id: self.session_id,
-            flow_id,
-            direction: self.role.local_send_direction(),
-            authority_id,
-        };
-        let mut flow = FlowState::new(target, FlowOrigin::Local, self.config);
-        flow.local_flow = Some(local_flow);
-        self.flows.insert(flow_id, flow);
-        self.next_local_flow_id = next;
-        self.next_local_authority_id = authority_id.checked_add(1);
-
-        let mut effects = vec![SessionEffect::LocalFlowOpened { flow: local_flow }];
-        if self.phase == SessionPhase::Active {
-            effects.push(SessionEffect::Transmit(open_frame));
-        }
-        Ok(effects)
-    }
-
-    fn local_data(
-        &mut self,
-        local_flow: LocalFlow,
-        payload: Bytes,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
-        let flow_id = self.validate_local_flow(local_flow)?;
-        self.precheck_flow_live(flow_id)?;
-        self.precheck_local_source_open(flow_id)?;
-        let direction = self.role.local_send_direction();
-        self.precheck_replay_budget(direction, payload.len(), 1)?;
-
-        let (append, owned_payload) = {
-            let flow = self.flow_mut(flow_id)?;
-            let offset = flow.send.next_sent();
-            let append = flow
-                .send
-                .append(offset, payload)
-                .map_err(|source| SessionError::TcpOwnership { flow_id, source })?;
-            let owned_payload = flow
-                .send
-                .replay_view()
-                .last()
-                .filter(|segment| {
-                    segment.offset() == append.offset()
-                        && segment.end_offset() == append.end_offset()
-                })
-                .map(|segment| segment.payload().clone())
-                .ok_or(SessionError::InvariantViolation(
-                    "new sender ownership has no replay view",
-                ))?;
-            (append, owned_payload)
-        };
-        self.add_replay_usage(
-            direction,
-            append.retained_bytes_added(),
-            append.segments_added(),
-        )?;
-
-        let receipt = ReplayStored {
-            local_flow,
-            direction,
-            start: append.offset(),
-            end: append.end_offset(),
-            payload: owned_payload.clone(),
-        };
-        let mut effects = vec![SessionEffect::ReplayStored { receipt }];
-        effects.extend(self.transmit_if_active(Record::Data {
-            flow_id,
-            direction,
-            offset: append.offset(),
-            payload: owned_payload,
-        }));
-        Ok(effects)
-    }
-
-    fn local_close(&mut self, local_flow: LocalFlow) -> Result<Vec<SessionEffect>, SessionError> {
-        let flow_id = self.validate_local_flow(local_flow)?;
-        self.precheck_flow_live(flow_id)?;
-        self.precheck_local_source_open(flow_id)?;
-        let direction = self.role.local_send_direction();
-        let close = {
-            let flow = self.flow_mut(flow_id)?;
-            let final_offset = flow.send.next_sent();
-            flow.send
-                .close(final_offset)
-                .map_err(|source| SessionError::TcpOwnership { flow_id, source })?
-        };
-        if close.final_accepted() {
-            return Ok(Vec::new());
-        }
-        Ok(self.transmit_if_active(Record::Close {
-            flow_id,
-            direction,
-            final_offset: close.final_offset(),
-        }))
-    }
-
-    fn local_reset(
-        &mut self,
-        local_flow: LocalFlow,
-        reason: ResetReason,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
-        let flow_id = self.validate_local_flow(local_flow)?;
-        self.precheck_flow_live(flow_id)?;
-        self.precheck_terminal_capacity()?;
-        let control = Record::Reset { flow_id, reason };
-        let mut effects = self.transmit_if_active(control.clone());
-        effects.extend(self.finish_flow(
-            flow_id,
-            FlowFinishReason::LocalReset(reason),
-            Some(control),
-        )?);
-        Ok(effects)
-    }
-
-    fn peer_open_resolved(
-        &mut self,
-        request: PeerOpenRequest,
-        result: OpenResultCode,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
-        let flow_id = self.validate_peer_open_request(request)?;
-        if self.role != SessionRole::Owner {
-            return Err(SessionError::RoleCannotResolvePeerOpen(self.role));
-        }
-        self.precheck_flow_live(flow_id)?;
-        if result != OpenResultCode::Opened {
-            self.precheck_terminal_capacity()?;
-        } else {
-            self.precheck_sink_activation_after_open(flow_id)?;
-        }
-        {
-            let flow = self.flow_mut(flow_id)?;
-            if flow.origin != FlowOrigin::Peer {
-                return Err(SessionError::FlowOriginMismatch { flow_id });
-            }
-            if let Some(recorded) = flow.peer_open_result {
-                if recorded != result {
-                    return Err(SessionError::ConflictingOpenResult {
-                        flow_id,
-                        recorded,
-                        attempted: result,
-                    });
-                }
-            } else {
-                flow.peer_open_result = Some(result);
-            }
-        }
-        let control = Record::OpenResult { flow_id, result };
-        let mut effects = self.transmit_if_active(control.clone());
-        if result == OpenResultCode::Opened {
-            effects.extend(self.activate_sink_after_open(flow_id)?);
-        } else {
-            effects.extend(self.finish_flow(
-                flow_id,
-                FlowFinishReason::OpenFailed(result),
-                Some(control),
-            )?);
-        }
-        Ok(effects)
-    }
-
-    fn peer_frame(
-        &mut self,
-        leg: CommittedLeg,
-        frame: Frame,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
-        self.validate_current_capability(&leg)?;
-        if self.phase != SessionPhase::Active {
-            return Err(SessionError::PeerFrameWhileLegless);
-        }
-        if frame.leg_generation() != self.current_leg.generation() {
-            return Err(SessionError::FrameGenerationMismatch {
-                current: self.current_leg.generation().get(),
-                actual: frame.leg_generation().get(),
-            });
-        }
-        validate_record(frame.record())
-            .map_err(|source| SessionError::InvalidProtocolRecord { source })?;
-        match frame.record().clone() {
-            Record::Open { flow_id, target } => self.receive_open(flow_id, target),
-            Record::OpenResult { flow_id, result } => self.receive_open_result(flow_id, result),
-            Record::Data {
-                flow_id,
-                direction,
-                offset,
-                payload,
-            } => self.receive_data(flow_id, direction, offset, payload),
-            Record::Ack {
-                flow_id,
-                direction,
-                next_accepted,
-                final_accepted,
-            } => self.receive_ack(flow_id, direction, next_accepted, final_accepted),
-            Record::Close {
-                flow_id,
-                direction,
-                final_offset,
-            } => self.receive_close(flow_id, direction, final_offset),
-            Record::Reset { flow_id, reason } => self.receive_reset(flow_id, reason),
-            Record::Attach { .. }
-            | Record::AttachAccepted { .. }
-            | Record::AttachGenerationStatus { .. } => Err(SessionError::UnexpectedAttachRecord),
-        }
-    }
-
-    fn receive_open(
-        &mut self,
-        flow_id: SessionFlowId,
-        target: TargetAddr,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
-        if self.role != SessionRole::Owner {
-            return Err(SessionError::UnexpectedPeerOpen(self.role));
-        }
-        if let Some(tombstone) = self.terminal_tombstones.get(&flow_id) {
-            if tombstone.target != target {
-                return Err(SessionError::FlowTargetConflict { flow_id });
-            }
-            return Ok(self.replay_terminal_control(tombstone));
-        }
-        if let Some(flow) = self.flows.get(&flow_id) {
-            if flow.target != target {
-                return Err(SessionError::FlowTargetConflict { flow_id });
-            }
-            return Ok(match flow.peer_open_result {
-                Some(result) => self.transmit_if_active(Record::OpenResult { flow_id, result }),
-                None => Vec::new(),
-            });
-        }
-        if flow_id.get() <= self.highest_peer_flow_id {
-            return Err(SessionError::PeerFlowIdNotMonotonic {
-                highest: self.highest_peer_flow_id,
-                attempted: flow_id.get(),
-            });
-        }
-        self.precheck_flow_capacity()?;
-        let request_id = self
-            .next_open_request_id
-            .ok_or(SessionError::OpenRequestIdExhausted)?;
-        let authority_id = self
-            .next_local_authority_id
-            .ok_or(SessionError::LocalFlowAuthorityExhausted)?;
-        let request = PeerOpenRequest {
-            session_id: self.session_id,
-            flow_id,
-            request_id,
-        };
-        let local_flow = LocalFlow {
-            session_id: self.session_id,
-            flow_id,
-            direction: self.role.local_send_direction(),
-            authority_id,
-        };
-        let mut flow = FlowState::new(target.clone(), FlowOrigin::Peer, self.config);
-        flow.peer_open_request = Some(request);
-        flow.local_flow = Some(local_flow);
-        self.flows.insert(flow_id, flow);
-        self.highest_peer_flow_id = flow_id.get();
-        self.next_open_request_id = request_id.checked_add(1);
-        self.next_local_authority_id = authority_id.checked_add(1);
-        Ok(vec![SessionEffect::PeerOpenRequested {
-            request,
-            flow: local_flow,
-            target,
-        }])
-    }
-
-    fn receive_open_result(
-        &mut self,
-        flow_id: SessionFlowId,
-        result: OpenResultCode,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
-        if self.role != SessionRole::Client {
-            return Err(SessionError::UnexpectedPeerOpenResult(self.role));
-        }
-        if let Some(tombstone) = self.terminal_tombstones.get(&flow_id) {
-            return Ok(self.replay_terminal_control(tombstone));
-        }
-        self.precheck_flow_live(flow_id)?;
-        if result != OpenResultCode::Opened {
-            self.precheck_terminal_capacity()?;
-        } else {
-            self.precheck_sink_activation_after_open(flow_id)?;
-        }
-        {
-            let flow = self.flow_mut(flow_id)?;
-            if flow.origin != FlowOrigin::Local {
-                return Err(SessionError::FlowOriginMismatch { flow_id });
-            }
-            if let Some(recorded) = flow.local_open_result {
-                if recorded != result {
-                    return Err(SessionError::ConflictingOpenResult {
-                        flow_id,
-                        recorded,
-                        attempted: result,
-                    });
-                }
-                return Ok(Vec::new());
-            }
-            flow.local_open_result = Some(result);
-            flow.local_open_pending = false;
-        }
-        let mut effects = vec![SessionEffect::LocalOpenResolved { flow_id, result }];
-        if result == OpenResultCode::Opened {
-            effects.extend(self.activate_sink_after_open(flow_id)?);
-        } else {
-            effects.extend(self.finish_flow(
-                flow_id,
-                FlowFinishReason::OpenFailed(result),
-                None,
-            )?);
-        }
-        Ok(effects)
-    }
-
-    fn receive_data(
-        &mut self,
-        flow_id: SessionFlowId,
-        direction: Direction,
-        offset: ByteOffset,
-        payload: Bytes,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
-        self.require_peer_receive_direction(direction)?;
-        if let Some(tombstone) = self.terminal_tombstones.get(&flow_id) {
-            return Ok(self.replay_terminal_control(tombstone));
-        }
-        self.precheck_flow_live(flow_id)?;
-        let (reservation, may_offer) = {
-            let flow = self
-                .flows
-                .get(&flow_id)
-                .ok_or(SessionError::UnknownFlow(flow_id))?;
-            (
-                flow.receive
-                    .preview_receive(offset, &payload)
-                    .map_err(|source| SessionError::TcpOwnership { flow_id, source })?,
-                flow.sink_is_open() && flow.pending_sink_offer.is_none(),
-            )
-        };
-        self.precheck_receive_budget(
-            reservation.buffered_bytes_added(),
-            reservation.ranges_added(),
-        )?;
-        if may_offer && self.next_sink_offer_id.is_none() {
-            return Err(SessionError::SinkOfferIdExhausted);
-        }
-        let expected_bytes = reservation.buffered_bytes_added();
-        let expected_ranges = reservation.ranges_added();
-        let should_offer = {
-            let flow = self.flow_mut(flow_id)?;
-            flow.receive
-                .commit_receive(reservation, offset, payload)
-                .map_err(|source| SessionError::TcpOwnership { flow_id, source })?;
-            flow.pending_sink_offer.is_none() && flow.sink_is_open()
-        };
-        self.add_receive_usage(expected_bytes, expected_ranges)?;
-        if should_offer {
-            self.offer_contiguous(flow_id)
-        } else {
-            Ok(Vec::new())
-        }
-    }
-
-    fn receive_ack(
-        &mut self,
-        flow_id: SessionFlowId,
-        direction: Direction,
-        next_accepted: ByteOffset,
-        final_accepted: bool,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
-        self.require_local_send_direction(direction)?;
-        if let Some(tombstone) = self.terminal_tombstones.get(&flow_id) {
-            return Ok(self.replay_terminal_control(tombstone));
-        }
-        self.precheck_flow_live(flow_id)?;
-        let may_finish = final_accepted
-            && self
-                .flows
-                .get(&flow_id)
-                .ok_or(SessionError::UnknownFlow(flow_id))?
-                .receive_final_accepted;
-        if may_finish {
-            self.precheck_terminal_capacity()?;
-        }
-        let local_flow = self
-            .flows
-            .get(&flow_id)
-            .and_then(|flow| flow.local_flow)
-            .ok_or(SessionError::InvariantViolation(
-                "live flow has no local ACK authority",
-            ))?;
-        let acknowledged = {
-            let flow = self.flow_mut(flow_id)?;
-            flow.send
-                .acknowledge(next_accepted, final_accepted)
-                .map_err(|source| SessionError::TcpOwnership { flow_id, source })?
-        };
-        self.release_replay_usage(
-            direction,
-            acknowledged.retained_bytes_released(),
-            acknowledged.segments_released(),
-        )?;
-        let finished = self
-            .flows
-            .get(&flow_id)
-            .map(|flow| flow.send.final_accepted() && flow.receive_final_accepted)
-            .unwrap_or(false);
-        let accepted_final = self
-            .flows
-            .get(&flow_id)
-            .map(|flow| flow.send.final_accepted())
-            .ok_or(SessionError::UnknownFlow(flow_id))?;
-        let receipt = ReplayAcknowledged {
-            local_flow,
-            generation: self.current_leg.generation(),
-            direction,
-            next_accepted: acknowledged.peer_acked(),
-            final_accepted: accepted_final,
-        };
-        let mut effects = vec![SessionEffect::ReplayAcknowledged { receipt }];
-        if finished {
-            let flow = self
-                .flows
-                .get(&flow_id)
-                .ok_or(SessionError::UnknownFlow(flow_id))?;
-            let control = Record::Ack {
-                flow_id,
-                direction: self.role.peer_receive_direction(),
-                next_accepted: flow.receive.accepted(),
-                final_accepted: true,
-            };
-            effects.extend(self.finish_flow(flow_id, FlowFinishReason::Graceful, Some(control))?);
-        }
-        Ok(effects)
-    }
-
-    fn receive_close(
-        &mut self,
-        flow_id: SessionFlowId,
-        direction: Direction,
-        final_offset: ByteOffset,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
-        self.require_peer_receive_direction(direction)?;
-        if let Some(tombstone) = self.terminal_tombstones.get(&flow_id) {
-            return Ok(self.replay_terminal_control(tombstone));
-        }
-        self.precheck_flow_live(flow_id)?;
-        let may_request_half_close = {
-            let flow = self
-                .flows
-                .get(&flow_id)
-                .ok_or(SessionError::UnknownFlow(flow_id))?;
-            flow.sink_is_open()
-                && final_offset == flow.receive.accepted()
-                && flow.pending_half_close.is_none()
-                && !flow.receive_final_accepted
-        };
-        if may_request_half_close && self.next_half_close_id.is_none() {
-            return Err(SessionError::HalfCloseCompletionIdExhausted);
-        }
-        let (accepted, half_close_ready, final_accepted, sink_is_open) = {
-            let flow = self.flow_mut(flow_id)?;
-            let close = flow
-                .receive
-                .receive_close(final_offset)
-                .map_err(|source| SessionError::TcpOwnership { flow_id, source })?;
-            (
-                flow.receive.accepted(),
-                close.half_close_ready(),
-                flow.receive_final_accepted,
-                flow.sink_is_open(),
-            )
-        };
-        let mut effects = self.transmit_if_active(Record::Ack {
-            flow_id,
-            direction,
-            next_accepted: accepted,
-            final_accepted,
-        });
-        if sink_is_open
-            && half_close_ready
-            && !final_accepted
-            && let Some(effect) = self.begin_half_close(flow_id)?
-        {
-            effects.push(effect);
-        }
-        Ok(effects)
-    }
-
-    fn receive_reset(
-        &mut self,
-        flow_id: SessionFlowId,
-        reason: ResetReason,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
-        if let Some(tombstone) = self.terminal_tombstones.get(&flow_id) {
-            return Ok(self.replay_terminal_control(tombstone));
-        }
-        self.precheck_flow_live(flow_id)?;
-        self.precheck_terminal_capacity()?;
-        let mut effects = vec![SessionEffect::PeerReset { flow_id, reason }];
-        effects.extend(self.finish_flow(flow_id, FlowFinishReason::PeerReset(reason), None)?);
-        Ok(effects)
-    }
-
-    fn sink_accepted(
-        &mut self,
-        offer: SinkOffer,
-        bytes: usize,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
-        self.validate_sink_offer(offer)?;
-        if bytes == 0 {
-            return Err(SessionError::ZeroSinkAcceptance);
-        }
-        if bytes > offer.len {
-            return Err(SessionError::SinkAcceptanceTooLarge {
-                offered: offer.len,
-                attempted: bytes,
-            });
-        }
-        if self.next_sink_offer_id.is_none() {
-            let contiguous = self
-                .flows
-                .get(&offer.flow_id)
-                .ok_or(SessionError::UnknownFlow(offer.flow_id))?
-                .receive
-                .peek_contiguous(usize::MAX)
-                .iter()
-                .try_fold(0usize, |total, segment| total.checked_add(segment.len()))
-                .ok_or(SessionError::InvariantViolation(
-                    "contiguous receive length overflow",
-                ))?;
-            if contiguous > bytes {
-                return Err(SessionError::SinkOfferIdExhausted);
-            }
-        }
-
-        let (accept_preview, will_request_half_close) = {
-            let flow = self
-                .flows
-                .get(&offer.flow_id)
-                .ok_or(SessionError::UnknownFlow(offer.flow_id))?;
-            let preview = flow.receive.preview_accept(bytes).map_err(|source| {
-                SessionError::TcpOwnership {
-                    flow_id: offer.flow_id,
-                    source,
-                }
-            })?;
-            (
-                preview,
-                flow.receive.final_offset() == Some(preview.accepted())
-                    && flow.pending_half_close.is_none()
-                    && !flow.receive_final_accepted,
-            )
-        };
-        if accept_preview.accepted_bytes() != bytes {
-            return Err(SessionError::InvariantViolation(
-                "sink offer exceeds contiguous TCP receive ownership",
-            ));
-        }
-        if will_request_half_close && self.next_half_close_id.is_none() {
-            return Err(SessionError::HalfCloseCompletionIdExhausted);
-        }
-        if self.receive_usage.bytes < bytes
-            || self.receive_usage.segments < accept_preview.ranges_released()
-        {
-            return Err(SessionError::InvariantViolation(
-                "sink acceptance exceeds global receive ownership",
-            ));
-        }
-
-        let (accepted, half_close_ready, final_accepted) = {
-            let flow = self.flow_mut(offer.flow_id)?;
-            let accepted =
-                flow.receive
-                    .accept(bytes)
-                    .map_err(|source| SessionError::TcpOwnership {
-                        flow_id: offer.flow_id,
-                        source,
-                    })?;
-            debug_assert_eq!(accepted.accepted_bytes(), accept_preview.accepted_bytes());
-            debug_assert_eq!(accepted.ranges_released(), accept_preview.ranges_released());
-            flow.pending_sink_offer = None;
-            (
-                accepted.accepted(),
-                flow.receive.half_close_ready(),
-                flow.receive_final_accepted,
-            )
-        };
-        self.release_receive_usage(bytes, accept_preview.ranges_released())?;
-
-        let mut effects = self.transmit_if_active(Record::Ack {
-            flow_id: offer.flow_id,
-            direction: offer.direction,
-            next_accepted: accepted,
-            final_accepted,
-        });
-        if half_close_ready
-            && !final_accepted
-            && let Some(effect) = self.begin_half_close(offer.flow_id)?
-        {
-            effects.push(effect);
-        }
-        effects.extend(self.offer_contiguous(offer.flow_id)?);
-        Ok(effects)
-    }
-
-    fn sink_abandoned(&mut self, offer: SinkOffer) -> Result<Vec<SessionEffect>, SessionError> {
-        self.validate_sink_offer(offer)?;
-        self.precheck_terminal_capacity()?;
-        let control = Record::Reset {
-            flow_id: offer.flow_id,
-            reason: ResetReason::LocalAbandon,
-        };
-        let mut effects = self.transmit_if_active(control.clone());
-        effects.extend(self.finish_flow(
-            offer.flow_id,
-            FlowFinishReason::LocalReset(ResetReason::LocalAbandon),
-            Some(control),
-        )?);
-        Ok(effects)
-    }
-
-    fn sink_half_closed(
-        &mut self,
-        completion: SinkHalfClose,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
-        let flow_id = self.validate_half_close(completion)?;
-        let will_finish = self
-            .flows
-            .get(&flow_id)
-            .ok_or(SessionError::UnknownFlow(flow_id))?
-            .send
-            .final_accepted();
-        if will_finish {
-            self.precheck_terminal_capacity()?;
-        }
-        let accepted = {
-            let flow = self.flow_mut(flow_id)?;
-            flow.pending_half_close = None;
-            flow.receive_final_accepted = true;
-            flow.receive.accepted()
-        };
-        let control = Record::Ack {
-            flow_id,
-            direction: completion.direction,
-            next_accepted: accepted,
-            final_accepted: true,
-        };
-        let mut effects = self.transmit_if_active(control.clone());
-        if will_finish {
-            effects.extend(self.finish_flow(flow_id, FlowFinishReason::Graceful, Some(control))?);
-        }
-        Ok(effects)
-    }
-
-    fn sink_half_close_failed(
-        &mut self,
-        completion: SinkHalfClose,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
-        let flow_id = self.validate_half_close(completion)?;
-        self.precheck_terminal_capacity()?;
-        let reason = ResetReason::LocalAbandon;
-        let control = Record::Reset { flow_id, reason };
-        let mut effects = self.transmit_if_active(control.clone());
-        effects.extend(self.finish_flow(
-            flow_id,
-            FlowFinishReason::LocalReset(reason),
-            Some(control),
-        )?);
-        Ok(effects)
-    }
-
-    fn expire_terminal_grace(
-        &mut self,
-        terminal: TerminalGrace,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
-        if terminal.session_id() != self.session_id {
-            return Err(SessionError::CrossSessionTerminalGrace);
-        }
-        let flow_id = terminal.flow_id();
-        let tombstone = self
-            .terminal_tombstones
-            .get(&flow_id)
-            .ok_or(SessionError::UnknownTerminalGrace)?;
-        if tombstone.terminal != terminal {
-            return Err(SessionError::UnknownTerminalGrace);
-        }
-        self.terminal_tombstones.remove(&flow_id);
-        Ok(Vec::new())
+        let recovery = self.recovery_effects_for(accepted_leg.generation())?;
+        Ok(PreparedReplacement {
+            _expected_current_leg: self.current_leg,
+            _expected_phase: self.phase,
+            model: self,
+            candidate: accepted_leg,
+            recovery,
+        })
     }
 
     fn validate_current_capability(&self, leg: &CommittedLeg) -> Result<(), SessionError> {
@@ -2077,7 +1602,7 @@ impl SessionModel {
     }
 
     fn precheck_flow_capacity(&self) -> Result<(), SessionError> {
-        if self.flows.len() >= self.config.max_flows() {
+        if self.flow_storage.len() >= self.config.max_flows() {
             return Err(SessionError::FlowCapacityExceeded {
                 max: self.config.max_flows(),
             });
@@ -2086,14 +1611,14 @@ impl SessionModel {
     }
 
     fn precheck_flow_live(&self, flow_id: SessionFlowId) -> Result<(), SessionError> {
-        if !self.flows.contains_key(&flow_id) {
+        if !self.flow_storage.contains_key(&flow_id) {
             let below_high_water = match self.role {
                 SessionRole::Client => self
                     .next_local_flow_id
                     .is_none_or(|next| flow_id.get() < next),
                 SessionRole::Owner => flow_id.get() <= self.highest_peer_flow_id,
             };
-            if self.terminal_tombstones.contains_key(&flow_id) || below_high_water {
+            if self.flow_storage.contains_terminal(&flow_id) || below_high_water {
                 return Err(SessionError::RetiredFlow(flow_id));
             }
             return Err(SessionError::UnknownFlow(flow_id));
@@ -2107,7 +1632,7 @@ impl SessionModel {
         }
         self.precheck_flow_live(local_flow.flow_id)?;
         let flow = self
-            .flows
+            .flow_storage
             .get(&local_flow.flow_id)
             .ok_or(SessionError::UnknownFlow(local_flow.flow_id))?;
         if flow.local_flow != Some(local_flow) {
@@ -2118,7 +1643,7 @@ impl SessionModel {
 
     fn precheck_local_source_open(&self, flow_id: SessionFlowId) -> Result<(), SessionError> {
         let flow = self
-            .flows
+            .flow_storage
             .get(&flow_id)
             .ok_or(SessionError::UnknownFlow(flow_id))?;
         if self.role == SessionRole::Owner
@@ -2139,7 +1664,7 @@ impl SessionModel {
         }
         self.precheck_flow_live(request.flow_id)?;
         let flow = self
-            .flows
+            .flow_storage
             .get(&request.flow_id)
             .ok_or(SessionError::UnknownFlow(request.flow_id))?;
         if flow.peer_open_request != Some(request) {
@@ -2157,7 +1682,7 @@ impl SessionModel {
         }
         self.precheck_flow_live(completion.flow_id)?;
         let flow = self
-            .flows
+            .flow_storage
             .get(&completion.flow_id)
             .ok_or(SessionError::UnknownFlow(completion.flow_id))?;
         if flow.pending_half_close != Some(completion) {
@@ -2167,7 +1692,7 @@ impl SessionModel {
     }
 
     fn precheck_terminal_capacity(&self) -> Result<(), SessionError> {
-        if self.terminal_tombstones.len() >= self.config.max_terminal_tombstones() {
+        if self.flow_storage.terminal_len() >= self.config.max_terminal_tombstones() {
             return Err(SessionError::TerminalTombstoneCapacityExceeded {
                 max: self.config.max_terminal_tombstones(),
             });
@@ -2179,7 +1704,7 @@ impl SessionModel {
     }
 
     fn flow_mut(&mut self, flow_id: SessionFlowId) -> Result<&mut FlowState, SessionError> {
-        self.flows
+        self.flow_storage
             .get_mut(&flow_id)
             .ok_or(SessionError::UnknownFlow(flow_id))
     }
@@ -2330,34 +1855,6 @@ impl SessionModel {
         Ok(())
     }
 
-    fn add_receive_usage(&mut self, bytes: usize, ranges: usize) -> Result<(), SessionError> {
-        self.receive_usage.bytes =
-            self.receive_usage
-                .bytes
-                .checked_add(bytes)
-                .ok_or(SessionError::InvariantViolation(
-                    "global receive byte accounting overflow",
-                ))?;
-        self.receive_usage.segments = self.receive_usage.segments.checked_add(ranges).ok_or(
-            SessionError::InvariantViolation("global receive range accounting overflow"),
-        )?;
-        Ok(())
-    }
-
-    fn release_receive_usage(&mut self, bytes: usize, ranges: usize) -> Result<(), SessionError> {
-        self.receive_usage.bytes =
-            self.receive_usage
-                .bytes
-                .checked_sub(bytes)
-                .ok_or(SessionError::InvariantViolation(
-                    "global receive byte accounting underflow",
-                ))?;
-        self.receive_usage.segments = self.receive_usage.segments.checked_sub(ranges).ok_or(
-            SessionError::InvariantViolation("global receive range accounting underflow"),
-        )?;
-        Ok(())
-    }
-
     fn validate_sink_offer(&self, offer: SinkOffer) -> Result<(), SessionError> {
         if offer.session_id != self.session_id {
             return Err(SessionError::CrossSessionSinkOffer);
@@ -2366,7 +1863,7 @@ impl SessionModel {
             return Err(SessionError::SinkOfferMismatch);
         }
         let flow = self
-            .flows
+            .flow_storage
             .get(&offer.flow_id)
             .ok_or(SessionError::UnknownFlow(offer.flow_id))?;
         if flow.pending_sink_offer != Some(offer) {
@@ -2378,223 +1875,69 @@ impl SessionModel {
     fn precheck_sink_activation_after_open(
         &self,
         flow_id: SessionFlowId,
-    ) -> Result<(), SessionError> {
+    ) -> Result<bool, SessionError> {
         let flow = self
-            .flows
+            .flow_storage
             .get(&flow_id)
             .ok_or(SessionError::UnknownFlow(flow_id))?;
-        if flow.pending_sink_offer.is_none()
-            && !flow
+        let will_offer = flow.pending_sink_offer.is_none()
+            && flow
                 .receive
-                .peek_contiguous(self.config.max_sink_offer_bytes())
-                .is_empty()
-            && self.next_sink_offer_id.is_none()
-        {
+                .contiguous_len(self.config.max_sink_offer_bytes())
+                > 0;
+        if will_offer && self.next_sink_offer_id.is_none() {
             return Err(SessionError::SinkOfferIdExhausted);
         }
-        if flow.receive.half_close_ready()
+        let will_half_close = flow.receive.half_close_ready()
             && flow.pending_half_close.is_none()
-            && !flow.receive_final_accepted
-            && self.next_half_close_id.is_none()
-        {
+            && !flow.receive_final_accepted;
+        if will_half_close && self.next_half_close_id.is_none() {
             return Err(SessionError::HalfCloseCompletionIdExhausted);
         }
-        Ok(())
+        Ok(will_offer || will_half_close)
     }
 
-    fn activate_sink_after_open(
-        &mut self,
-        flow_id: SessionFlowId,
+    fn recovery_effects_for(
+        &self,
+        generation: LegGeneration,
     ) -> Result<Vec<SessionEffect>, SessionError> {
-        let mut effects = self.offer_contiguous(flow_id)?;
-        let should_half_close = {
-            let flow = self
-                .flows
-                .get(&flow_id)
-                .ok_or(SessionError::UnknownFlow(flow_id))?;
-            flow.receive.half_close_ready()
-                && flow.pending_half_close.is_none()
-                && !flow.receive_final_accepted
+        // Count the same immutable original recovery before allocating or
+        // touching generation/phase. No dense configured maximum or ordinary
+        // spare is used. Every following push fits this exact original backing.
+        let mut required = 1usize;
+        let mut charge = |count: usize| -> Result<(), SessionError> {
+            required = required
+                .checked_add(count)
+                .ok_or(SessionError::EffectStorageLayout)?;
+            Ok(())
         };
-        if should_half_close && let Some(effect) = self.begin_half_close(flow_id)? {
-            effects.push(effect);
+        for tombstone in self.flow_storage.terminal_values() {
+            charge(usize::from(tombstone.replay_control.is_some()))?;
         }
-        Ok(effects)
-    }
-
-    fn offer_contiguous(
-        &mut self,
-        flow_id: SessionFlowId,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
-        let segments = {
-            let flow = self
-                .flows
-                .get(&flow_id)
-                .ok_or(SessionError::UnknownFlow(flow_id))?;
-            if flow.pending_sink_offer.is_some() || !flow.sink_is_open() {
-                return Ok(Vec::new());
-            }
-            flow.receive
-                .peek_contiguous(self.config.max_sink_offer_bytes())
-        };
-        if segments.is_empty() {
-            return Ok(Vec::new());
-        }
-        let len = segments
-            .iter()
-            .try_fold(0usize, |total, segment| total.checked_add(segment.len()))
-            .ok_or(SessionError::InvariantViolation(
-                "sink offer length overflow",
+        for flow in self.flow_storage.values() {
+            charge(usize::from(
+                flow.origin == FlowOrigin::Local && flow.local_open_pending,
             ))?;
-        let offset = segments[0].offset();
-        let id = self
-            .next_sink_offer_id
-            .ok_or(SessionError::SinkOfferIdExhausted)?;
-        let offer = SinkOffer {
-            session_id: self.session_id,
-            id,
-            flow_id,
-            direction: self.role.peer_receive_direction(),
-            offset,
-            len,
-        };
-        self.next_sink_offer_id = id.checked_add(1);
-        self.flow_mut(flow_id)?.pending_sink_offer = Some(offer);
-        Ok(vec![SessionEffect::OfferToSink { offer, segments }])
-    }
-
-    fn begin_half_close(
-        &mut self,
-        flow_id: SessionFlowId,
-    ) -> Result<Option<SessionEffect>, SessionError> {
-        let flow = self
-            .flows
-            .get(&flow_id)
-            .ok_or(SessionError::UnknownFlow(flow_id))?;
-        if flow.receive_final_accepted || flow.pending_half_close.is_some() {
-            return Ok(None);
-        }
-        if !flow.receive.half_close_ready() {
-            return Err(SessionError::InvariantViolation(
-                "half-close requested before final bytes were accepted",
-            ));
-        }
-        let id = self
-            .next_half_close_id
-            .ok_or(SessionError::HalfCloseCompletionIdExhausted)?;
-        let completion = SinkHalfClose {
-            session_id: self.session_id,
-            flow_id,
-            direction: self.role.peer_receive_direction(),
-            final_offset: flow.receive.accepted(),
-            completion_id: id,
-        };
-        self.next_half_close_id = id.checked_add(1);
-        self.flow_mut(flow_id)?.pending_half_close = Some(completion);
-        Ok(Some(SessionEffect::HalfCloseSink { completion }))
-    }
-
-    fn finish_flow(
-        &mut self,
-        flow_id: SessionFlowId,
-        reason: FlowFinishReason,
-        replay_control: Option<Record>,
-    ) -> Result<Vec<SessionEffect>, SessionError> {
-        self.precheck_terminal_capacity()?;
-        let direction = self.role.local_send_direction();
-        let (local_flow, target, send_bytes, send_segments, receive_bytes, receive_ranges) = {
-            let flow = self
-                .flows
-                .get(&flow_id)
-                .ok_or(SessionError::UnknownFlow(flow_id))?;
-            let send = flow.send.snapshot();
+            charge(usize::from(
+                flow.origin == FlowOrigin::Peer && flow.peer_open_result.is_some(),
+            ))?;
             let receive = flow.receive.snapshot();
-            (
-                flow.local_flow.ok_or(SessionError::InvariantViolation(
-                    "terminal flow has no local authority",
-                ))?,
-                flow.target.clone(),
-                send.retained_bytes(),
-                send.segment_count(),
-                receive.buffered_bytes(),
-                receive.range_count(),
-            )
-        };
-        let usage = self.replay_usage(direction);
-        if usage.bytes < send_bytes || usage.segments < send_segments {
-            return Err(SessionError::InvariantViolation(
-                "terminal flow release exceeds global replay ownership",
-            ));
+            charge(usize::from(
+                receive.accepted().get() > 0
+                    || receive.buffered_bytes() > 0
+                    || receive.final_offset().is_some(),
+            ))?;
+            charge(flow.send.segment_count())?;
+            charge(usize::from(
+                flow.send.final_offset().is_some() && !flow.send.final_accepted(),
+            ))?;
         }
-        if self.receive_usage.bytes < receive_bytes || self.receive_usage.segments < receive_ranges
-        {
-            return Err(SessionError::InvariantViolation(
-                "terminal flow release exceeds global receive ownership",
-            ));
-        }
-        if self.terminal_tombstones.contains_key(&flow_id) {
-            return Err(SessionError::InvariantViolation(
-                "live flow already has terminal tombstone",
-            ));
-        }
-        let tombstone_id = self
-            .next_tombstone_id
-            .ok_or(SessionError::TerminalTombstoneIdExhausted)?;
-        let terminal = TerminalGrace {
-            local_flow,
-            tombstone_id,
-        };
-
-        self.flows
-            .remove(&flow_id)
-            .ok_or(SessionError::UnknownFlow(flow_id))?;
-        let usage = self.replay_usage_mut(direction);
-        usage.bytes -= send_bytes;
-        usage.segments -= send_segments;
-        self.receive_usage.bytes -= receive_bytes;
-        self.receive_usage.segments -= receive_ranges;
-        self.next_tombstone_id = tombstone_id.checked_add(1);
-        self.terminal_tombstones.insert(
-            flow_id,
-            TerminalTombstone {
-                terminal,
-                target,
-                replay_control,
-            },
-        );
-        Ok(vec![SessionEffect::FlowFinished {
-            flow_id,
-            reason,
-            terminal,
-        }])
-    }
-
-    fn replay_terminal_control(&self, tombstone: &TerminalTombstone) -> Vec<SessionEffect> {
-        tombstone
-            .replay_control
-            .clone()
-            .map(|control| self.transmit_if_active(control))
-            .unwrap_or_default()
-    }
-
-    fn transmit_if_active(&self, record: Record) -> Vec<SessionEffect> {
-        if self.phase == SessionPhase::Active {
-            vec![SessionEffect::Transmit(Frame::new(
-                self.current_leg.generation(),
-                record,
-            ))]
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn recovery_effects(&self) -> Vec<SessionEffect> {
-        let generation = self.current_leg.generation();
-        let mut effects = vec![SessionEffect::LegActivated { generation }];
+        let mut effects = exact_vec(required)?;
+        effects.push(SessionEffect::LegActivated { generation });
         let local_direction = self.role.local_send_direction();
         let peer_direction = self.role.peer_receive_direction();
 
-        for tombstone in self.terminal_tombstones.values() {
+        for tombstone in self.flow_storage.terminal_values() {
             if let Some(control) = &tombstone.replay_control {
                 effects.push(SessionEffect::Transmit(Frame::new(
                     generation,
@@ -2603,7 +1946,7 @@ impl SessionModel {
             }
         }
 
-        for (&flow_id, flow) in &self.flows {
+        for (&flow_id, flow) in self.flow_storage.iter() {
             if flow.origin == FlowOrigin::Local && flow.local_open_pending {
                 effects.push(SessionEffect::Transmit(Frame::new(
                     generation,
@@ -2662,7 +2005,7 @@ impl SessionModel {
                 )));
             }
         }
-        effects
+        Ok(effects)
     }
 }
 
@@ -2728,6 +2071,16 @@ pub enum SessionConfigError {
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum SessionError {
+    #[error("session flow storage layout is invalid")]
+    FlowStorageLayout,
+    #[error("session flow storage reserve failed")]
+    FlowStorageReserve,
+    #[error("session effect storage layout is invalid")]
+    EffectStorageLayout,
+    #[error("session effect storage reserve failed")]
+    EffectStorageReserve,
+    #[error("session effect batch exceeded its prepared bound")]
+    EffectStorageOverflow,
     #[error("leg belongs to session {actual:?}, expected {expected:?}")]
     CrossSessionLeg {
         expected: SessionId,
@@ -2753,12 +2106,16 @@ pub enum SessionError {
     SessionExpired,
     #[error("{0:?} role cannot accept an owner-side replacement ATTACH")]
     RoleCannotAcceptOwnerAttach(SessionRole),
+    #[error("{0:?} role cannot enter the client replacement transaction")]
+    RoleCannotAcceptClientAttach(SessionRole),
     #[error("resume grace is not active")]
     ResumeGraceNotActive,
     #[error("peer frame arrived while the session has no active leg")]
     PeerFrameWhileLegless,
     #[error("{0:?} role cannot initiate a Target OPEN")]
     RoleCannotInitiateOpen(SessionRole),
+    #[error("prepared local OPEN requires an active session, got {actual:?}")]
+    PreparedLocalOpenRequiresActive { actual: SessionPhase },
     #[error("{0:?} role cannot resolve a peer Target OPEN")]
     RoleCannotResolvePeerOpen(SessionRole),
     #[error("{0:?} role cannot receive a peer OPEN")]
@@ -2771,6 +2128,8 @@ pub enum SessionError {
     FlowIdExhausted,
     #[error("local flow authority id space is exhausted")]
     LocalFlowAuthorityExhausted,
+    #[error("local OPEN effect materialization allocation failed")]
+    LocalOpenEffectAllocationFailed,
     #[error("peer OPEN request id space is exhausted")]
     OpenRequestIdExhausted,
     #[error("peer flow id {attempted} is not above high-water mark {highest}")]
@@ -2861,6 +2220,16 @@ pub enum SessionError {
     InvariantViolation(&'static str),
 }
 
+impl From<EffectStorageError> for SessionError {
+    fn from(error: EffectStorageError) -> Self {
+        match error {
+            EffectStorageError::Layout => Self::EffectStorageLayout,
+            EffectStorageError::Reserve => Self::EffectStorageReserve,
+            EffectStorageError::Bound | EffectStorageError::Overflow => Self::EffectStorageOverflow,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -2893,6 +2262,8 @@ mod tests {
 
     const _: fn() = || {
         let _ = <PreflightedReplacement<'static> as AmbiguousIfClone<_>>::marker;
+        let _ = <PreparedLocalOpen<'static> as AmbiguousIfClone<_>>::marker;
+        let _ = <ReducerCommittedLocalOpen<()> as AmbiguousIfClone<_>>::marker;
     };
 
     struct LegIssuer {
@@ -3053,7 +2424,12 @@ mod tests {
     }
 
     fn local_flow(model: &SessionModel, flow_id: SessionFlowId) -> LocalFlow {
-        model.flows.get(&flow_id).unwrap().local_flow.unwrap()
+        model
+            .flow_storage
+            .get(&flow_id)
+            .unwrap()
+            .local_flow
+            .unwrap()
     }
 
     fn peer_open(
@@ -3109,6 +2485,199 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn client_pending_effect_bound_takes_the_larger_exclusive_phase() {
+        let config = config_with_limits(1, 1, 64, 1, 64, 1);
+        let recovery = config.client_recovery_effect_bound().unwrap();
+
+        assert_eq!(config.client_incremental_effect_bound(), 2);
+        assert_eq!(config.client_pending_effect_bound(), Some(recovery));
+        assert_ne!(
+            config.client_pending_effect_bound(),
+            recovery.checked_add(2)
+        );
+    }
+
+    #[test]
+    fn client_pending_effect_bound_preserves_recovery_overflow() {
+        let config = config_with_limits(usize::MAX, 1, 64, 1, 64, 1);
+
+        assert_eq!(config.client_incremental_effect_bound(), 2);
+        assert_eq!(config.client_recovery_effect_bound(), None);
+        assert_eq!(config.client_pending_effect_bound(), None);
+    }
+
+    #[test]
+    fn client_incremental_effect_bound_is_tight_for_open_driver_and_inbound() {
+        let issuer = LegIssuer::new(0x35);
+        let leg = issuer.issue(2);
+        let mut model = SessionModel::new(SessionRole::Client, config(), leg);
+        let bound = model.config().client_incremental_effect_bound();
+
+        let open = model
+            .reduce(SessionEvent::LocalOpen {
+                leg,
+                target: target(443),
+            })
+            .unwrap();
+        assert_eq!(open.len(), bound);
+        let local = match open.as_slice() {
+            [
+                SessionEffect::LocalFlowOpened { flow },
+                SessionEffect::Transmit(frame),
+            ] if matches!(frame.record(), Record::Open { flow_id, .. } if *flow_id == flow.flow_id()) => {
+                *flow
+            }
+            other => panic!("expected LocalFlowOpened + OPEN transmit, got {other:?}"),
+        };
+
+        model
+            .reduce(SessionEvent::PeerFrame {
+                leg,
+                frame: frame(
+                    leg,
+                    Record::OpenResult {
+                        flow_id: local.flow_id(),
+                        result: OpenResultCode::Opened,
+                    },
+                ),
+            })
+            .unwrap();
+        let driver = model
+            .reduce(SessionEvent::LocalData {
+                flow: local,
+                payload: Bytes::from_static(b"x"),
+            })
+            .unwrap();
+        assert_eq!(driver.len(), bound);
+        assert!(matches!(
+            driver.as_slice(),
+            [
+                SessionEffect::ReplayStored { .. },
+                SessionEffect::Transmit(frame),
+            ] if matches!(frame.record(), Record::Data { flow_id, payload, .. }
+                if *flow_id == local.flow_id() && payload.as_ref() == b"x")
+        ));
+
+        let inbound = model
+            .reduce(SessionEvent::PeerFrame {
+                leg,
+                frame: frame(
+                    leg,
+                    Record::Reset {
+                        flow_id: local.flow_id(),
+                        reason: ResetReason::TargetFailure,
+                    },
+                ),
+            })
+            .unwrap();
+        assert_eq!(inbound.len(), bound);
+        assert!(matches!(
+            inbound.as_slice(),
+            [
+                SessionEffect::PeerReset {
+                    flow_id,
+                    reason: ResetReason::TargetFailure,
+                },
+                SessionEffect::FlowFinished {
+                    flow_id: finished,
+                    reason: FlowFinishReason::PeerReset(ResetReason::TargetFailure),
+                    ..
+                },
+            ] if *flow_id == local.flow_id() && *finished == local.flow_id()
+        ));
+    }
+
+    #[test]
+    fn sink_acceptance_offers_more_or_half_closes_but_never_both() {
+        let issuer = LegIssuer::new(0x36);
+        let leg = issuer.issue(2);
+        let mut model = SessionModel::new(SessionRole::Client, config(), leg);
+        let flow_id = local_open(&mut model, leg, target(443));
+        let bound = model.config().client_incremental_effect_bound();
+        model
+            .reduce(SessionEvent::PeerFrame {
+                leg,
+                frame: frame(
+                    leg,
+                    Record::OpenResult {
+                        flow_id,
+                        result: OpenResultCode::Opened,
+                    },
+                ),
+            })
+            .unwrap();
+
+        let received = model
+            .reduce(SessionEvent::PeerFrame {
+                leg,
+                frame: frame(
+                    leg,
+                    Record::Data {
+                        flow_id,
+                        direction: Direction::TargetToClient,
+                        offset: ByteOffset::new(0),
+                        payload: Bytes::from_static(b"abcdef"),
+                    },
+                ),
+            })
+            .unwrap();
+        let (offer, _) = only_offer(&received);
+        let partial = model
+            .reduce(SessionEvent::SinkAccepted { offer, bytes: 3 })
+            .unwrap();
+        assert_eq!(partial.len(), bound);
+        let remaining = partial
+            .iter()
+            .find_map(|effect| match effect {
+                SessionEffect::OfferToSink { offer, .. } => Some(*offer),
+                _ => None,
+            })
+            .expect("partial acceptance must offer the remaining contiguous bytes");
+        assert!(
+            !partial
+                .iter()
+                .any(|effect| matches!(effect, SessionEffect::HalfCloseSink { .. }))
+        );
+
+        let close = model
+            .reduce(SessionEvent::PeerFrame {
+                leg,
+                frame: frame(
+                    leg,
+                    Record::Close {
+                        flow_id,
+                        direction: Direction::TargetToClient,
+                        final_offset: ByteOffset::new(6),
+                    },
+                ),
+            })
+            .unwrap();
+        assert!(
+            !close
+                .iter()
+                .any(|effect| matches!(effect, SessionEffect::HalfCloseSink { .. }))
+        );
+
+        let final_acceptance = model
+            .reduce(SessionEvent::SinkAccepted {
+                offer: remaining,
+                bytes: 3,
+            })
+            .unwrap();
+        assert_eq!(final_acceptance.len(), bound);
+        assert!(
+            final_acceptance
+                .iter()
+                .any(|effect| matches!(effect, SessionEffect::HalfCloseSink { .. }))
+        );
+        assert!(
+            !final_acceptance
+                .iter()
+                .any(|effect| matches!(effect, SessionEffect::OfferToSink { .. }))
+        );
     }
 
     #[test]
@@ -3248,12 +2817,16 @@ mod tests {
         // `preflight_replacement`; there is no install method accepting a bare
         // `CommittedLeg`. Its exclusive borrow also makes any intervening
         // reducer mutation fail to compile.
-        fn install(preflighted: PreflightedReplacement<'_>) -> Vec<SessionEffect> {
-            preflighted.install()
+        fn install(prepared: PreparedReplacement<'_>) -> Vec<SessionEffect> {
+            prepared.install()
         }
 
-        let preflighted = model.preflight_replacement(leg3).unwrap();
-        let effects = install(preflighted);
+        let prepared = model
+            .preflight_replacement(leg3)
+            .unwrap()
+            .prepare_recovery()
+            .unwrap();
+        let effects = install(prepared);
         assert_eq!(before.generation().get(), 2);
         assert_eq!(model.snapshot().generation().get(), 3);
         assert!(matches!(
@@ -3446,7 +3019,9 @@ mod tests {
         assert_eq!(receipt.flow_id(), flow_id);
         assert_eq!(receipt.generation(), leg3.generation());
         assert_eq!(receipt.direction(), Direction::ClientToTarget);
+        assert_eq!(receipt.previous_accepted(), ByteOffset::new(0));
         assert_eq!(receipt.next_accepted(), ByteOffset::new(4));
+        assert_eq!(receipt.released_bytes(), 4);
         assert!(!receipt.final_accepted());
         assert!(!format!("{receipt:?}").contains("data"));
     }
@@ -4682,7 +4257,10 @@ mod tests {
             Err(SessionError::SinkOfferIdExhausted)
         );
         assert_eq!(model.snapshot(), before);
-        assert_eq!(model.flows[&data_id].peer_open_result, None);
+        assert_eq!(
+            model.flow_storage.get(&data_id).unwrap().peer_open_result,
+            None
+        );
         model.next_sink_offer_id = Some(1);
 
         let close_id = SessionFlowId::new(2).unwrap();
@@ -4711,7 +4289,10 @@ mod tests {
             Err(SessionError::HalfCloseCompletionIdExhausted)
         );
         assert_eq!(model.snapshot(), before);
-        assert_eq!(model.flows[&close_id].peer_open_result, None);
+        assert_eq!(
+            model.flow_storage.get(&close_id).unwrap().peer_open_result,
+            None
+        );
     }
 
     #[test]
@@ -5341,6 +4922,209 @@ mod tests {
         ));
         assert_eq!(model.snapshot(), before);
         assert_eq!(model.snapshot().flow_count(), 0);
+    }
+
+    #[test]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the test verifies exact prepared OPEN ownership is returned inline"
+    )]
+    fn prepared_local_open_adapter_rejection_leaves_ids_flows_and_effects_uncommitted() {
+        let issuer = LegIssuer::new(0x6a);
+        let leg = issuer.issue(2);
+        let mut model = SessionModel::new(SessionRole::Client, config(), leg);
+        let before = model.snapshot();
+        let adapter_ownership = Bytes::from(vec![0x5a; 17]);
+        let adapter_ptr = adapter_ownership.as_ptr();
+
+        let rejected = model
+            .install_prepared_client_local_open(leg, target(443), |input| {
+                assert_eq!(input.local_flow().flow_id(), SessionFlowId::new(1).unwrap());
+                assert!(matches!(
+                    input.open_frame().record(),
+                    Record::Open { flow_id, target: opened_target }
+                        if *flow_id == input.local_flow().flow_id()
+                            && opened_target == &target(443)
+                ));
+                Err::<(), _>(input.reject(adapter_ownership))
+            })
+            .expect("reducer preflight succeeds")
+            .expect_err("adapter rejection remains distinct from reducer rejection");
+        let (_target, input, rejected) = rejected.into_parts();
+        let (returned_flow, returned_frame) = input.into_parts();
+
+        assert_eq!(rejected.as_ptr(), adapter_ptr);
+        assert_eq!(returned_flow.flow_id(), SessionFlowId::new(1).unwrap());
+        assert!(matches!(
+            returned_frame.record(),
+            Record::Open { flow_id, target: opened_target }
+                if *flow_id == returned_flow.flow_id() && opened_target == &target(443)
+        ));
+        assert_eq!(model.snapshot(), before);
+        assert_eq!(model.snapshot().next_local_flow_id(), Some(1));
+        assert_eq!(model.snapshot().flow_count(), 0);
+    }
+
+    #[test]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the test exercises the same exact prepared OPEN rejection type"
+    )]
+    fn prepared_local_open_returns_exact_target_backing_on_validation_rejection() {
+        let issuer = LegIssuer::new(0x6c);
+        let leg = issuer.issue(2);
+        let mut model = SessionModel::new(SessionRole::Client, config(), leg);
+        let before = model.snapshot();
+        let mut host = String::with_capacity(4_096);
+        host.push_str(&"x".repeat(254));
+        let host_ptr = host.as_ptr();
+        let host_capacity = host.capacity();
+        let input = TargetAddr::DomainPort { host, port: 443 };
+
+        let failure = model
+            .install_prepared_client_local_open(leg, input, |input| {
+                Ok::<_, PreparedLocalOpenAdapterRejection<()>>(input)
+            })
+            .expect_err("oversized domain fails before adapter preparation");
+        let (returned, error) = failure.into_parts();
+        let TargetAddr::DomainPort { host, port } = returned else {
+            panic!("exact domain target changed variant");
+        };
+
+        assert_eq!(port, 443);
+        assert_eq!(host.as_ptr(), host_ptr);
+        assert_eq!(host.capacity(), host_capacity);
+        assert!(matches!(
+            error,
+            SessionError::InvalidProtocolRecord {
+                source: ProtocolError::InvalidDomainLength { len: 254, .. }
+            }
+        ));
+        assert_eq!(model.snapshot(), before);
+    }
+
+    #[test]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the test verifies exact prepared OPEN ownership is returned inline"
+    )]
+    fn prepared_local_open_returns_exact_valid_target_when_adapter_rejects() {
+        let issuer = LegIssuer::new(0x6d);
+        let leg = issuer.issue(2);
+        let mut model = SessionModel::new(SessionRole::Client, config(), leg);
+        let before = model.snapshot();
+        let mut host = String::with_capacity(4_096);
+        host.push_str("bounded.example");
+        let host_ptr = host.as_ptr();
+        let host_capacity = host.capacity();
+        let input = TargetAddr::DomainPort { host, port: 8443 };
+
+        let failure = model
+            .install_prepared_client_local_open(leg, input, |input| {
+                Err::<(), _>(input.reject(0x77_u8))
+            })
+            .expect("valid target reaches adapter")
+            .expect_err("adapter rejects before reducer commit");
+        let (returned, prepared_input, marker) = failure.into_parts();
+        let (returned_flow, returned_frame) = prepared_input.into_parts();
+        let TargetAddr::DomainPort { host, port } = returned else {
+            panic!("exact domain target changed variant");
+        };
+
+        assert_eq!(marker, 0x77);
+        assert_eq!(port, 8443);
+        assert_eq!(host.as_ptr(), host_ptr);
+        assert_eq!(host.capacity(), host_capacity);
+        assert_eq!(returned_flow.flow_id(), SessionFlowId::new(1).unwrap());
+        assert!(matches!(
+            returned_frame.record(),
+            Record::Open { flow_id, target }
+                if *flow_id == returned_flow.flow_id()
+                    && matches!(target, TargetAddr::DomainPort { host, port: 8443 }
+                        if host == "bounded.example")
+        ));
+        assert_eq!(model.snapshot(), before);
+    }
+
+    #[test]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the test exercises the same exact prepared OPEN rejection type"
+    )]
+    fn prepared_local_open_requires_active_while_legacy_legless_open_stays_characterized() {
+        let issuer = LegIssuer::new(0x6e);
+        let leg = issuer.issue(2);
+        let mut model = SessionModel::new(SessionRole::Client, config(), leg);
+        assert!(matches!(
+            model
+                .reduce(SessionEvent::LegLost { leg })
+                .unwrap()
+                .as_slice(),
+            [SessionEffect::ResumeGraceStarted { .. }]
+        ));
+        let before = model.snapshot();
+        let called = std::cell::Cell::new(false);
+
+        let failure = model
+            .install_prepared_client_local_open(leg, target(443), |input| {
+                called.set(true);
+                Ok::<_, PreparedLocalOpenAdapterRejection<()>>(input)
+            })
+            .expect_err("production prepared OPEN rejects a legless session");
+        let (returned, error) = failure.into_parts();
+        assert_eq!(returned, target(443));
+        assert!(matches!(
+            error,
+            SessionError::PreparedLocalOpenRequiresActive {
+                actual: SessionPhase::Legless
+            }
+        ));
+        assert!(!called.get());
+        assert_eq!(model.snapshot(), before);
+
+        let legacy = model
+            .reduce(SessionEvent::LocalOpen {
+                leg,
+                target: target(443),
+            })
+            .expect("legacy reducer semantics remain available during branch-by-abstraction");
+        assert!(matches!(
+            legacy.as_slice(),
+            [SessionEffect::LocalFlowOpened { .. }]
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the test exercises the same exact prepared OPEN rejection type"
+    )]
+    fn prepared_local_open_moves_the_exact_materialized_effect_batch_through_one_commit() {
+        let issuer = LegIssuer::new(0x6b);
+        let leg = issuer.issue(2);
+        let mut model = SessionModel::new(SessionRole::Client, config(), leg);
+        let effect_bound = model.config().client_incremental_effect_bound();
+
+        let committed = model
+            .install_prepared_client_local_open(leg, target(8443), |input| {
+                Ok::<_, PreparedLocalOpenAdapterRejection<()>>((input.local_flow(), input))
+            })
+            .expect("reducer preflight succeeds")
+            .expect("adapter preparation succeeds");
+        let ((prepared_flow, input), committed_flow) = committed.into_parts();
+        let (input_flow, open_frame) = input.into_parts();
+
+        assert_eq!(effect_bound, 2);
+        assert_eq!(committed_flow, prepared_flow);
+        assert_eq!(input_flow, prepared_flow);
+        assert!(matches!(
+            open_frame.record(),
+            Record::Open { flow_id, target: opened_target }
+                if *flow_id == prepared_flow.flow_id()
+                    && opened_target == &target(8443)
+        ));
+        assert_eq!(model.snapshot().flow_count(), 1);
+        assert_eq!(model.snapshot().next_local_flow_id(), Some(2));
     }
 
     #[test]

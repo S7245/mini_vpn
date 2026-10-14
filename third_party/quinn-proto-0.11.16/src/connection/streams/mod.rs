@@ -61,6 +61,22 @@ impl<'a> Streams<'a> {
         Some(id)
     }
 
+    /// Instantaneous local next stream index and peer-advertised cumulative limit.
+    /// Observation only: neither field is advanced and no notification is registered.
+    #[doc(hidden)]
+    pub fn local_open_budget(&self, dir: Dir) -> (u64, u64) {
+        (self.state.next[dir as usize], self.state.max[dir as usize])
+    }
+
+    /// Whether neither stream map contains this exact ID.
+    ///
+    /// A lazy entry with no materialized send/recv state still counts as present.
+    /// This is a local storage observation, not proof of peer application completion.
+    #[doc(hidden)]
+    pub fn stream_maps_absent(&self, id: StreamId) -> bool {
+        !self.state.send.contains_key(&id) && !self.state.recv.contains_key(&id)
+    }
+
     /// Accept a remotely initiated stream of a certain directionality, if possible
     ///
     /// Returns `None` if there are no new incoming streams for this connection.

@@ -1,6 +1,18 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
+/// 所有 fake-IP 都仍在册；调用方应返回 DNS SERVFAIL，等待安全回收后重试。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FakeIpPoolExhausted;
+
+impl std::fmt::Display for FakeIpPoolExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("fake-IP pool exhausted")
+    }
+}
+
+impl std::error::Error for FakeIpPoolExhausted {}
+
 /// 一个 fake-IP 映射的运行时状态（刀2：引用计数回收）。
 /// 中文要点：`refcount` = 当前仍在用这条映射的活跃 flow 数（TCP listener 槽 + UDP assoc）；
 /// `last_used` = 最近一次 DNS 查询/flow 边界的秒级时间戳。回收条件 = `refcount==0 且 idle>TTL`，
@@ -9,6 +21,8 @@ use std::net::Ipv4Addr;
 struct Mapping {
     domain: String,
     refcount: u32,
+    incarnation: u64,
+    checked_refs: u32,
     last_used: u64,
 }
 
@@ -21,6 +35,10 @@ pub struct FakeIpPool {
     range_end: u32,
     /// 下一个待分配地址（环形游标）。
     next: u32,
+    checked_owner: std::sync::Arc<()>,
+    next_mapping: u64,
+    next_acquisition: u64,
+    checked_leases: HashMap<u64, (Ipv4Addr, u64)>,
     domain_to_ip: HashMap<String, Ipv4Addr>,
     ip_to_mapping: HashMap<Ipv4Addr, Mapping>,
 }
@@ -40,54 +58,62 @@ impl FakeIpPool {
             range_start,
             range_end,
             next: range_start + 2,
+            checked_owner: std::sync::Arc::new(()),
+            next_mapping: 0,
+            next_acquisition: 0,
+            checked_leases: HashMap::new(),
             domain_to_ip: HashMap::new(),
             ip_to_mapping: HashMap::new(),
         }
     }
 
     /// 为域名分配 fake-IP；已分配过则稳定返回同一个，并 touch `last_used`。
+    /// 所有地址仍在册时返回容量错误，绝不覆盖映射；只有 `sweep` 能释放地址。
     /// 中文要点：稳定复用是硬要求——否则 DNS 给的 IP 与 TCP 时查的表会不一致。
     /// `alloc` 是 DNS 查询触发（不是 flow），**不改 refcount**；flow 引用由 `acquire`/`release` 管。
-    pub fn alloc(&mut self, domain: &str, now: u64) -> Ipv4Addr {
+    pub fn alloc(&mut self, domain: &str, now: u64) -> Result<Ipv4Addr, FakeIpPoolExhausted> {
         if let Some(&ip) = self.domain_to_ip.get(domain) {
             if let Some(m) = self.ip_to_mapping.get_mut(&ip) {
                 m.last_used = now;
             }
-            return ip;
+            return Ok(ip);
         }
-        let ip = self.next_free_ip();
+        let incarnation = self
+            .next_mapping
+            .checked_add(1)
+            .ok_or(FakeIpPoolExhausted)?;
+        let ip = self.next_free_ip()?;
+        self.next_mapping = incarnation;
         self.domain_to_ip.insert(domain.to_string(), ip);
         self.ip_to_mapping.insert(
             ip,
             Mapping {
                 domain: domain.to_string(),
                 refcount: 0,
+                incarnation,
+                checked_refs: 0,
                 last_used: now,
             },
         );
-        ip
+        Ok(ip)
     }
 
     /// 取下一个未被在册映射占用的 fake-IP（环形探测，回绕跳过占用地址，绝不覆盖在册映射）。
     /// 中文要点：在册映射靠 `sweep` 回收 idle 的来腾空间；正常情况第一格即空闲，O(1)。
-    fn next_free_ip(&mut self) -> Ipv4Addr {
+    fn next_free_ip(&mut self) -> Result<Ipv4Addr, FakeIpPoolExhausted> {
         let span = self.range_end - (self.range_start + 2) + 1;
+        // 满池重试不扫描约 13 万地址，避免 DNS 压力放大主循环停顿。
+        if self.ip_to_mapping.len() >= span as usize {
+            return Err(FakeIpPoolExhausted);
+        }
         for _ in 0..span {
             let cand = Ipv4Addr::from(self.next);
             self.advance_next();
             if !self.ip_to_mapping.contains_key(&cand) {
-                return cand;
+                return Ok(cand);
             }
         }
-        // 一圈全占用（极端：~13 万映射全在册）：覆盖当前 next（罕见，调用方应已 sweep）。
-        // review #3：覆盖前清掉 victim 的 domain_to_ip，否则旧域名残留一条悬挂别名指向这个 IP，
-        // 而 ip_to_mapping[ip] 即将被改写成新域名 → resolve(旧域名查到的 IP) 串到新域名。
-        let cand = Ipv4Addr::from(self.next);
-        self.advance_next();
-        if let Some(victim) = self.ip_to_mapping.remove(&cand) {
-            self.domain_to_ip.remove(&victim.domain);
-        }
-        cand
+        Err(FakeIpPoolExhausted)
     }
 
     fn advance_next(&mut self) {
@@ -121,7 +147,9 @@ impl FakeIpPool {
         let stale: Vec<Ipv4Addr> = self
             .ip_to_mapping
             .iter()
-            .filter(|(_, m)| m.refcount == 0 && now.saturating_sub(m.last_used) > ttl)
+            .filter(|(_, m)| {
+                m.refcount == 0 && m.checked_refs == 0 && now.saturating_sub(m.last_used) > ttl
+            })
             .map(|(&ip, _)| ip)
             .collect();
         for ip in &stale {
@@ -161,116 +189,275 @@ impl FakeIpPool {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+const MAX_CHECKED_LEASES: usize = 4224;
 
-    #[test]
-    fn alloc_is_stable_per_domain() {
-        let mut p = FakeIpPool::new();
-        let a = p.alloc("facebook.com", 0);
-        let b = p.alloc("facebook.com", 1);
-        assert_eq!(a, b, "same domain must reuse the same fake-IP");
-        let c = p.alloc("google.com", 0);
-        assert_ne!(a, c, "different domains get different fake-IPs");
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CheckedFakeIpError {
+    WrongPool,
+    MissingMapping,
+    ReverseMappingMismatch,
+    WrongIncarnation,
+    UnknownAcquisition,
+    CountMismatch,
+    CapacityReached,
+    AcquisitionIdExhausted,
+}
 
-    #[test]
-    fn alloc_starts_at_dot_two_skipping_resolver() {
-        let mut p = FakeIpPool::new();
-        assert_eq!(p.alloc("a.com", 0), Ipv4Addr::new(198, 18, 0, 2));
-        assert_eq!(p.alloc("b.com", 0), Ipv4Addr::new(198, 18, 0, 3));
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FakeIpLeaseReceipt {
+    pub(crate) ip: Ipv4Addr,
+    pub(crate) incarnation: u64,
+    pub(crate) acquisition: u64,
+    pub(crate) before: u32,
+    pub(crate) after: u32,
+}
 
-    #[test]
-    fn resolve_round_trips_and_misses() {
-        let mut p = FakeIpPool::new();
-        let ip = p.alloc("x.com", 0);
-        assert_eq!(p.resolve(ip).as_deref(), Some("x.com"));
-        assert_eq!(p.resolve(Ipv4Addr::new(198, 18, 0, 250)), None);
-    }
+/// A pool-bound, non-clone capability. Dropping it is not a release.
+#[derive(Debug)]
+pub(crate) struct CheckedFakeIpLease {
+    owner: std::sync::Arc<()>,
+    receipt: FakeIpLeaseReceipt,
+}
 
-    #[test]
-    fn is_fake_range_boundaries() {
-        let p = FakeIpPool::new();
-        assert!(p.is_fake(Ipv4Addr::new(198, 18, 0, 0)));
-        assert!(p.is_fake(Ipv4Addr::new(198, 19, 255, 255)));
-        assert!(!p.is_fake(Ipv4Addr::new(198, 17, 255, 255)));
-        assert!(!p.is_fake(Ipv4Addr::new(198, 20, 0, 0)));
-        assert!(!p.is_fake(Ipv4Addr::new(1, 1, 1, 1)));
-    }
-
-    /// 引用计数回收：活跃 flow（refcount>0）即使 idle 超 TTL 也**绝不回收**。
-    #[test]
-    fn sweep_never_reclaims_active_flow() {
-        let mut p = FakeIpPool::new();
-        let ip = p.alloc("live.com", 0);
-        p.acquire(ip, 0); // 一条活跃 flow
-        // 远超 TTL，但 refcount>0 → 不回收。
-        assert_eq!(p.sweep(10_000, 300), 0);
-        assert_eq!(p.resolve(ip).as_deref(), Some("live.com"));
-    }
-
-    /// 引用计数回收：refcount 归零 + idle 超 TTL → 回收；回收后 resolve miss。
-    #[test]
-    fn sweep_reclaims_idle_zero_refcount() {
-        let mut p = FakeIpPool::new();
-        let ip = p.alloc("idle.com", 0);
-        p.acquire(ip, 0);
-        p.release(ip, 5); // flow 结束，last_used=5，refcount=0
-        // idle 未到 TTL（now=100, ttl=300）→ 不回收。
-        assert_eq!(p.sweep(100, 300), 0);
-        assert!(p.resolve(ip).is_some());
-        // idle 超 TTL（now=5+301）→ 回收。
-        assert_eq!(p.sweep(306, 300), 1);
-        assert_eq!(p.resolve(ip), None);
-    }
-
-    /// release 饱和减不下溢（多 release 不 panic、不回绕成巨值）。
-    #[test]
-    fn release_saturates_at_zero() {
-        let mut p = FakeIpPool::new();
-        let ip = p.alloc("x.com", 0);
-        p.release(ip, 1); // refcount 本就是 0
-        p.release(ip, 2);
-        // 归零状态，idle 超 TTL 即可回收（证明没被 release 弄成巨值卡住）。
-        assert_eq!(p.sweep(1000, 300), 1);
-    }
-
-    /// 池用量 usage()（刀11）：alloc 计 total 不计 active；acquire/release 动 active；sweep 降 total。
-    #[test]
-    fn usage_tracks_total_and_active() {
-        let mut p = FakeIpPool::new();
-        assert_eq!(p.usage(), (0, 0), "空池");
-        let ip = p.alloc("a.com", 0);
-        assert_eq!(
-            p.usage(),
-            (1, 0),
-            "alloc 计 total、不改 refcount → active=0"
-        );
-        p.acquire(ip, 0);
-        assert_eq!(p.usage(), (1, 1), "acquire → active=1");
-        let _ = p.alloc("b.com", 0);
-        assert_eq!(p.usage(), (2, 1), "第二域名进 total、未 acquire");
-        p.release(ip, 5);
-        assert_eq!(p.usage(), (2, 0), "release 归零 → active=0、total 不变");
-        // a.com、b.com 均 refcount==0 且 idle 超 TTL → 回收。
-        assert_eq!(p.sweep(1000, 300), 2);
-        assert_eq!(p.usage(), (0, 0), "sweep 后池空");
-    }
-
-    /// 回收腾出的 IP 可被新域名复用（next_free_ip 跳过在册、回收后空出）。
-    #[test]
-    fn reclaimed_ip_is_reusable() {
-        let mut p = FakeIpPool::new();
-        let ip1 = p.alloc("a.com", 0);
-        let _ip2 = p.alloc("b.com", 0);
-        // a.com idle 回收。
-        assert_eq!(p.sweep(1000, 300), 2); // a 和 b 都 idle 无 flow
-        assert_eq!(p.resolve(ip1), None);
-        // 新分配应能再拿到地址（池未泄漏）。
-        let ip3 = p.alloc("c.com", 2000);
-        assert!(p.is_fake(ip3));
-        assert_eq!(p.resolve(ip3).as_deref(), Some("c.com"));
+impl CheckedFakeIpLease {
+    pub(crate) fn receipt(&self) -> FakeIpLeaseReceipt {
+        self.receipt
     }
 }
+
+/// One stop-only census over the original registry and physical capabilities.
+/// Invalid acquisition and mapping verdicts are local; missing observations do
+/// not invalidate a different capability, even when both share an IP.
+pub(crate) struct CheckedLeaseAudit<'a> {
+    owner: &'a std::sync::Arc<()>,
+    observed: HashMap<u64, (FakeIpLeaseReceipt, bool)>,
+    complete: bool,
+}
+
+impl CheckedLeaseAudit<'_> {
+    pub(crate) fn complete(&self) -> bool {
+        self.complete
+    }
+
+    pub(crate) fn accepts(&self, lease: &CheckedFakeIpLease) -> bool {
+        std::sync::Arc::ptr_eq(self.owner, &lease.owner)
+            && self
+                .observed
+                .get(&lease.receipt.acquisition)
+                .is_some_and(|(receipt, valid)| *valid && *receipt == lease.receipt)
+    }
+}
+
+/// All validation precedes a caller's fallible listener step. This borrow keeps
+/// the exact registry entry and mapping stable until the final infallible commit.
+pub(crate) struct PreparedFakeIpRelease<'a> {
+    mapping: &'a mut Mapping,
+    entry: std::collections::hash_map::OccupiedEntry<'a, u64, (Ipv4Addr, u64)>,
+    receipt: FakeIpLeaseReceipt,
+    checked_after: u32,
+    now: u64,
+}
+
+impl PreparedFakeIpRelease<'_> {
+    pub(crate) fn commit(self) -> FakeIpLeaseReceipt {
+        self.mapping.refcount = self.receipt.after;
+        self.mapping.checked_refs = self.checked_after;
+        self.mapping.last_used = self.now;
+        self.entry.remove();
+        self.receipt
+    }
+}
+
+impl FakeIpPool {
+    fn checked_mapping(&self, ip: Ipv4Addr) -> Result<&Mapping, CheckedFakeIpError> {
+        if self.checked_leases.len() > MAX_CHECKED_LEASES {
+            return Err(CheckedFakeIpError::CountMismatch);
+        }
+        let mapping = self
+            .ip_to_mapping
+            .get(&ip)
+            .ok_or(CheckedFakeIpError::MissingMapping)?;
+        if self.domain_to_ip.get(&mapping.domain) != Some(&ip) {
+            return Err(CheckedFakeIpError::ReverseMappingMismatch);
+        }
+        let mut checked = 0u32;
+        for (other_ip, incarnation) in self.checked_leases.values() {
+            if *other_ip == ip {
+                if *incarnation != mapping.incarnation {
+                    return Err(CheckedFakeIpError::WrongIncarnation);
+                }
+                checked = checked
+                    .checked_add(1)
+                    .ok_or(CheckedFakeIpError::CountMismatch)?;
+            }
+        }
+        if checked != mapping.checked_refs || mapping.refcount < checked {
+            return Err(CheckedFakeIpError::CountMismatch);
+        }
+        Ok(mapping)
+    }
+
+    pub(crate) fn audit_checked_leases<'pool, 'lease>(
+        &'pool self,
+        leases: impl Iterator<Item = &'lease CheckedFakeIpLease>,
+    ) -> CheckedLeaseAudit<'pool> {
+        let mut audit = CheckedLeaseAudit {
+            owner: &self.checked_owner,
+            observed: HashMap::new(),
+            complete: true,
+        };
+        if self.checked_leases.len() > MAX_CHECKED_LEASES {
+            audit.complete = false;
+            return audit;
+        }
+        // At most 4224 registry acquisitions and therefore at most 4224 IPs.
+        // Counts come from this physical registry, not the observed capabilities.
+        let mut counts = HashMap::<Ipv4Addr, (u32, bool)>::new();
+        for (ip, incarnation) in self.checked_leases.values() {
+            let entry = counts.entry(*ip).or_insert((0, true));
+            entry.0 += 1;
+            entry.1 &= self.ip_to_mapping.get(ip).is_some_and(|mapping| {
+                mapping.incarnation == *incarnation
+                    && self.domain_to_ip.get(&mapping.domain) == Some(ip)
+            });
+        }
+        // Keep the original full mapping census, including orphan checked_refs.
+        // Such an orphan fails completeness without inventing a flow or a lease.
+        for (ip, mapping) in &self.ip_to_mapping {
+            let count = counts.get(ip).map_or(0, |entry| entry.0);
+            let valid = mapping.checked_refs == count && mapping.refcount >= count;
+            audit.complete &= valid;
+            if let Some(entry) = counts.get_mut(ip) {
+                entry.1 &= valid;
+            }
+        }
+        for (index, lease) in leases.enumerate() {
+            if index == MAX_CHECKED_LEASES {
+                audit.observed.clear();
+                audit.complete = false;
+                return audit;
+            }
+            let receipt = lease.receipt;
+            let valid = std::sync::Arc::ptr_eq(&self.checked_owner, &lease.owner)
+                && self.checked_leases.get(&receipt.acquisition)
+                    == Some(&(receipt.ip, receipt.incarnation))
+                && counts.get(&receipt.ip).is_some_and(|entry| entry.1);
+            match audit.observed.entry(receipt.acquisition) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((receipt, valid));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    // Both observations of this acquisition are uncertain.
+                    entry.get_mut().1 = false;
+                    audit.complete = false;
+                }
+            }
+        }
+        audit.complete &= audit.observed.len() == self.checked_leases.len()
+            && audit.observed.values().all(|(_, valid)| *valid);
+        audit
+    }
+
+    pub(crate) fn validate_checked_leases<'a>(
+        &self,
+        leases: impl Iterator<Item = &'a CheckedFakeIpLease>,
+    ) -> bool {
+        self.audit_checked_leases(leases).complete()
+    }
+
+    pub(crate) fn acquire_checked(
+        &mut self,
+        ip: Ipv4Addr,
+        now: u64,
+    ) -> Result<CheckedFakeIpLease, CheckedFakeIpError> {
+        let mapping = self.checked_mapping(ip)?;
+        if self.checked_leases.len() == MAX_CHECKED_LEASES {
+            return Err(CheckedFakeIpError::CapacityReached);
+        }
+        let after = mapping
+            .refcount
+            .checked_add(1)
+            .ok_or(CheckedFakeIpError::CountMismatch)?;
+        let checked_after = mapping
+            .checked_refs
+            .checked_add(1)
+            .ok_or(CheckedFakeIpError::CountMismatch)?;
+        let acquisition = self
+            .next_acquisition
+            .checked_add(1)
+            .ok_or(CheckedFakeIpError::AcquisitionIdExhausted)?;
+        let receipt = FakeIpLeaseReceipt {
+            ip,
+            incarnation: mapping.incarnation,
+            acquisition,
+            before: mapping.refcount,
+            after,
+        };
+        let owner = std::sync::Arc::clone(&self.checked_owner);
+        if self.checked_leases.contains_key(&acquisition) {
+            return Err(CheckedFakeIpError::UnknownAcquisition);
+        }
+        let mapping = self
+            .ip_to_mapping
+            .get_mut(&ip)
+            .ok_or(CheckedFakeIpError::MissingMapping)?;
+        // The ID is monotonic and checked before any physical state changes.
+        self.checked_leases
+            .insert(acquisition, (ip, receipt.incarnation));
+        self.next_acquisition = acquisition;
+        mapping.refcount = after;
+        mapping.checked_refs = checked_after;
+        mapping.last_used = now;
+        Ok(CheckedFakeIpLease { owner, receipt })
+    }
+
+    pub(crate) fn prepare_checked_release<'a>(
+        &'a mut self,
+        lease: &CheckedFakeIpLease,
+        now: u64,
+    ) -> Result<PreparedFakeIpRelease<'a>, CheckedFakeIpError> {
+        if !std::sync::Arc::ptr_eq(&self.checked_owner, &lease.owner) {
+            return Err(CheckedFakeIpError::WrongPool);
+        }
+        let receipt = lease.receipt;
+        let mapping = self.checked_mapping(receipt.ip)?;
+        if mapping.incarnation != receipt.incarnation {
+            return Err(CheckedFakeIpError::WrongIncarnation);
+        }
+        let after = mapping
+            .refcount
+            .checked_sub(1)
+            .ok_or(CheckedFakeIpError::CountMismatch)?;
+        let checked_after = mapping
+            .checked_refs
+            .checked_sub(1)
+            .ok_or(CheckedFakeIpError::CountMismatch)?;
+        let before = mapping.refcount;
+        let entry = match self.checked_leases.entry(receipt.acquisition) {
+            std::collections::hash_map::Entry::Occupied(entry)
+                if *entry.get() == (receipt.ip, receipt.incarnation) =>
+            {
+                entry
+            }
+            _ => return Err(CheckedFakeIpError::UnknownAcquisition),
+        };
+        let mapping = self
+            .ip_to_mapping
+            .get_mut(&receipt.ip)
+            .ok_or(CheckedFakeIpError::MissingMapping)?;
+        Ok(PreparedFakeIpRelease {
+            mapping,
+            entry,
+            receipt: FakeIpLeaseReceipt {
+                before,
+                after,
+                ..receipt
+            },
+            checked_after,
+            now,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests;

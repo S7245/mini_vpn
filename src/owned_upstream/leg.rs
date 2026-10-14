@@ -1,22 +1,23 @@
 //! Typed provenance for frames received from one authenticated transport leg.
 //!
-//! The eventual Quinn adapter is responsible for constructing one
-//! [`EstablishedLeg`] after a full TLS handshake and for calling
-//! [`EstablishedLeg::bind_received_frame`] only with bytes decoded from that
-//! exact connection.  This module deliberately contains no Quinn, socket, or
-//! 0-RTT behavior.
-
+//! Authenticated adapters mint EstablishedLeg after TLS and bind only that
+//! connection's decoded frames. No Quinn, socket or 0-RTT behavior lives here.
+#[path = "leg/cold_inventory.rs"]
+mod cold_inventory;
+use super::client_controller::ClientControllerInstallGate;
+use super::leg_io::LegIoAuthenticatedTransportGate;
 use super::standby::{
-    RegisteredAttachResponseGate, RegisteredCatchUpAssemblyGate, RegisteredCatchUpBeginGate,
-    RegisteredCatchUpResponseGate, RegisteredPendingAttachAuthority,
+    AcceptedRegisteredLossGate, RegisteredAttachResponseGate, RegisteredCatchUpAssemblyGate,
+    RegisteredCatchUpBeginGate, RegisteredCatchUpResponseGate, RegisteredPendingAttachAuthority,
 };
-
+use super::supervisor::{SessionSupervisor, SessionSupervisorError};
 use crate::resumable::{
     AttachAuthority, AttachCredentials, AttachReject, AttachRequest, AttachTransportBinding,
-    AuthenticatedAttachStatus, AuthenticatedStandbyRegistration, CommittedLeg, Frame,
-    GenerationCatchUp, GenerationResynchronization, LegControlFrame, LegGeneration,
+    AuthenticatedAttachStatus, AuthenticatedStandbyRegistration, CommittedLeg, FeatureSet, Frame,
+    GenerationCatchUp, GenerationResynchronization, LegControlFrame, LegEpochNonce, LegGeneration,
     PendingGenerationCatchUp, Record, SessionConfig, SessionEffect, SessionError, SessionEvent,
-    SessionModel, SessionRole, StandbyNonce, StandbyRegistrationReject, StandbyRegistrationRequest,
+    SessionId, SessionModel, SessionRole, StandbyNonce, StandbyRegistrationReject,
+    StandbyRegistrationRequest,
 };
 use crate::shared::TargetAddr;
 use std::fmt;
@@ -58,6 +59,23 @@ pub(super) struct LegTransportEndpoint {
     terminal_transition: Mutex<()>,
 }
 
+/// Exact endpoint lease used only by the closed client installation
+/// transaction. Holding its guard excludes the sole terminal reporter across
+/// queue reservation, reducer commit, old-leg retirement, and cursor publish.
+pub(super) struct ClientInstallTransition {
+    endpoint: Arc<LegTransportEndpoint>,
+}
+
+impl ClientInstallTransition {
+    pub(super) fn lock(&self) -> Result<MutexGuard<'_, ()>, LegTerminalTransitionError> {
+        self.endpoint.lock_terminal_transition()
+    }
+
+    pub(super) fn endpoint_is_open(&self) -> bool {
+        self.endpoint.is_open()
+    }
+}
+
 impl LegTransportEndpoint {
     fn open() -> Self {
         Self {
@@ -93,6 +111,7 @@ pub(super) fn transport_endpoint_is_open(endpoint: &Weak<LegTransportEndpoint>) 
 /// report. Transient pressure and retryable I/O deliberately have no variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LegTransportTerminalReason {
+    LocalCancelled,
     PeerClosed,
     Reset,
     FatalIo,
@@ -148,6 +167,19 @@ pub(crate) struct ExactLegTerminal {
 impl ExactLegTerminal {
     pub(crate) const fn reason(&self) -> LegTransportTerminalReason {
         self.reason
+    }
+
+    /// Read-only exact-transport check for a typestate that retained the
+    /// authenticated seal and endpoint without retaining an AttachedLeg.
+    /// This remains valid after the endpoint has transitioned terminal.
+    pub(super) fn belongs_to_transport(
+        &self,
+        seal: &LegSeal,
+        endpoint: &Weak<LegTransportEndpoint>,
+    ) -> bool {
+        seal.same_connection(&self.seal)
+            && Weak::ptr_eq(endpoint, &Arc::downgrade(&self.endpoint))
+            && !self.endpoint.is_open()
     }
 }
 
@@ -212,7 +244,7 @@ pub(crate) struct EstablishedLeg {
 }
 
 impl EstablishedLeg {
-    pub(super) fn for_authenticated_transport_with_reporter(
+    fn authenticated_transport_parts(
         binding: AttachTransportBinding,
     ) -> (Self, LegTransportReporter) {
         let seal = LegSeal::fresh();
@@ -231,11 +263,25 @@ impl EstablishedLeg {
         )
     }
 
+    pub(super) fn for_leg_io_authenticated_transport_with_reporter(
+        _gate: LegIoAuthenticatedTransportGate,
+        binding: AttachTransportBinding,
+    ) -> (Self, LegTransportReporter) {
+        Self::authenticated_transport_parts(binding)
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_authenticated_transport_with_reporter(
+        binding: AttachTransportBinding,
+    ) -> (Self, LegTransportReporter) {
+        Self::authenticated_transport_parts(binding)
+    }
+
     /// Legacy construction is confined to deterministic tests. Production
     /// must retain the sole reporter returned by `LegIo` construction.
     #[cfg(test)]
     pub(super) fn for_authenticated_transport(binding: AttachTransportBinding) -> Self {
-        Self::for_authenticated_transport_with_reporter(binding).0
+        Self::authenticated_transport_parts(binding).0
     }
 
     fn pending_attach(&self, request: AttachRequest) -> PendingAttach {
@@ -356,13 +402,8 @@ impl EstablishedLeg {
         });
     }
 
-    /// Authenticates and commits the initial owner ATTACH on this exact
-    /// transport without exposing the committed reducer capability.
-    ///
-    /// The retry-safe pending bootstrap retains authority ownership. After a
-    /// successful CAS, every remaining step needed to construct the initial
-    /// owner model is infallible and no acceptance can be published before the
-    /// supervisor consumes this opaque value.
+    /// Exact initial ATTACH returns opaque ownership to Supervisor. The pending
+    /// bootstrap retains retry authority; post-CAS construction is infallible.
     pub(super) fn authenticate_initial_owner_attach(
         &self,
         received: LegBoundFrame,
@@ -372,9 +413,7 @@ impl EstablishedLeg {
             .map_err(InitialOwnerAttachAuthenticationFailure::into_kind)
     }
 
-    /// Ownership-preserving initial-owner authentication used by the queued
-    /// bootstrap transaction. A rejected proof or wrong exact seal returns
-    /// the same inbound capability so no controller must reconstruct bytes.
+    /// Initial proof/seal rejection returns the original inbound capability.
     #[allow(
         clippy::result_large_err,
         reason = "authentication rejection returns the exact inbound frame capability"
@@ -411,19 +450,15 @@ impl EstablishedLeg {
         })
     }
 
-    /// Authenticates, model-preflights, and commits an ATTACH received on this
-    /// exact transport.
-    ///
-    /// The model preflight token retains its exclusive mutable borrow through
-    /// the authority CAS and is consumed immediately afterward. The returned
-    /// capability, correlated response, and recovery effects therefore exist
-    /// only after model installation; this method still performs no wire I/O.
+    /// Exact ATTACH preflight exclusively borrows Model through CAS/install.
+    /// Recovery storage rejection returns the original inbound frame; installed
+    /// capability/response/effects are published together without wire I/O.
     pub(super) fn transact_owner_attach_from_supervisor(
         &self,
         received: LegBoundFrame,
         authority: &AttachAuthority,
         model: &mut SessionModel,
-    ) -> Result<Result<OwnerAttachTransaction, SessionError>, LegProvenanceError> {
+    ) -> Result<Result<OwnerAttachTransaction, OwnerModelPreflightError>, LegProvenanceError> {
         if !self.seal.same_connection(&received.seal) {
             return Err(LegProvenanceError::WrongLeg);
         }
@@ -442,30 +477,32 @@ impl EstablishedLeg {
                 acceptance: committed.attach_accepted_frame(),
                 recovery,
             })),
-            Ok(Err(error)) => Ok(Err(error)),
+            Ok(Err(
+                source @ (SessionError::EffectStorageLayout | SessionError::EffectStorageReserve),
+            )) => Ok(Err(OwnerModelPreflightError::Storage {
+                source,
+                received: LegBoundFrame { seal, frame },
+            })),
+            Ok(Err(error)) => Ok(Err(OwnerModelPreflightError::Existing(error))),
             Err(resynchronization) => Ok(Ok(OwnerAttachTransaction::Resynchronize {
                 status: resynchronization.status_frame(),
             })),
         }
     }
 
-    /// Preserves the byte/provenance integration floor without reopening the
-    /// production generic owner-commit surface. Only test crates can invoke
-    /// this explicit compatibility seam; production commits remain reachable
-    /// solely through `SessionSupervisor` and `OwnerTargetExecutor` gates.
+    /// Test-only byte/provenance floor with the same owning rejection contract.
+    /// Production commits stay behind Supervisor/Target gates.
     #[cfg(test)]
     pub(crate) fn transact_owner_attach_for_provenance_test(
         &self,
         received: LegBoundFrame,
         authority: &AttachAuthority,
         model: &mut SessionModel,
-    ) -> Result<Result<OwnerAttachTransaction, SessionError>, LegProvenanceError> {
+    ) -> Result<Result<OwnerAttachTransaction, OwnerModelPreflightError>, LegProvenanceError> {
         self.transact_owner_attach_from_supervisor(received, authority, model)
     }
 
-    /// Authenticates a stale/exhausted ATTACH on this exact transport without
-    /// invoking the owner reducer or generation CAS. The returned fact has no
-    /// attached-leg conversion.
+    /// Stale/exhausted ATTACH yields status only: no Model, CAS or attached leg.
     pub(super) fn authenticate_owner_resynchronization(
         &self,
         received: LegBoundFrame,
@@ -480,12 +517,8 @@ impl EstablishedLeg {
     }
 }
 
-/// Exact initial owner commit whose authority, model seed, and response have
-/// not yet been published separately.
-///
-/// This value is intentionally opaque and non-cloneable. Only the session
-/// supervisor may consume it, preventing a byte-path harness from acquiring a
-/// bare [`CommittedLeg`] or bypassing owner-model installation.
+/// Opaque, non-cloneable initial commit; only Supervisor consumes its model,
+/// authority and response together, never a harness bypass or bare CommittedLeg.
 pub(super) struct AuthenticatedInitialOwnerAttach {
     attached: AttachedLeg,
     acceptance: Frame,
@@ -609,8 +642,8 @@ impl PendingAttach {
     }
 
     /// Registered-only response validation. The private standby-minted gate
-    /// proves the exact request receipt completed before any raw leg value can
-    /// be derived inside this module.
+    /// proves this exact response is being reconciled with its retained
+    /// request receipt before any raw leg value can be derived here.
     #[allow(
         clippy::result_large_err,
         reason = "rejected validation returns the exact pending attach and received frame"
@@ -619,8 +652,24 @@ impl PendingAttach {
         self,
         response: LegBoundFrame,
         _gate: RegisteredAttachResponseGate,
-    ) -> Result<AttachResponse, PendingAttachValidationFailure> {
-        self.validate_response_inner(response)
+    ) -> Result<RegisteredPendingAttachResponse, PendingAttachValidationFailure> {
+        let status_retry_after_loss = AcceptedAttachStatusRetry {
+            seal: self.seal.share(),
+            endpoint: self.endpoint.clone(),
+            binding: self.binding,
+            request: self.request,
+        };
+        match self.validate_response_inner(response)? {
+            AttachResponse::Accepted(attached) => Ok(RegisteredPendingAttachResponse::Accepted(
+                UninstalledRegisteredAttach {
+                    attached,
+                    status_retry_after_loss,
+                },
+            )),
+            AttachResponse::GenerationStatus(status) => {
+                Ok(RegisteredPendingAttachResponse::GenerationStatus(status))
+            }
+        }
     }
 
     #[allow(
@@ -833,6 +882,242 @@ impl PendingAttach {
             binding: self.binding,
             request: self.request,
         })
+    }
+}
+
+/// Registered-only response result. Its accepted branch keeps the exact
+/// delivered correlation private until either installation or proven loss.
+pub(super) enum RegisteredPendingAttachResponse {
+    Accepted(UninstalledRegisteredAttach),
+    GenerationStatus(LegGenerationStatus),
+}
+
+/// Accepted registered B that has not yet crossed the client installation
+/// transaction. The fallback and attached-leg authorities move together.
+pub(super) struct UninstalledRegisteredAttach {
+    attached: AttachedLeg,
+    status_retry_after_loss: AcceptedAttachStatusRetry,
+}
+
+pub(super) enum ClientInstallTransaction<A, P, E> {
+    Installed(P),
+    PrepareRejected {
+        accepted: A,
+        error: E,
+    },
+    SupervisorRejected {
+        accepted: A,
+        error: SessionSupervisorError,
+    },
+}
+
+impl UninstalledRegisteredAttach {
+    pub(super) fn generation(&self) -> LegGeneration {
+        self.attached.generation()
+    }
+
+    pub(super) fn install_transition(
+        &self,
+        _gate: &ClientControllerInstallGate,
+    ) -> Option<ClientInstallTransition> {
+        self.attached
+            .endpoint
+            .upgrade()
+            .map(|endpoint| ClientInstallTransition { endpoint })
+    }
+
+    pub(super) fn commit_client_install<T, E, P>(
+        self,
+        supervisor: &mut SessionSupervisor,
+        prepare: impl FnOnce(Vec<SessionEffect>) -> Result<T, E>,
+        publish: impl FnOnce(ClientActiveLeg, T) -> P,
+        _gate: &ClientControllerInstallGate,
+    ) -> ClientInstallTransaction<Self, P, E> {
+        let installed = match supervisor
+            .install_prepared_client_replacement(self.attached.committed, prepare)
+        {
+            Ok(Ok(installed)) => installed,
+            Ok(Err(error)) => {
+                return ClientInstallTransaction::PrepareRejected {
+                    accepted: self,
+                    error,
+                };
+            }
+            Err(error) => {
+                return ClientInstallTransaction::SupervisorRejected {
+                    accepted: self,
+                    error,
+                };
+            }
+        };
+        let (prepared, commit) = installed;
+        let Self {
+            attached,
+            status_retry_after_loss,
+        } = self;
+        drop((commit, status_retry_after_loss));
+        let AttachedLeg {
+            seal,
+            endpoint,
+            committed,
+        } = attached;
+        let active = ClientActiveLeg {
+            seal,
+            endpoint,
+            committed,
+        };
+        ClientInstallTransaction::Installed(publish(active, prepared))
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "wrong terminal returns the exact accepted capability and terminal fact"
+    )]
+    pub(super) fn into_status_retry_after_terminal(
+        self,
+        terminal: ExactLegTerminal,
+        _gate: AcceptedRegisteredLossGate,
+    ) -> Result<LostPendingAttach, UninstalledRegisteredAttachTerminalMismatch> {
+        let Self {
+            attached,
+            status_retry_after_loss,
+        } = self;
+        match status_retry_after_loss.into_lost_after_terminal(terminal) {
+            Ok(lost) => {
+                drop(attached);
+                Ok(lost)
+            }
+            Err(failure) => {
+                let (status_retry_after_loss, terminal) = failure.into_parts();
+                Err(UninstalledRegisteredAttachTerminalMismatch {
+                    accepted: Self {
+                        attached,
+                        status_retry_after_loss,
+                    },
+                    terminal,
+                })
+            }
+        }
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "live queue returns the exact accepted capability"
+    )]
+    pub(super) fn into_status_retry_after_queue_loss(
+        self,
+        _gate: AcceptedRegisteredLossGate,
+    ) -> Result<LostPendingAttach, Self> {
+        let Self {
+            attached,
+            status_retry_after_loss,
+        } = self;
+        match status_retry_after_loss.into_lost_after_queue_loss() {
+            Ok(lost) => {
+                drop(attached);
+                Ok(lost)
+            }
+            Err(status_retry_after_loss) => Err(Self {
+                attached,
+                status_retry_after_loss,
+            }),
+        }
+    }
+}
+
+impl fmt::Debug for UninstalledRegisteredAttach {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("UninstalledRegisteredAttach([REDACTED])")
+    }
+}
+
+pub(super) struct UninstalledRegisteredAttachTerminalMismatch {
+    accepted: UninstalledRegisteredAttach,
+    terminal: ExactLegTerminal,
+}
+
+impl UninstalledRegisteredAttachTerminalMismatch {
+    pub(super) fn into_parts(self) -> (UninstalledRegisteredAttach, ExactLegTerminal) {
+        (self.accepted, self.terminal)
+    }
+}
+
+impl fmt::Debug for UninstalledRegisteredAttachTerminalMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("UninstalledRegisteredAttachTerminalMismatch([REDACTED])")
+    }
+}
+
+/// Exact immutable correlation retained only while an accepted registered
+/// response remains uninstalled.
+struct AcceptedAttachStatusRetry {
+    seal: LegSeal,
+    endpoint: Weak<LegTransportEndpoint>,
+    binding: AttachTransportBinding,
+    request: AttachRequest,
+}
+
+impl AcceptedAttachStatusRetry {
+    #[allow(
+        clippy::result_large_err,
+        reason = "wrong terminal returns the exact fallback and terminal fact"
+    )]
+    fn into_lost_after_terminal(
+        self,
+        terminal: ExactLegTerminal,
+    ) -> Result<LostPendingAttach, AcceptedAttachStatusRetryTerminalMismatch> {
+        if !self.seal.same_connection(&terminal.seal)
+            || !Weak::ptr_eq(&self.endpoint, &Arc::downgrade(&terminal.endpoint))
+            || terminal.endpoint.is_open()
+        {
+            return Err(AcceptedAttachStatusRetryTerminalMismatch {
+                retry: self,
+                terminal,
+            });
+        }
+        Ok(LostPendingAttach {
+            seal: self.seal,
+            binding: self.binding,
+            request: self.request,
+        })
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "queue-loss mismatch returns the exact non-cloneable retry authority without boxing"
+    )]
+    fn into_lost_after_queue_loss(self) -> Result<LostPendingAttach, Self> {
+        if !self.seal.outbound_queue_was_lost() {
+            return Err(self);
+        }
+        Ok(LostPendingAttach {
+            seal: self.seal,
+            binding: self.binding,
+            request: self.request,
+        })
+    }
+}
+
+impl fmt::Debug for AcceptedAttachStatusRetry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AcceptedAttachStatusRetry([REDACTED])")
+    }
+}
+
+struct AcceptedAttachStatusRetryTerminalMismatch {
+    retry: AcceptedAttachStatusRetry,
+    terminal: ExactLegTerminal,
+}
+
+impl AcceptedAttachStatusRetryTerminalMismatch {
+    fn into_parts(self) -> (AcceptedAttachStatusRetry, ExactLegTerminal) {
+        (self.retry, self.terminal)
+    }
+}
+
+impl fmt::Debug for AcceptedAttachStatusRetryTerminalMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AcceptedAttachStatusRetryTerminalMismatch([REDACTED])")
     }
 }
 
@@ -1057,6 +1342,16 @@ impl fmt::Debug for PendingInitialAttachBindingFailure {
     }
 }
 
+/// New storage failures retain the exact frame; existing errors keep old mapping.
+#[derive(Debug)]
+pub(crate) enum OwnerModelPreflightError {
+    Existing(SessionError),
+    Storage {
+        source: SessionError,
+        received: LegBoundFrame,
+    },
+}
+
 /// A decoded frame whose provenance was minted by the exact connection's
 /// sole receive adapter.  Fields and constructors remain private.
 pub(crate) struct LegBoundFrame {
@@ -1074,6 +1369,11 @@ impl LegBoundFrame {
             .map(|(request, _proof)| request)
             .map_err(LegProvenanceError::from)
     }
+
+    #[cfg(test)]
+    pub(crate) fn into_frame_for_test(self) -> Frame {
+        self.frame
+    }
 }
 
 /// Classified inbound facts retain disjoint protocol namespaces after exact
@@ -1084,6 +1384,46 @@ pub(crate) enum BoundInbound {
     LegControl(LegBoundControlFrame),
 }
 
+/// Read-only responder source minted only from an authenticated installed
+/// current leg. It shares exact transport identity and protocol correlation,
+/// but carries no reducer, liveness, or switch authority.
+pub(super) struct InstalledLegProbeSource {
+    seal: LegSeal,
+    endpoint: Weak<LegTransportEndpoint>,
+    session_id: SessionId,
+    generation: LegGeneration,
+    epoch_nonce: LegEpochNonce,
+    features: FeatureSet,
+}
+
+impl InstalledLegProbeSource {
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        LegSeal,
+        Weak<LegTransportEndpoint>,
+        SessionId,
+        LegGeneration,
+        LegEpochNonce,
+        FeatureSet,
+    ) {
+        (
+            self.seal,
+            self.endpoint,
+            self.session_id,
+            self.generation,
+            self.epoch_nonce,
+            self.features,
+        )
+    }
+}
+
+impl fmt::Debug for InstalledLegProbeSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InstalledLegProbeSource([REDACTED])")
+    }
+}
+
 /// One decoded leg-control frame bound to the exact authenticated connection
 /// that carried its bytes. Construction remains private to [`EstablishedLeg`].
 pub(crate) struct LegBoundControlFrame {
@@ -1092,6 +1432,10 @@ pub(crate) struct LegBoundControlFrame {
 }
 
 impl LegBoundControlFrame {
+    pub(super) fn parts(&self) -> (&LegSeal, &LegControlFrame) {
+        (&self.seal, &self.frame)
+    }
+
     pub(super) fn into_parts(self) -> (LegSeal, LegControlFrame) {
         (self.seal, self.frame)
     }
@@ -1250,8 +1594,18 @@ impl PendingCatchUpAttach {
         self,
         response: LegBoundFrame,
         _gate: RegisteredCatchUpResponseGate,
-    ) -> Result<CaughtUpAttachedLeg, PendingCatchUpValidationFailure> {
-        self.validate_response_inner(response)
+    ) -> Result<UninstalledRegisteredCatchUp, PendingCatchUpValidationFailure> {
+        let status_retry_after_loss = AcceptedAttachStatusRetry {
+            seal: self.follow_up_seal.share(),
+            endpoint: self.follow_up_endpoint.clone(),
+            binding: self.follow_up_binding,
+            request: self.status_request,
+        };
+        let attached = self.validate_response_inner(response)?;
+        Ok(UninstalledRegisteredCatchUp {
+            attached,
+            status_retry_after_loss,
+        })
     }
 
     #[allow(
@@ -1372,6 +1726,150 @@ impl PendingCatchUpAttach {
             binding: follow_up_binding,
             request: status_request,
         })
+    }
+}
+
+/// Accepted registered D that remains outside the client installation
+/// transaction. Proven D loss recovers only the original stale B correlation.
+pub(super) struct UninstalledRegisteredCatchUp {
+    attached: CaughtUpAttachedLeg,
+    status_retry_after_loss: AcceptedAttachStatusRetry,
+}
+
+impl UninstalledRegisteredCatchUp {
+    pub(super) fn generation(&self) -> LegGeneration {
+        self.attached.generation()
+    }
+
+    pub(super) fn install_transition(
+        &self,
+        _gate: &ClientControllerInstallGate,
+    ) -> Option<ClientInstallTransition> {
+        self.attached
+            .endpoint
+            .upgrade()
+            .map(|endpoint| ClientInstallTransition { endpoint })
+    }
+
+    pub(super) fn commit_client_install<T, E, P>(
+        self,
+        supervisor: &mut SessionSupervisor,
+        prepare: impl FnOnce(Vec<SessionEffect>) -> Result<T, E>,
+        publish: impl FnOnce(ClientActiveLeg, T) -> P,
+        _gate: &ClientControllerInstallGate,
+    ) -> ClientInstallTransaction<Self, P, E> {
+        let installed =
+            match supervisor.install_prepared_client_catch_up(self.attached.catch_up, prepare) {
+                Ok(Ok(installed)) => installed,
+                Ok(Err(error)) => {
+                    return ClientInstallTransaction::PrepareRejected {
+                        accepted: self,
+                        error,
+                    };
+                }
+                Err(error) => {
+                    return ClientInstallTransaction::SupervisorRejected {
+                        accepted: self,
+                        error,
+                    };
+                }
+            };
+        let (prepared, commit) = installed;
+        let Self {
+            attached,
+            status_retry_after_loss,
+        } = self;
+        let CaughtUpAttachedLeg {
+            seal,
+            endpoint,
+            catch_up,
+        } = attached;
+        let committed = catch_up.accepted_leg();
+        drop((commit, status_retry_after_loss));
+        let active = ClientActiveLeg {
+            seal,
+            endpoint,
+            committed,
+        };
+        ClientInstallTransaction::Installed(publish(active, prepared))
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "wrong terminal returns the exact accepted catch-up and terminal fact"
+    )]
+    pub(super) fn into_status_retry_after_terminal(
+        self,
+        terminal: ExactLegTerminal,
+        _gate: AcceptedRegisteredLossGate,
+    ) -> Result<LostPendingAttach, UninstalledRegisteredCatchUpTerminalMismatch> {
+        let Self {
+            attached,
+            status_retry_after_loss,
+        } = self;
+        match status_retry_after_loss.into_lost_after_terminal(terminal) {
+            Ok(lost) => {
+                drop(attached);
+                Ok(lost)
+            }
+            Err(failure) => {
+                let (status_retry_after_loss, terminal) = failure.into_parts();
+                Err(UninstalledRegisteredCatchUpTerminalMismatch {
+                    accepted: Self {
+                        attached,
+                        status_retry_after_loss,
+                    },
+                    terminal,
+                })
+            }
+        }
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "live D queue returns the exact accepted catch-up"
+    )]
+    pub(super) fn into_status_retry_after_queue_loss(
+        self,
+        _gate: AcceptedRegisteredLossGate,
+    ) -> Result<LostPendingAttach, Self> {
+        let Self {
+            attached,
+            status_retry_after_loss,
+        } = self;
+        match status_retry_after_loss.into_lost_after_queue_loss() {
+            Ok(lost) => {
+                drop(attached);
+                Ok(lost)
+            }
+            Err(status_retry_after_loss) => Err(Self {
+                attached,
+                status_retry_after_loss,
+            }),
+        }
+    }
+}
+
+impl fmt::Debug for UninstalledRegisteredCatchUp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("UninstalledRegisteredCatchUp([REDACTED])")
+    }
+}
+
+pub(super) struct UninstalledRegisteredCatchUpTerminalMismatch {
+    accepted: UninstalledRegisteredCatchUp,
+    terminal: ExactLegTerminal,
+}
+
+impl UninstalledRegisteredCatchUpTerminalMismatch {
+    pub(super) fn into_parts(self) -> (UninstalledRegisteredCatchUp, ExactLegTerminal) {
+        (self.accepted, self.terminal)
+    }
+}
+
+impl fmt::Debug for UninstalledRegisteredCatchUpTerminalMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("UninstalledRegisteredCatchUpTerminalMismatch([REDACTED])")
     }
 }
 
@@ -1566,6 +2064,288 @@ impl fmt::Debug for CaughtUpLegTerminalMismatch {
     }
 }
 
+/// Controller-owned installed client leg. Normal and catch-up acceptances are
+/// normalized here so both retain the full local-open, receive, terminal, and
+/// retirement surface.
+pub(crate) struct ClientActiveLeg {
+    seal: LegSeal,
+    endpoint: Weak<LegTransportEndpoint>,
+    committed: CommittedLeg,
+}
+
+impl ClientActiveLeg {
+    pub(super) fn from_initial(attached: AttachedLeg, _gate: ClientControllerInstallGate) -> Self {
+        let AttachedLeg {
+            seal,
+            endpoint,
+            committed,
+        } = attached;
+        Self {
+            seal,
+            endpoint,
+            committed,
+        }
+    }
+
+    pub(crate) fn generation(&self) -> LegGeneration {
+        self.committed.generation()
+    }
+
+    pub(super) fn committed_leg(&self) -> CommittedLeg {
+        self.committed
+    }
+
+    pub(super) fn probe_session_id(&self) -> crate::resumable::SessionId {
+        self.committed.session_id()
+    }
+
+    pub(super) fn probe_epoch_nonce(&self) -> crate::resumable::LegEpochNonce {
+        self.committed.nonce().into()
+    }
+
+    pub(super) fn share_probe_seal(&self) -> LegSeal {
+        self.seal.share()
+    }
+
+    pub(super) fn installed_leg_probe_source(&self) -> InstalledLegProbeSource {
+        InstalledLegProbeSource {
+            seal: self.seal.share(),
+            endpoint: self.endpoint.clone(),
+            session_id: self.committed.session_id(),
+            generation: self.committed.generation(),
+            epoch_nonce: self.committed.nonce().into(),
+            features: FeatureSet::new(self.committed.negotiated_features()),
+        }
+    }
+
+    pub(super) fn belongs_to_transport(&self, transport: &EstablishedLeg) -> bool {
+        transport.belongs_to_transport(&self.seal)
+    }
+
+    pub(super) fn transport_binding(&self) -> AttachTransportBinding {
+        self.committed.transport_binding()
+    }
+
+    pub(super) fn standby_registration_request(
+        &self,
+        nonce: StandbyNonce,
+    ) -> Result<StandbyRegistrationRequest, StandbyRegistrationReject> {
+        StandbyRegistrationRequest::from_installed_leg(&self.committed, nonce)
+    }
+
+    pub(crate) fn local_open_event(&self, target: TargetAddr) -> SessionEvent {
+        SessionEvent::LocalOpen {
+            leg: self.committed,
+            target,
+        }
+    }
+
+    pub(super) fn accept_inbound(
+        &self,
+        inbound: BoundInbound,
+    ) -> Result<SessionEvent, ClientActiveInboundFailure> {
+        let BoundInbound::Session(received) = inbound else {
+            return Err(ClientActiveInboundFailure { inbound });
+        };
+        if !self.seal.same_connection(&received.seal) || is_attach_record(received.frame.record()) {
+            return Err(ClientActiveInboundFailure {
+                inbound: BoundInbound::Session(received),
+            });
+        }
+        Ok(SessionEvent::PeerFrame {
+            leg: self.committed,
+            frame: received.frame,
+        })
+    }
+
+    pub(super) fn retire(self) -> RetiredClientLeg {
+        RetiredClientLeg {
+            seal: self.seal,
+            endpoint: self.endpoint,
+            generation: self.committed.generation(),
+        }
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "wrong terminal returns the exact active client leg and terminal fact"
+    )]
+    pub(super) fn bind_terminal_retaining_retired(
+        self,
+        terminal: ExactLegTerminal,
+    ) -> Result<(TerminalBoundRetiredClientLeg, PendingClientLegLoss), ClientActiveTerminalMismatch>
+    {
+        if !self.matches_terminal(&terminal) {
+            return Err(ClientActiveTerminalMismatch {
+                active: self,
+                terminal,
+            });
+        }
+        let retired = RetiredClientLeg {
+            seal: self.seal.share(),
+            endpoint: self.endpoint.clone(),
+            generation: self.committed.generation(),
+        };
+        let reason = terminal.reason();
+        let terminal_bound = TerminalBoundRetiredClientLeg { retired, terminal };
+        let pending = PendingClientLegLoss {
+            leg: self.committed,
+            reason,
+        };
+        Ok((terminal_bound, pending))
+    }
+
+    /// Borrow-only preflight for the shutdown transaction that may have to
+    /// release a fatal recovery tail before consuming the terminal. The
+    /// subsequent bind is synchronous, so a true result cannot become stale.
+    pub(super) fn matches_terminal(&self, terminal: &ExactLegTerminal) -> bool {
+        self.seal.same_connection(&terminal.seal)
+            && Weak::ptr_eq(&self.endpoint, &Arc::downgrade(&terminal.endpoint))
+            && !terminal.endpoint.is_open()
+    }
+}
+
+impl fmt::Debug for ClientActiveLeg {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ClientActiveLeg([REDACTED])")
+    }
+}
+
+pub(super) struct ClientActiveInboundFailure {
+    inbound: BoundInbound,
+}
+
+impl ClientActiveInboundFailure {
+    pub(super) fn into_inbound(self) -> BoundInbound {
+        self.inbound
+    }
+}
+
+impl fmt::Debug for ClientActiveInboundFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ClientActiveInboundFailure([REDACTED])")
+    }
+}
+
+pub(super) struct ClientActiveTerminalMismatch {
+    active: ClientActiveLeg,
+    terminal: ExactLegTerminal,
+}
+
+impl ClientActiveTerminalMismatch {
+    pub(super) fn into_parts(self) -> (ClientActiveLeg, ExactLegTerminal) {
+        (self.active, self.terminal)
+    }
+}
+
+impl fmt::Debug for ClientActiveTerminalMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ClientActiveTerminalMismatch([REDACTED])")
+    }
+}
+
+/// Bounded inert receive seal for a superseded client transport. It cannot
+/// construct a `SessionEvent`; it only proves and discards late data-plane
+/// frames or the exact terminal fact for its retired connection.
+pub(crate) struct RetiredClientLeg {
+    seal: LegSeal,
+    endpoint: Weak<LegTransportEndpoint>,
+    generation: LegGeneration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetiredClientInboundKind {
+    Data,
+    Ack,
+    Close,
+    Reset,
+}
+
+impl RetiredClientLeg {
+    pub(crate) fn generation(&self) -> LegGeneration {
+        self.generation
+    }
+
+    pub(super) fn discard_late_inbound(
+        &self,
+        inbound: BoundInbound,
+    ) -> Result<RetiredClientInboundKind, BoundInbound> {
+        let BoundInbound::Session(received) = inbound else {
+            return Err(inbound);
+        };
+        if !self.seal.same_connection(&received.seal) {
+            return Err(BoundInbound::Session(received));
+        }
+        let kind = match received.frame.record() {
+            Record::Data { .. } => RetiredClientInboundKind::Data,
+            Record::Ack { .. } => RetiredClientInboundKind::Ack,
+            Record::Close { .. } => RetiredClientInboundKind::Close,
+            Record::Reset { .. } => RetiredClientInboundKind::Reset,
+            _ => return Err(BoundInbound::Session(received)),
+        };
+        drop(received);
+        Ok(kind)
+    }
+
+    pub(super) fn discard_terminal(
+        &self,
+        terminal: ExactLegTerminal,
+    ) -> Result<(), ExactLegTerminal> {
+        if !self.seal.same_connection(&terminal.seal)
+            || !Weak::ptr_eq(&self.endpoint, &Arc::downgrade(&terminal.endpoint))
+            || terminal.endpoint.is_open()
+        {
+            return Err(terminal);
+        }
+        Ok(())
+    }
+}
+
+/// Exact terminal-bound cleanup authority for a current client transport that
+/// has already become logically lost. The terminal remains here while the
+/// separate logical-loss capability is consumed by the reducer, so later
+/// physical retired cleanup never needs a cloned or second terminal fact.
+pub(crate) struct TerminalBoundRetiredClientLeg {
+    retired: RetiredClientLeg,
+    terminal: ExactLegTerminal,
+}
+
+impl TerminalBoundRetiredClientLeg {
+    pub(crate) fn generation(&self) -> LegGeneration {
+        self.retired.generation()
+    }
+
+    pub(crate) const fn reason(&self) -> LegTransportTerminalReason {
+        self.terminal.reason()
+    }
+
+    pub(super) fn discard_late_inbound(
+        &self,
+        inbound: BoundInbound,
+    ) -> Result<RetiredClientInboundKind, BoundInbound> {
+        self.retired.discard_late_inbound(inbound)
+    }
+}
+
+impl fmt::Debug for TerminalBoundRetiredClientLeg {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalBoundRetiredClientLeg")
+            .field("generation", &self.generation())
+            .field("reason", &self.reason())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for RetiredClientLeg {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetiredClientLeg")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Successfully attached, connection-bound data-plane authority.
 ///
 /// The authenticated [`CommittedLeg`] deliberately remains private inside
@@ -1629,6 +2409,17 @@ impl AttachedLeg {
         self.seal.share()
     }
 
+    pub(super) fn installed_leg_probe_source(&self) -> InstalledLegProbeSource {
+        InstalledLegProbeSource {
+            seal: self.seal.share(),
+            endpoint: self.endpoint.clone(),
+            session_id: self.committed.session_id(),
+            generation: self.committed.generation(),
+            epoch_nonce: self.committed.nonce().into(),
+            features: FeatureSet::new(self.committed.negotiated_features()),
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn try_claim_unbound_test_queue(
         &self,
@@ -1680,7 +2471,7 @@ impl AttachedLeg {
         self,
         terminal: ExactLegTerminal,
     ) -> Result<PendingLegLoss, LegTerminalMismatch> {
-        if !self.seal.same_connection(&terminal.seal) || terminal.endpoint.is_open() {
+        if !self.matches_terminal(&terminal) {
             return Err(LegTerminalMismatch {
                 attached: self,
                 terminal,
@@ -1690,6 +2481,17 @@ impl AttachedLeg {
             leg: self.committed,
             terminal,
         })
+    }
+
+    /// Borrow-only exact-terminal preflight for a logically superseded owner
+    /// leg.  Unlike [`Self::bind_terminal`], this check cannot mint a pending
+    /// `LegLost` capability; the retired-owner transaction consumes both
+    /// inputs only after its replacement and physical actor have also been
+    /// validated.
+    pub(super) fn matches_terminal(&self, terminal: &ExactLegTerminal) -> bool {
+        self.seal.same_connection(&terminal.seal)
+            && Weak::ptr_eq(&self.endpoint, &Arc::downgrade(&terminal.endpoint))
+            && !terminal.endpoint.is_open()
     }
 
     pub(crate) fn resume_grace_expired_event(&self) -> SessionEvent {
@@ -1739,16 +2541,49 @@ impl PendingLegLoss {
         self.terminal.reason()
     }
 
+    /// Borrow-only reducer input used by terminal cleanup precommit. Keeping
+    /// the exact terminal fact in this capability lets a rejected reducer
+    /// transition restore the whole pending loss instead of reconstructing it
+    /// from a value-only `LegLost` event.
+    pub(crate) fn event(&self) -> SessionEvent {
+        SessionEvent::LegLost { leg: self.leg }
+    }
+
     pub(crate) fn into_event(self) -> SessionEvent {
-        let Self { leg, terminal } = self;
+        let event = self.event();
+        let Self { leg: _, terminal } = self;
         debug_assert!(!terminal.endpoint.is_open());
-        SessionEvent::LegLost { leg }
+        event
     }
 }
 
 impl fmt::Debug for PendingLegLoss {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PendingLegLoss([REDACTED])")
+    }
+}
+
+/// Exact client-leg reducer authority separated from its terminal-bound
+/// physical cleanup authority. Consuming this value can emit `LegLost` once,
+/// but cannot consume or recreate the retained terminal fact.
+pub(crate) struct PendingClientLegLoss {
+    leg: CommittedLeg,
+    reason: LegTransportTerminalReason,
+}
+
+impl PendingClientLegLoss {
+    pub(crate) const fn reason(&self) -> LegTransportTerminalReason {
+        self.reason
+    }
+
+    pub(crate) fn into_event(self) -> SessionEvent {
+        SessionEvent::LegLost { leg: self.leg }
+    }
+}
+
+impl fmt::Debug for PendingClientLegLoss {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PendingClientLegLoss([REDACTED])")
     }
 }
 

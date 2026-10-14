@@ -2,8 +2,9 @@
 
 Date: 2026-08-18
 
-Status: **R1-R5 FOUNDATION ACCEPTED LOCALLY; R6-R9 NOT IMPLEMENTED;
-TASK 4 NOT PASS; M3 BLOCKED**
+Status: **R1–R5 FOUNDATION AND R6A–D NECESSARY LOCAL SLICES ACCEPTED; R7A–D
+AND R8–R9 OPEN; TASK 4, PRODUCTION TUN, WAN, THROUGHPUT, AND M2 NOT ACCEPTED;
+M3 BLOCKED**
 
 ## Decision
 
@@ -66,12 +67,20 @@ wire reservoir is bounded, source extraction owns byte and segment capacity
 first, transient reducer admission returns the exact input, Target work is
 typed and resumable, and one pristine supervisor is the sole factory mint.
 
-This is not yet a Task-4 result. R6/R7 standby registration, probes,
-controller arbitration, ordered acceptance-before-recovery, attach/replay,
-stale-A retirement, and authenticated reverse-only switch hints are not
-implemented. R8/R9 fault-matrix and real-smoltcp parity acceptance are also
-open. The presence of R1-R5, or a passing R5 baseline, must not be reported as
-Task-4 PASS.
+This is not yet a Task-4 result. R6 now has necessary local transaction, fixed
+actor, exact retired-A join/clear, actor-inbound, current-terminal, post-loss
+B, silent-probe, late-record, checked recovery-capacity, and production-root
+slices. The bounded root owns real Quinn composition, prepared Open, fair
+nonpolling progress, same-clock semantic timers, lifecycle-linearized
+shutdown, and exact zero ownership. Current result:
+`docs/tech/2026-08-25-knife16-r6d-recovery-capacity-production-root-local-results.md`.
+
+All R7a–d reverse-only no-oracle, authenticated-hint, rejection, and trigger-
+race behavior remains unimplemented; an actual-close or ordinary blackout
+tracer does not cover R7. R8/R9 fault-matrix and real-smoltcp parity acceptance
+are also open. The presence of R1-R5 or these R6 necessary slices must not be
+reported as Task-4 PASS, production closure, a WAN/throughput result, or a fix
+for M2. The R6d result above supersedes the earlier composition-only position.
 
 ## Stage goal
 
@@ -899,22 +908,31 @@ Implement one vertical RED/GREEN slice at a time:
    MemoryIngress, decode, exact leg bind, owner, and `TargetIo`; direct reducer
    construction is forbidden. R1-R5 pass as a local foundation only and do not
    satisfy Task-4 blackout/switch acceptance.
-6. **R6a — actual hard close:** an exact A transport close reaches the
-   production controller, causes exactly one B attach/replay, keeps one Target
-   open, and never consults the fault oracle.
-7. **R6b — silent hard failure:** an A byte blackout without a close switches
-   only after the exact outstanding probe epoch expires; a fresh exact B probe
-   is required.
-8. **R6c — retired A:** late A DATA, ACK, CLOSE, RESET, acceptance, and status
-   after B commit are snapshot-inert and every physical queue/task byte joins
-   or releases exactly.
-9. **R6d — recovery capacity:** a component sum above `500ms` is rejected;
-   the 100-Mbit/s, 5ms-quantum case admits exactly 100 quanta per direction.
+6. **R6a — actual hard close (necessary local transaction accepted):** an
+   exact A transport close reaches the production controller, consumes one
+   logical loss, then installs one ordinary registered B, replays through the
+   retained Target, and recognizes only its first positive application ACK
+   before terminal-bound A clears. Production-root reachability and checked
+   recovery capacity remain outside this accepted sub-slice.
+7. **R6b — silent hard failure (necessary local slice accepted):** an A byte
+   blackout without a close switches only after the exact outstanding probe
+   epoch expires; a fresh exact B probe is required.
+8. **R6c — retired A (late-record matrix accepted locally):** late A DATA,
+   ACK, CLOSE, RESET, acceptance, and
+   status after B commit are snapshot-inert and every physical queue/task byte
+   joins or releases exactly.
+9. **R6d — recovery capacity/root (necessary local slice accepted):** a
+   component sum above `500ms` is rejected; the 100-Mbit/s, 5ms-quantum case
+   admits exactly 100 quanta per direction, and one bounded root owns the real
+   Quinn composition, prepared Open, progress, cutoff, shutdown, and join.
 10. **R7a — no oracle shortcut:** a reverse-only A DATA/ACK blackout may leave
     A's probe healthy; with no authenticated B hint the client does not switch.
 11. **R7b — authenticated reverse switch:** reducer-owned
     Target-to-client application-ACK age causes one B hint, one client attach,
     exact replay, and a first B application ACK inside the combined horizon.
+    Deadline acceptance requires the Quinn actor to capture same-clock arrival
+    time at transport-read admission and preserve it through queue/publication;
+    a publication epoch is not an arrival timestamp.
 12. **R7c — hint rejection:** wrong seal, session, generation, nonce,
     sequence, direction, cause, offset, idle flow, or stale B health cannot
     trigger a switch; duplicate/lower hints cannot start a second attach.

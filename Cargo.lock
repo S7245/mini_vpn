@@ -664,6 +664,7 @@ dependencies = [
  "sha2",
  "smoltcp",
  "socket2 0.5.10",
+ "syn 2.0.117",
  "thiserror 1.0.69",
  "tls-parser",
  "tokio",

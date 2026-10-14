@@ -1,3758 +1,1113 @@
-# TODO
+# mini_vpn Current Work
 
-## Current Knife16 Plan (2026-08-18)
+Last refreshed: 2026-10-14.
 
-### Path-diverse resumable upstream
+## 后续规划：N3 自动节点切换（2026-10-09 用户决定）
 
-#### Latest decision (2026-08-18 — Task 4 R1–R5 foundation accepted; R6 next)
+- [ ] N3：自动启动备用节点、运行中 TCP/UDP 自动换出口与自动回切。已移出本轮必做范围，未来单独规划和授权；节点启动失败由用户自行选择其他节点。
 
-Knife16 Task 3 now passes locally. The crate-private `OwnedUpstream` facade
-preserves exact legacy TCP relay variants and UDP/TUIC/Reality/Failover
-behavior while the real TUN/smoltcp loop can select typed resumable flow
-ports. One session factory owns the aggregate uplink-byte ledger; reservation
-precedes local extraction; exact reducer receipts own replay storage/release;
-and per-flow, message, and global capacity exhaustion all backpressure without
-consuming or closing local TCP.
+本轮规划顺序为 N1 → N2 → N4 → N5，保留所选节点的自动重连与故障恢复。用户接受恢复新通信、不保证原应用连接无缝续传的边界。精确范围与完成判据见[执行指南](docs/tech/2026-09-14-compatibility-recovery-execution-guide.md)顶部修订；当前 N1 接受位置与执行授权不变。
 
-Application ACK is emitted only after exact positive smoltcp `send_slice`
-acceptance. Sink/FIN traffic remains behind the existing D16/local-egress
-actor. DATA/CLOSE ordering, bounded control fairness, exact TLS-leg
-provenance, terminal/owner-loss handling, stale epoch, and every uninstalled
-async open path are capability-owned and fail closed.
+N4/N5 范围已于2026-10-09确认：N4 在 N2 后验证所选节点的并发、长时、循环故障和资源收敛；N5 在 N4/readiness/外部授权后验证深圳↔US启动、同节点恢复与真实链路质量。自动 A/B 切换/回切矩阵全部归延期 N3；同节点代际隔离、健康流保护和关闭验收保留。人工选节点耗时与程序恢复时间分开。完整矩阵以[执行指南§5](docs/tech/2026-09-14-compatibility-recovery-execution-guide.md#5-唯一剩余工作清单)为准。
 
-Focused `43/43`, all-target harness `875 + 3 ignored`, concurrency
-`10 + 4 ignored`, typed provenance `101/101`, real-smoltcp fake adapter `2/2`
-plus 100-repeat, release, strict Clippy, rustdoc, vendored Quinn/proto, fmt,
-diff, and four concentrated reviews pass with P0/P1 `0/0`. This is still a
-local branch-by-abstraction result: the public production entry remains
-legacy, and no production two-leg transport, server owner, blackout recovery,
-WAN result, or `>170 Mbit/s` claim exists. Result:
-`docs/tech/2026-08-18-knife16-owned-upstream-local-results.md`.
+2026-10-13 已批准并经独立审查的分层恢复修订生效：先修接入丢包，再贯通 Generic 同节点重连与服务owner下的受控会话重建，随后补齐family/S1和完整本地验收。旧资源未结算/未知债/Q禁止后继，最多一份活会话；120s失败边界不放宽原测试期限。唯一执行清单为 docs/current/n1-f1-implementation.md，窄范围契约为 docs/current/n1-session-rebuild-contract-20261013.md；其余禁止项不变。
 
-Task 4 R1–R5 now pass locally through the production-shared codec, exact-leg
-seal, attach transaction, single-owner supervisor, typed replay/source
-ownership, `TargetIo`, one-event wire scheduler, category-owned work budget,
-and complete byte-level baseline. Final ownership is zero and independent
-reviews report P0/P1 `0/0`. This is foundation acceptance only: R6–R9 and
-Task 4 remain open.
+## Current: N1 closed auxiliary recovery accepted; full Step B remains open
 
-Next implement only R6's protocol/auth/exact-leg vertical: freeze
-`STANDBY_CONTROL_V1`, add the five bounded leg-control records, independent
-standby HMAC, and exact-leg control capabilities. Then add the production-
-shared controller's actual-close tracer. Do not start a WAN test. Result:
-`docs/tech/2026-08-18-knife16-two-leg-foundation-local-results.md`.
+Current result: docs/current/n1-20260918-evidence/f1-aux-recovery-checkpoint-20261014.json. Actual legacy/staged Generic opens recover a closed auxiliary through one saved NodeHost transaction: original slot/preparation/lease custody, fixed first15s/at most2 attempts/at least500ms, whole-generation publication, actual predecessor/stats retirement and sticky failure/stop accounting. Typed configuration rejection stops retries within this NodeHost. Independent /root/n1_aux_final_review P0/P1/P2=0/0/0 accepts ClosedAuxiliaryRecovery only.
 
-#### Prior decision context (2026-08-18 — Knife15 Tier B failed)
+Final v3 source:576 total/178 vendor/398 governed, SHA2d16b0d0981962c24a7592617e306cd9432763aaf795fe1acb29fcdc5d7c63d1;8 existing changed+2 new,566 unchanged,0 deleted. All216 test executions on that final source pass (not necessarily unique tests), plus all-features lib/bin check, scopedfmt and diff. HEAD/index/locks/certs/device/harness/r8 guards remain unchanged. All REDs, rejected TLS retry oracle and v2 startup-cleanup regression remain in the journal.
 
-Knife15 is closed without acceptance. Exact-source `d5b8304` passed all
-pre-action gates and eleven complete cycles, then cycle 12 `udp-reverse` lost
-`13,760 / 447,313` packets (`3.076146%`) against the frozen `3%` limit. No
-six-hour epoch was sealed, but the genuine non-continuity quality failure is
-terminal to Tier B and does not authorize a retry. Mac/Exit bundles are
-`c96b342d.../567409b7...`; notification, evidence finalization, and cleanup
-passed. M3 remains blocked.
+Next: complete primary/UDP generation custody and healthy auxiliary replacement in the same root, preserving C=N+3 and original predecessor obligations. Then migrate four real production constructors with continuous saved-business/node driving and Failover health stop/join, followed by Generic same-node service/session rebuild. Production constructors are still legacy; full Step B/NodeSettled/Generic recovery are not accepted. Families/S1/fullW/F/cold/public/fullN1-L/R remain mandatory. Single Writer, independent Reviewer and evidence-based repair authority continue without renewed user approval. No commit/push/destructive cleanup/external/TUN/VPS/WAN/throughput/M2/P3/N2–N5.
 
-Paired capture observed `447,313` Target packets at the Exit, `436,189` outer
-TUIC application-sized packets leaving it, and `433,553` at the Mac receiver.
-The dominant `11,124`-packet loss boundary is after Target capture and before
-outer TUIC egress. Mac TUN/D16/Endpoint/interface evidence and Exit capture
-drops are clean. Existing evidence does not distinguish the exact Exit UDP
-socket, sing-box, and QUIC send-queue sub-boundary.
+## Historical N1 evidence and superseded continuation boundaries
 
-Do not rerun standard single-path TUIC, relax the threshold, add another
-equivalent resource, tune frozen constants, or switch to all-stream UDP.
-ADR-0015 accepts a single server-side session owner reachable through at least
-two independent ingress paths. It provides application-byte ACK/replay for TCP
-and independent bounded per-leg queues, sequence/dedup/feedback, and hot
-failover for UDP. TUIC remains a compatibility profile.
+The records below preserve evidence and past scope decisions. They do not extend the current action; the executable continuation is the current section above.
 
-Current execution order:
+S7b 已局部接受。两个独立只读 Reviewer 均为 P0/P1/P2=0/0/0：`RelayEventLane` 在任何分支副作用前只接受当前 `SocketCtx` 的精确 epoch；实际 bounded bridge 的 2×4 tracer 覆盖旧 epoch/缺失 context × `Data`、`DataReady`、`AckDrainHint`、`Closed`，并锁定 D4、context/read-credit、dirty、gap 与 custody。治理 7/7、精确 tracer 1/1、三条 helper 回归、scoped rustfmt 和 diff 均 GREEN；唯一 ratchet 已在用户确认后由 15351 降至现有 15312。证据见 `l1e-s7b-final-independent-review.json`，RED、治理 stop 与 GREEN 均保留。
 
-1. protocol model and capacity characterization — **COMPLETE**;
-2. deep `OwnedUpstream` abstraction behind existing client interfaces —
-   **COMPLETE**;
-3. deterministic two-leg TCP blackout harness — **IN PROGRESS: R1–R5
-   COMPLETE; R6–R9 OPEN**;
-4. `mini_vpn-upstreamd` single session owner and loopback lifecycle tests;
-5. local real-socket `>170 Mbit/s` capacity gate;
-6. security/review gates;
-7. bounded independent two-ingress qualification;
-8. only then a Knife16 long macOS acceptance run.
+S8 已局部接受：两位独立最终 Reviewer 均为 P0/P1/P2=0/0/0。两处测试 Rust 改动使同一 private fixture 在构造 saved session 前设置 `cheap=true`，并以 129 条真实 TCP socket 锁定 W128、原始 4096B、完成但未被原 loop 消费的 slot、原 handle/new epoch 重新准入、observer cancellation 与 cleanup 前 shutdown join。精确 tracer、两条既有 W 回归、治理 7/7 与 scoped fmt/diff 均 GREEN；首次 E0277 compile stop、用户确认的仅诊断输出修复和重跑 GREEN 全部保留。动态 tracer 只证明完成 worker 在原 loop 下次消费前仍被 W 持有；handler→`consumed` 是同一 select arm 的源码顺序。证据：`l1e-s8-final-independent-review.json`、`l1e-s8-writer-green.json`、`l1e-s8-cheap-w128-unexpected-stop.json`。下一步只做 F4096/five-role flow custody 的结构收敛和容量预案及独立审查；不自动写 F/S1 Rust 或进入外部 gate。
 
-Spec and plan:
-`docs/tech/2026-08-18-knife16-path-diverse-resumable-upstream-architecture-spec.md`
-and
-`docs/tech/2026-08-18-knife16-path-diverse-resumable-upstream-implementation-plan.md`.
-Task-3 result:
-`docs/tech/2026-08-18-knife16-owned-upstream-local-results.md`.
-Knife15 result:
-`docs/tech/2026-08-18-knife15-m2-frequency-first-run-udp-loss-results.md`.
+F4096/five-role revision 3/4 review history 均保留。revision 5（SHA `a1caad5e…adeb84`）的三项独立复审均 P0/P1/P2=0/0/0，用户已批准该范围。L0 只允许 listener registry/test pure Move、characterization 与治理来源证明；F4096 admission、4352 slot、RX/TX 限额、fixture/RED-GREEN、flow custody 和外部 gate 仍留给后续 gate。
 
-#### Superseded decision (2026-08-18 — two pre-action failures repaired locally)
+L0 已本地接受：`l1e-f4096-revision-5-l0-final-independent-review.json` 记录最终治理 P0/P1/P2=0/0/0。baseline green、E0425 stop、用户确认的唯一 `trace_enabled` import 修复与 1/1 green、provenance 579/575 stop、revision-1 reject、revision-2 accept、governance 7/7/provenance 20/20 green 全部保留。历史记录中的 467 是排除 `target` 后的仓库 Rust 文件总数；增长治理实际排除 `third_party` 的 173 份，当前 governed inventory 为 294。该术语更正及独立 P0/P1/P2=0/0/0 接受分别见 `l1e-f4096-revision-5-source-count-terminology-addendum.json` 与 `l1e-f4096-revision-5-source-count-terminology-independent-review.json`，不推翻 L0 行为或 7/7 结果。L1 写前映射（SHA `9002f723…ab6f3`）已由两位独立 Reviewer 以 P0/P1/P2=0/0/0 接受；其 L1a 预检与五条 baseline 均已完成，L1a 也已本地接受。
 
-The first Tier-B epoch has not started. Two exact-source `ce164e6` attempts
-passed baseline/direct/resource/start/smoke but failed closed before schedule
-entry. The first found the destroyed predecessor ECS key in root's
-`known_hosts`; the accepted replacement ED25519 fingerprint was independently
-reverified and root strict SSH now passes. The second found the exact
-`m2-frequency` command missing from `workload_command_matches()`, so PID
-identity registration could never succeed. Mac/Exit artifact SHA-256 pairs
-are `18dd409b.../72c7fec7...` and `dc5c83cd.../b066908a...`; both attempts
-completed notice, status/snapshot/stop, observer finalization, route/TUN,
-caffeinate, and IPv6 cleanup. They consume no epoch or ledger sequence.
+L1a、L1b 与 L1c RED 证据均已保留。用户确认后，历史 `ensure_spare_listeners_respects_global_cap` 已保持身份地更新为 zero-partial-write（2），其 abort 槽计数注释亦已更正；它与三个 direct tracer 均为 1/1 green。最终测试范围独立复核 P0/P1/P2=0/0/0，唯一 P1 已关闭。S0-G map 已独立 P0/P1/P2=0/0/0 接受。
 
-Local TDD admits the exact frequency command and rejects suffix drift. The
-adjacent sleep-inhibitor and M0/M1 same-TUN policies now include frequency.
-The detached controller validates one active/healthy observer report through
-the exact root SSH identity before starting workload; transport failure and
-inactive success reports both stop before workload. Complete runner,
-controller, frequency, ledger, resource, and process-visible observer
-self-tests plus syntax/diff/secret/review pass with no unresolved P0/P1. No
-Rust, workload, SLI, server, network, or frozen value changed. Next:
-commit/push, sync/build the HK Mac at the new exact source, rerun script gates,
-take a new baseline and fresh direct/resource evidence, then launch the first
-four-epoch run. Result:
-`docs/tech/2026-08-18-knife15-m2-frequency-preaction-control-failures-local-results.md`.
+S0-G 与 F0 的接受边界不变。G0-T 的三条物理 rearm characterizer 仍留在 private `compatibility_rearm_custody.rs`，G0-M 的 Generic dispatch pure Move 结论也保持。G0 gateway 现已本地接受：新 private `flow_custody/rearm.rs` 是唯一 no-F `request_close_or_rearm` mint 与物理 abort/clear/fake-IP-release/epoch/relisten sink；握手、reaper、remote payload、deferred close、owned action 和实际 `RelayEvent::Closed` 都经原 loop 的 borrowed gate。`ReapPlan` 先只读 inspect、先 gate、后 apply；当前 Closed bridge tracer 还在 rearm 后经同一被动 bridge 注入旧 epoch `DataReady` 并锁定拒绝。custody 与治理两位最终独立 Reviewer 均为 P0/P1/P2=0/0/0；rearm child 6/6、flow-custody 8/8、七组受影响 legacy filters、growth 7/7、provenance 20/20、scoped Rust-2024 fmt 与 diff 均 green。root shrink-only ratchet 为 14531、`too_many_arguments` 为 32；库存为 472 total / 173 third-party excluded / 299 governed。首次全仓 fmt 的非本范围脏格式失败、一次 test-only re-export compile stop 与用户确认的一行 `legacy_event_loop/mod.rs` repair 均保留。见 `l1e-f4096-revision-5-g0-final-acceptance.json`。这只接受 legacy no-F rearm gateway。其后 F1-T-CAP 的历史容量停止已由接受的 map-free allocation 取代：S4 条件已满足，且仅分配 settlement child 拓扑；在该 capacity-allocation boundary，当时的下一门是文档-only exact Writer map，而不是新的 capacity decision。该 map 现已接受；F1 Rust 仍须等待明确 scope/topology decision；P3/N2–N5 和外部验收未开始。
 
-#### Superseded decision (2026-08-17 — Tier A exhausted; replacement Exit admission PASS; fresh evidence next)
+S6 的纯 Move 已本地接受（P0/P1/P2=0/0/0）。用户已确认最小 S7a：先把三个只供 event lane 的 helper 独立 Move 并 green-to-green，再通过被动 harness bridge 驱动一条实际旧 epoch `Closed` tracer。S7a 不修复行为；首个 tracer 结果必须留证并停在 S7b 之前。见 `l1e-s7a-bridge-tracer-proposal.json`。
 
-The original Alibaba US candidate-1 ECS was destroyed after Tier A was sealed
-and before any Tier-B epoch began. Its retained EIP `47.89.211.4` /
-`eip-rj9hj9g6dbtxwwxfqmw0t` is now attached to replacement ECS
-`i-rj9c5rn1psf504mf1zo2` in `us-west-1b`. This is frozen as the new Tier-B
-identity `tierb-alibaba-usw1-r1`; it is not a third Tier-A candidate and it
-does not invalidate evidence because no epoch existed. Exact host key and
-server binary/config identities are
-`SHA256:km4qtBz/r+jNuPv4WKoCP3LoIyw1U6nfRNMIWpW9K24` and
-`4ea794fd.../0c48b683...`. Guest service, Target path, SSH, capacity, clock, and
-apt isolation pass. The exact no-TUN TUIC handshake/auth/Connect probe passed
-in `1002ms`, with the guest UDP 8443 counter advancing by `23 packets /
-11,726B`; real TUIC admission passes. Aegis Agent Protection is now disabled;
-the `2026-08-17 14:44:14Z` reboot proves no Aegis unit/process or `AliSecGuard`
-module, while sing-box and all frozen hashes remain healthy. The three extra
-ingress rules were removed; non-HK direct SSH then failed while HK strict SSH
-and a fresh exact TUIC probe passed in `1001ms`, with guest evidence `25
-packets / 11,843B` and exact nftables cleanup. Replacement Exit admission now
-passes. No TUN, observer, or Tier-B epoch has started. Result:
-`docs/tech/2026-08-17-knife15-m2-frequency-usw1-replacement-exit-admission-results.md`.
-
-Candidate-2 Formal 1 is complete and rejected. Exact-source `27a7ca0`
-Mac/Exit bundles SHA-256 `0501d259.../2453a153...` passed resource admission,
-observer identity, result integrity, and cleanup, but the first `udp-reverse`
-result measured `6.164314%` loss against the frozen `3%` ceiling. TCP
-receiver-zero and sender-zero were zero. Mac UDP/TUN/Endpoint drop and
-backpressure counters, Exit kernel drops, and the Exit/Target path were clean;
-paired probes select transient HK-to-Tokyo public-path loss after Exit kernel
-egress. This is a genuine quality failure, not an invalid controller run.
-
-Strict sequence 4 is sealed as `quality_failure/udp_loss`. Candidate 1 and
-candidate 2 are both rejected with zero formal passes; evaluation SHA-256
-`8a953089...` emits `TIER_A_EXHAUSTED`. Do not add a third Tier-A VPS, rerun
-candidate 2, resize, tune, or reopen AWS. Tier B is now active; M3 remains
-blocked.
-
-Task 8 local implementation/review passes at source floor `5ca79d4`. The
-separate `m2-frequency` action requires the exact Tier-A exhaustion pair,
-seals one to four exact six-hour epochs, preserves complete epochs across a
-later failed/interrupted parent, and accepts only twelve valid epochs with one
-uninterrupted four-epoch/24-hour process/TUN lifetime. Strict `m2` rejects
-Tier-B inputs. UDP/gap/DNS/real-client/D16/Endpoint/resource/observer/cleanup
-gates remain fail-closed; only complete receiver-zero intervals reach the
-frequency reducer.
-
-Archive replay binds exact epoch paths, source/binary/workload, stable
-provider/route/server identity, fresh per-run direct/resource evidence, paired
-Exit capture, and cleanup. Task 9 now also has a reviewed detached controller
-and exact macOS runbook. The controller maintains same-TTY sudo ownership,
-sends the requested best-effort completion email once, always attempts Mac
-status/snapshot/stop, and recovers an observer started before runner ownership
-was armed. Unknown observer cleanup fails closed.
-
-Root `713+3 ignored`, main `2`, integration `10+4 ignored`, release, Clippy,
-vendored Quinn/proto/docs, script self-tests, syntax, provenance, diff/secret,
-Endpoint `240.511 Mbit/s`, D16 batch, and full-TUN gates pass. Concentrated
-review has no unresolved P0/P1. Next: review/commit/push the replacement-
-identity closure, sync/build the HK Mac, take fresh baseline/direct/resource
-evidence, and then launch the first four-epoch/24-hour run. M3 remains blocked.
-Result:
-`docs/tech/2026-08-17-knife15-m2-frequency-controller-local-results.md`.
-
-#### Superseded decision (2026-08-17 — Formal 1 control-invalid; reviewed retry next)
-
-Formal 1 is not active. Candidate-2 bundles SHA-256
-`5d26e42d.../d6e1dad8...` completed 17 cycles and reached the healthy end of
-`idle-1`, then failed before the first checkpoint row. Completed traffic had
-zero receiver-zero intervals, maximum UDP loss `0.561407%`, Exit packet capture
-`64,792,664` with zero kernel drops, and clean safety/cleanup. The failure is a
-live-log partial-tail mismatch in the checkpoint reader, not VPS, Mac, TUN,
-Endpoint, data-plane, or candidate quality. It consumes no formal result;
-candidate 2 remains `awaiting_formal` with zero passes and `TIER_A_PENDING`.
-
-Local TDD/review repaired complete-record authority for data-plane samples,
-replay lifecycle syntax, and active leases. Repaired runner SHA-256 is
-`8b0d0c9e...`; the ledger bridges only the exact qualified/repaired runner pair
-when the exact Mac release hash remains `5e946af2...`. No Rust or frozen
-workload/value changed, and arbitrary source/runner/binary drift remains
-rejected. Relevant self-tests, shell/Python/diff/secret gates, existing ledger
-replay, and review pass.
-
-Next: commit/push, sync and exact-build the HK Mac, apply bounded candidate-VPS
-maintenance isolation, run fresh detached control/resource preflight, then one
-fresh Formal 1. Do not tune or repeat a genuine quality failure. Result:
-`docs/tech/2026-08-17-knife15-m2-candidate2-formal1-control-failure-local-results.md`.
-
-Exact-source `b4244a7` candidate-2 qualification pair SHA-256
-`71a61c55.../516ff6d4...` passed its complete strict envelope: baseline
-`22.809/36.695 Mbit/s`, bounded direct `11.404318 Mbit/s`, resource admission,
-smoke, two cycles/eight phases, DNS/real-client checks, paired observer,
-safety, and cleanup. Receiver-zero and sender-zero were zero; maximum TCP gap
-was `7,077,888B`; maximum UDP loss was `0.145685%`. Endpoint terminal
-available/live/outstanding was `61,402/0/0B`; the Exit captured `7,517,117`
-packets with zero kernel drops.
-
-The strict ledger sealed `attempt-003` as `pass/strict_pass`, marks
-`candidate2-alibaba-tokyo` `awaiting_formal`, and emits `TIER_A_PENDING`.
-Next: reuse the preserved exact qualification baseline, take one fresh direct
-and resource preflight, then run Formal 1 with the reviewed runner bridge and
-the same release binary, candidate, server, observer, and workload contract. A clean Formal 1 opens
-Formal 2; a genuine quality failure rejects candidate 2 and exhausts Tier A.
-M3 remains blocked. Result:
-`docs/tech/2026-08-15-knife15-m2-strict-candidate2-qualification-results.md`.
-
-Three invalid controller attempts before qualification were decision-neutral
-and consumed no slot. The active runbook now clears resource-preflight
-`OUT_DIR`; multi-hour remote Mac execution must live in a persistent local
-terminal session with bounded same-TTY sudo keepalive and a separate log.
-
-#### Previous decision (2026-08-15 — candidate 1 rejected, final strict candidate 2 next)
-
-Exact-source `b4244a7` Alibaba candidate 1 passed qualification, then its
-first formal run failed after `13h04m21s`. It completed 49 cycles, three
-idle/resume boundaries, 503 phases, 49 DNS/real-client checks, safety, and
-cleanup before cycle 53 `short-forward-1` produced one Target receiver-zero
-interval. The paired Exit captured `235,650,063` packets with zero kernel
-drops. Failure-window QUIC/Target payload gaps were only
-`144.568/165.236ms`; the first Target window carried `128,505B` raw TCP
-payload (`128,468B` test data), just below the `131,072B` iperf3 application
-block. This is not a D16/Endpoint/TUN or
-one-second wire blackout, but it is a valid failure under the frozen
-application-observed strict SLI.
-
-The strict ledger sealed `attempt-002` as
-`quality_failure/receiver_zero`, marks `candidate1-alibaba-usw1` rejected,
-and emits `TIER_A_PENDING`. Do not repeat or tune candidate 1. Result:
-`docs/tech/2026-08-15-knife15-m2-strict-candidate1-formal-failure-results.md`.
-
-Candidate 2 is now created as Alibaba ECS `i-6weckus0r7voaarxz2k3`, EIP
-`8.211.176.98`, Tokyo `ap-northeast-1c`, `ecs.c8ine.large` 2-vCPU/4-GiB class,
-Ubuntu 24.04. Its out-of-band ED25519 key matches network scan and strict SSH;
-instance/image/VPC/EIP identity and no global IPv6 pass. Next: agent-owned
-service provisioning, host isolation, external TUIC/resource preflight, and
-exact qualification. Candidate 2 is the final Tier-A resource. Contract:
-`docs/tech/2026-08-15-knife15-m2-strict-candidate2-resource-selection.md`.
-
-The user explicitly substituted Alibaba Tokyo for AWS Tokyo. This candidate is
-distinct from frozen `.33` Tencent/AS132203 but shares Alibaba/AS45102 with
-candidate 1; preserve that weaker provider discrimination. A genuine quality
-failure exhausts Tier A and opens Tier B without a later AWS retry.
-
-The following candidate-1 provisioning text is historical context.
-
-Candidate 1 is now provisioned, host/service-ready, and externally
-traffic-admitted at Alibaba EIP `47.89.211.4` (AS45102). Guest capture sees the
-narrowly admitted HK-Mac UDP 8443, and a real no-TUN TUIC handshake/auth/
-Target-Connect probe passes in `1002ms`. Qualification has not run. Reviewed
-source `218467b` preserves controlled probe diagnostics while requiring one
-valid final report before TUN. It also enforces a global
-`PreventUserIdleSystemSleep` assertion and repairs exact utun plus
-interface/gateway pre-ready cleanup.
-Result:
-`docs/tech/2026-08-14-knife15-m2-alibaba-candidate1-provisioning-and-preflight-results.md`.
-The real failed pre-ready state is now finalized with cleanup PASS in bundle
-SHA-256 `228533d3...`; no qualification slot was consumed.
-
-The `cdbfe36` formal M2 failure remains genuine and immutable. The user
-canceled the mature-client comparison before C0. The completed comparison
-harness remains historical; do not ask the user to open a TUIC client. Its
-reviewed complete-interval reducer may be reused locally.
-
-Next:
-
-0. **DONE:** establish agent-operated HK Mac access at
-   `xiaoou@192.168.133.109`, preserve the TCC-blocked Desktop clone, create
-   clean `/Users/xiaoou/mini_vpn` at `a16f661`, and pass release build plus the
-   full runner self-test. The user no longer runs Mac test commands;
-1. **DONE at `c688ce3`:** implement and review the immutable resource
-   manifest/admission helper and isolated nonsudo preflight;
-2. **DONE through `18c0e14`:** bind strict qualification/formal evidence to
-   the exact root-owned resource state, copied directory, and immutable archive
-   without weakening `receiver_zero == 0`;
-3. **DONE through `ffd99af`:** implement the strict attempt ledger, exact
-   paired-artifact/source reducer, and frozen `.33` reference identity;
-4. **DONE through source-floor closure `bcd63b4`:** write the operator runbook,
-   bind/limit semantic provider and route evidence, preserve the exact
-   baseline outside `/tmp`, and pass complete local review gates;
-5. **DONE:** candidate 1 was rejected by its first formal strict failure;
-   candidate 2 Alibaba Tokyo was provisioned, identity-bound, traffic-admitted,
-   and passed its one strict qualification;
-6. **IN PROGRESS:** run candidate-2 Formal 1 and, only if clean, Formal 2;
-   reject the candidate on its first genuine quality failure without tuning
-   or favorable-sample repetition;
-7. if one candidate passes twice, accept Tier A and reopen M3;
-8. only if both candidates genuinely fail, implement Tier B as a separate
-   action: at most three isolated one-second episodes/rolling 24h, at most one
-   /rolling 6h, no consecutive zero intervals, 72 valid hours including one
-   uninterrupted 24-hour process/TUN lifetime;
-9. preserve every other M2 safety, UDP, lifecycle, ownership, observer, and
-   cleanup gate.
-
-Specifications:
-`docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-spec.md`
-and
-`docs/tech/2026-08-14-knife15-m2-tiered-continuity-resource-strategy-implementation-plan.md`.
-Task-2 result:
-`docs/tech/2026-08-14-knife15-m2-resource-admission-local-results.md`.
-Task-3 result:
-`docs/tech/2026-08-14-knife15-m2-strict-resource-binding-local-results.md`.
-Task-4 result:
-`docs/tech/2026-08-14-knife15-m2-strict-attempt-ledger-local-results.md`.
-Task-5 result:
-`docs/tech/2026-08-14-knife15-m2-strict-resource-local-results.md`.
-
-#### Formal-failure basis (2026-08-14 — M2 reached the standard-TUIC one-second continuity stop)
-
-Exact-source `cdbfe36` formal artifact
-`/tmp/mini_vpn_knife15_macos_20260814_014536.tar.gz` (SHA-256 `2c002684...`)
-passed baseline `32.701/56.515 Mbit/s`, bounded direct `16.341 Mbit/s`, smoke,
-all preflights, four complete cycles/36 phases, four DNS and real-client
-checks, and cleanup. Cycle 5 `tcp-forward` then produced five complete Target
-receiver-zero intervals, so formal M2 failed and M3 remains blocked.
-
-Paired Exit SHA-256 `ba378743...` captured `25,857,901` packets with zero
-kernel drops. Target egress fell with TUIC ingress; the exact Target socket
-retained ACK progress with only `2,725B` retransmitted, a maximum `30,350B`
-send queue, and a `996.276ms` maximum payload-supply gap. The failed stream's
-Mac-side QUIC connection retained ACK progress while cwnd contracted
-`2,675,530 -> 24,463B`, lost bytes advanced `2,467,761 -> 3,795,148`, and
-PLPMTUD black holes advanced `4 -> 36`. D16, TUN, Endpoint, process, routes,
-DNS, observer, Target, and Exit-to-Target TCP were clean.
-
-Targeted code review found no unresolved local P0/P1 and no correct
-implementation seam within the frozen standard-TUIC architecture. Existing
-generation replacement and the VLESS/REALITY Transport can protect future
-opens, but neither can migrate the established Target TCP socket. Reusing
-same-path reset/rebind is formally rejected; a duplicate TUIC Connect is a
-different Target socket.
-
-Previous next decision, now superseded by the tiered-resource stage above:
-
-1. do not repeat formal M2 unchanged and do not tune any frozen value;
-2. freeze reviewed behavior at `cdbfe36`;
-3. do not choose a custom Upstream until two eligible strict resource
-   candidates and, if necessary, the bounded low-frequency gate are complete;
-4. keep formal M2 failed and M3 blocked meanwhile.
-
-Result:
-`docs/tech/2026-08-14-knife15-m2-ack-progress-native-loss-recovery-formal-failure-results.md`.
-
-#### Previous decision (2026-08-13 — paired successor install qualification passed; formal M2 reopened)
-
-Exact-source `d91f205` paired Mac artifact
-`/tmp/mini_vpn_knife15_macos_20260813_095649.tar.gz` (SHA-256 `db8297c6...`)
-passed baseline `19.549/52.870 Mbit/s`, bounded direct `9.771 Mbit/s`, smoke,
-all preflights, two cycles/eight phases, two DNS and real-client checks, and
-cleanup. Target receiver-zero was zero, maximum TCP gap was `5,767,168B`, and
-maximum UDP loss was `2.548546%`.
-
-The run reached the decisive branch: predecessor current `235,811B` became the
-handoff requirement, while successor readiness stayed `26,338B`; five exact
-turns proved final `427,953B` with zero loss and the live `c06a9d0` install CAS
-installed generation 2. No `stale_cwnd`, failed replacement, path reset, or
-Endpoint rebind recurred. Three timed close tails passed D16/terminal replay.
-Endpoint final was `61,402/0/0B` with zero abandon/would-block.
-
-Paired Exit SHA-256 `9dc4c864...` captured `10,442,111` packets with zero
-kernel drops and cleaned observer state/table ownership. Result:
-`docs/tech/2026-08-13-knife15-m2-successor-install-revalidation-macos-qualification-results.md`.
-
-Next:
-
-1. do not repeat qualification;
-2. pull/rebuild the pushed reviewed descendant on the HK Mac;
-3. reserve about 25 uninterrupted hours and run one fresh formal
-   `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke ->
-   fresh .33 observer start -> m2 -> status -> stop`;
-4. require `cce3bf8` or a descendant, then sync both automatically finalized
-   bundles. M3 remains blocked until formal M2 and cleanup pass.
-
-#### Previous decision (2026-08-13 — prequalification code review closed three preventable P1 gaps)
-
-Concentrated review after the service-floor separation repaired three defects
-that could otherwise waste or invalidate the next Mac run:
-
-- `c06a9d0` revalidates successor live close/path/cwnd state under the exact
-  generation-slot install mutex, after the typed proof and immediately before
-  activity/install ownership changes;
-- `cce3bf8` rejects untracked exact-source inputs such as `build.rs`; and
-- paired healthy Exit observer admission is now executable for qualification,
-  not only documented or reserved for formal M2.
-
-Expected RED/GREEN tests and all local gates pass. Root is `713+3 ignored`,
-integration is `10+4 ignored`, exact Endpoint capacity is `225.382 Mbit/s`,
-and code review has no unresolved P0/P1. No frozen data-plane value, workload,
-SLI, retry, or deadline changed. Result:
-`docs/tech/2026-08-13-knife15-m2-prequalification-code-review-local-results.md`.
-
-Next:
-
-1. pull/rebuild the pushed reviewed descendant on the HK Mac and confirm
-   `git status --short` is completely empty;
-2. reserve about 45 uninterrupted minutes and start one fresh `.33` observer
-   only after smoke;
-3. run exactly one paired `m2-ipv6-check -> baseline -> direct-discriminator
-   -> start -> smoke -> fresh .33 observer start -> m2-qualification ->
-   status -> stop -> observer freeze/bundle`;
-4. sync both bundles. A clean qualification reopens one fresh formal M2 of
-   about 25 hours. Do not run formal first or tune/repeat unchanged.
-
-#### Previous decision (2026-08-13 — formal M2 rejected historical handoff as lifetime readiness; separation ready for qualification)
-
-Exact-source `642e3ae` formal artifact
-`/tmp/mini_vpn_knife15_macos_20260813_053346.tar.gz` (SHA-256
-`6aeddcf1...`) passed baseline `23.289/52.799 Mbit/s`, bounded direct
-`11.632 Mbit/s`, smoke, every preflight, nine complete cycles, 87 phases,
-nine DNS/real-client checks, and cleanup. Cycle 10 `short-reverse-4` timed out
-before creating a connection. Formal M2 remains failed and M3 remains blocked.
-
-Paired Exit SHA-256 `8a0c0c19...` captured `57,705,606` packets with zero
-kernel drops and no Target counter advance for the failed phase. The exact
-auxiliary identity/path and black-hole state were unchanged, but current
-native cwnd `381,502B` was compared against a historical final handoff proof
-of `3,605,919B`. Repeated `stale_cwnd` replacement chased the historical
-value; the last proof lost one `1,409B` packet and failed closed before TUIC
-Connect. This selects certificate lifetime architecture, not external path,
-Mac operation, D16, TUN, or Endpoint.
-
-Reviewed `b7bb9a9` records the first exact successor service turn as immutable
-readiness and carries later multi-round cwnd only as typed install proof. Each
-authorized replacement recomputes `max(readiness floor, exact current cwnd)`
-for that transaction, so failed historical handoffs cannot ratchet future
-admission. All prior stale/current-handoff discriminators and frozen values
-remain intact. Complete local gates pass; exact release Endpoint capacity is
-`240.256 Mbit/s`; code review has no unresolved P0/P1. Results:
-
-- `docs/tech/2026-08-13-knife15-m2-successor-service-floor-separation-formal-failure-results.md`
-- `docs/tech/2026-08-13-knife15-m2-successor-service-floor-separation-local-results.md`
-
-Next:
-
-1. pull/rebuild the pushed reviewed descendant on the HK Mac;
-2. reserve about 45 uninterrupted minutes and start one fresh `.33` observer
-   only after smoke;
-3. run exactly one paired `m2-ipv6-check -> baseline -> direct-discriminator
-   -> start -> smoke -> fresh .33 observer start -> m2-qualification ->
-   status -> stop -> observer freeze/bundle`;
-4. sync both bundles; do not run formal M2 first or tune/repeat unchanged. A
-   clean qualification reopens one fresh formal M2.
-
-#### Previous decision (2026-08-13 — path-reset retirement qualification accepted; formal M2 reopened)
-
-Exact-source `bec6dc8` paired qualification artifact
-`/tmp/mini_vpn_knife15_macos_20260813_030113.tar.gz` (SHA-256
-`8a65cc5b...`) passed its full traffic, network, ownership, and cleanup
-envelope: baseline `31.445/60.511 Mbit/s`, bounded direct `15.716 Mbit/s`, two
-cycles/eight phases, zero Target receiver-zero intervals, maximum TCP gap
-`7,208,960B`, and maximum UDP loss `2.230867%`.
-
-The immutable status is `failed/MISMATCH` only because two exact 24-byte Apple
-control tails had left D16 ownership before their local TCP peers became
-terminally Closed. Pending/reap/permit-drop and Endpoint ownership were zero.
-Reviewed `0296688` recognizes only this exact same-handle terminal transfer;
-all owned, mismatched, send-capable, incomplete, and reused-handle cases still
-fail. Paired Exit SHA-256 `97b7f704...` captured `11,576,962` packets with zero
-kernel drops and cleaned all observer ownership. A current-floor `242,949B`
-replacement attempt safely failed proof and fell back without receiver loss.
-
-Formal source floor repair `2ada935` rejects `bec6dc8` and requires `0296688`
-or a descendant before traffic. Complete runner self-test, immutable artifact
-replay, shell, diff, secret, and review gates pass with no unresolved P0/P1.
-Result:
-`docs/tech/2026-08-13-knife15-m2-path-reset-retirement-macos-qualification-results.md`.
-
-Next:
-
-1. pull/rebuild the pushed reviewed descendant on the test Mac;
-2. reserve about 25 uninterrupted hours for the Mac, `.33` Exit, and `.77`
-   Target;
-3. run exactly one fresh `m2-ipv6-check -> baseline -> direct-discriminator
-   -> start -> smoke -> fresh .33 observer start -> m2 -> status -> stop`;
-4. sync both final bundles. Do not repeat qualification or tune constants.
-   M3 remains blocked until formal M2 and cleanup pass.
-
-#### Previous decision (2026-08-12 — formal M2 rejected ACK-progress path reset; retirement ready for qualification)
-
-Exact-source `fe7b809` formal artifact
-`/tmp/mini_vpn_knife15_macos_20260812_102923.tar.gz` (SHA-256
-`eb1888a1...`) passed baseline, direct, smoke, all preflights, twenty complete
-cycles, 181 phases, and cleanup, then cycle 22 `tcp-forward` lost three
-complete Target receiver intervals. Paired Exit SHA-256 `ce2478a...` had zero
-drops and proved continuous low-RTT Exit-to-Target service. Formal M2 remains
-failed and M3 remains blocked.
-
-The exact current flow retained ACK progress, but a PLPMTUD black-hole
-increment authorized `Connection::path_changed()` on an unchanged real path.
-Its cwnd fell `24,285 -> 12,000B`; Target zeros followed. The reviewed
-current-service handoff later worked, but cannot migrate an existing TCP byte
-stream from its draining predecessor. This hits the explicit stop rule and
-rejects connection-local path reset without parameter tuning.
-
-Reviewed `0a3cc9c` removes that authority and all mini_vpn `path_changed()`
-execution while preserving exact ACK-stall/UDP Endpoint rebind, native Quinn
-recovery, replacement, handoff, and drain. All local correctness, transport,
-script, capacity (`240.079 Mbit/s`), and code-review gates pass with no
-unresolved P0/P1. Result:
-`docs/tech/2026-08-12-knife15-m2-ack-progress-path-reset-retirement-local-results.md`.
-
-Next:
-
-1. pull/rebuild the reviewed pushed descendant on the HK Mac;
-2. run exactly one paired `m2-ipv6-check -> baseline -> direct-discriminator
-   -> start -> smoke -> fresh .33 observer start -> m2-qualification ->
-   status -> stop -> observer freeze/bundle`;
-3. reserve about 45 uninterrupted minutes and sync both bundles;
-4. do not run formal M2 or tune/repeat unchanged. A clean qualification only
-   reopens one fresh formal M2.
-
-#### Previous decision (2026-08-12 — current-service handoff qualification passed; formal M2 reopened)
-
-Exact-source `579fff4` artifact
-`/tmp/mini_vpn_knife15_macos_20260812_092030.tar.gz` (SHA-256
-`c6d9c339...`) completed the two-cycle paired qualification with
-`PASS_NON_ACCEPTANCE`: baseline `38.274/61.255 Mbit/s`, direct
-`19.125 Mbit/s`, eight phases, two DNS and real-client checks, zero Target
-receiver-zero intervals, maximum TCP gap `7,733,248B`, maximum UDP loss
-`1.954378%`, and clean stop cleanup.
-
-Paired Exit SHA-256 `95afe240...` captured `12,235,760` packets with zero
-kernel drops. It was frozen and bundled; observer state/table ownership is
-clean and sing-box remains active. No replacement or path reset occurred, so
-the run proves regression cleanliness without independently proving the rare
-handoff branch. Per the accepted stop contract, do not repeat qualification;
-formal M2 is reopened as the decisive discriminator.
-
-The formal runner now rejects source `85d8772` and requires `579fff4` or a
-descendant. RED/GREEN and full runner self-test pass. Result:
-`docs/tech/2026-08-12-knife15-m2-replacement-current-service-handoff-macos-qualification-results.md`.
-
-Next:
-
-1. pull/rebuild the reviewed pushed descendant on the HK Mac;
-2. reserve about 25 uninterrupted hours for the Mac, `.33` Exit, and `.77`
-   Target;
-3. run exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
-   start -> smoke -> fresh .33 observer start -> m2 -> status -> stop`;
-4. sync both automatically finalized bundles; do not repeat qualification or
-   tune constants. M3 remains blocked until formal M2 and cleanup pass.
-
-#### Previous decision (2026-08-12 — formal M2 rejected stale current-service handoff; local repair ready for qualification)
-
-Exact-source `85d8772` formal artifact
-`/tmp/mini_vpn_knife15_macos_20260812_034701.tar.gz` (SHA-256
-`9d33b1af...`) passed baseline `17.776/64.868 Mbit/s`, direct, smoke, exact
-observer admission, every preflight, fifteen whole cycles, and cleanup. Cycle
-16 `short-forward-5` then lost its first complete Target receiver interval.
-Formal M2 remains failed and M3 remains blocked.
-
-Paired Exit SHA-256 `643a019a...` proves that the exact Target socket kept ACK
-progress with about `1..5ms` RTT, but received only `113,261B` in the first
-`1.001031s`, below one `131,072B` iperf block. The direct replacement had
-discarded current forward service: predecessor cwnd was `361,778B`, while its
-stored inherited floor and successor proof were only `26,338B`. This rejects
-the previous path-reset-only inheritance mechanism as sufficient.
-
-The reviewed local repair atomically publishes
-`max(previous_owned_floor,current_generation_cwnd)` from the exact current
-slot before successor handshake/proof. The existing dynamic sequential
-ACK-owned turns and install CAS enforce that floor under the unchanged
-five-second deadline. All local correctness, vendored transport, script,
-capacity (`239.536 Mbit/s`), and review gates pass with no unresolved P0/P1.
-Result:
-`docs/tech/2026-08-12-knife15-m2-replacement-current-service-handoff-local-results.md`.
-
-Next:
-
-1. pull the reviewed pushed descendant on the Mac, confirm a clean worktree,
-   and rebuild release;
-2. run exactly one paired `m2-ipv6-check -> baseline -> direct-discriminator
-   -> start -> smoke -> fresh .33 observer start -> m2-qualification ->
-   status -> stop`;
-3. sync both bundles; do not run formal M2 or repeat/tune unchanged;
-4. a Target receiver-zero after the exact handoff floor is proved rejects the
-   architecture. A clean qualification only reopens formal M2.
-
-#### Previous decision (2026-08-12 — formal M2 observer state binding repaired locally)
-
-Exact-source `166c390` artifact
-`/tmp/mini_vpn_knife15_macos_20260812_030150.tar.gz` (SHA-256
-`692c6286...`) passed start/smoke and reached observer admission, but formal M2
-did not start. The referenced observer status file was zero bytes and cleanup
-passed. The matching `.33` observer was active and healthy; this was not a
-VPS, observer-lifetime, network, or operator-order failure.
-
-The runner had not persisted the parsed TUIC `server_port` at start. Formal
-M2 therefore read an empty value and its silent input guard returned before
-SSH. Reviewed `1cdb17c` writes the complete start network binding and leaves
-sanitized readable evidence for invalid observer inputs. Focused RED/GREEN
-self-tests pass. Formal M2 now rejects source older than `1cdb17c`; no Rust
-production code, workload, SLI, or frozen value changed. Result:
-`docs/tech/2026-08-12-knife15-formal-m2-observer-state-binding-repair-local-results.md`.
-
-Next:
-
-1. pull the reviewed pushed descendant on the Mac, confirm a clean worktree,
-   and rebuild release;
-2. run one fresh `m2-ipv6-check -> baseline -> direct-discriminator -> start
-   -> smoke -> observer start -> m2 -> status -> stop`;
-3. start the observer after smoke and invoke `m2` within 900 seconds;
-4. do not reuse the stopped run or frozen observer and do not tune constants.
-   M3 remains blocked until formal M2 and cleanup pass.
-
-#### Previous decision (2026-08-11 — formal M2 hit external UDP loss; exact v2 observer required)
-
-Exact-source `0e44a939` artifact
-`/tmp/mini_vpn_knife15_macos_20260811_074703.tar.gz` (SHA-256
-`a0c268c1...`) completed fourteen formal cycles before cycle 15 reverse UDP
-reported `3.934088%` loss, above the frozen `3%` limit. TCP receiver-zero was
-zero and cleanup passed. Local TUN/D16/Endpoint/backpressure evidence was
-clean; Target sent the full datagram count; a later exact `.77 -> .33`
-same-rate discriminator had `0%` loss. The highest-confidence classification
-is transient external UDP/QUIC path loss, but the missing historical Exit
-observer prevents exact segment attribution. The result remains a real formal
-M2 failure.
-
-The v2 observer now runs up to `93,600s`, samples Target/TUIC packet and byte
-counters once per second, retains only a bounded recent pcap ring, and owns
-its nftables table with fail-closed cleanup. Formal `m2` requires the matching
-observer to be fully healthy and at most `900s` old, binds its SSH host to the
-recorded Exit, and automatically freezes/bundles it on every terminal path.
-Source older than reviewed observer commit `2707873` is rejected.
-Local self-tests and a real `.33` lifecycle probe pass; no Rust production
-code, frozen value, workload, or SLI changed. Result:
-`docs/tech/2026-08-11-knife15-formal-m2-udp-path-attribution-observer-local-results.md`.
-
-Next:
-
-1. finish local gates, code review, commit, and push the v2 observer stage;
-2. pull the reviewed descendant and rebuild release on the Mac;
-3. after smoke, start exactly one fresh `93,600s` observer and invoke formal
-   `m2` within 900 seconds;
-4. preserve/sync both automatic Exit observer and Mac bundles;
-5. do not repeat qualification or tune constants. M3 remains blocked until
-   formal M2 and cleanup pass.
-
-#### Previous decision (2026-08-11 — formal M2 preflight self-audit passed)
-
-A concentrated pre-test audit removed three preventable long-run risks without
-changing Rust production code or frozen behavior. Formal M2 now uses the exact
-qualification recovery contract; source older than reviewed inheritance
-`de4d170` is rejected; stale/symlinked release binaries and dirty tracked
-worktrees are rejected before traffic. The Mac runbook now points to the
-formal `m2` action and mandatory cleanup.
-
-Root `705+3 ignored`, main `2`, integration `10+4 ignored`, focused successor
-`9+1`, release/full-TUN, Clippy, fmt, shell, runner/observer self-tests, and
-diff checks pass. Release batch capacity was `1,406.229 Mbit/s` with zero ring
-drops/full waits. Code review has no unresolved P0/P1; readiness to start
-formal M2 is `10/10`. Result:
-`docs/tech/2026-08-11-knife15-formal-m2-preflight-self-audit-local-results.md`.
-
-Next:
-
-1. pull the reviewed pushed descendant, confirm a clean worktree, and rebuild
-   release;
-2. while `.33` Exit and `.77` Target can remain uninterrupted for about 25
-   hours, run exactly one `m2-ipv6-check -> baseline -> direct-discriminator
-   -> start -> smoke -> m2 -> status -> stop`;
-3. do not rerun qualification or tune constants;
-4. preserve `status/snapshot/stop` after failure. M3 remains blocked until
-   formal M2 and cleanup pass.
-
-#### Previous decision (2026-08-11 — paired qualification evidence passed; runner false negative fixed; formal M2 reopened)
-
-Exact-source `25ea39c` artifact
-`/tmp/mini_vpn_knife15_macos_20260811_054300.tar.gz` (SHA-256
-`23a49673...`) passed baseline `11.858/55.917 Mbit/s`, bounded direct at
-`5.928 Mbit/s`, smoke, every preflight, two cycles/eight phases, two
-DNS/real-client checks, and cleanup. Target receiver-zero intervals were zero;
-one sender interval was zero, maximum TCP gap was `5,636,096B`, and maximum
-UDP loss was `1.830049%`.
-
-The immutable status is `failed/MISMATCH`, but exact replay proves a runner
-false negative. The immediate final Endpoint line was
-`60,031/1,409/0B`; about 14 seconds later ordinary statistics reached
-`61,414/0/0B` and stayed zero-owned. Paired Exit SHA-256 `6f745e9f...`
-captured `3,270,562` packets with zero drops. The short flow containing the
-sender-zero supplied `2,817,041B/10.182s` with maximum `263.147ms` gap, so
-Target continuity did not fail.
-
-Reviewed `3a8a796` waits for terminal safety under the existing 50-second
-controlled-drain bound, rejects persistent dirt, then rechecks runtime and
-network health. Full runner self-test, exact artifact replay, shell, diff,
-secret scan, and review pass with no unresolved P0/P1. No Rust data-plane or
-frozen value changed. No path reset/inherited floor occurred in this run, so
-formal M2 remains the deciding branch-reachability gate. Result:
-`docs/tech/2026-08-11-knife15-m2-successor-forward-service-inheritance-macos-qualification-results.md`.
-
-Next:
-
-1. do not repeat or tune qualification;
-2. pull/rebuild the pushed descendant of `3a8a796`;
-3. when the HK Mac and `.33` services can remain uninterrupted for about 25
-   hours, take exactly one `m2-ipv6-check -> baseline ->
-   direct-discriminator -> start -> smoke -> m2 -> status -> stop`;
-4. preserve `status/snapshot/stop` after failure;
-5. a Target receiver-zero after a logged nonzero inherited floor rejects the
-   mechanism. M3 remains blocked until formal M2 and cleanup pass.
-
-#### Previous decision (2026-08-11 — formal M2 rejected one-turn successor service; inheritance ready for qualification)
-
-Exact-source `e531b30` formal artifact
-`/tmp/mini_vpn_knife15_macos_20260811_014220.tar.gz` (SHA-256
-`2d8b4e6e...`) passed baseline/direct, smoke, every preflight, five whole M2
-cycles, and most of cycle 6. `short-forward-3` then lost its first complete
-Target receiver interval after the sender admitted `10,878,976B`; Target
-received `4,194,304B`, sender retransmits were zero, and cleanup passed.
-
-The exact predecessor path reset surrendered `41,301B` cwnd. Its successor
-installed after one service turn at `26,424B`, stayed on the same exact
-identity/path with continuous ACK progress, and owned the failed short flow.
-D16, TUN, Endpoint conservation, VPS probes, routes, DNS, resources, and
-cleanup were healthy. No paired Exit capture existed. This satisfies the
-previous stop rule and rejects one current-cwnd turn as sufficient.
-
-Reviewed `de4d170` stores the positive pre-reset cwnd as a monotonic exact
-generation-owned floor. A successor must perform sequential exact ACK-owned
-service turns on one path until it reaches that floor, all within the unchanged
-five-second replacement deadline. Reset and floor publication are one slot
-transaction; install CAS rechecks the latest floor. Every frozen data-plane
-and workload value remains unchanged.
-
-All local gates and review pass with no unresolved P0/P1: root
-`705+3 ignored`, vendored Quinn/proto `40+3 ignored`/`330`, and exact Endpoint
-capacity `240.349 Mbit/s` with final `61,440/0/0B` and zero would-block.
-Result:
-`docs/tech/2026-08-11-knife15-m2-successor-forward-service-inheritance-local-results.md`.
-
-Next:
-
-1. do not run another 25-hour formal M2 yet and do not tune constants;
-2. pull/rebuild the pushed reviewed descendant and start one fresh bounded
-   `.33` observer;
-3. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
-   start -> smoke -> m2-qualification -> status -> stop`;
-4. preserve `status/snapshot/stop` after failure and upload both bundles;
-5. a receiver-zero after a logged nonzero inherited floor rejects this
-   mechanism; a clean qualification reopens formal M2. M3 remains blocked
-   until formal M2 passes.
-
-#### Previous decision (2026-08-10 — paired qualification passed; formal M2 reopened)
-
-Exact-source `c6ffa3a` artifact
-`/tmp/mini_vpn_knife15_macos_20260810_101221.tar.gz` (SHA-256
-`6121b8b8...`) passed baseline `12.791/44.901 Mbit/s`, bounded direct at
-`6.393 Mbit/s` with no zero interval, smoke, every preflight, two exact mixed
-cycles/eight phases, two DNS/real-client checks, and cleanup. All six TCP
-results had zero sender/receiver intervals; maximum TCP gap was `5,767,168B`
-and maximum UDP loss was `1.830894%`. The result correctly remained
-`PASS_NON_ACCEPTANCE`; formal M2 was not run.
-
-Conn1's exact `gap_ack_reinforcements` counter advanced `0 -> 8 -> 22` under
-smoke pressure and then stayed `22` through both cycles. Paired Exit SHA-256
-`03d51370...` captured `2,971,792` packets with zero kernel drops. The two
-qualification reverse sockets had maximum supply gaps of only
-`251.174/342.575ms`, no gap at or above `500ms`, and longest zero receive
-windows of `249.901/341.525ms`. This satisfies reachability, effectiveness,
-and boundedness without tuning.
-
-Endpoint high/final was `61,440B / 61,414/0/0B`; interface, socket, process,
-DNS, route/TUN ownership, secret scan, and cleanup gates passed. Two
-`Stopped(0)` writes were zero-owned timed-transfer close tails, not
-active-transfer failures. Result:
-`docs/tech/2026-08-10-knife15-m2-reverse-gap-ack-reinforcement-macos-qualification-results.md`.
-
-Next:
-
-1. do not repeat or tune `m2-qualification`;
-2. keep the reviewed `c6ffa3a` production-code tree, implementation `300fb16`,
-   its docs-only pushed descendant, and every frozen workload/config value;
-3. when the HK Mac can remain uninterrupted for about 25 hours, take one fresh
-   `m2-ipv6-check -> baseline -> direct-discriminator -> start -> smoke -> m2
-   -> status -> stop`;
-4. preserve `status/snapshot/stop` after failure and upload the bundle;
-5. M3 remains blocked until formal M2 and cleanup pass.
-
-#### Previous decision (2026-08-10 — exact reverse-gap ACK reinforcement ready for qualification)
-
-Exact-source `673d13d` artifact
-`/tmp/mini_vpn_knife15_macos_20260810_075621.tar.gz` (SHA-256
-`25847808...`) passed baseline `23.502/64.236 Mbit/s`, bounded direct, smoke,
-every preflight, cycle 1, cycle-2 forward, and cleanup. Cycle-2 reverse then
-lost one complete Target receiver interval; formal M2 was not run.
-
-The exact conn1 generation-2 stream-2 reader stopped at `385,286,941B` behind
-a missing `1,386B` prefix while buffered same-stream tail grew to `7,552,771B`.
-Another `2,982` datagrams and `2,981` STREAM frames arrived before the prefix
-recovered after `1,759ms`. Paired Exit SHA-256 `5c26edfd...` had zero drops;
-the exact TCP socket receive window reached zero, supply paused
-`1,158.373ms`, and the window reopened with resumed supply. Local
-ownership/conservation, service readiness, Target, and cleanup were healthy.
-
-Reviewed pushed `300fb16` uses exact `STREAM_DATA_BLOCKED` plus the same
-receive stream's ordered assembler gap and buffered tail to authorize one
-bounded ACK reinforcement. Packet-number history alone cannot arm it. A newer
-ACK replaces the opportunity, a reinforcement cannot self-rearm, and range
-collapse disarms it. The new counter records only reinforcements actually
-transmitted; no frozen value, workload, or SLI changed.
-
-The 64KiB flow-control RED/GREEN proves the remote writer is Blocked, drops the
-sole gap ACK, and recovers before the sender's loss-detection/PTO deadline.
-All local gates pass with no unresolved P0/P1; root is `700+3 ignored`,
-vendored Quinn/proto are `40+3 ignored`/`330`, and exact Endpoint capacity is
-`239.815 Mbit/s` with final `61,440/0/0B`. Result:
-`docs/tech/2026-08-10-knife15-m2-reverse-gap-ack-reinforcement-local-results.md`.
-
-Next:
-
-1. pull `300fb16`, rebuild on the Mac, and keep every other VPN off;
-2. start one fresh bounded `.33` observer only when the Mac is ready;
-3. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
-   start -> smoke -> m2-qualification -> status -> stop`;
-4. preserve `status/snapshot/stop` after failure and upload the bundle;
-5. do not run formal M2 or repeat/tune unchanged; a recurrence with nonzero
-   reinforcement rejects this mechanism, while zero reinforcement retains
-   only the exact reachability branch. M2/M3 remain blocked.
-
-#### Previous decision (2026-08-10 — successor service certificate ready for qualification)
-
-Exact-source `80df179` artifact
-`/tmp/mini_vpn_knife15_macos_20260810_055556.tar.gz` (SHA-256
-`9d291f6c...`) passed baseline `23.658/61.795 Mbit/s`, bounded direct at
-`11.822 Mbit/s` without zero intervals, smoke, every preflight, seven mixed
-phases, and cleanup. Cycle-2 short forward then lost one complete Target
-receiver interval; formal M2 was not run.
-
-Paired Exit SHA-256 `6d5538c9...` saw `1,506,514B` on the exact socket over
-`10.210s`, maximum supply gap `280.203ms`, Target ACK RTT about `1..6ms`, zero
-retransmit growth, and zero capture/kernel drops. The selected successor had
-proved `24,800B` after its service turn but was admitted later at `17,360B`,
-about `173ms` RTT, and zero black holes. Local ownership/conservation and
-cleanup were healthy; this selects stale successor service readiness.
-
-Reviewed pushed `3737dee` stores an immutable certificate for exact transport
-identity, logical generation, path generation, and post-turn cwnd floor.
-Ready requires matching identity/path and current cwnd at least the proved
-floor; stale auxiliary state uses the existing bounded fresh replacement,
-CAS install, and predecessor drain. Initial/incomplete evidence remains
-`Unknown`, all-stale and failure fallback remain bounded, and no frozen value
-or workload changed. Review also fixed a possible no-progress replacement
-loop when exact qualification epoch evidence was absent.
-
-All local gates pass with no unresolved P0/P1; root is `700+3 ignored`,
-vendored Quinn/proto are `40+3 ignored`/`326`, and exact Endpoint capacity is
-`237.868 Mbit/s` with final `61,440/0/0B`. Result:
-`docs/tech/2026-08-10-knife15-m2-successor-service-certificate-local-results.md`.
-
-Next:
-
-1. pull/rebuild the pushed reviewed descendant on the Mac and keep every
-   other VPN off;
-2. start one fresh bounded `.33` observer only when the Mac is ready;
-3. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
-   start -> smoke -> m2-qualification -> status -> stop`;
-4. preserve `status/snapshot/stop` after failure and upload the bundle;
-5. do not run formal M2 or repeat/tune unchanged; a recurrence rejects this
-   architecture and keeps M2/M3 blocked.
-
-#### Previous decision (2026-08-10 — exact transport-write flight ownership ready for qualification)
-
-Exact-source `b437b93` artifact
-`/tmp/mini_vpn_knife15_macos_20260810_021421.tar.gz` (SHA-256
-`33dddf00...`) passed baseline `25.429/54.539 Mbit/s`, bounded direct at
-`12.715 Mbit/s` without a complete zero interval, smoke, every preflight,
-cycle 1, cycle 2 long forward/reverse TCP and reverse UDP, and cleanup. Its
-cycle-2 short forward then lost one complete Target receiver interval; formal
-M2 was not run.
-
-Paired Exit SHA-256 `2bc46085...` saw the exact business socket receive about
-`4.23MB`, with no positive-supply gap above `165.430ms`, Target ACK RTT about
-`1..4ms`, zero retransmit growth, and zero capture/kernel drops. The D16 writer
-accepted `6,296,563B`, waited up to `3,820,792us`, and the owning generation-3
-QUIC cwnd grew only `12,947 -> 223,724B`. Local ownership/conservation and
-cleanup were healthy. This selects client-to-Exit congestion ownership.
-
-Production D16 reports every successful partial write through an async
-Progress channel. Quinn can packetize the accepted prefix during that handoff,
-before the writer's next Blocked retry. The old per-stream bit was already
-cleared; the old deterministic test immediately retried and therefore missed
-the worker turn.
-
-Reviewed `c218d8a` retains one exclusive accepted-offset boundary until
-its exact prefix is cumulatively ACKed or terminal. It cannot lend authority
-to another stream, control traffic, or later same-stream bytes. The production
-interleaving was RED at `24,000 -> 1,772,034B < 1,990,080B` and is GREEN. No
-frozen path/value or workload changed.
-
-All local gates pass with no unresolved P0/P1; root is `689+3 ignored`,
-vendored Quinn/proto are `40+3 ignored`/`325`, and exact Endpoint capacity is
-`239.784 Mbit/s` with final `61,440/0/0B`. Result:
-`docs/tech/2026-08-10-knife15-m2-transport-write-demand-flight-ownership-local-results.md`.
-
-Next:
-
-1. pull/rebuild the pushed reviewed descendant on the Mac and keep every
-   other VPN off;
-2. start one fresh bounded `.33` observer only when the Mac is ready;
-3. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
-   start -> smoke -> m2-qualification -> status -> stop`;
-4. preserve `status/snapshot/stop` after failure and upload the bundle;
-5. do not run formal M2 or repeat/tune unchanged; a recurrence rejects this
-   architecture and keeps M2/M3 blocked.
-
-#### Previous decision (2026-08-08 — transport-write packet ownership ready for qualification)
-
-Exact-source `eb2185f` artifact
-`/tmp/mini_vpn_knife15_macos_20260808_092053.tar.gz` (SHA-256
-`100d3163...`) passed baseline `17.521/65.771 Mbit/s`, bounded direct at
-`8.758 Mbit/s` without a complete zero interval, smoke, every preflight, long
-forward/reverse TCP, reverse UDP, and cleanup. Its cycle-1 short forward then
-lost one complete Target receiver interval; formal M2 was not run.
-
-The stream used replacement generation 2 at `24,886B` cwnd and about `165ms`
-RTT. Quinn accepted `6,300,119B`, writer Pending reached `2,367,062us`, and
-sampled QUIC ACKs reached `3,849,795B` while Target received `4,194,304B`.
-D16, TUN, Endpoint conservation, process, routes, and cleanup stayed healthy.
-No fresh paired Exit observer existed, so none is claimed.
-
-Reviewed `f9c3c23` keeps a stream's write-Blocked demand across Writable
-delivery and gives ACK growth authority only to packets carrying that stream's
-frames. Review RED/GREEN proves a cancelled/deferred writer cannot lend this
-authority to an unrelated stream. Successor pre-start adoption also excludes
-only the exact active PLPMTUD probe; authentication packet loss remains
-fail-closed. No rate, MTU policy, pool, window, chunk, Cubic, GSO, Endpoint,
-D16, retry, or timer changed.
-
-All gates pass with no unresolved P0/P1; root is `689+3 ignored`, vendored
-Quinn/proto are `40+3 ignored`/`323`, and the exact Endpoint gate reached
-`240.079 Mbit/s` with final `61,440/0/0B`. Result:
-`docs/tech/2026-08-08-knife15-m2-transport-write-demand-local-results.md`.
-
-Next:
-
-1. pull/rebuild the pushed reviewed descendant on the Mac;
-2. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
-3. tell the agent when the Mac is ready so a fresh bounded `.33` observer can
-   be started;
-4. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
-   start -> smoke -> m2-qualification -> status -> stop`;
-5. preserve `status/snapshot/stop` after failure and upload the bundle;
-6. do not run formal M2 or repeat/tune unchanged; keep M2/M3 blocked.
-
-#### Previous decision (2026-08-08 — successor authentication-flight ownership ready for qualification)
-
-Code review before the next Mac run found a prerequisite-ownership gap in the
-successor readiness gate. TUIC Authenticate can already be an in-flight Quinn
-Data packet when the service turn starts; the old turn began at
-`sent_bytes=0` and counted only later carriers. An adopted PLPMTUD probe also
-used a special loss path that did not terminate the turn.
-
-Reviewed `6aefd19` adopts every existing ACK-eliciting,
-congestion-accounted Data packet into the same current-cwnd turn. Exact Pair
-replay now proves delivered authentication succeeds only after all owned ACKs,
-withheld authentication fails `PacketLost`, and owned PLPMTUD loss terminates
-without waiting for the outer deadline. No MTU/congestion policy, turn size,
-deadline, payload, retry, Endpoint, admission, or frozen value changed.
-
-All gates pass with no unresolved P0/P1; root is `689+3 ignored`, vendored
-Quinn/proto are `40+3 ignored`/`320`, and the exact Endpoint gate reached
-`240.300 Mbit/s` with final `61,440/0/0B`. Result:
-`docs/tech/2026-08-08-knife15-m2-successor-authentication-flight-ownership-local-results.md`.
-
-Next:
-
-1. pull/rebuild the pushed reviewed descendant on the Mac;
-2. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
-3. tell the agent when the Mac is ready so a fresh bounded `.33` observer can
-   be started;
-4. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
-   start -> smoke -> m2-qualification -> status -> stop`;
-5. preserve `status/snapshot/stop` after failure and upload the bundle;
-6. do not run formal M2 or repeat/tune unchanged; keep M2/M3 blocked.
-
-#### Previous decision (2026-08-08 — Endpoint-blocked application ownership ready for qualification)
-
-Exact-source `a7cd603` artifact
-`/tmp/mini_vpn_knife15_macos_20260808_065723.tar.gz` (SHA-256
-`6fae3611...`) passed baseline `28.490/52.003 Mbit/s`, direct at
-`13.970 Mbit/s` without gaps, smoke, every preflight, the cycle-1 long
-forward/reverse TCP and reverse UDP phases, and cleanup. Its short forward
-then lost one complete Target receiver interval. Formal M2 was not run.
-
-The prior tagged-turn fix was present: conn1 generation 2 passed
-`12,000/12,800/12,800/0B` and installed at `24,800B` cwnd. Its business
-writer stayed Pending and ACK-progressing, but the first 128KiB took about
-`1.21s` to reach the Exit. Paired capture SHA-256 `ffb39a48...` had
-`2,075,057` packets, zero kernel drops, and about `1ms` Target ACK RTT. This
-selects client-to-Exit ordinary cwnd growth, not operator, Target,
-Exit-to-Target, D16, TUN, Endpoint capacity, cleanup, or a frozen value.
-
-Reviewed `1d08565` prevents only an Endpoint `Bulk` reservation wait from
-publishing `app_limited=true` on an empty Quinn poll. Control waits, real idle,
-Quinn pacing/congestion, partial batches, Cubic, tagged turns, loss/path/close,
-and all frozen behavior remain unchanged. The real-pair RED was
-`12,000 -> 12,000B` across 120 waits and is GREEN at one full growth round.
-All gates pass with no unresolved P0/P1; root is `689+3 ignored`, vendored
-Quinn/proto are `40+3 ignored`/`317`, and the exact Endpoint gate reached
-`239.487 Mbit/s` with final `61,440/0/0B`. Result:
-`docs/tech/2026-08-08-knife15-m2-endpoint-blocked-app-limited-local-results.md`.
-
-Next:
-
-1. pull/rebuild the pushed descendant on the Mac;
-2. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
-3. tell the agent when the Mac is ready so a fresh bounded `.33` observer can
-   be started;
-4. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
-   start -> smoke -> m2-qualification -> status -> stop`;
-5. preserve `status/snapshot/stop` after failure and upload the bundle;
-6. do not run formal M2 or repeat/tune unchanged; keep M2/M3 blocked.
-
-#### Previous decision (2026-08-08 — service-turn ACK ownership ready for qualification)
-
-Exact-source `f693d0d` artifact
-`/tmp/mini_vpn_knife15_macos_20260808_054225.tar.gz` (SHA-256
-`0e6d8ee6...`) passed baseline `21.003/42.391 Mbit/s`, direct at
-`10.497 Mbit/s` without gaps, smoke, every preflight, the long forward/reverse
-TCP/reverse UDP phases, and cleanup. Its first ten-second short forward then
-lost one complete Target receiver interval. Formal M2 was not run.
-
-Conn1 generation 2 had passed its replacement service turn at
-`12,000/12,800/12,800/0B`, but installed with only `13,280B` cwnd and stayed
-cold through the reverse phases. The paired Exit observer captured `1,569,331`
-packets with zero kernel drops; Target ACKed every Exit-supplied short-flow byte
-at about `1..3ms`. This selects client-to-Exit initial supply, not operator,
-Target, Exit-to-Target, D16, Endpoint, TUN, cleanup, or a frozen value.
-
-Reviewed `c3c264a` preserves send-time non-application-limited ownership for
-the existing tagged service-turn ACKs even if a later empty Quinn poll changes
-the global snapshot. Ordinary packets, Cubic, turn size/deadline/failure,
-pool, MTU, D16, Endpoint, GSO, workload, and SLIs are unchanged. A deterministic
-`164ms` RTT RED at `12,000 + 13,068 > 23,616` is GREEN. All local gates pass
-with no unresolved P0/P1; root is `689+3 ignored`, vendored Quinn/proto are
-`40+3 ignored`/`316`, and the exact Endpoint gate reached `237.701 Mbit/s`
-with final `61,440/0/0B`. Result:
-`docs/tech/2026-08-08-knife15-m2-successor-service-turn-app-limited-local-results.md`.
-
-Next:
-
-1. pull/rebuild the pushed descendant on the Mac;
-2. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
-3. tell the agent when the Mac is ready so a fresh bounded `.33` observer can
-   be started;
-4. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
-   start -> smoke -> m2-qualification -> status -> stop`;
-5. preserve `status/snapshot/stop` after failure and upload the bundle;
-6. do not run formal M2 or repeat/tune unchanged; keep M2/M3 blocked.
-
-#### Previous decision (2026-08-07 — replacement failure business fallback ready for qualification)
-
-Exact-source `b04cb65` artifact
-`/tmp/mini_vpn_knife15_macos_20260808_030357.tar.gz` (SHA-256
-`e5c866f6...`) passed baseline `27.973/63.814 Mbit/s`, direct at
-`13.970 Mbit/s` without gaps, smoke, all preflights, exact forward, and
-cleanup. Its cycle-1 reverse never connected and hit the unchanged 330-second
-child timeout. Formal M2 was not run.
-
-The conn1 successor turn correctly failed closed at
-`12,000/13,058/10,326/1,366B`, but the replacement maintenance error was
-returned to the triggering business open as `handshake_failed -> rearm`. A
-later independent open passed a fresh turn and installed the successor. Paired
-Exit capture had `547,358` packets, zero kernel drops, and no new Target socket
-after forward completion. This selects maintenance/admission isolation, not a
-service-turn, network, Target, D16, Endpoint, or frozen-parameter change.
-
-Reviewed `68c7271` makes the failed slot attempt-local ineligible and permits
-the same business open to reserve only another already-qualified current
-generation. It cannot attempt replacement on a second degraded auxiliary; no
-safe fallback fails with both exact causes. Later independent opens retain
-fresh authority. All local gates pass with no unresolved P0/P1; root is
-`689+3 ignored`, vendored Quinn/proto are `40+3 ignored`/`315`, and the exact
-Endpoint gate reached `240.470 Mbit/s` with final `61,440/0/0B`. Result:
-`docs/tech/2026-08-07-knife15-m2-replacement-failure-business-fallback-local-results.md`.
-
-Next:
-
-1. pull/rebuild the pushed reviewed descendant on the Mac;
-2. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
-3. tell the agent when the Mac is ready so a fresh bounded `.33` observer can
-   be started;
-4. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
-   start -> smoke -> m2-qualification -> status -> stop`;
-5. preserve `status/snapshot/stop` after failure and upload the bundle;
-6. do not run formal M2 or repeat/tune unchanged; keep M2/M3 blocked.
-
-#### Previous decision (2026-08-07 — successor service turn ready for qualification)
-
-Exact-source `7131de4` artifact
-`/tmp/mini_vpn_knife15_macos_20260807_091815.tar.gz` (SHA-256
-`7c749fb9...`) passed baseline `35.336/61.978 Mbit/s`, direct at
-`17.659 Mbit/s` without gaps, start/smoke, every preflight, the long
-forward/reverse TCP/reverse UDP phases, and cleanup. Its first short forward
-then lost one complete Target receiver interval. Formal M2 was not run.
-
-Service-normalized admission selected the correct known busy candidate, but
-that candidate was authenticated conn1 generation 2 with no prior forward bulk
-service and only its initial `12,000B` congestion window. Reviewed `541fbfb`
-now requires one current-cwnd, Endpoint-bulk Quinn service turn before the
-existing successor generation CAS. Every tagged packet byte must be ACKed on
-the same path generation; loss/path/close/deadline fails without retry and
-leaves the predecessor current. No frozen value or new timer changed.
-
-All local gates pass with no unresolved P0/P1; root is `688+3 ignored`,
-vendored Quinn/proto are `40+3 ignored`/`315`, and the exact Endpoint gate
-reached `240.291 Mbit/s` with final `61,440/0/0B`. Result:
-`docs/tech/2026-08-07-knife15-m2-quinn-successor-service-turn-local-results.md`.
-
-Next:
-
-1. use the fresh paired `.33` Exit observer active at
-   `/tmp/mini_vpn_knife15_exit_target_observer_20260807_102734`;
-2. pull the pushed descendant and rebuild release on the Mac;
-3. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
-4. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
-   start -> smoke -> m2-qualification -> status -> stop`;
-5. preserve `status/snapshot/stop` after failure and upload the bundle;
-6. do not run formal M2 or repeat/tune unchanged; keep M2/M3 blocked.
-
-#### Previous decision (2026-08-07 — service-normalized admission ready for qualification)
-
-Exact-source `12e845f` artifact
-`/tmp/mini_vpn_knife15_macos_20260807_054320.tar.gz` (SHA-256
-`916db92b...`) passed baseline `26.054/60.199 Mbit/s`, direct at
-`13.020 Mbit/s` without gaps, start/smoke, every preflight, exact transfer,
-and cleanup. Its first qualification forward had two complete sender and
-receiver zero intervals during startup. Formal M2 was not run.
-
-Paired Exit evidence had zero capture/kernel drops, at most `223.987ms`
-between positive data packets, and about `1ms` Target ACK RTT. The exact writer
-continued ACK progress and local ownership/conservation stayed healthy.
-Control had selected warm conn1 at equal ownership; its reservation then made
-data select roughly 73-times colder conn0 because raw leases preceded service
-when loads differed.
-
-Reviewed `6e78d23` preserves categorical forward qualification and generation
-replacement, then compares exact `active * RTT / cwnd` only across admitted
-busy candidates with known positive service. No score threshold, weight,
-timer, state, config, payload action, or frozen value was added. Idle,
-unknown, and all-degraded fallbacks are unchanged. All local gates pass with
-no unresolved P0/P1; root is `686+3 ignored`, vendored Quinn/proto are
-`40+3 ignored`/`311`, and the exact Endpoint gate reached `240.313 Mbit/s`
-with final `61,440/0/0B`. Result:
-`docs/tech/2026-08-07-knife15-m2-service-normalized-admission-local-results.md`.
-
-Next:
-
-1. the `.33` observer is active at
-   `/tmp/mini_vpn_knife15_exit_target_observer_20260807_064333`;
-2. pull the pushed descendant and rebuild release on the Mac;
-3. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
-4. take exactly one `m2-ipv6-check -> baseline -> direct-discriminator ->
-   start -> smoke -> m2-qualification -> status -> stop`;
-5. preserve `status/snapshot/stop` after failure and upload the bundle;
-6. do not run formal M2 or repeat/tune unchanged; keep M2/M3 blocked.
-
-#### Previous decision (2026-08-07 — recovery evidence observer ready for qualification)
-
-Exact-source `f8c0639` artifact
-`/tmp/mini_vpn_knife15_macos_20260807_031530.tar.gz` (SHA-256
-`60c60b7f...`) passed baseline `24.026/58.984 Mbit/s`, direct, every
-preflight, the long forward/reverse TCP/reverse UDP phases, and cleanup. Its
-cycle-1 short forward then had two complete initial Target receiver-zero
-intervals. Formal M2 was not run.
-
-The ordered-gap predicate had already caused six Endpoint rebinds on the
-passing long forward while each exact missing prefix accumulated a growing
-multi-megabyte tail. The failed short flow was uplink-only, accepted
-`6,296,649B`, waited `4,493,917us`, and owned no exact business read gap. The
-active ordered-gap migration is therefore rejected as unsafe and insufficient;
-do not tune its former observation interval.
-
-Reviewed implementation `847a5d7` removes ordered-gap recovery authority but
-keeps read-only Quinn evidence. A pure diagnostic observer records one
-persistent-gap event and exact writer-Pending start/end ACK aggregates; it is
-instantiated only under `MINI_VPN_TCP_DIAG=1` and cannot mutate transport. The
-runner rejects old ordered-gap actions and malformed evidence. Existing exact
-ACK-stall rebind, writer plus PLPMTUD connection reset, and UDP-demand recovery
-remain unchanged.
-
-All local gates pass with no unresolved P0/P1. Root is `684+3 ignored`,
-vendored Quinn/proto are `40+3 ignored`/`311`, and exact 32 MiB Endpoint
-capacity reached `240.370 Mbit/s` with final `61,440/0/0B`. Result:
-`docs/tech/2026-08-07-knife15-m2-recovery-evidence-observer-local-results.md`.
-
-Next:
-
-1. pull the pushed descendant of `847a5d7` and rebuild release on the Mac;
-2. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
-3. wait for the agent to report the bounded Exit observer active on `.33`;
-4. take exactly one fresh `m2-ipv6-check -> baseline -> direct-discriminator
-   -> start -> smoke -> m2-qualification -> status -> stop`;
-5. allow about 30 minutes and preserve `status/snapshot/stop` after failure;
-6. do not run formal M2 or repeat/tune unchanged; classify paired writer/ACK
-   and Exit evidence before selecting another recovery mechanism;
-7. keep formal M2 and M3 blocked.
-
-#### Previous decision (2026-08-06 — exact ordered-gap migration ready for qualification)
-
-Exact-source `0a71ebe` artifact
-`/tmp/mini_vpn_knife15_macos_20260806_104632.tar.gz` (SHA-256
-`da12448c...`) passed baseline `46.328/59.947 Mbit/s`, direct
-`23.077 Mbit/s` without gaps, every preflight, cycle 1, cycle 2 forward, and
-cleanup. Cycle 2 reverse failed with eleven complete Target receiver-zero
-intervals about 25 minutes after the schedule began; the later fourteen hours
-were retained evidence time, not successful M2 time.
-
-The exact conn1/stream21 ordered reader stopped at `569,624,937B` for
-`12,630ms`. Its connection continued receiving packets and STREAM frames, but
-the historical log cannot prove those frames belonged to stream 21. D16, TUN,
-Endpoint conservation, routes, process, and cleanup remained healthy. Existing
-writer-Pending/path-reset recovery was unreachable for this downlink-only gap;
-generic TCP silence remains unsafe because of valid quiet traffic.
-
-Reviewed implementation `4d168a1` exposes exact read-only stream assembler
-progress and registers only live D16 ordered readers. Two observations over
-one full existing `250ms` interval of the same consumed offset plus exact
-same-stream bytes beyond a missing prefix consume one episode authority and
-reuse the existing Endpoint socket rebind. Progress, changed gap, close,
-inactivity, or generation replacement clears authority. The QUIC identity,
-stream, Target TCP, payload, pool, D16, and old-socket lifecycle are retained;
-no frozen value, replay, new threshold, or tuning branch was added.
-
-The public `m2-qualification` now runs exactly two mixed cycles, validates all
-8 phase results, 2 DNS/real-client results, unchanged TCP/UDP SLIs, Endpoint/
-D16 terminal state, and complete rebind lifecycle, and can emit only
-`PASS_NON_ACCEPTANCE`. All local gates pass with no unresolved P0/P1; the
-exact 32 MiB Endpoint gate reached `240.403 Mbit/s` with final
-`61,440/0/0B`. Result:
-`docs/tech/2026-08-06-knife15-m2-ordered-gap-path-migration-local-results.md`.
-
-Next:
-
-1. pull the pushed descendant of `4d168a1` and rebuild release on the Mac;
-2. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
-3. take exactly one fresh `m2-ipv6-check -> baseline -> direct-discriminator
-   -> start -> smoke -> m2-qualification -> status -> stop`;
-4. allow about 30 minutes for the two-cycle qualification and preserve
-   `status/snapshot/stop` after any post-start failure;
-5. do not run formal M2, tune, or repeat unchanged;
-6. keep formal M2 and M3 blocked pending qualification plus cleanup.
-
-#### Previous decision (2026-08-06 — qualification passed; formal M2 authorized)
-
-Exact-source `0c521fa` artifact
-`/tmp/mini_vpn_knife15_macos_20260806_101142.tar.gz` (SHA-256
-`2a45314d...`) passed baseline `34.964/8.262 Mbit/s`, direct
-`13.539 Mbit/s` without gaps, all preflights, four qualification phases,
-DNS/real-client checks, and cleanup. Qualification TCP had zero sender or
-receiver intervals, max sender/receiver gap `7,208,960B`; reverse UDP loss
-was `0.223184%`. Verdict is `PASS_NON_ACCEPTANCE`, not formal acceptance.
-
-No connection path reset occurred. Conn0's black-hole count advanced
-`0 -> 12`, but its exact writer wait was only `274,915us`, below the
-unchanged minimum `2s` predicate; conn1 remained at zero. This proves the
-healthy real-WAN false-positive boundary. It does not claim recovery fired,
-but it is not a predicate/observer mismatch: the earlier failure combined
-`7,001,335us` Pending and `144` same-connection black holes.
-
-Endpoint max/final was `61,440B / 61,403/0/0B`; routes, DNS, TUN, process,
-and secrets cleanup passed. Two peer `Stopped(0)` lines were reviewed as
-zero-debt timed-transfer close tails. Result:
-`docs/tech/2026-08-06-knife15-m2-connection-local-path-state-recovery-macos-qualification-results.md`.
-
-Next:
-
-1. pull the pushed descendant and rebuild release on the Mac;
-2. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
-3. take exactly one fresh `m2-ipv6-check -> baseline ->
-   direct-discriminator -> start -> smoke -> m2 -> status -> stop`;
-4. preserve `status/snapshot/stop` after any post-start failure;
-5. do not rerun qualification or tune unchanged values;
-6. accept Knife15 M2 only after the full schedule plus cleanup; keep M3
-   blocked until then.
-
-#### Previous decision (2026-08-06 — connection-local QUIC path recovery ready for qualification)
-
-Exact-source `bfaba9e` artifact
-`/tmp/mini_vpn_knife15_macos_20260806_083422.tar.gz` (SHA-256
-`74300b2e...`) passed baseline `32.551/58.899 Mbit/s`, the 300-second direct
-discriminator at `16.268 Mbit/s` without gaps, start/smoke, preflights, exact
-forward completion, and cleanup. The qualification forward nevertheless had
-three complete Target receiver-zero intervals. Its writer waited up to
-`7,001,335us`; the owning conn1 grew PLPMTUD black holes `0 -> 144`, QUIC loss
-to `2,147,556B`, and congestion events to `537`, while conn0 stayed healthy.
-
-The paired Exit observer (`e95880ae...`) had zero capture/kernel drops,
-`1..9ms` Target TCP RTT, no retransmit growth, and complete ACKs for every byte
-the mature Exit supplied. Application supply from QUIC alone decayed. This
-selects connection-local client-to-Exit QUIC service degradation, not an
-operator, baseline, Exit-to-Target, TUN, D16, Endpoint, or parameter issue.
-
-Reviewed implementation `0e94e56` consumes one reset authority per stable
-QUIC identity when the exact business writer reaches the existing RTT-derived
-Pending bound and the same connection adds black-hole detections. It invokes
-the existing Quinn path-state reset on the exact sampled handle and retains
-the connection, stream, Target TCP, socket, and bytes. ACK-stall Endpoint
-rebind retains precedence; no frozen values, payload replay, migration, or
-retry loop were added.
-
-All local/review gates pass with no unresolved P0/P1. Root is `679+3 ignored`,
-vendored Quinn/proto are `39+3 ignored`/`310`, and exact 32 MiB Endpoint
-capacity reached `240.348 Mbit/s` with final `61,440/0/0B`. Result:
-`docs/tech/2026-08-06-knife15-m2-connection-local-path-state-recovery-local-results.md`.
-
-Next:
-
-1. pull the pushed descendant of `0e94e56` and rebuild release on the Mac;
-2. keep Clash-TUN/every other VPN off; normal Apple Push/iCloud may remain;
-3. wait for the agent to report the bounded Exit observer active on `.33`;
-4. run one fresh `m2-ipv6-check -> baseline -> direct-discriminator -> start
-   -> smoke -> m2-qualification -> status -> stop`;
-5. do not run formal M2; this qualification schedules about `13m10s`;
-6. an applied reset plus another receiver-zero interval rejects this
-   architecture; do not tune or repeat unchanged;
-7. keep formal M2 and M3 blocked pending the short discriminator.
-
-#### Previous decision (2026-08-06 — Exit forwarding qualification required)
-
-Exact-source `727f00b` artifact
-`/tmp/mini_vpn_knife15_macos_20260806_035626.tar.gz` (SHA-256
-`4013a05b...`) passed baseline/direct, every preflight, cycle-1 long
-TCP/reverse TCP/reverse UDP, and cleanup. Its first 10-second short forward
-lost two complete Target receiver intervals. Startup priority was consumed and
-QUIC ACKs progressed while D16, Endpoint, TUN, controls, routes, process, and
-cleanup remained healthy. The remaining seam is Exit QUIC receipt to Target
-TCP delivery; another client constant or pool/recovery branch is rejected.
-
-Bare Exit-to-Target exact-order and sixty-fresh-connection controls passed.
-Reviewed `4d02355` therefore adds one falsifiable observation stage: public
-`m2-qualification` runs exactly `300 + 300 + 180 + 10` seconds with every
-formal preflight/quality/cleanup invariant, but can write only
-`PASS_NON_ACCEPTANCE`. A separate Exit observer owns an exact target filter,
-96-byte snapshots, 340,000,000-byte ring, 250ms TCP_INFO samples, two-hour
-timeout, exact PID cleanup, version/drop/secret/checksum evidence.
-
-All local/review gates pass with no unresolved P0/P1. Root is `673+3 ignored`,
-vendored Quinn/proto are `38+3 ignored`/`310`, and the exact 32 MiB Endpoint
-gate reached `237.737 Mbit/s` with `61,440/0/0B`. Result:
-`docs/tech/2026-08-06-knife15-exit-target-forwarding-observability-local-results.md`.
-
-Next:
-
-1. pull the pushed descendant of `4d02355` and rebuild release on the Mac;
-2. keep Clash-TUN/every other VPN off and use fresh IPv6/baseline/direct
-   evidence;
-3. wait for the agent to report the reviewed Exit observer active on `.33`;
-4. run exactly `start -> smoke -> m2-qualification -> status -> stop`;
-5. stop/bundle the Exit observer and correlate both UTC timelines;
-6. select kernel/path, mature-server copy service, client QUIC, or observer
-   mismatch from evidence; do not tune or repeat unchanged;
-7. keep formal M2 and M3 blocked until the selected architecture passes local
-   gates, review, one short qualification, and cleanup.
-
-#### Previous decision (2026-08-05 — Quinn new-stream startup service ready for M2)
-
-Exact-source `f570353` artifact
-`/tmp/mini_vpn_knife15_macos_20260805_111712.tar.gz` (SHA-256
-`b0d3815e...`) passed baseline/direct, every preflight, seven complete mixed
-cycles, and cleanup. Cycle 8 `tcp-forward` then lost the first complete Target
-receiver interval while the sender had already admitted `2,228,224B`. It
-ultimately transferred the exact `643,563,520B` with zero sender retransmits.
-
-Both new streams used installed conn1 generation 2. Gateway/Exit, routes,
-interfaces, process, TUN, D16, Endpoint conservation, and repaired recovery
-remained healthy. The auxiliary-replacement stop rule therefore fired. Do not
-repeat or tune another selector, replacement, pool, MTU, window, chunk, Cubic,
-GSO, Endpoint, recovery, workload, or SLI branch.
-
-Implementation `f7260ee` adds one deep TUIC startup writer plus the minimum
-vendored Quinn atomic scheduling seam. Each new TUIC TCP stream uses relative
-priority `original + 1` through Connect and its first accepted business write;
-the successful admission restores the original priority under the same Quinn
-connection lock. Empty/Pending writes do not consume it, later writes are
-ordinary, every generic/native/D16 mode shares it, and UDP is unchanged.
-
-Root `685+3 ignored`, main `2`, integration `10+4 ignored`, release, Clippy,
-shell, vendored Quinn/proto/docs, exact 32 MiB `240.076 Mbit/s` with
-`61,440/0/0B`, fmt/diff/secret, and review pass with no unresolved P0/P1.
-Result:
-`docs/tech/2026-08-05-knife15-m2-quinn-new-stream-startup-service-local-results.md`.
-
-Next:
-
-1. pull the pushed reviewed descendant and rebuild release on the test Mac;
-2. keep Clash-TUN/every other VPN off and avoid deliberate heavy non-test
-   traffic; normal Apple Push/iCloud may remain;
-3. run exactly one fresh `m2-ipv6-check -> baseline -> direct-discriminator ->
-   start -> smoke -> m2 -> status -> stop`;
-4. preserve `status/snapshot/stop` after any post-start failure;
-5. if startup consumption is present but the same healthy-control
-   installed-successor receiver zero recurs, reject this architecture and
-   open transport first-payload ACK/failover research; do not tune;
-6. keep M3 blocked until complete M2 plus cleanup acceptance.
-
-#### Previous decision (2026-08-05 — ambient-traffic recovery ready for M2)
-
-Exact-source `a1e22ca` artifact
-`/tmp/mini_vpn_knife15_macos_20260805_080607.tar.gz` (SHA-256
-`f5f6d933...`) passed baseline `19.183/50.639 Mbit/s`, direct
-`9.584823 Mbit/s` without gaps, start/smoke, every preflight, the bounded
-early stop, and cleanup. The user had closed all Apps; the remaining relay was
-Apple Push `28-courier.push.apple.com:5223`.
-
-That silent system relay caused fifteen false generic `no_rx` rebinds in about
-fifty seconds although `udp_active=false`, exact writer pressure was absent,
-and aggregate transport TX was only `37B`. Therefore the earlier global-zero
-machine model is rejected rather than enforced through daemon termination or
-an Apple-domain exception.
-
-Implementation `1debaff` requires existing UDP application activity before
-generic no-RX can arm; exact TCP writer/stream ACK-stall recovery is unchanged.
-The runner reconstructs exact lifecycle for its controlled iperf,
-api.ipify.org, and example.com Targets. Only controlled ownership must drain;
-ambient leases/relays/fake-IP remain numeric observations. Endpoint zero debt
-and conservation, DNS drops, replay validity, quality, resources, routes,
-cleanup, workload, SLOs, and frozen data-plane values remain unchanged.
-
-Focused `9/9`, root `672+3 ignored`, main `2`, integration `10+4 ignored`,
-release, established Clippy, shell, vendored Quinn/proto/doc, exact 32 MiB
-`235.232 Mbit/s` with `61,440/0/0B`, fmt/diff/secret, and review pass with no
-unresolved P0/P1. Result:
-`docs/tech/2026-08-05-knife15-m2-ambient-traffic-recovery-local-results.md`.
-
-Next:
-
-1. pull the pushed reviewed descendant and rebuild release on the test Mac;
-2. keep Clash-TUN and every other VPN/proxy off; avoid deliberate downloads,
-   streaming, sync, or other heavy non-test traffic, but do not terminate
-   Apple Push/iCloud system services;
-3. run exactly one fresh `m2-ipv6-check -> baseline -> direct-discriminator ->
-   start -> smoke -> m2 -> status -> stop`;
-4. preserve `status/snapshot/stop` after any post-start failure;
-5. do not tune or repeat unchanged; keep M3 blocked until complete M2 plus
-   cleanup acceptance.
-
-#### Previous decision (2026-08-05 — global-quiescence fail-fast)
-
-Exact-source `798c1a5` artifact
-`/tmp/mini_vpn_knife15_macos_20260805_015011.tar.gz` (SHA-256
-`386ecafc...`) passed baseline/direct, start/smoke, formal preflights, the
-four-hour steady-a window, 17 mixed cycles plus cycle 18 forward, and cleanup.
-All 154 phase results were structurally valid: zero Target receiver intervals,
-max TCP gap `10,354,688B`, max UDP loss `0.604884%`, and Endpoint max/final
-`61,440B / 61,403/0/0B`.
-
-The bounded auxiliary generation replacement ran successfully and the
-architecture rejection discriminator did not occur. M2 instead failed the
-first idle checkpoint because four non-test relays remained active and
-fake-IP ownership was `7/19`. Exact traffic included Apple/Google push,
-WeChat, and Cursor. Keep the unchanged checkpoint; this was a missing early
-dedicated-host prerequisite, not operator command misuse or a data-plane
-failure.
-
-Runner commit `4ceb2ed` checks the same global ownership contract within the
-existing smoke timeout (normally `50s`) after full-tunnel/real-client
-preflight and before the exact 86,400s timeline. It requires fresh data-plane
-and Endpoint samples and preserves structured evidence. No Rust, SLO,
-schedule, or frozen value changed. Result:
-`docs/tech/2026-08-05-knife15-m2-full-tunnel-quiescence-fail-fast-local-results.md`.
-
-Next:
-
-1. pull the pushed reviewed descendant and rebuild release on the test Mac;
-2. quit Cursor/Codex/VS Code, WeChat, browsers, Mail, sync/chat/media Apps,
-   and every VPN before opening the test terminal;
-3. run exactly one fresh `m2-ipv6-check -> baseline -> direct-discriminator ->
-   start -> smoke -> m2 -> status -> stop`;
-4. if the new quiescence preflight fails, preserve `status/snapshot/stop`,
-   remove the named background traffic, and start a fresh transaction; it
-   must not consume the 24-hour schedule;
-5. do not tune or repeat unchanged; keep M3 blocked until complete M2 plus
-   cleanup acceptance.
-
-#### Previous decision (2026-08-04 — auxiliary generation replacement ready for M2)
-
-Exact-source `fd6c34f` bundle
-`/tmp/mini_vpn_knife15_macos_20260804_095117.tar.gz` (SHA-256
-`889cdd276c...`) passed every prerequisite and cycle 1, then the first short
-forward had one complete receiver-zero interval. The reviewed busy-epoch rule
-correctly isolated degraded conn1 (`black_holes 0 -> 16`); both opens used
-qualified conn0. Conn0 stayed transport-live but already had fourteen lease
-halves and its data writer waited `1,169,717us`. Selector-only isolation is
-therefore falsified. Reverse UDP independently lost `3.391937% > 3%`.
-
-Runner `addc54d` now fails formal UDP phases immediately above the unchanged
-`3%` limit. Implementation `5533d15` installs one authenticated auxiliary
-successor while the predecessor drains its exact existing generation leases.
-No existing flow is replayed/reset, conn0 remains primary for UDP/health, the
-eligible pool remains two, and every frozen data-plane value/SLO remains
-unchanged. Focused `31/31`, root `671+3 ignored`, main `2`, integration `10+4
-ignored`, release, Clippy, shell, vendored Quinn/proto, 32 MiB
-`239.967 Mbit/s`, fmt/diff/secret, and review pass with no unresolved P0/P1.
-Result:
-`docs/tech/2026-08-04-knife15-m2-auxiliary-generation-replacement-local-results.md`.
-
-Next:
-
-1. pull the pushed reviewed descendant and rebuild release on the test Mac;
-2. keep Clash-TUN/every other VPN off and use the runbook IPv6 boundary;
-3. run exactly one fresh `m2-ipv6-check -> baseline -> direct-discriminator ->
-   start -> smoke -> m2 -> status -> stop`;
-4. preserve `status/snapshot/stop` after a post-start failure; do not tune or
-   repeat unchanged;
-5. reject this architecture if an installed successor still has a
-   healthy-control complete receiver-zero interval; keep M3 blocked until
-   complete M2 plus cleanup acceptance.
-
-#### Previous decision (2026-08-03 — busy-epoch forward qualification ready for M2)
-
-Exact-source `99e56b0` xiaoou Ethernet bundle
-`/tmp/mini_vpn_knife15_macos_20260803_093012.tar.gz` (SHA-256
-`804b96c5...`) passed baseline/direct and every M2 prerequisite, then the first
-short forward lost two complete receiver intervals. Same-window gateway/Exit,
-TUN, D16, Endpoint, routes, resources, and cleanup stayed healthy.
-
-The prior equal-load path-service hypothesis is rejected: both opens selected
-strictly less-loaded conn1, and conn1 had greater instantaneous `cwnd/RTT`.
-The decisive categorical difference is that conn1 advanced from zero to ten
-PLPMTUD black-hole detections inside one nonzero ownership epoch while conn0
-stayed at zero.
-
-Reviewed implementation `b40aa75` makes busy-epoch qualification part of the
-existing TCP admission authority. It anchors only after an idle slot wins
-reservation CAS, isolates only proven degraded candidates when a
-qualified/unknown alternative exists, and preserves bounded all-degraded
-fallback. No frozen constant, SLO, current flow, UDP path, reconnect policy, or
-payload hot path changed. Focused `27/27`, root `678+3 ignored`, main `2`,
-integration `10+4 ignored`, release, Clippy, shell, vendored Quinn/proto,
-32 MiB `240.154 Mbit/s`, fmt/diff/secret, and review gates pass with no
-unresolved P0/P1. Result:
-`docs/tech/2026-08-03-knife15-m2-busy-epoch-forward-qualification-local-results.md`.
-
-Next:
-
-1. pull the pushed reviewed descendant and rebuild release on the HK test Mac;
-2. keep Clash-TUN/every other VPN off and use the runbook IPv6 boundary;
-3. run exactly one fresh `m2-ipv6-check -> baseline -> direct-discriminator ->
-   start -> smoke -> m2 -> status -> stop`;
-4. preserve failure evidence and do not tune or repeat unchanged;
-5. keep M3 blocked until complete M2 plus cleanup acceptance.
-
-#### Previous decision (2026-08-03 — direct continuity preflight failed before TUN)
-
-Exact-source `6231048` baseline/direct directories
-`/tmp/mini_vpn_knife15_macos_baseline_20260803_035615` and
-`/tmp/mini_vpn_knife15_macos_direct_20260803_035733` are valid and correctly
-bound. Baseline receiver continuity passed at `12.930/49.357 Mbit/s`, but the
-300-second direct Target test failed even at `6.462 Mbit/s`: seven complete
-receiver-zero seconds occurred in two nonterminal episodes (`62–65s` and
-`152–156s`). Sender continuity failed at the same times, with 533 retransmits
-and cwnd as low as `1,344B`.
-
-This is an external physical Target-path continuity preflight failure. It is
-not “bandwidth below 200M,” and it occurs before any Knife15 TUN/product path.
-Do not run `start`; restore IPv6 immediately through the pre-start branch. No
-status/snapshot/stop is required. Result:
-`docs/tech/2026-08-03-knife15-hk-m2-direct-continuity-preflight-failure-results.md`.
-
-Next, after a materially later or repaired network window:
-
-1. use source `6231048` or a descendant and rebuild release;
-2. keep every other VPN off, disable only the recorded physical-service IPv6,
-   and require `m2-ipv6-check` PASS;
-3. take fresh baseline and direct evidence;
-4. proceed to `start -> smoke -> m2 -> status -> stop` only if direct PASSes;
-5. do not tune/repeat unchanged; keep M3 blocked.
-
-#### Previous decision (2026-08-02 — path-service-aware equal-busy pool selection)
-
-The recovered immutable bundle is
-`/tmp/mini_vpn_knife15_macos_20260801_053127.tar.gz` (SHA-256
-`d4fc3bc6...`, start source `6f1df4a`). The cleanup repair passed on the exact
-kernel-reap discriminator, so route/DNS/process ownership is closed.
-
-Formal M2 remains failed. Cycle 2 `short-forward-1` had a first complete
-receiver-zero second while exact Exit/gateway, route, TUN, Endpoint, D16, and
-QUIC liveness controls stayed healthy. An equal busy `62:62` lease tie put data
-on conn0 at `10,124B/163ms`, although conn1 had `23,842B/163ms`; the selected
-writer then waited `3.355s`.
-
-The accepted local repair preserves least-active as the first key and idle
-stable ordering, then breaks only equal nonzero ties by exact current
-`cwnd/RTT`. It adds no constant, SLI waiver, pool/window/MTU/pacing change,
-rebind, retry, or payload-hot-path work. Review and all local gates pass with
-no unresolved P0/P1. Result:
-`docs/tech/2026-08-02-knife15-m2-path-service-aware-pool-selection-local-results.md`.
-
-Next:
-
-1. pull the pushed reviewed source and rebuild release on the HK test Mac;
-2. keep Clash-TUN/every other VPN off and temporarily disable the recorded
-   physical service IPv6;
-3. require `m2-ipv6-check` PASS before fresh evidence;
-4. run exactly one fresh `baseline -> direct -> start -> smoke -> m2 -> status
-   -> stop` transaction;
-5. restore IPv6 only at the runbook-defined boundary and synchronize the
-   bundle;
-6. do not tune or repeat unchanged; keep M3 blocked until M2 plus cleanup is
-   accepted.
-
-#### Previous decision (2026-08-02 — recover M2 kernel-reaped route ownership)
-
-Exact-source `6f1df4a` real HK M2 run
-`/tmp/mini_vpn_knife15_macos_20260801_053127` passed baseline/direct,
-start/smoke, exact IPv6 preflight, full-tunnel/real-client preflight, and one
-complete mixed cycle. Cycle 2 failed `short-forward-1` with
-`receiver_zero_interval`; this remains an independent bundle-review failure.
-
-Stop could not finalize the artifact. Diagnostic
-`/tmp/mini_vpn_knife15_cleanup_diag_20260801_053127.txt` (SHA-256
-`146eb0e1...`) selected one exact lifecycle defect:
-
-```text
-utun4 absent
-low/high/fake ownership markers = 1
-DNS/Exit ownership markers = 0
-all six IPv4 probes = en0 / 192.168.133.1
-current Ethernet DNS = saved pre-M2 DNS = EMPTY
-```
-
-macOS removed the interface routes with the dead utun, but the runner retained
-their markers and rejected the already-restored physical path. The repair
-performs no deletion and releases a marker only when the utun is absent and
-the route exactly matches the recorded physical interface/gateway. Every
-foreign, live, changed, missing, DNS, and IPv6 observation remains fail-closed.
-
-Result:
-`docs/tech/2026-08-02-knife15-m2-kernel-route-reap-cleanup-local-results.md`.
-
-Next:
-
-1. pull the pushed repair on the test Mac;
-2. run repeated `stop`, then `bundle`, against the existing state;
-3. synchronize the immutable bundle;
-4. replay the independent cycle-2 receiver-zero failure;
-5. do not rerun baseline/M2 or open M3 before that review.
-
-#### Previous decision (2026-08-01 — M2 IPv6 route observer repair)
-
-Exact-source `19b5ceb` HK bundle
-`/tmp/mini_vpn_knife15_macos_20260801_044032.tar.gz` (SHA-256
-`651f977b...`) followed the documented physical-service IPv6 disable flow and
-passed start/smoke, but M2 again stopped before evidence creation. The bundle
-could not distinguish a physical route from an unknown route-command outcome.
-
-The exact formal probe reproduced locally as:
-
-```text
-route_status=0
-route: writing to routing socket: not in table
-old classification=unknown
-```
-
-The old observer recognized `not in table` only when status was nonzero. The
-repair uses one four-state classifier for a new public `m2-ipv6-check`, formal
-M2, health, and real-client paths. The exact absence line with no interface is
-`safe_absent` regardless of status; only `lo0`/`utun*` is `safe_tunnel`;
-physical interfaces and unknown combinations remain rejected. Formal M2 saves
-raw status/text/class/interface before continuing or rejecting and publishes
-the decisive fields in status/summary. The runbook uses the exact formal probe.
-
-Result:
-`docs/tech/2026-08-01-knife15-m2-ipv6-route-status-observability-local-results.md`.
-
-Next:
-
-1. pull the pushed repair on the HK Mac;
-2. disable IPv6 for the exact physical service using the runbook;
-3. run only `bash scripts/knife15-macos-soak.sh m2-ipv6-check`;
-4. restore immediately and send its structured output if it fails;
-5. only after PASS, take one fresh uninterrupted
-   `baseline -> direct -> start -> smoke -> m2 -> status -> stop`.
-
-Do not spend another baseline/direct/TUN cycle before the cheap check passes.
-No data-plane constant, SLO, route scope, or IPv6 non-goal changed. M3 remains
-blocked.
-
-#### Previous decision (2026-08-01 — M2 IPv6 precondition)
-
-Exact-source `753691a` HK bundle
-`/tmp/mini_vpn_knife15_macos_20260801_041142.tar.gz` (SHA-256
-`93d384a...`) passed target-only start and smoke, then formal M2 reported its
-physical-IPv6 error before any M2 route/DNS mutation. The bundle saved neither
-the raw route output nor its status, so it did not prove that a routable
-physical path existed. `m2_status=not_run`, `m2_full_tunnel_state=not_run`,
-and `formal_m2_acceptance=NOT_RUN` describe the fail-closed stop.
-
-Smoke forward/reverse receivers were `63.428/49.695 Mbit/s`; TCP-pool
-ownership drained, Endpoint conservation ended `61,414/0/0B`, and cleanup
-passed. This is not operator, smoke, pacing, D16, QUIC, pool, MTU, or
-throughput failure. The later exact-probe reproduction selected an observer
-false negative and supersedes this bundle's earlier physical-route inference;
-the frozen IPv6 leak boundary of the controlled IPv4-only M2 architecture is
-unchanged.
-
-The runbook now requires, before baseline:
-
-1. derive the physical Exit interface and its exact enabled network service;
-2. verify and record original `IPv6: Automatic` state;
-3. temporarily change only that service to `IPv6: Off`;
-4. prove the global IPv6 discriminator has no physical route;
-5. take a fresh uninterrupted baseline/direct/start/smoke/M2 transaction;
-6. restore immediately on a pre-start failure; once `start` is invoked, run
-   `status/snapshot/stop` first and restore IPv6 only after `stop`.
-
-Result:
-`docs/tech/2026-08-01-knife15-hk-m2-ipv6-precondition-results.md`.
-Do not reuse the rejected evidence, relax IPv6 safety, tune frozen values, or
-open M3. This next action was superseded by the repaired public
-`m2-ipv6-check`, which must pass before a real formal HK M2 bundle.
-
-#### Previous decision (2026-07-30 — M2 local)
-
-Knife15 M2 local implementation is accepted at `4dac87c`. One public `m2`
-action now owns a controlled IPv4 full tunnel, the active physical service
-DNS, an exact 24-hour mixed workload, real HTTPS/public-egress evidence, six
-drain checkpoints, and two-phase cleanup acceptance.
-
-The formal contract requires:
-
-```text
-86400s traffic/drain budget
-6 active windows + 5 idle/resume pairs + final drain
-93 complete cycles/DNS/real-client probes
-934 TCP + 95 UDP = 1029 phase results
-6 lifecycle/resource checkpoints
-```
-
-The Exit stays pinned to its physical gateway while `0/1`, `128/1`, and
-`198.18/15` use the owned utun. System-resolver HTTPS must observe fake remote
-addresses and the Exit public IPv4. A physical IPv6 route blocks M2. Cleanup
-restores the protected DNS snapshot and removes only matching owned routes;
-formal acceptance remains pending until `stop`.
-
-Root/harness, release, Clippy, all Knife15/Knife14 shell gates, vendored
-Quinn/proto, fmt/diff/secret, and code review pass with no unresolved P0/P1.
-No Rust data-plane or frozen value changed. Results:
-`docs/tech/2026-07-30-knife15-m2-24h-real-client-soak-local-results.md`.
-
-Next:
-
-1. pull the pushed branch and rebuild release on the HK Mac;
-2. disable Clash-TUN and every other VPN/TUN before baseline and through stop;
-3. run one fresh
-   `baseline -> direct-discriminator -> start -> smoke -> m2 -> status -> stop`
-   using `docs/tech/2026-07-30-knife15-m2-macos-hitl-runbook.md`;
-4. preserve `status -> snapshot -> stop` on any failure;
-5. review and accept the real bundle before planning M3.
-
-Do not repeat M0/M1, tune constants, or open M3 before M2 evidence review.
-
-#### Previous decision (2026-07-30 — formal M1)
-
-Exact-source `ee1a423` HK formal M1 bundle
-`/tmp/mini_vpn_knife15_macos_20260729_105127.tar.gz` (SHA-256
-`c263507c...`) completed the full frozen `28,800s` schedule and is accepted
-after a deterministic observer repair and immutable-artifact replay.
-
-The old `acceptance SLO mismatch` was not a workload failure. `en0` began with
-16 lifetime input errors and ended with 16, but the old summary counted all
-1,539 nonzero cumulative rows as new failures. Two clean relay tasks also
-ended with `19,456B`/`18,944B` leased to smoltcp; their same handles then
-proved equal local-EOF send queues, terminal zero queues/reap, and no reuse.
-The old global grep stopped at the transient snapshots.
-
-Physical error evidence now uses the first valid sample as the run baseline
-and fails on any later movement or reset. D16 terminal evidence accepts a
-nonzero clean lease only across the exact same-handle drain sequence. Open
-terminal queues, queued/reserved ownership, unequal or incomplete drain, and
-cross-epoch reuse remain fail-closed. One review P1 added mandatory
-`queue_closed=true`. No Rust data-plane, frozen constant, workload, or SLI
-changed.
-
-Repaired raw-evidence replay reports:
-
-```text
-formal_m1_acceptance=PASS
-Target receiver zero intervals=0
-TCP max gap=10485760B
-UDP max loss=2.446087%
-Endpoint max/final=61440B / 61403/0/0B
-```
-
-All 332 result files, 30 DNS checks, four checkpoints, controls, resources,
-and cleanup pass. Eighty-eight `Stopped(0)` terminal boundaries and 22 forward
-sender-zero intervals remain classified REVIEW evidence with zero receiver
-stall and zero terminal ownership. Root/harness, release, Clippy, shell,
-fmt/diff/secret, real-bundle replay, and code review pass. Result:
-`docs/tech/2026-07-30-knife15-hk-m1-formal-acceptance-results.md`.
-
-M1 is complete and must not be repeated. Next:
-
-1. write the M2 24-hour real-client soak architecture spec;
-2. write its TDD/implementation and macOS HITL plan;
-3. cover product-like TCP, UDP/video, DNS, idle, resource/log bounds, route/DNS
-   leak detection, and HK/Shenzhen path attribution;
-4. run M2 only after local gates and review;
-5. keep M3 recovery events single-variable and sequenced after the M2
-   acceptance contract.
-
-#### Previous decision (2026-07-28)
-
-Exact-source `0b43141` HK bundle
-`/tmp/mini_vpn_knife15_macos_20260727_085340.tar.gz` (SHA-256
-`0fdfbfd4...`) contains a correctly operated M1 diagnostic that ran 7h34m43s
-before cycle 32 reverse TCP produced an incomplete iperf result with
-`control socket has closed unexpectedly`.
-
-This is an external Exit outage. Exit `43.153.32.33` was `3/3`, 0% loss at
-`16:28:33Z`, then `0/3`, 100% loss at `16:29:04Z`; the local gateway remained
-`3/3`, 0% loss. Exit loss persisted for 861 consecutive samples through
-`00:04:07Z`, and TUIC rebind/reconnect could not recover. No other VPN/TUN
-route existed during the workload; `utun1024` appeared only about nine hours
-after the failure and just before stop.
-
-Before the outage, 305 completed phase results and 27 DNS results were valid,
-all three idle/resume checkpoints passed at `61,403/0/0B`, and the diagnostic
-violation ledger was empty. Maximum UDP loss was `2.127049%`, maximum TCP gap
-was `12,451,840B`, and Endpoint/D16/pool/TUN/resource invariants passed. About
-39 minutes of the frozen schedule remained. Result:
-`docs/tech/2026-07-28-knife15-hk-m1-diagnostic-exit-outage-results.md`.
-
-Do not tune or repair mini_vpn for this failure, and do not repeat the
-diagnostic. After confirming the Exit VPS will remain powered and the TUIC
-service is stable, take fresh baseline/direct evidence and run one formal
-`start -> smoke -> m1 -> status -> stop`. Formal M1 remains the only gate that
-can unblock M2/M3.
-
-#### Previous decision (2026-07-27)
-
-Exact-source `5c3cd95` HK bundle
-`/tmp/mini_vpn_knife15_macos_20260727_074752.tar.gz` (SHA-256
-`27f105d8...`) completed only `start -> smoke -> stop` in about 49 seconds.
-The post-`44ff086` pool-idle barrier reached exact `active_leases=0`, both TCP
-directions completed, and Endpoint/D16 conservation, network/interface
-controls, resources, routes, secret scan, and cleanup passed. No
-half-closed-idle block occurred.
-
-M1 diagnostic did not run: status/mode stayed `not_run`, and there is no M1
-controller, result directory, checkpoint, event, or violation ledger.
-`DNS_TARGET` was disabled when `start` captured run-owned state. The paired
-baseline/direct evidence itself passed (`30.885/52.530 Mbit/s` baseline,
-`15.412 Mbit/s` direct, zero receiver gaps), but direct was already 1,875
-seconds old at start versus the frozen 900-second limit. A later DNS export
-cannot repair existing start state, and the stale direct would independently
-reject M1.
-
-Accept this only as real-Mac smoke non-regression evidence. It does not
-exercise the exact static-owned timer branch, complete M1 diagnostic, accept
-M1, or unblock M2/M3. No code or frozen value changed. Result:
-`docs/tech/2026-07-27-knife15-hk-post-repair-smoke-only-results.md`.
-
-Next take a fresh uninterrupted HK
-`baseline -> direct-discriminator -> start -> smoke -> m1-diagnostic ->
-status -> stop`. Export `DNS_TARGET=8.8.8.8` before start, and enter
-`m1-diagnostic` within 900 seconds of direct completion. Do not stop after
-smoke.
-
-#### Previous decision (2026-07-26)
-
-Exact-source `a3ebe42` HK bundle
-`/tmp/mini_vpn_knife15_macos_20260724_105822.tar.gz` (SHA-256
-`b5ce3af4...`) was operated correctly. Both smoke TCP directions and fake-IP
-DNS completed, but the pool-idle safety barrier failed before M1 diagnostic:
-reverse-data handle 1 epoch 3 retained one native pool lease and exactly
-`524,288B` queued across four identical 10-second half-close windows.
-
-Endpoint conservation ended `61,414/0/0B`; three Endpoint rebinds recovered,
-and TUN, pump, interfaces, resources, routes, and cleanup remained healthy.
-The relay nevertheless ran roughly 19,000 more egress windows without local
-ownership progress because each timeout renewed on owned-byte presence alone.
-This selects a local bounded-lifecycle defect rather than operator procedure,
-network quality, pacing, or a frozen-value tuning branch.
-
-Commit `44ff086` makes the D16 queue publish monotonic local progress for
-queued-to-leased transfer and permit release. The first owned half-close
-window remains protected; later windows defer only when that evidence
-advances. Static ownership now reaches the existing half-close timeout.
-Focused RED/GREEN, root `667+3 ignored`, main `2`, integration `10+4
-ignored`, release, Clippy, shell, vendored Quinn/proto, 32 MiB capacity,
-fmt/diff/secret, and code-review gates pass with no P0/P1. No frozen value
-changed. Result:
-`docs/tech/2026-07-26-knife15-hk-smoke-half-close-progress-results.md`.
-
-Next pull the pushed repair, rebuild release, and take one fresh user-operated
-HK `baseline -> direct-discriminator -> start -> smoke -> m1-diagnostic ->
-status -> stop` sequence. Keep every other VPN/TUN disabled through stop and
-preserve status/snapshot/stop on failure. M1 diagnostic remains
-non-acceptance evidence and cannot unblock M2/M3.
-
-#### Previous decision (2026-07-24)
-
-Exact-source `f2c1484` HK pre-run bundle
-`/tmp/mini_vpn_knife15_macos_20260724_103153.tar.gz` (SHA-256
-`07f7e620...`) completed `start -> smoke -> stop`; no M1 diagnostic action
-ran. Binary/runner identity, routes, both TCP directions, fake-IP DNS, pool
-idle, Endpoint/D16 ownership, resources, and cleanup pass.
-
-Forward smoke retained four top-level zero intervals, but these are local
-sender intervals because smoke has no embedded server JSON. Replay over the
-six preceding real HK M1 bundles found `4/4/10/8/0/4` forward smoke
-cold-start sender zeros. They are not a new regression and do not predict the
-later Target receiver failure. One `1/3` Exit ICMP loss sample recovered in
-the next sample while the gateway remained lossless. Do not tune or add a
-strict smoke sender-zero gate. Result:
-`docs/tech/2026-07-24-knife15-hk-diagnostic-prerun-smoke-results.md`.
-
-Because the run was stopped, take one fresh complete
-`baseline -> direct-discriminator -> start -> smoke -> m1-diagnostic ->
-status -> stop` sequence. The diagnostic is still non-acceptance evidence and
-does not unblock M2/M3.
-
-#### Previous decision (2026-07-24)
-
-M1 diagnostic continuation is implemented locally at `b675540`. The new
-`m1-diagnostic` action reuses the exact frozen `28,800s` schedule and all
-formal preconditions/rates, but records valid receiver-zero, reverse-UDP loss
-above `3%`, and aggregate TCP gap above `16MiB` and continues the timeline.
-Formal `m1` remains fail-fast and is the only M1 acceptance action.
-
-The typed ledger is replayed against its original JSON and checked for missing
-observations. Receiver-zero continuation relaxes only receiver positivity;
-malformed or missing evidence and every command/DNS/health/checkpoint/sample/
-Endpoint/D16/pump/TUN/resource/rebind/ownership failure remain fail-closed.
-Root `666+3 ignored`, main `2`, integration `10+4 ignored`, release, Clippy,
-shell, syntax, fmt/diff/secret, and review gates pass with no P0/P1. Result:
-`docs/tech/2026-07-24-knife15-m1-diagnostic-continuation-local-results.md`.
-
-Next run one fresh user-operated HK diagnostic sequence from the pushed
-source: `baseline -> direct-discriminator -> start -> smoke -> m1-diagnostic
--> status -> stop`. Rebuild release, use fresh `M1_BASELINE_DIR` and
-`M1_DIRECT_DIR`, and keep every other VPN/TUN disabled through stop. This
-artifact is for complete longitudinal attribution; it cannot accept M1 or
-unblock M2/M3. Formal M1 still requires a separate passing run.
-
-#### Previous decision (2026-07-24)
-
-Exact-source `297dee9` HK bundle
-`/tmp/mini_vpn_knife15_macos_20260724_034941.tar.gz` (SHA-256 `182cc896...`)
-was operated correctly. Fresh baseline/direct and the smoke pool-idle barrier
-passed. M1 completed `steady-a`, `idle-1`, `quiet`, and `idle-2`, then failed
-about 3h20m into the run in cycle 15 forward with three complete Target
-receiver-zero seconds.
-
-The `297dee9` repair is not the failed boundary. Both checkpoints ended at
-`61,403/0/0B`, and the failing control/data pair split conn0/conn1 from an
-idle pool. Conn1 added `783` lost packets, `898,964B` loss, `366` congestion
-events, and `18` PLPMTUD black holes while its writer waited `9,256,932us`.
-A direct Exit control lost one of three probes inside the interruption; the
-gateway, TUN, Endpoint conservation, D16 ownership, resources, and cleanup
-remained healthy.
-
-Reverse UDP also exceeded the frozen `3%` loss SLO twice (`3.356208%`,
-`3.408435%`), with each window aligned to direct Exit degradation and zero
-internal UDP drops/backpressure. Result:
-`docs/tech/2026-07-24-knife15-m1-hk-path-quality-failure-results.md`.
-
-Classify this as an external single-path M1 failure. Do not tune product or
-workload values and do not immediately repeat in the same network window.
-M2/M3 remain blocked. One fresh later-window HK M1 remains the next acceptance
-action. A future TCP repeat under healthy direct controls opens connection
-isolation/failover; a future UDP repeat under healthy direct controls opens
-UDP/TUIC quality architecture.
-
-#### Previous decision (2026-07-22)
-
-Exact-source `f60926e` HK bundle
-`/tmp/mini_vpn_knife15_macos_20260722_110059.tar.gz` (SHA-256 `9071ec0f...`)
-was operated correctly and passed fresh baseline/direct. M1's first forward
-phase then had one complete initial Target receiver-zero second. Smoke had
-completed only one second before the phase: its old conn1 reverse-data relay
-still owned two native half leases, so a `2:2` pool tie placed both new M1
-flows on conn0. The old flow reaped only after this open. Three comparable
-earlier starts drained first, split control/data across conn0/conn1, and had a
-positive first interval.
-
-The Endpoint monitor now publishes the exact TCP-pool lease total only on
-transitions. Smoke waits for zero within its existing hard timeout; formal
-M0/M1 independently require the latest exact zero. Missing, malformed, and
-nonzero evidence fails closed and preserves the TUN for evidence. No fixed
-sleep, initial-interval waiver, selector/pool change, or frozen-value tuning
-was added.
-
-Full local gates pass: root `666+3 ignored`, main `2`, Quinn `37+3 ignored`,
-quinn-proto `309`, docs, release, Clippy, shell, fmt/diff/secret, and 32 MiB at
-`240.322 Mbit/s` with final `61,440/0/0B`. Review has no unresolved P0/P1.
-Result:
-`docs/tech/2026-07-22-knife15-m1-post-smoke-pool-idle-local-results.md`.
-
-Next run one fresh user-operated HK M1 from the pushed repair with rebuilt
-release and fresh baseline/direct. Keep every other VPN/TUN disabled through
-`stop`; preserve status/snapshot/stop on failure. Do not tune constants or
-waive strict TCP/UDP SLIs. M2/M3 remain blocked.
-
-#### Previous decision (2026-07-22)
-
-Exact-source `e479013` HK bundle
-`/tmp/mini_vpn_knife15_macos_20260722_094608.tar.gz` (SHA-256 `7443769e...`)
-was operated correctly. Fresh baseline/direct passed; M1 cycle 1 forward then
-had three complete Target receiver-zero seconds and seven successful
-`tcp_write_stall` rebind/recovery cycles. Repeated source-port migration while
-the same business writer stayed blocked proves the Pending-only trigger
-created false recovery churn. Physical controls, TUN, Endpoint conservation,
-resources, and cleanup reject operator, route, or local ownership failure.
-
-The replacement architecture samples monotonic ACK progress from the exact
-Quinn send stream owned by each Pending writer. The existing recovery may
-rebind only when both Pending age and exact-stream ACK-stall age reach the
-unchanged RTT-derived bound. Same-stream ACK progress suppresses false rebind;
-unrelated ACKs cannot hide a real stream black hole. One rebind covers all
-sampled writers. No frozen value changed.
-
-Full local gates pass: root `653+3 ignored`, main `2`, Quinn `37+3 ignored`,
-quinn-proto `309`, docs, release, Clippy, shell, fmt/diff/secret, and 32 MiB at
-`240.472 Mbit/s` with final `61,440/0/0B` conservation. Review has no
-unresolved P0/P1. Result:
-`docs/tech/2026-07-22-knife15-m1-stream-ack-qualified-rebind-local-results.md`.
-
-Next run one fresh user-operated HK M1 from the pushed repair with rebuilt
-release and fresh baseline/direct. Keep every other VPN/TUN disabled through
-`stop`; preserve `status/snapshot/stop` on failure. Do not tune constants or
-waive strict TCP/UDP SLIs. M2/M3 remain blocked.
-
-#### Previous decision (2026-07-22)
-
-Exact-source `b33a3f6` HK bundle
-`/tmp/mini_vpn_knife15_macos_20260722_075828.tar.gz` (SHA-256 `f8b5b2ea...`)
-was operated correctly and passed fresh baseline/direct, start/smoke, and M1
-cycle 1. Cycle 2 forward failed one complete Target receiver second while its
-sender stopped for most of an 18-second span. Conn1 accumulated `356` QUIC
-lost packets, `480,190B` loss, `112` congestion events, and an
-`11,279,769us` D16 writer wait. ACK/control RX continued, so the old no-RX
-Endpoint monitor did not trigger.
-
-The local repair adds per-pool continuous TCP `poll_write -> Pending`
-ownership and feeds it into the existing recovery state machine. An episode
-at the unchanged RTT bound can request one Endpoint rebind despite RX progress;
-the rebind covers all then-current pool episodes and retains the accepted
-authenticated set-wise current-generation recovery. Full local gates pass:
-root `650+3 ignored`, main `2`, TUIC `100`, Quinn/proto docs and tests,
-release/Clippy/shell/fmt/diff/secret, and 32 MiB at `240.585 Mbit/s` with exact
-conservation. Review has no unresolved P0/P1; no frozen value changed. Result:
-`docs/tech/2026-07-22-knife15-m1-tcp-write-stall-rebind-local-results.md`.
-
-Next run one fresh user-operated HK M1 from the pushed repair with rebuilt
-release and fresh baseline/direct. Keep every other VPN/TUN disabled through
-`stop` and preserve `status/snapshot/stop` on failure. Do not repeat unchanged,
-tune frozen constants, or waive strict SLIs. M2/M3 remain blocked.
-
-#### Previous decision (2026-07-21)
-
-Exact-source `1c587ba` HK bundle
-`/tmp/mini_vpn_knife15_macos_20260721_110225.tar.gz` (SHA-256 `62280ba0...`)
-was operated correctly and passed fresh baseline/direct. M1 ran about 6h43m,
-completed four active windows and all idle/resume boundaries, then failed
-cycle 28 `steady-c/short-reverse-6` with eight complete local receiver-zero
-seconds. Conn1 business RX paused `8,301ms` while conn0 control RX paused
-`10,733ms`; the shared Endpoint rebound, but Quinn released its retained old
-socket after only the first pooled connection proved the current socket.
-
-The local repair makes rebind recovery set-wise: Quinn retains one previous
-socket until every rebind-time live connection authenticates a current-socket
-packet or drains, and mini_vpn requires every sampled connection generation.
-Old-socket, routed-but-unauthenticated, stale-generation, and post-snapshot
-traffic cannot prove recovery. Review found and repaired the authentication
-P1. Full Rust/Quinn/proto/release/Clippy/shell/fmt/diff/secret gates pass; the
-32 MiB gate is `232.164 Mbit/s` with exact conservation. No frozen value or SLO
-changed. Result:
-`docs/tech/2026-07-21-knife15-m1-multi-connection-rebind-retention-local-results.md`.
-
-The failed bundle also had two independent reverse-UDP windows above `3%`.
-This remains a real discriminator, not a reason to tune or waive the SLO. Next
-run one fresh user-operated HK M1 from the pushed repair using a rebuilt
-release and fresh baseline/direct. Keep every other VPN/TUN disabled through
-`stop`; preserve `status/snapshot/stop` on failure. M2/M3 remain blocked.
-
-#### Previous decision (2026-07-20)
-
-The first real HK M1 bundle
-`/tmp/mini_vpn_knife15_macos_20260720_090636.tar.gz` (SHA-256 `5fd183b1...`)
-was operated correctly and completed five full mixed cycles. Cycle 6 forward
-then transferred `292,945,920B` over its complete 300-second command but was
-rejected as `receiver_zero_interval`. All `300` complete Target receiver
-intervals were positive; the only zero was a final `0.163918s` iperf command
-tail. Routes, conservation, resources, health, and cleanup reject operator,
-Clash, route, and data-plane failure.
-
-The local repair excludes only a numeric final sub-`0.5s` zero row proven at
-the command boundary. Complete, nonterminal, timing-unproven, malformed, and
-negative evidence still fails closed. Real artifact replay and all shell,
-Rust, release, Clippy, fmt, diff, and secret gates pass; review has no
-unresolved P0/P1. Result:
-`docs/tech/2026-07-20-knife15-m1-partial-tail-observer-repair-results.md`.
-
-The partial bundle does not satisfy the eight-hour M1 contract. After the
-repair is pushed, rebuild release and create fresh M1 baseline/direct artifacts
-for one new user-operated HK run. Disable every other VPN/TUN before baseline
-and keep them off through stop. Use `status/snapshot/stop` on failure. M2/M3
-remain blocked; do not tune frozen constants.
-
-#### Previous decision (2026-07-17)
-
-Knife15 M1 local implementation is complete and pushed at `2cca535`. The exact
-eight-hour schedule, stage-owned evidence, four fresh resource/ownership
-checkpoints, `302` TCP + `30` UDP + `30` DNS result contract, child deadlines,
-rebind SLO, summary validation, and fail-closed cleanup are implemented. All
-local shell/Rust/release/Clippy/fmt/diff/secret gates pass and code review has
-no unresolved P0/P1. Result:
-`docs/tech/2026-07-17-knife15-m1-eight-hour-soak-local-results.md`.
-
-Next run one user-operated HK macOS M1 from the exact reviewed source. Before
-baseline, completely disable Clash-TUN and every other VPN/TUN, and keep them
-off through `stop`. Use fresh M1 baseline/direct directories; do not reuse the
-M0 artifacts or run M0 in the same TUN lifecycle. A real failure requires
-`status/snapshot/stop` evidence and analysis, not frozen-constant tuning or an
-unchanged immediate repeat. M2 and M3 remain blocked pending M1 bundle review.
-
-#### Previous decision (2026-07-17)
-
-Knife15 M0 is complete. The independent rearm bundle
-`/tmp/mini_vpn_knife15_macos_20260717_063948.tar.gz` (SHA-256 `f4e0f649...`)
-used source `d3f7b13` and exact main-run binary/runner hashes. It created a
-fresh target-only `utun4`, kept Exit on physical `en1`, passed forward/reverse
-TCP and fake-IP DNS, then cleaned the process, TUN, and routes.
-
-Endpoint conservation passed and ended `61,277/0/0B`; interface errors,
-abandoned bytes, stranded queue ownership, log compactions, and secret scan
-failures were zero. Its `Stopped(0)` and bounded application-first close are
-the accepted REVIEW classes. No unresolved P0/P1 remains. Together with main
-bundle `...035908.tar.gz` (SHA-256 `1ecee823...`), this closes M0.
-
-Do not repeat M0, baseline, or direct. Next define the M1 eight-hour SLO/spec
-from the M0 resource/path envelope, then extend the runner with deterministic
-shell TDD before any M1 macOS execution. Keep all frozen data-plane constants
-and strict direction-aware receiver semantics. Result:
-`docs/tech/2026-07-17-knife15-hk-m0-rearm-acceptance-results.md`.
-
-#### Previous decision (2026-07-17)
-
-Exact source `8bc7b7c` has produced the first accepted two-hour Knife15 M0
-main bundle: `/tmp/mini_vpn_knife15_macos_20260717_035908.tar.gz` (SHA-256
-`1ecee823...`). Its fresh direct prerequisite completed 300 positive Target
-receiver seconds at `18.101918 Mbit/s`. The M0 controller completed eight full
-mixed cycles, both 30-second forward bookends, idle/resume, final drain, all
-`74` result files, and `8/8` DNS checks with zero phase/health failures and
-zero direction-aware receiver-zero intervals.
-
-Conservation remained at or below `61,440B` and ended `61,403/0/0B` available/
-live/outstanding. Resource envelopes were bounded; TUN/physical interface
-errors and log compactions were zero; stop restored routes and removed the
-process/TUN. The close-tail `REVIEW` contains only boundary `Stopped(0)` events
-with zero D16 ownership and one pre-M0 smoke local-close release matching the
-already accepted bounded `524288B + 27840B` case. No unresolved P0/P1 remains.
-
-Next run only an independent fresh `start -> smoke -> stop` rearm and return its
-bundle/checksum. Do not repeat baseline, direct, or two-hour M0; do not change
-frozen settings. M1 stays blocked until this rearm passes, after which define
-explicit M1 resource/recovery SLOs from the accepted M0 envelope. Result:
-`docs/tech/2026-07-17-knife15-hk-m0-main-run-results.md`.
-
-#### Earlier decision (2026-07-17)
-
-The exact-source `13faccc` HK bundle
-`/tmp/mini_vpn_knife15_macos_20260717_033923.tar.gz` (SHA-256 `a189b848...`)
-passes its scoped start/smoke/DNS qualification. The one canonical forward
-`Stopped(0)` is the accepted iperf close-tail class: D16 ownership was zero,
-Endpoint conservation passed, and reverse TCP plus DNS succeeded. The generic
-manual `remote_write_failed` grep was not a valid stop gate; it incorrectly
-prevented M0 from starting. No data-plane or runner change is required.
-
-The latest complete direct `...033233` has expired. Keep all other VPNs off,
-rerun the unchanged 300-second direct discriminator, then perform
-start/smoke/M0 immediately. A lone equivalent `Stopped(0)` remains visible as
-`REVIEW` but does not stop M0. Do not re-enable another VPN until Knife15
-`stop` completes; the last bundle's post-smoke `utun1024` route contaminated
-the final route sample. Result:
-`docs/tech/2026-07-17-knife15-hk-smoke-stopped0-classification-results.md`.
-
-#### Previous decision (2026-07-16)
-
-The first three Shenzhen physical baseline attempts after candidate `fe3ec83`
-failed before any TUN or mini_vpn execution. Attempt `...134708` established
-the iperf control and data connections but produced no interval; the client
-reported a closed control socket while Target reported an idle data receive.
-The Target service stayed active with zero restarts.
-
-Attempt `...135653` completed both directions. Forward Target receiver was
-`2.598 Mbit/s` with two zero intervals and 24 retransmits. Reverse local
-receiver was `0.098 Mbit/s` with four zero intervals and 50 retransmits. The
-accepted `1KiB` reverse observer normally exposed multiple blocks per positive
-second, but three consecutive receiver seconds were zero while sender cwnd
-fell to `1,388-2,776B`. This is physical path discontinuity, not a minimum-
-speed failure or observer quantization.
-
-Attempt `...140906` repeated the decisive forward symptom: both JSON results
-completed, reverse receiver was continuous at `0.566 Mbit/s`, but forward
-Target receiver still had one complete `0B` second plus a zero short tail at
-`2.444 Mbit/s`. The client recorded 31 retransmits and cwnd down to `1,388B`.
-The failure is therefore not caused only by validator treatment of a short
-tail, and immediate same-window repeats are exhausted.
-
-Do not export any failed directory, run direct/start/M0, tune mini_vpn, or relax
-receiver continuity. Retry the unchanged baseline in a different network
-window or on another Mac with a more continuous Target path. No minimum Mbps
-is required. A degraded-path lane, if planned later, remains non-promotable and
-separate from formal socket-rebind acceptance. Result:
-`docs/tech/2026-07-16-knife15-shenzhen-post-rebind-physical-baseline-results.md`.
-
-Previous exact source `8e9daf9` Shenzhen bundle
-`/tmp/mini_vpn_knife15_macos_20260716_110535.tar.gz` (SHA-256 `f9799711...`)
-was operated correctly. It did not stop because the user interrupted it or
-because a sudo password was delayed. Smoke passed, M0 cycle 1 completed, and
-cycle 2 forward failed by itself after about `65s`. The later status/snapshot/
-stop sequence preserved evidence and cleaned the TUN.
-
-Fresh physical baseline was `31.447419 Mbit/s` forward and `0.487728 Mbit/s`
-reverse. The fresh 300-second direct receiver passed at `15.716047 Mbit/s`
-with no zero interval. Shenzhen speed remains an environment measurement with
-no minimum threshold.
-
-Conn0/control and conn1/data shared one Quinn Endpoint and source port `64195`.
-After that identity had served smoke and all of cycle 1 for about 18 minutes,
-both connections timed out together. Reconnect on the same Endpoint/socket
-identity timed out. Endpoint pacing stayed within `61,440B` and ended
-`61,440/0/0B`; TUN, resources, physical controls, sing-box, and iperf remained
-healthy. The selected failure boundary is endpoint-wide UDP receive/service,
-not operator procedure, D16, pacing, TUN pressure, or a service restart.
-
-Commit `0460886` implements proactive endpoint socket recovery. One weak-owned
-monitor samples at `250ms`; active aggregate TX with no RX crosses
-`clamp(8 * max_rtt, 2s, 7s)` and causes at most one live socket rebind in that
-episode. It preserves the same Endpoint, both established connections, TUIC
-streams, optional bounded-adapter accounting, and EndpointWindowV1 state.
-Connection-local reconnect remains unchanged as the fallback.
-
-Review found and repaired one P1: Quinn retains the previous socket during
-active migration, so old-socket packets could increase connection RX and
-falsely declare the new socket healthy. Vendored Quinn now exposes the current-
-socket RX rebind generation. Product policy and runner evidence require that
-generation before recovery. No unresolved P0/P1 remains.
-
-Final local gates pass: policy `4/4`, root library `646 + 3 ignored`, main
-`2/2`, Quinn-proto `309/309 + 3/3` doc, Quinn `29 + 3 ignored + 1/1` doc,
-release, all-target check/Clippy, Knife15/Knife14 shell suites, fmt, and diff.
-No frozen D16, MTU, pool, QUIC window, chunk, Cubic, GSO, self-wake, pacing,
-workload, or receiver-SLI value changed.
-
-Next synchronize the pushed source to Shenzhen, build release, and take a
-fresh physical baseline plus fresh 300-second direct discriminator. Only a
-direct PASS permits start/smoke/M0. If a rebind occurs, M0 must show one
-trigger and current-socket RX recovery; any receiver-zero interval, missing
-trigger, missing recovery, or repeated same-episode rebind rejects the
-architecture without tuning. Results:
-`docs/tech/2026-07-16-knife15-macos-m0-cycle2-endpoint-timeout-results.md` and
-`docs/tech/2026-07-16-knife15-endpoint-socket-rebind-recovery-local-results.md`.
-
-Previous exact source `c50613c` clean Shenzhen rearm bundle
-`/tmp/mini_vpn_knife15_macos_20260716_100056.tar.gz` (SHA-256 `baee8f2f...`)
-was operated correctly and classifies the hanging smoke as a local TCP close-
-lifecycle defect. The target route remained `utun5`, Exit remained `en0`, and
-snapshot/stop cleaned the run. A public-IP query still showing Shenzhen is
-expected for the target-only TUN and is not evidence of failed routing.
-
-The first smoke relay wrote the exact `37B` iperf control request. After
-`11.045s` without a remote stream frame, the D16 queue closure installed
-`remote_eof` and queued local FIN. The later `remote_read_failed` event then
-immediately rearmed and aborted the same smoltcp socket before FIN could pass
-`iface.poll + flush_tx`. Local iperf3 received neither FIN nor RST, so the old
-smoke command had no completion bound and hung until user interruption.
-
-The fresh `.33` packet capture saw bidirectional UDP `8443` on the new source
-port, handshake/recovery bursts, and later heartbeats. This rejects the old-
-five-tuple permanent-blackhole branch. The path remains lossy and `.33` logged
-authentication timeouts, so transport stability still needs the repaired
-replay; slow Shenzhen throughput itself remains non-failing environment data.
-
-Commit `9f68435` keeps a same-epoch terminal event inside an already pending
-bounded close, upgrades the stored cause from clean EOF to the first non-clean
-cause, and allows smoltcp to deliver the local close before rearm. Its full
-in-memory TUN + dual-smoltcp test was exact RED (`Established`, still active)
-and is now GREEN. Each smoke iperf is also bounded to `duration+30s`, preserves
-its output, and returns `124` when killed by the watchdog.
-
-Full local gates pass: library `640 + 3 ignored`, main `2`, focused D16 close
-tests, release, all-target harness check/Clippy, Knife15 and Knife14 shell
-suites, fmt/diff, and code review with no unresolved P0/P1. No frozen H10d16
-constant or receiver SLI changed.
-
-Next synchronize commit `9f68435` to Shenzhen and rebuild release. Since the
-source, runner, and binary changed, take a fresh physical baseline and fresh
-300-second direct discriminator; `...064427` and `...071534` remain accepted
-historical evidence but cannot provide new-source M0 provenance. On direct
-PASS, run one bounded start/smoke. Smoke PASS permits formal M0; smoke failure
-must preserve TUN for status/snapshot/stop and cannot lead to constant tuning.
-Result:
-`docs/tech/2026-07-16-knife15-macos-smoke-close-lifecycle-results.md`.
-
-Previous exact source `c50613c` M0 bundle
-`/tmp/mini_vpn_knife15_macos_20260716_072536.tar.gz` (SHA-256 `dd8a28f0...`)
-correctly failed M0 cycle 1 forward. Start/smoke and all baseline/direct
-freshness/provenance checks passed. The user correctly preserved the failure,
-took a snapshot, and stopped with complete cleanup.
-
-The 300-second client sent only `10,485,760B`, reported `292/300` zero
-intervals and final `Broken pipe`, and had no server output. Target recorded an
-unexpectedly closed client. Both TUIC pool connections on the shared Quinn
-endpoint ended `TimedOut`; all reconnect attempts on that endpoint then timed
-out. The data relay had accepted `5,242,917B` before transport loss.
-
-Endpoint conservation stayed `<=61,440B` and ended `61,440/0/0B`; pacing
-blocking, TUN pump/flush errors, FD/thread growth, interface errors, log
-compaction, and watchdog failures were absent. `.33` sing-box and `.77` iperf
-remained active; `.33` had zero service restarts and logged both M0 Target
-opens. This rejects operator, observer, freshness, local pressure, and service-
-restart branches.
-
-At that point, the unresolved branch was Shenzhen/upstream UDP five-tuple
-blackhole versus a mini_vpn shared-endpoint receive/service failure. The
-bounded `.33` UDP `8443` capture and clean rearm classified that branch and
-exposed the newer local lifecycle result at the top of this section. Result:
-`docs/tech/2026-07-16-knife15-macos-m0-shared-quic-timeout-results.md`.
-
-Synchronized Shenzhen directory
-`/tmp/mini_vpn_knife15_macos_direct_20260716_071534` passes the unchanged
-300-second physical forward discriminator. Result SHA-256 is `810e777b...`.
-The Target receiver delivered `420,741,120B` at `11.213247 Mbit/s` over
-`300.174s`; all `300` complete receiver intervals were positive. Sender and
-receiver zero counts were both zero, and the sender reported one retransmit.
-
-The manifest is `status=pass/reason=ok` and binds source `c50613c`, the runner
-and release binary hashes, the accepted baseline's exact forward/reverse JSON
-hashes, requested `300s` at the exact half-baseline `11,218,349 bit/s`, and
-physical `en0` Target/Exit routes. This rejects the physical-continuity branch
-for the immediate M0 window without claiming a minimum Shenzhen speed.
-
-For source `c50613c`, this pair permitted the old start/smoke/M0 attempt. It is
-now historical evidence and is superseded as formal provenance by the
-`9f68435` repair at the top of this section. Result:
-`docs/tech/2026-07-15-knife15-macos-low-rate-reverse-observer-results.md`.
-
-Exact copied Shenzhen archive
-`/tmp/mini_vpn_knife15_macos_baseline_20260716_064427.tar.gz` (SHA-256
-`5ea583c5...`) passes the formal physical baseline with the 1KiB reverse
-observer. Forward Target receiver delivered `57,147,392B` at
-`22.436698 Mbit/s` with `21/21` positive intervals. Reverse local receiver
-delivered `454,656B` at `0.181787 Mbit/s` with `20/20` positive intervals.
-The reverse sender's nine zero intervals, 50 retransmits, roughly `164-170ms`
-RTT, and `8,328B` maximum cwnd remain physical-path diagnostics; acceptance is
-direction-aware at the receiver.
-
-The archive checksum and two-file regular-file shape are exact, and
-`blksize=1024` proves the new observer command was reached. It does not prove
-an exact source commit. Slow speed has no minimum threshold and is not a
-mini_vpn defect because this is the required pre-TUN physical lane.
-
-Next, keep mini_vpn/TUN off, export the original Shenzhen directory
-`/tmp/mini_vpn_knife15_macos_baseline_20260716_064427`, and run the unchanged
-300-second direct discriminator. A PASS permits start/smoke/M0; a direct
-receiver zero blocks formal M0 as physical continuity evidence without tuning
-data-plane constants. Result:
-`docs/tech/2026-07-15-knife15-macos-low-rate-reverse-observer-results.md`.
-
-Exact copied Shenzhen archive
-`/tmp/mini_vpn_knife15_macos_baseline_20260715_154130.tar.gz` (SHA-256
-`49c4b71a...`) used the repaired 16KiB reverse command. Physical forward was
-`31.798980 Mbit/s`, with all Target intervals positive but `9,420` sender
-retransmits. Physical reverse was `0.131071 Mbit/s`, with five local receiver
-zeros, 45 retransmits, `169-184ms` RTT, and max cwnd `8,328B`. mini_vpn/TUN was
-not running: slow speed and loss are environment capability, not product bugs.
-
-Every positive reverse interval remained a 16KiB multiple, while useful
-delivery was about 16KiB/s and the block exceeded cwnd. Commit `e49d83c`
-changes only reverse baseline/M0 iperf observation to 1KiB, giving about eight
-blocks/s at the current formal half-rate. Baseline also prints direction-aware
-physical receiver Mbit/s and zero counts before any acceptance verdict. No
-minimum Mbps is enforced.
-
-Forward/direct/short-forward, rates, durations, UDP1160, strict no-zero SLI,
-and all frozen mini_vpn settings remain unchanged. TDD, Knife15/Knife14 shell,
-syntax, fmt/diff, and review pass with no P0/P1.
-
-Next rebuild final source and run one fresh Shenzhen physical-`en0` baseline.
-Do not reuse `...131049` or `...154130`. Positive 1KiB reverse intervals permit
-direct/M0. Remaining zeros block formal M0 as physical continuity evidence,
-not a mini_vpn bug; do not tune data-plane constants. Result:
-`docs/tech/2026-07-15-knife15-macos-low-rate-reverse-observer-results.md`.
-
-Source `5c127eb` bundle
-`/tmp/mini_vpn_knife15_macos_20260715_104417.tar.gz` (SHA-256 `5743b352...`)
-is exact and correctly operated. Its 300-second direct prerequisite passed all
-Target receiver seconds at `6.626752 Mbit/s` and was fresh. Sustained forward,
-sustained reverse, and reverse UDP then passed; the first short-forward phase
-failed with two initial receiver-zero seconds and only `3,670,016B` received
-from `10,616,832B` sent.
-
-The deterministic discriminator is pool history. Global round-robin placed
-the first two TCP phase pairs on control/data conn0/conn1. Reverse UDP opened
-one TCP control on conn0 and shifted the cursor; the next short pair inverted
-to conn1/conn0. The conn0 data writer waited `3.864382s` while endpoint
-ownership, TUN/pump, resources, same-window Exit/gateway controls, and exit-side
-Connect timing remained clean. Operator error, direct-path continuity,
-server-dial delay, endpoint pacing, and connection liveness are rejected.
-
-Commit `c945a41` replaces global history with least-active atomic reservation,
-stable primary-first ties, and a per-slot RAII preparation gate held until the
-selected connection is cloned. The gate closes a P1 overtaking risk found in
-review of the initial counter-only implementation. Focused pool tests `15/15`,
-all-target library `640 + 3 ignored`, main `2/2`, release, Clippy, Knife15 and
-Knife14 shell gates, fmt, and diff checks pass; review has no unresolved P0/P1.
-Pool=2 and every frozen data-plane/workload setting remain unchanged.
-
-Next: user rebuilds release, takes a fresh baseline, and passes a new
-300-second direct discriminator before start/smoke/M0. Corrected M0 must place
-short control/data on conn0/conn1 and keep all complete Target receiver
-intervals positive. If placement is corrected but the SLI still fails, stop
-repeats and tuning and reopen the flow-specific QUIC/path architecture branch.
-If M0 passes, run an independent rearm. M1 stays blocked until both pass.
-Results:
-`docs/tech/2026-07-15-knife15-macos-m0-directpass-pool-parity-results.md` and
-`docs/tech/2026-07-15-knife15-macos-m0-lease-aware-pool-selection-architecture-spec.md`.
-
-Exact source `5e8846f` repaired-observer bundle
-`/tmp/mini_vpn_knife15_macos_20260715_084113.tar.gz` (SHA-256 `85dd7a66...`)
-passes the scoped short gate. All `5/5` physical rows have semantically valid
-numeric counters, zero errors, nonzero byte deltas and meaningful rates; all
-Exit/gateway controls are complete with zero loss. TCP/DNS smoke, endpoint
-conservation, D16 ownership, process/utun/route cleanup, and artifact
-provenance pass. The generic REVIEW is one forward close-tail logged three
-ways, not three independent failures.
-
-Summary-only follow-up commit `2c8030a` now counts one canonical D16 terminal
-relay in `remote_write_failures` and preserves all three diagnostic matches in
-`remote_write_failure_log_matches`. Knife15 internal/external and Knife14 shell
-self-tests pass. Observer collection and all frozen settings are unchanged.
-
-The observer prerequisite is closed, but M0 itself remains failed/incomplete
-and M1 remains blocked. Next take a fresh direct baseline on the dedicated
-Shenzhen Mac, run formal M0, then run an independent start/smoke/stop rearm.
-Do not reuse a prior baseline, relax the receiver SLI, or tune frozen settings.
-Result:
-`docs/tech/2026-07-15-knife15-macos-m0-physical-counter-observer-repair-results.md`.
-
-Exact source `b0fcb76` repeated a genuine receiver continuity failure in the
-first M0 forward phase. Five complete Target receiver seconds were zero, plus
-one short tail; the full command delivered `208,142,336B / 5.547 Mbit/s` from
-a `14.425 Mbit/s` offer before the direction-aware SLI stopped the schedule.
-The baseline, manifest, route, and user sequence were correct. A delayed sudo
-password before the much later stop can only delay evidence cleanup and was
-not the failure cause.
-
-Internal conservation, endpoint service, utun/pump, D16 lifecycle, and
-resource evidence remained clean. QUIC loss/congestion, cwnd contraction, and
-a `10.05s` writer wait select bulk-QUIC transport pressure, while same-window
-Exit/gateway ICMP rejects only a broad simultaneous outage. The exact external
-segment remains unisolated.
-
-The physical portion of network-v2 was independently invalid: BSD physical
-`netstat` included a link Address absent from the utun fixture, shifting every
-counter while preserving the expected 27 columns. Commit `524139b` repairs
-both row shapes and gates physical samples, errors, byte/rate envelopes, and
-freshness on semantic numeric validity. Focused shell TDD, Rust/release,
-Knife14 shell, syntax, fmt/diff, and review gates pass with no P0/P1. The
-separate rearm lifecycle passed but shares the old observer defect.
-
-M0 and M1 remain blocked. The later exact-source short validation above closes
-the observer prerequisite; a new direct baseline and formal Shenzhen M0,
-followed by independent rearm, remain required. Do not tune frozen settings or
-relax the receiver SLI.
-Result:
-`docs/tech/2026-07-15-knife15-macos-m0-physical-counter-observer-repair-results.md`.
-
-Exact source `b5c3963` completed two full mixed M0 cycles. Cycle 3 forward then
-contained four genuine Target receiver zero-byte seconds while transferring
-exactly `230,031,360B` over the full `300s`, so the receiver SLI correctly
-failed. This was not user operation and not the earlier sender-evidence defect.
-Endpoint ownership, TUN/pump service, relay lifecycle, and resource envelopes
-remained clean. QUIC loss/congestion rose and cwnd contracted to `25,174B`
-before recovery, selecting a path/QUIC congestion branch rather than a
-data-plane constant or lifecycle repair.
-
-The old runner did not collect the plan's same-window direct controls, so the
-artifact cannot distinguish external physical-path degradation from a
-tunnel-only UDP/QUIC event. The local evidence repair adds Exit/gateway
-RTT/loss, physical-interface counters/rates, raw network logs, pre-M0
-completeness, in-run freshness/watchdog checks, and fail-closed per-process
-network correspondence. All local Rust/release/shell/fmt/diff/review gates
-pass; no frozen setting changed. The separate rearm bundle passed.
-
-M0 is still incomplete. Next: rebuild on the dedicated Shenzhen Mac, exit any
-other VPN so Target/Exit use physical routes, take a fresh baseline, run the
-formal M0, then stop/re-create/smoke/stop. M1 remains blocked. Result:
-`docs/tech/2026-07-15-knife15-macos-m0-network-control-discriminator-results.md`.
-
-The fresh M0 bundle
-`/tmp/mini_vpn_knife15_macos_20260715_013158.tar.gz` (SHA-256 `5c04031e...`)
-completed its full first `300s` forward transfer at `14.420 Mbit/s` Target
-receiver. It crossed 90 seconds, both M0 relays closed cleanly, conservation
-stayed `<=61,440B`, and TUN/pump/interface failures were zero. The runner
-stopped only because one client sender interval was zero while the Target
-receiver still delivered `640 KiB / 5.24 Mbit/s`; this is an evidence-semantics
-failure, not user operation or a relay/pacing regression.
-
-The local runner repair uses `--get-server-output` and direction-aware receiver
-SLIs. Receiver zero remains fail-closed; sender zero is counted and makes the
-final summary `REVIEW` without prematurely ending M0. Target readiness now
-requires structured receiver evidence. `.77` is qualified with a reversible
-JSON-output systemd drop-in and the `.27 -> .77` capability probe passes.
-Repair commit `4f836b9`; local gates and review pass. Next: exit the HK
-`utun1024` VPN/proxy, take a fresh direct baseline, then run fresh M0 and
-rearm. No constants changed. Result:
-`docs/tech/2026-07-15-knife15-macos-m0-receiver-evidence-results.md`.
-
-The first user-run formal M0 selected a relay-lifecycle defect, not user
-operation or H10d16 pacing. A legitimately quiet iperf control relay was still
-full-duplex Established when the old 90-second payload-idle timer aborted it;
-the target then closed the data session and remained busy during the immediate
-rearm. Endpoint conservation, pump, and interface evidence reject pacing/TUN
-capacity as the cause.
-
-The local repair is implemented. Full-open relays are deadline-free; only a
-concrete unfinished write has the 90-second no-progress guard, actual partial
-and remote progress reset it, completed flush disarms it, and local FIN keeps
-the 10-second drain bound. All relay engines use the same policy. The runner
-now finalizes one immutable archive/checksum and requires a positive direct
-Target transaction before every `start` mutation. Local Rust/shell/fmt/diff
-gates and review pass without changing frozen constants.
-
-Relay lifecycle commit `a4e4549` and runner/rearm commit `89cf1e9` are complete.
-The release build and local suite pass (`635` library tests passed, `3`
-ignored; main binary `2/2`). Next, the user takes a fresh baseline and runs one
-new formal M0. If it passes, perform one fresh start/smoke/stop rearm. Do not
-reuse either failed-run bundle as acceptance and do not tune endpoint pacing
-or M0 rates. Result:
-`docs/tech/2026-07-14-knife15-macos-m0-first-run-failure-and-repair-results.md`.
-
-The formal M0 mixed-workload controller and evidence parser are locally PASS.
-It requires a fresh same-target direct baseline, derives sustained TCP/UDP at
-`50%` and short TCP bursts at `80%`, fixes UDP at `1160B`, and runs
-`6,780s` active + `300s` idle + `120s` final drain. Eight complete cycles
-provide bidirectional TCP, reverse video-like UDP, 48 short connections, and
-eight fake-IP DNS checks.
-
-The public `m0` action accepts only the full `7,200s` profile. It rejects
-wrong-target/direction/zero-interval baselines, zero-traffic or missing-evidence
-iperf JSON, non-fake DNS answers, process death, target-route escape, and Exit
-recursion. It identity-tracks the controller plus traffic/idle/drain child,
-fails closed if log compaction loses history, leaves TUN running on workload
-failure for evidence, and adds M0 result/DNS/timeline, resource, utun, and
-endpoint-ownership fields to the summary. Local
-shell TDD passes; no new real TUN or two-hour run occurred. Next is the user-
-executed M0 and fresh stop/re-create/rearm pair. Result:
-`docs/tech/2026-07-14-knife15-macos-m0-controller-local-gate-results.md`.
-
-The first HK user-controlled target-only qualification is PASS on exact source
-`2a85fd4`. Direct receiver rates were `9.045/26.790 Mbit/s` forward/reverse;
-TUN receiver rates were `31.444/48.490 Mbit/s`, all four with `20/20` nonzero
-intervals. This is client-function evidence on a variable path, not an absolute
-capacity gate.
-
-Endpoint conservation stayed at or below `61,440B`; the TUN pump reached
-`317/500` with zero waits/errors; macOS `utun4` reported zero input/output
-errors; DNS forged `198.18.0.2`; PID, utun, and routes cleaned up; bundle secret
-scan and SHA-256 passed. One forward iperf-tail `Stopped(0)` is classified
-`REVIEW`: D16 owned queues/reservations closed at zero and the slot rearmed for
-reverse, so it is not a leak, but M0 must retain idle-drain and byte-gap checks.
-
-The real bundle exposed and drove TDD repairs for macOS-awk summary counts,
-remote-write failure classification, and high-rate permit-release log noise.
-These are report/log-density changes only. The short qualification authorizes
-a user-run target-only 2-hour M0 on HK or Shenzhen after the repaired runner is
-rebuilt; it does not complete M0. Result:
-`docs/tech/2026-07-14-knife15-macos-hitl-short-qualification-results.md`.
-
-Knife14 is complete. The next planned stage is Knife15 long-duration
-release-readiness, with two separate evidence lanes: the capable Linux/VPS
-topology remains the architecture and peak-throughput reference, while macOS
-becomes the real-client, utun, resource-stability, mixed-traffic, and recovery
-lane. HK may run the first user-controlled target-only qualification;
-Shenzhen remains the preferred long-duration host.
-
-The HK/Shenzhen-to-US paths are expected to remain below `200 Mbit/s`. They are
-not a `170/200 Mbit/s` architecture discriminator. Each run must first measure
-its direct/control bandwidth `B`; sustained soak should use approximately
-`40-60% of B` and short bursts `75-85% of B`, while preserving MTU1200 and a
-valid `1160B` UDP payload. Absolute peak capacity remains owned by the capable
-Linux/VPS gate.
-
-The new H10d16-aware target-only HITL runner and shell TDD fixture are now
-implemented at `scripts/knife15-macos-soak.sh` and
-`scripts/knife15-macos-soak-self-test.sh`. Local syntax/self-tests pass. The
-runner records source/binary provenance, refuses Exit-route recursion, owns
-only explicit host routes, performs signal/watchdog cleanup, bounds logs,
-samples process/utun/network/events, and secret-scans the final bundle. Do not
-reuse the historical full-route Knife3.5/8/9 scripts unchanged or depend on
-Linux `ip`/sysfs `tx_dropped`.
-
-The staged gates are M0 `2h` target-only qualification, M1 `8h` mixed soak, M2
-`24h` controlled real-client soak, and M3 one-variable-at-a-time Wi-Fi,
-sleep/wake, path change, client restart, and authorized Exit-restart recovery.
-Every bundle must correlate mini_vpn data-plane/loop/QUIC/endpoint/TUN/relay
-logs with RSS, CPU, FD, thread, utun, network-control, and event timelines.
-
-Keep H10d16 and all accepted Knife14 parameters frozen. The HK development Mac
-is authorized only through the reviewed HITL runner, with the user explicitly
-executing every `sudo` command. Agent-started TUN remains prohibited. A
-read-only preflight currently sees Exit/target traffic on `utun1024`, so the
-user must exit that VPN/proxy before qualification. No real macOS TUN, soak,
-fault injection, or VPS run occurred in this implementation update.
-
-Source:
-`docs/tech/2026-07-14-knife15-long-duration-release-readiness-plan.md`.
-Runbook:
-`docs/tech/2026-07-14-knife15-macos-hitl-m0-runbook.md`.
-
-## Current Knife14 Status (2026-07-14)
-
-### H10d16 byte-owned egress completion
-
-#### Latest decision (2026-07-14)
-
-Knife14 H10d16 Task 12 step 4 is **complete**. Exact repair source `5f9da90`
-passed the formal target-only reverse P8 on the capable Shoes/Quinn
-`.111:8443` Exit at `188 Mbit/s` receiver with `60/60` nonzero intervals.
-All eight flows exceeded one D16 quantum; TUN drops were `0/0`, pump high was
-`129/500` with zero waits/errors, formal QUIC loss/congestion/blocking was
-zero, and endpoint conservation/close cleanup was exact.
-
-The earlier `.33` low reverse result is not an architecture discriminator:
-that external sing-box/quic-go sender is independently limited to the low
-single-digit Mbit/s class on this topology. Do not use an externally incapable
-sender to reject the client architecture.
-
-The valid `1160B` UDP regression passed the required downlink/live-streaming
-direction at `90 Mbit/s` with `0/290,950` loss and zero mini_vpn, TUN, or
-within-window client QUIC loss. Forward delivered `83.7 Mbit/s` from a
-`90 Mbit/s` offer with `7%` application loss but no mini_vpn/TUN/within-window
-client QUIC drop signal. The prior `1200B` payload result is excluded because
-`1200 + 28 = 1228B` exceeded the frozen TUN MTU and forced fragmentation.
-
-Linux fake-IP DNS and TUN lifecycle passed twice: arbitrary resolver queries
-returned `198.18.0.2`, metrics reported `DNS forge=1/drop=0`, both processes
-stopped without residual TUN/routes, and a fresh TUN recreated successfully.
-Post-VPS root, harness, integration, vendored Quinn/proto/smoltcp, check, fmt,
-shell, and diff gates passed; final review has no unresolved P0/P1. `.27` and
-`.111` cleanup is complete, `.111` buffers are restored to `212992`, and no
-macOS TUN ran.
-
-Accepted chain: `c55737e -> d934f12 -> 20a0f8c -> e201403 -> 5f9da90`.
-Gate A and Gate B remain accepted. Do not reopen bounded sender, cap64,
-GSO-only, D3 self-wake, or frozen-parameter tuning. The next work should be a
-new explicitly scoped stage rather than another Knife14 H10d16 pacing repair.
-Source:
-`docs/tech/2026-07-14-knife14h10d16-endpoint-pacing-service-vps-completion-results.md`.
-
-#### Previous decision (2026-07-13)
-
-The first fresh reverse P8 from `55792b3` failed at `0.103 Mbit/s`. All eight
-data relays opened, but each accepted only `117,412-134,760B`, approximately
-one D16 actor quantum, before stream consumption stopped. This is not a TUN,
-queue-capacity, path-loss, pool, or endpoint-pacing failure: TUN drops were
-`0/0`, pump high was `177/500` with zero waits/errors, pending ended at zero,
-smoltcp capacity remained `1 MiB`, QUIC loss/congestion was zero, and endpoint
-conservation was exact.
-
-The final D16 state was `Running=0`, `DrainOnly=8`, `Recovery=1` despite a
-clean `6/6` backlog pause/resume history and later `send_queue=0` snapshots.
-The root was lost ACK-completion evidence: a hard-pressure zero snapshot
-cleared the per-flow barrier before Recovery could consume it, leaving no later
-positive drain event.
-
-Commit `5f9da90f734b1754fd8c41bcb70fa4c8b6ae9f74` preserves that
-barrier through hard pressure, drop debt, and terminal no-send, then consumes
-the proven nonzero-to-zero transition on the first eligible clean snapshot.
-Local gates pass: focused `2/2`, D16 `60/60`, root `632/632`, harness
-`10/10`, concurrency `64/256/1024`, UDP `500/500` at four sizes, check/fmt/
-diff/shell tests, and controlled all-target Clippy. No unresolved P0/P1
-remains; no frozen constant changed.
-
-Next action: export/deploy exact `5f9da90`, rehearse the unchanged profile,
-and run one fresh target-only reverse P8 for 60 seconds. Require strictly
-`>170 Mbit/s`, `60/60` nonzero intervals, zero TUN drops, pump high below
-`500`, all eight flows progressing beyond one quantum, no eligible DrainOnly
-strand, exact endpoint/D16 ownership, bounded lifecycle, and cleanup. VPS and
-commits are authorized; macOS TUN is prohibited. If this P8 fails, do not tune
-constants. Sources:
-`docs/tech/2026-07-13-knife14h10d16-{reverse-p8-failure-results,ack-barrier-recovery-architecture-spec,ack-barrier-recovery-implementation-plan,ack-barrier-recovery-local-gate-results}.md`.
-
-The accepted forward position below remains a prerequisite and does not
-override the failed/repaired reverse-P8 position above.
-
-Task 12 step 4's zero-drop H10d16 successor is accepted. The complete chain is
-EndpointPacingService `c55737e`, batch relay `d934f12`, bounded TUN ingress
-`20a0f8c`, and the independent local TCP receive-credit service
-`e20140340f7f949fa8bad9e960ce94451d2c0229`.
-
-The repair preserves `1 MiB` smoltcp RX/TX storage but bounds H10d16 advertised
-and accepted TCP credit at `368,640B`. Correct semantics use
-`max_receive_extent - queued`; neither queueing nor ACK generation can move the
-right edge forward before application consumption. Default/non-H10 sockets are
-unchanged.
-
-Local evidence is complete. The exact 32 MiB real-Quinn gate passed at
-`302.246 Mbit/s`, exact bytes, ring/pump `15/500`, zero waits/drops, and
-`recv_queue_max=39,440B`. Vendored smoltcp, Quinn-proto/Quinn, root/harness,
-integration, explicit `64/256/1024`, four UDP sizes, fmt, clippy, scripts, and
-diff checks passed; no unresolved P0/P1 remains.
-
-The frozen VPS P1 passed at `191 Mbit/s` receiver with `20/20` intervals and a
-`201.333/192 Mbit/s` tail average/minimum. TUN drops were `0/0`, formal QUIC
-loss delta was `11,459,701B`, and flow-control blocking stayed zero. The local
-receive queue reached exactly `368,640B`; the predicted packet envelope and
-real pump high-water both resolved to `318`, leaving `182` slots of headroom
-and zero full waits/read errors. `623,222` packets mapped exactly to `4,022`
-batch/relay/poll/flush services.
-
-Endpoint conservation and cleanup were exact:
-`61,403 + 0 + 0 <= 61,440`, and
-`500,763,062 - 59,480 = 500,703,582`. There was no abandoned or outstanding
-byte, reconnect/migration, terminal pending/reap, TUN flush failure, residual
-process, or residual TUN route. The five-member sanitized bundle is archived
-under `/private/tmp/mini_vpn_local_uplink_window_e201403/` with SHA-256
-`769dadd36d1b6db8ba0ff4aad3bd7efc16699b5cc01530932e81cdfb018f18d4`.
-
-No further forward repair is pending for this discriminator. Resume Task 12
-step 4 at the repaired fresh reverse P8 gate, then UDP/live-streaming, Linux
-fake-IP DNS, and TUN stop/rearm. Preserve H10d16,
-EndpointWindowV1 constants, MTU, kernel/FIFO/batch capacities, pool, QUIC
-windows, chunk, Cubic, GSO default, Quinn sender/driver bound, and self-wake.
-Do not reopen bounded sender, cap64, GSO-only, or frozen-parameter tuning.
-macOS TUN remains prohibited. Source:
-`docs/tech/2026-07-13-knife14h10d16-local-uplink-window-service-{architecture-spec,implementation-plan,local-gate-results,vps-results}.md`.
-
-The older text below is chronological stage history and no longer describes
-the active authorization boundary.
-
-The confirmed post-cap64 design-preparation plan is complete. A deterministic
-fake-time Pacer replay at `RTT=200us`, `cwnd=40000B`, and `MTU=1280` failed
-the initial one-bucket/1ms assertion exactly at `259 > 64` datagrams. It is
-now a default-enabled characterization proving the selected root: a stored
-capacity ceiling does not impose a time-window service ceiling.
-
-The proposed successor spec and implementation plan are now ready:
-
-- `docs/tech/2026-07-13-knife14h10d16-endpoint-pacing-service-architecture-spec.md`
-- `docs/tech/2026-07-13-knife14h10d16-endpoint-pacing-service-implementation-plan.md`
-
-The candidate endpoint service is fixed at `30.72 MB/s` aggregate wire rate,
-`61,440B` burst, `10,240B` control reserve, and `20,480B` bulk DRR quantum.
-It provides formal connection-datagram bounds of `92,160B/1ms` and
-`368,640B/10ms`, with about `239.167 Mbit/s` application capacity after the
-measured QUIC overhead. The design owns pre-build reservations, short-build
-refunds, socket-blocked outstanding bytes, two-connection fairness/idle
-borrowing, control liveness, combined deadlines/wakers, and exact
-cancel/migration/drain cleanup.
-
-Current decision: **await explicit review/confirmation before coordinator
-implementation**. No implementation, VPS, P8, macOS TUN, commit, or external
-notification is authorized by the spec itself. Gate A/B and every frozen
-parameter remain unchanged. Vendored Quinn-proto `276/276` plus doc `3/3`,
-root fmt, and tracked/untracked diff-checks passed. A later VPS still requires
-a separate explicit authorization.
-
-The one authorized same-window pacer-cap64 forward discriminator is complete
-and **FAIL**. The valid sing-box control reached `192.567/191.928 Mbit/s` with
-target-only routing and zero client/Exit socket drops. The fresh frozen-profile
-mini_vpn P1 reached `196/185 Mbit/s` with all `20/20` intervals nonzero, but
-added `29` TUN TX drops, `50,621,275B` formal QUIC lost bytes, and `15,417`
-congestion events. It therefore failed both the zero-drop and `<=16 MiB` loss
-gates and stopped before P8.
-
-Attribution was sufficient to judge the mechanism: the data pool connection
-carried `99.9998%` of TX bytes and `99.9961%` of datagrams, no migration or
-reconnect occurred, blocking stayed zero, every formal `cwnd` was below
-`u32::MAX`, and one snapshot proved the cap active at `81920B = 64*1280`.
-Nevertheless client egress peaked at `267 packets/1ms` and `1337/10ms`, versus
-same-window sing-box `100/605` and prior Quinn-default mini_vpn `261/1259`.
-The cap did not leave the rejected burst class.
-
-Post-failure code review finds the design limitation: maximum stored Pacer
-tokens do not bound tokens refilled and spent within a time window. Quinn's
-unchanged `1.25*cwnd/rtt` refill slope can cycle multiple cap64 buckets in 1ms
-on the measured sub-ms path; later formal snapshots stopped adding delay
-events. Do not retry cap constants, revive the bounded socket cooldown or
-GSO-only branches, or tune frozen D16/MTU/pool/window/chunk/Cubic/self-wake
-values.
-
-Await confirmation of the next modification plan: first add a deterministic
-red sub-ms refill replay, then write a new reachability/capacity spec for a true
-Quinn-proto endpoint pre-accounting time-window/service contract across both
-pool connections. No implementation or further VPS is authorized. Gate A and
-Gate B remain PASS; cleanup is complete; no macOS TUN, commit, or Slack
-notification ran. See
-`docs/tech/2026-07-13-knife14h10d16-pacer-cap64-forward-discriminator-results.md`.
-
-Task 12 step 4's confirmed four-P1 repair and full local regression gate are
-now **PASS**. The rejected bounded replay is explicit/ignored, Quinn derives
-the optional cap from one upstream capacity result, formal stats distinguish
-`current_mtu` from `pacing_mtu`, and the runner validates, mutually excludes,
-propagates, reports, and independently fingerprints
-`MINI_VPN_TUIC_PACING_POLICY=quinn|pacer-cap64`.
-
-Final evidence: vendored Quinn `275/275` and doc tests `3/3`; the exact/clean
-GSO-enabled `32 MiB` cap64 gate at `621.573 Mbit/s`; library `620 passed / 0
-failed / 3 ignored`; normal harness `10 passed / 4 ignored`; explicit
-concurrency `64/64`, `256/256`, and `1024/1024`; zero-loss UDP payload sweep;
-default/harness checks, root fmt, all shell syntax/self-tests, and diff-check.
-Code review has no open P0/P1. Gate A and Gate B remain PASS.
-
-Stop locally here. No VPS or macOS TUN ran, no commit was created, and D16,
-MTU, pool, QUIC windows, chunk, Cubic, and self-wake remain frozen. The spec's
-single same-window forward control plus cap64 mini_vpn P1 is now locally
-eligible but was not authorized or run in this turn; obtain explicit user
-authorization before it. The required stage-stop Slack notification was sent.
-
-Task 12 step 4 is now **STOPPED after local capacity PASS but before full local
-regression completion**. The pinned Quinn patch passed `274/274` upstream
-tests. The candidate GSO-enabled `32 MiB` upload delivered exact bytes, zero
-pattern error, clean EOF, and `537.106 Mbit/s`; active stats proved the
-effective `64 * 1200 = 76800B` cap, uncapped `307200B`, pacing delay activity,
-and `cwnd <= u32::MAX`, with no stacked socket sender.
-
-The default library gate then ended at `620 passed / 1 failed / 2 ignored`.
-The failure was the already rejected fixed `48 then 2ms` bounded-sender replay
-still hard-coded to require `>170 Mbit/s`; it reached `101.084 Mbit/s`. Per the
-user's repeat-failure rule, do not edit or continue without confirmation.
-
-Proposed repair order after confirmation:
-
-1. mark the known-negative real bounded replay explicit/ignored while keeping
-   its deterministic conservation/timer/GSO/no-busy-wake tests;
-2. remove duplicate default-path pacer capacity division by deriving the cap
-   from the already computed upstream capacity;
-3. add `current_mtu` beside `pacing_mtu` in formal QUIC stats and tests;
-4. TDD the runner's `MINI_VPN_TUIC_PACING_POLICY=quinn|pacer-cap64`, mutual
-   exclusion, command/report propagation, and startup verification;
-5. rerun `274/274`, the fixed 32 MiB cap gate, the full library/harness,
-   64/256/1024 concurrency, UDP sweep, check/fmt/shell self-tests, diff-check,
-   and code-review. Only then decide whether the architecture's single allowed
-   same-window forward control + mini_vpn P1 is authorized.
-
-No VPS or macOS TUN ran and no frozen D16, MTU, pool, QUIC-window, chunk,
-Cubic, or self-wake value changed.
-
-The post-failure Task 12 step 4 architecture/capacity gate is complete. Gate B
-remains accepted and is not being rerun. Decision: **CONDITIONAL GO for local
-TDD implementation only** of a pinned `quinn-proto 0.11.16` per-connection
-pacer cap at `64` paced MTU-equivalents. Default remains the exact upstream
-`256 * mtu` maximum. With frozen pool=2, the design proves only a static
-`128 * mtu` stored paced-token ceiling; it does not claim an endpoint-wide
-sliding-window rate or cross-connection fairness bound.
-
-The public socket gate is rejected as a post-accounting second pacer, and the
-driver/kernel alternatives do not provide the required portable
-pre-accounting product seam. The full shared endpoint coordinator is deferred.
-Before any VPS, implementation must pass the spec's default-equivalence,
-rate/debt, migration, two-connection stored-cap, protocol-liveness,
-observability, exact GSO-enabled `32 MiB >170 Mbit/s`, concurrency, UDP, and
-code-review gates. This paragraph records the prior local-only design
-authorization; the implementation checkpoint and stop above are current.
-Source of truth:
-`docs/tech/2026-07-13-knife14h10d16-quinn-pacer-burst-cap-architecture-spec.md`.
-
-Task 12 step 4 is **stopped before VPS after the confirmed measurement gate
-failed**. Timing/service-rate instrumentation and the runner's pool-aggregate
-QUIC-loss decision passed red/green. The real GSO-enabled `32 MiB` upload
-again delivered exact bytes and clean EOF but reached only `98.311 Mbit/s`.
-
-The measured mean payload was `1199.953B`, so packetization is not the primary
-branch. A 48-datagram batch averaged `4.573ms`: `2ms` intentional cooldown,
-`1.340ms` mean rearm lateness, and about `1.233ms` send/service work. The
-required period is at most `2.710ms`; even zero timer lateness leaves only
-about `142.5 Mbit/s`. The additive cooldown wrapper is therefore rejected,
-not retuned.
-
-The architecture request from
-`docs/tech/2026-07-13-knife14h10d16-bounded-udp-send-service-measurement-results.md`
-is resolved by the conditional local-only decision above. No VPS or macOS TUN
-test ran; all frozen knobs and unspent product regressions remain unchanged.
-
-Task 12 step 4 is **stopped after the confirmed GSO-disabled tracer failed**.
-The default-enabled Quinn policy seam, real 32 MiB disabled-GSO upload, full
-library/harness gates, `64/256/1024` concurrency, and UDP sweep all passed
-locally. The same-window control reached `177.303/175.102 Mbit/s` with zero
-socket/capture drops. Fresh mini_vpn reached `206/193 Mbit/s` but again added
-`30` TUN TX drops, `67,826,613B` formal QUIC lost bytes, and `40,887`
-congestion events; final loss was `73,572,300B`.
-
-Bilateral capture measured a 2.47% control byte gap versus 12.89% for
-mini_vpn. GSO-disabled reduced the mini_vpn 1 ms peak from 261 to 163 packets
-but did not remove the loss edge. Code review confirms the mechanism:
-Quinn-proto limits one disabled-GSO `poll_transmit` to one datagram, while the
-Quinn driver still loops to 20 datagrams, self-wakes, and retains the
-256-packet pacer token capacity. GSO aggregation is rejected as a sufficient
-root; bounded send service remains active.
-
-Await confirmation of the next modification plan: first red/green the runner
-so a failed standard P1 cannot exit success and target-only checks are labeled
-correctly; then implement one shared timer-backed Quinn `AsyncUdpSocket`
-egress service with a fixed 48-datagram-equivalent/2ms ceiling. Capacity math
-is `30.72 MB/s` raw at 1280B versus `21.25 MB/s` required for 170 Mbit/s. Prove
-the bound across two pollers, no busy wake, byte/datagram conservation, exact
-32 MiB delivery/EOF and `>170 Mbit/s`, then repeat the full local gates and
-code review before at most one new control + mini forward P1. Do not spend
-another GSO-only sample. Result:
-`docs/tech/2026-07-13-knife14h10d16-gso-disabled-forward-discriminator-results.md`.
-P8, UDP/live-streaming, fake-IP DNS, and rearm remain unspent.
-
-Task 12 steps 1-3 / Gate B **passed** from clean `a54fb17`. The corrected
-same-window sing-box control reached `144.519/143.228 Mbit/s` with zero
-client/server UDP socket drops. The three exact mini_vpn `20s` reverse-first
-P1 receiver results were `192`, `188`, and `191 Mbit/s`; median `191 Mbit/s`
-passes the absolute `170 Mbit/s` gate and all three exceed `150 Mbit/s`.
-TUN drops, actor bypass, send/flush errors, pressure/drop debt, QUIC
-loss/blocking, reconnect, and terminal pending reap were zero. The only
-post-median fixed `64 MiB` A-clean completed at `179/179 Mbit/s`, delivered
-exactly `67108864B`, and closed via `clean_queue_lifecycle` with every queue,
-pending/inflight, terminal-drop/reap, close-egress, TUN-drop, and bypass counter
-zero. Result:
-`docs/tech/2026-07-13-knife14h10d16-gate-b-results.md`.
-
-The approved next action is Task 12 step 4 product regression: sustained `60s`
-reverse TCP, TCP multi-flow/concurrency, UDP/live-streaming, fake-IP DNS, and
-TUN create/start/stop/rearm lifecycle. Do not claim final stable `170 Mbit/s`,
-clean old paths, or change D16, MTU, pool, QUIC windows, chunk, or self-wake
-until that gate passes. No macOS TUN test ran.
-
-Operational override: evidence-backed preflight/configuration errors may be
-corrected and rerun without stopping for confirmation; a preflight-only exit is
-not a measurement sample. Real gate/product failures still require analysis
-and a proposed modification plan before any code or profile change.
-
-Composite Gate A **passed** from clean `79b41b3` against Shoes `v0.2.7` /
-Quinn `0.11.9` on `.111:8443`. A-capacity reached `192/188 Mbit/s`
-sender/receiver with zero TUN drop, actor bypass, send/flush error, pressure
-debt, and QUIC loss/congestion/blocking. Its only timed terminal was the
-approved exact `local_to_remote/local_socket_terminal`: one bounded `524288B`
-D16 ownership release and `27840B` terminal smoltcp egress. A-clean then
-completed exactly `64 MiB` at `179/179 Mbit/s` and closed through remote EOF
-plus `clean_queue_lifecycle`, with every queue/pending/inflight/terminal-drop/
-close-egress/TUN-drop counter at zero.
-
-Stage 8 and Gate A are closed. Their accepted composite evidence is the source
-that authorized the now-completed Gate B above; keep it as historical gate
-evidence, not as the current next action.
-Result:
-`docs/tech/2026-07-13-knife14h10d16-shoes-composite-gate-a-results.md`.
-
-H10d15 reached `186/185 Mbit/s` sender/receiver and proved that mini_vpn has
-sing-box-class single-flow capacity when the native QUIC read side maintains a
-service-sized independent pump. It did not pass clean acceptance: the tail had
-`tx_dropped_delta=229`, `global_rx_paused=true`,
-`close_egress_class=terminal_closed_no_send`, and
-`close_egress_bytes=327272`.
-
-The next step is not another floor, chunk, self-wake, pressure-threshold, VPS,
-MTU, or QUIC-window adjustment. The approved architecture closes the code-level
-contracts exposed by review:
-
-1. acquire an RAII byte reservation before every ordered Quinn read;
-2. remove the message-count TUIC payload channel before the D6 queue;
-3. keep payload in one per-flow leased byte queue and use `global_rx` for
-   coalesced readiness;
-4. make D16 actor mode the only downlink `send_slice` owner;
-5. use `Running -> DrainOnly -> Recovery`, where pressure stops read/admission
-   but never stops ACK/TUN RX, poll, flush, or permit release;
-6. expose remote EOF only after the owned queue and local inflight bytes drain.
-
-Source of truth:
-
-- `docs/tech/2026-07-09-knife14h10d16-byte-owned-egress-architecture-spec.md`
-- `docs/tech/2026-07-09-knife14h10d16-byte-owned-egress-implementation-plan.md`
-- `docs/tech/2026-07-09-knife14h10d16-session-handoff.md`
-
-Current stage remains stage 8 with the capacity half passed and the clean half
-failed. D16 code baseline `8496b8f` and ACK-capacity repair `f7847dd` are pushed
-on `codex/knife14d-downlink-reap-open`. The reopened stages 3-7 and Task 11A local
-TDD are now complete.
-Ownership conservation, actor-exclusive admission, authoritative DrainOnly
-recovery, bounded TUN RX service, per-flow ACK-completion isolation, and EOF
-ordering pass locally. The final 64 MiB/64-packet production seam passed 50/50
-capacity-qualified repeats at about `224 Mbit/s`, with a cumulative MTU-derived
-24-payload-packet admission window, zero modeled drop/bypass, and zero tail
-bytes.
-
-The single authorized ACK-capacity replacement Gate A has completed and
-failed at `19.2/17.9 Mbit/s` sender/receiver. It kept
-`tx_dropped_delta=0`, actor bypass `0`, pressure/backlog edges `0`, and
-send/flush failures `0`. Observed pending/egress/terminal-tail counters were
-zero, but the data flow was still active at final snapshot, so natural
-EOF/close was not established. The active failure was repeated ordered stream
-read starvation: data read gaps reached `3548ms` while application polling,
-local actor drain, smoltcp capacity, and QUIC loss/congestion/blocking were
-healthy.
-
-The sustained real-Quinn discriminator is complete at `1bf1f78`. Loopback tests
-now cover the direct ordered reader, RAII reservation/readiness queue, and the
-full `run_event_loop` TCP/smoltcp/TUN actor path. The full path delivered
-`32 MiB` above `170 Mbit/s`, respected the 24-payload-packet flush bound, and
-closed with zero modeled drop, actor bypass, and EOF tail in `30/30` repeats.
-All local gates pass. A transient timeout was traced to a stale harness
-lifecycle snapshot after a control-only dirty-relay pass; production queue,
-permit, actor, EOF, and socket behavior was unchanged.
-
-The later stream/frontier follow-up is complete through `bdaa19c`.
-`4bc847b` removed the disproved service-sized application `AsyncRead` buffer
-and restored transport-owned ordered Quinn chunks. In a window where mature
-sing-box reached `172.167 Mbit/s`, the clean scoped mini_vpn run reached only
-`38.5 Mbit/s`; D16 ownership, actor exclusivity, TUN drops, pressure, and tail
-surfaces stayed clean while ordered read gaps reached `5.219s`. A bounded
-unordered-frontier prototype is rejected because it deterministically fills
-the `512 KiB` per-flow ownership cap before a missing offset is retransmitted.
-`bdaa19c` now preserves an already armed reservation across non-pausing Running
-credit changes and cancels only for pause/close/stop. Default `591/591`, harness
-`600/600`, and checks pass. Its scoped VPS run remains unspent because the
-fresh mandatory mature control fell to `18.873 Mbit/s` receiver with direct
-`217.011 Mbit/s` and socket drop `0`. Do not run composite Gate A or Gate B
-until a new control exceeds `150 Mbit/s`; then test clean `bdaa19c` once before
-any further architecture change.
-
-A subsequent clean `ce5a87c` qualification against a same-version temporary
-`.77` Exit remained incapable. The role-reversed `.33` target had healthy
-direct receivers of `216.801 Mbit/s` from `.27` and `212.398 Mbit/s` from
-`.77`; client/Exit UDP socket drops were zero. Mature sing-box reached only
-`0.192 Mbit/s`, with eighteen of twenty one-second intervals at exactly zero.
-The `bdaa19c` scoped run and composite Gate A remain unspent. The next action
-requires an independent Exit-service change or genuinely capable control
-window, not another unchanged restart/retry or a mini_vpn parameter edit.
-
-The attempted independent `.33:9443` service started and listened correctly,
-but its mature control timed out before opening a TUIC stream. A controlled
-packet-arrival A/B sent one UDP byte to `8443` and one to `9443`; `.33` captured
-the `8443` packet and no `9443` packet. The alternate port is blocked outside
-the host, so this was not a capability measurement. The safe next discriminator
-is a user-confirmed maintenance window: temporarily replace the original
-`8443` process with the minimal isolated service, run one control, and restore
-the original service on every exit path. Scoped mini_vpn and Gate A remain
-unspent.
-
-The confirmed maintenance swap on the allowed `8443` port also failed the
-capability floor. A minimal same-version service replaced the original process
-under a restore watchdog. Direct receivers were `218.688 Mbit/s` from `.27`
-and `214.285 Mbit/s` from `.33`; both UDP socket drops were zero. Mature TUIC
-receiver was only `11.953 Mbit/s`, with thirteen zero-rate seconds and isolated
-bursts. The original service was restored successfully. Do not repeat process
-restart/full-config/minimal-config A/B or run `bdaa19c` scoped from this host
-window. Reaching Gate A now requires a genuinely independent capable Exit; a
-host-local network-namespace mature control is useful only if more attribution
-is required before provisioning that Exit.
-
-The new independent `.111` Exit also failed the historical mature precondition:
-`.111 -> .77` direct was `212.013 Mbit/s`, control direct was `214.092 Mbit/s`,
-both UDP socket drops were zero, but TUIC receiver was only `4.928 Mbit/s` with
-thirteen zero-rate seconds. This rules out `.33`-specific process/host state as
-a sufficient root.
-
-Code review now requests a Gate-process correction before more VPS traffic.
-The only authorization control hard-codes sing-box `BBR` and MTU `1500`, while
-the exact product Gate uses mini_vpn `Cubic` and safe MTU `1200`; mini_vpn's own
-TUIC source documents BBR as an experimental override that may underperform
-Cubic. Add one TDD-locked, versioned `gate-aligned` mature profile (`Cubic +
-MTU1200`) and keep the old historical profile as a diagnostic result rather
-than the sole authorization predicate. The aligned control must still exceed
-`150 Mbit/s` with both socket drops zero before clean `bdaa19c` scoped. Do not
-run scoped or Gate A until this plan is confirmed and implemented.
-
-That correction is complete at `1b83004`. The historical profile is now
-diagnostic-only and the new Gate-aligned control is fixed at mature-client
-`Cubic + MTU1200`, with exact profile, route, authorization, and strict-floor
-self-tests. Its first clean `.111` run did not authorize scoped mini_vpn:
-direct receiver was `217.220 Mbit/s`, both UDP sockets were `16 MiB` with drop
-`0`, but TUIC receiver was only `3.041 Mbit/s` and fourteen of twenty intervals
-were zero. The same burst/idle shape under historical and Gate-aligned profiles
-rejects BBR/MTU mismatch as the active root. Keep `bdaa19c` scoped, composite
-Gate A, and Gate B frozen. The next discriminator changes the mature-client
-host while holding `.111`, `.77`, sing-box version, Gate-aligned profile, and
-floor constant; do not change D16 or repeat `.27` against unchanged external
-state. Result:
-`docs/tech/2026-07-12-knife14h10d16-gate-aligned-control-results.md`.
-
-The approved client-host discriminator is complete and also incapable. With
-`.111`, `.77`, sing-box `1.13.14`, Cubic/MTU1200, and the floor unchanged, the
-`.33` mature client reached only `5.347 Mbit/s` receiver despite `218.285
-Mbit/s` direct, zero client/Exit UDP drops, and correct routing. Thirteen of
-twenty intervals were zero, and the existing `.33` sing-box remained active.
-This rejects `.27` as a sufficient root and rejects moving Gate A to `.33`.
-The next proposed discriminator is raw reverse UDP over the same allowed
-`.111:8443` port from both `.27` and `.33`, first at `100 Mbit/s` and then at
-`200 Mbit/s` only after a low-loss first stage. If raw UDP is clean, isolate
-minimal QUIC without TUIC/TUN next. Keep D16, scoped `bdaa19c`, composite Gate
-A, and Gate B frozen. Result:
-`docs/tech/2026-07-12-knife14h10d16-client-host-discriminator-results.md`.
-
-The raw UDP8443 discriminator is complete. Iperf3 could not run because its
-TCP8443 control was blocked before `.111`, so fixed iperf2 `2.1.9` pure UDP
-reverse was installed temporarily and purged after the test. Both `.27` and
-`.33` received a stable `105 Mbit/s` at the 100 Mbit/s setting with zero loss.
-At the 200 Mbit/s setting both received `198 Mbit/s` overall with no zero-rate
-interval, but both hit the same `.111` edge after five seconds: about `193
-Mbit/s` with `7.9%` interval loss. Client UDP kernel error/buffer-drop deltas
-were zero. This proves continuous raw capacity sufficient for Gate A and 170M
-Gate B while rejecting raw UDP as the TUIC burst/idle root. Next add a
-test-only, versioned minimal Quinn Cubic/safe1200 reverse-stream probe with a
-real loopback RED/GREEN test before one `.27 -> .111` cross-host run. Do not
-modify TUIC, D16, TUN, or product runtime. Result:
-`docs/tech/2026-07-12-knife14h10d16-raw-udp-path-results.md`.
-
-The minimal Quinn discriminator is complete at `8ea8925` with bounded probe
-cleanup at `21dd361`. A clean, identical test binary ran Cubic/safe1200 from
-`.27` against `.111` and received `489095168B` in `20.315s` at `192.597
-Mbit/s`. All 21 intervals were nonzero, minimum non-empty interval throughput
-was `183.934 Mbit/s`, byte-pattern errors were zero, EOF was clean, and the
-client had zero Quinn loss, congestion events, and data blocking. Server loss
-at the known raw-path shaping edge did not interrupt continuous delivery. This
-rules out raw UDP and minimal Quinn as the TUIC burst/idle root. The next
-approved design seam is a test-only direct TUIC Connect relay from `.27`
-through `.111` to `.77`: force `tcp_pool=1`, use generic ordered `open_tcp`,
-and bridge the loopback iperf3 control/data sockets to separate Connect
-streams. This bypasses auxiliary-pool policy, TUN, smoltcp, native readers,
-and D16.
-RED/GREEN the loopback relay, byte accounting, half-close/EOF, and bounded
-shutdown locally, then run one strict `>150 Mbit/s` cross-host discriminator.
-Gate A and Gate B remain frozen.
-Result:
-`docs/tech/2026-07-12-knife14h10d16-minimal-quinn-path-results.md`.
-
-The direct TUIC probe is implemented at `0f07406` and its server-CC A/B is
-complete. The exact same release test binary, pool 1, generic OrderedJoin,
-client Cubic/safe1200, `.111` sing-box, and `.77` target reached only `3.775
-Mbit/s` with server BBR and `2.674 Mbit/s` with server Cubic. BBR caused
-`14/20` zero client intervals and `3441ms` data-read gaps; Cubic made client
-delivery continuous and reduced the maximum data-read gap to `225ms`, but the
-`.77` sender still had `15/20` zero intervals and roughly five-second bursts.
-Quinn loss/congestion/blocking surfaces stayed clean. Because this path has no
-TUN, smoltcp, native reader, D16, product event loop, or auxiliary pool slot,
-the active root is now sing-box TUIC server/copy/flow-control behavior or its
-external QUIC-path interaction. Server BBR is rejected as a capacity root.
-Next run one host-local `.111` TUIC loopback discriminator with the same Cubic
-service and exact probe; Gate A and Gate B remain frozen. Result:
-`docs/tech/2026-07-12-knife14h10d16-direct-tuic-server-cc-results.md`.
-
-The host-local `.111` discriminator passed. The exact `0f07406` direct probe,
-same sing-box `1.13.14` binary, Cubic/safe1200 client, Cubic server, pool 1,
-and `.77` target reached `199.639 Mbit/s` receiver. All `20/20` intervals were
-nonzero, the minimum interval was `169.868 Mbit/s`, both control/data relays
-completed, and Quinn/socket error surfaces were zero. Target sender aggregate
-was `201 Mbit/s`, versus `5.08 Mbit/s` and `15/20` zero intervals in the
-external Cubic run. This proves the tested sing-box TUIC/copy path has capacity
-and moves the active root to its external sender interaction with `.111 ->
-.27`; it does not justify any D16/product edit. Next run one strict cross-host
-server implementation/version A/B on `.111:8443`, preserving the exact probe,
-profile, target, floor, and target journal. Gate A and Gate B remain frozen.
-This paragraph overrides the older historical next-action text below.
-Result:
-`docs/tech/2026-07-12-knife14h10d16-host-local-tuic-results.md`.
-
-The first alternate mature server did not authorize Gate A. Replacing
-sing-box with official Mihomo `v1.19.28` on `.111:8443` yielded only `3.460
-Mbit/s` receiver, `7/20` client zero intervals, and a `3431ms` maximum data
-read gap. `.77` showed `14/20` zero sender intervals and `5.18 Mbit/s`, while
-same-window direct receivers were `217.010 Mbit/s` from `.27` and `216.591
-Mbit/s` from `.111`. Quinn loss/congestion/blocking and `.111` UDP drops were
-zero. This removes sing-box application code as a sufficient root but not the
-quic-go transport family: Mihomo and sing-box use different quic-go `0.59.x`
-forks. Next review/TDD a TUIC v5 server with an independent QUIC stack and add
-synchronized bilateral capture/transport evidence before one further A/B.
-Gate A/B and D16 remain frozen. This paragraph supersedes older next-action
-text below. Result:
-`docs/tech/2026-07-12-knife14h10d16-mihomo-alternate-server-results.md`.
-
-The independent Rust/Quinn reference server also did not authorize Gate A,
-but it removed the active starvation signature. Official `tuic-server 1.0.0`
-using Quinn `0.10.1` reached `112.559 Mbit/s` receiver with `20/20` nonzero
-intervals, `103.805 Mbit/s` minimum interval, and `27ms` maximum data-read gap.
-Direct receivers were `217.640/216.382 Mbit/s`; `.77` sender was continuous at
-`119 Mbit/s`; client/server drops were zero and server CPU was not saturated.
-This separates quic-go multi-second starvation from the old reference
-implementation's insufficient continuous capacity. The next single server
-candidate is maintained Shoes `v0.2.7`, which supports TUIC v5 and uses Quinn
-`0.11.9`. First review its hot path/windows, then dry-run and SSH-banner
-preflight, then run one exact `0f07406` strict A/B with corrected `-i any`,
-port-only, 120-second bilateral captures. Only a clean `>150 Mbit/s` result
-authorizes composite Gate A. D16 and Gate A/B remain frozen. This paragraph
-supersedes older next-action text. Result:
-`docs/tech/2026-07-12-knife14h10d16-rust-quinn-reference-server-results.md`.
-
-The Shoes `v0.2.7` / Quinn `0.11.9` discriminator proved sufficient external
-TUIC capacity: `192.666 Mbit/s` receiver, `20/20` nonzero intervals, and
-`153.099 Mbit/s` minimum interval, with healthy direct baselines, zero pcap
-kernel drops, zero Exit UDP errors, and zero client UDP buffer-error delta.
-The process nevertheless exited failed because timed iperf ended one data
-Connect with `Connection reset by peer`. Code review found that the direct
-probe's blanket relay-error veto conflicts with the already approved composite
-Gate A split between timed capacity terminal classification and fixed-byte
-clean EOF. Do not rerun the 20-second Shoes discriminator or change D16. Next
-RED/GREEN a pure capacity decision that retains and permits only an expected
-post-result timed reset, keeps fixed-byte close strict, and replay the captured
-JSON/terminal evidence. After user confirmation, redeploy the exact Shoes
-release and run one clean-source composite Gate A. Gate B remains frozen.
-Result:
-`docs/tech/2026-07-12-knife14h10d16-shoes-modern-quinn-results.md`.
-
-The next task is now an external same-window capability precondition, not a
-production code edit. Mature sing-box reverse P1 controls fell to
-`14.207 Mbit/s` and then `1.363 Mbit/s` despite correct routing, `16 MiB` client
-UDP buffers, socket drop `0`, and healthy direct reverse baselines around
-`217/219 Mbit/s`. Do not spend the single post-local Gate A while the mature
-control is below `150 Mbit/s`. A further same-shape retry reached only
-`1.182 Mbit/s` while sequential direct baselines remained `218.898/211.140
-Mbit/s`. Restarting `.33` sing-box once improved MTU1200 control only to
-`17.301 Mbit/s`; MTU1500 then reached only `3.146 Mbit/s`. Both UDP sockets
-were `16 MiB` with drop `0`, service logs showed normal opens, and bidirectional
-ICMP had `0%` loss at about `0.5ms`. Do not repeat unchanged controls, restart
-again, tune VPS/CC/MTU, or spend Gate A in this window. Gate-process R1-R4 are
-now complete at `ec112a9`: the real-Quinn test uses the exact safe1200 profile,
-both acceptance runners are versioned and self-tested, artifacts record source/
-binary/runner hashes, and a clean `.27` build/startup rehearsal verified the
-D16 fingerprint, MTU, routing, zero idle TUN drop, and cleanup without iperf.
-In a genuinely new external window, run the versioned historical-MTU1500
-mature control exactly once. Only a receiver result `>150 Mbit/s` with both UDP
-socket drops `0` authorizes exactly one `20s` reverse-first P1 Gate A. Gate B
-remains frozen. Review and closure:
-`docs/tech/2026-07-10-knife14h10d16-gate-process-code-review.md` and
-`docs/tech/2026-07-11-knife14h10d16-gate-process-r1-r4-results.md`.
-
-The first versioned post-R1-R4 control ran from clean `044eccb` and did not
-unlock Gate A. Direct reverse baselines were `216.172 Mbit/s` from `.27` and
-`213.865 Mbit/s` from `.33`, while the MTU1500 sing-box TUIC control reached
-only `13.472/11.219 Mbit/s` sender/receiver. Both UDP sockets were `16 MiB` with
-drop `0`, routing was correct, and the receiver intervals were burst/idle with
-many zero-rate seconds. Gate A and Gate B remain unspent. Do not repeat the same
-control, restart services, or change mini_vpn until an independent external
-window change provides a new discriminator. Result:
-`docs/tech/2026-07-11-knife14h10d16-versioned-control-results.md`.
-
-An alternate-Exit discriminator has now removed the shared external blocker.
-Bilateral packet capture and role reversal showed that `.33` itself stopped
-emitting during the mature-client gaps. A temporary same-version TUIC Exit on
-`.77` produced a `163.786 Mbit/s` mature receiver and unlocked the one
-authorized Gate A. Clean source `5884ac0` then reached `187/183 Mbit/s`
-sender/receiver under the exact safe1200 profile with TUN drops, actor bypass,
-send/flush errors, QUIC loss/congestion/blocking, and terminal pending reap all
-at zero.
-
-The literal Gate A still failed close-tail: at the timed iperf boundary the
-data socket moved directly from `Established` to terminal `Closed` before data
-remote EOF, leaving an exact `524288B` owned reservoir and `27840B` smoltcp
-send queue. The ledger bounded and released the bytes once, but the relay
-summary lost the terminal reason and mislabeled the lifecycle clean. Gate B
-remains frozen.
-
-The acceptance correction is now implemented and pushed. Commit `879e904`
-removed unused close-reap parameters and duplicate terminal cleanup. Commit
-`7a7ca04` replaces the ambiguous leased-queue close boolean with
-`Open / RemoteEof / Terminal(cause)`, preserves
-`local_to_remote/local_socket_terminal` through relay teardown, reports D16
-close-cause counts, and versions a fixed-byte reverse `iperf3 -n` mode. Default
-library `588/588`, harness library `597/597`, integration `2/2`, harness targets
-`10 passed/4 ignored`, focused formatting/checks, and both runner self-tests
-pass.
-
-The next task is one composite Gate A from a clean `.27` build and one capable
-Exit window: first the established `20s` reverse-first P1 must exceed
-`150 Mbit/s` with zero TUN/bypass/error and only exact bounded timed-terminal
-accounting; after it becomes quiet, one `64 MiB` fixed-byte reverse flow must
-close by remote EOF with `clean_queue_lifecycle` and every queue/tail counter
-zero. Both subproofs are an AND gate. Do not try to drain bytes into an already
-`Closed` socket, shrink the reservoir to hide the terminal edge, or restart
-MTU/QUIC/pool/chunk/self-wake work. Result:
-`docs/tech/2026-07-11-knife14h10d16-alternate-exit-gate-a-results.md`.
-
-That composite Gate A has now run from clean `f1627bc` in a capable temporary
-Exit window. The mature control passed at `157.650 Mbit/s` receiver and direct
-reverse reached `212.607 Mbit/s`, but pool-2 mini_vpn reached only
-`0.0265 Mbit/s` in A-capacity and the fixed `64 MiB` A-clean flow timed out
-after about `3.68 MiB`. All D16/TUN local drop, bypass, pressure, send/flush,
-and QUIC loss/blocking surfaces stayed clean; the target sender itself stopped
-after a small TUIC-stream burst.
-
-A pool-1 discriminator on the same capable server reached `115 Mbit/s` with
-zero local drop/pressure and selected TUIC pool lifecycle as the next
-correctness seam. Task 11C is complete at `6209910`: idle auxiliary reuse now
-uses a bounded Heartbeat/ACK health probe, slot lease/open races are closed,
-reconnected slots have a ready barrier, and generation/reconnect evidence is
-versioned. All local gates pass without a macOS TUN test.
-
-The scoped capable-window A/B did not authorize Gate A. Mature sing-box reached
-`195.033 Mbit/s` receiver; clean pool-2 mini_vpn used auxiliary `conn=1`,
-generation `1`, with no probe or reconnect, but reached `108 Mbit/s`. The
-middle window sustained `188-190 Mbit/s`, while startup and tail contained
-multi-second starvation. D16 ownership/release, TUN drops, actor bypass,
-pressure, send/flush errors, and QUIC loss/congestion/blocking stayed clean.
-Therefore stale recycle is rejected as the active capacity root. Next build a
-deterministic TUIC stream-service/frontier discriminator that separates server
-write starvation, ordered-frontier blockage, and reader-service delay. Gate B
-remains frozen; do not change D16 ownership, actor cadence, queue size, EOF,
-MTU, broad QUIC windows, chunk size, or self-wake. Results:
-`docs/tech/2026-07-11-knife14h10d16-composite-gate-a-pool-lifecycle-results.md`
-and `docs/tech/2026-07-11-knife14h10d16-pool-health-probe-results.md`.
-
-Knife14fp found a mandatory high-throughput prerequisite: the exit VPS `.33`
-had Linux socket buffer caps/defaults of only `212992B`, which capped both
-mini_vpn and a mature sing-box client around the `20-30 Mbit/s` band. `.33` is
-now persistently raised to:
-
-```text
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.core.rmem_default = 1048576
-net.core.wmem_default = 1048576
-```
-
-After restarting sing-box under those limits, the mature sing-box client reached
-`185.242 Mbit/s` receiver and a later current-window mature sing-box repeat
-still reached `173/173 Mbit/s`. The VPS install/optimization checklist is
-captured in
-`docs/tech/2026-07-08-vps-install-and-optimization-guide.md`.
-
-Do **not** lower the target to `30 Mbit/s`. The `100+ Mbit/s` target is
-reachable on the current `.27/.33/.77` topology. Final mini_vpn acceptance is
-not closed because mini_vpn's reverse TUIC TCP data path is still below the
-mature-client baseline.
-
-Latest discriminator:
-
-- Knife14fp mini_vpn safe1200 reverse-first P1 reached a reported
-  `114.000 Mbit/s` receiver with high intervals averaging `189.483 Mbit/s`, but
-  iperf exited by external timeout and close-tail accounting was dirty.
-- Knife14fq repeated from a clean `f8765c1` clone with `IPERF_TIMEOUT_SECS=120`.
-  It exited normally and cleaned close-tail accounting, but regressed to
-  `35.700 Mbit/s` receiver with local pressure/headroom gating
-  (`may_recv_false=13594`, `headroom_deferred_bytes=17512861`) while QUIC
-  loss/blocking and TUN drops stayed `0`.
-- Knife14fu restored the ordered default after rejecting unordered TUIC chunk
-  reassembly, but the current branch at `6eb52e9` collapsed to a no-data
-  reverse-first shape: `0.349/0.046 Mbit/s`, with local pending/headroom/TUN
-  and QUIC loss/blocking surfaces clean.
-- Knife14fw reran the known Knife14fp-era commit `f8765c1` from a clean
-  detached worktree and got `19.900/18.700 Mbit/s` with clean close-tail and
-  healthy direct baselines. This shows the current branch has a worse no-data
-  regression, but the fp-era code still does not reliably reproduce `100+` in
-  the current window.
-- Knife14fx ran a mature sing-box `v1.13.14` client in the same current
-  environment and reached `173/173 Mbit/s`. Therefore VPS config can reach
-  `100+`; the remaining blocker is mini_vpn client/data-plane behavior.
-- Knife14gm added local TDD and code for the Knife14gl low-byte ordered stream
-  gap. Commit `9e50a32` made active payload-shaped ordered streams below the
-  old `64KiB` ACK/window service gate reach both the ACK-drain due predicate
-  and the relay supervisor polling gate. The focused safe1200 reverse-first P1
-  retry restored data movement (`23.2/21.2 Mbit/s`) but did **not** exceed
-  `30 Mbit/s`; the run stayed `low_average` with local-pressure/credit-edge
-  signals and clean TUN/QUIC surfaces.
-- Knife14gn added TDD and code for accepted downlink flush progress. Commit
-  `97cb55e` moves downlink credit-controller feedback until after
-  `send_slice`, so bytes accepted into smoltcp count as useful local egress
-  progress and wake read-credit publishers. The focused safe1200 reverse-first
-  P1 completed normally but regressed to `18.8/18.0 Mbit/s`, **not** `>30`.
-  The important discriminator changed: `local_pressure=0`, pressure/drop debt
-  and TUN drops stayed `0`, while `connection_stream_frames_pending` gaps
-  remained at `3405ms`.
-- Knife14go added TDD and code for active connection-RX self-wake. Commit
-  `39112ca` makes pending TUIC reads self-wake for both
-  `connection_stream_frames_pending` and `connection_rx_no_stream_frames`.
-  Focused safe1200 reverse-first P1 improved only to `24.6/22.4 Mbit/s`, still
-  **not** `>30`. The useful discriminator: data-stream polling cadence improved
-  (`data_poll_gap_max_ms=43`, `self_wake_armed=11702`,
-  `self_wake_fired=8726`), but ordered delivery still had multi-second gaps
-  (`data_read_gap_max_ms=3872`, `data_pending_gap_max_ms=3006`) and the final
-  burst reintroduced one local pressure edge (`downlink_backpressure
-  pause_edges=1`, `read_credit_pause_updates=1`).
-- Knife14gp added T13/T14 TDD and code for since-last-pending TUIC stream
-  diagnostics plus post-flush residual pressure debt. Commit `bd0d264` removed
-  the obvious false pre-flush debt shape: the focused run had
-  `downlink_backpressure pause_edges=0 resume_edges=0`, clean TUN drops,
-  clean close-tail accounting, and clean QUIC loss/blocking. It still regressed
-  to `15.0/13.5 Mbit/s`, **not** `>30`. The new discriminator showed many
-  repeated multi-second pending windows with
-  `conn_rx_stream_frames_since_pending=0`, meaning older
-  `connection_stream_frames_pending` evidence was often stale since the last
-  successful stream read. The remaining active branch is useful read-credit
-  collapse to `1200B` under residual local pressure/headroom evidence, not VPS
-  capacity, iperf3, MTU, stale pool, broad QUIC windows, or simply sleeping
-  stream polling.
-- Knife14gq implemented the B0-B7 feature-flagged buffered downlink
-  architecture. Commit `8a85ce7` promoted `SocketCtx.downlink_pending` into an
-  explicit buffered layer for TUIC read-credit decisions. The B7 focused
-  safe1200 reverse-first P1 did **not** pass: `18.3/17.2 Mbit/s`, below the
-  `>30 Mbit/s` gate. The old read-service collapse was fixed
-  (`remote_read_service_len_min=65536`,
-  `remote_batch_limit_bytes_min=524288`, `read_credit_pause_updates=0`), but
-  throughput stayed `low_average` with
-  `attribution: local_downlink_backpressure`, one local pressure pause/resume
-  edge, and multi-second ordered-stream pending gaps. Buffered read credit is
-  useful but not sufficient; the next architecture target is local
-  writer/egress cadence, not another credit-floor or self-wake tweak.
-- Knife14gs implemented the next G2-G5 local egress service lane after the
-  Knife14gr performance gate. The main loop now has an explicit bounded local
-  egress window that can alternate TUN RX ACK intake, `iface.poll`, dirty
-  downlink flush, and `flush_tx` until a target, no-progress, hard-pause, or
-  cycle-budget stop. Local gates passed, including the code-level G5 capacity
-  floor of `128KiB/5ms` active window. This is a local architecture/capacity
-  gate only; VPS acceptance still must prove first `>30 Mbit/s` before any
-  `100+ Mbit/s` claim.
-- Knife14gs G6 ran commit `4a44a11` on `.27` from a clean `/tmp` workdir. The
-  focused safe1200 reverse-first P1 improved to `28.6/27.6 Mbit/s` but still
-  did **not** exceed the `>30 Mbit/s` gate. The new local egress service ran
-  (`windows=6024`, `cycles=1718`) but reported `accepted_bytes=0` with dominant
-  `no_progress/no_work` exits. The useful discriminator is now clear: G5
-  serviced only local dirty/flush work; it did not fix the TUIC stream
-  read-cadence gap (`max_remote_read_gap_ms=5029`,
-  repeated `connection_stream_frames_pending`). The next slice must join TUIC
-  stream read service and main-loop local injection/egress under one measured
-  service contract before another VPS claim.
-- Knife14gt G7 ran commit `4caf60a` on `.27` from a clean `/tmp` workdir after
-  aligning relay dispatch with one local egress service window
-  (`64KiB -> 128KiB`). The focused safe1200 reverse-first P1 reached
-  `147/144 Mbit/s`, so the current branch has now passed the `>30 Mbit/s`
-  discriminator and demonstrated `100+ Mbit/s` data movement on this topology.
-  This is **not** final clean acceptance: the tail logged
-  `tx_dropped_delta=783`, `global_rx_queue_used_max=1019/1024`, and
-  `terminal_pending_reap_bytes=2653878`
-  (`close_pending_class=terminal_closed_no_send`). Next work must preserve this
-  dispatch/egress cadence while cleaning tail drop/pending, not return to VPS,
-  MTU/PLPMTUD, stale pool, broad QUIC windows, or unordered reassembly.
-- Knife14gu G8 tried the first close-tail cleanup slice at commit `1a3c5cb`:
-  stop extra relay ready-burst reads when the relay-to-main `global_rx` queue
-  is at the critical edge. The focused safe1200 reverse-first P1 did **not**
-  preserve G7 throughput; it regressed to `20.2/19.2 Mbit/s`, below even the
-  earlier `>30 Mbit/s` discriminator. Tail-drop surfaces improved
-  (`tx_dropped_delta=0`, data relay `global_rx_queue_used_max=210/1024`), but
-  the new limiter did not actually activate (`remote_batch_limited=0`). The
-  active failure returned to multi-second ordered TUIC stream read gaps
-  (`max_remote_read_gap_ms=3610`) and `tcp-local-egress-service
-  accepted_bytes=0`. Stop condition: no more code changes from this result
-  alone; next step is A/B repeat of `1a3c5cb` vs parent `4caf60a` before
-  choosing another implementation direction.
-- Knife14gv ran that A/B without code changes. `1a3c5cb` repeat improved to
-  `41.4/39.9 Mbit/s`, so it exceeded `30M` but still did not preserve
-  `100M+`; the RX-edge limiter still did not activate
-  (`remote_batch_limited=0`) and the run ended with local downlink
-  backpressure/pending (`pending_high=734035`, `may_recv_false=6519`).
-  Parent `4caf60a` did **not** reproduce the prior G7 high-throughput result;
-  it collapsed to `0.349/0.151 Mbit/s` with attribution
-  `tuic_stream_read_gap+tuic_stream_read_pending+relay_remote_read_gap+target_sender_stalled+tuic_stream_starved`.
-  This means G7 remains high-throughput evidence but not a stable baseline.
-  The active branch is now TUIC ordered stream service stability, not
-  `global_rx` queue-edge cleanup.
-
-Current result doc:
-
-- `docs/tech/2026-07-08-knife14gq-buffered-downlink-results.md`
-- Performance gate for the next slice:
-  `docs/tech/2026-07-09-knife14gr-egress-cadence-reachability.md`
-- Local G2-G5 result:
-  `docs/tech/2026-07-09-knife14gs-local-egress-service-g5-results.md`
-- G6 VPS result:
-  `docs/tech/2026-07-09-knife14gs-g6-local-egress-vps-results.md`
-- G7 VPS result:
-  `docs/tech/2026-07-09-knife14gt-dispatch-window-g7-results.md`
-- G8 VPS result:
-  `docs/tech/2026-07-09-knife14gu-rx-edge-g8-results.md`
-- G8/G7 A/B repeat:
-  `docs/tech/2026-07-09-knife14gv-ab-repeat-results.md`
-
-Current follow-up queue:
-
-1. Keep the ordered-default gate, Knife14gm low-byte ACK/window service,
-   Knife14gn accepted-flush progress feedback, Knife14go active connection-RX
-   self-wake, Knife14gp since-last-pending diagnostics/post-flush debt
-   separation, and Knife14gq buffered read-credit isolation; unordered
-   reassembly remains diagnostic only.
-2. Do not continue self-wake timer work as the main branch. Knife14go proved
-   frequent polling, Knife14gp proved repeated pending windows often have no
-   fresh `conn_rx_stream_frames_since_pending` progress, and Knife14gq proved
-   preserving a useful read-service floor alone does not clear `30 Mbit/s`.
-3. Do not keep changing local pressure-credit constants blindly. Knife14gq
-   removed the `1200B` credit-collapse symptom but still failed at
-   `17.2 Mbit/s`.
-4. Knife14gs added the first explicit local writer/egress service lane. Keep
-   its bounded stop reasons and diagnostics; do not convert it into an
-   unbounded pump or bypass hard pending/drop/terminal guards.
-5. Do not repeat G5-style local-only egress work as the next slice.
-   Knife14gs G6 proved that `tcp-local-egress-service` can run heavily while
-   `accepted_bytes=0`; this does not address TUIC ordered stream read cadence.
-6. Knife14gt proved the first TUIC-read/main-loop cadence slice can exceed both
-   `30 Mbit/s` and `100 Mbit/s`; preserve that dispatch-window alignment.
-7. Knife14gu proved that a `global_rx` critical-edge read guard alone is not
-   enough to preserve the G7 cadence. Do not keep editing queue-edge guards
-   without an A/B repeat.
-8. Knife14gv A/B is complete. Do not treat parent `4caf60a` as a stable
-   `100M+` baseline until it repeats; in the latest same-window run it produced
-   only `0.151 Mbit/s` receiver.
-9. The next implementation target must be TUIC ordered stream service
-   stability: classify fresh/stale `connection_stream_frames_pending`, explain
-   multi-second pending/read gaps while connection UDP/frame counters move, and
-   bind useful remote reads plus local admission in one measured service
-   contract.
-10. The next focused VPS acceptance target remains a clean safe1200
-   reverse-first P1 with receiver `>100 Mbit/s`, `tx_dropped_delta=0`,
-   `terminal_pending_reap_bytes=0`, and no data-relay
-   `terminal_closed_no_send`, but any `100M+` claim must now repeat at least
-   twice before being promoted to a stable baseline. Only after that should
-   longer duration, P2/P4, or concurrency stability work resume.
-
-## Roadmap: TUN transparent proxy (Target extraction)
-
-The TUN client must relay each intercepted connection to its real **Target**
-(the destination `IP:port` the OS routed into the TUN), not a hardcoded address.
-Split into two stages so the hot-path rewrite stays isolated and reversible:
-
-- **Stage 8 — fixed-port Target extraction (stepping stone).**
-  Enable smoltcp AnyIP + a default route so arbitrary destination IPs are accepted
-  on a single fixed listen port. Extract the Target from `local_endpoint()` and use
-  it instead of the removed hardcoded target. Deliverable is mechanism-only:
-  verifiable by routing a real port-80 host into the TUN; cannot browse real sites yet.
-- **Stage 9 — SYN-sniffing dynamic ports.**
-  Parse inbound IP/TCP headers (etherparse) in the rx path; on a SYN to a port with
-  no listener, create a smoltcp socket listening on that port; maintain a connection
-  table with idle reclamation. Only after this can arbitrary ports (incl. 443) work.
-
-### Gating dependencies for real browsing (e.g. facebook from Shenzhen)
-
-Target extraction alone does NOT make real sites work. In order of blocking severity:
-
-1. ~~Arbitrary ports (Stage 9)~~ — DONE.
-2. ~~DNS over tunnel or fake-IP (Stage 11)~~ — DONE (fake-IP).
-3. ~~UDP relay for QUIC/HTTP3 and live streaming~~ — DONE through TUIC:
-   UDP now rides TUIC `Packet` over QUIC datagrams (ADR-0004), oversized packets have
-   uni-stream fallback (刀3), and native+cubic high-rate soak passed (刀3.5). Re-test
-   on new exits/paths, but this is no longer a known missing feature.
-4. Exit IP reputation — datacenter IPs trigger target-site risk control; protocol-independent.
-5. MSS clamping / MTU handling — prevents large packets from stalling through the tunnel.
-
-### Historical architectural constraints retired by TUIC
-
-- Yamux/TLS is no longer the data plane. TUIC Connect uses one QUIC bi-stream per TCP
-  session, and the legacy server/yamux path was retired in 13d.
-- Server-speaks-first protocols remain outside the current proxy trigger model (the
-  local relay still opens on first local payload), but this is now a product/protocol
-  requirement question, not a yamux limitation.
-
-## Future architecture topics
-
-These cut across multiple stages and may need their own design before being scheduled.
-
-### Prioritized future task backlog (post-14d)
-
-Keep this list as the canonical next-work queue after 刀14c/14d. Items are ordered by current leverage.
-The 2026-06-30 US-client result moved connection-pool work behind downlink/backpressure + async-open
-validation; see `docs/tech/2026-06-30-knife14b-usclient-results.md` and
-`docs/tech/2026-06-30-knife14d-downlink-reap-open-spec.md`.
-
-1. **Re-run the US-client suite after 14c+14d.** Keep the same Client/Exit/Target shape and upload the
-   generated markdown/tar bundle for analysis.
-2. **Use the bundle to choose the next knife.** If reverse/P2 still fails, read the TCP diagnostics and loop
-   profile first; do not jump straight to connection-pool work.
-3. **#3 connection-pool spike.** Only start this if post-14d measurements still prove a single TUIC/QUIC
-   connection is the wall. Otherwise do not add pool complexity.
-4. **Mobile/productization core seam.** Add packet I/O traits for macOS tun / iOS `NEPacketTunnelFlow` /
-   Android `VpnService`, library-style config structs, and config injection for knobs such as `cc` and
-   `udp_mode`.
-5. **0-RTT / weak-network resume.** Revisit quinn/rustls once early exporter support is available, and pair
-   it with adaptive keepalive / mobile radio-sleep behavior.
-6. **DNS edge hardening.** Decide policy for IPv6 DNS, split-horizon/internal domains, exotic multi-question
-   DNS, hardcoded-IP apps, and when to switch parsing to `hickory-proto`.
-7. **Anti-censorship resilience beyond TCP failover.** Evaluate UDP-over-VLESS/TCP fallback only if QUIC is
-   blocked and UDP service continuity matters more than latency/complexity.
-8. **Scale / ops.** If multi-server or many-user operation returns, design service discovery, weighted
-   upstream health, graceful drain, metrics/alerting, and multi-region steering.
-9. **Longer-horizon product modes.** Multi-Hop, L3 tunnel mode, REALITY Vision flow / broader TLS cipher
-   fingerprinting, and exit-IP reputation handling are product-line decisions, not current data-plane blockers.
-
-### Data plane → TUIC protocol on QUIC (ADR-0004, supersedes self-built transport)
-
-ADR-0003's north star (unify on QUIC) is now realized via the **TUIC v5 protocol** on quinn
-(**ADR-0004**), NOT a self-designed transport (that work was reverted). Priority rule:
-「用成熟方案拿到最好体验」>「复用自研引擎」. **Client-only**: the exit is a mature **sing-box TUIC
-server** (interop = best experience, zero server code from us). Stage 12's UDP-over-QUIC-datagram
-≈ TUIC native mode and is reused. quinn 0.10 already exposes `export_keying_material` (TUIC auth).
-
-- **Stage 13 — TUIC client** (13a→13d complete; legacy/yamux retired):
-  - ~~**13a — TCP relay over TUIC Connect**~~ — DONE (2026-06-10): Authenticate (token via
-    keying-material) + per-flow Connect bi-stream behind a `ProxyUpstream` trait; **verified end-to-end
-    against a real sing-box TUIC server** (curl https://1.1.1.1 → Cloudflare 301, US egress).
-  - ~~**13b — UDP relay over TUIC `Packet`**~~ — DONE (2026-06-11): native QUIC datagram, one u16
-    assoc-id per UDP 4-tuple (`AssocTable`), `send_udp` + a self-healing downlink datagram pump +
-    periodic Heartbeat over the *same* authenticated connection as TCP; **verified end-to-end against a
-    real sing-box** (`dig @1.1.1.1 example.com/facebook.com` → real A records; `curl https://1.1.1.1`
-    still HTTP/2 301 = TCP non-regression). See `docs/tech/13b-tuic-udp-packet.md`. Oversized-packet
-    stream fallback was completed in 刀3.
-  - **13c — 0-RTT reconnect + keepalive clarification** — PARTIAL (2026-06-11). Scope narrowed (real
-    migration + battery-adaptive heartbeat moved to the mobile-readiness stage; they need iOS/Android
-    packet-flow backends to truly accept).
-    - DONE: **on-demand TUIC Heartbeat** — fires only while UDP is recently active (`last_udp_activity`
-      + `should_send_heartbeat`); pure-TCP sessions rely on the QUIC keep-alive PING. Two keepalive
-      layers clarified (QUIC PING = connection liveness; TUIC Heartbeat = UDP-session liveness).
-    - **0-RTT DEFERRED (ecosystem wall)**: quinn 0.10 / rustls 0.21 cannot `export_keying_material`
-      during the 0-RTT (handshake-incomplete) phase, and TUIC's auth token derives from it — so TUIC
-      0-RTT auth is **structurally impossible on this stack**. Verified vs sing-box (`zero_rtt_handshake`
-      on): auth fails → self-healing 1-RTT fallback, traffic flows. The 0-RTT code path + the
-      `MINI_VPN_TUIC_ZERO_RTT` switch are kept (default **OFF**, opt-in only).
-      - **Follow-up to actually get 0-RTT**: bump quinn/rustls to a version that exposes 0-RTT
-        keying-material (early-exporter) export — the version bump ADR-0004 foresaw. Best folded into
-        the **mobile-readiness stage** (weak-net / radio-sleep is where 0-RTT fast resume pays off),
-        alongside real connection migration + adaptive heartbeat. Re-validate against sing-box after the bump.
-  - ~~**13d — retire legacy** (yamux + Stage-12 self-server QUIC datagram + self server)~~ — DONE.
-
-#### Transport / protocol extensibility — two tiers
-
-- **Proxy-transport trait** (the abstraction Stage 13 builds): pluggable L4/L7 proxy protocols sharing
-  "intercept flow → relay to exit → exit dials target". TUIC = impl #1; **VLESS+REALITY (TCP)** is impl #2
-  and is wired into health-aware failover (刀6→刀10). Trojan/SS/Hysteria could follow the same trait if
-  a real product need appears.
-  - **Protocol selection** is implemented as `MINI_VPN_UPSTREAM=tuic|reality|failover`; failover keeps
-    UDP on TUIC and switches TCP to REALITY when QUIC/TUIC is unhealthy.
-- **Data-plane "tunnel mode"** (separate future path, NOT behind the proxy trait): WireGuard / OpenVPN
-  forward raw IP packets (L3), bypassing smoltcp/fake-IP/per-flow — a different mode for "general VPN
-  (non-circumvention)" use, and easily GFW-blocked without obfuscation. Add only if that product need
-  appears. **StealthVPN (Astrill, proprietary/closed): not doing** (no open spec).
-
-#### Mobile (iOS/Android) readiness
-- Abstract packet I/O behind a trait (current `tun` crate backend; **iOS NEPacketTunnelFlow**; **Android
-  VpnService fd**) and library-ize the core (config struct in, not env/CLI) for FFI.
-- Adaptive keep-alive (battery vs NAT timeout; current 5s is battery-hostile) + memory budget (iOS
-  NetworkExtension ~15–50MB limit) + QUIC 0-RTT for fast resume after radio sleep.
-- UDP→TCP upstream fallback where UDP/QUIC is blocked (ties into the protocol selector above).
-
-#### Other follow-ons
-- **DNS hardening**: core DoH/DoT/DoQ blocking and all plaintext `:53` hijack are done (刀4/刀5).
-  Remaining work is edge-case policy: IPv6 DNS, split-horizon/internal domains, exotic multi-question DNS,
-  or moving to hickory-proto when richer DNS record handling is needed.
-- **Scale/ops** (only if our own server returns): session-table hardening, multi-upstream/failover,
-  graceful drain, control-plane discovery + metrics (external stores belong here, not the hot path).
-
-### Multi-Hop
-
-Chain multiple Upstream hops (e.g. Shenzhen → HK → US) for jurisdiction layering
-and exit-IP rotation. Affects relay protocol, connection-table, and TLS chaining.
-
-### fake-IP / DNS interception
-
-Core implemented in Stage 11 (ADR-0002): intercept DNS in the TUN, forge A responses
-with `198.18.0.0/15` placeholders, map fake-IP↔domain, rewrite TCP target to DomainPort
-so the Upstream resolves at the exit. Follow-ups not in the original Stage 11, with current status:
-
-- ~~**DoH/DoT interception**: encrypted DNS (browser/system) bypasses the plaintext UDP/53
-  resolver → app gets real IP → blocked IPs still fail.~~ DONE in 刀4 for known encrypted DNS endpoints.
-- **Hardcoded-IP domains**: apps connecting to a literal IP never enter the fake-IP map;
-  stays IpPort. No clean fix without app cooperation.
-- ~~**QUIC/UDP relay**: needed for QUIC (UDP/443) and UDP services; until then apps usually
-  fall back to TCP.~~ DONE via TUIC Packet + native/cubic default.
-- ~~**fake-IP reclamation / LRU**: pool is never reclaimed this stage (131k addresses); add
-  LRU + TTL-based eviction if it ever matters.~~ DONE in 刀2 with refcount + idle sweep.
-- **Switch DNS codec to hickory-proto** when any of: parsing real upstream responses
-  (compression pointers), EDNS0/DNSSEC/DoH, more record types (CNAME/HTTPS/SVCB), or
-  hardening against malicious packets. Only the dns.rs codec module changes; interface stable.
-- **First-SYN-to-fresh-fake-IP refused race is closed**. 刀4 acceptance confirmed knife2's same-frame
-  listener creation and elastic spare listener logic eliminated the observed refused race.
-- ~~**Large HTTP/2 / multiplexed streams fail mid-transfer with `bad decrypt`**~~
-  RESOLVED 2026-06-04 (commit b476854): root cause was `send_slice` dropping the
-  unwritten tail when the tx buffer was full; fixed with a per-handle downlink
-  pending buffer that never drops bytes. Verified: `curl https://www.facebook.com/`
-  downloads a full ~415KB repeatedly with no bad decrypt.
-
-### Client-side concurrency bottlenecks (knife1/12/13 findings)
-
-Quantified by the mock loopback harness (`src/harness.rs`, feature `harness`) and later
-real-egress probes. Full data starts in `docs/tech/2026-06-12-knife1-bottleneck-findings.md`;
-ADR-0013 records the 100M attribution update.
-
-- ~~**P0 #1 — `run_event_loop` sweeps `registry.all_handles()` O(total listener slots)
-  every tick.** relay/call scales linearly with `distinct_ports × pool_size` and is
-  independent of active connections (0.13→0.45ms as slots 512→2048, N fixed). knife2:
-  process only handles with readiness (event/dirty-set), not a full per-tick sweep.~~ DONE in 刀2.
-- ~~**P0 #2 — per-port `pool_size` is a hard concurrency ceiling.** 256 conns to ONE
-  port with default pool=2 complete only 2/256; hot-port bursts stall (rearm-under-churn
-  doesn't drain — overlaps the first-SYN-refused race below). knife2: elastic per-port
-  pool / reuse + accept backlog.~~ DONE in 刀2.
-- **P1 #4 single-thread select ceiling** was re-tested by 刀12 LoopProfiler. `iface.poll` is not the 100M
-  bottleneck on measured paths, so event-loop sharding is cancelled for now.
-- **Cross-flow HoL from blocking TCP uplink send** was found by 刀12 and fixed by 刀13 using non-blocking
-  `try_reserve`: Full leaves bytes in smoltcp rx buffer and lets TCP window apply backpressure.
-- **#3 single QUIC connection / connection pool** remains unproven. Only revisit on a low RTT, genuinely
-  >100M end-to-end path where single-connection-vs-pool can be measured cleanly.
-
-### Scale & reconnection resilience (100+ servers / 5000+ users)
-
-Stage 10 ships client-side full-jitter reconnect as the baseline. To survive
-reconnect storms and scale, layered work beyond client code:
-
-- **Architecture**
-  - Multiple Upstream addresses + failover (rotate / health-aware pick); spreads
-    5000 users across the server pool (~50/server).
-  - Control plane / service discovery: clients pull a live healthy-server list with
-    weights instead of hardcoding one address; enables dynamic eviction + steering.
-  - L4 load balancer (LVS / NLB / nginx stream) in front of the pool. NOTE: a yamux
-    long connection is pinned to one backend, so if that backend dies the connection
-    still drops — client reconnect+jitter remains the foundation, LB does not replace it.
-  - Connection epoch/generation to discard stale relays after reconnect (anti-crosstalk).
-  - Application-layer heartbeat to detect half-open connections instead of waiting for
-    TCP timeout.
-- **Ops / deployment**
-  - Rolling restart + graceful drain (stop accepting, let existing connections drain)
-    — turns "5000 disconnect at once" into "a few dozen per batch"; most effective
-    anti-thundering-herd measure, more so than client jitter.
-  - Health checks with automatic node eviction; server-side accept rate limiting +
-    connection cap + SYN cookies to avoid being overwhelmed.
-  - Metrics (reconnect rate, concurrent connections, handshake failure rate) for
-    observability + alerting on reconnect storms.
-  - Cross-AZ / multi-region redundancy so single-point failure does not affect everyone.
-
-## Deferred Work
-
-These items are intentionally out of scope for the current stage, but are likely to be needed later.
-
-### TLS / Certificates
-
-- Support multiple server certificates selected by SNI.
-- Support certificate hot reload without restarting the server.
-- Support client certificate authentication (mTLS).
-- Unify TLS config loading between `client-direct` and `client-tun`.
-- Add explicit certificate expiry diagnostics at startup.
-- Consider separating CA bundle path from leaf certificate path more strictly in default dev assets.
-
-### Runtime / Reliability
-
-- Add reconnect policy for `client-tun` upstream TLS/Yamux connection.
-- Add upstream failover support with multiple server addresses.
-- Replace remaining runtime `unwrap()` paths in TLS material loading with structured errors.
-- Add retry/backoff strategy for transient upstream connection failures.
-
-### Testing / Tooling
-
-- Add scripted local dev certificate generation with stable output paths.
-- Add an end-to-end local test recipe covering `localhost` and `example.com` SANs.
-- Consider adding integration tests for TLS config loading with temporary test certificates.
-
-### Product / Config
-
-- Consider sharing a single top-level config model across `server`, `client-direct`, and `client-tun`.
-- Add config file support in addition to environment variables.
-- Evaluate whether `cert_path`, `key_path`, and `ca_path` should be documented in a single deployment guide.
+R4已获用户确认并完成：唯一测试叶`compatibility_open_settlement.rs`从787到794行（+7，仍≤800），其余460份Rust源码不变。四个批准命令按序全部GREEN，`1 + 1 + 1 + 11 = 14`次测试执行通过、0失败；最终独立Reviewer结论P0/P1/P2=0/0/0，见`l1e-r4-final-independent-review.json`。461份源码、HEAD `64f027fc`及978项index保持冻结。此前L1e-F4的失败日志、快照、提案和stop verification均保留；R4说明它是outer saved driver的终态等待缝，不把旧失败抹除或改写为生产缺陷。
+
+R5三份独立只读审计已在写Rust/Cargo前停止：pressure叶409/800只余391行，shared fixture父693/800只余107行；完整cheap/FIN/stale/reap/DNS-UDP/32-control/cleanup矩阵没有可信单叶闭合预算。更关键的是`global_tx/global_rx`、dirty和D4都属于原event loop局部状态，现有PressureProbe不能证明旧epoch `Closed`/`AckDrainHint`没有副作用；DNS/UDP和真实FIN也缺fixture入口/回包oracle。Reviewer结论P0/P1/P2=0/3/2。见`l1e-r5-pressure-capacity-stop.json`；这不是新的测试失败或repair，未运行Cargo、未写Rust，所有现有证据保持。
+
+R5 whole-scope review 已收敛为 S6-MoveLayout，独立 Reviewer 复核后 P0/P1/P2=0/0/0。提案只请求：新 private fixture 叶、new legacy_event_loop/mod.rs 与 relay_events.rs，以及 src/client_tun.rs/现有 open-custody 父的两次纯 Move；461 个 Rust 源预计只增至 464。root 仍唯一拥有 loop/Sleep/所有 sender，栈上 lane 仅存 global_rx、现有 handle-only D4、gap state 和 pause bit；select 触发顺序和所有行为保持。bridge、stale tracer/repair、cheap W128、FIN、reap、DNS/UDP、公平性及完整 W 均明确留给后续范围。见 l1e-r5-s6-movelayout-proposal.json、docs/tech/2026-09-20-n1-r5-event-owner-move-layout-proposal.md 和 l1e-r5-s6-movelayout-independent-review.json。
+
+用户已确认的 S6 已完成：/root Writer 与 Integrator 均已冻结，/root/n1_s6_independent_reviewer 最终复核为 0/0/0。完整 W、条件 S3、F/S1、cold 启动、生产切换和 TUIC 恢复仍未接受；全部脏工作与失败证据保留，禁止项不变。
+
+S2开工前的预检：继续原N1/S1时458份Rust与L1d最终清单逐项相同，HEAD64f027fc/978stage字节不变，未发现并行Writer/Cargo。两位只读预检确认：runtime余832行；两条session测试叶余59/93，首个完整W128真实socket tracer估计240–395行，现有fixture不能覆盖。具体S2仅请求新增compatibility_open_custody.rs与compatibility_flow_custody.rs两条私有测试叶（各≤800），原生产scope/预算/完整矩阵/治理不变。用户已回复“确认”批准S2，见s2-approval.json；恢复原N1/S1实施，无需重批。证据见当前N1结果最新L1e及n1-20260918-evidence/l1e-test-scope-proposal.json；前一容量预检零Rust/零Cargo/零测试；本次实施另记证据，L1d接受结论不变。
+
+### Historical accepted L1d boundary — open/flow custody provenance
+
+用户在多Agent执行说明后回复“继续”，本次按冻结N1卡推进；本次权限仅N1。
+[当前N1执行记录](docs/tech/2026-09-18-compatibility-recovery-n1-results.md)拥有实际改动、命令、失败记录、Writer与审查结论。
+[指南§5](docs/tech/2026-09-14-compatibility-recovery-execution-guide.md#5-唯一剩余工作清单)仍是兼容路线唯一剩余工作清单。
+
+M0/M1/M2均获原独立Reviewer的P0/P1/P2=0/0/0 Approve，仅接受纯Move。
+M0外置device/main原测试；M1迁出完整TUIC reader slice，父6984/child1048；
+M2迁出原336行启动壳，父16223/child360，DATA loop保持不变。治理同步收紧。
+三步共1636次测试执行通过（541+570+525），不是1636个唯一测试，零测试失败。
+原工具调用错误及一次格式检查失败保留，最终相关门禁通过。
+N1-M接受时453份Rust中原449份有6份变化、443份不变，新增4份、没有删除。
+N1-L的L0有界错误转换已独立0/0/0接受：record1128B、8case两模式通过，
+共533次执行通过；仅值转换。L1a真实device pump生命周期也已独立0/0/0接受：
+原8＋新11项两模式通过，累计561通过、8预期TDD失败、零非预期失败。
+仅pump局部接受。L1b纯Move＋R2来源门禁修正已获原Reviewer独立0/0/0接受：
+父13779/child458，原453行逆变换一致；保持338项。R2的20命令、509次执行通过。
+L1b累计570次通过；原漏计child和R1漏识tokio属性的两次真实失败完整保留。
+L1c共同整包pump＋显式设备stop/join已独立0/0/0接受：581次通过，
+6次预期接口compile RED、2次预期行为RED，零非预期失败。device1171，harness4099，
+两test叶707/749；实际Loopback与pump的退出/错误/压力已验证，Virtual只测已停止壳。
+L1d0原loop wrapper纯Move已独立0/0/0接受：529次通过。
+L1d持久原loop/device custody已获新独立Reviewer 0/0/0接受：最终源码591次通过，
+累计694次（含中间版本，非唯一测试数）；2次接口compile RED、3次行为RED保留，零非预期失败。
+外层保存device、内层原DATA借用；取消观察、poll/析构panic、固定关闭deadline与错误delta已测。
+Running状态无新增DATA控制锁；仅局部DeviceSettled，不是整个session/TUIC clean。
+最终458份源码无漂移，父16192/runtime668/新custody叶741；生产入口仍未切换。
+下一门为同一root的W128 open/Flow4096五角色custody，再接已批准S1载荷与TUIC lifecycle。
+N1-L整体与N1-R均未接受，TUIC恢复尚未实现；N1/S1原授权继续有效，无需重复申请。
+先预算既定test叶（剩59/93行）及runtime（剩832行），不得增未授权路径/豁免或压缩空白凑限额。
+
+S1是用户已明确批准的最小范围/API修订：将src/upstream.rs的NativeTcpRelayStream
+加入N1-L范围，携带尚未启动的opaque pump控制载荷；session持久custody统一
+登记与实际join。公开结构体构造方式改变，8处既有调用适配，任务/timer/error
+预算不增加。两位只读Agent已核实缺口；授权原文见s1-approval.json。
+
+[N0已接受结果与唯一N1卡](docs/tech/2026-09-18-compatibility-recovery-n0-results.md)保留D1–D4、D5-B、checkpoint、
+542次baseline执行和2次历史fixture失败。N0接受时449份Rust未变；N1现在已有
+上述纯Move改动，不能继续把“N1未授权/当前Rust未改”当作当前状态。
+
+HEAD64f027fc、978个Git stage entries和原P3脏WIP保留。不reset/clean/stash，
+不盲目add。L1c冷启动457份源码及Git逐项一致；L1d新增1份已授权test叶成为458份。
+上述L1d接受时/root/n1_writer冻结，/root/n1_reviewer独立只读最终0/0/0；历史/root/wip_audit身份不冒用。
+L1e曾由同一Writer续做、/root/n1_capacity_review独立审查；这是一项已结束的历史阶段事实。当前
+S6-MoveLayout 已局部接受，Writer/Integrator/独立Reviewer 均已完成；
+后续 Rust 范围须先有新的明确 proposal 与用户决定，见 authority.json。
+真实repair-test失败须先证据/具体方案并等用户确认下一次修复。
+不含N2–N5、P3行为、commit/push、外部/TUN/VPS/WAN/增强M2验收或完成通知。
+P3 aggregateP1、五项51B、Case C/R7/Task4及旧M2义务全部保留。
+下方P3记录只作历史位置，不能据其旧授权自动继续P3。
+
+Historical completed-task chronology is archived at
+`docs/archive/project-memory/2026-08-25/TODO.full.md`.
+
+## Historical P3 remaining-work checklist — frozen during current N1 F1 stage
+
+The material below is retained as provenance only. The current executable continuation is the F1 Writer map at the top of this file.
+
+The historical executable checklist was joint contract section51. It was refreshed against real GREEN evidence, not the historical runtime RED. Full consumer/P3/Case C/R7 remain incomplete.
+
+- [x] Resolve private C expiry test-leaf permission and establish its real
+  behavior-bearing route. Parent797/child284; same Heisenberg SOURCE0/0/0.
+  `/tmp/mini-vpn-terminal-consumer.gnAZqG/c-expiry-index.json` owns395 hashes,
+  original parent inverse,35 command records including route E0583, and review.
+- [x] Normal multi-Z: actual original facts/actions and C/output/Sleep expiry;
+  all four insertion rotations, removal/FIFO/free partition and exact reuse.
+  Exact1/1+10 repeats EACH mode, related/provenance/growth/scoped checks green.
+  No production edit; not capacity-exhaustion/pressure/Active-Root acceptance.
+- [x] Narrow shutdown-observer retention: real join block before observer drop;
+  actual C/timer stay held; actor-only reentry remains nonzero for whole root.
+- [x] Real BoundInactive HalfClose pressure and original expiry retention:
+  child522/parent797;394/395 paths unchanged; no production/governance change.
+  `/tmp/mini-vpn-terminal-consumer.gnAZqG/c-inactive-pressure.json`,
+  same SOURCE01a0a41a-0f2e-7550-90d3-47f9415ec8ed:0/0/0. Exact1/1+
+  10 repeats EACH mode and related/provenance/growth/scoped gates pass.
+  Original completion1 and Executor Flow records2 remain after A expiry.
+  Not waiter membership, duplicate registration, selected retry or wire acceptance.
+- [x] Map existing actual single-waiter RESET repressure to same-resource double
+  registration: inner/outer source path plus real3-round retention/handoff/final
+  output; same SOURCE0/0/0, exact1+10 EACH mode. No new Rust; all395 hashes equal.
+  existing-waiter-coverage.json; not HalfClose-specific repeated-pressure proof.
+- [x] Matrix2 real output-pressure across deadline and automatic recovery:
+  four actual actor permits, fifth FIFO ACK, same-clock101ms retention, original
+  release, exact5 nonfinal/1 final ACK, successor expiry/park. Parent798/child232;
+  physical-pressure.json, exact+10 EACH mode, related/growth/scoped gates pass;
+  same Heisenberg SOURCE0/0/0 ONLY this test. No production/fixture change.
+- [x] Matrix1 HalfClose-specific selected repeated-pressure payload/association:
+  completion.rs268->640, original268-line prefix exact;395 other Rust paths
+  unchanged. Three actual competitorZ rejections preserve whole SinkHalfClose,
+  Source identity, waiter, transit0/HalfClose1; final ACK/terminal once.
+  half-close-pressure.json; exact+10 EACH mode and related/growth/scoped gates,
+  same Heisenberg SOURCE0/0/0 ONLY this test. No production/new path change.
+- [x] Matrix5 actual post-terminal late wake and independent Flow DATA:
+  completed two-path grant, parent721->722 private route/new child431;
+  old parent inverse exact and395 other Rust paths unchanged. Original A
+  ReadReady Pending -> RESET/FlowFinished/publication end -> old publisher;
+  legal pre-B dispatch excludes reads and preserves Target snapshot. B actual
+  read/Driver/inbox/reduction yields exact DATA once, preserving Source identity,
+  A TerminalSettling/Z and B unACKed Replay11bytes/1segment. terminal-late-wake.json;
+  exact+10 EACH mode/related/provenance/growth/scoped checks green, same SOURCE
+  01a0a7ec-8cc3-7c51-b560-7077ba7bb844:0/0/0. Component invariant only.
+- [x] Matrix3 direct TargetAndProgress fault-injection custody: completed user
+  four-path grant; same Heisenberg SOURCE01a0a81b-9117-7261-b0d6-edc28a989ead0/0/0.
+  /tmp/mini-vpn-returned-error.405z5b/evidence.json: expected runtime RED->GREEN,
+  both-mode10 repeats/related/provenance/growth/check/scoped checks pass.
+  Original caller error/C bundle/window/Executor tail remain, two rejected
+  reentries stable; no non-test behavior or governance change. Not natural
+  double-failure reachability, unknown recovery, nested payload or full matrix3.
+- [x] Matrix3 defensive nested-observation test: completed single-file grant,
+  returned_error.rs140->326, original test byte-exact;397 other Rust paths equal.
+  Real RESET error/fact with injected wrapper; known caller/unknown C keep both
+  Box identities/full fact/window/nonzero tail across two rejected reentries.
+  Direct GREEN+10 EACH mode; related/provenance/growth/check/scoped gates pass.
+  Same SOURCE01a0a98f-df19-76a3-b110-1237761c6eb3:0/0/0 only this component;
+  /tmp/mini-vpn-nested-observation.9o5AQA/evidence.json and2026-09-16 local result.
+  No production/route change, natural-conflict or recursive-inventory claim.
+- [x] Source-only next-axis selection: real checked recovery FIFO-pressure is
+  applicable; natural nested conflict/unknown callback still lack a witness.
+  Aggregate cold-peak proof gap retained as SOURCE P1, not a confirmed OOM bug.
+- [x] Direct production cold Layout-rejection/exact-plan test: user single-file
+  grant completed, process_plan.rs415->433, old prefix exact;397 other Rust
+  paths unchanged. Direct GREEN+10 each mode/full scoped gates; same Heisenberg
+  SOURCE01a0ad1d-21b4-7b22-96ec-caba625f586b:0/0/0, only this characterization.
+  /tmp/mini-vpn-process-cold.YMBNAt/evidence.json and2026-09-16 local result.
+  Aggregate cold-peak P1 is NOT closed by this actual cold-entry rejection.
+- [x] Checked-Bound C recovery FIFO/cursor pressure: real FIFO1/E1, three rejected
+  publications, exact acceptance/OpenResult delivery and retained HandoffReady.
+  Test-only706, SOURCE0/0/0; both-mode exact10, fixture9/Controller61 and gates.
+  `/tmp/mini-vpn-p3-recovery.HLxB8L/evidence.json`; not full nested/unknown closure.
+- [x] joint51E pure Move prerequisite: complete original C/owner inventory impls
+  and provenance guard, exact ratchets; same SOURCE0/0/0 and both-mode gates.
+  /tmp/mini-vpn-p3-nested-inventory.q0LWgl/move.json; no nested behavior yet.
+- [x] joint51E finite error family: actual nested fact RED->GREEN, iterative
+  borrow, typed Uncovered/overflow, original C and Root failure ledger; same
+  SOURCE0/0/0. Both-mode C64/owner9/cont17/CurrentOnly13/server25/gates and40
+  focused repeats. behavior/behavior-gates.json; full carrying inventory open.
+- [x] joint51E recovery error cursor/resume family: real FIFO3 pressure RED->GREEN,
+  original cursor retry/peer results, pending/ready/retained array capacities,
+  ten checked metric axes and explicit diagnostic counterexamples; same SOURCE
+  0/0/0. Both Target171/C65/related gates,20 exact repeats; cursor/cursor-gates.json.
+  Not C normal recovery inventory, natural unknown, aggregate peak or P3 closure.
+- [x] joint51F complete current carrying-error traversal, same SOURCE0/0/0.
+  Actual holder/byte-view/permit/array/token audit; lower nominal owner locality,
+  checked overflow/invalid-frame fail-closed, no audit mutation/allocation/clone.
+  423 hashes/18 paths;32 final gates/80 repeats green; no old debt growth.
+  remaining{,-gates,-repeats}.json; not normal C recovery/aggregate peak/P3.
+- [x] joint51G normal C recovery inventory, same SOURCE0/0/0: real checked
+  FIFO1/E1 false-zero RED->GREEN; original retries/delivery preserved. Borrowed
+  six recovery/two status/high-water/quarantine/aborted, typed outer error.
+  normal-c*.json:424 hashes/8 paths/416 unchanged,24 gates/60 repeats; C3007,
+  parent516/new501/C test693; no debt edit. Not matrix3/physical/P3 closure.
+- [x] Current first-path matrix3 applicable closure: real checked typed fatal
+  retains original Executor cursor/output/effect and stable C/FIFO across two
+  refused reentries. Test-only575; SOURCE0/0/0,24 gates/40 repeats,424 hashes.
+  No natural unknown callback/await identified in current recovery alphabet:
+  SOURCE N/A-now, not runtimePASS; future51B/P4–7 obligations are not waived.
+- [x] joint51I original sender descriptor backing: capacity4/1 RED->GREEN,
+  real bounded1/2/4/5 and wrapped move, actual old+new Layout, original empty/
+  nonempty Drop/refusal/retry, ACK retained capacity, no effect-hook conflation.
+  tcp.rs1995/no ratchet edit; SOURCE0/0/0,34 gates/40 repeats,426 hashes/8paths.
+  Only this descriptor transaction, not receive/maps/Target/aggregate P1.
+- [x] 51J preparatory preview_receive pure Move:195 exact lines into existing
+  receiver, tcp1995->1800/receive603, sole Integrator debt updated. Same SOURCE
+  0/0/0;426 hashes/3changed/423unchanged, three inverse proofs,20 gates+strict7.
+  No new tree or Session Offer behavior; receiver-move{,-gates}.json.
+- [x] 51J complete receiver/Session Offer local closure, same Heisenberg
+  SOURCE0/0/0.430 hashes/12 paths/418 unchanged;31 gates+40 module repeats
+  (220 test executions) rerun after the sole extend-to-push review repair;
+  `/tmp/mini-vpn-p3-receive.T55xyv/closure-*.json` and review.json own evidence.
+  Nodes/Offer/partial accept/both OPEN/input Drop/global priorities covered;
+  no aggregate peak or whole-root closure. tcp1770/Session5585 ratchets exact.
+- [x] 51K preparatory Session lifecycle pure Move, SOURCE0/0/0;432 hashes,
+  six body hashes/both parent inverses exact;12 gates, Session5585->5380.
+- [x] 51K complete Session node/terminal lifecycle local closure:434 hashes/9paths,
+  31 gates/40 repeats/160 executions green; same Heisenberg SOURCE0/0/0 Approve.
+  Session5364 ratchet; source.json and gates/repeats own exact evidence.
+- [x] 51L M1 seven original DATA/receipt tests pure Move:435 hashes/3paths,
+  17 green commands, same Heisenberg SOURCE0/0/0. New private test493.
+- [x] 51L M2 complete original receipt/inventory/replay-release implementation
+  Moves:436 hashes/6paths/430 unchanged;21 green commands after equivalent
+  visibility repair, same Heisenberg SOURCE0/0/0. Supervisor4849/TCP2766 ratchets.
+- [x] 51L M3 original Supervisor node/candidate-scratch transaction:439 hashes/
+  11paths/428 unchanged,21 final gates/40 repeats/240 executions; same final
+  Heisenberg SOURCE0/0/0. Supervisor4834 ratchet; actual original DATA refusal,
+  prefix/permits/terminal/expiry/reuse and native node identities covered locally.
+  behavior-*.json owns evidence; no Bound/whole-root/P3 closure inferred.
+- [x] 51M actual Target retained-backing characterization: one real test,
+  19 command records, same Heisenberg SOURCE0/0/0. No production behavior fix.
+- [x] 51M complete seven-method Target inherent impl pure Move:208 lines
+  byte-exact, both whole-file inverses; parent1289/child918/test58. Same
+  SOURCE0/0/0;16 post-Move gates and20 exact repeats green,440 hashes.
+- [x] 51M original Target return-publication transaction: real wake cold0-vs8
+  RED->GREEN; concrete pending output, exact Reserve retry, partial/full
+  terminal/expiry and actual B-writer rearm. Same Heisenberg SOURCE0/0/0;
+  440 hashes/five paths/435 unchanged,20 gates/120 repeated test executions.
+  output-*.json owns evidence. Not full Target backing/aggregate/P3 closure.
+- [x] 51M original write/feed/directive Copy-buffer preparation: four real
+  tests, including feed input Drop summed4/stored0 RED->GREEN; SOURCE0/0/0.
+  440 hashes/three paths/437 unchanged,20 gates/200 repeated executions.
+  buffer-*.json owns evidence; wrapped order, clamp, Reserve and reuse tested.
+  Actual whole-Target backing/map/address peak remains mandatory.
+- [x] 51M original Target address preparation/transfer: same Heisenberg0/0/0;
+  441 hashes/three paths/438 unchanged,20 gates/60 repeated executions.
+  address-*.json owns Reserve/caller identity/retry/join/raw semantics evidence.
+  Native-node closure follows below; address/retained aggregate peak remains.
+- [x] 51M complete737-line TargetIo pure Move: memory_io372/flow_io745;
+  whole-parent inverse/body hash exact,442 hashes/two paths/440 unchanged.
+  Same Heisenberg SOURCE0/0/0;20 gates/460 repeated executions green.
+  node-move-*.json owns that behavior-preserving boundary.
+- [x] 51M original native Target node transactions: same Heisenberg0/0/0;
+  443 hashes/seven paths/436 unchanged;20 final gates/160 repeated executions.
+  Eight tests include same-Box join/retire, refusal, actual Waker interruption
+  and8192-node release on128KiB stack. native-*.json owns evidence; no ratchet.
+- [x] 51M Target requested-backing peak: same Heisenberg0/0/0;444 hashes,
+  six paths/438 unchanged. Two runtime RED->GREEN and five new tests;
+  20 final gates/720 repeated test executions green. peak-*.json owns evidence.
+  Original address overlap is checked before node allocation; readiness exact
+  backing and cold independent capacity sums are covered. Not RSS or Root peak.
+- [x] 51N complete progress Implementation Move:442 original lines,
+  parent2789/child453/Integrator ratchet2789; body/parent/governance inverse exact.
+  Same SOURCE0/0/0;445 hashes/three paths/442 unchanged,20 gates/680 repeats green.
+  move-*.json in /tmp/mini-vpn-p3-progress.nYWfZO/ owns evidence; storage unchanged.
+- [x] 51N complete capacity/Legacy cold-construction pure Moves: reverse2770/
+  progress472/C2956/construction207; Integrator-only exact two ratchets.
+  Same final SOURCE0/0/0;445 hashes/five paths/440 unchanged,20 gates/
+  40 repeats/2020 executions green. construction-move-*.json owns evidence.
+  Preparatory only; subsequent arena behavior closure is recorded below.
+- [x] 51N original progress cold arena: final same Heisenberg SOURCE0/0/0,
+  448 hashes/12 paths/436 unchanged;20 post-repair gates/2180 repeated executions.
+  Real checked BoundInactive Replay/RESET/output/timer retirement; seven native
+  tests preserve ordering/capacity/error/scan/corruption and actual header+Slot
+  Layout. Review P1 combined header omission repaired before final acceptance.
+  reverse2768/progress877/C2956; tests2393/native320/Cchild179; Integrator-only
+  two exact ratchets. arena-repair-*.json and arena-review.json own final proof.
+  No Active selected-read, naturally reachable C Layout failure or Root peak claim.
+- [x] 51O real Root cold aggregate before the first reserve, final same
+  Heisenberg SOURCE0/0/0;449 hashes/six paths/443 unchanged. Concrete generic
+  header/resident/Ready/Arc/OwnedNotified composition; exact array backing and
+  single pushes. Safe actual Layout/injected Reserve/full-plan/same-root start
+  plus three native tests.22 gates/40 repeats/1080 executions, no warning delta.
+  Root construction300/Ready1167/process_plan494/new leaf109; governance unchanged.
+  /tmp/mini-vpn-p3-root-peak.iroUDm/{source,sequence,gates,repeats,review}.json.
+  Empty cold phase only: C/physical/admitted/growth aggregate remains mandatory.
+- [ ] Complete matrix4: actual Layout/cold peak/call charges/capacity/topology
+  and independent combined consumer closure.
+  Receiver51J/Session51K/Supervisor51L and Target51M local closures are above.
+  Target requested-backing peak and original progress ordered storage are accepted;
+  Root cold first phase is also accepted. Whole-scope review retains aggregateP1;
+  source-pinned original-owner bounds need lifetime/overlap/release proofs.
+  Temporary offline channel diagnostics: normal debug/release8/8 each plus20
+  isolated defensive near-wrap observations, not natural lifetime/product bugs.
+  Diagnostic same SOURCE0/0/0 and actual-route producer map are closed:
+  checked Bound mailbox/TCP5/Actor3 serial, including privately held DELIVERED.
+  Next original serial-push lifetime/overlap/close/wrap proof; not a guessed
+  bound or concrete repair mandate. No Target port first, global queue rewrite or added
+  message-lifetime cap. Generic Target/original Executor maps, channel/task and
+  C/physical/runtime composition remain mandatory, with actual call charges/all51B.
+  Outer Peer OPEN input retry is not supplied by51K; retain full51B duties.
+  No scratch-only fix, sorted-Vec complexity
+  relaxation, guessed std-node Layout or new unsafe site. Existing aggregateP1
+  remains open; sender51I and receiver51J are accepted local components only.
+  User CONFIRMED
+  explicit original-owner capacity/reserve/growth; direction is no longer blocked.
+  SOURCE01a0ad58-2d62-7b31-80c4-b7701cdaa081 accepts original-owner controlled
+  contiguous Vec/VecDeque backing. First package: producer effects -> original
+  Supervisor journal -> Executor current/suffix -> raw output. Joint51D now
+  lists the exact requested packet; SOURCE01a0ad6e-ea3c-7270-8a07-0a0f2da40f62
+  approved its scope; the complete packet is now locally SOURCE-approved by the
+  same Heisenberg0/0/0. Original producer/journal/work/raw-output path, real
+  registered/catch-up refusal/retry, fault custody, both-mode regression/repeats
+  and exact shrink ratchets pass; progress.json owns411 hashes and actual gates.
+  User grants continuous P3 repairs without repeated in-scope permission pauses.
+  This does not close aggregate backing or remaining matrix3/4. Logical K/E,
+  raw E+1, retained backing and transfer scratch remain separate obligations.
+  Count moved backing once, simultaneous distinct backing separately, and no
+  duplicate inline-header charge. No acceptance duty is removed.
+- [ ] Complete all five later full-P3 packages in joint51B, not P4/P5/P6:
+  OPEN/static progress; concrete TCP/DNS; all scheduler/capacity;
+  Legless/full association; final lifecycle matrix/review.
+
+- [x] Authorized terminal-read prerequisite: original finish_target_flow and strict
+  Inactive/Active suspend_flow_reads; original service helper/validator unchanged.
+  Same Heisenberg SOURCE01a0a3ab-62be-74e0-a6ee-3eb7fa065a56:0/0/0 Approve.
+  /tmp/mini-vpn-terminal-consumer.gnAZqG/terminal-read-repair.json owns evidence.
+  Real RESET-wake clearing and exact B nonfinal ACK/actor cleanup1/1+10 repeats,
+  both-mode related tests/provenance/growth/scoped checks pass. No inventory edit.
+  At that preceding checkpoint the consumer still timed out. Retain
+  post-suspension late-wake runtime evidence as a full-consumer obligation.
+
+- [x] C normal returned-page journal and narrow Knife count repair accepted:
+  `/tmp/mini-vpn-terminal-c-journal.aT5m5e/accepted.json`, same SOURCE0/0/0.
+- [x] Real nonempty ACK interruption test accepted, same SOURCE0/0/0:
+  `/tmp/mini-vpn-terminal-frame-journal.V8Ix9v/accepted.json`.
+- [x] Real Bound Target-error source characterized, same SOURCE0/0/0:
+  `/tmp/mini-vpn-terminal-error-source.HR1f5q/accepted.json`.
+  Only leaf789 changes; exact/repeats and both-mode related/provenance/growth/
+  scoped checks pass. Known error is returned, not journal-held through unwind.
+- [x] Obtain and implement narrow Knife one-function inventory authority: add only
+  retained_target_errors to expected_inventory_fields, same-function whitespace
+  for net-zero; preserve all existing AST/count/field checks. No scanner,
+  threshold, governance or other-function edit. Prior count-only grant is settled.
+- [x] C returned-error+bundle owning journal and actual error-owner inventory:
+  `/tmp/mini-vpn-terminal-error-custody.fALxW9/accepted.json`, same SOURCE0/0/0.
+  Real unwind RED->GREEN and known-error cleanup; four files3268/688/786/2624,
+  both-mode related/provenance/growth/scoped checks green. Not nested payload,
+  recovery interruption or direct TargetAndProgress coverage at that checkpoint;
+  the latter now has the separate injection evidence recorded above.
+- [x] Supervisor committed receipt journal: same SOURCE0/0/0, original Vec/
+  current/observations retained through real Bound RESET interruption;
+  `/tmp/mini-vpn-supervisor-receipt.g2BFGs/accepted.json`, three paths5439/192/794.
+  Runtime RED->GREEN/ten repeats and both-mode scoped gates green.
+- [x] Real filtered-ACK suffix and actual permit-wake interruption evidence:
+  /tmp/mini-vpn-receipt-suffix.5optQG/accepted.json, same SOURCE0/0/0.
+  Two direct-GREEN Unbound tests, ten repeats each; original Target retained,
+  actual four permits0 and poisoned reentry. No new production behavior.
+- [x] Authorized TCP borrowed bind and complete Supervisor DATA/caller-fact journal:
+  same SOURCE01a0a329-6b89-71b2-bbfb-6f72b6f368fb,0/0/0/local9/10;
+  `/tmp/mini-vpn-owner-data-journal.Rb7JPH/accepted.json`.
+  Five paths2828/5439/422/217/669,388 unchanged. Actual DATA RED->GREEN,
+  original-receipt rejection and real SinkAccepted custody; both-mode scoped
+  regressions/growth/provenance/checks green. No second K backing or old API change.
+- [ ] Mandatory first-complete-path real C action/Z/Sleep/expiry/Target/
+  indexed Completion/C ACK-FIFO/successor, following the now-reviewed original
+  Supervisor/Executor owning journal prerequisites. Existing revision2
+  scope remains granted, no repeated borrowed-bind authority request.
+  Preserve pressure/cancellation/error/cost and actual physical inventory duties.
+  Component approvals do not establish Bound Root or full P3 acceptance.
+  - [x] Falsify original Executor custody with actual MemoryTarget RESET/Read-Waker
+    interruption: runtime RED guard0-vs-1, test leaf318 only;392 unchanged.
+    `/tmp/mini-vpn-executor-journal.L4vAOl/checkpoint.json` records pre-repair RED.
+  - [x] Pure Move the four complete original callers into existing observed_turn:
+    parent8518/child1077, exact ratchet; same SOURCE0/0/0. Current checkpoint
+    `/tmp/mini-vpn-executor-callers-move.lUd8El/accepted.json`.
+    Old153 tests green, same new RED retained; this does not close behavior.
+  - [x] Original Executor entered journal locally accepted, same SOURCE
+    01a0a36a-82c8-78d3-811e-c1268afdc0ee,0/0/0/local9/10:
+    `/tmp/mini-vpn-executor-full-journal.jttB1H/accepted.json`.
+    Inline current/original suffix/facts/outcome/Releasing/recovery; no extra
+    queue backing. Real RESET RED->GREEN and two callback cases each10 repeats;
+    full Target156 both modes without skips plus scoped related gates pass.
+    Nine Rust paths/384 unchanged, parent8515/exact ratchet; no new paths.
+    Three exact old-test migrations retain original identities and counts.
+
+JoinReady is now locally accepted: same Heisenberg SOURCE0/0/0, exact1/1 plus
+ten repeats, OwnerTarget148/CurrentOnly8 both modes and scoped broad/growth/
+provenance/check gates green. Prior JoinReady388 hashes and exact evidence:
+`/tmp/mini-vpn-p3-join-readiness.ZFRrST/accepted.json`.
+Original terminal retains first operational/typed readiness cause and refuses
+repoll/join/release. Runtime custody proof and SOURCE exact-cause proof differ.
+
+TerminalGrace revision2's full-token borrowing Interface P1 is now locally
+closed after explicit authority: same SOURCE01a09f27-d218-7f62-b306-303226a7def1
+and header supplement0/0/0. Real Executor original-fact/delayed-output pairing
+RED->GREEN1; both-mode OwnerTarget148/Controller52/Supervisor48/Client37 and
+scoped shared/provenance/growth/check gates pass. Four files5439/167/8841/406,
+389 unchanged; current393 checkpoint:
+`/tmp/mini-vpn-terminal-fact.gB8Hna/accepted.json`.
+Consuming transfer, original-time/window, journals and complete consumer remain.
+The real BoundInactive deferred-birth characterization is SOURCE-approved0/0/0;
+Controller45 both modes/provenance/growth/check gates pass, not timer acceptance.
+Preceding independent prerequisite is same-clock checked deadline preflight:
+SOURCE0/0/0, six tests and Controller51/clock2/CurrentOnly8 both modes green;
+clock100/test282 only. Preceding393-path checkpoint:
+`/tmp/mini-vpn-terminal-deadline.G56H7j/accepted.json`.
+It has no production C caller and does not discharge the owning consumer.
+All four pure Moves are SOURCE-approved0/0/0 (5439/169,8841/754,3268/280,
+990/698; exact ratchets and output entry removed), with actual related/
+provenance/growth/check gates green. Current392-path evidence:
+`/tmp/mini-vpn-terminal-grace-output-move.YMWwGL/accepted.json`.
+No preparatory Move remains. Borrowed-full-token seam is accepted; implement the complete
+normal consumer, then actual physical Completion/C-output. Unbound expiry auto-retry
+invalidates the old prebind-Z-release shortcut. No mask-only/count-only substitute.
+Inactive owning, Returned/Failed and physical Retirement normal path remain
+accepted components, not complete selected service or full P3/Case C/R7.
+
+- [x] Retain actual terminal/source through Target join/late DATA and exact Z
+  expiry; preserve original cold Open/resume and Unbound finish/join evidence.
+- [x] Preserve actual Driver rejection charge through original retry1->1->0.
+- [x] Verify repeated actual Z rejection, cold Open charge isolation, private
+  unchanged cold_open Move and independent real EOF/CLOSE disposition.
+- [x] Authorize tcp.rs counted-ownership and poison errors, TCP private refusal
+  leaf/route, and private bound_failure route using unchanged FailOnceTarget.
+- [x] Execute ordinary revoke RED->GREEN and close poison review P1 with real
+  poison RED->GREEN, exact reservation/completion/action/identity/isolation tests,
+  broad gates and same Heisenberg0/0/0 SOURCE approval. Legacy helper unchanged.
+- [x] Retain actual Failed work/cause through staging, Driver rejection and
+  reduction until real FlowFinished; unchanged FailOnceTarget route now used.
+- [x] Prove read-reservation release and RESET-staging progress-wake custody.
+- [x] Close one-step early peer RESET sink-release P1: original Offer/backing
+  and Target remain until actual terminal-first finish; same Reviewer0/0/0.
+- [x] Prove actual cold/local Failure Driver-charge isolation through real
+  Unbound failure/Z retry and independent Bound DATA; same Reviewer0/0/0.
+- [x] Obtain exact private bound_failure/sink.rs test-path grant and complete
+  pure Move before behavior: parent679/child128, exact122-line body/inverse,
+  same Reviewer0/0/0, both-mode focused/full and provenance/governance green.
+- [x] Complete incoming independent Write|HalfClose single-slot representation
+  and known-Failed DATA/CLOSE admission via two real RED/GREEN tracers; same
+  Reviewer0/0/0. This does not close every sink lifecycle/pressure branch.
+- [x] Prove Owner terminal-revocation progress-wake custody with real queued
+  FlowFinished and a fresh waiter; direct GREEN, same Heisenberg0/0/0. Original
+  terminal/sink/Target/source/charge remain; recovery is not proved by retention.
+- [x] Record real selected EOFs independently in original TerminalFlowSettlement;
+  runtime RED->GREEN, real late-wake/reselection, same Reviewer0/0/0. EOF does
+  not change transit/read credit or release Source/F/publishers.
+- [x] Publish both original Driver tickets after successful terminal close;
+  real parked Ordered selector RED->GREEN and exact EOF without a manual wake.
+  Same Reviewer0/0/0; original BoundInactive due semantics remain intact.
+- [x] Prove independent idle-Control first-wake causality: second fresh fixture
+  row has no local RESET/read/receipt; Control-only mutation fails exactly in
+  that row, original production SHA restored, same Reviewer0/0/0.
+- [x] Preserve real cold-Retiring terminal proof at original Flow before Target
+  work; actual Z2/Target tombstone1 installation RED->GREEN, ten repeats,
+  Unbound-compatible admission and same Heisenberg SOURCE0/0/0.
+- [ ] Complete actual selected Retiring service, completion/terminal disposition/
+  join/retry and F/publisher retirement using that original Cold proof.
+  Initial real revoke, full normal Source/F release, owning cold Open retry
+  and one-vacancy/two-EOF-waiter tests pass, but do not close this checkbox.
+  - [x] Authorize private bound_failure/completion.rs plus parent route and
+    existing provenance; no fixture/helper/visibility or inventory expansion.
+  - [x] Move145 original lines preserving the two known REDs, then migrate
+    both real selected calls with unchanged assertions. Parent653/child244;
+    both-mode14/14, exact repeats10 each, same Reviewer0/0/0 including format.
+  - [x] Grant private flow_lifecycle/completion.rs, parent route/whole70-line
+    test Move and existing provenance route/one-symbol lock; parent791->721.
+    Also permit child-local pre-bind population via unchanged lifecycle_executor
+    at original F4/Target4 for three real expiry/refill/selected-rejection cycles.
+    No post-bind dynamic OPEN, shared fixture/config change or fake F/wake.
+  - [x] Execute preserved-RED Move and three actual selected pressure rejections,
+    final once-only success, regression gates and same independent review.
+    Parent721/child268/provenance670; exact10 repeats, OwnerTarget145 both modes,
+    repository19/Knife162, both growth7, scoped fmt/whitespace; same0/0/0.
+  - [x] Close terminal-held Driver Returned charge and explicit Failed work
+    release: actual Reduced/Returned/late-receipt rows; exact cause retained
+    under Releasing/Released; Source/F reclaim separately. Same Reviewer0/0/0.
+    Legal work has no user callback. Guard source proof is not runtime panic
+    evidence; introducing callback-bearing work reopens this specific audit.
+  - [x] Retain exact Join readiness failure cause on the original terminal.
+    Both operational/typed faults use the granted Adapter at actual selected
+    Join, same valid publication retries reject without repoll/join. SOURCE
+    verifies private cause ownership; same Heisenberg0/0/0 and full scoped gates.
+  - [x] Preserve lawful BoundInactive owning requests without weakening the
+    strictly active selected-receipt validator.
+    Granted pure Move accepted1095/395/provenance773 with original17/18 RED.
+    Repair now515/private test555/provenance792; original RED->GREEN, plus
+    real inactive Root-index contradiction RED->GREEN and seven private tests.
+    Both-mode OwnerReady25/25, Target145/145, ten serial25/25 and scoped gates
+    pass; same Heisenberg behavior SOURCE0/0/0 Approve. No new scope grant needed.
+  - [ ] Enable completed Completion/Retirement in the original legal physical
+    source-service plan and prove actual C/output selection, without changing
+    pending-lifecycle/Page/continuation guards.
+    - [x] Retirement normal path: actual cold terminal/backlog/expiry, unchanged
+      checked C/CurrentOnly/adopt/start, real Root RED0vs1->GREEN1; sole actual
+      RetirementReleased result and park. Same Reviewer0/0/0, no shared fixture
+      changes/getter or postbind lifecycle claim; continuation1254/test600.
+    - [ ] Completion: independent actual C/output evidence; not enabled or
+      discharged by the Retirement tracer. Keep original lifecycle gate.
+      Blocker: no lawful Bound Z-release entry. Explicit TerminalGrace-only
+      scope must first connect real deadline->expiry->indexed completion->ACK
+      and successor terminal custody; concrete paths/symbols require freeze.
+  - [ ] After production repairs, run full regressions/provenance/growth/fmt/
+    check and same Reviewer. The received_reset pressure test itself is now
+    closed above; its old144/145 stop is historical, not the current test state.
+- [x] Grant and close private retirement Moves: completion971/child510,
+  bound700/child108, original495/100-line blocks inversely exact, existing
+  provenance618. Same Heisenberg0/0/0; full gates green, no ratchet.
+- [ ] Freeze and implement real C/root lifecycle installer/clock/deadline/due
+  consumer. TerminalGrace complete normal consumption is explicitly granted;
+  concrete owner/capacity/disposition/write freeze precedes Rust. Mandatory P3;
+  no settlement-only goal is selected and other P3 lifecycle duties remain.
+  - [x] Real checked BoundInactive terminal-before-deferred-output characterization;
+    same Reviewer0/0/0, original APIs and self-contained private fixture.
+  - [x] Independent mandatory prerequisite: one same-clock deadline preflight;
+    positive/exact interval, checked relative/native additions, no allocation.
+    SOURCE0/0/0 and six tests close primitive only; C wiring remains below.
+  - [x] Mandatory first-path prerequisite: authorize the two original wrappers'
+    borrowed complete TerminalGrace view; user "确定授权" received. Bundle
+    consumption alone cannot supply exact install/expiry identity.
+  - [x] Implement that borrowed full-token seam without changing scalar callers;
+    real original Executor bundle/delayed-output equality and same SOURCE0/0/0.
+  - [x] First C success-time component: immutable original window/full fact,
+    checked positive policy/exact returns and cold Z backing. Same SOURCE0/0/0;
+    real delayed-output/Missing continuation/policy tests and related gates.
+    Evidence: terminal-window.dMNA9p/accepted.json; not full consumer acceptance.
+  - [ ] Retain actual original observations through Supervisor/Executor/C
+    precommit/known-error/unknown journals. Complete Z/install/timer/expiry and
+    real Completion/C ACK-FIFO/successor, pressure/cancel/error tracers. The
+    accepted success-time component does not discharge these obligations.
+- [ ] Complete remaining joint51 A/B capacity/physical/credit/full review.
+
+Prior accepted Move evidence only (not current WIP gates): five Rust paths
+changed/new,383 final hashes. Parent9581 and
+governance752 unchanged. Main: moved exact+10 repeats,
+original Unbound1; Bound failure14/lifecycle10/OwnerTarget143 both modes;
+OwnerReady18/TCP74/Root24/continuation16/Bound1; Knife162/repository17,
+both governance7, fmt/diff/check and79untracked checks green. Existing warnings.
+No inventory edit, public cutover, P4-P7, commit/push or external.
+Component approval is not full P3 acceptance.
+
+## Authorized review repairs, public path first
+
+- [x] Implement and locally test fake-IP full-pool rejection and DNS SERVFAIL;
+  independent portion review P0/P1/P2 `0/0/0`.
+- [x] Implement fallible IPv4 UDP construction and exact bounded reassembly;
+  independent portion reviews P0/P1/P2 `0/0/0`.
+- [x] Close the non-suspending TUIC sender's P2 RESET-retirement capacity gap.
+  Capacity RED/GREEN, current UDP `22/22` and all planned lifecycle tracers have
+  passed. Isolated Quinn passed 49 unit and 1 doc test (4 ignored); the Writer
+  has frozen implementation; original Popper returned P0/P1/P2 `0/0/0`, Approve.
+- [x] Complete public gates and promote the combined public result. Both
+  governance routes, provenance, selected public tests, format/diff and final
+  all-feature library check pass. Four exact shrink entries are promoted at
+  `16561/7991/14230/5390`; final source fingerprints and stop history are retained.
+- [x] Independently accept the narrow client-root scan/stall-decision design.
+- [ ] Implement complete driver coverage before root park.
+- [ ] Implement retained eligible stall-decision coalescing after late ACK.
+  Both root Rust repairs remain explicitly frozen; neither has started. P2T
+  now continues with the coordinating task after completed public closure.
+
+Exact evidence: `docs/tech/2026-09-05-public-path-capacity-repair-local-results.md`.
+
+## Knife16 execution map
+
+- [x] Task 1: freeze Knife15 and the protocol vocabulary.
+- [x] Task 2: resumable protocol model and checked capacity characterization.
+- [x] Task 3: deep `OwnedUpstream` seam locally accepted while the public entry
+  deliberately remains legacy.
+- [ ] Task 4: deterministic two-leg transport harness and replacement transaction.
+  - [x] R1-R5 local protocol, ownership, scheduling, and baseline slices.
+  - [x] R6a-d local two-leg lifecycle, late-record, recovery-capacity, and
+    production-root prerequisites.
+  - [x] R7 prerequisite: actor-captured same-clock inbound arrival timestamp
+    carried through queue/publication and used for deadline evidence.
+  - [x] R7 local policy kernel: bounded owner progress/hint retry, client
+    rejection/sequence handling, and one epoch/nonce for all trigger orderings.
+    This is typed value-level evidence, not physical production composition.
+  - [x] R7 test-only physical Move/exact cleanup: private B-only adapter, exact
+    scalar-equal/pressure settlement, and focused/governance/provenance review.
+  - [x] R7 architecture-only convergence: close initial review Request Changes
+    P0/P1/P2 `0/5/1` and closure re-review Approve `0/0/0` over the failure tree,
+    two endpoint ledgers plus harness aggregate, `OwnerPhysicalSessionRoot<T>`,
+    no-ACK terminal transaction, capacity/restart correction, Writer ownership,
+    and stop rules.
+  - [x] Correct the static necessary-only owner scan manifest from `2 * F` to
+    checked `2 * (F + Z)` through typed `OwnerProgressCapacity`; characterize
+    checked completed-scan plus revision-reset scenario width and every
+    addition/multiplication/maximum/zero-scan boundary.
+  - [x] Lock the nested private capacity/progress-scan Module route with the
+    shared code-aware repository provenance scanner.
+  - [ ] Add the later root-owned live revision-reset credit transaction:
+    reserve before mutation, return on rejection/no revision change, and commit
+    only after a successful revision advance. Install it only after one
+    physical root owns both controller progress and `OwnerSwitchHintIssuer`;
+    CurrentOnly must represent the absence as `NotInstalled`, never scalar zero.
+  - [x] In a separate controller/output slice, reject a retained correlated
+    `progress_entries` value as exact zero, with exact raw-peer terminal/FIFO
+    fixture settlement and independent review.
+  - [x] Behavior-preservingly extract the hard-terminal Implementation from the
+    shrink-only `continuation.rs` under the 2026-09-02 narrow architecture
+    amendment; change production state/order only in a later green-to-green
+    slice. Exact A-D evidence is owned by
+    `docs/tech/2026-09-02-knife16-r7-hard-terminal-extraction-local-results.md`.
+    - [x] Freeze the parent-Interface/child-Implementation amendment and close
+      the same independent Reviewer at P0/P1/P2 `0/0/0`.
+    - [x] Move the existing Knife16 continuation provenance test unchanged into
+      one private child and promote the smaller exact parent ratchet.
+    - [x] Add the code-aware private/unconditional/default-path production-child
+      route and symbol-ownership RED.
+    - [x] Purely move the private state machine, correlation/quarantine, guard,
+      terminal method bodies, transaction implementation, and `Drop`, while
+      stable terminal Interface and root storage/mixed inventory remain in the
+      parent.
+    - [x] Promote the `continuation.rs` shrink from `1698` to `971` only after focused,
+      regression, provenance, governance, format/diff/check, and independent
+      review are green.
+    - [x] Preserve production terminal behavior as a separately gated later
+      slice; extraction itself proves neither exact zero nor reachability.
+  - [x] Close the post-extraction owner-root ordering amendment:
+    `CurrentOnly root Authority -> production terminal preservation ->
+    root-owned no-ACK finalizer`.
+    - [x] Repair the constructor commit edge, add the dated A-D evidence owner,
+      and name the complete missing root-plus-constructor RED seam.
+    - [x] Obtain independent architecture closure: the same Reviewer returned
+      P0/P1/P2 `0/0/0`, Approve, with Clean Architecture and System Design
+      `10/10`.
+  - [x] Confirm by symbol-first audit that the existing initial-A seam can build
+    the settled seed without a preparatory fixture/Authority Move.
+  - [x] Execute the first constructor tracer through its expected `E0433` RED,
+    focused `1/1` GREEN, and ten serial `1/1` repeats. The resulting
+    join-custody P1 was an intermediate review stop; the later direct-join
+    implementation result supersedes that prototype without erasing the
+    failure evidence.
+  - [ ] Close the complete CurrentOnly actor-resident lifecycle, including the
+    still-open Case C parent-custody branch.
+    - [x] Freeze the A/B/C distinction and unique `JoinCustody` contract at the
+      `docs/tech/2026-09-03-knife16-r7-current-only-join-custody-amendment.md`
+      writer boundary.
+    - [x] Obtain independent architecture closure: the same Reviewer reported
+      no findings, P0/P1/P2 `0/0/0`, Approve, closed the prior phase-ownership
+      P1, and scored Clean Architecture/System Design `10/10`. This does not
+      authorize Rust repair.
+    - [x] Freeze the direct-join superseding architecture that keeps the exact
+      actor in CurrentOnly and removes the extra spawn/JoinHandle transfer.
+    - [x] Obtain independent direct-join architecture closure: the sole exact
+      error P1 is closed; final review is P0/P1/P2 `0/0/0`, Approve, with Clean
+      Architecture/System Design `10/10`. This does not authorize Rust TDD.
+    - [x] Close living-root A/B through the two-file direct borrowed join:
+      observer cancellation resumes the same actor, and pre-await unwind permits
+      only same-actor roll-forward.
+    - [x] Retain the complete direct-join result root-first, keep the exact
+      modeled error in `Failed` for stable borrowed observations, run the
+      focused/repeat/regression/provenance/governance gates, and obtain
+      independent implementation closure at P0/P1/P2 `0/0/0`, Approve. Exact
+      evidence is in
+      `docs/tech/2026-09-03-knife16-r7-current-only-direct-join-local-results.md`.
+    - [ ] Before production exposure or caller cutover, implement the accepted
+      `OwnerServerRoot` parent so one owning slot accepts the entire CurrentOnly
+      root through a consuming move; a whole-root Drop test cannot close this
+      ultimate-destruction branch.
+      - [x] Select the Case C process-parent architecture, whole-root adoption,
+        bounded slot/capacity domains, and shutdown contract in
+        `docs/tech/2026-09-04-knife16-r7-case-c-owner-server-root-architecture.md`.
+      - [x] Close independent architecture review after the original five P1 and
+        two P2 findings: final P0/P1/P2 `0/0/0`, Approve, architecture-only
+        correctness `10/10`; implementation readiness remains `4/10`.
+      - [x] Freeze the exact Rust route/privacy, non-test production caller,
+        bootstrap-custody seam, allowed files/symbols, Writer ownership, line
+        counts, and TDD filters in a separately authorized plan-only gate.
+      - [x] Obtain independent implementation-plan closure after six P1 and one
+        P2 findings: final P0/P1/P2 `0/0/0`, Approve. This accepts the plan only
+        and authorizes no Rust.
+      - [x] Freeze and independently accept the P1 architecture-only Target-open
+        and ready-scheduler progress amendment with Rust zero. Heisenberg's
+        replacement independent closure is P0/P1/P2 `0/0/0`, Approve; the
+        2026-09-04 amendment owns exact evidence, not runtime acceptance.
+      - [x] Enter authorized P2T: freeze six blocks/routes/hashes and execute the
+        first pre-write governance check. It stopped `4/6` on independent
+        public-path shrink debt; the 2026-09-05 P2T entry owns exact evidence.
+      - [x] Close the independent public-path governance dependency through
+        its own Reviewer/Integrator, four exact shrinks and both `6/6` routes.
+      - [x] Revalidate P2T frozen source hashes, pass fresh governance `6/6`,
+        and run all six pre-Move exact baselines, each `1/1` green.
+      - [x] Complete and independently accept the four-file P2T pure Move,
+        immutable-block/new-identity checks, full gates and Integrator-only
+        shrink ratchets. Mencius was the sole Writer; same Heisenberg approved
+        P0/P1/P2 `0/0/0`, findings none.
+        Six formatted-tree exact tests, full provenance `159/159` and `13/13`,
+        fmt/diff/check and both governance `6/6` pass. Only the two expected
+        ratchets were lowered to `15818/2626`; new leaves are `480/374`.
+      - [x] Close final P2T status-review P2: user-confirmed single-sentence
+        correction precisely attributes Reviewer result/excerpt inspection.
+        Same Heisenberg approved `0/0/0` and allowed final handoff; no Rust or
+        tests changed or ran in that doc-only closure.
+      - [x] Authorize and freeze P2A parameter-object convergence under plan
+        Sections 6/12; autonomous in-scope red repair applies to this node only.
+      - [x] Complete P2A: preserve bootstrap input/cleanup identity and order,
+        pass the allowance tracer, stay within 7,001 lines, independently
+        ratchet 7→6 and review. Implementation/characterization are green at
+        7,001 lines; both governance routes 6/6, same Heisenberg final `0/0/0`,
+        Approve. The dated P2A result owns exact commands/hashes/evidence.
+      - [x] Authorize P2B's allowance-free bootstrap Move under Section 6.
+      - [x] Close its separately confirmed test Move/path repair: 614/205,
+        mapped expected RED, old-three GREEN, preparation gates and same
+        Heisenberg 0/0/0 Approve. This accepts no production Move.
+      - [x] Complete P2B implementation: production Move is 6769/243; source and real bootstrap
+        gates/repeats GREEN. Confirmed factory source repair stays 2626; full
+        Knife16 162/162, repository 13/13 and fmt/diff/check pass. Expected
+        actor-only shrink is independently ratcheted; both governance routes
+        pass 6/6. Same Heisenberg full review 0/0/0 Approve, no necessary
+        optimization finding. P2T/P2A/P2B are now committed in `532d766`, after
+        independently reviewed public prerequisite `5fca1ed`; no push occurred.
+      - [x] Authorize complete P3 with autonomous causal in-scope repair;
+        preserve architecture/growth/review gates and first-packet scope freeze.
+      - [ ] Complete P3 root command custody, ready/fair scheduler and concrete
+        split-phase TCP/DNS Target, not merely its first foothold. The initial
+        command route, mailbox notification/prefetch, Control rearm,
+        preparatory Moves and real Owner source characterization are accepted.
+        Source placement and conditional Owner-local credit protocol passed
+        independent0/0/0, including compact-doc closure. Target readiness
+        protocol review found only a P2 source anchor, now repaired; final
+        document/build-prerequisite closure passed0/0/0. Real registration, complete release-entry/
+        guard coverage, cold pairing, generation/backing and per-Flow/K/Layout
+        bounds still block binding implementation. See the 2026-09-07
+        source-service decision, owner-credit and target-readiness contracts.
+        The separate pure Target Implementation Move has green gates at1445/582,
+        with production debt removed; same-Reviewer closure passed0/0/0. It does
+        not implement readiness. Complete test Adapter Move has green focused/
+        scoped regressions at10206/726/133; exact ratchet, both governance,
+        provenance and all-feature check pass. Same-Reviewer final closure
+        passed0/0/0 Approve; target-adapter-move-plan owns this accepted scope.
+        Actual binding preflight passed review0/0/0 (binding-preflight.md): the
+        cross-generation backing/pressure/safe-drop-wake lifecycle must close with the
+        cold callers, guard and K/Layout. No Rust scope or binding acceptance;
+        the full coupled freeze remains open, not an implemented route.
+        The controlled-wake-contract.md passed conditional closure0/0/0:
+        standard Wake/inert Drop, finite Driver defer exclusion, same-turn
+        unlocked finalization and single-waiter notifier fault ordering.
+        Actual holder/cold/guard/K/Layout/symbol freeze remains open; no Rust
+        grant or full-P3 completion follows from protocol acceptance.
+        Construction/feedback direction passed0/0/0 (binding-construction-phase-
+        decision.md): same cold ready domain before Controller; preserve live/
+        recovery inputs; do not wait for RESET under its own input exclusion.
+        Only direction/document evidence is accepted. The follow-up Flow
+        completion protocol passed0/0/0 (flow-completion-contract.md), after
+        repairing source/Target absence handling for valid cold Open failure.
+        Late commands need actual terminal disposition and real transit/drain
+        closure. Closed carrier/owning-turn selection subsequently passed
+        same-Reviewer0/0/0 (binding-turn-contract.md): actual Driver pairing/
+        full LocalFlow, three existing-root turn modes and thirteen categories.
+        This is selection/protocol only. Joint same-domain placement/cold
+        returns, guard/real ports/expiry, work and physical Layout remain open.
+        The single binding-joint-contract.md records expiry/guard and OPEN
+        resident/admission-order choices reviewed0/0/0, not whole joint
+        acceptance. One model classification precedes new F/O reservation;
+        duplicates need neither. Metadata/test locality selection passed0/0/0:
+        inward metadata/geometry, outer policy and12 Root tests, nine private
+        metadata recipes. Finite test-operation/short-borrow/Wake lifetimes also
+        passed0/0/0; exact Rust signatures are not compiled. ReadyGeometry value
+        Interface and18-call/return facts also passed0/0/0. Closed Owner source
+        correlation selection now passed0/0/0; origin and actual admission gate
+        differ from SessionId/capacity. Cold-slot protocol also passed0/0/0
+        after explicit AssociatedPreparing and active/startup holder repairs;
+        Idle/Pending retains its cell lease, not a second runtime claim.
+        Constructor ownership-form selection passed0/0/0 after uncancellable
+        Cold P1 and falsifier P2 repairs: actual Root/build-failure custody,
+        no self-borrow, P4 table or false Free. Pair/route selection passed
+        0/0/0: checked inbox/Bound commands, consuming install, explicit nested
+        Drop and indirect legacy RESET isolation; no shutdown or Rust claim.
+        Initial-work/lane-poll protocol passed0/0/0: internal publication,
+        live-source import probes and registration-or-real-publication; Due is
+        not readiness/count. Actual shared owning operation/guarded consumer,
+        global activation, complete Move Interfaces and build/confinement/exit
+        proof remain open; fixture assembly cannot implement scheduler service.
+        Real-port hypotheses subsequently failed review0/2/0: universal Running
+        and Applied/Fatal predicate/rebuild shortcuts. Joint41–42's selected
+        first output adoption uses the actual post-join whole Parts, not an
+        old Fatal root. Written entry/retention review0/0/0 (9/9/8/8).
+        Joint43–44 selects semantic S/checked G/D, A<=D eligibility and Installed
+        commit; written closure0/0/0 after request/status P2 repair. D does not bound
+        settlement/retention. Joint45–47 now selects whole-holder initial A /
+        nested original C+B migration and normal no-ACK→real reporter→FIFO/
+        slot/stamp→direct join ordering; written closure0/0/0 after one P2.
+        Joint48–50 accepts the preparatory placement plan:15 complete impls
+        below retained initial declarations, then initial under owner; two source
+        routes, six effective scopes and one owner route exception are explicit.
+        Written review0/0/0 (9/9/8/8); no Rust grant. Joint51 now consolidates
+        the next order: Active real source→paired inbox→observed reduction→
+        physical output, after its concrete binding/readiness/Layout/lifecycle
+        and scope gate. Full P3 later OPEN/TCP/DNS/all-class/expiry/B obligations
+        stay unchecked; P4+ is separate. Scope review0/0/0; no documentary GREEN
+        counts as runtime. Subsequent user confirmation permits early P3
+        whole-CurrentOnly residency/opaque shared service, not P4–P6. The real
+        pre-opened fixture is implemented and reviewed0/0/0:744/219 test lines,
+        6/6 plus10/10 repeats, provenance162/13, both governance6/6 and
+        fmt/diff/all-feature check green. The next six-file production pure
+        Move is also accepted0/0/0: construction parent/child3565/71 and
+        completion parent/child10061/164, exact inverse bodies and ratchets,
+        related159/159, Active repeats10/10, provenance162/13 and all gates.
+        This changes placement, not Bound behavior. Test-only Prototype owning
+        representation is selected; finite test operations and the concrete
+        A1–A4 shared implementation/bound-route RED/GREEN remain unchecked.
+        The private complete command-visit extraction is accepted0/0/0:
+        Root857, unchanged56/56 plus five10/10 repeats and all gates green.
+        It supplies the shared command operation, not inward placement/binding.
+        One concrete A1–A4 packet is now written at joint51's end. First review
+        0/3/0 required inactive activation, publication-failure/unwind and real
+        Actor output-pressure wake repairs. Second review0/1/0 closed the first
+        two; the outer-root exit repair now uses existing JoinSet completion
+        and original result custody. Final review0/0/0 approves the finite Rust
+        sequence; no implemented binding/test or full-P3 checkbox is promoted.
+        Four cold-construction Moves now have default/all-feature275/275,
+        exact integrated ratchets/all final gates and code review0/0/0 Approve.
+        Actor fixture cleanup is now accepted0/0/0 with all final gates; the
+        characterized Actor Move has since closed0/0/0 with all gates. Neither
+        prerequisite completes the actual Bound route.
+        Independently accepted: continuation16-test pure co-Move to
+        transactions.rs407, parent728→330, default/all-feature before/after16/16,
+        all final gates and same Reviewer0/0/0. Initial-acceptance is also
+        accepted0/0/0: parent603/child574, both-mode post52/52 and final gates;
+        actual source-guard domain preserved and old1168 entry removed.
+        Physical attach is also accepted0/0/0: parent668/scenarios747, nine
+        unchanged tests, both-mode post53/53 and final gates; old1407 removed.
+        All three test co-Moves close, not actor repair or binding completion.
+        Canonical geometry preparation also closes0/0/0: both-mode57/57,
+        57×10 repeats and final gates; no formula/error-order change. Separate
+        foreign Layout cold-return characterization is now user-authorized and
+        accepted0/0/0: two real rejection cases, original ten unchanged, leaf448,
+        both-mode Root59/59 plus59×10 and final gates. Limited scope/coverage P1
+        closes. Separate inner-check removal now closes0/0/0: scheduler690->688,
+        sole current caller's earlier checks/reserve dominate both deleted
+        checks; exact cold cases, plan12, Root59 both modes,59×10/final gates
+        pass. No other source changed; full A3 Layout remains open.
+        All9 metadata-private recipes and the separate outward12-scenario
+        Move close0/0/0. All49 original items, including12 tests and7 native
+        Wake/Drop bodies, remain exact; real scenarios now have outer FQs.
+        Route provenance exact RED->GREEN, outer12/12, both-mode Root59/59,
+        59×10, Knife162/repository14 and final gates pass; no production or
+        inventory change in that Move. Inner Layout removal and complete
+        metadata placement have since closed0/0/0: owner_ready735/Root846,
+        24 implementation items and six recipe files exact, seven old files
+        removed; all outer59 tests/FQs unchanged. New AST route RED->GREEN,
+        Root59 both modes/59×10, Knife162/repository15 and final gates pass.
+        The subsequent independent command-Move freeze returns0/2/0: close
+        actual admission/masks/quarantine and nominal/result placement, plus
+        original pre-operation Full Box capture, within the same A1–A4 packet.
+        Couple the complete command/35-test migration to real Current/Bound
+        GREEN; no temporary production Prototype or new sidecar. The resumed
+        goal's four Actor fixture repairs now close0/0/0: index15814/leaf136/
+        arrival513, original body inverses, repeats and all final gates pass.
+        That fixture packet left production unchanged. The subsequent pure
+        Actor Move is accepted0/0/0: parent6583, children88/122, provenance507,
+        both-mode24/24,80 repeats, Root59 both modes and all final gates.
+        Active owning-fixture extraction is now accepted0/0/0:754/244 lines,
+        both-mode CurrentOnly6/Root59, exact10 repeats and all final gates;
+        original resource lifetimes/assertions survive, production unchanged.
+        The user now authorized the same-packet Root bound_source test-route
+        addition and complete seven-method Target retirement Move. That Move
+        is now accepted0/0/0: parent9635/completion411/provenance591, exact
+        inverses, both-mode Target74/74x10 and final gates/ratchet pass.
+        The real Bound tracer and fixed Root test route are written.
+        Original constructor extraction passed Active1/1 and CurrentOnly6/6.
+        Cold custody and actual factory identity are source-reviewed0/0/0.
+        Complete command/35-test inward migration, fresh empty pair and generic
+        whole resident are written; same source Reviewer0/0/0, NOT Move GREEN.
+        Actual consuming checked installation and original five-input failure
+        return are now written with real backing/publishers/pair. Source review
+        0/4/1 is causally repaired and re-reviewed0/0/0, not runtime acceptance.
+        All18 checked callers retain their real domains and exact retry/cancel;
+        remaining13-source review0/0/0. Only10 authorized test files changed.
+        Metadata tests are unrun; exact Bound compile RED4 has only actual
+        path references, no signature/privacy error. No runtime GREEN claim.
+        Fmt/diff/standalone governance6/6 pass; Executor9635/C3536 unchanged.
+        The total owning constructor-quarantine exit, actual Root build caller
+        and consuming start are implemented. Inventory-classification repair
+        source-closes0/0/0. Five-source selection and22 exact test-line migrations
+        are source-reviewed0/0/0; sends stay two-lane. Runtime remains unrun.
+        Whole-current adoption/activation is written and source-reviewed0/0/0;
+        actual actor/FIFO/handoff/C/Flow identity precedes the final binding admit
+        and reserved whole-root placement. Active/ENABLED classification repair
+        source-closes0/0/0. Two new metadata tests remain unrun.
+        Actor Output port/registration/producer edges and exact nursery retention
+        are written in three existing files6583/130/223. Same compile4 and
+        fmt/diff/governance6/6; same Reviewer SOURCE0/0/0. Poison remains and
+        child/root errors reach the original nursery despite LocalShutdown's
+        suppressed void-call record. Actual caller and poison/close/pressure
+        lifecycle tracers remain required; no runtime acceptance follows.
+        Target's seven-file implementation has conditional SOURCE0/0/0;
+        new test unrun behind the same4 Bound compilation gaps. The user-authorized
+        governance predicate/regression fix is reviewed0/0/0 and standalone7/7;
+        governance752, all limits/inventories unchanged, authority blocker resolved.
+        Production-mode compilation exposed a test-only current_leg call;
+        source_factory176 now uses original phase/generation+full contract checks,
+        same-Reviewer SOURCE0/0/0. Non-test library retains2 physical service gaps.
+        Metadata publication admission/finish now SOURCE-reviewed0/0/0 in
+        ready1041/flow755/test-flow591; five new tracers remain unrun. Default/
+        all-feature lib and Cargo governance retain2 real physical gaps, lib-test4;
+        fmt/diff/standalone7/7. Actual Root must store Completed before Notify,
+        retain original ready.finish after later fault, and own quarantine before
+        closing an interrupted interval. Complete real Target/Actor selected
+        receipt/service/output and its runtime evidence. Selected inbox/TCP
+        primitives are SOURCE-reviewed0/0/0 (session938/driver167/new test470),
+        with three real-port tests written but unrun; fmt/diff/standalone7/7.
+        Owner-only DATA scope is authorized and implemented, SOURCE-reviewed0/0/0:
+        original staging/Replay/map custody, error/unwind poison and Client/legacy
+        preservation. Supervisor5597/child337/test207; Integrator ratchet5597,
+        Main standalone7/7. Three real-Owner tests remain unrun; initial Vec
+        capacity and complete Bound C/Root integration still need acceptance.
+        C selected receipt consumer is SOURCE0/0/0: Held-before-clock, original
+        observed reduction/ordinary admission and real Flow pressure retention;
+        active validation is distinct from cold binding. Executor9634/service367,
+        C3536/service140, flow830/continuation1037; standalone7/7, fmt/diff.
+        Selected actual Driver producer now SOURCE0/0/0: indexed original Flow,
+        checked transit/Held/full LocalFlow, separate pull/transfer and preserved
+        Full/observer; Retiring due stays retained but ineligible for ordinary
+        Driver. Ready1059/flow1028/test648, commands694/bound tests693/old leaf771.
+        Four added tests remain unrun behind old4; standalone7/7 and fmt/diff.
+        Implement C guarded source caller, real Target/category/read-RESET
+        cutover and physical/Root completion next; do not check P3.
+        Preserve
+        actual claim/completion on Current quarantine failure. Cold regression
+        remains mandatory once the crate compiles; do not substitute metadata
+        or source review for runtime acceptance. Command coupling and real
+        Bound service remain unchecked, without another design phase.
+        Exact field/
+        phase placement, producer closure and bounded decision/expiry work
+        remain before callable expiry; no P4 table or fake initial cold seed.
+        Pre-join and both general P1s remain open. Actor-input retry/eligibility,
+        then ports/consumer/masks/work/Layout remain open. Old model live-F rejection
+        is not converted to held retry. CurrentOnly service scope is now
+        authorized; binding/activation is written, not runtime accepted; P6 is not granted.
+        Lane receive, Phase A and conditional Phase B remain accepted. Persistent
+        capacity registration also passes: session896/progress480, test parent88/
+        leaf344; root35/35 over ten rounds and full regressions/gates green,
+        same Reviewer0/0/0 Approve. Root405, prior B leaf771, Driver148,
+        scheduler51/Control604/tcp2883/client wrapper/ratchet stay unchanged.
+        The pure SessionCommands Rename is implementation-accepted0/0/0;
+        four inverse hashes and the same full gates pass, no behavior/size change.
+        The process-only arithmetic prerequisite is now accepted0/0/0:
+        nine exact tests, root44/44 and full scoped gates; root504/test parent89/
+        new leaf115, existing bodies/other sources/governance unchanged.
+        The selected-send Extract Method is now accepted0/0/0: root508,
+        exact four-line inverse and full scoped gates; no ready behavior.
+        Actual-ready design's two P1s closed0/0/0. Its first real dispatch
+        tracer now passes exact+ten repeats and full scoped gates; root823,
+        scheduler598/route90/leaf261 are independently accepted0/0/0. This is not
+        full readiness/lifecycle/fairness acceptance. The later §7 claim/finish
+        root-fatal mapping repair is also accepted0/0/0: real second-session-
+        send RED, exact+ten repeats/root46/full scoped gates GREEN;
+        root825/leaf333, other Rust/governance unchanged. Publisher-fatal and
+        runtime finish-error retention remain separate obligations. The next
+        remaining-Full re-registration test is independently accepted0/0/0:
+        leaf528, root47 and exact+ten/full scoped gates, no production
+        change. Publisher-failure design and pure test Move are accepted0/0/0;
+        first actual revision-overflow RED→GREEN passes exact+ten/root48/full
+        scoped gates. Quarantine's check-before-lock review P1 is repaired with
+        repeated green gates; re-review0/0/0 Approve. Other fatal branches stay open.
+        The separate process-revision characterization is now directly GREEN:
+        leaf215, exact+ten/root49/full scoped gates; independent review0/0/0 Approve,
+        no production change. The separately approved test-only fixture extraction
+        is accepted0/0/0 at209 lines, both tests/root49/all scoped gates. Slot-poison
+        publication is directly GREEN at288 lines: exact+ten/root50/all scoped
+        gates, same Reviewer0/0/0 Approve. The original209-line fixture prefix
+        and other Rust remain exact. Source-unwind quarantine is directly GREEN
+        at446 lines: exact+ten/root51/all scoped gates, same Reviewer0/0/0 Approve. Its real
+        mailbox receipt is not duplicated by Unknown; original claim remains held.
+        Ordered first-cause retention is directly GREEN at575 lines: exact+ten/
+        root52/all scoped gates, same Reviewer0/0/0 Approve; this is not
+        concurrent-race proof. Admitted-work completion is directly GREEN at743:
+        exact+ten/root53/all scoped gates, same Reviewer0/0/0 Approve; actual finish accounting
+        is checked, not merely mailbox enqueue. No production change.
+        Notify-unwind is directly GREEN: actual Pending, fault/unlock before
+        callback panic, same-root re-entry and one prefetched receipt; exact+ten/
+        root54/all scoped gates pass. Parent745/new child175; same Reviewer0/0/0
+        Approve. Healthy source-unknown isolation now directly GREENs: gate Open,
+        only A quarantined, actual B send succeeds, A Unknown/real receipts retained.
+        Exact+ten/root55/all scoped gates pass; parent746/new child255, same Reviewer
+        0/0/0 Approve. Re-park/fatal is directly GREEN: real old-Waker Drop/dequeue
+        inside root poll produces Rescan, then sticky stop/exact B retention;
+        faulted park_epoch rejects without dirty-epoch mutation. Exact+ten/root56/
+        all scoped gates pass, parent747/new child217; same Reviewer0/0/0 Approve.
+        Independent final epoch/gate, first registration/full park/concurrency
+        remain open. Actual Executor source service is the selected next direction.
+        Preparatory read Move is accepted at parent10965/new164 with exact inverse,
+        all scoped gates and Integrator-only ratchet; same-Reviewer0/0/0 Approve.
+        Persistent association,
+        exclusive routing and the full two-lane ledger item remain open.
+        The 2026-09-07 P3 result owns the full acceptance
+        ledger; this parent stays unchecked.
+      - [ ] Implement and independently accept the production root, caller,
+        bounded pre-auth custody/table, TCP Target Adapter, and whole-root
+        settlement. UDP retains its separate architecture gate.
+  - [x] Construct `OwnerPhysicalSessionRoot<T>::CurrentOnly` by consuming exactly
+    one `QuinnOwnerInitialPhysicalRootSeed<T>`, exact-returning it before commit,
+    recording restart credit as `NotInstalled`, and owning structural current-A
+    living-root shutdown. This closes only the private necessary-only
+    constructor/A/B/error subgate; it does not close Case C, production cutover,
+    terminal/no-ACK settlement, or whole-root exact zero.
+  - [ ] Repair the independent actor fixture debt only in a later separate
+    behavior-preserving slice: move the exact ordered-delivery fixture to
+    `join_fifo_inventory.rs`, promote any shrink through the Integrator, and
+    settle the real `LocalCancelled` terminal plus FIFO ownership. Do not mix
+    its `ResidualOwnership { messages: 1, bytes: 0 }` with direct-join repair.
+  - [ ] Absorb and cut over the existing initial-A terminal/join/shutdown
+    Authority only after ultimate root destruction has a longer-lived unique
+    custodian; then connect the private non-copyable committed outcome to
+    production terminal preservation.
+  - [ ] Close hard, cancellation, and shutdown through one
+    CurrentOnly-root-owned no-ACK transaction, including actor joins and
+    controller/output high-water/stamp finalization before whole-root exact
+    zero; unknown unwind stays sticky nonzero or exact known inventory.
+  - [ ] Add authenticated B topology without ungating the test-only B adapter;
+    only after root ownership converges may runtime restart credit be installed.
+  - [ ] R7a: a reverse-only A DATA/ACK blackout may leave A's probe healthy;
+    without an authenticated B hint the client does not switch.
+  - [ ] R7b: reducer-owned Target-to-client application-ACK age causes one B
+    hint, one client attach, exact replay, and first B application ACK inside the
+    combined horizon.
+  - [ ] R7c: wrong seal/session/generation/nonce/sequence/direction/cause/offset,
+    idle flow, or stale B health cannot switch; duplicate/lower hints cannot
+    start a second attach.
+  - [ ] R7d: simultaneous hard failure, local stall, and hint consume one switch
+    epoch and one nonce and commit at most one generation.
+  - [ ] R8: deterministic fault/fairness matrix.
+  - [ ] R9: real-smoltcp replacement parity and production-TUN readiness.
+- [ ] Task 5: bounded UDP two-leg delivery/path switching.
+- [ ] Task 6: single-owner server/upstreamd and Target ownership.
+- [ ] Task 7: local real-socket `>170 Mbit/s` capacity gate after reachability math.
+- [ ] Task 8: security/protocol review and release hardening.
+- [ ] Task 9: bounded qualification over two independent ingress paths.
+- [ ] Task 10: long macOS/M2 acceptance only after all prerequisites pass.
+
+## Historical R7 acceptance checklist
+
+- [x] Write the bounded R7 spec/plan before production edits.
+- [x] Inventory exact actor read -> queue -> publication -> controller path.
+- [x] Define the same-clock timestamp type, checked conversion, and ownership.
+- [x] Add deterministic before/equal/after-deadline tests before accepting policy.
+- [x] Prove the value-level R7c rejection kernel is snapshot-inert and cannot
+  mint a first/second attach. Physical B provenance/composition remains open.
+- [x] Prove the value-level arbiter consumes one epoch/nonce and commits at most
+  one generation for all trigger orderings. Production routing remains open.
+- [ ] Prove queue, bytes, ACK, replay, timers, actor, endpoint, and session
+  ownership return to exact zero for the complete physical R7 composition on
+  success, rejection, pressure, fatal, cancellation, and shutdown.
+- [x] Run proportionate focused/repeat, broad local, provenance, release,
+  current-baseline Clippy, rustdoc, vendored, fmt/diff, and secret gates for the
+  prerequisite/policy-kernel checkpoint.
+- [x] Complete independent P0/P1/P2 review and checkpoint result/status/learnings.
+- [ ] Repeat the full gate after physical owner/B/hint/arbiter composition is
+  production-reachable and close R7a-d end to end.
+
+## Standing stop rules
+
+- The public TUN entry remains legacy.
+- R7 prerequisite/policy-kernel acceptance is necessary-only; do not claim
+  physical R7a-d, Task 4, throughput, or M2 completion.
+- Do not run macOS TUN, VPS, WAN, throughput, or M2 yet.
+- If capacity math, reachability, or a deterministic seam is missing, stop and
+  deepen the architecture instead of tuning a parameter.
+- After a failed repair test, analyze and propose the next plan, then wait for
+  user confirmation.
+
+## Repository-maintenance backlog
+
+- [x] Split auto-loaded project memory into compact current files plus exact
+  read-on-demand archives.
+- [x] Establish the two-tier Rust test-layout rule: private unit-test bodies live
+  under `src/<module>/tests/`, root `tests/` owns integration/public-contract and
+  repository-provenance tests, and the exact legacy inline-Module allowlist is
+  shrink-only.
+- [x] Install fail-closed code-growth governance for all future Rust changes:
+  `1,500` production lines, `800` test-leaf lines, `300` test-index lines,
+  exact shrink-only legacy debt, and no new `clippy::too_many_arguments`
+  suppressions. Cover positive-cfg external test Modules, close every `#[path]`
+  target inside the governed inventory, and reject source `include!` or broad
+  `clippy::all`/`allow(warnings)` bypasses. Keep Module Depth and Authority
+  Locality as mandatory review gates rather than treating line count as a
+  splitting algorithm.
+- [ ] Reduce grandfathered production/test debt only in later coherent,
+  behavior-preserving stages. Do not combine mechanical movement with behavior
+  changes or split one success/rejection/pressure/fatal/cancel/shutdown
+  transaction across Authorities merely to lower a line count.
+- [ ] In a separate behavior-preserving stage, extract oversized embedded Rust
+  test modules behind stable module boundaries. Do not combine that mechanical
+  move with R7 behavior changes; preserve provenance sentinels and `include_str!`
+  paths, and rerun the full affected test gates.
+  - [x] Move the `quinn_leg_actor.rs` inline test Implementation into the private
+    `quinn_leg_actor/tests/mod.rs` child Module while preserving all `106` test
+    identities and the production prefix.
+  - [x] Move the `client_tun.rs` inline test Implementation into the private
+    `client_tun/tests/mod.rs` child Module while preserving all `338` test
+    identities and the production prefix.
+  - [x] Move the `tuic.rs` inline test Implementation into the private
+    `tuic/tests/mod.rs` child Module while preserving all `162` test identities,
+    the production prefix, and the separate direct-probe Module.
+  - [x] Move the `owned_upstream/tcp.rs` inline test Implementation into the
+    private `owned_upstream/tcp/tests/mod.rs` child Module while preserving all
+    `65` test identities, the production prefix, and its three parent-local
+    test-support helpers.
+  - [x] Move the `owned_upstream/two_leg_harness.rs` inline test Implementation
+    into the private `owned_upstream/two_leg_harness/tests/mod.rs` child Module
+    while preserving all `9` test identities and the normalized extracted
+    body. The parent file's separately tested R7 controller-API adaptation
+    remains disclosed rather than folded into a whole-prefix identity claim.
